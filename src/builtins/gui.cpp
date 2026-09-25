@@ -141,7 +141,7 @@ static std::string VS(NythonExecutor& E, const Value& v) { return E.getStringVal
 static Value make_evt(NythonExecutor& E, const std::string& type,
                       int x=0,int y=0,int btn=0,const std::string& key="",
                       int kc=0,const std::string& txt="",int delta=0,int w=0,int h=0,
-                      bool ctrl=false,bool shift=false,bool alt=false) {
+                      bool ctrl=false,bool shift=false,bool alt=false,int clicks=0) {
     auto* o = new Object((Runnable*)E.runner, "event", Type::MAP);
     o->set("type",   E.makeStringValue(type));
     o->set("x",      Value(x));  o->set("y",     Value(y));
@@ -149,6 +149,7 @@ static Value make_evt(NythonExecutor& E, const std::string& type,
     o->set("keycode",Value(kc)); o->set("text",  E.makeStringValue(txt));
     o->set("delta",  Value(delta));o->set("w",   Value(w)); o->set("h", Value(h));
     o->set("ctrl",   Value(ctrl)); o->set("shift", Value(shift)); o->set("alt", Value(alt));
+    o->set("clicks", Value(clicks));
     return Value(static_cast<Collectable*>(o));
 }
 
@@ -397,6 +398,21 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
         SDL_SetCursor(cur);
         return Value(true);
     }
+    // ── System clipboard ────────────────────────────────────────────────
+    // gui_set_clipboard(text) -> bool, gui_get_clipboard() -> string.
+    // The IDE kept its clipboard in a Nython string, so Copy inside the
+    // editor could never be pasted into another application and vice versa.
+    if(name=="gui_set_clipboard"){
+        if(args.empty() || !g_sdl_ok) return Value(false);
+        return Value(SDL_SetClipboardText(VS(E,args[0]).c_str()));
+    }
+    if(name=="gui_get_clipboard"){
+        if(!g_sdl_ok) return E.makeStringValue("");
+        char* txt = SDL_GetClipboardText();
+        std::string out = txt ? txt : "";
+        if(txt) SDL_free(txt);
+        return E.makeStringValue(out);
+    }
     if(name=="gui_get_display_size"){
         // Returns [w,h] of the usable primary display area, so callers can size
         // a window that actually fits the screen. Without this the IDE asked for
@@ -629,10 +645,14 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
             float x=VF(args[1]),y=VF(args[2]),w=VF(args[3]),h=VF(args[4]);
             int r1=VI(args[5]),g1=VI(args[6]),b1=VI(args[7]),r2=VI(args[8]),g2=VI(args[9]),b2=VI(args[10]);
             bool vert=VI(args[11])!=0; int steps=vert?(int)h:(int)w; if(steps<1)steps=1;
+            // Optional trailing alpha pair (a1, a2). Without it the gradient
+            // was always opaque, so a translucent "gloss" highlight painted a
+            // solid white slab over the IDE's Run button.
+            int a1=args.size()>=13?VI(args[12]):255, a2=args.size()>=14?VI(args[13]):255;
             SDL_SetRenderDrawBlendMode(it->second.ren,SDL_BLENDMODE_BLEND);
             for(int i=0;i<steps;i++){
                 float t=(float)i/(float)steps;
-                SDL_SetRenderDrawColor(it->second.ren,(Uint8)(r1+t*(r2-r1)),(Uint8)(g1+t*(g2-g1)),(Uint8)(b1+t*(b2-b1)),255);
+                SDL_SetRenderDrawColor(it->second.ren,(Uint8)(r1+t*(r2-r1)),(Uint8)(g1+t*(g2-g1)),(Uint8)(b1+t*(b2-b1)),(Uint8)(a1+t*(a2-a1)));
                 if(vert) SDL_RenderLine(it->second.ren,x,y+(float)i,x+w,y+(float)i);
                 else     SDL_RenderLine(it->second.ren,x+(float)i,y,x+(float)i,y+h);
             }
@@ -841,8 +861,20 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
 
     // ── EVENTS ──────────────────────────────────────────────────────────
     // gui_poll_events(window_handle) -> list of event dicts
+    // Nearly every poll is empty (a window that is simply open polls 60 times
+    // a second), and the interpreter never reclaims containers (GC_NOTES.md):
+    // a fresh empty list per poll was ~1 KB of permanent garbage per frame.
+    // Empty polls therefore share one list that is never written to; a poll
+    // that has events gets its own list as before. (Reusing containers across
+    // polls is NOT safe: Object::set does not overwrite an existing key.)
     if(name=="gui_poll_events"){
-        auto* list=new Object((Runnable*)E.runner,"events",Type::LIST); int idx=0;
+        static Object* empty_list=nullptr;
+        if(!empty_list){
+            empty_list=new Object((Runnable*)E.runner,"events",Type::LIST);
+            empty_list->set("__len__",Value(0));
+        }
+        Object* list=nullptr;
+        int idx=0;
         SDL_Event ev;
         while(SDL_PollEvent(&ev)){
             Value v=NONE_VALUE;
@@ -864,12 +896,26 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
                     break;
                 case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
                     v=make_evt(E,"quit"); break;
-                case SDL_EVENT_MOUSE_MOTION:
-                    v=make_evt(E,"mousemove",(int)ev.motion.x,(int)ev.motion.y); break;
+                // Mouse events carry the modifier state too. They used to be
+                // built with ctrl/shift/alt all false, so Shift+Click (extend
+                // selection) and Alt+Click (add a caret) could never trigger.
+                case SDL_EVENT_MOUSE_MOTION: {
+                    SDL_Keymod mod=SDL_GetModState();
+                    v=make_evt(E,"mousemove",(int)ev.motion.x,(int)ev.motion.y,0,"",0,"",0,0,0,
+                               (mod&SDL_KMOD_CTRL)!=0,(mod&SDL_KMOD_SHIFT)!=0,(mod&SDL_KMOD_ALT)!=0);
+                    break;
+                }
                 case SDL_EVENT_MOUSE_BUTTON_DOWN:
-                    v=make_evt(E,"mousedown",(int)ev.button.x,(int)ev.button.y,ev.button.button); break;
-                case SDL_EVENT_MOUSE_BUTTON_UP:
-                    v=make_evt(E,"mouseup",(int)ev.button.x,(int)ev.button.y,ev.button.button); break;
+                case SDL_EVENT_MOUSE_BUTTON_UP: {
+                    SDL_Keymod mod=SDL_GetModState();
+                    v=make_evt(E,ev.type==SDL_EVENT_MOUSE_BUTTON_DOWN?"mousedown":"mouseup",
+                               (int)ev.button.x,(int)ev.button.y,ev.button.button,"",0,"",0,0,0,
+                               (mod&SDL_KMOD_CTRL)!=0,(mod&SDL_KMOD_SHIFT)!=0,(mod&SDL_KMOD_ALT)!=0,
+                               // SDL counts consecutive clicks itself (double/triple
+                               // click) with the platform's own interval and distance.
+                               (int)ev.button.clicks);
+                    break;
+                }
                 case SDL_EVENT_MOUSE_WHEEL: {
                     // wheel.x/y = scroll amount (not screen position)
                     // wheel.mouse_x/y = cursor position relative to window
@@ -941,8 +987,12 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
                     v=make_evt(E,"textinput",0,0,0,"",0,std::string(ev.text.text)); break;
                 default: break;
             }
-            if(v.type!=ValueType::NONE) list->set(std::to_string(idx++),v);
+            if(v.type!=ValueType::NONE){
+                if(!list) list=new Object((Runnable*)E.runner,"events",Type::LIST);
+                list->set(std::to_string(idx++),v);
+            }
         }
+        if(!list) return Value(static_cast<Collectable*>(empty_list));
         list->set("__len__",Value(idx));
         return Value(static_cast<Collectable*>(list));
     }

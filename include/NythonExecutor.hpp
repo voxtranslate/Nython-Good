@@ -358,7 +358,7 @@ public:   // NythonExecutor is a struct: members default to public
             "lang_list_tokens","lang_list_rules","lang_list_operators",
             "lang_registry_json","lang_eval","lang_version","lang_reset",
             // ── GUI builtins — value-returning ──────────────────────────────
-            "gui_get_error","gui_sdl_version","gui_get_display_size","gui_get_window_size","gui_set_window_size","gui_set_cursor","gui_hash_id","gui_display_scale","gui_window_scale","gui_measure_text_w",
+            "gui_get_error","gui_sdl_version","gui_get_display_size","gui_get_window_size","gui_set_window_size","gui_set_cursor","gui_hash_id","gui_display_scale","gui_window_scale","gui_measure_text_w","gui_set_clipboard","gui_get_clipboard",
             // ── Previously implemented but never registered ──────────────
             // The module dispatchers implement 537 builtins; only 197 were
             // registered as global names, so the rest were unreachable and
@@ -572,6 +572,7 @@ public:   // NythonExecutor is a struct: members default to public
     Value evalScript(node_ptr node, Context* ctx) {
         Value result = NONE_VALUE;
         for (auto& child : node->statements()) {
+            noteStatement(child, ctx);
             result = evalNode(child, ctx);
         }
         return result;
@@ -580,6 +581,7 @@ public:   // NythonExecutor is a struct: members default to public
     Value evalStatements(node_ptr node, Context* ctx) {
         Value result = NONE_VALUE;
         for (auto& child : node->statements()) {
+            noteStatement(child, ctx);
             result = evalNode(child, ctx);
         }
         return result;
@@ -1628,10 +1630,24 @@ return lv * rv;
     // ─── PRINT ──────────────────────────────────────────────────────────
     Value evalPrint(node_ptr node, Context* ctx) {
         auto pn = static_pointer_cast<PrintNode>(node);
+        // While tracing, the printed line is also recorded, so the debugger
+        // can show exactly the output produced up to the current step.
+        std::ostringstream cap;
+        std::streambuf* saved = nullptr;
+        if (trace_on() && !tracer().in_repr) saved = std::cout.rdbuf(cap.rdbuf());
+        struct Restore { std::streambuf* s; ~Restore() { if (s) std::cout.rdbuf(s); } } restore{saved};
         for (size_t i = 0; i < pn->args.size(); i++) {
             if (i > 0) std::cout << " ";
             Value v = evalNode(pn->args[i], ctx);
             printValue(v, ctx);
+        }
+        if (saved) {
+            std::cout.rdbuf(saved);
+            restore.s = nullptr;
+            std::string line = cap.str();
+            std::cout << line << std::endl;
+            traceOutput(line);
+            return NONE_VALUE;
         }
         std::cout << std::endl;
         return NONE_VALUE;
@@ -3701,6 +3717,188 @@ public:
     // — callBuiltin included — private.
 public:
 
+    // ── Statement tracing (--trace) ─────────────────────────────────────────
+    // Records every statement executed in the user's own files, with its call
+    // depth, the enclosing function and that frame's variables, plus program
+    // output and the uncaught exception, one JSON object per line. The IDE's
+    // debugger replays the recording (lib/ide_debugger.ny), which is what lets
+    // it step backwards as well as forwards and never hang mid-step. Off by
+    // default; the only always-on cost is remembering the current statement
+    // node, which also lets an uncaught error report where it happened.
+    struct TraceState {
+        FILE* f = nullptr;
+        std::string main_file;
+        std::string main_dir;
+        long events = 0;
+        long max_events = 60000;
+        std::vector<std::string> fn_stack;
+        std::set<std::string> globals;
+        bool in_repr = false;
+        bool capped = false;
+    };
+    static TraceState& tracer() { static TraceState t; return t; }
+    static bool trace_on() { return tracer().f != nullptr; }
+    static node_ptr& last_stmt() { static node_ptr p; return p; }
+    // "file.ny:12" for the statement that was executing, "" if none.
+    static std::string last_stmt_where() {
+        auto& n = last_stmt();
+        if (!n) return std::string();
+        auto tk = n->token();
+        return tk.fileName() + ":" + std::to_string(tk.line());
+    }
+
+    struct TraceFrame {
+        bool on;
+        explicit TraceFrame(const std::string& name) {
+            on = trace_on() && !tracer().in_repr;
+            if (on) tracer().fn_stack.push_back(name.empty() ? std::string("<call>") : name);
+        }
+        ~TraceFrame() { if (on && !tracer().fn_stack.empty()) tracer().fn_stack.pop_back(); }
+    };
+
+    static std::string traceJson(const std::string& s) {
+        std::string o = "\"";
+        for (unsigned char c : s) {
+            if (c == '"' || c == '\\') { o += '\\'; o += (char)c; }
+            else if (c == '\n') o += "\\n";
+            else if (c == '\t') o += "\\t";
+            else if (c < 0x20) { char b[8]; snprintf(b, sizeof(b), "\\u%04x", c); o += b; }
+            else o += (char)c;
+        }
+        return o + "\"";
+    }
+
+    bool traceIsUserFile(const std::string& file) {
+        auto& T = tracer();
+        if (file == T.main_file) return true;
+        if (T.main_dir.empty() || file.rfind(T.main_dir, 0) != 0) return false;
+        return file.find("/lib/") == std::string::npos;
+    }
+
+    // A short, side-effect-free rendering: no user __repr__ is ever called.
+    std::string traceRepr(const Value& v, int depth) {
+        switch (v.type) {
+            case ValueType::NONE: return "none";
+            case ValueType::UNDEFINED: return "undefined";
+            case ValueType::BOOLEAN: return v.value.b ? "true" : "false";
+            case ValueType::INTEGER: return std::to_string(bigint_to_i64(v.value.i));
+            case ValueType::DOUBLE: { char b[64]; snprintf(b, sizeof(b), "%g", (double)v.value.d); return b; }
+            default: break;
+        }
+        if (v.type == ValueType::USERDATA && v.value.p) {
+            if (string_ptrs_.count(v.value.p) || isStringValue(v)) {
+                std::string s = *static_cast<std::string*>(v.value.p);
+                if (s.size() > 60) s = s.substr(0, 57) + "...";
+                return "\"" + s + "\"";
+            }
+            auto fit = func_names.find(v.value.p);
+            auto cit = instance_to_class.find(v.value.p);
+            if (cit != instance_to_class.end()) {
+                auto nit = func_names.find(cit->second);
+                std::string cls = nit != func_names.end() ? funcDisplayName(nit->second) : std::string("object");
+                if (cls.rfind("<class ", 0) == 0 && cls.size() > 8) cls = cls.substr(7, cls.size() - 8);
+                return "<" + cls + " object>";
+            }
+            if (fit != func_names.end()) return funcDisplayName(fit->second);
+            return "<value>";
+        }
+        if (v.isCollectable() && v.value.gc) {
+            auto* cont = dynamic_cast<Container*>(v.value.gc);
+            if (cont && cont->container) {
+                if (depth > 1) return "[...]";
+                auto len_it = cont->container->find("__len__");
+                if (len_it != cont->container->end()) {
+                    int len = (int)bigint_to_i64(len_it->second.value.i);
+                    std::string s = "[";
+                    for (int i = 0; i < len && i < 8; i++) {
+                        if (i) s += ", ";
+                        auto it = cont->container->find(std::to_string(i));
+                        if (it != cont->container->end()) s += traceRepr(it->second, depth + 1);
+                    }
+                    if (len > 8) s += ", ... (" + std::to_string(len) + ")";
+                    return s + "]";
+                }
+                std::vector<std::string> keys;
+                for (auto& kv : *cont->container) keys.push_back(kv.first);
+                std::sort(keys.begin(), keys.end());
+                std::string s = "{";
+                int n = 0;
+                for (auto& k : keys) {
+                    if (n >= 6) { s += ", ..."; break; }
+                    if (n) s += ", ";
+                    s += k + ": " + traceRepr((*cont->container)[k], depth + 1);
+                    n++;
+                }
+                return s + "}";
+            }
+        }
+        return "<value>";
+    }
+
+    inline void noteStatement(const node_ptr& st, Context* ctx) {
+        last_stmt() = st;
+        if (trace_on()) traceStatement(st, ctx);
+    }
+
+    void traceStatement(const node_ptr& st, Context* ctx) {
+        auto& T = tracer();
+        if (!st || T.in_repr || T.capped) return;
+        auto tk = st->token();
+        std::string file = tk.fileName();
+        if (!traceIsUserFile(file)) return;
+        if (T.events >= T.max_events) {
+            T.capped = true;
+            fprintf(T.f, "{\"cap\":%ld}\n", T.events);
+            fflush(T.f);
+            return;
+        }
+        T.events++;
+        std::string fn = T.fn_stack.empty() ? std::string("<module>") : T.fn_stack.back();
+        std::string out = "{\"f\":" + traceJson(file) + ",\"l\":" + std::to_string(tk.line())
+                        + ",\"d\":" + std::to_string(T.fn_stack.size()) + ",\"fn\":" + traceJson(fn) + ",\"v\":{";
+        if (ctx && ctx->container) {
+            bool is_global = (ctx == global_ctx);
+            std::vector<std::string> names;
+            for (auto& kv : *ctx->container) {
+                const std::string& nm = kv.first;
+                if (nm.size() >= 2 && nm[0] == '_' && nm[1] == '_') continue;
+                if (nm == "this") continue;   // alias of self
+                if (is_global && !T.globals.count(nm)) continue;
+                const Value& val = kv.second;
+                if (val.type == ValueType::USERDATA && val.value.p && func_names.count(val.value.p)
+                    && !instance_to_class.count(val.value.p) && !string_ptrs_.count(val.value.p)) continue;
+                names.push_back(nm);
+            }
+            std::sort(names.begin(), names.end());
+            T.in_repr = true;
+            int n = 0;
+            for (auto& nm : names) {
+                if (n >= 40) break;
+                if (n) out += ",";
+                out += traceJson(nm) + ":" + traceJson(traceRepr((*ctx->container)[nm], 0));
+                n++;
+            }
+            T.in_repr = false;
+        }
+        out += "}}\n";
+        fputs(out.c_str(), T.f);
+    }
+
+    static void traceOutput(const std::string& text) {
+        auto& T = tracer();
+        if (!T.f || T.capped) return;
+        std::string o = "{\"o\":" + traceJson(text) + "}\n";
+        fputs(o.c_str(), T.f);
+    }
+
+    static void traceException(const std::string& msg) {
+        auto& T = tracer();
+        if (!T.f) return;
+        std::string o = "{\"x\":" + traceJson(msg) + ",\"at\":" + traceJson(last_stmt_where()) + "}\n";
+        fputs(o.c_str(), T.f);
+        fflush(T.f);
+    }
+
     // Best-effort display name for a call site: `f()`, `obj.m()` -> "obj.m".
     std::string callTargetName(const std::shared_ptr<CallNode>& cn) {
         if (!cn || !cn->callee) return std::string();
@@ -3727,6 +3925,7 @@ public:
         auto cn = static_pointer_cast<CallNode>(node);
         // Zero cost when profiling is off: ProfScope short-circuits on the flag.
         ProfScope _prof(this, profiling_enabled() ? callTargetName(cn) : std::string());
+        TraceFrame _trace_frame(trace_on() ? callTargetName(cn) : std::string());
 
         // Special handling for method calls: obj.method(args)
         if (cn->callee->type() == NodeType::ATTRIBUTE) {
@@ -4957,6 +5156,49 @@ public:
         return f.substr(0, cut + 1);
     }
 
+    // "/a/b/lib/" -> "/a/b/". Normalised through realpath first so a path
+    // such as "build/../lib/" climbs to the real parent, not into build/.
+    static std::string parentDirOf(const std::string& dir) {
+        if (dir.empty()) return std::string();
+        std::string d = dir;
+#ifndef _WIN32
+        char buf[4096];
+        if (realpath(d.c_str(), buf)) d = std::string(buf) + "/";
+#endif
+        while (d.size() > 1 && (d.back() == '/' || d.back() == '\\')) d.pop_back();
+        size_t cut = d.find_last_of("/\\");
+        if (cut == std::string::npos) return std::string();
+        return d.substr(0, cut + 1);
+    }
+
+    // Library files name each other relative to the project root
+    // (lib/aiagent.ny does `import "lib/nytorch.ny"`), which only resolved when
+    // the working directory WAS the project root. Launching the IDE from any
+    // other folder - i.e. opening any other project - died with an ImportError.
+    // Tried after every existing candidate, so resolution that already worked
+    // is unchanged: the importing file's ancestor directories, nearest first.
+    std::vector<std::string> ancestorCandidates(const node_ptr& node, const std::string& rel) {
+        std::vector<std::string> out;
+        std::string anc = parentDirOf(importerDir(node));
+        for (int up = 0; up < 4 && !anc.empty(); ++up) {
+            out.push_back(anc + rel);
+            std::string next = parentDirOf(anc);
+            if (next == anc) break;
+            anc = next;
+        }
+        return out;
+    }
+
+    std::string locateModuleFile(const node_ptr& node, const std::string& rel) {
+        struct stat st;
+        if (stat(rel.c_str(), &st) == 0) return rel;
+        std::string here = importerDir(node);
+        if (!here.empty() && stat((here + rel).c_str(), &st) == 0) return here + rel;
+        for (auto& c : ancestorCandidates(node, rel))
+            if (stat(c.c_str(), &st) == 0) return c;
+        return rel;
+    }
+
     // Top-level declarations of a module: functions, classes and vars. Used to
     // build an `import ... as` namespace without depending on scope state.
     void collectTopLevelNames(const node_ptr& root, std::set<std::string>& out) {
@@ -5333,7 +5575,7 @@ public:
                 }
                 // Load the class library
                 {
-                    std::vector<std::string> ny_paths = {"lib/nytorch.ny", "./lib/nytorch.ny"};
+                    std::vector<std::string> ny_paths = {"lib/nytorch.ny", "./lib/nytorch.ny", locateModuleFile(node, "lib/nytorch.ny")};
                     for (auto& np : ny_paths) {
                         struct stat nst; if (stat(np.c_str(), &nst) == 0) {
                             try {
@@ -5630,7 +5872,7 @@ public:
 
         // ── lib/ module shortcuts ──────────────────────────────────────────────
         if (module_name == "stdlib") {
-            std::string p = "lib/stdlib.ny";
+            std::string p = locateModuleFile(node, "lib/stdlib.ny");
             struct stat st; if (stat(p.c_str(),&st)==0){
                 auto src=SourceCode(p); auto rep=std::make_shared<Reporter>(src);
                 auto lx=std::make_shared<Lexer>(src); lx->tokenize();
@@ -5639,7 +5881,7 @@ public:
             } return NONE_VALUE;
         }
         if (module_name == "os_lib" || module_name == "oslib") {
-            std::string p = "lib/os.ny";
+            std::string p = locateModuleFile(node, "lib/os.ny");
             struct stat st; if (stat(p.c_str(),&st)==0){
                 auto src=SourceCode(p); auto rep=std::make_shared<Reporter>(src);
                 auto lx=std::make_shared<Lexer>(src); lx->tokenize();
@@ -5648,7 +5890,7 @@ public:
             } return NONE_VALUE;
         }
         if (module_name == "network_lib" || module_name == "netlib") {
-            std::string p = "lib/network.ny";
+            std::string p = locateModuleFile(node, "lib/network.ny");
             struct stat st; if (stat(p.c_str(),&st)==0){
                 auto src=SourceCode(p); auto rep=std::make_shared<Reporter>(src);
                 auto lx=std::make_shared<Lexer>(src); lx->tokenize();
@@ -5657,7 +5899,7 @@ public:
             } return NONE_VALUE;
         }
         if (module_name == "sockets") {
-            std::string p = "lib/sockets.ny";
+            std::string p = locateModuleFile(node, "lib/sockets.ny");
             struct stat st; if (stat(p.c_str(),&st)==0){
                 auto src=SourceCode(p); auto rep=std::make_shared<Reporter>(src);
                 auto lx=std::make_shared<Lexer>(src); lx->tokenize();
@@ -5666,7 +5908,7 @@ public:
             } return NONE_VALUE;
         }
         if (module_name == "webserver" || module_name == "httpserver") {
-            std::string p = "lib/webserver.ny";
+            std::string p = locateModuleFile(node, "lib/webserver.ny");
             struct stat st; if (stat(p.c_str(),&st)==0){
                 auto src=SourceCode(p); auto rep=std::make_shared<Reporter>(src);
                 auto lx=std::make_shared<Lexer>(src); lx->tokenize();
@@ -5675,7 +5917,7 @@ public:
             } return NONE_VALUE;
         }
         if (module_name == "threads" || module_name == "threading_lib") {
-            std::string p = "lib/thread.ny";
+            std::string p = locateModuleFile(node, "lib/thread.ny");
             struct stat st; if (stat(p.c_str(),&st)==0){
                 auto src=SourceCode(p); auto rep=std::make_shared<Reporter>(src);
                 auto lx=std::make_shared<Lexer>(src); lx->tokenize();
@@ -5684,7 +5926,7 @@ public:
             } return NONE_VALUE;
         }
         if (module_name == "clientserver" || module_name == "cs_lib") {
-            std::string p = "lib/clientserver.ny";
+            std::string p = locateModuleFile(node, "lib/clientserver.ny");
             struct stat st; if (stat(p.c_str(),&st)==0){
                 auto src=SourceCode(p); auto rep=std::make_shared<Reporter>(src);
                 auto lx=std::make_shared<Lexer>(src); lx->tokenize();
@@ -5693,7 +5935,7 @@ public:
             } return NONE_VALUE;
         }
         if (module_name == "gui") {
-            std::string p = "lib/gui.ny";
+            std::string p = locateModuleFile(node, "lib/gui.ny");
             struct stat st; if (stat(p.c_str(),&st)==0){
                 auto src=SourceCode(p); auto rep=std::make_shared<Reporter>(src);
                 auto lx=std::make_shared<Lexer>(src); lx->tokenize();
@@ -5702,7 +5944,7 @@ public:
             } return NONE_VALUE;
         }
         if (module_name == "aiagent" || module_name == "nyxai" || module_name == "nyx") {
-            std::string p = "lib/aiagent.ny";
+            std::string p = locateModuleFile(node, "lib/aiagent.ny");
             struct stat st; if (stat(p.c_str(),&st)==0){
                 auto src=SourceCode(p); auto rep=std::make_shared<Reporter>(src);
                 auto lx=std::make_shared<Lexer>(src); lx->tokenize();
@@ -5736,6 +5978,8 @@ public:
         search_paths.push_back("./lib/" + module_name + ".ny");
         search_paths.push_back("lib/" + module_name + ".ny");
         search_paths.push_back("lib/" + module_name + "/" + module_name + ".ny");
+        for (auto& c : ancestorCandidates(node, module_name + ".ny")) search_paths.push_back(c);
+        for (auto& c : ancestorCandidates(node, module_name)) search_paths.push_back(c);
 
         std::string filepath;
         for (auto& p : search_paths) {

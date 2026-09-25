@@ -3550,9 +3550,38 @@ private:
             {"aiagent","lib/aiagent.ny"},{"nyxai","lib/aiagent.ny"},{"nyx","lib/aiagent.ny"},
             {"nytorch_classes","lib/nytorch.ny"},
         };
+        // Ancestors of the script's directory, nearest first. Library files
+        // name each other relative to the project root ("lib/nytorch.ny"), so
+        // running from any other working directory needs these. Tried after
+        // every existing candidate, matching the interpreter's
+        // ancestorCandidates().
+        auto ancestors=[&](const std::string& rel){
+            std::vector<std::string> out;
+            std::string d=script_dir_;
+#ifndef _WIN32
+            char rb[4096];
+            if(!d.empty() && realpath(d.c_str(),rb)) d=std::string(rb)+"/";
+#endif
+            for(int up=0;up<4;++up){
+                while(d.size()>1&&(d.back()=='/'||d.back()=='\\')) d.pop_back();
+                size_t cut=d.find_last_of("/\\");
+                if(cut==std::string::npos) break;
+                d=d.substr(0,cut+1);
+                out.push_back(d+rel);
+            }
+            return out;
+        };
         std::string filepath;
         auto it=lib_map.find(name);
-        if(it!=lib_map.end()) filepath=it->second;
+        if(it!=lib_map.end()){
+            filepath=it->second;
+            struct stat lst;
+            if(::stat(filepath.c_str(),&lst)!=0){
+                std::vector<std::string> alt={script_dir_+filepath};
+                for(auto& c:ancestors(filepath)) alt.push_back(c);
+                for(auto& c:alt){ if(::stat(c.c_str(),&lst)==0){ filepath=c; break; } }
+            }
+        }
         if(filepath.empty()){
             std::vector<std::string> paths={
                 // The importing script's own directory first, matching the
@@ -3564,6 +3593,8 @@ private:
                 cwd_+"/"+name+".ny","lib/"+name+".ny","./lib/"+name+".ny",
                 cwd_+"/lib/"+name+".ny",
             };
+            for(auto& c:ancestors(name+".ny")) paths.push_back(c);
+            for(auto& c:ancestors(name)) paths.push_back(c);
             for(auto& p:paths){struct stat st;if(::stat(p.c_str(),&st)==0){filepath=p;break;}}
             // Kept for the error message below; `paths` goes out of scope here.
             for(size_t i=0;i<paths.size();++i){ if(i) tried_paths+=", "; tried_paths+=paths[i]; }

@@ -22,6 +22,24 @@ import "lib/icons.ny"
 class Icons:
     def __init__(self):
         self.codicon = Icons_Codicon()
+        # The font path is relative to the IDE's own folder, not to wherever it
+        # was launched from. Launched from a project folder, the relative path
+        # missed, every icon fell back to the vector shapes below, and the Run
+        # icon (fill_polygon called with the wrong arguments) vanished.
+        if not path_exists(self.codicon.font_path):
+            var home = getenv("NYTHON_HOME")
+            if home != none and home != "":
+                var cand = path_join(home, "assets/fonts/codicon.ttf")
+                if path_exists(cand):
+                    self.codicon.font_path = cand
+        # Glyph fonts by pixel size. A list indexed by size, not a dict keyed
+        # by str(size): building that key string on every icon draw was a
+        # small permanent allocation, many times a frame.
+        self.glyph_by_size = []
+        var gi = 0
+        while gi < 97:
+            self.glyph_by_size.append(none)
+            gi = gi + 1
         self.glyph_fonts = {}
         # Off if the font is missing, so the vector fallback runs instead of
         # every icon rendering as a missing-glyph box.
@@ -76,11 +94,15 @@ class Icons:
     # If the font is missing the vector shapes below still run, so a stripped
     # install degrades instead of showing blank squares.
     def _glyph_font(self, size):
-        var key = str(int(size))
-        var f = self.glyph_fonts[key]
+        var sz = int(size)
+        if sz < 1:
+            sz = 1
+        if sz > 96:
+            sz = 96
+        var f = self.glyph_by_size[sz]
         if f == none:
-            f = Font(self.codicon.font_path, int(size), false, false)
-            self.glyph_fonts[key] = f
+            f = Font(self.codicon.font_path, sz, false, false)
+            self.glyph_by_size[sz] = f
         return f
 
     # v4's icon names differ from the codicon set's; map them.
@@ -201,9 +223,9 @@ class Icons:
         self._ln(r, x + 4.5 * u, y + 7.5 * u, x + 9.5 * u, y + 7.5 * u, c)
 
     def _play(self, r, x, y, u, c):
-        r.fill_polygon([int(x + 5 * u), int(y + 3.5 * u),
-                        int(x + 5 * u), int(y + 12.5 * u),
-                        int(x + 12.5 * u), int(y + 8 * u)], c)
+        r.fill_polygon([[int(x + 5 * u), int(y + 3.5 * u)],
+                        [int(x + 5 * u), int(y + 12.5 * u)],
+                        [int(x + 12.5 * u), int(y + 8 * u)]], 3, c)
 
     def _bug(self, r, x, y, u, c):
         self._fbox(r, x + 5 * u, y + 5 * u, 6 * u, 8 * u, c, int(3 * u))
@@ -261,9 +283,9 @@ class Icons:
         self._ln(r, x + 8.2 * u, y + 10.4 * u, x + 11.5 * u, y + 10.4 * u, c)
 
     def _warning(self, r, x, y, u, c):
-        r.fill_polygon([int(x + 8 * u), int(y + 2.5 * u),
-                        int(x + 14.5 * u), int(y + 13.5 * u),
-                        int(x + 1.5 * u), int(y + 13.5 * u)], c)
+        r.fill_polygon([[int(x + 8 * u), int(y + 2.5 * u)],
+                        [int(x + 14.5 * u), int(y + 13.5 * u)],
+                        [int(x + 1.5 * u), int(y + 13.5 * u)]], 3, c)
 
     def _close(self, r, x, y, u, c):
         self._ln(r, x + 4.5 * u, y + 4.5 * u, x + 11.5 * u, y + 11.5 * u, c)

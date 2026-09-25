@@ -143,6 +143,7 @@ class Font:
         self.bold = bold
         self.italic = italic
         self._handle = none
+        self._h_cache = 0
         self.load()  # auto-load; returns false silently if SDL not ready yet
 
     def load(self):
@@ -169,6 +170,20 @@ class Font:
         if result == none:
             return [len(text) * self.size / 2, self.size]
         return result
+
+    # Line height in pixels. nython_ide.ny called font.height() to centre the
+    # Run button label; the method did not exist, so the call returned none
+    # and the label was drawn at y=0 over the File menu. Measured once.
+    def height(self):
+        if self._h_cache == none or self._h_cache <= 0:
+            self.ensure_loaded()
+            if self._handle == none:
+                return self.size + 4
+            var m = gui_measure_text(self._handle, "Ag")
+            if m == none:
+                return self.size + 4
+            self._h_cache = m[1]
+        return self._h_cache
 
 # ─── Theme ───────────────────────────────────────────────────────────────────
 
@@ -569,6 +584,8 @@ class Event:
         self.ctrl = false
         self.shift = false
         self.alt = false
+        # Consecutive-click count from SDL (2 = double click, 3 = triple).
+        self.clicks = 0
 
     def consume(self):
         self.consumed = true
@@ -793,6 +810,30 @@ class Renderer:
     def clear_viewport(self):
         gui_clear_viewport(self.handle)
 
+    # ── allocation-free variants (see GC_NOTES.md / MEMORY_NOTES.md) ──────
+    def gradient_xywh(self, x, y, w, h, color1, color2, vertical):
+        gui_draw_gradient(self.handle, x, y, w, h, color1.r, color1.g, color1.b,
+                          color2.r, color2.g, color2.b, vertical, color1.a, color2.a)
+
+    def shadow_xywh(self, x, y, w, h, blur, offset_x, offset_y, color):
+        gui_draw_shadow(self.handle, x, y, w, h, blur, offset_x, offset_y, color.r, color.g, color.b, color.a)
+
+    def clip_xywh(self, x, y, w, h):
+        gui_set_clip(self.handle, x, y, w, h)
+
+    def rect_xywh(self, x, y, w, h, color, border_w):
+        gui_draw_rect(self.handle, x, y, w, h, color.r, color.g, color.b, color.a, border_w)
+
+    def round_rect_xywh(self, x, y, w, h, color, radius, border_w):
+        gui_draw_rounded_rect(self.handle, x, y, w, h, color.r, color.g, color.b, color.a, radius, border_w)
+
+    def text(self, s, x, y, font, color):
+        if font._handle == none:
+            font.ensure_loaded()
+            if font._handle == none:
+                return
+        gui_draw_text(self.handle, s, x, y, font._handle, color.r, color.g, color.b, color.a)
+
     def draw_polygon(self, points, n, color):
         gui_draw_polygon(self.handle, points, n, color.r, color.g, color.b, color.a)
 
@@ -872,23 +913,12 @@ class Window:
         var etype = raw_event["type"]
         if etype == "wheel":
             etype = "scroll"
-        var ev = Event(etype)
-        ev.x = raw_event["x"]
-        ev.y = raw_event["y"]
-        ev.button = raw_event["button"]
-        ev.key = raw_event["key"]
-        ev.keycode = raw_event["keycode"]
-        ev.text = raw_event["text"]
-        ev.delta = raw_event["delta"]
-        ev.ctrl = raw_event["ctrl"]
-        ev.shift = raw_event["shift"]
-        ev.alt = raw_event["alt"]
-        if ev.type == "quit":
+        if etype == "quit":
             self.running = false
             if self._on_close != none:
                 self._on_close()
             return
-        if ev.type == "resize":
+        if etype == "resize":
             self.width = raw_event["w"]
             self.height = raw_event["h"]
             # The IDE drives its own layout and never installs a root widget,
@@ -900,8 +930,37 @@ class Window:
             if self._on_resize != none:
                 self._on_resize(self.width, self.height)
             return
-        if self.root != none:
-            self.root.handle_event(ev)
+        # Only build a widget Event when there is a widget tree to receive it.
+        # An Event is a class instance, and the interpreter never reclaims
+        # instances (GC_NOTES.md), so the unconditional construction here cost
+        # ~2.4 KB per input event for applications - the IDE among them - that
+        # draw everything themselves and have an empty root.
+        if self.root == none or self.root.child_count == 0:
+            return
+        var ev = Event(etype)
+        self._fill_event(ev, raw_event, etype)
+        self.root.handle_event(ev)
+
+    # Copies one raw backend event into an existing Event, so the run loop can
+    # reuse a single Event object for every callback instead of allocating one
+    # per event. A callback must therefore not keep the Event it was handed
+    # beyond the call - the same contract SDL itself has for SDL_Event.
+    def _fill_event(self, ev, raw, etype):
+        ev.type = etype
+        ev.x = raw["x"]
+        ev.y = raw["y"]
+        ev.button = raw["button"]
+        ev.key = raw["key"]
+        ev.keycode = raw["keycode"]
+        ev.text = raw["text"]
+        ev.delta = raw["delta"]
+        ev.ctrl = raw["ctrl"]
+        ev.shift = raw["shift"]
+        ev.alt = raw["alt"]
+        ev.consumed = false
+        ev.clicks = 0
+        if raw.has_key("clicks"):
+            ev.clicks = raw["clicks"]
 
     def run(self, callback):
         if self._handle == none:
@@ -935,37 +994,35 @@ class Window:
                 return
         self.running = true
         var frame_ms = int(1000 / self.fps)
+        # Reused for every callback (see _fill_event): an Event per input
+        # event plus one per idle frame was ~150 KB/s of permanent garbage in
+        # an application that is simply sitting open.
+        var ev = Event("idle")
+        var idle_ev = Event("idle")
         while self.running:
             var t_start = time_ms()
             var painted = false
             var events = gui_poll_events(self._handle)
+            var n = len(events)
             var i = 0
-            while i < len(events):
+            while i < n:
                 var raw = events[i]
                 self._process_event(raw)
                 if callback != none:
                     var rtype = raw["type"]
                     if rtype == "wheel":
                         rtype = "scroll"
-                    var ev = Event(rtype)
-                    ev.x = raw["x"]
-                    ev.y = raw["y"]
-                    ev.button = raw["button"]
-                    ev.key = raw["key"]
-                    ev.keycode = raw["keycode"]
-                    ev.text = raw["text"]
-                    ev.delta = raw["delta"]
-                    ev.ctrl = raw["ctrl"]
-                    ev.shift = raw["shift"]
-                    ev.alt = raw["alt"]
-                    ev.is_last = (i == len(events) - 1)
+                    self._fill_event(ev, raw, rtype)
+                    ev.is_last = (i == n - 1)
                     var rp = callback(self.renderer, ev)
                     if rp != false:
                         painted = true
                 i = i + 1
             if callback != none:
-                if len(events) == 0:
-                    var idle_ev = Event("idle")
+                if n == 0:
+                    idle_ev.type = "idle"
+                    idle_ev.consumed = false
+                    idle_ev.is_last = true
                     var rp2 = callback(self.renderer, idle_ev)
                     if rp2 != false:
                         painted = true

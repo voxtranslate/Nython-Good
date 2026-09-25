@@ -201,6 +201,14 @@ typedef Uint16 SDL_Keymod;
 SDL_Keymod SDL_GetModState(void);
 const char* SDL_GetKeyName(SDL_Keycode key);
 
+// ── Clipboard ────────────────────────────────────────────────────────────
+// Same signatures as real SDL3. SDL_GetClipboardText's result must be
+// released with SDL_free, exactly as with the real library.
+bool SDL_SetClipboardText(const char* text);
+char* SDL_GetClipboardText(void);
+bool SDL_HasClipboardText(void);
+void SDL_free(void* mem);
+
 // ── Events ───────────────────────────────────────────────────────────────
 typedef Uint32 SDL_EventType;
 #define SDL_EVENT_QUIT                     0x100u

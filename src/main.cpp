@@ -1,5 +1,6 @@
 #ifndef _WIN32
 #include <sys/resource.h>
+#include <unistd.h>
 #endif
 // main.cpp
 // ─────────────────────────────────────────────────────────────────────────────
@@ -18,6 +19,7 @@
 #include "ConsoleManager.hpp"
 #include <algorithm>
 #include <sstream>
+#include <fstream>
 // ^ explicit: libstdc++ supplies these transitively, MinGW does not.
 
 using namespace std;
@@ -92,6 +94,20 @@ static void report_compiler_error(const std::string& kind,
     }
 }
 
+// --trace <out.jsonl>: record every statement executed in the user's files
+// (see NythonExecutor::traceStatement). Used by the IDE's debugger.
+static std::string g_trace_path;
+
+// Where an uncaught runtime error happened. Most runtime errors carried no
+// location at all ("ValueError: bad thing"), so the Problems panel could not
+// point at a line; the executor now remembers the statement it was running.
+static void report_uncaught_where(const std::string& msg) {
+    NythonExecutor::traceException(msg);
+    if (msg.find(" at line ") != std::string::npos) return;
+    std::string where = NythonExecutor::last_stmt_where();
+    if (!where.empty()) std::cerr << "  at " << where << "\n";
+}
+
 int run_file(const std::string& filename, bool show_ast = false) {
     struct stat buf;
     if (stat(filename.c_str(), &buf) != 0) {
@@ -114,6 +130,40 @@ int run_file(const std::string& filename, bool show_ast = false) {
 
 
         NythonExecutor exec((Runnable*)vm_ptr.get());
+        struct TraceCloser { ~TraceCloser() {
+            auto& T = NythonExecutor::tracer();
+            if (T.f) { fclose(T.f); T.f = nullptr; }
+        } } trace_closer;
+        if (!g_trace_path.empty()) {
+            auto& T = NythonExecutor::tracer();
+            T.f = fopen(g_trace_path.c_str(), "w");
+            if (!T.f) { std::cerr << "[Nython] cannot write trace file " << g_trace_path << "\n"; return 2; }
+            T.main_file = filename;
+            auto cut = filename.find_last_of("/\\");
+            T.main_dir = cut == std::string::npos ? std::string() : filename.substr(0, cut + 1);
+            if (ast) exec.collectTopLevelNames(ast, T.globals);
+            // Module-level variables worth showing are the ones the user's own
+            // file mentions (loop variables included), not the hundreds of
+            // names an import defines.
+            {
+                std::ifstream in(filename);
+                std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                size_t i = 0;
+                while (i < src.size()) {
+                    unsigned char c = (unsigned char)src[i];
+                    if (isalpha(c) || c == '_') {
+                        size_t j = i;
+                        while (j < src.size() && (isalnum((unsigned char)src[j]) || src[j] == '_')) j++;
+                        T.globals.insert(src.substr(i, j - i));
+                        i = j;
+                    } else i++;
+                }
+            }
+            if (const char* mx = getenv("NY_TRACE_MAX")) {
+                long v = atol(mx);
+                if (v > 0) T.max_events = v;
+            }
+        }
         exec.execute(ast);
         // --profile: emit measured per-function counts and timings after the
         // program finishes. Delimited so a caller can separate the report from
@@ -136,11 +186,17 @@ int run_file(const std::string& filename, bool show_ast = false) {
             if (colon != std::string::npos)
                 msg = msg.substr(0, colon) + ": " + msg.substr(colon + 1);
         }
-        std::cerr << "[Nython] Uncaught exception — " << msg << "\n"; return 1;
+        std::cerr << "[Nython] Uncaught exception — " << msg << "\n";
+        report_uncaught_where(msg);
+        return 1;
     } catch (std::runtime_error& e) {
-        std::cerr << "runtime error: " << e.what() << "\n"; return 1;
+        std::cerr << "runtime error: " << e.what() << "\n";
+        report_uncaught_where(e.what());
+        return 1;
     } catch (std::exception& e) {
-        std::cerr << "error: " << e.what() << "\n"; return 1;
+        std::cerr << "error: " << e.what() << "\n";
+        report_uncaught_where(e.what());
+        return 1;
     }
     return 0;
 }
@@ -175,6 +231,38 @@ static std::string get_binary_dir(const char* argv0) {
     else if (slash != std::string::npos) sep = slash;
     else if (bslash != std::string::npos) sep = bslash;
     return (sep != std::string::npos) ? p.substr(0, sep) : ".";
+}
+
+// Absolute path of the running executable. argv[0] is only a name when the
+// binary was started through PATH, which made get_binary_dir() return ".".
+static std::string g_argv0;
+[[maybe_unused]] static std::string get_exe_path() {
+#ifdef _WIN32
+    wchar_t wpath[4096] = {};
+    if (GetModuleFileNameW(nullptr, wpath, 4095) > 0) {
+        char path[4096] = {};
+        WideCharToMultiByte(CP_UTF8, 0, wpath, -1, path, sizeof(path)-1, nullptr, nullptr);
+        return path;
+    }
+    return g_argv0;
+#else
+    char buf[4096];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) { buf[n] = 0; return buf; }
+    char rp[4096];
+    if (!g_argv0.empty() && realpath(g_argv0.c_str(), rp)) return rp;
+    return g_argv0;
+#endif
+}
+
+[[maybe_unused]] static void set_env_default(const char* key, const std::string& val) {
+    const char* cur = getenv(key);
+    if (cur && *cur) return;       // an explicit setting always wins
+#ifdef _WIN32
+    _putenv_s(key, val.c_str());
+#else
+    setenv(key, val.c_str(), 0);
+#endif
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -218,6 +306,21 @@ static bool launch_ide(const std::string& binary_dir) {
 #endif
         return false;
     }
+    // Tell the IDE where it lives and which binary is running it. Its assets
+    // (assets/fonts/codicon.ttf) and the interpreter it runs programs with
+    // were both looked up relative to the working directory, so opening the
+    // IDE anywhere but its own folder lost every icon and could not Run.
+    {
+        std::string home = ide_path;
+#ifndef _WIN32
+        char rp[4096];
+        if (realpath(ide_path.c_str(), rp)) home = rp;
+#endif
+        auto cut = home.find_last_of("/\\");
+        home = (cut == std::string::npos) ? std::string(".") : home.substr(0, cut);
+        set_env_default("NYTHON_HOME", home);
+        set_env_default("NYTHON_EXE", get_exe_path());
+    }
     try {
         auto source = SourceCode(ide_path);
         auto reporter = std::make_shared<Reporter>(source);
@@ -247,6 +350,26 @@ static bool launch_ide(const std::string& binary_dir) {
         return true;
     } catch (std::exception& e) {
         std::string msg = std::string("[IDE Error] ") + e.what();
+#ifdef _WIN32
+        MessageBoxA(nullptr, msg.c_str(), "NythonIDE — Runtime Error", MB_OK | MB_ICONERROR);
+#else
+        std::cerr << msg << "\n";
+#endif
+        return false;
+    } catch (std::string& s) {
+        // Nython raises uncaught exceptions as tagged std::string (run_file()
+        // already handles this). Only std::exception was caught here, so any
+        // uncaught error while the IDE started - an ImportError from launching
+        // outside the repository, say - killed the process via std::terminate
+        // with no message at all.
+        std::string msg = s;
+        if (msg.rfind("__exc__:", 0) == 0) {
+            msg = msg.substr(8);
+            auto colon = msg.find(':');
+            if (colon != std::string::npos)
+                msg = msg.substr(0, colon) + ": " + msg.substr(colon + 1);
+        }
+        msg = "[IDE Error] " + msg;
 #ifdef _WIN32
         MessageBoxA(nullptr, msg.c_str(), "NythonIDE — Runtime Error", MB_OK | MB_ICONERROR);
 #else
@@ -503,6 +626,7 @@ void install_vm_builtin_bridge(Runnable* runner) {
 
 
 int main(int argc, char** argv, char** env) {
+    g_argv0 = (argc > 0 && argv[0]) ? argv[0] : "";
     try {
         setlocale(LC_ALL, "");
         nython::ConsoleManager cm; cm.setupConsole();
@@ -532,6 +656,7 @@ int main(int argc, char** argv, char** env) {
                     << "  --vm <file>        Run script via Bytecode VM\n"
                     << "  -d, --disasm       Disassemble file to bytecode listing\n"
                     << "  -p, --profile      Run with the profiler; measured per-function timings\n"
+                    << "      --trace OUT F  Run F, recording every executed statement to OUT (JSON lines)\n"
                     << "  --ide              Launch NythonIDE GUI\n"
                     << "  --console          Force terminal REPL (no GUI, shows all output)\n"
                     << "  --cli, --repl      Same as --console\n"
@@ -587,7 +712,14 @@ int main(int argc, char** argv, char** env) {
                     install_vm_builtin_bridge((Runnable*)vm2.get());
                     lexer2->tokenize();
                     auto ast = parser2->parse();
-                    if (ast) vm2->run(ast);
+                    // run() reports an uncaught exception itself and returns
+                    // RUNTIME_ERROR; that result used to be ignored, so a
+                    // failed program exited 0 on the VM and 1 on the
+                    // interpreter.
+                    if (ast) {
+                        auto res = vm2->run(ast);
+                        if (res == decltype(res)::RUNTIME_ERROR) return 1;
+                    }
                 } catch (exception::SyntaxError& e) {
                     // The VM compiler rejects some constructs the interpreter
                     // accepts. Report it rather than letting the exception
@@ -604,6 +736,11 @@ int main(int argc, char** argv, char** env) {
             }
 
             // ── Disassemble ──────────────────────────────────────────────
+            if (arg1 == "--trace" && argc >= 4) {
+                g_trace_path = argv[2];
+                return run_file(argv[3]);
+            }
+
             if ((arg1 == "--profile" || arg1 == "-p") && argc >= 3) {
                 NythonExecutor::profiling_enabled() = true;
                 return run_file(argv[2]);

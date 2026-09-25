@@ -1,4134 +1,2328 @@
 # ══════════════════════════════════════════════════════════════════════════════
-#  NythonIDE v4  —  responsive editor shell
+#  NythonIDE 5 — a VS Code-standard IDE for Nython
 #
-#  Every coordinate here derives from the LIVE window size (self.W / self.H),
-#  recomputed in _layout() and re-run on every "resize" event.
+#  This file holds the application state, input routing and the frame loop.
+#  The rest of the class lives in ide_core.ny (documents, commands, editing),
+#  ide_ops.ny (find, quick input, run/build, settings, file operations),
+#  ide_paint.ny (theme, layout, drawing) and ide_views.ny (side bar views);
+#  see ide_core.ny's header for the chain. Launched by `nython --ide`.
 #
-#  v3 hardcoded 1600x960. On a 1366x768 display Windows clamped the window while
-#  the layout kept painting at the unclamped size, so most of the UI landed
-#  off-screen and the window looked black. Nothing here uses a fixed size.
-#
-#  Arrangement follows VS Code / Code::Blocks: icon rail, collapsible sidebar,
-#  tabbed editor with gutter + minimap, tabbed bottom panel, status bar.
+#  Set NY_IDE_NO_RUN=1 to import this file without opening the window
+#  (tests and tools/ construct NythonIDE() and drive it directly).
 # ══════════════════════════════════════════════════════════════════════════════
 
-import "ide_editor.ny"
+import "ide_views.ny"
 import "ide_workshop.ny"
-import "ide_icons.ny"
-import "ide_project.ny"
 import "lib/aiagent.ny"
 import "lib/gui_motion.ny"
-import "lib/nyimgui.ny"
 import "lib/ide_toolchain.ny"
 import "lib/ide_commands.ny"
-import "lib/ide_selection.ny"
-
-
-class IDETheme:
-    def __init__(self):
-        self.dark = true
-        self.apply()
-
-    def toggle(self):
-        self.dark = not self.dark
-        self.apply()
-
-    def apply(self):
-        if self.dark:
-            # ── VS Code "Dark+" ──────────────────────────────────────────
-            # These are the published Dark+ workbench values. The previous
-            # palette was a blue-black with a purple accent, which is why the
-            # IDE did not read as an editor.
-            #
-            # A Dark+ palette was written in round 41 — into lib/gui.ny, which
-            # this file does not import. It therefore never appeared in the
-            # shipped IDE. Same class of mistake as editing the wrong IDE file:
-            # the change was real and landed somewhere unused.
-            self.bg          = Color(30, 30, 30, 255)      # #1E1E1E editor
-            self.chrome      = Color(60, 60, 60, 255)      # #3C3C3C title bar
-            self.chrome_hi   = Color(69, 69, 69, 255)      # #454545 raised
-            self.panel       = Color(37, 37, 38, 255)      # #252526 side/panel
-            self.editor_bg   = Color(30, 30, 30, 255)      # #1E1E1E
-            self.gutter_bg   = Color(30, 30, 30, 255)      # gutter matches editor
-            self.minimap_bg  = Color(30, 30, 30, 255)
-            self.status_bg   = Color(0, 122, 204, 255)     # #007ACC status bar
-            self.border      = Color(59, 59, 59, 255)      # #3B3B3B
-            self.border_soft = Color(255, 255, 255, 10)
-            self.text        = Color(212, 212, 212, 255)   # #D4D4D4
-            self.text_dim    = Color(133, 133, 133, 255)   # #858585
-            self.text_faint  = Color(106, 106, 106, 255)   # #6A6A6A
-            self.accent      = Color(0, 122, 204, 255)     # #007ACC focus
-            self.accent_soft = Color(0, 122, 204, 60)
-            self.ok          = Color(137, 209, 133, 255)   # #89D185
-            self.warn        = Color(204, 167, 0, 255)     # #CCA700
-            self.err         = Color(241, 76, 76, 255)     # #F14C4C
-            self.gutter      = Color(133, 133, 133, 255)   # #858585 line numbers
-            self.caret_line  = Color(255, 255, 255, 10)    # current-line wash
-            self.hover       = Color(42, 45, 46, 255)      # #2A2D2E list hover
-            self.overlay     = Color(37, 37, 38, 250)      # menus/popups
-            self.field       = Color(60, 60, 60, 255)      # #3C3C3C inputs
-            self.scrim       = Color(0, 0, 0, 125)
-            # Selection + tabs, referenced by the editor and tab strip.
-            self.selection   = Color(38, 79, 120, 255)     # #264F78
-            self.tab_active  = Color(30, 30, 30, 255)      # #1E1E1E
-            self.tab_inactive= Color(45, 45, 45, 255)      # #2D2D2D
-            self.activitybar = Color(51, 51, 51, 255)      # #333333
-        else:
-            self.bg          = Color(243, 244, 248, 255)
-            self.chrome      = Color(235, 237, 243, 255)
-            self.chrome_hi   = Color(246, 247, 251, 255)
-            self.panel       = Color(238, 240, 246, 255)
-            self.editor_bg   = Color(252, 252, 254, 255)
-            self.gutter_bg   = Color(246, 247, 251, 255)
-            self.minimap_bg  = Color(244, 245, 250, 255)
-            self.status_bg   = Color(230, 232, 240, 255)
-            self.border      = Color(0, 0, 0, 28)
-            self.border_soft = Color(0, 0, 0, 14)
-            self.text        = Color(32, 36, 52, 255)
-            self.text_dim    = Color(88, 95, 118, 255)
-            self.text_faint  = Color(134, 141, 163, 255)
-            self.accent      = Color(74, 84, 214, 255)
-            self.accent_soft = Color(74, 84, 214, 38)
-            self.ok          = Color(30, 150, 92, 255)
-            self.warn        = Color(184, 128, 20, 255)
-            self.err         = Color(198, 48, 58, 255)
-            self.gutter      = Color(150, 157, 178, 255)
-            self.caret_line  = Color(0, 0, 0, 10)
-            self.hover       = Color(0, 0, 0, 12)
-            self.overlay     = Color(255, 255, 255, 253)
-            self.field       = Color(0, 0, 0, 10)
-            self.scrim       = Color(0, 0, 0, 70)
 
 
 def hit(rx, ry, rw, rh, px, py):
     return px >= rx and px < rx + rw and py >= ry and py < ry + rh
 
 
-class RailItem:
-    def __init__(self, key, glyph, tip):
-        self.key = key
-        self.glyph = glyph
-        self.tip = tip
-        self.x = 0
-        self.y = 0
-        self.w = 0
-        self.h = 0
-        self.hovered = false
-
-
-class EdTab:
-    def __init__(self, title):
-        self.title = title
-        self.path = ""
-        self.dirty = false
-        self.x = 0
-        self.w = 0
-
-
-class NythonIDE:
+class NythonIDE(IDEViews):
     def __init__(self):
         self.th = IDETheme()
-
-        # Size the window to the ACTUAL display, never larger.
+        self.session_id = time_ms() % 100000000
+        # ── window ────────────────────────────────────────────────────────────
         var want_w = 1600
         var want_h = 960
         var disp = gui_get_display_size()
-        if disp != none:
-            if len(disp) >= 2:
-                var dw = disp[0]
-                var dh = disp[1]
-                if dw > 0 and dh > 0:
-                    if want_w > dw - 40:
-                        want_w = dw - 40
-                    if want_h > dh - 90:
-                        want_h = dh - 90
+        if disp != none and len(disp) >= 2:
+            if disp[0] > 0 and want_w > disp[0] - 40:
+                want_w = disp[0] - 40
+            if disp[1] > 0 and want_h > disp[1] - 90:
+                want_h = disp[1] - 90
         if want_w < 900:
             want_w = 900
         if want_h < 560:
             want_h = 560
-
-        self.win = Window(want_w, want_h, "NythonIDE v4")
+        self.win = Window(want_w, want_h, "NythonIDE")
         self.win.resizable = true
         self.W = want_w
         self.H = want_h
-
-        # High-DPI. Every metric and font size below is a design-pixel value.
-        # Nothing queried the display's content scale, so on a 4K or Retina
-        # panel the whole interface rendered at roughly half size with soft
-        # text. At scale 1.0 every number is identical to before, so a standard
-        # display is unaffected.
         self.dpi = gui_display_scale()
         if self.dpi <= 0.0 or self.dpi > 8.0:
             self.dpi = 1.0
-
-        self.RAIL_W     = self.dp(52)
-        self.SIDEBAR_W  = self.dp(258)
-        self.MENU_H     = self.dp(30)
-        self.TOOLBAR_H  = self.dp(40)
-        self.TABBAR_H   = self.dp(36)
-        self.STATUS_H   = self.dp(26)
-        self.PANELTAB_H = self.dp(32)
-        self.MINIMAP_W  = self.dp(92)
-        self.GUTTER_W   = self.dp(56)
-        self.LINE_H     = self.dp(18)
-
-        # Motion. Nothing in the UI eased: toasts appeared and vanished at full
-        # opacity, and panes snapped between open and closed in a single frame.
-        # Linear or instant transitions are the clearest "not a real app" tell,
-        # because nothing physical moves that way.
-        self.ease = Ease()
-        self.fuzzy = Fuzzy()
-        # Immediate-mode context, used by the panel tab strip. Retained widgets
-        # continue to work alongside it; the two coexist by flushing the IM draw
-        # list through the same renderer.
-        self.ui = NyImGui()
-        self.mouse_down = false
-        self.sidebar_anim = 1.0      # 0 = fully collapsed, 1 = fully open
-        self.panel_anim   = 1.0
-        self.ANIM_MS      = 160
-
-        self.sidebar_open = true
-        self.panel_open   = true
-        self.panel_ratio  = 0.30
-        self.minimap_on   = true
-
-        self.f_ui      = Font("sans-serif", self.dp(12), false, false)
-        self.f_ui_bold = Font("sans-serif", self.dp(12), true,  false)
-        self.f_small   = Font("sans-serif", self.dp(11), false, false)
-        self.f_code    = Font("monospace",  self.dp(13), false, false)
-        self.f_icon    = Font("sans-serif", self.dp(15), true,  false)
-
-        self.menus = ["File", "Edit", "View", "Search", "Build", "Debug", "Tools", "Help"]
-        self.menu_count = 8
-        self.menu_items = {
-            "File":   ["New File\tCtrl+N", "New Project...\tCtrl+Shift+N", "-",
-                       "Open File...\tCtrl+O", "Open Folder...\tCtrl+K", "Open Project...", "-",
-                       "Save\tCtrl+S", "Save All", "-", "Recent Files", "Close Folder", "Exit\tAlt+F4"],
-            "Edit":   ["Undo\tCtrl+Z", "Redo\tCtrl+Y", "-", "Cut\tCtrl+X", "Copy\tCtrl+C", "Paste\tCtrl+V", "-", "Toggle Comment\tCtrl+/", "Duplicate Line\tCtrl+D", "Delete Line\tCtrl+Shift+K", "Move Line Up\tAlt+Up", "Move Line Down\tAlt+Down"],
-            "View":   ["Toggle Sidebar\tCtrl+B", "Toggle Panel\tCtrl+J", "Toggle Minimap", "Toggle Theme\tCtrl+Shift+T", "-", "Zoom In\tCtrl++", "Zoom Out\tCtrl+-", "Reset Zoom\tCtrl+0", "-", "Command Palette\tCtrl+P"],
-            "Search": ["Find\tCtrl+F", "Replace\tCtrl+H", "Go to Line\tCtrl+G", "Find in Files"],
-            "Build":  ["Run\tF5", "Run on VM", "Build", "Tokenize", "Show AST", "Disassemble"],
-            "Debug":  ["Start Debugging\tF5", "Step Over\tF10", "Step Into\tF11", "-",
-                       "Toggle Breakpoint\tF9", "Clear All Breakpoints", "Show Breakpoints"],
-            "Tools":  ["Analyse Buffer", "Lang Workshop", "Terminal", "-", "Save Settings", "Reload Settings", "Add Highlight Token...", "Reload Highlight Rules", "Settings"],
-            "Help":   ["Documentation", "Keyboard Shortcuts", "About Nython"]
-        }
-        self.menu_open = -1
-        self.menu_hover = -1
-        self.menu_rects = []
-        self.menu_item_rects = []
-        self.menu_item_hover = -1
-
-        self.rail = [RailItem("explorer", "E", "Explorer"),
-                     RailItem("search",   "S", "Search"),
-                     RailItem("git",      "G", "Source Control"),
-                     RailItem("run",      "R", "Run and Debug"),
-                     RailItem("ext",      "X", "Extensions"),
-                     RailItem("outline",  "O", "Outline"),
-                     RailItem("ai",       "A", "AI Assistant")]
-        self.rail_count = 7
-        self.active_view = "explorer"
-
-        self.run_modes = ["Run", "VM", "Debug", "Tokenize", "AST", "Disasm"]
-        # Index 0 ("Run") is deliberately NOT drawn as a chip: the green ▶ button
-        # already is Run, and drawing both put two Run controls side by side.
-        # The entry stays in the list because mode indices are hardcoded
-        # throughout (0=Run, 1=VM, 3=Tokenize, 4=AST, 5=Disasm) and renumbering
-        # them here would silently rewire every menu command.
-        self.first_chip = 1
-        self.run_mode_count = 6
-        self.active_mode = 0
-        self.mode_rects = []
-
-        self.buffers = []
-        self.tabs = []
-        self.tab_count = 0
-        self.active_tab = 0
-        self._seed_files()
-
-        self.editor = RichEditor(0, 0, 100, 100)
-        # The IDE paints the gutter and the code itself, so the editor's rect
-        # starts AFTER the gutter. RichEditor was still subtracting its own
-        # gutter_w and using line_h 20 against the IDE's 18, which put every
-        # click roughly seven columns and one row away from where it looked.
-        self.editor.gutter_w = 0
-        self.editor.line_h = self.LINE_H
-        var cw = self.f_code.width("M")
-        self.editor.char_w = cw
-        self.editor.focused = true
-        self.editor.set_buffer(self.buffers[0])
-        self.console = OutputConsole(0, 0, 100, 100)
-        self.console.write("NythonIDE v4 ready", "ok")
-        self.console.write("Workspace: /project  |  3 files loaded", "info")
-
-        self.workshop = LangWorkshopPanel(0, 0, 100, 100)
-
-        self.panel_tabs = ["Output", "Problems", "Terminal", "Debug", "Tokens", "Workshop"]
-        self.panel_tab_count = 6
-        self.active_panel = 0
-        self.panel_rects = []
-
-        self.problems = [{"sev": "err",  "msg": "undefined name 'foo'",         "file": "main.ny",  "line": 12},
-                         {"sev": "warn", "msg": "unused variable 'tmp'",        "file": "main.ny",  "line": 27},
-                         {"sev": "info", "msg": "consider using a for-in loop", "file": "utils.ny", "line": 8}]
-        self.problem_count = 3
-        self.problem_rows = []
-
-        self.toolchain = Toolchain()
-        self.term_lines = ["Nython 0.2.1 interactive shell", "type ':help' (IDE), '>expr' (language) or '@agents' (AI)", ""]
-        self.term_count = 3
-        self.term_input = ""
-        self.term_hist_stash = ""
-
-        self.tree = [{"depth": 0, "name": "project",   "dir": true,  "open": true},
-                     {"depth": 1, "name": "src",       "dir": true,  "open": true},
-                     {"depth": 2, "name": "main.ny",   "dir": false, "open": false},
-                     {"depth": 2, "name": "utils.ny",  "dir": false, "open": false},
-                     {"depth": 2, "name": "model.ny",  "dir": false, "open": false},
-                     {"depth": 1, "name": "lib",       "dir": true,  "open": false},
-                     {"depth": 1, "name": "README.md", "dir": false, "open": false}]
-        self.tree_count = 7
-        self.tree_sel = 2
-        self.tree_hover = -1
-
-        self.palette_open = false
-        self.palette_query = ""
-        self.palette_sel = 0
-        self.palette_all = ["Run: Execute current file",
-                            "Run: Tokenize current file",
-                            "Run: Show AST",
-                            "View: Toggle Sidebar",
-                            "View: Toggle Panel",
-                            "View: Toggle Minimap",
-                            "View: Toggle Theme",
-                            "File: New File",
-                            "File: Save",
-                            "Tools: Lang Workshop",
-                            "Help: Keyboard Shortcuts"]
-        self.palette_hits = []
-        self.palette_hit_count = 0
-
-        self.mx = 0
-        self.my = 0
-        self.dragging_split = false
-        self.dragging_sidebar = false
-        self.status_msg = "Ready"
-        self.frames = 0
-        self._hl_cache = {}
-        self._hl_cache_n = 0
-        self._code_handle = none
-        # Repaint only when something changed. The IDE previously redrew its
-        # entire UI on every idle frame — ~178 interpreted draw_text calls a
-        # frame for pixels that were already correct.
-        self._dirty = true
-        self._skipped = 0
+        # ── metrics (VS Code's) ───────────────────────────────────────────────
+        self.TITLE_H = self.dp(30)
+        self.ACT_W = self.dp(48)
+        self.SIDEBAR_W = self.dp(270)
+        self.SIDE_HEAD = self.dp(35)
+        self.TAB_H = self.dp(35)
+        self.CRUMB_H = self.dp(22)
+        self.STATUS_H = self.dp(22)
+        self.PANEL_HEAD = self.dp(35)
+        self.MINIMAP_W = self.dp(80)
+        self.ROW_H = self.dp(22)
+        self.font_size = 13
+        self.LINE_H = int(self.dp(13) * 1.4)
+        # ── fonts ─────────────────────────────────────────────────────────────
+        self.f_ui = Font("sans-serif", self.dp(13), false, false)
+        self.f_ui_bold = Font("sans-serif", self.dp(13), true, false)
+        self.f_small = Font("sans-serif", self.dp(11), false, false)
+        self.f_small_bold = Font("sans-serif", self.dp(11), true, false)
+        self.f_tiny = Font("sans-serif", self.dp(10), false, false)
+        self.f_tab = Font("sans-serif", self.dp(11), false, false)
+        self.f_code = Font("monospace", self.dp(13), false, false)
+        self.f_mono_small = Font("monospace", self.dp(12), false, false)
+        self.f_title = Font("sans-serif", self.dp(34), false, false)
+        self.f_h2 = Font("sans-serif", self.dp(17), false, false)
+        self.ui_h = self.dp(17)
+        self.small_h = self.dp(15)
+        self.code_h = self.dp(17)
+        self.tab_h = self.dp(15)
+        self.code_small_h = self.dp(16)
+        self.char_w = 8
+        self.want_col = -1
+        # ── model objects ─────────────────────────────────────────────────────
         self.icons = Icons()
+        self.th.sym_method = Color(180, 130, 240, 255)
+        self.scratch = []
+        var si = 0
+        while si < 64:
+            self.scratch.append(Color(0, 0, 0, 0))
+            si = si + 1
+        self.scratch_i = 0
+        self.num_cache = []
+        var ni = 0
+        while ni < 1000:
+            self.num_cache.append(str(ni))
+            ni = ni + 1
+        self.line_nums = [""]
+        self.hits = HitMap()
+        self.reg = CommandRegistry()
+        self.frecency = Frecency(30 * 60 * 1000)
+        self.nav = NavHistory()
+        self.qi = QuickInput()
+        self.notes = Notifications()
+        self.ease = Ease()
+        self.hl = SyntaxHighlighter()
+        self.selmodel = SelectionModel()
         self.ws = Workspace()
-        # open_folder(getcwd()) alone: if the working directory could not be
-        # opened the explorer stayed permanently empty while the output still
-        # claimed files were loaded, and the only clue was an error string
-        # overflowing the sidebar. Try a chain of candidates and keep whichever
-        # works, so the tree is never empty just because the launch directory
-        # was odd.
-        self._open_initial_workspace()
-        self.tree_scroll = 0
-        # Modal path prompt. There is no native file chooser available, so
-        # New Project / Open Project / Open Folder ask for a path here.
-        self.dialog_open = false
-        self.dialog_title = ""
-        self.dialog_hint = ""
-        self.dialog_input = ""
-        self.dialog_action = ""
-        # Find / Replace (Ctrl+F, Ctrl+H) and Go to Line (Ctrl+G)
-        self.find_open = false
-        self.find_query = ""
-        self.find_replace = ""
-        self.find_field = 0          # 0 = find, 1 = replace
-        self.find_replace_mode = false
-        self.find_hits = []
-        self.find_hit_count = 0
-        self.find_index = 0
-        # Breakpoints, keyed "tabtitle:line"
-        self.breaks = {}
-        self.break_count = 0
-        # Structured build log for the Problems panel
-        self.build_ok = true
-        self.introspect = []
-        self.introspect_n = 0
-        self.introspect_kind = ""
-        # AI assistant: analyses the active buffer with lib/aiagent.ny.
+        self.git = GitRepo()
+        self.linediff = LineDiff()
+        self.dbg = DebugSession()
         self.ai = CodeAnalyzer()
-        self.ai_issues = []
-        self.ai_n = 0
-        self.ai_file = ""
-        # Terminal command line: :cmd / >expr / @agent, see lib/ide_commands.ny.
+        self.toolchain = Toolchain()
         self.cmdline = CommandLine(self.toolchain, self.ai)
-        # Workspace search
-        self.search_query = ""
-        self.search_hits = []
-        self.search_n = 0
-        self.search_files = 0
-        self.search_rows = []
-        self.search_focus = false
-        self.caret_on = true
-        self.caret_t = 0
-        self.clipboard = ""
-        self.debug_line = -1
-        self.status_segs = []
-        self.status_hover = -1
-        self.BREADCRUMB_H = 24
-        self.cursor_shape = "arrow"
-        self.tooltip = ""
-        self.tooltip_x = 0
-        self.tooltip_y = 0
-        self.toasts = []
-        self.toast_n = 0
-        self.show_indent_guides = true
+        self.workshop = LangWorkshopPanel(0, 0, 100, 100)
+        self.ctxk = {}
+        # ── documents ─────────────────────────────────────────────────────────
+        self.docs = [Doc("welcome", "Welcome", "", none)]
+        self.active = 0
+        self.untitled_seq = 0
+        self.closed_stack = []
+        self.pending_close = []
+        self.pending_save_as = none
+        # ── focus and UI state ────────────────────────────────────────────────
+        self.focus = "editor"
+        self.focus_before_qi = "editor"
+        self.focus_before_modal = "editor"
+        self.views = ["explorer", "search", "scm", "debug", "ext", "outline", "ai"]
+        self.view_icons = ["files", "search", "source-control", "debug-alt", "extensions", "symbol-structure", "sparkle"]
+        self.view_tips = ["Explorer (Ctrl+Shift+E)", "Search (Ctrl+Shift+F)", "Source Control (Ctrl+Shift+G)",
+                          "Run and Debug (Ctrl+Shift+D)", "Extensions (Ctrl+Shift+X)", "Outline", "AI Assistant"]
+        self.view_titles = ["EXPLORER", "SEARCH", "SOURCE CONTROL", "RUN AND DEBUG", "EXTENSIONS", "OUTLINE", "AI ASSISTANT"]
+        self.active_view = "explorer"
+        self.panel_keys = ["problems", "output", "debug", "terminal", "inspector", "workshop"]
+        self.panel_labels = ["PROBLEMS", "OUTPUT", "DEBUG CONSOLE", "TERMINAL", "INSPECTOR", "LANGUAGE WORKSHOP"]
+        self.active_panel = "problems"
+        self.sidebar_open = true
+        self.panel_open = true
+        self.panel_max = false
+        self.panel_ratio = 0.28
+        self.sidebar_anim = 1.0
+        self.panel_anim = 1.0
+        self.minimap_on = true
         self.show_whitespace = false
-        # Right-click context menu
+        self.show_indent_guides = true
+        self.tab_size = 4
+        self.auto_save = "off"
+        self.loading_settings = false
+        self.menu_open = -1
+        self.menu_sel = -1
+        self.menu_x = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         self.ctx_open = false
+        self.ctx_items = []
         self.ctx_x = 0
         self.ctx_y = 0
-        self.ctx_items = []
-        self.ctx_hover = -1
-        self.ctx_target = ""
-        self.ctx_arg = -1
-        # Autocomplete (Ctrl+Space)
+        self.ctx_sel = -1
+        self.modal_open = false
+        self.modal_title = ""
+        self.modal_msg = ""
+        self.modal_buttons = []
+        self.modal_sel = 0
+        self.notif_center = false
+        self.sections_closed = {}
+        self.cc_label = "NythonIDE"
+        self.status_msg = ""
+        self.status_t = 0
+        self.last_status = ""
+        self.tip_text = ""
+        self.tip_t0 = 0
+        self.tip_x = 0
+        self.tip_y = 0
+        self.tip_hit_cmd = ""
+        self.tip_hit_arg = ""
+        self.hover_info = ""
+        self.hover_x = 0
+        self.hover_y = 0
+        self.hover_t0 = 0
+        self.hover_done = true
+        self.mx = 0
+        self.my = 0
+        self.mouse_down = false
+        self.dragging = ""
+        self.drag_off = 0
+        self.drag_from = -1
+        self.drag_x0 = 0
+        self.overlay_up = false
+        self.drawing_overlay = false
+        self.cursor_shape = "arrow"
+        self.caret_on = true
+        self.caret_t = 0
+        self.frames = 0
+        self._dirty = true
+        self._skipped = 0
+        self._title_dirty = true
+        self._code_handle = none
+        self._hl_cache = {}
+        self._hl_cache_n = 0
+        self.clipboard = ""
+        self.clip_line_mode = false
+        self.tab_scroll_px = 0
+        self.actions_w = 0
+        self.tabs_total_w = 0
+        self.gutter_lines = -1
+        self.GUTTER_W = 60
+        self.GLYPH_W = 18
+        self.num_w = 24
+        self.text_x0 = 0
+        self.vs_thumb_y = 0
+        self.vs_thumb_h = 0
+        self.mm_first = 0
+        self.mm_doc = none
+        self.mm_state = -1
+        self.mm_count = -1
+        self.mm_model = []
+        self.crumb_doc = none
+        self.crumb_sym_row = -2
+        self.crumb_path = ""
+        self.crumb_title = ""
+        self.crumb_parts = []
+        self.crumb_kinds = []
+        self.crumb_paths = []
+        self.encl_state = -1
+        self.encl_row_in = -1
+        self.encl_doc = none
+        self.encl_row_out = -1
+        self.bm_state = -1
+        self.bm_row = -1
+        self.bm_col = -1
+        self.bm_doc = none
+        self.bm = none
+        self._status_refresh_reset()
+        # ── find ──────────────────────────────────────────────────────────────
+        self.find_open = false
+        self.find_replace_mode = false
+        self.find_field = 0
+        self.find_query = ""
+        self.find_replace = ""
+        self.find_case = false
+        self.find_word = false
+        self.find_regex = false
+        self.find_hits = []
+        self.find_n = 0
+        self.find_index = 0
+        self.find_error = ""
+        self.find_info = "No results"
+        # ── search view ───────────────────────────────────────────────────────
+        self.search_query = ""
+        self.search_replace = ""
+        self.search_replace_open = false
+        self.search_field = 0
+        self.search_case = false
+        self.search_word = false
+        self.search_regex = false
+        self.search_results = []
+        self.search_summary = ""
+        self.search_total = 0
+        self.search_collapsed = {}
+        self.search_rows = []
+        self.search_rows_src = none
+        self.search_rows_cn = -1
+        self.search_due = 0
+        # ── quick input / pickers ─────────────────────────────────────────────
+        self.path_dirs_only = false
+        self.ws_files = none
+        self.ws_files_root = ""
+        # ── autocomplete ──────────────────────────────────────────────────────
         self.ac_open = false
         self.ac_items = []
+        self.ac_kinds = []
         self.ac_n = 0
         self.ac_sel = 0
+        self.ac_top = 0
         self.ac_prefix = ""
-        # Text selection: anchor stays put, the buffer cursor is the moving head.
-        self.sel_on = false
-        self.sel_row = 0
-        self.sel_col = 0
-        self.dragging_sel = false
-        # Multi-cursor (lib/ide_selection.ny). The primary caret stays
-        # buf.cursor_row/cursor_col exactly as before; selmodel.sels[0] is
-        # only a dedup mirror kept in sync right before use, and
-        # selmodel.sels[1:selmodel.count] are the actual extra carets.
-        self.selmodel = SelectionModel()
-        self.outline = []
-        self.outline_n = 0
-        self.outline_sel = -1
-        self.ai_rows = []
-        self.font_size = 13
-        self.dragging_mm = false
+        # ── explorer ──────────────────────────────────────────────────────────
+        self.tree_scroll = 0
+        self.tree_sel = 0
+        # ── panel content ─────────────────────────────────────────────────────
         self.panel_scroll = 0
+        self.out_lines = []
+        self.out_kinds = []
+        self.out_follow = true
+        self.term_lines = ["Nython terminal - shell commands run in the workspace folder.",
+                           "':help' lists IDE commands, '>expr' evaluates Nython, '@explain' / '@fix' ask the analyser."]
+        self.term_kinds = ["dim", "dim"]
+        self.term_follow = true
+        self.term_input = ""
+        self.term_cwd = getcwd()
+        self.term_prompt = "$"
+        self.term_proc = none
+        self.term_seq = 0
+        self.dbgcon_lines = []
+        self.dbgcon_kinds = []
+        self.dbgcon_follow = true
+        self.dbgcon_input = ""
+        self.inspect_lines = []
+        self.inspect_kind = ""
+        self.inspect_scroll = 0
+        # ── problems ──────────────────────────────────────────────────────────
+        self.problems = []
+        self.n_errors = 0
+        self.n_warnings = 0
+        self.problem_cursor = -1
+        self.prob_rows = []
+        self.prob_rows_src = none
+        self.prob_rows_collapsed_n = -1
+        self.prob_collapsed = {}
+        self.prob_by_path = {}
+        self.prob_by_path_src = none
+        self._status_cache_key = ""
+        self.check_due = 0
+        # ── run / build ───────────────────────────────────────────────────────
+        self.run_seq = 0
+        self.job = none
+        self.job_running = false
+        self.job_mode = ""
+        self.job_path = ""
+        self.job_doc = none
+        self.job_seq = 0
+        self.job_t0 = 0
+        self.job_killed = false
+        self.job_in_profile = false
+        self.job_text = ""
+        self.job_text_n = 0
+        self.last_run_ok = true
+        # ── debugger ──────────────────────────────────────────────────────────
+        self.breaks = {}
+        self.break_list = []
+        self.dbg_line_row = -1
+        self.dbg_line_path = ""
+        self.dbg_doc = none
+        self.dbg_run_path = ""
+        self.dbg_trace = ""
+        self.dbg_breaks = {}
+        self.dbg_hits = []
+        self.dbg_frame = -1
+        self.dbg_vars = []
+        self.dbg_vars_pos = -2
+        self.dbg_vars_frame = -2
+        self.dbg_stack = []
+        self.dbg_stack_pos = -2
+        self.dbg_recording = false
+        self.watches = []
+        # ── source control ────────────────────────────────────────────────────
+        self.scm_stale = true
+        self.scm_branch = ""
+        self.scm_count = 0
+        self.scm_by_path = {}
+        self.scm_dirs = {}
+        self.scm_msg = ""
+        self.scm_diff_due = 0
+        self.scm_poll_t = 0
+        # ── extensions / outline / AI ─────────────────────────────────────────
+        self.cat = none
+        self.ext_query = ""
+        self.ext_filter = []
+        self.ext_filter_q = ""
+        self.ext_open_path = ""
+        self.outline_doc = none
+        self.outline_state = -1
+        self.outline_syms = []
+        self.ai_issues = []
+        self.ai_n = 0
+        self.ai_key = ""
+        # ── recent files ──────────────────────────────────────────────────────
         self.recent = []
-        self.recent_n = 0
-        # Set this to false to repaint every frame, the way the IDE behaved
-        # before dirty-flag repainting was added. It costs CPU but removes any
-        # dependence on the platform delivering expose events. Change this first
-        # if the window ever appears blank or stops updating.
-        self.repaint_on_change_only = true
-
-        self._load_hl_rules(false)
-        self._load_settings()
+        self.recent_folders = []
+        self.autosave_due = 0
+        # ── start ─────────────────────────────────────────────────────────────
+        self._register_commands()
+        self._load_state()
+        self._open_initial_workspace()
         self._layout()
-
-    def _seed_files(self):
-        var main_src = "# main.ny\nimport \"lib/gui.ny\"\n\nclass App:\n    def __init__(self, title):\n        self.title = title\n        self.count = 0\n\n    def tick(self):\n        self.count = self.count + 1\n        return self.count\n\nvar app = App(\"Nython\")\nprint app.tick()\n"
-        var utils_src = "# utils.ny\n\ndef clamp(v, lo, hi):\n    if v < lo:\n        return lo\n    if v > hi:\n        return hi\n    return v\n\ndef lerp(a, b, t):\n    return a + (b - a) * t\n"
-        var model_src = "# model.ny\nimport \"lib/nytorch.ny\"\n\nvar net = Sequential()\nnet.add(Dense(128, \"relu\"))\nnet.add(Dense(10, \"softmax\"))\nprint \"model ready\"\n"
-        self.buffers = [EditorBuffer("main.ny", main_src),
-                        EditorBuffer("utils.ny", utils_src),
-                        EditorBuffer("model.ny", model_src)]
-        self.tabs = [EdTab("main.ny"), EdTab("utils.ny"), EdTab("model.ny")]
-        self.tab_count = 3
-
-    # ── layout ───────────────────────────────────────────────────────────────
-    # Step both pane animations one frame. Returns true if anything moved.
-    #
-    # Exponential approach: each frame closes a fixed FRACTION of the remaining
-    # distance, so the pane moves fast at first and decelerates into place. That
-    # is an ease-out by construction, and unlike a fixed-size step it cannot
-    # overshoot or take a different number of frames depending on distance.
-    def _advance_panes(self):
-        var moved = false
-        var k = 0.28          # fraction of the remaining gap closed per frame
-        var snap = 0.004      # close enough to call it arrived
-
-        var s_target = 0.0
-        if self.sidebar_open:
-            s_target = 1.0
-        var ds = s_target - self.sidebar_anim
-        if ds > snap or ds < 0.0 - snap:
-            self.sidebar_anim = self.sidebar_anim + ds * k
-            moved = true
-        elif self.sidebar_anim != s_target:
-            self.sidebar_anim = s_target
-            moved = true
-
-        var p_target = 0.0
-        if self.panel_open:
-            p_target = 1.0
-        var dp = p_target - self.panel_anim
-        if dp > snap or dp < 0.0 - snap:
-            self.panel_anim = self.panel_anim + dp * k
-            moved = true
-        elif self.panel_anim != p_target:
-            self.panel_anim = p_target
-            moved = true
-
-        return moved
-
-    def _layout(self):
-        self._dirty = true
-        var W = self.W
-        var H = self.H
-
-        self.toolbar_y = self.MENU_H
-        self.content_y = self.MENU_H + self.TOOLBAR_H
-        self.status_y  = H - self.STATUS_H
-        var ch = self.status_y - self.content_y
-        if ch < 120:
-            ch = 120
-        self.content_h = ch
-
-        var i = 0
-        var ry = self.content_y + 8
-        while i < self.rail_count:
-            var b = self.rail[i]
-            b.x = 7
-            b.y = ry
-            b.w = self.RAIL_W - 14
-            b.h = 36
-            ry = ry + 42
-            i = i + 1
-
-        # Width is scaled by sidebar_anim (0..1) rather than switching between 0
-        # and full width in one frame, so collapsing the sidebar slides instead
-        # of teleporting. At rest anim is exactly 0 or 1, so the resting layout
-        # is unchanged.
-        self.sidebar_x = self.RAIL_W
-        var sw = self.SIDEBAR_W
-        if sw > W - self.RAIL_W - 320:
-            sw = W - self.RAIL_W - 320
-        if sw < 0:
-            sw = 0
-        self.sidebar_w = int(float(sw) * self.sidebar_anim)
-
-        self.col_x = self.RAIL_W + self.sidebar_w
-        self.col_w = W - self.col_x
-        if self.col_w < 200:
-            self.col_w = 200
-
-        self.panel_h = 0
-        var ph = int(ch * self.panel_ratio)
-        if ph < 110:
-            ph = 110
-        if ph > ch - 150:
-            ph = ch - 150
-        if ph < 0:
-            ph = 0
-        self.panel_h = int(float(ph) * self.panel_anim)
-        self.panel_y = self.content_y + ch - self.panel_h
-
-        self.tabbar_y = self.content_y
-        self.crumb_y = self.content_y + self.TABBAR_H
-        self.ed_y = self.crumb_y + self.BREADCRUMB_H
-        self.ed_h = self.panel_y - self.ed_y
-        if self.ed_h < 60:
-            self.ed_h = 60
-
-        self.mm_w = 0
-        if self.minimap_on:
-            if self.col_w > 520:
-                self.mm_w = self.MINIMAP_W
-        self.ed_w = self.col_w - self.mm_w
-
-        self.editor.set_pos(self.col_x + self.GUTTER_W, self.ed_y)
-        self.editor.set_size(self.ed_w - self.GUTTER_W, self.ed_h)
-        self.console.set_pos(self.col_x + 10, self.panel_y + self.PANELTAB_H + 6)
-        self.console.set_size(self.col_w - 20, self.panel_h - self.PANELTAB_H - 12)
-        self.workshop.set_pos(self.col_x + 10, self.panel_y + self.PANELTAB_H + 6)
-        self.workshop.set_size(self.col_w - 20, self.panel_h - self.PANELTAB_H - 12)
-
-        var t = 0
-        var tx = self.col_x + 4
-        while t < self.tab_count:
-            var tab = self.tabs[t]
-            var mw = self.f_ui.width(tab.title)
-            var tw = mw + 48
-            if tw < 112:
-                tw = 112
-            tab.x = tx
-            tab.w = tw
-            tx = tx + tw + 2
-            t = t + 1
-
-    def on_resize(self, w, h):
-        self.W = w
-        self.H = h
-        self._dirty = true
-        self._layout()
-        # Was: status_msg = "Resized W x H". Window size is already shown at the
-        # right of the status bar, so this only pushed real messages out of the
-        # way with debug noise on every resize event.
-
-    # ── draw ─────────────────────────────────────────────────────────────────
-    def draw(self, r):
-        self.frames = self.frames + 1
         self.f_code.ensure_loaded()
-        self._code_handle = self.f_code._handle
-        r.fill_xywh(0, 0, self.W, self.H, self.th.bg)
-        self._draw_menubar(r)
-        self._draw_toolbar(r)
-        self._draw_rail(r)
-        if self.sidebar_open:
-            if self.sidebar_w > 0:
-                self._draw_sidebar(r)
-        self._draw_tabbar(r)
-        self._draw_breadcrumbs(r)
-        self._draw_editor(r)
-        if self.mm_w > 0:
-            self._draw_minimap(r)
-        if self.find_open:
-            self._draw_find(r)
-        if self.panel_open:
-            if self.panel_h > 0:
-                self._draw_panel(r)
-        self._draw_status(r)
-        if self.menu_open >= 0:
-            self._draw_dropdown(r)
-        if self.palette_open:
-            self._draw_palette(r)
-        if self.dialog_open:
-            self._draw_dialog(r)
-        if self.ac_open:
-            self._draw_ac(r)
-        if self.ctx_open:
-            self._draw_ctx(r)
-        self._draw_toasts(r)
-        self._draw_tooltip(r)
+        self.char_w = self.f_code.width("M")
+        self._gutter_calc()
 
-    def _draw_menubar(self, r):
-        var th = self.th
-        r.draw_gradient(Rect(0, 0, self.W, self.MENU_H), th.chrome_hi, th.chrome, true)
-        r.draw_line(0, self.MENU_H, self.W, self.MENU_H, th.border_soft, 1)
-        r.fill_circle(17, 15, 5, th.accent)
-        self.menu_rects = []
-        var x = 34
-        var i = 0
-        while i < self.menu_count:
-            var name = self.menus[i]
-            var m = self.f_ui.width(name)
-            var w = m + 20
-            if self.menu_open == i or self.menu_hover == i:
-                r.fill_round_xywh(x, 4, w, self.MENU_H - 8, th.hover, 4)
-            var col = th.text_dim
-            if self.menu_open == i:
-                col = th.text
-            r.draw_text(name, x + 10, 8, self.f_ui, col)
-            self.menu_rects.append({"x": x, "w": w, "i": i})
-            x = x + w
-            i = i + 1
-        var label = "NythonIDE  -  /project"
-        var lm = self.f_small.width(label)
-        r.draw_text(label, int(self.W / 2 - lm / 2), 9, self.f_small, th.text_faint)
+    def _status_refresh_reset(self):
+        self.st_k_row = -9
+        self.st_k_col = -9
+        self.st_k_sel = -9
+        self.st_k_err = -9
+        self.st_k_warn = -9
+        self.st_k_doc = none
+        self.st_k_tab = -9
+        self.st_k_branch = "?"
+        self.st_k_dirtyrepo = -9
+        self.st_k_dbg = -9
+        self.st_k_job = false
+        self.st_k_eol = ""
+        self.st_k_bom = false
+        self.st_k_lang = ""
+        self.st_errors = "0"
+        self.st_warnings = "0"
+        self.st_branch = ""
+        self.st_job = ""
+        self.st_debug = ""
+        self.st_pos = ""
+        self.st_indent = ""
+        self.st_enc = ""
+        self.st_eol = ""
+        self.st_lang = ""
 
-    def _draw_dropdown(self, r):
-        var th = self.th
-        var mx = -1
-        var i = 0
-        while i < len(self.menu_rects):
-            var mr = self.menu_rects[i]
-            if mr["i"] == self.menu_open:
-                mx = mr["x"]
-            i = i + 1
-        if mx < 0:
-            return
-        var items = self.menu_items[self.menus[self.menu_open]]
-        var n = len(items)
-        var iw = 224
-        var ih = 10
-        var k = 0
-        while k < n:
-            if items[k] == "-":
-                ih = ih + 9
-            else:
-                ih = ih + 26
-            k = k + 1
-        if mx + iw > self.W - 8:
-            mx = self.W - iw - 8
-        r.draw_shadow(Rect(mx, self.MENU_H, iw, ih), 16, 0, 6, Color(0, 0, 0, 130))
-        r.fill_round_xywh(mx, self.MENU_H, iw, ih, th.overlay, 8)
-        r.draw_rounded_rect(Rect(mx, self.MENU_H, iw, ih), th.border, 8, 1)
-        var y = self.MENU_H + 5
-        self.menu_item_rects = []
-        k = 0
-        while k < n:
-            var it = items[k]
-            if it == "-":
-                r.draw_line(mx + 12, y + 4, mx + iw - 12, y + 4, th.border_soft, 1)
-                y = y + 9
-            else:
-                var parts = string_split(it, "\t")
-                if self.menu_item_hover == k:
-                    r.fill_round_xywh(mx + 4, y, iw - 8, 24, th.accent_soft, 5)
-                r.draw_text(parts[0], mx + 14, y + 5, self.f_ui, th.text)
-                if len(parts) > 1:
-                    var sm = self.f_small.width(parts[1])
-                    r.draw_text(parts[1], mx + iw - 14 - sm, y + 6, self.f_small, th.text_faint)
-                self.menu_item_rects.append({"x": mx, "y": y, "w": iw, "h": 26, "label": parts[0], "i": k})
-                y = y + 26
-            k = k + 1
-
-    # Try progressively more conservative roots. Returns the one that opened.
-    # Design pixels -> device pixels, rounded half up.
-    def dp(self, v):
-        return int(float(v) * self.dpi + 0.5)
-
+    # The folder the IDE was started in, like `code .`. If it cannot be
+    # opened, no folder: the Welcome page offers Open Folder.
     def _open_initial_workspace(self):
-        var tried = []
-        var cands = [getcwd(), ".", os_path_dirname(getcwd())]
-        var home = getenv("HOME")
-        if home == none or home == "":
-            home = getenv("USERPROFILE")
-        if home != none and home != "":
-            cands = cands + [home]
-        var i = 0
-        while i < len(cands):
-            var c = cands[i]
-            if c != none and c != "":
-                # Windows hands back backslashes; normalise before stat-ing so a
-                # perfectly valid path is not rejected for its separators.
-                var norm = string_replace(c, "\\", "/")
-                if self.ws.open_folder(norm):
-                    return norm
-                tried = tried + [norm]
-            i = i + 1
-        self.ws.error = "Could not open a workspace folder (tried " + str(len(tried)) + ")"
-        return ""
+        var cwd = string_replace(getcwd(), "\\", "/")
+        if cwd != "" and self.ws.open_folder(cwd):
+            self.term_cwd = cwd
+            self._remember_folder(cwd)
+            self._load_settings()
+            self._load_hl_rules(false)
+        self.cc_label = self._workspace_name()
 
-    def _draw_toolbar(self, r):
-        var th = self.th
-        var y = self.toolbar_y
-        r.draw_gradient(Rect(0, y, self.W, self.TOOLBAR_H), th.chrome, th.bg, true)
-        r.draw_line(0, y + self.TOOLBAR_H, self.W, y + self.TOOLBAR_H, th.border_soft, 1)
-        # ── Run button ───────────────────────────────────────────────────────
-        # Every coordinate here used to be a hardcoded constant: icon at x=22,
-        # text at x=44, inside a box at x=12 width 82. Those numbers were tuned
-        # for one font at one size, so the label sat off-centre and drifted
-        # further with the HiDPI scaling added later.
-        #
-        # The content is now MEASURED and centred as a unit: icon + gap + text
-        # is laid out from the middle of the button outward, so it stays centred
-        # at any font size or display scale.
-        var run_h  = self.dp(26)
-        var run_y  = y + int((self.TOOLBAR_H - run_h) / 2)
-        var ico_sz = self.dp(15)
-        var gap    = self.dp(7)
-        var tw     = self.f_ui_bold.width("Run")
-        var run_w  = self.dp(16) + ico_sz + gap + tw + self.dp(16)
-        var run_x  = self.dp(12)
+    def _workspace_name(self):
+        if self.ws.root == "":
+            return "NythonIDE"
+        return os_path_basename(self.ws.root)
 
-        var hovered = self.mx >= run_x and self.mx < run_x + run_w
-        hovered = hovered and self.my >= run_y and self.my < run_y + run_h
-        var green = Color(46, 176, 111, 245)
-        if hovered:
-            green = Color(56, 196, 126, 255)
-        r.fill_round_xywh(run_x, run_y, run_w, run_h, green, self.dp(6))
-        r.draw_gradient(Rect(run_x + 2, run_y + 2, run_w - 4, int(run_h / 2)),
-                        Color(255, 255, 255, 38), Color(255, 255, 255, 0), true)
-
-        var content_w = ico_sz + gap + tw
-        var cx = run_x + int((run_w - content_w) / 2)
-        var fg = Color(240, 255, 246, 255)
-        self.icons.draw(r, "run", cx, run_y + int((run_h - ico_sz) / 2), ico_sz, fg)
-        # Vertically centre the label on the glyph's own metrics rather than a
-        # guessed offset.
-        var th_txt = self.f_ui_bold.height()
-        r.draw_text("Run", cx + ico_sz + gap,
-                    run_y + int((run_h - th_txt) / 2), self.f_ui_bold, fg)
-        self.run_btn = {"x": run_x, "y": run_y, "w": run_w, "h": run_h}
-
-        # Mode chips: immediate mode. Was a draw loop plus a parallel
-        # `mode_rects` list plus a click handler elsewhere — the same
-        # three-piece arrangement as the panel tabs, with the same drift risk.
-        # One call now lays out, draws, hit-tests and returns the selection, and
-        # the chips gained hover feedback they never had: they were clickable
-        # but gave no sign of it until selected.
-        self.ui.io.mouse_x = self.mx
-        self.ui.io.mouse_y = self.my
-        self.ui.io.mouse_down = self.mouse_down
-        var chips_x = self.run_btn["x"] + self.run_btn["w"] + self.dp(14)
-        self.ui.begin_frame(chips_x, y + 8, self.W - chips_x, 24)
-        var newmode = self.ui.chips("modechips", self.run_modes, self.active_mode,
-                                    self.first_chip, th, chips_x, run_y, run_h,
-                                    self.f_small.width)
-        self.ui.end_frame()
-        self.ui.flush(r, self.f_small, self.f_ui_bold)
-        if newmode != self.active_mode:
-            self.active_mode = newmode
-            self.status_msg = "Mode: " + self.run_modes[newmode]
-
-        var pal = "Ctrl+P   Command Palette"
-        var pm = self.f_small.width(pal)
-        if self.W > 900:
-            r.fill_round_xywh(self.W - pm - 42, y + 8, pm + 28, 24, th.field, 5)
-            r.draw_text(pal, self.W - pm - 28, y + 14, self.f_small, th.text_faint)
-
-    def _draw_rail(self, r):
-        var th = self.th
-        r.fill_xywh(0, self.content_y, self.RAIL_W, self.content_h, th.chrome)
-        r.draw_line(self.RAIL_W, self.content_y, self.RAIL_W, self.status_y, th.border_soft, 1)
-        var i = 0
-        while i < self.rail_count:
-            var b = self.rail[i]
-            var act = false
-            if b.key == self.active_view:
-                if self.sidebar_open:
-                    act = true
-            if act:
-                r.fill_xywh(0, b.y, 2, b.h, th.accent)
-                r.fill_round_xywh(b.x, b.y, b.w, b.h, th.hover, 6)
-            elif b.hovered:
-                r.fill_round_xywh(b.x, b.y, b.w, b.h, Color(255, 255, 255, 8), 6)
-            var col = th.text_faint
-            if act:
-                col = th.text
-            self.icons.draw(r, b.key, int(b.x + b.w / 2 - 10), int(b.y + b.h / 2 - 10), 20, col)
-            i = i + 1
-        r.fill_circle(self.RAIL_W - 15, self.status_y - 24, 4, th.err)
-
-    def _draw_sidebar(self, r):
-        var th = self.th
-        var x = self.sidebar_x
-        var w = self.sidebar_w
-        r.fill_xywh(x, self.content_y, w, self.content_h, th.panel)
-        r.draw_line(x + w, self.content_y, x + w, self.status_y, th.border_soft, 1)
-        var title = "EXPLORER"
-        if self.active_view == "search":
-            title = "SEARCH"
-        elif self.active_view == "git":
-            title = "SOURCE CONTROL"
-        elif self.active_view == "run":
-            title = "RUN AND DEBUG"
-        elif self.active_view == "ext":
-            title = "EXTENSIONS"
-        elif self.active_view == "outline":
-            title = "OUTLINE"
-        elif self.active_view == "ai":
-            title = "AI ASSISTANT"
-        r.draw_text(title, x + 14, self.content_y + 10, self.f_small, th.text_faint)
-        if self.active_view == "explorer" and self.ws.root != "":
-            var rn = os_path_basename(self.ws.root)
-            var rm = self.f_small.width(rn)
-            r.draw_text(rn, x + w - rm - 14, self.content_y + 10, self.f_small, th.accent)
-        if self.active_view == "explorer":
-            self._draw_tree(r, x, w)
-        elif self.active_view == "outline":
-            self._draw_outline(r, x, w)
-        elif self.active_view == "ai":
-            self._draw_ai(r, x, w)
-        elif self.active_view == "search":
-            self._draw_search(r, x, w)
-        else:
-            r.draw_text("No content yet", x + 14, self.content_y + 44, self.f_small, th.text_faint)
-
-    def _draw_tree(self, r, x, w):
-        var th = self.th
-        var y = self.content_y + 34
-        var bottom = self.status_y
-        r.set_clip(Rect(x, y, w, bottom - y))
-        var i = self.tree_scroll
-        var drawn = 0
-        while i < self.ws.row_count:
-            # Stop at the last row that fits entirely. Drawing a half-height row
-            # against the status bar relies on the clip to hide the remainder,
-            # which looks cut off rather than scrolled.
-            if y + 22 > bottom:
-                i = self.ws.row_count
-            else:
-                var n = self.ws.rows[i]
-                var ix = x + 8 + n.depth * 14
-                if i == self.tree_sel:
-                    r.fill_xywh(x, y, w, 22, th.accent_soft)
-                    r.fill_xywh(x, y, 2, 22, th.accent)
-                elif i == self.tree_hover:
-                    r.fill_xywh(x, y, w, 22, th.hover)
-                var col = th.text_dim
-                if n.is_dir:
-                    col = th.text
-                    var chev = "chevron_right"
-                    if n.expanded:
-                        chev = "chevron_down"
-                    self.icons.draw(r, chev, ix, y + 4, 14, th.text_faint)
-                    var fic = "folder"
-                    if n.expanded:
-                        fic = "folder_open"
-                    self.icons.draw(r, fic, ix + 15, y + 3, 16, th.accent)
-                    r.draw_text(n.name, ix + 35, y + 4, self.f_ui, col)
-                else:
-                    var ic = "file"
-                    var icol = th.text_faint
-                    if n.kind == "code":
-                        ic = "file_code"
-                        icol = th.accent
-                    elif n.kind == "project":
-                        ic = "project"
-                        icol = th.ok
-                    self.icons.draw(r, ic, ix + 15, y + 3, 16, icol)
-                    r.draw_text(n.name, ix + 35, y + 4, self.f_ui, col)
-                y = y + 22
-                drawn = drawn + 1
-                i = i + 1
-        r.clear_clip()
-        if self.ws.error != "":
-            # Was drawn at full length with no clip, so a long Windows path ran
-            # out of the sidebar and across the panel below it. Clip to the
-            # sidebar and ellipsise on a character boundary.
-            var msg = self.ws.error
-            var avail = w - 24
-            while self.f_small.width(msg) > avail and len(msg) > 4:
-                msg = string_slice(msg, 0, len(msg) - 2) + "…"
-            r.set_clip(Rect(x, bottom - 34, w, 28))
-            r.draw_text(msg, x + 12, bottom - 22, self.f_small, th.err)
-            r.clear_clip()
-
-    def _draw_tabbar(self, r):
-        var th = self.th
-        var y = self.tabbar_y
-        r.fill_xywh(self.col_x, y, self.col_w, self.TABBAR_H, th.chrome)
-        r.draw_line(self.col_x, y + self.TABBAR_H, self.col_x + self.col_w, y + self.TABBAR_H, th.border_soft, 1)
-        r.set_clip(Rect(self.col_x, y, self.col_w, self.TABBAR_H))
-        var i = 0
-        while i < self.tab_count:
-            var t = self.tabs[i]
-            if i == self.active_tab:
-                r.fill_xywh(t.x, y, t.w, self.TABBAR_H, th.editor_bg)
-                r.fill_xywh(t.x, y, t.w, 2, th.accent)
-                r.draw_line(t.x, y + 2, t.x, y + self.TABBAR_H, th.border_soft, 1)
-                r.draw_line(t.x + t.w, y + 2, t.x + t.w, y + self.TABBAR_H, th.border_soft, 1)
-            r.fill_round_xywh(t.x + 11, y + 12, 9, 11, th.accent, 2)
-            var col = th.text_faint
-            if i == self.active_tab:
-                col = th.text
-            r.draw_text(t.title, t.x + 26, y + 10, self.f_ui, col)
-            if t.dirty:
-                r.fill_circle(t.x + t.w - 14, y + 18, 4, th.text_dim)
-            else:
-                self.icons.draw(r, "close", t.x + t.w - 24, y + 10, 14, th.text_faint)
-            i = i + 1
-        r.clear_clip()
-
-    def _draw_editor(self, r):
-        var th = self.th
-        r.fill_xywh(self.col_x, self.ed_y, self.ed_w, self.ed_h, th.editor_bg)
-        r.fill_xywh(self.col_x, self.ed_y, self.GUTTER_W, self.ed_h, th.gutter_bg)
-        var buf = self.buffers[self.active_tab]
-        var line_h = self.LINE_H
-        var rows = int(self.ed_h / line_h) + 1
-        var top = int(self.editor.scroll_y / line_h)
-        if top < 0:
-            top = 0
-        var text_x = self.col_x + self.GUTTER_W + 10
-        r.set_clip(Rect(self.col_x, self.ed_y, self.ed_w, self.ed_h))
-        self._draw_selection(r, buf, top, rows, line_h, text_x)
-        var i = 0
-        while i < rows:
-            var ln = top + i
-            if ln < buf.line_count:
-                var y = self.ed_y + i * line_h
-                if ln == self.debug_line:
-                    r.fill_xywh(self.col_x + self.GUTTER_W, y, self.ed_w - self.GUTTER_W, line_h, Color(232, 178, 74, 45))
-                    r.fill_polygon([self.col_x + 26, y + 4, self.col_x + 26, y + 14, self.col_x + 34, y + 9], th.warn)
-                elif ln == buf.cursor_row:
-                    r.fill_xywh(self.col_x + self.GUTTER_W, y, self.ed_w - self.GUTTER_W, line_h, th.caret_line)
-                var s = str(ln + 1)
-                var m = self.f_code.width(s)
-                var gc = th.gutter
-                if ln == buf.cursor_row:
-                    gc = th.text
-                if self._has_break(ln):
-                    r.fill_circle(self.col_x + 13, y + 9, 5, th.err)
-                r.draw_text(s, self.col_x + self.GUTTER_W - 12 - m, y + 1, self.f_code, gc)
-                if self.find_open and self.find_hit_count > 0:
-                    var hh = self.find_hits[self.find_index]
-                    if hh["line"] == ln:
-                        var pre = self.f_code.width(string_slice(buf.get_line(ln), 0, hh["col"]))
-                        var qm = self.f_code.width(self.find_query)
-                        r.fill_xywh(text_x + pre, y, qm, line_h, Color(232, 178, 74, 70))
-                if self.show_indent_guides:
-                    self._draw_indent_guides(r, buf.get_line(ln), text_x, y, line_h)
-                self._draw_code_line(r, buf.get_line(ln), text_x, y + 1)
-            i = i + 1
-
-        self._draw_bracket_match(r, buf, top, line_h, text_x)
-
-        # ── caret ────────────────────────────────────────────────────────────
-        # Blinks at roughly 1 Hz. The IDE only repaints when something changes,
-        # so the caret marks the frame dirty while the editor holds focus,
-        # exactly like the terminal's prompt does.
-        var crow = buf.cursor_row - top
-        if crow >= 0 and crow < rows:
-            var cy = self.ed_y + crow * line_h
-            var upto = string_slice(buf.get_line(buf.cursor_row), 0, buf.cursor_col)
-            var cm = self.f_code.width(upto)
-            if self.caret_on:
-                r.fill_xywh(text_x + cm, cy + 1, 2, line_h - 2, th.accent)
-
-        # Extra carets (multi-cursor, lib/ide_selection.ny). Same blink
-        # phase as the primary; a lighter tint keeps the primary caret
-        # visually distinct from the others.
-        if self.selmodel.count > 1 and self.caret_on:
-            var ei = 1
-            while ei < self.selmodel.count:
-                var s = self.selmodel.sels[ei]
-                var erow = s.caret.row - top
-                if erow >= 0 and erow < rows and s.caret.row < buf.line_count:
-                    var ecol = s.caret.col
-                    var ell = len(buf.get_line(s.caret.row))
-                    if ecol > ell:
-                        ecol = ell
-                    var ey = self.ed_y + erow * line_h
-                    var eupto = string_slice(buf.get_line(s.caret.row), 0, ecol)
-                    var ecm = self.f_code.width(eupto)
-                    r.fill_xywh(text_x + ecm, ey + 1, 2, line_h - 2, Color(255, 255, 255, 200))
-                ei = ei + 1
-        r.clear_clip()
-        r.draw_line(self.col_x + self.GUTTER_W, self.ed_y, self.col_x + self.GUTTER_W, self.ed_y + self.ed_h, th.border_soft, 1)
-
-        # vertical scrollbar
-        if buf.line_count * line_h > self.ed_h:
-            var track = self.ed_h
-            var frac = self.ed_h * 1.0 / (buf.line_count * line_h)
-            var th_h = int(track * frac)
-            if th_h < 30:
-                th_h = 30
-            var maxs = buf.line_count * line_h - self.ed_h
-            var prog = 0.0
-            if maxs > 0:
-                prog = self.editor.scroll_y * 1.0 / maxs
-            var ty = self.ed_y + int((track - th_h) * prog)
-            r.fill_round_xywh(self.col_x + self.ed_w - 8, ty, 5, th_h, Color(255, 255, 255, 40), 3)
-
-    def _draw_code_line(self, r, line, x, y):
-        if line == none:
-            return
-        if len(line) == 0:
-            return
-        # Tokenising is a full interpreted scan of the line. Redoing it for every
-        # visible line on every frame dominated the frame budget, so memoise by
-        # line content — editor text changes rarely relative to frame rate.
-        # Tokenising is a full interpreted scan of the line, and measuring each
-        # token is another builtin round-trip. Both were being redone for every
-        # visible line on every frame. Cache the finished layout (text, colour
-        # and resolved x offset) keyed by line content instead.
-        var segs = none
-        if self._hl_cache.has_key(line):
-            segs = self._hl_cache[line]
-        else:
-            var raw = self.editor.hl.tokenise_line(line)
-            var built = []
-            var k = 0
-            var dx = 0
-            while k < len(raw):
-                var rs = raw[k]
-                var rt = rs["text"]
-                built.append({"text": rt, "color": rs["color"], "dx": dx})
-                var mm = self.f_code.width(rt)
-                dx = dx + mm
-                k = k + 1
-            segs = built
-            if self._hl_cache_n > 2000:
-                self._hl_cache = {}
-                self._hl_cache_n = 0
-            self._hl_cache[line] = segs
-            self._hl_cache_n = self._hl_cache_n + 1
-        # Hot loop: call the builtin directly. Renderer.draw_text() adds two
-        # interpreted method calls (draw_text -> ensure_loaded) plus attribute
-        # lookups per token, which at ~180 text runs a frame is the single
-        # largest cost in the frame. The handle is resolved once per frame in
-        # draw() instead.
-        var fh = self._code_handle
-        var n = len(segs)
-        var i = 0
-        while i < n:
-            var s = segs[i]
-            var c = s["color"]
-            gui_draw_text(r.handle, s["text"], x + s["dx"], y, fh, c.r, c.g, c.b, c.a)
-            i = i + 1
-
-    def _draw_minimap(self, r):
-        var th = self.th
-        var x = self.col_x + self.ed_w
-        r.fill_xywh(x, self.ed_y, self.mm_w, self.ed_h, th.minimap_bg)
-        r.draw_line(x, self.ed_y, x, self.ed_y + self.ed_h, th.border_soft, 1)
-        var buf = self.buffers[self.active_tab]
-        var i = 0
-        var y = self.ed_y + 6
-        while i < buf.line_count:
-            if y < self.ed_y + self.ed_h - 4:
-                var ln = buf.get_line(i)
-                var w = len(ln)
-                if w > 0:
-                    if w > 68:
-                        w = 68
-                    r.fill_xywh(x + 10, y, w, 2, Color(120, 130, 165, 95))
-                y = y + 3
-            i = i + 1
-        var total = buf.line_count * self.LINE_H
-        var vh = self.ed_h
-        var vy = self.ed_y + 4
-        var box = self.ed_h - 8
-        if total > self.ed_h:
-            box = int(self.ed_h * (self.ed_h * 1.0 / total))
-            if box < 24:
-                box = 24
-            var maxs2 = total - self.ed_h
-            var pr = 0.0
-            if maxs2 > 0:
-                pr = self.editor.scroll_y * 1.0 / maxs2
-            vy = self.ed_y + int((self.ed_h - box) * pr)
-        r.fill_xywh(x + 4, vy, self.mm_w - 8, box, Color(255, 255, 255, 16))
-        r.draw_rect(Rect(x + 4, vy, self.mm_w - 8, box), Color(255, 255, 255, 30), 1)
-
-    def _draw_panel(self, r):
-        var th = self.th
-        var y = self.panel_y
-        r.fill_xywh(self.col_x, y, self.col_w, self.panel_h, th.panel)
-        r.draw_line(self.col_x, y, self.col_x + self.col_w, y, th.border, 1)
-        # ── panel tabs: immediate mode ───────────────────────────────────────
-        # This strip used to be three pieces that had to agree: a draw loop, a
-        # parallel `panel_rects` list of hit rectangles, and a click handler
-        # 600 lines away that walked that list. Adding a tab meant touching all
-        # three, and any disagreement showed up as a tab that drew in one place
-        # and responded in another.
-        #
-        # One call now lays out, draws and hit-tests, and returns the selection.
-        # `panel_rects` is gone and so is its handler.
-        var badges = [0, self.problem_count, 0, 0, 0, 0]
-        self.ui.io.mouse_x = self.mx
-        self.ui.io.mouse_y = self.my
-        self.ui.io.mouse_down = self.mouse_down
-        self.ui.begin_frame(self.col_x, y, self.col_w, self.PANELTAB_H)
-        self.active_panel = self.ui.tabs("paneltabs", self.panel_tabs,
-                                         self.active_panel, badges, th,
-                                         self.col_x, y, self.PANELTAB_H,
-                                         self.f_small.width)
-        self.ui.end_frame()
-        self.ui.flush(r, self.f_small, self.f_ui_bold)
-
-        var body_y = y + self.PANELTAB_H
-        r.set_clip(Rect(self.col_x, body_y, self.col_w, self.panel_h - self.PANELTAB_H))
-        if self.active_panel == 0:
-            self.console.draw(r)
-        elif self.active_panel == 1:
-            self._draw_problems(r, body_y)
-        elif self.active_panel == 2:
-            self._draw_terminal(r, body_y)
-        elif self.active_panel == 3:
-            self._draw_debug(r, body_y)
-        elif self.active_panel == 4:
-            self._draw_tokens(r, body_y)
-        elif self.active_panel == 5:
-            self.workshop.draw(r)
-        else:
-            r.draw_text("Nothing to show", self.col_x + 18, body_y + 12, self.f_small, th.text_faint)
-        r.clear_clip()
-
-    def _draw_problems(self, r, body_y):
-        var th = self.th
-        self.problem_rows = []
-        var i = self.panel_scroll
-        var y = body_y + 8
-        while i < self.problem_count:
-            var p = self.problems[i]
-            var col = th.err
-            if p["sev"] == "warn":
-                col = th.warn
-            elif p["sev"] == "info":
-                col = th.accent
-            r.fill_circle(self.col_x + 24, y + 8, 5, col)
-            r.draw_text(p["msg"], self.col_x + 40, y + 1, self.f_ui, th.text)
-            var loc = p["file"] + " : " + str(p["line"])
-            var m = self.f_small.width(loc)
-            r.draw_text(loc, self.col_x + self.col_w - m - 20, y + 2, self.f_small, th.text_faint)
-            self.problem_rows = self.problem_rows + [{"y": y, "i": i}]
-            y = y + 22
-            i = i + 1
-
-    # Tokens panel: whatever the last Tokenize / AST / Disasm run produced.
-    def _draw_tokens(self, r, body_y):
-        var th = self.th
-        if self.introspect_n == 0:
-            r.draw_text("Run Tokenize, AST or Disassemble to populate this panel",
-                        self.col_x + 18, body_y + 10, self.f_small, th.text_faint)
-            return
-        r.draw_text(self.introspect_kind + "  (" + str(self.introspect_n) + " lines)",
-                    self.col_x + 18, body_y + 6, self.f_ui_bold, th.text)
-        var i = self.panel_scroll
-        var y = body_y + 26
-        while i < self.introspect_n:
-            if y + 16 <= self.status_y:
-                r.draw_text(self.introspect[i], self.col_x + 18, y, self.f_code, th.text_dim)
-                y = y + 16
-            i = i + 1
-
-    def _draw_debug(self, r, body_y):
-        var th = self.th
-        r.draw_text("Breakpoints (" + str(self.break_count) + ")", self.col_x + 18, body_y + 8, self.f_ui_bold, th.text)
-        if self.break_count == 0:
-            r.draw_text("Click the gutter or press F9 to set one", self.col_x + 18, body_y + 30, self.f_small, th.text_faint)
-            return
-        var keys = self.breaks.keys()
-        var i = 0
-        var y = body_y + 30
-        while i < len(keys):
-            r.fill_circle(self.col_x + 24, y + 7, 5, th.err)
-            r.draw_text(keys[i], self.col_x + 38, y, self.f_ui, th.text_dim)
-            y = y + 20
-            i = i + 1
-
-    def _draw_terminal(self, r, body_y):
-        var th = self.th
-        var i = 0
-        var y = body_y + 6
-        while i < self.term_count:
-            r.draw_text(self.term_lines[i], self.col_x + 16, y, self.f_code, th.text_dim)
-            y = y + 17
-            i = i + 1
-        r.draw_text("$", self.col_x + 16, y, self.f_code, th.ok)
-        r.draw_text(self.term_input, self.col_x + 32, y, self.f_code, th.text)
-
-    def _draw_status(self, r):
-        var th = self.th
-        var y = self.status_y
-        r.draw_gradient(Rect(0, y, self.W, self.STATUS_H), th.chrome_hi, th.status_bg, true)
-        var brand = th.accent
-        if not self.build_ok:
-            brand = th.err
-        r.fill_xywh(0, y, 104, self.STATUS_H, brand)
-        r.draw_text("Nython", 26, y + 5, self.f_small, Color(245, 246, 255, 255))
-        r.draw_text(self.status_msg, 120, y + 5, self.f_small, th.text_dim)
-
-        # right-hand segments are clickable
-        self.status_segs = []
-        var buf = self.buffers[self.active_tab]
-        var segs = ["Ln " + str(buf.cursor_row + 1) + ", Col " + str(buf.cursor_col + 1),
-                    str(self.problem_count) + " problems",
-                    str(self.break_count) + " breakpoints",
-                    "UTF-8",
-                    "Nython",
-                    str(self.W) + " x " + str(self.H)]
-        var acts = ["goto", "problems", "breaks", "", "", ""]
-        var i = len(segs) - 1
-        var x = self.W - 12
-        while i >= 0:
-            var m = self.f_small.width(segs[i])
-            x = x - m - 16
-            var col = th.text_dim
-            if acts[i] != "" and self.status_hover == i:
-                r.fill_xywh(x - 4, y, m + 16, self.STATUS_H, Color(255, 255, 255, 18))
-                col = th.text
-            r.draw_text(segs[i], x + 4, y + 5, self.f_small, col)
-            self.status_segs.append({"x": x - 4, "w": m + 16, "act": acts[i], "i": i})
-            i = i - 1
-
-    def _draw_palette(self, r):
-        var th = self.th
-        r.fill_xywh(0, 0, self.W, self.H, th.scrim)
-        var pw = 560
-        if pw > self.W - 80:
-            pw = self.W - 80
-        var px = int(self.W / 2 - pw / 2)
-        var py = 88
-        var rows = self.palette_hit_count
-        if rows > 8:
-            rows = 8
-        var ph = 56 + rows * 30 + 8
-        r.draw_shadow(Rect(px, py, pw, ph), 24, 0, 10, Color(0, 0, 0, 170))
-        r.fill_round_xywh(px, py, pw, ph, th.overlay, 10)
-        r.draw_rounded_rect(Rect(px, py, pw, ph), th.accent, 10, 1)
-        r.fill_round_xywh(px + 12, py + 12, pw - 24, 32, th.field, 6)
-        if len(self.palette_query) == 0:
-            r.draw_text("Type a command...", px + 24, py + 20, self.f_ui, th.text_faint)
-        else:
-            r.draw_text(self.palette_query, px + 24, py + 20, self.f_ui, th.text)
-        var i = 0
-        var y = py + 52
-        while i < rows:
-            if i == self.palette_sel:
-                r.fill_round_xywh(px + 8, y, pw - 16, 28, th.accent_soft, 5)
-            var col = th.text_dim
-            if i == self.palette_sel:
-                col = th.text
-            r.draw_text(self.palette_hits[i], px + 22, y + 6, self.f_ui, col)
-            y = y + 30
-            i = i + 1
-
-    # ── events ───────────────────────────────────────────────────────────────
+    # ══ input ══════════════════════════════════════════════════════════════════
     def handle_event(self, e):
-        # Immediate-mode widgets read the pointer during draw rather than
-        # receiving events, so the latest position and button level are recorded
-        # here for them. Level, not edges: NyImGui derives press and release
-        # itself, which is what keeps a click tied to one item across frames.
-        if e.type == "mousedown" or e.type == "mouseup":
-            self.mx = e.x
-            self.my = e.y
-        if e.type == "mousedown":
-            self.mouse_down = true
-        if e.type == "mouseup":
-            self.mouse_down = false
-        # An immediate-mode widget only sees a press if a FRAME IS DRAWN while
-        # the button is down: it hit-tests during draw, it is not sent events.
-        # The frame loop skips redraws unless _dirty is set, so the panel tabs
-        # and toolbar chips recorded the pointer, never redrew, and therefore
-        # never registered a click — they looked completely dead.
-        if e.type == "mousedown" or e.type == "mouseup" or e.type == "mousemove":
+        var t = e.type
+        if t == "mousemove":
+            self._on_move(e)
+        elif t == "mousedown":
+            self._on_down(e)
+        elif t == "mouseup":
+            self._on_up(e)
+        elif t == "scroll":
+            self._on_wheel(e)
+        elif t == "keydown":
+            self._on_key(e)
+        elif t == "textinput":
+            self._on_text(e)
+        elif t == "expose":
             self._dirty = true
 
-        if e.type == "mousemove":
-            self.mx = e.x
-            self.my = e.y
-            self._update_hover()
-            self._apply_cursor()
-            if self.dragging_split:
-                self._apply_split(e.y)
-                return
-            if self.dragging_mm:
-                self._minimap_scroll(e.y)
-                self._dirty = true
-                return
-            if self.dragging_sel:
-                var dp = self._pos_at(e.x, e.y)
-                var dbuf = self.buffers[self.active_tab]
-                dbuf.cursor_row = dp["row"]
-                dbuf.cursor_col = dp["col"]
-                self._dirty = true
-                return
-            if self.dragging_sidebar:
-                var nw = e.x - self.RAIL_W
-                if nw < 150:
-                    nw = 150
-                if nw > 520:
-                    nw = 520
-                self.SIDEBAR_W = nw
-                self._layout()
-                return
+    def _close_overlays(self):
+        self.menu_open = -1
+        self.menu_sel = -1
+        self.ctx_open = false
+        self.notif_center = false
 
-        if self.dialog_open:
-            self._dialog_event(e)
-            if e.consumed:
-                self._dirty = true
-                return
-        if self.ctx_open:
-            if e.type == "mousemove":
-                self.ctx_hover = self._ctx_hit(e.x, e.y)
-                self._dirty = true
-                return
-            if e.type == "mousedown":
-                var hitc = self._ctx_hit(e.x, e.y)
-                self.ctx_open = false
-                if hitc >= 0:
-                    self._ctx_action(self.ctx_items[hitc])
-                e.consume()
-                self._dirty = true
-                return
-            if e.type == "keydown":
-                self.ctx_open = false
-                e.consume()
-                self._dirty = true
-                return
-        if self.ac_open:
-            self._ac_event(e)
-            if e.consumed:
-                self._dirty = true
-                return
-        if self.search_focus and self.sidebar_open and self.active_view == "search":
-            if e.type == "textinput" or e.type == "keydown":
-                # Let global shortcuts through; plain typing goes to the box.
-                if not e.ctrl and not e.alt:
-                    self._search_event(e)
-                    if e.consumed:
-                        self._dirty = true
-                        return
-        if self.find_open:
-            self._find_event(e)
-            if e.consumed:
-                self._dirty = true
-                return
-        if self.palette_open:
-            self._palette_event(e)
-            if e.consumed:
-                return
-
-        if e.type == "keydown":
-            if self._global_keys(e):
-                return
-
-        if e.type == "mouseup":
-            self.dragging_split = false
-            self.dragging_sidebar = false
-            self.dragging_sel = false
-            self.dragging_mm = false
-
-        if e.type == "mousedown":
-            self._mouse_down(e)
-            if e.consumed:
-                return
-
-        if e.type == "scroll" or e.type == "wheel":
-            # A wheel event carries its own pointer position; mx/my only track
-            # mousemove, so routing by those sent the scroll to whichever region
-            # the pointer was last *moved* over rather than where it now is.
-            if e.x > 0 or e.y > 0:
-                self.mx = e.x
-                self.my = e.y
-            if self.sidebar_open and self.mx > self.sidebar_x and self.mx < self.sidebar_x + self.sidebar_w and self.my > self.content_y and self.my < self.status_y:
-                self._scroll_tree(e.delta)
-            elif self.panel_open and self.my >= self.panel_y and self.my < self.status_y:
-                self._scroll_panel(e.delta)
-            elif self.my >= self.ed_y and self.my < self.panel_y:
-                self.editor.handle_event(e)
+    # ── pointer ──────────────────────────────────────────────────────────────
+    def _on_move(self, e):
+        self.mx = e.x
+        self.my = e.y
+        if self.dragging != "":
+            self._drag_to(e.x, e.y)
             self._dirty = true
             return
+        var h = self.hits.at(e.x, e.y)
+        var cmd = ""
+        var arg = ""
+        var tip = ""
+        if h != none:
+            cmd = h.cmd
+            arg = h.arg
+            tip = h.tip
+        # Repaint only when what is under the pointer changed.
+        if cmd != self.tip_hit_cmd or arg != self.tip_hit_arg:
+            self.tip_hit_cmd = cmd
+            self.tip_hit_arg = arg
+            self._dirty = true
+            self.tip_text = ""
+            if tip != "" and not string_startswith(cmd, "@tree") and cmd != "@editor":
+                self.tip_text = tip
+                self.tip_t0 = time_ms()
+                self.tip_x = e.x + self.dp(10)
+                self.tip_y = e.y + self.dp(20)
+            # Moving across the menu bar with a menu open switches menus.
+            if self.menu_open >= 0 and cmd == "@menu" and arg != self.menu_open:
+                self.menu_open = arg
+                self.menu_sel = -1
+            if self.menu_open >= 0 or self.ctx_open:
+                self.menu_sel = -1
+                self.ctx_sel = -1
+        # Code hover (definition signature, or a variable's value while
+        # debugging) after the pointer rests on a word.
+        if cmd == "@editor":
+            self.hover_t0 = time_ms()
+            self.hover_done = false
+            if self.hover_info != "":
+                self.hover_info = ""
+                self._dirty = true
+        elif self.hover_info != "":
+            self.hover_info = ""
+            self._dirty = true
+        self._set_cursor(cmd)
 
-        # Terminal panel owns the keyboard while it is visible and focused.
-        # Its prompt and caret were drawn but nothing could ever be typed.
-        if self.panel_open and self.active_panel == 2:
-            if e.type == "textinput":
-                self.term_input = self.term_input + e.text
-                e.consume()
-                return
-            if e.type == "keydown":
-                if e.key == "backspace":
-                    if len(self.term_input) > 0:
-                        self.term_input = string_slice(self.term_input, 0, len(self.term_input) - 1)
-                    e.consume()
-                    return
-                if e.key == "enter":
-                    self.term_lines.append("$ " + self.term_input)
-                    self.term_count = self.term_count + 1
-                    self._term_run(self.term_input)
-                    self.term_input = ""
-                    e.consume()
-                    return
-                if e.key == "up":
-                    self.term_input = self.cmdline.history_prev()
-                    e.consume()
-                    return
-                if e.key == "down":
-                    self.term_input = self.cmdline.history_next()
-                    e.consume()
-                    return
-                if e.key == "tab":
-                    var comp = self.cmdline.complete(self.term_input)
-                    if len(comp) == 1:
-                        self.term_input = comp[0]
-                    elif len(comp) > 1:
-                        self.term_lines.append(string_join(comp, "  "))
-                        self.term_count = self.term_count + 1
-                    e.consume()
-                    return
-
-        if e.type == "textinput" or e.type == "keydown":
-            if self.menu_open < 0:
-                var isnav = false
-                if e.type == "keydown":
-                    isnav = (e.key == "left" or e.key == "right" or e.key == "up"
-                             or e.key == "down" or e.key == "home" or e.key == "end")
-                if isnav:
-                    if e.shift:
-                        self._sel_begin()
-                    else:
-                        self._sel_clear()
-                if e.type == "textinput" or e.key == "backspace" or e.key == "enter":
-                    # Typing over a selection replaces it. A plain edit needs
-                    # no push here: EditorBuffer.insert_char/delete_char_back/
-                    # insert_newline record their own undo entry.
-                    if self._sel_range() != none:
-                        self._sel_delete()
-                        if e.key == "backspace":
-                            e.consume()
-                if e.consumed:
-                    return
-                self.editor.handle_event(e)
-                if e.type == "textinput" or e.key == "backspace" or e.key == "enter":
-                    self._apply_to_extra_carets(e)
-                # No auto-indent here: EditorBuffer.newline() already copies the
-                # previous line's indentation and adds a level after ':'. Doing
-                # it again indented new lines twice.
-                if e.type == "textinput":
-                    self._auto_close(e.text)
-                # Edited text must re-tokenise, and a changed line count changes
-                # the scrollbar, so drop the memoised highlight layout.
-                if e.type == "textinput" or e.key == "backspace" or e.key == "enter" or e.key == "tab":
-                    self._hl_cache = {}
-                    self._hl_cache_n = 0
-                    self.tabs[self.active_tab].dirty = true
-
-    # Pointer shape by region: I-beam over text, resize over the splitters,
-    # hand over anything clickable, arrow otherwise.
-    def _apply_cursor(self):
+    def _set_cursor(self, cmd):
         var want = "arrow"
-        if self.my > self.ed_y and self.my < self.panel_y and self.mx > self.col_x + self.GUTTER_W:
+        if cmd == "@editor" or cmd == "@qi.input" or cmd == "@find.field" or cmd == "@search.field" or cmd == "@scm.msg" or cmd == "@term" or cmd == "@dbgcon" or cmd == "@ext.search":
             want = "ibeam"
-        if self.sidebar_open:
-            if self.mx >= self.sidebar_x + self.sidebar_w - 5 and self.mx <= self.sidebar_x + self.sidebar_w + 5:
-                if self.my > self.content_y and self.my < self.status_y:
-                    want = "sizewe"
-        if self.panel_open:
-            if self.my >= self.panel_y - 6 and self.my <= self.panel_y + 6 and self.mx >= self.col_x:
-                want = "sizens"
-        if self.my < self.MENU_H:
+        elif cmd == "@split.sidebar":
+            want = "sizewe"
+        elif cmd == "@split.panel":
+            want = "sizens"
+        elif cmd != "" and not string_startswith(cmd, "@side") and cmd != "@menu.bg" and cmd != "@qi.bg" and cmd != "@overlay.dismiss" and cmd != "@panel.body" and cmd != "@tabstrip" and cmd != "@modal.scrim" and cmd != "@qi.dismiss" and cmd != "@find.bg":
             want = "hand"
-        if self.my >= self.status_y and self.status_hover >= 0:
-            want = "hand"
-        if self.mx < self.RAIL_W and self.my > self.content_y and self.my < self.status_y:
-            want = "hand"
-        if self.dialog_open or self.palette_open:
-            want = "arrow"
         if want != self.cursor_shape:
             self.cursor_shape = want
             gui_set_cursor(want)
 
-    def _update_hover(self):
-        self.tooltip = ""
-        var i = 0
-        while i < self.rail_count:
-            var b = self.rail[i]
-            b.hovered = hit(b.x, b.y, b.w, b.h, self.mx, self.my)
-            if b.hovered:
-                self.tooltip = b.tip
-                self.tooltip_x = b.x + b.w + 10
-                self.tooltip_y = b.y + 6
-            i = i + 1
-        self.menu_hover = -1
-        if self.my < self.MENU_H:
-            i = 0
-            while i < len(self.menu_rects):
-                var mr = self.menu_rects[i]
-                if self.mx >= mr["x"] and self.mx < mr["x"] + mr["w"]:
-                    self.menu_hover = mr["i"]
-                i = i + 1
-            if self.menu_open >= 0:
-                if self.menu_hover >= 0:
-                    self.menu_open = self.menu_hover
-        self.status_hover = -1
-        if self.my >= self.status_y:
-            var si = 0
-            while si < len(self.status_segs):
-                var sg = self.status_segs[si]
-                if self.mx >= sg["x"] and self.mx < sg["x"] + sg["w"] and sg["act"] != "":
-                    self.status_hover = sg["i"]
-                si = si + 1
-        self.tree_hover = -1
-        if self.sidebar_open:
-            if self.active_view == "explorer":
-                if self.mx > self.sidebar_x and self.mx < self.sidebar_x + self.sidebar_w:
-                    var idx = int((self.my - self.content_y - 34) / 22) + self.tree_scroll
-                    if idx >= 0 and idx < self.ws.row_count:
-                        self.tree_hover = idx
-
-    def _apply_split(self, my):
-        var avail = self.content_h
-        var newh = self.content_y + avail - my
-        var ratio = newh * 1.0 / avail
-        if ratio < 0.12:
-            ratio = 0.12
-        if ratio > 0.70:
-            ratio = 0.70
-        self.panel_ratio = ratio
-        self._layout()
-
-    def _mouse_down(self, e):
-        var x = e.x
-        var y = e.y
+    def _on_down(self, e):
+        self.mx = e.x
+        self.my = e.y
+        self.mouse_down = true
+        self.caret_on = true
+        self.caret_t = time_ms()
+        self.tip_text = ""
+        self.hover_info = ""
+        self._dirty = true
+        var h = self.hits.at(e.x, e.y)
         if e.button == 3:
-            if y >= self.tabbar_y and y < self.tabbar_y + self.TABBAR_H and x >= self.col_x:
-                self._open_ctx(x, y, "tab", -1)
-            elif self.sidebar_open and x > self.sidebar_x and x < self.sidebar_x + self.sidebar_w and y > self.content_y + 34:
-                var ri = int((y - self.content_y - 34) / 22) + self.tree_scroll
-                if ri >= 0 and ri < self.ws.row_count:
-                    self.tree_sel = ri
-                self._open_ctx(x, y, "tree", ri)
-            elif y >= self.ed_y and y < self.panel_y and x >= self.col_x:
-                self._open_ctx(x, y, "editor", -1)
-            else:
-                self._open_ctx(x, y, "view", -1)
-            e.consume()
+            self._close_overlays()
+            if not self.qi.visible and not self.modal_open:
+                self._context_menu(h, e)
             return
-        if y >= self.status_y:
-            var si = 0
-            while si < len(self.status_segs):
-                var sg = self.status_segs[si]
-                if x >= sg["x"] and x < sg["x"] + sg["w"]:
-                    if sg["act"] == "goto":
-                        self._ask("goto", "Go to Line", "Line number", "")
-                    elif sg["act"] == "problems":
-                        self.panel_open = true
-                        self.active_panel = 1
-                        self._layout()
-                    elif sg["act"] == "breaks":
-                        self.panel_open = true
-                        self.active_panel = 3
-                        self._layout()
-                    e.consume()
-                    return
-                si = si + 1
+        if h == none:
+            self._close_overlays()
             return
-        if y < self.MENU_H:
-            var i = 0
-            while i < len(self.menu_rects):
-                var mr = self.menu_rects[i]
-                if x >= mr["x"] and x < mr["x"] + mr["w"]:
-                    if self.menu_open == mr["i"]:
-                        self.menu_open = -1
-                    else:
-                        self.menu_open = mr["i"]
-                    e.consume()
-                    return
-                i = i + 1
-            self.menu_open = -1
+        if e.button == 2:
+            if h.cmd == "@tab" or h.cmd == "@tab.close":
+                self._close_doc(h.arg, false)
             return
-        if self.menu_open >= 0:
-            # Dropdown entries used to be drawn but not clickable: any click just
-            # dismissed the menu. Hit-test them first.
-            var mi = 0
-            while mi < len(self.menu_item_rects):
-                var ir = self.menu_item_rects[mi]
-                if hit(ir["x"], ir["y"], ir["w"], ir["h"], x, y):
-                    self.menu_open = -1
-                    self._menu_action(ir["label"])
-                    e.consume()
-                    return
-                mi = mi + 1
-            self.menu_open = -1
-            e.consume()
-            return
-        if y >= self.toolbar_y and y < self.content_y:
-            if hit(12, self.toolbar_y + 7, 82, 26, x, y):
-                self._run()
-                e.consume()
-                return
-            # The chip row hit-tests itself while drawing, so this only records
-            # the pointer state it will read and swallows the event.
-            e.consume()
-            return
-        if x < self.RAIL_W and y >= self.content_y and y < self.status_y:
-            var j = 0
-            while j < self.rail_count:
-                var b = self.rail[j]
-                if hit(b.x, b.y, b.w, b.h, x, y):
-                    if self.active_view == b.key and self.sidebar_open:
-                        self.sidebar_open = false
-                    else:
-                        self.active_view = b.key
-                        self.sidebar_open = true
-                        self.search_focus = (b.key == "search")
-                    self._layout()
-                    e.consume()
-                    return
-                j = j + 1
-            return
-        if self.sidebar_open:
-            if x >= self.sidebar_x + self.sidebar_w - 5 and x <= self.sidebar_x + self.sidebar_w + 5:
-                if y > self.content_y and y < self.status_y:
-                    self.dragging_sidebar = true
-                    e.consume()
-                    return
-        if self.sidebar_open and self.active_view == "search":
-            if x > self.sidebar_x and x < self.sidebar_x + self.sidebar_w:
-                if y >= self.content_y + 32 and y < self.content_y + 60:
-                    self.search_focus = true
-                    e.consume()
-                    return
-                var si2 = 0
-                while si2 < len(self.search_rows):
-                    var sr = self.search_rows[si2]
-                    if y >= sr["y"] and y < sr["y"] + 34:
-                        var hit = self.search_hits[sr["i"]]
-                        self._open_path(hit["path"])
-                        self._goto_line(hit["line"])
-                        self.status_msg = hit["file"] + " : " + str(hit["line"])
-                        e.consume()
-                        return
-                    si2 = si2 + 1
-                self.search_focus = false
-        if self.sidebar_open and self.active_view == "ai":
-            if x > self.sidebar_x and x < self.sidebar_x + self.sidebar_w:
-                var ai_i = 0
-                while ai_i < len(self.ai_rows):
-                    var arow = self.ai_rows[ai_i]
-                    if y >= arow["y"] and y < arow["y"] + 40:
-                        self._goto_line(arow["line"])
-                        e.consume()
-                        return
-                    ai_i = ai_i + 1
-        if self.sidebar_open and self.active_view == "outline":
-            if x > self.sidebar_x and x < self.sidebar_x + self.sidebar_w:
-                if y > self.content_y + 34 and y < self.status_y:
-                    var oi = int((y - self.content_y - 34) / 22)
-                    if oi >= 0 and oi < self.outline_n:
-                        self.outline_sel = oi
-                        self._goto_line(self.outline[oi]["line"] + 1)
-                        e.consume()
-                        return
-        if self.sidebar_open and self.active_view == "explorer":
-            if x > self.sidebar_x and x < self.sidebar_x + self.sidebar_w:
-                if y > self.content_y + 34 and y < self.status_y:
-                    var idx = int((y - self.content_y - 34) / 22) + self.tree_scroll
-                    if idx >= 0 and idx < self.ws.row_count:
-                        self.tree_sel = idx
-                        var n = self.ws.rows[idx]
-                        if n.is_dir:
-                            self.ws.toggle(n.path)
-                        else:
-                            self._open_path(n.path)
-                        self._dirty = true
-                        e.consume()
-                        return
-        if y >= self.tabbar_y and y < self.tabbar_y + self.TABBAR_H and x >= self.col_x:
-            var t = 0
-            while t < self.tab_count:
-                var tb = self.tabs[t]
-                if x >= tb.x and x < tb.x + tb.w:
-                    # The "x" glyph was drawn but never hit-tested, so tabs
-                    # could not be closed.
-                    if x >= tb.x + tb.w - 24:
-                        self._close_tab(t)
-                    else:
-                        self.active_tab = t
-                        self.editor.set_buffer(self.buffers[t])
-                        self.status_msg = "Opened " + tb.title
-                    e.consume()
-                    return
-                t = t + 1
-            return
-        if self.panel_open:
-            if y >= self.panel_y - 6 and y <= self.panel_y + 6 and x >= self.col_x:
-                self.dragging_split = true
-                e.consume()
-                return
-        # Clicking a problem opens its file at the reported line.
-        if self.panel_open and self.active_panel == 1 and y > self.panel_y + self.PANELTAB_H:
-            var pi = 0
-            while pi < len(self.problem_rows):
-                var pr2 = self.problem_rows[pi]
-                if y >= pr2["y"] and y < pr2["y"] + 22:
-                    var prob = self.problems[pr2["i"]]
-                    if self.ws.root != "":
-                        var fp = os_path_join(self.ws.root, prob["file"])
-                        if os_exists(fp):
-                            self._open_path(fp)
-                    if prob["line"] > 0:
-                        self._goto_line(prob["line"])
-                    self.status_msg = prob["file"] + ":" + str(prob["line"])
-                    e.consume()
-                    return
-                pi = pi + 1
-        if self.panel_open and y >= self.panel_y and y < self.panel_y + self.PANELTAB_H:
-            # The tab strip hit-tests itself during draw (immediate mode), so
-            # this only has to record the pointer state the strip will read and
-            # swallow the event.
-            e.consume()
-            return
-        if self.mm_w > 0 and x >= self.col_x + self.ed_w and y >= self.ed_y and y < self.panel_y:
-            self._minimap_scroll(y)
-            self.dragging_mm = true
-            e.consume()
-            return
-        if y >= self.ed_y and y < self.panel_y and x >= self.col_x:
-            # Clicking the gutter toggles a breakpoint, as in Code::Blocks.
-            if x < self.col_x + self.GUTTER_W:
-                var row = int((y - self.ed_y) / 18)
-                if row >= 0 and row < self.buffers[self.active_tab].line_count:
-                    self._toggle_break(row)
-                    e.consume()
-                    return
+        self._click(h, e)
+
+    def _on_up(self, e):
+        self.mouse_down = false
+        if self.dragging == "tab":
+            self._finish_tab_drag(e.x)
+        if self.dragging != "":
+            if self.dragging == "sidebar" or self.dragging == "panel":
+                self._save_settings()
+            self.dragging = ""
+            self._dirty = true
+
+    def _drag_to(self, x, y):
+        var d = self.dragging
+        if d == "sidebar":
+            var nw = x - self.ACT_W
+            if nw < self.dp(170):
+                nw = self.dp(170)
+            if nw > self.W - self.dp(500):
+                nw = self.W - self.dp(500)
+            self.SIDEBAR_W = nw
+            self._layout()
+        elif d == "panel":
+            var avail = self.content_h
+            var ratio = (self.content_y + avail - y) * 1.0 / avail
+            if ratio < 0.10:
+                ratio = 0.10
+            if ratio > 0.80:
+                ratio = 0.80
+            self.panel_ratio = ratio
+            self.panel_max = false
+            self._layout()
+        elif d == "select":
+            self._drag_select(x, y)
+        elif d == "lines":
             var p = self._pos_at(x, y)
-            var buf = self.buffers[self.active_tab]
-            if e.alt:
-                self._add_caret(p["row"], p["col"])
-                self.editor.focused = true
-                e.consume()
-                return
-            self._clear_extra_carets()
-            buf.cursor_row = p["row"]
-            buf.cursor_col = p["col"]
-            if e.shift:
-                self._sel_begin()
+            var b = self.buf()
+            var dd = self.doc()
+            if p[0] >= dd.sel_row:
+                b.cursor_row = p[0] + 1
+                b.cursor_col = 0
+                if b.cursor_row >= b.line_count:
+                    b.cursor_row = b.line_count - 1
+                    b.cursor_col = len(b.get_line(b.cursor_row))
             else:
-                self.sel_on = true
-                self.sel_row = p["row"]
-                self.sel_col = p["col"]
-            self.dragging_sel = true
-            self.editor.focused = true
-            e.consume()
+                b.cursor_row = p[0]
+                b.cursor_col = 0
+        elif d == "vscroll":
+            self._vscroll_to(y - self.drag_off)
+        elif d == "minimap":
+            self._minimap_to(y)
+        elif d == "dbgseek":
+            self._dbg_seek_x(x)
 
-    def _global_keys(self, e):
-        if e.key == "p" and e.ctrl:
-            self._open_palette()
-            e.consume()
-            return true
-        if e.key == "b" and e.ctrl:
-            self.sidebar_open = not self.sidebar_open
-            self._layout()
-            e.consume()
-            return true
-        if e.key == "j" and e.ctrl:
-            self.panel_open = not self.panel_open
-            self._layout()
-            e.consume()
-            return true
-        if e.key == "escape":
-            if self.menu_open >= 0:
-                self.menu_open = -1
-                e.consume()
-                return true
-            if self.selmodel.count > 1:
-                self._clear_extra_carets()
-                e.consume()
-                return true
-        if e.key == "k" and e.ctrl and not e.shift:
-            self._ask("open_folder", "Open Folder", "Folder to open as the workspace", getcwd())
-            e.consume()
-            return true
-        if e.key == "n" and e.ctrl and e.shift:
-            self._ask("new_project", "New Project", "Folder to create the project in", os_path_join(getcwd(), "MyProject"))
-            e.consume()
-            return true
-        if e.key == "o" and e.ctrl:
-            self._ask("open_file", "Open File", "Path to a file", getcwd())
-            e.consume()
-            return true
-        if e.ctrl and (e.key == "+" or e.key == "=" or e.key == "plus"):
-            self._zoom(1)
-            e.consume()
-            return true
-        if e.ctrl and (e.key == "-" or e.key == "minus"):
-            self._zoom(0 - 1)
-            e.consume()
-            return true
-        if e.ctrl and e.key == "0":
-            self._zoom(13 - self.font_size)
-            e.consume()
-            return true
-        if e.key == "t" and e.ctrl and e.shift:
-            self._set_theme(not self.th.dark)
-            var tm = "dark"
-            if not self.th.dark:
-                tm = "light"
-            self._toast("Theme: " + tm, "ok")
-            self.status_msg = "Theme: " + tm
-            e.consume()
-            return true
-        if e.ctrl and (e.key == "/" or e.key == "slash"):
-            self._toggle_comment()
-            e.consume()
-            return true
-        if e.key == "d" and e.ctrl:
-            self._duplicate_line()
-            e.consume()
-            return true
-        if e.key == "k" and e.ctrl and e.shift:
-            self._delete_line()
-            e.consume()
-            return true
-        if e.key == "up" and e.alt and e.ctrl:
-            self._add_caret_vertical(0 - 1)
-            e.consume()
-            return true
-        if e.key == "down" and e.alt and e.ctrl:
-            self._add_caret_vertical(1)
-            e.consume()
-            return true
-        if e.key == "up" and e.alt:
-            self._move_line(0 - 1)
-            e.consume()
-            return true
-        if e.key == "down" and e.alt:
-            self._move_line(1)
-            e.consume()
-            return true
-        if e.key == "space" and e.ctrl:
-            self._ac_open_now()
-            e.consume()
-            return true
-        if e.key == "s" and e.ctrl:
-            var sp = self._save_active()
-            self.console.write("saved " + sp, "ok")
-            self._toast("Saved " + os_path_basename(sp), "ok")
-            self.status_msg = "Saved " + os_path_basename(sp)
-            e.consume()
-            return true
-        if e.key == "z" and e.ctrl and e.shift:
-            self._redo()
-            e.consume()
-            return true
-        if e.key == "z" and e.ctrl:
-            self._undo()
-            e.consume()
-            return true
-        if e.key == "y" and e.ctrl:
-            self._redo()
-            e.consume()
-            return true
-        if e.key == "c" and e.ctrl:
-            self._copy_line()
-            e.consume()
-            return true
-        if e.key == "x" and e.ctrl:
-            self._cut_line()
-            e.consume()
-            return true
-        if e.key == "v" and e.ctrl:
-            self._paste()
-            e.consume()
-            return true
-        if e.key == "f10" or e.key == "f11":
-            self._debug_step("Step")
-            e.consume()
-            return true
-        if e.key == "f" and e.ctrl:
-            self.find_open = true
-            self.find_replace_mode = false
-            self.find_field = 0
-            self._find_run()
-            e.consume()
-            return true
-        if e.key == "h" and e.ctrl:
-            self.find_open = true
-            self.find_replace_mode = true
-            self.find_field = 0
-            self._find_run()
-            e.consume()
-            return true
-        if e.key == "g" and e.ctrl:
-            self._ask("goto", "Go to Line", "Line number", "")
-            e.consume()
-            return true
-        if e.key == "f9":
-            self._toggle_break(self.buffers[self.active_tab].cursor_row)
-            e.consume()
-            return true
-        if e.key == "f5":
-            self._run()
-            e.consume()
-            return true
-        return false
-
-    def _open_palette(self):
-        self.palette_open = true
-        self.palette_query = ""
-        self.palette_sel = 0
-        self._palette_filter()
-
-    def _palette_filter(self):
-        # Fuzzy, not substring. Substring matching meant "gtl" did not find
-        # "Go to Line" and "oprj" did not find "Open Project" — the two things a
-        # command palette exists to do. Results are ranked, so the intended
-        # command sorts to the top instead of merely appearing in the list.
-        var q = self.palette_query
-        var hits = []
-        var n = 0
-        if len(q) == 0:
-            var i = 0
-            while i < len(self.palette_all):
-                hits.append(self.palette_all[i])
-                n = n + 1
-                i = i + 1
-        else:
-            var ranked = self.fuzzy.rank(q, self.palette_all)
-            var j = 0
-            while j < len(ranked):
-                hits.append(ranked[j][0])
-                n = n + 1
-                j = j + 1
-        self.palette_hits = hits
-        self.palette_hit_count = n
-        if self.palette_sel >= n:
-            self.palette_sel = 0
-
-    def _palette_event(self, e):
-        if e.type == "keydown":
-            if e.key == "escape":
-                self.palette_open = false
-                e.consume()
-                return
-            if e.key == "down":
-                self.palette_sel = self.palette_sel + 1
-                if self.palette_sel >= self.palette_hit_count:
-                    self.palette_sel = 0
-                e.consume()
-                return
-            if e.key == "up":
-                self.palette_sel = self.palette_sel - 1
-                if self.palette_sel < 0:
-                    self.palette_sel = self.palette_hit_count - 1
-                e.consume()
-                return
-            if e.key == "enter":
-                if self.palette_hit_count > 0:
-                    self._run_command(self.palette_hits[self.palette_sel])
-                self.palette_open = false
-                e.consume()
-                return
-            if e.key == "backspace":
-                if len(self.palette_query) > 0:
-                    self.palette_query = string_slice(self.palette_query, 0, len(self.palette_query) - 1)
-                    self._palette_filter()
-                e.consume()
-                return
-        if e.type == "textinput":
-            self.palette_query = self.palette_query + e.text
-            self._palette_filter()
-            e.consume()
-
-    def _open_path(self, path):
-        var title = os_path_basename(path)
-        var i = 0
-        while i < self.tab_count:
-            if self.tabs[i].title == title:
-                self.active_tab = i
-                self.editor.set_buffer(self.buffers[i])
-                self.status_msg = "Switched to " + title
-                return
-            i = i + 1
-        var text = read_file(path)
-        if text == none:
-            self.status_msg = "Could not read " + path
+    # Auto-scrolls while a selection drag leaves the text area.
+    def _drag_select(self, x, y):
+        var d = self.doc()
+        if d.buf == none:
             return
-        self.buffers.append(EditorBuffer(title, text))
-        var nt = EdTab(title)
-        nt.path = path
-        self.tabs.append(nt)
-        self.tab_count = self.tab_count + 1
-        self.active_tab = self.tab_count - 1
-        self.editor.set_buffer(self.buffers[self.active_tab])
-        self._remember_recent(path)
-        self.status_msg = "Opened " + path
-        self._layout()
+        if y < self.ed_y:
+            d.scroll_y = d.scroll_y - self.LINE_H
+        elif y > self.ed_y + self.ed_h:
+            d.scroll_y = d.scroll_y + self.LINE_H
+        self._clamp_scroll()
+        var p = self._pos_at(x, y)
+        d.buf.cursor_row = p[0]
+        d.buf.cursor_col = p[1]
 
-    # ── modal path prompt ────────────────────────────────────────────────────
-    def _ask(self, action, title, hint, prefill):
-        self.dialog_open = true
-        self.dialog_action = action
-        self.dialog_title = title
-        self.dialog_hint = hint
-        self.dialog_input = prefill
-
-    def _dialog_commit(self):
-        var v = string_strip(self.dialog_input)
-        self.dialog_open = false
-        if v == "":
+    def _vscroll_to(self, thumb_y):
+        var d = self.doc()
+        if d.buf == none:
             return
-        if self.dialog_action == "open_folder":
-            if self.ws.open_folder(v):
-                self._load_hl_rules(false)
-                self.status_msg = "Opened folder " + v
-            else:
-                self.status_msg = self.ws.error
-        elif self.dialog_action == "open_file":
-            self._open_path(v)
-        elif self.dialog_action == "open_project":
-            var pr = Project()
-            if pr.load(v):
-                self.ws.project = pr
-                self.ws.open_folder(pr.root)
-                self._open_path(pr.target)
-                self.status_msg = "Project " + pr.name
-            else:
-                self.status_msg = "Not a project file: " + v
-        elif self.dialog_action == "addtoken":
-            var eqp = string_find(v, "=")
-            if eqp > 0:
-                var wname = string_strip(string_slice(v, 0, eqp))
-                var cparts = string_split(string_slice(v, eqp + 1, len(v)), ",")
-                if len(cparts) >= 3:
-                    self.editor.hl.add_token(wname, Color(int(cparts[0]), int(cparts[1]), int(cparts[2]), 255))
-                    self._toast("Highlighting " + wname, "ok")
-            else:
-                self.editor.hl.add_keyword(string_strip(v))
-                self._toast("Keyword " + string_strip(v), "ok")
-            self._hl_cache = {}
-            self._hl_cache_n = 0
-        elif self.dialog_action == "goto":
-            self._goto_line(int(v))
-        elif self.dialog_action == "new_project":
-            var nm = os_path_basename(v)
-            var pr2 = Project()
-            if pr2.create(v, nm):
-                self.ws.project = pr2
-                self.ws.open_folder(v)
-                self._open_path(pr2.target)
-                self.console.write("Created project " + nm + " at " + v, "ok")
-                self.active_panel = 0
-                self.panel_open = true
-                self.status_msg = "Created project " + nm
-            else:
-                self.status_msg = "Could not create project at " + v
-        self._layout()
-
-    def _draw_dialog(self, r):
-        var th = self.th
-        r.fill_xywh(0, 0, self.W, self.H, th.scrim)
-        var dw = 620
-        if dw > self.W - 80:
-            dw = self.W - 80
-        var dx = int(self.W / 2 - dw / 2)
-        var dy = 130
-        var dh = 150
-        r.draw_shadow(Rect(dx, dy, dw, dh), 26, 0, 12, Color(0, 0, 0, 180))
-        r.fill_round_xywh(dx, dy, dw, dh, th.overlay, 12)
-        r.draw_rounded_rect(Rect(dx, dy, dw, dh), th.accent, 12, 1)
-        self.icons.draw(r, "folder_open", dx + 20, dy + 18, 20, th.accent)
-        r.draw_text(self.dialog_title, dx + 50, dy + 20, self.f_ui_bold, th.text)
-        r.draw_text(self.dialog_hint, dx + 20, dy + 48, self.f_small, th.text_faint)
-        r.fill_round_xywh(dx + 20, dy + 70, dw - 40, 34, Color(255, 255, 255, 14), 7)
-        r.draw_rounded_rect(Rect(dx + 20, dy + 70, dw - 40, 34), th.border, 7, 1)
-        r.draw_text(self.dialog_input, dx + 32, dy + 79, self.f_code, th.text)
-        var m = self.f_code.width(self.dialog_input)
-        r.fill_xywh(dx + 33 + m, dy + 78, 1, 18, th.text)
-        r.draw_text("Enter to confirm     Esc to cancel", dx + 20, dy + 116, self.f_small, th.text_faint)
-
-    def _dialog_event(self, e):
-        if e.type == "keydown":
-            if e.key == "escape":
-                self.dialog_open = false
-                e.consume()
-                return
-            if e.key == "enter":
-                self._dialog_commit()
-                e.consume()
-                return
-            if e.key == "backspace":
-                if len(self.dialog_input) > 0:
-                    self.dialog_input = string_slice(self.dialog_input, 0, len(self.dialog_input) - 1)
-                e.consume()
-                return
-        if e.type == "textinput":
-            self.dialog_input = self.dialog_input + e.text
-            e.consume()
-
-    # A faint rule every four columns of leading whitespace, as VS Code does,
-    # so nesting is readable without counting spaces.
-    def _draw_indent_guides(self, r, line, x, y, line_h):
-        if line == none:
+        var total = (d.buf.line_count - 1) * self.LINE_H + self.ed_h
+        var maxs = total - self.ed_h
+        var room = self.ed_h - self.vs_thumb_h
+        if room <= 0:
             return
-        var n = len(line)
-        var i = 0
-        while i < n and string_slice(line, i, i + 1) == " ":
-            i = i + 1
-        if i < 4:
-            return
-        var cw = self.editor.char_w
-        var g = 4
-        while g <= i:
-            r.fill_xywh(x + g * cw - cw * 4, y, 1, line_h, Color(255, 255, 255, 14))
-            g = g + 4
+        var f = (thumb_y - self.ed_y) * 1.0 / room
+        if f < 0.0:
+            f = 0.0
+        if f > 1.0:
+            f = 1.0
+        d.scroll_y = int(maxs * f)
+        self._clamp_scroll()
 
-    # Highlight the bracket under the cursor and its partner.
-    def _draw_bracket_match(self, r, buf, top, line_h, text_x):
-        var row = buf.cursor_row
-        var line = buf.get_line(row)
-        var col = buf.cursor_col
-        if col >= len(line):
-            col = len(line) - 1
-        if col < 0:
-            return
-        var ch = string_slice(line, col, col + 1)
-        var opens = "([{"
-        var closes = ")]}"
-        var oi = string_find(opens, ch)
-        var ci = string_find(closes, ch)
-        if oi < 0 and ci < 0:
-            return
-        var want = ""
-        var step = 1
-        if oi >= 0:
-            want = string_slice(closes, oi, oi + 1)
-        else:
-            want = string_slice(opens, ci, ci + 1)
-            step = -1
-        var depth = 0
-        var c = col
-        var found = -1
-        while c >= 0 and c < len(line):
-            var cc = string_slice(line, c, c + 1)
-            if cc == ch:
-                depth = depth + 1
-            elif cc == want:
-                depth = depth - 1
-                if depth == 0:
-                    found = c
-                    c = -2
-            c = c + step
-        if found < 0:
-            return
-        var yy = self.ed_y + (row - top) * line_h
-        var a = self.f_code.width(string_slice(line, 0, col))
-        var b = self.f_code.width(string_slice(line, 0, found))
-        var cw = self.f_code.width(ch)
-        r.draw_rounded_rect(Rect(text_x + a - 1, yy + 1, cw + 2, line_h - 3), Color(140, 150, 255, 130), 2, 1)
-        r.draw_rounded_rect(Rect(text_x + b - 1, yy + 1, cw + 2, line_h - 3), Color(140, 150, 255, 130), 2, 1)
+    def _minimap_to(self, y):
+        var d = self.doc()
+        var row = self.mm_first + int((y - self.ed_y) / 2)
+        d.scroll_y = (row - int(self._rows_visible() / 2)) * self.LINE_H
+        self._clamp_scroll()
 
-    # Switching the chrome theme must also switch the syntax palette and drop
-    # the highlight cache, which stores resolved colours per line.
-    def _set_theme(self, dark):
-        self.th.dark = dark
-        self.th.apply()
-        self.editor.hl.set_dark(dark)
-        self._hl_cache = {}
-        self._hl_cache_n = 0
-
-    # Workspace-local syntax rules. Dropping a .nyhighlight file beside the
-    # project makes its tokens colour without touching the IDE source.
-    def _load_hl_rules(self, announce):
-        if self.ws.root == "":
-            return
-        var path = os_path_join(self.ws.root, ".nyhighlight")
-        var n = self.editor.hl.load_rules(path)
-        self._hl_cache = {}
-        self._hl_cache_n = 0
-        if n > 0:
-            self.status_msg = str(n) + " highlight rule(s) from .nyhighlight"
-            if announce:
-                self._toast(str(n) + " highlight rules loaded", "ok")
-        elif announce:
-            self._toast("No .nyhighlight in workspace", "err")
-
-    # ── recent files ─────────────────────────────────────────────────────────
-    def _remember_recent(self, path):
-        if path == "":
-            return
-        var keep = [path]
-        var n = 1
-        var i = 0
-        while i < self.recent_n:
-            if self.recent[i] != path and n < 8:
-                keep.append(self.recent[i])
-                n = n + 1
-            i = i + 1
-        self.recent = keep
-        self.recent_n = n
-
-    # ── wheel scrolling for the sidebar and the bottom panel ────────────────
-    def _scroll_tree(self, delta):
-        var rows = self.ws.row_count
-        if self.active_view == "outline":
-            rows = self.outline_n
-        var visible = int((self.status_y - self.content_y - 34) / 22)
-        var maxs = rows - visible
-        if maxs < 0:
-            maxs = 0
-        self.tree_scroll = self.tree_scroll - delta * 3
-        if self.tree_scroll < 0:
-            self.tree_scroll = 0
-        if self.tree_scroll > maxs:
-            self.tree_scroll = maxs
-
-    def _scroll_panel(self, delta):
-        self.panel_scroll = self.panel_scroll - delta * 3
-        if self.panel_scroll < 0:
-            self.panel_scroll = 0
-        var maxs = self.problem_count - 4
-        if maxs < 0:
-            maxs = 0
-        if self.panel_scroll > maxs:
-            self.panel_scroll = maxs
-
-    # ── editor zoom ──────────────────────────────────────────────────────────
-    # Ctrl +/- resizes the code font. Line height follows so the gutter, caret,
-    # selection and minimap stay aligned, and the highlight cache is dropped
-    # because it stores pixel offsets measured at the old size.
-    def _zoom(self, delta):
-        var ns = self.font_size + delta
-        if ns < 8:
-            ns = 8
-        if ns > 30:
-            ns = 30
-        if ns == self.font_size:
-            return
-        self.font_size = ns
-        self.f_code = Font("monospace", ns, false, false)
-        self.LINE_H = int(ns * 1.4)
-        self.editor.line_h = self.LINE_H
-        var cw = self.f_code.width("M")
-        self.editor.char_w = cw
-        self.f_code.ensure_loaded()
-        self._code_handle = self.f_code._handle
-        self._hl_cache = {}
-        self._hl_cache_n = 0
-        self.status_msg = "Font size " + str(ns)
-        self._layout()
-
-    # ── minimap navigation ───────────────────────────────────────────────────
-    # Clicking or dragging in the minimap scrolls the editor to that fraction of
-    # the document, like VS Code's.
-    def _minimap_scroll(self, y):
-        var buf = self.buffers[self.active_tab]
-        var frac = (y - self.ed_y) * 1.0 / self.ed_h
-        if frac < 0.0:
-            frac = 0.0
-        if frac > 1.0:
-            frac = 1.0
-        var maxs = buf.line_count * self.LINE_H - self.ed_h
-        if maxs < 0:
-            maxs = 0
-        self.editor.scroll_y = int(maxs * frac)
-        self.status_msg = "Line " + str(int(self.editor.scroll_y / self.LINE_H) + 1)
-
-    # ══ AI assistant ═════════════════════════════════════════════════════════
-    # Runs lib/aiagent.ny's CodeAnalyzer over the active buffer. Cached per file
-    # so the analysis is not redone on every frame.
-    def _ai_analyze(self, force):
-        var title = self.tabs[self.active_tab].title
-        if not force and self.ai_file == title:
-            return
-        var text = self.buffers[self.active_tab].get_all_text()
-        var found = self.ai.analyze(text)
-        self.ai_issues = found
-        self.ai_n = len(found)
-        self.ai_file = title
-
-    def _draw_ai(self, r, x, w):
-        var th = self.th
-        self._ai_analyze(false)
-        var y = self.content_y + 34
-        r.draw_text(self.tabs[self.active_tab].title, x + 14, y, self.f_small, th.accent)
-        y = y + 20
-        if self.ai_n == 0:
-            self.icons.draw(r, "run", x + 14, y + 2, 16, th.ok)
-            r.draw_text("No issues found", x + 36, y + 3, self.f_ui, th.text_dim)
-            r.draw_text("Analyser: pattern review of the open buffer", x + 14, y + 30, self.f_small, th.text_faint)
-            return
-        r.draw_text(str(self.ai_n) + " suggestion(s)", x + 14, y, self.f_small, th.text_faint)
-        y = y + 22
-        self.ai_rows = []
-        var i = self.tree_scroll
-        r.set_clip(Rect(x, y, w, self.status_y - y))
-        while i < self.ai_n:
-            if y + 40 <= self.status_y:
-                var it = self.ai_issues[i]
-                self.icons.draw(r, "warning", x + 12, y + 4, 14, th.warn)
-                r.draw_text(it["message"], x + 32, y + 2, self.f_ui, th.text)
-                r.draw_text("line " + str(it["line"]) + "   " + string_strip(it["code"]),
-                            x + 32, y + 20, self.f_small, th.text_faint)
-                self.ai_rows = self.ai_rows + [{"y": y, "line": it["line"]}]
-                y = y + 40
-            i = i + 1
-        r.clear_clip()
-
-    # ══ settings persistence ═════════════════════════════════════════════════
-    # Plain "key = value" lines in .nyide next to the workspace, so preferences
-    # survive a restart and can be edited without the IDE.
-    def _settings_path(self):
-        var root = self.ws.root
-        if root == "":
-            root = getcwd()
-        return os_path_join(root, ".nyide")
-
-    def _save_settings(self):
-        var mode = "dark"
-        if not self.th.dark:
-            mode = "light"
-        var body = "# NythonIDE preferences\n"
-        body = body + "theme = " + mode + "\n"
-        body = body + "font_size = " + str(self.font_size) + "\n"
-        body = body + "sidebar_width = " + str(self.SIDEBAR_W) + "\n"
-        body = body + "minimap = " + str(self.minimap_on) + "\n"
-        body = body + "panel = " + str(self.panel_open) + "\n"
-        write(self._settings_path(), body)
-        self.status_msg = "Settings saved"
-        return true
-
-    def _load_settings(self):
-        var path = self._settings_path()
-        if not os_exists(path):
-            return false
-        var text = read_file(path)
-        if text == none or text == "":
-            return false
-        var lines = string_split(text, "\n")
-        var i = 0
-        while i < len(lines):
-            var ln = string_strip(lines[i])
-            if len(ln) > 0 and string_find(ln, "#") != 0:
-                var eq = string_find(ln, "=")
-                if eq > 0:
-                    var k = string_strip(string_slice(ln, 0, eq))
-                    var v = string_strip(string_slice(ln, eq + 1, len(ln)))
-                    if k == "theme":
-                        self._set_theme(v == "dark")
-                    elif k == "font_size":
-                        self._zoom(int(v) - self.font_size)
-                    elif k == "sidebar_width":
-                        self.SIDEBAR_W = int(v)
-                    elif k == "minimap":
-                        self.minimap_on = (v == "true")
-                    elif k == "panel":
-                        self.panel_open = (v == "true")
-            i = i + 1
-        self._layout()
-        self.status_msg = "Settings loaded"
-        return true
-
-    # ══ workspace search ═════════════════════════════════════════════════════
-    # Scans every code file in the workspace for the query and lists each match
-    # with its file and line. Clicking a result opens the file at that line.
-    def _run_search(self):
-        var hits = []
-        var n = 0
-        var files = 0
-        if len(self.search_query) < 2:
-            self.search_hits = []
-            self.search_n = 0
-            self.search_files = 0
-            return
-        var i = 0
-        while i < self.ws.row_count:
-            var row = self.ws.rows[i]
-            if not row.is_dir and (row.kind == "code" or row.kind == "text"):
-                var text = read_file(row.path)
-                if text != none and text != "":
-                    var lines = string_split(text, "\n")
-                    var j = 0
-                    var found_here = false
-                    while j < len(lines) and n < 300:
-                        if string_find(lines[j], self.search_query) >= 0:
-                            hits.append({"file": row.name, "path": row.path,
-                                         "line": j + 1, "text": string_strip(lines[j])})
-                            n = n + 1
-                            found_here = true
-                        j = j + 1
-                    if found_here:
-                        files = files + 1
-            i = i + 1
-        self.search_hits = hits
-        self.search_n = n
-        self.search_files = files
-        self.status_msg = str(n) + " results in " + str(files) + " files"
-
-    def _draw_search(self, r, x, w):
-        var th = self.th
-        var fy = self.content_y + 32
-        var fb = th.field
-        if self.search_focus:
-            fb = th.accent_soft
-        r.fill_round_xywh(x + 10, fy, w - 20, 28, fb, 6)
-        self.icons.draw(r, "search", x + 16, fy + 6, 16, th.text_faint)
-        if self.search_query == "":
-            r.draw_text("Search workspace", x + 38, fy + 7, self.f_ui, th.text_faint)
-        else:
-            r.draw_text(self.search_query, x + 38, fy + 7, self.f_ui, th.text)
-            if self.search_focus:
-                var qm = self.f_code.width(self.search_query)
-                r.fill_xywh(x + 39 + qm, fy + 6, 1, 16, th.text)
-        var y = fy + 36
-        if self.search_n == 0:
-            var msg = "No results"
-            if self.search_query == "":
-                msg = "Type at least two characters"
-            r.draw_text(msg, x + 14, y, self.f_small, th.text_faint)
-            return
-        r.draw_text(str(self.search_n) + " results in " + str(self.search_files) + " files",
-                    x + 14, y, self.f_small, th.text_faint)
-        y = y + 20
-        self.search_rows = []
-        var i = self.tree_scroll
-        r.set_clip(Rect(x, y, w, self.status_y - y))
-        while i < self.search_n:
-            if y + 34 <= self.status_y:
-                var h = self.search_hits[i]
-                self.icons.draw(r, "file_code", x + 12, y + 2, 14, th.accent)
-                r.draw_text(h["file"] + " : " + str(h["line"]), x + 32, y, self.f_small, th.text_dim)
-                # No truncation by slice: string_slice cuts by byte offset and
-                # can split a multi-byte character, producing invalid UTF-8.
-                # The sidebar is already clipped, so let the clip do it.
-                r.draw_text(h["text"], x + 32, y + 16, self.f_code, th.text_faint)
-                self.search_rows = self.search_rows + [{"y": y, "i": i}]
-                y = y + 34
-            i = i + 1
-        r.clear_clip()
-
-    def _search_event(self, e):
-        if e.type == "textinput":
-            self.search_query = self.search_query + e.text
-            self._run_search()
-            e.consume()
-            return
-        if e.type == "keydown":
-            if e.key == "backspace":
-                if len(self.search_query) > 0:
-                    self.search_query = string_slice(self.search_query, 0, len(self.search_query) - 1)
-                    self._run_search()
-                e.consume()
-                return
-            if e.key == "escape":
-                self.search_focus = false
-                e.consume()
-                return
-            if e.key == "enter":
-                self._run_search()
-                e.consume()
-                return
-
-    # ══ symbol outline ═══════════════════════════════════════════════════════
-    # Code::Blocks' symbol browser: every class / def / top-level var in the
-    # active buffer, indented by nesting, click to jump.
-    def _build_outline(self):
-        var out = []
-        var n = 0
-        var buf = self.buffers[self.active_tab]
-        var i = 0
-        while i < buf.line_count:
-            var raw = buf.get_line(i)
-            var st = string_strip(raw)
-            var kind = ""
-            var nm = ""
-            if string_find(st, "class ") == 0:
-                kind = "class"
-                nm = string_slice(st, 6, len(st))
-            elif string_find(st, "def ") == 0:
-                kind = "def"
-                nm = string_slice(st, 4, len(st))
-            if kind != "":
-                var cut = len(nm)
-                var stops = ["(", ":", " "]
-                var k = 0
-                while k < len(stops):
-                    var at = string_find(nm, stops[k])
-                    if at >= 0 and at < cut:
-                        cut = at
-                    k = k + 1
-                nm = string_strip(string_slice(nm, 0, cut))
-                var indent = 0
-                while indent < len(raw) and string_slice(raw, indent, indent + 1) == " ":
-                    indent = indent + 1
-                if nm != "":
-                    out.append({"name": nm, "kind": kind, "line": i, "depth": int(indent / 4)})
-                    n = n + 1
-            i = i + 1
-        self.outline = out
-        self.outline_n = n
-
-    def _draw_outline(self, r, x, w):
-        var th = self.th
-        self._build_outline()
-        var y = self.content_y + 34
-        if self.outline_n == 0:
-            r.draw_text("No symbols in this file", x + 14, y, self.f_small, th.text_faint)
-            return
-        r.set_clip(Rect(x, y, w, self.status_y - y))
-        var i = self.tree_scroll
-        while i < self.outline_n:
-            if y + 22 <= self.status_y:
-                var sy = self.outline[i]
-                var ix = x + 10 + sy["depth"] * 14
-                if i == self.outline_sel:
-                    r.fill_xywh(x, y, w, 22, th.accent_soft)
-                    r.fill_xywh(x, y, 2, 22, th.accent)
-                var ic = "file_code"
-                var icol = th.accent
-                if sy["kind"] == "class":
-                    ic = "project"
-                    icol = th.ok
-                self.icons.draw(r, ic, ix, y + 3, 16, icol)
-                r.draw_text(sy["name"], ix + 22, y + 4, self.f_ui, th.text_dim)
-                var lm = self.f_small.width(str(sy["line"] + 1))
-                r.draw_text(str(sy["line"] + 1), x + w - lm - 12, y + 5, self.f_small, th.text_faint)
-                y = y + 22
-            i = i + 1
-        r.clear_clip()
-
-    # ══ line operations ══════════════════════════════════════════════════════
-    # Range the operation applies to: the selection if there is one, else the
-    # cursor line.
-    def _line_span(self):
-        var g = self._sel_range()
-        if g == none:
-            var cr = self.buffers[self.active_tab].cursor_row
-            return {"a": cr, "b": cr}
-        return {"a": g["r1"], "b": g["r2"]}
-
-    def _after_edit(self):
-        self._hl_cache = {}
-        self._hl_cache_n = 0
-        self.tabs[self.active_tab].dirty = true
-
-    def _toggle_comment(self):
-        self.buffers[self.active_tab].push_snapshot()
-        var buf = self.buffers[self.active_tab]
-        var sp = self._line_span()
-        # If every non-blank line in the range is already commented, uncomment;
-        # otherwise comment them all. Matches how editors behave on mixed input.
-        var all_commented = true
-        var i = sp["a"]
-        while i <= sp["b"]:
-            var st = string_strip(buf.get_line(i))
-            if st != "" and string_find(st, "#") != 0:
-                all_commented = false
-            i = i + 1
-        i = sp["a"]
-        while i <= sp["b"]:
-            var line = buf.get_line(i)
-            var st2 = string_strip(line)
-            if st2 != "":
-                if all_commented:
-                    var at = string_find(line, "#")
-                    var head = string_slice(line, 0, at)
-                    var rest = string_slice(line, at + 1, len(line))
-                    if string_find(rest, " ") == 0:
-                        rest = string_slice(rest, 1, len(rest))
-                    buf.lines[i] = head + rest
-                else:
-                    var ind = 0
-                    while ind < len(line) and string_slice(line, ind, ind + 1) == " ":
-                        ind = ind + 1
-                    buf.lines[i] = string_slice(line, 0, ind) + "# " + string_slice(line, ind, len(line))
-            i = i + 1
-        self._after_edit()
-        self.status_msg = "Toggled comment"
-
-    def _duplicate_line(self):
-        self.buffers[self.active_tab].push_snapshot()
-        var buf = self.buffers[self.active_tab]
-        var row = buf.cursor_row
-        var out = []
-        var i = 0
-        while i < buf.line_count:
-            out.append(buf.lines[i])
-            if i == row:
-                out.append(buf.lines[i])
-            i = i + 1
-        buf.lines = out
-        buf.line_count = len(out)
-        buf.cursor_row = row + 1
-        self._after_edit()
-        self.status_msg = "Duplicated line"
-
-    def _delete_line(self):
-        self.buffers[self.active_tab].push_snapshot()
-        var buf = self.buffers[self.active_tab]
-        if buf.line_count <= 1:
-            buf.lines = [""]
-            buf.line_count = 1
-            buf.cursor_row = 0
-            buf.cursor_col = 0
-            self._after_edit()
-            return
-        var row = buf.cursor_row
-        var out = []
-        var i = 0
-        while i < buf.line_count:
-            if i != row:
-                out.append(buf.lines[i])
-            i = i + 1
-        buf.lines = out
-        buf.line_count = len(out)
-        if buf.cursor_row >= buf.line_count:
-            buf.cursor_row = buf.line_count - 1
-        buf.cursor_col = 0
-        self._after_edit()
-        self.status_msg = "Deleted line"
-
-    def _move_line(self, delta):
-        var buf = self.buffers[self.active_tab]
-        var row = buf.cursor_row
-        var dest = row + delta
-        if dest < 0 or dest >= buf.line_count:
-            return
-        self.buffers[self.active_tab].push_snapshot()
-        var tmp = buf.lines[row]
-        buf.lines[row] = buf.lines[dest]
-        buf.lines[dest] = tmp
-        buf.cursor_row = dest
-        self._after_edit()
-        self.status_msg = "Moved line"
-
-    # ── typing helpers ───────────────────────────────────────────────────────
-    # Typing an opening bracket or quote inserts its partner and leaves the
-    # caret between them.
-    def _auto_close(self, ch):
-        var pairs = {"(": ")", "[": "]", "{": "}", "\"": "\"", "'": "'"}
-        if not pairs.has_key(ch):
-            return false
-        var buf = self.buffers[self.active_tab]
-        buf.insert_char(pairs[ch])
-        buf.cursor_col = buf.cursor_col - 1
-        return true
-
-    # ══ selection ════════════════════════════════════════════════════════════
-    def _sel_clear(self):
-        self.sel_on = false
-
-    def _sel_begin(self):
-        if not self.sel_on:
-            var buf = self.buffers[self.active_tab]
-            self.sel_row = buf.cursor_row
-            self.sel_col = buf.cursor_col
-            self.sel_on = true
-
-    # Ordered (startRow, startCol, endRow, endCol); empty selections report none.
-    def _sel_range(self):
-        if not self.sel_on:
-            return none
-        var buf = self.buffers[self.active_tab]
-        var ar = self.sel_row
-        var ac = self.sel_col
-        var br = buf.cursor_row
-        var bc = buf.cursor_col
-        if ar == br and ac == bc:
-            return none
-        if br < ar or (br == ar and bc < ac):
-            return {"r1": br, "c1": bc, "r2": ar, "c2": ac}
-        return {"r1": ar, "c1": ac, "r2": br, "c2": bc}
-
-    def _sel_text(self):
-        var g = self._sel_range()
-        if g == none:
-            return ""
-        var buf = self.buffers[self.active_tab]
-        if g["r1"] == g["r2"]:
-            return string_slice(buf.get_line(g["r1"]), g["c1"], g["c2"])
-        var out = string_slice(buf.get_line(g["r1"]), g["c1"], len(buf.get_line(g["r1"])))
-        var i = g["r1"] + 1
-        while i < g["r2"]:
-            out = out + "\n" + buf.get_line(i)
-            i = i + 1
-        out = out + "\n" + string_slice(buf.get_line(g["r2"]), 0, g["c2"])
-        return out
-
-    def _sel_delete(self):
-        var g = self._sel_range()
-        if g == none:
-            return false
-        self.buffers[self.active_tab].push_snapshot()
-        var buf = self.buffers[self.active_tab]
-        var head = string_slice(buf.get_line(g["r1"]), 0, g["c1"])
-        var tail = string_slice(buf.get_line(g["r2"]), g["c2"], len(buf.get_line(g["r2"])))
-        var out = []
-        var i = 0
-        while i < buf.line_count:
-            if i < g["r1"] or i > g["r2"]:
-                out.append(buf.lines[i])
-            elif i == g["r1"]:
-                out.append(head + tail)
-            i = i + 1
-        if len(out) == 0:
-            out = [""]
-        buf.lines = out
-        buf.line_count = len(out)
-        buf.cursor_row = g["r1"]
-        buf.cursor_col = g["c1"]
-        self.sel_on = false
-        self._hl_cache = {}
-        self._hl_cache_n = 0
-        self.tabs[self.active_tab].dirty = true
-        return true
-
-    # ══ multi-cursor ═════════════════════════════════════════════════════════
-    # Extra carets beyond the primary (buf.cursor_row/cursor_col, unchanged).
-    # Deliberately position-only, with no selection of their own — Alt+Click
-    # and Ctrl+Alt+Up/Down are the two ways real editors most commonly grow a
-    # multi-cursor set, and both only ever need a point, not a range.
-    def _sync_primary_caret(self):
-        var buf = self.buffers[self.active_tab]
-        self.selmodel.sels[0].caret.row = buf.cursor_row
-        self.selmodel.sels[0].caret.col = buf.cursor_col
-
-    def _add_caret(self, row, col):
-        self._sync_primary_caret()
-        var added = self.selmodel.add_caret(row, col)
-        if added:
-            self._dirty = true
-        return added
-
-    def _add_caret_vertical(self, delta):
-        var buf = self.buffers[self.active_tab]
-        self._sync_primary_caret()
-        # Extends from the last-added caret, not always the primary, so
-        # repeated presses walk further in the same direction.
-        var from_row = buf.cursor_row
-        var from_col = buf.cursor_col
-        if self.selmodel.count > 1:
-            var last = self.selmodel.sels[self.selmodel.count - 1]
-            from_row = last.caret.row
-            from_col = last.caret.col
-        var nrow = from_row + delta
-        if nrow < 0 or nrow >= buf.line_count:
-            return false
-        var ncol = from_col
-        var ll = len(buf.get_line(nrow))
-        if ncol > ll:
-            ncol = ll
-        var added = self.selmodel.add_caret(nrow, ncol)
-        if added:
-            self._dirty = true
-        return added
-
-    def _clear_extra_carets(self):
-        if self.selmodel.count > 1:
-            self.selmodel.clear_secondary()
-            self._dirty = true
-
-    # Replays the edit e just applied to the primary caret at every extra
-    # caret. Processed from the last caret to the first (by row, then col,
-    # descending): an insert or delete only shifts positions after it, so
-    # working backward keeps not-yet-processed carets' saved positions valid
-    # without having to recompute them. Bounds-checked against the CURRENT
-    # buffer rather than trusted outright, since a caret added before a tab
-    # switch would otherwise index past a shorter file's line count.
-    def _apply_to_extra_carets(self, e):
-        if self.selmodel.count <= 1:
-            return
-        var buf = self.buffers[self.active_tab]
-        var save_row = buf.cursor_row
-        var save_col = buf.cursor_col
-        var order = []
-        var i = 1
-        while i < self.selmodel.count:
-            if self.selmodel.sels[i].caret.row < buf.line_count:
-                order.append(i)
-            i = i + 1
-        var n = len(order)
-        var a = 0
-        while a < n:
-            var b = a + 1
-            while b < n:
-                var sa = self.selmodel.sels[order[a]]
-                var sb = self.selmodel.sels[order[b]]
-                var swap = false
-                if sb.caret.row > sa.caret.row:
-                    swap = true
-                elif sb.caret.row == sa.caret.row and sb.caret.col > sa.caret.col:
-                    swap = true
-                if swap:
-                    var t = order[a]
-                    order[a] = order[b]
-                    order[b] = t
-                b = b + 1
-            a = a + 1
-        var k = 0
-        while k < n:
-            var s = self.selmodel.sels[order[k]]
-            var crow = s.caret.row
-            var ccol = s.caret.col
-            var ll = len(buf.get_line(crow))
-            if ccol > ll:
-                ccol = ll
-            buf.cursor_row = crow
-            buf.cursor_col = ccol
-            if e.type == "textinput":
-                buf.insert_char(e.text)
-            elif e.key == "backspace":
-                buf.delete_char_back()
-            elif e.key == "enter":
-                buf.insert_newline()
-            s.caret.row = buf.cursor_row
-            s.caret.col = buf.cursor_col
-            s.anchor.row = buf.cursor_row
-            s.anchor.col = buf.cursor_col
-            k = k + 1
-        buf.cursor_row = save_row
-        buf.cursor_col = save_col
-
-    # Pixel position -> (row, col), used by click and drag.
+    # Pixel -> [row, col] in the active editor.
     def _pos_at(self, x, y):
-        var buf = self.buffers[self.active_tab]
-        var top = int(self.editor.scroll_y / self.LINE_H)
-        var row = top + int((y - self.ed_y) / self.LINE_H)
+        var d = self.doc()
+        var b = d.buf
+        var row = int((y - self.ed_y + d.scroll_y) / self.LINE_H)
         if row < 0:
             row = 0
-        if row >= buf.line_count:
-            row = buf.line_count - 1
-        var line = buf.get_line(row)
-        var text_x = self.col_x + self.GUTTER_W + 10
+        if row >= b.line_count:
+            row = b.line_count - 1
+        var line = b.lines[row]
+        var rel = x - (self.text_x0 - d.scroll_x)
         var col = 0
-        while col < len(line):
-            var m = self.f_code.width(string_slice(line, 0, col + 1))
-            if text_x + m > x:
-                col = col
-                break
-            col = col + 1
-        return {"row": row, "col": col}
+        if rel > 0:
+            # Monospace estimate, then refine against the real measurement.
+            col = int(rel / self.char_w + 0.5)
+            if col > len(line):
+                col = len(line)
+            while col > 0 and self._col_x(line, col) > rel + self.char_w / 2:
+                col = col - 1
+            while col < len(line) and self._col_x(line, col + 1) < rel + self.char_w / 2:
+                col = col + 1
+        return [row, col]
 
-    def _draw_selection(self, r, buf, top, rows, line_h, text_x):
-        var g = self._sel_range()
-        if g == none:
+    def _on_wheel(self, e):
+        if e.x > 0 or e.y > 0:
+            self.mx = e.x
+            self.my = e.y
+        var dy = e.delta
+        var h = self.hits.at(self.mx, self.my)
+        self._dirty = true
+        self.hover_info = ""
+        if self.qi.visible:
+            self.qi.top = self.qi.top - dy * 3
+            if self.qi.top > self.qi.n - self.qi.max_rows:
+                self.qi.top = self.qi.n - self.qi.max_rows
+            if self.qi.top < 0:
+                self.qi.top = 0
             return
-        var i = 0
-        while i < rows:
-            var ln = top + i
-            if ln >= g["r1"] and ln <= g["r2"] and ln < buf.line_count:
-                var line = buf.get_line(ln)
-                var a = 0
-                var b = len(line)
-                if ln == g["r1"]:
-                    a = g["c1"]
-                if ln == g["r2"]:
-                    b = g["c2"]
-                var ma = self.f_code.width(string_slice(line, 0, a))
-                var mb = self.f_code.width(string_slice(line, 0, b))
-                var w = mb - ma
-                if w < 3:
-                    w = 3
-                r.fill_xywh(text_x + ma, self.ed_y + i * line_h, w, line_h, Color(90, 110, 200, 90))
-            i = i + 1
+        if h == none:
+            return
+        var c = h.cmd
+        if c == "@editor" or c == "@gutter.glyph" or c == "@gutter.num" or c == "@minimap" or c == "@vscroll" or c == "@find.bg":
+            if not self._is_text():
+                return
+            var d = self.doc()
+            if e.shift:
+                d.scroll_x = d.scroll_x - dy * self.char_w * 6
+                if d.scroll_x < 0:
+                    d.scroll_x = 0
+            else:
+                d.scroll_y = d.scroll_y - dy * self.LINE_H * 3
+                self._clamp_scroll()
+        elif c == "@ac.item":
+            self.ac_top = self.ac_top - dy
+            if self.ac_top > self.ac_n - 10:
+                self.ac_top = self.ac_n - 10
+            if self.ac_top < 0:
+                self.ac_top = 0
+        elif c == "@tab" or c == "@tabstrip" or c == "@tab.close":
+            var strip = self.col_w - self.actions_w
+            self.tab_scroll_px = self.tab_scroll_px + dy * self.dp(60)
+            if self.tab_scroll_px < strip - self.tabs_total_w:
+                self.tab_scroll_px = strip - self.tabs_total_w
+            if self.tab_scroll_px > 0:
+                self.tab_scroll_px = 0
+        elif c == "@panel.body" or c == "@term" or c == "@dbgcon" or c == "@problem" or c == "@problem.file":
+            self.panel_scroll = self.panel_scroll - dy * 3
+            if self.panel_scroll < 0:
+                self.panel_scroll = 0
+            if self.active_panel == "output":
+                self.out_follow = false
+            if self.active_panel == "terminal":
+                self.term_follow = false
+        elif self.mx >= self.side_x and self.mx < self.side_x + self.side_w:
+            self.tree_scroll = self.tree_scroll - dy * 3
+            if self.tree_scroll < 0:
+                self.tree_scroll = 0
 
-    # ══ context menus ════════════════════════════════════════════════════════
-    def _open_ctx(self, x, y, target, arg):
-        self.ctx_target = target
-        self.ctx_arg = arg
-        if target == "editor":
-            self.ctx_items = ["Cut", "Copy", "Paste", "-", "Go to Line", "Toggle Breakpoint", "-", "Run"]
-        elif target == "tree":
-            self.ctx_items = ["Open", "Reveal in Explorer", "-", "Copy Path", "Set as Workspace"]
-        elif target == "tab":
-            self.ctx_items = ["Close", "Close Others", "-", "Copy Path", "Save"]
+    # ── clicks ───────────────────────────────────────────────────────────────
+    def _click(self, h, e):
+        var cmd = h.cmd
+        var arg = h.arg
+        if not string_startswith(cmd, "@"):
+            self._close_overlays()
+            self._exec(cmd, arg)
+            return
+        # Any click that is not on the open overlay closes it.
+        var overlay_cmd = cmd == "@menu" or cmd == "@menuitem" or cmd == "@menu.bg" or cmd == "@ctx.item"
+        if not overlay_cmd and (self.menu_open >= 0 or self.ctx_open or self.notif_center):
+            if cmd != "@toast.close":
+                self._close_overlays()
+                if cmd == "@overlay.dismiss":
+                    return
+        if cmd == "@overlay.dismiss" or cmd == "@menu.bg" or cmd == "@qi.bg" or cmd == "@find.bg" or cmd == "@modal.scrim" or cmd == "@tabstrip" or cmd == "@side.bg":
+            return
+        if cmd == "@qi.dismiss":
+            self.qi.close()
+            self.focus = self.focus_before_qi
+            return
+        if cmd == "@menu":
+            if self.menu_open == arg:
+                self.menu_open = -1
+            else:
+                self.menu_open = arg
+                self.menu_sel = -1
+            return
+        if cmd == "@menuitem":
+            self.menu_open = -1
+            self._exec(arg, none)
+            return
+        if cmd == "@ctx.item":
+            var it = self.ctx_items[arg]
+            self.ctx_open = false
+            if string_startswith(it[1], "@"):
+                self._ctx_internal(it[1], it[2], e)
+            else:
+                self._exec(it[1], it[2])
+            return
+        if cmd == "@modal.button":
+            var bt = self.modal_buttons[arg]
+            if string_startswith(bt[1], "@"):
+                self._exec_modal_cmd(bt[1], bt[2])
+            else:
+                self._modal_close()
+                self._exec(bt[1], bt[2])
+            return
+        if cmd == "@qi.item":
+            self.qi.sel = arg
+            self.qi.sel_moved = true
+            self._qi_accept(self.qi.current())
+            return
+        if cmd == "@qi.input":
+            return
+        if cmd == "@view":
+            if self.active_view == arg and self.sidebar_open:
+                self.sidebar_open = false
+                self.focus = "editor"
+            else:
+                self._show_view(arg)
+                if arg == "search":
+                    self.focus = "search"
+                elif arg == "explorer":
+                    self.focus = "explorer"
+                elif arg == "ai":
+                    self._ai_analyze(true)
+            self._layout()
+            return
+        if cmd == "@manage":
+            self._open_ctx(self.dp(8), self.status_y - self.dp(200), [["Command Palette...", "workbench.action.showCommands", ""],
+                           ["-", "", ""], ["Settings", "workbench.action.openSettings", ""],
+                           ["Keyboard Shortcuts", "workbench.action.openGlobalKeybindings", ""],
+                           ["Color Theme", "workbench.action.selectTheme", ""], ["-", "", ""],
+                           ["About", "nython.about", ""]])
+            return
+        if cmd == "@tab":
+            self._activate(arg)
+            self.focus = "editor"
+            self.dragging = "tab"
+            self.drag_from = arg
+            self.drag_x0 = e.x
+            return
+        if cmd == "@tab.close":
+            self._close_doc(arg, false)
+            return
+        if cmd == "@editor.more":
+            self._open_ctx(self.col_x + self.col_w - self.dp(270), self.content_y + self.TAB_H, [
+                ["Run on Bytecode VM", "nython.runOnVM", ""], ["Profile", "nython.profile", ""],
+                ["Check Syntax", "nython.checkSyntax", ""], ["-", "", ""],
+                ["Show Tokens", "nython.tokenize", ""], ["Show AST", "nython.showAST", ""],
+                ["Show Bytecode", "nython.disassemble", ""], ["-", "", ""],
+                ["Close All", "workbench.action.closeAllEditors", ""], ["Close Saved", "workbench.action.closeUnmodifiedEditors", ""]])
+            return
+        if cmd == "@editor":
+            self._editor_click(e)
+            return
+        if cmd == "@gutter.glyph":
+            if self._is_text():
+                var p = self._pos_at(e.x, e.y)
+                self._toggle_break(p[0])
+            return
+        if cmd == "@gutter.num":
+            if self._is_text():
+                var p2 = self._pos_at(e.x, e.y)
+                var d = self.doc()
+                d.sel_on = true
+                d.sel_row = p2[0]
+                d.sel_col = 0
+                self._goto_keep_sel(p2[0] + 1, 0)
+                self.focus = "editor"
+                self.dragging = "lines"
+            return
+        if cmd == "@vscroll":
+            if e.y >= self.vs_thumb_y and e.y < self.vs_thumb_y + self.vs_thumb_h:
+                self.drag_off = e.y - self.vs_thumb_y
+            else:
+                self.drag_off = int(self.vs_thumb_h / 2)
+                self._vscroll_to(e.y - self.drag_off)
+            self.dragging = "vscroll"
+            return
+        if cmd == "@minimap":
+            self._minimap_to(e.y)
+            self.dragging = "minimap"
+            return
+        if cmd == "@split.sidebar":
+            self.dragging = "sidebar"
+            return
+        if cmd == "@split.panel":
+            self.dragging = "panel"
+            return
+        if cmd == "@tree":
+            self._tree_click(arg, e)
+            return
+        if cmd == "@panel.tab":
+            self._show_panel(arg)
+            if arg == "terminal":
+                self.focus = "terminal"
+            elif arg == "debug":
+                self.focus = "dbgconsole"
+            return
+        if cmd == "@panel.body":
+            self.focus = "panel"
+            return
+        if cmd == "@problem":
+            self.problem_cursor = arg
+            self._open_problem(arg)
+            return
+        if cmd == "@problem.file":
+            if self.prob_collapsed.has_key(arg):
+                self.prob_collapsed.remove(arg)
+            else:
+                self.prob_collapsed[arg] = true
+            return
+        if cmd == "@term":
+            self.focus = "terminal"
+            return
+        if cmd == "@dbgcon":
+            self.focus = "dbgconsole"
+            return
+        if cmd == "@find.field":
+            self.focus = "find"
+            self.find_field = arg
+            return
+        if cmd == "@find.toggle":
+            if arg == "replace":
+                self.find_replace_mode = not self.find_replace_mode
+            elif arg == "case":
+                self.find_case = not self.find_case
+            elif arg == "word":
+                self.find_word = not self.find_word
+            elif arg == "regex":
+                self.find_regex = not self.find_regex
+            self._find_run()
+            self._find_info_update()
+            return
+        if cmd == "@find.close":
+            self.find_open = false
+            self.focus = "editor"
+            return
+        if cmd == "@find.replace":
+            self._replace_one()
+            self._find_info_update()
+            return
+        if cmd == "@find.replaceall":
+            self._replace_all()
+            self._find_info_update()
+            return
+        if cmd == "@ac.item":
+            self.ac_sel = arg
+            self._ac_accept()
+            return
+        if cmd == "@toast.close":
+            self.notes.dismiss(arg)
+            return
+        if cmd == "@recent":
+            if string_startswith(arg, "dir:"):
+                self._open_folder(string_slice(arg, 4, len(arg)))
+            else:
+                self._open_path(string_slice(arg, 5, len(arg)), -1, 0)
+            return
+        if cmd == "@job.stop":
+            if self.dbg_recording:
+                self._debug_stop()
+            else:
+                self._stop_job()
+            return
+        if cmd == "@section":
+            if self.sections_closed.has_key(arg):
+                self.sections_closed.remove(arg)
+            else:
+                self.sections_closed[arg] = true
+            return
+        if string_startswith(cmd, "@search"):
+            self._search_click(cmd, arg, e)
+            return
+        if string_startswith(cmd, "@scm"):
+            self._scm_click(cmd, arg, e)
+            return
+        if string_startswith(cmd, "@dbg") or string_startswith(cmd, "@break"):
+            self._dbg_click(cmd, arg, e)
+            return
+        if string_startswith(cmd, "@ext"):
+            if cmd == "@ext.search":
+                self.focus = "extsearch"
+            elif cmd == "@ext.open":
+                self._ext_page(arg)
+            elif cmd == "@ext.import":
+                self._ext_import(arg)
+            elif cmd == "@ext.refresh":
+                self.cat = none
+                self.ext_filter_q = "\x01"
+            return
+        if cmd == "@workshop":
+            self.focus = "workshop"
+            self.workshop.handle_event(e)
+            return
+        if cmd == "@outline":
+            var syms = self._outline_syms()
+            if arg < len(syms):
+                self._goto(syms[arg][2], syms[arg][3])
+                self.focus = "editor"
+            return
+        if cmd == "@ai":
+            self._goto(arg - 1, 0)
+            self.focus = "editor"
+            return
+        self._notify("Unhandled click target " + cmd, "warn")
+
+    # Context-menu entries that are UI actions rather than commands.
+    def _ctx_internal(self, cmd, arg, e):
+        if cmd == "@ctx.open":
+            self._open_path(arg, -1, 0)
+            self.focus = "editor"
+        elif cmd == "@ctx.terminal":
+            var dir = arg
+            if not os_isdir(dir):
+                dir = os_path_dirname(dir)
+            self.term_cwd = dir
+            self._show_panel("terminal")
+            self.focus = "terminal"
+            self._term_print("cd " + dir, "dim")
+        elif cmd == "@ctx.copypanel":
+            var src = self.out_lines
+            if self.active_panel == "terminal":
+                src = self.term_lines
+            elif self.active_panel == "debug":
+                src = self.dbgcon_lines
+            self._set_clipboard(string_join(src, "\n"))
+            self._notify("Copied " + str(len(src)) + " lines", "info")
         else:
-            self.ctx_items = ["Toggle Sidebar", "Toggle Panel", "Toggle Minimap"]
-        self.ctx_open = true
+            var fake = Hit()
+            fake.cmd = cmd
+            fake.arg = arg
+            self._click(fake, e)
+
+    def _goto_keep_sel(self, row, col):
+        var b = self.buf()
+        if row >= b.line_count:
+            row = b.line_count - 1
+            col = len(b.get_line(row))
+        b.cursor_row = row
+        b.cursor_col = col
+        b.begin_group()
+
+    def _editor_click(self, e):
+        if not self._is_text():
+            return
+        self.focus = "editor"
+        self.ac_open = false
+        var d = self.doc()
+        var b = d.buf
+        var p = self._pos_at(e.x, e.y)
+        b.begin_group()
+        self.want_col = -1
+        if e.alt:
+            if self._add_caret(p[0], p[1]):
+                self.status_msg = str(self.selmodel.count) + " cursors"
+            return
+        self._clear_extra_carets()
+        if e.clicks == 2:
+            var w = b.word_at(p[0], p[1])
+            d.sel_on = true
+            d.sel_row = p[0]
+            d.sel_col = w[0]
+            b.cursor_row = p[0]
+            b.cursor_col = w[1]
+            return
+        if e.clicks >= 3:
+            d.sel_on = true
+            d.sel_row = p[0]
+            d.sel_col = 0
+            self._goto_keep_sel(p[0] + 1, 0)
+            return
+        if e.shift:
+            self._sel_begin()
+        else:
+            d.sel_on = true
+            d.sel_row = p[0]
+            d.sel_col = p[1]
+        b.cursor_row = p[0]
+        b.cursor_col = p[1]
+        self._nav_record()
+        self.dragging = "select"
+
+    def _finish_tab_drag(self, x):
+        var frm = self.drag_from
+        if frm < 0 or frm >= len(self.docs) or abs(x - self.drag_x0) < self.dp(12):
+            return
+        var to = frm
+        var i = 0
+        while i < len(self.docs):
+            var d = self.docs[i]
+            if x >= d.tab_x and x < d.tab_x + d.tab_w:
+                to = i
+            i = i + 1
+        if to == frm:
+            return
+        var moving = self.docs[frm]
+        var rest = []
+        i = 0
+        while i < len(self.docs):
+            if i != frm:
+                rest.append(self.docs[i])
+            i = i + 1
+        var out = []
+        i = 0
+        while i < len(rest):
+            if i == to:
+                out.append(moving)
+            out.append(rest[i])
+            i = i + 1
+        if to >= len(rest):
+            out.append(moving)
+        self.docs = out
+        self.active = self._index_of(moving)
+
+    def _search_click(self, cmd, arg, e):
+        if cmd == "@search.field":
+            self.focus = "search"
+            self.search_field = arg
+        elif cmd == "@search.toggle":
+            if arg == "case":
+                self.search_case = not self.search_case
+            elif arg == "word":
+                self.search_word = not self.search_word
+            elif arg == "regex":
+                self.search_regex = not self.search_regex
+            self._run_search()
+        elif cmd == "@search.togglereplace":
+            self.search_replace_open = not self.search_replace_open
+        elif cmd == "@search.replaceall":
+            self._search_replace_all()
+        elif cmd == "@search.run":
+            self._run_search()
+        elif cmd == "@search.clear":
+            self.search_query = ""
+            self.search_results = []
+            self.search_summary = ""
+        elif cmd == "@search.file":
+            var p = self.search_results[arg][0]
+            if self.search_collapsed.has_key(p):
+                self.search_collapsed.remove(p)
+            else:
+                self.search_collapsed[p] = true
+        elif cmd == "@search.match":
+            self._open_search_match(arg)
+
+    def _scm_click(self, cmd, arg, e):
+        if cmd == "@scm.msg":
+            self.focus = "scm"
+        elif cmd == "@scm.row":
+            var staged = string_startswith(arg, "S:")
+            var p = arg
+            if staged:
+                p = string_slice(arg, 2, len(arg))
+            var c = self.git.status_of(p)
+            if c != none:
+                self._open_change(c, staged)
+        elif cmd == "@scm.openfile":
+            self._open_path(arg, -1, 0)
+        elif cmd == "@scm.more":
+            self._open_ctx(self.side_x + self.side_w - self.dp(250), self.content_y + self.SIDE_HEAD, [
+                ["Checkout to...", "git.checkout", ""], ["Show Log", "git.showLog", ""], ["-", "", ""],
+                ["Stage All Changes", "git.stageAll", ""], ["Unstage All Changes", "git.unstageAll", ""], ["-", "", ""],
+                ["Refresh", "git.refresh", ""]])
+
+    def _dbg_click(self, cmd, arg, e):
+        if cmd == "@dbg.seek":
+            self._dbg_seek_x(e.x)
+            self.dragging = "dbgseek"
+        elif cmd == "@dbg.addwatch":
+            self._open_prompt("addwatch", "Add Watch Expression", "A variable name", "")
+        elif cmd == "@dbg.rmwatch":
+            var keep = []
+            var i = 0
+            while i < len(self.watches):
+                if i != arg:
+                    keep.append(self.watches[i])
+                i = i + 1
+            self.watches = keep
+        elif cmd == "@dbg.frame":
+            var st = self.dbg_stack_cache()
+            if arg < len(st):
+                var fr = st[arg]
+                if fr[1] == self.dbg_run_path and self.dbg_doc != none:
+                    var di = self._index_of(self.dbg_doc)
+                    if di >= 0:
+                        self._activate(di)
+                        self._goto(fr[2] - 1, 0)
+                else:
+                    self._open_path(fr[1], fr[2] - 1, 0)
+                self.dbg_frame = fr[3]
+                if arg == 0:
+                    self.dbg_frame = -1
+        elif cmd == "@dbg.exception":
+            self.dbg.seek(self.dbg.n - 1)
+            self._dbg_sync()
+        elif cmd == "@break.go":
+            var c = self._break_parts(self.break_list[arg])
+            if string_startswith(c[0], "untitled:"):
+                var t = string_slice(c[0], 9, len(c[0]))
+                var k = 0
+                while k < len(self.docs):
+                    if self.docs[k].title == t:
+                        self._activate(k)
+                        self._goto(c[1] - 1, 0)
+                    k = k + 1
+            else:
+                self._open_path(c[0], c[1] - 1, 0)
+        elif cmd == "@break.rm":
+            var key = self.break_list[arg]
+            self.breaks.remove(key)
+            var keep2 = []
+            var j = 0
+            while j < len(self.break_list):
+                if j != arg:
+                    keep2.append(self.break_list[j])
+                j = j + 1
+            self.break_list = keep2
+
+    # ── context menus ────────────────────────────────────────────────────────
+    def _open_ctx(self, x, y, items):
+        self.ctx_items = items
         self.ctx_x = x
         self.ctx_y = y
-        self.ctx_hover = -1
+        self.ctx_open = true
+        self.ctx_sel = -1
 
-    def _ctx_height(self):
-        var h = 10
-        var i = 0
-        while i < len(self.ctx_items):
-            if self.ctx_items[i] == "-":
-                h = h + 9
+    def _context_menu(self, h, e):
+        if h == none:
+            return
+        var c = h.cmd
+        if c == "@tab" or c == "@tab.close":
+            self._activate(h.arg)
+            var p = self.docs[h.arg].path
+            self._open_ctx(e.x, e.y, [["Close", "workbench.action.closeActiveEditor", ""],
+                                      ["Close Others", "workbench.action.closeOtherEditors", h.arg],
+                                      ["Close to the Right", "workbench.action.closeEditorsToTheRight", h.arg],
+                                      ["Close Saved", "workbench.action.closeUnmodifiedEditors", ""],
+                                      ["Close All", "workbench.action.closeAllEditors", ""], ["-", "", ""],
+                                      ["Copy Path", "copyFilePath", p], ["Copy Relative Path", "copyRelativeFilePath", p], ["-", "", ""],
+                                      ["Reveal in Explorer View", "workbench.files.action.showActiveFileInExplorer", p]])
+        elif c == "@tree":
+            self.tree_sel = h.arg
+            self.focus = "explorer"
+            var n = self.ws.rows[h.arg]
+            var items = [["New File...", "explorer.newFile", n.path], ["New Folder...", "explorer.newFolder", n.path], ["-", "", ""]]
+            if not n.is_dir:
+                items.append(["Open", "@ctx.open", n.path])
+            items.append(["Open in Integrated Terminal", "@ctx.terminal", n.path])
+            items.append(["-", "", ""])
+            items.append(["Copy Path", "copyFilePath", n.path])
+            items.append(["Copy Relative Path", "copyRelativeFilePath", n.path])
+            if n.path != self.ws.root:
+                items.append(["-", "", ""])
+                items.append(["Rename...", "renameFile", n.path])
+                items.append(["Delete", "deleteFile", n.path])
+            self._open_ctx(e.x, e.y, items)
+        elif c == "@editor" or c == "@gutter.num":
+            self.focus = "editor"
+            self._open_ctx(e.x, e.y, [["Go to Definition", "editor.action.revealDefinition", ""],
+                                      ["Find All References", "references-view.findReferences", ""], ["-", "", ""],
+                                      ["Rename Symbol", "editor.action.rename", ""],
+                                      ["Change All Occurrences", "editor.action.changeAll", ""], ["-", "", ""],
+                                      ["Cut", "editor.action.clipboardCutAction", ""],
+                                      ["Copy", "editor.action.clipboardCopyAction", ""],
+                                      ["Paste", "editor.action.clipboardPasteAction", ""], ["-", "", ""],
+                                      ["Toggle Breakpoint", "editor.debug.action.toggleBreakpoint", ""],
+                                      ["Run Nython File", "workbench.action.debug.run", ""],
+                                      ["Command Palette...", "workbench.action.showCommands", ""]])
+        elif c == "@scm.row":
+            var staged = string_startswith(h.arg, "S:")
+            var p2 = h.arg
+            if staged:
+                p2 = string_slice(h.arg, 2, len(h.arg))
+            var its = [["Open Changes", "@scm.row", h.arg], ["Open File", "@scm.openfile", p2], ["-", "", ""]]
+            if staged:
+                its.append(["Unstage Changes", "git.unstage", p2])
             else:
-                h = h + 26
-            i = i + 1
-        return h
+                its.append(["Stage Changes", "git.stage", p2])
+                its.append(["Discard Changes", "git.clean", p2])
+            self._open_ctx(e.x, e.y, its)
+        elif c == "@term" or c == "@panel.body" or c == "@dbgcon":
+            self._open_ctx(e.x, e.y, [["Copy All", "@ctx.copypanel", ""], ["Clear", "workbench.action.terminal.clear", ""]])
 
-    def _draw_ctx(self, r):
-        var th = self.th
-        var w = 220
-        var h = self._ctx_height()
-        var x = self.ctx_x
-        var y = self.ctx_y
-        if x + w > self.W - 8:
-            x = self.W - w - 8
-        if y + h > self.H - 8:
-            y = self.H - h - 8
-        r.draw_shadow(Rect(x, y, w, h), 20, 0, 8, Color(0, 0, 0, 160))
-        r.fill_round_xywh(x, y, w, h, th.overlay, 8)
-        r.draw_rounded_rect(Rect(x, y, w, h), th.border, 8, 1)
-        var yy = y + 5
-        var i = 0
-        while i < len(self.ctx_items):
-            var it = self.ctx_items[i]
-            if it == "-":
-                r.draw_line(x + 12, yy + 4, x + w - 12, yy + 4, th.border_soft, 1)
-                yy = yy + 9
+    # ── keyboard ─────────────────────────────────────────────────────────────
+    def _on_key(self, e):
+        self.caret_on = true
+        self.caret_t = time_ms()
+        self._dirty = true
+        self.hover_info = ""
+        var k = e.key
+        if k == "ctrl" or k == "shift" or k == "alt" or k == "super":
+            return
+        if self.modal_open:
+            self._modal_key(e)
+            return
+        if self.focus == "qi" and self.qi.visible:
+            if self._qi_key(e):
+                return
+        if self.menu_open >= 0:
+            self._menu_key(e)
+            return
+        if self.ctx_open:
+            self._ctx_key(e)
+            return
+        if self.notif_center and k == "escape":
+            self.notif_center = false
+            return
+        if self.ac_open and self.focus == "editor":
+            if self._ac_key(e):
+                return
+        # Alt+letter opens a menu, as the underlined mnemonics do in VS Code.
+        if e.alt and not e.ctrl and not e.shift and len(k) == 1 and (self.focus == "editor" or self.focus == "explorer"):
+            var mi = self._menu_mnemonic(k)
+            if mi >= 0:
+                self.menu_open = mi
+                self.menu_sel = -1
+                return
+        var cmd = self.reg.resolve(e, self._ctx_keys())
+        if cmd == "__chord__":
+            self.status_msg = "(" + self.reg.pretty(self.reg.pending) + ") was pressed. Waiting for second key of chord..."
+            return
+        if cmd == "__chord_miss__":
+            self.status_msg = "The key combination (" + self.reg.pretty(self.reg.last_miss) + ") is not a command."
+            return
+        if cmd != "":
+            self._exec(cmd, none)
+            return
+        var f = self.focus
+        if f == "find":
+            self._find_key(e)
+        elif f == "search":
+            self._search_key(e)
+        elif f == "scm":
+            self._line_input_key(e, "scm")
+        elif f == "terminal":
+            self._term_key(e)
+        elif f == "dbgconsole":
+            self._line_input_key(e, "dbgcon")
+        elif f == "extsearch":
+            self._line_input_key(e, "ext")
+        elif f == "explorer":
+            if not self._tree_key(e) and k == "escape":
+                self.focus = "editor"
+        elif f == "panel":
+            if k == "escape":
+                self.focus = "editor"
+        elif f == "workshop":
+            if k == "escape":
+                self.focus = "editor"
             else:
-                if self.ctx_hover == i:
-                    r.fill_round_xywh(x + 4, yy, w - 8, 24, th.accent_soft, 5)
-                r.draw_text(it, x + 16, yy + 5, self.f_ui, th.text)
-                yy = yy + 26
-            i = i + 1
+                self.workshop.handle_event(e)
+        else:
+            self._editor_key(e)
 
-    def _ctx_hit(self, mx, my):
-        var w = 220
-        var h = self._ctx_height()
-        var x = self.ctx_x
-        var y = self.ctx_y
-        if x + w > self.W - 8:
-            x = self.W - w - 8
-        if y + h > self.H - 8:
-            y = self.H - h - 8
-        if mx < x or mx > x + w or my < y or my > y + h:
-            return -1
-        var yy = y + 5
+    def _menu_mnemonic(self, k):
         var i = 0
-        while i < len(self.ctx_items):
-            var it = self.ctx_items[i]
-            if it == "-":
-                yy = yy + 9
-            else:
-                if my >= yy and my < yy + 26:
-                    return i
-                yy = yy + 26
+        while i < len(self.menus):
+            if string_lower(string_slice(self.menus[i], 0, 1)) == k:
+                return i
             i = i + 1
         return -1
 
-    def _ctx_action(self, label):
-        if label == "Cut":
-            self._cut_line()
-        elif label == "Copy":
-            self._copy_line()
-        elif label == "Paste":
-            self._paste()
-        elif label == "Go to Line":
-            self._ask("goto", "Go to Line", "Line number", "")
-        elif label == "Toggle Breakpoint":
-            self._toggle_break(self.buffers[self.active_tab].cursor_row)
-        elif label == "Run":
-            self._run()
-        elif label == "Open":
-            if self.ctx_arg >= 0 and self.ctx_arg < self.ws.row_count:
-                var n = self.ws.rows[self.ctx_arg]
-                if not n.is_dir:
-                    self._open_path(n.path)
-        elif label == "Copy Path":
-            if self.ctx_target == "tree" and self.ctx_arg >= 0:
-                self.clipboard = self.ws.rows[self.ctx_arg].path
+    def _modal_key(self, e):
+        var k = e.key
+        var n = len(self.modal_buttons)
+        if k == "escape":
+            self._exec_modal_cmd("@modal.cancel", "")
+        elif k == "left" or (k == "tab" and e.shift):
+            self.modal_sel = (self.modal_sel + n - 1) % n
+        elif k == "right" or k == "tab":
+            self.modal_sel = (self.modal_sel + 1) % n
+        elif k == "enter" or k == "space":
+            var bt = self.modal_buttons[self.modal_sel]
+            if string_startswith(bt[1], "@"):
+                self._exec_modal_cmd(bt[1], bt[2])
             else:
-                self.clipboard = self.tabs[self.active_tab].path
-            self._toast("Path copied", "ok")
-        elif label == "Set as Workspace":
-            if self.ctx_arg >= 0:
-                var d = self.ws.rows[self.ctx_arg]
-                if d.is_dir:
-                    self.ws.open_folder(d.path)
-                    self._toast("Workspace: " + d.name, "ok")
-        elif label == "Reveal in Explorer":
-            self.active_view = "explorer"
-            self.sidebar_open = true
-        elif label == "Close":
-            self._close_tab(self.active_tab)
-        elif label == "Close Others":
-            var keepT = [self.tabs[self.active_tab]]
-            var keepB = [self.buffers[self.active_tab]]
-            self.tabs = keepT
-            self.buffers = keepB
-            self.tab_count = 1
-            self.active_tab = 0
-            self.editor.set_buffer(self.buffers[0])
-        elif label == "Save":
-            var sp = self._save_active()
-            self._toast("Saved " + os_path_basename(sp), "ok")
-        elif label == "Toggle Sidebar":
-            self.sidebar_open = not self.sidebar_open
-        elif label == "Toggle Panel":
-            self.panel_open = not self.panel_open
-        elif label == "Toggle Minimap":
-            self.minimap_on = not self.minimap_on
-        self.status_msg = label
-        self._layout()
+                self._modal_close()
+                self._exec(bt[1], bt[2])
 
-    # ══ autocomplete ═════════════════════════════════════════════════════════
-    # Suggestions come from language keywords plus every def/class/var name in
-    # the current buffer, filtered by the word being typed.
-    def _ac_symbols(self):
-        var out = ["if", "elif", "else", "while", "for", "def", "class", "return",
-                   "var", "true", "false", "none", "and", "or", "not", "import",
-                   "print", "len", "str", "int", "range"]
-        var buf = self.buffers[self.active_tab]
-        var i = 0
-        while i < buf.line_count:
-            var st = string_strip(buf.get_line(i))
-            var head = ""
-            if string_find(st, "def ") == 0:
-                head = string_slice(st, 4, len(st))
-            elif string_find(st, "class ") == 0:
-                head = string_slice(st, 6, len(st))
-            elif string_find(st, "var ") == 0:
-                head = string_slice(st, 4, len(st))
-            if head != "":
-                var cut = len(head)
-                var stops = ["(", ":", " ", "="]
-                var k = 0
-                while k < len(stops):
-                    var at = string_find(head, stops[k])
-                    if at >= 0 and at < cut:
-                        cut = at
-                    k = k + 1
-                var nm = string_strip(string_slice(head, 0, cut))
-                if nm != "":
-                    out.append(nm)
-            i = i + 1
-        return out
+    def _qi_key(self, e):
+        var k = e.key
+        if k == "escape":
+            self.qi.close()
+            self.focus = self.focus_before_qi
+            return true
+        if k == "enter":
+            self._qi_accept(self.qi.current())
+            return true
+        if k == "down":
+            self.qi.move(1)
+            return true
+        if k == "up":
+            self.qi.move(0 - 1)
+            return true
+        if k == "pagedown":
+            self.qi.page(1)
+            return true
+        if k == "pageup":
+            self.qi.page(0 - 1)
+            return true
+        if k == "backspace":
+            self.qi.backspace()
+            self._qi_value_changed()
+            return true
+        if k == "tab" and self.qi.kind == "path":
+            var it = self.qi.current()
+            if it != none:
+                self.qi.set_value(it.value)
+                self.qi.sel_moved = false
+                self._path_items_refresh()
+            return true
+        if e.ctrl and k == "v":
+            self.qi.type_text(self._one_line(self._get_clipboard()))
+            self._qi_value_changed()
+            return true
+        return false
 
-    def _ac_word(self):
-        var buf = self.buffers[self.active_tab]
-        var line = buf.get_line(buf.cursor_row)
-        var c = buf.cursor_col
-        var st = c
-        while st > 0:
-            var ch = string_slice(line, st - 1, st)
-            if (ch >= "a" and ch <= "z") or (ch >= "A" and ch <= "Z") or ch == "_" or (ch >= "0" and ch <= "9"):
-                st = st - 1
+    def _one_line(self, s):
+        var t = string_replace(s, "\r", "")
+        var nl = string_find(t, "\n")
+        if nl >= 0:
+            t = string_slice(t, 0, nl)
+        return t
+
+    def _menu_key(self, e):
+        var k = e.key
+        var items = self.menu_items[self.menus[self.menu_open]]
+        if k == "escape":
+            self._close_overlays()
+        elif k == "down" or k == "up":
+            var d = 1
+            if k == "up":
+                d = 0 - 1
+            var i = self.menu_sel
+            var guard = 0
+            while guard <= len(items):
+                i = (i + d + len(items)) % len(items)
+                if items[i] != "-" and self._command_enabled(items[i]):
+                    guard = len(items) + 1
+                guard = guard + 1
+            self.menu_sel = i
+        elif k == "left" or k == "right":
+            var d2 = 1
+            if k == "left":
+                d2 = 0 - 1
+            self.menu_open = (self.menu_open + d2 + len(self.menus)) % len(self.menus)
+            self.menu_sel = -1
+        elif k == "enter" or k == "space":
+            if self.menu_sel >= 0 and self.menu_sel < len(items) and items[self.menu_sel] != "-":
+                var id = items[self.menu_sel]
+                self._close_overlays()
+                self._exec(id, none)
+
+    def _ctx_key(self, e):
+        var k = e.key
+        if k == "escape":
+            self.ctx_open = false
+        elif k == "down" or k == "up":
+            var d = 1
+            if k == "up":
+                d = 0 - 1
+            var n = len(self.ctx_items)
+            var i = self.ctx_sel
+            var guard = 0
+            while guard <= n:
+                i = (i + d + n) % n
+                if self.ctx_items[i][0] != "-":
+                    guard = n + 1
+                guard = guard + 1
+            self.ctx_sel = i
+        elif k == "enter":
+            if self.ctx_sel >= 0:
+                var fake = Hit()
+                fake.cmd = "@ctx.item"
+                fake.arg = self.ctx_sel
+                self._click(fake, e)
+
+    def _find_key(self, e):
+        var k = e.key
+        if k == "escape":
+            self.find_open = false
+            self.focus = "editor"
+        elif k == "enter":
+            if e.ctrl and e.alt:
+                self._replace_all()
+            elif self.find_field == 1:
+                self._replace_one()
+            elif e.shift:
+                self._find_step(0 - 1)
             else:
-                st = 0 - 1
-        if st < 0:
-            st = 0
-            var j = c
-            while j > 0:
-                var c2 = string_slice(line, j - 1, j)
-                if (c2 >= "a" and c2 <= "z") or (c2 >= "A" and c2 <= "Z") or c2 == "_" or (c2 >= "0" and c2 <= "9"):
-                    j = j - 1
-                else:
-                    st = j
-                    j = 0
-            if j == 0 and st == 0:
-                st = 0
-        return string_slice(line, st, c)
+                self._find_step(1)
+        elif k == "tab":
+            if self.find_replace_mode:
+                self.find_field = 1 - self.find_field
+        elif k == "backspace":
+            if self.find_field == 0:
+                if len(self.find_query) > 0:
+                    self.find_query = string_slice(self.find_query, 0, len(self.find_query) - 1)
+                    self._find_run()
+            elif len(self.find_replace) > 0:
+                self.find_replace = string_slice(self.find_replace, 0, len(self.find_replace) - 1)
+        elif e.alt and k == "c":
+            self.find_case = not self.find_case
+            self._find_run()
+        elif e.alt and k == "w":
+            self.find_word = not self.find_word
+            self._find_run()
+        elif e.alt and k == "r":
+            self.find_regex = not self.find_regex
+            self._find_run()
+        elif e.ctrl and k == "v":
+            self._find_type(self._one_line(self._get_clipboard()))
+        self._find_info_update()
 
-    def _ac_open_now(self):
-        self.ac_prefix = self._ac_word()
-        var syms = self._ac_symbols()
-        var hits = []
-        var n = 0
-        var seen = {}
-        var i = 0
-        while i < len(syms):
-            var sname = syms[i]
-            if not seen.has_key(sname):
-                if self.ac_prefix == "" or string_find(sname, self.ac_prefix) == 0:
-                    seen[sname] = true
-                    hits.append(sname)
-                    n = n + 1
-            i = i + 1
-        self.ac_items = hits
-        self.ac_n = n
-        self.ac_sel = 0
-        self.ac_open = (n > 0)
-        if n == 0:
-            self.status_msg = "No completions for '" + self.ac_prefix + "'"
+    def _find_type(self, t):
+        if self.find_field == 0:
+            self.find_query = self.find_query + t
+            self._find_run()
+        else:
+            self.find_replace = self.find_replace + t
+        self._find_info_update()
 
-    def _ac_accept(self):
-        if self.ac_n == 0:
+    def _find_info_update(self):
+        if self.find_error != "":
+            self.find_info = self.find_error
+        elif self.find_n == 0:
+            self.find_info = "No results"
+        else:
+            self.find_info = str(self.find_index + 1) + " of " + str(self.find_n)
+
+    def _search_key(self, e):
+        var k = e.key
+        if k == "escape":
+            self.focus = "editor"
+        elif k == "enter":
+            if self.search_field == 1:
+                self._search_replace_all()
+            else:
+                self._run_search()
+        elif k == "tab":
+            if self.search_replace_open:
+                self.search_field = 1 - self.search_field
+        elif k == "backspace":
+            if self.search_field == 0:
+                if len(self.search_query) > 0:
+                    self.search_query = string_slice(self.search_query, 0, len(self.search_query) - 1)
+                    self.search_due = time_ms() + 300
+            elif len(self.search_replace) > 0:
+                self.search_replace = string_slice(self.search_replace, 0, len(self.search_replace) - 1)
+        elif e.ctrl and k == "v":
+            self._search_type(self._one_line(self._get_clipboard()))
+
+    def _search_type(self, t):
+        if self.search_field == 0:
+            self.search_query = self.search_query + t
+            # Search as you type, once typing pauses.
+            self.search_due = time_ms() + 300
+        else:
+            self.search_replace = self.search_replace + t
+
+    # Single-line inputs: the SCM message box, the Debug Console, the
+    # extensions filter.
+    def _line_input_key(self, e, which):
+        var k = e.key
+        var v = self._input_value(which)
+        if k == "escape":
+            self.focus = "editor"
             return
-        var word = self.ac_items[self.ac_sel]
-        var tail = string_slice(word, len(self.ac_prefix), len(word))
-        var buf = self.buffers[self.active_tab]
-        var k = 0
-        while k < len(tail):
-            buf.insert_char(string_slice(tail, k, k + 1))
-            k = k + 1
-        self.ac_open = false
-        self._hl_cache = {}
-        self._hl_cache_n = 0
-        self.status_msg = "Completed " + word
+        if k == "backspace":
+            if len(v) > 0:
+                self._set_input_value(which, string_slice(v, 0, len(v) - 1))
+            return
+        if k == "enter":
+            if which == "scm":
+                self._git_command("git.commit", none)
+            elif which == "dbgcon":
+                self._dbg_eval(v)
+                self.dbgcon_input = ""
+            return
+        if e.ctrl and k == "v":
+            self._set_input_value(which, v + self._one_line(self._get_clipboard()))
 
-    def _draw_ac(self, r):
-        var th = self.th
-        var buf = self.buffers[self.active_tab]
-        var top = int(self.editor.scroll_y / self.LINE_H)
-        var text_x = self.col_x + self.GUTTER_W + 10
-        var pre = self.f_code.width(string_slice(buf.get_line(buf.cursor_row), 0, buf.cursor_col))
-        var x = text_x + pre
-        var y = self.ed_y + (buf.cursor_row - top) * self.LINE_H + self.LINE_H
-        var rows = self.ac_n
-        if rows > 8:
-            rows = 8
-        var w = 240
-        var h = rows * 24 + 8
-        if x + w > self.W - 10:
-            x = self.W - w - 10
-        r.draw_shadow(Rect(x, y, w, h), 18, 0, 6, Color(0, 0, 0, 160))
-        r.fill_round_xywh(x, y, w, h, th.overlay, 7)
-        r.draw_rounded_rect(Rect(x, y, w, h), th.accent, 7, 1)
-        var i = 0
-        var yy = y + 4
-        while i < rows:
-            if i == self.ac_sel:
-                r.fill_round_xywh(x + 4, yy, w - 8, 22, th.accent_soft, 4)
-            self.icons.draw(r, "file_code", x + 8, yy + 3, 14, th.accent)
-            var col = th.text_dim
-            if i == self.ac_sel:
-                col = th.text
-            r.draw_text(self.ac_items[i], x + 28, yy + 3, self.f_code, col)
-            yy = yy + 24
-            i = i + 1
-
-    def _ac_event(self, e):
-        if e.type == "keydown":
-            if e.key == "escape":
-                self.ac_open = false
-                e.consume()
-                return
-            if e.key == "down":
-                self.ac_sel = self.ac_sel + 1
-                if self.ac_sel >= self.ac_n:
-                    self.ac_sel = 0
-                e.consume()
-                return
-            if e.key == "up":
-                self.ac_sel = self.ac_sel - 1
-                if self.ac_sel < 0:
-                    self.ac_sel = self.ac_n - 1
-                e.consume()
-                return
-            if e.key == "enter" or e.key == "tab":
-                self._ac_accept()
-                e.consume()
-                return
-
-    # ── breadcrumbs ──────────────────────────────────────────────────────────
-    # VS Code's path strip: workspace > folder > file > enclosing symbol.
-    def _draw_breadcrumbs(self, r):
-        var th = self.th
-        var y = self.crumb_y
-        r.fill_xywh(self.col_x, y, self.col_w, self.BREADCRUMB_H, th.editor_bg)
-        r.draw_line(self.col_x, y + self.BREADCRUMB_H, self.col_x + self.col_w, y + self.BREADCRUMB_H, th.border_soft, 1)
-        var parts = []
-        if self.ws.root != "":
-            parts.append(os_path_basename(self.ws.root))
-        var t = self.tabs[self.active_tab]
-        if t.path != "":
-            var d = os_path_basename(os_path_dirname(t.path))
-            if d != "" and d != os_path_basename(self.ws.root):
-                parts.append(d)
-        parts.append(t.title)
-        var sym = self._enclosing_symbol()
-        if sym != "":
-            parts.append(sym)
-        var x = self.col_x + 14
-        var i = 0
-        while i < len(parts):
-            if i > 0:
-                self.icons.draw(r, "chevron_right", x, y + 5, 14, th.text_faint)
-                x = x + 16
-            var col = th.text_faint
-            if i == len(parts) - 1:
-                col = th.text_dim
-            r.draw_text(parts[i], x, y + 4, self.f_small, col)
-            var m = self.f_small.width(parts[i])
-            x = x + m + 4
-            i = i + 1
-
-    # Nearest enclosing class/def above the cursor, for the last crumb.
-    def _enclosing_symbol(self):
-        var buf = self.buffers[self.active_tab]
-        var i = buf.cursor_row
-        while i >= 0:
-            var ln = buf.get_line(i)
-            var st = string_strip(ln)
-            if string_find(st, "def ") == 0 or string_find(st, "class ") == 0:
-                var head = string_slice(st, 0, len(st))
-                var paren = string_find(head, "(")
-                if paren > 0:
-                    head = string_slice(head, 0, paren)
-                var colon = string_find(head, ":")
-                if colon > 0:
-                    head = string_slice(head, 0, colon)
-                return string_strip(head)
-            i = i - 1
+    def _input_value(self, which):
+        if which == "scm":
+            return self.scm_msg
+        if which == "dbgcon":
+            return self.dbgcon_input
+        if which == "ext":
+            return self.ext_query
         return ""
 
-    # ── toasts ───────────────────────────────────────────────────────────────
-    def _toast(self, text, kind):
-        self.toasts.append({"text": text, "kind": kind, "t": time_ms()})
-        self.toast_n = self.toast_n + 1
+    def _set_input_value(self, which, v):
+        if which == "scm":
+            self.scm_msg = v
+        elif which == "dbgcon":
+            self.dbgcon_input = v
+        elif which == "ext":
+            self.ext_query = v
+            self.tree_scroll = 0
 
-    def _draw_toasts(self, r):
-        var th = self.th
-        var keep = []
-        var n = 0
-        var now = time_ms()
-        var i = 0
-        var y = self.status_y - 52
-        while i < self.toast_n:
-            var t = self.toasts[i]
-            var age = now - t["t"]
-            if age < 3200:
-                keep.append(t)
-                n = n + 1
-                var m = self.f_ui.width(t["text"])
-                var w = m + 54
-                var x = self.W - w - 22
-                var bar = th.accent
-                var ic = "output"
-                if t["kind"] == "ok":
-                    bar = th.ok
-                    ic = "run"
-                elif t["kind"] == "err":
-                    bar = th.err
-                    ic = "warning"
-                # Slide in from the right on out_cubic, hold, then fade out.
-                # Age is known per toast, so this needs no extra state.
-                var appear = 1.0
-                if age < 220:
-                    appear = self.ease.out_cubic(float(age) / 220.0)
-                var fade = 1.0
-                if age > 2600:
-                    fade = 1.0 - self.ease.in_out_quad(float(age - 2600) / 600.0)
-                if fade < 0.0:
-                    fade = 0.0
-                var slide = int((1.0 - appear) * 46.0)
-                var ax = x + slide
-                var alpha = int(255.0 * fade)
-                r.draw_shadow(Rect(ax, y, w, 40), 18, 0, 6, Color(0, 0, 0, int(150.0 * fade)))
-                r.fill_round_xywh(ax, y, w, 40, Color(th.overlay.r, th.overlay.g, th.overlay.b,
-                                                     int(float(th.overlay.a) * fade)), 8)
-                r.fill_xywh(ax, y + 8, 3, 24, Color(bar.r, bar.g, bar.b, alpha))
-                self.icons.draw(r, ic, ax + 14, y + 12, 16, Color(bar.r, bar.g, bar.b, alpha))
-                r.draw_text(t["text"], ax + 38, y + 12, self.f_ui,
-                            Color(th.text.r, th.text.g, th.text.b, alpha))
-                y = y - 48
-            i = i + 1
-        self.toasts = keep
-        self.toast_n = n
-        if n > 0:
-            self._dirty = true
-
-    # ── tooltip ──────────────────────────────────────────────────────────────
-    def _draw_tooltip(self, r):
-        if self.tooltip == "":
-            return
-        var th = self.th
-        var m = self.f_small.width(self.tooltip)
-        var w = m + 20
-        var x = self.tooltip_x
-        var y = self.tooltip_y
-        if x + w > self.W - 8:
-            x = self.W - w - 8
-        r.draw_shadow(Rect(x, y, w, 26), 12, 0, 4, Color(0, 0, 0, 150))
-        r.fill_round_xywh(x, y, w, 26, th.overlay, 6)
-        r.draw_rounded_rect(Rect(x, y, w, 26), th.border, 6, 1)
-        r.draw_text(self.tooltip, x + 10, y + 6, self.f_small, th.text)
-
-    # ── edit actions ─────────────────────────────────────────────────────────
-    # Undo/redo history now lives on each EditorBuffer itself
-    # (ide_editor.ny), one operation-log entry per edit instead of a
-    # whole-document snapshot per keystroke — see that file's _record_op/
-    # _apply_inverse, modelled on lib/gui_piecetable.ny's PieceTable. This
-    # also makes undo per-tab rather than a single history shared across
-    # every open file, which is what every other editor does and avoids the
-    # old behaviour's occasional surprise of Ctrl+Z switching tabs.
-    #
-    # Character-level edits (typing, backspace, newline) call
-    # EditorBuffer.insert_char/delete_char_back/insert_newline directly, via
-    # self.editor.handle_event(), and record their own undo entry — nothing
-    # to do here for those. Coarser edits that reach into buf.lines directly
-    # (cut/paste a line, comment toggle, move a line, indent/dedent a range,
-    # find/replace-all) still need one snapshot per action; call
-    # self.buffers[self.active_tab].push_snapshot() immediately before them.
-    def _undo(self):
-        var buf = self.buffers[self.active_tab]
-        if not buf.can_undo():
-            self.status_msg = "Nothing to undo"
-            return
-        buf.undo()
-        self.editor.set_buffer(buf)
-        self._hl_cache = {}
-        self._hl_cache_n = 0
-        self.status_msg = "Undo"
-
-    def _redo(self):
-        var buf = self.buffers[self.active_tab]
-        if not buf.can_redo():
-            self.status_msg = "Nothing to redo"
-            return
-        buf.redo()
-        self.editor.set_buffer(buf)
-        self._hl_cache = {}
-        self._hl_cache_n = 0
-        self.status_msg = "Redo"
-
-    def _copy_line(self):
-        var sel = self._sel_text()
-        if sel != "":
-            self.clipboard = sel
-            self.status_msg = "Copied selection"
-            return
-        var buf = self.buffers[self.active_tab]
-        self.clipboard = buf.get_line(buf.cursor_row)
-        self.status_msg = "Copied line " + str(buf.cursor_row + 1)
-
-    def _cut_line(self):
-        var sel = self._sel_text()
-        if sel != "":
-            self.clipboard = sel
-            self._sel_delete()
-            self.status_msg = "Cut selection"
-            return
-        self.buffers[self.active_tab].push_snapshot()
-        var buf = self.buffers[self.active_tab]
-        self.clipboard = buf.get_line(buf.cursor_row)
-        var keep = []
-        var i = 0
-        while i < buf.line_count:
-            if i != buf.cursor_row:
-                keep.append(buf.lines[i])
-            i = i + 1
-        if len(keep) == 0:
-            keep = [""]
-        buf.lines = keep
-        buf.line_count = len(keep)
-        if buf.cursor_row >= buf.line_count:
-            buf.cursor_row = buf.line_count - 1
-        self._hl_cache = {}
-        self._hl_cache_n = 0
-        self.tabs[self.active_tab].dirty = true
-        self.status_msg = "Cut line"
-
-    def _paste(self):
-        if self.clipboard == "":
-            self.status_msg = "Clipboard is empty"
-            return
-        self.buffers[self.active_tab].push_snapshot()
-        var buf = self.buffers[self.active_tab]
-        var out = []
-        var i = 0
-        while i < buf.line_count:
-            out.append(buf.lines[i])
-            if i == buf.cursor_row:
-                out.append(self.clipboard)
-            i = i + 1
-        buf.lines = out
-        buf.line_count = len(out)
-        buf.cursor_row = buf.cursor_row + 1
-        self._hl_cache = {}
-        self._hl_cache_n = 0
-        self.tabs[self.active_tab].dirty = true
-        self.status_msg = "Pasted"
-
-    def _find_in_files(self):
-        if self.find_query == "":
-            self.status_msg = "Set a search term with Ctrl+F first"
-            return
-        var probs = []
-        var n = 0
-        var i = 0
-        while i < self.ws.row_count:
-            var row = self.ws.rows[i]
-            if not row.is_dir and row.kind == "code":
-                var text = read_file(row.path)
-                if text != none:
-                    var lines = string_split(text, "\n")
-                    var j = 0
-                    while j < len(lines) and n < 200:
-                        if string_find(lines[j], self.find_query) >= 0:
-                            probs = probs + [{"sev": "info", "msg": string_strip(lines[j]),
-                                              "file": row.name, "line": j + 1}]
-                            n = n + 1
-                        j = j + 1
-            i = i + 1
-        self.problems = probs
-        self.problem_count = n
-        self.panel_open = true
-        self.active_panel = 1
-        self.status_msg = str(n) + " matches for '" + self.find_query + "'"
-
-    # ── debugging ────────────────────────────────────────────────────────────
-    def _start_debug(self):
-        self.panel_open = true
-        self.active_panel = 3
-        if self.break_count == 0:
-            self.status_msg = "No breakpoints set - running to completion"
-            self._build_run("Run")
-            return
-        var buf = self.buffers[self.active_tab]
-        var first = -1
-        var i = 0
-        while i < buf.line_count:
-            if self._has_break(i) and first < 0:
-                first = i
-            i = i + 1
-        if first >= 0:
-            buf.cursor_row = first
-            self.debug_line = first
-            self.status_msg = "Stopped at breakpoint, line " + str(first + 1)
-            self.console.write("debug: stopped at line " + str(first + 1), "info")
-
-    def _debug_step(self, kind):
-        var buf = self.buffers[self.active_tab]
-        if buf.cursor_row + 1 < buf.line_count:
-            buf.cursor_row = buf.cursor_row + 1
-        self.debug_line = buf.cursor_row
-        self.status_msg = kind + " - line " + str(buf.cursor_row + 1)
-
-    def _show_help(self, which):
-        self.panel_open = true
-        self.active_panel = 0
-        if which == "About Nython":
-            self.console.write("NythonIDE v4  -  Nython " + str(lang_version()), "ok")
-            self.console.write("SDL3 " + str(gui_sdl_version()), "info")
-        elif which == "Keyboard Shortcuts":
-            self.console.write("Ctrl+P palette   Ctrl+F find   Ctrl+H replace   Ctrl+G go to line", "info")
-            self.console.write("Ctrl+B sidebar   Ctrl+J panel  Ctrl+O open file  Ctrl+K open folder", "info")
-            self.console.write("Ctrl+Shift+N new project      F5 run   F9 breakpoint", "info")
-        else:
-            self.console.write("Documentation: see CLAUDE.md and SDL3_SETUP.md in the project root", "info")
-        self.status_msg = which
-
-    # ── build & run ──────────────────────────────────────────────────────────
-    # Executes the current file with the interpreter this IDE is running inside
-    # and captures its output, rather than printing a canned message.
-    def _save_active(self):
-        var t = self.tabs[self.active_tab]
-        if t.path == "":
-            t.path = os_path_join(getcwd(), t.title)
-        write(t.path, self.buffers[self.active_tab].get_all_text())
-        t.dirty = false
-        return t.path
-
-    # Locate the interpreter to build with. On Windows nython.exe sits beside
-    # the IDE; on a dev checkout it is in bin/. Falling straight through to a
-    # bare "nython" only works if it happens to be on PATH.
-    def _interpreter_path(self):
-        var cands = [os_path_join(getcwd(), "nython"),
-                     os_path_join(getcwd(), "nython.exe"),
-                     os_path_join(os_path_join(getcwd(), "bin"), "nython"),
-                     os_path_join(os_path_join(getcwd(), "bin"), "nython.exe"),
-                     os_path_join(os_path_join(getcwd(), "bin/Release"), "nython.exe")]
-        var i = 0
-        while i < len(cands):
-            if os_exists(cands[i]):
-                return cands[i]
-            i = i + 1
-        var env = os_getenv("NYTHON_EXE")
-        if env != none and env != "":
-            return env
-        return "nython"
-
-    def _build_run(self, mode):
-        self.active_panel = 0
-        self.panel_open = true
-        var path = self._save_active()
-        self.console.write("> " + mode + "  " + path, "info")
-        # Flags must match src/main.cpp exactly. "--tokens" was wrong — the
-        # interpreter accepts "--tokenize" — so Tokenize silently ran the file
-        # instead of dumping its token stream.
-        var flag = ""
-        if mode == "Tokenize":
-            flag = "--tokenize "
-        elif mode == "AST":
-            flag = "--ast "
-        elif mode == "Disasm":
-            flag = "--disasm "
-        elif mode == "VM":
-            flag = "--vm "
-        var t0 = time_ms()
-        var exe = self._interpreter_path()
-        var out = popen("\"" + exe + "\" " + flag + "\"" + path + "\" 2>&1")
-        var dt = int(time_ms() - t0)
-        if out == none:
-            out = ""
-        self._parse_build_output(out, path)
-        # Tokenize / AST / Disasm produce a dump rather than program output;
-        # keep it for the Tokens panel and show that panel instead of Output.
-        if mode == "Tokenize" or mode == "AST" or mode == "Disasm":
-            var dump = string_split(self._strip_ansi(out), "\n")
-            var keep = []
-            var kn = 0
-            var di = 0
-            while di < len(dump) and kn < 400:
-                if string_strip(dump[di]) != "":
-                    keep.append(dump[di])
-                    kn = kn + 1
-                di = di + 1
-            self.introspect = keep
-            self.introspect_n = kn
-            self.introspect_kind = mode
-            self.active_panel = 4
-            self.panel_scroll = 0
-        var lines = string_split(out, "\n")
-        var i = 0
-        var shown = 0
-        while i < len(lines) and shown < 200:
-            var ln = self._strip_ansi(lines[i])
-            if string_strip(ln) != "":
-                var kind = "out"
-                if string_find(ln, "Error") >= 0 or string_find(ln, "error") >= 0:
-                    kind = "err"
-                self.console.write(ln, kind)
-                shown = shown + 1
-            i = i + 1
-        if self.build_ok:
-            self.console.write("finished in " + str(dt) + " ms", "ok")
-            self.status_msg = mode + " succeeded (" + str(dt) + " ms)"
-            self._toast(mode + " succeeded in " + str(dt) + " ms", "ok")
-        else:
-            self.console.write("failed with " + str(self.problem_count) + " problem(s)", "err")
-            self.status_msg = mode + " failed"
-            self._toast(mode + " failed - see Problems", "err")
-        self._layout()
-
-    # Captured output carries terminal colour escapes; strip them so the
-    # console shows text rather than control sequences.
-    def _strip_ansi(self, text):
-        var out = ""
-        var i = 0
-        var n = len(text)
-        while i < n:
-            var ch = string_slice(text, i, i + 1)
-            if ch == "\x1b":
-                while i < n and string_slice(text, i, i + 1) != "m":
-                    i = i + 1
-                i = i + 1
+    # ── terminal ─────────────────────────────────────────────────────────────
+    def _term_key(self, e):
+        var k = e.key
+        if k == "enter":
+            var cmd = self.term_input
+            self._term_print(self.term_prompt + " " + cmd, "cmd")
+            self.term_input = ""
+            self.term_follow = true
+            self._term_run(cmd)
+        elif k == "backspace":
+            if len(self.term_input) > 0:
+                self.term_input = string_slice(self.term_input, 0, len(self.term_input) - 1)
+        elif k == "up":
+            self.term_input = self.cmdline.history_prev()
+        elif k == "down":
+            self.term_input = self.cmdline.history_next()
+        elif k == "tab":
+            var comp = self.cmdline.complete(self.term_input)
+            if len(comp) == 1:
+                self.term_input = comp[0]
+            elif len(comp) > 1:
+                self._term_print(string_join(comp, "  "), "dim")
+        elif e.ctrl and k == "c":
+            if self.term_proc != none and self.term_proc.running:
+                self.term_proc.stop()
+                self._term_print("^C", "warn")
             else:
-                out = out + ch
-                i = i + 1
-        return out
+                self.term_input = ""
+        elif e.ctrl and k == "l":
+            self.term_lines = []
+            self.term_kinds = []
+        elif e.ctrl and k == "v":
+            self.term_input = self.term_input + self._one_line(self._get_clipboard())
+        elif k == "escape":
+            self.focus = "editor"
 
-    # Turn interpreter diagnostics into Problems entries.
-    def _parse_build_output(self, out, path):
-        var probs = []
-        var n = 0
-        var lines = string_split(out, "\n")
-        var i = 0
-        while i < len(lines):
-            var ln = lines[i]
-            var bad = string_find(ln, "Error") >= 0 or string_find(ln, "error") >= 0
-            bad = bad or string_find(ln, "Uncaught") >= 0
-            bad = bad or string_find(ln, "not found") >= 0
-            bad = bad or string_find(ln, "No such file") >= 0
-            bad = bad or string_find(ln, "Traceback") >= 0
-            if bad:
-                var lineno = 0
-                var at = string_find(ln, "line ")
-                if at >= 0:
-                    var rest = string_slice(ln, at + 5, len(ln))
-                    lineno = int(rest)
-                probs = probs + [{"sev": "err", "msg": string_strip(ln),
-                                  "file": os_path_basename(path), "line": lineno}]
-                n = n + 1
-            i = i + 1
-        self.problems = probs
-        self.problem_count = n
-        self.build_ok = (n == 0)
-
-    # ── find / replace ───────────────────────────────────────────────────────
-    def _find_run(self):
-        var hits = []
-        var n = 0
-        var q = self.find_query
-        if q != "":
-            var buf = self.buffers[self.active_tab]
-            var i = 0
-            while i < buf.line_count:
-                var ln = buf.get_line(i)
-                var at = string_find(ln, q)
-                if at >= 0:
-                    hits.append({"line": i, "col": at})
-                    n = n + 1
-                i = i + 1
-        self.find_hits = hits
-        self.find_hit_count = n
-        if self.find_index >= n:
-            self.find_index = 0
-        if n > 0:
-            self._goto_line(self.find_hits[self.find_index]["line"] + 1)
-
-    def _find_step(self, delta):
-        if self.find_hit_count == 0:
-            return
-        self.find_index = self.find_index + delta
-        if self.find_index >= self.find_hit_count:
-            self.find_index = 0
-        if self.find_index < 0:
-            self.find_index = self.find_hit_count - 1
-        self._goto_line(self.find_hits[self.find_index]["line"] + 1)
-
-    def _replace_current(self, all_of_them):
-        if self.find_query == "":
-            return
-        var buf = self.buffers[self.active_tab]
-        # Not previously undoable at all; now that undo is a per-buffer op
-        # log rather than a hand-placed snapshot call, giving replace-all one
-        # is a one-line addition instead of its own risky change.
-        buf.push_snapshot()
-        var replaced = 0
-        var i = 0
-        while i < buf.line_count:
-            var ln = buf.get_line(i)
-            var at = string_find(ln, self.find_query)
-            if at >= 0:
-                var head = string_slice(ln, 0, at)
-                var tail = string_slice(ln, at + len(self.find_query), len(ln))
-                buf.lines[i] = head + self.find_replace + tail
-                replaced = replaced + 1
-                if not all_of_them:
-                    i = buf.line_count
-            i = i + 1
-        self.status_msg = "Replaced " + str(replaced)
-        self._hl_cache = {}
-        self._hl_cache_n = 0
-        self._find_run()
-
-    def _goto_line(self, one_based):
-        var buf = self.buffers[self.active_tab]
-        var r = one_based - 1
-        if r < 0:
-            r = 0
-        if r >= buf.line_count:
-            r = buf.line_count - 1
-        buf.cursor_row = r
-        buf.cursor_col = 0
-        self.status_msg = "Line " + str(r + 1)
-
-    def _draw_find(self, r):
-        var th = self.th
-        var w = 420
-        if w > self.col_w - 40:
-            w = self.col_w - 40
-        var x = self.col_x + self.col_w - w - 20
-        var y = self.ed_y + 8
-        var h = 40
-        if self.find_replace_mode:
-            h = 74
-        r.draw_shadow(Rect(x, y, w, h), 18, 0, 6, Color(0, 0, 0, 150))
-        r.fill_round_xywh(x, y, w, h, Color(30, 33, 52, 252), 8)
-        r.draw_rounded_rect(Rect(x, y, w, h), th.border, 8, 1)
-        self.icons.draw(r, "search", x + 10, y + 10, 16, th.text_faint)
-        var fb = Color(255, 255, 255, 12)
-        if self.find_field == 0:
-            fb = Color(110, 118, 246, 40)
-        r.fill_round_xywh(x + 32, y + 8, w - 150, 24, fb, 5)
-        r.draw_text(self.find_query, x + 40, y + 13, self.f_code, th.text)
-        var info = str(self.find_hit_count) + " matches"
-        if self.find_hit_count > 0:
-            info = str(self.find_index + 1) + " of " + str(self.find_hit_count)
-        var im = self.f_small.width(info)
-        r.draw_text(info, x + w - im - 14, y + 14, self.f_small, th.text_faint)
-        if self.find_replace_mode:
-            var rb = Color(255, 255, 255, 12)
-            if self.find_field == 1:
-                rb = Color(110, 118, 246, 40)
-            r.fill_round_xywh(x + 32, y + 40, w - 150, 24, rb, 5)
-            r.draw_text(self.find_replace, x + 40, y + 45, self.f_code, th.text)
-            r.draw_text("Ctrl+Enter replaces all", x + w - 150, y + 46, self.f_small, th.text_faint)
-
-    def _find_event(self, e):
-        if e.type == "keydown":
-            if e.key == "escape":
-                self.find_open = false
-                e.consume()
-                return
-            if e.key == "enter":
-                if e.ctrl and self.find_replace_mode:
-                    self._replace_current(true)
-                elif self.find_replace_mode and self.find_field == 1:
-                    self._replace_current(false)
-                else:
-                    self._find_step(1)
-                e.consume()
-                return
-            if e.key == "tab":
-                if self.find_replace_mode:
-                    if self.find_field == 0:
-                        self.find_field = 1
-                    else:
-                        self.find_field = 0
-                e.consume()
-                return
-            if e.key == "backspace":
-                if self.find_field == 0:
-                    if len(self.find_query) > 0:
-                        self.find_query = string_slice(self.find_query, 0, len(self.find_query) - 1)
-                        self._find_run()
-                else:
-                    if len(self.find_replace) > 0:
-                        self.find_replace = string_slice(self.find_replace, 0, len(self.find_replace) - 1)
-                e.consume()
-                return
-        if e.type == "textinput":
-            if self.find_field == 0:
-                self.find_query = self.find_query + e.text
-                self._find_run()
-            else:
-                self.find_replace = self.find_replace + e.text
-            e.consume()
-
-    # ── breakpoints ──────────────────────────────────────────────────────────
-    def _break_key(self, line):
-        return self.tabs[self.active_tab].title + ":" + str(line)
-
-    def _toggle_break(self, line):
-        var k = self._break_key(line)
-        if self.breaks.has_key(k):
-            self.breaks.remove(k)
-            self.break_count = self.break_count - 1
-            self.status_msg = "Breakpoint cleared at line " + str(line + 1)
-        else:
-            self.breaks[k] = true
-            self.break_count = self.break_count + 1
-            self.status_msg = "Breakpoint set at line " + str(line + 1)
-
-    def _has_break(self, line):
-        return self.breaks.has_key(self._break_key(line))
-
-    # Runs a line typed into the terminal through lib/ide_commands.ny's
-    # CommandLine: ":cmd" drives the IDE, ">expr"/bare input is real language
-    # evaluation via lib/ide_toolchain.ny's Toolchain, "@agent" talks to the
-    # analyser in lib/aiagent.ny. The command line only names an action
-    # (res.action); this is where the action is actually performed, since
-    # CommandLine has no window to reach into.
-    def _term_run(self, cmd):
-        var c = string_strip(cmd)
+    # ":" IDE command, ">" Nython expression, "@" analyser; anything else is a
+    # shell command run in the background in the terminal's folder.
+    def _term_run(self, raw):
+        var c = string_strip(raw)
         if c == "":
             return
-        # A couple of one-word conveniences people type without a sigil,
-        # kept for continuity with the old ad hoc terminal.
-        if c == "files":
-            var out = ""
+        if c == "clear" or c == "cls":
+            self.term_lines = []
+            self.term_kinds = []
+            return
+        if string_startswith(c, ":") or string_startswith(c, ">") or string_startswith(c, "@"):
+            var res = self.cmdline.execute(c, self)
             var i = 0
-            while i < self.tab_count:
-                out = out + self.tabs[i].title + "  "
+            while i < len(res.lines):
+                self._term_print(res.lines[i], "out")
                 i = i + 1
-            self.term_lines.append(out)
-            self.term_count = self.term_count + 1
+            self._term_dispatch(res.action, res.arg)
             return
-        if c == "version":
-            self.term_lines.append("Nython 0.2.1  |  NythonIDE v4")
-            self.term_count = self.term_count + 1
+        self.cmdline.push_history(c)
+        if c == "cd" or string_startswith(c, "cd "):
+            var dest = string_strip(string_slice(c, 2, len(c)))
+            if dest == "" or dest == "~":
+                dest = getenv("HOME")
+            elif not string_startswith(dest, "/"):
+                dest = path_join(self.term_cwd, dest)
+            var real = string_strip(os_exec("cd " + self._q(dest) + " 2>/dev/null && pwd"))
+            if real != "" and os_isdir(real):
+                self.term_cwd = real
+            else:
+                self._term_print("cd: no such directory: " + dest, "err")
             return
+        if self.term_proc != none and self.term_proc.running:
+            self._term_print("A command is still running (Ctrl+C stops it)", "warn")
+            return
+        self.term_seq = self.term_seq + 1
+        self.term_proc = BgProc("/tmp/nyide_term_" + str(self.session_id) + "_" + str(self.term_seq))
+        self.term_proc.start(c, self.term_cwd)
 
-        var res = self.cmdline.execute(cmd, self)
+    def _poll_term(self):
+        if self.term_proc == none or not self.term_proc.running:
+            return
+        var lines = self.term_proc.poll(80)
         var i = 0
-        while i < len(res.lines):
-            self.term_lines.append(res.lines[i])
-            self.term_count = self.term_count + 1
+        while i < len(lines):
+            self._term_print(self._strip_ansi(lines[i]), "out")
             i = i + 1
-        self._term_dispatch(res.action, res.arg)
+        if not self.term_proc.running and self.term_proc.code != 0:
+            self._term_print("[exit code " + str(self.term_proc.code) + "]", "dim")
 
-    # Performs the IDE-side effect of a ":cmd" or "@agent" command. Named
-    # actions keep CommandLine itself free of any window/editor dependency.
     def _term_dispatch(self, action, arg):
-        if action == "":
+        if action == "" or action == none:
             return
         if action == "clear":
             self.term_lines = []
-            self.term_count = 0
+            self.term_kinds = []
         elif action == "run" or action == "build":
-            self._build_run("Run")
+            self._run_active("Run")
         elif action == "vm":
-            self._build_run("VM")
+            self._run_active("VM")
         elif action == "tokens":
-            self._build_run("Tokenize")
+            self._run_active("Tokenize")
         elif action == "ast":
-            self._build_run("AST")
+            self._run_active("AST")
         elif action == "disasm":
-            self._build_run("Disasm")
+            self._run_active("Disasm")
         elif action == "profile":
-            self._term_profile()
+            self._run_active("Profile")
         elif action == "save":
-            self._save_active()
-            self._toast("Saved", "ok")
+            self._exec("workbench.action.files.save", none)
         elif action == "theme":
-            self._set_theme(not self.th.dark)
+            self._exec("nython.toggleTheme", none)
         elif action == "quit":
-            self._save_settings()
-            self.win.running = false
+            self._quit(false)
         elif action == "open":
             if arg != "":
-                self._open_path(arg)
-            else:
-                self.term_lines.append("usage: :open <path>")
-                self.term_count = self.term_count + 1
+                var p = arg
+                if not string_startswith(p, "/"):
+                    p = path_join(self.term_cwd, p)
+                self._open_path(p, -1, 0)
         elif action == "goto":
             if arg != "":
-                self._goto_line(int(arg))
-            else:
-                self.term_lines.append("usage: :goto <line>")
-                self.term_count = self.term_count + 1
+                self._goto(self._int_or(arg, 1) - 1, 0)
         elif action == "find":
             self.find_query = arg
-            self.find_open = true
-            self.find_replace_mode = false
-            self.find_field = 0
-            self._find_run()
+            self._open_find(false)
         elif action == "panel":
-            var pidx = -1
-            var pi = 0
-            while pi < len(self.panel_tabs):
-                if string_lower(self.panel_tabs[pi]) == string_lower(arg):
-                    pidx = pi
-                pi = pi + 1
-            if pidx >= 0:
-                self.panel_open = true
-                self.active_panel = pidx
-            else:
-                self.term_lines.append("unknown panel: " + arg)
-                self.term_count = self.term_count + 1
-        elif string_startswith(action, "agent:"):
-            self._term_agent(string_slice(action, 6, len(action)), arg)
-
-    # A run under `--profile`, top hot rows only — the IDE has no dedicated
-    # profiler panel yet, so this is the only place profiling is reachable.
-    def _term_profile(self):
-        var path = self._save_active()
-        var res = self.toolchain.profile(self.buffers[self.active_tab].get_all_text(), path)
-        if res.profile_count == 0:
-            self.term_lines.append("no profile data (did the program run to completion?)")
-            self.term_count = self.term_count + 1
-            return
-        self.term_lines.append("name                 calls   total ms   self ms")
-        self.term_count = self.term_count + 1
-        var i = 0
-        var shown = 0
-        while i < res.profile_count and shown < 15:
-            var row = res.profile_rows[i]
-            self.term_lines.append(str(row[0]) + "  " + str(row[1]) + "  " + str(row[2]) + "  " + str(row[3]))
-            self.term_count = self.term_count + 1
-            shown = shown + 1
-            i = i + 1
-
-    # @explain / @fix reuse the same pattern-based analyser the sidebar's
-    # "Analyse Buffer" action already runs (lib/aiagent.ny's CodeAnalyzer) —
-    # there is no separate LLM backend wired in, so this reports what the
-    # analyser actually finds rather than inventing a smarter answer.
-    def _term_agent(self, verb, arg):
-        if verb == "explain":
-            var text = self.buffers[self.active_tab].get_all_text()
-            self.term_lines.append(self.tabs[self.active_tab].title + ": "
-                + str(self.ai.count_lines(text)) + " lines, "
-                + str(self.ai.count_classes(text)) + " classes, "
-                + str(self.ai.count_functions(text)) + " functions")
-            self.term_count = self.term_count + 1
-            return
-        if verb == "fix":
-            self._ai_analyze(true)
-            if self.ai_n == 0:
-                self.term_lines.append("no issues found")
-                self.term_count = self.term_count + 1
-                return
             var i = 0
-            while i < self.ai_n:
-                var it = self.ai_issues[i]
-                self.term_lines.append("line " + str(it["line"]) + ": " + it["message"])
-                self.term_count = self.term_count + 1
+            while i < len(self.panel_keys):
+                if string_lower(self.panel_labels[i]) == string_lower(arg) or self.panel_keys[i] == string_lower(arg):
+                    self._show_panel(self.panel_keys[i])
                 i = i + 1
-            return
-        self.term_lines.append("@" + verb + " is not wired to a live model yet — try @explain or @fix")
-        self.term_count = self.term_count + 1
-
-    def _close_tab(self, idx):
-        if self.tab_count <= 1:
-            self.status_msg = "Cannot close the last tab"
-            return
-        var nt = []
-        var nb = []
-        var i = 0
-        while i < self.tab_count:
-            if i != idx:
-                nt.append(self.tabs[i])
-                nb.append(self.buffers[i])
-            i = i + 1
-        var closed = self.tabs[idx].title
-        self.tabs = nt
-        self.buffers = nb
-        self.tab_count = self.tab_count - 1
-        if self.active_tab >= self.tab_count:
-            self.active_tab = self.tab_count - 1
-        self.editor.set_buffer(self.buffers[self.active_tab])
-        self.status_msg = "Closed " + closed
-        self._layout()
-
-    def _menu_action(self, label):
-        if label == "Toggle Sidebar":
-            self.sidebar_open = not self.sidebar_open
-        elif label == "Toggle Panel":
-            self.panel_open = not self.panel_open
-        elif label == "Toggle Minimap":
-            self.minimap_on = not self.minimap_on
-        elif label == "Toggle Theme":
-            self._set_theme(not self.th.dark)
-            var mode = "dark"
-            if not self.th.dark:
-                mode = "light"
-            self._toast("Theme: " + mode, "ok")
-        elif label == "Zoom In":
-            self._zoom(1)
-        elif label == "Zoom Out":
-            self._zoom(0 - 1)
-        elif label == "Reset Zoom":
-            self._zoom(13 - self.font_size)
-        elif label == "Command Palette":
-            self._open_palette()
-        elif label == "Run":
-            self.active_mode = 0
-            self._run()
-        elif label == "Run on VM":
-            self.active_mode = 1
-            self._run()
-        elif label == "Tokenize":
-            self.active_mode = 3
-            self._run()
-        elif label == "Show AST":
-            self.active_mode = 4
-            self._run()
-        elif label == "Disassemble":
-            self.active_mode = 5
-            self._run()
-        elif label == "Build":
-            self.active_mode = 0
-            self._run()
-        elif label == "Analyse Buffer":
-            self.active_view = "ai"
-            self.sidebar_open = true
-            self._ai_analyze(true)
-            self._toast(str(self.ai_n) + " suggestion(s)", "ok")
-        elif label == "Lang Workshop":
-            self.panel_open = true
-            self.active_panel = 5
-        elif label == "Terminal":
-            self.panel_open = true
-            self.active_panel = 2
-        elif label == "Exit":
-            self._save_settings()
-            self.win.running = false
-        elif label == "Undo":
-            self._undo()
-        elif label == "Redo":
-            self._redo()
-        elif label == "Cut":
-            self._cut_line()
-        elif label == "Copy":
-            self._copy_line()
-        elif label == "Paste":
-            self._paste()
-        elif label == "Toggle Comment":
-            self._toggle_comment()
-        elif label == "Duplicate Line":
-            self._duplicate_line()
-        elif label == "Delete Line":
-            self._delete_line()
-        elif label == "Move Line Up":
-            self._move_line(0 - 1)
-        elif label == "Move Line Down":
-            self._move_line(1)
-        elif label == "Find":
-            self.find_open = true
-            self.find_replace_mode = false
-            self.find_field = 0
-            self._find_run()
-        elif label == "Replace":
-            self.find_open = true
-            self.find_replace_mode = true
-            self.find_field = 0
-            self._find_run()
-        elif label == "Go to Line":
-            self._ask("goto", "Go to Line", "Line number", "")
-        elif label == "Find in Files":
-            self._find_in_files()
-        elif label == "Start Debugging":
-            self._start_debug()
-        elif label == "Step Over" or label == "Step Into":
-            self._debug_step(label)
-        elif label == "Toggle Breakpoint":
-            self._toggle_break(self.buffers[self.active_tab].cursor_row)
-        elif label == "Clear All Breakpoints":
-            self.breaks = {}
-            self.break_count = 0
-            self.status_msg = "All breakpoints cleared"
-        elif label == "Show Breakpoints":
-            self.panel_open = true
-            self.active_panel = 3
-        elif label == "Add Highlight Token...":
-            self._ask("addtoken", "Add Highlight Token", "word  or  word=r,g,b", "")
-        elif label == "Reload Highlight Rules":
-            self._load_hl_rules(true)
-        elif label == "Save Settings":
-            self._save_settings()
-            self._toast("Settings saved", "ok")
-        elif label == "Reload Settings":
-            if self._load_settings():
-                self._toast("Settings loaded", "ok")
+        elif string_startswith(action, "agent:"):
+            var verb = string_slice(action, 6, len(action))
+            if verb == "fix" or verb == "explain":
+                self._ai_analyze(true)
+                if self.ai_n == 0:
+                    self._term_print("no issues found in " + self.doc().title, "ok")
+                var j = 0
+                while j < self.ai_n:
+                    var it = self.ai_issues[j]
+                    self._term_print("line " + str(it["line"]) + ": " + it["message"], "out")
+                    j = j + 1
             else:
-                self._toast("No .nyide file", "err")
-        elif label == "Settings":
-            self.panel_open = true
-            self.active_panel = 5
-        elif label == "Documentation" or label == "Keyboard Shortcuts" or label == "About Nython":
-            self._show_help(label)
-        elif label == "New Project...":
-            self._ask("new_project", "New Project", "Folder to create the project in", os_path_join(getcwd(), "MyProject"))
-        elif label == "Open Project...":
-            self._ask("open_project", "Open Project", "Path to a .nyproj manifest", getcwd())
-        elif label == "Open Folder...":
-            self._ask("open_folder", "Open Folder", "Folder to open as the workspace", getcwd())
-        elif label == "Open File...":
-            self._ask("open_file", "Open File", "Path to a file", getcwd())
-        elif label == "Recent Files":
-            self.panel_open = true
-            self.active_panel = 0
-            if self.recent_n == 0:
-                self.console.write("no recent files yet", "info")
-            else:
-                var ri = 0
-                while ri < self.recent_n:
-                    self.console.write("recent: " + self.recent[ri], "info")
-                    ri = ri + 1
-        elif label == "Close Folder":
-            self.ws.root = ""
-            self.ws.rebuild()
-        elif label == "Save All":
-            self.console.write("saved all open buffers", "ok")
-            self.panel_open = true
-            self.active_panel = 0
-        elif label == "New File":
-            var nm = "untitled" + str(self.tab_count + 1) + ".ny"
-            self.buffers.append(EditorBuffer(nm, "# " + nm + "\n"))
-            self.tabs.append(EdTab(nm))
-            self.tab_count = self.tab_count + 1
-            self.active_tab = self.tab_count - 1
-            self.editor.set_buffer(self.buffers[self.active_tab])
-        elif label == "Save":
-            self.console.write("saved " + self.tabs[self.active_tab].title, "ok")
-            self.panel_open = true
-            self.active_panel = 0
-        self.status_msg = label
-        self._layout()
+                self._term_print("@" + verb + " needs a language model, which is not connected; @explain and @fix use the local analyser.", "warn")
 
-    def _run_command(self, cmd):
-        if string_find(cmd, "Toggle Sidebar") >= 0:
-            self.sidebar_open = not self.sidebar_open
-        elif string_find(cmd, "Toggle Panel") >= 0:
-            self.panel_open = not self.panel_open
-        elif string_find(cmd, "Toggle Minimap") >= 0:
-            self.minimap_on = not self.minimap_on
-        elif string_find(cmd, "Toggle Theme") >= 0:
-            self._set_theme(not self.th.dark)
-        elif string_find(cmd, "Execute") >= 0:
-            self._run()
-        self.status_msg = cmd
-        self._layout()
-
-    def _open_by_name(self, name):
-        var i = 0
-        while i < self.tab_count:
-            if self.tabs[i].title == name:
-                self.active_tab = i
-                self.editor.set_buffer(self.buffers[i])
-                self.status_msg = "Opened " + name
+    # ── editor keys ──────────────────────────────────────────────────────────
+    def _editor_key(self, e):
+        if not self._is_text():
+            if e.key == "escape":
+                self._close_overlays()
+            return
+        var k = e.key
+        var d = self.doc()
+        var b = d.buf
+        var nav = k == "left" or k == "right" or k == "up" or k == "down" or k == "home" or k == "end" or k == "pageup" or k == "pagedown"
+        if nav:
+            b.begin_group()
+            var had_sel = self._sel_range()
+            if e.shift:
+                self._sel_begin()
+            elif had_sel != none and (k == "left" or k == "right") and not e.ctrl:
+                # Left/Right with a selection collapses it to that edge.
+                d.sel_on = false
+                if k == "left":
+                    b.cursor_row = had_sel[0]
+                    b.cursor_col = had_sel[1]
+                else:
+                    b.cursor_row = had_sel[2]
+                    b.cursor_col = had_sel[3]
+                self._reveal_caret()
                 return
-            i = i + 1
-        self.status_msg = name + " is not open"
+            else:
+                d.sel_on = false
+            self._move_caret(k, e.ctrl)
+            if self.selmodel.count > 1 and not e.shift:
+                self._move_extra_carets(k, e.ctrl)
+            self._reveal_caret()
+            self.ac_open = false
+            return
+        if k == "escape":
+            if self.selmodel.count > 1:
+                self._clear_extra_carets()
+            elif self.find_open:
+                self.find_open = false
+            elif d.sel_on:
+                d.sel_on = false
+            return
+        if d.readonly:
+            if k == "backspace" or k == "delete" or k == "enter" or k == "tab":
+                self.status_msg = d.title + " is read-only"
+            return
+        if k == "backspace":
+            self._edit_backspace(e.ctrl)
+        elif k == "delete":
+            self._edit_delete(e.ctrl)
+        elif k == "enter":
+            self._edit_enter()
+        elif k == "tab":
+            var sr = self._sel_range()
+            if e.shift:
+                self._indent_selection(false)
+            elif sr != none and sr[0] != sr[2]:
+                self._indent_selection(true)
+            else:
+                self._edit_type(self._spaces_to_tab_stop())
+        else:
+            return
+        self._after_typing()
 
-    def _run(self):
-        self._build_run(self.run_modes[self.active_mode])
+    def _spaces_to_tab_stop(self):
+        var col = self.buf().cursor_col
+        var n = self.tab_size - (col % self.tab_size)
+        var s = ""
+        var i = 0
+        while i < n:
+            s = s + " "
+            i = i + 1
+        return s
+
+    def _move_caret(self, k, ctrl):
+        var b = self.buf()
+        if k == "left":
+            if ctrl:
+                var w = b.word_left(b.cursor_row, b.cursor_col)
+                b.cursor_row = w[0]
+                b.cursor_col = w[1]
+            elif b.cursor_col > 0:
+                b.cursor_col = b.cursor_col - 1
+            elif b.cursor_row > 0:
+                b.cursor_row = b.cursor_row - 1
+                b.cursor_col = len(b.get_line(b.cursor_row))
+            self.want_col = -1
+        elif k == "right":
+            if ctrl:
+                var w2 = b.word_right(b.cursor_row, b.cursor_col)
+                b.cursor_row = w2[0]
+                b.cursor_col = w2[1]
+            elif b.cursor_col < len(b.get_line(b.cursor_row)):
+                b.cursor_col = b.cursor_col + 1
+            elif b.cursor_row + 1 < b.line_count:
+                b.cursor_row = b.cursor_row + 1
+                b.cursor_col = 0
+            self.want_col = -1
+        elif k == "up" or k == "down" or k == "pageup" or k == "pagedown":
+            var dr = 1
+            if k == "up":
+                dr = 0 - 1
+            elif k == "pageup":
+                dr = 0 - (self._rows_visible() - 1)
+            elif k == "pagedown":
+                dr = self._rows_visible() - 1
+            if ctrl and (k == "up" or k == "down"):
+                # Ctrl+Up/Down scrolls without moving the caret.
+                self.doc().scroll_y = self.doc().scroll_y + dr * self.LINE_H
+                self._clamp_scroll()
+                return
+            # Vertical movement aims for the column the caret started in.
+            if self.want_col < 0:
+                self.want_col = b.cursor_col
+            var nr = b.cursor_row + dr
+            if nr < 0:
+                b.cursor_row = 0
+                b.cursor_col = 0
+                return
+            if nr >= b.line_count:
+                b.cursor_row = b.line_count - 1
+                b.cursor_col = len(b.get_line(b.cursor_row))
+                return
+            b.cursor_row = nr
+            b.cursor_col = self._clamp_col(nr, self.want_col)
+            if k == "pageup" or k == "pagedown":
+                self.doc().scroll_y = self.doc().scroll_y + dr * self.LINE_H
+                self._clamp_scroll()
+        elif k == "home":
+            if ctrl:
+                b.cursor_row = 0
+                b.cursor_col = 0
+            else:
+                # Smart Home: first non-blank, then column 0.
+                var ind = self._line_indent(b.get_line(b.cursor_row))
+                if b.cursor_col == ind:
+                    b.cursor_col = 0
+                else:
+                    b.cursor_col = ind
+            self.want_col = -1
+        elif k == "end":
+            if ctrl:
+                b.cursor_row = b.line_count - 1
+            b.cursor_col = len(b.get_line(b.cursor_row))
+            self.want_col = -1
+
+    def _move_extra_carets(self, k, ctrl):
+        var b = self.buf()
+        var i = 1
+        while i < self.selmodel.count:
+            var s = self.selmodel.sels[i]
+            var r = s.caret.row
+            var c = s.caret.col
+            if k == "left" and c > 0:
+                c = c - 1
+            elif k == "right" and c < len(b.get_line(r)):
+                c = c + 1
+            elif k == "up" and r > 0:
+                r = r - 1
+            elif k == "down" and r + 1 < b.line_count:
+                r = r + 1
+            elif k == "home":
+                c = self._line_indent(b.get_line(r))
+            elif k == "end":
+                c = len(b.get_line(r))
+            s.caret.row = r
+            s.caret.col = self._clamp_col(r, c)
+            s.anchor.row = s.caret.row
+            s.anchor.col = s.caret.col
+            i = i + 1
+
+    def _edit_type(self, text):
+        if not self._can_edit():
+            return
+        var b = self.buf()
+        var d = self.doc()
+        if self._sel_range() != none:
+            b.begin_group()
+            self._sel_delete()
+        b.insert_text_typed(text)
+        self._apply_to_extra("text", text)
+        d.sel_on = false
+
+    def _edit_backspace(self, ctrl):
+        var b = self.buf()
+        if self._sel_range() != none:
+            b.begin_group()
+            self._sel_delete()
+            self._apply_to_extra("backspace", "")
+            b.begin_group()
+            return
+        if ctrl:
+            var w = b.word_left(b.cursor_row, b.cursor_col)
+            b.begin_group()
+            b.delete_range(w[0], w[1], b.cursor_row, b.cursor_col)
+            b.begin_group()
+            return
+        var line = b.get_line(b.cursor_row)
+        var c = b.cursor_col
+        # Deleting the opening half of an auto-closed pair removes both.
+        if c > 0 and c < len(line) and self.selmodel.count <= 1:
+            var pair = string_slice(line, c - 1, c + 1)
+            if pair == "()" or pair == "[]" or pair == "{}" or pair == "\"\"" or pair == "''":
+                b.delete_char_forward()
+        # Backspace in leading whitespace removes to the previous tab stop.
+        if c > 1 and self._line_indent(line) >= c and self.selmodel.count <= 1:
+            var to = c - 1 - ((c - 1) % self.tab_size)
+            b.delete_range(b.cursor_row, to, b.cursor_row, c)
+            return
+        b.delete_char_back()
+        self._apply_to_extra("backspace", "")
+
+    def _edit_delete(self, ctrl):
+        var b = self.buf()
+        if self._sel_range() != none:
+            b.begin_group()
+            self._sel_delete()
+            b.begin_group()
+            return
+        if ctrl:
+            var w = b.word_right(b.cursor_row, b.cursor_col)
+            b.begin_group()
+            b.delete_range(b.cursor_row, b.cursor_col, w[0], w[1])
+            b.begin_group()
+            return
+        b.delete_char_forward()
+        self._apply_to_extra("delete", "")
+
+    def _edit_enter(self):
+        var b = self.buf()
+        if self._sel_range() != none:
+            b.begin_group()
+            self._sel_delete()
+        # Enter between a pair of brackets opens an indented block.
+        var line = b.get_line(b.cursor_row)
+        var c = b.cursor_col
+        var pr = string_slice(line, c - 1, c + 1)
+        var between = c > 0 and c < len(line) and (pr == "()" or pr == "[]" or pr == "{}")
+        b.insert_newline()
+        if between and self.selmodel.count <= 1:
+            var r = b.cursor_row
+            b.insert_text(self._indent_unit())
+            var save_c = b.cursor_col
+            b.insert_newline_raw()
+            b.insert_text(string_slice(b.get_line(r - 1), 0, self._line_indent(b.get_line(r - 1))))
+            b.cursor_row = r
+            b.cursor_col = save_c
+        self._apply_to_extra("enter", "")
+        self.doc().sel_on = false
+
+    def _after_typing(self):
+        self._after_edit()
+        self._reveal_caret()
+        if self.auto_save == "afterDelay" and self.doc().kind == "file":
+            self.autosave_due = time_ms() + 1000
+
+    def _on_text(self, e):
+        var t = e.text
+        if t == "" or t == none:
+            return
+        self._dirty = true
+        self.caret_on = true
+        self.caret_t = time_ms()
+        var f = self.focus
+        if self.modal_open:
+            return
+        if f == "qi" and self.qi.visible:
+            self.qi.type_text(t)
+            self._qi_value_changed()
+            return
+        if self.menu_open >= 0 or self.ctx_open:
+            return
+        if f == "find":
+            self._find_type(t)
+        elif f == "search":
+            self._search_type(t)
+        elif f == "scm":
+            self.scm_msg = self.scm_msg + t
+        elif f == "terminal":
+            self.term_input = self.term_input + t
+        elif f == "dbgconsole":
+            self.dbgcon_input = self.dbgcon_input + t
+        elif f == "extsearch":
+            self.ext_query = self.ext_query + t
+            self.tree_scroll = 0
+        elif f == "workshop":
+            self.workshop.handle_event(e)
+        elif f == "explorer" or f == "panel":
+            return
+        else:
+            self._editor_text(t)
+
+    def _editor_text(self, t):
+        if not self._can_edit():
+            return
+        var b = self.buf()
+        var closer = self._auto_closer(t)
+        var line = b.get_line(b.cursor_row)
+        var c = b.cursor_col
+        # Typing a closing character that is already next to the caret
+        # steps over it instead of doubling it.
+        var is_close = t == ")" or t == "]" or t == "}" or t == "\"" or t == "'"
+        if is_close and c < len(line) and string_slice(line, c, c + 1) == t and self.selmodel.count <= 1 and self._sel_range() == none:
+            b.cursor_col = c + 1
+            self._after_typing()
+            return
+        var sel = self._sel_range()
+        if closer != "" and sel != none and sel[0] == sel[2] and self.selmodel.count <= 1:
+            # Wrap the selection in the pair.
+            var inner = self._sel_text()
+            b.begin_group()
+            self._sel_delete()
+            b.insert_text(t + inner + closer)
+            b.begin_group()
+            self._after_typing()
+            return
+        self._edit_type(t)
+        var next = string_slice(b.get_line(b.cursor_row), b.cursor_col, b.cursor_col + 1)
+        var room = next == "" or next == " " or next == ")" or next == "]" or next == "}" or next == ","
+        if closer != "" and room and self.selmodel.count <= 1:
+            var prev_is_word = b.cursor_col >= 2 and self._is_word_ch(string_slice(b.get_line(b.cursor_row), b.cursor_col - 2, b.cursor_col - 1))
+            if not ((t == "\"" or t == "'") and prev_is_word):
+                b.insert_text_typed(closer)
+                b.cursor_col = b.cursor_col - 1
+        self._after_typing()
+        self._ac_update(t)
+
+    def _auto_closer(self, t):
+        if t == "(":
+            return ")"
+        if t == "[":
+            return "]"
+        if t == "{":
+            return "}"
+        if t == "\"":
+            return "\""
+        if t == "'":
+            return "'"
+        return ""
+
+    def _is_word_ch(self, ch):
+        return (ch >= "a" and ch <= "z") or (ch >= "A" and ch <= "Z") or (ch >= "0" and ch <= "9") or ch == "_"
+
+    # ── autocomplete ─────────────────────────────────────────────────────────
+    # Opens by itself after two identifier characters (VS Code's quick
+    # suggestions) or with Ctrl+Space. Candidates: this file's symbols and
+    # identifiers, keywords and builtins, ranked by the fuzzy matcher.
+    def _ac_word_bounds(self):
+        var b = self.buf()
+        var line = b.get_line(b.cursor_row)
+        var st = b.cursor_col
+        while st > 0 and self._is_word_ch(string_slice(line, st - 1, st)):
+            st = st - 1
+        return st
+
+    def _ac_open_now(self, explicit):
+        if not self._is_text() or self.doc().lang != "nython":
+            return
+        var b = self.buf()
+        var st = self._ac_word_bounds()
+        self.ac_prefix = string_slice(b.get_line(b.cursor_row), st, b.cursor_col)
+        if not explicit and len(self.ac_prefix) < 2:
+            self.ac_open = false
+            return
+        var names = []
+        var kinds = []
+        var seen = {}
+        var syms = self._outline_syms()
+        var i = 0
+        while i < len(syms):
+            self._ac_add(names, kinds, seen, syms[i][0], syms[i][1])
+            i = i + 1
+        i = 0
+        while i < len(self.hl.storage):
+            self._ac_add(names, kinds, seen, self.hl.storage[i], "keyword")
+            i = i + 1
+        i = 0
+        while i < len(self.hl.keywords):
+            self._ac_add(names, kinds, seen, self.hl.keywords[i], "keyword")
+            i = i + 1
+        i = 0
+        while i < len(self.hl.builtins):
+            self._ac_add(names, kinds, seen, self.hl.builtins[i], "builtin")
+            i = i + 1
+        # Identifiers used near the caret.
+        var r = b.cursor_row - 60
+        if r < 0:
+            r = 0
+        while r < b.line_count and r < b.cursor_row + 60:
+            if r != b.cursor_row:
+                self._ac_words_of(b.get_line(r), names, kinds, seen)
+            r = r + 1
+        var fz = self.qi.fuzzy
+        var scored = []
+        i = 0
+        while i < len(names):
+            if names[i] != self.ac_prefix:
+                var m = fz.match(self.ac_prefix, names[i])
+                if m[0]:
+                    scored.append([names[i], kinds[i], m[1] * 10 + self._ac_kind_bonus(kinds[i])])
+            i = i + 1
+        scored = sorted(scored, key=lambda s: s[2], reverse=true)
+        var out_n = []
+        var out_k = []
+        i = 0
+        while i < len(scored) and i < 60:
+            out_n.append(scored[i][0])
+            out_k.append(scored[i][1])
+            i = i + 1
+        self.ac_items = out_n
+        self.ac_kinds = out_k
+        self.ac_n = len(out_n)
+        self.ac_sel = 0
+        self.ac_top = 0
+        self.ac_open = self.ac_n > 0
+        if explicit and self.ac_n == 0:
+            self.status_msg = "No suggestions."
+
+    def _ac_kind_bonus(self, k):
+        if k == "function" or k == "method" or k == "class" or k == "variable":
+            return 5
+        if k == "keyword":
+            return 3
+        return 0
+
+    def _ac_add(self, names, kinds, seen, n, k):
+        if not seen.has_key(n):
+            seen[n] = true
+            names.append(n)
+            kinds.append(k)
+
+    def _ac_words_of(self, line, names, kinds, seen):
+        var n = len(line)
+        var i = 0
+        while i < n:
+            var ch = string_slice(line, i, i + 1)
+            if self._is_word_ch(ch) and not (ch >= "0" and ch <= "9"):
+                var j = i
+                while j < n and self._is_word_ch(string_slice(line, j, j + 1)):
+                    j = j + 1
+                if j - i >= 3:
+                    self._ac_add(names, kinds, seen, string_slice(line, i, j), "text")
+                i = j
+            elif ch == "\"" or ch == "#":
+                i = n
+            else:
+                i = i + 1
+
+    def _ac_update(self, typed):
+        if self._is_word_ch(typed):
+            self._ac_open_now(false)
+        else:
+            self.ac_open = false
+
+    def _ac_key(self, e):
+        var k = e.key
+        if k == "escape":
+            self.ac_open = false
+            return true
+        if k == "down":
+            self.ac_sel = (self.ac_sel + 1) % self.ac_n
+        elif k == "up":
+            self.ac_sel = (self.ac_sel + self.ac_n - 1) % self.ac_n
+        elif k == "enter" or k == "tab":
+            self._ac_accept()
+            return true
+        else:
+            if k == "left" or k == "right" or k == "home" or k == "end" or k == "pageup" or k == "pagedown":
+                self.ac_open = false
+            return false
+        if self.ac_sel < self.ac_top:
+            self.ac_top = self.ac_sel
+        if self.ac_sel >= self.ac_top + 10:
+            self.ac_top = self.ac_sel - 9
+        return true
+
+    def _ac_accept(self):
+        if self.ac_n == 0 or not self._can_edit():
+            self.ac_open = false
+            return
+        var word = self.ac_items[self.ac_sel]
+        var b = self.buf()
+        var st = self._ac_word_bounds()
+        b.begin_group()
+        b.delete_range(b.cursor_row, st, b.cursor_row, b.cursor_col)
+        b.insert_text(word)
+        b.begin_group()
+        self.ac_open = false
+        self._after_edit()
+
+    # ── code hover ───────────────────────────────────────────────────────────
+    def _update_hover_info(self):
+        if self.hover_done or time_ms() - self.hover_t0 < 600:
+            return
+        self.hover_done = true
+        if not self._is_text() or self.mouse_down or self._any_overlay():
+            return
+        var p = self._pos_at(self.mx, self.my)
+        var b = self.buf()
+        var w = b.word_at(p[0], p[1])
+        if w[1] <= w[0]:
+            return
+        var word = string_slice(b.get_line(p[0]), w[0], w[1])
+        var info = ""
+        if self.dbg.active:
+            var v = self.dbg.value_of(word)
+            if v != none:
+                info = word + " = " + v
+        if info == "":
+            var syms = self._outline_syms()
+            var i = 0
+            while i < len(syms) and info == "":
+                if syms[i][0] == word:
+                    info = string_strip(b.get_line(syms[i][2]))
+                    if string_endswith(info, ":"):
+                        info = string_slice(info, 0, len(info) - 1)
+                i = i + 1
+        if info == "" and self.hl._bi.has_key(word):
+            info = "builtin function " + word
+        if info != "":
+            self.hover_info = info
+            self.hover_x = self.mx
+            self.hover_y = self.ed_y + (p[0] * self.LINE_H - self.doc().scroll_y)
+            self._dirty = true
+
+    # ══ frame loop ═════════════════════════════════════════════════════════════
+    def _advance_panes(self):
+        var moved = false
+        var st = 0.0
+        if self.sidebar_open:
+            st = 1.0
+        var ds = st - self.sidebar_anim
+        if ds > 0.004 or ds < -0.004:
+            self.sidebar_anim = self.sidebar_anim + ds * 0.3
+            moved = true
+        elif self.sidebar_anim != st:
+            self.sidebar_anim = st
+            moved = true
+        var pt = 0.0
+        if self.panel_open:
+            pt = 1.0
+        var dp = pt - self.panel_anim
+        if dp > 0.004 or dp < -0.004:
+            self.panel_anim = self.panel_anim + dp * 0.3
+            moved = true
+        elif self.panel_anim != pt:
+            self.panel_anim = pt
+            moved = true
+        return moved
+
+    # Work that happens on the clock rather than on an event.
+    def _tick(self):
+        var now = time_ms()
+        if self.job_running:
+            self._poll_job()
+        if self.term_proc != none and self.term_proc.running:
+            self._poll_term()
+            self._dirty = true
+        if self.check_due > 0 and now > self.check_due:
+            self.check_due = 0
+            if self._is_text() and self.doc().lang == "nython":
+                self._check_file(self.doc())
+                self._dirty = true
+        if self.search_due > 0 and now > self.search_due:
+            self.search_due = 0
+            self._run_search()
+        if self.autosave_due > 0 and now > self.autosave_due:
+            self.autosave_due = 0
+            var i = 0
+            while i < len(self.docs):
+                if self.docs[i].kind == "file" and self.docs[i].dirty():
+                    self._write_doc(self.docs[i], self.docs[i].path)
+                i = i + 1
+            self._dirty = true
+        # Re-read git status now and then, and whenever something changed it.
+        if self.ws.root != "" and (self.scm_stale or now - self.scm_poll_t > 8000):
+            self.scm_poll_t = now
+            self._scm_refresh()
+        if self.scm_diff_due > 0 and now > self.scm_diff_due:
+            self.scm_diff_due = 0
+            self._dirty = true
+        if self.tip_text != "" and now - self.tip_t0 >= 550 and now - self.tip_t0 < 700:
+            self._dirty = true
+        if not self.hover_done:
+            self._update_hover_info()
+        if self.status_msg != self.last_status:
+            self.last_status = self.status_msg
+            self.status_t = now
+            self._dirty = true
+        if self.find_open:
+            self._find_info_update()
+        if self._title_dirty:
+            self._title_dirty = false
+            self._update_title()
+        self._update_prob_index()
+
+    # VS Code's title: "● file.ny - folder - NythonIDE".
+    def _update_title(self):
+        var t = "NythonIDE"
+        if self.ws.root != "":
+            t = os_path_basename(self.ws.root) + " - " + t
+        var d = self.doc()
+        if d.kind != "welcome":
+            var mark = ""
+            if d.dirty():
+                mark = "\xe2\x97\x8f "
+            t = mark + d.title + " - " + t
+        if t != self.win.title:
+            self.win.set_title(t)
+        self.cc_label = self._workspace_name()
+
+    # Error counts per file for the explorer, rebuilt when problems change.
+    def _update_prob_index(self):
+        if self.prob_by_path_src == self.problems:
+            return
+        var m = {}
+        var i = 0
+        while i < len(self.problems):
+            var p = self.problems[i]
+            if p["sev"] == "err":
+                var c = m.get(p["path"])
+                if c == none:
+                    c = 0
+                m[p["path"]] = c + 1
+            i = i + 1
+        self.prob_by_path = m
+        self.prob_by_path_src = self.problems
 
     def _frame(self, renderer, event):
         self.handle_event(event)
-        # Anything that is not an idle tick may have changed the UI.
-        if event.type != "idle":
+        self._tick()
+        if event.type != "idle" and event.type != "keyup" and event.type != "mousemove":
             self._dirty = true
-        # The terminal draws a blinking caret, so it must keep animating.
-        if self.panel_open and self.active_panel == 2:
-            self._dirty = true
-        # So does the editor caret.
-        # Advance pane animations toward their target. Both are eased with
-        # out_cubic, which decelerates into place; a linear slide reads as
-        # mechanical and is the thing easing exists to avoid.
         if self._advance_panes():
             self._layout()
-            self._dirty = true
-
         var now = time_ms()
-        if now - self.caret_t > 500:
+        var f = self.focus
+        var blinking = f == "editor" or f == "terminal" or f == "find" or f == "search" or f == "qi" or f == "scm" or f == "dbgconsole" or f == "extsearch"
+        if blinking and now - self.caret_t > 530:
             self.caret_t = now
             self.caret_on = not self.caret_on
             self._dirty = true
-        if event.type == "textinput" or event.type == "keydown" or event.type == "mousedown":
-            self.caret_on = true
-        # Safety net. Skipping repaints depends on the platform delivering an
-        # expose/shown event whenever the window needs redrawing. If one is ever
-        # missed the window would stay stale forever, so force a repaint at
-        # least twice a second regardless. At ~60 Hz this costs two frames a
-        # second instead of sixty.
+        # Safety net: repaint at least twice a second even if an expose event
+        # is missed. Per-frame drawing allocates nothing (ide_paint.ny rule 2),
+        # so this costs time, not memory.
         if self._skipped >= 30:
-            self._dirty = true
-        if not self.repaint_on_change_only:
             self._dirty = true
         if not self._dirty:
             self._skipped = self._skipped + 1
             return false
-        # Coalesce: a poll batch delivers several events (move, down, up) before
-        # a single present. Handle them all, but repaint only on the last one.
         if not event.is_last:
             return false
         self._skipped = 0
@@ -4138,8 +2332,14 @@ class NythonIDE:
 
     def run(self):
         self.win.on_resize(self.on_resize)
+        self.win.on_close(self._on_window_close)
         self.win.run(self._frame)
 
+    def _on_window_close(self):
+        self._save_settings()
+        self._save_state()
 
-var ide = NythonIDE()
-ide.run()
+
+if getenv("NY_IDE_NO_RUN") != "1":
+    var ide = NythonIDE()
+    ide.run()
