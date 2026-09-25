@@ -1,2 +1,2 @@
-# Nython-Good
-A new programming language with syntax like python, c, and javascript
+# Nython
+A new programming language based on python, c, ruby and javascript writing styles
