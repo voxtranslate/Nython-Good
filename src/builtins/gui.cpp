@@ -154,18 +154,27 @@ static Value make_evt(NythonExecutor& E, const std::string& type,
 }
 
 // ── Geometry helpers (SDL3 uses SDL_FRect for rendering) ─────────────────────
+// Scanline fill: every pixel is covered exactly once. The previous version
+// drew the body as three rectangles plus a full circle at each corner, so a
+// translucent fill (hover backgrounds, the command centre) was blended two or
+// three times where they overlapped and showed dark blobs at the corners.
 static void fill_rounded_rect(SDL_Renderer* r,float x,float y,float w,float h,float rad,Uint8 cr,Uint8 cg,Uint8 cb,Uint8 ca) {
     SDL_SetRenderDrawColor(r,cr,cg,cb,ca);
     SDL_SetRenderDrawBlendMode(r,SDL_BLENDMODE_BLEND);
-    rad=std::min(rad,std::min(w/2,h/2));
-    SDL_FRect rects[3]={{x+rad,y,w-2*rad,h},{x,y+rad,rad,h-2*rad},{x+w-rad,y+rad,rad,h-2*rad}};
-    for(auto& rc:rects) SDL_RenderFillRect(r,&rc);
-    float cx[4]={x+rad,x+w-rad-1,x+rad,x+w-rad-1};
-    float cy[4]={y+rad,y+rad,y+h-rad-1,y+h-rad-1};
-    for(int c=0;c<4;c++) for(int dy=-(int)rad;dy<=(int)rad;dy++){
-        float dx=std::sqrt(rad*rad-(float)(dy*dy));
-        SDL_RenderLine(r,cx[c]-dx,cy[c]+dy,cx[c]+dx,cy[c]+dy);
+    if(w<=0||h<=0) return;
+    rad=std::max(0.0f,std::min(rad,std::min(w/2,h/2)));
+    int ir=(int)std::floor(rad);
+    int ih=(int)std::floor(h);
+    if(ir<=0){ SDL_FRect rc={x,y,w,h}; SDL_RenderFillRect(r,&rc); return; }
+    for(int row=0;row<ir;row++){
+        float dy=rad-(float)row-0.5f;
+        float inset=rad-std::sqrt(std::max(0.0f,rad*rad-dy*dy));
+        SDL_FRect top={x+inset,y+(float)row,w-2*inset,1.0f};
+        SDL_FRect bot={x+inset,y+(float)(ih-1-row),w-2*inset,1.0f};
+        SDL_RenderFillRect(r,&top);
+        if(ih-1-row>=ir) SDL_RenderFillRect(r,&bot);
     }
+    if(ih-2*ir>0){ SDL_FRect mid={x,y+(float)ir,w,(float)(ih-2*ir)}; SDL_RenderFillRect(r,&mid); }
 }
 static void draw_rounded_rect(SDL_Renderer* r,float x,float y,float w,float h,float rad,Uint8 cr,Uint8 cg,Uint8 cb,Uint8 ca,int bw) {
     (void)bw;

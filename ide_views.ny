@@ -83,10 +83,7 @@ class IDEViews(IDEPaint):
     # ══ Explorer ═══════════════════════════════════════════════════════════════
     def _draw_explorer(self, r, x, w):
         var th = self.th
-        self._view_actions(r, x, w, [["new-file", "explorer.newFile", "", "New File..."],
-                                     ["new-folder", "explorer.newFolder", "", "New Folder..."],
-                                     ["refresh", "workbench.files.action.refreshFilesExplorer", "", "Refresh Explorer"],
-                                     ["collapse-all", "workbench.files.action.collapseExplorerFolders", "", "Collapse Folders in Explorer"]])
+        self._view_actions(r, x, w, self.acts_explorer)
         var y = self.content_y + self.SIDE_HEAD
         if self.ws.root == "":
             r.text("You have not yet opened a folder.", x + self.dp(20), y + self.dp(12), self.f_ui, th.text)
@@ -216,8 +213,7 @@ class IDEViews(IDEPaint):
     # ══ Search ═════════════════════════════════════════════════════════════════
     def _draw_search(self, r, x, w):
         var th = self.th
-        self._view_actions(r, x, w, [["refresh", "@search.run", "", "Refresh"],
-                                     ["clear-all", "@search.clear", "", "Clear Search Results"]])
+        self._view_actions(r, x, w, self.acts_search)
         var y = self.content_y + self.SIDE_HEAD
         var tg = "chevron-right"
         if self.search_replace_open:
@@ -344,7 +340,13 @@ class IDEViews(IDEPaint):
         if total == 0:
             self.search_summary = "No results found."
         else:
-            self.search_summary = str(total) + " results in " + str(nfiles) + " files"
+            var rw = " results in "
+            if total == 1:
+                rw = " result in "
+            var fw = " files"
+            if nfiles == 1:
+                fw = " file"
+            self.search_summary = str(total) + rw + str(nfiles) + fw
         self._dirty = true
 
     def _is_texty(self, p):
@@ -513,9 +515,7 @@ class IDEViews(IDEPaint):
         var th = self.th
         if self.scm_stale:
             self._scm_refresh()
-        self._view_actions(r, x, w, [["check", "git.commit", "", "Commit"],
-                                     ["refresh", "git.refresh", "", "Refresh"],
-                                     ["ellipsis", "@scm.more", "", "More Actions..."]])
+        self._view_actions(r, x, w, self.acts_scm)
         var y = self.content_y + self.SIDE_HEAD
         if not self.git.available:
             r.text("Git was not found on this system.", x + self.dp(20), y + self.dp(10), self.f_ui, th.text)
@@ -724,12 +724,9 @@ class IDEViews(IDEPaint):
         var i = 0
         while i < len(self.docs):
             var d = self.docs[i]
-            if d.kind == "file" and not d.dirty():
-                if os_exists(d.path):
-                    d.buf = EditorBuffer(d.title, read_file(d.path))
-                    d.buf.coalesce = true
+            if d.kind == "file" and not d.dirty() and os_exists(d.path):
+                self._reload_from_disk(d)
             i = i + 1
-        self._hl_reset()
 
     # Gutter change markers for a document, recomputed shortly after edits
     # stop (scm_diff_due) and whenever HEAD moves.
@@ -761,10 +758,10 @@ class IDEViews(IDEPaint):
                 y = y + self.dp(80)
             else:
                 self._button(r, x + self.dp(20), y + self.dp(8), w - self.dp(40), self.dp(28), "Run and Debug", "workbench.action.debug.start", "", true)
-                r.text("Records the program, then lets you step through", x + self.dp(20), y + self.dp(46), self.f_small, th.text_faint)
-                r.text("it forwards and backwards (F10, F11, Ctrl+Shift+F11).", x + self.dp(20), y + self.dp(62), self.f_small, th.text_faint)
-                self._button(r, x + self.dp(20), y + self.dp(88), w - self.dp(40), self.dp(28), "Run Without Debugging", "workbench.action.debug.run", "", false)
-                y = y + self.dp(132)
+                var ty = self._draw_wrapped(r, "Records the program, then lets you step through it forwards and backwards (F10, F11, Ctrl+Shift+F11).",
+                                            x + self.dp(20), y + self.dp(46), w - self.dp(40), self.f_small, th.text_faint, self.dp(16))
+                self._button(r, x + self.dp(20), ty + self.dp(10), w - self.dp(40), self.dp(28), "Run Without Debugging", "workbench.action.debug.run", "", false)
+                y = ty + self.dp(54)
         else:
             y = self._draw_dbg_timeline(r, x, y, w)
             if self.dbg.exception != "":
@@ -835,7 +832,9 @@ class IDEViews(IDEPaint):
         while i < len(vars) and y + lh <= self.status_y - self.dp(80):
             var nm = vars[i][0]
             var v = vars[i][1]
-            if self._hov(x, y, w, lh):
+            if i == self.dbg_var_sel:
+                r.fill_xywh(x, y, w, lh, th.list_inactive)
+            elif self._hov(x, y, w, lh):
                 r.fill_xywh(x, y, w, lh, th.hover)
             r.text(nm, x + self.dp(24), y + int((lh - self.code_small_h) / 2), self.f_mono_small, th.info)
             var nw = self.f_mono_small.width(nm)
@@ -974,8 +973,29 @@ class IDEViews(IDEPaint):
             i = i + 1
         return [string_slice(key, 0, c), int(string_slice(key, c + 1, len(key)))]
 
+    # The active editor's breakpoints as {row: true}, rebuilt only when the
+    # breakpoints or the editor change. The gutter asks once per visible line
+    # per frame, and building a "path:line" key for each ask was a new
+    # permanent string per line per frame.
+    def _break_rows(self):
+        var d = self.doc()
+        if self.brk_rows_doc == d and self.brk_rows_gen == self.brk_gen:
+            return self.brk_rows
+        var rows = {}
+        var pre = self._doc_key(d) + ":"
+        var i = 0
+        while i < len(self.break_list):
+            var k = self.break_list[i]
+            if string_startswith(k, pre):
+                rows[int(string_slice(k, len(pre), len(k))) - 1] = true
+            i = i + 1
+        self.brk_rows = rows
+        self.brk_rows_doc = d
+        self.brk_rows_gen = self.brk_gen
+        return rows
+
     def _has_break(self, row):
-        return self.breaks.has_key(self._doc_key(self.doc()) + ":" + self._line_num(row + 1))
+        return self._break_rows().has_key(row)
 
     def _toggle_break(self, row):
         var k = self._break_key(row)
@@ -988,10 +1008,12 @@ class IDEViews(IDEPaint):
                     keep.append(self.break_list[i])
                 i = i + 1
             self.break_list = keep
+            self.brk_gen = self.brk_gen + 1
             self.status_msg = "Breakpoint removed at line " + str(row + 1)
         else:
             self.breaks[k] = true
             self.break_list.append(k)
+            self.brk_gen = self.brk_gen + 1
             self.status_msg = "Breakpoint set at line " + str(row + 1)
         if self.dbg.active:
             self._dbg_compute_hits()
@@ -1090,8 +1112,12 @@ class IDEViews(IDEPaint):
                 b.cursor_row = b.line_count - 1
             b.cursor_col = 0
             self._reveal_row_center(b.cursor_row)
-        # Program output up to this step, in the Debug Console.
+        # Program output up to this step, in the Debug Console; all of it once
+        # the end is reached (the last statement's output comes after the
+        # last recorded step).
         var upto = self.dbg.output_so_far()
+        if self.dbg.state == "ended":
+            upto = len(self.dbg.outputs)
         var keep_l = []
         var keep_k = []
         var i = 0
@@ -1262,7 +1288,7 @@ class IDEViews(IDEPaint):
 
     def _draw_extensions(self, r, x, w):
         var th = self.th
-        self._view_actions(r, x, w, [["refresh", "@ext.refresh", "", "Refresh"]])
+        self._view_actions(r, x, w, self.acts_ext)
         var y = self.content_y + self.SIDE_HEAD
         self._input(r, x + self.dp(12), y, w - self.dp(24), self.dp(26), self.ext_query, "Search libraries", self.focus == "extsearch", "@ext.search", "")
         y = y + self.dp(34)
@@ -1414,7 +1440,7 @@ class IDEViews(IDEPaint):
     # ══ AI assistant ═══════════════════════════════════════════════════════════
     def _draw_ai(self, r, x, w):
         var th = self.th
-        self._view_actions(r, x, w, [["refresh", "nython.ai.analyze", "", "Analyse Again"]])
+        self._view_actions(r, x, w, self.acts_ai)
         self._ai_analyze(false)
         var y = self.content_y + self.SIDE_HEAD
         if not self._is_text():

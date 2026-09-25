@@ -213,7 +213,45 @@ struct NythonExecutor {
     std::unordered_set<void*> string_ptrs_; // fast positive lookup for string pointers
 
     // Create a Value that stores a string (persists across Value copies)
+    // Strings made so far and their bytes; like heap objects they are kept for
+    // the life of the process, and --profile attributes them per function.
+    static long long& strings_created() { static long long n = 0; return n; }
+    static long long& string_bytes_created() { static long long n = 0; return n; }
+
+    // The empty string and the 256 one-byte strings are made once and shared.
+    // Strings are immutable and never freed here, so a character loop
+    // (line[i:i+1], string_lower(ch), ch == "a") used to leave one permanent
+    // string behind per character examined.
+    Value small_strs_[257];
+    bool small_made_[257] = {};
+
+    // One shared string per distinct text, for names the interpreter itself
+    // binds over and over (the parent class set up on every method call of a
+    // subclass). Those used to cost a new permanent string per call.
+    std::unordered_map<std::string, Value> interned_;
+    Value internString(const std::string& s) {
+        auto it = interned_.find(s);
+        if (it != interned_.end()) return it->second;
+        Value v = makeStringValue(s);
+        interned_.emplace(s, v);
+        return v;
+    }
+
     Value makeStringValue(const std::string& s) {
+        if (s.size() <= 1) {
+            int k = s.empty() ? 256 : (unsigned char)s[0];
+            if (small_made_[k]) return small_strs_[k];
+            small_made_[k] = true;
+            string_store.push_back(std::make_unique<std::string>(s));
+            Value sv;
+            sv.type = ValueType::USERDATA;
+            sv.value.p = (void*)string_store.back().get();
+            string_ptrs_.insert(sv.value.p);
+            small_strs_[k] = sv;
+            return sv;
+        }
+        strings_created()++;
+        string_bytes_created() += (long long)s.size();
         string_store.push_back(std::make_unique<std::string>(s));
         Value v;
         v.type = ValueType::USERDATA;
@@ -371,7 +409,7 @@ public:   // NythonExecutor is a struct: members default to public
             "cos_sim","cosine_similarity","cross_entropy_loss","ctc_loss","device_info","dns_resolve","dropout","elu",
             "embedding","embedding_lookup","env_get","eprint","exec_cmd","exp","fclose","fft_magnitude",
             "file_append","file_close","file_copy","file_delete","file_open","file_read","file_readline","file_readlines",
-            "file_rename","file_size","file_write","file_writelines","flush","fprint","fread","freadline",
+            "file_rename","file_size","file_mtime","fuzzy_score","fuzzy_positions","fuzzy_rank","file_write","file_writelines","flush","fprint","fread","freadline",
             "fs_mkdirs","fs_stat","fs_walk","function","fwrite","gelu","getcwd","getenv",
             "gethostbyname","hash_md5","hash_sha256","hex_decode","hex_encode","html_strip","htonl","htons",
             "http_parse_request","http_respond","huber_loss","inet_aton","inet_ntoa","integer","ip_to_string","is_dict",
@@ -635,6 +673,18 @@ public:   // NythonExecutor is a struct: members default to public
                 }
             }
             return makeStringValue(result);
+        }
+        // A literal is made into a string once, not on every evaluation. The
+        // interpreter never frees a string (string_store), so `"a"` inside a
+        // loop or a per-frame function used to add a new permanent string on
+        // each pass - in the IDE, most of the memory typing consumed.
+        auto* sn = dynamic_cast<StringNode*>(node.get());
+        if (sn) {
+            if (sn->interned_by != (const void*)this) {
+                sn->interned = makeStringValue(raw);
+                sn->interned_by = (const void*)this;
+            }
+            return sn->interned;
         }
         return makeStringValue(raw);
     }
@@ -1368,49 +1418,8 @@ return lv * rv;
             if (lv.type == ValueType::USERDATA) return Value(getStringValue(lv) != getStringValue(rv));
             return Value(lv.toString() != rv.toString());
         }
-        if (bn->op == "==") {
-            // String equality
-            if (lv.type == ValueType::USERDATA && rv.type == ValueType::USERDATA)
-                return Value(getStringValue(lv) == getStringValue(rv));
-            // List/collection equality: compare element-by-element
-            if (lv.isCollectable() && rv.isCollectable()) {
-                auto* lc = dynamic_cast<Container*>(lv.value.gc);
-                auto* rc = dynamic_cast<Container*>(rv.value.gc);
-                if (lc && rc && lc->container && rc->container) {
-                    auto li = lc->container->find("__len__");
-                    auto ri = rc->container->find("__len__");
-                    int ll = (li != lc->container->end()) ? static_cast<int>(bigint_to_i64(li->second.value.i)) : 0;
-                    int rl = (ri != rc->container->end()) ? static_cast<int>(bigint_to_i64(ri->second.value.i)) : 0;
-                    if (ll != rl) return Value(false);
-                    for (int i = 0; i < ll; i++) {
-                        auto a = lc->container->find(std::to_string(i));
-                        auto b = rc->container->find(std::to_string(i));
-                        if (a == lc->container->end() || b == rc->container->end()) return Value(false);
-                        if (a->second.toString() != b->second.toString()) return Value(false);
-                    }
-                    return Value(true);
-                }
-            }
-            // Mixed int/float comparison
-            if ((lv.type == ValueType::INTEGER && rv.type == ValueType::DOUBLE) ||
-                (lv.type == ValueType::DOUBLE && rv.type == ValueType::INTEGER)) {
-                double a = (lv.type == ValueType::DOUBLE) ? (double)lv.value.d : (double)bigint_to_i64(lv.value.i);
-                double b = (rv.type == ValueType::DOUBLE) ? (double)rv.value.d : (double)bigint_to_i64(rv.value.i);
-                return Value(a == b);
-            }
-            return Value(lv == rv);
-        }
-        if (bn->op == "!=") {
-            if (lv.type == ValueType::USERDATA && rv.type == ValueType::USERDATA)
-                return Value(getStringValue(lv) != getStringValue(rv));
-            if ((lv.type == ValueType::INTEGER && rv.type == ValueType::DOUBLE) ||
-                (lv.type == ValueType::DOUBLE && rv.type == ValueType::INTEGER)) {
-                double a = (lv.type == ValueType::DOUBLE) ? (double)lv.value.d : (double)bigint_to_i64(lv.value.i);
-                double b = (rv.type == ValueType::DOUBLE) ? (double)rv.value.d : (double)bigint_to_i64(rv.value.i);
-                return Value(a != b);
-            }
-            return Value(!(lv == rv));
-        }
+        if (bn->op == "==") return Value(valuesEqual(lv, rv, 0));
+        if (bn->op == "!=") return Value(!valuesEqual(lv, rv, 0));
         if (bn->op == "<") {
             if (lv.type == ValueType::USERDATA && rv.type == ValueType::USERDATA) {
                 return Value(getStringValue(lv) < getStringValue(rv));
@@ -1627,6 +1636,78 @@ return lv * rv;
         return v;
     }
 
+    // Structural equality, recursive, as on the VM (and in Python): lists
+    // and tuples element by element, maps key by key, sets as sets, 1 == 1.0.
+    // The old == compared list elements by their printed form, so nested
+    // lists were never equal; treated every pair of maps as equal (both had
+    // "length 0"); and != on containers compared identity, so
+    // [1, 2] != [1, 2] was true.
+    bool valuesEqual(const Value& a, const Value& b, int depth) {
+        if (depth > 100) return false;
+        bool as = isStringValue(a), bs = isStringValue(b);
+        if (as || bs) return as && bs && getStringValue(a) == getStringValue(b);
+        if ((a.type == ValueType::INTEGER || a.type == ValueType::DOUBLE) &&
+            (b.type == ValueType::INTEGER || b.type == ValueType::DOUBLE)) {
+            if (a.type == ValueType::INTEGER && b.type == ValueType::INTEGER) return a == b;
+            double x = (a.type == ValueType::DOUBLE) ? (double)a.value.d : (double)bigint_to_i64(a.value.i);
+            double y = (b.type == ValueType::DOUBLE) ? (double)b.value.d : (double)bigint_to_i64(b.value.i);
+            return x == y;
+        }
+        if (a.isCollectable() && b.isCollectable() && a.value.gc && b.value.gc) {
+            if (a.value.gc == b.value.gc) return true;
+            auto* lc = dynamic_cast<Container*>(a.value.gc);
+            auto* rc = dynamic_cast<Container*>(b.value.gc);
+            if (!lc || !rc || !lc->container || !rc->container) return a == b;
+            auto& L = *lc->container;
+            auto& R = *rc->container;
+            auto li = L.find("__len__");
+            auto ri = R.find("__len__");
+            bool llist = li != L.end(), rlist = ri != R.end();
+            if (llist != rlist) return false;
+            if (llist) {
+                int ln = (int)bigint_to_i64(li->second.value.i);
+                int rn = (int)bigint_to_i64(ri->second.value.i);
+                if (ln != rn) return false;
+                bool lset = L.count("__set__") > 0, rset = R.count("__set__") > 0;
+                if (lset != rset) return false;
+                if (lset) {
+                    for (int i = 0; i < ln; i++) {
+                        auto x = L.find(std::to_string(i));
+                        if (x == L.end()) return false;
+                        bool found = false;
+                        for (int j = 0; j < rn && !found; j++) {
+                            auto y = R.find(std::to_string(j));
+                            if (y != R.end() && valuesEqual(x->second, y->second, depth + 1)) found = true;
+                        }
+                        if (!found) return false;
+                    }
+                    return true;
+                }
+                for (int i = 0; i < ln; i++) {
+                    auto x = L.find(std::to_string(i));
+                    auto y = R.find(std::to_string(i));
+                    if (x == L.end() || y == R.end()) return false;
+                    if (!valuesEqual(x->second, y->second, depth + 1)) return false;
+                }
+                return true;
+            }
+            auto internal = [](const std::string& k) {
+                return k == "__type__" || k == "__name__" || k == "__class__";
+            };
+            size_t ln = 0, rn = 0;
+            for (auto& kv : L) if (!internal(kv.first)) ln++;
+            for (auto& kv : R) if (!internal(kv.first)) rn++;
+            if (ln != rn) return false;
+            for (auto& kv : L) {
+                if (internal(kv.first)) continue;
+                auto y = R.find(kv.first);
+                if (y == R.end() || !valuesEqual(kv.second, y->second, depth + 1)) return false;
+            }
+            return true;
+        }
+        return a == b;
+    }
+
     // ─── PRINT ──────────────────────────────────────────────────────────
     Value evalPrint(node_ptr node, Context* ctx) {
         auto pn = static_pointer_cast<PrintNode>(node);
@@ -1636,8 +1717,11 @@ return lv * rv;
         std::streambuf* saved = nullptr;
         if (trace_on() && !tracer().in_repr) saved = std::cout.rdbuf(cap.rdbuf());
         struct Restore { std::streambuf* s; ~Restore() { if (s) std::cout.rdbuf(s); } } restore{saved};
+        std::string sep = " ", end = "\n";
+        if (pn->sep) { Value sv = evalNode(pn->sep, ctx); if (!sv.isNone()) sep = getStringValue(sv); }
+        if (pn->end) { Value ev = evalNode(pn->end, ctx); if (!ev.isNone()) end = getStringValue(ev); }
         for (size_t i = 0; i < pn->args.size(); i++) {
-            if (i > 0) std::cout << " ";
+            if (i > 0) std::cout << sep;
             Value v = evalNode(pn->args[i], ctx);
             printValue(v, ctx);
         }
@@ -1645,11 +1729,14 @@ return lv * rv;
             std::cout.rdbuf(saved);
             restore.s = nullptr;
             std::string line = cap.str();
-            std::cout << line << std::endl;
+            std::cout << line << end;
+            if (end != "\n") std::cout.flush();
             traceOutput(line);
             return NONE_VALUE;
         }
-        std::cout << std::endl;
+        std::cout << end;
+        if (end != "\n") std::cout.flush();
+        else std::cout.flush();
         return NONE_VALUE;
     }
 
@@ -2608,6 +2695,7 @@ return lv * rv;
                             int idx = len - 1;
                             if (!args.empty() && args[0].type == ValueType::INTEGER)
                                 idx = static_cast<int>(bigint_to_i64(args[0].value.i));
+                            if (idx < 0) idx += len;   // pop(-1), pop(-2): from the end
                             auto it = cont->container->find(std::to_string(idx));
                             if (it != cont->container->end()) {
                                 Value val = it->second;
@@ -2864,6 +2952,12 @@ return lv * rv;
                         int idx = static_cast<int>(bigint_to_i64(args[0].value.i));
                         auto len_it = cont->container->find("__len__");
                         int len = (len_it != cont->container->end()) ? static_cast<int>(bigint_to_i64(len_it->second.value.i)) : 0;
+                        // Negative counts from the end and out of range clamps,
+                        // as on the VM (and in Python); insert(-1, x) used to
+                        // write key "-1" and grow the list by a phantom slot.
+                        if (idx < 0) idx += len;
+                        if (idx < 0) idx = 0;
+                        if (idx > len) idx = len;
                         // Shift elements right
                         for (int i = len; i > idx; i--) {
                             auto it = cont->container->find(std::to_string(i - 1));
@@ -2888,8 +2982,20 @@ return lv * rv;
                     return Value((Collectable*)result);
                 }
                 if (method_name == "clear") {
+                    // A list stays a list (and a set a set); a map stays a map.
+                    // Writing __len__ unconditionally turned a cleared map into
+                    // an empty list, after which m[k] = v was silently lost.
+                    bool is_list = cont->container->count("__len__") > 0;
+                    std::vector<std::pair<std::string, Value>> keep;
+                    for (auto& kv : *cont->container) {
+                        const std::string& k = kv.first;
+                        if (k != "__len__" && k.size() > 4 && k.rfind("__", 0) == 0
+                            && k.compare(k.size() - 2, 2, "__") == 0)
+                            keep.push_back(kv);
+                    }
                     cont->container->clear();
-                    (*cont->container)["__len__"] = Value(0);
+                    for (auto& kv : keep) (*cont->container)[kv.first] = kv.second;
+                    if (is_list) (*cont->container)["__len__"] = Value(0);
                     return NONE_VALUE;
                 }
                 if (method_name == "min" || method_name == "max" || method_name == "sum") {
@@ -3225,7 +3331,7 @@ return lv * rv;
                         }
                         // Set __parent_class__ so super() works in this method
                         if (cn->bases.size() > 0)
-                            fc->defineByName("__parent_class__", makeStringValue(cn->bases[0]->value()));
+                            fc->defineByName("__parent_class__", internString(cn->bases[0]->value()));
                         try { Value r = evalNode(fn->body, fc); return r; }
                         catch (nython::node::ReturnSignal& r) { return r.value; }
                         catch (std::string& e) { throw; }
@@ -3256,7 +3362,7 @@ return lv * rv;
                             }
                             // Set __parent_class__ so super() works
                             if (cn->bases.size() > 0)
-                                fn_ctx->defineByName("__parent_class__", makeStringValue(cn->bases[0]->value()));
+                                fn_ctx->defineByName("__parent_class__", internString(cn->bases[0]->value()));
                             // Bind params (skip first "self" param)
                             size_t param_start = 0;
                             if (!fn->params.empty() && fn->params[0]->value() == "self") param_start = 1;
@@ -3663,15 +3769,25 @@ public:
         long long total_ns = 0;
         long long self_ns = 0;
         int       depth = 0;      // active activations, for recursion handling
+        // Allocations made by the function's own statements (self) - heap
+        // objects, strings, string bytes. Nothing is reclaimed on the
+        // interpreter, so these are what the function adds to memory for good.
+        long long self_objs = 0;
+        long long self_strs = 0;
+        long long self_sbytes = 0;
     };
     static bool& profiling_enabled() { static bool e = false; return e; }
     std::map<std::string, ProfEntry> prof_;
     long long prof_child_ns_ = 0;   // ns charged to callees of the current frame
+    long long prof_child_objs_ = 0; // allocations charged to callees, likewise
+    long long prof_child_strs_ = 0;
+    long long prof_child_sbytes_ = 0;
 
     struct ProfScope {
         NythonExecutor* ex; std::string name; bool on;
         std::chrono::steady_clock::time_point t0;
         long long saved_child;
+        long long o0 = 0, s0 = 0, b0 = 0, saved_o = 0, saved_s = 0, saved_b = 0;
         ProfScope(NythonExecutor* e, const std::string& n) : ex(e), name(n) {
             on = profiling_enabled() && !name.empty();
             if (!on) return;
@@ -3680,6 +3796,9 @@ public:
             pe.depth++;
             saved_child = ex->prof_child_ns_;
             ex->prof_child_ns_ = 0;
+            saved_o = ex->prof_child_objs_; saved_s = ex->prof_child_strs_; saved_b = ex->prof_child_sbytes_;
+            ex->prof_child_objs_ = 0; ex->prof_child_strs_ = 0; ex->prof_child_sbytes_ = 0;
+            o0 = nython::gc::collectables_created(); s0 = strings_created(); b0 = string_bytes_created();
             t0 = std::chrono::steady_clock::now();
         }
         ~ProfScope() {
@@ -3689,26 +3808,45 @@ public:
             auto& pe = ex->prof_[name];
             long long children = ex->prof_child_ns_;
             pe.self_ns += (elapsed - children);
+            long long dobj = nython::gc::collectables_created() - o0;
+            long long dstr = strings_created() - s0;
+            long long dbyt = string_bytes_created() - b0;
+            pe.self_objs += dobj - ex->prof_child_objs_;
+            pe.self_strs += dstr - ex->prof_child_strs_;
+            pe.self_sbytes += dbyt - ex->prof_child_sbytes_;
             pe.depth--;
             // Only the outermost activation contributes total time, otherwise a
             // recursive chain would count the same interval once per level.
             if (pe.depth == 0) pe.total_ns += elapsed;
             ex->prof_child_ns_ = saved_child + elapsed;
+            ex->prof_child_objs_ = saved_o + dobj;
+            ex->prof_child_strs_ = saved_s + dstr;
+            ex->prof_child_sbytes_ = saved_b + dbyt;
         }
     };
 
     // "name,calls,total_ms,self_ms" sorted by self time — the shape the IDE
     // panel consumes, and readable enough to eyeball from a terminal.
+    // With NY_PROFILE_SORT=alloc, rows are sorted by what each function's own
+    // statements allocated (objects, then strings) instead of by time.
     std::string profile_report() {
         std::vector<std::pair<std::string, ProfEntry>> rows(prof_.begin(), prof_.end());
-        std::sort(rows.begin(), rows.end(), [](auto& a, auto& b){
+        const char* by = getenv("NY_PROFILE_SORT");
+        bool by_alloc = by && std::string(by) == "alloc";
+        std::sort(rows.begin(), rows.end(), [by_alloc](auto& a, auto& b){
+            if (by_alloc) {
+                long long wa = a.second.self_objs * 800 + a.second.self_strs * 64 + a.second.self_sbytes;
+                long long wb = b.second.self_objs * 800 + b.second.self_strs * 64 + b.second.self_sbytes;
+                if (wa != wb) return wa > wb;
+            }
             return a.second.self_ns > b.second.self_ns; });
         std::ostringstream os;
-        os << "name,calls,total_ms,self_ms\n";
+        os << "name,calls,total_ms,self_ms,self_objects,self_strings,self_string_bytes\n";
         for (auto& [n, e] : rows) {
             os << n << "," << e.calls << ","
                << std::fixed << std::setprecision(3) << (double)e.total_ns / 1e6 << ","
-               << std::fixed << std::setprecision(3) << (double)e.self_ns / 1e6 << "\n";
+               << std::fixed << std::setprecision(3) << (double)e.self_ns / 1e6 << ","
+               << e.self_objs << "," << e.self_strs << "," << e.self_sbytes << "\n";
         }
         return os.str();
     }
@@ -3981,7 +4119,7 @@ public:
                                     }
                                     // Set parent chain for chained super() calls
                                     if (!pcn->bases.empty())
-                                        fn_ctx->defineByName("__parent_class__", makeStringValue(pcn->bases[0]->value()));
+                                        fn_ctx->defineByName("__parent_class__", internString(pcn->bases[0]->value()));
                                     fn_ctx->defineByName("__instance__", self_val);
                                     try { Value r = evalNode(fn->body, fn_ctx); return r; }
                                     catch (nython::node::ReturnSignal& r) { return r.value; }
@@ -4429,7 +4567,7 @@ public:
                                 // Set up super() - find parent class and bind its init
                                 if (cn_raw->bases.size() > 0) {
                                     std::string pname = cn_raw->bases[0]->value();
-                                    fn_ctx->defineByName("__parent_class__", makeStringValue(pname));
+                                    fn_ctx->defineByName("__parent_class__", internString(pname));
                                     fn_ctx->defineByName("__instance__", instance);
                                 }
                                 // See the identical comment on the other __init__ call sites in
@@ -5416,6 +5554,7 @@ public:
                 registerBuiltin("file_writelines"); registerBuiltin("writelines");
                 registerBuiltin("file_append"); registerBuiltin("append_file");
                 registerBuiltin("file_size"); registerBuiltin("file_delete");
+                registerBuiltin("file_mtime");
                 registerBuiltin("file_rename"); registerBuiltin("file_copy");
                 registerBuiltin("print_to"); registerBuiltin("fprint");
                 registerBuiltin("eprint"); registerBuiltin("print_err");

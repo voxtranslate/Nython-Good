@@ -64,6 +64,7 @@ class IDETheme:
             self.accent      = Color(0, 122, 204, 255)
             self.focus       = Color(0, 127, 212, 255)     # focusBorder
             self.link        = Color(55, 148, 255, 255)
+            self.sym_method  = Color(177, 128, 215, 255)   # symbolIcon.methodForeground
             self.list_active = Color(4, 57, 94, 255)       # list.activeSelectionBackground
             self.list_inactive = Color(55, 55, 61, 255)
             self.hover       = Color(42, 45, 46, 255)      # list.hoverBackground
@@ -106,6 +107,10 @@ class IDETheme:
             self.gutter_mod  = Color(27, 129, 168, 255)
             self.gutter_add  = Color(72, 126, 2, 255)
             self.gutter_del  = Color(241, 76, 76, 255)
+            self.diff_ins_bg = Color(155, 185, 85, 51)     # diffEditor.insertedLineBackground
+            self.diff_del_bg = Color(255, 0, 0, 51)        # diffEditor.removedLineBackground
+            self.diff_ins_fg = Color(129, 184, 139, 255)
+            self.diff_del_fg = Color(244, 135, 113, 255)
             self.debug_bg    = Color(51, 51, 51, 255)
             self.debug_line  = Color(255, 255, 0, 51)
             self.breakpoint  = Color(229, 20, 0, 255)
@@ -148,6 +153,7 @@ class IDETheme:
             self.accent      = Color(0, 122, 204, 255)
             self.focus       = Color(0, 144, 241, 255)
             self.link        = Color(0, 106, 204, 255)
+            self.sym_method  = Color(101, 45, 144, 255)    # symbolIcon.methodForeground
             self.list_active = Color(0, 96, 192, 255)
             self.list_inactive = Color(228, 230, 241, 255)
             self.hover       = Color(232, 232, 232, 255)
@@ -190,6 +196,10 @@ class IDETheme:
             self.gutter_mod  = Color(102, 175, 224, 255)
             self.gutter_add  = Color(129, 184, 139, 255)
             self.gutter_del  = Color(202, 75, 81, 255)
+            self.diff_ins_bg = Color(155, 185, 85, 64)
+            self.diff_del_bg = Color(255, 0, 0, 51)
+            self.diff_ins_fg = Color(40, 120, 50, 255)
+            self.diff_del_fg = Color(170, 40, 40, 255)
             self.debug_bg    = Color(243, 243, 243, 255)
             self.debug_line  = Color(255, 255, 102, 115)
             self.breakpoint  = Color(229, 20, 0, 255)
@@ -801,16 +811,30 @@ class IDEPaint(IDEOps):
         var b = self.buf()
         if self.encl_state == b.state_id() and self.encl_row_in == row and self.encl_doc == self.doc():
             return self.encl_row_out
+        # Innermost def/class whose body contains `row`: walk up, and only a
+        # line indented less than everything seen so far can open the scope.
         var i = row
         var found = -1
-        while i >= 0 and found < 0:
+        var lim = 100000
+        while i >= 0:
             var ln = b.get_line(i)
             var j = 0
-            while j < len(ln) and string_slice(ln, j, j + 1) == " ":
+            var ind = 0
+            while j < len(ln) and (string_slice(ln, j, j + 1) == " " or string_slice(ln, j, j + 1) == "\t"):
+                if string_slice(ln, j, j + 1) == "\t":
+                    ind = ind + 4
+                else:
+                    ind = ind + 1
                 j = j + 1
-            var head = string_slice(ln, j, j + 6)
-            if string_startswith(head, "def ") or string_startswith(head, "class "):
-                found = i
+            if j < len(ln) and (ind < lim or i == row):
+                var head = string_slice(ln, j, j + 6)
+                if string_startswith(head, "def ") or string_startswith(head, "class "):
+                    found = i
+                    i = -1
+                elif ind == 0:
+                    i = -1
+                else:
+                    lim = ind
             i = i - 1
         self.encl_state = b.state_id()
         self.encl_row_in = row
@@ -844,6 +868,7 @@ class IDEPaint(IDEOps):
         r.clip_xywh(tx_clip, ey, self.ed_w - self.GUTTER_W, self.ed_h)
         var sel = self._sel_range()
         var cur_row = b.cursor_row
+        var is_diff = d.lang == "diff"
         var i = 0
         while i < rows:
             var ln = top + i
@@ -855,6 +880,12 @@ class IDEPaint(IDEOps):
                 elif ln == cur_row and sel == none and self.focus == "editor":
                     r.fill_xywh(tx_clip, y, self.ed_w - self.GUTTER_W, 1, th.line_border)
                     r.fill_xywh(tx_clip, y + lh - 1, self.ed_w - self.GUTTER_W, 1, th.line_border)
+                if is_diff and len(line) > 0:
+                    var c0 = string_slice(line, 0, 1)
+                    if c0 == "+" and not string_startswith(line, "+++"):
+                        r.fill_xywh(tx_clip, y, self.ed_w - self.GUTTER_W, lh, th.diff_ins_bg)
+                    elif c0 == "-" and not string_startswith(line, "---"):
+                        r.fill_xywh(tx_clip, y, self.ed_w - self.GUTTER_W, lh, th.diff_del_bg)
                 if sel != none and ln >= sel[0] and ln <= sel[2]:
                     self._draw_sel_band(r, line, ln, sel, text_x, y, lh, th.selection)
                 if self.selmodel.count > 1:
@@ -935,9 +966,28 @@ class IDEPaint(IDEOps):
     def _col_x(self, line, col):
         if col <= 0:
             return 0
-        if col >= len(line):
-            return self.f_code.width(line)
-        return self.f_code.width(string_slice(line, 0, col))
+        var pre = line
+        if col < len(line):
+            pre = string_slice(line, 0, col)
+        if string_find(pre, "\t") >= 0:
+            return self.f_code.width(self._expand_tabs(pre, 0))
+        return self.f_code.width(pre)
+
+    # Tabs drawn as spaces up to the next tab stop; `vcol` is the visual
+    # column the text starts at.
+    def _expand_tabs(self, s, vcol):
+        if string_find(s, "\t") < 0:
+            return s
+        var parts = string_split(s, "\t")
+        var out = parts[0]
+        var v = vcol + len(parts[0])
+        var i = 1
+        while i < len(parts):
+            var pad = self.tab_size - (v % self.tab_size)
+            out = out + " " * pad + parts[i]
+            v = v + pad + len(parts[i])
+            i = i + 1
+        return out
 
     def _line_num(self, n):
         while len(self.line_nums) <= n:
@@ -953,17 +1003,26 @@ class IDEPaint(IDEOps):
 
     # Highlight layout for one line, cached by content (see rule 2).
     def _line_layout(self, line):
+        var lang = self.doc().lang
+        if lang == "diff":
+            return self._diff_layout(line)
         if self._hl_cache.has_key(line):
             return self._hl_cache[line]
         var segs = none
-        if self.doc().lang == "nython":
+        if lang == "nython":
             segs = self.hl.tokenise_line(line)
         else:
             segs = [{"text": line, "color": self.hl.c_default}]
         var dx = 0
         var k = 0
+        var has_tab = string_find(line, "\t") >= 0
+        var vcol = 0
         while k < len(segs):
             segs[k]["dx"] = dx
+            if has_tab:
+                var shown = self._expand_tabs(segs[k]["text"], vcol)
+                segs[k]["text"] = shown
+                vcol = vcol + len(shown)
             dx = dx + self.f_code.width(segs[k]["text"])
             k = k + 1
         if self._hl_cache_n > 3000:
@@ -971,6 +1030,28 @@ class IDEPaint(IDEOps):
             self._hl_cache_n = 0
         self._hl_cache[line] = segs
         self._hl_cache_n = self._hl_cache_n + 1
+        return segs
+
+    # A unified diff (Source Control's Open Changes): added lines green,
+    # removed red, hunk headers blue, file headers dim. Its own cache, since
+    # "+x" means something else in a Nython file.
+    def _diff_layout(self, line):
+        if self._diff_cache.has_key(line):
+            return self._diff_cache[line]
+        var th = self.th
+        var col = self.hl.c_default
+        if string_startswith(line, "+++") or string_startswith(line, "---") or string_startswith(line, "diff ") or string_startswith(line, "index "):
+            col = th.text_faint
+        elif string_startswith(line, "+"):
+            col = th.diff_ins_fg
+        elif string_startswith(line, "-"):
+            col = th.diff_del_fg
+        elif string_startswith(line, "@@"):
+            col = th.info
+        var segs = [{"text": self._expand_tabs(line, 0), "color": col, "dx": 0}]
+        if len(self._diff_cache) > 3000:
+            self._diff_cache = {}
+        self._diff_cache[line] = segs
         return segs
 
     def _draw_segs(self, r, segs, x, y):
@@ -1164,7 +1245,7 @@ class IDEPaint(IDEOps):
         var x = self.col_x + self.ed_w
         var y0 = self.ed_y
         r.fill_xywh(x, y0, self.mm_w, self.ed_h, th.editor_bg)
-        var model = self._minimap_model(d)
+        var cols = self._mm_colors()
         var ph = 2
         var cap = int(self.ed_h / ph)
         var n = b.line_count
@@ -1179,14 +1260,14 @@ class IDEPaint(IDEOps):
         var i = 0
         var scale = 1
         while i < cap and first + i < n:
-            var ent = model[first + i]
-            var ind = ent[0]
-            var ln = ent[1]
+            var code = self._mm_code(b.lines[first + i])
+            var ln = (code // 4) % 4096
+            var ind = code // 16384
             if ln > ind:
                 var w = ln - ind
                 if w > 60:
                     w = 60
-                r.fill_xywh(x + self.dp(6) + ind, y0 + i * ph, w, 1, ent[2])
+                r.fill_xywh(x + self.dp(6) + ind, y0 + i * ph, w, 1, cols[code % 4])
             i = i + 1
         var top = int(d.scroll_y / self.LINE_H)
         var vis = self._rows_visible()
@@ -1199,34 +1280,42 @@ class IDEPaint(IDEOps):
         self.mm_first = first
         self._hit(x, y0, self.mm_w, self.ed_h, "@minimap", "", "")
 
-    # [indent, length, colour] per line, rebuilt only when the text changes.
-    def _minimap_model(self, d):
-        var sid = d.buf.state_id()
-        if self.mm_doc == d and self.mm_state == sid and self.mm_count == d.buf.line_count:
-            return self.mm_model
-        var out = []
-        var b = d.buf
-        var i = 0
-        var dim = self._a(self.th.text, 110)
-        var c_default = Color(dim.r, dim.g, dim.b, 110)
-        var c_comment = Color(self.hl.c_comment.r, self.hl.c_comment.g, self.hl.c_comment.b, 150)
-        var c_decl = Color(self.hl.c_storage.r, self.hl.c_storage.g, self.hl.c_storage.b, 170)
-        while i < b.line_count:
-            var line = b.lines[i]
-            var ind = self._line_indent(line)
-            var c = c_default
-            var head = string_slice(line, ind, ind + 4)
-            if string_startswith(head, "#"):
-                c = c_comment
-            elif string_startswith(head, "def ") or string_startswith(head, "clas"):
-                c = c_decl
-            out.append([ind, len(line), c])
-            i = i + 1
-        self.mm_model = out
-        self.mm_doc = d
-        self.mm_state = sid
-        self.mm_count = b.line_count
-        return out
+    # One int per distinct line text - indent, length and colour class packed
+    # together - so drawing the minimap allocates nothing and an edit costs
+    # one new entry for the line it changed. The previous model rebuilt an
+    # [indent, length, colour] list per line of the file on every keystroke.
+    def _mm_code(self, line):
+        if self.mm_codes.has_key(line):
+            return self.mm_codes[line]
+        var ind = self._line_indent(line)
+        var cls = 0
+        var head = string_slice(line, ind, ind + 4)
+        if string_startswith(head, "#"):
+            cls = 1
+        elif string_startswith(head, "def ") or string_startswith(head, "clas"):
+            cls = 2
+        var n = len(line)
+        if n > 4095:
+            n = 4095
+        if ind > 4095:
+            ind = 4095
+        var code = (ind * 4096 + n) * 4 + cls
+        if self.mm_codes_n > 20000:
+            self.mm_codes.clear()
+            self.mm_codes_n = 0
+        self.mm_codes[line] = code
+        self.mm_codes_n = self.mm_codes_n + 1
+        return code
+
+    # The three minimap colours, made once per theme.
+    def _mm_colors(self):
+        if self.mm_cols_dark != self.th.dark or len(self.mm_cols) == 0:
+            var dim = self.th.text
+            self.mm_cols = [Color(dim.r, dim.g, dim.b, 110),
+                            Color(self.hl.c_comment.r, self.hl.c_comment.g, self.hl.c_comment.b, 150),
+                            Color(self.hl.c_storage.r, self.hl.c_storage.g, self.hl.c_storage.b, 170)]
+            self.mm_cols_dark = self.th.dark
+        return self.mm_cols
 
     def _draw_vscroll(self, r):
         var th = self.th
@@ -1306,28 +1395,119 @@ class IDEPaint(IDEOps):
             self._small_button(r, fx + fw + self.dp(6), ry, self.dp(22), fh, "replace", "@find.replace", "", "Replace (Ctrl+Shift+1)", false)
             self._small_button(r, fx + fw + self.dp(30), ry, self.dp(22), fh, "replace-all", "@find.replaceall", "", "Replace All (Ctrl+Alt+Enter)", false)
 
+    # Word-wrapped text. Wrapping is measured once per (text, width) and
+    # cached by the text itself, so a repaint allocates nothing.
+    def _wrapped(self, text, font, w):
+        if self.wrap_cache.has_key(text):
+            var c = self.wrap_cache[text]
+            if c[0] == w:
+                return c[1]
+        var words = string_split(text, " ")
+        var lines = []
+        var cur = ""
+        var i = 0
+        while i < len(words):
+            var cand = words[i]
+            if cur != "":
+                cand = cur + " " + words[i]
+            if cur != "" and font.width(cand) > w:
+                lines.append(cur)
+                cur = words[i]
+            else:
+                cur = cand
+            i = i + 1
+        if cur != "":
+            lines.append(cur)
+        if len(self.wrap_cache) > 200:
+            self.wrap_cache = {}
+        self.wrap_cache[text] = [w, lines]
+        return lines
+
+    def _draw_wrapped(self, r, text, x, y, w, font, col, lh):
+        var ls = self._wrapped(text, font, w)
+        var i = 0
+        while i < len(ls):
+            r.text(ls[i], x, y + i * lh, font, col)
+            i = i + 1
+        return y + len(ls) * lh
+
+    def _qi_item_marks(self, it, qi):
+        it.pos_q = qi.value
+        it.pos_x = []
+        it.pos_ch = []
+        var q = qi.query()
+        if q == "" or qi.kind == "prompt" or qi.kind == "line":
+            return
+        var ps = fuzzy_positions(q, it.label)
+        if ps == none:
+            return
+        var i = 0
+        while i < len(ps):
+            it.pos_x.append(self.f_ui.width(string_slice(it.label, 0, ps[i])))
+            it.pos_ch.append(string_slice(it.label, ps[i], ps[i] + 1))
+            i = i + 1
+
+    def _field_of(self, cmd, arg):
+        if cmd == "@qi.input":
+            return "qi"
+        if cmd == "@find.field":
+            return "find" + str(arg)
+        if cmd == "@search.field":
+            return "search" + str(arg)
+        if cmd == "@scm.msg":
+            return "scm"
+        if cmd == "@ext.search":
+            return "ext"
+        return ""
+
     def _input(self, r, x, y, w, h, value, placeholder, focused, cmd, arg):
         var th = self.th
+        var name = self._field_of(cmd, arg)
         r.fill_xywh(x, y, w, h, th.input_bg)
         if focused:
             r.rect_xywh(x, y, w, h, th.focus, 1)
         var ty = y + int((h - self.ui_h) / 2)
         r.clip_xywh(x + 2, y, w - 4, h)
+        var vx = x + self.dp(6)
         if value == "":
-            r.text(placeholder, x + self.dp(6), ty, self.f_ui, th.placeholder)
+            r.text(placeholder, vx, ty, self.f_ui, th.placeholder)
             if focused and self.caret_on:
-                r.fill_xywh(x + self.dp(6), y + self.dp(4), 1, h - self.dp(8), th.input_fg)
+                r.fill_xywh(vx, y + self.dp(4), 1, h - self.dp(8), th.input_fg)
         else:
-            var vw = self.f_ui.width(value)
-            var vx = x + self.dp(6)
-            # Keep the end of a long value (where the caret is) visible.
-            if vw > w - self.dp(80):
-                vx = x + w - self.dp(80) - vw
+            var le = self._le(name)
+            le.sync(value)
+            var cw = self.f_ui.width(string_slice(value, 0, le.caret))
+            # Keep the caret in view when the value is wider than the box.
+            if cw > w - self.dp(40):
+                vx = x + w - self.dp(40) - cw
+            if focused and le.has_sel():
+                var sx = vx + self.f_ui.width(string_slice(value, 0, le.lo()))
+                var sw = self.f_ui.width(string_slice(value, le.lo(), le.hi()))
+                r.fill_xywh(sx, y + self.dp(3), sw, h - self.dp(6), th.selection)
             r.text(value, vx, ty, self.f_ui, th.input_fg)
             if focused and self.caret_on:
-                r.fill_xywh(vx + vw + 1, y + self.dp(4), 1, h - self.dp(8), th.input_fg)
+                r.fill_xywh(vx + cw, y + self.dp(4), 1, h - self.dp(8), th.input_fg)
+        self.field_vx[name] = vx
         r.clear_clip()
         self._hit(x, y, w, h, cmd, arg, "")
+
+    # A prompt line in a panel (terminal, Debug Console) with caret and
+    # selection from its LineEdit.
+    def _prompt_line(self, r, name, value, px, yy, lh, focused):
+        var th = self.th
+        var le = self._le(name)
+        le.sync(value)
+        var f = self.f_mono_small
+        if focused and le.has_sel():
+            r.fill_xywh(px + f.width(string_slice(value, 0, le.lo())), yy, f.width(string_slice(value, le.lo(), le.hi())), lh - 2, th.selection)
+        r.text(value, px, yy, f, th.text)
+        if focused and self.caret_on:
+            var cx = px + f.width(string_slice(value, 0, le.caret))
+            if le.caret < len(value):
+                r.fill_xywh(cx, yy, 2, lh - 2, self._a(th.text, 200))
+            else:
+                r.fill_xywh(cx, yy, self.dp(7), lh - 2, self._a(th.text, 180))
+        self.field_vx[name] = px
 
     def _toggle(self, r, x, y, icon, on, key, tip):
         var th = self.th
@@ -1497,10 +1677,8 @@ class IDEPaint(IDEOps):
         var prompt = self.term_prompt
         r.text(prompt, x + self.dp(16), yy, self.f_mono_small, th.ok)
         var px = x + self.dp(16) + self.f_mono_small.width(prompt) + self.dp(6)
-        r.text(self.term_input, px, yy, self.f_mono_small, th.text)
-        if self.focus == "terminal" and self.caret_on:
-            var cx = px + self.f_mono_small.width(self.term_input)
-            r.fill_xywh(cx, yy, self.dp(7), lh - 2, self._a(th.text, 180))
+        self._prompt_line(r, "term", self.term_input, px, yy, lh, self.focus == "terminal")
+        self.term_input_y = yy - self.dp(2)
         self._hit(x, y, w, h, "@term", "", "")
 
     def _draw_dbg_console(self, r, x, y, w, h):
@@ -1522,9 +1700,8 @@ class IDEPaint(IDEOps):
             yy = yy + lh
             i = i + 1
         r.text(">", x + self.dp(16), yy, self.f_mono_small, th.info)
-        r.text(self.dbgcon_input, x + self.dp(30), yy, self.f_mono_small, th.text)
-        if self.focus == "dbgconsole" and self.caret_on:
-            r.fill_xywh(x + self.dp(31) + self.f_mono_small.width(self.dbgcon_input), yy, self.dp(7), lh - 2, self._a(th.text, 180))
+        self._prompt_line(r, "dbgcon", self.dbgcon_input, x + self.dp(30), yy, lh, self.focus == "dbgconsole")
+        self.dbgcon_input_y = yy - self.dp(2)
         self._hit(x, y, w, h, "@dbgcon", "", "")
 
     def _draw_inspector(self, r, x, y, w, h):
@@ -1683,7 +1860,7 @@ class IDEPaint(IDEOps):
             rx = self._status_item_r(r, rx, y, h, "", self.st_lang, "workbench.action.editor.changeLanguageMode", "", "Select Language Mode")
             rx = self._status_item_r(r, rx, y, h, "", self.st_eol, "workbench.action.editor.changeEOL", "", "Select End of Line Sequence")
             rx = self._status_item_r(r, rx, y, h, "", self.st_enc, "workbench.action.editor.changeEncoding", "", "Select Encoding")
-            rx = self._status_item_r(r, rx, y, h, "", self.st_indent, "editor.action.indentationToSpaces", "", "Select Indentation")
+            rx = self._status_item_r(r, rx, y, h, "", self.st_indent, "changeEditorIndentation", "", "Select Indentation")
             rx = self._status_item_r(r, rx, y, h, "", self.st_pos, "workbench.action.gotoLine", "", "Go to Line/Column (Ctrl+G)")
 
     def _status_item(self, r, x, y, h, icon, label, cmd, arg, tip):
@@ -1728,7 +1905,7 @@ class IDEPaint(IDEOps):
                 nsel = len(b.text_range(g[0], g[1], g[2], g[3]))
         var key_same = self.st_k_row == row and self.st_k_col == col and self.st_k_sel == nsel
         key_same = key_same and self.st_k_err == self.n_errors and self.st_k_warn == self.n_warnings
-        key_same = key_same and self.st_k_doc == self.doc() and self.st_k_tab == self.tab_size
+        key_same = key_same and self.st_k_doc == self.doc() and self.st_k_tab == self.tab_size and self.st_k_spaces == self.insert_spaces
         key_same = key_same and self.st_k_branch == self.scm_branch and self.st_k_dirtyrepo == self.scm_count
         key_same = key_same and self.st_k_dbg == self.dbg_line_row and self.st_k_job == self.job_running
         if key_same and b != none and self.st_k_eol == b.eol and self.st_k_bom == self.doc().bom and self.st_k_lang == self.doc().lang:
@@ -1740,6 +1917,7 @@ class IDEPaint(IDEOps):
         self.st_k_warn = self.n_warnings
         self.st_k_doc = self.doc()
         self.st_k_tab = self.tab_size
+        self.st_k_spaces = self.insert_spaces
         self.st_k_branch = self.scm_branch
         self.st_k_dirtyrepo = self.scm_count
         self.st_k_dbg = self.dbg_line_row
@@ -1759,6 +1937,8 @@ class IDEPaint(IDEOps):
             if nsel > 0:
                 self.st_pos = self.st_pos + " (" + str(nsel) + " selected)"
             self.st_indent = "Spaces: " + str(self.tab_size)
+            if not self.insert_spaces:
+                self.st_indent = "Tab Size: " + str(self.tab_size)
             self.st_enc = "UTF-8"
             if self.doc().bom:
                 self.st_enc = "UTF-8 with BOM"
@@ -1810,6 +1990,12 @@ class IDEPaint(IDEOps):
     def _draw_dropdown(self, r):
         var th = self.th
         self._scrim_hit("@overlay.dismiss")
+        # The menu bar stays live above the dismiss layer: moving along it
+        # switches menus and clicking the open one closes it, as in VS Code.
+        var mi = 0
+        while mi < len(self.menus):
+            self._hit(self.menu_x[mi], 0, self.f_ui.width(self.menus[mi]) + self.dp(16), self.TITLE_H, "@menu", mi, "")
+            mi = mi + 1
         var items = self.menu_items[self.menus[self.menu_open]]
         var x = self.menu_x[self.menu_open]
         var y = self.TITLE_H
@@ -1946,7 +2132,7 @@ class IDEPaint(IDEOps):
                 icol = th.text
             elif kind == "function" or kind == "method" or kind == "builtin":
                 icon = "symbol-method"
-                icol = Color(180, 130, 240, 255)
+                icol = th.sym_method
             elif kind == "class":
                 icon = "symbol-class"
                 icol = th.git_mod
@@ -2037,7 +2223,7 @@ class IDEPaint(IDEOps):
                     icc = th.git_mod
                 elif ic == "function" or ic == "method":
                     ic = "symbol-method"
-                    icc = Color(180, 130, 240, 255)
+                    icc = th.sym_method
                 elif ic == "variable":
                     ic = "symbol-variable"
                     icc = th.info
@@ -2048,11 +2234,13 @@ class IDEPaint(IDEOps):
                 fg = th.text_hi
             var ty = ry + int((ih - self.ui_h) / 2)
             r.text(it.label, lx, ty, self.f_ui, fg)
-            # Matched characters in the highlight colour (fuzzy positions).
+            # Matched characters in the highlight colour. Worked out once per
+            # query for each item shown, not sliced and measured every frame.
+            if it.pos_q != qi.value:
+                self._qi_item_marks(it, qi)
             var p = 0
-            while p < len(it.pos):
-                var at = it.pos[p]
-                r.text(string_slice(it.label, at, at + 1), lx + self.f_ui.width(string_slice(it.label, 0, at)), ty, self.f_ui_bold, th.match_hi)
+            while p < len(it.pos_x):
+                r.text(it.pos_ch[p], lx + it.pos_x[p], ty, self.f_ui_bold, th.match_hi)
                 p = p + 1
             var lw = self.f_ui.width(it.label)
             if it.detail != "":
@@ -2077,6 +2265,8 @@ class IDEPaint(IDEOps):
             return
         var th = self.th
         var now = time_ms()
+        if not self.notes.any_active(now):
+            return
         var act = self.notes.active(now, 3)
         if len(act) == 0:
             return

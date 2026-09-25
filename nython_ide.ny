@@ -80,7 +80,6 @@ class NythonIDE(IDEViews):
         self.want_col = -1
         # ── model objects ─────────────────────────────────────────────────────
         self.icons = Icons()
-        self.th.sym_method = Color(180, 130, 240, 255)
         self.scratch = []
         var si = 0
         while si < 64:
@@ -141,6 +140,12 @@ class NythonIDE(IDEViews):
         self.show_whitespace = false
         self.show_indent_guides = true
         self.tab_size = 4
+        self.insert_spaces = true
+        self.st_k_spaces = true
+        self.default_tab_size = 4
+        self.default_insert_spaces = true
+        self.detect_indent = true
+        self.indent_mode = "spaces"
         self.auto_save = "off"
         self.loading_settings = false
         self.menu_open = -1
@@ -191,6 +196,7 @@ class NythonIDE(IDEViews):
         self._title_dirty = true
         self._code_handle = none
         self._hl_cache = {}
+        self._diff_cache = {}
         self._hl_cache_n = 0
         self.clipboard = ""
         self.clip_line_mode = false
@@ -206,9 +212,6 @@ class NythonIDE(IDEViews):
         self.vs_thumb_h = 0
         self.mm_first = 0
         self.mm_doc = none
-        self.mm_state = -1
-        self.mm_count = -1
-        self.mm_model = []
         self.crumb_doc = none
         self.crumb_sym_row = -2
         self.crumb_path = ""
@@ -322,6 +325,10 @@ class NythonIDE(IDEViews):
         # ── debugger ──────────────────────────────────────────────────────────
         self.breaks = {}
         self.break_list = []
+        self.brk_gen = 0
+        self.brk_rows = {}
+        self.brk_rows_doc = none
+        self.brk_rows_gen = -1
         self.dbg_line_row = -1
         self.dbg_line_path = ""
         self.dbg_doc = none
@@ -337,6 +344,32 @@ class NythonIDE(IDEViews):
         self.dbg_stack_pos = -2
         self.dbg_recording = false
         self.watches = []
+        self.dbg_var_sel = -1
+        self.fields = {}           # input name -> LineEdit (caret + selection)
+        self.wrap_cache = {}
+        self.mm_codes = {}
+        self.mm_codes_n = 0
+        self.mm_cols = []
+        self.mm_cols_dark = true
+        # Title-bar actions of each side view, built once: a list literal in a
+        # paint method is a new list every frame, and lists are never freed.
+        self.acts_explorer = [["new-file", "explorer.newFile", "", "New File..."], ["new-folder", "explorer.newFolder", "", "New Folder..."], ["refresh", "workbench.files.action.refreshFilesExplorer", "", "Refresh Explorer"], ["collapse-all", "workbench.files.action.collapseExplorerFolders", "", "Collapse Folders in Explorer"]]
+        self.acts_search = [["refresh", "@search.run", "", "Refresh"], ["clear-all", "@search.clear", "", "Clear Search Results"]]
+        self.acts_scm = [["check", "git.commit", "", "Commit"], ["refresh", "git.refresh", "", "Refresh"], ["ellipsis", "@scm.more", "", "More Actions..."]]
+        self.acts_ext = [["refresh", "@ext.refresh", "", "Refresh"]]
+        self.acts_ai = [["refresh", "nython.ai.analyze", "", "Analyse Again"]]
+        self.ac_row = -1
+        self.ac_start = -1
+        self.ac_doc = none
+        self.ac_names = []
+        self.ac_all_kinds = []
+        self.ac_bonus = []
+        self.watch_t = 0
+        self.watch_dirs = {}
+        self.watch_git = -3
+        self.term_input_y = 100000
+        self.dbgcon_input_y = 100000
+        self.field_vx = {}         # input name -> x of its first character, last frame
         # ── source control ────────────────────────────────────────────────────
         self.scm_stale = true
         self.scm_branch = ""
@@ -743,6 +776,7 @@ class NythonIDE(IDEViews):
             self._qi_accept(self.qi.current())
             return
         if cmd == "@qi.input":
+            self._field_click("qi", e)
             return
         if cmd == "@view":
             if self.active_view == arg and self.sidebar_open:
@@ -845,13 +879,18 @@ class NythonIDE(IDEViews):
             return
         if cmd == "@term":
             self.focus = "terminal"
+            if e.y >= self.term_input_y:
+                self._field_click("term", e)
             return
         if cmd == "@dbgcon":
             self.focus = "dbgconsole"
+            if e.y >= self.dbgcon_input_y:
+                self._field_click("dbgcon", e)
             return
         if cmd == "@find.field":
             self.focus = "find"
             self.find_field = arg
+            self._field_click("find" + str(arg), e)
             return
         if cmd == "@find.toggle":
             if arg == "replace":
@@ -914,6 +953,7 @@ class NythonIDE(IDEViews):
         if string_startswith(cmd, "@ext"):
             if cmd == "@ext.search":
                 self.focus = "extsearch"
+                self._field_click("ext", e)
             elif cmd == "@ext.open":
                 self._ext_page(arg)
             elif cmd == "@ext.import":
@@ -951,6 +991,18 @@ class NythonIDE(IDEViews):
             self._show_panel("terminal")
             self.focus = "terminal"
             self._term_print("cd " + dir, "dim")
+        elif cmd == "@ctx.copytext":
+            self._set_clipboard(arg)
+            self._notify("Copied to clipboard", "info")
+        elif cmd == "@ctx.watch":
+            var have = false
+            var wi = 0
+            while wi < len(self.watches):
+                if self.watches[wi] == arg:
+                    have = true
+                wi = wi + 1
+            if not have:
+                self.watches.append(arg)
         elif cmd == "@ctx.copypanel":
             var src = self.out_lines
             if self.active_panel == "terminal":
@@ -1050,6 +1102,7 @@ class NythonIDE(IDEViews):
         if cmd == "@search.field":
             self.focus = "search"
             self.search_field = arg
+            self._field_click("search" + str(arg), e)
         elif cmd == "@search.toggle":
             if arg == "case":
                 self.search_case = not self.search_case
@@ -1080,6 +1133,7 @@ class NythonIDE(IDEViews):
     def _scm_click(self, cmd, arg, e):
         if cmd == "@scm.msg":
             self.focus = "scm"
+            self._field_click("scm", e)
         elif cmd == "@scm.row":
             var staged = string_startswith(arg, "S:")
             var p = arg
@@ -1124,6 +1178,9 @@ class NythonIDE(IDEViews):
                 self.dbg_frame = fr[3]
                 if arg == 0:
                     self.dbg_frame = -1
+        elif cmd == "@dbg.var":
+            self.dbg_var_sel = arg
+            self.focus = "debugvars"
         elif cmd == "@dbg.exception":
             self.dbg.seek(self.dbg.n - 1)
             self._dbg_sync()
@@ -1149,6 +1206,7 @@ class NythonIDE(IDEViews):
                     keep2.append(self.break_list[j])
                 j = j + 1
             self.break_list = keep2
+            self.brk_gen = self.brk_gen + 1
 
     # ── context menus ────────────────────────────────────────────────────────
     def _open_ctx(self, x, y, items):
@@ -1212,6 +1270,13 @@ class NythonIDE(IDEViews):
                 its.append(["Stage Changes", "git.stage", p2])
                 its.append(["Discard Changes", "git.clean", p2])
             self._open_ctx(e.x, e.y, its)
+        elif c == "@dbg.var":
+            self.dbg_var_sel = h.arg
+            var vs = self.dbg_vars_cache()
+            if h.arg < len(vs):
+                self._open_ctx(e.x, e.y, [["Copy Value", "@ctx.copytext", vs[h.arg][1]],
+                                          ["Copy as Expression", "@ctx.copytext", vs[h.arg][0]],
+                                          ["Add to Watch", "@ctx.watch", vs[h.arg][0]]])
         elif c == "@term" or c == "@panel.body" or c == "@dbgcon":
             self._open_ctx(e.x, e.y, [["Copy All", "@ctx.copypanel", ""], ["Clear", "workbench.action.terminal.clear", ""]])
 
@@ -1223,6 +1288,14 @@ class NythonIDE(IDEViews):
         self.hover_info = ""
         var k = e.key
         if k == "ctrl" or k == "shift" or k == "alt" or k == "super":
+            return
+        # The developer dumps observe the workbench and must not disturb it,
+        # so they run whatever overlay is open (tools/ide_e2e.py relies on it).
+        if e.ctrl and e.shift and e.alt and (k == "j" or k == "d"):
+            if k == "j":
+                self._dump_state()
+            else:
+                self._dump_hitmap()
             return
         if self.modal_open:
             self._modal_key(e)
@@ -1260,6 +1333,10 @@ class NythonIDE(IDEViews):
             self._exec(cmd, none)
             return
         var f = self.focus
+        if f == "qi":
+            # An unhandled key in Quick Input stays there; it used to fall
+            # through to the editor underneath.
+            return
         if f == "find":
             self._find_key(e)
         elif f == "search":
@@ -1332,10 +1409,6 @@ class NythonIDE(IDEViews):
         if k == "pageup":
             self.qi.page(0 - 1)
             return true
-        if k == "backspace":
-            self.qi.backspace()
-            self._qi_value_changed()
-            return true
         if k == "tab" and self.qi.kind == "path":
             var it = self.qi.current()
             if it != none:
@@ -1343,11 +1416,7 @@ class NythonIDE(IDEViews):
                 self.qi.sel_moved = false
                 self._path_items_refresh()
             return true
-        if e.ctrl and k == "v":
-            self.qi.type_text(self._one_line(self._get_clipboard()))
-            self._qi_value_changed()
-            return true
-        return false
+        return self._field_key(e)
 
     def _one_line(self, s):
         var t = string_replace(s, "\r", "")
@@ -1411,6 +1480,8 @@ class NythonIDE(IDEViews):
 
     def _find_key(self, e):
         var k = e.key
+        if self._field_key(e):
+            return
         if k == "escape":
             self.find_open = false
             self.focus = "editor"
@@ -1426,13 +1497,8 @@ class NythonIDE(IDEViews):
         elif k == "tab":
             if self.find_replace_mode:
                 self.find_field = 1 - self.find_field
-        elif k == "backspace":
-            if self.find_field == 0:
-                if len(self.find_query) > 0:
-                    self.find_query = string_slice(self.find_query, 0, len(self.find_query) - 1)
-                    self._find_run()
-            elif len(self.find_replace) > 0:
-                self.find_replace = string_slice(self.find_replace, 0, len(self.find_replace) - 1)
+                var fname = "find" + str(self.find_field)
+                self._le(fname).reset(self._field_get(fname), true)
         elif e.alt and k == "c":
             self.find_case = not self.find_case
             self._find_run()
@@ -1442,16 +1508,10 @@ class NythonIDE(IDEViews):
         elif e.alt and k == "r":
             self.find_regex = not self.find_regex
             self._find_run()
-        elif e.ctrl and k == "v":
-            self._find_type(self._one_line(self._get_clipboard()))
         self._find_info_update()
 
     def _find_type(self, t):
-        if self.find_field == 0:
-            self.find_query = self.find_query + t
-            self._find_run()
-        else:
-            self.find_replace = self.find_replace + t
+        self._field_type("find" + str(self.find_field), t)
         self._find_info_update()
 
     def _find_info_update(self):
@@ -1464,6 +1524,8 @@ class NythonIDE(IDEViews):
 
     def _search_key(self, e):
         var k = e.key
+        if self._field_key(e):
+            return
         if k == "escape":
             self.focus = "editor"
         elif k == "enter":
@@ -1474,35 +1536,22 @@ class NythonIDE(IDEViews):
         elif k == "tab":
             if self.search_replace_open:
                 self.search_field = 1 - self.search_field
-        elif k == "backspace":
-            if self.search_field == 0:
-                if len(self.search_query) > 0:
-                    self.search_query = string_slice(self.search_query, 0, len(self.search_query) - 1)
-                    self.search_due = time_ms() + 300
-            elif len(self.search_replace) > 0:
-                self.search_replace = string_slice(self.search_replace, 0, len(self.search_replace) - 1)
-        elif e.ctrl and k == "v":
-            self._search_type(self._one_line(self._get_clipboard()))
+                var sname = "search" + str(self.search_field)
+                self._le(sname).reset(self._field_get(sname), true)
 
+    # Search as you type, once typing pauses (_field_set schedules it).
     def _search_type(self, t):
-        if self.search_field == 0:
-            self.search_query = self.search_query + t
-            # Search as you type, once typing pauses.
-            self.search_due = time_ms() + 300
-        else:
-            self.search_replace = self.search_replace + t
+        self._field_type("search" + str(self.search_field), t)
 
     # Single-line inputs: the SCM message box, the Debug Console, the
     # extensions filter.
     def _line_input_key(self, e, which):
         var k = e.key
         var v = self._input_value(which)
+        if self._field_key(e):
+            return
         if k == "escape":
             self.focus = "editor"
-            return
-        if k == "backspace":
-            if len(v) > 0:
-                self._set_input_value(which, string_slice(v, 0, len(v) - 1))
             return
         if k == "enter":
             if which == "scm":
@@ -1511,8 +1560,6 @@ class NythonIDE(IDEViews):
                 self._dbg_eval(v)
                 self.dbgcon_input = ""
             return
-        if e.ctrl and k == "v":
-            self._set_input_value(which, v + self._one_line(self._get_clipboard()))
 
     def _input_value(self, which):
         if which == "scm":
@@ -1532,18 +1579,148 @@ class NythonIDE(IDEViews):
             self.ext_query = v
             self.tree_scroll = 0
 
+    # ── single-line inputs ───────────────────────────────────────────────────
+    # Every input edits through a LineEdit (lib/ide_workbench.ny); the value
+    # itself stays in the attribute the rest of the IDE already reads.
+    def _focused_field(self):
+        var f = self.focus
+        if f == "qi" and self.qi.visible:
+            return "qi"
+        if f == "find":
+            return "find" + str(self.find_field)
+        if f == "search":
+            return "search" + str(self.search_field)
+        if f == "scm":
+            return "scm"
+        if f == "terminal":
+            return "term"
+        if f == "dbgconsole":
+            return "dbgcon"
+        if f == "extsearch":
+            return "ext"
+        return ""
+
+    def _le(self, name):
+        if not self.fields.has_key(name):
+            self.fields[name] = LineEdit()
+        return self.fields[name]
+
+    def _field_get(self, name):
+        if name == "qi":
+            return self.qi.value
+        if name == "find0":
+            return self.find_query
+        if name == "find1":
+            return self.find_replace
+        if name == "search0":
+            return self.search_query
+        if name == "search1":
+            return self.search_replace
+        if name == "scm":
+            return self.scm_msg
+        if name == "term":
+            return self.term_input
+        if name == "dbgcon":
+            return self.dbgcon_input
+        if name == "ext":
+            return self.ext_query
+        return ""
+
+    def _field_set(self, name, v):
+        if name == "qi":
+            self.qi.set_value(v)
+            self._qi_value_changed()
+        elif name == "find0":
+            self.find_query = v
+            self._find_run()
+            self._find_info_update()
+        elif name == "find1":
+            self.find_replace = v
+        elif name == "search0":
+            self.search_query = v
+            self.search_due = time_ms() + 300
+        elif name == "search1":
+            self.search_replace = v
+        elif name == "scm":
+            self.scm_msg = v
+        elif name == "term":
+            self.term_input = v
+        elif name == "dbgcon":
+            self.dbgcon_input = v
+        elif name == "ext":
+            self.ext_query = v
+            self.tree_scroll = 0
+
+    def _field_type(self, name, t):
+        var v = self._field_get(name)
+        self._field_set(name, self._le(name).insert(v, t))
+
+    # Caret, selection and clipboard keys for the focused input. False for
+    # the keys its owner handles (Enter, Escape, Tab, Up/Down, and Ctrl+C with
+    # nothing selected, which interrupts in the terminal).
+    def _field_key(self, e):
+        var name = self._focused_field()
+        if name == "":
+            return false
+        var le = self._le(name)
+        var v = self._field_get(name)
+        var k = e.key
+        if e.ctrl and not e.alt and not e.shift and (k == "c" or k == "x"):
+            if not le.has_sel():
+                return false
+            self._set_clipboard(le.selected(v))
+            if k == "x":
+                self._field_set(name, le.insert(v, ""))
+            return true
+        if e.ctrl and not e.alt and k == "v":
+            self._field_type(name, self._one_line(self._get_clipboard()))
+            return true
+        var nv = le.key(v, e)
+        if nv == none:
+            return false
+        if nv != v:
+            self._field_set(name, nv)
+        return true
+
+    # A click inside an input puts the caret under the pointer (Shift+click
+    # extends the selection; a double click selects the word).
+    def _field_click(self, name, e):
+        var v = self._field_get(name)
+        var le = self._le(name)
+        le.sync(v)
+        var x0 = 0
+        if self.field_vx.has_key(name):
+            x0 = self.field_vx[name]
+        var font = self.f_ui
+        if name == "term" or name == "dbgcon":
+            font = self.f_mono_small
+        var i = 0
+        var best = 0
+        var bestd = 1000000
+        while i <= len(v):
+            var dx = abs(x0 + font.width(string_slice(v, 0, i)) - e.x)
+            if dx < bestd:
+                bestd = dx
+                best = i
+            i = i + 1
+        if e.clicks >= 2:
+            le.select(v, le.word_left(v, best), le.word_right(v, best))
+        elif e.shift:
+            le.caret = best
+        else:
+            le.select(v, best, best)
+
     # ── terminal ─────────────────────────────────────────────────────────────
     def _term_key(self, e):
         var k = e.key
+        if self._field_key(e):
+            return
         if k == "enter":
             var cmd = self.term_input
             self._term_print(self.term_prompt + " " + cmd, "cmd")
             self.term_input = ""
             self.term_follow = true
             self._term_run(cmd)
-        elif k == "backspace":
-            if len(self.term_input) > 0:
-                self.term_input = string_slice(self.term_input, 0, len(self.term_input) - 1)
         elif k == "up":
             self.term_input = self.cmdline.history_prev()
         elif k == "down":
@@ -1738,14 +1915,13 @@ class NythonIDE(IDEViews):
         self._after_typing()
 
     def _spaces_to_tab_stop(self):
-        var col = self.buf().cursor_col
-        var n = self.tab_size - (col % self.tab_size)
-        var s = ""
-        var i = 0
-        while i < n:
-            s = s + " "
-            i = i + 1
-        return s
+        if not self.insert_spaces:
+            return "\t"
+        var b = self.buf()
+        # Measured in visual columns, so a tab earlier on the line counts as
+        # the width it is drawn at.
+        var vis = len(self._expand_tabs(string_slice(b.get_line(b.cursor_row), 0, b.cursor_col), 0))
+        return " " * (self.tab_size - (vis % self.tab_size))
 
     def _move_caret(self, k, ctrl):
         var b = self.buf()
@@ -1852,6 +2028,7 @@ class NythonIDE(IDEViews):
         if self._sel_range() != none:
             b.begin_group()
             self._sel_delete()
+            b.continue_group()
         b.insert_text_typed(text)
         self._apply_to_extra("text", text)
         d.sel_on = false
@@ -1940,24 +2117,14 @@ class NythonIDE(IDEViews):
         if self.modal_open:
             return
         if f == "qi" and self.qi.visible:
-            self.qi.type_text(t)
-            self._qi_value_changed()
+            self._field_type("qi", t)
             return
         if self.menu_open >= 0 or self.ctx_open:
             return
         if f == "find":
             self._find_type(t)
-        elif f == "search":
-            self._search_type(t)
-        elif f == "scm":
-            self.scm_msg = self.scm_msg + t
-        elif f == "terminal":
-            self.term_input = self.term_input + t
-        elif f == "dbgconsole":
-            self.dbgcon_input = self.dbgcon_input + t
-        elif f == "extsearch":
-            self.ext_query = self.ext_query + t
-            self.tree_scroll = 0
+        elif self._focused_field() != "":
+            self._field_type(self._focused_field(), t)
         elif f == "workshop":
             self.workshop.handle_event(e)
         elif f == "explorer" or f == "panel":
@@ -2037,6 +2204,43 @@ class NythonIDE(IDEViews):
         if not explicit and len(self.ac_prefix) < 2:
             self.ac_open = false
             return
+        # A completion session: candidates are gathered when completion opens
+        # on a word and re-ranked (natively) as the word grows, instead of
+        # being rebuilt and fuzzy-matched in Nython on every keystroke.
+        var row = b.cursor_row
+        if not self.ac_open or self.ac_row != row or self.ac_start != st or self.ac_doc != self.doc():
+            self._ac_gather()
+            self.ac_row = row
+            self.ac_start = st
+            self.ac_doc = self.doc()
+        var idx = fuzzy_rank(self.ac_prefix, self.ac_names, 61, self.ac_bonus)
+        var out_n = []
+        var out_k = []
+        var i = 0
+        while i < len(idx) and len(out_n) < 60:
+            var nm = self.ac_names[idx[i]]
+            if nm != self.ac_prefix:
+                out_n.append(nm)
+                out_k.append(self.ac_all_kinds[idx[i]])
+            i = i + 1
+        self.ac_items = out_n
+        self.ac_kinds = out_k
+        self.ac_n = len(out_n)
+        self.ac_sel = 0
+        self.ac_top = 0
+        self.ac_open = self.ac_n > 0
+        if explicit and self.ac_n == 0:
+            self.status_msg = "No suggestions."
+
+    def _ac_kind_bonus(self, k):
+        if k == "function" or k == "method" or k == "class" or k == "variable":
+            return 5
+        if k == "keyword":
+            return 3
+        return 0
+
+    def _ac_gather(self):
+        var b = self.buf()
         var names = []
         var kinds = []
         var seen = {}
@@ -2065,38 +2269,14 @@ class NythonIDE(IDEViews):
             if r != b.cursor_row:
                 self._ac_words_of(b.get_line(r), names, kinds, seen)
             r = r + 1
-        var fz = self.qi.fuzzy
-        var scored = []
+        var bonus = []
         i = 0
-        while i < len(names):
-            if names[i] != self.ac_prefix:
-                var m = fz.match(self.ac_prefix, names[i])
-                if m[0]:
-                    scored.append([names[i], kinds[i], m[1] * 10 + self._ac_kind_bonus(kinds[i])])
+        while i < len(kinds):
+            bonus.append(self._ac_kind_bonus(kinds[i]))
             i = i + 1
-        scored = sorted(scored, key=lambda s: s[2], reverse=true)
-        var out_n = []
-        var out_k = []
-        i = 0
-        while i < len(scored) and i < 60:
-            out_n.append(scored[i][0])
-            out_k.append(scored[i][1])
-            i = i + 1
-        self.ac_items = out_n
-        self.ac_kinds = out_k
-        self.ac_n = len(out_n)
-        self.ac_sel = 0
-        self.ac_top = 0
-        self.ac_open = self.ac_n > 0
-        if explicit and self.ac_n == 0:
-            self.status_msg = "No suggestions."
-
-    def _ac_kind_bonus(self, k):
-        if k == "function" or k == "method" or k == "class" or k == "variable":
-            return 5
-        if k == "keyword":
-            return 3
-        return 0
+        self.ac_names = names
+        self.ac_all_kinds = kinds
+        self.ac_bonus = bonus
 
     def _ac_add(self, names, kinds, seen, n, k):
         if not seen.has_key(n):
@@ -2226,6 +2406,7 @@ class NythonIDE(IDEViews):
     # Work that happens on the clock rather than on an event.
     def _tick(self):
         var now = time_ms()
+        self._watch_tick(now)
         if self.job_running:
             self._poll_job()
         if self.term_proc != none and self.term_proc.running:
@@ -2247,8 +2428,10 @@ class NythonIDE(IDEViews):
                     self._write_doc(self.docs[i], self.docs[i].path)
                 i = i + 1
             self._dirty = true
-        # Re-read git status now and then, and whenever something changed it.
-        if self.ws.root != "" and (self.scm_stale or now - self.scm_poll_t > 8000):
+        # Re-read git status whenever the watcher (or an action) says it may
+        # have changed, and otherwise only rarely, as a backstop for edits to
+        # files in folders that are not expanded.
+        if self.ws.root != "" and (self.scm_stale or now - self.scm_poll_t > 60000):
             self.scm_poll_t = now
             self._scm_refresh()
         if self.scm_diff_due > 0 and now > self.scm_diff_due:

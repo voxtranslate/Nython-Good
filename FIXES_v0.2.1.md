@@ -5361,3 +5361,31 @@ Also cross-checked that every file the handoff references exists.
 | `MEMORY_NOTES.md` | writing Nython the runtime can afford |
 | `IDE_FILES.md` | which IDE file is real |
 | `tests/ide/README_HEADLESS.md` | running GUI tests without a display |
+
+---
+
+## Round 73 — the IDE to VS Code standard, verified by driving it
+
+Full account in `HANDOFF.md` §0d. The log entry, by defect:
+
+| Defect | Cause | Fix |
+|---|---|---|
+| Nothing on a click or key had ever been tested | the stub could only construct and quit the IDE | scripted/live input + frame capture in the stub; `tools/ide_driver.py`, `tools/ide_e2e.py` |
+| JSON wrong on the interpreter (unescaped, flat only), `\u` wrong on the VM | two separate hand-written codecs | `include/NyJson.hpp`, one codec for both engines |
+| `print("a", b)` printed a tuple (interpreter); tuples flattened, `sep=` broken (VM) | the call form parsed as a print statement of one tuple | parser recognises `print(...)` with `sep=`/`end=`; both engines |
+| `[[1]] == [[1]]` false, `{"a":1} == {"b":2}` true, `[1] != [1]` true (interpreter) | elements compared by printed form; maps had "length 0"; `!=` compared identity | `valuesEqual`, recursive, used by both operators |
+| `true == 1` false (VM) | no cross-type rule | bool/int/float comparisons as on the interpreter |
+| `list.pop(i)` removed the last item (VM); `insert(-1, x)` made key "-1" (interpreter) | index ignored / not normalised | both fixed, negative indices on both |
+| `map.clear()` made the map a list | `__len__` written unconditionally | lists stay lists, maps stay maps |
+| `--trace` lost the uncaught exception | RAII guard closed the file inside the `try` | guard moved outside |
+| IDE terminated on a syntax error | `launch_ide` did not catch `SyntaxError` | caught and reported with location |
+| Jobs whose output ended in `\n` never finished | `os_exec` strips trailing newlines; byte offset drifted | line-counted polling with a sentinel; subshell for `exit N` |
+| Translucent rounded fills had dark corners | corner circles overlapped the body rects | scanline fill |
+| 787 KB kept per keystroke, 3.45 KB per idle frame | literal strings and one-char strings made per evaluation; `__parent_class__` string per method call; per-key autocomplete rebuild; paint-time list literals | interning; native `fuzzy_rank`; caches keyed by line text |
+| Menus could not be switched by hovering | dismiss layer registered above the menu bar | bar re-registered above it |
+| Unhandled Quick Input keys reached the editor | no `qi` branch in focus routing | added |
+| Inputs had no caret or selection | append-only string fields | `LineEdit` for every input |
+
+New: `fuzzy_score`/`fuzzy_positions`/`fuzzy_rank`, `file_mtime`, allocation
+columns in `--profile`, `NY_PROFILE_OUT` for the IDE, `tools/sweep.py`,
+`tools/ide_lint.py`, `tools/ide_memprobe.py`, `examples/vm_audit42`–`45.ny`.

@@ -390,6 +390,10 @@ class QuickItem:
         self.boost = 0.0          # frecency bonus
         self.score = 0
         self.pos = []             # matched character positions, for bolding
+        self.pos_q = "\x01"       # the query `pos` was computed for
+        self.pos_x = []           # x offset of each matched character
+        self.pos_ch = []          # each matched character
+        self.hit = 0              # refilter generation that last matched it
         self.idx = 0
         self.group = ""           # section header drawn above this item
 
@@ -413,6 +417,12 @@ class QuickInput:
         self.strip_prefix = ""    # e.g. ">" in the command palette
         self.max_rows = 12
         self.sel_moved = false    # the user picked an item with the keyboard
+        # Ranking inputs, built once per item list (not per keystroke):
+        # labels, "folder/label" paths, and each item's frecency bonus.
+        self._labels = none
+        self._paths = none
+        self._bonus = none
+        self.gen = 0
 
     def open(self, kind, title, placeholder, items, value):
         self.visible = true
@@ -429,6 +439,7 @@ class QuickInput:
         while i < len(items):
             items[i].idx = i
             i = i + 1
+        self._labels = none
         self.value = value
         self.refilter()
 
@@ -444,7 +455,30 @@ class QuickInput:
         while i < len(items):
             items[i].idx = i
             i = i + 1
+        self._labels = none
         self.refilter()
+
+    def _index(self):
+        var labels = []
+        var paths = []
+        var bonus = []
+        var any_detail = false
+        var i = 0
+        while i < len(self.items):
+            var it = self.items[i]
+            labels.append(it.label)
+            if it.detail != "":
+                any_detail = true
+                paths.append(it.detail + "/" + it.label)
+            else:
+                paths.append(it.label)
+            bonus.append(int(it.boost * 20.0))
+            i = i + 1
+        self._labels = labels
+        self._paths = none
+        if any_detail:
+            self._paths = paths
+        self._bonus = bonus
 
     def query(self):
         var q = self.value
@@ -457,34 +491,37 @@ class QuickInput:
         self.refilter()
 
     # Empty query: items in their given order (the IDE pre-sorts by frecency).
-    # Otherwise: fuzzy-match the label, falling back to the detail (a file's
-    # folder), then rank by match score plus the frecency boost.
+    # Otherwise: items whose label matches, ranked by match score plus the
+    # frecency boost, then items that match only through their folder
+    # ("src/util" finds util.ny). Ranking is the native fuzzy_rank
+    # (include/NyFuzzy.hpp): best alignment, and nothing allocated per item.
     def refilter(self):
         var q = self.query()
         var out = []
         var i = 0
         if q == "" or self.kind == "prompt" or self.kind == "line":
             while i < len(self.items):
-                var it0 = self.items[i]
-                it0.pos = []
-                out.append(it0)
+                out.append(self.items[i])
                 i = i + 1
         else:
-            while i < len(self.items):
-                var it = self.items[i]
-                var r = self.fuzzy.match(q, it.label)
-                if r[0]:
-                    it.score = r[1] * 10 + int(it.boost * 20.0)
-                    it.pos = r[2]
-                    out.append(it)
-                elif it.detail != "":
-                    var r2 = self.fuzzy.match(q, it.detail + "/" + it.label)
-                    if r2[0]:
-                        it.score = r2[1] * 5 + int(it.boost * 20.0)
-                        it.pos = []
-                        out.append(it)
+            if self._labels == none:
+                self._index()
+            self.gen = self.gen + 1
+            var idx = fuzzy_rank(q, self._labels, 0, self._bonus)
+            while i < len(idx):
+                var it = self.items[idx[i]]
+                it.hit = self.gen
+                out.append(it)
                 i = i + 1
-            out = sorted(out, key=lambda it2: it2.score * 100000 - it2.idx, reverse=true)
+            if self._paths != none:
+                var idx2 = fuzzy_rank(q, self._paths, 0, self._bonus)
+                i = 0
+                while i < len(idx2):
+                    var it2 = self.items[idx2[i]]
+                    if it2.hit != self.gen:
+                        it2.hit = self.gen
+                        out.append(it2)
+                    i = i + 1
         self.shown = out
         self.n = len(out)
         self.sel = 0
@@ -522,6 +559,155 @@ class QuickInput:
 
     def type_text(self, t):
         self.set_value(self.value + t)
+
+
+# ─── single-line text field ───────────────────────────────────────────────────
+# A caret and an anchor over a string that lives elsewhere (each workbench
+# input keeps its value in its own attribute). Quick Input, Find/Replace,
+# Search, the SCM message, the terminal and Debug Console prompts all edit
+# through one of these, so each behaves like a VS Code input: the caret moves,
+# Shift extends, Ctrl jumps by word, and typing replaces the selection.
+#
+# `known` is the value as this field last left it. When the owner replaces the
+# value by other means (history recall, a picker filling it in) the field
+# notices on the next sync and puts the caret at the end, so no setter in the
+# IDE has to remember to reposition it.
+
+class LineEdit:
+    def __init__(self):
+        self.caret = 0
+        self.anchor = 0
+        self.known = ""
+
+    def sync(self, v):
+        if v != self.known:
+            self.caret = len(v)
+            self.anchor = self.caret
+            self.known = v
+        if self.caret > len(v):
+            self.caret = len(v)
+        if self.anchor > len(v):
+            self.anchor = len(v)
+
+    # Take `v` as the field's value; select all of it (a prompt pre-filled
+    # with a name to replace) or put the caret at the end.
+    def reset(self, v, select_all):
+        self.known = v
+        self.caret = len(v)
+        self.anchor = self.caret
+        if select_all:
+            self.anchor = 0
+
+    def select(self, v, a, b):
+        self.known = v
+        self.anchor = a
+        self.caret = b
+
+    def has_sel(self):
+        return self.caret != self.anchor
+
+    def lo(self):
+        if self.caret < self.anchor:
+            return self.caret
+        return self.anchor
+
+    def hi(self):
+        if self.caret > self.anchor:
+            return self.caret
+        return self.anchor
+
+    def selected(self, v):
+        self.sync(v)
+        return string_slice(v, self.lo(), self.hi())
+
+    def insert(self, v, t):
+        self.sync(v)
+        var a = self.lo()
+        var out = string_slice(v, 0, a) + t + string_slice(v, self.hi(), len(v))
+        self.caret = a + len(t)
+        self.anchor = self.caret
+        self.known = out
+        return out
+
+    def _is_word(self, ch):
+        return (ch >= "a" and ch <= "z") or (ch >= "A" and ch <= "Z") or (ch >= "0" and ch <= "9") or ch == "_"
+
+    def word_left(self, v, i):
+        while i > 0 and not self._is_word(string_slice(v, i - 1, i)):
+            i = i - 1
+        while i > 0 and self._is_word(string_slice(v, i - 1, i)):
+            i = i - 1
+        return i
+
+    def word_right(self, v, i):
+        var n = len(v)
+        while i < n and not self._is_word(string_slice(v, i, i + 1)):
+            i = i + 1
+        while i < n and self._is_word(string_slice(v, i, i + 1)):
+            i = i + 1
+        return i
+
+    def _move(self, p, extend):
+        self.caret = p
+        if not extend:
+            self.anchor = p
+
+    def _cut_range(self, v, a, b):
+        var out = string_slice(v, 0, a) + string_slice(v, b, len(v))
+        self.caret = a
+        self.anchor = a
+        self.known = out
+        return out
+
+    # Editing and caret keys. Returns the new value, or none when `e` is not
+    # a key a single-line field handles (Enter, Escape, Up, Down, Tab...).
+    def key(self, v, e):
+        self.sync(v)
+        var k = e.key
+        var n = len(v)
+        if k == "left":
+            if self.has_sel() and not e.shift:
+                self._move(self.lo(), false)
+            elif e.ctrl:
+                self._move(self.word_left(v, self.caret), e.shift)
+            elif self.caret > 0:
+                self._move(self.caret - 1, e.shift)
+            return v
+        if k == "right":
+            if self.has_sel() and not e.shift:
+                self._move(self.hi(), false)
+            elif e.ctrl:
+                self._move(self.word_right(v, self.caret), e.shift)
+            elif self.caret < n:
+                self._move(self.caret + 1, e.shift)
+            return v
+        if k == "home":
+            self._move(0, e.shift)
+            return v
+        if k == "end":
+            self._move(n, e.shift)
+            return v
+        if k == "backspace":
+            if self.has_sel():
+                return self._cut_range(v, self.lo(), self.hi())
+            if e.ctrl:
+                return self._cut_range(v, self.word_left(v, self.caret), self.caret)
+            if self.caret > 0:
+                return self._cut_range(v, self.caret - 1, self.caret)
+            return v
+        if k == "delete":
+            if self.has_sel():
+                return self._cut_range(v, self.lo(), self.hi())
+            if e.ctrl:
+                return self._cut_range(v, self.caret, self.word_right(v, self.caret))
+            if self.caret < n:
+                return self._cut_range(v, self.caret, self.caret + 1)
+            return v
+        if e.ctrl and not e.alt and k == "a":
+            self.anchor = 0
+            self.caret = n
+            return v
+        return none
 
 
 # ─── notifications ────────────────────────────────────────────────────────────

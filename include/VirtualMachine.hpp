@@ -38,6 +38,8 @@
 #include <functional>
 #include <unordered_set>
 #include <cerrno>
+#include "NyJson.hpp"
+#include "NyFuzzy.hpp"
 #include <random>
 
 #include "Value.hpp"
@@ -181,6 +183,11 @@ struct VMVal {
         if(type!=o.type){
             if(type==VMType::INT&&o.type==VMType::FLOAT) return (double)i==o.d;
             if(type==VMType::FLOAT&&o.type==VMType::INT) return d==(double)o.i;
+            // true == 1 and false == 0, as on the interpreter (and in Python).
+            if(type==VMType::BOOL&&o.type==VMType::INT) return (int64_t)b==o.i;
+            if(type==VMType::INT&&o.type==VMType::BOOL) return i==(int64_t)o.b;
+            if(type==VMType::BOOL&&o.type==VMType::FLOAT) return (double)b==o.d;
+            if(type==VMType::FLOAT&&o.type==VMType::BOOL) return d==(double)o.b;
             return false;
         }
         switch(type){
@@ -624,26 +631,16 @@ private:
         // Print
         case NT::PRINT: {
             auto pn=std::static_pointer_cast<nython::node::PrintNode>(nd);
-            // Flatten single-tuple arg (print("a", b) parsed as PrintNode with 1 TupleNode arg)
-            std::vector<np> flat_args;
-            for(auto& a: pn->args){
-                if(a && a->type()==NT::TUPLE){
-                    auto tn=std::static_pointer_cast<nython::node::TupleNode>(a);
-                    for(auto& e:tn->elements) flat_args.push_back(e);
-                } else flat_args.push_back(a);
-            }
-            if(!flat_args.empty()){
-                // Convert first arg to string
-                flat_args[0] ? visit(flat_args[0]) : emit_lc(VMVal::make_str(""),l);
-                // Convert to string via str() if not already string-like
-                for(size_t _pi=1;_pi<flat_args.size();_pi++){
-                    emit_lc(VMVal::make_str(" "),l);
-                    emit(Op::BINARY_ADD,0,l);
-                    visit(flat_args[_pi]);
-                    emit(Op::BINARY_ADD,0,l);
-                }
-            } else emit_lc(VMVal::make_str(""),l);
-            emit(Op::PRINT,0,l); break;
+            // Stack: the arguments, then sep and end when given. PRINT's arg
+            // packs the count with two flags; each value is formatted by the
+            // op itself (so a list or an instance prints as itself rather
+            // than going through string +).
+            int argc=0;
+            for(auto& a: pn->args){ if(a){ visit(a); argc++; } }
+            int flags=0;
+            if(pn->sep){ visit(pn->sep); flags|=1; }
+            if(pn->end){ visit(pn->end); flags|=2; }
+            emit(Op::PRINT,argc|(flags<<16)|(1<<20),l); break;
         }
 
         // Return
@@ -2486,25 +2483,35 @@ private:
             }
 
             case Op::PRINT: {
-                VMVal v=pop(); std::string out;
-                if(v.type==VMType::INSTANCE){
-                    bool found=false;
+                auto str_of=[&](const VMVal& v)->std::string{
+                    if(v.type!=VMType::INSTANCE) return v.to_string();
                     for(auto dname : {"__str__","__repr__"}){
-                        if(found) break;
                         std::string cls=v.class_name;
-                        while(!cls.empty()&&!found){
+                        while(!cls.empty()){
                             auto cit=class_reg_.find(cls);
                             if(cit==class_reg_.end()) break;
                             for(auto& sub:cit->second->sub_codes)
                                 if(sub->name==dname&&!sub->is_class){
-                                    std::vector<VMVal> na; out=exec_code(sub,na,v).to_string(); found=true; break;
+                                    std::vector<VMVal> na; return exec_code(sub,na,v).to_string();
                                 }
                             cls=cit->second->parent_class;
                         }
                     }
-                    if(!found) out=v.to_string();
-                } else out=v.to_string();
-                std::cout<<out<<"\n"; break;
+                    return v.to_string();
+                };
+                // Old single-value encoding (arg 0) or the packed call form.
+                int argc=1, flags=0;
+                if(ins.arg&(1<<20)){ argc=ins.arg&0xFFFF; flags=(ins.arg>>16)&3; }
+                std::string sep=" ", end="\n";
+                if(flags&2){ VMVal e=pop(); if(e.type!=VMType::NONE) end=str_of(e); }
+                if(flags&1){ VMVal s=pop(); if(s.type!=VMType::NONE) sep=str_of(s); }
+                std::vector<VMVal> vals(argc);
+                for(int i=argc-1;i>=0;--i) vals[i]=pop();
+                std::string out;
+                for(int i=0;i<argc;++i){ if(i) out+=sep; out+=str_of(vals[i]); }
+                std::cout<<out<<end;
+                if(end!="\n") std::cout.flush();
+                break;
             }
             case Op::IMPORT_NAME: vm_import(fr.code->names[ins.arg]); break;
 
@@ -4529,91 +4536,87 @@ private:
     }
 
     void register_json_builtins() {
-        // JSON encoder: VMVal → JSON string
+        // JSON: the codec shared with the interpreter (include/NyJson.hpp), so
+        // both engines escape, format numbers and decode identically.
         globals_["json_encode"]=globals_["json_stringify"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             if(a.empty()) return VMVal::make_str("null");
-            std::function<std::string(const VMVal&)> enc;
-            enc=[&](const VMVal& v)->std::string{
-                if(v.type==VMType::NONE) return "null";
-                if(v.type==VMType::BOOL) return v.b?"true":"false";
-                if(v.type==VMType::INT) return std::to_string(v.i);
-                if(v.type==VMType::FLOAT){
-                    std::ostringstream os; os<<v.d; return os.str();}
-                if(v.type==VMType::STRING){
-                    std::string r="\""; for(char c:v.s){
-                        if(c=='"') r+="\\\""; else if(c=='\\') r+="\\\\";
-                        else if(c=='\n') r+="\\n"; else if(c=='\t') r+="\\t";
-                        else r+=c;} r+="\""; return r;}
+            std::function<void(const VMVal&, std::string&, int)> enc;
+            enc=[&](const VMVal& v, std::string& out, int depth){
+                if(depth>200){ out+="null"; return; }
+                if(v.type==VMType::NONE){ out+="null"; return; }
+                if(v.type==VMType::BOOL){ out+=v.b?"true":"false"; return; }
+                if(v.type==VMType::INT){ out+=std::to_string(v.i); return; }
+                if(v.type==VMType::FLOAT){ out+=nyjson::number(v.d); return; }
+                if(v.type==VMType::STRING){ nyjson::quote_to(out, v.s); return; }
                 if(v.type==VMType::LIST&&v.list){
-                    std::string r="["; bool f=true;
-                    for(auto& e:*v.list){if(!f)r+=", ";r+=enc(e);f=false;}
-                    return r+"]";}
+                    out+="["; bool f=true;
+                    for(auto& e:*v.list){ if(!f) out+=", "; enc(e,out,depth+1); f=false; }
+                    out+="]"; return; }
                 if((v.type==VMType::MAP||v.type==VMType::INSTANCE)&&v.map){
-                    std::string r="{"; bool f=true;
-                    for(auto& [k,mv]:*v.map){
-                        if(mv.type==VMType::NONE) continue;
-                        if(!f)r+=", "; r+="\""+k+"\": "+enc(mv); f=false;}
-                    return r+"}";}
-                return "null";};
-            return VMVal::make_str(enc(a[0]));});
+                    std::vector<std::string> keys;
+                    for(auto& kv:*v.map){
+                        const std::string& k=kv.first;
+                        if(k=="__len__"||k=="__type__"||k=="__name__"||k=="__class__") continue;
+                        keys.push_back(k); }
+                    std::sort(keys.begin(),keys.end());
+                    out+="{"; bool f=true;
+                    for(auto& k:keys){
+                        if(!f) out+=", ";
+                        nyjson::quote_to(out,k); out+=": ";
+                        enc(v.map->find(k)->second,out,depth+1); f=false; }
+                    out+="}"; return; }
+                out+="null"; };
+            std::string out;
+            enc(a[0],out,0);
+            return VMVal::make_str(out);});
 
-        // JSON decoder: JSON string → VMVal
+        // fuzzy_score / fuzzy_positions / fuzzy_rank: include/NyFuzzy.hpp, the
+        // same matcher as the interpreter.
+        globals_["fuzzy_score"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
+            if(a.size()<2||a[0].type!=VMType::STRING||a[1].type!=VMType::STRING) return VMVal::make_none();
+            int sc=0;
+            if(!nyfuzzy::score(a[0].s,a[1].s,sc)) return VMVal::make_none();
+            return VMVal::make_int(sc);});
+        globals_["fuzzy_positions"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
+            if(a.size()<2||a[0].type!=VMType::STRING||a[1].type!=VMType::STRING) return VMVal::make_none();
+            int sc=0; std::vector<int> pos;
+            if(!nyfuzzy::score(a[0].s,a[1].s,sc,&pos)) return VMVal::make_none();
+            std::vector<VMVal> out; for(int p:pos) out.push_back(VMVal::make_int(p));
+            return VMVal::make_list(std::move(out));});
+        globals_["fuzzy_rank"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
+            if(a.size()<2||a[0].type!=VMType::STRING||a[1].type!=VMType::LIST||!a[1].list) return VMVal::make_none();
+            std::vector<std::string> texts;
+            for(auto& v:*a[1].list) texts.push_back(v.type==VMType::STRING?v.s:v.to_string());
+            size_t limit=0;
+            if(a.size()>2&&a[2].type==VMType::INT&&a[2].i>0) limit=(size_t)a[2].i;
+            std::vector<long long> bonus; bool hb=a.size()>3&&a[3].type==VMType::LIST&&a[3].list;
+            if(hb) for(auto& v:*a[3].list) bonus.push_back(v.type==VMType::INT?v.i:(v.type==VMType::FLOAT?(long long)v.d:0));
+            auto idx=nyfuzzy::rank(a[0].s,texts,hb?&bonus:nullptr,limit);
+            std::vector<VMVal> out; for(int k:idx) out.push_back(VMVal::make_int(k));
+            return VMVal::make_list(std::move(out));});
+
         auto json_parse_fn = [](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()) return VMVal::make_none();
-            std::string js=a[0].s;
-            struct P{
-                const std::string& s; size_t i=0;
-                void ws(){while(i<s.size()&&isspace((unsigned char)s[i]))i++;}
-                VMVal parse(){
-                    ws();
-                    if(i>=s.size()) return VMVal::make_none();
-                    char c=s[i];
-                    if(c=='"') return parse_str();
-                    if(c=='{') return parse_obj();
-                    if(c=='[') return parse_arr();
-                    if(c=='t'){i+=4;return VMVal::make_bool(true);}
-                    if(c=='f'){i+=5;return VMVal::make_bool(false);}
-                    if(c=='n'){i+=4;return VMVal::make_none();}
-                    return parse_num();
+            if(a.empty()||a[0].type!=VMType::STRING) return VMVal::make_none();
+            nyjson::Node root; std::string err;
+            if(!nyjson::parse(a[0].s,root,err)) return VMVal::make_none();
+            std::function<VMVal(const nyjson::Node&)> conv=[&](const nyjson::Node& n)->VMVal{
+                switch(n.kind){
+                    case nyjson::Node::Null: return VMVal::make_none();
+                    case nyjson::Node::Bool: return VMVal::make_bool(n.b);
+                    case nyjson::Node::Int: return VMVal::make_int(n.i);
+                    case nyjson::Node::Float: return VMVal::make_float(n.d);
+                    case nyjson::Node::Str: return VMVal::make_str(n.s);
+                    case nyjson::Node::Arr: {
+                        std::vector<VMVal> lst; lst.reserve(n.items.size());
+                        for(auto& it:n.items) lst.push_back(conv(it));
+                        return VMVal::make_list(std::move(lst)); }
+                    case nyjson::Node::Obj: {
+                        auto m=VMVal::make_map();
+                        for(auto& f:n.fields) (*m.map)[f.first]=conv(f.second);
+                        return m; }
                 }
-                VMVal parse_str(){
-                    i++; std::string r;
-                    while(i<s.size()&&s[i]!='"'){
-                        if(s[i]=='\\'&&i+1<s.size()){i++;
-                            if(s[i]=='n')r+='\n'; else if(s[i]=='t')r+='\t';
-                            else r+=s[i];}
-                        else r+=s[i]; i++;}
-                    i++; return VMVal::make_str(r);}
-                VMVal parse_obj(){
-                    i++; auto m=VMVal::make_map(); ws();
-                    while(i<s.size()&&s[i]!='}'){
-                        ws(); if(s[i]==','){i++;ws();continue;}
-                        if(s[i]=='}') break;
-                        auto k=parse_str(); ws();
-                        if(i<s.size()&&s[i]==':') i++;
-                        auto v=parse(); ws();
-                        (*m.map)[k.s]=v;}
-                    if(i<s.size()) i++;
-                    return m;}
-                VMVal parse_arr(){
-                    i++; std::vector<VMVal> lst; ws();
-                    while(i<s.size()&&s[i]!=']'){
-                        if(s[i]==','){i++;ws();continue;}
-                        lst.push_back(parse()); ws();}
-                    if(i<s.size()) i++;
-                    return VMVal::make_list(std::move(lst));}
-                VMVal parse_num(){
-                    size_t start=i; bool is_f=false;
-                    if(i<s.size()&&s[i]=='-') i++;
-                    while(i<s.size()&&(isdigit((unsigned char)s[i])||s[i]=='.'||s[i]=='e'||s[i]=='E'||s[i]=='+'||s[i]=='-')){
-                        if(s[i]=='.'||s[i]=='e'||s[i]=='E') is_f=true; i++;}
-                    std::string ns=s.substr(start,i-start);
-                    if(is_f) try{return VMVal::make_float(std::stod(ns));}catch(...){}
-                    try{return VMVal::make_int(std::stoll(ns));}catch(...){}
-                    return VMVal::make_str(ns);}
-            };
-            P parser{js};
-            return parser.parse();
+                return VMVal::make_none(); };
+            return conv(root);
         };
         globals_["json_decode"]=globals_["json_parse"]=VMVal::make_native(json_parse_fn);
     }
@@ -4816,7 +4819,14 @@ private:
                 }
                 return acc;
             }
-            if(m=="pop"){if(lst.empty())return VMVal::make_none();VMVal v=lst.back();lst.pop_back();return v;}
+            if(m=="pop"){
+                // pop(i) removes index i (negative counts from the end); the
+                // index used to be ignored, so pop(0) removed the LAST item.
+                if(lst.empty())return VMVal::make_none();
+                int64_t i=(int64_t)lst.size()-1;
+                if(!a.empty()&&a[0].type==VMType::INT){i=a[0].i;if(i<0)i+=(int64_t)lst.size();}
+                if(i<0||i>=(int64_t)lst.size())return VMVal::make_none();
+                VMVal v=lst[(size_t)i];lst.erase(lst.begin()+i);return v;}
             if(m=="insert"){
                 if(a.size()>=2){int64_t i=a[0].i;if(i<0)i+=(int64_t)lst.size();
                 i=std::max((int64_t)0,std::min((int64_t)lst.size(),i));

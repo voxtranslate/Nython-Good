@@ -242,13 +242,16 @@ class GitRepo:
         var probe = string_strip(os_exec("git -C " + self._q(self.root) + " cat-file -t " + self._q("HEAD:" + rel) + " 2>/dev/null"))
         var lines = none
         if probe == "blob":
-            var text = os_exec("git -C " + self._q(self.root) + " show " + self._q("HEAD:" + rel) + " 2>/dev/null")
+            # "; printf x" keeps the file's trailing newline, which os_exec
+            # would strip: the editor shows a file ending in "\n" with an
+            # empty last line, and so must the HEAD version it is diffed
+            # against, or that line reads as added.
+            var text = os_exec("git -C " + self._q(self.root) + " show " + self._q("HEAD:" + rel) + " 2>/dev/null; printf x")
             if text == none:
-                text = ""
+                text = "x"
+            text = string_slice(text, 0, len(text) - 1)
             text = string_replace(text, "\r\n", "\n")
             lines = string_split(text, "\n")
-            if len(lines) > 1 and lines[len(lines) - 1] == "":
-                lines.pop()
         self.head_cache[key] = lines
         return lines
 

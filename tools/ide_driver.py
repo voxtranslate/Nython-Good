@@ -20,6 +20,7 @@ Locating things by their label (Frame.find) rather than by coordinates means a
 test keeps working when the layout moves, and fails when the label vanishes -
 which is exactly when a person could no longer find it either.
 """
+import json
 import os
 import shutil
 import subprocess
@@ -58,6 +59,10 @@ class IDE:
         env = dict(os.environ)
         env.pop("NY_STUB_AUTOQUIT", None)
         env["NY_STUB_EVENTS"] = self.events
+        self.state_path = os.path.join(self.tmp, "state.json")
+        self.hitmap_path = os.path.join(self.tmp, "hitmap.tsv")
+        env["NY_IDE_STATE"] = self.state_path
+        env["NY_IDE_DUMP"] = self.hitmap_path
         env.update(self.extra_env)
         self.log_path = os.path.join(self.tmp, "ide.log")
         self._log = open(self.log_path, "w")
@@ -170,6 +175,43 @@ class IDE:
         fr = self.snap() if fresh or self.last is None else self.last
         fr.render(out_png, root=self.cwd)
         return out_png
+
+    def _await_file(self, path, timeout):
+        t0 = time.time()
+        while not os.path.exists(path):
+            if self.proc.poll() is not None:
+                raise DriverError("IDE exited (code %s). Log tail:\n%s"
+                                  % (self.proc.returncode, self.log()[-3000:]))
+            if time.time() - t0 > timeout:
+                raise DriverError("timed out waiting for %s. Log tail:\n%s" % (path, self.log()[-3000:]))
+            time.sleep(0.02)
+
+    def state(self, timeout=30):
+        """What the IDE believes (developer.dumpState, Ctrl+Shift+Alt+J)."""
+        if os.path.exists(self.state_path):
+            os.remove(self.state_path)
+        self.wait(2)
+        self.key("ctrl+shift+alt+j")
+        self._await_file(self.state_path, timeout)
+        with open(self.state_path, errors="replace") as f:
+            return json.load(f)
+
+    def hitmap(self, timeout=30):
+        """Every clickable region of the last frame: [(x, y, w, h, cmd, arg, tip)]."""
+        if os.path.exists(self.hitmap_path):
+            os.remove(self.hitmap_path)
+        self.wait(2)
+        self.key("ctrl+shift+alt+d")
+        self._await_file(self.hitmap_path, timeout)
+        time.sleep(0.05)
+        out = []
+        with open(self.hitmap_path, errors="replace") as f:
+            for ln in f:
+                p = ln.rstrip("\n").split("\t")
+                if len(p) >= 5 and p[0].lstrip("-").isdigit():
+                    out.append((int(p[0]), int(p[1]), int(p[2]), int(p[3]), p[4],
+                                p[5] if len(p) > 5 else "", p[6] if len(p) > 6 else ""))
+        return out
 
     # ── by-label interaction ──────────────────────────────────────────────
     def find(self, text, exact=True, region=None, nth=0, fresh=True, font=None):

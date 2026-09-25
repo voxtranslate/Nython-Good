@@ -42,6 +42,10 @@ class Doc:
         self.diff = none          # SCM gutter decorations, lib/ide_scm.ny
         self.diff_state = -1      # buffer state the decorations were computed for
         self.problem_stamp = -1
+        self.mtime = -1            # file_mtime when last read or written
+        self.disk_changed = false  # changed on disk while it had unsaved edits
+        self.tab_size = 4          # per file, as in VS Code (detected on open)
+        self.insert_spaces = true
         if buf != none:
             buf.coalesce = true
 
@@ -73,6 +77,7 @@ class IDECore:
         var d = self.docs[i]
         if d.buf != none:
             d.buf.begin_group()
+            self._sync_indent(d)
         self.ac_open = false
         self.hover_info = ""
         self._clear_extra_carets()
@@ -89,6 +94,8 @@ class IDECore:
         return -1
 
     def _add_doc(self, d):
+        d.tab_size = self.default_tab_size
+        d.insert_spaces = self.default_insert_spaces
         # A pristine Welcome tab is replaced by the first real editor, as in
         # VS Code, rather than accumulating beside it.
         if len(self.docs) == 1 and self.docs[0].kind == "welcome" and d.kind != "welcome":
@@ -145,7 +152,10 @@ class IDECore:
             var d = Doc("file", os_path_basename(p), p, EditorBuffer(os_path_basename(p), text))
             d.bom = bom
             d.lang = self._lang_for(p)
+            d.mtime = file_mtime(p)
             i = self._add_doc(d)
+            if self.detect_indent:
+                self._detect_indent(d, false)
             self._remember_recent(p)
             self._check_file(d)
         else:
@@ -190,6 +200,15 @@ class IDECore:
         if d.kind == "untitled" or d.path == "":
             self._prompt_save_as(d, "")
             return false
+        # Someone else wrote the file since we read it: VS Code refuses to
+        # overwrite silently and asks.
+        var disk = file_mtime(d.path)
+        if d.mtime >= 0 and disk >= 0 and disk != d.mtime:
+            self._modal("Failed to save '" + d.title + "': The content of the file is newer.",
+                        "Compare your version with the file on disk, or overwrite it with your changes.",
+                        [["Overwrite", "@save.overwrite", self._index_of(d)], ["Revert", "@save.revert", self._index_of(d)],
+                         ["Cancel", "@modal.cancel", ""]])
+            return false
         return self._write_doc(d, d.path)
 
     def _write_doc(self, d, path):
@@ -206,6 +225,8 @@ class IDECore:
         d.title = os_path_basename(path)
         d.buf.name = d.title
         d.buf.mark_saved()
+        d.mtime = file_mtime(path)
+        d.disk_changed = false
         if was_untitled:
             d.lang = self._lang_for(path)
         self._remember_recent(path)
@@ -258,16 +279,44 @@ class IDECore:
         if d.kind != "file":
             self._notify("Only files on disk can be reverted", "warn")
             return
+        if self._reload_from_disk(d):
+            self._notify("Reverted " + d.title, "info")
+
+    # Replaces a file editor's buffer with the file's current content,
+    # keeping the caret and scroll position where they were (clamped).
+    def _reload_from_disk(self, d):
         var text = read_file(d.path)
         if text == none:
-            return
+            return false
+        var bom = false
         if string_startswith(text, "\xef\xbb\xbf"):
+            bom = true
             text = string_slice(text, 3, len(text))
+        var row = 0
+        var col = 0
+        if d.buf != none:
+            row = d.buf.cursor_row
+            col = d.buf.cursor_col
         d.buf = EditorBuffer(d.title, text)
         d.buf.coalesce = true
+        d.bom = bom
+        if row >= d.buf.line_count:
+            row = d.buf.line_count - 1
+        d.buf.cursor_row = row
+        var n = len(d.buf.get_line(row))
+        if col > n:
+            col = n
+        d.buf.cursor_col = col
         d.sel_on = false
+        d.mtime = file_mtime(d.path)
+        d.disk_changed = false
+        d.diff = none
+        self._sync_indent(d)
         self._hl_reset()
-        self._notify("Reverted " + d.title, "info")
+        if d == self.doc():
+            self._clear_extra_carets()
+        self._dirty = true
+        return true
 
     # ── closing ──────────────────────────────────────────────────────────────
     # A dirty editor asks first: Save / Don't Save / Cancel, exactly the three
@@ -523,7 +572,12 @@ class IDECore:
         c._cmd("copyRelativeFilePath", "File", "Copy Relative Path", "Ctrl+K Ctrl+Shift+Alt+C", "")
         c._cmd("workbench.files.action.showActiveFileInExplorer", "File", "Reveal Active File in Explorer View", "", "")
         # Status bar pickers
-        c._cmd("editor.action.indentationToSpaces", "Editor", "Change Indentation", "", "")
+        c._cmd("changeEditorIndentation", "Editor", "Change Indentation...", "", "")
+        c._cmd("editor.action.indentUsingSpaces", "Editor", "Indent Using Spaces", "", "")
+        c._cmd("editor.action.indentUsingTabs", "Editor", "Indent Using Tabs", "", "")
+        c._cmd("editor.action.detectIndentation", "Editor", "Detect Indentation from Content", "", "")
+        c._cmd("editor.action.indentationToSpaces", "Editor", "Convert Indentation to Spaces", "", "")
+        c._cmd("editor.action.indentationToTabs", "Editor", "Convert Indentation to Tabs", "", "")
         c._cmd("workbench.action.editor.changeEOL", "Editor", "Change End of Line Sequence", "", "")
         c._cmd("workbench.action.editor.changeEncoding", "Editor", "Change File Encoding", "", "")
         c._cmd("workbench.action.editor.changeLanguageMode", "Editor", "Change Language Mode", "Ctrl+K M", "")
@@ -538,6 +592,7 @@ class IDECore:
         c._cmd("workbench.action.keybindingsReference", "Help", "Keyboard Shortcuts Reference", "Ctrl+K Ctrl+R", "")
         c._cmd("nython.about", "Help", "About", "", "")
         c._cmd("developer.dumpHitMap", "Developer", "Dump Clickable Regions", "Ctrl+Shift+Alt+D", "")
+        c._cmd("developer.dumpState", "Developer", "Dump Workbench State", "Ctrl+Shift+Alt+J", "")
 
         self.menus = ["File", "Edit", "Selection", "View", "Go", "Run", "Terminal", "Help"]
         self.menu_items = {
@@ -615,8 +670,6 @@ class IDECore:
     # when the id was recognised; an unknown id reports itself instead of
     # silently doing nothing (the old palette's failure mode).
     def _exec(self, id, arg):
-        if self.reg.has(id):
-            self.frecency.touch(id, time_ms())
         self._dirty = true
         # ── File ──
         if id == "workbench.action.files.newUntitledFile":
@@ -711,14 +764,18 @@ class IDECore:
             self._show_view("search")
             self.search_replace_open = false
             self.focus = "search"
+            self.search_field = 0
             var w = self._selected_word()
-            if w != "" and self.search_query == "":
+            if w != "" and w != self.search_query:
                 self.search_query = w
                 self._run_search()
+            self._le("search0").reset(self.search_query, true)
         elif id == "workbench.action.replaceInFiles":
             self._show_view("search")
             self.search_replace_open = true
             self.focus = "search"
+            self.search_field = 0
+            self._le("search0").reset(self.search_query, true)
         elif id == "editor.action.commentLine":
             self._toggle_comment()
         # ── Selection ──
@@ -890,6 +947,7 @@ class IDECore:
         elif id == "workbench.debug.viewlet.action.removeAllBreakpoints":
             self.breaks = {}
             self.break_list = []
+            self.brk_gen = self.brk_gen + 1
             self._notify("All breakpoints removed", "info")
         # ── Terminal ──
         elif id == "workbench.action.terminal.new":
@@ -934,8 +992,19 @@ class IDECore:
         elif id == "workbench.files.action.showActiveFileInExplorer":
             self._reveal_in_explorer(self._arg_path(arg))
         # ── Status bar pickers ──
-        elif id == "editor.action.indentationToSpaces":
+        elif id == "changeEditorIndentation":
             self._indent_picker()
+        elif id == "editor.action.indentUsingSpaces":
+            self._indent_size_picker("spaces")
+        elif id == "editor.action.indentUsingTabs":
+            self._indent_size_picker("tabs")
+        elif id == "editor.action.detectIndentation":
+            if self._is_text():
+                self._detect_indent(self.doc(), true)
+        elif id == "editor.action.indentationToSpaces":
+            self._convert_indent(false)
+        elif id == "editor.action.indentationToTabs":
+            self._convert_indent(true)
         elif id == "workbench.action.editor.changeEOL":
             self._eol_picker()
         elif id == "workbench.action.editor.changeEncoding":
@@ -965,6 +1034,8 @@ class IDECore:
             self._about()
         elif id == "developer.dumpHitMap":
             self._dump_hitmap()
+        elif id == "developer.dumpState":
+            self._dump_state()
         else:
             self._notify("Command '" + id + "' is not available", "warn")
             return false
@@ -1002,10 +1073,14 @@ class IDECore:
 
     def _hl_reset(self):
         self._hl_cache = {}
+        self._diff_cache = {}
         self._hl_cache_n = 0
 
+    # The highlight cache is keyed by a line's text, so an edit leaves every
+    # unchanged line's entry valid; it is not cleared here. (Clearing it on
+    # every keystroke re-tokenised every visible line per key, and on the
+    # interpreter those segment lists are never reclaimed.)
     def _after_edit(self):
-        self._hl_reset()
         self._dirty = true
         self._title_dirty = true
         self.scm_diff_due = time_ms() + 400
@@ -1133,21 +1208,31 @@ class IDECore:
             i = i + 1
         if not any_text:
             return
-        b.push_snapshot()
+        var crow = b.cursor_row
+        var ccol = b.cursor_col
+        var was = b.open_group()
         i = sp[0]
         while i <= sp[1]:
             var line2 = b.get_line(i)
             if string_strip(line2) != "":
                 if all_commented:
                     var at = string_find(line2, "#")
-                    var rest = string_slice(line2, at + 1, len(line2))
-                    if string_startswith(rest, " "):
-                        rest = string_slice(rest, 1, len(rest))
-                    b.lines[i] = string_slice(line2, 0, at) + rest
+                    var k = 1
+                    if string_slice(line2, at + 1, at + 2) == " ":
+                        k = 2
+                    b.delete_range(i, at, i, at + k)
+                    if i == crow and ccol > at:
+                        ccol = ccol - k
+                        if ccol < at:
+                            ccol = at
                 else:
-                    b.lines[i] = string_slice(line2, 0, min_ind) + "# " + string_slice(line2, min_ind, len(line2))
+                    b.insert_at(i, min_ind, "# ")
+                    if i == crow and ccol >= min_ind:
+                        ccol = ccol + 2
             i = i + 1
-        b.cursor_col = self._clamp_col(b.cursor_row, b.cursor_col)
+        b.close_group(was)
+        b.cursor_row = crow
+        b.cursor_col = self._clamp_col(crow, ccol)
         self._after_edit()
 
     def _clamp_col(self, row, col):
@@ -1192,23 +1277,22 @@ class IDECore:
             return
         if dir > 0 and sp[1] >= b.line_count - 1:
             return
-        b.push_snapshot()
         var d = self.doc()
+        var crow = b.cursor_row
+        var ccol = b.cursor_col
+        var was = b.open_group()
         if dir < 0:
-            var above = b.lines[sp[0] - 1]
-            var i = sp[0]
-            while i <= sp[1]:
-                b.lines[i - 1] = b.lines[i]
-                i = i + 1
-            b.lines[sp[1]] = above
+            # The line above the block moves below it.
+            var above = b.get_line(sp[0] - 1)
+            b.delete_range(sp[0] - 1, 0, sp[0], 0)
+            b.insert_at(sp[1] - 1, len(b.get_line(sp[1] - 1)), "\n" + above)
         else:
-            var below = b.lines[sp[1] + 1]
-            var j = sp[1]
-            while j >= sp[0]:
-                b.lines[j + 1] = b.lines[j]
-                j = j - 1
-            b.lines[sp[0]] = below
-        b.cursor_row = b.cursor_row + dir
+            var below = b.get_line(sp[1] + 1)
+            b.delete_range(sp[1], len(b.get_line(sp[1])), sp[1] + 1, len(below))
+            b.insert_at(sp[0], 0, below + "\n")
+        b.close_group(was)
+        b.cursor_row = crow + dir
+        b.cursor_col = self._clamp_col(crow + dir, ccol)
         if d.sel_on:
             d.sel_row = d.sel_row + dir
         self._after_edit()
@@ -1281,12 +1365,59 @@ class IDECore:
         self._after_edit()
 
     def _indent_unit(self):
-        var s = ""
-        var i = 0
-        while i < self.tab_size:
-            s = s + " "
-            i = i + 1
-        return s
+        if not self.insert_spaces:
+            return "\t"
+        return " " * self.tab_size
+
+    # The active editor's indentation becomes the workbench's (rendering of
+    # tabs, Tab/Backspace, auto-indent all read tab_size / insert_spaces).
+    def _sync_indent(self, d):
+        if d.buf != none:
+            if d.insert_spaces:
+                d.buf.indent_unit = " " * d.tab_size
+            else:
+                d.buf.indent_unit = "\t"
+        if self.tab_size != d.tab_size or self.insert_spaces != d.insert_spaces:
+            self.tab_size = d.tab_size
+            self.insert_spaces = d.insert_spaces
+            self._hl_reset()
+            self._status_cache_key = ""
+
+    def _detect_indent(self, d, announce):
+        if d.buf == none:
+            return
+        var g = detect_indentation(d.buf)
+        if g == none:
+            if announce:
+                self._notify("Nothing indented to detect from; keeping " + self._indent_label(d), "info")
+            return
+        d.insert_spaces = g[0]
+        if g[1] > 0:
+            d.tab_size = g[1]
+        if d == self.doc():
+            self._sync_indent(d)
+        if announce:
+            self._notify("Detected " + self._indent_label(d), "info")
+
+    def _indent_label(self, d):
+        if d.insert_spaces:
+            return "Spaces: " + str(d.tab_size)
+        return "Tab Size: " + str(d.tab_size)
+
+    def _convert_indent(self, to_tabs):
+        if not self._can_edit():
+            return
+        var d = self.doc()
+        d.buf.begin_group()
+        var n = d.buf.convert_indentation(to_tabs, d.tab_size)
+        d.buf.begin_group()
+        d.insert_spaces = not to_tabs
+        self._sync_indent(d)
+        self._after_edit()
+        var what = "spaces"
+        if to_tabs:
+            what = "tabs"
+        self._notify("Converted " + str(n) + " line(s) to " + what, "info")
 
     # ── clipboard ────────────────────────────────────────────────────────────
     # Copy with no selection copies the whole line, and pasting such a copy

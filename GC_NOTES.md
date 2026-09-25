@@ -108,3 +108,30 @@ garbage in the first place: in-place `append` instead of `x = x + [y]`
 (measured 860x faster, 2400x less memory at 4,000 elements), and operation logs
 instead of state snapshots for history (measured 373 MB -> 56 MB for 400 edits).
 Those are workarounds. This document is the fix.
+
+## Round 73: garbage the interpreter no longer makes
+
+Strings are immutable and, like containers, never freed (`string_store`). Three
+sources of *pointless* strings were removed, safely — nothing's lifetime changes,
+the same value is simply handed out again instead of a fresh copy:
+
+- **String literals** are made once per AST node (`StringNode::interned`), not
+  on every evaluation. A 200,000-iteration loop comparing against two literals:
+  48 MB → 10 MB.
+- **The empty string and the 256 one-byte strings** are made once
+  (`small_strs_`), so character loops (`line[i:i+1]`, `string_lower(ch)`) stop
+  leaving one string per character examined: 28 MB → 10 MB on a 100,000-step
+  scan.
+- **`__parent_class__`**, bound on every method call of a subclass, is interned
+  (`internString`) instead of being a new string per call.
+
+To find the next one, `--profile` now reports, per function, the heap objects
+still alive and the strings made by its own statements (`self_objects`,
+`self_strings`, `self_string_bytes`; `NY_PROFILE_SORT=alloc` sorts by them), and
+`NY_PROFILE_OUT=file nython --ide` does the same for the IDE. The object count is
+created-minus-destroyed, so call frames that are reaped do not show up.
+
+In the IDE this took typing from 787 KB to ~40 KB kept per keystroke and idle
+repainting from 3.45 KB per frame to zero (`tools/ide_memprobe.py`). The
+collector itself is still unwired; everything above is about not creating
+garbage, not about reclaiming it.

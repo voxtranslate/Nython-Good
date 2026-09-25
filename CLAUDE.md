@@ -51,11 +51,22 @@ nython/
 │   ├── nytorch.ny            ← ML framework entry point
 │   ├── nytorch/              ← 17 nytorch sub-modules
 │   └── ...                   ← network.ny, thread.ny, os.ny, etc.
-├── nython_ide.ny             ← THE SHIPPED IDE (v4, ~3,700 lines) ← --ide loads this
-├── ide_editor.ny             ← editor buffer used by the shipped IDE
+├── nython_ide.ny             ← THE SHIPPED IDE ← --ide loads this. One class,
+│                                NythonIDE, split across a chain of files:
+├── ide_core.ny               ←   documents, command registry, _exec dispatcher
+├── ide_ops.ny                ←   jobs, find, Quick Input, run, settings, watcher
+├── ide_paint.ny              ←   theme + every painter (allocation-free)
+├── ide_views.ny              ←   Explorer/Search/SCM/Debug/Extensions/Outline/AI
+├── ide_editor.ny             ← EditorBuffer, SyntaxHighlighter
 ├── ide_icons.ny              ← icon set: Codicon glyphs, vector fallback
 ├── ide_project.ny            ← workspace / project model
 ├── ide_workshop.ny           ← language workshop panel
+├── lib/ide_workbench.ny      ← CommandRegistry, HitMap, QuickInput, LineEdit, ...
+├── lib/ide_scm.ny            ← GitRepo + LineDiff (Myers) for Source Control
+├── lib/ide_debugger.ny       ← record-and-replay debugger over `--trace`
+├── tools/                    ← ide_driver.py / ide_e2e.py (drive the real IDE
+│                                headlessly), ide_lint.py, ide_memprobe.py,
+│                                nyshot.py (frame capture → PNG), sweep.py
 ├── assets/fonts/codicon.ttf  ← VS Code icon font (CC BY 4.0, licence beside it)
 ├── examples/nython_ide.ny    ← a v3 DEMO, not shipped — see IDE_FILES.md
 ├── examples/                 ← 356 example scripts
@@ -250,6 +261,11 @@ These were aligned to match how the IDE calls them:
 | test_nytorch15 | 184 | ML cognitive |
 | test_nytorch16 | 153 | ML pipeline |
 | test_nytorch17 | 199 | ML device-agnostic |
+| vm_audit42 | 73 | IDE workbench model: registry, chords, when-clauses, QuickInput, LineEdit |
+| vm_audit43 | 52 | EditorBuffer undo groups/indentation/final newline, LineDiff, GitRepo |
+| vm_audit44 | 46 | record-and-replay debugger, including a real `--trace` recording |
+| vm_audit45 | 45 | JSON codec, print call form, list pop/insert, deep equality, file_mtime |
+| tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `for t in examples/test_*.ny examples/vm_audit*.ny; do ./build/nython-cli "$t"; done`
 
@@ -300,11 +316,20 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
 | `--profile` | real per-function counts and self/total time |
 | `gui_hash_id` | native FNV-1a for immediate-mode widget identity |
 | `gui_display_scale` | HiDPI content scale |
+| `print(a, b, sep=, end=)` | the call form, both engines (round 73) |
+| `fuzzy_score` / `fuzzy_positions` / `fuzzy_rank` | best-alignment fuzzy matching, native, both engines |
+| `file_mtime(path)` | ms since epoch, -1 if missing (folders too) |
+| `--trace OUT file.ny` | statement-level recording for the IDE's debugger |
+| `--profile` allocations | per function: objects and strings kept (`NY_PROFILE_SORT=alloc`); `NY_PROFILE_OUT=f nython --ide` profiles the IDE |
 
 ### Known limitations
 
 - **Containers are never reclaimed by the interpreter** — see `GC_NOTES.md`.
-  The VM does not have this problem (it uses `shared_ptr`).
+  The VM does not have this problem (it uses `shared_ptr`). Round 73 removed
+  the biggest *avoidable* sources: string literals, one-byte strings and the
+  per-method-call parent-class name are now made once and shared (a loop
+  with two literals: 48 MB → 10 MB at 200k iterations).
+- The VM has no tuple type: `print((1, 2))` shows `[1, 2]` there.
 - `len()` counts characters but `s[i]` / `s[a:b]` index bytes.
 - `1.+(2, 3)` parses but evaluates to `none` — primitives have no members.
 - ~~Integer `/` differs between engines~~ — **resolved (round 71)**: `/` is
@@ -329,7 +354,11 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
 4. Reproduce a defect minimally, trace it to source, fix **both engines
    together**, and add a test asserting values rather than termination.
 5. Re-run the sweep and compare divergence *sets* against
-   `/tmp/obuild/nython_orig`, not counts.
+   `/tmp/obuild/nython_orig`, not counts:
+   `python3 tools/sweep.py --base /tmp/obuild/nython_orig` does both engines
+   and prints regressions and fixes as sets. For IDE changes also run
+   `python3 tools/ide_lint.py`, `python3 tools/ide_e2e.py` and
+   `python3 tools/ide_memprobe.py --check`.
 6. Package to `/mnt/user-data/outputs/`.
 7. State plainly what was not done. A green suite that hides an unadopted module
    or a one-engine feature is worse than an honest gap.
@@ -512,6 +541,39 @@ zero-initialized bias) turned out not to be a bug — confirmed by printing
 the pre-activations and by re-checking with inputs that avoid that one
 coincidental point, which alone resolved it. See `HANDOFF.md` §0c for
 the full trace.
+
+## Round 73: the IDE to VS Code standard, verified by driving it
+
+The shipped IDE was rewritten around VS Code's model and then exercised end to
+end by a headless driver, which found and fixed real defects in the IDE, the
+runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
+
+- **IDE**: command registry (~150 VS Code ids, chords, when-clauses) behind
+  menus, palette, context menus, status bar and keys; Quick Input with `>`
+  `:` `@` `#`; document model with dirty tracking and Save/Don't Save/Cancel;
+  grouped undo (typing runs, typing over a selection, multi-caret edits,
+  comment/move-line/indent conversions are one step each); text fields with
+  a real caret and selection (`LineEdit`); per-file indentation detection,
+  Spaces/Tabs picker and conversion, tabs rendered at tab stops; workspace
+  file watching (explorer refresh, reload of clean editors, save-conflict
+  dialog); Source Control on git with Myers gutter bars and a diff view; a
+  record-and-replay debugger (breakpoints, step in/over/out, step back,
+  reverse continue, variables, call stack, watch); Extensions = the lib
+  catalog. The final newline is an empty last line, as in VS Code.
+- **Verification**: `tools/ide_e2e.py` (scenarios through real input, plus a
+  dead-click audit of every clickable in the editor, views and panels),
+  `tools/ide_lint.py` (unknown members, reserved words, dead commands and
+  click targets), `tools/ide_memprobe.py` (memory kept per frame/key/scroll).
+- **Runtime, both engines**: one JSON codec (`include/NyJson.hpp`; the
+  interpreter's was unescaped and flat); `print(a, b, sep=, end=)`;
+  `list.pop(i)` (VM ignored `i`), `insert` with negative index; deep `==`/`!=`
+  on the interpreter (nested lists were never equal, all maps were equal);
+  `true == 1` on the VM; `map.clear()` (turned maps into lists); the uncaught
+  exception is now in `--trace` recordings; `launch_ide` reports syntax
+  errors instead of terminating; background jobs whose output ended in a
+  newline never finished (os_exec strips it).
+- **Memory** (IDE, per `ide_memprobe.py`): idle 3.45 → 0 KB/frame, typing
+  787 → ~40 KB/key, scrolling 161 → ~7 KB/event, hover 40 → 0.
 
 ## Transcripts
 

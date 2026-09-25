@@ -20,8 +20,8 @@ class BgProc:
         self.pidf = base + ".pid"
         self.running = false
         self.code = 0
-        self.read = 0
-        self.carry = ""
+        self.read = 0              # lines of the log already returned
+        self.seen_size = -1
         self.poll_t = 0
         self.t0 = 0
         self.killed = false
@@ -34,18 +34,25 @@ class BgProc:
         write_file(self.log, "")
         if os_exists(self.exitf):
             os_remove(self.exitf)
-        var script = "cd " + self._q(cwd) + " && { " + inner + " ; } < /dev/null > " + self._q(self.log) + " 2>&1; echo $? > " + self._q(self.exitf)
+        # A subshell, not a { } group: `exit 3` in the command must end the
+        # command, not the wrapper that records its exit status.
+        var script = "cd " + self._q(cwd) + " && ( " + inner + "\n) < /dev/null > " + self._q(self.log) + " 2>&1; echo $? > " + self._q(self.exitf)
         os_exec("(sh -c " + self._q(script) + " & echo $! > " + self._q(self.pidf) + ") > /dev/null 2>&1")
         self.running = true
         self.code = 0
         self.read = 0
-        self.carry = ""
+        self.seen_size = -1
         self.killed = false
         self.t0 = time_ms()
         self.poll_t = 0
 
     # Complete new lines since the last poll ([] if none); sets running=false
     # and code once the process has exited and everything has been read.
+    #
+    # Counted in lines, not bytes: os_exec strips trailing newlines from what
+    # it returns and len() counts characters, so a byte offset drifted and a
+    # job whose output ended in "\n" was never seen to finish. The "; printf
+    # x" sentinel keeps the trailing newlines intact.
     def poll(self, min_ms):
         var out = []
         if not self.running:
@@ -56,30 +63,34 @@ class BgProc:
         self.poll_t = now
         var done = os_exists(self.exitf)
         var size = file_size(self.log)
-        if size != none and size > self.read:
-            var chunk = os_exec("tail -c +" + str(self.read + 1) + " " + self._q(self.log))
-            if chunk != none and chunk != "":
-                self.read = self.read + len(chunk)
-                var lines = string_split(self.carry + chunk, "\n")
-                var n = len(lines)
-                var i = 0
-                while i < n - 1:
-                    out.append(lines[i])
-                    i = i + 1
-                self.carry = lines[n - 1]
-        if done:
-            var size2 = file_size(self.log)
-            if size2 == none or size2 <= self.read:
-                if self.carry != "":
-                    out.append(self.carry)
-                    self.carry = ""
-                var cs = read_file(self.exitf)
-                if cs == none:
-                    cs = "1"
-                self.code = int_or_zero(string_strip(cs))
-                if self.killed:
-                    self.code = 143
-                self.running = false
+        if size == none:
+            size = 0
+        if size == self.seen_size and not done:
+            return out
+        self.seen_size = size
+        var chunk = os_exec("tail -n +" + str(self.read + 1) + " " + self._q(self.log) + "; printf x")
+        if chunk == none:
+            chunk = "x"
+        chunk = string_slice(chunk, 0, len(chunk) - 1)
+        var lines = string_split(chunk, "\n")
+        var n = len(lines)
+        var i = 0
+        while i < n - 1:
+            out.append(lines[i])
+            i = i + 1
+        self.read = self.read + n - 1
+        if done and file_size(self.log) == size:
+            # The last line may lack its newline; it is complete now.
+            if lines[n - 1] != "":
+                out.append(lines[n - 1])
+                self.read = self.read + 1
+            var cs = read_file(self.exitf)
+            if cs == none:
+                cs = "1"
+            self.code = int_or_zero(string_strip(cs))
+            if self.killed:
+                self.code = 143
+            self.running = false
         return out
 
     def stop(self):
@@ -370,9 +381,16 @@ class IDEOps(IDECore):
         self.find_replace_mode = replace
         self.focus = "find"
         self.find_field = 0
+        # Seeded from the selection, or the word at the caret, and selected
+        # so that typing replaces it (VS Code's seedSearchStringFromSelection).
         var s = self._sel_text()
+        if s == "":
+            var b = self.buf()
+            var wr = b.word_at(b.cursor_row, b.cursor_col)
+            s = string_slice(b.get_line(b.cursor_row), wr[0], wr[1])
         if s != "" and string_find(s, "\n") < 0:
             self.find_query = s
+        self._le("find0").reset(self.find_query, true)
         self._find_run()
 
     # All matches in the active buffer, honouring Match Case, Match Whole Word
@@ -517,6 +535,7 @@ class IDEOps(IDECore):
     def _open_palette(self, prefix):
         self._qi_focus()
         self.qi.open("files", "", "", [], prefix)
+        self._le("qi").reset(prefix, false)
         self._qi_mode_for_value()
 
     def _qi_mode_for_value(self):
@@ -776,6 +795,8 @@ class IDEOps(IDECore):
         self.qi.open("prompt", title, hint, [], value)
         self.qi.action = action
         self.qi.free_text = true
+        # The pre-filled value is selected, so typing replaces it.
+        self._le("qi").reset(value, true)
 
     # A simple file dialog in the quick input, like VS Code's own simple
     # dialog: the typed path, its folder's entries as completions (Tab or a
@@ -783,6 +804,7 @@ class IDEOps(IDECore):
     def _open_path_prompt(self, action, title, hint, value, dirs_only):
         self._qi_focus()
         self.qi.open("path", title, hint, [], value)
+        self._le("qi").reset(value, false)
         self.qi.action = action
         self.qi.free_text = true
         self.qi.data = none
@@ -849,8 +871,22 @@ class IDEOps(IDECore):
             cur = "light"
         self._pick("theme", "Select Color Theme", ["Dark+ (default dark)", "Light+ (default light)"], ["dark", "light"], cur)
 
+    # VS Code's status-bar indentation menu: an action, then (for the first
+    # three) the size.
     def _indent_picker(self):
-        self._pick("indent", "Select Tab Size", ["Indent Using Spaces: 2", "Indent Using Spaces: 4", "Indent Using Spaces: 8"], ["2", "4", "8"], str(self.tab_size))
+        if not self._is_text():
+            return
+        self._pick("indent", "Select Action",
+                   ["Indent Using Spaces", "Indent Using Tabs", "Change Tab Display Size",
+                    "Detect Indentation from Content", "Convert Indentation to Spaces", "Convert Indentation to Tabs"],
+                   ["spaces", "tabs", "display", "detect", "tospaces", "totabs"], "")
+
+    def _indent_size_picker(self, mode):
+        if not self._is_text():
+            return
+        self.indent_mode = mode
+        self._pick("indentsize", "Select Tab Size for Current File", ["1", "2", "3", "4", "5", "6", "7", "8"],
+                   ["1", "2", "3", "4", "5", "6", "7", "8"], str(self.tab_size))
 
     def _eol_picker(self):
         if not self._is_text():
@@ -909,6 +945,9 @@ class IDEOps(IDECore):
         self.focus = self.focus_before_qi
         if action == "commands":
             if item != none:
+                # "Recently used" in the palette means used from the palette,
+                # as in VS Code; a keybinding does not reorder the list.
+                self.frecency.touch(item.value, time_ms())
                 self._exec(item.value, none)
         elif action == "files":
             if item != none:
@@ -974,9 +1013,22 @@ class IDEOps(IDECore):
             self._set_theme(v == "dark")
             self._save_settings()
         elif action == "indent":
-            self.tab_size = int(v)
-            self._save_settings()
-            self._notify("Tab size: " + v, "info")
+            if v == "spaces" or v == "tabs" or v == "display":
+                self._indent_size_picker(v)
+            elif v == "detect":
+                self._detect_indent(self.doc(), true)
+            elif v == "tospaces":
+                self._convert_indent(false)
+            elif v == "totabs":
+                self._convert_indent(true)
+        elif action == "indentsize":
+            var d = self.doc()
+            d.tab_size = int(v)
+            if self.indent_mode == "spaces":
+                d.insert_spaces = true
+            elif self.indent_mode == "tabs":
+                d.insert_spaces = false
+            self._sync_indent(d)
         elif action == "eol":
             var b = self.buf()
             var want = "\n"
@@ -1112,6 +1164,13 @@ class IDEOps(IDECore):
             self._quit(true)
         elif cmd == "@quit.discard":
             self._quit(true)
+        elif cmd == "@save.overwrite":
+            if arg >= 0 and arg < len(self.docs):
+                self._write_doc(self.docs[arg], self.docs[arg].path)
+                self._notify("Saved " + self.docs[arg].title, "ok")
+        elif cmd == "@save.revert":
+            if arg >= 0 and arg < len(self.docs):
+                self._reload_from_disk(self.docs[arg])
         elif cmd == "@saveas.replace":
             var ps = self.pending_save_as
             self.pending_save_as = none
@@ -1251,7 +1310,7 @@ class IDEOps(IDECore):
             return
         if ln == "__NY_PROFILE__":
             self.job_in_profile = true
-            self._output_write("── profile (name, calls, total ms, self ms) ──", "info")
+            self._output_write("── profile (name, calls, total ms, self ms, objects, strings, string bytes) ──", "info")
             return
         var kind = "out"
         if string_find(ln, "Error") >= 0 or string_find(ln, "error:") >= 0 or string_find(ln, "Uncaught") >= 0:
@@ -1534,7 +1593,9 @@ class IDEOps(IDECore):
         var body = "# NythonIDE settings. Save this file (Ctrl+S) to apply changes.\n"
         body = body + "theme = " + mode + "\n"
         body = body + "font_size = " + str(self.font_size) + "\n"
-        body = body + "tab_size = " + str(self.tab_size) + "\n"
+        body = body + "tab_size = " + str(self.default_tab_size) + "\n"
+        body = body + "insert_spaces = " + str(self.default_insert_spaces) + "\n"
+        body = body + "detect_indentation = " + str(self.detect_indent) + "\n"
         body = body + "sidebar_width = " + str(self.SIDEBAR_W) + "\n"
         body = body + "minimap = " + str(self.minimap_on) + "\n"
         body = body + "panel = " + str(self.panel_open) + "\n"
@@ -1578,7 +1639,11 @@ class IDEOps(IDECore):
                     elif k == "tab_size":
                         var ts = self._int_or(v, 4)
                         if ts >= 1 and ts <= 16:
-                            self.tab_size = ts
+                            self.default_tab_size = ts
+                    elif k == "insert_spaces":
+                        self.default_insert_spaces = v != "false"
+                    elif k == "detect_indentation":
+                        self.detect_indent = v != "false"
                     elif k == "sidebar_width":
                         var sw = self._int_or(v, 258)
                         if sw >= 150 and sw <= 700:
@@ -1683,6 +1748,8 @@ class IDEOps(IDECore):
         self.ws_files = none
         self.tree_scroll = 0
         self.tree_sel = 0
+        self.watch_dirs = {}
+        self.watch_git = -3
         self._remember_folder(path)
         self._load_settings()
         self._load_hl_rules(false)
@@ -1793,7 +1860,17 @@ class IDEOps(IDECore):
                 p = self.ws.rows[self.tree_sel].path
         if p == none or p == "" or p == self.ws.root:
             return
-        self._open_prompt("rename", "Rename", "New name for " + os_path_basename(p), os_path_basename(p))
+        var base = os_path_basename(p)
+        self._open_prompt("rename", "Rename", "New name for " + base, base)
+        # As in VS Code's explorer, only the name is selected, not the extension.
+        var dot = -1
+        var di = len(base) - 1
+        while di > 0 and dot < 0:
+            if string_slice(base, di, di + 1) == ".":
+                dot = di
+            di = di - 1
+        if dot > 0 and not os_isdir(p):
+            self._le("qi").select(base, 0, dot)
         self.qi.data = p
 
     def _explorer_do_rename(self, old, name):
@@ -2068,8 +2145,137 @@ class IDEOps(IDECore):
         var p = getenv("NY_IDE_DUMP")
         if p == none or p == "":
             p = "/tmp/nyide_hitmap.tsv"
-        write_file(p, self.hits.dump())
+        write_file(p + ".tmp", self.hits.dump())
+        os_rename(p + ".tmp", p)
         self.status_msg = str(self.hits.count()) + " clickable regions written to " + p
+
+    # The workbench's observable state as JSON, for tools/ide_e2e.py: the screen
+    # says what a person can see, this says exactly what the IDE believes
+    # (which buffer is dirty, where every caret is, what has focus).
+    def _dump_state(self):
+        var p = getenv("NY_IDE_STATE")
+        if p == none or p == "":
+            p = "/tmp/nyide_state.json"
+        var d = self.doc()
+        var st = {}
+        st["frame"] = self.frames
+        st["active"] = self.active
+        st["title"] = d.title
+        st["kind"] = d.kind
+        st["path"] = d.path
+        st["dirty"] = d.dirty()
+        st["lang"] = d.lang
+        var tabs = []
+        var i = 0
+        while i < len(self.docs):
+            var t = self.docs[i].title
+            if self.docs[i].dirty():
+                t = t + " *"
+            tabs.append(t)
+            i = i + 1
+        st["tabs"] = tabs
+        if self._is_text():
+            var b = self.buf()
+            st["row"] = b.cursor_row
+            st["col"] = b.cursor_col
+            st["text"] = b.get_all_text()
+            st["sel"] = d.sel_on
+            st["sel_text"] = self._sel_text()
+            st["eol"] = b.eol
+        st["carets"] = self.selmodel.count
+        st["focus"] = self.focus
+        st["view"] = self.active_view
+        st["sidebar"] = self.sidebar_open
+        st["panel"] = self.active_panel
+        st["panel_open"] = self.panel_open
+        st["dark"] = self.th.dark
+        st["qi"] = self.qi.visible
+        st["qi_value"] = self.qi.value
+        var labels = []
+        var k = 0
+        while k < len(self.qi.shown) and k < 30:
+            labels.append(self.qi.shown[k].label)
+            k = k + 1
+        st["qi_items"] = labels
+        st["menu"] = self.menu_open
+        st["ctx"] = self.ctx_open
+        st["modal"] = self.modal_open
+        st["modal_title"] = self.modal_title
+        st["modal_msg"] = self.modal_msg
+        st["find"] = self.find_open
+        st["find_info"] = self.find_info
+        st["errors"] = self.n_errors
+        st["warnings"] = self.n_warnings
+        st["dbg_state"] = self.dbg.state
+        st["dbg_line"] = self.dbg.line_at(self.dbg.pos)
+        st["dbg_n"] = self.dbg.n
+        st["breaks"] = self.break_list
+        st["watches"] = self.watches
+        st["font_size"] = self.font_size
+        st["status"] = self.status_msg
+        st["clipboard"] = self._get_clipboard()
+        write_file(p + ".tmp", json_encode(st))
+        os_rename(p + ".tmp", p)
+
+    # ══ file watching ══════════════════════════════════════════════════════════
+    # VS Code watches the workspace for changes made outside it. This polls,
+    # cheaply: one file_mtime per folder shown in the explorer (a folder's
+    # mtime moves when an entry is added, removed or renamed), one per open
+    # file, and git's index and HEAD. Nothing is listed or allocated unless
+    # something actually changed - a directory listing per poll would be a
+    # steady leak on the interpreter, which never reclaims lists.
+    def _watch_tick(self, now):
+        if now - self.watch_t < 1200:
+            return
+        self.watch_t = now
+        if self.ws.root != "":
+            var changed = false
+            var i = 0
+            while i < self.ws.row_count:
+                var row = self.ws.rows[i]
+                if row.is_dir and row.expanded:
+                    var m = file_mtime(row.path)
+                    if not self.watch_dirs.has_key(row.path):
+                        self.watch_dirs[row.path] = m
+                    elif self.watch_dirs[row.path] != m:
+                        self.watch_dirs[row.path] = m
+                        changed = true
+                i = i + 1
+            if changed:
+                self._refresh_tree_keep()
+                self.scm_stale = true
+            var gm = file_mtime(self.ws.root + "/.git/index") + file_mtime(self.ws.root + "/.git/HEAD")
+            if gm != self.watch_git:
+                if self.watch_git != -3:
+                    self.scm_stale = true
+                self.watch_git = gm
+        var k = 0
+        while k < len(self.docs):
+            var d = self.docs[k]
+            if d.kind == "file" and d.mtime >= 0:
+                var fm = file_mtime(d.path)
+                if fm >= 0 and fm != d.mtime:
+                    if not d.dirty():
+                        self._reload_from_disk(d)
+                        self.scm_stale = true
+                    elif not d.disk_changed:
+                        d.disk_changed = true
+                        self._notify(d.title + " changed on disk. Saving will ask before overwriting it.", "warn")
+            k = k + 1
+
+    # Re-reads the tree, keeping the selected row on the same path.
+    def _refresh_tree_keep(self):
+        var sel_path = ""
+        if self.tree_sel >= 0 and self.tree_sel < self.ws.row_count:
+            sel_path = self.ws.rows[self.tree_sel].path
+        self.ws.rebuild()
+        if sel_path != "":
+            var i = 0
+            while i < self.ws.row_count:
+                if self.ws.rows[i].path == sel_path:
+                    self.tree_sel = i
+                i = i + 1
+        self._dirty = true
 
     # ══ AI assistant ══════════════════════════════════════════════════════════
     def _ai_analyze(self, force):

@@ -8,6 +8,59 @@ import "lib/gui.ny"
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ─── EditorBuffer ─────────────────────────────────────────────────────────────
+# Guesses a file's indentation from its content: [insert_spaces, size], or
+# none when nothing is indented. Tabs versus spaces is a vote over indented
+# lines; the size is the most common positive step between consecutive
+# space-indented lines (after VS Code's guessIndentation, simplified), ties
+# going to 4, then 2, then 8.
+def detect_indentation(b):
+    var tabs = 0
+    var spaces = 0
+    var hist = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+    var prev = 0
+    var lim = b.line_count
+    if lim > 4000:
+        lim = 4000
+    var r = 0
+    while r < lim:
+        var line = b.get_line(r)
+        var j = 0
+        var only_spaces = true
+        var going = true
+        while going and j < len(line):
+            var ch = string_slice(line, j, j + 1)
+            if ch == " ":
+                j = j + 1
+            elif ch == "\t":
+                only_spaces = false
+                j = j + 1
+            else:
+                going = false
+        if j < len(line):
+            if string_slice(line, 0, 1) == "\t":
+                tabs = tabs + 1
+            elif j > 0:
+                spaces = spaces + 1
+            if only_spaces:
+                var d = j - prev
+                if d > 0 and d <= 8:
+                    hist[d] = hist[d] + 1
+                prev = j
+        r = r + 1
+    if tabs == 0 and spaces == 0:
+        return none
+    var best = 0
+    var bestn = 0
+    var order = [4, 2, 8, 3, 6, 5, 7, 1]
+    var k = 0
+    while k < len(order):
+        if hist[order[k]] > bestn:
+            best = order[k]
+            bestn = hist[order[k]]
+        k = k + 1
+    return [spaces >= tabs, best]
+
+
 class EditorBuffer:
     def __init__(self, name, content):
         self.name = name
@@ -36,6 +89,7 @@ class EditorBuffer:
         self.coalesce = false
         self.group = 0
         self.hold = false          # multi-caret edits: everything joins one group
+        self.join_next = false     # the next edit continues the current group
         self.last_kind = ""
         self.last_row = -1
         self.last_end = -1
@@ -45,11 +99,12 @@ class EditorBuffer:
         # undoing back to the saved text clears the dirty dot again.
         self.op_seq = 0
         self.saved_id = 0
-        # Line endings and the final newline are preserved on save. Both were
-        # lost before: a CRLF file came back with LF, and every save removed
-        # the file's last newline.
+        # Line endings are preserved on save (a CRLF file used to come back
+        # LF). A file that ends with a newline has an empty last line, as in
+        # VS Code: Ctrl+End lands below the last line of text, and the final
+        # newline survives a save because it is part of the lines themselves.
         self.eol = "\n"
-        self.final_newline = false
+        self.indent_unit = "    "   # what Enter adds after ':' (the IDE sets it per file)
         self._parse_content(content)
 
     def _parse_content(self, text):
@@ -66,16 +121,8 @@ class EditorBuffer:
         if string_find(text, "\r\n") >= 0:
             self.eol = "\r\n"
             text = string_replace(text, "\r\n", "\n")
-        self.final_newline = string_endswith(text, "\n")
         self.lines = string_split(text, "\n")
         var n = len(self.lines)
-        # A trailing newline yields one empty element; that is the end of the
-        # last line, not an extra line.
-        # Drop it by shortening the count rather than rebuilding the list: a
-        # copy loop here would be O(n^2) again, which is the very thing this
-        # rewrite exists to remove.
-        if n > 1 and self.lines[n - 1] == "":
-            n = n - 1
         if n == 0:
             self.lines = [""]
             n = 1
@@ -96,12 +143,9 @@ class EditorBuffer:
             i = i + 1
         return out
 
-    # Text as it goes to disk: the file's own line ending and final newline.
+    # Text as it goes to disk, with the file's own line ending.
     def text_for_save(self):
-        var t = string_join(self.lines_view(), self.eol)
-        if self.final_newline:
-            t = t + self.eol
-        return t
+        return string_join(self.lines_view(), self.eol)
 
     def lines_view(self):
         if len(self.lines) == self.line_count:
@@ -129,6 +173,30 @@ class EditorBuffer:
     # Ends the current typing run: the next edit starts a new undo step.
     def begin_group(self):
         self.last_kind = ""
+
+    # Several primitive edits recorded as one undo step:
+    #     var was = b.open_group()  ...edits...  b.close_group(was)
+    def open_group(self):
+        var was = self.hold
+        if not was:
+            self.last_kind = ""
+            self.group = self.group + 1
+            self.hold = true
+        return was
+
+    def close_group(self, was):
+        self.hold = was
+        self.last_kind = ""
+
+    def insert_at(self, row, col, text):
+        self.cursor_row = row
+        self.cursor_col = col
+        self.insert_text(text)
+
+    # Typing over a selection is one undo step in VS Code: the deletion of the
+    # selection and the text typed in its place come back together.
+    def continue_group(self):
+        self.join_next = true
 
     # ── multi-line text operations ──────────────────────────────────────────
     # One undo entry each, holding only the text involved: a paste or a
@@ -194,7 +262,7 @@ class EditorBuffer:
     def insert_newline_raw(self):
         var row = self.cursor_row
         var col = self.cursor_col
-        self._raw_split(row, col, 0)
+        self._raw_split(row, col, "")
         self._record_op({"op": "newline", "row": row, "col": col, "text": "", "pad": 0})
         self.cursor_row = row + 1
         self.cursor_col = 0
@@ -287,13 +355,64 @@ class EditorBuffer:
         while r <= b:
             var line = self.get_line(r)
             var k = 0
-            while k < len(unit) and k < len(line) and string_slice(line, k, k + 1) == " ":
-                k = k + 1
+            if string_slice(line, 0, 1) == "\t":
+                k = 1
+            else:
+                while k < len(unit) and k < len(line) and string_slice(line, k, k + 1) == " ":
+                    k = k + 1
             if k > 0:
                 self._raw_delete_text(r, 0, r, k)
                 self._record_op({"op": "deltext", "row": r, "col": 0, "text": string_slice(line, 0, k), "pad": 0})
                 self.modified = true
             r = r + 1
+
+    # Rewrites every line's leading whitespace as tabs (plus spaces for any
+    # remainder) or as spaces, preserving its visual width at `size`. One
+    # undo step. Returns the number of lines changed.
+    def convert_indentation(self, to_tabs, size):
+        var was = self.hold
+        if not was:
+            self.group = self.group + 1
+            self.hold = true
+        var save_r = self.cursor_row
+        var save_c = self.cursor_col
+        var changed = 0
+        var r = 0
+        while r < self.line_count:
+            var line = self.get_line(r)
+            var j = 0
+            var vis = 0
+            var going = true
+            while going and j < len(line):
+                var ch = string_slice(line, j, j + 1)
+                if ch == " ":
+                    vis = vis + 1
+                    j = j + 1
+                elif ch == "\t":
+                    vis = vis + size - (vis % size)
+                    j = j + 1
+                else:
+                    going = false
+            var want = ""
+            if to_tabs:
+                want = "\t" * int(vis / size) + " " * (vis % size)
+            else:
+                want = " " * vis
+            if want != string_slice(line, 0, j) and j < len(line):
+                self.delete_range(r, 0, r, j)
+                self.cursor_row = r
+                self.cursor_col = 0
+                self.insert_text(want)
+                if r == save_r:
+                    save_c = save_c - j + len(want)
+                    if save_c < 0:
+                        save_c = 0
+                changed = changed + 1
+            r = r + 1
+        self.cursor_row = save_r
+        self.cursor_col = save_c
+        self.hold = was
+        return changed
 
     def insert_char(self, ch):
         var row = self.cursor_row
@@ -331,21 +450,19 @@ class EditorBuffer:
         var col = self.cursor_col
         var line = self.get_line(row)
         var before = line[0:col]
-        var indent = 0
+        # The new line keeps this line's leading whitespace exactly (tabs
+        # included) and opens one more level after a ':'.
         var li = 0
-        while li < len(before):
-            if before[li:li + 1] == " ":
-                indent = indent + 1
-            else:
-                li = len(before)
+        while li < len(before) and (before[li:li + 1] == " " or before[li:li + 1] == "\t"):
             li = li + 1
+        var pad = before[0:li]
         var ends_colon = len(string_strip(before)) > 0 and before[len(before) - 1:] == ":"
         if ends_colon:
-            indent = indent + 4
-        self._raw_split(row, col, indent)
-        self._record_op({"op": "newline", "row": row, "col": col, "text": "", "pad": indent})
+            pad = pad + self.indent_unit
+        self._raw_split(row, col, pad)
+        self._record_op({"op": "newline", "row": row, "col": col, "text": pad, "pad": len(pad)})
         self.cursor_row = row + 1
-        self.cursor_col = indent
+        self.cursor_col = len(pad)
         self.modified = true
 
     # ── raw mutation primitives ─────────────────────────────────────────────
@@ -363,24 +480,14 @@ class EditorBuffer:
     # Splits lines[row] at col into two lines, indenting the new second line
     # by pad_len spaces. The forward half of insert_newline, and the inverse
     # of _raw_join.
-    def _raw_split(self, row, col, pad_len):
+    # In-place list edits (insert/pop) rather than rebuilding self.lines:
+    # the interpreter never reclaims a list (GC_NOTES.md), so the old
+    # copy-the-whole-document per Enter cost a document-sized allocation per
+    # keystroke that was never given back.
+    def _raw_split(self, row, col, pad):
         var line = self.lines[row]
-        var before = line[0:col]
-        var after = line[col:]
-        var pad = ""
-        var pi = 0
-        while pi < pad_len:
-            pad = pad + " "
-            pi = pi + 1
-        self.lines[row] = before
-        var new_lines = []
-        var i = 0
-        while i < self.line_count:
-            new_lines.append(self.lines[i])
-            if i == row:
-                new_lines.append(pad + after)
-            i = i + 1
-        self.lines = new_lines
+        self.lines[row] = line[0:col]
+        self.lines.insert(row + 1, pad + line[col:])
         self.line_count = self.line_count + 1
 
     # Inserts possibly multi-line text at (row, col); returns [end_row, end_col].
@@ -392,21 +499,34 @@ class EditorBuffer:
         var line = self.lines[row]
         var head = line[0:col]
         var tail = line[col:]
-        var out = []
-        var i = 0
-        while i < self.line_count:
-            if i == row:
-                out.append(head + parts[0])
-                var k = 1
-                while k < len(parts) - 1:
-                    out.append(parts[k])
-                    k = k + 1
-                out.append(parts[len(parts) - 1] + tail)
-            else:
-                out.append(self.lines[i])
-            i = i + 1
-        self.lines = out
-        self.line_count = len(out)
+        var np = len(parts)
+        if np <= 64:
+            self.lines[row] = head + parts[0]
+            var k = 1
+            while k < np:
+                var piece = parts[k]
+                if k == np - 1:
+                    piece = piece + tail
+                self.lines.insert(row + k, piece)
+                k = k + 1
+            self.line_count = self.line_count + np - 1
+        else:
+            # A large paste: one rebuild beats np shifts of the whole list.
+            var out = []
+            var i = 0
+            while i < self.line_count:
+                if i == row:
+                    out.append(head + parts[0])
+                    var k2 = 1
+                    while k2 < np - 1:
+                        out.append(parts[k2])
+                        k2 = k2 + 1
+                    out.append(parts[np - 1] + tail)
+                else:
+                    out.append(self.lines[i])
+                i = i + 1
+            self.lines = out
+            self.line_count = len(out)
         return [row + len(parts) - 1, len(parts[len(parts) - 1])]
 
     # Removes [(r1,c1), (r2,c2)) and returns the removed text.
@@ -417,6 +537,14 @@ class EditorBuffer:
             return removed
         var head = string_slice(self.lines[r1], 0, c1)
         var tail = string_slice(self.lines[r2], c2, len(self.lines[r2]))
+        if r2 - r1 <= 64:
+            self.lines[r1] = head + tail
+            var k = r1 + 1
+            while k <= r2:
+                self.lines.pop(r1 + 1)
+                k = k + 1
+            self.line_count = self.line_count - (r2 - r1)
+            return removed
         var out = []
         var i = 0
         while i < self.line_count:
@@ -436,13 +564,7 @@ class EditorBuffer:
         var prev = self.lines[row]
         var cur = self.lines[row + 1]
         self.lines[row] = prev + cur[pad_len:]
-        var new_lines = []
-        var i = 0
-        while i < self.line_count:
-            if i != row + 1:
-                new_lines.append(self.lines[i])
-            i = i + 1
-        self.lines = new_lines
+        self.lines.pop(row + 1)
         self.line_count = self.line_count - 1
 
     # ── operation-based undo/redo ───────────────────────────────────────────
@@ -499,7 +621,10 @@ class EditorBuffer:
         elif op == "delete" or op == "fdelete" or op == "join":
             kind = "del"
         var cont = false
-        if self.coalesce and kind != "other" and kind == self.last_kind:
+        if self.join_next:
+            self.join_next = false
+            cont = self.group > 0
+        elif self.coalesce and kind != "other" and kind == self.last_kind:
             cont = (e["row"] == self.last_row and e["col"] == self.last_end) or op == "newline" or op == "join"
             if kind == "del" and op == "delete":
                 cont = cont or (e["row"] == self.last_row and e["col"] == self.last_end - 1)
@@ -532,13 +657,11 @@ class EditorBuffer:
                           "text": self.get_all_text(), "pad": 0})
 
     def _restore_text(self, text):
-        # A snapshot holds get_all_text() (LF, no final newline); keep the
-        # file's own line ending and final newline across the restore.
+        # A snapshot holds get_all_text() (LF); keep the file's own line
+        # ending across the restore.
         var eol = self.eol
-        var fin = self.final_newline
         self._parse_content(text)
         self.eol = eol
-        self.final_newline = fin
 
     # Applies the inverse of entry e and returns the entry that would undo
     # THIS change, for the opposite stack - same shape as
@@ -559,12 +682,15 @@ class EditorBuffer:
             self._raw_join(e["row"], e["pad"])
             self.cursor_row = e["row"]
             self.cursor_col = e["col"]
-            return {"op": "join", "row": e["row"], "col": e["col"], "text": "", "pad": e["pad"]}
+            return {"op": "join", "row": e["row"], "col": e["col"], "text": e["text"], "pad": e["pad"]}
         if op == "join":
-            self._raw_split(e["row"], e["col"], e["pad"])
+            var pt = e["text"]
+            if len(pt) != e["pad"]:
+                pt = " " * e["pad"]
+            self._raw_split(e["row"], e["col"], pt)
             self.cursor_row = e["row"] + 1
             self.cursor_col = e["pad"]
-            return {"op": "newline", "row": e["row"], "col": e["col"], "text": "", "pad": e["pad"]}
+            return {"op": "newline", "row": e["row"], "col": e["col"], "text": pt, "pad": e["pad"]}
         if op == "fdelete":
             self._raw_insert(e["row"], e["col"], e["text"])
             self.cursor_row = e["row"]

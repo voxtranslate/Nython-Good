@@ -53,6 +53,11 @@ struct FloatNode : Node {
 };
 
 struct StringNode : Node {
+    // The interpreter's string for this literal, made once (strings are
+    // immutable, so every evaluation can share it). `interned_by` is the
+    // executor that owns it.
+    Value interned{};
+    const void* interned_by = nullptr;
     StringNode(Token t) : Node(t, NodeType::STRING) {}
     Value eval(Context* ctx) override {
         Runnable* r = ctx ? getRunner(ctx) : nullptr;
@@ -746,15 +751,24 @@ struct PackageNode : Node {
 
 struct PrintNode : Node {
     std::vector<node_ptr> args;
+    // print(a, b, sep=..., end=...): the call form, parsed as an argument
+    // list. Before, `print("x", y)` was the statement form applied to one
+    // tuple, so the interpreter printed ('x', 6) and the VM flattened every
+    // tuple, printing print((1, 2)) as "1 2".
+    node_ptr sep;
+    node_ptr end;
+    bool call_form = false;
     PrintNode(Token t) : Node(t, NodeType::PRINT), args{} {}
     Node* add(node_ptr n) override { args.push_back(n); return this; }
     std::vector<node_ptr> statements() override { return args; }
     Value eval(Context* ctx) override {
+        std::string s = sep ? sep->eval(ctx).toString() : " ";
+        std::string e = end ? end->eval(ctx).toString() : "\n";
         for(size_t i=0;i<args.size();i++){
-            if(i>0) std::cout<<" ";
+            if(i>0) std::cout<<s;
             std::cout<<args[i]->eval(ctx).toString();
         }
-        std::cout<<std::endl;
+        std::cout<<e<<std::flush;
         return NONE_VALUE;
     }
 };

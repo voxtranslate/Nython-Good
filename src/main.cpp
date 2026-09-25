@@ -114,6 +114,13 @@ int run_file(const std::string& filename, bool show_ast = false) {
         std::cerr << "[Nython] No such file: " << filename << "\n";
         return 2;
     }
+    // Closes a --trace recording on the way out. Declared outside the try:
+    // inside it, the unwinding exception closed the file before the catch
+    // below could record that exception in it.
+    struct TraceCloser { ~TraceCloser() {
+        auto& T = NythonExecutor::tracer();
+        if (T.f) { fclose(T.f); T.f = nullptr; }
+    } } trace_closer;
     try {
         auto source = SourceCode(filename);
         auto reporter = std::make_shared<Reporter>(source);
@@ -130,10 +137,6 @@ int run_file(const std::string& filename, bool show_ast = false) {
 
 
         NythonExecutor exec((Runnable*)vm_ptr.get());
-        struct TraceCloser { ~TraceCloser() {
-            auto& T = NythonExecutor::tracer();
-            if (T.f) { fclose(T.f); T.f = nullptr; }
-        } } trace_closer;
         if (!g_trace_path.empty()) {
             auto& T = NythonExecutor::tracer();
             T.f = fopen(g_trace_path.c_str(), "w");
@@ -344,10 +347,29 @@ static bool launch_ide(const std::string& binary_dir) {
         //
         // run_file() already uses NythonExecutor; the IDE must use it too.
         if (ast) {
+            // NY_PROFILE_OUT=<file>: profile the IDE itself (time and, per
+            // function, the objects and strings it allocates - which on the
+            // interpreter is what it keeps), written when the IDE exits.
+            const char* prof_out = getenv("NY_PROFILE_OUT");
+            if (prof_out && *prof_out) NythonExecutor::profiling_enabled() = true;
             NythonExecutor exec((Runnable*)vm2.get());
             exec.execute(ast);
+            if (prof_out && *prof_out) {
+                std::ofstream pf(prof_out);
+                pf << exec.profile_report();
+            }
         }
         return true;
+    } catch (exception::UnexpectedCharError& e) {
+        // A syntax error in the IDE's own source, or in a module it imports,
+        // located like any other; this used to reach std::terminate.
+        report_compiler_error("error", e.location(), e.message());
+        std::cerr << "[IDE Error] the IDE could not be loaded\n";
+        return false;
+    } catch (exception::SyntaxError& e) {
+        report_compiler_error("syntax error", e.location(), e.message());
+        std::cerr << "[IDE Error] the IDE could not be loaded\n";
+        return false;
     } catch (std::exception& e) {
         std::string msg = std::string("[IDE Error] ") + e.what();
 #ifdef _WIN32

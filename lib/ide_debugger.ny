@@ -237,12 +237,18 @@ class DebugSession:
             i = i - 1
         return -1
 
+    # Stepping past the end lands on the last recorded step (where an
+    # uncaught exception was raised, if there was one), like Continue does.
+    def _run_off_end(self):
+        self.pos = self.n - 1
+        self.state = "ended"
+        return false
+
     def step_into(self):
         if self.pos + 1 < self.n:
             self.pos = self.pos + 1
             return true
-        self.state = "ended"
-        return false
+        return self._run_off_end()
 
     def step_over(self):
         var d = self.depths[self.pos]
@@ -252,8 +258,7 @@ class DebugSession:
                 self.pos = i
                 return true
             i = i + 1
-        self.state = "ended"
-        return false
+        return self._run_off_end()
 
     def step_out(self):
         var d = self.depths[self.pos]
@@ -263,8 +268,7 @@ class DebugSession:
                 self.pos = i
                 return true
             i = i + 1
-        self.state = "ended"
-        return false
+        return self._run_off_end()
 
     # Reverse Step Over: the previous step in this frame or an outer one.
     def step_back(self):

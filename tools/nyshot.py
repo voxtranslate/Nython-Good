@@ -17,9 +17,8 @@ Rendering notes
   * Every primitive is alpha-blended (gui.cpp always sets SDL_BLENDMODE_BLEND).
   * Clip rectangles are honoured, which matters: the editor, tree and panels
     all rely on clipping to hide overflow.
-  * The stub measures text as 0.6em per character. DejaVu Sans Mono's real
-    advance is 0.602em, so code text lands where the IDE thinks it does;
-    proportional UI text can be a few pixels off its measured box.
+  * The stub measures text with DejaVu's real advance widths (Sans, Sans
+    Bold, Sans Mono), so a run lands exactly where the IDE measured it.
 """
 import json
 import os

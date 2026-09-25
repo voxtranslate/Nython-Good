@@ -71,6 +71,10 @@ def strip_comment(line):
     return "".join(out)
 
 
+def blank_comments(text):
+    return "\n".join(strip_comment(ln) for ln in text.split("\n"))
+
+
 def blank_strings(line):
     return re.sub(r'"(?:[^"\\]|\\.)*"', '""', line)
 
@@ -193,6 +197,27 @@ def main():
         for ln, raw in enumerate(open(path, encoding="utf-8", errors="replace"), 1):
             if re.match(r"^\s+def\s+init\s*\(", raw):
                 problems.append("%s:%d: a method named 'init' is run as a constructor" % (rel, ln))
+    # Dead clicks. Every command a menu, palette entry, button or keybinding
+    # can name must have a branch in the dispatcher, and every internal
+    # "@target" a painter registers in the hit map must be handled by the
+    # click router - otherwise the item draws, highlights on hover, and does
+    # nothing when clicked.
+    chain_src = ""
+    for rel in CHAIN_FILES:
+        chain_src += blank_comments(open(os.path.join(REPO, rel), encoding="utf-8", errors="replace").read())
+    ids = re.findall(r'(?<![\w])_cmd\("([^"@][^"]*)"', chain_src)
+    handled = set(re.findall(r'\bid == "([^"]+)"', chain_src))
+    prefixes = re.findall(r'string_startswith\(id, "([^"]+)"\)', chain_src)
+    for cid in ids:
+        if cid not in handled and not any(cid.startswith(pf) for pf in prefixes):
+            problems.append("command '%s' is registered but _exec has no branch for it" % cid)
+    targets = set(re.findall(r'"(@[a-z][\w.]*)"', re.sub(r'string_startswith\(cmd, "[^"]*"\)', "", chain_src)))
+    routed = set(re.findall(r'cmd == "(@[\w.]+)"', chain_src)) | set(re.findall(r'\bc == "(@[\w.]+)"', chain_src))
+    # Only exact comparisons count: `string_startswith(cmd, "@dbg")` merely
+    # routes to a sub-handler, which must then name the target itself.
+    for t in sorted(targets):
+        if t not in routed:
+            problems.append("click target '%s' is drawn but nothing handles a click on it" % t)
     seen = set()
     for p in problems:
         if p not in seen:
