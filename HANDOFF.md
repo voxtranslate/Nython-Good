@@ -28,7 +28,7 @@ building the means to check, then used it on everything.
 | `thirdparty/sdl3-stub` | scripted/live input (`NY_STUB_EVENTS`: move, click, dblclick, drag, wheel, key, type, resize, snap, quit), real SDL key names and modifiers, clipboard, and a capture of every primitive of the last presented frame (`snap PATH`). Text is measured with DejaVu's real advance widths, so captured layouts are exact. |
 | `tools/nyshot.py` | turns a captured frame into a PNG (fonts, clipping, alpha) and finds text on screen. |
 | `tools/ide_driver.py` | runs `build/nython --ide` with a live input channel; `click_text("Save All")`, `key("ctrl+shift+p")`, `type(...)`, `snap()`, `state()` (the IDE's own `developer.dumpState`, Ctrl+Shift+Alt+J), `hitmap()` (every clickable region, `developer.dumpHitMap`). |
-| `tools/ide_e2e.py` | 20 scenarios through real input — editing/undo/save, clipboard and line commands, multi-cursor, palette, Quick Open (`>` `:` `@` `#`), menus, find/replace, every status-bar item, explorer create/rename/delete/refresh, close-with-unsaved, terminal, Run, Problems, debugger, Source Control, Search, views/layout — plus two **dead-click audits** that click every clickable region (editor chrome; then each side view and panel with content in it) and require each to change something. Prints `N passed, M failed`. |
+| `tools/ide_e2e.py` | 21 scenarios through real input — editing/undo/save, clipboard and line commands, multi-cursor, palette, Quick Open (`>` `:` `@` `#`), menus, find/replace, every status-bar item, explorer create/rename/delete/refresh, close-with-unsaved, terminal, Run, Problems, debugger, Source Control, Search, views/layout — plus two **dead-click audits** that click every clickable region (editor chrome; then each side view and panel with content in it) and require each to change something. Prints `N passed, M failed`. |
 | `tools/ide_lint.py` | static: `self.x` / `th.x` / typed receivers no class defines (Nython returns `none` instead of raising), reserved words as names, a method named `init` (a constructor alias here), **commands registered without an `_exec` branch and click targets nothing routes**. |
 | `tools/ide_memprobe.py` | resident memory kept per idle frame, hover event, keystroke and scroll step, with ceilings (`--check`). |
 | `tools/sweep.py` | the content-level sweep (§2) on both engines, optionally against a baseline binary, reporting regressions and fixes as sets. |
@@ -146,10 +146,12 @@ whatever `nython` was on PATH instead of the running binary.
 ### Numbers at the end of the round
 
 ```
-tools/ide_e2e.py        E2E_RESULT
+tools/ide_e2e.py        227 passed, 0 failed (21 scenarios incl. two dead-click audits)
 tools/ide_lint.py       0 unresolved
 tools/ide_memprobe.py   within ceilings (idle 0, hover 0, typing ~40 KB/key, scroll ~7 KB)
-tools/sweep.py --base   SWEEP_RESULT
+tools/sweep.py --base   176 runs (88 files x 2 engines): 0 regressions against the round-72
+                        binary, 8 runs newly passing; still failing: vm_audit23/25 on the
+                        VM only (pre-existing, @property decorator, §5.9)
 vm_audit42..45          73 / 52 / 46 / 45 passed, both engines
 ```
 

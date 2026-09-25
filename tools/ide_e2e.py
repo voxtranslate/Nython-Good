@@ -973,7 +973,11 @@ def sc_dead_clicks_views(s):
     for key, label in [("problems", "PROBLEMS"), ("output", "OUTPUT"), ("debug", "DEBUG CONSOLE"),
                        ("terminal", "TERMINAL")]:
         def go(label=label, key=key):
-            if ide.state()["panel"] != key:
+            st = ide.state()
+            if not st["panel_open"]:
+                ide.key("ctrl+j")
+                st = ide.state()
+            if st["panel"] != key:
                 ide.click_text(label)
         t, d = _click_audit(s, go, panel, skip, allow, "panel " + key)
         total += len(t)
