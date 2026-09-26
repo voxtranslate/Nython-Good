@@ -45,6 +45,145 @@ class Color:
         var b = int(self.b + (255 - self.b) * factor)
         return Color(r, g, b, self.a)
 
+# Colours used by the widgets' draw methods, made once. The interpreter
+# never frees an instance (GC_NOTES.md), so a Color(...) literal in a
+# draw method was a permanent allocation on every frame.
+var _GC_0_0_0_0 = Color(0, 0, 0, 0)
+var _GC_0_0_0_100 = Color(0, 0, 0, 100)
+var _GC_0_0_0_120 = Color(0, 0, 0, 120)
+var _GC_0_0_0_140 = Color(0, 0, 0, 140)
+var _GC_0_0_0_180 = Color(0, 0, 0, 180)
+var _GC_0_0_0_25 = Color(0, 0, 0, 25)
+var _GC_0_0_0_255 = Color(0, 0, 0, 255)
+var _GC_0_0_0_30 = Color(0, 0, 0, 30)
+var _GC_0_0_0_40 = Color(0, 0, 0, 40)
+var _GC_0_0_0_50 = Color(0, 0, 0, 50)
+var _GC_0_0_0_60 = Color(0, 0, 0, 60)
+var _GC_0_0_0_70 = Color(0, 0, 0, 70)
+var _GC_0_0_0_80 = Color(0, 0, 0, 80)
+var _GC_100_102_140_140 = Color(100, 102, 140, 140)
+var _GC_100_102_140_160 = Color(100, 102, 140, 160)
+var _GC_100_102_140_180 = Color(100, 102, 140, 180)
+var _GC_120_120_120_255 = Color(120, 120, 120, 255)
+var _GC_120_122_160_140 = Color(120, 122, 160, 140)
+var _GC_120_122_160_160 = Color(120, 122, 160, 160)
+var _GC_120_122_160_180 = Color(120, 122, 160, 180)
+var _GC_128_128_128_255 = Color(128, 128, 128, 255)
+var _GC_130_132_170_160 = Color(130, 132, 170, 160)
+var _GC_130_132_170_170 = Color(130, 132, 170, 170)
+var _GC_130_215_100_200 = Color(130, 215, 100, 200)
+var _GC_140_142_180_170 = Color(140, 142, 180, 170)
+var _GC_140_142_180_180 = Color(140, 142, 180, 180)
+var _GC_140_142_180_200 = Color(140, 142, 180, 200)
+var _GC_160_162_180_180 = Color(160, 162, 180, 180)
+var _GC_160_162_190_180 = Color(160, 162, 190, 180)
+var _GC_160_162_190_200 = Color(160, 162, 190, 200)
+var _GC_160_162_200_160 = Color(160, 162, 200, 160)
+var _GC_160_162_200_200 = Color(160, 162, 200, 200)
+var _GC_180_180_180_255 = Color(180, 180, 180, 255)
+var _GC_180_180_200_120 = Color(180, 180, 200, 120)
+var _GC_180_182_210_200 = Color(180, 182, 210, 200)
+var _GC_180_182_220_190 = Color(180, 182, 220, 190)
+var _GC_180_182_220_200 = Color(180, 182, 220, 200)
+var _GC_180_182_220_210 = Color(180, 182, 220, 210)
+var _GC_180_182_240_230 = Color(180, 182, 240, 230)
+var _GC_180_220_120_230 = Color(180, 220, 120, 230)
+var _GC_18_20_34_255 = Color(18, 20, 34, 255)
+var _GC_200_200_220_180 = Color(200, 200, 220, 180)
+var _GC_200_202_230_200 = Color(200, 202, 230, 200)
+var _GC_200_202_240_210 = Color(200, 202, 240, 210)
+var _GC_200_202_240_220 = Color(200, 202, 240, 220)
+var _GC_20_22_36_255 = Color(20, 22, 36, 255)
+var _GC_20_22_38_255 = Color(20, 22, 38, 255)
+var _GC_210_212_240_230 = Color(210, 212, 240, 230)
+var _GC_220_220_240_200 = Color(220, 220, 240, 200)
+var _GC_220_222_255_220 = Color(220, 222, 255, 220)
+var _GC_220_222_255_230 = Color(220, 222, 255, 230)
+var _GC_220_222_255_240 = Color(220, 222, 255, 240)
+var _GC_230_232_255_255 = Color(230, 232, 255, 255)
+var _GC_235_235_250_255 = Color(235, 235, 250, 255)
+var _GC_235_237_255_255 = Color(235, 237, 255, 255)
+var _GC_24_26_44_255 = Color(24, 26, 44, 255)
+var _GC_252_176_98_220 = Color(252, 176, 98, 220)
+var _GC_255_149_0_180 = Color(255, 149, 0, 180)
+var _GC_255_149_0_20 = Color(255, 149, 0, 20)
+var _GC_255_149_0_200 = Color(255, 149, 0, 200)
+var _GC_255_149_0_220 = Color(255, 149, 0, 220)
+var _GC_255_149_0_230 = Color(255, 149, 0, 230)
+var _GC_255_149_0_255 = Color(255, 149, 0, 255)
+var _GC_255_149_0_30 = Color(255, 149, 0, 30)
+var _GC_255_189_46_255 = Color(255, 189, 46, 255)
+var _GC_255_255_255_0 = Color(255, 255, 255, 0)
+var _GC_255_255_255_10 = Color(255, 255, 255, 10)
+var _GC_255_255_255_12 = Color(255, 255, 255, 12)
+var _GC_255_255_255_120 = Color(255, 255, 255, 120)
+var _GC_255_255_255_140 = Color(255, 255, 255, 140)
+var _GC_255_255_255_15 = Color(255, 255, 255, 15)
+var _GC_255_255_255_18 = Color(255, 255, 255, 18)
+var _GC_255_255_255_180 = Color(255, 255, 255, 180)
+var _GC_255_255_255_20 = Color(255, 255, 255, 20)
+var _GC_255_255_255_200 = Color(255, 255, 255, 200)
+var _GC_255_255_255_22 = Color(255, 255, 255, 22)
+var _GC_255_255_255_220 = Color(255, 255, 255, 220)
+var _GC_255_255_255_230 = Color(255, 255, 255, 230)
+var _GC_255_255_255_240 = Color(255, 255, 255, 240)
+var _GC_255_255_255_25 = Color(255, 255, 255, 25)
+var _GC_255_255_255_255 = Color(255, 255, 255, 255)
+var _GC_255_255_255_3 = Color(255, 255, 255, 3)
+var _GC_255_255_255_30 = Color(255, 255, 255, 30)
+var _GC_255_255_255_35 = Color(255, 255, 255, 35)
+var _GC_255_255_255_4 = Color(255, 255, 255, 4)
+var _GC_255_255_255_40 = Color(255, 255, 255, 40)
+var _GC_255_255_255_45 = Color(255, 255, 255, 45)
+var _GC_255_255_255_50 = Color(255, 255, 255, 50)
+var _GC_255_255_255_6 = Color(255, 255, 255, 6)
+var _GC_255_255_255_60 = Color(255, 255, 255, 60)
+var _GC_255_255_255_8 = Color(255, 255, 255, 8)
+var _GC_255_255_255_80 = Color(255, 255, 255, 80)
+var _GC_255_45_85_255 = Color(255, 45, 85, 255)
+var _GC_255_59_48_200 = Color(255, 59, 48, 200)
+var _GC_255_59_48_220 = Color(255, 59, 48, 220)
+var _GC_255_59_48_255 = Color(255, 59, 48, 255)
+var _GC_255_59_48_30 = Color(255, 59, 48, 30)
+var _GC_255_80_60_255 = Color(255, 80, 60, 255)
+var _GC_255_95_86_255 = Color(255, 95, 86, 255)
+var _GC_30_32_48_255 = Color(30, 32, 48, 255)
+var _GC_39_201_63_255 = Color(39, 201, 63, 255)
+var _GC_40_42_60_230 = Color(40, 42, 60, 230)
+var _GC_45_47_65_255 = Color(45, 47, 65, 255)
+var _GC_50_52_70_255 = Color(50, 52, 70, 255)
+var _GC_50_52_80_120 = Color(50, 52, 80, 120)
+var _GC_52_199_89_160 = Color(52, 199, 89, 160)
+var _GC_52_199_89_200 = Color(52, 199, 89, 200)
+var _GC_52_199_89_220 = Color(52, 199, 89, 220)
+var _GC_60_62_100_120 = Color(60, 62, 100, 120)
+var _GC_60_62_100_140 = Color(60, 62, 100, 140)
+var _GC_60_62_80_255 = Color(60, 62, 80, 255)
+var _GC_70_72_95_200 = Color(70, 72, 95, 200)
+var _GC_80_82_110_140 = Color(80, 82, 110, 140)
+var _GC_80_82_110_150 = Color(80, 82, 110, 150)
+var _GC_80_82_110_160 = Color(80, 82, 110, 160)
+var _GC_80_82_120_120 = Color(80, 82, 120, 120)
+var _GC_80_82_120_140 = Color(80, 82, 120, 140)
+var _GC_80_82_120_160 = Color(80, 82, 120, 160)
+var _GC_86_196_255_210 = Color(86, 196, 255, 210)
+var _GC_86_196_255_220 = Color(86, 196, 255, 220)
+var _GC_99_102_141_200 = Color(99, 102, 141, 200)
+var _GC_99_102_241_100 = Color(99, 102, 241, 100)
+var _GC_99_102_241_12 = Color(99, 102, 241, 12)
+var _GC_99_102_241_180 = Color(99, 102, 241, 180)
+var _GC_99_102_241_20 = Color(99, 102, 241, 20)
+var _GC_99_102_241_200 = Color(99, 102, 241, 200)
+var _GC_99_102_241_220 = Color(99, 102, 241, 220)
+var _GC_99_102_241_25 = Color(99, 102, 241, 25)
+var _GC_99_102_241_255 = Color(99, 102, 241, 255)
+var _GC_99_102_241_30 = Color(99, 102, 241, 30)
+var _GC_99_102_241_35 = Color(99, 102, 241, 35)
+var _GC_99_102_241_45 = Color(99, 102, 241, 45)
+var _GC_99_102_241_50 = Color(99, 102, 241, 50)
+var _GC_99_102_241_80 = Color(99, 102, 241, 80)
+
+
 # ─── Palette ─────────────────────────────────────────────────────────────────
 
 class Palette:
@@ -1565,14 +1704,14 @@ class Button:
     def _draw(self, renderer):
         var bg = self._get_bg_color()
         if self.variant != "ghost":
-            renderer.draw_shadow(self.rect, 4, 0, 2, Color(0,0,0,80))
+            renderer.draw_shadow(self.rect, 4, 0, 2, _GC_0_0_0_80)
         renderer.fill_rounded_rect(self.rect, bg, self.border_radius)
         if self.focused:
             var focus_rect = self.rect.expand(2)
             renderer.draw_rounded_rect(focus_rect, self.theme.accent, self.border_radius + 2, 2)
         var text_color = self.theme.text
         if self.variant == "primary":
-            text_color = Color(255, 255, 255, 255)
+            text_color = _GC_255_255_255_255
         if self.enabled == false:
             text_color = text_color.with_alpha(120)
         if self._loading:
@@ -2146,8 +2285,8 @@ class Checkbox:
         if self.checked:
             var cx = self.rect.x + 4
             var cy = self.rect.y + 10
-            renderer.draw_line(cx, cy, cx + 5, cy + 5, Color(255,255,255,255), 2)
-            renderer.draw_line(cx + 5, cy + 5, cx + 12, cy - 4, Color(255,255,255,255), 2)
+            renderer.draw_line(cx, cy, cx + 5, cy + 5, _GC_255_255_255_255, 2)
+            renderer.draw_line(cx + 5, cy + 5, cx + 12, cy - 4, _GC_255_255_255_255, 2)
         var label_x = self.rect.right() + 8
         var label_y = self.rect.y + 3
         renderer.draw_text(self.label, label_x, label_y, self.font, self.theme.text)
@@ -2273,7 +2412,7 @@ class Slider:
         if self.hovered or self.dragging:
             thumb_color = self.theme.accent_hover
         renderer.fill_circle(thumb_x, self.rect.center_y(), 10, thumb_color)
-        renderer.draw_circle(thumb_x, self.rect.center_y(), 10, Color(255,255,255,60))
+        renderer.draw_circle(thumb_x, self.rect.center_y(), 10, _GC_255_255_255_60)
         if self.show_value:
             var txt = str(self.value)
             renderer.draw_text(txt, thumb_x - 10, self.rect.y - 18, self.font, self.theme.text)
@@ -3371,7 +3510,7 @@ class Toast:
 
     def _draw(self, renderer):
         var rect = Rect(self.x, self.y, self.w, self.h)
-        renderer.draw_shadow(rect, 8, 0, 4, Color(0,0,0,100))
+        renderer.draw_shadow(rect, 8, 0, 4, _GC_0_0_0_100)
         renderer.fill_rounded_rect(rect, self.theme.surface, 10)
         var indicator = Rect(self.x, self.y, 4, self.h)
         renderer.fill_rounded_rect(indicator, self._get_color(), 2)
@@ -3503,19 +3642,19 @@ class VideoPlayer:
 
     def _draw(self, renderer):
         if self._handle == none:
-            renderer.fill_rect(self.rect, Color(0,0,0,255))
-            renderer.draw_text("No video", self.rect.center_x() - 36, self.rect.center_y() - 7, self._font_placeholder, Color(128,128,128,255))
+            renderer.fill_rect(self.rect, _GC_0_0_0_255)
+            renderer.draw_text("No video", self.rect.center_x() - 36, self.rect.center_y() - 7, self._font_placeholder, _GC_128_128_128_255)
             return
         gui_video_render(self._handle, self.rect.x, self.rect.y, self.rect.w, self.rect.h)
         if self.playing == false:
             var cx = self.rect.center_x()
             var cy = self.rect.center_y()
-            renderer.fill_circle(cx, cy, 32, Color(0,0,0,140))
+            renderer.fill_circle(cx, cy, 32, _GC_0_0_0_140)
             var pts = []
             pts[0] = [cx - 10, cy - 18]
             pts[1] = [cx + 18, cy]
             pts[2] = [cx - 10, cy + 18]
-            renderer.fill_polygon(pts, 3, Color(255,255,255,220))
+            renderer.fill_polygon(pts, 3, _GC_255_255_255_220)
 
     def handle_event(self, event):
         if self.visible == false:
@@ -3952,7 +4091,7 @@ class Switch:
         if self.checked:
             knob_x = self.rect.right() - 23
         var knob = Rect(knob_x, self.rect.y + 3, 20, 20)
-        renderer.fill_circle(knob.center_x(), knob.center_y(), 10, Color(255, 255, 255, 255))
+        renderer.fill_circle(knob.center_x(), knob.center_y(), 10, _GC_255_255_255_255)
         if self.label != "":
             var tx = self.rect.right() + 8
             var ty = self.rect.y + int((self.rect.h - 14) / 2)
@@ -4354,7 +4493,7 @@ class TextArea:
             border = self.theme.accent
         renderer.fill_rounded_rect(self.rect, bg, self.theme.radius)
         renderer.draw_rounded_rect(self.rect, border, self.theme.radius, 1)
-        renderer.set_clip(Rect(self.rect.x + 2, self.rect.y + 2, self.rect.w - 4, self.rect.h - 4))
+        renderer.clip_xywh(self.rect.x + 2, self.rect.y + 2, self.rect.w - 4, self.rect.h - 4)
         if self.value == "":
             renderer.draw_text(self.placeholder, self.rect.x + 10, self.rect.y + 10, self.font, self.theme.text_secondary)
         else:
@@ -4437,7 +4576,7 @@ class Badge:
         var h = 20
         var r = Rect(self.x, self.y, w, h)
         renderer.fill_rounded_rect(r, color, 10)
-        renderer.draw_text(self.text, self.x + pad_x, self.y + pad_y, self.font, Color(255, 255, 255, 255))
+        renderer.draw_text(self.text, self.x + pad_x, self.y + pad_y, self.font, _GC_255_255_255_255)
 
     def draw(self, renderer):
         if self.visible:
@@ -4483,11 +4622,11 @@ class Divider:
                 var lw = len(self.label) * 8 + 16
                 var lx = self.x + int((self.length - lw) / 2)
                 var seg1 = int((self.length - lw) / 2) - 8
-                renderer.fill_rect(Rect(self.x, self.y, seg1, self.thickness), color)
-                renderer.fill_rect(Rect(lx + lw + 4, self.y, self.length - lx - lw, self.thickness), color)
+                renderer.fill_xywh(self.x, self.y, seg1, self.thickness, color)
+                renderer.fill_xywh(lx + lw + 4, self.y, self.length - lx - lw, self.thickness, color)
                 renderer.draw_text(self.label, lx + 8, self.y - 8, self.font, self.theme.text_secondary)
             else:
-                renderer.fill_rect(Rect(self.x, self.y, self.length, self.thickness), color)
+                renderer.fill_xywh(self.x, self.y, self.length, self.thickness, color)
 
     def draw(self, renderer):
         if self.visible:
@@ -5926,8 +6065,8 @@ class RangeSlider:
         renderer.fill_rounded_rect(sel, self.theme.accent, 2)
         renderer.fill_circle(lx, cy, 8, self.theme.accent)
         renderer.fill_circle(hx, cy, 8, self.theme.accent)
-        renderer.draw_circle(lx, cy, 8, Color(255, 255, 255, 80))
-        renderer.draw_circle(hx, cy, 8, Color(255, 255, 255, 80))
+        renderer.draw_circle(lx, cy, 8, _GC_255_255_255_80)
+        renderer.draw_circle(hx, cy, 8, _GC_255_255_255_80)
         if self.show_values:
             renderer.draw_text(str(self.low), lx - 10, self.rect.y - 18, self.font, self.theme.text_secondary)
             renderer.draw_text(str(self.high), hx - 10, self.rect.y - 18, self.font, self.theme.text_secondary)
@@ -6385,7 +6524,7 @@ class TagInput:
             var tw = len(self.tags[i]) * 7 + 16
             var tag_r = Rect(tx, ty, tw, 20)
             renderer.fill_rounded_rect(tag_r, self.theme.accent, 10)
-            renderer.draw_text(self.tags[i], tx + 6, ty + 3, self.font_small, Color(255, 255, 255, 255))
+            renderer.draw_text(self.tags[i], tx + 6, ty + 3, self.font_small, _GC_255_255_255_255)
             tx = tx + tw + 4
             i = i + 1
         if len(self.input_value) > 0:
@@ -6673,12 +6812,12 @@ class Avatar:
             renderer.fill_circle(cx, cy, r, bg)
             var init = self.initials()
             var fw = len(init) * 7
-            renderer.draw_text(init, cx - int(fw / 2), cy - int(self.size / 8), self.font, Color(255, 255, 255, 255))
+            renderer.draw_text(init, cx - int(fw / 2), cy - int(self.size / 8), self.font, _GC_255_255_255_255)
         var sc = self._status_color()
         if sc != none:
             var sr = int(self.size / 5)
             renderer.fill_circle(cx + r - sr, cy + r - sr, sr, sc)
-            renderer.draw_circle(cx + r - sr, cy + r - sr, sr, Color(0, 0, 0, 60))
+            renderer.draw_circle(cx + r - sr, cy + r - sr, sr, _GC_0_0_0_60)
 
     def draw(self, renderer):
         if self.visible:
@@ -6889,7 +7028,7 @@ class Pagination:
             var bg = self.theme.accent if is_current else self.theme.surface
             renderer.fill_rounded_rect(br, bg, 6)
             renderer.draw_rounded_rect(br, self.theme.border, 6, 1)
-            var tc = Color(255, 255, 255, 255) if is_current else (self.theme.text_secondary if is_disabled else self.theme.text)
+            var tc = _GC_255_255_255_255 if is_current else (self.theme.text_secondary if is_disabled else self.theme.text)
             var lw = len(btn["label"]) * 7
             renderer.draw_text(btn["label"], br.center_x() - int(lw / 2), br.center_y() - 7, self.font, tc)
             i = i + 1
@@ -7003,13 +7142,13 @@ class Stepper:
             var circle_color = self.theme.accent if is_current else (self.theme.success if step.completed else (self.theme.danger if step.error else self.theme.border))
             renderer.fill_circle(sx, sy, 14, circle_color)
             var num = str(i + 1) if not step.completed else "[OK]"
-            renderer.draw_text(num, sx - 4, sy - 7, self.font, Color(255, 255, 255, 255))
+            renderer.draw_text(num, sx - 4, sy - 7, self.font, _GC_255_255_255_255)
             renderer.draw_text(step.label, sx - int(len(step.label) * 4), sy + 20, self.font, self.theme.text if is_current else self.theme.text_secondary)
             if i < self.step_count - 1:
                 var line_x = sx + 14
                 var line_end = self.rect.x + (i + 1) * step_w + int(step_w / 2) - 14
                 var line_color = self.theme.accent if step.completed else self.theme.border
-                renderer.fill_rect(Rect(line_x, sy - 1, line_end - line_x, 2), line_color)
+                renderer.fill_xywh(line_x, sy - 1, line_end - line_x, 2, line_color)
             i = i + 1
 
     def draw(self, renderer):
@@ -7116,8 +7255,8 @@ class Drawer:
             return
         var dr = self._rect()
         if self.overlay:
-            renderer.fill_rect(Rect(0, 0, self.window_w, self.window_h), Color(0, 0, 0, 120))
-        renderer.draw_shadow(dr, 16, 0, 0, Color(0, 0, 0, 80))
+            renderer.fill_xywh(0, 0, self.window_w, self.window_h, _GC_0_0_0_120)
+        renderer.draw_shadow(dr, 16, 0, 0, _GC_0_0_0_80)
         renderer.fill_rect(dr, self.theme.surface)
         if self.title != "":
             var title_r = Rect(dr.x, dr.y, dr.w, 56)
@@ -7636,8 +7775,8 @@ class StatusBar:
 
     def _draw(self, renderer):
         var bar_y = self.window_h - self.h
-        renderer.fill_rect(Rect(0, bar_y, self.window_w, self.h), self.theme.bg)
-        renderer.fill_rect(Rect(0, bar_y, self.window_w, 1), self.theme.border)
+        renderer.fill_xywh(0, bar_y, self.window_w, self.h, self.theme.bg)
+        renderer.fill_xywh(0, bar_y, self.window_w, 1, self.theme.border)
         var lx = 8
         var i = 0
         while i < self.left_count:
@@ -7648,7 +7787,7 @@ class StatusBar:
             renderer.draw_text(full, lx, bar_y + int((self.h - 12) / 2), self.font, self.theme.text_secondary)
             lx = lx + len(full) * 7 + 16
             if i < self.left_count - 1:
-                renderer.fill_rect(Rect(lx - 8, bar_y + 4, 1, self.h - 8), self.theme.border)
+                renderer.fill_xywh(lx - 8, bar_y + 4, 1, self.h - 8, self.theme.border)
             i = i + 1
         var rx = self.window_w - 8
         i = self.right_count - 1
@@ -7661,7 +7800,7 @@ class StatusBar:
             renderer.draw_text(full, rx, bar_y + int((self.h - 12) / 2), self.font, self.theme.text_secondary)
             rx = rx - 16
             if i > 0:
-                renderer.fill_rect(Rect(rx + 8, bar_y + 4, 1, self.h - 8), self.theme.border)
+                renderer.fill_xywh(rx + 8, bar_y + 4, 1, self.h - 8, self.theme.border)
             i = i - 1
 
     def draw(self, renderer):
@@ -7787,10 +7926,10 @@ class NotificationCenter:
             var nx = self.window_w - self.notif_w - 16
             var ny = 16 + i * (self.notif_h + self.gap)
             var nr = Rect(nx, ny, self.notif_w, self.notif_h)
-            renderer.draw_shadow(nr, 8, 0, 2, Color(0, 0, 0, 60))
+            renderer.draw_shadow(nr, 8, 0, 2, _GC_0_0_0_60)
             renderer.fill_rounded_rect(nr, self.theme.surface, 8)
             var accent = self._get_color(n.type)
-            renderer.fill_rect(Rect(nx, ny + 4, 4, self.notif_h - 8), accent)
+            renderer.fill_xywh(nx, ny + 4, 4, self.notif_h - 8, accent)
             renderer.draw_rounded_rect(nr, self.theme.border, 8, 1)
             renderer.draw_text(n.title, nx + 16, ny + 14, self.font_title, self.theme.text)
             renderer.draw_text(n.body, nx + 16, ny + 34, self.font_body, self.theme.text_secondary)
@@ -8161,7 +8300,7 @@ class GlassCard:
         renderer.fill_rounded_rect(self.rect, self.tint, self.radius)
         # Vertical gradient overlay to simulate glass depth
         var top_rect = Rect(self.rect.x, self.rect.y, self.rect.w, int(self.rect.h / 2))
-        renderer.fill_rounded_rect(top_rect, Color(255, 255, 255, 10), self.radius)
+        renderer.fill_rounded_rect(top_rect, _GC_255_255_255_10, self.radius)
         # Accent glow bar at top
         if self.glow:
             var glow_rect = Rect(self.rect.x + 20, self.rect.y - 1, int(self.rect.w * 2 / 3), 3)
@@ -8170,14 +8309,14 @@ class GlassCard:
         renderer.draw_rounded_rect(self.rect, self.border_color, self.radius, 1)
         # Inner highlight (top edge of glass)
         var inner = Rect(self.rect.x + 2, self.rect.y + 2, self.rect.w - 4, 1)
-        renderer.fill_rect(inner, Color(255, 255, 255, 30))
+        renderer.fill_rect(inner, _GC_255_255_255_30)
         # Title and subtitle
         var ty = self.rect.y + 18
         if self.title != "":
-            renderer.draw_text(self.title, self.rect.x + 20, ty, self.font_title, Color(255, 255, 255, 240))
+            renderer.draw_text(self.title, self.rect.x + 20, ty, self.font_title, _GC_255_255_255_240)
             ty = ty + 22
         if self.subtitle != "":
-            renderer.draw_text(self.subtitle, self.rect.x + 20, ty, self.font_sub, Color(200, 200, 220, 180))
+            renderer.draw_text(self.subtitle, self.rect.x + 20, ty, self.font_sub, _GC_200_200_220_180)
         # Children
         var i = 0
         while i < self.child_count:
@@ -8185,7 +8324,7 @@ class GlassCard:
             i = i + 1
         # Hover shimmer
         if self.hovered:
-            renderer.fill_rounded_rect(self.rect, Color(255, 255, 255, 8), self.radius)
+            renderer.fill_rounded_rect(self.rect, _GC_255_255_255_8, self.radius)
 
     def draw(self, renderer):
         if self.visible:
@@ -8330,7 +8469,7 @@ class FloatingActionButton:
                 bg = Color(min(self.color.r + 20, 255), min(self.color.g + 20, 255), min(self.color.b + 20, 255), 255)
             renderer.fill_circle(self.cx, self.cy, self.r, bg)
             # Highlight arc (top-left quadrant)
-            renderer.fill_circle(self.cx - int(self.r * 0.2), self.cy - int(self.r * 0.25), int(self.r * 0.55), Color(255, 255, 255, 25))
+            renderer.fill_circle(self.cx - int(self.r * 0.2), self.cy - int(self.r * 0.25), int(self.r * 0.55), _GC_255_255_255_25)
             # Icon
             var iw = len(self.icon) * int(self.size * 0.24)
             renderer.draw_text(self.icon, self.cx - int(iw / 2), self.cy - int(self.size * 0.22), self.font, self.icon_color)
@@ -8531,15 +8670,15 @@ class ColorPicker:
                 var s = float(col) / float(cols - 1)
                 var v = 1.0 - float(row) / float(rows - 1)
                 var cell_c = self._hsv_to_rgb(self.hue, s, v)
-                renderer.fill_rect(Rect(sv.x + col * cw, sv.y + row * ch, cw + 1, ch + 1), cell_c)
+                renderer.fill_xywh(sv.x + col * cw, sv.y + row * ch, cw + 1, ch + 1, cell_c)
                 col = col + 1
             row = row + 1
-        renderer.draw_rounded_rect(sv, Color(0, 0, 0, 80), 4, 1)
+        renderer.draw_rounded_rect(sv, _GC_0_0_0_80, 4, 1)
         # SV cursor crosshair
         var cx = sv.x + int(self.saturation * float(sv.w))
         var cy = sv.y + int((1.0 - self.value) * float(sv.h))
-        renderer.draw_circle(cx, cy, 8, Color(255, 255, 255, 200))
-        renderer.draw_circle(cx, cy, 6, Color(0, 0, 0, 120))
+        renderer.draw_circle(cx, cy, 8, _GC_255_255_255_200)
+        renderer.draw_circle(cx, cy, 6, _GC_0_0_0_120)
         renderer.fill_circle(cx, cy, 4, self.get_color())
         # Hue rainbow strip (8 segments)
         var seg_w = int(hr.w / 8)
@@ -8547,13 +8686,13 @@ class ColorPicker:
         var hi = 0
         while hi < 8:
             var seg_c = self._hsv_to_rgb(hues[hi], 1.0, 1.0)
-            renderer.fill_rect(Rect(hr.x + hi * seg_w, hr.y, seg_w + 1, hr.h), seg_c)
+            renderer.fill_xywh(hr.x + hi * seg_w, hr.y, seg_w + 1, hr.h, seg_c)
             hi = hi + 1
-        renderer.draw_rounded_rect(hr, Color(0, 0, 0, 80), 4, 1)
+        renderer.draw_rounded_rect(hr, _GC_0_0_0_80, 4, 1)
         # Hue cursor
         var hx = hr.x + int(self.hue * float(hr.w))
-        renderer.fill_rect(Rect(hx - 2, hr.y - 2, 4, hr.h + 4), Color(255, 255, 255, 230))
-        renderer.draw_rect(Rect(hx - 2, hr.y - 2, 4, hr.h + 4), Color(0, 0, 0, 100), 1)
+        renderer.fill_xywh(hx - 2, hr.y - 2, 4, hr.h + 4, _GC_255_255_255_230)
+        renderer.rect_xywh(hx - 2, hr.y - 2, 4, hr.h + 4, _GC_0_0_0_100, 1)
         # Alpha strip
         if self.show_alpha:
             var ar = self.alpha_rect()
@@ -8562,21 +8701,21 @@ class ColorPicker:
             var checker_cols = int(ar.w / csize)
             var ci = 0
             while ci < checker_cols:
-                var checker_c = Color(180, 180, 180, 255) if (ci % 2 == 0) else Color(120, 120, 120, 255)
-                renderer.fill_rect(Rect(ar.x + ci * csize, ar.y, csize, ar.h), checker_c)
+                var checker_c = _GC_180_180_180_255 if (ci % 2 == 0) else _GC_120_120_120_255
+                renderer.fill_xywh(ar.x + ci * csize, ar.y, csize, ar.h, checker_c)
                 ci = ci + 1
             var base_c = self.get_color()
             renderer.fill_rounded_rect(ar, Color(base_c.r, base_c.g, base_c.b, int(self.alpha * 180)), 4)
-            renderer.draw_rounded_rect(ar, Color(0, 0, 0, 80), 4, 1)
+            renderer.draw_rounded_rect(ar, _GC_0_0_0_80, 4, 1)
             var ax = ar.x + int(self.alpha * float(ar.w))
-            renderer.fill_rect(Rect(ax - 2, ar.y - 2, 4, ar.h + 4), Color(255, 255, 255, 230))
-            renderer.draw_rect(Rect(ax - 2, ar.y - 2, 4, ar.h + 4), Color(0, 0, 0, 100), 1)
+            renderer.fill_xywh(ax - 2, ar.y - 2, 4, ar.h + 4, _GC_255_255_255_230)
+            renderer.rect_xywh(ax - 2, ar.y - 2, 4, ar.h + 4, _GC_0_0_0_100, 1)
         # Color preview swatch + hex
         if self.show_hex:
             var swatch_y = self.y + self.size + self.gap * 3 + self.hue_strip_h + self.alpha_strip_h
             var swatch_r = Rect(self.x, swatch_y, 36, 24)
             renderer.fill_rounded_rect(swatch_r, self.get_color(), 6)
-            renderer.draw_rounded_rect(swatch_r, Color(255, 255, 255, 60), 6, 1)
+            renderer.draw_rounded_rect(swatch_r, _GC_255_255_255_60, 6, 1)
             renderer.draw_text(self.get_hex(), self.x + 44, swatch_y + 4, self.font_mono, self.theme.text)
 
     def draw(self, renderer):
@@ -8727,9 +8866,9 @@ class LineChart:
         # Background
         if self.bg_color != none:
             renderer.fill_rounded_rect(self.rect, self.bg_color, 12)
-        renderer.draw_shadow(self.rect, 16, 0, 4, Color(0, 0, 0, 50))
+        renderer.draw_shadow(self.rect, 16, 0, 4, _GC_0_0_0_50)
         renderer.fill_rounded_rect(self.rect, self.theme.surface, 12)
-        renderer.draw_rounded_rect(self.rect, Color(255, 255, 255, 15), 12, 1)
+        renderer.draw_rounded_rect(self.rect, _GC_255_255_255_15, 12, 1)
         # Title
         if self.title != "":
             var tw = len(self.title) * 8
@@ -8739,7 +8878,7 @@ class LineChart:
             var gi = 0
             while gi <= self.grid_lines:
                 var gy = pa.bottom() - int(float(gi) / float(self.grid_lines) * float(pa.h))
-                renderer.fill_rect(Rect(pa.x, gy, pa.w, 1), Color(255, 255, 255, 12))
+                renderer.fill_xywh(pa.x, gy, pa.w, 1, _GC_255_255_255_12)
                 var label_v = min_v + float(gi) / float(self.grid_lines) * val_range
                 var lbl = str(int(label_v))
                 renderer.draw_text(lbl, self.rect.x + 4, gy - 6, self.font, self.theme.text_secondary)
@@ -8753,8 +8892,8 @@ class LineChart:
                 renderer.draw_text(self.x_labels[xi], pos[0] - int(len(self.x_labels[xi]) * 3), pa.bottom() + 8, self.font, self.theme.text_secondary)
                 xi = xi + 1
         # Axis lines
-        renderer.fill_rect(Rect(pa.x, pa.y, 1, pa.h), Color(255, 255, 255, 30))
-        renderer.fill_rect(Rect(pa.x, pa.bottom(), pa.w, 1), Color(255, 255, 255, 30))
+        renderer.fill_xywh(pa.x, pa.y, 1, pa.h, _GC_255_255_255_30)
+        renderer.fill_xywh(pa.x, pa.bottom(), pa.w, 1, _GC_255_255_255_30)
         # Series
         var si = 0
         while si < self.series_count:
@@ -8778,7 +8917,7 @@ class LineChart:
                         var strip_w = p1[0] - p0[0] + 1
                         var strip_top = min(p0[1], p1[1])
                         var strip_h = pa.bottom() - strip_top
-                        renderer.fill_rect(Rect(strip_x, strip_top, strip_w, strip_h), Color(ser.color.r, ser.color.g, ser.color.b, ser.fill_alpha))
+                        renderer.fill_xywh(strip_x, strip_top, strip_w, strip_h, Color(ser.color.r, ser.color.g, ser.color.b, ser.fill_alpha))
                         fi = fi + 1
                 # Line segments
                 var li = 0
@@ -8796,7 +8935,7 @@ class LineChart:
                         var p = self._data_to_px(di, ser.data[di], n, min_v, max_v, pa)
                         renderer.fill_circle(p[0], p[1], ser.dot_r + 2, Color(ser.color.r, ser.color.g, ser.color.b, 80))
                         renderer.fill_circle(p[0], p[1], ser.dot_r, ser.color)
-                        renderer.fill_circle(p[0], p[1], ser.dot_r - 2, Color(255, 255, 255, 180))
+                        renderer.fill_circle(p[0], p[1], ser.dot_r - 2, _GC_255_255_255_180)
                         di = di + 1
                 si = si + 1
         # Legend
@@ -8811,7 +8950,7 @@ class LineChart:
                 li = li + 1
         # Hover crosshair
         if self.hover_x >= pa.x and self.hover_x <= pa.right():
-            renderer.fill_rect(Rect(self.hover_x, pa.y, 1, pa.h), Color(255, 255, 255, 40))
+            renderer.fill_xywh(self.hover_x, pa.y, 1, pa.h, _GC_255_255_255_40)
 
     def draw(self, renderer):
         if self.visible:
@@ -8899,9 +9038,9 @@ class BarChart:
         if mx == 0.0:
             var mx = 1.0
         # Background
-        renderer.draw_shadow(self.rect, 16, 0, 4, Color(0, 0, 0, 50))
+        renderer.draw_shadow(self.rect, 16, 0, 4, _GC_0_0_0_50)
         renderer.fill_rounded_rect(self.rect, self.theme.surface, 12)
-        renderer.draw_rounded_rect(self.rect, Color(255, 255, 255, 15), 12, 1)
+        renderer.draw_rounded_rect(self.rect, _GC_255_255_255_15, 12, 1)
         # Title
         if self.title != "":
             var tw = len(self.title) * 8
@@ -8911,13 +9050,13 @@ class BarChart:
             var gi = 0
             while gi <= self.grid_lines:
                 var gy = pa_bottom - int(float(gi) / float(self.grid_lines) * float(pa_h))
-                renderer.fill_rect(Rect(pa_x, gy, pa_w, 1), Color(255, 255, 255, 12))
+                renderer.fill_xywh(pa_x, gy, pa_w, 1, _GC_255_255_255_12)
                 var lv = int(float(gi) / float(self.grid_lines) * mx)
                 renderer.draw_text(str(lv), self.rect.x + 4, gy - 6, self.font, self.theme.text_secondary)
                 gi = gi + 1
         # Axes
-        renderer.fill_rect(Rect(pa_x, pa_y, 1, pa_h + 1), Color(255, 255, 255, 30))
-        renderer.fill_xywh(pa_x, pa_bottom, pa_w, 1, Color(255, 255, 255, 30))
+        renderer.fill_xywh(pa_x, pa_y, 1, pa_h + 1, _GC_255_255_255_30)
+        renderer.fill_xywh(pa_x, pa_bottom, pa_w, 1, _GC_255_255_255_30)
         # Bars
         var total_bar_w = self.bar_count * (self.bar_w + self.bar_gap) - self.bar_gap
         var start_x = pa_x + int((pa_w - total_bar_w) / 2)
@@ -8931,15 +9070,15 @@ class BarChart:
             var by = pa_bottom - animated_h
             var c = bar["color"]
             # Shadow under bar
-            renderer.fill_rect(Rect(bx + 3, by + 4, self.bar_w, animated_h), Color(c.r, c.g, c.b, 40))
+            renderer.fill_xywh(bx + 3, by + 4, self.bar_w, animated_h, Color(c.r, c.g, c.b, 40))
             # Gradient bar body (drawn as two halves: brighter top, normal bottom)
             var bright = Color(min(c.r + 50, 255), min(c.g + 50, 255), min(c.b + 50, 255), 255)
             if animated_h > 0:
-                renderer.fill_rounded_rect(Rect(bx, by, self.bar_w, animated_h), c, 6)
+                renderer.fill_round_xywh(bx, by, self.bar_w, animated_h, c, 6)
                 # Highlight on top third of bar
-                renderer.fill_rounded_rect(Rect(bx, by, self.bar_w, int(animated_h / 3) + 1), bright, 6)
+                renderer.fill_round_xywh(bx, by, self.bar_w, int(animated_h / 3) + 1, bright, 6)
                 # Shine stripe
-                renderer.fill_rounded_rect(Rect(bx + 4, by + 4, int(self.bar_w / 4), int(animated_h / 2)), Color(255, 255, 255, 45), 3)
+                renderer.fill_round_xywh(bx + 4, by + 4, int(self.bar_w / 4), int(animated_h / 2), _GC_255_255_255_45, 3)
             # Value label on top
             if self.show_values and animated_h > 16:
                 var val_str = str(int(bar["value"]))
@@ -9053,8 +9192,8 @@ class Gauge:
         var cy = self.y + int(self.size / 2)
         var r = int(self.size / 2) - 4
         # Outer glow
-        renderer.fill_circle(cx, cy, r + 10, Color(0, 0, 0, 40))
-        renderer.fill_circle(cx, cy, r + 4, Color(0, 0, 0, 60))
+        renderer.fill_circle(cx, cy, r + 10, _GC_0_0_0_40)
+        renderer.fill_circle(cx, cy, r + 4, _GC_0_0_0_60)
         # Background disk
         renderer.fill_circle(cx, cy, r, self.bg_color)
         # Track arc
@@ -9073,7 +9212,7 @@ class Gauge:
         if range_v == 0.0:
             var range_v = 1.0
         var pct = (self.display_value - float(self.min_val)) / range_v
-        var prog_color = Color(99, 102, 241, 255)
+        var prog_color = _GC_99_102_241_255
         if self.zone_count > 0:
             var zi2 = 0
             while zi2 < self.zone_count:
@@ -9092,15 +9231,15 @@ class Gauge:
                 var t_inner = r - self.thickness - 4 - t_len
                 var t_outer = r - self.thickness - 4
                 # Use approximate sin/cos (hard coded for 8 angles won't work, use renderer.draw_line with angle)
-                renderer.draw_spoke(cx, cy, t_inner, t_outer, t_angle, Color(180, 180, 200, 120))
+                renderer.draw_spoke(cx, cy, t_inner, t_outer, t_angle, _GC_180_180_200_120)
                 ti = ti + 1
         # Inner circle (hub)
-        renderer.fill_circle(cx, cy, int(r * 0.22), Color(50, 52, 70, 255))
-        renderer.draw_circle(cx, cy, int(r * 0.22), Color(255, 255, 255, 20))
+        renderer.fill_circle(cx, cy, int(r * 0.22), _GC_50_52_70_255)
+        renderer.draw_circle(cx, cy, int(r * 0.22), _GC_255_255_255_20)
         # Needle
         renderer.draw_needle(cx, cy, int(r * 0.72), prog_angle, self.needle_color, 3)
         renderer.fill_circle(cx, cy, int(r * 0.1), self.needle_color)
-        renderer.fill_circle(cx, cy, int(r * 0.06), Color(255, 255, 255, 200))
+        renderer.fill_circle(cx, cy, int(r * 0.06), _GC_255_255_255_200)
         # Value text
         var val_str = str(int(self.display_value))
         var vw = len(val_str) * int(self.size / 10)
@@ -9271,17 +9410,17 @@ class CalendarWidget:
         var month_names = ["", "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
         var day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         # Background
-        renderer.draw_shadow(self.rect, 20, 0, 6, Color(0, 0, 0, 60))
+        renderer.draw_shadow(self.rect, 20, 0, 6, _GC_0_0_0_60)
         renderer.fill_rounded_rect(self.rect, self.theme.surface, 16)
-        renderer.draw_rounded_rect(self.rect, Color(255, 255, 255, 15), 16, 1)
+        renderer.draw_rounded_rect(self.rect, _GC_255_255_255_15, 16, 1)
         # Header gradient
         var hdr = Rect(self.rect.x, self.rect.y, self.rect.w, self.header_h)
         renderer.fill_rounded_rect(hdr, Color(self.accent.r, self.accent.g, self.accent.b, 30), 16)
-        renderer.fill_rect(Rect(self.rect.x, self.rect.y + 8, self.rect.w, self.header_h - 8), Color(self.accent.r, self.accent.g, self.accent.b, 20))
+        renderer.fill_xywh(self.rect.x, self.rect.y + 8, self.rect.w, self.header_h - 8, Color(self.accent.r, self.accent.g, self.accent.b, 20))
         # Navigation
-        renderer.fill_rounded_rect(Rect(self.rect.x + 10, self.rect.y + 10, 30, 30), Color(255, 255, 255, 15), 8)
+        renderer.fill_round_xywh(self.rect.x + 10, self.rect.y + 10, 30, 30, _GC_255_255_255_15, 8)
         renderer.chevron(self.rect.x + 25, self.rect.y + 25, 10, "left", self.theme.text)
-        renderer.fill_rounded_rect(Rect(self.rect.right() - 40, self.rect.y + 10, 30, 30), Color(255, 255, 255, 15), 8)
+        renderer.fill_round_xywh(self.rect.right() - 40, self.rect.y + 10, 30, 30, _GC_255_255_255_15, 8)
         renderer.chevron(self.rect.right() - 25, self.rect.y + 25, 10, "right", self.theme.text)
         # Month/year title
         var title = month_names[self.month] + " " + str(self.year)
@@ -9297,7 +9436,7 @@ class CalendarWidget:
             var dc = self.weekend_color if is_weekend else self.theme.text_secondary
             renderer.draw_text(dname, dx, wd_y + 6, self.font, dc)
             di = di + 1
-        renderer.fill_rect(Rect(self.rect.x, self.rect.y + self.header_h + self.weekday_h - 1, self.rect.w, 1), Color(255, 255, 255, 15))
+        renderer.fill_xywh(self.rect.x, self.rect.y + self.header_h + self.weekday_h - 1, self.rect.w, 1, _GC_255_255_255_15)
         # Calendar grid
         var grid_y = self.rect.y + self.header_h + self.weekday_h
         var first_wd = self._first_weekday(self.year, self.month)
@@ -9317,14 +9456,14 @@ class CalendarWidget:
                     var is_selected = (d == self.selected_day)
                     var is_weekend = (ci == 5 or ci == 6)
                     if is_selected:
-                        renderer.fill_rounded_rect(Rect(cx + 4, cy + 2, self.cell_w - 8, self.cell_h - 4), self.accent, 10)
+                        renderer.fill_round_xywh(cx + 4, cy + 2, self.cell_w - 8, self.cell_h - 4, self.accent, 10)
                     elif is_today:
-                        renderer.fill_rounded_rect(Rect(cx + 4, cy + 2, self.cell_w - 8, self.cell_h - 4), Color(self.accent.r, self.accent.g, self.accent.b, 35), 10)
+                        renderer.fill_round_xywh(cx + 4, cy + 2, self.cell_w - 8, self.cell_h - 4, Color(self.accent.r, self.accent.g, self.accent.b, 35), 10)
                     var day_str = str(d)
                     var dw = len(day_str) * 7
                     var tx = cx + int((self.cell_w - dw) / 2)
                     var ty = cy + int((self.cell_h - 14) / 2)
-                    var tc = Color(255, 255, 255, 255) if is_selected else (self.today_color if is_today else (self.weekend_color if is_weekend else self.theme.text))
+                    var tc = _GC_255_255_255_255 if is_selected else (self.today_color if is_today else (self.weekend_color if is_weekend else self.theme.text))
                     var df = self.font_bold if (is_today or is_selected) else self.font
                     renderer.draw_text(day_str, tx, ty, df, tc)
                     if self.has_event(d):
@@ -9426,11 +9565,11 @@ class SkeletonLoader:
         var i = 0
         while i < self.block_count:
             var b = self.blocks[i]
-            renderer.fill_rounded_rect(Rect(b.x, b.y, b.w, b.h), self.base_color, b.radius)
+            renderer.fill_round_xywh(b.x, b.y, b.w, b.h, self.base_color, b.radius)
             var sx = b.x + int(self.shimmer_x) - int(float(self.shimmer_w) / 2)
             var clip_r = Rect(b.x, b.y, b.w, b.h)
             renderer.set_clip(clip_r)
-            renderer.fill_rounded_rect(Rect(sx, b.y, self.shimmer_w, b.h), self.shimmer_color, b.radius)
+            renderer.fill_round_xywh(sx, b.y, self.shimmer_w, b.h, self.shimmer_color, b.radius)
             renderer.clear_clip()
             i = i + 1
 
@@ -9534,7 +9673,7 @@ class Timeline:
         var lx = self.x + self.line_x_offset
         var total_h = self.total_height()
         # Vertical connector line with gradient feel
-        renderer.fill_rect(Rect(lx - 1, self.y + self.dot_r, 2, total_h - self.dot_r * 2), self.line_color)
+        renderer.fill_xywh(lx - 1, self.y + self.dot_r, 2, total_h - self.dot_r * 2, self.line_color)
         var iy = self.y
         var i = 0
         while i < self.event_count:
@@ -9547,9 +9686,9 @@ class Timeline:
                 renderer.fill_circle(lx, dot_y, self.dot_r + 3, Color(ev.color.r, ev.color.g, ev.color.b, 60))
             # Dot with inner highlight
             renderer.fill_circle(lx, dot_y, self.dot_r, ev.color)
-            renderer.fill_circle(lx - 2, dot_y - 2, int(self.dot_r * 0.45), Color(255, 255, 255, 80))
+            renderer.fill_circle(lx - 2, dot_y - 2, int(self.dot_r * 0.45), _GC_255_255_255_80)
             if ev.icon != "":
-                renderer.draw_text(ev.icon, lx - 6, dot_y - 8, self.font_icon, Color(255, 255, 255, 230))
+                renderer.draw_text(ev.icon, lx - 6, dot_y - 8, self.font_icon, _GC_255_255_255_230)
             # Content area
             var cx = lx + self.dot_r + 16
             var cw = self.w - self.line_x_offset - self.dot_r - 20
@@ -9570,7 +9709,7 @@ class Timeline:
                 renderer.draw_text(ev.description, cx, iy + 40, self.font_desc, Color(self.theme.text_secondary.r, self.theme.text_secondary.g, self.theme.text_secondary.b, 200))
             # Subtle horizontal rule under item (except last)
             if not is_last:
-                renderer.fill_rect(Rect(cx, iy + self.min_item_h + int(self.item_gap / 2) - 1, cw, 1), Color(255, 255, 255, 8))
+                renderer.fill_xywh(cx, iy + self.min_item_h + int(self.item_gap / 2) - 1, cw, 1, _GC_255_255_255_8)
             iy = iy + self.min_item_h + self.item_gap
             i = i + 1
 
@@ -9711,8 +9850,8 @@ class PieChart:
         var cy = self.y + int(self.size / 2)
         var r = int(self.size / 2) - 8
         # Background
-        renderer.draw_shadow(Rect(self.x, self.y, self.size, self.size), 20, 0, 6, Color(0, 0, 0, 50))
-        renderer.fill_rounded_rect(Rect(self.x, self.y, self.size, self.size), self.theme.surface, 16)
+        renderer.shadow_xywh(self.x, self.y, self.size, self.size, 20, 0, 6, _GC_0_0_0_50)
+        renderer.fill_round_xywh(self.x, self.y, self.size, self.size, self.theme.surface, 16)
         # Title
         if self.title != "":
             var tw = len(self.title) * 8
@@ -9721,7 +9860,7 @@ class PieChart:
         if tot == 0.0:
             var tot = 1.0
         # Outer glow ring
-        renderer.fill_circle(cx, cy, r + 6, Color(0, 0, 0, 30))
+        renderer.fill_circle(cx, cy, r + 6, _GC_0_0_0_30)
         # Draw segments
         var angle = -90.0
         var draw_sweep = 360.0 * self.anim_progress
@@ -9754,8 +9893,8 @@ class PieChart:
         if self.donut:
             var hole_r = int(r * self.donut_ratio)
             renderer.fill_circle(cx, cy, hole_r, self.theme.surface)
-            renderer.draw_circle(cx, cy, hole_r, Color(0, 0, 0, 40))
-            renderer.draw_circle(cx, cy, hole_r - 2, Color(255, 255, 255, 10))
+            renderer.draw_circle(cx, cy, hole_r, _GC_0_0_0_40)
+            renderer.draw_circle(cx, cy, hole_r - 2, _GC_255_255_255_10)
             # Center value display
             if self.center_value != "":
                 var vw = len(self.center_value) * int(self.size / 15)
@@ -9771,7 +9910,7 @@ class PieChart:
             while i2 < self.seg_count:
                 var seg = self.segments[i2]
                 var pct = int(seg.value / tot * 100.0)
-                renderer.fill_rounded_rect(Rect(leg_x, leg_y + 3, 10, 10), seg.color, 5)
+                renderer.fill_round_xywh(leg_x, leg_y + 3, 10, 10, seg.color, 5)
                 renderer.draw_text(seg.label + " " + str(pct) + "%", leg_x + 14, leg_y, self.font, self.theme.text_secondary)
                 leg_x = leg_x + len(seg.label) * 7 + 60
                 if leg_x > self.x + self.size - 80:
@@ -9877,15 +10016,15 @@ class KanbanColumn:
         # Column header
         var hdr = Rect(cx, cy, self.card_w + 20, self.header_h)
         renderer.fill_rounded_rect(hdr, Color(self.color.r, self.color.g, self.color.b, 40), 14)
-        renderer.fill_rect(Rect(cx, cy + 8, self.card_w + 20, self.header_h - 8), Color(self.color.r, self.color.g, self.color.b, 25))
+        renderer.fill_xywh(cx, cy + 8, self.card_w + 20, self.header_h - 8, Color(self.color.r, self.color.g, self.color.b, 25))
         # Color accent strip at top of column
-        renderer.fill_rounded_rect(Rect(cx + 12, cy + 8, 36, 4), self.color, 2)
-        renderer.draw_text(self.title, cx + 14, cy + 14, font_title, Color(255, 255, 255, 230))
+        renderer.fill_round_xywh(cx + 12, cy + 8, 36, 4, self.color, 2)
+        renderer.draw_text(self.title, cx + 14, cy + 14, font_title, _GC_255_255_255_230)
         # Card count badge
         var cnt_str = str(self.card_count)
         var badge_r = Rect(cx + self.card_w - 4, cy + 12, len(cnt_str) * 7 + 10, 20)
         renderer.fill_rounded_rect(badge_r, Color(self.color.r, self.color.g, self.color.b, 80), 10)
-        renderer.draw_text(cnt_str, cx + self.card_w - 2, cy + 14, font_small, Color(255, 255, 255, 200))
+        renderer.draw_text(cnt_str, cx + self.card_w - 2, cy + 14, font_small, _GC_255_255_255_200)
         # Cards
         var card_y = cy + self.header_h + self.card_gap
         var i = 0
@@ -9893,27 +10032,27 @@ class KanbanColumn:
             var card = self.cards[i]
             var cr = Rect(cx + 10, card_y, self.card_w, self.card_h)
             # Card shadow + lift
-            renderer.draw_shadow(cr, 12, 0, 4, Color(0, 0, 0, 60))
+            renderer.draw_shadow(cr, 12, 0, 4, _GC_0_0_0_60)
             # Card bg
-            var card_bg = Color(45, 47, 65, 255) if card.color == none else card.color
+            var card_bg = _GC_45_47_65_255 if card.color == none else card.color
             renderer.fill_rounded_rect(cr, card_bg, 10)
-            renderer.draw_rounded_rect(cr, Color(255, 255, 255, 12), 10, 1)
+            renderer.draw_rounded_rect(cr, _GC_255_255_255_12, 10, 1)
             # Priority stripe on left edge
-            var pri_color = Color(255, 80, 60, 255)
+            var pri_color = _GC_255_80_60_255
             if card.priority == "normal":
-                var pri_color = Color(99, 102, 241, 200)
+                var pri_color = _GC_99_102_241_200
             elif card.priority == "low":
-                pri_color = Color(52, 199, 89, 200)
+                pri_color = _GC_52_199_89_200
             elif card.priority == "critical":
-                pri_color = Color(255, 45, 85, 255)
-            renderer.fill_rounded_rect(Rect(cx + 10, card_y, 3, self.card_h), pri_color, 2)
+                pri_color = _GC_255_45_85_255
+            renderer.fill_round_xywh(cx + 10, card_y, 3, self.card_h, pri_color, 2)
             # Title
-            renderer.draw_text(card.title, cx + 20, card_y + 10, font_title, Color(235, 235, 250, 255))
+            renderer.draw_text(card.title, cx + 20, card_y + 10, font_title, _GC_235_235_250_255)
             # Description (truncated)
             var desc = card.description
             if len(desc) > 28:
                 desc = desc[0:28] + "..."
-            renderer.draw_text(desc, cx + 20, card_y + 30, font, Color(160, 162, 190, 200))
+            renderer.draw_text(desc, cx + 20, card_y + 30, font, _GC_160_162_190_200)
             # Tags
             var tx = cx + 20
             var ti = 0
@@ -9926,17 +10065,17 @@ class KanbanColumn:
             # Progress bar (if set)
             if card.progress > 0:
                 var pb_r = Rect(cx + 20, card_y + 74, self.card_w - 30, 4)
-                renderer.fill_rounded_rect(pb_r, Color(60, 62, 80, 255), 2)
+                renderer.fill_rounded_rect(pb_r, _GC_60_62_80_255, 2)
                 var fill_w = int(float(card.progress) / 100.0 * float(self.card_w - 30))
-                renderer.fill_rounded_rect(Rect(cx + 20, card_y + 74, fill_w, 4), self.color, 2)
+                renderer.fill_round_xywh(cx + 20, card_y + 74, fill_w, 4, self.color, 2)
             # Assignee
             if card.assignee != "":
                 var initials = card.assignee[0:1]
                 renderer.fill_circle(cx + self.card_w - 8, card_y + self.card_h - 14, 11, self.color)
-                renderer.draw_text(string_upper(initials), cx + self.card_w - 13, card_y + self.card_h - 21, font_small, Color(255, 255, 255, 230))
+                renderer.draw_text(string_upper(initials), cx + self.card_w - 13, card_y + self.card_h - 21, font_small, _GC_255_255_255_230)
             # Due date
             if card.due != "":
-                renderer.draw_text("? " + card.due, cx + 20, card_y + self.card_h - 20, font_small, Color(160, 162, 180, 180))
+                renderer.draw_text("? " + card.due, cx + 20, card_y + self.card_h - 20, font_small, _GC_160_162_180_180)
             card_y = card_y + self.card_h + self.card_gap
             i = i + 1
 
@@ -10011,12 +10150,12 @@ class KanbanBoard:
     def _draw(self, renderer):
         # Board background
         renderer.fill_rounded_rect(self.rect, self.bg_color, 16)
-        renderer.draw_rounded_rect(self.rect, Color(255, 255, 255, 10), 16, 1)
+        renderer.draw_rounded_rect(self.rect, _GC_255_255_255_10, 16, 1)
         renderer.set_clip(self.rect)
         # Board title bar
         if self.title != "":
             var tb_r = Rect(self.rect.x, self.rect.y, self.rect.w, 50)
-            renderer.fill_rounded_rect(tb_r, Color(0, 0, 0, 30), 16)
+            renderer.fill_rounded_rect(tb_r, _GC_0_0_0_30, 16)
             renderer.draw_text(self.title, self.rect.x + 20, self.rect.y + 14, self.font_board_title, self.theme.text)
             var total_str = str(self.total_cards()) + " cards"
             renderer.draw_text(total_str, self.rect.right() - len(total_str) * 7 - 20, self.rect.y + 16, self.font, self.theme.text_secondary)
@@ -10193,12 +10332,12 @@ class HeatMap:
                 var cell_r = Rect(cx, cy, self.cell_size, self.cell_size)
                 var cc = self._cell_color(val)
                 # Cell shadow
-                renderer.fill_rounded_rect(Rect(cx + 1, cy + 1, self.cell_size, self.cell_size), Color(0, 0, 0, 40), self.radius)
+                renderer.fill_round_xywh(cx + 1, cy + 1, self.cell_size, self.cell_size, _GC_0_0_0_40, self.radius)
                 renderer.fill_rounded_rect(cell_r, cc, self.radius)
                 # Subtle highlight on bright cells
                 var brightness = int(float(cc.r + cc.g + cc.b) / 3)
                 if brightness > 100:
-                    renderer.fill_rounded_rect(Rect(cx, cy, self.cell_size, int(self.cell_size / 2)), Color(255, 255, 255, 20), self.radius)
+                    renderer.fill_round_xywh(cx, cy, self.cell_size, int(self.cell_size / 2), _GC_255_255_255_20, self.radius)
                 renderer.draw_rounded_rect(cell_r, self.border_color, self.radius, 1)
                 row = row + 1
             if self.col_label_count > col and col < self.col_label_count:
@@ -10224,7 +10363,7 @@ class HeatMap:
             var r = int(float(self.colors_low.r) + t * float(self.colors_high.r - self.colors_low.r))
             var g = int(float(self.colors_low.g) + t * float(self.colors_high.g - self.colors_low.g))
             var b = int(float(self.colors_low.b) + t * float(self.colors_high.b - self.colors_low.b))
-            renderer.fill_rounded_rect(Rect(ox + li * sw, leg_y, sw + 1, 8), Color(r, g, b, 255), 2)
+            renderer.fill_round_xywh(ox + li * sw, leg_y, sw + 1, 8, Color(r, g, b, 255), 2)
             li = li + 1
         renderer.draw_text(str(int(self.min_val)), ox, leg_y + 12, self.font, self.theme.text_secondary)
         renderer.draw_text(str(int(self.max_val)), ox + leg_w - 16, leg_y + 12, self.font, self.theme.text_secondary)
@@ -10337,7 +10476,7 @@ class AudioWaveform:
 
     def _draw(self, renderer):
         renderer.fill_rounded_rect(self.rect, self.bg_color, 12)
-        renderer.draw_rounded_rect(self.rect, Color(255, 255, 255, 12), 12, 1)
+        renderer.draw_rounded_rect(self.rect, _GC_255_255_255_12, 12, 1)
         var cy = self.rect.y + int(self.rect.h / 2)
         var bar_w = 3
         var step = bar_w + self.bar_gap
@@ -10356,7 +10495,7 @@ class AudioWaveform:
             if bh < 2:
                 var bh = 2
             var is_played = (bx < playhead_px)
-            var bar_color = Color(0,0,0,0)
+            var bar_color = _GC_0_0_0_0
             if is_played:
                 var t = float(bi) / float(n_bars)
                 var r = int(float(self.color_low.r) + t * float(self.color_high.r - self.color_low.r))
@@ -10364,26 +10503,26 @@ class AudioWaveform:
                 var b_ch = int(float(self.color_low.b) + t * float(self.color_high.b - self.color_low.b))
                 var bar_color = Color(r, g, b_ch, 255)
             else:
-                bar_color = Color(70, 72, 95, 200)
+                bar_color = _GC_70_72_95_200
             # Upper bar
-            renderer.fill_rounded_rect(Rect(bx, cy - bh, bar_w, bh), bar_color, 1)
+            renderer.fill_round_xywh(bx, cy - bh, bar_w, bh, bar_color, 1)
             # Mirror lower bar (slightly dimmer)
-            renderer.fill_rounded_rect(Rect(bx, cy, bar_w, int(bh * 0.6)), Color(bar_color.r, bar_color.g, bar_color.b, int(bar_color.a * 0.5)), 1)
+            renderer.fill_round_xywh(bx, cy, bar_w, int(bh * 0.6), Color(bar_color.r, bar_color.g, bar_color.b, int(bar_color.a * 0.5)), 1)
             # Glow on played bars
             if is_played and bh > 8:
-                renderer.fill_rounded_rect(Rect(bx, cy - bh, bar_w, bh), Color(bar_color.r, bar_color.g, bar_color.b, 60), 1)
+                renderer.fill_round_xywh(bx, cy - bh, bar_w, bh, Color(bar_color.r, bar_color.g, bar_color.b, 60), 1)
             bi = bi + 1
         # Playhead needle
-        renderer.fill_rect(Rect(playhead_px, self.rect.y + 4, 2, self.rect.h - 8), self.playhead_color)
+        renderer.fill_xywh(playhead_px, self.rect.y + 4, 2, self.rect.h - 8, self.playhead_color)
         renderer.fill_circle(playhead_px + 1, self.rect.y + 6, 5, self.playhead_color)
         renderer.fill_circle(playhead_px + 1, self.rect.bottom() - 6, 5, self.playhead_color)
         # Title + time display
         if self.title != "":
-            renderer.draw_text(self.title, self.rect.x + 12, self.rect.y + 8, self.font, Color(220, 220, 240, 200))
+            renderer.draw_text(self.title, self.rect.x + 12, self.rect.y + 8, self.font, _GC_220_220_240_200)
         if self.current_str != "" and self.duration_str != "":
             var time_str = self.current_str + " / " + self.duration_str
             var tw = len(time_str) * 7
-            renderer.draw_text(time_str, self.rect.right() - tw - 12, self.rect.y + 8, self.font, Color(160, 162, 190, 180))
+            renderer.draw_text(time_str, self.rect.right() - tw - 12, self.rect.y + 8, self.font, _GC_160_162_190_180)
 
     def draw(self, renderer):
         if self.visible:
@@ -10586,25 +10725,25 @@ class Spotlight:
 
     def _draw(self, renderer):
         # Backdrop
-        renderer.fill_rect(Rect(0, 0, self.window_w, self.window_h), Color(0, 0, 0, 140))
+        renderer.fill_xywh(0, 0, self.window_w, self.window_h, _GC_0_0_0_140)
         # Panel
         var panel = Rect(self.x, self.y, self.w, self.h)
-        renderer.draw_shadow(panel, 40, 0, 16, Color(0, 0, 0, 120))
+        renderer.draw_shadow(panel, 40, 0, 16, _GC_0_0_0_120)
         renderer.fill_rounded_rect(panel, self.bg, 16)
-        renderer.draw_rounded_rect(panel, Color(255, 255, 255, 20), 16, 1)
+        renderer.draw_rounded_rect(panel, _GC_255_255_255_20, 16, 1)
         # Accent top border glow
-        renderer.fill_rounded_rect(Rect(self.x + 40, self.y - 1, self.w - 80, 2), Color(99, 102, 241, 200), 1)
+        renderer.fill_round_xywh(self.x + 40, self.y - 1, self.w - 80, 2, _GC_99_102_241_200, 1)
         # Search input area
         var inp_r = Rect(self.x, self.y, self.w, self.input_h)
-        renderer.fill_rounded_rect(inp_r, Color(255, 255, 255, 6), 16)
-        renderer.fill_rect(Rect(self.x, self.y + self.input_h - 1, self.w, 1), Color(255, 255, 255, 12))
+        renderer.fill_rounded_rect(inp_r, _GC_255_255_255_6, 16)
+        renderer.fill_xywh(self.x, self.y + self.input_h - 1, self.w, 1, _GC_255_255_255_12)
         # Search icon
         renderer.magnifier(self.x + 16, self.y + 16, 18, self.theme.text_secondary)
         # Query text with cursor
         var disp_q = self.query + "|"
-        renderer.draw_text(disp_q, self.x + 44, self.y + 16, self.font, Color(230, 232, 255, 255))
+        renderer.draw_text(disp_q, self.x + 44, self.y + 16, self.font, _GC_230_232_255_255)
         if self.query == "":
-            renderer.draw_text("Search commands, files, actions...", self.x + 44, self.y + 16, self.font, Color(100, 102, 140, 180))
+            renderer.draw_text("Search commands, files, actions...", self.x + 44, self.y + 16, self.font, _GC_100_102_140_180)
         # Results
         var max_visible = int((self.h - self.input_h) / self.item_h)
         var show_start = 0
@@ -10620,34 +10759,34 @@ class Spotlight:
                 var iy = self.y + self.input_h + ri * self.item_h
                 var ir = Rect(self.x, iy, self.w, self.item_h)
                 if idx == self.selected:
-                    renderer.fill_rounded_rect(Rect(self.x + 4, iy + 2, self.w - 8, self.item_h - 4), Color(99, 102, 241, 50), 10)
-                    renderer.draw_rounded_rect(Rect(self.x + 4, iy + 2, self.w - 8, self.item_h - 4), Color(99, 102, 241, 80), 10, 1)
+                    renderer.fill_round_xywh(self.x + 4, iy + 2, self.w - 8, self.item_h - 4, _GC_99_102_241_50, 10)
+                    renderer.round_rect_xywh(self.x + 4, iy + 2, self.w - 8, self.item_h - 4, _GC_99_102_241_80, 10, 1)
                 # Icon badge
-                renderer.fill_rounded_rect(Rect(self.x + 12, iy + 10, 28, 24), Color(99, 102, 241, 30), 8)
-                renderer.draw_text(item.icon, self.x + 16, iy + 11, self.font_icon, Color(180, 182, 240, 230))
+                renderer.fill_round_xywh(self.x + 12, iy + 10, 28, 24, _GC_99_102_241_30, 8)
+                renderer.draw_text(item.icon, self.x + 16, iy + 11, self.font_icon, _GC_180_182_240_230)
                 # Label
-                renderer.draw_text(item.label, self.x + 52, iy + 8, self.font_bold, Color(220, 222, 255, 240))
+                renderer.draw_text(item.label, self.x + 52, iy + 8, self.font_bold, _GC_220_222_255_240)
                 # Category badge
                 var cat_w = len(item.category) * 7 + 12
-                renderer.fill_rounded_rect(Rect(self.x + 52, iy + 26, cat_w, 14), Color(255, 255, 255, 10), 7)
-                renderer.draw_text(item.category, self.x + 58, iy + 27, self.font_small, Color(140, 142, 180, 180))
+                renderer.fill_round_xywh(self.x + 52, iy + 26, cat_w, 14, _GC_255_255_255_10, 7)
+                renderer.draw_text(item.category, self.x + 58, iy + 27, self.font_small, _GC_140_142_180_180)
                 # Shortcut
                 if item.shortcut != "":
                     var sw = len(item.shortcut) * 7 + 10
-                    renderer.fill_rounded_rect(Rect(self.x + self.w - sw - 12, iy + 13, sw, 18), Color(255, 255, 255, 8), 6)
-                    renderer.draw_text(item.shortcut, self.x + self.w - sw - 7, iy + 14, self.font_small, Color(160, 162, 200, 160))
+                    renderer.fill_round_xywh(self.x + self.w - sw - 12, iy + 13, sw, 18, _GC_255_255_255_8, 6)
+                    renderer.draw_text(item.shortcut, self.x + self.w - sw - 7, iy + 14, self.font_small, _GC_160_162_200_160)
                 ri = ri + 1
         # Empty state
         if self.result_count == 0:
-            renderer.draw_text("No results for  \"" + self.query + "\"", self.x + int(self.w / 2) - 80, self.y + self.input_h + 50, self.font, Color(100, 102, 140, 180))
+            renderer.draw_text("No results for  \"" + self.query + "\"", self.x + int(self.w / 2) - 80, self.y + self.input_h + 50, self.font, _GC_100_102_140_180)
         # Footer hint
         var footer_y = self.y + self.h - 26
-        renderer.fill_rect(Rect(self.x, footer_y, self.w, 1), Color(255, 255, 255, 10))
-        renderer.draw_text("^v navigate", self.x + 12, footer_y + 8, self.font_small, Color(100, 102, 140, 160))
-        renderer.draw_text("Enter execute", self.x + 100, footer_y + 8, self.font_small, Color(100, 102, 140, 160))
-        renderer.draw_text("esc dismiss", self.x + 175, footer_y + 8, self.font_small, Color(100, 102, 140, 160))
+        renderer.fill_xywh(self.x, footer_y, self.w, 1, _GC_255_255_255_10)
+        renderer.draw_text("^v navigate", self.x + 12, footer_y + 8, self.font_small, _GC_100_102_140_160)
+        renderer.draw_text("Enter execute", self.x + 100, footer_y + 8, self.font_small, _GC_100_102_140_160)
+        renderer.draw_text("esc dismiss", self.x + 175, footer_y + 8, self.font_small, _GC_100_102_140_160)
         var total_str = str(self.result_count) + " results"
-        renderer.draw_text(total_str, self.x + self.w - len(total_str) * 7 - 12, footer_y + 8, self.font_small, Color(100, 102, 140, 140))
+        renderer.draw_text(total_str, self.x + self.w - len(total_str) * 7 - 12, footer_y + 8, self.font_small, _GC_100_102_140_140)
 
     def draw(self, renderer):
         if self.visible:
@@ -10759,10 +10898,10 @@ class NotificationBell:
         var bell_r = int(self.size / 2)
         # Glow behind bell when panel open or unread > 0
         if self.panel_open or self.unread > 0:
-            renderer.fill_circle(self.cx + wiggle_offset, self.cy, bell_r + 8, Color(99, 102, 241, 25))
-            renderer.fill_circle(self.cx + wiggle_offset, self.cy, bell_r + 4, Color(99, 102, 241, 45))
-        renderer.fill_circle(self.cx + wiggle_offset, self.cy, bell_r, Color(40, 42, 60, 230))
-        renderer.draw_circle(self.cx + wiggle_offset, self.cy, bell_r, Color(255, 255, 255, 15))
+            renderer.fill_circle(self.cx + wiggle_offset, self.cy, bell_r + 8, _GC_99_102_241_25)
+            renderer.fill_circle(self.cx + wiggle_offset, self.cy, bell_r + 4, _GC_99_102_241_45)
+        renderer.fill_circle(self.cx + wiggle_offset, self.cy, bell_r, _GC_40_42_60_230)
+        renderer.draw_circle(self.cx + wiggle_offset, self.cy, bell_r, _GC_255_255_255_15)
         # Bell: a dome, a rim and the clapper.
         var bx = self.cx + wiggle_offset
         var br2 = int(self.size * 0.22)
@@ -10776,23 +10915,23 @@ class NotificationBell:
             if self.unread > 9:
                 var badge_str = "9+"
             var badge_r = Rect(self.cx + bell_r - 6, self.cy - bell_r - 2, len(badge_str) * 7 + 8, 18)
-            renderer.fill_rounded_rect(badge_r, Color(255, 59, 48, 255), 9)
-            renderer.draw_rounded_rect(badge_r, Color(0, 0, 0, 80), 9, 1)
-            renderer.draw_text(badge_str, badge_r.x + 4, badge_r.y + 2, self.font_small, Color(255, 255, 255, 255))
+            renderer.fill_rounded_rect(badge_r, _GC_255_59_48_255, 9)
+            renderer.draw_rounded_rect(badge_r, _GC_0_0_0_80, 9, 1)
+            renderer.draw_text(badge_str, badge_r.x + 4, badge_r.y + 2, self.font_small, _GC_255_255_255_255)
         # Dropdown panel
         if self.panel_open:
             var panel_x = self.cx - self.panel_w + self.size
             var panel_y = self.cy + bell_r + 10
             var pr = Rect(panel_x, panel_y, self.panel_w, self.panel_h)
-            renderer.draw_shadow(pr, 24, 0, 8, Color(0, 0, 0, 100))
+            renderer.draw_shadow(pr, 24, 0, 8, _GC_0_0_0_100)
             renderer.fill_rounded_rect(pr, self.bg_color, 12)
-            renderer.draw_rounded_rect(pr, Color(255, 255, 255, 18), 12, 1)
+            renderer.draw_rounded_rect(pr, _GC_255_255_255_18, 12, 1)
             # Header
             var hdr_r = Rect(panel_x, panel_y, self.panel_w, 40)
-            renderer.fill_rounded_rect(hdr_r, Color(255, 255, 255, 6), 12)
-            renderer.draw_text("Notifications", panel_x + 14, panel_y + 12, self.font_bold, Color(220, 222, 255, 230))
-            renderer.draw_text("Mark all read", panel_x + self.panel_w - 90, panel_y + 12, self.font_small, Color(99, 102, 241, 200))
-            renderer.fill_rect(Rect(panel_x, panel_y + 40, self.panel_w, 1), Color(255, 255, 255, 10))
+            renderer.fill_rounded_rect(hdr_r, _GC_255_255_255_6, 12)
+            renderer.draw_text("Notifications", panel_x + 14, panel_y + 12, self.font_bold, _GC_220_222_255_230)
+            renderer.draw_text("Mark all read", panel_x + self.panel_w - 90, panel_y + 12, self.font_small, _GC_99_102_241_200)
+            renderer.fill_xywh(panel_x, panel_y + 40, self.panel_w, 1, _GC_255_255_255_10)
             var max_show = int((self.panel_h - 48) / self.item_h)
             var iy = panel_y + 42
             var i = 0
@@ -10800,15 +10939,15 @@ class NotificationBell:
                 var item = self.items[self.item_count - 1 - i]
                 var ir = Rect(panel_x, iy, self.panel_w, self.item_h)
                 if not item["read"]:
-                    renderer.fill_rect(ir, Color(99, 102, 241, 12))
+                    renderer.fill_rect(ir, _GC_99_102_241_12)
                 var tc = self._type_color(item["type"])
-                renderer.fill_rect(Rect(panel_x + 2, iy + 8, 3, self.item_h - 16), tc)
-                renderer.draw_text(item["title"], panel_x + 14, iy + 10, self.font_bold, Color(220, 222, 255, 230))
+                renderer.fill_xywh(panel_x + 2, iy + 8, 3, self.item_h - 16, tc)
+                renderer.draw_text(item["title"], panel_x + 14, iy + 10, self.font_bold, _GC_220_222_255_230)
                 var body_short = item["body"]
                 if len(body_short) > 35:
                     body_short = body_short[0:35] + "..."
-                renderer.draw_text(body_short, panel_x + 14, iy + 30, self.font_small, Color(140, 142, 180, 180))
-                renderer.fill_rect(Rect(panel_x + 8, iy + self.item_h - 1, self.panel_w - 16, 1), Color(255, 255, 255, 8))
+                renderer.draw_text(body_short, panel_x + 14, iy + 30, self.font_small, _GC_140_142_180_180)
+                renderer.fill_xywh(panel_x + 8, iy + self.item_h - 1, self.panel_w - 16, 1, _GC_255_255_255_8)
                 iy = iy + self.item_h
                 i = i + 1
 
@@ -10961,15 +11100,15 @@ class GradientButton:
             renderer.fill_rounded_rect(strip_r, Color(r, g, b_ch, 255), self.radius)
             i = i + 1
         # Top highlight (glass effect)
-        renderer.fill_rounded_rect(Rect(dr.x, dr.y, dr.w, int(dr.h / 2)), Color(255, 255, 255, 22), self.radius)
+        renderer.fill_round_xywh(dr.x, dr.y, dr.w, int(dr.h / 2), _GC_255_255_255_22, self.radius)
         # Shimmer sweep
         if self.shimmer_x >= 0.0:
             var sx = dr.x + int(self.shimmer_x * float(dr.w)) - 30
             renderer.set_clip(dr)
-            renderer.fill_rounded_rect(Rect(sx, dr.y, 60, dr.h), Color(255, 255, 255, 35), self.radius)
+            renderer.fill_round_xywh(sx, dr.y, 60, dr.h, _GC_255_255_255_35, self.radius)
             renderer.clear_clip()
         # Glowing border
-        renderer.draw_rounded_rect(dr, Color(255, 255, 255, 50), self.radius, 1)
+        renderer.draw_rounded_rect(dr, _GC_255_255_255_50, self.radius, 1)
         # Ripple effect
         if self.ripple_active:
             renderer.set_clip(dr)
@@ -10977,7 +11116,7 @@ class GradientButton:
             renderer.clear_clip()
         # Disabled overlay
         if self.disabled:
-            renderer.fill_rounded_rect(dr, Color(0, 0, 0, 100), self.radius)
+            renderer.fill_rounded_rect(dr, _GC_0_0_0_100, self.radius)
         # Icon + Label
         var content_w = len(self.label) * 8
         if self.icon != "":
@@ -11088,11 +11227,11 @@ class AnimatedCounter:
 
     def _draw(self, renderer):
         # Card background
-        renderer.draw_shadow(self.rect, 16, 0, 4, Color(0, 0, 0, 60))
+        renderer.draw_shadow(self.rect, 16, 0, 4, _GC_0_0_0_60)
         renderer.fill_rounded_rect(self.rect, self.bg_color, 14)
         renderer.draw_rounded_rect(self.rect, self.border_color, 14, 1)
         # Inner top highlight
-        renderer.fill_rounded_rect(Rect(self.rect.x + 1, self.rect.y + 1, self.rect.w - 2, 2), Color(255, 255, 255, 15), 14)
+        renderer.fill_round_xywh(self.rect.x + 1, self.rect.y + 1, self.rect.w - 2, 2, _GC_255_255_255_15, 14)
         # Label
         renderer.draw_text(self.label, self.rect.x + 16, self.rect.y + 14, self.font_label, self.theme.text_secondary)
         # Main value
@@ -11109,8 +11248,8 @@ class AnimatedCounter:
                 dabs = -dabs
             var d_str = arrow + " " + self._format(dabs)
             var badge_w = len(d_str) * 7 + 12
-            renderer.fill_rounded_rect(Rect(self.rect.x + 16, self.rect.y + self.rect.h - 30, badge_w, 20), Color(dc.r, dc.g, dc.b, 30), 10)
-            renderer.draw_rounded_rect(Rect(self.rect.x + 16, self.rect.y + self.rect.h - 30, badge_w, 20), Color(dc.r, dc.g, dc.b, 80), 10, 1)
+            renderer.fill_round_xywh(self.rect.x + 16, self.rect.y + self.rect.h - 30, badge_w, 20, Color(dc.r, dc.g, dc.b, 30), 10)
+            renderer.round_rect_xywh(self.rect.x + 16, self.rect.y + self.rect.h - 30, badge_w, 20, Color(dc.r, dc.g, dc.b, 80), 10, 1)
             renderer.draw_text(d_str, self.rect.x + 22, self.rect.y + self.rect.h - 27, self.font_delta, dc)
         # Sparkline
         if self.history_count > 1:
@@ -11145,7 +11284,7 @@ class AnimatedCounter:
             var last_x = spark_x + spark_w
             var last_y = spark_y + spark_h - int((self.history[self.history_count - 1] - mn) / spark_range * float(spark_h))
             renderer.fill_circle(last_x, last_y, 4, self.sparkline_color)
-            renderer.fill_circle(last_x, last_y, 2, Color(255, 255, 255, 200))
+            renderer.fill_circle(last_x, last_y, 2, _GC_255_255_255_200)
 
     def draw(self, renderer):
         if self.visible:
@@ -11279,7 +11418,7 @@ class SplitPane:
         # Divider handle dots
         var cx = dr.center_x()
         var cy = dr.center_y()
-        renderer.fill_rounded_rect(Rect(cx - 1, cy, 2, 20), Color(self.accent.r, self.accent.g, self.accent.b, self.handle_alpha), 1)
+        renderer.fill_round_xywh(cx - 1, cy, 2, 20, Color(self.accent.r, self.accent.g, self.accent.b, self.handle_alpha), 1)
         renderer.fill_circle(cx, cy - 12, 2, Color(self.accent.r, self.accent.g, self.accent.b, self.handle_alpha))
         renderer.fill_circle(cx, cy, 2, Color(self.accent.r, self.accent.g, self.accent.b, self.handle_alpha))
         renderer.fill_circle(cx, cy + 12, 2, Color(self.accent.r, self.accent.g, self.accent.b, self.handle_alpha))
@@ -11389,9 +11528,9 @@ class RadarChart:
     def _draw(self, renderer):
         var size = self.radius * 2 + 80
         var bg_r = Rect(self.cx - self.radius - 40, self.cy - self.radius - 40, size, size)
-        renderer.draw_shadow(bg_r, 20, 0, 6, Color(0, 0, 0, 60))
+        renderer.draw_shadow(bg_r, 20, 0, 6, _GC_0_0_0_60)
         renderer.fill_rounded_rect(bg_r, self.bg_color, 16)
-        renderer.draw_rounded_rect(bg_r, Color(255, 255, 255, 12), 16, 1)
+        renderer.draw_rounded_rect(bg_r, _GC_255_255_255_12, 16, 1)
         if self.title != "":
             var tw = len(self.title) * 8
             renderer.draw_text(self.title, self.cx - int(tw / 2), self.cy - self.radius - 30, self.font_title, self.theme.text)
@@ -11447,7 +11586,7 @@ class RadarChart:
                     while di < len(pts):
                         renderer.fill_circle(pts[di][0], pts[di][1], 5, Color(ser.color.r, ser.color.g, ser.color.b, 80))
                         renderer.fill_circle(pts[di][0], pts[di][1], 3, ser.color)
-                        renderer.fill_circle(pts[di][0], pts[di][1], 1, Color(255, 255, 255, 200))
+                        renderer.fill_circle(pts[di][0], pts[di][1], 1, _GC_255_255_255_200)
                         di = di + 1
                 si = si + 1
         # Legend
@@ -11456,7 +11595,7 @@ class RadarChart:
             var ly = self.cy + self.radius + 20
             var li = 0
             while li < self.series_count:
-                renderer.fill_rounded_rect(Rect(lx, ly + 2, 10, 10), self.series[li].color, 5)
+                renderer.fill_round_xywh(lx, ly + 2, 10, 10, self.series[li].color, 5)
                 renderer.draw_text(self.series[li].name, lx + 14, ly, self.font, self.theme.text_secondary)
                 lx = lx + len(self.series[li].name) * 7 + 28
                 li = li + 1
@@ -11640,10 +11779,10 @@ class SideNav:
         renderer.draw_line(self.x + self.w - 1, self.y, self.x + self.w - 1, self.y + self.h, self.border_color, 1)
         # Logo/header
         var hdr = Rect(self.x, self.y, self.w, self.top_h)
-        renderer.fill_rect(hdr, Color(0, 0, 0, 30))
+        renderer.fill_rect(hdr, _GC_0_0_0_30)
         renderer.draw_line(self.x, self.y + self.top_h - 1, self.x + self.w, self.y + self.top_h - 1, self.border_color, 1)
         # Logo icon with glow
-        renderer.fill_rounded_rect(Rect(self.x + 12, self.y + 12, 30, 30), Color(self.accent.r, self.accent.g, self.accent.b, 30), 8)
+        renderer.fill_round_xywh(self.x + 12, self.y + 12, 30, 30, Color(self.accent.r, self.accent.g, self.accent.b, 30), 8)
         renderer.draw_text(self.logo, self.x + 17, self.y + 14, self.font_logo, self.accent)
         if not self.collapsed:
             renderer.draw_text(self.app_name, self.x + 50, self.y + 18, self.font_bold, self.theme.text)
@@ -11661,25 +11800,25 @@ class SideNav:
             var ir = Rect(self.x, iy, self.w, self.item_h)
             # Section heading
             if item.divider_before and not self.collapsed and item.section != "":
-                renderer.draw_line(self.x + 12, iy - 4, self.x + self.w - 12, iy - 4, Color(255, 255, 255, 8), 1)
-                renderer.draw_text(item.section, self.x + 16, iy + 2, self.font_section, Color(100, 102, 140, 180))
+                renderer.draw_line(self.x + 12, iy - 4, self.x + self.w - 12, iy - 4, _GC_255_255_255_8, 1)
+                renderer.draw_text(item.section, self.x + 16, iy + 2, self.font_section, _GC_100_102_140_180)
                 iy = iy + 18
                 var ir = Rect(self.x, iy, self.w, self.item_h)
             # Active/hover background
             if is_active:
-                renderer.fill_rect(Rect(self.x, iy, self.w, self.item_h), Color(self.accent.r, self.accent.g, self.accent.b, 20))
-                renderer.fill_rect(Rect(self.x, iy + 6, 3, self.item_h - 12), self.accent)
+                renderer.fill_xywh(self.x, iy, self.w, self.item_h, Color(self.accent.r, self.accent.g, self.accent.b, 20))
+                renderer.fill_xywh(self.x, iy + 6, 3, self.item_h - 12, self.accent)
             elif is_hovered:
-                renderer.fill_rect(Rect(self.x, iy, self.w, self.item_h), Color(255, 255, 255, 6))
+                renderer.fill_xywh(self.x, iy, self.w, self.item_h, _GC_255_255_255_6)
             # Icon
             var icon_x = self.x + 16
-            var icon_color = self.accent if is_active else Color(160, 162, 200, 200)
+            var icon_color = self.accent if is_active else _GC_160_162_200_200
             if is_active:
-                renderer.fill_rounded_rect(Rect(icon_x - 4, iy + 10, 28, 24), Color(self.accent.r, self.accent.g, self.accent.b, 25), 8)
+                renderer.fill_round_xywh(icon_x - 4, iy + 10, 28, 24, Color(self.accent.r, self.accent.g, self.accent.b, 25), 8)
             renderer.draw_text(item.icon, icon_x, iy + 12, self.font_icon, icon_color)
             # Label
             if not self.collapsed:
-                var text_color = Color(235, 237, 255, 255) if is_active else Color(160, 162, 200, 200)
+                var text_color = _GC_235_237_255_255 if is_active else _GC_160_162_200_200
                 var lf = self.font_bold if is_active else self.font
                 renderer.draw_text(item.label, self.x + 50, iy + 14, lf, text_color)
                 # Badge
@@ -11688,7 +11827,7 @@ class SideNav:
                     var bw = len(badge_str) * 7 + 10
                     var br = Rect(self.x + self.w - bw - 12, iy + 13, bw, 18)
                     renderer.fill_rounded_rect(br, item.badge_color, 9)
-                    renderer.draw_text(badge_str, br.x + 5, br.y + 2, self.font_section, Color(255, 255, 255, 255))
+                    renderer.draw_text(badge_str, br.x + 5, br.y + 2, self.font_section, _GC_255_255_255_255)
             else:
                 if item.badge > 0:
                     renderer.fill_circle(self.x + self.w - 10, iy + 8, 5, item.badge_color)
@@ -11696,13 +11835,13 @@ class SideNav:
             i = i + 1
         # Bottom profile strip
         var bottom_r = Rect(self.x, self.y + self.h - self.bottom_h, self.w, self.bottom_h)
-        renderer.fill_rect(bottom_r, Color(0, 0, 0, 25))
+        renderer.fill_rect(bottom_r, _GC_0_0_0_25)
         renderer.draw_line(self.x, self.y + self.h - self.bottom_h, self.x + self.w, self.y + self.h - self.bottom_h, self.border_color, 1)
         renderer.fill_circle(self.x + 28, self.y + self.h - 30, 16, self.profile_color)
-        renderer.draw_text(string_upper(self.profile_initial), self.x + 22, self.y + self.h - 38, self.font_bold, Color(255, 255, 255, 230))
+        renderer.draw_text(string_upper(self.profile_initial), self.x + 22, self.y + self.h - 38, self.font_bold, _GC_255_255_255_230)
         if not self.collapsed and self.profile_name != "":
             renderer.draw_text(self.profile_name, self.x + 50, self.y + self.h - 40, self.font_bold, self.theme.text)
-            renderer.draw_text("View profile", self.x + 50, self.y + self.h - 22, self.font, Color(99, 102, 241, 180))
+            renderer.draw_text("View profile", self.x + 50, self.y + self.h - 22, self.font, _GC_99_102_241_180)
 
     def draw(self, renderer):
         if self.visible:
@@ -11861,7 +12000,7 @@ class OTPInput:
             var is_focused = (self.focused and i == self.focused_idx)
             var is_filled = (self.values[i] != "")
             # Shadow under box
-            renderer.draw_shadow(br, 8, 0, 3, Color(0, 0, 0, 50))
+            renderer.draw_shadow(br, 8, 0, 3, _GC_0_0_0_50)
             # Box background
             renderer.fill_rounded_rect(br, self.bg_color, 10)
             # Border with state color
@@ -11880,10 +12019,10 @@ class OTPInput:
             elif self.success and is_filled:
                 renderer.draw_shadow(br, 10, 0, 3, Color(self.success_color.r, self.success_color.g, self.success_color.b, 40))
             # Inner highlight
-            renderer.fill_rounded_rect(Rect(bx + 2, self.y + 2, self.box_w - 4, 2), Color(255, 255, 255, 15), 8)
+            renderer.fill_round_xywh(bx + 2, self.y + 2, self.box_w - 4, 2, _GC_255_255_255_15, 8)
             # Digit character
             if is_filled:
-                var char_c = Color(235, 237, 255, 255)
+                var char_c = _GC_235_237_255_255
                 if self.error:
                     var char_c = self.error_color
                 elif self.success:
@@ -11892,7 +12031,7 @@ class OTPInput:
                 renderer.draw_text(self.values[i], bx + int((self.box_w - cw) / 2), self.y + int(self.box_h * 0.27), self.font, char_c)
             elif is_focused:
                 # Blinking cursor (always draw)
-                renderer.fill_rect(Rect(bx + int(self.box_w / 2) - 1, self.y + int(self.box_h * 0.25), 2, int(self.box_h * 0.5)), Color(self.accent.r, self.accent.g, self.accent.b, 180))
+                renderer.fill_xywh(bx + int(self.box_w / 2) - 1, self.y + int(self.box_h * 0.25), 2, int(self.box_h * 0.5), Color(self.accent.r, self.accent.g, self.accent.b, 180))
             i = i + 1
 
     def draw(self, renderer):
@@ -12021,34 +12160,34 @@ class CodeBlock:
                 self.copied = false
 
     def _draw(self, renderer):
-        renderer.draw_shadow(self.rect, 16, 0, 4, Color(0, 0, 0, 70))
+        renderer.draw_shadow(self.rect, 16, 0, 4, _GC_0_0_0_70)
         renderer.fill_rounded_rect(self.rect, self.bg_color, 12)
         renderer.draw_rounded_rect(self.rect, self.border_color, 12, 1)
         # Header bar
         var hdr = Rect(self.rect.x, self.rect.y, self.rect.w, 36)
-        renderer.fill_rounded_rect(hdr, Color(30, 32, 48, 255), 12)
-        renderer.fill_rect(Rect(self.rect.x, self.rect.y + 12, self.rect.w, 24), Color(30, 32, 48, 255))
+        renderer.fill_rounded_rect(hdr, _GC_30_32_48_255, 12)
+        renderer.fill_xywh(self.rect.x, self.rect.y + 12, self.rect.w, 24, _GC_30_32_48_255)
         renderer.draw_line(self.rect.x, self.rect.y + 36, self.rect.right(), self.rect.y + 36, self.border_color, 1)
         # Traffic light dots
-        renderer.fill_circle(self.rect.x + 16, self.rect.y + 18, 5, Color(255, 95, 86, 255))
-        renderer.fill_circle(self.rect.x + 30, self.rect.y + 18, 5, Color(255, 189, 46, 255))
-        renderer.fill_circle(self.rect.x + 44, self.rect.y + 18, 5, Color(39, 201, 63, 255))
+        renderer.fill_circle(self.rect.x + 16, self.rect.y + 18, 5, _GC_255_95_86_255)
+        renderer.fill_circle(self.rect.x + 30, self.rect.y + 18, 5, _GC_255_189_46_255)
+        renderer.fill_circle(self.rect.x + 44, self.rect.y + 18, 5, _GC_39_201_63_255)
         # Language badge
         if self.language != "":
             var lw = len(self.language) * 7 + 12
-            renderer.fill_rounded_rect(Rect(self.rect.x + 60, self.rect.y + 9, lw, 18), Color(99, 102, 241, 50), 9)
-            renderer.draw_text(self.language, self.rect.x + 66, self.rect.y + 11, self.font_badge, Color(180, 182, 240, 230))
+            renderer.fill_round_xywh(self.rect.x + 60, self.rect.y + 9, lw, 18, _GC_99_102_241_50, 9)
+            renderer.draw_text(self.language, self.rect.x + 66, self.rect.y + 11, self.font_badge, _GC_180_182_240_230)
         # Copy button
         var copy_str = "[OK] Copied" if self.copied else "? Copy"
         var cw = len(copy_str) * 7 + 12
         var copy_r = Rect(self.rect.right() - cw - 8, self.rect.y + 8, cw, 20)
-        renderer.fill_rounded_rect(copy_r, Color(255, 255, 255, 10), 6)
-        renderer.draw_text(copy_str, copy_r.x + 6, copy_r.y + 3, self.font_ui, Color(140, 142, 180, 200))
+        renderer.fill_rounded_rect(copy_r, _GC_255_255_255_10, 6)
+        renderer.draw_text(copy_str, copy_r.x + 6, copy_r.y + 3, self.font_ui, _GC_140_142_180_200)
         # Gutter
-        renderer.fill_rect(Rect(self.rect.x, self.rect.y + 36, self.pad_left, self.rect.h - 36), self.gutter_color)
-        renderer.draw_line(self.rect.x + self.pad_left, self.rect.y + 36, self.rect.x + self.pad_left, self.rect.bottom(), Color(255, 255, 255, 6), 1)
+        renderer.fill_xywh(self.rect.x, self.rect.y + 36, self.pad_left, self.rect.h - 36, self.gutter_color)
+        renderer.draw_line(self.rect.x + self.pad_left, self.rect.y + 36, self.rect.x + self.pad_left, self.rect.bottom(), _GC_255_255_255_6, 1)
         # Lines
-        renderer.set_clip(Rect(self.rect.x, self.rect.y + 36, self.rect.w, self.rect.h - 36))
+        renderer.clip_xywh(self.rect.x, self.rect.y + 36, self.rect.w, self.rect.h - 36)
         var first_line = int(self.scroll_y / self.line_h)
         var max_visible = int((self.rect.h - 36) / self.line_h) + 2
         var li = first_line
@@ -12083,7 +12222,7 @@ class CodeBlock:
             if thumb_h < 24:
                 var thumb_h = 24
             var thumb_y = self.rect.y + 36 + int(float(self.scroll_y) / float(content_h) * float(view_h))
-            renderer.fill_rounded_rect(Rect(self.rect.right() - 6, thumb_y, 4, thumb_h), Color(99, 102, 241, 100), 2)
+            renderer.fill_round_xywh(self.rect.right() - 6, thumb_y, 4, thumb_h, _GC_99_102_241_100, 2)
 
     def draw(self, renderer):
         if self.visible:
@@ -12236,9 +12375,9 @@ class Confetti:
                 var c = Color(p.color.r, p.color.g, p.color.b, p.alpha)
                 # Draw as small rect or circle based on size
                 if p.size <= 6:
-                    renderer.fill_rect(Rect(px - int(p.size / 2), py - int(p.size / 2), p.size, p.size), c)
+                    renderer.fill_xywh(px - int(p.size / 2), py - int(p.size / 2), p.size, p.size, c)
                 else:
-                    renderer.fill_rounded_rect(Rect(px - int(p.size / 2), py - int(p.size / 2), p.size, p.size), c, 2)
+                    renderer.fill_round_xywh(px - int(p.size / 2), py - int(p.size / 2), p.size, p.size, c, 2)
             i = i + 1
 
     def draw(self, renderer):
@@ -12400,27 +12539,27 @@ class TreeMap:
         var dr = Rect(node.rect.x, node.rect.bottom() - animated_h, node.rect.w, animated_h)
         # Shadow for top-level
         if depth == 0:
-            renderer.draw_shadow(node.rect, 10, 0, 3, Color(0, 0, 0, 60))
+            renderer.draw_shadow(node.rect, 10, 0, 3, _GC_0_0_0_60)
         # Fill with gradient simulation (bright top, normal base)
         renderer.fill_rounded_rect(dr, node.color, 6 if depth == 0 else 4)
         var bright = Color(min(node.color.r + 35, 255), min(node.color.g + 35, 255), min(node.color.b + 35, 255), 80)
         var top_h = int(dr.h / 3)
         if top_h > 0:
-            renderer.fill_rounded_rect(Rect(dr.x, dr.y, dr.w, top_h), bright, 4)
+            renderer.fill_round_xywh(dr.x, dr.y, dr.w, top_h, bright, 4)
         # Hover glow
         if self.hovered != none and node.id == self.hovered.id:
-            renderer.fill_rounded_rect(dr, Color(255, 255, 255, 30), 4)
-            renderer.draw_rounded_rect(dr, Color(255, 255, 255, 120), 4, 2)
+            renderer.fill_rounded_rect(dr, _GC_255_255_255_30, 4)
+            renderer.draw_rounded_rect(dr, _GC_255_255_255_120, 4, 2)
         else:
-            renderer.draw_rounded_rect(dr, Color(0, 0, 0, 40), 4, 1)
+            renderer.draw_rounded_rect(dr, _GC_0_0_0_40, 4, 1)
         # Label
         if dr.w >= self.min_label_w and dr.h >= 30:
             var lw = len(node.label) * 7
             if lw < dr.w - 8:
-                renderer.draw_text(node.label, dr.x + 8, dr.y + 8, self.font_label, Color(255, 255, 255, 220))
+                renderer.draw_text(node.label, dr.x + 8, dr.y + 8, self.font_label, _GC_255_255_255_220)
             if dr.h >= 48:
                 var val_str = str(int(node.total_value()))
-                renderer.draw_text(val_str, dr.x + 8, dr.y + 24, self.font_val, Color(255, 255, 255, 140))
+                renderer.draw_text(val_str, dr.x + 8, dr.y + 24, self.font_val, _GC_255_255_255_140)
         # Children
         var i = 0
         while i < node.child_count:
@@ -12428,9 +12567,9 @@ class TreeMap:
             i = i + 1
 
     def _draw(self, renderer):
-        renderer.draw_shadow(self.rect, 16, 0, 4, Color(0, 0, 0, 60))
+        renderer.draw_shadow(self.rect, 16, 0, 4, _GC_0_0_0_60)
         renderer.fill_rounded_rect(self.rect, self.theme.surface, 12)
-        renderer.draw_rounded_rect(self.rect, Color(255, 255, 255, 12), 12, 1)
+        renderer.draw_rounded_rect(self.rect, _GC_255_255_255_12, 12, 1)
         var content_r = self.rect
         if self.title != "":
             var tw = len(self.title) * 8
@@ -12553,9 +12692,9 @@ class Marquee:
         if self.item_count == 0 or self.total_w <= 0:
             return
         # Fade masks on edges
-        renderer.fill_rect(Rect(self.rect.x, self.rect.y, 40, self.rect.h), Color(self.bg_color.r, self.bg_color.g, self.bg_color.b, 200))
-        renderer.fill_rect(Rect(self.rect.right() - 40, self.rect.y, 40, self.rect.h), Color(self.bg_color.r, self.bg_color.g, self.bg_color.b, 200))
-        renderer.set_clip(Rect(self.rect.x + 20, self.rect.y, self.rect.w - 40, self.rect.h))
+        renderer.fill_xywh(self.rect.x, self.rect.y, 40, self.rect.h, Color(self.bg_color.r, self.bg_color.g, self.bg_color.b, 200))
+        renderer.fill_xywh(self.rect.right() - 40, self.rect.y, 40, self.rect.h, Color(self.bg_color.r, self.bg_color.g, self.bg_color.b, 200))
+        renderer.clip_xywh(self.rect.x + 20, self.rect.y, self.rect.w - 40, self.rect.h)
         var x_start = self.rect.x + 20 - int(self.offset)
         # Draw enough copies to fill
         var copies_needed = int(float(self.rect.w) / float(self.total_w)) + 2
@@ -12569,7 +12708,7 @@ class Marquee:
                 var cy = self.rect.y + int((self.rect.h - 14) / 2)
                 # Separator dot
                 if i > 0 or copy_i > 0:
-                    renderer.draw_text(self.separator, item_x - 24, cy, self.font, Color(100, 102, 140, 180))
+                    renderer.draw_text(self.separator, item_x - 24, cy, self.font, _GC_100_102_140_180)
                 # Icon
                 if item.icon != "":
                     renderer.draw_text(item.icon, item_x, cy - 1, self.font_icon, item.color)
@@ -12695,9 +12834,9 @@ class BubbleChart:
         var pa_y = self.rect.y + self.padding
         var pa_w = self.rect.w - self.padding * 2
         var pa_h = self.rect.h - self.padding * 2
-        renderer.draw_shadow(self.rect, 16, 0, 4, Color(0, 0, 0, 50))
+        renderer.draw_shadow(self.rect, 16, 0, 4, _GC_0_0_0_50)
         renderer.fill_rounded_rect(self.rect, self.theme.surface, 12)
-        renderer.draw_rounded_rect(self.rect, Color(255, 255, 255, 12), 12, 1)
+        renderer.draw_rounded_rect(self.rect, _GC_255_255_255_12, 12, 1)
         if self.title != "":
             var tw = len(self.title) * 8
             renderer.draw_text(self.title, self.rect.x + int((self.rect.w - tw) / 2), self.rect.y + 14, self.font_title, self.theme.text)
@@ -12707,8 +12846,8 @@ class BubbleChart:
             while gi <= self.grid_lines:
                 var gx = pa_x + int(float(gi) / float(self.grid_lines) * float(pa_w))
                 var gy = pa_y + int(float(gi) / float(self.grid_lines) * float(pa_h))
-                renderer.fill_rect(Rect(gx, pa_y, 1, pa_h), Color(255, 255, 255, 8))
-                renderer.fill_rect(Rect(pa_x, gy, pa_w, 1), Color(255, 255, 255, 8))
+                renderer.fill_xywh(gx, pa_y, 1, pa_h, _GC_255_255_255_8)
+                renderer.fill_xywh(pa_x, gy, pa_w, 1, _GC_255_255_255_8)
                 var x_range = self.x_max - self.x_min
                 var y_range = self.y_max - self.y_min
                 var x_lv = self.x_min + float(gi) / float(self.grid_lines) * x_range
@@ -12717,8 +12856,8 @@ class BubbleChart:
                 renderer.draw_text(str(int(y_lv)), pa_x - 30, gy - 6, self.font, self.theme.text_secondary)
                 gi = gi + 1
         # Axes
-        renderer.fill_rect(Rect(pa_x, pa_y, 1, pa_h), Color(255, 255, 255, 30))
-        renderer.fill_xywh(pa_x, pa_y + pa_h, pa_w, 1, Color(255, 255, 255, 30))
+        renderer.fill_xywh(pa_x, pa_y, 1, pa_h, _GC_255_255_255_30)
+        renderer.fill_xywh(pa_x, pa_y + pa_h, pa_w, 1, _GC_255_255_255_30)
         if self.x_label != "":
             var xw = len(self.x_label) * 7
             renderer.draw_text(self.x_label, pa_x + int((pa_w - xw) / 2), pa_y + pa_h + 22, self.font, self.theme.text_secondary)
@@ -12742,15 +12881,15 @@ class BubbleChart:
             if anim_size < 1:
                 anim_size = 1
             # Shadow
-            renderer.fill_circle(pt[0] + 3, pt[1] + 3, anim_size, Color(0, 0, 0, 40))
+            renderer.fill_circle(pt[0] + 3, pt[1] + 3, anim_size, _GC_0_0_0_40)
             # Main bubble
             renderer.fill_circle(pt[0], pt[1], anim_size, Color(b.color.r, b.color.g, b.color.b, 190))
             # Specular highlight
             var hi_x = pt[0] - int(float(anim_size) * 0.3)
             var hi_y = pt[1] - int(float(anim_size) * 0.35)
-            renderer.fill_circle(hi_x, hi_y, int(float(anim_size) * 0.35), Color(255, 255, 255, 60))
+            renderer.fill_circle(hi_x, hi_y, int(float(anim_size) * 0.35), _GC_255_255_255_60)
             # Outline
-            renderer.draw_circle(pt[0], pt[1], anim_size, Color(255, 255, 255, 30))
+            renderer.draw_circle(pt[0], pt[1], anim_size, _GC_255_255_255_30)
             bi = bi + 1
         # Labels on top
         if self.show_labels:
@@ -12761,7 +12900,7 @@ class BubbleChart:
                 var anim_size = int(float(b.size) * self.anim_progress)
                 if b.label != "" and anim_size > 10:
                     var lw = len(b.label) * 6
-                    renderer.draw_text(b.label, pt[0] - int(lw / 2), pt[1] - int(float(anim_size) * 0.45), self.font_label, Color(255, 255, 255, 200))
+                    renderer.draw_text(b.label, pt[0] - int(lw / 2), pt[1] - int(float(anim_size) * 0.45), self.font_label, _GC_255_255_255_200)
                 bi = bi + 1
 
     def draw(self, renderer):
@@ -12886,7 +13025,7 @@ class CommandBar:
                     self._on_search(self.search_text)
 
     def _draw(self, renderer):
-        renderer.fill_rect(Rect(0, 0, self.window_w, self.h), self.bg_color)
+        renderer.fill_xywh(0, 0, self.window_w, self.h, self.bg_color)
         renderer.draw_line(0, self.h - 1, self.window_w, self.h - 1, self.border_color, 1)
         # Gradient accent line at bottom
         var seg_count = 8
@@ -12897,7 +13036,7 @@ class CommandBar:
             var r = int(float(self.accent.r) * (1.0 - t) + 168.0 * t)
             var g = int(float(self.accent.g) * (1.0 - t) + 85.0 * t)
             var b = int(float(self.accent.b) * (1.0 - t) + 247.0 * t)
-            renderer.fill_rect(Rect(si * seg_w, self.h - 2, seg_w + 1, 2), Color(r, g, b, 180))
+            renderer.fill_xywh(si * seg_w, self.h - 2, seg_w + 1, 2, Color(r, g, b, 180))
             si = si + 1
         # Left items
         var lx = 16
@@ -12906,8 +13045,8 @@ class CommandBar:
             var item = self.left_items[li]
             var iw = len(item["label"]) * 7 + 28
             if item["icon"] != "":
-                renderer.draw_text(item["icon"], lx + 4, int(self.h / 2) - 9, self.font_icon, Color(160, 162, 200, 200))
-            renderer.draw_text(item["label"], lx + 24, int(self.h / 2) - 7, self.font, Color(200, 202, 230, 200))
+                renderer.draw_text(item["icon"], lx + 4, int(self.h / 2) - 9, self.font_icon, _GC_160_162_200_200)
+            renderer.draw_text(item["label"], lx + 24, int(self.h / 2) - 7, self.font, _GC_200_202_230_200)
             if li < self.left_count - 1:
                 renderer.chevron(lx + iw + 2, int(self.h / 2), 8, "right", self.theme.text_secondary)
             lx = lx + iw + 4
@@ -12916,22 +13055,22 @@ class CommandBar:
         if self.show_search:
             var search_x = int((self.window_w - self.search_w) / 2)
             var sr = Rect(search_x, 8, self.search_w, self.h - 16)
-            renderer.fill_rounded_rect(sr, Color(30, 32, 48, 255), 8)
+            renderer.fill_rounded_rect(sr, _GC_30_32_48_255, 8)
             if self.search_focused:
                 renderer.draw_rounded_rect(sr, Color(self.accent.r, self.accent.g, self.accent.b, 120), 8, 1)
                 renderer.draw_shadow(sr, 12, 0, 3, Color(self.accent.r, self.accent.g, self.accent.b, 40))
             else:
-                renderer.draw_rounded_rect(sr, Color(255, 255, 255, 10), 8, 1)
+                renderer.draw_rounded_rect(sr, _GC_255_255_255_10, 8, 1)
             renderer.magnifier(search_x + 10, int(self.h / 2) - 7, 14, self.theme.text_secondary)
             var disp = self.search_text if (self.search_text != "" or self.search_focused) else self.search_placeholder
-            var text_c = Color(220, 222, 255, 220) if self.search_text != "" else Color(100, 102, 140, 140)
+            var text_c = _GC_220_222_255_220 if self.search_text != "" else _GC_100_102_140_140
             renderer.draw_text(disp, search_x + 32, int(self.h / 2) - 7, self.font, text_c)
             if self.search_text == "" and not self.search_focused:
                 var hint = "CtrlK"
                 var hw = len(hint) * 7 + 8
                 var hr = Rect(search_x + self.search_w - hw - 8, int(self.h / 2) - 9, hw, 18)
-                renderer.fill_rounded_rect(hr, Color(255, 255, 255, 8), 5)
-                renderer.draw_text(hint, hr.x + 4, hr.y + 2, self.font_small, Color(120, 122, 160, 140))
+                renderer.fill_rounded_rect(hr, _GC_255_255_255_8, 5)
+                renderer.draw_text(hint, hr.x + 4, hr.y + 2, self.font_small, _GC_120_122_160_140)
         # Right items
         var rx = self.window_w - 16
         var ri = self.right_count - 1
@@ -12939,14 +13078,14 @@ class CommandBar:
             var item = self.right_items[ri]
             var iw = len(item["label"]) * 7 + 32
             rx = rx - iw
-            renderer.fill_rounded_rect(Rect(rx, 8, iw, self.h - 16), Color(255, 255, 255, 6), 8)
+            renderer.fill_round_xywh(rx, 8, iw, self.h - 16, _GC_255_255_255_6, 8)
             if item["icon"] != "":
-                renderer.draw_text(item["icon"], rx + 6, int(self.h / 2) - 9, self.font_icon, Color(160, 162, 200, 200))
-            renderer.draw_text(item["label"], rx + 24, int(self.h / 2) - 7, self.font, Color(200, 202, 230, 200))
+                renderer.draw_text(item["icon"], rx + 6, int(self.h / 2) - 9, self.font_icon, _GC_160_162_200_200)
+            renderer.draw_text(item["label"], rx + 24, int(self.h / 2) - 7, self.font, _GC_200_202_230_200)
             if item["badge"] > 0:
                 var bs = str(item["badge"])
-                renderer.fill_circle(rx + iw - 4, 10, 6, Color(255, 59, 48, 255))
-                renderer.draw_text(bs, rx + iw - 7, 4, self.font_small, Color(255, 255, 255, 255))
+                renderer.fill_circle(rx + iw - 4, 10, 6, _GC_255_59_48_255)
+                renderer.draw_text(bs, rx + iw - 7, 4, self.font_small, _GC_255_255_255_255)
             rx = rx - 4
             ri = ri - 1
 
@@ -13119,10 +13258,10 @@ class AutoComplete:
         var panel_h = vis * self.item_h + 8
         var ay = self.y + int(self.anim_y)
         var panel_r = Rect(self.x, ay, self.w, panel_h)
-        renderer.draw_shadow(panel_r, 24, 0, 8, Color(0, 0, 0, 120))
+        renderer.draw_shadow(panel_r, 24, 0, 8, _GC_0_0_0_120)
         renderer.fill_rounded_rect(panel_r, self.bg_color, 10)
         renderer.draw_rounded_rect(panel_r, self.border_color, 10, 1)
-        renderer.fill_rounded_rect(Rect(self.x + 40, ay - 1, 60, 2), Color(99, 102, 241, 180), 1)
+        renderer.fill_round_xywh(self.x + 40, ay - 1, 60, 2, _GC_99_102_241_180, 1)
         var scroll_start = 0
         if self.selected >= self.max_visible:
             var scroll_start = self.selected - self.max_visible + 1
@@ -13136,15 +13275,15 @@ class AutoComplete:
                 var iy = ay + 4 + i * self.item_h
                 var ir = Rect(self.x, iy, self.w, self.item_h)
                 if idx == self.selected:
-                    renderer.fill_rounded_rect(Rect(self.x + 2, iy + 1, self.w - 4, self.item_h - 2), Color(99, 102, 241, 35), 7)
-                    renderer.fill_rect(Rect(self.x + 2, iy + 4, 3, self.item_h - 8), self.accent)
+                    renderer.fill_round_xywh(self.x + 2, iy + 1, self.w - 4, self.item_h - 2, _GC_99_102_241_35, 7)
+                    renderer.fill_xywh(self.x + 2, iy + 4, 3, self.item_h - 8, self.accent)
                 var kc = self._kind_color(item.kind)
-                renderer.fill_rounded_rect(Rect(self.x + 8, iy + 7, 16, 16), Color(kc.r, kc.g, kc.b, 25), 4)
+                renderer.fill_round_xywh(self.x + 8, iy + 7, 16, 16, Color(kc.r, kc.g, kc.b, 25), 4)
                 renderer.draw_text(item.icon, self.x + 10, iy + 8, self.font_icon, kc)
-                renderer.draw_text(item.label, self.x + 30, iy + 8, self.font_bold, Color(220, 222, 255, 240))
+                renderer.draw_text(item.label, self.x + 30, iy + 8, self.font_bold, _GC_220_222_255_240)
                 if item.detail != "":
                     var lw = len(item.label) * 8
-                    renderer.draw_text(item.detail, self.x + 34 + lw, iy + 9, self.font_detail, Color(120, 122, 160, 160))
+                    renderer.draw_text(item.detail, self.x + 34 + lw, iy + 9, self.font_detail, _GC_120_122_160_160)
                 i = i + 1
 
     def draw(self, renderer):
@@ -13218,7 +13357,7 @@ class MiniMap:
 
     def _draw(self, renderer):
         renderer.fill_rect(self.rect, self.bg_color)
-        renderer.draw_line(self.rect.x, self.rect.y, self.rect.x, self.rect.bottom(), Color(255, 255, 255, 8), 1)
+        renderer.draw_line(self.rect.x, self.rect.y, self.rect.x, self.rect.bottom(), _GC_255_255_255_8, 1)
         var lh = self.scale
         var max_lines = int(self.rect.h / lh) + 1
         var start_line = int(self.scroll_pct * float(self.line_count))
@@ -13239,11 +13378,11 @@ class MiniMap:
                 var band_idx = (i + start_line) % 5
                 var lc = self._color_bands[band_idx]
                 var lx = self.rect.x + 4 + int(float(indent) * float(self.rect.w - 8) / 80.0)
-                renderer.fill_rect(Rect(lx, ly, bar_w, max(lh - 1, 1)), lc)
+                renderer.fill_xywh(lx, ly, bar_w, max(lh - 1, 1), lc)
             i = i + 1
         var vp_h = int(self.viewport_pct * float(self.rect.h))
         var vp_y = self.rect.y + int(self.scroll_pct * float(self.rect.h - vp_h))
-        renderer.fill_rect(Rect(self.rect.x, vp_y, self.rect.w, vp_h), self.viewport_color)
+        renderer.fill_xywh(self.rect.x, vp_y, self.rect.w, vp_h, self.viewport_color)
         renderer.draw_line(self.rect.x, vp_y, self.rect.right(), vp_y, self.viewport_border, 1)
         renderer.draw_line(self.rect.x, vp_y + vp_h, self.rect.right(), vp_y + vp_h, self.viewport_border, 1)
 
@@ -13418,23 +13557,23 @@ class ChatPanel:
                 bx = self.rect.x + 44
             var bubble_c = self.user_bubble if is_user else self.bot_bubble
             var bubble_r = Rect(bx, cy, bw, msg.height - 4)
-            renderer.draw_shadow(bubble_r, 8, 0, 3, Color(0, 0, 0, 50))
+            renderer.draw_shadow(bubble_r, 8, 0, 3, _GC_0_0_0_50)
             renderer.fill_rounded_rect(bubble_r, bubble_c, 14)
             if is_user:
-                renderer.fill_rounded_rect(Rect(bx, cy, bw, 1), Color(255, 255, 255, 30), 14)
+                renderer.fill_round_xywh(bx, cy, bw, 1, _GC_255_255_255_30, 14)
             else:
-                renderer.draw_rounded_rect(bubble_r, Color(255, 255, 255, 8), 14, 1)
+                renderer.draw_rounded_rect(bubble_r, _GC_255_255_255_8, 14, 1)
             var avatar_color = self.user_avatar_color if is_user else self.bot_avatar_color
             var avatar_x = bx + bw + 6 if is_user else self.rect.x + 16
             renderer.fill_circle(avatar_x, cy + 18, 14, avatar_color)
             if is_user:
-                renderer.draw_text("U", avatar_x - 4, cy + 11, self.font_bold, Color(255, 255, 255, 230))
+                renderer.draw_text("U", avatar_x - 4, cy + 11, self.font_bold, _GC_255_255_255_230)
             else:
-                renderer.draw_text("*", avatar_x - 6, cy + 10, self.font_icon, Color(255, 255, 255, 230))
-            var text_c = Color(255, 255, 255, 240) if is_user else Color(210, 212, 240, 230)
+                renderer.draw_text("*", avatar_x - 6, cy + 10, self.font_icon, _GC_255_255_255_230)
+            var text_c = _GC_255_255_255_240 if is_user else _GC_210_212_240_230
             if msg.is_code:
-                renderer.fill_rounded_rect(Rect(bx + 6, cy + 6, bw - 12, msg.height - 16), self.code_bg, 8)
-                renderer.draw_text(msg.text[0:min(len(msg.text), 60)], bx + 12, cy + 14, self.font_mono, Color(180, 220, 120, 230))
+                renderer.fill_round_xywh(bx + 6, cy + 6, bw - 12, msg.height - 16, self.code_bg, 8)
+                renderer.draw_text(msg.text[0:min(len(msg.text), 60)], bx + 12, cy + 14, self.font_mono, _GC_180_220_120_230)
             else:
                 var chars_per = int(float(bw - self.bubble_pad * 2) / float(self.char_w))
                 if chars_per < 1:
@@ -13464,10 +13603,10 @@ class ChatPanel:
                 di = di + 1
             var typing_r = Rect(self.rect.x + 44, cy, 80, 32)
             renderer.fill_rounded_rect(typing_r, self.bot_bubble, 14)
-            renderer.draw_rounded_rect(typing_r, Color(255, 255, 255, 8), 14, 1)
-            renderer.draw_text(dots, typing_r.x + 12, typing_r.y + 9, self.font, Color(140, 142, 180, 200))
+            renderer.draw_rounded_rect(typing_r, _GC_255_255_255_8, 14, 1)
+            renderer.draw_text(dots, typing_r.x + 12, typing_r.y + 9, self.font, _GC_140_142_180_200)
             renderer.fill_circle(self.rect.x + 16, cy + 16, 14, self.bot_avatar_color)
-            renderer.draw_text("*", self.rect.x + 10, cy + 9, self.font_icon, Color(255, 255, 255, 230))
+            renderer.draw_text("*", self.rect.x + 10, cy + 9, self.font_icon, _GC_255_255_255_230)
         renderer.clear_clip()
         renderer.draw_line(self.rect.x, self.rect.bottom() - self.input_h, self.rect.right(), self.rect.bottom() - self.input_h, self.border_color, 1)
         var inp_r = Rect(self.rect.x + 10, self.rect.bottom() - self.input_h + 8, self.rect.w - 52, self.input_h - 16)
@@ -13476,17 +13615,17 @@ class ChatPanel:
             renderer.draw_rounded_rect(inp_r, Color(self.accent.r, self.accent.g, self.accent.b, 120), 10, 1)
             renderer.draw_shadow(inp_r, 10, 0, 3, Color(self.accent.r, self.accent.g, self.accent.b, 30))
         else:
-            renderer.draw_rounded_rect(inp_r, Color(255, 255, 255, 12), 10, 1)
-        var placeholder_c = Color(80, 82, 110, 160)
+            renderer.draw_rounded_rect(inp_r, _GC_255_255_255_12, 10, 1)
+        var placeholder_c = _GC_80_82_110_160
         if self.input_text != "":
-            renderer.draw_text(self.input_text, inp_r.x + 10, inp_r.y + 9, self.font, Color(220, 222, 255, 230))
+            renderer.draw_text(self.input_text, inp_r.x + 10, inp_r.y + 9, self.font, _GC_220_222_255_230)
         else:
             renderer.draw_text("Ask Nython AI...", inp_r.x + 10, inp_r.y + 9, self.font, placeholder_c)
         var send_r = Rect(self.rect.right() - 40, self.rect.bottom() - self.input_h + 10, 30, 30)
         var send_c = Color(self.accent.r, self.accent.g, self.accent.b, 180 if self.input_text != "" else 60)
         renderer.fill_rounded_rect(send_r, send_c, 8)
         renderer.chevron(send_r.center_x(), send_r.center_y(), 12, "right", self.theme.text)
-        renderer.draw_line(self.rect.x, self.rect.y, self.rect.x, self.rect.bottom(), Color(255, 255, 255, 6), 1)
+        renderer.draw_line(self.rect.x, self.rect.y, self.rect.x, self.rect.bottom(), _GC_255_255_255_6, 1)
 
     def draw(self, renderer):
         if self.visible:
@@ -13687,10 +13826,10 @@ class FileTree:
     def _draw(self, renderer):
         renderer.fill_rect(self.rect, self.bg_color)
         var hdr_r = Rect(self.rect.x, self.rect.y, self.rect.w, 36)
-        renderer.fill_rect(hdr_r, Color(0, 0, 0, 30))
-        renderer.draw_text("EXPLORER", self.rect.x + 12, self.rect.y + 11, self.font_small, Color(100, 102, 140, 180))
+        renderer.fill_rect(hdr_r, _GC_0_0_0_30)
+        renderer.draw_text("EXPLORER", self.rect.x + 12, self.rect.y + 11, self.font_small, _GC_100_102_140_180)
         renderer.draw_line(self.rect.x, self.rect.y + 35, self.rect.right(), self.rect.y + 35, self.border_color, 1)
-        renderer.set_clip(Rect(self.rect.x, self.rect.y + 36, self.rect.w, self.rect.h - 36))
+        renderer.clip_xywh(self.rect.x, self.rect.y + 36, self.rect.w, self.rect.h - 36)
         var items = self._all_visible()
         var n = len(items)
         var iy = self.rect.y + 36 - self.scroll_y
@@ -13702,9 +13841,9 @@ class FileTree:
             var is_hovered = (node.path == self.hovered_path)
             if is_selected:
                 renderer.fill_rect(ir, Color(self.accent.r, self.accent.g, self.accent.b, 25))
-                renderer.fill_rect(Rect(self.rect.x, iy, 2, self.item_h), self.accent)
+                renderer.fill_xywh(self.rect.x, iy, 2, self.item_h, self.accent)
             elif is_hovered:
-                renderer.fill_rect(ir, Color(255, 255, 255, 6))
+                renderer.fill_rect(ir, _GC_255_255_255_6)
             var ix = self.rect.x + 8 + node.depth * self.indent_w
             if node.is_dir:
                 var fdir = "down" if node.expanded else "right"
@@ -13712,20 +13851,20 @@ class FileTree:
                 ix = ix + 12
             else:
                 ix = ix + 14
-            renderer.draw_text(node.icon, ix, iy + 7, self.font_icon, Color(160, 162, 200, 200))
-            var name_c = Color(220, 222, 255, 230) if (is_selected or node.is_dir) else Color(180, 182, 210, 200)
+            renderer.draw_text(node.icon, ix, iy + 7, self.font_icon, _GC_160_162_200_200)
+            var name_c = _GC_220_222_255_230 if (is_selected or node.is_dir) else _GC_180_182_210_200
             var nf = self.font_bold if node.is_dir else self.font
             renderer.draw_text(node.name, ix + 20, iy + 8, nf, name_c)
             if node.modified:
-                renderer.fill_circle(self.rect.right() - 10, iy + 14, 3, Color(255, 149, 0, 200))
+                renderer.fill_circle(self.rect.right() - 10, iy + 14, 3, _GC_255_149_0_200)
             if node.git_status != "":
-                var gs_c = Color(52, 199, 89, 200)
+                var gs_c = _GC_52_199_89_200
                 if node.git_status == "M":
-                    var gs_c = Color(255, 149, 0, 200)
+                    var gs_c = _GC_255_149_0_200
                 elif node.git_status == "?":
-                    gs_c = Color(99, 102, 241, 200)
+                    gs_c = _GC_99_102_241_200
                 elif node.git_status == "D":
-                    gs_c = Color(255, 59, 48, 200)
+                    gs_c = _GC_255_59_48_200
                 renderer.draw_text(node.git_status, self.rect.right() - 16, iy + 8, self.font_small, gs_c)
             iy = iy + self.item_h
             i = i + 1
@@ -13908,7 +14047,7 @@ class TabBar:
         renderer.fill_rect(self.rect, self.bg_color)
         renderer.draw_line(self.rect.x, self.rect.bottom() - 1, self.rect.right(), self.rect.bottom() - 1, self.border_color, 1)
         var tw = self._tab_w()
-        renderer.set_clip(Rect(self.rect.x, self.rect.y, self.rect.w - 44, self.rect.h))
+        renderer.clip_xywh(self.rect.x, self.rect.y, self.rect.w - 44, self.rect.h)
         var tx = self.rect.x - self.scroll_x
         var i = 0
         while i < self.tab_count:
@@ -13916,26 +14055,26 @@ class TabBar:
             var tab_r = Rect(tx, self.rect.y, tw, self.rect.h)
             if tab.active:
                 renderer.fill_rect(tab_r, self.active_bg)
-                renderer.fill_rect(Rect(tx, self.rect.bottom() - 2, tw, 2), self.accent)
-                renderer.draw_shadow(Rect(tx, self.rect.y, tw, 2), 8, 0, 2, Color(self.accent.r, self.accent.g, self.accent.b, 40))
-            renderer.draw_line(tx + tw - 1, self.rect.y + 6, tx + tw - 1, self.rect.bottom() - 6, Color(255, 255, 255, 8), 1)
-            var name_c = Color(220, 222, 255, 230) if tab.active else Color(120, 122, 160, 160)
+                renderer.fill_xywh(tx, self.rect.bottom() - 2, tw, 2, self.accent)
+                renderer.shadow_xywh(tx, self.rect.y, tw, 2, 8, 0, 2, Color(self.accent.r, self.accent.g, self.accent.b, 40))
+            renderer.draw_line(tx + tw - 1, self.rect.y + 6, tx + tw - 1, self.rect.bottom() - 6, _GC_255_255_255_8, 1)
+            var name_c = _GC_220_222_255_230 if tab.active else _GC_120_122_160_160
             renderer.draw_text(tab.icon, tx + 8, self.rect.y + int((self.rect.h - 13) / 2), self.font_icon, Color(self.accent.r, self.accent.g, self.accent.b, 180 if tab.active else 100))
             var fname = tab.filename
             if len(fname) > 16:
                 fname = fname[0:14] + "..."
             renderer.draw_text(fname, tx + 24, self.rect.y + int((self.rect.h - 13) / 2), self.font, name_c)
             if tab.modified:
-                renderer.fill_circle(tx + tw - 14, self.rect.y + int(self.rect.h / 2), 4, Color(255, 149, 0, 200))
+                renderer.fill_circle(tx + tw - 14, self.rect.y + int(self.rect.h / 2), 4, _GC_255_149_0_200)
             else:
-                renderer.fill_rounded_rect(Rect(tx + tw - 22, self.rect.y + int((self.rect.h - 16) / 2), 16, 16), Color(255, 255, 255, 0), 8)
-                renderer.draw_text("x", tx + tw - 18, self.rect.y + int((self.rect.h - 13) / 2), self.font, Color(80, 82, 110, 140))
+                renderer.fill_round_xywh(tx + tw - 22, self.rect.y + int((self.rect.h - 16) / 2), 16, 16, _GC_255_255_255_0, 8)
+                renderer.draw_text("x", tx + tw - 18, self.rect.y + int((self.rect.h - 13) / 2), self.font, _GC_80_82_110_140)
             tx = tx + tw
             i = i + 1
         renderer.clear_clip()
         var new_btn = Rect(self.rect.x + self.tab_count * tw - self.scroll_x + 8, self.rect.y + 8, 24, self.rect.h - 16)
-        renderer.fill_rounded_rect(new_btn, Color(255, 255, 255, 8), 6)
-        renderer.draw_text("+", new_btn.x + 6, new_btn.y + 4, self.font, Color(160, 162, 200, 200))
+        renderer.fill_rounded_rect(new_btn, _GC_255_255_255_8, 6)
+        renderer.draw_text("+", new_btn.x + 6, new_btn.y + 4, self.font, _GC_160_162_200_200)
 
     def draw(self, renderer):
         if self.visible:
@@ -14108,16 +14247,16 @@ class TerminalPanel:
         renderer.fill_rounded_rect(self.rect, self.bg_color, 8)
         renderer.draw_rounded_rect(self.rect, self.border_color, 8, 1)
         var hdr_r = Rect(self.rect.x, self.rect.y, self.rect.w, 32)
-        renderer.fill_rounded_rect(hdr_r, Color(20, 22, 36, 255), 8)
-        renderer.fill_rect(Rect(self.rect.x, self.rect.y + 12, self.rect.w, 20), Color(20, 22, 36, 255))
+        renderer.fill_rounded_rect(hdr_r, _GC_20_22_36_255, 8)
+        renderer.fill_xywh(self.rect.x, self.rect.y + 12, self.rect.w, 20, _GC_20_22_36_255)
         renderer.draw_line(self.rect.x, self.rect.y + 32, self.rect.right(), self.rect.y + 32, self.border_color, 1)
-        renderer.fill_circle(self.rect.x + 14, self.rect.y + 16, 5, Color(255, 95, 86, 255))
-        renderer.fill_circle(self.rect.x + 28, self.rect.y + 16, 5, Color(255, 189, 46, 255))
-        renderer.fill_circle(self.rect.x + 42, self.rect.y + 16, 5, Color(39, 201, 63, 255))
+        renderer.fill_circle(self.rect.x + 14, self.rect.y + 16, 5, _GC_255_95_86_255)
+        renderer.fill_circle(self.rect.x + 28, self.rect.y + 16, 5, _GC_255_189_46_255)
+        renderer.fill_circle(self.rect.x + 42, self.rect.y + 16, 5, _GC_39_201_63_255)
         renderer.draw_text("TERMINAL", self.rect.x + 58, self.rect.y + 10, self.font_ui, self.header_color)
         var clear_r = Rect(self.rect.right() - 54, self.rect.y + 8, 46, 18)
-        renderer.fill_rounded_rect(clear_r, Color(255, 255, 255, 8), 6)
-        renderer.draw_text("clear", clear_r.x + 8, clear_r.y + 3, self.font_ui, Color(120, 122, 160, 160))
+        renderer.fill_rounded_rect(clear_r, _GC_255_255_255_8, 6)
+        renderer.draw_text("clear", clear_r.x + 8, clear_r.y + 3, self.font_ui, _GC_120_122_160_160)
         var content_area = Rect(self.rect.x, self.rect.y + 32, self.rect.w, self.rect.h - self.input_h - 32)
         renderer.set_clip(content_area)
         var first_line = int(self.scroll_y / self.line_h)
@@ -14149,7 +14288,7 @@ class TerminalPanel:
         renderer.draw_text(self.input_text, px, inp_y, self.font, self.input_color)
         if self.input_focused and self._blink_visible:
             var cursor_x = px + len(self.input_text) * 7
-            renderer.fill_rect(Rect(cursor_x, inp_y, 2, 14), self.cursor_color)
+            renderer.fill_xywh(cursor_x, inp_y, 2, 14, self.cursor_color)
 
     def draw(self, renderer):
         if self.visible:
@@ -14210,9 +14349,9 @@ class GlowBadge:
         var alpha = 255
         if self.pulse:
             var glow = int(40.0 + 20.0 * sin(self.t))
-            renderer.draw_shadow(Rect(self.x, self.y, w, h), glow, 0, 4, Color(self.color.r, self.color.g, self.color.b, 80))
-        renderer.fill_rounded_rect(Rect(self.x, self.y, w, h), Color(self.color.r, self.color.g, self.color.b, 30), 11)
-        renderer.draw_rounded_rect(Rect(self.x, self.y, w, h), Color(self.color.r, self.color.g, self.color.b, 120), 11, 1)
+            renderer.shadow_xywh(self.x, self.y, w, h, glow, 0, 4, Color(self.color.r, self.color.g, self.color.b, 80))
+        renderer.fill_round_xywh(self.x, self.y, w, h, Color(self.color.r, self.color.g, self.color.b, 30), 11)
+        renderer.round_rect_xywh(self.x, self.y, w, h, Color(self.color.r, self.color.g, self.color.b, 120), 11, 1)
         renderer.draw_text(self.label, self.x + pad, self.y + 5, self.font, Color(self.color.r, self.color.g, self.color.b, 240))
 
     def set_pos(self, x, y):
@@ -14259,15 +14398,15 @@ class ProgressTrack:
         if not self.visible:
             return
         self.update()
-        renderer.draw_text(self.label, self.x, self.y, self.font, Color(160, 162, 200, 200))
+        renderer.draw_text(self.label, self.x, self.y, self.font, _GC_160_162_200_200)
         var pct_str = str(int(self.value * 100.0)) + "%"
         renderer.draw_text(pct_str, self.x + self.w - 36, self.y, self.font_bold, Color(self.color.r, self.color.g, self.color.b, 220))
         var track_r = Rect(self.x, self.y + 18, self.w, 6)
-        renderer.fill_rounded_rect(track_r, Color(255, 255, 255, 12), 3)
+        renderer.fill_rounded_rect(track_r, _GC_255_255_255_12, 3)
         var fill_w = int(float(self.w) * self.value)
         if fill_w > 0:
-            renderer.fill_rounded_rect(Rect(self.x, self.y + 18, fill_w, 6), self.color, 3)
-            renderer.fill_rounded_rect(Rect(self.x, self.y + 18, fill_w, 3), Color(255, 255, 255, 30), 3)
+            renderer.fill_round_xywh(self.x, self.y + 18, fill_w, 6, self.color, 3)
+            renderer.fill_round_xywh(self.x, self.y + 18, fill_w, 3, _GC_255_255_255_30, 3)
 
     def set_pos(self, x, y):
         self.x = x
@@ -14335,33 +14474,33 @@ class KeybindPanel:
     def draw(self, renderer):
         if not self.visible:
             return
-        renderer.draw_shadow(self.rect, 40, 0, 16, Color(0, 0, 0, 180))
+        renderer.draw_shadow(self.rect, 40, 0, 16, _GC_0_0_0_180)
         renderer.fill_rounded_rect(self.rect, self.bg, 16)
         renderer.draw_rounded_rect(self.rect, self.border, 16, 1)
         var hdr_r = Rect(self.rect.x, self.rect.y, self.rect.w, 52)
-        renderer.fill_rounded_rect(hdr_r, Color(0, 0, 0, 40), 16)
-        renderer.fill_rect(Rect(self.rect.x, self.rect.y + 36, self.rect.w, 16), Color(0, 0, 0, 40))
-        renderer.draw_text("?  Keyboard Shortcuts", self.rect.x + 20, self.rect.y + 16, self.font_bold, Color(220, 222, 255, 240))
-        renderer.draw_text("Esc to close", self.rect.right() - 90, self.rect.y + 18, self.font_header, Color(100, 102, 140, 160))
-        renderer.draw_line(self.rect.x, self.rect.y + 52, self.rect.right(), self.rect.y + 52, Color(255,255,255,8), 1)
-        renderer.set_clip(Rect(self.rect.x, self.rect.y + 52, self.rect.w, self.rect.h - 52))
+        renderer.fill_rounded_rect(hdr_r, _GC_0_0_0_40, 16)
+        renderer.fill_xywh(self.rect.x, self.rect.y + 36, self.rect.w, 16, _GC_0_0_0_40)
+        renderer.draw_text("?  Keyboard Shortcuts", self.rect.x + 20, self.rect.y + 16, self.font_bold, _GC_220_222_255_240)
+        renderer.draw_text("Esc to close", self.rect.right() - 90, self.rect.y + 18, self.font_header, _GC_100_102_140_160)
+        renderer.draw_line(self.rect.x, self.rect.y + 52, self.rect.right(), self.rect.y + 52, _GC_255_255_255_8, 1)
+        renderer.clip_xywh(self.rect.x, self.rect.y + 52, self.rect.w, self.rect.h - 52)
         var row_h = 38
         var i = 0
         while i < self.row_count:
             var row = self.rows[i]
             var ry = self.rect.y + 52 + i * row_h - self.scroll_y + 6
             if i % 2 == 0:
-                renderer.fill_rect(Rect(self.rect.x, ry - 4, self.rect.w, row_h), Color(255,255,255,3))
-            renderer.draw_text(row.description, self.rect.x + 20, ry + 4, self.font, Color(180, 182, 220, 200))
+                renderer.fill_xywh(self.rect.x, ry - 4, self.rect.w, row_h, _GC_255_255_255_3)
+            renderer.draw_text(row.description, self.rect.x + 20, ry + 4, self.font, _GC_180_182_220_200)
             var kx = self.rect.right() - 20
             var ki = len(row.keys) - 1
             while ki >= 0:
                 var k = row.keys[ki]
                 var kw = len(k) * 9 + 14
                 kx = kx - kw - 4
-                renderer.fill_rounded_rect(Rect(kx, ry, kw, 22), Color(255, 255, 255, 10), 5)
-                renderer.draw_rounded_rect(Rect(kx, ry, kw, 22), Color(255, 255, 255, 20), 5, 1)
-                renderer.draw_text(k, kx + 7, ry + 4, self.font_key, Color(200, 202, 240, 220))
+                renderer.fill_round_xywh(kx, ry, kw, 22, _GC_255_255_255_10, 5)
+                renderer.round_rect_xywh(kx, ry, kw, 22, _GC_255_255_255_20, 5, 1)
+                renderer.draw_text(k, kx + 7, ry + 4, self.font_key, _GC_200_202_240_220)
                 ki = ki - 1
             i = i + 1
         renderer.clear_clip()
@@ -14454,26 +14593,26 @@ class ActivityBar:
     def draw(self, renderer):
         if not self.visible:
             return
-        renderer.fill_rect(Rect(self.x, self.y, self.w, self.h), self.bg)
-        renderer.draw_line(self.x + self.w - 1, self.y, self.x + self.w - 1, self.y + self.h, Color(255,255,255,6), 1)
-        renderer.fill_rounded_rect(Rect(self.x + 8, self.y + 8, 32, 36), Color(99,102,241,30), 8)
+        renderer.fill_xywh(self.x, self.y, self.w, self.h, self.bg)
+        renderer.draw_line(self.x + self.w - 1, self.y, self.x + self.w - 1, self.y + self.h, _GC_255_255_255_6, 1)
+        renderer.fill_round_xywh(self.x + 8, self.y + 8, 32, 36, _GC_99_102_241_30, 8)
         renderer.draw_text("*", self.x + 12, self.y + 14, self.font_logo, self.accent)
         var i = 0
         while i < self.item_count:
             var item = self.items[i]
             var iy = self.y + 60 + i * 52
             if item.active:
-                renderer.fill_rect(Rect(self.x, iy + 2, 3, 40), self.accent)
-                renderer.fill_rounded_rect(Rect(self.x + 4, iy, self.w - 8, 44), Color(self.accent.r, self.accent.g, self.accent.b, 20), 8)
+                renderer.fill_xywh(self.x, iy + 2, 3, 40, self.accent)
+                renderer.fill_round_xywh(self.x + 4, iy, self.w - 8, 44, Color(self.accent.r, self.accent.g, self.accent.b, 20), 8)
             elif item.id == self.hover_id:
-                renderer.fill_rounded_rect(Rect(self.x + 4, iy, self.w - 8, 44), Color(255,255,255,8), 8)
-            var ic = self.accent if item.active else Color(120, 122, 160, 180)
+                renderer.fill_round_xywh(self.x + 4, iy, self.w - 8, 44, _GC_255_255_255_8, 8)
+            var ic = self.accent if item.active else _GC_120_122_160_180
             renderer.draw_text(item.icon, self.x + 12, iy + 12, self.font_icon, ic)
             if item.badge > 0:
                 var bx = self.x + self.w - 14
                 var by = iy + 4
-                renderer.fill_circle(bx, by, 9, Color(255, 59, 48, 255))
-                renderer.draw_text(str(item.badge), bx - 4, by - 6, self.font_badge, Color(255,255,255,255))
+                renderer.fill_circle(bx, by, 9, _GC_255_59_48_255)
+                renderer.draw_text(str(item.badge), bx - 4, by - 6, self.font_badge, _GC_255_255_255_255)
             i = i + 1
         var settings_y = self.h - 52
         # Settings: a cog drawn as a ring with spokes.
@@ -14581,15 +14720,15 @@ class DiagnosticPanel:
             return
         renderer.fill_rect(self.rect, self.bg)
         var hdr_r = Rect(self.rect.x, self.rect.y, self.rect.w, 34)
-        renderer.fill_rect(hdr_r, Color(20, 22, 36, 255))
+        renderer.fill_rect(hdr_r, _GC_20_22_36_255)
         renderer.draw_line(self.rect.x, self.rect.y + 34, self.rect.right(), self.rect.y + 34, self.border, 1)
-        renderer.draw_text("PROBLEMS", self.rect.x + 12, self.rect.y + 10, self.font_ui, Color(100,102,140,180))
+        renderer.draw_text("PROBLEMS", self.rect.x + 12, self.rect.y + 10, self.font_ui, _GC_100_102_140_180)
         var ex = self.rect.x + 90
-        renderer.fill_rounded_rect(Rect(ex, self.rect.y + 8, 28, 18), Color(255, 59, 48, 30), 5)
-        renderer.draw_text(str(self.error_count), ex + 8, self.rect.y + 10, self.font_ui, Color(255, 59, 48, 220))
-        renderer.fill_rounded_rect(Rect(ex + 36, self.rect.y + 8, 28, 18), Color(255, 149, 0, 30), 5)
-        renderer.draw_text(str(self.warn_count), ex + 44, self.rect.y + 10, self.font_ui, Color(255, 149, 0, 220))
-        renderer.set_clip(Rect(self.rect.x, self.rect.y + 34, self.rect.w, self.rect.h - 34))
+        renderer.fill_round_xywh(ex, self.rect.y + 8, 28, 18, _GC_255_59_48_30, 5)
+        renderer.draw_text(str(self.error_count), ex + 8, self.rect.y + 10, self.font_ui, _GC_255_59_48_220)
+        renderer.fill_round_xywh(ex + 36, self.rect.y + 8, 28, 18, _GC_255_149_0_30, 5)
+        renderer.draw_text(str(self.warn_count), ex + 44, self.rect.y + 10, self.font_ui, _GC_255_149_0_220)
+        renderer.clip_xywh(self.rect.x, self.rect.y + 34, self.rect.w, self.rect.h - 34)
         var iy = self.rect.y + 34 - self.scroll_y
         var i = 0
         while i < self.item_count:
@@ -14598,18 +14737,18 @@ class DiagnosticPanel:
             if i == self.selected:
                 renderer.fill_rect(ir, Color(self.accent.r, self.accent.g, self.accent.b, 20))
             elif i % 2 == 0:
-                renderer.fill_rect(ir, Color(255,255,255,3))
-            var dot_c = Color(255, 59, 48, 255) if item.kind == "error" else Color(255, 149, 0, 255)
+                renderer.fill_rect(ir, _GC_255_255_255_3)
+            var dot_c = _GC_255_59_48_255 if item.kind == "error" else _GC_255_149_0_255
             var dot_icon = "x" if item.kind == "error" else "!"
             renderer.draw_text(dot_icon, self.rect.x + 10, iy + 10, self.font_ui, dot_c)
-            renderer.draw_text(item.message, self.rect.x + 28, iy + 10, self.font, Color(200, 202, 240, 210))
+            renderer.draw_text(item.message, self.rect.x + 28, iy + 10, self.font, _GC_200_202_240_210)
             var loc_str = item.file + ":" + str(item.line) + ":" + str(item.col)
-            renderer.draw_text(loc_str, self.rect.right() - len(loc_str) * 7 - 10, iy + 10, self.font_ui, Color(100,102,140,160))
-            renderer.draw_line(self.rect.x, iy + self.item_h - 1, self.rect.right(), iy + self.item_h - 1, Color(255,255,255,4), 1)
+            renderer.draw_text(loc_str, self.rect.right() - len(loc_str) * 7 - 10, iy + 10, self.font_ui, _GC_100_102_140_160)
+            renderer.draw_line(self.rect.x, iy + self.item_h - 1, self.rect.right(), iy + self.item_h - 1, _GC_255_255_255_4, 1)
             iy = iy + self.item_h
             i = i + 1
         if self.item_count == 0:
-            renderer.draw_text("[OK]  No problems detected", self.rect.x + int(self.rect.w / 2) - 80, self.rect.y + int(self.rect.h / 2) - 8, self.font_bold, Color(52, 199, 89, 160))
+            renderer.draw_text("[OK]  No problems detected", self.rect.x + int(self.rect.w / 2) - 80, self.rect.y + int(self.rect.h / 2) - 8, self.font_bold, _GC_52_199_89_160)
         renderer.clear_clip()
 
     def set_pos(self, x, y):
@@ -14725,9 +14864,9 @@ class SearchPanel:
             return
         renderer.fill_rounded_rect(self.rect, self.bg, 0)
         renderer.draw_line(self.rect.right() - 1, self.rect.y, self.rect.right() - 1, self.rect.bottom(), self.border, 1)
-        renderer.draw_text("SEARCH", self.rect.x + 12, self.rect.y + 12, self.font_ui, Color(100,102,140,180))
+        renderer.draw_text("SEARCH", self.rect.x + 12, self.rect.y + 12, self.font_ui, _GC_100_102_140_180)
         var esc_r = Rect(self.rect.right() - 30, self.rect.y + 8, 22, 18)
-        renderer.fill_rounded_rect(esc_r, Color(255,255,255,8), 4)
+        renderer.fill_rounded_rect(esc_r, _GC_255_255_255_8, 4)
         renderer.cross(esc_r.center_x(), esc_r.center_y(), 8, self._glyph_col)
         var inp_r = Rect(self.rect.x + 8, self.rect.y + 36, self.rect.w - 16, 32)
         renderer.fill_rounded_rect(inp_r, self.input_bg, 8)
@@ -14737,24 +14876,24 @@ class SearchPanel:
             renderer.draw_rounded_rect(inp_r, self.border, 8, 1)
         renderer.magnifier(inp_r.x + 8, inp_r.y + 9, 14, self._glyph_col)
         if self.query != "":
-            renderer.draw_text(self.query, inp_r.x + 28, inp_r.y + 9, self.font_mono, Color(220, 222, 255, 230))
+            renderer.draw_text(self.query, inp_r.x + 28, inp_r.y + 9, self.font_mono, _GC_220_222_255_230)
             if self.focused:
                 var cx = inp_r.x + 28 + len(self.query) * 7
-                renderer.fill_rect(Rect(cx, inp_r.y + 7, 2, 18), self.accent)
+                renderer.fill_xywh(cx, inp_r.y + 7, 2, 18, self.accent)
         else:
-            renderer.draw_text("Find in files...", inp_r.x + 28, inp_r.y + 9, self.font, Color(80,82,120,140))
+            renderer.draw_text("Find in files...", inp_r.x + 28, inp_r.y + 9, self.font, _GC_80_82_120_140)
         if self.result_count > 0:
-            renderer.draw_text(str(self.result_count) + " results", self.rect.x + 12, self.rect.y + 76, self.font_ui, Color(100,102,140,160))
-        renderer.set_clip(Rect(self.rect.x, self.rect.y + 96, self.rect.w, self.rect.h - 96))
+            renderer.draw_text(str(self.result_count) + " results", self.rect.x + 12, self.rect.y + 76, self.font_ui, _GC_100_102_140_160)
+        renderer.clip_xywh(self.rect.x, self.rect.y + 96, self.rect.w, self.rect.h - 96)
         var iy = self.rect.y + 96 - self.scroll_y
         var i = 0
         while i < self.result_count:
             var res = self.results[i]
             var ir = Rect(self.rect.x, iy, self.rect.w, 40)
             renderer.fill_rect(ir, Color(255,255,255, 3 if i % 2 == 0 else 0))
-            renderer.draw_text(res.file + ":" + str(res.line), self.rect.x + 10, iy + 4, self.font_ui, Color(99, 102, 141, 200))
-            renderer.draw_text(string_strip(res.text), self.rect.x + 10, iy + 20, self.font_mono, Color(180,182,220,190))
-            renderer.draw_line(self.rect.x, iy + 39, self.rect.right(), iy + 39, Color(255,255,255,4), 1)
+            renderer.draw_text(res.file + ":" + str(res.line), self.rect.x + 10, iy + 4, self.font_ui, _GC_99_102_141_200)
+            renderer.draw_text(string_strip(res.text), self.rect.x + 10, iy + 20, self.font_mono, _GC_180_182_220_190)
+            renderer.draw_line(self.rect.x, iy + 39, self.rect.right(), iy + 39, _GC_255_255_255_4, 1)
             iy = iy + 40
             i = i + 1
         renderer.clear_clip()
@@ -14841,10 +14980,10 @@ class GitPanel:
             return
         renderer.fill_rect(self.rect, self.bg)
         renderer.draw_line(self.rect.right() - 1, self.rect.y, self.rect.right() - 1, self.rect.bottom(), self.border, 1)
-        renderer.fill_rect(Rect(self.rect.x, self.rect.y, self.rect.w, 48), Color(0,0,0,30))
-        renderer.draw_text("SOURCE CONTROL", self.rect.x + 12, self.rect.y + 10, self.font_ui, Color(100,102,140,180))
-        renderer.fill_rounded_rect(Rect(self.rect.x + 12, self.rect.y + 26, 80, 16), Color(99,102,241,20), 5)
-        renderer.draw_text("[branch] " + self.branch, self.rect.x + 16, self.rect.y + 27, self.font_ui, Color(99, 102, 141, 200))
+        renderer.fill_xywh(self.rect.x, self.rect.y, self.rect.w, 48, _GC_0_0_0_30)
+        renderer.draw_text("SOURCE CONTROL", self.rect.x + 12, self.rect.y + 10, self.font_ui, _GC_100_102_140_180)
+        renderer.fill_round_xywh(self.rect.x + 12, self.rect.y + 26, 80, 16, _GC_99_102_241_20, 5)
+        renderer.draw_text("[branch] " + self.branch, self.rect.x + 16, self.rect.y + 27, self.font_ui, _GC_99_102_141_200)
         renderer.draw_line(self.rect.x, self.rect.y + 48, self.rect.right(), self.rect.y + 48, self.border, 1)
         var staged_c = 0
         var i = 0
@@ -14852,7 +14991,7 @@ class GitPanel:
             if self.changes[i].staged:
                 staged_c = staged_c + 1
             i = i + 1
-        renderer.draw_text("Changes (" + str(self.change_count) + ")", self.rect.x + 10, self.rect.y + 54, self.font_ui, Color(120,122,160,160))
+        renderer.draw_text("Changes (" + str(self.change_count) + ")", self.rect.x + 10, self.rect.y + 54, self.font_ui, _GC_120_122_160_160)
         var iy = self.rect.y + 72
         i = 0
         while i < self.change_count:
@@ -14862,30 +15001,30 @@ class GitPanel:
                 renderer.fill_rect(ir, Color(self.accent.r, self.accent.g, self.accent.b, 12))
             var cb = Rect(self.rect.x + 8, iy + 7, 16, 16)
             renderer.fill_rounded_rect(cb, Color(255,255,255, 15 if ch.staged else 6), 4)
-            renderer.draw_rounded_rect(cb, Color(255,255,255,20), 4, 1)
+            renderer.draw_rounded_rect(cb, _GC_255_255_255_20, 4, 1)
             if ch.staged:
-                renderer.draw_text("[OK]", cb.x + 3, cb.y + 2, self.font_ui, Color(52, 199, 89, 220))
-            var sc = Color(255, 149, 0, 220)
+                renderer.draw_text("[OK]", cb.x + 3, cb.y + 2, self.font_ui, _GC_52_199_89_220)
+            var sc = _GC_255_149_0_220
             if ch.status == "A":
-                var sc = Color(52, 199, 89, 220)
+                var sc = _GC_52_199_89_220
             elif ch.status == "D":
-                sc = Color(255, 59, 48, 220)
+                sc = _GC_255_59_48_220
             var fname = ch.path
             if len(fname) > 20:
                 fname = "..." + fname[len(fname) - 19:]
-            renderer.draw_text(fname, self.rect.x + 30, iy + 9, self.font_mono, Color(180,182,220,200))
+            renderer.draw_text(fname, self.rect.x + 30, iy + 9, self.font_mono, _GC_180_182_220_200)
             renderer.draw_text(ch.status, self.rect.right() - 18, iy + 9, self.font_bold, sc)
             iy = iy + 30
             i = i + 1
         renderer.draw_line(self.rect.x, self.rect.bottom() - 90, self.rect.right(), self.rect.bottom() - 90, self.border, 1)
         var inp_r = Rect(self.rect.x + 8, self.rect.bottom() - 84, self.rect.w - 16, 30)
-        renderer.fill_rounded_rect(inp_r, Color(24,26,44,255), 8)
+        renderer.fill_rounded_rect(inp_r, _GC_24_26_44_255, 8)
         if self.commit_input_focused:
             renderer.draw_rounded_rect(inp_r, Color(self.accent.r, self.accent.g, self.accent.b, 100), 8, 1)
         else:
             renderer.draw_rounded_rect(inp_r, self.border, 8, 1)
         var commit_display = self.commit_msg if self.commit_msg != "" else "Commit message..."
-        var commit_c = Color(180,182,220,210) if self.commit_msg != "" else Color(80,82,120,120)
+        var commit_c = _GC_180_182_220_210 if self.commit_msg != "" else _GC_80_82_120_120
         renderer.draw_text(commit_display, inp_r.x + 8, inp_r.y + 8, self.font, commit_c)
         var commit_btn = Rect(self.rect.x + 8, self.rect.bottom() - 46, self.rect.w - 16, 30)
         var btn_active = self.commit_msg != "" and staged_c > 0
@@ -14977,8 +15116,8 @@ class RunConfigBar:
     def draw(self, renderer):
         if not self.visible: return
         renderer.fill_rect(self.rect, self.bg)
-        renderer.draw_line(self.rect.x, self.rect.y, self.rect.right(), self.rect.y, Color(255,255,255,8), 1)
-        renderer.draw_line(self.rect.x, self.rect.bottom()-1, self.rect.right(), self.rect.bottom()-1, Color(255,255,255,6), 1)
+        renderer.draw_line(self.rect.x, self.rect.y, self.rect.right(), self.rect.y, _GC_255_255_255_8, 1)
+        renderer.draw_line(self.rect.x, self.rect.bottom()-1, self.rect.right(), self.rect.bottom()-1, _GC_255_255_255_6, 1)
         var bw = 86
         var i = 0
         while i < len(self.modes):
@@ -14989,18 +15128,18 @@ class RunConfigBar:
             var is_hover = (i == self.hover_mode)
             var mc = self._mode_color(i)
             if is_active:
-                renderer.fill_rounded_rect(Rect(bx, by, bw, bh), Color(mc.r, mc.g, mc.b, 28), 7)
-                renderer.draw_rounded_rect(Rect(bx, by, bw, bh), Color(mc.r, mc.g, mc.b, 100), 7, 1)
-                renderer.fill_rect(Rect(bx + 8, by + bh - 2, bw - 16, 2), mc)
+                renderer.fill_round_xywh(bx, by, bw, bh, Color(mc.r, mc.g, mc.b, 28), 7)
+                renderer.round_rect_xywh(bx, by, bw, bh, Color(mc.r, mc.g, mc.b, 100), 7, 1)
+                renderer.fill_xywh(bx + 8, by + bh - 2, bw - 16, 2, mc)
             elif is_hover:
-                renderer.fill_rounded_rect(Rect(bx, by, bw, bh), Color(255,255,255,8), 7)
+                renderer.fill_round_xywh(bx, by, bw, bh, _GC_255_255_255_8, 7)
             renderer.draw_text(self.mode_icons[i], bx + 8, by + 6, self.font_icon, Color(mc.r, mc.g, mc.b, 210 if is_active else 130))
             renderer.draw_text(self.modes[i], bx + 24, by + 8, self.font, Color(220,222,255, 230 if is_active else 140))
             i = i + 1
         var run_bx = self.rect.right() - 110
         var run_c = self._mode_color(self.active_mode)
-        renderer.fill_rounded_rect(Rect(run_bx, self.rect.y + 5, 100, self.rect.h - 10), Color(run_c.r, run_c.g, run_c.b, 35), 8)
-        renderer.draw_rounded_rect(Rect(run_bx, self.rect.y + 5, 100, self.rect.h - 10), Color(run_c.r, run_c.g, run_c.b, 100), 8, 1)
+        renderer.fill_round_xywh(run_bx, self.rect.y + 5, 100, self.rect.h - 10, Color(run_c.r, run_c.g, run_c.b, 35), 8)
+        renderer.round_rect_xywh(run_bx, self.rect.y + 5, 100, self.rect.h - 10, Color(run_c.r, run_c.g, run_c.b, 100), 8, 1)
         renderer.draw_text(">  " + self.modes[self.active_mode], run_bx + 10, self.rect.y + 11, self.font, Color(run_c.r, run_c.g, run_c.b, 230))
 
     def set_pos(self, x, y):
@@ -15159,21 +15298,21 @@ class TokenViewer:
         renderer.fill_rect(self.rect, self.bg)
         renderer.draw_rounded_rect(self.rect, self.border, 0, 1)
         var hdr = Rect(self.rect.x, self.rect.y, self.rect.w, 44)
-        renderer.fill_rect(hdr, Color(20, 22, 38, 255))
+        renderer.fill_rect(hdr, _GC_20_22_38_255)
         renderer.draw_line(self.rect.x, self.rect.y + 44, self.rect.right(), self.rect.y + 44, self.border, 1)
-        renderer.draw_text("<>  TOKEN STREAM", self.rect.x + 14, self.rect.y + 12, self.font_bold, Color(99, 102, 241, 220))
-        renderer.draw_text(str(self.token_count) + " tokens", self.rect.right() - 72, self.rect.y + 14, self.font_ui, Color(100,102,140,160))
+        renderer.draw_text("<>  TOKEN STREAM", self.rect.x + 14, self.rect.y + 12, self.font_bold, _GC_99_102_241_220)
+        renderer.draw_text(str(self.token_count) + " tokens", self.rect.right() - 72, self.rect.y + 14, self.font_ui, _GC_100_102_140_160)
         var col_v  = self.rect.x + 14
         var col_t  = self.rect.x + 148
         var col_k  = self.rect.x + 296
         var col_c  = self.rect.x + 416
         var col_ln = self.rect.right() - 60
-        renderer.draw_text("VALUE", col_v, self.rect.y + 28, self.font_tag, Color(80,82,110,160))
-        renderer.draw_text("TYPE", col_t, self.rect.y + 28, self.font_tag, Color(80,82,110,160))
-        renderer.draw_text("KIND", col_k, self.rect.y + 28, self.font_tag, Color(80,82,110,160))
-        renderer.draw_text("CLASS", col_c, self.rect.y + 28, self.font_tag, Color(80,82,110,160))
-        renderer.draw_text("LN:COL", col_ln, self.rect.y + 28, self.font_tag, Color(80,82,110,160))
-        renderer.set_clip(Rect(self.rect.x, self.rect.y + 44, self.rect.w, self.rect.h - 44))
+        renderer.draw_text("VALUE", col_v, self.rect.y + 28, self.font_tag, _GC_80_82_110_160)
+        renderer.draw_text("TYPE", col_t, self.rect.y + 28, self.font_tag, _GC_80_82_110_160)
+        renderer.draw_text("KIND", col_k, self.rect.y + 28, self.font_tag, _GC_80_82_110_160)
+        renderer.draw_text("CLASS", col_c, self.rect.y + 28, self.font_tag, _GC_80_82_110_160)
+        renderer.draw_text("LN:COL", col_ln, self.rect.y + 28, self.font_tag, _GC_80_82_110_160)
+        renderer.clip_xywh(self.rect.x, self.rect.y + 44, self.rect.w, self.rect.h - 44)
         var first = int(self.scroll_y / self.item_h)
         var vis_count = int(self.rect.h / self.item_h) + 2
         var i = max(0, first)
@@ -15182,20 +15321,20 @@ class TokenViewer:
             var iy = self.rect.y + 44 + i * self.item_h - self.scroll_y
             var cc = self._class_color(tk.tok_class)
             if i == self.selected:
-                renderer.fill_rect(Rect(self.rect.x, iy, self.rect.w, self.item_h), Color(self.accent.r, self.accent.g, self.accent.b, 22))
-                renderer.fill_rect(Rect(self.rect.x, iy, 3, self.item_h), self.accent)
+                renderer.fill_xywh(self.rect.x, iy, self.rect.w, self.item_h, Color(self.accent.r, self.accent.g, self.accent.b, 22))
+                renderer.fill_xywh(self.rect.x, iy, 3, self.item_h, self.accent)
             elif i % 2 == 0:
-                renderer.fill_rect(Rect(self.rect.x, iy, self.rect.w, self.item_h), Color(255,255,255,3))
+                renderer.fill_xywh(self.rect.x, iy, self.rect.w, self.item_h, _GC_255_255_255_3)
             var val_disp = tk.value
             if len(val_disp) > 14: val_disp = val_disp[0:12] + "..."
             renderer.draw_text(val_disp, col_v, iy + 8, self.font_bold, cc)
-            renderer.draw_text(tk.tok_type, col_t, iy + 8, self.font, Color(180,182,220,190))
-            renderer.draw_text(tk.tok_kind, col_k, iy + 8, self.font, Color(140,142,180,170))
+            renderer.draw_text(tk.tok_type, col_t, iy + 8, self.font, _GC_180_182_220_190)
+            renderer.draw_text(tk.tok_kind, col_k, iy + 8, self.font, _GC_140_142_180_170)
             var cls_pill_w = len(tk.tok_class) * 7 + 12
-            renderer.fill_rounded_rect(Rect(col_c, iy + 4, cls_pill_w, 20), Color(cc.r, cc.g, cc.b, 20), 5)
+            renderer.fill_round_xywh(col_c, iy + 4, cls_pill_w, 20, Color(cc.r, cc.g, cc.b, 20), 5)
             renderer.draw_text(tk.tok_class, col_c + 6, iy + 8, self.font_tag, Color(cc.r, cc.g, cc.b, 200))
-            renderer.draw_text(str(tk.line) + ":" + str(tk.col), col_ln, iy + 8, self.font_ui, Color(80,82,110,150))
-            renderer.draw_line(self.rect.x, iy + self.item_h - 1, self.rect.right(), iy + self.item_h - 1, Color(255,255,255,4), 1)
+            renderer.draw_text(str(tk.line) + ":" + str(tk.col), col_ln, iy + 8, self.font_ui, _GC_80_82_110_150)
+            renderer.draw_line(self.rect.x, iy + self.item_h - 1, self.rect.right(), iy + self.item_h - 1, _GC_255_255_255_4, 1)
             i = i + 1
         renderer.clear_clip()
 
@@ -15320,11 +15459,11 @@ class ASTViewer:
         renderer.fill_rect(self.rect, self.bg)
         renderer.draw_rounded_rect(self.rect, self.border, 0, 1)
         var hdr = Rect(self.rect.x, self.rect.y, self.rect.w, 44)
-        renderer.fill_rect(hdr, Color(20, 22, 38, 255))
+        renderer.fill_rect(hdr, _GC_20_22_38_255)
         renderer.draw_line(self.rect.x, self.rect.y + 44, self.rect.right(), self.rect.y + 44, self.border, 1)
-        renderer.draw_text("[tree]  AST VIEWER", self.rect.x + 14, self.rect.y + 13, self.font_bold, Color(252, 176, 98, 220))
-        renderer.draw_text(str(self.node_count) + " nodes", self.rect.right() - 68, self.rect.y + 14, self.font_ui, Color(100,102,140,160))
-        renderer.set_clip(Rect(self.rect.x, self.rect.y + 44, self.rect.w, self.rect.h - 44))
+        renderer.draw_text("[tree]  AST VIEWER", self.rect.x + 14, self.rect.y + 13, self.font_bold, _GC_252_176_98_220)
+        renderer.draw_text(str(self.node_count) + " nodes", self.rect.right() - 68, self.rect.y + 14, self.font_ui, _GC_100_102_140_160)
+        renderer.clip_xywh(self.rect.x, self.rect.y + 44, self.rect.w, self.rect.h - 44)
         var first = int(self.scroll_y / self.item_h)
         var vis = int(self.rect.h / self.item_h) + 2
         var i = max(0, first)
@@ -15333,13 +15472,13 @@ class ASTViewer:
             var iy = self.rect.y + 44 + i * self.item_h - self.scroll_y
             var tc = self._tag_color(node.tag)
             if i == self.selected:
-                renderer.fill_rect(Rect(self.rect.x, iy, self.rect.w, self.item_h), Color(self.accent.r, self.accent.g, self.accent.b, 22))
+                renderer.fill_xywh(self.rect.x, iy, self.rect.w, self.item_h, Color(self.accent.r, self.accent.g, self.accent.b, 22))
             elif i % 2 == 0:
-                renderer.fill_rect(Rect(self.rect.x, iy, self.rect.w, self.item_h), Color(255,255,255,3))
+                renderer.fill_xywh(self.rect.x, iy, self.rect.w, self.item_h, _GC_255_255_255_3)
             var ix = self.rect.x + 10 + node.depth * self.indent_w
             if node.depth > 0:
-                renderer.fill_rect(Rect(ix - self.indent_w + 8, iy, 1, self.item_h), Color(255,255,255,8))
-                renderer.fill_rect(Rect(ix - self.indent_w + 8, iy + int(self.item_h/2), self.indent_w - 8, 1), Color(255,255,255,8))
+                renderer.fill_xywh(ix - self.indent_w + 8, iy, 1, self.item_h, _GC_255_255_255_8)
+                renderer.fill_xywh(ix - self.indent_w + 8, iy + int(self.item_h/2), self.indent_w - 8, 1, _GC_255_255_255_8)
             if node.has_children:
                 var adir2 = "down" if node.expanded else "right"
                 renderer.chevron(ix + 4, iy + int(self.item_h / 2), 8, adir2, tc)
@@ -15360,8 +15499,8 @@ class ASTViewer:
                 var disp = string_strip(clean_attrs)
                 if len(disp) > 40: disp = disp[0:38] + "..."
                 var lw = len(tag_label) * 8 + 8
-                renderer.draw_text(disp, ix + lw, iy + 7, self.font_ui, Color(130, 132, 170, 170))
-            renderer.draw_line(self.rect.x, iy + self.item_h - 1, self.rect.right(), iy + self.item_h - 1, Color(255,255,255,4), 1)
+                renderer.draw_text(disp, ix + lw, iy + 7, self.font_ui, _GC_130_132_170_170)
+            renderer.draw_line(self.rect.x, iy + self.item_h - 1, self.rect.right(), iy + self.item_h - 1, _GC_255_255_255_4, 1)
             i = i + 1
         renderer.clear_clip()
 
@@ -15506,15 +15645,15 @@ class DebugPanel:
         renderer.draw_line(self.rect.x, self.rect.y, self.rect.right(), self.rect.y, self.border, 1)
         var tab_h = 32
         var tw = int(self.rect.w / 3)
-        renderer.fill_rect(Rect(self.rect.x, self.rect.y, self.rect.w, tab_h), Color(18, 20, 34, 255))
+        renderer.fill_xywh(self.rect.x, self.rect.y, self.rect.w, tab_h, _GC_18_20_34_255)
         var ti = 0
         while ti < 3:
             var tx = self.rect.x + ti * tw
             if ti == self.active_tab:
-                renderer.fill_rect(Rect(tx, self.rect.y + tab_h - 2, tw, 2), self.accent)
+                renderer.fill_xywh(tx, self.rect.y + tab_h - 2, tw, 2, self.accent)
                 renderer.draw_text(self.tabs[ti], tx + 8, self.rect.y + 9, self.font_bold, Color(ACC.r, ACC.g, ACC.b, 220) if false else Color(self.accent.r, self.accent.g, self.accent.b, 220))
             else:
-                renderer.draw_text(self.tabs[ti], tx + 8, self.rect.y + 9, self.font_ui, Color(100,102,140,160))
+                renderer.draw_text(self.tabs[ti], tx + 8, self.rect.y + 9, self.font_ui, _GC_100_102_140_160)
             renderer.draw_line(tx + tw - 1, self.rect.y + 6, tx + tw - 1, self.rect.y + tab_h - 6, self.border, 1)
             ti = ti + 1
         var dbg_icons = ["v", ">>", ">", "[]"]
@@ -15526,57 +15665,57 @@ class DebugPanel:
             var bx = btn_x + bi * 46
             var is_active = (self.running or (bi < 3))
             var bc = dbg_cols[bi]
-            renderer.fill_rounded_rect(Rect(bx, self.rect.y + 4, 40, 24), Color(bc.r, bc.g, bc.b, 22 if is_active else 8), 7)
-            renderer.draw_rounded_rect(Rect(bx, self.rect.y + 4, 40, 24), Color(bc.r, bc.g, bc.b, 60 if is_active else 20), 7, 1)
+            renderer.fill_round_xywh(bx, self.rect.y + 4, 40, 24, Color(bc.r, bc.g, bc.b, 22 if is_active else 8), 7)
+            renderer.round_rect_xywh(bx, self.rect.y + 4, 40, 24, Color(bc.r, bc.g, bc.b, 60 if is_active else 20), 7, 1)
             renderer.draw_text(dbg_icons[bi], bx + 12, self.rect.y + 7, self.font_icon, Color(bc.r, bc.g, bc.b, 200 if is_active else 60))
             bi = bi + 1
         if self.paused and self.current_line >= 0:
-            renderer.fill_rounded_rect(Rect(self.rect.x + 4, self.rect.y + tab_h + 4, self.rect.w - 8, 22), Color(255, 149, 0, 20), 6)
-            renderer.draw_text("O Paused at " + self.current_file + " line " + str(self.current_line), self.rect.x + 10, self.rect.y + tab_h + 8, self.font_ui, Color(255, 149, 0, 220))
+            renderer.fill_round_xywh(self.rect.x + 4, self.rect.y + tab_h + 4, self.rect.w - 8, 22, _GC_255_149_0_20, 6)
+            renderer.draw_text("O Paused at " + self.current_file + " line " + str(self.current_line), self.rect.x + 10, self.rect.y + tab_h + 8, self.font_ui, _GC_255_149_0_220)
         var content_y = self.rect.y + tab_h + (30 if self.paused else 0)
-        renderer.set_clip(Rect(self.rect.x, content_y, self.rect.w, self.rect.h - tab_h - (30 if self.paused else 0)))
+        renderer.clip_xywh(self.rect.x, content_y, self.rect.w, self.rect.h - tab_h - (30 if self.paused else 0))
         var item_h = 28
         if self.active_tab == 0:
             if self.bp_count == 0:
-                renderer.draw_text("No breakpoints set", self.rect.x + int(self.rect.w/2) - 70, content_y + 30, self.font_ui, Color(80,82,120,140))
-                renderer.draw_text("Click the gutter (line numbers) to set a breakpoint", self.rect.x + int(self.rect.w/2) - 140, content_y + 52, self.font_ui, Color(60,62,100,120))
+                renderer.draw_text("No breakpoints set", self.rect.x + int(self.rect.w/2) - 70, content_y + 30, self.font_ui, _GC_80_82_120_140)
+                renderer.draw_text("Click the gutter (line numbers) to set a breakpoint", self.rect.x + int(self.rect.w/2) - 140, content_y + 52, self.font_ui, _GC_60_62_100_120)
             else:
                 var i = 0
                 while i < self.bp_count:
                     var bp = self.breakpoints[i]
                     var iy = content_y + i * item_h - self.scroll_y + 4
-                    if i % 2 == 0: renderer.fill_rect(Rect(self.rect.x, iy, self.rect.w, item_h), Color(255,255,255,3))
-                    var dot_c = self.red if bp.enabled else Color(100,102,140,140)
+                    if i % 2 == 0: renderer.fill_xywh(self.rect.x, iy, self.rect.w, item_h, _GC_255_255_255_3)
+                    var dot_c = self.red if bp.enabled else _GC_100_102_140_140
                     renderer.fill_circle(self.rect.x + 16, iy + 14, 6, dot_c)
-                    renderer.draw_text(bp.file + ":" + str(bp.line), self.rect.x + 28, iy + 8, self.font, Color(180,182,220,210))
+                    renderer.draw_text(bp.file + ":" + str(bp.line), self.rect.x + 28, iy + 8, self.font, _GC_180_182_220_210)
                     if bp.hit_count > 0:
-                        renderer.draw_text("x " + str(bp.hit_count), self.rect.right() - 44, iy + 8, self.font_ui, Color(255,149,0,180))
+                        renderer.draw_text("x " + str(bp.hit_count), self.rect.right() - 44, iy + 8, self.font_ui, _GC_255_149_0_180)
                     i = i + 1
         elif self.active_tab == 1:
             if self.watch_count == 0:
-                renderer.draw_text("No watch expressions", self.rect.x + int(self.rect.w/2) - 70, content_y + 30, self.font_ui, Color(80,82,120,140))
+                renderer.draw_text("No watch expressions", self.rect.x + int(self.rect.w/2) - 70, content_y + 30, self.font_ui, _GC_80_82_120_140)
             else:
                 var i = 0
                 while i < self.watch_count:
                     var we = self.watches[i]
                     var iy = content_y + i * item_h - self.scroll_y + 4
-                    if i % 2 == 0: renderer.fill_rect(Rect(self.rect.x, iy, self.rect.w, item_h), Color(255,255,255,3))
-                    renderer.draw_text(we.expr, self.rect.x + 12, iy + 8, self.font_bold, Color(86,196,255,210))
-                    var val_c = Color(255,149,0,230) if we.changed else Color(130,215,100,200)
+                    if i % 2 == 0: renderer.fill_xywh(self.rect.x, iy, self.rect.w, item_h, _GC_255_255_255_3)
+                    renderer.draw_text(we.expr, self.rect.x + 12, iy + 8, self.font_bold, _GC_86_196_255_210)
+                    var val_c = _GC_255_149_0_230 if we.changed else _GC_130_215_100_200
                     renderer.draw_text("= " + we.value, self.rect.x + 180, iy + 8, self.font, val_c)
                     i = i + 1
         elif self.active_tab == 2:
             if self.stack_depth == 0:
-                renderer.draw_text("No active call stack", self.rect.x + int(self.rect.w/2) - 70, content_y + 30, self.font_ui, Color(80,82,120,140))
+                renderer.draw_text("No active call stack", self.rect.x + int(self.rect.w/2) - 70, content_y + 30, self.font_ui, _GC_80_82_120_140)
             else:
                 var i = 0
                 while i < self.stack_depth:
                     var frame = self.call_stack[i]
                     var iy = content_y + i * item_h - self.scroll_y + 4
-                    if i == 0: renderer.fill_rect(Rect(self.rect.x, iy, self.rect.w, item_h), Color(self.accent.r, self.accent.g, self.accent.b, 15))
-                    renderer.draw_text("#" + str(i), self.rect.x + 10, iy + 8, self.font_ui, Color(80,82,120,160))
-                    renderer.draw_text(frame["name"], self.rect.x + 32, iy + 8, self.font_bold, Color(86,196,255,220))
-                    renderer.draw_text(frame["file"] + ":" + str(frame["line"]), self.rect.x + 160, iy + 8, self.font, Color(130,132,170,160))
+                    if i == 0: renderer.fill_xywh(self.rect.x, iy, self.rect.w, item_h, Color(self.accent.r, self.accent.g, self.accent.b, 15))
+                    renderer.draw_text("#" + str(i), self.rect.x + 10, iy + 8, self.font_ui, _GC_80_82_120_160)
+                    renderer.draw_text(frame["name"], self.rect.x + 32, iy + 8, self.font_bold, _GC_86_196_255_220)
+                    renderer.draw_text(frame["file"] + ":" + str(frame["line"]), self.rect.x + 160, iy + 8, self.font, _GC_130_132_170_160)
                     i = i + 1
         renderer.clear_clip()
 
@@ -15674,19 +15813,19 @@ class ProfilerPanel:
         renderer.fill_rect(self.rect, self.bg)
         renderer.draw_rounded_rect(self.rect, self.border, 0, 1)
         var hdr_r = Rect(self.rect.x, self.rect.y, self.rect.w, 54)
-        renderer.fill_rect(hdr_r, Color(20, 22, 38, 255))
+        renderer.fill_rect(hdr_r, _GC_20_22_38_255)
         renderer.draw_line(self.rect.x, self.rect.y + 54, self.rect.right(), self.rect.y + 54, self.border, 1)
-        renderer.draw_text("[time]  PROFILER", self.rect.x + 14, self.rect.y + 10, self.font_bold, Color(255, 149, 0, 220))
-        renderer.draw_text("Total: " + str(int(self.total_ms)) + "ms · " + str(self.entry_count) + " entries", self.rect.x + 14, self.rect.y + 32, self.font_ui, Color(100,102,140,160))
+        renderer.draw_text("[time]  PROFILER", self.rect.x + 14, self.rect.y + 10, self.font_bold, _GC_255_149_0_220)
+        renderer.draw_text("Total: " + str(int(self.total_ms)) + "ms · " + str(self.entry_count) + " entries", self.rect.x + 14, self.rect.y + 32, self.font_ui, _GC_100_102_140_160)
         var col_name = self.rect.x + 14
         var col_calls = self.rect.right() - 240
         var col_total = self.rect.right() - 160
         var col_self  = self.rect.right() - 76
-        renderer.draw_text("FUNCTION", col_name, self.rect.y + 38, self.font_tag, Color(80,82,110,160))
-        renderer.draw_text("CALLS", col_calls, self.rect.y + 38, self.font_tag, Color(80,82,110,160))
-        renderer.draw_text("TOTAL", col_total, self.rect.y + 38, self.font_tag, Color(80,82,110,160))
-        renderer.draw_text("SELF", col_self, self.rect.y + 38, self.font_tag, Color(80,82,110,160))
-        renderer.set_clip(Rect(self.rect.x, self.rect.y + 54, self.rect.w, self.rect.h - 54))
+        renderer.draw_text("FUNCTION", col_name, self.rect.y + 38, self.font_tag, _GC_80_82_110_160)
+        renderer.draw_text("CALLS", col_calls, self.rect.y + 38, self.font_tag, _GC_80_82_110_160)
+        renderer.draw_text("TOTAL", col_total, self.rect.y + 38, self.font_tag, _GC_80_82_110_160)
+        renderer.draw_text("SELF", col_self, self.rect.y + 38, self.font_tag, _GC_80_82_110_160)
+        renderer.clip_xywh(self.rect.x, self.rect.y + 54, self.rect.w, self.rect.h - 54)
         var first = int(self.scroll_y / self.item_h)
         var vis = int(self.rect.h / self.item_h) + 2
         var i = max(0, first)
@@ -15694,24 +15833,24 @@ class ProfilerPanel:
             var e = self.entries[i]
             var iy = self.rect.y + 54 + i * self.item_h - self.scroll_y
             if i == self.selected:
-                renderer.fill_rect(Rect(self.rect.x, iy, self.rect.w, self.item_h), Color(self.accent.r, self.accent.g, self.accent.b, 22))
+                renderer.fill_xywh(self.rect.x, iy, self.rect.w, self.item_h, Color(self.accent.r, self.accent.g, self.accent.b, 22))
             elif i % 2 == 0:
-                renderer.fill_rect(Rect(self.rect.x, iy, self.rect.w, self.item_h), Color(255,255,255,3))
+                renderer.fill_xywh(self.rect.x, iy, self.rect.w, self.item_h, _GC_255_255_255_3)
             var bar_w = int(e.pct * float(self.rect.w - 40))
             if bar_w > 0:
                 var bar_c = self.green
                 if e.pct > 0.5: bar_c = self.orange
                 if e.pct > 0.8: bar_c = self.red
-                renderer.fill_rect(Rect(self.rect.x, iy, bar_w, self.item_h), Color(bar_c.r, bar_c.g, bar_c.b, 12))
-            renderer.draw_text(e.name, col_name, iy + 9, self.font_bold, Color(220,222,255,220))
-            renderer.draw_text(str(e.calls), col_calls, iy + 9, self.font, Color(140,142,180,200))
+                renderer.fill_xywh(self.rect.x, iy, bar_w, self.item_h, Color(bar_c.r, bar_c.g, bar_c.b, 12))
+            renderer.draw_text(e.name, col_name, iy + 9, self.font_bold, _GC_220_222_255_220)
+            renderer.draw_text(str(e.calls), col_calls, iy + 9, self.font, _GC_140_142_180_200)
             var total_str = str(int(e.total_ms)) + "ms"
             var tc = self.red if e.pct > 0.5 else (self.orange if e.pct > 0.2 else self.green)
             renderer.draw_text(total_str, col_total, iy + 9, self.font_bold, tc)
-            renderer.draw_text(str(int(e.self_ms)) + "ms", col_self, iy + 9, self.font, Color(140,142,180,180))
+            renderer.draw_text(str(int(e.self_ms)) + "ms", col_self, iy + 9, self.font, _GC_140_142_180_180)
             var pct_str = str(int(e.pct * 100.0)) + "%"
             renderer.draw_text(pct_str, self.rect.right() - 8 - len(pct_str) * 7, iy + 9, self.font_ui, Color(tc.r, tc.g, tc.b, 180))
-            renderer.draw_line(self.rect.x, iy + self.item_h - 1, self.rect.right(), iy + self.item_h - 1, Color(255,255,255,4), 1)
+            renderer.draw_line(self.rect.x, iy + self.item_h - 1, self.rect.right(), iy + self.item_h - 1, _GC_255_255_255_4, 1)
             i = i + 1
         renderer.clear_clip()
 
@@ -15839,13 +15978,13 @@ class REPLPanel:
         renderer.fill_rounded_rect(self.rect, self.bg, 0)
         renderer.draw_rounded_rect(self.rect, self.border, 0, 1)
         var hdr = Rect(self.rect.x, self.rect.y, self.rect.w, 36)
-        renderer.fill_rect(hdr, Color(18, 20, 34, 255))
+        renderer.fill_rect(hdr, _GC_18_20_34_255)
         renderer.draw_line(self.rect.x, self.rect.y + 36, self.rect.right(), self.rect.y + 36, self.border, 1)
-        renderer.fill_circle(self.rect.x + 14, self.rect.y + 18, 5, Color(255,95,86,255))
-        renderer.fill_circle(self.rect.x + 28, self.rect.y + 18, 5, Color(255,189,46,255))
-        renderer.fill_circle(self.rect.x + 42, self.rect.y + 18, 5, Color(39,201,63,255))
-        renderer.draw_text(">>  REPL  -  Interactive Nython", self.rect.x + 56, self.rect.y + 11, self.font_bold, Color(99,102,241,220))
-        renderer.draw_text("Enter to run · ^v for history", self.rect.right() - 180, self.rect.y + 12, self.font_ui, Color(60,62,100,140))
+        renderer.fill_circle(self.rect.x + 14, self.rect.y + 18, 5, _GC_255_95_86_255)
+        renderer.fill_circle(self.rect.x + 28, self.rect.y + 18, 5, _GC_255_189_46_255)
+        renderer.fill_circle(self.rect.x + 42, self.rect.y + 18, 5, _GC_39_201_63_255)
+        renderer.draw_text(">>  REPL  -  Interactive Nython", self.rect.x + 56, self.rect.y + 11, self.font_bold, _GC_99_102_241_220)
+        renderer.draw_text("Enter to run · ^v for history", self.rect.right() - 180, self.rect.y + 12, self.font_ui, _GC_60_62_100_140)
         var content_r = Rect(self.rect.x, self.rect.y + 36, self.rect.w, self.rect.h - 72)
         renderer.set_clip(content_r)
         var first_line = max(0, int(self.scroll_y / self.line_h))
@@ -15869,10 +16008,10 @@ class REPLPanel:
         if self.input_text != "":
             renderer.draw_text(self.input_text, txt_x, inp_y, self.font, self.input_c)
         else:
-            renderer.draw_text("type expression...", txt_x, inp_y, self.font, Color(50,52,80,120))
+            renderer.draw_text("type expression...", txt_x, inp_y, self.font, _GC_50_52_80_120)
         if self.focused and self.blink_v:
             var cx = txt_x + len(self.input_text) * 8
-            renderer.fill_rect(Rect(cx, inp_y - 1, 2, 16), self.accent)
+            renderer.fill_xywh(cx, inp_y - 1, 2, 16, self.accent)
 
     def set_pos(self, x, y):
         self.rect.x = x
