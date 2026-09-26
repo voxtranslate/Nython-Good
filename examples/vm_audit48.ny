@@ -392,9 +392,9 @@ except e:
 check("future re-raises", contains(ferr, "boom in thread"), true)
 check("future_exception text", contains(future_exception(ff, 5000), "boom in thread"), true)
 check("future_done", future_done(ff), true)
-var fa = pool_submit(pool, sleeper, 150)
-var fb = pool_submit(pool, sleeper, 30)
-var fc = pool_submit(pool, sleeper, 80)
+var fa = pool_submit(pool, sleeper, 300)
+var fb = pool_submit(pool, sleeper, 60)
+var fc = pool_submit(pool, sleeper, 180)
 check("as_completed order", as_completed([fa, fb, fc], 5000), [fb, fc, fa])
 var cb_seen = []
 def on_done(f):
@@ -573,11 +573,19 @@ var waits_forever = event_create()
 def stuck():
     event_wait(waits_forever)
 var stuck_err = ""
+var stuck_t = thread_create(stuck)
 try:
-    thread_join(thread_create(stuck))
+    thread_join(stuck_t)
 except e:
     stuck_err = str(e)
 check("join on a thread that can never finish", contains(stuck_err, "deadlock detected"), true)
+# Whichever of the two blocked last got the DeadlockError; if it was the main
+# thread, the stuck thread is still waiting - release it.
+event_set(waits_forever)
+try:
+    thread_join(stuck_t, 5000)
+except e:
+    pass
 var join_self = ""
 try:
     thread_join(thread_id())

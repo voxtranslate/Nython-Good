@@ -252,16 +252,16 @@ var ordered = none
 var mapped = none
 with ThreadPoolExecutor(3) as ex:
     mapped = ex.map(square, [1, 2, 3, 4])
-    var fa = ex.submit(nap, 0.12)
-    var fb = ex.submit(nap, 0.02)
-    var fc = ex.submit(nap, 0.06)
+    var fa = ex.submit(nap, 0.3)
+    var fb = ex.submit(nap, 0.06)
+    var fc = ex.submit(nap, 0.18)
     fb.add_done_callback(lambda f: done_cb.append(f.result()))
     ordered = []
     for f in as_completed([fa, fb, fc], 5):
         ordered.append(f.result())
 check("executor map", mapped, [1, 4, 9, 16])
-check("as_completed with Future objects", ordered, [0.02, 0.06, 0.12])
-check("done callback got the Future", done_cb, [0.02])
+check("as_completed with Future objects", ordered, [0.06, 0.18, 0.3])
+check("done callback got the Future", done_cb, [0.06])
 var pool = ThreadPool(2)
 pool.submit(square, 5)
 pool.submit(square, 6)
