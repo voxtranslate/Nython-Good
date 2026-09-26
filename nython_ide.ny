@@ -42,11 +42,18 @@ class NythonIDE(IDETools):
             want_h = 560
         self.win = Window(want_w, want_h, "NythonIDE")
         self.win.resizable = true
+        # Every metric below is multiplied by the display scale, so the window
+        # must work in pixels: without high pixel density a Retina or scaled
+        # Wayland display reports scale 2 while the window is in points, and
+        # the whole workbench came out twice its size.
+        self.win.high_dpi = true
         self.W = want_w
         self.H = want_h
         self.dpi = gui_display_scale()
         if self.dpi <= 0.0 or self.dpi > 8.0:
             self.dpi = 1.0
+        # VS Code's smallest window; the layout ladder handles it.
+        self.win.set_min_size(int(400 * self.dpi), int(270 * self.dpi))
         # ── metrics (VS Code's) ───────────────────────────────────────────────
         self.TITLE_H = self.dp(30)
         self.ACT_W = self.dp(48)
@@ -477,6 +484,8 @@ class NythonIDE(IDETools):
             self._on_text(e)
         elif t == "expose":
             self._dirty = true
+        elif t == "dropfile" or t == "droptext" or t == "focuslost" or t == "focusgained":
+            self._on_window_event(e)
 
     def _close_overlays(self):
         self.menu_open = -1
@@ -2523,6 +2532,14 @@ class NythonIDE(IDETools):
     # Work that happens on the clock rather than on an event.
     def _tick(self):
         var now = time_ms()
+        # The window loop sleeps up to idle_wait_ms waiting for input after a
+        # frame that painted nothing. While a program, a build or a debug
+        # recording runs, output and progress must arrive promptly, so it
+        # only naps one frame then.
+        if self.job_running or self.build_running or self.dbg_recording:
+            self.win.idle_wait_ms = 16
+        else:
+            self.win.idle_wait_ms = 250
         if self.build_running:
             self._build_step()
         self._watch_tick(now)

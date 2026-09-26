@@ -153,6 +153,24 @@ models rather than copied:
   (`ide_memprobe.py` measures it against plain hover at the same point).
   The status bar's build target no longer lists the workspace folder on
   every frame.
+- **Window integration** (on the GUI merge):
+  - The loop now sleeps waiting for input after a frame that painted
+    nothing, instead of redrawing continuously. While a program, a build
+    or a debug recording runs, the wait drops to one frame so output
+    arrives promptly.
+  - The window works in pixels (`high_dpi`). The metrics were already
+    multiplied by the display scale, so on a Retina or scaled Wayland
+    display the workbench used to come out at twice its size.
+  - The minimum window size is 400×270 (VS Code's).
+  - F11 is real full screen.
+  - A file dropped on the window opens; a dropped folder becomes the
+    workspace; dropped text lands where it is dropped.
+  - `auto_save = onFocusChange` saves when the window loses focus. Coming
+    back re-checks the workspace and git.
+  - `tools/ide_driver.py` sends pointer positions in points when
+    `NY_STUB_DPI_SCALE` is set, so the IDE can be driven at 2×. Note that
+    many e2e checks use fixed scale-1 regions, so only the region-free
+    scenarios pass at 2×.
 - **Keymaps**: VS Code or Code::Blocks (`CB_KEYMAP`: F9, Ctrl+F9, Ctrl+D,
   ...). *Change Keybinding* captures a pressed key. Bindings are saved in
   `.nyide` (`keybinding = Ctrl+Alt+M | command.id`).
@@ -185,7 +203,7 @@ Defects found while driving these, all fixed:
   `len(prefix)` characters, not the ones the fuzzy matcher matched.
 
 e2e scenarios added: `build`, `cbedit`, `cbtools`, `cbdebug`, `responsive`,
-`session`, `columns`, `split`.
+`session`, `columns`, `split`, `window`.
 
 ---
 

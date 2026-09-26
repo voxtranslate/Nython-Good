@@ -2952,11 +2952,54 @@ class IDETools(IDEViews):
 
     # ══ window ═════════════════════════════════════════════════════════════════
     def _toggle_fullscreen(self):
-        try:
-            gui_set_fullscreen(self.win._handle, not self.fullscreen)
-            self.fullscreen = not self.fullscreen
-        except Exception as e:
-            self._notify("Full screen is not available with this GUI backend", "warn")
+        var want = not self.win.is_fullscreen()
+        if self.win.set_fullscreen(want):
+            self.fullscreen = want
+        else:
+            self._notify("Full screen is not available on this display", "warn")
+
+    # ══ window events ══════════════════════════════════════════════════════════
+    # A file dropped on the window opens (a folder becomes the workspace);
+    # text dropped on an editor is inserted where it lands. Leaving the
+    # window saves dirty files when auto_save = onFocusChange, and coming
+    # back checks the workspace for changes made meanwhile (VS Code).
+    def _on_window_event(self, e):
+        var t = e.type
+        self._dirty = true
+        if t == "dropfile":
+            var p = string_replace(e.text, "\\", "/")
+            if p == "":
+                return
+            if os_isdir(p):
+                self._open_folder(self._strip_slash(p))
+            elif self._open_path(p, 0, 0):
+                self.focus = "editor"
+        elif t == "droptext":
+            var h = self.hits.at(e.x, e.y)
+            if h != none and h.cmd == "@editor" and self._can_edit() and e.text != "":
+                var pos = self._pos_at(e.x, e.y)
+                var b = self.buf()
+                self._sel_clear()
+                self._clear_extra_carets()
+                b.begin_group()
+                b.cursor_row = pos[0]
+                b.cursor_col = pos[1]
+                b.insert_text(e.text)
+                b.begin_group()
+                self.focus = "editor"
+                self._after_edit()
+        elif t == "focuslost":
+            self.mouse_down = false
+            self.dragging = ""
+            if self.auto_save == "onFocusChange":
+                var i = 0
+                while i < len(self.docs):
+                    if self.docs[i].kind == "file" and self.docs[i].dirty():
+                        self._write_doc(self.docs[i], self.docs[i].path)
+                    i = i + 1
+        elif t == "focusgained":
+            self.watch_t = 0
+            self.scm_stale = true
 
     # ══ clicks this file owns ══════════════════════════════════════════════════
     def _tools_click(self, cmd, arg, e):

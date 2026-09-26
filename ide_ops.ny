@@ -1580,7 +1580,7 @@ class IDEOps(IDECore):
         body = body + "panel = " + str(self.panel_open) + "\n"
         body = body + "sidebar = " + str(self.sidebar_open) + "\n"
         body = body + "render_whitespace = " + str(self.show_whitespace) + "\n"
-        body = body + "# off | afterDelay\n"
+        body = body + "# off | afterDelay | onFocusChange\n"
         body = body + "auto_save = " + self.auto_save + "\n"
         body = body + self._tools_settings_text()
         return body
@@ -1638,7 +1638,7 @@ class IDEOps(IDECore):
                     elif k == "render_whitespace":
                         self.show_whitespace = (v == "true")
                     elif k == "auto_save":
-                        if v == "afterDelay" or v == "off":
+                        if v == "afterDelay" or v == "off" or v == "onFocusChange":
                             self.auto_save = v
                     else:
                         self._tools_setting(k, v)

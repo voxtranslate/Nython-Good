@@ -1502,6 +1502,48 @@ def sc_split(s):
     c(st["split"] == "" and len([h for h in ide.hitmap() if h[4] == "@editor"]) == 1, "split: join back to one group", st["split"])
 
 
+def sc_window_events(s):
+    ide = s.start()
+    c = s.res.check
+    # A file dropped on the window opens in an editor.
+    ide.send("drop " + os.path.join(s.ws, "src", "util.ny"))
+    st = ide.state()
+    c(st["title"] == "util.ny", "window: a dropped file opens", st["title"])
+    # Text dropped on the editor is inserted where it lands.
+    hm = ide.hitmap()
+    ed = [h for h in hm if h[4] == "@editor"][0]
+    ide.send("move %d %d" % (ed[0] + 2, ed[1] + 4))
+    ide.send("droptext DROPPED")
+    st = ide.state()
+    c(st["text"].startswith("DROPPED"), "window: dropped text is inserted in the editor", st["text"][:20])
+    # auto_save = onFocusChange saves dirty files when the window loses focus.
+    s.write(".nyide", "auto_save = onFocusChange\n")
+    palette(s, "Tools: Configure Tools...")
+    ide.key("ctrl+s")
+    s.open_file("app.ny")
+    ide.key("ctrl+end")
+    ide.type("# unsaved")
+    st = ide.state()
+    c(st["dirty"], "window: edit makes the file dirty", st["dirty"])
+    ide.send("focus 0")
+    ide.send("focus 1")
+    st = ide.state()
+    c(not st["dirty"] and s.read("app.ny").endswith("# unsaved"), "window: leaving the window saves (onFocusChange)", st["dirty"])
+    # A dropped folder becomes the workspace.
+    other = os.path.join(s.root, "other")
+    os.makedirs(other)
+    with open(os.path.join(other, "o.ny"), "w") as f:
+        f.write("print(1)\n")
+    ide.send("drop " + other)
+    ok = False
+    for _ in range(40):
+        if ide.snap().has("o.ny", exact=True):
+            ok = True
+            break
+        time.sleep(0.1)
+    c(ok, "window: a dropped folder opens as the workspace")
+
+
 SCENARIOS = [
     ("boot", sc_boot), ("edit", sc_edit_undo_save), ("clipboard", sc_clipboard_lines),
     ("multicursor", sc_multicursor), ("palette", sc_palette), ("quickopen", sc_quick_open),
@@ -1512,7 +1554,7 @@ SCENARIOS = [
     ("deadviews", sc_dead_clicks_views), ("build", sc_build), ("cbedit", sc_cb_editing),
     ("cbtools", sc_cb_tools), ("cbdebug", sc_cb_debug), ("responsive", sc_responsive),
     ("session", sc_session), ("columns", sc_column_select),
-    ("split", sc_split),
+    ("split", sc_split), ("window", sc_window_events),
 ]
 
 

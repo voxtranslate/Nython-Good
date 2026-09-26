@@ -109,13 +109,40 @@ class IDE:
             shutil.rmtree(self.tmp, ignore_errors=True)
 
     # ── raw input ─────────────────────────────────────────────────────────
+    # Pointer positions in the stub script are in window points, as SDL
+    # reports them; frames are in pixels. On a high-pixel-density window
+    # (NY_STUB_DPI_SCALE, and the IDE opts in) they differ, so coordinates
+    # taken from a frame are divided by the scale on the way out.
+    POINTER_CMDS = {"move": 2, "down": 2, "up": 2, "click": 2, "dblclick": 2, "drag": 4, "wheel": 2}
+
+    def _scale(self):
+        v = self.extra_env.get("NY_STUB_DPI_SCALE", os.environ.get("NY_STUB_DPI_SCALE", ""))
+        try:
+            f = float(v)
+        except ValueError:
+            return 1.0
+        return f if f > 0 else 1.0
+
+    def _to_points(self, ln):
+        sc = self._scale()
+        parts = ln.split(" ")
+        n = self.POINTER_CMDS.get(parts[0], 0)
+        if sc == 1.0 or n == 0:
+            return ln
+        for i in range(1, min(n + 1, len(parts))):
+            try:
+                parts[i] = "%d" % round(float(parts[i]) / sc)
+            except ValueError:
+                pass
+        return " ".join(parts)
+
     def send(self, *lines):
         if self.proc is not None and self.proc.poll() is not None:
             raise DriverError("IDE exited (code %s). Log tail:\n%s"
                               % (self.proc.returncode, self.log()[-3000:]))
         with open(self.events, "a") as f:
             for ln in lines:
-                f.write(ln + "\n")
+                f.write(self._to_points(ln) + "\n")
             f.flush()
 
     def wait(self, frames=1):
