@@ -851,6 +851,16 @@ public:   // NythonExecutor is a struct: members default to public
         return val;
     }
 
+    // Floor division of two integers of any size, rounding toward negative
+    // infinity like Python. (The result used to be cast to a 32-bit int, so
+    // 1790429563123456789 // 1000000 came out as -571799309.)
+    static bigint floorDivInt(const bigint& a, const bigint& b) {
+        bigint q = a / b;
+        bigint r = a - q * b;
+        if (r != bigint(0) && ((r < bigint(0)) != (b < bigint(0)))) q = q - bigint(1);
+        return q;
+    }
+
     Value evalAugAssignment(node_ptr node, Context* ctx) {
         auto an = static_pointer_cast<AugAssignNode>(node);
         Value old_val = evalNode(an->target, ctx);
@@ -888,22 +898,34 @@ public:   // NythonExecutor is a struct: members default to public
                 result = Value(std::pow(a, b));
             }
             else if (old_val.type == ValueType::INTEGER && new_val.type == ValueType::INTEGER) {
-                int64_t base = bigint_to_i64(old_val.value.i);
                 int64_t exp = bigint_to_i64(new_val.value.i);
-                int64_t r = 1;
-                for (int64_t i = 0; i < exp; i++) r *= base;
-                result = Value(static_cast<int>(r));
+                if (exp < 0) {
+                    result = Value(std::pow((double)bigint_to_i64(old_val.value.i), (double)exp));
+                } else {
+                    // exact, any size (square-and-multiply on bigint)
+                    bigint base = old_val.value.i, r = bigint(1);
+                    while (exp > 0) {
+                        if (exp & 1) r = r * base;
+                        exp >>= 1;
+                        if (exp) base = base * base;
+                    }
+                    result = Value(r);
+                }
             } else {
                 double a = old_val.type == ValueType::DOUBLE ? static_cast<double>(old_val.value.d) : static_cast<double>(bigint_to_i64(old_val.value.i));
                 double b = new_val.type == ValueType::DOUBLE ? static_cast<double>(new_val.value.d) : static_cast<double>(bigint_to_i64(new_val.value.i));
                 result = Value(std::pow(a, b));
             }
         }
+        else if ((an->op == "//=" || an->op == "\\=") && old_val.type == ValueType::INTEGER && new_val.type == ValueType::INTEGER) {
+            if (new_val.value.i == bigint(0)) throw std::string("__exc__:ZeroDivisionError:division by zero");
+            result = Value(floorDivInt(old_val.value.i, new_val.value.i));
+        }
         else if (an->op == "//=" || an->op == "\\=") {
             double da = old_val.type == ValueType::DOUBLE ? static_cast<double>(old_val.value.d) : static_cast<double>(bigint_to_i64(old_val.value.i));
             double db = new_val.type == ValueType::DOUBLE ? static_cast<double>(new_val.value.d) : static_cast<double>(bigint_to_i64(new_val.value.i));
             if (db == 0) throw std::string("__exc__:ZeroDivisionError:division by zero");
-            result = Value(static_cast<int>(std::floor(da / db)));
+            result = Value(std::floor(da / db));   // a float operand gives a float, as with //
         }
         else if (an->op == "&=") {
             int64_t a = old_val.type == ValueType::DOUBLE ? static_cast<int64_t>(old_val.value.d) : bigint_to_i64(old_val.value.i);
@@ -1298,13 +1320,8 @@ return lv * rv;
             // The VM already treats them as synonyms (VirtualMachine.hpp's
             // bin_op()); this brings the interpreter to parity.
             if (lv.type == ValueType::INTEGER && rv.type == ValueType::INTEGER) {
-                int64_t a = bigint_to_i64(lv.value.i);
-                int64_t b = bigint_to_i64(rv.value.i);
-                if (b == 0) throw std::string("__exc__:ZeroDivisionError:division by zero");
-                int64_t result = a / b;
-                // Floor toward negative infinity (Python semantics)
-                if ((a ^ b) < 0 && result * b != a) result--;
-                return Value(static_cast<int>(result));
+                if (rv.value.i == bigint(0)) throw std::string("__exc__:ZeroDivisionError:division by zero");
+                return Value(floorDivInt(lv.value.i, rv.value.i));
             }
             if (lv.type == ValueType::DOUBLE || rv.type == ValueType::DOUBLE) {
                 double a = (lv.type == ValueType::DOUBLE) ? static_cast<double>(lv.value.d) : static_cast<double>(bigint_to_i64(lv.value.i));
@@ -1601,10 +1618,9 @@ return lv * rv;
         }
         if (un->op == "-") {
             if (v.type == ValueType::INTEGER) {
-                int64_t val = (long long)v.value.i;
-                nython::kernel::bigint zero(0);
-                if (v.value.i < zero) val = -val;
-                return Value((int)(-val));
+                // Full width: -5000000000 used to come out as -705032704 (the
+                // result was cast to a 32-bit int).
+                return Value(nython::kernel::bigint(0) - v.value.i);
             }
             if (v.type == ValueType::DOUBLE) return Value(-v.value.d);
             return Value(0) - v;
@@ -1613,7 +1629,7 @@ return lv * rv;
         if (un->op == "!" || un->op == "not") return Value(v.isFalse() || v.isNone());
         if (un->op == "~") {
             if (v.type == ValueType::INTEGER)
-                return Value(static_cast<int>(~bigint_to_i64(v.value.i)));
+                return Value(nython::kernel::bigint(0) - v.value.i - nython::kernel::bigint(1));   // ~x == -x - 1
             return Value(0);
         }
         if (un->op == "++" || un->op == "--") {

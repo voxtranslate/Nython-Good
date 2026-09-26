@@ -529,7 +529,17 @@ Value dispatch_tensor(NythonExecutor& E,
         if (name == "int") {
             if (args.empty()) return Value(0);
             if (args[0].type == ValueType::INTEGER) return args[0];
-            if (args[0].type == ValueType::DOUBLE) return Value(static_cast<int>(args[0].value.d));
+            if (args[0].type == ValueType::DOUBLE) {
+                // Truncate toward zero at full width. static_cast<int> made
+                // int(time_ms()) -2147483648 (and was undefined behaviour).
+                double d = std::trunc((double)args[0].value.d);
+                if (std::isnan(d)) throw std::string("__exc__:ValueError:cannot convert float NaN to integer");
+                if (std::isinf(d)) throw std::string("__exc__:OverflowError:cannot convert float infinity to integer");
+                if (std::fabs(d) < 9.2e18) return Value(bigint((long long)d));
+                char buf[400];
+                std::snprintf(buf, sizeof buf, "%.0f", d);
+                return Value(bigint(std::string(buf)));
+            }
             if (args[0].type == ValueType::BOOLEAN) return Value(args[0].value.b ? 1 : 0);
             if (args[0].type == ValueType::USERDATA || args[0].isCollectable()) {
                 std::string s = getStringValue(args[0]);
@@ -543,11 +553,29 @@ Value dispatch_tensor(NythonExecutor& E,
                     if (base != 10 && (s[1] == 'x' || s[1] == 'X' || s[1] == 'b' || s[1] == 'B' || s[1] == 'o' || s[1] == 'O'))
                         s = s.substr(2);
                 }
+                // Surrounding whitespace is allowed, as in Python.
+                size_t b0 = s.find_first_not_of(" \t\r\n"), b1 = s.find_last_not_of(" \t\r\n");
+                std::string t = b0 == std::string::npos ? std::string() : s.substr(b0, b1 - b0 + 1);
                 try {
                     size_t idx = 0;
-                    long long iv = std::stoll(s, &idx, base);
-                    if (idx != s.size()) throw std::invalid_argument("not fully consumed");
-                    return Value(static_cast<int>(iv));
+                    long long iv = std::stoll(t, &idx, base);
+                    if (idx != t.size() || t.empty()) throw std::invalid_argument("not fully consumed");
+                    return Value(bigint(iv));   // full width (it was cast to a 32-bit int)
+                }
+                catch (std::out_of_range&) {
+                    // Wider than 64 bits: accumulate digit by digit.
+                    bool neg = false;
+                    size_t i = 0;
+                    if (i < t.size() && (t[i] == '+' || t[i] == '-')) { neg = t[i] == '-'; i++; }
+                    if (i >= t.size()) throw std::string("__exc__:ValueError:invalid literal for int(): '" + s + "'");
+                    bigint acc(0);
+                    for (; i < t.size(); i++) {
+                        char ch = (char)std::tolower((unsigned char)t[i]);
+                        int dgt = std::isdigit((unsigned char)ch) ? ch - '0' : (ch >= 'a' && ch <= 'z') ? ch - 'a' + 10 : 99;
+                        if (dgt >= base) throw std::string("__exc__:ValueError:invalid literal for int(): '" + s + "'");
+                        acc = acc * bigint(base) + bigint(dgt);
+                    }
+                    return Value(neg ? bigint(0) - acc : acc);
                 }
                 catch (...) { throw std::string("__exc__:ValueError:invalid literal for int(): '" + s + "'"); }
             }
@@ -568,8 +596,9 @@ Value dispatch_tensor(NythonExecutor& E,
         if (name == "abs") {
             if (args.size() >= 1) {
                 if (args[0].type == ValueType::INTEGER) {
-                    int64_t v = bigint_to_i64(args[0].value.i);
-                    return Value((int)(v < 0 ? -v : v));
+                    // bigint: abs(-5000000000) used to be truncated to 32 bits
+                    const bigint& v = args[0].value.i;
+                    return Value(v < bigint(0) ? bigint(0) - v : v);
                 }
                 if (args[0].type == ValueType::DOUBLE) return Value(std::abs(args[0].value.d));
             }

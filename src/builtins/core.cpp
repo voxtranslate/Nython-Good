@@ -898,8 +898,9 @@ Value dispatch_core(NythonExecutor& E,
         if (name == "abs") {
             if (args.size() >= 1) {
                 if (args[0].type == ValueType::INTEGER) {
-                    int64_t v = bigint_to_i64(args[0].value.i);
-                    return Value((int)(v < 0 ? -v : v));
+                    // full width: abs(-5000000000) was cast to a 32-bit int
+                    const bigint& v = args[0].value.i;
+                    return Value(v < bigint(0) ? bigint(0) - v : v);
                 }
                 if (args[0].type == ValueType::DOUBLE) return Value(std::abs(args[0].value.d));
             }
