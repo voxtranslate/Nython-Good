@@ -132,6 +132,10 @@ class DrawList:
         c.h = h
         return self._push(c)
 
+    # Ends the innermost push_clip.
+    def pop_clip(self):
+        return self._push(DrawCmd("unclip"))
+
     # One string standing for the whole frame. Comparing it against the previous
     # frame's is how the loop decides whether to present at all.
     def signature(self):
@@ -201,8 +205,13 @@ class NyImGui:
         self.avail_w = 0
         self.line_h = 0
         self.same_line_pending = false
+        # The last item laid out, so same_line() can put the next one after it.
+        self.last_x = 0
+        self.last_y = 0
+        self.last_w = 0
 
         self.frame_count = 0
+        self._col = none
         self.last_signature = ""
         self.skipped_frames = 0
 
@@ -245,6 +254,10 @@ class NyImGui:
         self.cursor_y = y
         self.avail_w = w
         self.line_h = 0
+        self.last_x = x
+        self.last_y = y
+        self.last_w = 0
+        self.same_line_pending = false
         self.hot_id = 0
         self.id_seed = 0
         self.id_stack = []
@@ -272,29 +285,34 @@ class NyImGui:
         return true
 
     # ── layout ───────────────────────────────────────────────────────────────
+    # The next item goes on the same row as the last one, right after it
+    # (ImGui's SameLine). It used to take effect only after the NEXT item had
+    # already been placed on a new row, so it put the item after that on the
+    # wrong row instead.
     def same_line(self):
+        self.cursor_x = self.last_x + self.last_w + self.style.item_spacing_x
+        self.cursor_y = self.last_y
         self.same_line_pending = true
         return true
 
+    # Records the item just placed at the cursor, then moves the cursor to
+    # the start of the next row (below the tallest item of this row).
     def item_size(self, w, h):
-        if self.same_line_pending:
-            self.cursor_x = self.cursor_x + w + self.style.item_spacing_x
-            if h > self.line_h:
-                self.line_h = h
-            self.same_line_pending = false
-        else:
-            self.cursor_x = self.origin_x
-            self.cursor_y = self.cursor_y + h + self.style.item_spacing_y
+        if not self.same_line_pending:
+            self.line_h = 0
+        self.last_x = self.cursor_x
+        self.last_y = self.cursor_y
+        self.last_w = w
+        if h > self.line_h:
             self.line_h = h
+        self.cursor_x = self.origin_x
+        self.cursor_y = self.last_y + self.line_h + self.style.item_spacing_y
+        self.same_line_pending = false
         return true
 
     # Reserve the rect this item occupies, BEFORE advancing the cursor.
     def item_rect(self, w, h):
-        var x = self.cursor_x
-        var y = self.cursor_y
-        if self.same_line_pending:
-            x = self.cursor_x
-        return [x, y, w, h]
+        return [self.cursor_x, self.cursor_y, w, h]
 
     def text_width(self, s):
         return len(s) * self.style.char_w
@@ -445,11 +463,22 @@ class NyImGui:
     # IDE: the panel is expressed as calls, and its commands are flushed through
     # the same renderer everything else uses. Porting can therefore proceed one
     # panel at a time instead of as a rewrite.
+    # One reusable colour for the whole flush: the renderer reads it at once,
+    # and a Color per command per frame is never freed by the interpreter.
+    # Clips nest (push_clip / pop_clip) and none is left set afterwards - a
+    # clip command used to stay in force for everything drawn after the flush.
     def flush(self, r, font, font_bold):
+        if self._col == none:
+            self._col = Color(0, 0, 0, 255)
+        var col = self._col
+        var clips = 0
         var i = 0
         while i < self.draw.count:
             var c = self.draw.cmds[i]
-            var col = Color(c.r, c.g, c.b, c.a)
+            col.r = c.r
+            col.g = c.g
+            col.b = c.b
+            col.a = c.a
             if c.kind == "rect" or c.kind == "frame":
                 if c.radius > 0:
                     r.fill_round_xywh(c.x, c.y, c.w, c.h, col, c.radius)
@@ -463,8 +492,15 @@ class NyImGui:
             elif c.kind == "line":
                 r.draw_line(c.x, c.y, c.x2, c.y2, col, 1)
             elif c.kind == "clip":
-                r.set_clip(Rect(c.x, c.y, c.w, c.h))
+                r.push_clip(c.x, c.y, c.w, c.h)
+                clips = clips + 1
+            elif c.kind == "unclip" and clips > 0:
+                r.pop_clip()
+                clips = clips - 1
             i = i + 1
+        while clips > 0:
+            r.pop_clip()
+            clips = clips - 1
         return self.draw.count
 
     def add_bold_text(self, x, y, s, col):

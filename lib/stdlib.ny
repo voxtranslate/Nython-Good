@@ -983,32 +983,9 @@ class Random:
     def randfloat(self, lo, hi):
         return lo + self.random() * (hi - lo)
 
-    def choice(self, arr):
-        var n = len(arr)
-        if n == 0:
-            return none
-        var idx = self._next() % n
-        return arr[idx]
-
-    def shuffle(self, arr):
-        var n = len(arr)
-        var i = n - 1
-        while i > 0:
-            var j = self._next() % (i + 1)
-            var tmp = arr[i]
-            arr[i] = arr[j]
-            arr[j] = tmp
-            i = i - 1
-        return arr
-
-    def sample(self, arr, k):
-        var copy = self.shuffle(arr)
-        var result = []
-        var i = 0
-        while i < k and i < len(copy):
-            result.append(copy[i])
-            i = i + 1
-        return result
+    # choice/shuffle/sample were each defined twice in this class; the
+    # interpreter kept the second set and the VM the first, and the second
+    # sample() never advanced its loop counters. One set, both engines.
     def choice(self, arr, n=none):
         if n == none:
             var ln = len(arr)
@@ -1032,13 +1009,15 @@ class Random:
     def sample(self, arr, n, k):
         var copy = []
         var i = 0
-        while i < n:
+        while i < n and i < len(arr):
             copy.append(arr[i])
-        self.shuffle(copy, n)
+            i = i + 1
+        self.shuffle(copy, len(copy))
         var result = []
         i = 0
-        while i < k:
+        while i < k and i < len(copy):
             result.append(copy[i])
+            i = i + 1
         return result
     def normal(self, mean, std):
         var u1 = self.random()

@@ -208,6 +208,8 @@ class FlexItem:
         self.grow = grow
         self.min_size = 0
         self.max_size = 0        # 0 = unbounded
+        self.main_size = 0       # solved size along the main axis
+        self.cross = 0           # own size across the axis (align != stretch)
         self.x = 0
         self.y = 0
         self.w = 0
@@ -290,21 +292,55 @@ class Flex:
         if slack < 0:
             slack = 0
 
-        # Assign main-axis sizes, honouring minimums. Anything a minimum steals
-        # is taken back off the remaining slack so the row still fits.
+        # Assign main-axis sizes, honouring minimums and maximums. An item
+        # pinned by one is frozen at that size and the slack is shared again
+        # among the others, so the row still fits (CSS's "resolve flexible
+        # lengths" loop). The comment always said so; the code used to give
+        # every item its share first and then enlarge the pinned one, so a
+        # minimum pushed the row past its container.
+        var frozen = []
         i = 0
-        var assigned = 0
         while i < self.item_count:
-            var it = self.items[i]
-            var size = it.basis
-            if grow_total > 0 and it.grow > 0:
-                size = size + int(float(slack) * (float(it.grow) / float(grow_total)))
-            if it.min_size > 0 and size < it.min_size:
-                size = it.min_size
-            if it.max_size > 0 and size > it.max_size:
-                size = it.max_size
-            it.main_size = size
-            assigned = assigned + size
+            var it0 = self.items[i]
+            frozen.append(grow_total <= 0 or it0.grow <= 0)
+            it0.main_size = self._bound(it0, it0.basis)
+            i = i + 1
+        var rounds = 0
+        while rounds <= self.item_count:
+            var used2 = gaps
+            var weight = 0.0
+            i = 0
+            while i < self.item_count:
+                if frozen[i]:
+                    used2 = used2 + self.items[i].main_size
+                else:
+                    used2 = used2 + self.items[i].basis
+                    weight = weight + float(self.items[i].grow)
+                i = i + 1
+            var spare = main_total - used2
+            if spare < 0:
+                spare = 0
+            var changed = false
+            i = 0
+            while i < self.item_count:
+                if not frozen[i]:
+                    var it = self.items[i]
+                    var want = it.basis
+                    if weight > 0.0:
+                        want = want + int(float(spare) * float(it.grow) / weight)
+                    var got = self._bound(it, want)
+                    it.main_size = got
+                    if got != want:
+                        frozen[i] = true
+                        changed = true
+                i = i + 1
+            if not changed:
+                rounds = self.item_count + 1
+            rounds = rounds + 1
+        var assigned = 0
+        i = 0
+        while i < self.item_count:
+            assigned = assigned + self.items[i].main_size
             i = i + 1
 
         # justify only matters when nothing grows and space is left over
@@ -334,10 +370,20 @@ class Flex:
             i = i + 1
         return self.items
 
+    def _bound(self, it, v):
+        if it.min_size > 0 and v < it.min_size:
+            v = it.min_size
+        if it.max_size > 0 and v > it.max_size:
+            v = it.max_size
+        return v
+
+    # Cross-axis size: the full extent when stretching; otherwise the item's
+    # own `cross` size if it has one (it used to return the full extent in
+    # every mode, so center/start/end changed nothing).
     def _cross(self, avail, it):
-        if self.align == "stretch":
+        if self.align == "stretch" or it.cross <= 0 or it.cross > avail:
             return avail
-        return avail          # non-stretch keeps full size unless a widget measures itself
+        return it.cross
 
     def _cross_offset(self, avail, size):
         if self.align == "center":

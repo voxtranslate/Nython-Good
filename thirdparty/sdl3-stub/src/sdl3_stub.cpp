@@ -28,6 +28,10 @@
 //                           Write the last presented frame to <file> when
 //                           the (auto)quit is delivered.
 //
+// SDL_WaitEventTimeout returns at once when a (scripted) event is pending;
+// otherwise it sleeps min(timeout, 16 ms) and reports nothing. Either way it
+// counts as one poll for NY_STUB_AUTOQUIT and the scripted idle gaps.
+//
 // Frame capture: when any of the three variables above is set, every draw
 // call is recorded, and the last *presented* frame is kept as a display list
 // (JSON lines: rects, lines, points, clip changes, and text runs with their
@@ -54,9 +58,15 @@
 #include <deque>
 #include <unordered_map>
 #include <cmath>
+#include <algorithm>
+#include <chrono>
+#include <thread>
 
 // ── Opaque struct definitions ───────────────────────────────────────────
-struct SDL_Window   { std::string title; int w = 0, h = 0; int x = 0, y = 0; };
+struct SDL_Window   {
+    std::string title; int w = 0, h = 0; int x = 0, y = 0;
+    SDL_WindowID id = 0; SDL_WindowFlags flags = 0; int min_w = 0, min_h = 0;
+};
 // Draw state is tracked (not just accepted and dropped) so frame capture can
 // record what each primitive would actually have painted.
 struct SDL_Renderer {
@@ -98,6 +108,8 @@ static CapFrame g_cur, g_last;
 static long g_frame_no = 0;
 static int g_win_w = 0, g_win_h = 0;
 static SDL_Window* g_last_window = nullptr;
+static std::vector<SDL_Window*> g_all_windows;   // creation order, for `window N`
+static SDL_WindowID g_next_window_id = 1;
 
 static bool capture_enabled() {
     static int cached = -1;
@@ -215,15 +227,48 @@ SDL_Window* SDL_CreateWindow(const char* title, int w, int h, SDL_WindowFlags fl
     win->h = h;
     win->x = 0;
     win->y = 0;
+    win->id = g_next_window_id++;
+    win->flags = flags;
     g_win_w = w;
     g_win_h = h;
     g_last_window = win;
+    g_all_windows.push_back(win);
     return win;
 }
 
 void SDL_DestroyWindow(SDL_Window* window) {
-    if (window == g_last_window) g_last_window = nullptr;
+    g_all_windows.erase(std::remove(g_all_windows.begin(), g_all_windows.end(), window), g_all_windows.end());
+    if (window == g_last_window) g_last_window = g_all_windows.empty() ? nullptr : g_all_windows.back();
     delete window;
+}
+
+SDL_WindowID SDL_GetWindowID(SDL_Window* window) { return window ? window->id : 0; }
+SDL_WindowFlags SDL_GetWindowFlags(SDL_Window* window) { return window ? window->flags : 0; }
+
+bool SDL_SetWindowMinimumSize(SDL_Window* window, int min_w, int min_h) {
+    if (!window) return false;
+    window->min_w = min_w;
+    window->min_h = min_h;
+    return true;
+}
+
+bool SDL_SetWindowFullscreen(SDL_Window* window, bool fullscreen) {
+    if (!window) return false;
+    if (fullscreen) window->flags |= SDL_WINDOW_FULLSCREEN;
+    else window->flags &= ~SDL_WINDOW_FULLSCREEN;
+    return true;
+}
+
+bool SDL_SetWindowIcon(SDL_Window* window, SDL_Surface* icon) { return window && icon; }
+
+// Remembered only; there is no IME headlessly.
+static SDL_Rect g_text_area{0, 0, 0, 0};
+static int g_text_area_cursor = 0;
+bool SDL_SetTextInputArea(SDL_Window* window, const SDL_Rect* rect, int cursor) {
+    if (!window) return false;
+    if (rect) g_text_area = *rect;
+    g_text_area_cursor = cursor;
+    return true;
 }
 
 bool SDL_SetWindowPosition(SDL_Window* window, int x, int y) {
@@ -329,6 +374,9 @@ void SDL_DestroyCursor(SDL_Cursor* cursor) {
     delete cursor;
 }
 
+bool SDL_HideCursor(void) { return true; }
+bool SDL_ShowCursor(void) { return true; }
+
 // ── Renderer ───────────────────────────────────────────────────────────
 SDL_Renderer* SDL_CreateRenderer(SDL_Window* window, const char* name) {
     (void)name;
@@ -427,6 +475,60 @@ bool SDL_SetRenderViewport(SDL_Renderer* renderer, const SDL_Rect* rc) {
     return true;
 }
 
+// A window created with SDL_WINDOW_HIGH_PIXEL_DENSITY has a drawing surface
+// of NY_STUB_DPI_SCALE pixels per point, as on a Retina display; any other
+// window is scaled by the system and draws in points.
+static float window_pixel_scale(SDL_Window* w) {
+    if (!w || !(w->flags & SDL_WINDOW_HIGH_PIXEL_DENSITY)) return 1.0f;
+    return dpi_scale_from_env();
+}
+
+bool SDL_GetRenderOutputSize(SDL_Renderer* renderer, int* w, int* h) {
+    if (!renderer || !renderer->window) return false;
+    float sc = window_pixel_scale(renderer->window);
+    if (w) *w = (int)(renderer->window->w * sc + 0.5f);
+    if (h) *h = (int)(renderer->window->h * sc + 0.5f);
+    return true;
+}
+
+// Triangles are captured as the horizontal one-pixel spans they cover, so a
+// frame capture (and tools/nyshot.py) sees arcs and pies as ordinary fills.
+// Colour is the first vertex's; SDL interpolates, the UI never varies it.
+bool SDL_RenderGeometry(SDL_Renderer* renderer, SDL_Texture* texture,
+                        const SDL_Vertex* v, int nv, const int* idx, int ni) {
+    (void)texture;
+    if (!renderer || !v || nv < 3) return false;
+    if (!capture_enabled()) return true;
+    Uint8 sr = renderer->r, sg = renderer->g, sb = renderer->b, sa = renderer->a;
+    renderer->r = (Uint8)std::lround(v[0].color.r * 255.0f);
+    renderer->g = (Uint8)std::lround(v[0].color.g * 255.0f);
+    renderer->b = (Uint8)std::lround(v[0].color.b * 255.0f);
+    renderer->a = (Uint8)std::lround(v[0].color.a * 255.0f);
+    int count = idx ? ni : nv;
+    for (int t = 0; t + 2 < count; t += 3) {
+        const SDL_FPoint* p[3];
+        for (int k = 0; k < 3; k++) p[k] = &v[idx ? idx[t + k] : t + k].position;
+        float y0 = std::min({p[0]->y, p[1]->y, p[2]->y});
+        float y1 = std::max({p[0]->y, p[1]->y, p[2]->y});
+        for (int y = (int)std::floor(y0); y <= (int)std::ceil(y1); y++) {
+            float sy = (float)y + 0.5f, lo = 1e30f, hi = -1e30f;
+            for (int e = 0; e < 3; e++) {
+                const SDL_FPoint* a = p[e];
+                const SDL_FPoint* b = p[(e + 1) % 3];
+                if ((a->y <= sy && sy < b->y) || (b->y <= sy && sy < a->y)) {
+                    float x = a->x + (b->x - a->x) * (sy - a->y) / (b->y - a->y);
+                    lo = std::min(lo, x);
+                    hi = std::max(hi, x);
+                }
+            }
+            float xa = std::round(lo), xb = std::round(hi);
+            if (xb > xa) cap('F', renderer, xa, (float)y, xb - xa, 1.0f);
+        }
+    }
+    renderer->r = sr; renderer->g = sg; renderer->b = sb; renderer->a = sa;
+    return true;
+}
+
 // ── Textures / surfaces ──────────────────────────────────────────────────
 SDL_Texture* SDL_CreateTextureFromSurface(SDL_Renderer* renderer, SDL_Surface* surface) {
     (void)renderer;
@@ -490,6 +592,7 @@ static const KeyDef kKeys[] = {
     {"f4", "F4", 0x4000003D}, {"f5", "F5", 0x4000003E}, {"f6", "F6", 0x4000003F},
     {"f7", "F7", 0x40000040}, {"f8", "F8", 0x40000041}, {"f9", "F9", 0x40000042},
     {"f10", "F10", 0x40000043}, {"f11", "F11", 0x40000044}, {"f12", "F12", 0x40000045},
+    {"kp_enter", "Keypad Enter", 0x40000058},
 };
 
 const char* SDL_GetKeyName(SDL_Keycode key) {
@@ -524,6 +627,32 @@ bool SDL_HasClipboardText(void) { return g_has_clipboard; }
 
 void SDL_free(void* mem) { free(mem); }
 
+char* SDL_strdup(const char* str) {
+    if (!str) return nullptr;
+    size_t n = strlen(str) + 1;
+    char* out = (char*)malloc(n);
+    if (out) memcpy(out, str, n);
+    return out;
+}
+
+// ── File dialogs ─────────────────────────────────────────────────────────
+// Nothing to show headlessly. The request is remembered, and the script
+// command `dialog PATH` (or `dialog` alone, meaning Cancel) answers it
+// through the application's own callback, exactly as a real dialog would.
+static SDL_DialogFileCallback g_dialog_cb = nullptr;
+static void* g_dialog_ud = nullptr;
+void SDL_ShowOpenFileDialog(SDL_DialogFileCallback cb, void* ud, SDL_Window*,
+                            const SDL_DialogFileFilter*, int, const char*, bool) {
+    g_dialog_cb = cb; g_dialog_ud = ud;
+}
+void SDL_ShowSaveFileDialog(SDL_DialogFileCallback cb, void* ud, SDL_Window*,
+                            const SDL_DialogFileFilter*, int, const char*) {
+    g_dialog_cb = cb; g_dialog_ud = ud;
+}
+void SDL_ShowOpenFolderDialog(SDL_DialogFileCallback cb, void* ud, SDL_Window*, const char*, bool) {
+    g_dialog_cb = cb; g_dialog_ud = ud;
+}
+
 // ── Scripted input ─────────────────────────────────────────────────────
 // NY_STUB_EVENTS=<file>, one command per line (blank lines and #comments
 // ignored). Coordinates are window pixels; [mods] is e.g. ctrl, alt,
@@ -538,7 +667,8 @@ void SDL_free(void* mem) { free(mem); }
 //   click X Y [BTN] [mods]   press, idle frames, release
 //   dblclick X Y             two clicks in quick succession
 //   drag X1 Y1 X2 Y2         press, move in steps, release
-//   wheel X Y DY [mods]      wheel at X,Y (DY > 0 scrolls up), e.g. wheel 300 200 1 ctrl
+//   wheel X Y DY [DX] [mods] wheel at X,Y (DY > 0 scrolls up; DX horizontal),
+//                            e.g. wheel 300 200 1 ctrl, wheel 300 200 0.5 -0.25
 //   key COMBO                key down/up, e.g. key ctrl+shift+p, key f5, key ctrl++
 //   type TEXT                per character: key down + text input + key up.
 //                            \n = Enter, \t = Tab, \\ = backslash
@@ -648,10 +778,22 @@ static bool parse_combo(const std::string& combo, SDL_Keymod& mods, SDL_Keycode&
     return false;
 }
 
+// Scripted events go to the window chosen with `window N` (1-based creation
+// order), by default the most recently created one.
+static SDL_Window* g_target_window = nullptr;
+static SDL_WindowID target_window_id() {
+    SDL_Window* w = g_target_window;
+    if (w && std::find(g_all_windows.begin(), g_all_windows.end(), w) == g_all_windows.end()) w = nullptr;
+    if (!w) w = g_last_window;
+    return w ? w->id : 0;
+}
+
 static PendingEvent blank_event(Uint32 type, SDL_Keymod mods) {
     PendingEvent pe;
     memset(&pe.ev, 0, sizeof(SDL_Event));
     pe.ev.type = type;
+    // windowID sits at the same offset in every event struct that has one.
+    pe.ev.window.windowID = target_window_id();
     pe.mods = mods;
     pe.batch_end = true;
     pe.wait_after = event_gap();
@@ -672,11 +814,15 @@ static void push_mouse(Uint32 type, float x, float y, int btn, SDL_Keymod mods, 
     g_pending.push_back(pe);
 }
 
-static void push_key(SDL_Keycode code, SDL_Keymod mods, const std::string* text, bool last) {
+static void push_key(SDL_Keycode code, SDL_Keymod mods, const std::string* text, bool last, int repeats = 0) {
     PendingEvent d = blank_event(SDL_EVENT_KEY_DOWN, mods);
     d.ev.key.key = code; d.ev.key.mod = mods; d.ev.key.down = true;
     d.batch_end = false;
     g_pending.push_back(d);
+    for (int r = 0; r < repeats; r++) {       // auto-repeat, as a held key sends
+        d.ev.key.repeat = true;
+        g_pending.push_back(d);
+    }
     if (text) {
         PendingEvent t = blank_event(SDL_EVENT_TEXT_INPUT, mods);
         g_text_store.push_back(*text);
@@ -773,23 +919,108 @@ static void exec_command(const std::string& raw) {
         return;
     }
     if (cmd == "wheel") {
-        SDL_Keymod wm = a.size() > 4 ? parse_mods(a[4]) : SDL_KMOD_NONE;
+        // After DY, in any order: a number is the horizontal amount DX,
+        // anything else the modifiers (wheel 300 200 1 ctrl / wheel 0 0 0.5 -0.25).
+        SDL_Keymod wm = SDL_KMOD_NONE;
+        float wdx = 0.0f;
+        for (size_t i = 4; i < a.size(); i++) {
+            char c0 = a[i].empty() ? 0 : a[i][0];
+            if (isdigit((unsigned char)c0) || c0 == '-' || c0 == '+' || c0 == '.') wdx = (float)atof(a[i].c_str());
+            else wm = parse_mods(a[i]);
+        }
         PendingEvent w = blank_event(SDL_EVENT_MOUSE_WHEEL, wm);
         w.ev.wheel.mouse_x = num(1, g_mouse_x);
         w.ev.wheel.mouse_y = num(2, g_mouse_y);
         w.ev.wheel.y = num(3, 0);
+        w.ev.wheel.x = wdx;
         w.ev.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
         g_pending.push_back(w);
         return;
     }
     if (cmd == "resize") {
+        // Real SDL sends RESIZED and then PIXEL_SIZE_CHANGED for the same
+        // change; the backend must report it once.
         PendingEvent r = blank_event(SDL_EVENT_WINDOW_RESIZED, SDL_KMOD_NONE);
         r.ev.window.data1 = (Sint32)num(1, 800);
         r.ev.window.data2 = (Sint32)num(2, 600);
         g_win_w = r.ev.window.data1;
         g_win_h = r.ev.window.data2;
-        if (g_last_window) { g_last_window->w = g_win_w; g_last_window->h = g_win_h; }
+        SDL_Window* tw = nullptr;
+        for (SDL_Window* w : g_all_windows) if (w->id == r.ev.window.windowID) tw = w;
+        if (tw) { tw->w = g_win_w; tw->h = g_win_h; }
+        r.batch_end = false;
         g_pending.push_back(r);
+        PendingEvent px = r;
+        px.ev.type = SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED;
+        px.batch_end = true;
+        g_pending.push_back(px);
+        return;
+    }
+    // drop PATH / droptext TEXT: a file (or text) dropped at the pointer.
+    if (cmd == "drop" || cmd == "droptext") {
+        size_t at = line.find(cmd) + cmd.size();
+        if (at < line.size() && line[at] == ' ') at++;
+        PendingEvent d = blank_event(cmd == "drop" ? SDL_EVENT_DROP_FILE : SDL_EVENT_DROP_TEXT, SDL_KMOD_NONE);
+        g_text_store.push_back(line.substr(at));
+        if (g_text_store.size() > 256) g_text_store.pop_front();
+        d.ev.drop.data = g_text_store.back().c_str();
+        d.ev.drop.x = g_mouse_x;
+        d.ev.drop.y = g_mouse_y;
+        g_pending.push_back(d);
+        return;
+    }
+    if (cmd == "leave") {
+        g_pending.push_back(blank_event(SDL_EVENT_WINDOW_MOUSE_LEAVE, SDL_KMOD_NONE));
+        return;
+    }
+    if (cmd == "focus") {
+        bool on = a.size() < 2 || a[1] != "0";
+        g_pending.push_back(blank_event(on ? SDL_EVENT_WINDOW_FOCUS_GAINED : SDL_EVENT_WINDOW_FOCUS_LOST, SDL_KMOD_NONE));
+        return;
+    }
+    // window N: later events are addressed to the N-th window created.
+    if (cmd == "window") {
+        int n = (int)num(1, 1);
+        g_target_window = (n >= 1 && n <= (int)g_all_windows.size()) ? g_all_windows[(size_t)n - 1] : nullptr;
+        return;
+    }
+    // textedit TEXT: an IME composition in progress (cursor at its end).
+    if (cmd == "textedit") {
+        size_t at = line.find(cmd) + cmd.size();
+        if (at < line.size() && line[at] == ' ') at++;
+        PendingEvent t = blank_event(SDL_EVENT_TEXT_EDITING, SDL_KMOD_NONE);
+        g_text_store.push_back(line.substr(at));
+        if (g_text_store.size() > 256) g_text_store.pop_front();
+        t.ev.edit.text = g_text_store.back().c_str();
+        t.ev.edit.start = (Sint32)g_text_store.back().size();
+        t.ev.edit.length = 0;
+        g_pending.push_back(t);
+        return;
+    }
+    // dialog [PATH]: answer the open/save dialog the application started;
+    // no PATH means the user cancelled.
+    if (cmd == "dialog") {
+        size_t at = line.find(cmd) + cmd.size();
+        while (at < line.size() && line[at] == ' ') at++;
+        std::string path = line.substr(at);
+        if (!g_dialog_cb) {
+            fprintf(stderr, "[SDL3-stub] dialog: no dialog was started\n");
+            return;
+        }
+        const char* one[2] = {path.c_str(), nullptr};
+        const char* none[1] = {nullptr};
+        g_dialog_cb(g_dialog_ud, path.empty() ? none : one, -1);
+        return;
+    }
+    // keyrepeat COMBO [N]: key held down: one press, N auto-repeats, release.
+    if (cmd == "keyrepeat") {
+        if (a.size() < 2) return;
+        SDL_Keymod mods; SDL_Keycode code;
+        if (!parse_combo(a[1], mods, code)) {
+            fprintf(stderr, "[SDL3-stub] unknown key: %s\n", a[1].c_str());
+            return;
+        }
+        push_key(code, mods, nullptr, true, (int)num(2, 2));
         return;
     }
     if (cmd == "key") {
@@ -917,6 +1148,54 @@ bool SDL_PollEvent(SDL_Event* event) {
     return false; // no events pending
 }
 
+bool SDL_WaitEventTimeout(SDL_Event* event, Sint32 timeoutMS) {
+    if (SDL_PollEvent(event)) return true;
+    if (timeoutMS != 0) {
+        int ms = timeoutMS < 0 ? 16 : std::min<int>(timeoutMS, 16);
+        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+    }
+    return false;
+}
+
+// An event the application (or a dialog callback) posts: delivered as its
+// own batch, like a scripted command.
+bool SDL_PushEvent(SDL_Event* event) {
+    if (!event) return false;
+    PendingEvent pe;
+    pe.ev = *event;
+    pe.mods = g_mods;
+    pe.batch_end = true;
+    pe.wait_after = event_gap();
+    g_pending.push_back(pe);
+    return true;
+}
+
+Uint32 SDL_RegisterEvents(int numevents) {
+    static Uint32 next = SDL_EVENT_USER;
+    if (numevents <= 0 || next + (Uint32)numevents > SDL_EVENT_LAST) return 0;
+    Uint32 first = next;
+    next += (Uint32)numevents;
+    return first;
+}
+
+// Window coordinates (points) to render coordinates (pixels): the same
+// unless the window has high pixel density.
+bool SDL_ConvertEventToRenderCoordinates(SDL_Renderer* renderer, SDL_Event* event) {
+    if (!renderer || !event) return false;
+    float sc = window_pixel_scale(renderer->window);
+    if (sc == 1.0f) return true;
+    switch (event->type) {
+    case SDL_EVENT_MOUSE_MOTION: event->motion.x *= sc; event->motion.y *= sc; break;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP: event->button.x *= sc; event->button.y *= sc; break;
+    case SDL_EVENT_MOUSE_WHEEL: event->wheel.mouse_x *= sc; event->wheel.mouse_y *= sc; break;
+    case SDL_EVENT_DROP_FILE:
+    case SDL_EVENT_DROP_TEXT: event->drop.x *= sc; event->drop.y *= sc; break;
+    default: break;
+    }
+    return true;
+}
+
 // ── SDL3_ttf ───────────────────────────────────────────────────────────
 // Advance widths of printable ASCII (32..126) in 1/1000 em, measured from
 // DejaVu Sans / DejaVu Sans Bold / DejaVu Sans Mono - the fonts
@@ -1018,6 +1297,15 @@ SDL_Surface* TTF_RenderText_Blended(TTF_Font* font, const char* text, size_t tex
     return surf;
 }
 
+// DejaVu Sans proportions: ascent 0.93 em, descent 0.24 em.
+int TTF_GetFontHeight(const TTF_Font* font) { return stub_text_height(const_cast<TTF_Font*>(font)); }
+int TTF_GetFontAscent(const TTF_Font* font) {
+    float size = font ? font->ptsize : 16.0f;
+    return (int)(size * 0.93f + 0.5f);
+}
+int TTF_GetFontDescent(const TTF_Font* font) { return TTF_GetFontAscent(font) - TTF_GetFontHeight(font); }
+int TTF_GetFontLineSkip(const TTF_Font* font) { return TTF_GetFontHeight(font); }
+
 bool TTF_GetStringSize(TTF_Font* font, const char* text, size_t text_len,
                         int* w, int* h) {
     size_t len = text_len ? text_len : (text ? strlen(text) : 0);
@@ -1027,11 +1315,36 @@ bool TTF_GetStringSize(TTF_Font* font, const char* text, size_t text_len,
 }
 
 // ── SDL3_image ────────────────────────────────────────────────────────
+// No decoder headlessly. A PNG or BMP is recognised by its header and
+// yields a surface of the right size with transparent pixels, so code that
+// lays out by image size behaves as with the real library; anything else
+// (missing file, other formats) fails the way the real library does.
 SDL_Surface* IMG_Load(const char* file) {
-    (void)file;
-    // No real decoder available headlessly: report failure the same way the
-    // real library does for an unreadable/unsupported file, rather than
-    // fabricating pixel data callers might mistake for a real image.
-    g_last_error = "IMG_Load: image loading unavailable in headless SDL3 stub";
-    return nullptr;
+    FILE* f = file ? fopen(file, "rb") : nullptr;
+    if (!f) {
+        g_last_error = std::string("IMG_Load: couldn't open ") + (file ? file : "(null)");
+        return nullptr;
+    }
+    unsigned char hd[32] = {0};
+    size_t n = fread(hd, 1, sizeof(hd), f);
+    fclose(f);
+    int w = 0, h = 0;
+    static const unsigned char png[8] = {0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A};
+    if (n >= 24 && memcmp(hd, png, 8) == 0) {
+        w = (hd[16] << 24) | (hd[17] << 16) | (hd[18] << 8) | hd[19];
+        h = (hd[20] << 24) | (hd[21] << 16) | (hd[22] << 8) | hd[23];
+    } else if (n >= 26 && hd[0] == 'B' && hd[1] == 'M') {
+        w = hd[18] | (hd[19] << 8) | (hd[20] << 16) | (hd[21] << 24);
+        h = hd[22] | (hd[23] << 8) | (hd[24] << 16) | (hd[25] << 24);
+        if (h < 0) h = -h;
+    }
+    if (w <= 0 || h <= 0 || (long long)w * h > 64LL * 1024 * 1024) {
+        g_last_error = "IMG_Load: unsupported image format (headless SDL3 stub reads PNG/BMP sizes only)";
+        return nullptr;
+    }
+    auto* surf = new SDL_Surface();
+    surf->w = w;
+    surf->h = h;
+    surf->pixels = calloc((size_t)w * (size_t)h, 4);
+    return surf;
 }

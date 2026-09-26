@@ -61,11 +61,18 @@ check_true("label advanced cursor", after_one > 20)
 lay.label("two", th.text)
 check_true("second label advanced again", lay.cursor_y > after_one)
 check("x returns to origin", lay.cursor_x, 10)
+# same_line puts the next item on the row of the LAST one, right after it
+# (ImGui's SameLine); it used to leave it on a new row.
+var two_cmd = lay.draw.cmds[lay.draw.count - 1]
 lay.same_line()
-var y_before = lay.cursor_y
 lay.label("three", th.text)
-check("same_line keeps the row", lay.cursor_y, y_before)
-check_true("same_line advanced x", lay.cursor_x > 10)
+var three_cmd = lay.draw.cmds[lay.draw.count - 1]
+check("same_line keeps the row", three_cmd.y, two_cmd.y)
+check_true("same_line advanced x", three_cmd.x > two_cmd.x + 10)
+lay.label("four", th.text)
+var four_cmd = lay.draw.cmds[lay.draw.count - 1]
+check("next item starts a new row", four_cmd.x, 10)
+check_true("new row is below", four_cmd.y > three_cmd.y)
 lay.indent()
 check("indent moves origin", lay.origin_x, 26)
 lay.unindent()
