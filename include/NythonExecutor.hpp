@@ -144,6 +144,8 @@ struct NythonExecutor;
 // ── Forward declarations of module dispatch functions ─────────────────────
 // Each is implemented in src/builtins/X.cpp
 Value dispatch_tensor   (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
+Value dispatch_nt       (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
+std::vector<std::string> nt_builtin_names();   // shared tensor natives (src/builtins/tensor.cpp)
 Value dispatch_audio    (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_string   (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_io       (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
@@ -477,6 +479,9 @@ public:   // NythonExecutor is a struct: members default to public
             "time_ms","time_now","time_sleep","thread_sleep"
         };
         for (auto& name : builtins) registerBuiltin(name);
+        // Shared tensor natives (include/NyTensor.hpp): the same kernels the
+        // VM registers, so both engines resolve these names identically.
+        for (auto& name : nt_builtin_names()) registerBuiltin(name);
         // Exception types
         std::vector<std::string> exc_types = {
             "Exception","BaseException","Error",
@@ -4928,6 +4933,9 @@ public:
 
         // ── Module dispatch (try each module in priority order) ────────────────
         Value result;
+        // Shared tensor kernels first: they replace the older per-module
+        // implementations of the same names (see include/NyTensor.hpp).
+        result = dispatch_nt(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         result = dispatch_lang(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         result = dispatch_core(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         result = dispatch_tensor(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
