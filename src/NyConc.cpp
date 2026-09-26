@@ -225,7 +225,10 @@ static std::string error_text(const NyError& e) {
 }
 static bool is_cancel_error(const NyError& e) {
     if (e.type == "CancelledError") return true;
-    return e.raw.find("CancelledError") != std::string::npos;
+    // Re-raised by user code: the interpreter's `except e: raise e` keeps only
+    // the message, so also recognise the runtime's own wording.
+    return e.raw.find("CancelledError") != std::string::npos ||
+           e.raw.find(" was cancelled") != std::string::npos;
 }
 
 // The record for the calling OS thread, created on first use (the main thread,
@@ -1387,7 +1390,7 @@ static BoxPtr await_value(Engine& e, int64_t h, bool is_handle, const BoxPtr& v)
             task_cancel_locked(t);
         }
         block_released(self, {&t->wq}, [t] { return t->done; }, Deadline::never(), nullptr, false);
-        raise("TimeoutError", "wait_for: timed out after " + std::to_string(a->secs) + " s");
+        { std::ostringstream os; os << a->secs; raise("TimeoutError", "wait_for: timed out after " + os.str() + " s"); }
     }
     std::lock_guard<std::mutex> l(RT().m);
     return task_outcome_locked(e, t);
@@ -2046,6 +2049,15 @@ static std::unordered_map<std::string, Handler>& table() {
             if (a.size() < 3) raise("TypeError", "queue_put_timeout(q, item, ms)");
             return Ret::boolean(chan_send(e, H(a, 0, "queue_put_timeout"), a.box(1), priority_of(a, 1), std::max(0.0, a.as_num(2))));
         };
+        T["queue_peek"] = [](Engine& e, const Args& a) {
+            std::lock_guard<std::mutex> l(RT().m);
+            Chan* c = chan_get_locked(H(a, 0, "queue_peek"));
+            if (c->items.empty()) return Ret::lst({Ret::none(), Ret::boolean(false)});
+            const auto& it = c->kind == Chan::LIFO ? c->items.back() : c->items.front();
+            (void)e;
+            return Ret::lst({boxret(it.v), Ret::boolean(true)});
+        };
+        T["chan_peek"] = T["queue_peek"];
         T["queue_get"] = T["chan_recv"];
         T["queue_try_get"] = T["chan_try_recv"];
         T["queue_get_timeout"] = T["chan_recv_timeout"];
@@ -2160,6 +2172,10 @@ static std::unordered_map<std::string, Handler>& table() {
             for (auto* f : sorted) out.push_back(Ret::integer(f->id));
             return Ret::lst(std::move(out));
         };
+
+        // lib/thread.ny defines an object-level as_completed(); the native stays
+        // reachable under this name.
+        T["futures_as_completed"] = T["as_completed"];
 
         // ── thread pool ─────────────────────────────────────────────────────
         T["pool_create"] = [](Engine& e, const Args& a) {
