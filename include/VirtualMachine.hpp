@@ -40,6 +40,7 @@
 #include <cerrno>
 #include "NyJson.hpp"
 #include "NyFuzzy.hpp"
+#include "NyExcTypes.hpp"
 #include <random>
 
 #include "Value.hpp"
@@ -93,6 +94,12 @@ enum class Op : uint8_t {
     // the operands were left on the stack instead of being combined and
     // consumed, corrupting whatever ran next (see HANDOFF.md).
     COMPARE_SEQ, COMPARE_SNE, LOGICAL_XOR,
+    // try/finally and with (see ExceptionEntry): FIN_NORMAL pushes the
+    // "fell off the end" state, FIN_RETURN turns the returned value into a
+    // pending-return state, FIN_JUMP a pending break/continue to arg;
+    // END_FINALLY acts on the state once the finally body has run.
+    FIN_NORMAL, FIN_RETURN, FIN_JUMP, END_FINALLY,
+    WITH_ENTER, WITH_EXIT,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -237,35 +244,38 @@ struct VMVal {
 // VMCODE — compiled code object
 // ═══════════════════════════════════════════════════════════════════════════
 struct ExceptionEntry {
+    // One try (or with) statement. Its body [try_start, try_end) is covered
+    // by the except clauses and then the finally; the handlers and the else
+    // [try_end, finally_start) by the finally only. An exception that no
+    // clause matches runs the finally and propagates (it used to be silently
+    // dropped); one raised by a handler or the else runs the finally too.
     int try_start = 0;
     int try_end   = 0;
-    // One entry per `except` clause, tried in source order - mirrors the
-    // interpreter's evalTry (NythonExecutor.hpp), which walks tn->except_clauses
-    // and runs the first one whose declared type matches (or is a parent of)
-    // the raised exception's type, or that has no declared type at all. The
-    // VM used to have a single `handler`/`alias` here and always ran the
-    // FIRST except clause's body regardless of its declared type - every
-    // other clause's body wasn't even compiled.
     struct Clause {
-        std::string type_name;   // empty = catch-all, matches any exception
-        std::string bind_var;    // empty = don't bind (bare "except:")
-        int handler = 0;         // bytecode offset of this clause's body
+        std::vector<std::string> types;  // empty = catch-all
+        std::string bind_var;            // empty = don't bind
+        int handler = 0;                 // offset of the clause body
     };
     std::vector<Clause> clauses;
-    // Bytecode offset of the `else` clause's body (runs only if the try body
-    // did NOT raise), or -1 if there is none. Previously not compiled at all.
     int else_handler = -1;
-    // Offset immediately after the whole try/except/else, used when an
-    // exception is raised but no clause's type matches - the interpreter
-    // silently falls through to `finally` in that case rather than
-    // re-raising, so the VM matches that instead of leaving the exception
-    // to propagate further up.
+    // Offset of the finally body, -1 if there is none. The body runs with a
+    // pending state (normal / exception / return / break-continue) on the
+    // stack, consumed by the END_FINALLY that closes it.
+    int finally_start = -1;
+    // Values that stay on the operand stack across the statement - one per
+    // enclosing `for` loop's iterator, one per enclosing finally's pending
+    // state - so a handler can drop whatever a half-evaluated expression
+    // left behind when it raised (a raise in the middle of a list literal
+    // inside a for loop otherwise left the literal's items above the loop's
+    // iterator, and the loop stopped).
+    int depth = 0;
     int end = 0;
 };
 
 struct VMCode {
     std::string              name;
     std::string              parent_class;
+    std::vector<std::string> bases;         // every base class, in order (parent_class is bases[0])
     std::string              owner_class;   // class that defines this method
     std::vector<Instruction> instructions;
     std::vector<VMVal>       constants;
@@ -312,6 +322,30 @@ struct VMCode {
 };
 
 
+// Class names that derive from BaseException - builtin or user-defined -
+// filled in as classes are made, so a bare VMVal can tell an exception
+// instance (which prints as its message) from any other instance.
+inline std::unordered_set<std::string>& vm_exc_classes() {
+    static std::unordered_set<std::string> s; return s;
+}
+// Python's BaseException.__str__: no args -> "", one -> str(arg), more ->
+// the args tuple.
+inline std::string vm_exc_message(const VMVal& e) {
+    if(!e.map) return std::string();
+    auto it=e.map->find("args");
+    if(it!=e.map->end()&&it->second.type==VMType::LIST&&it->second.list){
+        auto& a=*it->second.list;
+        if(a.empty()) return std::string();
+        if(a.size()==1) return a[0].to_string();
+        std::string r="(";
+        for(size_t k=0;k<a.size();k++){ if(k) r+=", "; r+=a[k].repr(); }
+        return r+")";
+    }
+    auto mt=e.map->find("msg");
+    if(mt!=e.map->end()) return mt->second.to_string();
+    return std::string();
+}
+
 // ── VMVal method bodies (defined after VMCode is complete) ────────────────
 inline std::string VMVal::to_string() const {
     switch(type){
@@ -343,11 +377,10 @@ inline std::string VMVal::to_string() const {
     case VMType::FUNCTION: return "<function "+(code?code->name:"?")+">"; 
     case VMType::CLASS:    return "<class "+class_name+">";
     case VMType::INSTANCE: {
-        if(map){
-            auto it=map->find("msg");
-            if(it!=map->end()&&it->second.type==VMType::STRING)
-                return class_name+": "+it->second.s;
-        }
+        // An exception reads as its message, as in Python: str(e) is the
+        // message, not "Type: message" (that is how an uncaught one is
+        // reported, not what the value is).
+        if(map && vm_exc_classes().count(class_name)) return vm_exc_message(*this);
         return "<"+class_name+" instance>";
     }
     case VMType::NATIVE:   return "<native>";
@@ -361,6 +394,13 @@ inline std::string VMVal::repr() const {
     // on both engines, otherwise any test or program comparing stringified
     // containers gets different answers depending on how it was run.
     if(type==VMType::STRING) return "'"+s+"'";
+    if(type==VMType::INSTANCE && map && vm_exc_classes().count(class_name)){
+        std::string r=class_name+"(";
+        auto it=map->find("args");
+        if(it!=map->end()&&it->second.type==VMType::LIST&&it->second.list)
+            for(size_t k=0;k<it->second.list->size();k++){ if(k) r+=", "; r+=(*it->second.list)[k].repr(); }
+        return r+")";
+    }
     return to_string();
 }
 
@@ -391,8 +431,16 @@ class Compiler {
     void push_code(const std::string& name, bool is_class=false) {
         auto c=std::make_shared<VMCode>(); c->name=name; c->is_class=is_class;
         code_stack_.push_back(code_); code_=c;
+        body_saves_.push_back({std::move(loops_),std::move(fin_stack_),persist_depth_,std::move(exc_vars_)});
+        loops_.clear(); fin_stack_.clear(); persist_depth_=0; exc_vars_.clear();
     }
     std::shared_ptr<VMCode> pop_code() {
+        {
+            auto& sv=body_saves_.back();
+            loops_=std::move(sv.loops); fin_stack_=std::move(sv.fins);
+            persist_depth_=sv.depth; exc_vars_=std::move(sv.ev);
+            body_saves_.pop_back();
+        }
         auto c=code_; code_=code_stack_.back(); code_stack_.pop_back();
         // If this code is a method inside a class, tag its owner_class
         if(code_->is_class && c->owner_class.empty())
@@ -403,9 +451,38 @@ class Compiler {
 
     void emit(Op op,int arg=0,int ln=0)    { C().emit(op,arg,ln); }
     void emit_lc(VMVal v,int ln=0)         { emit(Op::LOAD_CONST,  C().add_const(std::move(v)),ln); }
-    void emit_ln(const std::string& n,int l=0){ emit(Op::LOAD_NAME,  C().add_name(n),l); }
-    void emit_sn(const std::string& n,int l=0){ emit(Op::STORE_NAME, C().add_name(n),l); }
-    void emit_dn(const std::string& n,int l=0){ emit(Op::DEFINE_NAME,C().add_name(n),l); }
+    void emit_ln(const std::string& n,int l=0){ emit(Op::LOAD_NAME,  C().add_name(rn(n)),l); }
+    void emit_sn(const std::string& n,int l=0){ emit(Op::STORE_NAME, C().add_name(rn(n)),l); }
+    void emit_dn(const std::string& n,int l=0){ emit(Op::DEFINE_NAME,C().add_name(rn(n)),l); }
+
+    // Comprehension targets are compiled under hidden names (the
+    // comprehension's own scope, so they no longer overwrite a same-named
+    // variable of the enclosing one). Innermost scope last; a function or
+    // lambda parameter maps to itself, shadowing an outer rename.
+    std::vector<std::unordered_map<std::string,std::string>> renames_;
+    std::string rn(const std::string& n) const {
+        for(auto it=renames_.rbegin(); it!=renames_.rend(); ++it){
+            auto f=it->find(n);
+            if(f!=it->end()) return f->second;
+        }
+        return n;
+    }
+    static void target_names(const nython::node::node_ptr& t, std::vector<std::string>& out){
+        if(!t) return;
+        if(t->type()==nython::node::NodeType::TUPLE||t->type()==nython::node::NodeType::LIST){ for(auto& e:t->statements()) target_names(e,out); return; }
+        out.push_back(t->token().value);
+    }
+    // Stores TOS into a comprehension/for target, unpacking tuples.
+    void store_target(const nython::node::node_ptr& t, int l){
+        if(t->type()==nython::node::NodeType::TUPLE||t->type()==nython::node::NodeType::LIST){
+            auto el=t->statements();
+            emit(Op::UNPACK_SEQ,(int)el.size(),l);
+            for(auto& e:el) store_target(e,l);
+            return;
+        }
+        emit_dn(t->token().value,l);
+    }
+    int comp_id_ = 0;
     int  ln(nython::node::node_ptr nd) { return nd?nd->token().location().row:0; }
 
     // Integer literal tokens keep their source spelling verbatim
@@ -431,6 +508,33 @@ class Compiler {
     struct LoopCtx { int start; std::vector<int> breaks,conts; bool is_for=false; };
     std::vector<LoopCtx> loops_;
 
+    // try/finally and with: the finally blocks the code being compiled is
+    // inside (innermost last), so return/break/continue can run them first.
+    struct FinCtx { int entry; size_t loop_depth; std::vector<int> jumps; };
+    std::vector<FinCtx> fin_stack_;
+    // Operand-stack values held across statements here (ExceptionEntry::depth).
+    int persist_depth_ = 0;
+    // Hidden variables holding the exception each enclosing except clause is
+    // handling, for a bare `raise`.
+    std::vector<std::string> exc_vars_;
+    int try_counter_ = 0;
+    // Emits a jump to the innermost enclosing finally (patched when its
+    // offset is known).
+    void jump_to_finally(int l){
+        fin_stack_.back().jumps.push_back(C().here());
+        emit(Op::JUMP_ABSOLUTE,-1,l);
+    }
+    // True when a break/continue here leaves a try/with inside the innermost
+    // loop, and so must run that statement's finally first.
+    bool loop_exit_crosses_finally() const {
+        return !loops_.empty() && !fin_stack_.empty() && fin_stack_.back().loop_depth >= loops_.size();
+    }
+    // A function, lambda or class body starts with none of the above: a
+    // `break` in a nested function does not belong to the enclosing loop and
+    // a `return` there does not run the enclosing function's finally blocks.
+    struct SavedBody { std::vector<LoopCtx> loops; std::vector<FinCtx> fins; int depth; std::vector<std::string> ev; };
+    std::vector<SavedBody> body_saves_;
+
 public:
     Compiler() : code_(std::make_shared<VMCode>()) { code_->name="<module>"; }
 
@@ -446,13 +550,31 @@ private:
     using np = nython::node::node_ptr;
 
     // ─── statement wrapper — pops discarded expression results ─────────────
+    // Every expression used as a statement leaves its value on the operand
+    // stack and must be popped. Only calls, tuples and lists used to be: any
+    // other expression statement - a docstring, `x == 1`, `a[i]` - left a
+    // value behind, and inside a `for` loop FOR_ITER then read that value
+    // instead of the loop's iterator and the loop silently ended after one
+    // pass.
+    static bool pushes_value(const np& nd) {
+        switch(nd->type()){
+        case NT::INTEGER: case NT::FLOAT: case NT::STRING: case NT::TRUE:
+        case NT::FALSE: case NT::NONE: case NT::VARIABLE: case NT::SELF:
+        case NT::SUPER: case NT::ATTRIBUTE: case NT::SUBSCRIPT: case NT::UNARY:
+        case NT::BINARY: case NT::CALL: case NT::LIST: case NT::TUPLE:
+        case NT::MAP: case NT::COMPLEX: case NT::LAMBDA: case NT::WALRUS: case NT::COMPREHENSION:
+        case NT::RANGE: case NT::SLICE: case NT::YIELD:
+            return true;
+        case NT::IF:
+            return std::static_pointer_cast<nython::node::IfNode>(nd)->is_expr;
+        default:
+            return false;
+        }
+    }
     void visit_stmt(np nd) {
         if(!nd) return;
-        auto nt=nd->type();
         visit(nd);
-        // Pop the result if this is a call-as-statement (result unused)
-        bool is_expr_stmt = (nt==NT::CALL || nt==NT::TUPLE || nt==NT::LIST);
-        if(is_expr_stmt) emit(Op::POP_TOP,0,ln(nd));
+        if(pushes_value(nd)) emit(Op::POP_TOP,0,ln(nd));
     }
 
     // ─── dispatch ──────────────────────────────────────────────────────────
@@ -646,7 +768,10 @@ private:
         case NT::RETURN: {
             auto rn=std::static_pointer_cast<nython::node::ReturnNode>(nd);
             if(rn->expr) visit(rn->expr); else emit_lc(VMVal::make_none(),l);
-            emit(Op::RETURN_VALUE,0,l); break;
+            // Inside try/finally or with: run the finally blocks first.
+            if(!fin_stack_.empty()){ emit(Op::FIN_RETURN,0,l); jump_to_finally(l); }
+            else emit(Op::RETURN_VALUE,0,l);
+            break;
         }
 
         // If
@@ -661,12 +786,15 @@ private:
         case NT::LAMBDA: {
             auto lm=std::static_pointer_cast<nython::node::LambdaNode>(nd);
             push_code("<lambda>");
+            renames_.emplace_back();
             for(auto& p:lm->params){
                 std::string pn=p->value(); if(pn=="self") continue;
                 C().param_names.push_back(pn); C().add_name(pn);
+                renames_.back()[pn]=pn;
             }
             if(lm->body){ visit(lm->body); emit(Op::RETURN_VALUE,0,l); }
             else{ emit_lc(VMVal::make_none(),l); emit(Op::RETURN_VALUE,0,l); }
+            renames_.pop_back();
             pop_code();
             emit(Op::MAKE_FUNCTION,(int)C().sub_codes.size()-1,l); break;
         }
@@ -723,42 +851,36 @@ private:
         }
         // Switch/match
         case NT::WITH: {
+            // with E as x: body  ==  ctx = E; x = ctx.__enter__() (or ctx
+            // itself when it has none); try: body; finally: ctx.__exit__(...)
+            // __exit__ gets (type, value, none) for an exception, and a truthy
+            // result suppresses it; every other way out - falling off the
+            // end, return, break, continue - gets (none, none, none).
             auto wn=std::static_pointer_cast<nython::node::WithNode>(nd);
             int l2=ln(wn);
-            // Store ctx manager in a hidden temp var
-            static int with_cnt=0;
-            std::string ctx_tmp="__with_ctx"+std::to_string(with_cnt++)+"__";
+            std::string ctx_tmp="__with_ctx"+std::to_string(try_counter_++)+"__";
             visit(wn->expr);
             emit_dn(ctx_tmp,l2);
-            // Call __enter__, bind result to alias
             emit_ln(ctx_tmp,l2);
-            emit_lc(VMVal::make_str("__enter__"),l2);
-            emit(Op::CALL_METHOD,0,l2);
+            emit(Op::WITH_ENTER,0,l2);
             if(!wn->alias.empty()) emit_dn(wn->alias,l2);
             else emit(Op::POP_TOP,0,l2);
-            // Body protected by SETUP_EXCEPT
-            int exc_entry=C().here(); emit(Op::SETUP_EXCEPT,0,l2);
+            int idx=(int)C().exc_table.size();
+            C().exc_table.emplace_back();
+            C().exc_table[idx].depth=persist_depth_;
+            fin_stack_.push_back({idx,loops_.size(),{}});
+            C().exc_table[idx].try_start=C().here();
             if(wn->body) visit_stmt(wn->body);
-            emit(Op::END_EXCEPT,0,l2);
-            // Normal exit: ctx.__exit__(none,none,none)
+            C().exc_table[idx].try_end=C().here();
+            FinCtx fc=std::move(fin_stack_.back()); fin_stack_.pop_back();
+            emit(Op::FIN_NORMAL,0,l2);
+            int fs=C().here();
+            C().exc_table[idx].finally_start=fs;
+            for(int j:fc.jumps) C().patch(j,fs);
             emit_ln(ctx_tmp,l2);
-            emit_lc(VMVal::make_str("__exit__"),l2);
-            emit_lc(VMVal::make_none(),l2);
-            emit_lc(VMVal::make_none(),l2);
-            emit_lc(VMVal::make_none(),l2);
-            emit(Op::CALL_METHOD,3,l2);
-            emit(Op::POP_TOP,0,l2);
-            int end_jmp=C().here(); emit(Op::JUMP_FORWARD,0,l2);
-            // Exception exit: ctx.__exit__(exc_type,exc_val,tb)
-            C().patch(exc_entry,C().here());
-            emit_ln(ctx_tmp,l2);
-            emit_lc(VMVal::make_str("__exit__"),l2);
-            emit_lc(VMVal::make_none(),l2);
-            emit_lc(VMVal::make_none(),l2);
-            emit_lc(VMVal::make_none(),l2);
-            emit(Op::CALL_METHOD,3,l2);
-            emit(Op::POP_TOP,0,l2);
-            C().patch(end_jmp,C().here());
+            emit(Op::WITH_EXIT,0,l2);
+            emit(Op::END_FINALLY, fin_stack_.empty()?-1:fin_stack_.back().entry, l2);
+            C().exc_table[idx].end=C().here();
             break;
         }
         case NT::SWITCH: {
@@ -777,7 +899,7 @@ private:
                 // on the VM.
                 if(cn->value_node && cn->value_node->value()=="_"){
                     emit(Op::POP_TOP,0,l);
-                    if(cn->body) visit(cn->body);
+                    if(cn->body) visit_stmt(cn->body);
                     wildcard_handled=true;
                     break;
                 }
@@ -786,7 +908,7 @@ private:
                 emit(Op::COMPARE_EQ,0,l);
                 int jf=C().here(); emit(Op::JUMP_IF_FALSE,0,l);
                 emit(Op::POP_TOP,0,l);
-                if(cn->body) visit(cn->body);
+                if(cn->body) visit_stmt(cn->body);
                 end_jumps.push_back(C().here()); emit(Op::JUMP_FORWARD,0,l);
                 C().patch(jf,C().here());
             }
@@ -797,7 +919,7 @@ private:
                 // ran on the VM.
                 if(sw->default_case){
                     auto dn=std::static_pointer_cast<nython::node::DefaultNode>(sw->default_case);
-                    if(dn->body) visit(dn->body);
+                    if(dn->body) visit_stmt(dn->body);
                 }
             }
             int end=C().here();
@@ -846,7 +968,7 @@ private:
                 else if(stmt->type()==NT::CLASS) mn=std::static_pointer_cast<nython::node::ClassNode>(stmt)->name;
                 if(!mn.empty()) member_names.push_back(mn);
             }
-            if(nn->body) for(auto& s:nn->body->statements()) visit(s);
+            if(nn->body) for(auto& s:nn->body->statements()) visit_stmt(s);
             for(auto& mn:member_names){ emit_lc(VMVal::make_str(mn),l); emit_ln(mn,l); }
             emit(Op::BUILD_MAP,(int)member_names.size(),l);
             emit_dn(nn->name,l);
@@ -863,7 +985,7 @@ private:
             auto in_=std::static_pointer_cast<nython::node::InterfaceNode>(nd);
             push_code(in_->name,true);
             code_->is_class=true;
-            if(in_->body) for(auto& s:in_->body->statements()) visit(s);
+            if(in_->body) for(auto& s:in_->body->statements()) visit_stmt(s);
             emit(Op::HALT,0,l);
             pop_code();
             int idx=(int)C().sub_codes.size()-1;
@@ -881,6 +1003,9 @@ private:
         // List comprehension (ComplexNode)
         case NT::COMPLEX: {
             auto cn=std::static_pointer_cast<nython::node::ComplexNode>(nd);
+            // Comprehensions are ComprehensionNodes now; a ComplexNode is a
+            // complex-number literal (`2j`), which has no items to index.
+            if(cn->items.size()<2){ emit_lc(VMVal::make_none(),l); break; }
             // items: [0]=expr, [1]=iterable, [2]=filter(or null), 
             //        optionally [3]=var2, [4]=iterable2
             std::string var_name = cn->token().value;
@@ -954,6 +1079,57 @@ private:
             break;
         }
 
+        case NT::COMPREHENSION: {
+            auto cn=std::static_pointer_cast<nython::node::ComprehensionNode>(nd);
+            using CK=nython::node::ComprehensionNode;
+            int id=comp_id_++;
+            std::string acc="__comp"+std::to_string(id)+"__";
+            if(cn->kind==CK::DICT) emit(Op::BUILD_MAP,0,l); else emit(Op::BUILD_LIST,0,l);
+            emit(Op::DEFINE_NAME,C().add_name(acc),l);
+            // The first iterable is evaluated in the enclosing scope.
+            if(!cn->clauses.empty()) visit(cn->clauses[0].iter);
+            renames_.emplace_back();
+            for(auto& cl:cn->clauses){
+                std::vector<std::string> names; target_names(cl.target,names);
+                for(auto& n:names) renames_.back()[n]="__c"+std::to_string(id)+"_"+n;
+            }
+            std::vector<int> exits;
+            std::vector<int> tops;
+            for(size_t k=0;k<cn->clauses.size();k++){
+                auto& cl=cn->clauses[k];
+                if(k>0) visit(cl.iter);
+                emit(Op::GET_ITER,0,l);
+                int top=C().here(); tops.push_back(top);
+                exits.push_back(C().here()); emit(Op::FOR_ITER,0,l);
+                store_target(cl.target,l);
+                for(auto& c:cl.conds){ visit(c); emit(Op::JUMP_IF_FALSE,top,l); }
+            }
+            if(cn->kind==CK::DICT){
+                visit(cn->value);
+                emit(Op::LOAD_NAME,C().add_name(acc),l);
+                visit(cn->elt);
+                emit(Op::STORE_SUBSCR,0,l);
+            } else {
+                emit(Op::LOAD_NAME,C().add_name(acc),l);
+                visit(cn->elt);
+                emit(Op::LIST_APPEND,0,l);
+                emit(Op::POP_TOP,0,l);
+            }
+            // Close the loops innermost first: each jumps back to its own
+            // FOR_ITER; an exhausted inner loop falls through to the next
+            // iteration of the one around it.
+            for(int k=(int)cn->clauses.size()-1;k>=0;k--){
+                emit(Op::JUMP_ABSOLUTE,tops[k],l);
+                C().patch(exits[k],C().here());
+            }
+            renames_.pop_back();
+            if(cn->kind==CK::SET){
+                emit_ln("set",l);
+                emit(Op::LOAD_NAME,C().add_name(acc),l);
+                emit(Op::CALL_FUNCTION,1,l);
+            } else emit(Op::LOAD_NAME,C().add_name(acc),l);
+            break;
+        }
         case NT::LIST: {
             auto ln_=std::static_pointer_cast<nython::node::ListNode>(nd);
             for(auto& e:ln_->elements) visit(e);
@@ -974,8 +1150,13 @@ private:
             // A break in a `for` must discard the iterator FOR_ITER would have
             // popped on natural exit; otherwise it outlives the loop.
             if(!loops_.empty() && loops_.back().is_for) emit(Op::POP_TOP,0,l);
-            emit(Op::JUMP_ABSOLUTE,-9991,l); break;
-        case NT::CONTINUE: emit(Op::JUMP_ABSOLUTE,-9992,l); break;
+            if(loop_exit_crosses_finally()){ emit(Op::FIN_JUMP,-9991,l); jump_to_finally(l); }
+            else emit(Op::JUMP_ABSOLUTE,-9991,l);
+            break;
+        case NT::CONTINUE:
+            if(loop_exit_crosses_finally()){ emit(Op::FIN_JUMP,-9992,l); jump_to_finally(l); }
+            else emit(Op::JUMP_ABSOLUTE,-9992,l);
+            break;
 
         // Import
         case NT::IMPORT: {
@@ -995,71 +1176,80 @@ private:
         // Raise
         case NT::RAISE: {
             auto rn=std::static_pointer_cast<nython::node::RaiseNode>(nd);
-            if(rn->expr) visit(rn->expr);
-            else emit_lc(VMVal::make_str("Exception"),l);
-            emit(Op::RAISE_ERROR,0,l); break;
+            if(!rn->expr){
+                // Bare `raise` re-raises the exception the enclosing except
+                // clause is handling. It used to raise the string "Exception",
+                // which no typed clause matched.
+                if(!exc_vars_.empty()){ emit_ln(exc_vars_.back(),l); emit(Op::RAISE_ERROR,1,l); }
+                else { emit_lc(VMVal::make_str("RuntimeError: No active exception to reraise"),l); emit(Op::RAISE_ERROR,0,l); }
+                break;
+            }
+            visit(rn->expr);
+            if(rn->cause){ visit(rn->cause); emit(Op::RAISE_ERROR,2,l); }
+            else emit(Op::RAISE_ERROR,0,l);
+            break;
         }
-        // Assert
+        // Assert: raises AssertionError(message) - it raised the bare message
+        // string (or the string "AssertionError"), which `except
+        // AssertionError` could not catch.
         case NT::ASSERT: {
             auto an=std::static_pointer_cast<nython::node::AssertNode>(nd);
             visit(an->condition);
             int jt=C().here(); emit(Op::JUMP_IF_TRUE,0,l);
-            if(an->message) visit(an->message);
-            else emit_lc(VMVal::make_str("AssertionError"),l);
+            emit_ln("AssertionError",l);
+            if(an->message){ visit(an->message); emit(Op::CALL_FUNCTION,1,l); }
+            else emit(Op::CALL_FUNCTION,0,l);
             emit(Op::RAISE_ERROR,0,l);
             C().patch(jt,C().here()); break;
         }
-        // Try/except — exception table approach
         case NT::TRY: {
             auto tn=std::static_pointer_cast<nython::node::TryNode>(nd);
-            ExceptionEntry ee;
-            ee.try_start = C().here();
-            // Compile try body
-            if(tn->body) visit(tn->body);
-            ee.try_end = C().here();
+            int idx=(int)C().exc_table.size();
+            C().exc_table.emplace_back();
+            C().exc_table[idx].depth=persist_depth_;
+            bool has_fin=(bool)tn->finally_clause;
+            if(has_fin) fin_stack_.push_back({idx,loops_.size(),{}});
+            C().exc_table[idx].try_start=C().here();
+            if(tn->body) visit_stmt(tn->body);
+            C().exc_table[idx].try_end=C().here();
             // Jump over the handlers when no exception was raised.
-            int jmp_over = C().here(); emit(Op::JUMP_FORWARD,0,l);
-            // Compile EVERY except clause as its own handler entry point -
-            // previously only the first clause's body was even compiled, so
-            // `except TypeError:` after `except ValueError:` was dead code
-            // and every exception ran the ValueError handler regardless of
-            // its actual type. Which handler to jump to is decided at
-            // runtime by match_except_handler(), comparing the raised
-            // exception's type against each clause's type_name in order -
-            // mirroring the interpreter's evalTry (NythonExecutor.hpp).
-            std::vector<int> end_jumps;
-            auto compile_clause=[&](const std::string& type_filter, const std::string& bind_var, node_ptr body){
-                ExceptionEntry::Clause cl;
-                cl.type_name=type_filter; cl.bind_var=bind_var;
-                cl.handler=C().here();
-                if(!bind_var.empty()) emit_dn(bind_var,l);
-                else emit(Op::POP_TOP,0,l);
-                if(body) visit(body);
-                end_jumps.push_back(C().here()); emit(Op::JUMP_FORWARD,0,l);
-                ee.clauses.push_back(std::move(cl));
-            };
+            int jmp_over=C().here(); emit(Op::JUMP_FORWARD,0,l);
+            // Every except clause is its own handler entry point; which one
+            // runs is decided at runtime (match_except_handler) from the
+            // raised exception's class and each clause's types. The
+            // exception is kept in a hidden variable for a bare `raise`.
+            std::string held="__exc"+std::to_string(try_counter_++)+"__";
+            std::vector<int> to_exit;
             for(auto& ec:tn->except_clauses){
                 auto en=std::static_pointer_cast<nython::node::ExceptNode>(ec);
-                // 'except e:'          -> name="e", alias=""    -> catch-all, bind "e"
-                // 'except Err as e:'    -> name="Err", alias="e"  -> type "Err", bind "e"
-                // 'except:'            -> name="", alias=""     -> catch-all, no bind
-                bool has_type = !en->alias.empty();
-                compile_clause(has_type?en->name:std::string(), has_type?en->alias:en->name, en->body);
+                ExceptionEntry::Clause cl;
+                cl.types=en->types; cl.bind_var=en->var;
+                cl.handler=C().here();
+                emit_dn(held,l);
+                if(!en->var.empty()){ emit_ln(held,l); emit_dn(en->var,l); }
+                exc_vars_.push_back(held);
+                if(en->body) visit_stmt(en->body);
+                exc_vars_.pop_back();
+                to_exit.push_back(C().here()); emit(Op::JUMP_FORWARD,0,l);
+                C().exc_table[idx].clauses.push_back(std::move(cl));
             }
-            if(tn->except_clauses.empty()){
-                // try/finally with no except at all: give the dispatch a
-                // catch-all landing spot that just discards the exception.
-                compile_clause(std::string(),std::string(),nullptr);
-            }
-            // No-exception path (and "no clause matched") lands here.
             C().patch(jmp_over,C().here());
-            ee.else_handler = tn->else_clause ? C().here() : -1;
-            if(tn->else_clause) visit(tn->else_clause);
-            int end_pos=C().here();
-            for(int j:end_jumps) C().patch(j,end_pos);
-            ee.end=end_pos;
-            C().exc_table.push_back(ee);
-            if(tn->finally_clause) visit(tn->finally_clause);
+            C().exc_table[idx].else_handler = tn->else_clause ? C().here() : -1;
+            if(tn->else_clause) visit_stmt(tn->else_clause);
+            int exit_pt=C().here();
+            for(int j:to_exit) C().patch(j,exit_pt);
+            if(has_fin){
+                FinCtx fc=std::move(fin_stack_.back()); fin_stack_.pop_back();
+                emit(Op::FIN_NORMAL,0,l);
+                int fs=C().here();
+                C().exc_table[idx].finally_start=fs;
+                for(int j:fc.jumps) C().patch(j,fs);
+                persist_depth_++;
+                visit_stmt(tn->finally_clause);
+                persist_depth_--;
+                emit(Op::END_FINALLY, fin_stack_.empty()?-1:fin_stack_.back().entry, l);
+            }
+            C().exc_table[idx].end=C().here();
             break;
         }
         // Expression statement (discard result)
@@ -1104,9 +1294,12 @@ private:
     // needs the parser to distinguish statement-ifs from ternaries first.
     void visit_if(std::shared_ptr<nython::node::IfNode> nd) {
         int l=ln(nd);
+        // An expression-if's branches are values; a statement-if's are
+        // statements (IfNode::is_expr, set by the parser for ternaries).
+        auto branch=[&](np b){ if(nd->is_expr) visit(b); else visit_stmt(b); };
         visit(nd->condition);
         int jf=C().here(); emit(Op::JUMP_IF_FALSE,0,l);
-        visit(nd->then_branch);
+        branch(nd->then_branch);
         std::vector<int> ends; ends.push_back(C().here());
         emit(Op::JUMP_FORWARD,0,l);
         C().patch(jf,C().here());
@@ -1114,11 +1307,12 @@ private:
             auto eif=std::static_pointer_cast<nython::node::IfNode>(ei);
             visit(eif->condition);
             int jf2=C().here(); emit(Op::JUMP_IF_FALSE,0,l);
-            visit(eif->then_branch);
+            branch(eif->then_branch);
             ends.push_back(C().here()); emit(Op::JUMP_FORWARD,0,l);
             C().patch(jf2,C().here());
         }
-        if(nd->else_branch) visit(nd->else_branch);
+        if(nd->else_branch) branch(nd->else_branch);
+        else if(nd->is_expr) emit_lc(VMVal::make_none(),l);
         int end=C().here();
         for(int j:ends) C().patch(j,end);
     }
@@ -1143,7 +1337,7 @@ private:
             // Re-patch break jumps: JUMP_ABSOLUTE to 'end' → jump to 'else_end'
             for(int i=start;i<end;i++){
                 auto& ins=C().instructions[i];
-                if(ins.op==Op::JUMP_ABSOLUTE&&ins.arg==end)
+                if((ins.op==Op::JUMP_ABSOLUTE||ins.op==Op::FIN_JUMP)&&ins.arg==end)
                     ins.arg=else_end;
             }
         }
@@ -1180,7 +1374,9 @@ private:
         } else {
             emit_sn(nd->var?nd->var->value():"_",l);
         }
+        persist_depth_++;   // the iterator stays on the stack during the body
         visit_stmt(nd->body);
+        persist_depth_--;
         emit(Op::JUMP_ABSOLUTE,start,l);
         int end=C().here(); C().patch(fi,end);
         patch_loop(start,end);
@@ -1196,7 +1392,7 @@ private:
             // Re-patch break jumps: change JUMP_ABSOLUTE to 'end' → jump to 'else_end' (skip else)
             for(int i=start; i<else_start; i++){
                 auto& ins=C().instructions[i];
-                if(ins.op==Op::JUMP_ABSOLUTE && ins.arg==end)
+                if((ins.op==Op::JUMP_ABSOLUTE||ins.op==Op::FIN_JUMP) && ins.arg==end)
                     ins.arg=else_end;
             }
         }
@@ -1205,7 +1401,7 @@ private:
     void patch_loop(int start, int end) {
         for(int i=start;i<end;i++){
             auto& ins=C().instructions[i];
-            if(ins.op==Op::JUMP_ABSOLUTE){
+            if(ins.op==Op::JUMP_ABSOLUTE||ins.op==Op::FIN_JUMP){
                 if(ins.arg==-9991) ins.arg=end;
                 if(ins.arg==-9992) ins.arg=start;
             }
@@ -1279,7 +1475,10 @@ private:
                 // Use a "constant folding" trick: for simple literals.
             }
         }
-        if(fn->body) visit(fn->body);
+        renames_.emplace_back();
+        for(auto& p:fn->params){ std::string pn=p->value(); renames_.back()[pn]=pn; }
+        if(fn->body) visit_stmt(fn->body);
+        renames_.pop_back();
         emit_lc(VMVal::make_none(),l); emit(Op::RETURN_VALUE,0,l);
         // Now store defaults: compile each default expr and store result
         // We can't easily do this at compile time for non-literal defaults.
@@ -1305,11 +1504,9 @@ private:
         int l=ln(cn);
         push_code(cn->name,true);
         code_->is_class=true;  // mark this sub_code as a class
-        if(!cn->bases.empty()){
-            auto base=std::static_pointer_cast<nython::node::VariableNode>(cn->bases[0]);
-            code_->parent_class=base->token().value;
-        }
-        if(cn->body) for(auto& s:cn->body->statements()) visit(s);
+        for(auto& b:cn->bases) code_->bases.push_back(b->token().value);
+        if(!code_->bases.empty()) code_->parent_class=code_->bases[0];
+        if(cn->body) for(auto& s:cn->body->statements()) visit_stmt(s);
         emit(Op::HALT,0,l);
         pop_code();
         int idx=(int)C().sub_codes.size()-1;
@@ -1504,6 +1701,12 @@ struct GenState {
     // yielded value, read (and cleared) by gen_next: a yield and a return
     // both leave run_loop by an ordinary return now, not a C++ exception.
     bool yielded=false;
+    // Suspended at a `yield` expression: resuming pushes the value sent in
+    // (none for next()), which is the yield's value. Resuming used to push
+    // nothing, so `v = yield x` stored whatever was below it on the stack -
+    // the loop's iterator - and the generator stopped.
+    bool at_yield=false;
+    bool started=false;
 };
 
 
@@ -1569,10 +1772,33 @@ struct CallFrame {
     }
     void define(const std::string& n, VMVal v) { locals[n]=std::move(v); }
     std::shared_ptr<GenState>  gen_state;   // non-null when executing a generator
+    // Operand-stack height when the frame was entered; an exception handler
+    // truncates to stack_base + ExceptionEntry::depth.
+    size_t stack_base = 0;
 };
 
 struct VMReturn   { VMVal value; };
 struct VMYield    { VMVal value; };
+// A raised exception travelling up the C++ stack: the exception object itself
+// (an instance of an exception class, or whatever value was raised), so it
+// reaches an `except` in an outer frame intact. what() is the uncaught form,
+// "Type: message". It used to be a plain runtime_error whose object rode in a
+// VM member that the first frame it passed through cleared, so every
+// exception raised in a called function arrived as a bare string that no
+// typed clause could match.
+struct VMException : std::runtime_error {
+    VMVal value;
+    VMException(VMVal v, const std::string& what) : std::runtime_error(what), value(std::move(v)) {}
+};
+// Pending state of a finally body (see ExceptionEntry): a VMVal of type
+// UNDEFINED tagged "__fin__", kind in i, payload in list[0], jump target in d.
+enum { FIN_K_NORMAL=0, FIN_K_RETURN=1, FIN_K_JUMP=2, FIN_K_EXC=3 };
+inline VMVal make_fin_state(int kind, VMVal payload=VMVal::make_none(), int target=-1){
+    VMVal v; v.type=VMType::UNDEFINED; v.s="__fin__"; v.i=kind; v.d=(double)target;
+    v.list=std::make_shared<std::vector<VMVal>>(); v.list->push_back(std::move(payload));
+    return v;
+}
+inline bool is_fin_state(const VMVal& v){ return v.type==VMType::UNDEFINED && v.s=="__fin__" && v.list; }
 enum   class VMResult { SUCCESS, COMPILE_ERROR, RUNTIME_ERROR };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1720,6 +1946,11 @@ public:
         } catch(std::exception& e) {
             std::cerr<<"\x1b[31m[VMError] "<<e.what()<<"\x1b[0m\n";
             return VMResult::RUNTIME_ERROR;
+        } catch(std::string& m) {
+            std::string type, msg;
+            if(nython::ny_split_exc_message(m,type,msg)) std::cerr<<"\x1b[31m[VMError] "<<type<<": "<<msg<<"\x1b[0m\n";
+            else std::cerr<<"\x1b[31m[VMError] "<<m<<"\x1b[0m\n";
+            return VMResult::RUNTIME_ERROR;
         }
     }
 
@@ -1797,6 +2028,7 @@ private:
         if(self) fr.self_val=self;
         fr.closure_env=closure;
         fr.locals=std::move(locs);
+        fr.stack_base=stack_.size();
         call_stack_.push_back(std::move(fr));
         VMVal result=VMVal::make_none();
         try { result=run_loop(); }
@@ -1811,6 +2043,7 @@ private:
                     std::shared_ptr<std::unordered_map<std::string,VMVal>> closure=nullptr) {
         size_t _stack_base=stack_.size();
         CallFrame fr; fr.code=code; fr.ip=0;
+        fr.stack_base=_stack_base;
         if(self) fr.self_val=self;
         // Store closure env in frame (shared reference, not copy)
         fr.closure_env = closure;
@@ -1844,14 +2077,17 @@ private:
 
     // ── Main dispatch loop ───────────────────────────────────────────────
     // Resume a generator; returns {value, done} as VMVal (NONE if done)
-    VMVal gen_next(VMVal& gv) {
+    VMVal gen_next(VMVal& gv, VMVal sent=VMVal::make_none()) {
         if(gv.type!=VMType::GENERATOR||!gv.gen||gv.gen->done) return VMVal::make_none();
         auto& gs=*gv.gen;
         // Restore saved stack (iterators held across yields)
         gs.stack_base = stack_.size();
         for(auto& sv : gs.saved_stack) stack_.push_back(sv);
         gs.saved_stack.clear();
+        gs.started=true;
+        if(gs.at_yield){ gs.at_yield=false; push(std::move(sent)); }
         CallFrame fr; fr.code=gs.code; fr.ip=gs.ip;
+        fr.stack_base=gs.stack_base;
         fr.locals=gs.locals;
         fr.self_val=gs.self_val;
         fr.closure_env=gs.closure;
@@ -1899,7 +2135,27 @@ private:
         return a.to_string()<b.to_string()?-1:(a.to_string()>b.to_string()?1:0);
     }
 
-        VMVal call_dunder(const VMVal& obj, const std::string& dunder, std::vector<VMVal> args) {
+    // Like call_dunder, and reports whether the method exists at all - a
+    // dunder that returns none is not the same as one that is missing.
+    VMVal call_dunder_f(const VMVal& obj, const std::string& dunder, std::vector<VMVal> args, bool& found) {
+        found=false;
+        if(obj.type!=VMType::INSTANCE) return VMVal::make_none();
+        std::string cls=obj.class_name;
+        while(!cls.empty()){
+            auto cit=class_reg_.find(cls);
+            if(cit==class_reg_.end()) break;
+            for(auto& sub:cit->second->sub_codes)
+                if(sub->name==dunder&&!sub->is_class){
+                    found=true;
+                    if(sub->has_yield())
+                        return make_generator_val(sub, args, obj);
+                    return exec_code(sub,args,obj);
+                }
+            cls=cit->second->parent_class;
+        }
+        return VMVal::make_none();
+    }
+    VMVal call_dunder(const VMVal& obj, const std::string& dunder, std::vector<VMVal> args) {
         if(obj.type!=VMType::INSTANCE) return VMVal::make_none();
         std::string cls=obj.class_name;
         while(!cls.empty()){
@@ -2248,7 +2504,10 @@ private:
                     if(!cvars.empty()) class_vars_[sub->name]=std::move(cvars);
                 }
                 push(VMVal::make_class(sub,sub->name));
-                class_reg_[sub->name]=sub; break;
+                class_reg_[sub->name]=sub;
+                if(is_exception_class(sub->name)) vm_exc_classes().insert(sub->name);
+                else vm_exc_classes().erase(sub->name);
+                break;
             }
 
             // Calls
@@ -2384,6 +2643,7 @@ private:
                         stack_.resize(base);
                     }
                     cfr.gen_state->yielded=true;
+                    cfr.gen_state->at_yield=true;
                     return yv;
                 }
                 throw VMYield{yv};
@@ -2474,11 +2734,15 @@ private:
                 if(it_type==VMType::INSTANCE){
                     VMVal it_copy = stack_[it_idx]; // copy since stack may reallocate
                     VMVal nv;
-                    bool stop_iter=false;
-                    try { nv=call_dunder(it_copy,"__next__",{}); }
-                    catch(std::runtime_error&){ stop_iter=true; }
-                    // Sync back in case gen_next moved it
-                    if(stop_iter||nv.type==VMType::NONE){ pop(); fr.ip=ins.arg; break; }
+                    bool stop_iter=false, found=false;
+                    // Only StopIteration ends the loop: any other exception
+                    // raised by __next__ propagates (it used to end the loop
+                    // silently, as did a __next__ that returned none).
+                    try { nv=call_dunder_f(it_copy,"__next__",{},found); }
+                    catch(VMException& e){ if(is_stop_iteration(e.value)) stop_iter=true; else throw; }
+                    if(!stop_iter && !found)
+                        throw_exception(make_exception("TypeError",{VMVal::make_str("'"+it_copy.class_name+"' object is not an iterator")}));
+                    if(stop_iter){ pop(); fr.ip=ins.arg; break; }
                     push(nv); break;
                 }
                 if(it_type==VMType::GENERATOR){
@@ -2538,32 +2802,8 @@ private:
             case Op::IMPORT_NAME: vm_import(fr.code->names[ins.arg]); break;
 
             // Exception handling
-            case Op::RAISE: {
-                VMVal ev=pop();
-                std::string msg;
-                if(ev.type==VMType::INSTANCE){
-                    // Store the instance as the current exception object (for except as e:)
-                    std::string cls=ev.class_name;
-                    bool found=false;
-                    while(!cls.empty()&&!found){
-                        auto cit=class_reg_.find(cls);
-                        if(cit==class_reg_.end()) break;
-                        for(auto& sub:cit->second->sub_codes)
-                            if(sub->name=="__str__"&&!sub->is_class){
-                                std::vector<VMVal> na; msg=exec_code(sub,na,ev).to_string(); found=true; break;
-                            }
-                        cls=cit->second->parent_class;
-                    }
-                    if(!found) msg=ev.to_string();
-                    // Encode the instance into the error message so it survives the catch
-                    // We wrap: encode as JSON-like to recover in except handler
-                    last_exception_obj_=ev;
-                } else {
-                    msg=ev.to_string();
-                    last_exception_obj_=VMVal::make_none();
-                }
-                throw std::runtime_error(msg);
-            }
+            case Op::RAISE:
+                throw_exception(pop());
             case Op::SETUP_EXCEPT: break;   // marker only; handled structurally
             case Op::END_EXCEPT:   break;   // marker only
             case Op::STORE_EXCEPT_AS: {
@@ -2582,36 +2822,63 @@ private:
             }
 
             case Op::RAISE_ERROR: {
-                VMVal ev=pop();
-                std::string msg;
-                VMVal exc_obj;
-                if(ev.type==VMType::INSTANCE){
-                    // Raised an instance — call __str__ for the message
-                    exc_obj=ev;
-                    last_exception_obj_=ev;
-                    VMVal s=call_dunder(ev,"__str__",{});
-                    msg=s.type!=VMType::NONE?s.to_string():ev.to_string();
-                } else {
-                    msg=ev.to_string();
-                    exc_obj=VMVal::make_str(msg);
-                    last_exception_obj_=VMVal::make_none();
-                }
-                // Check exception table for a matching handler
-                int ip_at_raise = fr.ip - 1;
-                bool handled = false;
-                for(auto& ee : fr.code->exc_table){
-                    if(ip_at_raise >= ee.try_start && ip_at_raise < ee.try_end){
-                        push(exc_obj);
-                        fr.ip = match_except_handler(ee, exc_obj);
-                        handled = true;
-                        last_exception_obj_=VMVal::make_none();
-                        break;
+                // arg 0: raise X   1: bare raise (re-raise)   2: raise X from Y
+                VMVal cause; if(ins.arg==2) cause=pop();
+                VMVal ev=normalize_exception(pop());
+                if(ins.arg==2 && ev.type==VMType::INSTANCE && ev.map)
+                    (*ev.map)["__cause__"]=cause.type==VMType::NONE?cause:normalize_exception(cause);
+                throw_exception(std::move(ev));
+            }
+
+            // ── try/finally, with (see ExceptionEntry) ─────────────────────
+            case Op::FIN_NORMAL: push(make_fin_state(FIN_K_NORMAL)); break;
+            case Op::FIN_RETURN: push(make_fin_state(FIN_K_RETURN, pop())); break;
+            case Op::FIN_JUMP:   push(make_fin_state(FIN_K_JUMP, VMVal::make_none(), ins.arg)); break;
+            case Op::END_FINALLY: {
+                VMVal st=pop();
+                if(!is_fin_state(st)) break;
+                int outer=ins.arg;
+                switch((int)st.i){
+                case FIN_K_EXC:
+                    throw_exception((*st.list)[0]);
+                case FIN_K_RETURN:
+                    if(outer>=0){ push(st); fr.ip=fr.code->exc_table[outer].finally_start; break; }
+                    return (*st.list)[0];
+                case FIN_K_JUMP: {
+                    int t=(int)st.d;
+                    if(outer>=0){
+                        auto& oe=fr.code->exc_table[outer];
+                        // Leaving the enclosing try as well: run its finally.
+                        if(!(t>=oe.try_start && t<oe.finally_start)){ push(st); fr.ip=oe.finally_start; break; }
                     }
+                    fr.ip=t; break;
                 }
-                if(!handled) throw std::runtime_error(msg);
+                default: break;
+                }
                 break;
             }
-                push(VMVal::make_str(pop().to_string())); break;
+            case Op::WITH_ENTER: {
+                VMVal cm=pop();
+                bool found=false;
+                VMVal r=call_dunder_f(cm,"__enter__",{},found);
+                // No __enter__: bind the object itself (both engines).
+                push(found?r:cm); break;
+            }
+            case Op::WITH_EXIT: {
+                VMVal cm=pop();
+                VMVal& st=stack_.back();
+                if(is_fin_state(st) && st.i==FIN_K_EXC){
+                    VMVal exc=(*st.list)[0];
+                    bool found=false;
+                    VMVal r=call_dunder_f(cm,"__exit__",{class_of_exception(exc),exc,VMVal::make_none()},found);
+                    bool truthy = r.type==VMType::INSTANCE ? instance_truthy(r) : r.is_truthy();
+                    if(found && truthy) st=make_fin_state(FIN_K_NORMAL);
+                } else {
+                    bool found=false;
+                    call_dunder_f(cm,"__exit__",{VMVal::make_none(),VMVal::make_none(),VMVal::make_none()},found);
+                }
+                break;
+            }
 
             case Op::IADD: {
                 VMVal r=pop(),l=pop();
@@ -2633,47 +2900,154 @@ private:
             default: break;
             } // end switch
             } catch(VMReturn& r) { throw; }  // propagate returns
-              catch(std::runtime_error& exc) {
-                CallFrame& fr2=call_stack_.back();
-                std::string emsg=exc.what();
-                // Use the exception object if available (raised via 'raise instance')
-                VMVal exc_val = (last_exception_obj_.type==VMType::INSTANCE) ?
-                    last_exception_obj_ : VMVal::make_str(emsg);
-                last_exception_obj_ = VMVal::make_none(); // clear after use
-                bool handled=false;
-                // 1) Check exc_table (structured try/except blocks)
-                int ip_at_raise=fr2.ip-1;
-                for(auto& ee:fr2.code->exc_table){
-                    if(ip_at_raise>=ee.try_start && ip_at_raise<=ee.try_end){
-                        push(exc_val);
-                        fr2.ip=match_except_handler(ee, exc_val);
-                        handled=true; break;
-                    }
-                }
-                // 2) Fallback: find SETUP_EXCEPT instruction (used by `with`,
-                // see NT::WITH). Must skip any SETUP_EXCEPT whose block
-                // already exited normally (reached its matching END_EXCEPT)
-                // - otherwise an exception raised anywhere after a completed
-                // `with` block, with nothing else to catch it, walked back
-                // into that `with`'s stale handler instead of propagating,
-                // re-ran the code after the `with` block, hit the same raise
-                // again, and looped forever.
-                if(!handled){
-                    int skip=0;
-                    for(int i=fr2.ip-1;i>=0;i--){
-                        Op op2=fr2.code->instructions[i].op;
-                        if(op2==Op::END_EXCEPT){ skip++; continue; }
-                        if(op2==Op::SETUP_EXCEPT){
-                            if(skip>0){ skip--; continue; }
-                            push(exc_val);
-                            fr2.ip=fr2.code->instructions[i].arg;
-                            handled=true; break;
-                        }
-                    }
-                }
-                if(!handled) throw;
+              catch(VMYield&) { throw; }
+              catch(VMException& ex) {
+                if(!dispatch_exception(call_stack_.back(), ex.value)) throw;
+              }
+              catch(std::string& m) {
+                // Interpreter builtins reached through the bridge, and a few
+                // VM paths, report errors as "__exc__:Type:message" strings.
+                VMVal ev=exception_from_message(m);
+                if(!dispatch_exception(call_stack_.back(), ev)) throw VMException(ev, describe_exception(ev));
+              }
+              catch(std::exception& exc) {
+                // Runtime errors raised as "Type: message" (ZeroDivisionError
+                // from a division, ValueError from int(), ...) become instances
+                // of that builtin class, so `except ZeroDivisionError` catches
+                // them like any raised exception.
+                VMVal ev=exception_from_message(exc.what());
+                if(!dispatch_exception(call_stack_.back(), ev)) throw VMException(ev, describe_exception(ev));
               }
         }
+    }
+
+    // ── Exceptions ───────────────────────────────────────────────────────
+    // Finds the handler for `ev` raised at the current instruction of `f`:
+    // the innermost try whose body covers it and has a matching clause, or
+    // whose body/handlers cover it and has a finally. Truncates the operand
+    // stack to that statement's depth, pushes the exception (or, for a
+    // finally, its pending-exception state) and jumps there.
+    bool dispatch_exception(CallFrame& f, const VMVal& ev) {
+        if(!f.code) return false;
+        int ip=f.ip-1;
+        auto& tbl=f.code->exc_table;
+        if(tbl.empty()) return false;
+        std::vector<int> cands;
+        for(int i=0;i<(int)tbl.size();i++){
+            auto& e=tbl[i];
+            bool in_body = ip>=e.try_start && ip<e.try_end;
+            bool in_rest = e.finally_start>=0 && ip>=e.try_end && ip<e.finally_start;
+            if(in_body||in_rest) cands.push_back(i);
+        }
+        // Innermost first. Nested statements can start at the same offset
+        // (a try whose first statement is a try); the inner one's entry was
+        // created later, so the higher index wins a tie.
+        std::sort(cands.begin(),cands.end(),[&](int a,int b){
+            if(tbl[a].try_start!=tbl[b].try_start) return tbl[a].try_start>tbl[b].try_start;
+            return a>b; });
+        for(int i:cands){
+            auto& e=tbl[i];
+            size_t want=f.stack_base+(size_t)e.depth;
+            if(ip>=e.try_start && ip<e.try_end){
+                int h=match_except_handler(e, ev);
+                if(h>=0){
+                    if(stack_.size()>want) stack_.resize(want);
+                    push(ev); f.ip=h; return true;
+                }
+            }
+            if(e.finally_start>=0){
+                if(stack_.size()>want) stack_.resize(want);
+                push(make_fin_state(FIN_K_EXC, ev)); f.ip=e.finally_start; return true;
+            }
+        }
+        return false;
+    }
+    [[noreturn]] void throw_exception(VMVal ev) {
+        std::string what=describe_exception(ev);
+        throw VMException(std::move(ev), what);
+    }
+    // The uncaught form: "Type: message" (just "Type" without a message).
+    std::string describe_exception(const VMVal& ev) {
+        if(ev.type==VMType::INSTANCE){
+            std::string m=exception_str(ev);
+            return m.empty()?ev.class_name:ev.class_name+": "+m;
+        }
+        return ev.to_string();
+    }
+    // str(e): the class's own __str__ when it has one, else the message.
+    std::string exception_str(const VMVal& ev) {
+        if(ev.type==VMType::INSTANCE){
+            bool found=false;
+            VMVal r=call_dunder_f(ev,"__str__",{},found);
+            if(found) return r.to_string();
+        }
+        return ev.to_string();
+    }
+    // A new instance of builtin exception class `type` with the given args.
+    VMVal make_exception(const std::string& type, std::vector<VMVal> args) {
+        auto attrs=std::make_shared<std::unordered_map<std::string,VMVal>>();
+        std::string msg = args.size()==1 ? args[0].to_string() : std::string();
+        (*attrs)["args"]=VMVal::make_list(std::move(args));
+        (*attrs)["msg"]=VMVal::make_str(msg);
+        return VMVal::make_instance(type, attrs);
+    }
+    VMVal exception_from_message(const std::string& m) {
+        std::string type, msg;
+        if(!nython::ny_split_exc_message(m, type, msg)){ type="Exception"; msg=m; }
+        std::vector<VMVal> a; a.push_back(VMVal::make_str(msg));
+        return make_exception(type, std::move(a));
+    }
+    // `raise X`: a class is instantiated with no arguments; an instance is
+    // raised as is; anything else (Nython lets a string be raised) as well.
+    VMVal normalize_exception(VMVal ev) {
+        if(ev.type==VMType::CLASS){
+            std::vector<VMVal> none_args;
+            return vm_call(ev, none_args, std::nullopt);
+        }
+        return ev;
+    }
+    VMVal class_of_exception(const VMVal& ev) {
+        std::string cn = ev.type==VMType::INSTANCE ? ev.class_name : std::string("Exception");
+        auto it=class_reg_.find(cn);
+        if(it==class_reg_.end()) return VMVal::make_none();
+        return VMVal::make_class(it->second, cn);
+    }
+    // Whether class `cls` is `want` or derives from it (first base chain,
+    // then the builtin exception table).
+    bool class_derives(const std::string& cls, const std::string& want) {
+        std::string cur=cls;
+        for(int guard=0; guard<64 && !cur.empty(); guard++){
+            if(cur==want) return true;
+            auto it=class_reg_.find(cur);
+            if(it==class_reg_.end()||!it->second){
+                return nython::ny_builtin_exc_is(cur, want);
+            }
+            // every base, not just the first
+            if(it->second->bases.size()>1){
+                for(size_t k=1;k<it->second->bases.size();k++)
+                    if(class_derives(it->second->bases[k], want)) return true;
+            }
+            cur=it->second->parent_class;
+        }
+        return false;
+    }
+    bool is_exception_class(const std::string& cls) { return class_derives(cls, "BaseException"); }
+    bool exception_matches(const VMVal& ev, const std::string& t) {
+        if(ev.type==VMType::INSTANCE){
+            if(t=="Error" && is_exception_class(ev.class_name)
+               && !class_derives(ev.class_name,"SystemExit") && !class_derives(ev.class_name,"KeyboardInterrupt")
+               && !class_derives(ev.class_name,"GeneratorExit")) return true;
+            return class_derives(ev.class_name, t);
+        }
+        // A raised non-exception value (Nython allows `raise "msg"`): the
+        // generic names catch it, and a string naming a class matches that
+        // class (`raise "StopIteration"`).
+        if(t=="Exception"||t=="BaseException"||t=="Error") return true;
+        return ev.type==VMType::STRING && ev.s==t;
+    }
+    bool is_stop_iteration(const VMVal& ev) {
+        if(ev.type==VMType::INSTANCE) return class_derives(ev.class_name,"StopIteration");
+        return ev.type==VMType::STRING && ev.s.find("StopIteration")!=std::string::npos;
     }
 
     // ── JSON parser ─────────────────────────────────────────────────────────
@@ -2904,23 +3278,14 @@ private:
     // type, or a parent of it. Mirrors the interpreter's evalTry
     // (NythonExecutor.hpp) type-matching, including its silent fall-through
     // to `finally` (ee.end) when nothing matches rather than re-raising.
+    // The first clause (in source order) that catches exc_val, -1 if none.
     int match_except_handler(const ExceptionEntry& ee, const VMVal& exc_val) {
-        std::string exc_type = exc_val.type==VMType::INSTANCE ? exc_val.class_name : std::string();
         for(auto& cl : ee.clauses){
-            if(cl.type_name.empty()) return cl.handler;
-            if(exc_type.empty()) continue; // typed clause, untyped exception: no match
-            if(exc_type==cl.type_name || cl.type_name=="Exception"
-               || cl.type_name=="BaseException" || cl.type_name=="Error")
-                return cl.handler;
-            std::string cur=exc_type; int guard=0;
-            while(!cur.empty() && guard++<16){
-                auto cit=class_reg_.find(cur);
-                if(cit==class_reg_.end()) break;
-                cur=cit->second->parent_class;
-                if(cur==cl.type_name) return cl.handler;
-            }
+            if(cl.types.empty()) return cl.handler;
+            for(auto& t : cl.types)
+                if(exception_matches(exc_val, t)) return cl.handler;
         }
-        return ee.end;
+        return -1;
     }
     bool value_is_type(const VMVal& v, const std::string& want) {
         // Everything is an Object.
@@ -3271,6 +3636,13 @@ private:
             auto attrs=std::make_shared<std::unordered_map<std::string,VMVal>>();
             VMVal inst=VMVal::make_instance(callee.class_name,attrs);
             if(!class_reg_.count(callee.class_name)) class_reg_[callee.class_name]=callee.code;
+            // An exception's args are the constructor's arguments whatever
+            // its __init__ does (Python's BaseException.__new__); a class
+            // that calls super().__init__(...) replaces them there.
+            if(vm_exc_classes().count(callee.class_name)){
+                (*attrs)["args"]=VMVal::make_list(args);
+                (*attrs)["msg"]=VMVal::make_str(args.size()==1?args[0].to_string():std::string());
+            }
             {
                 // Find __init__ in class hierarchy
                 std::string search_cls=callee.class_name;
@@ -3308,6 +3680,21 @@ private:
         return n=="__init__" || n=="init";
     }
     VMVal vm_call_method(VMVal obj, const std::string& method, std::vector<VMVal>& args) {
+        // Generator protocol: send(v) resumes with v as the value of the
+        // pending yield; close() finishes it.
+        if(obj.type==VMType::GENERATOR&&obj.gen){
+            if(method=="send"||method=="__next__"||method=="next"){
+                VMVal sent = (method=="send"&&!args.empty()) ? args[0] : VMVal::make_none();
+                if(method=="send" && !obj.gen->started && sent.type!=VMType::NONE)
+                    throw_exception(make_exception("TypeError",{VMVal::make_str("can't send non-None value to a just-started generator")}));
+                if(obj.gen->done) throw_exception(make_exception("StopIteration",{}));
+                VMVal v=gen_next(obj, sent);
+                if(obj.gen->done) throw_exception(make_exception("StopIteration",{}));
+                return v;
+            }
+            if(method=="close"){ obj.gen->done=true; obj.gen->saved_stack.clear(); return VMVal::make_none(); }
+            if(method=="__iter__") return obj;
+        }
         // SUPER_PROXY: call method on parent class with self
         if(obj.type==VMType::SUPER_PROXY){
             std::string parent=obj.s;
@@ -3319,6 +3706,12 @@ private:
                 for(auto& sub:cit->second->sub_codes)
                     if(sub->name==method&&!sub->is_class) return exec_code(sub,args,self_v);
                 cls=cit->second->parent_class;
+            }
+            // super().__init__(...) reaching a builtin exception class sets
+            // the exception's args.
+            if(is_ctor_name(method) && self_v.type==VMType::INSTANCE && self_v.map && is_exception_class(parent)){
+                (*self_v.map)["args"]=VMVal::make_list(args);
+                (*self_v.map)["msg"]=VMVal::make_str(args.size()==1?args[0].to_string():std::string());
             }
             return VMVal::make_none();
         }
@@ -4293,18 +4686,28 @@ private:
             return VMVal::make_list(std::move(r));});
         // ── any / all / map / filter / list / set ──────────────────────────
         // ── map / filter (call Nython functions) ────────────────────────
+        // next(it[, default]): an exhausted iterator raises StopIteration
+        // (or returns the default), as on the interpreter.
         globals_["next"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.empty()) return VMVal::make_none();
-            if(a[0].type==VMType::GENERATOR) return gen_next(a[0]);
+            bool has_default=a.size()>=2;
+            auto exhausted=[&]()->VMVal{
+                if(has_default) return a[1];
+                throw_exception(make_exception("StopIteration",{}));
+            };
+            if(a[0].type==VMType::GENERATOR){
+                if(!a[0].gen||a[0].gen->done) return exhausted();
+                VMVal v=gen_next(a[0]);
+                if(a[0].gen->done) return exhausted();
+                return v;
+            }
             if(a[0].type==VMType::INSTANCE){
-                VMVal nv;
-                try { nv=call_dunder(a[0],"__next__",{}); }
-                catch(std::runtime_error&){ return VMVal::make_none(); }
-                return nv;
+                try { return call_dunder(a[0],"__next__",{}); }
+                catch(VMException& e){ if(is_stop_iteration(e.value)) return exhausted(); throw; }
             }
             if(a[0].type!=VMType::ITERATOR||!a[0].iter) return VMVal::make_none();
             auto&[cur,items]=*a[0].iter;
-            if(cur>=(int)items.size()) return VMVal::make_none();
+            if(cur>=(int)items.size()) return exhausted();
             return items[cur++];});
         globals_["map"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()<2||a[1].type!=VMType::LIST||!a[1].list) return VMVal::make_list();
@@ -5272,22 +5675,21 @@ private:
         globals_["none"]=VMVal::make_none();
         globals_["true"]=VMVal::make_bool(true);
         // ── Built-in exception classes ────────────────────────────────────────
-        auto make_exc_class = [this](const std::string& cname) {
-            globals_[cname] = VMVal::make_native([cname](std::vector<VMVal>& a) -> VMVal {
-                auto attrs = std::make_shared<std::unordered_map<std::string,VMVal>>();
-                std::string msg = a.empty() ? cname : a[0].to_string();
-                (*attrs)["msg"] = VMVal::make_str(msg);
-                (*attrs)["args"] = VMVal::make_list(a);
-                return VMVal::make_instance(cname, attrs);
-            });
-        };
-        for(auto& en : std::vector<std::string>{
-            "Exception","BaseException","ValueError","TypeError","ZeroDivisionError",
-            "KeyError","IndexError","AttributeError","RuntimeError","NameError",
-            "StopIteration","NotImplementedError","OverflowError","OSError","IOError",
-            "FileNotFoundError","PermissionError","TimeoutError","ConnectionError",
-            "ImportError","SyntaxError","AssertionError","ArithmeticError"
-        }) make_exc_class(en);
+        // Builtin exception classes are real classes - registered like a
+        // user class, with Python's hierarchy - so `class E(ValueError)`,
+        // `except LookupError`, isinstance(e, Exception) and super().__init__
+        // all work on them. They used to be natives returning an instance,
+        // unrelated to one another and impossible to subclass.
+        for(auto& en : nython::ny_builtin_exc_names()){
+            auto code=std::make_shared<VMCode>();
+            code->name=en; code->is_class=true;
+            const char* par=nython::ny_builtin_exc_parent(en);
+            if(par && *par){ code->parent_class=par; code->bases.push_back(par); }
+            code->instructions.emplace_back(Op::HALT);
+            class_reg_[en]=code;
+            globals_[en]=VMVal::make_class(code,en);
+            vm_exc_classes().insert(en);
+        }
         globals_["false"]=VMVal::make_bool(false);
         globals_["null"]=VMVal::make_none();
         globals_["PI"]  =VMVal::make_float(3.14159265358979323846);
@@ -5727,6 +6129,12 @@ private:
         case Op::RAISE_ERROR:  return "RAISE_ERROR";
         case Op::SETUP_EXCEPT: return "SETUP_EXCEPT";
         case Op::END_EXCEPT:   return "END_EXCEPT";
+        case Op::FIN_NORMAL:   return "FIN_NORMAL";
+        case Op::FIN_RETURN:   return "FIN_RETURN";
+        case Op::FIN_JUMP:     return "FIN_JUMP";
+        case Op::END_FINALLY:  return "END_FINALLY";
+        case Op::WITH_ENTER:   return "WITH_ENTER";
+        case Op::WITH_EXIT:    return "WITH_EXIT";
         default:               return "???";
         }
     }

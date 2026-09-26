@@ -457,9 +457,26 @@ struct BlockNode : Node {
     Value eval(Context* ctx) override { Value r=NONE_VALUE; for(auto& s:stmts) r=s->eval(ctx); return r; }
 };
 
+// [e for t in it if c ...], {e ...}, {k: v ...}, (e ...): every for/if
+// clause in order, and the scope the clause targets live in is the
+// comprehension's own (they no longer leak into the enclosing one).
+struct ComprehensionNode : Node {
+    enum Kind { LIST = 0, SET = 1, DICT = 2, GEN = 3 };
+    struct Clause { node_ptr target; node_ptr iter; std::vector<node_ptr> conds; };
+    int kind;
+    node_ptr elt, value;            // value: the dict comprehension's value (elt is the key)
+    std::vector<Clause> clauses;
+    ComprehensionNode(Token t, int k) : Node(t, NodeType::COMPREHENSION), kind(k), elt{}, value{}, clauses{} {}
+    Value eval(Context*) override { return NONE_VALUE; }
+};
+
 struct IfNode : Node {
     node_ptr condition, then_branch, else_branch;
     std::vector<node_ptr> elseif_branches;
+    // True for the expression forms (`a if c else b`, `c ? a : b`), whose
+    // value is used; false for an `if` statement, whose branches are
+    // statements and leave nothing behind (the VM compiles the two apart).
+    bool is_expr = false;
     IfNode(Token t, node_ptr c, node_ptr tb) : Node(t, NodeType::IF), condition(c), then_branch(tb), else_branch{}, elseif_branches{} {}
     Value eval(Context* ctx) override {
         if(condition->eval(ctx).isTrue()) return then_branch->eval(ctx);
@@ -599,6 +616,15 @@ struct SwitchNode : Node {
 
 struct ExceptNode : Node {
     std::string name, alias; node_ptr body;
+    // What the clause catches and what it binds, resolved by the parser:
+    // `types` empty = catch everything; `var` empty = bind nothing.
+    //   except:                 types {}      var ""
+    //   except e:               types {}      var "e"   (lower-case name)
+    //   except ValueError:      types {VE}    var ""    (a type name)
+    //   except ValueError as e: types {VE}    var "e"
+    //   except (A, B) as e:     types {A, B}  var "e"
+    // `name`/`alias` keep their historical spelling for older consumers.
+    std::vector<std::string> types; std::string var;
     ExceptNode(Token t, const std::string& n, const std::string& a, node_ptr b) : Node(t, NodeType::EXCEPT), name(n), alias(a), body(b) {}
     Value eval(Context* ctx) override { return body->eval(ctx); }
 };
@@ -625,6 +651,7 @@ struct TryNode : Node {
 
 struct RaiseNode : Node {
     node_ptr expr;
+    node_ptr cause;   // `raise X from Y`: Y (becomes X.__cause__)
     RaiseNode(Token t, node_ptr e=nullptr) : Node(t, NodeType::RAISE), expr(e) {}
     Value eval(Context* ctx) override {
         std::string msg = expr ? expr->eval(ctx).toString() : "Exception raised";

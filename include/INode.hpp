@@ -120,7 +120,8 @@ enum class NodeType:uint8_t {
     OPERATOR,
     LOOP,
     MACRO_CALL,
-    DYN_BINOP
+    DYN_BINOP,
+    COMPREHENSION
 };
 
 struct INode{

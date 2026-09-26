@@ -156,6 +156,12 @@ static const TokenDef KeywordTokens[] = {
 	TokenDef(TokenType::Except,std::string("catch"), TokenKind::Name, TokenClass::Keyword),
 	// JS/C "null" is an alias for Nython/Python "none"
 	TokenDef(TokenType::None,std::string("null"), TokenKind::Name, TokenClass::Keyword),
+	// Python's capitalised spellings. `True` used to be an ordinary (undefined)
+	// name reading none, so a Python-style `while True:` never ran and
+	// `return True` returned a falsy value.
+	TokenDef(TokenType::True,std::string("True"), TokenKind::Name, TokenClass::Keyword),
+	TokenDef(TokenType::False,std::string("False"), TokenKind::Name, TokenClass::Keyword),
+	TokenDef(TokenType::None,std::string("None"), TokenKind::Name, TokenClass::Keyword),
 	// Lua "elseif" as alias for "elif"
 	TokenDef(TokenType::ElseIf,std::string("elseif"), TokenKind::Name, TokenClass::Keyword)
 };

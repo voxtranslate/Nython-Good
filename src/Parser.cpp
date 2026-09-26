@@ -1,6 +1,7 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-but-set-variable"
 #include "Parser.hpp"
+#include "NyExcTypes.hpp"
 #include "SourceCode.hpp"
 #include "Except.hpp"
 #include "Script.hpp"
@@ -602,6 +603,7 @@ node_ptr Parser::ternary(){
         node_ptr else_expr = expression();
         auto node = make_node<IfNode>(tok, expr, then_expr);
         std::static_pointer_cast<IfNode>(node)->else_branch = else_expr;
+        std::static_pointer_cast<IfNode>(node)->is_expr = true;
         return node;
     }
     // Python-style ternary: value if cond else other
@@ -612,6 +614,7 @@ node_ptr Parser::ternary(){
         node_ptr else_expr = expression();
         auto node = make_node<IfNode>(tok, condition, expr);
         std::static_pointer_cast<IfNode>(node)->else_branch = else_expr;
+        std::static_pointer_cast<IfNode>(node)->is_expr = true;
         return node;
     }
     return expr;
@@ -888,21 +891,9 @@ node_ptr Parser::postfix(){
                     return make_node<KeywordArgNode>(kw_tok, kw_name, kw_val);
                 }
                 node_ptr first_expr = expression();
-                // Generator expression: expr for var in iter [if cond]
-                if(have(TokenType::For)){
-                    Token comp_tok = prev();
-                    comp_tok.value = identifier(); // var name
-                    mustBe(TokenType::In);
-                    node_ptr iterable = logicalOr();
-                    node_ptr filter_expr = nullptr;
-                    if(have(TokenType::If)) filter_expr = expression();
-                    auto comp = make_node<ComplexNode>(comp_tok);
-                    auto cp = std::static_pointer_cast<ComplexNode>(comp);
-                    cp->items.push_back(first_expr);
-                    cp->items.push_back(iterable);
-                    cp->items.push_back(filter_expr);
-                    return comp;
-                }
+                // Generator expression argument: f(expr for t in it if c ...)
+                if(have(TokenType::For))
+                    return comprehension(prev(), ComprehensionNode::GEN, first_expr, nullptr);
                 return first_expr;
             };
             if(!see(TokenType::ParenClose)){
@@ -1280,20 +1271,10 @@ node_ptr Parser::atom(){
             return make_node<WalrusNode>(tok, wname, init);
         }
         node_ptr expr = expression();
-        // Standalone generator expression: (expr for var in iter [if cond])
+        // Standalone generator expression: (expr for t in it if c ...)
         if(have(TokenType::For)){
-            std::string var_name = identifier();
-            mustBe(TokenType::In);
-            node_ptr iterable = logicalOr();
-            node_ptr filter_expr = nullptr;
-            if(have(TokenType::If)) filter_expr = expression();
+            node_ptr comp = comprehension(tok, ComprehensionNode::GEN, expr, nullptr);
             mustBe(TokenType::ParenClose);
-            auto comp = make_node<ComplexNode>(tok);
-            auto cp = std::static_pointer_cast<ComplexNode>(comp);
-            cp->items.push_back(expr);
-            cp->items.push_back(iterable);
-            cp->items.push_back(filter_expr);
-            cp->_token.value = var_name;
             return comp;
         }
         if(have(TokenType::Comma)){
@@ -2075,20 +2056,53 @@ node_ptr Parser::tryStmt(){
     auto try_node = make_node<TryNode>(tok, body);
     auto tn = std::static_pointer_cast<TryNode>(try_node);
     while(have(TokenType::NewLine)) {}
+    // A bare name after `except` is a TYPE when it names an exception class
+    // (a builtin one, or anything capitalised, as class names are) and the
+    // Nython catch-all binding `except e:` otherwise. Both engines used to
+    // read every bare name as a binding, so `except ValueError:` caught
+    // everything - and rebound the name ValueError to the exception.
+    auto is_type_name = [](const std::string& n) {
+        return nython::ny_is_builtin_exc(n) || (!n.empty() && n[0] >= 'A' && n[0] <= 'Z');
+    };
+    auto dotted = [&]() {
+        std::string n = identifier();
+        while (see(TokenType::Dot) && peek(1).type() == TokenType::Identifier) {
+            next(); n = identifier();   // mod.Error -> Error (classes are global by name)
+        }
+        return n;
+    };
     while(see(TokenType::Except)){
         next(); // consume 'except'
         std::string ename, ealias;
+        std::vector<std::string> types;
+        std::string var;
         if(see(TokenType::As)){
             // "except as e:" — catch-all with alias
             next(); // consume 'as'
             if(see(TokenType::Identifier)) ealias = identifier();
+            var = ealias;
+        } else if(have(TokenType::ParenOpen)){
+            // except (A, B) as e:
+            while(!see(TokenType::ParenClose) && !see(TokenType::End)){
+                types.push_back(dotted());
+                if(!have(TokenType::Comma)) break;
+            }
+            mustBe(TokenType::ParenClose);
+            if(!types.empty()) ename = types[0];
+            if(have(TokenType::As)) { ealias = identifier(); var = ealias; }
         } else if(see(TokenType::Identifier)){
-            ename = identifier();
-            if(have(TokenType::As)) ealias = identifier();
+            ename = dotted();
+            if(have(TokenType::As)) { ealias = identifier(); types.push_back(ename); var = ealias; }
+            else if(is_type_name(ename)) types.push_back(ename);
+            else var = ename;
         }
         have(TokenType::Colon);
         node_ptr ebody = blockOrStmt();
-        tn->except_clauses.push_back(make_node<ExceptNode>(tok, ename, ealias, ebody));
+        auto en = make_node<ExceptNode>(tok, ename, ealias, ebody);
+        auto enp = std::static_pointer_cast<ExceptNode>(en);
+        enp->types = std::move(types);
+        enp->var = std::move(var);
+        tn->except_clauses.push_back(en);
         while(have(TokenType::NewLine)) {}
     }
     return try_node;
@@ -2097,9 +2111,17 @@ node_ptr Parser::tryStmt(){
 node_ptr Parser::raiseStmt(){
     Token tok = token(); next(); // consume raise/throw
     node_ptr expr = nullptr;
-    if(!see(TokenType::NewLine)&&!see(TokenType::SemiColon)) expr = expression();
+    node_ptr cause = nullptr;
+    if(!see(TokenType::NewLine)&&!see(TokenType::SemiColon)&&!see(TokenType::End)
+       &&!see(TokenType::Dedent)) {
+        expr = expression();
+        // raise X from Y
+        if(have(TokenType::From)) cause = expression();
+    }
     have(TokenType::SemiColon); have(TokenType::NewLine);
-    return make_node<RaiseNode>(tok, expr);
+    auto rn = make_node<RaiseNode>(tok, expr);
+    std::static_pointer_cast<RaiseNode>(rn)->cause = cause;
+    return rn;
 }
 
 node_ptr Parser::assertStmt(){
@@ -2265,6 +2287,64 @@ node_ptr Parser::blockOrStmt(){
 // COLLECTION LITERALS
 // ═══════════════════════════════════════════════════════════════════════════
 
+// A comprehension's clauses, the first `for` already consumed:
+//   for T in ITER (if COND)* (for T in ITER (if COND)*)*
+// Conditions and iterables stop before a ternary's `if`/`else` (logicalOr),
+// so `[x for x in xs if a if b]` has two conditions rather than being read
+// as a malformed conditional expression.
+node_ptr Parser::comprehension(Token tok, int kind, node_ptr elt, node_ptr value){
+    auto comp = make_node<ComprehensionNode>(tok, kind);
+    auto cp = std::static_pointer_cast<ComprehensionNode>(comp);
+    cp->elt = elt; cp->value = value;
+    do {
+        ComprehensionNode::Clause cl;
+        cl.target = compTarget();
+        mustBe(TokenType::In);
+        cl.iter = logicalOr();
+        while(have(TokenType::If)) cl.conds.push_back(logicalOr());
+        cp->clauses.push_back(std::move(cl));
+    } while(have(TokenType::For));
+    return comp;
+}
+
+// A comprehension target: a name, or a (possibly nested, possibly
+// parenthesised) comma-separated list of targets.
+node_ptr Parser::compTargetOne(){
+    Token tok = token();
+    if(have(TokenType::ParenOpen)){
+        node_ptr t = compTarget();
+        mustBe(TokenType::ParenClose);
+        if(t->type() != NodeType::TUPLE){
+            auto tup = make_node<TupleNode>(tok); tup->add(t); return tup;
+        }
+        return t;
+    }
+    if(have(TokenType::BracketOpen)){
+        node_ptr t = compTarget();
+        mustBe(TokenType::BracketClose);
+        if(t->type() != NodeType::TUPLE){
+            auto tup = make_node<TupleNode>(tok); tup->add(t); return tup;
+        }
+        return t;
+    }
+    Token id = token();
+    id.value = identifier();
+    return make_node<VariableNode>(id);
+}
+
+node_ptr Parser::compTarget(){
+    Token tok = token();
+    node_ptr first = compTargetOne();
+    if(!see(TokenType::Comma)) return first;
+    auto tup = make_node<TupleNode>(tok);
+    tup->add(first);
+    while(have(TokenType::Comma)){
+        if(see(TokenType::In) || see(TokenType::ParenClose) || see(TokenType::BracketClose)) break;
+        tup->add(compTargetOne());
+    }
+    return tup;
+}
+
 node_ptr Parser::listLiteral(){
     Token tok = token();
     mustBe(TokenType::BracketOpen);
@@ -2274,46 +2354,10 @@ node_ptr Parser::listLiteral(){
     }
     // Parse first expression
     node_ptr first = expression();
-    // Check for list comprehension: [expr for var in iterable (for var2 in iter2)*]
+    // List comprehension: [expr for t in it if c ... for t2 in it2 ...]
     if(have(TokenType::For)){
-        // Support tuple unpacking: for a, b in ...
-        std::string var_name = identifier();
-        std::string var_names_combined = var_name;
-        while(see(TokenType::Comma)){
-            have(TokenType::Comma);
-            if(see(TokenType::In)) break; // trailing comma
-            var_names_combined += "," + identifier();
-        }
-        var_name = var_names_combined;
-        mustBe(TokenType::In);
-        node_ptr iterable = logicalOr();
-        // Check for nested for:
-        std::string var_name2;
-        node_ptr iterable2 = nullptr;
-        if(have(TokenType::For)) {
-            var_name2 = identifier();
-            mustBe(TokenType::In);
-            iterable2 = logicalOr();
-        }
-        node_ptr filter_expr = nullptr;
-        if(have(TokenType::If)){
-            filter_expr = expression();
-        }
-mustBe(TokenType::BracketClose);
-        // Build a ComprehensionNode
-        auto comp = make_node<ComplexNode>(tok);
-        auto comp_ptr = std::static_pointer_cast<ComplexNode>(comp);
-        comp_ptr->items.push_back(first);        // [0] = expr to evaluate
-        comp_ptr->items.push_back(iterable);     // [1] = iterable
-        if(filter_expr) comp_ptr->items.push_back(filter_expr); // [2] = optional filter
-        else comp_ptr->items.push_back(nullptr);
-        // Nested for: store var2 and iterable2
-        if(iterable2) {
-            Token v2tok = tok; v2tok.value = var_name2;
-            comp_ptr->items.push_back(make_node<VariableNode>(v2tok)); // [3] = var2
-            comp_ptr->items.push_back(iterable2);                      // [4] = iterable2
-        }
-        comp_ptr->_token.value = var_name;
+        node_ptr comp = comprehension(tok, ComprehensionNode::LIST, first, nullptr);
+        mustBe(TokenType::BracketClose);
         return comp;
     }
     // Regular list literal
@@ -2407,59 +2451,11 @@ node_ptr Parser::mapLiteral(){
     if(have(TokenType::Colon)){
         // It's a map
         node_ptr val = expression();
-        // Check for dict comprehension: {k: v for var in iterable if cond}
-        if(see(TokenType::For)) {
-            next(); // consume 'for'
-            std::string var_name = identifier();
-            // Check for tuple unpacking: for k, v in ...
-            std::string var_name2;
-            if(have(TokenType::Comma)) {
-                var_name2 = identifier();
-            }
-            mustBe(TokenType::In);
-            node_ptr iter = logicalOr(); // don't consume 'if' as ternary
-            // Optional filter
-            node_ptr filter_expr = nullptr;
-            if(have(TokenType::If)) {
-                filter_expr = expression();
-            }
+        // Dict comprehension: {k: v for t in it if c ...}
+        if(have(TokenType::For)) {
+            node_ptr comp = comprehension(tok, ComprehensionNode::DICT, key, val);
             mustBe(TokenType::BraceClose);
-            // Transform into: (lambda: var __d={} \n for var_name in iter: __d[key_expr]=val_expr \n return __d)()
-            // Simpler: create a special ComprehensionNode that builds a map
-            // For now, generate equivalent AST:
-            auto block = make_node<BlockNode>(tok);
-            // var __dictcomp__ = {}
-            auto empty_map = make_node<MapNode>(tok);
-            block->add(make_node<VarDeclNode>(tok, "__dictcomp__", empty_map, false, false));
-            // for var_name in iter:
-            Token var_tok = tok; var_tok.value = var_name;
-            auto loop_var = make_node<VariableNode>(var_tok);
-            // __dictcomp__[key] = val
-            Token dc_tok = tok; dc_tok.value = "__dictcomp__";
-            auto dc_var = make_node<VariableNode>(dc_tok);
-            auto subscr = make_node<SubscriptNode>(tok, dc_var, key);
-            auto assign = make_node<AssignmentNode>(tok, subscr, val);
-            // Build for body: optionally wrap in if filter
-            node_ptr for_body;
-            if (filter_expr) {
-                // Create: if cond: assign (with no else)
-                auto if_block = make_node<IfNode>(tok, filter_expr, assign);
-                for_body = if_block;
-            } else {
-                for_body = assign;
-            }
-            auto for_node = make_node<ForNode>(tok, loop_var, iter, for_body);
-            // Add tuple unpacking vars
-            if (!var_name2.empty()) {
-                Token v2tok = tok; v2tok.value = var_name2;
-                for_node->add(make_node<VariableNode>(v2tok));
-                static_cast<ForNode*>(for_node.get())->unpack_vars.push_back(make_node<VariableNode>(v2tok));
-            }
-            block->add(for_node);
-            // return __dictcomp__
-            Token dc_tok2 = tok; dc_tok2.value = "__dictcomp__";
-            block->add(make_node<VariableNode>(dc_tok2));
-            return block;
+            return comp;
         }
         map->add(make_node<MapEntryNode>(tok, key, val));
         while(have(TokenType::Comma)&&!see(TokenType::BraceClose)){
@@ -2474,45 +2470,11 @@ node_ptr Parser::mapLiteral(){
     // Set literal: {expr1, expr2, ...}
     // Build as: set([expr1, expr2, ...])
     // Set literal or set comprehension: {expr ...}
-    // Check for set comprehension: {expr for var in iter [if cond]}
-    if (see(TokenType::For)) {
-        next(); // consume 'for'
-        std::string var_name = identifier();
-        std::string var_name2;
-        if (have(TokenType::Comma)) var_name2 = identifier();
-        mustBe(TokenType::In);
-        node_ptr iter = logicalOr();
-        node_ptr filter_expr = nullptr;
-        if (have(TokenType::If)) filter_expr = expression();
+    // Set comprehension: {e for t in it if c ...}
+    if (have(TokenType::For)) {
+        node_ptr comp = comprehension(tok, ComprehensionNode::SET, key, nullptr);
         mustBe(TokenType::BraceClose);
-        // Generate: var __setcomp__ = set([]) \n for var in iter: if cond: __setcomp__.add(key)\n return __setcomp__
-        auto block = make_node<BlockNode>(tok);
-        // var __setcomp__ = set([])
-        auto empty_list = make_node<ListNode>(tok);
-        Token set_tok2 = tok; set_tok2.value = "set";
-        auto set_var2 = make_node<VariableNode>(set_tok2);
-        auto set_call = make_node<CallNode>(tok, set_var2);
-        set_call->add(empty_list);
-        block->add(make_node<VarDeclNode>(tok, "__setcomp__", set_call, false, false));
-        // for var_name in iter: __setcomp__.add(key)
-        Token sc_tok = tok; sc_tok.value = "__setcomp__";
-        auto sc_var = make_node<VariableNode>(sc_tok);
-        Token add_tok = tok; add_tok.value = "add";
-        auto add_attr = make_node<AttributeNode>(tok, sc_var, "add");
-        auto add_call = make_node<CallNode>(tok, add_attr);
-        add_call->add(key);
-        node_ptr for_body = filter_expr ? (node_ptr)make_node<IfNode>(tok, filter_expr, add_call) : (node_ptr)add_call;
-        Token var_tok = tok; var_tok.value = var_name;
-        auto loop_var = make_node<VariableNode>(var_tok);
-        auto for_node = make_node<ForNode>(tok, loop_var, iter, for_body);
-        if (!var_name2.empty()) {
-            Token v2tok = tok; v2tok.value = var_name2;
-            static_cast<ForNode*>(for_node.get())->unpack_vars.push_back(make_node<VariableNode>(v2tok));
-        }
-        block->add(for_node);
-        Token sc_tok2 = tok; sc_tok2.value = "__setcomp__";
-        block->add(make_node<VariableNode>(sc_tok2));
-        return block;
+        return comp;
     }
     auto list = make_node<ListNode>(tok);
     list->add(key);

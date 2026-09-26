@@ -225,6 +225,10 @@ private:
     std::vector<node_ptr> lambdaParamList();
     std::vector<node_ptr> argList();
     node_ptr listLiteral();
+    // After the first `for` of a comprehension: its clauses.
+    node_ptr comprehension(Token tok, int kind, node_ptr elt, node_ptr value);
+    node_ptr compTarget();
+    node_ptr compTargetOne();
     node_ptr mapLiteral();
     node_ptr tupleLiteral();
 

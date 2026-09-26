@@ -25,6 +25,7 @@
 // Windows: winsock2.h MUST come before windows.h (which some headers pull in)
 #include "Nython.hpp"
 #include "NythonREPL.hpp"
+#include "NyExcTypes.hpp"
 #include <algorithm>
 #include <fstream>
 #include <cwctype>
@@ -535,7 +536,16 @@ public:   // NythonExecutor is a struct: members default to public
 
     Value execute(node_ptr ast) {
         if (!ast) return NONE_VALUE;
-        return evalNode(ast, global_ctx);
+        try {
+            return evalNode(ast, global_ctx);
+        } catch (std::string& flow) {
+            // An uncaught raised instance travels as "__exc__:C:__obj__:<ptr>";
+            // resolve it to "__exc__:C:message" while the instance still
+            // exists, so the top level reports the message, not a pointer.
+            if (flow.find(":__obj__:") != std::string::npos)
+                throw std::string("__exc__:" + excTypeOf(flow) + ":" + excMessageOf(flow));
+            throw;
+        }
     }
 
     // ── return / break / continue without C++ exceptions ─────────────────
@@ -654,6 +664,7 @@ public:   // NythonExecutor is a struct: members default to public
             case NodeType::SUBSCRIPT: return evalSubscript(node, ctx);
             case NodeType::LIST: return evalList(node, ctx);
             case NodeType::COMPLEX: return evalComprehension(node, ctx);
+            case NodeType::COMPREHENSION: return evalComprehensionNode(node, ctx);
             case NodeType::MAP: return evalMap(node, ctx);
             case NodeType::TUPLE: return evalList(node, ctx);
             case NodeType::ARRAY: return evalList(node, ctx);
@@ -1260,12 +1271,14 @@ public:   // NythonExecutor is a struct: members default to public
                 double b = (rv.type == ValueType::DOUBLE) ? (double)rv.value.d : (double)bigint_to_i64(rv.value.i);
                 return Value(static_cast<double>(a + b));
             }
-            // String concatenation
-            if (lv.type == ValueType::USERDATA && rv.type == ValueType::USERDATA) {
-                return makeStringValue(getStringValue(lv) + getStringValue(rv));
-            }
+            // String concatenation. An instance joins as str(instance) - its
+            // __str__, or an exception's message - as on the VM; it used to
+            // join as its internal handle, "<function __instance__:C>".
             if (lv.type == ValueType::USERDATA || rv.type == ValueType::USERDATA) {
-                return makeStringValue(getStringValue(lv) + getStringValue(rv));
+                auto part = [&](const Value& v) {
+                    return isInstanceValue(v) ? instanceString(v, ctx) : getStringValue(v);
+                };
+                return makeStringValue(part(lv) + part(rv));
             }
             return lv + rv;
         }
@@ -1452,7 +1465,7 @@ return lv * rv;
                 return makeStringValue(result);
             }
             if (lv.type == ValueType::INTEGER && rv.type == ValueType::INTEGER) {
-                if (rv.value.i == 0) throw std::string("modulo by zero");
+                if (rv.value.i == 0) throw std::string("__exc__:ZeroDivisionError:integer division or modulo by zero");
                 int64_t ma = bigint_to_i64(lv.value.i), mb = bigint_to_i64(rv.value.i);
                 int64_t mr = ma % mb;
                 // Floor-modulo, to match this file's floor `//`: the remainder
@@ -1464,7 +1477,7 @@ return lv * rv;
             if (lv.type == ValueType::DOUBLE || rv.type == ValueType::DOUBLE) {
                 double a = lv.type == ValueType::DOUBLE ? static_cast<double>(lv.value.d) : static_cast<double>(bigint_to_i64(lv.value.i));
                 double b = rv.type == ValueType::DOUBLE ? static_cast<double>(rv.value.d) : static_cast<double>(bigint_to_i64(rv.value.i));
-                if (b == 0) throw std::string("modulo by zero");
+                if (b == 0) throw std::string("__exc__:ZeroDivisionError:integer division or modulo by zero");
                 return Value(std::fmod(a, b));
 
             }
@@ -3509,14 +3522,8 @@ return lv * rv;
             auto* cn_check = static_cast<ClassNode*>(class_node);
             for (auto& base_node : cn_check->bases) {
                 std::string parent_name = base_node->value();
-                Value parent_class_val;
-                try { parent_class_val = ctx->getByName(parent_name); } catch (...) { continue; }
-                if (parent_class_val.type != ValueType::USERDATA || !parent_class_val.value.p) continue;
-                void* parent_ast = parent_class_val.value.p;
-                auto past_it = func_ast_nodes.find(parent_ast);
-                if (past_it != func_ast_nodes.end()) parent_ast = past_it->second;
-                Node* parent_node = (Node*)parent_ast;
-                if (!parent_node || parent_node->type() != NodeType::CLASS) continue;
+                Node* parent_node = classNodeByName(parent_name);
+                if (!parent_node) continue;
                 auto* pcn = static_cast<ClassNode*>(parent_node);
                 if (!pcn->body) continue;
                 for (auto& stmt : pcn->body->statements()) {
@@ -3642,6 +3649,7 @@ return lv * rv;
         class_val.value.p = (void*)node.get();
         func_names[(void*)node.get()] = "__class__:" + cn->name;
         class_by_name[cn->name] = (void*)node.get();
+        mro_cache_.clear();
         // Store parent class if exists
         if (!cn->bases.empty()) {
             // bases[0] is a VariableNode with parent class name
@@ -4209,6 +4217,12 @@ public:
                 }
                 std::vector<Value> args; std::unordered_map<std::string, Value> kw_args;
                 evalCallArgs(cn->args, ctx, args, kw_args);
+                // super().__init__(...) reaching a builtin exception class.
+                if ((method_name == "__init__" || method_name == "init") && !parent_name.empty()
+                    && !classNodeByName(parent_name) && nython::ny_is_builtin_exc(parent_name)) {
+                    setExceptionArgs(self_val, args);
+                    return NONE_VALUE;
+                }
                 if (!parent_name.empty()) {
                     auto pcit = class_by_name.find(parent_name);
                     if (pcit != class_by_name.end()) {
@@ -4646,6 +4660,9 @@ public:
             // Create property storage for this instance
             Context* props = new Context(runner, className + "_props", nullptr, nullptr, nullptr);
             instance_properties[instance.value.p] = props;
+            // An exception's args are the constructor's arguments whatever its
+            // __init__ does (as in Python); super().__init__(...) replaces them.
+            if (isExceptionClass(className)) setExceptionArgs(instance, args);
 
             // Create instance context inheriting class methods
             Context* inst_ctx = new Context(runner, className + "_instance", nullptr, nullptr, ctx);
@@ -4704,14 +4721,12 @@ public:
                     bool advanced = false;
                     for (auto& base_node_ptr : cn_walk->bases) {
                         std::string parent_name = base_node_ptr->value();
-                        Value parent_val;
-                        try { parent_val = ctx->getByName(parent_name); } catch (...) { continue; }
-                        if (parent_val.type != ValueType::USERDATA || !parent_val.value.p) continue;
-                        void* past = parent_val.value.p;
-                        auto pit = func_ast_nodes.find(past);
-                        if (pit != func_ast_nodes.end()) past = pit->second;
-                        Node* pnode = (Node*)past;
-                        if (!pnode || pnode->type() != NodeType::CLASS) continue;
+                        // By class name, not by looking the base's name up as a
+                        // variable: a builtin base (class E(Exception)) is a
+                        // builtin function value, and treating its pointer as a
+                        // class node crashed the interpreter.
+                        Node* pnode = classNodeByName(parent_name);
+                        if (!pnode) continue;
                         auto* pcn = static_cast<ClassNode*>(pnode);
                         if (pcn->body) {
                             for (auto& stmt : pcn->body->statements()) {
@@ -5195,6 +5210,119 @@ public:
     }
 
     // ─── TRY / EXCEPT ───────────────────────────────────────────────────
+    // ── Iteration protocol ─────────────────────────────────────────────
+    // The values a `for` over `v` visits, in order: a list's items (a
+    // generator here is a list), a map's keys, a string's characters, the
+    // numbers below an integer (what range() returns on this engine), or an
+    // instance's __iter__/__next__ protocol (a __getitem__ sequence without
+    // __iter__ is indexed from 0 until IndexError).
+    std::vector<Value> iterValues(const Value& v, Context* ctx) {
+        std::vector<Value> out;
+        if (v.type == ValueType::INTEGER) {
+            int64_t n = bigint_to_i64(v.value.i);
+            for (int64_t i = 0; i < n; i++) out.push_back(Value((int)i));
+            return out;
+        }
+        if (v.isCollectable() && v.value.gc) {
+            auto* cont = dynamic_cast<Container*>(v.value.gc);
+            if (!cont || !cont->container) return out;
+            auto li = cont->container->find("__len__");
+            int len = li != cont->container->end() ? (int)bigint_to_i64(li->second.value.i) : 0;
+            bool is_list = len > 0 || cont->container->count("0") || li != cont->container->end();
+            if (is_list) return listItems(v);
+            for (auto& [k, val] : *cont->container) {
+                if (k.empty() || k[0] == '_') continue;
+                out.push_back(makeStringValue(k));
+            }
+            return out;
+        }
+        if (isInstanceValue(v)) {
+            std::vector<Value> no_args;
+            Value iterator = v;
+            if (instanceHasMethod(v, "__iter__")) {
+                iterator = callMethod(v, "__iter__", no_args, ctx);
+                if (!isInstanceValue(iterator)) return iterValues(iterator, ctx);
+            } else if (!instanceHasMethod(v, "__next__") && instanceHasMethod(v, "__getitem__")) {
+                for (int i = 0; ; i++) {
+                    std::vector<Value> ia{Value(i)};
+                    try { out.push_back(callMethod(v, "__getitem__", ia, ctx)); }
+                    catch (std::string& flow) {
+                        if (excTypeMatches(flow, "IndexError") || excTypeMatches(flow, "StopIteration")) break;
+                        throw;
+                    }
+                }
+                return out;
+            }
+            if (!instanceHasMethod(iterator, "__next__"))
+                throw std::string("__exc__:TypeError:'" + instanceClassName(v) + "' object is not iterable");
+            while (true) {
+                try { out.push_back(callMethod(iterator, "__next__", no_args, ctx)); }
+                catch (std::string& flow) {
+                    if (excTypeMatches(flow, "StopIteration") || flow.find("StopIteration") != std::string::npos) break;
+                    throw;
+                }
+            }
+            return out;
+        }
+        if (v.type == ValueType::USERDATA && v.value.p && !func_names.count(v.value.p)) {
+            const std::string& sv = *static_cast<std::string*>(v.value.p);
+            for (size_t i = 0; i < sv.size(); i++) out.push_back(makeStringValue(std::string(1, sv[i])));
+        }
+        return out;
+    }
+    // Binds a for/comprehension target: a name, or a (nested) tuple of
+    // targets unpacked from the value.
+    void bindTarget(node_ptr target, const Value& v, Context* ctx) {
+        if (!target) return;
+        if (target->type() == NodeType::TUPLE || target->type() == NodeType::LIST) {
+            std::vector<Value> items = iterValues(v, ctx);
+            auto elems = target->statements();
+            for (size_t i = 0; i < elems.size(); i++)
+                bindTarget(elems[i], i < items.size() ? items[i] : NONE_VALUE, ctx);
+            return;
+        }
+        ctx->defineByName(target->value(), v);
+    }
+
+    Value evalComprehensionNode(node_ptr node, Context* ctx) {
+        auto cn = static_pointer_cast<ComprehensionNode>(node);
+        // The targets live in the comprehension's own scope, as in Python 3:
+        // `x = 10; [x for x in range(3)]` leaves x == 10.
+        Context* cc = new Context(runner, "<comprehension>", nullptr, nullptr, ctx);
+        CtxReaper _reap_cc(this, cc);
+        std::vector<Value> items;
+        std::vector<std::pair<Value, Value>> kvs;
+        std::function<void(size_t)> clause = [&](size_t k) {
+            auto& cl = cn->clauses[k];
+            // The first iterable is evaluated in the enclosing scope.
+            Value itv = evalNode(cl.iter, k == 0 ? ctx : cc);
+            for (auto& item : iterValues(itv, cc)) {
+                bindTarget(cl.target, item, cc);
+                bool keep = true;
+                for (auto& c : cl.conds) if (!isTruthy(evalNode(c, cc))) { keep = false; break; }
+                if (!keep) continue;
+                if (k + 1 < cn->clauses.size()) clause(k + 1);
+                else if (cn->kind == ComprehensionNode::DICT) {
+                    Value kv = evalNode(cn->elt, cc);
+                    kvs.push_back({kv, evalNode(cn->value, cc)});
+                }
+                else items.push_back(evalNode(cn->elt, cc));
+            }
+        };
+        if (!cn->clauses.empty()) clause(0);
+        if (cn->kind == ComprehensionNode::DICT) {
+            auto* cont = new Object((Runnable*)runner, "map", Type::MAP);
+            for (auto& [k, v] : kvs) (*cont->container)[getStringValue(k)] = v;
+            return Value((Collectable*)cont);
+        }
+        Value lst = makeListValue(items);
+        if (cn->kind == ComprehensionNode::SET) {
+            std::vector<Value> sa{lst};
+            return callBuiltin("set", sa, ctx);
+        }
+        return lst;
+    }
+
     Value evalComprehension(node_ptr node, Context* ctx) {
         auto cn = static_pointer_cast<ComplexNode>(node);
         if (cn->items.size() < 2) return NONE_VALUE;
@@ -5255,157 +5383,257 @@ public:
 
     }
 
+    // The ClassNode declared under `name`, or nullptr (an interface, a
+    // builtin, or nothing).
+    Node* classNodeByName(const std::string& name) {
+        auto it = class_by_name.find(name);
+        if (it == class_by_name.end()) return nullptr;
+        Node* n = (Node*)it->second;
+        return (n && n->type() == NodeType::CLASS) ? n : nullptr;
+    }
+    std::string instanceClassName(const Value& v) {
+        if (v.type != ValueType::USERDATA || !v.value.p) return std::string();
+        auto fn_it = func_names.find(v.value.p);
+        if (fn_it != func_names.end() && fn_it->second.rfind("__instance__:", 0) == 0)
+            return fn_it->second.substr(13);
+        auto cit = instance_to_class.find(v.value.p);
+        if (cit != instance_to_class.end())
+            for (auto& kv : class_by_name) if (kv.second == cit->second) return kv.first;
+        return std::string();
+    }
+    // A list value holding `items`.
+    Value makeListValue(const std::vector<Value>& items) {
+        Object* list = new Object((Runnable*)runner, "list", Type::LIST);
+        for (size_t i = 0; i < items.size(); i++) list->set(std::to_string(i), items[i]);
+        list->set("__len__", Value((int)items.size()));
+        return Value((Collectable*)list);
+    }
+    // The items of a list-like value, in order.
+    std::vector<Value> listItems(const Value& v) {
+        std::vector<Value> out;
+        if (!v.isCollectable() || !v.value.gc) return out;
+        auto* cont = dynamic_cast<Container*>(v.value.gc);
+        if (!cont || !cont->container) return out;
+        auto li = cont->container->find("__len__");
+        int n = li != cont->container->end() ? (int)bigint_to_i64(li->second.value.i) : 0;
+        for (int i = 0; i < n; i++) {
+            auto it = cont->container->find(std::to_string(i));
+            out.push_back(it != cont->container->end() ? it->second : NONE_VALUE);
+        }
+        return out;
+    }
+    // Sets an exception instance's args (and the legacy msg) from the
+    // constructor or super().__init__ arguments.
+    void setExceptionArgs(const Value& inst, const std::vector<Value>& args) {
+        auto pit = instance_properties.find(inst.value.p);
+        if (pit == instance_properties.end()) return;
+        pit->second->defineByName("args", makeListValue(args));
+        pit->second->defineByName("msg", makeStringValue(args.size() == 1 ? valueToDisplay(args[0]) : std::string()));
+    }
+    std::string valueToDisplay(const Value& v) {
+        if (v.type == ValueType::USERDATA && v.value.p && instance_to_class.count(v.value.p))
+            return instanceString(v, global_ctx);
+        if (isStringValue(v)) return getStringValue(v);
+        if (v.type == ValueType::USERDATA) return getStringValue(v);
+        std::vector<Value> sa{v};
+        return getStringValue(callBuiltin("str", sa, global_ctx));
+    }
+    // Python's BaseException.__str__ over the instance's args.
+    std::string exceptionMessage(const Value& inst) {
+        auto pit = instance_properties.find(inst.value.p);
+        if (pit == instance_properties.end()) return std::string();
+        Value a = pit->second->getByName("args");
+        std::vector<Value> items = listItems(a);
+        if (a.type == ValueType::UNDEFINED) {
+            Value m = pit->second->getByName("msg");
+            return m.type == ValueType::UNDEFINED ? std::string() : valueToDisplay(m);
+        }
+        if (items.empty()) return std::string();
+        if (items.size() == 1) return valueToDisplay(items[0]);
+        std::string r = "(";
+        for (size_t i = 0; i < items.size(); i++) { if (i) r += ", "; r += valueToDisplay(items[i]); }
+        return r + ")";
+    }
+    // str(instance): its __str__/__repr__, an exception's message, or
+    // "<Class instance>".
+    std::string instanceString(const Value& inst, Context* ctx) {
+        std::vector<Value> sa{inst};
+        return getStringValue(callBuiltin("str", sa, ctx ? ctx : global_ctx));
+    }
+
+    // ── Exceptions ──────────────────────────────────────────────────────
+    // An exception travels as a std::string: "__exc__:Type:message" for a
+    // builtin exception, "__exc__:Class:__obj__:<ptr>" for a raised instance
+    // (the instance itself is kept in exc_instance_map_), or any other string
+    // for a plain `raise "text"`.
+    std::vector<std::string> handling_exc_;   // except clauses running, innermost last (bare raise)
+
+    static std::string excTypeOf(const std::string& flow) {
+        if (flow.size() > 8 && flow.compare(0, 8, "__exc__:") == 0) {
+            size_t c = flow.find(':', 8);
+            return flow.substr(8, c == std::string::npos ? std::string::npos : c - 8);
+        }
+        return std::string();
+    }
+    Value excInstanceOf(const std::string& flow) {
+        size_t op = flow.find(":__obj__:");
+        if (op == std::string::npos || flow.compare(0, 8, "__exc__:") != 0) return NONE_VALUE;
+        uintptr_t ptr_val = 0;
+        std::istringstream iss(flow.substr(op + 9));
+        iss >> std::hex >> ptr_val;
+        auto eit = exc_instance_map_.find(reinterpret_cast<void*>(ptr_val));
+        return eit != exc_instance_map_.end() ? eit->second : NONE_VALUE;
+    }
+    // The message of an exception string: what str(e) gives in an except.
+    std::string excMessageOf(const std::string& flow) {
+        Value inst = excInstanceOf(flow);
+        if (inst.type != ValueType::NONE) return instanceString(inst, global_ctx);
+        if (flow.size() > 8 && flow.compare(0, 8, "__exc__:") == 0) {
+            size_t c = flow.find(':', 8);
+            return c == std::string::npos ? std::string() : flow.substr(c + 1);
+        }
+        return flow;
+    }
+    // "Type: message", the uncaught form.
+    std::string describeException(const std::string& flow) {
+        std::string t = excTypeOf(flow);
+        std::string m = excMessageOf(flow);
+        if (t.empty()) return m;
+        return m.empty() ? t : t + ": " + m;
+    }
+    // Whether class `cls` is `want` or derives from it - through every base
+    // of a user class, then Python's builtin exception hierarchy.
+    bool classDerivesFrom(const std::string& cls, const std::string& want, int depth = 0) {
+        if (cls == want) return true;
+        if (depth > 32 || cls.empty()) return false;
+        auto it = class_by_name.find(cls);
+        if (it != class_by_name.end()) {
+            Node* n = (Node*)it->second;
+            if (n && n->type() == NodeType::CLASS)
+                for (auto& b : static_cast<ClassNode*>(n)->bases)
+                    if (classDerivesFrom(b->value(), want, depth + 1)) return true;
+            return false;
+        }
+        return nython::ny_builtin_exc_is(cls, want);
+    }
+    bool isExceptionClass(const std::string& cls) { return classDerivesFrom(cls, "BaseException"); }
+    // Python's rule for one type named in an except clause, plus Nython's
+    // leniency: Exception/Error also catch a raised non-exception (a plain
+    // string or an instance of an unrelated class).
+    bool excTypeMatches(const std::string& flow, const std::string& t) {
+        std::string t0 = excTypeOf(flow);
+        if (t == "BaseException") return true;
+        if (t == "Exception" || t == "Error")
+            return !(classDerivesFrom(t0, "SystemExit") || classDerivesFrom(t0, "KeyboardInterrupt")
+                     || classDerivesFrom(t0, "GeneratorExit"));
+        if (t0.empty()) return flow == t;           // raise "StopIteration"
+        return classDerivesFrom(t0, t);
+    }
+    bool excClauseMatches(ExceptNode* en, const std::string& flow) {
+        if (en->types.empty()) return true;
+        for (auto& t : en->types) if (excTypeMatches(flow, t)) return true;
+        return false;
+    }
+    // A C++ exception from a builtin, as a tagged exception string.
+    static std::string excFromCpp(const std::string& what) {
+        std::string t, m;
+        if (nython::ny_split_exc_message(what, t, m)) return "__exc__:" + t + ":" + m;
+        return "__exc__:Exception:" + what;
+    }
+
     Value evalTry(node_ptr node, Context* ctx) {
         auto tn = static_pointer_cast<TryNode>(node);
         Value result = NONE_VALUE;
-
+        // The finally body runs on every way out: normal completion, return,
+        // break/continue, an exception no clause matches (which then
+        // propagates - it used to be silently dropped), and an exception
+        // raised by a handler or the else clause (it used to skip finally).
+        auto run_finally = [&]() { if (tn->finally_clause) evalNode(tn->finally_clause, ctx); };
+        std::string exc;
+        bool raised = false;
         try {
             result = evalNode(tn->body, ctx);
         }
-        catch (nython::node::ReturnSignal& rs) {
-            // Return signals: run finally, then re-throw
-            if (tn->finally_clause) evalNode(tn->finally_clause, ctx);
-            throw;
-        }
+        catch (nython::node::ReturnSignal&) { run_finally(); throw; }
+        catch (nython::node::YieldSignal&) { throw; }
         catch (std::string& flow) {
-            if (flow == "break" || flow == "continue") {
-                if (tn->finally_clause) evalNode(tn->finally_clause, ctx);
-                throw;
-            }
-            // Determine exception type and message from tagged "__exc__:TypeName:msg" or plain string
-            std::string exc_type, exc_msg;
-            if (flow.size() > 7 && flow.substr(0, 7) == "__exc__") {
-                // Format: "__exc__:TypeName:message"
-                size_t colon1 = flow.find(':', 7);
-                if (colon1 != std::string::npos) {
-                    size_t colon2 = flow.find(':', colon1 + 1);
-                    exc_type = flow.substr(colon1 + 1, colon2 == std::string::npos ? std::string::npos : colon2 - colon1 - 1);
-                    exc_msg = colon2 != std::string::npos ? flow.substr(colon2 + 1) : "";
-                }
-            } else {
-                exc_msg = flow;
-            }
-            // Find a matching except clause: typed or untyped
-            for (auto& ec : tn->except_clauses) {
-                auto en = static_pointer_cast<ExceptNode>(ec);
-                bool has_type = !en->alias.empty();
-                std::string type_filter = has_type ? en->name : "";
-                std::string err_var = has_type ? en->alias : en->name;
-                // Type filter: match exc_type or its parent classes, or generic Exception
-                bool matches = type_filter.empty()
-                    || exc_type == type_filter
-                    || type_filter == "Exception" || type_filter == "BaseException" || type_filter == "Error";
-                // Walk inheritance chain for user-defined exception classes
-                if (!matches && !exc_type.empty() && !type_filter.empty()) {
-                    std::string cur = exc_type;
-                    for (int depth = 0; depth < 16 && !cur.empty(); depth++) {
-                        auto cbit = class_by_name.find(cur);
-                        if (cbit == class_by_name.end()) break;
-                        auto pit = class_parent.find(cbit->second);
-                        if (pit == class_parent.end()) break;
-                        cur = pit->second;
-                        if (cur == type_filter) { matches = true; break; }
-                    }
-                }
-                if (!matches) continue;
-                if (!err_var.empty()) {
-                    // Check if this is a class instance exception: __exc__:Type:__obj__:<ptr>
-                    bool bound_instance = false;
-                    if (flow.find("__obj__:") != std::string::npos) {
-                        size_t obj_pos = flow.find("__obj__:");
-                        if (obj_pos != std::string::npos) {
-                            uintptr_t ptr_val = 0;
-                            std::istringstream iss(flow.substr(obj_pos + 8));
-                            iss >> std::hex >> ptr_val;
-                            void* inst_ptr = reinterpret_cast<void*>(ptr_val);
-                            auto eit = exc_instance_map_.find(inst_ptr);
-                            if (eit != exc_instance_map_.end()) {
-                                ctx->defineByName(err_var, eit->second);
-                                bound_instance = true;
-                            }
-                        }
-                    }
-                    if (!bound_instance) ctx->defineByName(err_var, makeStringValue(exc_msg));
-                }
-                try { result = evalNode(en->body, ctx); }
-                catch (nython::node::ReturnSignal&) { if (tn->finally_clause) evalNode(tn->finally_clause, ctx); throw; }
-                break;
-            }
-            if (tn->finally_clause) evalNode(tn->finally_clause, ctx);
-            return result;
+            if (flow == "break" || flow == "continue") { run_finally(); throw; }
+            exc = flow; raised = true;
         }
-        catch (std::exception& e) {
-            std::string exc_msg = e.what();
-            for (auto& ec : tn->except_clauses) {
-                auto en = static_pointer_cast<ExceptNode>(ec);
-                bool has_type = !en->alias.empty();
-                std::string err_var = has_type ? en->alias : en->name;
-                if (!err_var.empty()) ctx->defineByName(err_var, makeStringValue(exc_msg));
-                try { result = evalNode(en->body, ctx); }
-                catch (nython::node::ReturnSignal&) { if (tn->finally_clause) evalNode(tn->finally_clause, ctx); throw; }
-                break;
+        catch (std::exception& e) { exc = excFromCpp(e.what()); raised = true; }
+
+        if (!raised) {
+            if (tn->else_clause) {
+                try { result = evalNode(tn->else_clause, ctx); }
+                catch (nython::node::YieldSignal&) { throw; }
+                catch (...) { run_finally(); throw; }
             }
-            if (tn->finally_clause) evalNode(tn->finally_clause, ctx);
-            return result;
-        }
-        catch (...) {
-            for (auto& ec : tn->except_clauses) {
-                auto en = static_pointer_cast<ExceptNode>(ec);
-                bool has_type = !en->alias.empty();
-                std::string err_var = has_type ? en->alias : en->name;
-                if (!err_var.empty()) ctx->defineByName(err_var, makeStringValue("unknown error"));
-                try { result = evalNode(en->body, ctx); }
-                catch (nython::node::ReturnSignal&) { if (tn->finally_clause) evalNode(tn->finally_clause, ctx); throw; }
-                break;
-            }
-            if (tn->finally_clause) evalNode(tn->finally_clause, ctx);
+            run_finally();
             return result;
         }
 
-        // No exception: run else clause, then finally
-        if (tn->else_clause) result = evalNode(tn->else_clause, ctx);
-        if (tn->finally_clause) evalNode(tn->finally_clause, ctx);
+        ExceptNode* match = nullptr;
+        for (auto& ec : tn->except_clauses) {
+            auto* en = static_cast<ExceptNode*>(ec.get());
+            if (excClauseMatches(en, exc)) { match = en; break; }
+        }
+        if (!match) { run_finally(); throw exc; }
+
+        if (!match->var.empty()) {
+            Value inst = excInstanceOf(exc);
+            if (inst.type != ValueType::NONE) ctx->defineByName(match->var, inst);
+            else ctx->defineByName(match->var, makeStringValue(excMessageOf(exc)));
+        }
+        handling_exc_.push_back(exc);
+        struct PopHandling { std::vector<std::string>& v; ~PopHandling() { v.pop_back(); } } _ph{handling_exc_};
+        try { result = evalNode(match->body, ctx); }
+        catch (nython::node::YieldSignal&) { throw; }
+        catch (...) { run_finally(); throw; }
+        run_finally();
         return result;
     }
 
     Value evalRaise(node_ptr node, Context* ctx) {
         auto rn = static_pointer_cast<RaiseNode>(node);
-        if (rn->expr) {
-            Value v = evalNode(rn->expr, ctx);
-            // Class instance (user-defined exception class)
-            if (v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p)) {
-                // Check if it's a class instance
-                auto cit = instance_to_class.find(v.value.p);
-                if (cit != instance_to_class.end()) {
-                    // Get class name from func_names for the instance ("__instance__:ClassName")
-                    std::string class_name;
-                    auto fn_it = func_names.find(v.value.p);
-                    if (fn_it != func_names.end() && fn_it->second.find("__instance__:") == 0)
-                        class_name = fn_it->second.substr(13);
-                    if (class_name.empty()) {
-                        // fallback: search class_by_name
-                        for (auto& kv : class_by_name)
-                            if (kv.second == cit->second) { class_name = kv.first; break; }
-                    }
-                    std::ostringstream oss;
-                    oss << "__exc__:" << class_name << ":__obj__:" << std::hex << reinterpret_cast<uintptr_t>(v.value.p);
-                    exc_instance_map_[v.value.p] = v;
-                    throw std::string(oss.str());
+        if (!rn->expr) {
+            // Bare `raise`: the exception the enclosing except clause is
+            // handling (it used to raise the string "Exception").
+            if (!handling_exc_.empty()) throw std::string(handling_exc_.back());
+            throw std::string("__exc__:RuntimeError:No active exception to reraise");
+        }
+        Value v = evalNode(rn->expr, ctx);
+        // `raise SomeClass` raises a new instance of it.
+        if (v.type == ValueType::USERDATA && v.value.p) {
+            auto fit = func_names.find(v.value.p);
+            if (fit != func_names.end()) {
+                if (fit->second.rfind("__class__:", 0) == 0) {
+                    std::vector<Value> none_args;
+                    v = callFunctionValue(v, none_args, ctx);
+                } else if (fit->second.rfind("__builtin__:", 0) == 0
+                           && nython::ny_is_builtin_exc(fit->second.substr(12))) {
+                    throw std::string("__exc__:" + fit->second.substr(12) + ":");
                 }
-                // Check if it's a tagged __exc__ string
-                std::string msg = getStringValue(v);
-                if (msg.size() > 7 && msg.substr(0, 7) == "__exc__") throw msg;
-                throw msg;
-            } else if (v.type == ValueType::USERDATA && v.value.p && string_ptrs_.count(v.value.p)) {
-                // Plain string raise
-                throw getStringValue(v);
-            } else if (v.type == ValueType::NONE) {
-                throw std::string("Exception");
-            } else {
-                throw std::string(v.toString());
             }
         }
-        throw std::string("Exception");
+        if (v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p)) {
+            auto cit = instance_to_class.find(v.value.p);
+            if (cit != instance_to_class.end()) {
+                std::string class_name = instanceClassName(v);
+                if (rn->cause) {
+                    Value cause = evalNode(rn->cause, ctx);
+                    auto pit = instance_properties.find(v.value.p);
+                    if (pit != instance_properties.end()) pit->second->defineByName("__cause__", cause);
+                }
+                std::ostringstream oss;
+                oss << "__exc__:" << class_name << ":__obj__:" << std::hex << reinterpret_cast<uintptr_t>(v.value.p);
+                exc_instance_map_[v.value.p] = v;
+                throw std::string(oss.str());
+            }
+            throw getStringValue(v);
+        }
+        if (v.type == ValueType::USERDATA && v.value.p) throw getStringValue(v);   // a string
+        if (v.type == ValueType::NONE) throw std::string("__exc__:Exception:");
+        throw std::string(v.toString());
     }
 
     Value evalAssert(node_ptr node, Context* ctx) {
@@ -6467,34 +6695,154 @@ public:
         return NONE_VALUE;
     }
 
+    // ── Classes: method resolution order ────────────────────────────────
+    // C3 linearisation over the declared bases (resolved by class name),
+    // the order Python uses; a hierarchy C3 rejects falls back to depth-first
+    // left-to-right. Bases that are not user classes (a builtin exception,
+    // an interface) have no node and are left out here.
+    std::unordered_map<Node*, std::vector<Node*>> mro_cache_;
+    std::vector<Node*> classMro(Node* cls) {
+        if (!cls || cls->type() != NodeType::CLASS) return {};
+        auto it = mro_cache_.find(cls);
+        if (it != mro_cache_.end()) return it->second;
+        mro_cache_[cls] = {cls};                    // guards against a cycle
+        std::vector<std::vector<Node*>> seqs;
+        std::vector<Node*> direct;
+        for (auto& b : static_cast<ClassNode*>(cls)->bases) {
+            Node* bn = classNodeByName(b->value());
+            if (!bn || bn == cls) continue;
+            seqs.push_back(classMro(bn));
+            direct.push_back(bn);
+        }
+        seqs.push_back(direct);
+        std::vector<Node*> out{cls};
+        bool ok = true;
+        while (true) {
+            bool any = false;
+            for (auto& sq : seqs) if (!sq.empty()) { any = true; break; }
+            if (!any) break;
+            Node* pick = nullptr;
+            for (auto& sq : seqs) {
+                if (sq.empty()) continue;
+                Node* cand = sq[0];
+                bool in_tail = false;
+                for (auto& sq2 : seqs)
+                    for (size_t k = 1; k < sq2.size(); k++) if (sq2[k] == cand) { in_tail = true; break; }
+                if (!in_tail) { pick = cand; break; }
+            }
+            if (!pick) { ok = false; break; }
+            out.push_back(pick);
+            for (auto& sq : seqs) if (!sq.empty() && sq[0] == pick) sq.erase(sq.begin());
+        }
+        if (!ok) {
+            out = {cls};
+            std::vector<Node*> todo(direct.begin(), direct.end());
+            while (!todo.empty()) {
+                Node* k = todo.front(); todo.erase(todo.begin());
+                if (std::find(out.begin(), out.end(), k) != out.end()) continue;
+                out.push_back(k);
+                size_t at = 0;
+                for (auto& b : static_cast<ClassNode*>(k)->bases) {
+                    Node* bn = classNodeByName(b->value());
+                    if (bn) todo.insert(todo.begin() + (long)(at++), bn);
+                }
+            }
+        }
+        mro_cache_[cls] = out;
+        return out;
+    }
+    // A member defined in the body of class `cls` or a class after it in its
+    // MRO: its value in that class's own namespace (not the enclosing
+    // scope's), and the class that defines it.
+    bool findClassMember(Node* cls, const std::string& name, Value& out, Node** owner = nullptr,
+                         Node* after = nullptr) {
+        std::vector<Node*> mro = classMro(cls);
+        size_t start = 0;
+        if (after) {
+            for (size_t i = 0; i < mro.size(); i++) if (mro[i] == after) { start = i + 1; break; }
+        }
+        for (size_t i = start; i < mro.size(); i++) {
+            auto cit = class_ctx_map_.find((void*)mro[i]);
+            if (cit == class_ctx_map_.end() || !cit->second || !cit->second->container) continue;
+            auto vit = cit->second->container->find(name);
+            if (vit == cit->second->container->end()) continue;
+            out = vit->second;
+            if (owner) *owner = mro[i];
+            return true;
+        }
+        return false;
+    }
+    Node* classNodeOfInstance(const Value& v) {
+        if (v.type != ValueType::USERDATA || !v.value.p) return nullptr;
+        auto it = instance_to_class.find(v.value.p);
+        if (it == instance_to_class.end()) return nullptr;
+        Node* n = (Node*)it->second;
+        return (n && n->type() == NodeType::CLASS) ? n : nullptr;
+    }
+    bool isInstanceValue(const Value& v) {
+        return v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p)
+               && instance_to_class.count(v.value.p);
+    }
+    bool instanceHasMethod(const Value& v, const std::string& name) {
+        Node* cn = classNodeOfInstance(v);
+        Value m;
+        return cn && findClassMember(cn, name, m);
+    }
+    // The class value of an exception string's type (the class itself for a
+    // user class, the builtin for a builtin exception), for __exit__.
+    Value exceptionClassValue(const std::string& flow) {
+        std::string t = excTypeOf(flow);
+        if (t.empty()) t = "Exception";
+        Node* cn = classNodeByName(t);
+        if (cn) { Value cv; cv.type = ValueType::USERDATA; cv.value.p = (void*)cn; return cv; }
+        Value bv = global_ctx->getByName(t);
+        return bv.type == ValueType::UNDEFINED ? makeStringValue(t) : bv;
+    }
+
+    // with E as x: body. __enter__'s result is bound (the object itself when
+    // it has none); __exit__ runs on every way out, with (type, value, none)
+    // for an exception - a truthy result suppresses it - and (none, none,
+    // none) otherwise. It used to be called with no arguments at all, and
+    // its result was ignored.
     Value evalWith(node_ptr node, Context* ctx) {
         auto wn = static_pointer_cast<WithNode>(node);
         Value v = evalNode(wn->expr, ctx);
-        // Call __enter__ if it exists
+        bool managed = isInstanceValue(v);
         Value ctx_val = v;
-        if (v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p) && instance_to_class.count(v.value.p)) {
+        if (managed && instanceHasMethod(v, "__enter__")) {
             std::vector<Value> no_args;
-            Value enter_result = callMethod(v, "__enter__", no_args, ctx);
-            if (enter_result.type != ValueType::NONE) ctx_val = enter_result;
+            ctx_val = callMethod(v, "__enter__", no_args, ctx);
         }
         if (!wn->alias.empty()) ctx->defineByName(wn->alias, ctx_val);
-        // Execute body, then call __exit__
+        auto exit_plain = [&]() {
+            if (!managed || !instanceHasMethod(v, "__exit__")) return;
+            std::vector<Value> a{NONE_VALUE, NONE_VALUE, NONE_VALUE};
+            callMethod(v, "__exit__", a, ctx);
+        };
+        auto exit_exc = [&](const std::string& flow) -> bool {
+            if (!managed || !instanceHasMethod(v, "__exit__")) return false;
+            Value inst = excInstanceOf(flow);
+            Value ev = inst.type != ValueType::NONE ? inst : makeStringValue(excMessageOf(flow));
+            std::vector<Value> a{exceptionClassValue(flow), ev, NONE_VALUE};
+            return isTruthy(callMethod(v, "__exit__", a, ctx));
+        };
         Value result = NONE_VALUE;
         try {
             result = evalNode(wn->body, ctx);
-        } catch (...) {
-            // Call __exit__ even on exception
-            if (v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p) && instance_to_class.count(v.value.p)) {
-                std::vector<Value> no_args;
-                callMethod(v, "__exit__", no_args, ctx);
-            }
+        }
+        catch (nython::node::ReturnSignal&) { exit_plain(); throw; }
+        catch (nython::node::YieldSignal&) { throw; }
+        catch (std::string& flow) {
+            if (flow == "break" || flow == "continue") { exit_plain(); throw; }
+            if (exit_exc(flow)) return NONE_VALUE;
             throw;
         }
-        // Call __exit__ on normal completion
-        if (v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p) && instance_to_class.count(v.value.p)) {
-            std::vector<Value> no_args;
-            callMethod(v, "__exit__", no_args, ctx);
+        catch (std::exception& e) {
+            std::string flow = excFromCpp(e.what());
+            if (exit_exc(flow)) return NONE_VALUE;
+            throw flow;
         }
+        exit_plain();
         return result;
     }
 
