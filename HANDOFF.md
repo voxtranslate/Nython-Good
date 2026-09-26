@@ -141,6 +141,16 @@ models rather than copied:
   paste spreads one line per caret when the counts match (VS Code's
   "spread"). Copy, cut and paste with several selections used to act on the
   primary only.
+- **Split editor**: two editor groups, side by side (Ctrl+\\) or stacked
+  (Ctrl+K Ctrl+\\; Shift+Alt+0 toggles). Each group has its own document,
+  caret, selection and scroll, even on the same file. Ctrl+1 / Ctrl+2 move
+  the focus, a click in the other group focuses it, and the wheel scrolls
+  it without taking the focus. The sash drags, and Join Editor Groups
+  closes the split. Painting uses one painter: the other group's view is
+  kept in scalars and swapped in, so the split allocates nothing per frame
+  (`ide_memprobe.py` measures it against plain hover at the same point).
+  The status bar's build target no longer lists the workspace folder on
+  every frame.
 - **Keymaps**: VS Code or Code::Blocks (`CB_KEYMAP`: F9, Ctrl+F9, Ctrl+D,
   ...). *Change Keybinding* captures a pressed key. Bindings are saved in
   `.nyide` (`keybinding = Ctrl+Alt+M | command.id`).
@@ -173,7 +183,7 @@ Defects found while driving these, all fixed:
   `len(prefix)` characters, not the ones the fuzzy matcher matched.
 
 e2e scenarios added: `build`, `cbedit`, `cbtools`, `cbdebug`, `responsive`,
-`session`, `columns`.
+`session`, `columns`, `split`.
 
 ---
 

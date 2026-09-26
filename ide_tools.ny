@@ -146,6 +146,31 @@ class IDETools(IDEViews):
         # Column selection: two corners, rows and text-area x (pixels from
         # the text origin, so tabs line up by what is on screen).
         self.column_mode = false
+        # Split editor: two editor groups, "cols" (side by side) or "rows"
+        # (stacked). The active group's document and view live in the usual
+        # places (self.active, the doc's scroll and selection, the buffer's
+        # caret); the other group's are kept in these scalars and swapped in
+        # to paint it, so painting a split allocates nothing per frame.
+        self.st_target = ""
+        self.st_target_t = 0
+        self.st_target_sel = ""
+        self.split_on = false
+        self.split_dir = "cols"
+        self.split_ratio = 0.5
+        self.group = 0
+        self.ps_doc = none
+        self.ps_sx = 0
+        self.ps_sy = 0
+        self.ps_son = false
+        self.ps_srow = 0
+        self.ps_scol = 0
+        self.ps_crow = 0
+        self.ps_ccol = 0
+        self.pane_selmodel = SelectionModel()
+        self.area_x = 0
+        self.area_w = 0
+        self.area_crumb = 0
+        self.area_bottom = 0
         self.box_doc = none
         self.box_r0 = 0
         self.box_x0 = 0
@@ -216,6 +241,14 @@ class IDETools(IDEViews):
         c._cmd("cursorColumnSelectLeft", "Selection", "Column Select Left", "Ctrl+Shift+Alt+Left", "editorFocus")
         c._cmd("cursorColumnSelectRight", "Selection", "Column Select Right", "Ctrl+Shift+Alt+Right", "editorFocus")
         c._cmd("editor.action.toggleColumnSelection", "Selection", "Column Selection Mode", "", "editorFocus")
+        # Split editor (VS Code's editor groups; Code::Blocks' Split view).
+        c._cmd("workbench.action.splitEditor", "View", "Split Editor Right", "Ctrl+\\", "")
+        c._cmd("workbench.action.splitEditorDown", "View", "Split Editor Down", "Ctrl+K Ctrl+\\", "")
+        c._cmd("workbench.action.joinAllGroups", "View", "Join Editor Groups", "", "")
+        c._cmd("workbench.action.toggleEditorGroupLayout", "View", "Toggle Vertical/Horizontal Editor Layout", "Shift+Alt+0", "")
+        c._cmd("workbench.action.focusFirstEditorGroup", "View", "Focus First Editor Group", "Ctrl+1", "")
+        c._cmd("workbench.action.focusSecondEditorGroup", "View", "Focus Second Editor Group", "Ctrl+2", "")
+        c._cmd("workbench.action.focusOtherEditorGroup", "View", "Focus Other Editor Group", "", "")
 
         # Menus: Code::Blocks' Build and Tools join VS Code's bar.
         self.menus = ["File", "Edit", "Selection", "View", "Go", "Build", "Run", "Terminal", "Tools", "Help"]
@@ -236,6 +269,10 @@ class IDETools(IDEViews):
         vw.append("editor.unfold")
         vw.append("editor.foldAll")
         vw.append("editor.unfoldAll")
+        vw.append("-")
+        vw.append("workbench.action.splitEditor")
+        vw.append("workbench.action.splitEditorDown")
+        vw.append("workbench.action.joinAllGroups")
         vw.append("-")
         vw.append("nython.showBuildLog")
         vw.append("nython.todo")
@@ -294,6 +331,29 @@ class IDETools(IDEViews):
             self._box_key("left")
         elif id == "cursorColumnSelectRight":
             self._box_key("right")
+        elif id == "workbench.action.splitEditor":
+            self._split_open("cols")
+        elif id == "workbench.action.splitEditorDown":
+            self._split_open("rows")
+        elif id == "workbench.action.joinAllGroups":
+            self._split_close()
+        elif id == "workbench.action.toggleEditorGroupLayout":
+            if self.split_on:
+                if self.split_dir == "cols":
+                    self.split_dir = "rows"
+                else:
+                    self.split_dir = "cols"
+                self._layout()
+        elif id == "workbench.action.focusFirstEditorGroup":
+            self._group_focus(0)
+        elif id == "workbench.action.focusSecondEditorGroup":
+            if not self.split_on:
+                self._split_open("cols")
+            else:
+                self._group_focus(1)
+        elif id == "workbench.action.focusOtherEditorGroup":
+            if self.split_on:
+                self._group_focus(1 - self.group)
         elif id == "editor.action.toggleColumnSelection":
             self.column_mode = not self.column_mode
             if self.column_mode:
@@ -463,6 +523,17 @@ class IDETools(IDEViews):
             if n == 1:
                 return found
         return ""
+
+    # The status bar's target name, re-read at most every two seconds: the
+    # lookup lists the workspace folder for a .nyproj, which the status bar
+    # used to do on every frame.
+    def _status_target(self):
+        var now = time_ms()
+        if now - self.st_target_t > 2000 or self.st_target == "" or self.st_target_sel != self.build_target:
+            self.st_target_t = now
+            self.st_target_sel = self.build_target
+            self.st_target = self._active_target()["name"]
+        return self.st_target
 
     def _targets_list(self):
         var man = self._manifest()
@@ -1039,6 +1110,261 @@ class IDETools(IDEViews):
                 last = r
             i = i + 1
         return out
+
+    # ══ split editor ═══════════════════════════════════════════════════════════
+    # The new group shows the same document at the same place and takes the
+    # focus, as in VS Code; either group can then open any document (tabs,
+    # Quick Open, the explorer open into the focused group).
+    def _split_open(self, dir):
+        if self.split_on:
+            self.split_dir = dir
+            self._layout()
+            return
+        var d = self.doc()
+        self.split_on = true
+        self.split_dir = dir
+        self.split_ratio = 0.5
+        self.ps_doc = d
+        self.ps_sx = d.scroll_x
+        self.ps_sy = d.scroll_y
+        self.ps_son = d.sel_on
+        self.ps_srow = d.sel_row
+        self.ps_scol = d.sel_col
+        self.ps_crow = 0
+        self.ps_ccol = 0
+        if d.buf != none:
+            self.ps_crow = d.buf.cursor_row
+            self.ps_ccol = d.buf.cursor_col
+        self.group = 1
+        self._layout()
+        self.status_msg = "Editor split: Ctrl+1 / Ctrl+2 move between the groups"
+
+    def _split_close(self):
+        if not self.split_on:
+            return
+        self.split_on = false
+        self.ps_doc = none
+        self.group = 0
+        self._layout()
+
+    def _doc_index(self, d):
+        var i = 0
+        while i < len(self.docs):
+            if self.docs[i] == d:
+                return i
+            i = i + 1
+        return -1
+
+    # Exchanges the live view (active document, its scroll, selection and
+    # caret) with the other group's. False (and the split closed) when the
+    # other group's document is no longer open.
+    def _pane_swap(self):
+        var oi = self._doc_index(self.ps_doc)
+        if oi < 0:
+            self._split_close()
+            return false
+        var d = self.doc()
+        var sx = d.scroll_x
+        var sy = d.scroll_y
+        var son = d.sel_on
+        var srow = d.sel_row
+        var scol = d.sel_col
+        var crow = 0
+        var ccol = 0
+        if d.buf != none:
+            crow = d.buf.cursor_row
+            ccol = d.buf.cursor_col
+        var od = self.ps_doc
+        self.active = oi
+        od.scroll_x = self.ps_sx
+        od.scroll_y = self.ps_sy
+        od.sel_on = self.ps_son
+        od.sel_row = self.ps_srow
+        od.sel_col = self.ps_scol
+        if od.buf != none:
+            var r = self.ps_crow
+            if r >= od.buf.line_count:
+                r = od.buf.line_count - 1
+            od.buf.cursor_row = r
+            var c = self.ps_ccol
+            if c > len(od.buf.get_line(r)):
+                c = len(od.buf.get_line(r))
+            od.buf.cursor_col = c
+            if od.sel_row >= od.buf.line_count:
+                od.sel_on = false
+        self.ps_doc = d
+        self.ps_sx = sx
+        self.ps_sy = sy
+        self.ps_son = son
+        self.ps_srow = srow
+        self.ps_scol = scol
+        self.ps_crow = crow
+        self.ps_ccol = ccol
+        return true
+
+    def _group_focus(self, g):
+        if not self.split_on or g == self.group:
+            return
+        self._clear_extra_carets()
+        self.ac_open = false
+        if not self._pane_swap():
+            return
+        self.group = g
+        self.focus = "editor"
+        self._layout()
+        self._title_dirty = true
+
+    # [x, w, crumb_y, bottom] of group g inside the editor area.
+    def _pane_x(self, g):
+        if self.split_dir == "rows" or g == 0:
+            return self.area_x
+        return self.area_x + self._split_first_w()
+
+    def _split_first_w(self):
+        var w = int(self.area_w * self.split_ratio)
+        if w < self.dp(160):
+            w = self.dp(160)
+        if w > self.area_w - self.dp(160):
+            w = self.area_w - self.dp(160)
+        return w
+
+    def _pane_w(self, g):
+        if self.split_dir == "rows":
+            return self.area_w
+        if g == 0:
+            return self._split_first_w()
+        return self.area_w - self._split_first_w()
+
+    def _split_mid_y(self):
+        var h = self.area_bottom - self.area_crumb
+        var m = self.area_crumb + int(h * self.split_ratio)
+        var lo = self.area_crumb + self.CRUMB_H + self.dp(60)
+        var hi = self.area_bottom - self.CRUMB_H - self.dp(60)
+        if m < lo:
+            m = lo
+        if m > hi:
+            m = hi
+        return m
+
+    def _pane_top(self, g):
+        if self.split_dir == "rows" and g == 1:
+            return self._split_mid_y()
+        return self.area_crumb
+
+    def _pane_bottom(self, g):
+        if self.split_dir == "rows" and g == 0:
+            return self._split_mid_y()
+        return self.area_bottom
+
+    # Makes group g's rectangle the editor geometry every painter and the
+    # input code read (col_x/col_w are restored to the whole area after).
+    def _apply_geom(self, g):
+        var x = self._pane_x(g)
+        var w = self._pane_w(g)
+        self.col_x = x
+        self.col_w = w
+        self.crumb_y = self._pane_top(g)
+        self.ed_x = x
+        self.ed_y = self.crumb_y + self.CRUMB_H
+        self.ed_h = self._pane_bottom(g) - self.ed_y
+        if self.ed_h < 40:
+            self.ed_h = 40
+        self.mm_w = 0
+        if self.minimap_on and w > self.dp(560):
+            self.mm_w = self.MINIMAP_W
+        self.ed_w = w - self.mm_w - self.vs_w
+        self._gutter_calc()
+
+    # From _layout: remember the whole editor area, then make the focused
+    # group's rectangle current.
+    def _split_layout(self):
+        self.area_x = self.col_x
+        self.area_w = self.col_w
+        self.area_crumb = self.crumb_y
+        self.area_bottom = self.panel_y
+        if not self.split_on:
+            return
+        self._apply_geom(self.group)
+        self.col_x = self.area_x
+        self.col_w = self.area_w
+
+    def _draw_pane(self, r, active):
+        if active:
+            self._draw_breadcrumbs(r)
+        else:
+            # The other group's header: its file name (no symbol path, which
+            # would be rebuilt every frame as the two groups alternate).
+            var th = self.th
+            r.fill_xywh(self.col_x, self.crumb_y, self.col_w, self.CRUMB_H, th.editor_bg)
+            r.text(self.doc().title, self.col_x + self.dp(14), self.crumb_y + int((self.CRUMB_H - self.small_h) / 2), self.f_small, th.text_faint)
+        if self.doc().kind == "welcome":
+            self._draw_welcome(r)
+        else:
+            self._draw_editor(r)
+            if self.mm_w > 0:
+                self._draw_minimap(r)
+            self._draw_vscroll(r)
+            if active and self.find_open:
+                self._draw_find(r)
+
+    def _draw_split(self, r):
+        var th = self.th
+        var other = 1 - self.group
+        if not self._pane_swap():
+            self._layout()
+            return false
+        self._apply_geom(other)
+        var f = self.focus
+        self.focus = "group"
+        var sm = self.selmodel
+        self.selmodel = self.pane_selmodel
+        self._draw_pane(r, false)
+        self.selmodel = sm
+        self.focus = f
+        # Any click in the other group first focuses it (_tools_click).
+        var ox = self.col_x
+        var ow = self.col_w
+        var oy = self.crumb_y
+        var oh = self._pane_bottom(other) - oy
+        self._hit(ox, oy, ow, oh, "@group.focus", other, "")
+        self._pane_swap()
+        self._apply_geom(self.group)
+        self._draw_pane(r, true)
+        # The focused group's header carries the accent, as a focus border.
+        r.fill_xywh(self.col_x, self.crumb_y, self.col_w, self.dp(1), th.focus)
+        # The sash between the groups: a line, and a wider grip to drag.
+        if self.split_dir == "cols":
+            var sx = self.area_x + self._split_first_w()
+            r.fill_xywh(sx, self.area_crumb, 1, self.area_bottom - self.area_crumb, th.panel_border)
+            self._hit(sx - self.dp(3), self.area_crumb, self.dp(6), self.area_bottom - self.area_crumb, "@split.sash", "", "")
+        else:
+            var sy = self._split_mid_y()
+            r.fill_xywh(self.area_x, sy, self.area_w, 1, th.panel_border)
+            self._hit(self.area_x, sy - self.dp(3), self.area_w, self.dp(6), "@split.sash", "", "")
+        self.col_x = self.area_x
+        self.col_w = self.area_w
+        return true
+
+    def _split_drag(self, x, y):
+        if self.split_dir == "cols":
+            if self.area_w > 0:
+                self.split_ratio = (x - self.area_x) * 1.0 / self.area_w
+        else:
+            var h = self.area_bottom - self.area_crumb
+            if h > 0:
+                self.split_ratio = (y - self.area_crumb) * 1.0 / h
+        if self.split_ratio < 0.1:
+            self.split_ratio = 0.1
+        if self.split_ratio > 0.9:
+            self.split_ratio = 0.9
+        self._layout()
+
+    # A click in the unfocused group focuses it, then acts there.
+    def _group_click(self, g, e):
+        self._group_focus(g)
+        if e.x >= self.ed_x and e.x < self.ed_x + self.ed_w and e.y >= self.ed_y and e.y < self.ed_y + self.ed_h and self._is_text():
+            if e.x >= self.ed_x + self.GUTTER_W:
+                self._editor_click(e)
 
     # ══ column (box) selection ═════════════════════════════════════════════════
     # Each row of the box becomes one selection of the multi-cursor model
@@ -2172,6 +2498,11 @@ class IDETools(IDEViews):
     # Developer: Dump Workbench State - what these features believe.
     def _tools_dump(self, st):
         var d = self.doc()
+        st["split"] = ""
+        if self.split_on:
+            st["split"] = self.split_dir
+        st["group"] = self.group
+        st["split_ratio"] = self.split_ratio
         if d.buf != none:
             st["bookmarks"] = d.bookmarks
             st["folds"] = d.folds
@@ -2629,6 +2960,12 @@ class IDETools(IDEViews):
 
     # ══ clicks this file owns ══════════════════════════════════════════════════
     def _tools_click(self, cmd, arg, e):
+        if cmd == "@group.focus":
+            self._group_click(arg, e)
+            return true
+        if cmd == "@split.sash":
+            self.dragging = "splitsash"
+            return true
         if cmd == "@todo.item":
             if arg < len(self.todo_items):
                 var it = self.todo_items[arg]

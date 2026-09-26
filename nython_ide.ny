@@ -539,6 +539,10 @@ class NythonIDE(IDETools):
             want = "sizewe"
         elif cmd == "@split.panel":
             want = "sizens"
+        elif cmd == "@split.sash":
+            want = "sizewe"
+            if self.split_dir == "rows":
+                want = "sizens"
         elif cmd != "" and not string_startswith(cmd, "@side") and cmd != "@menu.bg" and cmd != "@qi.bg" and cmd != "@overlay.dismiss" and cmd != "@panel.body" and cmd != "@tabstrip" and cmd != "@modal.scrim" and cmd != "@qi.dismiss" and cmd != "@find.bg":
             want = "hand"
         if want != self.cursor_shape:
@@ -606,6 +610,8 @@ class NythonIDE(IDETools):
             self._drag_select(x, y)
         elif d == "box":
             self._box_drag(x, y)
+        elif d == "splitsash":
+            self._split_drag(x, y)
         elif d == "lines":
             var p = self._pos_at(x, y)
             var b = self.buf()
@@ -692,6 +698,18 @@ class NythonIDE(IDETools):
                 col = col + 1
         return [row, col]
 
+    def _on_wheel_editor(self, e, dy):
+        if not self._is_text():
+            return
+        var d = self.doc()
+        if e.shift:
+            d.scroll_x = d.scroll_x - dy * self.char_w * 6
+            if d.scroll_x < 0:
+                d.scroll_x = 0
+        else:
+            d.scroll_y = d.scroll_y - dy * self.LINE_H * 3
+            self._clamp_scroll()
+
     def _on_wheel(self, e):
         if e.x > 0 or e.y > 0:
             self.mx = e.x
@@ -710,6 +728,18 @@ class NythonIDE(IDETools):
         if h == none:
             return
         var c = h.cmd
+        if c == "@group.focus":
+            # Scrolling the other group scrolls it without moving the focus
+            # (or touching the focused group's carets).
+            var g = self.group
+            if self._pane_swap():
+                self.group = h.arg
+                self._layout()
+                self._on_wheel_editor(e, dy)
+                self._pane_swap()
+                self.group = g
+                self._layout()
+            return
         if e.ctrl and (c == "@editor" or c == "@gutter.glyph" or c == "@gutter.num" or c == "@gutter.fold"):
             if dy > 0:
                 self._zoom(1)
@@ -717,16 +747,7 @@ class NythonIDE(IDETools):
                 self._zoom(0 - 1)
             return
         if c == "@editor" or c == "@gutter.glyph" or c == "@gutter.num" or c == "@gutter.fold" or c == "@minimap" or c == "@vscroll" or c == "@find.bg":
-            if not self._is_text():
-                return
-            var d = self.doc()
-            if e.shift:
-                d.scroll_x = d.scroll_x - dy * self.char_w * 6
-                if d.scroll_x < 0:
-                    d.scroll_x = 0
-            else:
-                d.scroll_y = d.scroll_y - dy * self.LINE_H * 3
-                self._clamp_scroll()
+            self._on_wheel_editor(e, dy)
         elif c == "@ac.item":
             self.ac_top = self.ac_top - dy
             if self.ac_top > self.ac_n - 10:

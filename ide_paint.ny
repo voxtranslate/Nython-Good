@@ -315,6 +315,7 @@ class IDEPaint(IDEOps):
         self.workshop.set_pos(self.col_x + 10, self.panel_y + self.PANEL_HEAD + 6)
         self.workshop.set_size(self.col_w - 20, self.panel_h - self.PANEL_HEAD - 12)
         self._gutter_calc()
+        self._split_layout()
 
     # Gutter = glyph margin (breakpoints) + line numbers + change bar.
     def _gutter_calc(self):
@@ -518,16 +519,17 @@ class IDEPaint(IDEOps):
         if self.side_w > 0 and not self.side_overlay:
             self._draw_sidebar(r)
         self._draw_tabs(r)
-        self._draw_breadcrumbs(r)
-        if self.doc().kind == "welcome":
-            self._draw_welcome(r)
-        else:
-            self._draw_editor(r)
-            if self.mm_w > 0:
-                self._draw_minimap(r)
-            self._draw_vscroll(r)
-            if self.find_open:
-                self._draw_find(r)
+        if not self.split_on or not self._draw_split(r):
+            self._draw_breadcrumbs(r)
+            if self.doc().kind == "welcome":
+                self._draw_welcome(r)
+            else:
+                self._draw_editor(r)
+                if self.mm_w > 0:
+                    self._draw_minimap(r)
+                self._draw_vscroll(r)
+                if self.find_open:
+                    self._draw_find(r)
         if self.panel_h > 0:
             self._draw_panel(r)
         if self.side_w > 0 and self.side_overlay:
@@ -1271,7 +1273,7 @@ class IDEPaint(IDEOps):
         var x0 = self.ed_x
         var y0 = self.crumb_y
         var w = self.col_w
-        var h = self.panel_y - y0
+        var h = self.ed_y + self.ed_h - y0
         r.fill_xywh(x0, y0, w, h, th.editor_bg)
         var cx = x0 + int(w * 0.12)
         if cx < x0 + self.dp(40):
@@ -2014,7 +2016,7 @@ class IDEPaint(IDEOps):
         x = x - self.dp(6)
         x = self._status_item(r, x, y, h, "warning", self.st_warnings, "workbench.actions.view.problems", "", "Problems (Ctrl+Shift+M)")
         if self.ws.root != "" and self.W > self.dp(640):
-            x = self._status_item(r, x, y, h, "tools", self._active_target()["name"], "@status.target", "", "Build target (Build > Select Target)")
+            x = self._status_item(r, x, y, h, "tools", self._status_target(), "@status.target", "", "Build target (Build > Select Target)")
         if self.build_running:
             x = self._status_item(r, x, y, h, "loading", "Building", "nython.abort", "", "Click to abort the build")
         if self.job_running:

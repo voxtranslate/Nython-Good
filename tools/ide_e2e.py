@@ -1434,6 +1434,74 @@ def sc_column_select(s):
     c(st["carets"] == 1 and st["sel_text"] == "alpha = 1\n", "column: mode off gives a normal selection", (st["carets"], repr(st["sel_text"])))
 
 
+def sc_split(s):
+    ide = s.start()
+    c = s.res.check
+    body = "".join("r%d_x = %d\n" % (i, i) for i in range(1, 121))
+    s.write("long.ny", body)
+    s.open_file("long.ny")
+    ide.key("ctrl+\\")
+    st = ide.state()
+    c(st["split"] == "cols" and st["group"] == 1, "split: Ctrl+\\ splits right and focuses the new group", (st["split"], st["group"]))
+    hm = ide.hitmap()
+    eds = [h for h in hm if h[4] == "@editor"]
+    other = [h for h in hm if h[4] == "@group.focus"]
+    c(len(eds) == 2 and len(other) == 1, "split: two editors, the other group clickable", (len(eds), len(other)))
+    left = tuple(other[0][:4]) if other else (0, 0, 1, 1)
+    right = tuple(eds[-1][:4]) if eds else (0, 0, 1, 1)
+    # Each group keeps its own place in the same file.
+    ide.key("ctrl+g")
+    ide.type("100\n")
+    st = ide.state()
+    c(st["row"] == 99, "split: go to line in the right group", st["row"])
+    f = ide.snap()
+    c(f.has("r1_x", exact=True, region=left) and not f.has("r100_x", exact=True, region=left)
+      and f.has("r100_x", exact=True, region=right), "split: each group shows its own part of the file")
+    # Typing in one group shows in the other (same buffer).
+    ide.key("home")
+    ide.type("EDITED")
+    ide.key("ctrl+1")
+    st = ide.state()
+    c(st["group"] == 0 and st["row"] == 0, "split: Ctrl+1 focuses the first group, its caret kept", (st["group"], st["row"]))
+    f = ide.snap()
+    c(f.has("EDITEDr100_x", exact=True, region=right) and not f.has("EDITEDr100_x", exact=True, region=left),
+      "split: the edit shows in the other group, which kept its scroll")
+    ide.key("ctrl+g")
+    ide.type("100\n")
+    f = ide.snap()
+    c(f.has("EDITEDr100_x", exact=True, region=left), "split: the same edit in the first group")
+    ide.key("ctrl+2")
+    ide.key("ctrl+z")
+    ide.key("ctrl+1")
+    # Open a different file in the focused group.
+    s.open_file("app.ny")
+    st = ide.state()
+    c(st["title"] == "app.ny" and st["group"] == 0, "split: opening a file uses the focused group", (st["title"], st["group"]))
+    # Clicking the other group focuses it and places the caret there.
+    hm = ide.hitmap()
+    other = [h for h in hm if h[4] == "@group.focus"]
+    if other:
+        x, y, w, h = other[0][:4]
+        ide.click(x + w // 2, y + h // 2)
+        st = ide.state()
+        c(st["group"] == 1 and st["title"] == "long.ny", "split: clicking the other group focuses it", (st["group"], st["title"]))
+    # Stacked layout, then the sash, then join.
+    ide.key("shift+alt+0")
+    st = ide.state()
+    c(st["split"] == "rows", "split: toggle to a stacked layout", st["split"])
+    hm = ide.hitmap()
+    sash = [h for h in hm if h[4] == "@split.sash"]
+    c(len(sash) == 1, "split: one sash", len(sash))
+    if sash:
+        x, y, w, h = sash[0][:4]
+        ide.drag(x + w // 2, y + h // 2, x + w // 2, y + h // 2 - 120)
+        st = ide.state()
+        c(st["split_ratio"] < 0.45, "split: dragging the sash resizes the groups", st["split_ratio"])
+    palette(s, "View: Join Editor Groups")
+    st = ide.state()
+    c(st["split"] == "" and len([h for h in ide.hitmap() if h[4] == "@editor"]) == 1, "split: join back to one group", st["split"])
+
+
 SCENARIOS = [
     ("boot", sc_boot), ("edit", sc_edit_undo_save), ("clipboard", sc_clipboard_lines),
     ("multicursor", sc_multicursor), ("palette", sc_palette), ("quickopen", sc_quick_open),
@@ -1444,6 +1512,7 @@ SCENARIOS = [
     ("deadviews", sc_dead_clicks_views), ("build", sc_build), ("cbedit", sc_cb_editing),
     ("cbtools", sc_cb_tools), ("cbdebug", sc_cb_debug), ("responsive", sc_responsive),
     ("session", sc_session), ("columns", sc_column_select),
+    ("split", sc_split),
 ]
 
 
