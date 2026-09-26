@@ -432,7 +432,7 @@ print ""
 print "=== INTEGRATION: Full AI Creation Demo ==="
 print ""
 print "Building a complete text-generation AI from scratch..."
-var ai_config = {"vocab_size": 128, "d_model": 16, "n_layers": 3, "n_heads": 4, "max_ctx": 64, "temperature": 0.9, "top_k": 20, "max_new_tokens": 12, "use_mod": true}
+var ai_config = {"vocab_size": 128, "d_model": 16, "n_layers": 3, "n_heads": 4, "max_ctx": 64, "temperature": 0.9, "top_k": 20, "max_new_tokens": 6, "use_mod": true}
 var my_ai = GenerativeAIPipeline(ai_config)
 var ai_info = my_ai.get_model_info()
 print "  Model: FoundationModel + MoD + RoPE + GQA"

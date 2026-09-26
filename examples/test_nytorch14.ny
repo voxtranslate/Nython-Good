@@ -165,7 +165,7 @@ assert_true("CTC decode to string", len(ctc_text) > 0)
 # the 6 alignments (1__, _1_, __1, 11_, _11, 111) give -log(6 / 8^3)
 var uni = []
 for i in range(0, 3):
-    uni = uni + [[0.0 - log(8.0)] * 8]
+    uni.append([0.0 - log(8.0)] * 8)
 var ctc_loss_val = ctc.compute_loss(uni, [1])
 assert_near("CTC loss = -log(6 / 512)", ctc_loss_val, log(512.0 / 6.0), 0.000000001)
 var ctc_bad = false
@@ -472,13 +472,13 @@ assert_eq("NMS drops the overlapping lower-score box", yolo.nms([[0.5, 0.5, 0.4,
 var ar = [0.0]
 var arn = nt_normal(400, 0.0, 1.0)
 for i in range(1, 400):
-    ar = ar + [0.7 * ar[i - 1] + arn[i]]
+    ar.append(0.7 * ar[i - 1] + arn[i])
 var arm = ARIMAModel(1, 0, 0)
 arm.fit(ar)
 assert_near("ARIMA(1,0,0) finds phi = 0.7", arm.ar_coefs[0], 0.7, 0.1)
 var trend = []
 for i in range(0, 60):
-    trend = trend + [3.0 + 2.0 * float(i)]
+    trend.append(3.0 + 2.0 * float(i))
 var arm2 = ARIMAModel(1, 1, 0)
 arm2.fit(trend)
 var tf = arm2.forecast(3)
@@ -498,7 +498,7 @@ assert_true("BayesOpt: best x within 0.05 of 0.3", abs(bo.best()["params"]["x"] 
 var sr = 16000
 var tone = []
 for i in range(0, 4096):
-    tone = tone + [sin(2.0 * 3.141592653589793 * 1000.0 * float(i) / float(sr))]
+    tone.append(sin(2.0 * 3.141592653589793 * 1000.0 * float(i) / float(sr)))
 var ms = MelSpectrogram(sr, 512, 256, 40, 0.0, 8000.0)
 var melp = ms.compute(tone)
 var mid = melp.select(0, melp.size()[0] // 2)
@@ -527,7 +527,7 @@ torch.manual_seed(7)
 var asr2 = ASRPipeline(8000, 13, ["_", "a", "b"], 16)
 var utt = []
 for i in range(0, 1536):
-    utt = utt + [sin(0.05 * float(i)) * sin(0.0021 * float(i))]
+    utt.append(sin(0.05 * float(i)) * sin(0.0021 * float(i)))
 var asr_first = asr2.train_step(utt, "ab", 0.05)
 var asr_last = asr_first
 for i in range(0, 60):

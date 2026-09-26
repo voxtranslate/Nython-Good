@@ -27,7 +27,7 @@ def assert_eq(name, a, b):
 # policy must prefer it.
 print "--- SACAgent ---"
 torch.manual_seed(0)
-var sac = SACAgent(4, 2, 0.01, 0.05)
+var sac = SACAgent(4, 2, 0.01, 0.05, 16)
 assert_eq("SAC name", sac.get_stats()["name"], "SAC")
 assert_eq("SAC no update yet", sac.update(), 0.0)
 var bandit_s = [0.5, -0.2, 0.1, 0.3]
@@ -434,7 +434,7 @@ var llm_tok = TransformerTokenizer(500, 20)
 llm_tok.add_word("nython")
 llm_tok.add_word("is")
 llm_tok.add_word("great")
-var llm = LLMPipeline("nython-llm-1b", llm_tok, 50, 0.7)
+var llm = LLMPipeline("nython-llm-1b", llm_tok, 12, 0.7)   # 12 new tokens keep the interpreter's memory bounded
 assert_eq("LLM name", llm.get_name(), "LLMPipeline")
 llm.add_plugin("lowercase", lambda x: x.lower())
 var gen = llm.generate("nython is great", ["\n"])

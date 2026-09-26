@@ -1568,15 +1568,23 @@ class TinyCausalLM(Module):
             i = i + 1
         self.norm = LayerNorm(d_model)
         self.lm_head = Linear(d_model, vocab_size)
-    # token ids (L,) -> next-token logits for every position (L, vocab)
-    def forward(self, ids):
+    def hidden(self, ids):
         var h = self.embed.forward(ids)
         var mask = causal_mask(len(ids))
         var i = 0
         while i < len(self.blocks):
             h = self.blocks[i].forward(h, mask, none)
             i = i + 1
-        return self.lm_head.forward(self.norm.forward(h))
+        return self.norm.forward(h)
+
+    # token ids (L,) -> next-token logits for every position (L, vocab)
+    def forward(self, ids):
+        return self.lm_head.forward(self.hidden(ids))
+
+    # logits (vocab,) after the last token only (what generation needs)
+    def next_logits(self, ids):
+        var h = self.hidden(ids)
+        return self.lm_head.forward(h.select(0, h.size()[0] - 1))
 
 # Tokenise -> run a causal language model -> sample -> detokenise. `model`
 # is any Module mapping token ids (L,) to logits (L, vocab); by default a
@@ -1627,7 +1635,11 @@ class LLMPipeline:
         var k = 0
         with no_grad():
             while k < n_new:
-                var logits = self.model.forward(seq).select(0, len(seq) - 1)
+                var logits = none
+                if hasattr(self.model, "next_logits"):
+                    logits = self.model.next_logits(seq)
+                else:
+                    logits = self.model.forward(seq).select(0, len(seq) - 1)
                 var probs = (logits * (1.0 / max(self.temperature, 0.01))).softmax(0)
                 var nxt = _rl_sample(probs.data)
                 if nxt == 0 or nxt == 3:
