@@ -251,7 +251,9 @@ print "--- SelfSupervisedLearner ---"
 for method in ["simclr", "byol", "mae", "barlow_twins"]:
     var ssl = SelfSupervisedLearner(16, 8, method, 0.07)
     assert_eq("SSL name (" + method + ")", ssl.get_name(), "SelfSupervisedLearner")
-    var x_ssl = tensor_randn([16])
+    # a batch of 4: SimCLR takes its negatives and Barlow Twins its
+    # cross-correlation statistics from the other examples in the batch
+    var x_ssl = Tensor(tensor_randn([64]), false, [4, 16])
     var result = ssl.forward(x_ssl)
     assert_true("SSL " + method + " has loss", "loss" in result)
     assert_true("SSL " + method + " loss >= 0", result["loss"] >= 0.0)
@@ -496,6 +498,143 @@ print "  PASS: Two AgentMinds operated independently"
 passed = passed + 1
 
 # ── Summary ──────────────────────────────────────────────────────────────
+
+# ── Values and invariants ──────────────────────────────────────────────────
+print "--- invariants ---"
+torch.manual_seed(21)
+# RK4 on y'' = -y from (1, 0): y(t) = (cos t, -sin t)
+var rk = ODESolver("rk4", 0.05, 1.0)
+var yr = rk.solve([1.0, 0.0], lambda y, t: [y[1], 0.0 - y[0]])
+assert_true("RK4 matches cos/sin to 1e-7", abs(yr[0] - cos(1.0)) < 0.0000001 and abs(yr[1] + sin(1.0)) < 0.0000001)
+var eu = ODESolver("euler", 0.1, 0.1)
+var ye = eu.solve([1.0, 0.0], lambda y, t: [y[1], 0.0 - y[0]])
+assert_true("one Euler step is y + dt f(y)", abs(ye[0] - 1.0) < 0.000000001 and abs(ye[1] + 0.1) < 0.000000001)
+
+# Neural ODE: f is W2 tanh(W1 h + b1) + b2, and gradients flow through the solver
+var node2 = NeuralODE(3, "rk4", 0.1, 0.3)
+var hh = Tensor([0.2, -0.4, 0.6])
+var f_manual = node2.f2.weight.mv(node2.f1.weight.mv(hh).add(node2.f1.bias).tanh()).add(node2.f2.bias)
+assert_true("NeuralODE dynamics = W2 tanh(W1 h + b1) + b2", node2.dynamics(hh, 0.0).allclose(f_manual, 0.0, 0.000000001))
+node2.forward(Tensor([0.2, -0.4, 0.6], true)).sum().backward()
+assert_true("NeuralODE: gradient reaches the dynamics weights", node2.f1.weight.grad != none and Tensor(node2.f1.weight.grad).abs().sum().item() > 0.0)
+
+# KAN: the B-spline basis is a partition of unity, and a KAN fits a curve
+var kl = KANLayer(1, 1, 5, 3)
+var pu = kl.basis(Tensor([0.37])).sum().item()
+assert_true("KAN B-splines sum to 1", abs(pu - 1.0) < 0.000000001)
+var kan2 = KolmogorovArnoldNetwork([1, 1], 6, 3)
+var kopt = Adam(kan2.parameters(), 0.05)
+var kx = [-0.9, -0.5, -0.1, 0.3, 0.7]
+var kfirst = 0.0
+var klast = 0.0
+for step in range(0, 150):
+    kopt.zero_grad()
+    var kl_total = Tensor(0.0)
+    for xv in kx:
+        kl_total = kl_total + (kan2.forward([xv]).sum() - xv * xv).square()
+    kl_total.backward()
+    kopt.step()
+    if step == 0:
+        kfirst = kl_total.item()
+    klast = kl_total.item()
+assert_true("KAN learns x^2 (loss falls 50x)", klast < kfirst / 50.0)
+
+# Hopfield: a stored pattern is recovered from a corrupted probe
+var hop = HopfieldNetwork(8, "hebbian")
+hop.store([1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0])
+hop.store([1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0])
+assert_eq("Hopfield fixes a flipped unit", hop.recall([1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, 1.0], 3), [1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0])
+var mh2 = ModernHopfieldNetwork(4, 4, 8.0)
+mh2.store([1.0, 0.0, 0.0, 0.0])
+mh2.store([0.0, 1.0, 0.0, 0.0])
+var mret = mh2.retrieve([0.9, 0.2, 0.0, 0.1], 2)
+assert_true("modern Hopfield retrieves the nearest memory", abs(mret[0] - 1.0) < 0.01 and abs(mret[1]) < 0.01)
+
+# PINN, hypernetwork and world model actually train
+torch.manual_seed(4)
+var pinn2 = PhysicsInformedNN(2, 8, 2, "heat", {"alpha": 0.1})
+pinn2.add_collocation_point(0.3, 0.2)
+pinn2.add_collocation_point(0.6, 0.5)
+var p_first = pinn2.train_step([[0.0, 0.0], [1.0, 0.0]], [0.0, 1.0], 0.02)["total"]
+var p_last = p_first
+for i in range(0, 60):
+    p_last = pinn2.train_step([[0.0, 0.0], [1.0, 0.0]], [0.0, 1.0], 0.02)["total"]
+assert_true("PINN loss falls", p_last < p_first * 0.2)
+var hn = HyperNetwork(8, 2, 2, 3)
+var h_first = hn.adapt([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], [[1.0, 2.0], [2.0, 1.0]], [1.0, -1.0], 0.02)
+var h_last = h_first
+for i in range(0, 60):
+    h_last = hn.adapt([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], [[1.0, 2.0], [2.0, 1.0]], [1.0, -1.0], 0.02)
+assert_true("HyperNetwork adapts to its contexts", h_last < h_first * 0.05)
+var wm3 = WorldModel(3, 1, 2, 8)
+var w_first = wm3.train_step([0.1, 0.2, 0.3], [0.5], [0.2, 0.3, 0.4], 1.0, false, 0.01)
+var w_last = w_first
+for i in range(0, 80):
+    w_last = wm3.train_step([0.1, 0.2, 0.3], [0.5], [0.2, 0.3, 0.4], 1.0, false, 0.01)
+assert_true("WorldModel loss falls", w_last < w_first * 0.5)
+
+# SimCLR on a fixed batch: the contrastive loss falls
+var ssl2 = SelfSupervisedLearner(6, 4, "simclr", 0.5)
+var sb = Tensor([[1.0, 0.0, 0.0, 0.5, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0, 0.5, 0.0], [0.0, 0.0, 1.0, 0.0, 0.0, 0.5], [0.5, 0.5, 0.0, 0.0, 0.0, 1.0]])
+var s_first = ssl2.train_step(sb, 0.02)
+for i in range(0, 40):
+    ssl2.train_step(sb, 0.02)
+assert_true("SimCLR loss falls", ssl2.forward(sb)["loss"] < s_first)
+
+# EWC: no penalty at the consolidated parameters, a positive one after moving
+var ewc2 = ContinualLearner(3, 1.0, 2)
+ewc2.consolidate_task([[1.0, 0.0, 0.5], [0.0, 1.0, 0.5]])
+assert_near("EWC penalty is 0 at theta*", ewc2.ewc_penalty(), 0.0, 0.000000001)
+ewc2.train_task(1, [[0.5, 0.5, 0.0]], 5, 0.1)
+assert_true("EWC penalty grows as the weights move", ewc2.ewc_penalty() > 0.0)
+
+# neuroevolution improves the sphere function
+var ne2 = NeuroEvolution(20, 4, 0.1, 0.7, 0.2)
+var sphere = lambda g: 0.0 - (g[0] * g[0] + g[1] * g[1] + g[2] * g[2] + g[3] * g[3])
+ne2.evolve(sphere)
+var ne_start = ne2.best_fitness
+for i in range(0, 15):
+    ne2.evolve(sphere)
+assert_true("NeuroEvolution improves the best fitness", ne2.best_fitness > ne_start)
+
+# a structural causal model propagates an intervention to its descendants
+var scm = CausalModel(3, 4)
+scm.add_edge(0, 1)
+scm.add_edge(1, 2)
+scm.noise_std = [0.0, 0.0, 0.0]
+var sd = scm.intervene(0, 2.0, 1)
+assert_true("do(x0 = 2) reaches x2 through x1", abs(sd["2"][0] - 2.0 * scm.eq_weights[1][0] * scm.eq_weights[2][1]) < 0.000000001)
+var cyc = false
+try:
+    scm.add_edge(2, 0)
+except e:
+    cyc = true
+assert_true("CausalModel rejects a cycle", cyc)
+
+# program search recovers -(relu(x) + x) exactly
+var nps2 = NeuralProgramSynthesizer(["add", "mul", "relu", "negate", "softmax"], 3, 3)
+var pin = [[1.0, -2.0, 0.5], [-1.0, 3.0, -0.5]]
+var pout = [[-2.0, 2.0, -1.0], [1.0, -6.0, 0.5]]
+var ps = nps2.synthesize(pin, pout, 125)
+assert_near("program search finds an exact program", ps["score"], 0.0, 0.000000001)
+assert_true("the found program reproduces the outputs", nps2.run(ps["program"], pin[1]).allclose(Tensor(pout[1])))
+
+# prototypical few-shot and zero-shot learners
+torch.manual_seed(21)
+var fs = FewShotLearner(2, "euclidean")
+var fs_loss = 0.0
+for i in range(0, 30):
+    fs_loss = fs.train_episode([[1.0, 1.0], [1.2, 0.9], [-1.0, -1.0], [-0.9, -1.1]], ["a", "a", "b", "b"], [[0.8, 1.1], [-1.1, -0.8]], ["a", "b"], 0.05)
+assert_true("few-shot: the prototypical loss is driven down", fs_loss < 0.05)
+fs.fit_episode([[1.0, 1.0], [1.2, 0.9], [-1.0, -1.0], [-0.9, -1.1]], ["a", "a", "b", "b"])
+assert_eq("few-shot: query near class a", fs.predict([0.9, 1.0])["label"], "a")
+assert_eq("few-shot: query near class b", fs.predict([-1.0, -0.9])["label"], "b")
+var zs = ZeroShotLearner(3, 2, 2)
+zs.add_class("up", [0.0, 1.0])
+zs.add_class("right", [1.0, 0.0])
+zs.fit([[0.0, 1.0, 0.2], [1.0, 0.0, 0.1]], ["up", "right"], 0.05, 60)
+assert_eq("zero-shot learner maps features to the right class", zs.predict([0.1, 0.9, 0.2])["class"], "up")
+
 print ""
 print "Results: " + str(passed) + " passed, " + str(failed) + " failed"
 if failed == 0:
