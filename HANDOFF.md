@@ -7,7 +7,8 @@ Last updated: round 74. This round is **§0e** (IDE responsiveness: native
 text services and a responsive layout ladder; the Code::Blocks feature set;
 non-throwing control flow on both engines; the build system) and **§0f**
 (the OS layer: files, paths, processes, environment and time, with one
-implementation for both engines). §0d is
+implementation for both engines) and **§0g** (threads, synchronisation and
+async on both engines). §0d is
 round 73 (the IDE to VS Code's model, verified by driving it). Earlier
 rounds: §0/§0b language-level work, §5.3 terminal command line / undo /
 multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
@@ -215,6 +216,80 @@ Defects found while driving these, all fixed:
 
 e2e scenarios added: `build`, `cbedit`, `cbtools`, `cbdebug`, `responsive`,
 `session`, `columns`, `split`, `window`.
+
+---
+
+## 0g. Round 74 — threads, synchronisation and async (both engines)
+
+Merged from `round74-conc`. Tests: `vm_audit48` (threads and
+synchronisation, 125 checks), `vm_audit49` (async, 41) and `vm_audit50`
+(`lib/thread.ny`, 51). All three pass on both engines, including under CPU
+load and parallel runs. helgrind finds 0 data races.
+
+- **One runtime for both engines.** `include/NyConc.hpp` and
+  `src/NyConc.cpp` implement and dispatch every concurrency builtin (166
+  names). Each engine supplies only an adapter (`InterpEngine` in
+  `threading.cpp`, `VMConcEngine` in `src/VMConc.cpp`), so the engines
+  cannot drift apart.
+- **The GIL.** There is one process-wide lock, because VM threads call
+  interpreter builtins through the bridge.
+  - It is a first-in-first-out ticket lock. The holder hands it over after
+    5 ms when another thread is waiting.
+  - Threads switch at every statement on the interpreter, and at frame
+    entry and backward jumps on the VM.
+  - It is off until the first thread starts. A single-threaded program pays
+    one relaxed atomic load per check (+0.04% instructions on the
+    interpreter, +0.2–0.7% on the VM).
+  - Every blocking call releases it: waits, sleeps, joins, `popen`,
+    `os_run`/`os_wait` and the process polls, and the window's idle wait
+    for events (added on merge).
+- **Interpreter per-thread state** is now `thread_local`. This includes
+  `last_stmt`, whose shared pointer was corrupting the heap.
+- **VM threads** share one `VirtualMachine`. Each thread's operand stack,
+  frame stack and in-flight exception are swapped in with the GIL.
+- **Blocking waits** all go through one function, which handles timeouts,
+  cooperative cancellation and deadlock detection. A wait-for-graph cycle,
+  or every thread blocked with no timeout, raises `DeadlockError` instead
+  of hanging. Optional lock-order checking (`lockdep_enable`) raises
+  `LockOrderError`.
+- **Async.** `async def` compiles to a coroutine factory and `await x` to
+  `async_await(x)`.
+  - One task runs at a time, in a deterministic order: ready tasks first in,
+    first out; timers by deadline, then creation order.
+  - The API: `async_run`, `create_task`, `gather`, `gather_settled`,
+    `wait_for`, `async_sleep`, `task_cancel`, `async_call_later`.
+  - Channels, locks, futures and sleep suspend only the calling task.
+- **Primitives**:
+  - threads: join with timeout, result, daemon, thread-locals, cancel
+  - locks: mutex, recursive mutex, rwlock, condition
+  - signalling: semaphore (bounded), event, barrier, latch
+  - atomics
+  - channels (unbuffered, buffered, unbounded, close, a Go-style `select`
+    that picks the first ready case)
+  - FIFO, LIFO and priority queues
+  - futures with callbacks and `as_completed`, a thread pool, timers, and
+    task groups (the first failure cancels the others)
+- **`lib/thread.ny`** is rewritten over these natives; the old names still
+  work. Its event class is `ThreadEvent`, because `lib/gui.ny` already has
+  `Event`.
+- **Behaviour change.** `semaphore_acquire` now blocks, as in Python. A lone
+  thread waiting forever raises `DeadlockError`. `stdlib_test` and
+  `stdlib_v2_test` use `semaphore_try_acquire` for the non-blocking check.
+- **Found and fixed on the way:**
+  - On the interpreter, inherited methods got none of their default
+    arguments.
+  - `with` passes the exception to `__exit__`.
+  - A pool worker could exit early.
+  - Failures of threads nobody joined were swallowed at exit.
+- **Not done:**
+  - Handles are never freed, so a program that creates millions of
+    primitives grows.
+  - `--trace`'s function stack is shared between threads.
+  - Cancellation is only checked at blocking calls.
+  - There are no async generators or streams.
+  - On the VM, an exception from another thread keeps its class name but
+    loses extra fields.
+  - The VM `with` + `return` gaps belong to the language work.
 
 ---
 

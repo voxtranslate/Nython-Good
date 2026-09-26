@@ -36,6 +36,7 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include "NyConc.hpp"   // concurrency runtime shared with the VM (src/NyConc.cpp)
 #include <random>
 #include <regex>
 #include <sstream>
@@ -164,7 +165,9 @@ struct NythonExecutor {
     Context* global_ctx;
     Runnable* runner;
     std::map<void*, std::string> func_names;
-    std::vector<Value>* yield_sink_ = nullptr; // set during generator collection
+    // Per OS thread: generator collection in one thread must not capture the
+    // yields of another (round 74, threads).
+    static inline thread_local std::vector<Value>* yield_sink_ = nullptr; // set during generator collection
     std::map<int, FILE*> file_handles{};
     int next_file_handle{1000};
     std::map<void*, Context*> closure_contexts;
@@ -524,6 +527,10 @@ public:   // NythonExecutor is a struct: members default to public
             "file_open_or_raise","file_seek","file_tell","file_flush"
         };
         for (auto& name : builtins) registerBuiltin(name);
+        // Concurrency runtime (src/NyConc.cpp): threads, locks, channels,
+        // futures, task groups, async. Same names and semantics on the VM.
+        for (auto& name : nyconc::builtin_names()) registerBuiltin(name);
+        for (auto& name : nyconc::exception_names()) registerBuiltin(name);
         // Exception types
         std::vector<std::string> exc_types = {
             "Exception","BaseException","Error",
@@ -2446,6 +2453,11 @@ return lv * rv;
         if (fn_val.type != ValueType::USERDATA || !fn_val.value.p) return NONE_VALUE;
         auto fit = func_names.find(fn_val.value.p);
         if (fit == func_names.end()) return NONE_VALUE;
+        // A builtin, an instance or a class is not an AST function: treating its
+        // pointer as a Node* crashed (e.g. thread_create(print)).
+        if (fit->second.rfind("__builtin__:", 0) == 0) return callBuiltin(fit->second.substr(12), call_args, ctx);
+        if (fit->second.rfind("__instance__:", 0) == 0) return callMethod(fn_val, "__call__", call_args, ctx);
+        if (fit->second.rfind("__class__:", 0) == 0) return NONE_VALUE;
         // Bound-method `self` is supplied centrally in bindParamsKw via the
         // callee pointer. Lambdas are never bound (makeBoundMethod only binds
         // FUNCTION nodes declaring self), so the lambda path below can use
@@ -3671,10 +3683,10 @@ return lv * rv;
                     CtxReaper _reap_fn_ctx3162(this, fn_ctx);
                     fn_ctx->defineByName("self", obj);
                     size_t param_start = (!fn->params.empty() && fn->params[0]->value() == "self") ? 1 : 0;
-                    for (size_t i = param_start; i < fn->params.size(); i++) {
-                        size_t arg_idx = i - param_start;
-                        if (arg_idx < args.size()) fn_ctx->defineByName(fn->params[i]->value(), args[arg_idx]);
-                    }
+                    // Defaults and keyword arguments too: binding only the supplied
+                    // arguments left a missing parameter undefined, so an
+                    // inherited `def m(self, x=5)` saw x as "" (round 74).
+                    bindParamsKw(fn, args, kw_args_in, fn_ctx, ctx, param_start);
                     try { return evalBody(fn->body, fn_ctx); }
                     catch (nython::node::ReturnSignal& ret) { return ret.value; }
                     catch (std::string& _exc) { if (_exc.size()>7 && _exc.substr(0,7)=="__exc__") throw; return NONE_VALUE; }
@@ -3703,10 +3715,7 @@ return lv * rv;
                                     fn_ctx->defineByName("self", obj);
                                     size_t param_start = 0;
                                     if (!fn->params.empty() && fn->params[0]->value() == "self") param_start = 1;
-                                    for (size_t i = param_start; i < fn->params.size(); i++) {
-                                        size_t arg_idx = i - param_start;
-                                        if (arg_idx < args.size()) fn_ctx->defineByName(fn->params[i]->value(), args[arg_idx]);
-                                    }
+                                    bindParamsKw(fn, args, kw_args_in, fn_ctx, ctx, param_start);   // defaults too (round 74)
                                     try { Value result = evalBody(fn->body, fn_ctx); return result; }
                                     catch (nython::node::ReturnSignal& ret) { return ret.value; }
                                     catch (std::string& flow) { if (flow=="break"||flow=="continue") throw; if (flow.size()>7&&flow.substr(0,7)=="__exc__") throw; return NONE_VALUE; }
@@ -3738,10 +3747,7 @@ return lv * rv;
                                         fn_ctx->defineByName("self", obj);
                                         size_t param_start = 0;
                                         if (!fn->params.empty() && fn->params[0]->value() == "self") param_start = 1;
-                                        for (size_t i = param_start; i < fn->params.size(); i++) {
-                                            size_t arg_idx = i - param_start;
-                                            if (arg_idx < args.size()) fn_ctx->defineByName(fn->params[i]->value(), args[arg_idx]);
-                                        }
+                                        bindParamsKw(fn, args, kw_args_in, fn_ctx, ctx, param_start);   // defaults too (round 74)
                                         try { Value result = evalBody(fn->body, fn_ctx); return result; }
                                         catch (nython::node::ReturnSignal& ret) { return ret.value; }
                                         catch (std::string& flow) { if (flow.size()>7&&flow.substr(0,7)=="__exc__") throw; return NONE_VALUE; }
@@ -4003,7 +4009,8 @@ return lv * rv;
     // call that builtin by bare name inside it — e.g. `def read_file(self, f)`
     // containing `read_file(f)`. The bare name resolves back to the method, so
     // it calls itself forever.) Convert that into a catchable Nython error.
-    int call_depth_ = 0;
+    // Per OS thread: each thread has its own C++ stack (round 74).
+    static inline thread_local int call_depth_ = 0;
     static const int kMaxCallDepth = 900;
     struct DepthGuard {
         int& d;
@@ -4036,10 +4043,11 @@ public:
     };
     static bool& profiling_enabled() { static bool e = false; return e; }
     std::map<std::string, ProfEntry> prof_;
-    long long prof_child_ns_ = 0;   // ns charged to callees of the current frame
-    long long prof_child_objs_ = 0; // allocations charged to callees, likewise
-    long long prof_child_strs_ = 0;
-    long long prof_child_sbytes_ = 0;
+    // Per OS thread (round 74): a frame's children run on the same thread.
+    static inline thread_local long long prof_child_ns_ = 0;   // ns charged to callees of the current frame
+    static inline thread_local long long prof_child_objs_ = 0; // allocations charged to callees, likewise
+    static inline thread_local long long prof_child_strs_ = 0;
+    static inline thread_local long long prof_child_sbytes_ = 0;
 
     struct ProfScope {
         NythonExecutor* ex; std::string name; bool on;
@@ -4134,7 +4142,9 @@ public:
     };
     static TraceState& tracer() { static TraceState t; return t; }
     static bool trace_on() { return tracer().f != nullptr; }
-    static node_ptr& last_stmt() { static node_ptr p; return p; }
+    // Per OS thread (round 74): written on every statement; a shared
+    // shared_ptr assigned from two threads corrupted AST refcounts.
+    static node_ptr& last_stmt() { static thread_local node_ptr p; return p; }
     // "file.ny:12" for the statement that was executing, "" if none.
     static std::string last_stmt_where() {
         auto& n = last_stmt();
@@ -4232,6 +4242,7 @@ public:
     }
 
     inline void noteStatement(const node_ptr& st, Context* ctx) {
+        nyconc::tick();          // GIL switch point (no-op until a thread exists)
         last_stmt() = st;
         if (trace_on()) traceStatement(st, ctx);
     }
@@ -5157,7 +5168,8 @@ public:
     // ─── ATTRIBUTE / SUBSCRIPT ──────────────────────────────────────────
     // Receivers already evaluated by evalCall, keyed by the object node. Lets
     // the callee-lookup fallback reuse a receiver instead of re-running it.
-    std::unordered_map<const void*, Value> receiver_cache_;
+    // Per OS thread (round 74): two threads can run the same call node.
+    static inline thread_local std::unordered_map<const void*, Value> receiver_cache_;
 
     Value evalAttribute(node_ptr node, Context* ctx) {
         auto an = static_pointer_cast<AttributeNode>(node);
@@ -6706,6 +6718,23 @@ public:
         Value result = NONE_VALUE;
         try {
             result = evalNode(wn->body, ctx);
+        } catch (std::string& exc) {
+            // Call __exit__ even on exception, with (type, message, none) as
+            // Python does, so a context manager can tell the body failed (a
+            // task group cancels its children then) - round 74.
+            if (v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p) && instance_to_class.count(v.value.p)) {
+                std::string et = "Exception", em = exc;
+                if (exc.rfind("__exc__:", 0) == 0) {
+                    std::string rest = exc.substr(8);
+                    auto c = rest.find(':');
+                    et = rest.substr(0, c);
+                    em = c == std::string::npos ? std::string() : rest.substr(c + 1);
+                }
+                std::vector<Value> exc_args = {makeStringValue(et), makeStringValue(em), NONE_VALUE};
+                if (exc != "break" && exc != "continue") callMethod(v, "__exit__", exc_args, ctx);
+                else { std::vector<Value> no_args; callMethod(v, "__exit__", no_args, ctx); }
+            }
+            throw;
         } catch (...) {
             // Call __exit__ even on exception
             if (v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p) && instance_to_class.count(v.value.p)) {

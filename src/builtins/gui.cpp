@@ -34,6 +34,7 @@ using nython::kernel::bigint;
 #endif
 #include <cmath>
 #include <algorithm>
+#include "NyConc.hpp"
 
 // ── Handle registries ───────────────────────────────────────────────────────
 static int next_win_id  = 1;
@@ -415,7 +416,15 @@ static bool convert_event(SDL_Event& ev, EvData& d) {
 // first event (so an idle window sleeps instead of spinning), then drains.
 static void pump_events(bool wait, int timeout_ms) {
     SDL_Event ev;
-    bool got = wait ? SDL_WaitEventTimeout(&ev, (Sint32)timeout_ms) : SDL_PollEvent(&ev);
+    bool got;
+    if (wait) {
+        // Other Nython threads keep running while the window sleeps: the
+        // wait touches no engine state, so the GIL is released for it.
+        nyconc::GilRelease unlocked;
+        got = SDL_WaitEventTimeout(&ev, (Sint32)timeout_ms);
+    } else {
+        got = SDL_PollEvent(&ev);
+    }
     while(got){
         EvData d;
         if(convert_event(ev, d)) g_evq.push_back(std::move(d));

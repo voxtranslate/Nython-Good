@@ -271,6 +271,10 @@ These were aligned to match how the IDE calls them:
 | vm_audit44 | 46 | record-and-replay debugger, including a real `--trace` recording |
 | vm_audit45 | 45 | JSON codec, print call form, list pop/insert, deep equality, file_mtime |
 | vm_audit46 | 252 | OS layer: paths, files, file objects, typed errors, os_run/os_spawn, env, time, full-width ints, sys.argv |
+| vm_audit48 | 125 | threads and synchronisation: mutex/rwlock/condition/semaphore/barrier/latch/atomics/channels/queues/futures/pools, deadlock detection |
+| vm_audit49 | 41 | async/await: tasks, gather, wait_for, cancellation, deterministic order |
+| vm_audit50 | 51 | `lib/thread.ny` over the native runtime |
+| vm_audit51 | 52 | native editor text services (symbols, syntax check, diff, search, folding, format, completion index) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `for t in examples/test_*.ny examples/vm_audit*.ny; do ./build/nython-cli "$t"; done`
@@ -603,6 +607,17 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   `__name__`, `__file__`, `import os` / `time.time()` namespaces.
 - Interpreter integers: `int()`, `//`, `//=`, `**=`, `abs()`, unary `-`, `~`
   no longer truncate to 32 bits.
+
+## Round 74: threads, synchronisation and async (see `HANDOFF.md` §0g)
+
+- One concurrency runtime for both engines: `include/NyConc.hpp`,
+  `src/NyConc.cpp` (engine adapters: `threading.cpp`, `src/VMConc.cpp`).
+- One process-wide GIL (FIFO ticket lock, 5 ms hand-over). It is off
+  until the first thread starts. **Any native code that blocks must release
+  it**: wrap the wait in `nyconc::GilRelease unlocked;` and touch no engine
+  state inside it.
+- `async def` / `await`; channels with `select`; futures, pools, task
+  groups; `DeadlockError` / `LockOrderError` instead of hangs.
 
 ## Transcripts
 

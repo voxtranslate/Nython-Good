@@ -45,6 +45,7 @@
 
 #include "NythonExecutor.hpp"
 #include "builtins/os.hpp"
+#include "NyConc.hpp"
 #include "NyRuntime.hpp"
 
 #ifndef _WIN32
@@ -70,6 +71,7 @@ using nyos::raise_errno;
 // Legacy stdout capture through the shell. fread keeps NUL bytes (fgets cut
 // the output at the first one); trailing "\n" and "\r" are stripped.
 std::string capture(const std::string& cmd, bool strip) {
+    nyconc::GilRelease unlocked;     // touches no engine state (round 74, threads)
     std::string result;
     FILE* pipe = ::popen(cmd.c_str(), "r");
     if (!pipe) return result;
@@ -341,7 +343,8 @@ Value run(NythonExecutor& E, std::vector<Value>& args) {
             if (left <= 0) { timed_out = true; break; }
             wait_ms = (int)std::min(200.0, left * 1000.0 + 1);
         }
-        int r = ::poll(fds, (nfds_t)nf, wait_ms);
+        int r;
+        { nyconc::GilRelease unlocked; r = ::poll(fds, (nfds_t)nf, wait_ms); }
         if (r < 0 && errno != EINTR) break;
         if (r <= 0) continue;
         if (i_out >= 0 && (fds[i_out].revents & (POLLIN | POLLHUP | POLLERR))) {
@@ -368,7 +371,7 @@ Value run(NythonExecutor& E, std::vector<Value>& args) {
         if (err_fd >= 0) { drain(err_fd, err); ::close(err_fd); }
     }
     int st = 0;
-    while (::waitpid(pid, &st, 0) < 0 && errno == EINTR) {}
+    { nyconc::GilRelease unlocked; while (::waitpid(pid, &st, 0) < 0 && errno == EINTR) {} }
     code = decode_status(st);
     if (timed_out) {
         std::ostringstream m;
@@ -533,7 +536,7 @@ Value dispatch_os_proc(NythonExecutor& E,
                 raise("TimeoutError", m.str());
             }
             lk.unlock();
-            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            { nyconc::GilRelease unlocked; std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
             lk.lock();
             it = procs().find(pid);
             if (it == procs().end()) raise("ChildProcessError", "process table changed while waiting");

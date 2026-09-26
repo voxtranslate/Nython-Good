@@ -1,0 +1,144 @@
+#pragma once
+// ─────────────────────────────────────────────────────────────────────────────
+// NyConc.hpp — the concurrency runtime shared by BOTH engines.
+//
+// Everything that does not depend on how an engine represents values lives in
+// src/NyConc.cpp: the GIL, the thread registry, every synchronisation
+// primitive, channels/queues + select, futures and the thread pool, timers,
+// task groups (structured concurrency), deadlock / lock-order detection and the
+// async event loop. It is also where the builtins are dispatched — once — so
+// the interpreter (src/builtins/threading.cpp) and the VM (src/VMConc.cpp)
+// cannot drift apart: each engine only supplies
+//   * an Engine (how to call a Nython callable, how to save/restore its
+//     per-thread execution state when the GIL changes hands), and
+//   * an Args adapter (read engine arguments) + a converter for Ret.
+//
+// Threading model
+//   Real OS threads (std::thread). One process-wide GIL serialises execution
+//   of Nython code: a thread holds it while it runs engine code and releases
+//   it around every blocking operation. Engines call nyconc::tick() at every
+//   statement (interpreter) / instruction (VM); when another thread is waiting
+//   and the holder has had the GIL for longer than the switch interval (5 ms,
+//   as CPython) it hands the GIL over. The GIL is a FIFO ticket lock, so a
+//   yielding thread queues behind the waiters instead of re-grabbing it.
+//   Nothing of this is active until the first thread is created, so a
+//   single-threaded program pays one relaxed atomic load per statement.
+//
+// Lock order: the GIL may be held while taking the runtime mutex; the GIL is
+// never *acquired* while the runtime mutex is held.
+// ─────────────────────────────────────────────────────────────────────────────
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace nyconc {
+
+// ── Engine values, type-erased ──────────────────────────────────────────────
+struct Box { virtual ~Box() = default; };
+using BoxPtr = std::shared_ptr<Box>;
+
+// A Nython exception crossing the engine boundary.
+//  - raised by the runtime itself: type + msg are set (DeadlockError, ...)
+//  - captured from engine code (a thread's uncaught exception): `raw` holds the
+//    engine's own payload and `obj` the engine exception object, if any, so the
+//    exception can be re-raised unchanged in another thread (thread_join,
+//    future_result, task groups, await).
+struct NyError {
+    std::string type;
+    std::string msg;
+    std::string raw;
+    BoxPtr obj;
+    NyError() : type(), msg(), raw(), obj() {}
+    static NyError make(const std::string& t, const std::string& m) { NyError e; e.type = t; e.msg = m; return e; }
+};
+
+struct Engine {
+    virtual ~Engine() = default;
+    // Call a Nython callable on the current thread (the GIL is held). Throws
+    // NyError if the callee raises.
+    virtual BoxPtr call(const BoxPtr& fn, const std::vector<BoxPtr>& args) = 0;
+    virtual BoxPtr box_int(int64_t v) = 0;
+    virtual BoxPtr box_none() = 0;
+    virtual bool   unbox_int(const BoxPtr& b, int64_t& out) = 0;
+    virtual BoxPtr from_ret(const struct Ret& r) = 0;
+    virtual bool   is_callable(const BoxPtr& b) = 0;
+    // Human-readable text of a boxed value (task/thread names, errors).
+    virtual std::string describe(const BoxPtr& b) = 0;
+    // Per-thread engine state. The runtime creates one per thread and calls
+    // swap_in right after the thread acquires the GIL and swap_out right before
+    // it releases it (the VM keeps one operand stack/frame stack per thread by
+    // swapping them in and out of the single VirtualMachine object).
+    // Called (GIL held) on the thread that is about to start another thread or
+    // an event loop.
+    virtual void  on_thread_start() {}
+    virtual void* state_new() { return nullptr; }
+    virtual void  state_free(void*) {}
+    virtual void  swap_in(void*) {}
+    virtual void  swap_out(void*) {}
+};
+
+// ── Arguments / results of the shared builtin dispatcher ────────────────────
+struct Args {
+    virtual ~Args() = default;
+    virtual size_t size() const = 0;
+    virtual bool is_none(size_t i) const = 0;
+    virtual bool is_number(size_t i) const = 0;
+    virtual bool is_string(size_t i) const = 0;
+    virtual bool is_list(size_t i) const = 0;
+    virtual int64_t as_int(size_t i) const = 0;
+    virtual double as_num(size_t i) const = 0;
+    virtual std::string as_str(size_t i) const = 0;
+    virtual bool truthy(size_t i) const = 0;
+    virtual BoxPtr box(size_t i) const = 0;
+    // Elements of a list argument, as another Args.
+    virtual std::unique_ptr<Args> list(size_t i) const = 0;
+};
+
+struct Ret {
+    enum Kind { NONE, BOOL, INT, NUM, STR, BOX, LIST } k = NONE;
+    bool b = false; int64_t i = 0; double d = 0; std::string s; BoxPtr box;
+    std::vector<Ret> list;
+    static Ret none() { return Ret(); }
+    static Ret boolean(bool v) { Ret r; r.k = BOOL; r.b = v; return r; }
+    static Ret integer(int64_t v) { Ret r; r.k = INT; r.i = v; return r; }
+    static Ret number(double v) { Ret r; r.k = NUM; r.d = v; return r; }
+    static Ret str(const std::string& v) { Ret r; r.k = STR; r.s = v; return r; }
+    static Ret boxed(const BoxPtr& v) { Ret r; if (v) { r.k = BOX; r.box = v; } return r; }
+    static Ret lst(std::vector<Ret> v) { Ret r; r.k = LIST; r.list = std::move(v); return r; }
+};
+
+// Dispatch a concurrency builtin. Returns false if `name` is not one of ours.
+// Throws NyError for Nython-level errors. Called with the GIL held.
+bool dispatch(Engine& e, const std::string& name, const Args& a, Ret& out);
+
+// Every builtin name handled by dispatch(), for registration by the engines.
+const std::vector<std::string>& builtin_names();
+// Exception type names the runtime raises (registered as constructors).
+const std::vector<std::string>& exception_names();
+
+// ── GIL ─────────────────────────────────────────────────────────────────────
+extern std::atomic<int> g_gil_waiters;      // threads queued for the GIL
+void tick_slow();
+// Called by the engines at every statement / instruction.
+inline void tick() {
+    if (__builtin_expect(g_gil_waiters.load(std::memory_order_relaxed) != 0, 0)) tick_slow();
+}
+bool active();                              // true once a second thread exists
+// Release the GIL around a blocking native operation (no-op when inactive or
+// not held). The operation must not touch engine state while released.
+struct GilRelease {
+    bool released = false;
+    GilRelease();
+    ~GilRelease();
+    GilRelease(const GilRelease&) = delete;
+    GilRelease& operator=(const GilRelease&) = delete;
+};
+
+// Wait for every non-daemon thread before the process tears the engine down
+// (both engines' run paths call this after the main program). Never throws;
+// reports a deadlock at exit instead of hanging.
+void join_nondaemon_at_exit();
+
+} // namespace nyconc

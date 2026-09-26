@@ -93,7 +93,7 @@ print "=== THREADING ==="
 var sem = semaphore_create(2)
 t("sem_a1", semaphore_acquire(sem), true)
 t("sem_a2", semaphore_acquire(sem), true)
-t("sem_a3_fail", semaphore_acquire(sem), false)
+t("sem_a3_fail", semaphore_try_acquire(sem), false)   # blocking acquire would wait forever (round 74)
 t("sem_rel", semaphore_release(sem), true)
 t("sem_a4", semaphore_acquire(sem), true)
 

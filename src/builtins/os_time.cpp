@@ -380,10 +380,9 @@ Value dispatch_os_time(NythonExecutor& E,
         return Value(std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count());
     }
     if (name == "time_sleep" || name == "sleep_ms") {
-        double secs = args.empty() ? 0.0 : to_num(args[0], 0.0);
-        if (name == "sleep_ms") secs /= 1000.0;
-        if (secs > 0) std::this_thread::sleep_for(std::chrono::microseconds((long long)(secs * 1e6)));
-        return NONE_VALUE;
+        // The concurrency runtime's sleep (src/NyConc.cpp): releases the GIL,
+        // is cancellable and suspends only the current async task.
+        return E.callBuiltin(name == "sleep_ms" ? "thread_sleep" : "sleep", args, ctx);
     }
     if (name == "time_format" || name == "time_date" || name == "time_strftime") {
         // time_format(fmt="%Y-%m-%d %H:%M:%S", ts=now, utc=false). The

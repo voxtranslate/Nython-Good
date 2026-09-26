@@ -30,6 +30,8 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <unordered_set>
+#include <unordered_map>
 #include <ctime>
 #include <cwctype>
 #include <locale>
@@ -37,6 +39,164 @@
 // Full executor definition (needed for E.getStringValue etc.)
 #include "NythonExecutor.hpp"
 #include "builtins/threading.hpp"
+
+#include "NyConc.hpp"
+
+// ════════════════════════════════════════════════════════════════════════════
+// Interpreter side of the concurrency runtime (src/NyConc.cpp).
+// All semantics live in the runtime; this only converts values and errors.
+// ════════════════════════════════════════════════════════════════════════════
+namespace {
+
+struct InterpBox : nyconc::Box { Value v; explicit InterpBox(const Value& x) : v(x) {} };
+
+static Value unbox_value(const nyconc::BoxPtr& b) {
+    auto* ib = dynamic_cast<InterpBox*>(b.get());
+    return ib ? ib->v : NONE_VALUE;
+}
+
+struct InterpEngine : nyconc::Engine {
+    NythonExecutor& E;
+    explicit InterpEngine(NythonExecutor& e) : E(e) {}
+
+    nyconc::BoxPtr box(const Value& v) { return std::make_shared<InterpBox>(v); }
+
+    const std::string* tag_of(const Value& f) {
+        if (f.type != ValueType::USERDATA || !f.value.p) return nullptr;
+        auto it = E.func_names.find(f.value.p);
+        return it == E.func_names.end() ? nullptr : &it->second;
+    }
+
+    // Any callable the language has: functions, lambdas, bound methods,
+    // builtins, instances with __call__, classes.
+    Value invoke(const Value& f, std::vector<Value>& av) {
+        Context* ctx = E.globalContext();
+        const std::string* tag = tag_of(f);
+        if (!tag) throw nyconc::NyError::make("TypeError", "object is not callable");
+        if (tag->rfind("__builtin__:", 0) == 0) return E.callBuiltin(tag->substr(12), av, ctx);
+        if (tag->rfind("__instance__:", 0) == 0) return E.callMethod(f, "__call__", av, ctx);
+        if (tag->rfind("__class__:", 0) == 0) {
+            // Construct through the ordinary call path: bind callee and args to
+            // names in a scratch scope and evaluate `callee(a0, a1, ...)`.
+            Context* scope = new Context(E.runner, "<native-call>", nullptr, nullptr, E.globalContext());
+            Token t(TokenIdent{}, "__ny_callee");
+            auto call = std::make_shared<CallNode>(t, std::make_shared<VariableNode>(t));
+            scope->defineByName("__ny_callee", f);
+            for (size_t i = 0; i < av.size(); i++) {
+                std::string nm = "__ny_arg" + std::to_string(i);
+                scope->defineByName(nm, av[i]);
+                call->add(std::make_shared<VariableNode>(Token(TokenIdent{}, nm)));
+            }
+            return E.evalNode(call, scope);
+        }
+        return E.callFunctionValue(f, av, ctx);
+    }
+
+    nyconc::BoxPtr call(const nyconc::BoxPtr& fn, const std::vector<nyconc::BoxPtr>& args) override {
+        Value f = unbox_value(fn);
+        std::vector<Value> av;
+        for (auto& a : args) av.push_back(unbox_value(a));
+        try { return box(invoke(f, av)); }
+        catch (std::string& s) { nyconc::NyError e; e.raw = s; throw e; }
+        catch (nython::node::ReturnSignal& r) { return box(r.value); }
+        catch (nyconc::NyError&) { throw; }
+        catch (std::exception& x) { throw nyconc::NyError::make("RuntimeError", x.what()); }
+    }
+    nyconc::BoxPtr box_int(int64_t v) override { return box(Value((int64_t)v)); }
+    nyconc::BoxPtr box_none() override { return box(NONE_VALUE); }
+    bool unbox_int(const nyconc::BoxPtr& b, int64_t& out) override {
+        Value v = unbox_value(b);
+        if (v.type != ValueType::INTEGER) return false;
+        out = bigint_to_i64(v.value.i);
+        return true;
+    }
+    Value to_value(const nyconc::Ret& r) {
+        switch (r.k) {
+            case nyconc::Ret::NONE: return NONE_VALUE;
+            case nyconc::Ret::BOOL: return Value(r.b);
+            case nyconc::Ret::INT:  return Value((int64_t)r.i);
+            case nyconc::Ret::NUM:  return Value(r.d);
+            case nyconc::Ret::STR:  return E.makeStringValue(r.s);
+            case nyconc::Ret::BOX:  return unbox_value(r.box);
+            case nyconc::Ret::LIST: {
+                auto* lst = new Object((Runnable*)E.runner, "list", Type::LIST);
+                int n = 0;
+                for (auto& x : r.list) lst->set(std::to_string(n++), to_value(x));
+                lst->set("__len__", Value(n));
+                return Value(static_cast<Collectable*>(lst));
+            }
+        }
+        return NONE_VALUE;
+    }
+    nyconc::BoxPtr from_ret(const nyconc::Ret& r) override { return box(to_value(r)); }
+    bool is_callable(const nyconc::BoxPtr& b) override { return tag_of(unbox_value(b)) != nullptr; }
+    std::string describe(const nyconc::BoxPtr& b) override {
+        Value v = unbox_value(b);
+        const std::string* tag = tag_of(v);
+        if (tag) {
+            std::string t = *tag;
+            auto c = t.find(':');
+            return c == std::string::npos ? t : t.substr(c + 1);
+        }
+        return E.isStringValue(v) ? E.getStringValue(v) : v.toString();
+    }
+};
+
+struct InterpArgs : nyconc::Args {
+    NythonExecutor& E;
+    std::vector<Value> v;
+    InterpArgs(NythonExecutor& e, std::vector<Value> xs) : E(e), v(std::move(xs)) {}
+    size_t size() const override { return v.size(); }
+    bool is_none(size_t i) const override { return v[i].type == ValueType::NONE; }
+    bool is_number(size_t i) const override { return v[i].type == ValueType::INTEGER || v[i].type == ValueType::DOUBLE; }
+    bool is_string(size_t i) const override { return E.isStringValue(v[i]); }
+    Container* cont(size_t i) const {
+        if (!v[i].isCollectable()) return nullptr;
+        auto* c = dynamic_cast<Container*>(v[i].value.gc);
+        return (c && c->container && c->container->count("__len__")) ? c : nullptr;
+    }
+    bool is_list(size_t i) const override { return cont(i) != nullptr; }
+    int64_t as_int(size_t i) const override {
+        if (v[i].type == ValueType::INTEGER) return bigint_to_i64(v[i].value.i);
+        if (v[i].type == ValueType::DOUBLE) return (int64_t)v[i].value.d;
+        if (v[i].type == ValueType::BOOLEAN) return v[i].value.b ? 1 : 0;
+        return 0;
+    }
+    double as_num(size_t i) const override {
+        if (v[i].type == ValueType::DOUBLE) return (double)v[i].value.d;
+        return (double)as_int(i);
+    }
+    std::string as_str(size_t i) const override {
+        return E.isStringValue(v[i]) ? E.getStringValue(v[i]) : v[i].toString();
+    }
+    bool truthy(size_t i) const override { return E.isTruthy(v[i]); }
+    nyconc::BoxPtr box(size_t i) const override { return std::make_shared<InterpBox>(v[i]); }
+    std::unique_ptr<nyconc::Args> list(size_t i) const override {
+        std::vector<Value> out;
+        if (Container* c = cont(i)) {
+            int n = (int)bigint_to_i64(c->container->find("__len__")->second.value.i);
+            for (int k = 0; k < n; k++) {
+                auto it = c->container->find(std::to_string(k));
+                out.push_back(it == c->container->end() ? NONE_VALUE : it->second);
+            }
+        }
+        return std::make_unique<InterpArgs>(E, std::move(out));
+    }
+};
+
+InterpEngine& engine_for(NythonExecutor& E) {
+    // One engine per executor, never freed: threads may outlive the call that
+    // created them (daemons at process exit).
+    static std::unordered_map<NythonExecutor*, InterpEngine*> engines;
+    auto it = engines.find(&E);
+    if (it != engines.end()) return *it->second;
+    auto* eng = new InterpEngine(E);
+    engines[&E] = eng;
+    return *eng;
+}
+
+} // namespace
+
 
 // ── Namespace imports (match main.cpp) ────────────────────────────────────────
 using namespace std;
@@ -86,6 +246,26 @@ Value dispatch_threading(NythonExecutor& E,
     auto  printValue       = [&](const Value& v, Context* c = nullptr) { E.printValue(v, c ? c : ctx); };
 
     // ── shape_to_size helper (used by tensor builtins) ───────────────────────
+
+    // ── Concurrency runtime (threads, locks, channels, futures, async) ──────
+    {
+        static const std::unordered_set<std::string> exc_names(
+            nyconc::exception_names().begin(), nyconc::exception_names().end());
+        if (exc_names.count(name)) {
+            std::string msg = args.empty() ? "" : (E.isStringValue(args[0]) ? E.getStringValue(args[0]) : args[0].toString());
+            return E.makeStringValue("__exc__:" + name + ":" + msg);
+        }
+        InterpEngine& eng = engine_for(E);
+        InterpArgs ia(E, args);
+        nyconc::Ret r;
+        bool handled;
+        try { handled = nyconc::dispatch(eng, name, ia, r); }
+        catch (nyconc::NyError& err) {
+            if (!err.raw.empty()) throw std::string(err.raw);
+            throw std::string("__exc__:" + err.type + ":" + err.msg);
+        }
+        if (handled) return eng.to_value(r);
+    }
     auto shape_to_size = [&](const Value& v) -> int {
         if (v.type == ValueType::INTEGER) return (int)bigint_to_i64(v.value.i);
         if (v.type == ValueType::DOUBLE)  return (int)v.value.d;
@@ -191,18 +371,6 @@ Value dispatch_threading(NythonExecutor& E,
         // =====================================================================
         // NYTORCH MATH: STATISTICS & LINEAR ALGEBRA
     // ── from main.cpp lines 4939–4988 ──────────────────────────────────────────
-        if (name == "sleep") {
-            // sleep(seconds). Microsecond resolution; a non-number or a
-            // negative value does not sleep (a string used to be read as a
-            // garbage integer).
-            if (!args.empty()) {
-                double secs = args[0].type == ValueType::DOUBLE ? static_cast<double>(args[0].value.d)
-                            : args[0].type == ValueType::INTEGER ? static_cast<double>(bigint_to_i64(args[0].value.i))
-                            : 0.0;
-                if (secs > 0) std::this_thread::sleep_for(std::chrono::microseconds(static_cast<long long>(secs * 1e6)));
-            }
-            return NONE_VALUE;
-        }
         if (name == "isdigit_str") {
             if (!args.empty()) {
                 std::string s = getStringValue(args[0]);
@@ -246,89 +414,8 @@ Value dispatch_threading(NythonExecutor& E,
             }
             return NONE_VALUE;
         }
-    // ── from main.cpp lines 8659–8729 ──────────────────────────────────────────
-        if (name == "thread_create") {
-            if (!args.empty() && args[0].type == ValueType::USERDATA) {
-                Value fn = args[0];
-                // Create a real thread using std::thread
-                auto* thr = new std::thread([&E, fn, ctx]() {
-                    std::vector<Value> no_args;
-                    try {
-                        E.callFunctionValue(const_cast<Value&>(fn), no_args, ctx);
-                    } catch (...) {}
-                });
-                thr->detach();
-                // Return thread handle as integer
-                return Value(static_cast<int>(reinterpret_cast<intptr_t>(thr) & 0x7FFFFFFF));
-            }
-            return NONE_VALUE;
-        }
-        if (name == "thread_join") {
-            // thread_join waits for thread (simplified - detached threads can't be joined)
-            // Use sleep as approximation
-            if (!args.empty()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            }
-            return Value(true);
-        }
-        if (name == "thread_sleep") {
-            // thread_sleep() takes MILLISECONDS. It used to forward straight to
-            // time_sleep(), which takes SECONDS — so lib/gui.ny's
-            //     thread_sleep(int(1000 / fps))  ->  thread_sleep(16)
-            // slept 16 seconds per frame instead of 16 ms, giving the IDE a frame
-            // every 16s and the appearance of a frozen/black window.
-            // Every caller in lib/ passes milliseconds (frame_ms, interval_ms, ...).
-            if (!args.empty()) {
-                double ms = (args[0].type == ValueType::DOUBLE)
-                    ? static_cast<double>(args[0].value.d)
-                    : (double)bigint_to_i64(args[0].value.i);
-                if (ms < 0) ms = 0;
-                std::this_thread::sleep_for(std::chrono::microseconds((long long)(ms * 1000.0)));
-            }
-            return NONE_VALUE;
-        }
-        if (name == "mutex_create") {
-            static int mutex_counter = 0;
-            return Value(++mutex_counter);
-        }
-        if (name == "mutex_lock" || name == "mutex_unlock") {
-            return Value(true); // Simplified - single-threaded
-        }
-        if (name == "semaphore_create") {
-            int count = (args.size() >= 1) ? (int)bigint_to_i64(args[0].value.i) : 1;
-            auto* sem = new Object((Runnable*)runner, "semaphore", Type::LIST);
-            sem->set("count", Value(count));
-            sem->set("max", Value(count));
-            return Value((Collectable*)sem);
-        }
-        if (name == "semaphore_acquire") {
-            if (args.size() >= 1 && args[0].isCollectable()) {
-                auto* cont = dynamic_cast<Container*>(args[0].value.gc);
-                if (cont && cont->container) {
-                    auto it = cont->container->find("count");
-                    if (it != cont->container->end()) {
-                        int c = (int)bigint_to_i64(it->second.value.i);
-                        if (c > 0) { it->second = Value(c - 1); return Value(true); }
-                    }
-                }
-            }
-            return Value(false);
-        }
-        if (name == "semaphore_release") {
-            if (args.size() >= 1 && args[0].isCollectable()) {
-                auto* cont = dynamic_cast<Container*>(args[0].value.gc);
-                if (cont && cont->container) {
-                    auto it = cont->container->find("count");
-                    auto mx = cont->container->find("max");
-                    if (it != cont->container->end()) {
-                        int c = (int)bigint_to_i64(it->second.value.i);
-                        int m = (mx != cont->container->end()) ? (int)bigint_to_i64(mx->second.value.i) : c + 1;
-                        if (c < m) { it->second = Value(c + 1); return Value(true); }
-                    }
-                }
-            }
-            return Value(false);
-        }
+    // Threads, locks, channels, futures, task groups, async: see the shared
+    // runtime (src/NyConc.cpp), dispatched at the top of this function.
 
         // ===================== NET/SOCKET MODULE =====================
 
