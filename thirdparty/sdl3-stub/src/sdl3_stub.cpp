@@ -475,10 +475,19 @@ bool SDL_SetRenderViewport(SDL_Renderer* renderer, const SDL_Rect* rc) {
     return true;
 }
 
+// A window created with SDL_WINDOW_HIGH_PIXEL_DENSITY has a drawing surface
+// of NY_STUB_DPI_SCALE pixels per point, as on a Retina display; any other
+// window is scaled by the system and draws in points.
+static float window_pixel_scale(SDL_Window* w) {
+    if (!w || !(w->flags & SDL_WINDOW_HIGH_PIXEL_DENSITY)) return 1.0f;
+    return dpi_scale_from_env();
+}
+
 bool SDL_GetRenderOutputSize(SDL_Renderer* renderer, int* w, int* h) {
     if (!renderer || !renderer->window) return false;
-    if (w) *w = renderer->window->w;
-    if (h) *h = renderer->window->h;
+    float sc = window_pixel_scale(renderer->window);
+    if (w) *w = (int)(renderer->window->w * sc + 0.5f);
+    if (h) *h = (int)(renderer->window->h * sc + 0.5f);
     return true;
 }
 
@@ -1169,9 +1178,22 @@ Uint32 SDL_RegisterEvents(int numevents) {
     return first;
 }
 
-// Window and render coordinates are the same headlessly.
+// Window coordinates (points) to render coordinates (pixels): the same
+// unless the window has high pixel density.
 bool SDL_ConvertEventToRenderCoordinates(SDL_Renderer* renderer, SDL_Event* event) {
-    return renderer && event;
+    if (!renderer || !event) return false;
+    float sc = window_pixel_scale(renderer->window);
+    if (sc == 1.0f) return true;
+    switch (event->type) {
+    case SDL_EVENT_MOUSE_MOTION: event->motion.x *= sc; event->motion.y *= sc; break;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+    case SDL_EVENT_MOUSE_BUTTON_UP: event->button.x *= sc; event->button.y *= sc; break;
+    case SDL_EVENT_MOUSE_WHEEL: event->wheel.mouse_x *= sc; event->wheel.mouse_y *= sc; break;
+    case SDL_EVENT_DROP_FILE:
+    case SDL_EVENT_DROP_TEXT: event->drop.x *= sc; event->drop.y *= sc; break;
+    default: break;
+    }
+    return true;
 }
 
 // ── SDL3_ttf ───────────────────────────────────────────────────────────
