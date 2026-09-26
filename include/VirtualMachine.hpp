@@ -40,6 +40,7 @@
 #include <cerrno>
 #include "NyJson.hpp"
 #include "NyFuzzy.hpp"
+#include "NyConc.hpp"   // concurrency runtime shared with the interpreter
 #include <random>
 
 #include "Value.hpp"
@@ -1571,8 +1572,17 @@ enum   class VMResult { SUCCESS, COMPILE_ERROR, RUNTIME_ERROR };
 // ═══════════════════════════════════════════════════════════════════════════
 // VIRTUAL MACHINE
 // ═══════════════════════════════════════════════════════════════════════════
+// Threads, locks, channels, futures, async for the VM (src/VMConc.cpp): VM
+// natives over the shared runtime in src/NyConc.cpp. It needs the VM's
+// per-thread execution state (operand stack, frames), hence the friendship.
+class VirtualMachine;
+struct VMConc { static void install(VirtualMachine& vm); };
+struct VMConcEngine;
+
 class VirtualMachine : public Runnable {
     friend class gc::GarbageCollector;
+    friend struct VMConc;
+    friend struct VMConcEngine;
     using gc_ptr = std::shared_ptr<GarbageCollector>;
 
     gc_ptr                                             gc_;
@@ -1592,6 +1602,16 @@ class VirtualMachine : public Runnable {
     bool vm_trace_ = getenv("NY_VM_TRACE") != nullptr;
     bool export_to_globals_ = false;   // true while executing an import
     std::string cwd_ = ".";            // working directory for imports
+    // ── Threads (round 74, src/VMConc.cpp) ──────────────────────────────────
+    // Module-level variables live in the main thread's bottom frame and are
+    // found by walking the call stack. A thread has a call stack of its own, so
+    // it reaches the main module frame through this pointer, set when the first
+    // thread starts. The frame outlives every non-daemon thread: run() joins
+    // them before popping it (daemons never get the GIL back after that).
+    CallFrame* module_frame_ = nullptr;
+    bool in_other_thread() const {
+        return module_frame_ && (call_stack_.empty() || &call_stack_.front() != module_frame_);
+    }
 
     // Stack helpers
     void   push(VMVal v)       { stack_.push_back(std::move(v)); }
@@ -1634,6 +1654,10 @@ private:
             auto v=call_stack_[i].get_local(n);
             if(v.type!=VMType::UNDEFINED) return v;
         }
+        if(in_other_thread()){                                   // round 74
+            auto mv=module_frame_->get_local(n);
+            if(mv.type!=VMType::UNDEFINED) return mv;
+        }
         auto it=globals_.find(n);
         if(it!=globals_.end()) return it->second;
         // Fall back to an interpreter builtin of this name, wrapped as a native.
@@ -1657,6 +1681,9 @@ private:
             if(call_stack_[i].closure_env && call_stack_[i].closure_env->count(n)){
                 (*call_stack_[i].closure_env)[n]=std::move(v); return;
             }
+        }
+        if(in_other_thread() && module_frame_->has_local(n)){    // round 74
+            module_frame_->set(n,std::move(v)); return;
         }
         if(!call_stack_.empty()) call_stack_.back().locals[n]=std::move(v);
         else globals_[n]=std::move(v);
@@ -1700,6 +1727,7 @@ public:
     void register_all_builtins() {
         register_nytorch_builtins();
         register_builtins();
+        VMConc::install(*this);   // last: its GIL-aware sleep natives win
     }
 
     ~VirtualMachine() override = default;
@@ -1708,7 +1736,22 @@ public:
     VMResult run(nython::node::node_ptr ast) {
         try {
             Compiler c; auto code=c.compile(ast);
-            exec_code(code,{},std::nullopt);
+            // The module frame is pushed here rather than by exec_code() so that
+            // non-daemon threads, which read module variables through it, are
+            // joined before it is popped (round 74).
+            size_t base=stack_.size();
+            CallFrame fr; fr.code=code; fr.ip=0;
+            call_stack_.push_back(std::move(fr));
+            struct PopModule {
+                VirtualMachine* vm; size_t base;
+                ~PopModule(){
+                    nyconc::join_nondaemon_at_exit();
+                    vm->module_frame_=nullptr;
+                    vm->call_stack_.pop_back();
+                    if(vm->stack_.size()>base) vm->stack_.resize(base);
+                }
+            } pop_module{this, base};
+            try { run_loop(); } catch(VMReturn&) {}
             return VMResult::SUCCESS;
         } catch(std::exception& e) {
             std::cerr<<"\x1b[31m[VMError] "<<e.what()<<"\x1b[0m\n";
@@ -1913,6 +1956,7 @@ private:
 
         VMVal run_loop() {
         while(true){
+            nyconc::tick();   // GIL switch point, before `fr` is taken (round 74)
             CallFrame& fr=call_stack_.back();
             if(fr.ip>=(int)fr.code->instructions.size()) return VMVal::make_none();
             const Instruction& ins=fr.code->instructions[fr.ip++];
