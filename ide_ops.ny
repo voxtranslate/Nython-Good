@@ -8,10 +8,16 @@ import "ide_core.ny"
 import "lib/ide_selection.ny"
 
 
-# A shell command running in the background with its output captured to a
-# file and read incrementally. Run, the debugger's recording and the terminal
-# all use it, so none of them can freeze the IDE; the old IDE blocked in popen
-# until a program finished, with no way to stop it.
+# A shell command running in the background whose output is read
+# incrementally. Run, Build, tools, the debugger's recording and the
+# terminal all use it, so none of them can freeze the IDE.
+#
+# It runs on the OS layer's process API: os_spawn starts `sh -c` in its own
+# process group with stdout and stderr on pipes, os_proc_read drains them
+# without blocking, os_poll reaps the exit code and os_kill signals the whole
+# group. Nothing touches the disk and polling starts no process. Where
+# os_spawn is not available (Windows), the older route is used: the command
+# runs in the background with its output in a file, read with `tail`.
 class BgProc:
     def __init__(self, base):
         self.base = base
@@ -20,24 +26,19 @@ class BgProc:
         self.pidf = base + ".pid"
         self.running = false
         self.code = 0
-        self.read = 0              # lines of the log already returned
+        self.read = 0              # file route: lines of the log already returned
         self.seen_size = -1
         self.poll_t = 0
         self.t0 = 0
         self.killed = false
+        self.pid = -1              # process route: the os_spawn pid, -1 for the file route
+        self.partial = ""          # process route: output after the last newline
 
     def _q(self, s):
         return "'" + string_replace(s, "'", "'\\''") + "'"
 
-    # `inner` is a shell command line; stdout and stderr go to the log.
+    # `inner` is a shell command line; stdout and stderr are captured together.
     def start(self, inner, cwd):
-        write_file(self.log, "")
-        if os_exists(self.exitf):
-            os_remove(self.exitf)
-        # A subshell, not a { } group: `exit 3` in the command must end the
-        # command, not the wrapper that records its exit status.
-        var script = "cd " + self._q(cwd) + " && ( " + inner + "\n) < /dev/null > " + self._q(self.log) + " 2>&1; echo $? > " + self._q(self.exitf)
-        os_exec("(sh -c " + self._q(script) + " & echo $! > " + self._q(self.pidf) + ") > /dev/null 2>&1")
         self.running = true
         self.code = 0
         self.read = 0
@@ -45,14 +46,24 @@ class BgProc:
         self.killed = false
         self.t0 = time_ms()
         self.poll_t = 0
+        self.partial = ""
+        self.pid = -1
+        # A subshell, not a { } group: `exit 3` in the command must end the
+        # command, not the wrapper. stderr joins stdout so the two stay in
+        # the order they were written.
+        try:
+            self.pid = os_spawn("( " + inner + "\n) < /dev/null 2>&1", cwd=cwd)
+            return
+        except Exception as e:
+            self.pid = -1
+        write_file(self.log, "")
+        if os_exists(self.exitf):
+            os_remove(self.exitf)
+        var script = "cd " + self._q(cwd) + " && ( " + inner + "\n) < /dev/null > " + self._q(self.log) + " 2>&1; echo $? > " + self._q(self.exitf)
+        os_exec("(sh -c " + self._q(script) + " & echo $! > " + self._q(self.pidf) + ") > /dev/null 2>&1")
 
     # Complete new lines since the last poll ([] if none); sets running=false
     # and code once the process has exited and everything has been read.
-    #
-    # Counted in lines, not bytes: os_exec strips trailing newlines from what
-    # it returns and len() counts characters, so a byte offset drifted and a
-    # job whose output ended in "\n" was never seen to finish. The "; printf
-    # x" sentinel keeps the trailing newlines intact.
     def poll(self, min_ms):
         var out = []
         if not self.running:
@@ -61,6 +72,40 @@ class BgProc:
         if now - self.poll_t < min_ms:
             return out
         self.poll_t = now
+        if self.pid >= 0:
+            return self._poll_proc(out)
+        return self._poll_file(out)
+
+    def _poll_proc(self, out):
+        var code = os_poll(self.pid)
+        var r = os_proc_read(self.pid)
+        var chunk = r["stdout"]
+        if chunk != "":
+            var text = self.partial + chunk
+            var lines = string_split(text, "\n")
+            var n = len(lines)
+            var i = 0
+            while i < n - 1:
+                out.append(lines[i])
+                i = i + 1
+            self.partial = lines[n - 1]
+        if code != none and r["done"]:
+            # Everything is read once the pipes are closed; the last line may
+            # lack its newline.
+            if self.partial != "":
+                out.append(self.partial)
+                self.partial = ""
+            self.code = code
+            if self.killed:
+                self.code = 143
+            self.running = false
+        return out
+
+    # Counted in lines, not bytes: os_exec strips trailing newlines from what
+    # it returns and len() counts characters, so a byte offset drifted and a
+    # job whose output ended in "\n" was never seen to finish. The "; printf
+    # x" sentinel keeps the trailing newlines intact.
+    def _poll_file(self, out):
         var done = os_exists(self.exitf)
         var size = file_size(self.log)
         if size == none:
@@ -96,11 +141,17 @@ class BgProc:
     def stop(self):
         if not self.running:
             return
+        self.killed = true
+        if self.pid >= 0:
+            # The process group os_spawn made: the shell and all it started.
+            try:
+                os_kill(self.pid, sig=15)
+            except Exception as e:
+                pass
+            return
         var pid = string_strip(read_file(self.pidf))
         if pid != "":
-            # The sh -c wrapper and everything it started.
             os_exec("pkill -TERM -P " + pid + " > /dev/null 2>&1; kill " + pid + " > /dev/null 2>&1")
-        self.killed = true
         write_file(self.exitf, "143")
 
     def elapsed(self):

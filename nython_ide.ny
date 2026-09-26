@@ -389,6 +389,10 @@ class NythonIDE(IDETools):
         self.field_vx = {}         # input name -> x of its first character, last frame
         # ── source control ────────────────────────────────────────────────────
         self.scm_stale = true
+        self.scm_job = none            # the background git refresh (BgProc)
+        self.scm_out = []
+        self.scm_seq = 0
+        self.scm_again = false
         self.scm_branch = ""
         self.scm_count = 0
         self.scm_by_path = {}
@@ -2536,12 +2540,13 @@ class NythonIDE(IDETools):
         # frame that painted nothing. While a program, a build or a debug
         # recording runs, output and progress must arrive promptly, so it
         # only naps one frame then.
-        if self.job_running or self.build_running or self.dbg_recording:
+        if self.job_running or self.build_running or self.dbg_recording or (self.scm_job != none and self.scm_job.running):
             self.win.idle_wait_ms = 16
         else:
             self.win.idle_wait_ms = 250
         if self.build_running:
             self._build_step()
+        self._scm_poll()
         self._watch_tick(now)
         if self.job_running:
             self._poll_job()

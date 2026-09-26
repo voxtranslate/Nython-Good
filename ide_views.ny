@@ -506,7 +506,37 @@ class IDEViews(IDEPaint):
         elif self.git.root == "" or not string_startswith(self.ws.root, self.git.root):
             self.git.probe(self.ws.root)
         else:
-            self.git.refresh()
+            # Branch, HEAD and status in the background: git status can take
+            # a while in a large repository, and this runs after every save.
+            # A refresh asked for while one is running runs again after it.
+            if self.scm_job != none and self.scm_job.running:
+                self.scm_again = true
+                return
+            self.scm_seq = self.scm_seq + 1
+            self.scm_job = BgProc("/tmp/nyide_git_" + str(self.session_id) + "_" + str(self.scm_seq))
+            self.scm_out = []
+            self.scm_job.start(self.git.refresh_command(), self.git.root)
+            return
+        self._scm_applied()
+
+    # From the frame tick: collects the background refresh's output.
+    def _scm_poll(self):
+        if self.scm_job == none or not self.scm_job.running:
+            return
+        var ls = self.scm_job.poll(20)
+        var i = 0
+        while i < len(ls):
+            self.scm_out.append(ls[i])
+            i = i + 1
+        if not self.scm_job.running:
+            self.git.apply_refresh(self.scm_out)
+            self.scm_out = []
+            self._scm_applied()
+            if self.scm_again:
+                self.scm_again = false
+                self.scm_stale = true
+
+    def _scm_applied(self):
         self.scm_branch = self.git.branch
         self.scm_count = len(self.git.changes)
         var by = {}

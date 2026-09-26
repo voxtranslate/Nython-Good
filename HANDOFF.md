@@ -171,6 +171,17 @@ models rather than copied:
     `NY_STUB_DPI_SCALE` is set, so the IDE can be driven at 2×. Note that
     many e2e checks use fixed scale-1 regions, so only the region-free
     scenarios pass at 2×.
+- **Background work off the frame thread** (on the OS merge):
+  - `BgProc` (Run, Build, tools, the debugger's recording, the terminal)
+    runs on `os_spawn` / `os_proc_read` / `os_poll` / `os_kill`. Nothing
+    goes to disk, polling starts no process (it used to start `tail` each
+    time output grew), and Stop signals the whole process group. Where
+    `os_spawn` is unavailable (Windows) it falls back to the file-and-`tail`
+    route.
+  - Source Control's refresh (branch, HEAD, `git status`) is one background
+    process instead of 3–4 synchronous ones after every save.
+    `GitRepo.refresh_command()` / `apply_refresh()` are shared with the
+    synchronous `refresh()` that `vm_audit43` tests.
 - **Keymaps**: VS Code or Code::Blocks (`CB_KEYMAP`: F9, Ctrl+F9, Ctrl+D,
   ...). *Change Keybinding* captures a pressed key. Bindings are saved in
   `.nyide` (`keybinding = Ctrl+Alt+M | command.id`).
