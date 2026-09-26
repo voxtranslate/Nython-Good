@@ -1372,6 +1372,68 @@ def sc_session(s):
     c(st["title"] == "util.ny", "session: active editor restored", st["title"])
 
 
+def sc_column_select(s):
+    ide = s.start()
+    c = s.res.check
+    s.write("cols.ny", "alpha = 1\nbeta  = 2\ngo\ndelta = 4\n")
+    s.open_file("cols.ny")
+    # Keyboard: Ctrl+Shift+Alt+Down x3, Right x5 selects a 4x5 box.
+    ide.key("ctrl+home")
+    for _ in range(3):
+        ide.key("ctrl+shift+alt+down")
+    for _ in range(5):
+        ide.key("ctrl+shift+alt+right")
+    st = ide.state()
+    c(st["carets"] == 4, "column: one selection per row", st["carets"])
+    ide.key("ctrl+c")
+    st = ide.state()
+    c(st["clipboard"] == "alpha\nbeta \ngo\ndelta", "column: copy keeps the box's rows (short line clipped)", repr(st["clipboard"]))
+    # Typing replaces every row's piece; one undo restores all of them.
+    ide.type("X")
+    st = ide.state()
+    c(st["text"] == "X = 1\nX = 2\nX\nX = 4\n", "column: typing replaces each row", repr(st["text"]))
+    ide.key("ctrl+z")
+    st = ide.state()
+    c(st["text"] == "alpha = 1\nbeta  = 2\ngo\ndelta = 4\n", "column: one undo step", repr(st["text"]))
+    # Mouse: Shift+Alt+drag from row 0 col 0 to row 1 col 5, then cut.
+    hm = ide.hitmap()
+    ed = [h for h in hm if h[4] == "@editor"][0]
+    ide.key("escape")
+    ide.key("ctrl+home")
+    a = ide.find("alpha", region=(ed[0], ed[1], ed[2], ed[3]))
+    b = ide.find("beta", region=(ed[0], ed[1], ed[2], ed[3]))
+    cw = a.w / 5.0
+    ide.send("move %d %d" % (int(a.x) + 1, int(a.cy)))
+    ide.send("down %d %d 1 shift+alt" % (int(a.x) + 1, int(a.cy)))
+    ide.send("move %d %d" % (int(a.x + cw * 3), int(b.cy)))
+    ide.send("move %d %d" % (int(a.x + cw * 5), int(b.cy)))
+    ide.send("up %d %d 1 shift+alt" % (int(a.x + cw * 5), int(b.cy)))
+    st = ide.state()
+    c(st["carets"] == 2, "column: Shift+Alt+drag selects a box", st["carets"])
+    ide.key("ctrl+x")
+    st = ide.state()
+    c(st["text"] == " = 1\n = 2\ngo\ndelta = 4\n" and st["clipboard"] == "alpha\nbeta ", "column: cut removes every row's piece", (repr(st["text"]), repr(st["clipboard"])))
+    # Paste spreads one line per caret.
+    ide.key("ctrl+v")
+    st = ide.state()
+    c(st["text"] == "alpha = 1\nbeta  = 2\ngo\ndelta = 4\n", "column: paste spreads the lines over the carets", repr(st["text"]))
+    ide.key("escape")
+    # Column selection mode: Shift+arrows make boxes.
+    palette(s, "Selection: Column Selection Mode")
+    ide.key("ctrl+home")
+    ide.key("shift+down")
+    ide.key("shift+right")
+    ide.key("shift+right")
+    st = ide.state()
+    c(st["carets"] == 2 and st["sel_text"] == "be", "column: Shift+arrows in column mode", (st["carets"], st["sel_text"]))
+    palette(s, "Selection: Column Selection Mode")
+    ide.key("escape")
+    ide.key("ctrl+home")
+    ide.key("shift+down")
+    st = ide.state()
+    c(st["carets"] == 1 and st["sel_text"] == "alpha = 1\n", "column: mode off gives a normal selection", (st["carets"], repr(st["sel_text"])))
+
+
 SCENARIOS = [
     ("boot", sc_boot), ("edit", sc_edit_undo_save), ("clipboard", sc_clipboard_lines),
     ("multicursor", sc_multicursor), ("palette", sc_palette), ("quickopen", sc_quick_open),
@@ -1381,7 +1443,7 @@ SCENARIOS = [
     ("search", sc_search), ("views", sc_views_layout), ("deadclicks", sc_dead_clicks),
     ("deadviews", sc_dead_clicks_views), ("build", sc_build), ("cbedit", sc_cb_editing),
     ("cbtools", sc_cb_tools), ("cbdebug", sc_cb_debug), ("responsive", sc_responsive),
-    ("session", sc_session),
+    ("session", sc_session), ("columns", sc_column_select),
 ]
 
 

@@ -566,6 +566,9 @@ class NythonIDE(IDETools):
         if e.button == 2:
             if h.cmd == "@tab" or h.cmd == "@tab.close":
                 self._close_doc(h.arg, false)
+            elif h.cmd == "@editor":
+                # Middle-button drag selects a column, as in VS Code.
+                self._box_mouse_start(e.x, e.y)
             return
         self._click(h, e)
 
@@ -601,6 +604,8 @@ class NythonIDE(IDETools):
             self._layout()
         elif d == "select":
             self._drag_select(x, y)
+        elif d == "box":
+            self._box_drag(x, y)
         elif d == "lines":
             var p = self._pos_at(x, y)
             var b = self.buf()
@@ -1092,6 +1097,11 @@ class NythonIDE(IDETools):
         var p = self._pos_at(e.x, e.y)
         b.begin_group()
         self.want_col = -1
+        # Column selection: Shift+Alt+drag (VS Code), or any single-click drag
+        # in column selection mode (Code::Blocks' rectangular selection).
+        if (e.alt and e.shift) or (self.column_mode and e.clicks < 2 and not e.alt and not e.shift):
+            self._box_mouse_start(e.x, e.y)
+            return
         if e.alt:
             if self._add_caret(p[0], p[1]):
                 self.status_msg = str(self.selmodel.count) + " cursors"
@@ -1945,6 +1955,10 @@ class NythonIDE(IDETools):
         var d = self.doc()
         var b = d.buf
         var nav = k == "left" or k == "right" or k == "up" or k == "down" or k == "home" or k == "end" or k == "pageup" or k == "pagedown"
+        if nav and self.column_mode and e.shift and not e.ctrl and not e.alt and (k == "left" or k == "right" or k == "up" or k == "down"):
+            b.begin_group()
+            self._box_key(k)
+            return
         if nav:
             b.begin_group()
             var had_sel = self._sel_range()

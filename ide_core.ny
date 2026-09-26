@@ -1440,6 +1440,11 @@ class IDECore:
     def _copy(self):
         if not self._is_text():
             return
+        if self.selmodel.count > 1:
+            self._set_clipboard(self._multi_copy_text())
+            self.clip_line_mode = false
+            self.status_msg = "Copied " + str(self.selmodel.count) + " selections"
+            return
         var s = self._sel_text()
         if s != "":
             self._set_clipboard(s)
@@ -1452,6 +1457,9 @@ class IDECore:
 
     def _cut(self):
         if not self._can_edit():
+            return
+        if self.selmodel.count > 1:
+            self._multi_cut()
             return
         var s = self._sel_text()
         if s != "":
@@ -1474,6 +1482,9 @@ class IDECore:
             self.status_msg = "Clipboard is empty"
             return
         var b = self.buf()
+        if self.selmodel.count > 1:
+            self._multi_paste(text)
+            return
         b.begin_group()
         if self._sel_range() != none:
             # Pasting over a selection is one undo step.

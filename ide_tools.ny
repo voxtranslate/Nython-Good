@@ -143,6 +143,15 @@ class IDETools(IDEViews):
         self.session_open = []
         self.session_active = ""
         self.session_root = ""
+        # Column selection: two corners, rows and text-area x (pixels from
+        # the text origin, so tabs line up by what is on screen).
+        self.column_mode = false
+        self.box_doc = none
+        self.box_r0 = 0
+        self.box_x0 = 0
+        self.box_r1 = 0
+        self.box_x1 = 0
+        self.box_sig = ""
 
     # ══ commands and menus ═════════════════════════════════════════════════════
     # Called at the end of _register_commands (ide_core.ny).
@@ -199,6 +208,14 @@ class IDETools(IDEViews):
         c._cmd("nython.addToWatch", "Debug", "Add to Watch", "", "")
         # Window
         c._cmd("workbench.action.toggleFullScreen", "View", "Toggle Full Screen", "F11", "!inDebugMode")
+        # Column (box) selection: VS Code's keys; Shift+Alt+drag and a
+        # middle-button drag with the mouse; the mode makes Shift+arrows and
+        # plain drags rectangular (Code::Blocks' Alt+drag).
+        c._cmd("cursorColumnSelectUp", "Selection", "Column Select Up", "Ctrl+Shift+Alt+Up", "editorFocus")
+        c._cmd("cursorColumnSelectDown", "Selection", "Column Select Down", "Ctrl+Shift+Alt+Down", "editorFocus")
+        c._cmd("cursorColumnSelectLeft", "Selection", "Column Select Left", "Ctrl+Shift+Alt+Left", "editorFocus")
+        c._cmd("cursorColumnSelectRight", "Selection", "Column Select Right", "Ctrl+Shift+Alt+Right", "editorFocus")
+        c._cmd("editor.action.toggleColumnSelection", "Selection", "Column Selection Mode", "", "editorFocus")
 
         # Menus: Code::Blocks' Build and Tools join VS Code's bar.
         self.menus = ["File", "Edit", "Selection", "View", "Go", "Build", "Run", "Terminal", "Tools", "Help"]
@@ -233,6 +250,9 @@ class IDETools(IDEViews):
         go.append("nython.bookmarks.prev")
         go.append("nython.bookmarks.list")
         go.append("nython.bookmarks.clear")
+        var se = self.menu_items["Selection"]
+        se.append("-")
+        se.append("editor.action.toggleColumnSelection")
         var rn = self.menu_items["Run"]
         rn.append("-")
         rn.append("nython.debug.runToCursor")
@@ -266,6 +286,20 @@ class IDETools(IDEViews):
     def _tools_exec(self, id, arg):
         if id == "nython.build":
             self._build_start("all", false)
+        elif id == "cursorColumnSelectUp":
+            self._box_key("up")
+        elif id == "cursorColumnSelectDown":
+            self._box_key("down")
+        elif id == "cursorColumnSelectLeft":
+            self._box_key("left")
+        elif id == "cursorColumnSelectRight":
+            self._box_key("right")
+        elif id == "editor.action.toggleColumnSelection":
+            self.column_mode = not self.column_mode
+            if self.column_mode:
+                self.status_msg = "Column selection mode: Shift+arrows and drags select rectangles"
+            else:
+                self.status_msg = "Column selection mode off"
         elif id == "nython.compileFile":
             self._build_start("current", false)
         elif id == "nython.runTarget":
@@ -1005,6 +1039,262 @@ class IDETools(IDEViews):
                 last = r
             i = i + 1
         return out
+
+    # ══ column (box) selection ═════════════════════════════════════════════════
+    # Each row of the box becomes one selection of the multi-cursor model
+    # (the head row is the primary), so typing, Backspace, Delete, copy, cut
+    # and paste act on every row. Rows shorter than the box get a caret at
+    # their end, as in VS Code.
+    def _col_at_rel(self, line, rel):
+        if rel <= 0:
+            return 0
+        var col = int(rel / self.char_w + 0.5)
+        if col > len(line):
+            col = len(line)
+        while col > 0 and self._col_x(line, col) > rel + self.char_w / 2:
+            col = col - 1
+        while col < len(line) and self._col_x(line, col + 1) < rel + self.char_w / 2:
+            col = col + 1
+        return col
+
+    def _rel_of_col(self, row):
+        var b = self.buf()
+        return self._col_x(b.get_line(row), b.cursor_col)
+
+    def _box_signature(self):
+        var b = self.buf()
+        return str(self.selmodel.count) + ":" + str(b.cursor_row) + ":" + str(b.cursor_col) + ":" + str(b.state_id())
+
+    # Is the current selection still the box last made (nothing moved)?
+    def _box_live(self):
+        return self.box_doc == self.doc() and self.box_sig == self._box_signature()
+
+    def _box_begin(self, row, rel):
+        self._clear_extra_carets()
+        self.box_doc = self.doc()
+        self.box_r0 = row
+        self.box_x0 = rel
+        self.box_r1 = row
+        self.box_x1 = rel
+
+    def _box_apply(self):
+        var d = self.doc()
+        var b = d.buf
+        if self.box_r1 >= b.line_count:
+            self.box_r1 = b.line_count - 1
+        if self.box_r1 < 0:
+            self.box_r1 = 0
+        self._clear_extra_carets()
+        var step = 1
+        if self.box_r1 < self.box_r0:
+            step = 0 - 1
+        # Rows hidden in a fold are skipped, as a person would expect.
+        var r = self.box_r0
+        var done = false
+        while not done:
+            if r == self.box_r1:
+                done = true
+            if r != self.box_r1 and not self._is_hidden_row(d, r):
+                var line = b.get_line(r)
+                var ca = self._col_at_rel(line, self.box_x0)
+                var ch = self._col_at_rel(line, self.box_x1)
+                self._add_selection(r, ca, r, ch)
+            r = r + step
+        var hl = b.get_line(self.box_r1)
+        var ha = self._col_at_rel(hl, self.box_x0)
+        var hh = self._col_at_rel(hl, self.box_x1)
+        b.cursor_row = self.box_r1
+        b.cursor_col = hh
+        d.sel_on = ha != hh
+        d.sel_row = self.box_r1
+        d.sel_col = ha
+        self._sync_primary_caret()
+        self.box_sig = self._box_signature()
+        var n = self.selmodel.count
+        if n > 1:
+            self.status_msg = str(n) + " rows selected (column selection)"
+        self._reveal_caret()
+
+    def _is_hidden_row(self, d, r):
+        if d.folds == none or len(d.folds) == 0:
+            return false
+        return self._row_to_vrow(d, r) == self._row_to_vrow(d, r - 1) and r > 0
+
+    # Ctrl+Shift+Alt+arrows (and Shift+arrows in column selection mode).
+    def _box_key(self, k):
+        if not self._is_text():
+            return
+        var b = self.buf()
+        if not self._box_live():
+            self._sel_clear()
+            self._box_begin(b.cursor_row, self._rel_of_col(b.cursor_row))
+        if k == "up" and self.box_r1 > 0:
+            self.box_r1 = self.box_r1 - 1
+        elif k == "down" and self.box_r1 + 1 < b.line_count:
+            self.box_r1 = self.box_r1 + 1
+        elif k == "left":
+            self.box_x1 = self.box_x1 - self.char_w
+            if self.box_x1 < 0:
+                self.box_x1 = 0
+        elif k == "right":
+            self.box_x1 = self.box_x1 + self.char_w
+        self._box_apply()
+
+    # Mouse: the drag that started a box moves its head.
+    def _box_drag(self, x, y):
+        var d = self.doc()
+        if d.buf == none:
+            return
+        if y < self.ed_y:
+            d.scroll_y = d.scroll_y - self.LINE_H
+        elif y > self.ed_y + self.ed_h:
+            d.scroll_y = d.scroll_y + self.LINE_H
+        self._clamp_scroll()
+        var p = self._pos_at(x, y)
+        var rel = x - (self.text_x0 - d.scroll_x)
+        if rel < 0:
+            rel = 0
+        if p[0] == self.box_r1 and rel == self.box_x1:
+            return
+        self.box_r1 = p[0]
+        self.box_x1 = rel
+        self._box_apply()
+
+    def _box_mouse_start(self, x, y):
+        if not self._is_text():
+            return
+        self.focus = "editor"
+        self.ac_open = false
+        var d = self.doc()
+        var p = self._pos_at(x, y)
+        var rel = x - (self.text_x0 - d.scroll_x)
+        if rel < 0:
+            rel = 0
+        self._sel_clear()
+        self._box_begin(p[0], rel)
+        self._box_apply()
+        self.dragging = "box"
+
+    # ── clipboard over several selections ──────────────────────────────────
+    # [start_row, start_col, end_row, end_col, index] for every selection,
+    # in document order; index 0 is the primary.
+    def _sels_in_order(self):
+        var b = self.buf()
+        var out = []
+        var g = self._sel_range()
+        if g == none:
+            out.append([b.cursor_row, b.cursor_col, b.cursor_row, b.cursor_col, 0])
+        else:
+            out.append([g[0], g[1], g[2], g[3], 0])
+        var i = 1
+        while i < self.selmodel.count:
+            var s = self.selmodel.sels[i]
+            var st = s.start()
+            var en = s.end()
+            out.append([st.row, self._clamp_col(st.row, st.col), en.row, self._clamp_col(en.row, en.col), i])
+            i = i + 1
+        # Insertion sort: a handful of rows, and it keeps equal starts stable.
+        var j = 1
+        while j < len(out):
+            var cur = out[j]
+            var k = j - 1
+            while k >= 0 and (out[k][0] > cur[0] or (out[k][0] == cur[0] and out[k][1] > cur[1])):
+                out[k + 1] = out[k]
+                k = k - 1
+            out[k + 1] = cur
+            j = j + 1
+        return out
+
+    # Copy: the selected pieces joined by newlines (empty selections count as
+    # empty lines, so a box's shape survives a copy and paste round trip).
+    def _multi_copy_text(self):
+        var b = self.buf()
+        var ss = self._sels_in_order()
+        var parts = []
+        var i = 0
+        while i < len(ss):
+            var s = ss[i]
+            parts.append(b.text_range(s[0], s[1], s[2], s[3]))
+            i = i + 1
+        return string_join(parts, "\n")
+
+    # Replaces selection i (document order) with texts[i], every one in one
+    # undo step; afterwards each caret sits after its replacement.
+    def _multi_replace(self, texts):
+        var b = self.buf()
+        var d = self.doc()
+        var ss = self._sels_in_order()
+        var ends = []
+        var i = 0
+        while i < len(ss):
+            ends.append(none)
+            i = i + 1
+        var g = b.open_group()
+        i = len(ss) - 1
+        while i >= 0:
+            var s = ss[i]
+            if s[0] != s[2] or s[1] != s[3]:
+                b.delete_range(s[0], s[1], s[2], s[3])
+            b.cursor_row = s[0]
+            b.cursor_col = s[1]
+            if texts[i] != "":
+                b.insert_text(texts[i])
+            var ne = Pos(b.cursor_row, b.cursor_col)
+            # Later selections (already replaced) move with this edit.
+            var j = i + 1
+            while j < len(ss):
+                self._xform(ends[j], Pos(s[0], s[1]), Pos(s[2], s[3]), ne)
+                j = j + 1
+            ends[i] = ne
+            i = i - 1
+        b.close_group(g)
+        i = 0
+        while i < len(ss):
+            var idx = ss[i][4]
+            var p = ends[i]
+            if idx == 0:
+                b.cursor_row = p.row
+                b.cursor_col = p.col
+                d.sel_on = false
+            else:
+                var sel = self.selmodel.sels[idx]
+                sel.caret.row = p.row
+                sel.caret.col = p.col
+                sel.anchor.row = p.row
+                sel.anchor.col = p.col
+            i = i + 1
+        self._sync_primary_caret()
+        self._after_edit()
+
+    def _multi_cut(self):
+        var text = self._multi_copy_text()
+        self._set_clipboard(text)
+        self.clip_line_mode = false
+        var blanks = []
+        var i = 0
+        while i < self.selmodel.count:
+            blanks.append("")
+            i = i + 1
+        self._multi_replace(blanks)
+        self.status_msg = "Cut " + str(self.selmodel.count) + " selections"
+
+    # Paste over several carets: one clipboard line per caret when the
+    # counts match (VS Code's "spread"), else the whole text at each.
+    def _multi_paste(self, text):
+        var n = self.selmodel.count
+        var lines = string_split(string_replace(text, "\r\n", "\n"), "\n")
+        var nl = len(lines)
+        if nl == n + 1 and lines[n] == "":
+            nl = n
+        var texts = []
+        var i = 0
+        while i < n:
+            if nl == n:
+                texts.append(lines[i])
+            else:
+                texts.append(text)
+            i = i + 1
+        self._multi_replace(texts)
 
     # ══ insert / overwrite ═════════════════════════════════════════════════════
     # Before a typed character in overwrite mode: the character under the

@@ -132,6 +132,15 @@ models rather than copied:
   - Duplicate, transpose, upper / lower / title case.
   - Format Document / Selection (Shift+Alt+F) in the file's own
     indentation unit, as one undo step.
+- **Column (box) selection**: Shift+Alt+drag, middle-button drag,
+  Ctrl+Shift+Alt+arrows, or *Column Selection Mode* (Shift+arrows and plain
+  drags select rectangles, like Code::Blocks' Alt+drag). The box is two
+  corners in text-area pixels, so tabs line up by what is on screen. Each
+  row becomes one selection of the multi-cursor model, so typing, Backspace
+  and Delete act on every row. Copy joins the rows, cut removes them, and
+  paste spreads one line per caret when the counts match (VS Code's
+  "spread"). Copy, cut and paste with several selections used to act on the
+  primary only.
 - **Keymaps**: VS Code or Code::Blocks (`CB_KEYMAP`: F9, Ctrl+F9, Ctrl+D,
   ...). *Change Keybinding* captures a pressed key. Bindings are saved in
   `.nyide` (`keybinding = Ctrl+Alt+M | command.id`).
@@ -164,7 +173,7 @@ Defects found while driving these, all fixed:
   `len(prefix)` characters, not the ones the fuzzy matcher matched.
 
 e2e scenarios added: `build`, `cbedit`, `cbtools`, `cbdebug`, `responsive`,
-`session`.
+`session`, `columns`.
 
 ---
 
