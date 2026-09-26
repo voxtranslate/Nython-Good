@@ -318,11 +318,19 @@ struct VMCode {
         return (int)instructions.size()-1;
     }
     void patch(int idx, int arg) { instructions[idx].arg=arg; }
+    // Whether this function is a generator: a yield in its own body. A yield
+    // in a nested function belongs to that function - searching sub_codes
+    // made every function that merely defines a generator a generator
+    // itself (make(k) returning an inner generator function returned a
+    // generator instead).
     bool has_yield() const {
-        for(auto& ins:instructions) if(ins.op==Op::YIELD_VALUE||ins.op==Op::YIELD_FROM_OP) return true;
-        for(auto& sub:sub_codes) if(sub && sub->has_yield()) return true;
-        return false;
+        if(yield_known) return yield_cached;
+        bool y=false;
+        for(auto& ins:instructions) if(ins.op==Op::YIELD_VALUE||ins.op==Op::YIELD_FROM_OP){ y=true; break; }
+        yield_cached=y; yield_known=true;
+        return y;
     }
+    mutable bool yield_known=false, yield_cached=false;
     int  here() const { return (int)instructions.size(); }
 };
 
@@ -755,9 +763,20 @@ private:
                && b->right->type()==NT::VARIABLE){
                 const std::string& tn=b->right->token().value;
                 if(isTypeNameToken(tn)){
+                    // A builtin type word (int, list, ...) is always a type
+                    // test. Any other capitalised name is decided at run time
+                    // (COMPARE_IS_TYPE arg 1): a type test when it names a
+                    // class, identity when it is an ordinary value - `L is L`
+                    // for a list named L was compiled as a type test and read
+                    // false.
+                    static const std::set<std::string> words = {
+                        "int","Integer","integer","float","Float","double","Double",
+                        "str","String","string","bool","Boolean","boolean",
+                        "list","List","array","Array","map","Map","dict","Dict",
+                        "none","None","function","Function","Object","object","any","Any"};
                     visit(b->left);
                     emit_lc(VMVal::make_str(tn),l);
-                    emit(op=="is not"?Op::COMPARE_IS_NOT_TYPE:Op::COMPARE_IS_TYPE,0,l);
+                    emit(op=="is not"?Op::COMPARE_IS_NOT_TYPE:Op::COMPARE_IS_TYPE, words.count(tn)?0:1, l);
                     break;
                 }
             }
@@ -1900,8 +1919,21 @@ public:
     }
 
 private:
+    // Names resolve lexically: the running frame's locals and closure, the
+    // frames of the functions it is nested in (they share its closure
+    // environment - MAKE_FUNCTION), the main module's frame, then globals.
+    // Every frame on the call stack used to be searched, so a function read
+    // and assigned its CALLER's local variables (dynamic scoping): a helper
+    // doing `i = 99` changed the i of whichever function called it.
+    bool frame_visible(int i) const {
+        int top=(int)call_stack_.size()-1;
+        if(i==top || i==0) return true;
+        const auto& env=call_stack_[top].closure_env;
+        return env && call_stack_[i].closure_env.get()==env.get();
+    }
     VMVal load_var(const std::string& n) {
         for(int i=(int)call_stack_.size()-1;i>=0;i--){
+            if(!frame_visible(i)) continue;
             auto v=call_stack_[i].get_local(n);
             if(v.type!=VMType::UNDEFINED) return v;
         }
@@ -1920,14 +1952,28 @@ private:
         return VMVal::make_none();
     }
     void store_var(const std::string& n, VMVal v) {
-        // Walk frames: if found in locals or closure_env, update there
+        // An existing binding in a lexically visible scope is rebound
+        // (Nython's `x = ...` updates an enclosing variable); otherwise the
+        // name becomes a local of the running frame.
         for(int i=(int)call_stack_.size()-1;i>=0;i--){
-            if(call_stack_[i].locals.count(n)){
-                call_stack_[i].locals[n]=std::move(v); return;
+            if(!frame_visible(i)) continue;
+            auto& f=call_stack_[i];
+            bool in_locals=f.locals.count(n)>0;
+            bool in_env=f.closure_env && f.closure_env->count(n);
+            if(!in_locals && !in_env) continue;
+            // A closure variable is one binding: write it to the shared
+            // environment and to every still-running frame that holds a copy
+            // (the enclosing function read its stale local after an inner
+            // function assigned the variable: x += 1 in inc() left outer's x
+            // unchanged).
+            if(in_env) (*f.closure_env)[n]=v;
+            if(in_locals) f.locals[n]=v;
+            if(in_env){
+                for(int j=(int)call_stack_.size()-1;j>=0;j--)
+                    if(j!=i && frame_visible(j) && call_stack_[j].closure_env==f.closure_env && call_stack_[j].locals.count(n))
+                        call_stack_[j].locals[n]=v;
             }
-            if(call_stack_[i].closure_env && call_stack_[i].closure_env->count(n)){
-                (*call_stack_[i].closure_env)[n]=std::move(v); return;
-            }
+            return;
         }
         if(!call_stack_.empty()) call_stack_.back().locals[n]=std::move(v);
         else globals_[n]=std::move(v);
@@ -2908,8 +2954,18 @@ private:
             case Op::COMPARE_NOT_IN:   { VMVal c=pop(),it=pop(); push(VMVal::make_bool(!op_in(it,c))); break; }
             case Op::COMPARE_IS:       { VMVal r=pop(),l=pop(); push(VMVal::make_bool(op_is(l,r))); break; }
             case Op::COMPARE_IS_NOT:   { VMVal r=pop(),l=pop(); push(VMVal::make_bool(!op_is(l,r))); break; }
-            case Op::COMPARE_IS_TYPE:  { VMVal t=pop(),v=pop(); push(VMVal::make_bool(value_is_type(v,t.s))); break; }
-            case Op::COMPARE_IS_NOT_TYPE:{ VMVal t=pop(),v=pop(); push(VMVal::make_bool(!value_is_type(v,t.s))); break; }
+            case Op::COMPARE_IS_TYPE:
+            case Op::COMPARE_IS_NOT_TYPE: {
+                VMVal t=pop(),v=pop();
+                bool r;
+                VMVal named;
+                if(ins.arg==1 && (named=load_var(t.s)).type!=VMType::NONE && named.type!=VMType::CLASS
+                   && named.type!=VMType::UNDEFINED)
+                    r=op_is(v,named);          // an ordinary value: identity
+                else
+                    r=value_is_type(v,t.s);
+                push(VMVal::make_bool(ins.op==Op::COMPARE_IS_TYPE ? r : !r)); break;
+            }
             // Unary
             case Op::UNARY_NEG: {
                 VMVal v=pop();
