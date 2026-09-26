@@ -426,6 +426,23 @@ var sp = nt_stft([0.0, 1.0, 0.0, -1.0, 0.0, 1.0, 0.0, -1.0], 4, 4, false)
 check_list("stft (Hann, period-4 tone): all energy in bin 1", sp[0], [0.0, 0.0, 1.0, 1.0, 0.0, 0.0], 0.000000000001)
 check("nms drops the overlapping box", nms([[0, 0, 10, 10], [1, 1, 11, 11], [20, 20, 30, 30]], [0.9, 0.8, 0.7], 0.5), [0, 2])
 
+print("== one definition per class name ==")
+# lib/nytorch.ny loads every submodule; the class a name resolves to must be
+# the real one whichever file was imported last (these used to be shadowed
+# by fakes: a TransformerEncoderLayer returning random lists, a second
+# GATLayer/GraphSAGE/DDPMScheduler, four KnowledgeBase classes).
+torch.manual_seed(2)
+var tel = TransformerEncoderLayer(8, 2, 16, 0.0)
+check("TransformerEncoderLayer is the Module", isinstance(tel, Module), true)
+check("TransformerEncoderLayer keeps (L, E)", tel.forward(Tensor(nt_randn([3, 8]), false, [3, 8]), none, none).shape, [3, 8])
+check("GATLayer is the attention one", GATLayer(4, 3, 2, 0.0).forward([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]], [[1], [0]]).shape, [2, 3])
+check("GraphSAGE takes (in, hidden, out, layers, aggregator)", GraphSAGE(4, 5, 2, 2, "mean").forward([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]], [[1], [0]]).shape, [2, 2])
+check("DDPMScheduler is the full scheduler", len(DDPMScheduler(10, 0.0001, 0.02).alphas_cumprod), 10)
+var kbase = KnowledgeBase("/tmp/vm_audit47_kb")
+check("KnowledgeBase is the storage one", kbase.has("nothing"), false)
+var cc = os_exec("python3 tools/ny_classcheck.py")
+check("tools/ny_classcheck.py finds no duplicate class names", string_find(cc, "no duplicate") >= 0, true)
+
 print("")
 print("Results: " + str(pass_n) + " passed, " + str(fail_n) + " failed")
 if fail_n == 0:

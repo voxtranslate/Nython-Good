@@ -1,9 +1,4 @@
-import nytorch
-import "lib/nytorch/activations.ny"
-import "lib/nytorch/reinforcement.ny"
-import "lib/nytorch/convnets.ny"
-import "lib/nytorch/neural_ode.ny"
-import "lib/nytorch/sequence.ny"
+import "lib/nytorch.ny"
 
 print "=== NYTORCH16 NEXT-GEN AI ARCHITECTURES TEST SUITE ==="
 print ""

@@ -1,6 +1,4 @@
-import nytorch
-import "lib/nytorch/activations.ny"
-import "lib/nytorch/reinforcement.ny"
+import "lib/nytorch.ny"
 
 print "=== NYTORCH13 TEST SUITE ==="
 print ""

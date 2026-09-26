@@ -1,8 +1,4 @@
-import nytorch
-import "lib/nytorch/storage.ny"
-import "lib/nytorch/serving.ny"
-import "lib/nytorch/vision.ny"
-import "lib/nytorch/distributed.ny"
+import "lib/nytorch.ny"
 
 print "=== NyTorch v3.0 Part 12 Test Suite ==="
 
