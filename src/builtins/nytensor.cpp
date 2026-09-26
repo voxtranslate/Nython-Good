@@ -1199,7 +1199,9 @@ NT_OP("nt_reduce", {
     Red r = plan_reduce(x.s, a[3], truthy(a[4]));
     double corr = Dor(a, 5, 1.0, "correction");
     Vec out = reduce(op, *x.d, x.s, r, corr);
-    return pair(std::move(out), r.out);
+    Val res = pair(std::move(out), r.out);
+    if (op == "argmax" || op == "argmin") res.items[0].v_int = true;   // indices come back as ints
+    return res;
 });
 NT_OP("nt_reduce_bw", {
     need(a, 6, "nt_reduce_bw(op, x, shape, dims, grad, out[, correction])");
