@@ -459,7 +459,6 @@ private:
     void visit(np nd) {
         if(!nd) return;
         int l=ln(nd);
-        if(nd->type()==NT::WALRUS) std::cerr<<"[DBG] visit WALRUS node!\n";
         switch(nd->type()) {
         // Literals
         case NT::INTEGER: emit_lc(VMVal::make_int(parse_int_literal(nd->token().value)),l); break;
@@ -696,8 +695,6 @@ private:
             visit(wn->init);
             emit(Op::DUP_TOP,0,l);
             emit_dn(wn->name,l);
-            // DEBUG: verify DUP_TOP leaves a value
-            std::cerr<<"[DBG] WALRUS compiled: init, DUP_TOP, DEFINE_NAME("<<wn->name<<")\n";
             break;
         }
         // Pass / global / nonlocal
@@ -795,7 +792,13 @@ private:
             }
             if(!wildcard_handled){
                 emit(Op::POP_TOP,0,l);
-                if(sw->default_case) visit(sw->default_case);
+                // default_case is a DefaultNode wrapping the body; visiting
+                // the wrapper itself compiled to a NOP, so `default:` never
+                // ran on the VM.
+                if(sw->default_case){
+                    auto dn=std::static_pointer_cast<nython::node::DefaultNode>(sw->default_case);
+                    if(dn->body) visit(dn->body);
+                }
             }
             int end=C().here();
             for(int j:end_jumps) C().patch(j,end);

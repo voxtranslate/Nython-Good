@@ -719,6 +719,17 @@ int main(int argc, char** argv, char** env) {
 
             // ── Bytecode VM ──────────────────────────────────────────────
             if (arg1 == "--vm" && argc >= 3) {
+                // SourceCode treats a string that is not an existing file as
+                // program TEXT, so a mistyped path used to be run as code
+                // (`--vm t/x.ny` evaluated `t / x.ny`). Refuse it like the
+                // interpreter's run_file() does.
+                {
+                    struct stat vm_st;
+                    if (stat(argv[2], &vm_st) != 0) {
+                        std::cerr << "[Nython] No such file: " << argv[2] << "\n";
+                        return 2;
+                    }
+                }
                 try {
                     auto source = SourceCode(std::string(argv[2]));
                     auto reporter = std::make_shared<Reporter>(source);
@@ -769,6 +780,13 @@ int main(int argc, char** argv, char** env) {
             }
 
             if ((arg1 == "--disasm" || arg1 == "-d") && argc >= 3) {
+                {
+                    struct stat da_st;
+                    if (stat(argv[2], &da_st) != 0) {
+                        std::cerr << "[Nython] No such file: " << argv[2] << "\n";
+                        return 2;
+                    }
+                }
                 try {
                     auto source = SourceCode(std::string(argv[2]));
                     auto reporter = std::make_shared<Reporter>(source);
