@@ -45,7 +45,12 @@ struct WinEntry {
     SDL_WindowID  sdl_id = 0;
     int last_w = 0, last_h = 0;          // last size reported in a "resize"
     std::vector<SDL_Rect> clip_stack{};  // gui_push_clip / gui_pop_clip
+    // gui_push_offset: everything drawn is shifted by (ox, oy), so a scrolled
+    // container moves all its descendants without touching their positions.
+    float ox = 0.0f, oy = 0.0f;
+    std::vector<std::pair<float,float>> off_stack{};
 };
+
 static std::unordered_map<int, WinEntry>      g_windows;
 static std::unordered_map<int, TTF_Font*>     g_fonts;
 
@@ -179,6 +184,9 @@ static int    VI(const Value& v) { return v.type==ValueType::INTEGER?(int)bi64(v
 static float  VF(const Value& v) { return (float)(v.type==ValueType::DOUBLE?(double)v.value.d:v.type==ValueType::INTEGER?(double)bi64(v.value.i):0.0); }
 static Uint8  VU(const Value& v) { return (Uint8)std::clamp(VI(v),0,255); }
 static std::string VS(NythonExecutor& E, const Value& v) { return E.getStringValue(v); }
+// Coordinates with the window's current drawing offset applied.
+static inline float OX(const WinEntry* we, const Value& v) { return VF(v) + we->ox; }
+static inline float OY(const WinEntry* we, const Value& v) { return VF(v) + we->oy; }
 
 static Value make_int_list(NythonExecutor& E, const std::vector<int>& xs) {
     auto* lst=new Object((Runnable*)E.runner,"list",Type::LIST);
@@ -1038,8 +1046,8 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
         SDL_GetWindowSize(we->win,&ww,&wh);
         float sx = ow>0 ? (float)ww/(float)ow : 1.0f;
         float sy = oh>0 ? (float)wh/(float)oh : 1.0f;
-        SDL_Rect rc={(int)(VF(args[1])*sx),(int)(VF(args[2])*sy),(int)(VF(args[3])*sx),(int)(VF(args[4])*sy)};
-        int cursor = args.size()>=6 ? (int)(VF(args[5])*sx) : 0;
+        SDL_Rect rc={(int)(OX(we,args[1])*sx),(int)(OY(we,args[2])*sy),(int)(VF(args[3])*sx),(int)(VF(args[4])*sy)};
+        int cursor = args.size()>=6 ? (int)(VF(args[5])*sx) : 0;   // relative to the rect
         return Value(SDL_SetTextInputArea(we->win,&rc,cursor));
     }
 
@@ -1075,6 +1083,7 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
             // A frame ends here: clips pushed and never popped do not leak
             // into the next one.
             if(!we->clip_stack.empty()){ we->clip_stack.clear(); apply_clip(*we,nullptr); }
+            we->off_stack.clear(); we->ox=0; we->oy=0;
             SDL_RenderPresent(we->ren);
         }
         return NONE_VALUE;
@@ -1083,7 +1092,7 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
     if(name=="gui_fill_rect"){
         if(args.size()<9) return NONE_VALUE;
         if(WinEntry* we=win_of(args)){
-            SDL_FRect rc={VF(args[1]),VF(args[2]),VF(args[3]),VF(args[4])};
+            SDL_FRect rc={OX(we,args[1]),OY(we,args[2]),VF(args[3]),VF(args[4])};
             SDL_SetRenderDrawColor(we->ren,VU(args[5]),VU(args[6]),VU(args[7]),VU(args[8]));
             SDL_SetRenderDrawBlendMode(we->ren,SDL_BLENDMODE_BLEND);
             SDL_RenderFillRect(we->ren,&rc);
@@ -1096,21 +1105,21 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
         if(WinEntry* we=win_of(args)){
             SDL_SetRenderDrawColor(we->ren,VU(args[5]),VU(args[6]),VU(args[7]),VU(args[8]));
             int bw=std::max(1,VI(args[9]));
-            for(int i=0;i<bw;i++){SDL_FRect r2={VF(args[1])+(float)i,VF(args[2])+(float)i,VF(args[3])-2.0f*i,VF(args[4])-2.0f*i};SDL_RenderRect(we->ren,&r2);}
+            for(int i=0;i<bw;i++){SDL_FRect r2={OX(we,args[1])+(float)i,OY(we,args[2])+(float)i,VF(args[3])-2.0f*i,VF(args[4])-2.0f*i};SDL_RenderRect(we->ren,&r2);}
         }
         return NONE_VALUE;
     }
     // gui_fill_rounded_rect(handle, x, y, w, h, r, g, b, a, radius)
     if(name=="gui_fill_rounded_rect"){
         if(args.size()<10) return NONE_VALUE;
-        if(WinEntry* we=win_of(args)) fill_rounded_rect(we->ren,VF(args[1]),VF(args[2]),VF(args[3]),VF(args[4]),VF(args[9]),VU(args[5]),VU(args[6]),VU(args[7]),VU(args[8]));
+        if(WinEntry* we=win_of(args)) fill_rounded_rect(we->ren,OX(we,args[1]),OY(we,args[2]),VF(args[3]),VF(args[4]),VF(args[9]),VU(args[5]),VU(args[6]),VU(args[7]),VU(args[8]));
         return NONE_VALUE;
     }
     // gui_draw_rounded_rect(handle, x, y, w, h, r, g, b, a, radius, border_w)
     if(name=="gui_draw_rounded_rect"){
         if(args.size()<10) return NONE_VALUE;
         int bw = args.size()>=11 ? VI(args[10]) : 1;
-        if(WinEntry* we=win_of(args)) draw_rounded_rect(we->ren,VF(args[1]),VF(args[2]),VF(args[3]),VF(args[4]),VF(args[9]),VU(args[5]),VU(args[6]),VU(args[7]),VU(args[8]),bw);
+        if(WinEntry* we=win_of(args)) draw_rounded_rect(we->ren,OX(we,args[1]),OY(we,args[2]),VF(args[3]),VF(args[4]),VF(args[9]),VU(args[5]),VU(args[6]),VU(args[7]),VU(args[8]),bw);
         return NONE_VALUE;
     }
     // gui_draw_arc(handle, cx, cy, r_inner, r_outer, start_deg, end_deg, r, g, b, a)
@@ -1118,7 +1127,7 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
     // 0 at 3 o'clock, increasing clockwise.
     if(name=="gui_draw_arc"){
         if(args.size()<11) return NONE_VALUE;
-        if(WinEntry* we=win_of(args)) fill_arc(we->ren,VF(args[1]),VF(args[2]),VF(args[3]),VF(args[4]),VF(args[5]),VF(args[6]),VU(args[7]),VU(args[8]),VU(args[9]),VU(args[10]));
+        if(WinEntry* we=win_of(args)) fill_arc(we->ren,OX(we,args[1]),OY(we,args[2]),VF(args[3]),VF(args[4]),VF(args[5]),VF(args[6]),VU(args[7]),VU(args[8]),VU(args[9]),VU(args[10]));
         return NONE_VALUE;
     }
     // gui_draw_text(handle, text, x, y, font_handle, r, g, b, a) -> width drawn
@@ -1128,7 +1137,7 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
         auto fit=g_fonts.find(VI(args[4]));
         if(we&&fit!=g_fonts.end()){
             SDL_Color c={VU(args[5]),VU(args[6]),VU(args[7]),VU(args[8])};
-            draw_text_run(*we,VI(args[4]),fit->second,VS(E,args[1]),VF(args[2]),VF(args[3]),c);
+            draw_text_run(*we,VI(args[4]),fit->second,VS(E,args[1]),OX(we,args[2]),OY(we,args[3]),c);
         }
         return NONE_VALUE;
     }
@@ -1145,8 +1154,8 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
         if(lh<=0) lh=measure(fid,fit->second,"Ag").second;
         SDL_Color c={VU(args[5]),VU(args[6]),VU(args[7]),VU(args[8])};
         auto lines=wrap_text(fid,fit->second,VS(E,args[1]),VI(args[9]));
-        float y=VF(args[3]);
-        for(auto& ln:lines){ draw_text_run(*we,fid,fit->second,ln,VF(args[2]),y,c); y+=(float)lh; }
+        float y=OY(we,args[3]);
+        for(auto& ln:lines){ draw_text_run(*we,fid,fit->second,ln,OX(we,args[2]),y,c); y+=(float)lh; }
         return Value((int)lines.size()*lh);
     }
     // gui_wrap_text(font, text, width) -> list of lines
@@ -1172,7 +1181,7 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
         if(we&&iit!=g_images.end()){
             SDL_Texture* t=image_texture(iit->second,we->ren);
             if(t){
-                SDL_FRect dst={VF(args[2]),VF(args[3]),VF(args[4]),VF(args[5])};
+                SDL_FRect dst={OX(we,args[2]),OY(we,args[3]),VF(args[4]),VF(args[5])};
                 SDL_RenderTexture(we->ren,t,nullptr,&dst);
             }
         }
@@ -1184,7 +1193,7 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
         if(WinEntry* we=win_of(args)){
             SDL_SetRenderDrawColor(we->ren,VU(args[5]),VU(args[6]),VU(args[7]),VU(args[8]));
             SDL_SetRenderDrawBlendMode(we->ren,SDL_BLENDMODE_BLEND);
-            float x1=VF(args[1]),y1=VF(args[2]),x2=VF(args[3]),y2=VF(args[4]);
+            float x1=OX(we,args[1]),y1=OY(we,args[2]),x2=OX(we,args[3]),y2=OY(we,args[4]);
             int thick=std::max(1,VI(args[9]));
             float dx=x2-x1, dy=y2-y1;
             float len=std::sqrt(dx*dx+dy*dy);
@@ -1206,20 +1215,20 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
     // gui_draw_circle(handle, cx, cy, radius, r, g, b, a)
     if(name=="gui_draw_circle"){
         if(args.size()<8) return NONE_VALUE;
-        if(WinEntry* we=win_of(args)) draw_circle_sdl(we->ren,VF(args[1]),VF(args[2]),VF(args[3]),VU(args[4]),VU(args[5]),VU(args[6]),VU(args[7]));
+        if(WinEntry* we=win_of(args)) draw_circle_sdl(we->ren,OX(we,args[1]),OY(we,args[2]),VF(args[3]),VU(args[4]),VU(args[5]),VU(args[6]),VU(args[7]));
         return NONE_VALUE;
     }
     // gui_fill_circle(handle, cx, cy, radius, r, g, b, a)
     if(name=="gui_fill_circle"){
         if(args.size()<8) return NONE_VALUE;
-        if(WinEntry* we=win_of(args)) fill_circle_sdl(we->ren,VF(args[1]),VF(args[2]),VF(args[3]),VU(args[4]),VU(args[5]),VU(args[6]),VU(args[7]));
+        if(WinEntry* we=win_of(args)) fill_circle_sdl(we->ren,OX(we,args[1]),OY(we,args[2]),VF(args[3]),VU(args[4]),VU(args[5]),VU(args[6]),VU(args[7]));
         return NONE_VALUE;
     }
     // gui_draw_shadow(handle, x, y, w, h, blur, ox, oy, r, g, b, a)
     if(name=="gui_draw_shadow"){
         if(args.size()<12) return NONE_VALUE;
         if(WinEntry* we=win_of(args)){
-            float x=VF(args[1])+VF(args[6]),y=VF(args[2])+VF(args[7]),w=VF(args[3]),h=VF(args[4]);
+            float x=OX(we,args[1])+VF(args[6]),y=OY(we,args[2])+VF(args[7]),w=VF(args[3]),h=VF(args[4]);
             int blur=std::max(1,VI(args[5]));
             Uint8 sr=VU(args[8]),sg=VU(args[9]),sb=VU(args[10]),sa=VU(args[11]);
             SDL_SetRenderDrawBlendMode(we->ren,SDL_BLENDMODE_BLEND);
@@ -1239,7 +1248,7 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
     if(name=="gui_draw_gradient"){
         if(args.size()<12) return NONE_VALUE;
         if(WinEntry* we=win_of(args)){
-            float x=VF(args[1]),y=VF(args[2]),w=VF(args[3]),h=VF(args[4]);
+            float x=OX(we,args[1]),y=OY(we,args[2]),w=VF(args[3]),h=VF(args[4]);
             int r1=VI(args[5]),g1=VI(args[6]),b1=VI(args[7]),r2=VI(args[8]),g2=VI(args[9]),b2=VI(args[10]);
             bool vert=VI(args[11])!=0; int steps=vert?(int)h:(int)w; if(steps<1)steps=1;
             // Optional trailing alpha pair (a1, a2). Without it the gradient
@@ -1276,7 +1285,7 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
                         auto xi=pts->container->find(std::to_string(2*i));
                         auto yi=pts->container->find(std::to_string(2*i+1));
                         if(xi==pts->container->end()||yi==pts->container->end()) break;
-                        xs.push_back(VF(xi->second)); ys.push_back(VF(yi->second));
+                        xs.push_back(VF(xi->second)+we->ox); ys.push_back(VF(yi->second)+we->oy);
                         continue;
                     }
                     auto pi=pts->container->find(std::to_string(i));
@@ -1286,7 +1295,7 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
                             float px=0,py=0;
                             auto x0=p->container->find("0"); if(x0!=p->container->end()) px=VF(x0->second);
                             auto y0=p->container->find("1"); if(y0!=p->container->end()) py=VF(y0->second);
-                            xs.push_back(px); ys.push_back(py);
+                            xs.push_back(px+we->ox); ys.push_back(py+we->oy);
                         }
                     }
                 }
@@ -1308,7 +1317,7 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
     if(name=="gui_set_clip"){
         if(args.size()<5) return NONE_VALUE;
         if(WinEntry* we=win_of(args)){
-            SDL_Rect rc=clip_isect(*we,SDL_Rect{VI(args[1]),VI(args[2]),VI(args[3]),VI(args[4])});
+            SDL_Rect rc=clip_isect(*we,SDL_Rect{(int)std::lround(OX(we,args[1])),(int)std::lround(OY(we,args[2])),VI(args[3]),VI(args[4])});
             apply_clip(*we,&rc);
         }
         return NONE_VALUE;
@@ -1327,7 +1336,7 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
     if(name=="gui_push_clip"){
         if(args.size()<5) return NONE_VALUE;
         if(WinEntry* we=win_of(args)){
-            SDL_Rect rc=clip_isect(*we,SDL_Rect{VI(args[1]),VI(args[2]),VI(args[3]),VI(args[4])});
+            SDL_Rect rc=clip_isect(*we,SDL_Rect{(int)std::lround(OX(we,args[1])),(int)std::lround(OY(we,args[2])),VI(args[3]),VI(args[4])});
             we->clip_stack.push_back(rc);
             apply_clip(*we,&rc);
             return Value((int)we->clip_stack.size());
@@ -1340,6 +1349,28 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
             if(we->clip_stack.empty()) apply_clip(*we,nullptr);
             else apply_clip(*we,&we->clip_stack.back());
             return Value((int)we->clip_stack.size());
+        }
+        return NONE_VALUE;
+    }
+    // gui_push_offset(handle, dx, dy) / gui_pop_offset(handle): shift all
+    // drawing (and clip rects) by (dx, dy), cumulatively. A scroll container
+    // pushes (-scroll_x, -scroll_y) and draws its children where they are.
+    if(name=="gui_push_offset"){
+        if(args.size()<3) return NONE_VALUE;
+        if(WinEntry* we=win_of(args)){
+            we->off_stack.push_back(std::make_pair(we->ox,we->oy));
+            we->ox+=VF(args[1]); we->oy+=VF(args[2]);
+            return Value((int)we->off_stack.size());
+        }
+        return NONE_VALUE;
+    }
+    if(name=="gui_pop_offset"){
+        if(WinEntry* we=win_of(args)){
+            if(!we->off_stack.empty()){
+                we->ox=we->off_stack.back().first; we->oy=we->off_stack.back().second;
+                we->off_stack.pop_back();
+            } else { we->ox=0; we->oy=0; }
+            return Value((int)we->off_stack.size());
         }
         return NONE_VALUE;
     }
