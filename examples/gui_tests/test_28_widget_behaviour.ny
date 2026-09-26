@@ -237,6 +237,35 @@ check("max_length in characters", ti.value, "abc")
 ti.handle_event(ev("mousedown", 700, 500))
 check("click elsewhere unfocuses", ti.focused, false)
 
+# ── TextArea: a caret you can move, multi-line edits ────────────────────────
+var ta = TextArea(0, 300, 300, 100, "notes")
+ta.handle_event(ev("mousedown", 5, 305))
+ta.handle_event(text_ev("héllo"))
+ta.handle_event(key("enter"))
+ta.handle_event(text_ev("wörld"))
+check("text area value", ta.value, "héllo\nwörld")
+check("caret on the second line", ta.line, 1)
+ta.handle_event(key("up"))
+check("up keeps the column", ta.col, 5)
+ta.handle_event(key("backspace"))
+check("backspace at the caret (characters)", ta.value, "héll\nwörld")
+ta.handle_event(key("end"))
+ta.handle_event(key("delete"))
+check("delete at a line end joins lines", ta.value, "héllwörld")
+ta.handle_event(key("home"))
+ta.handle_event(text_ev("A\nB"))
+check("multi-line insert", ta.value, "A\nBhéllwörld")
+check("caret after the insert", str(ta.line) + ":" + str(ta.col), "1:1")
+var n_enter = 0
+while n_enter < 12:
+    ta.handle_event(key("enter"))
+    n_enter = n_enter + 1
+check_true("scrolls to keep the caret visible", ta.scroll_y > 0)
+check_true("scroll is bounded", ta.scroll_y <= ta.max_scroll())
+ta.scroll_y = 0
+ta.handle_event(ev("mousedown", 10, 300 + 10 + 2 + 20))
+check("click places the caret on its line", ta.line, 1)
+
 # ── Layouts reflow ──────────────────────────────────────────────────────────
 var vb = VBox(10, 10, 300, 4)
 var vt = TextInput(0, 0, 100, 30)
@@ -440,6 +469,28 @@ sp.handle_event(ev("mousedown", 196, 105))
 sp.handle_event(ev("mousemove", 196, 155))
 sp.handle_event(ev("mouseup", 196, 155))
 check_true("scrollbar thumb drag scrolls", sp.scroll_y > 0)
+
+# ── Timers run on gui_ticks (milliseconds on both engines) ──────────────────
+check_true("gui_ticks is monotonic milliseconds", gui_ticks() >= 0)
+var tip = Tooltip("Save the file")
+tip.attach(Rect(100, 100, 80, 30))
+tip.delay_ms = 400
+tip.handle_event(ev("mousemove", 120, 110))
+tip.draw(rr)
+check("tooltip waits for its delay", tip.visible, false)
+tip.delay_ms = 0
+tip.draw(rr)
+check("tooltip shows after the delay", tip.visible, true)
+tip.handle_event(ev("mousemove", 400, 400))
+check("tooltip hides when the pointer leaves", tip.visible, false)
+var toasts = ToastManager(800)
+toasts.show("saved", "success", 0)
+toasts.show("stays", "info", 60000)
+thread_sleep(5)
+toasts.update()
+check("expired toast removed, live one kept", toasts.count, 1)
+toasts.window_resized(1000, 700)
+check("toasts follow the window's right edge", toasts.toasts[0].x, 1000 - 320 - 16)
 
 # ── MenuBar: hover switches menus, submenus, keyboard, shortcuts ────────────
 var log = []

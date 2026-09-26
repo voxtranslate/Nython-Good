@@ -43,6 +43,9 @@ script = script + "window 2\n"
 script = script + "key a\n"
 script = script + "window 1\n"
 script = script + "quit\n"
+# read later, by the high-pixel-density window below
+script = script + "window 1\n"
+script = script + "move 10 10\n"
 write_file(script_path, script)
 os_setenv("NY_STUB_EVENTS", script_path)
 
@@ -123,6 +126,31 @@ else:
 gui_destroy_window(h2)
 gui_destroy_window(h)
 os_remove(script_path)
+
+# ── High pixel density: everything in pixels ────────────────────────────────
+# NY_STUB_DPI_SCALE=2 makes the stub behave like a Retina display for windows
+# that ask for high pixel density: the drawing surface is 2x the window size
+# and the pointer is reported in pixels too.
+if scripted:
+    os_setenv("NY_STUB_DPI_SCALE", "2")
+    var hw = Window(400, 300, "hidpi")
+    hw.high_dpi = true
+    var seen = []
+    def hidpi_cb(r, e):
+        if e.type != "idle":
+            seen.append(e.type + ":" + str(e.x) + "," + str(e.y) + ":" + str(e.w) + "x" + str(e.h))
+    hw.start()
+    var s3 = 0
+    while s3 < 8:
+        hw.step(hidpi_cb)
+        s3 = s3 + 1
+    check("window scale", hw.scale(), 2.0)
+    check("drawing surface in pixels", gui_get_window_size(hw._handle)[0], 800)
+    check("told its real size at once", hw.width, 800)
+    check("resize event carries pixels", seen[0], "resize:0,0:800x600")
+    check("pointer in pixels", seen[1], "mousemove:20,20:0x0")
+    hw.destroy()
+    os_setenv("NY_STUB_DPI_SCALE", "")
 
 # ── The loop sleeps while nothing changes ───────────────────────────────────
 # A callback that reports "nothing changed" (returns false) makes the loop
