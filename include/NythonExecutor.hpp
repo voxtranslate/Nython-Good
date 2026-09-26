@@ -3425,10 +3425,10 @@ return lv * rv;
                     CtxReaper _reap_fn_ctx3162(this, fn_ctx);
                     fn_ctx->defineByName("self", obj);
                     size_t param_start = (!fn->params.empty() && fn->params[0]->value() == "self") ? 1 : 0;
-                    for (size_t i = param_start; i < fn->params.size(); i++) {
-                        size_t arg_idx = i - param_start;
-                        if (arg_idx < args.size()) fn_ctx->defineByName(fn->params[i]->value(), args[arg_idx]);
-                    }
+                    // Defaults and keyword arguments too: binding only the supplied
+                    // arguments left a missing parameter undefined, so an
+                    // inherited `def m(self, x=5)` saw x as "" (round 74).
+                    bindParamsKw(fn, args, kw_args_in, fn_ctx, ctx, param_start);
                     try { return evalNode(fn->body, fn_ctx); }
                     catch (nython::node::ReturnSignal& ret) { return ret.value; }
                     catch (std::string& _exc) { if (_exc.size()>7 && _exc.substr(0,7)=="__exc__") throw; return NONE_VALUE; }
@@ -3457,10 +3457,7 @@ return lv * rv;
                                     fn_ctx->defineByName("self", obj);
                                     size_t param_start = 0;
                                     if (!fn->params.empty() && fn->params[0]->value() == "self") param_start = 1;
-                                    for (size_t i = param_start; i < fn->params.size(); i++) {
-                                        size_t arg_idx = i - param_start;
-                                        if (arg_idx < args.size()) fn_ctx->defineByName(fn->params[i]->value(), args[arg_idx]);
-                                    }
+                                    bindParamsKw(fn, args, kw_args_in, fn_ctx, ctx, param_start);   // defaults too (round 74)
                                     try { Value result = evalNode(fn->body, fn_ctx); return result; }
                                     catch (nython::node::ReturnSignal& ret) { return ret.value; }
                                     catch (std::string& flow) { if (flow=="break"||flow=="continue") throw; if (flow.size()>7&&flow.substr(0,7)=="__exc__") throw; return NONE_VALUE; }
@@ -3492,10 +3489,7 @@ return lv * rv;
                                         fn_ctx->defineByName("self", obj);
                                         size_t param_start = 0;
                                         if (!fn->params.empty() && fn->params[0]->value() == "self") param_start = 1;
-                                        for (size_t i = param_start; i < fn->params.size(); i++) {
-                                            size_t arg_idx = i - param_start;
-                                            if (arg_idx < args.size()) fn_ctx->defineByName(fn->params[i]->value(), args[arg_idx]);
-                                        }
+                                        bindParamsKw(fn, args, kw_args_in, fn_ctx, ctx, param_start);   // defaults too (round 74)
                                         try { Value result = evalNode(fn->body, fn_ctx); return result; }
                                         catch (nython::node::ReturnSignal& ret) { return ret.value; }
                                         catch (std::string& flow) { if (flow.size()>7&&flow.substr(0,7)=="__exc__") throw; return NONE_VALUE; }
@@ -6384,6 +6378,23 @@ public:
         Value result = NONE_VALUE;
         try {
             result = evalNode(wn->body, ctx);
+        } catch (std::string& exc) {
+            // Call __exit__ even on exception, with (type, message, none) as
+            // Python does, so a context manager can tell the body failed (a
+            // task group cancels its children then) - round 74.
+            if (v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p) && instance_to_class.count(v.value.p)) {
+                std::string et = "Exception", em = exc;
+                if (exc.rfind("__exc__:", 0) == 0) {
+                    std::string rest = exc.substr(8);
+                    auto c = rest.find(':');
+                    et = rest.substr(0, c);
+                    em = c == std::string::npos ? std::string() : rest.substr(c + 1);
+                }
+                std::vector<Value> exc_args = {makeStringValue(et), makeStringValue(em), NONE_VALUE};
+                if (exc != "break" && exc != "continue") callMethod(v, "__exit__", exc_args, ctx);
+                else { std::vector<Value> no_args; callMethod(v, "__exit__", no_args, ctx); }
+            }
+            throw;
         } catch (...) {
             // Call __exit__ even on exception
             if (v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p) && instance_to_class.count(v.value.p)) {
