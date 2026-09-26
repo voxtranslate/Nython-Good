@@ -51,6 +51,18 @@ inline const char* ny_builtin_exc_parent(const std::string& name) {
         {"AssertionError", "Exception"},
         {"StopIteration", "Exception"},
         {"MemoryError", "Exception"},
+        {"EOFError", "Exception"},
+        // The OS layer's typed errors (include/builtins/os.hpp raises them).
+        {"EnvironmentError", "OSError"},
+        {"IsADirectoryError", "OSError"},
+        {"NotADirectoryError", "OSError"},
+        {"InterruptedError", "OSError"},
+        {"ChildProcessError", "OSError"},
+        {"ProcessLookupError", "OSError"},
+        {"BlockingIOError", "OSError"},
+        {"BrokenPipeError", "ConnectionError"},
+        {"ConnectionRefusedError", "ConnectionError"},
+        {"ConnectionResetError", "ConnectionError"},
     };
     auto it = parents.find(name);
     return it == parents.end() ? nullptr : it->second;
@@ -84,7 +96,10 @@ inline const std::vector<std::string>& ny_builtin_exc_names() {
         "FileNotFoundError", "FileExistsError", "PermissionError",
         "TimeoutError", "ConnectionError", "ImportError",
         "ModuleNotFoundError", "SyntaxError", "AssertionError",
-        "StopIteration", "MemoryError",
+        "StopIteration", "MemoryError", "EOFError", "EnvironmentError",
+        "IsADirectoryError", "NotADirectoryError", "InterruptedError",
+        "ChildProcessError", "ProcessLookupError", "BlockingIOError",
+        "BrokenPipeError", "ConnectionRefusedError", "ConnectionResetError",
     };
     return names;
 }
