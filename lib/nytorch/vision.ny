@@ -12,6 +12,8 @@
 #   DataNormalizer, DataAugmentor, Preprocessor, DataSplitter
 # ============================================================
 
+import "lib/nytorch/core.ny"
+
 import nytorch
 
 # -----------------------------------------

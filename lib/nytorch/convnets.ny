@@ -6,6 +6,8 @@
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ── 231: ConvBlock ─────────────────────────────────────────────────────────
+import "lib/nytorch/core.ny"
+
 class ConvBlock:
     def __init__(self, in_ch, out_ch, kernel, stride, use_bn, activation):
         self.in_ch = in_ch

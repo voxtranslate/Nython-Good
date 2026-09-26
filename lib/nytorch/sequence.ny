@@ -19,6 +19,8 @@
 # --- 291: RetentionHead ----------------------------------------------------
 # Core mechanism of RetNet: replaces attention with a decaying retention score.
 # In parallel mode: O(n?) training. In recurrent mode: O(1) inference.
+import "lib/nytorch/core.ny"
+
 class RetentionHead:
     def __init__(self, dim, gamma):
         self.dim = dim

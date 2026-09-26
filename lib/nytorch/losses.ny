@@ -1,210 +1,196 @@
-# import nytorch
+# ─── nytorch losses ──────────────────────────────────────────────────────────
+# Loss modules (torch.nn names); every one returns a differentiable Tensor
+# (0-d for reduction "mean"/"sum"), so loss.backward() reaches the model.
+#
+# CrossEntropyLoss / NLLLoss follow PyTorch exactly: input is LOGITS (resp.
+# log-probabilities) shaped (N, C), (C,) or (N, C, d1, ...); target is class
+# indices (N,) — or class probabilities with the input's shape — with
+# weight, ignore_index and label_smoothing. The older CrossEntropyLoss
+# computed -sum(target * log(pred)) on whatever it was given, so logits
+# [2, 1, 0] with target class 0 came out as -0.693 instead of 0.4076, and
+# NLLLoss was the same function under another name.
 
-class SwiGLU:
-    # Used in LLaMA, PaLM - SwiGLU(x) = W1(x) * SiLU(W2(x))
-    def init(self, in_dim, out_dim):
-        self.W1 = Linear(in_dim, out_dim)
-        self.W2 = Linear(in_dim, out_dim)
-    def forward(self, x):
-        var h1 = self.W1.forward(x)
-        var h2 = self.W2.forward(x)
-        var swish_h2 = Tensor([0.0])
-        swish_h2.data = tensor_apply(h2.data, lambda v: silu(v))
-        var out = Tensor([0.0])
-        out.data = tensor_mul(h1.data, swish_h2.data)
-        return out
+import "lib/nytorch/tensor.ny"
+import "lib/nytorch/module.ny"
 
+class _Loss(Module):
+    # (every intermediate class defines __init__: a two-level super() chain
+    # through a class without one does not run on the interpreter)
+    def __init__(self):
+        super().__init__()
+    def __call__(self, input, target):
+        return self.forward(input, target)
 
-# ---------------------------------------------
-# SECTION 7: LOSS FUNCTIONS
-# ---------------------------------------------
+class MSELoss(_Loss):
+    def __init__(self, reduction="mean"):
+        super().__init__()
+        self.reduction = reduction
+    def forward(self, input, target):
+        return _fn_mse(input, target, self.reduction)
 
-class MSELoss:
-    def forward(self, pred, target):
-        return mse_loss(pred.data, target.data)
+class L1Loss(_Loss):
+    def __init__(self, reduction="mean"):
+        super().__init__()
+        self.reduction = reduction
+    def forward(self, input, target):
+        return _fn_l1(input, target, self.reduction)
 
-class MAELoss:
-    def forward(self, pred, target):
-        var diff = tensor_abs(tensor_sub(pred.data, target.data))
-        return tensor_mean(diff)
+class CrossEntropyLoss(_Loss):
+    def __init__(self, weight=none, ignore_index=none, reduction="mean", label_smoothing=0.0):
+        if ignore_index == none:
+            ignore_index = -100
+        super().__init__()
+        self.weight = weight
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+        self.label_smoothing = label_smoothing
+    def forward(self, input, target):
+        return _fn_cross_entropy(input, target, self.weight, self.ignore_index, self.reduction, self.label_smoothing)
 
-class BCELoss:
-    def forward(self, pred, target):
-        return binary_cross_entropy(pred.data, target.data)
+class NLLLoss(_Loss):
+    def __init__(self, weight=none, ignore_index=none, reduction="mean"):
+        if ignore_index == none:
+            ignore_index = -100
+        super().__init__()
+        self.weight = weight
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+    def forward(self, input, target):
+        return _fn_nll_loss(input, target, self.weight, self.ignore_index, self.reduction)
 
-class CrossEntropyLoss:
-    def forward(self, pred, target):
-        return cross_entropy_loss(pred.data, target.data)
+class BCELoss(_Loss):
+    # input: probabilities
+    def __init__(self, reduction="mean"):
+        super().__init__()
+        self.reduction = reduction
+    def forward(self, input, target):
+        return _fn_bce(input, target, self.reduction)
 
-class HuberLoss:
-    def init(self, delta):
+class BCEWithLogitsLoss(_Loss):
+    def __init__(self, pos_weight=none, reduction="mean"):
+        super().__init__()
+        self.pos_weight = pos_weight
+        self.reduction = reduction
+    def forward(self, input, target):
+        return _fn_bce_logits(input, target, self.pos_weight, self.reduction)
+
+class SmoothL1Loss(_Loss):
+    def __init__(self, reduction="mean", beta=1.0):
+        super().__init__()
+        self.reduction = reduction
+        self.beta = beta
+    def forward(self, input, target):
+        return _fn_smooth_l1(input, target, self.reduction, self.beta)
+
+class HuberLoss(_Loss):
+    # HuberLoss(delta) — the older positional form — or HuberLoss(delta, reduction)
+    def __init__(self, delta=1.0, reduction="mean"):
+        super().__init__()
         self.delta = delta
-    def forward(self, pred, target):
-        return huber_loss(pred.data, target.data, self.delta)
+        self.reduction = reduction
+    def forward(self, input, target):
+        return _fn_huber(input, target, self.reduction, self.delta)
 
-class FocalLoss:
-    def init(self, alpha, gamma):
+class KLDivLoss(_Loss):
+    # input: log-probabilities, target: probabilities
+    def __init__(self, reduction="mean"):
+        super().__init__()
+        self.reduction = reduction
+    def forward(self, input, target):
+        return _fn_kl_div(input, target, self.reduction)
+
+# older names
+def MAELoss():
+    return L1Loss("mean")
+def L2Loss():
+    return MSELoss("mean")
+
+class FocalLoss(_Loss):
+    # binary focal loss on probabilities (Lin et al. 2017), mean over elements
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super().__init__()
         self.alpha = alpha
         self.gamma = gamma
-    def forward(self, pred, target):
-        var total = 0.0
-        var n = len(pred.data)
-        var i = 0
-        while i < n:
-            var p = max(0.0000001, min(1.0 - 0.0000001, pred.data[i]))
-            var t = target.data[i]
-            var fl = -self.alpha * ((1.0 - p) ** self.gamma) * log(p) * t
-            var fl = fl - (1.0 - self.alpha) * (p ** self.gamma) * log(1.0 - p) * (1.0 - t)
-            var total = total + fl
-            var i = i + 1
-        return total / float(n)
+    def forward(self, input, target):
+        var p = _t_wrap(input).clamp(0.0000001, 1.0 - 0.0000001)
+        var t = _t_wrap(target)
+        var a = self.alpha
+        var pos = p.rsub(1.0).pow(self.gamma) * p.log() * t * (0.0 - a)
+        var neg = p.pow(self.gamma) * p.rsub(1.0).log() * t.rsub(1.0) * (0.0 - (1.0 - a))
+        return (pos + neg).mean()
 
-class LabelSmoothingLoss:
-    def init(self, num_classes, smoothing):
+class LabelSmoothingLoss(_Loss):
+    # cross-entropy of LOG-probabilities against a smoothed one-hot target
+    def __init__(self, num_classes, smoothing):
+        super().__init__()
         self.num_classes = num_classes
-        self.smoothing   = smoothing
-    def forward(self, log_pred, target):
-        var eps   = self.smoothing
-        var k     = float(self.num_classes)
-        var st    = tensor_add(tensor_scale(target.data, 1.0 - eps), tensor_scale(ones(len(target.data)), eps / k))
-        return -tensor_dot(st, log_pred.data)
+        self.smoothing = smoothing
+    def forward(self, input, target):
+        var lp = _t_wrap(input)
+        var t = _t_wrap(target)
+        var st = t * (1.0 - self.smoothing) + self.smoothing / (1.0 * self.num_classes)
+        return (st * lp).sum().neg()
 
-class TripletLoss:
-    def init(self, margin):
-        self.margin = margin
-    def forward(self, anchor, positive, negative):
-        var d_pos = tensor_mean(tensor_pow(tensor_sub(anchor.data, positive.data), 2.0))
-        var d_neg = tensor_mean(tensor_pow(tensor_sub(anchor.data, negative.data), 2.0))
-        var loss  = d_pos - d_neg + self.margin
-        if loss < 0.0:
-            return 0.0
-        return loss
-
-class DiceLoss:
-    def init(self):
+class DiceLoss(_Loss):
+    def __init__(self):
+        super().__init__()
         self.eps = 0.000001
-    def forward(self, pred, target):
-        var inter = tensor_dot(pred.data, target.data)
-        var denom = tensor_sum(pred.data) + tensor_sum(target.data) + self.eps
-        return 1.0 - (2.0 * inter + self.eps) / denom
+    def forward(self, input, target):
+        var p = _t_wrap(input)
+        var t = _t_wrap(target)
+        var inter = (p * t).sum()
+        var denom = p.sum() + t.sum() + self.eps
+        return (inter * 2.0 + self.eps).div(denom).rsub(1.0)
 
-class CosineEmbeddingLoss:
-    def init(self, margin):
+class TripletLoss(Module):
+    # max(0, d(a, p) - d(a, n) + margin), d = mean squared difference
+    def __init__(self, margin):
+        super().__init__()
         self.margin = margin
-    def forward(self, x1, x2, label):
-        var sim = cosine_similarity(x1.data, x2.data)
-        if label == 1.0:
-            return 1.0 - sim
-        var val = sim - self.margin
-        if val < 0.0:
-            return 0.0
-        return val
+    def __call__(self, anchor, positive, negative):
+        return self.forward(anchor, positive, negative)
+    def forward(self, anchor, positive, negative):
+        var a = _t_wrap(anchor)
+        var dp = (a - positive).pow(2.0).mean()
+        var dn = (a - negative).pow(2.0).mean()
+        return (dp - dn + self.margin).relu()
 
-class ContrastiveLoss:
-    def init(self, margin):
+class TripletMarginLoss(Module):
+    # torch.nn.TripletMarginLoss: max(0, ||a-p||_2 - ||a-n||_2 + margin), mean over the batch
+    def __init__(self, margin=1.0):
+        super().__init__()
         self.margin = margin
+    def __call__(self, anchor, positive, negative):
+        return self.forward(anchor, positive, negative)
+    def forward(self, anchor, positive, negative):
+        var a = _t_wrap(anchor)
+        var dp = (a - positive).norm(-1)
+        var dn = (a - negative).norm(-1)
+        return (dp - dn + self.margin).relu().mean()
+
+class CosineEmbeddingLoss(Module):
+    # label 1: 1 - cos(x1, x2); label -1 (or 0): max(0, cos - margin)
+    def __init__(self, margin=0.0):
+        super().__init__()
+        self.margin = margin
+    def __call__(self, x1, x2, label):
+        return self.forward(x1, x2, label)
     def forward(self, x1, x2, label):
-        var diff = tensor_sub(x1.data, x2.data)
-        var dist = sqrt(tensor_dot(diff, diff))
-        if label == 1.0:
-            return dist * dist
-        var hinge = self.margin - dist
-        if hinge < 0.0:
-            return 0.0
-        return hinge * hinge
+        var sim = _fn_cosine_similarity(x1, x2, -1, 0.00000001)
+        if label == 1 or label == 1.0:
+            return sim.rsub(1.0).mean()
+        return (sim - self.margin).relu().mean()
 
-
-# ---------------------------------------------
-# SECTION 8: OPTIMIZERS
-# ---------------------------------------------
-
-class SGD:
-    def init(self, lr):
-        self.lr = lr
-    def step(self, params, grads):
-        var i = 0
-        while i < len(params):
-            params[i] = tensor_sub(params[i], tensor_scale(grads[i], self.lr))
-            var i = i + 1
-        return params
-
-class MomentumSGD:
-    def init(self, lr, momentum):
-        self.lr       = lr
-        self.momentum = momentum
-        self.velocity = []
-        self.initialized = false
-    def step(self, params, grads):
-        if not self.initialized:
-            var k = 0
-            while k < len(params):
-                self.velocity.append(zeros(len(grads[k])))
-                var k = k + 1
-            self.initialized = true
-        var i = 0
-        while i < len(params):
-            self.velocity[i] = tensor_add(tensor_scale(self.velocity[i], self.momentum), tensor_scale(grads[i], self.lr))
-            params[i] = tensor_sub(params[i], self.velocity[i])
-            var i = i + 1
-        return params
-
-class Adam:
-    def init(self, lr, beta1, beta2, eps):
-        self.lr    = lr
-        self.beta1 = beta1
-        self.beta2 = beta2
-        self.eps   = eps
-        self.t     = 0
-        self.m     = []
-        self.v     = []
-        self.initialized = false
-    def step(self, params, grads):
-        if not self.initialized:
-            var k = 0
-            while k < len(params):
-                self.m.append(zeros(len(grads[k])))
-                self.v.append(zeros(len(grads[k])))
-                var k = k + 1
-            self.initialized = true
-        self.t = self.t + 1
-        var b1   = self.beta1
-        var b2   = self.beta2
-        var lr_t = self.lr * sqrt(1.0 - b2 ** self.t) / (1.0 - b1 ** self.t)
-        var i = 0
-        while i < len(params):
-            self.m[i] = tensor_add(tensor_scale(self.m[i], b1), tensor_scale(grads[i], 1.0 - b1))
-            self.v[i] = tensor_add(tensor_scale(self.v[i], b2), tensor_scale(tensor_pow(grads[i], 2.0), 1.0 - b2))
-            var denom = tensor_add(tensor_sqrt(self.v[i]), tensor_scale(ones(len(self.v[i])), self.eps))
-            params[i] = tensor_sub(params[i], tensor_scale(tensor_mul(self.m[i], tensor_pow(denom, -1.0)), lr_t))
-            var i = i + 1
-        return params
-
-
-
-# ─── PyTorch-compatible names ────────────────────────────────────────────────
-# The classes above use descriptive names; PyTorch uses different ones for
-# several of the same criteria. Both spellings now work, so code written against
-# PyTorch conventions runs unchanged. These are subclasses rather than
-# assignments so `type()` reports the name the caller used.
-
-# L1Loss is mean absolute error.
-class L1Loss(MAELoss):
-    def name(self):
-        return "L1Loss"
-
-# SmoothL1Loss is the Huber criterion.
-class SmoothL1Loss(HuberLoss):
-    def name(self):
-        return "SmoothL1Loss"
-
-# PyTorch spells mean-squared error L2 in some APIs.
-class L2Loss(MSELoss):
-    def name(self):
-        return "L2Loss"
-
-# Negative log-likelihood over already-log-softmaxed inputs. CrossEntropyLoss
-# here folds the softmax in, which is the same relationship PyTorch has between
-# the two.
-class NLLLoss(CrossEntropyLoss):
-    def name(self):
-        return "NLLLoss"
+class ContrastiveLoss(Module):
+    # label 1 (similar): d^2; label 0: max(0, margin - d)^2, d = ||x1 - x2||
+    def __init__(self, margin=1.0):
+        super().__init__()
+        self.margin = margin
+    def __call__(self, x1, x2, label):
+        return self.forward(x1, x2, label)
+    def forward(self, x1, x2, label):
+        var d = (_t_wrap(x1) - x2).norm()
+        if label == 1 or label == 1.0:
+            return d * d
+        var h = d.rsub(self.margin).relu()
+        return h * h

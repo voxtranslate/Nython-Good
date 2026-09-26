@@ -16,6 +16,8 @@
 # ═══════════════════════════════════════════════════════════════════════════
 
 # ── 261: ODESolver (Euler + RK4) ───────────────────────────────────────────
+import "lib/nytorch/core.ny"
+
 class ODESolver:
     def __init__(self, method, dt, t_span):
         self.method = method   # "euler", "rk4", "midpoint"
