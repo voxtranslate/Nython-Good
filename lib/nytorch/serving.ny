@@ -537,24 +537,32 @@ class ConsensusVoter:
                             collected = collected + 1
         return self.votes
 
+    # the most common value among the collected votes (ties: smallest value)
     def tally(self):
-        var counts = {}
-        var keys = []
-        var i = 0
-        while i < len(keys):
-            var i = i + 1
-        var winner = none
-        var best = 0
-        var vk = kv_keys("/tmp/nyv_tally_" + self.agent_id + ".kv")
-        return winner
+        return self.majority(self.votes)
 
     def majority(self, votes_map):
         var counts = {}
+        var vals = []
+        var keys = sorted(votes_map.keys())
+        var i = 0
+        while i < len(keys):
+            var v = str(votes_map[keys[i]])
+            if v in counts:
+                counts[v] = counts[v] + 1
+            else:
+                counts[v] = 1
+                vals.append(v)
+            i = i + 1
+        vals = sorted(vals)
         var best_val = none
         var best_count = 0
-        var i = 0
-        var total = 0
-        var vals = []
+        i = 0
+        while i < len(vals):
+            if counts[vals[i]] > best_count:
+                best_count = counts[vals[i]]
+                best_val = vals[i]
+            i = i + 1
         return best_val
 
 # -----------------------------------------
