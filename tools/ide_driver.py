@@ -136,8 +136,8 @@ class IDE:
     def drag(self, x1, y1, x2, y2):
         self.send("drag %d %d %d %d" % (x1, y1, x2, y2))
 
-    def wheel(self, x, y, dy):
-        self.send("wheel %d %d %d" % (x, y, dy))
+    def wheel(self, x, y, dy, mods=""):
+        self.send(("wheel %d %d %d %s" % (x, y, dy, mods)).rstrip())
 
     def key(self, combo):
         self.send("key " + combo)

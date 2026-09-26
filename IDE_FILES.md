@@ -30,7 +30,8 @@ single file is too large for the parser and each has one concern:
 | `ide_ops.ny` | `IDEOps(IDECore)` | background jobs (`BgProc`), multi-cursor, find/replace, Quick Input (palette, Quick Open, pickers, prompts), dialogs, Run, diagnostics, settings, workspace, explorer file operations, symbols, file watching, `developer.dumpState` |
 | `ide_paint.ny` | `IDETheme`, `IDEPaint(IDEOps)` | layout and every painter: title bar/menus, activity bar, tabs, breadcrumbs, editor, minimap, panel, status bar, overlays. Paint methods allocate nothing per frame (see "Memory" below) |
 | `ide_views.ny` | `IDEViews(IDEPaint)` | the side bar views: Explorer, Search, Source Control, Run and Debug, Extensions, Outline, AI |
-| `nython_ide.ny` | `NythonIDE(IDEViews)` | state, input routing (mouse, keyboard, text), the frame loop, launch |
+| `ide_tools.ny` | `IDETools(IDEViews)` | the Code::Blocks side (round 74): build targets and a time-sliced Build/Rebuild/Clean with a Build Log, bookmarks, code folding, abbreviations/snippets with tab stops, insert/overwrite, keymaps (VS Code / Code::Blocks) and key rebinding by capture, class wizard, code statistics, TODO list, user tools with macros, environment variables, breakpoint conditions/hit counts/log points, run to cursor, session restore |
+| `nython_ide.ny` | `NythonIDE(IDETools)` | state, input routing (mouse, keyboard, text), the frame loop, launch |
 
 Models with no window, testable on both engines:
 

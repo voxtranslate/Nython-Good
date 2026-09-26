@@ -481,10 +481,10 @@ class IDEOps(IDECore):
             return
         var h = self.find_hits[self.find_index]
         var b = self.buf()
-        b.begin_group()
+        var g = b.open_group()
         b.delete_range(h[0], h[1], h[0], h[1] + h[2])
         b.insert_text(self._replacement_for(b.get_line(h[0]), h))
-        b.begin_group()
+        b.close_group(g)
         self._after_edit()
         var idx = self.find_index
         self._find_run()
@@ -921,6 +921,9 @@ class IDEOps(IDECore):
                 return
         self.qi.close()
         self.focus = self.focus_before_qi
+        if string_startswith(action, "t."):
+            self._tools_accept(action, value, item)
+            return
         if action == "commands":
             if item != none:
                 # "Recently used" in the palette means used from the palette,
@@ -1577,6 +1580,7 @@ class IDEOps(IDECore):
         body = body + "render_whitespace = " + str(self.show_whitespace) + "\n"
         body = body + "# off | afterDelay\n"
         body = body + "auto_save = " + self.auto_save + "\n"
+        body = body + self._tools_settings_text()
         return body
 
     def _save_settings(self):
@@ -1597,6 +1601,7 @@ class IDEOps(IDECore):
         if text == none or text == "":
             return false
         self.loading_settings = true
+        self._tools_settings_reset()
         var lines = string_split(text, "\n")
         var i = 0
         while i < len(lines):
@@ -1633,7 +1638,10 @@ class IDEOps(IDECore):
                     elif k == "auto_save":
                         if v == "afterDelay" or v == "off":
                             self.auto_save = v
+                    else:
+                        self._tools_setting(k, v)
             i = i + 1
+        self._tools_settings_loaded()
         self.loading_settings = false
         self._layout()
         return true
@@ -1671,6 +1679,8 @@ class IDEOps(IDECore):
                 var dp = string_slice(ln, 7, len(ln))
                 if os_isdir(dp):
                     self.recent_folders.append(dp)
+            else:
+                self._tools_state_line(ln)
             i = i + 1
 
     def _save_state(self):
@@ -1686,6 +1696,7 @@ class IDEOps(IDECore):
         while i < len(self.recent):
             body = body + "file=" + self.recent[i] + "\n"
             i = i + 1
+        body = body + self._tools_state_text()
         write_file(p, body)
 
     def _remember_recent(self, path):
@@ -2185,6 +2196,7 @@ class IDEOps(IDECore):
         st["font_size"] = self.font_size
         st["status"] = self.status_msg
         st["clipboard"] = self._get_clipboard()
+        self._tools_dump(st)
         write_file(p + ".tmp", json_encode(st))
         os_rename(p + ".tmp", p)
 

@@ -106,6 +106,10 @@ class EditorBuffer:
         self.eol = "\n"
         self.indent_unit = "    "   # what Enter adds after ':' (the IDE sets it per file)
         self._parse_content(content)
+        # Line count as of the IDE's last look (ide_tools.ny moves bookmarks
+        # and folds by the difference after each edit). Kept on the buffer so
+        # a reloaded document starts from its own count.
+        self.track_lines = self.line_count
 
     def _parse_content(self, text):
         # Single split instead of the previous character walk.

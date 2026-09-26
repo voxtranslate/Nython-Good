@@ -931,9 +931,12 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
                     // Handle natural-scroll (FLIPPED) direction
                     float wy = ev.wheel.direction == SDL_MOUSEWHEEL_FLIPPED
                                ? -ev.wheel.y : ev.wheel.y;
+                    // Modifiers too: Ctrl+wheel zooms, Shift+wheel scrolls sideways.
+                    SDL_Keymod wmod=SDL_GetModState();
                     v=make_evt(E,"wheel",
                                (int)ev.wheel.mouse_x,(int)ev.wheel.mouse_y,
-                               0,"",0,"",(int)wy);
+                               0,"",0,"",(int)wy,0,0,
+                               (wmod&SDL_KMOD_CTRL)!=0,(wmod&SDL_KMOD_SHIFT)!=0,(wmod&SDL_KMOD_ALT)!=0);
                     break;
                 }
                 case SDL_EVENT_KEY_DOWN: {

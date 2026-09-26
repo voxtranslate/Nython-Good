@@ -28,6 +28,9 @@ nython/
 │   │   ├── audio.cpp         ← audio builtins (stubs)
 │   │   ├── threading.cpp     ← thread_create, thread_sleep, mutex_*
 │   │   ├── lang.cpp          ← lang_define_token, lang_eval, ...
+│   │   ├── text.cpp          ← editor text services: symbols, syntax check,
+│   │   │                        Myers diff, workspace search, folding, format,
+│   │   │                        completion index (keeps the IDE's hot paths native)
 │   │   └── gui.cpp           ← SDL3 GUI backend (38 gui_* functions)
 │   └── ...                   ← Lexer, Parser, Value, GarbageCollector, etc.
 ├── include/                  ← C++ headers
@@ -57,6 +60,8 @@ nython/
 ├── ide_ops.ny                ←   jobs, find, Quick Input, run, settings, watcher
 ├── ide_paint.ny              ←   theme + every painter (allocation-free)
 ├── ide_views.ny              ←   Explorer/Search/SCM/Debug/Extensions/Outline/AI
+├── ide_tools.ny              ←   Code::Blocks side: build targets, bookmarks,
+│                                folding, snippets, keymaps, wizard, tools
 ├── ide_editor.ny             ← EditorBuffer, SyntaxHighlighter
 ├── ide_icons.ny              ← icon set: Codicon glyphs, vector fallback
 ├── ide_project.ny            ← workspace / project model

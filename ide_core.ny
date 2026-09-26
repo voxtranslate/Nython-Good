@@ -46,6 +46,13 @@ class Doc:
         self.disk_changed = false  # changed on disk while it had unsaved edits
         self.tab_size = 4          # per file, as in VS Code (detected on open)
         self.insert_spaces = true
+        # ide_tools.ny: bookmarks and folds (rows), and the folding caches.
+        self.bookmarks = []
+        self.folds = []
+        self.fold_ranges = none
+        self.fold_state = -1
+        self.fold_key = ""
+        self.fold_spans = none
         if buf != none:
             buf.coalesce = true
 
@@ -215,6 +222,7 @@ class IDECore:
         var text = d.buf.text_for_save()
         if d.bom:
             text = "\xef\xbb\xbf" + text
+        self._tools_before_write(path)
         var ok = write_file(path, text)
         if ok == false or not os_exists(path):
             self._notify("Could not write " + path, "err")
@@ -240,6 +248,7 @@ class IDECore:
             self.ws.rebuild()
         self.scm_stale = true
         self._check_file(d)
+        self._tools_after_save(d)
         return true
 
     def _prompt_save_as(self, d, after):
@@ -637,6 +646,7 @@ class IDECore:
             "Help": ["workbench.action.showWelcomePage", "workbench.action.showCommands", "workbench.action.openDocumentationUrl", "-",
                      "workbench.action.keybindingsReference", "-", "nython.about"]
         }
+        self._tools_register()
 
     # Context keys for keybinding when-clauses.
     def _ctx_keys(self):
@@ -1036,6 +1046,8 @@ class IDECore:
             self._dump_hitmap()
         elif id == "developer.dumpState":
             self._dump_state()
+        elif self._tools_exec(id, arg):
+            return true
         else:
             self._notify("Command '" + id + "' is not available", "warn")
             return false
@@ -1081,6 +1093,7 @@ class IDECore:
     # every keystroke re-tokenised every visible line per key, and on the
     # interpreter those segment lists are never reclaimed.)
     def _after_edit(self):
+        self._tools_after_edit()
         self._dirty = true
         self._title_dirty = true
         self.scm_diff_due = time_ms() + 400
@@ -1463,8 +1476,11 @@ class IDECore:
         var b = self.buf()
         b.begin_group()
         if self._sel_range() != none:
+            # Pasting over a selection is one undo step.
+            var g = b.open_group()
             self._sel_delete()
             b.insert_text(text)
+            b.close_group(g)
         elif self.clip_line_mode and string_endswith(text, "\n"):
             var col = b.cursor_col
             b.cursor_col = 0
@@ -1513,6 +1529,7 @@ class IDECore:
             r = 0
         if r >= b.line_count:
             r = b.line_count - 1
+        self._fold_reveal(self.doc(), r)
         b.cursor_row = r
         b.cursor_col = self._clamp_col(r, col)
         b.begin_group()

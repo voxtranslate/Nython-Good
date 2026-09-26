@@ -3,12 +3,168 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: end of round 73. **§0d** is this round: the IDE rebuilt to
-VS Code's model and — for the first time — verified by driving the real
-binary with mouse and keyboard input, which found and fixed defects in the
-IDE, the runtime and both engines. Earlier rounds: §0/§0b language-level
-work, §5.3 terminal command line / undo / multi-cursor (71b/71c), §0c
-nytorch autograd (72), §5.10 nytorch class-name collisions.
+Last updated: round 74. **§0e** is this round: IDE responsiveness (native
+text services, a responsive layout ladder), the Code::Blocks feature set,
+non-throwing control flow on both engines, and the build system. §0d is
+round 73 (the IDE to VS Code's model, verified by driving it). Earlier
+rounds: §0/§0b language-level work, §5.3 terminal command line / undo /
+multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
+collisions.
+
+---
+
+## 0e. Round 74 — responsive IDE, Code::Blocks features, faster engines
+
+The request: make the IDE "totally responsive", bring in features from
+Code::Blocks, and fix what is missing or broken across the GUI, nytorch,
+OS, the language, threads/mutexes/synchronisation and async.
+
+### Build (commit 9f8c96e)
+
+Every translation unit except `main.cpp` is the same in the IDE and CLI
+builds, so they are compiled once into `build/obj/`; `main.cpp` is built per
+flavour (`main_ide.o`, `main_cli.o`). `-MMD -MP` records header
+dependencies: editing a header rebuilds exactly the objects that include it,
+so the stale-object trap in §4 no longer needs `make clean`. Both binaries
+build in about 1.5–2.5 minutes.
+
+### Engines: return/break/continue without C++ exceptions (f284623)
+
+A call to a one-line function cost ~20 µs on the interpreter and ~70 µs on
+the VM, because every `return` threw a C++ exception, and every
+`break`/`continue` threw a `std::string`. callgrind put 80% (interpreter)
+and 92% (VM) of a call loop in the unwinder.
+
+- **VM**: `RETURN_VALUE` returns from `run_loop`; each `run_loop` runs
+  exactly one frame. Yields set `GenState.yielded` and return.
+- **Interpreter**: a thread-local `FlowState` (`pending` = return / break /
+  continue, plus the value). Blocks, `if` and every loop check it after each
+  statement. `evalBody` at the function-body call sites and the loops
+  consume it. Constructs that must see a real exception (try/with/switch/
+  class/namespace/import/macro) suspend the fast path (`SuspendFast`).
+- 100k calls: interpreter 2341 → 371 ms (function) and 3554 → 485 ms
+  (method); VM 7240 → 121 ms and 6414 → 180 ms.
+- Found on the way: `while`/`repeat` on the interpreter swallowed every
+  exception raised in their body. They now rethrow.
+
+### Interpreter: inherited methods read as values (9f8c96e)
+
+`obj.method` evaluated to `none` when the method was inherited, although
+calling it worked. The IDE registers `self.on_resize` (defined in a base
+class) as its resize callback, so **resizing never relaid out the
+workbench**. `evalAttribute` now walks the bases depth-first (an MRO walk).
+
+### Responsiveness (294c5a6)
+
+Measured with the headless driver on an 1,800-line file:
+
+| | before | after |
+|---|---|---|
+| keystroke | 381 ms | 34 ms |
+| scroll step | 72 ms | 37 ms |
+| window resize | 81 ms | 29 ms |
+
+About 16 ms of each "after" figure is frame pacing. Memory kept
+(`ide_memprobe.py`): idle 0, hover 0, typing ~18 KB/key, scroll ~8 KB/event.
+
+The profile showed where the time went:
+
+- **Completion** rebuilt its candidates by walking every line on every key.
+- **Syntax checking** spawned a second interpreter and waited for it.
+- **The SCM gutter** ran Myers diff as a script loop inside the painter.
+- **Search, Quick Open, workspace symbols and go-to-definition** read and
+  split every file in the interpreter.
+
+All of that is now in **`src/builtins/text.cpp`**, on both engines and
+pinned by `examples/vm_audit51.ny`:
+
+- `ny_symbols`: a tolerant outline with class bases, method parameters,
+  fields, variables, constants and depth.
+- `ny_check_syntax` / `ny_check_file`: the real lexer and parser, in process.
+- `text_diff` / `text_diff_classify`: Myers diff. `text_diff_classify`
+  agrees with `LineDiff.classify` on 60 random edits.
+- `fs_list_files`, `fs_search` (case / word / regex, include / exclude
+  globs), `fs_symbols`, `fs_todos` and `fs_line_stats` for the workspace.
+- `text_fold_ranges` (indentation blocks and `# region`), `text_line_stats`,
+  `text_todos` and `text_format_nython`.
+- A **completion index** (`ac_index_*`). Candidates stay in C++ and come
+  back as cached strings, so a keystroke allocates one result list.
+
+**Layout ladder.** Each step has hysteresis, so resizing across a threshold
+does not flicker:
+
+- The side bar floats over the editor, with a shadow and light dismiss,
+  when the editor would be narrower than 360 dp.
+- The menus fold into a hamburger that lists the menus and has a way back.
+- The command centre shrinks, then hides.
+- Activity-bar views and panel tabs that do not fit move to a `...` menu.
+- Status-bar items drop lowest priority first.
+
+### Code::Blocks features (`ide_tools.ny`, class `IDETools` in the chain)
+
+These are Code::Blocks' everyday features, rebuilt around this IDE's own
+models rather than copied:
+
+- **Build targets** come from `[target Name]` sections in `*.nyproj`
+  (`main`, `engine` = interp/vm, `args`, `cwd`, `env`, `pre`, `post`).
+  Build, Rebuild, Clean, Build and Run, Run Target and Abort (Shift+F5).
+  - The build is *time-sliced*: `_build_step` checks one file per slice
+    within an 8 ms budget from the frame tick, with `ny_check_file` in
+    process, so the IDE keeps drawing while it builds.
+  - Errors go to Problems and to a **Build Log** panel.
+  - The selected target is saved in `.nyide`.
+- **Bookmarks** (Ctrl+Alt+K / L / J, gutter icon, context menu) and
+  **folds** move with inserted and deleted lines. A mark carries down with
+  its text when Enter is pressed before it, as Scintilla's markers do.
+- **Code folding**: gutter chevrons, Ctrl+Shift+[ / ], Fold All, Unfold All
+  and fold by level. Scrolling, the caret, go-to, the minimap and clicks
+  all work in visual rows. A folded body shows a `...` marker that unfolds
+  when clicked, and jumping into a fold opens it.
+- **Abbreviations**: 20 snippets plus user snippets from `.nyide`, with tab
+  stops written `$<n:text>` (`${}` would be string interpolation in Nython).
+  They appear in the completion list with an exact prefix first, as in VS
+  Code. While tab stops are active, suggestions do not open by themselves
+  (VS Code's `snippetsPreventQuickSuggestions`), and Escape leaves snippet
+  mode.
+- **Editing**:
+  - Insert/overwrite (Insert key, an OVR status item). A run of overtyping
+    undoes as one step.
+  - Duplicate, transpose, upper / lower / title case.
+  - Format Document / Selection (Shift+Alt+F) in the file's own
+    indentation unit, as one undo step.
+- **Keymaps**: VS Code or Code::Blocks (`CB_KEYMAP`: F9, Ctrl+F9, Ctrl+D,
+  ...). *Change Keybinding* captures a pressed key. Bindings are saved in
+  `.nyide` (`keybinding = Ctrl+Alt+M | command.id`).
+- **Tools**:
+  - Class wizard: a file with the constructor and `__str__`, which runs.
+  - Code statistics per file and in total (code, comment, blank, doc).
+  - TODO list panel for the file or the workspace, with owners.
+  - User tools with `$(FILE)`, `$(LINE)`, `$(WORD)`, … macros.
+  - Environment variables for runs, targets and tools.
+  - Saving writes a `.bak` backup when the setting is on.
+- **Debugger**: breakpoint conditions (`i == 3`), hit counts (`5`, `>5`,
+  `%5`) and log points (`i is {i}`). Log points passed before a stop print
+  to the Debug Console. Also Run to Cursor and Add to Watch.
+- **Session**: open editors, the active editor and the caret are restored
+  on the next start.
+
+Defects found while driving these, all fixed:
+
+- **Two undo steps for one action.** Every action that deletes and then
+  inserts recorded two steps: completion accept, replace-one, paste over a
+  selection, wrapping a selection in brackets, format, transpose and case
+  change. They now use `open_group`/`close_group`.
+- **Wheel events had no modifiers.** Wheel events carried no Ctrl/Shift/Alt,
+  so Ctrl+wheel zoom and Shift+wheel sideways scroll never worked
+  (`gui.cpp`). The stub's `wheel` command takes modifiers now.
+- **`K=v cmd` in tool environments.** The shell expanded `$K` before the
+  assignment existed, so tool lines like `echo $GREET` saw nothing. The
+  environment is now `export`ed first.
+- **Wrong completion highlight.** The popup highlighted the first
+  `len(prefix)` characters, not the ones the fuzzy matcher matched.
+
+e2e scenarios added: `build`, `cbedit`, `cbtools`, `cbdebug`, `responsive`,
+`session`.
 
 ---
 

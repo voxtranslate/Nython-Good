@@ -399,7 +399,7 @@ public:   // NythonExecutor is a struct: members default to public
             // ── Native text services for editors (src/builtins/text.cpp) ─────
             "text_words","ny_symbols","ny_check_syntax","text_diff","fs_list_files","fs_search",
             "text_fold_ranges","text_line_stats","text_todos","fs_todos","text_format_nython",
-            "ac_index_new","ac_index_set_base","ac_index_scan","ac_index_rank","text_diff_classify","fs_symbols",
+            "ac_index_new","ac_index_set_base","ac_index_scan","ac_index_rank","text_diff_classify","fs_symbols","ny_check_file","fs_line_stats",
             // ── GUI builtins — value-returning ──────────────────────────────
             "gui_get_error","gui_sdl_version","gui_get_display_size","gui_get_window_size","gui_set_window_size","gui_set_cursor","gui_hash_id","gui_display_scale","gui_window_scale","gui_measure_text_w","gui_set_clipboard","gui_get_clipboard",
             // ── Previously implemented but never registered ──────────────

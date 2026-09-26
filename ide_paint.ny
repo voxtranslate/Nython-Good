@@ -109,6 +109,7 @@ class IDETheme:
             self.gutter_del  = Color(241, 76, 76, 255)
             self.diff_ins_bg = Color(155, 185, 85, 51)     # diffEditor.insertedLineBackground
             self.diff_del_bg = Color(255, 0, 0, 51)        # diffEditor.removedLineBackground
+            self.fold_bg     = Color(255, 255, 255, 28)    # editor.foldPlaceholder
             self.diff_ins_fg = Color(129, 184, 139, 255)
             self.diff_del_fg = Color(244, 135, 113, 255)
             self.debug_bg    = Color(51, 51, 51, 255)
@@ -198,6 +199,7 @@ class IDETheme:
             self.gutter_del  = Color(202, 75, 81, 255)
             self.diff_ins_bg = Color(155, 185, 85, 64)
             self.diff_del_bg = Color(255, 0, 0, 51)
+            self.fold_bg     = Color(0, 0, 0, 22)
             self.diff_ins_fg = Color(40, 120, 50, 255)
             self.diff_del_fg = Color(170, 40, 40, 255)
             self.debug_bg    = Color(243, 243, 243, 255)
@@ -324,7 +326,8 @@ class IDEPaint(IDEOps):
                 n = int(n / 10)
         self.num_w = digits * self.f_code.width("0")
         self.GLYPH_W = self.dp(18)
-        self.GUTTER_W = self.GLYPH_W + self.num_w + self.dp(20)
+        self.FOLD_W = self.dp(16)
+        self.GUTTER_W = self.GLYPH_W + self.num_w + self.dp(20) + self.FOLD_W
         self.text_x0 = self.ed_x + self.GUTTER_W + self.dp(4)
 
     def on_resize(self, w, h):
@@ -370,6 +373,7 @@ class IDEPaint(IDEOps):
         if not self._is_text():
             return
         var d = self.doc()
+        row = self._row_to_vrow(d, row)
         var top = int(d.scroll_y / self.LINE_H)
         var vis = self._rows_visible()
         if row < top:
@@ -382,6 +386,7 @@ class IDEPaint(IDEOps):
         if not self._is_text():
             return
         var d = self.doc()
+        row = self._row_to_vrow(d, row)
         var top = int(d.scroll_y / self.LINE_H)
         var vis = self._rows_visible()
         if row < top or row >= top + vis - 1:
@@ -415,7 +420,7 @@ class IDEPaint(IDEOps):
             return
         var d = self.doc()
         # VS Code lets the last line scroll up to the top of the viewport.
-        var maxs = (d.buf.line_count - 1) * self.LINE_H
+        var maxs = (self._vis_count(d) - 1) * self.LINE_H
         if d.scroll_y > maxs:
             d.scroll_y = maxs
         if d.scroll_y < 0:
@@ -493,6 +498,9 @@ class IDEPaint(IDEOps):
             self.dbgcon_kinds = []
         elif self.active_panel == "inspector":
             self.inspect_lines = []
+        elif self.active_panel == "buildlog":
+            self.build_lines = []
+            self.build_kinds = []
         self.panel_scroll = 0
 
     # ══ draw ═══════════════════════════════════════════════════════════════════
@@ -929,6 +937,11 @@ class IDEPaint(IDEOps):
         self._hit(ex + self.GUTTER_W, ey, self.ed_w - self.GUTTER_W, self.ed_h, "@editor", "", "")
         self._hit(ex, ey, self.GLYPH_W, self.ed_h, "@gutter.glyph", "", "")
         self._hit(ex + self.GLYPH_W, ey, self.GUTTER_W - self.GLYPH_W, self.ed_h, "@gutter.num", "", "")
+        var fold_x = ex + self.GUTTER_W - self.FOLD_W
+        self._hit(fold_x, ey, self.FOLD_W, self.ed_h, "@gutter.fold", "", "")
+        # Screen rows, not buffer rows: a folded region is one row.
+        var nvis = self._vis_count(d)
+        var has_folds = len(d.folds) > 0
         # Text area, clipped so horizontal scroll never paints over the gutter.
         r.clip_xywh(tx_clip, ey, self.ed_w - self.GUTTER_W, self.ed_h)
         var sel = self._sel_range()
@@ -936,8 +949,11 @@ class IDEPaint(IDEOps):
         var is_diff = d.lang == "diff"
         var i = 0
         while i < rows:
-            var ln = top + i
-            if ln < b.line_count:
+            var vr = top + i
+            if vr < nvis:
+                var ln = vr
+                if has_folds:
+                    ln = self._vrow_to_row(d, vr)
                 var y = ey + i * lh - yoff
                 var line = b.lines[ln]
                 if ln == self.dbg_line_row and self.dbg.active and self._dbg_doc_is_active():
@@ -967,20 +983,32 @@ class IDEPaint(IDEOps):
                 if self.show_whitespace:
                     self._draw_whitespace(r, line, text_x, y, lh)
                 self._draw_segs(r, segs, text_x, y + int((lh - self.code_h) / 2))
+                if has_folds and self._is_folded(d, ln):
+                    # The folded region's placeholder; clicking it unfolds.
+                    var fx = text_x + self._col_x(line, len(line)) + self.dp(8)
+                    var fw = self.dp(28)
+                    r.fill_round_xywh(fx, y + self.dp(3), fw, lh - self.dp(6), th.fold_bg, self.dp(3))
+                    r.text("...", fx + self.dp(6), y + int((lh - self.code_h) / 2) - self.dp(2), self.f_code, th.text_dim)
+                    self._hit(fx, y, fw, lh, "@fold.marker", ln, "Unfold")
             i = i + 1
-        self._draw_bracket_match(r, b, top, yoff, text_x)
+        if not has_folds:
+            self._draw_bracket_match(r, b, top, yoff, text_x)
         # Carets: primary, then extras in the same blink phase.
         if self.caret_on and self.focus == "editor" and not d.readonly:
-            var crow = cur_row - top
+            var crow = self._row_to_vrow(d, cur_row) - top
             if crow >= 0 and crow < rows:
                 var cy = ey + crow * lh - yoff
                 var cx = text_x + self._col_x(b.lines[cur_row], b.cursor_col)
-                r.fill_xywh(cx, cy + 1, self.dp(2), lh - 2, th.caret)
+                if self.overwrite:
+                    # Overwrite mode: a block over the character it replaces.
+                    r.fill_xywh(cx, cy + 1, self.char_w, lh - 2, self._a(th.caret, 110))
+                else:
+                    r.fill_xywh(cx, cy + 1, self.dp(2), lh - 2, th.caret)
             if self.selmodel.count > 1:
                 var ei = 1
                 while ei < self.selmodel.count:
                     var s = self.selmodel.sels[ei]
-                    var er = s.caret.row - top
+                    var er = self._row_to_vrow(d, s.caret.row) - top
                     if er >= 0 and er < rows and s.caret.row < b.line_count:
                         var ecx = text_x + self._col_x(b.lines[s.caret.row], s.caret.col)
                         r.fill_xywh(ecx, ey + er * lh - yoff + 1, self.dp(2), lh - 2, th.caret)
@@ -992,11 +1020,17 @@ class IDEPaint(IDEOps):
         var diff = self._diff_for(d)
         var glyph_hover_row = -1
         if self._hov(ex, ey, self.GLYPH_W, self.ed_h):
-            glyph_hover_row = top + int((self.my - ey + yoff) / lh)
+            glyph_hover_row = self._vrow_to_row(d, top + int((self.my - ey + yoff) / lh))
+        var gutter_hov = self._hov(ex, ey, self.GUTTER_W, self.ed_h)
+        var bm = d.bookmarks
+        var bj = 0
         i = 0
         while i < rows:
-            var ln2 = top + i
-            if ln2 < b.line_count:
+            var vr2 = top + i
+            if vr2 < nvis:
+                var ln2 = vr2
+                if has_folds:
+                    ln2 = self._vrow_to_row(d, vr2)
                 var y2 = ey + i * lh - yoff
                 var ns = self._line_num(ln2 + 1)
                 var gc = th.gutter_fg
@@ -1012,6 +1046,19 @@ class IDEPaint(IDEOps):
                     r.fill_circle(bcx, bcy, self.dp(5), self._a(th.breakpoint, 90))
                 if ln2 == self.dbg_line_row and self.dbg.active and self._dbg_doc_is_active():
                     self.icons.draw(r, "debug-stackframe", bcx - self.dp(8), bcy - self.dp(8), self.dp(16), th.warn)
+                # Bookmarks (sorted rows; walked alongside the visible rows).
+                while bj < len(bm) and bm[bj] < ln2:
+                    bj = bj + 1
+                if bj < len(bm) and bm[bj] == ln2:
+                    self.icons.draw(r, "bookmark", ex + self.dp(1), bcy - self.dp(7), self.dp(14), th.info)
+                # Folding: a chevron on every region header while the pointer
+                # is over the gutter, and always on a folded one.
+                var folded = has_folds and self._is_folded(d, ln2)
+                if folded or (gutter_hov and self._fold_range_at(d, ln2) != none):
+                    var chev = "chevron-down"
+                    if folded:
+                        chev = "chevron-right"
+                    self.icons.draw(r, chev, fold_x + int((self.FOLD_W - self.dp(14)) / 2), y2 + int((lh - self.dp(14)) / 2), self.dp(14), th.text_dim)
                 if diff != none and ln2 < len(diff):
                     var dk = diff[ln2]
                     var dx = ex + self.GLYPH_W + self.num_w + self.dp(8)
@@ -1624,7 +1671,7 @@ class IDEPaint(IDEOps):
         # Tabs that do not fit before the action buttons go to a "..." menu;
         # the active tab always stays visible (it takes the last slot).
         var nbtn = 2
-        if self.active_panel == "output" or self.active_panel == "terminal" or self.active_panel == "debug" or self.active_panel == "inspector":
+        if self.active_panel == "output" or self.active_panel == "terminal" or self.active_panel == "debug" or self.active_panel == "inspector" or self.active_panel == "buildlog":
             nbtn = 3
         if self.active_panel == "output" and self.job_running:
             nbtn = 4
@@ -1693,7 +1740,7 @@ class IDEPaint(IDEOps):
             mx_icon = "chevron-down"
             mx_tip = "Restore Panel Size"
         self._small_button(r, ax - self.dp(28), y + self.dp(6), self.dp(26), hh - self.dp(12), mx_icon, "workbench.action.toggleMaximizedPanel", "", mx_tip, false)
-        if self.active_panel == "output" or self.active_panel == "terminal" or self.active_panel == "debug" or self.active_panel == "inspector":
+        if self.active_panel == "output" or self.active_panel == "terminal" or self.active_panel == "debug" or self.active_panel == "inspector" or self.active_panel == "buildlog":
             self._small_button(r, ax - self.dp(56), y + self.dp(6), self.dp(26), hh - self.dp(12), "clear-all", "workbench.action.terminal.clear", "", "Clear", false)
         if self.active_panel == "output" and self.job_running:
             self._small_button(r, ax - self.dp(84), y + self.dp(6), self.dp(26), hh - self.dp(12), "debug-stop", "@job.stop", "", "Stop the running program (Shift+F5)", false)
@@ -1711,6 +1758,10 @@ class IDEPaint(IDEOps):
             self._draw_dbg_console(r, x, by, w, bh)
         elif ap == "inspector":
             self._draw_inspector(r, x, by, w, bh)
+        elif ap == "buildlog":
+            self._draw_lines(r, x, by, w, bh, self.build_lines, self.build_kinds, "buildlog", "No build output yet. Build with " + self._or_none(self.reg.keys_of("nython.build")) + ".")
+        elif ap == "todo":
+            self._draw_todo(r, x, by, w, bh)
         elif ap == "workshop":
             self.workshop.draw(r)
             self._hit(x, by, w, bh, "@workshop", "", "")
@@ -1962,6 +2013,10 @@ class IDEPaint(IDEOps):
         x = self._status_item(r, x, y, h, "error", self.st_errors, "workbench.actions.view.problems", "", "Problems (Ctrl+Shift+M)")
         x = x - self.dp(6)
         x = self._status_item(r, x, y, h, "warning", self.st_warnings, "workbench.actions.view.problems", "", "Problems (Ctrl+Shift+M)")
+        if self.ws.root != "" and self.W > self.dp(640):
+            x = self._status_item(r, x, y, h, "tools", self._active_target()["name"], "@status.target", "", "Build target (Build > Select Target)")
+        if self.build_running:
+            x = self._status_item(r, x, y, h, "loading", "Building", "nython.abort", "", "Click to abort the build")
         if self.job_running:
             x = self._status_item(r, x, y, h, "loading", self.st_job, "@job.stop", "", "Click to stop the running program")
         if self.dbg.active:
@@ -2010,6 +2065,8 @@ class IDEPaint(IDEOps):
                 rx = self._status_item_r(r, rx, y, h, "", self.st_indent, "changeEditorIndentation", "", "Select Indentation")
             if s_pos:
                 rx = self._status_item_r(r, rx, y, h, "", self.st_pos, "workbench.action.gotoLine", "", "Go to Line/Column (Ctrl+G)")
+            if self.overwrite:
+                rx = self._status_item_r(r, rx, y, h, "", "OVR", "@status.ovr", "", "Overwrite mode (Insert toggles)")
         # The transient message fits in whatever is left between the groups.
         if self.status_msg != "" and time_ms() - self.status_t < 8000 and rx - x > self.dp(40):
             r.clip_xywh(x, y, rx - x - self.dp(4), h)
@@ -2347,15 +2404,48 @@ class IDEPaint(IDEOps):
             elif kind == "class":
                 icon = "symbol-class"
                 icol = th.git_mod
+            elif kind == "snippet":
+                icon = "symbol-snippet"
+                icol = th.text
             self.icons.draw(r, icon, x + self.dp(6), yy + self.dp(3), self.dp(16), icol)
             var label = self.ac_items[k]
-            r.text(label, x + self.dp(28), yy + int((ih - self.code_h) / 2), self.f_code, th.text)
-            # Matched prefix in the highlight colour, as in VS Code's suggest.
-            if len(self.ac_prefix) > 0:
-                r.text(string_slice(label, 0, len(self.ac_prefix)), x + self.dp(28), yy + int((ih - self.code_h) / 2), self.f_code, th.match_hi)
-            r.text(kind, x + w - self.dp(10) - self.f_small.width(kind), yy + int((ih - self.small_h) / 2), self.f_small, th.text_faint)
+            var ty = yy + int((ih - self.code_h) / 2)
+            r.text(label, x + self.dp(28), ty, self.f_code, th.text)
+            # The characters the fuzzy matcher actually matched, in the
+            # highlight colour (not just the first len(prefix) characters,
+            # which for "def" -> "undefined" marked the wrong three).
+            var ms = self._ac_marks_for(k)
+            var j = 0
+            while j < len(ms):
+                r.text(string_slice(label, ms[j], ms[j] + 1), x + self.dp(28) + ms[j] * self.char_w, ty, self.f_code, th.match_hi)
+                j = j + 1
+            var kl = kind
+            if kind == "snippet":
+                kl = "snippet"
+            r.text(kl, x + w - self.dp(10) - self.f_small.width(kl), yy + int((ih - self.small_h) / 2), self.f_small, th.text_faint)
             self._hit(x, yy, w, ih, "@ac.item", k, "")
             i = i + 1
+
+    # Matched positions per suggestion, computed once per prefix and item.
+    def _ac_marks_for(self, k):
+        if self.ac_mark_key != self.ac_prefix:
+            self.ac_mark_key = self.ac_prefix
+            self.ac_marks = []
+            var i = 0
+            while i < self.ac_n:
+                self.ac_marks.append(none)
+                i = i + 1
+        if k >= len(self.ac_marks):
+            return []
+        var ms = self.ac_marks[k]
+        if ms == none:
+            ms = []
+            if len(self.ac_prefix) > 0:
+                var ps = fuzzy_positions(self.ac_prefix, self.ac_items[k])
+                if ps != none:
+                    ms = ps
+            self.ac_marks[k] = ms
+        return ms
 
     def _draw_hover_info(self, r):
         var th = self.th

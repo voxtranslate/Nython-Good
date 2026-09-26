@@ -1038,8 +1038,10 @@ class IDEViews(IDEPaint):
             self.break_list.append(k)
             self.brk_gen = self.brk_gen + 1
             self.status_msg = "Breakpoint set at line " + str(row + 1)
+        # A breakpoint set or cleared during a session applies to it at once
+        # (the recording's map used to be fixed when the session started).
         if self.dbg.active:
-            self._dbg_compute_hits()
+            self._dbg_rebuild_breaks()
 
     # ── debug session ────────────────────────────────────────────────────────
     def _debug_start(self):
@@ -1058,16 +1060,7 @@ class IDEViews(IDEPaint):
         self.dbg_run_path = path
         self.dbg_trace = "/tmp/nyide_trace_" + str(self.session_id) + ".jsonl"
         write_file(self.dbg_trace, "")
-        # Breakpoints of an untitled editor apply to its temporary copy.
-        self.dbg_breaks = {}
-        var i = 0
-        while i < len(self.break_list):
-            var parts = self._break_parts(self.break_list[i])
-            var file = parts[0]
-            if file == self._doc_key(d):
-                file = path
-            self.dbg_breaks[file + ":" + str(parts[1])] = true
-            i = i + 1
+        self._dbg_rebuild_breaks()
         self.dbgcon_lines = []
         self.dbgcon_kinds = []
         self._dbg_print("Recording " + os_path_basename(path) + " ...", "info")
@@ -1097,9 +1090,32 @@ class IDEViews(IDEPaint):
         self.dbg.start(self.dbg_breaks)
         self.dbg_frame = -1
         self._dbg_print("Recorded " + str(self.dbg.n) + " steps. Paused at line " + str(self.dbg.line_at(self.dbg.pos)) + ".", "info")
+        self._dbg_flush_logs()
         if self.dbg.exception != "":
             self._dbg_print("The program raised: " + self.dbg.exception + "  (" + self.dbg.exception_at + ")", "err")
         self._dbg_sync()
+
+    # The recording's breakpoint map: "file:line" -> true, or a map with a
+    # condition, hit count or log message (ide_tools.ny, Edit Breakpoint).
+    # Breakpoints of an untitled editor apply to its temporary copy.
+    def _dbg_rebuild_breaks(self):
+        var d = self.dbg_doc
+        var path = self.dbg_run_path
+        self.dbg_breaks = {}
+        var i = 0
+        while i < len(self.break_list):
+            var key = self.break_list[i]
+            var parts = self._break_parts(key)
+            var file = parts[0]
+            if d != none and file == self._doc_key(d):
+                file = path
+            var spec = true
+            if self.brk_extra.has_key(key):
+                spec = self.brk_extra[key]
+            self.dbg_breaks[file + ":" + str(parts[1])] = spec
+            i = i + 1
+        if self.dbg.active:
+            self._dbg_compute_hits()
 
     def _dbg_compute_hits(self):
         var hits = []
@@ -1180,6 +1196,7 @@ class IDEViews(IDEPaint):
         if dir > 0:
             if not self.dbg.continue_fwd(self.dbg_breaks):
                 self._dbg_end_reached()
+            self._dbg_flush_logs()
         else:
             self.dbg.continue_back(self.dbg_breaks)
         self._dbg_sync()

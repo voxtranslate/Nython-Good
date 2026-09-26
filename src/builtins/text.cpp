@@ -473,6 +473,24 @@ Value ny_check_syntax(NythonExecutor& E, std::vector<Value>& args) {
     return out.done();
 }
 
+// ny_check_file(path) -> the same as ny_check_syntax on the file's text,
+// read here (a build checks every file of a project; reading them in the
+// interpreter would keep every file's text for the rest of the session).
+Value ny_check_file(NythonExecutor& E, std::vector<Value>& args) {
+    if (args.empty()) return ListBuilder(E).done();
+    std::string path = E.getStringValue(args[0]);
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        ListBuilder out(E), d(E);
+        d.add_int(0); d.add_int(0); d.add_str("cannot read " + path);
+        out.add(d.done());
+        return out.done();
+    }
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::vector<Value> a{E.makeStringValue(text.empty() ? std::string("\n") : text)};
+    return ny_check_syntax(E, a);
+}
+
 // ── text_diff (Myers, O((N+M)D) time, snapshots of V for the backtrack) ─────
 struct Hunk { int a0, al, b0, bl; };
 
@@ -923,6 +941,47 @@ Value text_line_stats(NythonExecutor& E, std::vector<Value>& args) {
     return out.done();
 }
 
+// fs_line_stats(root, include="*.ny") -> [[relpath, total, code, comment,
+// blank, docstring], ...] for Code Statistics.
+Value fs_line_stats(NythonExecutor& E, std::vector<Value>& args) {
+    ListBuilder out(E);
+    if (args.empty()) return out.done();
+    std::string root = E.getStringValue(args[0]);
+    while (root.size() > 1 && (root.back() == '/' || root.back() == '\\')) root.pop_back();
+    auto includes = split_globs(args.size() > 1 ? E.getStringValue(args[1]) : std::string("*.ny"));
+    std::unordered_set<std::string> skip;
+    for (int i = 0; kDefaultSkip[i]; i++) skip.insert(kDefaultSkip[i]);
+    std::vector<std::string> files;
+    walk(root, "", skip, 20000, files, 0, true, 40);
+    std::string text;
+    for (auto& rel : files) {
+        if (!includes.empty() && !path_matches(rel, includes)) continue;
+        if (!read_small(root + "/" + rel, 8 * 1024 * 1024, text)) continue;
+        std::vector<std::string> lines;
+        split_lines(text, lines);
+        if (!lines.empty() && lines.back().empty()) lines.pop_back();   // the final newline
+        long long code = 0, comment = 0, blank = 0, doc = 0;
+        char triple = 0;
+        std::vector<bool> mask;
+        for (auto& ln : lines) {
+            bool was = triple != 0;
+            bool has_comment = false, has_code = false;
+            scan_line(ln, triple, mask, &has_comment, &has_code);
+            std::string t = trim(ln);
+            bool starts_doc = t.size() >= 3 && (t[0] == '"' || t[0] == '\'') && t[1] == t[0] && t[2] == t[0];
+            if (was || starts_doc) { doc++; continue; }
+            if (is_blank(ln)) { blank++; continue; }
+            if (!has_code && has_comment) { comment++; continue; }
+            code++;
+        }
+        ListBuilder h(E);
+        h.add_str(rel); h.add_int((long long)lines.size());
+        h.add_int(code); h.add_int(comment); h.add_int(blank); h.add_int(doc);
+        out.add(h.done());
+    }
+    return out.done();
+}
+
 // ── TODO scanning ────────────────────────────────────────────────────────────
 // A tag counts in a comment only: "# TODO: x", "# FIXME(bob): y", "// NOTE z".
 struct Todo { size_t row; long long col; std::string tag, text, owner; };
@@ -1309,12 +1368,14 @@ Value dispatch_text(NythonExecutor& E, const std::string& name, std::vector<Valu
         case 'n':
             if (name == "ny_symbols") return ny_symbols(E, args);
             if (name == "ny_check_syntax") return ny_check_syntax(E, args);
+            if (name == "ny_check_file") return ny_check_file(E, args);
             break;
         case 'f':
             if (name == "fs_list_files") return fs_list_files(E, args);
             if (name == "fs_search") return fs_search(E, args);
             if (name == "fs_todos") return fs_todos(E, args);
             if (name == "fs_symbols") return fs_symbols(E, args);
+            if (name == "fs_line_stats") return fs_line_stats(E, args);
             break;
     }
     return UNDEFINED_VALUE;

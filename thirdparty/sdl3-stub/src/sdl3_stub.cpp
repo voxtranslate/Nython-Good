@@ -538,7 +538,7 @@ void SDL_free(void* mem) { free(mem); }
 //   click X Y [BTN] [mods]   press, idle frames, release
 //   dblclick X Y             two clicks in quick succession
 //   drag X1 Y1 X2 Y2         press, move in steps, release
-//   wheel X Y DY             wheel at X,Y (DY > 0 scrolls up)
+//   wheel X Y DY [mods]      wheel at X,Y (DY > 0 scrolls up), e.g. wheel 300 200 1 ctrl
 //   key COMBO                key down/up, e.g. key ctrl+shift+p, key f5, key ctrl++
 //   type TEXT                per character: key down + text input + key up.
 //                            \n = Enter, \t = Tab, \\ = backslash
@@ -773,7 +773,8 @@ static void exec_command(const std::string& raw) {
         return;
     }
     if (cmd == "wheel") {
-        PendingEvent w = blank_event(SDL_EVENT_MOUSE_WHEEL, SDL_KMOD_NONE);
+        SDL_Keymod wm = a.size() > 4 ? parse_mods(a[4]) : SDL_KMOD_NONE;
+        PendingEvent w = blank_event(SDL_EVENT_MOUSE_WHEEL, wm);
         w.ev.wheel.mouse_x = num(1, g_mouse_x);
         w.ev.wheel.mouse_y = num(2, g_mouse_y);
         w.ev.wheel.y = num(3, 0);
