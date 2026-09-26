@@ -67,9 +67,9 @@ print "node status: " + node.status()
 node.stop()
 print "MeshNode.PASS"
 
-# --- ServiceRegistry ---
-print "--- ServiceRegistry ---"
-var registry = ServiceRegistry("/tmp/ny_svc_reg")
+# --- MeshServiceRegistry ---
+print "--- MeshServiceRegistry ---"
+var registry = MeshServiceRegistry("/tmp/ny_svc_reg")
 registry.register("inference_api", "127.0.0.1", 8080, "1.2.0", "ml,gpu")
 registry.register("training_service", "127.0.0.1", 8081, "2.0.1", "ml,cpu")
 registry.register("data_pipeline", "127.0.0.1", 8082, "1.0.0", "etl")
@@ -80,11 +80,11 @@ print "discovered port: " + str(svc["port"])
 print "health: " + registry.health_check("inference_api")
 registry.mark_down("data_pipeline")
 print "healthy count: " + str(len(registry.healthy_services()))
-print "ServiceRegistry.PASS"
+print "MeshServiceRegistry.PASS"
 
-# --- LoadBalancer ---
-print "--- LoadBalancer ---"
-var lb_rr = LoadBalancer("round_robin")
+# --- MeshLoadBalancer ---
+print "--- MeshLoadBalancer ---"
+var lb_rr = MeshLoadBalancer("round_robin")
 lb_rr.add_backend("192.168.1.1", 8080, 1.0)
 lb_rr.add_backend("192.168.1.2", 8080, 1.0)
 lb_rr.add_backend("192.168.1.3", 8080, 1.0)
@@ -95,12 +95,12 @@ var b4 = lb_rr.next()
 print "RR first: " + b1["host"]
 print "RR fourth (wraps): " + b4["host"]
 print "LB stats: " + lb_rr.stats()
-var lb_lc = LoadBalancer("least_conn")
+var lb_lc = MeshLoadBalancer("least_conn")
 lb_lc.add_backend("10.0.0.1", 9090, 1.0)
 lb_lc.add_backend("10.0.0.2", 9090, 2.0)
 var lc_b = lb_lc.next()
 print "least_conn choice: " + lc_b["host"]
-print "LoadBalancer.PASS"
+print "MeshLoadBalancer.PASS"
 
 # --- CircuitBreaker ---
 print "--- CircuitBreaker ---"
@@ -118,9 +118,9 @@ cb.on_success()
 print "success tracked: " + str(cb.successes)
 print "CircuitBreaker.PASS"
 
-# --- RateLimiter ---
-print "--- RateLimiter ---"
-var rl = RateLimiter("api_limit", 10, 5)
+# --- TokenBucketLimiter ---
+print "--- TokenBucketLimiter ---"
+var rl = TokenBucketLimiter("api_limit", 10, 5)
 print "initial tokens: " + str(rl.tokens)
 var ok1 = rl.allow(1)
 var ok2 = rl.allow(1)
@@ -130,7 +130,7 @@ print "tokens remaining: " + str(rl.tokens > 0.0)
 var ok_big = rl.allow(100)
 print "large request denied: " + str(not ok_big)
 print "RL stats: " + rl.stats()
-print "RateLimiter.PASS"
+print "TokenBucketLimiter.PASS"
 
 # --- NyDB + NyTable + QueryBuilder ---
 print "--- NyDB / NyTable / QueryBuilder ---"

@@ -1,5 +1,7 @@
 # import nytorch
 
+import "lib/nytorch/core.ny"
+
 class UniformDist:
     def init(self, low, high):
         self.low  = low
@@ -9,7 +11,7 @@ class UniformDist:
         var lo  = self.low
         var hi  = self.high
         var out = Tensor([0.0])
-        out.data = tensor_apply(u, lambda v: lo + (hi - lo) * v)
+        out = Tensor(tensor_apply(u, lambda v: lo + (hi - lo) * v))
         return out
     def log_prob(self, x):
         if x < self.low or x > self.high:
@@ -36,7 +38,7 @@ class LoRALayer:
         var xA   = matmul(x.data, self.A, 1, self.in_dim, self.rank)
         var xAB  = matmul(xA, self.B, 1, self.rank, self.out_dim)
         var out  = Tensor([0.0])
-        out.data = tensor_add(base_out.data, tensor_scale(xAB, self.scale))
+        out = Tensor(tensor_add(base_out.data, tensor_scale(xAB, self.scale)))
         return out
     def lora_params(self):
         return [self.A, self.B]
@@ -68,7 +70,7 @@ class QuantizedLinear:
         var shift = tensor_scale(ones(len(w)), -wmin)
         var q_w   = tensor_add(tensor_scale(tensor_apply(tensor_scale(tensor_add(w, shift), 1.0 / scale), lambda v: float(int(v + 0.5))), scale), tensor_scale(ones(len(w)), wmin))
         var out   = Tensor([0.0])
-        out.data  = tensor_add(matmul(x.data, q_w, 1, self.in_dim, self.out_dim), self.base.bias)
+        out = Tensor(tensor_add(matmul(x.data, q_w, 1, self.in_dim, self.out_dim), self.base.bias))
         return out
 
 class SpectralNorm:
@@ -93,7 +95,7 @@ class SpectralNorm:
         var sig  = max(0.000000001, self.sigma())
         var W_sn = tensor_scale(self.layer.weights, 1.0 / sig)
         var out  = Tensor([0.0])
-        out.data = tensor_add(matmul(x.data, W_sn, 1, self.layer.in_dim, self.layer.out_dim), self.layer.bias)
+        out = Tensor(tensor_add(matmul(x.data, W_sn, 1, self.layer.in_dim, self.layer.out_dim), self.layer.bias))
         return out
 
 
@@ -155,7 +157,7 @@ class MixtureOfExperts:
             var result = tensor_add(result, tensor_scale(eout.data, w))
             var ki2 = ki2 + 1
         var out = Tensor([0.0])
-        out.data = result
+        out = Tensor(result)
         return out
 
 
@@ -183,11 +185,11 @@ class S4Layer:
             var h = tensor_add(tensor_mul(A_bar, h), Bx)
             var Ch  = matmul(h, self.C, 1, self.state_dim, self.d_model)
             var y   = Tensor([0.0])
-            y.data  = tensor_add(Ch, tensor_mul(self.D, x.data))
+            y = Tensor(tensor_add(Ch, tensor_mul(self.D, x.data)))
             outputs.append(y)
         return outputs
 
-class MambaBlock:
+class SimpleMambaBlock:
     # Selective SSM block (Gu & Dao 2023)
     def init(self, d_model, state_dim, expand):
         self.d_model  = d_model
@@ -201,18 +203,18 @@ class MambaBlock:
         var proj   = self.in_proj.forward(normed)
         var half   = self.d_inner
         var h_in   = Tensor([0.0])
-        h_in.data  = tensor_slice(proj.data, 0, half)
+        h_in = Tensor(tensor_slice(proj.data, 0, half))
         var z      = Tensor([0.0])
-        z.data     = tensor_slice(proj.data, half, half * 2)
+        z = Tensor(tensor_slice(proj.data, half, half * 2))
         var ssm_out = self.ssm.forward([h_in])
         var h_out   = ssm_out[0]
         var gate    = Tensor([0.0])
-        gate.data   = tensor_apply(z.data, lambda v: silu(v))
+        gate = Tensor(tensor_apply(z.data, lambda v: silu(v)))
         var gated   = Tensor([0.0])
-        gated.data  = tensor_mul(gate.data, h_out.data)
+        gated = Tensor(tensor_mul(gate.data, h_out.data))
         var out     = self.out_proj.forward(gated)
         var out_f   = Tensor([0.0])
-        out_f.data  = tensor_add(x.data, out.data)
+        out_f = Tensor(tensor_add(x.data, out.data))
         return out_f
 
 
@@ -220,7 +222,7 @@ class MambaBlock:
 # SECTION 18: REINFORCEMENT LEARNING
 # ---------------------------------------------
 
-class ReplayBuffer:
+class RingReplayBuffer:
     def init(self, capacity):
         self.capacity = capacity
         self.buffer   = []
@@ -246,7 +248,7 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
-class DQNAgent:
+class MLPDQNAgent:
     def init(self, state_dim, action_dim, hidden_dim, gamma, epsilon):
         self.state_dim  = state_dim
         self.action_dim = action_dim
@@ -254,7 +256,7 @@ class DQNAgent:
         self.epsilon    = epsilon
         self.q_net      = MLP([state_dim, hidden_dim, hidden_dim, action_dim], "relu")
         self.target_net = MLP([state_dim, hidden_dim, hidden_dim, action_dim], "relu")
-        self.buffer     = ReplayBuffer(10000)
+        self.buffer     = RingReplayBuffer(10000)
         self.optimizer  = Adam(0.001, 0.9, 0.999, 0.00000001)
         self.steps      = 0
     def act(self, state):
@@ -362,7 +364,7 @@ class GraphSAGE:
             var self_part  = self.W_self.forward(node_features[v])
             var neigh_part = self.W_neigh.forward(Tensor(mean_neigh))
             var combined   = Tensor([0.0])
-            combined.data  = tensor_add(self_part.data, neigh_part.data)
+            combined = Tensor(tensor_add(self_part.data, neigh_part.data))
             out.append(self.act.forward(combined))
             var v = v + 1
         return out
@@ -394,7 +396,7 @@ class GATLayer:
             if denom > 0.000000001:
                 attn_sum = tensor_scale(attn_sum, 1.0 / denom)
             var res   = Tensor([0.0])
-            res.data  = tensor_apply(attn_sum, lambda v: relu(v))
+            res = Tensor(tensor_apply(attn_sum, lambda v: relu(v)))
             out.append(res)
             var v = v + 1
         return out
@@ -425,7 +427,7 @@ class DDPMScheduler:
         var nd  = NormalDist(0.0, 1.0)
         var eps = nd.sample(len(x0.data))
         var noisy = Tensor([0.0])
-        noisy.data = tensor_add(tensor_scale(x0.data, sqrt(ab)), tensor_scale(eps.data, sqrt(1.0 - ab)))
+        noisy = Tensor(tensor_add(tensor_scale(x0.data, sqrt(ab)), tensor_scale(eps.data, sqrt(1.0 - ab))))
         return [noisy, eps]
     def denoise_step(self, x_t, pred_noise, t):
         var beta_t  = self.betas[t]
@@ -438,12 +440,12 @@ class DDPMScheduler:
         var mean    = tensor_add(tensor_scale(x0_pred, coef1), tensor_scale(x_t.data, coef2))
         if t == 0:
             var out = Tensor([0.0])
-            out.data = mean
+            out = Tensor(mean)
             return out
         var sigma = sqrt(beta_t * (1.0 - ab_prev) / (1.0 - ab_t))
         var nd    = NormalDist(0.0, sigma)
         var z     = nd.sample(len(mean))
         var out   = Tensor([0.0])
-        out.data  = tensor_add(mean, z.data)
+        out = Tensor(tensor_add(mean, z.data))
         return out
 

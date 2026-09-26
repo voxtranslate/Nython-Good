@@ -2,7 +2,7 @@
 # NyTorch v3.0 -- Part 10: Servers, Federated AI, NyApp
 # ============================================================
 # Classes 139-163:
-#   SocketServer, HttpRouter, HttpServer, AgentServer,
+#   SocketServer, HttpRouter, AgentHttpServer, AgentServer,
 #   AgentHttpClient, KnowledgeGraph, FederatedRound,
 #   FederatedLearner, ConsensusVoter, GradientSharer,
 #   NyPipeline, AutoTrainer, HyperSearch,
@@ -10,6 +10,8 @@
 #   AgentCluster, NyMonitor, NyConfig,
 #   NyApp, NyWorld, NyOS
 # ============================================================
+
+import "lib/nytorch/core.ny"
 
 import nytorch
 
@@ -90,9 +92,9 @@ class HttpRouter:
         return self
 
 # -----------------------------------------
-# 141. HttpServer  (single-threaded HTTP)
+# 141. AgentHttpServer  (single-threaded HTTP)
 # -----------------------------------------
-class HttpServer:
+class AgentHttpServer:
     def __init__(self, port):
         self.port = port
         self.server = SocketServer(port)
@@ -155,7 +157,7 @@ class AgentServer:
     def __init__(self, agent_id, port, storage_dir):
         self.agent_id = agent_id
         self.port = port
-        self.http = HttpServer(port)
+        self.http = AgentHttpServer(port)
         self.kb = KnowledgeBase(storage_dir + "/" + agent_id + "_srv.kv")
         self.logger = DataLogger(storage_dir + "/logs", agent_id + "_server")
         self.model_store = ModelStore(storage_dir + "/models")

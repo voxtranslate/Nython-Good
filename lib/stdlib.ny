@@ -1050,7 +1050,7 @@ class Random:
 
 # ─── Pipeline / Functional ───────────────────────────────────────────────────
 
-class Pipeline:
+class FnPipeline:
     def __init__(self):
         self.steps = []
         self.step_count = 0
@@ -1107,7 +1107,7 @@ class CSV:
 
 # ─── Template engine ─────────────────────────────────────────────────────────
 
-class Template:
+class TextTemplate:
     def __init__(self, text):
         self.text = text
     def render(self, vars):

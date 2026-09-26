@@ -7,9 +7,9 @@
 # Capabilities:
 #   DeviceManager   - auto-detect & route CPU/GPU/TPU/multi-core compute
 #   UniversalLoader - read URLs, HTML, ZIP, JSON, CSV, PDF, code files
-#   KnowledgeBase   - store/search/retrieve documents & embeddings
+#   VectorKnowledgeBase   - store/search/retrieve documents & embeddings
 #   Translator      - multi-language text translation
-#   CodeAnalyzer    - understand & generate code in any language
+#   SourceCodeAnalyzer    - understand & generate code in any language
 #   AIInterface     - Claude, GPT, Gemini API integration
 #   AutonomousAgent - self-directed learning, planning, execution
 #   MultiAgentSystem - coordinate agent swarms
@@ -19,6 +19,8 @@
 # ---------------------------------------------------------------------------
 # 321: DeviceManager - detect and manage CPU/GPU/TPU backends
 # ---------------------------------------------------------------------------
+import "lib/nytorch/core.ny"
+
 class DeviceManager:
     def __init__(self):
         self.name = "DeviceManager"
@@ -348,9 +350,9 @@ class WebScraper:
         return self.name
 
 # ---------------------------------------------------------------------------
-# 327: KnowledgeBase - vector-indexed document store with semantic search
+# 327: VectorKnowledgeBase - vector-indexed document store with semantic search
 # ---------------------------------------------------------------------------
-class KnowledgeBase:
+class VectorKnowledgeBase:
     def __init__(self, embed_dim):
         self.embed_dim = embed_dim
         self.documents = []
@@ -358,7 +360,7 @@ class KnowledgeBase:
         self.doc_ids = []
         self.metadata = {}
         self.n_docs = 0
-        self.name = "KnowledgeBase"
+        self.name = "VectorKnowledgeBase"
 
     def _text_to_embedding(self, text):
         var chars = string_lower(text)
@@ -518,16 +520,16 @@ class Translator:
         return self.name
 
 # ---------------------------------------------------------------------------
-# 330: CodeAnalyzer - analyze, understand and generate code
+# 330: SourceCodeAnalyzer - analyze, understand and generate code
 # ---------------------------------------------------------------------------
-class CodeAnalyzer:
+class SourceCodeAnalyzer:
     def __init__(self):
         self.language = "python"
         self.keywords = {}
         self.patterns = {}
         self._init_languages()
         self.analysis_history = []
-        self.name = "CodeAnalyzer"
+        self.name = "SourceCodeAnalyzer"
 
     def _init_languages(self):
         self.keywords["python"] = ["def", "class", "import", "from", "return", "if", "else", "elif", "for", "while", "try", "except", "with", "as", "lambda", "yield", "async", "await", "pass", "break", "continue"]
@@ -694,7 +696,7 @@ class AutonomousLearner:
     def __init__(self, name, embed_dim):
         self.agent_name = name
         self.embed_dim = embed_dim
-        self.kb = KnowledgeBase(embed_dim)
+        self.kb = VectorKnowledgeBase(embed_dim)
         self.loader = UniversalLoader()
         self.learned_facts = []
         self.n_learning_episodes = 0
@@ -756,16 +758,16 @@ class AutonomousLearner:
         return self.name
 
 # ---------------------------------------------------------------------------
-# 333: CodeGenerator - generate code from natural language descriptions
+# 333: TemplateCodeGenerator - generate code from natural language descriptions
 # ---------------------------------------------------------------------------
-class CodeGenerator:
+class TemplateCodeGenerator:
     def __init__(self, target_lang, ai_interface):
         self.target_lang = target_lang
         self.ai = ai_interface
         self.generated_programs = []
         self.templates = {}
         self._load_templates()
-        self.name = "CodeGenerator"
+        self.name = "TemplateCodeGenerator"
 
     def _load_templates(self):
         self.templates["sort"] = "def sort_list(lst):\n    return sorted(lst)\n"
@@ -788,7 +790,7 @@ class CodeGenerator:
         elif string_contains(desc_lower, "api") or string_contains(desc_lower, "request"):
             code = self.templates["api_call"]
         else:
-            var analyzer = CodeAnalyzer()
+            var analyzer = SourceCodeAnalyzer()
             var method_name = string_replace(string_lower(description), " ", "_")[:30]
             code = analyzer.generate_function(method_name, ["data"], description, self.target_lang)
         self.generated_programs = self.generated_programs + [{"description": description, "code": code, "lang": self.target_lang}]
@@ -1384,13 +1386,13 @@ class StreamingProcessor:
         return self.name
 
 # ---------------------------------------------------------------------------
-# 343: DataAugmentor - advanced data augmentation for any modality
+# 343: MultimodalAugmentor - advanced data augmentation for any modality
 # ---------------------------------------------------------------------------
-class DataAugmentor:
+class MultimodalAugmentor:
     def __init__(self, modality):
         self.modality = modality
         self.augmentation_log = []
-        self.name = "DataAugmentor"
+        self.name = "MultimodalAugmentor"
 
     def augment_tensor(self, x, ops):
         var result = x
@@ -1448,16 +1450,16 @@ class DataAugmentor:
         return self.name
 
 # ---------------------------------------------------------------------------
-# 344: ExperimentTracker - MLflow-style experiment tracking
+# 344: ExperimentLogger - MLflow-style experiment tracking
 # ---------------------------------------------------------------------------
-class ExperimentTracker:
+class ExperimentLogger:
     def __init__(self, experiment_name, log_dir):
         self.experiment_name = experiment_name
         self.log_dir = log_dir
         self.runs = {}
         self.current_run = none
         self.best_run = none
-        self.name = "ExperimentTracker"
+        self.name = "ExperimentLogger"
 
     def start_run(self, run_id, hyperparams):
         self.current_run = {"id": run_id, "params": hyperparams, "metrics": {}, "artifacts": [], "start_time": time_now(), "status": "running"}
@@ -1635,9 +1637,9 @@ class MultimodalAI:
         return self.name
 
 # ---------------------------------------------------------------------------
-# 347: FederatedLearner - privacy-preserving federated learning coordinator
+# 347: FedAvgSimulator - privacy-preserving federated learning coordinator
 # ---------------------------------------------------------------------------
-class FederatedLearner:
+class FedAvgSimulator:
     def __init__(self, n_clients, embed_dim):
         self.n_clients = n_clients
         self.embed_dim = embed_dim
@@ -1645,7 +1647,7 @@ class FederatedLearner:
         self.client_models = []
         self.round = 0
         self.aggregation_log = []
-        self.name = "FederatedLearner"
+        self.name = "FedAvgSimulator"
 
         for i in range(0, n_clients):
             self.client_models = self.client_models + [tensor_randn([embed_dim])]
@@ -1805,17 +1807,17 @@ class NyTorchAGI:
         self.device = DeviceManager()
         self.device.detect()
         self.memory = MemoryManager(config["memory_capacity"] if "memory_capacity" in config else 10000)
-        self.kb = KnowledgeBase(self.embed_dim)
+        self.kb = VectorKnowledgeBase(self.embed_dim)
         self.loader = UniversalLoader()
         self.scraper = WebScraper()
         self.nlp = NaturalLanguageProcessor()
         self.translator = Translator()
         self.detector = LanguageDetector()
-        self.code_analyzer = CodeAnalyzer()
-        self.code_gen = CodeGenerator("python", none)
+        self.code_analyzer = SourceCodeAnalyzer()
+        self.code_gen = TemplateCodeGenerator("python", none)
         self.replication = ReplicationEngine()
         self.orchestrator = MultiAgentOrchestrator()
-        self.augmentor = DataAugmentor("universal")
+        self.augmentor = MultimodalAugmentor("universal")
         self.optimizer_engine = ModelOptimizer("float32")
         self.generation_count = 0
         self.tasks_completed = 0

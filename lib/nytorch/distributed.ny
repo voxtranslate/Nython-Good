@@ -4,14 +4,16 @@
 # ============================================================
 # Classes 181-205:
 #   MessageQueue, PubSubBus, RPC, PeerMesh,
-#   MeshNode, ServiceRegistry, LoadBalancer,
-#   CircuitBreaker, RetryPolicy, RateLimiter,
+#   MeshNode, MeshServiceRegistry, MeshLoadBalancer,
+#   CircuitBreaker, RetryPolicy, TokenBucketLimiter,
 #   NyDB, NyTable, NyIndex, QueryBuilder,
 #   ReplayBuffer, PrioritizedReplayBuffer,
 #   DQNAgent, PPOMemory, MultiAgentEnv,
 #   CurriculumScheduler, RewardShaper,
 #   MetaLearner, TaskDistributor, ResultAggregator
 # ============================================================
+
+import "lib/nytorch/core.ny"
 
 import nytorch
 
@@ -265,9 +267,9 @@ class MeshNode:
         return self.node_id + " peers=" + str(self.mesh.peer_count()) + " tick=" + str(self.tick)
 
 # -----------------------------------------
-# 186. ServiceRegistry  (service discovery)
+# 186. MeshServiceRegistry  (service discovery)
 # -----------------------------------------
-class ServiceRegistry:
+class MeshServiceRegistry:
     def __init__(self, storage_dir):
         self.store = storage_dir + "/services.kv"
         self.health_store = storage_dir + "/health.kv"
@@ -322,9 +324,9 @@ class ServiceRegistry:
         return healthy
 
 # -----------------------------------------
-# 187. LoadBalancer
+# 187. MeshLoadBalancer
 # -----------------------------------------
-class LoadBalancer:
+class MeshLoadBalancer:
     def __init__(self, strategy):
         self.strategy = strategy
         self.backends = []
@@ -451,9 +453,9 @@ class CircuitBreaker:
         return self.name + " state=" + self.state + " failures=" + str(self.failures)
 
 # -----------------------------------------
-# 189. RateLimiter  (token bucket)
+# 189. TokenBucketLimiter  (token bucket)
 # -----------------------------------------
-class RateLimiter:
+class TokenBucketLimiter:
     def __init__(self, name, rate_per_second, burst):
         self.name = name
         self.rate = to_float(rate_per_second)
