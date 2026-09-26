@@ -962,7 +962,21 @@ public:   // NythonExecutor is a struct: members default to public
     // Floor division of two integers of any size, rounding toward negative
     // infinity like Python. (The result used to be cast to a 32-bit int, so
     // 1790429563123456789 // 1000000 came out as -571799309.)
+    static bool smallInt(const bigint& b, int64_t& out) {
+        if (b.size() > 1) return false;
+        unsigned long long mag = b.size() ? b.get(0) : 0ULL;
+        if (mag > 0x7FFFFFFFFFFFFFFFULL) return false;
+        bool neg = const_cast<bigint&>(b).sign() != 0;
+        out = neg ? -(int64_t)mag : (int64_t)mag;
+        return true;
+    }
     static bigint floorDivInt(const bigint& a, const bigint& b) {
+        int64_t x, y;
+        if (smallInt(a, x) && smallInt(b, y) && y != 0 && !(y == -1 && x == INT64_MIN)) {
+            int64_t q = x / y;
+            if ((x % y != 0) && ((x < 0) != (y < 0))) q--;
+            return bigint((long long)q);
+        }
         bigint q = a / b;
         bigint r = a - q * b;
         if (r != bigint(0) && ((r < bigint(0)) != (b < bigint(0)))) q = q - bigint(1);

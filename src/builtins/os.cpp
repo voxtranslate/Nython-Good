@@ -714,6 +714,13 @@ Value dispatch_os(NythonExecutor& E,
     };
     auto Str = [&](const std::string& s) { return E.makeStringValue(s); };
 
+    // The modules dispatched after this one (data, threading, gui) include
+    // the per-frame gui_* drawing calls; let them through without walking
+    // every comparison below.
+    if (name.size() > 4 && (name.compare(0, 4, "gui_") == 0 || name.compare(0, 7, "thread_") == 0
+                            || name.compare(0, 6, "mutex_") == 0 || name.compare(0, 5, "json_") == 0))
+        return UNDEFINED_VALUE;
+
     // Time and processes live in their own files.
     {
         Value r = dispatch_os_time(E, name, args, ctx);
