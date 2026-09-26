@@ -1298,6 +1298,10 @@ def gui_dispatch(children, count, event):
         i = i - 1
     return event.consumed
 
+# Event names by the code gui_next_event returns (the backend's kEventTypes,
+# same order); the wheel is "scroll", as widgets expect.
+var GUI_EVENT_TYPES = ["", "quit", "resize", "expose", "focusgained", "focuslost", "mouseleave", "mousemove", "mousedown", "mouseup", "scroll", "keydown", "keyup", "textinput", "textedit", "dropfile", "droptext", "dialog"]
+
 # ─── Window ───────────────────────────────────────────────────────────────────
 
 class Window:
@@ -1341,6 +1345,7 @@ class Window:
         self._ev = none
         self._idle_ev = none
         self._tree_ev = none
+        self._raw_ev = none
 
     def create(self):
         var flags = 0
@@ -1428,19 +1433,28 @@ class Window:
     def on_resize(self, fn):
         self._on_resize = fn
 
+    # A backend event map (gui_poll_events / gui_wait_events) handled as run()
+    # handles an event: quit, resize, then the overlay and the widget tree.
     def _process_event(self, raw_event):
         # Normalise event type: C++ backend emits "wheel", widgets expect "scroll"
         var etype = raw_event["type"]
         if etype == "wheel":
             etype = "scroll"
+        if self._raw_ev == none:
+            self._raw_ev = Event(etype)
+        self._fill_event(self._raw_ev, raw_event, etype)
+        self._process(self._raw_ev)
+
+    def _process(self, ev):
+        var etype = ev.type
         if etype == "quit":
             self.running = false
             if self._on_close != none:
                 self._on_close()
             return
         if etype == "resize":
-            self.width = raw_event["w"]
-            self.height = raw_event["h"]
+            self.width = ev.w
+            self.height = ev.h
             # The IDE drives its own layout and never installs a root widget,
             # so root is none here. Assigning through it aborted resize handling
             # before _on_resize could ever fire.
@@ -1462,14 +1476,76 @@ class Window:
         var has_tree = self.root != none and self.root.child_count > 0
         if not has_tree and self.overlay.count == 0:
             return
+        # The tree gets its own copy: widgets consume it and shift its
+        # coordinates, and the callback must see the event as it arrived.
         if self._tree_ev == none:
             self._tree_ev = Event(etype)
-        var ev = self._tree_ev
-        self._fill_event(ev, raw_event, etype)
-        if self.overlay.handle_event(ev):
+        var tev = self._tree_ev
+        self._copy_event(tev, ev)
+        if self.overlay.handle_event(tev):
             return
         if has_tree:
-            self.root.handle_event(ev)
+            self.root.handle_event(tev)
+
+    def _copy_event(self, dst, src):
+        dst.type = src.type
+        dst.x = src.x
+        dst.y = src.y
+        dst.button = src.button
+        dst.key = src.key
+        dst.keycode = src.keycode
+        dst.text = src.text
+        dst.delta = src.delta
+        dst.ctrl = src.ctrl
+        dst.shift = src.shift
+        dst.alt = src.alt
+        dst.meta = src.meta
+        dst.clicks = src.clicks
+        dst.w = src.w
+        dst.h = src.h
+        dst.repeat = src.repeat
+        dst.dx = src.dx
+        dst.dy = src.dy
+        dst.window = src.window
+        dst.is_last = src.is_last
+        dst.consumed = false
+
+    # Fills `ev` from the event gui_next_event just popped, field by field -
+    # no event map is built (one is ~6 KB the interpreter never reclaims) and
+    # no string is made unless the event carries one.
+    def _read_event(self, ev, code):
+        ev.type = GUI_EVENT_TYPES[code]
+        ev.x = gui_event_get("x")
+        ev.y = gui_event_get("y")
+        ev.button = gui_event_get("button")
+        ev.delta = gui_event_get("delta")
+        ev.clicks = gui_event_get("clicks")
+        ev.ctrl = gui_event_get("ctrl")
+        ev.shift = gui_event_get("shift")
+        ev.alt = gui_event_get("alt")
+        ev.meta = gui_event_get("meta")
+        ev.w = gui_event_get("w")
+        ev.h = gui_event_get("h")
+        ev.window = gui_event_get("window")
+        ev.consumed = false
+        if code == 11 or code == 12:
+            ev.key = gui_event_get("key")
+            ev.keycode = gui_event_get("keycode")
+            ev.repeat = gui_event_get("repeat")
+        else:
+            ev.key = ""
+            ev.keycode = 0
+            ev.repeat = false
+        if code >= 13:
+            ev.text = gui_event_get("text")
+        else:
+            ev.text = ""
+        if code == 10:
+            ev.dx = gui_event_get("dx")
+            ev.dy = gui_event_get("dy")
+        else:
+            ev.dx = 0.0
+            ev.dy = 0.0
 
     # Copies one raw backend event into an existing Event, so the run loop can
     # reuse a single Event object for every callback instead of allocating one
@@ -1491,13 +1567,19 @@ class Window:
         ev.clicks = 0
         if raw.has_key("clicks"):
             ev.clicks = raw["clicks"]
+        # Newer fields; the backend sends dx/dy only with wheel events and
+        # "window" only while several windows are open.
+        ev.w = raw["w"]
+        ev.h = raw["h"]
+        ev.meta = raw["meta"] == true
+        ev.repeat = raw["repeat"] == true
+        ev.dx = 0.0
+        ev.dy = 0.0
         if raw.has_key("dx"):
-            ev.w = raw["w"]
-            ev.h = raw["h"]
-            ev.meta = raw["meta"]
-            ev.repeat = raw["repeat"]
             ev.dx = raw["dx"]
             ev.dy = raw["dy"]
+        ev.window = 0
+        if raw.has_key("window"):
             ev.window = raw["window"]
 
     # One turn of the event loop: read input, hand it to the callback (or the
@@ -1514,28 +1596,30 @@ class Window:
         if not self.running:
             return false
         var t_start = gui_ticks()
-        var events = none
-        if self._painted:
-            events = gui_poll_events(self._handle)
-        else:
+        var timeout = 0
+        if not self._painted:
             self.waits = self.waits + 1
-            events = gui_wait_events(self._handle, self.idle_wait_ms)
+            timeout = self.idle_wait_ms
         var painted = false
-        var n = len(events)
-        var i = 0
-        while i < n:
-            var raw = events[i]
-            self._process_event(raw)
+        var ev = self._ev
+        var n = 0
+        # The same events gui_wait_events would return (gui_poll_events when
+        # timeout is 0), read one at a time without building event maps.
+        var code = gui_next_event(self._handle, timeout)
+        while code > 0:
+            n = n + 1
+            self._read_event(ev, code)
+            var more = gui_event_get("more")
+            ev.is_last = not more
+            self._process(ev)
             if callback != none:
-                var rtype = raw["type"]
-                if rtype == "wheel":
-                    rtype = "scroll"
-                self._fill_event(self._ev, raw, rtype)
-                self._ev.is_last = (i == n - 1)
-                var rp = callback(self.renderer, self._ev)
+                ev.consumed = false
+                var rp = callback(self.renderer, ev)
                 if rp != false:
                     painted = true
-            i = i + 1
+            code = 0
+            if more:
+                code = gui_next_event(self._handle, 0)
         if callback != none:
             if n == 0:
                 var iev = self._idle_ev

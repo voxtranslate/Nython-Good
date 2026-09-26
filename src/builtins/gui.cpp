@@ -241,8 +241,12 @@ static Value ev_value(NythonExecutor& E, const EvData& d) {
     o->set("ctrl",   Value(d.ctrl)); o->set("shift", Value(d.shift)); o->set("alt", Value(d.alt));
     o->set("meta",   Value(d.meta)); o->set("repeat", Value(d.repeat));
     o->set("clicks", Value(d.clicks));
-    o->set("dx",     Value(d.dx)); o->set("dy", Value(d.dy));
-    o->set("window", Value(d.window));
+    // Each entry costs a few hundred bytes the interpreter never gives back
+    // (GC_NOTES.md), on every event, so the rest are only sent when they
+    // mean something: the wheel's exact amounts, and the window when there
+    // is more than one to tell apart (absent means the only window).
+    if(d.type=="wheel"){ o->set("dx", Value(d.dx)); o->set("dy", Value(d.dy)); }
+    if(g_windows.size()>1) o->set("window", Value(d.window));
     return Value(static_cast<Collectable*>(o));
 }
 
@@ -428,6 +432,12 @@ static bool has_events_for(int handle) {
     for(auto& d:g_evq) if(ev_for(d,handle)) return true;
     return false;
 }
+
+// The event gui_next_event popped, read field by field with gui_event_get.
+static EvData g_cur;
+static int g_cur_handle = -1;
+// A type missing from the code table (none today): code 0, as if no event.
+static Value gui_next_event_unknown(const EvData&) { return Value(0); }
 
 // ── File dialogs ────────────────────────────────────────────────────────────
 // SDL may call this from another thread: post an event, never touch Values.
@@ -1550,6 +1560,62 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
         if(!list) return Value(static_cast<Collectable*>(empty_list));
         list->set("__len__",Value(idx));
         return Value(static_cast<Collectable*>(list));
+    }
+
+    // gui_next_event(handle, timeout_ms) -> int type code, 0 when none
+    // gui_event_get(field) -> a field of that event, as a number or string
+    //
+    // The same events as gui_wait_events (timeout_ms 0 = do not wait), one at
+    // a time and without building a map: an event map is ~6 KB that the
+    // interpreter never reclaims (GC_NOTES.md), on every mouse move and key.
+    // Window.run reads events this way. The code indexes gui.ny's
+    // GUI_EVENT_TYPES (kEventTypes below, same order), so even the type name
+    // needs no new string. gui_event_get("more") says whether another event
+    // of the same batch is already waiting (a batch is what one poll drains).
+    if(name=="gui_next_event"){
+        static const char* kEventTypes[] = {"", "quit", "resize", "expose", "focusgained",
+            "focuslost", "mouseleave", "mousemove", "mousedown", "mouseup", "wheel",
+            "keydown", "keyup", "textinput", "textedit", "dropfile", "droptext", "dialog"};
+        int handle = args.empty() ? -1 : VI(args[0]);
+        int timeout = args.size()>=2 ? VI(args[1]) : 0;
+        g_cur_handle = handle;
+        if(!has_events_for(handle)) pump_events(timeout!=0, timeout);
+        for(auto it=g_evq.begin(); it!=g_evq.end(); ++it){
+            if(!ev_for(*it,handle)) continue;
+            g_cur = *it;
+            g_evq.erase(it);
+            for(int k=1;k<(int)(sizeof(kEventTypes)/sizeof(kEventTypes[0]));k++)
+                if(g_cur.type==kEventTypes[k]) return Value(k);
+            return gui_next_event_unknown(g_cur);
+        }
+        g_cur = EvData();
+        return Value(0);
+    }
+    if(name=="gui_event_get"){
+        if(args.empty()) return NONE_VALUE;
+        std::string f = VS(E,args[0]);
+        const EvData& d = g_cur;
+        if(f=="x") return Value(d.x);
+        if(f=="y") return Value(d.y);
+        if(f=="button") return Value(d.button);
+        if(f=="delta") return Value(d.delta);
+        if(f=="clicks") return Value(d.clicks);
+        if(f=="w") return Value(d.w);
+        if(f=="h") return Value(d.h);
+        if(f=="keycode") return Value(d.keycode);
+        if(f=="window") return Value(d.window);
+        if(f=="ctrl") return Value(d.ctrl);
+        if(f=="shift") return Value(d.shift);
+        if(f=="alt") return Value(d.alt);
+        if(f=="meta") return Value(d.meta);
+        if(f=="repeat") return Value(d.repeat);
+        if(f=="dx") return Value(d.dx);
+        if(f=="dy") return Value(d.dy);
+        if(f=="key") return E.makeStringValue(d.key);
+        if(f=="text") return E.makeStringValue(d.text);
+        if(f=="type") return E.makeStringValue(d.type);
+        if(f=="more") return Value(has_events_for(g_cur_handle));
+        return NONE_VALUE;
     }
 
     // ── VIDEO STUBS ─────────────────────────────────────────────────────

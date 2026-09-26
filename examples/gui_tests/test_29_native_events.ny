@@ -116,7 +116,7 @@ else:
         k = k + 1
     check("RESIZED + PIXEL_SIZE_CHANGED reported once", resizes, 1)
     check("resize size", got["resize"]["w"], 640)
-    check("window of the event", got["resize"]["window"], h)
+    check("window of the event (two windows open)", got["resize"]["window"], h)
     check("window size follows", gui_get_window_size(h)[0], 640)
     # The key for window 2 waited in its own queue.
     var evs2 = gui_poll_events(h2)
