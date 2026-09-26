@@ -150,7 +150,15 @@ class NythonIDE(IDEViews):
         self.loading_settings = false
         self.menu_open = -1
         self.menu_sel = -1
-        self.menu_x = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        self.menu_x = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        # Responsive layout (ide_paint.ny, _layout): the menus fold into a
+        # hamburger, the side bar floats over the editor, overflowing panel
+        # tabs and activity-bar views go to a "..." menu.
+        self.menu_compact = false
+        self.side_overlay = false
+        self.act_fit = 99
+        self.panel_fit = 99
+        self.panel_ai = 0
         self.ctx_open = false
         self.ctx_items = []
         self.ctx_x = 0
@@ -361,9 +369,9 @@ class NythonIDE(IDEViews):
         self.ac_row = -1
         self.ac_start = -1
         self.ac_doc = none
-        self.ac_names = []
-        self.ac_all_kinds = []
-        self.ac_bonus = []
+        self.ac_index = 0
+        self.ac_scan_doc = none
+        self.ac_scan_state = -1
         self.watch_t = 0
         self.watch_dirs = {}
         self.watch_git = -3
@@ -731,7 +739,7 @@ class NythonIDE(IDEViews):
             self._exec(cmd, arg)
             return
         # Any click that is not on the open overlay closes it.
-        var overlay_cmd = cmd == "@menu" or cmd == "@menuitem" or cmd == "@menu.bg" or cmd == "@ctx.item"
+        var overlay_cmd = cmd == "@menu" or cmd == "@menuitem" or cmd == "@menu.bg" or cmd == "@menu.pick" or cmd == "@ctx.item"
         if not overlay_cmd and (self.menu_open >= 0 or self.ctx_open or self.notif_center):
             if cmd != "@toast.close":
                 self._close_overlays()
@@ -753,6 +761,34 @@ class NythonIDE(IDEViews):
         if cmd == "@menuitem":
             self.menu_open = -1
             self._exec(arg, none)
+            return
+        if cmd == "@act.more":
+            var vitems = []
+            var vi = self.act_fit
+            while vi < len(self.views):
+                vitems.append([self.view_titles[vi], "@view", self.views[vi]])
+                vi = vi + 1
+            self._open_ctx(e.x, e.y, vitems)
+            return
+        if cmd == "@panel.more":
+            var pitems = []
+            var pi = 0
+            while pi < len(self.panel_keys):
+                if not self._panel_tab_shown(pi):
+                    pitems.append([self.panel_labels[pi], "@panel.tab", self.panel_keys[pi]])
+                pi = pi + 1
+            self._open_ctx(e.x, e.y, pitems)
+            return
+        if cmd == "@menu.pick":
+            self.menu_open = arg
+            self.menu_sel = -1
+            return
+        if cmd == "@side.dismiss":
+            # A click beside the floating side bar closes it (the click is
+            # not passed through, as for any other light-dismiss surface).
+            self.sidebar_open = false
+            self.focus = "editor"
+            self._layout()
             return
         if cmd == "@ctx.item":
             var it = self.ctx_items[arg]
@@ -1427,6 +1463,23 @@ class NythonIDE(IDEViews):
 
     def _menu_key(self, e):
         var k = e.key
+        if self.menu_open >= len(self.menus):
+            # The hamburger's list of menus.
+            var n = len(self.menus)
+            if k == "escape":
+                self._close_overlays()
+            elif k == "down":
+                self.menu_sel = (self.menu_sel + 1) % n
+            elif k == "up":
+                self.menu_sel = (self.menu_sel + n - 1) % n
+            elif (k == "enter" or k == "right" or k == "space") and self.menu_sel >= 0:
+                self.menu_open = self.menu_sel
+                self.menu_sel = -1
+            return
+        if k == "left" and self.menu_compact:
+            self.menu_sel = self.menu_open
+            self.menu_open = len(self.menus)
+            return
         var items = self.menu_items[self.menus[self.menu_open]]
         if k == "escape":
             self._close_overlays()
@@ -2204,102 +2257,59 @@ class NythonIDE(IDEViews):
         if not explicit and len(self.ac_prefix) < 2:
             self.ac_open = false
             return
-        # A completion session: candidates are gathered when completion opens
-        # on a word and re-ranked (natively) as the word grows, instead of
-        # being rebuilt and fuzzy-matched in Nython on every keystroke.
+        # One session per word: candidates are refreshed when a word starts
+        # (or on Ctrl+Space), then only re-ranked as it grows. The session is
+        # the word - row, start column, document - not whether the popup is
+        # showing: a word with no candidates used to close the popup and so
+        # re-gather the whole document on every following keystroke (280 ms
+        # per key in a 1,800-line file).
         var row = b.cursor_row
-        if not self.ac_open or self.ac_row != row or self.ac_start != st or self.ac_doc != self.doc():
-            self._ac_gather()
+        var d = self.doc()
+        if explicit or self.ac_row != row or self.ac_start != st or self.ac_doc != d:
+            self._ac_gather(explicit)
             self.ac_row = row
             self.ac_start = st
-            self.ac_doc = self.doc()
-        var idx = fuzzy_rank(self.ac_prefix, self.ac_names, 61, self.ac_bonus)
-        var out_n = []
-        var out_k = []
-        var i = 0
-        while i < len(idx) and len(out_n) < 60:
-            var nm = self.ac_names[idx[i]]
-            if nm != self.ac_prefix:
-                out_n.append(nm)
-                out_k.append(self.ac_all_kinds[idx[i]])
-            i = i + 1
-        self.ac_items = out_n
-        self.ac_kinds = out_k
-        self.ac_n = len(out_n)
+            self.ac_doc = d
+        # Ranked natively over the index; the lists reuse cached strings.
+        var res = ac_index_rank(self.ac_index, self.ac_prefix, 60, self.ac_prefix)
+        self.ac_items = res[0]
+        self.ac_kinds = res[1]
+        self.ac_n = len(self.ac_items)
         self.ac_sel = 0
         self.ac_top = 0
         self.ac_open = self.ac_n > 0
         if explicit and self.ac_n == 0:
             self.status_msg = "No suggestions."
 
-    def _ac_kind_bonus(self, k):
-        if k == "function" or k == "method" or k == "class" or k == "variable":
-            return 5
-        if k == "keyword":
-            return 3
-        return 0
-
-    def _ac_gather(self):
-        var b = self.buf()
-        var names = []
-        var kinds = []
-        var seen = {}
-        var syms = self._outline_syms()
-        var i = 0
-        while i < len(syms):
-            self._ac_add(names, kinds, seen, syms[i][0], syms[i][1])
-            i = i + 1
-        i = 0
-        while i < len(self.hl.storage):
-            self._ac_add(names, kinds, seen, self.hl.storage[i], "keyword")
-            i = i + 1
-        i = 0
-        while i < len(self.hl.keywords):
-            self._ac_add(names, kinds, seen, self.hl.keywords[i], "keyword")
-            i = i + 1
-        i = 0
-        while i < len(self.hl.builtins):
-            self._ac_add(names, kinds, seen, self.hl.builtins[i], "builtin")
-            i = i + 1
-        # Identifiers used near the caret.
-        var r = b.cursor_row - 60
-        if r < 0:
-            r = 0
-        while r < b.line_count and r < b.cursor_row + 60:
-            if r != b.cursor_row:
-                self._ac_words_of(b.get_line(r), names, kinds, seen)
-            r = r + 1
-        var bonus = []
-        i = 0
-        while i < len(kinds):
-            bonus.append(self._ac_kind_bonus(kinds[i]))
-            i = i + 1
-        self.ac_names = names
-        self.ac_all_kinds = kinds
-        self.ac_bonus = bonus
-
-    def _ac_add(self, names, kinds, seen, n, k):
-        if not seen.has_key(n):
-            seen[n] = true
-            names.append(n)
-            kinds.append(k)
-
-    def _ac_words_of(self, line, names, kinds, seen):
-        var n = len(line)
-        var i = 0
-        while i < n:
-            var ch = string_slice(line, i, i + 1)
-            if self._is_word_ch(ch) and not (ch >= "0" and ch <= "9"):
-                var j = i
-                while j < n and self._is_word_ch(string_slice(line, j, j + 1)):
-                    j = j + 1
-                if j - i >= 3:
-                    self._ac_add(names, kinds, seen, string_slice(line, i, j), "text")
-                i = j
-            elif ch == "\"" or ch == "#":
-                i = n
-            else:
+    # The candidates live in a native completion index (ac_index_*,
+    # src/builtins/text.cpp): keywords and builtins once, and this
+    # document's symbols and identifiers rescanned only when it changed.
+    def _ac_gather(self, force):
+        if self.ac_index == 0:
+            self.ac_index = ac_index_new()
+            var names = []
+            var kinds = []
+            var i = 0
+            while i < len(self.hl.storage):
+                names.append(self.hl.storage[i])
+                kinds.append("keyword")
                 i = i + 1
+            i = 0
+            while i < len(self.hl.keywords):
+                names.append(self.hl.keywords[i])
+                kinds.append("keyword")
+                i = i + 1
+            i = 0
+            while i < len(self.hl.builtins):
+                names.append(self.hl.builtins[i])
+                kinds.append("builtin")
+                i = i + 1
+            ac_index_set_base(self.ac_index, names, kinds)
+        var b = self.buf()
+        if force or self.ac_scan_doc != self.doc() or self.ac_scan_state != b.state_id():
+            ac_index_scan(self.ac_index, b.lines, 3)
+            self.ac_scan_doc = self.doc()
+            self.ac_scan_state = b.state_id()
 
     def _ac_update(self, typed):
         if self._is_word_ch(typed):

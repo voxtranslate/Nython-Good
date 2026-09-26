@@ -89,6 +89,114 @@ class CommandRegistry:
             self.prefixes[string_slice(seq, 0, sp)] = true
         return true
 
+    # ── keymaps ───────────────────────────────────────────────────────────
+    # set_keys(id, keys, when) gives a command a new set of keybindings, as a
+    # keymap preset or a user rebinding does: the command's old bindings go,
+    # and any other command bound to one of the new keys loses that binding
+    # (its displayed shortcut falls back to its next remaining one). keys ""
+    # unbinds the command.
+    def set_keys(self, id, keys, when):
+        if not self.cmds.has_key(id):
+            return false
+        var alts = []
+        if keys != "":
+            alts = string_split(keys, " | ")
+        var seqs = {}
+        var i = 0
+        while i < len(alts):
+            var sq = self.normalize(string_strip(alts[i]))
+            if sq != "":
+                seqs[sq] = true
+            i = i + 1
+        var kept = []
+        var touched = {}
+        i = 0
+        while i < len(self.bindings):
+            var b = self.bindings[i]
+            if b.cmd == id:
+                i = i + 1
+                continue
+            if seqs.has_key(b.seq):
+                touched[b.cmd] = true
+                i = i + 1
+                continue
+            kept.append(b)
+            i = i + 1
+        self.bindings = kept
+        var shown = ""
+        i = 0
+        while i < len(alts):
+            if self.bind(id, string_strip(alts[i]), when) and shown == "":
+                shown = string_strip(alts[i])
+            i = i + 1
+        self.cmds[id].keys = shown
+        var others = touched.keys()
+        i = 0
+        while i < len(others):
+            self._refresh_keys(others[i])
+            i = i + 1
+        return true
+
+    # The shortcut a menu shows for `id`: its first remaining binding.
+    def _refresh_keys(self, id):
+        if not self.cmds.has_key(id):
+            return
+        var i = 0
+        while i < len(self.bindings):
+            if self.bindings[i].cmd == id:
+                self.cmds[id].keys = self.pretty(self.bindings[i].seq)
+                return
+            i = i + 1
+        self.cmds[id].keys = ""
+
+    # A copy of every binding and displayed shortcut, to return to later
+    # (switching keymap presets starts from the defaults).
+    def snapshot(self):
+        var keys = {}
+        var i = 0
+        while i < len(self.order):
+            keys[self.order[i]] = self.cmds[self.order[i]].keys
+            i = i + 1
+        var binds = []
+        i = 0
+        while i < len(self.bindings):
+            binds.append(self.bindings[i])
+            i = i + 1
+        return [binds, keys]
+
+    def restore(self, snap):
+        var binds = []
+        var i = 0
+        while i < len(snap[0]):
+            binds.append(snap[0][i])
+            i = i + 1
+        self.bindings = binds
+        self.prefixes = {}
+        i = 0
+        while i < len(binds):
+            var sp = string_find(binds[i].seq, " ")
+            if sp > 0:
+                self.prefixes[string_slice(binds[i].seq, 0, sp)] = true
+            i = i + 1
+        var ks = snap[1]
+        i = 0
+        while i < len(self.order):
+            var id = self.order[i]
+            if ks.has_key(id):
+                self.cmds[id].keys = ks[id]
+            i = i + 1
+
+    # Commands bound to a key sequence, for "key already in use" warnings.
+    def commands_for(self, keys):
+        var seq = self.normalize(keys)
+        var out = []
+        var i = 0
+        while i < len(self.bindings):
+            if self.bindings[i].seq == seq:
+                out.append(self.bindings[i].cmd)
+            i = i + 1
+        return out
+
     def has(self, id):
         return self.cmds.has_key(id)
 

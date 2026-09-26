@@ -656,28 +656,13 @@ class IDEOps(IDECore):
             return self.ws_files
         var out = []
         if self.ws.root != "":
-            self._walk_files(self.ws.root, 0, out)
+            # Native walk (fs_list_files): the same rules as before - no dot
+            # names, no build/node_modules/__pycache__, 8 levels, 4000 files.
+            out = fs_list_files(self.ws.root, {"max": 4000, "depth": 8, "full": true,
+                                               "skip": ["build", "node_modules", "__pycache__"]})
         self.ws_files = out
         self.ws_files_root = self.ws.root
         return out
-
-    def _walk_files(self, dir, depth, out):
-        if depth > 8 or len(out) >= 4000:
-            return
-        var ents = os_listdir(dir)
-        if ents == none:
-            return
-        ents = sorted(ents)
-        var i = 0
-        while i < len(ents):
-            var nm = ents[i]
-            if not string_startswith(nm, ".") and nm != "build" and nm != "node_modules" and nm != "__pycache__":
-                var full = path_join(dir, nm)
-                if os_isdir(full):
-                    self._walk_files(full, depth + 1, out)
-                else:
-                    out.append(full)
-            i = i + 1
 
     def _file_items(self):
         var out = []
@@ -718,34 +703,27 @@ class IDEOps(IDECore):
 
     def _workspace_symbol_items(self):
         var out = []
-        var files = self._workspace_files()
+        if self.ws.root == "":
+            return out
+        # One native pass over the workspace (fs_symbols) instead of reading
+        # and splitting every .ny file in the interpreter each time # opens.
+        var syms = fs_symbols(self.ws.root, {"max": 3000, "skip": ["build", "node_modules", "__pycache__"]})
         var i = 0
-        while i < len(files) and len(out) < 3000:
-            var p = files[i]
-            if os_path_ext(p) == ".ny" and file_size(p) < 600000:
-                var text = read_file(p)
-                if text != none:
-                    var lines = string_split(text, "\n")
-                    var r = 0
-                    while r < len(lines):
-                        var sym = self._symbol_on_line(lines[r])
-                        if sym != none:
-                            var it = QuickItem(sym[0], self._rel(p) + ":" + str(r + 1), p + "|" + str(r), sym[1])
-                            out.append(it)
-                        r = r + 1
+        while i < len(syms):
+            var s = syms[i]
+            var where = s[0] + ":" + str(s[3] + 1)
+            if s[5] != "":
+                where = s[5] + "  " + where
+            var it = QuickItem(s[1], where, self.ws.root + "/" + s[0] + "|" + str(s[3]), s[2])
+            out.append(it)
             i = i + 1
         return out
 
-    # [name, kind, row, col] for class / def / top-level var declarations.
+    # [name, kind, row, col, container, detail, depth] for every class,
+    # function, method, field, variable and constant: ny_symbols, a native
+    # line scanner that also works while the file does not parse.
     def _doc_symbols(self, b):
-        var out = []
-        var r = 0
-        while r < b.line_count:
-            var sym = self._symbol_on_line(b.get_line(r))
-            if sym != none:
-                out.append([sym[0], sym[1], r, sym[2]])
-            r = r + 1
-        return out
+        return ny_symbols(b.lines)
 
     def _symbol_on_line(self, raw):
         var st = string_strip(raw)
@@ -1518,23 +1496,19 @@ class IDEOps(IDECore):
     def _check_file(self, d):
         if d == none or d.buf == none or d.lang != "nython":
             return
-        var path = d.path
-        var target = path
-        if d.kind != "file" or d.dirty():
-            self.run_seq = self.run_seq + 1
-            target = "/tmp/nyide_check_" + str(self.session_id) + ".ny"
-            write_file(target, d.buf.get_all_text())
-        if target == "":
-            return
-        var out = os_exec(self._q(self._interpreter()) + " --ast " + self._q(target) + " 2>&1 > /dev/null < /dev/null")
-        var probs = self._parse_diagnostics(out, target, "")
-        var key = path
+        # In process, through the real lexer and parser (ny_check_syntax).
+        # This used to write the buffer to a temp file and wait for a second
+        # interpreter to parse it (--ast): a blocking process spawn on every
+        # open, every save and every pause in typing.
+        var diags = ny_check_syntax(d.buf.lines)
+        var key = d.path
         if key == "":
             key = "untitled:" + d.title
+        var probs = []
         var i = 0
-        while i < len(probs):
-            probs[i]["path"] = key
-            probs[i]["src"] = "syntax"
+        while i < len(diags):
+            var g = diags[i]
+            probs.append({"sev": "err", "msg": g[2], "path": key, "line": g[0] + 1, "col": g[1] + 1, "src": "syntax"})
             i = i + 1
         self._set_problems_for(key, "syntax", probs)
         d.problem_stamp = d.buf.state_id()
@@ -1982,22 +1956,19 @@ class IDEOps(IDECore):
                 self._goto(syms[i][2], syms[i][3])
                 return
             i = i + 1
-        var files = self._workspace_files()
-        var f = 0
-        while f < len(files):
-            var p = files[f]
-            if os_path_ext(p) == ".ny" and file_size(p) < 600000:
-                var text = read_file(p)
-                if text != none and string_find(text, w) >= 0:
-                    var lines = string_split(text, "\n")
-                    var r = 0
-                    while r < len(lines):
-                        var sym = self._symbol_on_line(lines[r])
-                        if sym != none and sym[0] == w:
-                            self._open_path(p, r, sym[2])
-                            return
-                        r = r + 1
-            f = f + 1
+        # Then the workspace, natively: a definition is `def w`, `class w`,
+        # `struct/enum/interface w` or `var/const w =` at the start of a line.
+        if self.ws.root != "":
+            var pat = "^\\s*(async\\s+)?(def|class|struct|enum|interface|fn)\\s+" + w + "\\b|^\\s*(var|const)\\s+" + w + "\\b"
+            var hits = fs_search(self.ws.root, pat, {"regex": true, "case": true, "include": "*.ny", "max_results": 1,
+                                                     "skip": ["build", "node_modules", "__pycache__"]})
+            if len(hits) > 0:
+                var h = hits[0]
+                var col = string_find(string_slice(h[3], h[2], len(h[3])), w)
+                if col < 0:
+                    col = 0
+                self._open_path(self.ws.root + "/" + h[0], h[1], h[2] + col)
+                return
         self._notify("No definition found for '" + w + "'", "info")
 
     def _find_references(self):

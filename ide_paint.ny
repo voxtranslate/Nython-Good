@@ -252,8 +252,27 @@ class IDEPaint(IDEOps):
             ch = 120
         self.content_h = ch
         self.side_x = self.ACT_W
+        # Responsive ladder. Each step has two thresholds (hysteresis), so a
+        # window resized across one does not flicker between layouts:
+        #  - the side bar stops pushing the editor and floats over it (with
+        #    a shadow; a click outside closes it) when the editor would be
+        #    narrower than 360 dp;
+        #  - the minimap goes when the editor is narrower than 560 dp;
+        #  - the menus fold into a hamburger and the command centre
+        #    shrinks, then hides (_draw_titlebar);
+        #  - status-bar items drop lowest-priority first (_draw_statusbar);
+        #  - panel tabs and activity-bar views that do not fit go to a
+        #    "..." menu (_draw_panel, _draw_activitybar).
         var sw = self.SIDEBAR_W
-        if sw > W - self.ACT_W - 320:
+        var need = self.ACT_W + sw + self.dp(360)
+        if self.side_overlay and W > need + self.dp(48):
+            self.side_overlay = false
+        elif not self.side_overlay and W < need:
+            self.side_overlay = true
+        if self.side_overlay:
+            if sw > W - self.ACT_W - self.dp(40):
+                sw = W - self.ACT_W - self.dp(40)
+        elif sw > W - self.ACT_W - 320:
             sw = W - self.ACT_W - 320
         if sw < 0:
             sw = 0
@@ -263,9 +282,11 @@ class IDEPaint(IDEOps):
         elif self.sidebar_anim > 0.0:
             self.side_w = int(float(sw) * self.sidebar_anim)
         self.col_x = self.ACT_W + self.side_w
+        if self.side_overlay:
+            self.col_x = self.ACT_W
         self.col_w = W - self.col_x
-        if self.col_w < 240:
-            self.col_w = 240
+        if self.col_w < self.dp(120):
+            self.col_w = self.dp(120)
         var ph = int(float(ch) * self.panel_ratio)
         if self.panel_max:
             ph = ch - self.TAB_H - 40
@@ -285,7 +306,7 @@ class IDEPaint(IDEOps):
         if self.ed_h < 40:
             self.ed_h = 40
         self.mm_w = 0
-        if self.minimap_on and self.col_w > 560:
+        if self.minimap_on and self.col_w > self.dp(560):
             self.mm_w = self.MINIMAP_W
         self.vs_w = self.dp(14)
         self.ed_w = self.col_w - self.mm_w - self.vs_w
@@ -486,7 +507,7 @@ class IDEPaint(IDEOps):
         r.fill_xywh(0, 0, self.W, self.H, th.bg)
         self._draw_titlebar(r)
         self._draw_activitybar(r)
-        if self.side_w > 0:
+        if self.side_w > 0 and not self.side_overlay:
             self._draw_sidebar(r)
         self._draw_tabs(r)
         self._draw_breadcrumbs(r)
@@ -501,6 +522,11 @@ class IDEPaint(IDEOps):
                 self._draw_find(r)
         if self.panel_h > 0:
             self._draw_panel(r)
+        if self.side_w > 0 and self.side_overlay:
+            # Floating: a click anywhere else in the workbench closes it.
+            self._hit(self.ACT_W, self.content_y, self.W - self.ACT_W, self.content_h, "@side.dismiss", "", "")
+            r.shadow_xywh(self.ACT_W, self.content_y, self.side_w, self.content_h, 14, 2, 0, th.shadow)
+            self._draw_sidebar(r)
         self._draw_statusbar(r)
         if self.dbg.active:
             self._draw_debug_toolbar(r)
@@ -531,18 +557,43 @@ class IDEPaint(IDEOps):
         r.fill_xywh(0, 0, self.W, h, th.title_bg)
         self.icons.draw(r, "code", self.dp(10), int((h - self.dp(16)) / 2), self.dp(16), th.accent)
         var x = self.dp(34)
+        # The menus, or - when they would crowd out the command centre and
+        # the layout buttons - one hamburger that opens them (VS Code's
+        # compact menu). Folds below full + 140 dp, unfolds above + 200 dp.
+        var full = 0
         var i = 0
         while i < len(self.menus):
-            var name = self.menus[i]
-            var w = self.f_ui.width(name) + self.dp(16)
-            var open = self.menu_open == i
-            if open or (self.menu_open < 0 and self._hov(x, 0, w, h)):
-                r.fill_round_xywh(x, self.dp(4), w, h - self.dp(8), self._a(th.text, 30), self.dp(4))
-            r.text(name, x + self.dp(8), int((h - self.ui_h) / 2), self.f_ui, th.text)
-            self._hit(x, 0, w, h, "@menu", i, "")
-            self.menu_x[i] = x
-            x = x + w
+            full = full + self.f_ui.width(self.menus[i]) + self.dp(16)
             i = i + 1
+        var room = self.W - self.dp(34) - self.dp(72)
+        if self.menu_compact and room > full + self.dp(200):
+            self.menu_compact = false
+        elif not self.menu_compact and room < full + self.dp(140):
+            self.menu_compact = true
+        if self.menu_compact:
+            var hw = self.dp(30)
+            if self.menu_open >= 0 or self._hov(x, 0, hw, h):
+                r.fill_round_xywh(x, self.dp(4), hw, h - self.dp(8), self._a(th.text, 30), self.dp(4))
+            self.icons.draw(r, "menu", x + int((hw - self.dp(16)) / 2), int((h - self.dp(16)) / 2), self.dp(16), th.text)
+            self._hit(x, 0, hw, h, "@menu", len(self.menus), "Application Menu")
+            i = 0
+            while i <= len(self.menus):
+                self.menu_x[i] = x
+                i = i + 1
+            x = x + hw
+        else:
+            i = 0
+            while i < len(self.menus):
+                var name = self.menus[i]
+                var w = self.f_ui.width(name) + self.dp(16)
+                var open = self.menu_open == i
+                if open or (self.menu_open < 0 and self._hov(x, 0, w, h)):
+                    r.fill_round_xywh(x, self.dp(4), w, h - self.dp(8), self._a(th.text, 30), self.dp(4))
+                r.text(name, x + self.dp(8), int((h - self.ui_h) / 2), self.f_ui, th.text)
+                self._hit(x, 0, w, h, "@menu", i, "")
+                self.menu_x[i] = x
+                x = x + w
+                i = i + 1
         var menus_end = x
         # Command center: VS Code's search box in the title bar.
         var ccw = int(self.W * 0.36)
@@ -551,7 +602,7 @@ class IDEPaint(IDEOps):
         var ccx = int((self.W - ccw) / 2)
         if ccx < menus_end + self.dp(12):
             ccx = menus_end + self.dp(12)
-            ccw = self.W - ccx - self.dp(96)
+            ccw = self.W - ccx - self.dp(84)
         if ccw > self.dp(120):
             var cch = self.dp(22)
             var ccy = int((h - cch) / 2)
@@ -591,7 +642,14 @@ class IDEPaint(IDEOps):
         var i = 0
         var y = y0
         var s = self.dp(24)
-        while i < len(self.views):
+        # Views that do not fit above the gear go to a "..." item.
+        var fit = int((self.status_y - self.ACT_W - y0) / self.ACT_W)
+        if fit < len(self.views):
+            fit = fit - 1
+        if fit < 0:
+            fit = 0
+        self.act_fit = fit
+        while i < len(self.views) and i < fit:
             var key = self.views[i]
             var active = self.sidebar_open and self.active_view == key
             var hov = self._hov(0, y, self.ACT_W, self.ACT_W)
@@ -616,6 +674,13 @@ class IDEPaint(IDEOps):
             self._hit(0, y, self.ACT_W, self.ACT_W, "@view", key, self.view_tips[i])
             y = y + self.ACT_W
             i = i + 1
+        if fit < len(self.views):
+            var mh = self._hov(0, y, self.ACT_W, self.ACT_W)
+            var mc = th.activity_dim
+            if mh:
+                mc = th.activity_fg
+            self.icons.draw(r, "ellipsis", int((self.ACT_W - s) / 2), y + int((self.ACT_W - s) / 2), s, mc)
+            self._hit(0, y, self.ACT_W, self.ACT_W, "@act.more", "", "Additional Views")
         # Manage (gear) at the bottom, as in VS Code.
         var gy = self.status_y - self.ACT_W
         var ghov = self._hov(0, gy, self.ACT_W, self.ACT_W)
@@ -1556,17 +1621,51 @@ class IDEPaint(IDEOps):
         self._hit(x, y - self.dp(3), w, self.dp(6), "@split.panel", "", "")
         var tx = x + self.dp(12)
         var hh = self.PANEL_HEAD
+        # Tabs that do not fit before the action buttons go to a "..." menu;
+        # the active tab always stays visible (it takes the last slot).
+        var nbtn = 2
+        if self.active_panel == "output" or self.active_panel == "terminal" or self.active_panel == "debug" or self.active_panel == "inspector":
+            nbtn = 3
+        if self.active_panel == "output" and self.job_running:
+            nbtn = 4
+        var limit = x + w - self.dp(34) - self.dp(28) * (nbtn - 1) - self.dp(6)
+        var n = len(self.panel_keys)
+        var ai = 0
+        var fit = 0
+        var need = tx
         var i = 0
-        while i < len(self.panel_keys):
+        while i < n:
+            if self.panel_keys[i] == self.active_panel:
+                ai = i
+            i = i + 1
+        i = 0
+        while i < n:
+            var tw0 = self._panel_tab_w(i)
+            var room = limit
+            if i < n - 1:
+                room = limit - self.dp(30)
+            if need + tw0 > room:
+                i = n
+            else:
+                need = need + tw0
+                fit = fit + 1
+                i = i + 1
+        if fit < 1:
+            fit = 1
+        self.panel_fit = fit
+        self.panel_ai = ai
+        i = 0
+        while i < n:
+            if not self._panel_tab_shown(i):
+                i = i + 1
+                continue
             var key = self.panel_keys[i]
             var label = self.panel_labels[i]
             var lw = self.f_tab.width(label)
-            var tw = lw + self.dp(20)
+            var tw = self._panel_tab_w(i)
             var badge = 0
             if key == "problems":
                 badge = self.n_errors + self.n_warnings
-            if badge > 0:
-                tw = tw + self.dp(22)
             var active = self.active_panel == key
             var col = th.panel_title_dim
             if active or self._hov(tx, y, tw, hh):
@@ -1583,6 +1682,8 @@ class IDEPaint(IDEOps):
             self._hit(tx, y, tw, hh, "@panel.tab", key, "")
             tx = tx + tw
             i = i + 1
+        if fit < n:
+            self._small_button(r, tx + self.dp(2), y + self.dp(6), self.dp(26), hh - self.dp(12), "ellipsis", "@panel.more", "", "More Panels", false)
         # Panel actions: Clear, Maximize/Restore, Close.
         var ax = x + w - self.dp(34)
         self._small_button(r, ax, y + self.dp(6), self.dp(26), hh - self.dp(12), "close", "workbench.action.togglePanel", "", "Hide Panel (Ctrl+J)", false)
@@ -1614,6 +1715,22 @@ class IDEPaint(IDEOps):
             self.workshop.draw(r)
             self._hit(x, by, w, bh, "@workshop", "", "")
         r.clear_clip()
+
+    def _panel_tab_w(self, i):
+        var tw = self.f_tab.width(self.panel_labels[i]) + self.dp(20)
+        if self.panel_keys[i] == "problems" and self.n_errors + self.n_warnings > 0:
+            tw = tw + self.dp(22)
+        return tw
+
+    # Which panel tabs the strip shows (see _draw_panel): the first
+    # panel_fit, except that an active tab beyond them takes the last slot.
+    def _panel_tab_shown(self, i):
+        var fit = self.panel_fit
+        if fit >= len(self.panel_keys):
+            return true
+        if self.panel_ai < fit:
+            return i < fit
+        return i < fit - 1 or i == self.panel_ai
 
     def _kind_color(self, kind):
         var th = self.th
@@ -1849,19 +1966,55 @@ class IDEPaint(IDEOps):
             x = self._status_item(r, x, y, h, "loading", self.st_job, "@job.stop", "", "Click to stop the running program")
         if self.dbg.active:
             x = self._status_item(r, x, y, h, "debug-alt", self.st_debug, "workbench.view.debug", "", "Run and Debug")
-        if self.status_msg != "" and time_ms() - self.status_t < 8000:
-            r.text(self.status_msg, x + self.dp(8), ty, self.f_small, self._a(th.status_fg, 200))
-        # Right side, laid out right-to-left.
+        # Right side, laid out right-to-left. Items that do not fit beside the
+        # left group drop out lowest-priority first: encoding, line endings,
+        # language, indentation; the cursor position goes last.
         var rx = self.W - self.dp(8)
         rx = self._status_item_r(r, rx, y, h, "bell", "", "notifications.showList", "", "Notifications")
         if self.notes.unread > 0:
             r.fill_circle(rx + self.dp(21), y + self.dp(6), self.dp(3), th.status_fg)
         if self._is_text():
-            rx = self._status_item_r(r, rx, y, h, "", self.st_lang, "workbench.action.editor.changeLanguageMode", "", "Select Language Mode")
-            rx = self._status_item_r(r, rx, y, h, "", self.st_eol, "workbench.action.editor.changeEOL", "", "Select End of Line Sequence")
-            rx = self._status_item_r(r, rx, y, h, "", self.st_enc, "workbench.action.editor.changeEncoding", "", "Select Encoding")
-            rx = self._status_item_r(r, rx, y, h, "", self.st_indent, "changeEditorIndentation", "", "Select Indentation")
-            rx = self._status_item_r(r, rx, y, h, "", self.st_pos, "workbench.action.gotoLine", "", "Go to Line/Column (Ctrl+G)")
+            var w_lang = self._status_w("", self.st_lang)
+            var w_eol = self._status_w("", self.st_eol)
+            var w_enc = self._status_w("", self.st_enc)
+            var w_ind = self._status_w("", self.st_indent)
+            var w_pos = self._status_w("", self.st_pos)
+            var avail = rx - x - self.dp(12)
+            var total = w_lang + w_eol + w_enc + w_ind + w_pos
+            var s_enc = true
+            var s_eol = true
+            var s_lang = true
+            var s_ind = true
+            var s_pos = true
+            if total > avail:
+                s_enc = false
+                total = total - w_enc
+            if total > avail:
+                s_eol = false
+                total = total - w_eol
+            if total > avail:
+                s_lang = false
+                total = total - w_lang
+            if total > avail:
+                s_ind = false
+                total = total - w_ind
+            if total > avail:
+                s_pos = false
+            if s_lang:
+                rx = self._status_item_r(r, rx, y, h, "", self.st_lang, "workbench.action.editor.changeLanguageMode", "", "Select Language Mode")
+            if s_eol:
+                rx = self._status_item_r(r, rx, y, h, "", self.st_eol, "workbench.action.editor.changeEOL", "", "Select End of Line Sequence")
+            if s_enc:
+                rx = self._status_item_r(r, rx, y, h, "", self.st_enc, "workbench.action.editor.changeEncoding", "", "Select Encoding")
+            if s_ind:
+                rx = self._status_item_r(r, rx, y, h, "", self.st_indent, "changeEditorIndentation", "", "Select Indentation")
+            if s_pos:
+                rx = self._status_item_r(r, rx, y, h, "", self.st_pos, "workbench.action.gotoLine", "", "Go to Line/Column (Ctrl+G)")
+        # The transient message fits in whatever is left between the groups.
+        if self.status_msg != "" and time_ms() - self.status_t < 8000 and rx - x > self.dp(40):
+            r.clip_xywh(x, y, rx - x - self.dp(4), h)
+            r.text(self.status_msg, x + self.dp(8), ty, self.f_small, self._a(th.status_fg, 200))
+            r.clear_clip()
 
     def _status_item(self, r, x, y, h, icon, label, cmd, arg, tip):
         var th = self.th
@@ -1880,6 +2033,14 @@ class IDEPaint(IDEOps):
             r.text(label, cx, y + int((h - self.small_h) / 2), self.f_small, th.status_fg)
         self._hit(x, y, w, h, cmd, arg, tip)
         return x + w
+
+    def _status_w(self, icon, label):
+        var w = self.dp(10)
+        if icon != "":
+            w = w + self.dp(16)
+        if label != "":
+            w = w + self.f_small.width(label) + self.dp(4)
+        return w
 
     def _status_item_r(self, r, right, y, h, icon, label, cmd, arg, tip):
         var w = self.dp(10)
@@ -1993,15 +2154,23 @@ class IDEPaint(IDEOps):
         # The menu bar stays live above the dismiss layer: moving along it
         # switches menus and clicking the open one closes it, as in VS Code.
         var mi = 0
-        while mi < len(self.menus):
-            self._hit(self.menu_x[mi], 0, self.f_ui.width(self.menus[mi]) + self.dp(16), self.TITLE_H, "@menu", mi, "")
-            mi = mi + 1
+        if self.menu_compact:
+            self._hit(self.menu_x[0], 0, self.dp(30), self.TITLE_H, "@menu", len(self.menus), "")
+        else:
+            while mi < len(self.menus):
+                self._hit(self.menu_x[mi], 0, self.f_ui.width(self.menus[mi]) + self.dp(16), self.TITLE_H, "@menu", mi, "")
+                mi = mi + 1
+        var ih = self._menu_item_h()
+        if self.menu_open >= len(self.menus):
+            self._draw_menu_list(r, ih)
+            return
         var items = self.menu_items[self.menus[self.menu_open]]
         var x = self.menu_x[self.menu_open]
         var y = self.TITLE_H
         var w = self.dp(300)
-        var ih = self._menu_item_h()
         var h = self.dp(8)
+        if self.menu_compact:
+            h = h + ih + self.dp(9)
         var i = 0
         while i < len(items):
             if items[i] == "-":
@@ -2009,6 +2178,12 @@ class IDEPaint(IDEOps):
             else:
                 h = h + ih
             i = i + 1
+        if y + h > self.H - self.dp(4):
+            # Short window: the menu starts higher rather than running off
+            # the bottom (it may then cover the title bar).
+            y = self.H - self.dp(4) - h
+            if y < 0:
+                y = 0
         if x + w > self.W - 4:
             x = self.W - w - 4
         r.shadow_xywh(x, y, w, h, 12, 0, 4, th.shadow)
@@ -2016,6 +2191,17 @@ class IDEPaint(IDEOps):
         r.round_rect_xywh(x, y, w, h, th.menu_border, self.dp(5), 1)
         self._hit(x, y, w, h, "@menu.bg", "", "")
         var yy = y + self.dp(4)
+        if self.menu_compact:
+            # Back to the list of menus.
+            var bsel = self._hov(x, yy, w, ih)
+            if bsel:
+                r.fill_round_xywh(x + self.dp(4), yy, w - self.dp(8), ih, th.menu_sel, self.dp(3))
+            self.icons.draw(r, "chevron-left", x + self.dp(8), yy + int((ih - self.dp(14)) / 2), self.dp(14), th.text_dim)
+            r.text(self.menus[self.menu_open], x + self.dp(26), yy + int((ih - self.ui_h) / 2), self.f_ui, th.text_dim)
+            self._hit(x, yy, w, ih, "@menu.pick", len(self.menus), "All menus")
+            yy = yy + ih
+            r.fill_xywh(x + self.dp(10), yy + self.dp(4), w - self.dp(20), 1, th.menu_border)
+            yy = yy + self.dp(9)
         i = 0
         while i < len(items):
             var id = items[i]
@@ -2041,6 +2227,31 @@ class IDEPaint(IDEOps):
                 else:
                     self._hit(x, yy, w, ih, "@menu.bg", "", "")
                 yy = yy + ih
+            i = i + 1
+
+    # The hamburger's list: one row per menu; choosing one opens it in place.
+    def _draw_menu_list(self, r, ih):
+        var th = self.th
+        var x = self.menu_x[0]
+        var y = self.TITLE_H
+        var w = self.dp(220)
+        var h = self.dp(8) + ih * len(self.menus)
+        r.shadow_xywh(x, y, w, h, 12, 0, 4, th.shadow)
+        r.fill_round_xywh(x, y, w, h, th.menu_bg, self.dp(5))
+        r.round_rect_xywh(x, y, w, h, th.menu_border, self.dp(5), 1)
+        self._hit(x, y, w, h, "@menu.bg", "", "")
+        var yy = y + self.dp(4)
+        var i = 0
+        while i < len(self.menus):
+            var sel = self.menu_sel == i or (self.menu_sel < 0 and self._hov(x, yy, w, ih))
+            var fg = th.text
+            if sel:
+                r.fill_round_xywh(x + self.dp(4), yy, w - self.dp(8), ih, th.menu_sel, self.dp(3))
+                fg = th.text_hi
+            r.text(self.menus[i], x + self.dp(26), yy + int((ih - self.ui_h) / 2), self.f_ui, fg)
+            self.icons.draw(r, "chevron-right", x + w - self.dp(24), yy + int((ih - self.dp(14)) / 2), self.dp(14), th.text_faint)
+            self._hit(x, yy, w, ih, "@menu.pick", i, "")
+            yy = yy + ih
             i = i + 1
 
     def _draw_ctx(self, r):
