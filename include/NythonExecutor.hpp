@@ -538,6 +538,79 @@ public:   // NythonExecutor is a struct: members default to public
         return evalNode(ast, global_ctx);
     }
 
+    // ── return / break / continue without C++ exceptions ─────────────────
+    // Every `return` used to throw ReturnSignal and every break/continue a
+    // std::string, caught where the function or loop was entered. Unwinding
+    // costs microseconds: a call to a one-line function took ~20 us, 80% of
+    // it in __gxx_personality_v0 and _Unwind_*.
+    //
+    // Now the common case sets a pending flag instead and returns normally.
+    // Blocks, `if` and every loop check the flag after each statement and
+    // stop; the function-call site (evalBody) or the loop consumes it. The
+    // flag may only be used where EVERY construct between the statement and
+    // its function/loop checks it, so:
+    //   - fast_ctx is the context of the function whose body evalBody is
+    //     running; a return in any other context (legacy call paths, an
+    //     except handler's context...) still throws;
+    //   - brk_ok is set only while a loop evaluates its body;
+    //   - constructs that run statements but do not check the flag (try,
+    //     with, switch, class/namespace/interface bodies, import, macros)
+    //     suspend both for their duration (SuspendFast), so a return or
+    //     break inside them throws exactly as before and they keep their
+    //     finally/__exit__/else handling.
+    // Thread-local, so each thread has its own.
+    struct FlowState {
+        Context* fast_ctx = nullptr;
+        bool brk_ok = false;
+        int pending = 0;          // 1 return, 2 break, 3 continue
+        Value value;              // a pending return's value
+    };
+    static FlowState& flow() { static thread_local FlowState f; return f; }
+    struct SuspendFast {
+        FlowState& f; Context* c; bool b;
+        SuspendFast() : f(flow()), c(f.fast_ctx), b(f.brk_ok) { f.fast_ctx = nullptr; f.brk_ok = false; }
+        ~SuspendFast() { f.fast_ctx = c; f.brk_ok = b; }
+        SuspendFast(const SuspendFast&) = delete;
+        SuspendFast& operator=(const SuspendFast&) = delete;
+    };
+    // Held while a loop evaluates its body.
+    struct LoopBody {
+        FlowState& f; bool b;
+        explicit LoopBody(FlowState& ff) : f(ff), b(ff.brk_ok) { f.brk_ok = true; }
+        ~LoopBody() { f.brk_ok = b; }
+        LoopBody(const LoopBody&) = delete;
+        LoopBody& operator=(const LoopBody&) = delete;
+    };
+    // After a loop body: consume a pending break/continue, or leave the loop
+    // (without running its else branch) with a pending return still set, so
+    // the enclosing statements unwind to evalBody. `lf` is the loop's
+    // FlowState reference and `result` its running value.
+#define NY_LOOP_FLOW(broke_var) \
+    if (lf.pending) { \
+        if (lf.pending == 1) return result; \
+        int ny_pf_ = lf.pending; lf.pending = 0; \
+        if (ny_pf_ == 2) { broke_var = true; break; } \
+        continue; \
+    }
+    // Runs a function body in fc and returns what the call should return:
+    // the value of a `return` (fast or thrown), or - as before - the value
+    // of the body's last statement when it runs off the end.
+    Value evalBody(node_ptr body, Context* fc) {
+        FlowState& f = flow();
+        struct Restore {
+            FlowState& f; Context* c; bool b;
+            ~Restore() { f.fast_ctx = c; f.brk_ok = b; }
+        } _restore{f, f.fast_ctx, f.brk_ok};
+        f.fast_ctx = fc;
+        f.brk_ok = false;
+        Value v = evalNode(body, fc);
+        if (f.pending) {
+            if (f.pending == 1) { v = f.value; f.value = NONE_VALUE; }
+            f.pending = 0;
+        }
+        return v;
+    }
+
     Value evalNode(node_ptr node, Context* ctx) {
         if (!node) return NONE_VALUE;
 
@@ -563,10 +636,18 @@ public:   // NythonExecutor is a struct: members default to public
             case NodeType::WHILE: return evalWhile(node, ctx);
             case NodeType::FOR: return evalFor(node, ctx);
             case NodeType::FUNCTION: return evalFunctionDecl(node, ctx);
-            case NodeType::CLASS: return evalClassDecl(node, ctx);
+            case NodeType::CLASS: { SuspendFast _sf; return evalClassDecl(node, ctx); }
             case NodeType::RETURN: return evalReturn(node, ctx);
-            case NodeType::BREAK: throw std::string("break");
-            case NodeType::CONTINUE: throw std::string("continue");
+            case NodeType::BREAK: {
+                FlowState& f = flow();
+                if (f.brk_ok) { f.pending = 2; return NONE_VALUE; }
+                throw std::string("break");
+            }
+            case NodeType::CONTINUE: {
+                FlowState& f = flow();
+                if (f.brk_ok) { f.pending = 3; return NONE_VALUE; }
+                throw std::string("continue");
+            }
             case NodeType::PASS: return NONE_VALUE;
             case NodeType::CALL: return evalCall(node, ctx);
             case NodeType::ATTRIBUTE: return evalAttribute(node, ctx);
@@ -577,20 +658,20 @@ public:   // NythonExecutor is a struct: members default to public
             case NodeType::TUPLE: return evalList(node, ctx);
             case NodeType::ARRAY: return evalList(node, ctx);
             case NodeType::RANGE: return evalRange(node, ctx);
-            case NodeType::TRY: return evalTry(node, ctx);
+            case NodeType::TRY: { SuspendFast _sf; return evalTry(node, ctx); }
             case NodeType::RAISE: return evalRaise(node, ctx);
             case NodeType::ASSERT: return evalAssert(node, ctx);
-            case NodeType::IMPORT: return evalImport(node, ctx);
+            case NodeType::IMPORT: { SuspendFast _sf; return evalImport(node, ctx); }
             case NodeType::ENUM: return evalEnum(node, ctx);
-            case NodeType::SWITCH: return evalSwitch(node, ctx);
+            case NodeType::SWITCH: { SuspendFast _sf; return evalSwitch(node, ctx); }
             case NodeType::DELETE: return evalDelete(node, ctx);
-            case NodeType::MACRO_CALL: return evalMacroCall(node, ctx);
+            case NodeType::MACRO_CALL: { SuspendFast _sf; return evalMacroCall(node, ctx); }
             case NodeType::DYN_BINOP:  return evalDynBinop(node, ctx);
             case NodeType::LAMBDA: return evalLambda(node, ctx);
             case NodeType::REPEAT: return evalRepeat(node, ctx);
-            case NodeType::WITH: return evalWith(node, ctx);
-            case NodeType::NAMESPACE: return evalNamespace(node, ctx);
-            case NodeType::INTERFACE: return evalInterfaceDecl(node, ctx);
+            case NodeType::WITH: { SuspendFast _sf; return evalWith(node, ctx); }
+            case NodeType::NAMESPACE: { SuspendFast _sf; return evalNamespace(node, ctx); }
+            case NodeType::INTERFACE: { SuspendFast _sf; return evalInterfaceDecl(node, ctx); }
             case NodeType::YIELD: { auto yn = static_pointer_cast<YieldNode>(node); Value yv = yn->expr ? evalNode(yn->expr, ctx) : NONE_VALUE; if (yield_sink_) { yield_sink_->push_back(yv); return NONE_VALUE; } throw nython::node::YieldSignal(yv); }
             case NodeType::GLOBAL: return NONE_VALUE;
             case NodeType::SELF: return ctx->getByName("self");
@@ -609,18 +690,22 @@ public:   // NythonExecutor is a struct: members default to public
     // ─── SCRIPT / STATEMENTS ────────────────────────────────────────────
     Value evalScript(node_ptr node, Context* ctx) {
         Value result = NONE_VALUE;
+        FlowState& f = flow();
         for (auto& child : node->statements()) {
             noteStatement(child, ctx);
             result = evalNode(child, ctx);
+            if (f.pending) return result;
         }
         return result;
     }
 
     Value evalStatements(node_ptr node, Context* ctx) {
         Value result = NONE_VALUE;
+        FlowState& f = flow();
         for (auto& child : node->statements()) {
             noteStatement(child, ctx);
             result = evalNode(child, ctx);
+            if (f.pending) return result;
         }
         return result;
     }
@@ -1861,12 +1946,19 @@ return lv * rv;
         auto wn = static_pointer_cast<WhileNode>(node);
         Value result = NONE_VALUE;
         bool broke = false;
+        FlowState& lf = flow();
         while (isTruthy(evalNode(wn->condition, ctx))) {
-            try { result = evalNode(wn->body, ctx); }
+            try { LoopBody _lb(lf); result = evalNode(wn->body, ctx); }
             catch (std::string& flow) {
                 if (flow == "break") { broke = true; break; }
                 if (flow == "continue") continue;
+                // Anything else is a raised exception (or a signal for an
+                // outer construct). It used to fall out of this handler and
+                // be dropped: `while ...: raise ValueError()` carried on
+                // looping and nothing could catch the error.
+                throw;
             }
+            NY_LOOP_FLOW(broke)
         }
         // while/else: execute else branch only on natural exit (no break)
         if (!broke && wn->else_branch) result = evalNode(wn->else_branch, ctx);
@@ -1876,6 +1968,7 @@ return lv * rv;
     Value evalFor(node_ptr node, Context* ctx) {
         auto fn = static_pointer_cast<ForNode>(node);
         bool broke = false;
+        FlowState& lf = flow();
         Value iter_val = evalNode(fn->iterable, ctx);
         std::string var_name = fn->var->value();
         Value result = NONE_VALUE;
@@ -1885,8 +1978,9 @@ return lv * rv;
             int64_t n = bigint_to_i64(iter_val.value.i);
             for (int64_t i = 0; i < n; i++) {
                 ctx->defineByName(var_name, Value((int)i));
-                try { result = evalNode(fn->body, ctx); }
+                try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
                 catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
+                NY_LOOP_FLOW(broke)
             }
             if (!broke && fn->else_branch) result = evalNode(fn->else_branch, ctx);
             return result;
@@ -1906,8 +2000,9 @@ return lv * rv;
                     for (auto& [key, val] : *cont->container) {
                         if (key.empty() || key[0] == '_') continue; // skip __len__ etc
                         ctx->defineByName(var_name, makeStringValue(key));
-                        try { result = evalNode(fn->body, ctx); }
+                        try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
                         catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
+                        NY_LOOP_FLOW(broke)
                     }
                     return result;
                 }
@@ -1936,8 +2031,9 @@ return lv * rv;
                         } else {
                             ctx->defineByName(var_name, elem);
                         }
-                        try { result = evalNode(fn->body, ctx); }
+                        try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
                         catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
+                        NY_LOOP_FLOW(broke)
                     }
                 }
             }
@@ -1953,8 +2049,9 @@ return lv * rv;
                 for (size_t i = 0; i < sp->size(); i++) {
                     std::string ch(1, (*sp)[i]);
                     ctx->defineByName(var_name, makeStringValue(ch));
-                    try { result = evalNode(fn->body, ctx); }
+                    try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
                     catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
+                    NY_LOOP_FLOW(broke)
                 }
                 if (!broke && fn->else_branch) result = evalNode(fn->else_branch, ctx);
                 return result;
@@ -1997,8 +2094,9 @@ return lv * rv;
                 } else {
                     ctx->defineByName(var_name, item);
                 }
-                try { result = evalNode(fn->body, ctx); }
+                try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
                 catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
+                NY_LOOP_FLOW(broke)
             }
             if (!broke && fn->else_branch) result = evalNode(fn->else_branch, ctx);
             return result;
@@ -2016,13 +2114,18 @@ return lv * rv;
         Value count = evalNode(rn->count, ctx);
         int64_t n = (count.type == ValueType::INTEGER) ? bigint_to_i64(count.value.i) : 0;
         Value result = NONE_VALUE;
+        bool broke = false;
+        FlowState& lf = flow();
         for (int64_t i = 0; i < n; i++) {
-            try { result = evalNode(rn->body, ctx); }
+            try { LoopBody _lb(lf); result = evalNode(rn->body, ctx); }
             catch (std::string& flow) {
                 if (flow == "break") break;
                 if (flow == "continue") continue;
+                throw;   // a raised exception, not loop control (see evalWhile)
             }
+            NY_LOOP_FLOW(broke)
         }
+        (void)broke;
         return result;
     }
 
@@ -2089,6 +2192,17 @@ return lv * rv;
 
 
     // Check if an AST subtree contains any YieldNode (used to skip generator probe)
+    // Whether a function body yields, cached per body node: every call to a
+    // user function asks, and the walk is proportional to the body's size.
+    std::unordered_map<const Node*, bool> yield_cache_;
+    bool bodyYields(const node_ptr& body) {
+        if (!body) return false;
+        auto it = yield_cache_.find(body.get());
+        if (it != yield_cache_.end()) return it->second;
+        bool y = hasYield(body);
+        yield_cache_[body.get()] = y;
+        return y;
+    }
     bool hasYield(node_ptr node) {
         if (!node) return false;
         if (node->type() == NodeType::YIELD) return true;
@@ -2204,13 +2318,13 @@ return lv * rv;
             auto cit = closure_contexts.find(fn_val.value.p);
             if (cit != closure_contexts.end()) closure_parent = cit->second;
             // Generator detection: run with yield_sink_ set so yield appends and continues
-            if (hasYield(fn_node->body)) {
+            if (bodyYields(fn_node->body)) {
                 std::vector<Value> yielded;
                 yield_sink_ = &yielded;
                 Context* fn_ctx_probe = new Context(runner, fn_node->name, nullptr, nullptr, closure_parent);
                 CtxReaper _reap_fn_ctx_probe2003(this, fn_ctx_probe);
                 bindParams(fn_node, call_args, fn_ctx_probe, ctx, fn_val.value.p);
-                try { evalNode(fn_node->body, fn_ctx_probe); }
+                try { evalBody(fn_node->body, fn_ctx_probe); }
                 catch (nython::node::ReturnSignal&) {}
                 catch (...) {}
                 yield_sink_ = nullptr;
@@ -2229,7 +2343,7 @@ return lv * rv;
             CtxReaper _reap_fn_ctx2020(this, fn_ctx);
             bindParams(fn_node, call_args, fn_ctx, ctx, fn_val.value.p);
             try {
-                Value rv = evalNode(fn_node->body, fn_ctx);
+                Value rv = evalBody(fn_node->body, fn_ctx);
                 return rv;
             } catch (nython::node::ReturnSignal& r) { return r.value; }
             catch (std::string& _ex) { throw; }
@@ -3332,7 +3446,7 @@ return lv * rv;
                         // Set __parent_class__ so super() works in this method
                         if (cn->bases.size() > 0)
                             fc->defineByName("__parent_class__", internString(cn->bases[0]->value()));
-                        try { Value r = evalNode(fn->body, fc); return r; }
+                        try { Value r = evalBody(fn->body, fc); return r; }
                         catch (nython::node::ReturnSignal& r) { return r.value; }
                         catch (std::string& e) { throw; }
                     }
@@ -3376,7 +3490,7 @@ return lv * rv;
                                     fn_ctx->defineByName(fn->params[i]->value(), args[arg_idx]);
                             }
                             try {
-                                Value result = evalNode(fn->body, fn_ctx);
+                                Value result = evalBody(fn->body, fn_ctx);
                                 return result;
                             } catch (nython::node::ReturnSignal& ret) {
                                 return ret.value;
@@ -3417,7 +3531,7 @@ return lv * rv;
                         size_t arg_idx = i - param_start;
                         if (arg_idx < args.size()) fn_ctx->defineByName(fn->params[i]->value(), args[arg_idx]);
                     }
-                    try { return evalNode(fn->body, fn_ctx); }
+                    try { return evalBody(fn->body, fn_ctx); }
                     catch (nython::node::ReturnSignal& ret) { return ret.value; }
                     catch (std::string& _exc) { if (_exc.size()>7 && _exc.substr(0,7)=="__exc__") throw; return NONE_VALUE; }
                 }
@@ -3449,7 +3563,7 @@ return lv * rv;
                                         size_t arg_idx = i - param_start;
                                         if (arg_idx < args.size()) fn_ctx->defineByName(fn->params[i]->value(), args[arg_idx]);
                                     }
-                                    try { Value result = evalNode(fn->body, fn_ctx); return result; }
+                                    try { Value result = evalBody(fn->body, fn_ctx); return result; }
                                     catch (nython::node::ReturnSignal& ret) { return ret.value; }
                                     catch (std::string& flow) { if (flow=="break"||flow=="continue") throw; if (flow.size()>7&&flow.substr(0,7)=="__exc__") throw; return NONE_VALUE; }
                                 }
@@ -3484,7 +3598,7 @@ return lv * rv;
                                             size_t arg_idx = i - param_start;
                                             if (arg_idx < args.size()) fn_ctx->defineByName(fn->params[i]->value(), args[arg_idx]);
                                         }
-                                        try { Value result = evalNode(fn->body, fn_ctx); return result; }
+                                        try { Value result = evalBody(fn->body, fn_ctx); return result; }
                                         catch (nython::node::ReturnSignal& ret) { return ret.value; }
                                         catch (std::string& flow) { if (flow.size()>7&&flow.substr(0,7)=="__exc__") throw; return NONE_VALUE; }
                                     }
@@ -4121,7 +4235,7 @@ public:
                                     if (!pcn->bases.empty())
                                         fn_ctx->defineByName("__parent_class__", internString(pcn->bases[0]->value()));
                                     fn_ctx->defineByName("__instance__", self_val);
-                                    try { Value r = evalNode(fn->body, fn_ctx); return r; }
+                                    try { Value r = evalBody(fn->body, fn_ctx); return r; }
                                     catch (nython::node::ReturnSignal& r) { return r.value; }
                                     catch (...) {}
                                 }
@@ -4225,7 +4339,7 @@ public:
                                         Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
                                         CtxReaper _reap_fc3627(this, fc);
                                         bindParams(fn, args, fc, ctx, attr_val.value.p);
-                                        try { return evalNode(fn->body, fc); }
+                                        try { return evalBody(fn->body, fc); }
                                         catch (nython::node::ReturnSignal& r) { return r.value; }
                                         catch (...) { return NONE_VALUE; }
                                     }
@@ -4261,7 +4375,7 @@ public:
                                         Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
                                         CtxReaper _reap_fc3662(this, fc);
                                         bindParamsKw(fn, args, kw_args, fc, ctx, 0, attr_val.value.p);
-                                        try { Value r = evalNode(fn->body, fc); return r; }
+                                        try { Value r = evalBody(fn->body, fc); return r; }
                                         catch (nython::node::ReturnSignal& r) { return r.value; }
                                         catch (...) { return NONE_VALUE; }
                                     }
@@ -4332,7 +4446,7 @@ public:
                                                 // propagate like it does for every other function call,
                                                 // not be silently discarded (see NythonExecutor.hpp's
                                                 // other ReturnSignal-only catches for the same pattern).
-                                                try { evalNode(fn->body, fn_ctx); } catch (nython::node::ReturnSignal&) {}
+                                                try { evalBody(fn->body, fn_ctx); } catch (nython::node::ReturnSignal&) {}
                                                 break;
                                             }
                                         }
@@ -4428,13 +4542,13 @@ public:
                     auto cit = closure_contexts.find(callee.value.p);
                     if (cit != closure_contexts.end()) closure_parent = cit->second;
                     // Generator detection: run with yield_sink_ set (only if yield exists in AST)
-                    if (hasYield(fn->body)) {
+                    if (bodyYields(fn->body)) {
                         std::vector<Value> yielded;
                         yield_sink_ = &yielded;
                         Context* probe_ctx = new Context(runner, fn->name, nullptr, nullptr, closure_parent);
                         CtxReaper _reapProbe(this, probe_ctx);
                         bindParamsKw(fn, args, kw_args, probe_ctx, ctx, 0, callee.value.p);
-                        try { evalNode(fn->body, probe_ctx); }
+                        try { evalBody(fn->body, probe_ctx); }
                         catch (nython::node::ReturnSignal&) {}
                         catch (...) {}
                         yield_sink_ = nullptr;
@@ -4453,7 +4567,7 @@ public:
                     // Bind parameters with keyword arg and *args support
                     bindParamsKw(fn, args, kw_args, fn_ctx, ctx, 0, callee.value.p);
                     try {
-                        Value result = evalNode(fn->body, fn_ctx);
+                        Value result = evalBody(fn->body, fn_ctx);
                         return result;
                     } catch (nython::node::ReturnSignal& ret) {
                         return ret.value;
@@ -4572,7 +4686,7 @@ public:
                                 }
                                 // See the identical comment on the other __init__ call sites in
                                 // this file: only ReturnSignal (a bare `return`) is swallowed here.
-                                try { evalNode(fn->body, fn_ctx); } catch (nython::node::ReturnSignal&) {}
+                                try { evalBody(fn->body, fn_ctx); } catch (nython::node::ReturnSignal&) {}
                             }
                         }
                     }
@@ -4615,7 +4729,7 @@ public:
                                                 fn_ctx->defineByName(fn->params[i]->value(), evalNode(fn->defaults[i], ctx));
                                             else fn_ctx->defineByName(fn->params[i]->value(), NONE_VALUE);
                                         }
-                                        try { evalNode(fn->body, fn_ctx); }
+                                        try { evalBody(fn->body, fn_ctx); }
                                         catch (nython::node::ReturnSignal&) {}
                                         break;
                                     }
@@ -4910,7 +5024,7 @@ public:
                                 if (cit != closure_contexts.end()) closure_parent = cit->second;
                                 Context* fc = new Context(runner, fn->name, nullptr, nullptr, closure_parent);
                                 fc->defineByName("self", obj);
-                                try { Value r = evalNode(fn->body, fc); return r; }
+                                try { Value r = evalBody(fn->body, fc); return r; }
                                 catch (nython::node::ReturnSignal& r) { return r.value; }
                                 catch (...) {}
                             }
@@ -4985,7 +5099,7 @@ public:
                                     if (cit2 != closure_contexts.end()) cp = cit2->second;
                                     Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
                                     fc->defineByName("self", obj);
-                                    try { Value r = evalNode(fn->body, fc); return r; }
+                                    try { Value r = evalBody(fn->body, fc); return r; }
                                     catch (nython::node::ReturnSignal& r) { return r.value; }
                                     catch (...) {}
                                 }
@@ -5075,6 +5189,8 @@ public:
     Value evalReturn(node_ptr node, Context* ctx) {
         auto rn = static_pointer_cast<ReturnNode>(node);
         Value val = rn->expr ? evalNode(rn->expr, ctx) : NONE_VALUE;
+        FlowState& f = flow();
+        if (ctx && f.fast_ctx == ctx) { f.value = val; f.pending = 1; return val; }
         throw nython::node::ReturnSignal{val};
     }
 

@@ -1497,6 +1497,10 @@ struct GenState {
     bool done=false;
     std::vector<VMVal> saved_stack; // intermediate stack at yield point
     size_t stack_base=0;           // stack level when generator was entered
+    // Set by YIELD_VALUE / YIELD_FROM_OP just before run_loop returns the
+    // yielded value, read (and cleared) by gen_next: a yield and a return
+    // both leave run_loop by an ordinary return now, not a C++ exception.
+    bool yielded=false;
 };
 
 
@@ -1852,11 +1856,17 @@ private:
         call_stack_.push_back(std::move(fr));
         VMVal result=VMVal::make_none();
         try {
-            run_loop();
-            // Generator function returned without yield → done
-            gs.done=true;
-            // Clean up any remaining stack from generator
-            if(stack_.size() > gs.stack_base) stack_.resize(gs.stack_base);
+            gs.yielded=false;
+            VMVal out=run_loop();
+            if(gs.yielded){
+                gs.yielded=false;
+                result=out;          // stack state was saved by the yield
+            } else {
+                // Returned (or ran off the end) without yielding: done. A
+                // `return v` still hands v back, as the VMReturn path did.
+                gs.done=true; result=out;
+                if(stack_.size() > gs.stack_base) stack_.resize(gs.stack_base);
+            }
         } catch(VMYield& y) {
             result=y.value;
             // Stack state was already saved in YIELD_VALUE handler
@@ -2350,7 +2360,13 @@ private:
                 VMVal mname=pop(); VMVal obj=pop();
                 push(vm_call_method(obj,mname.s,args)); break;
             }
-            case Op::RETURN_VALUE: throw VMReturn{pop()};
+            // A return used to throw VMReturn, caught (and rethrown once) on the
+            // way out: two C++ unwinds per call, ~90% of a function call's cost
+            // (a 30k-call loop spent 14 of 15 billion instructions unwinding).
+            // Every run_loop invocation runs exactly one frame - exec_code,
+            // exec_code_bound and gen_next each push a frame and call run_loop
+            // - so returning from run_loop returns from that frame.
+            case Op::RETURN_VALUE: return pop();
             case Op::YIELD_VALUE: {
                 VMVal yv=pop();
                 auto& cfr=call_stack_.back();
@@ -2364,6 +2380,8 @@ private:
                         cfr.gen_state->saved_stack.assign(stack_.begin()+base, stack_.end());
                         stack_.resize(base);
                     }
+                    cfr.gen_state->yielded=true;
+                    return yv;
                 }
                 throw VMYield{yv};
             }
@@ -2411,7 +2429,8 @@ private:
                             cfr.gen_state->saved_stack.assign(stack_.begin()+base,stack_.end());
                             stack_.resize(base);
                         }
-                        throw VMYield{item};
+                        cfr.gen_state->yielded=true;
+                        return item;
                     }
                     // Not in a generator context (shouldn't happen) - just push
                 }
