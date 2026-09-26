@@ -455,6 +455,165 @@ print "  Generated " + str(my_ai.generation_count) + " responses (" + str(my_ai.
 print "  PASS: Complete AI pipeline operational"
 passed = passed + 1
 
+
+# ── Values and invariants (the architectures compute what they claim) ─────
+print "--- invariants ---"
+def close_t(a, b, tol):
+    return Tensor(a).allclose(Tensor(b), 0.0, tol)
+
+torch.manual_seed(11)
+# retention: parallel and recurrent forms are the same function
+var rh2 = RetentionHead(4, 0.8)
+var rxs = [Tensor([1.0, 0.5, -0.5, 0.2]), Tensor([0.3, -1.0, 0.4, 0.9]), Tensor([-0.7, 0.2, 0.8, -0.1])]
+var rpar = rh2.forward_parallel(rxs)
+rh2.reset_state()
+var rrec_ok = true
+for i in range(0, 3):
+    if not rh2.forward_recurrent(rxs[i]).allclose(rpar[i], 0.0, 0.000000001):
+        rrec_ok = false
+assert_true("Retention: recurrent == parallel", rrec_ok)
+var rn = RetNet(8, 2, 2, 16, 20)
+var rn_par = rn.forward_parallel([3, 1, 4, 1, 5])
+var rn_rec = rn.forward_recurrent([3, 1, 4, 1, 5])
+assert_true("RetNet: recurrent logits == parallel logits", rn_rec[4].allclose(rn_par[4], 0.0, 0.000000001) and rn_rec[0].allclose(rn_par[0], 0.0, 0.000000001))
+
+# RWKV: greedy decoding is deterministic, the state is what makes it recurrent
+var rw = RWKV(8, 2, 2, 16)
+var g1 = rw.generate([1, 2, 3], 4, 0.0)
+var g2 = rw.generate([1, 2, 3], 4, 0.0)
+assert_eq("RWKV greedy generation is reproducible", g1, g2)
+var l_a = rw.forward([5])
+var l_b = rw.forward([2, 5])
+assert_true("RWKV: the previous token changes the logits", not l_a.allclose(l_b))
+
+# SSM: step-by-step == whole-sequence scan
+var ssm2 = SelectiveSSM(4, 3, 1)
+var sx = [Tensor([0.5, -0.3, 0.1, 0.7]), Tensor([-0.2, 0.4, 0.9, -0.6]), Tensor([0.1, 0.1, -0.8, 0.3])]
+var s_seq = ssm2.forward_sequence(sx)
+ssm2.reset()
+var s_ok = true
+for i in range(0, 3):
+    if not ssm2.forward(sx[i]).allclose(s_seq[i], 0.0, 0.000000001):
+        s_ok = false
+assert_true("SelectiveSSM: step == sequence scan", s_ok)
+
+# DDPM: the forward process inverts exactly, and a step at t=0 with the true
+# noise returns x0; a DDIM step with the true noise lands on q(x_(t') | x0)
+var sch = DDPMScheduler(50, 0.0001, 0.02, "linear")
+var d_x0 = Tensor([0.5, -1.0, 2.0, 0.25])
+var d_eps = Tensor([0.3, 0.1, -0.7, 1.2])
+var d_xt = sch.add_noise(d_x0, 30, d_eps)
+assert_true("DDPM add_noise = sqrt(ab) x0 + sqrt(1-ab) eps", abs(d_xt.data[0] - (sqrt(sch.alphas_cumprod[30]) * 0.5 + sqrt(1.0 - sch.alphas_cumprod[30]) * 0.3)) < 0.000000001)
+assert_true("DDPM predict_x0 inverts add_noise", sch.predict_x0(d_xt, d_eps, 30).allclose(d_x0, 0.0, 0.000000001))
+assert_true("DDPM step at t=0 with the true noise gives x0", sch.step(d_eps, 0, sch.add_noise(d_x0, 0, d_eps)).allclose(d_x0, 0.0, 0.000000001))
+assert_true("DDIM step with the true noise lands on q(x_t' | x0)", sch.ddim_step(d_eps, 30, 10, d_xt).allclose(sch.add_noise(d_x0, 10, d_eps), 0.0, 0.000000001))
+var cos_s = DDPMScheduler(100, 0.0001, 0.02, "cosine")
+assert_true("cosine schedule ends near pure noise", cos_s.alphas_cumprod[99] < 0.001)
+
+# flow matching learns to transport noise onto a single data point
+torch.manual_seed(5)
+var fm2 = FlowMatchingModel(2, 32, 2, 0.0001)
+fm2.fit([[2.0, -1.0]], 400, 0.01)
+var fm_s = fm2.sample(20)
+assert_true("flow matching samples land on the data point", abs(fm_s.data[0] - 2.0) < 0.25 and abs(fm_s.data[1] + 1.0) < 0.25)
+
+# EBM: the Langevin drift is the true input gradient of the energy
+var eb = EnergyBasedModel(3, 8, 2)
+var ex = [0.2, -0.4, 0.6]
+var eg = eb.energy_grad(ex)
+var eh = 0.000001
+var efd = (eb.energy([0.2 + eh, -0.4, 0.6]) - eb.energy([0.2 - eh, -0.4, 0.6])) / (2.0 * eh)
+assert_true("EBM energy gradient matches finite differences", abs(eg.data[0] - efd) < 0.00001)
+
+# MoD: tokens not selected by the router are passed through untouched
+var mod2 = MoDLayer(4, 0.5, lambda x: x * 2.0)
+var mtoks = [Tensor([1.0, 0.0, 0.0, 0.0]), Tensor([0.0, 1.0, 0.0, 0.0]), Tensor([0.0, 0.0, 1.0, 0.0]), Tensor([0.0, 0.0, 0.0, 1.0])]
+var mout = mod2.forward(mtoks)
+var n_same = 0
+for i in range(0, 4):
+    if mout[i].allclose(mtoks[i]):
+        n_same = n_same + 1
+assert_eq("MoD: exactly half the tokens skip the layer", n_same, 2)
+
+# attention weights are distributions
+var cma2 = CrossModalAttention(4, 6, 8, 2)
+cma2.forward([[1.0, 0.0, 0.5, 0.2]], [[0.1, 0.2, 0.3, 0.4, 0.5, 0.6], [0.6, 0.5, 0.4, 0.3, 0.2, 0.1]])
+assert_true("CrossModal attention rows sum to 1", abs(cma2.attn_weights.sum().item() - 1.0) < 0.000000001)
+
+# RoPE preserves norms and makes q.k depend only on the offset
+var rp = RotaryPositionalEncoding(4, 10000, 64)
+var rq = Tensor([0.3, -0.2, 0.9, 0.4])
+var rk = Tensor([-0.5, 0.8, 0.1, 0.6])
+assert_true("RoPE preserves the norm", abs(rp.apply_rotary(rq, 7).norm().item() - rq.norm().item()) < 0.000000001)
+var d1 = rp.apply_rotary(rq, 5).dot(rp.apply_rotary(rk, 2)).item()
+var d2 = rp.apply_rotary(rq, 13).dot(rp.apply_rotary(rk, 10)).item()
+assert_true("RoPE: q(m).k(n) depends only on m - n", abs(d1 - d2) < 0.000000001)
+
+# GQA: token-by-token decoding with the KV cache == causal attention over
+# the whole sequence
+var gq = GroupedQueryAttention(8, 4, 2, 2)
+var gx = Tensor([[0.1, 0.2, -0.3, 0.4, 0.5, -0.6, 0.7, 0.8], [0.9, -0.1, 0.2, 0.3, -0.4, 0.5, 0.6, -0.7], [-0.2, 0.3, 0.4, -0.5, 0.6, 0.7, -0.8, 0.9]])
+var g_full = gq.forward(gx, false)
+gq.clear_cache()
+var g_ok = true
+for i in range(0, 3):
+    if not gq.forward(gx[i], true).allclose(g_full[i], 0.0, 0.000000001):
+        g_ok = false
+assert_true("GQA: cached decoding == full causal attention", g_ok)
+
+# sliding window: a token outside the window cannot affect the output
+var sw = SlidingWindowAttention(4, 2, 2, 2)
+var sw_a = sw.forward([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.5, 0.5, 0.0, 0.0]])
+var sw_b = sw.forward([[9.0, 9.0, 9.0, 9.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.5, 0.5, 0.0, 0.0]])
+assert_true("SWA: token 0 is outside token 3's window", sw_a[3].allclose(sw_b[3], 0.0, 0.000000001))
+assert_true("SWA: token 1 sees token 0", not sw_a[1].allclose(sw_b[1]))
+
+# LLM decoder: the incremental (KV-cached) logits equal a full recompute
+var dec = LLMDecoder(24, 8, 2, 2, 1, 16, 32)
+var full_logits = dec.forward_all([4, 7, 1, 9])
+dec.forward([4, 7, 1], 0)
+var inc = dec.forward([4, 7, 1, 9], 3)
+assert_true("LLMDecoder: cached step == full recompute", inc.allclose(full_logits[3], 0.0, 0.00000001))
+assert_true("LLMDecoder: forward from 0 == last row of forward_all", dec.forward([4, 7, 1, 9], 0).allclose(full_logits[3], 0.0, 0.00000001))
+var greedy_a = dec.generate([4, 7], 3, 1.0, 0)
+var greedy_b = dec.generate([4, 7], 3, 1.0, 0)
+assert_eq("LLMDecoder greedy decoding is reproducible", greedy_a, greedy_b)
+
+# VQ: the chosen code is the nearest one, and eval mode leaves the codebook alone
+var vq3 = VectorQuantizer2(5, 2, 0.25, 0.9)
+vq3.eval()
+var vz = Tensor([0.3, -0.1])
+var vr = vq3.quantize(vz)
+var best_d = 1e30
+var best_k = -1
+for k in range(0, 5):
+    var dk = (vq3.get_embedding(k) - vz).square().sum().item()
+    if dk < best_d:
+        best_d = dk
+        best_k = k
+assert_eq("VQ picks the nearest codeword", vr["index"], best_k)
+assert_true("VQ codebook loss is that squared distance", abs(vr["codebook_loss"] - best_d) < 0.000000001)
+assert_true("VQ z_q equals the codeword", vr["z_q"].allclose(vq3.get_embedding(best_k), 0.0, 0.000000001))
+
+# reward model learns a consistent preference
+torch.manual_seed(3)
+var rm2 = RewardModel(4, 8)
+var good = [[1.0, 0.2, 0.0, 0.1], [0.9, -0.1, 0.3, 0.0], [1.2, 0.0, -0.2, 0.2]]
+var bad = [[-1.0, 0.1, 0.0, 0.2], [-0.8, 0.2, 0.1, -0.1], [-1.1, -0.2, 0.3, 0.0]]
+var first_l = rm2.train_step(good, bad, 0.05)
+var last_l = first_l
+for i in range(0, 40):
+    last_l = rm2.train_step(good, bad, 0.05)
+assert_true("RewardModel: pairwise loss falls", last_l < first_l * 0.5)
+assert_true("RewardModel ranks every pair correctly after training", rm2.evaluate_win_rate() == 1.0)
+
+# DiT depends on the class and the timestep
+var dit2 = DiffusionTransformer(8, 2, 8, 2, 1, 3, 8)
+var dx = Tensor([0.1, -0.2, 0.3, 0.4, -0.5, 0.6, 0.7, -0.8])
+assert_true("DiT: same input, same output", dit2.forward(dx, 10, 1).allclose(dit2.forward(dx, 10, 1)))
+assert_true("DiT: the class changes the prediction", not dit2.forward(dx, 10, 1).allclose(dit2.forward(dx, 10, 2)))
+assert_true("DiT: the timestep changes the prediction", not dit2.forward(dx, 10, 1).allclose(dit2.forward(dx, 400, 1)))
+
 print ""
 print "Results: " + str(passed) + " passed, " + str(failed) + " failed"
 if failed == 0:

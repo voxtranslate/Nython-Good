@@ -1,221 +1,239 @@
-# import nytorch
+# ─── nytorch: parameter-efficient layers, mixture of experts, state space
+# models, value/policy-gradient agents and graph convolution ───────────────
+# All Modules on the Tensor autograd engine. (GraphSAGE, GATLayer and
+# DDPMScheduler live in reinforcement.ny / sequence.ny.)
 
 import "lib/nytorch/core.ny"
 
 class UniformDist:
     def init(self, low, high):
-        self.low  = low
+        if high <= low:
+            raise ValueError("UniformDist needs low < high")
+        self.low = low
         self.high = high
     def sample(self, n):
-        var u   = rand_tensor(n)
-        var lo  = self.low
-        var hi  = self.high
-        var out = Tensor([0.0])
-        out = Tensor(tensor_apply(u, lambda v: lo + (hi - lo) * v))
-        return out
+        return Tensor(nt_uniform(n, self.low, self.high))
     def log_prob(self, x):
         if x < self.low or x > self.high:
-            return -999999.0
-        return -log(self.high - self.low)
+            return nt_unary("log", [0.0])[0]
+        return 0.0 - log(self.high - self.low)
 
 
 # ---------------------------------------------
 # SECTION 15: PARAMETER-EFFICIENT METHODS
 # ---------------------------------------------
 
-class LoRALayer:
-    # Low-Rank Adaptation - trains A,B with rank << full weight
-    def init(self, in_dim, out_dim, rank, alpha):
-        self.in_dim  = in_dim
+# LoRA (Hu et al. 2021): y = base(x) + (alpha / r) x A^T B^T with the base
+# weights frozen; A (r, in) starts random, B (out, r) at zero, so training
+# starts from the base model exactly.
+class LoRALayer(Module):
+    def __init__(self, in_dim, out_dim, rank, alpha):
+        super().__init__()
+        self.in_dim = in_dim
         self.out_dim = out_dim
-        self.rank    = rank
-        self.scale   = float(alpha) / float(rank)
-        self.A       = tensor_scale(randn_tensor(in_dim * rank), 0.02)
-        self.B       = zeros(rank * out_dim)
-        self.base    = Linear(in_dim, out_dim)
+        self.rank = rank
+        self.scale = float(alpha) / float(rank)
+        self.base = Linear(in_dim, out_dim)
+        self.base.requires_grad_(false)
+        self.A = _l_uniform([rank, in_dim], 1.0 / sqrt(1.0 * in_dim))
+        self.B = _l_const([out_dim, rank], 0.0)
     def forward(self, x):
-        var base_out = self.base.forward(x)
-        var xA   = matmul(x.data, self.A, 1, self.in_dim, self.rank)
-        var xAB  = matmul(xA, self.B, 1, self.rank, self.out_dim)
-        var out  = Tensor([0.0])
-        out = Tensor(tensor_add(base_out.data, tensor_scale(xAB, self.scale)))
-        return out
+        var t = _t_wrap(x)
+        return self.base.forward(t) + _fn_linear(_fn_linear(t, self.A, none), self.B, none) * self.scale
     def lora_params(self):
         return [self.A, self.B]
+    # the equivalent single weight W + (alpha / r) B A
+    def merged_weight(self):
+        return self.base.weight.detach() + self.B.detach().matmul(self.A.detach()) * self.scale
 
-class QuantizedLinear:
-    # Simulated INT8 quantization of a Linear layer
-    def init(self, in_dim, out_dim, bits):
-        self.in_dim    = in_dim
-        self.out_dim   = out_dim
-        self.bits      = bits
-        self.n_levels  = float(2 ** bits - 1)
-        self.base      = Linear(in_dim, out_dim)
-        self.w_min     = 0.0
-        self.w_max     = 1.0
+# Uniform affine fake quantisation of the weights to 2^bits levels, with a
+# straight-through estimator so gradients reach the float weights.
+class QuantizedLinear(Module):
+    def __init__(self, in_dim, out_dim, bits):
+        super().__init__()
+        if bits < 1 or bits > 16:
+            raise ValueError("QuantizedLinear bits must be in 1..16, got " + str(bits))
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.bits = bits
+        self.n_levels = float(2 ** bits - 1)
+        self.base = Linear(in_dim, out_dim)
+        self.w_min = 0.0
+        self.w_max = 0.0
         self.calibrated = false
     def calibrate(self):
-        self.w_min      = tensor_min(self.base.weights)
-        self.w_max      = tensor_max(self.base.weights)
+        var w = self.base.weight
+        self.w_min = w.min().item()
+        self.w_max = w.max().item()
         self.calibrated = true
-    def forward(self, x):
+    def quantized_weight(self):
         if not self.calibrated:
             self.calibrate()
-        var rng   = self.w_max - self.w_min
-        var scale = rng / self.n_levels
+        var scale = (self.w_max - self.w_min) / self.n_levels
         if scale < 0.000000001:
-            var scale = 0.000000001
-        var w     = self.base.weights
-        var wmin  = self.w_min
-        var shift = tensor_scale(ones(len(w)), -wmin)
-        var q_w   = tensor_add(tensor_scale(tensor_apply(tensor_scale(tensor_add(w, shift), 1.0 / scale), lambda v: float(int(v + 0.5))), scale), tensor_scale(ones(len(w)), wmin))
-        var out   = Tensor([0.0])
-        out = Tensor(tensor_add(matmul(x.data, q_w, 1, self.in_dim, self.out_dim), self.base.bias))
-        return out
-
-class SpectralNorm:
-    # Weight spectral normalization via power iteration (Miyato 2018)
-    def init(self, linear_layer, n_iter):
-        self.layer  = linear_layer
-        self.n_iter = n_iter
-        self.u      = tensor_normalize(randn_tensor(linear_layer.out_dim))
-        self.v      = tensor_normalize(randn_tensor(linear_layer.in_dim))
-    def sigma(self):
-        var W  = self.layer.weights
-        var ii = 0
-        while ii < self.n_iter:
-            var Wtu = matmul(self.u, W, 1, self.layer.out_dim, self.layer.in_dim)
-            self.v  = tensor_normalize(Wtu)
-            var Wv  = matmul(self.v, W, 1, self.layer.in_dim, self.layer.out_dim)
-            self.u  = tensor_normalize(Wv)
-            var ii = ii + 1
-        var Wv = matmul(self.v, W, 1, self.layer.in_dim, self.layer.out_dim)
-        return tensor_dot(self.u, Wv)
+            scale = 0.000000001
+        var w = self.base.weight
+        var q = ((w.detach() - self.w_min) * (1.0 / scale)).round().clamp(0.0, self.n_levels) * scale + self.w_min
+        return w + (q - w.detach())
     def forward(self, x):
-        var sig  = max(0.000000001, self.sigma())
-        var W_sn = tensor_scale(self.layer.weights, 1.0 / sig)
-        var out  = Tensor([0.0])
-        out = Tensor(tensor_add(matmul(x.data, W_sn, 1, self.layer.in_dim, self.layer.out_dim), self.layer.bias))
-        return out
+        return _fn_linear(_t_wrap(x), self.quantized_weight(), self.base.bias)
+
+# Spectral normalisation (Miyato et al. 2018): W / sigma_max(W), sigma from
+# power iteration with persistent vectors u, v.
+class SpectralNorm(Module):
+    def __init__(self, linear_layer, n_iter):
+        super().__init__()
+        self.layer = linear_layer
+        self.n_iter = n_iter
+        var u = Tensor(nt_randn(linear_layer.weight.shape[0]))
+        var v = Tensor(nt_randn(linear_layer.weight.shape[1]))
+        self.u = u.div(u.norm()).data
+        self.v = v.div(v.norm()).data
+    def sigma(self):
+        var W = self.layer.weight.detach()
+        var u = Tensor(self.u)
+        var v = Tensor(self.v)
+        var i = 0
+        while i < self.n_iter:
+            v = W.t().mv(u)
+            v = v.div(v.norm())
+            u = W.mv(v)
+            u = u.div(u.norm())
+            i = i + 1
+        self.u = u.data
+        self.v = v.data
+        return u.dot(W.mv(v)).item()
+    def forward(self, x):
+        var sig = self.sigma()
+        if sig < 0.000000001:
+            sig = 0.000000001
+        return _fn_linear(_t_wrap(x), self.layer.weight * (1.0 / sig), self.layer.bias)
 
 
 # ---------------------------------------------
 # SECTION 16: MIXTURE OF EXPERTS
 # ---------------------------------------------
 
-class Expert:
-    def init(self, in_dim, hidden_dim, out_dim):
-        self.l1  = Linear(in_dim, hidden_dim)
-        self.l2  = Linear(hidden_dim, out_dim)
-        self.act = GeLULayer()
+class Expert(Module):
+    def __init__(self, in_dim, hidden_dim, out_dim):
+        super().__init__()
+        self.l1 = Linear(in_dim, hidden_dim)
+        self.l2 = Linear(hidden_dim, out_dim)
     def forward(self, x):
-        var h1 = self.l1.forward(x)
-        var h2 = self.act.forward(h1)
-        return self.l2.forward(h2)
+        return self.l2.forward(self.l1.forward(x).gelu())
 
-class MixtureOfExperts:
-    def init(self, num_experts, in_dim, hidden_dim, out_dim, top_k):
+# Sparse top-k mixture (Shazeer et al. 2017): gate probabilities p, the k
+# largest renormalised, output sum_k p_k / sum p * expert_k(x). Only the
+# chosen experts run. last_gate holds the gate probabilities.
+class MixtureOfExperts(Module):
+    def __init__(self, num_experts, in_dim, hidden_dim, out_dim, top_k):
+        super().__init__()
+        if top_k < 1 or top_k > num_experts:
+            raise ValueError("top_k must be in 1.." + str(num_experts))
         self.num_experts = num_experts
-        self.top_k       = top_k
-        self.in_dim      = in_dim
-        self.out_dim     = out_dim
-        self.gate        = Linear(in_dim, num_experts)
-        self.experts     = []
+        self.top_k = top_k
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.gate = Linear(in_dim, num_experts)
+        self.experts = []
         var i = 0
         while i < num_experts:
             self.experts.append(Expert(in_dim, hidden_dim, out_dim))
-            var i = i + 1
-    def forward(self, x):
-        var logits = self.gate.forward(x)
-        var probs  = softmax(logits.data)
-        var used   = zeros(self.num_experts)
-        var sel    = []
-        var k = 0
-        while k < self.top_k:
-            var best = -1
-            var bv   = -999999.0
-            var j = 0
-            while j < self.num_experts:
-                if used[j] == 0.0 and probs[j] > bv:
-                    var bv = probs[j]
-                    var best = j
-                var j = j + 1
-            sel.append(best)
-            used[best] = 1.0
-            var k = k + 1
-        var total_w = 0.0
-        var ki = 0
-        while ki < self.top_k:
-            var total_w = total_w + probs[sel[ki]]
-            var ki = ki + 1
-        var result = zeros(self.out_dim)
-        var ki2 = 0
-        while ki2 < self.top_k:
-            var eid    = sel[ki2]
-            var w      = probs[eid] / (total_w + 0.000000001)
-            var eout   = self.experts[eid].forward(x)
-            var result = tensor_add(result, tensor_scale(eout.data, w))
-            var ki2 = ki2 + 1
-        var out = Tensor([0.0])
-        out = Tensor(result)
+            i = i + 1
+        self.last_gate = none
+        self.expert_counts = nt_full([num_experts], 0.0)
+    def _one(self, x):
+        var probs = self.gate.forward(x).softmax(0)
+        self.last_gate = probs.detach()
+        var top = tensor_topk(_t_flat(probs.data), self.top_k)
+        var idx = []
+        var i = 0
+        while i < len(top):
+            idx.append(top[i]["index"])
+            i = i + 1
+        var w = probs.index_select(0, idx)
+        w = w.div(w.sum())
+        var out = none
+        i = 0
+        while i < len(idx):
+            var y = self.experts[idx[i]].forward(x) * w.select(0, i)
+            self.expert_counts[idx[i]] = self.expert_counts[idx[i]] + 1.0
+            if out == none:
+                out = y
+            else:
+                out = out + y
+            i = i + 1
         return out
+    # x (in_dim,) or (B, in_dim)
+    def forward(self, x):
+        var t = _t_wrap(x)
+        if t.dim() == 1:
+            return self._one(t)
+        var rows = []
+        var b = 0
+        while b < t.size()[0]:
+            rows.append(self._one(t.select(0, b)))
+            b = b + 1
+        return _t_stack(rows, 0)
 
 
 # ---------------------------------------------
 # SECTION 17: STATE SPACE MODELS
 # ---------------------------------------------
 
-class S4Layer:
-    # Simplified Structured State Space (S4 / Mamba-inspired)
-    def init(self, d_model, state_dim):
-        self.d_model   = d_model
+# Diagonal state space layer (S4D, Gu et al. 2022), zero-order hold:
+#   A_bar = exp(dt A),  B_bar = (A_bar - 1) / A * B,
+#   h_t = A_bar h_(t-1) + B_bar x_t,  y_t = C h_t + D x_t
+class S4Layer(Module):
+    def __init__(self, d_model, state_dim):
+        super().__init__()
+        self.d_model = d_model
         self.state_dim = state_dim
-        self.A_diag    = tensor_add(tensor_scale(ones(state_dim), -0.5), tensor_scale(randn_tensor(state_dim), 0.01))
-        self.B         = tensor_scale(randn_tensor(state_dim * d_model), 0.1)
-        self.C         = tensor_scale(randn_tensor(d_model * state_dim), 0.1)
-        self.D         = ones(d_model)
-        self.delta     = tensor_scale(ones(d_model), 0.01)
+        var a = []
+        var n = 0
+        while n < state_dim:
+            a.append(log(0.5 + float(n)))
+            n = n + 1
+        self.A_log = Parameter(Tensor(a))
+        self.B = _l_uniform([state_dim, d_model], 1.0 / sqrt(1.0 * d_model))
+        self.C = _l_uniform([d_model, state_dim], 1.0 / sqrt(1.0 * state_dim))
+        self.D = _l_const([d_model], 1.0)
+        self.log_dt = _l_const([1], log(0.01))
+    # a list of (d_model,) vectors or (L, d_model) -> list of (d_model,) outputs
     def forward(self, sequence):
-        var h    = zeros(self.state_dim)
-        var d    = tensor_mean(self.delta)
-        var A_bar = tensor_apply(tensor_scale(self.A_diag, d), lambda v: 2.71828182845904 ** v)
+        var A = self.A_log.exp().neg()
+        var dA = (A * self.log_dt.exp()).exp()
+        var dB = (dA - 1.0).div(A).unsqueeze(1) * self.B
+        var h = Tensor(nt_full([self.state_dim], 0.0))
         var outputs = []
-        for x in sequence:
-            var Bx  = matmul(x.data, self.B, 1, self.d_model, self.state_dim)
-            var h = tensor_add(tensor_mul(A_bar, h), Bx)
-            var Ch  = matmul(h, self.C, 1, self.state_dim, self.d_model)
-            var y   = Tensor([0.0])
-            y = Tensor(tensor_add(Ch, tensor_mul(self.D, x.data)))
-            outputs.append(y)
+        var L = len(sequence)
+        var i = 0
+        while i < L:
+            var x = _t_wrap(sequence[i])
+            h = dA * h + dB.mv(x)
+            outputs.append(self.C.mv(h) + self.D * x)
+            i = i + 1
         return outputs
 
-class SimpleMambaBlock:
-    # Selective SSM block (Gu & Dao 2023)
-    def init(self, d_model, state_dim, expand):
-        self.d_model  = d_model
-        self.d_inner  = int(float(d_model) * float(expand))
-        self.in_proj  = Linear(d_model, self.d_inner * 2)
+# A simplified Mamba block (Gu & Dao 2023) over one token: RMSNorm, in_proj
+# to [x, z], the S4 layer on x, SiLU(z) gating, out_proj, residual. (The
+# selective, input-dependent scan is MambaBlock in sequence.ny.)
+class SimpleMambaBlock(Module):
+    def __init__(self, d_model, state_dim, expand):
+        super().__init__()
+        self.d_model = d_model
+        self.d_inner = int(float(d_model) * float(expand))
+        self.in_proj = Linear(d_model, self.d_inner * 2)
         self.out_proj = Linear(self.d_inner, d_model)
-        self.ssm      = S4Layer(self.d_inner, state_dim)
-        self.norm     = RMSNorm(d_model)
+        self.ssm = S4Layer(self.d_inner, state_dim)
+        self.norm = RMSNorm(d_model)
     def forward(self, x):
-        var normed = self.norm.forward(x)
-        var proj   = self.in_proj.forward(normed)
-        var half   = self.d_inner
-        var h_in   = Tensor([0.0])
-        h_in = Tensor(tensor_slice(proj.data, 0, half))
-        var z      = Tensor([0.0])
-        z = Tensor(tensor_slice(proj.data, half, half * 2))
-        var ssm_out = self.ssm.forward([h_in])
-        var h_out   = ssm_out[0]
-        var gate    = Tensor([0.0])
-        gate = Tensor(tensor_apply(z.data, lambda v: silu(v)))
-        var gated   = Tensor([0.0])
-        gated = Tensor(tensor_mul(gate.data, h_out.data))
-        var out     = self.out_proj.forward(gated)
-        var out_f   = Tensor([0.0])
-        out_f = Tensor(tensor_add(x.data, out.data))
-        return out_f
+        var t = _t_wrap(x)
+        var proj = self.in_proj.forward(self.norm.forward(t))
+        var h_in = proj.slice(0, 0, self.d_inner)
+        var z = proj.slice(0, self.d_inner, 2 * self.d_inner)
+        var h_out = self.ssm.forward([h_in])[0]
+        return t + self.out_proj.forward(z.silu() * h_out)
 
 
 # ---------------------------------------------
@@ -225,227 +243,176 @@ class SimpleMambaBlock:
 class RingReplayBuffer:
     def init(self, capacity):
         self.capacity = capacity
-        self.buffer   = []
-        self.pos      = 0
+        self.buffer = []
+        self.pos = 0
     def push(self, state, action, reward, next_state, done):
         if len(self.buffer) < self.capacity:
             self.buffer.append([state, action, reward, next_state, done])
         else:
             self.buffer[self.pos] = [state, action, reward, next_state, done]
         self.pos = (self.pos + 1) % self.capacity
+    # batch_size transitions drawn uniformly with replacement
     def sample(self, batch_size):
-        var n      = len(self.buffer)
-        var rands  = rand_tensor(batch_size)
-        var batch  = []
+        if len(self.buffer) == 0:
+            raise ValueError("cannot sample from an empty replay buffer")
+        var idx = nt_randint(0, len(self.buffer), batch_size)
+        var batch = []
         var i = 0
         while i < batch_size:
-            var idx = int(rands[i] * float(n))
-            if idx >= n:
-                var idx = n - 1
-            batch.append(self.buffer[idx])
-            var i = i + 1
+            batch.append(self.buffer[idx[i]])
+            i = i + 1
         return batch
     def __len__(self):
         return len(self.buffer)
 
+# DQN (Mnih et al. 2015): epsilon-greedy acting, experience replay, and a
+# periodically synchronised target network:
+#   loss = mean (Q(s, a) - (r + gamma (1 - done) max_a' Q_target(s', a')))^2
 class MLPDQNAgent:
     def init(self, state_dim, action_dim, hidden_dim, gamma, epsilon):
-        self.state_dim  = state_dim
+        self.state_dim = state_dim
         self.action_dim = action_dim
-        self.gamma      = gamma
-        self.epsilon    = epsilon
-        self.q_net      = MLP([state_dim, hidden_dim, hidden_dim, action_dim], "relu")
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.q_net = MLP([state_dim, hidden_dim, hidden_dim, action_dim], "relu")
         self.target_net = MLP([state_dim, hidden_dim, hidden_dim, action_dim], "relu")
-        self.buffer     = RingReplayBuffer(10000)
-        self.optimizer  = Adam(0.001, 0.9, 0.999, 0.00000001)
-        self.steps      = 0
+        self.sync_target()
+        self.buffer = RingReplayBuffer(10000)
+        self.optimizer = Adam(self.q_net.parameters(), 0.001)
+        self.steps = 0
+        self.target_every = 100
+    def sync_target(self):
+        self.target_net.load_state_dict(self.q_net.state_dict())
+    def q_values(self, state):
+        var q = none
+        with no_grad():
+            q = self.q_net.forward(Tensor(state))
+        return q.data
     def act(self, state):
-        var r = rand_tensor(1)
-        if r[0] < self.epsilon:
-            var ri = rand_tensor(1)
-            return int(ri[0] * float(self.action_dim))
-        var q_vals = self.q_net.forward(Tensor(state))
-        return tensor_argmax(q_vals.data)
+        if nt_rand(1)[0] < self.epsilon:
+            return nt_randint(0, self.action_dim, 1)[0]
+        return Tensor(self.q_values(state)).argmax().item()
     def remember(self, state, action, reward, next_state, done):
         self.buffer.push(state, action, reward, next_state, done)
+    # one gradient step on a replayed batch; returns the TD loss
+    def update(self, batch_size):
+        if len(self.buffer.buffer) < batch_size:
+            return 0.0
+        var batch = self.buffer.sample(batch_size)
+        var s = []
+        var a = []
+        var y = []
+        var i = 0
+        while i < batch_size:
+            var tr = batch[i]
+            s.append(tr[0])
+            a.append(tr[1])
+            var target = 1.0 * tr[2]
+            if not tr[4]:
+                var qn = none
+                with no_grad():
+                    qn = self.target_net.forward(Tensor(tr[3]))
+                target = target + self.gamma * qn.max().item()
+            y.append(target)
+            i = i + 1
+        var q = self.q_net.forward(Tensor(s))
+        var q_sa = (q * _fn_one_hot(a, self.action_dim)).sum(1)
+        var loss = _fn_mse(q_sa, Tensor(y), "mean")
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        self.steps = self.steps + 1
+        if self.steps % self.target_every == 0:
+            self.sync_target()
+        return loss.item()
     def decay_epsilon(self, decay, min_eps):
         self.epsilon = self.epsilon * decay
         if self.epsilon < min_eps:
             self.epsilon = min_eps
 
+# REINFORCE (Williams 1992) with normalised returns:
+#   loss = -sum_t log pi(a_t | s_t) (G_t - mean G) / std G
 class PolicyGradientAgent:
     def init(self, state_dim, action_dim, hidden_dim, lr, gamma):
-        self.state_dim  = state_dim
+        self.state_dim = state_dim
         self.action_dim = action_dim
-        self.gamma      = gamma
-        self.policy     = MLP([state_dim, hidden_dim, action_dim], "relu")
-        self.optimizer  = Adam(lr, 0.9, 0.999, 0.00000001)
-        self.rewards    = []
+        self.gamma = gamma
+        self.policy = MLP([state_dim, hidden_dim, action_dim], "relu")
+        self.optimizer = Adam(self.policy.parameters(), lr)
+        self.rewards = []
+        self.log_probs = []
     def act(self, state):
-        var logits = self.policy.forward(Tensor(state))
-        var probs  = softmax(logits.data)
-        var r      = rand_tensor(1)[0]
-        var cum    = 0.0
+        var lp = self.policy.forward(Tensor(state)).log_softmax(0)
+        var p = lp.exp().data
+        var u = nt_rand(1)[0]
+        var cum = 0.0
+        var a = self.action_dim - 1
         var i = 0
         while i < self.action_dim:
-            var cum = cum + probs[i]
-            if r <= cum:
-                return i
-            var i = i + 1
-        return self.action_dim - 1
+            cum = cum + p[i]
+            if u <= cum:
+                a = i
+                break
+            i = i + 1
+        self.log_probs.append(lp.select(0, a))
+        return a
     def remember_reward(self, r):
         self.rewards.append(r)
     def returns(self):
-        var G   = []
-        var n   = len(self.rewards)
+        var n = len(self.rewards)
+        var G = nt_full([n], 0.0)
         var cum = 0.0
-        var i   = n - 1
+        var i = n - 1
         while i >= 0:
-            var cum = self.rewards[i] + self.gamma * cum
-            G.append(cum)
-            var i = i - 1
-        var G_rev = []
-        var j = len(G) - 1
-        while j >= 0:
-            G_rev.append(G[j])
-            var j = j - 1
-        return G_rev
+            cum = self.rewards[i] + self.gamma * cum
+            G[i] = cum
+            i = i - 1
+        return G
+    # one policy-gradient step on the finished episode; returns the loss
+    def update(self):
+        var n = len(self.log_probs)
+        if n == 0 or n != len(self.rewards):
+            raise ValueError("update needs one reward per action taken")
+        var G = Tensor(self.returns())
+        if n > 1:
+            G = (G - G.mean()).div(G.std(none, false, 0) + 0.00000001)
+        var lp = _t_stack(self.log_probs, 0)
+        var loss = (lp * G).sum().neg()
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        self.reset_episode()
+        return loss.item()
     def reset_episode(self):
         self.rewards = []
+        self.log_probs = []
 
 
 # ---------------------------------------------
 # SECTION 19: GRAPH NEURAL NETWORKS
 # ---------------------------------------------
 
-class GraphConv:
-    def init(self, in_dim, out_dim):
-        self.in_dim  = in_dim
+# h_v' = W ((h_v + mean_{u in N(v)} h_u) / 2); an isolated node keeps h_v.
+# node_features: a list of N vectors or (N, in_dim); adjacency: neighbour lists
+class GraphConv(Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.in_dim = in_dim
         self.out_dim = out_dim
-        self.W       = Linear(in_dim, out_dim)
+        self.W = Linear(in_dim, out_dim)
     def forward(self, node_features, adjacency):
-        var n   = len(node_features)
-        var out = []
-        var v   = 0
+        var H = node_features
+        if type(H) == "list":
+            H = _t_stack(H, 0)
+        H = _t_wrap(H)
+        var n = H.size()[0]
+        var rows = []
+        var v = 0
         while v < n:
-            var neighbors = adjacency[v]
-            var deg = float(len(neighbors))
-            if deg < 1.0:
-                var deg = 1.0
-            var agg = zeros(self.in_dim)
-            for u in neighbors:
-                var agg = tensor_add(agg, node_features[u].data)
-            agg = tensor_add(tensor_scale(agg, 1.0 / deg), node_features[v].data)
-            agg = tensor_scale(agg, 0.5)
-            out.append(self.W.forward(Tensor(agg)))
-            var v = v + 1
-        return out
-
-class GraphSAGE:
-    # Inductive GraphSAGE (Hamilton et al. 2017) - mean aggregation
-    def init(self, in_dim, out_dim):
-        self.in_dim  = in_dim
-        self.out_dim = out_dim
-        self.W_self  = Linear(in_dim, out_dim)
-        self.W_neigh = Linear(in_dim, out_dim)
-        self.act     = ReLULayer()
-    def forward(self, node_features, adjacency):
-        var n   = len(node_features)
-        var out = []
-        var v   = 0
-        while v < n:
-            var neighbors = adjacency[v]
-            var nb = len(neighbors)
-            var mean_neigh = zeros(self.in_dim)
-            if nb > 0:
-                for u in neighbors:
-                    var mean_neigh = tensor_add(mean_neigh, node_features[u].data)
-                mean_neigh = tensor_scale(mean_neigh, 1.0 / float(nb))
-            var self_part  = self.W_self.forward(node_features[v])
-            var neigh_part = self.W_neigh.forward(Tensor(mean_neigh))
-            var combined   = Tensor([0.0])
-            combined = Tensor(tensor_add(self_part.data, neigh_part.data))
-            out.append(self.act.forward(combined))
-            var v = v + 1
-        return out
-
-class GATLayer:
-    # Graph Attention Network layer (Veličković et al. 2017)
-    def init(self, in_dim, out_dim, num_heads):
-        self.in_dim    = in_dim
-        self.out_dim   = out_dim
-        self.num_heads = num_heads
-        self.W         = Linear(in_dim, out_dim * num_heads)
-        self.a         = tensor_scale(randn_tensor(2 * out_dim), 0.1)
-    def forward(self, node_features, adjacency):
-        var n   = len(node_features)
-        var out = []
-        var v   = 0
-        while v < n:
-            var Wh_v  = self.W.forward(node_features[v])
-            var neighbors = adjacency[v]
-            var attn_sum  = zeros(self.out_dim)
-            var denom     = 0.0
-            for u in neighbors:
-                var Wh_u  = self.W.forward(node_features[u])
-                var concat = tensor_concat(Wh_v.data, Wh_u.data)
-                var e     = tensor_dot(concat, self.a)
-                var alpha = relu(e)
-                var attn_sum = tensor_add(attn_sum, tensor_scale(Wh_u.data, alpha))
-                var denom = denom + alpha
-            if denom > 0.000000001:
-                attn_sum = tensor_scale(attn_sum, 1.0 / denom)
-            var res   = Tensor([0.0])
-            res = Tensor(tensor_apply(attn_sum, lambda v: relu(v)))
-            out.append(res)
-            var v = v + 1
-        return out
-
-
-# ---------------------------------------------
-# SECTION 20: DIFFUSION & GENERATIVE MODELS
-# ---------------------------------------------
-
-class DDPMScheduler:
-    def init(self, T, beta_start, beta_end):
-        self.T          = T
-        self.betas      = []
-        self.alphas     = []
-        self.alpha_bars = []
-        var ab = 1.0
-        var i  = 0
-        while i < T:
-            var beta  = beta_start + (beta_end - beta_start) * float(i) / float(T - 1)
-            var alpha = 1.0 - beta
-            var ab = ab * alpha
-            self.betas.append(beta)
-            self.alphas.append(alpha)
-            self.alpha_bars.append(ab)
-            var i = i + 1
-    def add_noise(self, x0, t):
-        var ab  = self.alpha_bars[t]
-        var nd  = NormalDist(0.0, 1.0)
-        var eps = nd.sample(len(x0.data))
-        var noisy = Tensor([0.0])
-        noisy = Tensor(tensor_add(tensor_scale(x0.data, sqrt(ab)), tensor_scale(eps.data, sqrt(1.0 - ab))))
-        return [noisy, eps]
-    def denoise_step(self, x_t, pred_noise, t):
-        var beta_t  = self.betas[t]
-        var ab_t    = self.alpha_bars[t]
-        var alpha_t = self.alphas[t]
-        var x0_pred = tensor_scale(tensor_sub(x_t.data, tensor_scale(pred_noise.data, sqrt(1.0 - ab_t))), 1.0 / sqrt(ab_t))
-        var ab_prev = self.alpha_bars[t - 1] if t > 0 else 1.0
-        var coef1   = sqrt(ab_t) * beta_t / (1.0 - ab_t)
-        var coef2   = sqrt(alpha_t) * (1.0 - ab_prev) / (1.0 - ab_t)
-        var mean    = tensor_add(tensor_scale(x0_pred, coef1), tensor_scale(x_t.data, coef2))
-        if t == 0:
-            var out = Tensor([0.0])
-            out = Tensor(mean)
-            return out
-        var sigma = sqrt(beta_t * (1.0 - ab_prev) / (1.0 - ab_t))
-        var nd    = NormalDist(0.0, sigma)
-        var z     = nd.sample(len(mean))
-        var out   = Tensor([0.0])
-        out = Tensor(tensor_add(mean, z.data))
-        return out
-
+            var nb = adjacency[v]
+            if len(nb) == 0:
+                rows.append(H.select(0, v))
+            else:
+                rows.append((H.select(0, v) + H.index_select(0, nb).mean(0)) * 0.5)
+            v = v + 1
+        return self.W.forward(_t_stack(rows, 0))
