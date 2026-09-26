@@ -1513,7 +1513,7 @@ class Window:
     def step(self, callback):
         if not self.running:
             return false
-        var t_start = time_ms()
+        var t_start = gui_ticks()
         var events = none
         if self._painted:
             events = gui_poll_events(self._handle)
@@ -1565,7 +1565,7 @@ class Window:
             self.frames = self.frames + 1
             # Sleep only the time left in this frame's budget: the real period
             # is max(work, frame_ms), not work + frame_ms.
-            var remain = int(1000 / self.fps) - int(time_ms() - t_start)
+            var remain = int(1000 / self.fps) - (gui_ticks() - t_start)
             if remain > 0:
                 thread_sleep(remain)
         self._painted = painted
@@ -3490,7 +3490,7 @@ class Toast:
         self.message = message
         self.type = type_name
         self.duration_ms = duration_ms
-        self.created_at = time_ms()
+        self.created_at = gui_ticks()
         self.visible = true
         self.x = 0
         self.y = 0
@@ -3500,7 +3500,7 @@ class Toast:
         self._font = Font("sans-serif", 13, false, false)
 
     def is_expired(self):
-        return time_ms() - self.created_at > self.duration_ms
+        return gui_ticks() - self.created_at > self.duration_ms
 
     def _get_color(self):
         if self.type == "success": return self.theme.success
@@ -3584,6 +3584,7 @@ class ToastManager:
 
 class VideoPlayer:
     def __init__(self, x, y, w, h):
+        self._play_pts = [0, 0, 0, 0, 0, 0]
         self.rect = Rect(x, y, w, h)
         self.path = ""
         self._handle = none
@@ -3650,10 +3651,16 @@ class VideoPlayer:
             var cx = self.rect.center_x()
             var cy = self.rect.center_y()
             renderer.fill_circle(cx, cy, 32, _GC_0_0_0_140)
-            var pts = []
-            pts[0] = [cx - 10, cy - 18]
-            pts[1] = [cx + 18, cy]
-            pts[2] = [cx - 10, cy + 18]
+            # The play triangle, in a list reused every frame. (It was built
+            # as pts[0] = ... on an EMPTY list, the dict-style append that
+            # does not append.)
+            var pts = self._play_pts
+            pts[0] = cx - 10
+            pts[1] = cy - 18
+            pts[2] = cx + 18
+            pts[3] = cy
+            pts[4] = cx - 10
+            pts[5] = cy + 18
             renderer.fill_polygon(pts, 3, _GC_255_255_255_220)
 
     def handle_event(self, event):
@@ -4418,6 +4425,16 @@ class TextArea:
         self.enabled = true
         self.readonly = false
         self.id = ""
+        self.pad = 10
+        self.tab_spaces = "    "
+        # Caret: line and column, the column in CHARACTERS (UTF-8 safe).
+        self.line = 0
+        self.col = 0
+        self._want_col = -1         # column kept while moving up/down
+        # The value split into lines, redone only when the value changes
+        # (it was split on every frame).
+        self._lines = [""]
+        self._lines_src = ""
         self._eh_counts = {}
         self._event_handlers = {}
 
@@ -4440,8 +4457,20 @@ class TextArea:
                 h(event)
             i = i + 1
 
+    # ── model ────────────────────────────────────────────────────────────
+    def lines(self):
+        if self._lines_src != self.value or len(self._lines) == 0:
+            self._lines = self.value.split("\n")
+            if len(self._lines) == 0:
+                self._lines = [""]
+            self._lines_src = self.value
+        return self._lines
+
     def set_value(self, text):
         self.value = text
+        var ls = self.lines()
+        self.line = len(ls) - 1
+        self.col = len(ls[self.line])
         return self
 
     def append(self, text):
@@ -4452,39 +4481,263 @@ class TextArea:
     def clear(self):
         self.value = ""
         self.scroll_y = 0
+        self.line = 0
+        self.col = 0
         return self
 
     def line_count(self):
-        return len(self.value.split("\n"))
+        return len(self.lines())
 
+    def _clamp_caret(self):
+        var ls = self.lines()
+        if self.line >= len(ls):
+            self.line = len(ls) - 1
+        if self.line < 0:
+            self.line = 0
+        var n = len(ls[self.line])
+        if self.col > n:
+            self.col = n
+        if self.col < 0:
+            self.col = 0
+
+    def _set_lines(self, ls):
+        self.value = "\n".join(ls)
+        self._lines = ls
+        self._lines_src = self.value
+
+    def _changed(self):
+        self._want_col = -1
+        var ev = Event("input")
+        ev.target = self
+        ev.text = self.value
+        self.emit(ev)
+
+    # Inserts text (may contain newlines) at the caret.
+    def insert(self, s):
+        if self.readonly or len(self.value) + len(s) > self.max_length:
+            return self
+        self._clamp_caret()
+        var ls = self.lines()
+        var cur = ls[self.line]
+        var before = string_slice(cur, 0, self.col)
+        var after = string_slice(cur, self.col, len(cur))
+        var parts = s.split("\n")
+        var out = []
+        var i = 0
+        while i < self.line:
+            out.append(ls[i])
+            i = i + 1
+        if len(parts) == 1:
+            out.append(before + s + after)
+            self.col = self.col + len(s)
+        else:
+            out.append(before + parts[0])
+            var k = 1
+            while k < len(parts) - 1:
+                out.append(parts[k])
+                k = k + 1
+            var last = parts[len(parts) - 1]
+            out.append(last + after)
+            self.line = self.line + len(parts) - 1
+            self.col = len(last)
+        i = self.line - len(parts) + 2
+        while i < len(ls):
+            out.append(ls[i])
+            i = i + 1
+        self._set_lines(out)
+        self._changed()
+        return self
+
+    def _backspace(self):
+        self._clamp_caret()
+        var ls = self.lines()
+        if self.col > 0:
+            var cur = ls[self.line]
+            ls[self.line] = string_slice(cur, 0, self.col - 1) + string_slice(cur, self.col, len(cur))
+            self.col = self.col - 1
+            self._set_lines(ls)
+        elif self.line > 0:
+            var out = []
+            var i = 0
+            while i < len(ls):
+                if i == self.line - 1:
+                    out.append(ls[i] + ls[i + 1])
+                elif i != self.line:
+                    out.append(ls[i])
+                i = i + 1
+            self.col = len(ls[self.line - 1])
+            self.line = self.line - 1
+            self._set_lines(out)
+        self._changed()
+
+    def _delete(self):
+        self._clamp_caret()
+        var ls = self.lines()
+        var cur = ls[self.line]
+        if self.col < len(cur):
+            ls[self.line] = string_slice(cur, 0, self.col) + string_slice(cur, self.col + 1, len(cur))
+            self._set_lines(ls)
+        elif self.line < len(ls) - 1:
+            var out = []
+            var i = 0
+            while i < len(ls):
+                if i == self.line:
+                    out.append(ls[i] + ls[i + 1])
+                elif i != self.line + 1:
+                    out.append(ls[i])
+                i = i + 1
+            self._set_lines(out)
+        self._changed()
+
+    def _visible_rows(self):
+        var n = int((self.rect.h - self.pad) / self.line_height)
+        if n < 1:
+            n = 1
+        return n
+
+    def max_scroll(self):
+        var m = self.line_count() * self.line_height + self.pad * 2 - self.rect.h
+        if m < 0:
+            return 0
+        return m
+
+    def _clamp_scroll(self):
+        if self.scroll_y > self.max_scroll():
+            self.scroll_y = self.max_scroll()
+        if self.scroll_y < 0:
+            self.scroll_y = 0
+
+    def _scroll_to_caret(self):
+        var top = self.line * self.line_height
+        if top < self.scroll_y:
+            self.scroll_y = top
+        var bottom = top + self.line_height + self.pad * 2
+        if bottom > self.scroll_y + self.rect.h:
+            self.scroll_y = bottom - self.rect.h
+        self._clamp_scroll()
+
+    # Caret position for a click at window (x, y).
+    def _caret_at(self, x, y):
+        var ls = self.lines()
+        var ln = int((y - self.rect.y - self.pad + self.scroll_y) / self.line_height)
+        if ln < 0:
+            ln = 0
+        if ln >= len(ls):
+            ln = len(ls) - 1
+        var s = ls[ln]
+        var rel = x - self.rect.x - self.pad
+        var c = 0
+        var prev = 0
+        var n = len(s)
+        while c < n:
+            var w = self.font.width(string_slice(s, 0, c + 1))
+            if rel < (prev + w) / 2:
+                return [ln, c]
+            prev = w
+            c = c + 1
+        return [ln, n]
+
+    def _vertical(self, d):
+        if self._want_col < 0:
+            self._want_col = self.col
+        self.line = self.line + d
+        self._clamp_caret_keep()
+
+    def _clamp_caret_keep(self):
+        var want = self._want_col
+        self._clamp_caret()
+        var n = len(self.lines()[self.line])
+        if want >= 0:
+            self.col = want
+            if self.col > n:
+                self.col = n
+
+    # ── input ────────────────────────────────────────────────────────────
     def handle_event(self, event):
         if not self.visible or not self.enabled:
             return
-        if event.type == "mousedown":
+        var t = event.type
+        if t == "mousedown":
             self.focused = self.rect.contains(event.x, event.y)
-        elif event.type == "keydown" and self.focused and not self.readonly:
-            if event.key == "backspace":
-                if len(self.value) > 0:
-                    self.value = self.value[0:len(self.value)-1]
-                    var ev = Event("input")
-                    ev.target = self
-                    self.emit(ev)
-            elif event.key == "enter":
-                if len(self.value) < self.max_length:
-                    self.value = self.value + "\n"
-                    var ev = Event("input")
-                    ev.target = self
-                    self.emit(ev)
-        elif event.type == "textinput" and self.focused and not self.readonly:
-            if len(self.value) < self.max_length:
-                self.value = self.value + event.text
-                var ev = Event("input")
-                ev.target = self
-                self.emit(ev)
-        elif event.type == "scroll" and self.rect.contains(event.x, event.y):
+            if self.focused:
+                var p = self._caret_at(event.x, event.y)
+                self.line = p[0]
+                self.col = p[1]
+                self._want_col = -1
+                event.consume()
+            return
+        if t == "mousemove":
+            self.hovered = self.rect.contains(event.x, event.y)
+            return
+        if t == "scroll" and self.rect.contains(event.x, event.y):
             self.scroll_y = self.scroll_y - event.delta * self.line_height
-            if self.scroll_y < 0:
-                self.scroll_y = 0
+            self._clamp_scroll()
+            event.consume()
+            return
+        if not self.focused:
+            return
+        if t == "textinput":
+            if not self.readonly:
+                self.insert(event.text)
+                self._scroll_to_caret()
+            event.consume()
+            return
+        if t != "keydown":
+            return
+        var k = event.key
+        var ls = self.lines()
+        var handled = true
+        if k == "left":
+            if self.col > 0:
+                self.col = self.col - 1
+            elif self.line > 0:
+                self.line = self.line - 1
+                self.col = len(ls[self.line])
+            self._want_col = -1
+        elif k == "right":
+            if self.col < len(ls[self.line]):
+                self.col = self.col + 1
+            elif self.line < len(ls) - 1:
+                self.line = self.line + 1
+                self.col = 0
+            self._want_col = -1
+        elif k == "up":
+            self._vertical(-1)
+        elif k == "down":
+            self._vertical(1)
+        elif k == "pageup":
+            self._vertical(-self._visible_rows())
+        elif k == "pagedown":
+            self._vertical(self._visible_rows())
+        elif k == "home":
+            self.col = 0
+            if event.ctrl or event.meta:
+                self.line = 0
+            self._want_col = -1
+        elif k == "end":
+            if event.ctrl or event.meta:
+                self.line = len(ls) - 1
+            self.col = len(ls[self.line])
+            self._want_col = -1
+        elif self.readonly:
+            handled = false
+        elif k == "enter":
+            self.insert("\n")
+        elif k == "backspace":
+            self._backspace()
+        elif k == "delete":
+            self._delete()
+        elif k == "tab":
+            self.insert(self.tab_spaces)
+        elif (event.ctrl or event.meta) and k == "v":
+            var clip = gui_get_clipboard()
+            if clip != none and clip != "":
+                self.insert(clip)
+        else:
+            handled = false
+        if handled:
+            self._scroll_to_caret()
+            event.consume()
 
     def _draw(self, renderer):
         var bg = self.theme.surface
@@ -4493,18 +4746,27 @@ class TextArea:
             border = self.theme.accent
         renderer.fill_rounded_rect(self.rect, bg, self.theme.radius)
         renderer.draw_rounded_rect(self.rect, border, self.theme.radius, 1)
-        renderer.clip_xywh(self.rect.x + 2, self.rect.y + 2, self.rect.w - 4, self.rect.h - 4)
+        renderer.push_clip(self.rect.x + 2, self.rect.y + 2, self.rect.w - 4, self.rect.h - 4)
+        var tx = self.rect.x + self.pad
         if self.value == "":
-            renderer.draw_text(self.placeholder, self.rect.x + 10, self.rect.y + 10, self.font, self.theme.text_secondary)
+            renderer.draw_text(self.placeholder, tx, self.rect.y + self.pad, self.font, self.theme.text_secondary)
         else:
-            var lines = self.value.split("\n")
-            var i = 0
-            while i < len(lines):
-                var ty = self.rect.y + 10 + i * self.line_height - self.scroll_y
-                if ty >= self.rect.y and ty < self.rect.bottom():
-                    renderer.draw_text(lines[i], self.rect.x + 10, ty, self.font, self.theme.text)
+            # Only the rows on screen are drawn.
+            var ls = self.lines()
+            var first = int(self.scroll_y / self.line_height)
+            var i = first
+            var last = first + self._visible_rows() + 1
+            while i < len(ls) and i <= last:
+                var ty = self.rect.y + self.pad + i * self.line_height - self.scroll_y
+                renderer.draw_text(ls[i], tx, ty, self.font, self.theme.text)
                 i = i + 1
-        renderer.clear_clip()
+        if self.focused:
+            self._clamp_caret()
+            var cur = self.lines()[self.line]
+            var cx = tx + self.font.width(string_slice(cur, 0, self.col))
+            var cy = self.rect.y + self.pad + self.line * self.line_height - self.scroll_y
+            renderer.fill_xywh(cx, cy, 1, self.line_height - 2, self.theme.accent)
+        renderer.pop_clip()
 
     def draw(self, renderer):
         if self.visible:
@@ -4773,7 +5035,7 @@ class Tooltip:
 
     # Shows a pending tip once its delay has passed; draw() calls it.
     def update(self):
-        if self._pending and time_ms() - self._timer >= self.delay_ms:
+        if self._pending and gui_ticks() - self._timer >= self.delay_ms:
             self.show_at(self.x, self.y + 36)
 
     # Never consumes: a tooltip only watches the pointer.
@@ -4784,7 +5046,7 @@ class Tooltip:
             if self._target_rect.contains(event.x, event.y):
                 if not self.visible and not self._pending:
                     self._pending = true
-                    self._timer = time_ms()
+                    self._timer = gui_ticks()
                     self.x = event.x
                     self.y = event.y - 36
             elif self.visible or self._pending:
@@ -7820,7 +8082,7 @@ class Notification:
         self.body = body
         self.type = type_name
         self.duration_ms = duration_ms
-        self.created_at = time_ms()
+        self.created_at = gui_ticks()
         self.read = false
         self.dismissed = false
         self.id = "ntf_" + str(int(time_ms()))
@@ -7830,7 +8092,7 @@ class Notification:
     def is_expired(self):
         if self.duration_ms <= 0:
             return false
-        return (time_ms() - self.created_at) > float(self.duration_ms)
+        return (gui_ticks() - self.created_at) > self.duration_ms
 
     def dismiss(self):
         self.dismissed = true
@@ -8508,6 +8770,7 @@ class FloatingActionButton:
 
 class ColorPicker:
     def __init__(self, x, y, size):
+        self._hues = [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875]
         self.x = x
         self.y = y
         self.size = size
@@ -8682,7 +8945,7 @@ class ColorPicker:
         renderer.fill_circle(cx, cy, 4, self.get_color())
         # Hue rainbow strip (8 segments)
         var seg_w = int(hr.w / 8)
-        var hues = [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875]
+        var hues = self._hues
         var hi = 0
         while hi < 8:
             var seg_c = self._hsv_to_rgb(hues[hi], 1.0, 1.0)
@@ -9279,6 +9542,8 @@ class Gauge:
 
 class CalendarWidget:
     def __init__(self, x, y, w, h):
+        self._month_names = ["", "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+        self._day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
         self.rect = Rect(x, y, w, h)
         self.year = 2025
         self.month = 1
@@ -9407,8 +9672,8 @@ class CalendarWidget:
                             event.consume()
 
     def _draw(self, renderer):
-        var month_names = ["", "January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
-        var day_names = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        var month_names = self._month_names
+        var day_names = self._day_names
         # Background
         renderer.draw_shadow(self.rect, 20, 0, 6, _GC_0_0_0_60)
         renderer.fill_rounded_rect(self.rect, self.theme.surface, 16)
@@ -15532,6 +15797,9 @@ class WatchEntry:
 
 class DebugPanel:
     def __init__(self, x, y, w, h):
+        self._dbg_icons = ["v", ">>", ">", "[]"]
+        self._dbg_tips = ["Step Into", "Step Over", "Continue", "Stop"]
+        self._dbg_cols = none
         self.rect = Rect(x, y, w, h)
         self.breakpoints = []
         self.bp_count = 0
@@ -15656,9 +15924,11 @@ class DebugPanel:
                 renderer.draw_text(self.tabs[ti], tx + 8, self.rect.y + 9, self.font_ui, _GC_100_102_140_160)
             renderer.draw_line(tx + tw - 1, self.rect.y + 6, tx + tw - 1, self.rect.y + tab_h - 6, self.border, 1)
             ti = ti + 1
-        var dbg_icons = ["v", ">>", ">", "[]"]
-        var dbg_tips  = ["Step Into", "Step Over", "Continue", "Stop"]
-        var dbg_cols  = [self.accent, self.accent, self.green, self.red]
+        var dbg_icons = self._dbg_icons
+        var dbg_tips  = self._dbg_tips
+        if self._dbg_cols == none:
+            self._dbg_cols = [self.accent, self.accent, self.green, self.red]
+        var dbg_cols  = self._dbg_cols
         var btn_x = self.rect.right() - 204
         var bi = 0
         while bi < 4:
