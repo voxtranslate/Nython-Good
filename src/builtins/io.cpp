@@ -374,6 +374,27 @@ Value dispatch_io(NythonExecutor& E,
             }
             return Value(-1);
         }
+        // file_mtime(path) -> last modification time in milliseconds since the
+        // epoch, or -1 when the path does not exist. On a directory it changes
+        // whenever an entry is created, removed or renamed, which is what lets
+        // the IDE watch a workspace by comparing one integer per folder.
+        if (name == "file_mtime") {
+            if (!args.empty()) {
+                std::string path = getStringValue(args[0]);
+                struct stat st;
+                if (stat(path.c_str(), &st) == 0) {
+#if defined(__APPLE__)
+                    long long ms = (long long)st.st_mtimespec.tv_sec * 1000 + st.st_mtimespec.tv_nsec / 1000000;
+#elif defined(_WIN32)
+                    long long ms = (long long)st.st_mtime * 1000;
+#else
+                    long long ms = (long long)st.st_mtim.tv_sec * 1000 + st.st_mtim.tv_nsec / 1000000;
+#endif
+                    return Value(bigint(ms));
+                }
+            }
+            return Value(-1);
+        }
         if (name == "file_delete" || name == "remove_file") {
             if (args.size() >= 1) {
                 return Value(remove(getStringValue(args[0]).c_str()) == 0);

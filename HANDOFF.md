@@ -3,12 +3,346 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: end of round 72 (see §0/§0b for the language-level work,
-§5.3 for the IDE terminal command line, operation-based undo, and
-multi-cursor editing wired in across rounds 71b/71c, §0c for nytorch's new
-autograd engine, the multi-layer/Adam extension, the online-learning
-coding agent, real 2D matrix support, and the VM closure bug it surfaced,
-§5.10 for a real class-name-collision finding found along the way).
+Last updated: round 74. **§0e** is this round: IDE responsiveness (native
+text services, a responsive layout ladder), the Code::Blocks feature set,
+non-throwing control flow on both engines, and the build system. §0d is
+round 73 (the IDE to VS Code's model, verified by driving it). Earlier
+rounds: §0/§0b language-level work, §5.3 terminal command line / undo /
+multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
+collisions.
+
+---
+
+## 0e. Round 74 — responsive IDE, Code::Blocks features, faster engines
+
+The request: make the IDE "totally responsive", bring in features from
+Code::Blocks, and fix what is missing or broken across the GUI, nytorch,
+OS, the language, threads/mutexes/synchronisation and async.
+
+### Build (commit 9f8c96e)
+
+Every translation unit except `main.cpp` is the same in the IDE and CLI
+builds, so they are compiled once into `build/obj/`; `main.cpp` is built per
+flavour (`main_ide.o`, `main_cli.o`). `-MMD -MP` records header
+dependencies: editing a header rebuilds exactly the objects that include it,
+so the stale-object trap in §4 no longer needs `make clean`. Both binaries
+build in about 1.5–2.5 minutes.
+
+### Engines: return/break/continue without C++ exceptions (f284623)
+
+A call to a one-line function cost ~20 µs on the interpreter and ~70 µs on
+the VM, because every `return` threw a C++ exception, and every
+`break`/`continue` threw a `std::string`. callgrind put 80% (interpreter)
+and 92% (VM) of a call loop in the unwinder.
+
+- **VM**: `RETURN_VALUE` returns from `run_loop`; each `run_loop` runs
+  exactly one frame. Yields set `GenState.yielded` and return.
+- **Interpreter**: a thread-local `FlowState` (`pending` = return / break /
+  continue, plus the value). Blocks, `if` and every loop check it after each
+  statement. `evalBody` at the function-body call sites and the loops
+  consume it. Constructs that must see a real exception (try/with/switch/
+  class/namespace/import/macro) suspend the fast path (`SuspendFast`).
+- 100k calls: interpreter 2341 → 371 ms (function) and 3554 → 485 ms
+  (method); VM 7240 → 121 ms and 6414 → 180 ms.
+- Found on the way: `while`/`repeat` on the interpreter swallowed every
+  exception raised in their body. They now rethrow.
+
+### Interpreter: inherited methods read as values (9f8c96e)
+
+`obj.method` evaluated to `none` when the method was inherited, although
+calling it worked. The IDE registers `self.on_resize` (defined in a base
+class) as its resize callback, so **resizing never relaid out the
+workbench**. `evalAttribute` now walks the bases depth-first (an MRO walk).
+
+### Responsiveness (294c5a6)
+
+Measured with the headless driver on an 1,800-line file:
+
+| | before | after |
+|---|---|---|
+| keystroke | 381 ms | 34 ms |
+| scroll step | 72 ms | 37 ms |
+| window resize | 81 ms | 29 ms |
+
+About 16 ms of each "after" figure is frame pacing. Memory kept
+(`ide_memprobe.py`): idle 0, hover 0, typing ~18 KB/key, scroll ~8 KB/event.
+
+The profile showed where the time went:
+
+- **Completion** rebuilt its candidates by walking every line on every key.
+- **Syntax checking** spawned a second interpreter and waited for it.
+- **The SCM gutter** ran Myers diff as a script loop inside the painter.
+- **Search, Quick Open, workspace symbols and go-to-definition** read and
+  split every file in the interpreter.
+
+All of that is now in **`src/builtins/text.cpp`**, on both engines and
+pinned by `examples/vm_audit51.ny`:
+
+- `ny_symbols`: a tolerant outline with class bases, method parameters,
+  fields, variables, constants and depth.
+- `ny_check_syntax` / `ny_check_file`: the real lexer and parser, in process.
+- `text_diff` / `text_diff_classify`: Myers diff. `text_diff_classify`
+  agrees with `LineDiff.classify` on 60 random edits.
+- `fs_list_files`, `fs_search` (case / word / regex, include / exclude
+  globs), `fs_symbols`, `fs_todos` and `fs_line_stats` for the workspace.
+- `text_fold_ranges` (indentation blocks and `# region`), `text_line_stats`,
+  `text_todos` and `text_format_nython`.
+- A **completion index** (`ac_index_*`). Candidates stay in C++ and come
+  back as cached strings, so a keystroke allocates one result list.
+
+**Layout ladder.** Each step has hysteresis, so resizing across a threshold
+does not flicker:
+
+- The side bar floats over the editor, with a shadow and light dismiss,
+  when the editor would be narrower than 360 dp.
+- The menus fold into a hamburger that lists the menus and has a way back.
+- The command centre shrinks, then hides.
+- Activity-bar views and panel tabs that do not fit move to a `...` menu.
+- Status-bar items drop lowest priority first.
+
+### Code::Blocks features (`ide_tools.ny`, class `IDETools` in the chain)
+
+These are Code::Blocks' everyday features, rebuilt around this IDE's own
+models rather than copied:
+
+- **Build targets** come from `[target Name]` sections in `*.nyproj`
+  (`main`, `engine` = interp/vm, `args`, `cwd`, `env`, `pre`, `post`).
+  Build, Rebuild, Clean, Build and Run, Run Target and Abort (Shift+F5).
+  - The build is *time-sliced*: `_build_step` checks one file per slice
+    within an 8 ms budget from the frame tick, with `ny_check_file` in
+    process, so the IDE keeps drawing while it builds.
+  - Errors go to Problems and to a **Build Log** panel.
+  - The selected target is saved in `.nyide`.
+- **Bookmarks** (Ctrl+Alt+K / L / J, gutter icon, context menu) and
+  **folds** move with inserted and deleted lines. A mark carries down with
+  its text when Enter is pressed before it, as Scintilla's markers do.
+- **Code folding**: gutter chevrons, Ctrl+Shift+[ / ], Fold All, Unfold All
+  and fold by level. Scrolling, the caret, go-to, the minimap and clicks
+  all work in visual rows. A folded body shows a `...` marker that unfolds
+  when clicked, and jumping into a fold opens it.
+- **Abbreviations**: 20 snippets plus user snippets from `.nyide`, with tab
+  stops written `$<n:text>` (`${}` would be string interpolation in Nython).
+  They appear in the completion list with an exact prefix first, as in VS
+  Code. While tab stops are active, suggestions do not open by themselves
+  (VS Code's `snippetsPreventQuickSuggestions`), and Escape leaves snippet
+  mode.
+- **Editing**:
+  - Insert/overwrite (Insert key, an OVR status item). A run of overtyping
+    undoes as one step.
+  - Duplicate, transpose, upper / lower / title case.
+  - Format Document / Selection (Shift+Alt+F) in the file's own
+    indentation unit, as one undo step.
+- **Column (box) selection**: Shift+Alt+drag, middle-button drag,
+  Ctrl+Shift+Alt+arrows, or *Column Selection Mode* (Shift+arrows and plain
+  drags select rectangles, like Code::Blocks' Alt+drag). The box is two
+  corners in text-area pixels, so tabs line up by what is on screen. Each
+  row becomes one selection of the multi-cursor model, so typing, Backspace
+  and Delete act on every row. Copy joins the rows, cut removes them, and
+  paste spreads one line per caret when the counts match (VS Code's
+  "spread"). Copy, cut and paste with several selections used to act on the
+  primary only.
+- **Split editor**: two editor groups, side by side (Ctrl+\\) or stacked
+  (Ctrl+K Ctrl+\\; Shift+Alt+0 toggles). Each group has its own document,
+  caret, selection and scroll, even on the same file. Ctrl+1 / Ctrl+2 move
+  the focus, a click in the other group focuses it, and the wheel scrolls
+  it without taking the focus. The sash drags, and Join Editor Groups
+  closes the split. Painting uses one painter: the other group's view is
+  kept in scalars and swapped in, so the split allocates nothing per frame
+  (`ide_memprobe.py` measures it against plain hover at the same point).
+  The status bar's build target no longer lists the workspace folder on
+  every frame.
+- **Keymaps**: VS Code or Code::Blocks (`CB_KEYMAP`: F9, Ctrl+F9, Ctrl+D,
+  ...). *Change Keybinding* captures a pressed key. Bindings are saved in
+  `.nyide` (`keybinding = Ctrl+Alt+M | command.id`).
+- **Tools**:
+  - Class wizard: a file with the constructor and `__str__`, which runs.
+  - Code statistics per file and in total (code, comment, blank, doc).
+  - TODO list panel for the file or the workspace, with owners.
+  - User tools with `$(FILE)`, `$(LINE)`, `$(WORD)`, … macros.
+  - Environment variables for runs, targets and tools.
+  - Saving writes a `.bak` backup when the setting is on.
+- **Debugger**: breakpoint conditions (`i == 3`), hit counts (`5`, `>5`,
+  `%5`) and log points (`i is {i}`). Log points passed before a stop print
+  to the Debug Console. Also Run to Cursor and Add to Watch.
+- **Session**: open editors, the active editor and the caret are restored
+  on the next start.
+
+Defects found while driving these, all fixed:
+
+- **Two undo steps for one action.** Every action that deletes and then
+  inserts recorded two steps: completion accept, replace-one, paste over a
+  selection, wrapping a selection in brackets, format, transpose and case
+  change. They now use `open_group`/`close_group`.
+- **Wheel events had no modifiers.** Wheel events carried no Ctrl/Shift/Alt,
+  so Ctrl+wheel zoom and Shift+wheel sideways scroll never worked
+  (`gui.cpp`). The stub's `wheel` command takes modifiers now.
+- **`K=v cmd` in tool environments.** The shell expanded `$K` before the
+  assignment existed, so tool lines like `echo $GREET` saw nothing. The
+  environment is now `export`ed first.
+- **Wrong completion highlight.** The popup highlighted the first
+  `len(prefix)` characters, not the ones the fuzzy matcher matched.
+
+e2e scenarios added: `build`, `cbedit`, `cbtools`, `cbdebug`, `responsive`,
+`session`, `columns`, `split`.
+
+---
+
+## 0d. Round 73 — the IDE to VS Code standard, verified by driving it
+
+The request: continue the IDE "with the real standards of VS Code, making
+sure that all the functionalities are really working and all the clicking
+items perform the expected task". Until this round nothing that happens on a
+click or a keystroke had ever been exercised: the stub could construct the IDE
+and quit it, nothing more (§5.3 said so each round). So the round started by
+building the means to check, then used it on everything.
+
+### How it is verified now
+
+| Tool | What it does |
+|---|---|
+| `thirdparty/sdl3-stub` | scripted/live input (`NY_STUB_EVENTS`: move, click, dblclick, drag, wheel, key, type, resize, snap, quit), real SDL key names and modifiers, clipboard, and a capture of every primitive of the last presented frame (`snap PATH`). Text is measured with DejaVu's real advance widths, so captured layouts are exact. |
+| `tools/nyshot.py` | turns a captured frame into a PNG (fonts, clipping, alpha) and finds text on screen. |
+| `tools/ide_driver.py` | runs `build/nython --ide` with a live input channel; `click_text("Save All")`, `key("ctrl+shift+p")`, `type(...)`, `snap()`, `state()` (the IDE's own `developer.dumpState`, Ctrl+Shift+Alt+J), `hitmap()` (every clickable region, `developer.dumpHitMap`). |
+| `tools/ide_e2e.py` | 21 scenarios through real input — editing/undo/save, clipboard and line commands, multi-cursor, palette, Quick Open (`>` `:` `@` `#`), menus, find/replace, every status-bar item, explorer create/rename/delete/refresh, close-with-unsaved, terminal, Run, Problems, debugger, Source Control, Search, views/layout — plus two **dead-click audits** that click every clickable region (editor chrome; then each side view and panel with content in it) and require each to change something. Prints `N passed, M failed`. |
+| `tools/ide_lint.py` | static: `self.x` / `th.x` / typed receivers no class defines (Nython returns `none` instead of raising), reserved words as names, a method named `init` (a constructor alias here), **commands registered without an `_exec` branch and click targets nothing routes**. |
+| `tools/ide_memprobe.py` | resident memory kept per idle frame, hover event, keystroke and scroll step, with ceilings (`--check`). |
+| `tools/sweep.py` | the content-level sweep (§2) on both engines, optionally against a baseline binary, reporting regressions and fixes as sets. |
+| `--profile` | now also counts, per function, the objects and strings it leaves alive; `NY_PROFILE_OUT=f nython --ide` profiles the IDE itself. This is what found the memory problems below in minutes. |
+
+### The IDE
+
+One class, `NythonIDE`, in a chain of files (`IDE_FILES.md` has the map):
+`ide_core.ny` → `ide_ops.ny` → `ide_paint.ny` → `ide_views.ny` →
+`nython_ide.ny`, with window-free models in `lib/ide_workbench.ny`,
+`lib/ide_scm.ny`, `lib/ide_debugger.ny`. What it does, all driven by the e2e
+suite:
+
+- **Commands.** ~150 VS Code command ids (`workbench.action.files.save`,
+  `editor.action.commentLine`, …) with categories, keybindings (alternatives,
+  chords like Ctrl+K Ctrl+S, when-clauses such as `editorFocus`,
+  `!inputFocus`, `inDebugMode`) in `CommandRegistry`. Menus, the palette,
+  context menus, buttons, the status bar and keys all name commands; there is
+  one dispatcher (`_exec`). Unknown ids report themselves.
+- **Quick Input**: files (Ctrl+P), `>` commands with recently-used first (only
+  palette use counts, as in VS Code), `:` line, `@` symbols, `#` workspace
+  symbols, pickers (theme, language, EOL, encoding, indentation), prompts
+  (new file, rename, commit message…), a path dialog. Every input — here, find,
+  search, SCM message, terminal, Debug Console — is a real text field
+  (`LineEdit`): caret, Shift/Ctrl movement, selection that typing replaces,
+  clipboard, click-to-place, double-click word; pre-filled prompts are selected
+  (rename selects the name without its extension).
+- **Documents**: untitled/file/virtual/welcome, dirty dot, Save / Save As /
+  Save All / Revert, Save · Don't Save · Cancel on close and quit, reopen
+  closed editor, preview on single click. The final newline is an empty last
+  line, as in VS Code (Ctrl+End goes below the last line of text).
+- **Editing**: grouped undo — a typing run, typing over a selection, a
+  multi-caret edit, comment toggle, line move, indentation conversion, Replace
+  All: one Ctrl+Z each; auto-closing pairs and step-over; line copy/cut/paste
+  with no selection; Ctrl+D / Ctrl+Shift+L / Alt+Click carets; bracket
+  matching; breadcrumbs from the real enclosing scope.
+- **Indentation**, per file: detected on open (tabs vs spaces by vote, size
+  by the most common indent step), status bar `Spaces: 4` / `Tab Size: 4`,
+  VS Code's picker (Indent Using Spaces/Tabs, Detect, Convert to Spaces/Tabs),
+  tabs drawn at tab stops, Enter keeps the line's own whitespace.
+- **Workspace watching**: one `file_mtime` per visible folder and open file
+  (new builtin) — files made outside appear in the explorer, clean editors
+  reload when the file changes on disk, and saving over a newer file asks
+  (Overwrite / Revert / Cancel) instead of clobbering it.
+- **Source Control** on git: changes and staged lists, stage/unstage/discard,
+  commit (Ctrl+Enter), branch checkout/create, log, gutter bars from a Myers
+  diff against HEAD, Open Changes as a coloured unified diff.
+- **Run and Debug**: Run (Ctrl+F5) streams output and turns errors into
+  Problems with locations. F5 records the program with `nython --trace` and
+  replays it: breakpoints, continue, step over/into/out, **step back and
+  reverse continue** (record-and-replay; after Lewis, "Debugging Backwards in
+  Time", 2003), variables, watch, call stack, Debug Console, a timeline
+  scrubber, the uncaught exception with its line.
+- **Search** across open buffers and disk with case/word/regex, replace all.
+  **Extensions** is the catalog of `lib/` modules (description, API, open,
+  import). Terminal runs shell commands (with `cd`), `:cmd`, `>expr`, `@agent`.
+
+### Defects found by driving it (all fixed, all with value-asserting tests)
+
+Runtime, both engines unless noted — `examples/vm_audit45.ny`:
+- **JSON** (`include/NyJson.hpp`, one codec for both): the interpreter wrote
+  strings unescaped (`"say "hi""`) and decoded only flat objects (nested
+  objects, arrays, escapes: wrong or `{}`); the VM decoded `\u00e9` as
+  `u00e9`. The debugger's variable view depended on it.
+- **`print("total", r)`** printed `('total', 6)` on the interpreter — the call
+  form was parsed as a print statement of one tuple; the VM flattened *every*
+  tuple (`print((1, 2))` → `1 2`) and mangled `sep=`. Now a real call form
+  with `sep=`/`end=` on both.
+- **Equality** (interpreter): nested lists were never equal (elements compared
+  by printed form), **every two maps compared equal**, `[1, 2] != [1, 2]` was
+  true. **`true == 1`** was false on the VM only.
+- **`list.pop(i)`** ignored `i` on the VM (removed the last item);
+  `insert(-1, x)` wrote a key named `"-1"` on the interpreter.
+- **`map.clear()`** (interpreter) turned the map into an empty list; later
+  `m[k] = v` was silently lost.
+- **`--trace`** never recorded the uncaught exception (the file was closed by
+  an RAII guard inside the `try` before the `catch` ran).
+- **`launch_ide`** terminated on a syntax error in the IDE's sources; now
+  reported with its location.
+- Background jobs whose output ended in a newline **never finished**
+  (`os_exec` strips trailing newlines, so a byte offset drifted); a command
+  containing `exit N` killed the wrapper before its status was recorded.
+- `gui.cpp`'s rounded-rectangle fill blended corners two or three times
+  (dark blobs on any translucent rounded fill).
+
+Memory — the interpreter never frees a string or container (§5.1), so what
+repaint and keystrokes allocate is kept. Measured with `ide_memprobe.py`:
+
+| | before | after |
+|---|---|---|
+| idle frame | 3.45 KB | 0 |
+| hover event | 40 KB | 0 |
+| keystroke | 787 KB | ~40 KB |
+| scroll step (long file) | 161 KB | ~7 KB |
+
+Causes, found with the new allocation profile: **every evaluation of a string
+literal made a new permanent string** (now interned per AST node — benefits
+every Nython program: a loop with two literals, 48 MB → 10 MB); every
+one-character string (`line[i:i+1]`) likewise (now shared); **every method
+call on a subclass made a permanent string** for `__parent_class__` (now
+interned); autocomplete rebuilt and fuzzy-matched its whole candidate list in
+Nython per key (now a session re-ranked by the native `fuzzy_rank`, which
+also finds best alignments instead of first occurrences); the highlight cache
+was cleared on every edit; the minimap rebuilt a list per line per edit; the
+gutter built a `"path:line"` string per line per frame; view title actions
+were list literals in paint methods.
+
+IDE-level: menus could not be switched by hovering (a dismiss layer covered
+the bar); a key the Quick Input did not handle fell through to the editor
+underneath; palette "recently used" counted keybindings; `@dbg.var` rows
+were dead clicks; breadcrumbs named the last `def` above the caret even at
+top level; the search summary said "1 results in 1 files"; the toolchain ran
+whatever `nython` was on PATH instead of the running binary.
+
+### Numbers at the end of the round
+
+```
+tools/ide_e2e.py        227 passed, 0 failed (21 scenarios incl. two dead-click audits)
+tools/ide_lint.py       0 unresolved
+tools/ide_memprobe.py   within ceilings (idle 0, hover 0, typing ~40 KB/key, scroll ~7 KB)
+tools/sweep.py --base   176 runs (88 files x 2 engines): 0 regressions against the round-72
+                        binary, 8 runs newly passing; still failing: vm_audit23/25 on the
+                        VM only (pre-existing, @property decorator, §5.9)
+vm_audit42..45          73 / 52 / 46 / 45 passed, both engines
+```
+
+### Not done / known gaps
+
+- The interpreter's collector is still unwired (§5.1). This round removed
+  the avoidable garbage; ~40 KB per keystroke remains (undo records, the new
+  line's tokens, status text) and is kept for the session.
+- The VM has no tuple type (`print((1, 2))` shows `[1, 2]` there).
+- No split editors, no settings UI beyond the `.nyide` file, no extension
+  installation (Extensions lists and imports `lib/` modules), no real language
+  server (symbols, go-to-definition and references are text-based).
+- The debugger replays a recording: it cannot change a variable's value and
+  continue, and a program that needs interactive input cannot be recorded.
+- Two pre-existing VM failures remain (`vm_audit23`/`25`, `@property` as a
+  decorator — §5.9).
 
 ---
 
@@ -515,18 +849,25 @@ before changing either.
 
 ## 4. Traps that have cost real time
 
-**Two IDE files.** `nython_ide.ny` at the repository root (v4, ~3700 lines) is
-what `--ide` launches. `examples/nython_ide.ny` (v3) is a demo and is **not**
+**Two IDE implementations.** `nython_ide.ny` at the repository root and its
+chain (`ide_core.ny` → `ide_ops.ny` → `ide_paint.ny` → `ide_views.ny`) is what
+`--ide` launches. `examples/nython_ide.ny` (v3) is a demo and is **not**
 shipped. Six rounds of work went into the wrong one. See `IDE_FILES.md`.
 
-**The shipped IDE does not import `lib/gui.ny`.** It uses its own `Theme` class
-and `ide_icons.ny`. A VS Code Dark+ palette written into `lib/gui.ny` was
-invisible for eighteen rounds for this reason. Check what the file you are
-editing actually imports:
+**The shipped IDE's look does not come from `lib/gui.ny`.** Colours are
+`IDETheme` in `ide_paint.ny` (VS Code Dark+/Light+ tokens) and icons are
+`ide_icons.ny`; `lib/gui.ny` supplies only Window/Renderer/Font. A palette
+written into `lib/gui.ny` was invisible for eighteen rounds for this reason.
 
-```bash
-grep -n "^import" nython_ide.ny
-```
+**Nython returns `none` for a missing member instead of raising.** A typo'd
+method name or an attribute never assigned just evaluates to `none` and the
+IDE carries on, drawing at y=0 or doing nothing on a click. Run
+`python3 tools/ide_lint.py` after any IDE change.
+
+**Anything allocated while painting is kept forever** on the interpreter
+(§5.1): a list literal in a paint method is a new permanent list per frame.
+Measure with `python3 tools/ide_memprobe.py`; find the allocator with
+`NY_PROFILE_OUT=/tmp/p.csv NY_PROFILE_SORT=alloc ./build/nython --ide`.
 
 **Dead code that looks live.** Two fixes landed in code that never executes and
 were reported as working:
@@ -575,6 +916,11 @@ functions on either engine — only the *method* form `obj.id()` worked, which
 is what this section's `objectProtocol()` already covered).
 
 ### 5.3 Built but not adopted by the shipped IDE
+
+*(Round 73: the "not verified — no keyboard injection" caveats below are
+obsolete. The stub now takes scripted input and `tools/ide_e2e.py` drives the
+terminal, undo, multi-cursor and everything else through real events; a
+multi-caret edit is now one undo step. See §0d.)*
 
 **`lib/ide_commands.ny` — CLOSED (round 71b)**: the `:cmd` / `>expr` /
 `@agent` terminal command line (paired with `lib/ide_toolchain.ny`'s real
@@ -709,13 +1055,12 @@ positionless default. `/tmp/eof.ny` with an unclosed paren now reports
 `/tmp/eof.ny:3:1: ...` — the real end-of-file position — instead of
 `stdin:1:1`.
 
-### 5.7 IDE visual work
-Not addressed: menu and toolbar rearrangement (the VS Code / Code::Blocks
-hybrid), and three status-bar segments (UTF-8, Nython, size) that are decorative
-but consume the click, which reads as unresponsive.
-
-**Visual work needs a screenshot.** Every attempt to fix appearance without one
-produced work in the wrong file. Ask for one.
+### 5.7 IDE visual work — addressed in round 73 (§0d)
+The layout follows VS Code (title-bar menus and command centre, activity bar,
+side bar, editor group, panel, status bar); every status-bar segment opens its
+picker. **Visual work needs a screenshot** — and one can now be taken
+headlessly: `ide.screenshot("x.png")` in `tools/ide_driver.py`, or
+`python3 tools/nyshot.py frame.dl out.png` on a capture.
 
 ### 5.8 Content-level failures in old version-numbered example files (found, not fixed)
 
@@ -854,6 +1199,11 @@ reproducible finding rather than a guess.
 | `examples/vm_audit39.ny` | `autograd.ny` multi-output layers (`select`/`stack_vars`/`LinearLayerVar`/`MLPVar`), `softmax_cross_entropy`, `AdamVar`; MLP solves XOR (round 72) |
 | `examples/vm_audit40.ny` | `lib/nytorch/agent_learn.ny`'s online-learning `CodingAgent` — real tokeniser, `AgentKnowledge` persistence, held-out perplexity improves after training on different code (round 72) |
 | `examples/vm_audit41.ny` | `autograd.ny` real 2D matrix support — `matmul`/`add_bias_row`/`select_row`, `LinearMatVar`/`MLPMatVar` batched training solves XOR in one matmul per layer per step (round 72) |
+| `examples/vm_audit42.ny` | IDE workbench model: `CommandRegistry` keys/chords/when-clauses, `HitMap`, `Frecency`, `QuickInput`, `LineEdit`, `Notifications`, `NavHistory` (round 73) |
+| `examples/vm_audit43.ny` | `EditorBuffer` final-newline model, undo groups, tab-aware newline, in-place line edits, indentation detect/convert; `LineDiff`; `GitRepo` in a throwaway repository (round 73) |
+| `examples/vm_audit44.ny` | `DebugSession` replay on a known recording and on a real `--trace` recording, including the uncaught exception (round 73) |
+| `examples/vm_audit45.ny` | JSON codec, `print` call form, `list.pop(i)`/`insert`, deep equality, `true == 1`, `file_mtime` (round 73) |
+| `tools/ide_e2e.py` | the shipped IDE driven through real input, 20 scenarios + dead-click audits (round 73) |
 | `gui_tests/test_13` | Codicons, Dark+ palette, HiDPI scaling |
 | `gui_tests/test_14` | toolchain — real compile/run/AST/disasm |
 | `gui_tests/test_15` | cursor manager, value inspector, Unicode |

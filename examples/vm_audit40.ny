@@ -49,7 +49,11 @@ check("string literal is one token", str_cats[3], "string")
 check("comment produces no extra tokens", len(str_cats), 4)
 
 print("== AgentKnowledge persists across calls (routes around the real KnowledgeBase name collision - see agent_learn.ny's note) ==")
-var kb = AgentKnowledge("/tmp/ny_vm_audit40_kb/test.kv")
+# A directory of its own per run: the two engines (and parallel sweeps) run
+# this file at the same time, and a shared store made them read each
+# other's counters ("files_seen: got 1 want 2").
+var run_tag = string_replace(str(time_ms()), ".", "_") + "_" + str(random_int(0, 999999))
+var kb = AgentKnowledge("/tmp/ny_vm_audit40_kb_" + run_tag + "/test.kv")
 kb.remember("hello", "world")
 check("recall matches remember", kb.recall("hello"), "world")
 check_true("has() true for a stored key", kb.has("hello"))
@@ -64,7 +68,7 @@ var snippet_b = "def mul(a, b):\n    return a * b\n\nclass Counter:\n    def __i
 # not memorisation of a or b.
 var held_out = "def sub(a, b):\n    return a - b\n\nclass Stack:\n    def __init__(self):\n        self.items = []\n\n    def push(self, v):\n        self.items.append(v)\n\nvar s = Stack()\nfor i in range(3):\n    s.push(i)\nprint(len(s.items))\n"
 
-var agent = CodingAgent("vm_audit40", "/tmp/ny_vm_audit40_agent", 8, 5)
+var agent = CodingAgent("vm_audit40", "/tmp/ny_vm_audit40_agent_" + run_tag, 8, 5)
 var perplexity_before = agent.perplexity_on(held_out)
 agent.observe_source(snippet_a)
 agent.observe_source(snippet_b)

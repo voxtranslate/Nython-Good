@@ -15,12 +15,15 @@ namespace nython {
 namespace gc {
 
 Collectable::Collectable(Type type_arg): type{type_arg}, marked{false}, runner{nullptr} {
+    collectables_created()++;
 }
 
 Collectable::Collectable(Runnable* runner_arg, Type type_arg): type{type_arg}, marked{false}, runner{runner_arg} {
+    collectables_created()++;
 }
 
 Collectable::~Collectable() {
+    collectables_created()--;
     clean();
 }
 

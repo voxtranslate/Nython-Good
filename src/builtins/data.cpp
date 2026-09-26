@@ -36,6 +36,7 @@
 
 // Full executor definition (needed for E.getStringValue etc.)
 #include "NythonExecutor.hpp"
+#include "NyJson.hpp"
 #include "builtins/data.hpp"
 
 // ── Namespace imports (match main.cpp) ────────────────────────────────────────
@@ -124,136 +125,97 @@ Value dispatch_data(NythonExecutor& E,
                 return makeStringValue(ny_crypto::sha256(getStringValue(args[0])));
             return NONE_VALUE;
         }
-        // ===================== FIXED JSON DECODE =====================
-    // ── from main.cpp lines 4888–4938 ──────────────────────────────────────────
-        if (name == "json_decode" || name == "json_parse") {
-            if (!args.empty()) {
-                std::string json = getStringValue(args[0]);
-                // Trim whitespace
-                while (!json.empty() && (json.front()==' '||json.front()=='\t'||json.front()=='\n')) json.erase(0,1);
-                while (!json.empty() && (json.back()==' '||json.back()=='\t'||json.back()=='\n')) json.pop_back();
-                // Handle primitives first
-                if (json == "null" || json == "none") return NONE_VALUE;
-                if (json == "true") return Value(true);
-                if (json == "false") return Value(false);
-                if (json.size() >= 2 && json.front() == '"' && json.back() == '"')
-                    return makeStringValue(json.substr(1, json.size() - 2));
-                if (!json.empty() && json[0] != '{' && json[0] != '[') {
-                    if (json.find('.') != std::string::npos) { try { return Value(std::stod(json)); } catch (...) {} }
-                    try { return Value(static_cast<int>(std::stoll(json))); } catch (...) {}
-                }
-                Object* result = new Object((Runnable*)runner, "map", Type::LIST);
-                if (!json.empty() && json[0] == '{') {
-                    size_t pos = 1;
-                    while (pos < json.size()) {
-                        while (pos < json.size() && (json[pos]==' '||json[pos]=='\n'||json[pos]==','||json[pos]=='\t')) pos++;
-                        if (pos >= json.size() || json[pos] == '}') break;
-                        if (json[pos] == '"') {
-                            pos++; size_t ks = pos;
-                            while (pos < json.size() && json[pos] != '"') pos++;
-                            std::string key = json.substr(ks, pos - ks); pos++;
-                            while (pos < json.size() && (json[pos]==':'||json[pos]==' ')) pos++;
-                            if (pos < json.size()) {
-                                if (json[pos] == '"') {
-                                    pos++; size_t vs = pos;
-                                    while (pos < json.size() && json[pos] != '"') pos++;
-                                    result->set(key, makeStringValue(json.substr(vs, pos - vs))); pos++;
-                                } else if (json[pos]=='t') { result->set(key, Value(true)); pos+=4; }
-                                else if (json[pos]=='f') { result->set(key, Value(false)); pos+=5; }
-                                else if (json[pos]=='n') { result->set(key, NONE_VALUE); pos+=4; }
-                                else {
-                                    size_t vs = pos; bool dot = false;
-                                    while (pos<json.size()&&(std::isdigit(json[pos])||json[pos]=='.'||json[pos]=='-')) { if(json[pos]=='.') dot=true; pos++; }
-                                    std::string ns = json.substr(vs, pos-vs);
-                                    // A malformed/edge-case number here (empty, a
-                                    // lone "-") previously threw an unguarded
-                                    // std::invalid_argument straight out of
-                                    // json_decode, past every Nython-level
-                                    // try/except, and crashed the whole process
-                                    // with an unhelpful "error: stol" instead of
-                                    // a catchable ValueError. Fall back to 0
-                                    // rather than take the process down over one
-                                    // bad field, matching the top-level-primitive
-                                    // parse a few lines above.
-                                    if (dot) { try { result->set(key, Value(std::stod(ns))); } catch (...) { result->set(key, Value(0.0)); } }
-                                    else { try { result->set(key, Value(static_cast<int>(std::stol(ns)))); } catch (...) { result->set(key, Value(0)); } }
-                                }
-                            }
-                        } else pos++;
-                    }
-                }
-                return Value((Collectable*)result);
-            }
-            return NONE_VALUE;
-        }
-        // ===================== THREADING =====================
-    // ── from main.cpp lines 8452–8518 ──────────────────────────────────────────
-        // ===================== JSON MODULE =====================
+        // ===================== JSON (include/NyJson.hpp) =====================
+        // One codec for both engines. Strings are escaped, nested arrays and
+        // objects decode, \u escapes (with surrogate pairs) become UTF-8, and
+        // invalid JSON decodes to none rather than to a partial value.
         if (name == "json_encode" || name == "json_stringify") {
-            if (args.size() >= 1) {
-                std::function<std::string(Value)> to_json;
-                to_json = [&](Value v) -> std::string {
-                    if (v.isNone()) return "null";
-                    if (v.type == ValueType::BOOLEAN) return v.value.b ? "true" : "false";
-                    if (v.type == ValueType::INTEGER) return std::to_string(bigint_to_i64(v.value.i));
-                    if (v.type == ValueType::DOUBLE) {
-                        std::ostringstream oss; oss << v.value.d; return oss.str();
-                    }
-                    if (v.type == ValueType::USERDATA) return "\"" + getStringValue(v) + "\"";
-                    if (v.isCollectable() && v.value.gc) {
-                        auto* cont = dynamic_cast<Container*>(v.value.gc);
-                        if (cont && cont->container) {
-                            auto li = cont->container->find("__len__");
-                            if (li != cont->container->end()) {
-                                int len = (int)bigint_to_i64(li->second.value.i);
-                                std::string r = "[";
-                                for (int i = 0; i < len; i++) {
-                                    if (i > 0) r += ", ";
-                                    auto it = cont->container->find(std::to_string(i));
-                                    r += (it != cont->container->end()) ? to_json(it->second) : "null";
-                                }
-                                return r + "]";
+            if (args.empty()) return makeStringValue("null");
+            std::function<void(const Value&, std::string&, int)> enc;
+            enc = [&](const Value& v, std::string& out, int depth) {
+                if (depth > 200) { out += "null"; return; }
+                if (v.isNone() || v.type == ValueType::UNDEFINED) { out += "null"; return; }
+                if (v.type == ValueType::BOOLEAN) { out += v.value.b ? "true" : "false"; return; }
+                if (v.type == ValueType::INTEGER) {
+                    std::string digits = v.value.i.toString(10);
+                    out += digits.empty() ? "0" : digits;
+                    return;
+                }
+                if (v.type == ValueType::DOUBLE) { out += nyjson::number((double)v.value.d); return; }
+                if (isStringValue(v)) { nyjson::quote_to(out, getStringValue(v)); return; }
+                if (v.isCollectable() && v.value.gc) {
+                    auto* cont = dynamic_cast<Container*>(v.value.gc);
+                    if (cont && cont->container) {
+                        auto li = cont->container->find("__len__");
+                        if (li != cont->container->end()) {
+                            int len = (int)bigint_to_i64(li->second.value.i);
+                            out += "[";
+                            for (int i = 0; i < len; i++) {
+                                if (i > 0) out += ", ";
+                                auto it = cont->container->find(std::to_string(i));
+                                if (it != cont->container->end()) enc(it->second, out, depth + 1);
+                                else out += "null";
                             }
-                            std::string r = "{";
-                            bool first = true;
-                            for (auto& [k, val] : *cont->container) {
-                                if (k == "__len__" || k == "__type__" || k == "__name__") continue;
-                                if (!first) r += ", ";
-                                first = false;
-                                r += "\"" + k + "\": " + to_json(val);
-                            }
-                            return r + "}";
+                            out += "]";
+                            return;
                         }
+                        // Sorted keys: the container is a hash map, so its own
+                        // order is arbitrary and would differ run to run.
+                        std::vector<std::string> keys;
+                        for (auto& kv : *cont->container) {
+                            const std::string& k = kv.first;
+                            if (k == "__len__" || k == "__type__" || k == "__name__" || k == "__class__") continue;
+                            keys.push_back(k);
+                        }
+                        std::sort(keys.begin(), keys.end());
+                        out += "{";
+                        bool first = true;
+                        for (auto& k : keys) {
+                            if (!first) out += ", ";
+                            first = false;
+                            nyjson::quote_to(out, k);
+                            out += ": ";
+                            enc(cont->container->find(k)->second, out, depth + 1);
+                        }
+                        out += "}";
+                        return;
                     }
-                    return "null";
-                };
-                return makeStringValue(to_json(args[0]));
-            }
-            return makeStringValue("null");
+                }
+                out += "null";
+            };
+            std::string out;
+            enc(args[0], out, 0);
+            return makeStringValue(out);
         }
         if (name == "json_decode" || name == "json_parse") {
-            if (args.size() >= 1) {
-                std::string json = getStringValue(args[0]);
-                // Simple JSON parser for basic types
-                auto trim = [](std::string s) -> std::string {
-                    while (!s.empty() && (s.front() == ' ' || s.front() == '\t' || s.front() == '\n')) s.erase(0, 1);
-                    while (!s.empty() && (s.back() == ' ' || s.back() == '\t' || s.back() == '\n')) s.pop_back();
-                    return s;
-                };
-                json = trim(json);
-                if (json == "null") return NONE_VALUE;
-                if (json == "true") return Value(true);
-                if (json == "false") return Value(false);
-                if (json.size() >= 2 && json.front() == '"' && json.back() == '"')
-                    return makeStringValue(json.substr(1, json.size() - 2));
-                if (json.find('.') != std::string::npos) {
-                    try { return Value(std::stod(json)); } catch (...) {}
+            if (args.empty()) return NONE_VALUE;
+            nyjson::Node root;
+            std::string err;
+            if (!nyjson::parse(getStringValue(args[0]), root, err)) return NONE_VALUE;
+            std::function<Value(const nyjson::Node&)> conv = [&](const nyjson::Node& n) -> Value {
+                switch (n.kind) {
+                    case nyjson::Node::Null: return NONE_VALUE;
+                    case nyjson::Node::Bool: return Value(n.b);
+                    case nyjson::Node::Int: return Value(bigint((long long)n.i));
+                    case nyjson::Node::Float: return Value(n.d);
+                    case nyjson::Node::Str: return makeStringValue(n.s);
+                    case nyjson::Node::Arr: {
+                        auto* obj = new Object((Runnable*)runner, "list", Type::LIST);
+                        int idx = 0;
+                        for (auto& it : n.items) obj->set(std::to_string(idx++), conv(it));
+                        obj->set("__len__", Value(idx));
+                        return Value((Collectable*)obj);
+                    }
+                    case nyjson::Node::Obj: {
+                        auto* obj = new Object((Runnable*)runner, "map", Type::LIST);
+                        for (auto& f : n.fields) obj->set(f.first, conv(f.second));
+                        return Value((Collectable*)obj);
+                    }
                 }
-                try { return Value((int)std::stoll(json)); } catch (...) {}
-            }
-            return NONE_VALUE;
+                return NONE_VALUE;
+            };
+            return conv(root);
         }
-
         // ===================== CRYPTO/HASH MODULE =====================
     // ── from main.cpp lines 8519–8658 ──────────────────────────────────────────
         if (name == "hash_sha256" || name == "hash_md5") {

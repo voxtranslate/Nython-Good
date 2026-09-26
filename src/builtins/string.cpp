@@ -36,6 +36,7 @@
 
 // Full executor definition (needed for E.getStringValue etc.)
 #include "NythonExecutor.hpp"
+#include "NyFuzzy.hpp"
 #include "builtins/string.hpp"
 
 // ── Namespace imports (match main.cpp) ────────────────────────────────────────
@@ -527,57 +528,61 @@ Value dispatch_string(NythonExecutor& E,
             }
             return NONE_VALUE;
         }
-        // ── json_stringify(value) ────────────────────────────────────────────────
-        if (name == "json_stringify") {
-            if (!args.empty()) {
-                std::function<std::string(const Value&, int)> to_json = [&](const Value& v, int depth) -> std::string {
-                    if (depth > 20) return "null";
-                    if (isStringValue(v)) {
-                        std::string s = getStringValue(v), r = "\"";
-                        for (char c : s) {
-                            if (c=='"') r+="\\\""; else if (c=='\\') r+="\\\\";
-                            else if (c=='\n') r+="\\n"; else if (c=='\r') r+="\\r";
-                            else if (c=='\t') r+="\\t"; else r+=c;
+        // json_stringify lives with json_encode in data.cpp (include/NyJson.hpp).
+
+        // ── fuzzy_score / fuzzy_positions / fuzzy_rank (include/NyFuzzy.hpp) ──
+        // Best-alignment fuzzy matching in C++, so a palette or autocomplete
+        // list is ranked without allocating per candidate.
+        if (name == "fuzzy_score" || name == "fuzzy_positions") {
+            if (args.size() < 2) return NONE_VALUE;
+            int sc = 0;
+            std::vector<int> pos;
+            if (!nyfuzzy::score(getStringValue(args[0]), getStringValue(args[1]), sc,
+                                name == "fuzzy_positions" ? &pos : nullptr))
+                return NONE_VALUE;
+            if (name == "fuzzy_score") return Value(sc);
+            auto* obj = new Object((Runnable*)runner, "list", Type::LIST);
+            for (size_t i = 0; i < pos.size(); i++) obj->set(std::to_string(i), Value(pos[i]));
+            obj->set("__len__", Value((int)pos.size()));
+            return Value((Collectable*)obj);
+        }
+        if (name == "fuzzy_rank") {
+            // fuzzy_rank(query, texts, limit=0, bonus=none) -> indices, best first
+            if (args.size() < 2) return NONE_VALUE;
+            auto list_of = [&](const Value& v, std::vector<std::string>* strs, std::vector<long long>* nums) {
+                if (!v.isCollectable()) return;
+                auto* c = dynamic_cast<Container*>(v.value.gc);
+                if (!c || !c->container) return;
+                auto li = c->container->find("__len__");
+                int n = (li != c->container->end()) ? (int)bigint_to_i64(li->second.value.i) : 0;
+                for (int i = 0; i < n; i++) {
+                    auto it = c->container->find(std::to_string(i));
+                    if (strs) strs->push_back(it != c->container->end() ? getStringValue(it->second) : std::string());
+                    if (nums) {
+                        long long x = 0;
+                        if (it != c->container->end()) {
+                            if (it->second.type == ValueType::INTEGER) x = bigint_to_i64(it->second.value.i);
+                            else if (it->second.type == ValueType::DOUBLE) x = (long long)it->second.value.d;
                         }
-                        return r + "\"";
-                    } else if (v.type == ValueType::BOOLEAN) {
-                        return v.value.b ? "true" : "false";
-                    } else if (v.type == ValueType::NONE) {
-                        return "null";
-                    } else if (v.type == ValueType::DOUBLE) {
-                        std::ostringstream oss; oss << v.value.d; return oss.str();
-                    } else if (v.type == ValueType::INTEGER) {
-                        return std::to_string(bigint_to_i64(v.value.i));
-                    } else if (v.isCollectable()) {
-                        auto* obj = dynamic_cast<Container*>(v.value.gc);
-                        if (!obj || !obj->container) return "null";
-                        auto li = obj->container->find("__len__");
-                        bool is_list = (li != obj->container->end());
-                        if (is_list) {
-                            int len = (int)bigint_to_i64(li->second.value.i);
-                            std::string r = "[";
-                            for (int i = 0; i < len; i++) {
-                                if (i > 0) r += ",";
-                                auto it = obj->container->find(std::to_string(i));
-                                r += (it != obj->container->end()) ? to_json(it->second, depth+1) : "null";
-                            }
-                            return r + "]";
-                        } else {
-                            std::string r = "{"; bool first = true;
-                            for (auto& kv : *obj->container) {
-                                if (kv.first == "__class__") continue;
-                                if (!first) r += ",";
-                                r += "\"" + kv.first + "\":" + to_json(kv.second, depth+1);
-                                first = false;
-                            }
-                            return r + "}";
-                        }
+                        nums->push_back(x);
                     }
-                    return "null";
-                };
-                return makeStringValue(to_json(args[0], 0));
+                }
+            };
+            std::vector<std::string> texts;
+            list_of(args[1], &texts, nullptr);
+            size_t limit = 0;
+            if (args.size() > 2 && args[2].type == ValueType::INTEGER) {
+                long long l = bigint_to_i64(args[2].value.i);
+                if (l > 0) limit = (size_t)l;
             }
-            return makeStringValue("null");
+            std::vector<long long> bonus;
+            bool has_bonus = args.size() > 3 && args[3].isCollectable();
+            if (has_bonus) list_of(args[3], nullptr, &bonus);
+            auto idx = nyfuzzy::rank(getStringValue(args[0]), texts, has_bonus ? &bonus : nullptr, limit);
+            auto* obj = new Object((Runnable*)runner, "list", Type::LIST);
+            for (size_t i = 0; i < idx.size(); i++) obj->set(std::to_string(i), Value(idx[i]));
+            obj->set("__len__", Value((int)idx.size()));
+            return Value((Collectable*)obj);
         }
         // ── device_info() ────────────────────────────────────────────────────────
         if (name == "device_info") {

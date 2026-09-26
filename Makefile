@@ -87,24 +87,32 @@ else
   SDL3_LDFLAGS += -lSDL3_ttf -lSDL3_image
 endif
 
+# ── Objects ────────────────────────────────────────────────────────
+# Every translation unit except main.cpp is identical in the IDE and CLI
+# builds, so it is compiled once into build/obj and shared; only main.cpp
+# (which reads NYTHON_WITH_IDE) is compiled per flavour. -MMD -MP records
+# each object's header dependencies, so editing a header such as
+# NythonExecutor.hpp rebuilds exactly the objects that include it - the
+# stale-object trap (CLAUDE.md, "Stale object files") no longer needs a
+# `make clean`.
+OBJDIR         = build/obj
+DEPFLAGS       = -MMD -MP
+BASE_CXXFLAGS  = $(CXXSTD) $(CXXOPT) $(CXXWARN) $(INCLUDE) $(SDL3_CFLAGS)
+COMMON_SRCS    = $(filter-out src/main.cpp,$(SRCS))
+COMMON_OBJS    = $(patsubst src/%.cpp,$(OBJDIR)/%.o,$(COMMON_SRCS))
+ifeq ($(USE_SDL_STUB),yes)
+  COMMON_OBJS += $(OBJDIR)/sdl3_stub.o
+endif
+
 # ── IDE build (default) ────────────────────────────────────────────
-IDE_BUILDDIR   = build/ide
-IDE_OBJS       = $(patsubst src/%.cpp,$(IDE_BUILDDIR)/%.o,$(filter src/%.cpp,$(SRCS))) \
-                 $(patsubst src/builtins/%.cpp,$(IDE_BUILDDIR)/builtins/%.o,$(filter src/builtins/%.cpp,$(SRCS)))
+IDE_OBJS       = $(OBJDIR)/main_ide.o $(COMMON_OBJS)
 IDE_TARGET     = build/nython$(EXE)
-IDE_CXXFLAGS   = $(CXXSTD) $(CXXOPT) $(CXXWARN) $(INCLUDE) -DNYTHON_WITH_IDE=1 $(SDL3_CFLAGS)
+IDE_CXXFLAGS   = $(BASE_CXXFLAGS) -DNYTHON_WITH_IDE=1
 
 # ── CLI build ──────────────────────────────────────────────────────
-CLI_BUILDDIR   = build/cli
-CLI_OBJS       = $(patsubst src/%.cpp,$(CLI_BUILDDIR)/%.o,$(filter src/%.cpp,$(SRCS))) \
-                 $(patsubst src/builtins/%.cpp,$(CLI_BUILDDIR)/builtins/%.o,$(filter src/builtins/%.cpp,$(SRCS)))
+CLI_OBJS       = $(OBJDIR)/main_cli.o $(COMMON_OBJS)
 CLI_TARGET     = build/nython-cli$(EXE)
-CLI_CXXFLAGS   = $(CXXSTD) $(CXXOPT) $(CXXWARN) $(INCLUDE) -DNYTHON_WITH_IDE=0 $(SDL3_CFLAGS)
-
-ifeq ($(USE_SDL_STUB),yes)
-  IDE_OBJS += $(IDE_BUILDDIR)/sdl3_stub.o
-  CLI_OBJS += $(CLI_BUILDDIR)/sdl3_stub.o
-endif
+CLI_CXXFLAGS   = $(BASE_CXXFLAGS) -DNYTHON_WITH_IDE=0
 
 .PHONY: all ide cli clean help
 
@@ -133,38 +141,29 @@ $(IDE_TARGET): $(IDE_OBJS) | build
 $(CLI_TARGET): $(CLI_OBJS) | build
 	$(CXX) $(CLI_CXXFLAGS) $^ -o $@ $(LDFLAGS) $(SDL3_LDFLAGS)
 
-# ── Compile IDE objects ────────────────────────────────────────────
-$(IDE_BUILDDIR)/%.o: src/%.cpp | $(IDE_BUILDDIR)
-	$(CXX) $(IDE_CXXFLAGS) -c $< -o $@
+# ── Compile ────────────────────────────────────────────────────────
+$(OBJDIR)/%.o: src/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(BASE_CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
-$(IDE_BUILDDIR)/builtins/%.o: src/builtins/%.cpp | $(IDE_BUILDDIR)/builtins
-	$(CXX) $(IDE_CXXFLAGS) -c $< -o $@
+$(OBJDIR)/main_ide.o: src/main.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(IDE_CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
-# ── Compile CLI objects ────────────────────────────────────────────
-$(CLI_BUILDDIR)/%.o: src/%.cpp | $(CLI_BUILDDIR)
-	$(CXX) $(CLI_CXXFLAGS) -c $< -o $@
-
-$(CLI_BUILDDIR)/builtins/%.o: src/builtins/%.cpp | $(CLI_BUILDDIR)/builtins
-	$(CXX) $(CLI_CXXFLAGS) -c $< -o $@
+$(OBJDIR)/main_cli.o: src/main.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CLI_CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 # ── Compile SDL3 stub (only when USE_SDL_STUB=yes) ────────────────
-$(IDE_BUILDDIR)/sdl3_stub.o: $(STUB_SRC) | $(IDE_BUILDDIR)
-	$(CXX) $(IDE_CXXFLAGS) -c $< -o $@
+$(OBJDIR)/sdl3_stub.o: $(STUB_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(BASE_CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
-$(CLI_BUILDDIR)/sdl3_stub.o: $(STUB_SRC) | $(CLI_BUILDDIR)
-	$(CXX) $(CLI_CXXFLAGS) -c $< -o $@
+-include $(COMMON_OBJS:.o=.d) $(OBJDIR)/main_ide.d $(OBJDIR)/main_cli.d
 
 # ── Directories ────────────────────────────────────────────────────
 build:
 	mkdir -p build
-$(IDE_BUILDDIR):
-	mkdir -p $(IDE_BUILDDIR)
-$(IDE_BUILDDIR)/builtins:
-	mkdir -p $(IDE_BUILDDIR)/builtins
-$(CLI_BUILDDIR):
-	mkdir -p $(CLI_BUILDDIR)
-$(CLI_BUILDDIR)/builtins:
-	mkdir -p $(CLI_BUILDDIR)/builtins
 
 # ── Clean ──────────────────────────────────────────────────────────
 clean:

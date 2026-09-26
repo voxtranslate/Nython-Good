@@ -1991,10 +1991,49 @@ node_ptr Parser::yieldStmt(){
     return make_node<YieldNode>(tok, expr);
 }
 
+// `print(` begins the call form when its matching `)` ends the statement;
+// otherwise the parentheses belong to an expression (`print (a + b) * 2`).
+static bool endsStatement(TokenType t){
+    return t == TokenType::NewLine || t == TokenType::SemiColon || t == TokenType::End || t == TokenType::Dedent;
+}
+
 node_ptr Parser::printStmt(){
     Token tok = token(); mustBe(TokenType::Print);
     auto node = make_node<PrintNode>(tok);
-    if(!see(TokenType::NewLine)&&!see(TokenType::SemiColon)&&!see(TokenType::End)){
+    auto pn = std::static_pointer_cast<PrintNode>(node);
+    bool call_form = false;
+    if(see(TokenType::ParenOpen)){
+        int depth = 1;
+        for(int k = 1; k < 100000; ++k){
+            TokenType t = peek(k).type();
+            if(t == TokenType::End) break;
+            if(t == TokenType::ParenOpen) depth++;
+            else if(t == TokenType::ParenClose && --depth == 0){
+                call_form = endsStatement(peek(k + 1).type());
+                break;
+            }
+        }
+    }
+    if(call_form){
+        mustBe(TokenType::ParenOpen);
+        while(!see(TokenType::ParenClose) && !see(TokenType::End)){
+            // `end` is also the block keyword (TokenType::EndBlock), so it is
+            // matched by spelling as well as by identifier.
+            if((see(TokenType::Identifier) || see(TokenType::EndBlock)) && (value() == "sep" || value() == "end")
+               && peek().type() == TokenType::Assign){
+                std::string kw = value();
+                next();
+                mustBe(TokenType::Assign);
+                node_ptr e = expression();
+                if(kw == "sep") pn->sep = e; else pn->end = e;
+            } else {
+                node->add(expression());
+            }
+            if(!have(TokenType::Comma)) break;
+        }
+        mustBe(TokenType::ParenClose);
+        pn->call_form = true;
+    } else if(!see(TokenType::NewLine)&&!see(TokenType::SemiColon)&&!see(TokenType::End)){
         node->add(expression());
         while(have(TokenType::Comma)) node->add(expression());
     }

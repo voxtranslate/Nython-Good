@@ -47,9 +47,13 @@ class Toolchain:
         self.seq = 0
         self.last_command = ""
 
-    # The IDE may be launched from anywhere; prefer a binary sitting next to the
-    # workspace, then fall back to PATH.
+    # The IDE may be launched from anywhere. The binary running the IDE
+    # exports its own path as NYTHON_EXE (src/main.cpp), which is always the
+    # right one; otherwise prefer a binary next to the workspace, then PATH.
     def _find_exe(self):
+        var own = getenv("NYTHON_EXE")
+        if own != none and own != "" and path_exists(own):
+            return "'" + string_replace(own, "'", "'\\''") + "'"
         for cand in ["./nython", "./ny_test", "./build/nython"]:
             if path_exists(cand):
                 return cand

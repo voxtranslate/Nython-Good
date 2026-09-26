@@ -748,7 +748,14 @@ private:
     // ─── Statements ─────────────────────────────────────────────────────
     Value evalPrint(Node* n, Context* ctx) {
         auto* pn = static_cast<PrintNode*>(n);
-        evalPrintArgs(pn->args, ctx);
+        std::string sep = " ", end = "\n";
+        if (pn->sep) sep = eval(pn->sep.get(), ctx).toString();
+        if (pn->end) end = eval(pn->end.get(), ctx).toString();
+        for (size_t i = 0; i < pn->args.size(); i++) {
+            if (i > 0) std::cout << sep;
+            std::cout << eval(pn->args[i].get(), ctx).toString();
+        }
+        std::cout << end;
         return NONE_VALUE;
     }
 

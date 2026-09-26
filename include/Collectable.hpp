@@ -13,6 +13,12 @@ using nython::kernel::Object;
 
 namespace nython::gc {
 
+// Heap objects currently alive (lists, maps, instances, call frames...):
+// created minus destroyed. The interpreter never reclaims containers
+// (GC_NOTES.md), so their count only grows; --profile attributes the growth
+// per function to find what makes memory climb.
+inline long long& collectables_created() { static long long n = 0; return n; }
+
 // Metadata which is stores in every heap Value
 class Collectable {
 public:

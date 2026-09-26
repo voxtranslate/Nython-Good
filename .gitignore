@@ -1,0 +1,5 @@
+build/
+ny_test
+__pycache__/
+*.pyc
+.nyide
