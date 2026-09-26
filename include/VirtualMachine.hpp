@@ -1955,8 +1955,12 @@ private:
     }
 
         VMVal run_loop() {
+        // GIL switch points (round 74), as in CPython: entering a frame and
+        // every backward jump (JUMP_ABSOLUTE closes each loop). A switch
+        // swaps this thread's stacks out and back in; references into them
+        // (`fr`) stay valid because deque elements never move.
+        nyconc::tick();
         while(true){
-            nyconc::tick();   // GIL switch point, before `fr` is taken (round 74)
             CallFrame& fr=call_stack_.back();
             if(fr.ip>=(int)fr.code->instructions.size()) return VMVal::make_none();
             const Instruction& ins=fr.code->instructions[fr.ip++];
@@ -2193,7 +2197,7 @@ private:
 
             // Jumps
             case Op::JUMP_FORWARD:         fr.ip=ins.arg; break;
-            case Op::JUMP_ABSOLUTE:        fr.ip=ins.arg; break;
+            case Op::JUMP_ABSOLUTE:        nyconc::tick(); fr.ip=ins.arg; break;
             case Op::JUMP_IF_FALSE: {
                 VMVal v=pop();
                 bool t = (v.type==VMType::INSTANCE) ? instance_truthy(v) : v.is_truthy();
