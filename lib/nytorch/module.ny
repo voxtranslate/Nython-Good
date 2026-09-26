@@ -662,6 +662,29 @@ def _fn_cosine_similarity(a, b, dim, eps):
     var den = (x.norm(dim) * y.norm(dim)).clamp(eps, 1e300)
     return num.div(den)
 
+# CTC (Graves et al. 2006) for one sequence: log_probs (T, C) (log-softmax
+# output), targets a list of label ids (no blanks). Forward-backward in log
+# space is native; its gradient w.r.t. log_probs flows back through autograd.
+def _fn_ctc_loss(log_probs, targets, blank):
+    var lp = _t_wrap(log_probs)
+    if len(lp.shape) != 2:
+        raise ValueError("ctc_loss: log_probs must be (T, C) for one sequence, got " + str(lp.shape))
+    var t0 = _fn_target_flat(targets)
+    var tg = []
+    var i = 0
+    while i < len(t0):
+        tg.append(int(t0[i]))
+        i = i + 1
+    var r = nt_ctc_loss(lp.data, lp.shape, tg, blank)
+    var out = _t_new1(r[0], [], lp)
+    if out.requires_grad:
+        var g0 = r[1]
+        var s = lp.shape
+        def _bw(g):
+            lp._acc(_t_fix(nt_binary("mul", g0, s, g, [])[0], s))
+        out._bw = _bw
+    return out
+
 def _fn_normalize(x, dim, eps):
     var t = _t_wrap(x)
     var n = t.norm(dim, true).clamp(eps, 1e300)
@@ -771,6 +794,8 @@ class _Functional:
         return _fn_bce_logits(x, target, pos_weight, reduction)
     def kl_div(self, input_logp, target_p, reduction="mean"):
         return _fn_kl_div(input_logp, target_p, reduction)
+    def ctc_loss(self, log_probs, targets, blank=0):
+        return _fn_ctc_loss(log_probs, targets, blank)
     def cosine_similarity(self, a, b, dim=none, eps=0.00000001):
         if dim == none:
             dim = -1

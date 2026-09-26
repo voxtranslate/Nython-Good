@@ -194,3 +194,12 @@ class ContrastiveLoss(Module):
             return d * d
         var h = d.rsub(self.margin).relu()
         return h * h
+
+
+# CTC for one sequence: forward(log_probs (T, C), targets label ids)
+class CTCLoss(_Loss):
+    def __init__(self, blank=0):
+        super().__init__()
+        self.blank = blank
+    def forward(self, log_probs, targets):
+        return _fn_ctc_loss(log_probs, targets, self.blank)

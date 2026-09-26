@@ -1,131 +1,186 @@
-# import nytorch  # removed: already loaded via nytorch.ny
-
 # ═══════════════════════════════════════════════════════════════════════════
-# NyTorch v3.0 — Part 14: Vision, Audio/Speech, Time Series, MLOps
-# Classes 231–260
+# NyTorch - Part 14: vision, audio/speech, time series, MLOps
+# Classes 231-260
+#
+# 1-d convolutional networks (ResNet, TCN, WaveNet), a YOLO detection head
+# with real box decoding and NMS, a ViT, log-mel spectrograms and MFCCs,
+# CTC decoding and a CTC-trained speech recogniser, ARIMA fitted by
+# Hannan-Rissanen least squares, a time-series transformer, and MLOps tools
+# (experiment tracking, metrics, alerts, checkpoints on disk, an LR range
+# test that really trains, a GP-based Bayesian optimiser).
+#
+# Signals are channels x length: a (C, L) tensor, a batch (N, C, L), or a
+# flat list of C * L values read as C rows.
 # ═══════════════════════════════════════════════════════════════════════════
 
-# ── 231: ConvBlock ─────────────────────────────────────────────────────────
 import "lib/nytorch/core.ny"
+import "lib/nytorch/reinforcement.ny"
 
-class ConvBlock:
+# (C, L) / (N, C, L) tensor, or a flat list of C * L values -> (C, L) or (N, C, L)
+def _cv_seq(x, channels):
+    var t = _t_wrap(x)
+    if t.dim() >= 2:
+        return t
+    if t.numel() % channels != 0:
+        raise ValueError("a signal of " + str(t.numel()) + " values is not " + str(channels) + " channels")
+    return t.reshape([channels, t.numel() // channels])
+
+# zeros on the left of the last (time) dimension
+def _cv_left_pad(x, p):
+    if p <= 0:
+        return x
+    var s = x.shape[:]
+    s[len(s) - 1] = p
+    return torch.cat([Tensor(nt_full(s, 0.0), false, s), x], len(s) - 1)
+
+def _cv_act(h, name):
+    if name == "relu":
+        return h.relu()
+    if name == "leaky_relu":
+        return h.leaky_relu(0.01)
+    if name == "silu":
+        return h.silu()
+    if name == "gelu":
+        return h.gelu()
+    if name == "none" or name == none:
+        return h
+    raise ValueError("unknown activation '" + str(name) + "'")
+
+def _cv_batch(x):
+    # (C, L) -> [(1, C, L), true]; (N, C, L) -> [x, false]
+    if x.dim() == 2:
+        return [x.unsqueeze(0), true]
+    return [x, false]
+
+def _cv_unbatch(y, was):
+    if was:
+        return y.squeeze(0)
+    return y
+
+
+# ── 231: ConvBlock: Conv1d ("same" padding) -> BatchNorm1d -> activation ────
+class ConvBlock(Module):
     def __init__(self, in_ch, out_ch, kernel, stride, use_bn, activation):
+        super().__init__()
         self.in_ch = in_ch
         self.out_ch = out_ch
         self.kernel = kernel
         self.stride = stride
         self.use_bn = use_bn
         self.activation = activation
-        self.weight = tensor_randn([out_ch * in_ch * kernel])
-        self.bias = tensor_zeros([out_ch])
-        self.bn_gamma = tensor_ones([out_ch])
-        self.bn_beta = tensor_zeros([out_ch])
-        self.bn_running_mean = tensor_zeros([out_ch])
-        self.bn_running_var = tensor_ones([out_ch])
+        self.conv = Conv1d(in_ch, out_ch, kernel, stride, kernel // 2)
+        self.bn = none
+        if use_bn:
+            self.bn = BatchNorm1d(out_ch)
         self.name = "ConvBlock"
 
+    # x: (C, L), (N, C, L) or a flat list; training selects batch statistics
     def forward(self, x, training):
-        var out_len = max(1, (len(x) - self.kernel) / self.stride + 1)
-        var out = conv1d(x, self.weight[:self.kernel])
-        if self.use_bn and training:
-            var m = tensor_mean(out)
-            var s = tensor_std(out)
-            if s < 1e-8:
-                var s = 1e-8
-            var out = tensor_apply(out, lambda v: (v - m) / s)
-        if self.activation == "relu":
-            out = tensor_apply(out, lambda v: relu(v))
-        elif self.activation == "leaky_relu":
-            out = tensor_apply(out, lambda v: leaky_relu(v))
-        elif self.activation == "silu":
-            out = tensor_apply(out, lambda v: v * sigmoid(v))
-        return out
+        self.train_mode(training)
+        var b = _cv_batch(_cv_seq(x, self.in_ch))
+        var h = self.conv.forward(b[0])
+        if self.bn != none:
+            h = self.bn.forward(h)
+        return _cv_unbatch(_cv_act(h, self.activation), b[1])
 
     def get_n_params(self):
-        return self.out_ch * self.in_ch * self.kernel + self.out_ch
+        return self.num_parameters()
 
     def get_name(self):
         return self.name
 
 
-# ── 232: ResidualBlock ─────────────────────────────────────────────────────
-class ResidualBlock:
+# ── 232: ResidualBlock (He et al. 2016, 1-d) ───────────────────────────────
+#   relu(x + BN(conv(dropout(relu(BN(conv(x)))))))
+class ResidualBlock(Module):
     def __init__(self, channels, kernel, dropout_rate):
+        super().__init__()
         self.channels = channels
         self.kernel = kernel
         self.dropout_rate = dropout_rate
-        self.conv1_w = tensor_randn([channels * channels * kernel])
-        self.conv2_w = tensor_randn([channels * channels * kernel])
-        self.bn1_gamma = tensor_ones([channels])
-        self.bn1_beta = tensor_zeros([channels])
-        self.bn2_gamma = tensor_ones([channels])
-        self.bn2_beta = tensor_zeros([channels])
-        self.shortcut_w = none   # only needed if dims change
+        self.conv1 = Conv1d(channels, channels, kernel, 1, kernel // 2, 1, 1, false)
+        self.bn1 = BatchNorm1d(channels)
+        self.conv2 = Conv1d(channels, channels, kernel, 1, kernel // 2, 1, 1, false)
+        self.bn2 = BatchNorm1d(channels)
+        self.drop = Dropout(dropout_rate)
         self.name = "ResidualBlock"
 
     def forward(self, x, training):
-        var residual = x
-        var out = conv1d(x, self.conv1_w[:self.kernel])
-        var m1 = tensor_mean(out)
-        var s1 = max(tensor_std(out), 1e-8)
-        var out = tensor_apply(out, lambda v: relu((v - m1) / s1))
-        out = conv1d(out, self.conv2_w[:self.kernel])
-        var m2 = tensor_mean(out)
-        var s2 = max(tensor_std(out), 1e-8)
-        out = tensor_apply(out, lambda v: (v - m2) / s2)
-        if len(out) == len(residual):
-            out = tensor_add(out, residual)
-        return tensor_apply(out, lambda v: relu(v))
+        self.train_mode(training)
+        var b = _cv_batch(_cv_seq(x, self.channels))
+        var h = self.drop.forward(self.bn1.forward(self.conv1.forward(b[0])).relu())
+        h = self.bn2.forward(self.conv2.forward(h))
+        return _cv_unbatch((h + b[0]).relu(), b[1])
 
     def get_name(self):
         return self.name
 
 
-# ── 233: SimpleResNet ──────────────────────────────────────────────────────
-class SimpleResNet:
+# ── 233: SimpleResNet: stem conv -> residual blocks -> global average pool
+# -> linear classifier. forward returns logits (n_classes,) per signal.
+class SimpleResNet(Module):
     def __init__(self, in_channels, n_blocks, hidden_channels, n_classes):
+        super().__init__()
         self.in_channels = in_channels
         self.n_blocks = n_blocks
         self.hidden_channels = hidden_channels
         self.n_classes = n_classes
-        self.stem_w = tensor_randn([hidden_channels * in_channels * 7])
+        self.stem = Conv1d(in_channels, hidden_channels, 7, 1, 3)
+        self.stem_bn = BatchNorm1d(hidden_channels)
         self.blocks = []
-        for i in range(0, n_blocks):
-            self.blocks = self.blocks + [ResidualBlock(hidden_channels, 3, 0.1)]
-        self.head_w = tensor_randn([n_classes * hidden_channels])
-        self.head_b = tensor_zeros([n_classes])
+        var i = 0
+        while i < n_blocks:
+            self.blocks.append(ResidualBlock(hidden_channels, 3, 0.1))
+            i = i + 1
+        self.head = Linear(hidden_channels, n_classes)
         self.name = "SimpleResNet"
 
     def forward(self, x, training):
-        var h = conv1d(x, self.stem_w[:7])
-        var h = tensor_apply(h, lambda v: relu(v))
-        for block in self.blocks:
-            h = block.forward(h, training)
-        var pooled_val = tensor_mean(h)
-        var pooled = tensor([pooled_val])
-        var logits = tensor_randn([self.n_classes])
-        return logits
+        self.train_mode(training)
+        var b = _cv_batch(_cv_seq(x, self.in_channels))
+        var h = self.stem_bn.forward(self.stem.forward(b[0])).relu()
+        var i = 0
+        while i < len(self.blocks):
+            h = self.blocks[i].forward(h, training)
+            i = i + 1
+        return _cv_unbatch(self.head.forward(h.mean(2)), b[1])
 
+    # class probabilities as a list
     def classify(self, x):
-        var logits = self.forward(x, false)
-        return softmax(logits)
+        var p = none
+        with no_grad():
+            p = self.forward(x, false).softmax(-1)
+        return p.data
 
     def n_params(self):
-        return self.hidden_channels * self.in_channels * 7 + self.n_blocks * self.hidden_channels * self.hidden_channels * 6 + self.n_classes * self.hidden_channels
+        return self.num_parameters()
 
     def get_name(self):
         return self.name
 
 
-# ── 234: YOLOHead ─────────────────────────────────────────────────────────
-class YOLOHead:
-    def __init__(self, n_classes, n_anchors, grid_size):
+# ── 234: YOLOHead (Redmon & Farhadi 2018) ──────────────────────────────────
+# A 1x1 convolution over an (in_channels, S, S) feature map predicts, per
+# cell and anchor, (tx, ty, tw, th, objectness, class logits). decode:
+#   bx = (sigmoid(tx) + cx) stride,  bw = anchor_w exp(tw), ...
+#   score = sigmoid(obj) * max_c sigmoid(class_c)
+# then confidence filtering and per-class NMS. Boxes are [cx, cy, w, h].
+class YOLOHead(Module):
+    def __init__(self, n_classes, n_anchors, grid_size, in_channels=64, stride=32):
+        super().__init__()
         self.n_classes = n_classes
         self.n_anchors = n_anchors
         self.grid_size = grid_size
-        self.n_outputs = n_anchors * (5 + n_classes)   # tx,ty,tw,th,conf + classes
-        self.conv_w = tensor_randn([self.n_outputs * 64])
-        self.anchors = [[10.0, 13.0], [16.0, 30.0], [33.0, 23.0]]
+        self.in_channels = in_channels
+        self.stride = stride
+        self.n_outputs = n_anchors * (5 + n_classes)
+        self.conv = Linear(in_channels, self.n_outputs)
+        var base = [[116.0, 90.0], [156.0, 198.0], [373.0, 326.0], [30.0, 61.0], [62.0, 45.0], [59.0, 119.0], [10.0, 13.0], [16.0, 30.0], [33.0, 23.0]]
+        self.anchors = []
+        var i = 0
+        while i < n_anchors:
+            self.anchors.append(base[i % len(base)])
+            i = i + 1
         self.iou_threshold = 0.5
         self.conf_threshold = 0.25
         self.name = "YOLOHead"
@@ -133,9 +188,7 @@ class YOLOHead:
     def decode_box(self, tx, ty, tw, th, anchor_w, anchor_h, grid_x, grid_y, stride):
         var bx = (sigmoid(tx) + float(grid_x)) * float(stride)
         var by = (sigmoid(ty) + float(grid_y)) * float(stride)
-        var bw = exp(tw) * anchor_w
-        var bh = exp(th) * anchor_h
-        return [bx, by, bw, bh]
+        return [bx, by, exp(tw) * anchor_w, exp(th) * anchor_h]
 
     def compute_iou(self, box1, box2):
         var x1 = max(box1[0] - box1[2] / 2.0, box2[0] - box2[2] / 2.0)
@@ -143,90 +196,171 @@ class YOLOHead:
         var x2 = min(box1[0] + box1[2] / 2.0, box2[0] + box2[2] / 2.0)
         var y2 = min(box1[1] + box1[3] / 2.0, box2[1] + box2[3] / 2.0)
         var inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
-        var area1 = box1[2] * box1[3]
-        var area2 = box2[2] * box2[3]
-        var union_area = area1 + area2 - inter
-        if union_area < 1e-8:
+        var union_area = box1[2] * box1[3] + box2[2] * box2[3] - inter
+        if union_area < 0.00000001:
             return 0.0
         return inter / union_area
 
+    # greedy NMS: indices kept, highest score first
     def nms(self, boxes, scores):
+        var order = tensor_topk(scores, len(scores))
         var keep = []
-        var indices = tensor_topk(tensor(scores), len(scores))
-        for item in indices:
-            var idx = item["index"]
-            var dominated = false
-            for kept_idx in keep:
-                var iou = self.compute_iou(boxes[idx], boxes[kept_idx])
-                if iou > self.iou_threshold:
-                    var dominated = true
-            if not dominated:
-                var keep = keep + [idx]
+        var i = 0
+        while i < len(order):
+            var idx = order[i]["index"]
+            var ok = true
+            var j = 0
+            while j < len(keep):
+                if self.compute_iou(boxes[idx], boxes[keep[j]]) > self.iou_threshold:
+                    ok = false
+                j = j + 1
+            if ok:
+                keep.append(idx)
+            i = i + 1
         return keep
 
+    # raw predictions (S, S, n_anchors, 5 + n_classes) from (C, S, S) or a flat map
+    def raw(self, feature_map):
+        var t = _t_wrap(feature_map)
+        var C = self.in_channels
+        if t.dim() == 1:
+            var cells = t.numel() // C
+            var S = int(sqrt(float(cells)) + 0.5)
+            if S * S * C != t.numel():
+                raise ValueError("feature map of " + str(t.numel()) + " values is not " + str(C) + " x S x S")
+            t = t.reshape([C, S, S])
+        var S2 = t.size()[1]
+        var cells2 = t.permute([1, 2, 0]).reshape([S2 * S2, C])
+        return self.conv.forward(cells2).reshape([S2, S2, self.n_anchors, 5 + self.n_classes])
+
+    # -> [{"conf", "class", "box"}] after thresholding and per-class NMS
     def forward(self, feature_map):
-        var n_pred = self.n_anchors * self.grid_size * self.grid_size
-        var preds = []
-        for i in range(0, min(n_pred, 4)):
-            var conf = sigmoid(0.5)
-            if conf > self.conf_threshold:
-                var preds = preds + [{"conf": conf, "class": 0, "box": [0.5, 0.5, 0.3, 0.3]}]
-        return preds
+        var r = none
+        with no_grad():
+            r = self.raw(feature_map)
+        var S = r.size()[0]
+        var P = 5 + self.n_classes
+        var d = _t_flat(r.data)
+        var boxes = []
+        var scores = []
+        var classes = []
+        var gy = 0
+        while gy < S:
+            var gx = 0
+            while gx < S:
+                var a = 0
+                while a < self.n_anchors:
+                    var o = ((gy * S + gx) * self.n_anchors + a) * P
+                    var best_c = 0
+                    var best_p = 0.0
+                    var c = 0
+                    while c < self.n_classes:
+                        var pc = sigmoid(d[o + 5 + c])
+                        if pc > best_p:
+                            best_p = pc
+                            best_c = c
+                        c = c + 1
+                    var conf = sigmoid(d[o + 4]) * best_p
+                    if conf > self.conf_threshold:
+                        boxes.append(self.decode_box(d[o], d[o + 1], d[o + 2], d[o + 3], self.anchors[a][0], self.anchors[a][1], gx, gy, self.stride))
+                        scores.append(conf)
+                        classes.append(best_c)
+                    a = a + 1
+                gx = gx + 1
+            gy = gy + 1
+        var out = []
+        var cls_seen = sorted(classes)
+        var k = 0
+        while k < len(cls_seen):
+            var cl = cls_seen[k]
+            if k == 0 or cls_seen[k - 1] != cl:
+                var bi = []
+                var bb = []
+                var bs = []
+                var i = 0
+                while i < len(classes):
+                    if classes[i] == cl:
+                        bi.append(i)
+                        bb.append(boxes[i])
+                        bs.append(scores[i])
+                    i = i + 1
+                var kept = self.nms(bb, bs)
+                var j = 0
+                while j < len(kept):
+                    out.append({"conf": bs[kept[j]], "class": cl, "box": bb[kept[j]]})
+                    j = j + 1
+            k = k + 1
+        return out
 
     def get_name(self):
         return self.name
 
 
-# ── 235: SegmentationHead ─────────────────────────────────────────────────
-class SegmentationHead:
+# ── 235: SegmentationHead (1-d): nearest upsampling, 3-tap conv to class
+# logits, per-position softmax; class_probs are the average over positions.
+class SegmentationHead(Module):
     def __init__(self, in_channels, n_classes, upsample_factor):
+        super().__init__()
         self.in_channels = in_channels
         self.n_classes = n_classes
         self.upsample_factor = upsample_factor
-        self.conv_w = tensor_randn([n_classes * in_channels * 3])
-        self.class_embed = tensor_randn([n_classes * in_channels])
+        self.conv = Conv1d(in_channels, n_classes, 3, 1, 1)
         self.name = "SegmentationHead"
 
+    # (C, L) -> (C, L * factor), each position repeated
     def upsample(self, feature, factor):
-        var result = []
-        for i in range(0, len(feature)):
-            for j in range(0, factor):
-                var result = result + [feature[i]]
-        return tensor(result)
+        var t = _t_wrap(feature)
+        var L = t.size()[t.dim() - 1]
+        var idx = []
+        var i = 0
+        while i < L * factor:
+            idx.append(i // factor)
+            i = i + 1
+        return t.index_select(t.dim() - 1, idx)
 
     def forward(self, features):
-        var upsampled = self.upsample(features, self.upsample_factor)
-        var out = conv1d(upsampled, self.conv_w[:3])
-        var class_probs = softmax(tensor_randn([self.n_classes]))
-        return {"pixel_probs": out, "class_probs": class_probs}
+        var x = _cv_seq(features, self.in_channels)
+        var logits = self.conv.forward(self.upsample(x, self.upsample_factor))
+        var probs = logits.softmax(0)
+        return {"pixel_probs": probs, "class_probs": probs.mean(1), "logits": logits}
 
     def get_name(self):
         return self.name
 
 
-# ── 236: ImagePatchEmbedder ────────────────────────────────────────────────
-class ImagePatchEmbedder:
+# ── 236: ImagePatchEmbedder (ViT patchify, Dosovitskiy et al. 2021) ─────────
+# A single-channel img_size x img_size image (flat or 2-d) -> [CLS, patches]
+# linearly embedded, plus learned positions: (n_patches + 1, embed_dim).
+class ImagePatchEmbedder(Module):
     def __init__(self, img_size, patch_size, embed_dim):
+        super().__init__()
+        if img_size % patch_size != 0:
+            raise ValueError("img_size must be a multiple of patch_size")
         self.img_size = img_size
         self.patch_size = patch_size
         self.embed_dim = embed_dim
-        self.n_patches = int((img_size / patch_size) * (img_size / patch_size))
-        self.projection = tensor_randn([patch_size * patch_size * embed_dim])
-        self.cls_token = tensor_randn([embed_dim])
-        self.pos_embed = tensor_randn([(self.n_patches + 1) * embed_dim])
+        self.n_side = img_size // patch_size
+        self.n_patches = self.n_side * self.n_side
+        self.projection = Linear(patch_size * patch_size, embed_dim)
+        self.cls_token = Parameter(Tensor(nt_normal(embed_dim, 0.0, 0.02)))
+        var ps = [self.n_patches + 1, embed_dim]
+        self.pos_embed = Parameter(Tensor(nt_normal(ps, 0.0, 0.02), false, ps))
         self.name = "ImagePatchEmbedder"
 
+    def patches(self, image):
+        var t = _t_wrap(image)
+        if t.numel() != self.img_size * self.img_size:
+            raise ValueError("expected " + str(self.img_size) + "x" + str(self.img_size) + " pixels, got " + str(t.numel()))
+        var p = self.patch_size
+        var n = self.n_side
+        return t.reshape([n, p, n, p]).permute([0, 2, 1, 3]).reshape([n * n, p * p])
+
     def embed_patch(self, patch_data):
-        return tensor_randn([self.embed_dim])
+        return self.projection.forward(_t_wrap(patch_data))
 
     def forward(self, flat_image):
-        var patches = []
-        var n = self.n_patches
-        var patch_vals = []
-        for i in range(0, n):
-            var patch_vals = patch_vals + [tensor_randn([self.embed_dim])]
-        var seq = [self.cls_token] + patch_vals
-        return seq
+        var e = self.projection.forward(self.patches(flat_image))
+        return torch.cat([self.cls_token.unsqueeze(0), e], 0) + self.pos_embed
 
     def get_n_patches(self):
         return self.n_patches
@@ -235,9 +369,11 @@ class ImagePatchEmbedder:
         return self.name
 
 
-# ── 237: VisionTransformer (ViT) ───────────────────────────────────────────
-class VisionTransformer:
+# ── 237: VisionTransformer: patch embedding -> pre-norm encoder layers ->
+# LayerNorm -> linear head on the CLS token.
+class VisionTransformer(Module):
     def __init__(self, img_size, patch_size, embed_dim, n_heads, n_layers, n_classes, mlp_ratio):
+        super().__init__()
         self.img_size = img_size
         self.patch_size = patch_size
         self.embed_dim = embed_dim
@@ -247,32 +383,38 @@ class VisionTransformer:
         self.mlp_ratio = mlp_ratio
         self.patch_embed = ImagePatchEmbedder(img_size, patch_size, embed_dim)
         self.n_patches = self.patch_embed.get_n_patches()
-        self.attn_weights = []
-        for i in range(0, n_layers):
-            self.attn_weights = self.attn_weights + [tensor_randn([embed_dim * embed_dim])]
-        self.head_w = tensor_randn([n_classes * embed_dim])
+        self.layers = []
+        var i = 0
+        while i < n_layers:
+            self.layers.append(TransformerEncoderLayer(embed_dim, n_heads, int(embed_dim * mlp_ratio), 0.0, "gelu", false, true))
+            i = i + 1
+        self.norm = LayerNorm(embed_dim)
+        self.head = Linear(embed_dim, n_classes)
         self.name = "VisionTransformer"
 
     def forward(self, flat_image):
-        var seq = self.patch_embed.forward(flat_image)
-        var cls = seq[0]
-        for w in self.attn_weights:
-            var cls = tensor_randn([self.embed_dim])
-        var logits = tensor_randn([self.n_classes])
-        return logits
+        var h = self.patch_embed.forward(flat_image)
+        var i = 0
+        while i < len(self.layers):
+            h = self.layers[i].forward(h, none, none)
+            i = i + 1
+        return self.head.forward(self.norm.forward(h).select(0, 0))
 
     def classify(self, flat_image):
-        var logits = self.forward(flat_image)
-        return {"probs": softmax(logits), "pred_class": tensor_argmax(softmax(logits))}
+        var p = none
+        with no_grad():
+            p = self.forward(flat_image).softmax(0)
+        return {"probs": p.data, "pred_class": p.argmax().item()}
 
     def n_params(self):
-        return self.n_patches * self.embed_dim + self.n_layers * self.embed_dim * self.embed_dim * 4 + self.n_classes * self.embed_dim
+        return self.num_parameters()
 
     def get_name(self):
         return self.name
 
 
-# ── 238: MelSpectrogram ────────────────────────────────────────────────────
+# ── 238: MelSpectrogram: power STFT (Hann window, centred frames) through a
+# triangular mel filterbank on [f_min, f_max] -> (n_frames, n_mels).
 class MelSpectrogram:
     def __init__(self, sample_rate, n_fft, hop_length, n_mels, f_min, f_max):
         self.sample_rate = sample_rate
@@ -281,22 +423,21 @@ class MelSpectrogram:
         self.n_mels = n_mels
         self.f_min = f_min
         self.f_max = f_max
-        self.filterbank = mel_filterbank(n_mels, n_fft, float(sample_rate))
+        var fb = nt_mel_filterbank(n_mels, n_fft, float(sample_rate), f_min, f_max)
+        self.filterbank = Tensor(fb[0], false, fb[1])
         self.name = "MelSpectrogram"
 
+    # magnitude STFT (n_fft/2 + 1, n_frames)
+    def stft(self, waveform):
+        var r = nt_stft(_t_flat(_t_wrap(waveform).data), self.n_fft, self.hop_length)
+        return Tensor(r[0], false, r[1])
+
     def compute(self, waveform):
-        var stft = stft_magnitude(waveform, self.n_fft, self.hop_length)
-        var n_frames = len(stft)
-        var mel_frames = []
-        for i in range(0, n_frames):
-            var energy = stft[i]
-            var mel_energy = tensor_apply(self.filterbank, lambda f: log(max(abs(energy - f / 1000.0), 1e-10)))
-            var mel_frames = mel_frames + [tensor_mean(mel_energy)]
-        return tensor(mel_frames)
+        var S = self.stft(waveform)
+        return (self.filterbank.matmul(S * S)).t()
 
     def compute_db(self, waveform):
-        var mel = self.compute(waveform)
-        return tensor_apply(mel, lambda v: 10.0 * log(max(abs(v), 1e-10)) / log(10.0))
+        return self.compute(waveform).clamp(0.0000000001, 1e300).log() * (10.0 / log(10.0))
 
     def get_n_mels(self):
         return self.n_mels
@@ -305,7 +446,8 @@ class MelSpectrogram:
         return self.name
 
 
-# ── 239: MFCCExtractor ─────────────────────────────────────────────────────
+# ── 239: MFCCExtractor: log mel energies -> orthonormal DCT-II, the first
+# n_mfcc coefficients; returned as (n_mfcc, n_frames) like librosa.
 class MFCCExtractor:
     def __init__(self, sample_rate, n_mfcc, n_mels, n_fft, hop_length):
         self.sample_rate = sample_rate
@@ -314,56 +456,52 @@ class MFCCExtractor:
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.mel_spec = MelSpectrogram(sample_rate, n_fft, hop_length, n_mels, 0.0, float(sample_rate) / 2.0)
-        self.filterbank = mel_filterbank(n_mels, n_fft, float(sample_rate))
+        var d = nt_dct_matrix(n_mfcc, n_mels)
+        self.dct = Tensor(d[0], false, d[1])
         self.name = "MFCCExtractor"
 
     def extract(self, waveform):
-        var mel = self.mel_spec.compute(waveform)
-        var coeffs = mfcc(mel, self.n_mfcc)
-        return coeffs
+        var logmel = self.mel_spec.compute(waveform).clamp(0.0000000001, 1e300).log()
+        return self.dct.matmul(logmel.t())
 
+    # first differences along time, (n_mfcc, n_frames - 1)
     def extract_delta(self, waveform):
-        var coeffs = self.extract(waveform)
-        var delta = tensor_diff(coeffs)
-        return {"mfcc": coeffs, "delta": delta, "n_coeffs": self.n_mfcc}
+        var c = self.extract(waveform)
+        var T = c.size()[1]
+        var delta = c.slice(1, 1, T) - c.slice(1, 0, T - 1)
+        return {"mfcc": c, "delta": delta, "n_coeffs": self.n_mfcc}
 
     def get_name(self):
         return self.name
 
 
-# ── 240: WaveNetBlock ──────────────────────────────────────────────────────
-class WaveNetBlock:
+# ── 240: WaveNetBlock (van den Oord et al. 2016) ───────────────────────────
+# z = tanh(W_f *_d x) . sigmoid(W_g *_d x) with causal dilated convolutions;
+# returns [x + W_res z, skip_accum + W_skip z] (1x1 convolutions).
+class WaveNetBlock(Module):
     def __init__(self, channels, dilation, kernel):
+        super().__init__()
         self.channels = channels
         self.dilation = dilation
         self.kernel = kernel
-        self.filter_w = tensor_randn([channels * channels * kernel])
-        self.gate_w = tensor_randn([channels * channels * kernel])
-        self.res_w = tensor_randn([channels * channels])
-        self.skip_w = tensor_randn([channels * channels])
+        self.filter_conv = Conv1d(channels, channels, kernel, 1, 0, dilation)
+        self.gate_conv = Conv1d(channels, channels, kernel, 1, 0, dilation)
+        self.res_conv = Conv1d(channels, channels, 1)
+        self.skip_conv = Conv1d(channels, channels, 1)
         self.name = "WaveNetBlock"
 
-    def dilated_conv(self, x, weight, dilation):
-        if dilation == 1:
-            return conv1d(x, weight[:self.kernel])
-        var dilated = []
-        for i in range(0, len(x)):
-            if i % dilation == 0:
-                var dilated = dilated + [x[i]]
-        var out = conv1d(tensor(dilated), weight[:self.kernel])
-        return out
+    def dilated_conv(self, x, conv, dilation):
+        return conv.forward(_cv_left_pad(x, (self.kernel - 1) * dilation))
 
     def forward(self, x, skip_accum):
-        var h_filter = self.dilated_conv(x, self.filter_w, self.dilation)
-        var h_gate = self.dilated_conv(x, self.gate_w, self.dilation)
-        var n = min(len(h_filter), len(h_gate))
-        var h = tensor_mul(
-            tensor_apply(h_filter[:n], lambda v: tanh_fn(v)),
-            tensor_apply(h_gate[:n], lambda v: sigmoid(v))
-        )
-        var skip_val = tensor_mean(h)
-        var res_out = tensor_add(x[:len(h)], h)
-        return [res_out, skip_accum + skip_val]
+        var h = _cv_seq(x, self.channels)
+        var z = self.dilated_conv(h, self.filter_conv, self.dilation).tanh() * self.dilated_conv(h, self.gate_conv, self.dilation).sigmoid()
+        var skip = self.skip_conv.forward(z)
+        if not _t_isnum(skip_accum):
+            skip = skip + skip_accum
+        elif skip_accum != 0:
+            skip = skip + skip_accum
+        return [h + self.res_conv.forward(z), skip]
 
     def get_dilation(self):
         return self.dilation
@@ -372,38 +510,49 @@ class WaveNetBlock:
         return self.name
 
 
-# ── 241: WaveNet ───────────────────────────────────────────────────────────
-class WaveNet:
+# ── 241: WaveNet: causal input conv, n_cycles x n_layers blocks with
+# dilations 1, 2, 4, ..., relu(sum of skips) -> 1x1 -> relu -> 1x1 to
+# n_classes (mu-law bins). logits(x) is (n_classes, L); forward(x) is the
+# predicted distribution of the next sample, as a list.
+class WaveNet(Module):
     def __init__(self, channels, n_layers, n_cycles, n_classes):
+        super().__init__()
         self.channels = channels
         self.n_layers = n_layers
         self.n_cycles = n_cycles
         self.n_classes = n_classes
-        self.input_conv_w = tensor_randn([channels * channels])
+        self.input_conv = Conv1d(1, channels, 2)
         self.blocks = []
-        for cycle in range(0, n_cycles):
-            for layer in range(0, n_layers):
-                var dilation = 1
-                var d = 1
-                for k in range(0, layer):
-                    var d = d * 2
-                var dilation = d
-                self.blocks = self.blocks + [WaveNetBlock(channels, dilation, 2)]
-        self.output_w1 = tensor_randn([channels * channels])
-        self.output_w2 = tensor_randn([n_classes * channels])
+        var c = 0
+        while c < n_cycles:
+            var d = 1
+            var l = 0
+            while l < n_layers:
+                self.blocks.append(WaveNetBlock(channels, d, 2))
+                d = d * 2
+                l = l + 1
+            c = c + 1
+        self.out1 = Conv1d(channels, channels, 1)
+        self.out2 = Conv1d(channels, n_classes, 1)
         self.name = "WaveNet"
 
+    def logits(self, x):
+        var h = self.input_conv.forward(_cv_left_pad(_cv_seq(x, 1), 1))
+        var skip = 0.0
+        var i = 0
+        while i < len(self.blocks):
+            var r = self.blocks[i].forward(h, skip)
+            h = r[0]
+            skip = r[1]
+            i = i + 1
+        return self.out2.forward(self.out1.forward(skip.relu()).relu())
+
     def forward(self, x):
-        var h = conv1d(x, self.input_conv_w[:3])
-        var h = tensor_apply(h, lambda v: relu(v))
-        var skip_total = 0.0
-        for block in self.blocks:
-            var result = block.forward(h, skip_total)
-            h = result[0]
-            var skip_total = result[1]
-        var output = tensor_apply(tensor_randn([self.n_classes]), lambda v: relu(v))
-        var output = softmax(output)
-        return output
+        var p = none
+        with no_grad():
+            var lg = self.logits(x)
+            p = lg.select(1, lg.size()[1] - 1).softmax(0)
+        return p.data
 
     def n_blocks(self):
         return self.n_layers * self.n_cycles
@@ -420,133 +569,185 @@ class CTCDecoder:
         self.vocab_size = len(vocab)
         self.name = "CTCDecoder"
 
+    # best path: argmax per frame, merge repeats, drop blanks. A frame is a
+    # score vector, or already a label id.
     def greedy_decode(self, log_probs_seq):
+        var frames = log_probs_seq
+        if isinstance(frames, Tensor):
+            var rows = []
+            var r = 0
+            while r < frames.size()[0]:
+                rows.append(frames.select(0, r).data)
+                r = r + 1
+            frames = rows
         var tokens = []
         var prev = self.blank_id
-        for frame in log_probs_seq:
-            if type(frame) == "list" or type(frame) == "tensor":
-                var best = tensor_argmax(softmax(tensor(frame)))
-                if best != self.blank_id and best != prev:
-                    var tokens = tokens + [best]
-                var prev = best
+        var i = 0
+        while i < len(frames):
+            var f = frames[i]
+            var best = 0
+            if _t_isnum(f):
+                best = int(f)
+                if best < 0 or best >= self.vocab_size:
+                    raise IndexError("label " + str(best) + " out of range for a vocabulary of " + str(self.vocab_size))
             else:
-                var best_id = int(frame) % self.vocab_size
-                if best_id != self.blank_id and best_id != prev:
-                    tokens = tokens + [best_id]
-                prev = best_id
+                best = Tensor(_t_flat(_t_wrap(f).data)).argmax().item()
+            if best != self.blank_id and best != prev:
+                tokens.append(best)
+            prev = best
+            i = i + 1
         return tokens
 
     def decode_to_string(self, token_ids):
-        var chars = []
-        for tid in token_ids:
-            if tid < len(self.vocab):
-                var chars = chars + [self.vocab[tid]]
-        return chars.join("")
+        var s = ""
+        var i = 0
+        while i < len(token_ids):
+            if token_ids[i] < len(self.vocab):
+                s = s + self.vocab[token_ids[i]]
+            i = i + 1
+        return s
 
-    def compute_loss(self, input_len, target_len):
-        return ctc_loss(input_len, target_len)
+    # CTC negative log-likelihood of the target ids under per-frame
+    # log-probabilities (T, V) (differentiable when log_probs is a Tensor)
+    def compute_loss(self, log_probs, targets):
+        if _t_isnum(log_probs):
+            raise TypeError("compute_loss(log_probs (T, V), targets): the old compute_loss(input_len, target_len) returned a made-up number")
+        var lp = log_probs
+        if not isinstance(lp, Tensor):
+            lp = Tensor(log_probs)
+        return _fn_ctc_loss(lp, targets, self.blank_id).item()
 
     def get_name(self):
         return self.name
 
 
-# ── 243: ASRPipeline ───────────────────────────────────────────────────────
-class ASRPipeline:
+# ── 243: ASRPipeline: MFCC features -> two 1-d convolutions -> per-frame
+# log-probabilities over the vocabulary -> greedy CTC decoding. train_step
+# fits it to (waveform, transcript) pairs with the CTC loss.
+class ASRPipeline(Module):
     def __init__(self, sample_rate, n_mfcc, vocab, model_channels):
+        super().__init__()
         self.sample_rate = sample_rate
         self.n_mfcc = n_mfcc
         self.vocab = vocab
         self.model_channels = model_channels
         self.feature_extractor = MFCCExtractor(sample_rate, n_mfcc, 40, 512, 128)
-        self.encoder_w = tensor_randn([model_channels * n_mfcc])
-        self.decoder_w = tensor_randn([len(vocab) * model_channels])
+        self.norm = BatchNorm1d(n_mfcc)
+        self.enc = Conv1d(n_mfcc, model_channels, 3, 1, 1)
+        self.dec = Conv1d(model_channels, len(vocab), 1)
         self.ctc_decoder = CTCDecoder(vocab, 0)
+        self.opt = none
         self.name = "ASRPipeline"
 
+    def features(self, waveform):
+        return self.feature_extractor.extract(waveform)
+
+    # (T, V) log-probabilities
+    def log_probs(self, feats):
+        var h = self.enc.forward(self.norm.forward(feats.unsqueeze(0))).relu()
+        return self.dec.forward(h).squeeze(0).t().log_softmax(1)
+
     def transcribe(self, waveform):
-        var features = self.feature_extractor.extract(waveform)
-        var encoded = tensor_randn([self.model_channels])
-        var logits_per_frame = []
-        var n_frames = max(1, len(features) / self.n_mfcc)
-        for i in range(0, n_frames):
-            var logits_per_frame = logits_per_frame + [tensor_randn([len(self.vocab)])]
-        var token_ids = self.ctc_decoder.greedy_decode(logits_per_frame)
-        var text = self.ctc_decoder.decode_to_string(token_ids)
-        return {"text": text, "n_frames": n_frames, "n_tokens": len(token_ids)}
+        var lp = none
+        var was = self.training
+        self.eval()
+        with no_grad():
+            lp = self.log_probs(self.features(waveform))
+        self.train_mode(was)
+        var ids = self.ctc_decoder.greedy_decode(lp)
+        return {"text": self.ctc_decoder.decode_to_string(ids), "n_frames": lp.size()[0], "n_tokens": len(ids)}
+
+    def encode_text(self, text):
+        var ids = []
+        var i = 0
+        while i < len(text):
+            var k = 1
+            var found = -1
+            while k < len(self.vocab):
+                if self.vocab[k] == text[i]:
+                    found = k
+                k = k + 1
+            if found < 0:
+                raise ValueError("character '" + text[i] + "' is not in the vocabulary")
+            ids.append(found)
+            i = i + 1
+        return ids
+
+    def train_step(self, waveform, transcript, lr):
+        if self.opt == none:
+            self.opt = Adam(self.parameters(), lr)
+        self.train()
+        self.opt.zero_grad()
+        var loss = _fn_ctc_loss(self.log_probs(self.features(waveform)), self.encode_text(transcript), 0)
+        loss.backward()
+        self.opt.step()
+        return loss.item()
 
     def get_name(self):
         return self.name
 
 
-# ── 244: TCNLayer (Temporal Convolutional Network) ─────────────────────────
-class TCNLayer:
+# ── 244: TCNLayer (Bai et al. 2018): two causal dilated convolutions with
+# ReLU and dropout, plus a residual (1x1 conv when the width changes).
+class TCNLayer(Module):
     def __init__(self, in_channels, out_channels, kernel, dilation, dropout):
+        super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.kernel = kernel
         self.dilation = dilation
         self.dropout = dropout
-        self.conv_w = tensor_randn([out_channels * in_channels * kernel])
-        self.bn_gamma = tensor_ones([out_channels])
-        self.downsample_w = none
+        self.conv1 = Conv1d(in_channels, out_channels, kernel, 1, 0, dilation)
+        self.conv2 = Conv1d(out_channels, out_channels, kernel, 1, 0, dilation)
+        self.drop = Dropout(dropout)
+        self.downsample = none
         if in_channels != out_channels:
-            self.downsample_w = tensor_randn([out_channels * in_channels])
+            self.downsample = Conv1d(in_channels, out_channels, 1)
         self.name = "TCNLayer"
 
-    def causal_conv(self, x):
-        var pad_size = (self.kernel - 1) * self.dilation
-        var padded = tensor_zeros([pad_size])
-        if len(x) > 0:
-            var padded = tensor_add(tensor_zeros([pad_size]), tensor_zeros([pad_size]))
-        var combined_list = []
-        for i in range(0, pad_size):
-            var combined_list = combined_list + [0.0]
-        for i in range(0, len(x)):
-            combined_list = combined_list + [x[i]]
-        var combined = tensor(combined_list)
-        return conv1d(combined, self.conv_w[:self.kernel])
+    def causal_conv(self, x, conv):
+        return conv.forward(_cv_left_pad(x, (self.kernel - 1) * self.dilation))
 
     def forward(self, x, training):
-        var residual = x
-        var out = self.causal_conv(x)
-        var m = tensor_mean(out)
-        var s = max(tensor_std(out), 1e-8)
-        var out = tensor_apply(out, lambda v: relu((v - m) / s))
-        if training and self.dropout > 0.0:
-            var mask = tensor_apply(tensor_rand([len(out)]), lambda v: 1.0 if v > self.dropout else 0.0)
-            out = tensor_mul(out, mask)
-        if len(out) >= len(residual):
-            out = tensor_add(out[:len(residual)], residual)
-        return tensor_apply(out, lambda v: relu(v))
+        self.train_mode(training)
+        var h0 = _cv_seq(x, self.in_channels)
+        var h = self.drop.forward(self.causal_conv(h0, self.conv1).relu())
+        h = self.drop.forward(self.causal_conv(h, self.conv2).relu())
+        var res = h0
+        if self.downsample != none:
+            res = self.downsample.forward(h0)
+        return (h + res).relu()
 
     def get_name(self):
         return self.name
 
 
-# ── 245: TemporalConvNet ────────────────────────────────────────────────────
-class TemporalConvNet:
+# ── 245: TemporalConvNet: TCN layers with dilations 1, 2, 4, ...
+class TemporalConvNet(Module):
     def __init__(self, input_size, channel_sizes, kernel, dropout):
+        super().__init__()
         self.input_size = input_size
         self.channel_sizes = channel_sizes
         self.kernel = kernel
         self.dropout = dropout
         self.layers = []
-        var n_levels = len(channel_sizes)
-        for i in range(0, n_levels):
-            var in_ch = input_size if i == 0 else channel_sizes[i - 1]
-            var out_ch = channel_sizes[i]
-            var dilation = 1
-            var d = 1
-            for k in range(0, i):
-                var d = d * 2
-            var dilation = d
-            self.layers = self.layers + [TCNLayer(in_ch, out_ch, kernel, dilation, dropout)]
+        var d = 1
+        var i = 0
+        while i < len(channel_sizes):
+            var in_ch = input_size
+            if i > 0:
+                in_ch = channel_sizes[i - 1]
+            self.layers.append(TCNLayer(in_ch, channel_sizes[i], kernel, d, dropout))
+            d = d * 2
+            i = i + 1
         self.name = "TemporalConvNet"
 
     def forward(self, x, training):
-        var h = x
-        for layer in self.layers:
-            var h = layer.forward(h, training)
+        var h = _cv_seq(x, self.input_size)
+        var i = 0
+        while i < len(self.layers):
+            h = self.layers[i].forward(h, training)
+            i = i + 1
         return h
 
     def n_layers(self):
@@ -556,92 +757,320 @@ class TemporalConvNet:
         return self.name
 
 
-# ── 246: ARIMAModel ────────────────────────────────────────────────────────
+# Solve A x = b (small, dense) by Gaussian elimination with partial pivoting.
+def _cv_solve(A, b):
+    var n = len(b)
+    var M = []
+    var i = 0
+    while i < n:
+        M.append(A[i][:] + [b[i]])
+        i = i + 1
+    var c = 0
+    while c < n:
+        var p = c
+        var r = c + 1
+        while r < n:
+            if abs(M[r][c]) > abs(M[p][c]):
+                p = r
+            r = r + 1
+        if abs(M[p][c]) < 0.000000000001:
+            raise ValueError("singular system in least squares")
+        var tmp = M[c]
+        M[c] = M[p]
+        M[p] = tmp
+        r = c + 1
+        while r < n:
+            var f = M[r][c] / M[c][c]
+            var k = c
+            while k <= n:
+                M[r][k] = M[r][k] - f * M[c][k]
+                k = k + 1
+            r = r + 1
+        c = c + 1
+    var x = nt_full([n], 0.0)
+    i = n - 1
+    while i >= 0:
+        var s = M[i][n]
+        var k2 = i + 1
+        while k2 < n:
+            s = s - M[i][k2] * x[k2]
+            k2 = k2 + 1
+        x[i] = s / M[i][i]
+        i = i - 1
+    return x
+
+# least squares: rows of X (lists), targets y; ridge keeps it well posed
+def _cv_lstsq(X, y, ridge):
+    var k = len(X[0])
+    var A = []
+    var b = nt_full([k], 0.0)
+    var i = 0
+    while i < k:
+        A.append(nt_full([k], 0.0))
+        i = i + 1
+    var r = 0
+    while r < len(X):
+        var row = X[r]
+        i = 0
+        while i < k:
+            b[i] = b[i] + row[i] * y[r]
+            var j = 0
+            while j < k:
+                A[i][j] = A[i][j] + row[i] * row[j]
+                j = j + 1
+            i = i + 1
+        r = r + 1
+    i = 0
+    while i < k:
+        A[i][i] = A[i][i] + ridge
+        i = i + 1
+    return _cv_solve(A, b)
+
+
+# ── 246: ARIMAModel(p, d, q), fitted by Hannan-Rissanen:
+#   1. difference d times;  2. a long AR by least squares gives residuals e;
+#   3. regress y_t on [1, y_(t-1..t-p), e_(t-1..t-q)].
+# forecast() recurses on the differenced series (future shocks 0) and
+# integrates back to the original scale. aic/bic from the residual variance.
 class ARIMAModel:
     def __init__(self, p, d, q):
-        self.p = p   # AR order
-        self.d = d   # differencing order
-        self.q = q   # MA order
-        self.ar_coefs = tensor_zeros([p])
-        self.ma_coefs = tensor_zeros([q])
+        self.p = p
+        self.d = d
+        self.q = q
+        self.ar_coefs = nt_full([p], 0.0)
+        self.ma_coefs = nt_full([q], 0.0)
         self.intercept = 0.0
         self.residuals = []
         self.fitted_values = []
+        self.series = []
+        self.diff_series = []
+        self.sigma2 = 0.0
         self.aic = 0.0
         self.bic = 0.0
         self.name = "ARIMAModel"
 
     def difference(self, series, order):
-        var diff = series
-        for d in range(0, order):
-            var diff = tensor_diff(diff)
-        return diff
+        var s = _t_flat(_t_wrap(series).data)
+        var k = 0
+        while k < order:
+            var nd = []
+            var i = 1
+            while i < len(s):
+                nd.append(s[i] - s[i - 1])
+                i = i + 1
+            s = nd
+            k = k + 1
+        return s
 
     def fit(self, series):
-        var diff_series = self.difference(series, self.d)
-        var n = len(diff_series)
-        var mean = tensor_mean(diff_series)
-        self.intercept = mean
-        for i in range(0, self.p):
-            self.ar_coefs[i] = tensor_std(diff_series) * 0.1 * float(i + 1)
-        for i in range(0, self.q):
-            self.ma_coefs[i] = tensor_std(diff_series) * 0.05
-        var n_params = float(self.p + self.q + 1)
-        self.aic = 2.0 * n_params - 2.0 * float(n) * log(max(tensor_std(diff_series), 1e-8))
-        self.bic = n_params * log(float(n)) - 2.0 * float(n) * log(max(tensor_std(diff_series), 1e-8))
-        self.fitted_values = tensor_apply(diff_series, lambda v: v * 0.95 + mean * 0.05)
+        self.series = _t_flat(_t_wrap(series).data)
+        var y = self.difference(self.series, self.d)
+        self.diff_series = y
+        var n = len(y)
+        var m = max(self.p, self.q) + 3
+        if n < m + max(self.p, self.q) + 5:
+            raise ValueError("series too short for ARIMA(" + str(self.p) + ", " + str(self.d) + ", " + str(self.q) + ")")
+        # step 2: long AR(m) residuals
+        var e = nt_full([n], 0.0)
+        if self.q > 0:
+            var X = []
+            var Y = []
+            var t = m
+            while t < n:
+                var row = [1.0]
+                var j = 1
+                while j <= m:
+                    row.append(y[t - j])
+                    j = j + 1
+                X.append(row)
+                Y.append(y[t])
+                t = t + 1
+            var phi = _cv_lstsq(X, Y, 0.000001)
+            t = m
+            while t < n:
+                var pred = phi[0]
+                var j2 = 1
+                while j2 <= m:
+                    pred = pred + phi[j2] * y[t - j2]
+                    j2 = j2 + 1
+                e[t] = y[t] - pred
+                t = t + 1
+        # step 3: ARMA regression
+        var start = max(self.p, self.q)
+        if self.q > 0:
+            start = m + self.q
+        var X2 = []
+        var Y2 = []
+        var t2 = start
+        while t2 < n:
+            var row2 = [1.0]
+            var i = 1
+            while i <= self.p:
+                row2.append(y[t2 - i])
+                i = i + 1
+            i = 1
+            while i <= self.q:
+                row2.append(e[t2 - i])
+                i = i + 1
+            X2.append(row2)
+            Y2.append(y[t2])
+            t2 = t2 + 1
+        var beta = _cv_lstsq(X2, Y2, 0.000001)
+        self.intercept = beta[0]
+        var k = 0
+        while k < self.p:
+            self.ar_coefs[k] = beta[1 + k]
+            k = k + 1
+        k = 0
+        while k < self.q:
+            self.ma_coefs[k] = beta[1 + self.p + k]
+            k = k + 1
+        # in-sample one-step predictions and residuals
+        var res = nt_full([n], 0.0)
+        var fitted = []
+        var t3 = 0
+        while t3 < n:
+            var pr = self.intercept
+            var i3 = 1
+            while i3 <= self.p:
+                if t3 - i3 >= 0:
+                    pr = pr + self.ar_coefs[i3 - 1] * y[t3 - i3]
+                i3 = i3 + 1
+            i3 = 1
+            while i3 <= self.q:
+                if t3 - i3 >= 0:
+                    pr = pr + self.ma_coefs[i3 - 1] * res[t3 - i3]
+                i3 = i3 + 1
+            fitted.append(pr)
+            res[t3] = y[t3] - pr
+            t3 = t3 + 1
+        self.fitted_values = fitted
+        self.residuals = res
+        var ss = 0.0
+        var cnt = 0
+        t3 = start
+        while t3 < n:
+            ss = ss + res[t3] * res[t3]
+            cnt = cnt + 1
+            t3 = t3 + 1
+        self.sigma2 = ss / float(max(1, cnt))
+        var kpar = float(self.p + self.q + 1)
+        var lv = log(max(self.sigma2, 0.000000000001))
+        self.aic = float(cnt) * lv + 2.0 * kpar
+        self.bic = float(cnt) * lv + kpar * log(float(max(2, cnt)))
         return self
 
     def forecast(self, n_steps):
-        var preds = []
-        var history = self.fitted_values
-        for step in range(0, n_steps):
-            var pred = self.intercept
-            for i in range(0, self.p):
-                var lag = len(history) - 1 - i
-                if lag >= 0:
-                    var pred = pred + self.ar_coefs[i] * history[lag]
-            var preds = preds + [pred]
-            var history = tensor_add(history, tensor([pred]))
-        return tensor(preds)
+        if len(self.series) == 0:
+            raise ValueError("fit the model before forecasting")
+        var y = self.diff_series[:]
+        var e = self.residuals[:]
+        var s = 0
+        while s < n_steps:
+            var t = len(y)
+            var pr = self.intercept
+            var i = 1
+            while i <= self.p:
+                pr = pr + self.ar_coefs[i - 1] * y[t - i]
+                i = i + 1
+            i = 1
+            while i <= self.q:
+                pr = pr + self.ma_coefs[i - 1] * e[t - i]
+                i = i + 1
+            y.append(pr)
+            e.append(0.0)
+            s = s + 1
+        var out = y[len(self.diff_series):]
+        # integrate back d times, starting from the last values of each level
+        var lvl = self.d
+        while lvl > 0:
+            var base = self.difference(self.series, lvl - 1)
+            var last = base[len(base) - 1]
+            var integ = []
+            var j = 0
+            while j < len(out):
+                last = last + out[j]
+                integ.append(last)
+                j = j + 1
+            out = integ
+            lvl = lvl - 1
+        return out
 
     def get_info(self):
-        return {"p": self.p, "d": self.d, "q": self.q, "aic": self.aic, "bic": self.bic}
+        return {"p": self.p, "d": self.d, "q": self.q, "aic": self.aic, "bic": self.bic, "ar": self.ar_coefs, "ma": self.ma_coefs, "sigma2": self.sigma2}
 
     def get_name(self):
         return self.name
 
 
-# ── 247: TimeSeriesTransformer ─────────────────────────────────────────────
-class TimeSeriesTransformer:
+# ── 247: TimeSeriesTransformer: per-step input projection + sinusoidal
+# positions -> pre-norm encoder layers -> the last step's state -> linear
+# head predicting pred_len future values.
+class TimeSeriesTransformer(Module):
     def __init__(self, input_dim, d_model, n_heads, n_layers, pred_len, dropout):
+        super().__init__()
         self.input_dim = input_dim
         self.d_model = d_model
         self.n_heads = n_heads
         self.n_layers = n_layers
         self.pred_len = pred_len
         self.dropout = dropout
-        self.input_proj = tensor_randn([d_model * input_dim])
-        self.encoder_layers = []
-        for i in range(0, n_layers):
-            self.encoder_layers = self.encoder_layers + [tensor_randn([d_model * d_model * 4])]
-        self.output_proj = tensor_randn([pred_len * d_model])
+        self.input_proj = Linear(input_dim, d_model)
+        self.layers = []
+        var i = 0
+        while i < n_layers:
+            self.layers.append(TransformerEncoderLayer(d_model, n_heads, 4 * d_model, dropout, "gelu", false, true))
+            i = i + 1
+        self.norm = LayerNorm(d_model)
+        self.output_proj = Linear(d_model, pred_len)
+        self.opt = none
         self.name = "TimeSeriesTransformer"
 
+    def positions(self, L):
+        var d = []
+        var t = 0
+        while t < L:
+            var k = 0
+            while k < self.d_model:
+                var f = exp(0.0 - log(10000.0) * float(2 * (k // 2)) / float(self.d_model))
+                if k % 2 == 0:
+                    d.append(sin(float(t) * f))
+                else:
+                    d.append(cos(float(t) * f))
+                k = k + 1
+            t = t + 1
+        return Tensor(d, false, [L, self.d_model])
+
+    # history (L * input_dim values or (L, input_dim)) -> (L, d_model)
     def encode(self, x):
-        var h = tensor_randn([self.d_model])
-        for w in self.encoder_layers:
-            var attn = tensor_randn([self.d_model])
-            var ff = tensor_randn([self.d_model])
-            var h = tensor_add(attn, ff)
-        return h
+        var t = _t_wrap(x)
+        if t.dim() == 1:
+            t = t.reshape([t.numel() // self.input_dim, self.input_dim])
+        var h = self.input_proj.forward(t) + self.positions(t.size()[0])
+        var i = 0
+        while i < len(self.layers):
+            h = self.layers[i].forward(h, none, none)
+            i = i + 1
+        return self.norm.forward(h)
+
+    def predict(self, history):
+        var h = self.encode(history)
+        return self.output_proj.forward(h.select(0, h.size()[0] - 1))
 
     def forecast(self, history):
-        var h = self.encode(history)
-        var preds = []
-        for i in range(0, self.pred_len):
-            var preds = preds + [tensor_mean(h) + tensor_mean(tensor_randn([4])) * 0.1]
-        return tensor(preds)
+        var p = none
+        with no_grad():
+            p = self.predict(history)
+        return p
+
+    def train_step(self, history, future, lr):
+        if self.opt == none:
+            self.opt = Adam(self.parameters(), lr)
+        self.opt.zero_grad()
+        var loss = _fn_mse(self.predict(history), _t_wrap(future), "mean")
+        loss.backward()
+        self.opt.step()
+        return loss.item()
 
     def get_name(self):
         return self.name
@@ -653,19 +1082,15 @@ class ExperimentTracker:
         self.experiment_name = experiment_name
         self.tags = tags
         self.runs = {}
+        self.run_order = []
         self.current_run = ""
         self.run_count = 0
         self.name = "ExperimentTracker"
 
     def start_run(self, run_name):
         self.current_run = run_name
-        self.runs[run_name] = {
-            "metrics": {},
-            "params": {},
-            "artifacts": [],
-            "status": "running",
-            "step": 0
-        }
+        self.runs[run_name] = {"metrics": {}, "params": {}, "artifacts": [], "status": "running", "step": 0}
+        self.run_order.append(run_name)
         self.run_count = self.run_count + 1
         return run_name
 
@@ -676,45 +1101,42 @@ class ExperimentTracker:
     def log_metric(self, key, value, step):
         if self.current_run in self.runs:
             var run = self.runs[self.current_run]
-            if key not in run["metrics"]:
+            if not (key in run["metrics"]):
                 run["metrics"][key] = []
-            run["metrics"][key] = run["metrics"][key] + [{"step": step, "value": value}]
+            run["metrics"][key].append({"step": step, "value": value})
             run["step"] = step
 
     def log_artifact(self, path):
         if self.current_run in self.runs:
-            self.runs[self.current_run]["artifacts"] = self.runs[self.current_run]["artifacts"] + [path]
+            self.runs[self.current_run]["artifacts"].append(path)
 
     def end_run(self, status):
         if self.current_run in self.runs:
             self.runs[self.current_run]["status"] = status
 
+    # the run whose last value of `metric` is best ("min" or "max")
     def get_best_run(self, metric, mode):
         var best_name = ""
         var best_val = 0.0
-        if mode == "min":
-            var best_val = 1e18
-        else:
-            best_val = 0.0 - 1e18
-        for run_name in self.runs:
-            var run = self.runs[run_name]
+        var i = 0
+        while i < len(self.run_order):
+            var nm = self.run_order[i]
+            var run = self.runs[nm]
             if metric in run["metrics"]:
-                var history = run["metrics"][metric]
-                if len(history) > 0:
-                    var last_val = history[len(history) - 1]["value"]
-                    if mode == "min" and last_val < best_val:
-                        best_val = last_val
-                        var best_name = run_name
-                    elif mode == "max" and last_val > best_val:
-                        best_val = last_val
-                        best_name = run_name
+                var h = run["metrics"][metric]
+                if len(h) > 0:
+                    var v = h[len(h) - 1]["value"]
+                    if best_name == "" or (mode == "min" and v < best_val) or (mode == "max" and v > best_val):
+                        best_name = nm
+                        best_val = v
+            i = i + 1
         return {"run": best_name, "value": best_val}
 
     def get_name(self):
         return self.name
 
 
-# ── 249: MetricsCollector ──────────────────────────────────────────────────
+# ── 249: MetricsCollector (sliding windows, counters, gauges) ──────────────
 class MetricsCollector:
     def __init__(self, name, window_size):
         self.name = name
@@ -722,19 +1144,18 @@ class MetricsCollector:
         self.metrics = {}
         self.counters = {}
         self.gauges = {}
-        self.histograms = {}
         self.total_updates = 0
 
     def record(self, metric_name, value):
-        if metric_name not in self.metrics:
+        if not (metric_name in self.metrics):
             self.metrics[metric_name] = []
-        self.metrics[metric_name] = self.metrics[metric_name] + [value]
+        self.metrics[metric_name].append(value)
         if len(self.metrics[metric_name]) > self.window_size:
             self.metrics[metric_name] = self.metrics[metric_name][1:]
         self.total_updates = self.total_updates + 1
 
     def increment(self, counter_name, amount):
-        if counter_name not in self.counters:
+        if not (counter_name in self.counters):
             self.counters[counter_name] = 0.0
         self.counters[counter_name] = self.counters[counter_name] + amount
 
@@ -742,28 +1163,25 @@ class MetricsCollector:
         self.gauges[gauge_name] = value
 
     def summary(self, metric_name):
-        if metric_name not in self.metrics or len(self.metrics[metric_name]) == 0:
-            return {"mean": 0.0, "min": 0.0, "max": 0.0, "count": 0}
-        var vals = tensor(self.metrics[metric_name])
-        return {
-            "mean": tensor_mean(vals),
-            "min": tensor_min(vals),
-            "max": tensor_max(vals),
-            "std": tensor_std(vals),
-            "count": len(self.metrics[metric_name])
-        }
+        if not (metric_name in self.metrics) or len(self.metrics[metric_name]) == 0:
+            return {"mean": 0.0, "min": 0.0, "max": 0.0, "std": 0.0, "count": 0}
+        var v = self.metrics[metric_name]
+        return {"mean": tensor_mean(v), "min": tensor_min(v), "max": tensor_max(v), "std": tensor_std(v), "count": len(v)}
 
     def all_summaries(self):
-        var result = {}
-        for key in self.metrics:
-            result[key] = self.summary(key)
-        return result
+        var out = {}
+        var keys = sorted(self.metrics.keys())
+        var i = 0
+        while i < len(keys):
+            out[keys[i]] = self.summary(keys[i])
+            i = i + 1
+        return out
 
     def get_name(self):
         return self.name
 
 
-# ── 250: AlertManager ─────────────────────────────────────────────────────
+# ── 250: AlertManager (threshold rules over a metrics snapshot) ────────────
 class AlertManager:
     def __init__(self, name):
         self.name = name
@@ -773,42 +1191,31 @@ class AlertManager:
         self.total_fired = 0
 
     def add_rule(self, rule_name, metric, op, threshold, severity):
-        self.rules = self.rules + [{
-            "name": rule_name,
-            "metric": metric,
-            "op": op,
-            "threshold": threshold,
-            "severity": severity,
-            "firing": false
-        }]
+        if op != ">" and op != "<" and op != ">=" and op != "<=" and op != "==":
+            raise ValueError("unknown comparison '" + str(op) + "'")
+        self.rules.append({"name": rule_name, "metric": metric, "op": op, "threshold": threshold, "severity": severity})
 
     def check(self, metrics_snapshot):
-        var new_alerts = []
-        for i in range(0, len(self.rules)):
+        var fired_now = []
+        var i = 0
+        while i < len(self.rules):
             var rule = self.rules[i]
-            var metric = rule["metric"]
-            if metric in metrics_snapshot:
-                var val = metrics_snapshot[metric]
-                var fired = false
-                if rule["op"] == ">" and val > rule["threshold"]:
-                    var fired = true
-                elif rule["op"] == "<" and val < rule["threshold"]:
-                    fired = true
-                elif rule["op"] == ">=" and val >= rule["threshold"]:
-                    fired = true
-                elif rule["op"] == "<=" and val <= rule["threshold"]:
-                    fired = true
-                elif rule["op"] == "==" and val == rule["threshold"]:
-                    fired = true
-                if fired and rule["name"] not in self.silenced:
-                    var alert = {"rule": rule["name"], "metric": metric, "value": val, "severity": rule["severity"]}
-                    var new_alerts = new_alerts + [alert]
-                    self.alerts = self.alerts + [alert]
+            var m = rule["metric"]
+            if m in metrics_snapshot:
+                var v = metrics_snapshot[m]
+                var th = rule["threshold"]
+                var op = rule["op"]
+                var fired = (op == ">" and v > th) or (op == "<" and v < th) or (op == ">=" and v >= th) or (op == "<=" and v <= th) or (op == "==" and v == th)
+                if fired and not (rule["name"] in self.silenced):
+                    var alert = {"rule": rule["name"], "metric": m, "value": v, "severity": rule["severity"]}
+                    fired_now.append(alert)
+                    self.alerts.append(alert)
                     self.total_fired = self.total_fired + 1
-        return new_alerts
+            i = i + 1
+        return fired_now
 
     def silence(self, rule_name):
-        self.silenced = self.silenced + [rule_name]
+        self.silenced.append(rule_name)
 
     def active_alerts(self):
         return self.alerts[max(0, len(self.alerts) - 10):]
@@ -817,66 +1224,54 @@ class AlertManager:
         return self.name
 
 
-# ── 251: ModelMonitor ──────────────────────────────────────────────────────
+# ── 251: ModelMonitor: error rate, latency and residual drift of a deployed model
 class ModelMonitor:
     def __init__(self, model_name, baseline_metrics):
         self.model_name = model_name
         self.baseline_metrics = baseline_metrics
-        self.metrics_history = []
         self.drift_detector = DriftDetector(50, 0.1)
         self.alert_manager = AlertManager("model_alerts")
         self.prediction_count = 0
         self.error_count = 0
         self.latency_history = []
+        self.error_tolerance = 0.5
         self.name = "ModelMonitor"
-
         self.alert_manager.add_rule("high_error_rate", "error_rate", ">", 0.1, "critical")
         self.alert_manager.add_rule("high_latency", "avg_latency_ms", ">", 100.0, "warning")
         self.alert_manager.add_rule("low_accuracy", "accuracy", "<", 0.8, "warning")
 
     def record_prediction(self, predicted, actual, latency_ms):
         self.prediction_count = self.prediction_count + 1
-        var is_error = 0.0
-        if abs(predicted - actual) > 0.5:
-            var is_error = 1.0
+        if abs(predicted - actual) > self.error_tolerance:
             self.error_count = self.error_count + 1
-        self.latency_history = self.latency_history + [latency_ms]
+        self.latency_history.append(latency_ms)
         if len(self.latency_history) > 1000:
             self.latency_history = self.latency_history[1:]
         self.drift_detector.update(predicted - actual)
 
     def get_snapshot(self):
-        var error_rate = 0.0
+        var err = 0.0
         if self.prediction_count > 0:
-            var error_rate = float(self.error_count) / float(self.prediction_count)
-        var avg_latency = 0.0
+            err = float(self.error_count) / float(self.prediction_count)
+        var lat = 0.0
         if len(self.latency_history) > 0:
-            for l in self.latency_history:
-                var avg_latency = avg_latency + l
-            avg_latency = avg_latency / float(len(self.latency_history))
-        var accuracy = 1.0 - error_rate
-        return {
-            "error_rate": error_rate,
-            "avg_latency_ms": avg_latency,
-            "accuracy": accuracy,
-            "predictions": self.prediction_count,
-            "drift_detected": self.drift_detector.drift_detected
-        }
+            lat = tensor_mean(self.latency_history)
+        return {"error_rate": err, "avg_latency_ms": lat, "accuracy": 1.0 - err, "predictions": self.prediction_count, "drift_detected": self.drift_detector.drift_detected}
 
     def check_health(self):
-        var snapshot = self.get_snapshot()
-        var alerts = self.alert_manager.check(snapshot)
-        return {"snapshot": snapshot, "alerts": alerts, "n_alerts": len(alerts)}
+        var snap = self.get_snapshot()
+        var alerts = self.alert_manager.check(snap)
+        return {"snapshot": snap, "alerts": alerts, "n_alerts": len(alerts)}
 
     def get_name(self):
         return self.name
 
 
-# ── 252: DatasetBuilder ────────────────────────────────────────────────────
+# ── 252: DatasetBuilder (records, label encoders, deterministic splits) ────
 class DatasetBuilder:
     def __init__(self, name, schema):
         self.name = name
-        self.schema = schema   # dict of field_name -> type
+        self.schema = schema
         self.records = []
         self.splits = {}
         self.transforms = []
@@ -884,34 +1279,43 @@ class DatasetBuilder:
         self.total_added = 0
 
     def add_record(self, record):
-        self.records = self.records + [record]
+        var r = record
+        var i = 0
+        while i < len(self.transforms):
+            var tr = self.transforms[i]
+            if tr["field"] in r:
+                r[tr["field"]] = tr["fn"](r[tr["field"]])
+            i = i + 1
+        self.records.append(r)
         self.total_added = self.total_added + 1
 
+    # applied to records added afterwards
     def add_transform(self, field, transform_fn):
-        self.transforms = self.transforms + [{"field": field, "fn": transform_fn}]
+        self.transforms.append({"field": field, "fn": transform_fn})
 
+    # values in first-seen order -> 0, 1, 2, ...
     def fit_label_encoder(self, field):
-        var seen = []
-        for record in self.records:
-            if field in record:
-                var val = str(record[field])
-                if val not in seen:
-                    var seen = seen + [val]
-        var encoder = {}
-        for i in range(0, len(seen)):
-            encoder[seen[i]] = i
-        self.label_encoders[field] = encoder
-        return encoder
+        var enc = {}
+        var n = 0
+        var i = 0
+        while i < len(self.records):
+            if field in self.records[i]:
+                var v = str(self.records[i][field])
+                if not (v in enc):
+                    enc[v] = n
+                    n = n + 1
+            i = i + 1
+        self.label_encoders[field] = enc
+        return enc
 
+    # contiguous train / val / test slices (shuffle the records first if needed)
     def build(self, train_frac, val_frac, test_frac):
+        if train_frac + val_frac + test_frac > 1.0000001:
+            raise ValueError("split fractions add up to more than 1")
         var n = len(self.records)
         var n_train = int(float(n) * train_frac)
         var n_val = int(float(n) * val_frac)
-        self.splits = {
-            "train": self.records[:n_train],
-            "val": self.records[n_train:n_train + n_val],
-            "test": self.records[n_train + n_val:]
-        }
+        self.splits = {"train": self.records[:n_train], "val": self.records[n_train:n_train + n_val], "test": self.records[n_train + n_val:]}
         return self.splits
 
     def stats(self):
@@ -921,46 +1325,85 @@ class DatasetBuilder:
         return self.name
 
 
-# ── 253: DataSampler ──────────────────────────────────────────────────────
+# ── 253: DataSampler with its own seeded generator (Park-Miller) so a
+# sampler's draws are reproducible and independent of the global seed.
+#   random: uniform with replacement; weighted: by set_weights; stratified:
+#   classes in turn (labels from compute_class_weights' last call).
 class DataSampler:
     def __init__(self, strategy, seed):
-        self.strategy = strategy   # "random", "weighted", "stratified", "oversampling"
+        if strategy != "random" and strategy != "weighted" and strategy != "stratified" and strategy != "oversampling":
+            raise ValueError("strategy must be random, weighted, stratified or oversampling")
+        self.strategy = strategy
         self.seed = seed
+        self.state = seed % 2147483646 + 1
         self.weights = []
         self.class_counts = {}
+        self.labels = []
         self.total_sampled = 0
         self.name = "DataSampler"
+
+    def _uniform(self):
+        self.state = (self.state * 16807) % 2147483647
+        return float(self.state) / 2147483647.0
 
     def set_weights(self, weights):
         self.weights = weights
 
+    # inverse-frequency weight per example: n / (count(class) * n_classes)
     def compute_class_weights(self, labels):
-        for label in labels:
-            var key = str(label)
-            if key not in self.class_counts:
-                self.class_counts[key] = 0
-            self.class_counts[key] = self.class_counts[key] + 1
+        self.class_counts = {}
+        self.labels = labels
+        var i = 0
+        while i < len(labels):
+            var k = str(labels[i])
+            if not (k in self.class_counts):
+                self.class_counts[k] = 0
+            self.class_counts[k] = self.class_counts[k] + 1
+            i = i + 1
         var n = len(labels)
-        var inv_weights = []
-        for label in labels:
-            var key = str(label)
-            var count = self.class_counts[key]
-            var inv_weights = inv_weights + [float(n) / (float(count) * float(len(self.class_counts)) + 1e-8)]
-        return tensor(inv_weights)
+        var nc = len(self.class_counts)
+        var w = []
+        i = 0
+        while i < n:
+            w.append(float(n) / (float(self.class_counts[str(labels[i])]) * float(nc)))
+            i = i + 1
+        if self.strategy == "oversampling" or self.strategy == "weighted":
+            if len(self.weights) == 0:
+                self.weights = w
+        return w
+
+    def _index(self, m):
+        if (self.strategy == "weighted" or self.strategy == "oversampling") and len(self.weights) == m:
+            var total = 0.0
+            var i = 0
+            while i < m:
+                total = total + self.weights[i]
+                i = i + 1
+            var r = self._uniform() * total
+            var c = 0.0
+            i = 0
+            while i < m:
+                c = c + self.weights[i]
+                if r <= c:
+                    return i
+                i = i + 1
+            return m - 1
+        var j = int(self._uniform() * float(m))
+        if j >= m:
+            j = m - 1
+        return j
 
     def sample(self, data, n):
-        var indices = []
         var m = len(data)
         if m == 0:
             return []
-        for i in range(0, n):
-            var idx = (i * 7 + self.seed) % m
-            var indices = indices + [idx]
-        var sampled = []
-        for idx in indices:
-            var sampled = sampled + [data[idx]]
+        var out = []
+        var i = 0
+        while i < n:
+            out.append(data[self._index(m)])
+            i = i + 1
         self.total_sampled = self.total_sampled + n
-        return sampled
+        return out
 
     def bootstrap_sample(self, data):
         return self.sample(data, len(data))
@@ -969,7 +1412,8 @@ class DataSampler:
         return self.name
 
 
-# ── 254: DataAugmenter ────────────────────────────────────────────────────
+# ── 254: DataAugmenter: each augmentation applies with probability
+# prob * augmentation_prob (seeded global generator).
 class DataAugmenter:
     def __init__(self, augmentation_prob):
         self.augmentation_prob = augmentation_prob
@@ -978,22 +1422,27 @@ class DataAugmenter:
         self.name = "DataAugmenter"
 
     def add_augmentation(self, name, aug_fn, prob):
-        self.augmentations = self.augmentations + [{"name": name, "fn": aug_fn, "prob": prob}]
+        self.augmentations.append({"name": name, "fn": aug_fn, "prob": prob})
 
     def augment(self, x, step):
         var out = x
-        for aug in self.augmentations:
-            var r = float((step * 31 + 17) % 100) / 100.0
-            if r < aug["prob"] * self.augmentation_prob:
-                var out = aug["fn"](out)
+        var i = 0
+        while i < len(self.augmentations):
+            var aug = self.augmentations[i]
+            if nt_rand(1)[0] < aug["prob"] * self.augmentation_prob:
+                var f = aug["fn"]
+                out = f(out)
                 self.applied_count = self.applied_count + 1
+            i = i + 1
         return out
 
     def augment_batch(self, batch, step):
-        var result = []
-        for i in range(0, len(batch)):
-            var result = result + [self.augment(batch[i], step + i)]
-        return result
+        var out = []
+        var i = 0
+        while i < len(batch):
+            out.append(self.augment(batch[i], step + i))
+            i = i + 1
+        return out
 
     def stats(self):
         return {"augmentations": len(self.augmentations), "applied": self.applied_count}
@@ -1002,43 +1451,40 @@ class DataAugmenter:
         return self.name
 
 
-# ── 255: TensorboardWriter ────────────────────────────────────────────────
+# ── 255: TensorboardWriter: an in-memory scalar/histogram/text log;
+# export(path) writes it as JSON (not TensorBoard's protobuf event format).
 class TensorboardWriter:
     def __init__(self, log_dir, flush_secs):
         self.log_dir = log_dir
         self.flush_secs = flush_secs
         self.scalars = {}
         self.histograms = {}
-        self.images = []
         self.texts = []
         self.global_step = 0
         self.name = "TensorboardWriter"
 
     def add_scalar(self, tag, value, step):
-        if tag not in self.scalars:
+        if not (tag in self.scalars):
             self.scalars[tag] = []
-        self.scalars[tag] = self.scalars[tag] + [{"step": step, "value": value}]
+        self.scalars[tag].append({"step": step, "value": value})
         if step > self.global_step:
             self.global_step = step
 
     def add_scalars(self, main_tag, tag_scalar_dict, step):
-        for tag in tag_scalar_dict:
-            self.add_scalar(main_tag + "/" + tag, tag_scalar_dict[tag], step)
+        var keys = sorted(tag_scalar_dict.keys())
+        var i = 0
+        while i < len(keys):
+            self.add_scalar(main_tag + "/" + keys[i], tag_scalar_dict[keys[i]], step)
+            i = i + 1
 
     def add_histogram(self, tag, values, step):
-        if tag not in self.histograms:
+        var v = _t_flat(_t_wrap(values).data)
+        if not (tag in self.histograms):
             self.histograms[tag] = []
-        var hist_summary = {
-            "step": step,
-            "mean": tensor_mean(values),
-            "std": tensor_std(values),
-            "min": tensor_min(values),
-            "max": tensor_max(values)
-        }
-        self.histograms[tag] = self.histograms[tag] + [hist_summary]
+        self.histograms[tag].append({"step": step, "mean": tensor_mean(v), "std": tensor_std(v), "min": tensor_min(v), "max": tensor_max(v)})
 
     def add_text(self, tag, text, step):
-        self.texts = self.texts + [{"tag": tag, "text": text, "step": step}]
+        self.texts.append({"tag": tag, "text": text, "step": step})
 
     def get_scalar_history(self, tag):
         if tag in self.scalars:
@@ -1048,47 +1494,90 @@ class TensorboardWriter:
     def flush(self):
         return {"scalars": len(self.scalars), "histograms": len(self.histograms), "step": self.global_step}
 
+    def export(self, path):
+        return write_file(path, json_encode({"scalars": self.scalars, "histograms": self.histograms, "texts": self.texts}))
+
     def get_name(self):
         return self.name
 
 
-# ── 256: CheckpointManager ────────────────────────────────────────────────
+# ── 256: CheckpointManager: writes each checkpoint to save_dir, keeps the
+# newest max_to_keep files (the best one is never deleted) and reloads the
+# best. A Module or a {name: Tensor} state is saved with torch.save; any
+# other state as JSON.
 class CheckpointManager:
     def __init__(self, save_dir, max_to_keep, monitor_metric, mode):
+        if mode != "min" and mode != "max":
+            raise ValueError("mode must be 'min' or 'max'")
         self.save_dir = save_dir
         self.max_to_keep = max_to_keep
         self.monitor_metric = monitor_metric
-        self.mode = mode   # "min" or "max"
+        self.mode = mode
         self.checkpoints = []
         self.best_value = 0.0
         self.best_path = ""
         self.save_count = 0
         if mode == "min":
-            self.best_value = 1e18
+            self.best_value = 1e300
         else:
-            self.best_value = 0.0 - 1e18
+            self.best_value = 0.0 - 1e300
         self.name = "CheckpointManager"
 
+    def _is_tensor_state(self, st):
+        if isinstance(st, Module):
+            return true
+        if type(st) != "map":
+            return false
+        var ks = st.keys()
+        var i = 0
+        while i < len(ks):
+            if not isinstance(st[ks[i]], Tensor):
+                return false
+            i = i + 1
+        return len(ks) > 0
+
     def save(self, model_state, metric_value, step):
-        var path = self.save_dir + "/ckpt_step_" + str(step) + ".ny"
-        var checkpoint = {"path": path, "value": metric_value, "step": step, "state_size": len(str(model_state))}
-        self.checkpoints = self.checkpoints + [checkpoint]
+        if not os_isdir(self.save_dir):
+            os_mkdir(self.save_dir)
+            if not os_isdir(self.save_dir):
+                raise OSError("cannot create checkpoint directory " + str(self.save_dir))
+        var path = ""
+        if self._is_tensor_state(model_state):
+            path = self.save_dir + "/ckpt_step_" + str(step) + ".nyt"
+            var st = model_state
+            if isinstance(st, Module):
+                st = st.state_dict()
+            torch.save(st, path)
+        else:
+            path = self.save_dir + "/ckpt_step_" + str(step) + ".json"
+            if not write_file(path, json_encode({"state": model_state, "step": step, "metric": metric_value})):
+                raise OSError("cannot write " + path)
+        var is_best = (self.mode == "min" and metric_value < self.best_value) or (self.mode == "max" and metric_value > self.best_value)
+        if is_best:
+            self.best_value = metric_value
+            self.best_path = path
+        self.checkpoints.append({"path": path, "value": metric_value, "step": step})
         self.save_count = self.save_count + 1
-        var is_best = false
-        if self.mode == "min" and metric_value < self.best_value:
-            self.best_value = metric_value
-            self.best_path = path
-            var is_best = true
-        elif self.mode == "max" and metric_value > self.best_value:
-            self.best_value = metric_value
-            self.best_path = path
-            is_best = true
-        if len(self.checkpoints) > self.max_to_keep:
-            self.checkpoints = self.checkpoints[len(self.checkpoints) - self.max_to_keep:]
+        while len(self.checkpoints) > self.max_to_keep:
+            var drop = 0
+            if self.checkpoints[0]["path"] == self.best_path:
+                drop = 1
+            if drop < len(self.checkpoints):
+                var old = self.checkpoints[drop]["path"]
+                if old != self.best_path and file_exists(old):
+                    os_remove(old)
+                self.checkpoints = self.checkpoints[:drop] + self.checkpoints[drop + 1:]
         return {"path": path, "is_best": is_best, "best_value": self.best_value}
 
+    def _load(self, path):
+        if len(path) > 4 and path[len(path) - 4:] == ".nyt":
+            return torch.load(path)
+        return json_decode(read_file(path))["state"]
+
     def load_best(self):
-        return {"path": self.best_path, "value": self.best_value}
+        if self.best_path == "":
+            raise ValueError("no checkpoint saved yet")
+        return {"path": self.best_path, "value": self.best_value, "state": self._load(self.best_path)}
 
     def list_checkpoints(self):
         return self.checkpoints
@@ -1097,46 +1586,81 @@ class CheckpointManager:
         return self.name
 
 
-# ── 257: LearningRateFinder ───────────────────────────────────────────────
+# ── 257: LearningRateFinder (Smith 2017 LR range test): trains the model
+# for n_steps with the learning rate rising geometrically from min_lr to
+# max_lr, records the bias-corrected smoothed loss, stops when it diverges
+# (4x the best), restores the weights, and suggests the rate of steepest
+# descent. data_iterator: a list of [x, y] batches; loss_fn defaults to MSE.
 class LearningRateFinder:
-    def __init__(self, model, optimizer, min_lr, max_lr, n_steps):
+    def __init__(self, model, optimizer, min_lr, max_lr, n_steps, loss_fn=none):
+        if not isinstance(model, Module):
+            raise TypeError("LearningRateFinder needs a Module to train")
         self.model = model
         self.optimizer = optimizer
         self.min_lr = min_lr
         self.max_lr = max_lr
         self.n_steps = n_steps
+        self.loss_fn = loss_fn
         self.lrs = []
         self.losses = []
         self.best_lr = min_lr
         self.name = "LearningRateFinder"
 
     def compute_lr(self, step):
-        var ratio = float(step) / float(self.n_steps)
-        return self.min_lr * (self.max_lr / self.min_lr) ** ratio
+        return self.min_lr * (self.max_lr / self.min_lr) ** (float(step) / float(max(1, self.n_steps - 1)))
+
+    def _loss(self, pred, y):
+        if self.loss_fn == none:
+            return _fn_mse(pred, _t_wrap(y), "mean")
+        var f = self.loss_fn
+        return f(pred, y)
 
     def run(self, data_iterator):
+        if len(data_iterator) == 0:
+            raise ValueError("LearningRateFinder.run needs at least one [x, y] batch")
+        var saved = self.model.state_dict()
+        var snapshot = {}
+        var ks = saved.keys()
+        var i = 0
+        while i < len(ks):
+            snapshot[ks[i]] = saved[ks[i]].clone().detach()
+            i = i + 1
         self.lrs = []
         self.losses = []
-        var smoothed_loss = 1e9
+        var avg = 0.0
+        var best = 1e300
         var beta = 0.98
-        for step in range(0, self.n_steps):
+        var step = 0
+        while step < self.n_steps:
             var lr = self.compute_lr(step)
-            var loss = abs(tensor_mean(tensor_randn([8]))) + 1.0 / (1.0 + float(step))
-            var smoothed_loss = beta * smoothed_loss + (1.0 - beta) * loss
-            self.lrs = self.lrs + [lr]
-            self.losses = self.losses + [smoothed_loss]
-        var best_step = 0
-        var best_rate = 0.0
-        var min_loss = 1e18
-        for i in range(1, len(self.losses) - 1):
-            if self.losses[i] < min_loss:
-                var min_loss = self.losses[i]
-                var best_step = i
-        if best_step > 0:
-            self.best_lr = self.lrs[best_step - 1]
-        else:
-            self.best_lr = self.lrs[0] if len(self.lrs) > 0 else self.min_lr
-        return {"best_lr": self.best_lr, "min_loss": min_loss, "n_steps": self.n_steps}
+            self.optimizer.set_lr(lr)
+            var batch = data_iterator[step % len(data_iterator)]
+            self.optimizer.zero_grad()
+            var loss = self._loss(self.model.forward(batch[0]), batch[1])
+            loss.backward()
+            self.optimizer.step()
+            avg = beta * avg + (1.0 - beta) * loss.item()
+            var smoothed = avg / (1.0 - beta ** float(step + 1))
+            self.lrs.append(lr)
+            self.losses.append(smoothed)
+            if smoothed < best:
+                best = smoothed
+            if step > 0 and (smoothed > 4.0 * best or smoothed != smoothed):
+                break
+            step = step + 1
+        self.model.load_state_dict(snapshot)
+        # steepest descent of the smoothed loss (per unit log lr)
+        var best_i = 0
+        var best_slope = 1e300
+        i = 1
+        while i < len(self.losses):
+            var slope = self.losses[i] - self.losses[i - 1]
+            if slope < best_slope:
+                best_slope = slope
+                best_i = i
+            i = i + 1
+        self.best_lr = self.lrs[best_i]
+        return {"best_lr": self.best_lr, "min_loss": best, "n_steps": len(self.lrs)}
 
     def plot_summary(self):
         if len(self.lrs) == 0:
@@ -1147,7 +1671,8 @@ class LearningRateFinder:
         return self.name
 
 
-# ── 258: GradientAnalyzer ─────────────────────────────────────────────────
+# ── 258: GradientAnalyzer: per-layer gradient norms and statistics, with
+# explosion / vanishing counts.
 class GradientAnalyzer:
     def __init__(self, model_name, track_norms, track_histogram):
         self.model_name = model_name
@@ -1158,57 +1683,60 @@ class GradientAnalyzer:
         self.explosion_events = 0
         self.vanish_events = 0
         self.norm_threshold_high = 10.0
-        self.norm_threshold_low = 1e-7
+        self.norm_threshold_low = 0.0000001
         self.step = 0
         self.name = "GradientAnalyzer"
 
     def record_grads(self, layer_name, grad_tensor):
-        var norm = tensor_norm(grad_tensor)
-        if layer_name not in self.grad_norms:
+        var g = grad_tensor
+        if isinstance(g, Tensor):
+            if g.grad != none:
+                g = g.grad
+            else:
+                g = g.data
+        g = _t_flat(g)
+        var norm = tensor_norm(g)
+        if not (layer_name in self.grad_norms):
             self.grad_norms[layer_name] = []
-        self.grad_norms[layer_name] = self.grad_norms[layer_name] + [norm]
-        self.grad_stats[layer_name] = {
-            "mean": tensor_mean(grad_tensor),
-            "std": tensor_std(grad_tensor),
-            "norm": norm,
-            "min": tensor_min(grad_tensor),
-            "max": tensor_max(grad_tensor)
-        }
+        self.grad_norms[layer_name].append(norm)
+        self.grad_stats[layer_name] = {"mean": tensor_mean(g), "std": tensor_std(g), "norm": norm, "min": tensor_min(g), "max": tensor_max(g)}
         if norm > self.norm_threshold_high:
             self.explosion_events = self.explosion_events + 1
         if norm < self.norm_threshold_low and norm > 0.0:
             self.vanish_events = self.vanish_events + 1
         self.step = self.step + 1
 
+    # every parameter of a Module (after backward), by name
+    def record_module(self, module):
+        var np = module.named_parameters()
+        var i = 0
+        while i < len(np):
+            if np[i][1].grad != none:
+                self.record_grads(np[i][0], np[i][1].grad)
+            i = i + 1
+
     def detect_problems(self):
         var problems = []
         if self.explosion_events > 0:
-            var problems = problems + ["gradient_explosion: " + str(self.explosion_events) + " events"]
+            problems.append("gradient_explosion: " + str(self.explosion_events) + " events")
         if self.vanish_events > 0:
-            problems = problems + ["gradient_vanishing: " + str(self.vanish_events) + " events"]
+            problems.append("gradient_vanishing: " + str(self.vanish_events) + " events")
         return problems
 
     def summary(self):
         var layer_norms = {}
-        for layer in self.grad_norms:
-            var norms = self.grad_norms[layer]
-            if len(norms) > 0:
-                var avg = 0.0
-                for n in norms:
-                    var avg = avg + n
-                layer_norms[layer] = avg / float(len(norms))
-        return {
-            "layers_tracked": len(self.grad_norms),
-            "explosion_events": self.explosion_events,
-            "vanish_events": self.vanish_events,
-            "avg_norms_per_layer": layer_norms
-        }
+        var keys = sorted(self.grad_norms.keys())
+        var i = 0
+        while i < len(keys):
+            layer_norms[keys[i]] = tensor_mean(self.grad_norms[keys[i]])
+            i = i + 1
+        return {"layers_tracked": len(keys), "explosion_events": self.explosion_events, "vanish_events": self.vanish_events, "avg_norms_per_layer": layer_norms}
 
     def get_name(self):
         return self.name
 
 
-# ── 259: ProfilerSession ──────────────────────────────────────────────────
+# ── 259: ProfilerSession: wall-clock timing of named events (time_ms) ─────
 class ProfilerSession:
     def __init__(self, name, enabled):
         self.name = name
@@ -1220,92 +1748,190 @@ class ProfilerSession:
         self.memory_snapshots = []
 
     def start_event(self, event_name):
-        if not self.enabled:
-            return
-        self.active_timers[event_name] = float(len(self.events)) * 0.001
+        if self.enabled:
+            self.active_timers[event_name] = time_ms()
 
     def end_event(self, event_name):
         if not self.enabled:
             return
-        var elapsed = 0.001
-        if event_name not in self.total_time:
+        if not (event_name in self.active_timers):
+            raise ValueError("end_event('" + str(event_name) + "') without start_event")
+        var elapsed = time_ms() - self.active_timers[event_name]
+        if not (event_name in self.total_time):
             self.total_time[event_name] = 0.0
             self.call_count[event_name] = 0
         self.total_time[event_name] = self.total_time[event_name] + elapsed
         self.call_count[event_name] = self.call_count[event_name] + 1
-        self.events = self.events + [{"name": event_name, "elapsed_ms": elapsed * 1000.0}]
+        self.events.append({"name": event_name, "elapsed_ms": elapsed})
 
     def record_memory(self, label, bytes_used):
-        self.memory_snapshots = self.memory_snapshots + [{"label": label, "bytes": bytes_used}]
+        self.memory_snapshots.append({"label": label, "bytes": bytes_used})
 
     def report(self):
-        var hotspots = []
-        for event in self.total_time:
-            var hotspots = hotspots + [{"name": event, "total_ms": self.total_time[event] * 1000.0, "calls": self.call_count[event]}]
-        return {"total_events": len(self.events), "hotspots": hotspots, "memory_snapshots": len(self.memory_snapshots)}
+        var hot = []
+        var keys = sorted(self.total_time.keys())
+        var i = 0
+        while i < len(keys):
+            hot.append({"name": keys[i], "total_ms": self.total_time[keys[i]], "calls": self.call_count[keys[i]]})
+            i = i + 1
+        return {"total_events": len(self.events), "hotspots": hot, "memory_snapshots": len(self.memory_snapshots)}
 
     def get_name(self):
         return self.name
 
 
-# ── 260: HyperparameterBayesOpt ────────────────────────────────────────────
+# ── 260: HyperparameterBayesOpt: a Gaussian-process surrogate (RBF kernel,
+# length scale 0.2 on the unit cube, noise 1e-6) over parameters scaled to
+# [0, 1]; the first n_initial suggestions are uniform, later ones maximise
+# the acquisition ("ei", "ucb" or "pi", for minimisation) over 200 uniform
+# candidates. Minimises the observed value.
 class HyperparameterBayesOpt:
     def __init__(self, param_bounds, n_initial, acquisition):
-        self.param_bounds = param_bounds   # dict: param -> [low, high]
+        if acquisition != "ei" and acquisition != "ucb" and acquisition != "pi":
+            raise ValueError("acquisition must be ei, ucb or pi")
+        self.param_bounds = param_bounds
+        self.keys = sorted(param_bounds.keys())
         self.n_initial = n_initial
-        self.acquisition = acquisition   # "ei", "ucb", "pi"
+        self.acquisition = acquisition
         self.observations_x = []
+        self.observations_u = []
         self.observations_y = []
         self.best_x = {}
-        self.best_y = 1e18
+        self.best_y = 1e300
         self.iteration = 0
+        self.length_scale = 0.2
+        self.noise = 0.000001
+        self._mu = 0.0
+        self._sd = 1.0
+        self._O = none
+        self._Kinv = none
+        self._alpha = none
         self.name = "HyperparameterBayesOpt"
 
+    def _to_params(self, u):
+        var p = {}
+        var i = 0
+        while i < len(self.keys):
+            var b = self.param_bounds[self.keys[i]]
+            p[self.keys[i]] = b[0] + (b[1] - b[0]) * u[i]
+            i = i + 1
+        return p
+
+    def _to_unit(self, x):
+        var u = []
+        var i = 0
+        while i < len(self.keys):
+            var b = self.param_bounds[self.keys[i]]
+            u.append((x[self.keys[i]] - b[0]) / (b[1] - b[0]))
+            i = i + 1
+        return u
+
     def _random_sample(self):
-        var params = {}
-        for key in self.param_bounds:
-            var bounds = self.param_bounds[key]
-            var lo = bounds[0]
-            var hi = bounds[1]
-            var r = float(self.iteration * 7919 + 17) % 1000.0 / 1000.0
-            params[key] = lo + (hi - lo) * r
-        return params
+        return nt_rand(len(self.keys))
+
+    def _k(self, a, b):
+        var d = 0.0
+        var i = 0
+        while i < len(a):
+            d = d + (a[i] - b[i]) * (a[i] - b[i])
+            i = i + 1
+        return exp(0.0 - d / (2.0 * self.length_scale * self.length_scale))
+
+    # RBF kernel matrix between rows of A (m, d) and B (n, d)
+    def _kmat(self, A, B):
+        var d2 = A.square().sum(1, true) + B.square().sum(1, true).t() - A.matmul(B.t()) * 2.0
+        return (d2 * (-0.5 / (self.length_scale * self.length_scale))).exp()
+
+    # fit the GP to the (standardised) observations: K^-1 and alpha = K^-1 y
+    def _fit(self):
+        var n = len(self.observations_u)
+        var ys = self.observations_y
+        self._mu = tensor_mean(ys)
+        self._sd = tensor_std(ys)
+        if self._sd < 0.000000001:
+            self._sd = 1.0
+        self._O = Tensor(self.observations_u)
+        var K = self._kmat(self._O, self._O) + torch.eye(n) * self.noise
+        var rows = []
+        var i = 0
+        while i < n:
+            rows.append(K.select(0, i).data)
+            i = i + 1
+        var inv = []
+        i = 0
+        while i < n:
+            var e = nt_full([n], 0.0)
+            e[i] = 1.0
+            inv.append(_cv_solve(rows, e))
+            i = i + 1
+        self._Kinv = Tensor(inv)
+        var yz = []
+        i = 0
+        while i < n:
+            yz.append((ys[i] - self._mu) / self._sd)
+            i = i + 1
+        self._alpha = self._Kinv.mv(Tensor(yz))
+
+    # GP posterior means and stds at the rows of U (m, d) -> [means, stds]
+    def _posterior_batch(self, U):
+        var Kc = self._kmat(U, self._O)
+        var m = Kc.mv(self._alpha) * self._sd + self._mu
+        var v = (Kc.matmul(self._Kinv) * Kc).sum(1).rsub(1.0).clamp(0.000000000001, 1e300)
+        return [m, v.sqrt() * self._sd]
+
+    def _posterior(self, u):
+        self._fit()
+        var r = self._posterior_batch(Tensor([u]))
+        return [r[0].data[0], r[1].data[0]]
 
     def _surrogate_mean(self, x):
-        if len(self.observations_y) == 0:
-            return 0.0
-        var total = 0.0
-        for y in self.observations_y:
-            var total = total + y
-        return total / float(len(self.observations_y))
+        return self._posterior(self._to_unit(x))[0]
+
+    def _norm_cdf(self, z):
+        return 0.5 * (1.0 + tanh(0.7978845608028654 * (z + 0.044715 * z * z * z)))
+
+    def _acq_from(self, m, s):
+        if self.acquisition == "ucb":
+            return 0.0 - (m - 2.0 * s)
+        var z = (self.best_y - m) / s
+        if self.acquisition == "pi":
+            return self._norm_cdf(z)
+        return (self.best_y - m) * self._norm_cdf(z) + s * exp(0.0 - 0.5 * z * z) / 2.5066282746310002
+
+    # larger is better
+    def _acq(self, u):
+        var ps = self._posterior(u)
+        return self._acq_from(ps[0], ps[1])
 
     def _acquisition_value(self, x):
-        var mu = self._surrogate_mean(x)
-        var sigma = 0.1 + 0.01 * float(self.iteration)
-        if self.acquisition == "ucb":
-            return mu - 2.0 * sigma
-        elif self.acquisition == "ei":
-            var z = (self.best_y - mu) / max(sigma, 1e-8)
-            return 0.0 - (self.best_y - mu) * sigmoid(z) + sigma * 0.4
-        return mu
+        return self._acq(self._to_unit(x))
 
     def suggest(self):
         self.iteration = self.iteration + 1
-        if self.iteration <= self.n_initial:
-            return self._random_sample()
-        var best_cand = self._random_sample()
-        var best_acq = self._acquisition_value(best_cand)
-        for i in range(0, 10):
-            var cand = self._random_sample()
-            var acq = self._acquisition_value(cand)
-            if acq < best_acq:
-                var best_acq = acq
-                var best_cand = cand
-        return best_cand
+        if len(self.observations_u) < self.n_initial:
+            return self._to_params(self._random_sample())
+        self._fit()
+        var M = 200
+        var d = len(self.keys)
+        var U = Tensor(nt_rand(M * d), false, [M, d])
+        var ps = self._posterior_batch(U)
+        var md = ps[0].data
+        var sd = ps[1].data
+        var best = 0
+        var best_a = 0.0
+        var c = 0
+        while c < M:
+            var a = self._acq_from(md[c], sd[c])
+            if c == 0 or a > best_a:
+                best = c
+                best_a = a
+            c = c + 1
+        return self._to_params(U.select(0, best).data)
 
     def observe(self, x, y):
-        self.observations_x = self.observations_x + [x]
-        self.observations_y = self.observations_y + [y]
+        self.observations_x.append(x)
+        self.observations_u.append(self._to_unit(x))
+        self.observations_y.append(y)
         if y < self.best_y:
             self.best_y = y
             self.best_x = x
@@ -1315,4 +1941,3 @@ class HyperparameterBayesOpt:
 
     def get_name(self):
         return self.name
-
