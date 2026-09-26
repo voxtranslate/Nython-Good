@@ -40,6 +40,7 @@
 #include <cerrno>
 #include "NyJson.hpp"
 #include "NyFuzzy.hpp"
+#include "NyOrderedMap.hpp"
 #include <random>
 
 #include "Value.hpp"
@@ -114,6 +115,10 @@ enum class VMType : uint8_t {
 };
 
 struct VMCode;  // forward declaration (defined after VMVal)
+struct VMVal;
+// Dicts, instance fields and closure environments: insertion-ordered, so a
+// dict iterates in the order its keys were added (as in Python).
+using VMMap = nypy::OrderedMap<VMVal>;
 using NativeFunc = std::function<struct VMVal(std::vector<struct VMVal>&)>;
 
 struct VMVal {
@@ -123,14 +128,14 @@ struct VMVal {
     double  d   = 0.0;
     std::string s;
     std::shared_ptr<std::vector<VMVal>>                        list;
-    std::shared_ptr<std::unordered_map<std::string,VMVal>>     map;
+    std::shared_ptr<VMMap>     map;
     std::shared_ptr<VMCode>                                    code;
     NativeFunc                                                 native;
     std::shared_ptr<std::pair<int,std::vector<VMVal>>>         iter;
     std::shared_ptr<struct GenState>                           gen;
     std::string class_name;
     // Closure environment: captured variables from enclosing scope
-    std::shared_ptr<std::unordered_map<std::string,VMVal>>     closure_env;
+    std::shared_ptr<VMMap>     closure_env;
 
     static VMVal make_none()              { return {}; }
     static VMVal make_bool(bool v)        { VMVal x; x.type=VMType::BOOL;  x.b=v; return x; }
@@ -143,7 +148,7 @@ struct VMVal {
     }
     static VMVal make_map() {
         VMVal x; x.type=VMType::MAP;
-        x.map=std::make_shared<std::unordered_map<std::string,VMVal>>(); return x;
+        x.map=std::make_shared<VMMap>(); return x;
     }
     static VMVal make_func(std::shared_ptr<VMCode> c) {
         VMVal x; x.type=VMType::FUNCTION; x.code=c; return x;
@@ -152,7 +157,7 @@ struct VMVal {
         VMVal x; x.type=VMType::CLASS; x.code=c; x.class_name=std::move(name); return x;
     }
     static VMVal make_instance(std::string cname,
-        std::shared_ptr<std::unordered_map<std::string,VMVal>> attrs) {
+        std::shared_ptr<VMMap> attrs) {
         VMVal x; x.type=VMType::INSTANCE; x.class_name=std::move(cname); x.map=attrs; return x;
     }
     static VMVal make_native(NativeFunc f) {
@@ -277,7 +282,7 @@ struct VMCode {
     bool                     is_static     = false;
     bool                     is_classmethod= false;
     bool                     is_generator  = false;
-    std::shared_ptr<std::unordered_map<std::string,VMVal>> closure_env;
+    std::shared_ptr<VMMap> closure_env;
     std::vector<std::shared_ptr<VMCode>> sub_codes;
     std::vector<ExceptionEntry>          exc_table;
 
@@ -1491,9 +1496,9 @@ private:
 struct GenState {
     std::shared_ptr<VMCode> code;
     size_t ip=0;
-    std::unordered_map<std::string,VMVal> locals;
+    VMMap locals;
     std::optional<VMVal> self_val;
-    std::shared_ptr<std::unordered_map<std::string,VMVal>> closure;
+    std::shared_ptr<VMMap> closure;
     bool done=false;
     std::vector<VMVal> saved_stack; // intermediate stack at yield point
     size_t stack_base=0;           // stack level when generator was entered
@@ -1507,7 +1512,7 @@ struct GenState {
 inline VMVal make_generator_val(std::shared_ptr<VMCode> code,
                             std::vector<VMVal> args,
                             std::optional<VMVal> self,
-                            std::shared_ptr<std::unordered_map<std::string,VMVal>> closure=nullptr) {
+                            std::shared_ptr<VMMap> closure=nullptr) {
     VMVal g; g.type=VMType::GENERATOR;
     g.gen=std::make_shared<GenState>();
     g.gen->code=code; g.gen->ip=0; g.gen->self_val=self; g.gen->closure=closure;
@@ -1538,10 +1543,10 @@ inline VMVal make_generator_val(std::shared_ptr<VMCode> code,
 struct CallFrame {
     std::shared_ptr<VMCode>                       code;
     int                                           ip = 0;
-    std::unordered_map<std::string,VMVal>         locals;
+    VMMap         locals;
     std::optional<VMVal>                          self_val;
     // Shared closure environment (shared with enclosing scope)
-    std::shared_ptr<std::unordered_map<std::string,VMVal>> closure_env;
+    std::shared_ptr<VMMap> closure_env;
 
     bool has_local(const std::string& n) const {
         if(locals.count(n)) return true;
@@ -1558,11 +1563,13 @@ struct CallFrame {
     VMVal& local(const std::string& n)           { return locals[n]; }
     void   set(const std::string& n, VMVal v)    {
         // If var exists in closure_env (and is NOT a local param), update closure_env
-        if(closure_env && closure_env->count(n) && !locals.count(n)){
-            (*closure_env)[n]=std::move(v);
-        } else {
-            locals[n]=std::move(v);
+        auto li=locals.find(n);
+        if(li!=locals.end()){ li->second=std::move(v); return; }
+        if(closure_env){
+            auto ci=closure_env->find(n);
+            if(ci!=closure_env->end()){ ci->second=std::move(v); return; }
         }
+        locals[n]=std::move(v);
     }
     void define(const std::string& n, VMVal v) { locals[n]=std::move(v); }
     std::shared_ptr<GenState>  gen_state;   // non-null when executing a generator
@@ -1589,9 +1596,9 @@ class VirtualMachine : public Runnable {
     // sorted(xs, key=...). deque::push_back does not invalidate references to
     // existing elements.
     std::deque<CallFrame>                              call_stack_;
-    std::unordered_map<std::string,VMVal>              globals_;
+    VMMap              globals_;
     std::unordered_map<std::string,std::shared_ptr<VMCode>> class_reg_;
-    std::unordered_map<std::string,std::unordered_map<std::string,VMVal>> class_vars_;
+    std::unordered_map<std::string,VMMap> class_vars_;
     VMVal last_exception_obj_;
     bool vm_trace_ = getenv("NY_VM_TRACE") != nullptr;
     bool export_to_globals_ = false;   // true while executing an import
@@ -1655,11 +1662,11 @@ private:
     void store_var(const std::string& n, VMVal v) {
         // Walk frames: if found in locals or closure_env, update there
         for(int i=(int)call_stack_.size()-1;i>=0;i--){
-            if(call_stack_[i].locals.count(n)){
-                call_stack_[i].locals[n]=std::move(v); return;
-            }
-            if(call_stack_[i].closure_env && call_stack_[i].closure_env->count(n)){
-                (*call_stack_[i].closure_env)[n]=std::move(v); return;
+            auto li=call_stack_[i].locals.find(n);
+            if(li!=call_stack_[i].locals.end()){ li->second=std::move(v); return; }
+            if(call_stack_[i].closure_env){
+                auto ci=call_stack_[i].closure_env->find(n);
+                if(ci!=call_stack_[i].closure_env->end()){ ci->second=std::move(v); return; }
             }
         }
         if(!call_stack_.empty()) call_stack_.back().locals[n]=std::move(v);
@@ -1787,9 +1794,9 @@ private:
     }
 
     VMVal exec_code_bound(std::shared_ptr<VMCode> code,
-                          std::unordered_map<std::string,VMVal> locs,
+                          VMMap locs,
                           std::optional<VMVal> self,
-                          std::shared_ptr<std::unordered_map<std::string,VMVal>> closure=nullptr) {
+                          std::shared_ptr<VMMap> closure=nullptr) {
         CallFrame fr; fr.code=code; fr.ip=0;
         if(self) fr.self_val=self;
         fr.closure_env=closure;
@@ -1805,7 +1812,7 @@ private:
     VMVal exec_code(std::shared_ptr<VMCode> code,
                     std::vector<VMVal> args,
                     std::optional<VMVal> self,
-                    std::shared_ptr<std::unordered_map<std::string,VMVal>> closure=nullptr) {
+                    std::shared_ptr<VMMap> closure=nullptr) {
         size_t _stack_base=stack_.size();
         CallFrame fr; fr.code=code; fr.ip=0;
         if(self) fr.self_val=self;
@@ -2195,7 +2202,7 @@ private:
                     // Create shared closure_env on first inner function in this frame
                     // so ALL inner functions share the SAME cell for mutable variables
                     if(!fr.closure_env){
-                        fr.closure_env = std::make_shared<std::unordered_map<std::string,VMVal>>(fr.locals);
+                        fr.closure_env = std::make_shared<VMMap>(fr.locals);
                     } else {
                         // Sync any new locals into the shared closure_env
                         for(auto& kv : fr.locals)
@@ -2214,7 +2221,7 @@ private:
                 // Statically scan class body to collect class-level variable initializations
                 // (LOAD_CONST followed by DEFINE_NAME = class variable)
                 {
-                    std::unordered_map<std::string,VMVal> cvars;
+                    VMMap cvars;
                     const auto& insts = sub->instructions;
                     for(size_t ci=0;ci+1<insts.size();ci++){
                         const auto& prev_ins = insts[ci];
@@ -2270,7 +2277,7 @@ private:
                         else bound.push_back(VMVal::make_none());
                     }
                     // Build locals map and call without re-expansion
-                    std::unordered_map<std::string,VMVal> locs;
+                    VMMap locs;
                     for(int bi=0;bi<(int)pnames.size()&&bi<(int)bound.size();bi++){
                         const std::string& pn2=pnames[bi];
                         std::string ln2=(pn2.size()>=2&&pn2[0]=='*'&&pn2[1]=='*')?pn2.substr(2):(!pn2.empty()&&pn2[0]=='*')?pn2.substr(1):pn2;
@@ -2696,7 +2703,7 @@ private:
         }
         if(c=='{') {
             // Parse object
-            auto map=std::make_shared<std::unordered_map<std::string,VMVal>>();
+            auto map=std::make_shared<VMMap>();
             pos++;
             while(pos<s.size()){
                 while(pos<s.size()&&(s[pos]==' '||s[pos]=='\t'||s[pos]=='\r'||s[pos]=='\n')) pos++;
@@ -3265,7 +3272,7 @@ private:
             return exec_code(callee.code,args,self,callee.closure_env);
         }
         if(callee.type==VMType::CLASS&&callee.code){
-            auto attrs=std::make_shared<std::unordered_map<std::string,VMVal>>();
+            auto attrs=std::make_shared<VMMap>();
             VMVal inst=VMVal::make_instance(callee.class_name,attrs);
             if(!class_reg_.count(callee.class_name)) class_reg_[callee.class_name]=callee.code;
             {
@@ -3672,7 +3679,7 @@ private:
               catch(std::exception& e){ std::cerr<<"[VM import error] "<<filepath<<": "<<e.what()<<"\n"; }
             export_to_globals_=old_exp;
             if(!alias.empty()){
-                auto ns=std::make_shared<std::unordered_map<std::string,VMVal>>();
+                auto ns=std::make_shared<VMMap>();
                 for(const auto& n : own_names){
                     auto it=globals_.find(n);
                     if(it!=globals_.end()){ (*ns)[n]=it->second; continue; }
@@ -4024,7 +4031,7 @@ private:
             return a.empty()?VMVal::make_list():a[0];});
         // ── device_info() ─────────────────────────────────────────────────────
         globals_["device_info"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            auto m=std::make_shared<std::unordered_map<std::string,VMVal>>();
+            auto m=std::make_shared<VMMap>();
             (*m)["backend"]=VMVal::make_str("cpu");
             (*m)["cpu_cores"]=VMVal::make_int((int64_t)std::max(1u,std::thread::hardware_concurrency()));
             (*m)["gpu_available"]=VMVal::make_bool(false);
@@ -4044,7 +4051,7 @@ private:
             std::sort(iv.begin(),iv.end(),[](auto& a,auto& b){return a.first>b.first;});
             std::vector<VMVal> r;
             for(int i=0;i<k;i++){
-                auto m=std::make_shared<std::unordered_map<std::string,VMVal>>();
+                auto m=std::make_shared<VMMap>();
                 (*m)["value"]=VMVal::make_float(iv[i].first);
                 (*m)["index"]=VMVal::make_int(iv[i].second);
                 VMVal entry; entry.type=VMType::MAP; entry.map=m; r.push_back(entry);}
@@ -4370,7 +4377,7 @@ private:
                 if(!seen.count(k)){seen.insert(k);r.push_back(v);}}
             return VMVal::make_list(std::move(r));});
         globals_["dict"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            auto m=std::make_shared<std::unordered_map<std::string,VMVal>>();
+            auto m=std::make_shared<VMMap>();
             if(!a.empty()&&a[0].type==VMType::LIST&&a[0].list){
                 for(auto& item:vm_arg_list(a,0)){
                     if(item.type==VMType::LIST&&item.list&&item.list->size()>=2)
@@ -4936,13 +4943,13 @@ private:
                 // property() builtin — create a property descriptor
         globals_["property"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             VMVal desc; desc.type=VMType::MAP;
-            desc.map=std::make_shared<std::unordered_map<std::string,VMVal>>();
+            desc.map=std::make_shared<VMMap>();
             if(!a.empty()) (*desc.map)["__get__"]=a[0];
             (*desc.map)["__is_property__"]=VMVal::make_bool(true);
             // Add .setter(fn) method to the descriptor so @prop.setter works:
             (*desc.map)["setter"]=VMVal::make_native([desc](std::vector<VMVal>& b) mutable ->VMVal{
                 VMVal d2; d2.type=VMType::MAP;
-                d2.map=std::make_shared<std::unordered_map<std::string,VMVal>>(*desc.map);
+                d2.map=std::make_shared<VMMap>(*desc.map);
                 if(!b.empty()) (*d2.map)["__set__"]=b[0];
                 (*d2.map)["setter"]=(*desc.map)["setter"]; // keep setter method
                 return d2;
@@ -5271,7 +5278,7 @@ private:
         // ── Built-in exception classes ────────────────────────────────────────
         auto make_exc_class = [this](const std::string& cname) {
             globals_[cname] = VMVal::make_native([cname](std::vector<VMVal>& a) -> VMVal {
-                auto attrs = std::make_shared<std::unordered_map<std::string,VMVal>>();
+                auto attrs = std::make_shared<VMMap>();
                 std::string msg = a.empty() ? cname : a[0].to_string();
                 (*attrs)["msg"] = VMVal::make_str(msg);
                 (*attrs)["args"] = VMVal::make_list(a);
