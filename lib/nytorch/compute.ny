@@ -21,6 +21,75 @@
 # ---------------------------------------------------------------------------
 import "lib/nytorch/core.ny"
 
+# FNV-1a (32-bit) of a string
+def _cm_fnv(text):
+    var h = 2166136261
+    var i = 0
+    while i < len(text):
+        h = ((h ^ ord(text[i])) * 16777619) % 4294967296
+        i = i + 1
+    return h
+
+# Hashed bag-of-features text embedding (the "hashing trick"): lowercase
+# words (weight 1) and their boundary-marked character trigrams (weight 0.5)
+# are hashed into `dim` signed buckets, then L2-normalised. Deterministic,
+# lexical (no learned semantics): texts sharing words and word pieces score
+# high under cosine similarity.
+def _cm_hash_embed(text, dim):
+    var v = nt_full([dim], 0.0)
+    var words = []
+    var w = ""
+    var low = string_lower(text)
+    var i = 0
+    while i < len(low):
+        var c = low[i]
+        if (c >= "a" and c <= "z") or (c >= "0" and c <= "9"):
+            w = w + c
+        elif len(w) > 0:
+            words.append(w)
+            w = ""
+        i = i + 1
+    if len(w) > 0:
+        words.append(w)
+    var k = 0
+    while k < len(words):
+        var word = words[k]
+        var h = _cm_fnv(word)
+        var sign = 1.0
+        if (h // dim) % 2 == 1:
+            sign = -1.0
+        v[h % dim] = v[h % dim] + sign
+        var b = "<" + word + ">"
+        var j = 0
+        while j + 3 <= len(b):
+            var g = _cm_fnv(b[j:j + 3])
+            var sg = 0.5
+            if (g // dim) % 2 == 1:
+                sg = -0.5
+            v[g % dim] = v[g % dim] + sg
+            j = j + 1
+        k = k + 1
+    var n = tensor_norm(v)
+    if n < 0.000000000001:
+        return v
+    return tensor_scale(v, 1.0 / n)
+
+# round to the nearest IEEE half-precision value (10-bit mantissa)
+def _cm_to_half(x):
+    if x == 0.0:
+        return 0.0
+    var a = abs(x)
+    var e = floor(log(a) / log(2.0))
+    if e < -14:
+        e = -14
+    var q = 2.0 ** (10 - e)
+    var r = round(a * q) / q
+    if r > 65504.0:
+        r = 65504.0
+    if x < 0:
+        return 0.0 - r
+    return r
+
 class DeviceManager:
     def __init__(self):
         self.name = "DeviceManager"
@@ -95,24 +164,30 @@ class TensorDevice:
         self.device = "cuda"
         return self
 
+    # values rounded to float16 precision
     def half(self):
-        self.dtype = "float16"
-        var scaled = tensor_mul(self.data, tensor([1.0]))
-        return TensorDevice(scaled, self.device)
+        var h = []
+        var i = 0
+        while i < len(self.data):
+            h.append(_cm_to_half(self.data[i]))
+            i = i + 1
+        var t = TensorDevice(h, self.device)
+        t.dtype = "float16"
+        return t
 
     def float(self):
         self.dtype = "float32"
         return self
 
     def add(self, other):
-        if type(other) == "class":
+        if isinstance(other, TensorDevice):
             return TensorDevice(tensor_add(self.data, other.data), self.device)
-        return TensorDevice(tensor_add(self.data, tensor([other])), self.device)
+        return TensorDevice(tensor_add(self.data, [1.0 * other]), self.device)
 
     def mul(self, other):
-        if type(other) == "class":
+        if isinstance(other, TensorDevice):
             return TensorDevice(tensor_mul(self.data, other.data), self.device)
-        return TensorDevice(tensor_mul(self.data, tensor([other])), self.device)
+        return TensorDevice(tensor_mul(self.data, [1.0 * other]), self.device)
 
     def norm(self):
         return tensor_norm(self.data)
@@ -172,33 +247,32 @@ class ComputeScheduler:
 # ---------------------------------------------------------------------------
 # 324: OptimizedLayer - auto-vectorized linear layer with device dispatch
 # ---------------------------------------------------------------------------
-class OptimizedLayer:
+class OptimizedLayer(Module):
+    # y = x W^T + b through the native linear kernel; fused_forward runs a
+    # whole batch as one matrix product.
     def __init__(self, in_dim, out_dim, device):
+        super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.device = device
-        self.weight = tensor_randn([in_dim * out_dim])
-        self.bias = tensor_zeros([out_dim])
+        self.linear = Linear(in_dim, out_dim)
         self.use_fused = true
         self.name = "OptimizedLayer"
 
     def forward(self, x):
-        var out = tensor_zeros([self.out_dim])
-        for i in range(0, self.out_dim):
-            var w_i = self.weight[i * self.in_dim:(i + 1) * self.in_dim] if len(x) <= self.in_dim else tensor_zeros([self.in_dim])
-            var xi = x[:self.in_dim] if len(x) >= self.in_dim else x
-            var dot = tensor_dot(xi, xi)
-            var out = tensor_add(out, tensor_mul(tensor_ones([self.out_dim]), tensor([dot / self.out_dim])))
-        return tensor_add(out, self.bias)
+        var t = _t_wrap(x)
+        if t.numel() != self.in_dim:
+            raise ValueError("OptimizedLayer expects " + str(self.in_dim) + " inputs, got " + str(t.numel()))
+        return self.linear.forward(t.reshape([self.in_dim]))
 
     def fused_forward(self, x_batch):
-        var results = []
-        for x in x_batch:
-            var results = results + [self.forward(x)]
-        return results
+        var X = _t_wrap(x_batch)
+        if X.dim() == 1:
+            X = X.reshape([X.numel() // self.in_dim, self.in_dim])
+        return self.linear.forward(X)
 
     def n_params(self):
-        return self.in_dim * self.out_dim + self.out_dim
+        return self.num_parameters()
 
     def get_name(self):
         return self.name
@@ -363,15 +437,7 @@ class VectorKnowledgeBase:
         self.name = "VectorKnowledgeBase"
 
     def _text_to_embedding(self, text):
-        var chars = string_lower(text)
-        var emb = tensor_zeros([self.embed_dim])
-        var n = min(len(chars), 512)
-        for i in range(0, n):
-            var idx = i % self.embed_dim
-            var char_val = float(string_find("abcdefghijklmnopqrstuvwxyz ", string_slice(chars, i, i+1)) + 1) / 28.0
-            var emb = tensor_add(emb, tensor_mul(tensor_ones([self.embed_dim]), tensor([char_val / float(self.embed_dim)])))
-        var norm_val = max(tensor_norm(emb), 1e-8)
-        return tensor_mul(emb, tensor([1.0 / norm_val]))
+        return _cm_hash_embed(text, self.embed_dim)
 
     def add_document(self, doc_id, text, metadata_dict):
         var emb = self._text_to_embedding(text)
@@ -1285,28 +1351,46 @@ class ModelOptimizer:
         self.optimization_log = []
         self.name = "ModelOptimizer"
 
+    # symmetric uniform quantisation to signed `bits`-bit integers:
+    #   scale = (2^(bits-1) - 1) / max|w|,  w_q = round(w * scale) / scale
     def quantize(self, weights, bits):
-        if bits == 8:
-            var scale = 127.0 / max(tensor_max(tensor_abs(weights)), 1e-8)
-            var quantized = tensor_apply(weights, lambda w: float(int(w * scale)) / scale)
-            var compression = 4.0 / 1.0
-            self.optimization_log = self.optimization_log + [{"op": "quantize", "bits": bits, "compression": compression}]
-            return {"weights": quantized, "scale": scale, "bits": bits, "compression": compression}
-        elif bits == 4:
-            var scale = 7.0 / max(tensor_max(tensor_abs(weights)), 1e-8)
-            var quantized = tensor_apply(weights, lambda w: float(int(w * scale)) / scale)
-            var compression = 8.0
-            self.optimization_log = self.optimization_log + [{"op": "quantize", "bits": bits, "compression": compression}]
-            return {"weights": quantized, "scale": scale, "bits": bits, "compression": compression}
-        return {"weights": weights, "scale": 1.0, "bits": 32, "compression": 1.0}
+        var w = _t_flat(_t_wrap(weights).data)
+        if bits >= 32:
+            return {"weights": w, "scale": 1.0, "bits": 32, "compression": 1.0}
+        if bits < 2:
+            raise ValueError("quantize needs at least 2 bits")
+        var qmax = float(2 ** (bits - 1) - 1)
+        var scale = qmax / max(tensor_max(tensor_abs(w)), 0.00000001)
+        var q = []
+        var i = 0
+        while i < len(w):
+            q.append(round(w[i] * scale) / scale)
+            i = i + 1
+        var compression = 32.0 / float(bits)
+        self.optimization_log.append({"op": "quantize", "bits": bits, "compression": compression})
+        return {"weights": q, "scale": scale, "bits": bits, "compression": compression}
 
+    # magnitude pruning: exactly k = floor(sparsity * n) weights with the
+    # smallest |w| become zero (ties broken by position), so the achieved
+    # sparsity is k / n.
     def prune(self, weights, sparsity):
-        var threshold = tensor_norm(weights) * sparsity / float(len(weights))
-        var pruned = tensor_apply(weights, lambda w: w if abs(w) > threshold else 0.0)
-        var n_zero = len([w for w in pruned if abs(w) < 1e-10])
-        var actual_sparsity = float(n_zero) / float(max(len(pruned), 1))
-        self.optimization_log = self.optimization_log + [{"op": "prune", "target_sparsity": sparsity, "actual_sparsity": actual_sparsity}]
-        return {"weights": pruned, "sparsity": actual_sparsity, "n_params_removed": n_zero}
+        if sparsity < 0.0 or sparsity > 1.0:
+            raise ValueError("sparsity must be in [0, 1]")
+        var w = _t_flat(_t_wrap(weights).data)
+        var n = len(w)
+        var k = int(sparsity * float(n))
+        var mags = tensor_abs(w)
+        var order = []
+        if k > 0:
+            order = tensor_topk(tensor_scale(mags, -1.0), k)
+        var out = w[:]
+        var i = 0
+        while i < len(order):
+            out[order[i]["index"]] = 0.0
+            i = i + 1
+        var actual = float(k) / float(max(n, 1))
+        self.optimization_log.append({"op": "prune", "target_sparsity": sparsity, "actual_sparsity": actual})
+        return {"weights": out, "sparsity": actual, "n_params_removed": k}
 
     def distill(self, teacher_output, student_output, temperature):
         var t_soft = softmax(tensor_mul(teacher_output, tensor([1.0 / max(temperature, 1e-8)])))
@@ -1403,10 +1487,11 @@ class MultimodalAugmentor:
                 var s = 0.8 + tensor_mean(tensor_abs(tensor_randn([1]))) * 0.4
                 result = tensor_mul(result, tensor([s]))
             elif op == "flip":
-                var n = len(result)
-                var flipped = tensor_zeros([n])
-                for i in range(0, n):
-                    var flipped = tensor_add(flipped, tensor_mul(tensor_ones([n]), tensor([result[n-1-i] / float(n)])))
+                var flipped = []
+                var fi = len(result) - 1
+                while fi >= 0:
+                    flipped.append(result[fi])
+                    fi = fi - 1
                 result = flipped
             elif op == "normalize":
                 var mean = tensor_mean(result)
@@ -1575,40 +1660,48 @@ class MultimodalAI:
         self.name = "MultimodalAI"
 
     def _encode_text(self, text):
-        var chars = string_lower(text)
-        var emb = tensor_zeros([self.embed_dim])
-        var n = min(len(chars), 256)
-        for i in range(0, n):
-            var val = float(string_find("abcdefghijklmnopqrstuvwxyz0123456789 .,!?", string_slice(chars, i, i+1)) + 1) / 42.0
-            var pos = i % self.embed_dim
-            var emb = tensor_add(emb, tensor_mul(tensor_ones([self.embed_dim]), tensor([val * 0.01])))
-        var norm = max(tensor_norm(emb), 1e-8)
-        return tensor_mul(emb, tensor([1.0 / norm]))
+        return _cm_hash_embed(text, self.embed_dim)
+
+    # the signal averaged into embed_dim equal bins (linear interpolation
+    # of bin edges), then L2-normalised
+    def _pool(self, values):
+        var v = _t_flat(_t_wrap(values).data)
+        var n = len(v)
+        if n == 0:
+            raise ValueError("empty input")
+        var out = []
+        var b = 0
+        while b < self.embed_dim:
+            var lo = float(b) * float(n) / float(self.embed_dim)
+            var hi = float(b + 1) * float(n) / float(self.embed_dim)
+            var total = 0.0
+            var i = int(lo)
+            while i < n and float(i) < hi:
+                var seg = min(hi, float(i + 1)) - max(lo, float(i))
+                total = total + v[i] * seg
+                i = i + 1
+            out.append(total / (hi - lo))
+            b = b + 1
+        var nrm = tensor_norm(out)
+        if nrm < 0.000000000001:
+            return out
+        return tensor_scale(out, 1.0 / nrm)
 
     def _encode_image(self, pixel_tensor):
-        var resized = pixel_tensor[:min(len(pixel_tensor), self.embed_dim)]
-        if len(resized) < self.embed_dim:
-            var resized = tensor_add(tensor_zeros([self.embed_dim]), tensor_mul(tensor_ones([self.embed_dim]), tensor([tensor_mean(resized)])))
-        var norm = max(tensor_norm(resized), 1e-8)
-        return tensor_mul(resized, tensor([1.0 / norm]))
+        return self._pool(pixel_tensor)
 
+    # amplitude envelope (|x| pooled into embed_dim bins)
     def _encode_audio(self, audio_tensor):
-        var spectral = tensor_apply(audio_tensor[:min(len(audio_tensor), self.embed_dim)], lambda v: abs(v))
-        if len(spectral) < self.embed_dim:
-            var spectral = tensor_add(tensor_zeros([self.embed_dim]), tensor_mul(tensor_ones([self.embed_dim]), tensor([tensor_mean(spectral)])))
-        var norm = max(tensor_norm(spectral), 1e-8)
-        return tensor_mul(spectral, tensor([1.0 / norm]))
+        return self._pool(tensor_abs(_t_flat(_t_wrap(audio_tensor).data)))
 
     def encode(self, data, modality):
-        if modality == "text":
+        if modality == "text" or modality == "code":
             return self._encode_text(data)
-        elif modality == "image":
+        if modality == "image":
             return self._encode_image(data)
-        elif modality == "audio":
+        if modality == "audio":
             return self._encode_audio(data)
-        elif modality == "code":
-            return self._encode_text(data)
-        return tensor_randn([self.embed_dim])
+        raise ValueError("unknown modality '" + str(modality) + "' (text, code, image, audio)")
 
     def fuse(self, embeddings, weights):
         var fused = tensor_zeros([self.embed_dim])
@@ -1631,7 +1724,8 @@ class MultimodalAI:
                 var best_idx = i
         if ai_interface != none:
             return ai_interface.complete("Answer based on context: " + query_text, 200, 0.7)
-        return {"answer": "Context-based answer", "confidence": best_score, "context_idx": best_idx}
+        # without a language model the answer is the best-matching context
+        return {"answer": none, "confidence": best_score, "context_idx": best_idx}
 
     def get_name(self):
         return self.name
@@ -1649,8 +1743,10 @@ class FedAvgSimulator:
         self.aggregation_log = []
         self.name = "FedAvgSimulator"
 
+        self.client_samples = []
         for i in range(0, n_clients):
-            self.client_models = self.client_models + [tensor_randn([embed_dim])]
+            self.client_models = self.client_models + [self.global_model[:]]
+            self.client_samples = self.client_samples + [0]
 
     def client_update(self, client_id, local_data, n_epochs, lr):
         if client_id >= self.n_clients:
@@ -1662,29 +1758,58 @@ class FedAvgSimulator:
                 var grad = tensor_mul(tensor_sub(model, sample_tensor[:min(len(sample_tensor), self.embed_dim)]), tensor([0.01]))
                 var model = tensor_sub(model, tensor_mul(grad, tensor([lr])))
         self.client_models[client_id] = model
+        self.client_samples[client_id] = self.client_samples[client_id] + len(local_data)
         return model
 
+    # FedAvg (McMahan et al. 2017): the average of the participating client
+    # models weighted by their number of local samples (uniform if none)
     def fedavg(self, participating_clients):
-        var aggregated = tensor_zeros([self.embed_dim])
-        var n = len(participating_clients)
-        for cid in participating_clients:
-            if cid < self.n_clients:
-                var w = 1.0 / float(max(n, 1))
-                var aggregated = tensor_add(aggregated, tensor_mul(self.client_models[cid], tensor([w])))
-        self.global_model = aggregated
+        var ids = []
+        var i = 0
+        while i < len(participating_clients):
+            if participating_clients[i] < self.n_clients:
+                ids.append(participating_clients[i])
+            i = i + 1
+        if len(ids) == 0:
+            raise ValueError("fedavg needs at least one valid client")
+        var total = 0.0
+        i = 0
+        while i < len(ids):
+            total = total + float(self.client_samples[ids[i]])
+            i = i + 1
+        var agg = nt_full([self.embed_dim], 0.0)
+        i = 0
+        while i < len(ids):
+            var w = 1.0 / float(len(ids))
+            if total > 0:
+                w = float(self.client_samples[ids[i]]) / total
+            agg = tensor_add(agg, tensor_scale(self.client_models[ids[i]], w))
+            i = i + 1
+        self.global_model = agg
         self.round = self.round + 1
-        var global_norm = tensor_norm(self.global_model)
-        self.aggregation_log = self.aggregation_log + [{"round": self.round, "clients": n, "global_norm": global_norm}]
+        self.aggregation_log.append({"round": self.round, "clients": len(ids), "global_norm": tensor_norm(agg)})
         return self.global_model
 
+    # every client starts the next round from the global model
     def distribute_global_model(self):
-        for i in range(0, self.n_clients):
-            self.client_models[i] = tensor_add(self.global_model, tensor_mul(tensor_randn([self.embed_dim]), tensor([0.001])))
+        var i = 0
+        while i < self.n_clients:
+            self.client_models[i] = self.global_model[:]
+            self.client_samples[i] = 0
+            i = i + 1
         return true
 
-    def privacy_noise(self, update, epsilon):
-        var noise_scale = 1.0 / (epsilon + 1e-8)
-        return tensor_add(update, tensor_mul(tensor_randn([len(update)]), tensor([noise_scale * 0.01])))
+    # Gaussian mechanism: clip the update to L2 norm `clip`, add N(0, s^2),
+    # s = clip sqrt(2 ln(1.25 / delta)) / epsilon  -> (epsilon, delta)-DP
+    def privacy_noise(self, update, epsilon, clip=1.0, delta=0.00001):
+        if epsilon <= 0:
+            raise ValueError("epsilon must be positive")
+        var u = _t_flat(_t_wrap(update).data)
+        var nrm = tensor_norm(u)
+        if nrm > clip:
+            u = tensor_scale(u, clip / nrm)
+        var sigma = clip * sqrt(2.0 * log(1.25 / delta)) / epsilon
+        return tensor_add(u, nt_normal(len(u), 0.0, sigma))
 
     def get_name(self):
         return self.name
