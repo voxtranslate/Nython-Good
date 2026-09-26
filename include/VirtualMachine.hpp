@@ -1307,6 +1307,24 @@ private:
             code_->parent_class=base->token().value;
         }
         if(cn->body) for(auto& s:cn->body->statements()) visit(s);
+        // A method defined twice in one class body: the LAST definition wins,
+        // as in Python and on the interpreter. Methods are found by scanning
+        // sub_codes for the first name match, so the VM used to keep the
+        // FIRST one - the same class behaved differently on the two engines.
+        // Earlier duplicates are renamed out of reach (they stay in place,
+        // since MAKE_FUNCTION refers to sub_codes by index).
+        {
+            auto& subs=code_->sub_codes;
+            for(size_t i=0;i<subs.size();i++){
+                if(!subs[i]||subs[i]->is_class) continue;
+                for(size_t j=i+1;j<subs.size();j++){
+                    if(subs[j]&&!subs[j]->is_class&&subs[j]->name==subs[i]->name){
+                        subs[i]->name+="\x01shadowed";
+                        break;
+                    }
+                }
+            }
+        }
         emit(Op::HALT,0,l);
         pop_code();
         int idx=(int)C().sub_codes.size()-1;
