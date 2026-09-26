@@ -28,6 +28,7 @@ using nython::kernel::bigint;
 #include <deque>
 #include <cstring>
 #include <cstdint>
+#include <chrono>
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -727,6 +728,16 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
 
     // gui_get_error() -> string: surface last SDL error to Nython scripts
     if(name=="gui_get_error") return E.makeStringValue(g_sdl_error);
+
+    // gui_ticks() -> int: milliseconds on a monotonic clock, for UI timers
+    // (tooltip delays, toast lifetimes, frame pacing). It never jumps with the
+    // wall clock, and it is milliseconds on both engines - the VM's time_ms()
+    // becomes seconds once nytorch (imported by gui.ny) is loaded.
+    if(name=="gui_ticks"){
+        static const auto t0 = std::chrono::steady_clock::now();
+        auto dt = std::chrono::steady_clock::now() - t0;
+        return Value((int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(dt).count());
+    }
 
     // gui_sdl_version() -> string: returns SDL3 runtime version (e.g. "3.2.4")
     // Useful to confirm SDL3.dll is loaded correctly on Windows.
