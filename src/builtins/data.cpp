@@ -457,31 +457,8 @@ Value dispatch_data(NythonExecutor& E,
             std::exit(code);
             return NONE_VALUE;
         }
-        if (name == "open") {
-            // open(filename, mode) - returns file handle as map
-            if (args.size() >= 1) {
-                std::string filename = getStringValue(args[0]);
-                std::string mode = (args.size() >= 2) ? getStringValue(args[1]) : "r";
-                auto* fobj = new Object((Runnable*)runner, "file", Type::LIST);
-                fobj->set("name", makeStringValue(filename));
-                fobj->set("mode", makeStringValue(mode));
-                if (mode == "r") {
-                    std::ifstream f(filename);
-                    if (f.good()) {
-                        std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-                        fobj->set("content", makeStringValue(content));
-                        fobj->set("open", Value(true));
-                    } else {
-                        fobj->set("open", Value(false));
-                    }
-                } else {
-                    fobj->set("content", makeStringValue(""));
-                    fobj->set("open", Value(true));
-                }
-                return Value((Collectable*)fobj);
-            }
-            return NONE_VALUE;
-        }
+        // (An `open` returning a map lived here; io.cpp is dispatched first,
+        // so it never ran. open() is now the prelude's file object.)
         if (name == "chr") {
             if (args.size() >= 1) {
                 int code = (int)bigint_to_i64(args[0].value.i);

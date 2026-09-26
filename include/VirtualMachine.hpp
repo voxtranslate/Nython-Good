@@ -40,6 +40,8 @@
 #include <cerrno>
 #include "NyJson.hpp"
 #include "NyFuzzy.hpp"
+#include "NyRuntime.hpp"
+#include "NyPrelude.hpp"
 #include <random>
 
 #include "Value.hpp"
@@ -1589,6 +1591,8 @@ class VirtualMachine : public Runnable {
     std::unordered_map<std::string,std::shared_ptr<VMCode>> class_reg_;
     std::unordered_map<std::string,std::unordered_map<std::string,VMVal>> class_vars_;
     VMVal last_exception_obj_;
+    bool prelude_loaded_=false;
+    std::vector<nython::node::node_ptr> prelude_asts_;
     bool vm_trace_ = getenv("NY_VM_TRACE") != nullptr;
     bool export_to_globals_ = false;   // true while executing an import
     std::string cwd_ = ".";            // working directory for imports
@@ -1627,6 +1631,10 @@ public:
     static std::function<VMVal(const std::string&, std::vector<VMVal>&)>& bridge_call() {
         static std::function<VMVal(const std::string&, std::vector<VMVal>&)> f; return f;
     }
+    // Every builtin name the interpreter registers (for module namespaces).
+    static std::function<std::vector<std::string>()>& bridge_names() {
+        static std::function<std::vector<std::string>()> f; return f;
+    }
 
 private:
     VMVal load_var(const std::string& n) {
@@ -1641,10 +1649,12 @@ private:
         // undefined variable still reads as none rather than becoming callable.
         if(bridge_exists() && bridge_exists()(n)){
             std::string nm=n;
-            return VMVal::make_native([nm](std::vector<VMVal>& a)->VMVal{
+            VMVal nv=VMVal::make_native([nm](std::vector<VMVal>& a)->VMVal{
                 if(bridge_call()) return bridge_call()(nm,a);
                 return VMVal::make_none();
             });
+            nv.class_name="__builtin__:"+nm;   // lets time.time() find time's members
+            return nv;
         }
         return VMVal::make_none();
     }
@@ -1707,6 +1717,7 @@ public:
     // Compile + run an AST
     VMResult run(nython::node::node_ptr ast) {
         try {
+            load_prelude();
             Compiler c; auto code=c.compile(ast);
             exec_code(code,{},std::nullopt);
             return VMResult::SUCCESS;
@@ -1714,6 +1725,122 @@ public:
             std::cerr<<"\x1b[31m[VMError] "<<e.what()<<"\x1b[0m\n";
             return VMResult::RUNTIME_ERROR;
         }
+    }
+
+    // The Nython prelude (include/NyPrelude.hpp) - the same text the
+    // interpreter runs at startup: file objects for open().
+    void load_prelude() {
+        if(prelude_loaded_) return;
+        prelude_loaded_=true;
+        try {
+            auto source=nython::reader::SourceCode(std::string(nyrt::prelude_source()));
+            auto reporter=std::make_shared<nython::exception::Reporter>(source);
+            auto lx=std::make_shared<nython::lexer::Lexer>(source);
+            lx->tokenize();
+            auto pr=std::make_shared<nython::parser::Parser>(reporter.get(),(nython::Runnable*)this,lx.get());
+            auto ast=pr->parse();
+            if(!ast) return;
+            prelude_asts_.push_back(ast);
+            Compiler c; auto code=c.compile(ast);
+            bool old_exp=export_to_globals_; export_to_globals_=true;
+            try{ exec_code(code,{},std::nullopt); } catch(VMReturn&){}
+            export_to_globals_=old_exp;
+            for(auto& sub:code->sub_codes) if(sub->is_class) class_reg_[sub->name]=sub;
+        } catch(std::exception& e){ std::cerr<<"[VM] prelude failed to load: "<<e.what()<<"\n"; }
+        // open() as a native: the prelude's `def open` raises from its own
+        // frame, and an exception crossing a Nython frame is not yet
+        // catchable by typed `except` in the caller on this engine. Opening
+        // here raises FileNotFoundError & co. in the CALLER's frame; the
+        // object is still the prelude's NythonFile.
+        globals_["open"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            std::vector<VMVal> args=a;
+            VMVal kw=VMVal::make_none();
+            if(!args.empty()&&args.back().type==VMType::MAP&&args.back().map&&args.size()>=1){
+                bool all_kw=true;
+                for(auto& kv:*args.back().map) if(kv.first!="mode"&&kv.first!="encoding"&&kv.first!="file"&&kv.first!="path") all_kw=false;
+                if(all_kw&&!args.back().map->empty()){ kw=args.back(); args.pop_back(); }
+            }
+            auto kwget=[&](const char* k)->VMVal{
+                if(kw.type==VMType::MAP&&kw.map&&kw.map->count(k)) return (*kw.map)[k];
+                return VMVal::make_none();
+            };
+            VMVal path=args.size()>0?args[0]:kwget("file");
+            if(path.type==VMType::NONE) path=kwget("path");
+            VMVal mode=args.size()>1?args[1]:kwget("mode");
+            if(mode.type==VMType::NONE) mode=VMVal::make_str("r");
+            std::vector<VMVal> oa={path,mode};
+            VMVal opener=load_var("file_open_or_raise");
+            VMVal h=vm_call(opener,oa,std::nullopt);
+            auto cit=class_reg_.find("NythonFile");
+            if(cit==class_reg_.end()) return h;
+            VMVal cls=VMVal::make_class(cit->second,"NythonFile");
+            std::vector<VMVal> ca={path,mode,h};
+            return vm_call(cls,ca,std::nullopt);
+        });
+    }
+
+    // `import os`: os.getcwd(), os.path.join(), ... over the interpreter's
+    // os_* builtins (include/NyRuntime.hpp module_members), plus the
+    // constants and a snapshot of os.environ - as on the interpreter.
+    void define_os_module(const std::string& as_name) {
+        std::vector<std::string> names;
+        if(bridge_names()) names=bridge_names()();
+        VMVal ns=VMVal::make_map(), path=VMVal::make_map();
+        for(auto& m : nyrt::module_members("os",names)){
+            if(m.first=="environ") continue;   // a map, below (os.environ["HOME"])
+            VMVal fn=load_var(m.second);
+            if(m.first.rfind("path.",0)==0) (*path.map)[m.first.substr(5)]=fn;
+            else (*ns.map)[m.first]=fn;
+        }
+        for(const char* c : {"sep","pathsep","linesep","name"}){
+            VMVal v=globals_.count(std::string("os_")+c)?globals_[std::string("os_")+c]:VMVal::make_none();
+            (*ns.map)[c]=v;
+            if(std::string(c)=="sep"||std::string(c)=="pathsep") (*path.map)[c]=v;
+        }
+        VMVal envf=load_var("os_environ");
+        std::vector<VMVal> none_args;
+        (*ns.map)["environ"]=envf.type==VMType::NATIVE?envf.native(none_args):VMVal::make_map();
+        path.class_name="path";
+        (*ns.map)["path"]=path;
+        ns.class_name=as_name;
+        globals_[as_name]=ns;
+    }
+
+    // `import sys`: a namespace with argv (the script path, then the
+    // arguments after it), platform, executable and version; argv and
+    // platform are also bound bare, as on the interpreter.
+    void define_sys_module(const std::string& as_name) {
+        std::vector<VMVal> av;
+        for(auto& a : nyrt::argv()) av.push_back(VMVal::make_str(a));
+        VMVal argv_list=VMVal::make_list(std::move(av));
+#if defined(_WIN32)
+        std::string plat="win32";
+#elif defined(__APPLE__)
+        std::string plat="darwin";
+#else
+        std::string plat="linux";
+#endif
+        VMVal ns=VMVal::make_map();
+        (*ns.map)["argv"]=argv_list;
+        (*ns.map)["platform"]=VMVal::make_str(plat);
+        (*ns.map)["executable"]=VMVal::make_str(nyrt::executable_path());
+        (*ns.map)["version"]=VMVal::make_str(NYTHON_VERSION);
+        ns.class_name=as_name;
+        globals_[as_name]=ns;
+        globals_["argv"]=argv_list;
+        globals_["platform"]=VMVal::make_str(plat);
+    }
+
+    // Raise a builtin exception of `type` from native code (the builtin
+    // bridge uses it for "__exc__:Type:msg" errors from interpreter
+    // builtins): the same instance and runtime_error an Op::RAISE of
+    // Type(msg) produces, so it takes the VM's normal raise path.
+    [[noreturn]] void raise_native_exception(const std::string& type, const std::string& msg) {
+        auto attrs=std::make_shared<std::unordered_map<std::string,VMVal>>();
+        (*attrs)["msg"]=VMVal::make_str(msg);
+        (*attrs)["args"]=VMVal::make_list(std::vector<VMVal>{VMVal::make_str(msg)});
+        last_exception_obj_=VMVal::make_instance(type.empty()?std::string("Exception"):type, attrs);
+        throw std::runtime_error((type.empty()?std::string("Exception"):type)+": "+msg);
     }
 
     // Compile only
@@ -3418,6 +3545,17 @@ private:
             if(nested.type == VMType::FUNCTION && nested.code)
                 return exec_code(nested.code, args, VMVal::make_none());
         }
+        // A builtin used as a namespace: `import time` then time.time(),
+        // time.sleep(1), time.monotonic() - the builtin time_X, else X.
+        if(obj.type==VMType::NATIVE&&obj.class_name.rfind("__builtin__:",0)==0){
+            std::string target=nyrt::builtin_member(obj.class_name.substr(12),method,
+                [&](const std::string& n){ return bridge_exists()&&bridge_exists()(n); });
+            if(!target.empty()){
+                VMVal fn=load_var(target);
+                if(fn.type==VMType::NATIVE) return fn.native(args);
+            }
+            return VMVal::make_none();
+        }
         // Fallback: check globals
         auto git=globals_.find(method);
         if(git!=globals_.end()&&git->second.type==VMType::NATIVE)
@@ -3520,11 +3658,18 @@ private:
         // the interpreter's container-leak problem that made loading this
         // 220+-class file risky there (see GC_NOTES.md).
         if(name=="nytorch_classes"){ register_nytorch_builtins(); }
-        if(name=="os"||name=="shell"||name=="sh"){ register_os_builtins(); return; }
+        // os/shell/time/io: their functions are the interpreter's, reached
+        // through the builtin bridge - one implementation for both engines.
+        // These imports used to install VM copies that differed (time_ms()
+        // in seconds, sleep(0.5) not sleeping, shell() returning a wait
+        // status); now they are acknowledgements only.
+        if(name=="os"){ define_os_module(alias.empty()?std::string("os"):alias); return; }
+        if(name=="shell"||name=="sh"){ return; }
+        if(name=="sys"){ define_sys_module(alias.empty()?std::string("sys"):alias); return; }
         if(name=="math"){ register_math_builtins(); return; }
-        if(name=="time"){ register_time_builtins(); return; }
+        if(name=="time"){ return; }
         if(name=="json"){ register_json_builtins(); return; }
-        if(name=="io"||name=="fs"||name=="file"){ register_io_builtins(); return; }
+        if(name=="io"||name=="fs"||name=="file"){ return; }
         if(name=="string"){
             globals_["isdigit_str"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
                 return VMVal::make_bool(!a.empty()&&!a[0].s.empty()&&std::all_of(a[0].s.begin(),a[0].s.end(),::isdigit));});
@@ -3649,8 +3794,22 @@ private:
                         own_names.insert(std::static_pointer_cast<nython::node::VarDeclNode>(st)->name);
                 }
             }
+            // __name__ / __file__ are the module's own while its top level
+            // runs, so `if __name__ == "__main__":` does not fire on import.
+            VMVal prev_name=globals_.count("__name__")?globals_["__name__"]:VMVal::make_str("__main__");
+            VMVal prev_file=globals_.count("__file__")?globals_["__file__"]:VMVal::make_str("");
+            {
+                std::string stem=filepath;
+                size_t cut=stem.find_last_of("/\\");
+                if(cut!=std::string::npos) stem=stem.substr(cut+1);
+                if(stem.size()>3&&stem.compare(stem.size()-3,3,".ny")==0) stem=stem.substr(0,stem.size()-3);
+                globals_["__name__"]=VMVal::make_str(stem);
+                globals_["__file__"]=VMVal::make_str(filepath);
+            }
             try{ exec_code(code,{},std::nullopt); } catch(VMReturn&){}
               catch(std::exception& e){ std::cerr<<"[VM import error] "<<filepath<<": "<<e.what()<<"\n"; }
+            globals_["__name__"]=prev_name;
+            globals_["__file__"]=prev_file;
             export_to_globals_=old_exp;
             if(!alias.empty()){
                 auto ns=std::make_shared<std::unordered_map<std::string,VMVal>>();
@@ -4013,9 +4172,8 @@ private:
             (*m)["tpu_available"]=VMVal::make_bool(false);
             (*m)["tpu_count"]=VMVal::make_int(0);
             VMVal r; r.type=VMType::MAP; r.map=m; return r;});
-        globals_["time_now"]=globals_["time_ms"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            return VMVal::make_float((double)std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count()/1000.0);});
+        // time_now/time_ms: os_time.cpp through the bridge. (This copy made
+        // time_ms() return SECONDS after `import nytorch`.)
         globals_["tensor_topk"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             if(a.empty()||a[0].type!=VMType::LIST||!a[0].list)return VMVal::make_list();
             auto& v=vm_arg_list(a,0); int k=(int)v.size();
@@ -4448,74 +4606,13 @@ private:
             return a.empty()?VMVal::make_list():a[0];});
         globals_["class_conditioning"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             return a.empty()?VMVal::make_list():a[0];});
-        register_os_builtins(); register_io_builtins(); register_json_builtins();
+        register_json_builtins();
     }
 
-    void register_os_builtins() {
-        globals_["os_getcwd"]=VMVal::make_native([](std::vector<VMVal>&)->VMVal{char buf[4096];return VMVal::make_str(::getcwd(buf,sizeof(buf))?std::string(buf):".");});
-        globals_["os_listdir"]=globals_["list_dir"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            std::string path=a.empty()?".":a[0].s;std::vector<VMVal> items;
-#ifdef _WIN32
-            WIN32_FIND_DATAA fd;std::string pattern=path+"\\*";
-            HANDLE h=FindFirstFileA(pattern.c_str(),&fd);
-            if(h!=INVALID_HANDLE_VALUE){do{std::string n=fd.cFileName;if(n!="."&&n!="..")items.push_back(VMVal::make_str(n));}while(FindNextFileA(h,&fd));FindClose(h);}
-#else
-            DIR* d=opendir(path.c_str());if(!d)return VMVal::make_list();
-            struct dirent* e;while((e=readdir(d))!=nullptr){std::string n=e->d_name;if(n!="."&&n!="..")items.push_back(VMVal::make_str(n));}closedir(d);
-#endif
-            return VMVal::make_list(std::move(items));});
-        globals_["os_exists"]=globals_["exists"]=globals_["path_exists"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_bool(false);struct stat st;return VMVal::make_bool(::stat(a[0].s.c_str(),&st)==0);});
-        globals_["os_isfile"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_bool(false);struct stat st;return VMVal::make_bool(::stat(a[0].s.c_str(),&st)==0&&S_ISREG(st.st_mode));});
-        globals_["os_isdir"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_bool(false);struct stat st;return VMVal::make_bool(::stat(a[0].s.c_str(),&st)==0&&S_ISDIR(st.st_mode));});
-        globals_["os_getenv"]=globals_["env"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_none();const char* v=::getenv(a[0].s.c_str());return v?VMVal::make_str(v):VMVal::make_str(a.size()>1?a[1].s:"");});
-        globals_["os_path_join"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            std::string r;for(size_t i=0;i<a.size();i++){if(i&&!r.empty()&&r.back()!='/')r+='/';r+=a[i].s;}return VMVal::make_str(r);});
-        globals_["os_path_basename"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_str("");std::string s=a[0].s;auto p=s.rfind('/');return VMVal::make_str(p==std::string::npos?s:s.substr(p+1));});
-        globals_["os_path_dirname"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_str(".");std::string s=a[0].s;auto p=s.rfind('/');return VMVal::make_str(p==std::string::npos?".":s.substr(0,p));});
-        globals_["os_path_ext"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_str("");std::string s=a[0].s;auto p=s.rfind('.');return VMVal::make_str(p==std::string::npos?"":s.substr(p));});
-        globals_["os_mkdir"]=globals_["mkdir"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()) return VMVal::make_bool(false);
-#ifdef _WIN32
-            int r=::_mkdir(a[0].s.c_str()); return VMVal::make_bool(r==0||errno==EEXIST);});
-#else
-            int r=::mkdir(a[0].s.c_str(),0755); return VMVal::make_bool(r==0||errno==EEXIST);});
-#endif
-        globals_["os_remove"]=globals_["remove_file"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()) return VMVal::make_bool(false);
-            return VMVal::make_bool(::remove(a[0].s.c_str())==0);});
-        globals_["os_rename"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2) return VMVal::make_bool(false);
-            return VMVal::make_bool(::rename(a[0].s.c_str(),a[1].s.c_str())==0);});
-        globals_["write"]=globals_["write_text"]=globals_["save_text"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2) return VMVal::make_bool(false);
-            std::ofstream f(a[0].s); if(!f) return VMVal::make_bool(false);
-            f<<a[1].s; return VMVal::make_bool(true);});
-        globals_["append"]=globals_["append_text"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2) return VMVal::make_bool(false);
-            std::ofstream f(a[0].s,std::ios::app); if(!f) return VMVal::make_bool(false);
-            f<<a[1].s; return VMVal::make_bool(true);});
-        globals_["shell"]=globals_["system"]=globals_["cmd"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_int(0);return VMVal::make_int(::system(a[0].s.c_str()));});
-    }
-
-    void register_io_builtins() {
-        globals_["read_file"]=globals_["load_text"]=globals_["read_text"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_str("");std::ifstream f(a[0].s);if(!f)return VMVal::make_str("");
-            std::string s((std::istreambuf_iterator<char>(f)),std::istreambuf_iterator<char>());return VMVal::make_str(s);});
-        globals_["write_file"]=globals_["save_text"]=globals_["write_text"]=globals_["write"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2)return VMVal::make_bool(false);std::ofstream f(a[0].s);if(!f)return VMVal::make_bool(false);f<<a[1].s;return VMVal::make_bool(true);});
-        globals_["append_file"]=globals_["append_text"]=globals_["append"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2)return VMVal::make_bool(false);std::ofstream f(a[0].s,std::ios::app);if(!f)return VMVal::make_bool(false);f<<a[1].s;return VMVal::make_bool(true);});
-        globals_["file_exists"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_bool(false);struct stat st;return VMVal::make_bool(::stat(a[0].s.c_str(),&st)==0);});
-    }
+    // (register_os_builtins / register_io_builtins lived here: VM copies of
+    // os_*, read_file, write_file, shell, ... that disagreed with the
+    // interpreter's. Removed in round 74 - the bridge serves the
+    // interpreter's implementations, see include/builtins/os.hpp.)
 
     void register_math_builtins() {
         // Registered after the guarded copies above, so these shadowed them and
@@ -4525,14 +4622,6 @@ private:
         globals_["log10"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{return VMVal::make_float(std::log10(a.empty()?1.0:to_d(a[0])));});
         globals_["exp"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{return VMVal::make_float(std::exp(a.empty()?0.0:to_d(a[0])));});
         globals_["fabs"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{return VMVal::make_float(std::fabs(a.empty()?0.0:to_d(a[0])));});
-    }
-
-    void register_time_builtins() {
-        globals_["time"]=globals_["time_now"]=VMVal::make_native([](std::vector<VMVal>&)->VMVal{return VMVal::make_float((double)std::time(nullptr));});
-        globals_["sleep"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(!a.empty()){struct timespec ts{(time_t)to_d(a[0]),0};nanosleep(&ts,nullptr);}return VMVal::make_none();});
-        globals_["sleep_ms"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(!a.empty()){long ms=(long)to_d(a[0]);struct timespec ts{ms/1000,(ms%1000)*1000000L};nanosleep(&ts,nullptr);}return VMVal::make_none();});
     }
 
     void register_json_builtins() {
@@ -4986,7 +5075,9 @@ private:
                 // The base argument and 0x/0b/0o prefix auto-detection were
                 // also missing here (always base 10), matched to the
                 // interpreter below.
-                std::string s=v.s;
+                // Surrounding whitespace is allowed, as on the interpreter.
+                size_t b0=v.s.find_first_not_of(" \t\r\n"), b1=v.s.find_last_not_of(" \t\r\n");
+                std::string s=b0==std::string::npos?std::string():v.s.substr(b0,b1-b0+1);
                 int base=10;
                 if(a.size()>=2&&a[1].type==VMType::INT) base=(int)a[1].i;
                 if(s.size()>2&&s[0]=='0'){
@@ -5001,6 +5092,9 @@ private:
                     long long iv=std::stoll(s,&idx,base);
                     if(idx!=s.size()) throw std::invalid_argument("not fully consumed");
                     return VMVal::make_int(iv);
+                }catch(std::out_of_range&){
+                    // VM integers are 64-bit (the interpreter's are unbounded)
+                    throw std::runtime_error("OverflowError: int too large for the VM's 64-bit integers: '"+v.s+"'");
                 }catch(...){
                     throw std::runtime_error("ValueError: invalid literal for int(): '"+v.s+"'");
                 }
@@ -5264,36 +5358,29 @@ private:
             "KeyError","IndexError","AttributeError","RuntimeError","NameError",
             "StopIteration","NotImplementedError","OverflowError","OSError","IOError",
             "FileNotFoundError","PermissionError","TimeoutError","ConnectionError",
-            "ImportError","SyntaxError","AssertionError","ArithmeticError"
+            "ImportError","SyntaxError","AssertionError","ArithmeticError",
+            "IsADirectoryError","NotADirectoryError","FileExistsError","ChildProcessError",
+            "ProcessLookupError","InterruptedError","BlockingIOError","BrokenPipeError",
+            "ConnectionRefusedError","ConnectionResetError","LookupError","EOFError",
+            "ModuleNotFoundError","UnicodeError"
         }) make_exc_class(en);
         globals_["false"]=VMVal::make_bool(false);
         globals_["null"]=VMVal::make_none();
         globals_["PI"]  =VMVal::make_float(3.14159265358979323846);
         globals_["E"]   =VMVal::make_float(2.71828182845904523536);
         globals_["INFINITY"]=VMVal::make_float(std::numeric_limits<double>::infinity());
-        // Time builtins (always available)
-        globals_["time"]=globals_["time_now"]=globals_["clock"]=VMVal::make_native([](std::vector<VMVal>&)->VMVal{
-            // std::time() truncates to whole seconds, so elapsed-time code that
-            // works on the interpreter measured 0 here. Match the interpreter's
-            // sub-second resolution.
-            struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts);
-            return VMVal::make_float((double)ts.tv_sec+(double)ts.tv_nsec/1e9);});
-        globals_["time_ms"]=VMVal::make_native([](std::vector<VMVal>&)->VMVal{
-            struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts);
-            return VMVal::make_float(ts.tv_sec*1000.0+ts.tv_nsec/1e6);});
-        globals_["sleep"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(!a.empty()){struct timespec ts{(time_t)(int)to_d(a[0]),(long)((to_d(a[0])-(int)to_d(a[0]))*1e9)};nanosleep(&ts,nullptr);}
-            return VMVal::make_none();});
-        globals_["sleep_ms"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(!a.empty()){long ms=(long)to_d(a[0]);struct timespec ts{ms/1000,(ms%1000)*1000000L};nanosleep(&ts,nullptr);}
-            return VMVal::make_none();});
-        globals_["uuid"]=globals_["gen_uuid"]=VMVal::make_native([](std::vector<VMVal>&)->VMVal{
-            // Simple UUID v4-like string
-            static std::mt19937 rng(std::random_device{}());
-            std::uniform_int_distribution<int> d(0,15);
-            const char* h="0123456789abcdef"; std::string r="whk_";
-            for(int i=0;i<8;i++) r+=h[d(rng)];
-            return VMVal::make_str(r);});
+        // Time builtins (time, time_now, clock, time_ms, sleep, sleep_ms,
+        // uuid, ...) come from the interpreter through the bridge.
+        // OS constants and the running script.
+#ifdef _WIN32
+        globals_["os_sep"]=VMVal::make_str("\\"); globals_["os_pathsep"]=VMVal::make_str(";");
+        globals_["os_linesep"]=VMVal::make_str("\r\n"); globals_["os_name"]=VMVal::make_str("nt");
+#else
+        globals_["os_sep"]=VMVal::make_str("/"); globals_["os_pathsep"]=VMVal::make_str(":");
+        globals_["os_linesep"]=VMVal::make_str("\n"); globals_["os_name"]=VMVal::make_str("posix");
+#endif
+        globals_["__name__"]=VMVal::make_str("__main__");
+        globals_["__file__"]=VMVal::make_str(nyrt::script_path());
         globals_["println"]=globals_["print"];
 
         // ── Map / collection builtins ─────────────────────────────────────

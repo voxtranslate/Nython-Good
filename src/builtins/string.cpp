@@ -333,24 +333,8 @@ Value dispatch_string(NythonExecutor& E,
             }
             return Value(false);
         }
-        // ── file_exists(path) ────────────────────────────────────────────────────
-        if (name == "path_exists") {
-            if (!args.empty()) {
-                std::ifstream f(getStringValue(args[0]));
-                return Value(f.good());
-            }
-            return Value(false);
-        }
-        // ── file_list(dir) ───────────────────────────────────────────────────────
-        if (name == "list_dir") {
-            std::string dir = args.empty() ? "." : getStringValue(args[0]);
-            auto* lst = new Container((Runnable*)runner, Type::LIST);
-            int idx = 0;
-            for (const auto& entry : ny_fs::listdir(dir))
-                (*lst->container)[std::to_string(idx++)] = makeStringValue(entry);
-            (*lst->container)["__len__"] = Value(idx);
-            return Value((Collectable*)lst);
-        }
+        // path_exists: builtins/os.cpp (stat-based; this opened the file).
+        // list_dir: builtins/os.cpp.
         // ── string_split(s, delim) ───────────────────────────────────────────────
     // ── from main.cpp lines 7039–7561 ──────────────────────────────────────────
         if (name == "string_split") {
@@ -609,28 +593,7 @@ Value dispatch_string(NythonExecutor& E,
             (*result->container)["backend"] = makeStringValue(!gpu_name.empty() ? "cuda" : "cpu");
             return Value((Collectable*)result);
         }
-        // ── time_now() ───────────────────────────────────────────────────────────
-        if (name == "time_now") {
-            auto now = std::chrono::system_clock::now();
-            return Value((double)std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() / 1000.0);
-        }
-        // ── time_ms() ────────────────────────────────────────────────────────────
-        if (name == "time_ms") {
-            return Value((double)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
-        }
-        // ── process_exec(cmd) ────────────────────────────────────────────────────
-        if (name == "process_exec") {
-            if (!args.empty()) {
-                std::string cmd = getStringValue(args[0]) + " 2>&1";
-                FILE* pipe = popen(cmd.c_str(), "r");
-                if (!pipe) return makeStringValue("");
-                std::string result; char buf[4096];
-                while (fgets(buf, sizeof(buf), pipe)) result += buf;
-                pclose(pipe);
-                return makeStringValue(result);
-            }
-            return makeStringValue("");
-        }
+        // time_now/time_ms: builtins/os_time.cpp; process_exec: os_proc.cpp.
         // ── env_get(key) ─────────────────────────────────────────────────────────
         if (name == "env_get") {
             if (!args.empty()) {

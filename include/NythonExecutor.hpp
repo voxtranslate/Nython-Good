@@ -25,6 +25,8 @@
 // Windows: winsock2.h MUST come before windows.h (which some headers pull in)
 #include "Nython.hpp"
 #include "NythonREPL.hpp"
+#include "NyRuntime.hpp"
+#include "NyPrelude.hpp"
 #include <algorithm>
 #include <fstream>
 #include <cwctype>
@@ -336,6 +338,28 @@ struct NythonExecutor {
         class_by_name{}, super_parent_stack{}, class_parent{} {
         global_ctx = new Context(r, "global");
         registerBuiltins();
+        loadPrelude();
+    }
+
+    // Nython source every program starts with (include/NyPrelude.hpp): the
+    // file objects open() returns. The VM runs the same text.
+    void loadPrelude() {
+        try {
+            auto source = SourceCode(std::string(nyrt::prelude_source()));
+            auto reporter = std::make_shared<Reporter>(source);
+            auto lex = std::make_shared<Lexer>(source);
+            lex->tokenize();
+            auto parser = std::make_shared<Parser>(reporter.get(), (Runnable*)runner, lex.get());
+            auto ast = parser->parse();
+            if (ast) {
+                imported_asts.push_back(ast);
+                evalNode(ast, global_ctx);
+            }
+        } catch (std::exception& e) {
+            std::cerr << "[Nython] prelude failed to load: " << e.what() << "\n";
+        } catch (...) {
+            std::cerr << "[Nython] prelude failed to load\n";
+        }
     }
 
     ~NythonExecutor() {
@@ -469,7 +493,29 @@ public:   // NythonExecutor is a struct: members default to public
             // ── HTTP / network ───────────────────────────────────────────────
             "http_get","http_post","http_request","http_get_json","http_post_json",
             // ── Time ─────────────────────────────────────────────────────────
-            "time_ms","time_now","time_sleep","thread_sleep"
+            "time_ms","time_now","time_sleep","thread_sleep",
+            // ── Round 74: OS / filesystem / process / time (builtins/os*.cpp)
+            // Every name here works on both engines (the VM through the
+            // builtin bridge).
+            "os_path_split","os_path_splitext","os_path_normpath","os_path_normalize",
+            "os_path_abspath","os_path_realpath","os_path_relpath","os_path_isabs",
+            "os_path_expanduser","os_path_expandvars","os_path_commonpath",
+            "os_path_exists","os_path_isdir","os_path_isfile","os_path_islink",
+            "os_path_getsize","os_path_getmtime","os_fnmatch","fnmatch","os_glob","glob",
+            "os_islink","os_access","os_stat","os_lstat","os_makedirs","os_rmdir","os_rmtree",
+            "os_walk","os_unlink","os_copy","os_copyfile","os_copytree","os_move","os_chmod",
+            "os_symlink","os_readlink","os_touch","append","os_gettempdir","os_mkstemp",
+            "os_mkdtemp","os_disk_usage","os_chdir","cd","sh",
+            "os_unsetenv","os_environ","os_platform","os_cpu_count","os_hostname",
+            "os_username","os_home","os_uname",
+            "os_system","os_run","subprocess_run","os_spawn","os_proc_read","os_poll",
+            "os_wait","os_kill","os_getpid","os_getppid","shell_quote","os_shell_quote",
+            "which","os_which","sys_argv",
+            "time","clock","time_ns","time_monotonic","monotonic","time_perf_counter",
+            "perf_counter","time_process","process_time","time_strftime","time_localtime",
+            "time_gmtime","time_mktime","time_timegm","time_strptime","time_iso",
+            "time_parse_iso","uuid","gen_uuid","sleep_ms",
+            "file_open_or_raise","file_seek","file_tell","file_flush"
         };
         for (auto& name : builtins) registerBuiltin(name);
         // Exception types
@@ -479,9 +525,30 @@ public:   // NythonExecutor is a struct: members default to public
             "NameError","RuntimeError","IOError","OSError","FileNotFoundError",
             "ZeroDivisionError","OverflowError","MemoryError","RecursionError",
             "StopIteration","GeneratorExit","SystemExit","KeyboardInterrupt",
-            "AssertionError","NotImplementedError","PermissionError","TimeoutError"
+            "AssertionError","NotImplementedError","PermissionError","TimeoutError",
+            "IsADirectoryError","NotADirectoryError","FileExistsError","ChildProcessError",
+            "ProcessLookupError","InterruptedError","BlockingIOError","ConnectionError",
+            "BrokenPipeError","ConnectionRefusedError","ConnectionResetError",
+            "LookupError","ArithmeticError","EOFError","ImportError","ModuleNotFoundError",
+            "UnicodeError"
         };
         for (auto& name : exc_types) registerBuiltin(name);
+        // OS constants (os.sep, os.pathsep, os.linesep, os.name)
+#ifdef _WIN32
+        global_ctx->defineByName("os_sep", makeStringValue("\\"));
+        global_ctx->defineByName("os_pathsep", makeStringValue(";"));
+        global_ctx->defineByName("os_linesep", makeStringValue("\r\n"));
+        global_ctx->defineByName("os_name", makeStringValue("nt"));
+#else
+        global_ctx->defineByName("os_sep", makeStringValue("/"));
+        global_ctx->defineByName("os_pathsep", makeStringValue(":"));
+        global_ctx->defineByName("os_linesep", makeStringValue("\n"));
+        global_ctx->defineByName("os_name", makeStringValue("posix"));
+#endif
+        // The running script: `if __name__ == "__main__":` and __file__.
+        // evalImport switches both while a module's top level runs.
+        global_ctx->defineByName("__name__", makeStringValue("__main__"));
+        global_ctx->defineByName("__file__", makeStringValue(nyrt::script_path()));
         // Math constants
         global_ctx->defineByName("PI", Value(3.14159265358979323846));
         global_ctx->defineByName("E", Value(2.71828182845904523536));
@@ -849,6 +916,47 @@ public:   // NythonExecutor is a struct: members default to public
             }
         }
         return val;
+    }
+
+    // The value a registered builtin name evaluates to.
+    Value builtinValue(const std::string& name) {
+        auto it = builtin_ptrs.find(name);
+        if (it == builtin_ptrs.end()) return NONE_VALUE;
+        Value v;
+        v.type = ValueType::USERDATA;
+        v.value.p = (void*)it->second.get();
+        return v;
+    }
+
+    // `import os`: a namespace over the os_* builtins (os.getcwd,
+    // os.path.join, ...) plus os.sep/pathsep/linesep/name and a snapshot of
+    // os.environ. The flat os_* names stay registered as well.
+    Value makeOsNamespace() {
+        std::vector<std::string> names;
+        for (auto& kv : builtin_ptrs) names.push_back(kv.first);
+        auto* ns = new Object((Runnable*)runner, "os", Type::MAP);
+        auto* path = new Object((Runnable*)runner, "path", Type::MAP);
+        for (auto& m : nyrt::module_members("os", names)) {
+            if (m.first == "environ") continue;   // a map, below (os.environ["HOME"])
+            if (m.first.rfind("path.", 0) == 0) path->set(m.first.substr(5), builtinValue(m.second));
+            else ns->set(m.first, builtinValue(m.second));
+        }
+        for (const char* c : {"sep", "pathsep", "linesep", "name"}) {
+            Value v = global_ctx->getByName(std::string("os_") + c);
+            ns->set(c, v);
+            if (std::string(c) == "sep" || std::string(c) == "pathsep") path->set(c, v);
+        }
+        std::vector<Value> no_args;
+        ns->set("environ", callBuiltin("os_environ", no_args, global_ctx));
+        ns->set("path", Value((Collectable*)path));
+        return Value((Collectable*)ns);
+    }
+
+    Value nyos_list_of(const std::vector<std::string>& items) {
+        auto* o = new Object((Runnable*)runner, "list", Type::LIST);
+        for (size_t i = 0; i < items.size(); i++) o->set(std::to_string(i), makeStringValue(items[i]));
+        o->set("__len__", Value((int)items.size()));
+        return Value((Collectable*)o);
     }
 
     // Floor division of two integers of any size, rounding toward negative
@@ -4421,6 +4529,21 @@ public:
                 auto sit = kw_args.find("start");
                 if (sit != kw_args.end()) args.push_back(sit->second);
             }
+            // Builtins that take named options receive them as one trailing
+            // map - the convention the VM's CALL_KW already uses for natives,
+            // so the same implementation serves both engines (nyos::Args).
+            static const std::unordered_set<std::string> kwmap_builtins = {
+                "os_run", "subprocess_run", "os_spawn", "os_wait", "os_kill",
+                "os_getenv", "getenv", "env", "os_makedirs", "os_rmtree",
+                "os_mkstemp", "os_mkdtemp", "os_path_relpath",
+                "time_format", "time_date", "time_strftime", "time_iso",
+                "file_open", "file_open_or_raise", "os_proc_read", "os_poll"
+            };
+            if (!kw_args.empty() && kwmap_builtins.count(builtin)) {
+                auto* kw = new Object((Runnable*)runner, "map", Type::MAP);
+                for (auto& kv : kw_args) kw->set(kv.first, kv.second);
+                args.push_back(Value((Collectable*)kw));
+            }
             return callBuiltin(builtin, args, ctx);
         }
         // Also check callee token for builtin (for print etc parsed as keywords)
@@ -4807,7 +4930,12 @@ public:
             "NameError","RuntimeError","IOError","OSError","FileNotFoundError",
             "ZeroDivisionError","OverflowError","MemoryError","RecursionError",
             "StopIteration","GeneratorExit","SystemExit","KeyboardInterrupt",
-            "AssertionError","NotImplementedError","PermissionError","TimeoutError"
+            "AssertionError","NotImplementedError","PermissionError","TimeoutError",
+            "IsADirectoryError","NotADirectoryError","FileExistsError","ChildProcessError",
+            "ProcessLookupError","InterruptedError","BlockingIOError","ConnectionError",
+            "BrokenPipeError","ConnectionRefusedError","ConnectionResetError",
+            "LookupError","ArithmeticError","EOFError","ImportError","ModuleNotFoundError",
+            "UnicodeError"
         };
         if (exc_types_.count(name_orig)) {
             // Create exception Value tagged as "__exc__:TypeName:message"
@@ -4941,6 +5069,20 @@ public:
             if (cont && cont->container) {
                 auto it = cont->container->find(an->attr);
                 if (it != cont->container->end()) return it->second;
+            }
+        }
+        // A builtin used as a namespace: `import time` then time.time(),
+        // time.sleep(1), time.monotonic() - the builtin time_X, else X for
+        // `time`. A builtin must never reach the class lookup below: its
+        // pointer is a std::string, and reading it as an AST node crashed
+        // (time.time() was a segmentation fault).
+        if (obj.type == ValueType::USERDATA && obj.value.p) {
+            auto bit = func_names.find(obj.value.p);
+            if (bit != func_names.end() && bit->second.rfind("__builtin__:", 0) == 0) {
+                std::string target = nyrt::builtin_member(bit->second.substr(12), an->attr,
+                    [&](const std::string& n) { return builtin_ptrs.count(n) > 0; });
+                if (!target.empty()) return builtinValue(target);
+                return NONE_VALUE;
             }
         }
         // Class variable / static method lookup: ClassName.var or ClassName.staticmethod
@@ -5865,8 +6007,30 @@ public:
                 return NONE_VALUE;
         }
         if (module_name == "sys") {
-                ctx->defineByName("argv", makeStringValue("nython"));
-                ctx->defineByName("platform", makeStringValue("linux"));
+                // `sys` is a namespace: sys.argv (the script path, then the
+                // arguments after it on the command line), sys.platform,
+                // sys.executable, sys.version. argv and platform are also
+                // bound bare, as they always were - but argv is now the real
+                // list, not the string "nython", and platform is the real OS.
+                std::vector<std::string> av = nyrt::argv();
+                Value argv_list = nyos_list_of(av);
+                std::string plat;
+#if defined(_WIN32)
+                plat = "win32";
+#elif defined(__APPLE__)
+                plat = "darwin";
+#else
+                plat = "linux";
+#endif
+                auto* ns = new Object((Runnable*)runner, in_node->alias.empty() ? "sys" : in_node->alias, Type::MAP);
+                ns->set("argv", argv_list);
+                ns->set("platform", makeStringValue(plat));
+                ns->set("executable", makeStringValue(nyrt::executable_path()));
+                ns->set("version", makeStringValue(NYTHON_VERSION));
+                ctx->defineByName(in_node->alias.empty() ? "sys" : in_node->alias, Value((Collectable*)ns));
+                ctx->defineByName("argv", argv_list);
+                ctx->defineByName("platform", makeStringValue(plat));
+                imported_modules_.erase(module_name);   // `import sys as s` after `import sys`
                 return NONE_VALUE;
         }
         if (module_name == "json") {
@@ -5930,6 +6094,10 @@ public:
                 registerBuiltin("os_path_dirname");
                 registerBuiltin("os_path_ext");
                 registerBuiltin("os_path_abs");
+                if (module_name == "os") {
+                    ctx->defineByName(in_node->alias.empty() ? "os" : in_node->alias, makeOsNamespace());
+                    imported_modules_.erase(module_name);
+                }
                 return NONE_VALUE;
         }
         if (module_name == "regex" || module_name == "re") {
@@ -6212,6 +6380,25 @@ public:
                 // times the module has been imported.
                 std::set<std::string> own;
                 if (aliased) collectTopLevelNames(ast, own);
+
+                // While the module's top level runs, __name__ is the module's
+                // name and __file__ its path, so `if __name__ == "__main__":`
+                // in a module does not run on import.
+                struct NameScope {
+                    Context* c; Value name, file;
+                    NameScope(Context* cx, Value n, Value f, Value nn, Value nf) : c(cx), name(n), file(f) {
+                        c->defineByName("__name__", nn); c->defineByName("__file__", nf);
+                    }
+                    ~NameScope() { c->defineByName("__name__", name); c->defineByName("__file__", file); }
+                };
+                std::string stem = filepath;
+                {
+                    size_t cut = stem.find_last_of("/\\");
+                    if (cut != std::string::npos) stem = stem.substr(cut + 1);
+                    if (stem.size() > 3 && stem.compare(stem.size() - 3, 3, ".ny") == 0) stem = stem.substr(0, stem.size() - 3);
+                }
+                Value prev_name = ctx->getByName("__name__"), prev_file = ctx->getByName("__file__");
+                NameScope name_scope(ctx, prev_name, prev_file, makeStringValue(stem), makeStringValue(filepath));
 
                 evalNode(ast, ctx);
 
