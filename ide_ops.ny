@@ -804,8 +804,10 @@ class IDEOps(IDECore):
             if ents != none:
                 ents = sorted(ents)
                 var up = os_path_dirname(string_slice(dir, 0, len(dir) - 1))
+                if not string_endswith(up, "/"):
+                    up = up + "/"
                 if string_endswith(dir, "/") and len(dir) > 1:
-                    items.append(QuickItem("..", "parent folder", up + "/", "folder"))
+                    items.append(QuickItem("..", "parent folder", up, "folder"))
                 var i = 0
                 while i < len(ents) and len(items) < 400:
                     var nm = ents[i]
@@ -1935,7 +1937,7 @@ class IDEOps(IDECore):
     def _select_tree_path(self, p):
         # Expand every ancestor so the row exists, then select it.
         var dir = os_path_dirname(p)
-        while dir != "" and string_startswith(dir, self.ws.root) and dir != self.ws.root:
+        while dir != "" and dir != "/" and string_startswith(dir, self.ws.root) and dir != self.ws.root:
             self.ws.expanded[dir] = true
             dir = os_path_dirname(dir)
         self.ws.rebuild()

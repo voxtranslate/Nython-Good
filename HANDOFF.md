@@ -3,9 +3,11 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 74. **§0e** is this round: IDE responsiveness (native
-text services, a responsive layout ladder), the Code::Blocks feature set,
-non-throwing control flow on both engines, and the build system. §0d is
+Last updated: round 74. This round is **§0e** (IDE responsiveness: native
+text services and a responsive layout ladder; the Code::Blocks feature set;
+non-throwing control flow on both engines; the build system) and **§0f**
+(the OS layer: files, paths, processes, environment and time, with one
+implementation for both engines). §0d is
 round 73 (the IDE to VS Code's model, verified by driving it). Earlier
 rounds: §0/§0b language-level work, §5.3 terminal command line / undo /
 multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
@@ -184,6 +186,164 @@ Defects found while driving these, all fixed:
 
 e2e scenarios added: `build`, `cbedit`, `cbtools`, `cbdebug`, `responsive`,
 `session`, `columns`, `split`.
+
+---
+
+## 0f. Round 74 — the OS layer (files, paths, processes, environment, time)
+
+An audit of every os/file/path/env/time/process builtin on both engines found
+20 defects (below) and most of Python's os/os.path/shutil/subprocess/glob/
+tempfile/time surface missing. Both were addressed. **One implementation per
+builtin, both engines:** the VM's own copies of the os/io/time natives
+(`register_os_builtins`, `register_io_builtins`, `register_time_builtins`, the
+time block in `register_builtins`, `time_now`/`time_ms` in
+`register_nytorch_builtins`) were deleted; the VM reaches the interpreter's
+implementations through the builtin bridge. `import os/time/io/shell` on the VM
+no longer re-installs anything.
+
+Where things are:
+- `src/builtins/os.cpp` — files, paths, environment, system info (dispatch_os,
+  which forwards to the two below); shared helpers in
+  `include/builtins/os.hpp` (`nyos::Args` for kwargs, list/map builders,
+  `raise_errno`, path functions).
+- `src/builtins/os_time.cpp` — every `time_*` name, `time`, `clock`,
+  `monotonic`, `perf_counter`, `sleep_ms`, `uuid` (math.cpp's and
+  string.cpp's copies were removed; `sleep`/`thread_sleep` stay in
+  threading.cpp).
+- `src/builtins/os_proc.cpp` — `os_run`, `os_spawn`/`os_poll`/`os_wait`/
+  `os_kill`/`os_proc_read`, the legacy shell captures, `which`,
+  `shell_quote`, `sys_argv`.
+- `include/NyRuntime.hpp` — sys.argv / script path / executable, the builtin
+  exception hierarchy table (`builtin_exc_parent`, `exc_matches`), the
+  `"__exc__:Type:msg"` convention (`make_exc`, `parse_exc`), module
+  namespaces (`module_members`, `builtin_member`).
+- `include/NyPrelude.hpp` — Nython source both engines run at startup: the
+  `NythonFile` class and `open()`.
+
+### Contract
+- **Legacy names keep their return-value contract** (the IDE depends on
+  them): `os_remove`/`os_rename`/`os_mkdir`/`file_copy` return bool,
+  `os_listdir` returns `[]` for a missing dir, `read_file` returns `""` for a
+  missing file, `file_open` returns -1, `os_exec`/`shell`/`system`/`cmd`
+  return the command's stdout.
+- **New names raise typed errors like Python**: `os_stat`, `os_lstat`,
+  `os_rmdir`, `os_rmtree`, `os_makedirs`, `os_unlink`, `os_copy`,
+  `os_copytree`, `os_move`, `os_chmod`, `os_symlink`, `os_readlink`,
+  `os_touch`, `os_chdir`, `os_mkstemp`, `os_mkdtemp`, `os_disk_usage`,
+  `os_path_getsize`/`getmtime`, `open()`, `os_run`/`os_spawn` (a program that
+  cannot start), timeouts (`TimeoutError`). Messages read like Python's:
+  `[Errno 2] No such file or directory: '/x'`.
+- Natives raise with `throw std::string("__exc__:Type:msg")`
+  (`nyos::raise`/`raise_errno`). The bridge (`src/main.cpp`
+  install_vm_builtin_bridge) turns that - and any C++ exception - into the
+  VM's normal raise path (`VirtualMachine::raise_native_exception`: an
+  instance of the builtin exception class + `std::runtime_error`), so it is
+  catchable by `except Type` in the same frame on the VM.
+- **Keyword arguments to builtins**: the interpreter now passes them to the
+  names in `kwmap_builtins` (NythonExecutor.hpp, evalCall) as one trailing
+  map - the VM's CALL_KW convention - and `nyos::Args` takes it off. A new
+  builtin with kwargs: add it to `kwmap_builtins` and read it with `Args`.
+
+### The 20 audit defects (all fixed; checked by value in vm_audit46)
+1. VM `time_ms()` returned SECONDS after `import nytorch` (lib/os.ny,
+   stdlib.ny and gui.ny all import it). 2. VM `import time` made `time_now`
+   whole seconds and `sleep(0.5)` a no-op — stdlib's `Timer` measured 0.
+3. `shell`/`system`/`cmd` returned stdout on the interpreter and the raw wait
+   status (768 for exit 3) on the VM. 4. `os_mkdir` recursive on one engine
+   only; `mkdir` of an existing dir true on one, false on the other;
+   `os_mkdir(file)` true. 5. `os_getenv(unset)` none vs ""; VM natives read
+   non-string args as "". 6. `os_path_join("a","/b")` gave `a//b`,
+   `dirname("/x")` gave `""`, `ext("/a.b/c")` gave `.b/c`, `os_path_abs` of a
+   missing path gave `""`, VM basename ignored `\`. 7. `file_size`/`fs_stat`
+   were int32 (3 GB read -1073741824). 8. `file_copy` of a missing source left
+   an empty destination. 9. `time_format` ignored its timestamp and returned
+   garbage past 63 chars. 10. `open()` returned an int, so `with open(p) as f:
+   f.read()` was none. 11. Reading a directory surfaced a raw C++ stream
+   failure (now IsADirectoryError). 12. Interpreter builtins' exceptions were
+   uncatchable on the VM (bridge translation). 13. `process_exec` merged
+   stderr of the last command only; `os_exec` left `\r`, cut at NUL.
+   14. `kv_set` truncated multi-line values. 15. `fs_walk` was not recursive;
+   `file_readline` split lines over 8 KB; `write_bytes` wrapped 300 to 44.
+   16. `import sys` gave `argv = "nython"` and a hard-coded platform; no script
+   arguments at all; `os.getcwd()` read none. 17. `int()`, `//`, `//=`,
+   `**=`, `abs()`, unary minus and `~` truncated to 32 bits on the
+   interpreter (`int(time_ms())` was -2147483648, so every temp file name
+   collided). 18. (VM `with` skipping `__exit__` — handed to the
+   exception-machinery work, not done here.) 19. lib/os.ny: `listdir_full`
+   looped forever, `Process.shell` recursed, `run_check` always true, `pid()`
+   was a shell's pid, `copy` of a missing file "succeeded". 20. Dead or
+   shadowed duplicates (os.cpp's second `ls`/`mkdir`/`path_exists`, math.cpp's
+   `time_*`, data.cpp's `open`) removed.
+
+Also: `time.time()` / `len.x` — any attribute of a builtin — was a
+segmentation fault on the interpreter (evalAttribute read the builtin's
+std::string as an AST node). `import time; time.time()` now works on both
+engines, as do `import os; os.getcwd(); os.path.join(...)`.
+
+### Added (all on both engines)
+Paths: `os_path_split/splitext/normpath/abspath/realpath/relpath/isabs/
+expanduser/expandvars/commonpath/exists/isdir/isfile/islink/getsize/getmtime`,
+`os_glob`/`glob` (`**` recursive), `fnmatch`, `os_sep`/`os_pathsep`/
+`os_linesep`/`os_name` constants. Files: `os_stat`/`os_lstat` (int64 size,
+mtime/atime/ctime, mode, permissions, is_link, uid, gid, nlink, ino),
+`os_walk` (Python's shape), `os_makedirs(exist_ok=)`, `os_rmdir`, `os_rmtree
+(ignore_errors=)`, `os_copy`, `os_copytree`, `os_move` (cross-device),
+`os_unlink`, `os_chmod`, `os_symlink`, `os_readlink`, `os_islink`,
+`os_touch`, `os_access`, `os_mkstemp`, `os_mkdtemp`, `os_gettempdir`,
+`os_disk_usage`, `file_seek`/`file_tell`/`file_flush`, `file_readline(h,
+keep_newline)`. File objects: `open(path, mode="r")`. Processes: `os_run(cmd,
+cwd=, env=, input=, timeout=, check=)` → `{code, stdout, stderr, ok}` (a list
+runs via fork+execvp with no shell); `os_spawn` / `os_poll` / `os_wait
+(timeout=)` / `os_kill(sig=)` / `os_proc_read`; `os_system`, `os_getpid`,
+`os_getppid`, `shell_quote`, `which`. Environment/system: `os_unsetenv`,
+`os_environ`, `os_platform`, `os_cpu_count`, `os_hostname`, `os_username`,
+`os_home`, `os_uname`. Time: `time_ns`, `monotonic`, `perf_counter`,
+`process_time`, `time_format(fmt, ts, utc)` with `%f`, `time_localtime`/
+`time_gmtime`, `time_mktime`/`time_timegm`, `time_strptime`, `time_iso`,
+`time_parse_iso`, `uuid` (a real v4 UUID; the VM's was `whk_` + 8 hex).
+Interpreter-side names the VM already had: `time`, `clock`, `sleep_ms`,
+`append`. `sys.argv` (script path + the arguments after it on the command
+line, both engines, `--vm`/`--profile`/`--trace` too), `sys.platform`,
+`sys.executable`, `__name__` (`"__main__"`, the module name while a module's
+top level runs), `__file__`. New exception types registered on both engines:
+IsADirectoryError, NotADirectoryError, FileExistsError, ChildProcessError,
+ProcessLookupError, InterruptedError, BlockingIOError, BrokenPipeError,
+ConnectionRefusedError, ConnectionResetError, LookupError, EOFError,
+ModuleNotFoundError, UnicodeError.
+
+### Verification at the end of the round
+- `examples/vm_audit46.ny`: 252 passed, 0 failed on both engines (2 pending on
+  the interpreter, 4 on the VM - see below).
+- `python3 tools/sweep.py --base /tmp/obuild/nython_orig`: 178 runs,
+  **0 regressions**, 12 fixed; the only not-ok runs are vm_audit23/25 on the
+  VM, not ok on the baseline too. Against the branch head's own binary: 0
+  regressions.
+- `tools/ide_e2e.py` 227 passed, 0 failed; `tools/ide_lint.py` 0 unresolved.
+  `tools/ide_memprobe.py --check` reports hover at ~6 KB/event, above its
+  2.0 ceiling - and so does the branch head built from the same commit
+  (5.89), so it is not from this round; idle/typing/scroll are unchanged.
+- Cost: the interpreter parses the prelude at startup (+~5 ms per process);
+  `//` on 64-bit operands is now twice as fast as before the round.
+
+### Not done / pending
+- **Exception hierarchy and cross-frame catching** belong to the separate
+  exception-machinery work: `except OSError` does not yet catch a
+  FileNotFoundError on either engine, an unmatched typed `except` still
+  swallows the error, and on the VM an error raised inside a called
+  function is not caught by a typed `except` in the caller. vm_audit46
+  reports these as PENDING (`check_pending`); turn them into `check` once
+  that lands. `NyRuntime.hpp` has the parent table (`builtin_exc_parent`,
+  `exc_matches`) ready for evalTry and `match_except_handler`. Because of
+  the frame issue, the VM installs a native `open()` (after the prelude) so
+  `open(missing)` raises in the caller's frame; the file object is still the
+  prelude's.
+- The IDE's background jobs (`ide_ops.ny`, `sh -c ... & echo $!` + `tail`)
+  were not moved to `os_spawn`/`os_proc_read`; they can be now.
+- Windows: `os_run` goes through the shell (stderr/stdin via temp files, no
+  timeout); `os_spawn`/`os_poll`/`os_wait`/`os_kill` raise OSError; symlinks
+  raise. The _WIN32 branches were written but could not be compiled here.
+- VM integers are 64-bit: `int("1" * 30)` is OverflowError there, a bigint on
+  the interpreter.
 
 ---
 
@@ -1203,6 +1363,7 @@ reproducible finding rather than a guess.
 | `examples/vm_audit43.ny` | `EditorBuffer` final-newline model, undo groups, tab-aware newline, in-place line edits, indentation detect/convert; `LineDiff`; `GitRepo` in a throwaway repository (round 73) |
 | `examples/vm_audit44.ny` | `DebugSession` replay on a known recording and on a real `--trace` recording, including the uncaught exception (round 73) |
 | `examples/vm_audit45.ny` | JSON codec, `print` call form, `list.pop(i)`/`insert`, deep equality, `true == 1`, `file_mtime` (round 73) |
+| `examples/vm_audit46.ny` | the OS layer, 252 value checks: paths, files/dirs, file objects, typed errors, os_run/os_spawn, environment, time, full-width integers, sys.argv/`__name__`, lib/os.ny (round 74) |
 | `tools/ide_e2e.py` | the shipped IDE driven through real input, 20 scenarios + dead-click audits (round 73) |
 | `gui_tests/test_13` | Codicons, Dark+ palette, HiDPI scaling |
 | `gui_tests/test_14` | toolchain — real compile/run/AST/disasm |

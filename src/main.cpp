@@ -587,6 +587,15 @@ Value vm_to_value(const VMVal& v, NythonExecutor& exec) {
             if (v.map) for (auto& kv : *v.map) mp->set(kv.first, vm_to_value(kv.second, exec));
             return Value(static_cast<Collectable*>(mp));
         }
+        case VMType::INSTANCE: {
+            // An instance crosses as a map of its attributes plus
+            // "__class__" - enough for builtins that read fields (the file
+            // functions take a file object's "handle"). It used to be none.
+            auto* mp = new Object((Runnable*)exec.runner, "map", Type::MAP);
+            if (v.map) for (auto& kv : *v.map) mp->set(kv.first, vm_to_value(kv.second, exec));
+            mp->set("__class__", exec.makeStringValue(v.class_name));
+            return Value(static_cast<Collectable*>(mp));
+        }
         default: return NONE_VALUE;
     }
 }
@@ -631,15 +640,41 @@ void install_vm_builtin_bridge(Runnable* runner) {
     if (g_bridge_exec) return;
     g_bridge_exec = std::make_shared<NythonExecutor>(runner);
     NythonExecutor* ex = g_bridge_exec.get();
+    auto* vm = static_cast<nython::vm::VirtualMachine*>(runner);
     nython::vm::VirtualMachine::bridge_exists() = [ex](const std::string& n) {
         return ex->hasBuiltin(n);
     };
+    nython::vm::VirtualMachine::bridge_names() = [ex]() {
+        std::vector<std::string> out;
+        for (auto& kv : ex->builtin_ptrs) out.push_back(kv.first);
+        return out;
+    };
     nython::vm::VirtualMachine::bridge_call() =
-        [ex](const std::string& n, std::vector<VMVal>& a) -> VMVal {
+        [ex, vm](const std::string& n, std::vector<VMVal>& a) -> VMVal {
             std::vector<Value> args;
             args.reserve(a.size());
             for (auto& v : a) args.push_back(vm_to_value(v, *ex));
-            Value r = ex->callBuiltin(n, args, ex->globalContext());
+            Value r;
+            // Interpreter builtins raise Nython exceptions as a tagged
+            // std::string ("__exc__:FileNotFoundError:msg"), which the VM's
+            // exception handling does not see: it unwound past every try and
+            // ended the program. Raise it the way Op::RAISE would instead -
+            // an instance of the builtin exception type.
+            try {
+                r = ex->callBuiltin(n, args, ex->globalContext());
+            } catch (std::string& s) {
+                std::string type, msg;
+                nyrt::parse_exc(s, type, msg);
+                vm->raise_native_exception(type.empty() ? "Exception" : type, msg);
+            } catch (std::runtime_error& e) {
+                // e.g. std::ios_base::failure from a stream
+                vm->raise_native_exception(nyrt::native_exc_type(e), e.what());
+            } catch (std::logic_error& e) {
+                // std::out_of_range, std::invalid_argument, ...
+                vm->raise_native_exception(nyrt::native_exc_type(e), e.what());
+            } catch (std::bad_alloc& e) {
+                vm->raise_native_exception("MemoryError", e.what());
+            }
             return value_to_vm(r, *ex);
         };
 }
@@ -649,6 +684,7 @@ void install_vm_builtin_bridge(Runnable* runner) {
 
 int main(int argc, char** argv, char** env) {
     g_argv0 = (argc > 0 && argv[0]) ? argv[0] : "";
+    nyrt::executable_path() = get_exe_path();
     try {
         setlocale(LC_ALL, "");
         nython::ConsoleManager cm; cm.setupConsole();
@@ -719,6 +755,7 @@ int main(int argc, char** argv, char** env) {
 
             // ── Bytecode VM ──────────────────────────────────────────────
             if (arg1 == "--vm" && argc >= 3) {
+                nyrt::set_command_line(argv[2], argc, argv, 3);
                 try {
                     auto source = SourceCode(std::string(argv[2]));
                     auto reporter = std::make_shared<Reporter>(source);
@@ -759,11 +796,13 @@ int main(int argc, char** argv, char** env) {
 
             // ── Disassemble ──────────────────────────────────────────────
             if (arg1 == "--trace" && argc >= 4) {
+                nyrt::set_command_line(argv[3], argc, argv, 4);
                 g_trace_path = argv[2];
                 return run_file(argv[3]);
             }
 
             if ((arg1 == "--profile" || arg1 == "-p") && argc >= 3) {
+                nyrt::set_command_line(argv[2], argc, argv, 3);
                 NythonExecutor::profiling_enabled() = true;
                 return run_file(argv[2]);
             }
@@ -788,6 +827,9 @@ int main(int argc, char** argv, char** env) {
             }
 
             // ── Run script (tree-walk) ───────────────────────────────────
+            // Everything after the script path is the script's own command
+            // line (sys.argv[1:]).
+            nyrt::set_command_line(arg1, argc, argv, 2);
             return run_file(arg1);
 
         } else {

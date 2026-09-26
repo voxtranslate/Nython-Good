@@ -815,8 +815,13 @@ Value dispatch_core(NythonExecutor& E,
             return args.size() ? args[0] : Value(0);
         }
         if (name == "read_file") {
+            // "" for a missing file (legacy contract); a directory is an
+            // IsADirectoryError rather than the raw C++ stream failure.
             if (args.size() >= 1) {
                 std::string fname = getStringValue(args[0]);
+                struct stat dst;
+                if (stat(fname.c_str(), &dst) == 0 && S_ISDIR(dst.st_mode))
+                    throw std::string("__exc__:IsADirectoryError:[Errno 21] Is a directory: '" + fname + "'");
                 std::ifstream f(fname);
                 if (f.is_open()) {
                     std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
@@ -898,8 +903,9 @@ Value dispatch_core(NythonExecutor& E,
         if (name == "abs") {
             if (args.size() >= 1) {
                 if (args[0].type == ValueType::INTEGER) {
-                    int64_t v = bigint_to_i64(args[0].value.i);
-                    return Value((int)(v < 0 ? -v : v));
+                    // full width: abs(-5000000000) was cast to a 32-bit int
+                    const bigint& v = args[0].value.i;
+                    return Value(v < bigint(0) ? bigint(0) - v : v);
                 }
                 if (args[0].type == ValueType::DOUBLE) return Value(std::abs(args[0].value.d));
             }

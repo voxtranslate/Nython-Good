@@ -270,6 +270,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit43 | 52 | EditorBuffer undo groups/indentation/final newline, LineDiff, GitRepo |
 | vm_audit44 | 46 | record-and-replay debugger, including a real `--trace` recording |
 | vm_audit45 | 45 | JSON codec, print call form, list pop/insert, deep equality, file_mtime |
+| vm_audit46 | 252 | OS layer: paths, files, file objects, typed errors, os_run/os_spawn, env, time, full-width ints, sys.argv |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `for t in examples/test_*.ny examples/vm_audit*.ny; do ./build/nython-cli "$t"; done`
@@ -579,6 +580,29 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   newline never finished (os_exec strips it).
 - **Memory** (IDE, per `ide_memprobe.py`): idle 3.45 → 0 KB/frame, typing
   787 → ~40 KB/key, scrolling 161 → ~7 KB/event, hover 40 → 0.
+
+## Round 74: the OS layer (see `HANDOFF.md` §0f)
+
+- **One implementation per os/io/time builtin, both engines.** The VM's own
+  copies were deleted; it reaches the interpreter's through the bridge.
+  Files: `src/builtins/os.cpp` (files, paths, env), `os_time.cpp`,
+  `os_proc.cpp`; helpers in `include/builtins/os.hpp`; conventions in
+  `include/NyRuntime.hpp`; the startup prelude (file objects, `open()`) in
+  `include/NyPrelude.hpp`.
+- Legacy names keep their return-value contract; the new `os_*` names raise
+  typed errors (FileNotFoundError, IsADirectoryError, FileExistsError, ...)
+  that the bridge turns into VM exceptions.
+- **Builtin kwargs**: names in `kwmap_builtins` (evalCall) get their keyword
+  arguments as one trailing map, as the VM's CALL_KW already did; read them
+  with `nyos::Args`.
+- New: `open()` file objects, `os_run(cmd, cwd=, env=, input=, timeout=)`
+  (argv list = no shell), `os_spawn`/`os_poll`/`os_wait`/`os_kill`, `os_walk`,
+  `os_glob`, `os_rmtree`/`os_copytree`/`os_move`, `os_stat`, `os_mkstemp`,
+  path normpath/relpath/split/splitext/expanduser/..., `time_strftime`/
+  `gmtime`/`strptime`/`time_iso`/`monotonic`/`time_ns`, `sys.argv`,
+  `__name__`, `__file__`, `import os` / `time.time()` namespaces.
+- Interpreter integers: `int()`, `//`, `//=`, `**=`, `abs()`, unary `-`, `~`
+  no longer truncate to 32 bits.
 
 ## Transcripts
 

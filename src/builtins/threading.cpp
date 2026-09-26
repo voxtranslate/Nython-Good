@@ -192,9 +192,14 @@ Value dispatch_threading(NythonExecutor& E,
         // NYTORCH MATH: STATISTICS & LINEAR ALGEBRA
     // ── from main.cpp lines 4939–4988 ──────────────────────────────────────────
         if (name == "sleep") {
+            // sleep(seconds). Microsecond resolution; a non-number or a
+            // negative value does not sleep (a string used to be read as a
+            // garbage integer).
             if (!args.empty()) {
-                double secs = args[0].type == ValueType::DOUBLE ? static_cast<double>(args[0].value.d) : static_cast<double>(bigint_to_i64(args[0].value.i));
-                std::this_thread::sleep_for(std::chrono::milliseconds(static_cast<int>(secs * 1000)));
+                double secs = args[0].type == ValueType::DOUBLE ? static_cast<double>(args[0].value.d)
+                            : args[0].type == ValueType::INTEGER ? static_cast<double>(bigint_to_i64(args[0].value.i))
+                            : 0.0;
+                if (secs > 0) std::this_thread::sleep_for(std::chrono::microseconds(static_cast<long long>(secs * 1e6)));
             }
             return NONE_VALUE;
         }
