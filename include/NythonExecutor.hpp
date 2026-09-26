@@ -4939,6 +4939,30 @@ public:
             if (ast_it != func_ast_nodes.end()) ast_ptr = ast_it->second;
             Node* class_node = (Node*)ast_ptr;
             if (class_node && func_names.find(class_ptr) != func_names.end() && class_node->type() == NodeType::CLASS) {
+              // The class itself, then its bases depth-first, left to right.
+              // Only the instance's own class used to be searched here, so a
+              // method inherited from a base read as `none` when taken as a
+              // value (`cb = self.on_resize` in a subclass) even though
+              // calling it directly worked - the call path walks the chain.
+              std::vector<Node*> mro;
+              {
+                  std::vector<Node*> todo{class_node};
+                  while (!todo.empty() && mro.size() < 64) {
+                      Node* k = todo.front();
+                      todo.erase(todo.begin());
+                      if (!k || k->type() != NodeType::CLASS) continue;
+                      if (std::find(mro.begin(), mro.end(), k) != mro.end()) continue;
+                      mro.push_back(k);
+                      size_t at = 0;
+                      for (auto& b : static_cast<ClassNode*>(k)->bases) {
+                          auto bit = class_by_name.find(b->value());
+                          if (bit != class_by_name.end())
+                              todo.insert(todo.begin() + (long)(at++), (Node*)bit->second);
+                      }
+                  }
+              }
+              for (Node* mro_node : mro) {
+                class_node = mro_node;
                 auto* cn = static_cast<ClassNode*>(class_node);
                 // Check class body context (handles @staticmethod, @property, class vars)
                 auto ctx_it = class_ctx_map_.find((void*)class_node);
@@ -4989,6 +5013,7 @@ public:
                         }
                     }
                 }
+              }
             }
         }
         return NONE_VALUE;
