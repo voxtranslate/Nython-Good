@@ -143,11 +143,9 @@ Value dispatch_math(NythonExecutor& E,
             return Value(static_cast<double>(ns / 1e9));
         }
         if (name == "time_sleep") {
-            if (args.size() >= 1) {
-                double secs = (args[0].type == ValueType::DOUBLE) ? static_cast<double>(args[0].value.d) : (double)bigint_to_i64(args[0].value.i);
-                std::this_thread::sleep_for(std::chrono::milliseconds((int)(secs * 1000)));
-            }
-            return NONE_VALUE;
+            // The concurrency runtime's sleep: releases the GIL, is cancellable
+            // and lets other async tasks run (src/NyConc.cpp).
+            return callBuiltin("sleep", args, ctx);
         }
         if (name == "time_format" || name == "time_date") {
             std::time_t t = std::time(nullptr);

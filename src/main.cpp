@@ -137,6 +137,9 @@ int run_file(const std::string& filename, bool show_ast = false) {
 
 
         NythonExecutor exec((Runnable*)vm_ptr.get());
+        // Wait for non-daemon threads before the executor is torn down, also
+        // when the main program ends with an uncaught exception (round 74).
+        struct JoinThreadsAtExit { ~JoinThreadsAtExit() { nyconc::join_nondaemon_at_exit(); } } join_threads_at_exit;
         if (!g_trace_path.empty()) {
             auto& T = NythonExecutor::tracer();
             T.f = fopen(g_trace_path.c_str(), "w");
@@ -724,6 +727,8 @@ int main(int argc, char** argv, char** env) {
                     auto reporter = std::make_shared<Reporter>(source);
                     auto lexer2 = std::make_shared<Lexer>(source);
                     auto vm2 = std::make_shared<nython::vm::VirtualMachine>(reporter.get());
+                    // Non-daemon threads finish before the VM goes away (round 74).
+                    struct JoinThreadsAtExit { ~JoinThreadsAtExit() { nyconc::join_nondaemon_at_exit(); } } join_threads_at_exit;
                     // Imports must resolve relative to the script, not the
                     // working directory — and must do so on BOTH engines. The
                     // interpreter already did; without this the same file's

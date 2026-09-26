@@ -38,6 +38,19 @@
 #include "NythonExecutor.hpp"
 #include "builtins/os.hpp"
 
+#include "NyConc.hpp"
+// Run a shell command and collect its output with the GIL released, so other
+// Nython threads keep running while the child process works (round 74).
+static bool ny_run_pipe(const std::string& cmd, std::string& out) {
+    nyconc::GilRelease unlocked;
+    FILE* pipe = ::popen(cmd.c_str(), "r");
+    if (!pipe) return false;
+    char buffer[4096];
+    while (fgets(buffer, sizeof(buffer), pipe)) out += buffer;
+    ::pclose(pipe);
+    return true;
+}
+
 // ── Namespace imports (match main.cpp) ────────────────────────────────────────
 using namespace std;
 using namespace nython;
@@ -258,11 +271,7 @@ Value dispatch_os(NythonExecutor& E,
             if (!args.empty()) {
                 std::string cmd = getStringValue(args[0]);
                 std::string result;
-                FILE* pipe = ::popen(cmd.c_str(), "r");
-                if (pipe) {
-                    char buffer[256];
-                    while (fgets(buffer, sizeof(buffer), pipe)) result += buffer;
-                    ::pclose(pipe);
+                if (ny_run_pipe(cmd, result)) {
                     while (!result.empty() && result.back() == '\n') result.pop_back();
                 }
                 return makeStringValue(result);
@@ -317,12 +326,8 @@ Value dispatch_os(NythonExecutor& E,
         if (name == "shell" || name == "system" || name == "cmd") {
             if (!args.empty()) {
                 std::string command = getStringValue(args[0]);
-                FILE* pipe = popen(command.c_str(), "r");
-                if (pipe) {
-                    std::string result;
-                    char buffer[4096];
-                    while (fgets(buffer, sizeof(buffer), pipe)) result += buffer;
-                    pclose(pipe);
+                std::string result;
+                if (ny_run_pipe(command, result)) {
                     // Remove trailing newline
                     while (!result.empty() && (result.back() == '\n' || result.back() == '\r'))
                         result.pop_back();
@@ -452,12 +457,8 @@ Value dispatch_os(NythonExecutor& E,
         if (name == "os_exec") {
             if (args.size() >= 1) {
                 std::string cmd = getStringValue(args[0]);
-                FILE* fp = popen(cmd.c_str(), "r");
-                if (fp) {
-                    std::string result;
-                    char buf[4096];
-                    while (fgets(buf, sizeof(buf), fp)) result += buf;
-                    pclose(fp);
+                std::string result;
+                if (ny_run_pipe(cmd, result)) {
                     while (!result.empty() && result.back() == '\n') result.pop_back();
                     return makeStringValue(result);
                 }
