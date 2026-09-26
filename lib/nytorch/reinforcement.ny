@@ -5,59 +5,185 @@
 # Classes 202–230
 # ═══════════════════════════════════════════════════════════════════════════
 
-# ── 202: SACAgent (Soft Actor-Critic) ──────────────────────────────────────
+import "lib/nytorch/core.ny"
+
+# ── shared helpers for the agents below ─────────────────────────────────────
+def _rl_vec(x, dim, what):
+    var t = _t_wrap(x)
+    if t.numel() != dim:
+        raise ValueError(what + " must have " + str(dim) + " values, got " + str(t.numel()))
+    return t.reshape([dim])
+
+def _rl_batch(rows, dim, what):
+    var flat = []
+    var i = 0
+    while i < len(rows):
+        var r = _t_flat(_t_wrap(rows[i]).data)
+        if len(r) != dim:
+            raise ValueError(what + " must have " + str(dim) + " values, got " + str(len(r)))
+        var j = 0
+        while j < dim:
+            flat.append(r[j])
+            j = j + 1
+        i = i + 1
+    return Tensor(flat, false, [len(rows), dim])
+
+def _rl_mlp(sizes, out_act):
+    var mods = []
+    var i = 0
+    while i < len(sizes) - 1:
+        mods.append(Linear(sizes[i], sizes[i + 1]))
+        if i < len(sizes) - 2:
+            mods.append(ReLU())
+        i = i + 1
+    if out_act == "tanh":
+        mods.append(Tanh())
+    return Sequential(mods)
+
+# sample an index from a probability vector (the seeded generator)
+def _rl_sample(probs):
+    var u = nt_rand(1)[0]
+    var c = 0.0
+    var i = 0
+    while i < len(probs):
+        c = c + probs[i]
+        if u <= c:
+            return i
+        i = i + 1
+    return len(probs) - 1
+
+# target <- tau * source + (1 - tau) * target, in place
+def _rl_soft_update(target, source, tau):
+    var tp = target.parameters()
+    var sp = source.parameters()
+    var i = 0
+    while i < len(tp):
+        nt_scale_(tp[i].data, 1.0 - tau)
+        nt_axpy(tp[i].data, tau, sp[i].data)
+        i = i + 1
+
+def _rl_copy(target, source):
+    target.load_state_dict(source.state_dict())
+
+def _rl_pick(q, actions, n_actions):
+    # q (B, n_actions), actions: list of ints -> (B,) Q(s, a)
+    return (q * _fn_one_hot(actions, n_actions)).sum(1)
+
+def _rl_indices(n, k):
+    return nt_randint(0, n, k)
+
+
+# ── 202: SACAgent (Soft Actor-Critic, discrete actions) ────────────────────
+# Christodoulou 2019: a categorical policy, twin Q networks with Polyak-
+# averaged targets, and the entropy-regularised soft Bellman target
+#   y = r + gamma (1 - done) sum_a' pi(a'|s') [min Q'(s', a') - alpha log pi(a'|s')]
 class SACAgent:
-    def __init__(self, state_dim, action_dim, lr, alpha):
+    def __init__(self, state_dim, action_dim, lr, alpha, hidden=64, gamma=0.99, tau=0.005, batch_size=32):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.lr = lr
-        self.alpha = alpha   # entropy temperature
-        self.actor_w = tensor_randn([state_dim * action_dim])
-        self.critic_w1 = tensor_randn([state_dim * action_dim])
-        self.critic_w2 = tensor_randn([state_dim * action_dim])
-        self.log_alpha = 0.0
-        self.target_entropy = 0.0 - action_dim
+        self.alpha = alpha
+        self.gamma = gamma
+        self.tau = tau
+        self.batch_size = batch_size
+        self.actor = _rl_mlp([state_dim, hidden, action_dim], "none")
+        self.q1 = _rl_mlp([state_dim, hidden, action_dim], "none")
+        self.q2 = _rl_mlp([state_dim, hidden, action_dim], "none")
+        self.q1_target = _rl_mlp([state_dim, hidden, action_dim], "none")
+        self.q2_target = _rl_mlp([state_dim, hidden, action_dim], "none")
+        _rl_copy(self.q1_target, self.q1)
+        _rl_copy(self.q2_target, self.q2)
+        self.actor_opt = Adam(self.actor.parameters(), lr)
+        self.critic_opt = Adam(self.q1.parameters() + self.q2.parameters(), lr)
         self.replay = []
         self.step_count = 0
         self.name = "SAC"
 
     def act(self, state):
-        var logits = tensor_zeros([self.action_dim])
-        var noise = tensor_randn([self.action_dim])
-        var idx = self.step_count % self.action_dim
-        return idx
+        var out = 0
+        with no_grad():
+            var p = self.actor.forward(_rl_vec(state, self.state_dim, "state")).softmax(0)
+            out = _rl_sample(p.data)
+        return out
 
     def store(self, state, action, reward, next_state, done):
-        self.replay = self.replay + [[state, action, reward, next_state, done]]
+        self.replay.append([state, action, reward, next_state, done])
         if len(self.replay) > 10000:
             self.replay = self.replay[1:]
 
     def update(self):
-        if len(self.replay) < 32:
+        if len(self.replay) < self.batch_size:
             return 0.0
         self.step_count = self.step_count + 1
-        var critic_loss = 0.0
-        var actor_loss = 0.0
-        for i in range(0, min(32, len(self.replay))):
-            var transition = self.replay[i]
-            var reward = transition[2]
-            var critic_loss = critic_loss + (reward - 0.5) * (reward - 0.5)
-            var actor_loss = actor_loss + self.alpha * 0.1
-        return (critic_loss + actor_loss) / 32.0
+        var idx = _rl_indices(len(self.replay), self.batch_size)
+        var s = []
+        var a = []
+        var r = []
+        var s2 = []
+        var nd = []
+        var i = 0
+        while i < len(idx):
+            var t = self.replay[idx[i]]
+            s.append(t[0])
+            a.append(t[1])
+            r.append(1.0 * t[2])
+            s2.append(t[3])
+            if t[4]:
+                nd.append(0.0)
+            else:
+                nd.append(1.0)
+            i = i + 1
+        var S = _rl_batch(s, self.state_dim, "state")
+        var S2 = _rl_batch(s2, self.state_dim, "next_state")
+        var y = none
+        with no_grad():
+            var lp2 = self.actor.forward(S2).log_softmax(1)
+            var p2 = lp2.exp()
+            var qmin = self.q1_target.forward(S2).minimum(self.q2_target.forward(S2))
+            var v2 = (p2 * (qmin - lp2 * self.alpha)).sum(1)
+            y = Tensor(r) + v2 * Tensor(nd) * self.gamma
+        var q1 = _rl_pick(self.q1.forward(S), a, self.action_dim)
+        var q2 = _rl_pick(self.q2.forward(S), a, self.action_dim)
+        var critic_loss = _fn_mse(q1, y, "mean") + _fn_mse(q2, y, "mean")
+        self.critic_opt.zero_grad()
+        critic_loss.backward()
+        self.critic_opt.step()
+        var lp = self.actor.forward(S).log_softmax(1)
+        var qmin_s = self.q1.forward(S).minimum(self.q2.forward(S)).detach()
+        var actor_loss = (lp.exp() * (lp * self.alpha - qmin_s)).sum(1).mean()
+        self.actor_opt.zero_grad()
+        actor_loss.backward()
+        self.actor_opt.step()
+        _rl_soft_update(self.q1_target, self.q1, self.tau)
+        _rl_soft_update(self.q2_target, self.q2, self.tau)
+        return critic_loss.item() + actor_loss.item()
 
     def get_stats(self):
         return {"steps": self.step_count, "buffer": len(self.replay), "alpha": self.alpha, "name": self.name}
 
 
-# ── 203: TD3Agent (Twin Delayed DDPG) ─────────────────────────────────────
+# ── 203: TD3Agent (Twin Delayed DDPG, continuous actions in [-1, 1]) ───────
+# Fujimoto 2018: clipped double-Q targets, target-policy smoothing noise,
+# and a delayed actor update every `policy_delay` critic updates.
 class TD3Agent:
-    def __init__(self, state_dim, action_dim, lr):
+    def __init__(self, state_dim, action_dim, lr, hidden=64, gamma=0.99, tau=0.005, batch_size=16):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.lr = lr
-        self.actor_w = tensor_randn([state_dim])
-        self.critic1_w = tensor_randn([state_dim])
-        self.critic2_w = tensor_randn([state_dim])
+        self.gamma = gamma
+        self.tau = tau
+        self.batch_size = batch_size
+        self.actor = _rl_mlp([state_dim, hidden, action_dim], "tanh")
+        self.actor_target = _rl_mlp([state_dim, hidden, action_dim], "tanh")
+        self.q1 = _rl_mlp([state_dim + action_dim, hidden, 1], "none")
+        self.q2 = _rl_mlp([state_dim + action_dim, hidden, 1], "none")
+        self.q1_target = _rl_mlp([state_dim + action_dim, hidden, 1], "none")
+        self.q2_target = _rl_mlp([state_dim + action_dim, hidden, 1], "none")
+        _rl_copy(self.actor_target, self.actor)
+        _rl_copy(self.q1_target, self.q1)
+        _rl_copy(self.q2_target, self.q2)
+        self.actor_opt = Adam(self.actor.parameters(), lr)
+        self.critic_opt = Adam(self.q1.parameters() + self.q2.parameters(), lr)
         self.policy_delay = 2
         self.noise_clip = 0.5
         self.policy_noise = 0.2
@@ -66,131 +192,230 @@ class TD3Agent:
         self.name = "TD3"
 
     def act(self, state, noise_scale):
-        var action = tensor_randn([self.action_dim])
-        var noise = tensor_randn([self.action_dim])
-        return tensor_add(action, tensor_mul(noise, tensor_zeros([self.action_dim])))
+        var out = none
+        with no_grad():
+            var a = self.actor.forward(_rl_vec(state, self.state_dim, "state"))
+            if noise_scale > 0:
+                a = a + Tensor(nt_normal(self.action_dim, 0.0, noise_scale))
+            out = a.clamp(-1.0, 1.0).data
+        return out
 
     def store(self, state, action, reward, next_state, done):
-        self.replay = self.replay + [[reward, done]]
+        self.replay.append([state, action, reward, next_state, done])
+        if len(self.replay) > 100000:
+            self.replay = self.replay[1:]
 
     def update(self):
-        if len(self.replay) < 16:
-            return {"critic": 0.0, "actor": 0.0}
+        if len(self.replay) < self.batch_size:
+            return {"critic": 0.0, "actor": 0.0, "updates": self.update_count}
         self.update_count = self.update_count + 1
-        var c_loss = tensor_mean(tensor_randn([8]))
+        var idx = _rl_indices(len(self.replay), self.batch_size)
+        var s = []
+        var a = []
+        var r = []
+        var s2 = []
+        var nd = []
+        var i = 0
+        while i < len(idx):
+            var t = self.replay[idx[i]]
+            s.append(t[0])
+            a.append(t[1])
+            r.append(1.0 * t[2])
+            s2.append(t[3])
+            if t[4]:
+                nd.append(0.0)
+            else:
+                nd.append(1.0)
+            i = i + 1
+        var S = _rl_batch(s, self.state_dim, "state")
+        var A = _rl_batch(a, self.action_dim, "action")
+        var S2 = _rl_batch(s2, self.state_dim, "next_state")
+        var y = none
+        with no_grad():
+            var n = self.batch_size * self.action_dim
+            var noise = Tensor(nt_normal(n, 0.0, self.policy_noise), false, [self.batch_size, self.action_dim]).clamp(0.0 - self.noise_clip, self.noise_clip)
+            var a2 = (self.actor_target.forward(S2) + noise).clamp(-1.0, 1.0)
+            var sa2 = torch.cat([S2, a2], 1)
+            var qt = self.q1_target.forward(sa2).minimum(self.q2_target.forward(sa2)).reshape([self.batch_size])
+            y = Tensor(r) + qt * Tensor(nd) * self.gamma
+        var sa = torch.cat([S, A], 1)
+        var c1 = self.q1.forward(sa).reshape([self.batch_size])
+        var c2 = self.q2.forward(sa).reshape([self.batch_size])
+        var critic_loss = _fn_mse(c1, y, "mean") + _fn_mse(c2, y, "mean")
+        self.critic_opt.zero_grad()
+        critic_loss.backward()
+        self.critic_opt.step()
         var a_loss = 0.0
         if self.update_count % self.policy_delay == 0:
-            var a_loss = 0.01 * self.update_count
-        return {"critic": c_loss, "actor": a_loss, "updates": self.update_count}
+            var actor_loss = self.q1.forward(torch.cat([S, self.actor.forward(S)], 1)).mean().neg()
+            self.actor_opt.zero_grad()
+            actor_loss.backward()
+            self.actor_opt.step()
+            a_loss = actor_loss.item()
+            _rl_soft_update(self.actor_target, self.actor, self.tau)
+            _rl_soft_update(self.q1_target, self.q1, self.tau)
+            _rl_soft_update(self.q2_target, self.q2, self.tau)
+        return {"critic": critic_loss.item(), "actor": a_loss, "updates": self.update_count}
 
     def get_name(self):
         return self.name
 
 
-# ── 204: A2CAgent (Advantage Actor-Critic) ────────────────────────────────
+# ── 204: A2CAgent (Advantage Actor-Critic) ─────────────────────────────────
+# One network with a policy head and a value head; the update minimises
+#   -log pi(a|s) A  +  0.5 (R - V(s))^2  -  entropy_coef H(pi(.|s)),  A = R - V(s)
 class A2CAgent:
-    def __init__(self, state_dim, action_dim, lr, gamma, entropy_coef):
+    def __init__(self, state_dim, action_dim, lr, gamma, entropy_coef, hidden=64):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.lr = lr
         self.gamma = gamma
         self.entropy_coef = entropy_coef
-        self.actor_w = tensor_randn([state_dim * action_dim])
-        self.critic_w = tensor_randn([state_dim])
+        self.body = _rl_mlp([state_dim, hidden], "none")
+        self.policy_head = Linear(hidden, action_dim)
+        self.value_head = Linear(hidden, 1)
+        self.opt = Adam(self.body.parameters() + self.policy_head.parameters() + self.value_head.parameters(), lr)
         self.trajectory = []
         self.total_steps = 0
         self.name = "A2C"
 
+    def _heads(self, S):
+        var h = self.body.forward(S).relu()
+        return [self.policy_head.forward(h), self.value_head.forward(h)]
+
+    # returns [action, log_prob, value] (pass log_prob/value to store_step)
     def act(self, state):
-        var logits = tensor_randn([self.action_dim])
-        var probs = softmax(logits)
-        return tensor_argmax(probs)
+        var out = none
+        with no_grad():
+            var hv = self._heads(_rl_vec(state, self.state_dim, "state").unsqueeze(0))
+            var lp = hv[0].log_softmax(1).reshape([self.action_dim])
+            var a = _rl_sample(lp.exp().data)
+            out = [a, lp.data[a], hv[1].item()]
+        return out
 
     def store_step(self, state, action, reward, value, log_prob):
-        self.trajectory = self.trajectory + [[reward, value, log_prob]]
+        self.trajectory.append([state, action, reward, value, log_prob])
 
     def compute_returns(self):
         var returns = []
         var g = 0.0
-        var n = len(self.trajectory)
-        var i = n - 1
+        var i = len(self.trajectory) - 1
         while i >= 0:
-            var step = self.trajectory[i]
-            var g = step[0] + self.gamma * g
+            g = self.trajectory[i][2] + self.gamma * g
             returns = [g] + returns
-            var i = i - 1
+            i = i - 1
         return returns
 
     def update(self):
         if len(self.trajectory) == 0:
             return 0.0
-        var returns = self.compute_returns()
-        var policy_loss = 0.0
-        var value_loss = 0.0
-        for i in range(0, len(self.trajectory)):
-            var step = self.trajectory[i]
-            var ret = returns[i]
-            var advantage = ret - step[1]
-            var policy_loss = policy_loss - step[2] * advantage
-            var value_loss = value_loss + advantage * advantage
+        var R = Tensor(self.compute_returns())
+        var s = []
+        var a = []
+        var i = 0
+        while i < len(self.trajectory):
+            s.append(self.trajectory[i][0])
+            a.append(self.trajectory[i][1])
+            i = i + 1
+        var hv = self._heads(_rl_batch(s, self.state_dim, "state"))
+        var lp = hv[0].log_softmax(1)
+        var v = hv[1].reshape([len(a)])
+        var adv = (R - v).detach()
+        var policy_loss = (_rl_pick(lp, a, self.action_dim) * adv).mean().neg()
+        var value_loss = _fn_mse(v, R, "mean") * 0.5
+        var entropy = (lp.exp() * lp).sum(1).mean().neg()
+        var loss = policy_loss + value_loss - entropy * self.entropy_coef
+        self.opt.zero_grad()
+        loss.backward()
+        self.opt.step()
         self.total_steps = self.total_steps + len(self.trajectory)
         self.trajectory = []
-        return (policy_loss + 0.5 * value_loss + self.entropy_coef) / 10.0
+        return loss.item()
 
     def get_stats(self):
         return {"steps": self.total_steps, "gamma": self.gamma, "name": self.name}
 
 
-# ── 205: PPOAgent (Proximal Policy Optimization) ──────────────────────────
+# ── 205: PPOAgent (Proximal Policy Optimization, clipped objective) ────────
 class PPOAgent:
-    def __init__(self, state_dim, action_dim, lr, clip_eps, n_epochs):
+    def __init__(self, state_dim, action_dim, lr, clip_eps, n_epochs, hidden=64, gamma=0.99):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.lr = lr
-        self.clip_eps = clip_eps   # epsilon for PPO clipping
+        self.clip_eps = clip_eps
         self.n_epochs = n_epochs
-        self.actor_w = tensor_randn([state_dim * action_dim])
-        self.critic_w = tensor_randn([state_dim])
+        self.gamma = gamma
+        self.policy = _rl_mlp([state_dim, hidden, action_dim], "none")
+        self.value = _rl_mlp([state_dim, hidden, 1], "none")
+        self.opt = Adam(self.policy.parameters() + self.value.parameters(), lr)
         self.buffer = []
         self.episode_rewards = []
         self.total_updates = 0
         self.name = "PPO"
 
+    # [action, log_prob] sampled from the current policy
     def act(self, state):
-        var logits = tensor_randn([self.action_dim])
-        var probs = softmax(logits)
-        var action = tensor_argmax(probs)
-        var log_prob = 0.0 - 1.0
-        return [action, log_prob]
+        var out = none
+        with no_grad():
+            var lp = self.policy.forward(_rl_vec(state, self.state_dim, "state")).log_softmax(0)
+            var a = _rl_sample(lp.exp().data)
+            out = [a, lp.data[a]]
+        return out
 
     def store(self, state, action, reward, log_prob_old, value, done):
-        self.buffer = self.buffer + [[reward, log_prob_old, value, done]]
+        self.buffer.append([state, action, reward, log_prob_old, value, done])
 
     def update(self):
         if len(self.buffer) < 8:
-            return {"loss": 0.0, "clip_frac": 0.0}
-        var total_loss = 0.0
-        var clip_count = 0
-        for epoch in range(0, self.n_epochs):
-            for i in range(0, len(self.buffer)):
-                var step = self.buffer[i]
-                var reward = step[0]
-                var log_prob_old = step[1]
-                var value = step[2]
-                var log_prob_new = 0.0 - 0.9
-                var ratio = exp(log_prob_new - log_prob_old)
-                var advantage = reward - value
-                var surr1 = ratio * advantage
-                var lo = 1.0 - self.clip_eps
-                var hi = 1.0 + self.clip_eps
-                var clipped = min(max(ratio, lo), hi) * advantage
-                if abs(ratio - 1.0) > self.clip_eps:
-                    var clip_count = clip_count + 1
-                var total_loss = total_loss + (0.0 - min(surr1, clipped))
+            return {"loss": 0.0, "clip_frac": 0.0, "updates": self.total_updates}
+        var n = len(self.buffer)
+        var returns = []
+        var g = 0.0
+        var i = n - 1
+        while i >= 0:
+            if self.buffer[i][5]:
+                g = 0.0
+            g = self.buffer[i][2] + self.gamma * g
+            returns = [g] + returns
+            i = i - 1
+        var s = []
+        var a = []
+        var old = []
+        i = 0
+        while i < n:
+            s.append(self.buffer[i][0])
+            a.append(self.buffer[i][1])
+            old.append(self.buffer[i][3])
+            i = i + 1
+        var S = _rl_batch(s, self.state_dim, "state")
+        var R = Tensor(returns)
+        var old_lp = Tensor(old)
+        var total = 0.0
+        var clipped = 0
+        var e = 0
+        while e < self.n_epochs:
+            var lp = _rl_pick(self.policy.forward(S).log_softmax(1), a, self.action_dim)
+            var v = self.value.forward(S).reshape([n])
+            var adv = (R - v).detach()
+            var ratio = (lp - old_lp).exp()
+            var surr1 = ratio * adv
+            var surr2 = ratio.clamp(1.0 - self.clip_eps, 1.0 + self.clip_eps) * adv
+            var loss = surr1.minimum(surr2).mean().neg() + _fn_mse(v, R, "mean") * 0.5
+            self.opt.zero_grad()
+            loss.backward()
+            self.opt.step()
+            total = total + loss.item()
+            var rd = ratio.data
+            var k = 0
+            while k < n:
+                if rd[k] < 1.0 - self.clip_eps or rd[k] > 1.0 + self.clip_eps:
+                    clipped = clipped + 1
+                k = k + 1
+            e = e + 1
         self.total_updates = self.total_updates + 1
         self.buffer = []
-        var n = self.n_epochs * 8
-        return {"loss": total_loss / n, "clip_frac": clip_count / n, "updates": self.total_updates}
+        var m = self.n_epochs * n
+        return {"loss": total / self.n_epochs, "clip_frac": (1.0 * clipped) / m, "updates": self.total_updates}
 
     def get_name(self):
         return self.name
@@ -246,44 +471,46 @@ class TransformerTokenizer:
         return self.next_id
 
 
-# ── 207: TransformerEmbedding ──────────────────────────────────────────────
-class TransformerEmbedding:
+# ── 207: TransformerEmbedding (token + learned position embeddings) ────────
+class TransformerEmbedding(Module):
     def __init__(self, vocab_size, embed_dim, max_len):
+        super().__init__()
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
         self.max_len = max_len
-        self.token_embed = tensor_randn([vocab_size * embed_dim])
-        self.pos_embed = tensor_randn([max_len * embed_dim])
-        self.dropout_rate = 0.1
+        self.token_embed = Embedding(vocab_size, embed_dim)
+        self.pos_embed = Embedding(max_len, embed_dim)
         self.name = "TransformerEmbedding"
 
     def embed_token(self, token_id):
-        var start = (token_id % self.vocab_size) * self.embed_dim
-        var end = start + self.embed_dim
-        if end > len(self.token_embed):
-            return tensor_zeros([self.embed_dim])
-        return self.token_embed[start:end]
+        if token_id < 0 or token_id >= self.vocab_size:
+            raise IndexError("token id " + str(token_id) + " out of range for vocab " + str(self.vocab_size))
+        return self.token_embed.forward(token_id)
 
     def embed_position(self, pos):
-        var start = (pos % self.max_len) * self.embed_dim
-        var end = start + self.embed_dim
-        if end > len(self.pos_embed):
-            return tensor_zeros([self.embed_dim])
-        return self.pos_embed[start:end]
+        if pos < 0 or pos >= self.max_len:
+            raise IndexError("position " + str(pos) + " out of range for max_len " + str(self.max_len))
+        return self.pos_embed.forward(pos)
 
+    # token ids (L,) -> (L, embed_dim)
     def forward(self, token_ids):
-        var result = []
-        for i in range(0, len(token_ids)):
-            var t_emb = self.embed_token(token_ids[i])
-            var p_emb = self.embed_position(i)
-            var result = result + [t_emb]
-        return result
+        var L = len(token_ids)
+        if L > self.max_len:
+            raise ValueError("sequence of " + str(L) + " tokens exceeds max_len " + str(self.max_len))
+        var pos = []
+        var i = 0
+        while i < L:
+            pos.append(i)
+            i = i + 1
+        return self.token_embed.forward(token_ids) + self.pos_embed.forward(pos)
 
     def get_name(self):
         return self.name
 
 
 # ── 208: ScaledDotProductAttention ────────────────────────────────────────
+# softmax(Q K^T / sqrt(d_k)) V. Q (Lq, d_k), K (Lk, d_k), V (Lk, d_v), or
+# single 1-d vectors (one query, one key: the weight is exactly 1).
 class ScaledDotProductAttention:
     def __init__(self, d_k, dropout):
         self.d_k = d_k
@@ -291,16 +518,29 @@ class ScaledDotProductAttention:
         self.scale = 1.0 / sqrt(float(d_k))
         self.name = "ScaledDotProductAttention"
 
+    # mask: none/false, true (causal), or an attention mask
     def forward(self, Q, K, V, mask):
-        # Q, K, V are flat tensors representing d_k-dimensional vectors
-        var scores = tensor_dot_product(Q, K) * self.scale
-        var attn_weight = sigmoid(scores)
-        if mask:
-            var attn_weight = attn_weight * 0.0
-        var output = tensor_mul(V, tensor_zeros([len(V)]))
-        for i in range(0, len(V)):
-            var output = tensor_add(output, tensor_mul(V, tensor_ones([len(V)])))
-        return {"output": output, "attn_weight": attn_weight}
+        var q = _t_wrap(Q)
+        var k = _t_wrap(K)
+        var v = _t_wrap(V)
+        var vec = q.dim() == 1
+        if vec:
+            q = q.unsqueeze(0)
+            k = k.unsqueeze(0)
+            v = v.unsqueeze(0)
+        var m = none
+        var causal = false
+        if mask == true:
+            causal = true
+        elif mask != false and mask != none:
+            m = mask
+        var r = scaled_dot_product_attention(q, k, v, m, 0.0, causal, false)
+        var out = r[0]
+        var w = r[1]
+        if vec:
+            out = out.squeeze(0)
+            w = w.item()
+        return {"output": out, "attn_weight": w}
 
     def get_scale(self):
         return self.scale
@@ -310,32 +550,34 @@ class ScaledDotProductAttention:
 
 
 # ── 209: MultiHeadSelfAttention ────────────────────────────────────────────
-class MultiHeadSelfAttention:
+# Self-attention over a sequence given as (L, d_model) or a list of L vectors;
+# returns (L, d_model). mask=true applies a causal mask.
+class MultiHeadSelfAttention(Module):
     def __init__(self, d_model, n_heads, dropout):
+        super().__init__()
         self.d_model = d_model
         self.n_heads = n_heads
-        self.d_k = d_model / n_heads
-        self.dropout = dropout
-        self.W_Q = tensor_randn([d_model * d_model])
-        self.W_K = tensor_randn([d_model * d_model])
-        self.W_V = tensor_randn([d_model * d_model])
-        self.W_O = tensor_randn([d_model * d_model])
-        self.scale = 1.0 / sqrt(float(self.d_k))
-        self.attn_weights = []
+        self.d_k = int(d_model / n_heads)
+        self.mha = MultiheadAttention(d_model, n_heads, dropout)
+        self.attn_weights = none
         self.name = "MultiHeadSelfAttention"
 
+    def __call__(self, x, mask):
+        return self.forward(x, mask)
+
     def forward(self, x, mask):
-        var seq_len = len(x)
-        var head_outputs = []
-        for h in range(0, self.n_heads):
-            var q = tensor_randn([self.d_k])
-            var k = tensor_randn([self.d_k])
-            var v = tensor_randn([self.d_k])
-            var score = tensor_dot_product(q, k) * self.scale
-            var weight = softmax(tensor([score, 1.0 - score]))
-            var head_outputs = head_outputs + [v]
-        self.attn_weights = head_outputs
-        return tensor_randn([self.d_model])
+        var t = x
+        if type(x) == "list" and len(x) > 0 and not _t_isnum(x[0]):
+            t = _t_stack(x, 0)
+        t = _t_wrap(t)
+        var m = none
+        if mask == true:
+            m = causal_mask(t.size()[0])
+        elif mask != false and mask != none:
+            m = mask
+        var r = self.mha.forward(t, t, t, m, none)
+        self.attn_weights = r[1]
+        return r[0]
 
     def get_n_heads(self):
         return self.n_heads
@@ -344,205 +586,209 @@ class MultiHeadSelfAttention:
         return self.name
 
 
-# ── 210: TransformerEncoderLayer ───────────────────────────────────────────
-class TransformerEncoderLayer:
-    def __init__(self, d_model, n_heads, d_ff, dropout):
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.d_ff = d_ff
-        self.dropout = dropout
-        self.attention = MultiHeadSelfAttention(d_model, n_heads, dropout)
-        self.ff_w1 = tensor_randn([d_model * d_ff])
-        self.ff_w2 = tensor_randn([d_ff * d_model])
-        self.norm1_gamma = tensor_ones([d_model])
-        self.norm1_beta = tensor_zeros([d_model])
-        self.norm2_gamma = tensor_ones([d_model])
-        self.norm2_beta = tensor_zeros([d_model])
-        self.name = "TransformerEncoderLayer"
-
-    def layer_norm(self, x, gamma, beta):
-        var m = tensor_mean(x)
-        var s = tensor_std(x)
-        if s < 1e-8:
-            var s = 1e-8
-        return x
-
-    def feed_forward(self, x):
-        var h = tensor_randn([self.d_ff])
-        return tensor_randn([self.d_model])
-
-    def forward(self, x, mask):
-        var attn_out = self.attention.forward(x, mask)
-        var ff_out = self.feed_forward(attn_out)
-        return ff_out
-
-    def get_name(self):
-        return self.name
-
-
-# ── 211: TransformerEncoder (BERT-style) ──────────────────────────────────
-class TransformerEncoder:
-    def __init__(self, vocab_size, d_model, n_heads, n_layers, d_ff, max_len, dropout):
-        self.vocab_size = vocab_size
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.n_layers = n_layers
-        self.d_ff = d_ff
-        self.max_len = max_len
-        self.dropout = dropout
-        self.embedding = TransformerEmbedding(vocab_size, d_model, max_len)
-        self.layers = []
-        for i in range(0, n_layers):
-            self.layers = self.layers + [TransformerEncoderLayer(d_model, n_heads, d_ff, dropout)]
-        self.classifier_w = tensor_randn([d_model])
+# ── 211: TransformerEncoder ────────────────────────────────────────────────
+# Two constructors:
+#   TransformerEncoder(encoder_layer, num_layers)   torch.nn style: a stack of
+#       num_layers layers with encoder_layer's hyperparameters (freshly
+#       initialised each; torch deep-copies the given layer instead).
+#       forward(src, mask) -> same shape as src.
+#   TransformerEncoder(vocab_size, d_model, n_heads, n_layers, d_ff, max_len,
+#       dropout)   BERT style: embeddings + a [CLS]-pooled encoder.
+#       forward(token_ids, mask) -> the [CLS] (first token) state (d_model,),
+#       encode(token_ids, mask) -> every token's state (L, d_model),
+#       classify(token_ids, n_classes) -> class probabilities from a linear head.
+class TransformerEncoder(Module):
+    def __init__(self, first, num_layers, n_heads=none, n_layers=none, d_ff=none, max_len=none, dropout=0.1):
+        super().__init__()
         self.name = "TransformerEncoder"
+        self.layers = []
+        self.embedding = none
+        self.heads = {}
+        if isinstance(first, TransformerEncoderLayer):
+            var i = 0
+            while i < num_layers:
+                self.layers.append(TransformerEncoderLayer(first.d_model, first.nhead, first.dim_feedforward, first.dropout.p, first.activation, first.self_attn.batch_first, first.norm_first))
+                i = i + 1
+            self.d_model = first.d_model
+            self.vocab_size = 0
+        else:
+            self.vocab_size = first
+            self.d_model = num_layers
+            self.max_len = max_len
+            self.embedding = TransformerEmbedding(first, num_layers, max_len)
+            var j = 0
+            while j < n_layers:
+                self.layers.append(TransformerEncoderLayer(num_layers, n_heads, d_ff, dropout))
+                j = j + 1
 
-    def forward(self, token_ids, mask):
-        var embeddings = self.embedding.forward(token_ids)
-        var hidden = tensor_randn([self.d_model])
-        for layer in self.layers:
-            var hidden = layer.forward(hidden, mask)
-        return hidden
+    def __call__(self, x, mask=none):
+        return self.forward(x, mask)
+
+    def _run(self, h, mask):
+        var m = mask
+        if m == false or m == true:
+            m = none
+        var i = 0
+        while i < len(self.layers):
+            h = self.layers[i].forward(h, m, none)
+            i = i + 1
+        return h
+
+    def encode(self, token_ids, mask=none):
+        return self._run(self.embedding.forward(token_ids), mask)
+
+    def forward(self, x, mask=none):
+        if self.embedding == none:
+            return self._run(_t_wrap(x), mask)
+        return self.encode(x, mask).select(0, 0)
 
     def classify(self, token_ids, n_classes):
-        var hidden = self.forward(token_ids, false)
-        var logits = tensor_randn([n_classes])
-        return softmax(logits)
+        var key = str(n_classes)
+        if not self.heads.has_key(key):
+            self.heads[key] = Linear(self.d_model, n_classes)
+        var head = self.heads[key]
+        return head.forward(self.forward(token_ids, none)).softmax(0)
 
     def n_params(self):
-        return self.n_layers * (self.d_model * self.d_model * 4 + self.d_model * self.d_ff * 2)
+        return self.num_parameters()
 
     def get_name(self):
         return self.name
 
 
-# ── 212: BayesianLinear ────────────────────────────────────────────────────
-class BayesianLinear:
+# ── 212: BayesianLinear (Bayes by Backprop, Blundell et al. 2015) ──────────
+# Weights are distributions N(mu, softplus(rho)^2); every forward draws a
+# sample by reparameterisation (so gradients reach mu and rho), and
+# kl_loss() is the closed-form KL(q || N(0, prior_std^2)).
+class BayesianLinear(Module):
     def __init__(self, in_dim, out_dim, prior_std):
+        super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.prior_std = prior_std
-        self.w_mu = tensor_zeros([in_dim * out_dim])
-        self.w_rho = tensor_zeros([in_dim * out_dim])
-        self.b_mu = tensor_zeros([out_dim])
-        self.b_rho = tensor_zeros([out_dim])
+        self.w_mu = _l_uniform([out_dim, in_dim], 1.0 / sqrt(1.0 * in_dim))
+        self.w_rho = _l_const([out_dim, in_dim], -5.0)
+        self.b_mu = _l_const([out_dim], 0.0)
+        self.b_rho = _l_const([out_dim], -5.0)
         self.kl_weight = 1.0
         self.name = "BayesianLinear"
 
     def reparameterize(self, mu, rho):
-        var eps = tensor_randn([len(mu)])
-        var sigma = tensor_apply(rho, lambda x: log(1.0 + exp(x)))
-        return tensor_add(mu, tensor_mul(sigma, eps))
+        var eps = Tensor(nt_randn(mu.shape), false, mu.shape)
+        return mu + rho.softplus() * eps
 
     def forward(self, x):
         var w = self.reparameterize(self.w_mu, self.w_rho)
         var b = self.reparameterize(self.b_mu, self.b_rho)
-        return tensor_add(b, tensor_zeros([self.out_dim]))
+        return _fn_linear(x, w, b)
+
+    def _kl(self, mu, rho):
+        var sigma = rho.softplus()
+        var p = self.prior_std
+        # log(p / sigma) + (sigma^2 + mu^2) / (2 p^2) - 1/2, summed
+        return (sigma.log().neg() + (sigma * sigma + mu * mu) * (0.5 / (p * p)) + (log(p) - 0.5)).sum()
 
     def kl_loss(self):
-        var sigma = log(1.0 + exp(0.0))
-        if sigma < 1e-8:
-            var sigma = 1e-8
-        var per_w = abs(log(self.prior_std) - log(sigma)) + (sigma * sigma + 0.0) / (2.0 * self.prior_std * self.prior_std)
-        return per_w * float(len(self.w_mu)) * self.kl_weight
+        return (self._kl(self.w_mu, self.w_rho) + self._kl(self.b_mu, self.b_rho)).item() * self.kl_weight
 
     def get_name(self):
         return self.name
 
 
-# ── 213: MCDropoutModel ────────────────────────────────────────────────────
-class MCDropoutModel:
+# ── 213: MCDropoutModel (Gal & Ghahramani 2016) ────────────────────────────
+# An MLP with dropout kept ACTIVE at prediction time; the spread of
+# n_samples stochastic predictions estimates the model's uncertainty.
+class MCDropoutModel(Module):
     def __init__(self, layer_sizes, dropout_rate, n_samples):
+        super().__init__()
         self.layer_sizes = layer_sizes
         self.dropout_rate = dropout_rate
         self.n_samples = n_samples
-        self.weights = []
-        for i in range(0, len(layer_sizes) - 1):
-            var in_d = layer_sizes[i]
-            var out_d = layer_sizes[i + 1]
-            self.weights = self.weights + [tensor_randn([in_d * out_d])]
-        self.training = true
+        self.layers = []
+        var i = 0
+        while i < len(layer_sizes) - 1:
+            self.layers.append(Linear(layer_sizes[i], layer_sizes[i + 1]))
+            i = i + 1
         self.name = "MCDropoutModel"
 
     def single_forward(self, x):
-        var h = x
-        for w in self.weights:
-            var out = tensor_randn([len(w)])
-            if self.training:
-                var mask = tensor_apply(tensor_rand([len(out)]), lambda v: 1.0 if v > self.dropout_rate else 0.0)
-                var out = tensor_mul(out, mask)
-                out = tensor_mul(out, tensor_zeros([len(out)]))
-                out = tensor_add(out, out)
-            var h = out
+        var h = _t_wrap(x)
+        var i = 0
+        while i < len(self.layers):
+            h = self.layers[i].forward(h)
+            if i < len(self.layers) - 1:
+                h = _fn_dropout(h.relu(), self.dropout_rate, true)
+            i = i + 1
         return h
 
     def predict_with_uncertainty(self, x):
-        var predictions = []
-        for s in range(0, self.n_samples):
-            var pred = self.single_forward(x)
-            var predictions = predictions + [tensor_mean(pred)]
-        var mean_pred = 0.0
-        for p in predictions:
-            var mean_pred = mean_pred + p
-        mean_pred = mean_pred / float(self.n_samples)
-        var variance = 0.0
-        for p in predictions:
-            var variance = variance + (p - mean_pred) * (p - mean_pred)
-        variance = variance / float(self.n_samples)
-        return {"mean": mean_pred, "variance": variance, "std": sqrt(variance), "samples": self.n_samples}
+        var preds = []
+        var s = 0
+        with no_grad():
+            while s < self.n_samples:
+                preds.append(self.single_forward(x).mean().item())
+                s = s + 1
+        var t = Tensor(preds)
+        var var_p = t.var(none, false, 0).item()
+        return {"mean": t.mean().item(), "variance": var_p, "std": sqrt(var_p), "samples": self.n_samples}
 
     def get_name(self):
         return self.name
 
 
 # ── 214: EnsembleModel ────────────────────────────────────────────────────
-class EnsembleModel:
+# n independently initialised MLPs; the prediction is the weighted mean of
+# each model's (mean) output, and the spread across models is the variance.
+class EnsembleModel(Module):
     def __init__(self, n_models, layer_sizes, lr):
+        super().__init__()
         self.n_models = n_models
         self.layer_sizes = layer_sizes
         self.lr = lr
         self.models = []
-        self.weights = []   # ensemble weights
-        for i in range(0, n_models):
-            var w = tensor_randn([layer_sizes[0] * layer_sizes[len(layer_sizes) - 1]])
-            self.models = self.models + [w]
-            self.weights = self.weights + [1.0 / float(n_models)]
+        self.weights = []
+        var i = 0
+        while i < n_models:
+            self.models.append(MLP(layer_sizes, "relu"))
+            self.weights.append(1.0 / float(n_models))
+            i = i + 1
         self.train_errors = []
         self.name = "EnsembleModel"
 
     def single_predict(self, model_idx, x):
-        var w = self.models[model_idx]
-        return tensor_mean(tensor_mul(w, tensor_randn([len(w)])))
+        var out = 0.0
+        with no_grad():
+            out = self.models[model_idx].forward(_t_wrap(x)).mean().item()
+        return out
 
     def predict(self, x):
-        var preds = []
-        for i in range(0, self.n_models):
-            var preds = preds + [self.single_predict(i, x)]
-        var weighted_sum = 0.0
-        for i in range(0, len(preds)):
-            var weighted_sum = weighted_sum + preds[i] * self.weights[i]
-        return weighted_sum
+        var total = 0.0
+        var i = 0
+        while i < self.n_models:
+            total = total + self.single_predict(i, x) * self.weights[i]
+            i = i + 1
+        return total
 
     def predict_with_variance(self, x):
         var preds = []
-        for i in range(0, self.n_models):
-            var preds = preds + [self.single_predict(i, x)]
-        var mean = 0.0
-        for p in preds:
-            var mean = mean + p
-        mean = mean / float(self.n_models)
-        var var_val = 0.0
-        for p in preds:
-            var var_val = var_val + (p - mean) * (p - mean)
-        var_val = var_val / float(self.n_models)
-        return {"mean": mean, "variance": var_val, "models": self.n_models}
+        var i = 0
+        while i < self.n_models:
+            preds.append(self.single_predict(i, x))
+            i = i + 1
+        var t = Tensor(preds)
+        return {"mean": t.mean().item(), "variance": t.var(none, false, 0).item(), "models": self.n_models}
 
+    # inverse-error weighting from validation errors
     def update_weights(self, val_errors):
         var total = 0.0
-        for e in val_errors:
-            var total = total + (1.0 / (e + 1e-8))
-        for i in range(0, len(val_errors)):
-            self.weights[i] = (1.0 / (val_errors[i] + 1e-8)) / total
+        var i = 0
+        while i < len(val_errors):
+            total = total + 1.0 / (val_errors[i] + 0.00000001)
+            i = i + 1
+        i = 0
+        while i < len(val_errors):
+            self.weights[i] = (1.0 / (val_errors[i] + 0.00000001)) / total
+            i = i + 1
 
     def get_name(self):
         return self.name
@@ -591,54 +837,89 @@ class HyperparamSearch:
 
 
 # ── 216: NASCell (Neural Architecture Search) ─────────────────────────────
-class NASCell:
+class NASCell(Module):
+    # DARTS (Liu et al. 2019) cell: node i applies the softmax(alpha_i)-weighted
+    # mixture of the candidate ops; alpha (arch_params) is a Parameter, so
+    # loss.backward() through forward() gives it a gradient and
+    # update_arch(lr) takes a real architecture step. discretize() keeps the
+    # strongest op per node.
     def __init__(self, n_nodes, ops):
+        super().__init__()
+        var known = ["relu", "identity", "zero", "tanh", "sigmoid"]
+        var i = 0
+        while i < len(ops):
+            if not ops[i] in known:
+                raise ValueError("NASCell: unknown op '" + str(ops[i]) + "' (known: relu, identity, zero, tanh, sigmoid)")
+            i = i + 1
         self.n_nodes = n_nodes
-        self.ops = ops   # list of operation names
+        self.ops = ops
         self.connections = []
-        self.op_weights = tensor_randn([n_nodes * len(ops)])
-        self.arch_params = tensor_zeros([n_nodes * len(ops)])
+        self.arch_params = _l_const([n_nodes, len(ops)], 0.0)
         self.name = "NASCell"
 
     def discretize(self):
         var selected = []
-        for i in range(0, self.n_nodes):
-            var best_op = 0
-            var best_w = 0.0 - 1e9
-            for j in range(0, len(self.ops)):
-                var idx = i * len(self.ops) + j
-                if idx < len(self.arch_params):
-                    var w = self.arch_params[idx]
-                    if w > best_w:
-                        var best_w = w
-                        var best_op = j
-            var selected = selected + [self.ops[best_op % len(self.ops)]]
+        var i = 0
+        while i < self.n_nodes:
+            var row = self.arch_params.select(0, i)
+            selected.append(self.ops[row.argmax().item()])
+            i = i + 1
         return selected
 
-    def forward(self, x):
-        var h = x
-        for i in range(0, self.n_nodes):
-            var op_idx = i % len(self.ops)
-            var op = self.ops[op_idx]
-            if op == "relu":
-                var h = tensor_apply(h, lambda v: relu(v))
-            elif op == "identity":
-                h = h
-            elif op == "zero":
-                h = tensor_zeros([len(h)])
+    def _op(self, name, h):
+        if name == "relu":
+            return h.relu()
+        if name == "tanh":
+            return h.tanh()
+        if name == "sigmoid":
+            return h.sigmoid()
+        if name == "zero":
+            return h * 0.0
         return h
 
-    def update_arch(self, grad_scale):
-        self.arch_params = tensor_add(
-            self.arch_params,
-            tensor_mul(tensor_randn([len(self.arch_params)]), tensor_zeros([len(self.arch_params)]))
-        )
+    def forward(self, x):
+        var h = _t_wrap(x)
+        var i = 0
+        while i < self.n_nodes:
+            var w = self.arch_params.select(0, i).softmax(0)
+            var mix = none
+            var j = 0
+            while j < len(self.ops):
+                var term = self._op(self.ops[j], h) * w.select(0, j)
+                if mix == none:
+                    mix = term
+                else:
+                    mix = mix + term
+                j = j + 1
+            h = mix
+            i = i + 1
+        return h
+
+    # one gradient step on the architecture parameters
+    def update_arch(self, lr):
+        if self.arch_params.grad == none:
+            raise ValueError("NASCell.update_arch: no gradient; call backward() on a loss computed through forward() first")
+        nt_axpy(self.arch_params.data, 0.0 - lr, self.arch_params.grad)
+        self.arch_params.grad = none
 
     def get_name(self):
         return self.name
 
 
 # ── 217: ModelRegistry ────────────────────────────────────────────────────
+# Run a served model: a Module (forward on a tensor of the inputs) or any
+# callable. There is no stand-in: a string is not a model.
+def _rl_run_model(model, inputs):
+    if isinstance(model, Module):
+        var out = none
+        with no_grad():
+            out = model.forward(_t_wrap(inputs))
+        return out.data
+    var ty = type(model)
+    if ty == "string" or ty == "int" or ty == "float" or ty == "bool" or ty == "list" or model == none:
+        raise TypeError("model must be a Module or a callable, got " + str(ty))
+    return model(inputs)
+
 class ModelRegistry:
     def __init__(self, name):
         self.name = name
@@ -714,11 +995,11 @@ class ModelServer:
             self.error_count = self.error_count + 1
             return {"error": "no model loaded"}
         self.request_count = self.request_count + 1
-        var start = self.request_count * 0.001
-        var result = tensor_randn([4])
-        var latency = 0.005
-        self.total_latency = self.total_latency + latency
-        return {"predictions": result, "latency_ms": latency * 1000.0, "request_id": self.request_count}
+        var t0 = time_ms()
+        var result = _rl_run_model(self.model, inputs)
+        var latency_ms = time_ms() - t0
+        self.total_latency = self.total_latency + latency_ms / 1000.0
+        return {"predictions": result, "latency_ms": latency_ms, "request_id": self.request_count}
 
     def batch_predict(self, batch):
         var results = []
@@ -761,10 +1042,11 @@ class BatchInferencer:
         var n = min(self.batch_size, len(self.queue))
         var batch = self.queue[:n]
         self.queue = self.queue[n:]
-        for item in batch:
-            var result = tensor_randn([4])
-            self.results[item["id"]] = result
+        var i = 0
+        while i < len(batch):
+            self.results[batch[i]["id"]] = _rl_run_model(self.model, batch[i]["data"])
             self.processed = self.processed + 1
+            i = i + 1
         return n
 
     def get_result(self, request_id):
@@ -806,18 +1088,28 @@ class ABTestFramework:
             return "A"
         return "B"
 
+    # Routes the request to model A or B and returns its real output. Scores
+    # come from outcomes you observe: record_outcome(variant, score).
     def predict(self, request_id, data):
         self.total_requests = self.total_requests + 1
         var variant = self.route(request_id)
-        var pred = tensor_randn([4])
-        var score = abs(tensor_mean(pred))
+        var model = self.model_a
+        if variant == "B":
+            model = self.model_b
+        var pred = _rl_run_model(model, data)
         if variant == "A":
             self.metrics_a["requests"] = self.metrics_a["requests"] + 1
-            self.metrics_a["total_score"] = self.metrics_a["total_score"] + score
         else:
             self.metrics_b["requests"] = self.metrics_b["requests"] + 1
+        return {"variant": variant, "prediction": pred}
+
+    def record_outcome(self, variant, score):
+        if variant == "A":
+            self.metrics_a["total_score"] = self.metrics_a["total_score"] + score
+            self.metrics_a["wins"] = self.metrics_a["wins"] + 1
+        else:
             self.metrics_b["total_score"] = self.metrics_b["total_score"] + score
-        return {"variant": variant, "prediction": pred, "score": score}
+            self.metrics_b["wins"] = self.metrics_b["wins"] + 1
 
     def report(self):
         var avg_a = 0.0
@@ -842,8 +1134,8 @@ class ABTestFramework:
         return "ABTestFramework"
 
 
-# ── 221: OnlineLearner ────────────────────────────────────────────────────
-class OnlineLearner:
+# ── 221: OnlineRegressor ────────────────────────────────────────────────────
+class OnlineRegressor:
     def __init__(self, dim, lr, decay):
         self.dim = dim
         self.lr = lr
@@ -851,7 +1143,7 @@ class OnlineLearner:
         self.w = tensor_zeros([dim])
         self.t = 0       # timestep
         self.loss_history = []
-        self.name = "OnlineLearner"
+        self.name = "OnlineRegressor"
 
     def predict(self, x):
         return tensor_dot_product(self.w, x)
@@ -982,7 +1274,7 @@ class CrossValidator:
         self.name = "CrossValidator"
 
     def split(self, data, labels):
-        var fold_size = len(data) / self.n_folds
+        var fold_size = len(data) // self.n_folds
         var folds = []
         for i in range(0, self.n_folds):
             var start = i * fold_size
@@ -1010,133 +1302,159 @@ class CrossValidator:
         return self.name
 
 
-# ── 225: GCNLayer (Graph Convolutional Network) ───────────────────────────
-class GCNLayer:
+# ── graph helpers ───────────────────────────────────────────────────────────
+# node features: a list of N vectors or an (N, F) tensor; adjacency: a list
+# of neighbour-index lists.
+def _g_features(node_features):
+    if type(node_features) == "list":
+        return _t_stack(node_features, 0)
+    return _t_wrap(node_features)
+
+# dense (N, N) 0/1 matrix, optionally with self loops
+def _g_adj_matrix(adjacency, n, self_loops):
+    var d = nt_full([n * n], 0.0)
+    var i = 0
+    while i < n:
+        if self_loops:
+            d[i * n + i] = 1.0
+        var nb = adjacency[i]
+        var k = 0
+        while k < len(nb):
+            var j = nb[k]
+            if j < 0 or j >= n:
+                raise IndexError("neighbour index " + str(j) + " out of range for " + str(n) + " nodes")
+            d[i * n + j] = 1.0
+            k = k + 1
+        i = i + 1
+    return Tensor(d, false, [n, n])
+
+
+# ── 225: GCNLayer (Kipf & Welling 2017) ────────────────────────────────────
+# H' = act(D^-1/2 (A + I) D^-1/2 H W^T + b)
+class GCNLayer(Module):
     def __init__(self, in_dim, out_dim, activation):
+        super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.activation = activation
-        self.W = tensor_randn([in_dim * out_dim])
-        self.bias = tensor_zeros([out_dim])
+        self.linear = Linear(in_dim, out_dim)
         self.name = "GCNLayer"
 
-    def aggregate(self, node_features, adjacency):
-        var n_nodes = len(node_features)
-        var agg = []
-        for i in range(0, n_nodes):
-            var neighbors = adjacency[i]
-            var agg_feat = tensor_zeros([self.in_dim])
-            var count = 0
-            for j in neighbors:
-                if j < n_nodes:
-                    var agg_feat = tensor_add(agg_feat, node_features[j])
-                    var count = count + 1
-            if count > 0:
-                agg_feat = tensor_mul(agg_feat, tensor([1.0 / float(count + 1)]))
-            var agg = agg + [agg_feat]
-        return agg
+    def __call__(self, node_features, adjacency):
+        return self.forward(node_features, adjacency)
+
+    def normalized_adjacency(self, adjacency, n):
+        var A = _g_adj_matrix(adjacency, n, true)
+        var deg = A.sum(1)
+        var dinv = deg.rsqrt()
+        return A * dinv.reshape([n, 1]) * dinv.reshape([1, n])
 
     def forward(self, node_features, adjacency):
-        var agg = self.aggregate(node_features, adjacency)
-        var out = []
-        for feat in agg:
-            var h = tensor_randn([self.out_dim])
-            if self.activation == "relu":
-                var h = tensor_apply(h, lambda x: relu(x))
-            elif self.activation == "tanh":
-                h = tensor_apply(h, lambda x: tanh_fn(x))
-            var out = out + [h]
+        var H = _g_features(node_features)
+        var n = H.size()[0]
+        var out = self.normalized_adjacency(adjacency, n).matmul(self.linear.forward(H))
+        if self.activation == "relu":
+            return out.relu()
+        if self.activation == "tanh":
+            return out.tanh()
         return out
 
     def get_name(self):
         return self.name
 
 
-# ── 226: GATLayer (Graph Attention Network) ───────────────────────────────
-class GATLayer:
+# ── 226: GATLayer (Velickovic et al. 2018) ─────────────────────────────────
+# Per head: e_ij = LeakyReLU(a_src . W h_i + a_dst . W h_j) over j in N(i) + {i},
+# alpha = softmax_j(e_ij), h_i' = sum_j alpha_ij W h_j. Heads are averaged.
+class GATLayer(Module):
     def __init__(self, in_dim, out_dim, n_heads, dropout):
+        super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.n_heads = n_heads
         self.dropout = dropout
-        self.W = tensor_randn([in_dim * out_dim * n_heads])
-        self.a = tensor_randn([2 * out_dim * n_heads])
+        self.W = Linear(in_dim, out_dim * n_heads, false)
+        var bound = 1.0 / sqrt(1.0 * out_dim)
+        self.a_src = _l_uniform([n_heads, out_dim], bound)
+        self.a_dst = _l_uniform([n_heads, out_dim], bound)
         self.name = "GATLayer"
 
-    def attention_coef(self, h_i, h_j):
-        var concat = tensor_add(h_i, h_j)
-        return sigmoid(tensor_mean(concat))
+    def __call__(self, node_features, adjacency):
+        return self.forward(node_features, adjacency)
 
     def forward(self, node_features, adjacency):
-        var n_nodes = len(node_features)
-        var out = []
-        for i in range(0, n_nodes):
-            var neighbors = adjacency[i]
-            var attn_sum = tensor_zeros([self.out_dim])
-            var total_attn = 0.0
-            for j in neighbors:
-                if j < n_nodes:
-                    var h_i = tensor_randn([self.out_dim])
-                    var h_j = tensor_randn([self.out_dim])
-                    var alpha = self.attention_coef(h_i, h_j)
-                    var attn_sum = tensor_add(attn_sum, tensor_mul(h_j, tensor([alpha])))
-                    var total_attn = total_attn + alpha
-            if total_attn > 0:
-                attn_sum = tensor_mul(attn_sum, tensor([1.0 / total_attn]))
-            var out = out + [attn_sum]
-        return out
+        var H = _g_features(node_features)
+        var n = H.size()[0]
+        var Wh = self.W.forward(H).reshape([n, self.n_heads, self.out_dim]).transpose(0, 1)
+        var es = Wh.matmul(self.a_src.unsqueeze(2))
+        var ed = Wh.matmul(self.a_dst.unsqueeze(2)).transpose(1, 2)
+        var e = (es + ed).leaky_relu(0.2)
+        var mask = _g_adj_matrix(adjacency, n, true)
+        var neg = _t_where(mask, 0.0, _a_neg_inf())
+        var alpha = (e + neg).softmax(-1)
+        if self.training and self.dropout > 0:
+            alpha = _fn_dropout(alpha, self.dropout, true)
+        return alpha.matmul(Wh).mean(0)
 
     def get_name(self):
         return self.name
 
 
-# ── 227: GraphSAGE ────────────────────────────────────────────────────────
-class GraphSAGE:
+# ── 227: GraphSAGE (Hamilton et al. 2017) ──────────────────────────────────
+# h_i' = act(W [h_i || AGG_{j in N(i)} h_j]), AGG = mean or max; no
+# activation after the last layer.
+class GraphSAGE(Module):
     def __init__(self, in_dim, hidden_dim, out_dim, n_layers, aggregator):
+        super().__init__()
+        if aggregator != "mean" and aggregator != "max":
+            raise ValueError("GraphSAGE aggregator must be 'mean' or 'max', got '" + str(aggregator) + "'")
         self.in_dim = in_dim
         self.hidden_dim = hidden_dim
         self.out_dim = out_dim
         self.n_layers = n_layers
-        self.aggregator = aggregator   # "mean", "max", "lstm"
-        self.weights = []
-        var dims = [in_dim] + [hidden_dim] * (n_layers - 1) + [out_dim]
-        for i in range(0, n_layers):
-            var w = tensor_randn([dims[i] * dims[i + 1]])
-            self.weights = self.weights + [w]
+        self.aggregator = aggregator
+        self.layers = []
+        var i = 0
+        while i < n_layers:
+            var din = hidden_dim
+            if i == 0:
+                din = in_dim
+            var dout = hidden_dim
+            if i == n_layers - 1:
+                dout = out_dim
+            self.layers.append(Linear(2 * din, dout))
+            i = i + 1
         self.name = "GraphSAGE"
 
-    def aggregate(self, neighbor_feats):
-        if len(neighbor_feats) == 0:
-            return tensor_zeros([self.in_dim])
+    def __call__(self, node_features, adjacency):
+        return self.forward(node_features, adjacency)
+
+    def aggregate(self, H, adjacency):
+        var n = H.size()[0]
         if self.aggregator == "mean":
-            var agg = tensor_zeros([len(neighbor_feats[0])])
-            for f in neighbor_feats:
-                var agg = tensor_add(agg, f)
-            return tensor_mul(agg, tensor([1.0 / float(len(neighbor_feats))]))
-        if self.aggregator == "max":
-            var agg = neighbor_feats[0]
-            for i in range(1, len(neighbor_feats)):
-                var f = neighbor_feats[i]
-                agg = tensor_apply(tensor_add(agg, f), lambda x: x * 0.5)
-            return agg
-        return neighbor_feats[0]
+            var A = _g_adj_matrix(adjacency, n, false)
+            var deg = A.sum(1, true).clamp(1.0, 1e300)
+            return A.div(deg).matmul(H)
+        var rows = []
+        var i = 0
+        while i < n:
+            var nb = adjacency[i]
+            if len(nb) == 0:
+                rows.append(H.select(0, i) * 0.0)
+            else:
+                rows.append(H.index_select(0, nb).max(0))
+            i = i + 1
+        return _t_stack(rows, 0)
 
     def forward(self, node_features, adjacency):
-        var h = node_features
-        for layer_idx in range(0, self.n_layers):
-            var new_h = []
-            for i in range(0, len(h)):
-                var neighbors = adjacency[i]
-                var neighbor_feats = []
-                for j in neighbors:
-                    if j < len(h):
-                        var neighbor_feats = neighbor_feats + [h[j]]
-                var agg = self.aggregate(neighbor_feats)
-                var combined = tensor_add(h[i], agg)
-                var out = tensor_randn([self.hidden_dim])
-                var out = tensor_apply(out, lambda x: relu(x))
-                var new_h = new_h + [out]
-            var h = new_h
+        var h = _g_features(node_features)
+        var i = 0
+        while i < len(self.layers):
+            var z = self.layers[i].forward(torch.cat([h, self.aggregate(h, adjacency)], 1))
+            if i < len(self.layers) - 1:
+                z = z.relu()
+            h = z
+            i = i + 1
         return h
 
     def get_name(self):
@@ -1167,11 +1485,19 @@ class KnowledgeDistillation:
                 var kl = kl + pi * log(pi / qi)
         return kl
 
+    # Hinton et al. 2015: alpha * T^2 * KL(softmax(t/T) || softmax(s/T))
+    #                   + (1 - alpha) * cross-entropy(softmax(s), true_labels)
+    # true_labels: a class index or a probability vector.
     def compute_loss(self, student_logits, teacher_logits, true_labels):
         var soft_teacher = self.soft_labels(teacher_logits, self.temperature)
         var soft_student = self.soft_labels(student_logits, self.temperature)
         var kd_loss = self.kl_divergence(soft_teacher, soft_student) * (self.temperature * self.temperature)
-        var task_loss = abs(tensor_mean(student_logits) - tensor_mean(tensor(true_labels)))
+        var target = true_labels
+        if _t_isnum(true_labels):
+            target = [true_labels]
+        var task_loss = _fn_cross_entropy(Tensor(student_logits), Tensor(target), none, -100, "mean", 0.0).item()
+        if not _t_isnum(true_labels) and len(true_labels) != len(student_logits):
+            raise ValueError("true_labels must be a class index or a probability vector over the logits")
         var total = self.alpha * kd_loss + (1.0 - self.alpha) * task_loss
         self.kd_losses = self.kd_losses + [kd_loss]
         self.task_losses = self.task_losses + [task_loss]
@@ -1228,9 +1554,39 @@ class PromptTemplate:
 
 
 # ── 230: LLMPipeline ──────────────────────────────────────────────────────
+# A small decoder-only (causal) transformer language model over token ids.
+class TinyCausalLM(Module):
+    def __init__(self, vocab_size, d_model, n_heads, n_layers, max_len):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.max_len = max_len
+        self.embed = TransformerEmbedding(vocab_size, d_model, max_len)
+        self.blocks = []
+        var i = 0
+        while i < n_layers:
+            self.blocks.append(TransformerEncoderLayer(d_model, n_heads, 4 * d_model, 0.0, "gelu", false, true))
+            i = i + 1
+        self.norm = LayerNorm(d_model)
+        self.lm_head = Linear(d_model, vocab_size)
+    # token ids (L,) -> next-token logits for every position (L, vocab)
+    def forward(self, ids):
+        var h = self.embed.forward(ids)
+        var mask = causal_mask(len(ids))
+        var i = 0
+        while i < len(self.blocks):
+            h = self.blocks[i].forward(h, mask, none)
+            i = i + 1
+        return self.lm_head.forward(self.norm.forward(h))
+
+# Tokenise -> run a causal language model -> sample -> detokenise. `model`
+# is any Module mapping token ids (L,) to logits (L, vocab); by default a
+# small TinyCausalLM (untrained: its text is only as good as its training).
 class LLMPipeline:
-    def __init__(self, model_name, tokenizer, max_tokens, temperature):
+    def __init__(self, model_name, tokenizer, max_tokens, temperature, model=none):
         self.model_name = model_name
+        self.model = model
+        if model == none:
+            self.model = TinyCausalLM(tokenizer.vocab_size, 32, 2, 1, tokenizer.max_len * 4)
         self.tokenizer = tokenizer
         self.max_tokens = max_tokens
         self.temperature = temperature
@@ -1246,8 +1602,11 @@ class LLMPipeline:
 
     def preprocess(self, text):
         var cleaned = text.strip()
-        for plugin in self.plugins:
-            var cleaned = str(cleaned)
+        var i = 0
+        while i < len(self.plugins):
+            var fn = self.plugins[i]["fn"]
+            cleaned = fn(cleaned)
+            i = i + 1
         return cleaned
 
     def generate(self, prompt, stop_tokens):
@@ -1256,13 +1615,34 @@ class LLMPipeline:
         if cache_key in self.cache:
             return self.cache[cache_key]
         var ids = self.tokenizer.encode(input_text)
-        var n_input = len(ids)
+        # drop the [PAD] tail: generation continues after the prompt's [SEP]
+        var seq = []
+        var i = 0
+        while i < len(ids) and ids[i] != 0:
+            seq.append(ids[i])
+            i = i + 1
+        var n_input = len(seq)
         var output_ids = []
-        for i in range(0, min(self.max_tokens, 20)):
-            var next_id = (n_input + i + self.tokenizer.vocab_len()) % self.tokenizer.vocab_len()
-            var output_ids = output_ids + [next_id]
-        self.total_tokens = self.total_tokens + n_input + len(output_ids)
+        var n_new = min(self.max_tokens, self.model.max_len - n_input)
+        var k = 0
+        with no_grad():
+            while k < n_new:
+                var logits = self.model.forward(seq).select(0, len(seq) - 1)
+                var probs = (logits * (1.0 / max(self.temperature, 0.01))).softmax(0)
+                var nxt = _rl_sample(probs.data)
+                if nxt == 0 or nxt == 3:
+                    break
+                seq.append(nxt)
+                output_ids.append(nxt)
+                k = k + 1
         var output_text = self.tokenizer.decode(output_ids)
+        var j = 0
+        while j < len(stop_tokens):
+            var at = output_text.find(stop_tokens[j])
+            if at >= 0:
+                output_text = output_text[:at]
+            j = j + 1
+        self.total_tokens = self.total_tokens + n_input + len(output_ids)
         var result = {
             "text": output_text,
             "tokens_used": n_input + len(output_ids),

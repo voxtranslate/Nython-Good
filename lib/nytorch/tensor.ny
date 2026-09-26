@@ -789,6 +789,17 @@ class Tensor:
     def is_matrix(self):
         return len(self._mat_es()) == 2
 
+    # same shape and |a - b| <= atol + rtol |b| everywhere (torch.allclose)
+    def allclose(self, other, rtol=0.00001, atol=0.00000001):
+        var o = _t_wrap(other)
+        if o.shape != self.shape:
+            return false
+        return nt_allclose(_t_flat(self.data), _t_flat(o.data), rtol, atol)
+
+    def equal(self, other):
+        var o = _t_wrap(other)
+        return o.shape == self.shape and _t_flat(o.data) == _t_flat(self.data)
+
     def clone(self):
         var d = self.data
         if type(d) == "list":
