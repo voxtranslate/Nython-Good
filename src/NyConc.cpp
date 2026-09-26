@@ -394,7 +394,7 @@ static int64_t start_thread(Engine& e, Body body, const std::string& name, bool 
 }
 
 static void launch(std::shared_ptr<ThreadRec> rec, Body body) {
-    std::thread th([rec, body]() {
+    std::thread th([rec, body]() mutable {
         t_self = rec.get();
         gil_acquire();
         rec->started = true;
@@ -403,6 +403,7 @@ static void launch(std::shared_ptr<ThreadRec> rec, Body body) {
         catch (NyError& x) { failed = true; err = x; }
         catch (std::exception& x) { failed = true; err = NyError::make("RuntimeError", x.what()); }
         catch (...) { failed = true; err = NyError::make("RuntimeError", "unknown error in thread"); }
+        body = nullptr;               // release the captured engine values with the GIL held
         bool report = false;
         {
             std::lock_guard<std::mutex> l(RT().m);
@@ -1206,7 +1207,7 @@ static void grant(std::unique_lock<std::mutex>& lk, Loop* L, Task* t) {
         Task* tp = t;
         Body body = [tp](ThreadRec*) -> BoxPtr { return tp->entry(*tp->engine); };
         std::shared_ptr<ThreadRec> r = rec;
-        std::thread th([r, body, tp, L]() {
+        std::thread th([r, body, tp, L]() mutable {
             t_self = r.get();
             {
                 std::unique_lock<std::mutex> l(RT().m);
@@ -1218,6 +1219,8 @@ static void grant(std::unique_lock<std::mutex>& lk, Loop* L, Task* t) {
             try { res = body(r.get()); }
             catch (NyError& x) { failed = true; err = x; }
             catch (std::exception& x) { failed = true; err = NyError::make("RuntimeError", x.what()); }
+            body = nullptr;
+            tp->entry = nullptr;      // captured engine values go while the GIL is held
             {
                 std::lock_guard<std::mutex> l(RT().m);
                 task_finish_locked(tp, res, failed, err);
@@ -2526,12 +2529,19 @@ void join_nondaemon_at_exit() {
         }
         if (pending.empty()) break;
         for (auto id : pending) {
-            try { join_thread(*e, id, -1); }
-            catch (NyError& x) {
+            // Wait for completion without re-raising: a failure nobody joined is
+            // reported below instead.
+            ThreadRec* t;
+            {
                 std::lock_guard<std::mutex> l(RT().m);
-                auto* t = RT().threads[id].get();
+                t = RT().threads[id].get();
+            }
+            try {
+                block_released(self, {&t->joiners}, [t] { return t->done; }, Deadline::never(), t, false);
+            } catch (NyError& x) {
+                std::lock_guard<std::mutex> l(RT().m);
                 if (!t->done) {
-                    // Blocked for good (e.g. a deadlock found while waiting): stop waiting.
+                    // Blocked for good (a deadlock found while waiting): stop waiting.
                     std::cerr << "[Nython] at exit: " << error_text(x) << std::endl;
                     t->daemon = true;
                 }

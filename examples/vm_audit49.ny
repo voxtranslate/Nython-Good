@@ -69,9 +69,9 @@ async def tagged(tag, secs):
     return tag
 
 async def order_main():
-    var t1 = create_task(tagged("a", 0.06))
-    var t2 = create_task(tagged("b", 0.02))
-    var t3 = create_task(tagged("c", 0.04))
+    var t1 = create_task(tagged("a", 0.3))
+    var t2 = create_task(tagged("b", 0.1))
+    var t3 = create_task(tagged("c", 0.2))
     log.append("main after create")
     return await gather(t1, t2, t3)
 
@@ -103,10 +103,10 @@ check("sleep(0) round-robins", log, ["p0", "q0", "p1", "q1", "p2", "q2"])
 
 async def concurrent_main():
     var t0 = time_ms()
-    await gather(async_sleep(0.1), async_sleep(0.1), async_sleep(0.1))
+    await gather(async_sleep(0.2), async_sleep(0.2), async_sleep(0.2))
     return time_ms() - t0
 var elapsed = async_run(concurrent_main())
-check("three 0.1 s sleeps run concurrently", elapsed >= 90 and elapsed < 250, true)
+check("three 0.2 s sleeps run concurrently", elapsed >= 190 and elapsed < 500, true)
 
 # ── 3. async queues (channels suspend only the task) ────────────────────────
 async def producer(q, n):

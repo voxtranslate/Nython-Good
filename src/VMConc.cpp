@@ -208,6 +208,19 @@ void VMConc::install(VirtualMachine& vm) {
             return ret_to_vm(r);
         });
     }
+    // The VM's own process natives touch no VM state and write nothing through
+    // std::cout, so they release the GIL while the child runs (the
+    // interpreter's, reached through the bridge, already do: builtins/os.cpp).
+    // input() is left alone: its prompt goes through std::cout.
+    for (const char* blocking : {"shell", "system", "cmd"}) {
+        auto it = vm.globals_.find(blocking);
+        if (it == vm.globals_.end() || it->second.type != VMType::NATIVE || !it->second.native) continue;
+        NativeFunc inner = it->second.native;
+        it->second = VMVal::make_native([inner](std::vector<VMVal>& a) -> VMVal {
+            nyconc::GilRelease unlocked;
+            return inner(a);
+        });
+    }
     for (const auto& en : nyconc::exception_names()) {
         std::string cname = en;
         vm.globals_[cname] = VMVal::make_native([cname](std::vector<VMVal>& a) -> VMVal {
