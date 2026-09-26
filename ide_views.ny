@@ -497,7 +497,7 @@ class IDEViews(IDEPaint):
             by[c.path] = c
             var d = os_path_dirname(c.path)
             var guard = 0
-            while d != "" and string_startswith(d, self.git.root) and guard < 40:
+            while d != "" and d != "/" and string_startswith(d, self.git.root) and guard < 40:
                 dirs[d] = true
                 d = os_path_dirname(d)
                 guard = guard + 1
