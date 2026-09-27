@@ -970,7 +970,7 @@ class MultiAgentOrchestrator:
         var n = len(self.agent_names)
         for i in range(0, n):
             var aid = self.agent_names[i]
-            var info = self.agents[aid]
+            var info = self.agents.get(aid)
             if not info["busy"]:
                 var caps = info["caps"]
                 var match_score = self.agent_scores[aid]

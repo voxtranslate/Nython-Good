@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""ide_lint.py - catch the IDE's silent-`none` bugs before they run.
+"""ide_lint.py - catch the IDE's missing-member bugs before they run.
 
-Nython does not raise on a missing method or attribute: `obj.missing()` and
-`obj.missing` both evaluate to `none` and execution carries on. That is how
-`Font.height()` (never defined) put the Run button's label at y=0, and how the
-toolbar chips read `theme.on_badge` (never defined) for rounds without anyone
-noticing. This checker resolves, statically:
+Until round 75 Nython did not raise on a missing method or attribute:
+`obj.missing()` and `obj.missing` both evaluated to `none` and execution
+carried on. That is how `Font.height()` (never defined) put the Run button's
+label at y=0, and how the toolbar chips read `theme.on_badge` (never defined)
+for rounds without anyone noticing. Both now raise AttributeError - but only
+when the line runs; this checker finds them without running anything. It
+resolves, statically:
 
   * self.name(...) and self.name   against every class in the IDE's chain
   * th.name / self.th.name         against IDETheme

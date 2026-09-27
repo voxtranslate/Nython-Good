@@ -827,7 +827,7 @@ class ModelEnsemble:
         var i = 0
         while i < n:
             var p = str(predictions_list[i])
-            if counts[p] == none:
+            if counts.get(p) == none:
                 counts[p] = 0
             counts[p] = counts[p] + 1
             var i = i + 1
@@ -1060,7 +1060,7 @@ class NyMonitor:
         var ts = str(time_timestamp())
         kv_set(self.metrics_store, metric_name + "_last", str(value))
         kv_set(self.metrics_store, metric_name + "_ts", ts)
-        var thr = self.thresholds[metric_name]
+        var thr = self.thresholds.get(metric_name)
         if thr != none:
             if value > to_float(thr):
                 var alert = metric_name + " exceeded threshold: " + str(value) + " > " + thr
@@ -1137,7 +1137,7 @@ class NyConfig:
         return self
 
     def get(self, key, default_val):
-        var v = self.data[key]
+        var v = self.data.get(key)
         if v == none:
             return default_val
         return v
@@ -1147,13 +1147,13 @@ class NyConfig:
         return self
 
     def get_int(self, key, default_val):
-        var v = self.data[key]
+        var v = self.data.get(key)
         if v == none:
             return default_val
         return to_int(v)
 
     def get_float(self, key, default_val):
-        var v = self.data[key]
+        var v = self.data.get(key)
         if v == none:
             return default_val
         return to_float(v)

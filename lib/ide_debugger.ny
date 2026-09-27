@@ -284,7 +284,7 @@ class DebugSession:
     # Recorded value (its printed form) of `name` at step i, or none.
     def _value_at(self, i, name):
         var ev = json_decode(self.raw[i])
-        if ev == none or ev["v"] == none:
+        if ev == none or ev.get("v") == none:
             return none
         var vars = ev["v"]
         if vars.has_key(name):

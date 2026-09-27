@@ -807,7 +807,7 @@ class Widget:
         self.child_count = new_count
 
     def on(self, event, handler):
-        var count = self._eh_counts[event]
+        var count = self._eh_counts.get(event)
         if count == none:
             count = 0
         self._event_handlers[event + "_" + str(count)] = handler
@@ -815,18 +815,18 @@ class Widget:
         return self
 
     def emit(self, event):
-        var count = self._eh_counts[event.type]
+        var count = self._eh_counts.get(event.type)
         if count == none:
             return
         var i = 0
         while i < count:
-            var h = self._event_handlers[event.type + "_" + str(i)]
+            var h = self._event_handlers.get(event.type + "_" + str(i))
             if h != none and event.consumed == false:
                 h(event)
             i = i + 1
 
     def _handles(self, type_name):
-        return self._eh_counts[type_name] != none
+        return self._eh_counts.get(type_name) != none
 
     # Children are drawn over their parent, so they see an event first,
     # topmost first (gui_dispatch); one a child consumed does not reach the
@@ -1291,7 +1291,7 @@ def gui_dispatch(children, count, event):
     var i = count - 1
     while i >= 0:
         var c = children[i]
-        if c._in_overlay != true:
+        if c?._in_overlay != true:
             c.handle_event(event)
             if event.consumed and not broadcast:
                 return true
@@ -1553,26 +1553,26 @@ class Window:
     # beyond the call - the same contract SDL itself has for SDL_Event.
     def _fill_event(self, ev, raw, etype):
         ev.type = etype
-        ev.x = raw["x"]
-        ev.y = raw["y"]
-        ev.button = raw["button"]
-        ev.key = raw["key"]
-        ev.keycode = raw["keycode"]
-        ev.text = raw["text"]
-        ev.delta = raw["delta"]
-        ev.ctrl = raw["ctrl"]
-        ev.shift = raw["shift"]
-        ev.alt = raw["alt"]
+        ev.x = raw.get("x")
+        ev.y = raw.get("y")
+        ev.button = raw.get("button")
+        ev.key = raw.get("key")
+        ev.keycode = raw.get("keycode")
+        ev.text = raw.get("text")
+        ev.delta = raw.get("delta")
+        ev.ctrl = raw.get("ctrl")
+        ev.shift = raw.get("shift")
+        ev.alt = raw.get("alt")
         ev.consumed = false
         ev.clicks = 0
         if raw.has_key("clicks"):
             ev.clicks = raw["clicks"]
         # Newer fields; the backend sends dx/dy only with wheel events and
         # "window" only while several windows are open.
-        ev.w = raw["w"]
-        ev.h = raw["h"]
-        ev.meta = raw["meta"] == true
-        ev.repeat = raw["repeat"] == true
+        ev.w = raw.get("w")
+        ev.h = raw.get("h")
+        ev.meta = raw.get("meta") == true
+        ev.repeat = raw.get("repeat") == true
         ev.dx = 0.0
         ev.dy = 0.0
         if raw.has_key("dx"):
@@ -1740,7 +1740,7 @@ class Button:
         self._animation = 0.0
 
     def on(self, event, handler):
-        var count = self._eh_counts[event]
+        var count = self._eh_counts.get(event)
         if count == none:
             count = 0
         self._event_handlers[event + "_" + str(count)] = handler
@@ -1748,12 +1748,12 @@ class Button:
         return self
 
     def emit(self, event):
-        var count = self._eh_counts[event.type]
+        var count = self._eh_counts.get(event.type)
         if count == none:
             return
         var i = 0
         while i < count:
-            var h = self._event_handlers[event.type + "_" + str(i)]
+            var h = self._event_handlers.get(event.type + "_" + str(i))
             if h != none:
                 h(event)
             i = i + 1
@@ -1972,7 +1972,7 @@ class TextInput:
         self._event_handlers = {}
 
     def on(self, event, handler):
-        var count = self._eh_counts[event]
+        var count = self._eh_counts.get(event)
         if count == none:
             count = 0
         self._event_handlers[event + "_" + str(count)] = handler
@@ -1980,12 +1980,12 @@ class TextInput:
         return self
 
     def emit(self, event):
-        var count = self._eh_counts[event.type]
+        var count = self._eh_counts.get(event.type)
         if count == none:
             return
         var i = 0
         while i < count:
-            var h = self._event_handlers[event.type + "_" + str(i)]
+            var h = self._event_handlers.get(event.type + "_" + str(i))
             if h != none:
                 h(event)
             i = i + 1
@@ -2338,7 +2338,7 @@ class Checkbox:
         self._event_handlers = {}
 
     def on(self, event, handler):
-        var count = self._eh_counts[event]
+        var count = self._eh_counts.get(event)
         if count == none:
             count = 0
         self._event_handlers[event + "_" + str(count)] = handler
@@ -2346,12 +2346,12 @@ class Checkbox:
         return self
 
     def emit(self, event):
-        var count = self._eh_counts[event.type]
+        var count = self._eh_counts.get(event.type)
         if count == none:
             return
         var i = 0
         while i < count:
-            var h = self._event_handlers[event.type + "_" + str(i)]
+            var h = self._event_handlers.get(event.type + "_" + str(i))
             if h != none:
                 h(event)
             i = i + 1
@@ -2440,7 +2440,7 @@ class Slider:
         self._event_handlers = {}
 
     def on(self, event, handler):
-        var count = self._eh_counts[event]
+        var count = self._eh_counts.get(event)
         if count == none:
             count = 0
         self._event_handlers[event + "_" + str(count)] = handler
@@ -2448,12 +2448,12 @@ class Slider:
         return self
 
     def emit(self, event):
-        var count = self._eh_counts[event.type]
+        var count = self._eh_counts.get(event.type)
         if count == none:
             return
         var i = 0
         while i < count:
-            var h = self._event_handlers[event.type + "_" + str(i)]
+            var h = self._event_handlers.get(event.type + "_" + str(i))
             if h != none:
                 h(event)
             i = i + 1
@@ -2818,7 +2818,7 @@ def gui_widget_h(w):
 # Puts a widget at (x, y) with size (w, h): layouts re-lay themselves out,
 # rect-based widgets get their rect set, others are only moved.
 def gui_place(widget, x, y, w, h):
-    if widget.is_layout == true:
+    if widget?.is_layout == true:
         widget.layout(x, y, w, h)
         return
     widget.set_pos(x, y)
@@ -3811,7 +3811,7 @@ class Dropdown:
         self._event_handlers = {}
 
     def on(self, event, handler):
-        var count = self._eh_counts[event]
+        var count = self._eh_counts.get(event)
         if count == none:
             count = 0
         self._event_handlers[event + "_" + str(count)] = handler
@@ -3819,12 +3819,12 @@ class Dropdown:
         return self
 
     def emit(self, event):
-        var count = self._eh_counts[event.type]
+        var count = self._eh_counts.get(event.type)
         if count == none:
             return
         var i = 0
         while i < count:
-            var h = self._event_handlers[event.type + "_" + str(i)]
+            var h = self._event_handlers.get(event.type + "_" + str(i))
             if h != none:
                 h(event)
             i = i + 1
@@ -4136,7 +4136,7 @@ class Switch:
         self._event_handlers = {}
 
     def on(self, event, handler):
-        var count = self._eh_counts[event]
+        var count = self._eh_counts.get(event)
         if count == none:
             count = 0
         self._event_handlers[event + "_" + str(count)] = handler
@@ -4144,12 +4144,12 @@ class Switch:
         return self
 
     def emit(self, event):
-        var count = self._eh_counts[event.type]
+        var count = self._eh_counts.get(event.type)
         if count == none:
             return
         var i = 0
         while i < count:
-            var h = self._event_handlers[event.type + "_" + str(i)]
+            var h = self._event_handlers.get(event.type + "_" + str(i))
             if h != none:
                 h(event)
             i = i + 1
@@ -4239,7 +4239,7 @@ class RadioButton:
         self._event_handlers = {}
 
     def on(self, event, handler):
-        var count = self._eh_counts[event]
+        var count = self._eh_counts.get(event)
         if count == none:
             count = 0
         self._event_handlers[event + "_" + str(count)] = handler
@@ -4247,12 +4247,12 @@ class RadioButton:
         return self
 
     def emit(self, event):
-        var count = self._eh_counts[event.type]
+        var count = self._eh_counts.get(event.type)
         if count == none:
             return
         var i = 0
         while i < count:
-            var h = self._event_handlers[event.type + "_" + str(i)]
+            var h = self._event_handlers.get(event.type + "_" + str(i))
             if h != none:
                 h(event)
             i = i + 1
@@ -4380,7 +4380,7 @@ class NumberInput:
         self._event_handlers = {}
 
     def on(self, event, handler):
-        var count = self._eh_counts[event]
+        var count = self._eh_counts.get(event)
         if count == none:
             count = 0
         self._event_handlers[event + "_" + str(count)] = handler
@@ -4388,12 +4388,12 @@ class NumberInput:
         return self
 
     def emit(self, event):
-        var count = self._eh_counts[event.type]
+        var count = self._eh_counts.get(event.type)
         if count == none:
             return
         var i = 0
         while i < count:
-            var h = self._event_handlers[event.type + "_" + str(i)]
+            var h = self._event_handlers.get(event.type + "_" + str(i))
             if h != none:
                 h(event)
             i = i + 1
@@ -4525,7 +4525,7 @@ class TextArea:
         self._event_handlers = {}
 
     def on(self, event, handler):
-        var count = self._eh_counts[event]
+        var count = self._eh_counts.get(event)
         if count == none:
             count = 0
         self._event_handlers[event + "_" + str(count)] = handler
@@ -4533,12 +4533,12 @@ class TextArea:
         return self
 
     def emit(self, event):
-        var count = self._eh_counts[event.type]
+        var count = self._eh_counts.get(event.type)
         if count == none:
             return
         var i = 0
         while i < count:
-            var h = self._event_handlers[event.type + "_" + str(i)]
+            var h = self._event_handlers.get(event.type + "_" + str(i))
             if h != none:
                 h(event)
             i = i + 1
@@ -6005,7 +6005,7 @@ class DataTable:
         var key = self.columns[col_index]["key"]
         var picked = self.get_selected()
         def cell_key(row):
-            var v = row[key]
+            var v = row.get(key)
             if v == none:
                 return ""
             if isinstance(v, "int") or isinstance(v, "float"):
@@ -6309,7 +6309,7 @@ class RangeSlider:
         self._event_handlers = {}
 
     def on(self, event, handler):
-        var count = self._eh_counts[event]
+        var count = self._eh_counts.get(event)
         if count == none:
             var count = 0
         self._event_handlers[event + "_" + str(count)] = handler
@@ -6317,12 +6317,12 @@ class RangeSlider:
         return self
 
     def emit(self, event):
-        var count = self._eh_counts[event.type]
+        var count = self._eh_counts.get(event.type)
         if count == none:
             return
         var i = 0
         while i < count:
-            var h = self._event_handlers[event.type + "_" + str(i)]
+            var h = self._event_handlers.get(event.type + "_" + str(i))
             if h != none:
                 h(event)
             i = i + 1
@@ -6775,7 +6775,7 @@ class TagInput:
         self._event_handlers = {}
 
     def on(self, event, handler):
-        var count = self._eh_counts[event]
+        var count = self._eh_counts.get(event)
         if count == none:
             var count = 0
         self._event_handlers[event + "_" + str(count)] = handler
@@ -6783,12 +6783,12 @@ class TagInput:
         return self
 
     def emit(self, event):
-        var count = self._eh_counts[event.type]
+        var count = self._eh_counts.get(event.type)
         if count == none:
             return
         var i = 0
         while i < count:
-            var h = self._event_handlers[event.type + "_" + str(i)]
+            var h = self._event_handlers.get(event.type + "_" + str(i))
             if h != none:
                 h(event)
             i = i + 1
@@ -8130,7 +8130,7 @@ class StatusBar:
         while i < self.left_count:
             var item = self.left_items[i]
             var full = item["text"]
-            if item["icon"] != "" and item["icon"] != none:
+            if item.get("icon") != "" and item.get("icon") != none:
                 full = item["icon"] + " " + full
             renderer.draw_text(full, lx, bar_y + int((self.h - 12) / 2), self.font, self.theme.text_secondary)
             lx = lx + len(full) * 7 + 16
@@ -8142,7 +8142,7 @@ class StatusBar:
         while i >= 0:
             var item = self.right_items[i]
             var full = item["text"]
-            if item["icon"] != "" and item["icon"] != none:
+            if item.get("icon") != "" and item.get("icon") != none:
                 full = item["icon"] + " " + full
             rx = rx - len(full) * 7
             renderer.draw_text(full, rx, bar_y + int((self.h - 12) / 2), self.font, self.theme.text_secondary)
@@ -8537,7 +8537,7 @@ class ListView:
                     self._render_item(renderer, item, self.rect.x, iy, self.rect.w, self.item_h, sel)
                 else:
                     var tx = self.rect.x + 12
-                    var sub = item["subtitle"]
+                    var sub = item.get("subtitle")
                     var ty = iy + int((self.item_h - fh) / 2)
                     if sub != "" and sub != none:
                         ty = iy + 6
@@ -8726,7 +8726,7 @@ class FloatingActionButton:
         self._event_handlers = {}
 
     def on(self, event, handler):
-        var count = self._eh_counts[event]
+        var count = self._eh_counts.get(event)
         if count == none:
             var count = 0
         self._event_handlers[event + "_" + str(count)] = handler
@@ -8734,12 +8734,12 @@ class FloatingActionButton:
         return self
 
     def emit(self, event):
-        var count = self._eh_counts[event.type]
+        var count = self._eh_counts.get(event.type)
         if count == none:
             return
         var i = 0
         while i < count:
-            var h = self._event_handlers[event.type + "_" + str(i)]
+            var h = self._event_handlers.get(event.type + "_" + str(i))
             if h != none:
                 h(event)
             i = i + 1
@@ -9676,7 +9676,7 @@ class CalendarWidget:
 
     def has_event(self, day):
         var key = str(self.year) + "-" + str(self.month) + "-" + str(day)
-        return self.events[key] != none
+        return self.events.get(key) != none
 
     def on_select(self, fn):
         self._on_select = fn
@@ -11353,7 +11353,7 @@ class GradientButton:
         self._event_handlers = {}
 
     def on(self, event, handler):
-        var count = self._eh_counts[event]
+        var count = self._eh_counts.get(event)
         if count == none:
             var count = 0
         self._event_handlers[event + "_" + str(count)] = handler
@@ -11361,12 +11361,12 @@ class GradientButton:
         return self
 
     def emit(self, event):
-        var count = self._eh_counts[event.type]
+        var count = self._eh_counts.get(event.type)
         if count == none:
             return
         var i = 0
         while i < count:
-            var h = self._event_handlers[event.type + "_" + str(i)]
+            var h = self._event_handlers.get(event.type + "_" + str(i))
             if h != none:
                 h(event)
             i = i + 1
@@ -13347,7 +13347,7 @@ class CommandBar:
                 var item = self.left_items[li]
                 var iw = len(item["label"]) * 7 + 28
                 var ir = Rect(lx, 8, iw, self.h - 16)
-                if ir.contains(event.x, event.y) and item["action"] != none:
+                if ir.contains(event.x, event.y) and item.get("action") != none:
                     var ev = Event("click")
                     item["action"](ev)
                     event.consume()
@@ -13361,7 +13361,7 @@ class CommandBar:
                 var iw = len(item["label"]) * 7 + 32
                 rx = rx - iw
                 var ir = Rect(rx, 8, iw, self.h - 16)
-                if ir.contains(event.x, event.y) and item["action"] != none:
+                if ir.contains(event.x, event.y) and item.get("action") != none:
                     var ev = Event("click")
                     item["action"](ev)
                     event.consume()
@@ -14091,7 +14091,7 @@ class FileTree:
                     parent_path = parent_path + "/"
                 parent_path = parent_path + parts[i]
                 i = i + 1
-            var parent = self._nodes_by_path[parent_path]
+            var parent = self._nodes_by_path.get(parent_path)
             if parent != none:
                 parent.add_child(node)
         return self

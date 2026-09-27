@@ -520,7 +520,8 @@ check("time.strftime()", time.strftime("%Y", 0, true), "1970")
 var tm0 = time.monotonic()
 time.sleep(0.05)
 check("time.sleep() / time.monotonic()", time.monotonic() - tm0 >= 0.04, true)
-check("attribute of a plain builtin", len.nope, none)
+check("attribute of a plain builtin", getattr(len, "nope", none), none)
+check("attribute of a plain builtin raises", hasattr(len, "nope"), false)
 
 # ── lib/os.ny ───────────────────────────────────────────────────────────────
 var P = Path()
