@@ -53,7 +53,7 @@ VMVal ret_to_vm(const nyconc::Ret& r) {
 }
 
 VMVal exception_instance(const std::string& type, const std::string& msg) {
-    auto attrs = std::make_shared<VMMap>();
+    auto attrs = std::make_shared<VMMap>(); vmgc::track_map(attrs);
     (*attrs)["msg"] = VMVal::make_str(msg);
     (*attrs)["args"] = VMVal::make_list({VMVal::make_str(msg)});
     return VMVal::make_instance(type, attrs);

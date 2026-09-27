@@ -48,7 +48,20 @@
 // ════════════════════════════════════════════════════════════════════════════
 namespace {
 
-struct InterpBox : nyconc::Box { Value v; explicit InterpBox(const Value& x) : v(x) {} };
+struct InterpBox : nyconc::Box {
+    Value v;
+    explicit InterpBox(const Value& x) : v(x) {}
+    // Reference counts are only touched with the GIL held (NyGC.hpp). A box
+    // released by a thread in a blocking wait hands its reference to the
+    // next safe point instead.
+    ~InterpBox() override {
+        if (v.value.o && !nyconc::holds_gil()) {
+            nython::gc::Collectable* o = v.value.o;
+            v.value.o = nullptr;
+            nygc::release_later(o);
+        }
+    }
+};
 
 static Value unbox_value(const nyconc::BoxPtr& b) {
     auto* ib = dynamic_cast<InterpBox*>(b.get());
@@ -79,6 +92,7 @@ struct InterpEngine : nyconc::Engine {
             // Construct through the ordinary call path: bind callee and args to
             // names in a scratch scope and evaluate `callee(a0, a1, ...)`.
             Context* scope = new Context(E.runner, "<native-call>", nullptr, nullptr, E.globalContext());
+            NythonExecutor::CtxReaper scope_creator(&E, scope);
             Token t(TokenIdent{}, "__ny_callee");
             auto call = std::make_shared<CallNode>(t, std::make_shared<VariableNode>(t));
             scope->defineByName("__ny_callee", f);

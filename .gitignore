@@ -1,4 +1,5 @@
 build/
+build-asan/
 ny_test
 __pycache__/
 *.pyc

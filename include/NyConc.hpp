@@ -126,6 +126,9 @@ inline void tick() {
     if (__builtin_expect(g_gil_waiters.load(std::memory_order_relaxed) != 0, 0)) tick_slow();
 }
 bool active();                              // true once a second thread exists
+// True when this thread may touch engine values: it holds the GIL, or there
+// is no GIL yet (one thread).
+bool holds_gil();
 // Release the GIL around a blocking native operation (no-op when inactive or
 // not held). The operation must not touch engine state while released.
 struct GilRelease {

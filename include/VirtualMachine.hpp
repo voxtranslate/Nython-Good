@@ -59,6 +59,7 @@
 #include "GarbageCollector.hpp"
 #include "ASTNodes.hpp"
 #include "Context.hpp"
+#include "NyGC.hpp"     // rss_kb (round 75)
 
 using nython::Runnable;
 using nython::kernel::Value;
@@ -138,6 +139,9 @@ struct VMVal;
 // dict iterates in the order its keys were added (as in Python).
 using VMMap = nypy::OrderedMap<VMVal>;
 using NativeFunc = std::function<struct VMVal(std::vector<struct VMVal>&)>;
+} // namespace nython::vm
+#include "VMGC.hpp"   // cycle collection for the containers below (round 75)
+namespace nython::vm {
 
 struct VMVal {
     VMType type = VMType::NONE;
@@ -145,15 +149,16 @@ struct VMVal {
     int64_t i   = 0;
     double  d   = 0.0;
     std::string s;
-    std::shared_ptr<std::vector<VMVal>>                        list;
-    std::shared_ptr<VMMap>     map;
+    // Container pointers free deep structures iteratively (VMGC.hpp).
+    vmgc::DeepPtr<std::vector<VMVal>>                          list;
+    vmgc::DeepPtr<VMMap>       map;
     std::shared_ptr<VMCode>                                    code;
     NativeFunc                                                 native;
-    std::shared_ptr<std::pair<int,std::vector<VMVal>>>         iter;
-    std::shared_ptr<struct GenState>                           gen;
+    vmgc::DeepPtr<std::pair<int,std::vector<VMVal>>>           iter;
+    vmgc::DeepPtr<struct GenState>                             gen;
     std::string class_name;
     // Closure environment: captured variables from enclosing scope
-    std::shared_ptr<VMMap>     closure_env;
+    vmgc::DeepPtr<VMMap>       closure_env;
 
     // A LIST with b == true is a tuple: immutable, printed with parentheses,
     // never equal to a list, hashable as a dict key. An INT whose s is not
@@ -178,11 +183,15 @@ struct VMVal {
     static VMVal make_str(std::string v)  { VMVal x; x.type=VMType::STRING;x.s=std::move(v); return x; }
     static VMVal make_list(std::vector<VMVal> items={}) {
         VMVal x; x.type=VMType::LIST;
-        x.list=std::make_shared<std::vector<VMVal>>(std::move(items)); return x;
+        x.list=std::make_shared<std::vector<VMVal>>(std::move(items));
+        vmgc::track_list(x.list);
+        return x;
     }
     static VMVal make_map() {
         VMVal x; x.type=VMType::MAP;
-        x.map=std::make_shared<VMMap>(); return x;
+        x.map=std::make_shared<VMMap>();
+        vmgc::track_map(x.map);
+        return x;
     }
     static VMVal make_func(std::shared_ptr<VMCode> c) {
         VMVal x; x.type=VMType::FUNCTION; x.code=c; return x;
@@ -199,7 +208,9 @@ struct VMVal {
     }
     static VMVal make_iter(std::vector<VMVal> items) {
         VMVal x; x.type=VMType::ITERATOR;
-        x.iter=std::make_shared<std::pair<int,std::vector<VMVal>>>(0,std::move(items)); return x;
+        x.iter=std::make_shared<std::pair<int,std::vector<VMVal>>>(0,std::move(items));
+        vmgc::track_iter(x.iter);
+        return x;
     }
 
     bool is_truthy() const {
@@ -1933,6 +1944,7 @@ inline VMVal make_generator_val(std::shared_ptr<VMCode> code,
                             std::shared_ptr<VMMap> closure=nullptr) {
     VMVal g; g.type=VMType::GENERATOR;
     g.gen=std::make_shared<GenState>();
+    vmgc::track_gen(g.gen);
     g.gen->code=code; g.gen->ip=0; g.gen->self_val=self; g.gen->closure=closure;
     int n=(int)code->param_names.size();
     int arg_idx=0;
@@ -2014,7 +2026,7 @@ struct VMException : std::runtime_error {
 enum { FIN_K_NORMAL=0, FIN_K_RETURN=1, FIN_K_JUMP=2, FIN_K_EXC=3 };
 inline VMVal make_fin_state(int kind, VMVal payload=VMVal::make_none(), int target=-1){
     VMVal v; v.type=VMType::UNDEFINED; v.s="__fin__"; v.i=kind; v.d=(double)target;
-    v.list=std::make_shared<std::vector<VMVal>>(); v.list->push_back(std::move(payload));
+    v.list=std::make_shared<std::vector<VMVal>>(); vmgc::track_list(v.list); v.list->push_back(std::move(payload));
     return v;
 }
 inline bool is_fin_state(const VMVal& v){ return v.type==VMType::UNDEFINED && v.s=="__fin__" && v.list; }
@@ -2245,6 +2257,7 @@ public:
         tag_type_builtins();      // again: register_pycore replaced the tagged ones
         wrap_iterable_natives();  // after the tensor and pycore natives, so it wraps those
         VMConc::install(*this);   // last: its GIL-aware sleep natives win
+        register_gc_natives();
     }
     // Builtins that consume an iterable get its items first when it is a
     // generator, an iterator, or an object with __iter__/__getitem__ -
@@ -2318,7 +2331,117 @@ public:
         }
     }
 
-    ~VirtualMachine() override = default;
+    ~VirtualMachine() override { gc_teardown(); }
+
+    // ── Memory (round 75, VMGC.hpp) ──────────────────────────────────────
+    bool vm_finalizers_off_ = false;
+    std::unordered_map<std::string, bool> has_del_cache_;
+    // The field map of a new instance: one whose class (or a base) defines
+    // __del__ is owned through the finalizing deleter.
+    std::shared_ptr<VMMap> new_instance_fields(const std::string& cls) {
+        auto it = has_del_cache_.find(cls);
+        bool has_del;
+        if (it != has_del_cache_.end()) has_del = it->second;
+        else { VMVal m; has_del = class_lookup(cls, "__del__", m); has_del_cache_[cls] = has_del; }
+        if (has_del && !vm_finalizers_off_) return vmgc::new_finalizable_map(cls);
+        auto attrs = std::make_shared<VMMap>();
+        vmgc::track_map(attrs);
+        return attrs;
+    }
+    // __del__ on an instance, at a safe point; an exception it raises is
+    // reported and ignored, as in Python.
+    void gc_run_finalizer(const std::string& cls, const std::shared_ptr<VMMap>& attrs) {
+        if (vm_finalizers_off_) return;
+        VMVal m;
+        if (!class_lookup(cls, "__del__", m)) return;
+        VMVal inst = VMVal::make_instance(cls, attrs);
+        VMVal saved_exc = last_exception_obj_;
+        std::vector<VMVal> no_args;
+        try { invoke_method(m, inst, no_args, cls); }
+        catch (std::exception& e) {
+            std::cerr << "Exception ignored in: <function " << cls << ".__del__>\n" << e.what() << "\n";
+        }
+        catch (...) {}
+        last_exception_obj_ = saved_exc;
+    }
+    // Teardown: drop the program's roots so reference counting and a last
+    // collection free its objects (no finalizer runs, as on the interpreter).
+    void gc_teardown() {
+        vmgc::safe_point(*this);       // __del__ of what the last statement released
+        vm_finalizers_off_ = true;
+        bool saved = vmgc::g_shutdown;
+        vmgc::g_shutdown = true;       // a dying __del__ instance is just freed
+        {
+            VMMap g; g.swap(globals_);
+            std::unordered_map<std::string, VMMap> cv; cv.swap(class_vars_);
+            std::vector<VMVal> st; st.swap(stack_);
+            std::deque<CallFrame> cs; cs.swap(call_stack_);
+            VMVal le; std::swap(le, last_exception_obj_);
+        }
+        vmgc::g_shutdown = false;
+        vmgc::collect(*this, 2);
+        vmgc::g_shutdown = saved;
+    }
+    void register_gc_natives() {
+        auto I = [](int64_t v) { return VMVal::make_int(v); };
+        globals_["gc_collect"] = VMVal::make_native([this, I](std::vector<VMVal>& a) -> VMVal {
+            int g = (!a.empty() && a[0].type == VMType::INT) ? (int)a[0].i : 2;
+            vmgc::safe_point(*this);
+            long n = vmgc::collect(*this, g);
+            vmgc::safe_point(*this);
+            // Values the builtin bridge made on the interpreter's heap.
+            if (nygc::tracked_objects() > 0) nygc::collect(g);
+            return I(n);
+        });
+        // weakref(obj): a callable giving the instance back while it is
+        // alive, none afterwards (instances only, as on the interpreter).
+        globals_["weakref"] = VMVal::make_native([this](std::vector<VMVal>& a) -> VMVal {
+            if (a.empty() || a[0].type != VMType::INSTANCE || !a[0].map)
+                throw_exception(make_exception("TypeError", {VMVal::make_str("cannot create weak reference to '"
+                    + (a.empty() ? std::string("NoneType") : vm_type_name(a[0])) + "' object")}));
+            std::weak_ptr<VMMap> w = a[0].map;
+            std::string cn = a[0].class_name;
+            return VMVal::make_native([w, cn](std::vector<VMVal>&) -> VMVal {
+                auto sp = w.lock();
+                if (!sp) return VMVal::make_none();
+                return VMVal::make_instance(cn, sp);
+            });
+        });
+        globals_["gc_enable"] = VMVal::make_native([](std::vector<VMVal>&) -> VMVal { vmgc::set_enabled(true); return VMVal::make_none(); });
+        globals_["gc_disable"] = VMVal::make_native([](std::vector<VMVal>&) -> VMVal { vmgc::set_enabled(false); return VMVal::make_none(); });
+        globals_["gc_is_enabled"] = VMVal::make_native([](std::vector<VMVal>&) -> VMVal { return VMVal::make_bool(vmgc::is_enabled()); });
+        globals_["gc_isenabled"] = globals_["gc_is_enabled"];
+        globals_["gc_live_objects"] = VMVal::make_native([I](std::vector<VMVal>&) -> VMVal { return I(vmgc::live_objects()); });
+        globals_["gc_set_threshold"] = VMVal::make_native([](std::vector<VMVal>& a) -> VMVal {
+            for (size_t i = 0; i < a.size() && i < 3; i++) if (a[i].type == VMType::INT) vmgc::set_threshold((int)i, (long)a[i].i);
+            return VMVal::make_none();
+        });
+        globals_["gc_get_threshold"] = VMVal::make_native([I](std::vector<VMVal>&) -> VMVal {
+            return VMVal::make_tuple({I(vmgc::threshold(0)), I(vmgc::threshold(1)), I(vmgc::threshold(2))});
+        });
+        globals_["gc_stats"] = VMVal::make_native([I](std::vector<VMVal>&) -> VMVal {
+            auto st = vmgc::stats();
+            VMVal m = VMVal::make_map();
+            auto key = [](const std::string& k) { return nypy::key_of_str(k); };
+            long long coll = st.collections[0] + st.collections[1] + st.collections[2];
+            (*m.map)[key("engine")] = VMVal::make_str("vm");
+            (*m.map)[key("enabled")] = VMVal::make_bool(vmgc::is_enabled());
+            (*m.map)[key("collections")] = I(coll);
+            (*m.map)[key("collections_per_gen")] = VMVal::make_list({I(st.collections[0]), I(st.collections[1]), I(st.collections[2])});
+            (*m.map)[key("collected")] = I(st.collected);
+            (*m.map)[key("uncollectable")] = I(st.uncollectable);
+            (*m.map)[key("finalized")] = I(st.finalized);
+            (*m.map)[key("tracked")] = I(st.gen_count[0] + st.gen_count[1] + st.gen_count[2]);
+            (*m.map)[key("gen0")] = I(st.gen_count[0]);
+            (*m.map)[key("gen1")] = I(st.gen_count[1]);
+            (*m.map)[key("gen2")] = I(st.gen_count[2]);
+            (*m.map)[key("live_objects")] = I(vmgc::live_objects());
+            (*m.map)[key("rss_kb")] = I(nygc::rss_kb());
+            return m;
+        });
+        globals_["mem_rss_kb"] = VMVal::make_native([I](std::vector<VMVal>&) -> VMVal { return I(nygc::rss_kb()); });
+        globals_["mem_peak_rss_kb"] = VMVal::make_native([I](std::vector<VMVal>&) -> VMVal { return I(nygc::peak_rss_kb()); });
+    }
 
     // Compile + run an AST
     VMResult run(nython::node::node_ptr ast) {
@@ -2462,7 +2585,7 @@ public:
     // builtins): the same instance and runtime_error an Op::RAISE of
     // Type(msg) produces, so it takes the VM's normal raise path.
     [[noreturn]] void raise_native_exception(const std::string& type, const std::string& msg) {
-        auto attrs=std::make_shared<VMMap>();
+        auto attrs=std::make_shared<VMMap>(); vmgc::track_map(attrs);
         (*attrs)["msg"]=VMVal::make_str(msg);
         (*attrs)["args"]=VMVal::make_list(std::vector<VMVal>{VMVal::make_str(msg)});
         last_exception_obj_=VMVal::make_instance(type.empty()?std::string("Exception"):type, attrs);
@@ -3024,7 +3147,7 @@ private:
         return false;
     }
     VMVal instantiate(const VMVal& cls, std::vector<VMVal>& args, const VMVal* kwargs=nullptr) {
-        auto attrs=std::make_shared<VMMap>();
+        auto attrs=new_instance_fields(cls.class_name);
         VMVal inst=VMVal::make_instance(cls.class_name,attrs);
         if(!class_reg_.count(cls.class_name)&&cls.code) class_reg_[cls.class_name]=cls.code;
         // An exception's args are the constructor's arguments whatever its
@@ -3044,7 +3167,7 @@ private:
         bool outer_fn = outer.code && outer.code->name!="<module>" && !outer.code->is_class;
         if(outer_fn){
             // Methods of a class defined in a function close over it.
-            if(!outer.closure_env) outer.closure_env=std::make_shared<VMMap>(outer.locals);
+            if(!outer.closure_env){ outer.closure_env=std::make_shared<VMMap>(outer.locals); vmgc::track_map(outer.closure_env); }
             else for(auto& kv:outer.locals) if(!outer.closure_env->count(kv.first)) (*outer.closure_env)[kv.first]=kv.second;
             if(outer.self_val && !outer.closure_env->count("self")) (*outer.closure_env)["self"]=*outer.self_val;
             cf.closure_env=outer.closure_env;
@@ -3066,6 +3189,8 @@ private:
         // (`fr`) stay valid because deque elements never move.
         nyconc::tick();
         while(true){
+            // Queued __del__ calls and due cycle collections (one load).
+            vmgc::safe_point(*this);
             CallFrame& fr=call_stack_.back();
             if(fr.ip>=(int)fr.code->instructions.size()) return VMVal::make_none();
             const Instruction& ins=fr.code->instructions[fr.ip++];
@@ -3135,7 +3260,7 @@ private:
                 VMVal proxy;
                 proxy.type=VMType::SUPER_PROXY;
                 proxy.s=cur_cls;
-                proxy.list=std::make_shared<std::vector<VMVal>>();
+                proxy.list=std::make_shared<std::vector<VMVal>>(); vmgc::track_list(proxy.list);
                 proxy.list->push_back(self_v);
                 push(proxy);
                 break;
@@ -3370,6 +3495,7 @@ private:
                 if(n_defs>0 && fn_val.code){
                     auto& fc=*fn_val.code;
                     auto d=std::make_shared<std::vector<VMVal>>(fc.param_defaults);
+                    vmgc::track_list(d);
                     d->resize(fc.param_names.size(), VMVal{VMType::UNDEFINED});
                     for(int i=0;i<n_defs && i<(int)fc.default_idx.size();i++){
                         int pi=fc.default_idx[i];
@@ -3384,6 +3510,7 @@ private:
                     // so ALL inner functions share the SAME cell for mutable variables
                     if(!fr.closure_env){
                         fr.closure_env = std::make_shared<VMMap>(fr.locals);
+                        vmgc::track_map(fr.closure_env);
                     } else {
                         // Sync any new locals into the shared closure_env
                         for(auto& kv : fr.locals)
@@ -3404,6 +3531,7 @@ private:
                 auto sub=fr.code->sub_codes[ins.arg];
                 class_reg_[sub->name]=sub;
                 mro_cache_.clear();
+                has_del_cache_.clear();
                 class_vars_[sub->name]=run_class_body(sub, fr);
                 if(is_exception_class(sub->name)) vm_exc_classes().insert(sub->name);
                 else vm_exc_classes().erase(sub->name);
@@ -3884,7 +4012,7 @@ private:
     // A new instance of builtin exception class `type` with the given args.
     VMVal make_exception(const std::string& type, std::vector<VMVal> args) {
         if(!class_reg_.count(type)) vm_exc_classes().insert(type);
-        auto attrs=std::make_shared<VMMap>();
+        auto attrs=std::make_shared<VMMap>(); vmgc::track_map(attrs);
         std::string msg = args.size()==1 ? args[0].to_string() : std::string();
         (*attrs)["args"]=VMVal::make_list(std::move(args));
         (*attrs)["msg"]=VMVal::make_str(msg);
@@ -3979,7 +4107,7 @@ private:
         }
         if(c=='{') {
             // Parse object
-            auto map=std::make_shared<VMMap>();
+            auto map=std::make_shared<VMMap>(); vmgc::track_map(map);
             pos++;
             while(pos<s.size()){
                 while(pos<s.size()&&(s[pos]==' '||s[pos]=='\t'||s[pos]=='\r'||s[pos]=='\n')) pos++;
@@ -4693,7 +4821,7 @@ private:
             if(args.size()==2&&args[0].type==VMType::CLASS){
                 VMVal proxy=callee;
                 proxy.s=args[0].class_name;
-                proxy.list=std::make_shared<std::vector<VMVal>>();
+                proxy.list=std::make_shared<std::vector<VMVal>>(); vmgc::track_list(proxy.list);
                 proxy.list->push_back(args[1]);
                 return proxy;
             }
@@ -5263,7 +5391,7 @@ private:
             globals_["__file__"]=prev_file;
             export_to_globals_=old_exp; export_depth_=old_depth;
             if(!alias.empty()){
-                auto ns=std::make_shared<VMMap>();
+                auto ns=std::make_shared<VMMap>(); vmgc::track_map(ns);
                 for(const auto& n : own_names){
                     auto it=globals_.find(n);
                     if(it!=globals_.end()){ (*ns)[n]=it->second; continue; }
@@ -5385,7 +5513,7 @@ private:
                 } catch (nt::Error& e) {
                     // A typed instance, so `except ValueError as e:` matches
                     // (a bare runtime_error only reaches untyped handlers).
-                    auto attrs = std::make_shared<VMMap>();
+                    auto attrs = std::make_shared<VMMap>(); vmgc::track_map(attrs);
                     (*attrs)["msg"] = VMVal::make_str(e.msg);
                     (*attrs)["args"] = VMVal::make_list({VMVal::make_str(e.msg)});
                     last_exception_obj_ = VMVal::make_instance(e.type, attrs);
@@ -5469,7 +5597,7 @@ private:
             double v=a.empty()?0:to_d(a[0]); return VMVal::make_float(v*std::tanh(std::log(1+std::exp(v))));});
         // ── device_info() ─────────────────────────────────────────────────────
         globals_["device_info"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            auto m=std::make_shared<VMMap>();
+            auto m=std::make_shared<VMMap>(); vmgc::track_map(m);
             (*m)["backend"]=VMVal::make_str("cpu");
             (*m)["cpu_cores"]=VMVal::make_int((int64_t)std::max(1u,std::thread::hardware_concurrency()));
             (*m)["gpu_available"]=VMVal::make_bool(false);
@@ -5488,7 +5616,7 @@ private:
             std::sort(iv.begin(),iv.end(),[](auto& a,auto& b){return a.first>b.first;});
             std::vector<VMVal> r;
             for(int i=0;i<k;i++){
-                auto m=std::make_shared<VMMap>();
+                auto m=std::make_shared<VMMap>(); vmgc::track_map(m);
                 (*m)["value"]=VMVal::make_float(iv[i].first);
                 (*m)["index"]=VMVal::make_int(iv[i].second);
                 VMVal entry; entry.type=VMType::MAP; entry.map=m; r.push_back(entry);}
@@ -5805,7 +5933,7 @@ private:
                 if(!seen.count(k)){seen.insert(k);r.push_back(v);}}
             return VMVal::make_list(std::move(r));});
         globals_["dict"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            auto m=std::make_shared<VMMap>();
+            auto m=std::make_shared<VMMap>(); vmgc::track_map(m);
             if(!a.empty()&&a[0].type==VMType::LIST&&a[0].list){
                 for(auto& item:vm_arg_list(a,0)){
                     if(item.type==VMType::LIST&&item.list&&item.list->size()>=2)
@@ -6646,13 +6774,13 @@ private:
                 // property() builtin — create a property descriptor
         globals_["property"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             VMVal desc; desc.type=VMType::MAP;
-            desc.map=std::make_shared<VMMap>();
+            desc.map=std::make_shared<VMMap>(); vmgc::track_map(desc.map);
             if(!a.empty()) (*desc.map)["__get__"]=a[0];
             (*desc.map)["__is_property__"]=VMVal::make_bool(true);
             // Add .setter(fn) method to the descriptor so @prop.setter works:
             (*desc.map)["setter"]=VMVal::make_native([desc](std::vector<VMVal>& b) mutable ->VMVal{
                 VMVal d2; d2.type=VMType::MAP;
-                d2.map=std::make_shared<VMMap>(*desc.map);
+                d2.map=std::make_shared<VMMap>(*desc.map); vmgc::track_map(d2.map);
                 if(!b.empty()) (*d2.map)["__set__"]=b[0];
                 (*d2.map)["setter"]=(*desc.map)["setter"]; // keep setter method
                 return d2;

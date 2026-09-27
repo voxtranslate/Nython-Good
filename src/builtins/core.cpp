@@ -455,7 +455,12 @@ Value dispatch_core(NythonExecutor& E,
                 // segfaulted: items("abc"), keys("abc") and values("abc") all
                 // crashed the process.
                 if (!cont && args[0].type == ValueType::USERDATA && !isStringValue(args[0]))
-                    cont = dynamic_cast<Container*>(static_cast<Collectable*>(args[0].value.p));
+                {
+                    // An instance's fields (value.p is its identity, not a
+                    // Collectable: casting it read a bogus vtable).
+                    auto pit = instance_properties.find(args[0].value.p);
+                    if (pit != instance_properties.end()) cont = pit->second;
+                }
                 if (cont && cont->container) {
                     auto* list = new Object(static_cast<Runnable*>(runner), "list", Type::LIST);
                     int idx = 0;
@@ -479,7 +484,12 @@ Value dispatch_core(NythonExecutor& E,
                 // segfaulted: items("abc"), keys("abc") and values("abc") all
                 // crashed the process.
                 if (!cont && args[0].type == ValueType::USERDATA && !isStringValue(args[0]))
-                    cont = dynamic_cast<Container*>(static_cast<Collectable*>(args[0].value.p));
+                {
+                    // An instance's fields (value.p is its identity, not a
+                    // Collectable: casting it read a bogus vtable).
+                    auto pit = instance_properties.find(args[0].value.p);
+                    if (pit != instance_properties.end()) cont = pit->second;
+                }
                 if (cont && cont->container) {
                     auto* list = new Object(static_cast<Runnable*>(runner), "list", Type::LIST);
                     int idx = 0;
@@ -503,7 +513,12 @@ Value dispatch_core(NythonExecutor& E,
                 // segfaulted: items("abc"), keys("abc") and values("abc") all
                 // crashed the process.
                 if (!cont && args[0].type == ValueType::USERDATA && !isStringValue(args[0]))
-                    cont = dynamic_cast<Container*>(static_cast<Collectable*>(args[0].value.p));
+                {
+                    // An instance's fields (value.p is its identity, not a
+                    // Collectable: casting it read a bogus vtable).
+                    auto pit = instance_properties.find(args[0].value.p);
+                    if (pit != instance_properties.end()) cont = pit->second;
+                }
                 if (cont && cont->container) {
                     auto* list = new Object(static_cast<Runnable*>(runner), "list", Type::LIST);
                     int idx = 0;

@@ -75,6 +75,8 @@ Object* Value::operator->() {
 
 void Value::SetNone(){
 	value.gc = nullptr;
+	value.p  = nullptr;
+	value.release();
 	type     = ValueType::NONE;
 }
 

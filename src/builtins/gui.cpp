@@ -1552,6 +1552,7 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
         if(!empty_list){
             empty_list=new Object((Runnable*)E.runner,"events",Type::LIST);
             empty_list->set("__len__",Value(0));
+            nygc::incref(empty_list);   // this pointer is a reference too: never freed
         }
         int handle = args.empty() ? -1 : VI(args[0]);
         bool wait = name=="gui_wait_events" && !has_events_for(handle);

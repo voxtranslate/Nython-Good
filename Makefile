@@ -114,7 +114,7 @@ CLI_OBJS       = $(OBJDIR)/main_cli.o $(COMMON_OBJS)
 CLI_TARGET     = build/nython-cli$(EXE)
 CLI_CXXFLAGS   = $(BASE_CXXFLAGS) -DNYTHON_WITH_IDE=0
 
-.PHONY: all ide cli clean help
+.PHONY: all ide cli clean help asan
 
 # ── Default: IDE build ──────────────────────────────────────────────
 all: ide
@@ -161,13 +161,23 @@ $(OBJDIR)/sdl3_stub.o: $(STUB_SRC)
 
 -include $(COMMON_OBJS:.o=.d) $(OBJDIR)/main_ide.d $(OBJDIR)/main_cli.d
 
+# ── Sanitizer build (round 75) ─────────────────────────────────────
+# AddressSanitizer (use-after-free, double free, overflows) + LeakSanitizer
+# (leaks at exit) + UBSan, in its own tree so it never mixes with the normal
+# objects:  make asan  ->  build-asan/nython-cli
+#   ASAN_OPTIONS=detect_leaks=1 build-asan/nython-cli examples/vm_audit55.ny
+# UBSan reports and continues ("runtime error:" lines); grep the output.
+ASAN_CXXOPT = -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
+asan:
+	$(MAKE) cli OBJDIR=build-asan/obj CLI_TARGET=build-asan/nython-cli CXXOPT="$(ASAN_CXXOPT)"
+
 # ── Directories ────────────────────────────────────────────────────
 build:
 	mkdir -p build
 
 # ── Clean ──────────────────────────────────────────────────────────
 clean:
-	rm -rf build
+	rm -rf build build-asan
 
 # ── Help ───────────────────────────────────────────────────────────
 help:
@@ -177,6 +187,7 @@ help:
 	@echo "  make          Build IDE version → build/nython"
 	@echo "  make ide      Same as above"
 	@echo "  make cli      Build CLI version → build/nython-cli"
+	@echo "  make asan     ASan+UBSan+LSan CLI build → build-asan/nython-cli"
 	@echo "  make clean    Remove all build artifacts"
 	@echo ""
 	@echo "  SDL3 is always required:"
