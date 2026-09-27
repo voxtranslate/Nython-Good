@@ -149,6 +149,28 @@ def test_metrics_and_normalisation():
     assert sum(d) == 200 and min(d) >= 0
 
 
+
+def test_flickr_caption_detokenisation():
+    cases = {"The dog 's mouth is open .": "The dog's mouth is open.",
+             'a sign reading " HOMELESS HELPS " near a site .': 'A sign reading "HOMELESS HELPS" near a site.',
+             "Two dogs ( one black ) play , outside .": "Two dogs (one black) play, outside.",
+             "It is n't here .": "It isn't here.", "a cyclist": "A cyclist"}
+    for src, want in cases.items():
+        got = K.detok_caption(src)
+        assert got == want, (src, got)
+        assert K.detok_caption(got) == got  # idempotent (cached manifests are re-detokenised on load)
+
+
+def test_route_mbr_same_route_candidates_share_one_vote():
+    # two cascade candidates that agree with each other must not out-vote a direct route they disagree with
+    direct = ["the man walks to the market"]
+    casc = ["a woman sings in the church", "a woman sings in the church"]
+    _, r_old, _ = K.route_mbr({"direct": direct, "cascade": [casc[0]], "cascade_ctc": [casc[1]]})
+    assert r_old != "direct"  # the old 3-route layout handed the cascade a 100-chrF self-vote
+    u_d = K.route_mbr({"direct": direct, "cascade": casc}, selectable=["direct"])[2]
+    u_c = K.route_mbr({"direct": direct, "cascade": casc}, selectable=["cascade"])[2]
+    assert abs(u_d - u_c) < 1e-6, (u_d, u_c)  # one vote each: the two routes are now symmetric
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

@@ -298,7 +298,6 @@ class DataConfig:
     # optional Kaggle datasets {logical_name: "owner/slug"} mounted with kagglehub and searched too
     kaggle_slugs: Dict[str, str] = field(default_factory=dict)
     # ---- sizes / filters ------------------------------------------------------------------
-    sample_rate: int = 16000
     min_dur: float = 0.6
     max_dur: float = 20.0                  # longest utterance used for TRAINING / pseudo-labelling
     eval_max_dur: float = 30.0             # longest utterance kept at all (Whisper's 30 s window)
@@ -686,6 +685,21 @@ def ctc_text(s: str) -> str:
 def tts_text(s: str) -> str:
     """TTS / alignment text: canonical characters without orthography-only marks."""
     return normalize_text(s, strip_ortho=True)
+
+
+def detok_caption(s: str) -> str:
+    """Flickr8k captions are PTB-tokenised ('a man 's hat , outside .'). YFACC translation targets would
+    otherwise teach the decoder a spacing that no other English source (FLEURS, WEB, HaVG) uses and that
+    no reference outside Flickr8k contains. Idempotent."""
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r" (n't|'s|'re|'ve|'ll|'m|'d)\b", r"\1", s)
+    s = re.sub(r" ([.,;:!?)\]])", r"\1", s)
+    s = re.sub(r"([(\[]) ", r"\1", s)
+    parts = s.split('"')
+    if len(parts) % 2 == 1:  # balanced quotes: glue each quoted span to its content
+        s = "".join(p if k % 2 == 0 else '"' + p.strip() + '"' for k, p in enumerate(parts))
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:1].upper() + s[1:]
 
 
 def detect_repetition(text: str, n: int = 3, max_rep: int = 3) -> bool:
@@ -1323,6 +1337,10 @@ class DataHub:
         """Verse-aligned Bible text for target-domain MT (text-only domain adaptation). Every CHAPTER that
         has audio anywhere in this experiment (adapt/dev/test, any language; by file name AND by text
         match) is excluded, so no transcript or translation of a used clip can reach the model through text.
+        The Bible also repeats itself across chapters (Genesis genealogies in 1 Chronicles, 2 Chr 36:22 =
+        Ezra 1:1, Nehemiah 7 ~ Ezra 2): a verse whose text in ANY language — English included — is a
+        near-duplicate (ratio >= 90) of a clip's transcript or English reference, or CONTAINS most of one
+        (>= 40% of the clip's word 4-grams, e.g. GEN 10:18 ⊃ 1CH 1:16), is excluded as well.
         Verses merged into multi-verse lines in any language are skipped (no 1:1 alignment)."""
         used_ch = set()
         for b in bible:
@@ -1338,13 +1356,52 @@ class DataHub:
             bk, c, _ = self._parse_vref(v)
             if f"{bk}_{c:03d}" not in used_ch and v not in merged:
                 pool.append(v)
-        pool = sorted(pool, key=lambda v: stable_hash("ebible|" + v))[: self.d.ebible_max_verses]
-        out = []
-        for v in pool:
-            row = {l: ebible[l][v] for l in langs if v in ebible.get(l, {})}
-            if len(row) >= 2:
-                out.append(dict(vref=v, **row))
-        return out
+        pool = sorted(pool, key=lambda v: stable_hash("ebible|" + v))
+        from rapidfuzz import fuzz
+        from rapidfuzz.process import cdist
+        used_txt = defaultdict(set)
+        for b in bible:
+            if b.get("text"):
+                used_txt[b["lang"]].add(normalize_text(b["text"]))
+            if b.get("en"):
+                used_txt["en"].add(normalize_text(b["en"]))
+        used_txt = {l: sorted(t) for l, t in used_txt.items()}
+
+        def grams(t: str) -> set:
+            w = t.split()
+            return {tuple(w[i:i + 4]) for i in range(len(w) - 3)}
+
+        gram_index: Dict[str, Dict[tuple, List[int]]] = {}
+        gram_n: Dict[str, List[int]] = {}
+        for l, texts in used_txt.items():
+            gram_index[l], gram_n[l] = defaultdict(list), []
+            for ci, t in enumerate(texts):
+                g = grams(t) if len(t.split()) >= 6 else set()
+                gram_n[l].append(max(1, len(g)))
+                for x in g:
+                    gram_index[l][x].append(ci)
+        out, n_dup = [], 0
+        for s in range(0, len(pool), 2000):
+            rows = [{l: ebible[l][v] for l in langs if v in ebible.get(l, {})} for v in pool[s:s + 2000]]
+            dup = np.zeros(len(rows), dtype=bool)
+            for l, choices in used_txt.items():
+                idx = [i for i, r in enumerate(rows) if l in r]
+                if idx and choices:
+                    sim = cdist([normalize_text(rows[i][l]) for i in idx], choices, scorer=fuzz.ratio,
+                                dtype=np.uint8, workers=-1)
+                    dup[np.asarray(idx)[sim.max(1) >= 90]] = True
+                for i in idx:
+                    if dup[i]:
+                        continue
+                    hits = Counter(ci for x in grams(normalize_text(rows[i][l])) for ci in gram_index[l].get(x, ()))
+                    dup[i] = any(c >= 0.4 * gram_n[l][ci] for ci, c in hits.items())
+            n_dup += int(dup.sum())
+            out += [dict(vref=v, **r) for v, r, d in zip(pool[s:s + 2000], rows, dup) if not d and len(r) >= 2]
+            if len(out) >= self.d.ebible_max_verses:
+                break
+        LOG.info(f"eBible MT: {min(len(out), self.d.ebible_max_verses)} verses; {n_dup} near-duplicates of used "
+                 f"clips (parallel passages) excluded")
+        return out[: self.d.ebible_max_verses]
 
     # ---------------------------------------------------------------- Hausa Visual Genome ----
     HAVG_TXT = {"train": "hausa-visual-genome-train.txt", "dev": "hausa-visual-genome-dev.txt",
@@ -1487,7 +1544,7 @@ class DataHub:
         Flickr8k_text/Flickr8k.token.{train,dev,test}_yoruba.txt ('<img>.jpg#<k>\\t<Yorùbá caption>')."""
         cached = self._cached("yfacc.jsonl", ["audio", "image"])
         if cached is not None:
-            return cached
+            return [dict(r, en=detok_caption(r["en"])) for r in cached]  # manifests written before detok
         out_dir = os.path.join(self.root, "yfacc")
         sources = [("file", p) for p in self.find("yfacc_v6.tar.gz")] + [("url", u) for u in self.d.yfacc_urls]
         audio: Dict[str, dict] = {}
@@ -1536,8 +1593,8 @@ class DataHub:
             if not (self.d.min_dur <= a["dur"] <= self.d.eval_max_dur):
                 continue
             rows.append(dict(uid=f"yfacc_{a['split']}_{a['stem']}", split=a["split"], audio=a["audio"], dur=a["dur"],
-                             lang="yo", yo=texts[key], en=caps[key], image=images[img], box=None, domain="yfacc",
-                             speaker=a["speaker"], flickr_key=key))
+                             lang="yo", yo=texts[key], en=detok_caption(caps[key]), image=images[img], box=None,
+                             domain="yfacc", speaker=a["speaker"], flickr_key=key))
         for s in ["train", "dev", "test"]:
             if not any(r["split"] == s for r in rows):
                 raise RuntimeError(f"YFACC split '{s}' is empty")
@@ -1678,8 +1735,8 @@ class DataHub:
         }
         save_json(os.path.join(self.cfg.paths.results_dir, "dataset_statistics.json"), stats)
         LOG.info(f"dataset statistics: {json.dumps(stats)}")
-        return dict(fleurs=fleurs, parallel=parallel, bible=bible, bible_text=bible_text, ebible_langs=list(ebible),
-                    havg=havg, yfacc=yfacc, vis_path=vis_path, vis_index=vis_index, spoken=spoken, stats=stats)
+        return dict(fleurs=fleurs, parallel=parallel, bible=bible, bible_text=bible_text, havg=havg, yfacc=yfacc,
+                    vis_path=vis_path, vis_index=vis_index, spoken=spoken, stats=stats)
 
 
 # =============================================================================================
@@ -2012,12 +2069,11 @@ def spans_to_mask(spans_list: List[List[Tuple[int, int]]], lengths: Sequence[int
 
 @dataclass
 class Segmentation:
-    """One subword segmentation per utterance: token ids (None for pseudo-tokens), frame masks, texts."""
+    """One subword segmentation per utterance: token ids (None for pseudo-tokens), frame masks, provenance."""
     tok_ids: List[Optional[List[int]]]
     mask: torch.Tensor          # (B, N, T) bool
     n_tok: torch.Tensor         # (B,)
-    texts: List[str]
-    source: List[str]           # 'viterbi' | 'greedy' | 'uniform' | 'pseudo'
+    source: List[str]           # 'viterbi' | 'greedy' | 'uniform' | 'pseudo' (logged as a training diagnostic)
     conf: Optional[torch.Tensor] = None  # (B, N) mean max CTC posterior inside each segment
 
 
@@ -2058,7 +2114,7 @@ class SpeechSeqDataset(Dataset):
         return dict(wav=load_audio(x["audio"], 16000), lang=x["lang"], tgt_lang=tl, tgt_text=tg[tl],
                     seg_text=x.get("seg_text") or "", ctc_text=x.get("ctc_text"),
                     tok_w=(x.get("tok_w") or {}).get(tl), weight=x.get("weight", 1.0),
-                    vis_row=x.get("vis_row", -1), uid=x["uid"], domain=x["domain"])
+                    vis_row=x.get("vis_row", -1))
 
 
 class TextPairDataset(Dataset):
@@ -2086,7 +2142,7 @@ class UnlabeledAudioDataset(Dataset):
 
     def __getitem__(self, i):
         x = self.e[i]
-        return dict(wav=load_audio(x["audio"], 16000), domain=x["domain"], uid=x["uid"])
+        return dict(wav=load_audio(x["audio"], 16000))
 
 
 class TTSDataset(Dataset):
@@ -2218,8 +2274,7 @@ class Collator:
 
     def speech(self, batch: List[dict]) -> dict:
         x, am = self.feat([b["wav"] for b in batch])
-        out = dict(x=x, am=am, domain=[b["domain"] for b in batch], uid=[b["uid"] for b in batch],
-                   dur=[len(b["wav"]) / 16000.0 for b in batch])
+        out = dict(x=x, am=am)
         if "tgt_text" in batch[0]:
             lab, dec_in, tw = self._targets([b["tgt_text"] for b in batch], [b["tgt_lang"] for b in batch],
                                             [b["tok_w"] for b in batch])
@@ -2742,7 +2797,7 @@ class KORA(nn.Module):
         lens_l = [int(v) for v in lens.tolist()]
         tok_ids: List[Optional[List[int]]] = [None] * B
         spans: List[List[Tuple[int, int]]] = [[] for _ in range(B)]
-        out_texts, source = [""] * B, [""] * B
+        source = [""] * B
         todo_greedy = list(range(B))
         if mode == "viterbi":
             if texts is None or len(texts) != B:
@@ -2755,7 +2810,7 @@ class KORA(nn.Module):
                 for j, b in enumerate(vi):
                     cs = counts_to_spans(counts[j]) if counts[j] is not None else uniform_char_spans(len(tn[b]), lens_l[b])
                     tok_ids[b], spans[b] = token_spans(self.tok, tn[b], cs, self.max_tok)
-                    out_texts[b], source[b] = tn[b], ("viterbi" if counts[j] is not None else "uniform")
+                    source[b] = "viterbi" if counts[j] is not None else "uniform"
             todo_greedy = [b for b in range(B) if not tn[b]]
         elif mode != "greedy":
             raise ValueError(mode)
@@ -2765,7 +2820,7 @@ class KORA(nn.Module):
                 text, cs = self.chars.greedy_segments(arg[b, :lens_l[b]].tolist())
                 if text.strip():
                     tok_ids[b], spans[b] = token_spans(self.tok, text, cs, self.max_tok)
-                    out_texts[b], source[b] = text, "greedy"
+                    source[b] = "greedy"
         for b in range(B):
             if not spans[b]:
                 k = max(1, lens_l[b] // 15)
@@ -2775,7 +2830,7 @@ class KORA(nn.Module):
         maxp = logits.softmax(-1).max(-1).values                                    # (B,T)
         mf = mask.float()
         conf = (mf * maxp[:, None, :]).sum(-1) / mf.sum(-1).clamp(min=1)
-        return Segmentation(tok_ids=tok_ids, mask=mask, n_tok=n_tok, texts=out_texts, source=source, conf=conf)
+        return Segmentation(tok_ids=tok_ids, mask=mask, n_tok=n_tok, source=source, conf=conf)
 
     def speech_inputs(self, enc: dict, seg: Segmentation, src_langs: List[str]):
         """[lang] e_1..e_N [</s>] — the speech counterpart of the NLLB source format."""
@@ -3194,23 +3249,9 @@ class KoraDecoding:
     def joint(self, enc, langs: List[str], lam: float, beams: int, n_ctc: int = 5) -> List[str]:
         """Two-route joint decoding: CTC prefix-beam n-best ∪ AED n-best (from the greedy-segmented SAB
         memory), each candidate rescored with λ·log P_CTC + (1-λ)·log P_AED (attention rescoring of the
-        union, cf. WeNet; v1 only re-ranked the AED n-best, so it could never escape an AED failure)."""
-        logps = self.ctc_logps(enc)
-        ctc_nb = self.ctc_nbest(logps, max(self.cfg.pl.ctc_beam, n_ctc), n_ctc)
-        mem, mm, _, _ = self.memory(enc, langs, "greedy")
-        aed_nb = self.nbest(mem, mm, langs, beams, beams)
-        best = []
-        for i in range(len(langs)):
-            cands = [c for c in dict.fromkeys([t for t, _ in ctc_nb[i]] + [normalize_text(a) for a in aed_nb[i]]) if c]
-            if not cands:
-                best.append("")
-                continue
-            cs = self.ctc_scores(logps[i], cands)
-            aes = self.aed_scores(mem[i:i + 1], mm[i:i + 1], cands, langs[i])
-            sc = [lam * c + (1 - lam) * a if np.isfinite(c) else -np.inf for c, a in zip(cs, aes)]
-            k = int(np.argmax(sc)) if np.isfinite(max(sc)) else int(np.argmax(aes))
-            best.append(cands[k])
-        return best
+        union, cf. WeNet; v1 only re-ranked the AED n-best, so it could never escape an AED failure).
+        Same code path as the dev selection and the multi-mode evaluation (decode_asr_all)."""
+        return decode_asr_all(self, enc, langs, beams, [lam], ["joint"], n_ctc)[f"joint@{lam}"]
 
     @torch.no_grad()
     def text_memory(self, texts: List[str], src_langs: List[str], vis_rows=None, gate_mode="learned"):
@@ -3271,26 +3312,24 @@ class PseudoLabeler:
         # transcript routes: CTC prefix beam search and the AED decoder reading the greedy SAB memory
         logps = D.ctc_logps(enc)
         ctc_nb = D.ctc_nbest(logps, pc.ctc_beam, pc.nbest)
-        mem_g, mm_g, _, _ = D.memory(enc, langs, "greedy")
-        aed_nb = [[normalize_text(a) for a in x] for x in D.nbest(mem_g, mm_g, langs, pc.beams, pc.nbest)]
+        mem, mm, _, _ = D.memory(enc, langs, "greedy")
+        aed_nb = [[normalize_text(a) for a in x] for x in D.nbest(mem, mm, langs, pc.beams, pc.nbest)]
         t_sel = [route_mbr({"ctc": [t for t, _ in ctc_nb[i]], "aed": aed_nb[i]}, normalized=True,
                            within=pc.mbr_within_route) for i in range(n)]
         t_star = [t for t, _, _ in t_sel]
         t_route = [r for _, r, _ in t_sel]
         ctc_best = [ctc_nb[i][0][0] for i in range(n)]
         aed_best = [aed_nb[i][0] if aed_nb[i] else "" for i in range(n)]
-        # translation routes: direct (SAB memory on the CTC hypothesis' own segmentation, independent of the
-        # selected transcript) and cascade (MT of the selected transcript)
-        mem_t, mm_t, _, _ = D.memory(enc, langs, "greedy")
-        st_nb = D.nbest(mem_t, mm_t, ["en"] * n, pc.beams, pc.nbest)
+        # translation routes: direct (the same SAB memory, built on the CTC hypothesis' own segmentation and
+        # therefore independent of the selected transcript) and cascade (MT of the selected transcript)
+        st_nb = D.nbest(mem, mm, ["en"] * n, pc.beams, pc.nbest)
         y_casc = [y[0] for y in D.translate_texts(t_star, langs, "en", pc.beams)[0]]
         y_sel = [route_mbr({"cascade": [y_casc[i]], "direct": st_nb[i]}, within=pc.mbr_within_route)
                  for i in range(n)]
         y_star = [y for y, _, _ in y_sel]
         y_route = [r for _, r, _ in y_sel]
         with amp_ctx(D.device):
-            lp_t = self.model.score_texts(mem_t, mm_t, t_star, langs)
-            lp_y = self.model.score_texts(mem_t, mm_t, y_star, ["en"] * n)
+            lp_t = self.model.score_texts(mem, mm, t_star, langs)
         for i, e in enumerate(chunk):
             lang = langs[i]
             n_chars = len(ctc_text(t_star[i]))
@@ -3315,7 +3354,8 @@ class PseudoLabeler:
                             y_route=y_route[i], t_ctc=ctc_best[i], t_aed=aed_best[i],
                             y_direct=st_nb[i][0] if st_nb[i] else "", y_casc=y_casc[i],
                             s_ctc_aed=s_ctc, s_route=s_route, s_conf=s_conf, s_len=s_len, repetition=bool(rep),
-                            S=S, n_words=len(t_star[i].split()), n_tok_src=len(lp_t[i]), n_tok_tgt=len(lp_y[i]),
+                            S=S, n_words=len(t_star[i].split()), n_tok_src=len(lp_t[i]),
+                            n_tok_tgt=len(self.tok.tgt(y_star[i], "en")),
                             tok_w={lang: tw_t, "en": tw_y}))
 
     # ------------------------------------------------------------ selection strategies -------
@@ -3530,10 +3570,8 @@ class Trainer:
         self.cfg, self.model, self.tok, self.chars, self.data = cfg, model, tok, chars, data
         self.device, self.aux = torch.device(device), torch.device(aux_device)
         self.tc = cfg.train
-        self.vis_store = vis_store
         self.featurizer = featurizer
         self.collate = Collator(tok, chars, vis_store, featurizer, cfg.train.image_drop)
-        self.collate_eval = Collator(tok, chars, vis_store, featurizer, 0.0)
         self.ckpt = CheckpointManager(cfg.paths.ckpt_dir, cfg.train.keep_last)
         self.state_path = cfg.paths.state_path
         self.state = load_json(self.state_path, {})
@@ -3744,7 +3782,7 @@ class Trainer:
         l_gate = F.binary_cross_entropy_with_logits(logit[has], u)
         l_aw = F.relu(self.tc.aware_margin - delta).mean()
         return dict(gate=self.tc.lambda_gate * l_gate, aware=self.tc.lambda_aware * l_aw,
-                    _delta=float(delta.mean()), _gate=float(g[has].mean()))
+                    _cf_delta=float(delta.mean()), _gate_mean=float(g[has].mean()))
 
     def _ctc_loss(self, enc, batch):
         dev = self.device
@@ -3769,6 +3807,9 @@ class Trainer:
         p_greedy = tc.sab_greedy_prob if variant.sab_anchor else 0.25
         greedy = random.random() < p_greedy
         seg = m.segment(enc, batch["seg_text"], "greedy" if greedy else "viterbi")
+        # diagnostics (logged, not optimised): share of utterances whose CTC alignment failed (uniform /
+        # pseudo-token fallback) — high values mean the bridge is fed without a usable alignment
+        parts["_seg_fallback"] = float(np.mean([s in ("uniform", "pseudo") for s in seg.source]))
         mem, mmask, _ = m.speech_memory(enc, seg, batch["src_lang"])
         dec_mem = mem
         if task == "smmt" and "vis" in batch:
@@ -3792,6 +3833,8 @@ class Trainer:
         # token-synchronous NLLB-encoder matching: same subwords at the same positions -> position-wise MSE
         rows = torch.tensor([seg.tok_ids[b] is not None and seg.tok_ids[b] == gold[b] for b in range(len(gold))],
                             device=dev)
+        if greedy:
+            parts["_hyp_exact"] = float(rows.float().mean())  # CTC hypothesis spells exactly the gold subwords
         if bool(rows.any()):
             Lc = min(mem.shape[1], t_mem.shape[1])
             valid = mmask[:, :Lc] & t_am[:, :Lc].bool() & rows[:, None]
@@ -3829,15 +3872,21 @@ class Trainer:
         else:
             raise ValueError(task)
         loss = sum(v for k, v in parts.items() if not k.startswith("_"))
-        for k, v in parts.items():
-            logs[f"{task}/{k.lstrip('_')}"] = float(v.detach()) if torch.is_tensor(v) else float(v)
+        for k, v in parts.items():  # '_'-prefixed parts are diagnostics; their names never shadow a loss term
+            key = f"{task}/{k.lstrip('_')}"
+            if key in logs:
+                raise KeyError(f"log key collision: {key}")
+            logs[key] = float(v.detach()) if torch.is_tensor(v) else float(v)
         return loss, logs
 
     # ------------------------------------------------------------------ quick dev eval ------
     @torch.no_grad()
     def dev_eval(self, warn: bool = True) -> Dict[str, float]:
         """FLEURS-dev ASR (CTC and AED through SAB) and ST, plus collapse detectors: output diversity and
-        the source-sensitivity index (v1's collapse would have been caught at the first evaluation)."""
+        the source-sensitivity index (v1's collapse would have been caught at the first evaluation).
+        The multimodal branches are monitored on the HaVG and YFACC dev splits (used for nothing else):
+        en->ha MMT with the true vs an incongruent image, and speech+image -> English. They are logged
+        but do not enter dev_score, so snapshot selection stays a speech criterion."""
         D = self.dec
         par = self.data["parallel"]
         dev = [x for x in self.data["fleurs"] if x["split"] == "dev" and "en" in par[x["sid"]]]
@@ -3865,6 +3914,32 @@ class Trainer:
             if warn and (res[f"distinct_st_{lang}"] < 0.5 or res[f"distinct_aed_{lang}"] < 0.5):
                 LOG.warning(f"[collapse detector] {lang}: distinct ST {res[f'distinct_st_{lang}']:.2f}, "
                             f"AED {res[f'distinct_aed_{lang}']:.2f}, SSI {res[f'ssi_st_{lang}']:.2f}")
+        vi = self.data["vis_index"]
+        n_mm = max(2, self.tc.dev_eval_utts // 2)
+        hd = sorted([h for h in self.data["havg"] if h["split"] == "dev"], key=lambda h: h["uid"])[:n_mm]
+        if len(hd) >= 2:
+            rows = [vi[h["uid"]] for h in hd]
+
+            def mmt(vis_rows):
+                out = []
+                for s in range(0, len(hd), 16):
+                    ch = hd[s:s + 16]
+                    out += [x[0] for x in D.translate_texts([h["en"] for h in ch], ["en"] * len(ch), "ha", 1,
+                                                            vis_rows[s:s + 16])[0]]
+                return out
+
+            refs = [h["ha"] for h in hd]
+            res["chrf_mmt_en_ha"] = chrf(refs, mmt(rows))
+            res["img_delta_mmt"] = res["chrf_mmt_en_ha"] - chrf(refs, mmt(rows[1:] + rows[:1]))
+        yd = sorted([y for y in self.data["yfacc"] if y["split"] == "dev"], key=lambda y: y["uid"])[:max(2, n_mm // 2)]
+        if len(yd) >= 2:
+            hyps = []
+            for s in range(0, len(yd), 8):
+                ch = yd[s:s + 8]
+                enc = D.encode([load_audio(y["audio"]) for y in ch])
+                mem, mm, _, _ = D.memory(enc, ["yo"] * len(ch), "greedy", vis_rows=[vi[y["uid"]] for y in ch])
+                hyps += [x[0] for x in D.nbest(mem, mm, ["en"] * len(ch), 1, 1)]
+            res["chrf_smmt_yo_en"] = chrf([y["en"] for y in yd], hyps)
         res = {k: float(v) for k, v in res.items()}
         L = self.cfg.data.african_langs
         res["dev_score"] = float(np.mean([res[f"chrf_st_{l}"] for l in L]) +
@@ -4281,9 +4356,12 @@ class KoraInferencer:
         casc = [c[0] for c in casc]
         if route == "cascade":
             return casc, gates
+        # the cascade route also proposes the MT of the greedy CTC transcript. It is a second CANDIDATE of the
+        # same route, not a route of its own: two cascades share the MT system (and usually the transcript),
+        # and as separate routes they would out-vote the direct route (the v1 failure route_mbr prevents)
         greedy = D.ctc_greedy(enc)
         casc_g = [c[0] for c in D.translate_texts(greedy, src_langs, tgt_lang, beams, vis_rows, gate_mode)[0]]
-        out = [route_mbr({"direct": direct[i], "cascade": [casc[i]], "cascade_ctc": [casc_g[i]]},
+        out = [route_mbr({"direct": direct[i], "cascade": [casc[i], casc_g[i]]},
                          within=self.cfg.pl.mbr_within_route)[0] for i in range(n)]
         return out, gates
 
@@ -4510,7 +4588,7 @@ class UTMOS:
 #                                         EVALUATOR
 # =============================================================================================
 def decode_asr_all(D: KoraDecoding, enc, langs: List[str], beams: int, lams: Sequence[float],
-                   modes: Sequence[str]) -> Dict[str, List[str]]:
+                   modes: Sequence[str], n_ctc: int = 5) -> Dict[str, List[str]]:
     """Every ASR decoding mode from ONE speech encoding (dev selection and multi-mode evaluation).
     Keys: 'ctc', 'ctcbeam', 'aed', 'joint@<λ>'."""
     out: Dict[str, List[str]] = {}
@@ -4519,7 +4597,7 @@ def decode_asr_all(D: KoraDecoding, enc, langs: List[str], beams: int, lams: Seq
     if "ctc" in modes:
         out["ctc"] = D.ctc_greedy(enc)
     logps = D.ctc_logps(enc) if need_nb else None
-    ctc_nb = D.ctc_nbest(logps, max(D.cfg.pl.ctc_beam, 5), 5) if need_nb else None
+    ctc_nb = D.ctc_nbest(logps, max(D.cfg.pl.ctc_beam, n_ctc), n_ctc) if need_nb else None
     if "ctcbeam" in modes:
         out["ctcbeam"] = [nb[0][0] for nb in ctc_nb]
     if need_aed:
@@ -4550,7 +4628,7 @@ class Evaluator:
     """Full evaluation suite for the article. Every block is cached in results/all_results.json and the
     time budget is checked before each block, so an interrupted evaluation resumes where it stopped."""
 
-    def __init__(self, cfg: KoraConfig, trainer: Trainer, vis_store: VisStore, device, aux_device):
+    def __init__(self, cfg: KoraConfig, trainer: Trainer, device, aux_device):
         self.cfg, self.tr, self.device, self.aux = cfg, trainer, torch.device(device), torch.device(aux_device)
         self.model, self.tok, self.chars, self.data = trainer.model, trainer.tok, trainer.chars, trainer.data
         self.vocoder = Vocoder(cfg.model.vocoder_model, self.aux)
@@ -5423,7 +5501,10 @@ class Visualizer:
             return
         dd["gstep"] = dd["step"] + dd["phase"].map(offs)
         dd = dd.sort_values("gstep")
-        fig, axs = plt.subplots(1, 3, figsize=(12, 3))
+        mm_keys = [(k, lab) for k, lab in [("chrf_mmt_en_ha", "HaVG en→ha (image)"),
+                                           ("img_delta_mmt", "image Δ (true − incongruent)"),
+                                           ("chrf_smmt_yo_en", "YFACC speech+image→en")] if k in dd.columns]
+        fig, axs = plt.subplots(1, 3 + bool(mm_keys), figsize=(12 + 4 * bool(mm_keys), 3))
         for i, l in enumerate(self.langs):
             axs[0].plot(dd["gstep"], dd[f"wer_ctc_{l}"], color=PAL[i], marker="o", ms=3, label=f"{LANG_NAMES[l]} CTC")
             axs[0].plot(dd["gstep"], dd[f"wer_aed_{l}"], color=PAL[i], ls="--", marker="s", ms=3, label=f"{LANG_NAMES[l]} AED")
@@ -5433,6 +5514,12 @@ class Visualizer:
         axs[1].set_ylabel("dev ST chrF++ (↑)")
         axs[2].set_ylabel("dev ST source-sensitivity (↑)")
         axs[2].axhline(0, color=INK2, lw=0.8)
+        for i, (k, lab) in enumerate(mm_keys):
+            s_ = dd[["gstep", k]].dropna()
+            axs[3].plot(s_["gstep"], s_[k], color=PAL[3 + i], marker="o", ms=4, label=lab)
+        if mm_keys:
+            axs[3].set_ylabel("dev multimodal chrF++ (↑)")
+            axs[3].axhline(0, color=INK2, lw=0.8)
         for a in axs:
             a.set_xlabel("global step")
             a.legend(fontsize=6)
@@ -5756,6 +5843,11 @@ class ReportWriter:
         "utterances to <= {max_dur:.0f} s. ASR decoding mode and joint λ are selected on dev sets only.",
         "The 'SONAR xsim' pseudo-label filter implements the LASER-style filter of Gheini et al. (2023) with SONAR, "
         "the successor of LASER that covers Lingala.",
+        "The 'no_sab_anchor' ablation starts, like every ablation, from the anchored Stage-1 model: its acoustic-only "
+        "head is freshly initialised at that point and trained for the ablation budget only. It measures swapping the "
+        "bridge after the warm start; the controlled from-scratch comparison is the SAB learnability check (README §6).",
+        "YFACC English targets are the Flickr8k captions, detokenised ('a man 's hat .' -> 'A man's hat.') so that "
+        "all English targets and references share one convention.",
     ]
 
     def __init__(self, cfg: KoraConfig, R: dict, stats: dict, failed_figures: Optional[List[str]] = None):
@@ -6011,7 +6103,7 @@ def main():
             verify_bundle(bundle, model)
             trainer.mark("bundle_verified")
         trainer.release_teacher()
-        evaluator = Evaluator(cfg, trainer, vis_store, device, aux)
+        evaluator = Evaluator(cfg, trainer, device, aux)
         evaluator.run_all(abl)
         viz = Visualizer(cfg, evaluator)
         viz.make_all()

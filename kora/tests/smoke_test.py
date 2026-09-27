@@ -69,7 +69,7 @@ def build_data(root, cfg):
                 k += 1
     bible_text = [dict(vref=f"EXO 1:{i}", **{l: SENT[l][i] for l in ["ha", "yo", "ln", "en"]}) for i in range(5)]
     havg = [dict(uid=f"havg_{s}_{i}", split=s, image=None, box=[0, 0, 5, 5], en=SENT["en"][i], ha=SENT["ha"][i])
-            for s, n in [("train", 4), ("test", 3), ("challenge", 3)] for i in range(n)]
+            for s, n in [("train", 4), ("dev", 2), ("test", 3), ("challenge", 3)] for i in range(n)]
     yfacc = []
     for s, n in [("train", 4), ("dev", 2), ("test", 3)]:
         for i in range(n):
@@ -92,8 +92,7 @@ def build_data(root, cfg):
                       for s in ["target_dev", "target_test", "target_adapt"]} for l in L},
         bibletts_hours={l: 0.01 for l in L}, bible_test_with_english_ref={l: 3 for l in L}, ebible_mt_verses=5,
         havg={}, yfacc_real_speech={"train": 4, "dev": 2, "test": 3}, yfacc_hours=0.01, spoken_havg_synthetic={})
-    return dict(fleurs=fleurs, parallel=parallel, bible=bible, bible_text=bible_text, ebible_langs=L + ["en"],
-                havg=havg, yfacc=yfacc, vis_path=vp, vis_index=vis_index, spoken=[], stats=stats)
+    return dict(fleurs=fleurs, parallel=parallel, bible=bible, bible_text=bible_text, havg=havg, yfacc=yfacc, vis_path=vp, vis_index=vis_index, spoken=[], stats=stats)
 
 
 def tiny_cfg(tmp):
@@ -192,6 +191,9 @@ def main():
     for key in ["stage1_done", "round1_done", "tts_done", "silver_done", "round1_pl_done"]:
         assert tr.done(key), key
     assert model.tts.seen_conds, "TTS conditions were not recorded"
+    dev_rows = [h for h in K.read_jsonl(tr.hist_path) if h.get("kind") == "dev"]
+    assert dev_rows and all(k in dev_rows[-1] for k in ("chrf_mmt_en_ha", "img_delta_mmt", "chrf_smmt_yo_en")), \
+        "multimodal dev monitors missing"
     # every task's loss (both SAB segmentation modes) runs forward + backward at least once
     recs = K.read_jsonl(os.path.join(cfg.paths.pl_dir, "pl_round1.jsonl"))
     assert recs and all(r["t_route"] in ("ctc", "aed") for r in recs)
@@ -199,6 +201,7 @@ def main():
     tts_entries = tr.tts_entries_from_disk(tr.tts_tag())
     assert tts_entries, "no TTS entries"
     variant = K.VARIANTS["rapl_full"]
+    seen_parts = set()
     for task in ["asr", "st", "mt", "mt_bible", "mmt", "smmt", "mpd", "pl", "tts"]:
         for greedy in ([0.0, 1.0] if task in ("asr", "st", "smmt") else [0.0]):
             tr.tc.sab_greedy_prob = greedy
@@ -210,6 +213,13 @@ def main():
             loss.backward()
             model.zero_grad(set_to_none=True)
             print(f"task {task:8s} greedy={greedy}: loss={float(loss):.3f} parts={sorted(logs)}")
+            seen_parts |= set(logs)
+    # every loss term and diagnostic of every task is actually produced: no dead branch
+    want = {f"{t}/{p}" for t in ("asr", "st", "smmt") for p in ("ctc", "seq", "kd", "enc", "seg_fallback", "hyp_exact")}
+    want |= {"mt/seq", "mt_bible/seq", "mmt/seq", "mmt/gate", "mmt/aware", "mmt/gate_mean", "mmt/cf_delta",
+             "smmt/gate", "smmt/aware", "mpd/mpd", "mpd_conf_frac", "pl/ctc", "pl/seq", "pl/seg_fallback",
+             "tts/tts_fm", "tts/tts_prior", "tts/tts_dur"}
+    assert want <= seen_parts, f"loss terms never produced: {sorted(want - seen_parts)}"
     tr.tc.sab_greedy_prob = 0.25
     abl = tr.run_ablations()
     tr.load_snapshot("final_tts.pt")
@@ -222,7 +232,7 @@ def main():
     K.SonarEmbedder = FakeSonar
     K.UTMOS = lambda cfg, device: (lambda wav, sr: 3.0)
     tr.release_teacher()
-    ev = K.Evaluator(cfg, tr, vis, dev, dev)
+    ev = K.Evaluator(cfg, tr, dev, dev)
     ev.run_all(abl)
     R = ev.R
     for block in ["asr", "st", "mt", "mmt", "gate_analysis", "smmt", "tts", "s2st", "pl_analysis", "domain",

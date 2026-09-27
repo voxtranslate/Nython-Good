@@ -109,6 +109,7 @@ Verified (CPU, this environment):
   - the SigLIP visual-cache code path.
 - The real NLLB-600M reads SAB's `inputs_embeds` exactly like tokens (max |Δ| = 0).
 - `tests/sab_learnability.py`: SAB with the real NLLB-600M on synthetic character-coded speech (see §6).
+- `tests/test_data_alignment.py`: every training/evaluation pair checked with independent models (see §7).
 
 Not verified:
 - **Full-scale GPU training and the final WER/BLEU/MOS numbers.** Memory and speed figures are estimates.
@@ -135,3 +136,45 @@ Setup (`tests/sab_learnability.py`):
 Under identical conditions (noise 1.2, same steps), the acoustic-only bridge trained with CE only **collapses exactly like v1**: 18 % distinct outputs, SSI 0.5, and the same few Bible sentences whatever the input. With anchoring losses (first row) it avoids collapse but barely depends on its input. The hypothesis-anchored bridge matches the text route and the cascade (direct vs. text-route agreement: 85.4 chrF++).
 
 Limits: the synthetic CTC is almost perfect, so this shows no collapse and generalisation to unseen words. It does **not** show the acoustic residual beating a cascade; that needs real ASR errors and the full-scale run.
+
+## 7. Data audit: pairing and leakage (`tests/test_data_alignment.py`)
+
+Each paired resource was checked with models KORA does not train. NLLB-200-600M translates one side and chrF++ is scored against the paired text; MMS-1B-all transcribes the audio and CER is scored against the paired transcript. Each score is compared with the same score against a *deranged* partner (another item's). Correct pairing gives an aligned score far better than the shuffled one.
+
+| Pair | n | aligned | shuffled |
+|---|---|---|---|
+| FLEURS ha→en (same sentence id) | 40 | chrF++ 54.2 | 14.5 |
+| FLEURS yo→en | 40 | 39.7 | 14.2 |
+| FLEURS ln→en | 40 | 50.0 | 13.5 |
+| FLEURS ha→yo (n-way, X→X targets) | 40 | 19.6 | 9.3 |
+| YFACC Yorùbá caption → Flickr8k English caption | 40 | 44.7 | 13.0 |
+| eBible MT pairs ha / yo / ln → en | 40 each | 46.0 / 50.6 / 42.0 | 14.0 / 15.2 / 14.8 |
+| BibleTTS transcript → WEB reference ha / yo / ln | 40 each | 53.7 / 56.6 / 51.6 | 15.4 / 15.4 / 16.2 |
+| YFACC audio ↔ Yorùbá caption | 8 | CER 28.3 | 97.4 |
+| BibleTTS audio ↔ transcript ha / yo / ln | 8 each | CER 2.7 / 6.0 / 2.5 | 96.8 / 88.6 / 99.5 |
+
+Further checks:
+- Images were checked by eye. 8 random HaVG test boxes all sit on the captioned object (man in military clothes, elephant, headlight, …). 6 random YFACC test images match both their English and Yorùbá captions.
+- **FLEURS splits agree across languages**: 2 009 sentence ids, none in different splits for ha/yo/ln/en. The n-way ST/MT targets therefore cannot leak test sentences.
+- YFACC train/dev/test images are disjoint (5 000 / 514 / 519, zero overlap). Every YFACC clip is caption #0 of its image.
+- Bible-domain characters: the only character outside the FLEURS+YFACC inventory is the Hausa orthographic breve (`ă`), which `tts_text` and `WER_ortho` already remove.
+
+## 8. Second code audit: what was found and fixed
+
+| Finding | Effect | Fix |
+|---|---|---|
+| The Bible repeats itself across books: Genesis genealogies in 1 Chronicles, 2 Chr 36:22 = Ezra 1:1, Nehemiah 7 ≈ Ezra 2. Two text-MT verses were word-for-word copies of **test** clips (GEN 10:25 = 1CH 1:19, GEN 36:22 = 1CH 1:39), and GEN 10:18 contains all of test verse 1CH 1:16. Excluding by chapter cannot see this | Test sentences, with their English translations, reached training through `mt_bible` | A verse is excluded if its text in any language, English included, is a near-duplicate of a used clip (ratio ≥ 90) or contains most of one (≥ 40 % of the clip's word 4-grams). 42 verses were removed; the highest remaining similarity to any used clip is formulaic (Pauline greetings) |
+| Route-balanced MBR in the inferencer ran the CTC-greedy cascade as a third route | Whenever the two transcripts matched (the usual case), the cascade voted twice with a 100-chrF self-agreement. `KORA-mbr` was then biased towards the cascade, the same failure route-balancing was built to prevent | The greedy-CTC cascade is a second *candidate* of the cascade route. Unit test added |
+| Flickr8k captions are PTB-tokenised (`a man 's hat .`) | YFACC English targets and references used a spacing that no other English source uses | `detok_caption` (idempotent; also applied to cached manifests) |
+| The gate-loss log key was overwritten by the mean gate value (`_gate` → `gate`) | The gate BCE loss never appeared in `history.jsonl` | Renamed diagnostics (`gate_mean`, `cf_delta`); `compute` now raises on any log-key collision |
+| The pseudo-labeller built the same greedy SAB memory twice and teacher-scored the translation only to count its tokens | ≈1/3 of the pseudo-labelling decoder work was wasted | One memory; the token count comes from the tokenizer |
+| `KoraDecoding.joint` duplicated `decode_asr_all` | Two copies of the joint CTC/AED rescoring could drift apart | `joint` calls `decode_asr_all` |
+| The HaVG and YFACC **dev** splits were downloaded and encoded with SigLIP, but nothing read them. `dev_eval` watched only the speech branches | A collapse of the image or speech+image branches would go unseen until the final evaluation | `dev_eval` also logs HaVG-dev en→ha chrF++, the image Δ (true minus incongruent image) and YFACC-dev speech+image→en chrF++, plotted in `fig_dev_curves`. They do not enter `dev_score`, so snapshot selection stays a speech criterion |
+| Dead code: `DataConfig.sample_rate`, `Trainer.collate_eval`/`vis_store`, `data["ebible_langs"]`, `Evaluator(vis_store)`, unused collator/dataset keys, `Segmentation.texts` | — | Removed. `Segmentation.source` is now logged (`*/seg_fallback`, `*/hyp_exact`: how often the CTC hypothesis spells the gold subwords exactly) |
+
+The smoke test now asserts that every loss term of every task is actually produced: ctc/seq/kd/enc for asr, st and smmt in both segmentation modes; gate/aware; mpd; pl; the three TTS terms.
+
+Checked and left as is:
+- The `no_sab_anchor` ablation starts from the anchored Stage-1 model with a freshly initialised acoustic head. It measures swapping the bridge after the warm start, not training it from scratch; §6 is the controlled comparison, and the report states this.
+- Keep-best snapshots are stored in fp16. Restoring one perturbs weights by about 5·10⁻⁴ relative, which is negligible.
+
