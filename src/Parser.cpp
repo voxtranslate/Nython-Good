@@ -10,6 +10,9 @@
 #include "ASTNodes.hpp"
 #include "DynamicLang.hpp"
 
+// Set by stmt() when `async` precedes a def; consumed by functionDecl().
+static bool s_async_def_next = false;
+
 using nython::node::Script;
 using namespace nython::node;
 
@@ -344,7 +347,15 @@ node_ptr Parser::statement(){
         }
         return target;
     }
-    if(see(TokenType::Async)) { next(); } // consume async modifier, parse as normal function
+    if(see(TokenType::Async)) {
+        next();
+        // `async for` / `async with`: iterate / enter synchronously (the loop
+        // body can await). `async def`: functionDecl() turns the body into a
+        // coroutine (see async_def_desugar).
+        if(!(see(TokenType::Def)||see(TokenType::Function)||see(TokenType::Fn)||see(TokenType::Fun)))
+            return statement();
+        s_async_def_next = true;
+    }
     if(see(TokenType::Def)||see(TokenType::Function)||see(TokenType::Fn)||see(TokenType::Fun)) {
         // If the keyword is followed by = [ ( . += -= etc., treat it as an identifier/assignment
         // rather than a function declaration (e.g. `fn = x[0:5]` where fn is a variable name)
@@ -1123,8 +1134,27 @@ node_ptr Parser::postfix(){
 }
 
 node_ptr Parser::primary(){
-    // await expr — treat as pass-through (no real async runtime needed for basic use)
-    if(see(TokenType::Await)) { next(); return unary(); }
+    // await expr -> async_await(expr): suspends the current task until the
+    // awaitable (coroutine, task, future, sleep, gather, wait_for) is done; a
+    // plain value is returned as is. `await` followed by something that cannot
+    // start an expression is the ordinary name `await`.
+    if(see(TokenType::Await)) {
+        TokenType nt = peek().type();
+        bool as_name = nt == TokenType::ParenClose || nt == TokenType::Comma || nt == TokenType::NewLine
+            || nt == TokenType::Assign || nt == TokenType::BracketClose || nt == TokenType::Colon
+            || nt == TokenType::End || nt == TokenType::SemiColon || nt == TokenType::Dot
+            || nt == TokenType::Dedent || nt == TokenType::BraceClose;
+        if(!as_name) {
+            Token at = token(); next();
+            node_ptr operand = unary();
+            at.value = "async_await";
+            auto call = make_node<CallNode>(at, make_node<VariableNode>(at));
+            call->add(operand);
+            return call;
+        }
+        Token nt_tok = token(); next();
+        return make_node<VariableNode>(nt_tok);
+    }
     // Handle typeof/sizeof as identifiers that resolve to builtins
     if(see(TokenType::Typeof)||see(TokenType::Sizeof)) {
         Token tok = token();
@@ -1745,7 +1775,61 @@ node_ptr Parser::forStmt(){
     return fnode;
 }
 
+// ── async def ────────────────────────────────────────────────────────────────
+// Both engines run coroutines through the shared runtime (src/NyConc.cpp), so
+// `async def` needs no engine support. It desugars to a gate at the top of the
+// body:
+//
+//     async def f(a, b=1, *rest):          def f(a, b=1, *rest):
+//         body                    ==>          if async_body_begin():
+//                                                  return async_coroutine_def(f, "f", a, b, *rest)
+//                                              body
+//
+// Calling f binds the arguments as usual and returns a coroutine that captured
+// them. When the coroutine runs, the runtime sets a per-thread token and calls
+// f again with the captured arguments; async_body_begin() consumes the token and
+// the body executes. Methods (first parameter self/this) refer to themselves as
+// self.name, so the coroutine holds the bound method.
+static node_ptr async_def_desugar(const Token& tok, node_ptr fn) {
+    auto* f = static_cast<FunctionNode*>(fn.get());
+    Token t = tok;
+    auto name_tok = [&](const std::string& v) { Token x = t; x.value = v; return x; };
+    bool method = !f->params.empty() &&
+        (f->params[0]->value() == "self" || f->params[0]->value() == "this");
+    node_ptr ref;
+    if (method) ref = make_node<AttributeNode>(name_tok(f->name), make_node<SelfNode>(name_tok("self")), f->name);
+    else ref = make_node<VariableNode>(name_tok(f->name));
+    Token mk = name_tok("async_coroutine_def");
+    auto make = make_node<CallNode>(mk, make_node<VariableNode>(mk));
+    make->add(ref);
+    make->add(make_node<StringNode>(name_tok(f->name)));
+    for (size_t i = method ? 1 : 0; i < f->params.size(); i++) {
+        std::string pn = f->params[i]->value();
+        if (pn.rfind("**", 0) == 0)
+            make->add(make_node<UnaryNode>(name_tok("**"), make_node<VariableNode>(name_tok(pn.substr(2)))));
+        else if (pn.rfind("*", 0) == 0)
+            make->add(make_node<UnaryNode>(name_tok("*"), make_node<VariableNode>(name_tok(pn.substr(1)))));
+        else
+            make->add(make_node<VariableNode>(name_tok(pn)));
+    }
+    Token bt = name_tok("async_body_begin");
+    auto begin = make_node<CallNode>(bt, make_node<VariableNode>(bt));
+    auto then_blk = make_node<BlockNode>(t);
+    then_blk->add(make_node<ReturnNode>(t, make));
+    auto guard = make_node<IfNode>(t, begin, then_blk);
+    auto body = make_node<BlockNode>(t);
+    body->add(guard);
+    if (f->body) {
+        if (f->body->type() == NodeType::BLOCK) for (auto& st : f->body->statements()) body->add(st);
+        else body->add(f->body);
+    }
+    f->body = body;
+    return fn;
+}
+
 node_ptr Parser::functionDecl(bool is_method){
+    bool is_async = s_async_def_next;
+    s_async_def_next = false;
     Token tok = token();
     next(); // consume def/function/fn
     std::string name = identifier();
@@ -1764,6 +1848,7 @@ node_ptr Parser::functionDecl(bool is_method){
     auto fn = make_node<FunctionNode>(tok, name, body, is_method);
     for(auto& p : params) fn->add(p);
     static_cast<FunctionNode*>(fn.get())->defaults = std::move(param_defaults_);
+    if(is_async) return async_def_desugar(tok, fn);
     return fn;
 }
 

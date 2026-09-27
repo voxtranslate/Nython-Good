@@ -185,7 +185,7 @@ class MemoryStore:
 
 # ─── Knowledge Base ──────────────────────────────────────────────────────────
 
-class KnowledgeBase:
+class CodeKnowledgeBase:
     def __init__(self, store_path):
         self.memory = MemoryStore(store_path)
         self.index = {}
@@ -734,7 +734,7 @@ class NyxAI:
 
         var kb_path = os_path_join(workspace, "nyx_memory.json")
         os_mkdir(workspace)
-        self.kb = KnowledgeBase(kb_path)
+        self.kb = CodeKnowledgeBase(kb_path)
         self.analyzer = CodeAnalyzer()
         self.generator = CodeGenerator()
         self.files = FileAssistant(workspace)

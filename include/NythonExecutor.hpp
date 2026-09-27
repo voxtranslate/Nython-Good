@@ -26,6 +26,8 @@
 #include "Nython.hpp"
 #include "NythonREPL.hpp"
 #include "NyExcTypes.hpp"
+#include "NyRuntime.hpp"
+#include "NyPrelude.hpp"
 #include <algorithm>
 #include <fstream>
 #include <cwctype>
@@ -35,6 +37,7 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include "NyConc.hpp"   // concurrency runtime shared with the VM (src/NyConc.cpp)
 #include <random>
 #include <regex>
 #include <sstream>
@@ -145,6 +148,8 @@ struct NythonExecutor;
 // ── Forward declarations of module dispatch functions ─────────────────────
 // Each is implemented in src/builtins/X.cpp
 Value dispatch_tensor   (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
+Value dispatch_nt       (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
+std::vector<std::string> nt_builtin_names();   // shared tensor natives (src/builtins/tensor.cpp)
 Value dispatch_audio    (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_string   (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_io       (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
@@ -155,6 +160,7 @@ Value dispatch_data     (NythonExecutor& E, const std::string& name, std::vector
 Value dispatch_threading(NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_core     (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_gui      (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
+Value dispatch_text     (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_lang     (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 
 
@@ -162,7 +168,9 @@ struct NythonExecutor {
     Context* global_ctx;
     Runnable* runner;
     std::map<void*, std::string> func_names;
-    std::vector<Value>* yield_sink_ = nullptr; // set during generator collection
+    // Per OS thread: generator collection in one thread must not capture the
+    // yields of another (round 74, threads).
+    static inline thread_local std::vector<Value>* yield_sink_ = nullptr; // set during generator collection
     std::map<int, FILE*> file_handles{};
     int next_file_handle{1000};
     std::map<void*, Context*> closure_contexts;
@@ -337,6 +345,28 @@ struct NythonExecutor {
         class_by_name{}, super_parent_stack{}, class_parent{} {
         global_ctx = new Context(r, "global");
         registerBuiltins();
+        loadPrelude();
+    }
+
+    // Nython source every program starts with (include/NyPrelude.hpp): the
+    // file objects open() returns. The VM runs the same text.
+    void loadPrelude() {
+        try {
+            auto source = SourceCode(std::string(nyrt::prelude_source()));
+            auto reporter = std::make_shared<Reporter>(source);
+            auto lex = std::make_shared<Lexer>(source);
+            lex->tokenize();
+            auto parser = std::make_shared<Parser>(reporter.get(), (Runnable*)runner, lex.get());
+            auto ast = parser->parse();
+            if (ast) {
+                imported_asts.push_back(ast);
+                evalNode(ast, global_ctx);
+            }
+        } catch (std::exception& e) {
+            std::cerr << "[Nython] prelude failed to load: " << e.what() << "\n";
+        } catch (...) {
+            std::cerr << "[Nython] prelude failed to load\n";
+        }
     }
 
     ~NythonExecutor() {
@@ -396,8 +426,13 @@ public:   // NythonExecutor is a struct: members default to public
             "lang_remove_token","lang_remove_rule","lang_remove_operator",
             "lang_list_tokens","lang_list_rules","lang_list_operators",
             "lang_registry_json","lang_eval","lang_version","lang_reset",
+            // ── Native text services for editors (src/builtins/text.cpp) ─────
+            "text_words","ny_symbols","ny_check_syntax","text_diff","fs_list_files","fs_search",
+            "text_fold_ranges","text_line_stats","text_todos","fs_todos","text_format_nython",
+            "ac_index_new","ac_index_set_base","ac_index_scan","ac_index_rank","text_diff_classify","fs_symbols","ny_check_file","fs_line_stats",
             // ── GUI builtins — value-returning ──────────────────────────────
             "gui_get_error","gui_sdl_version","gui_get_display_size","gui_get_window_size","gui_set_window_size","gui_set_cursor","gui_hash_id","gui_display_scale","gui_window_scale","gui_measure_text_w","gui_set_clipboard","gui_get_clipboard",
+            "gui_wait_events","gui_set_min_size","gui_set_fullscreen","gui_is_fullscreen","gui_show_open_dialog","gui_show_save_dialog","gui_set_text_input_area","gui_draw_arc","gui_draw_text_wrapped","gui_wrap_text","gui_font_metrics","gui_image_size","gui_free_image","gui_push_clip","gui_pop_clip","gui_push_offset","gui_pop_offset","gui_ticks","gui_next_event","gui_event_get",
             // ── Previously implemented but never registered ──────────────
             // The module dispatchers implement 537 builtins; only 197 were
             // registered as global names, so the rest were unreachable and
@@ -470,9 +505,38 @@ public:   // NythonExecutor is a struct: members default to public
             // ── HTTP / network ───────────────────────────────────────────────
             "http_get","http_post","http_request","http_get_json","http_post_json",
             // ── Time ─────────────────────────────────────────────────────────
-            "time_ms","time_now","time_sleep","thread_sleep"
+            "time_ms","time_now","time_sleep","thread_sleep",
+            // ── Round 74: OS / filesystem / process / time (builtins/os*.cpp)
+            // Every name here works on both engines (the VM through the
+            // builtin bridge).
+            "os_path_split","os_path_splitext","os_path_normpath","os_path_normalize",
+            "os_path_abspath","os_path_realpath","os_path_relpath","os_path_isabs",
+            "os_path_expanduser","os_path_expandvars","os_path_commonpath",
+            "os_path_exists","os_path_isdir","os_path_isfile","os_path_islink",
+            "os_path_getsize","os_path_getmtime","os_fnmatch","fnmatch","os_glob","glob",
+            "os_islink","os_access","os_stat","os_lstat","os_makedirs","os_rmdir","os_rmtree",
+            "os_walk","os_unlink","os_copy","os_copyfile","os_copytree","os_move","os_chmod",
+            "os_symlink","os_readlink","os_touch","append","os_gettempdir","os_mkstemp",
+            "os_mkdtemp","os_disk_usage","os_chdir","cd","sh",
+            "os_unsetenv","os_environ","os_platform","os_cpu_count","os_hostname",
+            "os_username","os_home","os_uname",
+            "os_system","os_run","subprocess_run","os_spawn","os_proc_read","os_poll",
+            "os_wait","os_kill","os_getpid","os_getppid","shell_quote","os_shell_quote",
+            "which","os_which","sys_argv",
+            "time","clock","time_ns","time_monotonic","monotonic","time_perf_counter",
+            "perf_counter","time_process","process_time","time_strftime","time_localtime",
+            "time_gmtime","time_mktime","time_timegm","time_strptime","time_iso",
+            "time_parse_iso","uuid","gen_uuid","sleep_ms",
+            "file_open_or_raise","file_seek","file_tell","file_flush"
         };
         for (auto& name : builtins) registerBuiltin(name);
+        // Concurrency runtime (src/NyConc.cpp): threads, locks, channels,
+        // futures, task groups, async. Same names and semantics on the VM.
+        for (auto& name : nyconc::builtin_names()) registerBuiltin(name);
+        for (auto& name : nyconc::exception_names()) registerBuiltin(name);
+        // Shared tensor natives (include/NyTensor.hpp): the same kernels the
+        // VM registers, so both engines resolve these names identically.
+        for (auto& name : nt_builtin_names()) registerBuiltin(name);
         // Exception types
         std::vector<std::string> exc_types = {
             "Exception","BaseException","Error",
@@ -480,9 +544,30 @@ public:   // NythonExecutor is a struct: members default to public
             "NameError","RuntimeError","IOError","OSError","FileNotFoundError",
             "ZeroDivisionError","OverflowError","MemoryError","RecursionError",
             "StopIteration","GeneratorExit","SystemExit","KeyboardInterrupt",
-            "AssertionError","NotImplementedError","PermissionError","TimeoutError"
+            "AssertionError","NotImplementedError","PermissionError","TimeoutError",
+            "IsADirectoryError","NotADirectoryError","FileExistsError","ChildProcessError",
+            "ProcessLookupError","InterruptedError","BlockingIOError","ConnectionError",
+            "BrokenPipeError","ConnectionRefusedError","ConnectionResetError",
+            "LookupError","ArithmeticError","EOFError","ImportError","ModuleNotFoundError",
+            "UnicodeError"
         };
         for (auto& name : exc_types) registerBuiltin(name);
+        // OS constants (os.sep, os.pathsep, os.linesep, os.name)
+#ifdef _WIN32
+        global_ctx->defineByName("os_sep", makeStringValue("\\"));
+        global_ctx->defineByName("os_pathsep", makeStringValue(";"));
+        global_ctx->defineByName("os_linesep", makeStringValue("\r\n"));
+        global_ctx->defineByName("os_name", makeStringValue("nt"));
+#else
+        global_ctx->defineByName("os_sep", makeStringValue("/"));
+        global_ctx->defineByName("os_pathsep", makeStringValue(":"));
+        global_ctx->defineByName("os_linesep", makeStringValue("\n"));
+        global_ctx->defineByName("os_name", makeStringValue("posix"));
+#endif
+        // The running script: `if __name__ == "__main__":` and __file__.
+        // evalImport switches both while a module's top level runs.
+        global_ctx->defineByName("__name__", makeStringValue("__main__"));
+        global_ctx->defineByName("__file__", makeStringValue(nyrt::script_path()));
         // Math constants
         global_ctx->defineByName("PI", Value(3.14159265358979323846));
         global_ctx->defineByName("E", Value(2.71828182845904523536));
@@ -1007,6 +1092,71 @@ public:   // NythonExecutor is a struct: members default to public
         return val;
     }
 
+    // The value a registered builtin name evaluates to.
+    Value builtinValue(const std::string& name) {
+        auto it = builtin_ptrs.find(name);
+        if (it == builtin_ptrs.end()) return NONE_VALUE;
+        Value v;
+        v.type = ValueType::USERDATA;
+        v.value.p = (void*)it->second.get();
+        return v;
+    }
+
+    // `import os`: a namespace over the os_* builtins (os.getcwd,
+    // os.path.join, ...) plus os.sep/pathsep/linesep/name and a snapshot of
+    // os.environ. The flat os_* names stay registered as well.
+    Value makeOsNamespace() {
+        std::vector<std::string> names;
+        for (auto& kv : builtin_ptrs) names.push_back(kv.first);
+        auto* ns = new Object((Runnable*)runner, "os", Type::MAP);
+        auto* path = new Object((Runnable*)runner, "path", Type::MAP);
+        for (auto& m : nyrt::module_members("os", names)) {
+            if (m.first == "environ") continue;   // a map, below (os.environ["HOME"])
+            if (m.first.rfind("path.", 0) == 0) path->set(m.first.substr(5), builtinValue(m.second));
+            else ns->set(m.first, builtinValue(m.second));
+        }
+        for (const char* c : {"sep", "pathsep", "linesep", "name"}) {
+            Value v = global_ctx->getByName(std::string("os_") + c);
+            ns->set(c, v);
+            if (std::string(c) == "sep" || std::string(c) == "pathsep") path->set(c, v);
+        }
+        std::vector<Value> no_args;
+        ns->set("environ", callBuiltin("os_environ", no_args, global_ctx));
+        ns->set("path", Value((Collectable*)path));
+        return Value((Collectable*)ns);
+    }
+
+    Value nyos_list_of(const std::vector<std::string>& items) {
+        auto* o = new Object((Runnable*)runner, "list", Type::LIST);
+        for (size_t i = 0; i < items.size(); i++) o->set(std::to_string(i), makeStringValue(items[i]));
+        o->set("__len__", Value((int)items.size()));
+        return Value((Collectable*)o);
+    }
+
+    // Floor division of two integers of any size, rounding toward negative
+    // infinity like Python. (The result used to be cast to a 32-bit int, so
+    // 1790429563123456789 // 1000000 came out as -571799309.)
+    static bool smallInt(const bigint& b, int64_t& out) {
+        if (b.size() > 1) return false;
+        unsigned long long mag = b.size() ? b.get(0) : 0ULL;
+        if (mag > 0x7FFFFFFFFFFFFFFFULL) return false;
+        bool neg = const_cast<bigint&>(b).sign() != 0;
+        out = neg ? -(int64_t)mag : (int64_t)mag;
+        return true;
+    }
+    static bigint floorDivInt(const bigint& a, const bigint& b) {
+        int64_t x, y;
+        if (smallInt(a, x) && smallInt(b, y) && y != 0 && !(y == -1 && x == INT64_MIN)) {
+            int64_t q = x / y;
+            if ((x % y != 0) && ((x < 0) != (y < 0))) q--;
+            return bigint((long long)q);
+        }
+        bigint q = a / b;
+        bigint r = a - q * b;
+        if (r != bigint(0) && ((r < bigint(0)) != (b < bigint(0)))) q = q - bigint(1);
+        return q;
+    }
+
     Value evalAugAssignment(node_ptr node, Context* ctx) {
         auto an = static_pointer_cast<AugAssignNode>(node);
         Value old_val = evalNode(an->target, ctx);
@@ -1044,22 +1194,34 @@ public:   // NythonExecutor is a struct: members default to public
                 result = Value(std::pow(a, b));
             }
             else if (old_val.type == ValueType::INTEGER && new_val.type == ValueType::INTEGER) {
-                int64_t base = bigint_to_i64(old_val.value.i);
                 int64_t exp = bigint_to_i64(new_val.value.i);
-                int64_t r = 1;
-                for (int64_t i = 0; i < exp; i++) r *= base;
-                result = Value(static_cast<int>(r));
+                if (exp < 0) {
+                    result = Value(std::pow((double)bigint_to_i64(old_val.value.i), (double)exp));
+                } else {
+                    // exact, any size (square-and-multiply on bigint)
+                    bigint base = old_val.value.i, r = bigint(1);
+                    while (exp > 0) {
+                        if (exp & 1) r = r * base;
+                        exp >>= 1;
+                        if (exp) base = base * base;
+                    }
+                    result = Value(r);
+                }
             } else {
                 double a = old_val.type == ValueType::DOUBLE ? static_cast<double>(old_val.value.d) : static_cast<double>(bigint_to_i64(old_val.value.i));
                 double b = new_val.type == ValueType::DOUBLE ? static_cast<double>(new_val.value.d) : static_cast<double>(bigint_to_i64(new_val.value.i));
                 result = Value(std::pow(a, b));
             }
         }
+        else if ((an->op == "//=" || an->op == "\\=") && old_val.type == ValueType::INTEGER && new_val.type == ValueType::INTEGER) {
+            if (new_val.value.i == bigint(0)) throw std::string("__exc__:ZeroDivisionError:division by zero");
+            result = Value(floorDivInt(old_val.value.i, new_val.value.i));
+        }
         else if (an->op == "//=" || an->op == "\\=") {
             double da = old_val.type == ValueType::DOUBLE ? static_cast<double>(old_val.value.d) : static_cast<double>(bigint_to_i64(old_val.value.i));
             double db = new_val.type == ValueType::DOUBLE ? static_cast<double>(new_val.value.d) : static_cast<double>(bigint_to_i64(new_val.value.i));
             if (db == 0) throw std::string("__exc__:ZeroDivisionError:division by zero");
-            result = Value(static_cast<int>(std::floor(da / db)));
+            result = Value(std::floor(da / db));   // a float operand gives a float, as with //
         }
         else if (an->op == "&=") {
             int64_t a = old_val.type == ValueType::DOUBLE ? static_cast<int64_t>(old_val.value.d) : bigint_to_i64(old_val.value.i);
@@ -1443,13 +1605,8 @@ return lv * rv;
             // The VM already treats them as synonyms (VirtualMachine.hpp's
             // bin_op()); this brings the interpreter to parity.
             if (lv.type == ValueType::INTEGER && rv.type == ValueType::INTEGER) {
-                int64_t a = bigint_to_i64(lv.value.i);
-                int64_t b = bigint_to_i64(rv.value.i);
-                if (b == 0) throw std::string("__exc__:ZeroDivisionError:division by zero");
-                int64_t result = a / b;
-                // Floor toward negative infinity (Python semantics)
-                if ((a ^ b) < 0 && result * b != a) result--;
-                return Value(static_cast<int>(result));
+                if (rv.value.i == bigint(0)) throw std::string("__exc__:ZeroDivisionError:division by zero");
+                return Value(floorDivInt(lv.value.i, rv.value.i));
             }
             if (lv.type == ValueType::DOUBLE || rv.type == ValueType::DOUBLE) {
                 double a = (lv.type == ValueType::DOUBLE) ? static_cast<double>(lv.value.d) : static_cast<double>(bigint_to_i64(lv.value.i));
@@ -1760,10 +1917,9 @@ return lv * rv;
         }
         if (un->op == "-") {
             if (v.type == ValueType::INTEGER) {
-                int64_t val = (long long)v.value.i;
-                nython::kernel::bigint zero(0);
-                if (v.value.i < zero) val = -val;
-                return Value((int)(-val));
+                // Full width: -5000000000 used to come out as -705032704 (the
+                // result was cast to a 32-bit int).
+                return Value(nython::kernel::bigint(0) - v.value.i);
             }
             if (v.type == ValueType::DOUBLE) return Value(-v.value.d);
             return Value(0) - v;
@@ -1772,7 +1928,7 @@ return lv * rv;
         if (un->op == "!" || un->op == "not") return Value(v.isFalse() || v.isNone());
         if (un->op == "~") {
             if (v.type == ValueType::INTEGER)
-                return Value(static_cast<int>(~bigint_to_i64(v.value.i)));
+                return Value(nython::kernel::bigint(0) - v.value.i - nython::kernel::bigint(1));   // ~x == -x - 1
             return Value(0);
         }
         if (un->op == "++" || un->op == "--") {
@@ -2474,6 +2630,11 @@ return lv * rv;
         if (fn_val.type != ValueType::USERDATA || !fn_val.value.p) return NONE_VALUE;
         auto fit = func_names.find(fn_val.value.p);
         if (fit == func_names.end()) return NONE_VALUE;
+        // A builtin, an instance or a class is not an AST function: treating its
+        // pointer as a Node* crashed (e.g. thread_create(print)).
+        if (fit->second.rfind("__builtin__:", 0) == 0) return callBuiltin(fit->second.substr(12), call_args, ctx);
+        if (fit->second.rfind("__instance__:", 0) == 0) return callMethod(fn_val, "__call__", call_args, ctx);
+        if (fit->second.rfind("__class__:", 0) == 0) return NONE_VALUE;
         // Bound-method `self` is supplied centrally in bindParamsKw via the
         // callee pointer. Lambdas are never bound (makeBoundMethod only binds
         // FUNCTION nodes declaring self), so the lambda path below can use
@@ -3682,10 +3843,10 @@ return lv * rv;
                     CtxReaper _reap_fn_ctx3162(this, fn_ctx);
                     fn_ctx->defineByName("self", obj);
                     size_t param_start = (!fn->params.empty() && fn->params[0]->value() == "self") ? 1 : 0;
-                    for (size_t i = param_start; i < fn->params.size(); i++) {
-                        size_t arg_idx = i - param_start;
-                        if (arg_idx < args.size()) fn_ctx->defineByName(fn->params[i]->value(), args[arg_idx]);
-                    }
+                    // Defaults and keyword arguments too: binding only the supplied
+                    // arguments left a missing parameter undefined, so an
+                    // inherited `def m(self, x=5)` saw x as "" (round 74).
+                    bindParamsKw(fn, args, kw_args_in, fn_ctx, ctx, param_start);
                     return runFunctionBody(fn, fn_ctx);
                 }
             }
@@ -3712,10 +3873,7 @@ return lv * rv;
                                     fn_ctx->defineByName("self", obj);
                                     size_t param_start = 0;
                                     if (!fn->params.empty() && fn->params[0]->value() == "self") param_start = 1;
-                                    for (size_t i = param_start; i < fn->params.size(); i++) {
-                                        size_t arg_idx = i - param_start;
-                                        if (arg_idx < args.size()) fn_ctx->defineByName(fn->params[i]->value(), args[arg_idx]);
-                                    }
+                                    bindParamsKw(fn, args, kw_args_in, fn_ctx, ctx, param_start);   // defaults too (round 74)
                                     return runFunctionBody(fn, fn_ctx);
                                 }
                             }
@@ -3745,10 +3903,7 @@ return lv * rv;
                                         fn_ctx->defineByName("self", obj);
                                         size_t param_start = 0;
                                         if (!fn->params.empty() && fn->params[0]->value() == "self") param_start = 1;
-                                        for (size_t i = param_start; i < fn->params.size(); i++) {
-                                            size_t arg_idx = i - param_start;
-                                            if (arg_idx < args.size()) fn_ctx->defineByName(fn->params[i]->value(), args[arg_idx]);
-                                        }
+                                        bindParamsKw(fn, args, kw_args_in, fn_ctx, ctx, param_start);   // defaults too (round 74)
                                         return runFunctionBody(fn, fn_ctx);
                                     }
                                 }
@@ -4046,7 +4201,8 @@ return lv * rv;
     // call that builtin by bare name inside it — e.g. `def read_file(self, f)`
     // containing `read_file(f)`. The bare name resolves back to the method, so
     // it calls itself forever.) Convert that into a catchable Nython error.
-    int call_depth_ = 0;
+    // Per OS thread: each thread has its own C++ stack (round 74).
+    static inline thread_local int call_depth_ = 0;
     static const int kMaxCallDepth = 900;
     struct DepthGuard {
         int& d;
@@ -4079,10 +4235,11 @@ public:
     };
     static bool& profiling_enabled() { static bool e = false; return e; }
     std::map<std::string, ProfEntry> prof_;
-    long long prof_child_ns_ = 0;   // ns charged to callees of the current frame
-    long long prof_child_objs_ = 0; // allocations charged to callees, likewise
-    long long prof_child_strs_ = 0;
-    long long prof_child_sbytes_ = 0;
+    // Per OS thread (round 74): a frame's children run on the same thread.
+    static inline thread_local long long prof_child_ns_ = 0;   // ns charged to callees of the current frame
+    static inline thread_local long long prof_child_objs_ = 0; // allocations charged to callees, likewise
+    static inline thread_local long long prof_child_strs_ = 0;
+    static inline thread_local long long prof_child_sbytes_ = 0;
 
     struct ProfScope {
         NythonExecutor* ex; std::string name; bool on;
@@ -4177,7 +4334,9 @@ public:
     };
     static TraceState& tracer() { static TraceState t; return t; }
     static bool trace_on() { return tracer().f != nullptr; }
-    static node_ptr& last_stmt() { static node_ptr p; return p; }
+    // Per OS thread (round 74): written on every statement; a shared
+    // shared_ptr assigned from two threads corrupted AST refcounts.
+    static node_ptr& last_stmt() { static thread_local node_ptr p; return p; }
     // "file.ny:12" for the statement that was executing, "" if none.
     static std::string last_stmt_where() {
         auto& n = last_stmt();
@@ -4275,6 +4434,7 @@ public:
     }
 
     inline void noteStatement(const node_ptr& st, Context* ctx) {
+        nyconc::tick();          // GIL switch point (no-op until a thread exists)
         last_stmt() = st;
         if (trace_on()) traceStatement(st, ctx);
     }
@@ -4666,6 +4826,21 @@ public:
                 auto sit = kw_args.find("start");
                 if (sit != kw_args.end()) args.push_back(sit->second);
             }
+            // Builtins that take named options receive them as one trailing
+            // map - the convention the VM's CALL_KW already uses for natives,
+            // so the same implementation serves both engines (nyos::Args).
+            static const std::unordered_set<std::string> kwmap_builtins = {
+                "os_run", "subprocess_run", "os_spawn", "os_wait", "os_kill",
+                "os_getenv", "getenv", "env", "os_makedirs", "os_rmtree",
+                "os_mkstemp", "os_mkdtemp", "os_path_relpath",
+                "time_format", "time_date", "time_strftime", "time_iso",
+                "file_open", "file_open_or_raise", "os_proc_read", "os_poll"
+            };
+            if (!kw_args.empty() && kwmap_builtins.count(builtin)) {
+                auto* kw = new Object((Runnable*)runner, "map", Type::MAP);
+                for (auto& kv : kw_args) kw->set(kv.first, kv.second);
+                args.push_back(Value((Collectable*)kw));
+            }
             return callBuiltin(builtin, args, ctx);
         }
         // Also check callee token for builtin (for print etc parsed as keywords)
@@ -4951,7 +5126,12 @@ public:
             "NameError","RuntimeError","IOError","OSError","FileNotFoundError",
             "ZeroDivisionError","OverflowError","MemoryError","RecursionError",
             "StopIteration","GeneratorExit","SystemExit","KeyboardInterrupt",
-            "AssertionError","NotImplementedError","PermissionError","TimeoutError"
+            "AssertionError","NotImplementedError","PermissionError","TimeoutError",
+            "IsADirectoryError","NotADirectoryError","FileExistsError","ChildProcessError",
+            "ProcessLookupError","InterruptedError","BlockingIOError","ConnectionError",
+            "BrokenPipeError","ConnectionRefusedError","ConnectionResetError",
+            "LookupError","ArithmeticError","EOFError","ImportError","ModuleNotFoundError",
+            "UnicodeError"
         };
         if (exc_types_.count(name_orig)) {
             // Create exception Value tagged as "__exc__:TypeName:message"
@@ -4969,6 +5149,9 @@ public:
 
         // ── Module dispatch (try each module in priority order) ────────────────
         Value result;
+        // Shared tensor kernels first: they replace the older per-module
+        // implementations of the same names (see include/NyTensor.hpp).
+        result = dispatch_nt(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         result = dispatch_lang(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         result = dispatch_core(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         result = dispatch_tensor(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
@@ -4981,6 +5164,7 @@ public:
         result = dispatch_data(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         result = dispatch_threading(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         result = dispatch_gui(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
+        result = dispatch_text(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         return NONE_VALUE;
     }
 
@@ -5038,7 +5222,8 @@ public:
     // ─── ATTRIBUTE / SUBSCRIPT ──────────────────────────────────────────
     // Receivers already evaluated by evalCall, keyed by the object node. Lets
     // the callee-lookup fallback reuse a receiver instead of re-running it.
-    std::unordered_map<const void*, Value> receiver_cache_;
+    // Per OS thread (round 74): two threads can run the same call node.
+    static inline thread_local std::unordered_map<const void*, Value> receiver_cache_;
 
     Value evalAttribute(node_ptr node, Context* ctx) {
         auto an = static_pointer_cast<AttributeNode>(node);
@@ -5083,6 +5268,20 @@ public:
             if (cont && cont->container) {
                 auto it = cont->container->find(an->attr);
                 if (it != cont->container->end()) return it->second;
+            }
+        }
+        // A builtin used as a namespace: `import time` then time.time(),
+        // time.sleep(1), time.monotonic() - the builtin time_X, else X for
+        // `time`. A builtin must never reach the class lookup below: its
+        // pointer is a std::string, and reading it as an AST node crashed
+        // (time.time() was a segmentation fault).
+        if (obj.type == ValueType::USERDATA && obj.value.p) {
+            auto bit = func_names.find(obj.value.p);
+            if (bit != func_names.end() && bit->second.rfind("__builtin__:", 0) == 0) {
+                std::string target = nyrt::builtin_member(bit->second.substr(12), an->attr,
+                    [&](const std::string& n) { return builtin_ptrs.count(n) > 0; });
+                if (!target.empty()) return builtinValue(target);
+                return NONE_VALUE;
             }
         }
         // Class variable / static method lookup: ClassName.var or ClassName.staticmethod
@@ -6258,8 +6457,30 @@ public:
                 return NONE_VALUE;
         }
         if (module_name == "sys") {
-                ctx->defineByName("argv", makeStringValue("nython"));
-                ctx->defineByName("platform", makeStringValue("linux"));
+                // `sys` is a namespace: sys.argv (the script path, then the
+                // arguments after it on the command line), sys.platform,
+                // sys.executable, sys.version. argv and platform are also
+                // bound bare, as they always were - but argv is now the real
+                // list, not the string "nython", and platform is the real OS.
+                std::vector<std::string> av = nyrt::argv();
+                Value argv_list = nyos_list_of(av);
+                std::string plat;
+#if defined(_WIN32)
+                plat = "win32";
+#elif defined(__APPLE__)
+                plat = "darwin";
+#else
+                plat = "linux";
+#endif
+                auto* ns = new Object((Runnable*)runner, in_node->alias.empty() ? "sys" : in_node->alias, Type::MAP);
+                ns->set("argv", argv_list);
+                ns->set("platform", makeStringValue(plat));
+                ns->set("executable", makeStringValue(nyrt::executable_path()));
+                ns->set("version", makeStringValue(NYTHON_VERSION));
+                ctx->defineByName(in_node->alias.empty() ? "sys" : in_node->alias, Value((Collectable*)ns));
+                ctx->defineByName("argv", argv_list);
+                ctx->defineByName("platform", makeStringValue(plat));
+                imported_modules_.erase(module_name);   // `import sys as s` after `import sys`
                 return NONE_VALUE;
         }
         if (module_name == "json") {
@@ -6323,6 +6544,10 @@ public:
                 registerBuiltin("os_path_dirname");
                 registerBuiltin("os_path_ext");
                 registerBuiltin("os_path_abs");
+                if (module_name == "os") {
+                    ctx->defineByName(in_node->alias.empty() ? "os" : in_node->alias, makeOsNamespace());
+                    imported_modules_.erase(module_name);
+                }
                 return NONE_VALUE;
         }
         if (module_name == "regex" || module_name == "re") {
@@ -6605,6 +6830,25 @@ public:
                 // times the module has been imported.
                 std::set<std::string> own;
                 if (aliased) collectTopLevelNames(ast, own);
+
+                // While the module's top level runs, __name__ is the module's
+                // name and __file__ its path, so `if __name__ == "__main__":`
+                // in a module does not run on import.
+                struct NameScope {
+                    Context* c; Value name, file;
+                    NameScope(Context* cx, Value n, Value f, Value nn, Value nf) : c(cx), name(n), file(f) {
+                        c->defineByName("__name__", nn); c->defineByName("__file__", nf);
+                    }
+                    ~NameScope() { c->defineByName("__name__", name); c->defineByName("__file__", file); }
+                };
+                std::string stem = filepath;
+                {
+                    size_t cut = stem.find_last_of("/\\");
+                    if (cut != std::string::npos) stem = stem.substr(cut + 1);
+                    if (stem.size() > 3 && stem.compare(stem.size() - 3, 3, ".ny") == 0) stem = stem.substr(0, stem.size() - 3);
+                }
+                Value prev_name = ctx->getByName("__name__"), prev_file = ctx->getByName("__file__");
+                NameScope name_scope(ctx, prev_name, prev_file, makeStringValue(stem), makeStringValue(filepath));
 
                 evalNode(ast, ctx);
 

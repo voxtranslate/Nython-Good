@@ -8,10 +8,16 @@ import "ide_core.ny"
 import "lib/ide_selection.ny"
 
 
-# A shell command running in the background with its output captured to a
-# file and read incrementally. Run, the debugger's recording and the terminal
-# all use it, so none of them can freeze the IDE; the old IDE blocked in popen
-# until a program finished, with no way to stop it.
+# A shell command running in the background whose output is read
+# incrementally. Run, Build, tools, the debugger's recording and the
+# terminal all use it, so none of them can freeze the IDE.
+#
+# It runs on the OS layer's process API: os_spawn starts `sh -c` in its own
+# process group with stdout and stderr on pipes, os_proc_read drains them
+# without blocking, os_poll reaps the exit code and os_kill signals the whole
+# group. Nothing touches the disk and polling starts no process. Where
+# os_spawn is not available (Windows), the older route is used: the command
+# runs in the background with its output in a file, read with `tail`.
 class BgProc:
     def __init__(self, base):
         self.base = base
@@ -20,24 +26,19 @@ class BgProc:
         self.pidf = base + ".pid"
         self.running = false
         self.code = 0
-        self.read = 0              # lines of the log already returned
+        self.read = 0              # file route: lines of the log already returned
         self.seen_size = -1
         self.poll_t = 0
         self.t0 = 0
         self.killed = false
+        self.pid = -1              # process route: the os_spawn pid, -1 for the file route
+        self.partial = ""          # process route: output after the last newline
 
     def _q(self, s):
         return "'" + string_replace(s, "'", "'\\''") + "'"
 
-    # `inner` is a shell command line; stdout and stderr go to the log.
+    # `inner` is a shell command line; stdout and stderr are captured together.
     def start(self, inner, cwd):
-        write_file(self.log, "")
-        if os_exists(self.exitf):
-            os_remove(self.exitf)
-        # A subshell, not a { } group: `exit 3` in the command must end the
-        # command, not the wrapper that records its exit status.
-        var script = "cd " + self._q(cwd) + " && ( " + inner + "\n) < /dev/null > " + self._q(self.log) + " 2>&1; echo $? > " + self._q(self.exitf)
-        os_exec("(sh -c " + self._q(script) + " & echo $! > " + self._q(self.pidf) + ") > /dev/null 2>&1")
         self.running = true
         self.code = 0
         self.read = 0
@@ -45,14 +46,24 @@ class BgProc:
         self.killed = false
         self.t0 = time_ms()
         self.poll_t = 0
+        self.partial = ""
+        self.pid = -1
+        # A subshell, not a { } group: `exit 3` in the command must end the
+        # command, not the wrapper. stderr joins stdout so the two stay in
+        # the order they were written.
+        try:
+            self.pid = os_spawn("( " + inner + "\n) < /dev/null 2>&1", cwd=cwd)
+            return
+        except Exception as e:
+            self.pid = -1
+        write_file(self.log, "")
+        if os_exists(self.exitf):
+            os_remove(self.exitf)
+        var script = "cd " + self._q(cwd) + " && ( " + inner + "\n) < /dev/null > " + self._q(self.log) + " 2>&1; echo $? > " + self._q(self.exitf)
+        os_exec("(sh -c " + self._q(script) + " & echo $! > " + self._q(self.pidf) + ") > /dev/null 2>&1")
 
     # Complete new lines since the last poll ([] if none); sets running=false
     # and code once the process has exited and everything has been read.
-    #
-    # Counted in lines, not bytes: os_exec strips trailing newlines from what
-    # it returns and len() counts characters, so a byte offset drifted and a
-    # job whose output ended in "\n" was never seen to finish. The "; printf
-    # x" sentinel keeps the trailing newlines intact.
     def poll(self, min_ms):
         var out = []
         if not self.running:
@@ -61,6 +72,40 @@ class BgProc:
         if now - self.poll_t < min_ms:
             return out
         self.poll_t = now
+        if self.pid >= 0:
+            return self._poll_proc(out)
+        return self._poll_file(out)
+
+    def _poll_proc(self, out):
+        var code = os_poll(self.pid)
+        var r = os_proc_read(self.pid)
+        var chunk = r["stdout"]
+        if chunk != "":
+            var text = self.partial + chunk
+            var lines = string_split(text, "\n")
+            var n = len(lines)
+            var i = 0
+            while i < n - 1:
+                out.append(lines[i])
+                i = i + 1
+            self.partial = lines[n - 1]
+        if code != none and r["done"]:
+            # Everything is read once the pipes are closed; the last line may
+            # lack its newline.
+            if self.partial != "":
+                out.append(self.partial)
+                self.partial = ""
+            self.code = code
+            if self.killed:
+                self.code = 143
+            self.running = false
+        return out
+
+    # Counted in lines, not bytes: os_exec strips trailing newlines from what
+    # it returns and len() counts characters, so a byte offset drifted and a
+    # job whose output ended in "\n" was never seen to finish. The "; printf
+    # x" sentinel keeps the trailing newlines intact.
+    def _poll_file(self, out):
         var done = os_exists(self.exitf)
         var size = file_size(self.log)
         if size == none:
@@ -96,11 +141,17 @@ class BgProc:
     def stop(self):
         if not self.running:
             return
+        self.killed = true
+        if self.pid >= 0:
+            # The process group os_spawn made: the shell and all it started.
+            try:
+                os_kill(self.pid, sig=15)
+            except Exception as e:
+                pass
+            return
         var pid = string_strip(read_file(self.pidf))
         if pid != "":
-            # The sh -c wrapper and everything it started.
             os_exec("pkill -TERM -P " + pid + " > /dev/null 2>&1; kill " + pid + " > /dev/null 2>&1")
-        self.killed = true
         write_file(self.exitf, "143")
 
     def elapsed(self):
@@ -481,10 +532,10 @@ class IDEOps(IDECore):
             return
         var h = self.find_hits[self.find_index]
         var b = self.buf()
-        b.begin_group()
+        var g = b.open_group()
         b.delete_range(h[0], h[1], h[0], h[1] + h[2])
         b.insert_text(self._replacement_for(b.get_line(h[0]), h))
-        b.begin_group()
+        b.close_group(g)
         self._after_edit()
         var idx = self.find_index
         self._find_run()
@@ -656,28 +707,13 @@ class IDEOps(IDECore):
             return self.ws_files
         var out = []
         if self.ws.root != "":
-            self._walk_files(self.ws.root, 0, out)
+            # Native walk (fs_list_files): the same rules as before - no dot
+            # names, no build/node_modules/__pycache__, 8 levels, 4000 files.
+            out = fs_list_files(self.ws.root, {"max": 4000, "depth": 8, "full": true,
+                                               "skip": ["build", "node_modules", "__pycache__"]})
         self.ws_files = out
         self.ws_files_root = self.ws.root
         return out
-
-    def _walk_files(self, dir, depth, out):
-        if depth > 8 or len(out) >= 4000:
-            return
-        var ents = os_listdir(dir)
-        if ents == none:
-            return
-        ents = sorted(ents)
-        var i = 0
-        while i < len(ents):
-            var nm = ents[i]
-            if not string_startswith(nm, ".") and nm != "build" and nm != "node_modules" and nm != "__pycache__":
-                var full = path_join(dir, nm)
-                if os_isdir(full):
-                    self._walk_files(full, depth + 1, out)
-                else:
-                    out.append(full)
-            i = i + 1
 
     def _file_items(self):
         var out = []
@@ -718,34 +754,27 @@ class IDEOps(IDECore):
 
     def _workspace_symbol_items(self):
         var out = []
-        var files = self._workspace_files()
+        if self.ws.root == "":
+            return out
+        # One native pass over the workspace (fs_symbols) instead of reading
+        # and splitting every .ny file in the interpreter each time # opens.
+        var syms = fs_symbols(self.ws.root, {"max": 3000, "skip": ["build", "node_modules", "__pycache__"]})
         var i = 0
-        while i < len(files) and len(out) < 3000:
-            var p = files[i]
-            if os_path_ext(p) == ".ny" and file_size(p) < 600000:
-                var text = read_file(p)
-                if text != none:
-                    var lines = string_split(text, "\n")
-                    var r = 0
-                    while r < len(lines):
-                        var sym = self._symbol_on_line(lines[r])
-                        if sym != none:
-                            var it = QuickItem(sym[0], self._rel(p) + ":" + str(r + 1), p + "|" + str(r), sym[1])
-                            out.append(it)
-                        r = r + 1
+        while i < len(syms):
+            var s = syms[i]
+            var where = s[0] + ":" + str(s[3] + 1)
+            if s[5] != "":
+                where = s[5] + "  " + where
+            var it = QuickItem(s[1], where, self.ws.root + "/" + s[0] + "|" + str(s[3]), s[2])
+            out.append(it)
             i = i + 1
         return out
 
-    # [name, kind, row, col] for class / def / top-level var declarations.
+    # [name, kind, row, col, container, detail, depth] for every class,
+    # function, method, field, variable and constant: ny_symbols, a native
+    # line scanner that also works while the file does not parse.
     def _doc_symbols(self, b):
-        var out = []
-        var r = 0
-        while r < b.line_count:
-            var sym = self._symbol_on_line(b.get_line(r))
-            if sym != none:
-                out.append([sym[0], sym[1], r, sym[2]])
-            r = r + 1
-        return out
+        return ny_symbols(b.lines)
 
     def _symbol_on_line(self, raw):
         var st = string_strip(raw)
@@ -826,8 +855,10 @@ class IDEOps(IDECore):
             if ents != none:
                 ents = sorted(ents)
                 var up = os_path_dirname(string_slice(dir, 0, len(dir) - 1))
+                if not string_endswith(up, "/"):
+                    up = up + "/"
                 if string_endswith(dir, "/") and len(dir) > 1:
-                    items.append(QuickItem("..", "parent folder", up + "/", "folder"))
+                    items.append(QuickItem("..", "parent folder", up, "folder"))
                 var i = 0
                 while i < len(ents) and len(items) < 400:
                     var nm = ents[i]
@@ -943,6 +974,9 @@ class IDEOps(IDECore):
                 return
         self.qi.close()
         self.focus = self.focus_before_qi
+        if string_startswith(action, "t."):
+            self._tools_accept(action, value, item)
+            return
         if action == "commands":
             if item != none:
                 # "Recently used" in the palette means used from the palette,
@@ -1518,23 +1552,19 @@ class IDEOps(IDECore):
     def _check_file(self, d):
         if d == none or d.buf == none or d.lang != "nython":
             return
-        var path = d.path
-        var target = path
-        if d.kind != "file" or d.dirty():
-            self.run_seq = self.run_seq + 1
-            target = "/tmp/nyide_check_" + str(self.session_id) + ".ny"
-            write_file(target, d.buf.get_all_text())
-        if target == "":
-            return
-        var out = os_exec(self._q(self._interpreter()) + " --ast " + self._q(target) + " 2>&1 > /dev/null < /dev/null")
-        var probs = self._parse_diagnostics(out, target, "")
-        var key = path
+        # In process, through the real lexer and parser (ny_check_syntax).
+        # This used to write the buffer to a temp file and wait for a second
+        # interpreter to parse it (--ast): a blocking process spawn on every
+        # open, every save and every pause in typing.
+        var diags = ny_check_syntax(d.buf.lines)
+        var key = d.path
         if key == "":
             key = "untitled:" + d.title
+        var probs = []
         var i = 0
-        while i < len(probs):
-            probs[i]["path"] = key
-            probs[i]["src"] = "syntax"
+        while i < len(diags):
+            var g = diags[i]
+            probs.append({"sev": "err", "msg": g[2], "path": key, "line": g[0] + 1, "col": g[1] + 1, "src": "syntax"})
             i = i + 1
         self._set_problems_for(key, "syntax", probs)
         d.problem_stamp = d.buf.state_id()
@@ -1601,8 +1631,9 @@ class IDEOps(IDECore):
         body = body + "panel = " + str(self.panel_open) + "\n"
         body = body + "sidebar = " + str(self.sidebar_open) + "\n"
         body = body + "render_whitespace = " + str(self.show_whitespace) + "\n"
-        body = body + "# off | afterDelay\n"
+        body = body + "# off | afterDelay | onFocusChange\n"
         body = body + "auto_save = " + self.auto_save + "\n"
+        body = body + self._tools_settings_text()
         return body
 
     def _save_settings(self):
@@ -1623,6 +1654,7 @@ class IDEOps(IDECore):
         if text == none or text == "":
             return false
         self.loading_settings = true
+        self._tools_settings_reset()
         var lines = string_split(text, "\n")
         var i = 0
         while i < len(lines):
@@ -1657,9 +1689,12 @@ class IDEOps(IDECore):
                     elif k == "render_whitespace":
                         self.show_whitespace = (v == "true")
                     elif k == "auto_save":
-                        if v == "afterDelay" or v == "off":
+                        if v == "afterDelay" or v == "off" or v == "onFocusChange":
                             self.auto_save = v
+                    else:
+                        self._tools_setting(k, v)
             i = i + 1
+        self._tools_settings_loaded()
         self.loading_settings = false
         self._layout()
         return true
@@ -1697,6 +1732,8 @@ class IDEOps(IDECore):
                 var dp = string_slice(ln, 7, len(ln))
                 if os_isdir(dp):
                     self.recent_folders.append(dp)
+            else:
+                self._tools_state_line(ln)
             i = i + 1
 
     def _save_state(self):
@@ -1712,6 +1749,7 @@ class IDEOps(IDECore):
         while i < len(self.recent):
             body = body + "file=" + self.recent[i] + "\n"
             i = i + 1
+        body = body + self._tools_state_text()
         write_file(p, body)
 
     def _remember_recent(self, path):
@@ -1950,7 +1988,7 @@ class IDEOps(IDECore):
     def _select_tree_path(self, p):
         # Expand every ancestor so the row exists, then select it.
         var dir = os_path_dirname(p)
-        while dir != "" and string_startswith(dir, self.ws.root) and dir != self.ws.root:
+        while dir != "" and dir != "/" and string_startswith(dir, self.ws.root) and dir != self.ws.root:
             self.ws.expanded[dir] = true
             dir = os_path_dirname(dir)
         self.ws.rebuild()
@@ -1982,22 +2020,19 @@ class IDEOps(IDECore):
                 self._goto(syms[i][2], syms[i][3])
                 return
             i = i + 1
-        var files = self._workspace_files()
-        var f = 0
-        while f < len(files):
-            var p = files[f]
-            if os_path_ext(p) == ".ny" and file_size(p) < 600000:
-                var text = read_file(p)
-                if text != none and string_find(text, w) >= 0:
-                    var lines = string_split(text, "\n")
-                    var r = 0
-                    while r < len(lines):
-                        var sym = self._symbol_on_line(lines[r])
-                        if sym != none and sym[0] == w:
-                            self._open_path(p, r, sym[2])
-                            return
-                        r = r + 1
-            f = f + 1
+        # Then the workspace, natively: a definition is `def w`, `class w`,
+        # `struct/enum/interface w` or `var/const w =` at the start of a line.
+        if self.ws.root != "":
+            var pat = "^\\s*(async\\s+)?(def|class|struct|enum|interface|fn)\\s+" + w + "\\b|^\\s*(var|const)\\s+" + w + "\\b"
+            var hits = fs_search(self.ws.root, pat, {"regex": true, "case": true, "include": "*.ny", "max_results": 1,
+                                                     "skip": ["build", "node_modules", "__pycache__"]})
+            if len(hits) > 0:
+                var h = hits[0]
+                var col = string_find(string_slice(h[3], h[2], len(h[3])), w)
+                if col < 0:
+                    col = 0
+                self._open_path(self.ws.root + "/" + h[0], h[1], h[2] + col)
+                return
         self._notify("No definition found for '" + w + "'", "info")
 
     def _find_references(self):
@@ -2214,6 +2249,7 @@ class IDEOps(IDECore):
         st["font_size"] = self.font_size
         st["status"] = self.status_msg
         st["clipboard"] = self._get_clipboard()
+        self._tools_dump(st)
         write_file(p + ".tmp", json_encode(st))
         os_rename(p + ".tmp", p)
 

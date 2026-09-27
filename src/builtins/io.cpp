@@ -37,6 +37,10 @@
 // Full executor definition (needed for E.getStringValue etc.)
 #include "NythonExecutor.hpp"
 #include "builtins/io.hpp"
+#include "builtins/os.hpp"
+#include "NyRuntime.hpp"
+#include <cerrno>
+#include <cstring>
 
 // ── Namespace imports (match main.cpp) ────────────────────────────────────────
 using namespace std;
@@ -48,6 +52,99 @@ using namespace nython::kernel;
 using namespace nython::parser;
 using namespace nython::reader;
 using namespace nython::exception;
+
+namespace {
+
+// A file handle argument: the int file_open returns, or a file object from
+// open() (its "handle" attribute) - an interpreter instance, or the map an
+// instance becomes when the VM passes it through the builtin bridge.
+long long handle_of(NythonExecutor& E, const Value& v) {
+    if (v.type == ValueType::INTEGER) return bigint_to_i64(v.value.i);
+    if (v.type == ValueType::DOUBLE) return (long long)v.value.d;
+    if (nyos::is_map(v)) {
+        for (auto& kv : nyos::map_items(v)) if (kv.first == "handle") return handle_of(E, kv.second);
+        return -1;
+    }
+    if (v.type == ValueType::USERDATA && v.value.p && !E.string_ptrs_.count(v.value.p)
+        && E.instance_properties.count(v.value.p)) {
+        auto* pctx = E.instance_properties[v.value.p];
+        if (pctx) {
+            try {
+                Value h = pctx->getByName("handle");
+                if (h.type == ValueType::INTEGER || h.type == ValueType::DOUBLE) return handle_of(E, h);
+            } catch (...) {}
+        }
+    }
+    return -1;
+}
+
+// "r" "w" "a" "x" plus "+" "b" "t", as Python spells them, to an fopen mode.
+// "x" (create, fail if it exists) is glibc's "wx".
+std::string fopen_mode(const std::string& mode) {
+    std::string m = mode.empty() ? "r" : mode;
+    std::string base;
+    bool plus = m.find('+') != std::string::npos, bin = m.find('b') != std::string::npos;
+    if (m.find('x') != std::string::npos) base = "w";
+    else if (m.find('w') != std::string::npos) base = "w";
+    else if (m.find('a') != std::string::npos) base = "a";
+    else base = "r";
+    std::string out = base;
+    if (plus) out += "+";
+    if (bin) out += "b";   // text mode translates line endings on Windows only
+#ifndef _WIN32
+    if (m.find('x') != std::string::npos) out += "x";
+#endif
+    return out;
+}
+
+// kv store lines are "key \x1F value"; escape the separator, newlines and
+// backslashes so any string round-trips (a newline used to end the value).
+std::string kv_escape(const std::string& s) {
+    std::string o;
+    for (char c : s) {
+        if (c == '\\') o += "\\\\";
+        else if (c == '\n') o += "\\n";
+        else if (c == '\r') o += "\\r";
+        else if (c == '\x1F') o += "\\u";
+        else o += c;
+    }
+    return o;
+}
+std::string kv_unescape(const std::string& s) {
+    std::string o;
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '\\' && i + 1 < s.size()) {
+            char n = s[++i];
+            if (n == 'n') o += '\n';
+            else if (n == 'r') o += '\r';
+            else if (n == 'u') o += '\x1F';
+            else o += n;
+        } else o += s[i];
+    }
+    return o;
+}
+std::map<std::string, std::string> kv_load(const std::string& store, std::vector<std::string>* order = nullptr) {
+    std::map<std::string, std::string> db;
+    std::ifstream fin(store, std::ios::binary);
+    if (!fin.is_open()) return db;
+    std::string line;
+    while (std::getline(fin, line)) {
+        auto eq = line.find('\x1F');
+        if (eq == std::string::npos) continue;
+        std::string k = kv_unescape(line.substr(0, eq));
+        if (order && !db.count(k)) order->push_back(k);
+        db[k] = kv_unescape(line.substr(eq + 1));
+    }
+    return db;
+}
+bool kv_save(const std::string& store, const std::map<std::string, std::string>& db) {
+    std::ofstream fout(store, std::ios::binary | std::ios::trunc);
+    if (!fout.is_open()) return false;
+    for (auto& kv : db) fout << kv_escape(kv.first) << '\x1F' << kv_escape(kv.second) << '\n';
+    return true;
+}
+
+} // namespace
 
 // ════════════════════════════════════════════════════════════════════════════════
 // dispatch_io
@@ -112,48 +209,25 @@ Value dispatch_io(NythonExecutor& E,
     };
 
 // ── Extracted builtin implementations ────────────────────────────────────────
-    // ── from main.cpp lines 2821–2926 ──────────────────────────────────────────
         // =====================================================================
-        // NYTORCH AGENT I/O: KEY-VALUE STORE (JSON-backed flat file database)
+        // KEY-VALUE STORE (flat file, one "key \x1F value" line per entry)
         // =====================================================================
         if (name == "kv_set") {
             // kv_set(store_file, key, value_str) -> bool
             if (args.size() >= 3) {
                 std::string store = getStringValue(args[0]);
-                std::string key   = getStringValue(args[1]);
-                std::string val   = getStringValue(args[2]);
-                // Load existing entries
-                std::map<std::string,std::string> db;
-                std::ifstream fin(store);
-                if (fin.is_open()) {
-                    std::string line;
-                    while (std::getline(fin, line)) {
-                        auto eq = line.find('\x1F');
-                        if (eq != std::string::npos) db[line.substr(0,eq)] = line.substr(eq+1);
-                    }
-                    fin.close();
-                }
-                db[key] = val;
-                std::ofstream fout(store);
-                for (auto& kv : db) fout << kv.first << '\x1F' << kv.second << '\n';
-                return Value(true);
+                auto db = kv_load(store);
+                db[getStringValue(args[1])] = getStringValue(args[2]);
+                return Value(kv_save(store, db));
             }
             return Value(false);
         }
         if (name == "kv_get") {
             // kv_get(store_file, key) -> string or none
             if (args.size() >= 2) {
-                std::string store = getStringValue(args[0]);
-                std::string key   = getStringValue(args[1]);
-                std::ifstream fin(store);
-                if (fin.is_open()) {
-                    std::string line;
-                    while (std::getline(fin, line)) {
-                        auto eq = line.find('\x1F');
-                        if (eq != std::string::npos && line.substr(0,eq) == key)
-                            return makeStringValue(line.substr(eq+1));
-                    }
-                }
+                auto db = kv_load(getStringValue(args[0]));
+                auto it = db.find(getStringValue(args[1]));
+                if (it != db.end()) return makeStringValue(it->second);
             }
             return NONE_VALUE;
         }
@@ -161,20 +235,9 @@ Value dispatch_io(NythonExecutor& E,
             // kv_del(store_file, key) -> bool
             if (args.size() >= 2) {
                 std::string store = getStringValue(args[0]);
-                std::string key   = getStringValue(args[1]);
-                std::map<std::string,std::string> db;
-                std::ifstream fin(store);
-                if (fin.is_open()) {
-                    std::string line;
-                    while (std::getline(fin, line)) {
-                        auto eq = line.find('\x1F');
-                        if (eq != std::string::npos) db[line.substr(0,eq)] = line.substr(eq+1);
-                    }
-                    fin.close();
-                }
-                bool erased = (db.erase(key) > 0);
-                std::ofstream fout(store);
-                for (auto& kv : db) fout << kv.first << '\x1F' << kv.second << '\n';
+                auto db = kv_load(store);
+                bool erased = db.erase(getStringValue(args[1])) > 0;
+                if (erased) kv_save(store, db);
                 return Value(erased);
             }
             return Value(false);
@@ -182,44 +245,21 @@ Value dispatch_io(NythonExecutor& E,
         if (name == "kv_keys") {
             // kv_keys(store_file) -> list of key strings
             if (!args.empty()) {
-                std::string store = getStringValue(args[0]);
-                auto* lst = new Container((Runnable*)runner, Type::LIST);
-                int idx = 0;
-                std::ifstream fin(store);
-                if (fin.is_open()) {
-                    std::string line;
-                    while (std::getline(fin, line)) {
-                        auto eq = line.find('\x1F');
-                        if (eq != std::string::npos) {
-                            (*lst->container)[std::to_string(idx++)] = makeStringValue(line.substr(0,eq));
-                        }
-                    }
-                }
-                (*lst->container)["__len__"] = Value(idx);
-                return Value((Collectable*)lst);
+                std::vector<std::string> order;
+                kv_load(getStringValue(args[0]), &order);
+                return nyos::make_str_list(E, order);
             }
             return NONE_VALUE;
         }
         if (name == "kv_all") {
             // kv_all(store_file) -> map {key: value}
             if (!args.empty()) {
-                std::string store = getStringValue(args[0]);
                 auto* obj = new Object((Runnable*)runner, "map", Type::MAP);
-                std::ifstream fin(store);
-                if (fin.is_open()) {
-                    std::string line;
-                    while (std::getline(fin, line)) {
-                        auto eq = line.find('\x1F');
-                        if (eq != std::string::npos)
-                            obj->set(line.substr(0,eq), makeStringValue(line.substr(eq+1)));
-                    }
-                }
+                for (auto& kv : kv_load(getStringValue(args[0]))) obj->set(kv.first, makeStringValue(kv.second));
                 return Value((Collectable*)obj);
             }
             return NONE_VALUE;
         }
-        // =====================================================================
-    // ── from main.cpp lines 4989–5195 ──────────────────────────────────────────
         // ===================== COMPLETE I/O MODULE =====================
         if (name == "input") {
             // input(prompt) -> reads line from stdin
@@ -233,85 +273,129 @@ Value dispatch_io(NythonExecutor& E,
             }
             return makeStringValue("");
         }
-        if (name == "file_open" || name == "open") {
-            if (args.size() >= 1) {
-                std::string path = getStringValue(args[0]);
-                std::string mode = (args.size() >= 2) ? getStringValue(args[1]) : "r";
-                FILE* f = fopen(path.c_str(), mode.c_str());
-                if (f) {
-                    int handle = next_file_handle++;
-                    file_handles[handle] = f;
-                    return Value(handle);
-                }
+        // ── Handle-based files ───────────────────────────────────────────────
+        // file_open(path, mode="r") -> int handle, or -1. Every handle
+        // function also accepts the file object open() returns.
+        if (name == "file_open" || name == "file_open_or_raise") {
+            nyos::Args A(E, args, {"mode"});
+            std::string path = A.str(0, "path");
+            std::string mode = A.str(1, "mode", "r");
+            bool raise = name == "file_open_or_raise";
+            struct stat st;
+            if (path.empty()) {
+                if (raise) nyos::raise_errno(ENOENT, path);
+                return Value(-1);
             }
-            return Value(-1);
+            if (::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+                // fopen() of a directory for reading succeeds on Linux.
+                if (raise) nyos::raise_errno(EISDIR, path);
+                return Value(-1);
+            }
+            if (mode.find('x') != std::string::npos && ::stat(path.c_str(), &st) == 0) {
+                if (raise) nyos::raise_errno(EEXIST, path);
+                return Value(-1);
+            }
+            errno = 0;
+            FILE* f = fopen(path.c_str(), fopen_mode(mode).c_str());
+            if (!f) {
+                if (raise) nyos::raise_errno(errno ? errno : ENOENT, path);
+                return Value(-1);
+            }
+            int handle = next_file_handle++;
+            file_handles[handle] = f;
+            return Value(handle);
         }
+        if (name == "open") {
+            // Reached only if the prelude's open() was replaced by a user
+            // definition that calls the builtin: the legacy int handle.
+            if (args.empty()) return Value(-1);
+            std::string mode = args.size() >= 2 ? getStringValue(args[1]) : "r";
+            FILE* f = fopen(getStringValue(args[0]).c_str(), fopen_mode(mode).c_str());
+            if (!f) return Value(-1);
+            int handle = next_file_handle++;
+            file_handles[handle] = f;
+            return Value(handle);
+        }
+        auto file_of = [&](size_t i) -> FILE* {
+            if (i >= args.size()) return nullptr;
+            long long h = handle_of(E, args[i]);
+            auto it = file_handles.find((int)h);
+            return it == file_handles.end() ? nullptr : it->second;
+        };
         if (name == "file_close" || name == "fclose") {
-            if (args.size() >= 1) {
-                int handle = static_cast<int>(bigint_to_i64(args[0].value.i));
-                auto it = file_handles.find(handle);
-                if (it != file_handles.end()) {
-                    fclose(it->second);
-                    file_handles.erase(it);
-                    return Value(true);
-                }
-            }
-            return Value(false);
+            if (args.empty()) return Value(false);
+            long long h = handle_of(E, args[0]);
+            auto it = file_handles.find((int)h);
+            if (it == file_handles.end()) return Value(false);
+            fclose(it->second);
+            file_handles.erase(it);
+            return Value(true);
         }
         if (name == "file_read" || name == "fread") {
-            if (args.size() >= 1) {
-                int handle = static_cast<int>(bigint_to_i64(args[0].value.i));
-                FILE* f = (file_handles.count(handle)) ? file_handles[handle] : nullptr;
-                if (f) {
-                    int size = (args.size() >= 2) ? static_cast<int>(bigint_to_i64(args[1].value.i)) : -1;
-                    if (size < 0) {
-                        // Read all
-                        long pos = ftell(f);
-                        fseek(f, 0, SEEK_END);
-                        long fsize = ftell(f);
-                        fseek(f, pos, SEEK_SET);
-                        std::string content(static_cast<size_t>(fsize - pos), '\0');
-                        size_t r = fread(&content[0], 1, content.size(), f);
-                        content.resize(r);
-                        return makeStringValue(content);
-                    } else {
-                        std::string buf(static_cast<size_t>(size), '\0');
-                        size_t r = fread(&buf[0], 1, static_cast<size_t>(size), f);
-                        buf.resize(r);
-                        return makeStringValue(buf);
-                    }
-                }
+            // file_read(h, size=-1): size < 0 reads to the end. Reads in
+            // chunks, so pipes and other unseekable files work too (it used
+            // to size the read with ftell/fseek).
+            FILE* f = file_of(0);
+            if (!f) return makeStringValue("");
+            long long size = args.size() >= 2 ? nyos::to_int(args[1], -1) : -1;
+            std::string content;
+            if (size < 0) {
+                char buf[65536];
+                size_t n;
+                while ((n = fread(buf, 1, sizeof buf, f)) > 0) content.append(buf, n);
+            } else if (size > 0) {
+                content.resize((size_t)size);
+                size_t r = fread(&content[0], 1, (size_t)size, f);
+                content.resize(r);
             }
-            return makeStringValue("");
+            return makeStringValue(content);
         }
         if (name == "file_write" || name == "fwrite") {
-            if (args.size() >= 2) {
-                int handle = static_cast<int>(bigint_to_i64(args[0].value.i));
-                FILE* f = (file_handles.count(handle)) ? file_handles[handle] : nullptr;
-                std::string data = getStringValue(args[1]);
-                if (f) {
-                    size_t written = fwrite(data.c_str(), 1, data.size(), f);
-                    return Value(static_cast<int>(written));
-                }
-            }
-            return Value(-1);
+            FILE* f = file_of(0);
+            if (!f || args.size() < 2) return Value(-1);
+            std::string data = getStringValue(args[1]);
+            size_t written = fwrite(data.data(), 1, data.size(), f);
+            return Value(static_cast<int>(written));
         }
         if (name == "file_readline" || name == "freadline") {
-            if (args.size() >= 1) {
-                int handle = static_cast<int>(bigint_to_i64(args[0].value.i));
-                FILE* f = (file_handles.count(handle)) ? file_handles[handle] : nullptr;
-                if (f) {
-                    char buf[8192];
-                    if (fgets(buf, sizeof(buf), f)) {
-                        std::string line(buf);
-                        // Remove trailing newline
-                        while (!line.empty() && (line.back() == '\n' || line.back() == '\r'))
-                            line.pop_back();
-                        return makeStringValue(line);
-                    }
-                }
+            // file_readline(h, keep_newline=false). Without keep_newline the
+            // line ending is stripped and EOF is none (legacy); with it the
+            // "\n" stays and EOF is "" (what file objects need). Lines of any
+            // length - an 8 KB buffer used to split long lines in two.
+            FILE* f = file_of(0);
+            bool keep = args.size() >= 2 && E.isTruthy(args[1]);
+            if (!f) return keep ? makeStringValue("") : NONE_VALUE;
+            std::string line;
+            int c;
+            bool any = false;
+            while ((c = fgetc(f)) != EOF) {
+                any = true;
+                line += (char)c;
+                if (c == '\n') break;
             }
-            return NONE_VALUE;
+            if (!any) return keep ? makeStringValue("") : NONE_VALUE;
+            if (!keep) while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
+            return makeStringValue(line);
+        }
+        if (name == "file_seek") {
+            // file_seek(h, offset, whence=0) -> new position (0 set, 1 cur, 2 end)
+            FILE* f = file_of(0);
+            if (!f) nyos::raise("ValueError", "file_seek: not an open file");
+            long long off = args.size() >= 2 ? nyos::to_int(args[1], 0) : 0;
+            int wh = args.size() >= 3 ? (int)nyos::to_int(args[2], 0) : 0;
+            int w = wh == 1 ? SEEK_CUR : wh == 2 ? SEEK_END : SEEK_SET;
+            if (fseek(f, (long)off, w) != 0) nyos::raise_errno(errno ? errno : EINVAL, "seek");
+            return nyos::make_int((long long)ftell(f));
+        }
+        if (name == "file_tell") {
+            FILE* f = file_of(0);
+            if (!f) nyos::raise("ValueError", "file_tell: not an open file");
+            return nyos::make_int((long long)ftell(f));
+        }
+        if (name == "file_flush") {
+            FILE* f = file_of(0);
+            if (f) fflush(f);
+            return Value(f != nullptr);
         }
         if (name == "file_readlines" || name == "readlines") {
             // Read all lines from a file path
@@ -323,6 +407,7 @@ Value dispatch_io(NythonExecutor& E,
                     int idx = 0;
                     std::string line;
                     while (std::getline(file, line)) {
+                        if (!line.empty() && line.back() == '\r') line.pop_back();
                         result->set(std::to_string(idx++), makeStringValue(line));
                     }
                     result->set("__len__", Value(idx));
@@ -335,18 +420,9 @@ Value dispatch_io(NythonExecutor& E,
             // Write list of lines to file
             if (args.size() >= 2) {
                 std::string path = getStringValue(args[0]);
-                std::ofstream file(path);
+                std::ofstream file(path, std::ios::binary);
                 if (file.is_open() && args[1].isCollectable()) {
-                    auto* cont = dynamic_cast<Container*>(args[1].value.gc);
-                    if (cont && cont->container) {
-                        auto li = cont->container->find("__len__");
-                        int len = (li != cont->container->end()) ? static_cast<int>(bigint_to_i64(li->second.value.i)) : 0;
-                        for (int i = 0; i < len; i++) {
-                            auto it = cont->container->find(std::to_string(i));
-                            if (it != cont->container->end())
-                                file << getStringValue(it->second) << "\n";
-                        }
-                    }
+                    for (auto& v : nyos::list_items(args[1])) file << getStringValue(v) << "\n";
                     return Value(true);
                 }
             }
@@ -355,22 +431,20 @@ Value dispatch_io(NythonExecutor& E,
         if (name == "file_append" || name == "append_file") {
             // Append string to file
             if (args.size() >= 2) {
-                std::string path = getStringValue(args[0]);
-                std::string data = getStringValue(args[1]);
-                std::ofstream file(path, std::ios::app);
+                std::ofstream file(getStringValue(args[0]), std::ios::binary | std::ios::app);
                 if (file.is_open()) {
-                    file << data;
+                    file << getStringValue(args[1]);
                     return Value(true);
                 }
             }
             return Value(false);
         }
         if (name == "file_size") {
+            // int64: a 3 GB file used to read -1073741824.
             if (args.size() >= 1) {
-                std::string path = getStringValue(args[0]);
                 struct stat st;
-                if (stat(path.c_str(), &st) == 0)
-                    return Value(static_cast<int>(st.st_size));
+                if (stat(getStringValue(args[0]).c_str(), &st) == 0)
+                    return nyos::make_int((long long)st.st_size);
             }
             return Value(-1);
         }
@@ -395,37 +469,12 @@ Value dispatch_io(NythonExecutor& E,
             }
             return Value(-1);
         }
-        if (name == "file_delete" || name == "remove_file") {
-            if (args.size() >= 1) {
-                return Value(remove(getStringValue(args[0]).c_str()) == 0);
-            }
-            return Value(false);
-        }
-        if (name == "file_rename") {
-            if (args.size() >= 2) {
-                return Value(rename(getStringValue(args[0]).c_str(), getStringValue(args[1]).c_str()) == 0);
-            }
-            return Value(false);
-        }
-        if (name == "file_copy") {
-            if (args.size() >= 2) {
-                std::ifstream src(getStringValue(args[0]), std::ios::binary);
-                std::ofstream dst(getStringValue(args[1]), std::ios::binary);
-                if (src.is_open() && dst.is_open()) {
-                    dst << src.rdbuf();
-                    return Value(true);
-                }
-            }
-            return Value(false);
-        }
         if (name == "print_to" || name == "fprint") {
             // Print to file: print_to(path, data)
             if (args.size() >= 2) {
-                std::string path = getStringValue(args[0]);
-                std::string data = getStringValue(args[1]);
-                std::ofstream file(path, std::ios::app);
+                std::ofstream file(getStringValue(args[0]), std::ios::binary | std::ios::app);
                 if (file.is_open()) {
-                    file << data << "\n";
+                    file << getStringValue(args[1]) << "\n";
                     return Value(true);
                 }
             }
@@ -445,9 +494,9 @@ Value dispatch_io(NythonExecutor& E,
         }
         if (name == "flush") {
             std::cout << std::flush;
+            fflush(stdout);
             return NONE_VALUE;
         }
-        // ===================== LINUX SHELL COMMANDS =====================
 
     return UNDEFINED_VALUE;  // not handled by this module
 }

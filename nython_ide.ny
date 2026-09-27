@@ -11,7 +11,7 @@
 #  (tests and tools/ construct NythonIDE() and drive it directly).
 # ══════════════════════════════════════════════════════════════════════════════
 
-import "ide_views.ny"
+import "ide_tools.ny"
 import "ide_workshop.ny"
 import "lib/aiagent.ny"
 import "lib/gui_motion.ny"
@@ -23,7 +23,7 @@ def hit(rx, ry, rw, rh, px, py):
     return px >= rx and px < rx + rw and py >= ry and py < ry + rh
 
 
-class NythonIDE(IDEViews):
+class NythonIDE(IDETools):
     def __init__(self):
         self.th = IDETheme()
         self.session_id = time_ms() % 100000000
@@ -42,11 +42,18 @@ class NythonIDE(IDEViews):
             want_h = 560
         self.win = Window(want_w, want_h, "NythonIDE")
         self.win.resizable = true
+        # Every metric below is multiplied by the display scale, so the window
+        # must work in pixels: without high pixel density a Retina or scaled
+        # Wayland display reports scale 2 while the window is in points, and
+        # the whole workbench came out twice its size.
+        self.win.high_dpi = true
         self.W = want_w
         self.H = want_h
         self.dpi = gui_display_scale()
         if self.dpi <= 0.0 or self.dpi > 8.0:
             self.dpi = 1.0
+        # VS Code's smallest window; the layout ladder handles it.
+        self.win.set_min_size(int(400 * self.dpi), int(270 * self.dpi))
         # ── metrics (VS Code's) ───────────────────────────────────────────────
         self.TITLE_H = self.dp(30)
         self.ACT_W = self.dp(48)
@@ -127,8 +134,8 @@ class NythonIDE(IDEViews):
                           "Run and Debug (Ctrl+Shift+D)", "Extensions (Ctrl+Shift+X)", "Outline", "AI Assistant"]
         self.view_titles = ["EXPLORER", "SEARCH", "SOURCE CONTROL", "RUN AND DEBUG", "EXTENSIONS", "OUTLINE", "AI ASSISTANT"]
         self.active_view = "explorer"
-        self.panel_keys = ["problems", "output", "debug", "terminal", "inspector", "workshop"]
-        self.panel_labels = ["PROBLEMS", "OUTPUT", "DEBUG CONSOLE", "TERMINAL", "INSPECTOR", "LANGUAGE WORKSHOP"]
+        self.panel_keys = ["problems", "output", "debug", "terminal", "buildlog", "todo", "inspector", "workshop"]
+        self.panel_labels = ["PROBLEMS", "OUTPUT", "DEBUG CONSOLE", "TERMINAL", "BUILD LOG", "TODO", "INSPECTOR", "LANGUAGE WORKSHOP"]
         self.active_panel = "problems"
         self.sidebar_open = true
         self.panel_open = true
@@ -150,7 +157,15 @@ class NythonIDE(IDEViews):
         self.loading_settings = false
         self.menu_open = -1
         self.menu_sel = -1
-        self.menu_x = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        self.menu_x = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        # Responsive layout (ide_paint.ny, _layout): the menus fold into a
+        # hamburger, the side bar floats over the editor, overflowing panel
+        # tabs and activity-bar views go to a "..." menu.
+        self.menu_compact = false
+        self.side_overlay = false
+        self.act_fit = 99
+        self.panel_fit = 99
+        self.panel_ai = 0
         self.ctx_open = false
         self.ctx_items = []
         self.ctx_x = 0
@@ -267,6 +282,8 @@ class NythonIDE(IDEViews):
         self.ac_open = false
         self.ac_items = []
         self.ac_kinds = []
+        self.ac_mark_key = ""
+        self.ac_marks = []
         self.ac_n = 0
         self.ac_sel = 0
         self.ac_top = 0
@@ -361,9 +378,9 @@ class NythonIDE(IDEViews):
         self.ac_row = -1
         self.ac_start = -1
         self.ac_doc = none
-        self.ac_names = []
-        self.ac_all_kinds = []
-        self.ac_bonus = []
+        self.ac_index = 0
+        self.ac_scan_doc = none
+        self.ac_scan_state = -1
         self.watch_t = 0
         self.watch_dirs = {}
         self.watch_git = -3
@@ -372,6 +389,10 @@ class NythonIDE(IDEViews):
         self.field_vx = {}         # input name -> x of its first character, last frame
         # ── source control ────────────────────────────────────────────────────
         self.scm_stale = true
+        self.scm_job = none            # the background git refresh (BgProc)
+        self.scm_out = []
+        self.scm_seq = 0
+        self.scm_again = false
         self.scm_branch = ""
         self.scm_count = 0
         self.scm_by_path = {}
@@ -395,10 +416,14 @@ class NythonIDE(IDEViews):
         self.recent = []
         self.recent_folders = []
         self.autosave_due = 0
+        self.fullscreen = false
+        self.menu_mnemonics = []
+        self._tools_init()
         # ── start ─────────────────────────────────────────────────────────────
         self._register_commands()
         self._load_state()
         self._open_initial_workspace()
+        self._restore_session()
         self._layout()
         self.f_code.ensure_loaded()
         self.char_w = self.f_code.width("M")
@@ -463,6 +488,8 @@ class NythonIDE(IDEViews):
             self._on_text(e)
         elif t == "expose":
             self._dirty = true
+        elif t == "dropfile" or t == "droptext" or t == "focuslost" or t == "focusgained":
+            self._on_window_event(e)
 
     def _close_overlays(self):
         self.menu_open = -1
@@ -525,6 +552,10 @@ class NythonIDE(IDEViews):
             want = "sizewe"
         elif cmd == "@split.panel":
             want = "sizens"
+        elif cmd == "@split.sash":
+            want = "sizewe"
+            if self.split_dir == "rows":
+                want = "sizens"
         elif cmd != "" and not string_startswith(cmd, "@side") and cmd != "@menu.bg" and cmd != "@qi.bg" and cmd != "@overlay.dismiss" and cmd != "@panel.body" and cmd != "@tabstrip" and cmd != "@modal.scrim" and cmd != "@qi.dismiss" and cmd != "@find.bg":
             want = "hand"
         if want != self.cursor_shape:
@@ -552,6 +583,9 @@ class NythonIDE(IDEViews):
         if e.button == 2:
             if h.cmd == "@tab" or h.cmd == "@tab.close":
                 self._close_doc(h.arg, false)
+            elif h.cmd == "@editor":
+                # Middle-button drag selects a column, as in VS Code.
+                self._box_mouse_start(e.x, e.y)
             return
         self._click(h, e)
 
@@ -587,6 +621,10 @@ class NythonIDE(IDEViews):
             self._layout()
         elif d == "select":
             self._drag_select(x, y)
+        elif d == "box":
+            self._box_drag(x, y)
+        elif d == "splitsash":
+            self._split_drag(x, y)
         elif d == "lines":
             var p = self._pos_at(x, y)
             var b = self.buf()
@@ -625,7 +663,7 @@ class NythonIDE(IDEViews):
         var d = self.doc()
         if d.buf == none:
             return
-        var total = (d.buf.line_count - 1) * self.LINE_H + self.ed_h
+        var total = (self._vis_count(d) - 1) * self.LINE_H + self.ed_h
         var maxs = total - self.ed_h
         var room = self.ed_h - self.vs_thumb_h
         if room <= 0:
@@ -641,16 +679,22 @@ class NythonIDE(IDEViews):
     def _minimap_to(self, y):
         var d = self.doc()
         var row = self.mm_first + int((y - self.ed_y) / 2)
-        d.scroll_y = (row - int(self._rows_visible() / 2)) * self.LINE_H
+        if row >= d.buf.line_count:
+            row = d.buf.line_count - 1
+        d.scroll_y = (self._row_to_vrow(d, row) - int(self._rows_visible() / 2)) * self.LINE_H
         self._clamp_scroll()
 
     # Pixel -> [row, col] in the active editor.
     def _pos_at(self, x, y):
         var d = self.doc()
         var b = d.buf
-        var row = int((y - self.ed_y + d.scroll_y) / self.LINE_H)
-        if row < 0:
-            row = 0
+        var vrow = int((y - self.ed_y + d.scroll_y) / self.LINE_H)
+        var nv = self._vis_count(d)
+        if vrow >= nv:
+            vrow = nv - 1
+        if vrow < 0:
+            vrow = 0
+        var row = self._vrow_to_row(d, vrow)
         if row >= b.line_count:
             row = b.line_count - 1
         var line = b.lines[row]
@@ -666,6 +710,18 @@ class NythonIDE(IDEViews):
             while col < len(line) and self._col_x(line, col + 1) < rel + self.char_w / 2:
                 col = col + 1
         return [row, col]
+
+    def _on_wheel_editor(self, e, dy):
+        if not self._is_text():
+            return
+        var d = self.doc()
+        if e.shift:
+            d.scroll_x = d.scroll_x - dy * self.char_w * 6
+            if d.scroll_x < 0:
+                d.scroll_x = 0
+        else:
+            d.scroll_y = d.scroll_y - dy * self.LINE_H * 3
+            self._clamp_scroll()
 
     def _on_wheel(self, e):
         if e.x > 0 or e.y > 0:
@@ -685,17 +741,26 @@ class NythonIDE(IDEViews):
         if h == none:
             return
         var c = h.cmd
-        if c == "@editor" or c == "@gutter.glyph" or c == "@gutter.num" or c == "@minimap" or c == "@vscroll" or c == "@find.bg":
-            if not self._is_text():
-                return
-            var d = self.doc()
-            if e.shift:
-                d.scroll_x = d.scroll_x - dy * self.char_w * 6
-                if d.scroll_x < 0:
-                    d.scroll_x = 0
-            else:
-                d.scroll_y = d.scroll_y - dy * self.LINE_H * 3
-                self._clamp_scroll()
+        if c == "@group.focus":
+            # Scrolling the other group scrolls it without moving the focus
+            # (or touching the focused group's carets).
+            var g = self.group
+            if self._pane_swap():
+                self.group = h.arg
+                self._layout()
+                self._on_wheel_editor(e, dy)
+                self._pane_swap()
+                self.group = g
+                self._layout()
+            return
+        if e.ctrl and (c == "@editor" or c == "@gutter.glyph" or c == "@gutter.num" or c == "@gutter.fold"):
+            if dy > 0:
+                self._zoom(1)
+            elif dy < 0:
+                self._zoom(0 - 1)
+            return
+        if c == "@editor" or c == "@gutter.glyph" or c == "@gutter.num" or c == "@gutter.fold" or c == "@minimap" or c == "@vscroll" or c == "@find.bg":
+            self._on_wheel_editor(e, dy)
         elif c == "@ac.item":
             self.ac_top = self.ac_top - dy
             if self.ac_top > self.ac_n - 10:
@@ -731,7 +796,7 @@ class NythonIDE(IDEViews):
             self._exec(cmd, arg)
             return
         # Any click that is not on the open overlay closes it.
-        var overlay_cmd = cmd == "@menu" or cmd == "@menuitem" or cmd == "@menu.bg" or cmd == "@ctx.item"
+        var overlay_cmd = cmd == "@menu" or cmd == "@menuitem" or cmd == "@menu.bg" or cmd == "@menu.pick" or cmd == "@ctx.item"
         if not overlay_cmd and (self.menu_open >= 0 or self.ctx_open or self.notif_center):
             if cmd != "@toast.close":
                 self._close_overlays()
@@ -753,6 +818,34 @@ class NythonIDE(IDEViews):
         if cmd == "@menuitem":
             self.menu_open = -1
             self._exec(arg, none)
+            return
+        if cmd == "@act.more":
+            var vitems = []
+            var vi = self.act_fit
+            while vi < len(self.views):
+                vitems.append([self.view_titles[vi], "@view", self.views[vi]])
+                vi = vi + 1
+            self._open_ctx(e.x, e.y, vitems)
+            return
+        if cmd == "@panel.more":
+            var pitems = []
+            var pi = 0
+            while pi < len(self.panel_keys):
+                if not self._panel_tab_shown(pi):
+                    pitems.append([self.panel_labels[pi], "@panel.tab", self.panel_keys[pi]])
+                pi = pi + 1
+            self._open_ctx(e.x, e.y, pitems)
+            return
+        if cmd == "@menu.pick":
+            self.menu_open = arg
+            self.menu_sel = -1
+            return
+        if cmd == "@side.dismiss":
+            # A click beside the floating side bar closes it (the click is
+            # not passed through, as for any other light-dismiss surface).
+            self.sidebar_open = false
+            self.focus = "editor"
+            self._layout()
             return
         if cmd == "@ctx.item":
             var it = self.ctx_items[arg]
@@ -976,6 +1069,8 @@ class NythonIDE(IDEViews):
             self._goto(arg - 1, 0)
             self.focus = "editor"
             return
+        if self._tools_click(cmd, arg, e):
+            return
         self._notify("Unhandled click target " + cmd, "warn")
 
     # Context-menu entries that are UI actions rather than commands.
@@ -1036,6 +1131,11 @@ class NythonIDE(IDEViews):
         var p = self._pos_at(e.x, e.y)
         b.begin_group()
         self.want_col = -1
+        # Column selection: Shift+Alt+drag (VS Code), or any single-click drag
+        # in column selection mode (Code::Blocks' rectangular selection).
+        if (e.alt and e.shift) or (self.column_mode and e.clicks < 2 and not e.alt and not e.shift):
+            self._box_mouse_start(e.x, e.y)
+            return
         if e.alt:
             if self._add_caret(p[0], p[1]):
                 self.status_msg = str(self.selmodel.count) + " cursors"
@@ -1258,6 +1358,13 @@ class NythonIDE(IDEViews):
                                       ["Toggle Breakpoint", "editor.debug.action.toggleBreakpoint", ""],
                                       ["Run Nython File", "workbench.action.debug.run", ""],
                                       ["Command Palette...", "workbench.action.showCommands", ""]])
+            self.ctx_items = self._tools_editor_ctx(self.ctx_items)
+        elif c == "@gutter.glyph":
+            var gp = self._pos_at(e.x, e.y)
+            self._open_ctx(e.x, e.y, [["Toggle Breakpoint", "@ctx.brktoggle", gp[0]],
+                                      ["Edit Breakpoint...", "nython.debug.editBreakpoint", gp[0]],
+                                      ["-", "", ""],
+                                      ["Toggle Bookmark", "@ctx.bookmark", gp[0]]])
         elif c == "@scm.row":
             var staged = string_startswith(h.arg, "S:")
             var p2 = h.arg
@@ -1366,12 +1473,17 @@ class NythonIDE(IDEViews):
     def _menu_mnemonic(self, k):
         var i = 0
         while i < len(self.menus):
-            if string_lower(string_slice(self.menus[i], 0, 1)) == k:
+            var m = string_lower(string_slice(self.menus[i], 0, 1))
+            if i < len(self.menu_mnemonics):
+                m = self.menu_mnemonics[i]
+            if m == k:
                 return i
             i = i + 1
         return -1
 
     def _modal_key(self, e):
+        if self.key_capture != "" and self._capture_key(e):
+            return
         var k = e.key
         var n = len(self.modal_buttons)
         if k == "escape":
@@ -1427,6 +1539,23 @@ class NythonIDE(IDEViews):
 
     def _menu_key(self, e):
         var k = e.key
+        if self.menu_open >= len(self.menus):
+            # The hamburger's list of menus.
+            var n = len(self.menus)
+            if k == "escape":
+                self._close_overlays()
+            elif k == "down":
+                self.menu_sel = (self.menu_sel + 1) % n
+            elif k == "up":
+                self.menu_sel = (self.menu_sel + n - 1) % n
+            elif (k == "enter" or k == "right" or k == "space") and self.menu_sel >= 0:
+                self.menu_open = self.menu_sel
+                self.menu_sel = -1
+            return
+        if k == "left" and self.menu_compact:
+            self.menu_sel = self.menu_open
+            self.menu_open = len(self.menus)
+            return
         var items = self.menu_items[self.menus[self.menu_open]]
         if k == "escape":
             self._close_overlays()
@@ -1860,6 +1989,10 @@ class NythonIDE(IDEViews):
         var d = self.doc()
         var b = d.buf
         var nav = k == "left" or k == "right" or k == "up" or k == "down" or k == "home" or k == "end" or k == "pageup" or k == "pagedown"
+        if nav and self.column_mode and e.shift and not e.ctrl and not e.alt and (k == "left" or k == "right" or k == "up" or k == "down"):
+            b.begin_group()
+            self._box_key(k)
+            return
         if nav:
             b.begin_group()
             var had_sel = self._sel_range()
@@ -1885,7 +2018,12 @@ class NythonIDE(IDEViews):
             self.ac_open = false
             return
         if k == "escape":
-            if self.selmodel.count > 1:
+            if len(self.snip_marks) > 0:
+                # Leaves snippet mode (the remaining tab stops), as in VS Code.
+                self.snip_marks = []
+                self.snip_cur = []
+                d.sel_on = false
+            elif self.selmodel.count > 1:
                 self._clear_extra_carets()
             elif self.find_open:
                 self.find_open = false
@@ -1904,6 +2042,10 @@ class NythonIDE(IDEViews):
             self._edit_enter()
         elif k == "tab":
             var sr = self._sel_range()
+            if not e.shift and len(self.snip_marks) > 0 and self._snippet_next():
+                return
+            if not e.shift and sr == none and not self.ac_open and self._snippet_try():
+                return
             if e.shift:
                 self._indent_selection(false)
             elif sr != none and sr[0] != sr[2]:
@@ -1933,7 +2075,8 @@ class NythonIDE(IDEViews):
             elif b.cursor_col > 0:
                 b.cursor_col = b.cursor_col - 1
             elif b.cursor_row > 0:
-                b.cursor_row = b.cursor_row - 1
+                var dl = self.doc()
+                b.cursor_row = self._vrow_to_row(dl, self._row_to_vrow(dl, b.cursor_row) - 1)
                 b.cursor_col = len(b.get_line(b.cursor_row))
             self.want_col = -1
         elif k == "right":
@@ -1944,8 +2087,12 @@ class NythonIDE(IDEViews):
             elif b.cursor_col < len(b.get_line(b.cursor_row)):
                 b.cursor_col = b.cursor_col + 1
             elif b.cursor_row + 1 < b.line_count:
-                b.cursor_row = b.cursor_row + 1
-                b.cursor_col = 0
+                # Past the end of a folded header: to the next visible line.
+                var dv = self.doc()
+                var nxt = self._vrow_to_row(dv, self._row_to_vrow(dv, b.cursor_row) + 1)
+                if nxt > b.cursor_row and nxt < b.line_count:
+                    b.cursor_row = nxt
+                    b.cursor_col = 0
             self.want_col = -1
         elif k == "up" or k == "down" or k == "pageup" or k == "pagedown":
             var dr = 1
@@ -1960,18 +2107,21 @@ class NythonIDE(IDEViews):
                 self.doc().scroll_y = self.doc().scroll_y + dr * self.LINE_H
                 self._clamp_scroll()
                 return
-            # Vertical movement aims for the column the caret started in.
+            # Vertical movement aims for the column the caret started in, and
+            # counts screen rows: a folded region is stepped over in one.
             if self.want_col < 0:
                 self.want_col = b.cursor_col
-            var nr = b.cursor_row + dr
-            if nr < 0:
+            var d = self.doc()
+            var vr = self._row_to_vrow(d, b.cursor_row) + dr
+            if vr < 0:
                 b.cursor_row = 0
                 b.cursor_col = 0
                 return
-            if nr >= b.line_count:
-                b.cursor_row = b.line_count - 1
+            if vr >= self._vis_count(d):
+                b.cursor_row = self._vrow_to_row(d, self._vis_count(d) - 1)
                 b.cursor_col = len(b.get_line(b.cursor_row))
                 return
+            var nr = self._vrow_to_row(d, vr)
             b.cursor_row = nr
             b.cursor_col = self._clamp_col(nr, self.want_col)
             if k == "pageup" or k == "pagedown":
@@ -2150,12 +2300,13 @@ class NythonIDE(IDEViews):
         if closer != "" and sel != none and sel[0] == sel[2] and self.selmodel.count <= 1:
             # Wrap the selection in the pair.
             var inner = self._sel_text()
-            b.begin_group()
+            var g = b.open_group()
             self._sel_delete()
             b.insert_text(t + inner + closer)
-            b.begin_group()
+            b.close_group(g)
             self._after_typing()
             return
+        self._overwrite_prepare()
         self._edit_type(t)
         var next = string_slice(b.get_line(b.cursor_row), b.cursor_col, b.cursor_col + 1)
         var room = next == "" or next == " " or next == ")" or next == "]" or next == "}" or next == ","
@@ -2204,104 +2355,73 @@ class NythonIDE(IDEViews):
         if not explicit and len(self.ac_prefix) < 2:
             self.ac_open = false
             return
-        # A completion session: candidates are gathered when completion opens
-        # on a word and re-ranked (natively) as the word grows, instead of
-        # being rebuilt and fuzzy-matched in Nython on every keystroke.
+        # One session per word: candidates are refreshed when a word starts
+        # (or on Ctrl+Space), then only re-ranked as it grows. The session is
+        # the word - row, start column, document - not whether the popup is
+        # showing: a word with no candidates used to close the popup and so
+        # re-gather the whole document on every following keystroke (280 ms
+        # per key in a 1,800-line file).
         var row = b.cursor_row
-        if not self.ac_open or self.ac_row != row or self.ac_start != st or self.ac_doc != self.doc():
-            self._ac_gather()
+        var d = self.doc()
+        if explicit or self.ac_row != row or self.ac_start != st or self.ac_doc != d:
+            self._ac_gather(explicit)
             self.ac_row = row
             self.ac_start = st
-            self.ac_doc = self.doc()
-        var idx = fuzzy_rank(self.ac_prefix, self.ac_names, 61, self.ac_bonus)
-        var out_n = []
-        var out_k = []
-        var i = 0
-        while i < len(idx) and len(out_n) < 60:
-            var nm = self.ac_names[idx[i]]
-            if nm != self.ac_prefix:
-                out_n.append(nm)
-                out_k.append(self.ac_all_kinds[idx[i]])
-            i = i + 1
-        self.ac_items = out_n
-        self.ac_kinds = out_k
-        self.ac_n = len(out_n)
+            self.ac_doc = d
+        # Ranked natively over the index; the lists reuse cached strings.
+        var res = ac_index_rank(self.ac_index, self.ac_prefix, 60, self.ac_prefix)
+        self.ac_items = res[0]
+        self.ac_kinds = res[1]
+        # Snippets take part in completion, as in VS Code: an exact prefix
+        # goes first (so Tab after "def" expands the snippet instead of
+        # accepting some other word that merely contains "def"), others
+        # that start with the typed text follow the ranked words.
+        self._ac_add_snippets()
+        self.ac_n = len(self.ac_items)
+        self.ac_mark_key = ""
         self.ac_sel = 0
         self.ac_top = 0
         self.ac_open = self.ac_n > 0
         if explicit and self.ac_n == 0:
             self.status_msg = "No suggestions."
 
-    def _ac_kind_bonus(self, k):
-        if k == "function" or k == "method" or k == "class" or k == "variable":
-            return 5
-        if k == "keyword":
-            return 3
-        return 0
-
-    def _ac_gather(self):
-        var b = self.buf()
-        var names = []
-        var kinds = []
-        var seen = {}
-        var syms = self._outline_syms()
-        var i = 0
-        while i < len(syms):
-            self._ac_add(names, kinds, seen, syms[i][0], syms[i][1])
-            i = i + 1
-        i = 0
-        while i < len(self.hl.storage):
-            self._ac_add(names, kinds, seen, self.hl.storage[i], "keyword")
-            i = i + 1
-        i = 0
-        while i < len(self.hl.keywords):
-            self._ac_add(names, kinds, seen, self.hl.keywords[i], "keyword")
-            i = i + 1
-        i = 0
-        while i < len(self.hl.builtins):
-            self._ac_add(names, kinds, seen, self.hl.builtins[i], "builtin")
-            i = i + 1
-        # Identifiers used near the caret.
-        var r = b.cursor_row - 60
-        if r < 0:
-            r = 0
-        while r < b.line_count and r < b.cursor_row + 60:
-            if r != b.cursor_row:
-                self._ac_words_of(b.get_line(r), names, kinds, seen)
-            r = r + 1
-        var bonus = []
-        i = 0
-        while i < len(kinds):
-            bonus.append(self._ac_kind_bonus(kinds[i]))
-            i = i + 1
-        self.ac_names = names
-        self.ac_all_kinds = kinds
-        self.ac_bonus = bonus
-
-    def _ac_add(self, names, kinds, seen, n, k):
-        if not seen.has_key(n):
-            seen[n] = true
-            names.append(n)
-            kinds.append(k)
-
-    def _ac_words_of(self, line, names, kinds, seen):
-        var n = len(line)
-        var i = 0
-        while i < n:
-            var ch = string_slice(line, i, i + 1)
-            if self._is_word_ch(ch) and not (ch >= "0" and ch <= "9"):
-                var j = i
-                while j < n and self._is_word_ch(string_slice(line, j, j + 1)):
-                    j = j + 1
-                if j - i >= 3:
-                    self._ac_add(names, kinds, seen, string_slice(line, i, j), "text")
-                i = j
-            elif ch == "\"" or ch == "#":
-                i = n
-            else:
+    # The candidates live in a native completion index (ac_index_*,
+    # src/builtins/text.cpp): keywords and builtins once, and this
+    # document's symbols and identifiers rescanned only when it changed.
+    def _ac_gather(self, force):
+        if self.ac_index == 0:
+            self.ac_index = ac_index_new()
+            var names = []
+            var kinds = []
+            var i = 0
+            while i < len(self.hl.storage):
+                names.append(self.hl.storage[i])
+                kinds.append("keyword")
                 i = i + 1
+            i = 0
+            while i < len(self.hl.keywords):
+                names.append(self.hl.keywords[i])
+                kinds.append("keyword")
+                i = i + 1
+            i = 0
+            while i < len(self.hl.builtins):
+                names.append(self.hl.builtins[i])
+                kinds.append("builtin")
+                i = i + 1
+            ac_index_set_base(self.ac_index, names, kinds)
+        var b = self.buf()
+        if force or self.ac_scan_doc != self.doc() or self.ac_scan_state != b.state_id():
+            ac_index_scan(self.ac_index, b.lines, 3)
+            self.ac_scan_doc = self.doc()
+            self.ac_scan_state = b.state_id()
 
     def _ac_update(self, typed):
+        # While a snippet's tab stops are active, suggestions only open on
+        # Ctrl+Space (VS Code's editor.suggest.snippetsPreventQuickSuggestions):
+        # otherwise Tab, meant for the next stop, would accept a suggestion.
+        if len(self.snip_marks) > 0:
+            self.ac_open = false
+            return
         if self._is_word_ch(typed):
             self._ac_open_now(false)
         else:
@@ -2336,10 +2456,20 @@ class NythonIDE(IDEViews):
         var word = self.ac_items[self.ac_sel]
         var b = self.buf()
         var st = self._ac_word_bounds()
-        b.begin_group()
+        if self.ac_kinds[self.ac_sel] == "snippet":
+            var body = self._snippet_body(word)
+            if body != none:
+                self.ac_open = false
+                var g0 = b.open_group()
+                b.delete_range(b.cursor_row, st, b.cursor_row, b.cursor_col)
+                b.cursor_col = st
+                self._snippet_expand(body)
+                b.close_group(g0)
+                return
+        var g = b.open_group()
         b.delete_range(b.cursor_row, st, b.cursor_row, b.cursor_col)
         b.insert_text(word)
-        b.begin_group()
+        b.close_group(g)
         self.ac_open = false
         self._after_edit()
 
@@ -2406,6 +2536,17 @@ class NythonIDE(IDEViews):
     # Work that happens on the clock rather than on an event.
     def _tick(self):
         var now = time_ms()
+        # The window loop sleeps up to idle_wait_ms waiting for input after a
+        # frame that painted nothing. While a program, a build or a debug
+        # recording runs, output and progress must arrive promptly, so it
+        # only naps one frame then.
+        if self.job_running or self.build_running or self.dbg_recording or (self.scm_job != none and self.scm_job.running):
+            self.win.idle_wait_ms = 16
+        else:
+            self.win.idle_wait_ms = 250
+        if self.build_running:
+            self._build_step()
+        self._scm_poll()
         self._watch_tick(now)
         if self.job_running:
             self._poll_job()

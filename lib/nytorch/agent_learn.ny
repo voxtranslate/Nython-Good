@@ -26,6 +26,8 @@
 # The same keyword list ide_editor.ny's SyntaxHighlighter ships with —
 # duplicated rather than imported (nytorch has no business depending on GUI
 # code), but sourced from the same real language, not reinvented.
+import "lib/nytorch/core.ny"
+
 def _ny_keywords():
     return ["def", "class", "if", "elif", "else", "while", "for", "in",
             "return", "import", "var", "const", "let", "not", "and", "or",

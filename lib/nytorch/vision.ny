@@ -12,6 +12,8 @@
 #   DataNormalizer, DataAugmentor, Preprocessor, DataSplitter
 # ============================================================
 
+import "lib/nytorch/core.ny"
+
 import nytorch
 
 # -----------------------------------------
@@ -321,6 +323,8 @@ class Vocabulary:
         var ids = self.encode_sequence(tokens)
         return tensor(ids)
 
+    # the k most frequent words as [count, word], most frequent first
+    # (ties in word order)
     def top_k_frequent(self, k):
         var pairs = []
         var i = 0
@@ -329,10 +333,20 @@ class Vocabulary:
             var w = self.id2word[i]
             var c = self.counts[w]
             if c == none:
-                var c = 0
-            var pairs = pairs + [[c, w]]
-            var i = i + 1
-        return pairs
+                c = 0
+            pairs.append([c, w])
+            i = i + 1
+        var out = []
+        while len(out) < k and len(pairs) > 0:
+            var best = 0
+            var j = 1
+            while j < len(pairs):
+                if pairs[j][0] > pairs[best][0]:
+                    best = j
+                j = j + 1
+            out.append(pairs[best])
+            pairs = pairs[:best] + pairs[best + 1:]
+        return out
 
 # -----------------------------------------
 # 167. Tokenizer

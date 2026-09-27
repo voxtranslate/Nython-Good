@@ -28,6 +28,9 @@ nython/
 │   │   ├── audio.cpp         ← audio builtins (stubs)
 │   │   ├── threading.cpp     ← thread_create, thread_sleep, mutex_*
 │   │   ├── lang.cpp          ← lang_define_token, lang_eval, ...
+│   │   ├── text.cpp          ← editor text services: symbols, syntax check,
+│   │   │                        Myers diff, workspace search, folding, format,
+│   │   │                        completion index (keeps the IDE's hot paths native)
 │   │   └── gui.cpp           ← SDL3 GUI backend (38 gui_* functions)
 │   └── ...                   ← Lexer, Parser, Value, GarbageCollector, etc.
 ├── include/                  ← C++ headers
@@ -57,6 +60,8 @@ nython/
 ├── ide_ops.ny                ←   jobs, find, Quick Input, run, settings, watcher
 ├── ide_paint.ny              ←   theme + every painter (allocation-free)
 ├── ide_views.ny              ←   Explorer/Search/SCM/Debug/Extensions/Outline/AI
+├── ide_tools.ny              ←   Code::Blocks side: build targets, bookmarks,
+│                                folding, snippets, keymaps, wizard, tools
 ├── ide_editor.ny             ← EditorBuffer, SyntaxHighlighter
 ├── ide_icons.ny              ← icon set: Codicon glyphs, vector fallback
 ├── ide_project.ny            ← workspace / project model
@@ -265,6 +270,12 @@ These were aligned to match how the IDE calls them:
 | vm_audit43 | 52 | EditorBuffer undo groups/indentation/final newline, LineDiff, GitRepo |
 | vm_audit44 | 46 | record-and-replay debugger, including a real `--trace` recording |
 | vm_audit45 | 45 | JSON codec, print call form, list pop/insert, deep equality, file_mtime |
+| vm_audit46 | 252 | OS layer: paths, files, file objects, typed errors, os_run/os_spawn, env, time, full-width ints, sys.argv |
+| vm_audit47 | 153 | nytorch: kernels, autograd, Module/optimizers, XOR and a toy CNN, checked against PyTorch numbers and finite differences; one definition per class name |
+| vm_audit48 | 125 | threads and synchronisation: mutex/rwlock/condition/semaphore/barrier/latch/atomics/channels/queues/futures/pools, deadlock detection |
+| vm_audit49 | 41 | async/await: tasks, gather, wait_for, cancellation, deterministic order |
+| vm_audit50 | 51 | `lib/thread.ny` over the native runtime |
+| vm_audit51 | 52 | native editor text services (symbols, syntax check, diff, search, folding, format, completion index) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `for t in examples/test_*.ny examples/vm_audit*.ny; do ./build/nython-cli "$t"; done`
@@ -574,6 +585,54 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   newline never finished (os_exec strips it).
 - **Memory** (IDE, per `ide_memprobe.py`): idle 3.45 → 0 KB/frame, typing
   787 → ~40 KB/key, scrolling 161 → ~7 KB/event, hover 40 → 0.
+
+## Round 74: the OS layer (see `HANDOFF.md` §0f)
+
+- **One implementation per os/io/time builtin, both engines.** The VM's own
+  copies were deleted; it reaches the interpreter's through the bridge.
+  Files: `src/builtins/os.cpp` (files, paths, env), `os_time.cpp`,
+  `os_proc.cpp`; helpers in `include/builtins/os.hpp`; conventions in
+  `include/NyRuntime.hpp`; the startup prelude (file objects, `open()`) in
+  `include/NyPrelude.hpp`.
+- Legacy names keep their return-value contract; the new `os_*` names raise
+  typed errors (FileNotFoundError, IsADirectoryError, FileExistsError, ...)
+  that the bridge turns into VM exceptions.
+- **Builtin kwargs**: names in `kwmap_builtins` (evalCall) get their keyword
+  arguments as one trailing map, as the VM's CALL_KW already did; read them
+  with `nyos::Args`.
+- New: `open()` file objects, `os_run(cmd, cwd=, env=, input=, timeout=)`
+  (argv list = no shell), `os_spawn`/`os_poll`/`os_wait`/`os_kill`, `os_walk`,
+  `os_glob`, `os_rmtree`/`os_copytree`/`os_move`, `os_stat`, `os_mkstemp`,
+  path normpath/relpath/split/splitext/expanduser/..., `time_strftime`/
+  `gmtime`/`strptime`/`time_iso`/`monotonic`/`time_ns`, `sys.argv`,
+  `__name__`, `__file__`, `import os` / `time.time()` namespaces.
+- Interpreter integers: `int()`, `//`, `//=`, `**=`, `abs()`, unary `-`, `~`
+  no longer truncate to 32 bits.
+
+## Round 74: threads, synchronisation and async (see `HANDOFF.md` §0g)
+
+- One concurrency runtime for both engines: `include/NyConc.hpp`,
+  `src/NyConc.cpp` (engine adapters: `threading.cpp`, `src/VMConc.cpp`).
+- One process-wide GIL (FIFO ticket lock, 5 ms hand-over). It is off
+  until the first thread starts. **Any native code that blocks must release
+  it**: wrap the wait in `nyconc::GilRelease unlocked;` and touch no engine
+  state inside it.
+- `async def` / `await`; channels with `select`; futures, pools, task
+  groups; `DeadlockError` / `LockOrderError` instead of hangs.
+
+## Round 74: nytorch (see `HANDOFF.md` §0h)
+
+- One tensor kernel library for both engines: `include/NyTensor.hpp`,
+  `src/builtins/nytensor.cpp` (interpreter: `dispatch_nt` first in the
+  callBuiltin chain; VM: `register_nt_natives()`). Tensors are flat lists
+  plus a shape; float64; broadcasting, axis reductions, batched matmul,
+  conv/pool/norm, seeded RNG, save/load v2.
+- `lib/nytorch/`: Tensor + autograd (`tensor.ny`), Module/Sequential
+  (`module.ny`), layers, losses, optimizers, data; every model class now
+  computes (no random-output stubs).
+- **One definition per class name under `lib/`**: `python3
+  tools/ny_classcheck.py` fails on duplicates (a later same-named class
+  silently replaces the earlier one). Run it after adding a class.
 
 ## Transcripts
 

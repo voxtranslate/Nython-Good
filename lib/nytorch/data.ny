@@ -1,5 +1,8 @@
 # import nytorch
 
+import "lib/nytorch/tensor.ny"
+import "lib/nytorch/module.ny"
+
 class TrainingHistory:
     def init(self):
         self.epochs       = 0
@@ -36,6 +39,7 @@ class TrainingHistory:
 # ---------------------------------------------
 
 class Dataset:
+    # the older list dataset: X and Y are parallel lists
     def init(self, X, Y):
         self.X = X
         self.Y = Y
@@ -44,46 +48,104 @@ class Dataset:
     def __len__(self):
         return len(self.X)
 
+class TensorDataset:
+    # TensorDataset(X, Y, ...) (up to 4): tensors sharing their first
+    # dimension; ds[i] -> [X[i], Y[i], ...]
+    def __init__(self, t0, t1=none, t2=none, t3=none):
+        var given = [t0, t1, t2, t3]
+        self.tensors = []
+        var i = 0
+        while i < len(given):
+            if given[i] != none:
+                self.tensors.append(_t_wrap(given[i]))
+            i = i + 1
+        var n = self.tensors[0].shape[0]
+        i = 1
+        while i < len(self.tensors):
+            if self.tensors[i].shape[0] != n:
+                raise ValueError("TensorDataset: tensors must have the same size in dim 0")
+            i = i + 1
+        self.n = n
+    def __len__(self):
+        return self.n
+    def __getitem__(self, i):
+        var out = []
+        var k = 0
+        while k < len(self.tensors):
+            out.append(self.tensors[k][i])
+            k = k + 1
+        return out
+
+def _d_len(ds):
+    if isinstance(ds, Dataset):
+        return len(ds.X)
+    return ds.n
+
 class DataLoader:
-    def init(self, dataset, batch_size, shuffle):
-        self.dataset    = dataset
+    # DataLoader(dataset, batch_size=1, shuffle=false, drop_last=false)
+    #   for batch in loader.batches(): ...        (one epoch, reshuffled)
+    #   len(loader), loader[i]                    (batches of the last epoch)
+    # A TensorDataset yields [X_batch, Y_batch] tensors (one native gather
+    # per tensor per batch); the older list Dataset yields [xs, ys] lists.
+    # (No __iter__: `for b in obj` over an object hangs the interpreter today,
+    # so iterate batches().)
+    def __init__(self, dataset, batch_size=1, shuffle=false, drop_last=false):
+        self.dataset = dataset
         self.batch_size = batch_size
-        self.shuffle    = shuffle
-    def batches(self):
-        var n   = len(self.dataset.X)
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.last = []
+    def _order(self):
+        var n = _d_len(self.dataset)
+        if self.shuffle:
+            return nt_randperm(n)
         var idx = []
-        var k   = 0
+        var k = 0
         while k < n:
             idx.append(k)
-            var k = k + 1
-        if self.shuffle:
-            var rands = rand_tensor(n)
-            var j = n - 1
-            while j > 0:
-                var ri = int(rands[j] * float(j + 1))
-                if ri > j:
-                    var ri = j
-                var tmp  = idx[j]
-                idx[j]   = idx[ri]
-                idx[ri]  = tmp
-                var j = j - 1
-        var batches = []
-        var start   = 0
+            k = k + 1
+        return idx
+    def __len__(self):
+        var n = _d_len(self.dataset)
+        if self.drop_last:
+            return int(n / self.batch_size)
+        return int((n + self.batch_size - 1) / self.batch_size)
+    def batches(self):
+        var n = _d_len(self.dataset)
+        var idx = self._order()
+        var out = []
+        var start = 0
         while start < n:
-            var batch_end = start + self.batch_size
-            if batch_end > n:
-                var batch_end = n
-            var bX = []
-            var bY = []
-            var ki = start
-            while ki < batch_end:
-                var s = self.dataset[idx[ki]]
-                bX.append(s[0])
-                bY.append(s[1])
-                var ki = ki + 1
-            batches.append([bX, bY])
-            var start = start + self.batch_size
-        return batches
+            var stop = start + self.batch_size
+            if stop > n:
+                if self.drop_last:
+                    break
+                stop = n
+            var sel = idx[start:stop]
+            if isinstance(self.dataset, TensorDataset):
+                var parts = []
+                var k = 0
+                while k < len(self.dataset.tensors):
+                    parts.append(self.dataset.tensors[k].index_select(0, sel))
+                    k = k + 1
+                out.append(parts)
+            else:
+                var bX = []
+                var bY = []
+                var j = 0
+                while j < len(sel):
+                    var s = self.dataset[sel[j]]
+                    bX.append(s[0])
+                    bY.append(s[1])
+                    j = j + 1
+                out.append([bX, bY])
+            start = stop
+        self.last = out
+        return out
+    def __getitem__(self, i):
+        if len(self.last) == 0:
+            self.batches()
+        return self.last[i]
 
 class Normalizer:
     def init(self):
@@ -99,11 +161,11 @@ class Normalizer:
         return self
     def transform(self, t):
         var out = Tensor([0.0])
-        out.data = tensor_scale(tensor_add(t.data, tensor_scale(ones(len(t.data)), -self.mean)), 1.0 / self.std)
+        out = Tensor(tensor_scale(tensor_add(t.data, tensor_scale(ones(len(t.data)), -self.mean)), 1.0 / self.std))
         return out
     def inverse_transform(self, t):
         var out = Tensor([0.0])
-        out.data = tensor_add(tensor_scale(t.data, self.std), tensor_scale(ones(len(t.data)), self.mean))
+        out = Tensor(tensor_add(tensor_scale(t.data, self.std), tensor_scale(ones(len(t.data)), self.mean)))
         return out
     def fit_transform(self, t):
         self.fit(t)
@@ -123,7 +185,7 @@ class MinMaxScaler:
         return self
     def transform(self, t):
         var out = Tensor([0.0])
-        out.data = tensor_scale(tensor_add(t.data, tensor_scale(ones(len(t.data)), -self.min_val)), 1.0 / (self.max_val - self.min_val))
+        out = Tensor(tensor_scale(tensor_add(t.data, tensor_scale(ones(len(t.data)), -self.min_val)), 1.0 / (self.max_val - self.min_val)))
         return out
 
 
@@ -131,9 +193,14 @@ class MinMaxScaler:
 # SECTION 12: METRICS
 # ---------------------------------------------
 
+def _d_accuracy(p, t):
+    return accuracy(p, t)
+
 class Metrics:
+    # (a bare accuracy() inside this class would call Metrics.accuracy itself
+    # on the interpreter — see tensor.ny's LANGUAGE NOTES)
     def accuracy(self, preds, targets):
-        return accuracy(preds.data, targets.data)
+        return _d_accuracy(preds.data, targets.data)
     def mse(self, pred, target):
         return mse_loss(pred.data, target.data)
     def mae(self, pred, target):
@@ -235,7 +302,7 @@ class SinusoidalPE:
     def encode(self, x, position):
         var pe  = tensor_slice(self.table, position * self.d_model, (position + 1) * self.d_model)
         var out = Tensor([0.0])
-        out.data = tensor_add(x.data, pe)
+        out = Tensor(tensor_add(x.data, pe))
         return out
     def encode_sequence(self, seq_tensors):
         var out = []
@@ -265,7 +332,7 @@ class RotaryPE:
         var rot1 = tensor_sub(tensor_mul(x1, cos_a), tensor_mul(x2, sin_a))
         var rot2 = tensor_add(tensor_mul(x1, sin_a), tensor_mul(x2, cos_a))
         var out  = Tensor([0.0])
-        out.data = tensor_concat(rot1, rot2)
+        out = Tensor(tensor_concat(rot1, rot2))
         return out
 
 class LearnedPE:
@@ -276,7 +343,7 @@ class LearnedPE:
     def encode(self, x, position):
         var pe  = tensor_slice(self.embeddings, position * self.d_model, (position + 1) * self.d_model)
         var out = Tensor([0.0])
-        out.data = tensor_add(x.data, pe)
+        out = Tensor(tensor_add(x.data, pe))
         return out
 
 class ALiBi:
@@ -319,7 +386,7 @@ class NormalDist:
             result[i] = mu + sig * z
             var i = i + 1
         var out = Tensor([0.0])
-        out.data = result
+        out = Tensor(result)
         return out
     def log_prob(self, x):
         var pi  = 3.14159265358979
@@ -335,7 +402,7 @@ class BernoulliDist:
         var u   = rand_tensor(n)
         var p   = self.p
         var out = Tensor([0.0])
-        out.data = tensor_apply(u, lambda v: 1.0 if v < p else 0.0)
+        out = Tensor(tensor_apply(u, lambda v: 1.0 if v < p else 0.0))
         return out
     def log_prob(self, x):
         var p = max(0.0000001, min(1.0 - 0.0000001, self.p))

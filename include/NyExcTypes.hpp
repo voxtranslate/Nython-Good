@@ -63,6 +63,11 @@ inline const char* ny_builtin_exc_parent(const std::string& name) {
         {"BrokenPipeError", "ConnectionError"},
         {"ConnectionRefusedError", "ConnectionError"},
         {"ConnectionResetError", "ConnectionError"},
+        // The concurrency runtime's (src/NyConc.cpp).
+        {"DeadlockError", "RuntimeError"},
+        {"LockOrderError", "RuntimeError"},
+        {"CancelledError", "Exception"},
+        {"ChannelClosedError", "Exception"},
     };
     auto it = parents.find(name);
     return it == parents.end() ? nullptr : it->second;
@@ -100,6 +105,7 @@ inline const std::vector<std::string>& ny_builtin_exc_names() {
         "IsADirectoryError", "NotADirectoryError", "InterruptedError",
         "ChildProcessError", "ProcessLookupError", "BlockingIOError",
         "BrokenPipeError", "ConnectionRefusedError", "ConnectionResetError",
+        "DeadlockError", "LockOrderError", "CancelledError", "ChannelClosedError",
     };
     return names;
 }

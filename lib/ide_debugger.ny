@@ -42,6 +42,9 @@ class DebugSession:
         self._cur_vars = none
         self._cur_pos = -2
         self._cur_fn = ""
+        self.logs = []             # log-message breakpoints passed by continue_fwd
+        self.logging = false
+        self._hit_nos = none       # per step: how many times its line was reached so far
 
     def reset(self):
         self.__init__()
@@ -212,14 +215,154 @@ class DebugSession:
         self.active = true
         self.state = "paused"
         self.pos = 0
+        # Log points passed on the way to the first stop are reported too.
+        self.logs = []
+        self.logging = true
         if not self._is_break(0, breaks):
             var hit = self._next_break(0, breaks)
             if hit >= 0:
                 self.pos = hit
+        self.logging = false
         return true
 
+    # A breakpoint is `true` or a map {cond, hits, log}. Hit counts: "5" stops
+    # on the 5th time the line is reached, ">5", ">=5", "%5" (every fifth).
+    # Conditions: `name op literal` (== != < > <= >=) or a bare name, on the
+    # values recorded at that step. A log message never stops: with {name}
+    # replaced by values it is added to self.logs while continuing forward.
     def _is_break(self, i, breaks):
-        return breaks.has_key(self.file_at(i) + ":" + str(self.lines[i]))
+        var key = self.file_at(i) + ":" + str(self.lines[i])
+        if not breaks.has_key(key):
+            return false
+        var spec = breaks[key]
+        if spec == true:
+            return true
+        var hits = spec["hits"]
+        if hits != "" and not self._hits_ok(self._hit_no(i), hits):
+            return false
+        var cond = spec["cond"]
+        if cond != "" and not self._cond_ok(i, cond):
+            return false
+        var log = spec["log"]
+        if log != "":
+            if self.logging:
+                self.logs.append(self._interpolate(i, log))
+            return false
+        return true
+
+    # How many times step i's line has been reached, counting step i.
+    def _hit_no(self, i):
+        if self._hit_nos == none:
+            var counts = {}
+            var out = []
+            var k = 0
+            while k < self.n:
+                var key = str(self.files[k]) + ":" + str(self.lines[k])
+                var c = counts.get(key)
+                if c == none:
+                    c = 0
+                c = c + 1
+                counts[key] = c
+                out.append(c)
+                k = k + 1
+            self._hit_nos = out
+        return self._hit_nos[i]
+
+    def _hits_ok(self, n, spec):
+        var s = string_strip(spec)
+        if string_startswith(s, ">="):
+            return n >= int_or_zero_dbg(string_slice(s, 2, len(s)))
+        if string_startswith(s, ">"):
+            return n > int_or_zero_dbg(string_slice(s, 1, len(s)))
+        if string_startswith(s, "%"):
+            var m = int_or_zero_dbg(string_slice(s, 1, len(s)))
+            return m > 0 and n % m == 0
+        if string_startswith(s, "=="):
+            s = string_slice(s, 2, len(s))
+        return n == int_or_zero_dbg(s)
+
+    # Recorded value (its printed form) of `name` at step i, or none.
+    def _value_at(self, i, name):
+        var ev = json_decode(self.raw[i])
+        if ev == none or ev["v"] == none:
+            return none
+        var vars = ev["v"]
+        if vars.has_key(name):
+            return vars[name]
+        return none
+
+    def _cond_ok(self, i, cond):
+        var ops = ["==", "!=", ">=", "<=", ">", "<"]
+        var k = 0
+        while k < len(ops):
+            var at = string_find(cond, ops[k])
+            if at > 0:
+                var name = string_strip(string_slice(cond, 0, at))
+                var lit = string_strip(string_slice(cond, at + len(ops[k]), len(cond)))
+                var v = self._value_at(i, name)
+                if v == none:
+                    return false
+                return self._compare(self._unquote(str(v)), ops[k], self._unquote(lit))
+            k = k + 1
+        var bare = self._value_at(i, string_strip(cond))
+        if bare == none:
+            return false
+        var t = self._unquote(str(bare))
+        return t != "" and t != "0" and t != "false" and t != "none" and t != "[]" and t != "{}"
+
+    def _unquote(self, s):
+        if len(s) >= 2:
+            var a = string_slice(s, 0, 1)
+            if (a == "\"" or a == "'") and string_slice(s, len(s) - 1, len(s)) == a:
+                return string_slice(s, 1, len(s) - 1)
+        return s
+
+    def _compare(self, a, op, b):
+        var na = to_number_dbg(a)
+        var nb = to_number_dbg(b)
+        if na != none and nb != none:
+            if op == "==":
+                return na == nb
+            if op == "!=":
+                return na != nb
+            if op == ">=":
+                return na >= nb
+            if op == "<=":
+                return na <= nb
+            if op == ">":
+                return na > nb
+            return na < nb
+        if op == "==":
+            return a == b
+        if op == "!=":
+            return a != b
+        if op == ">=":
+            return a >= b
+        if op == "<=":
+            return a <= b
+        if op == ">":
+            return a > b
+        return a < b
+
+    def _interpolate(self, i, msg):
+        var out = ""
+        var k = 0
+        while k < len(msg):
+            var ch = string_slice(msg, k, k + 1)
+            if ch == "{":
+                var close = string_find(string_slice(msg, k, len(msg)), "}")
+                if close > 0:
+                    var name = string_strip(string_slice(msg, k + 1, k + close))
+                    var v = self._value_at(i, name)
+                    if v == none:
+                        out = out + "?"
+                    else:
+                        out = out + str(v)
+                    k = k + close + 1
+                    continue
+            out = out + ch
+            k = k + 1
+        return os_path_basename(self.file_at(i)) + ":" + str(self.lines[i]) + ": " + out
 
     def _next_break(self, frm, breaks):
         var i = frm + 1
@@ -286,7 +429,9 @@ class DebugSession:
         return true
 
     def continue_fwd(self, breaks):
+        self.logging = true
         var hit = self._next_break(self.pos, breaks)
+        self.logging = false
         if hit >= 0:
             self.pos = hit
             return true
@@ -316,3 +461,37 @@ class DebugSession:
         self.active = false
         self.state = "idle"
         self.pos = -1
+
+
+def int_or_zero_dbg(s):
+    var t = string_strip(s)
+    if t == "":
+        return 0
+    var i = 0
+    while i < len(t):
+        var ch = string_slice(t, i, i + 1)
+        if not (ch >= "0" and ch <= "9") and not (i == 0 and ch == "-"):
+            return 0
+        i = i + 1
+    return int(t)
+
+
+# A number from a recorded value's text, or none.
+def to_number_dbg(s):
+    var t = string_strip(s)
+    if t == "":
+        return none
+    var dots = 0
+    var i = 0
+    while i < len(t):
+        var ch = string_slice(t, i, i + 1)
+        if ch == ".":
+            dots = dots + 1
+        elif not (ch >= "0" and ch <= "9") and not (i == 0 and ch == "-"):
+            return none
+        i = i + 1
+    if dots > 1 or t == "-" or t == ".":
+        return none
+    if dots == 1:
+        return float(t)
+    return int(t)

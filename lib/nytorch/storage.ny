@@ -11,6 +11,8 @@
 #   AgentWorld, AgentBuilder
 # ============================================================
 
+import "lib/nytorch/core.ny"
+
 import nytorch
 
 # -----------------------------------------
