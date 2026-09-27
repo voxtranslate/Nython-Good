@@ -1603,8 +1603,9 @@ public:   // NythonExecutor is a struct: members default to public
     // == true. A list never equals a tuple.
     bool valuesEqual(const Value& a, const Value& b, int depth) {
         if (depth > 100) return false;
-        // Objects inside containers compare through __eq__, as in Python.
-        if (depth > 0 && (isInstanceVal(a) || isInstanceVal(b))) {
+        // Objects compare through __eq__ (inside containers, for `in`,
+        // index(), count(), remove()), as in Python.
+        if (isInstanceVal(a) || isInstanceVal(b)) {
             Value r;
             if (binaryDunder("==", a, b, global_ctx, r)) return isTruthy(r);
             return identical(a, b);
