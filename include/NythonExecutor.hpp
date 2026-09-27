@@ -999,6 +999,8 @@ public:   // NythonExecutor is a struct: members default to public
     Value evalVarDecl(node_ptr node, Context* ctx) {
         auto vd = static_pointer_cast<VarDeclNode>(node);
         Value val = vd->init ? evalNode(vd->init, ctx) : NONE_VALUE;
+        // a, b = gen(): the targets index a list of its values (nygen).
+        if (vd->unpack != -2 && nygen::is_gen(val)) val = nygen::unpack_list(*this, val, vd->unpack, ctx);
         ctx->defineByName(vd->name, val);
         return val;
     }
@@ -1928,7 +1930,7 @@ public:   // NythonExecutor is a struct: members default to public
         }
         if (name == "update" || name == "merge") {
             if (!args.empty()) {
-                if (Container* src = contOf(args[0]); src && seqLen(src) < 0) dictUpdate(cont, src);
+                if (Container* src = contOf(args[0]); src && seqLen(src) < 0 && !nygen::is_gen(args[0])) dictUpdate(cont, src);
                 else for (auto& pairv : iterItems(args[0], ctx)) {
                     std::vector<Value> kv = iterItems(pairv, ctx);
                     if (kv.size() != 2) pyRaise("ValueError", "dictionary update sequence element has length " + std::to_string(kv.size()) + "; 2 is required");
@@ -2377,7 +2379,7 @@ public:   // NythonExecutor is a struct: members default to public
         bool mapping = false;
         Container* rc = contOf(rv);
         if (rc && seqLen(rc) >= 0 && isTupleCont(rc)) args = seqItems(rc);
-        else { args.push_back(rv); mapping = rc && seqLen(rc) < 0; }
+        else { args.push_back(rv); mapping = rc && seqLen(rc) < 0 && !nygen::is_gen(rv); }
         std::string out = nyCall([&] {
             return nypy::percent_format(fmt, (int64_t)args.size(), mapping,
                 [&](int64_t i, const std::string& key, char conv) -> nypy::FmtVal {
@@ -5631,17 +5633,23 @@ public:
             auto& cl = cn->clauses[k];
             // The first iterable is evaluated in the enclosing scope.
             Value itv = evalNode(cl.iter, k == 0 ? ctx : cc);
-            for (auto& item : iterValues(itv, cc)) {
+            auto one = [&](const Value& item) {
                 bindTarget(cl.target, item, cc);
-                bool keep = true;
-                for (auto& c : cl.conds) if (!isTruthy(evalNode(c, cc))) { keep = false; break; }
-                if (!keep) continue;
+                for (auto& c : cl.conds) if (!isTruthy(evalNode(c, cc))) return;
                 if (k + 1 < cn->clauses.size()) clause(k + 1);
                 else if (cn->kind == ComprehensionNode::DICT) {
                     Value kv = evalNode(cn->elt, cc);
                     kvs.push_back({kv, evalNode(cn->value, cc)});
                 }
                 else items.push_back(evalNode(cn->elt, cc));
+            };
+            // Over a generator, one value at a time: its side effects and
+            // the element's interleave, as in Python.
+            if (nygen::Gen* g = nygen::gen_of(itv)) {
+                Value item;
+                while (nygen::next(*this, g, item, cc)) one(item);
+            } else {
+                for (auto& item : iterValues(itv, cc)) one(item);
             }
         };
         if (!cn->clauses.empty()) clause(0);

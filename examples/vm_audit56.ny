@@ -152,6 +152,38 @@ log = []
 check("return from a loop over a generator", first_true(x - 1 for x in producer(5)), -1)
 check("the generator is not run further", log, ["make 0"])
 
+# ── everything that consumes an iterable ───────────────────────────────────
+def countdown(n):
+    while n > 0:
+        yield n
+        n -= 1
+
+log = []
+made = [log.append("use " + str(x)) for x in producer(2)]
+check("a list comprehension over a generator interleaves", log, ["make 0", "use 0", "make 1", "use 1", "producer done"])
+check("list(generator)", list(countdown(3)), [3, 2, 1])
+a1, b1, c1 = countdown(3)
+check("a, b, c = generator", [a1, b1, c1], [3, 2, 1])
+first, *rest = countdown(4)
+check("first, *rest = generator", [first, rest], [4, [3, 2, 1]])
+def unpack_two(it):
+    x, y = it
+    return [x, y]
+check("too many values to unpack", error_of(lambda: unpack_two(naturals())), "ValueError")
+check("not enough values to unpack", error_of(lambda: unpack_two(countdown(1))), "ValueError")
+def spread(*args):
+    return len(args)
+check("f(*generator)", spread(*countdown(5)), 5)
+check("sorted/min/max/sum", [sorted(countdown(3)), min(countdown(4)), max(countdown(4)), sum(countdown(4))], [[1, 2, 3], 1, 4, 10])
+check("str.join over a generator expression", ",".join(str(x) for x in countdown(3)), "3,2,1")
+check("dict over a generator of pairs", dict((str(x), x) for x in countdown(2)), {"2": 2, "1": 1})
+check("tuple / list", [tuple(countdown(2)), list(countdown(2))], [(2, 1), [2, 1]])
+check("enumerate then next", next(enumerate(countdown(2))), (0, 2))
+it = iter([10, 20, 30])
+check("iter() of a list is an iterator", [next(it), list(it)], [10, [20, 30]])
+check("iter(generator) is the generator", [next(iter(countdown(2)))], [2])
+check("zip stops at the shortest", list(zip(countdown(3), countdown(2))), [(3, 2), (2, 1)])
+
 # ── send ───────────────────────────────────────────────────────────────────
 def accumulator():
     total = 0

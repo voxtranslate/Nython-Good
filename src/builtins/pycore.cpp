@@ -396,7 +396,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         Value d = E.makeDictValue();
         Container* dc = E.contOf(d);
         if (!args.empty()) {
-            if (Container* src = E.contOf(args[0]); src && NythonExecutor::seqLen(src) < 0) {
+            if (Container* src = E.contOf(args[0]); src && NythonExecutor::seqLen(src) < 0 && !nygen::is_gen(args[0])) {
                 E.dictUpdate(dc, src);
             } else {
                 for (auto& pairv : E.iterItems(args[0], ctx)) {

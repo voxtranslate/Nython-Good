@@ -567,7 +567,6 @@ node_ptr Parser::statement(){
             std::function<void(node_ptr, node_ptr)> assign_to = [&](node_ptr t, node_ptr value) {
                 if(t->type() == NodeType::TUPLE || t->type() == NodeType::LIST) {
                     std::string tn = tmp_name();
-                    block->add(make_node<VarDeclNode>(op, tn, value, false, false));
                     std::vector<node_ptr> inner; int istar = -1;
                     for(auto& e : t->statements()) {
                         if(e->type() == NodeType::UNARY && e->value() == "*") {
@@ -575,6 +574,9 @@ node_ptr Parser::statement(){
                             inner.push_back(static_cast<UnaryNode*>(e.get())->operand);
                         } else inner.push_back(e);
                     }
+                    auto decl = make_node<VarDeclNode>(op, tn, value, false, false);
+                    static_cast<VarDeclNode*>(decl.get())->unpack = istar < 0 ? (int)inner.size() : -1;
+                    block->add(decl);
                     unpack(inner, istar, tn);
                     return;
                 }
@@ -595,7 +597,11 @@ node_ptr Parser::statement(){
                     assign_to(ts[si + 1 + j], make_node<SubscriptNode>(op, var_ref(src), int_node(-(n_after - j))));
             };
             std::string src = tmp_name();
-            if(vals.size() == 1) block->add(make_node<VarDeclNode>(op, src, vals[0], false, false));
+            if(vals.size() == 1) {
+                auto decl = make_node<VarDeclNode>(op, src, vals[0], false, false);
+                static_cast<VarDeclNode*>(decl.get())->unpack = star < 0 ? (int)targets.size() : -1;
+                block->add(decl);
+            }
             else {
                 // Several values: evaluated first, all of them (a, b = b, a).
                 auto lst = make_node<ListNode>(op);
@@ -1469,7 +1475,11 @@ node_ptr Parser::varDecl(bool is_const, bool is_let){
             // Perform outer unpack from vals
             if (vals.size() == 1) {
                 std::string outer_src = "__outer_src__";
-                block->add(make_node<VarDeclNode>(tok, outer_src, vals[0], false, false));
+                {
+                    auto decl = make_node<VarDeclNode>(tok, outer_src, vals[0], false, false);
+                    static_cast<VarDeclNode*>(decl.get())->unpack = (int)outer_names.size();
+                    block->add(decl);
+                }
                 for (int i = 0; i < (int)outer_names.size(); i++) {
                     Token tmp_tok = tok; tmp_tok.value = outer_src;
                     auto tmp_var = make_node<VariableNode>(tmp_tok);
@@ -1528,10 +1538,14 @@ node_ptr Parser::varDecl(bool is_const, bool is_let){
             if (vals.size() == 1 && names.size() > 1) {
                 // Single RHS -> list unpacking: var a, b = func()
                 std::string tmp = "__unpack_src__";
-                block->add(make_node<VarDeclNode>(tok, tmp, vals[0], false, false));
                 // Find star index
                 int si = -1;
                 for(size_t k=0;k<names.size();k++) if(!names[k].empty()&&names[k][0]=='*') { si=(int)k; break; }
+                {
+                    auto decl = make_node<VarDeclNode>(tok, tmp, vals[0], false, false);
+                    static_cast<VarDeclNode*>(decl.get())->unpack = si < 0 ? (int)names.size() : -1;
+                    block->add(decl);
+                }
                 if(si < 0) {
                     // No star: straight index assignment
                     for(size_t i = 0; i < names.size(); i++) {

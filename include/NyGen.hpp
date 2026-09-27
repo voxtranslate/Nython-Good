@@ -96,6 +96,10 @@ void close(NythonExecutor& E, Gen* g);
 bool contains(NythonExecutor& E, Gen* g, const Value& x, Context* ctx);
 // "generator".
 std::string type_name(const Gen* g);
+// The values an unpacking assignment of `n` targets takes from generator
+// `v` (n = -1: a starred target, all of them): n + 1 are pulled at most, as
+// Python does, and too many or too few is a ValueError.
+Value unpack_list(NythonExecutor& E, const Value& v, int n, Context* ctx);
 // `x in v` for any iterable, pulling values until the first match.
 bool contains_iter(NythonExecutor& E, const Value& v, const Value& x, Context* ctx);
 // iter(v) for anything that is not already a generator: a lazy iterator.

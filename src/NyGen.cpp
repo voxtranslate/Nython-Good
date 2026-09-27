@@ -1148,6 +1148,21 @@ Value for_loop(NythonExecutor& E, void* for_node, const Value& gv, Context* ctx,
     return result;
 }
 
+Value unpack_list(NythonExecutor& E, const Value& v, int n, Context* ctx) {
+    Gen* g = gen_of(v);
+    std::vector<Value> items;
+    if (!g) return v;
+    Value x;
+    if (n < 0) drain(E, g, items, ctx);
+    else {
+        while ((int)items.size() <= n && next(E, g, x, ctx)) items.push_back(x);
+        if ((int)items.size() > n) raise("ValueError", "too many values to unpack (expected " + std::to_string(n) + ")");
+        if ((int)items.size() < n)
+            raise("ValueError", "not enough values to unpack (expected " + std::to_string(n) + ", got " + std::to_string(items.size()) + ")");
+    }
+    return E.makeListValue(items);
+}
+
 bool contains_iter(NythonExecutor& E, const Value& v, const Value& x, Context* ctx) {
     Cursor cu;
     open(E, v, ctx, cu);

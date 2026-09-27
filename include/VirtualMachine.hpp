@@ -745,6 +745,15 @@ private:
         // Var decl
         case NT::VARIABLE_DECL: {
             auto vd=std::static_pointer_cast<nython::node::VarDeclNode>(nd);
+            if(vd->unpack!=-2 && vd->init){
+                // a, b = rhs: a generator or iterator is read into a list
+                // first (__unpack_seq__), which the targets then index.
+                emit(Op::LOAD_NAME,C().add_name("__unpack_seq__"),l);
+                visit(vd->init);
+                emit_lc(VMVal::make_int(vd->unpack),l);
+                emit(Op::CALL_FUNCTION,2,l);
+                emit_dn(vd->name,l); break;
+            }
             if(vd->init) visit(vd->init); else emit_lc(VMVal::make_none(),l);
             emit_dn(vd->name,l); break;
         }
@@ -3160,6 +3169,23 @@ private:
                 o=std::move(v);
                 return true;
             });
+        });
+        // The right side of an unpacking assignment (see VarDeclNode::unpack).
+        globals_["__unpack_seq__"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.empty()) return VMVal::make_none();
+            if(!vm_lazy_arg(a[0])) return a[0];
+            int64_t n = a.size()>=2 && a[1].type==VMType::INT ? a[1].i : -1;
+            VMVal it=a[0], v;
+            std::vector<VMVal> items;
+            if(n<0){ while(vm_iter_step(it,v)) items.push_back(std::move(v)); }
+            else {
+                while((int64_t)items.size()<=n && vm_iter_step(it,v)) items.push_back(std::move(v));
+                if((int64_t)items.size()>n)
+                    throw_exception(make_exception("ValueError",{VMVal::make_str("too many values to unpack (expected "+std::to_string(n)+")")}));
+                if((int64_t)items.size()<n)
+                    throw_exception(make_exception("ValueError",{VMVal::make_str("not enough values to unpack (expected "+std::to_string(n)+", got "+std::to_string(items.size())+")")}));
+            }
+            return VMVal::make_list(std::move(items));
         });
         globals_["take"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()!=2) throw_exception(make_exception("TypeError",{VMVal::make_str("take() takes exactly 2 arguments ("+std::to_string(a.size())+" given)")}));
