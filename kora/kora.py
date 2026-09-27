@@ -4541,8 +4541,10 @@ class Baselines:
         out = []
         for t in texts:
             inp = tk(t, return_tensors="pt").to(self.device)
-            if inp["input_ids"].shape[1] < 2:
-                raise ValueError(f"MMS-TTS ({lang}) produced no symbols for {t!r}")
+            if inp["input_ids"].shape[1] < 2:  # e.g. an empty cascade translation: silence, not an abort
+                LOG.warning(f"MMS-TTS ({lang}): no symbols in {t!r}; 0.1 s of silence instead")
+                out.append(np.zeros(int(0.1 * 24000), dtype=np.float32))
+                continue
             torch.manual_seed(stable_hash(t))
             w = model(**inp).waveform[0].float().cpu().numpy()
             out.append(resample(w, model.config.sampling_rate, 24000))
@@ -4772,7 +4774,9 @@ class Evaluator:
                         errs[k][1] += float(n_.sum())
         dev_wer = {k: 100 * e / max(1.0, n) for k, (e, n) in errs.items()}
         best = min(dev_wer, key=dev_wer.get)
-        mode, lam = (best.split("@")[0], float(best.split("@")[1])) if "@" in best else (best, 0.5)
+        mode = best.split("@")[0]
+        # λ of the joint mode is tuned on dev even when another mode wins: the KORA-joint rows use it too
+        lam = float(min((k for k in dev_wer if k.startswith("joint@")), key=dev_wer.get).split("@")[1])
         self.inf.asr_mode, self.inf.joint_lambda = mode, lam
         self.put(dict(asr_mode=mode, joint_lambda=lam, dev_wer=dev_wer), "decoding")
         LOG.info(f"dev-selected ASR decoding: {mode} (λ={lam}) | dev WER {json.dumps({k: round(v, 2) for k, v in dev_wer.items()})}")
@@ -5057,15 +5061,22 @@ class Evaluator:
                     for e, w in list(zip(E, wavs))[: self.ec.n_audio_samples]:
                         save_wav(os.path.join(self.P.audio_dir, "s2st", key, f"{e['uid']}.wav"), w, 24000)
                     asr = self.base.mms_asr([resample(w, 24000, 16000) for w in wavs], tgt)
-                    self.put(dict(text_BLEU=bleu(refs, texts), text_chrF=chrf(refs, texts), ASR_BLEU=bleu(refs, asr),
-                                  ASR_chrF=chrf(refs, asr), n=len(E)), "s2st", "KORA (ST→TTS, shared model)", key)
+                    self.put(dict(text_BLEU=bleu(refs, texts), text_chrF=chrf(refs, texts),
+                                  **self._asr_scores(refs, asr), n=len(E)), "s2st", "KORA (ST→TTS, shared model)", key)
                 # the cascade baseline needs an MMS-TTS voice in the target language (none for Lingala)
                 if tgt in self.ec.mms_tts_langs and not self.has("s2st", "MMS-ASR→NLLB→MMS-TTS", key):
                     self.check()
                     t = self.base.nllb(self.base.mms_asr(self._wavs(E), src), src, tgt)
                     back = self.base.mms_asr([resample(x, 24000, 16000) for x in self.base.mms_tts(t, tgt)], tgt)
-                    self.put(dict(text_BLEU=bleu(refs, t), text_chrF=chrf(refs, t), ASR_BLEU=bleu(refs, back),
-                                  ASR_chrF=chrf(refs, back), n=len(E)), "s2st", "MMS-ASR→NLLB→MMS-TTS", key)
+                    self.put(dict(text_BLEU=bleu(refs, t), text_chrF=chrf(refs, t), **self._asr_scores(refs, back),
+                                  n=len(E)), "s2st", "MMS-ASR→NLLB→MMS-TTS", key)
+
+    @staticmethod
+    def _asr_scores(refs, asr) -> dict:
+        """ASR-BLEU / ASR-chrF: the ASR judge emits lowercase text without punctuation, so references and
+        transcripts are both normalised (the usual ASR-BLEU protocol); text_* scores stay on raw text."""
+        r, h = [normalize_text(x) for x in refs], [normalize_text(x) for x in asr]
+        return dict(ASR_BLEU=bleu(r, h), ASR_chrF=chrf(r, h))
 
     # ------------------------------------------------------------------ PL analysis ---------
     def sonar(self) -> SonarEmbedder:
@@ -5138,7 +5149,7 @@ class Evaluator:
             for s in recs:
                 alt = s["t_aed"] if s.get("t_route") == "ctc" else s["t_ctc"]
                 agree = word_agreement(s["t_star"], alt)
-                correct = word_agreement(s["t_star"], gold[s["uid"]])
+                correct = word_agreement(s["t_star"], normalize_text(gold[s["uid"]]))
                 y_err += [int(not c) for c in correct]
                 y_dis += [int(not a) for a in agree]
             auroc = float(roc_auc_score(y_err, y_dis)) if len(set(y_err)) > 1 and len(set(y_dis)) > 1 else float("nan")

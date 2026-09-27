@@ -171,6 +171,16 @@ def test_route_mbr_same_route_candidates_share_one_vote():
     u_c = K.route_mbr({"direct": direct, "cascade": casc}, selectable=["cascade"])[2]
     assert abs(u_d - u_c) < 1e-6, (u_d, u_c)  # one vote each: the two routes are now symmetric
 
+
+def test_asr_bleu_is_scored_on_normalised_text():
+    refs = ["Sai Yesu-Kristi ya ce, 'Ku zo.'", "Ọmọ náà ń sáré."]
+    judge = [K.normalize_text(r) for r in refs]  # a perfect ASR judge emits lowercase, unpunctuated text
+    sc = K.Evaluator._asr_scores(refs, judge)
+    assert sc["ASR_BLEU"] > 99.9 and sc["ASR_chrF"] > 99.9, sc
+    # word-level error labels against a normalised gold: a perfect hypothesis has no "errors"
+    gold = K.normalize_text(refs[0])
+    assert all(K.word_agreement(gold, gold))
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):
