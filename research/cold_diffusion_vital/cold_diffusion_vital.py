@@ -218,6 +218,7 @@ class Config:
     clock_bands: Tuple[float, ...] = (0.5, 1.0, 2.0, 4.0, 8.0)
     clock_window: int = 15
     clock_smooth_sigma: float = 6.0
+    blind_clock_margin: float = 0.5  # blind mode uses the lower confidence bound tau = mu - m*b (risk-averse)
 
     # ----------------------------- Optimisation -----------------------------
     batch_size: int = 4
@@ -258,8 +259,9 @@ class Config:
     adaptive_steps: bool = True  # fewer steps for lightly degraded inputs
     step_rho: float = 1.5  # u_k = (1 - k/K)^rho
     rn_eta: float = 1.0  # range-null anchoring strength             [N2]
-    rn_lambda: float = 5e-3  # Wiener regulariser (synthetic / clean observations)
-    rn_lambda_real: float = 2e-2  # Wiener regulariser for real photos (noise/JPEG)
+    rn_lambda: float = 2e-2  # Wiener regulariser, known clock (match it to the observation noise;
+    #                          ~5e-3 only for noiseless float observations)
+    rn_lambda_real: float = 5e-2  # blind mode / real photos (estimated operator, noise, JPEG)
     churn: float = 0.0  # uncertainty-gated stochasticity for restoration
     gen_churn: float = 0.3  # ... and for generation
     prior_res: int = 8  # degraded-prior thumbnail size             [N8]
@@ -283,6 +285,8 @@ class Config:
     generate_num: int = 8
     generate_steps: int = 100
     real_max_side: int = 768
+    eval_obs_noise: float = 0.01  # sensor noise added to synthetic observations (avoids the "inverse crime")
+    eval_quantize: bool = True  # 8-bit quantisation of synthetic observations
     compute_lpips: bool = True
     save_gif: bool = True
 
@@ -1658,7 +1662,15 @@ class ColdDiffusionModel(nn.Module):
     def estimate_clock(self, y: torch.Tensor, smooth_sigma: Optional[float] = None) -> Dict[str, torch.Tensor]:
         est = self.clock_estimator(y)
         s = self.cfg.clock_smooth_sigma if smooth_sigma is None else smooth_sigma
-        est["tau_smooth"] = SpectralClockEstimator.smooth(est["tau_mu"], est["tau_logscale"], s) if s > 0 else est["tau_mu"]
+        scale = est["tau_logscale"].float().exp()
+        if s > 0:
+            est["tau_smooth"] = SpectralClockEstimator.smooth(est["tau_mu"], est["tau_logscale"], s)
+            est["scale_smooth"] = SpectralClockEstimator.smooth(scale, est["tau_logscale"], s)
+        else:
+            est["tau_smooth"], est["scale_smooth"] = est["tau_mu"], scale
+        # Risk-averse clock: over-estimating the blur causes ringing / hallucination, under-estimating
+        # only leaves residual blur -> use a lower confidence bound of the Laplace posterior.
+        est["tau_lcb"] = (est["tau_smooth"] - self.cfg.blind_clock_margin * est["scale_smooth"]).clamp(0, 1)
         return est
 
     # ---- sampler building blocks -------------------------------------------------------------
@@ -1721,7 +1733,9 @@ class ColdDiffusionModel(nn.Module):
         sampler = sampler or cfg.sampler
         churn = cfg.churn if churn is None else churn
         eta = cfg.rn_eta if eta is None else eta
-        lam = cfg.rn_lambda if lam is None else lam
+        blind = tau_obs is None
+        if lam is None:  # an *estimated* operator is uncertain -> stronger Wiener regularisation
+            lam = cfg.rn_lambda_real if blind else cfg.rn_lambda
         y = y.float()
         B, C, H, W = y.shape
         info: Dict[str, Any] = {}
@@ -1735,7 +1749,7 @@ class ColdDiffusionModel(nn.Module):
             else:
                 kind = torch.full((B,), KINDS.index(cfg.degradation_type), dtype=torch.long, device=y.device)
         if tau_obs is None:
-            tau_obs = (est["tau_smooth"] * strength).clamp(0, 1)
+            tau_obs = (est["tau_lcb"] * strength).clamp(0, 1)
         elif tau_obs.dim() == 1:
             tau_obs = tau_obs.view(B, 1, 1, 1).expand(B, 1, H, W)
         tau_obs = tau_obs.float()
@@ -2604,6 +2618,15 @@ class Inferencer:
             return self.model.sample_tau(B, H, W, self.device, generator, force_field=True)
         return torch.full((B, 1, H, W), float(tau), device=self.device)
 
+    def _observe(self, y: torch.Tensor, generator: Optional[torch.Generator]) -> torch.Tensor:
+        """Realistic synthetic observation: sensor noise + 8-bit quantisation. Without it an exact,
+        noiseless, known operator can be inverted perfectly (the 'inverse crime')."""
+        if self.cfg.eval_obs_noise > 0:
+            y = y + self.cfg.eval_obs_noise * _randn(tuple(y.shape), y.device, generator)
+        if self.cfg.eval_quantize:
+            y = torch.round(to01(y) * 255.0) / 255.0 * 2 - 1
+        return y.clamp(-1, 1)
+
     def _metrics(self, out, x0, y, tau, kind) -> Dict[str, float]:
         m = {"psnr": psnr(out, x0).mean().item(), "ssim": ssim(out, x0).mean().item(),
              "psnr_input": psnr(y, x0).mean().item(), "ssim_input": ssim(y, x0).mean().item(),
@@ -2627,6 +2650,7 @@ class Inferencer:
             kind = self.model.sample_kind(B, self.device, g)
         tau_map = self._tau_map(tau, B, H, W, g)
         y, st = self.model.degradation.apply(x0, tau_map, kind, generator=g)
+        y = self._observe(y, g)
         observed = st["rank"] >= self.model.degradation.mask_ratio(tau_map)
         t0 = time.time()
         res = self.model.restore(y, tau_obs=None if blind else tau_map, kind=None if blind else kind, sampler=sampler,
@@ -2825,7 +2849,7 @@ class Inferencer:
                 kind = self.model.sample_kind(B, self.device, g)
                 tau = self._tau_map(tv, B, H, W, g)
                 y, _ = self.model.degradation.apply(x0, tau, kind, generator=g)
-                est = self.model.estimate_clock(y)
+                est = self.model.estimate_clock(self._observe(y, g))
                 sub = (slice(None), slice(None), slice(None, None, 8), slice(None, None, 8))
                 t_true.append(tau[sub].flatten().cpu())
                 t_raw.append(est["tau_mu"][sub].flatten().cpu())
@@ -3251,6 +3275,7 @@ class Inferencer:
                               dtype=torch.long, device=self.device)
             tau = self.model.sample_tau(1, H, W, self.device, g, force_field=True)
             y, _ = self.model.degradation.apply(x0, tau, kind, generator=g)
+            y = self._observe(y, g)
             demo_path = d / "demo_degraded_image.png"
             tensor_to_pil(y).save(demo_path)
             tensor_to_pil(x0).save(d / "demo_ground_truth.png")

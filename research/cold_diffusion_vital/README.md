@@ -39,6 +39,9 @@ The scalar time `t` of cold diffusion becomes a **per-pixel clock field** `τ(x)
 * **Sampling.** *Synchronised Field Descent*, `τ_k(x) = τ_obs(x)·(1−k/K)^ρ`: every pixel
   reaches τ = 0 on the same step. The number of steps adapts to `max τ_obs`, and a
   user-controlled strength `κ` scales the clock (`τ_obs = κ·τ̂`).
+* **Risk-averse clock.** Blind mode starts from the lower confidence bound of the estimated
+  clock, `τ̂ = μ − m·b` with `blind_clock_margin = m`. Over-estimating the blur causes ringing
+  and hallucinated detail, while under-estimating it only leaves some residual blur.
 
 **Closest prior work.** SVNR (per-pixel times, *noise only*, asynchronous, noise map from a
 camera model). DynFaceRestore and SuperSharpen (one *global* blur level or start step).
@@ -108,6 +111,35 @@ heat-dissipation trajectories** and to spatially varying operators.
     consistency; radial spectra; uncertainty reliability diagram; clock-sensitivity map
     `∂x̂₀/∂τ`; physics features; raw tensors (`.pt`).
 
+## Sanity-check results (tiny scale, *not* a benchmark)
+
+**Setup**
+* Model: 64×64 images, `dim=16`.
+* Training: about 250 CPU steps on procedural images, `max_sigma=8`.
+* Evaluation: 16 held-out procedural images. Each observation gets sensor noise
+  (σ = 0.01) and 8-bit quantisation.
+* Metric: PSNR (dB).
+
+| Method | τ = 0.2 | τ = 0.4 | τ = 0.6 | Clock field |
+|---|---|---|---|---|
+| Degraded input | 38.90 | 28.19 | 24.13 | 27.74 |
+| Direct (1 step) | 39.07 | 28.28 | 24.18 | 27.79 |
+| Cold Diffusion, Alg. 2 | 43.28 | 30.20 | 25.16 | 29.13 |
+| **SRN (N2), λ = 0.02** | **43.38** | **30.67** | **25.97** | **29.53** |
+| SRN-blind (N1), margin 0 | 35.50 | 28.09 | 25.23 | 26.78 |
+| SRN-blind (N1), margin 1 | 38.33 | 29.18 | 24.89 | 27.29 |
+
+**Findings**
+* After this little training, the clock estimator's MAE fell from 0.24 to 0.09.
+* Without observation noise, SRN reached 92 dB at τ=0.2. That number is the classic
+  *inverse crime*: a known, noiseless operator can be inverted perfectly. For this reason
+  `Inferencer` always adds sensor noise and quantisation (`eval_obs_noise`,
+  `eval_quantize`). **Keep this for the paper.**
+* Wiener λ must match the noise level. With λ = 5e-3, SRN was worse than Alg. 2 on noisy
+  inputs. With λ ≥ 0.02 it was better at every level.
+* At this training budget, blind mode is not yet better than the input. Its quality is
+  bounded by the clock estimator.
+
 ## Suggested experimental protocol (for the article)
 * **Where the model fits best.** The operator is *isotropic heat dissipation*. The natural
   targets are defocus and Gaussian-type blur, which are spatially varying:
@@ -140,7 +172,8 @@ heat-dissipation trajectories** and to spatially varying operators.
     step being equal to DDIM;
   * end-to-end runs of every degradation type;
   * automatic resume, bf16 autocast, odd image sizes, and gradient reaching every parameter.
-* **No benchmark numbers exist yet.** Paper results require full GPU training.
+* **No benchmark numbers exist yet.** Paper results require full GPU training. The table
+  above is only a sanity check that the model learns.
 * The novelty claims come from a literature search done in September 2026. Run a dedicated
   related-work search before submission; search engines miss papers.
 * The heat operator is isotropic. Motion blur would need an anisotropic or learned-kernel
