@@ -3,7 +3,8 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 74. This round is **§0e** (IDE responsiveness: native
+Last updated: round 75 (§0n real SDL3 and HiDPI, §0k garbage collection on
+both engines). Round 74 is **§0e** (IDE responsiveness: native
 text services and a responsive layout ladder; the Code::Blocks feature set;
 non-throwing control flow on both engines; the build system) and **§0f**
 (the OS layer: files, paths, processes, environment and time, with one
@@ -153,6 +154,96 @@ work fixed them); seven others failed on both engines:
 
 §5.8's "content-level failures in old version-numbered example files" is
 closed by this: those files are swept now and pass.
+
+---
+
+## 0k. Round 75 — garbage collection on both engines
+
+The request: "make sure the garbage collectors works very well in the whole
+language, vm and interpreter ... Interpreter memory: it never frees
+containers, so the biggest nytorch tests peak near 1 GB, fix it so that
+should also use the garbage collector". `GC_NOTES.md` is the full design
+note; this is the summary and the traps.
+
+### What was wrong
+
+- **Interpreter**: nothing was ever freed - lists, dicts, tuples, strings,
+  function values, bound methods, instances, and every scope a closure or
+  class had referred to. `GarbageCollector.cpp` was complete code wired to
+  nothing (GC_NOTES, history).
+- **VM**: `shared_ptr` freed acyclic data, but every reference cycle leaked
+  (an instance whose field points at itself, a closure over `self` stored on
+  `self`, autograd graphs), and dropping a 30,000-node linked list **crashed**
+  (recursive `shared_ptr` destructors overflowed the stack).
+
+### What it is now (CPython's model, both engines)
+
+- **Reference counting**, exact and immediate. Interpreter:
+  `Collectable::gc_rc`, counted by every `Value` copy through the new
+  `TValue::o` (the object a value keeps alive). VM: `use_count()`.
+- **A generational cycle collector** using trial deletion (subtract the
+  references the candidates hold on each other; what keeps a count is
+  referenced from outside - a C++ local, another thread's stack, a native
+  table - and survives with all it reaches; the rest is cleared). Three
+  generations, thresholds 700/10/10, collections only at safe points
+  (statement boundaries / instruction boundaries).
+- **Interpreter heap objects** (`include/NyHeap.hpp`): `Str`, `Func`,
+  `Bound`, `Inst`, `Weak`. The identity `value.p` points at is a member of
+  the owning object, and its destructor erases every side-table entry keyed
+  by it. Scopes are counted: born with the creator's reference, released by
+  `CtxReaper`; the "escaped scopes" set is gone.
+- **VM** (`src/VMGC.cpp`): containers registered by `weak_ptr` at creation;
+  `vmgc::DeepPtr` frees deep chains iteratively.
+- **`__del__`** runs once, at the next statement (interpreter) / instruction
+  (VM) boundary, never inside a decrement; cyclic garbage is finalized
+  before it is cleared and survives if a finalizer resurrects it (PEP 442).
+- **Builtins, both engines**: `gc_collect`, `gc_enable`, `gc_disable`,
+  `gc_is_enabled`, `gc_set_threshold`, `gc_get_threshold`, `gc_stats`,
+  `gc_live_objects`, `mem_rss_kb`, `mem_peak_rss_kb`, `weakref`.
+- `examples/vm_audit55.ny` (4059 checks, identical output on both engines).
+- `make asan` builds `build-asan/nython-cli` (ASan + UBSan + LSan).
+
+### Defects found on the way (all fixed)
+
+- `gui_poll_events` cached its shared empty event list in a `static
+  Object*` without a reference: freed after the first empty poll, returned
+  freed afterwards (the GUI tests crashed on both engines).
+- `@prop.setter` left the property's getter unreferenced while the setter's
+  `def` rebound the name; the next `def` reused the getter's address and
+  inherited its identity (`vm_audit53`: `t.celsius` read `t.fahrenheit`).
+- `keys()`/`values()`/`items()` of an instance cast its identity to a
+  `Collectable*` and `dynamic_cast` it (a bogus vtable read).
+- An expression statement's value (`L.pop()`) stayed alive one statement
+  longer; `__del__` ran late.
+- Raised instances were kept forever, keyed by address; they are a serial
+  number plus a ring of the last 256 now.
+
+### Traps
+
+- **A pointer kept outside a `Value` is a reference or a bug.** A freed
+  address is reused immediately (often by the next object of the same
+  size), so a stale side-table entry or a cached raw pointer silently
+  describes a different object. ASan does *not* catch this (its quarantine
+  delays reuse); the normal build's tests did. Hold a reference
+  (`nygc::incref`) or erase the entry in the object's destructor.
+- A tracked object with a count of zero is under construction by native
+  code and is a collector root: `new Object` + fill + wrap is safe even if
+  filling calls back into Nython.
+- Never touch a `Value` without the GIL (`nyconc::holds_gil()`); an
+  `InterpBox` released without it defers its reference
+  (`nygc::release_later`).
+- Contexts are born with one reference: a new `new Context(...)` site needs
+  a `CtxReaper` (or hands its reference to an owner), or it leaks.
+- VM containers must be registered where they are created
+  (`vmgc::track_*`); a missed one only leaks its cycles.
+
+### Numbers
+
+HANDOFF_NUMBERS_PLACEHOLDER
+
+### Not done
+
+HANDOFF_NOTDONE_PLACEHOLDER
 
 ---
 
@@ -550,8 +641,9 @@ engines.
   - A training step of a [16,64,4] MLP at batch 32: interpreter 788 →
     6.4 ms, VM 787 → 2.5 ms (Module API).
 - **Not done.**
-  - Interpreter memory is still high: the worst nytorch tests peak near
-    1 GB, because the interpreter never frees containers (GC_NOTES).
+  - ~~Interpreter memory is still high: the worst nytorch tests peak near
+    1 GB, because the interpreter never frees containers (GC_NOTES).~~
+    Fixed in round 75 (§0k): 81-181 MB.
   - The library works around several language bugs (these are in the
     language work), which the torch agent listed:
     - a bare call inside a method resolves to a same-named method
@@ -1498,7 +1590,11 @@ that was partly already filled.
 
 ## 5. Outstanding work, in priority order
 
-### 5.1 Container leak — the last unambiguous defect
+### 5.1 Container leak — CLOSED (round 75, §0k)
+Reference counting and a cycle collector on both engines; `GC_NOTES.md` is
+now the design note. What follows is the round-51 diagnosis, kept for
+history.
+
 Full diagnosis in **`GC_NOTES.md`**. Summary: identical program, 200k container
 literals — interpreter 494 MB, VM 7 MB. The VM uses `shared_ptr` and is fine.
 The interpreter's collector is *correct code wired to nothing*: 24 raw

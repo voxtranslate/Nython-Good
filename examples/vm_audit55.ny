@@ -324,6 +324,38 @@ var long_chain = chain(30000)
 long_chain = none
 check("a 30000-long chain was freed", 1, 1)
 
+# ── threads: collections while other threads hold values ────────────────────
+# Each thread builds cyclic garbage and a structure it keeps, collecting as it
+# goes; the GIL hands over at statement boundaries, so collections run while
+# the other threads' locals are live on their own stacks.
+def gc_worker(k):
+    var keep = []
+    for i in range(1500):
+        var g = GNode(k * 100000 + i)
+        g.next = g
+        if i % 3 == 0:
+            keep.append(g)
+        if i % 500 == 0:
+            gc_collect()
+    var s = 0
+    for g in keep:
+        s = s + g.v - k * 100000
+        if not (g.next is g):
+            s = -1000000000
+    return s
+
+var ths = []
+for k in range(4):
+    ths.append(thread_create(gc_worker, k))
+var sums = []
+for h in ths:
+    sums.append(thread_join(h, 60000))
+var want_sum = 0
+for i in range(0, 1500, 3):
+    want_sum = want_sum + i
+check("threads collecting concurrently keep their values", sums, [want_sum, want_sum, want_sum, want_sum])
+gc_collect()
+
 # ── weak references ─────────────────────────────────────────────────────────
 def error_of(f):
     try:

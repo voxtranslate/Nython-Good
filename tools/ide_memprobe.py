@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """ide_memprobe.py - how much memory the IDE keeps per frame and per action.
 
-The interpreter never reclaims containers (GC_NOTES.md), so anything the IDE
-allocates while repainting, polling or handling a key is memory it keeps for
-the rest of the session. This drives the real IDE headlessly and reports the
-resident-set growth for:
+Since round 75 the interpreter reclaims garbage (GC_NOTES.md), so what this
+measures is memory the IDE really keeps - a cache that grows, a history, a
+leak through a native table - rather than the garbage it makes. It drives
+the real IDE headlessly and reports the resident-set growth for:
 
     idle     frames with nothing happening (repaint + watcher + timers)
     hover    the pointer moving over the workbench (hover, tooltips)
