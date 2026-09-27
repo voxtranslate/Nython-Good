@@ -3029,12 +3029,14 @@ private:
             }
             case Op::LOAD_SUBSCR: {
                 VMVal idx=pop(),obj=pop();
-                if(obj.type==VMType::INSTANCE){bool f=false;VMVal res=call_dunder_f(obj,"__getitem__",{idx},f);if(f){push(res);break;}}
+                if(obj.type==VMType::INSTANCE){bool f=false;VMVal res=call_dunder_f(obj,"__getitem__",{idx},f);if(f){push(res);break;}
+                    throw_exception(make_exception("TypeError",{VMVal::make_str("'"+obj.class_name+"' object is not subscriptable")}));}
                 push(get_sub(obj,idx)); break;
             }
             case Op::STORE_SUBSCR:{
                 VMVal idx=pop(),obj=pop(),val=pop();
-                if(obj.type==VMType::INSTANCE){bool f=false;call_dunder_f(obj,"__setitem__",{idx,val},f);if(f) break;}
+                if(obj.type==VMType::INSTANCE){bool f=false;call_dunder_f(obj,"__setitem__",{idx,val},f);if(f) break;
+                    throw_exception(make_exception("TypeError",{VMVal::make_str("'"+obj.class_name+"' object does not support item assignment")}));}
                 set_sub(obj,idx,std::move(val)); break;
             }
             case Op::DELETE_SUBSCR: {
@@ -4121,7 +4123,12 @@ private:
     }
 
     // ── Attribute access ────────────────────────────────────────────────
-    VMVal get_attr(const VMVal& obj, const std::string& attr) {
+    // A missing attribute of an instance or class: `probe` (hasattr /
+    // getattr) raises AttributeError for try_get_attr to catch; a plain read
+    // gives none, as on the interpreter (see kStrictAttributeReads there).
+    // Calling a missing method raises (vm_call_method).
+    static constexpr bool kStrictAttributeReads = false;
+    VMVal get_attr(const VMVal& obj, const std::string& attr, bool probe=false) {
         // Instance / map fields — check for property descriptors
         if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map){
             auto it=obj.map->find(attr);
@@ -4153,6 +4160,9 @@ private:
                 std::vector<VMVal> a{VMVal::make_str(attr)};
                 return invoke_method(ga, obj, a, obj.class_name);
             }
+            if(probe || kStrictAttributeReads)
+                throw_exception(make_exception("AttributeError",{VMVal::make_str(
+                    "'"+obj.class_name+"' object has no attribute '"+attr+"'")}));
             return VMVal::make_none();
         }
         if(obj.type==VMType::STRING){
@@ -4181,8 +4191,20 @@ private:
                 if(rit!=class_reg_.end()&&rit->second) for(auto& b:rit->second->bases){ VMVal cv=class_value(b); if(cv.type!=VMType::NONE) r.push_back(cv); }
                 return VMVal::make_list(std::move(r));
             }
+            if(class_reg_.count(cname) && (probe || kStrictAttributeReads))
+                throw_exception(make_exception("AttributeError",{VMVal::make_str(
+                    "type object '"+cname+"' has no attribute '"+attr+"'")}));
         }
         return VMVal::make_none();
+    }
+    // obj.attr, or false when it has none (hasattr / getattr with a default).
+    bool try_get_attr(const VMVal& obj, const std::string& attr, VMVal& out) {
+        try { out=get_attr(obj, attr, true); }
+        catch(VMException& e){
+            if(class_derives(e.value.class_name,"AttributeError")) return false;
+            throw;
+        }
+        return true;
     }
     void set_attr(VMVal& obj, const std::string& attr, VMVal val) {
         if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map){
@@ -4388,7 +4410,7 @@ private:
             VMVal m;
             if(class_lookup(callee.class_name, "__call__", m)) return invoke_method(m, callee, args, callee.class_name, kwargs);
             (void)found;
-            return VMVal::make_none();
+            throw_exception(make_exception("TypeError",{VMVal::make_str("'"+callee.class_name+"' object is not callable")}));
         }
         // A method bound to its instance (obj.m read as a value), or a
         // classmethod bound to its class.
@@ -4559,6 +4581,10 @@ private:
                 if(obj.map) for(auto& kv:*obj.map) r.push_back(VMVal::make_str(kv.first));
                 return VMVal::make_list(std::move(r));
             }
+            // No such method: AttributeError (the call returned none, which
+            // hid misspelt method names).
+            throw_exception(make_exception("AttributeError",{VMVal::make_str(
+                "'"+obj.class_name+"' object has no attribute '"+method+"'")}));
         }
         // Class.method(...): a static method or a Nython method without self
         // takes the arguments as they are, a classmethod gets the class, and
@@ -4587,6 +4613,9 @@ private:
                 (*args[0].map)["msg"]=VMVal::make_str(rest.size()==1?rest[0].to_string():std::string());
                 return VMVal::make_none();
             }
+            if(!is_ctor_name(method) && class_reg_.count(obj.class_name))
+                throw_exception(make_exception("AttributeError",{VMVal::make_str(
+                    "type object '"+obj.class_name+"' has no attribute '"+method+"'")}));
         }
         if(obj.type==VMType::STRING) return call_str_method(obj,method,args);
         if(obj.type==VMType::LIST)   return call_list_method(obj,method,args);
@@ -5153,11 +5182,15 @@ private:
             for(auto& x:v) r.push_back(VMVal::make_float(to_d(x)/rms));
             return VMVal::make_list(std::move(r));});
         // ── hasattr, ord, chr ────────────────────────────────────────────────
-        globals_["hasattr"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
+        // hasattr: the full attribute lookup (methods and class attributes
+        // too; only an instance's own fields were seen).
+        globals_["hasattr"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()<2) return VMVal::make_bool(false);
             std::string attr=a[1].to_string();
-            if((a[0].type==VMType::INSTANCE||a[0].type==VMType::MAP)&&a[0].map)
-                return VMVal::make_bool(a[0].map->count(attr)>0);
+            if(a[0].type==VMType::MAP) return VMVal::make_bool(a[0].map&&a[0].map->count(attr)>0);
+            if(a[0].type==VMType::INSTANCE||a[0].type==VMType::CLASS){
+                VMVal v; return VMVal::make_bool(try_get_attr(a[0],attr,v));
+            }
             return VMVal::make_bool(false);});
         globals_["repr"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.empty()) return VMVal::make_str("none");
@@ -5177,6 +5210,11 @@ private:
         });
         globals_["getattr"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()<2) return a.size()>=3?a[2]:VMVal::make_none();
+            if(a[0].type==VMType::INSTANCE||a[0].type==VMType::CLASS){
+                VMVal v;
+                if(a.size()>=3) return try_get_attr(a[0],a[1].to_string(),v) ? v : a[2];
+                return get_attr(a[0],a[1].to_string(),true);
+            }
             VMVal result=get_attr(a[0],a[1].to_string());
             if(result.type==VMType::NONE&&a.size()>=3) return a[2];
             return result;
@@ -5188,6 +5226,11 @@ private:
         });
         globals_["getattr"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()<2) return a.size()>=3?a[2]:VMVal::make_none();
+            if(a[0].type==VMType::INSTANCE||a[0].type==VMType::CLASS){
+                VMVal v;
+                if(a.size()>=3) return try_get_attr(a[0],a[1].to_string(),v) ? v : a[2];
+                return get_attr(a[0],a[1].to_string(),true);
+            }
             VMVal result=get_attr(a[0],a[1].to_string());
             if(result.type==VMType::NONE&&a.size()>=3) return a[2]; // default
             return result;

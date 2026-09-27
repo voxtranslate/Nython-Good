@@ -1000,6 +1000,8 @@ public:   // NythonExecutor is a struct: members default to public
             Value idx = evalNode(sub->index, ctx);
             // Check for __setitem__ on instances
             if (obj.type == ValueType::USERDATA && obj.value.p && !string_ptrs_.count(obj.value.p) && instance_to_class.count(obj.value.p)) {
+                if (!instanceHasMethod(obj, "__setitem__"))
+                    throw std::string("__exc__:TypeError:'" + instanceClassName(obj) + "' object does not support item assignment");
                 std::vector<Value> call_args = {idx, val};
                 Value result = callMethod(obj, "__setitem__", call_args, ctx);
                 if (result.type != ValueType::NONE) return val;
@@ -3928,9 +3930,20 @@ return lv * rv;
             if (r.type != ValueType::UNDEFINED) return r;
         }
 
-        // Fallback: try calling as a regular attribute
-        Value method_val = evalAttribute(std::make_shared<AttributeNode>(
-            Token(), std::make_shared<VariableNode>(Token()), method_name), ctx);
+        // Nothing of that name: __getattr__ may supply it; otherwise an
+        // instance or a class raises AttributeError (the call returned none,
+        // which hid misspelt method names).
+        if (isInstanceValue(obj) && method_name != "__getattr__" && instanceHasMethod(obj, "__getattr__")) {
+            std::vector<Value> a{makeStringValue(method_name)};
+            Value target = callMethod(obj, "__getattr__", a, ctx);
+            if (isInstanceValue(target) && instanceHasMethod(target, "__call__"))
+                return callMethod(target, "__call__", args, ctx, kw_in);
+            return callFunctionValue(target, args, ctx);
+        }
+        {
+            std::string err;
+            if (attributeErrorFor(obj, method_name, err)) throw err;
+        }
         return NONE_VALUE;
     }
 
@@ -4722,7 +4735,9 @@ public:
                 // calls instead of n (v.add(1).add(1).add(1) incremented by 7).
                 // Reuse it via receiver_cache_ instead of evaluating again.
                 receiver_cache_[attr->object.get()] = obj;
-                Value callee_val = evalNode(cn->callee, ctx);
+                Value callee_val;
+                try { callee_val = evalAttribute(cn->callee, ctx, true); }
+                catch (...) { receiver_cache_.erase(attr->object.get()); throw; }
                 receiver_cache_.erase(attr->object.get());
                 // Only use the fallback for builtin functions stored in dict namespaces
                 // (e.g. math.sqrt). For class methods (__func__), let callMethod handle
@@ -4898,7 +4913,9 @@ public:
         // __call__ protocol: if callee is an instance with __call__ method, invoke it
         if (callee.type == ValueType::USERDATA && callee.value.p && !string_ptrs_.count(callee.value.p) &&
             fname.find("__instance__:") == 0 && instance_to_class.count(callee.value.p)) {
-            Value call_result = callMethod(callee, "__call__", args, ctx);
+            if (!instanceHasMethod(callee, "__call__"))
+                throw std::string("__exc__:TypeError:'" + instanceClassName(callee) + "' object is not callable");
+            Value call_result = callMethod(callee, "__call__", args, ctx, &kw_args);
             if (call_result.type != ValueType::NONE) return call_result;
             // __call__ returned none — still return it (it IS the result)
             // Check if __call__ method exists at all before returning NONE
@@ -5225,7 +5242,10 @@ public:
     // Per OS thread (round 74): two threads can run the same call node.
     static inline thread_local std::unordered_map<const void*, Value> receiver_cache_;
 
-    Value evalAttribute(node_ptr node, Context* ctx) {
+    // soft: a missing attribute of an instance or class reads UNDEFINED
+    // instead of raising AttributeError (for hasattr/getattr, and for the
+    // method-call path, where callMethod decides).
+    Value evalAttribute(node_ptr node, Context* ctx, bool soft = false) {
         auto an = static_pointer_cast<AttributeNode>(node);
         Value obj;
         {
@@ -5318,7 +5338,8 @@ public:
                         auto own = ctx_it->second->container->find(an->attr);
                         if (own != ctx_it->second->container->end()) cv = own->second;
                     }
-                    if (cv.type != ValueType::UNDEFINED && cv.type != ValueType::NONE) {
+                    if (cv.type == ValueType::NONE) return cv;   // `x = None` in the class body
+                    if (cv.type != ValueType::UNDEFINED) {
                         // Check if this is a @property getter — invoke it with self
                         if (cv.type == ValueType::USERDATA && cv.value.p) {
                             auto fn_it = func_names.find(cv.value.p);
@@ -5363,7 +5384,36 @@ public:
               }
             }
         }
-        return specialAttribute(obj, an->attr, ctx);
+        return specialAttribute(obj, an->attr, ctx, soft);
+    }
+    // obj.name for a value in hand: UNDEFINED when it has no such attribute.
+    Value lookupAttribute(const Value& obj, const std::string& name, Context* ctx) {
+        auto objn = std::make_shared<VariableNode>(Token());
+        auto an = std::make_shared<AttributeNode>(Token(), objn, name);
+        receiver_cache_[objn.get()] = obj;
+        try {
+            Value v = evalAttribute(an, ctx, true);
+            receiver_cache_.erase(objn.get());
+            return v;
+        } catch (...) { receiver_cache_.erase(objn.get()); throw; }
+    }
+    // The AttributeError for obj.name, when obj is an instance or a class.
+    bool attributeErrorFor(const Value& obj, const std::string& name, std::string& err) {
+        if (isInstanceValue(obj)) {
+            err = "__exc__:AttributeError:'" + instanceClassName(obj) + "' object has no attribute '" + name + "'";
+            return true;
+        }
+        if (obj.type == ValueType::USERDATA && obj.value.p) {
+            std::string t = fnTag(func_names, obj.value.p);
+            if (t.rfind("__class__:", 0) == 0) {
+                std::string cn = t.substr(10);
+                size_t tag = cn.find("__");
+                if (tag != std::string::npos && tag > 0) cn = cn.substr(0, tag);
+                err = "__exc__:AttributeError:type object '" + cn + "' has no attribute '" + name + "'";
+                return true;
+            }
+        }
+        return false;
     }
     // Attributes every value answers: __name__ of a function or class (and of
     // the name string type() returns), an instance's __class__, and what an
@@ -5373,7 +5423,7 @@ public:
     std::unordered_map<void*, Value> prop_setters_;
     bool any_property_ = false;   // no property anywhere: attribute stores skip the class lookup
     std::vector<std::unique_ptr<std::string>> prop_setter_ids_;
-    Value specialAttribute(const Value& obj, const std::string& attr, Context* ctx) {
+    Value specialAttribute(const Value& obj, const std::string& attr, Context* ctx, bool soft = false) {
         if (obj.type == ValueType::USERDATA && obj.value.p) {
             auto fit = func_names.find(obj.value.p);
             // prop.setter: a callable that records its argument as the
@@ -5409,8 +5459,21 @@ public:
                 }
             }
         }
+        // A missing attribute of an instance or a class: hasattr / getattr
+        // see it as missing. A plain read still gives none - library code
+        // (lib/gui.ny above all) probes optional attributes that way
+        // (`if w.rect != none`, `widget.is_layout == true`); raising
+        // AttributeError there is one switch away once those idioms are
+        // ported to hasattr/getattr. Calling a missing method does raise
+        // (callMethod).
+        std::string err;
+        if (attributeErrorFor(obj, attr, err)) {
+            if (soft) return UNDEFINED_VALUE;
+            if (kStrictAttributeReads) throw err;
+        }
         return NONE_VALUE;
     }
+    static constexpr bool kStrictAttributeReads = false;
 
     Value evalSubscript(node_ptr node, Context* ctx) {
         auto sn = static_pointer_cast<SubscriptNode>(node);
@@ -5457,9 +5520,10 @@ public:
         }
         // Check for __getitem__ on instances
         if (obj.type == ValueType::USERDATA && obj.value.p && !string_ptrs_.count(obj.value.p) && instance_to_class.count(obj.value.p)) {
+            if (!instanceHasMethod(obj, "__getitem__"))
+                throw std::string("__exc__:TypeError:'" + instanceClassName(obj) + "' object is not subscriptable");
             std::vector<Value> call_args = {idx};
-            Value result = callMethod(obj, "__getitem__", call_args, ctx);
-            if (result.type != ValueType::NONE) return result;
+            return callMethod(obj, "__getitem__", call_args, ctx);
         }
         return NONE_VALUE;
     }
@@ -6079,7 +6143,8 @@ public:
             // not a description of the object. Use the same "<Class instance>"
             // form print uses, and honour a user __str__ if the class has one.
             std::vector<Value> noargs;
-            Value custom = callMethod(obj, "__str__", noargs, ctx);
+            Value custom = isInstanceValue(obj) && instanceHasMethod(obj, "__str__")
+                         ? callMethod(obj, "__str__", noargs, ctx) : NONE_VALUE;
             if (custom.type == ValueType::USERDATA && !getStringValue(custom).empty()
                 && getStringValue(custom).rfind("<function", 0) != 0)
                 return custom;
@@ -6127,7 +6192,7 @@ public:
             lst->set("__len__", Value((int)n));
             return Value((Collectable*)lst);
         }
-        return Value();   // UNDEFINED — not part of the protocol
+        return UNDEFINED_VALUE;   // not part of the protocol (Value() is none)
     }
 
     Value evalImport(node_ptr node, Context* ctx) {
@@ -7307,6 +7372,25 @@ public:
         // values with a read position (__gen__/__idx__), which next() already
         // understands; iter() of a list, string or dict makes one of those,
         // and objects go through __iter__/__next__. Both returned none.
+        // hasattr / getattr on instances and classes: the full attribute
+        // lookup (methods, class attributes, properties, __getattr__); only
+        // an instance's own fields were seen.
+        if ((name == "hasattr" || name == "getattr") && args.size() >= 2 && isStringValue(args[1])) {
+            std::string err;
+            if (attributeErrorFor(args[0], getStringValue(args[1]), err)) {
+                Value v;
+                try { v = lookupAttribute(args[0], getStringValue(args[1]), ctx); }
+                catch (std::string& e) {
+                    if (!excTypeMatches(e, "AttributeError")) throw;
+                    v = UNDEFINED_VALUE;
+                }
+                bool has = v.type != ValueType::UNDEFINED;
+                if (name == "hasattr") { out = Value(has); return true; }
+                if (has) { out = v; return true; }
+                if (args.size() >= 3) { out = args[2]; return true; }
+                throw err;
+            }
+        }
         if (name == "callable" && args.size() == 1) {
             const Value& v = args[0];
             bool r = isFunctionValue(v);
