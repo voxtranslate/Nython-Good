@@ -1603,6 +1603,12 @@ public:   // NythonExecutor is a struct: members default to public
     // == true. A list never equals a tuple.
     bool valuesEqual(const Value& a, const Value& b, int depth) {
         if (depth > 100) return false;
+        // Objects inside containers compare through __eq__, as in Python.
+        if (depth > 0 && (isInstanceVal(a) || isInstanceVal(b))) {
+            Value r;
+            if (binaryDunder("==", a, b, global_ctx, r)) return isTruthy(r);
+            return identical(a, b);
+        }
         Num x, y;
         if (asNum(a, x) && asNum(b, y)) return numCmp(x, y) == 0;
         bool as = isStringValue(a), bs = isStringValue(b);
@@ -5415,6 +5421,19 @@ public:
                 func_names[id] = "__builtin__:" + os.str();
                 Value v; v.type = ValueType::USERDATA; v.value.p = id;
                 return v;
+            }
+            // C.__mro__ / C.__bases__: the classes, in C3 order / as written.
+            if ((attr == "__mro__" || attr == "__bases__") && fit != func_names.end()
+                && fit->second.rfind("__class__:", 0) == 0) {
+                Node* cn = classNodeByName(fit->second.substr(10));
+                std::vector<Value> out;
+                if (cn) {
+                    std::vector<Node*> seq;
+                    if (attr == "__mro__") seq = classMro(cn);
+                    else for (auto& b : static_cast<ClassNode*>(cn)->bases) if (Node* bn = classNodeByName(b->value())) seq.push_back(bn);
+                    for (Node* c : seq) { Value cv; cv.type = ValueType::USERDATA; cv.value.p = (void*)c; out.push_back(cv); }
+                }
+                return makeListValue(out, attr == "__mro__");
             }
             if (attr == "__name__") {
                 if (fit != func_names.end()) {
