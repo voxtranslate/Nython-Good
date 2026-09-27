@@ -148,6 +148,7 @@
         <Unit filename="src/builtins/os.cpp" />
         <Unit filename="src/builtins/string.cpp" />
         <Unit filename="src/builtins/tensor.cpp" />
+        <Unit filename="src/builtins/nytensor.cpp" />
         <Unit filename="src/builtins/threading.cpp" />
         <!-- ═══════════ Key headers (for IDE navigation) ═══════════ -->
         <Unit filename="include/platform_compat.hpp" />
@@ -161,6 +162,7 @@
         <Unit filename="include/NythonREPL.hpp" />
         <Unit filename="include/builtins/core.hpp" />
         <Unit filename="include/builtins/tensor.hpp" />
+        <Unit filename="include/NyTensor.hpp" />
         <Unit filename="include/builtins/audio.hpp" />
         <Unit filename="include/builtins/string.hpp" />
         <Unit filename="include/builtins/io.hpp" />

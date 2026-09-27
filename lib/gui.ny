@@ -15256,7 +15256,7 @@ class SearchPanel:
         self.rect.h = h
 
 # ─── GitPanel ─────────────────────────────────────────────────────────────────
-class GitChange:
+class GitPanelChange:
     def __init__(self, path, status):
         self.path = path
         self.status = status
@@ -15284,7 +15284,7 @@ class GitPanel:
         self._on_stage = none
 
     def add_change(self, path, status):
-        self.changes.append(GitChange(path, status))
+        self.changes.append(GitPanelChange(path, status))
         self.change_count = self.change_count + 1
         return self
 

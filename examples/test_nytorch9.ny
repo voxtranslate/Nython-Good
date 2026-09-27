@@ -1,5 +1,4 @@
-import nytorch
-import "lib/nytorch_all.ny"
+import "lib/nytorch.ny"
 
 print "=== NyTorch v3.0 Agent I/O Test Suite ==="
 

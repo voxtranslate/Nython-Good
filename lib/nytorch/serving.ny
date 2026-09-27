@@ -2,7 +2,7 @@
 # NyTorch v3.0 -- Part 10: Servers, Federated AI, NyApp
 # ============================================================
 # Classes 139-163:
-#   SocketServer, HttpRouter, HttpServer, AgentServer,
+#   SocketServer, HttpRouter, AgentHttpServer, AgentServer,
 #   AgentHttpClient, KnowledgeGraph, FederatedRound,
 #   FederatedLearner, ConsensusVoter, GradientSharer,
 #   NyPipeline, AutoTrainer, HyperSearch,
@@ -10,6 +10,8 @@
 #   AgentCluster, NyMonitor, NyConfig,
 #   NyApp, NyWorld, NyOS
 # ============================================================
+
+import "lib/nytorch/core.ny"
 
 import nytorch
 
@@ -90,9 +92,9 @@ class HttpRouter:
         return self
 
 # -----------------------------------------
-# 141. HttpServer  (single-threaded HTTP)
+# 141. AgentHttpServer  (single-threaded HTTP)
 # -----------------------------------------
-class HttpServer:
+class AgentHttpServer:
     def __init__(self, port):
         self.port = port
         self.server = SocketServer(port)
@@ -155,7 +157,7 @@ class AgentServer:
     def __init__(self, agent_id, port, storage_dir):
         self.agent_id = agent_id
         self.port = port
-        self.http = HttpServer(port)
+        self.http = AgentHttpServer(port)
         self.kb = KnowledgeBase(storage_dir + "/" + agent_id + "_srv.kv")
         self.logger = DataLogger(storage_dir + "/logs", agent_id + "_server")
         self.model_store = ModelStore(storage_dir + "/models")
@@ -535,24 +537,32 @@ class ConsensusVoter:
                             collected = collected + 1
         return self.votes
 
+    # the most common value among the collected votes (ties: smallest value)
     def tally(self):
-        var counts = {}
-        var keys = []
-        var i = 0
-        while i < len(keys):
-            var i = i + 1
-        var winner = none
-        var best = 0
-        var vk = kv_keys("/tmp/nyv_tally_" + self.agent_id + ".kv")
-        return winner
+        return self.majority(self.votes)
 
     def majority(self, votes_map):
         var counts = {}
+        var vals = []
+        var keys = sorted(votes_map.keys())
+        var i = 0
+        while i < len(keys):
+            var v = str(votes_map[keys[i]])
+            if v in counts:
+                counts[v] = counts[v] + 1
+            else:
+                counts[v] = 1
+                vals.append(v)
+            i = i + 1
+        vals = sorted(vals)
         var best_val = none
         var best_count = 0
-        var i = 0
-        var total = 0
-        var vals = []
+        i = 0
+        while i < len(vals):
+            if counts[vals[i]] > best_count:
+                best_count = counts[vals[i]]
+                best_val = vals[i]
+            i = i + 1
         return best_val
 
 # -----------------------------------------

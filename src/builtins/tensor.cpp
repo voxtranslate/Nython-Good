@@ -37,6 +37,7 @@
 // Full executor definition (needed for E.getStringValue etc.)
 #include "NythonExecutor.hpp"
 #include "builtins/tensor.hpp"
+#include "NyTensor.hpp"
 
 // ── Namespace imports (match main.cpp) ────────────────────────────────────────
 using namespace std;
@@ -64,6 +65,20 @@ static int64_t ny_mat_dim(Container* c, const char* key, int64_t fallback = -1) 
     if (it == c->container->end()) return fallback;
     if (it->second.type != ValueType::INTEGER) return fallback;
     return bigint_to_i64(it->second.value.i);
+}
+
+
+// Numeric value of an element whatever its type. Reading `.value.d` directly
+// (the long-double member of the value union) is only correct for DOUBLE
+// elements: an INTEGER element read that way came back as 0, so e.g.
+// tensor_scale([1, 2, 3], 2) returned [0, 0, 0].
+static inline double ny_num(const Value& v) {
+    switch (v.type) {
+        case ValueType::INTEGER: return (double)bigint_to_i64(v.value.i);
+        case ValueType::DOUBLE:  return (double)v.value.d;
+        case ValueType::BOOLEAN: return v.value.b ? 1.0 : 0.0;
+        default:                 return 0.0;
+    }
 }
 
 Value dispatch_tensor(NythonExecutor& E,
@@ -144,7 +159,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     f.write((char*)&magic, 4); f.write((char*)&sz, 4);
                     for (int i = 0; i < n; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        float v = (it != t->container->end()) ? (float)it->second.value.d : 0.0f;
+                        float v = (it != t->container->end()) ? (float)ny_num(it->second) : 0.0f;
                         f.write((char*)&v, 4);
                     }
                     return Value(true);
@@ -196,7 +211,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     f.write((char*)&tsz, 4);
                     for (int i = 0; i < tn; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        float v = (it != t->container->end()) ? (float)it->second.value.d : 0.0f;
+                        float v = (it != t->container->end()) ? (float)ny_num(it->second) : 0.0f;
                         f.write((char*)&v, 4);
                     }
                 }
@@ -241,15 +256,15 @@ Value dispatch_tensor(NythonExecutor& E,
                 double ma=0,mb=0;
                 for (int i=0;i<n;i++) {
                     auto ia=ta->container->find(std::to_string(i)), ib=tb->container->find(std::to_string(i));
-                    ma+=(ia!=ta->container->end())?ia->second.value.d:0.0;
-                    mb+=(ib!=tb->container->end())?ib->second.value.d:0.0;
+                    ma+=(ia!=ta->container->end())?ny_num(ia->second):0.0;
+                    mb+=(ib!=tb->container->end())?ny_num(ib->second):0.0;
                 }
                 ma/=n; mb/=n;
                 double cov=0,sa=0,sb=0;
                 for (int i=0;i<n;i++) {
                     auto ia=ta->container->find(std::to_string(i)), ib=tb->container->find(std::to_string(i));
-                    double da=((ia!=ta->container->end())?ia->second.value.d:0.0)-ma;
-                    double db=((ib!=tb->container->end())?ib->second.value.d:0.0)-mb;
+                    double da=((ia!=ta->container->end())?ny_num(ia->second):0.0)-ma;
+                    double db=((ib!=tb->container->end())?ny_num(ib->second):0.0)-mb;
                     cov+=da*db; sa+=da*da; sb+=db*db;
                 }
                 double denom=std::sqrt(sa*sb); if(denom<1e-12) denom=1e-12;
@@ -265,10 +280,10 @@ Value dispatch_tensor(NythonExecutor& E,
                 if (!t||!t->container||nbins<1) return NONE_VALUE;
                 auto li=t->container->find("__len__"); int n=(li!=t->container->end())?(int)bigint_to_i64(li->second.value.i):0;
                 double mn=1e308,mx=-1e308;
-                for (int i=0;i<n;i++) { auto it=t->container->find(std::to_string(i)); double v=(it!=t->container->end())?it->second.value.d:0.0; if(v<mn)mn=v; if(v>mx)mx=v; }
+                for (int i=0;i<n;i++) { auto it=t->container->find(std::to_string(i)); double v=(it!=t->container->end())?ny_num(it->second):0.0; if(v<mn)mn=v; if(v>mx)mx=v; }
                 double rng=mx-mn; if(rng<1e-12) rng=1.0;
                 std::vector<int> counts((size_t)nbins,0);
-                for (int i=0;i<n;i++) { auto it=t->container->find(std::to_string(i)); double v=(it!=t->container->end())?it->second.value.d:0.0; int b=(int)((v-mn)/rng*nbins); if(b>=nbins)b=nbins-1; counts[(size_t)b]++; }
+                for (int i=0;i<n;i++) { auto it=t->container->find(std::to_string(i)); double v=(it!=t->container->end())?ny_num(it->second):0.0; int b=(int)((v-mn)/rng*nbins); if(b>=nbins)b=nbins-1; counts[(size_t)b]++; }
                 auto* bins_t=new Container((Runnable*)runner,Type::LIST); (*bins_t->container)["__len__"]=Value(nbins);
                 auto* cnts_t=new Container((Runnable*)runner,Type::LIST); (*cnts_t->container)["__len__"]=Value(nbins);
                 for (int i=0;i<nbins;i++) { (*bins_t->container)[std::to_string(i)]=Value(mn+rng*i/nbins); (*cnts_t->container)[std::to_string(i)]=Value(counts[(size_t)i]); }
@@ -286,7 +301,7 @@ Value dispatch_tensor(NythonExecutor& E,
                 if (!t||!t->container) return Value(0.0);
                 auto li=t->container->find("__len__"); int n=(li!=t->container->end())?(int)bigint_to_i64(li->second.value.i):0;
                 std::vector<double> v; v.reserve((size_t)n);
-                for (int i=0;i<n;i++) { auto it=t->container->find(std::to_string(i)); v.push_back(it!=t->container->end()?it->second.value.d:0.0); }
+                for (int i=0;i<n;i++) { auto it=t->container->find(std::to_string(i)); v.push_back(it!=t->container->end()?ny_num(it->second):0.0); }
                 std::sort(v.begin(),v.end());
                 double idx=(p/100.0)*(n-1); int lo=(int)idx; int hi=std::min(lo+1,n-1);
                 return Value(v[(size_t)lo]+(idx-lo)*(v[(size_t)hi]-v[(size_t)lo]));
@@ -300,12 +315,12 @@ Value dispatch_tensor(NythonExecutor& E,
                 if (!t||!t->container) return NONE_VALUE;
                 auto li=t->container->find("__len__"); int n=(li!=t->container->end())?(int)bigint_to_i64(li->second.value.i):0;
                 double mean=0,var2=0;
-                for (int i=0;i<n;i++) { auto it=t->container->find(std::to_string(i)); mean+=(it!=t->container->end())?it->second.value.d:0.0; }
+                for (int i=0;i<n;i++) { auto it=t->container->find(std::to_string(i)); mean+=(it!=t->container->end())?ny_num(it->second):0.0; }
                 mean/=std::max(1,n);
-                for (int i=0;i<n;i++) { auto it=t->container->find(std::to_string(i)); double d=((it!=t->container->end())?it->second.value.d:0.0)-mean; var2+=d*d; }
+                for (int i=0;i<n;i++) { auto it=t->container->find(std::to_string(i)); double d=((it!=t->container->end())?ny_num(it->second):0.0)-mean; var2+=d*d; }
                 double std_val=std::sqrt(var2/std::max(1,n)); if(std_val<1e-12) std_val=1.0;
                 auto* out=new Container((Runnable*)runner,Type::LIST); (*out->container)["__len__"]=Value(n);
-                for (int i=0;i<n;i++) { auto it=t->container->find(std::to_string(i)); double v=(it!=t->container->end())?it->second.value.d:0.0; (*out->container)[std::to_string(i)]=Value((v-mean)/std_val); }
+                for (int i=0;i<n;i++) { auto it=t->container->find(std::to_string(i)); double v=(it!=t->container->end())?ny_num(it->second):0.0; (*out->container)[std::to_string(i)]=Value((v-mean)/std_val); }
                 return Value((Collectable*)out);
             }
             return NONE_VALUE;
@@ -1156,7 +1171,7 @@ Value dispatch_tensor(NythonExecutor& E,
                         if (it != cont->container->end()) {
                             double val = 0;
                             if (it->second.type == ValueType::INTEGER) val = static_cast<double>(bigint_to_i64(it->second.value.i));
-                            else if (it->second.type == ValueType::DOUBLE) val = static_cast<double>(it->second.value.d);
+                            else if (it->second.type == ValueType::DOUBLE) val = ny_num(it->second);
                             tensor->set(std::to_string(i), Value(val));
                         }
                     }
@@ -1182,8 +1197,8 @@ Value dispatch_tensor(NythonExecutor& E,
                             auto ai = a->container->find(std::to_string(i));
                             auto bi = b->container->find(std::to_string(i));
                             if (ai != a->container->end() && bi != b->container->end()) {
-                                double va = ai->second.type == ValueType::DOUBLE ? static_cast<double>(ai->second.value.d) : static_cast<double>(bigint_to_i64(ai->second.value.i));
-                                double vb = bi->second.type == ValueType::DOUBLE ? static_cast<double>(bi->second.value.d) : static_cast<double>(bigint_to_i64(bi->second.value.i));
+                                double va = ai->second.type == ValueType::DOUBLE ? ny_num(ai->second) : static_cast<double>(bigint_to_i64(ai->second.value.i));
+                                double vb = bi->second.type == ValueType::DOUBLE ? ny_num(bi->second) : static_cast<double>(bigint_to_i64(bi->second.value.i));
                                 sum += va * vb;
                             }
                         }
@@ -1193,8 +1208,8 @@ Value dispatch_tensor(NythonExecutor& E,
                     for (int i = 0; i < len; i++) {
                         auto ai = a->container->find(std::to_string(i));
                         auto bi = b->container->find(std::to_string(i));
-                        double va = (ai != a->container->end()) ? (ai->second.type == ValueType::DOUBLE ? static_cast<double>(ai->second.value.d) : static_cast<double>(bigint_to_i64(ai->second.value.i))) : 0;
-                        double vb = (bi != b->container->end()) ? (bi->second.type == ValueType::DOUBLE ? static_cast<double>(bi->second.value.d) : static_cast<double>(bigint_to_i64(bi->second.value.i))) : 0;
+                        double va = (ai != a->container->end()) ? (ai->second.type == ValueType::DOUBLE ? ny_num(ai->second) : static_cast<double>(bigint_to_i64(ai->second.value.i))) : 0;
+                        double vb = (bi != b->container->end()) ? (bi->second.type == ValueType::DOUBLE ? ny_num(bi->second) : static_cast<double>(bigint_to_i64(bi->second.value.i))) : 0;
                         double r = 0;
                         if (name == "tensor_add") r = va + vb;
                         else if (name == "tensor_sub") r = va - vb;
@@ -1218,7 +1233,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
                         if (it != t->container->end()) {
-                            double v = it->second.type == ValueType::DOUBLE ? static_cast<double>(it->second.value.d) : static_cast<double>(bigint_to_i64(it->second.value.i));
+                            double v = it->second.type == ValueType::DOUBLE ? ny_num(it->second) : static_cast<double>(bigint_to_i64(it->second.value.i));
                             sum += v;
                             if (v < mn) mn = v;
                             if (v > mx) mx = v;
@@ -1242,7 +1257,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     Object* result = new Object((Runnable*)runner, "tensor", Type::LIST);
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? static_cast<double>(it->second.value.d) : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         result->set(std::to_string(i), Value(v * scale));
                     }
                     result->set("__len__", Value(len));
@@ -1304,7 +1319,7 @@ Value dispatch_tensor(NythonExecutor& E,
                                     auto val_it = row_cont->container->find(std::to_string(c));
                                     double v = 0;
                                     if (val_it != row_cont->container->end()) {
-                                        if (val_it->second.type == ValueType::DOUBLE) v = static_cast<double>(val_it->second.value.d);
+                                        if (val_it->second.type == ValueType::DOUBLE) v = ny_num(val_it->second);
                                         else if (val_it->second.type == ValueType::INTEGER) v = static_cast<double>(bigint_to_i64(val_it->second.value.i));
                                     }
                                     mat->set(std::to_string(r) + "," + std::to_string(c), Value(v));
@@ -1338,8 +1353,8 @@ Value dispatch_tensor(NythonExecutor& E,
                             for (int k = 0; k < ac; k++) {
                                 auto aik = A->container->find(std::to_string(i)+","+std::to_string(k));
                                 auto bkj = B->container->find(std::to_string(k)+","+std::to_string(j));
-                                double va = (aik != A->container->end()) ? static_cast<double>(aik->second.value.d) : 0;
-                                double vb = (bkj != B->container->end()) ? static_cast<double>(bkj->second.value.d) : 0;
+                                double va = (aik != A->container->end()) ? ny_num(aik->second) : 0;
+                                double vb = (bkj != B->container->end()) ? ny_num(bkj->second) : 0;
                                 sum += va * vb;
                             }
                             C->set(std::to_string(i)+","+std::to_string(j), Value(sum));
@@ -1364,7 +1379,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     for (int i = 0; i < rows; i++)
                         for (int j = 0; j < cols; j++) {
                             auto it = M->container->find(std::to_string(i)+","+std::to_string(j));
-                            double v = (it != M->container->end()) ? static_cast<double>(it->second.value.d) : 0;
+                            double v = (it != M->container->end()) ? ny_num(it->second) : 0;
                             T->set(std::to_string(j)+","+std::to_string(i), Value(v));
                         }
                     T->set("__rows__", Value(cols));
@@ -1429,14 +1444,14 @@ Value dispatch_tensor(NythonExecutor& E,
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
                         if (it != t->container->end()) {
-                            double v = it->second.type == ValueType::DOUBLE ? static_cast<double>(it->second.value.d) : static_cast<double>(bigint_to_i64(it->second.value.i));
+                            double v = it->second.type == ValueType::DOUBLE ? ny_num(it->second) : static_cast<double>(bigint_to_i64(it->second.value.i));
                             if (v > max_val) max_val = v;
                         }
                     }
                     Object* result = new Object((Runnable*)runner, "tensor", Type::LIST);
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (it->second.type == ValueType::DOUBLE ? static_cast<double>(it->second.value.d) : static_cast<double>(bigint_to_i64(it->second.value.i))) : 0;
+                        double v = (it != t->container->end()) ? (it->second.type == ValueType::DOUBLE ? ny_num(it->second) : static_cast<double>(bigint_to_i64(it->second.value.i))) : 0;
                         double e = std::exp(v - max_val);
                         result->set(std::to_string(i), Value(e));
                         sum_exp += e;
@@ -1444,7 +1459,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     for (int i = 0; i < len; i++) {
                         auto it = result->container->find(std::to_string(i));
                         if (it != result->container->end())
-                            it->second = Value(static_cast<double>(it->second.value.d) / sum_exp);
+                            it->second = Value(ny_num(it->second) / sum_exp);
                     }
                     result->set("__len__", Value(len));
                     result->set("__type__", makeStringValue("tensor"));
@@ -1503,7 +1518,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
                         if (it != t->container->end()) {
-                            double v = it->second.type == ValueType::DOUBLE ? (double)it->second.value.d : (double)bigint_to_i64(it->second.value.i);
+                            double v = it->second.type == ValueType::DOUBLE ? ny_num(it->second) : (double)bigint_to_i64(it->second.value.i);
                             if (v > max_val) max_val = v;
                         }
                     }
@@ -1511,7 +1526,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     std::vector<double> exps(len);
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (it->second.type == ValueType::DOUBLE ? (double)it->second.value.d : (double)bigint_to_i64(it->second.value.i)) : 0;
+                        double v = (it != t->container->end()) ? (it->second.type == ValueType::DOUBLE ? ny_num(it->second) : (double)bigint_to_i64(it->second.value.i)) : 0;
                         exps[i] = std::exp(v - max_val);
                         sum_exp += exps[i];
                     }
@@ -1534,7 +1549,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     Object* result = new Object((Runnable*)runner, "tensor", Type::LIST);
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         double r = 0;
                         if (name == "tensor_exp") r = std::exp(v);
                         else if (name == "tensor_log") r = (v > 0) ? std::log(v) : -1e308;
@@ -1560,7 +1575,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     Object* result = new Object((Runnable*)runner, "tensor", Type::LIST);
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         result->set(std::to_string(i), Value(std::pow(v, exp_val)));
                     }
                     result->set("__len__", Value(len));
@@ -1588,8 +1603,8 @@ Value dispatch_tensor(NythonExecutor& E,
                             for (int k = 0; k < ca; k++) {
                                 auto ai = a->container->find(std::to_string(i * ca + k));
                                 auto bj = b->container->find(std::to_string(k * cb + j));
-                                double va = (ai != a->container->end()) ? (double)ai->second.value.d : 0;
-                                double vb = (bj != b->container->end()) ? (double)bj->second.value.d : 0;
+                                double va = (ai != a->container->end()) ? ny_num(ai->second) : 0;
+                                double vb = (bj != b->container->end()) ? ny_num(bj->second) : 0;
                                 sum += va * vb;
                             }
                             result->set(std::to_string(idx++), Value(sum));
@@ -1613,7 +1628,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     for (int j = 0; j < cols; j++) {
                         for (int i = 0; i < rows; i++) {
                             auto it = t->container->find(std::to_string(i * cols + j));
-                            double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                            double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                             result->set(std::to_string(idx++), Value(v));
                         }
                     }
@@ -1743,8 +1758,8 @@ Value dispatch_tensor(NythonExecutor& E,
                     for (int i = 0; i < len; i++) {
                         auto pi = pred->container->find(std::to_string(i));
                         auto ti = target->container->find(std::to_string(i));
-                        double pv = (pi != pred->container->end()) ? (double)pi->second.value.d : 0;
-                        double tv = (ti != target->container->end()) ? (double)ti->second.value.d : 0;
+                        double pv = (pi != pred->container->end()) ? ny_num(pi->second) : 0;
+                        double tv = (ti != target->container->end()) ? ny_num(ti->second) : 0;
                         total += (pv - tv) * (pv - tv);
                     }
                     return Value(total / len);
@@ -1764,8 +1779,8 @@ Value dispatch_tensor(NythonExecutor& E,
                     for (int i = 0; i < len; i++) {
                         auto pi = pred->container->find(std::to_string(i));
                         auto ti = target->container->find(std::to_string(i));
-                        double pv = (pi != pred->container->end()) ? (double)pi->second.value.d : 1e-7;
-                        double tv = (ti != target->container->end()) ? (double)ti->second.value.d : 0;
+                        double pv = (pi != pred->container->end()) ? ny_num(pi->second) : 1e-7;
+                        double tv = (ti != target->container->end()) ? ny_num(ti->second) : 0;
                         if (pv < 1e-7) pv = 1e-7;
                         total += -tv * std::log(pv);
                     }
@@ -1787,7 +1802,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     for (int i = 0; i < len; i++) {
                         // f(x + eps)
                         auto orig = t->container->find(std::to_string(i));
-                        double orig_val = (orig != t->container->end()) ? (double)orig->second.value.d : 0;
+                        double orig_val = (orig != t->container->end()) ? ny_num(orig->second) : 0;
                         (*t->container)[std::to_string(i)] = Value(orig_val + eps);
                         std::vector<Value> a1 = {Value((Collectable*)t)};
                         Value f_plus = callFunctionValue(fn_val, a1, ctx);
@@ -1819,7 +1834,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     Object* result = new Object((Runnable*)runner, "tensor", Type::LIST);
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         if (v < lo) v = lo;
                         if (v > hi) v = hi;
                         result->set(std::to_string(i), Value(v));
@@ -1839,7 +1854,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     double best = -1e308; int best_idx = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         if (v > best) { best = v; best_idx = i; }
                     }
                     return Value(best_idx);
@@ -1856,7 +1871,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     double best = 1e308; int best_idx = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         if (v < best) { best = v; best_idx = i; }
                     }
                     return Value(best_idx);
@@ -1874,7 +1889,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     double sum_sq = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         sum_sq += v * v;
                     }
                     return Value(std::sqrt(sum_sq));
@@ -1892,7 +1907,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     double sum_sq = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         sum_sq += v * v;
                     }
                     double n = std::sqrt(sum_sq);
@@ -1900,7 +1915,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     Object* result = new Object((Runnable*)runner, "tensor", Type::LIST);
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         result->set(std::to_string(i), Value(v / n));
                     }
                     result->set("__len__", Value(len));
@@ -1958,8 +1973,8 @@ Value dispatch_tensor(NythonExecutor& E,
                     for (int i = 0; i < len; i++) {
                         auto pi = pred->container->find(std::to_string(i));
                         auto ti = target->container->find(std::to_string(i));
-                        double p = (pi != pred->container->end()) ? (double)pi->second.value.d : 0.5;
-                        double t = (ti != target->container->end()) ? (double)ti->second.value.d : 0;
+                        double p = (pi != pred->container->end()) ? ny_num(pi->second) : 0.5;
+                        double t = (ti != target->container->end()) ? ny_num(ti->second) : 0;
                         p = std::max(1e-7, std::min(1.0 - 1e-7, p));
                         total += -(t * std::log(p) + (1 - t) * std::log(1 - p));
                     }
@@ -1981,8 +1996,8 @@ Value dispatch_tensor(NythonExecutor& E,
                         auto pi = preds->container->find(std::to_string(i));
                         auto ti = targets->container->find(std::to_string(i));
                         if (pi != preds->container->end() && ti != targets->container->end()) {
-                            double pv = (double)pi->second.value.d;
-                            double tv = (double)ti->second.value.d;
+                            double pv = ny_num(pi->second);
+                            double tv = ny_num(ti->second);
                             if (std::round(pv) == std::round(tv)) correct++;
                         }
                     }
@@ -2010,8 +2025,8 @@ Value dispatch_tensor(NythonExecutor& E,
                         for (int k = 0; k < klen; k++) {
                             auto ii = inp->container->find(std::to_string(i + k));
                             auto ki = ker->container->find(std::to_string(k));
-                            double iv = (ii != inp->container->end()) ? (double)ii->second.value.d : 0;
-                            double kv = (ki != ker->container->end()) ? (double)ki->second.value.d : 0;
+                            double iv = (ii != inp->container->end()) ? ny_num(ii->second) : 0;
+                            double kv = (ki != ker->container->end()) ? ny_num(ki->second) : 0;
                             sum += iv * kv;
                         }
                         result->set(std::to_string(i), Value(sum));
@@ -2036,7 +2051,7 @@ Value dispatch_tensor(NythonExecutor& E,
                         double mx = -1e308;
                         for (int k = 0; k < ks; k++) {
                             auto it = inp->container->find(std::to_string(i * ks + k));
-                            double v = (it != inp->container->end()) ? (double)it->second.value.d : 0;
+                            double v = (it != inp->container->end()) ? ny_num(it->second) : 0;
                             if (v > mx) mx = v;
                         }
                         result->set(std::to_string(i), Value(mx));
@@ -2060,7 +2075,7 @@ Value dispatch_tensor(NythonExecutor& E,
                         double sum = 0;
                         for (int k = 0; k < ks; k++) {
                             auto it = inp->container->find(std::to_string(i * ks + k));
-                            sum += (it != inp->container->end()) ? (double)it->second.value.d : 0;
+                            sum += (it != inp->container->end()) ? ny_num(it->second) : 0;
                         }
                         result->set(std::to_string(i), Value(sum / ks));
                     }
@@ -2082,7 +2097,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     double scale = 1.0 / (1.0 - rate);
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         double r = static_cast<double>(rand()) / RAND_MAX;
                         result->set(std::to_string(i), Value(r > rate ? v * scale : 0.0));
                     }
@@ -2109,7 +2124,7 @@ Value dispatch_tensor(NythonExecutor& E,
                         int word_idx = (ii != indices->container->end()) ? (int)bigint_to_i64(ii->second.value.i) : 0;
                         for (int d = 0; d < embed_dim; d++) {
                             auto ti = table->container->find(std::to_string(word_idx * embed_dim + d));
-                            double v = (ti != table->container->end()) ? (double)ti->second.value.d : 0;
+                            double v = (ti != table->container->end()) ? ny_num(ti->second) : 0;
                             result->set(std::to_string(idx++), Value(v));
                         }
                     }
@@ -2131,8 +2146,8 @@ Value dispatch_tensor(NythonExecutor& E,
                     for (int i = 0; i < len; i++) {
                         auto ai = a->container->find(std::to_string(i));
                         auto bi = b->container->find(std::to_string(i));
-                        double av = (ai != a->container->end()) ? (double)ai->second.value.d : 0;
-                        double bv = (bi != b->container->end()) ? (double)bi->second.value.d : 0;
+                        double av = (ai != a->container->end()) ? ny_num(ai->second) : 0;
+                        double bv = (bi != b->container->end()) ? ny_num(bi->second) : 0;
                         dot += av * bv; na += av * av; nb += bv * bv;
                     }
                     double denom = std::sqrt(na) * std::sqrt(nb);
@@ -2166,8 +2181,8 @@ Value dispatch_tensor(NythonExecutor& E,
                         for (int d = 0; d < dk; d++) {
                             auto qi = Q->container->find(std::to_string(d));
                             auto ki = K->container->find(std::to_string(s * dk + d));
-                            double qv = (qi != Q->container->end()) ? (double)qi->second.value.d : 0;
-                            double kv = (ki != K->container->end()) ? (double)ki->second.value.d : 0;
+                            double qv = (qi != Q->container->end()) ? ny_num(qi->second) : 0;
+                            double kv = (ki != K->container->end()) ? ny_num(ki->second) : 0;
                             dot += qv * kv;
                         }
                         scores[s] = dot * scale;
@@ -2186,7 +2201,7 @@ Value dispatch_tensor(NythonExecutor& E,
                         double sum = 0;
                         for (int s = 0; s < seq_len; s++) {
                             auto vi = V->container->find(std::to_string(s * dv + d));
-                            double vv = (vi != V->container->end()) ? (double)vi->second.value.d : 0;
+                            double vv = (vi != V->container->end()) ? ny_num(vi->second) : 0;
                             sum += scores[s] * vv;
                         }
                         result->set(std::to_string(d), Value(sum));
@@ -2209,12 +2224,12 @@ Value dispatch_tensor(NythonExecutor& E,
                     double mean = 0, var_val = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        mean += (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        mean += (it != t->container->end()) ? ny_num(it->second) : 0;
                     }
                     mean /= len;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         var_val += (v - mean) * (v - mean);
                     }
                     var_val /= len;
@@ -2222,7 +2237,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     Object* result = new Object((Runnable*)runner, "tensor", Type::LIST);
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         double normed = (v - mean) / std_val;
                         // Apply gamma and beta if provided
                         if (args.size() >= 3 && args[1].isCollectable() && args[2].isCollectable()) {
@@ -2230,8 +2245,8 @@ Value dispatch_tensor(NythonExecutor& E,
                             auto* beta = dynamic_cast<Container*>(args[2].value.gc);
                             auto gi = gamma->container->find(std::to_string(i));
                             auto bi = beta->container->find(std::to_string(i));
-                            double g = (gi != gamma->container->end()) ? (double)gi->second.value.d : 1.0;
-                            double b = (bi != beta->container->end()) ? (double)bi->second.value.d : 0.0;
+                            double g = (gi != gamma->container->end()) ? ny_num(gi->second) : 1.0;
+                            double b = (bi != beta->container->end()) ? ny_num(bi->second) : 0.0;
                             normed = g * normed + b;
                         }
                         result->set(std::to_string(i), Value(normed));
@@ -2252,13 +2267,13 @@ Value dispatch_tensor(NythonExecutor& E,
                     double mean = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        mean += (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        mean += (it != t->container->end()) ? ny_num(it->second) : 0;
                     }
                     mean /= len;
                     double var_sum = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         var_sum += (v - mean) * (v - mean);
                     }
                     return Value(var_sum / len);
@@ -2275,13 +2290,13 @@ Value dispatch_tensor(NythonExecutor& E,
                     double mean = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        mean += (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        mean += (it != t->container->end()) ? ny_num(it->second) : 0;
                     }
                     mean /= len;
                     double var_sum = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         var_sum += (v - mean) * (v - mean);
                     }
                     return Value(std::sqrt(var_sum / len));
@@ -2303,9 +2318,9 @@ Value dispatch_tensor(NythonExecutor& E,
                         auto ci = cond->container->find(std::to_string(i));
                         auto xi = x->container->find(std::to_string(i));
                         auto yi = y->container->find(std::to_string(i));
-                        double cv = (ci != cond->container->end()) ? (double)ci->second.value.d : 0;
-                        double xv = (xi != x->container->end()) ? (double)xi->second.value.d : 0;
-                        double yv = (yi != y->container->end()) ? (double)yi->second.value.d : 0;
+                        double cv = (ci != cond->container->end()) ? ny_num(ci->second) : 0;
+                        double xv = (xi != x->container->end()) ? ny_num(xi->second) : 0;
+                        double yv = (yi != y->container->end()) ? ny_num(yi->second) : 0;
                         result->set(std::to_string(i), Value(cv > 0 ? xv : yv));
                     }
                     result->set("__len__", Value(len));
@@ -2416,7 +2431,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     std::vector<double> vals;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        if (it != t->container->end()) vals.push_back((double)it->second.value.d);
+                        if (it != t->container->end()) vals.push_back(ny_num(it->second));
                     }
                     std::sort(vals.begin(), vals.end());
                     if (vals.empty()) return NONE_VALUE;
@@ -2436,7 +2451,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     double running = -1e18;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         if (v > running) running = v;
                         result->set(std::to_string(i), Value(running));
                     }
@@ -2456,7 +2471,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     double running = 1e18;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         if (v < running) running = v;
                         result->set(std::to_string(i), Value(running));
                     }
@@ -2476,7 +2491,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     Object* result = new Object((Runnable*)runner, "tensor", Type::LIST);
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(len-1-i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         result->set(std::to_string(i), Value(v));
                     }
                     result->set("__len__", Value(len));
@@ -2497,7 +2512,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     Object* result = new Object((Runnable*)runner, "tensor", Type::LIST);
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string((i - shift + len) % len));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         result->set(std::to_string(i), Value(v));
                     }
                     result->set("__len__", Value(len));
@@ -2515,7 +2530,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     std::vector<double> vals;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        if (it != t->container->end()) vals.push_back((double)it->second.value.d);
+                        if (it != t->container->end()) vals.push_back(ny_num(it->second));
                     }
                     std::sort(vals.begin(), vals.end());
                     vals.erase(std::unique(vals.begin(), vals.end()), vals.end());
@@ -2537,7 +2552,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     Object* result = new Object((Runnable*)runner, "tensor", Type::LIST);
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? std::abs((double)it->second.value.d) : 0;
+                        double v = (it != t->container->end()) ? std::abs(ny_num(it->second)) : 0;
                         result->set(std::to_string(i), Value(v));
                     }
                     result->set("__len__", Value(len));
@@ -2556,7 +2571,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     Object* result = new Object((Runnable*)runner, "tensor", Type::LIST);
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? std::pow((double)it->second.value.d, exp_v) : 0;
+                        double v = (it != t->container->end()) ? std::pow(ny_num(it->second), exp_v) : 0;
                         result->set(std::to_string(i), Value(v));
                     }
                     result->set("__len__", Value(len));
@@ -2574,7 +2589,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     Object* result = new Object((Runnable*)runner, "tensor", Type::LIST);
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? std::sqrt(std::abs((double)it->second.value.d)) : 0;
+                        double v = (it != t->container->end()) ? std::sqrt(std::abs(ny_num(it->second))) : 0;
                         result->set(std::to_string(i), Value(v));
                     }
                     result->set("__len__", Value(len));
@@ -2595,7 +2610,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     double running = 1.0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         running *= v;
                         result->set(std::to_string(i), Value(running));
                     }
@@ -2615,7 +2630,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     Object* result = new Object((Runnable*)runner, "tensor", Type::LIST);
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         double sign = (v > 0) ? 1.0 : ((v < 0) ? -1.0 : 0.0);
                         result->set(std::to_string(i), Value(sign));
                     }
@@ -2635,13 +2650,13 @@ Value dispatch_tensor(NythonExecutor& E,
                     double max_val = -1e18;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : -1e18;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : -1e18;
                         if (v > max_val) max_val = v;
                     }
                     double sum = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : -1e18;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : -1e18;
                         sum += std::exp(v - max_val);
                     }
                     return Value(max_val + std::log(sum));
@@ -2671,11 +2686,11 @@ Value dispatch_tensor(NythonExecutor& E,
                         auto ii = idx->container->find(std::to_string(i));
                         auto vi = val->container->find(std::to_string(i));
                         if (ii != idx->container->end() && vi != val->container->end()) {
-                            int target = (ii->second.type == ValueType::INTEGER) ? (int)bigint_to_i64(ii->second.value.i) : (int)(double)ii->second.value.d;
+                            int target = (ii->second.type == ValueType::INTEGER) ? (int)bigint_to_i64(ii->second.value.i) : (int)ny_num(ii->second);
                             if (target >= 0 && target < olen) {
                                 auto cur = result->container->find(std::to_string(target));
-                                double cv = (cur != result->container->end()) ? (double)cur->second.value.d : 0;
-                                result->set(std::to_string(target), Value(cv + (double)vi->second.value.d));
+                                double cv = (cur != result->container->end()) ? ny_num(cur->second) : 0;
+                                result->set(std::to_string(target), Value(cv + ny_num(vi->second)));
                             }
                         }
                     }
@@ -2701,7 +2716,7 @@ Value dispatch_tensor(NythonExecutor& E,
                         int src = 0;
                         if (ii != idx->container->end()) {
                             if (ii->second.type == ValueType::INTEGER) src = (int)bigint_to_i64(ii->second.value.i);
-                            else src = (int)(double)ii->second.value.d;
+                            else src = (int)ny_num(ii->second);
                         }
                         src = std::max(0, std::min(inlen - 1, src));
                         auto vi = inp->container->find(std::to_string(src));
@@ -2724,13 +2739,13 @@ Value dispatch_tensor(NythonExecutor& E,
                     double mean = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        mean += (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        mean += (it != t->container->end()) ? ny_num(it->second) : 0;
                     }
                     mean /= len;
                     double var_val = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         var_val += (v - mean) * (v - mean);
                     }
                     return Value(var_val / len);
@@ -2747,13 +2762,13 @@ Value dispatch_tensor(NythonExecutor& E,
                     double mean = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        mean += (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        mean += (it != t->container->end()) ? ny_num(it->second) : 0;
                     }
                     mean /= len;
                     double var_val = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         var_val += (v - mean) * (v - mean);
                     }
                     return Value(std::sqrt(var_val / len));
@@ -2775,9 +2790,9 @@ Value dispatch_tensor(NythonExecutor& E,
                         auto ci = cond->container->find(std::to_string(i));
                         auto ai = a->container->find(std::to_string(i));
                         auto bi = b->container->find(std::to_string(i));
-                        double cv = (ci != cond->container->end()) ? (double)ci->second.value.d : 0;
-                        double av = (ai != a->container->end()) ? (double)ai->second.value.d : 0;
-                        double bv = (bi != b->container->end()) ? (double)bi->second.value.d : 0;
+                        double cv = (ci != cond->container->end()) ? ny_num(ci->second) : 0;
+                        double av = (ai != a->container->end()) ? ny_num(ai->second) : 0;
+                        double bv = (bi != b->container->end()) ? ny_num(bi->second) : 0;
                         result->set(std::to_string(i), Value(cv > 0 ? av : bv));
                     }
                     result->set("__len__", Value(len));
@@ -2851,19 +2866,19 @@ Value dispatch_tensor(NythonExecutor& E,
                     double mean = 0, var_v = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        mean += (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        mean += (it != t->container->end()) ? ny_num(it->second) : 0;
                     }
                     mean /= len;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         var_v += (v - mean) * (v - mean);
                     }
                     double s = std::sqrt(var_v / len + 1e-5);
                     Object* result = new Object((Runnable*)runner, "tensor", Type::LIST);
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         result->set(std::to_string(i), Value((v - mean) / s));
                     }
                     result->set("__len__", Value(len));
@@ -2882,7 +2897,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     double cumsum = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        cumsum += (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        cumsum += (it != t->container->end()) ? ny_num(it->second) : 0;
                         result->set(std::to_string(i), Value(cumsum));
                     }
                     result->set("__len__", Value(len));
@@ -2902,8 +2917,8 @@ Value dispatch_tensor(NythonExecutor& E,
                     for (int i = 1; i < len; i++) {
                         auto prev = t->container->find(std::to_string(i-1));
                         auto curr = t->container->find(std::to_string(i));
-                        double pv = (prev != t->container->end()) ? (double)prev->second.value.d : 0;
-                        double cv = (curr != t->container->end()) ? (double)curr->second.value.d : 0;
+                        double pv = (prev != t->container->end()) ? ny_num(prev->second) : 0;
+                        double cv = (curr != t->container->end()) ? ny_num(curr->second) : 0;
                         result->set(std::to_string(i-1), Value(cv - pv));
                     }
                     result->set("__len__", Value(len > 0 ? len - 1 : 0));
@@ -2926,10 +2941,10 @@ Value dispatch_tensor(NythonExecutor& E,
                     int idx = 0;
                     for (int i = 0; i < alen; i++) {
                         auto ai = a->container->find(std::to_string(i));
-                        double av = (ai != a->container->end()) ? (double)ai->second.value.d : 0;
+                        double av = (ai != a->container->end()) ? ny_num(ai->second) : 0;
                         for (int j = 0; j < blen; j++) {
                             auto bj = b->container->find(std::to_string(j));
-                            double bv = (bj != b->container->end()) ? (double)bj->second.value.d : 0;
+                            double bv = (bj != b->container->end()) ? ny_num(bj->second) : 0;
                             result->set(std::to_string(idx++), Value(av * bv));
                         }
                     }
@@ -2952,8 +2967,8 @@ Value dispatch_tensor(NythonExecutor& E,
                     for (int i = 0; i < len; i++) {
                         auto pi = pred->container->find(std::to_string(i));
                         auto ti = target->container->find(std::to_string(i));
-                        double pv = (pi != pred->container->end()) ? (double)pi->second.value.d : 0;
-                        double tv = (ti != target->container->end()) ? (double)ti->second.value.d : 0;
+                        double pv = (pi != pred->container->end()) ? ny_num(pi->second) : 0;
+                        double tv = (ti != target->container->end()) ? ny_num(ti->second) : 0;
                         double diff = std::abs(pv - tv);
                         total += (diff <= delta) ? 0.5 * diff * diff : delta * (diff - 0.5 * delta);
                     }
@@ -3002,9 +3017,9 @@ Value dispatch_tensor(NythonExecutor& E,
                         auto ci = cond->container->find(std::to_string(i));
                         auto ai = a->container->find(std::to_string(i));
                         auto bi = b->container->find(std::to_string(i));
-                        double cv = (ci != cond->container->end()) ? (double)ci->second.value.d : 0;
-                        double av = (ai != a->container->end()) ? (double)ai->second.value.d : 0;
-                        double bv = (bi != b->container->end()) ? (double)bi->second.value.d : 0;
+                        double cv = (ci != cond->container->end()) ? ny_num(ci->second) : 0;
+                        double av = (ai != a->container->end()) ? ny_num(ai->second) : 0;
+                        double bv = (bi != b->container->end()) ? ny_num(bi->second) : 0;
                         result->set(std::to_string(i), Value(cv > 0 ? av : bv));
                     }
                     result->set("__len__", Value(len));
@@ -3024,7 +3039,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     double cum = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        cum += (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        cum += (it != t->container->end()) ? ny_num(it->second) : 0;
                         result->set(std::to_string(i), Value(cum));
                     }
                     result->set("__len__", Value(len));
@@ -3045,8 +3060,8 @@ Value dispatch_tensor(NythonExecutor& E,
                     for (int i = 0; i < len - 1; i++) {
                         auto a = t->container->find(std::to_string(i));
                         auto b = t->container->find(std::to_string(i + 1));
-                        double av = (a != t->container->end()) ? (double)a->second.value.d : 0;
-                        double bv = (b != t->container->end()) ? (double)b->second.value.d : 0;
+                        double av = (a != t->container->end()) ? ny_num(a->second) : 0;
+                        double bv = (b != t->container->end()) ? ny_num(b->second) : 0;
                         result->set(std::to_string(i), Value(bv - av));
                     }
                     result->set("__len__", Value(len - 1));
@@ -3065,13 +3080,13 @@ Value dispatch_tensor(NythonExecutor& E,
                     double mean = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        mean += (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        mean += (it != t->container->end()) ? ny_num(it->second) : 0;
                     }
                     mean /= len;
                     double var_val = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         var_val += (v - mean) * (v - mean);
                     }
                     var_val /= len;
@@ -3094,8 +3109,8 @@ Value dispatch_tensor(NythonExecutor& E,
                     for (int i = 0; i < len; i++) {
                         auto pi = pred->container->find(std::to_string(i));
                         auto ti = target->container->find(std::to_string(i));
-                        double pv = (pi != pred->container->end()) ? (double)pi->second.value.d : 0;
-                        double tv = (ti != target->container->end()) ? (double)ti->second.value.d : 0;
+                        double pv = (pi != pred->container->end()) ? ny_num(pi->second) : 0;
+                        double tv = (ti != target->container->end()) ? ny_num(ti->second) : 0;
                         double diff = std::abs(pv - tv);
                         total += (diff <= delta) ? 0.5 * diff * diff : delta * (diff - 0.5 * delta);
                     }
@@ -3115,20 +3130,20 @@ Value dispatch_tensor(NythonExecutor& E,
                     double mean = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        mean += (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        mean += (it != t->container->end()) ? ny_num(it->second) : 0;
                     }
                     mean /= len;
                     double var_v = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         var_v += (v - mean) * (v - mean);
                     }
                     var_v /= len;
                     Object* result = new Object((Runnable*)runner, "tensor", Type::LIST);
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         result->set(std::to_string(i), Value((v - mean) / std::sqrt(var_v + eps)));
                     }
                     result->set("__len__", Value(len));
@@ -3177,9 +3192,9 @@ Value dispatch_tensor(NythonExecutor& E,
                         auto ci = cond->container->find(std::to_string(i));
                         auto ai = a->container->find(std::to_string(i));
                         auto bi = b->container->find(std::to_string(i));
-                        double cv = (ci != cond->container->end()) ? (double)ci->second.value.d : 0;
-                        double av = (ai != a->container->end()) ? (double)ai->second.value.d : 0;
-                        double bv = (bi != b->container->end()) ? (double)bi->second.value.d : 0;
+                        double cv = (ci != cond->container->end()) ? ny_num(ci->second) : 0;
+                        double av = (ai != a->container->end()) ? ny_num(ai->second) : 0;
+                        double bv = (bi != b->container->end()) ? ny_num(bi->second) : 0;
                         result->set(std::to_string(i), Value(cv > 0 ? av : bv));
                     }
                     result->set("__len__", Value(len));
@@ -3201,8 +3216,8 @@ Value dispatch_tensor(NythonExecutor& E,
                     for (int i = 0; i < len; i++) {
                         auto pi = pred->container->find(std::to_string(i));
                         auto ti = target->container->find(std::to_string(i));
-                        double pv = (pi != pred->container->end()) ? (double)pi->second.value.d : 0;
-                        double tv = (ti != target->container->end()) ? (double)ti->second.value.d : 0;
+                        double pv = (pi != pred->container->end()) ? ny_num(pi->second) : 0;
+                        double tv = (ti != target->container->end()) ? ny_num(ti->second) : 0;
                         double a = std::abs(pv - tv);
                         total += (a <= delta) ? 0.5 * a * a : delta * (a - 0.5 * delta);
                     }
@@ -3221,13 +3236,13 @@ Value dispatch_tensor(NythonExecutor& E,
                     double mean = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        mean += (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        mean += (it != t->container->end()) ? ny_num(it->second) : 0;
                     }
                     mean /= len;
                     double var_v = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         var_v += (v - mean) * (v - mean);
                     }
                     var_v /= len;
@@ -3248,7 +3263,7 @@ Value dispatch_tensor(NythonExecutor& E,
                     double cum = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        cum += (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        cum += (it != t->container->end()) ? ny_num(it->second) : 0;
                         result->set(std::to_string(i), Value(cum));
                     }
                     result->set("__len__", Value(len));
@@ -3259,6 +3274,114 @@ Value dispatch_tensor(NythonExecutor& E,
         }
 
     return UNDEFINED_VALUE;  // not handled by this module
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
+// dispatch_nt — interpreter adapter for the shared tensor kernels
+// ════════════════════════════════════════════════════════════════════════════════
+// Converts interpreter Values to nt::Val, runs the one shared implementation
+// (src/builtins/nytensor.cpp) and converts the result back. The VM has the
+// mirror-image adapter (VirtualMachine.hpp: register_nt_natives), so a name
+// served here gives bit-identical results on both engines.
+namespace {
+
+nt::Val ny_to_nt(NythonExecutor& E, const Value& v, int depth) {
+    switch (v.type) {
+        case ValueType::INTEGER: return nt::Val::integer(bigint_to_i64(v.value.i));
+        case ValueType::DOUBLE:  return nt::Val::num((double)v.value.d);
+        case ValueType::BOOLEAN: return nt::Val::boolean(v.value.b);
+        case ValueType::NONE:
+        case ValueType::UNDEFINED: return nt::Val::none();
+        default: break;
+    }
+    if (E.isStringValue(v)) return nt::Val::str(E.getStringValue(v));
+    Container* c = v.isCollectable() ? dynamic_cast<Container*>(v.value.gc) : nullptr;
+    if (!c || !c->container) return nt::Val::none();
+    auto li = c->container->find("__len__");
+    if (li == c->container->end()) return nt::Val::none();          // a map
+    int64_t n = li->second.type == ValueType::INTEGER ? bigint_to_i64(li->second.value.i) : (int64_t)li->second.value.d;
+    std::vector<const Value*> el((size_t)std::max<int64_t>(n, 0), nullptr);
+    bool allnum = true, allint = true;
+    for (int64_t i = 0; i < n; i++) {
+        auto it = c->container->find(std::to_string(i));
+        if (it == c->container->end()) { allnum = false; continue; }
+        el[i] = &it->second;
+        auto t = it->second.type;
+        if (t == ValueType::DOUBLE) allint = false;
+        else if (t != ValueType::INTEGER && t != ValueType::BOOLEAN) allnum = false;
+    }
+    if (allnum) {
+        std::vector<double> d((size_t)n);
+        for (int64_t i = 0; i < n; i++) {
+            const Value& e = *el[i];
+            d[i] = e.type == ValueType::INTEGER ? (double)bigint_to_i64(e.value.i)
+                 : e.type == ValueType::DOUBLE ? (double)e.value.d : (e.value.b ? 1.0 : 0.0);
+        }
+        return nt::Val::vec(std::move(d), allint);
+    }
+    if (depth > 64) throw std::string("__exc__:ValueError:list nesting is too deep for a tensor");
+    std::vector<nt::Val> items;
+    items.reserve((size_t)n);
+    for (int64_t i = 0; i < n; i++) items.push_back(el[i] ? ny_to_nt(E, *el[i], depth + 1) : nt::Val::none());
+    return nt::Val::list(std::move(items));
+}
+
+Value nt_to_ny(NythonExecutor& E, nt::Val& v) {
+    switch (v.k) {
+        case nt::Val::NONE:  return NONE_VALUE;
+        case nt::Val::BOOL:  return Value(v.b);
+        case nt::Val::INT:   return Value((long int)v.i);
+        case nt::Val::FLOAT: return Value(v.d);
+        case nt::Val::STR:   return E.makeStringValue(v.s);
+        case nt::Val::VEC: {
+            auto* lst = new Object((Runnable*)E.runner, "list", Type::LIST);
+            lst->container->reserve(v.v.size() + 1);
+            for (size_t i = 0; i < v.v.size(); i++)
+                (*lst->container)[std::to_string(i)] = v.v_int ? Value((long int)v.v[i]) : Value(v.v[i]);
+            (*lst->container)["__len__"] = Value((int)v.v.size());
+            return Value(static_cast<Collectable*>(lst));
+        }
+        case nt::Val::LIST: {
+            auto* lst = new Object((Runnable*)E.runner, "list", Type::LIST);
+            lst->container->reserve(v.items.size() + 1);
+            for (size_t i = 0; i < v.items.size(); i++)
+                (*lst->container)[std::to_string(i)] = nt_to_ny(E, v.items[i]);
+            (*lst->container)["__len__"] = Value((int)v.items.size());
+            return Value(static_cast<Collectable*>(lst));
+        }
+    }
+    return NONE_VALUE;
+}
+
+// In-place natives (optimizer steps, running statistics): copy the updated
+// numbers back into the caller's own list object.
+void nt_write_back(Value& dst, const nt::Val& src) {
+    if (src.k != nt::Val::VEC) return;
+    Container* c = dst.isCollectable() ? dynamic_cast<Container*>(dst.value.gc) : nullptr;
+    if (!c || !c->container) return;
+    for (size_t i = 0; i < src.v.size(); i++) (*c->container)[std::to_string(i)] = Value(src.v[i]);
+    (*c->container)["__len__"] = Value((int)src.v.size());
+}
+
+} // namespace
+
+std::vector<std::string> nt_builtin_names() { return nt::names(); }
+
+Value dispatch_nt(NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context*) {
+    const nt::Op* op = nt::find(name);
+    if (!op) return UNDEFINED_VALUE;
+    std::vector<nt::Val> a;
+    a.reserve(args.size());
+    for (auto& v : args) a.push_back(ny_to_nt(E, v, 0));
+    nt::Val r;
+    try {
+        r = op->fn(a);
+    } catch (nt::Error& e) {
+        throw std::string("__exc__:" + e.type + ":" + e.msg);
+    }
+    for (int k : op->mutates)
+        if (k < (int)args.size()) nt_write_back(args[k], a[k]);
+    return nt_to_ny(E, r);
 }
 
 #pragma GCC diagnostic pop

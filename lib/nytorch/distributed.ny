@@ -4,14 +4,16 @@
 # ============================================================
 # Classes 181-205:
 #   MessageQueue, PubSubBus, RPC, PeerMesh,
-#   MeshNode, ServiceRegistry, LoadBalancer,
-#   CircuitBreaker, RetryPolicy, RateLimiter,
+#   MeshNode, MeshServiceRegistry, MeshLoadBalancer,
+#   CircuitBreaker, RetryPolicy, TokenBucketLimiter,
 #   NyDB, NyTable, NyIndex, QueryBuilder,
 #   ReplayBuffer, PrioritizedReplayBuffer,
 #   DQNAgent, PPOMemory, MultiAgentEnv,
 #   CurriculumScheduler, RewardShaper,
 #   MetaLearner, TaskDistributor, ResultAggregator
 # ============================================================
+
+import "lib/nytorch/core.ny"
 
 import nytorch
 
@@ -265,9 +267,9 @@ class MeshNode:
         return self.node_id + " peers=" + str(self.mesh.peer_count()) + " tick=" + str(self.tick)
 
 # -----------------------------------------
-# 186. ServiceRegistry  (service discovery)
+# 186. MeshServiceRegistry  (service discovery)
 # -----------------------------------------
-class ServiceRegistry:
+class MeshServiceRegistry:
     def __init__(self, storage_dir):
         self.store = storage_dir + "/services.kv"
         self.health_store = storage_dir + "/health.kv"
@@ -322,9 +324,9 @@ class ServiceRegistry:
         return healthy
 
 # -----------------------------------------
-# 187. LoadBalancer
+# 187. MeshLoadBalancer
 # -----------------------------------------
-class LoadBalancer:
+class MeshLoadBalancer:
     def __init__(self, strategy):
         self.strategy = strategy
         self.backends = []
@@ -451,9 +453,9 @@ class CircuitBreaker:
         return self.name + " state=" + self.state + " failures=" + str(self.failures)
 
 # -----------------------------------------
-# 189. RateLimiter  (token bucket)
+# 189. TokenBucketLimiter  (token bucket)
 # -----------------------------------------
-class RateLimiter:
+class TokenBucketLimiter:
     def __init__(self, name, rate_per_second, burst):
         self.name = name
         self.rate = to_float(rate_per_second)
@@ -930,12 +932,19 @@ class PPOMemory:
 # -----------------------------------------
 # 197. MultiAgentEnv
 # -----------------------------------------
+# A cooperative point-mass task: each agent has a position in R^state_dim
+# and must reach the origin. An integer action a moves it by 0.1 along
+# dimension (a // 2) % state_dim, in the + direction for even a and - for
+# odd a; a vector action moves it by 0.1 * action. Transitions add N(0,
+# 0.01^2) noise; the reward is the decrease in distance to the origin; an
+# agent is done within 0.1 of it, and every agent after 200 steps.
 class MultiAgentEnv:
     def __init__(self, name, n_agents, state_dim, action_dim):
         self.name = name
         self.n_agents = n_agents
         self.state_dim = state_dim
         self.action_dim = action_dim
+        self.max_steps = 200
         self.states = []
         self.rewards = []
         self.dones = []
@@ -943,50 +952,67 @@ class MultiAgentEnv:
         self.episode = 0
         var i = 0
         while i < n_agents:
-            self.states = self.states + [tensor_randn([state_dim])]
-            self.rewards = self.rewards + [0.0]
-            self.dones = self.dones + [false]
-            var i = i + 1
+            self.states.append(nt_full([state_dim], 0.0))
+            self.rewards.append(0.0)
+            self.dones.append(false)
+            i = i + 1
 
     def reset(self):
         self.step_count = 0
         self.episode = self.episode + 1
         var i = 0
         while i < self.n_agents:
-            self.states[i] = tensor_randn([self.state_dim])
+            self.states[i] = nt_uniform(self.state_dim, -1.0, 1.0)
             self.rewards[i] = 0.0
             self.dones[i] = false
-            var i = i + 1
+            i = i + 1
         return self.states
 
+    def _move(self, action):
+        var d = nt_full([self.state_dim], 0.0)
+        if _t_isnum(action):
+            var a = int(action)
+            if a < 0 or a >= self.action_dim:
+                raise IndexError("action " + str(a) + " out of range for " + str(self.action_dim) + " actions")
+            var dim = (a // 2) % self.state_dim
+            if a % 2 == 0:
+                d[dim] = 0.1
+            else:
+                d[dim] = -0.1
+            return d
+        var v = _t_flat(_t_wrap(action).data)
+        var i = 0
+        while i < self.state_dim and i < len(v):
+            d[i] = 0.1 * v[i]
+            i = i + 1
+        return d
+
     def step(self, actions):
+        if len(actions) != self.n_agents:
+            raise ValueError("step needs one action per agent (" + str(self.n_agents) + ")")
         self.step_count = self.step_count + 1
-        var new_states = []
-        var new_rewards = []
-        var new_dones = []
         var i = 0
         while i < self.n_agents:
-            var noise = tensor_randn([self.state_dim])
-            var new_state = tensor_add(self.states[i], tensor_scale(noise, 0.1))
-            var reward = random_float(-0.1, 1.0)
-            var done = false
-            if self.step_count >= 200:
-                var done = true
-            var new_states = new_states + [new_state]
-            var new_rewards = new_rewards + [reward]
-            var new_dones = new_dones + [done]
-            var i = i + 1
-        self.states = new_states
-        self.rewards = new_rewards
-        self.dones = new_dones
-        return {"states": new_states, "rewards": new_rewards, "dones": new_dones}
+            if not self.dones[i]:
+                var before = tensor_norm(self.states[i])
+                var s = tensor_add(tensor_add(self.states[i], self._move(actions[i])), nt_normal(self.state_dim, 0.0, 0.01))
+                var after = tensor_norm(s)
+                self.states[i] = s
+                self.rewards[i] = before - after
+                self.dones[i] = after < 0.1
+            else:
+                self.rewards[i] = 0.0
+            if self.step_count >= self.max_steps:
+                self.dones[i] = true
+            i = i + 1
+        return {"states": self.states, "rewards": self.rewards, "dones": self.dones}
 
     def total_reward(self):
         var total = 0.0
         var i = 0
         while i < self.n_agents:
-            var total = total + self.rewards[i]
-            var i = i + 1
+            total = total + self.rewards[i]
+            i = i + 1
         return total
 
 # -----------------------------------------

@@ -271,6 +271,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit44 | 46 | record-and-replay debugger, including a real `--trace` recording |
 | vm_audit45 | 45 | JSON codec, print call form, list pop/insert, deep equality, file_mtime |
 | vm_audit46 | 252 | OS layer: paths, files, file objects, typed errors, os_run/os_spawn, env, time, full-width ints, sys.argv |
+| vm_audit47 | 153 | nytorch: kernels, autograd, Module/optimizers, XOR and a toy CNN, checked against PyTorch numbers and finite differences; one definition per class name |
 | vm_audit48 | 125 | threads and synchronisation: mutex/rwlock/condition/semaphore/barrier/latch/atomics/channels/queues/futures/pools, deadlock detection |
 | vm_audit49 | 41 | async/await: tasks, gather, wait_for, cancellation, deterministic order |
 | vm_audit50 | 51 | `lib/thread.ny` over the native runtime |
@@ -618,6 +619,20 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   state inside it.
 - `async def` / `await`; channels with `select`; futures, pools, task
   groups; `DeadlockError` / `LockOrderError` instead of hangs.
+
+## Round 74: nytorch (see `HANDOFF.md` §0h)
+
+- One tensor kernel library for both engines: `include/NyTensor.hpp`,
+  `src/builtins/nytensor.cpp` (interpreter: `dispatch_nt` first in the
+  callBuiltin chain; VM: `register_nt_natives()`). Tensors are flat lists
+  plus a shape; float64; broadcasting, axis reductions, batched matmul,
+  conv/pool/norm, seeded RNG, save/load v2.
+- `lib/nytorch/`: Tensor + autograd (`tensor.ny`), Module/Sequential
+  (`module.ny`), layers, losses, optimizers, data; every model class now
+  computes (no random-output stubs).
+- **One definition per class name under `lib/`**: `python3
+  tools/ny_classcheck.py` fails on duplicates (a later same-named class
+  silently replaces the earlier one). Run it after adding a class.
 
 ## Transcripts
 

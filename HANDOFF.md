@@ -7,8 +7,9 @@ Last updated: round 74. This round is **§0e** (IDE responsiveness: native
 text services and a responsive layout ladder; the Code::Blocks feature set;
 non-throwing control flow on both engines; the build system) and **§0f**
 (the OS layer: files, paths, processes, environment and time, with one
-implementation for both engines) and **§0g** (threads, synchronisation and
-async on both engines). §0d is
+implementation for both engines) **§0g** (threads, synchronisation and
+async on both engines) and **§0h** (nytorch: one native tensor engine for
+both engines, real models). §0d is
 round 73 (the IDE to VS Code's model, verified by driving it). Earlier
 rounds: §0/§0b language-level work, §5.3 terminal command line / undo /
 multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
@@ -216,6 +217,64 @@ Defects found while driving these, all fixed:
 
 e2e scenarios added: `build`, `cbedit`, `cbtools`, `cbdebug`, `responsive`,
 `session`, `columns`, `split`, `window`.
+
+---
+
+## 0h. Round 74 — nytorch: one tensor engine, real models
+
+Merged from `round74-torch`. `vm_audit47` has 153 value checks against
+PyTorch-derived numbers and finite differences, byte-identical on both
+engines. All of `test_nytorch9`–`17` and `vm_audit38`–`41` pass on both
+engines.
+
+- **One kernel library for both engines.** It lives in
+  `include/NyTensor.hpp` and `src/builtins/nytensor.cpp`, in float64 C++.
+  - The interpreter reaches it through `dispatch_nt`, first in the
+    `callBuiltin` chain. The VM reaches it through `register_nt_natives()`.
+  - The kernels: broadcasting; axis reductions; blocked batched matmul;
+    views and slicing; stable softmax; conv2d, pooling, BatchNorm,
+    LayerNorm and embedding; a seeded RNG with `manual_seed`; NYTENSOR v2
+    save/load; STFT, mel and DCT; CTC forward-backward; einsum; NMS.
+  - Bad arguments raise typed errors.
+  - The VM's stub natives, which returned random numbers or echoed their
+    input, are deleted.
+- **Tensor representation.** A tensor is a flat row-major list plus a shape
+  list, not an opaque handle, because a handle store would leak in the
+  interpreter. Fused kernels and in-place optimizer steps keep allocation
+  down.
+- **The library on top.**
+  - `tensor.ny`: Tensor with an iterative backward pass, `no_grad`,
+    operators and indexing.
+  - `module.ny`: Module with `parameters`, `state_dict`, `train`/`eval`, and
+    `Sequential`.
+  - Layers, attention, losses on logits with class indices, optimizers
+    (SGD, Adam, AdamW, RMSprop) and schedulers, and DataLoader.
+  - `lib/nytorch/core.ny` is the single import every submodule starts from.
+  - The legacy `Variable` API runs on the same engine.
+- **Fake implementations replaced with computing ones**, across parts 13 to
+  17 and `advanced`: RL agents, transformers, GNNs and serving; conv nets,
+  detection, audio, ARIMA and a CTC-trained ASR model; Neural ODE, KAN,
+  PINN and world models; RetNet, RWKV, Mamba, DiT, DDPM and xLSTM; LoRA,
+  MoE and S4. The scope limits are written in docstrings (for example,
+  Mamba2 uses the Mamba-1 scan).
+- **Magnitude pruning** removes exactly floor(s·n) of the smallest weights.
+  This ends `test_nytorch17`'s statistical flake.
+- **Speed.**
+  - Native matmul 128×128: interpreter 318 → 16 ms. The VM's version used
+    to return `[]`; it now takes 4 ms.
+  - A training step of a [16,64,4] MLP at batch 32: interpreter 788 →
+    6.4 ms, VM 787 → 2.5 ms (Module API).
+- **Not done.**
+  - Interpreter memory is still high: the worst nytorch tests peak near
+    1 GB, because the interpreter never frees containers (GC_NOTES).
+  - The library works around several language bugs (these are in the
+    language work), which the torch agent listed:
+    - a bare call inside a method resolves to a same-named method
+    - constructor `*args` arrive empty
+    - a callable instance used as an attribute call returns `none`
+    - `__iter__`
+    - missing reflected and unary operators
+    - `@` is not lexed
 
 ---
 
@@ -1408,7 +1467,13 @@ pattern immediately after a same-named method definition, at class-compile
 time, and tag that `sub_codes` entry — touching class compilation and every
 method-resolution path (`get_attr`, `set_attr`, `vm_call_method`).
 
-### 5.10 nytorch class-name collisions across submodules (found, not fixed — round 72)
+### 5.10 nytorch class-name collisions across submodules — CLOSED (round 74, §0h)
+
+Every duplicate top-level class name under `lib/` is gone, and
+`tools/ny_classcheck.py` exits 1 on any new one; `vm_audit47` runs it. Round 74's
+merges briefly reintroduced three (`Queue`, `PriorityQueue`, `Timer` in both
+`lib/stdlib.ny` and `lib/thread.ny`); `stdlib.ny` now imports `thread.ny`'s
+thread-safe versions, which answer both APIs. The original finding follows.
 
 Nython has no per-module namespacing for `import "path"` — every class a
 submodule defines lands in one shared global namespace, and a later import
