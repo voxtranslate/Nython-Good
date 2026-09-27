@@ -41,12 +41,14 @@ v2 identifies each verse by text (rapidfuzz, same book ±1 chapter). Only whole-
 ## 2. Components (novel parts kept, improved or added)
 
 - **SAB, Subword-Anchored Bridge (new).**
-  - The model's own CTC head cuts speech into one segment per **NLLB subword**: batched GPU CTC-Viterbi on the gold transcript during training, the CTC hypothesis at test time.
-  - Each segment is attention-pooled into one vector that *replaces the token embedding* at the input of the LoRA-adapted NLLB encoder, in the format `[lang] e₁…e_N </s>`.
-  - Because the speech sequence is token-synchronous with the text, three position-wise losses tie the modalities together: embedding anchoring, NLLB-encoder-output matching, and top-k distillation from the model's own text route.
-  - 25 % of batches are segmented by the CTC hypothesis instead of the gold alignment, so training sees the same conditions as inference.
-  - Related work: CTC compression (Gaido et al. 2021), word-aligned contrastive learning WACO (Ouyang et al. 2023, external aligner), cross-modal KD (Liu et al. 2019; Tang et al. 2021).
-  - SAB differs in three ways: it aligns at the *MT tokenizer's* granularity, it uses its *own* CTC, and the pooled vectors live in NLLB's frozen embedding space.
+  - The model's own CTC head cuts speech into one segment per **NLLB subword**. Segmentation comes from its CTC hypothesis (the test-time condition, 80 % of training batches) or from GPU CTC-Viterbi on the gold transcript.
+  - Each segment becomes one vector at the input of the LoRA-adapted NLLB encoder, in the format `[lang] e₁…e_N </s>`: `e_k = E[subword_k] + R(attention-pooled frames_k, E[subword_k], CTC confidence_k)`.
+  - `E[subword_k]` is NLLB's own embedding of the hypothesised subword. `R` is a **zero-initialised** acoustic residual.
+  - So the bridge starts as an exact cascade (it cannot collapse), token identity comes from the tokenizer (unseen words work), and end-to-end training learns where the acoustics should overrule an uncertain hypothesis.
+  - Because speech and text are token-synchronous, the NLLB-encoder outputs are matched position by position wherever the subwords agree. The decoder is also distilled (top-k) from the model's text route reading the gold transcript.
+  - My first variant regressed pooled audio straight onto subword embeddings (no hypothesis anchor). With the real NLLB it avoided collapse but did not generalise to unseen subwords (§6). It is kept as the `no_sab_anchor` ablation.
+  - Related work: CTC compression (Gaido et al. 2021), WACO (Ouyang et al. 2023), tight cascade integration (Bahar et al. 2021), cross-modal KD (Liu et al. 2019; Tang et al. 2021).
+  - What SAB adds: subword-level self-segmentation at the *MT tokenizer's* granularity, a zero-initialised acoustic residual on the hypothesis embedding, and token-synchronous encoder matching.
 - **CTC self-alignment (kept).** Now one batched GPU Viterbi shared by SAB and the TTS durations.
 - **RAPL (improved).** Route-balanced MBR; CTC and AED transcript routes; direct vs cascade translation routes.
 - **AMT-PL (kept).** The alternative route is now genuinely independent of the selected label.

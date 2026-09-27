@@ -4,7 +4,7 @@ Synthetic "speech": every character of a real Hausa Bible verse becomes 3-5 nois
 Hausa->English (World English Bible) through SAB exactly as in KORA (CE + anchoring + encoder matching + KD).
 On held-out verses we measure whether direct speech translation carries source information (SSI, distinct
 outputs) and how close it gets to the text route (NLLB translating the gold transcript).
-Run: python kora/tests/sab_learnability.py <path to ebible.json> [--no-anchor]"""
+Run: python kora/tests/sab_learnability.py <path to ebible.json> [--no-anchor] [--noise 1.2]"""
 import json
 import os
 import random
@@ -25,6 +25,7 @@ random.seed(0)
 np.random.seed(0)
 eb = json.load(open(sys.argv[1]))
 anchor = "--no-anchor" not in sys.argv
+NOISE = float(sys.argv[sys.argv.index("--noise") + 1]) if "--noise" in sys.argv else 0.3
 pairs = [(K.ctc_text(eb["ha"][v]), eb["en"][v]) for v in sorted(eb["ha"]) if v in eb["en"]]
 pairs = [p for p in pairs if 25 <= len(p[0]) <= 70 and len(p[1]) <= 90]
 random.shuffle(pairs)
@@ -38,7 +39,7 @@ def speech(text):
     frames = []
     for i in chars.encode(text):
         for _ in range(rng.integers(3, 6)):
-            frames.append(proto[i] + 0.3 * rng.standard_normal(160).astype(np.float32))
+            frames.append(proto[i] + NOISE * rng.standard_normal(160).astype(np.float32))
     return np.stack(frames)
 
 
@@ -52,11 +53,12 @@ w2v = Wav2Vec2BertModel(Wav2Vec2BertConfig(hidden_size=128, num_hidden_layers=3,
                                            mask_time_prob=0.0, left_max_position_embeddings=32,
                                            right_max_position_embeddings=8, output_hidden_size=128))
 model = K.KORA(cfg, chars, tok, nllb=nllb, speech_backbone=w2v)
+model.sab_mode = "anchored" if anchor else "acoustic"
 for p in model.speech.w2v.feature_projection.parameters():
     p.requires_grad = True   # random tiny encoder: train everything
 col = K.Collator(tok, chars, None, None)
 fake = SimpleNamespace(model=model, tc=t_, device=torch.device("cpu"), tok=tok)
-t_.sab_greedy_prob, t_.kd_topk = 0.25, 16
+t_.kd_topk = 16
 variant = K.Variant("sab", sab_anchor=anchor)
 opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=5e-4)
 
@@ -94,7 +96,7 @@ for step in range(500):
 
 model.eval()
 feat = lambda wavs: (None, None)
-refs, hyps, casc, ctc_h = [], [], [], []
+refs, hyps, casc, ctc_h, casc_ctc = [], [], [], [], []
 with torch.no_grad():
     for s in range(0, len(test), 8):
         items = test[s:s + 8]
@@ -110,7 +112,14 @@ with torch.no_grad():
         tm = model.encode_text(ids, (ids != tok.pad_id).long())
         casc += [h[0] for h in model.generate(tm, (ids != tok.pad_id).long(), ["en"] * len(items), beams=4, max_new_tokens=60)[0]]
         refs += [e for _, e in items]
-print("variant:", "SAB + anchoring/enc-match/KD" if anchor else "SAB, CE only")
+        hyp_txt = ctc_h[-len(items):]
+        ids2 = K._pad_labels([tok.src(t, "ha") for t in hyp_txt], tok.pad_id)
+        tm2 = model.encode_text(ids2, (ids2 != tok.pad_id).long())
+        casc_ctc += [h[0] for h in model.generate(tm2, (ids2 != tok.pad_id).long(), ["en"] * len(items), beams=4,
+                                                   max_new_tokens=60)[0]]
+print("variant:", "hypothesis-anchored SAB + enc-match + KD" if anchor else "acoustic-only SAB, CE only",
+      "| noise", NOISE)
+print("text route on the CTC hypothesis (plain cascade) chrF++:", round(K.chrf(refs, casc_ctc), 2))
 print("CTC CER on held-out:", round(K.cer([s for s, _ in test], ctc_h), 2))
 print("direct ST  chrF++", round(K.chrf(refs, hyps), 2), "SSI", round(K.source_sensitivity(refs, hyps), 2),
       "distinct", K.distinct_ratio(hyps))

@@ -11,13 +11,17 @@
 #     same fluent sentence per language, while the CTC head was fine (FLEURS CER 11-30 %). The speech
 #     memory produced by a randomly initialised 2-layer bridge never became readable by the frozen
 #     NLLB decoder, which fell back on its language-model prior.
-#       -> NEW Subword-Anchored Bridge (SAB): the model's own CTC alignment cuts the speech into one
-#          segment per NLLB *subword* of the transcript (gold transcript + batched CTC-Viterbi in
-#          training, CTC hypothesis at test time); every segment is attention-pooled into one vector
-#          that REPLACES the token embedding at the input of the (LoRA-adapted) NLLB encoder. Because
-#          the speech sequence is token-synchronous with the text sequence, three losses tie the two
-#          modalities together position by position: embedding anchoring, NLLB-encoder-output
-#          matching and top-k decoder distillation from the text route of the same model.
+#       -> NEW Subword-Anchored Bridge (SAB): the model's own CTC cuts the speech into one segment per
+#          NLLB *subword* of its hypothesis (or of the force-aligned transcript, batched CTC-Viterbi).
+#          Each segment becomes one vector at the input of the (LoRA-adapted) NLLB encoder:
+#          e_k = E[subword_k] + R(attention-pooled frames_k, E[subword_k], CTC confidence_k), with the
+#          acoustic residual R zero-initialised — the bridge starts as an exact cascade (it cannot
+#          collapse), token identity comes from the tokenizer (unseen words generalise) and training
+#          learns where the acoustics must overrule the hypothesis. Because speech and text sequences
+#          are token-synchronous, NLLB-encoder outputs are matched position by position wherever the
+#          subwords agree, and the decoder is distilled (top-k) from the model's own text route.
+#          (A first acoustic-only variant — pooled frames regressed onto subword embeddings — did not
+#          generalise to unseen subwords in a check with the real NLLB; it is kept as an ablation.)
 #       -> CTC warm-up curriculum before any sequence loss on speech, dev-time collapse detectors
 #          (output diversity, source-sensitivity index) and best-checkpoint selection.
 #   * "joint" decoding was AED-only (CTC only re-ranked the collapsed AED n-best) -> real two-route
@@ -409,11 +413,10 @@ class TrainConfig:
         "asr": 0.15, "st": 0.14, "mt": 0.06, "mt_bible": 0.06, "mmt": 0.10, "smmt": 0.06, "mpd": 0.10,
         "pl": 0.23})
     lambda_ctc: float = 0.5
-    lambda_anchor: float = 1.0
     lambda_encmatch: float = 1.0
     lambda_kd: float = 0.5
     kd_topk: int = 32
-    sab_greedy_prob: float = 0.25  # share of speech batches segmented by the CTC hypothesis (exposure)
+    sab_greedy_prob: float = 0.8   # share of speech batches segmented by the CTC hypothesis (= test condition)
     lambda_gate: float = 0.2
     lambda_aware: float = 0.1
     aware_margin: float = 0.05
@@ -2015,6 +2018,7 @@ class Segmentation:
     n_tok: torch.Tensor         # (B,)
     texts: List[str]
     source: List[str]           # 'viterbi' | 'greedy' | 'uniform' | 'pseudo'
+    conf: Optional[torch.Tensor] = None  # (B, N) mean max CTC posterior inside each segment
 
 
 # =============================================================================================
@@ -2448,19 +2452,28 @@ class SpeechEncoder(nn.Module):
 
 
 class SubwordAnchoredBridge(nn.Module):
-    """SAB: one vector per NLLB subword. Frames of a token segment are attention-pooled (plus mean-pooled)
-    and projected onto the scale of NLLB's (scaled) input embeddings, so the result can REPLACE the token
-    embeddings at the input of the NLLB encoder."""
+    """SAB: one vector per NLLB subword of the CTC hypothesis (or of the force-aligned transcript).
+    Anchored mode (default): e_k = E[token_k] + R(pooled frames_k, E[token_k], CTC confidence_k), where
+    E[token_k] is NLLB's own input embedding of the subword the model's CTC spelled out and R is a
+    ZERO-INITIALISED acoustic residual. At initialisation the bridge is therefore an exact cascade (it
+    cannot collapse), token identity comes from the tokenizer (unseen words generalise), and end-to-end
+    training learns where the acoustics should overrule an uncertain hypothesis.
+    Acoustic mode (ablation 'no_sab_anchor'): e_k predicted from the pooled frames alone — a learned
+    spelling->embedding map, which the learnability check showed does not generalise to unseen subwords."""
 
     def __init__(self, H: int, D: int, hidden: int, dropout: float, emb_rms: float):
         super().__init__()
         self.pre = nn.Sequential(nn.LayerNorm(H), nn.Linear(H, hidden), nn.GELU(), nn.Dropout(dropout))
         self.score = nn.Linear(hidden, 1)
+        self.res = nn.Sequential(nn.Linear(2 * hidden + D + 1, hidden), nn.GELU(), nn.Dropout(dropout),
+                                 nn.Linear(hidden, D))
+        nn.init.zeros_(self.res[-1].weight)
+        nn.init.zeros_(self.res[-1].bias)
         self.out = nn.Sequential(nn.Linear(2 * hidden, hidden), nn.GELU(), nn.Dropout(dropout), nn.Linear(hidden, D))
         self.norm = nn.LayerNorm(D)
         self.register_buffer("emb_rms", torch.tensor(float(emb_rms)))
 
-    def forward(self, h: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def pool(self, h: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         z = self.pre(h)                                                        # (B,T,hd)
         s = self.score(z).squeeze(-1).float()                                  # (B,T)
         logits = s[:, None, :].expand(-1, mask.shape[1], -1).masked_fill(~mask, float("-inf"))
@@ -2468,7 +2481,15 @@ class SubwordAnchoredBridge(nn.Module):
         att = torch.bmm(w, z)
         m = mask.to(z.dtype)
         mean = torch.bmm(m, z) / m.sum(-1, keepdim=True).clamp(min=1)
-        return self.norm(self.out(torch.cat([att, mean], -1))) * self.emb_rms
+        return torch.cat([att, mean], -1)
+
+    def forward(self, h: torch.Tensor, mask: torch.Tensor, base: Optional[torch.Tensor] = None,
+                conf: Optional[torch.Tensor] = None) -> torch.Tensor:
+        p = self.pool(h, mask)
+        if base is None:
+            return self.norm(self.out(p)) * self.emb_rms
+        x = torch.cat([p, (base / self.emb_rms).to(p.dtype), conf.to(p.dtype)[..., None]], -1)
+        return base.to(p.dtype) + self.res(x) * self.emb_rms.to(p.dtype)
 
 
 class VisualUtilityGate(nn.Module):
@@ -2669,8 +2690,8 @@ class Vocoder:
 
 class KORA(nn.Module):
     """Shared tri-modal encoder-decoder:
-         speech -> w2v-BERT -> CTC head ─┬─ CTC self-alignment -> subword segments
-                                         └─ SAB (one vector / subword) ─┐
+         speech -> w2v-BERT -> CTC head ─┬─ CTC hypothesis / self-alignment -> subword segments
+                                         └─ SAB: E[subword] + acoustic residual ─┐
          text   -> NLLB token embeddings ───────────────────────────────┴─> NLLB encoder (LoRA)
                  -> CS-VUG (image, cached SigLIP global/region/grid tokens) -> NLLB decoder (LoRA)
          chars  -> FlowTTS (durations from CTC self-alignment) -> Vocos"""
@@ -2700,6 +2721,7 @@ class KORA(nn.Module):
             ids = torch.from_numpy(np.random.default_rng(0).integers(4, V, size=min(V - 4, 20000)))
             rms = float(nllb_token_embeds(self.nllb.model.encoder, ids).float().pow(2).mean().sqrt())
         self.sab = SubwordAnchoredBridge(self.speech.hidden, d, mc.sab_hidden, mc.sab_dropout, rms)
+        self.sab_mode = "anchored"  # 'acoustic' only for the no_sab_anchor ablation (saved with checkpoints)
         self.vgate = VisualUtilityGate(mc.vis_dim, d, mc.gate_hidden, 2 + cfg.data.vis_grid ** 2)
         self.langs = list(cfg.data.african_langs)
         self.tts = FlowTTS(len(chars), len(self.langs), mc)
@@ -2750,13 +2772,30 @@ class KORA(nn.Module):
                 spans[b], tok_ids[b], source[b] = uniform_char_spans(k, max(1, lens_l[b])), None, "pseudo"
         mask = spans_to_mask(spans, lens_l, T).to(logits.device)
         n_tok = torch.tensor([len(s) for s in spans], device=logits.device)
-        return Segmentation(tok_ids=tok_ids, mask=mask, n_tok=n_tok, texts=out_texts, source=source)
+        maxp = logits.softmax(-1).max(-1).values                                    # (B,T)
+        mf = mask.float()
+        conf = (mf * maxp[:, None, :]).sum(-1) / mf.sum(-1).clamp(min=1)
+        return Segmentation(tok_ids=tok_ids, mask=mask, n_tok=n_tok, texts=out_texts, source=source, conf=conf)
 
     def speech_inputs(self, enc: dict, seg: Segmentation, src_langs: List[str]):
         """[lang] e_1..e_N [</s>] — the speech counterpart of the NLLB source format."""
-        e = self.sab(enc["h"], seg.mask)
-        B, N, D = e.shape
         emb = self.nllb.model.encoder
+        if self.sab_mode == "anchored":
+            B0, N0 = seg.mask.shape[:2]
+            ids = torch.zeros(B0, N0, dtype=torch.long, device=seg.mask.device)
+            has = torch.zeros(B0, N0, dtype=torch.bool, device=seg.mask.device)
+            for b, t in enumerate(seg.tok_ids):
+                if t:
+                    ids[b, :len(t)] = torch.tensor(t[:N0], device=ids.device)
+                    has[b, :len(t)] = True
+            with torch.no_grad():
+                base = nllb_token_embeds(emb, ids) * has[..., None].to(torch.float32)
+            e = self.sab(enc["h"], seg.mask, base, seg.conf)
+        elif self.sab_mode == "acoustic":
+            e = self.sab(enc["h"], seg.mask)
+        else:
+            raise ValueError(self.sab_mode)
+        B, N, D = e.shape
         dev = e.device
         lang_emb = nllb_token_embeds(emb, torch.tensor([self.tok.lang_ids[l] for l in src_langs], device=dev)).to(e.dtype)
         eos_emb = nllb_token_embeds(emb, torch.tensor([self.tok.eos_id], device=dev))[0].to(e.dtype)
@@ -2819,24 +2858,6 @@ class KORA(nn.Module):
         w = batch["tok_weights"].to(logp.device)[sel]
         kd = -(t_prob * logp.gather(1, t_idx)).sum(-1)
         return (kd * w).sum() / w.sum().clamp(min=1e-6)
-
-    def anchor_loss(self, e: torch.Tensor, seg: Segmentation) -> Optional[torch.Tensor]:
-        """Pooled speech vector of every subword -> the (frozen) NLLB input embedding of that subword."""
-        rows = [b for b, t in enumerate(seg.tok_ids) if t and seg.source[b] == "viterbi"]
-        if not rows:
-            return None
-        N = e.shape[1]
-        ids = torch.zeros(len(rows), N, dtype=torch.long, device=e.device)
-        valid = torch.zeros(len(rows), N, dtype=torch.bool, device=e.device)
-        for j, b in enumerate(rows):
-            t = seg.tok_ids[b][:N]
-            ids[j, :len(t)] = torch.tensor(t, device=e.device)
-            valid[j, :len(t)] = True
-        with torch.no_grad():
-            tgt = nllb_token_embeds(self.nllb.model.encoder, ids).float()
-        ef, tf = e[rows].float()[valid], tgt[valid]
-        rms2 = self.sab.emb_rms.float() ** 2
-        return ((1 - F.cosine_similarity(ef, tf, dim=-1)) + ((ef - tf) ** 2).mean(-1) / rms2).mean()
 
     # ------------------------------------------------------------------ generation ----------
     @torch.no_grad()
@@ -3258,8 +3279,9 @@ class PseudoLabeler:
         t_route = [r for _, r, _ in t_sel]
         ctc_best = [ctc_nb[i][0][0] for i in range(n)]
         aed_best = [aed_nb[i][0] if aed_nb[i] else "" for i in range(n)]
-        # translation routes: direct (SAB memory segmented by the selected transcript) and cascade
-        mem_t, mm_t, _, _ = D.memory(enc, langs, "viterbi", texts=t_star)
+        # translation routes: direct (SAB memory on the CTC hypothesis' own segmentation, independent of the
+        # selected transcript) and cascade (MT of the selected transcript)
+        mem_t, mm_t, _, _ = D.memory(enc, langs, "greedy")
         st_nb = D.nbest(mem_t, mm_t, ["en"] * n, pc.beams, pc.nbest)
         y_casc = [y[0] for y in D.translate_texts(t_star, langs, "en", pc.beams)[0]]
         y_sel = [route_mbr({"cascade": [y_casc[i]], "direct": st_nb[i]}, within=pc.mbr_within_route)
@@ -3486,7 +3508,7 @@ class Variant:
     use_mpd: bool = True
     gate_supervision: bool = True
     use_pl: bool = True
-    sab_anchor: bool = True   # SAB anchoring + encoder matching + text-route distillation
+    sab_anchor: bool = True   # hypothesis-anchored SAB + encoder matching + text-route distillation
 
 
 VARIANTS = {
@@ -3738,11 +3760,16 @@ class Trainer:
         return (l * w).sum() / w.sum().clamp(min=1e-6)
 
     def _speech_seq(self, task: str, batch: dict, variant: Variant, enc: dict, parts: dict):
-        """SAB speech->text step: segmentation, NLLB encoding, CE + (anchoring, encoder matching, KD)."""
+        """SAB speech->text step. Segmentation comes from the CTC hypothesis (the test-time condition) in
+        `sab_greedy_prob` of the batches and from the force-aligned transcript otherwise; losses: CE on the
+        targets + top-k distillation from the model's own text route reading the gold transcript +
+        token-synchronous NLLB-encoder matching wherever the segmentation's subwords equal the gold ones.
+        The 'no_sab_anchor' ablation uses acoustic-only vectors and CE only."""
         m, tc, dev = self.model, self.tc, self.device
-        greedy = variant.sab_anchor and task != "pl" and random.random() < tc.sab_greedy_prob
+        p_greedy = tc.sab_greedy_prob if variant.sab_anchor else 0.25
+        greedy = random.random() < p_greedy
         seg = m.segment(enc, batch["seg_text"], "greedy" if greedy else "viterbi")
-        mem, mmask, e = m.speech_memory(enc, seg, batch["src_lang"])
+        mem, mmask, _ = m.speech_memory(enc, seg, batch["src_lang"])
         dec_mem = mem
         if task == "smmt" and "vis" in batch:
             dec_mem, g, logit = m.fuse(mem, mmask, batch["vis"], batch["has_vis"])
@@ -3762,13 +3789,8 @@ class Trainer:
             t_mem = m.encode_text(t_ids, t_am)
             t_prob, t_idx = m.teacher_topk(t_mem, t_am.bool(), dec_in, sel, tc.kd_topk)
         parts["kd"] = tc.lambda_kd * m.kd_loss(logp, sel, t_prob, t_idx, batch)
-        if greedy:
-            return
-        a = m.anchor_loss(e, seg)
-        if a is not None:
-            parts["anchor"] = tc.lambda_anchor * a
-        # token-synchronous NLLB-encoder matching: same subwords, same positions, so position-wise MSE
-        rows = torch.tensor([seg.source[b] == "viterbi" and seg.tok_ids[b] == gold[b] for b in range(len(gold))],
+        # token-synchronous NLLB-encoder matching: same subwords at the same positions -> position-wise MSE
+        rows = torch.tensor([seg.tok_ids[b] is not None and seg.tok_ids[b] == gold[b] for b in range(len(gold))],
                             device=dev)
         if bool(rows.any()):
             Lc = min(mem.shape[1], t_mem.shape[1])
@@ -3857,7 +3879,7 @@ class Trainer:
             rng["cuda"] = torch.cuda.get_rng_state_all()
         return dict(phase=phase, step=step, model=trainable_state_dict(self.model), optimizer=opt.state_dict(),
                     scheduler=sched.state_dict(), scaler=scaler.state_dict(), teacher=self.teacher.state_dict(),
-                    rng=rng, time=time.time())
+                    rng=rng, time=time.time(), sab_mode=self.model.sab_mode)
 
     def _task_schedule(self, phase, tasks, probs, total_steps, mpd_warmup):
         """Deterministic task sequence of a phase (identical after resumption). MPD is not sampled during
@@ -3884,6 +3906,7 @@ class Trainer:
         if not w:
             raise RuntimeError(f"[{phase}] no task has data")
         self._ctc_warmup = ctc_warmup
+        self.model.sab_mode = "anchored" if variant.sab_anchor else "acoustic"
         loaders = self.make_loaders(w, pl_entries, silver, tts_entries, seed=stable_hash(phase) % 10000)
         tasks = list(w.keys())
         probs = np.asarray([w[t] for t in tasks], dtype=np.float64)
@@ -3970,7 +3993,7 @@ class Trainer:
                     LOG.info(f"[{phase}] dev: " + " ".join(f"{k}={v:.2f}" for k, v in dv.items() if isinstance(v, float)))
                     if keep_best and step + 1 > ctc_warmup and (best is None or last_dev > best):
                         best = last_dev
-                        self.ckpt.save(f"best_{phase}.pt", dict(step=step + 1, score=best,
+                        self.ckpt.save(f"best_{phase}.pt", dict(step=step + 1, score=best, sab_mode=self.model.sab_mode,
                                                                 model=trainable_state_dict(self.model, half=True)))
                         self.mark(f"best_{phase}", best)
                 if (step + 1) % self.tc.save_every == 0 and step + 1 < total_steps:
@@ -3983,7 +4006,8 @@ class Trainer:
             LOG.info(f"[{phase}] dev-selected snapshot of step {st['step']} restored (dev {best:.2f} > final {last_dev:.2f})")
             del st
         is_abl = phase.startswith("abl_")
-        blob = dict(phase=phase, step=total_steps, model=trainable_state_dict(self.model, half=is_abl))
+        blob = dict(phase=phase, step=total_steps, model=trainable_state_dict(self.model, half=is_abl),
+                    sab_mode=self.model.sab_mode)
         if phase == "stage1" or phase.startswith("round"):
             blob["teacher"] = self.teacher.state_dict()  # needed to continue training from this snapshot
         self.ckpt.save(f"final_{phase}.pt", blob)
@@ -4092,6 +4116,7 @@ class Trainer:
     def load_snapshot(self, name: str):
         st = self.ckpt.load(name)
         load_trainable_state(self.model, st["model"])
+        self.model.sab_mode = st.get("sab_mode", "anchored")
         if "teacher" in st and self.teacher is not None:
             self.teacher.load_state_dict(st["teacher"])
         del st
@@ -4279,7 +4304,7 @@ class KoraInferencer:
         D = self.dec
         enc = D.encode(wavs)
         transcripts = self._transcripts_from_enc(enc, langs, beams)
-        mem, mm, _, _ = D.memory(enc, langs, "viterbi", texts=transcripts)
+        mem, mm, _, _ = D.memory(enc, langs, "greedy")
         direct = D.nbest(mem, mm, [tgt_lang] * len(wavs), beams, min(beams, 4))
         casc = [c[0] for c in D.translate_texts(transcripts, langs, tgt_lang, beams)[0]]
         trans = [route_mbr({"direct": direct[i], "cascade": [casc[i]]}, within=self.cfg.pl.mbr_within_route)[0]
@@ -5892,7 +5917,8 @@ class ReportWriter:
 # =============================================================================================
 def export_bundle(cfg: KoraConfig, model: KORA, chars: CharVocab, mel_stats: dict, path: str):
     torch.save(dict(config=cfg.to_dict(), chars=chars.itos, model=trainable_state_dict(model), mel_stats=mel_stats,
-                    transformers=transformers.__version__, torch=torch.__version__), path + ".tmp")
+                    sab_mode=model.sab_mode, transformers=transformers.__version__, torch=torch.__version__),
+               path + ".tmp")
     os.replace(path + ".tmp", path)
     LOG.info(f"inference bundle saved to {path} ({os.path.getsize(path) / 1e6:.0f} MB)")
 
@@ -5909,6 +5935,7 @@ def load_bundle(path: str, device) -> Tuple[KORA, TextTok, CharVocab, KoraConfig
                   AutoConfig.from_pretrained(cfg.model.text_model).decoder_start_token_id)
     model = KORA(cfg, chars, tok)
     load_trainable_state(model, b["model"])
+    model.sab_mode = b.get("sab_mode", "anchored")
     model.tts.set_mel_stats(b["mel_stats"]["mean"], b["mel_stats"]["std"])
     model.tts.seen_conds = [tuple(s) for s in b["mel_stats"].get("seen_conds", [])]
     return model.to(device).eval(), tok, chars, cfg, SpeechFeaturizer(cfg.model.speech_model)
