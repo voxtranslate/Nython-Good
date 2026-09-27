@@ -39,6 +39,9 @@
 #include <sstream>
 #include <ctime>
 #include <functional>
+#include "NyBigInt.hpp"
+#include "NyStr.hpp"
+#include "NyFormat.hpp"
 
 // Platform compat (sockets, dirent, stat, getcwd, etc.) in platform_compat.hpp
 #include <locale>
@@ -118,19 +121,76 @@ static const std::set<std::string> builtin_set = {
     "hex","oct","bin","ord","chr"
 };
 
-// Safe bigint to int64_t conversion
-inline int64_t bigint_to_i64(nython::kernel::bigint bi) {
-    // Use string conversion to avoid ambiguous operator overloads in C++20
-    std::string s = bi.toString(10, false, true);
-    if (s.empty() || s == "0") return 0;
-    try { return std::stoll(s); }
-    catch (...) { return 0; }
+// ── Integers ──────────────────────────────────────────────────────────────
+// Every interpreter int is stored in a nython::kernel::bigint (Value::value.i),
+// but that class's arithmetic is not used: its multiplication is bit-serial,
+// its bitwise operators are sign-magnitude and its `long long` conversion
+// drops the sign. Ints that fit a machine word are computed as int64_t with
+// overflow checks; anything larger goes through nypy::BigInt (NyBigInt.hpp),
+// which both engines share. These convert through the limbs directly - the
+// old bigint_to_i64 went through a decimal string and std::stoll on every
+// arithmetic operation (a quarter of a call-heavy loop's time) and returned 0
+// for anything past 64 bits.
+inline bool bigint_fits_i64(const nython::kernel::bigint& b, int64_t& out) {
+    const auto& d = b.limbs();
+    size_t n = d.size();
+    while (n && d[n - 1] == 0) n--;
+    if (n == 0) { out = 0; return true; }
+    if (n > 1) return false;
+    uint64_t u = d[0];
+    if (!b.isNegative()) {
+        if (u > (uint64_t)INT64_MAX) return false;
+        out = (int64_t)u;
+        return true;
+    }
+    if (u > (uint64_t)INT64_MAX + 1) return false;
+    out = (int64_t)(~u + 1);
+    return true;
+}
+// For callers that need a machine integer (indexes, counts, sizes):
+// saturates instead of wrapping when the value does not fit.
+inline int64_t bigint_to_i64(const nython::kernel::bigint& bi) {
+    int64_t v;
+    if (bigint_fits_i64(bi, v)) return v;
+    return bi.isNegative() ? INT64_MIN : INT64_MAX;
+}
+inline nypy::BigInt bigint_to_nbig(const nython::kernel::bigint& b) {
+    nypy::BigInt r;
+    for (auto l : b.limbs()) { r.mag.push_back((uint32_t)l); r.mag.push_back((uint32_t)((uint64_t)l >> 32)); }
+    r.neg = b.isNegative();
+    r.trim();
+    return r;
+}
+inline nython::kernel::bigint nbig_to_bigint(const nypy::BigInt& n) {
+    std::vector<unsigned long long> d;
+    for (size_t i = 0; i < n.mag.size(); i += 2)
+        d.push_back((unsigned long long)n.mag[i] | (i + 1 < n.mag.size() ? (unsigned long long)n.mag[i + 1] << 32 : 0ull));
+    nython::kernel::bigint r;
+    r.assignLimbs(n.neg, std::move(d));
+    return r;
+}
+inline Value intValue(int64_t v) { return Value((long int)v); }
+inline Value intValue(const nypy::BigInt& n) {
+    int64_t v;
+    if (n.to_i64(v)) return intValue(v);
+    return Value(nbig_to_bigint(n));
+}
+inline std::string intToString(const nython::kernel::bigint& b) {
+    int64_t v;
+    if (bigint_fits_i64(b, v)) return std::to_string(v);
+    return bigint_to_nbig(b).to_string();
+}
+inline double bigint_to_double(const nython::kernel::bigint& b) {
+    int64_t v;
+    if (bigint_fits_i64(b, v)) return (double)v;
+    return bigint_to_nbig(b).to_double();
 }
 
 // Safe double extraction from Value (avoids long double -> double warning)
 inline double to_double(const Value& v) {
     if (v.type == ValueType::DOUBLE) return static_cast<double>(v.value.d);
-    if (v.type == ValueType::INTEGER) return (double)bigint_to_i64(v.value.i);
+    if (v.type == ValueType::INTEGER) return bigint_to_double(v.value.i);
+    if (v.type == ValueType::BOOLEAN) return v.value.b ? 1.0 : 0.0;
     return 0.0;
 }
 
@@ -155,6 +215,7 @@ Value dispatch_threading(NythonExecutor& E, const std::string& name, std::vector
 Value dispatch_core     (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_gui      (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_lang     (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
+Value dispatch_pycore   (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 
 
 struct NythonExecutor {
@@ -250,6 +311,19 @@ struct NythonExecutor {
             small_strs_[k] = sv;
             return sv;
         }
+        // A single multi-byte character (indexing and iterating a string go
+        // by character): shared too, like the one-byte strings.
+        if (s.size() <= 4 && (unsigned char)s[0] >= 0xC0 && nypy::u8_seq((unsigned char)s[0]) == s.size()) {
+            auto it = interned_.find(s);
+            if (it != interned_.end()) return it->second;
+            string_store.push_back(std::make_unique<std::string>(s));
+            Value cv;
+            cv.type = ValueType::USERDATA;
+            cv.value.p = (void*)string_store.back().get();
+            string_ptrs_.insert(cv.value.p);
+            interned_.emplace(s, cv);
+            return cv;
+        }
         strings_created()++;
         string_bytes_created() += (long long)s.size();
         string_store.push_back(std::make_unique<std::string>(s));
@@ -300,31 +374,6 @@ struct NythonExecutor {
         return v.toString();
     } // maps USERDATA ptr -> function identifier
 
-    // Produce a stable string key for any value (used for dict keys)
-    std::string valueToKeyString(const Value& v) {
-        if (v.type == ValueType::INTEGER) return std::to_string(bigint_to_i64(v.value.i));
-        if (v.type == ValueType::DOUBLE) return v.toString();
-        if (v.type == ValueType::BOOLEAN) return v.value.b ? "true" : "false";
-        if (v.type == ValueType::NONE) return "none";
-        if (v.type == ValueType::USERDATA && v.value.p && !func_names.count(v.value.p))
-            return *static_cast<std::string*>(v.value.p);
-        if (v.isCollectable() && v.value.gc) {
-            auto* cont = dynamic_cast<Container*>(v.value.gc);
-            if (cont && cont->container) {
-                auto len_it = cont->container->find("__len__");
-                int len = len_it != cont->container->end() ? (int)bigint_to_i64(len_it->second.value.i) : 0;
-                std::string s = "(";
-                for (int i = 0; i < len; i++) {
-                    if (i > 0) s += ", ";
-                    auto it = cont->container->find(std::to_string(i));
-                    if (it != cont->container->end()) s += valueToKeyString(it->second);
-                }
-                s += ")";
-                return s;
-            }
-        }
-        return v.toString();
-    }
 
     NythonExecutor(const NythonExecutor&) = delete;
     NythonExecutor& operator=(const NythonExecutor&) = delete;
@@ -374,6 +423,7 @@ public:   // NythonExecutor is a struct: members default to public
         global_ctx->defineByName("undefined", UNDEFINED_VALUE);
         // Built-in functions
         std::vector<std::string> builtins = {
+            "__format_value__","ascii",
             "print","println","range","len","type","str","int","float","bool",
             "input","abs","min","max","round","sorted","reversed",
             "list","tuple","dict","set","map","filter","reduce","zip",
@@ -809,279 +859,26 @@ public:   // NythonExecutor is a struct: members default to public
         } else if (an->target->type() == NodeType::ATTRIBUTE) {
             auto attr = static_pointer_cast<AttributeNode>(an->target);
             Value obj = evalNode(attr->object, ctx);
-            // Store on instance properties (USERDATA instances)
-            if (obj.type == ValueType::USERDATA && obj.value.p) {
-                auto pit = instance_properties.find(obj.value.p);
-                if (pit != instance_properties.end()) {
-                    pit->second->defineByName(attr->attr, val);
-                } else {
-                    // Might be a class object (not an instance) — store as class var
-                    void* class_ptr = obj.value.p;
-                    void* ast_ptr = class_ptr;
-                    auto ast_it = func_ast_nodes.find(class_ptr);
-                    if (ast_it != func_ast_nodes.end()) ast_ptr = ast_it->second;
-                    Node* class_node = (Node*)ast_ptr;
-                    if (class_node && func_names.find(class_ptr) != func_names.end() && class_node->type() == NodeType::CLASS) {
-                        auto* cn = static_cast<ClassNode*>(class_node);
-                        class_vars_[cn->name + "." + attr->attr] = val;
-                        // Also update class_ctx_map_ so subsequent reads via evalAttribute see the new value
-                        auto cctx_it = class_ctx_map_.find((void*)class_node);
-                        if (cctx_it != class_ctx_map_.end()) {
-                            try { cctx_it->second->setByName(attr->attr, val); }
-                            catch (...) { cctx_it->second->defineByName(attr->attr, val); }
-                        }
-                    }
-                }
-            }
-            // Store on Collectable containers
-            if (obj.isCollectable() && obj.value.gc) {
-                auto* cont = dynamic_cast<nython::kernel::Container*>(obj.value.gc);
-                if (cont && cont->container) (*cont->container)[attr->attr] = val;
-            }
+            setAttr(obj, attr->attr, val);
         } else if (an->target->type() == NodeType::SUBSCRIPT) {
             auto sub = static_pointer_cast<SubscriptNode>(an->target);
             Value obj = evalNode(sub->object, ctx);
             Value idx = evalNode(sub->index, ctx);
-            // Check for __setitem__ on instances
-            if (obj.type == ValueType::USERDATA && obj.value.p && !string_ptrs_.count(obj.value.p) && instance_to_class.count(obj.value.p)) {
-                std::vector<Value> call_args = {idx, val};
-                Value result = callMethod(obj, "__setitem__", call_args, ctx);
-                if (result.type != ValueType::NONE) return val;
-            }
-            if (obj.isCollectable() && obj.value.gc) {
-                auto* cont = dynamic_cast<Container*>(obj.value.gc);
-                if (cont && cont->container) {
-                    if (idx.type == ValueType::INTEGER) {
-                        int64_t i = bigint_to_i64(idx.value.i);
-                        if (i < 0) {
-                            auto len_it = cont->container->find("__len__");
-                            if (len_it != cont->container->end()) i += bigint_to_i64(len_it->second.value.i);
-                        }
-                        (*cont->container)[std::to_string(i)] = val;
-                    } else if (idx.type == ValueType::USERDATA) {
-                        (*cont->container)[getStringValue(idx)] = val;
-                    } else if (idx.isCollectable() && idx.value.gc) {
-                        // Tuple/list as key: use stable string representation
-                        (*cont->container)[valueToKeyString(idx)] = val;
-                    } else {
-                        (*cont->container)[idx.toString()] = val;
-                    }
-                }
-            }
+            setItem(obj, idx, val, ctx);
         } else if (an->target->type() == NodeType::CALL) {
             // Slice assignment: arr[1:3] = [20, 30] is parsed as arr.slice(1,3) = [20,30]
             auto cn = static_pointer_cast<CallNode>(an->target);
             if (cn->callee && cn->callee->type() == NodeType::ATTRIBUTE) {
                 auto attr = static_pointer_cast<AttributeNode>(cn->callee);
-                if (attr->attr == "slice" && cn->args.size() >= 2) {
+                if (attr->attr == "slice" && cn->args.size() >= 1) {
                     Value obj = evalNode(attr->object, ctx);
-                    int64_t start = bigint_to_i64(evalNode(cn->args[0], ctx).value.i);
-                    int64_t end = bigint_to_i64(evalNode(cn->args[1], ctx).value.i);
-                    if (obj.isCollectable() && obj.value.gc) {
-                        auto* cont = dynamic_cast<Container*>(obj.value.gc);
-                        if (cont && cont->container) {
-                            auto len_it = cont->container->find("__len__");
-                            int64_t old_len = (len_it != cont->container->end()) ? bigint_to_i64(len_it->second.value.i) : 0;
-                            if (start < 0) start += old_len;
-                            if (end < 0) end += old_len;
-                            if (start < 0) start = 0;
-                            if (end > old_len) end = old_len;
-                            int64_t slice_len = end - start;
-                            // Get replacement values
-                            int64_t repl_len = 0;
-                            Container* repl_cont = nullptr;
-                            if (val.isCollectable() && val.value.gc) {
-                                repl_cont = dynamic_cast<Container*>(val.value.gc);
-                                if (repl_cont && repl_cont->container) {
-                                    auto rl = repl_cont->container->find("__len__");
-                                    repl_len = (rl != repl_cont->container->end()) ? bigint_to_i64(rl->second.value.i) : 0;
-                                }
-                            }
-                            int64_t new_len = old_len - slice_len + repl_len;
-                            // Shift elements after the slice
-                            if (repl_len != slice_len) {
-                                if (repl_len < slice_len) {
-                                    // Shrinking: shift left
-                                    for (int64_t i = end; i < old_len; i++) {
-                                        auto it2 = cont->container->find(std::to_string(i));
-                                        if (it2 != cont->container->end())
-                                            (*cont->container)[std::to_string(i - slice_len + repl_len)] = it2->second;
-                                    }
-                                    // Remove trailing
-                                    for (int64_t i = new_len; i < old_len; i++)
-                                        cont->container->erase(std::to_string(i));
-                                } else {
-                                    // Growing: shift right (from end)
-                                    for (int64_t i = old_len - 1; i >= end; i--) {
-                                        auto it2 = cont->container->find(std::to_string(i));
-                                        if (it2 != cont->container->end())
-                                            (*cont->container)[std::to_string(i + repl_len - slice_len)] = it2->second;
-                                    }
-                                }
-                            }
-                            // Insert replacement values
-                            if (repl_cont && repl_cont->container) {
-                                for (int64_t i = 0; i < repl_len; i++) {
-                                    auto it2 = repl_cont->container->find(std::to_string(i));
-                                    if (it2 != repl_cont->container->end())
-                                        (*cont->container)[std::to_string(start + i)] = it2->second;
-                                }
-                            }
-                            (*cont->container)["__len__"] = Value(static_cast<int>(new_len));
-                        }
-                    }
+                    std::vector<Value> sargs;
+                    for (auto& an2 : cn->args) sargs.push_back(evalNode(an2, ctx));
+                    assignSlice(obj, sargs, val, ctx);
                 }
             }
         }
         return val;
-    }
-
-    Value evalAugAssignment(node_ptr node, Context* ctx) {
-        auto an = static_pointer_cast<AugAssignNode>(node);
-        Value old_val = evalNode(an->target, ctx);
-        Value new_val = evalNode(an->value_node, ctx);
-        Value result;
-        if (an->op == "+=") {
-            // String concatenation
-            if (old_val.type == ValueType::USERDATA || new_val.type == ValueType::USERDATA) {
-                result = makeStringValue(getStringValue(old_val) + getStringValue(new_val));
-            } else {
-                result = old_val + new_val;
-            }
-        }
-        else if (an->op == "-=") result = old_val - new_val;
-        else if (an->op == "*=") result = old_val * new_val;
-        else if (an->op == "/=") {
-            if (old_val.type == ValueType::INTEGER && new_val.type == ValueType::INTEGER) {
-                double a = static_cast<double>(bigint_to_i64(old_val.value.i));
-                double b = static_cast<double>(bigint_to_i64(new_val.value.i));
-                if (b == 0) throw std::string("__exc__:ZeroDivisionError:division by zero");
-                result = Value(a / b);
-            } else result = old_val / new_val;
-        }
-        else if (an->op == "%=") {
-            if (old_val.type == ValueType::DOUBLE || new_val.type == ValueType::DOUBLE) {
-                double a = old_val.type == ValueType::DOUBLE ? static_cast<double>(old_val.value.d) : static_cast<double>(bigint_to_i64(old_val.value.i));
-                double b = new_val.type == ValueType::DOUBLE ? static_cast<double>(new_val.value.d) : static_cast<double>(bigint_to_i64(new_val.value.i));
-                result = Value(std::fmod(a, b));
-            } else result = old_val % new_val;
-        }
-        else if (an->op == "**=") {
-            if (old_val.type == ValueType::DOUBLE || new_val.type == ValueType::DOUBLE) {
-                double a = old_val.type == ValueType::DOUBLE ? static_cast<double>(old_val.value.d) : static_cast<double>(bigint_to_i64(old_val.value.i));
-                double b = new_val.type == ValueType::DOUBLE ? static_cast<double>(new_val.value.d) : static_cast<double>(bigint_to_i64(new_val.value.i));
-                result = Value(std::pow(a, b));
-            }
-            else if (old_val.type == ValueType::INTEGER && new_val.type == ValueType::INTEGER) {
-                int64_t base = bigint_to_i64(old_val.value.i);
-                int64_t exp = bigint_to_i64(new_val.value.i);
-                int64_t r = 1;
-                for (int64_t i = 0; i < exp; i++) r *= base;
-                result = Value(static_cast<int>(r));
-            } else {
-                double a = old_val.type == ValueType::DOUBLE ? static_cast<double>(old_val.value.d) : static_cast<double>(bigint_to_i64(old_val.value.i));
-                double b = new_val.type == ValueType::DOUBLE ? static_cast<double>(new_val.value.d) : static_cast<double>(bigint_to_i64(new_val.value.i));
-                result = Value(std::pow(a, b));
-            }
-        }
-        else if (an->op == "//=" || an->op == "\\=") {
-            double da = old_val.type == ValueType::DOUBLE ? static_cast<double>(old_val.value.d) : static_cast<double>(bigint_to_i64(old_val.value.i));
-            double db = new_val.type == ValueType::DOUBLE ? static_cast<double>(new_val.value.d) : static_cast<double>(bigint_to_i64(new_val.value.i));
-            if (db == 0) throw std::string("__exc__:ZeroDivisionError:division by zero");
-            result = Value(static_cast<int>(std::floor(da / db)));
-        }
-        else if (an->op == "&=") {
-            int64_t a = old_val.type == ValueType::DOUBLE ? static_cast<int64_t>(old_val.value.d) : bigint_to_i64(old_val.value.i);
-            int64_t b = new_val.type == ValueType::DOUBLE ? static_cast<int64_t>(new_val.value.d) : bigint_to_i64(new_val.value.i);
-            result = Value(static_cast<int>(a & b));
-        }
-        else if (an->op == "|=") {
-            int64_t a = old_val.type == ValueType::DOUBLE ? static_cast<int64_t>(old_val.value.d) : bigint_to_i64(old_val.value.i);
-            int64_t b = new_val.type == ValueType::DOUBLE ? static_cast<int64_t>(new_val.value.d) : bigint_to_i64(new_val.value.i);
-            result = Value(static_cast<int>(a | b));
-        }
-        else if (an->op == "^=") {
-            int64_t a = old_val.type == ValueType::DOUBLE ? static_cast<int64_t>(old_val.value.d) : bigint_to_i64(old_val.value.i);
-            int64_t b = new_val.type == ValueType::DOUBLE ? static_cast<int64_t>(new_val.value.d) : bigint_to_i64(new_val.value.i);
-            result = Value(static_cast<int>(a ^ b));
-        }
-        else if (an->op == "<<=") {
-            int64_t a = old_val.type == ValueType::DOUBLE ? static_cast<int64_t>(old_val.value.d) : bigint_to_i64(old_val.value.i);
-            int64_t b = new_val.type == ValueType::DOUBLE ? static_cast<int64_t>(new_val.value.d) : bigint_to_i64(new_val.value.i);
-            result = Value(static_cast<int>(a << b));
-        }
-        else if (an->op == ">>=" || an->op == ">>>=") {
-            // `>>>=` (ShiftAssign, unsigned/logical right shift) parsed
-            // fine (Parser::isAugAssign) but had no case here, so it
-            // silently fell to `else result = new_val;` below - the shift
-            // was discarded and the target just became the shift amount.
-            // Integers here are arbitrary-precision (bigint), which has no
-            // fixed bit width to zero-fill from, so there is no daylight
-            // between "arithmetic" and "logical" right shift to preserve;
-            // treated as the same operation as `>>=`.
-            int64_t a = old_val.type == ValueType::DOUBLE ? static_cast<int64_t>(old_val.value.d) : bigint_to_i64(old_val.value.i);
-            int64_t b = new_val.type == ValueType::DOUBLE ? static_cast<int64_t>(new_val.value.d) : bigint_to_i64(new_val.value.i);
-            result = Value(static_cast<int>(a >> b));
-        }
-        else if (an->op == "~=") {
-            // No natural binary reading of "complement" exists, so this is
-            // a judgment call, documented here rather than left a silent
-            // no-op: `x ~= y` assigns the bitwise complement of the RIGHT
-            // operand to x (`x = ~y`), the same relationship `x = ~x` has
-            // to bare `~x` (complement-then-assign), extended to two
-            // operands the way every other compound assignment reads
-            // `x op= y` as `x = x op y`. Old x is discarded, not combined.
-            int64_t b = new_val.type == ValueType::DOUBLE ? static_cast<int64_t>(new_val.value.d) : bigint_to_i64(new_val.value.i);
-            result = Value(static_cast<int>(~b));
-        }
-        else result = new_val;
-        if (an->target->type() == NodeType::VARIABLE) {
-            ctx->setByName(static_pointer_cast<VariableNode>(an->target)->name, result);
-        } else if (an->target->type() == NodeType::SUBSCRIPT) {
-            // arr[i] += val
-            auto sub = static_pointer_cast<SubscriptNode>(an->target);
-            Value obj = evalNode(sub->object, ctx);
-            Value idx = evalNode(sub->index, ctx);
-            if (obj.isCollectable() && obj.value.gc) {
-                auto* cont = dynamic_cast<Container*>(obj.value.gc);
-                if (cont && cont->container) {
-                    std::string key;
-                    if (idx.type == ValueType::INTEGER) key = std::to_string(bigint_to_i64(idx.value.i));
-                    else key = getStringValue(idx);
-                    (*cont->container)[key] = result;
-                }
-            }
-        } else if (an->target->type() == NodeType::ATTRIBUTE) {
-            // obj.field += val
-            auto attr = static_pointer_cast<AttributeNode>(an->target);
-            Value obj = evalNode(attr->object, ctx);
-            if (obj.type == ValueType::USERDATA && obj.value.p) {
-                auto pit = instance_properties.find(obj.value.p);
-                if (pit != instance_properties.end())
-                    pit->second->setByName(attr->attr, result);
-                else {
-                    // Class variable aug-assign (Counter.count += 1)
-                    void* ast_ptr = obj.value.p;
-                    auto ast_it = func_ast_nodes.find(obj.value.p);
-                    if (ast_it != func_ast_nodes.end()) ast_ptr = ast_it->second;
-                    Node* class_node = (Node*)ast_ptr;
-                    if (class_node && class_node->type() == NodeType::CLASS) {
-                        auto* cn = static_cast<ClassNode*>(class_node);
-                        class_vars_[cn->name + "." + attr->attr] = result;
-                        auto cctx_it = class_ctx_map_.find((void*)class_node);
-                        if (cctx_it != class_ctx_map_.end()) {
-                            try { cctx_it->second->setByName(attr->attr, result); }
-                            catch (...) { cctx_it->second->defineByName(attr->attr, result); }
-                        }
-                    }
-                }
-            }
-            if (obj.isCollectable() && obj.value.gc) {
-                auto* cont = dynamic_cast<Container*>(obj.value.gc);
-                if (cont && cont->container) (*cont->container)[attr->attr] = result;
-            }
-        }
-        return result;
     }
 
     // ─── EXPRESSIONS ────────────────────────────────────────────────────
@@ -1107,17 +904,15 @@ public:   // NythonExecutor is a struct: members default to public
         }
         return out;
     }
-    Value build_set_val(std::vector<Value> items) {
+    Value build_set_val(const std::vector<Value>& items) {
         auto* obj = new Object((Runnable*)runner, "list", Type::LIST);
         obj->set("__set__", Value(1));
-        int idx = 0;
-        std::vector<std::string> seen;
+        int64_t idx = 0;
+        std::unordered_set<std::string> seen;
         for (auto& v : items) {
-            std::string k = set_key_str(v);
-            bool dup = false; for (auto& s : seen) if (s==k){dup=true;break;}
-            if (!dup) { seen.push_back(k); obj->set(std::to_string(idx++), v); }
+            if (seen.insert(set_key_str(v)).second) (*obj->container)[std::to_string(idx++)] = v;
         }
-        obj->set("__len__", Value(idx));
+        (*obj->container)["__len__"] = intValue(idx);
         return Value((Collectable*)obj);
     }
     Value setUnion(const Value& a, const Value& b) {
@@ -1163,580 +958,444 @@ public:   // NythonExecutor is a struct: members default to public
         return build_set_val(result);
     }
 
-    Value evalBinary(node_ptr node, Context* ctx) {
-        auto bn = static_pointer_cast<BinaryNode>(node);
-        // Short-circuit for logical ops
-        if (bn->op == "and" || bn->op == "&&") {
-            Value lv = evalNode(bn->left, ctx);
-            if (lv.isFalse() || lv.isNone()) return Value(false);
-            return evalNode(bn->right, ctx);
+    // ─── VALUE KINDS ────────────────────────────────────────────────────
+    // Lists, tuples and sets are Containers keyed "0".."n-1" plus "__len__"
+    // ("__tuple__" / "__set__" mark the latter two); dicts are Containers
+    // without "__len__". Strings, functions, classes and instances are
+    // USERDATA pointers told apart by the side tables.
+    Container* contOf(const Value& v) const {
+        if (!v.isCollectable() || !v.value.gc) return nullptr;
+        auto* c = dynamic_cast<Container*>(v.value.gc);
+        return (c && c->container) ? c : nullptr;
+    }
+    // Length of a list/tuple/set container, -1 if it is not one.
+    static int64_t seqLen(Container* c) {
+        auto it = c->container->find("__len__");
+        if (it == c->container->end()) return -1;
+        return bigint_to_i64(it->second.value.i);
+    }
+    static bool isTupleCont(Container* c) { return c->container->count("__tuple__") > 0; }
+    static bool isSetCont(Container* c) { return c->container->count("__set__") > 0; }
+    static bool isGenCont(Container* c) { return c->container->count("__gen__") > 0; }
+    bool isInstanceVal(const Value& v) const {
+        return v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p)
+            && instance_to_class.count(v.value.p);
+    }
+    static std::vector<Value> seqItems(Container* c) {
+        std::vector<Value> out;
+        int64_t n = seqLen(c);
+        if (n <= 0) return out;
+        out.reserve((size_t)n);
+        for (int64_t i = 0; i < n; i++) {
+            auto it = c->container->find(std::to_string(i));
+            if (it != c->container->end()) out.push_back(it->second);
         }
-        if (bn->op == "or" || bn->op == "||") {
-            Value lv = evalNode(bn->left, ctx);
-            if (lv.isTrue()) return lv;
-            return evalNode(bn->right, ctx);
-        }
-        if (bn->op == "xor" || bn->op == "^^") {
-            Value lv = evalNode(bn->left, ctx);
-            Value rv = evalNode(bn->right, ctx);
-            bool lb = isTruthy(lv);
-            bool rb = isTruthy(rv);
-            return Value(lb != rb); // XOR: true when exactly one is true
-        }
+        return out;
+    }
+    Value makeListValue(const std::vector<Value>& items, bool tuple = false) {
+        auto* obj = new Object((Runnable*)runner, tuple ? "tuple" : "list", Type::LIST);
+        int64_t i = 0;
+        for (auto& v : items) (*obj->container)[std::to_string(i++)] = v;
+        (*obj->container)["__len__"] = intValue(i);
+        if (tuple) (*obj->container)["__tuple__"] = Value(1);
+        return Value((Collectable*)obj);
+    }
+    // Raises a Python exception the way the interpreter represents them.
+    [[noreturn]] static void pyRaise(const std::string& type, const std::string& msg) {
+        throw std::string("__exc__:" + type + ":" + msg);
+    }
+    // Runs a shared-library (nypy) operation, converting its errors.
+    template<class F> auto nyCall(F&& f) -> decltype(f()) {
+        try { return f(); }
+        catch (nypy::PyError& e) { pyRaise(e.type, e.msg); }
+    }
 
-        Value lv = evalNode(bn->left, ctx);
-        Value rv = evalNode(bn->right, ctx);
+    // ─── NUMBERS ────────────────────────────────────────────────────────
+    // A numeric operand: k = 1 machine int, 2 big int, 3 float. bool is an
+    // int, as in Python (True + True == 2).
+    struct Num { int k = 0; int64_t i = 0; double d = 0.0; const nython::kernel::bigint* b = nullptr; };
+    static bool asNum(const Value& v, Num& n) {
+        switch (v.type) {
+            case ValueType::BOOLEAN: n.k = 1; n.i = v.value.b ? 1 : 0; return true;
+            case ValueType::INTEGER:
+                if (bigint_fits_i64(v.value.i, n.i)) n.k = 1; else { n.k = 2; n.b = &v.value.i; }
+                return true;
+            case ValueType::DOUBLE: n.k = 3; n.d = (double)v.value.d; return true;
+            default: return false;
+        }
+    }
+    static nypy::BigInt numBig(const Num& n) { return n.k == 2 ? bigint_to_nbig(*n.b) : nypy::BigInt(n.i); }
+    static double numD(const Num& n) { return n.k == 3 ? n.d : n.k == 2 ? bigint_to_double(*n.b) : (double)n.i; }
+    static bool numIsZero(const Num& n) { return n.k == 3 ? n.d == 0.0 : n.k == 1 ? n.i == 0 : false; }
+    static bool numIsNeg(const Num& n) { return n.k == 3 ? n.d < 0 : n.k == 1 ? n.i < 0 : n.b->isNegative(); }
+    // -1/0/1, or 2 when unordered (a NaN is involved).
+    static int numCmp(const Num& a, const Num& b) {
+        if (a.k == 1 && b.k == 1) return a.i < b.i ? -1 : a.i > b.i ? 1 : 0;
+        return nypy::num_cmp(toNumV(a), toNumV(b));
+    }
+    enum BinOpCode {
+        OP_UNKNOWN = 0, OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_FLOORDIV, OP_MOD, OP_POW,
+        OP_BAND, OP_BOR, OP_BXOR, OP_LSHIFT, OP_RSHIFT,
+        OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE, OP_SEQ, OP_SNE,
+        OP_IS, OP_ISNOT, OP_IN, OP_NOTIN, OP_AND, OP_OR, OP_LXOR
+    };
+    static int binOpCode(const std::string& op) {
+        switch (op.size()) {
+            case 1: switch (op[0]) {
+                case '+': return OP_ADD; case '-': return OP_SUB; case '*': return OP_MUL;
+                case '/': return OP_DIV; case '%': return OP_MOD; case '&': return OP_BAND;
+                case '|': return OP_BOR; case '^': return OP_BXOR; case '<': return OP_LT;
+                case '>': return OP_GT; case '\\': return OP_FLOORDIV;
+                default: return OP_UNKNOWN; }
+            case 2:
+                if (op == "//") return OP_FLOORDIV; if (op == "**") return OP_POW;
+                if (op == "==") return OP_EQ; if (op == "!=") return OP_NE;
+                if (op == "<=") return OP_LE; if (op == ">=") return OP_GE;
+                if (op == "<<") return OP_LSHIFT; if (op == ">>") return OP_RSHIFT;
+                if (op == "is") return OP_IS; if (op == "in") return OP_IN;
+                if (op == "or" || op == "||") return OP_OR; if (op == "&&") return OP_AND;
+                if (op == "^^") return OP_LXOR;
+                return OP_UNKNOWN;
+            case 3:
+                if (op == "and") return OP_AND; if (op == "xor") return OP_LXOR;
+                if (op == "===") return OP_SEQ; if (op == "!==") return OP_SNE;
+                if (op == ">>>") return OP_RSHIFT;
+                return OP_UNKNOWN;
+            default:
+                if (op == "not in") return OP_NOTIN; if (op == "is not") return OP_ISNOT;
+                if (op == "instanceof") return OP_IS; if (op == "equals") return OP_SEQ;
+                return OP_UNKNOWN;
+        }
+    }
+    static const char* opSymbol(int opc) {
+        static const char* s[] = {"?", "+", "-", "*", "/", "//", "%", "**", "&", "|", "^", "<<", ">>",
+                                  "==", "!=", "<", "<=", ">", ">=", "===", "!==", "is", "is not", "in", "not in", "and", "or", "xor"};
+        return (opc >= 0 && opc <= OP_LXOR) ? s[opc] : "?";
+    }
+    // Arithmetic on two numbers: nypy::arith (NyBigInt.hpp), shared with
+    // the VM. The OP_ codes 1..12 are nypy::ArithOp's.
+    static nypy::NumV toNumV(const Num& n) {
+        if (n.k == 3) return nypy::NumV::F(n.d);
+        if (n.k == 1) return nypy::NumV::I(n.i);
+        return nypy::NumV::B(bigint_to_nbig(*n.b));
+    }
+    static Value fromNumV(const nypy::NumV& n) {
+        if (n.k == 3) return Value(n.d);
+        if (n.k == 1) return intValue(n.i);
+        return intValue(n.b);
+    }
+    Value numArith(int opc, const Num& a, const Num& b) {
+        if (opc <= OP_SUB && a.k == 1 && b.k == 1) {   // the common case, inline
+            int64_t r;
+            if (!(opc == OP_ADD ? nypy::add_ovf(a.i, b.i, r) : nypy::sub_ovf(a.i, b.i, r))) return intValue(r);
+        }
+        return nyCall([&] { return fromNumV(nypy::arith(opc, toNumV(a), toNumV(b))); });
+    }
 
-        // Operator overloading: check for dunder methods on instances
-        if (lv.type == ValueType::USERDATA && lv.value.p && !string_ptrs_.count(lv.value.p) && instance_to_class.count(lv.value.p)) {
-            std::string dunder;
-            if (bn->op == "+") dunder = "__add__";
-            else if (bn->op == "-") dunder = "__sub__";
-            else if (bn->op == "*") dunder = "__mul__";
-            else if (bn->op == "/") dunder = "__div__";
-            else if (bn->op == "%") dunder = "__mod__";
-            else if (bn->op == "**") dunder = "__pow__";
-            else if (bn->op == "//") dunder = "__floordiv__";
-            else if (bn->op == "&") dunder = "__and__";
-            else if (bn->op == "|") dunder = "__or__";
-            else if (bn->op == "^") dunder = "__xor__";
-            else if (bn->op == "<<") dunder = "__lshift__";
-            else if (bn->op == ">>") dunder = "__rshift__";
-            else if (bn->op == "<") dunder = "__lt__";
-            else if (bn->op == ">") dunder = "__gt__";
-            else if (bn->op == "<=") dunder = "__le__";
-            else if (bn->op == ">=") dunder = "__ge__";
-            else if (bn->op == "==") dunder = "__eq__";
-            else if (bn->op == "!=") dunder = "__ne__";
-            if (!dunder.empty()) {
+    // ─── ORDERING ───────────────────────────────────────────────────────
+    // Python ordering for the built-in types: numbers, strings (code point
+    // order - UTF-8 byte order is the same), and lists/tuples element by
+    // element. Returns false when the two are not comparable (the operators
+    // then read false, as they always have here, rather than raising).
+    bool orderValues(const Value& a, const Value& b, int& res, Context* ctx, int depth = 0) {
+        Num x, y;
+        if (asNum(a, x) && asNum(b, y)) { res = numCmp(x, y); return res != 2; }
+        bool as = isStringValue(a), bs = isStringValue(b);
+        if (as && bs) {
+            int c = ((std::string*)a.value.p)->compare(*(std::string*)b.value.p);
+            res = c < 0 ? -1 : c > 0 ? 1 : 0;
+            return true;
+        }
+        if (as || bs) return false;
+        Container* ca = contOf(a); Container* cb = contOf(b);
+        if (ca && cb && depth < 100) {
+            int64_t la = seqLen(ca), lb = seqLen(cb);
+            if (la < 0 || lb < 0) return false;
+            for (int64_t i = 0; i < la && i < lb; i++) {
+                auto ia = ca->container->find(std::to_string(i));
+                auto ib = cb->container->find(std::to_string(i));
+                if (ia == ca->container->end() || ib == cb->container->end()) return false;
+                if (valuesEqual(ia->second, ib->second, depth + 1)) continue;
+                return orderValues(ia->second, ib->second, res, ctx, depth + 1);
+            }
+            res = la < lb ? -1 : la > lb ? 1 : 0;
+            return true;
+        }
+        if (isInstanceVal(a) && ctx) {
+            std::vector<Value> args1 = {b};
+            Value lt = callMethod(a, "__lt__", args1, ctx);
+            if (lt.type == ValueType::BOOLEAN) {
+                if (lt.value.b) { res = -1; return true; }
+                std::vector<Value> args2 = {b};
+                Value eq = callMethod(a, "__eq__", args2, ctx);
+                res = (eq.type == ValueType::BOOLEAN && eq.value.b) ? 0 : 1;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // `x in c`
+    bool containsValue(const Value& c, const Value& x, Context* ctx) {
+        if (isInstanceVal(c)) {
+            std::vector<Value> args = {x};
+            Value r = callMethod(c, "__contains__", args, ctx);
+            if (r.type == ValueType::BOOLEAN) return r.value.b;
+        }
+        if (isStringValue(c)) {
+            if (!isStringValue(x)) pyRaise("TypeError", "'in <string>' requires string as left operand");
+            return ((std::string*)c.value.p)->find(*(std::string*)x.value.p) != std::string::npos;
+        }
+        Container* cont = contOf(c);
+        if (!cont) return false;
+        int64_t n = seqLen(cont);
+        if (n >= 0) {
+            for (int64_t i = 0; i < n; i++) {
+                auto it = cont->container->find(std::to_string(i));
+                if (it != cont->container->end() && valuesEqual(x, it->second, 0)) return true;
+            }
+            return false;
+        }
+        return dictFind(cont, x) != cont->container->end();
+    }
+
+    // ─── BINARY OPERATORS ───────────────────────────────────────────────
+    Value binaryOp(int opc, Value lv, Value rv, Context* ctx) {
+        // Operator overloading on instances.
+        if (isInstanceVal(lv)) {
+            const char* dunder = nullptr;
+            switch (opc) {
+                case OP_ADD: dunder = "__add__"; break; case OP_SUB: dunder = "__sub__"; break;
+                case OP_MUL: dunder = "__mul__"; break; case OP_DIV: dunder = "__truediv__"; break;
+                case OP_MOD: dunder = "__mod__"; break; case OP_POW: dunder = "__pow__"; break;
+                case OP_FLOORDIV: dunder = "__floordiv__"; break; case OP_BAND: dunder = "__and__"; break;
+                case OP_BOR: dunder = "__or__"; break; case OP_BXOR: dunder = "__xor__"; break;
+                case OP_LSHIFT: dunder = "__lshift__"; break; case OP_RSHIFT: dunder = "__rshift__"; break;
+                case OP_LT: dunder = "__lt__"; break; case OP_GT: dunder = "__gt__"; break;
+                case OP_LE: dunder = "__le__"; break; case OP_GE: dunder = "__ge__"; break;
+                case OP_EQ: dunder = "__eq__"; break; case OP_NE: dunder = "__ne__"; break;
+                default: break;
+            }
+            if (dunder) {
                 std::vector<Value> call_args = {rv};
                 Value result = callMethod(lv, dunder, call_args, ctx);
-                if (result.type != ValueType::NONE || dunder == "__eq__" || dunder == "__ne__") {
-                    // Only use dunder result if it didn't return none (method exists)
-                    // For __eq__/__ne__, none means no method, but we need to check
-                    // Try to detect if method actually existed:
-                    // If result is NONE and it's not __eq__/__ne__, fall through
+                if (result.type != ValueType::NONE) return result;
+                if (opc == OP_DIV) {
+                    std::vector<Value> call_args2 = {rv};
+                    result = callMethod(lv, "__div__", call_args2, ctx);
                     if (result.type != ValueType::NONE) return result;
                 }
             }
         }
-
-        if (bn->op == "+") {
-            // List concatenation
-            if (lv.type == ValueType::COLLECTABLE && rv.type == ValueType::COLLECTABLE) {
-                auto* lc = dynamic_cast<Container*>(lv.value.gc);
-                auto* rc = dynamic_cast<Container*>(rv.value.gc);
-                if (lc && rc && lc->container && rc->container) {
-                    auto li = lc->container->find("__len__");
-                    auto ri = rc->container->find("__len__");
-                    if (li != lc->container->end() && ri != rc->container->end()) {
-                        int ll = (int)bigint_to_i64(li->second.value.i);
-                        int rl = (int)bigint_to_i64(ri->second.value.i);
-                        auto* result = new Object((Runnable*)runner, "list", Type::LIST);
-                        int idx = 0;
-                        for (int i = 0; i < ll; i++) {
-                            auto it = lc->container->find(std::to_string(i));
-                            if (it != lc->container->end()) result->set(std::to_string(idx++), it->second);
-                        }
-                        for (int i = 0; i < rl; i++) {
-                            auto it = rc->container->find(std::to_string(i));
-                            if (it != rc->container->end()) result->set(std::to_string(idx++), it->second);
-                        }
-                        result->set("__len__", Value(idx));
-                        return Value((Collectable*)result);
-                    }
-                }
+        Num x, y;
+        bool nums = asNum(lv, x) && asNum(rv, y);
+        switch (opc) {
+        case OP_ADD: {
+            if (nums) return numArith(opc, x, y);
+            bool ls = isStringValue(lv), rs = isStringValue(rv);
+            if (ls && rs) return makeStringValue(*(std::string*)lv.value.p + *(std::string*)rv.value.p);
+            Container* lc = contOf(lv); Container* rc = contOf(rv);
+            if (lc && rc && seqLen(lc) >= 0 && seqLen(rc) >= 0) {
+                std::vector<Value> items = seqItems(lc);
+                for (auto& v : seqItems(rc)) items.push_back(v);
+                return makeListValue(items, isTupleCont(lc) && isTupleCont(rc));
             }
-            // Integer addition
-            if (lv.type == ValueType::INTEGER && rv.type == ValueType::INTEGER) {
-                return Value(bigint(bigint_to_i64(lv.value.i) + bigint_to_i64(rv.value.i)));
-
-            }
-            // Mixed int/float
-            if ((lv.type == ValueType::INTEGER && rv.type == ValueType::DOUBLE) ||
-                (lv.type == ValueType::DOUBLE && rv.type == ValueType::INTEGER) ||
-                (lv.type == ValueType::DOUBLE && rv.type == ValueType::DOUBLE)) {
-                double a = (lv.type == ValueType::DOUBLE) ? (double)lv.value.d : (double)bigint_to_i64(lv.value.i);
-                double b = (rv.type == ValueType::DOUBLE) ? (double)rv.value.d : (double)bigint_to_i64(rv.value.i);
-                return Value(static_cast<double>(a + b));
-            }
-            // String concatenation
-            if (lv.type == ValueType::USERDATA && rv.type == ValueType::USERDATA) {
+            // Lenient: a string on either side concatenates the other's text.
+            if (ls || rs || lv.type == ValueType::USERDATA || rv.type == ValueType::USERDATA)
                 return makeStringValue(getStringValue(lv) + getStringValue(rv));
-            }
-            if (lv.type == ValueType::USERDATA || rv.type == ValueType::USERDATA) {
-                return makeStringValue(getStringValue(lv) + getStringValue(rv));
-            }
             return lv + rv;
         }
-        if (bn->op == "-") {
+        case OP_SUB:
+            if (nums) return numArith(opc, x, y);
             if (lv.isCollectable() && rv.isCollectable()) return setDiff(lv, rv);
-            if (lv.type == ValueType::INTEGER && rv.type == ValueType::INTEGER) {
-                return Value(bigint(bigint_to_i64(lv.value.i) - bigint_to_i64(rv.value.i)));
-
-            }
-            if ((lv.type == ValueType::INTEGER && rv.type == ValueType::DOUBLE) ||
-                (lv.type == ValueType::DOUBLE && rv.type == ValueType::INTEGER) ||
-                (lv.type == ValueType::DOUBLE && rv.type == ValueType::DOUBLE)) {
-                double a = (lv.type == ValueType::DOUBLE) ? (double)lv.value.d : (double)bigint_to_i64(lv.value.i);
-                double b = (rv.type == ValueType::DOUBLE) ? (double)rv.value.d : (double)bigint_to_i64(rv.value.i);
-                return Value(static_cast<double>(a - b));
-            }
             return lv - rv;
-        }
-        if (bn->op == "*") {
-            if (lv.type == ValueType::INTEGER && rv.type == ValueType::INTEGER) {
-                int64_t a = bigint_to_i64(lv.value.i);
-                int64_t b = bigint_to_i64(rv.value.i);
-                return Value(bigint(a * b));
-            }
-            if ((lv.type == ValueType::INTEGER && rv.type == ValueType::DOUBLE) ||
-                (lv.type == ValueType::DOUBLE && rv.type == ValueType::INTEGER) ||
-                (lv.type == ValueType::DOUBLE && rv.type == ValueType::DOUBLE)) {
-                double a = (lv.type == ValueType::DOUBLE) ? (double)lv.value.d : (double)bigint_to_i64(lv.value.i);
-                double b = (rv.type == ValueType::DOUBLE) ? (double)rv.value.d : (double)bigint_to_i64(rv.value.i);
-                return Value(static_cast<double>(a * b));
-            }
-            if (lv.type == ValueType::USERDATA && rv.type == ValueType::INTEGER) {
-                std::string s = getStringValue(lv), r;
-                for (int64_t i = 0; i < bigint_to_i64(rv.value.i); i++) r += s;
-                return makeStringValue(r);
-            }
-            
-            // Reverse: int * string  ->  3 * "ab" = "ababab"
-            if (lv.type == ValueType::INTEGER && rv.type == ValueType::USERDATA) {
-                int times = static_cast<int>(bigint_to_i64(lv.value.i));
-                std::string s = getStringValue(rv);
-                std::string result;
-                for (int i = 0; i < times; i++) result += s;
-                return makeStringValue(result);
-            }
-            // Reverse: int * list  ->  3 * [1,2] = [1,2,1,2,1,2]
-            if (lv.type == ValueType::INTEGER && rv.isCollectable()) {
-                auto* cont = dynamic_cast<Container*>(rv.value.gc);
-                if (cont && cont->container) {
-                    auto len_it = cont->container->find("__len__");
-                    int len = (len_it != cont->container->end()) ? static_cast<int>(bigint_to_i64(len_it->second.value.i)) : 0;
-                    int times = static_cast<int>(bigint_to_i64(lv.value.i));
-                    Object* result = new Object((Runnable*)runner, "list", Type::LIST);
-                    int idx = 0;
-                    for (int t = 0; t < times; t++) {
-                        for (int i = 0; i < len; i++) {
-                            auto it = cont->container->find(std::to_string(i));
-                            if (it != cont->container->end())
-                                result->set(std::to_string(idx++), it->second);
-                        }
-                    }
-                    result->set("__len__", Value(idx));
-                    return Value((Collectable*)result);
+        case OP_MUL: {
+            if (nums) return numArith(opc, x, y);
+            // sequence * int, int * sequence (bool counts as an int)
+            const Value* seq = nullptr; Num cnt;
+            if (asNum(rv, cnt) && cnt.k != 3) seq = &lv;
+            else if (asNum(lv, cnt) && cnt.k != 3) seq = &rv;
+            if (seq) {
+                int64_t n = cnt.k == 1 ? cnt.i : (numIsNeg(cnt) ? 0 : INT64_MAX);
+                if (isStringValue(*seq)) {
+                    const std::string& s = *(std::string*)seq->value.p;
+                    if (n > 0 && s.size() * (uint64_t)n > (1ull << 32)) pyRaise("MemoryError", "repeated string is too long");
+                    return makeStringValue(nypy::repeat_str(s, n));
                 }
-            }
-            // List repetition: [1,2] * 3 = [1,2,1,2,1,2]
-            if (lv.isCollectable() && rv.type == ValueType::INTEGER) {
-                auto* cont = dynamic_cast<Container*>(lv.value.gc);
-                if (cont && cont->container) {
-                    auto len_it = cont->container->find("__len__");
-                    int len = (len_it != cont->container->end()) ? static_cast<int>(bigint_to_i64(len_it->second.value.i)) : 0;
-                    int times = static_cast<int>(bigint_to_i64(rv.value.i));
-                    Object* result = new Object((Runnable*)runner, "list", Type::LIST);
-                    int idx = 0;
-                    for (int t = 0; t < times; t++) {
-                        for (int i = 0; i < len; i++) {
-                            auto it = cont->container->find(std::to_string(i));
-                            if (it != cont->container->end())
-                                result->set(std::to_string(idx++), it->second);
-                        }
-                    }
-                    result->set("__len__", Value(idx));
-                    return Value((Collectable*)result);
-                }
-            }
-return lv * rv;
-        }
-        if (bn->op == "/") {
-            // True division (always returns float, like Python)
-            if (lv.type == ValueType::INTEGER && rv.type == ValueType::INTEGER) {
-                int64_t a = bigint_to_i64(lv.value.i);
-                int64_t b = bigint_to_i64(rv.value.i);
-                if (b == 0) throw std::string("__exc__:ZeroDivisionError:division by zero");
-                // Return float (true division) - use // for integer division
-                return Value(static_cast<double>(a) / static_cast<double>(b));
-            }
-            // Float division when mixing types
-            if ((lv.type == ValueType::INTEGER && rv.type == ValueType::DOUBLE) ||
-                (lv.type == ValueType::DOUBLE && rv.type == ValueType::INTEGER) ||
-                (lv.type == ValueType::DOUBLE && rv.type == ValueType::DOUBLE)) {
-                double a = (lv.type == ValueType::DOUBLE) ? (double)lv.value.d : (double)bigint_to_i64(lv.value.i);
-                double b = (rv.type == ValueType::DOUBLE) ? (double)rv.value.d : (double)bigint_to_i64(rv.value.i);
-                if (b == 0.0) throw std::string("__exc__:ZeroDivisionError:division by zero");
-                return Value(static_cast<double>(a / b));
-            }
-            if (rv.type == ValueType::INTEGER && rv.value.i == 0) throw std::string("__exc__:ZeroDivisionError:division by zero");
-            if (rv.type == ValueType::DOUBLE && rv.value.d == 0.0) throw std::string("__exc__:ZeroDivisionError:division by zero");
-            return lv / rv;
-        }
-        if (bn->op == "//" || bn->op == "\\") {
-            // Floor division. `\` (RevDiv, see IToken.hpp) is a second
-            // spelling for the same operator — lexed and parsed since round
-            // 1 (Parser.cpp's multiplication()) but never actually
-            // evaluated on this engine, so `10 \ 2` silently read `none`.
-            // The VM already treats them as synonyms (VirtualMachine.hpp's
-            // bin_op()); this brings the interpreter to parity.
-            if (lv.type == ValueType::INTEGER && rv.type == ValueType::INTEGER) {
-                int64_t a = bigint_to_i64(lv.value.i);
-                int64_t b = bigint_to_i64(rv.value.i);
-                if (b == 0) throw std::string("__exc__:ZeroDivisionError:division by zero");
-                int64_t result = a / b;
-                // Floor toward negative infinity (Python semantics)
-                if ((a ^ b) < 0 && result * b != a) result--;
-                return Value(static_cast<int>(result));
-            }
-            if (lv.type == ValueType::DOUBLE || rv.type == ValueType::DOUBLE) {
-                double a = (lv.type == ValueType::DOUBLE) ? static_cast<double>(lv.value.d) : static_cast<double>(bigint_to_i64(lv.value.i));
-                double b = (rv.type == ValueType::DOUBLE) ? static_cast<double>(rv.value.d) : static_cast<double>(bigint_to_i64(rv.value.i));
-                if (b == 0.0) throw std::string("__exc__:ZeroDivisionError:division by zero");
-                return Value(std::floor(a / b));
-            }
-            return Value(0);
-        }
-        if (bn->op == "%") {
-            // String % formatting: "fmt" % (args...)
-            if (isStringValue(lv)) {
-                std::string fmt = getStringValue(lv);
-                // Collect args from rhs (tuple/list or single value)
-                std::vector<Value> fargs;
-                if (rv.isCollectable() && rv.value.gc) {
-                    auto* cont = dynamic_cast<Container*>(rv.value.gc);
-                    if (cont && cont->container) {
-                        auto len_it = cont->container->find("__len__");
-                        int len = len_it != cont->container->end() ? (int)bigint_to_i64(len_it->second.value.i) : 0;
-                        for (int i = 0; i < len; i++) {
-                            auto it = cont->container->find(std::to_string(i));
-                            if (it != cont->container->end()) fargs.push_back(it->second);
-                        }
-                    }
-                } else {
-                    fargs.push_back(rv);
-                }
-                // Apply format substitutions
-                std::string result;
-                size_t fi = 0; int ai = 0;
-                while (fi < fmt.size()) {
-                    if (fmt[fi] == '%' && fi + 1 < fmt.size()) {
-                        char spec = fmt[fi + 1];
-                        if (spec == '%') { result += '%'; fi += 2; continue; }
-                        Value arg = (ai < (int)fargs.size()) ? fargs[ai++] : NONE_VALUE;
-                        if (spec == 's') {
-                            result += getStringValue(arg);
-                        } else if (spec == 'd' || spec == 'i') {
-                            int64_t iv = arg.type == ValueType::INTEGER ? bigint_to_i64(arg.value.i) : (int64_t)arg.value.d;
-                            result += std::to_string(iv);
-                        } else if (spec == 'f') {
-                            double dv = arg.type == ValueType::DOUBLE ? arg.value.d : (double)bigint_to_i64(arg.value.i);
-                            char buf[64]; std::snprintf(buf, sizeof(buf), "%.6f", dv);
-                            result += buf;
-                        } else if (spec == 'g') {
-                            double dv = arg.type == ValueType::DOUBLE ? arg.value.d : (double)bigint_to_i64(arg.value.i);
-                            char buf[64]; std::snprintf(buf, sizeof(buf), "%g", dv);
-                            result += buf;
-                        } else if (spec == 'r') {
-                            result += getStringValue(arg);
-                        } else {
-                            result += fmt[fi]; result += spec;
-                        }
-                        fi += 2;
-                    } else {
-                        result += fmt[fi++];
+                if (Container* c = contOf(*seq)) {
+                    if (seqLen(c) >= 0) {
+                        std::vector<Value> items = seqItems(c), out;
+                        for (int64_t t = 0; t < n; t++) out.insert(out.end(), items.begin(), items.end());
+                        return makeListValue(out, isTupleCont(c));
                     }
                 }
-                return makeStringValue(result);
             }
-            if (lv.type == ValueType::INTEGER && rv.type == ValueType::INTEGER) {
-                if (rv.value.i == 0) throw std::string("modulo by zero");
-                int64_t ma = bigint_to_i64(lv.value.i), mb = bigint_to_i64(rv.value.i);
-                int64_t mr = ma % mb;
-                // Floor-modulo, to match this file's floor `//`: the remainder
-                // takes the sign of the divisor, so -7 % 3 is 2, not -1.
-                if (mr != 0 && ((mr < 0) != (mb < 0))) mr += mb;
-                return Value(bigint(mr));
-            }
-            // Float modulo
-            if (lv.type == ValueType::DOUBLE || rv.type == ValueType::DOUBLE) {
-                double a = lv.type == ValueType::DOUBLE ? static_cast<double>(lv.value.d) : static_cast<double>(bigint_to_i64(lv.value.i));
-                double b = rv.type == ValueType::DOUBLE ? static_cast<double>(rv.value.d) : static_cast<double>(bigint_to_i64(rv.value.i));
-                if (b == 0) throw std::string("modulo by zero");
-                return Value(std::fmod(a, b));
-
-            }
+            return lv * rv;
+        }
+        case OP_DIV: case OP_FLOORDIV: case OP_POW:
+            if (nums) return numArith(opc, x, y);
+            if (opc == OP_DIV) return lv / rv;
+            return NONE_VALUE;
+        case OP_MOD:
+            if (isStringValue(lv)) return percentFormat(*(std::string*)lv.value.p, rv, ctx);
+            if (nums) return numArith(opc, x, y);
             return lv % rv;
-        }
-        if (bn->op == "**") {
-            double base_v = (lv.type == ValueType::DOUBLE) ? (double)lv.value.d : (double)bigint_to_i64(lv.value.i);
-            double exp_v = (rv.type == ValueType::DOUBLE) ? (double)rv.value.d : (double)bigint_to_i64(rv.value.i);
-            double pow_result = std::pow(base_v, exp_v);
-            if (lv.type == ValueType::INTEGER && rv.type == ValueType::INTEGER && pow_result == (int64_t)pow_result) {
-                int64_t ir = (int64_t)pow_result;
-                // Was capped at 2^31 and demoted to double past that, so 2**62
-                // printed as 4.61e+18 instead of the exact value. int64 range is
-                // exactly the range where pow_result == (int64_t)pow_result still
-                // holds, so no precision is claimed that double does not have.
-                return Value(bigint(ir));
+        case OP_BAND: case OP_BOR: case OP_BXOR: {
+            if (nums) {
+                Value r = numArith(opc, x, y);
+                if (lv.type == ValueType::BOOLEAN && rv.type == ValueType::BOOLEAN) return Value(isTruthy(r));
+                return r;
             }
-            return Value(pow_result);
+            if (lv.isCollectable() && rv.isCollectable())
+                return opc == OP_BAND ? setIntersect(lv, rv) : opc == OP_BOR ? setUnion(lv, rv) : setSymDiff(lv, rv);
+            return intValue(0);
         }
-        if (bn->op == "===" || bn->op == "equals") {
-            // Deep/strict equality: same type AND same value
-            if (lv.type != rv.type) return Value(false);
-            if (lv.type == ValueType::INTEGER) return Value(bigint_to_i64(lv.value.i) == bigint_to_i64(rv.value.i));
-            if (lv.type == ValueType::DOUBLE) return Value(lv.value.d == rv.value.d);
-            if (lv.type == ValueType::BOOLEAN) return Value(lv.value.b == rv.value.b);
-            if (lv.type == ValueType::NONE) return Value(true);
-            if (lv.type == ValueType::USERDATA) return Value(getStringValue(lv) == getStringValue(rv));
-            return Value(lv.toString() == rv.toString());
+        case OP_LSHIFT: case OP_RSHIFT:
+            if (nums) return numArith(opc, x, y);
+            return intValue(0);
+        case OP_EQ: return Value(valuesEqual(lv, rv, 0));
+        case OP_NE: return Value(!valuesEqual(lv, rv, 0));
+        case OP_LT: case OP_LE: case OP_GT: case OP_GE: {
+            int c;
+            if (!orderValues(lv, rv, c, ctx)) return Value(false);
+            return Value(opc == OP_LT ? c < 0 : opc == OP_LE ? c <= 0 : opc == OP_GT ? c > 0 : c >= 0);
         }
-        if (bn->op == "!==") {
-            if (lv.type != rv.type) return Value(true);
-            if (lv.type == ValueType::INTEGER) return Value(bigint_to_i64(lv.value.i) != bigint_to_i64(rv.value.i));
-            if (lv.type == ValueType::DOUBLE) return Value(lv.value.d != rv.value.d);
-            if (lv.type == ValueType::BOOLEAN) return Value(lv.value.b != rv.value.b);
-            if (lv.type == ValueType::NONE) return Value(false);
-            if (lv.type == ValueType::USERDATA) return Value(getStringValue(lv) != getStringValue(rv));
-            return Value(lv.toString() != rv.toString());
+        case OP_SEQ: case OP_SNE: {
+            // Strict (in)equality: same type AND same value, no int/float coercion.
+            bool eq = lv.type == rv.type && valuesEqual(lv, rv, 0);
+            return Value(opc == OP_SEQ ? eq : !eq);
         }
-        if (bn->op == "==") return Value(valuesEqual(lv, rv, 0));
-        if (bn->op == "!=") return Value(!valuesEqual(lv, rv, 0));
-        if (bn->op == "<") {
-            if (lv.type == ValueType::USERDATA && rv.type == ValueType::USERDATA) {
-                return Value(getStringValue(lv) < getStringValue(rv));
-            }
-            double a_d, b_d;
-            if (lv.type == ValueType::INTEGER) a_d = (double)bigint_to_i64(lv.value.i);
-            else if (lv.type == ValueType::DOUBLE) a_d = (double)lv.value.d;
-            else { return Value(false); }
-            if (rv.type == ValueType::INTEGER) b_d = (double)bigint_to_i64(rv.value.i);
-            else if (rv.type == ValueType::DOUBLE) b_d = (double)rv.value.d;
-            else { return Value(false); }
-            return Value(a_d < b_d);
+        case OP_IN: return Value(containsValue(rv, lv, ctx));
+        case OP_NOTIN: return Value(!containsValue(rv, lv, ctx));
+        case OP_LXOR: return Value(isTruthy(lv) != isTruthy(rv));
+        default: return NONE_VALUE;
         }
-        if (bn->op == ">") {
-            if (lv.type == ValueType::USERDATA && rv.type == ValueType::USERDATA) {
-                return Value(getStringValue(lv) > getStringValue(rv));
-            }
-            double a_d, b_d;
-            if (lv.type == ValueType::INTEGER) a_d = (double)bigint_to_i64(lv.value.i);
-            else if (lv.type == ValueType::DOUBLE) a_d = (double)lv.value.d;
-            else { return Value(false); }
-            if (rv.type == ValueType::INTEGER) b_d = (double)bigint_to_i64(rv.value.i);
-            else if (rv.type == ValueType::DOUBLE) b_d = (double)rv.value.d;
-            else { return Value(false); }
-            return Value(a_d > b_d);
-        }
-        if (bn->op == "<=") {
-            if (lv.type == ValueType::USERDATA && rv.type == ValueType::USERDATA) {
-                return Value(getStringValue(lv) <= getStringValue(rv));
-            }
-            double a_d, b_d;
-            if (lv.type == ValueType::INTEGER) a_d = (double)bigint_to_i64(lv.value.i);
-            else if (lv.type == ValueType::DOUBLE) a_d = (double)lv.value.d;
-            else { return Value(false); }
-            if (rv.type == ValueType::INTEGER) b_d = (double)bigint_to_i64(rv.value.i);
-            else if (rv.type == ValueType::DOUBLE) b_d = (double)rv.value.d;
-            else { return Value(false); }
-            return Value(a_d <= b_d);
-        }
-        if (bn->op == ">=") {
-            if (lv.type == ValueType::USERDATA && rv.type == ValueType::USERDATA) {
-                return Value(getStringValue(lv) >= getStringValue(rv));
-            }
-            double a_d, b_d;
-            if (lv.type == ValueType::INTEGER) a_d = (double)bigint_to_i64(lv.value.i);
-            else if (lv.type == ValueType::DOUBLE) a_d = (double)lv.value.d;
-            else { return Value(false); }
-            if (rv.type == ValueType::INTEGER) b_d = (double)bigint_to_i64(rv.value.i);
-            else if (rv.type == ValueType::DOUBLE) b_d = (double)rv.value.d;
-            else { return Value(false); }
-            return Value(a_d >= b_d);
-        }
-        if (bn->op == "is" || bn->op == "instanceof") {
-            // `instanceof` is a second spelling of `is` for class-membership
-            // checks (`x instanceof MyClass`) - it parsed into a BinaryNode
-            // (Parser.cpp) but had no evaluation case at all here, so it
-            // always fell through to the final `return NONE_VALUE;`.
-            // `is` answers "does the left operand belong to the right?" in the
-            // widest useful sense, not only pointer identity:
-            //
-            //     1 is 1          -> true   (same value)
-            //     1 is int        -> true   (type name)
-            //     1 is Integer    -> true   (type alias)
-            //     1 is Object     -> true   (everything is an Object)
-            //     1 is "1"        -> false  (a number is not a string)
-            //     obj is MyClass  -> true   (class, walking the parent chain)
-            //
-            // The right operand may be a TYPE NAME rather than a value, so the
-            // type test is tried BEFORE evaluating identity — otherwise `int`
-            // would resolve as an undefined variable and the test would silently
-            // be false. `bn->right` is inspected rather than `rv` for that
-            // reason.
-            {
-                std::string tn = typeNameOperand(bn->right, ctx);
-                if (!tn.empty()) return Value(valueIsOfType(lv, tn, ctx));
-            }
-            if (lv.isNone() && rv.isNone()) return Value(true);
-            if (lv.isNone() || rv.isNone()) return Value(false);
-            if (lv.type == rv.type) {
-                if (lv.type == ValueType::INTEGER) return Value(lv.value.i == rv.value.i);
-                if (lv.type == ValueType::DOUBLE) return Value(lv.value.d == rv.value.d);
-                if (lv.type == ValueType::BOOLEAN) return Value(lv.value.b == rv.value.b);
-                if (lv.type == ValueType::USERDATA) {
-                    // Two equal strings are the same value even when they are
-                    // separate allocations: `"1" is "1"` was false here and true
-                    // on the VM. Comparing by pointer is right for instances and
-                    // wrong for strings, which are immutable values.
-                    if (string_ptrs_.count(lv.value.p) && string_ptrs_.count(rv.value.p))
-                        return Value(getStringValue(lv) == getStringValue(rv));
-                    return Value(lv.value.p == rv.value.p);
-                }
-                if (lv.type == ValueType::COLLECTABLE) return Value(lv.value.gc == rv.value.gc);
-            }
-            return Value(false);
-        }
-        if (bn->op == "is not") {
-            bn->op = "is";
-            Value r = evalBinary(node, ctx);
-            bn->op = "is not";
-            return Value(!isTruthy(r));
-        }
-        if (bn->op == "in") {
-            // Check for __contains__ dunder method on RHS
-            if (rv.type == ValueType::USERDATA && rv.value.p && !string_ptrs_.count(rv.value.p) && instance_to_class.count(rv.value.p)) {
-                std::vector<Value> args = {lv};
-                Value result = callMethod(rv, "__contains__", args, ctx);
-                if (result.type == ValueType::BOOLEAN) return result;
-            }
-            if (lv.type == ValueType::USERDATA && rv.type == ValueType::USERDATA) {
-                return Value(getStringValue(rv).find(getStringValue(lv)) != std::string::npos);
-            }
-            if (rv.isCollectable() && rv.value.gc) {
-                auto* cont = dynamic_cast<Container*>(rv.value.gc);
-                if (cont && cont->container) {
-                    auto len_it = cont->container->find("__len__");
-                    if (len_it != cont->container->end()) {
-                        int len = (int)bigint_to_i64(len_it->second.value.i);
-                        for (int i = 0; i < len; i++) {
-                            auto it = cont->container->find(std::to_string(i));
-                            if (it == cont->container->end()) continue;
-                            if (lv == it->second) return Value(true);
-                            if (lv.type == ValueType::USERDATA && it->second.type == ValueType::USERDATA &&
-                                getStringValue(lv) == getStringValue(it->second)) return Value(true);
-                        }
-                        return Value(false);
-                    }
-                    std::string key = getStringValue(lv);
-                    return Value(cont->container->count(key) > 0);
-                }
-            }
-            return Value(false);
-        }
-        if (bn->op == "not in") {
-            bn->op = "in";
-            Value r = evalBinary(node, ctx);
-            bn->op = "not in";
-            return Value(!isTruthy(r));
-        }
-        if (bn->op == "<<") {
-            if (lv.type == ValueType::INTEGER && rv.type == ValueType::INTEGER)
-                return Value((int)(bigint_to_i64(lv.value.i) << bigint_to_i64(rv.value.i)));
-
-            return Value(0);
-        }
-        if (bn->op == ">>") {
-            if (lv.type == ValueType::INTEGER && rv.type == ValueType::INTEGER)
-                return Value((int)(bigint_to_i64(lv.value.i) >> bigint_to_i64(rv.value.i)));
-
-            return Value(0);
-        }
-        if (bn->op == "|") {
-            if (lv.type == ValueType::INTEGER && rv.type == ValueType::INTEGER)
-                return Value(static_cast<int>(bigint_to_i64(lv.value.i) | bigint_to_i64(rv.value.i)));
-            // Set union
-            if (lv.isCollectable() && rv.isCollectable()) return setUnion(lv, rv);
-            return Value(0);
-        }
-        if (bn->op == "&") {
-            // Set intersection
-            if (lv.isCollectable() && rv.isCollectable()) return setIntersect(lv, rv);
-            if (lv.type == ValueType::INTEGER && rv.type == ValueType::INTEGER)
-                return Value(static_cast<int>(bigint_to_i64(lv.value.i) & bigint_to_i64(rv.value.i)));
-            return Value(0);
-        }
-        if (bn->op == "^") {
-            if (lv.isCollectable() && rv.isCollectable()) return setSymDiff(lv, rv);
-            if (lv.type == ValueType::INTEGER && rv.type == ValueType::INTEGER)
-                return Value(static_cast<int>(bigint_to_i64(lv.value.i) ^ bigint_to_i64(rv.value.i)));
-            return Value(0);
-        }
-        return NONE_VALUE;
     }
 
-    Value evalUnary(node_ptr node, Context* ctx) {
-        auto un = static_pointer_cast<UnaryNode>(node);
-        Value v = evalNode(un->operand, ctx);
-        if (un->op == "+") {
-            return v; // unary plus is identity
+    // ─── AUGMENTED ASSIGNMENT ───────────────────────────────────────────
+    // `t op= v` evaluates the target's object and index once, computes with
+    // the same operators as the binary form, and stores back. Lists are
+    // mutable, so `L += it` extends and `L *= n` repeats in place: every
+    // alias sees the change (a new list used to be built, or none returned).
+    Value evalAugAssignment(node_ptr node, Context* ctx) {
+        auto an = static_pointer_cast<AugAssignNode>(node);
+        const std::string& op = an->op;
+        std::string base = op.substr(0, op.size() > 0 ? op.size() - 1 : 0);
+        if (op == ">>>=") base = ">>";
+        int opc = binOpCode(base);
+        // Target: read its current value, remembering where to store.
+        Value obj, idx, old_val;
+        int kind = an->target->type() == NodeType::SUBSCRIPT ? 1 : an->target->type() == NodeType::ATTRIBUTE ? 2 : 0;
+        if (kind == 1) {
+            auto sub = static_pointer_cast<SubscriptNode>(an->target);
+            obj = evalNode(sub->object, ctx);
+            idx = evalNode(sub->index, ctx);
+            old_val = getItem(obj, idx, ctx);
+        } else if (kind == 2) {
+            auto attr = static_pointer_cast<AttributeNode>(an->target);
+            obj = evalNode(attr->object, ctx);
+            receiver_cache_[attr->object.get()] = obj;
+            try { old_val = evalNode(an->target, ctx); }
+            catch (...) { receiver_cache_.erase(attr->object.get()); throw; }
+            receiver_cache_.erase(attr->object.get());
+        } else {
+            old_val = evalNode(an->target, ctx);
         }
-        if (un->op == "-") {
-            if (v.type == ValueType::INTEGER) {
-                int64_t val = (long long)v.value.i;
-                nython::kernel::bigint zero(0);
-                if (v.value.i < zero) val = -val;
-                return Value((int)(-val));
+        Value new_val = evalNode(an->value_node, ctx);
+        Value result;
+        Container* oc = contOf(old_val);
+        if (op == "~=") {
+            // `x ~= y` assigns the bitwise complement of the right operand
+            // (`x = ~y`) - the reading chosen when the operator was wired up.
+            Num y;
+            if (!asNum(new_val, y) || y.k == 3) pyRaise("TypeError", "bad operand type for unary ~");
+            result = y.k == 1 ? intValue(~y.i) : intValue(-(numBig(y) + nypy::BigInt(1)));
+        } else if (oc && seqLen(oc) >= 0 && !isTupleCont(oc) && !isSetCont(oc) && (opc == OP_ADD || opc == OP_MUL)) {
+            if (opc == OP_ADD) {
+                std::vector<Value> more = iterItems(new_val, ctx);
+                int64_t n = seqLen(oc);
+                for (auto& v : more) (*oc->container)[std::to_string(n++)] = v;
+                (*oc->container)["__len__"] = intValue(n);
+            } else {
+                Num cnt;
+                if (!asNum(new_val, cnt) || cnt.k == 3) pyRaise("TypeError", "can't multiply sequence by non-int");
+                int64_t times = cnt.k == 1 ? cnt.i : (numIsNeg(cnt) ? 0 : 1);
+                std::vector<Value> items = seqItems(oc);
+                int64_t n = (int64_t)items.size();
+                for (int64_t k = 0; k < n; k++) oc->container->erase(std::to_string(k));
+                int64_t w = 0;
+                for (int64_t t = 0; t < times; t++) for (auto& v : items) (*oc->container)[std::to_string(w++)] = v;
+                (*oc->container)["__len__"] = intValue(w);
             }
-            if (v.type == ValueType::DOUBLE) return Value(-v.value.d);
-            return Value(0) - v;
-        }
-        if (un->op == "+" ) return v;
-        if (un->op == "!" || un->op == "not") return Value(v.isFalse() || v.isNone());
-        if (un->op == "~") {
-            if (v.type == ValueType::INTEGER)
-                return Value(static_cast<int>(~bigint_to_i64(v.value.i)));
-            return Value(0);
-        }
-        if (un->op == "++" || un->op == "--") {
-            Value result = (un->op == "++") ? v + Value(1) : v - Value(1);
-            // Post-increment/decrement: update the variable in context
-            if (un->operand->type() == NodeType::VARIABLE) {
-                ctx->setByName(un->operand->value(), result);
-            } else if (un->operand->type() == NodeType::ATTRIBUTE) {
-                // Handle obj.field++ 
-                auto attr = static_pointer_cast<AttributeNode>(un->operand);
-                Value obj = evalNode(attr->object, ctx);
-                if (obj.type == ValueType::USERDATA && obj.value.p) {
-                    auto pit = instance_properties.find(obj.value.p);
-                    if (pit != instance_properties.end())
-                        pit->second->setByName(attr->attr, result);
+            result = old_val;
+        } else {
+            result = NONE_VALUE;
+            bool done = false;
+            if (isInstanceVal(old_val)) {
+                static const std::unordered_map<std::string, const char*> idunder = {
+                    {"+=", "__iadd__"}, {"-=", "__isub__"}, {"*=", "__imul__"}, {"/=", "__itruediv__"},
+                    {"//=", "__ifloordiv__"}, {"%=", "__imod__"}, {"**=", "__ipow__"}, {"&=", "__iand__"},
+                    {"|=", "__ior__"}, {"^=", "__ixor__"}, {"<<=", "__ilshift__"}, {">>=", "__irshift__"}};
+                auto it = idunder.find(op);
+                if (it != idunder.end()) {
+                    std::vector<Value> a = {new_val};
+                    Value r = callMethod(old_val, it->second, a, ctx);
+                    if (r.type != ValueType::NONE) { result = r; done = true; }
                 }
             }
-            return v; // return OLD value (post-increment)
+            if (!done) {
+                if (opc == OP_UNKNOWN) result = new_val;
+                else result = binaryOp(opc, old_val, new_val, ctx);
+            }
         }
-        return v;
+        if (kind == 1) setItem(obj, idx, result, ctx);
+        else if (kind == 2) setAttr(obj, static_pointer_cast<AttributeNode>(an->target)->attr, result);
+        else if (an->target->type() == NodeType::VARIABLE)
+            ctx->setByName(static_pointer_cast<VariableNode>(an->target)->name, result);
+        return result;
+    }
+
+    // ─── ATTRIBUTE / ITEM STORES ────────────────────────────────────────
+    void setAttr(const Value& obj, const std::string& name, const Value& val) {
+        // Store on instance properties (USERDATA instances)
+        if (obj.type == ValueType::USERDATA && obj.value.p) {
+            auto pit = instance_properties.find(obj.value.p);
+            if (pit != instance_properties.end()) {
+                pit->second->defineByName(name, val);
+            } else {
+                // Might be a class object (not an instance) — store as class var
+                void* class_ptr = obj.value.p;
+                void* ast_ptr = class_ptr;
+                auto ast_it = func_ast_nodes.find(class_ptr);
+                if (ast_it != func_ast_nodes.end()) ast_ptr = ast_it->second;
+                Node* class_node = (Node*)ast_ptr;
+                if (class_node && func_names.find(class_ptr) != func_names.end() && class_node->type() == NodeType::CLASS) {
+                    auto* cn = static_cast<ClassNode*>(class_node);
+                    class_vars_[cn->name + "." + name] = val;
+                    // Also update class_ctx_map_ so subsequent reads via evalAttribute see the new value
+                    auto cctx_it = class_ctx_map_.find((void*)class_node);
+                    if (cctx_it != class_ctx_map_.end()) {
+                        try { cctx_it->second->setByName(name, val); }
+                        catch (...) { cctx_it->second->defineByName(name, val); }
+                    }
+                }
+            }
+        }
+        // Store on Collectable containers (namespaces, modules)
+        if (Container* cont = contOf(obj)) (*cont->container)[name] = val;
     }
 
     // Structural equality, recursive, as on the VM (and in Python): lists
-    // and tuples element by element, maps key by key, sets as sets, 1 == 1.0.
-    // The old == compared list elements by their printed form, so nested
-    // lists were never equal; treated every pair of maps as equal (both had
-    // "length 0"); and != on containers compared identity, so
-    // [1, 2] != [1, 2] was true.
+    // and tuples element by element, maps key by key, sets as sets, 1 == 1.0
+    // == true. A list never equals a tuple.
     bool valuesEqual(const Value& a, const Value& b, int depth) {
         if (depth > 100) return false;
+        Num x, y;
+        if (asNum(a, x) && asNum(b, y)) return numCmp(x, y) == 0;
         bool as = isStringValue(a), bs = isStringValue(b);
-        if (as || bs) return as && bs && getStringValue(a) == getStringValue(b);
-        if ((a.type == ValueType::INTEGER || a.type == ValueType::DOUBLE) &&
-            (b.type == ValueType::INTEGER || b.type == ValueType::DOUBLE)) {
-            if (a.type == ValueType::INTEGER && b.type == ValueType::INTEGER) return a == b;
-            double x = (a.type == ValueType::DOUBLE) ? (double)a.value.d : (double)bigint_to_i64(a.value.i);
-            double y = (b.type == ValueType::DOUBLE) ? (double)b.value.d : (double)bigint_to_i64(b.value.i);
-            return x == y;
+        if (as || bs) {
+            if (!(as && bs)) return false;
+            return a.value.p == b.value.p || *(std::string*)a.value.p == *(std::string*)b.value.p;
         }
         if (a.isCollectable() && b.isCollectable() && a.value.gc && b.value.gc) {
             if (a.value.gc == b.value.gc) return true;
@@ -1750,29 +1409,30 @@ return lv * rv;
             bool llist = li != L.end(), rlist = ri != R.end();
             if (llist != rlist) return false;
             if (llist) {
-                int ln = (int)bigint_to_i64(li->second.value.i);
-                int rn = (int)bigint_to_i64(ri->second.value.i);
+                int64_t ln = bigint_to_i64(li->second.value.i);
+                int64_t rn = bigint_to_i64(ri->second.value.i);
                 if (ln != rn) return false;
+                if (isTupleCont(lc) != isTupleCont(rc)) return false;
                 bool lset = L.count("__set__") > 0, rset = R.count("__set__") > 0;
                 if (lset != rset) return false;
                 if (lset) {
-                    for (int i = 0; i < ln; i++) {
-                        auto x = L.find(std::to_string(i));
-                        if (x == L.end()) return false;
+                    for (int64_t i = 0; i < ln; i++) {
+                        auto x2 = L.find(std::to_string(i));
+                        if (x2 == L.end()) return false;
                         bool found = false;
-                        for (int j = 0; j < rn && !found; j++) {
-                            auto y = R.find(std::to_string(j));
-                            if (y != R.end() && valuesEqual(x->second, y->second, depth + 1)) found = true;
+                        for (int64_t j = 0; j < rn && !found; j++) {
+                            auto y2 = R.find(std::to_string(j));
+                            if (y2 != R.end() && valuesEqual(x2->second, y2->second, depth + 1)) found = true;
                         }
                         if (!found) return false;
                     }
                     return true;
                 }
-                for (int i = 0; i < ln; i++) {
-                    auto x = L.find(std::to_string(i));
-                    auto y = R.find(std::to_string(i));
-                    if (x == L.end() || y == R.end()) return false;
-                    if (!valuesEqual(x->second, y->second, depth + 1)) return false;
+                for (int64_t i = 0; i < ln; i++) {
+                    auto x2 = L.find(std::to_string(i));
+                    auto y2 = R.find(std::to_string(i));
+                    if (x2 == L.end() || y2 == R.end()) return false;
+                    if (!valuesEqual(x2->second, y2->second, depth + 1)) return false;
                 }
                 return true;
             }
@@ -1785,12 +1445,716 @@ return lv * rv;
             if (ln != rn) return false;
             for (auto& kv : L) {
                 if (internal(kv.first)) continue;
-                auto y = R.find(kv.first);
-                if (y == R.end() || !valuesEqual(kv.second, y->second, depth + 1)) return false;
+                auto y2 = R.find(kv.first);
+                if (y2 == R.end() || !valuesEqual(kv.second, y2->second, depth + 1)) return false;
             }
             return true;
         }
+        if (a.type == ValueType::NONE || b.type == ValueType::NONE) return a.type == b.type;
         return a == b;
+    }
+
+    // ─── ITEMS ──────────────────────────────────────────────────────────
+    // Dict keys keep their type (NyStr.hpp: nypy::key_of_*): 1 and "1" are
+    // different keys, 1 == 1.0 == true are the same one, tuples are keys.
+    std::string dictKey(const Value& k) {
+        switch (k.type) {
+            case ValueType::NONE: case ValueType::UNDEFINED: return nypy::key_of_none();
+            case ValueType::BOOLEAN: return nypy::key_of_int(k.value.b ? 1 : 0);
+            case ValueType::INTEGER: {
+                int64_t v;
+                if (bigint_fits_i64(k.value.i, v)) return nypy::key_of_int(v);
+                return nypy::key_of_big(bigint_to_nbig(k.value.i));
+            }
+            case ValueType::DOUBLE: return nypy::key_of_float((double)k.value.d);
+            default: break;
+        }
+        if (isStringValue(k)) return nypy::key_of_str(*(std::string*)k.value.p);
+        if (Container* c = contOf(k)) {
+            if (seqLen(c) >= 0 && isTupleCont(c)) {
+                std::vector<std::string> parts;
+                for (auto& e : seqItems(c)) parts.push_back(dictKey(e));
+                return nypy::key_of_tuple(parts);
+            }
+            if (!isInstanceVal(k)) pyRaise("TypeError", "unhashable type: '" + typeNameOf(k) + "'");
+        }
+        char buf[32]; snprintf(buf, sizeof buf, "%p", k.type == ValueType::USERDATA ? k.value.p : (void*)k.value.gc);
+        std::string id = std::string(k.type == ValueType::USERDATA ? "u" : "g") + buf;
+        key_objs_[id] = k;
+        return nypy::key_of_obj(id);
+    }
+    std::unordered_map<std::string, Value> key_objs_;   // object keys, by identity
+    Value keyValue(const std::string& k) {
+        switch (nypy::key_kind(k)) {
+            case nypy::K_STR: return nypy::key_is_plain(k) ? internString(k) : makeStringValue(k.substr(2));
+            case nypy::K_INT: {
+                nypy::BigInt b;
+                nypy::BigInt::parse(k.substr(2), 10, b);
+                return intValue(b);
+            }
+            case nypy::K_FLOAT: return Value(std::strtod(k.c_str() + 2, nullptr));
+            case nypy::K_NONE: return NONE_VALUE;
+            case nypy::K_TUPLE: {
+                std::vector<Value> items;
+                for (auto& part : nypy::key_tuple_parts(k)) items.push_back(keyValue(part));
+                return makeListValue(items, true);
+            }
+            case nypy::K_OBJ: {
+                auto it = key_objs_.find(k.substr(2));
+                return it != key_objs_.end() ? it->second : NONE_VALUE;
+            }
+        }
+        return NONE_VALUE;
+    }
+    ContainerType::iterator dictFind(Container* c, const Value& k) {
+        return c->container->find(dictKey(k));
+    }
+    void dictSet(Container* c, const Value& k, const Value& v) {
+        (*c->container)[dictKey(k)] = v;
+    }
+    // A dict's keys / values / (key, value) tuples, in insertion order.
+    std::vector<Value> dictKeys(Container* c) {
+        std::vector<Value> out;
+        for (auto& kv : *c->container) if (!isInternalKey(kv.first)) out.push_back(keyValue(kv.first));
+        return out;
+    }
+
+    // dict methods. Returns false when `name` is not one.
+    bool dictMethod(Container* cont, const Value& obj, const std::string& name, std::vector<Value>& args,
+                    const std::unordered_map<std::string, Value>& kw, Context* ctx, Value& out) {
+        auto& C = *cont->container;
+        const bool is_dict = seqLen(cont) < 0;
+        auto need = [&](size_t lo, size_t hi) {
+            if (args.size() < lo || args.size() > hi)
+                pyRaise("TypeError", name + "() takes " + (lo == hi ? "exactly " + std::to_string(lo) : "at most " + std::to_string(hi)) + " argument" + (hi == 1 ? "" : "s") + " (" + std::to_string(args.size()) + " given)");
+        };
+        if (name == "keys" || name == "values" || name == "items" || name == "entries") {
+            std::vector<Value> r;
+            for (auto& kv : C) {
+                if (isInternalKey(kv.first)) continue;
+                if (name == "keys") r.push_back(keyValue(kv.first));
+                else if (name == "values") r.push_back(kv.second);
+                else r.push_back(makeListValue({keyValue(kv.first), kv.second}, true));
+            }
+            out = makeListValue(r);
+            return true;
+        }
+        if (name == "get") {
+            need(1, 2);
+            auto it = dictFind(cont, args[0]);
+            out = it != C.end() ? it->second : (args.size() >= 2 ? args[1] : NONE_VALUE);
+            return true;
+        }
+        if (name == "has_key" || name == "has" || name == "containsKey") {
+            need(1, 1);
+            out = Value(dictFind(cont, args[0]) != C.end());
+            return true;
+        }
+        if (name == "setdefault") {
+            need(1, 2);
+            std::string k = dictKey(args[0]);
+            auto it = C.find(k);
+            if (it != C.end()) { out = it->second; return true; }
+            out = args.size() >= 2 ? args[1] : NONE_VALUE;
+            C[k] = out;
+            return true;
+        }
+        if (name == "copy" && is_dict) {
+            Value d = makeDictValue();
+            Container* dc = contOf(d);
+            for (auto& kv : C) (*dc->container)[kv.first] = kv.second;
+            out = d;
+            return true;
+        }
+        if (name == "size" || name == "length") { out = intValue(dictSize(cont)); return true; }
+        if (!is_dict) return false;   // list methods of the same name are elsewhere
+        if (name == "pop") {
+            need(1, 2);
+            std::string k = dictKey(args[0]);
+            auto it = C.find(k);
+            if (it != C.end()) { out = it->second; C.erase(k); return true; }
+            if (args.size() >= 2) { out = args[1]; return true; }
+            pyRaise("KeyError", reprOf(args[0], ctx));
+        }
+        if (name == "popitem") {
+            std::string last;
+            for (auto& kv : C) if (!isInternalKey(kv.first)) last = kv.first;
+            if (last.empty() && C.find(last) == C.end()) pyRaise("KeyError", "'popitem(): dictionary is empty'");
+            out = makeListValue({keyValue(last), C[last]}, true);
+            C.erase(last);
+            return true;
+        }
+        if (name == "update" || name == "merge") {
+            if (!args.empty()) {
+                if (Container* src = contOf(args[0]); src && seqLen(src) < 0) dictUpdate(cont, src);
+                else for (auto& pairv : iterItems(args[0], ctx)) {
+                    std::vector<Value> kv = iterItems(pairv, ctx);
+                    if (kv.size() != 2) pyRaise("ValueError", "dictionary update sequence element has length " + std::to_string(kv.size()) + "; 2 is required");
+                    dictSet(cont, kv[0], kv[1]);
+                }
+            }
+            for (auto& [k, v] : kw) dictSet(cont, makeStringValue(k), v);
+            out = name == "merge" ? obj : NONE_VALUE;
+            return true;
+        }
+        if (name == "remove" || name == "delete") {
+            // Nython's map.remove(key[, default]): erases and returns the value.
+            if (args.empty()) { out = NONE_VALUE; return true; }
+            std::string k = dictKey(args[0]);
+            auto it = C.find(k);
+            if (it != C.end()) { out = it->second; C.erase(k); return true; }
+            out = args.size() >= 2 ? args[1] : NONE_VALUE;
+            return true;
+        }
+        if (name == "clear") {
+            std::vector<std::pair<std::string, Value>> keep;
+            for (auto& kv : C) if (isInternalKey(kv.first)) keep.push_back(kv);
+            C.clear();
+            for (auto& kv : keep) C[kv.first] = kv.second;
+            out = NONE_VALUE;
+            return true;
+        }
+        return false;
+    }
+
+    // A dict's own entries (containers also hold "__len__"/"__type__" style
+    // internal markers, which are not keys).
+    static bool isInternalKey(const std::string& k) { return k.size() >= 2 && k[0] == '_' && k[1] == '_'; }
+    int64_t dictSize(Container* c) {
+        int64_t n = 0;
+        for (auto& kv : *c->container) if (!isInternalKey(kv.first)) n++;
+        return n;
+    }
+    Value makeDictValue() {
+        auto* m = new Object((Runnable*)runner, "map", Type::MAP);
+        return Value((Collectable*)m);
+    }
+    void dictUpdate(Container* dst, Container* src) {
+        for (auto& kv : *src->container) if (!isInternalKey(kv.first)) (*dst->container)[kv.first] = kv.second;
+    }
+    // Keyword arguments of the builtin call being dispatched (evalCall sets
+    // it for the builtins that read them; dispatch_pycore takes it).
+    const std::unordered_map<std::string, Value>* cur_kwargs_ = nullptr;
+    struct KwScope {
+        NythonExecutor* e; const std::unordered_map<std::string, Value>* prev;
+        KwScope(NythonExecutor* x, const std::unordered_map<std::string, Value>* k) : e(x), prev(x->cur_kwargs_) { e->cur_kwargs_ = k; }
+        ~KwScope() { e->cur_kwargs_ = prev; }
+        KwScope(const KwScope&) = delete;
+        KwScope& operator=(const KwScope&) = delete;
+    };
+
+    // A slice bound: false when omitted (none); raises for a non-integer.
+    bool sliceArg(const std::vector<Value>& args, size_t i, int64_t& out) {
+        if (i >= args.size() || args[i].type == ValueType::NONE) return false;
+        Num n;
+        if (!asNum(args[i], n) || n.k == 3) pyRaise("TypeError", "slice indices must be integers or None or have an __index__ method");
+        out = n.k == 1 ? n.i : (numIsNeg(n) ? INT64_MIN / 2 : INT64_MAX / 2);
+        return true;
+    }
+    // L[a:b] = it and L[a:b:c] = it (extended slices must match in length).
+    void assignSlice(const Value& obj, const std::vector<Value>& sargs, const Value& val, Context* ctx) {
+        Container* cont = contOf(obj);
+        if (!cont || seqLen(cont) < 0) pyRaise("TypeError", "'" + typeNameOf(obj) + "' object does not support item assignment");
+        if (isTupleCont(cont)) pyRaise("TypeError", "'tuple' object does not support item assignment");
+        std::vector<Value> items = seqItems(cont);
+        std::vector<Value> repl = iterItems(val, ctx);
+        int64_t len = (int64_t)items.size(), st = 0, en = 0, step = 1;
+        bool hs = sliceArg(sargs, 0, st), he = sliceArg(sargs, 1, en);
+        if (sargs.size() >= 3 && sargs[2].type != ValueType::NONE) sliceArg(sargs, 2, step);
+        int64_t cnt = nyCall([&] { return nypy::slice_adjust(len, hs, st, he, en, step); });
+        std::vector<Value> out;
+        if (step == 1) {
+            if (cnt < 0) cnt = 0;
+            if (st > len) st = len;
+            out.assign(items.begin(), items.begin() + st);
+            out.insert(out.end(), repl.begin(), repl.end());
+            out.insert(out.end(), items.begin() + st + cnt, items.end());
+        } else {
+            if ((int64_t)repl.size() != cnt)
+                pyRaise("ValueError", "attempt to assign sequence of size " + std::to_string(repl.size()) + " to extended slice of size " + std::to_string(cnt));
+            out = items;
+            for (int64_t k = 0, i = st; k < cnt; k++, i += step) out[(size_t)i] = repl[(size_t)k];
+        }
+        for (int64_t k = 0; k < len; k++) cont->container->erase(std::to_string(k));
+        int64_t w = 0;
+        for (auto& v : out) (*cont->container)[std::to_string(w++)] = v;
+        (*cont->container)["__len__"] = intValue(w);
+    }
+
+    // obj[idx]
+    Value getItem(const Value& obj, const Value& idx, Context* ctx) {
+        // String indexing, in characters: s[0], s[-1]
+        if (obj.type == ValueType::USERDATA && obj.value.p && !func_names.count(obj.value.p)) {
+            const std::string& s = *(std::string*)obj.value.p;
+            Num k;
+            if (!asNum(idx, k) || k.k == 3) pyRaise("TypeError", "string indices must be integers, not '" + typeNameOf(idx) + "'");
+            int64_t i = k.k == 1 ? k.i : (numIsNeg(k) ? INT64_MIN / 2 : INT64_MAX / 2);
+            return makeStringValue(nyCall([&] { return nypy::str_getitem(s, i); }));
+        }
+        // List/Map indexing with negative index support
+        if (Container* cont = contOf(obj)) {
+            int64_t n = seqLen(cont);
+            if (n >= 0) {
+                Num k;
+                if (asNum(idx, k) && k.k != 3) {
+                    int64_t i = k.k == 1 ? k.i : (numIsNeg(k) ? INT64_MIN : INT64_MAX);
+                    int64_t j = i;
+                    if (j < 0) j += n;
+                    if (j >= 0 && j < n) {
+                        auto it = cont->container->find(std::to_string(j));
+                        if (it != cont->container->end()) return it->second;
+                    }
+                    throw std::string("__exc__:IndexError:index " + std::to_string(i) + " out of range (length " + std::to_string(n) + ")");
+                }
+            }
+            auto it = dictFind(cont, idx);
+            if (it != cont->container->end()) return it->second;
+            // A missing dict key reads none: the libraries and the IDE are
+            // written against that (`v = d[k]` then `if v == none`) in too
+            // many places to raise KeyError here; d.get() is the same.
+            if (n < 0) return NONE_VALUE;
+            pyRaise("TypeError", std::string(isTupleCont(cont) ? "tuple" : "list") + " indices must be integers or slices, not " + typeNameOf(idx));
+        }
+        // __getitem__ on instances
+        if (isInstanceVal(obj)) {
+            std::vector<Value> call_args = {idx};
+            Value result = callMethod(obj, "__getitem__", call_args, ctx);
+            if (result.type != ValueType::NONE) return result;
+        }
+        return NONE_VALUE;
+    }
+
+    // obj[idx] = val
+    void setItem(const Value& obj, const Value& idx, const Value& val, Context* ctx) {
+        if (isInstanceVal(obj)) {
+            std::vector<Value> call_args = {idx, val};
+            Value result = callMethod(obj, "__setitem__", call_args, ctx);
+            if (result.type != ValueType::NONE) return;
+        }
+        Container* cont = contOf(obj);
+        if (!cont) {
+            if (isStringValue(obj)) pyRaise("TypeError", "'str' object does not support item assignment");
+            return;
+        }
+        int64_t n = seqLen(cont);
+        if (n >= 0) {
+            if (isTupleCont(cont)) pyRaise("TypeError", "'tuple' object does not support item assignment");
+            Num k;
+            if (!asNum(idx, k) || k.k == 3) pyRaise("TypeError", "list indices must be integers or slices, not " + typeNameOf(idx));
+            int64_t i = k.k == 1 ? k.i : (numIsNeg(k) ? INT64_MIN / 2 : INT64_MAX / 2);
+            if (i < 0) i += n;
+            if (i < 0) pyRaise("IndexError", "list assignment index out of range");
+            // Past the end the list grows (padded with none): the VM always
+            // did this, and library code appends with `a[len] = x`. It used
+            // to store the element without growing the length here.
+            if (i >= n) {
+                for (int64_t k = n; k < i; k++) (*cont->container)[std::to_string(k)] = NONE_VALUE;
+                (*cont->container)["__len__"] = intValue(i + 1);
+            }
+            (*cont->container)[std::to_string(i)] = val;
+            return;
+        }
+        dictSet(cont, idx, val);
+    }
+
+    Value evalSubscript(node_ptr node, Context* ctx) {
+        auto sn = static_pointer_cast<SubscriptNode>(node);
+        Value obj = evalNode(sn->object, ctx);
+        Value idx = evalNode(sn->index, ctx);
+        return getItem(obj, idx, ctx);
+    }
+
+    // Every element an iterable yields: lists/tuples/sets/generators in
+    // order, a dict's keys, a string's characters, or an instance's
+    // __iter__/__next__ sequence.
+    std::vector<Value> iterItems(const Value& v, Context* ctx) {
+        if (Container* c = contOf(v)) {
+            if (seqLen(c) >= 0) {
+                if (!isGenCont(c)) return seqItems(c);
+                // A generator: what is left of it, which this consumes.
+                auto ix = c->container->find("__idx__");
+                int64_t from = ix != c->container->end() ? bigint_to_i64(ix->second.value.i) : 0;
+                std::vector<Value> all = seqItems(c);
+                (*c->container)["__idx__"] = intValue((int64_t)all.size());
+                if (from <= 0) return all;
+                return std::vector<Value>(all.begin() + std::min<int64_t>(from, (int64_t)all.size()), all.end());
+            }
+            return dictKeys(c);
+        }
+        if (isStringValue(v)) {
+            std::vector<Value> out;
+            for (auto& ch : nypy::u8_chars(*(std::string*)v.value.p)) out.push_back(makeStringValue(ch));
+            return out;
+        }
+        if (isInstanceVal(v)) {
+            std::vector<Value> out, no_args;
+            Value iterator = v;
+            Value itv = callMethod(v, "__iter__", no_args, ctx);
+            if (itv.type != ValueType::NONE && itv.type != ValueType::UNDEFINED) iterator = itv;
+            if (contOf(iterator)) return iterItems(iterator, ctx);
+            for (int guard = 0; guard < 100000000; guard++) {
+                Value item;
+                try { item = callMethod(iterator, "__next__", no_args, ctx); }
+                catch (nython::node::ReturnSignal& rs) { item = rs.value; }
+                catch (std::string& exc) {
+                    if (exc.find("StopIteration") != std::string::npos) break;
+                    throw;
+                }
+                out.push_back(item);
+            }
+            return out;
+        }
+        pyRaise("TypeError", "'" + typeNameOf(v) + "' object is not iterable");
+    }
+    // Python's type name for messages.
+    std::string typeNameOf(const Value& v) {
+        switch (v.type) {
+            case ValueType::NONE: return "NoneType";
+            case ValueType::BOOLEAN: return "bool";
+            case ValueType::INTEGER: return "int";
+            case ValueType::DOUBLE: return "float";
+            case ValueType::UNDEFINED: return "undefined";
+            default: break;
+        }
+        if (isStringValue(v)) return "str";
+        if (Container* c = contOf(v)) {
+            if (seqLen(c) < 0) return "dict";
+            return isTupleCont(c) ? "tuple" : isSetCont(c) ? "set" : isGenCont(c) ? "generator" : "list";
+        }
+        if (v.type == ValueType::USERDATA && v.value.p) {
+            auto fit = func_names.find(v.value.p);
+            if (fit != func_names.end()) {
+                if (fit->second.rfind("__instance__:", 0) == 0) return fit->second.substr(13);
+                if (fit->second.rfind("__class__:", 0) == 0) return "type";
+                if (fit->second.rfind("__builtin__:", 0) == 0) return "builtin_function_or_method";
+                return "function";
+            }
+        }
+        return "object";
+    }
+
+    // ─── STR / REPR ─────────────────────────────────────────────────────
+    // One implementation behind print(), str(), repr(), f-strings, format()
+    // and the text of containers, so all of them agree: containers show their
+    // elements' repr (strings quoted), floats the shortest round-trip form.
+    std::string strOf(const Value& v, Context* ctx = nullptr) { return toText(v, false, ctx, 0); }
+    std::string reprOf(const Value& v, Context* ctx = nullptr) { return toText(v, true, ctx, 0); }
+    std::string toText(const Value& v, bool repr, Context* ctx, int depth) {
+        switch (v.type) {
+            case ValueType::NONE: return "none";
+            case ValueType::BOOLEAN: return v.value.b ? "true" : "false";
+            case ValueType::INTEGER: return intToString(v.value.i);
+            case ValueType::DOUBLE: return nypy::float_repr((double)v.value.d);
+            case ValueType::UNDEFINED: return "undefined";
+            default: break;
+        }
+        if (depth > 50) return "...";
+        if (v.type == ValueType::USERDATA) {
+            if (!v.value.p) return "none";
+            if (string_ptrs_.count(v.value.p)) {
+                const std::string& s = *(std::string*)v.value.p;
+                return repr ? nypy::str_repr(s) : s;
+            }
+            if (instance_to_class.count(v.value.p)) {
+                std::vector<Value> no_args;
+                Context* c = ctx ? ctx : global_ctx;
+                if (!repr) {
+                    Value r;
+                    try { r = callMethod(v, "__str__", no_args, c); }
+                    catch (nython::node::ReturnSignal& rs) { r = rs.value; }
+                    if (r.type != ValueType::NONE && r.type != ValueType::UNDEFINED) return getStringValue(r);
+                }
+                Value r;
+                try { r = callMethod(v, "__repr__", no_args, c); }
+                catch (nython::node::ReturnSignal& rs) { r = rs.value; }
+                if (r.type != ValueType::NONE && r.type != ValueType::UNDEFINED) return getStringValue(r);
+                return "<" + typeNameOf(v) + " instance>";
+            }
+            auto fit = func_names.find(v.value.p);
+            if (fit != func_names.end()) {
+                if (fit->second.rfind("__builtin__:", 0) == 0) return "<built-in function " + fit->second.substr(12) + ">";
+                return funcDisplayName(fit->second);
+            }
+            const std::string& s = *(std::string*)v.value.p;
+            return repr ? nypy::str_repr(s) : s;
+        }
+        Container* c = contOf(v);
+        if (!c) return v.value.gc ? v.value.gc->toString() : "none";
+        int64_t n = seqLen(c);
+        if (n >= 0) {
+            bool tup = isTupleCont(c), st = isSetCont(c);
+            if (st && n == 0) return "set()";
+            std::string r = tup ? "(" : st ? "{" : "[";
+            for (int64_t i = 0; i < n; i++) {
+                if (i) r += ", ";
+                auto it = c->container->find(std::to_string(i));
+                if (it != c->container->end()) {
+                    if (it->second.isCollectable() && it->second.value.gc == v.value.gc) r += tup ? "(...)" : "[...]";
+                    else r += toText(it->second, true, ctx, depth + 1);
+                }
+            }
+            if (tup && n == 1) r += ",";
+            return r + (tup ? ")" : st ? "}" : "]");
+        }
+        std::string r = "{";
+        bool first = true;
+        for (auto& kv : *c->container) {
+            if (isInternalKey(kv.first)) continue;
+            if (!first) r += ", ";
+            first = false;
+            r += toText(keyValue(kv.first), true, ctx, depth + 1) + ": " + (kv.second.isCollectable() && kv.second.value.gc == v.value.gc ? std::string("{...}") : toText(kv.second, true, ctx, depth + 1));
+        }
+        return r + "}";
+    }
+
+    // ─── FORMATTING ─────────────────────────────────────────────────────
+    // A value as the shared formatter sees it (NyFormat.hpp); conv is
+    // 's', 'r' or 'a' to pass its str/repr/ascii text instead.
+    nypy::FmtVal toFmtVal(const Value& v, char conv, Context* ctx) {
+        if (conv == 's') return nypy::FmtVal::of_str(strOf(v, ctx));
+        if (conv == 'r') return nypy::FmtVal::of_str(reprOf(v, ctx));
+        if (conv == 'a') {
+            std::string r = reprOf(v, ctx), out;
+            for (size_t i = 0; i < r.size();) {
+                size_t j = i; uint32_t cp = nypy::u8_decode(r, j);
+                if (cp < 0x80) out += (char)cp; else out += nypy::hex_esc(cp);
+                i = j;
+            }
+            return nypy::FmtVal::of_str(out);
+        }
+        switch (v.type) {
+            case ValueType::NONE: return nypy::FmtVal::of_none();
+            case ValueType::BOOLEAN: return nypy::FmtVal::of_bool(v.value.b);
+            case ValueType::INTEGER: {
+                int64_t i;
+                if (bigint_fits_i64(v.value.i, i)) return nypy::FmtVal::of_int(i);
+                return nypy::FmtVal::of_big(bigint_to_nbig(v.value.i));
+            }
+            case ValueType::DOUBLE: return nypy::FmtVal::of_float((double)v.value.d);
+            default: break;
+        }
+        if (isStringValue(v)) return nypy::FmtVal::of_str(*(std::string*)v.value.p);
+        return nypy::FmtVal::of_other(strOf(v, ctx), typeNameOf(v));
+    }
+    // format(value, spec), with __format__ on instances.
+    std::string formatValue(const Value& v, const std::string& spec, Context* ctx) {
+        if (isInstanceVal(v)) {
+            std::vector<Value> a = {makeStringValue(spec)};
+            Value r = callMethod(v, "__format__", a, ctx ? ctx : global_ctx);
+            if (r.type != ValueType::NONE && r.type != ValueType::UNDEFINED) return getStringValue(r);
+            if (spec.empty()) return strOf(v, ctx);
+        }
+        return nyCall([&] { return nypy::format_value(toFmtVal(v, 0, ctx), spec); });
+    }
+    // str methods: arguments to and results from nypy::str_method.
+    nypy::SArg toSArg(const Value& v, Context* ctx) {
+        nypy::SArg a;
+        a.tname = typeNameOf(v);
+        switch (v.type) {
+            case ValueType::NONE: a.k = nypy::SArg::NONE; return a;
+            case ValueType::BOOLEAN: a.k = nypy::SArg::BOOL; a.i = v.value.b ? 1 : 0; return a;
+            case ValueType::INTEGER: a.k = nypy::SArg::INT; a.i = bigint_to_i64(v.value.i); return a;
+            default: break;
+        }
+        if (isStringValue(v)) { a.k = nypy::SArg::STR; a.s = *(std::string*)v.value.p; return a; }
+        if (contOf(v) || isInstanceVal(v)) {
+            // An iterable of strings (join, startswith((...)))
+            std::vector<Value> items = iterItems(v, ctx);
+            a.k = nypy::SArg::STRS;
+            for (size_t i = 0; i < items.size(); i++) {
+                if (!isStringValue(items[i]))
+                    pyRaise("TypeError", "sequence item " + std::to_string(i) + ": expected str instance, " + typeNameOf(items[i]) + " found");
+                a.v.push_back(*(std::string*)items[i].value.p);
+            }
+            return a;
+        }
+        a.k = nypy::SArg::OTHER;
+        return a;
+    }
+    Value fromSRes(const nypy::SRes& r) {
+        switch (r.k) {
+            case nypy::SRes::INT: return intValue(r.i);
+            case nypy::SRes::BOOL: return Value(r.b);
+            case nypy::SRes::STR:
+                if (r.i == 1) { double d = 0; nypy::parse_float_str(r.s, d); return Value(d); }
+                return makeStringValue(r.s);
+            case nypy::SRes::LIST: case nypy::SRes::TUPLE: {
+                std::vector<Value> items;
+                items.reserve(r.v.size());
+                for (auto& x : r.v) items.push_back(makeStringValue(x));
+                return makeListValue(items, r.k == nypy::SRes::TUPLE);
+            }
+            default: return NONE_VALUE;
+        }
+    }
+    // A value's attribute, for "{0.attr}" fields.
+    Value attrOf(const Value& obj, const std::string& name) {
+        if (obj.type == ValueType::USERDATA && obj.value.p) {
+            auto pit = instance_properties.find(obj.value.p);
+            if (pit != instance_properties.end()) {
+                Value v = pit->second->getByName(name);
+                if (v.type != ValueType::UNDEFINED) return v;
+            }
+        }
+        if (Container* c = contOf(obj)) {
+            auto it = c->container->find(name);
+            if (it != c->container->end()) return it->second;
+        }
+        pyRaise("AttributeError", "'" + typeNameOf(obj) + "' object has no attribute '" + name + "'");
+    }
+    // str.format: positional {} / {0}, named {name}, {0.attr}, {0[key]},
+    // !r/!s/!a and format specs, through nypy::str_format.
+    std::string strFormat(const std::string& fmt, const std::vector<Value>& args,
+                          const std::unordered_map<std::string, Value>& kw, Context* ctx) {
+        return nyCall([&] {
+            return nypy::str_format(fmt, [&](const nypy::FieldRef& f, char conv) -> nypy::FmtVal {
+                Value v;
+                if (f.numeric) {
+                    if (f.index < 0 || (size_t)f.index >= args.size())
+                        pyRaise("IndexError", "Replacement index " + std::to_string(f.index) + " out of range for positional args tuple");
+                    v = args[(size_t)f.index];
+                } else {
+                    auto it = kw.find(f.name);
+                    if (it == kw.end()) pyRaise("KeyError", nypy::str_repr(f.name));
+                    v = it->second;
+                }
+                for (auto& step : f.chain) {
+                    if (step.first == '.') v = attrOf(v, step.second);
+                    else {
+                        bool digits = !step.second.empty() && std::all_of(step.second.begin(), step.second.end(), [](char c) { return c >= '0' && c <= '9'; });
+                        v = getItem(v, digits ? intValue((int64_t)std::stoll(step.second)) : makeStringValue(step.second), ctx);
+                    }
+                }
+                if (conv) return toFmtVal(v, conv, ctx);
+                if (isInstanceVal(v)) return nypy::FmtVal::of_other(strOf(v, ctx), typeNameOf(v));
+                return toFmtVal(v, 0, ctx);
+            });
+        });
+    }
+
+    // "fmt" % args
+    Value percentFormat(const std::string& fmt, const Value& rv, Context* ctx) {
+        std::vector<Value> args;
+        bool mapping = false;
+        Container* rc = contOf(rv);
+        if (rc && seqLen(rc) >= 0 && isTupleCont(rc)) args = seqItems(rc);
+        else { args.push_back(rv); mapping = rc && seqLen(rc) < 0; }
+        std::string out = nyCall([&] {
+            return nypy::percent_format(fmt, (int64_t)args.size(), mapping,
+                [&](int64_t i, const std::string& key, char conv) -> nypy::FmtVal {
+                    if (i < 0) {
+                        auto it = dictFind(rc, makeStringValue(key));
+                        if (it == rc->container->end()) pyRaise("KeyError", nypy::str_repr(key));
+                        return toFmtVal(it->second, conv, ctx);
+                    }
+                    return toFmtVal(args[(size_t)i], conv, ctx);
+                });
+        });
+        return makeStringValue(out);
+    }
+
+    Value evalBinary(node_ptr node, Context* ctx) {
+        BinaryNode* bn = static_cast<BinaryNode*>(node.get());
+        int opc = binOpCode(bn->op);
+        switch (opc) {
+        // `and` / `or` short-circuit on truthiness and yield an operand, as in
+        // Python: 0 or "x" is "x", [] or [1] is [1], "" and 1 is "". They used
+        // to test only for false/none and always produced a bool for `and`.
+        case OP_AND: { Value lv = evalNode(bn->left, ctx); if (!isTruthy(lv)) return lv; return evalNode(bn->right, ctx); }
+        case OP_OR:  { Value lv = evalNode(bn->left, ctx); if (isTruthy(lv)) return lv; return evalNode(bn->right, ctx); }
+        case OP_IS: case OP_ISNOT: {
+            // `is` answers "does the left operand belong to the right?" in the
+            // widest useful sense, not only pointer identity:
+            //     1 is 1          -> true   (same value)
+            //     1 is int        -> true   (type name)
+            //     1 is Object     -> true   (everything is an Object)
+            //     obj is MyClass  -> true   (class, walking the parent chain)
+            // The right operand may be a TYPE NAME rather than a value, so the
+            // type test is tried before evaluating it. `instanceof` is a second
+            // spelling of `is`. `is not` is its negation (it used to rewrite
+            // the AST node in place and put it back afterwards).
+            Value lv = evalNode(bn->left, ctx);
+            std::string tn = typeNameOperand(bn->right, ctx);
+            bool r;
+            if (!tn.empty()) r = valueIsOfType(lv, tn, ctx);
+            else r = identical(lv, evalNode(bn->right, ctx));
+            return Value(opc == OP_IS ? r : !r);
+        }
+        default: break;
+        }
+        Value lv = evalNode(bn->left, ctx);
+        Value rv = evalNode(bn->right, ctx);
+        if (opc == OP_UNKNOWN) return NONE_VALUE;
+        return binaryOp(opc, lv, rv, ctx);
+    }
+
+    // Identity for `is`: immutable values (numbers, strings, none, bools)
+    // by value, everything else by reference.
+    bool identical(const Value& lv, const Value& rv) {
+        if (lv.isNone() && rv.isNone()) return true;
+        if (lv.isNone() || rv.isNone()) return false;
+        if (lv.type != rv.type) return false;
+        switch (lv.type) {
+            case ValueType::INTEGER: case ValueType::DOUBLE: return valuesEqual(lv, rv, 0);
+            case ValueType::BOOLEAN: return lv.value.b == rv.value.b;
+            case ValueType::USERDATA:
+                // Two equal strings are the same value even when they are
+                // separate allocations; instances compare by pointer.
+                if (string_ptrs_.count(lv.value.p) && string_ptrs_.count(rv.value.p))
+                    return *(std::string*)lv.value.p == *(std::string*)rv.value.p;
+                return lv.value.p == rv.value.p;
+            case ValueType::COLLECTABLE: return lv.value.gc == rv.value.gc;
+            default: return false;
+        }
+    }
+
+    Value evalUnary(node_ptr node, Context* ctx) {
+        auto un = static_pointer_cast<UnaryNode>(node);
+        Value v = evalNode(un->operand, ctx);
+        const std::string& op = un->op;
+        if (op == "!" || op == "not") return Value(!isTruthy(v));
+        if (op == "-" || op == "+" || op == "~") {
+            Num n;
+            if (asNum(v, n)) {
+                if (op == "+") return n.k == 3 ? v : (v.type == ValueType::BOOLEAN ? intValue(n.i) : v);
+                if (op == "-") {
+                    if (n.k == 3) return Value(-n.d);
+                    if (n.k == 1 && n.i != INT64_MIN) return intValue(-n.i);
+                    return intValue(-numBig(n));
+                }
+                if (n.k == 3) pyRaise("TypeError", "bad operand type for unary ~: 'float'");
+                if (n.k == 1) return intValue(~n.i);
+                return intValue(-(numBig(n) + nypy::BigInt(1)));
+            }
+            if (isInstanceVal(v)) {
+                std::vector<Value> no_args;
+                Value r = callMethod(v, op == "-" ? "__neg__" : op == "+" ? "__pos__" : "__invert__", no_args, ctx);
+                if (r.type != ValueType::NONE) return r;
+            }
+            if (op == "+") return v;
+            if (op == "~") return intValue(0);
+            return Value(0) - v;
+        }
+        if (op == "++" || op == "--") {
+            Num n;
+            Value result = asNum(v, n) ? numArith(op == "++" ? OP_ADD : OP_SUB, n, Num{1, 1, 0.0, nullptr})
+                                       : ((op == "++") ? v + Value(1) : v - Value(1));
+            // Post-increment/decrement: update the variable in context
+            if (un->operand->type() == NodeType::VARIABLE) {
+                ctx->setByName(un->operand->value(), result);
+            } else if (un->operand->type() == NodeType::ATTRIBUTE) {
+                // Handle obj.field++
+                auto attr = static_pointer_cast<AttributeNode>(un->operand);
+                Value obj = evalNode(attr->object, ctx);
+                if (obj.type == ValueType::USERDATA && obj.value.p) {
+                    auto pit = instance_properties.find(obj.value.p);
+                    if (pit != instance_properties.end())
+                        pit->second->setByName(attr->attr, result);
+                }
+            }
+            return v; // return OLD value (post-increment)
+        }
+        return v;
     }
 
     // ─── PRINT ──────────────────────────────────────────────────────────
@@ -1825,109 +2189,9 @@ return lv * rv;
         return NONE_VALUE;
     }
 
-    void printValueRepr(Value v, Context* ctx = nullptr) {
-        if (v.type == ValueType::USERDATA && v.value.p && func_names.count(v.value.p)
-            && !instance_to_class.count(v.value.p) && !string_ptrs_.count(v.value.p)) {
-            std::cout << funcDisplayName(func_names[v.value.p]);
-            return;
-        }
-        if (v.type == ValueType::USERDATA && v.value.p
-            && (string_ptrs_.count(v.value.p)
-                || (!func_names.count(v.value.p)
-                    && !instance_to_class.count(v.value.p)))) {
-            std::cout << "'" << *(std::string*)v.value.p << "'";
-        } else {
-            printValue(v, ctx);
-        }
-    }
+    void printValueRepr(Value v, Context* ctx = nullptr) { std::cout << reprOf(v, ctx); }
 
-    void printValue(Value v, Context* ctx = nullptr) {
-        switch (v.type) {
-            case ValueType::NONE: std::cout << "none"; break;
-            case ValueType::BOOLEAN: std::cout << (v.value.b ? "true" : "false"); break;
-            case ValueType::INTEGER: std::cout << v.value.i; break;
-            case ValueType::DOUBLE: std::cout << v.toString(); break;
-            case ValueType::UNDEFINED: std::cout << "undefined"; break;
-            case ValueType::COLLECTABLE:
-                if (v.value.gc) {
-                    auto* cont = dynamic_cast<Container*>(v.value.gc);
-                    if (cont && cont->container) {
-                        auto len_it = cont->container->find("__len__");
-                        if (len_it != cont->container->end()) {
-                            int len = (int)bigint_to_i64(len_it->second.value.i);
-                            bool is_tup = cont->container->count("__tuple__") > 0;
-                            bool is_set2 = cont->container->count("__set__") > 0;
-                            std::cout << (is_tup ? "(" : (is_set2 ? "{" : "["));
-                            for (int i = 0; i < len; i++) {
-                                if (i > 0) std::cout << ", ";
-                                auto eit = cont->container->find(std::to_string(i));
-                                if (eit != cont->container->end()) printValueRepr(eit->second);
-                            }
-                            if (is_tup && len == 1) std::cout << ",";
-                            std::cout << (is_tup ? ")" : (is_set2 ? "}" : "]"));
-                        } else {
-                            // Map or generic object
-                            std::cout << "{";
-                            bool first = true;
-                            for (auto& [k, val] : *cont->container) {
-                                if (k == "__len__") continue;
-                                if (!first) std::cout << ", ";
-                                std::cout << k << ": ";
-                                printValue(val);
-                                first = false;
-                            }
-                            std::cout << "}";
-                        }
-                    } else {
-                        std::cout << v.value.gc->toString();
-                    }
-                } else std::cout << "none";
-                break;
-            case ValueType::USERDATA:
-                if (v.value.p) {
-                    if (string_ptrs_.count(v.value.p)) {
-                        // Known string pointer
-                        std::cout << *(std::string*)v.value.p;
-                    } else if (instance_to_class.count(v.value.p)) {
-                        // Class instance - use __str__ if available
-                        std::vector<Value> sa = {v};
-                        Value sv = callBuiltin("str", sa, ctx);
-                        if (sv.type == ValueType::USERDATA && sv.value.p)
-                            std::cout << *(std::string*)sv.value.p;
-                        else
-                            std::cout << sv.toString();
-                    } else if (!func_names.count(v.value.p)) {
-                        // Plain string
-                        std::cout << *(std::string*)v.value.p;
-                    } else {
-                        // A function value. This printed "none", which is
-                        // actively misleading: the function is perfectly live
-                        // (calling it works, and it compares != none), it just
-                        // had no display case. Match the VM's spelling.
-                        std::cout << funcDisplayName(func_names[v.value.p]);
-                    }
-                } else std::cout << "none";
-                break;
-            default: {
-                    // Check if it's a list/collection and print nicely
-                    auto* cont = dynamic_cast<Container*>(v.value.gc);
-                    if (cont && cont->container) {
-                        auto len_it = cont->container->find("__len__");
-                        int len = (len_it != cont->container->end()) ? (int)bigint_to_i64(len_it->second.value.i) : 0;
-                        std::cout << "[";
-                        for (int i = 0; i < len; i++) {
-                            if (i > 0) std::cout << ", ";
-                            auto eit = cont->container->find(std::to_string(i));
-                            if (eit != cont->container->end()) printValueRepr(eit->second);
-                        }
-                        std::cout << "]";
-                    } else {
-                        std::cout << v.toString();
-                    }
-                    break;
-                }
-        }
-    }
+    void printValue(Value v, Context* ctx = nullptr) { std::cout << strOf(v, ctx); }
 
     // ─── CONTROL FLOW ───────────────────────────────────────────────────
     Value evalIf(node_ptr node, Context* ctx) {
@@ -1993,13 +2257,15 @@ return lv * rv;
                 // Check if this is a list (has numeric indices) or a map (has string keys)
                 auto len_it = cont->container->find("__len__");
                 int len = (len_it != cont->container->end()) ? static_cast<int>(bigint_to_i64(len_it->second.value.i)) : 0;
-                bool is_list = (len > 0) || cont->container->count("0");
+                bool is_list = seqLen(cont) >= 0;
                 
                 if (!is_list) {
                     // Dict/map iteration — iterate all non-internal keys
-                    for (auto& [key, val] : *cont->container) {
-                        if (key.empty() || key[0] == '_') continue; // skip __len__ etc
-                        ctx->defineByName(var_name, makeStringValue(key));
+                    // Over a snapshot of the keys: the body may add or
+                    // delete entries.
+                    std::vector<Value> keys = iterItems(iter_val, ctx);
+                    for (auto& key : keys) {
+                        ctx->defineByName(var_name, key);
                         try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
                         catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
                         NY_LOOP_FLOW(broke)
@@ -2045,9 +2311,9 @@ return lv * rv;
         if (iter_val.type == ValueType::USERDATA && iter_val.value.p) {
             // Check if it's a string (not in func_names)
             if (!func_names.count(iter_val.value.p)) {
-                std::string* sp = static_cast<std::string*>(iter_val.value.p);
-                for (size_t i = 0; i < sp->size(); i++) {
-                    std::string ch(1, (*sp)[i]);
+                // By character, not byte.
+                std::vector<std::string> chars = nypy::u8_chars(*static_cast<std::string*>(iter_val.value.p));
+                for (auto& ch : chars) {
                     ctx->defineByName(var_name, makeStringValue(ch));
                     try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
                     catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
@@ -2302,6 +2568,14 @@ return lv * rv;
         if (fn_val.type != ValueType::USERDATA || !fn_val.value.p) return NONE_VALUE;
         auto fit = func_names.find(fn_val.value.p);
         if (fit == func_names.end()) return NONE_VALUE;
+        // A builtin (key=len, map(str, xs)): its pointer is a std::string,
+        // not an AST node - reading it as one crashed.
+        if (fit->second.rfind("__builtin__:", 0) == 0) {
+            std::string bname = fit->second.substr(12);
+            return callBuiltin(bname, call_args, ctx);
+        }
+        if (instance_to_class.count(fn_val.value.p)) return callMethod(fn_val, "__call__", call_args, ctx);
+        if (fit->second.rfind("__class__:", 0) == 0 || fit->second.rfind("__instance__:", 0) == 0) return NONE_VALUE;
         // Bound-method `self` is supplied centrally in bindParamsKw via the
         // callee pointer. Lambdas are never bound (makeBoundMethod only binds
         // FUNCTION nodes declaring self), so the lambda path below can use
@@ -2394,333 +2668,42 @@ return lv * rv;
             std::string s = getStringValue(obj);
             bool is_string = string_ptrs_.count(obj.value.p) || (!func_names.count(obj.value.p) && !instance_to_class.count(obj.value.p));
             if (is_string) {
-                if (method_name == "upper") { return makeStringValue(utf8_upper(s)); }
-                if (method_name == "lower") { return makeStringValue(utf8_lower(s)); }
-                if (method_name == "strip" || method_name == "trim") {
-                    size_t a = s.find_first_not_of(" \t\n\r"), b = s.find_last_not_of(" \t\n\r");
-                    return makeStringValue(a == std::string::npos ? "" : s.substr(a, b-a+1));
+                // Every str method has one implementation shared with the VM
+                // (NyStr.hpp: nypy::str_method); only format needs values.
+                if (method_name == "format") return makeStringValue(strFormat(s, args, kw_args_in, ctx));
+                if (method_name == "format_map" && !args.empty()) {
+                    std::unordered_map<std::string, Value> kw;
+                    if (Container* mc = contOf(args[0])) for (auto& kv : *mc->container) if (!isInternalKey(kv.first)) kw[nypy::key_payload(kv.first)] = kv.second;
+                    std::vector<Value> none;
+                    return makeStringValue(strFormat(s, none, kw, ctx));
                 }
-                if (method_name == "split") {
-                    std::string delim = args.empty() ? " " : getStringValue(args[0]);
-                    int maxsplit = (args.size() >= 2 && args[1].type == ValueType::INTEGER)
-                        ? (int)bigint_to_i64(args[1].value.i) : -1;
-                    Object* list = new Object((Runnable*)runner, "list", Type::LIST);
-                    int idx = 0; size_t pos = 0, found;
-                    while ((maxsplit < 0 || idx < maxsplit) &&
-                           (found = s.find(delim, pos)) != std::string::npos) {
-                        list->set(std::to_string(idx++), makeStringValue(s.substr(pos, found - pos)));
-                        pos = found + delim.size();
-                    }
-                    list->set(std::to_string(idx++), makeStringValue(s.substr(pos)));
-                    list->set("__len__", Value((int)idx));
-                    return Value((Collectable*)list);
-                }
-                if (method_name == "join") {
-                    if (!args.empty() && args[0].isCollectable()) {
-                        auto* cont = dynamic_cast<Container*>(args[0].value.gc);
-                        if (cont && cont->container) {
-                            std::string result; int len = cont->size(), i = 0;
-                            for (int j = 0; j < len; j++) {
-                                auto it = cont->container->find(std::to_string(j));
-                                if (it != cont->container->end()) {
-                                    if (i > 0) result += s;
-                                    result += getStringValue(it->second);
-                                    i++;
-                                }
-                            }
-                            return makeStringValue(result);
-                        }
-                    }
-                    return makeStringValue("");
-                }
-                if (method_name == "replace") {
-                    if (args.size() >= 2) {
-                        std::string from = getStringValue(args[0]), to = getStringValue(args[1]);
-                        std::string r = s; size_t pos = 0;
-                        while ((pos = r.find(from, pos)) != std::string::npos) { r.replace(pos, from.size(), to); pos += to.size(); }
-                        return makeStringValue(r);
-                    }
-                    return makeStringValue(s);
-                }
-                if (method_name == "find" || method_name == "index") {
-                    if (!args.empty()) {
-                        size_t pos = s.find(getStringValue(args[0]));
-                        return Value(pos == std::string::npos ? -1 : (int)pos);
-                    }
-                    return Value(-1);
-                }
-                if (method_name == "startswith") {
-                    return args.empty() ? Value(false) : Value(s.find(getStringValue(args[0])) == 0);
-                }
-                if (method_name == "endswith") {
-                    if (args.empty()) return Value(false);
-                    std::string suf = getStringValue(args[0]);
-                    return Value(s.size() >= suf.size() && s.compare(s.size()-suf.size(), suf.size(), suf) == 0);
-                }
-                if (method_name == "contains" || method_name == "__contains__") {
-                    return args.empty() ? Value(false) : Value(s.find(getStringValue(args[0])) != std::string::npos);
-                }
-                if (method_name == "length" || method_name == "size") {
-                    int cc = 0;
-                    for (size_t ii = 0; ii < s.size(); ) {
-                        unsigned char uc = (unsigned char)s[ii];
-                        if (uc < 0x80) ii += 1; else if ((uc & 0xE0) == 0xC0) ii += 2;
-                        else if ((uc & 0xF0) == 0xE0) ii += 3; else if ((uc & 0xF8) == 0xF0) ii += 4; else ii += 1;
-                        cc++;
-                    }
-                    return Value(cc);
-                }
-                if (method_name == "reverse" || method_name == "reversed") {
-                    std::string r(s.rbegin(), s.rend()); return makeStringValue(r);
-                }
-                if (method_name == "repeat") {
-                    if (!args.empty() && args[0].type == ValueType::INTEGER) {
-                        std::string r; for (int64_t i = 0; i < bigint_to_i64(args[0].value.i); i++) r += s;
-                        return makeStringValue(r);
-                    }
-                    return makeStringValue(s);
-                }
-                if (method_name == "charAt" || method_name == "char_at") {
-                    if (!args.empty() && args[0].type == ValueType::INTEGER) {
-                        int idx = (int)bigint_to_i64(args[0].value.i);
-                        if (idx >= 0 && idx < (int)s.size()) return makeStringValue(std::string(1, s[idx]));
-                    }
-                    return makeStringValue("");
-                }
-                if (method_name == "substring" || method_name == "substr") {
-                    if (args.size() >= 2) return makeStringValue(s.substr(bigint_to_i64(args[0].value.i), bigint_to_i64(args[1].value.i)));
-                    if (args.size() >= 1) return makeStringValue(s.substr(bigint_to_i64(args[0].value.i)));
-                    return makeStringValue(s);
-                }
-                if (method_name == "slice") {
-                    // String slice with optional step: s[start:end:step]
-                    int start = 0, end_idx = static_cast<int>(s.size()), step = 1;
-                    if (args.size() >= 1 && args[0].type == ValueType::INTEGER) start = static_cast<int>(bigint_to_i64(args[0].value.i));
-                    if (args.size() >= 2 && args[1].type == ValueType::INTEGER) end_idx = static_cast<int>(bigint_to_i64(args[1].value.i));
-                    else if (args.size() >= 2 && args[1].type == ValueType::NONE) end_idx = static_cast<int>(s.size());
-                    if (args.size() >= 3 && args[2].type == ValueType::INTEGER) step = static_cast<int>(bigint_to_i64(args[2].value.i));
-                    int len = static_cast<int>(s.size());
-                    if (start < 0) start += len;
-                    if (end_idx < 0) end_idx += len;
-                    if (start < 0) start = 0;
-                    if (end_idx > len) end_idx = len;
-                    std::string result;
-                    if (step > 0) {
-                        for (int i = start; i < end_idx; i += step) result += s[static_cast<size_t>(i)];
-                    } else if (step < 0) {
-                        if (args.size() < 2 || args[1].type == ValueType::NONE) { start = len - 1; end_idx = -1; }
-                        if (args.size() >= 1 && args[0].type == ValueType::INTEGER) {
-                            start = static_cast<int>(bigint_to_i64(args[0].value.i));
-                            if (start == 0 && args.size() >= 2 && args[1].type == ValueType::NONE) start = len - 1;
-                        }
-                        for (int i = start; i > end_idx; i += step) result += s[static_cast<size_t>(i)];
-                    }
-                    return makeStringValue(result);
-                }
-                if (method_name == "isdigit") {
-                    return Value(!s.empty() && std::all_of(s.begin(), s.end(), ::isdigit));
-                }
-                if (method_name == "format") {
-                    std::string result = s;
-                    // First handle numbered placeholders {0}, {1}, etc.
-                    for (size_t i = 0; i < args.size(); i++) {
-                        std::string placeholder = "{" + std::to_string(i) + "}";
-                        size_t pos;
-                        while ((pos = result.find(placeholder)) != std::string::npos) {
-                            result.replace(pos, placeholder.size(), getStringValue(args[i]));
-                        }
-                    }
-                    // Then handle positional {} placeholders
-                    for (size_t i = 0; i < args.size(); i++) {
-                        size_t pos = result.find("{}");
-                        if (pos != std::string::npos) {
-                            result.replace(pos, 2, getStringValue(args[i]));
-                        }
-                    }
-                    return makeStringValue(result);
-                }
-                if (method_name == "count") {
-                    if (!args.empty()) {
-                        std::string sub = getStringValue(args[0]);
-                        int count = 0; size_t pos = 0;
-                        while ((pos = s.find(sub, pos)) != std::string::npos) { count++; pos += sub.size(); }
-                        return Value(count);
-                    }
-                    return Value(0);
-                }
-                if (method_name == "capitalize") {
-                    std::string r = s;
-                    if (!r.empty()) r[0] = toupper(r[0]);
-                    return makeStringValue(r);
-                }
-                if (method_name == "title") {
-                    std::string r = s; bool next_upper = true;
-                    for (auto& c : r) { if (next_upper) { c = toupper(c); next_upper = false; } if (c == ' ') next_upper = true; }
-                    return makeStringValue(r);
-                }
-                if (method_name == "lstrip") {
-                    size_t a = s.find_first_not_of(" \t\n\r");
-                    return makeStringValue(a == std::string::npos ? "" : s.substr(a));
-                }
-                if (method_name == "rstrip") {
-                    size_t b = s.find_last_not_of(" \t\n\r");
-                    return makeStringValue(b == std::string::npos ? "" : s.substr(0, b+1));
-                }
-                if (method_name == "center") {
-                    if (!args.empty()) {
-                        int width = static_cast<int>(bigint_to_i64(args[0].value.i));
-                        char fill = (args.size() > 1) ? getStringValue(args[1])[0] : ' ';
-                        int pad = width - static_cast<int>(s.size());
-                        if (pad > 0) {
-                            int left = pad / 2;
-                            int right = pad - left;
-                            return makeStringValue(std::string(left, fill) + s + std::string(right, fill));
-                        }
-                    }
-                    return makeStringValue(s);
-                }
-                if (method_name == "ljust") {
-                    if (!args.empty()) {
-                        int width = static_cast<int>(bigint_to_i64(args[0].value.i));
-                        char fill = (args.size() > 1) ? getStringValue(args[1])[0] : ' ';
-                        if (static_cast<int>(s.size()) < width)
-                            return makeStringValue(s + std::string(width - s.size(), fill));
-                    }
-                    return makeStringValue(s);
-                }
-                if (method_name == "rjust") {
-                    if (!args.empty()) {
-                        int width = static_cast<int>(bigint_to_i64(args[0].value.i));
-                        char fill = (args.size() > 1) ? getStringValue(args[1])[0] : ' ';
-                        if (static_cast<int>(s.size()) < width)
-                            return makeStringValue(std::string(width - s.size(), fill) + s);
-                    }
-                    return makeStringValue(s);
-                }
-                if (method_name == "isalnum") {
-                    bool result = !s.empty();
-                    for (char c : s) if (!std::isalnum(static_cast<unsigned char>(c))) { result = false; break; }
-                    return Value(result);
-                }
-                if (method_name == "isupper") {
-                    bool result = !s.empty();
-                    for (char c : s) if (std::isalpha(static_cast<unsigned char>(c)) && !std::isupper(static_cast<unsigned char>(c))) { result = false; break; }
-                    return Value(result);
-                }
-                if (method_name == "islower") {
-                    bool result = !s.empty();
-                    for (char c : s) if (std::isalpha(static_cast<unsigned char>(c)) && !std::islower(static_cast<unsigned char>(c))) { result = false; break; }
-                    return Value(result);
-                }
-                if (method_name == "isspace") {
-                    bool result = !s.empty();
-                    for (char c : s) if (!std::isspace(static_cast<unsigned char>(c))) { result = false; break; }
-                    return Value(result);
-                }
-                if (method_name == "swapcase") {
-                    std::string r;
-                    for (char c : s) {
-                        if (std::isupper((unsigned char)c)) r += (char)std::tolower((unsigned char)c);
-                        else if (std::islower((unsigned char)c)) r += (char)std::toupper((unsigned char)c);
-                        else r += c;
-                    }
-                    return makeStringValue(r);
-                }
-                if (method_name == "partition") {
-                    if (!args.empty()) {
-                        std::string sep = getStringValue(args[0]);
-                        size_t pos = s.find(sep);
-                        Object* result = new Object((Runnable*)runner, "list", Type::LIST);
-                        if (pos != std::string::npos) {
-                            result->set("0", makeStringValue(s.substr(0, pos)));
-                            result->set("1", makeStringValue(sep));
-                            result->set("2", makeStringValue(s.substr(pos + sep.size())));
-                        } else {
-                            result->set("0", makeStringValue(s));
-                            result->set("1", makeStringValue(""));
-                            result->set("2", makeStringValue(""));
-                        }
-                        result->set("__len__", Value(3));
-                        return Value((Collectable*)result);
-                    }
-                    return NONE_VALUE;
-                }
-                if (method_name == "encode" || method_name == "decode") {
-                    return makeStringValue(s);
-                }
-                if (method_name == "removeprefix") {
-                    if (!args.empty()) {
-                        std::string pfx = getStringValue(args[0]);
-                        if (s.substr(0, pfx.size()) == pfx) return makeStringValue(s.substr(pfx.size()));
-                    }
-                    return makeStringValue(s);
-                }
-                if (method_name == "removesuffix") {
-                    if (!args.empty()) {
-                        std::string sfx = getStringValue(args[0]);
-                        if (s.size() >= sfx.size() && s.substr(s.size() - sfx.size()) == sfx)
-                            return makeStringValue(s.substr(0, s.size() - sfx.size()));
-                    }
-                    return makeStringValue(s);
-                }
-                if (method_name == "swapcase") {
-                    std::string result;
-                    for (char c : s) {
-                        if (std::isupper((unsigned char)c)) result += (char)std::tolower((unsigned char)c);
-                        else if (std::islower((unsigned char)c)) result += (char)std::toupper((unsigned char)c);
-                        else result += c;
-                    }
-                    return makeStringValue(result);
-                }
-                if (method_name == "partition") {
-                    if (!args.empty()) {
-                        std::string sep = getStringValue(args[0]);
-                        size_t pos = s.find(sep);
-                        Object* r = new Object((Runnable*)runner, "list", Type::LIST);
-                        if (pos != std::string::npos) {
-                            r->set("0", makeStringValue(s.substr(0, pos)));
-                            r->set("1", makeStringValue(sep));
-                            r->set("2", makeStringValue(s.substr(pos + sep.size())));
-                        } else { r->set("0", makeStringValue(s)); r->set("1", makeStringValue("")); r->set("2", makeStringValue("")); }
-                        r->set("__len__", Value(3));
-                        return Value((Collectable*)r);
-                    }
-                    return NONE_VALUE;
-                }
-                if (method_name == "removeprefix") {
-                    if (!args.empty()) { std::string p = getStringValue(args[0]); if (s.substr(0, p.size()) == p) return makeStringValue(s.substr(p.size())); }
-                    return makeStringValue(s);
-                }
-                if (method_name == "removesuffix") {
-                    if (!args.empty()) { std::string sf = getStringValue(args[0]); if (s.size() >= sf.size() && s.substr(s.size()-sf.size()) == sf) return makeStringValue(s.substr(0, s.size()-sf.size())); }
-                    return makeStringValue(s);
-                }
-                if (method_name == "encode" || method_name == "decode") { return makeStringValue(s); }
-                if (method_name == "zfill") {
-                    if (!args.empty() && args[0].type == ValueType::INTEGER) {
-                        int width = (int)bigint_to_i64(args[0].value.i);
-                        std::string r = s;
-                        while ((int)r.size() < width) r = "0" + r;
-                        return makeStringValue(r);
-                    }
-                    return makeStringValue(s);
-                }
-                if (method_name == "center") {
-                    if (!args.empty() && args[0].type == ValueType::INTEGER) {
-                        int width = (int)bigint_to_i64(args[0].value.i);
-                        if ((int)s.size() >= width) return makeStringValue(s);
-                        int pad = width - (int)s.size();
-                        int left = pad / 2, right = pad - left;
-                        return makeStringValue(std::string(left, ' ') + s + std::string(right, ' '));
-                    }
-                    return makeStringValue(s);
-                }
-                if (method_name == "isalpha") {
-                    return Value(!s.empty() && std::all_of(s.begin(), s.end(), ::isalpha));
-                }
+                std::vector<nypy::SArg> sa;
+                sa.reserve(args.size());
+                for (auto& a : args) sa.push_back(toSArg(a, ctx));
+                nypy::SRes r;
+                if (nyCall([&] { return nypy::str_method(s, method_name, sa, r); })) return fromSRes(r);
             }
         }
 
+        // dict methods first: the list block below also has pop/remove/clear.
+        if (Container* dc = contOf(obj); dc && seqLen(dc) < 0) {
+            Value r;
+            if (dictMethod(dc, obj, method_name, args, kw_args_in, ctx, r)) return r;
+        }
+        // list.remove(x): the first element equal to x (ValueError if none)
+        if (Container* lc = contOf(obj); lc && method_name == "remove" && seqLen(lc) >= 0 && !isSetCont(lc) && !isTupleCont(lc)) {
+            if (args.size() != 1) pyRaise("TypeError", "list.remove() takes exactly one argument (" + std::to_string(args.size()) + " given)");
+            std::vector<Value> items = seqItems(lc);
+            for (size_t i = 0; i < items.size(); i++) {
+                if (valuesEqual(items[i], args[0], 0)) {
+                    for (size_t k = i; k + 1 < items.size(); k++) (*lc->container)[std::to_string(k)] = items[k + 1];
+                    lc->container->erase(std::to_string(items.size() - 1));
+                    (*lc->container)["__len__"] = intValue((int64_t)items.size() - 1);
+                    return NONE_VALUE;
+                }
+            }
+            pyRaise("ValueError", "list.remove(x): x not in list");
+        }
         // Built-in list methods
         if (obj.isCollectable() && obj.value.gc) {
             auto* cont = dynamic_cast<Container*>(obj.value.gc);
@@ -2900,35 +2883,21 @@ return lv * rv;
                     }
                     return NONE_VALUE;
                 }
-                if (method_name == "slice") {
-                    // List slice with optional step
-                    auto len_it = cont->container->find("__len__");
-                    int list_len = (len_it != cont->container->end()) ? static_cast<int>(bigint_to_i64(len_it->second.value.i)) : 0;
-                    int start = 0, end_idx = list_len, step = 1;
-                    if (args.size() >= 1 && args[0].type == ValueType::INTEGER) start = static_cast<int>(bigint_to_i64(args[0].value.i));
-                    if (args.size() >= 2 && args[1].type == ValueType::INTEGER) end_idx = static_cast<int>(bigint_to_i64(args[1].value.i));
-                    else if (args.size() >= 2 && args[1].type == ValueType::NONE) end_idx = list_len;
-                    if (args.size() >= 3 && args[2].type == ValueType::INTEGER) step = static_cast<int>(bigint_to_i64(args[2].value.i));
-                    if (start < 0) start += list_len;
-                    if (end_idx < 0) end_idx += list_len;
-                    if (start < 0) start = 0;
-                    if (end_idx > list_len) end_idx = list_len;
-                    Object* result = new Object((Runnable*)runner, "list", Type::LIST);
-                    int idx = 0;
-                    if (step > 0) {
-                        for (int i = start; i < end_idx; i += step) {
-                            auto it = cont->container->find(std::to_string(i));
-                            if (it != cont->container->end()) result->set(std::to_string(idx++), it->second);
-                        }
-                    } else if (step < 0) {
-                        if (args.size() < 2 || args[1].type == ValueType::NONE) { start = list_len - 1; end_idx = -1; }
-                        for (int i = start; i > end_idx; i += step) {
-                            auto it = cont->container->find(std::to_string(i));
-                            if (it != cont->container->end()) result->set(std::to_string(idx++), it->second);
-                        }
+                if (method_name == "slice" && seqLen(cont) >= 0) {
+                    // L[a:b:c] (the parser emits L.slice(a, b, c), none for an
+                    // omitted bound), Python's slice semantics; a tuple slice
+                    // is a tuple.
+                    int64_t len = seqLen(cont), st = 0, en = 0, step = 1;
+                    bool hs = sliceArg(args, 0, st), he = sliceArg(args, 1, en);
+                    if (args.size() >= 3 && args[2].type != ValueType::NONE) sliceArg(args, 2, step);
+                    int64_t cnt = nyCall([&] { return nypy::slice_adjust(len, hs, st, he, en, step); });
+                    std::vector<Value> out;
+                    out.reserve((size_t)std::max<int64_t>(cnt, 0));
+                    for (int64_t k = 0, i = st; k < cnt; k++, i += step) {
+                        auto it = cont->container->find(std::to_string(i));
+                        out.push_back(it != cont->container->end() ? it->second : NONE_VALUE);
                     }
-                    result->set("__len__", Value(idx));
-                    return Value((Collectable*)result);
+                    return makeListValue(out, isTupleCont(cont));
                 }
                 if (method_name == "sort" || method_name == "sorted") {
                     auto len_it = cont->container->find("__len__");
@@ -3155,161 +3124,10 @@ return lv * rv;
             }
         }
 
-        // Built-in map methods
-        if (obj.isCollectable() && obj.value.gc) {
-            auto* cont = dynamic_cast<Container*>(obj.value.gc);
-            if (cont && cont->container) {
-                // Check if it's a map (no __len__ key = likely a map)
-                bool is_map = true;
-                if (method_name == "keys") {
-                    Object* result = new Object((Runnable*)runner, "list", Type::LIST);
-                    int idx = 0;
-                    for (auto& [k, v] : *cont->container) {
-                        if (k != "__len__") result->set(std::to_string(idx++), makeStringValue(k));
-                    }
-                    result->set("__len__", Value(idx));
-                    return Value((Collectable*)result);
-                }
-                if (method_name == "values") {
-                    Object* result = new Object((Runnable*)runner, "list", Type::LIST);
-                    int idx = 0;
-                    for (auto& [k, v] : *cont->container) {
-                        if (k != "__len__") result->set(std::to_string(idx++), v);
-                    }
-                    result->set("__len__", Value(idx));
-                    return Value((Collectable*)result);
-                }
-                if (method_name == "has_key" || method_name == "has" || method_name == "containsKey") {
-                    if (!args.empty()) {
-                        std::string key = getStringValue(args[0]);
-                        return Value(cont->container->count(key) > 0);
-                    }
-                    return Value(false);
-                }
-                if (method_name == "pop") {
-                    if (!args.empty()) {
-                        std::string key = getStringValue(args[0]);
-                        auto it = cont->container->find(key);
-                        if (it != cont->container->end()) {
-                            Value val = it->second;
-                            cont->container->erase(key);
-                            return val;
-                        }
-                        if (args.size() >= 2) return args[1]; // default value
-                    }
-                    return NONE_VALUE;
-                }
-                if (method_name == "update") {
-                    if (!args.empty() && args[0].isCollectable()) {
-                        auto* src = dynamic_cast<Container*>(args[0].value.gc);
-                        if (src && src->container) {
-                            for (auto& [k, v] : *src->container) {
-                                if (k != "__len__" && !k.empty() && k[0] != '_')
-                                    (*cont->container)[k] = v;
-                            }
-                        }
-                    }
-                    return NONE_VALUE;
-                }
-                if (method_name == "setdefault") {
-                    if (!args.empty()) {
-                        std::string key = getStringValue(args[0]);
-                        auto it = cont->container->find(key);
-                        if (it != cont->container->end()) return it->second;
-                        Value def = (args.size() >= 2) ? args[1] : NONE_VALUE;
-                        (*cont->container)[key] = def;
-                        return def;
-                    }
-                    return NONE_VALUE;
-                }
-                if (method_name == "get") {
-                    if (!args.empty()) {
-                        std::string key = getStringValue(args[0]);
-                        auto it = cont->container->find(key);
-                        if (it != cont->container->end()) return it->second;
-                        if (args.size() >= 2) return args[1]; // default value
-                    }
-                    return NONE_VALUE;
-                }
-                if (method_name == "remove" || method_name == "delete") {
-                    if (args.empty()) return NONE_VALUE;
-                    // Discriminate container kind: lists/sets carry "__len__",
-                    // maps do not. Previously this block ran LIST logic on maps
-                    // (scanning "0","1","2"...) and called args[0].toString(),
-                    // which threw on USERDATA strings.
-                    bool is_indexed = cont->container->count("__len__") > 0;
-                    if (!is_indexed) {
-                        // MAP: erase by key, return the removed value.
-                        std::string key = getStringValue(args[0]);
-                        auto it = cont->container->find(key);
-                        if (it != cont->container->end()) {
-                            Value removed = it->second;
-                            cont->container->erase(it);
-                            return removed;
-                        }
-                        if (args.size() >= 2) return args[1]; // default when absent
-                        return NONE_VALUE;
-                    }
-                    // LIST: remove first element equal to args[0], shift left.
-                    {
-                        auto len_it = cont->container->find("__len__");
-                        int len = (len_it != cont->container->end()) ? static_cast<int>(bigint_to_i64(len_it->second.value.i)) : 0;
-                        // Use getStringValue, not Value::toString(): toString()
-                        // throws on USERDATA (interned string) values.
-                        std::string target = getStringValue(args[0]);
-                        int found = -1;
-                        for (int i = 0; i < len; i++) {
-                            auto it = cont->container->find(std::to_string(i));
-                            if (it != cont->container->end() && getStringValue(it->second) == target) {
-                                found = i;
-                                break;
-                            }
-                        }
-                        if (found >= 0) {
-                            // Shift elements left
-                            for (int i = found; i < len - 1; i++) {
-                                auto next = cont->container->find(std::to_string(i + 1));
-                                if (next != cont->container->end())
-                                    (*cont->container)[std::to_string(i)] = next->second;
-                            }
-                            cont->container->erase(std::to_string(len - 1));
-                            (*cont->container)["__len__"] = Value(len - 1);
-                        }
-                    }
-                    return NONE_VALUE;
-                }
-                if (method_name == "size" || method_name == "length") {
-                    int count = 0;
-                    for (auto& [k, v] : *cont->container) { if (k != "__len__") count++; }
-                    return Value(count);
-                }
-                if (method_name == "items" || method_name == "entries") {
-                    Object* result = new Object((Runnable*)runner, "list", Type::LIST);
-                    int idx = 0;
-                    for (auto& [k, v] : *cont->container) {
-                        if (k != "__len__") {
-                            Object* pair = new Object((Runnable*)runner, "list", Type::LIST);
-                            pair->set("0", makeStringValue(k));
-                            pair->set("1", v);
-                            pair->set("__len__", Value(2));
-                            result->set(std::to_string(idx++), Value((Collectable*)pair));
-                        }
-                    }
-                    result->set("__len__", Value(idx));
-                    return Value((Collectable*)result);
-                }
-                if (method_name == "merge" || method_name == "update") {
-                    if (!args.empty() && args[0].isCollectable()) {
-                        auto* other = dynamic_cast<Container*>(args[0].value.gc);
-                        if (other && other->container) {
-                            for (auto& [k, v] : *other->container) {
-                                if (k != "__len__") (*cont->container)[k] = v;
-                            }
-                        }
-                    }
-                    return obj;
-                }
-            }
+        // Built-in dict methods (keys are typed: dictKey/keyValue)
+        if (Container* cont = contOf(obj)) {
+            Value r;
+            if (dictMethod(cont, obj, method_name, args, kw_args_in, ctx, r)) return r;
         }
 
         // Find the class this instance belongs to
@@ -3768,7 +3586,7 @@ return lv * rv;
                         auto* cont = dynamic_cast<Container*>(spread_val.value.gc);
                         if (cont && cont->container)
                             for (auto& [k, v] : *cont->container)
-                                if (k != "__len__") kw_args[k] = v;
+                                if (!isInternalKey(k)) kw_args[nypy::key_payload(k)] = v;
                     }
                 } else {
                     call_args.push_back(evalNode(a, ctx));
@@ -4506,8 +4324,19 @@ public:
         if (fname.find("__builtin__:") == 0) {
             std::string builtin = fname.substr(12);
             // Flatten kwargs for builtins that accept them (key=, reverse=, default=)
+            // The core builtins (builtins/pycore.cpp) read their keyword
+            // arguments by name. Flattening them into positional arguments
+            // made min(a, b, key=f) look like min(a, b, f).
+            static const std::unordered_set<std::string> kw_native = {
+                "sorted", "min", "max", "sum", "enumerate", "round", "int", "dict", "pow",
+                "format", "range", "zip", "map", "filter", "list", "tuple", "set", "str", "repr"
+            };
+            if (kw_native.count(builtin)) {
+                KwScope ks(this, kw_args.empty() ? nullptr : &kw_args);
+                return callBuiltin(builtin, args, ctx);
+            }
             static const std::unordered_set<std::string> kw_builtins = {
-                "sorted", "min", "max", "filter", "map", "reduce", "enumerate"
+                "reduce"
             };
             if (!kw_args.empty() && kw_builtins.count(builtin)) {
                 auto kit = kw_args.find("key");
@@ -4923,6 +4752,7 @@ public:
 
         // ── Module dispatch (try each module in priority order) ────────────────
         Value result;
+        result = dispatch_pycore(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         result = dispatch_lang(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         result = dispatch_core(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         result = dispatch_tensor(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
@@ -4961,8 +4791,7 @@ public:
             Value key = evalNode(me->key, ctx);
             Value val = evalNode(me->val, ctx);
             // Use string key for map storage
-            std::string skey = getStringValue(key);
-            (*cont->container)[skey] = val;
+            dictSet(cont, key, val);
         }
         return Value((Collectable*)cont);
     }
@@ -5129,58 +4958,6 @@ public:
                 }
               }
             }
-        }
-        return NONE_VALUE;
-    }
-
-    Value evalSubscript(node_ptr node, Context* ctx) {
-        auto sn = static_pointer_cast<SubscriptNode>(node);
-        Value obj = evalNode(sn->object, ctx);
-        Value idx = evalNode(sn->index, ctx);
-
-        // String indexing: s[0], s[-1]
-        if (obj.type == ValueType::USERDATA && obj.value.p && !func_names.count(obj.value.p)) {
-            std::string s = getStringValue(obj);
-            if (idx.type == ValueType::INTEGER) {
-                int64_t i = bigint_to_i64(idx.value.i);
-                if (i < 0) i += (int64_t)s.size();
-                if (i >= 0 && i < (int64_t)s.size())
-                    return makeStringValue(std::string(1, s[(size_t)i]));
-            }
-            return NONE_VALUE;
-        }
-
-        // List/Map indexing with negative index support
-        if (obj.isCollectable() && obj.value.gc) {
-            auto* cont = dynamic_cast<Container*>(obj.value.gc);
-            if (cont && cont->container) {
-                if (idx.type == ValueType::INTEGER) {
-                    int64_t i = bigint_to_i64(idx.value.i);
-                    if (i < 0) {
-                        auto len_it = cont->container->find("__len__");
-                        if (len_it != cont->container->end())
-                            i += bigint_to_i64(len_it->second.value.i);
-                    }
-                    auto it = cont->container->find(std::to_string(i));
-                    if (it != cont->container->end()) return it->second;
-                    // Index out of bounds: check if it's a list
-                    auto len_it = cont->container->find("__len__");
-                    if (len_it != cont->container->end()) {
-                        throw std::string("__exc__:IndexError:index " + std::to_string(i) + " out of range (length " + std::to_string(bigint_to_i64(len_it->second.value.i)) + ")");
-                    }
-                }
-                // String key lookup for maps
-                std::string key = (idx.type == ValueType::USERDATA) ? getStringValue(idx) :
-                                  idx.isCollectable() ? valueToKeyString(idx) : idx.toString();
-                auto it = cont->container->find(key);
-                if (it != cont->container->end()) return it->second;
-            }
-        }
-        // Check for __getitem__ on instances
-        if (obj.type == ValueType::USERDATA && obj.value.p && !string_ptrs_.count(obj.value.p) && instance_to_class.count(obj.value.p)) {
-            std::vector<Value> call_args = {idx};
-            Value result = callMethod(obj, "__getitem__", call_args, ctx);
-            if (result.type != ValueType::NONE) return result;
         }
         return NONE_VALUE;
     }
@@ -5510,6 +5287,7 @@ public:
             "int","Integer","integer","float","Float","double","Double",
             "str","String","string","bool","Boolean","boolean",
             "list","List","array","Array","map","Map","dict","Dict",
+            "tuple","Tuple","set","Set",
             "none","None","function","Function","Object","object","any","Any"
         };
         if (type_names.count(n)) return n;
@@ -5544,11 +5322,24 @@ public:
         // and `type()` can never disagree.
         std::vector<Value> targs{v};
         std::string actual = getStringValue(callBuiltin("type", targs, ctx));
-        if (actual == "string" && (want=="str"||want=="String"||want=="string")) return true;
-        if (actual == "list"   && (want=="list"||want=="List"||want=="array"||want=="Array")) return true;
-        if (actual == "map"    && (want=="map"||want=="Map"||want=="dict"||want=="Dict")) return true;
-        if (actual == "function" && (want=="function"||want=="Function")) return true;
-        if (actual == want) return true;
+        auto names_type = [&](const std::string& t) {
+            if (t == "string") return want=="str"||want=="String"||want=="string";
+            if (t == "list")   return want=="list"||want=="List"||want=="array"||want=="Array";
+            if (t == "map")    return want=="map"||want=="Map"||want=="dict"||want=="Dict";
+            if (t == "tuple")  return want=="tuple"||want=="Tuple";
+            if (t == "set")    return want=="set"||want=="Set";
+            // A builtin (print, len...) is a function like any other.
+            if (t == "function" || t == "builtin") return want=="function"||want=="Function";
+            if (t == "int")    return want=="int"||want=="Integer"||want=="integer";
+            if (t == "float")  return want=="float"||want=="Float"||want=="double"||want=="Double";
+            if (t == "bool")   return want=="bool"||want=="Boolean"||want=="boolean";
+            if (t == "none")   return want=="none"||want=="None";
+            return false;
+        };
+        if (names_type(actual) || actual == want) return true;
+        // type(x) returns the type's name, so `type(t) is tuple` compares
+        // that name with the type.
+        if (actual == "string" && names_type(*static_cast<std::string*>(v.value.p))) return true;
 
         // Class membership, walking the inheritance chain so
         // `child is Base` holds.
@@ -6373,32 +6164,22 @@ public:
             auto sub = static_pointer_cast<SubscriptNode>(dn->target);
             Value obj = evalNode(sub->object, ctx);
             Value idx = evalNode(sub->index, ctx);
-            if (obj.isCollectable() && obj.value.gc) {
-                auto* cont = dynamic_cast<Container*>(obj.value.gc);
-                if (cont && cont->container) {
-                    std::string key;
-                    if (idx.type == ValueType::INTEGER) key = std::to_string(bigint_to_i64(idx.value.i));
-                    else key = getStringValue(idx);
-                    cont->container->erase(key);
-                    // Update __len__ for lists and reindex
-                    auto len_it = cont->container->find("__len__");
-                    if (len_it != cont->container->end()) {
-                        int64_t old_len = bigint_to_i64(len_it->second.value.i);
-                        // If the key was numeric, shift subsequent elements down
-                        if (idx.type == ValueType::INTEGER) {
-                            int64_t del_idx = bigint_to_i64(idx.value.i);
-                            for (int64_t j = del_idx + 1; j < old_len; j++) {
-                                std::string src = std::to_string(j);
-                                std::string dst = std::to_string(j - 1);
-                                auto it2 = cont->container->find(src);
-                                if (it2 != cont->container->end()) {
-                                    (*cont->container)[dst] = it2->second;
-                                    cont->container->erase(src);
-                                }
-                            }
-                        }
-                        (*cont->container)["__len__"] = Value(static_cast<int>(old_len - 1));
-                    }
+            if (Container* cont = contOf(obj)) {
+                int64_t n = seqLen(cont);
+                if (n < 0) {
+                    // del d[k]: a missing key is a KeyError, as in Python
+                    if (cont->container->erase(dictKey(idx)) == 0) pyRaise("KeyError", reprOf(idx, ctx));
+                } else {
+                    if (isTupleCont(cont)) pyRaise("TypeError", "'tuple' object doesn't support item deletion");
+                    Num k;
+                    if (!asNum(idx, k) || k.k == 3) pyRaise("TypeError", "list indices must be integers or slices, not " + typeNameOf(idx));
+                    int64_t i = k.k == 1 ? k.i : INT64_MAX;
+                    if (i < 0) i += n;
+                    if (i < 0 || i >= n) pyRaise("IndexError", "list assignment index out of range");
+                    std::vector<Value> items = seqItems(cont);
+                    for (int64_t j = i; j + 1 < n; j++) (*cont->container)[std::to_string(j)] = items[(size_t)j + 1];
+                    cont->container->erase(std::to_string(n - 1));
+                    (*cont->container)["__len__"] = intValue(n - 1);
                 }
             }
         } else if (dn->target->type() == NodeType::ATTRIBUTE) {
@@ -6532,24 +6313,63 @@ public:
     }
 
     // ─── HELPER ─────────────────────────────────────────────────────────
-    bool isTruthy(Value v) {
-        if (v.isNone()) return false;
-        if (v.type == ValueType::UNDEFINED) return false;
-        if (v.type == ValueType::BOOLEAN) return v.value.b;
-        if (v.type == ValueType::INTEGER) return bigint_to_i64(v.value.i) != 0;
-        if (v.type == ValueType::DOUBLE) return v.value.d != 0.0;
-        if (v.type == ValueType::USERDATA) {
-            std::string s = getStringValue(v);
-            return !s.empty();
+    // Python truthiness: none, false, 0, 0.0, "" and empty containers are
+    // false; an instance asks its __bool__, then its __len__.
+    bool isTruthy(const Value& v) {
+        switch (v.type) {
+            case ValueType::NONE: case ValueType::UNDEFINED: return false;
+            case ValueType::BOOLEAN: return v.value.b;
+            case ValueType::INTEGER: { for (auto l : v.value.i.limbs()) if (l) return true; return false; }
+            case ValueType::DOUBLE: return v.value.d != 0.0;
+            case ValueType::USERDATA:
+                if (!v.value.p) return false;
+                if (string_ptrs_.count(v.value.p)) return !static_cast<std::string*>(v.value.p)->empty();
+                if (instance_to_class.count(v.value.p)) return instanceTruthy(v);
+                if (func_names.count(v.value.p)) return true;
+                return !static_cast<std::string*>(v.value.p)->empty();
+            default: break;
         }
-        if (v.isCollectable() && v.value.gc) {
-            auto* cont = dynamic_cast<Container*>(v.value.gc);
-            if (cont && cont->container) {
-                auto li = cont->container->find("__len__");
-                if (li != cont->container->end()) return bigint_to_i64(li->second.value.i) != 0;
-            }
+        if (Container* c = contOf(v)) {
+            int64_t n = seqLen(c);
+            if (n >= 0) return n != 0;
+            for (auto& kv : *c->container)
+                if (!(kv.first.size() >= 2 && kv.first[0] == '_' && kv.first[1] == '_')) return true;
+            return false;
         }
-        return true;
+        return v.isCollectable() ? v.value.gc != nullptr : true;
+    }
+    // 0 = neither, 1 = __bool__, 2 = __len__, per class.
+    std::unordered_map<void*, int> truthy_proto_;
+    bool classDefines(void* class_ptr, const std::string& name, int depth = 0) {
+        if (!class_ptr || depth > 32) return false;
+        void* ast_ptr = class_ptr;
+        auto ast_it = func_ast_nodes.find(class_ptr);
+        if (ast_it != func_ast_nodes.end()) ast_ptr = ast_it->second;
+        Node* nd = (Node*)ast_ptr;
+        if (!nd || nd->type() != NodeType::CLASS) return false;
+        auto* cn = static_cast<ClassNode*>(nd);
+        if (cn->body)
+            for (auto& st : cn->body->statements())
+                if (st->type() == NodeType::FUNCTION && static_cast<FunctionNode*>(st.get())->name == name) return true;
+        for (auto& b : cn->bases) {
+            auto bit = class_by_name.find(b->value());
+            if (bit != class_by_name.end() && classDefines(bit->second, name, depth + 1)) return true;
+        }
+        return false;
+    }
+    bool instanceTruthy(const Value& v) {
+        void* cls = instance_to_class[v.value.p];
+        auto it = truthy_proto_.find(cls);
+        int kind;
+        if (it != truthy_proto_.end()) kind = it->second;
+        else {
+            kind = classDefines(cls, "__bool__") ? 1 : classDefines(cls, "__len__") ? 2 : 0;
+            truthy_proto_[cls] = kind;
+        }
+        if (kind == 0) return true;
+        std::vector<Value> no_args;
+        Value r = callMethod(v, kind == 1 ? "__bool__" : "__len__", no_args, global_ctx);
+        return isTruthy(r);
     }
 };
 

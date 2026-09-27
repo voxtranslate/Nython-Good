@@ -443,6 +443,26 @@ public:
         return sign_?1:0;
     }
 
+    // Direct access to the representation (sign + little-endian 64-bit
+    // magnitude limbs), for exact conversions without a decimal round trip.
+    // Zero may be stored as no limbs or as a single 0 limb.
+    bool isNegative() const
+    {
+        if(!sign_) return false;
+        for(auto v : data_) if(v) return true;
+        return false;
+    }
+    const __Data & limbs() const
+    {
+        return data_;
+    }
+    void assignLimbs(bool neg, __Data d)
+    {
+        data_ = std::move(d);
+        sign_ = neg;
+        shrink();
+    }
+
     //==================================================================
     //  Cast conversion operators.
     //==================================================================
