@@ -415,7 +415,7 @@ class NyImGui:
     # tree node's open state without the caller holding an object.
     def get_state(self, id, dflt):
         var k = str(id)
-        var v = self.storage[k]
+        var v = self.storage.get(k)
         if v == none:
             return dflt
         return v

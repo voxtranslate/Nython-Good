@@ -48,7 +48,7 @@ class Request:
             self.method = parsed["method"]
             self.path = parsed["path"]
             self.body = parsed["body"]
-            if parsed["query"] != none:
+            if parsed.get("query") != none:
                 self.query_string = parsed["query"]
 
     def query(self, key):
@@ -80,7 +80,7 @@ class Request:
         return ""
 
     def header(self, name):
-        var val = self.headers[string_lower(name)]
+        var val = self.headers.get(string_lower(name))
         if val == none:
             return ""
         return val
@@ -340,7 +340,7 @@ class RateLimitMiddleware:
         if ip == none or ip == "":
             var ip = "unknown"
         var now = time_now()
-        var entry = self.clients[ip]
+        var entry = self.clients.get(ip)
         if entry == none:
             var entry = {}
             entry["count"] = 0
@@ -403,7 +403,7 @@ class StaticFilesMiddleware:
         var mime = "application/octet-stream"
         if dot >= 0:
             var ext = rel[dot:]
-            var m = self.mime[ext]
+            var m = self.mime.get(ext)
             if m != none:
                 var mime = m
         res.send_file(filepath, mime)
@@ -422,7 +422,7 @@ class Session:
         self.accessed_at = time_now()
 
     def get(self, key):
-        return self.data[key]
+        return self.data.get(key)
 
     def delete(self, key):
         self.data[key] = none
@@ -444,7 +444,7 @@ class SessionStore:
         return sid
 
     def get(self, sid):
-        var s = self.sessions[sid]
+        var s = self.sessions.get(sid)
         if s == none:
             return none
         if s.is_expired(self.ttl):
@@ -718,7 +718,7 @@ class RequestValidator:
         var i = 0
         while i < self.rule_count:
             var rule = self.rules[i]
-            var val = data[rule.field]
+            var val = data.get(rule.field)
             var failed = false
             if rule.rule_type == "required":
                 if val == none or str(val) == "":
@@ -824,7 +824,7 @@ class ErrorHandler:
         return self.register(500, handler_fn)
 
     def handle(self, error):
-        var h = self.handlers[str(error.status)]
+        var h = self.handlers.get(str(error.status))
         if h != none:
             return h(error)
         if self.default_format == "json":
@@ -951,11 +951,11 @@ class WebhookHandler:
         if self.log_size < self.max_log:
             self.log.append({"event": event_type, "at": time_now()})
             self.log_size = self.log_size + 1
-        var h = self.handlers[event_type]
+        var h = self.handlers.get(event_type)
         if h != none:
             h(payload)
             return true
-        var wildcard = self.handlers["*"]
+        var wildcard = self.handlers.get("*")
         if wildcard != none:
             wildcard(event_type, payload)
             return true

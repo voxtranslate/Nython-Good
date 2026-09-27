@@ -126,7 +126,8 @@ bool Parser::isAugAssign(){
         ||see(TokenType::XorAssign)||see(TokenType::BinAndAssign)||see(TokenType::BinOrAssign)
         ||see(TokenType::BinXorAssign)||see(TokenType::ModAssign)||see(TokenType::RevDivAssign)
         ||see(TokenType::ExpAssign)||see(TokenType::ShiftLeftAssign)||see(TokenType::ShiftRightAssign)
-        ||see(TokenType::ShiftAssign)||see(TokenType::ComplementAssign);
+        ||see(TokenType::ShiftAssign)||see(TokenType::ComplementAssign)
+        ||see(TokenType::NullCoalesceAssign);
 }
 
 bool Parser::isOperator(){
@@ -399,15 +400,20 @@ node_ptr Parser::statement(){
     if(see(TokenType::NameSpace)) return namespaceDecl();
 
     // Flow statements
-    // global x, y / nonlocal x, y. Assignment already rebinds an existing
-    // variable; the declaration matters for a `for` loop variable, which is
-    // otherwise a new local.
+    // global x, y / nonlocal x, y. A plain assignment already rebinds the
+    // nearest existing binding; the declarations matter for a `for` loop
+    // variable (otherwise a new local), and `global` makes every later use
+    // of the name in this function the module's - creating it if it does
+    // not exist yet, and skipping an enclosing function's variable of the
+    // same name (VariableNode::global_ref).
     if(see(TokenType::Global) || (see(TokenType::Identifier) && token().value == "nonlocal"
                                   && peek(1).type() == TokenType::Identifier)) {
+        bool is_global = see(TokenType::Global);
         next(); // consume 'global' / 'nonlocal'
         do {
             std::string n = identifier();
             if(!outer_decls_.empty()) outer_decls_.back().push_back(n);
+            if(is_global && !global_decls_.empty()) global_decls_.back().push_back(n);
         } while(have(TokenType::Comma));
         have(TokenType::SemiColon); have(TokenType::NewLine);
         return make_node<BlockNode>(token()); // no-op
@@ -636,6 +642,9 @@ node_ptr Parser::assignment(){
         node_ptr init = ternary();
         return make_node<WalrusNode>(op, left->value(), init);
     }
+    // `a?.b = v` has no meaning when a is none: an optional chain is read-only.
+    if(left && left->type() == NodeType::OPT_CHAIN && (see(TokenType::Assign) || isAugAssign()))
+        throw SyntaxError(token().location(), "cannot assign to an optional chain (?. / ?[)");
     if(have(TokenType::Assign)){
         Token op = prev();
         node_ptr right = assignment(); // right-associative
@@ -664,7 +673,7 @@ node_ptr Parser::ternary(){
             yexpr = expression();
         return make_node<YieldNode>(tok, yexpr);
     }
-    node_ptr expr = rangeExpr();
+    node_ptr expr = coalesce();
     // C-style ternary: cond ? then : else
     if(have(TokenType::QuestionMark)){
         Token tok = prev();
@@ -679,7 +688,7 @@ node_ptr Parser::ternary(){
     // Python-style ternary: value if cond else other
     if(have(TokenType::If)){
         Token tok = prev();
-        node_ptr condition = logicalOr();
+        node_ptr condition = coalesce();
         mustBe(TokenType::Else);
         node_ptr else_expr = expression();
         auto node = make_node<IfNode>(tok, condition, expr);
@@ -688,6 +697,20 @@ node_ptr Parser::ternary(){
         return node;
     }
     return expr;
+}
+
+// a ?? b: a, unless a is none or undefined - then b, which is evaluated
+// only in that case. Binds looser than `or` and tighter than the ternaries
+// (C#'s and JavaScript's place), and groups to the right: a ?? b ?? c.
+node_ptr Parser::coalesce(){
+    node_ptr left = rangeExpr();
+    if(have(TokenType::NullCoalesce)){
+        Token tok = prev();
+        tok.value = "??";
+        node_ptr right = coalesce();
+        return make_node<BinaryNode>(tok, left, right);
+    }
+    return left;
 }
 
 // Range / interval:  a..b   (inclusive of a, exclusive of b)
@@ -927,6 +950,16 @@ node_ptr Parser::postfix(){
     // Indent with a Dedent; since this indent never opened a block, the matching
     // Dedent would otherwise be left for the statement parser, which rejects it.
     int joined_indents = 0;
+    // Optional chaining (ASTNodes.hpp, OptChainNode): after `recv?.x`, the
+    // steps that follow are parsed onto oc->hole and become oc->rest when
+    // the chain ends (or the next `?` link starts a chain around it).
+    std::shared_ptr<OptChainNode> oc;
+    auto close_chain = [&]() {
+        if(!oc) return;
+        oc->rest = expr.get() == oc->hole.get() ? nullptr : expr;
+        expr = oc;
+        oc = nullptr;
+    };
     while(true){
         // A method chain may continue on the following line:
         //     [1,2,3]
@@ -939,212 +972,76 @@ node_ptr Parser::postfix(){
             while(peek(look).type() == TokenType::NewLine
                || peek(look).type() == TokenType::Indent
                || peek(look).type() == TokenType::Dedent) look++;
-            if(look > 0 && peek(look).type() == TokenType::Dot){
+            if(look > 0 && (peek(look).type() == TokenType::Dot || peek(look).type() == TokenType::OptDot)){
                 for(int k=0;k<look;k++){
                     if(token().type() == TokenType::Indent) joined_indents++;
                     next();
                 }
             }
         }
+        if(see(TokenType::OptDot) || see(TokenType::OptBracket)){
+            // recv?.name  recv?.m(args)  recv?[k]  recv?.[k]  recv?.(args)
+            Token qtok = token();
+            bool bracket = see(TokenType::OptBracket);
+            next();
+            close_chain();
+            auto node = std::make_shared<OptChainNode>(qtok, expr);
+            if(bracket || see(TokenType::BracketOpen)){
+                mustBe(TokenType::BracketOpen);
+                node_ptr sub = parseSubscriptTail(prev(), node->recv_hole);
+                if(sub->type() == NodeType::SUBSCRIPT){
+                    node->kind = OptChainNode::INDEX;
+                    node->index = std::static_pointer_cast<SubscriptNode>(sub)->index;
+                } else {
+                    node->kind = OptChainNode::SLICE;
+                    node->call = sub;
+                }
+            } else if(have(TokenType::ParenOpen)){
+                auto call = std::make_shared<CallNode>(prev(), node->recv_hole);
+                parseCallArgs(call);
+                node->kind = OptChainNode::CALL;
+                node->call = call;
+            } else {
+                Token mtok = token();
+                std::string attr = memberName();
+                if(have(TokenType::ParenOpen)){
+                    auto call = std::make_shared<CallNode>(prev(), make_node<AttributeNode>(mtok, node->recv_hole, attr));
+                    parseCallArgs(call);
+                    node->kind = OptChainNode::METHOD;
+                    node->name = attr;
+                    node->call = call;
+                } else {
+                    node->kind = OptChainNode::ATTR;
+                    node->name = attr;
+                }
+            }
+            oc = node;
+            expr = node->hole;
+            continue;
+        }
         if(have(TokenType::ParenOpen)){
             // Function call
             Token tok = prev();
-            auto call = make_node<CallNode>(tok, expr);
-            auto parse_call_arg = [&]() -> node_ptr {
-                if(have(TokenType::Mul)){
-                    Token star = prev();
-                    node_ptr operand = expression();
-                    return make_node<UnaryNode>(star, operand);
-                }
-                if(have(TokenType::Exp)){
-                    Token dstar = prev();
-                    node_ptr operand = expression();
-                    return make_node<UnaryNode>(dstar, operand);
-                }
-                // Keyword argument: name=value (must look ahead before expression() consumes it as assignment)
-                // A keyword spelled like a name is still a valid argument name
-                // here (`max(xs, default=0)`): no expression starts `default =`.
-                auto word_tok = [&](const Token& t) {
-                    if (t.type() == TokenType::Identifier) return true;
-                    if (t.kind() != TokenKind::Name || t.clazz() != TokenClass::Keyword || t.value.empty()) return false;
-                    for (char c : t.value) if (!(std::isalnum((unsigned char)c) || c == '_')) return false;
-                    return !std::isdigit((unsigned char)t.value[0]);
-                };
-                if(word_tok(token()) && peek(1).type() == TokenType::Assign
-                   && peek(2).type() != TokenType::Assign) { // distinguish name=val from name==val
-                    Token kw_tok = token();
-                    std::string kw_name = kw_tok.value;
-                    next(); // consume name
-                    next(); // consume =
-                    node_ptr kw_val = expression();
-                    return make_node<KeywordArgNode>(kw_tok, kw_name, kw_val);
-                }
-                node_ptr first_expr = expression();
-                // Generator expression argument: f(expr for t in it if c ...)
-                if(have(TokenType::For))
-                    return comprehension(prev(), ComprehensionNode::GEN, first_expr, nullptr);
-                return first_expr;
-            };
-            if(!see(TokenType::ParenClose)){
-                call->add(parse_call_arg());
-                while(have(TokenType::Comma) && !see(TokenType::ParenClose)){
-                    call->add(parse_call_arg());
-                }
-            }
-            mustBe(TokenType::ParenClose);
+            auto call = std::make_shared<CallNode>(tok, expr);
+            parseCallArgs(call);
             expr = call;
         } else if(have(TokenType::BracketOpen)){
             // Subscript or slice
-            Token tok = prev();
-            auto make_int = [&](int v) -> node_ptr {
-                Token zt = tok; zt.value = std::to_string(v);
-                return make_node<IntegerNode>(zt);
-            };
-            auto make_none_node = [&]() -> node_ptr {
-                Token nt = tok; nt.value = "none";
-                return make_node<NoneNode>(nt);
-            };
-            // Check for [:...] (empty start)
-            if(see(TokenType::Colon)) {
-                next(); // consume first :
-                // An omitted start is none, not 0: s[::-1] starts at the end.
-                node_ptr start_expr = make_none_node();
-                node_ptr end_expr = nullptr;
-                node_ptr step_expr = nullptr;
-                if(see(TokenType::Colon)) {
-                    // [::step]
-                    next(); // consume second :
-                    if(!see(TokenType::BracketClose))
-                        step_expr = expression();
-                } else if(!see(TokenType::BracketClose)) {
-                    end_expr = expression();
-                    if(have(TokenType::Colon)) {
-                        // [:end:step]
-                        if(!see(TokenType::BracketClose))
-                            step_expr = expression();
-                    }
-                }
-                mustBe(TokenType::BracketClose);
-                std::vector<node_ptr> slice_args;
-                slice_args.push_back(start_expr);
-                if(end_expr) slice_args.push_back(end_expr);
-                else if(step_expr) slice_args.push_back(make_none_node());
-                if(step_expr) slice_args.push_back(step_expr);
-                auto attr = make_node<AttributeNode>(tok, expr, "slice");
-                auto call = make_node<CallNode>(tok, attr);
-                for(auto& sa : slice_args) call->add(sa);
-                expr = call;
-            } else {
-                node_ptr index = expression();
-                if(have(TokenType::Colon)) {
-                    // [start:end] or [start:end:step] or [start:]
-                    node_ptr end_expr = nullptr;
-                    node_ptr step_expr = nullptr;
-                    if(!see(TokenType::BracketClose) && !see(TokenType::Colon))
-                        end_expr = expression();
-                    if(have(TokenType::Colon)) {
-                        if(!see(TokenType::BracketClose))
-                            step_expr = expression();
-                    }
-                    mustBe(TokenType::BracketClose);
-                    std::vector<node_ptr> slice_args;
-                    slice_args.push_back(index);
-                    if(end_expr) slice_args.push_back(end_expr);
-                    else if(step_expr) slice_args.push_back(make_none_node());
-                    if(step_expr) slice_args.push_back(step_expr);
-                    auto attr = make_node<AttributeNode>(tok, expr, "slice");
-                    auto call = make_node<CallNode>(tok, attr);
-                    for(auto& sa : slice_args) call->add(sa);
-                    expr = call;
-                } else {
-                    mustBe(TokenType::BracketClose);
-                    expr = make_node<SubscriptNode>(tok, expr, index);
-                }
-            }
+            expr = parseSubscriptTail(prev(), expr);
         } else if(have(TokenType::Dot)){
             // Attribute access.
-            //
-            // An OPERATOR is a legal member name here: `1.+(2, 3)` calls the
-            // `+` member of 1, which is how an object language with operators as
-            // methods should read. Previously identifier() demanded a Name
-            // token, so `1.+(2,3)` failed with "Expected Identifier, but found
-            // Add" — the operator method could be defined but never called by
-            // name.
             Token tok = token();
-            std::string attr;
-            // Comparisons too (1.<(2, 3)); their tokens do not all carry
-            // their spelling, so it comes from the type.
-            const char* rel = see(TokenType::Equal) ? "==" : see(TokenType::NotEqual) ? "!="
-                            : see(TokenType::Less) ? "<" : see(TokenType::LessEqual) ? "<="
-                            : see(TokenType::Great) ? ">" : see(TokenType::GreatEqual) ? ">=" : nullptr;
-            if(rel){
-                attr = rel;
-                next();
-            } else if(token().clazz() == TokenClass::Operator
-               && !see(TokenType::Dot) && !see(TokenType::ParenOpen)){
-                attr = token().value;
-                next();
-            } else {
-                attr = identifier();
-            }
+            std::string attr = memberName();
             expr = make_node<AttributeNode>(tok, expr, attr);
-        } else if(have(TokenType::DoubleAdd)){
-            Token tok = prev();
-            tok.value = "++";
-            expr = make_node<UnaryNode>(tok, expr);
-        } else if(have(TokenType::DoubleSub)){
-            Token tok = prev();
-            tok.value = "--";
-            expr = make_node<UnaryNode>(tok, expr);
-        } else if(see(TokenType::RightArrow)){
-            // Arrow function:  x => body  OR  (params) => body  OR  () => body
-            // RightArrow is produced by both  ->  and  =>
-            Token arrow_tok = token();
-            next(); // consume =>  or  ->
-            node_ptr body = expression();
-            auto lam = make_node<LambdaNode>(arrow_tok, body);
-            // Extract parameters from the left-hand side
-            if(expr->type() == NodeType::TUPLE) {
-                // (a, b, c) => body  — each element is a param
-                auto* tup = static_cast<TupleNode*>(expr.get());
-                for(auto& el : tup->elements) lam->add(el);
-            } else if(expr->type() == NodeType::VARIABLE) {
-                // x => body  — single identifier param
-                lam->add(expr);
-            }
-            // (anything else: zero-param arrow)
-            return lam;
-        } else if(see(TokenType::Identifier)) {
-            // ── Dynamic infix operators ────────────────────────────
-            // Check for dynamic keyword used as INFIX_OP, or __dynop: symbol
-            auto& dynreg2 = nython::DynamicLangRegistry::instance();
-            std::string tok_val = token().value;
-            std::string infix_name;
-            bool is_dyn_infix = false;
-            if (nython::is_dyntok_value(tok_val)) {
-                std::string dname = nython::decode_dyntok_name(tok_val);
-                if (dynreg2.infix_rule_for(dname)) {
-                    infix_name = dname;
-                    is_dyn_infix = true;
-                }
-            } else if (nython::is_dynop_value(tok_val)) {
-                std::string dsym = nython::decode_dynop_sym(tok_val);
-                auto* dop = dynreg2.find_operator(dsym);
-                if (dop && dop->arity == nython::DynamicOperator::Arity::INFIX) {
-                    infix_name = dsym;
-                    is_dyn_infix = true;
-                }
-            }
-            if (is_dyn_infix) {
-                Token op_tok = token();
-                next(); // consume the operator token
-                node_ptr rhs = unary(); // parse RHS at unary precedence
-                expr = make_node<DynBinopNode>(op_tok, infix_name, expr, rhs);
-            } else {
-                break;
-            }
+        } else if(see(TokenType::DoubleAdd) || see(TokenType::DoubleSub) || see(TokenType::RightArrow)
+                  || see(TokenType::Identifier)){
+            // Postfix ++/--, an arrow function or a dynamic infix operator
+            // applies to the whole optional chain, not to its last step.
+            close_chain();
+            if(!postfixOther(expr)) break;
         } else break;
     }
+    close_chain();
     // Consume the Dedent(s) the lexer paired with the Indent(s) skipped above.
     // Those indents never opened a block, so nothing else will claim them and
     // the statement parser would reject the stray Dedent.
@@ -1156,6 +1053,214 @@ node_ptr Parser::postfix(){
         break;
     }
     return expr;
+}
+
+// The arguments of a call, after its `(`, through the `)`.
+void Parser::parseCallArgs(std::shared_ptr<CallNode> call){
+    auto parse_call_arg = [&]() -> node_ptr {
+        if(have(TokenType::Mul)){
+            Token star = prev();
+            node_ptr operand = expression();
+            return make_node<UnaryNode>(star, operand);
+        }
+        if(have(TokenType::Exp)){
+            Token dstar = prev();
+            node_ptr operand = expression();
+            return make_node<UnaryNode>(dstar, operand);
+        }
+        // Keyword argument: name=value (must look ahead before expression() consumes it as assignment)
+        // A keyword spelled like a name is still a valid argument name
+        // here (`max(xs, default=0)`): no expression starts `default =`.
+        auto word_tok = [&](const Token& t) {
+            if (t.type() == TokenType::Identifier) return true;
+            if (t.kind() != TokenKind::Name || t.clazz() != TokenClass::Keyword || t.value.empty()) return false;
+            for (char c : t.value) if (!(std::isalnum((unsigned char)c) || c == '_')) return false;
+            return !std::isdigit((unsigned char)t.value[0]);
+        };
+        if(word_tok(token()) && peek(1).type() == TokenType::Assign
+           && peek(2).type() != TokenType::Assign) { // distinguish name=val from name==val
+            Token kw_tok = token();
+            std::string kw_name = kw_tok.value;
+            next(); // consume name
+            next(); // consume =
+            node_ptr kw_val = expression();
+            return make_node<KeywordArgNode>(kw_tok, kw_name, kw_val);
+        }
+        node_ptr first_expr = expression();
+        // Generator expression argument: f(expr for t in it if c ...)
+        if(have(TokenType::For))
+            return comprehension(prev(), ComprehensionNode::GEN, first_expr, nullptr);
+        return first_expr;
+    };
+    if(!see(TokenType::ParenClose)){
+        call->add(parse_call_arg());
+        while(have(TokenType::Comma) && !see(TokenType::ParenClose)){
+            call->add(parse_call_arg());
+        }
+    }
+    mustBe(TokenType::ParenClose);
+}
+
+// `expr[` ... `]` after its `[` (tok): a SubscriptNode, or a slice as the
+// method call expr.slice(start, stop[, step]).
+node_ptr Parser::parseSubscriptTail(Token tok, node_ptr expr){
+    auto make_int = [&](int v) -> node_ptr {
+        Token zt = tok; zt.value = std::to_string(v);
+        return make_node<IntegerNode>(zt);
+    };
+    auto make_none_node = [&]() -> node_ptr {
+        Token nt = tok; nt.value = "none";
+        return make_node<NoneNode>(nt);
+    };
+    // Check for [:...] (empty start)
+    if(see(TokenType::Colon)) {
+        next(); // consume first :
+        // An omitted start is none, not 0: s[::-1] starts at the end.
+        node_ptr start_expr = make_none_node();
+        node_ptr end_expr = nullptr;
+        node_ptr step_expr = nullptr;
+        if(see(TokenType::Colon)) {
+            // [::step]
+            next(); // consume second :
+            if(!see(TokenType::BracketClose))
+                step_expr = expression();
+        } else if(!see(TokenType::BracketClose)) {
+            end_expr = expression();
+            if(have(TokenType::Colon)) {
+                // [:end:step]
+                if(!see(TokenType::BracketClose))
+                    step_expr = expression();
+            }
+        }
+        mustBe(TokenType::BracketClose);
+        std::vector<node_ptr> slice_args;
+        slice_args.push_back(start_expr);
+        if(end_expr) slice_args.push_back(end_expr);
+        else if(step_expr) slice_args.push_back(make_none_node());
+        if(step_expr) slice_args.push_back(step_expr);
+        auto attr = make_node<AttributeNode>(tok, expr, "slice");
+        auto call = make_node<CallNode>(tok, attr);
+        for(auto& sa : slice_args) call->add(sa);
+        return call;
+    } else {
+        node_ptr index = expression();
+        if(have(TokenType::Colon)) {
+            // [start:end] or [start:end:step] or [start:]
+            node_ptr end_expr = nullptr;
+            node_ptr step_expr = nullptr;
+            if(!see(TokenType::BracketClose) && !see(TokenType::Colon))
+                end_expr = expression();
+            if(have(TokenType::Colon)) {
+                if(!see(TokenType::BracketClose))
+                    step_expr = expression();
+            }
+            mustBe(TokenType::BracketClose);
+            std::vector<node_ptr> slice_args;
+            slice_args.push_back(index);
+            if(end_expr) slice_args.push_back(end_expr);
+            else if(step_expr) slice_args.push_back(make_none_node());
+            if(step_expr) slice_args.push_back(step_expr);
+            auto attr = make_node<AttributeNode>(tok, expr, "slice");
+            auto call = make_node<CallNode>(tok, attr);
+            for(auto& sa : slice_args) call->add(sa);
+            return call;
+        } else {
+            mustBe(TokenType::BracketClose);
+            return make_node<SubscriptNode>(tok, expr, index);
+        }
+    }
+}
+
+// The name after `.` or `?.`: an identifier, or an operator (1.+(2, 3)).
+std::string Parser::memberName(){
+    // Attribute access.
+    //
+    // An OPERATOR is a legal member name here: `1.+(2, 3)` calls the
+    // `+` member of 1, which is how an object language with operators as
+    // methods should read. Previously identifier() demanded a Name
+    // token, so `1.+(2,3)` failed with "Expected Identifier, but found
+    // Add" — the operator method could be defined but never called by
+    // name.
+    std::string attr;
+    // Comparisons too (1.<(2, 3)); their tokens do not all carry
+    // their spelling, so it comes from the type.
+    const char* rel = see(TokenType::Equal) ? "==" : see(TokenType::NotEqual) ? "!="
+                    : see(TokenType::Less) ? "<" : see(TokenType::LessEqual) ? "<="
+                    : see(TokenType::Great) ? ">" : see(TokenType::GreatEqual) ? ">=" : nullptr;
+    if(rel){
+        attr = rel;
+        next();
+    } else if(token().clazz() == TokenClass::Operator
+       && !see(TokenType::Dot) && !see(TokenType::ParenOpen)){
+        attr = token().value;
+        next();
+    } else {
+        attr = identifier();
+    }
+    return attr;
+}
+
+// Postfix ++ / --, an arrow function (x => body) or a dynamic infix
+// operator after `expr`; false when none follows.
+bool Parser::postfixOther(node_ptr& expr){
+    if(have(TokenType::DoubleAdd)){
+        Token tok = prev();
+        tok.value = "++";
+        expr = make_node<UnaryNode>(tok, expr);
+    } else if(have(TokenType::DoubleSub)){
+        Token tok = prev();
+        tok.value = "--";
+        expr = make_node<UnaryNode>(tok, expr);
+    } else if(see(TokenType::RightArrow)){
+        // Arrow function:  x => body  OR  (params) => body  OR  () => body
+        // RightArrow is produced by both  ->  and  =>
+        Token arrow_tok = token();
+        next(); // consume =>  or  ->
+        node_ptr body = expression();
+        auto lam = make_node<LambdaNode>(arrow_tok, body);
+        // Extract parameters from the left-hand side
+        if(expr->type() == NodeType::TUPLE) {
+            // (a, b, c) => body  — each element is a param
+            auto* tup = static_cast<TupleNode*>(expr.get());
+            for(auto& el : tup->elements) lam->add(el);
+        } else if(expr->type() == NodeType::VARIABLE) {
+            // x => body  — single identifier param
+            lam->add(expr);
+        }
+        // (anything else: zero-param arrow)
+        expr = lam;
+        return false;   // nothing applies after an arrow function
+    } else if(see(TokenType::Identifier)) {
+        // ── Dynamic infix operators ────────────────────────────
+        // Check for dynamic keyword used as INFIX_OP, or __dynop: symbol
+        auto& dynreg2 = nython::DynamicLangRegistry::instance();
+        std::string tok_val = token().value;
+        std::string infix_name;
+        bool is_dyn_infix = false;
+        if (nython::is_dyntok_value(tok_val)) {
+            std::string dname = nython::decode_dyntok_name(tok_val);
+            if (dynreg2.infix_rule_for(dname)) {
+                infix_name = dname;
+                is_dyn_infix = true;
+            }
+        } else if (nython::is_dynop_value(tok_val)) {
+            std::string dsym = nython::decode_dynop_sym(tok_val);
+            auto* dop = dynreg2.find_operator(dsym);
+            if (dop && dop->arity == nython::DynamicOperator::Arity::INFIX) {
+                infix_name = dsym;
+                is_dyn_infix = true;
+            }
+        }
+        if (is_dyn_infix) {
+            Token op_tok = token();
+            next(); // consume the operator token
+            node_ptr rhs = unary(); // parse RHS at unary precedence
+            expr = make_node<DynBinopNode>(op_tok, infix_name, expr, rhs);
+        } else {
+            return false;
+        }
+    } else return false;
+    return true;
 }
 
 node_ptr Parser::primary(){
@@ -1338,7 +1443,12 @@ node_ptr Parser::atom(){
             next(); // consume the string
             return fstringNode(str_tok, str_tok.value);
         }
-        return make_node<VariableNode>(id_tok);
+        auto vn = std::make_shared<VariableNode>(id_tok);
+        if(!global_decls_.empty()){
+            auto& g = global_decls_.back();
+            vn->global_ref = std::find(g.begin(), g.end(), id_tok.value) != g.end();
+        }
+        return vn;
     }
 
     // Lambda: lambda params: body  OR  fn(params) => body
@@ -1745,11 +1855,18 @@ node_ptr Parser::forStmt(){
         return block;
     }
     node_ptr var = make_node<VariableNode>(token());
+    auto mark_global = [&](const node_ptr& v) {
+        if(global_decls_.empty()) return;
+        auto& g = global_decls_.back();
+        static_cast<VariableNode*>(v.get())->global_ref = std::find(g.begin(), g.end(), v->value()) != g.end();
+    };
+    mark_global(var);
     next(); // consume variable name
     // Check for tuple unpacking: for k, v in ...
     std::vector<node_ptr> unpack_vars;
     while(have(TokenType::Comma)) {
         unpack_vars.push_back(make_node<VariableNode>(token()));
+        mark_global(unpack_vars.back());
         next();
     }
     mustBe(TokenType::In);
@@ -1835,10 +1952,12 @@ node_ptr Parser::functionDecl(bool is_method){
     }
     have(TokenType::Colon);
     outer_decls_.emplace_back();
+    global_decls_.emplace_back();
     auto saved_defaults = std::move(param_defaults_);
     node_ptr body = blockOrStmt();
     param_defaults_ = std::move(saved_defaults);
     outer_decls_.pop_back();
+    global_decls_.pop_back();
     auto fn = make_node<FunctionNode>(tok, name, body, is_method);
     for(auto& p : params) fn->add(p);
     static_cast<FunctionNode*>(fn.get())->defaults = std::move(param_defaults_);

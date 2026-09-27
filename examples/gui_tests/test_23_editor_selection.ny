@@ -33,9 +33,14 @@ class Buf:
     def get_all_text(self):
         return string_join(self.lines, "\n")
 
+class Tab:
+    def __init__(self):
+        self.dirty = false
+
 class IDE:
     def __init__(self, lines):
         self.buffers = [Buf(lines)]
+        self.tabs = [Tab()]
         self.active_tab = 0
         self.sel_on = false
         self.sel_row = 0

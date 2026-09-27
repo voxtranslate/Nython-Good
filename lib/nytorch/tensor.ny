@@ -675,9 +675,11 @@ class Tensor:
     # matrix by setting .rows/.cols on it; that view is adopted here.
     def _mat_es(self):
         var s = self.shape
-        if len(s) == 1 and hasattr(self, "rows"):
-            if self.rows > 0 and self.cols > 0 and self.rows * self.cols == s[0]:
-                self.shape = [self.rows, self.cols]
+        if len(s) == 1:
+            var r = self?.rows ?? 0
+            var c = self?.cols ?? 0
+            if r > 0 and c > 0 and r * c == s[0]:
+                self.shape = [r, c]
         return self.shape
 
     def _acc(self, g):

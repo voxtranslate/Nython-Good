@@ -86,7 +86,7 @@ var dns = DNS()
 dns.cache["example.com"] = "93.184.216.34"
 var cached = dns.resolve("example.com")
 assert_eq("cached", cached, "93.184.216.34")
-var none_result = dns.cache["notcached.com"]
+var none_result = dns.cache.get("notcached.com")
 assert_eq("not cached", none_result, none)
 assert_eq("cache has key", dns.cache["example.com"], "93.184.216.34")
 

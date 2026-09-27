@@ -11,6 +11,10 @@
 #include <deque>
 #include <string>
 #include <unordered_map>
+#include <set>
+#include <map>
+#include <tuple>
+#include <mutex>
 #include <functional>
 #include <unordered_set>
 #include <optional>
@@ -47,6 +51,7 @@
 #include "NyStr.hpp"
 #include "NyFormat.hpp"
 #include "NyRuntime.hpp"
+#include "NyMembers.hpp"
 #include "NyPrelude.hpp"
 #include "NyConc.hpp"   // concurrency runtime shared with the interpreter
 #include <random>
@@ -112,6 +117,22 @@ enum class Op : uint8_t {
     MAP_MERGE,       // f(**d): TOS (a map) merged into the map below it
     // A tuple display `(a, b)`: BUILD_LIST's items, as a tuple (VMVal::is_tuple).
     BUILD_TUPLE,
+    // Optional chaining and ?? / ??= (round 75; OptChainNode in ASTNodes.hpp).
+    // JUMP_IF_NONE_KEEP: TOS none/undefined -> TOS = none, jump.
+    // JUMP_IF_MISSING_KEEP: TOS the absent marker -> TOS = none, jump.
+    // JUMP_IF_NOT_NONE_OR_POP: TOS neither none, undefined nor absent -> jump
+    //   keeping it; else pop it.
+    // LOAD_ATTR_OPT / LOAD_SUBSCR_OPT: as LOAD_ATTR / LOAD_SUBSCR, but a
+    //   missing member / key / index pushes the absent marker.
+    // CHECK_MEMBER: TOS lacks member names[arg] -> TOS = the absent marker.
+    // DUP_TOP_TWO: a b -> a b a b.
+    JUMP_IF_NONE_KEEP, JUMP_IF_MISSING_KEEP, JUMP_IF_NOT_NONE_OR_POP,
+    LOAD_ATTR_OPT, LOAD_SUBSCR_OPT, CHECK_MEMBER, DUP_TOP_TWO,
+    // A name declared `global` in the running function (VariableNode::
+    // global_ref): read / bound at module level, created there if new.
+    LOAD_GLOBAL_NAME, STORE_GLOBAL_NAME,
+    // del x: unbinds the nearest x (a later read is a NameError).
+    DELETE_NAME,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -172,6 +193,18 @@ struct VMVal {
         return x;
     }
     static VMVal make_none()              { return {}; }
+    // UNDEFINED carries a tag in s: "undefined" is the language's
+    // `undefined` value (distinct from none, falsy, absent to ?? and ?.);
+    // untagged is the "not found" sentinel frames and defaults use;
+    // "__absent__" is what an optional read (?. / ?[) pushes for a missing
+    // member or key, consumed by the jump that follows it; "__fin__" is a
+    // try/finally state (make_fin_state).
+    static VMVal make_undefined()         { VMVal x; x.type=VMType::UNDEFINED; x.s="undefined"; return x; }
+    static VMVal make_absent()            { VMVal x; x.type=VMType::UNDEFINED; x.s="__absent__"; return x; }
+    bool is_missing() const               { return type==VMType::UNDEFINED && s.empty(); }
+    bool is_absent_marker() const         { return type==VMType::UNDEFINED && s=="__absent__"; }
+    // none or undefined: what ?? replaces and ?. short-circuits on
+    bool is_nullish() const               { return type==VMType::NONE || type==VMType::UNDEFINED; }
     static VMVal make_bool(bool v)        { VMVal x; x.type=VMType::BOOL;  x.b=v; return x; }
     static VMVal make_int(int64_t v)      { VMVal x; x.type=VMType::INT;   x.i=v; return x; }
     static VMVal make_float(double v)     { VMVal x; x.type=VMType::FLOAT; x.d=v; return x; }
@@ -205,6 +238,7 @@ struct VMVal {
     bool is_truthy() const {
         switch(type){
         case VMType::NONE:   return false;
+        case VMType::UNDEFINED: return false;
         case VMType::BOOL:   return b;
         case VMType::INT:    return i!=0||!s.empty();
         case VMType::FLOAT:  return d!=0.0;
@@ -264,6 +298,7 @@ struct VMVal {
         case VMType::GENERATOR: return gen.get()==o.gen.get();
         case VMType::ITERATOR:  return iter.get()==o.iter.get();
         case VMType::NATIVE: return !class_name.empty() && class_name==o.class_name;
+        case VMType::UNDEFINED: return s==o.s;   // undefined == undefined
         default:             return false;
         }
     }
@@ -350,6 +385,7 @@ struct ExceptionEntry {
 
 struct VMCode {
     std::string              name;
+    std::string              file;          // source file (diagnostics)
     std::string              parent_class;
     std::vector<std::string> bases;         // every base class, in order (parent_class is bases[0])
     std::string              owner_class;   // class that defines this method
@@ -604,7 +640,11 @@ class Compiler {
         emit_dn(t->token().value,l);
     }
     int comp_id_ = 0;
-    int  ln(nython::node::node_ptr nd) { return nd?nd->token().location().row:0; }
+    int  ln(nython::node::node_ptr nd) {
+        if(!nd) return 0;
+        if(C().file.empty()) C().file=nd->token().fileName();
+        return nd->token().location().row;
+    }
 
     // Integer literal tokens keep their source spelling verbatim
     // ("0xFF", "0o17", "0b1010"), but plain std::stoll(s) - base 10 by
@@ -685,7 +725,7 @@ private:
     static bool pushes_value(const np& nd) {
         switch(nd->type()){
         case NT::INTEGER: case NT::FLOAT: case NT::STRING: case NT::TRUE:
-        case NT::FALSE: case NT::NONE: case NT::VARIABLE: case NT::SELF:
+        case NT::FALSE: case NT::NONE: case NT::UNDEFINED: case NT::OPT_CHAIN: case NT::VARIABLE: case NT::SELF:
         case NT::SUPER: case NT::ATTRIBUTE: case NT::SUBSCRIPT: case NT::UNARY:
         case NT::BINARY: case NT::CALL: case NT::LIST: case NT::TUPLE:
         case NT::MAP: case NT::COMPLEX: case NT::LAMBDA: case NT::WALRUS: case NT::COMPREHENSION:
@@ -729,9 +769,17 @@ private:
         case NT::TRUE:    emit_lc(VMVal::make_bool(true),l); break;
         case NT::FALSE:   emit_lc(VMVal::make_bool(false),l); break;
         case NT::NONE:    emit_lc(VMVal::make_none(),l); break;
+        case NT::UNDEFINED: emit_lc(VMVal::make_undefined(),l); break;
+        // Optional chaining: the hole's value is already on the stack.
+        case NT::CHAIN_HOLE: break;
+        case NT::OPT_CHAIN: visit_opt_chain(std::static_pointer_cast<nython::node::OptChainNode>(nd)); break;
 
         // Names
-        case NT::VARIABLE: emit_ln(nd->token().value,l); break;
+        case NT::VARIABLE:
+            if(std::static_pointer_cast<nython::node::VariableNode>(nd)->global_ref)
+                emit(Op::LOAD_GLOBAL_NAME,C().add_name(nd->token().value),l);
+            else emit_ln(nd->token().value,l);
+            break;
         case NT::SELF:     emit(Op::LOAD_SELF,0,l); break;
         case NT::SUPER:    emit(Op::LOAD_SUPER,0,l); break;
 
@@ -790,6 +838,7 @@ private:
         }
         case NT::ASSIGNMENT_AUG: {
             auto an=std::static_pointer_cast<nython::node::AugAssignNode>(nd);
+            if(an->op=="??="){ visit_coalesce_assign(an.get(),l); break; }
             if(an->op=="~="){
                 // No natural binary reading of "complement" exists (see the
                 // identical comment on the interpreter's evalAugAssignment,
@@ -859,6 +908,12 @@ private:
             if(op=="or"||op=="||") {
                 visit(b->left); int j=C().here();
                 emit(Op::JUMP_IF_TRUE_OR_POP,0,l); visit(b->right);
+                C().patch(j,C().here()); break;
+            }
+            // a ?? b: b only when a is none or undefined (and only then evaluated).
+            if(op=="??") {
+                visit(b->left); int j=C().here();
+                emit(Op::JUMP_IF_NOT_NONE_OR_POP,0,l); visit(b->right);
                 C().patch(j,C().here()); break;
             }
             // `x is int` / `x is MyClass`: the right operand names a TYPE, not
@@ -1001,8 +1056,7 @@ private:
             auto dn=std::static_pointer_cast<nython::node::DeleteNode>(nd);
             if(!dn->target) break;
             if(dn->target->type()==NT::VARIABLE){
-                emit_lc(VMVal::make_none(),l);
-                emit_sn(dn->target->token().value,l);
+                emit(Op::DELETE_NAME,C().add_name(rn(dn->target->token().value)),l);
             } else if(dn->target->type()==NT::SUBSCRIPT){
                 // del obj[key] — emit: LOAD obj, LOAD key, DELETE_SUBSCR
                 auto s=std::static_pointer_cast<nython::node::SubscriptNode>(dn->target);
@@ -1536,7 +1590,15 @@ private:
         // exactly once — silently, with no error.
         loops_.push_back({start,{},{},true});
         int fi=C().here(); emit(Op::FOR_ITER,0,l);
-        auto bind_loop=[&](const std::string& n){ if(nd->rebinds) emit_sn(n,l); else emit_dn(n,l); };
+        // A name declared `global` is the module's (VariableNode::global_ref).
+        auto bind_loop=[&](const std::string& n){
+            bool glob=false;
+            auto gref=[](const np& v){ return v && v->type()==NT::VARIABLE && std::static_pointer_cast<nython::node::VariableNode>(v)->global_ref; };
+            if(nd->var && nd->var->value()==n) glob=gref(nd->var);
+            for(auto& u:nd->unpack_vars) if(!glob && u->value()==n) glob=gref(u);
+            if(glob) emit(Op::STORE_GLOBAL_NAME,C().add_name(n),l);
+            else if(nd->rebinds) emit_sn(n,l); else emit_dn(n,l);
+        };
         if(!nd->unpack_vars.empty()) {
             // for a, b, c in ...: FOR_ITER pushed [a_val, b_val,...]; unpack by index
             std::string tmp="__for_unpack__";
@@ -1620,6 +1682,7 @@ private:
                     case NT::TRUE:    dflt=VMVal::make_bool(true); break;
                     case NT::FALSE:   dflt=VMVal::make_bool(false); break;
                     case NT::NONE:    dflt=VMVal::make_none(); break;
+                    case NT::UNDEFINED: dflt=VMVal::make_undefined(); break;
                     default: break;
                 }
             }
@@ -1816,10 +1879,88 @@ private:
         }
     }
 
+    // ─── optional chaining (OptChainNode) ─────────────────────────────────
+    // recv; if none/undefined -> none, done. The link: an attribute or key
+    // (missing -> none, done), a method call (receiver lacks the member ->
+    // none, done), a slice or a call. Then the rest of the chain, compiled
+    // against the value left on the stack (its hole compiles to nothing:
+    // every postfix step evaluates its receiver first).
+    void visit_opt_chain(std::shared_ptr<nython::node::OptChainNode> oc) {
+        using OC=nython::node::OptChainNode;
+        int l=ln(oc);
+        std::vector<int> ends;
+        visit(oc->recv);
+        ends.push_back(C().emit(Op::JUMP_IF_NONE_KEEP,0,l));
+        switch(oc->kind){
+            case OC::ATTR:
+                emit(Op::LOAD_ATTR_OPT,C().add_name(oc->name),l);
+                ends.push_back(C().emit(Op::JUMP_IF_MISSING_KEEP,0,l));
+                break;
+            case OC::INDEX:
+                visit(oc->index);
+                emit(Op::LOAD_SUBSCR_OPT,0,l);
+                ends.push_back(C().emit(Op::JUMP_IF_MISSING_KEEP,0,l));
+                break;
+            case OC::METHOD:
+                emit(Op::CHECK_MEMBER,C().add_name(oc->name),l);
+                ends.push_back(C().emit(Op::JUMP_IF_MISSING_KEEP,0,l));
+                visit(oc->call);
+                break;
+            default:   // SLICE, CALL
+                visit(oc->call);
+                break;
+        }
+        if(oc->rest) visit(oc->rest);
+        int end=C().here();
+        for(int j:ends) C().patch(j,end);
+    }
+    // t ??= v (the interpreter's evalCoalesceAssign): v is evaluated and
+    // stored only when t is none/undefined or, for an attribute or a key,
+    // missing; the target's object and index are evaluated once.
+    void visit_coalesce_assign(nython::node::AugAssignNode* an, int l) {
+        auto tt=an->target->type();
+        int j, jend;
+        if(tt==NT::ATTRIBUTE){
+            auto a=std::static_pointer_cast<nython::node::AttributeNode>(an->target);
+            int ni=C().add_name(a->attr);
+            visit(a->object);                                   // obj
+            emit(Op::DUP_TOP,0,l);                              // obj obj
+            emit(Op::LOAD_ATTR_OPT,ni,l);                       // obj cur
+            j=C().emit(Op::JUMP_IF_NOT_NONE_OR_POP,0,l);        // obj
+            visit(an->value_node);                              // obj val
+            emit(Op::ROT_TWO,0,l);                              // val obj
+            emit(Op::STORE_ATTR,ni,l);
+            jend=C().emit(Op::JUMP_FORWARD,0,l);
+            C().patch(j,C().here());                            // obj cur
+            emit(Op::POP_TOP,0,l); emit(Op::POP_TOP,0,l);
+        } else if(tt==NT::SUBSCRIPT){
+            auto sb=std::static_pointer_cast<nython::node::SubscriptNode>(an->target);
+            visit(sb->object); visit(sb->index);                // obj idx
+            emit(Op::DUP_TOP_TWO,0,l);                          // obj idx obj idx
+            emit(Op::LOAD_SUBSCR_OPT,0,l);                      // obj idx cur
+            j=C().emit(Op::JUMP_IF_NOT_NONE_OR_POP,0,l);        // obj idx
+            visit(an->value_node);                              // obj idx val
+            emit(Op::ROT_THREE,0,l);                            // val obj idx
+            emit(Op::STORE_SUBSCR,0,l);
+            jend=C().emit(Op::JUMP_FORWARD,0,l);
+            C().patch(j,C().here());                            // obj idx cur
+            emit(Op::POP_TOP,0,l); emit(Op::POP_TOP,0,l); emit(Op::POP_TOP,0,l);
+        } else {
+            load_target(an->target,l);                          // cur
+            j=C().emit(Op::JUMP_IF_NOT_NONE_OR_POP,0,l);
+            visit(an->value_node);
+            store(an->target,l);
+            jend=C().emit(Op::JUMP_FORWARD,0,l);
+            C().patch(j,C().here());                            // cur
+            emit(Op::POP_TOP,0,l);
+        }
+        C().patch(jend,C().here());
+    }
+
     // ─── load target value (for augmented assignment) ──────────────────────────
     void load_target(np tgt, int l) {
         if(tgt->type()==NT::VARIABLE) {
-            emit_ln(tgt->token().value,l);
+            visit(tgt);
         } else if(tgt->type()==NT::ATTRIBUTE) {
             auto a=std::static_pointer_cast<nython::node::AttributeNode>(tgt);
             visit(a->object); emit(Op::LOAD_ATTR,C().add_name(a->attr),l);
@@ -1832,7 +1973,9 @@ private:
     // ─── store target ───────────────────────────────────────────────────
     void store(np tgt, int l) {
         if(tgt->type()==NT::VARIABLE) {
-            emit_sn(tgt->token().value,l);
+            if(std::static_pointer_cast<nython::node::VariableNode>(tgt)->global_ref)
+                emit(Op::STORE_GLOBAL_NAME,C().add_name(tgt->token().value),l);
+            else emit_sn(tgt->token().value,l);
         } else if(tgt->type()==NT::ATTRIBUTE) {
             auto a=std::static_pointer_cast<nython::node::AttributeNode>(tgt);
             visit(a->object); emit(Op::STORE_ATTR,C().add_name(a->attr),l);
@@ -1950,7 +2093,7 @@ inline VMVal make_generator_val(std::shared_ptr<VMCode> code,
         } else if(arg_idx<(int)args.size()){
             g.gen->locals[pn]=args[arg_idx++];
         } else if(!code->param_defaults.empty()&&i<(int)code->param_defaults.size()
-                  &&code->param_defaults[i].type!=VMType::UNDEFINED){
+                  &&!code->param_defaults[i].is_missing()){
             g.gen->locals[pn]=code->param_defaults[i];
         }
     }
@@ -2133,7 +2276,7 @@ private:
             const auto& f=call_stack_[i];
             if(f.locals.count(n) || (f.closure_env && f.closure_env->count(n))) return true;
         }
-        if(in_other_thread() && module_frame_ && module_frame_->get_local(n).type!=VMType::UNDEFINED) return true;
+        if(in_other_thread() && module_frame_ && !module_frame_->get_local(n).is_missing()) return true;
         if(globals_.count(n)) return true;
         return bridge_exists() && bridge_exists()(n);
     }
@@ -2141,11 +2284,11 @@ private:
         for(int i=(int)call_stack_.size()-1;i>=0;i--){
             if(!frame_visible(i)) continue;
             auto v=call_stack_[i].get_local(n);
-            if(v.type!=VMType::UNDEFINED) return v;
+            if(!v.is_missing()) return v;
         }
         if(in_other_thread()){                                   // round 74
             auto mv=module_frame_->get_local(n);
-            if(mv.type!=VMType::UNDEFINED) return mv;
+            if(!mv.is_missing()) return mv;
         }
         auto it=globals_.find(n);
         if(it!=globals_.end()){
@@ -2168,6 +2311,28 @@ private:
             return nv;
         }
         return VMVal::make_none();
+    }
+    // del x: the nearest binding of x goes (the scopes store_var looks in).
+    bool delete_var(const std::string& n) {
+        for(int i=(int)call_stack_.size()-1;i>=0;i--){
+            if(!frame_visible(i)) continue;
+            auto& f=call_stack_[i];
+            bool hit=f.locals.erase(n)>0;
+            if(f.closure_env && f.closure_env->erase(n)>0) hit=true;
+            if(hit) return true;
+        }
+        if(in_other_thread() && module_frame_ && module_frame_->locals.erase(n)>0) return true;
+        return globals_.erase(n)>0;
+    }
+    // A `global` name: the main module's frame, then globals (an imported
+    // module's names and builtins), then an interpreter builtin.
+    bool load_global(const std::string& n, VMVal& out) {
+        CallFrame* mf=in_other_thread()?module_frame_:(call_stack_.empty()?nullptr:&call_stack_.front());
+        if(mf){ out=mf->get_local(n); if(!out.is_missing()) return true; }
+        auto it=globals_.find(n);
+        if(it!=globals_.end()){ out=it->second; return true; }
+        if(bridge_exists() && bridge_exists()(n)){ out=load_var(n); return true; }
+        return false;
     }
     void store_var(const std::string& n, VMVal v) {
         // An existing binding in a lexically visible scope is rebound
@@ -2585,7 +2750,7 @@ private:
                 star_seen=true; has_varargs=true; continue;
             }
             bool have=false;
-            bool has_default = pi<dflts.size()&&dflts[pi].type!=VMType::UNDEFINED;
+            bool has_default = pi<dflts.size()&&!dflts[pi].is_missing();
             if(!star_seen){ max_pos++; if(!has_default) min_pos++; }
             if(!star_seen && ai<pos.size()){ locs[pn]=pos[ai++]; have=true; }
             if(kw && kw->map){
@@ -3101,6 +3266,29 @@ private:
                 }
                 break;
             }
+            case Op::DELETE_NAME: {
+                const std::string& n=fr.code->names[ins.arg];
+                if(!delete_var(n))
+                    throw_exception(make_exception("NameError",{VMVal::make_str("name '"+n+"' is not defined")}));
+                break;
+            }
+            case Op::LOAD_GLOBAL_NAME: {
+                const std::string& n=fr.code->names[ins.arg];
+                VMVal v;
+                if(!load_global(n,v))
+                    throw_exception(make_exception("NameError",{VMVal::make_str("name '"+n+"' is not defined")}));
+                push(std::move(v));
+                break;
+            }
+            case Op::STORE_GLOBAL_NAME: {
+                const std::string& n=fr.code->names[ins.arg];
+                VMVal v=pop();
+                CallFrame* mf=in_other_thread()?module_frame_:(call_stack_.empty()?nullptr:&call_stack_.front());
+                if(mf && mf->has_local(n)) mf->set(n,std::move(v));
+                else if(globals_.count(n) || !mf) globals_[n]=std::move(v);
+                else mf->set(n,std::move(v));
+                break;
+            }
             case Op::DEFINE_NAME: {
                 if(fr.code->is_class){ fr.locals[fr.code->names[ins.arg]]=pop(); break; }
                 VMVal dv=pop();
@@ -3144,6 +3332,20 @@ private:
             case Op::LOAD_ATTR: {
                 VMVal obj=pop(); push(get_attr(obj,fr.code->names[ins.arg])); break;
             }
+            case Op::LOAD_ATTR_OPT: {
+                VMVal obj=pop(), v;
+                if(lookup_attr(obj,fr.code->names[ins.arg],v)) push(std::move(v)); else push(VMVal::make_absent());
+                break;
+            }
+            case Op::LOAD_SUBSCR_OPT: {
+                VMVal idx=pop(),obj=pop(),v;
+                if(try_get_sub(obj,idx,v)) push(std::move(v)); else push(VMVal::make_absent());
+                break;
+            }
+            case Op::CHECK_MEMBER:
+                if(!stack_.empty()&&!has_member_noeval(stack_.back(),fr.code->names[ins.arg])) stack_.back()=VMVal::make_absent();
+                break;
+            case Op::DUP_TOP_TWO: { VMVal b=peek(0), a=peek(1); push(a); push(b); break; }
             case Op::STORE_ATTR: {
                 VMVal obj=pop(); VMVal val=pop();
                 set_attr(obj,fr.code->names[ins.arg],std::move(val)); break;
@@ -3193,8 +3395,7 @@ private:
             }
             case Op::DELETE_ATTR: {
                 VMVal obj=pop();
-                if((obj.type==VMType::MAP||obj.type==VMType::INSTANCE)&&obj.map)
-                    obj.map->erase(fr.code->names[ins.arg]);
+                del_attr(obj, fr.code->names[ins.arg]);
                 break;
             }
 
@@ -3357,6 +3558,15 @@ private:
                 if(t) fr.ip=ins.arg; break;
             }
             case Op::JUMP_IF_FALSE_OR_POP: { VMVal t=peek(); if(!vm_truthy(t)) fr.ip=ins.arg; else pop(); break; }
+            case Op::JUMP_IF_NONE_KEEP:
+                if(!stack_.empty()&&stack_.back().is_nullish()){ stack_.back()=VMVal::make_none(); fr.ip=ins.arg; }
+                break;
+            case Op::JUMP_IF_MISSING_KEEP:
+                if(!stack_.empty()&&stack_.back().is_absent_marker()){ stack_.back()=VMVal::make_none(); fr.ip=ins.arg; }
+                break;
+            case Op::JUMP_IF_NOT_NONE_OR_POP:
+                if(!stack_.empty()&&!stack_.back().is_nullish()) fr.ip=ins.arg; else pop();
+                break;
             case Op::JUMP_IF_TRUE_OR_POP:  { VMVal t=peek(); if(vm_truthy(t))  fr.ip=ins.arg; else pop(); break; }
 
             // Make function/class
@@ -4058,6 +4268,7 @@ private:
             case VMType::INSTANCE: return v.class_name;
             case VMType::GENERATOR: return "generator";
             case VMType::ITERATOR: return "iterator";
+            case VMType::UNDEFINED: return "undefined";
             default: return "object";
         }
     }
@@ -4418,88 +4629,222 @@ private:
     }
 
     // ── Attribute access ────────────────────────────────────────────────
-    // A missing attribute of an instance or class: `probe` (hasattr /
-    // getattr) raises AttributeError for try_get_attr to catch; a plain read
-    // gives none, as on the interpreter (see kStrictAttributeReads there).
-    // Calling a missing method raises (vm_call_method).
-    static constexpr bool kStrictAttributeReads = false;
-    VMVal get_attr(const VMVal& obj, const std::string& attr, bool probe=false) {
+    // obj.attr. Reading an attribute the object does not have raises
+    // AttributeError, whatever the object (round 75: it read none), as on
+    // the interpreter (NythonExecutor::evalAttribute). getattr(o, n, d),
+    // hasattr, `o?.attr` and `o?.attr ?? d` are the graceful forms.
+    VMVal get_attr(const VMVal& obj, const std::string& attr) {
+        // The common read, a field present on an instance or a map (not a
+        // property), straight from the map: a VMVal is costly to default-
+        // construct and copy twice.
+        if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map){
+            auto it=obj.map->find(attr);
+            if(it!=obj.map->end()&&!is_property_desc(it->second)) return it->second;
+        }
+        VMVal v;
+        if(lookup_attr(obj, attr, v)) return v;
+        return missing_attr(obj, attr);
+    }
+    // obj.attr for a value in hand: true with the value in `out`, false when
+    // obj has no such attribute - nothing is raised for that. Property
+    // getters and __getattr__ run, and what they raise propagates. `bind`
+    // false: a builtin's method is not made into a bound value.
+    bool lookup_attr(const VMVal& obj, const std::string& attr, VMVal& out, bool bind=true) {
         // Instance / map fields — check for property descriptors
         if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map){
             auto it=obj.map->find(attr);
             if(it!=obj.map->end()){
                 VMVal& v=it->second;
                 // A property stored on the instance itself: self.x = property(get)
-                if(obj.type==VMType::INSTANCE&&is_property_desc(v)) return property_get(v, obj);
+                if(obj.type==VMType::INSTANCE&&is_property_desc(v)){ out=property_get(v, obj); return true; }
                 if(obj.type==VMType::MAP&&is_property_desc(v)){
                     auto git=v.map->find("__get__");
                     if(git!=v.map->end()&&git->second.type==VMType::FUNCTION){
                         std::vector<VMVal> no_args;
-                        return call_function(git->second, no_args, obj);
+                        out=call_function(git->second, no_args, obj);
+                        return true;
                     }
                 }
-                return v;
+                out=v;
+                return true;
             }
         }
-        if(obj.type==VMType::INSTANCE){
+        switch(obj.type){
+        case VMType::INSTANCE: {
             VMVal m;
-            if(class_lookup(obj.class_name, attr, m)) return bind_member(m, obj, obj.class_name);
-            if(attr=="__class__") return class_value(obj.class_name);
+            if(class_lookup(obj.class_name, attr, m)){ out=bind_member(m, obj, obj.class_name); return true; }
+            if(attr=="__class__"){ out=class_value(obj.class_name); return true; }
             if(attr=="__dict__"){
                 VMVal d=VMVal::make_map();
                 if(obj.map) for(auto& kv:*obj.map) (*d.map)[kv.first]=kv.second;
-                return d;
+                out=d; return true;
             }
             VMVal ga;
             if(class_lookup(obj.class_name, "__getattr__", ga)){
                 std::vector<VMVal> a{VMVal::make_str(attr)};
-                return invoke_method(ga, obj, a, obj.class_name);
+                out=invoke_method(ga, obj, a, obj.class_name);
+                return true;
             }
-            if(probe || kStrictAttributeReads)
-                throw_exception(make_exception("AttributeError",{VMVal::make_str(
-                    "'"+obj.class_name+"' object has no attribute '"+attr+"'")}));
-            return VMVal::make_none();
+            break;
         }
-        if(obj.type==VMType::STRING){
+        case VMType::STRING:
             // type(x).__name__: type() gives a name string on this engine.
-            if(attr=="__name__") return obj;
-            return str_method(obj,attr);
+            if(attr=="__name__"){ out=obj; return true; }
+            break;
+        case VMType::FUNCTION: {
+            if(!func_attrs_.empty()){
+                auto fa=func_attrs_.find(func_key(obj));
+                if(fa!=func_attrs_.end()){ auto it=fa->second.find(attr); if(it!=fa->second.end()){ out=it->second; return true; } }
+            }
+            if(attr=="__name__"){ out=VMVal::make_str(obj.code?obj.code->name:""); return true; }
+            return false;
         }
-        if(obj.type==VMType::LIST)   return list_method(obj,attr);
-        if(obj.type==VMType::FUNCTION&&attr=="__name__") return VMVal::make_str(obj.code?obj.code->name:"");
-        if(obj.type==VMType::CLASS){
+        case VMType::CLASS: {
             std::string cname = obj.class_name.empty() ? obj.s : obj.class_name;
             VMVal m;
             if(class_lookup(cname, attr, m)){
-                if(m.type==VMType::FUNCTION&&m.code&&m.code->is_classmethod) return make_bound(m, obj, true);
-                return m;   // a method read from the class is the plain function
+                if(m.type==VMType::FUNCTION&&m.code&&m.code->is_classmethod) out=make_bound(m, obj, true);
+                else out=m;   // a method read from the class is the plain function
+                return true;
             }
-            if(attr=="__name__") return VMVal::make_str(cname);
+            if(attr=="__name__"){ out=VMVal::make_str(cname); return true; }
             if(attr=="__mro__"){
                 std::vector<VMVal> r;
                 for(auto& c:*class_mro(cname)){ VMVal cv=class_value(c); if(cv.type!=VMType::NONE) r.push_back(cv); }
-                return VMVal::make_list(std::move(r));
+                out=VMVal::make_list(std::move(r)); return true;
             }
             if(attr=="__bases__"){
                 std::vector<VMVal> r;
                 auto rit=class_reg_.find(cname);
                 if(rit!=class_reg_.end()&&rit->second) for(auto& b:rit->second->bases){ VMVal cv=class_value(b); if(cv.type!=VMType::NONE) r.push_back(cv); }
-                return VMVal::make_list(std::move(r));
+                out=VMVal::make_list(std::move(r)); return true;
             }
-            if(class_reg_.count(cname) && (probe || kStrictAttributeReads))
-                throw_exception(make_exception("AttributeError",{VMVal::make_str(
-                    "type object '"+cname+"' has no attribute '"+attr+"'")}));
+            return false;
         }
-        return VMVal::make_none();
+        case VMType::NATIVE:
+            // A builtin used as a namespace: time.time, os.path ...
+            if(obj.class_name.rfind("__builtin__:",0)==0){
+                std::string target=nyrt::builtin_member(obj.class_name.substr(12),attr,
+                    [&](const std::string& n){ return bridge_exists()&&bridge_exists()(n); });
+                if(!target.empty()){ out=load_var(target); return true; }
+            }
+            return false;
+        default: break;
+        }
+        // A builtin value's method, or the object protocol, read as a value.
+        if(bind){
+            nypy::MemberKind k=vm_member_kind(obj);
+            if(k!=nypy::MemberKind::Other&&nypy::kind_has_method(k,attr)){ out=bound_member(obj,attr); return true; }
+        }
+        return false;
     }
-    // obj.attr, or false when it has none (hasattr / getattr with a default).
+    // Attributes stored on a function (f.calls = 0), as in Python, keyed by
+    // the function value's identity (VMVal::operator== for FUNCTION).
+    using FuncKey=std::tuple<const void*,const void*,const void*>;
+    std::map<FuncKey,std::unordered_map<std::string,VMVal>> func_attrs_;
+    static FuncKey func_key(const VMVal& f){ return FuncKey{f.code.get(),f.closure_env.get(),f.list.get()}; }
+    static nypy::MemberKind vm_member_kind(const VMVal& v){
+        switch(v.type){
+            case VMType::NONE:   return nypy::MemberKind::None;
+            case VMType::BOOL:   return nypy::MemberKind::Bool;
+            case VMType::INT:    return nypy::MemberKind::Int;
+            case VMType::FLOAT:  return nypy::MemberKind::Float;
+            case VMType::STRING: return nypy::MemberKind::Str;
+            case VMType::LIST:   return v.b?nypy::MemberKind::Tuple:nypy::MemberKind::List;
+            case VMType::MAP:    return nypy::MemberKind::Dict;
+            case VMType::INSTANCE: return nypy::MemberKind::Instance;
+            default:             return nypy::MemberKind::Other;
+        }
+    }
+    // A builtin value's method read as a value: a native calling it on obj.
+    VMVal bound_member(const VMVal& obj, const std::string& m){
+        if(obj.type==VMType::STRING) return str_method(obj,m);
+        if(obj.type==VMType::LIST)   return list_method(obj,m);
+        VirtualMachine* vm=this;
+        return VMVal::make_native([vm,obj,m](std::vector<VMVal>& a)->VMVal{
+            VMVal kw=take_kwargs(a);
+            VMVal o=obj;
+            return vm->vm_call_method(o,m,a,kw.type==VMType::MAP?&kw:nullptr);
+        });
+    }
+    // Whether obj has a member `name`, without running a property getter or
+    // __getattr__ (an object with __getattr__ counts as having every name):
+    // the test `obj?.m(...)` makes before calling.
+    bool has_member_noeval(const VMVal& obj, const std::string& name){
+        if(obj.type==VMType::INSTANCE){
+            if(obj.map&&obj.map->count(name)) return true;
+            VMVal m;
+            if(class_lookup(obj.class_name,name,m)) return true;
+            if(name=="__class__"||name=="__dict__"||class_lookup(obj.class_name,"__getattr__",m)) return true;
+            return nypy::kind_has_method(nypy::MemberKind::Instance,name);
+        }
+        VMVal v;
+        if(lookup_attr(obj,name,v,false)) return true;
+        nypy::MemberKind k=vm_member_kind(obj);
+        return k!=nypy::MemberKind::Other&&nypy::kind_has_method(k,name);
+    }
+    // obj.attr, or false when it has none (hasattr / getattr with a default):
+    // an AttributeError from a property getter or __getattr__ counts as none.
     bool try_get_attr(const VMVal& obj, const std::string& attr, VMVal& out) {
-        try { out=get_attr(obj, attr, true); }
+        try { return lookup_attr(obj, attr, out); }
         catch(VMException& e){
             if(class_derives(e.value.class_name,"AttributeError")) return false;
             throw;
         }
-        return true;
+    }
+    std::string attr_error_text(const VMVal& obj, const std::string& attr){
+        if(obj.type==VMType::INSTANCE) return "'"+obj.class_name+"' object has no attribute '"+attr+"'";
+        if(obj.type==VMType::CLASS){
+            std::string cname = obj.class_name.empty() ? obj.s : obj.class_name;
+            return "type object '"+cname+"' has no attribute '"+attr+"'";
+        }
+        return "'"+vm_type_name(obj)+"' object has no attribute '"+attr+"'";
+    }
+    // A missing attribute read: AttributeError, or - NY_LENIENT_READS=log, a
+    // porting aid - a line on stderr and none.
+    VMVal missing_attr(const VMVal& obj, const std::string& attr){
+        std::string msg=attr_error_text(obj,attr);
+        if(nypy::lenient_reads_log()){ log_lenient_read("AttributeError: "+msg); return VMVal::make_none(); }
+        throw_exception(make_exception("AttributeError",{VMVal::make_str(msg)}));
+        return VMVal::make_none();
+    }
+    VMVal missing_key(const VMVal& key){
+        if(nypy::lenient_reads_log()){ log_lenient_read("KeyError: "+key.repr()); return VMVal::make_none(); }
+        raise_native_exception("KeyError",key.repr());
+        return VMVal::make_none();
+    }
+    // "file:line" of the running instruction.
+    std::string vm_where(){
+        if(call_stack_.empty()) return "?";
+        auto& fr=call_stack_.back();
+        int ip=fr.ip-1;
+        int line=(fr.code&&ip>=0&&ip<(int)fr.code->instructions.size())?fr.code->instructions[(size_t)ip].line:0;
+        std::string f=fr.code?(fr.code->file.empty()?fr.code->name:fr.code->file):std::string("?");
+        return f+":"+std::to_string(line);
+    }
+    void log_lenient_read(const std::string& what){
+        static std::mutex mu;
+        static std::set<std::string> seen;
+        std::string loc=vm_where();
+        std::lock_guard<std::mutex> lk(mu);
+        if(!seen.insert(loc+" "+what).second) return;
+        fprintf(stderr,"[lenient-read] %s: %s\n",loc.c_str(),what.c_str());
+    }
+    // del obj.name / delattr(obj, name): an instance's field, a class
+    // attribute or a namespace/dict entry is removed; anything else is an
+    // AttributeError (it was ignored).
+    void del_attr(const VMVal& obj, const std::string& attr) {
+        if((obj.type==VMType::MAP||obj.type==VMType::INSTANCE)&&obj.map&&obj.map->erase(attr)) return;
+        if(obj.type==VMType::CLASS){
+            std::string cname = obj.class_name.empty() ? obj.s : obj.class_name;
+            auto it=class_vars_.find(cname);
+            if(it!=class_vars_.end()&&it->second.erase(attr)) return;
+        }
+        if(obj.type==VMType::FUNCTION){
+            auto fa=func_attrs_.find(func_key(obj));
+            if(fa!=func_attrs_.end()&&fa->second.erase(attr)) return;
+        }
+        throw_exception(make_exception("AttributeError",{VMVal::make_str(attr_error_text(obj,attr))}));
     }
     void set_attr(VMVal& obj, const std::string& attr, VMVal val) {
         if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map){
@@ -4538,7 +4883,14 @@ private:
         if(obj.type==VMType::CLASS){
             std::string cname = obj.class_name.empty() ? obj.s : obj.class_name;
             class_vars_[cname][attr] = std::move(val);
+            return;
         }
+        if(obj.type==VMType::FUNCTION&&obj.code){ func_attrs_[func_key(obj)][attr]=std::move(val); return; }
+        // none.x = v, 5.x = v, "s".x = v, len.x = v: nothing can hold it
+        // (AttributeError, as in Python - it was dropped silently).
+        std::string msg=attr_error_text(obj,attr);
+        if(nypy::lenient_reads_log()){ log_lenient_read("AttributeError (store): "+msg); return; }
+        throw_exception(make_exception("AttributeError",{VMVal::make_str(msg)}));
     }
     // Resolve a [start,end,step] slice against a sequence of length sz,
     // returning the indices to take in order. NONE start/end mean "the natural
@@ -4580,10 +4932,11 @@ private:
             return L[(size_t)i];
         }
         if(obj.type==VMType::MAP&&obj.map){
-            // A missing key reads none, as on the interpreter (library code
-            // relies on it); d.get() is the same.
+            // A missing key raises KeyError, as in Python (round 75: it read
+            // none). d.get(k, default), `k in d` and d?[k] are the graceful
+            // forms.
             auto it=obj.map->find(vkey(idx));
-            return it!=obj.map->end()?it->second:VMVal::make_none();
+            return it!=obj.map->end()?it->second:missing_key(idx);
         }
         if(obj.type==VMType::STRING){
             if(idx.type==VMType::LIST&&idx.list&&!idx.b){
@@ -4597,7 +4950,43 @@ private:
             int64_t i=index_of(idx,"string");
             return VMVal::make_str(nycall([&]{ return nypy::str_getitem(obj.s,i); }));
         }
+        // none[k], 5[0], f[0]: TypeError (they read none).
+        std::string msg="'"+vm_type_name(obj)+"' object is not subscriptable";
+        if(nypy::lenient_reads_log()){ log_lenient_read("TypeError: "+msg); return VMVal::make_none(); }
+        raise_native_exception("TypeError",msg);
         return VMVal::make_none();
+    }
+    // obj[idx] for d?[k]: false when the key or index does not exist - a
+    // missing dict key, an index out of range, or __getitem__ raising
+    // KeyError / IndexError. Other errors raise as obj[idx] does.
+    bool try_get_sub(const VMVal& obj, const VMVal& idx, VMVal& out) {
+        if(obj.type==VMType::MAP&&obj.map){
+            auto it=obj.map->find(vkey(idx));
+            if(it==obj.map->end()) return false;
+            out=it->second; return true;
+        }
+        if(obj.type==VMType::LIST&&obj.list&&(idx.type==VMType::INT||idx.type==VMType::BOOL)){
+            int64_t n=(int64_t)obj.list->size(), i=index_of(idx,"list");
+            if(i<0) i+=n;
+            if(i<0||i>=n) return false;
+        }
+        if(obj.type==VMType::STRING&&(idx.type==VMType::INT||idx.type==VMType::BOOL)){
+            int64_t n=(int64_t)nypy::u8_len(obj.s), i=index_of(idx,"string");
+            if(i<0) i+=n;
+            if(i<0||i>=n) return false;
+        }
+        if(obj.type==VMType::INSTANCE){
+            bool f=false;
+            try { out=call_dunder_f(obj,"__getitem__",{idx},f); }
+            catch(VMException& e){
+                if(class_derives(e.value.class_name,"KeyError")||class_derives(e.value.class_name,"IndexError")) return false;
+                throw;
+            }
+            if(f) return true;
+            raise_native_exception("TypeError","'"+obj.class_name+"' object is not subscriptable");
+        }
+        out=get_sub(obj,idx);
+        return true;
     }
     void set_sub(VMVal& obj, const VMVal& idx, VMVal val) {
         if(obj.type==VMType::LIST&&obj.list){
@@ -4956,7 +5345,8 @@ private:
         }
         // CLASS type: support nested class instantiation via CALL_METHOD (e.g. Outer.Inner(v))
         if(obj.type==VMType::CLASS){
-            VMVal nested = get_attr(obj, method);
+            VMVal nested;
+            lookup_attr(obj, method, nested, false);
             if(nested.type == VMType::CLASS) return vm_call(nested, args, std::nullopt, kwargs);
             // Static method call
             if(nested.type == VMType::FUNCTION && nested.code)
@@ -4971,13 +5361,12 @@ private:
                 VMVal fn=load_var(target);
                 if(fn.type==VMType::NATIVE) return fn.native(with_kw());
             }
-            return VMVal::make_none();
+            return missing_attr(obj, method);
         }
-        // Fallback: check globals
-        auto git=globals_.find(method);
-        if(git!=globals_.end()&&git->second.type==VMType::NATIVE)
-            return git->second.native(with_kw());
-        return VMVal::make_none();
+        // Nothing else has methods: none.m(), 5.m(), f.m() raise
+        // AttributeError (they returned none, or called a global native of
+        // that name with the receiver dropped). x?.m() is the graceful form.
+        return missing_attr(obj, method);
     }
 
     // dict methods, typed keys (vkey / vm_key_value), as the interpreter's
@@ -5067,7 +5456,7 @@ private:
             VMVal d=a.size()>=2?a[1]:VMVal::make_none();
             mp[key]=d; return d;
         }
-        return VMVal::make_none();
+        return missing_attr(obj,m);
     }
 
 
@@ -5535,14 +5924,34 @@ private:
         // ── hasattr, ord, chr ────────────────────────────────────────────────
         // hasattr: the full attribute lookup (methods and class attributes
         // too; only an instance's own fields were seen).
-        globals_["hasattr"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2) return VMVal::make_bool(false);
-            std::string attr=a[1].to_string();
-            if(a[0].type==VMType::MAP) return VMVal::make_bool(a[0].map&&a[0].map->count(attr)>0);
-            if(a[0].type==VMType::INSTANCE||a[0].type==VMType::CLASS){
-                VMVal v; return VMVal::make_bool(try_get_attr(a[0],attr,v));
-            }
-            return VMVal::make_bool(false);});
+        // hasattr / getattr / setattr / delattr for every kind of value, as
+        // in Python and as on the interpreter: hasattr and getattr with a
+        // default see an AttributeError (a missing attribute, or one a
+        // property / __getattr__ raises) as absence; other errors propagate.
+        auto attr_name=[this](std::vector<VMVal>& a, const char* fn)->std::string{
+            if(a[1].type!=VMType::STRING)
+                raise_native_exception("TypeError",std::string(fn)+"(): attribute name must be string, not '"+vm_type_name(a[1])+"'");
+            return a[1].s;
+        };
+        globals_["hasattr"]=VMVal::make_native([this,attr_name](std::vector<VMVal>& a)->VMVal{
+            if(a.size()!=2) raise_native_exception("TypeError","hasattr expected 2 arguments, got "+std::to_string(a.size()));
+            VMVal v; return VMVal::make_bool(try_get_attr(a[0],attr_name(a,"hasattr"),v));});
+        globals_["getattr"]=VMVal::make_native([this,attr_name](std::vector<VMVal>& a)->VMVal{
+            if(a.size()<2||a.size()>3) raise_native_exception("TypeError","getattr expected at most 3 arguments, got "+std::to_string(a.size()));
+            std::string n=attr_name(a,"getattr");
+            VMVal v;
+            if(try_get_attr(a[0],n,v)) return v;
+            if(a.size()==3) return a[2];
+            throw_exception(make_exception("AttributeError",{VMVal::make_str(attr_error_text(a[0],n))}));
+            return VMVal::make_none();});
+        globals_["setattr"]=VMVal::make_native([this,attr_name](std::vector<VMVal>& a)->VMVal{
+            if(a.size()!=3) raise_native_exception("TypeError","setattr expected 3 arguments, got "+std::to_string(a.size()));
+            set_attr(a[0],attr_name(a,"setattr"),a[2]);
+            return VMVal::make_none();});
+        globals_["delattr"]=VMVal::make_native([this,attr_name](std::vector<VMVal>& a)->VMVal{
+            if(a.size()!=2) raise_native_exception("TypeError","delattr expected 2 arguments, got "+std::to_string(a.size()));
+            del_attr(a[0],attr_name(a,"delattr"));
+            return VMVal::make_none();});
         globals_["repr"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.empty()) return VMVal::make_str("none");
             if(a[0].type==VMType::INSTANCE||a[0].type==VMType::LIST||a[0].type==VMType::MAP)
@@ -5559,38 +5968,8 @@ private:
             }
             return VMVal::make_str(a[0].to_string());
         });
-        globals_["getattr"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2) return a.size()>=3?a[2]:VMVal::make_none();
-            if(a[0].type==VMType::INSTANCE||a[0].type==VMType::CLASS){
-                VMVal v;
-                if(a.size()>=3) return try_get_attr(a[0],a[1].to_string(),v) ? v : a[2];
-                return get_attr(a[0],a[1].to_string(),true);
-            }
-            VMVal result=get_attr(a[0],a[1].to_string());
-            if(result.type==VMType::NONE&&a.size()>=3) return a[2];
-            return result;
-        });
-        globals_["setattr"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<3) return VMVal::make_none();
-            set_attr(a[0],a[1].to_string(),a[2]);
-            return VMVal::make_none();
-        });
-        globals_["getattr"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2) return a.size()>=3?a[2]:VMVal::make_none();
-            if(a[0].type==VMType::INSTANCE||a[0].type==VMType::CLASS){
-                VMVal v;
-                if(a.size()>=3) return try_get_attr(a[0],a[1].to_string(),v) ? v : a[2];
-                return get_attr(a[0],a[1].to_string(),true);
-            }
-            VMVal result=get_attr(a[0],a[1].to_string());
-            if(result.type==VMType::NONE&&a.size()>=3) return a[2]; // default
-            return result;
-        });
-        globals_["setattr"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<3) return VMVal::make_none();
-            set_attr(a[0],a[1].to_string(),a[2]);
-            return VMVal::make_none();
-        });
+
+
         globals_["ord"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             if(a.empty()||a[0].s.empty()) return VMVal::make_int(0);
             return VMVal::make_int((int64_t)(unsigned char)a[0].s[0]);});
@@ -5717,6 +6096,8 @@ private:
             if(a.empty()) return VMVal::make_bool(false);
             const VMVal& v=a[0];
             if(v.type==VMType::FUNCTION||v.type==VMType::NATIVE||v.type==VMType::CLASS) return VMVal::make_bool(true);
+            // a bound method (obj.method read as a value)
+            if(v.type==VMType::MAP&&(v.class_name=="__bound_method__"||v.class_name=="__super_bound__")) return VMVal::make_bool(true);
             if(v.type==VMType::INSTANCE){ VMVal m; return VMVal::make_bool(class_lookup(v.class_name,"__call__",m)); }
             return VMVal::make_bool(false);
         });
@@ -6043,7 +6424,7 @@ private:
             for(auto& v:a) sa.push_back(vm->to_sarg(v));
             nypy::SRes r;
             if(vm->nycall([&]{ return nypy::str_method(obj.s,m,sa,r); })) return from_sres(r);
-            return VMVal::make_none();
+            return vm->missing_attr(obj,m);
         });
     }
     VMVal call_str_method(VMVal obj, const std::string& m, std::vector<VMVal>& a) {
@@ -6263,7 +6644,7 @@ private:
                 std::vector<VMVal> sub;
                 for(int64_t k=0,i=st;k<n;k++,i+=step) sub.push_back(lst[(size_t)i]);
                 VMVal r=VMVal::make_list(std::move(sub)); r.b=obj.b; return r;}
-            return VMVal::make_none();
+            return vm->missing_attr(obj,m);
         });
     }
     VMVal call_list_method(VMVal obj, const std::string& m, std::vector<VMVal>& a) {
@@ -6630,6 +7011,7 @@ private:
             case VMType::CLASS:return VMVal::make_str("class");
             case VMType::INSTANCE:return VMVal::make_str(a[0].class_name);
             case VMType::GENERATOR:case VMType::ITERATOR:return VMVal::make_str("generator");
+            case VMType::UNDEFINED:return VMVal::make_str("undefined");
             default:return VMVal::make_str("unknown");}});
         globals_["typeof"]=globals_["type"];
     }
@@ -6765,6 +7147,7 @@ private:
             case VMType::FUNCTION:return VMVal::make_str("function");
             case VMType::CLASS:return VMVal::make_str("class");
             case VMType::INSTANCE:return VMVal::make_str(a[0].class_name);
+            case VMType::UNDEFINED:return VMVal::make_str("undefined");
             default:return VMVal::make_str("unknown");}});
         globals_["abs"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             if(a.empty())return VMVal::make_int(0);
@@ -7370,6 +7753,16 @@ private:
         case Op::STORE_NAME:   return "STORE_NAME";
         case Op::DEFINE_NAME:  return "DEFINE_NAME";
         case Op::LOAD_ATTR:    return "LOAD_ATTR";
+        case Op::LOAD_ATTR_OPT: return "LOAD_ATTR_OPT";
+        case Op::LOAD_SUBSCR_OPT: return "LOAD_SUBSCR_OPT";
+        case Op::CHECK_MEMBER: return "CHECK_MEMBER";
+        case Op::DUP_TOP_TWO:  return "DUP_TOP_TWO";
+        case Op::LOAD_GLOBAL_NAME: return "LOAD_GLOBAL_NAME";
+        case Op::DELETE_NAME:  return "DELETE_NAME";
+        case Op::STORE_GLOBAL_NAME: return "STORE_GLOBAL_NAME";
+        case Op::JUMP_IF_NONE_KEEP: return "JUMP_IF_NONE_KEEP";
+        case Op::JUMP_IF_MISSING_KEEP: return "JUMP_IF_MISSING_KEEP";
+        case Op::JUMP_IF_NOT_NONE_OR_POP: return "JUMP_IF_NOT_NONE_OR_POP";
         case Op::STORE_ATTR:   return "STORE_ATTR";
         case Op::LOAD_SUBSCR:  return "LOAD_SUBSCR";
         case Op::STORE_SUBSCR: return "STORE_SUBSCR";
