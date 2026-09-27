@@ -1659,8 +1659,63 @@ void Lexer::consume_ident() {
         source.appendToFrame(source.current_char);
     }
     source.put_char();
-    this->token.value = source.get_current_frame();
+    std::string ident = source.get_current_frame();
+    // r"..." / r'...': a raw string - backslashes are kept as written.
+    if ((ident == "r" || ident == "R") && (source.peek_char() == '"' || source.peek_char() == '\'')) {
+        char q = source.read_char();
+        consume_raw_string(q);
+        return;
+    }
+    this->token.value = ident;
     make_token(TokenType::Identifier,TokenKind::Identifier,TokenClass::Identifier);
+}
+
+// The body of a raw string literal, its opening quote just read (a single
+// quote, or the first of three). Nothing is an escape; a backslash only keeps
+// the quote after it from ending the string, as in Python.
+void Lexer::consume_raw_string(char q) {
+    std::string out;
+    int n = 1;
+    if (source.peek_char() == q) {
+        source.read_char();
+        if (source.peek_char() == q) { source.read_char(); n = 3; }
+        else { this->token.value = ""; make_token(TokenType::String,TokenKind::String,TokenClass::Literal); return; }
+    }
+    while (true) {
+        char c = source.read_char();
+        if (c == '\0' || c == (char)-1) {
+            this->token.value = out;
+            errors++;
+            make_token(TokenType::UnterminatedStringError,TokenKind::Error, TokenClass::Invalid);
+            add_info_item(LexerInfoLevel::Error,token);
+            return;
+        }
+        if (c == '\\') {
+            out += c;
+            char d = source.read_char();
+            if (d == '\0' || d == (char)-1) continue;
+            out += d;
+            continue;
+        }
+        if (c == q) {
+            if (n == 1) break;
+            if (source.peek_char() == q) {
+                source.read_char();
+                if (source.peek_char() == q) { source.read_char(); break; }
+                out += q; out += q; continue;
+            }
+        }
+        if (c == '\n' && n == 1) {
+            this->token.value = out;
+            errors++;
+            make_token(TokenType::UnterminatedStringError,TokenKind::Error, TokenClass::Invalid);
+            add_info_item(LexerInfoLevel::Error,token);
+            return;
+        }
+        out += c;
+    }
+    this->token.value = out;
+    make_token(TokenType::String,TokenKind::String,TokenClass::Literal);
 }
 
 void Lexer::consume_regex(char first) {

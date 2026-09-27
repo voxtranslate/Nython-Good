@@ -208,6 +208,25 @@ private:
     node_ptr raiseStmt();
     node_ptr assertStmt();
     node_ptr switchStmt();
+    // `match` (Python's structural pattern matching): the patterns parse into
+    // MatchPat and the statement desugars into an if-chain over a subject
+    // temporary - see switchStmt().
+    struct MatchPat {
+        enum Kind { WILD, CAPTURE, VALUE, OR, SEQ, CLASS, MAP } kind = WILD;
+        std::string name;                 // CAPTURE
+        std::string as_name;              // `pattern as name`, any kind
+        node_ptr value;                   // VALUE: the expression; CLASS: the class
+        std::vector<std::shared_ptr<MatchPat>> subs;   // OR / SEQ / CLASS positional
+        int star = -1;                    // SEQ: index of the starred item
+        std::string star_name;            // SEQ: its name ("" or "_" binds nothing)
+        std::vector<std::pair<std::string, std::shared_ptr<MatchPat>>> kw;  // CLASS keywords
+        std::vector<std::pair<node_ptr, std::shared_ptr<MatchPat>>> items; // MAP
+        std::string rest;                 // MAP: **rest
+    };
+    std::shared_ptr<MatchPat> matchPattern();        // open sequence at the top
+    std::shared_ptr<MatchPat> matchOrPattern();
+    std::shared_ptr<MatchPat> matchClosedPattern();
+    node_ptr matchStmt(Token tok, node_ptr subject);
     node_ptr enumDecl();
     node_ptr lambdaExpr();
     node_ptr deleteStmt();
