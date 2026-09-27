@@ -130,8 +130,8 @@ Setup (`tests/sab_learnability.py`):
 |---|---|---|---|---|---|---|---|
 | acoustic-only (first design, now the `no_sab_anchor` ablation) | 0.3 | 0.18 | 14.5 | 2.7 | 0.93 | 39.2 | – |
 | **hypothesis-anchored (final)** | 1.2 | 0.36 | **44.7** | **32.8** | 1.00 | 46.3 | 46.9 |
-| acoustic-only | 1.2 | (see PR) | | | | | |
+| acoustic-only, CE only (= `no_sab_anchor`) | 1.2 | 0.14 | 11.0 | 0.5 | 0.18 | 35.6 | 35.6 |
 
-The acoustic-only bridge avoids collapse but barely depends on its input. The anchored bridge matches the text route and the cascade (direct vs. text-route agreement: 85.4 chrF++).
+Under identical conditions (noise 1.2, same steps), the acoustic-only bridge trained with CE only **collapses exactly like v1**: 18 % distinct outputs, SSI 0.5, and the same few Bible sentences whatever the input. With anchoring losses (first row) it avoids collapse but barely depends on its input. The hypothesis-anchored bridge matches the text route and the cascade (direct vs. text-route agreement: 85.4 chrF++).
 
 Limits: the synthetic CTC is almost perfect, so this shows no collapse and generalisation to unseen words. It does **not** show the acoustic residual beating a cascade; that needs real ASR errors and the full-scale run.
