@@ -16,15 +16,27 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cmath>
+#include <cstring>
 
 namespace nypy {
 
 
 // ── UTF-8 ───────────────────────────────────────────────────────────────
-inline bool is_ascii(const std::string& s) {
-    for (unsigned char c : s) if (c >= 0x80) return false;
+// True when the first n bytes (all of them by default) are ASCII: there a
+// character index is a byte index. Eight bytes at a time, since indexing and
+// slicing ask on every call.
+inline bool ascii_prefix(const std::string& s, size_t n) {
+    if (n > s.size()) n = s.size();
+    const char* p = s.data();
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t w; std::memcpy(&w, p + i, 8);
+        if (w & 0x8080808080808080ULL) return false;
+    }
+    for (; i < n; i++) if ((unsigned char)p[i] >= 0x80) return false;
     return true;
 }
+inline bool is_ascii(const std::string& s) { return ascii_prefix(s, s.size()); }
 inline size_t u8_seq(unsigned char c) {
     if (c < 0x80) return 1;
     if ((c >> 5) == 6) return 2;
@@ -39,6 +51,7 @@ inline size_t u8_at_len(const std::string& s, size_t i) {
     return n;
 }
 inline size_t u8_len(const std::string& s) {
+    if (is_ascii(s)) return s.size();
     size_t n = 0;
     for (size_t i = 0; i < s.size(); i += u8_at_len(s, i)) n++;
     return n;
@@ -561,6 +574,8 @@ inline std::string str_repeat(const std::string& s, int64_t n) { return repeat_s
 
 // ── indexing and slicing in characters ──────────────────────────────────
 inline std::string str_getitem(const std::string& s, int64_t i) {
+    // s[i] with i >= 0 needs only the first i + 1 characters to be ASCII.
+    if (i >= 0 && (uint64_t)i < s.size() && ascii_prefix(s, (size_t)i + 1)) return std::string(1, s[(size_t)i]);
     if (is_ascii(s)) {
         int64_t n = (int64_t)s.size();
         if (!seq_index(n, i)) raise("IndexError", "string index out of range");
@@ -572,6 +587,9 @@ inline std::string str_getitem(const std::string& s, int64_t i) {
     return s.substr(offs[(size_t)i], offs[(size_t)i + 1] - offs[(size_t)i]);
 }
 inline std::string str_slice(const std::string& s, bool hs, int64_t start, bool he, int64_t stop, int64_t step = 1) {
+    // s[a:b] with 0 <= a <= b: only the first b characters matter.
+    if (step == 1 && hs && he && start >= 0 && stop >= start && ascii_prefix(s, (size_t)std::min<uint64_t>((uint64_t)stop, s.size())))
+        return (uint64_t)start >= s.size() ? std::string() : s.substr((size_t)start, (size_t)(stop - start));
     bool ascii = is_ascii(s);
     std::vector<size_t> offs;
     int64_t len;
@@ -666,6 +684,8 @@ inline SRes sres_list(std::vector<std::string> v, bool tuple = false) { SRes r; 
 
 inline bool str_method(const std::string& s, const std::string& m, const std::vector<SArg>& a, SRes& out) {
     const size_t n = a.size();
+    // The method name against each literal: length first, no strlen.
+    auto M = [&m](const auto& lit) { return m.size() == sizeof(lit) - 1 && std::memcmp(m.data(), lit, sizeof(lit) - 1) == 0; };
     auto bad_arg = [&](size_t i, const char* want) {
         raise("TypeError", m + "() argument " + std::to_string(i + 1) + " must be " + want + ", not " + (i < n ? a[i].tname : std::string("nothing")));
     };
@@ -693,40 +713,40 @@ inline bool str_method(const std::string& s, const std::string& m, const std::ve
         return nullptr;
     };
     // ── case / predicates
-    if (m == "upper") { out = sres_str(str_upper(s)); return true; }
-    if (m == "lower") { out = sres_str(str_lower(s)); return true; }
-    if (m == "casefold") { out = sres_str(str_casefold(s)); return true; }
-    if (m == "swapcase") { out = sres_str(str_swapcase(s)); return true; }
-    if (m == "capitalize") { out = sres_str(str_capitalize(s)); return true; }
-    if (m == "title") { out = sres_str(str_title(s)); return true; }
-    if (m == "isdigit" || m == "isdecimal" || m == "isnumeric") { out = sres_bool(str_isdigit(s)); return true; }
-    if (m == "isalpha") { out = sres_bool(str_isalpha(s)); return true; }
-    if (m == "isalnum") { out = sres_bool(str_isalnum(s)); return true; }
-    if (m == "isspace") { out = sres_bool(str_isspace(s)); return true; }
-    if (m == "isupper") { out = sres_bool(str_isupper(s)); return true; }
-    if (m == "islower") { out = sres_bool(str_islower(s)); return true; }
-    if (m == "istitle") { out = sres_bool(str_istitle(s)); return true; }
-    if (m == "isidentifier") { out = sres_bool(str_isidentifier(s)); return true; }
-    if (m == "isprintable") { out = sres_bool(str_isprintable(s)); return true; }
-    if (m == "isascii") { out = sres_bool(str_isascii(s)); return true; }
+    if (M("upper")) { out = sres_str(str_upper(s)); return true; }
+    if (M("lower")) { out = sres_str(str_lower(s)); return true; }
+    if (M("casefold")) { out = sres_str(str_casefold(s)); return true; }
+    if (M("swapcase")) { out = sres_str(str_swapcase(s)); return true; }
+    if (M("capitalize")) { out = sres_str(str_capitalize(s)); return true; }
+    if (M("title")) { out = sres_str(str_title(s)); return true; }
+    if (M("isdigit") || M("isdecimal") || M("isnumeric")) { out = sres_bool(str_isdigit(s)); return true; }
+    if (M("isalpha")) { out = sres_bool(str_isalpha(s)); return true; }
+    if (M("isalnum")) { out = sres_bool(str_isalnum(s)); return true; }
+    if (M("isspace")) { out = sres_bool(str_isspace(s)); return true; }
+    if (M("isupper")) { out = sres_bool(str_isupper(s)); return true; }
+    if (M("islower")) { out = sres_bool(str_islower(s)); return true; }
+    if (M("istitle")) { out = sres_bool(str_istitle(s)); return true; }
+    if (M("isidentifier")) { out = sres_bool(str_isidentifier(s)); return true; }
+    if (M("isprintable")) { out = sres_bool(str_isprintable(s)); return true; }
+    if (M("isascii")) { out = sres_bool(str_isascii(s)); return true; }
     // ── strip
-    if (m == "strip" || m == "trim") { need(0, 1); out = sres_str(str_strip(s, opt_chars(0), 0)); return true; }
-    if (m == "lstrip") { need(0, 1); out = sres_str(str_strip(s, opt_chars(0), 1)); return true; }
-    if (m == "rstrip") { need(0, 1); out = sres_str(str_strip(s, opt_chars(0), 2)); return true; }
-    if (m == "removeprefix") { need(1, 1); const std::string& p = str_at(0); out = sres_str(s.compare(0, p.size(), p) == 0 && s.size() >= p.size() ? s.substr(p.size()) : s); return true; }
-    if (m == "removesuffix") { need(1, 1); const std::string& p = str_at(0); out = sres_str(!p.empty() && s.size() >= p.size() && s.compare(s.size() - p.size(), p.size(), p) == 0 ? s.substr(0, s.size() - p.size()) : s); return true; }
+    if (M("strip") || M("trim")) { need(0, 1); out = sres_str(str_strip(s, opt_chars(0), 0)); return true; }
+    if (M("lstrip")) { need(0, 1); out = sres_str(str_strip(s, opt_chars(0), 1)); return true; }
+    if (M("rstrip")) { need(0, 1); out = sres_str(str_strip(s, opt_chars(0), 2)); return true; }
+    if (M("removeprefix")) { need(1, 1); const std::string& p = str_at(0); out = sres_str(s.compare(0, p.size(), p) == 0 && s.size() >= p.size() ? s.substr(p.size()) : s); return true; }
+    if (M("removesuffix")) { need(1, 1); const std::string& p = str_at(0); out = sres_str(!p.empty() && s.size() >= p.size() && s.compare(s.size() - p.size(), p.size(), p) == 0 ? s.substr(0, s.size() - p.size()) : s); return true; }
     // ── split / join
-    if (m == "split" || m == "rsplit") {
+    if (M("split") || M("rsplit")) {
         need(0, 2);
         const std::string* sep = opt_chars(0);
         int64_t maxs = -1;
         if (n >= 2) maxs = int_at(1);
-        out = sres_list(m == "split" ? str_split(s, sep != nullptr, sep ? *sep : std::string(), maxs)
+        out = sres_list(M("split") ? str_split(s, sep != nullptr, sep ? *sep : std::string(), maxs)
                                      : str_rsplit(s, sep != nullptr, sep ? *sep : std::string(), maxs));
         return true;
     }
-    if (m == "splitlines") { need(0, 1); bool keep = n >= 1 && a[0].k != SArg::NONE && a[0].i != 0; out = sres_list(str_splitlines(s, keep)); return true; }
-    if (m == "join") {
+    if (M("splitlines")) { need(0, 1); bool keep = n >= 1 && a[0].k != SArg::NONE && a[0].i != 0; out = sres_list(str_splitlines(s, keep)); return true; }
+    if (M("join")) {
         need(1, 1);
         if (a[0].k == SArg::STR) {   // "".join("abc") joins its characters
             auto ch = u8_chars(a[0].s);
@@ -738,21 +758,21 @@ inline bool str_method(const std::string& s, const std::string& m, const std::ve
         for (size_t i = 0; i < a[0].v.size(); i++) { if (i) r += s; r += a[0].v[i]; }
         out = sres_str(r); return true;
     }
-    if (m == "partition" || m == "rpartition") { need(1, 1); out = sres_list(str_partition(s, str_at(0), m == "rpartition"), true); return true; }
+    if (M("partition") || M("rpartition")) { need(1, 1); out = sres_list(str_partition(s, str_at(0), M("rpartition")), true); return true; }
     // ── search
-    if (m == "find" || m == "rfind" || m == "index" || m == "rindex" || m == "count") {
+    if (M("find") || M("rfind") || M("index") || M("rindex") || M("count")) {
         need(1, 3);
         const std::string& sub = str_at(0);
         bool hs, he; int64_t st = 0, en = 0;
         opt_int(1, hs, st); opt_int(2, he, en);
         int64_t r;
-        if (m == "count") { out = sres_int(str_count(s, sub, hs, st, he, en)); return true; }
-        bool rev = m == "rfind" || m == "rindex";
+        if (M("count")) { out = sres_int(str_count(s, sub, hs, st, he, en)); return true; }
+        bool rev = M("rfind") || M("rindex");
         r = rev ? str_rfind(s, sub, hs, st, he, en) : str_find(s, sub, hs, st, he, en);
-        if (r < 0 && (m == "index" || m == "rindex")) raise("ValueError", "substring not found");
+        if (r < 0 && (M("index") || M("rindex"))) raise("ValueError", "substring not found");
         out = sres_int(r); return true;
     }
-    if (m == "startswith" || m == "endswith" || m == "starts_with" || m == "ends_with") {
+    if (M("startswith") || M("endswith") || M("starts_with") || M("ends_with")) {
         need(1, 3);
         std::vector<std::string> ps;
         if (a[0].k == SArg::STR) ps.push_back(a[0].s);
@@ -763,28 +783,28 @@ inline bool str_method(const std::string& s, const std::string& m, const std::ve
         out = sres_bool(str_startswith(s, ps, hs, st, he, en, m[0] == 'e'));
         return true;
     }
-    if (m == "contains" || m == "__contains__" || m == "includes") { need(1, 1); out = sres_bool(s.find(str_at(0)) != std::string::npos); return true; }
+    if (M("contains") || M("__contains__") || M("includes")) { need(1, 1); out = sres_bool(s.find(str_at(0)) != std::string::npos); return true; }
     // ── replace / padding
-    if (m == "replace") {
+    if (M("replace")) {
         need(2, 3);
         int64_t cnt = n >= 3 ? int_at(2) : -1;
         out = sres_str(str_replace(s, str_at(0), str_at(1), cnt)); return true;
     }
-    if (m == "center" || m == "ljust" || m == "rjust") {
+    if (M("center") || M("ljust") || M("rjust")) {
         need(1, 2);
         int64_t w = int_at(0);
         const std::string* f = n >= 2 ? &str_at(1) : nullptr;
-        out = sres_str(m == "center" ? str_center(s, w, f) : m == "ljust" ? str_ljust(s, w, f) : str_rjust(s, w, f));
+        out = sres_str(M("center") ? str_center(s, w, f) : M("ljust") ? str_ljust(s, w, f) : str_rjust(s, w, f));
         return true;
     }
-    if (m == "zfill") { need(1, 1); out = sres_str(str_zfill(s, int_at(0))); return true; }
-    if (m == "expandtabs") { need(0, 1); out = sres_str(str_expandtabs(s, n ? int_at(0) : 8)); return true; }
-    if (m == "encode" || m == "decode") { out = sres_str(s); return true; }
+    if (M("zfill")) { need(1, 1); out = sres_str(str_zfill(s, int_at(0))); return true; }
+    if (M("expandtabs")) { need(0, 1); out = sres_str(str_expandtabs(s, n ? int_at(0) : 8)); return true; }
+    if (M("encode") || M("decode")) { out = sres_str(s); return true; }
     // ── Nython extras (kept on both engines)
-    if (m == "length" || m == "size" || m == "len") { out = sres_int((int64_t)str_width(s)); return true; }
-    if (m == "reverse" || m == "reversed") { out = sres_str(str_reverse(s)); return true; }
-    if (m == "repeat") { need(1, 1); out = sres_str(repeat_str(s, int_at(0))); return true; }
-    if (m == "charAt" || m == "char_at") {
+    if (M("length") || M("size") || M("len")) { out = sres_int((int64_t)str_width(s)); return true; }
+    if (M("reverse") || M("reversed")) { out = sres_str(str_reverse(s)); return true; }
+    if (M("repeat")) { need(1, 1); out = sres_str(repeat_str(s, int_at(0))); return true; }
+    if (M("charAt") || M("char_at")) {
         // Lenient, as it always was: out of range reads "".
         need(1, 1);
         int64_t i = int_at(0);
@@ -792,7 +812,7 @@ inline bool str_method(const std::string& s, const std::string& m, const std::ve
         out = sres_str(i >= 0 && i < len ? str_getitem(s, i) : std::string());
         return true;
     }
-    if (m == "substring" || m == "substr") {
+    if (M("substring") || M("substr")) {
         // (start, length), as on the interpreter since the start.
         need(0, 2);
         int64_t st = n >= 1 ? int_at(0) : 0;
@@ -804,7 +824,7 @@ inline bool str_method(const std::string& s, const std::string& m, const std::ve
         out = sres_str(str_slice(s, true, st, true, std::min(len, st + cnt), 1));
         return true;
     }
-    if (m == "slice") {
+    if (M("slice")) {
         // s[a:b:c] - the parser emits s.slice(a, b, c) with none for a
         // missing bound.
         need(0, 3);
@@ -814,14 +834,14 @@ inline bool str_method(const std::string& s, const std::string& m, const std::ve
         out = sres_str(str_slice(s, ha, st, hb, en, step));
         return true;
     }
-    if (m == "to_float" || m == "to_number") {
+    if (M("to_float") || M("to_number")) {
         char* e = nullptr; double v = std::strtod(s.c_str(), &e);
         out.k = SRes::STR; out.s = (e && *e == 0 && !s.empty()) ? s : std::string("0");
         out.i = 1;   // STR with i == 1: the engine returns float(out.s)
         (void)v;
         return true;
     }
-    if (m == "to_int" || m == "to_integer") {
+    if (M("to_int") || M("to_integer")) {
         char* e = nullptr; long long v = std::strtoll(s.c_str(), &e, 10);
         out = sres_int(e && *e == 0 && !s.empty() ? v : 0); return true;
     }
@@ -855,7 +875,7 @@ inline std::string key_of_float(double d) {
     if (d == std::trunc(d) && std::fabs(d) < 9.2e18) return key_of_int((int64_t)d);
     if (d == std::trunc(d) && !std::isinf(d)) return key_of_big(BigInt::from_double(d));
     char buf[40]; snprintf(buf, sizeof buf, "%.17g", d);
-    return std::string("\x01f") + buf;
+    return std::string("\x01" "f") + buf;   // not "\x01f": that is one hex escape, 0x1F
 }
 inline std::string key_of_none() { return "\x01n"; }
 inline std::string key_of_tuple(const std::vector<std::string>& parts) {
@@ -885,5 +905,64 @@ inline std::vector<std::string> key_tuple_parts(const std::string& k) {
         i = c + 1 + n;
     }
     return out;
+}
+
+// hash(x) from x's key: Python's own value for ints, floats (so hash(1) ==
+// hash(1.0) == hash(True) == 1) and tuples of them; strings and objects get
+// a stable FNV-1a (Python randomises those per process anyway).
+inline int64_t hash_of_key(const std::string& k) {
+    const uint64_t P = (1ULL << 61) - 1;
+    auto fin = [](int64_t h) { return h == -1 ? (int64_t)-2 : h; };
+    auto fnv = [&](const std::string& t) {
+        uint64_t h = 1469598103934665603ULL;
+        for (unsigned char c : t) { h ^= c; h *= 1099511628211ULL; }
+        return fin((int64_t)(h & P));
+    };
+    switch (key_kind(k)) {
+        case K_INT: {
+            const std::string d = k.substr(2);
+            bool neg = !d.empty() && d[0] == '-';
+            unsigned __int128 h = 0;
+            for (size_t i = neg ? 1 : 0; i < d.size(); i++) h = (h * 10 + (unsigned)(d[i] - '0')) % P;
+            int64_t r = (int64_t)h;
+            return fin(neg ? -r : r);
+        }
+        case K_FLOAT: {
+            double v = std::strtod(k.c_str() + 2, nullptr);
+            if (std::isinf(v)) return v > 0 ? 314159 : -314159;
+            if (std::isnan(v)) return 0;
+            int e; double m = std::frexp(v, &e);
+            int sign = 1;
+            if (m < 0) { sign = -1; m = -m; }
+            uint64_t x = 0;
+            while (m != 0) {
+                x = ((x << 28) & P) | x >> (61 - 28);
+                m *= 268435456.0; e -= 28;
+                uint64_t y = (uint64_t)m; m -= (double)y;
+                x += y;
+                if (x >= P) x -= P;
+            }
+            e = e >= 0 ? e % 61 : 61 - 1 - ((-1 - e) % 61);
+            x = ((x << e) & P) | x >> (61 - e);
+            return fin((int64_t)x * sign);
+        }
+        case K_NONE: return 0xFCA86420;
+        case K_TUPLE: {
+            // CPython's tuple hash (xxHash-derived).
+            const uint64_t X1 = 11400714785074694791ULL, X2 = 14029467366897019727ULL, X5 = 2870177450012600261ULL;
+            auto parts = key_tuple_parts(k);
+            uint64_t acc = X5;
+            for (auto& p : parts) {
+                uint64_t lane = (uint64_t)hash_of_key(p);
+                acc += lane * X2;
+                acc = (acc << 31) | (acc >> 33);
+                acc *= X1;
+            }
+            acc += (uint64_t)parts.size() ^ (X5 ^ 3527539ULL);
+            if (acc == (uint64_t)-1) return 1546275796;
+            return (int64_t)acc;
+        }
+        default: return fnv(k);
+    }
 }
 } // namespace nypy

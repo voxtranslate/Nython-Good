@@ -118,6 +118,16 @@ private:
         return (size_t)h;
     }
 
+    // Keys are mostly short names: compared inline rather than via memcmp.
+    static bool key_eq(const std::string& a, std::string_view b) {
+        const size_t n = a.size();
+        if (n != b.size()) return false;
+        const char* x = a.data(); const char* y = b.data();
+        if (n > 16) return std::memcmp(x, y, n) == 0;
+        for (size_t i = 0; i < n; i++) if (x[i] != y[i]) return false;
+        return true;
+    }
+
     void rebuild_index(size_t cap) {
         size_t c = 8;
         while (c < cap) c <<= 1;
@@ -135,8 +145,8 @@ private:
     void grow_if_needed() {
         if ((used_ + 1) * 2 > index_.size()) rebuild_index(live_ * 4 + 8);
     }
-    // Index cell holding key, or -1 (hashed mode only).
-    long find_cell(std::string_view k, size_t h) const {
+    // Index cell holding key, or -1 (hashed mode only); *sp is its slot.
+    long find_cell(std::string_view k, size_t h, const Slot** sp = nullptr) const {
         size_t mask = index_.size() - 1, i = h & mask;
         const uint64_t tag = (uint64_t)(h >> 32);
         while (true) {
@@ -144,7 +154,7 @@ private:
             if (c == kEmpty) return -1;
             if ((c >> 32) == tag && is_ref(c)) {
                 const Slot& sl = slots_[slot_of(c)];
-                if (sl.hash == h && sl.kv.first == k) return (long)i;
+                if (sl.hash == h && key_eq(sl.kv.first, k)) { if (sp) *sp = &sl; return (long)i; }
             }
             i = (i + 1) & mask;
         }
@@ -154,7 +164,9 @@ private:
     // scopes and objects never grow past it. Hashes are computed when a map
     // first needs its index.
     static constexpr size_t kSmall = 8;
-    long find_slot(std::string_view k) const {
+    // Slot number holding key, or -1; *sp (when given) is the slot itself,
+    // so callers need not locate it again.
+    long find_slot(std::string_view k, const Slot** sp = nullptr) const {
         if (index_.empty()) {
             const size_t e = slots_.size(), ks = k.size();
             const char* kd = k.data();
@@ -163,14 +175,16 @@ private:
                 size_t lim = std::min(kB << c, e - base);
                 for (size_t o = 0; o < lim; o++) {
                     const std::string& key = ch[o].kv.first;
-                    if (key.size() == ks && (ks == 0 || (key[0] == kd[0] && std::memcmp(key.data(), kd, ks) == 0)) && ch[o].live)
+                    if (key.size() == ks && (ks == 0 || (key[0] == kd[0] && key_eq(key, k))) && ch[o].live) {
+                        if (sp) *sp = &ch[o];
                         return (long)(base + o);
+                    }
                 }
                 base += kB << c;
             }
             return -1;
         }
-        long c = find_cell(k, hash_of(k));
+        long c = find_cell(k, hash_of(k), sp);
         return c < 0 ? -1 : (long)slot_of(index_[(size_t)c]);
     }
     // Inserts a key known to be absent; returns its slot number.
@@ -219,12 +233,21 @@ private:
         rebuild_index(live_ * 4 + 8);
     }
 
+    // An iterator is a slot number plus that slot's address (slots never
+    // move), so dereferencing costs no chunk arithmetic.
     template<class MapT, class ValT>
     class Iter {
         friend class OrderedMap;
+        using SlotP = std::conditional_t<std::is_const_v<MapT>, const Slot*, Slot*>;
         MapT* m_ = nullptr;
         size_t n_ = 0;
-        void skip() { while (n_ < m_->slots_.size() && !m_->slots_[n_].live) ++n_; }
+        SlotP p_ = nullptr;
+        void settle() {
+            const size_t sz = m_->slots_.size();
+            for (; n_ < sz; ++n_) { SlotP s = &m_->slots_[n_]; if (s->live) { p_ = s; return; } }
+            p_ = nullptr;
+        }
+        Iter(MapT* m, size_t n, SlotP p) : m_(m), n_(n), p_(p) {}   // a live slot, known
     public:
         using iterator_category = std::forward_iterator_tag;
         using value_type = OrderedMap::value_type;
@@ -232,12 +255,12 @@ private:
         using pointer = ValT*;
         using reference = ValT&;
         Iter() = default;
-        Iter(MapT* m, size_t n) : m_(m), n_(n) { skip(); }
+        Iter(MapT* m, size_t n) : m_(m), n_(n) { settle(); }
         template<class M2, class V2, class = std::enable_if_t<std::is_const_v<MapT> && !std::is_const_v<M2>>>
-        Iter(const Iter<M2, V2>& o) : m_(o.m_), n_(o.n_) {}
-        reference operator*() const { return m_->slots_[n_].kv; }
-        pointer operator->() const { return &m_->slots_[n_].kv; }
-        Iter& operator++() { ++n_; skip(); return *this; }
+        Iter(const Iter<M2, V2>& o) : m_(o.m_), n_(o.n_), p_(o.p_) {}
+        reference operator*() const { return p_->kv; }
+        pointer operator->() const { return &p_->kv; }
+        Iter& operator++() { ++n_; settle(); return *this; }
         Iter operator++(int) { Iter t = *this; ++*this; return t; }
         template<class M2, class V2> bool operator==(const Iter<M2, V2>& o) const { return n_ == o.n_; }
         template<class M2, class V2> bool operator!=(const Iter<M2, V2>& o) const { return n_ != o.n_; }
@@ -268,12 +291,14 @@ public:
     void clear() { slots_.clear(); index_.clear(); live_ = 0; used_ = 0; }
 
     iterator find(std::string_view k) {
-        long n = find_slot(k);
-        return n < 0 ? end() : iterator(this, (size_t)n);
+        const Slot* sp = nullptr;
+        long n = find_slot(k, &sp);
+        return n < 0 ? end() : iterator(this, (size_t)n, const_cast<Slot*>(sp));
     }
     const_iterator find(std::string_view k) const {
-        long n = find_slot(k);
-        return n < 0 ? end() : const_iterator(this, (size_t)n);
+        const Slot* sp = nullptr;
+        long n = find_slot(k, &sp);
+        return n < 0 ? end() : const_iterator(this, (size_t)n, sp);
     }
     iterator find(const std::string& k) { return find(std::string_view(k)); }
     const_iterator find(const std::string& k) const { return find(std::string_view(k)); }
@@ -285,13 +310,13 @@ public:
     bool contains(std::string_view k) const { return count(k) > 0; }
 
     V& operator[](const std::string& k) {
-        long n = find_slot(k);
-        if (n >= 0) return slots_[(size_t)n].kv.second;
+        const Slot* sp = nullptr;
+        if (find_slot(k, &sp) >= 0) return const_cast<Slot*>(sp)->kv.second;
         return slots_[insert_new(std::string(k), V())].kv.second;
     }
     V& operator[](std::string&& k) {
-        long n = find_slot(k);
-        if (n >= 0) return slots_[(size_t)n].kv.second;
+        const Slot* sp = nullptr;
+        if (find_slot(k, &sp) >= 0) return const_cast<Slot*>(sp)->kv.second;
         return slots_[insert_new(std::move(k), V())].kv.second;
     }
     V& operator[](const char* k) { return (*this)[std::string(k)]; }

@@ -558,6 +558,33 @@ inline bool parse_int_str(const std::string& in, int base, BigInt& out) {
     if (neg) out = -out;
     return true;
 }
+// int(s) with no base: decimal, as in Python, and also a 0x/0o/0b prefixed
+// number - Nython's int("0xFF") == 255, which Python spells int(s, 0).
+inline bool parse_int_default(const std::string& s, BigInt& out) {
+    if (parse_int_str(s, 10, out)) return true;
+    size_t i = s.find_first_not_of(" \t\n\r\f\v");
+    if (i != std::string::npos && (s[i] == '+' || s[i] == '-')) i++;
+    if (i == std::string::npos || i + 1 >= s.size() || s[i] != '0') return false;
+    char p = (char)std::tolower((unsigned char)s[i + 1]);
+    if (p != 'x' && p != 'o' && p != 'b') return false;
+    return parse_int_str(s, 0, out);
+}
+// An integer literal's text (decimal, 0x/0o/0b, underscores, leading zeros
+// allowed as the lexer passes them) to its exact value; 0 if malformed.
+inline BigInt parse_int_literal(const std::string& v) {
+    BigInt out;
+    int base = 10;
+    std::string digits = v;
+    if (v.size() > 2 && v[0] == '0') {
+        char p = (char)std::tolower((unsigned char)v[1]);
+        if (p == 'x') base = 16; else if (p == 'o') base = 8; else if (p == 'b') base = 2;
+        if (base != 10) digits = v.substr(2);
+    }
+    std::string clean;
+    for (char c : digits) if (c != '_') clean += c;
+    if (!BigInt::parse(clean, base, out)) return BigInt();
+    return out;
+}
 inline bool parse_float_str(const std::string& in, double& out) {
     size_t a = 0, b = in.size(), n;
     while (a < b && ws_at(in, a, n)) a += n;
