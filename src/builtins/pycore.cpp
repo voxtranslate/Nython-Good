@@ -32,7 +32,7 @@ enum PyB {
     B_LEN = 1, B_STR, B_REPR, B_ASCII, B_FORMAT, B_INT, B_FLOAT, B_BOOL, B_ABS, B_ROUND,
     B_POW, B_DIVMOD, B_HEX, B_OCT, B_BIN, B_CHR, B_ORD, B_MIN, B_MAX, B_SUM, B_SORTED,
     B_REVERSED, B_LIST, B_TUPLE, B_SET, B_DICT, B_ENUMERATE, B_ZIP, B_MAP, B_FILTER,
-    B_ANY, B_ALL, B_RANGE, B_TYPE, B_FMTVAL
+    B_ANY, B_ALL, B_RANGE, B_TYPE, B_FMTVAL, B_HASH
 };
 }
 
@@ -45,7 +45,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         {"sorted", B_SORTED}, {"reversed", B_REVERSED}, {"list", B_LIST}, {"tuple", B_TUPLE},
         {"set", B_SET}, {"dict", B_DICT}, {"enumerate", B_ENUMERATE}, {"zip", B_ZIP}, {"map", B_MAP},
         {"filter", B_FILTER}, {"any", B_ANY}, {"all", B_ALL}, {"range", B_RANGE},
-        {"type", B_TYPE}, {"typeof", B_TYPE}, {"__format_value__", B_FMTVAL},
+        {"type", B_TYPE}, {"typeof", B_TYPE}, {"__format_value__", B_FMTVAL}, {"hash", B_HASH},
     };
     auto idit = ids.find(name);
     if (idit == ids.end()) return UNDEFINED_VALUE;
@@ -188,7 +188,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         if (E.isStringValue(v)) {
             const std::string& s = *(std::string*)v.value.p;
             nypy::BigInt out;
-            if (!nypy::parse_int_str(s, 10, out))
+            if (!nypy::parse_int_default(s, out))
                 E.pyRaise("ValueError", "invalid literal for int() with base 10: " + nypy::str_repr(s));
             return intValue(out);
         }
@@ -304,6 +304,21 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         if (!E.isStringValue(args[0])) E.pyRaise("TypeError", "ord() expected string of length 1, but " + E.typeNameOf(args[0]) + " found");
         return intValue(E.nyCall([&] { return nypy::str_ord(*(std::string*)args[0].value.p); }));
     }
+    case B_HASH: {
+        // Equal values hash equal (hash(1) == hash(1.0) == hash(true)), the
+        // numbers and tuples of them to Python's own values; a list or dict
+        // is unhashable. One implementation for both engines: nypy::hash_of_key.
+        need(1, "hash()");
+        const Value& v = args[0];
+        if (E.isInstanceVal(v)) {
+            auto cit = E.instance_to_class.find(v.value.p);
+            if (cit != E.instance_to_class.end() && E.classDefines(cit->second, "__hash__")) {
+                std::vector<Value> none;
+                return E.callMethod(v, "__hash__", none, ctx);
+            }
+        }
+        return intValue(nypy::hash_of_key(E.dictKey(v)));
+    }
     case B_MIN: case B_MAX: {
         // min(iterable, *, key, default) / min(a, b, *rest, key)
         const Value* keyv = kwarg("key");
@@ -395,7 +410,11 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
                 }
             }
         }
-        for (auto& [k, v] : kw) E.dictSet(dc, E.makeStringValue(k), v);
+        // Keyword arguments in the order they were written (kw itself is
+        // unordered), then any that came from a ** spread.
+        std::vector<std::string> order = E.cur_kw_order_;
+        for (auto& kv : kw) if (std::find(order.begin(), order.end(), kv.first) == order.end()) order.push_back(kv.first);
+        for (auto& k : order) { auto it = kw.find(k); if (it != kw.end()) E.dictSet(dc, E.makeStringValue(k), it->second); }
         return d;
     }
     case B_ENUMERATE: {

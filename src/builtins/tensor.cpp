@@ -384,7 +384,12 @@ Value dispatch_tensor(NythonExecutor& E,
                 } else {
                     type_name = getStringValue(args[1]);
                 }
-                if (type_name == "int" || type_name == "integer") return Value(args[0].type == ValueType::INTEGER);
+                // bool is a subclass of int, as in Python.
+                if (type_name == "int" || type_name == "integer") return Value(args[0].type == ValueType::INTEGER || args[0].type == ValueType::BOOLEAN);
+                if (type_name == "tuple") {
+                    auto* cont = args[0].isCollectable() ? dynamic_cast<Container*>(args[0].value.gc) : nullptr;
+                    return Value(cont && cont->container && cont->container->count("__tuple__") > 0);
+                }
                 if (type_name == "float" || type_name == "double") return Value(args[0].type == ValueType::DOUBLE);
                 if (type_name == "bool" || type_name == "boolean") return Value(args[0].type == ValueType::BOOLEAN);
                 if (type_name == "str" || type_name == "string") {
@@ -405,15 +410,13 @@ Value dispatch_tensor(NythonExecutor& E,
                     return Value(false);
                 }
                 if (type_name == "list" || type_name == "array") {
-                    if (args[0].isCollectable() && args[0].value.gc) {
-                        Type t = args[0].value.gc->getType();
-                        if (t == Type::LIST || t == Type::ARRAY) return Value(true);
-                    }
-                    // Check via __len__ key (our list representation)
+                    // Check via __len__ key (our list representation); a
+                    // tuple, set or generator is no list.
                     if (args[0].isCollectable() && args[0].value.gc) {
                         auto* cont = dynamic_cast<Container*>(args[0].value.gc);
                         if (cont && cont->container && cont->container->count("__len__"))
-                            return Value(true);
+                            return Value(!cont->container->count("__tuple__") && !cont->container->count("__set__")
+                                         && !cont->container->count("__gen__"));
                     }
                     return Value(false);
                 }

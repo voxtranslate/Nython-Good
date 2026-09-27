@@ -847,18 +847,13 @@ public:   // NythonExecutor is a struct: members default to public
 
     // ─── LITERALS ───────────────────────────────────────────────────────
     Value evalInteger(node_ptr node) {
-        Token tok_copy = node->token(); auto& v = tok_copy.value;
-        try {
-            if (v.size() > 2 && v[0] == '0') {
-                if (v[1]=='x'||v[1]=='X') return Value((int)std::stoi(v, nullptr, 16));
-                if (v[1]=='o'||v[1]=='O') return Value((int)std::stoi(v.substr(2), nullptr, 8));
-                if (v[1]=='b'||v[1]=='B') return Value((int)std::stoi(v.substr(2), nullptr, 2));
-            }
-            return Value((int)std::stoi(v));
-        } catch (...) {
-            try { return Value((long int)std::stoll(v)); }
-            catch (...) { return Value(0); }
-        }
+        const std::string& v = node->token().value;
+        // Up to 18 decimal digits fit an int64 whatever they are.
+        if (!v.empty() && v.size() <= 18 && std::all_of(v.begin(), v.end(), [](char c) { return c >= '0' && c <= '9'; }))
+            return intValue((int64_t)std::strtoll(v.c_str(), nullptr, 10));
+        // Prefixed (0x/0o/0b), long or with underscores: exact at any size
+        // (literals past 64 bits used to read as 0).
+        return intValue(nypy::parse_int_literal(v));
     }
 
     Value evalFloat(node_ptr node) {
@@ -1287,6 +1282,13 @@ public:   // NythonExecutor is a struct: members default to public
     }
 
     // ─── BINARY OPERATORS ───────────────────────────────────────────────
+    // Arithmetic between types that have no such operator: TypeError, as in
+    // Python and on the VM (binop). 1 + none used to give none here and 1
+    // there; an instance added to anything concatenated its handle's text.
+    [[noreturn]] void unsupportedOperands(int opc, const Value& lv, const Value& rv) {
+        pyRaise("TypeError", std::string("unsupported operand type(s) for ") + opSymbol(opc) + ": '"
+                + typeNameOf(lv) + "' and '" + typeNameOf(rv) + "'");
+    }
     Value binaryOp(int opc, Value lv, Value rv, Context* ctx) {
         // Operator overloading on instances.
         if (isInstanceVal(lv)) {
@@ -1328,14 +1330,13 @@ public:   // NythonExecutor is a struct: members default to public
                 return makeListValue(items, isTupleCont(lc) && isTupleCont(rc));
             }
             // Lenient: a string on either side concatenates the other's text.
-            if (ls || rs || lv.type == ValueType::USERDATA || rv.type == ValueType::USERDATA)
-                return makeStringValue(getStringValue(lv) + getStringValue(rv));
-            return lv + rv;
+            if (ls || rs) return makeStringValue(strOf(lv, ctx) + strOf(rv, ctx));
+            unsupportedOperands(opc, lv, rv);
         }
         case OP_SUB:
             if (nums) return numArith(opc, x, y);
             if (lv.isCollectable() && rv.isCollectable()) return setDiff(lv, rv);
-            return lv - rv;
+            unsupportedOperands(opc, lv, rv);
         case OP_MUL: {
             if (nums) return numArith(opc, x, y);
             // sequence * int, int * sequence (bool counts as an int)
@@ -1357,16 +1358,15 @@ public:   // NythonExecutor is a struct: members default to public
                     }
                 }
             }
-            return lv * rv;
+            unsupportedOperands(opc, lv, rv);
         }
         case OP_DIV: case OP_FLOORDIV: case OP_POW:
             if (nums) return numArith(opc, x, y);
-            if (opc == OP_DIV) return lv / rv;
-            return NONE_VALUE;
+            unsupportedOperands(opc, lv, rv);
         case OP_MOD:
             if (isStringValue(lv)) return percentFormat(*(std::string*)lv.value.p, rv, ctx);
             if (nums) return numArith(opc, x, y);
-            return lv % rv;
+            unsupportedOperands(opc, lv, rv);
         case OP_BAND: case OP_BOR: case OP_BXOR: {
             if (nums) {
                 Value r = numArith(opc, x, y);
@@ -1646,6 +1646,121 @@ public:   // NythonExecutor is a struct: members default to public
         return out;
     }
 
+    // list/tuple methods with Python semantics. Returns false when `name`
+    // is not one of them.
+    bool listMethod(Container* c, const Value& obj, const std::string& name, std::vector<Value>& args,
+                    const std::unordered_map<std::string, Value>& kw, Context* ctx, Value& out) {
+        static const std::unordered_set<std::string> mine = {
+            "sort", "index", "indexOf", "count", "pop", "insert", "copy", "reverse", "clear", "extend", "append", "push"};
+        if (!mine.count(name)) return false;
+        const bool tup = isTupleCont(c);
+        static const std::unordered_set<std::string> mutating = {"sort", "pop", "insert", "reverse", "clear", "extend", "append", "push"};
+        if (tup && mutating.count(name)) pyRaise("AttributeError", "'tuple' object has no attribute '" + name + "'");
+        auto& C = *c->container;
+        int64_t n = seqLen(c);
+        auto store = [&](const std::vector<Value>& items) {
+            for (int64_t k = (int64_t)items.size(); k < n; k++) C.erase(std::to_string(k));
+            for (size_t k = 0; k < items.size(); k++) C[std::to_string(k)] = items[k];
+            C["__len__"] = intValue((int64_t)items.size());
+        };
+        if (name == "append" || name == "push") {
+            if (args.size() != 1) pyRaise("TypeError", "list.append() takes exactly one argument (" + std::to_string(args.size()) + " given)");
+            C[std::to_string(n)] = args[0];
+            C["__len__"] = intValue(n + 1);
+            out = NONE_VALUE; return true;
+        }
+        if (name == "extend") {
+            if (args.size() != 1) pyRaise("TypeError", "list.extend() takes exactly one argument (" + std::to_string(args.size()) + " given)");
+            for (auto& v : iterItems(args[0], ctx)) C[std::to_string(n++)] = v;
+            C["__len__"] = intValue(n);
+            out = NONE_VALUE; return true;
+        }
+        if (name == "sort") {
+            // key= / reverse= by keyword, or the old positional forms
+            // L.sort(keyfn) / L.sort(true).
+            Value keyfn = NONE_VALUE; bool rev = false;
+            auto kit = kw.find("key"); if (kit != kw.end()) keyfn = kit->second;
+            auto rit = kw.find("reverse"); if (rit != kw.end()) rev = isTruthy(rit->second);
+            for (auto& a : args) {
+                if (a.type == ValueType::BOOLEAN) rev = a.value.b;
+                else if (a.type == ValueType::USERDATA && a.value.p && func_names.count(a.value.p) && keyfn.type == ValueType::NONE) keyfn = a;
+            }
+            std::vector<Value> items = seqItems(c), keys;
+            if (keyfn.type != ValueType::NONE)
+                for (auto& v : items) { std::vector<Value> ka = {v}; keys.push_back(callFunctionValue(keyfn, ka, ctx)); }
+            std::vector<size_t> order(items.size());
+            for (size_t k = 0; k < order.size(); k++) order[k] = k;
+            auto less = [&](const Value& x, const Value& y) {
+                int cmp;
+                if (orderValues(x, y, cmp, ctx)) return cmp < 0;
+                std::string tx = typeNameOf(x), ty = typeNameOf(y);
+                if (tx != ty) return tx < ty;
+                return strOf(x, ctx) < strOf(y, ctx);
+            };
+            std::stable_sort(order.begin(), order.end(), [&](size_t x, size_t y) {
+                const Value& kx = keys.empty() ? items[x] : keys[x];
+                const Value& ky = keys.empty() ? items[y] : keys[y];
+                return rev ? less(ky, kx) : less(kx, ky);
+            });
+            std::vector<Value> sorted_items;
+            for (size_t k : order) sorted_items.push_back(items[k]);
+            store(sorted_items);
+            out = obj; return true;   // the list itself, for chaining
+        }
+        if (name == "index" || name == "indexOf") {
+            if (args.empty()) pyRaise("TypeError", "index expected at least 1 argument, got 0");
+            int64_t st = 0, en = n;
+            if (args.size() >= 2) { sliceArg(args, 1, st); if (st < 0) st = std::max<int64_t>(0, st + n); }
+            if (args.size() >= 3) { sliceArg(args, 2, en); if (en < 0) en += n; en = std::min(en, n); }
+            for (int64_t k = st; k < en; k++) {
+                auto it = C.find(std::to_string(k));
+                if (it != C.end() && valuesEqual(it->second, args[0], 0)) { out = intValue(k); return true; }
+            }
+            if (name == "indexOf") { out = intValue(-1); return true; }
+            pyRaise("ValueError", reprOf(args[0], ctx) + " is not in list");
+        }
+        if (name == "count") {
+            if (args.size() != 1) pyRaise("TypeError", "count() takes exactly one argument (" + std::to_string(args.size()) + " given)");
+            int64_t cnt = 0;
+            for (auto& v : seqItems(c)) if (valuesEqual(v, args[0], 0)) cnt++;
+            out = intValue(cnt); return true;
+        }
+        if (name == "pop") {
+            // A non-integer argument is a dict-style pop on a map; not here.
+            if (!args.empty() && args[0].type != ValueType::INTEGER && args[0].type != ValueType::BOOLEAN) return false;
+            if (n == 0) pyRaise("IndexError", "pop from empty list");
+            int64_t i = n - 1;
+            if (!args.empty()) { Num k; asNum(args[0], k); i = k.k == 1 ? k.i : INT64_MAX; if (i < 0) i += n; }
+            if (i < 0 || i >= n) pyRaise("IndexError", "pop index out of range");
+            std::vector<Value> items = seqItems(c);
+            out = items[(size_t)i];
+            items.erase(items.begin() + i);
+            store(items);
+            return true;
+        }
+        if (name == "insert") {
+            if (args.size() != 2) pyRaise("TypeError", "insert expected 2 arguments, got " + std::to_string(args.size()));
+            Num k;
+            if (!asNum(args[0], k) || k.k == 3) pyRaise("TypeError", "'" + typeNameOf(args[0]) + "' object cannot be interpreted as an integer");
+            int64_t i = k.k == 1 ? k.i : (numIsNeg(k) ? INT64_MIN / 2 : INT64_MAX / 2);
+            if (i < 0) i = std::max<int64_t>(0, i + n);
+            if (i > n) i = n;
+            std::vector<Value> items = seqItems(c);
+            items.insert(items.begin() + i, args[1]);
+            store(items);
+            out = NONE_VALUE; return true;
+        }
+        if (name == "copy") { out = makeListValue(seqItems(c), tup); return true; }
+        if (name == "reverse") {
+            std::vector<Value> items = seqItems(c);
+            std::reverse(items.begin(), items.end());
+            store(items);
+            out = obj; return true;   // the list itself, like sort (Nython chains these)
+        }
+        if (name == "clear") { store({}); out = NONE_VALUE; return true; }
+        return false;
+    }
+
     // dict methods. Returns false when `name` is not one.
     bool dictMethod(Container* cont, const Value& obj, const std::string& name, std::vector<Value>& args,
                     const std::unordered_map<std::string, Value>& kw, Context* ctx, Value& out) {
@@ -1762,6 +1877,7 @@ public:   // NythonExecutor is a struct: members default to public
     // Keyword arguments of the builtin call being dispatched (evalCall sets
     // it for the builtins that read them; dispatch_pycore takes it).
     const std::unordered_map<std::string, Value>* cur_kwargs_ = nullptr;
+    std::vector<std::string> cur_kw_order_;   // their names in call order (dict(a=1, b=2))
     struct KwScope {
         NythonExecutor* e; const std::unordered_map<std::string, Value>* prev;
         KwScope(NythonExecutor* x, const std::unordered_map<std::string, Value>* k) : e(x), prev(x->cur_kwargs_) { e->cur_kwargs_ = k; }
@@ -2783,10 +2899,47 @@ public:   // NythonExecutor is a struct: members default to public
     // argument passed to a method was silently dropped:
     //     c.m(b=20, a=10)  ->  a=none b=none
     // Plain functions were unaffected, which is why this went unnoticed.
+    // Members every plain value answers: an operator used as a method name
+    // (1.+(2, 3) is 1 + 2 + 3; a comparison chains, 1.<(2, 3) is 1 < 2 < 3)
+    // and the object protocol's class_name / type_name / to_string. The VM's
+    // primitive_member is the same.
+    bool primitiveMember(const Value& obj, const std::string& m, std::vector<Value>& args, Context* ctx, Value& out) {
+        if (m.empty()) return false;
+        bool plain = obj.type == ValueType::INTEGER || obj.type == ValueType::DOUBLE
+                  || obj.type == ValueType::BOOLEAN || obj.type == ValueType::NONE || isStringValue(obj);
+        if (!plain) { Container* c = contOf(obj); plain = c && seqLen(c) >= 0; }
+        if (!plain) return false;
+        if (!std::isalnum((unsigned char)m[0]) && m[0] != '_') {
+            int opc = binOpCode(m);
+            if (opc < OP_ADD || opc > OP_GE) return false;
+            if (args.empty()) pyRaise("TypeError", typeNameOf(obj) + "." + m + "() takes at least 1 argument (0 given)");
+            if (opc < OP_EQ) {
+                Value acc = obj;
+                for (auto& a : args) acc = binaryOp(opc, acc, a, ctx);
+                out = acc;
+                return true;
+            }
+            Value l = obj;
+            for (auto& r : args) {
+                if (!isTruthy(binaryOp(opc, l, r, ctx))) { out = Value(false); return true; }
+                l = r;
+            }
+            out = Value(true);
+            return true;
+        }
+        if (m == "class_name" || m == "type_name") { out = makeStringValue(typeNameOf(obj)); return true; }
+        if (m == "to_string") { out = makeStringValue(strOf(obj, ctx)); return true; }
+        return false;
+    }
+
     Value callMethod(Value obj, const std::string& method_name, std::vector<Value>& args, Context* ctx,
                      const std::unordered_map<std::string, Value>* kw_in = nullptr) {
         static const std::unordered_map<std::string, Value> kEmptyKw;
         const std::unordered_map<std::string, Value>& kw_args_in = kw_in ? *kw_in : kEmptyKw;
+        {
+            Value pm;
+            if (primitiveMember(obj, method_name, args, ctx, pm)) return pm;
+        }
         // Built-in string methods
         if (obj.type == ValueType::USERDATA && obj.value.p) {
             std::string s = getStringValue(obj);
@@ -2813,6 +2966,12 @@ public:   // NythonExecutor is a struct: members default to public
         if (Container* dc = contOf(obj); dc && seqLen(dc) < 0) {
             Value r;
             if (dictMethod(dc, obj, method_name, args, kw_args_in, ctx, r)) return r;
+        }
+        // Python list (and tuple) methods; the older block below keeps the
+        // Nython extras (map/filter/forEach/reduce/join/...).
+        if (Container* lc = contOf(obj); lc && seqLen(lc) >= 0 && !isSetCont(lc) && !isGenCont(lc)) {
+            Value r;
+            if (listMethod(lc, obj, method_name, args, kw_args_in, ctx, r)) return r;
         }
         // list.remove(x): the first element equal to x (ValueError if none)
         if (Container* lc = contOf(obj); lc && method_name == "remove" && seqLen(lc) >= 0 && !isSetCont(lc) && !isTupleCont(lc)) {
@@ -3285,6 +3444,18 @@ public:   // NythonExecutor is a struct: members default to public
                 Context* ccx = class_ctx_it->second;
                 Value method_val;
                 try { method_val = ccx->getByName(method_name); } catch (...) {}
+                // The lookup reaches global builtins too; one the class does
+                // not hold itself is no member (c.hash() is the object
+                // protocol's), and its pointer is no AST node to inspect.
+                if (method_val.type == ValueType::USERDATA && method_val.value.p) {
+                    auto bit = func_names.find(method_val.value.p);
+                    if (bit != func_names.end() && bit->second.rfind("__builtin__:", 0) == 0) {
+                        bool own = false;
+                        ccx->access_container_shared([&](ContainerType* c) { own = c && c->count(method_name); });
+                        if (own) return callBuiltin(bit->second.substr(12), args, ctx);
+                        method_val = Value();
+                    }
+                }
                 if (method_val.type == ValueType::USERDATA && method_val.value.p) {
                     void* ast_ptr = method_val.value.p;
                     auto ast_it2 = func_ast_nodes.find(method_val.value.p);
@@ -4250,6 +4421,15 @@ public:
                                 bool is_fn  = fn_type.find("__func__:") == 0;
                                 bool is_lam = fn_type.find("__lambda__") == 0;
                                 bool is_bi  = fn_type.find("__builtin__:") == 0;
+                                // A builtin counts only when the instance really holds it:
+                                // the lookup also finds global builtins, so c.hash()
+                                // called hash() with no argument instead of the
+                                // object protocol's hash.
+                                if (is_bi) {
+                                    bool own = false;
+                                    pit->second->access_container_shared([&](ContainerType* c) { own = c && c->count(method_name); });
+                                    if (!own) is_bi = false;
+                                }
                                 if (is_fn || is_lam || is_bi) {
                                     if (is_bi) return callBuiltin(fn_type.substr(12), args, ctx);
                                     // A bound method can be STORED in an attribute
@@ -4345,7 +4525,18 @@ public:
                 if (callee_val.type == ValueType::USERDATA && callee_val.value.p) {
                     auto fn_it = func_names.find(callee_val.value.p);
                     if (fn_it != func_names.end()) {
-                        if (fn_it->second.find("__builtin__:") == 0)
+                        // On an instance the attribute read also finds global
+                        // builtins; only one the instance holds is its member
+                        // (c.hash() is the object protocol, not hash()).
+                        bool stray = false;
+                        if (fn_it->second.find("__builtin__:") == 0 && isInstanceVal(obj)) {
+                            bool own = false;
+                            auto pit2 = instance_properties.find(obj.value.p);
+                            if (pit2 != instance_properties.end() && pit2->second)
+                                pit2->second->access_container_shared([&](ContainerType* c) { own = c && c->count(method_name); });
+                            stray = !own;
+                        }
+                        if (!stray && fn_it->second.find("__builtin__:") == 0)
                             return callBuiltin(fn_it->second.substr(12), args, ctx);
                         // Class value accessed via attribute (e.g. Outer.Inner()) -> instantiate
                         if (fn_it->second.find("__class__:") == 0) {
@@ -4455,6 +4646,9 @@ public:
                 "format", "range", "zip", "map", "filter", "list", "tuple", "set", "str", "repr"
             };
             if (kw_native.count(builtin)) {
+                cur_kw_order_.clear();
+                for (auto& an : cn->args)
+                    if (an->type() == NodeType::KEYWORD_ARG) cur_kw_order_.push_back(static_pointer_cast<KeywordArgNode>(an)->name);
                 KwScope ks(this, kw_args.empty() ? nullptr : &kw_args);
                 return callBuiltin(builtin, args, ctx);
             }
@@ -6388,6 +6582,31 @@ public:
                     for (int64_t j = i; j + 1 < n; j++) (*cont->container)[std::to_string(j)] = items[(size_t)j + 1];
                     cont->container->erase(std::to_string(n - 1));
                     (*cont->container)["__len__"] = intValue(n - 1);
+                }
+            }
+        } else if (dn->target->type() == NodeType::CALL) {
+            // del L[a:b:c]: the parser spells the slice L.slice(a, b, c)
+            auto cn = static_pointer_cast<CallNode>(dn->target);
+            if (cn->callee && cn->callee->type() == NodeType::ATTRIBUTE
+                && static_pointer_cast<AttributeNode>(cn->callee)->attr == "slice") {
+                Value obj = evalNode(static_pointer_cast<AttributeNode>(cn->callee)->object, ctx);
+                std::vector<Value> sargs;
+                for (auto& a : cn->args) sargs.push_back(evalNode(a, ctx));
+                Container* cont = contOf(obj);
+                if (!cont || seqLen(cont) < 0) pyRaise("TypeError", "'" + typeNameOf(obj) + "' object does not support item deletion");
+                if (isTupleCont(cont)) pyRaise("TypeError", "'tuple' object doesn't support item deletion");
+                std::vector<Value> items = seqItems(cont);
+                int64_t len = (int64_t)items.size(), st = 0, en = 0, step = 1;
+                bool hs = sliceArg(sargs, 0, st), he = sliceArg(sargs, 1, en);
+                if (sargs.size() >= 3 && sargs[2].type != ValueType::NONE) sliceArg(sargs, 2, step);
+                int64_t cnt = nyCall([&] { return nypy::slice_adjust(len, hs, st, he, en, step); });
+                if (cnt > 0) {
+                    std::vector<bool> gone((size_t)len, false);
+                    for (int64_t k = 0, i = st; k < cnt; k++, i += step) gone[(size_t)i] = true;
+                    for (int64_t k = 0; k < len; k++) cont->container->erase(std::to_string(k));
+                    int64_t w = 0;
+                    for (int64_t k = 0; k < len; k++) if (!gone[(size_t)k]) (*cont->container)[std::to_string(w++)] = items[(size_t)k];
+                    (*cont->container)["__len__"] = intValue(w);
                 }
             }
         } else if (dn->target->type() == NodeType::ATTRIBUTE) {

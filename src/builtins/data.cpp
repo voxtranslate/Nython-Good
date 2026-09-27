@@ -137,8 +137,7 @@ Value dispatch_data(NythonExecutor& E,
                 if (v.isNone() || v.type == ValueType::UNDEFINED) { out += "null"; return; }
                 if (v.type == ValueType::BOOLEAN) { out += v.value.b ? "true" : "false"; return; }
                 if (v.type == ValueType::INTEGER) {
-                    std::string digits = v.value.i.toString(10);
-                    out += digits.empty() ? "0" : digits;
+                    out += intToString(v.value.i);
                     return;
                 }
                 if (v.type == ValueType::DOUBLE) { out += nyjson::number((double)v.value.d); return; }
@@ -197,7 +196,9 @@ Value dispatch_data(NythonExecutor& E,
                 switch (n.kind) {
                     case nyjson::Node::Null: return NONE_VALUE;
                     case nyjson::Node::Bool: return Value(n.b);
-                    case nyjson::Node::Int: return Value(bigint((long long)n.i));
+                    case nyjson::Node::Int:
+                        if (!n.s.empty()) { nypy::BigInt big; if (nypy::BigInt::parse(n.s, 10, big)) return intValue(big); }
+                        return Value(bigint((long long)n.i));
                     case nyjson::Node::Float: return Value(n.d);
                     case nyjson::Node::Str: return makeStringValue(n.s);
                     case nyjson::Node::Arr: {
