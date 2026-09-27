@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# run outputs of the pipeline (Config defaults)
+results/
+runnings/
+vizs/
