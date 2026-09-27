@@ -35,6 +35,12 @@ using nython::kernel::bigint;
 #include <cmath>
 #include <algorithm>
 #include "NyConc.hpp"
+// Built against a real SDL3, the SDL calls below go through the test
+// harness (scripted input + frame capture for tools/ide_driver.py); with
+// no harness variable set each wrapper is a direct SDL call.
+#ifndef NYTHON_SDL_STUB
+#include "builtins/gui_harness.hpp"
+#endif
 
 // ── Handle registries ───────────────────────────────────────────────────────
 static int next_win_id  = 1;
@@ -51,7 +57,28 @@ struct WinEntry {
     // container moves all its descendants without touching their positions.
     float ox = 0.0f, oy = 0.0f;
     std::vector<std::pair<float,float>> off_stack{};
+    // Layout-unit window (flag 16): sizes the application passes are the
+    // sizes it would have at scale 1; min_uw/min_uh are kept in those units
+    // so the minimum follows the window to a display of another scale.
+    bool units = false;
+    int min_uw = 0, min_uh = 0;
 };
+
+// Window points per layout unit. SDL3 has two HiDPI models (SDL's
+// docs/README-highdpi.md): on Windows and X11 window coordinates are device
+// pixels and the content scale says how much bigger to draw (200%: 2 points
+// per unit); on macOS and Wayland they are points and a high-density window
+// just has more pixels per point (1 point per unit). The window display
+// scale (pixels per unit) over the pixel density (pixels per point) is the
+// answer on both - measured on the window, so no platform table is needed.
+static float units_k(SDL_Window* w) {
+    float ds = SDL_GetWindowDisplayScale(w), pd = SDL_GetWindowPixelDensity(w);
+    if (!(ds > 0.0f)) ds = 1.0f;
+    if (!(pd > 0.0f)) pd = 1.0f;
+    float k = ds / pd;
+    return k < 0.25f ? 0.25f : (k > 8.0f ? 8.0f : k);
+}
+static int units_px(int v, float k) { return (int)((float)v * k + 0.5f); }
 
 static std::unordered_map<int, WinEntry>      g_windows;
 static std::unordered_map<int, TTF_Font*>     g_fonts;
@@ -339,6 +366,21 @@ static bool convert_event(SDL_Event& ev, EvData& d) {
         case SDL_EVENT_WINDOW_SHOWN:
         case SDL_EVENT_WINDOW_RESTORED:
             d.type="expose"; return true;
+        // The window's display scale changed (it moved to a monitor of another
+        // scale, or the system setting changed): dx is the new pixels per
+        // layout unit. A layout-unit window's minimum size follows.
+        case SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED: {
+            auto it = g_windows.find(d.window);
+            if(it==g_windows.end()) return false;
+            SDL_Window* w = it->second.win;
+            d.type="scale"; d.dx = SDL_GetWindowDisplayScale(w);
+            if(!(d.dx > 0.0f)) d.dx = 1.0f;
+            if(it->second.units && (it->second.min_uw>0 || it->second.min_uh>0)){
+                float k = units_k(w);
+                SDL_SetWindowMinimumSize(w, units_px(it->second.min_uw,k), units_px(it->second.min_uh,k));
+            }
+            return true;
+        }
         case SDL_EVENT_WINDOW_FOCUS_GAINED: d.type="focusgained"; return true;
         case SDL_EVENT_WINDOW_FOCUS_LOST:   d.type="focuslost";   return true;
         // Without this a hover highlight stayed lit after the pointer left the
@@ -768,7 +810,12 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
 
     // ── WINDOW ──────────────────────────────────────────────────────────
     // gui_create_window(title, x, y, w, h, flags) -> handle
-    // flags: 1 resizable, 2 borderless, 4 always on top, 8 high pixel density
+    // flags: 1 resizable, 2 borderless, 4 always on top, 8 high pixel density,
+    //        16 layout units: w/h (and later min/set sizes) are the size at
+    //        scale 1, and the window is made that many layout units big on
+    //        whatever display it opens on - the same workbench on a 200%
+    //        Windows/X11 panel (twice the points) as on a Retina Mac (the same
+    //        points, twice the pixels). Events still report pixels.
     if(name=="gui_create_window"){
         if(args.size()<6){
             // Previously returned NONE silently, leaving g_sdl_error empty — which
@@ -848,6 +895,22 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
         int id=next_win_id++;
         WinEntry we;
         we.win=win; we.ren=ren; we.sdl_id=SDL_GetWindowID(win);
+        we.units=(fl&16)!=0;
+        if(we.units){
+            float k=units_k(win);
+            if(k<0.99f || k>1.01f){
+                int nw=units_px(w,k), nh=units_px(h,k);
+                SDL_Rect ub;
+                SDL_DisplayID dsp=SDL_GetDisplayForWindow(win);
+                if(dsp && SDL_GetDisplayUsableBounds(dsp,&ub) && ub.w>0 && ub.h>0){
+                    if(nw>ub.w) nw=ub.w;
+                    if(nh>ub.h) nh=ub.h;
+                }
+                SDL_SetWindowSize(win,nw,nh);
+                if(x<0||y<0) SDL_SetWindowPosition(win,SDL_WINDOWPOS_CENTERED,SDL_WINDOWPOS_CENTERED);
+                SDL_SyncWindow(win);
+            }
+        }
         g_windows[id]=we;
         // The drawing surface can differ from the size asked for (a HiDPI
         // window in pixels, or a window manager that clamped it); tell the
@@ -1002,14 +1065,35 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
         if(WinEntry* we=win_of(args)) output_size(*we,ww,hh);
         return make_int_list(E,{ww,hh});
     }
+    // A layout-unit window (flag 16) takes both sizes in layout units.
     if(name=="gui_set_window_size"){
-        if(args.size()>=3){ if(WinEntry* we=win_of(args)) SDL_SetWindowSize(we->win,VI(args[1]),VI(args[2])); }
+        if(args.size()>=3){ if(WinEntry* we=win_of(args)){
+            float k = we->units ? units_k(we->win) : 1.0f;
+            SDL_SetWindowSize(we->win,units_px(VI(args[1]),k),units_px(VI(args[2]),k));
+        } }
         return NONE_VALUE;
     }
     // gui_set_min_size(handle, w, h): the window cannot be resized smaller.
     if(name=="gui_set_min_size"){
-        if(args.size()>=3){ if(WinEntry* we=win_of(args)) return Value(SDL_SetWindowMinimumSize(we->win,VI(args[1]),VI(args[2]))); }
+        if(args.size()>=3){ if(WinEntry* we=win_of(args)){
+            float k = we->units ? units_k(we->win) : 1.0f;
+            we->min_uw=VI(args[1]); we->min_uh=VI(args[2]);
+            return Value(SDL_SetWindowMinimumSize(we->win,units_px(we->min_uw,k),units_px(we->min_uh,k)));
+        } }
         return Value(false);
+    }
+    // gui_display_density() -> pixels per point a high-density window gets on
+    // the primary display (2.0 on a Retina Mac or a 200% Wayland output, 1.0
+    // on Windows and X11, whose points are pixels). Times gui_display_scale()
+    // it predicts a window's display scale - the factor to draw at - before
+    // the window exists; the window's own "scale" event corrects it.
+    if(name=="gui_display_density"){
+        float pd = 1.0f;
+        if(ensure_sdl_for_window()){
+            const SDL_DisplayMode* m = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay());
+            if(m && m->pixel_density > 0.0f) pd = m->pixel_density;
+        }
+        return Value((double)pd);
     }
     // gui_set_fullscreen(handle, on) -> bool ; gui_is_fullscreen(handle) -> bool
     if(name=="gui_set_fullscreen"){
@@ -1585,7 +1669,7 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
     if(name=="gui_next_event"){
         static const char* kEventTypes[] = {"", "quit", "resize", "expose", "focusgained",
             "focuslost", "mouseleave", "mousemove", "mousedown", "mouseup", "wheel",
-            "keydown", "keyup", "textinput", "textedit", "dropfile", "droptext", "dialog"};
+            "keydown", "keyup", "textinput", "textedit", "dropfile", "droptext", "dialog", "scale"};
         int handle = args.empty() ? -1 : VI(args[0]);
         int timeout = args.size()>=2 ? VI(args[1]) : 0;
         g_cur_handle = handle;

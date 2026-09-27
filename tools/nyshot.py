@@ -54,15 +54,20 @@ class Text:
 class Frame:
     """One presented frame: the ordered display list plus a text index."""
 
-    def __init__(self, ops, w, h, n):
+    def __init__(self, ops, w, h, n, density=1.0, scale=1.0, backend="stub"):
         self.ops = ops
         self.w, self.h, self.n = w, h, n
+        # density: drawing-surface pixels per window point (what a pointer
+        # position is divided by); scale: the display scale the UI multiplies
+        # its metrics by. Both 1 on an ordinary display.
+        self.density, self.scale, self.backend = density, scale, backend
         self.texts = [Text(o) for o in ops if o["op"] == "text"]
 
     @classmethod
     def load(cls, path):
         ops = []
         w = h = n = 0
+        hdr = {}
         with open(path, "rb") as f:
             for raw in f:
                 line = raw.decode("utf-8", "replace").strip()
@@ -71,9 +76,11 @@ class Frame:
                 o = json.loads(line)
                 if o["op"] == "frame":
                     w, h, n = o["w"], o["h"], o["n"]
+                    hdr = o
                 else:
                     ops.append(o)
-        return cls(ops, w, h, n)
+        return cls(ops, w, h, n, float(hdr.get("density", 1.0) or 1.0),
+                   float(hdr.get("scale", 1.0) or 1.0), hdr.get("backend", "stub"))
 
     # ── querying ──────────────────────────────────────────────────────────
     def find(self, text, exact=True, region=None, font=None):

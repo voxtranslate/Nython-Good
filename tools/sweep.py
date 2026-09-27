@@ -24,6 +24,10 @@ FAIL_RE = re.compile(r"(?<![\w-])([1-9]\d*) failed|FAILED|^FAIL |\bFAIL \[", re.
 
 def files():
     out = sorted(glob.glob(os.path.join(REPO, "examples", "test_*.ny")))
+    # The older *_test.ny suites (stdlib_test, stdlib_v2_test, the v3..v14
+    # feature suites, ...) sat outside the sweep and rotted unseen; they are
+    # swept like every other suite.
+    out += sorted(glob.glob(os.path.join(REPO, "examples", "*_test.ny")))
     out += sorted(glob.glob(os.path.join(REPO, "examples", "vm_audit*.ny")))
     out += sorted(glob.glob(os.path.join(REPO, "examples", "gui_tests", "test_*.ny")))
     return out

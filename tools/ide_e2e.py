@@ -46,6 +46,25 @@ class Result:
         return cond
 
 
+# Coordinates written in this file are the IDE's scale-1 metrics (activity
+# bar 48 wide, title bar 30 high, ...). On a scaled display - a real HiDPI
+# one, X11 with a scaling factor, or the stub's NY_STUB_DPI_SCALE - the IDE
+# multiplies every metric by its display scale, and R()/D() do the same, so
+# the suite runs unchanged at any scale. The scale is read from the frame
+# the IDE last presented.
+_UI = {"scale": 1.0}
+
+
+def D(v):
+    """A scale-1 distance in the current IDE's pixels (the IDE's own dp())."""
+    return int(float(v) * _UI["scale"] + 0.5)
+
+
+def R(x, y, w, h):
+    """A scale-1 region (x, y, w, h) in the current IDE's pixels."""
+    return (D(x), D(y), D(w), D(h))
+
+
 class Scenario:
     def __init__(self, res, shots):
         self.res = res
@@ -78,6 +97,7 @@ class Scenario:
         self.ide = IDE(cwd=self.ws, env={"HOME": self.home, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
                                          "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
         self.ide.start()
+        _UI["scale"] = self.ide.ui_scale
         return self.ide
 
     def finish(self, name):
@@ -103,15 +123,15 @@ class Scenario:
         # A file created after start-up appears once the workspace watcher's
         # next poll (about a second) sees the folder change.
         t0 = time.time()
-        while not ide.snap().has(label, exact=True, region=(48, 30, 280, 600)) and time.time() - t0 < 8:
+        while not ide.snap().has(label, exact=True, region=R(48, 30, 280, 600)) and time.time() - t0 < 8:
             time.sleep(0.2)
-        t = ide.find(label, region=(48, 30, 280, 600))
+        t = ide.find(label, region=R(48, 30, 280, 600))
         ide.dblclick(int(t.cx), int(t.cy))
         return ide.state()
 
     def status_region(self):
         f = self.ide.last
-        return (0, f.h - 24, f.w, 24)
+        return (0, f.h - D(24), f.w, D(24))
 
     def wait_until(self, pred, timeout=20, step=4):
         t0 = time.time()
@@ -134,7 +154,7 @@ def sc_boot(s):
     c(f.has("app.ny", exact=True), "boot: explorer lists app.ny")
     c(f.has("src", exact=True), "boot: explorer lists src/")
     for m in ["File", "Edit", "Selection", "View", "Go", "Run", "Terminal", "Help"]:
-        c(f.has(m, exact=True, region=(0, 0, 600, 30)), "boot: menu " + m)
+        c(f.has(m, exact=True, region=R(0, 0, 600, 30)), "boot: menu " + m)
     for label in ["PROBLEMS", "OUTPUT", "DEBUG CONSOLE", "TERMINAL"]:
         c(f.has(label, exact=True), "boot: panel tab " + label)
     st = ide.state()
@@ -263,7 +283,7 @@ def sc_palette(s):
     st = ide.state()
     c(st["dark"] is False, "palette: theme toggles to light")
     f = ide.snap()
-    bg = f.fills_at(900, 400)
+    bg = f.fills_at(D(900), D(400))
     c(len(bg) > 0 and bg[-1][0] > 200, "palette: editor background is light after toggle", bg[-1:] if bg else bg)
     # Recently used commands float to the top
     ide.key("ctrl+shift+p")
@@ -325,19 +345,19 @@ def sc_quick_open(s):
 def sc_menus(s):
     ide = s.start()
     c = s.res.check
-    ide.click_text("File", region=(0, 0, 600, 30))
+    ide.click_text("File", region=R(0, 0, 600, 30))
     f = ide.snap()
     c(f.has("New Text File", exact=True) and f.has("Save All", exact=True), "menus: File menu opens with its items")
     c(f.has("Ctrl+N", exact=True), "menus: items show their keybinding")
     # Moving across the bar while a menu is open switches menus (VS Code)
-    t = ide.find("Edit", region=(0, 0, 600, 30), fresh=False)
+    t = ide.find("Edit", region=R(0, 0, 600, 30), fresh=False)
     ide.move(int(t.cx), int(t.cy))
     f = ide.snap()
     c(f.has("Undo", exact=True) and not f.has("New Text File", exact=True), "menus: hovering Edit switches menus")
     ide.key("escape")
     st = ide.state()
     c(st["menu"] < 0, "menus: Escape closes", st["menu"])
-    ide.click_text("File", region=(0, 0, 600, 30))
+    ide.click_text("File", region=R(0, 0, 600, 30))
     ide.click_text("New Text File")
     st = ide.state()
     c(st["kind"] == "untitled" and st["menu"] < 0, "menus: File > New Text File creates Untitled-1", st["title"])
@@ -346,7 +366,7 @@ def sc_menus(s):
     st = ide.state()
     c(st["menu"] >= 0, "menus: Alt+V opens View", st["menu"])
     ide.key("escape")
-    ide.click_text("Help", region=(0, 0, 600, 30))
+    ide.click_text("Help", region=R(0, 0, 600, 30))
     ide.click_text("About")
     st = ide.state()
     c(st["modal"] and "Nython" in st["modal_title"] + st["modal_msg"], "menus: Help > About shows the About dialog",
@@ -354,8 +374,8 @@ def sc_menus(s):
     ide.key("escape")
     st = ide.state()
     c(not st["modal"], "menus: Escape dismisses the dialog")
-    ide.click_text("View", region=(0, 0, 600, 30))
-    ide.click_text("Terminal", region=(0, 30, 800, 600))
+    ide.click_text("View", region=R(0, 0, 600, 30))
+    ide.click_text("Terminal", region=R(0, 30, 800, 600))
     st = ide.state()
     c(st["panel"] == "terminal" and st["panel_open"], "menus: View > Terminal shows the terminal", st["panel"])
 
@@ -453,7 +473,7 @@ def sc_statusbar(s):
     ide.key("escape")
     # error/warning counters open Problems
     ide.key("ctrl+`")
-    ide.click_text("0", region=(0, s.status_region()[1], 80, 24))
+    ide.click_text("0", region=(0, s.status_region()[1], D(80), D(24)))
     st = ide.state()
     c(st["panel"] == "problems", "status: problems counter opens Problems", st["panel"])
     # the bell opens the notification centre
@@ -484,10 +504,10 @@ def sc_explorer_ops(s):
     c(os.path.isfile(os.path.join(s.ws, "pkg/new_mod.ny")), "explorer: file (and folder) created on disk")
     c(st["title"] == "new_mod.ny", "explorer: new file opened", st["title"])
     f = ide.snap()
-    c(f.has("pkg", exact=True) and f.has("new_mod.ny", exact=True, region=(48, 30, 280, 700)),
+    c(f.has("pkg", exact=True) and f.has("new_mod.ny", exact=True, region=R(48, 30, 280, 700)),
       "explorer: tree shows the new file")
     # rename with F2 from the tree
-    t = ide.find("new_mod.ny", region=(48, 30, 280, 700))
+    t = ide.find("new_mod.ny", region=R(48, 30, 280, 700))
     ide.click(int(t.cx), int(t.cy))
     ide.key("f2")
     st = ide.state()
@@ -501,7 +521,7 @@ def sc_explorer_ops(s):
     st = ide.state()
     c("renamed.ny" in st["tabs"], "explorer: open editor follows the rename", st["tabs"])
     # delete through the context menu
-    t = ide.find("renamed.ny", region=(48, 30, 280, 700))
+    t = ide.find("renamed.ny", region=R(48, 30, 280, 700))
     ide.right_click(int(t.cx), int(t.cy))
     f = ide.snap()
     c(f.has("Delete", exact=True) and f.has("Rename...", exact=True), "explorer: context menu")
@@ -521,13 +541,13 @@ def sc_explorer_ops(s):
         ide.click(x + w // 2, y + h // 2)
         f = ide.snap()
         c(f.has("external.ny", exact=True), "explorer: Refresh picks up a file created outside")
-    t = ide.find("src", region=(48, 30, 280, 700))
+    t = ide.find("src", region=R(48, 30, 280, 700))
     ide.click(int(t.cx), int(t.cy))
     f = ide.snap()
-    c(f.has("util.ny", exact=True, region=(48, 30, 280, 700)), "explorer: clicking a folder expands it")
+    c(f.has("util.ny", exact=True, region=R(48, 30, 280, 700)), "explorer: clicking a folder expands it")
     ide.click(int(t.cx), int(t.cy))
     f = ide.snap()
-    c(not f.has("util.ny", exact=True, region=(48, 30, 280, 700)), "explorer: clicking again collapses it")
+    c(not f.has("util.ny", exact=True, region=R(48, 30, 280, 700)), "explorer: clicking again collapses it")
 
 
 def sc_close_dirty(s):
@@ -588,7 +608,7 @@ def sc_terminal(s):
     ide.type("ls\n")
     ok = False
     for _ in range(40):
-        if ide.snap().has("util.ny", exact=False, region=(318, 690, 1300, 250)):
+        if ide.snap().has("util.ny", exact=False, region=R(318, 690, 1300, 250)):
             ok = True
             break
         time.sleep(0.1)
@@ -596,7 +616,7 @@ def sc_terminal(s):
     ide.type(">1 + 2\n")
     ok = False
     for _ in range(40):
-        if ide.snap().has("3", exact=True, region=(318, 690, 1300, 250)):
+        if ide.snap().has("3", exact=True, region=R(318, 690, 1300, 250)):
             ok = True
             break
         time.sleep(0.1)
@@ -714,7 +734,7 @@ def sc_scm(s):
     ok = False
     for _ in range(30):
         f = ide.snap()
-        if f.has("app.ny", exact=True, region=(48, 30, 280, 700)) and f.has("M", exact=True, region=(48, 30, 280, 700)):
+        if f.has("app.ny", exact=True, region=R(48, 30, 280, 700)) and f.has("M", exact=True, region=R(48, 30, 280, 700)):
             ok = True
             break
         ide.wait(10)
@@ -724,7 +744,7 @@ def sc_scm(s):
     # stage via the row's + action (hover shows it)
     hm = [h for h in ide.hitmap() if h[4] == "git.stage"]
     if not hm:
-        t = ide.find("app.ny", region=(48, 30, 280, 700))
+        t = ide.find("app.ny", region=R(48, 30, 280, 700))
         ide.move(int(t.cx), int(t.cy))
         hm = [h for h in ide.hitmap() if h[4] == "git.stage"]
     c(len(hm) >= 1, "scm: stage action on hover", len(hm))
@@ -755,7 +775,7 @@ def sc_scm(s):
     st = ide.state()
     c(st["focus"] == "scm", "scm: focus stays in the message box after committing", st["focus"])
     # gutter decoration after an edit (click into the editor first)
-    t = ide.find("def", region=(318, 80, 400, 200))
+    t = ide.find("def", region=R(318, 80, 400, 200))
     ide.click(int(t.cx), int(t.cy))
     ide.key("ctrl+home")
     ide.type("# changed\n")
@@ -763,7 +783,7 @@ def sc_scm(s):
     t0 = time.time()
     while not green and time.time() - t0 < 15:
         f = ide.snap()
-        green = [o for o in f.ops if o["op"] == "fill" and 318 <= o["a"][0] < 400 and o["a"][2] <= 4
+        green = [o for o in f.ops if o["op"] == "fill" and D(318) <= o["a"][0] < D(400) and o["a"][2] <= D(4)
                  and o["c"][1] > 120 and o["c"][0] < 120]
         time.sleep(0.2)
     c(len(green) >= 1, "scm: gutter shows an added-line bar")
@@ -779,13 +799,13 @@ def sc_search(s):
     ok = False
     for _ in range(30):
         f = ide.snap()
-        if f.has("util.ny", exact=True, region=(48, 30, 280, 700)):
+        if f.has("util.ny", exact=True, region=R(48, 30, 280, 700)):
             ok = True
             break
         ide.wait(5)
     c(ok, "search: result file listed")
     f = ide.snap()
-    c(f.has("1 result in 1 file", exact=False), "search: summary", [t for t in f.all_text((48, 30, 280, 200))])
+    c(f.has("1 result in 1 file", exact=False), "search: summary", [t for t in f.all_text(R(48, 30, 280, 200))])
     hm = [h for h in ide.hitmap() if h[4] == "@search.match"]
     c(len(hm) >= 1, "search: match row clickable", len(hm))
     if hm:
@@ -824,7 +844,7 @@ def sc_views_layout(s):
     c(st["panel_open"], "views: Ctrl+J shows it again")
     ide.key("ctrl+shift+x")
     f = ide.snap()
-    c(f.has("EXTENSIONS", exact=True) and len(f.all_text((48, 60, 270, 800))) > 6, "views: Extensions lists modules")
+    c(f.has("EXTENSIONS", exact=True) and len(f.all_text(R(48, 60, 270, 800))) > 6, "views: Extensions lists modules")
     ide.key("ctrl+=")
     st = ide.state()
     c(st["font_size"] == 14, "views: Ctrl+= zooms in", st["font_size"])
@@ -839,7 +859,7 @@ def sc_views_layout(s):
     # resize survives and the layout follows
     ide.resize(1200, 800)
     f = ide.snap()
-    c(f.w == 1200 and f.has("PROBLEMS", exact=True), "views: window resize relayouts", (f.w, f.h))
+    c(f.w == D(1200) and f.has("PROBLEMS", exact=True), "views: window resize relayouts", (f.w, f.h))
 
 
 def sc_dead_clicks(s):
@@ -940,8 +960,8 @@ def sc_dead_clicks_views(s):
     # Refresh-style buttons legitimately change nothing when nothing changed.
     allow = {"git.refresh", "@search.run", "@ext.refresh", "workbench.files.action.refreshFilesExplorer",
              "nython.ai.analyze", "@dbg.seek"}
-    side = (48, 30, 270, 900)
-    panel = (318, 684, 1282, 254)
+    side = R(48, 30, 270, 900)
+    panel = R(318, 684, 1282, 254)
     all_dead = []
     total = 0
 
@@ -1333,7 +1353,7 @@ def sc_responsive(s):
         c(f.has("Undo", exact=True), "responsive: picking a menu opens it")
         ide.key("escape")
     # clicking beside the floating side bar closes it
-    ide.click(440, 200)
+    ide.click(D(440), D(200))
     st = ide.state()
     c(not st["sidebar"], "responsive: click outside closes the floating side bar", st["sidebar"])
     # overflowing panel tabs
@@ -1494,7 +1514,7 @@ def sc_split(s):
     c(len(sash) == 1, "split: one sash", len(sash))
     if sash:
         x, y, w, h = sash[0][:4]
-        ide.drag(x + w // 2, y + h // 2, x + w // 2, y + h // 2 - 120)
+        ide.drag(x + w // 2, y + h // 2, x + w // 2, y + h // 2 - D(120))
         st = ide.state()
         c(st["split_ratio"] < 0.45, "split: dragging the sash resizes the groups", st["split_ratio"])
     palette(s, "View: Join Editor Groups")
@@ -1544,6 +1564,44 @@ def sc_window_events(s):
     c(ok, "window: a dropped folder opens as the workspace")
 
 
+def sc_hidpi_live(s):
+    """The window moves to a display of twice the scale and back - the stub's
+    `scale` command sends what SDL sends. Every metric and font follows, the
+    workbench keeps its size in layout units, and input still lands."""
+    ide = s.start()
+    c = s.res.check
+    if ide.last.backend != "stub":
+        return          # a real display cannot be rescaled from a script
+    s0 = ide.ui_scale
+    st = ide.state()
+    w0, h0, dpi0, sw0 = st["W"], st["H"], st["dpi"], st["sidebar_w"]
+    c(abs(dpi0 - s0) < 1e-6, "hidpi: the IDE draws at the window's display scale", (dpi0, s0))
+    f = ide.snap()
+    t0 = ide.find("File", region=R(0, 0, 600, 30))
+    ide.send("scale %g" % (s0 * 2))
+    f = ide.snap()
+    _UI["scale"] = ide.ui_scale
+    st = ide.state()
+    c(abs(st["dpi"] - s0 * 2) < 1e-6, "hidpi: the IDE adopts the new scale", st["dpi"])
+    c(abs(st["W"] - w0 * 2) <= 2 and abs(st["H"] - h0 * 2) <= 2,
+      "hidpi: the same workbench in layout units", (w0, h0, st["W"], st["H"]))
+    c(abs(st["sidebar_w"] - sw0 * 2) <= 2, "hidpi: the side bar keeps its width in units", (sw0, st["sidebar_w"]))
+    t1 = f.find("File", region=R(0, 0, 600, 30))
+    c(len(t1) == 1 and abs(t1[0].h - 2 * t0.h) <= 3, "hidpi: text is drawn twice as large",
+      (t0.h, t1[0].h if t1 else None))
+    c(f.has("Debug", exact=True, region=s.status_region()), "hidpi: status bar at the bottom at the new scale")
+    ide.click_text("File", region=R(0, 0, 600, 30))
+    f = ide.snap()
+    c(f.has("Save All", exact=True), "hidpi: menus open by pointer at the new scale")
+    ide.key("escape")
+    ide.send("scale %g" % s0)
+    f = ide.snap()
+    _UI["scale"] = ide.ui_scale
+    st = ide.state()
+    c(abs(st["dpi"] - dpi0) < 1e-6 and abs(st["W"] - w0) <= 2 and abs(st["H"] - h0) <= 2,
+      "hidpi: back at the first scale, the first layout", (st["dpi"], st["W"], st["H"]))
+
+
 SCENARIOS = [
     ("boot", sc_boot), ("edit", sc_edit_undo_save), ("clipboard", sc_clipboard_lines),
     ("multicursor", sc_multicursor), ("palette", sc_palette), ("quickopen", sc_quick_open),
@@ -1554,7 +1612,7 @@ SCENARIOS = [
     ("deadviews", sc_dead_clicks_views), ("build", sc_build), ("cbedit", sc_cb_editing),
     ("cbtools", sc_cb_tools), ("cbdebug", sc_cb_debug), ("responsive", sc_responsive),
     ("session", sc_session), ("columns", sc_column_select),
-    ("split", sc_split), ("window", sc_window_events),
+    ("split", sc_split), ("window", sc_window_events), ("hidpi", sc_hidpi_live),
 ]
 
 

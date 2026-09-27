@@ -72,7 +72,7 @@ ifeq ($(USE_SDL_STUB),yes)
   # Headless SDL3/SDL3_ttf/SDL3_image stand-in — see thirdparty/sdl3-stub/.
   # No real SDL3 is linked; the stub's own .cpp is added to the object list
   # below and provides every symbol gui.cpp needs as a headless no-op.
-  SDL3_CFLAGS  := $(STUB_INCLUDE)
+  SDL3_CFLAGS  := $(STUB_INCLUDE) -DNYTHON_SDL_STUB=1
   SDL3_LDFLAGS :=
 else
   SDL3_CFLAGS  := $(SDL3_CFLAGS_REAL)
@@ -85,6 +85,13 @@ else
     SDL3_LDFLAGS = -L/usr/local/lib -lSDL3
   endif
   SDL3_LDFLAGS += -lSDL3_ttf -lSDL3_image
+  # An SDL3 outside the system library path (e.g. built from source into
+  # /opt/sdl3 with PKG_CONFIG_PATH=/opt/sdl3/lib/pkgconfig) is found at run
+  # time through an rpath, so the binary runs without LD_LIBRARY_PATH.
+  SDL3_LIBDIR := $(shell pkg-config --variable=libdir sdl3 2>/dev/null)
+  ifneq ($(filter-out /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu,$(SDL3_LIBDIR)),)
+    SDL3_LDFLAGS += -Wl,-rpath,$(SDL3_LIBDIR)
+  endif
 endif
 
 # ── Objects ────────────────────────────────────────────────────────
@@ -95,7 +102,10 @@ endif
 # NythonExecutor.hpp rebuilds exactly the objects that include it - the
 # stale-object trap (CLAUDE.md, "Stale object files") no longer needs a
 # `make clean`.
-OBJDIR         = build/obj
+# BUILD selects the output directory, so a real-SDL3 build can live next to
+# the stub build: make BUILD=build-sdl NYTHON_SDL_STUB=0
+BUILD         ?= build
+OBJDIR         = $(BUILD)/obj
 DEPFLAGS       = -MMD -MP
 BASE_CXXFLAGS  = $(CXXSTD) $(CXXOPT) $(CXXWARN) $(INCLUDE) $(SDL3_CFLAGS)
 COMMON_SRCS    = $(filter-out src/main.cpp,$(SRCS))
@@ -106,12 +116,12 @@ endif
 
 # ── IDE build (default) ────────────────────────────────────────────
 IDE_OBJS       = $(OBJDIR)/main_ide.o $(COMMON_OBJS)
-IDE_TARGET     = build/nython$(EXE)
+IDE_TARGET     = $(BUILD)/nython$(EXE)
 IDE_CXXFLAGS   = $(BASE_CXXFLAGS) -DNYTHON_WITH_IDE=1
 
 # ── CLI build ──────────────────────────────────────────────────────
 CLI_OBJS       = $(OBJDIR)/main_cli.o $(COMMON_OBJS)
-CLI_TARGET     = build/nython-cli$(EXE)
+CLI_TARGET     = $(BUILD)/nython-cli$(EXE)
 CLI_CXXFLAGS   = $(BASE_CXXFLAGS) -DNYTHON_WITH_IDE=0
 
 .PHONY: all ide cli clean help asan
@@ -135,10 +145,10 @@ cli: $(CLI_TARGET)
 	@echo ""
 
 # ── Link ───────────────────────────────────────────────────────────
-$(IDE_TARGET): $(IDE_OBJS) | build
+$(IDE_TARGET): $(IDE_OBJS) | $(BUILD)
 	$(CXX) $(IDE_CXXFLAGS) $^ -o $@ $(LDFLAGS) $(SDL3_LDFLAGS)
 
-$(CLI_TARGET): $(CLI_OBJS) | build
+$(CLI_TARGET): $(CLI_OBJS) | $(BUILD)
 	$(CXX) $(CLI_CXXFLAGS) $^ -o $@ $(LDFLAGS) $(SDL3_LDFLAGS)
 
 # ── Compile ────────────────────────────────────────────────────────
@@ -169,15 +179,15 @@ $(OBJDIR)/sdl3_stub.o: $(STUB_SRC)
 # UBSan reports and continues ("runtime error:" lines); grep the output.
 ASAN_CXXOPT = -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
 asan:
-	$(MAKE) cli OBJDIR=build-asan/obj CLI_TARGET=build-asan/nython-cli CXXOPT="$(ASAN_CXXOPT)"
+	$(MAKE) cli BUILD=build-asan CXXOPT="$(ASAN_CXXOPT)"
 
 # ── Directories ────────────────────────────────────────────────────
-build:
-	mkdir -p build
+$(BUILD):
+	mkdir -p $(BUILD)
 
 # ── Clean ──────────────────────────────────────────────────────────
 clean:
-	rm -rf build build-asan
+	rm -rf $(BUILD) build-asan
 
 # ── Help ───────────────────────────────────────────────────────────
 help:

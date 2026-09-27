@@ -19,6 +19,143 @@ collisions.
 
 ---
 
+## 0n. Round 75 — real SDL3, HiDPI done properly, every test in the sweep
+
+The request: "Real SDL3: nothing has been built against it … use our real
+SDL3 and fix everything"; "HiDPI tests: at a simulated 2× display, only the
+IDE tests that don't use fixed pixel positions pass … use the best settings
+and make sure everything works"; and the two stdlib tests "should be inside
+sweep".
+
+### Real SDL3
+
+`tools/build_sdl3.sh` builds SDL 3.4.8, SDL3_ttf 3.2.2 (with its vendored
+FreeType and HarfBuzz, as the release binaries are) and SDL3_image 3.4.6 from
+source into `/opt/sdl3` - Ubuntu 24.04 has no SDL3 package. Then:
+
+```bash
+PKG_CONFIG_PATH=/opt/sdl3/lib/pkgconfig make cli BUILD=build-sdl NYTHON_SDL_STUB=0
+PKG_CONFIG_PATH=/opt/sdl3/lib/pkgconfig make     BUILD=build-sdl NYTHON_SDL_STUB=0
+```
+
+`BUILD=` puts the real-SDL3 build beside the stub build; the Makefile adds an
+rpath when SDL3 lives outside the system library path, so the binary runs
+without `LD_LIBRARY_PATH`. Stub builds now define `NYTHON_SDL_STUB`.
+
+**The test harness** (`include/builtins/gui_harness.hpp`,
+`src/builtins/gui_harness.cpp`, compiled only for real SDL3) gives the real
+backend the stub's two test abilities, so the *same* end-to-end suite runs on
+both: the stub's event-script language (`NY_STUB_EVENTS`: move, click, key,
+type, wheel, resize, drop, focus, dialog, snap, quit, …) is delivered as real
+`SDL_Event`s with the stub's batching, and every draw call is recorded at the
+SDL call boundary into the same display-list format. `resize` really resizes
+the window. With `NY_REAL_PIXELS=1` each presented frame is read back
+(`SDL_RenderReadPixels`) and `snap PATH` also writes `PATH.png` - a real
+screenshot of real SDL3 rendering with real fonts. The wrappers are macros
+over the SDL names gui.cpp calls, so gui.cpp is unchanged; with no harness
+variable set each is one predictable branch and a direct SDL call.
+
+```bash
+Xvfb :99 -screen 0 1920x1080x24 &                       # or a real display
+NY_IDE_BINARY=build-sdl/nython NY_IDE_ENV="SDL_VIDEODRIVER=x11 DISPLAY=:99" \
+    python3 tools/ide_e2e.py
+SDL_VIDEODRIVER=offscreen build-sdl/nython --ide        # no display at all
+```
+
+`tools/ide_driver.py` takes the binary from `NY_IDE_BINARY` and extra
+environment from `NY_IDE_ENV`. Frame headers now carry `density` (pixels per
+window point), `scale` (the window's display scale) and `backend`.
+
+Found by running on real SDL3: a snapshot's PNG was written after its display
+list, so a driver that waits for the display list could copy a half-written
+PNG (fixed: PNG first, each via a temporary name); and SDL_ttf built without
+HarfBuzz mis-kerns ("Te xt") - the build script now builds it as releases are.
+
+### HiDPI: two models, one workbench
+
+SDL3 has two HiDPI models (its `docs/README-highdpi.md`): on **Windows and
+X11** window coordinates are device pixels and the display's content scale
+says how much larger to draw (200%: density 1, content scale 2); on **macOS
+and Wayland** they are points and a high-density window has more pixels per
+point (density 2, content scale 1). The window's *display scale* - density ×
+content scale - is pixels per layout unit on both. Before this round the IDE:
+
+- drew at the display's **content** scale - 1.0 on a Retina Mac, so the whole
+  workbench would have been drawn at half size into a 2× surface;
+- asked for a 1600×960 window **in points** - on a 200% Windows/X11 panel
+  that is 1600×960 pixels, an 800×480 workbench;
+- used the stub's fake display, which reported content scale = density = 2,
+  a combination no real platform produces - which is how both went unseen.
+
+Now:
+
+- **Layout-unit windows** (`gui_create_window` flag 16, `Window.layout_units`):
+  sizes given to create / `set_min_size` / `set_size` are the size at scale
+  1; the native side measures points per unit *on the real window* (display
+  scale ÷ pixel density) and sizes it, clamped to the display. No platform
+  table.
+- The IDE draws at the window's display scale: predicted before the window
+  exists (`gui_display_scale()` × the new `gui_display_density()`, the
+  desktop mode's pixel density), then confirmed from the window once open.
+- **Live scale changes**: `SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED` arrives as a
+  `"scale"` event (`Window.on_scale`); the IDE rebuilds every metric and font
+  (`_metrics()`), keeps the side-bar width and scroll positions in units, and
+  a layout-unit window's minimum size follows.
+- Raw pixel constants left in the layout (panel and editor minimums, the
+  side-bar limit, workshop insets, text-field clip) and the minimap (2 px per
+  line, 1 px per character) are now in dp. The saved side-bar width is in
+  units.
+- **The stub models both platforms faithfully**: `NY_STUB_DPI_SCALE=f` with
+  `NY_STUB_DPI_MODE=points` (default; macOS/Wayland) or `=pixels`
+  (Windows/X11; the display is f × 1920×1080 pixels). The script command
+  `scale F` changes the scale at run time and sends what SDL sends (plus the
+  resize Windows does on `WM_DPICHANGED`).
+- **The e2e suite is scale-independent**: coordinates in `tools/ide_e2e.py`
+  are the IDE's scale-1 metrics passed through `R()`/`D()`, which scale by
+  the display scale the last frame reported; pointer positions are divided
+  by the frame's density; `resize()` means "the window a person at scale 1
+  would have". New scenario `hidpi`: moving to twice the scale and back
+  keeps the workbench in units, doubles text size, and input still lands.
+
+Results (full `tools/ide_e2e.py`, 30 scenarios):
+
+| Backend | Display | Result |
+|---|---|---|
+| stub | 1× | 365 passed, 0 failed |
+| stub | 2×, points model (Retina) | 365 passed, 0 failed |
+| stub | 2×, pixels model (Windows/X11) | 365 passed, 0 failed |
+| real SDL3, X11 (Xvfb) | 1× 1920×1080 | 357 passed, 0 failed |
+| real SDL3, X11 (Xvfb) | 4K at 200% (`SDL_VIDEO_X11_SCALING_FACTOR=2`) | 357 passed, 0 failed |
+
+(Real SDL3 runs 8 checks fewer: the `hidpi` scenario's live scale change
+needs the stub's `scale` command - a real display's scale cannot be changed
+from a script. Before this round, the 200% X11 window came out 1600×960
+pixels, an 800×480 workbench; now it is 3200×1920, the same 1600×960 units.)
+
+### Every test file in the sweep
+
+`tools/sweep.py` now also runs every `examples/*_test.ny` (70 files). The two
+stdlib tests already passed on both engines (the round-74 value and thread
+work fixed them); seven others failed on both engines:
+
+- stale expectations from before floats printed as floats and lists as
+  Python lists (`advanced_test`, `v4_lambda_functional_test`,
+  `v13_systems_test`, `v14_systems_test`, `v14_all_systems_test` - inputs
+  like `tensor([1.0, 2.0])` produce `[6.0, 8.0]`, as Python and NumPy do);
+- `rl_test.ny` read a `/tmp` file nothing created - rewritten to write its
+  own file and assert the handle API, `keep_newline`, and file objects;
+- a real gap: the legacy flat tensor ops turned integer inputs into floats.
+  They now follow NumPy's promotion rule - integers stay integers through
+  `+ - *`, dot, sum, max/min, abs/neg/sign and `relu`; `/`, mean, sqrt, exp
+  become floats; an integer sum or dot accumulates exactly in int64 and falls
+  back to float only on overflow (or a result a double cannot hold).
+- `1k`-style literals (`v3`/`v4`/`v5`/`v9`) are the suffix ruling, §0m.
+
+§5.8's "content-level failures in old version-numbered example files" is
+closed by this: those files are swept now and pass.
+
+---
+
 ## 0e. Round 74 — responsive IDE, Code::Blocks features, faster engines
 
 The request: make the IDE "totally responsive", bring in features from
@@ -1258,7 +1395,8 @@ assuming a full rebuild is required.
 | Variable | Effect |
 |---|---|
 | `NY_STUB_AUTOQUIT=<n>` | Synthesises one `SDL_EVENT_QUIT` after *n* empty polls, so GUI/IDE event loops terminate headlessly. Use ~120 for sweeps. |
-| `NY_STUB_DPI_SCALE=<f>` | Fakes a HiDPI display, for testing `gui_display_scale()`. |
+| `NY_STUB_DPI_SCALE=<f>` | Fakes a display scaled *f* times. The script command `scale F` changes it at run time (§0n). |
+| `NY_STUB_DPI_MODE=points\|pixels` | Which SDL3 HiDPI model the fake display follows: macOS/Wayland (default) or Windows/X11 (§0n). |
 
 The quit is **latched** — delivered once. An unlatched version made an
 application's `while (SDL_PollEvent(&e))` drain loop never terminate and drove
@@ -1533,7 +1671,10 @@ picker. **Visual work needs a screenshot** — and one can now be taken
 headlessly: `ide.screenshot("x.png")` in `tools/ide_driver.py`, or
 `python3 tools/nyshot.py frame.dl out.png` on a capture.
 
-### 5.8 Content-level failures in old version-numbered example files (found, not fixed)
+### 5.8 Content-level failures in old version-numbered example files — CLOSED (round 75, §0n)
+
+Every `examples/*_test.ny` is in `tools/sweep.py` now and passes on both
+engines; what follows is the round-70 record.
 
 Round 70's content-level sweep (§0/§2) found real `N failed` output — not
 crashes, not caught by any exit-code sweep — in about three dozen files:

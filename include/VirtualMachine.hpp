@@ -5544,7 +5544,10 @@ private:
         globals_["tan"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{return VMVal::make_float(std::tan(a.empty()?0.0:to_d(a[0])));});
         globals_["tanh"]=globals_["tanh_fn"]=globals_["tanh_act"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{return VMVal::make_float(std::tanh(a.empty()?0.0:to_d(a[0])));});
         globals_["atan2"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{double y=a.size()>0?to_d(a[0]):0,x=a.size()>1?to_d(a[1]):1;return VMVal::make_float(std::atan2(y,x));});
-        globals_["relu"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{double v=to_d(a.empty()?VMVal::make_int(0):a[0]);return VMVal::make_float(v>0?v:0);});
+        globals_["relu"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
+            // relu is closed over the integers: relu(-5) is 0, relu(3) is 3.
+            if(!a.empty()&&a[0].type==VMType::INT) return VMVal::make_int(a[0].i>0?a[0].i:0);
+            double v=to_d(a.empty()?VMVal::make_int(0):a[0]);return VMVal::make_float(v>0?v:0);});
         globals_["sigmoid"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{double v=to_d(a.empty()?VMVal::make_int(0):a[0]);return VMVal::make_float(1.0/(1.0+std::exp(-v)));});
         globals_["leaky_relu"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             double x=to_d(a.empty()?VMVal::make_int(0):a[0]);double alpha=a.size()>1?to_d(a[1]):0.01;return VMVal::make_float(x>0?x:alpha*x);});
