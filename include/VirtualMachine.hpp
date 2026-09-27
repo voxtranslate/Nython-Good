@@ -1899,6 +1899,13 @@ class VirtualMachine : public Runnable {
     VMVal last_exception_obj_;
     bool vm_trace_ = getenv("NY_VM_TRACE") != nullptr;
     bool export_to_globals_ = false;   // true while executing an import
+    // The call depth of the importing module's own frame: only ITS top-level
+    // names are exported. Every `var` in every function the module's code
+    // called was written to the globals too, so two functions' locals of
+    // the same name overwrote each other (the IDE, run from an import,
+    // called methods on a Command where it meant `self`).
+    int export_depth_ = -1;
+    bool exporting() const { return export_to_globals_ && (int)call_stack_.size()==export_depth_; }
     std::string cwd_ = ".";            // working directory for imports
 
     // Stack helpers
@@ -2008,7 +2015,7 @@ private:
         else globals_[n]=std::move(v);
     }
     void define_var(const std::string& n, VMVal v) {
-        if(export_to_globals_) { globals_[n]=std::move(v); return; }
+        if(exporting()) { globals_[n]=std::move(v); return; }
         if(!call_stack_.empty()) call_stack_.back().set(n,std::move(v));
         else globals_[n]=std::move(v);
     }
@@ -2767,7 +2774,7 @@ private:
             case Op::STORE_NAME: {
                 // A class body binds in the class namespace, always.
                 if(fr.code->is_class){ fr.locals[fr.code->names[ins.arg]]=pop(); break; }
-                if(export_to_globals_&&!call_stack_.empty()&&call_stack_.size()==1)
+                if(exporting())
                     globals_[fr.code->names[ins.arg]]=pop();
                 else {
                     VMVal sv=pop();
@@ -4604,6 +4611,9 @@ private:
             if(!ast) return;
             Compiler c; auto code=c.compile(ast);
             bool old_exp=export_to_globals_; export_to_globals_=true;
+            int old_depth=export_depth_; export_depth_=(int)call_stack_.size()+1;
+            struct ExportRestore { VirtualMachine* vm; bool e; int d;
+                ~ExportRestore(){ vm->export_to_globals_=e; vm->export_depth_=d; } } _export_restore{this, old_exp, old_depth};
             // Snapshot the global names so the alias namespace can be built from
             // whatever the module adds, matching the interpreter.
             // The module's OWN top-level names, read from its AST. Diffing
@@ -4625,7 +4635,7 @@ private:
             }
             try{ exec_code(code,{},std::nullopt); } catch(VMReturn&){}
               catch(std::exception& e){ std::cerr<<"[VM import error] "<<filepath<<": "<<e.what()<<"\n"; }
-            export_to_globals_=old_exp;
+            export_to_globals_=old_exp; export_depth_=old_depth;
             if(!alias.empty()){
                 auto ns=std::make_shared<std::unordered_map<std::string,VMVal>>();
                 for(const auto& n : own_names){
