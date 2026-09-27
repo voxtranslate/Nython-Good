@@ -246,7 +246,7 @@ try:
     os_stat(S + "/nope")
 except OSError as e:
     got = "OSError"
-check_pending("except OSError catches FileNotFoundError", got, "OSError")
+check("except OSError catches FileNotFoundError", got, "OSError")
 def stat_it(p):
     return os_stat(p)
 got = "none"
@@ -254,7 +254,7 @@ try:
     stat_it(S + "/nope")
 except FileNotFoundError as e:
     got = "FileNotFoundError"
-check_pending("error raised in a called function", got, "FileNotFoundError")
+check("error raised in a called function", got, "FileNotFoundError")
 got = "none"
 try:
     try:
@@ -263,7 +263,7 @@ try:
         got = "KeyError"
 except FileNotFoundError as e:
     got = "outer"
-check_pending("an unmatched except clause passes the error on", got, "outer")
+check("an unmatched except clause passes the error on", got, "outer")
 
 # ── File objects ────────────────────────────────────────────────────────────
 var p = S + "/obj.txt"
@@ -329,7 +329,7 @@ try:
     fc.read()
 except ValueError as e:
     got = "ValueError"
-check_pending("read after close", got, "ValueError")
+check("read after close", got, "ValueError")
 var hl = file_open(p, "r")
 check("legacy file_readline", [file_readline(hl), file_readline(hl, true)], ["a", "b\n"])
 file_close(hl)
