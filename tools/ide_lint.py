@@ -22,8 +22,8 @@ import re
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CHAIN_FILES = ["ide_core.ny", "ide_ops.ny", "ide_paint.ny", "ide_views.ny", "nython_ide.ny"]
-CHAIN_CLASSES = ["IDECore", "IDEOps", "IDEPaint", "IDEViews", "NythonIDE"]
+CHAIN_FILES = ["ide_core.ny", "ide_ops.ny", "ide_paint.ny", "ide_views.ny", "ide_tools.ny", "nython_ide.ny"]
+CHAIN_CLASSES = ["IDECore", "IDEOps", "IDEPaint", "IDEViews", "IDETools", "NythonIDE"]
 SOURCE_FILES = CHAIN_FILES + ["ide_editor.ny", "ide_project.ny", "ide_icons.ny", "ide_workshop.ny",
                               "lib/ide_workbench.ny", "lib/ide_scm.ny", "lib/ide_debugger.ny",
                               "lib/ide_selection.ny", "lib/gui.ny", "lib/gui_motion.ny",

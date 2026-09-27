@@ -86,21 +86,39 @@ class GitRepo:
     def is_repo(self):
         return self.root != ""
 
+    # One shell line that prints the branch, the HEAD commit and the status,
+    # separated by marker lines - so a refresh is one process, and the IDE
+    # can run it in the background (BgProc) and hand the output to
+    # apply_refresh when it finishes.
+    def refresh_command(self):
+        var g = "git -C " + self._q(self.root)
+        return "(" + g + " symbolic-ref --short -q HEAD || " + g + " rev-parse --short HEAD) 2>&1; echo @@NY@@; " + g + " rev-parse -q --verify HEAD 2>&1; echo @@NY@@; " + g + " status --porcelain=v1 -uall 2>&1"
+
     def refresh(self):
         if self.root == "":
             return
-        var b = string_strip(self._git("symbolic-ref --short -q HEAD"))
-        if b == "" or string_find(b, "fatal") >= 0:
-            b = string_strip(self._git("rev-parse --short HEAD"))
-        self.branch = b
-        self.head_commit = string_strip(self._git("rev-parse -q --verify HEAD"))
-        var out = self._git("status --porcelain=v1 -uall")
-        var lines = string_split(out, "\n")
+        var out = os_exec(self.refresh_command())
+        if out == none:
+            out = ""
+        self.apply_refresh(string_split(out, "\n"))
+
+    def apply_refresh(self, lines):
+        var sec = 0
+        var b = ""
+        var head = ""
         var ch = []
         var i = 0
         while i < len(lines):
             var ln = lines[i]
-            if len(ln) > 3 and not string_startswith(ln, "fatal"):
+            if ln == "@@NY@@":
+                sec = sec + 1
+            elif sec == 0:
+                if b == "" and ln != "":
+                    b = string_strip(ln)
+            elif sec == 1:
+                if head == "" and ln != "":
+                    head = string_strip(ln)
+            elif len(ln) > 3 and not string_startswith(ln, "fatal"):
                 var x = string_slice(ln, 0, 1)
                 var y = string_slice(ln, 1, 2)
                 var rel = string_slice(ln, 3, len(ln))
@@ -111,6 +129,12 @@ class GitRepo:
                     rel = string_slice(rel, 1, len(rel) - 1)
                 ch.append(GitChange(path_join(self.root, rel), rel, x, y))
             i = i + 1
+        if string_find(b, "fatal") >= 0:
+            b = ""
+        if string_find(head, "fatal") >= 0:
+            head = ""
+        self.branch = b
+        self.head_commit = head
         self.changes = ch
 
     def staged(self):

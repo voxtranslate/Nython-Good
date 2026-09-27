@@ -89,6 +89,20 @@ static size_t ny_u8_char_at(const std::string& s, size_t byte_idx) {
     return chars;
 }
 
+
+// Numeric value of an element whatever its type. Reading `.value.d` directly
+// (the long-double member of the value union) is only correct for DOUBLE
+// elements: an INTEGER element read that way came back as 0, so e.g.
+// tensor_scale([1, 2, 3], 2) returned [0, 0, 0].
+static inline double ny_num(const Value& v) {
+    switch (v.type) {
+        case ValueType::INTEGER: return (double)bigint_to_i64(v.value.i);
+        case ValueType::DOUBLE:  return (double)v.value.d;
+        case ValueType::BOOLEAN: return v.value.b ? 1.0 : 0.0;
+        default:                 return 0.0;
+    }
+}
+
 Value dispatch_string(NythonExecutor& E,
                        const std::string& name,
                        std::vector<Value>& args,
@@ -333,24 +347,8 @@ Value dispatch_string(NythonExecutor& E,
             }
             return Value(false);
         }
-        // ── file_exists(path) ────────────────────────────────────────────────────
-        if (name == "path_exists") {
-            if (!args.empty()) {
-                std::ifstream f(getStringValue(args[0]));
-                return Value(f.good());
-            }
-            return Value(false);
-        }
-        // ── file_list(dir) ───────────────────────────────────────────────────────
-        if (name == "list_dir") {
-            std::string dir = args.empty() ? "." : getStringValue(args[0]);
-            auto* lst = new Container((Runnable*)runner, Type::LIST);
-            int idx = 0;
-            for (const auto& entry : ny_fs::listdir(dir))
-                (*lst->container)[std::to_string(idx++)] = makeStringValue(entry);
-            (*lst->container)["__len__"] = Value(idx);
-            return Value((Collectable*)lst);
-        }
+        // path_exists: builtins/os.cpp (stat-based; this opened the file).
+        // list_dir: builtins/os.cpp.
         // ── string_split(s, delim) ───────────────────────────────────────────────
     // ── from main.cpp lines 7039–7561 ──────────────────────────────────────────
         if (name == "string_split") {
@@ -609,28 +607,7 @@ Value dispatch_string(NythonExecutor& E,
             (*result->container)["backend"] = makeStringValue(!gpu_name.empty() ? "cuda" : "cpu");
             return Value((Collectable*)result);
         }
-        // ── time_now() ───────────────────────────────────────────────────────────
-        if (name == "time_now") {
-            auto now = std::chrono::system_clock::now();
-            return Value((double)std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() / 1000.0);
-        }
-        // ── time_ms() ────────────────────────────────────────────────────────────
-        if (name == "time_ms") {
-            return Value((double)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
-        }
-        // ── process_exec(cmd) ────────────────────────────────────────────────────
-        if (name == "process_exec") {
-            if (!args.empty()) {
-                std::string cmd = getStringValue(args[0]) + " 2>&1";
-                FILE* pipe = popen(cmd.c_str(), "r");
-                if (!pipe) return makeStringValue("");
-                std::string result; char buf[4096];
-                while (fgets(buf, sizeof(buf), pipe)) result += buf;
-                pclose(pipe);
-                return makeStringValue(result);
-            }
-            return makeStringValue("");
-        }
+        // time_now/time_ms: builtins/os_time.cpp; process_exec: os_proc.cpp.
         // ── env_get(key) ─────────────────────────────────────────────────────────
         if (name == "env_get") {
             if (!args.empty()) {
@@ -771,8 +748,8 @@ Value dispatch_string(NythonExecutor& E,
                     for (int i = 0; i < len; i++) {
                         auto pi = pred->container->find(std::to_string(i));
                         auto ti = target->container->find(std::to_string(i));
-                        double pv = (pi != pred->container->end()) ? (double)pi->second.value.d : 0;
-                        double tv = (ti != target->container->end()) ? (double)ti->second.value.d : 0;
+                        double pv = (pi != pred->container->end()) ? ny_num(pi->second) : 0;
+                        double tv = (ti != target->container->end()) ? ny_num(ti->second) : 0;
                         double diff = std::abs(pv - tv);
                         total += (diff <= delta) ? 0.5 * diff * diff : delta * (diff - 0.5 * delta);
                     }
@@ -808,8 +785,8 @@ Value dispatch_string(NythonExecutor& E,
                             for (int d = 0; d < d_k; d++) {
                                 auto qi = Q->container->find(std::to_string(h * d_k + d));
                                 auto ki = K->container->find(std::to_string(s * d_model + h * d_k + d));
-                                double qv = (qi != Q->container->end()) ? (double)qi->second.value.d : 0;
-                                double kv = (ki != K->container->end()) ? (double)ki->second.value.d : 0;
+                                double qv = (qi != Q->container->end()) ? ny_num(qi->second) : 0;
+                                double kv = (ki != K->container->end()) ? ny_num(ki->second) : 0;
                                 dot += qv * kv;
                             }
                             scores[s] = dot * scale;
@@ -822,7 +799,7 @@ Value dispatch_string(NythonExecutor& E,
                             double sum = 0;
                             for (int s = 0; s < seq_len; s++) {
                                 auto vi = V->container->find(std::to_string(s * d_model + h * d_k + d));
-                                double vv = (vi != V->container->end()) ? (double)vi->second.value.d : 0;
+                                double vv = (vi != V->container->end()) ? ny_num(vi->second) : 0;
                                 sum += scores[s] * vv;
                             }
                             output->set(std::to_string(out_idx++), Value(sum));
@@ -870,13 +847,13 @@ Value dispatch_string(NythonExecutor& E,
                     double mean = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        mean += (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        mean += (it != t->container->end()) ? ny_num(it->second) : 0;
                     }
                     mean /= len;
                     double var_v = 0;
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         var_v += (v - mean) * (v - mean);
                     }
                     var_v /= len;
@@ -884,7 +861,7 @@ Value dispatch_string(NythonExecutor& E,
                     Object* result = new Object((Runnable*)runner, "tensor", Type::LIST);
                     for (int i = 0; i < len; i++) {
                         auto it = t->container->find(std::to_string(i));
-                        double v = (it != t->container->end()) ? (double)it->second.value.d : 0;
+                        double v = (it != t->container->end()) ? ny_num(it->second) : 0;
                         result->set(std::to_string(i), Value((v - mean) / std_v));
                     }
                     result->set("__len__", Value(len));

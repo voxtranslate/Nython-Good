@@ -1,5 +1,7 @@
 # import nytorch
 
+import "lib/nytorch/core.ny"
+
 class VectorQuantizer:
     # VQ-VAE quantizer (van den Oord et al. 2017)
     def init(self, num_embeddings, embedding_dim, commitment_cost):
@@ -21,13 +23,13 @@ class VectorQuantizer:
             var k = k + 1
         var q_data = tensor_slice(self.codebook, best_k * self.D, (best_k + 1) * self.D)
         var q      = Tensor([0.0])
-        q.data     = q_data
+        q = Tensor(q_data)
         var diff_c = tensor_sub(z.data, q_data)
         var commit = tensor_dot(diff_c, diff_c) * self.commitment_cost
         return [q, best_k, commit]
     def lookup(self, k):
         var out = Tensor([0.0])
-        out.data = tensor_slice(self.codebook, k * self.D, (k + 1) * self.D)
+        out = Tensor(tensor_slice(self.codebook, k * self.D, (k + 1) * self.D))
         return out
 
 
@@ -152,7 +154,7 @@ class NTMMemory:
             var result = tensor_add(result, tensor_scale(row, w[i]))
             var i = i + 1
         var out = Tensor([0.0])
-        out.data = result
+        out = Tensor(result)
         return out
     def write(self, key, beta, erase_vec, add_vec):
         var w = self.content_addressing(key, beta)
@@ -207,7 +209,7 @@ class KVCache:
 # SECTION 24: KNOWLEDGE & AGENT
 # ---------------------------------------------
 
-class KnowledgeBase:
+class KeyValueMemory:
     def init(self):
         self.facts  = {}
         self.keys_l = []
@@ -223,7 +225,7 @@ class KnowledgeBase:
 class Agent:
     def init(self, name):
         self.name = name
-        self.kb   = KnowledgeBase()
+        self.kb   = KeyValueMemory()
         self.memory_list = []
     def learn(self, key, value):
         self.kb.store(key, value)
@@ -239,37 +241,37 @@ class Agent:
 
 def make_tensor(lst):
     var t = Tensor([0.0])
-    t.data = tensor(lst)
+    t = Tensor(tensor(lst))
     return t
 
 def zeros_tensor(n):
     var t = Tensor([0.0])
-    t.data = zeros(n)
+    t = Tensor(zeros(n))
     return t
 
 def ones_tensor(n):
     var t = Tensor([0.0])
-    t.data = ones(n)
+    t = Tensor(ones(n))
     return t
 
 def rand_t(n):
     var t = Tensor([0.0])
-    t.data = rand_tensor(n)
+    t = Tensor(rand_tensor(n))
     return t
 
 def randn_t(n):
     var t = Tensor([0.0])
-    t.data = randn_tensor(n)
+    t = Tensor(randn_tensor(n))
     return t
 
 def arange_tensor(start, stop, step):
     var t = Tensor([0.0])
-    t.data = tensor_arange(start, stop, step)
+    t = Tensor(tensor_arange(start, stop, step))
     return t
 
 def linspace_tensor(start, stop, n):
     var t = Tensor([0.0])
-    t.data = tensor_linspace(start, stop, n)
+    t = Tensor(tensor_linspace(start, stop, n))
     return t
 
 def eye_tensor(n):
@@ -279,20 +281,18 @@ def eye_tensor(n):
         data[i * n + i] = 1.0
         var i = i + 1
     var t = Tensor([0.0])
-    t.data = data
+    t = Tensor(data)
     return t
 
 def one_hot_tensor(idx, n):
     var t = Tensor([0.0])
-    t.data = one_hot(idx, n)
+    t = Tensor(one_hot(idx, n))
     return t
 
 # Statistical utilities
 def log_softmax_tensor(t):
-    var sm  = softmax(t.data)
-    var out = Tensor([0.0])
-    out.data = tensor_log(sm)
-    return out
+    # log-sum-exp stabilised (log(softmax(x)) underflowed to -inf / -1e308)
+    return Tensor(nt_softmax(t.data, [len(t.data)], 0, true))
 
 def kl_divergence(p, q):
     var ratio     = tensor_mul(p.data, tensor_pow(q.data, -1.0))

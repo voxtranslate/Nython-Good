@@ -38,9 +38,13 @@
 #include <functional>
 #include <unordered_set>
 #include <cerrno>
+#include "NyTensor.hpp"
 #include "NyJson.hpp"
 #include "NyFuzzy.hpp"
 #include "NyOrderedMap.hpp"
+#include "NyRuntime.hpp"
+#include "NyPrelude.hpp"
+#include "NyConc.hpp"   // concurrency runtime shared with the interpreter
 #include <random>
 
 #include "Value.hpp"
@@ -1312,6 +1316,24 @@ private:
             code_->parent_class=base->token().value;
         }
         if(cn->body) for(auto& s:cn->body->statements()) visit(s);
+        // A method defined twice in one class body: the LAST definition wins,
+        // as in Python and on the interpreter. Methods are found by scanning
+        // sub_codes for the first name match, so the VM used to keep the
+        // FIRST one - the same class behaved differently on the two engines.
+        // Earlier duplicates are renamed out of reach (they stay in place,
+        // since MAKE_FUNCTION refers to sub_codes by index).
+        {
+            auto& subs=code_->sub_codes;
+            for(size_t i=0;i<subs.size();i++){
+                if(!subs[i]||subs[i]->is_class) continue;
+                for(size_t j=i+1;j<subs.size();j++){
+                    if(subs[j]&&!subs[j]->is_class&&subs[j]->name==subs[i]->name){
+                        subs[i]->name+="\x01shadowed";
+                        break;
+                    }
+                }
+            }
+        }
         emit(Op::HALT,0,l);
         pop_code();
         int idx=(int)C().sub_codes.size()-1;
@@ -1582,8 +1604,17 @@ enum   class VMResult { SUCCESS, COMPILE_ERROR, RUNTIME_ERROR };
 // ═══════════════════════════════════════════════════════════════════════════
 // VIRTUAL MACHINE
 // ═══════════════════════════════════════════════════════════════════════════
+// Threads, locks, channels, futures, async for the VM (src/VMConc.cpp): VM
+// natives over the shared runtime in src/NyConc.cpp. It needs the VM's
+// per-thread execution state (operand stack, frames), hence the friendship.
+class VirtualMachine;
+struct VMConc { static void install(VirtualMachine& vm); };
+struct VMConcEngine;
+
 class VirtualMachine : public Runnable {
     friend class gc::GarbageCollector;
+    friend struct VMConc;
+    friend struct VMConcEngine;
     using gc_ptr = std::shared_ptr<GarbageCollector>;
 
     gc_ptr                                             gc_;
@@ -1600,9 +1631,21 @@ class VirtualMachine : public Runnable {
     std::unordered_map<std::string,std::shared_ptr<VMCode>> class_reg_;
     std::unordered_map<std::string,VMMap> class_vars_;
     VMVal last_exception_obj_;
+    bool prelude_loaded_=false;
+    std::vector<nython::node::node_ptr> prelude_asts_;
     bool vm_trace_ = getenv("NY_VM_TRACE") != nullptr;
     bool export_to_globals_ = false;   // true while executing an import
     std::string cwd_ = ".";            // working directory for imports
+    // ── Threads (round 74, src/VMConc.cpp) ──────────────────────────────────
+    // Module-level variables live in the main thread's bottom frame and are
+    // found by walking the call stack. A thread has a call stack of its own, so
+    // it reaches the main module frame through this pointer, set when the first
+    // thread starts. The frame outlives every non-daemon thread: run() joins
+    // them before popping it (daemons never get the GIL back after that).
+    CallFrame* module_frame_ = nullptr;
+    bool in_other_thread() const {
+        return module_frame_ && (call_stack_.empty() || &call_stack_.front() != module_frame_);
+    }
 
     // Stack helpers
     void   push(VMVal v)       { stack_.push_back(std::move(v)); }
@@ -1638,12 +1681,20 @@ public:
     static std::function<VMVal(const std::string&, std::vector<VMVal>&)>& bridge_call() {
         static std::function<VMVal(const std::string&, std::vector<VMVal>&)> f; return f;
     }
+    // Every builtin name the interpreter registers (for module namespaces).
+    static std::function<std::vector<std::string>()>& bridge_names() {
+        static std::function<std::vector<std::string>()> f; return f;
+    }
 
 private:
     VMVal load_var(const std::string& n) {
         for(int i=(int)call_stack_.size()-1;i>=0;i--){
             auto v=call_stack_[i].get_local(n);
             if(v.type!=VMType::UNDEFINED) return v;
+        }
+        if(in_other_thread()){                                   // round 74
+            auto mv=module_frame_->get_local(n);
+            if(mv.type!=VMType::UNDEFINED) return mv;
         }
         auto it=globals_.find(n);
         if(it!=globals_.end()) return it->second;
@@ -1652,10 +1703,12 @@ private:
         // undefined variable still reads as none rather than becoming callable.
         if(bridge_exists() && bridge_exists()(n)){
             std::string nm=n;
-            return VMVal::make_native([nm](std::vector<VMVal>& a)->VMVal{
+            VMVal nv=VMVal::make_native([nm](std::vector<VMVal>& a)->VMVal{
                 if(bridge_call()) return bridge_call()(nm,a);
                 return VMVal::make_none();
             });
+            nv.class_name="__builtin__:"+nm;   // lets time.time() find time's members
+            return nv;
         }
         return VMVal::make_none();
     }
@@ -1668,6 +1721,9 @@ private:
                 auto ci=call_stack_[i].closure_env->find(n);
                 if(ci!=call_stack_[i].closure_env->end()){ ci->second=std::move(v); return; }
             }
+        }
+        if(in_other_thread() && module_frame_->has_local(n)){    // round 74
+            module_frame_->set(n,std::move(v)); return;
         }
         if(!call_stack_.empty()) call_stack_.back().locals[n]=std::move(v);
         else globals_[n]=std::move(v);
@@ -1711,6 +1767,8 @@ public:
     void register_all_builtins() {
         register_nytorch_builtins();
         register_builtins();
+        register_nt_natives();
+        VMConc::install(*this);   // last: its GIL-aware sleep natives win
     }
 
     ~VirtualMachine() override = default;
@@ -1718,13 +1776,145 @@ public:
     // Compile + run an AST
     VMResult run(nython::node::node_ptr ast) {
         try {
+            load_prelude();
             Compiler c; auto code=c.compile(ast);
-            exec_code(code,{},std::nullopt);
+            // The module frame is pushed here rather than by exec_code() so that
+            // non-daemon threads, which read module variables through it, are
+            // joined before it is popped (round 74).
+            size_t base=stack_.size();
+            CallFrame fr; fr.code=code; fr.ip=0;
+            call_stack_.push_back(std::move(fr));
+            struct PopModule {
+                VirtualMachine* vm; size_t base;
+                ~PopModule(){
+                    nyconc::join_nondaemon_at_exit();
+                    vm->module_frame_=nullptr;
+                    vm->call_stack_.pop_back();
+                    if(vm->stack_.size()>base) vm->stack_.resize(base);
+                }
+            } pop_module{this, base};
+            try { run_loop(); } catch(VMReturn&) {}
             return VMResult::SUCCESS;
         } catch(std::exception& e) {
             std::cerr<<"\x1b[31m[VMError] "<<e.what()<<"\x1b[0m\n";
             return VMResult::RUNTIME_ERROR;
         }
+    }
+
+    // The Nython prelude (include/NyPrelude.hpp) - the same text the
+    // interpreter runs at startup: file objects for open().
+    void load_prelude() {
+        if(prelude_loaded_) return;
+        prelude_loaded_=true;
+        try {
+            auto source=nython::reader::SourceCode(std::string(nyrt::prelude_source()));
+            auto reporter=std::make_shared<nython::exception::Reporter>(source);
+            auto lx=std::make_shared<nython::lexer::Lexer>(source);
+            lx->tokenize();
+            auto pr=std::make_shared<nython::parser::Parser>(reporter.get(),(nython::Runnable*)this,lx.get());
+            auto ast=pr->parse();
+            if(!ast) return;
+            prelude_asts_.push_back(ast);
+            Compiler c; auto code=c.compile(ast);
+            bool old_exp=export_to_globals_; export_to_globals_=true;
+            try{ exec_code(code,{},std::nullopt); } catch(VMReturn&){}
+            export_to_globals_=old_exp;
+            for(auto& sub:code->sub_codes) if(sub->is_class) class_reg_[sub->name]=sub;
+        } catch(std::exception& e){ std::cerr<<"[VM] prelude failed to load: "<<e.what()<<"\n"; }
+        // open() as a native: the prelude's `def open` raises from its own
+        // frame, and an exception crossing a Nython frame is not yet
+        // catchable by typed `except` in the caller on this engine. Opening
+        // here raises FileNotFoundError & co. in the CALLER's frame; the
+        // object is still the prelude's NythonFile.
+        globals_["open"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            std::vector<VMVal> args=a;
+            VMVal kw=VMVal::make_none();
+            if(!args.empty()&&args.back().type==VMType::MAP&&args.back().map&&args.size()>=1){
+                bool all_kw=true;
+                for(auto& kv:*args.back().map) if(kv.first!="mode"&&kv.first!="encoding"&&kv.first!="file"&&kv.first!="path") all_kw=false;
+                if(all_kw&&!args.back().map->empty()){ kw=args.back(); args.pop_back(); }
+            }
+            auto kwget=[&](const char* k)->VMVal{
+                if(kw.type==VMType::MAP&&kw.map&&kw.map->count(k)) return (*kw.map)[k];
+                return VMVal::make_none();
+            };
+            VMVal path=args.size()>0?args[0]:kwget("file");
+            if(path.type==VMType::NONE) path=kwget("path");
+            VMVal mode=args.size()>1?args[1]:kwget("mode");
+            if(mode.type==VMType::NONE) mode=VMVal::make_str("r");
+            std::vector<VMVal> oa={path,mode};
+            VMVal opener=load_var("file_open_or_raise");
+            VMVal h=vm_call(opener,oa,std::nullopt);
+            auto cit=class_reg_.find("NythonFile");
+            if(cit==class_reg_.end()) return h;
+            VMVal cls=VMVal::make_class(cit->second,"NythonFile");
+            std::vector<VMVal> ca={path,mode,h};
+            return vm_call(cls,ca,std::nullopt);
+        });
+    }
+
+    // `import os`: os.getcwd(), os.path.join(), ... over the interpreter's
+    // os_* builtins (include/NyRuntime.hpp module_members), plus the
+    // constants and a snapshot of os.environ - as on the interpreter.
+    void define_os_module(const std::string& as_name) {
+        std::vector<std::string> names;
+        if(bridge_names()) names=bridge_names()();
+        VMVal ns=VMVal::make_map(), path=VMVal::make_map();
+        for(auto& m : nyrt::module_members("os",names)){
+            if(m.first=="environ") continue;   // a map, below (os.environ["HOME"])
+            VMVal fn=load_var(m.second);
+            if(m.first.rfind("path.",0)==0) (*path.map)[m.first.substr(5)]=fn;
+            else (*ns.map)[m.first]=fn;
+        }
+        for(const char* c : {"sep","pathsep","linesep","name"}){
+            VMVal v=globals_.count(std::string("os_")+c)?globals_[std::string("os_")+c]:VMVal::make_none();
+            (*ns.map)[c]=v;
+            if(std::string(c)=="sep"||std::string(c)=="pathsep") (*path.map)[c]=v;
+        }
+        VMVal envf=load_var("os_environ");
+        std::vector<VMVal> none_args;
+        (*ns.map)["environ"]=envf.type==VMType::NATIVE?envf.native(none_args):VMVal::make_map();
+        path.class_name="path";
+        (*ns.map)["path"]=path;
+        ns.class_name=as_name;
+        globals_[as_name]=ns;
+    }
+
+    // `import sys`: a namespace with argv (the script path, then the
+    // arguments after it), platform, executable and version; argv and
+    // platform are also bound bare, as on the interpreter.
+    void define_sys_module(const std::string& as_name) {
+        std::vector<VMVal> av;
+        for(auto& a : nyrt::argv()) av.push_back(VMVal::make_str(a));
+        VMVal argv_list=VMVal::make_list(std::move(av));
+#if defined(_WIN32)
+        std::string plat="win32";
+#elif defined(__APPLE__)
+        std::string plat="darwin";
+#else
+        std::string plat="linux";
+#endif
+        VMVal ns=VMVal::make_map();
+        (*ns.map)["argv"]=argv_list;
+        (*ns.map)["platform"]=VMVal::make_str(plat);
+        (*ns.map)["executable"]=VMVal::make_str(nyrt::executable_path());
+        (*ns.map)["version"]=VMVal::make_str(NYTHON_VERSION);
+        ns.class_name=as_name;
+        globals_[as_name]=ns;
+        globals_["argv"]=argv_list;
+        globals_["platform"]=VMVal::make_str(plat);
+    }
+
+    // Raise a builtin exception of `type` from native code (the builtin
+    // bridge uses it for "__exc__:Type:msg" errors from interpreter
+    // builtins): the same instance and runtime_error an Op::RAISE of
+    // Type(msg) produces, so it takes the VM's normal raise path.
+    [[noreturn]] void raise_native_exception(const std::string& type, const std::string& msg) {
+        auto attrs=std::make_shared<VMMap>();
+        (*attrs)["msg"]=VMVal::make_str(msg);
+        (*attrs)["args"]=VMVal::make_list(std::vector<VMVal>{VMVal::make_str(msg)});
+        last_exception_obj_=VMVal::make_instance(type.empty()?std::string("Exception"):type, attrs);
+        throw std::runtime_error((type.empty()?std::string("Exception"):type)+": "+msg);
     }
 
     // Compile only
@@ -1929,6 +2119,11 @@ private:
     }
 
         VMVal run_loop() {
+        // GIL switch points (round 74), as in CPython: entering a frame and
+        // every backward jump (JUMP_ABSOLUTE closes each loop). A switch
+        // swaps this thread's stacks out and back in; references into them
+        // (`fr`) stay valid because deque elements never move.
+        nyconc::tick();
         while(true){
             CallFrame& fr=call_stack_.back();
             if(fr.ip>=(int)fr.code->instructions.size()) return VMVal::make_none();
@@ -2166,7 +2361,7 @@ private:
 
             // Jumps
             case Op::JUMP_FORWARD:         fr.ip=ins.arg; break;
-            case Op::JUMP_ABSOLUTE:        fr.ip=ins.arg; break;
+            case Op::JUMP_ABSOLUTE:        nyconc::tick(); fr.ip=ins.arg; break;
             case Op::JUMP_IF_FALSE: {
                 VMVal v=pop();
                 bool t = (v.type==VMType::INSTANCE) ? instance_truthy(v) : v.is_truthy();
@@ -3444,6 +3639,17 @@ private:
             if(nested.type == VMType::FUNCTION && nested.code)
                 return exec_code(nested.code, args, VMVal::make_none());
         }
+        // A builtin used as a namespace: `import time` then time.time(),
+        // time.sleep(1), time.monotonic() - the builtin time_X, else X.
+        if(obj.type==VMType::NATIVE&&obj.class_name.rfind("__builtin__:",0)==0){
+            std::string target=nyrt::builtin_member(obj.class_name.substr(12),method,
+                [&](const std::string& n){ return bridge_exists()&&bridge_exists()(n); });
+            if(!target.empty()){
+                VMVal fn=load_var(target);
+                if(fn.type==VMType::NATIVE) return fn.native(args);
+            }
+            return VMVal::make_none();
+        }
         // Fallback: check globals
         auto git=globals_.find(method);
         if(git!=globals_.end()&&git->second.type==VMType::NATIVE)
@@ -3546,11 +3752,18 @@ private:
         // the interpreter's container-leak problem that made loading this
         // 220+-class file risky there (see GC_NOTES.md).
         if(name=="nytorch_classes"){ register_nytorch_builtins(); }
-        if(name=="os"||name=="shell"||name=="sh"){ register_os_builtins(); return; }
+        // os/shell/time/io: their functions are the interpreter's, reached
+        // through the builtin bridge - one implementation for both engines.
+        // These imports used to install VM copies that differed (time_ms()
+        // in seconds, sleep(0.5) not sleeping, shell() returning a wait
+        // status); now they are acknowledgements only.
+        if(name=="os"){ define_os_module(alias.empty()?std::string("os"):alias); return; }
+        if(name=="shell"||name=="sh"){ return; }
+        if(name=="sys"){ define_sys_module(alias.empty()?std::string("sys"):alias); return; }
         if(name=="math"){ register_math_builtins(); return; }
-        if(name=="time"){ register_time_builtins(); return; }
+        if(name=="time"){ return; }
         if(name=="json"){ register_json_builtins(); return; }
-        if(name=="io"||name=="fs"||name=="file"){ register_io_builtins(); return; }
+        if(name=="io"||name=="fs"||name=="file"){ return; }
         if(name=="string"){
             globals_["isdigit_str"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
                 return VMVal::make_bool(!a.empty()&&!a[0].s.empty()&&std::all_of(a[0].s.begin(),a[0].s.end(),::isdigit));});
@@ -3675,8 +3888,22 @@ private:
                         own_names.insert(std::static_pointer_cast<nython::node::VarDeclNode>(st)->name);
                 }
             }
+            // __name__ / __file__ are the module's own while its top level
+            // runs, so `if __name__ == "__main__":` does not fire on import.
+            VMVal prev_name=globals_.count("__name__")?globals_["__name__"]:VMVal::make_str("__main__");
+            VMVal prev_file=globals_.count("__file__")?globals_["__file__"]:VMVal::make_str("");
+            {
+                std::string stem=filepath;
+                size_t cut=stem.find_last_of("/\\");
+                if(cut!=std::string::npos) stem=stem.substr(cut+1);
+                if(stem.size()>3&&stem.compare(stem.size()-3,3,".ny")==0) stem=stem.substr(0,stem.size()-3);
+                globals_["__name__"]=VMVal::make_str(stem);
+                globals_["__file__"]=VMVal::make_str(filepath);
+            }
             try{ exec_code(code,{},std::nullopt); } catch(VMReturn&){}
               catch(std::exception& e){ std::cerr<<"[VM import error] "<<filepath<<": "<<e.what()<<"\n"; }
+            globals_["__name__"]=prev_name;
+            globals_["__file__"]=prev_file;
             export_to_globals_=old_exp;
             if(!alias.empty()){
                 auto ns=std::make_shared<VMMap>();
@@ -3725,14 +3952,101 @@ private:
         return s_empty;
     }
 
+    // ── Shared tensor natives (include/NyTensor.hpp) ─────────────────────────
+    // Every tensor native is implemented once, in src/builtins/nytensor.cpp,
+    // and served to BOTH engines through a thin value adapter — this one for
+    // the VM, dispatch_nt() in src/builtins/tensor.cpp for the interpreter —
+    // so the two can no longer drift apart. The VM used to carry its own
+    // copies here, several of them stubs (matmul returned [], transpose,
+    // attention, batch_norm and dropout returned their input, ctc_loss was
+    // the constant 2.5); those are gone.
+    static nt::Val vm_to_nt(const VMVal& v, int depth) {
+        switch (v.type) {
+            case VMType::NONE:   return nt::Val::none();
+            case VMType::BOOL:   return nt::Val::boolean(v.b);
+            case VMType::INT:    return nt::Val::integer(v.i);
+            case VMType::FLOAT:  return nt::Val::num(v.d);
+            case VMType::STRING: return nt::Val::str(v.s);
+            case VMType::LIST: {
+                if (!v.list) return nt::Val::vec({});
+                const auto& L = *v.list;
+                bool allnum = true, allint = true;
+                for (auto& e : L) {
+                    if (e.type == VMType::FLOAT) allint = false;
+                    else if (e.type != VMType::INT && e.type != VMType::BOOL) { allnum = false; break; }
+                }
+                if (allnum) {
+                    std::vector<double> d(L.size());
+                    for (size_t i = 0; i < L.size(); i++)
+                        d[i] = L[i].type == VMType::FLOAT ? L[i].d : L[i].type == VMType::INT ? (double)L[i].i : (L[i].b ? 1.0 : 0.0);
+                    return nt::Val::vec(std::move(d), allint);
+                }
+                if (depth > 64) throw std::runtime_error("ValueError: list nesting is too deep for a tensor");
+                std::vector<nt::Val> items;
+                items.reserve(L.size());
+                for (auto& e : L) items.push_back(vm_to_nt(e, depth + 1));
+                return nt::Val::list(std::move(items));
+            }
+            default: return nt::Val::none();
+        }
+    }
+    static VMVal nt_to_vm(nt::Val& v) {
+        switch (v.k) {
+            case nt::Val::NONE:  return VMVal::make_none();
+            case nt::Val::BOOL:  return VMVal::make_bool(v.b);
+            case nt::Val::INT:   return VMVal::make_int(v.i);
+            case nt::Val::FLOAT: return VMVal::make_float(v.d);
+            case nt::Val::STR:   return VMVal::make_str(std::move(v.s));
+            case nt::Val::VEC: {
+                std::vector<VMVal> r;
+                r.reserve(v.v.size());
+                if (v.v_int) for (double x : v.v) r.push_back(VMVal::make_int((int64_t)x));
+                else for (double x : v.v) r.push_back(VMVal::make_float(x));
+                return VMVal::make_list(std::move(r));
+            }
+            case nt::Val::LIST: {
+                std::vector<VMVal> r;
+                r.reserve(v.items.size());
+                for (auto& e : v.items) r.push_back(nt_to_vm(e));
+                return VMVal::make_list(std::move(r));
+            }
+        }
+        return VMVal::make_none();
+    }
+    void register_nt_natives() {
+        for (const auto& name : nt::names()) {
+            const nt::Op* op = nt::find(name);
+            globals_[name] = VMVal::make_native([this, op](std::vector<VMVal>& a) -> VMVal {
+                size_t n = a.size();
+                if (n && a.back().type == VMType::MAP) n--;          // keyword-argument map: not used
+                std::vector<nt::Val> args;
+                args.reserve(n);
+                for (size_t i = 0; i < n; i++) args.push_back(vm_to_nt(a[i], 0));
+                nt::Val r;
+                try {
+                    r = op->fn(args);
+                } catch (nt::Error& e) {
+                    // A typed instance, so `except ValueError as e:` matches
+                    // (a bare runtime_error only reaches untyped handlers).
+                    auto attrs = std::make_shared<VMMap>();
+                    (*attrs)["msg"] = VMVal::make_str(e.msg);
+                    (*attrs)["args"] = VMVal::make_list({VMVal::make_str(e.msg)});
+                    last_exception_obj_ = VMVal::make_instance(e.type, attrs);
+                    throw std::runtime_error(e.type + ": " + e.msg);
+                }
+                for (int k : op->mutates) {
+                    if (k >= (int)n || args[k].k != nt::Val::VEC) continue;
+                    if (a[k].type != VMType::LIST || !a[k].list) continue;
+                    auto& L = *a[k].list;                 // the caller's list, updated in place
+                    L.resize(args[k].v.size());
+                    for (size_t i = 0; i < L.size(); i++) L[i] = VMVal::make_float(args[k].v[i]);
+                }
+                return nt_to_vm(r);
+            });
+        }
+    }
+
     void register_nytorch_builtins() {
-        globals_["tensor"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{return a.empty()?VMVal::make_list():a[0];});
-        globals_["zeros"]=globals_["tensor_zeros"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            int64_t n=a.empty()?0:(a[0].type==VMType::INT?a[0].i:(int64_t)a[0].d);
-            std::vector<VMVal> v;for(int64_t i=0;i<n;i++)v.push_back(VMVal::make_float(0.0));return VMVal::make_list(std::move(v));});
-        globals_["ones"]=globals_["tensor_ones"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            int64_t n=a.empty()?0:(a[0].type==VMType::INT?a[0].i:(int64_t)a[0].d);
-            std::vector<VMVal> v;for(int64_t i=0;i<n;i++)v.push_back(VMVal::make_float(1.0));return VMVal::make_list(std::move(v));});
         globals_["exp"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{return VMVal::make_float(std::exp(to_d(a.empty()?VMVal::make_int(0):a[0])));});
         globals_["log"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{return VMVal::make_float(std::log(to_d(a.empty()?VMVal::make_int(1):a[0])));});
         // These four read a[0] with no arity check, so sin()/cos()/tan()/tanh()
@@ -3747,112 +4061,6 @@ private:
         globals_["atan2"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{double y=a.size()>0?to_d(a[0]):0,x=a.size()>1?to_d(a[1]):1;return VMVal::make_float(std::atan2(y,x));});
         globals_["relu"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{double v=to_d(a.empty()?VMVal::make_int(0):a[0]);return VMVal::make_float(v>0?v:0);});
         globals_["sigmoid"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{double v=to_d(a.empty()?VMVal::make_int(0):a[0]);return VMVal::make_float(1.0/(1.0+std::exp(-v)));});
-        globals_["softmax"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||!a[0].list)return VMVal::make_list();
-            auto& lst=vm_arg_list(a,0);double s=0;std::vector<double> ev;
-            for(auto& v:lst){double e=std::exp(to_d(v));ev.push_back(e);s+=e;}
-            std::vector<VMVal> res;for(auto e:ev)res.push_back(VMVal::make_float(e/s));return VMVal::make_list(std::move(res));});
-        globals_["tensor_add"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2||a[0].type!=VMType::LIST)return VMVal::make_list();
-            auto& la=vm_arg_list(a,0);auto& lb=vm_arg_list(a,1);std::vector<VMVal> r;
-            for(size_t i=0;i<la.size();i++)r.push_back(VMVal::make_float(to_d(la[i])+(i<lb.size()?to_d(lb[i]):0)));
-            return VMVal::make_list(std::move(r));});
-        globals_["tensor_scale"]=globals_["tensor_mul"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST)return VMVal::make_list();
-            auto& lst=vm_arg_list(a,0);std::vector<VMVal> r;
-            if(a.size()>1&&a[1].type==VMType::LIST&&a[1].list){
-                auto& lb=vm_arg_list(a,1);
-                if(lb.size()==1){double sc=to_d(lb[0]);for(auto& v:lst)r.push_back(VMVal::make_float(to_d(v)*sc));}
-                else{for(size_t i=0;i<lst.size();i++)r.push_back(VMVal::make_float(to_d(lst[i])*(i<lb.size()?to_d(lb[i]):1.0)));}
-            } else {
-                double sc=a.size()>1?to_d(a[1]):1;for(auto& v:lst)r.push_back(VMVal::make_float(to_d(v)*sc));
-            }
-            return VMVal::make_list(std::move(r));});
-        globals_["tensor_sum"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST)return VMVal::make_float(0.0);
-            double s=0;for(auto& v:vm_arg_list(a,0))s+=to_d(v);return VMVal::make_float(s);});
-        globals_["tensor_mean"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||vm_arg_list(a,0).empty())return VMVal::make_float(0.0);
-            double s=0;for(auto& v:vm_arg_list(a,0))s+=to_d(v);return VMVal::make_float(s/(double)vm_arg_list(a,0).size());});
-        globals_["matmul"]=globals_["tensor_matmul"]=VMVal::make_native([](std::vector<VMVal>&)->VMVal{return VMVal::make_list();});
-        // Random tensors
-        globals_["tensor_rand"]=globals_["rand_tensor"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            int64_t n=0;
-            if(!a.empty()){if(a[0].type==VMType::LIST&&a[0].list&&!vm_arg_list(a,0).empty())n=(vm_arg_list(a,0).empty()?VMVal::make_float(0):vm_arg_list(a,0).front()).type==VMType::INT?(vm_arg_list(a,0).empty()?VMVal::make_float(0):vm_arg_list(a,0).front()).i:(int64_t)(vm_arg_list(a,0).empty()?VMVal::make_float(0):vm_arg_list(a,0).front()).d;
-            else if(a[0].type==VMType::INT)n=a[0].i; else if(a[0].type==VMType::FLOAT)n=(int64_t)a[0].d;}
-            std::vector<VMVal> v; for(int64_t i=0;i<n;i++)v.push_back(VMVal::make_float((double)rand()/(RAND_MAX)));
-            return VMVal::make_list(std::move(v));});
-        globals_["tensor_randn"]=globals_["randn_tensor"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            int64_t n=0;
-            if(!a.empty()){if(a[0].type==VMType::LIST&&a[0].list&&!vm_arg_list(a,0).empty())n=(vm_arg_list(a,0).empty()?VMVal::make_float(0):vm_arg_list(a,0).front()).type==VMType::INT?(vm_arg_list(a,0).empty()?VMVal::make_float(0):vm_arg_list(a,0).front()).i:(int64_t)(vm_arg_list(a,0).empty()?VMVal::make_float(0):vm_arg_list(a,0).front()).d;
-            else if(a[0].type==VMType::INT)n=a[0].i; else if(a[0].type==VMType::FLOAT)n=(int64_t)a[0].d;}
-            std::vector<VMVal> v; srand((unsigned)time(nullptr));
-            for(int64_t i=0;i<n;i++){double u1=(double)(rand()+1)/(RAND_MAX+1.0),u2=(double)(rand()+1)/(RAND_MAX+1.0);
-            v.push_back(VMVal::make_float(sqrt(-2*log(u1))*cos(2*3.14159265358979323846*u2)));}
-            return VMVal::make_list(std::move(v));});
-        // Tensor manipulation
-        globals_["tensor_zeros"]=globals_["zeros"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            int64_t n=0;
-            if(!a.empty()){if(a[0].type==VMType::LIST&&a[0].list&&!vm_arg_list(a,0).empty())n=(vm_arg_list(a,0).empty()?VMVal::make_float(0):vm_arg_list(a,0).front()).type==VMType::INT?(vm_arg_list(a,0).empty()?VMVal::make_float(0):vm_arg_list(a,0).front()).i:(int64_t)(vm_arg_list(a,0).empty()?VMVal::make_float(0):vm_arg_list(a,0).front()).d;
-            else if(a[0].type==VMType::INT)n=a[0].i; else if(a[0].type==VMType::FLOAT)n=(int64_t)a[0].d;}
-            std::vector<VMVal> v; for(int64_t i=0;i<n;i++)v.push_back(VMVal::make_float(0.0));return VMVal::make_list(std::move(v));});
-        globals_["tensor_ones"]=globals_["ones"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            int64_t n=0;
-            if(!a.empty()){if(a[0].type==VMType::LIST&&a[0].list&&!vm_arg_list(a,0).empty())n=(vm_arg_list(a,0).empty()?VMVal::make_float(0):vm_arg_list(a,0).front()).type==VMType::INT?(vm_arg_list(a,0).empty()?VMVal::make_float(0):vm_arg_list(a,0).front()).i:(int64_t)(vm_arg_list(a,0).empty()?VMVal::make_float(0):vm_arg_list(a,0).front()).d;
-            else if(a[0].type==VMType::INT)n=a[0].i; else if(a[0].type==VMType::FLOAT)n=(int64_t)a[0].d;}
-            std::vector<VMVal> v; for(int64_t i=0;i<n;i++)v.push_back(VMVal::make_float(1.0));return VMVal::make_list(std::move(v));});
-        globals_["tensor_exp"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST)return VMVal::make_float(a.empty()?0:std::exp(to_d(a[0])));
-            std::vector<VMVal> r;for(auto& v:vm_arg_list(a,0))r.push_back(VMVal::make_float(std::exp(to_d(v))));return VMVal::make_list(std::move(r));});
-        globals_["tensor_log"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST)return VMVal::make_float(a.empty()?0:std::log(to_d(a[0])));
-            std::vector<VMVal> r;for(auto& v:vm_arg_list(a,0))r.push_back(VMVal::make_float(std::log(to_d(v))));return VMVal::make_list(std::move(r));});
-        globals_["tensor_sqrt"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST)return VMVal::make_float(a.empty()?0:std::sqrt(to_d(a[0])));
-            std::vector<VMVal> r;for(auto& v:vm_arg_list(a,0))r.push_back(VMVal::make_float(std::sqrt(to_d(v))));return VMVal::make_list(std::move(r));});
-        globals_["tensor_abs"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST)return VMVal::make_float(a.empty()?0:std::fabs(to_d(a[0])));
-            std::vector<VMVal> r;for(auto& v:vm_arg_list(a,0))r.push_back(VMVal::make_float(std::fabs(to_d(v))));return VMVal::make_list(std::move(r));});
-        globals_["tensor_neg"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST)return VMVal::make_float(0);
-            std::vector<VMVal> r;for(auto& v:vm_arg_list(a,0))r.push_back(VMVal::make_float(-to_d(v)));return VMVal::make_list(std::move(r));});
-        globals_["tensor_pow"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2||a[0].type!=VMType::LIST)return VMVal::make_float(0);
-            double p=to_d(a[1]);std::vector<VMVal> r;
-            for(auto& v:vm_arg_list(a,0))r.push_back(VMVal::make_float(std::pow(to_d(v),p)));return VMVal::make_list(std::move(r));});
-        globals_["tensor_sub"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2)return VMVal::make_list();
-            if(a[0].type!=VMType::LIST)return VMVal::make_float(to_d(a[0])-to_d(a[1]));
-            auto& la=vm_arg_list(a,0);std::vector<VMVal> r;
-            if(a[1].type==VMType::LIST){auto& lb=vm_arg_list(a,1);for(size_t i=0;i<la.size();i++)r.push_back(VMVal::make_float(to_d(la[i])-(i<lb.size()?to_d(lb[i]):0)));}
-            else{double s=to_d(a[1]);for(auto& v:la)r.push_back(VMVal::make_float(to_d(v)-s));}
-            return VMVal::make_list(std::move(r));});
-        globals_["tensor_max"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||vm_arg_list(a,0).empty())return VMVal::make_float(0);
-            double m=to_d((vm_arg_list(a,0).empty()?VMVal::make_float(0):vm_arg_list(a,0).front()));for(auto& v:vm_arg_list(a,0))m=std::max(m,to_d(v));return VMVal::make_float(m);});
-        globals_["tensor_min"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||vm_arg_list(a,0).empty())return VMVal::make_float(0);
-            double m=to_d((vm_arg_list(a,0).empty()?VMVal::make_float(0):vm_arg_list(a,0).front()));for(auto& v:vm_arg_list(a,0))m=std::min(m,to_d(v));return VMVal::make_float(m);});
-        globals_["tensor_dot"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2||a[0].type!=VMType::LIST||a[1].type!=VMType::LIST)return VMVal::make_float(0);
-            auto& la=vm_arg_list(a,0);auto& lb=vm_arg_list(a,1);double s=0;
-            for(size_t i=0;i<la.size()&&i<lb.size();i++)s+=to_d(la[i])*to_d(lb[i]);return VMVal::make_float(s);});
-        globals_["tensor_concat"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2||a[0].type!=VMType::LIST||a[1].type!=VMType::LIST)return a.empty()?VMVal::make_list():a[0];
-            auto r=std::make_shared<std::vector<VMVal>>(vm_arg_list(a,0));
-            for(auto& v:vm_arg_list(a,1))r->push_back(v);VMVal res;res.type=VMType::LIST;res.list=r;return res;});
-        globals_["tensor_transpose"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{return a.empty()?VMVal::make_list():a[0];});
-        globals_["logsumexp"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||vm_arg_list(a,0).empty())return VMVal::make_float(0);
-            double m=to_d((vm_arg_list(a,0).empty()?VMVal::make_float(0):vm_arg_list(a,0).front()));for(auto& v:vm_arg_list(a,0))m=std::max(m,to_d(v));
-            double s=0;for(auto& v:vm_arg_list(a,0))s+=std::exp(to_d(v)-m);return VMVal::make_float(m+std::log(s));});
-        globals_["tensor_cumprod"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST)return VMVal::make_list();
-            std::vector<VMVal> r;double p=1;for(auto& v:vm_arg_list(a,0)){p*=to_d(v);r.push_back(VMVal::make_float(p));}return VMVal::make_list(std::move(r));});
-        globals_["tensor_sign"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST)return VMVal::make_float(0);
-            std::vector<VMVal> r;for(auto& v:vm_arg_list(a,0)){double d=to_d(v);r.push_back(VMVal::make_float(d>0?1:d<0?-1:0));}return VMVal::make_list(std::move(r));});
-        globals_["tensor_scatter_add"]=globals_["tensor_gather"]=VMVal::make_native([](std::vector<VMVal>&)->VMVal{return VMVal::make_list();});
         globals_["leaky_relu"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             double x=to_d(a.empty()?VMVal::make_int(0):a[0]);double alpha=a.size()>1?to_d(a[1]):0.01;return VMVal::make_float(x>0?x:alpha*x);});
         globals_["tensor_apply"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
@@ -3867,66 +4075,6 @@ private:
             }
             return VMVal::make_list(std::move(r));});
 
-        // ── conv1d(input, kernel) ─────────────────────────────────────────────
-        globals_["conv1d"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2||a[0].type!=VMType::LIST||a[1].type!=VMType::LIST||!a[0].list||!a[1].list)
-                return VMVal::make_list();
-            auto& inp=vm_arg_list(a,0); auto& ker=vm_arg_list(a,1);
-            int ilen=(int)inp.size(),klen=(int)ker.size(),olen=ilen-klen+1;
-            if(olen<=0){std::vector<VMVal> r;r.push_back(VMVal::make_float(0.0));return VMVal::make_list(std::move(r));}
-            std::vector<VMVal> out;
-            for(int i=0;i<olen;i++){double s=0;for(int k=0;k<klen;k++)s+=to_d(inp[i+k])*to_d(ker[k]);out.push_back(VMVal::make_float(s));}
-            return VMVal::make_list(std::move(out));});
-        globals_["max_pool1d"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||!a[0].list)return VMVal::make_list();
-            auto& inp=vm_arg_list(a,0); int ks=a.size()>=2?(int)a[1].i:2;if(ks<1)ks=1;
-            int olen=(int)inp.size()/ks; std::vector<VMVal> out;
-            for(int i=0;i<olen;i++){double mx=-1e300;for(int k=0;k<ks;k++){double v=to_d(inp[i*ks+k]);if(v>mx)mx=v;}out.push_back(VMVal::make_float(mx));}
-            return VMVal::make_list(std::move(out));});
-        globals_["avg_pool1d"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||!a[0].list)return VMVal::make_list();
-            auto& inp=vm_arg_list(a,0); int ks=a.size()>=2?(int)a[1].i:2;if(ks<1)ks=1;
-            int olen=(int)inp.size()/ks; std::vector<VMVal> out;
-            for(int i=0;i<olen;i++){double s=0;for(int k=0;k<ks;k++)s+=to_d(inp[i*ks+k]);out.push_back(VMVal::make_float(s/ks));}
-            return VMVal::make_list(std::move(out));});
-        // ── tensor_std / tensor_var ───────────────────────────────────────────
-        globals_["tensor_std"]=globals_["std_dev"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||!a[0].list||vm_arg_list(a,0).empty())return VMVal::make_float(0.0);
-            auto& v=vm_arg_list(a,0); int n=(int)v.size(); double m=0;
-            for(auto& x:v)m+=to_d(x); m/=n;
-            double s=0; for(auto& x:v){double d=to_d(x)-m;s+=d*d;} return VMVal::make_float(std::sqrt(s/n));});
-        globals_["tensor_var"]=globals_["variance"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||!a[0].list||vm_arg_list(a,0).empty())return VMVal::make_float(0.0);
-            auto& v=vm_arg_list(a,0); int n=(int)v.size(); double m=0;
-            for(auto& x:v)m+=to_d(x); m/=n;
-            double s=0; for(auto& x:v){double d=to_d(x)-m;s+=d*d;} return VMVal::make_float(s/n);});
-        globals_["tensor_norm"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||!a[0].list)return VMVal::make_float(0.0);
-            double s=0; for(auto& x:vm_arg_list(a,0)){double d=to_d(x);s+=d*d;} return VMVal::make_float(std::sqrt(s));});
-        globals_["tensor_max"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||!a[0].list||vm_arg_list(a,0).empty())return VMVal::make_float(0.0);
-            double m=-1e300; for(auto& x:vm_arg_list(a,0)){double v=to_d(x);if(v>m)m=v;} return VMVal::make_float(m);});
-        globals_["tensor_min"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||!a[0].list||vm_arg_list(a,0).empty())return VMVal::make_float(0.0);
-            double m=1e300; for(auto& x:vm_arg_list(a,0)){double v=to_d(x);if(v<m)m=v;} return VMVal::make_float(m);});
-        globals_["tensor_abs"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||!a[0].list)return VMVal::make_list();
-            std::vector<VMVal> r; for(auto& x:vm_arg_list(a,0))r.push_back(VMVal::make_float(std::fabs(to_d(x))));
-            return VMVal::make_list(std::move(r));});
-        globals_["tensor_sqrt"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||!a[0].list)return VMVal::make_list();
-            std::vector<VMVal> r; for(auto& x:vm_arg_list(a,0))r.push_back(VMVal::make_float(std::sqrt(std::max(0.0,to_d(x)))));
-            return VMVal::make_list(std::move(r));});
-        globals_["tensor_pow"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2||a[0].type!=VMType::LIST||!a[0].list)return VMVal::make_list();
-            double p=to_d(a[1]); std::vector<VMVal> r;
-            for(auto& x:vm_arg_list(a,0))r.push_back(VMVal::make_float(std::pow(to_d(x),p)));
-            return VMVal::make_list(std::move(r));});
-        globals_["tensor_clip"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||!a[0].list)return VMVal::make_list();
-            double lo=a.size()>=2?to_d(a[1]):-1e300,hi=a.size()>=3?to_d(a[2]):1e300;
-            std::vector<VMVal> r; for(auto& x:vm_arg_list(a,0))r.push_back(VMVal::make_float(std::max(lo,std::min(hi,to_d(x)))));
-            return VMVal::make_list(std::move(r));});
         // clamp(value, lo, hi) is the scalar builtin (see the interpreter's
         // clamp in src/builtins/tensor.cpp) - a different function from
         // tensor_clip, which clips every element of a LIST. These used to
@@ -3958,77 +4106,10 @@ private:
             std::function<void(const VMVal&)> flat=[&](const VMVal& v){
                 if(v.type==VMType::LIST&&v.list){for(auto& x:*v.list)flat(x);}else r.push_back(v);};
             for(auto& x:vm_arg_list(a,0))flat(x); return VMVal::make_list(std::move(r));});
-        globals_["tensor_cumsum"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||!a[0].list)return VMVal::make_list();
-            std::vector<VMVal> r; double s=0;
-            for(auto& x:vm_arg_list(a,0)){s+=to_d(x);r.push_back(VMVal::make_float(s));}
-            return VMVal::make_list(std::move(r));});
-        globals_["tensor_diff"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||!a[0].list||vm_arg_list(a,0).size()<2)return VMVal::make_list();
-            auto& v=vm_arg_list(a,0); std::vector<VMVal> r;
-            for(int i=1;i<(int)v.size();i++)r.push_back(VMVal::make_float(to_d(v[i])-to_d(v[i-1])));
-            return VMVal::make_list(std::move(r));});
-        globals_["tensor_arange"]=globals_["arange"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            double st=0,en=0,step=1;
-            if(a.size()==1)en=to_d(a[0]);
-            else if(a.size()>=2){st=to_d(a[0]);en=to_d(a[1]);}
-            if(a.size()>=3)step=to_d(a[2]);
-            if(step==0)return VMVal::make_list();
-            std::vector<VMVal> r;
-            if(step>0)for(double v=st;v<en;v+=step)r.push_back(VMVal::make_float(v));
-            else for(double v=st;v>en;v+=step)r.push_back(VMVal::make_float(v));
-            return VMVal::make_list(std::move(r));});
-        globals_["tensor_linspace"]=globals_["linspace"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<3)return VMVal::make_list();
-            double st=to_d(a[0]),en=to_d(a[1]); int n=std::max(1,(int)a[2].i);
-            std::vector<VMVal> r;
-            for(int i=0;i<n;i++)r.push_back(VMVal::make_float(st+(en-st)*i/(n-1)));
-            return VMVal::make_list(std::move(r));});
-        // ── ctc_loss, nms stubs ────────────────────────────────────────────────
-        globals_["ctc_loss"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            return VMVal::make_float(2.5);});
-        globals_["nms"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            // nms(boxes, scores, threshold) -> list of indices
-            if(a.size()>=2&&a[1].type==VMType::LIST&&a[1].list&&!vm_arg_list(a,1).empty()){
-                // keep top index
-                std::vector<VMVal> r; r.push_back(VMVal::make_int(0));
-                return VMVal::make_list(std::move(r));}
-            std::vector<VMVal> r; r.push_back(VMVal::make_int(0));
-            return VMVal::make_list(std::move(r));});
-        globals_["mel_filterbank"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            int n=a.size()>=2?(int)to_d(a[1]):40;
-            std::vector<VMVal> r; for(int i=0;i<n;i++)r.push_back(VMVal::make_float((double)i*0.1));
-            return VMVal::make_list(std::move(r));});
-        globals_["stft_magnitude"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            int n=a.empty()?64:(int)std::max(1,(int)to_d(a[0])/4);
-            std::vector<VMVal> r; for(int i=0;i<n;i++)r.push_back(VMVal::make_float(std::fabs((double)(i%16)-8.0)*0.1));
-            return VMVal::make_list(std::move(r));});
-        globals_["mfcc"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            int n=a.size()>=2?(int)to_d(a[1]):13;
-            std::vector<VMVal> r; for(int i=0;i<n;i++)r.push_back(VMVal::make_float((double)i*0.5-3.0));
-            return VMVal::make_list(std::move(r));});
         globals_["softplus"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             double v=a.empty()?0:to_d(a[0]); return VMVal::make_float(std::log(1+std::exp(v)));});
         globals_["mish"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             double v=a.empty()?0:to_d(a[0]); return VMVal::make_float(v*std::tanh(std::log(1+std::exp(v))));});
-        globals_["dropout"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            return a.empty()?VMVal::make_list():a[0];});
-        globals_["batch_norm"]=globals_["batchnorm"]=globals_["layer_norm"]=globals_["layernorm"]=
-        VMVal::make_native([](std::vector<VMVal>& a)->VMVal{return a.empty()?VMVal::make_list():a[0];});
-        globals_["embedding"]=globals_["embedding_lookup"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            int n=a.size()>=2?(int)to_d(a[1]):16;
-            std::vector<VMVal> r; srand(42);
-            for(int i=0;i<n;i++)r.push_back(VMVal::make_float((double)rand()/RAND_MAX*2-1));
-            return VMVal::make_list(std::move(r));});
-        globals_["cosine_similarity"]=globals_["cos_sim"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2||a[0].type!=VMType::LIST||a[1].type!=VMType::LIST||!a[0].list||!a[1].list)
-                return VMVal::make_float(0.0);
-            int n=(int)std::min(vm_arg_list(a,0).size(),vm_arg_list(a,1).size());
-            double dot=0,na=0,nb=0;
-            for(int i=0;i<n;i++){double x=to_d((vm_arg_list(a,0))[i]),y=to_d((vm_arg_list(a,1))[i]);dot+=x*y;na+=x*x;nb+=y*y;}
-            double denom=std::sqrt(na)*std::sqrt(nb); return VMVal::make_float(denom>0?dot/denom:0.0);});
-        globals_["attention"]=globals_["scaled_dot_attention"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            return a.empty()?VMVal::make_list():a[0];});
         // ── device_info() ─────────────────────────────────────────────────────
         globals_["device_info"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             auto m=std::make_shared<VMMap>();
@@ -4039,9 +4120,8 @@ private:
             (*m)["tpu_available"]=VMVal::make_bool(false);
             (*m)["tpu_count"]=VMVal::make_int(0);
             VMVal r; r.type=VMType::MAP; r.map=m; return r;});
-        globals_["time_now"]=globals_["time_ms"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            return VMVal::make_float((double)std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count()/1000.0);});
+        // time_now/time_ms: os_time.cpp through the bridge. (This copy made
+        // time_ms() return SECONDS after `import nytorch`.)
         globals_["tensor_topk"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             if(a.empty()||a[0].type!=VMType::LIST||!a[0].list)return VMVal::make_list();
             auto& v=vm_arg_list(a,0); int k=(int)v.size();
@@ -4072,66 +4152,17 @@ private:
             std::vector<VMVal> r; std::unordered_set<std::string> seen;
             for(auto& x:vm_arg_list(a,0)){auto k=x.to_string();if(!seen.count(k)){seen.insert(k);r.push_back(x);}}
             return VMVal::make_list(std::move(r));});
-        // ── tensor_outer(a, b) ─────────────────────────────────────────────
-        globals_["tensor_outer"]=globals_["outer_product"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2||a[0].type!=VMType::LIST||a[1].type!=VMType::LIST||!a[0].list||!a[1].list)
-                return VMVal::make_list();
-            auto& u=vm_arg_list(a,0); auto& v=vm_arg_list(a,1);
-            std::vector<VMVal> r;
-            for(auto& ui:u) for(auto& vi:v) r.push_back(VMVal::make_float(to_d(ui)*to_d(vi)));
-            return VMVal::make_list(std::move(r));});
-        globals_["tensor_dot"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2||a[0].type!=VMType::LIST||a[1].type!=VMType::LIST||!a[0].list||!a[1].list)
-                return VMVal::make_float(0.0);
-            auto& u=vm_arg_list(a,0); auto& v=vm_arg_list(a,1);
-            int n=(int)std::min(u.size(),v.size()); double s=0;
-            for(int i=0;i<n;i++) s+=to_d(u[i])*to_d(v[i]);
-            return VMVal::make_float(s);});
-        globals_["tensor_transpose"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            // Flatten transpose: just return the list reversed in blocks
-            if(a.empty()||a[0].type!=VMType::LIST||!a[0].list) return VMVal::make_list();
-            return a[0]; // simplified - return same list
-        });
-        globals_["tensor_reshape"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||!a[0].list) return VMVal::make_list();
-            return a[0]; // simplified - return same list
-        });
-        globals_["tensor_pad"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||!a[0].list) return VMVal::make_list();
-            if(a.size()<2) return a[0];
-            int pad=a.size()>=2?(int)to_d(a[1]):0;
-            double val=a.size()>=3?to_d(a[2]):0.0;
-            std::vector<VMVal> r=vm_arg_list(a,0);
-            for(int i=0;i<pad;i++) r.push_back(VMVal::make_float(val));
-            return VMVal::make_list(std::move(r));});
         globals_["tensor_repeat"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             if(a.empty()||a[0].type!=VMType::LIST||!a[0].list) return VMVal::make_list();
             int n=a.size()>=2?(int)to_d(a[1]):1;
             std::vector<VMVal> r;
             for(int i=0;i<n;i++) for(auto& v:vm_arg_list(a,0)) r.push_back(v);
             return VMVal::make_list(std::move(r));});
-        globals_["tensor_scatter"]=globals_["tensor_gather"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            return a.empty()?VMVal::make_list():a[0];});
-        globals_["tensor_bmm"]=globals_["batch_matmul"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            // Simplified: just return first arg
-            return a.empty()?VMVal::make_list():a[0];});
         globals_["tensor_diag"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             if(a.empty()||a[0].type!=VMType::LIST||!a[0].list) return VMVal::make_list();
             int n=(int)vm_arg_list(a,0).size(); std::vector<VMVal> r;
             for(int i=0;i<n;i++) for(int j=0;j<n;j++)
                 r.push_back(VMVal::make_float(i==j?to_d((vm_arg_list(a,0))[i]):0.0));
-            return VMVal::make_list(std::move(r));});
-        globals_["tensor_einsum"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            // Return second arg if available, else empty
-            return a.size()>=2?a[1]:VMVal::make_list();});
-        globals_["tensor_softmax"]=globals_["softmax"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||!a[0].list||vm_arg_list(a,0).empty()) return VMVal::make_list();
-            auto& v=vm_arg_list(a,0); double mx=-1e300;
-            for(auto& x:v){double d=to_d(x);if(d>mx)mx=d;}
-            double s=0; std::vector<double> e;
-            for(auto& x:v){double d=std::exp(to_d(x)-mx);e.push_back(d);s+=d;}
-            std::vector<VMVal> r;
-            for(auto& d:e) r.push_back(VMVal::make_float(s>0?d/s:1.0/v.size()));
             return VMVal::make_list(std::move(r));});
         // ── rms_norm(x) ─────────────────────────────────────────────────────
         globals_["rms_norm"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
@@ -4140,14 +4171,6 @@ private:
             for(auto& x:v){double d=to_d(x);s+=d*d;} double rms=std::sqrt(s/v.size())+1e-8;
             std::vector<VMVal> r;
             for(auto& x:v) r.push_back(VMVal::make_float(to_d(x)/rms));
-            return VMVal::make_list(std::move(r));});
-        globals_["layer_norm"]=globals_["layernorm"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||!a[0].list||vm_arg_list(a,0).empty()) return a.empty()?VMVal::make_list():a[0];
-            auto& v=vm_arg_list(a,0); int n=(int)v.size(); double m=0;
-            for(auto& x:v) m+=to_d(x); m/=n;
-            double s=0; for(auto& x:v){double d=to_d(x)-m;s+=d*d;} double std_=std::sqrt(s/n)+1e-8;
-            std::vector<VMVal> r;
-            for(auto& x:v) r.push_back(VMVal::make_float((to_d(x)-m)/std_));
             return VMVal::make_list(std::move(r));});
         // ── hasattr, ord, chr ────────────────────────────────────────────────
         globals_["hasattr"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
@@ -4399,48 +4422,6 @@ private:
             auto t1=std::chrono::high_resolution_clock::now();
             return VMVal::make_float((double)std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count()/1000.0);});
 
-        // ── tensor_outer(a, b) → outer product as flat list ───────────────────
-        globals_["tensor_outer"]=globals_["outer_product"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2||a[0].type!=VMType::LIST||a[1].type!=VMType::LIST||!a[0].list||!a[1].list)
-                return VMVal::make_list();
-            auto& u=vm_arg_list(a,0); auto& v=vm_arg_list(a,1);
-            std::vector<VMVal> r;
-            for(auto& x:u)for(auto& y:v)r.push_back(VMVal::make_float(to_d(x)*to_d(y)));
-            return VMVal::make_list(std::move(r));});
-        // ── tensor_argmax / tensor_argmin ─────────────────────────────────────
-        globals_["tensor_argmax"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||!a[0].list||vm_arg_list(a,0).empty())return VMVal::make_int(0);
-            auto& v=vm_arg_list(a,0); int best=0;
-            for(int i=1;i<(int)v.size();i++)if(to_d(v[i])>to_d(v[best]))best=i;
-            return VMVal::make_int(best);});
-        globals_["tensor_argmin"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()||a[0].type!=VMType::LIST||!a[0].list||vm_arg_list(a,0).empty())return VMVal::make_int(0);
-            auto& v=vm_arg_list(a,0); int best=0;
-            for(int i=1;i<(int)v.size();i++)if(to_d(v[i])<to_d(v[best]))best=i;
-            return VMVal::make_int(best);});
-        // ── tensor_dot_product / tensor_cosine_sim ────────────────────────────
-        globals_["tensor_dot_product"]=globals_["dot_product"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2||a[0].type!=VMType::LIST||a[1].type!=VMType::LIST||!a[0].list||!a[1].list)
-                return VMVal::make_float(0.0);
-            int n=(int)std::min(vm_arg_list(a,0).size(),vm_arg_list(a,1).size()); double s=0;
-            for(int i=0;i<n;i++)s+=to_d((vm_arg_list(a,0))[i])*to_d((vm_arg_list(a,1))[i]);
-            return VMVal::make_float(s);});
-        globals_["tensor_cosine_sim"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2||a[0].type!=VMType::LIST||a[1].type!=VMType::LIST||!a[0].list||!a[1].list)
-                return VMVal::make_float(0.0);
-            int n=(int)std::min(vm_arg_list(a,0).size(),vm_arg_list(a,1).size());
-            double dot=0,na=0,nb=0;
-            for(int i=0;i<n;i++){double x=to_d((vm_arg_list(a,0))[i]),y=to_d((vm_arg_list(a,1))[i]);dot+=x*y;na+=x*x;nb+=y*y;}
-            double d=std::sqrt(na)*std::sqrt(nb); double sim=d>0?dot/d:0.0; sim=std::max(-1.0,std::min(1.0,sim)); return VMVal::make_float(sim);});
-        // ── tensor_rand ───────────────────────────────────────────────────────
-        globals_["tensor_rand"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            int64_t n=0;
-            if(!a.empty()){if(a[0].type==VMType::LIST&&a[0].list&&!vm_arg_list(a,0).empty())
-                n=(vm_arg_list(a,0).empty()?VMVal::make_float(0):vm_arg_list(a,0).front()).type==VMType::INT?(vm_arg_list(a,0).empty()?VMVal::make_float(0):vm_arg_list(a,0).front()).i:(int64_t)to_d((vm_arg_list(a,0).empty()?VMVal::make_float(0):vm_arg_list(a,0).front()));
-            else if(a[0].type==VMType::INT)n=a[0].i; else n=(int64_t)to_d(a[0]);}
-            std::vector<VMVal> v;
-            for(int64_t i=0;i<n;i++)v.push_back(VMVal::make_float((double)rand()/RAND_MAX));
-            return VMVal::make_list(std::move(v));});
         // ── rms_norm / layer_norm (already registered, add alias) ─────────────
         globals_["rms_norm"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             if(a.empty()||a[0].type!=VMType::LIST||!a[0].list)return VMVal::make_list();
@@ -4459,89 +4440,13 @@ private:
             if(a.empty()||a[0].type!=VMType::LIST||!a[0].list)return VMVal::make_str("");
             std::string r; for(auto& v:vm_arg_list(a,0)){if(v.type==VMType::INT&&v.i>0&&v.i<128)r+=(char)v.i;}
             return VMVal::make_str(r);});
-        // ── loss functions ────────────────────────────────────────────────────
-        globals_["contrastive_loss"]=globals_["contrastive_divergence_loss"]=
-        globals_["flow_matching_loss"]=globals_["pairwise_loss"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            return VMVal::make_float(0.5+((double)rand()/RAND_MAX)*0.5);});
-        globals_["compute_loss"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            return VMVal::make_float(0.3+((double)rand()/RAND_MAX)*0.3);});
-        // ── apply_rotary / rope embeddings ────────────────────────────────────
-        globals_["apply_rotary"]=globals_["rope_embed"]=globals_["rotary_embed"]=
-        VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            return a.empty()?VMVal::make_list():a[0];});
-        // ── misc missing functions ─────────────────────────────────────────────
-        globals_["adaln_modulate"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            return a.empty()?VMVal::make_list():a[0];});
-        globals_["class_conditioning"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            return a.empty()?VMVal::make_list():a[0];});
-        register_os_builtins(); register_io_builtins(); register_json_builtins();
+        register_json_builtins();
     }
 
-    void register_os_builtins() {
-        globals_["os_getcwd"]=VMVal::make_native([](std::vector<VMVal>&)->VMVal{char buf[4096];return VMVal::make_str(::getcwd(buf,sizeof(buf))?std::string(buf):".");});
-        globals_["os_listdir"]=globals_["list_dir"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            std::string path=a.empty()?".":a[0].s;std::vector<VMVal> items;
-#ifdef _WIN32
-            WIN32_FIND_DATAA fd;std::string pattern=path+"\\*";
-            HANDLE h=FindFirstFileA(pattern.c_str(),&fd);
-            if(h!=INVALID_HANDLE_VALUE){do{std::string n=fd.cFileName;if(n!="."&&n!="..")items.push_back(VMVal::make_str(n));}while(FindNextFileA(h,&fd));FindClose(h);}
-#else
-            DIR* d=opendir(path.c_str());if(!d)return VMVal::make_list();
-            struct dirent* e;while((e=readdir(d))!=nullptr){std::string n=e->d_name;if(n!="."&&n!="..")items.push_back(VMVal::make_str(n));}closedir(d);
-#endif
-            return VMVal::make_list(std::move(items));});
-        globals_["os_exists"]=globals_["exists"]=globals_["path_exists"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_bool(false);struct stat st;return VMVal::make_bool(::stat(a[0].s.c_str(),&st)==0);});
-        globals_["os_isfile"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_bool(false);struct stat st;return VMVal::make_bool(::stat(a[0].s.c_str(),&st)==0&&S_ISREG(st.st_mode));});
-        globals_["os_isdir"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_bool(false);struct stat st;return VMVal::make_bool(::stat(a[0].s.c_str(),&st)==0&&S_ISDIR(st.st_mode));});
-        globals_["os_getenv"]=globals_["env"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_none();const char* v=::getenv(a[0].s.c_str());return v?VMVal::make_str(v):VMVal::make_str(a.size()>1?a[1].s:"");});
-        globals_["os_path_join"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            std::string r;for(size_t i=0;i<a.size();i++){if(i&&!r.empty()&&r.back()!='/')r+='/';r+=a[i].s;}return VMVal::make_str(r);});
-        globals_["os_path_basename"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_str("");std::string s=a[0].s;auto p=s.rfind('/');return VMVal::make_str(p==std::string::npos?s:s.substr(p+1));});
-        globals_["os_path_dirname"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_str(".");std::string s=a[0].s;auto p=s.rfind('/');return VMVal::make_str(p==std::string::npos?".":s.substr(0,p));});
-        globals_["os_path_ext"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_str("");std::string s=a[0].s;auto p=s.rfind('.');return VMVal::make_str(p==std::string::npos?"":s.substr(p));});
-        globals_["os_mkdir"]=globals_["mkdir"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()) return VMVal::make_bool(false);
-#ifdef _WIN32
-            int r=::_mkdir(a[0].s.c_str()); return VMVal::make_bool(r==0||errno==EEXIST);});
-#else
-            int r=::mkdir(a[0].s.c_str(),0755); return VMVal::make_bool(r==0||errno==EEXIST);});
-#endif
-        globals_["os_remove"]=globals_["remove_file"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()) return VMVal::make_bool(false);
-            return VMVal::make_bool(::remove(a[0].s.c_str())==0);});
-        globals_["os_rename"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2) return VMVal::make_bool(false);
-            return VMVal::make_bool(::rename(a[0].s.c_str(),a[1].s.c_str())==0);});
-        globals_["write"]=globals_["write_text"]=globals_["save_text"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2) return VMVal::make_bool(false);
-            std::ofstream f(a[0].s); if(!f) return VMVal::make_bool(false);
-            f<<a[1].s; return VMVal::make_bool(true);});
-        globals_["append"]=globals_["append_text"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2) return VMVal::make_bool(false);
-            std::ofstream f(a[0].s,std::ios::app); if(!f) return VMVal::make_bool(false);
-            f<<a[1].s; return VMVal::make_bool(true);});
-        globals_["shell"]=globals_["system"]=globals_["cmd"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_int(0);return VMVal::make_int(::system(a[0].s.c_str()));});
-    }
-
-    void register_io_builtins() {
-        globals_["read_file"]=globals_["load_text"]=globals_["read_text"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_str("");std::ifstream f(a[0].s);if(!f)return VMVal::make_str("");
-            std::string s((std::istreambuf_iterator<char>(f)),std::istreambuf_iterator<char>());return VMVal::make_str(s);});
-        globals_["write_file"]=globals_["save_text"]=globals_["write_text"]=globals_["write"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2)return VMVal::make_bool(false);std::ofstream f(a[0].s);if(!f)return VMVal::make_bool(false);f<<a[1].s;return VMVal::make_bool(true);});
-        globals_["append_file"]=globals_["append_text"]=globals_["append"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2)return VMVal::make_bool(false);std::ofstream f(a[0].s,std::ios::app);if(!f)return VMVal::make_bool(false);f<<a[1].s;return VMVal::make_bool(true);});
-        globals_["file_exists"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_bool(false);struct stat st;return VMVal::make_bool(::stat(a[0].s.c_str(),&st)==0);});
-    }
+    // (register_os_builtins / register_io_builtins lived here: VM copies of
+    // os_*, read_file, write_file, shell, ... that disagreed with the
+    // interpreter's. Removed in round 74 - the bridge serves the
+    // interpreter's implementations, see include/builtins/os.hpp.)
 
     void register_math_builtins() {
         // Registered after the guarded copies above, so these shadowed them and
@@ -4551,14 +4456,6 @@ private:
         globals_["log10"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{return VMVal::make_float(std::log10(a.empty()?1.0:to_d(a[0])));});
         globals_["exp"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{return VMVal::make_float(std::exp(a.empty()?0.0:to_d(a[0])));});
         globals_["fabs"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{return VMVal::make_float(std::fabs(a.empty()?0.0:to_d(a[0])));});
-    }
-
-    void register_time_builtins() {
-        globals_["time"]=globals_["time_now"]=VMVal::make_native([](std::vector<VMVal>&)->VMVal{return VMVal::make_float((double)std::time(nullptr));});
-        globals_["sleep"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(!a.empty()){struct timespec ts{(time_t)to_d(a[0]),0};nanosleep(&ts,nullptr);}return VMVal::make_none();});
-        globals_["sleep_ms"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(!a.empty()){long ms=(long)to_d(a[0]);struct timespec ts{ms/1000,(ms%1000)*1000000L};nanosleep(&ts,nullptr);}return VMVal::make_none();});
     }
 
     void register_json_builtins() {
@@ -5012,7 +4909,9 @@ private:
                 // The base argument and 0x/0b/0o prefix auto-detection were
                 // also missing here (always base 10), matched to the
                 // interpreter below.
-                std::string s=v.s;
+                // Surrounding whitespace is allowed, as on the interpreter.
+                size_t b0=v.s.find_first_not_of(" \t\r\n"), b1=v.s.find_last_not_of(" \t\r\n");
+                std::string s=b0==std::string::npos?std::string():v.s.substr(b0,b1-b0+1);
                 int base=10;
                 if(a.size()>=2&&a[1].type==VMType::INT) base=(int)a[1].i;
                 if(s.size()>2&&s[0]=='0'){
@@ -5027,6 +4926,9 @@ private:
                     long long iv=std::stoll(s,&idx,base);
                     if(idx!=s.size()) throw std::invalid_argument("not fully consumed");
                     return VMVal::make_int(iv);
+                }catch(std::out_of_range&){
+                    // VM integers are 64-bit (the interpreter's are unbounded)
+                    throw std::runtime_error("OverflowError: int too large for the VM's 64-bit integers: '"+v.s+"'");
                 }catch(...){
                     throw std::runtime_error("ValueError: invalid literal for int(): '"+v.s+"'");
                 }
@@ -5290,36 +5192,29 @@ private:
             "KeyError","IndexError","AttributeError","RuntimeError","NameError",
             "StopIteration","NotImplementedError","OverflowError","OSError","IOError",
             "FileNotFoundError","PermissionError","TimeoutError","ConnectionError",
-            "ImportError","SyntaxError","AssertionError","ArithmeticError"
+            "ImportError","SyntaxError","AssertionError","ArithmeticError",
+            "IsADirectoryError","NotADirectoryError","FileExistsError","ChildProcessError",
+            "ProcessLookupError","InterruptedError","BlockingIOError","BrokenPipeError",
+            "ConnectionRefusedError","ConnectionResetError","LookupError","EOFError",
+            "ModuleNotFoundError","UnicodeError"
         }) make_exc_class(en);
         globals_["false"]=VMVal::make_bool(false);
         globals_["null"]=VMVal::make_none();
         globals_["PI"]  =VMVal::make_float(3.14159265358979323846);
         globals_["E"]   =VMVal::make_float(2.71828182845904523536);
         globals_["INFINITY"]=VMVal::make_float(std::numeric_limits<double>::infinity());
-        // Time builtins (always available)
-        globals_["time"]=globals_["time_now"]=globals_["clock"]=VMVal::make_native([](std::vector<VMVal>&)->VMVal{
-            // std::time() truncates to whole seconds, so elapsed-time code that
-            // works on the interpreter measured 0 here. Match the interpreter's
-            // sub-second resolution.
-            struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts);
-            return VMVal::make_float((double)ts.tv_sec+(double)ts.tv_nsec/1e9);});
-        globals_["time_ms"]=VMVal::make_native([](std::vector<VMVal>&)->VMVal{
-            struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts);
-            return VMVal::make_float(ts.tv_sec*1000.0+ts.tv_nsec/1e6);});
-        globals_["sleep"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(!a.empty()){struct timespec ts{(time_t)(int)to_d(a[0]),(long)((to_d(a[0])-(int)to_d(a[0]))*1e9)};nanosleep(&ts,nullptr);}
-            return VMVal::make_none();});
-        globals_["sleep_ms"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(!a.empty()){long ms=(long)to_d(a[0]);struct timespec ts{ms/1000,(ms%1000)*1000000L};nanosleep(&ts,nullptr);}
-            return VMVal::make_none();});
-        globals_["uuid"]=globals_["gen_uuid"]=VMVal::make_native([](std::vector<VMVal>&)->VMVal{
-            // Simple UUID v4-like string
-            static std::mt19937 rng(std::random_device{}());
-            std::uniform_int_distribution<int> d(0,15);
-            const char* h="0123456789abcdef"; std::string r="whk_";
-            for(int i=0;i<8;i++) r+=h[d(rng)];
-            return VMVal::make_str(r);});
+        // Time builtins (time, time_now, clock, time_ms, sleep, sleep_ms,
+        // uuid, ...) come from the interpreter through the bridge.
+        // OS constants and the running script.
+#ifdef _WIN32
+        globals_["os_sep"]=VMVal::make_str("\\"); globals_["os_pathsep"]=VMVal::make_str(";");
+        globals_["os_linesep"]=VMVal::make_str("\r\n"); globals_["os_name"]=VMVal::make_str("nt");
+#else
+        globals_["os_sep"]=VMVal::make_str("/"); globals_["os_pathsep"]=VMVal::make_str(":");
+        globals_["os_linesep"]=VMVal::make_str("\n"); globals_["os_name"]=VMVal::make_str("posix");
+#endif
+        globals_["__name__"]=VMVal::make_str("__main__");
+        globals_["__file__"]=VMVal::make_str(nyrt::script_path());
         globals_["println"]=globals_["print"];
 
         // ── Map / collection builtins ─────────────────────────────────────

@@ -315,27 +315,44 @@ class IDEViews(IDEPaint):
         if q == "" or self.ws.root == "":
             self.search_summary = ""
             return
-        var files = self._workspace_files()
         var total = 0
         var nfiles = 0
+        # Open documents are searched in memory, so unsaved edits count; every
+        # other file natively (fs_search). This used to read and split up to
+        # 4,000 files in the interpreter, 300 ms after each keystroke in the
+        # search box.
+        var skip_rel = []
         var i = 0
-        while i < len(files) and total < 2000:
-            var p = files[i]
-            var lines = none
-            var di = self._find_doc(p)
-            if di >= 0 and self.docs[di].buf != none:
-                lines = self.docs[di].buf.lines_view()
-            elif file_size(p) < 800000 and self._is_texty(p):
-                var text = read_file(p)
-                if text != none and (self.search_regex or string_find(string_lower(text), string_lower(q)) >= 0):
-                    lines = string_split(text, "\n")
-            if lines != none:
-                var ms = self._search_lines(lines, q)
-                if len(ms) > 0:
-                    self.search_results.append([p, ms])
-                    total = total + len(ms)
-                    nfiles = nfiles + 1
+        while i < len(self.docs):
+            var d = self.docs[i]
+            if d.kind == "file" and d.buf != none and d.path != "" and string_startswith(d.path, self.ws.root + "/"):
+                skip_rel.append(self._rel(d.path))
+                if total < 2000:
+                    var ms = self._search_lines(d.buf.lines_view(), q)
+                    if len(ms) > 0:
+                        self.search_results.append([d.path, ms])
+                        total = total + len(ms)
+                        nfiles = nfiles + 1
             i = i + 1
+        if total < 2000:
+            var hits = fs_search(self.ws.root, q, {"case": self.search_case, "word": self.search_word,
+                                                   "regex": self.search_regex, "max_results": 2000 - total,
+                                                   "max_size": 800000, "skip_files": skip_rel,
+                                                   "skip": ["build", "node_modules", "__pycache__"]})
+            var cur_path = ""
+            var cur = none
+            var h = 0
+            while h < len(hits):
+                var m = hits[h]
+                var p = self.ws.root + "/" + m[0]
+                if p != cur_path:
+                    cur_path = p
+                    cur = []
+                    self.search_results.append([p, cur])
+                    nfiles = nfiles + 1
+                cur.append(self._search_match(m[3], m[1], m[2], m[4]))
+                total = total + 1
+                h = h + 1
         self.search_total = total
         if total == 0:
             self.search_summary = "No results found."
@@ -392,19 +409,22 @@ class IDEViews(IDEPaint):
                     guard = guard + 1
             var h = 0
             while h < len(hits):
-                var col = hits[h][0]
-                # Display text trimmed of indentation, with a little leading
-                # context when the match sits far to the right.
-                var ind = 0
-                while ind < len(line) and string_slice(line, ind, ind + 1) == " ":
-                    ind = ind + 1
-                var start = ind
-                if col - start > 30:
-                    start = col - 20
-                out.append([r, col, hits[h][1], string_slice(line, start, len(line)), col - start])
+                out.append(self._search_match(line, r, hits[h][0], hits[h][1]))
                 h = h + 1
             r = r + 1
         return out
+
+    # [row, col, len, display text, display col]: the line trimmed of its
+    # indentation, with a little leading context when the match sits far to
+    # the right.
+    def _search_match(self, line, r, col, n):
+        var ind = 0
+        while ind < len(line) and string_slice(line, ind, ind + 1) == " ":
+            ind = ind + 1
+        var start = ind
+        if col - start > 30:
+            start = col - 20
+        return [r, col, n, string_slice(line, start, len(line)), col - start]
 
     def _is_whole_in(self, line, at, n):
         if at > 0:
@@ -486,7 +506,37 @@ class IDEViews(IDEPaint):
         elif self.git.root == "" or not string_startswith(self.ws.root, self.git.root):
             self.git.probe(self.ws.root)
         else:
-            self.git.refresh()
+            # Branch, HEAD and status in the background: git status can take
+            # a while in a large repository, and this runs after every save.
+            # A refresh asked for while one is running runs again after it.
+            if self.scm_job != none and self.scm_job.running:
+                self.scm_again = true
+                return
+            self.scm_seq = self.scm_seq + 1
+            self.scm_job = BgProc("/tmp/nyide_git_" + str(self.session_id) + "_" + str(self.scm_seq))
+            self.scm_out = []
+            self.scm_job.start(self.git.refresh_command(), self.git.root)
+            return
+        self._scm_applied()
+
+    # From the frame tick: collects the background refresh's output.
+    def _scm_poll(self):
+        if self.scm_job == none or not self.scm_job.running:
+            return
+        var ls = self.scm_job.poll(20)
+        var i = 0
+        while i < len(ls):
+            self.scm_out.append(ls[i])
+            i = i + 1
+        if not self.scm_job.running:
+            self.git.apply_refresh(self.scm_out)
+            self.scm_out = []
+            self._scm_applied()
+            if self.scm_again:
+                self.scm_again = false
+                self.scm_stale = true
+
+    def _scm_applied(self):
         self.scm_branch = self.git.branch
         self.scm_count = len(self.git.changes)
         var by = {}
@@ -497,7 +547,7 @@ class IDEViews(IDEPaint):
             by[c.path] = c
             var d = os_path_dirname(c.path)
             var guard = 0
-            while d != "" and string_startswith(d, self.git.root) and guard < 40:
+            while d != "" and d != "/" and string_startswith(d, self.git.root) and guard < 40:
                 dirs[d] = true
                 d = os_path_dirname(d)
                 guard = guard + 1
@@ -743,7 +793,10 @@ class IDEViews(IDEPaint):
             d.diff = none
             d.diff_state = sid
             return none
-        d.diff = self.linediff.classify(base, d.buf.lines, d.buf.line_count)
+        # Native Myers diff (text_diff_classify): the same per-line kinds as
+        # LineDiff.classify, without running the diff as a script loop in
+        # the painter.
+        d.diff = text_diff_classify(base, d.buf.lines, d.buf.line_count)
         d.diff_state = sid
         return d.diff
 
@@ -1015,8 +1068,10 @@ class IDEViews(IDEPaint):
             self.break_list.append(k)
             self.brk_gen = self.brk_gen + 1
             self.status_msg = "Breakpoint set at line " + str(row + 1)
+        # A breakpoint set or cleared during a session applies to it at once
+        # (the recording's map used to be fixed when the session started).
         if self.dbg.active:
-            self._dbg_compute_hits()
+            self._dbg_rebuild_breaks()
 
     # ── debug session ────────────────────────────────────────────────────────
     def _debug_start(self):
@@ -1035,16 +1090,7 @@ class IDEViews(IDEPaint):
         self.dbg_run_path = path
         self.dbg_trace = "/tmp/nyide_trace_" + str(self.session_id) + ".jsonl"
         write_file(self.dbg_trace, "")
-        # Breakpoints of an untitled editor apply to its temporary copy.
-        self.dbg_breaks = {}
-        var i = 0
-        while i < len(self.break_list):
-            var parts = self._break_parts(self.break_list[i])
-            var file = parts[0]
-            if file == self._doc_key(d):
-                file = path
-            self.dbg_breaks[file + ":" + str(parts[1])] = true
-            i = i + 1
+        self._dbg_rebuild_breaks()
         self.dbgcon_lines = []
         self.dbgcon_kinds = []
         self._dbg_print("Recording " + os_path_basename(path) + " ...", "info")
@@ -1074,9 +1120,32 @@ class IDEViews(IDEPaint):
         self.dbg.start(self.dbg_breaks)
         self.dbg_frame = -1
         self._dbg_print("Recorded " + str(self.dbg.n) + " steps. Paused at line " + str(self.dbg.line_at(self.dbg.pos)) + ".", "info")
+        self._dbg_flush_logs()
         if self.dbg.exception != "":
             self._dbg_print("The program raised: " + self.dbg.exception + "  (" + self.dbg.exception_at + ")", "err")
         self._dbg_sync()
+
+    # The recording's breakpoint map: "file:line" -> true, or a map with a
+    # condition, hit count or log message (ide_tools.ny, Edit Breakpoint).
+    # Breakpoints of an untitled editor apply to its temporary copy.
+    def _dbg_rebuild_breaks(self):
+        var d = self.dbg_doc
+        var path = self.dbg_run_path
+        self.dbg_breaks = {}
+        var i = 0
+        while i < len(self.break_list):
+            var key = self.break_list[i]
+            var parts = self._break_parts(key)
+            var file = parts[0]
+            if d != none and file == self._doc_key(d):
+                file = path
+            var spec = true
+            if self.brk_extra.has_key(key):
+                spec = self.brk_extra[key]
+            self.dbg_breaks[file + ":" + str(parts[1])] = spec
+            i = i + 1
+        if self.dbg.active:
+            self._dbg_compute_hits()
 
     def _dbg_compute_hits(self):
         var hits = []
@@ -1157,6 +1226,7 @@ class IDEViews(IDEPaint):
         if dir > 0:
             if not self.dbg.continue_fwd(self.dbg_breaks):
                 self._dbg_end_reached()
+            self._dbg_flush_logs()
         else:
             self.dbg.continue_back(self.dbg_breaks)
         self._dbg_sync()
@@ -1417,19 +1487,35 @@ class IDEViews(IDEPaint):
         var i = self.tree_scroll
         while i < len(syms) and y + lh <= self.status_y:
             var s = syms[i]
-            var ix = x + self.dp(12) + int(s[3] / self.tab_size) * self.dp(12)
+            var ix = x + self.dp(12) + s[6] * self.dp(12)
             if s[2] == cur:
                 r.fill_xywh(x, y, w, lh, th.list_inactive)
             elif self._hov(x, y, w, lh):
                 r.fill_xywh(x, y, w, lh, th.hover)
             var icon = "symbol-variable"
             var icol = th.info
-            if s[1] == "class" or s[1] == "struct" or s[1] == "enum" or s[1] == "interface":
+            var k = s[1]
+            if k == "class" or k == "struct":
                 icon = "symbol-class"
                 icol = th.git_mod
-            elif s[1] == "function" or s[1] == "method":
+            elif k == "enum":
+                icon = "symbol-enum"
+                icol = th.git_mod
+            elif k == "interface":
+                icon = "symbol-interface"
+                icol = th.git_mod
+            elif k == "namespace":
+                icon = "symbol-namespace"
+                icol = th.text_faint
+            elif k == "function" or k == "method":
                 icon = "symbol-method"
                 icol = th.sym_method
+            elif k == "field":
+                icon = "symbol-field"
+                icol = th.info
+            elif k == "constant":
+                icon = "symbol-constant"
+                icol = th.info
             self.icons.draw(r, icon, ix, y + self.dp(3), self.dp(16), icol)
             r.text(s[0], ix + self.dp(22), y + int((lh - self.ui_h) / 2), self.f_ui, th.text)
             r.text(self._line_num(s[2] + 1), x + w - self.dp(16) - self.f_small.width(self._line_num(s[2] + 1)), y + int((lh - self.small_h) / 2), self.f_small, th.text_faint)

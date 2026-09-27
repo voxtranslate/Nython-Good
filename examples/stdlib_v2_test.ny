@@ -106,7 +106,7 @@ t("mtx_lock", mutex_lock(mtx), true)
 t("mtx_unlock", mutex_unlock(mtx), true)
 var sem = semaphore_create(1)
 t("sem1_acq", semaphore_acquire(sem), true)
-t("sem1_block", semaphore_acquire(sem), false)
+t("sem1_block", semaphore_try_acquire(sem), false)   # blocking acquire would wait forever (round 74)
 semaphore_release(sem)
 t("sem1_reacq", semaphore_acquire(sem), true)
 

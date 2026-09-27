@@ -24,6 +24,8 @@ import traceback
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ide_driver import IDE, DriverError  # noqa: E402
 
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 APP = 'def greet(name):\n    return "hi " + name\n\nprint(greet("bob"))\n'
 UTIL = 'def twice(x):\n    return x * 2\n'
 LOOP = ('def total(n):\n    s = 0\n    i = 0\n    while i < n:\n        s = s + i\n        i = i + 1\n'
@@ -986,6 +988,562 @@ def sc_dead_clicks_views(s):
     c(not all_dead, "deadclick views: every clickable does something", all_dead)
 
 
+# ── Code::Blocks-side features (ide_tools.ny) ──────────────────────────────
+def palette(s, label):
+    """Runs a command by its palette label (Category: Title)."""
+    ide = s.ide
+    ide.key("ctrl+shift+p")
+    ide.type(label)
+    st = ide.state()
+    first = st["qi_items"][0] if st["qi_items"] else ""
+    ide.key("enter")
+    return first
+
+
+def wait_log(s, needle, key="build_log", tries=80):
+    for _ in range(tries):
+        st = s.ide.state()
+        if any(needle in ln for ln in st.get(key, [])):
+            return st
+        time.sleep(0.1)
+    return s.ide.state()
+
+
+def sc_build(s):
+    ide = s.start()
+    c = s.res.check
+    s.write("bad.ny", "def f(:\n    pass\n")
+    s.open_file("app.ny")
+    ide.key("ctrl+shift+b")
+    st = wait_log(s, "=== Build")
+    log = st["build_log"]
+    c(any("Build: Debug" in ln for ln in log), "build: log names the target", log[:3])
+    c(any("=== Build failed: 1 error(s)" in ln for ln in log), "build: one error found", log[-3:])
+    c(any("bad.ny:" in ln and "error" in ln for ln in log), "build: error line in the log", log)
+    c(st["errors"] >= 1 and st["panel"] == "problems", "build: failure opens Problems", (st["errors"], st["panel"]))
+    s.write("bad.ny", "def f():\n    pass\n")
+    time.sleep(1.2)
+    ide.key("ctrl+shift+b")
+    st = wait_log(s, "=== Build finished")
+    c(any("=== Build finished: 0 error(s)" in ln for ln in st["build_log"]), "build: clean build", st["build_log"][-2:])
+    c(st["errors"] == 0, "build: problems cleared", st["errors"])
+    # Build and Run
+    first = palette(s, "Build: Build and Run")
+    c(first == "Build: Build and Run", "build: palette finds Build and Run", first)
+    ok = False
+    for _ in range(80):
+        if ide.snap().has("hi bob", exact=True):
+            ok = True
+            break
+        time.sleep(0.1)
+    c(ok, "build: Build and Run runs the program after a clean build")
+    # targets: arguments, environment, engine, pre-build step
+    s.write("args.ny", 'print("env", getenv("GREETING"))\n')
+    s.write("proj.nyproj", "name = proj\ntarget = args.ny\n[target Debug]\nengine = interp\nenv = GREETING=hey\npre = echo pre > pre_ran.txt\n"
+                           "[target Release]\nengine = vm\nenv = GREETING=vm-hey\n")
+    time.sleep(1.2)
+    palette(s, "Build: Select Target...")
+    st = ide.state()
+    c(any("Debug" in x for x in st["qi_items"]) and any("Release" in x for x in st["qi_items"]),
+      "build: target picker lists the project's targets", st["qi_items"])
+    ide.key("escape")
+    ide.key("ctrl+shift+b")
+    wait_log(s, "=== Build")
+    c(os.path.exists(os.path.join(s.ws, "pre_ran.txt")), "build: pre-build step ran")
+    palette(s, "Build: Run Target")
+    ok = False
+    for _ in range(80):
+        if ide.snap().has("env hey", exact=True):
+            ok = True
+            break
+        time.sleep(0.1)
+    c(ok, "build: Run Target uses the target's main file and environment")
+    palette(s, "Build: Select Target...")
+    ide.type("Release\n")
+    st = ide.state()
+    c(st["build_target"] == "Release", "build: target selected", st["build_target"])
+    palette(s, "Build: Run Target")
+    ok = False
+    for _ in range(80):
+        if ide.snap().has("env vm-hey", exact=True):
+            ok = True
+            break
+        time.sleep(0.1)
+    c(ok, "build: the Release target runs on the VM with its own environment")
+    c("build_target = Release" in s.read(".nyide"), "build: selected target saved in .nyide", "")
+    # Abort a program that never ends, with Shift+F5 (it used to do nothing)
+    s.write("forever.ny", "var i = 0\nwhile true:\n    i = i + 1\n")
+    s.open_file("forever.ny")
+    ide.key("ctrl+f5")
+    time.sleep(0.8)
+    ide.key("shift+f5")
+    ok = False
+    for _ in range(60):
+        if ide.snap().has("[process stopped]", exact=True):
+            ok = True
+            break
+        time.sleep(0.1)
+    c(ok, "build: Shift+F5 stops a running program")
+
+
+def sc_cb_editing(s):
+    ide = s.start()
+    c = s.res.check
+    s.write("ed.ny", "def one():\n    return 1\n\ndef two():\n    return 2\n\nclass K:\n    def m(self):\n        return 3\n")
+    st = s.open_file("ed.ny")
+    # bookmarks
+    ide.key("ctrl+home")
+    ide.key("ctrl+alt+k")
+    ide.key("ctrl+g")
+    ide.type("7\n")
+    ide.key("ctrl+alt+k")
+    st = ide.state()
+    c(st["bookmarks"] == [0, 6], "cb: two bookmarks set", st["bookmarks"])
+    ide.key("ctrl+alt+l")
+    st = ide.state()
+    c(st["row"] == 0, "cb: next bookmark wraps to the first", st["row"])
+    ide.key("ctrl+alt+j")
+    st = ide.state()
+    c(st["row"] == 6, "cb: previous bookmark wraps to the last", st["row"])
+    ide.key("ctrl+home")
+    ide.key("enter")
+    st = ide.state()
+    c(st["bookmarks"] == [1, 7], "cb: bookmarks move with inserted lines", st["bookmarks"])
+    ide.key("ctrl+z")
+    # folding
+    ide.key("ctrl+home")
+    ide.key("ctrl+shift+[")
+    st = ide.state()
+    c(st["folds"] == [0] and st["vis_rows"] == st["text"].count("\n") + 1 - 1, "cb: fold hides the body", (st["folds"], st["vis_rows"]))
+    ide.key("down")
+    st = ide.state()
+    c(st["row"] == 2, "cb: Down steps over the folded body", st["row"])
+    ide.key("ctrl+k")
+    ide.key("ctrl+0")
+    st = ide.state()
+    c(len(st["folds"]) == 3, "cb: Fold All folds every top-level region", st["folds"])
+    ide.key("ctrl+g")
+    ide.type("9\n")
+    st = ide.state()
+    c(st["row"] == 8 and 6 not in st["folds"], "cb: jumping into a fold unfolds it", (st["row"], st["folds"]))
+    ide.key("ctrl+k")
+    ide.key("ctrl+j")
+    st = ide.state()
+    c(st["folds"] == [], "cb: Unfold All", st["folds"])
+    # the gutter chevron folds too
+    hm = ide.hitmap()
+    fold = [h for h in hm if h[4] == "@gutter.fold"]
+    c(len(fold) == 1, "cb: folding column in the gutter", len(fold))
+    if fold:
+        x, y, w, h = fold[0][:4]
+        ide.click(x + w // 2, y + 8)
+        st = ide.state()
+        c(st["folds"] == [0], "cb: clicking the chevron folds the region", st["folds"])
+        ide.click(x + w // 2, y + 8)
+        st = ide.state()
+        c(st["folds"] == [], "cb: clicking again unfolds", st["folds"])
+    # abbreviations
+    ide.key("ctrl+end")
+    ide.type("\ndef")
+    ide.key("tab")
+    ide.type("go")
+    ide.key("tab")
+    ide.type("a, b")
+    ide.key("tab")
+    ide.type("return a")
+    st = ide.state()
+    c("def go(a, b):\n    return a" in st["text"], "cb: def<Tab> expands and Tab walks the stops", st["text"][-60:])
+    # overwrite mode, one undo step per typed character
+    ide.key("ctrl+home")
+    ide.key("insert")
+    ide.type("DEF")
+    st = ide.state()
+    c(st["text"].startswith("DEF one()") and st["overwrite"], "cb: overwrite mode replaces characters", st["text"][:12])
+    ide.key("insert")
+    st = ide.state()
+    c(not st["overwrite"], "cb: Insert toggles back to insert mode", st["overwrite"])
+    ide.key("ctrl+z")
+    st = ide.state()
+    c(st["text"].startswith("def one()"), "cb: one undo restores the overtyped word", st["text"][:12])
+    # case, duplicate, transpose
+    ide.key("ctrl+home")
+    palette(s, "Edit: Transform to Uppercase")
+    st = ide.state()
+    c(st["text"].startswith("DEF one"), "cb: uppercase the word at the caret", st["text"][:10])
+    ide.key("ctrl+z")
+    ide.key("ctrl+home")
+    palette(s, "Edit: Duplicate Selection")
+    st = ide.state()
+    c(st["text"].startswith("def one():\ndef one():"), "cb: duplicate line without a selection", st["text"][:24])
+    ide.key("ctrl+z")
+    ide.key("ctrl+g")
+    ide.type("2\n")
+    palette(s, "Edit: Transpose Lines")
+    st = ide.state()
+    c(st["text"].startswith("    return 1\ndef one():") and st["row"] == 1, "cb: transpose swaps with the line above", st["text"][:26])
+    ide.key("ctrl+z")
+    # format
+    s.write("messy.ny", "def f( a,b ):\n  x=a+b\n  if x==3:\n        return x\n\n\n\n  return 0  \n")
+    s.open_file("messy.ny")
+    ide.key("shift+alt+f")
+    st = ide.state()
+    # The file is indented with two spaces, so that is the unit it keeps.
+    c(st["text"] == "def f( a, b ):\n  x = a+b\n  if x == 3:\n    return x\n\n  return 0\n", "cb: Format Document", st["text"])
+    ide.key("ctrl+z")
+    st = ide.state()
+    c(st["text"].startswith("def f( a,b ):\n  x=a+b"), "cb: format undoes in one step", st["text"][:20])
+    # Ctrl+wheel zoom
+    f0 = ide.state()["font_size"]
+    hm = ide.hitmap()
+    ed = [h for h in hm if h[4] == "@editor"][0]
+    ide.wheel(ed[0] + 50, ed[1] + 50, 1)
+    st = ide.state()
+    c(st["font_size"] == f0, "cb: plain wheel does not zoom", st["font_size"])
+    ide.wheel(ed[0] + 50, ed[1] + 50, 1, "ctrl")
+    st = ide.state()
+    c(st["font_size"] > f0, "cb: Ctrl+wheel zooms in", (f0, st["font_size"]))
+    ide.wheel(ed[0] + 50, ed[1] + 50, -1, "ctrl")
+    st = ide.state()
+    c(st["font_size"] == f0, "cb: Ctrl+wheel back zooms out", (f0, st["font_size"]))
+
+
+def sc_cb_tools(s):
+    ide = s.start()
+    c = s.res.check
+    s.write("todo.ny", "def f():\n    # TODO(ana): first\n    s = \"# FIXME not a comment\"\n    return 1  # FIXME: second\n")
+    s.open_file("todo.ny")
+    palette(s, "View: TODO List")
+    st = ide.state()
+    c(st["panel"] == "todo" and st["todo_n"] == 2, "tools: TODO list finds comments, not strings", (st["panel"], st["todo_n"]))
+    f = ide.snap()
+    c(f.has("first", exact=True) and f.has("(ana)", exact=True), "tools: TODO text and owner shown")
+    # code statistics
+    palette(s, "Tools: Code Statistics")
+    st = ide.state()
+    c(st["title"] == "Code Statistics" and "Total lines:" in st["text"] and "todo.ny" in st["text"], "tools: code statistics document", st["title"])
+    # class wizard
+    palette(s, "Tools: New Class...")
+    ide.type("ShoppingCart\n")
+    ide.type("\n")
+    ide.type("items, owner\n")
+    ide.state()
+    p = os.path.join(s.ws, "shopping_cart.ny")
+    c(os.path.exists(p), "tools: class wizard writes shopping_cart.ny")
+    if os.path.exists(p):
+        body = open(p).read()
+        c("class ShoppingCart:" in body and "self.items = items" in body and "def __str__" in body, "tools: class skeleton", body[:200])
+        r = subprocess.run([os.path.join(REPO, "build", "nython-cli"), p], capture_output=True, text=True, timeout=30)
+        c(r.returncode == 0, "tools: generated class file runs", r.stderr[-300:])
+    # user tool with macros, and an environment variable
+    s.write(".nyide", "tool = Echo file | echo tool-ran $(FILE_NAME) $GREET\nenv = GREET=hello\n")
+    palette(s, "Tools: Configure Tools...")
+    st = ide.state()
+    c(st["title"] == ".nyide", "tools: Configure Tools opens the settings file", st["title"])
+    ide.key("ctrl+s")
+    s.open_file("todo.ny")
+    first = palette(s, "Tools: Echo file")
+    c(first == "Tools: Echo file", "tools: user tool in the palette", first)
+    ok = False
+    for _ in range(60):
+        if ide.snap().has("tool-ran todo.ny hello", exact=True):
+            ok = True
+            break
+        time.sleep(0.1)
+    c(ok, "tools: tool runs with macros expanded and the environment set")
+    # keymap: Code::Blocks
+    palette(s, "Preferences: Keymap...")
+    ide.type("Code::Blocks\n")
+    st = ide.state()
+    c(st["keymap"] == "codeblocks", "tools: Code::Blocks keymap selected", st["keymap"])
+    ide.key("ctrl+f9")
+    st = wait_log(s, "=== Build")
+    c(any("=== Build" in ln for ln in st["build_log"]), "tools: Ctrl+F9 builds in the Code::Blocks keymap", st["build_log"][-1:])
+    ide.key("ctrl+home")
+    ide.key("ctrl+d")
+    st = ide.state()
+    c(st["text"].startswith("def f():\ndef f():"), "tools: Ctrl+D duplicates the line (Code::Blocks)", st["text"][:20])
+    ide.key("ctrl+z")
+    c("keymap = codeblocks" in s.read(".nyide"), "tools: keymap saved", "")
+    # rebind a command by pressing the key
+    palette(s, "Preferences: Change Keybinding...")
+    ide.type("Toggle Bookmark")
+    ide.key("enter")
+    st = ide.state()
+    c(st["modal"], "tools: key capture dialog", st["modal_title"])
+    ide.key("ctrl+alt+m")
+    ide.key("enter")
+    st = ide.state()
+    c(not st["modal"], "tools: capture confirmed", st["modal_msg"])
+    ide.key("ctrl+home")
+    ide.key("ctrl+alt+m")
+    st = ide.state()
+    c(st["bookmarks"] == [0], "tools: rebound key toggles a bookmark", st["bookmarks"])
+    c("keybinding = Ctrl+Alt+M | nython.bookmarks.toggle" in s.read(".nyide"), "tools: rebinding saved", "")
+
+
+def sc_cb_debug(s):
+    ide = s.start()
+    c = s.res.check
+    s.write("cnt.ny", "var total = 0\nvar i = 0\nwhile i < 6:\n    total = total + i\n    i = i + 1\nprint(\"done\", total)\n")
+    s.open_file("cnt.ny")
+    ide.key("ctrl+g")
+    ide.type("4\n")
+    palette(s, "Run: Edit Breakpoint...")
+    ide.type("Condition\n")
+    ide.type("i == 3\n")
+    ide.key("ctrl+g")
+    ide.type("5\n")
+    palette(s, "Run: Edit Breakpoint...")
+    ide.type("Log Message\n")
+    ide.type("i is {i}\n")
+    ide.key("f5")
+    st = s.wait_until(lambda st: st["dbg_state"] == "paused")
+    c(st["dbg_state"] == "paused" and st["dbg_line"] == 4, "debug-cb: conditional breakpoint stops", (st["dbg_state"], st["dbg_line"]))
+    f = ide.snap()
+    c(f.has("cnt.ny:5: i is 0", exact=True) and f.has("cnt.ny:5: i is 2", exact=True) and not f.has("cnt.ny:5: i is 3", exact=True),
+      "debug-cb: log points passed before the stop print to the debug console")
+    ide.key("ctrl+g")
+    ide.type("6\n")
+    palette(s, "Debug: Run to Cursor")
+    st = ide.state()
+    c(st["dbg_state"] == "paused" and st["dbg_line"] == 6, "debug-cb: run to cursor", (st["dbg_state"], st["dbg_line"]))
+    f = ide.snap()
+    c(f.has("cnt.ny:5: i is 5", exact=True), "debug-cb: log points on the way to the cursor print too")
+    ide.key("shift+f5")
+
+
+def sc_responsive(s):
+    ide = s.start()
+    c = s.res.check
+    s.open_file("app.ny")
+    ide.resize(480, 360)
+    ide.wait(10)
+    st = ide.state()
+    c(st["menu_compact"], "responsive: menus fold into a hamburger", st["menu_compact"])
+    c(st["side_overlay"], "responsive: side bar floats over the editor", st["side_overlay"])
+    hm = ide.hitmap()
+    ham = [h for h in hm if h[4] == "@menu"]
+    c(len(ham) == 1, "responsive: one menu button", len(ham))
+    if ham:
+        ide.click(ham[0][0] + 10, ham[0][1] + 10)
+        f = ide.snap()
+        c(f.has("Build", exact=True) and f.has("Tools", exact=True), "responsive: hamburger lists the menus")
+        ide.click_text("Edit")
+        f = ide.snap()
+        c(f.has("Undo", exact=True), "responsive: picking a menu opens it")
+        ide.key("escape")
+    # clicking beside the floating side bar closes it
+    ide.click(440, 200)
+    st = ide.state()
+    c(not st["sidebar"], "responsive: click outside closes the floating side bar", st["sidebar"])
+    # overflowing panel tabs
+    hm = ide.hitmap()
+    more = [h for h in hm if h[4] == "@panel.more"]
+    c(len(more) == 1, "responsive: panel tabs overflow into ...", len(more))
+    if more:
+        ide.click(more[0][0] + 5, more[0][1] + 5)
+        ide.click_text("BUILD LOG")
+        st = ide.state()
+        c(st["panel"] == "buildlog", "responsive: hidden panel reachable from ...", st["panel"])
+    ide.resize(1600, 960)
+    ide.wait(10)
+    st = ide.state()
+    c(not st["menu_compact"] and not st["side_overlay"], "responsive: full layout returns", (st["menu_compact"], st["side_overlay"]))
+    f = ide.snap()
+    c(f.has("Terminal", exact=True) and f.has("Help", exact=True), "responsive: menus back on the bar")
+
+
+def sc_session(s):
+    ide = s.start()
+    c = s.res.check
+    s.open_file("app.ny")
+    ide.key("ctrl+g")
+    ide.type("2\n")
+    ide.key("ctrl+p")
+    ide.type("util.ny\n")
+    st = ide.state()
+    c(st["title"] == "util.ny", "session: second file open", st["title"])
+    s.ide = None
+    ide.close()
+    ide.cleanup()
+    ide2 = s.start()
+    st = ide2.state()
+    c("app.ny" in st["tabs"] and "util.ny" in st["tabs"], "session: editors reopened", st["tabs"])
+    c(st["title"] == "util.ny", "session: active editor restored", st["title"])
+
+
+def sc_column_select(s):
+    ide = s.start()
+    c = s.res.check
+    s.write("cols.ny", "alpha = 1\nbeta  = 2\ngo\ndelta = 4\n")
+    s.open_file("cols.ny")
+    # Keyboard: Ctrl+Shift+Alt+Down x3, Right x5 selects a 4x5 box.
+    ide.key("ctrl+home")
+    for _ in range(3):
+        ide.key("ctrl+shift+alt+down")
+    for _ in range(5):
+        ide.key("ctrl+shift+alt+right")
+    st = ide.state()
+    c(st["carets"] == 4, "column: one selection per row", st["carets"])
+    ide.key("ctrl+c")
+    st = ide.state()
+    c(st["clipboard"] == "alpha\nbeta \ngo\ndelta", "column: copy keeps the box's rows (short line clipped)", repr(st["clipboard"]))
+    # Typing replaces every row's piece; one undo restores all of them.
+    ide.type("X")
+    st = ide.state()
+    c(st["text"] == "X = 1\nX = 2\nX\nX = 4\n", "column: typing replaces each row", repr(st["text"]))
+    ide.key("ctrl+z")
+    st = ide.state()
+    c(st["text"] == "alpha = 1\nbeta  = 2\ngo\ndelta = 4\n", "column: one undo step", repr(st["text"]))
+    # Mouse: Shift+Alt+drag from row 0 col 0 to row 1 col 5, then cut.
+    hm = ide.hitmap()
+    ed = [h for h in hm if h[4] == "@editor"][0]
+    ide.key("escape")
+    ide.key("ctrl+home")
+    a = ide.find("alpha", region=(ed[0], ed[1], ed[2], ed[3]))
+    b = ide.find("beta", region=(ed[0], ed[1], ed[2], ed[3]))
+    cw = a.w / 5.0
+    ide.send("move %d %d" % (int(a.x) + 1, int(a.cy)))
+    ide.send("down %d %d 1 shift+alt" % (int(a.x) + 1, int(a.cy)))
+    ide.send("move %d %d" % (int(a.x + cw * 3), int(b.cy)))
+    ide.send("move %d %d" % (int(a.x + cw * 5), int(b.cy)))
+    ide.send("up %d %d 1 shift+alt" % (int(a.x + cw * 5), int(b.cy)))
+    st = ide.state()
+    c(st["carets"] == 2, "column: Shift+Alt+drag selects a box", st["carets"])
+    ide.key("ctrl+x")
+    st = ide.state()
+    c(st["text"] == " = 1\n = 2\ngo\ndelta = 4\n" and st["clipboard"] == "alpha\nbeta ", "column: cut removes every row's piece", (repr(st["text"]), repr(st["clipboard"])))
+    # Paste spreads one line per caret.
+    ide.key("ctrl+v")
+    st = ide.state()
+    c(st["text"] == "alpha = 1\nbeta  = 2\ngo\ndelta = 4\n", "column: paste spreads the lines over the carets", repr(st["text"]))
+    ide.key("escape")
+    # Column selection mode: Shift+arrows make boxes.
+    palette(s, "Selection: Column Selection Mode")
+    ide.key("ctrl+home")
+    ide.key("shift+down")
+    ide.key("shift+right")
+    ide.key("shift+right")
+    st = ide.state()
+    c(st["carets"] == 2 and st["sel_text"] == "be", "column: Shift+arrows in column mode", (st["carets"], st["sel_text"]))
+    palette(s, "Selection: Column Selection Mode")
+    ide.key("escape")
+    ide.key("ctrl+home")
+    ide.key("shift+down")
+    st = ide.state()
+    c(st["carets"] == 1 and st["sel_text"] == "alpha = 1\n", "column: mode off gives a normal selection", (st["carets"], repr(st["sel_text"])))
+
+
+def sc_split(s):
+    ide = s.start()
+    c = s.res.check
+    body = "".join("r%d_x = %d\n" % (i, i) for i in range(1, 121))
+    s.write("long.ny", body)
+    s.open_file("long.ny")
+    ide.key("ctrl+\\")
+    st = ide.state()
+    c(st["split"] == "cols" and st["group"] == 1, "split: Ctrl+\\ splits right and focuses the new group", (st["split"], st["group"]))
+    hm = ide.hitmap()
+    eds = [h for h in hm if h[4] == "@editor"]
+    other = [h for h in hm if h[4] == "@group.focus"]
+    c(len(eds) == 2 and len(other) == 1, "split: two editors, the other group clickable", (len(eds), len(other)))
+    left = tuple(other[0][:4]) if other else (0, 0, 1, 1)
+    right = tuple(eds[-1][:4]) if eds else (0, 0, 1, 1)
+    # Each group keeps its own place in the same file.
+    ide.key("ctrl+g")
+    ide.type("100\n")
+    st = ide.state()
+    c(st["row"] == 99, "split: go to line in the right group", st["row"])
+    f = ide.snap()
+    c(f.has("r1_x", exact=True, region=left) and not f.has("r100_x", exact=True, region=left)
+      and f.has("r100_x", exact=True, region=right), "split: each group shows its own part of the file")
+    # Typing in one group shows in the other (same buffer).
+    ide.key("home")
+    ide.type("EDITED")
+    ide.key("ctrl+1")
+    st = ide.state()
+    c(st["group"] == 0 and st["row"] == 0, "split: Ctrl+1 focuses the first group, its caret kept", (st["group"], st["row"]))
+    f = ide.snap()
+    c(f.has("EDITEDr100_x", exact=True, region=right) and not f.has("EDITEDr100_x", exact=True, region=left),
+      "split: the edit shows in the other group, which kept its scroll")
+    ide.key("ctrl+g")
+    ide.type("100\n")
+    f = ide.snap()
+    c(f.has("EDITEDr100_x", exact=True, region=left), "split: the same edit in the first group")
+    ide.key("ctrl+2")
+    ide.key("ctrl+z")
+    ide.key("ctrl+1")
+    # Open a different file in the focused group.
+    s.open_file("app.ny")
+    st = ide.state()
+    c(st["title"] == "app.ny" and st["group"] == 0, "split: opening a file uses the focused group", (st["title"], st["group"]))
+    # Clicking the other group focuses it and places the caret there.
+    hm = ide.hitmap()
+    other = [h for h in hm if h[4] == "@group.focus"]
+    if other:
+        x, y, w, h = other[0][:4]
+        ide.click(x + w // 2, y + h // 2)
+        st = ide.state()
+        c(st["group"] == 1 and st["title"] == "long.ny", "split: clicking the other group focuses it", (st["group"], st["title"]))
+    # Stacked layout, then the sash, then join.
+    ide.key("shift+alt+0")
+    st = ide.state()
+    c(st["split"] == "rows", "split: toggle to a stacked layout", st["split"])
+    hm = ide.hitmap()
+    sash = [h for h in hm if h[4] == "@split.sash"]
+    c(len(sash) == 1, "split: one sash", len(sash))
+    if sash:
+        x, y, w, h = sash[0][:4]
+        ide.drag(x + w // 2, y + h // 2, x + w // 2, y + h // 2 - 120)
+        st = ide.state()
+        c(st["split_ratio"] < 0.45, "split: dragging the sash resizes the groups", st["split_ratio"])
+    palette(s, "View: Join Editor Groups")
+    st = ide.state()
+    c(st["split"] == "" and len([h for h in ide.hitmap() if h[4] == "@editor"]) == 1, "split: join back to one group", st["split"])
+
+
+def sc_window_events(s):
+    ide = s.start()
+    c = s.res.check
+    # A file dropped on the window opens in an editor.
+    ide.send("drop " + os.path.join(s.ws, "src", "util.ny"))
+    st = ide.state()
+    c(st["title"] == "util.ny", "window: a dropped file opens", st["title"])
+    # Text dropped on the editor is inserted where it lands.
+    hm = ide.hitmap()
+    ed = [h for h in hm if h[4] == "@editor"][0]
+    ide.send("move %d %d" % (ed[0] + 2, ed[1] + 4))
+    ide.send("droptext DROPPED")
+    st = ide.state()
+    c(st["text"].startswith("DROPPED"), "window: dropped text is inserted in the editor", st["text"][:20])
+    # auto_save = onFocusChange saves dirty files when the window loses focus.
+    s.write(".nyide", "auto_save = onFocusChange\n")
+    palette(s, "Tools: Configure Tools...")
+    ide.key("ctrl+s")
+    s.open_file("app.ny")
+    ide.key("ctrl+end")
+    ide.type("# unsaved")
+    st = ide.state()
+    c(st["dirty"], "window: edit makes the file dirty", st["dirty"])
+    ide.send("focus 0")
+    ide.send("focus 1")
+    st = ide.state()
+    c(not st["dirty"] and s.read("app.ny").endswith("# unsaved"), "window: leaving the window saves (onFocusChange)", st["dirty"])
+    # A dropped folder becomes the workspace.
+    other = os.path.join(s.root, "other")
+    os.makedirs(other)
+    with open(os.path.join(other, "o.ny"), "w") as f:
+        f.write("print(1)\n")
+    ide.send("drop " + other)
+    ok = False
+    for _ in range(40):
+        if ide.snap().has("o.ny", exact=True):
+            ok = True
+            break
+        time.sleep(0.1)
+    c(ok, "window: a dropped folder opens as the workspace")
+
+
 SCENARIOS = [
     ("boot", sc_boot), ("edit", sc_edit_undo_save), ("clipboard", sc_clipboard_lines),
     ("multicursor", sc_multicursor), ("palette", sc_palette), ("quickopen", sc_quick_open),
@@ -993,7 +1551,10 @@ SCENARIOS = [
     ("explorer", sc_explorer_ops), ("close", sc_close_dirty), ("terminal", sc_terminal),
     ("run", sc_run), ("problems", sc_syntax_problems), ("debug", sc_debugger), ("scm", sc_scm),
     ("search", sc_search), ("views", sc_views_layout), ("deadclicks", sc_dead_clicks),
-    ("deadviews", sc_dead_clicks_views),
+    ("deadviews", sc_dead_clicks_views), ("build", sc_build), ("cbedit", sc_cb_editing),
+    ("cbtools", sc_cb_tools), ("cbdebug", sc_cb_debug), ("responsive", sc_responsive),
+    ("session", sc_session), ("columns", sc_column_select),
+    ("split", sc_split), ("window", sc_window_events),
 ]
 
 

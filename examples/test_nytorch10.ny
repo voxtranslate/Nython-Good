@@ -1,6 +1,4 @@
-import nytorch
-import "lib/nytorch/storage.ny"
-import "lib/nytorch/serving.ny"
+import "lib/nytorch.ny"
 
 print "=== NyTorch v3.0 Part 10 Test Suite ==="
 
@@ -27,7 +25,7 @@ tcp_close(cli_fd)
 srv.stop()
 print "SocketServer.PASS"
 
-# --- HttpServer request parsing ---
+# --- AgentHttpServer request parsing ---
 print "--- HTTP Parse Test ---"
 var raw_req = "GET /health?fmt=json HTTP/1.1\r\nHost: localhost\r\n\r\n"
 var parsed = http_parse_request(raw_req)
@@ -36,17 +34,17 @@ print "HTTP path: " + parsed["path"]
 print "HTTP query: " + parsed["query"]
 print "HTTP parse.PASS"
 
-# --- HttpServer serve one ---
-print "--- HttpServer Test ---"
-var http_srv = HttpServer(20001)
+# --- AgentHttpServer serve one ---
+print "--- AgentHttpServer Test ---"
+var http_srv = AgentHttpServer(20001)
 var hs_ok = http_srv.start()
-print "HttpServer started: " + str(hs_ok)
+print "AgentHttpServer started: " + str(hs_ok)
 
 var cl2 = tcp_connect("127.0.0.1", 20001, 2000)
 tcp_send(cl2, "GET /ping HTTP/1.0\r\nHost: localhost\r\n\r\n")
 
 var ctx = http_srv.handle_one(1000)
-print "HttpServer got request: " + str(ctx != none)
+print "AgentHttpServer got request: " + str(ctx != none)
 if ctx != none:
     var req2 = ctx["req"]
     var fd2 = ctx["fd"]
@@ -57,7 +55,7 @@ var pong = tcp_recv_all(cl2, 1000)
 print "Client got response: " + str(pong != none)
 tcp_close(cl2)
 http_srv.stop()
-print "HttpServer.PASS"
+print "AgentHttpServer.PASS"
 
 # --- AgentServer ---
 print "--- AgentServer Test ---"

@@ -28,7 +28,7 @@ from ide_driver import IDE  # noqa: E402
 # KB of resident memory kept, per unit. Measured when these were set:
 # idle 0.0, hover 0.0, typing ~40, scroll ~7 (before this round's fixes:
 # 3.45, 40, 787 and 161).
-CEILINGS = {"idle": 0.5, "hover": 2.0, "typing": 50.0, "scroll": 12.0}
+CEILINGS = {"idle": 0.5, "hover": 2.0, "typing": 50.0, "scroll": 12.0, "split": 2.0}
 
 
 def rss_kb(pid):
@@ -97,12 +97,27 @@ def main(argv):
                 ide.wheel(900, 400, -3 if (i // 40) % 2 == 0 else 3)
                 ide.wait(1)
         results["scroll"] = measure(ide, scroll, 160, 80)
+
+        # Two editor groups repaint on every hover: swapping the other
+        # group's view in to paint it must not allocate either.
+        # Measured against plain hover at the same point in the process's
+        # life (once the allocator's slack is used up, every input event's
+        # map shows in RSS - see GC_NOTES), so the number is what painting
+        # the second group adds.
+        t = ide.find("app.ny")
+        ide.dblclick(int(t.cx), int(t.cy))
+        settle(ide)
+        base = measure(ide, hover, 150, 60)
+        ide.key("ctrl+\\")
+        settle(ide)
+        sp = measure(ide, hover, 150, 60)
+        results["split"] = (sp[0] - base[0], sp[1], sp[2])
     finally:
         ide.close()
         ide.cleanup()
         shutil.rmtree(root, ignore_errors=True)
     bad = []
-    for k in ["idle", "hover", "typing", "scroll"]:
+    for k in ["idle", "hover", "typing", "scroll", "split"]:
         per, b, a = results[k]
         unit = "frame" if k == "idle" else ("event" if k != "typing" else "key")
         flag = ""

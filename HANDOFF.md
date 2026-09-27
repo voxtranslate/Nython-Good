@@ -3,12 +3,510 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: end of round 73. **§0d** is this round: the IDE rebuilt to
-VS Code's model and — for the first time — verified by driving the real
-binary with mouse and keyboard input, which found and fixed defects in the
-IDE, the runtime and both engines. Earlier rounds: §0/§0b language-level
-work, §5.3 terminal command line / undo / multi-cursor (71b/71c), §0c
-nytorch autograd (72), §5.10 nytorch class-name collisions.
+Last updated: round 74. This round is **§0e** (IDE responsiveness: native
+text services and a responsive layout ladder; the Code::Blocks feature set;
+non-throwing control flow on both engines; the build system) and **§0f**
+(the OS layer: files, paths, processes, environment and time, with one
+implementation for both engines) **§0g** (threads, synchronisation and
+async on both engines) and **§0h** (nytorch: one native tensor engine for
+both engines, real models). §0d is
+round 73 (the IDE to VS Code's model, verified by driving it). Earlier
+rounds: §0/§0b language-level work, §5.3 terminal command line / undo /
+multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
+collisions.
+
+---
+
+## 0e. Round 74 — responsive IDE, Code::Blocks features, faster engines
+
+The request: make the IDE "totally responsive", bring in features from
+Code::Blocks, and fix what is missing or broken across the GUI, nytorch,
+OS, the language, threads/mutexes/synchronisation and async.
+
+### Build (commit 9f8c96e)
+
+Every translation unit except `main.cpp` is the same in the IDE and CLI
+builds, so they are compiled once into `build/obj/`; `main.cpp` is built per
+flavour (`main_ide.o`, `main_cli.o`). `-MMD -MP` records header
+dependencies: editing a header rebuilds exactly the objects that include it,
+so the stale-object trap in §4 no longer needs `make clean`. Both binaries
+build in about 1.5–2.5 minutes.
+
+### Engines: return/break/continue without C++ exceptions (f284623)
+
+A call to a one-line function cost ~20 µs on the interpreter and ~70 µs on
+the VM, because every `return` threw a C++ exception, and every
+`break`/`continue` threw a `std::string`. callgrind put 80% (interpreter)
+and 92% (VM) of a call loop in the unwinder.
+
+- **VM**: `RETURN_VALUE` returns from `run_loop`; each `run_loop` runs
+  exactly one frame. Yields set `GenState.yielded` and return.
+- **Interpreter**: a thread-local `FlowState` (`pending` = return / break /
+  continue, plus the value). Blocks, `if` and every loop check it after each
+  statement. `evalBody` at the function-body call sites and the loops
+  consume it. Constructs that must see a real exception (try/with/switch/
+  class/namespace/import/macro) suspend the fast path (`SuspendFast`).
+- 100k calls: interpreter 2341 → 371 ms (function) and 3554 → 485 ms
+  (method); VM 7240 → 121 ms and 6414 → 180 ms.
+- Found on the way: `while`/`repeat` on the interpreter swallowed every
+  exception raised in their body. They now rethrow.
+
+### Interpreter: inherited methods read as values (9f8c96e)
+
+`obj.method` evaluated to `none` when the method was inherited, although
+calling it worked. The IDE registers `self.on_resize` (defined in a base
+class) as its resize callback, so **resizing never relaid out the
+workbench**. `evalAttribute` now walks the bases depth-first (an MRO walk).
+
+### Responsiveness (294c5a6)
+
+Measured with the headless driver on an 1,800-line file:
+
+| | before | after |
+|---|---|---|
+| keystroke | 381 ms | 34 ms |
+| scroll step | 72 ms | 37 ms |
+| window resize | 81 ms | 29 ms |
+
+About 16 ms of each "after" figure is frame pacing. Memory kept
+(`ide_memprobe.py`): idle 0, hover 0, typing ~18 KB/key, scroll ~8 KB/event.
+
+The profile showed where the time went:
+
+- **Completion** rebuilt its candidates by walking every line on every key.
+- **Syntax checking** spawned a second interpreter and waited for it.
+- **The SCM gutter** ran Myers diff as a script loop inside the painter.
+- **Search, Quick Open, workspace symbols and go-to-definition** read and
+  split every file in the interpreter.
+
+All of that is now in **`src/builtins/text.cpp`**, on both engines and
+pinned by `examples/vm_audit51.ny`:
+
+- `ny_symbols`: a tolerant outline with class bases, method parameters,
+  fields, variables, constants and depth.
+- `ny_check_syntax` / `ny_check_file`: the real lexer and parser, in process.
+- `text_diff` / `text_diff_classify`: Myers diff. `text_diff_classify`
+  agrees with `LineDiff.classify` on 60 random edits.
+- `fs_list_files`, `fs_search` (case / word / regex, include / exclude
+  globs), `fs_symbols`, `fs_todos` and `fs_line_stats` for the workspace.
+- `text_fold_ranges` (indentation blocks and `# region`), `text_line_stats`,
+  `text_todos` and `text_format_nython`.
+- A **completion index** (`ac_index_*`). Candidates stay in C++ and come
+  back as cached strings, so a keystroke allocates one result list.
+
+**Layout ladder.** Each step has hysteresis, so resizing across a threshold
+does not flicker:
+
+- The side bar floats over the editor, with a shadow and light dismiss,
+  when the editor would be narrower than 360 dp.
+- The menus fold into a hamburger that lists the menus and has a way back.
+- The command centre shrinks, then hides.
+- Activity-bar views and panel tabs that do not fit move to a `...` menu.
+- Status-bar items drop lowest priority first.
+
+### Code::Blocks features (`ide_tools.ny`, class `IDETools` in the chain)
+
+These are Code::Blocks' everyday features, rebuilt around this IDE's own
+models rather than copied:
+
+- **Build targets** come from `[target Name]` sections in `*.nyproj`
+  (`main`, `engine` = interp/vm, `args`, `cwd`, `env`, `pre`, `post`).
+  Build, Rebuild, Clean, Build and Run, Run Target and Abort (Shift+F5).
+  - The build is *time-sliced*: `_build_step` checks one file per slice
+    within an 8 ms budget from the frame tick, with `ny_check_file` in
+    process, so the IDE keeps drawing while it builds.
+  - Errors go to Problems and to a **Build Log** panel.
+  - The selected target is saved in `.nyide`.
+- **Bookmarks** (Ctrl+Alt+K / L / J, gutter icon, context menu) and
+  **folds** move with inserted and deleted lines. A mark carries down with
+  its text when Enter is pressed before it, as Scintilla's markers do.
+- **Code folding**: gutter chevrons, Ctrl+Shift+[ / ], Fold All, Unfold All
+  and fold by level. Scrolling, the caret, go-to, the minimap and clicks
+  all work in visual rows. A folded body shows a `...` marker that unfolds
+  when clicked, and jumping into a fold opens it.
+- **Abbreviations**: 20 snippets plus user snippets from `.nyide`, with tab
+  stops written `$<n:text>` (`${}` would be string interpolation in Nython).
+  They appear in the completion list with an exact prefix first, as in VS
+  Code. While tab stops are active, suggestions do not open by themselves
+  (VS Code's `snippetsPreventQuickSuggestions`), and Escape leaves snippet
+  mode.
+- **Editing**:
+  - Insert/overwrite (Insert key, an OVR status item). A run of overtyping
+    undoes as one step.
+  - Duplicate, transpose, upper / lower / title case.
+  - Format Document / Selection (Shift+Alt+F) in the file's own
+    indentation unit, as one undo step.
+- **Column (box) selection**: Shift+Alt+drag, middle-button drag,
+  Ctrl+Shift+Alt+arrows, or *Column Selection Mode* (Shift+arrows and plain
+  drags select rectangles, like Code::Blocks' Alt+drag). The box is two
+  corners in text-area pixels, so tabs line up by what is on screen. Each
+  row becomes one selection of the multi-cursor model, so typing, Backspace
+  and Delete act on every row. Copy joins the rows, cut removes them, and
+  paste spreads one line per caret when the counts match (VS Code's
+  "spread"). Copy, cut and paste with several selections used to act on the
+  primary only.
+- **Split editor**: two editor groups, side by side (Ctrl+\\) or stacked
+  (Ctrl+K Ctrl+\\; Shift+Alt+0 toggles). Each group has its own document,
+  caret, selection and scroll, even on the same file. Ctrl+1 / Ctrl+2 move
+  the focus, a click in the other group focuses it, and the wheel scrolls
+  it without taking the focus. The sash drags, and Join Editor Groups
+  closes the split. Painting uses one painter: the other group's view is
+  kept in scalars and swapped in, so the split allocates nothing per frame
+  (`ide_memprobe.py` measures it against plain hover at the same point).
+  The status bar's build target no longer lists the workspace folder on
+  every frame.
+- **Window integration** (on the GUI merge):
+  - The loop now sleeps waiting for input after a frame that painted
+    nothing, instead of redrawing continuously. While a program, a build
+    or a debug recording runs, the wait drops to one frame so output
+    arrives promptly.
+  - The window works in pixels (`high_dpi`). The metrics were already
+    multiplied by the display scale, so on a Retina or scaled Wayland
+    display the workbench used to come out at twice its size.
+  - The minimum window size is 400×270 (VS Code's).
+  - F11 is real full screen.
+  - A file dropped on the window opens; a dropped folder becomes the
+    workspace; dropped text lands where it is dropped.
+  - `auto_save = onFocusChange` saves when the window loses focus. Coming
+    back re-checks the workspace and git.
+  - `tools/ide_driver.py` sends pointer positions in points when
+    `NY_STUB_DPI_SCALE` is set, so the IDE can be driven at 2×. Note that
+    many e2e checks use fixed scale-1 regions, so only the region-free
+    scenarios pass at 2×.
+- **Background work off the frame thread** (on the OS merge):
+  - `BgProc` (Run, Build, tools, the debugger's recording, the terminal)
+    runs on `os_spawn` / `os_proc_read` / `os_poll` / `os_kill`. Nothing
+    goes to disk, polling starts no process (it used to start `tail` each
+    time output grew), and Stop signals the whole process group. Where
+    `os_spawn` is unavailable (Windows) it falls back to the file-and-`tail`
+    route.
+  - Source Control's refresh (branch, HEAD, `git status`) is one background
+    process instead of 3–4 synchronous ones after every save.
+    `GitRepo.refresh_command()` / `apply_refresh()` are shared with the
+    synchronous `refresh()` that `vm_audit43` tests.
+- **Keymaps**: VS Code or Code::Blocks (`CB_KEYMAP`: F9, Ctrl+F9, Ctrl+D,
+  ...). *Change Keybinding* captures a pressed key. Bindings are saved in
+  `.nyide` (`keybinding = Ctrl+Alt+M | command.id`).
+- **Tools**:
+  - Class wizard: a file with the constructor and `__str__`, which runs.
+  - Code statistics per file and in total (code, comment, blank, doc).
+  - TODO list panel for the file or the workspace, with owners.
+  - User tools with `$(FILE)`, `$(LINE)`, `$(WORD)`, … macros.
+  - Environment variables for runs, targets and tools.
+  - Saving writes a `.bak` backup when the setting is on.
+- **Debugger**: breakpoint conditions (`i == 3`), hit counts (`5`, `>5`,
+  `%5`) and log points (`i is {i}`). Log points passed before a stop print
+  to the Debug Console. Also Run to Cursor and Add to Watch.
+- **Session**: open editors, the active editor and the caret are restored
+  on the next start.
+
+Defects found while driving these, all fixed:
+
+- **Two undo steps for one action.** Every action that deletes and then
+  inserts recorded two steps: completion accept, replace-one, paste over a
+  selection, wrapping a selection in brackets, format, transpose and case
+  change. They now use `open_group`/`close_group`.
+- **Wheel events had no modifiers.** Wheel events carried no Ctrl/Shift/Alt,
+  so Ctrl+wheel zoom and Shift+wheel sideways scroll never worked
+  (`gui.cpp`). The stub's `wheel` command takes modifiers now.
+- **`K=v cmd` in tool environments.** The shell expanded `$K` before the
+  assignment existed, so tool lines like `echo $GREET` saw nothing. The
+  environment is now `export`ed first.
+- **Wrong completion highlight.** The popup highlighted the first
+  `len(prefix)` characters, not the ones the fuzzy matcher matched.
+
+e2e scenarios added: `build`, `cbedit`, `cbtools`, `cbdebug`, `responsive`,
+`session`, `columns`, `split`, `window`.
+
+---
+
+## 0h. Round 74 — nytorch: one tensor engine, real models
+
+Merged from `round74-torch`. `vm_audit47` has 153 value checks against
+PyTorch-derived numbers and finite differences, byte-identical on both
+engines. All of `test_nytorch9`–`17` and `vm_audit38`–`41` pass on both
+engines.
+
+- **One kernel library for both engines.** It lives in
+  `include/NyTensor.hpp` and `src/builtins/nytensor.cpp`, in float64 C++.
+  - The interpreter reaches it through `dispatch_nt`, first in the
+    `callBuiltin` chain. The VM reaches it through `register_nt_natives()`.
+  - The kernels: broadcasting; axis reductions; blocked batched matmul;
+    views and slicing; stable softmax; conv2d, pooling, BatchNorm,
+    LayerNorm and embedding; a seeded RNG with `manual_seed`; NYTENSOR v2
+    save/load; STFT, mel and DCT; CTC forward-backward; einsum; NMS.
+  - Bad arguments raise typed errors.
+  - The VM's stub natives, which returned random numbers or echoed their
+    input, are deleted.
+- **Tensor representation.** A tensor is a flat row-major list plus a shape
+  list, not an opaque handle, because a handle store would leak in the
+  interpreter. Fused kernels and in-place optimizer steps keep allocation
+  down.
+- **The library on top.**
+  - `tensor.ny`: Tensor with an iterative backward pass, `no_grad`,
+    operators and indexing.
+  - `module.ny`: Module with `parameters`, `state_dict`, `train`/`eval`, and
+    `Sequential`.
+  - Layers, attention, losses on logits with class indices, optimizers
+    (SGD, Adam, AdamW, RMSprop) and schedulers, and DataLoader.
+  - `lib/nytorch/core.ny` is the single import every submodule starts from.
+  - The legacy `Variable` API runs on the same engine.
+- **Fake implementations replaced with computing ones**, across parts 13 to
+  17 and `advanced`: RL agents, transformers, GNNs and serving; conv nets,
+  detection, audio, ARIMA and a CTC-trained ASR model; Neural ODE, KAN,
+  PINN and world models; RetNet, RWKV, Mamba, DiT, DDPM and xLSTM; LoRA,
+  MoE and S4. The scope limits are written in docstrings (for example,
+  Mamba2 uses the Mamba-1 scan).
+- **Magnitude pruning** removes exactly floor(s·n) of the smallest weights.
+  This ends `test_nytorch17`'s statistical flake.
+- **Speed.**
+  - Native matmul 128×128: interpreter 318 → 16 ms. The VM's version used
+    to return `[]`; it now takes 4 ms.
+  - A training step of a [16,64,4] MLP at batch 32: interpreter 788 →
+    6.4 ms, VM 787 → 2.5 ms (Module API).
+- **Not done.**
+  - Interpreter memory is still high: the worst nytorch tests peak near
+    1 GB, because the interpreter never frees containers (GC_NOTES).
+  - The library works around several language bugs (these are in the
+    language work), which the torch agent listed:
+    - a bare call inside a method resolves to a same-named method
+    - constructor `*args` arrive empty
+    - a callable instance used as an attribute call returns `none`
+    - `__iter__`
+    - missing reflected and unary operators
+    - `@` is not lexed
+
+---
+
+## 0g. Round 74 — threads, synchronisation and async (both engines)
+
+Merged from `round74-conc`. Tests: `vm_audit48` (threads and
+synchronisation, 125 checks), `vm_audit49` (async, 41) and `vm_audit50`
+(`lib/thread.ny`, 51). All three pass on both engines, including under CPU
+load and parallel runs. helgrind finds 0 data races.
+
+- **One runtime for both engines.** `include/NyConc.hpp` and
+  `src/NyConc.cpp` implement and dispatch every concurrency builtin (166
+  names). Each engine supplies only an adapter (`InterpEngine` in
+  `threading.cpp`, `VMConcEngine` in `src/VMConc.cpp`), so the engines
+  cannot drift apart.
+- **The GIL.** There is one process-wide lock, because VM threads call
+  interpreter builtins through the bridge.
+  - It is a first-in-first-out ticket lock. The holder hands it over after
+    5 ms when another thread is waiting.
+  - Threads switch at every statement on the interpreter, and at frame
+    entry and backward jumps on the VM.
+  - It is off until the first thread starts. A single-threaded program pays
+    one relaxed atomic load per check (+0.04% instructions on the
+    interpreter, +0.2–0.7% on the VM).
+  - Every blocking call releases it: waits, sleeps, joins, `popen`,
+    `os_run`/`os_wait` and the process polls, and the window's idle wait
+    for events (added on merge).
+- **Interpreter per-thread state** is now `thread_local`. This includes
+  `last_stmt`, whose shared pointer was corrupting the heap.
+- **VM threads** share one `VirtualMachine`. Each thread's operand stack,
+  frame stack and in-flight exception are swapped in with the GIL.
+- **Blocking waits** all go through one function, which handles timeouts,
+  cooperative cancellation and deadlock detection. A wait-for-graph cycle,
+  or every thread blocked with no timeout, raises `DeadlockError` instead
+  of hanging. Optional lock-order checking (`lockdep_enable`) raises
+  `LockOrderError`.
+- **Async.** `async def` compiles to a coroutine factory and `await x` to
+  `async_await(x)`.
+  - One task runs at a time, in a deterministic order: ready tasks first in,
+    first out; timers by deadline, then creation order.
+  - The API: `async_run`, `create_task`, `gather`, `gather_settled`,
+    `wait_for`, `async_sleep`, `task_cancel`, `async_call_later`.
+  - Channels, locks, futures and sleep suspend only the calling task.
+- **Primitives**:
+  - threads: join with timeout, result, daemon, thread-locals, cancel
+  - locks: mutex, recursive mutex, rwlock, condition
+  - signalling: semaphore (bounded), event, barrier, latch
+  - atomics
+  - channels (unbuffered, buffered, unbounded, close, a Go-style `select`
+    that picks the first ready case)
+  - FIFO, LIFO and priority queues
+  - futures with callbacks and `as_completed`, a thread pool, timers, and
+    task groups (the first failure cancels the others)
+- **`lib/thread.ny`** is rewritten over these natives; the old names still
+  work. Its event class is `ThreadEvent`, because `lib/gui.ny` already has
+  `Event`.
+- **Behaviour change.** `semaphore_acquire` now blocks, as in Python. A lone
+  thread waiting forever raises `DeadlockError`. `stdlib_test` and
+  `stdlib_v2_test` use `semaphore_try_acquire` for the non-blocking check.
+- **Found and fixed on the way:**
+  - On the interpreter, inherited methods got none of their default
+    arguments.
+  - `with` passes the exception to `__exit__`.
+  - A pool worker could exit early.
+  - Failures of threads nobody joined were swallowed at exit.
+- **Not done:**
+  - Handles are never freed, so a program that creates millions of
+    primitives grows.
+  - `--trace`'s function stack is shared between threads.
+  - Cancellation is only checked at blocking calls.
+  - There are no async generators or streams.
+  - On the VM, an exception from another thread keeps its class name but
+    loses extra fields.
+  - The VM `with` + `return` gaps belong to the language work.
+
+---
+
+## 0f. Round 74 — the OS layer (files, paths, processes, environment, time)
+
+An audit of every os/file/path/env/time/process builtin on both engines found
+20 defects (below) and most of Python's os/os.path/shutil/subprocess/glob/
+tempfile/time surface missing. Both were addressed. **One implementation per
+builtin, both engines:** the VM's own copies of the os/io/time natives
+(`register_os_builtins`, `register_io_builtins`, `register_time_builtins`, the
+time block in `register_builtins`, `time_now`/`time_ms` in
+`register_nytorch_builtins`) were deleted; the VM reaches the interpreter's
+implementations through the builtin bridge. `import os/time/io/shell` on the VM
+no longer re-installs anything.
+
+Where things are:
+- `src/builtins/os.cpp` — files, paths, environment, system info (dispatch_os,
+  which forwards to the two below); shared helpers in
+  `include/builtins/os.hpp` (`nyos::Args` for kwargs, list/map builders,
+  `raise_errno`, path functions).
+- `src/builtins/os_time.cpp` — every `time_*` name, `time`, `clock`,
+  `monotonic`, `perf_counter`, `sleep_ms`, `uuid` (math.cpp's and
+  string.cpp's copies were removed; `sleep`/`thread_sleep` stay in
+  threading.cpp).
+- `src/builtins/os_proc.cpp` — `os_run`, `os_spawn`/`os_poll`/`os_wait`/
+  `os_kill`/`os_proc_read`, the legacy shell captures, `which`,
+  `shell_quote`, `sys_argv`.
+- `include/NyRuntime.hpp` — sys.argv / script path / executable, the builtin
+  exception hierarchy table (`builtin_exc_parent`, `exc_matches`), the
+  `"__exc__:Type:msg"` convention (`make_exc`, `parse_exc`), module
+  namespaces (`module_members`, `builtin_member`).
+- `include/NyPrelude.hpp` — Nython source both engines run at startup: the
+  `NythonFile` class and `open()`.
+
+### Contract
+- **Legacy names keep their return-value contract** (the IDE depends on
+  them): `os_remove`/`os_rename`/`os_mkdir`/`file_copy` return bool,
+  `os_listdir` returns `[]` for a missing dir, `read_file` returns `""` for a
+  missing file, `file_open` returns -1, `os_exec`/`shell`/`system`/`cmd`
+  return the command's stdout.
+- **New names raise typed errors like Python**: `os_stat`, `os_lstat`,
+  `os_rmdir`, `os_rmtree`, `os_makedirs`, `os_unlink`, `os_copy`,
+  `os_copytree`, `os_move`, `os_chmod`, `os_symlink`, `os_readlink`,
+  `os_touch`, `os_chdir`, `os_mkstemp`, `os_mkdtemp`, `os_disk_usage`,
+  `os_path_getsize`/`getmtime`, `open()`, `os_run`/`os_spawn` (a program that
+  cannot start), timeouts (`TimeoutError`). Messages read like Python's:
+  `[Errno 2] No such file or directory: '/x'`.
+- Natives raise with `throw std::string("__exc__:Type:msg")`
+  (`nyos::raise`/`raise_errno`). The bridge (`src/main.cpp`
+  install_vm_builtin_bridge) turns that - and any C++ exception - into the
+  VM's normal raise path (`VirtualMachine::raise_native_exception`: an
+  instance of the builtin exception class + `std::runtime_error`), so it is
+  catchable by `except Type` in the same frame on the VM.
+- **Keyword arguments to builtins**: the interpreter now passes them to the
+  names in `kwmap_builtins` (NythonExecutor.hpp, evalCall) as one trailing
+  map - the VM's CALL_KW convention - and `nyos::Args` takes it off. A new
+  builtin with kwargs: add it to `kwmap_builtins` and read it with `Args`.
+
+### The 20 audit defects (all fixed; checked by value in vm_audit46)
+1. VM `time_ms()` returned SECONDS after `import nytorch` (lib/os.ny,
+   stdlib.ny and gui.ny all import it). 2. VM `import time` made `time_now`
+   whole seconds and `sleep(0.5)` a no-op — stdlib's `Timer` measured 0.
+3. `shell`/`system`/`cmd` returned stdout on the interpreter and the raw wait
+   status (768 for exit 3) on the VM. 4. `os_mkdir` recursive on one engine
+   only; `mkdir` of an existing dir true on one, false on the other;
+   `os_mkdir(file)` true. 5. `os_getenv(unset)` none vs ""; VM natives read
+   non-string args as "". 6. `os_path_join("a","/b")` gave `a//b`,
+   `dirname("/x")` gave `""`, `ext("/a.b/c")` gave `.b/c`, `os_path_abs` of a
+   missing path gave `""`, VM basename ignored `\`. 7. `file_size`/`fs_stat`
+   were int32 (3 GB read -1073741824). 8. `file_copy` of a missing source left
+   an empty destination. 9. `time_format` ignored its timestamp and returned
+   garbage past 63 chars. 10. `open()` returned an int, so `with open(p) as f:
+   f.read()` was none. 11. Reading a directory surfaced a raw C++ stream
+   failure (now IsADirectoryError). 12. Interpreter builtins' exceptions were
+   uncatchable on the VM (bridge translation). 13. `process_exec` merged
+   stderr of the last command only; `os_exec` left `\r`, cut at NUL.
+   14. `kv_set` truncated multi-line values. 15. `fs_walk` was not recursive;
+   `file_readline` split lines over 8 KB; `write_bytes` wrapped 300 to 44.
+   16. `import sys` gave `argv = "nython"` and a hard-coded platform; no script
+   arguments at all; `os.getcwd()` read none. 17. `int()`, `//`, `//=`,
+   `**=`, `abs()`, unary minus and `~` truncated to 32 bits on the
+   interpreter (`int(time_ms())` was -2147483648, so every temp file name
+   collided). 18. (VM `with` skipping `__exit__` — handed to the
+   exception-machinery work, not done here.) 19. lib/os.ny: `listdir_full`
+   looped forever, `Process.shell` recursed, `run_check` always true, `pid()`
+   was a shell's pid, `copy` of a missing file "succeeded". 20. Dead or
+   shadowed duplicates (os.cpp's second `ls`/`mkdir`/`path_exists`, math.cpp's
+   `time_*`, data.cpp's `open`) removed.
+
+Also: `time.time()` / `len.x` — any attribute of a builtin — was a
+segmentation fault on the interpreter (evalAttribute read the builtin's
+std::string as an AST node). `import time; time.time()` now works on both
+engines, as do `import os; os.getcwd(); os.path.join(...)`.
+
+### Added (all on both engines)
+Paths: `os_path_split/splitext/normpath/abspath/realpath/relpath/isabs/
+expanduser/expandvars/commonpath/exists/isdir/isfile/islink/getsize/getmtime`,
+`os_glob`/`glob` (`**` recursive), `fnmatch`, `os_sep`/`os_pathsep`/
+`os_linesep`/`os_name` constants. Files: `os_stat`/`os_lstat` (int64 size,
+mtime/atime/ctime, mode, permissions, is_link, uid, gid, nlink, ino),
+`os_walk` (Python's shape), `os_makedirs(exist_ok=)`, `os_rmdir`, `os_rmtree
+(ignore_errors=)`, `os_copy`, `os_copytree`, `os_move` (cross-device),
+`os_unlink`, `os_chmod`, `os_symlink`, `os_readlink`, `os_islink`,
+`os_touch`, `os_access`, `os_mkstemp`, `os_mkdtemp`, `os_gettempdir`,
+`os_disk_usage`, `file_seek`/`file_tell`/`file_flush`, `file_readline(h,
+keep_newline)`. File objects: `open(path, mode="r")`. Processes: `os_run(cmd,
+cwd=, env=, input=, timeout=, check=)` → `{code, stdout, stderr, ok}` (a list
+runs via fork+execvp with no shell); `os_spawn` / `os_poll` / `os_wait
+(timeout=)` / `os_kill(sig=)` / `os_proc_read`; `os_system`, `os_getpid`,
+`os_getppid`, `shell_quote`, `which`. Environment/system: `os_unsetenv`,
+`os_environ`, `os_platform`, `os_cpu_count`, `os_hostname`, `os_username`,
+`os_home`, `os_uname`. Time: `time_ns`, `monotonic`, `perf_counter`,
+`process_time`, `time_format(fmt, ts, utc)` with `%f`, `time_localtime`/
+`time_gmtime`, `time_mktime`/`time_timegm`, `time_strptime`, `time_iso`,
+`time_parse_iso`, `uuid` (a real v4 UUID; the VM's was `whk_` + 8 hex).
+Interpreter-side names the VM already had: `time`, `clock`, `sleep_ms`,
+`append`. `sys.argv` (script path + the arguments after it on the command
+line, both engines, `--vm`/`--profile`/`--trace` too), `sys.platform`,
+`sys.executable`, `__name__` (`"__main__"`, the module name while a module's
+top level runs), `__file__`. New exception types registered on both engines:
+IsADirectoryError, NotADirectoryError, FileExistsError, ChildProcessError,
+ProcessLookupError, InterruptedError, BlockingIOError, BrokenPipeError,
+ConnectionRefusedError, ConnectionResetError, LookupError, EOFError,
+ModuleNotFoundError, UnicodeError.
+
+### Verification at the end of the round
+- `examples/vm_audit46.ny`: 252 passed, 0 failed on both engines (2 pending on
+  the interpreter, 4 on the VM - see below).
+- `python3 tools/sweep.py --base /tmp/obuild/nython_orig`: 178 runs,
+  **0 regressions**, 12 fixed; the only not-ok runs are vm_audit23/25 on the
+  VM, not ok on the baseline too. Against the branch head's own binary: 0
+  regressions.
+- `tools/ide_e2e.py` 227 passed, 0 failed; `tools/ide_lint.py` 0 unresolved.
+  `tools/ide_memprobe.py --check` reports hover at ~6 KB/event, above its
+  2.0 ceiling - and so does the branch head built from the same commit
+  (5.89), so it is not from this round; idle/typing/scroll are unchanged.
+- Cost: the interpreter parses the prelude at startup (+~5 ms per process);
+  `//` on 64-bit operands is now twice as fast as before the round.
+
+### Not done / pending
+- **Exception hierarchy and cross-frame catching** belong to the separate
+  exception-machinery work: `except OSError` does not yet catch a
+  FileNotFoundError on either engine, an unmatched typed `except` still
+  swallows the error, and on the VM an error raised inside a called
+  function is not caught by a typed `except` in the caller. vm_audit46
+  reports these as PENDING (`check_pending`); turn them into `check` once
+  that lands. `NyRuntime.hpp` has the parent table (`builtin_exc_parent`,
+  `exc_matches`) ready for evalTry and `match_except_handler`. Because of
+  the frame issue, the VM installs a native `open()` (after the prelude) so
+  `open(missing)` raises in the caller's frame; the file object is still the
+  prelude's.
+- The IDE's background jobs (`ide_ops.ny`, `sh -c ... & echo $!` + `tail`)
+  were not moved to `os_spawn`/`os_proc_read`; they can be now.
+- Windows: `os_run` goes through the shell (stderr/stdin via temp files, no
+  timeout); `os_spawn`/`os_poll`/`os_wait`/`os_kill` raise OSError; symlinks
+  raise. The _WIN32 branches were written but could not be compiled here.
+- VM integers are 64-bit: `int("1" * 30)` is OverflowError there, a bigint on
+  the interpreter.
 
 ---
 
@@ -969,7 +1467,13 @@ pattern immediately after a same-named method definition, at class-compile
 time, and tag that `sub_codes` entry — touching class compilation and every
 method-resolution path (`get_attr`, `set_attr`, `vm_call_method`).
 
-### 5.10 nytorch class-name collisions across submodules (found, not fixed — round 72)
+### 5.10 nytorch class-name collisions across submodules — CLOSED (round 74, §0h)
+
+Every duplicate top-level class name under `lib/` is gone, and
+`tools/ny_classcheck.py` exits 1 on any new one; `vm_audit47` runs it. Round 74's
+merges briefly reintroduced three (`Queue`, `PriorityQueue`, `Timer` in both
+`lib/stdlib.ny` and `lib/thread.ny`); `stdlib.ny` now imports `thread.ny`'s
+thread-safe versions, which answer both APIs. The original finding follows.
 
 Nython has no per-module namespacing for `import "path"` — every class a
 submodule defines lands in one shared global namespace, and a later import
@@ -1028,6 +1532,7 @@ reproducible finding rather than a guess.
 | `examples/vm_audit43.ny` | `EditorBuffer` final-newline model, undo groups, tab-aware newline, in-place line edits, indentation detect/convert; `LineDiff`; `GitRepo` in a throwaway repository (round 73) |
 | `examples/vm_audit44.ny` | `DebugSession` replay on a known recording and on a real `--trace` recording, including the uncaught exception (round 73) |
 | `examples/vm_audit45.ny` | JSON codec, `print` call form, `list.pop(i)`/`insert`, deep equality, `true == 1`, `file_mtime` (round 73) |
+| `examples/vm_audit46.ny` | the OS layer, 252 value checks: paths, files/dirs, file objects, typed errors, os_run/os_spawn, environment, time, full-width integers, sys.argv/`__name__`, lib/os.ny (round 74) |
 | `tools/ide_e2e.py` | the shipped IDE driven through real input, 20 scenarios + dead-click audits (round 73) |
 | `gui_tests/test_13` | Codicons, Dark+ palette, HiDPI scaling |
 | `gui_tests/test_14` | toolchain — real compile/run/AST/disasm |
