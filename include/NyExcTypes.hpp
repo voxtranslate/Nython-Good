@@ -129,4 +129,29 @@ inline bool ny_split_exc_message(const std::string& m, std::string& type, std::s
     return true;
 }
 
+// The TypeError message for a call that does not fit a function's
+// parameters, in Python's words. `missing`: required parameters nothing
+// supplied; min_pos/max_pos: how many positional arguments it takes (max_pos
+// < 0 for *args); given: how many were passed. "" when the call fits.
+inline std::string ny_arity_error(const std::string& fname, const std::vector<std::string>& missing,
+                                  size_t min_pos, long max_pos, size_t given) {
+    std::string f = (fname.empty() ? std::string("<lambda>") : fname) + "()";
+    if (max_pos >= 0 && given > (size_t)max_pos) {
+        std::string takes = min_pos == (size_t)max_pos ? std::to_string(max_pos)
+                          : "from " + std::to_string(min_pos) + " to " + std::to_string(max_pos);
+        return f + " takes " + takes + " positional argument" + (max_pos == 1 && min_pos == 1 ? "" : "s")
+             + " but " + std::to_string(given) + (given == 1 ? " was" : " were") + " given";
+    }
+    if (!missing.empty()) {
+        std::string names;
+        for (size_t i = 0; i < missing.size(); i++) {
+            if (i) names += missing.size() == 2 ? " and " : (i + 1 == missing.size() ? ", and " : ", ");
+            names += "'" + missing[i] + "'";
+        }
+        return f + " missing " + std::to_string(missing.size()) + " required positional argument"
+             + (missing.size() == 1 ? "" : "s") + ": " + names;
+    }
+    return "";
+}
+
 } // namespace nython

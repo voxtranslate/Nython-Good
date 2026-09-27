@@ -227,6 +227,14 @@ struct VMVal {
         case VMType::INSTANCE:
             // Two instances are equal only if same pointer (identity comparison)
             return map.get()==o.map.get();
+        // Functions, classes, generators and iterators compare by identity
+        // (f == f was false, so a handler could not be found in a list).
+        case VMType::FUNCTION:
+            return code.get()==o.code.get() && closure_env.get()==o.closure_env.get() && list.get()==o.list.get();
+        case VMType::CLASS:  return code.get()==o.code.get() && class_name==o.class_name;
+        case VMType::GENERATOR: return gen.get()==o.gen.get();
+        case VMType::ITERATOR:  return iter.get()==o.iter.get();
+        case VMType::NATIVE: return !class_name.empty() && class_name==o.class_name;
         default:             return false;
         }
     }
@@ -2011,6 +2019,7 @@ private:
             const auto& f=call_stack_[i];
             if(f.locals.count(n) || (f.closure_env && f.closure_env->count(n))) return true;
         }
+        if(in_other_thread() && module_frame_ && module_frame_->get_local(n).type!=VMType::UNDEFINED) return true;
         if(globals_.count(n)) return true;
         return bridge_exists() && bridge_exists()(n);
     }
@@ -2025,7 +2034,13 @@ private:
             if(mv.type!=VMType::UNDEFINED) return mv;
         }
         auto it=globals_.find(n);
-        if(it!=globals_.end()) return it->second;
+        if(it!=globals_.end()){
+            // A builtin carries its name, so two reads of it compare equal
+            // (len == len).
+            if(it->second.type==VMType::NATIVE && it->second.class_name.empty())
+                it->second.class_name="__native__:"+n;
+            return it->second;
+        }
         // Fall back to an interpreter builtin of this name, wrapped as a native.
         // Only names the interpreter actually registers are wrapped, so an
         // undefined variable still reads as none rather than becoming callable.
@@ -2417,9 +2432,11 @@ private:
     // default. `defaults` is the function value's own (MAKE_FUNCTION), else
     // the code's literal defaults. Returns an error message for a call that
     // does not fit (reported as TypeError by the caller when strict).
+    // `bound_self`: the call supplies self (a method), counted as Python
+    // counts it in the messages.
     std::string bind_args(const VMCode& code, const std::vector<VMVal>* defaults,
                           const std::vector<VMVal>& pos, const VMVal* kw,
-                          std::unordered_map<std::string,VMVal>& locs) {
+                          std::unordered_map<std::string,VMVal>& locs, bool bound_self=false) {
         const auto& pnames=code.param_names;
         const std::vector<VMVal>& dflts = defaults ? *defaults : code.param_defaults;
         size_t ai=0;
@@ -2427,6 +2444,8 @@ private:
         std::unordered_set<std::string> used_kw;
         std::string err;
         std::string kw_name;
+        std::vector<std::string> missing;
+        size_t min_pos=0, max_pos=0;
         for(size_t pi=0;pi<pnames.size();pi++){
             const std::string& pn=pnames[pi];
             if(pn.size()>=2&&pn[0]=='*'&&pn[1]=='*'){ has_varkw=true; kw_name=pn.substr(2); continue; }
@@ -2438,6 +2457,8 @@ private:
                 star_seen=true; has_varargs=true; continue;
             }
             bool have=false;
+            bool has_default = pi<dflts.size()&&dflts[pi].type!=VMType::UNDEFINED;
+            if(!star_seen){ max_pos++; if(!has_default) min_pos++; }
             if(!star_seen && ai<pos.size()){ locs[pn]=pos[ai++]; have=true; }
             if(kw && kw->map){
                 auto it=kw->map->find(pn);
@@ -2447,17 +2468,17 @@ private:
                 }
             }
             if(!have){
-                if(pi<dflts.size()&&dflts[pi].type!=VMType::UNDEFINED){ locs[pn]=dflts[pi]; }
+                if(has_default){ locs[pn]=dflts[pi]; }
                 else {
                     locs[pn]=VMVal::make_none();
-                    if(err.empty()) err=code.name+"() missing required argument: '"+pn+"'";
+                    missing.push_back(pn);
                 }
             }
         }
-        if(ai<pos.size() && !has_varargs && err.empty()){
-            size_t np=0; for(auto& pn:pnames) if(pn!="*"&&(pn.empty()||pn[0]!='*')) np++;
-            err=code.name+"() takes "+std::to_string(np)+" positional argument"+(np==1?"":"s")
-                +" but "+std::to_string(pos.size())+" were given";
+        if(err.empty()){
+            size_t s = bound_self ? 1 : 0;
+            err=nython::ny_arity_error(code.name=="<lambda>"?std::string():code.name, missing,
+                                       min_pos+s, has_varargs ? -1L : (long)(max_pos+s), pos.size()+s);
         }
         if(kw && kw->map){
             VMVal extra=VMVal::make_map();
@@ -2480,7 +2501,7 @@ private:
         if(self) fr.self_val=self;
         // Store closure env in frame (shared reference, not copy)
         fr.closure_env = closure;
-        std::string err=bind_args(*code, defaults, args, kwargs, fr.locals);
+        std::string err=bind_args(*code, defaults, args, kwargs, fr.locals, self.has_value() && code->is_method);
         if(!err.empty() && strict_args_) throw_exception(make_exception("TypeError",{VMVal::make_str(err)}));
         call_stack_.push_back(std::move(fr));
         VMVal result=VMVal::make_none();
@@ -2501,15 +2522,16 @@ private:
             VMVal g=make_generator_val(fn.code, args, self, fn.closure_env);
             // Re-bind with the function's own defaults and keywords.
             std::unordered_map<std::string,VMVal> locs;
-            bind_args(*fn.code, d, args, kwargs, locs);
+            std::string err=bind_args(*fn.code, d, args, kwargs, locs, self.has_value() && fn.code->is_method);
+            if(!err.empty() && strict_args_) throw_exception(make_exception("TypeError",{VMVal::make_str(err)}));
             g.gen->locals=std::move(locs);
             return g;
         }
         return exec_code(fn.code, args, self, fn.closure_env, d, kwargs);
     }
-    // A call with no parameter checking unless NY_STRICT_ARGS is set, for
-    // now: see bind_args.
-    bool strict_args_ = false;
+    // A call that does not fit the parameters raises TypeError (it bound
+    // none to the missing ones and dropped the extra ones).
+    bool strict_args_ = true;
 
     // ── Main dispatch loop ───────────────────────────────────────────────
     // Resume a generator; returns {value, done} as VMVal (NONE if done)

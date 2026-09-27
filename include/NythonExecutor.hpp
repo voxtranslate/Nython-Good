@@ -2663,26 +2663,8 @@ return lv * rv;
             if (cit != closure_contexts.end()) closure_parent = cit->second;
             Context* fn_ctx = new Context(runner, "<lambda>", nullptr, nullptr, closure_parent);
             CtxReaper _reap_fn_ctx2033(this, fn_ctx);
-            {
-                size_t arg_idx = 0;
-                for (size_t i = 0; i < lam->params.size(); i++) {
-                    std::string pname = lam->params[i]->value();
-                    if (pname.size() > 1 && pname[0] == '*' && pname[1] != '*') {
-                        std::string real_name = pname.substr(1);
-                        Object* varargs = new Object((Runnable*)runner, "list", Type::LIST);
-                        int va_idx = 0;
-                        while (arg_idx < call_args.size()) {
-                            varargs->set(std::to_string(va_idx++), call_args[arg_idx++]);
-                        }
-                        varargs->set("__len__", Value(va_idx));
-                        fn_ctx->defineByName(real_name, Value((Collectable*)varargs));
-                    } else if (arg_idx < call_args.size()) {
-                        fn_ctx->defineByName(pname, call_args[arg_idx++]);
-                    } else {
-                        fn_ctx->defineByName(pname, NONE_VALUE);
-                    }
-                }
-            }
+            static const std::unordered_map<std::string, Value> no_kw;
+            bindLambdaParams(lam, call_args, no_kw, fn_ctx, closure_parent);
             return evalNode(lam->body, fn_ctx);
         }
         return NONE_VALUE;
@@ -4165,13 +4147,17 @@ return lv * rv;
                         Context* fn_ctx, Context* eval_ctx, size_t skip_params,
                         void* callee_ptr = nullptr) {
         size_t arg_idx = 0;
-        bool star_seen = false;
+        bool star_seen = false, has_varargs = false;
         std::string kw_collect;
         std::unordered_set<std::string> named;
+        std::vector<std::string> missing;
+        std::string err;
+        size_t min_pos = 0, max_pos = 0;
         for (size_t i = skip_params; i < fn->params.size(); i++) {
             std::string pname = fn->params[i]->value();
             if (pname == "*") { star_seen = true; continue; }
             if (pname.size() > 1 && pname[0] == '*' && pname[1] != '*') {
+                has_varargs = true;
                 // *args: collect remaining positional args into a list
                 std::string real_name = pname.substr(1);
                 Object* varargs = new Object((Runnable*)runner, "list", Type::LIST);
@@ -4187,14 +4173,19 @@ return lv * rv;
             } else {
                 named.insert(pname);
                 auto kw_it = kw_args.find(pname);
+                bool has_default = i < fn->defaults.size() && fn->defaults[i];
+                if (!star_seen) { max_pos++; if (!has_default) min_pos++; }
                 if (!star_seen && arg_idx < call_args.size()) {
+                    if (kw_it != kw_args.end() && err.empty())
+                        err = fn->name + "() got multiple values for argument '" + pname + "'";
                     fn_ctx->defineByName(pname, call_args[arg_idx++]);
                 } else if (kw_it != kw_args.end()) {
                     fn_ctx->defineByName(pname, kw_it->second);
-                } else if (i < fn->defaults.size() && fn->defaults[i]) {
+                } else if (has_default) {
                     fn_ctx->defineByName(pname, paramDefault(fn, i, eval_ctx, callee_ptr));
                 } else {
                     fn_ctx->defineByName(pname, NONE_VALUE);
+                    missing.push_back(pname);
                 }
             }
         }
@@ -4202,7 +4193,47 @@ return lv * rv;
             Object* kwargs_obj = new Object((Runnable*)runner, "map", Type::MAP);
             for (auto& [k, v] : kw_args) if (!named.count(k)) kwargs_obj->set(k, v);
             fn_ctx->defineByName(kw_collect, Value((Collectable*)kwargs_obj));
+        } else if (err.empty()) {
+            for (auto& [k, v] : kw_args)
+                if (!named.count(k)) { err = fn->name + "() got an unexpected keyword argument '" + k + "'"; break; }
         }
+        // A call that does not fit raises TypeError, in Python's words (the
+        // missing parameters were none and extra arguments were dropped).
+        // A bound self counts, as Python counts it.
+        if (err.empty())
+            err = nython::ny_arity_error(fn->name, missing, min_pos + skip_params,
+                                         has_varargs ? -1L : (long)(max_pos + skip_params),
+                                         call_args.size() + skip_params);
+        if (!err.empty()) throw std::string("__exc__:TypeError:" + err);
+    }
+    // The same for a lambda: binds its parameters (positional, keyword,
+    // *args, defaults evaluated in `def_ctx`) and checks the call fits.
+    void bindLambdaParams(LambdaNode* lam, std::vector<Value>& args,
+                          const std::unordered_map<std::string, Value>& kw, Context* fc, Context* def_ctx) {
+        size_t ai = 0, min_pos = 0, max_pos = 0;
+        bool has_varargs = false;
+        std::vector<std::string> missing;
+        for (size_t i = 0; i < lam->params.size(); i++) {
+            std::string pname = lam->params[i]->value();
+            if (pname.size() > 1 && pname[0] == '*' && pname[1] != '*') {
+                Object* varargs = new Object((Runnable*)runner, "list", Type::LIST);
+                int va_idx = 0;
+                while (ai < args.size()) varargs->set(std::to_string(va_idx++), args[ai++]);
+                varargs->set("__len__", Value(va_idx));
+                fc->defineByName(pname.substr(1), Value((Collectable*)varargs));
+                has_varargs = true;
+                continue;
+            }
+            bool has_default = i < lam->defaults.size() && lam->defaults[i];
+            max_pos++; if (!has_default) min_pos++;
+            auto kw_it = kw.find(pname);
+            if (ai < args.size()) fc->defineByName(pname, args[ai++]);
+            else if (kw_it != kw.end()) fc->defineByName(pname, kw_it->second);
+            else if (has_default) fc->defineByName(pname, evalNode(lam->defaults[i], def_ctx));
+            else { fc->defineByName(pname, NONE_VALUE); missing.push_back(pname); }
+        }
+        std::string err = nython::ny_arity_error("", missing, min_pos, has_varargs ? -1L : (long)max_pos, args.size());
+        if (!err.empty()) throw std::string("__exc__:TypeError:" + err);
     }
 
     // Helper: bind function params with *args/*kwargs support
@@ -4671,8 +4702,7 @@ public:
                                         if (cit != closure_contexts.end()) cp = cit->second;
                                         Context* fc = new Context(runner, "<lambda>", nullptr, nullptr, cp);
                                         CtxReaper _reap_fc3618(this, fc);
-                                        for (size_t i = 0; i < lam->params.size() && i < args.size(); i++)
-                                            fc->defineByName(lam->params[i]->value(), args[i]);
+                                        bindLambdaParams(lam, args, kw_args, fc, cp);
                                         return evalNode(lam->body, fc);
                                     } else if (raw->type() == NodeType::FUNCTION) {
                                         auto fn = static_cast<FunctionNode*>(raw);
@@ -4891,19 +4921,7 @@ public:
                     if (cit2 != closure_contexts.end()) closure_parent = cit2->second;
                     Context* fn_ctx = new Context(runner, "<lambda>", nullptr, nullptr, closure_parent);
                     CtxReaper _reap_fn_ctx3854(this, fn_ctx);
-                    for (size_t i = 0; i < lam->params.size(); i++) {
-                        std::string pname = lam->params[i]->value();
-                        auto kw_it = kw_args.find(pname);
-                        if (kw_it != kw_args.end()) {
-                            fn_ctx->defineByName(pname, kw_it->second);
-                        } else if (i < args.size()) {
-                            fn_ctx->defineByName(pname, args[i]);
-                        } else if (i < lam->defaults.size() && lam->defaults[i]) {
-                            fn_ctx->defineByName(pname, evalNode(lam->defaults[i], closure_parent));
-                        } else {
-                            fn_ctx->defineByName(pname, NONE_VALUE);
-                        }
-                    }
+                    bindLambdaParams(lam, args, kw_args, fn_ctx, closure_parent);
                     Value result = evalNode(lam->body, fn_ctx);
                     return result;
                 }
