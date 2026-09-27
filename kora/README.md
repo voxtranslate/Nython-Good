@@ -121,4 +121,17 @@ Known limits:
 
 ## 6. SAB learnability check (real NLLB-600M, synthetic speech)
 
-See `tests/sab_learnability.py`. Results are reported in the PR / chat message for this change.
+Setup (`tests/sab_learnability.py`):
+- Every character of a real Hausa Bible verse becomes 3–5 noisy frames of a fixed random vector.
+- A tiny w2v-BERT learns CTC for 150 steps; then 350 steps of Hausa→English (World English Bible) training run through the bridge exactly as in KORA.
+- Evaluation is on 40 held-out verses. Text route = the model's NLLB translating the gold transcript; cascade = NLLB translating the CTC hypothesis.
+
+| Bridge | noise | CTC CER | direct ST chrF++ | SSI | distinct | text route chrF++ | cascade chrF++ |
+|---|---|---|---|---|---|---|---|
+| acoustic-only (first design, now the `no_sab_anchor` ablation) | 0.3 | 0.18 | 14.5 | 2.7 | 0.93 | 39.2 | – |
+| **hypothesis-anchored (final)** | 1.2 | 0.36 | **44.7** | **32.8** | 1.00 | 46.3 | 46.9 |
+| acoustic-only | 1.2 | (see PR) | | | | | |
+
+The acoustic-only bridge avoids collapse but barely depends on its input. The anchored bridge matches the text route and the cascade (direct vs. text-route agreement: 85.4 chrF++).
+
+Limits: the synthetic CTC is almost perfect, so this shows no collapse and generalisation to unseen words. It does **not** show the acoustic residual beating a cascade; that needs real ASR errors and the full-scale run.
