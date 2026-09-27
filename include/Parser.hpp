@@ -19,6 +19,7 @@ namespace nython {
 namespace lexer{
 extern std::map<TokenType,std::string> TokenTypeNames;
 }
+namespace node { struct CallNode; }
 }
 
 namespace nython::parser {
@@ -44,6 +45,7 @@ private:
     std::vector<node_ptr> param_defaults_;
     // Per function being parsed: the names it declared `global`/`nonlocal`.
     std::vector<std::vector<std::string>> outer_decls_;
+    std::vector<std::vector<std::string>> global_decls_;   // `global` only, per function
     // Set when a statement was terminated by ';' rather than a newline.
     // Statement parsers consume the semicolon themselves, so blockOrStmt()
     // cannot otherwise tell that an inline suite continues.
@@ -188,6 +190,12 @@ private:
     node_ptr power();
     node_ptr unary();
     node_ptr postfix();
+    // postfix() pieces, shared by `.`/`[`/`(` and their optional forms
+    void parseCallArgs(std::shared_ptr<nython::node::CallNode> call);
+    node_ptr parseSubscriptTail(Token tok, node_ptr expr);
+    std::string memberName();
+    bool postfixOther(node_ptr& expr);
+    node_ptr coalesce();          // a ?? b
     node_ptr primary();
     node_ptr atom();
     // f"..." / `...${}...` interpolation: literal parts and fields, joined by +

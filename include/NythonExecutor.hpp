@@ -46,6 +46,7 @@
 #include "NyBigInt.hpp"
 #include "NyStr.hpp"
 #include "NyFormat.hpp"
+#include "NyMembers.hpp"
 
 // Platform compat (sockets, dirent, stat, getcwd, etc.) in platform_compat.hpp
 #include <locale>
@@ -482,7 +483,7 @@ public:   // NythonExecutor is a struct: members default to public
             "print","println","range","len","type","str","int","float","bool",
             "input","abs","min","max","round","sorted","reversed",
             "list","tuple","dict","set","map","filter","reduce","zip",
-            "enumerate","sum","any","all","hasattr","getattr","setattr",
+            "enumerate","sum","any","all","hasattr","getattr","setattr","delattr",
             "isinstance","issubclass","id","hash","hex","oct","bin",
             "chr","ord","repr","format","open","exit","quit",
             "pow","divmod","input","dict","display","show","is_int","is_float","is_string","is_list","is_none","is_bool","to_int","to_float","to_str","clamp","lerp","map_range","repeat_str","repeat","flatten","flat","shell","system","ls","cat","pwd","mkdir","write","exists","env","all","any","complex","slice","super","property",
@@ -820,6 +821,8 @@ public:   // NythonExecutor is a struct: members default to public
             case NodeType::PASS: return NONE_VALUE;
             case NodeType::CALL: return evalCall(node, ctx);
             case NodeType::ATTRIBUTE: return evalAttribute(node, ctx);
+            case NodeType::OPT_CHAIN: return evalOptChain(static_cast<OptChainNode*>(node.get()), ctx);
+            case NodeType::CHAIN_HOLE: return static_cast<HoleNode*>(node.get())->slot;
             case NodeType::SUBSCRIPT: return evalSubscript(node, ctx);
             case NodeType::LIST: return evalList(node, ctx);
             case NodeType::COMPLEX: return evalComprehension(node, ctx);
@@ -952,10 +955,24 @@ public:   // NythonExecutor is a struct: members default to public
     // ─── VARIABLES ──────────────────────────────────────────────────────
 
 
+    // The module scope a context belongs to: the root of its scope chain.
+    static Context* moduleCtx(Context* ctx) {
+        while (ctx && ctx->parent) ctx = ctx->parent;
+        return ctx;
+    }
+    // Stores a plain `name = value`: in a class body the class namespace;
+    // a name declared `global` at module level; otherwise the nearest
+    // existing binding, or a new local (Context::setByName).
+    void assignName(VariableNode* vn, const Value& val, Context* ctx) {
+        if (vn->global_ref) moduleCtx(ctx)->defineByName(vn->name, val);
+        else if (ctx->inClass) ctx->defineByName(vn->name, val);
+        else ctx->setByName(vn->name, val);
+    }
+
     Value evalVariable(node_ptr node, Context* ctx) {
         auto vn = static_pointer_cast<VariableNode>(node);
         // Check user-defined first
-        Value found = ctx->getByName(vn->name);
+        Value found = vn->global_ref ? moduleCtx(ctx)->getByName(vn->name) : ctx->getByName(vn->name);
         if (found.type != ValueType::UNDEFINED) return found;
         // Then check builtins — return a USERDATA marker
         if (builtin_set.count(vn->name)) {
@@ -969,7 +986,7 @@ public:   // NythonExecutor is a struct: members default to public
         // program carried on). Bound-to-undefined (`x = undefined`) and names
         // that resolve by another route (a class or function an imported
         // module registered) are not errors.
-        if (!ctx->hasByName(vn->name) && !knownName(vn->name)) {
+        if (!(vn->global_ref ? moduleCtx(ctx) : ctx)->hasByName(vn->name) && !knownName(vn->name)) {
             std::string hint = suggestName(vn->name);
             if (!hint.empty()) hint = "  (did you mean '" + hint + "'?)";
             throw std::string("__exc__:NameError:name '" + vn->name + "' is not defined" + hint);
@@ -1006,8 +1023,7 @@ public:   // NythonExecutor is a struct: members default to public
             // setByName found a same-named variable in an enclosing scope and
             // rebound IT (`items = []` in a class body overwrote the global
             // builtin `items`, and the class never got the attribute).
-            if (ctx->inClass) ctx->defineByName(vn->name, val);
-            else ctx->setByName(vn->name, val);
+            assignName(vn.get(), val, ctx);
         } else if (an->target->type() == NodeType::ATTRIBUTE) {
             auto attr = static_pointer_cast<AttributeNode>(an->target);
             Value obj = evalNode(attr->object, ctx);
@@ -1231,7 +1247,7 @@ public:   // NythonExecutor is a struct: members default to public
         OP_UNKNOWN = 0, OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_FLOORDIV, OP_MOD, OP_POW,
         OP_BAND, OP_BOR, OP_BXOR, OP_LSHIFT, OP_RSHIFT,
         OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE, OP_SEQ, OP_SNE,
-        OP_IS, OP_ISNOT, OP_IN, OP_NOTIN, OP_AND, OP_OR, OP_LXOR
+        OP_IS, OP_ISNOT, OP_IN, OP_NOTIN, OP_AND, OP_OR, OP_LXOR, OP_COALESCE
     };
     static int binOpCode(const std::string& op) {
         switch (op.size()) {
@@ -1249,6 +1265,7 @@ public:   // NythonExecutor is a struct: members default to public
                 if (op == "is") return OP_IS; if (op == "in") return OP_IN;
                 if (op == "or" || op == "||") return OP_OR; if (op == "&&") return OP_AND;
                 if (op == "^^") return OP_LXOR;
+                if (op == "??") return OP_COALESCE;
                 return OP_UNKNOWN;
             case 3:
                 if (op == "and") return OP_AND; if (op == "xor") return OP_LXOR;
@@ -1263,7 +1280,7 @@ public:   // NythonExecutor is a struct: members default to public
     }
     static const char* opSymbol(int opc) {
         static const char* s[] = {"?", "+", "-", "*", "/", "//", "%", "**", "&", "|", "^", "<<", ">>",
-                                  "==", "!=", "<", "<=", ">", ">=", "===", "!==", "is", "is not", "in", "not in", "and", "or", "xor"};
+                                  "==", "!=", "<", "<=", ">", ">=", "===", "!==", "is", "is not", "in", "not in", "and", "or", "xor", "??"};
         return (opc >= 0 && opc <= OP_LXOR) ? s[opc] : "?";
     }
     // Arithmetic on two numbers: nypy::arith (NyBigInt.hpp), shared with
@@ -1474,6 +1491,7 @@ public:   // NythonExecutor is a struct: members default to public
     Value evalAugAssignment(node_ptr node, Context* ctx) {
         auto an = static_pointer_cast<AugAssignNode>(node);
         const std::string& op = an->op;
+        if (op == "??=") return evalCoalesceAssign(an.get(), ctx);
         std::string base = op.substr(0, op.size() > 0 ? op.size() - 1 : 0);
         if (op == ">>>=") base = ">>";
         int opc = binOpCode(base);
@@ -1488,10 +1506,7 @@ public:   // NythonExecutor is a struct: members default to public
         } else if (kind == 2) {
             auto attr = static_pointer_cast<AttributeNode>(an->target);
             obj = evalNode(attr->object, ctx);
-            receiver_cache_[attr->object.get()] = obj;
-            try { old_val = evalNode(an->target, ctx); }
-            catch (...) { receiver_cache_.erase(attr->object.get()); throw; }
-            receiver_cache_.erase(attr->object.get());
+            if (!getAttrValue(obj, attr->attr, ctx, old_val)) old_val = missingAttribute(obj, attr->attr, an->target.get());
         } else {
             old_val = evalNode(an->target, ctx);
         }
@@ -1545,8 +1560,40 @@ public:   // NythonExecutor is a struct: members default to public
         if (kind == 1) setItem(obj, idx, result, ctx);
         else if (kind == 2) setAttr(obj, static_pointer_cast<AttributeNode>(an->target)->attr, result);
         else if (an->target->type() == NodeType::VARIABLE)
-            ctx->setByName(static_pointer_cast<VariableNode>(an->target)->name, result);
+            assignName(static_cast<VariableNode*>(an->target.get()), result, ctx);
         return result;
+    }
+
+    // t ??= v: v is evaluated and assigned only when t is absent - none or
+    // undefined, or, for an attribute or a key, missing (a name must exist:
+    // an unbound one is a NameError, as a read of it is). The target's
+    // object and index are evaluated once. The value is t's, old or new.
+    Value evalCoalesceAssign(AugAssignNode* an, Context* ctx) {
+        NodeType tt = an->target->type();
+        if (tt == NodeType::SUBSCRIPT) {
+            auto* sub = static_cast<SubscriptNode*>(an->target.get());
+            Value obj = evalNode(sub->object, ctx);
+            Value idx = evalNode(sub->index, ctx);
+            Value cur;
+            if (tryGetItem(obj, idx, ctx, cur) && !isAbsent(cur)) return cur;
+            Value nv = evalNode(an->value_node, ctx);
+            setItem(obj, idx, nv, ctx);
+            return nv;
+        }
+        if (tt == NodeType::ATTRIBUTE) {
+            auto* at = static_cast<AttributeNode*>(an->target.get());
+            Value obj = evalNode(at->object, ctx);
+            Value cur;
+            if (getAttrValue(obj, at->attr, ctx, cur) && !isAbsent(cur)) return cur;
+            Value nv = evalNode(an->value_node, ctx);
+            setAttr(obj, at->attr, nv);
+            return nv;
+        }
+        Value cur = evalNode(an->target, ctx);
+        if (!isAbsent(cur)) return cur;
+        Value nv = evalNode(an->value_node, ctx);
+        if (tt == NodeType::VARIABLE) assignName(static_cast<VariableNode*>(an->target.get()), nv, ctx);
+        return nv;
     }
 
     // ─── ATTRIBUTE / ITEM STORES ────────────────────────────────────────
@@ -1585,17 +1632,25 @@ public:   // NythonExecutor is a struct: members default to public
                 if (class_node && fnTag(func_names, class_ptr).rfind("__class__:", 0) == 0 && class_node->type() == NodeType::CLASS) {
                     auto* cn = static_cast<ClassNode*>(class_node);
                     class_vars_[cn->name + "." + name] = val;
-                    // Also update class_ctx_map_ so subsequent reads via evalAttribute see the new value
+                    // Also update class_ctx_map_ so subsequent reads via evalAttribute see the new value.
+                    // In the class's own namespace: setByName walked on into
+                    // the scope the class was defined in, so C.x = v rebound a
+                    // same-named global when the class had no x yet.
                     auto cctx_it = class_ctx_map_.find((void*)class_node);
-                    if (cctx_it != class_ctx_map_.end()) {
-                        try { cctx_it->second->setByName(name, val); }
-                        catch (...) { cctx_it->second->defineByName(name, val); }
-                    }
+                    if (cctx_it != class_ctx_map_.end()) cctx_it->second->defineByName(name, val);
+                    return;
                 }
             }
+            if (pit != instance_properties.end()) return;
         }
         // Store on Collectable containers (namespaces, modules)
-        if (Container* cont = contOf(obj)) (*cont->container)[name] = val;
+        if (Container* cont = contOf(obj)) { (*cont->container)[name] = val; return; }
+        if (isPlainFunction(obj)) { func_attrs_[obj.value.p][name] = val; return; }
+        // none.x = v, 5.x = v, "s".x = v, len.x = v: nothing can hold it
+        // (AttributeError, as in Python - it was dropped silently).
+        std::string msg = attributeErrorText(obj, name);
+        if (nypy::lenient_reads_log()) { logLenientRead(nullptr, "AttributeError (store): " + msg); return; }
+        throw std::string("__exc__:AttributeError:" + msg);
     }
 
     // Structural equality, recursive, as on the VM (and in Python): lists
@@ -2045,10 +2100,10 @@ public:   // NythonExecutor is a struct: members default to public
             }
             auto it = dictFind(cont, idx);
             if (it != cont->container->end()) return it->second;
-            // A missing dict key reads none: the libraries and the IDE are
-            // written against that (`v = d[k]` then `if v == none`) in too
-            // many places to raise KeyError here; d.get() is the same.
-            if (n < 0) return NONE_VALUE;
+            // A missing dict key raises KeyError, as in Python (round 75: it
+            // read none). d.get(k, default), `k in d` and d?[k] are the
+            // graceful forms.
+            if (n < 0) return missingKey(idx, ctx);
             pyRaise("TypeError", std::string(isTupleCont(cont) ? "tuple" : "list") + " indices must be integers or slices, not " + typeNameOf(idx));
         }
         // __getitem__ on instances
@@ -2058,7 +2113,46 @@ public:   // NythonExecutor is a struct: members default to public
             std::vector<Value> call_args = {idx};
             return callMethod(obj, "__getitem__", call_args, ctx);
         }
-        return NONE_VALUE;
+        // none[k], 5[0], f[0]: TypeError (they read none).
+        std::string msg = "'" + typeNameOf(obj) + "' object is not subscriptable";
+        if (nypy::lenient_reads_log()) { logLenientRead(nullptr, "TypeError: " + msg); return NONE_VALUE; }
+        pyRaise("TypeError", msg);
+    }
+    // obj[idx] for d?[k]: false when the key or index does not exist - a
+    // missing dict key, an index out of range, or __getitem__ raising
+    // KeyError / IndexError. Other errors (an unhashable key, a type that is
+    // not subscriptable) raise as obj[idx] does.
+    bool tryGetItem(const Value& obj, const Value& idx, Context* ctx, Value& out) {
+        if (Container* cont = contOf(obj)) {
+            int64_t n = seqLen(cont);
+            if (n < 0) {
+                auto it = dictFind(cont, idx);
+                if (it == cont->container->end()) return false;
+                out = it->second;
+                return true;
+            }
+            Num k;
+            if (asNum(idx, k) && k.k == 1) {
+                int64_t j = k.i < 0 ? k.i + n : k.i;
+                if (j < 0 || j >= n) return false;
+            }
+        } else if (isStringValue(obj)) {
+            Num k;
+            if (asNum(idx, k) && k.k == 1) {
+                int64_t n = (int64_t)nypy::u8_len(*(std::string*)obj.value.p);
+                int64_t j = k.i < 0 ? k.i + n : k.i;
+                if (j < 0 || j >= n) return false;
+            }
+        } else if (isInstanceVal(obj) && instanceHasMethod(obj, "__getitem__")) {
+            try { out = getItem(obj, idx, ctx); }
+            catch (std::string& e) {
+                if (excTypeMatches(e, "KeyError") || excTypeMatches(e, "IndexError")) return false;
+                throw;
+            }
+            return true;
+        }
+        out = getItem(obj, idx, ctx);
+        return true;
     }
 
     // obj[idx] = val
@@ -2149,7 +2243,7 @@ public:   // NythonExecutor is a struct: members default to public
             if (fit != func_names.end()) {
                 if (fit->second.rfind("__instance__:", 0) == 0) return fit->second.substr(13);
                 if (fit->second.rfind("__class__:", 0) == 0) return "type";
-                if (fit->second.rfind("__builtin__:", 0) == 0) return "builtin_function_or_method";
+                if (fit->second.rfind("__builtin__:", 0) == 0 || fit->second.rfind("__bmethod__:", 0) == 0) return "builtin_function_or_method";
                 return "function";
             }
         }
@@ -2394,6 +2488,8 @@ public:   // NythonExecutor is a struct: members default to public
         // to test only for false/none and always produced a bool for `and`.
         case OP_AND: { Value lv = evalNode(bn->left, ctx); if (!isTruthy(lv)) return lv; return evalNode(bn->right, ctx); }
         case OP_OR:  { Value lv = evalNode(bn->left, ctx); if (isTruthy(lv)) return lv; return evalNode(bn->right, ctx); }
+        // a ?? b: b only when a is none or undefined (and only then evaluated).
+        case OP_COALESCE: { Value lv = evalNode(bn->left, ctx); if (!isAbsent(lv)) return lv; return evalNode(bn->right, ctx); }
         case OP_IS: case OP_ISNOT: {
             // `is` answers "does the left operand belong to the right?" in the
             // widest useful sense, not only pointer identity:
@@ -3005,6 +3101,7 @@ public:   // NythonExecutor is a struct: members default to public
         // A builtin, an instance or a class is not an AST function: treating its
         // pointer as a Node* crashed (thread_create(print), key=len, map(str, xs)).
         if (fit->second.rfind("__builtin__:", 0) == 0) return callBuiltin(fit->second.substr(12), call_args, ctx);
+        if (fit->second.rfind("__bmethod__:", 0) == 0) { Value r; callBoundMember(fn_val, call_args, nullptr, ctx, r); return r; }
         if (fit->second.rfind("__instance__:", 0) == 0 || instance_to_class.count(fn_val.value.p)) return callMethod(fn_val, "__call__", call_args, ctx);
         if (fit->second.rfind("__class__:", 0) == 0) return NONE_VALUE;
         // Bound-method `self` is supplied centrally in bindParamsKw via the
@@ -3879,11 +3976,12 @@ public:   // NythonExecutor is a struct: members default to public
                 return callMethod(target, "__call__", args, ctx, kw_in);
             return callFunctionValue(target, args, ctx);
         }
-        {
-            std::string err;
-            if (attributeErrorFor(obj, method_name, err)) throw err;
-        }
-        return NONE_VALUE;
+        // Any other value without such a method raises too: `none.m()` and
+        // `"s".nosuch()` returned none (round 75). `x?.m()` is the graceful
+        // spelling.
+        if (isInstanceValue(obj) || fnTag(func_names, obj.value.p).rfind("__class__:", 0) == 0)
+            throw std::string("__exc__:AttributeError:" + attributeErrorText(obj, method_name));
+        return missingAttribute(obj, method_name, nullptr);
     }
 
     std::vector<std::unique_ptr<int64_t>> func_id_store;
@@ -4633,6 +4731,10 @@ public:
                         // An object with __call__ held in an attribute.
                         if (isInstanceValue(attr_val) && instanceHasMethod(attr_val, "__call__"))
                             return callMethod(attr_val, "__call__", args, ctx, &kw_args);
+                        {
+                            Value r;
+                            if (callBoundMember(attr_val, args, &kw_args, ctx, r)) return r;
+                        }
                         if (attr_val.type == ValueType::USERDATA && attr_val.value.p) {
                             auto fname_it = func_names.find(attr_val.value.p);
                             if (fname_it != func_names.end()) {
@@ -4694,6 +4796,10 @@ public:
                     auto attr_it = cont->container->find(method_name);
                     if (attr_it != cont->container->end()) {
                         Value attr_val = attr_it->second;
+                        {
+                            Value r;
+                            if (callBoundMember(attr_val, args, &kw_args, ctx, r)) return r;
+                        }
                         if (attr_val.type == ValueType::USERDATA && attr_val.value.p) {
                             auto fn_it = func_names.find(attr_val.value.p);
                             if (fn_it != func_names.end()) {
@@ -4729,12 +4835,10 @@ public:
                 // side effect fired twice — and because the doubling compounds
                 // through nesting, an n-deep method chain performed 2^n - 1
                 // calls instead of n (v.add(1).add(1).add(1) incremented by 7).
-                // Reuse it via receiver_cache_ instead of evaluating again.
-                receiver_cache_[attr->object.get()] = obj;
+                // The attribute of the receiver in hand (a builtin's method is
+                // left to callMethod, not bound).
                 Value callee_val;
-                try { callee_val = evalAttribute(cn->callee, ctx, true); }
-                catch (...) { receiver_cache_.erase(attr->object.get()); throw; }
-                receiver_cache_.erase(attr->object.get());
+                if (!getAttrValue(obj, method_name, ctx, callee_val, false)) callee_val = UNDEFINED_VALUE;
                 // Only use the fallback for builtin functions stored in dict namespaces
                 // (e.g. math.sqrt). For class methods (__func__), let callMethod handle
                 // self-binding correctly.
@@ -4878,6 +4982,11 @@ public:
                 args.push_back(Value((Collectable*)kw));
             }
             return callBuiltin(builtin, args, ctx);
+        }
+        // A builtin value's method read as a value (f = xs.append; f(1)).
+        if (fname.rfind("__bmethod__:", 0) == 0) {
+            Value r;
+            if (callBoundMember(callee, args, &kw_args, ctx, r)) return r;
         }
         // Also check callee token for builtin (for print etc parsed as keywords)
 
@@ -5224,28 +5333,87 @@ public:
     }
 
     // ─── ATTRIBUTE / SUBSCRIPT ──────────────────────────────────────────
-    // Receivers already evaluated by evalCall, keyed by the object node. Lets
-    // the callee-lookup fallback reuse a receiver instead of re-running it.
-    // Per OS thread (round 74): two threads can run the same call node.
-    static inline thread_local std::unordered_map<const void*, Value> receiver_cache_;
+    // obj.attr. Reading an attribute the object does not have raises
+    // AttributeError, whatever the object (round 75: it read none, and
+    // library code probed optional attributes that way). Graceful forms:
+    // getattr(o, n, d), hasattr, `o?.attr` and `o?.attr ?? d`.
+    Value evalAttribute(node_ptr node, Context* ctx) {
+        auto* an = static_cast<AttributeNode*>(node.get());
+        Value obj = evalNode(an->object, ctx);
+        Value v;
+        if (getAttrValue(obj, an->attr, ctx, v)) return v;
+        return missingAttribute(obj, an->attr, node.get());
+    }
 
-    // soft: a missing attribute of an instance or class reads UNDEFINED
-    // instead of raising AttributeError (for hasattr/getattr, and for the
-    // method-call path, where callMethod decides).
-    Value evalAttribute(node_ptr node, Context* ctx, bool soft = false) {
-        auto an = static_pointer_cast<AttributeNode>(node);
-        Value obj;
-        {
-            auto rc = receiver_cache_.find(an->object.get());
-            if (rc != receiver_cache_.end()) obj = rc->second;
-            else obj = evalNode(an->object, ctx);
+    // a?.b  a?[k]  a?.m(x)  a?[i:j]  f?.(x), and the chain after the link
+    // (OptChainNode, ASTNodes.hpp). none/undefined is absent (isAbsent).
+    static bool isAbsent(const Value& v) { return v.type == ValueType::NONE || v.type == ValueType::UNDEFINED; }
+    Value evalOptChain(OptChainNode* oc, Context* ctx) {
+        Value r = evalNode(oc->recv, ctx);
+        if (isAbsent(r)) return NONE_VALUE;
+        Value v;
+        switch (oc->kind) {
+            case OptChainNode::ATTR:
+                if (!getAttrValue(r, oc->name, ctx, v)) return NONE_VALUE;
+                break;
+            case OptChainNode::INDEX: {
+                Value idx = evalNode(oc->index, ctx);
+                if (!tryGetItem(r, idx, ctx, v)) return NONE_VALUE;
+                break;
+            }
+            case OptChainNode::METHOD: {
+                if (!hasMemberNoEval(r, oc->name, ctx)) return NONE_VALUE;
+                oc->recv_hole->slot = r;
+                v = evalNode(oc->call, ctx);
+                break;
+            }
+            default:   // SLICE, CALL
+                oc->recv_hole->slot = r;
+                v = evalNode(oc->call, ctx);
+                break;
         }
+        if (!oc->rest) return v;
+        oc->hole->slot = v;
+        return evalNode(oc->rest, ctx);
+    }
+    // Whether obj.m(...) finds a method the call path supplies itself (a
+    // builtin kind's method or the object protocol) - the methods a read
+    // with bind=false leaves to callMethod.
+    bool hasMethodMember(const Value& obj, const std::string& m) {
+        nypy::MemberKind k = memberKindOf(obj);
+        return k != nypy::MemberKind::Other && nypy::kind_has_method(k, m);
+    }
+    // Whether obj has a member `name`, without running a property getter or
+    // __getattr__ (an object with __getattr__ counts as having every name):
+    // the test `obj?.m(...)` makes before calling.
+    bool hasMemberNoEval(const Value& obj, const std::string& name, Context* ctx) {
+        if (isInstanceValue(obj)) {
+            auto pit = instance_properties.find(obj.value.p);
+            if (pit != instance_properties.end() && pit->second && pit->second->container
+                && pit->second->container->count(name)) return true;
+            Value m;
+            if (Node* cls = classNodeOfInstance(obj); cls && findClassMember(cls, name, m)) return true;
+            if (name == "__class__" || name == "__dict__" || instanceHasMethod(obj, "__getattr__")) return true;
+            return hasMethodMember(obj, name);
+        }
+        Value v;
+        return getAttrValue(obj, name, ctx, v, false) || hasMethodMember(obj, name);
+    }
+
+    // obj.attr for a value in hand: true with the value in `out`, false when
+    // obj has no such attribute - nothing is raised for that. Property
+    // getters and __getattr__ run, and what they raise propagates. `bind`
+    // false: a builtin method (list.append ...) is left to the method call
+    // that is about to happen instead of being read as a bound value.
+    bool getAttrValue(const Value& obj, const std::string& attr, Context* ctx, Value& out, bool bind = true) {
         // Check instance properties first (and invoke @property getters)
         if (obj.type == ValueType::USERDATA && obj.value.p) {
             auto pit = instance_properties.find(obj.value.p);
-            if (pit != instance_properties.end()) {
-                Value v = pit->second->getByName(an->attr);
-                if (v.type != ValueType::UNDEFINED) {
+            if (pit != instance_properties.end() && pit->second && pit->second->container) {
+                // Present even when it holds undefined (self.x = undefined).
+                auto fit0 = pit->second->container->find(attr);
+                if (fit0 != pit->second->container->end()) {
+                    Value v = fit0->second;
                     // Check if this is a @property — if so, call it with self
                     if (v.type == ValueType::USERDATA && v.value.p) {
                         auto fn_it = func_names.find(v.value.p);
@@ -5262,19 +5430,24 @@ public:
                                 if (cit != closure_contexts.end()) closure_parent = cit->second;
                                 Context* fc = new Context(runner, fn->name, nullptr, nullptr, closure_parent);
                                 fc->defineByName("self", obj);
-                                return runFunctionBody(fn, fc);
+                                out = runFunctionBody(fn, fc);
+                                return true;
                             }
                         }
                     }
-                    return v;
+                    out = v;
+                    return true;
                 }
             }
         }
         if (obj.isCollectable() && obj.value.gc) {
             auto* cont = dynamic_cast<Container*>(obj.value.gc);
             if (cont && cont->container) {
-                auto it = cont->container->find(an->attr);
-                if (it != cont->container->end()) return it->second;
+                auto it = cont->container->find(attr);
+                if (it != cont->container->end()) { out = it->second; return true; }
+                // A dict / list / tuple / set method read as a value.
+                if (bind && nypy::kind_has_method(memberKindOf(obj), attr)) { out = boundMember(obj, attr); return true; }
+                return false;
             }
         }
         // A builtin used as a namespace: `import time` then time.time(),
@@ -5285,10 +5458,10 @@ public:
         if (obj.type == ValueType::USERDATA && obj.value.p) {
             auto bit = func_names.find(obj.value.p);
             if (bit != func_names.end() && bit->second.rfind("__builtin__:", 0) == 0) {
-                std::string target = nyrt::builtin_member(bit->second.substr(12), an->attr,
+                std::string target = nyrt::builtin_member(bit->second.substr(12), attr,
                     [&](const std::string& n) { return builtin_ptrs.count(n) > 0; });
-                if (!target.empty()) return builtinValue(target);
-                return NONE_VALUE;
+                if (!target.empty()) { out = builtinValue(target); return true; }
+                return false;
             }
         }
         // Class variable / static method lookup: ClassName.var or ClassName.staticmethod
@@ -5322,10 +5495,10 @@ public:
                 if (ctx_it != class_ctx_map_.end() && ctx_it->second && ctx_it->second->container) {
                     Value cv = UNDEFINED_VALUE;
                     {
-                        auto own = ctx_it->second->container->find(an->attr);
+                        auto own = ctx_it->second->container->find(attr);
                         if (own != ctx_it->second->container->end()) cv = own->second;
                     }
-                    if (cv.type == ValueType::NONE) return cv;   // `x = None` in the class body
+                    if (cv.type == ValueType::NONE) { out = cv; return true; }   // `x = None` in the class body
                     if (cv.type != ValueType::UNDEFINED) {
                         // Check if this is a @property getter — invoke it with self
                         if (cv.type == ValueType::USERDATA && cv.value.p) {
@@ -5342,28 +5515,30 @@ public:
                                     if (cit2 != closure_contexts.end()) cp = cit2->second;
                                     Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
                                     fc->defineByName("self", obj);
-                                    return runFunctionBody(fn, fc);
+                                    out = runFunctionBody(fn, fc);
+                                    return true;
                                 }
                             }
                         }
                         // A method read as a value off an INSTANCE must carry its
                         // instance with it, or `self` is lost at call time.
-                        if (instance_to_class.count(obj.value.p))
-                            return makeBoundMethod(cv, obj);
-                        return cv;
+                        if (instance_to_class.count(obj.value.p)) { out = makeBoundMethod(cv, obj); return true; }
+                        out = cv;
+                        return true;
                     }
                 }
                 // Check class_vars_ (mutable class-level variables set at runtime)
-                std::string cv_key = cn->name + "." + an->attr;
+                std::string cv_key = cn->name + "." + attr;
                 auto cv_it = class_vars_.find(cv_key);
-                if (cv_it != class_vars_.end()) return cv_it->second;
+                if (cv_it != class_vars_.end()) { out = cv_it->second; return true; }
                 // Not yet set — evaluate class-level default from body
                 if (cn->body) {
                     for (auto& stmt : cn->body->statements()) {
                         if (stmt->type() == NodeType::ASSIGNMENT) {
                             auto as = static_pointer_cast<AssignmentNode>(stmt);
-                            if (as->target->type() == NodeType::VARIABLE && as->target->value() == an->attr) {
-                                return evalNode(as->value_node, ctx);
+                            if (as->target->type() == NodeType::VARIABLE && as->target->value() == attr) {
+                                out = evalNode(as->value_node, ctx);
+                                return true;
                             }
                         }
                     }
@@ -5371,47 +5546,130 @@ public:
               }
             }
         }
-        return specialAttribute(obj, an->attr, ctx, soft);
+        return specialAttribute(obj, attr, ctx, out, bind);
     }
     // obj.name for a value in hand: UNDEFINED when it has no such attribute.
     Value lookupAttribute(const Value& obj, const std::string& name, Context* ctx) {
-        auto objn = std::make_shared<VariableNode>(Token());
-        auto an = std::make_shared<AttributeNode>(Token(), objn, name);
-        receiver_cache_[objn.get()] = obj;
-        try {
-            Value v = evalAttribute(an, ctx, true);
-            receiver_cache_.erase(objn.get());
-            return v;
-        } catch (...) { receiver_cache_.erase(objn.get()); throw; }
+        Value v;
+        return getAttrValue(obj, name, ctx, v) ? v : UNDEFINED_VALUE;
     }
-    // The AttributeError for obj.name, when obj is an instance or a class.
-    bool attributeErrorFor(const Value& obj, const std::string& name, std::string& err) {
-        if (isInstanceValue(obj)) {
-            err = "__exc__:AttributeError:'" + instanceClassName(obj) + "' object has no attribute '" + name + "'";
-            return true;
+    // Which builtin kind a value is, for the method tables (NyMembers.hpp).
+    nypy::MemberKind memberKindOf(const Value& v) {
+        switch (v.type) {
+            case ValueType::NONE: return nypy::MemberKind::None;
+            case ValueType::BOOLEAN: return nypy::MemberKind::Bool;
+            case ValueType::INTEGER: return nypy::MemberKind::Int;
+            case ValueType::DOUBLE: return nypy::MemberKind::Float;
+            case ValueType::UNDEFINED: return nypy::MemberKind::Other;
+            default: break;
         }
+        if (isStringValue(v)) return nypy::MemberKind::Str;
+        if (Container* c = contOf(v)) {
+            if (seqLen(c) < 0) return nypy::MemberKind::Dict;
+            if (isTupleCont(c)) return nypy::MemberKind::Tuple;
+            if (isSetCont(c)) return nypy::MemberKind::Set;
+            return nypy::MemberKind::List;
+        }
+        if (isInstanceVal(v)) return nypy::MemberKind::Instance;
+        return nypy::MemberKind::Other;
+    }
+    // A method of a builtin value (or an object-protocol member) read as a
+    // value: a callable that calls it on `recv`. One per receiver and name
+    // (the interpreter keeps what it allocates, so it is cached).
+    // Attributes stored on a function (f.calls = 0), as in Python: per
+    // function value (each `def` evaluation is its own value).
+    std::unordered_map<void*, std::unordered_map<std::string, Value>> func_attrs_;
+    bool isPlainFunction(const Value& v) {
+        if (v.type != ValueType::USERDATA || !v.value.p) return false;
+        std::string t = fnTag(func_names, v.value.p);
+        return t.rfind("__func__:", 0) == 0 || t.rfind("__lambda__", 0) == 0;
+    }
+    struct BoundMember { Value recv; std::string name; };
+    std::unordered_map<void*, BoundMember> bound_members_;
+    std::map<std::pair<uintptr_t, std::string>, void*> bound_member_cache_;
+    std::vector<std::unique_ptr<std::string>> bound_member_store_;
+    Value boundMember(const Value& recv, const std::string& name) {
+        uintptr_t id = 0;
+        if (recv.type == ValueType::USERDATA) id = (uintptr_t)recv.value.p;
+        else if (recv.isCollectable()) id = (uintptr_t)recv.value.gc;
+        if (id) {
+            auto it = bound_member_cache_.find({id, name});
+            if (it != bound_member_cache_.end()) { Value v; v.type = ValueType::USERDATA; v.value.p = it->second; return v; }
+        }
+        bound_member_store_.push_back(std::make_unique<std::string>("__bmethod__:" + name));
+        void* p = bound_member_store_.back().get();
+        func_names[p] = "__bmethod__:" + name;
+        bound_members_[p] = BoundMember{recv, name};
+        if (id) bound_member_cache_[{id, name}] = p;
+        Value v; v.type = ValueType::USERDATA; v.value.p = p;
+        return v;
+    }
+    // Calls a bound member made by boundMember; false if `fn` is not one.
+    bool callBoundMember(const Value& fn, std::vector<Value>& args, const std::unordered_map<std::string, Value>* kw,
+                         Context* ctx, Value& out) {
+        if (fn.type != ValueType::USERDATA || !fn.value.p) return false;
+        auto it = bound_members_.find(fn.value.p);
+        if (it == bound_members_.end()) return false;
+        BoundMember bm = it->second;
+        out = callMethod(bm.recv, bm.name, args, ctx, kw);
+        return true;
+    }
+    // The text of the AttributeError for obj.name.
+    std::string attributeErrorText(const Value& obj, const std::string& name) {
+        if (isInstanceValue(obj))
+            return "'" + instanceClassName(obj) + "' object has no attribute '" + name + "'";
         if (obj.type == ValueType::USERDATA && obj.value.p) {
             std::string t = fnTag(func_names, obj.value.p);
             if (t.rfind("__class__:", 0) == 0) {
                 std::string cn = t.substr(10);
                 size_t tag = cn.find("__");
                 if (tag != std::string::npos && tag > 0) cn = cn.substr(0, tag);
-                err = "__exc__:AttributeError:type object '" + cn + "' has no attribute '" + name + "'";
-                return true;
+                return "type object '" + cn + "' has no attribute '" + name + "'";
             }
         }
-        return false;
+        return "'" + typeNameOf(obj) + "' object has no attribute '" + name + "'";
+    }
+    // A missing attribute read: AttributeError, or - NY_LENIENT_READS=log, a
+    // porting aid - a line on stderr and none.
+    Value missingAttribute(const Value& obj, const std::string& name, Node* where) {
+        std::string msg = attributeErrorText(obj, name);
+        if (nypy::lenient_reads_log()) { logLenientRead(where, "AttributeError: " + msg); return NONE_VALUE; }
+        throw std::string("__exc__:AttributeError:" + msg);
+    }
+    // A missing dict key read: KeyError(key), or the NY_LENIENT_READS=log line.
+    Value missingKey(const Value& key, Context* ctx) {
+        std::string k = reprOf(key, ctx);
+        if (nypy::lenient_reads_log()) { logLenientRead(nullptr, "KeyError: " + k); return NONE_VALUE; }
+        throw std::string("__exc__:KeyError:" + k);
+    }
+    void logLenientRead(Node* where, const std::string& what) {
+        std::string loc;
+        if (where) { auto tk = where->token(); loc = tk.fileName() + ":" + std::to_string(tk.line()); }
+        else loc = last_stmt_where();
+        static std::mutex mu;
+        static std::set<std::string> seen;
+        std::lock_guard<std::mutex> lk(mu);
+        if (!seen.insert(loc + " " + what).second) return;
+        fprintf(stderr, "[lenient-read] %s: %s\n", loc.c_str(), what.c_str());
     }
     // Attributes every value answers: __name__ of a function or class (and of
-    // the name string type() returns), an instance's __class__, and what an
-    // instance's __getattr__ supplies for anything it does not have.
+    // the name string type() returns), an instance's __class__ and __dict__,
+    // what an instance's __getattr__ supplies for anything it does not have,
+    // and a builtin value's methods (NyMembers.hpp) read as bound values.
     // Properties: a getter function tagged __property__; its setter, from
     // @prop.setter, is kept here.
     std::unordered_map<void*, Value> prop_setters_;
     bool any_property_ = false;   // no property anywhere: attribute stores skip the class lookup
     std::vector<std::unique_ptr<std::string>> prop_setter_ids_;
-    Value specialAttribute(const Value& obj, const std::string& attr, Context* ctx, bool soft = false) {
+    bool specialAttribute(const Value& obj, const std::string& attr, Context* ctx, Value& out, bool bind = true) {
         if (obj.type == ValueType::USERDATA && obj.value.p) {
+            if (!func_attrs_.empty()) {
+                auto fa = func_attrs_.find(obj.value.p);
+                if (fa != func_attrs_.end()) {
+                    auto it = fa->second.find(attr);
+                    if (it != fa->second.end()) { out = it->second; return true; }
+                }
+            }
             auto fit = func_names.find(obj.value.p);
             // prop.setter: a callable that records its argument as the
             // property's setter and returns the property.
@@ -5420,21 +5678,22 @@ public:
                 prop_setter_ids_.push_back(std::make_unique<std::string>(os.str()));
                 void* id = prop_setter_ids_.back().get();
                 func_names[id] = "__builtin__:" + os.str();
-                Value v; v.type = ValueType::USERDATA; v.value.p = id;
-                return v;
+                out.type = ValueType::USERDATA; out.value.p = id;
+                return true;
             }
             // C.__mro__ / C.__bases__: the classes, in C3 order / as written.
             if ((attr == "__mro__" || attr == "__bases__") && fit != func_names.end()
                 && fit->second.rfind("__class__:", 0) == 0) {
                 Node* cn = classNodeByName(fit->second.substr(10));
-                std::vector<Value> out;
+                std::vector<Value> seq_vals;
                 if (cn) {
                     std::vector<Node*> seq;
                     if (attr == "__mro__") seq = classMro(cn);
                     else for (auto& b : static_cast<ClassNode*>(cn)->bases) if (Node* bn = classNodeByName(b->value())) seq.push_back(bn);
-                    for (Node* c : seq) { Value cv; cv.type = ValueType::USERDATA; cv.value.p = (void*)c; out.push_back(cv); }
+                    for (Node* c : seq) { Value cv; cv.type = ValueType::USERDATA; cv.value.p = (void*)c; seq_vals.push_back(cv); }
                 }
-                return makeListValue(out, attr == "__mro__");
+                out = makeListValue(seq_vals, attr == "__mro__");
+                return true;
             }
             if (attr == "__name__") {
                 if (fit != func_names.end()) {
@@ -5443,37 +5702,40 @@ public:
                     std::string nm = c == std::string::npos ? t : t.substr(c + 1);
                     size_t tag = nm.find("__");
                     if (tag != std::string::npos && tag > 0) nm = nm.substr(0, tag);   // name__static__ etc
-                    return makeStringValue(nm);
+                    out = makeStringValue(nm);
+                    return true;
                 }
-                if (isStringValue(obj)) return obj;
+                if (isStringValue(obj)) { out = obj; return true; }
             }
             if (isInstanceValue(obj)) {
                 if (attr == "__class__") {
-                    Value cv; cv.type = ValueType::USERDATA;
-                    cv.value.p = instance_to_class[obj.value.p];
-                    return cv;
+                    out.type = ValueType::USERDATA;
+                    out.value.p = instance_to_class[obj.value.p];
+                    return true;
+                }
+                if (attr == "__dict__") {
+                    auto* d = new Object((Runnable*)runner, "map", Type::MAP);
+                    auto pit = instance_properties.find(obj.value.p);
+                    if (pit != instance_properties.end() && pit->second && pit->second->container)
+                        for (auto& kv : *pit->second->container) d->set(kv.first, kv.second);
+                    out = Value((Collectable*)d);
+                    return true;
                 }
                 if (instanceHasMethod(obj, "__getattr__")) {
                     std::vector<Value> a{makeStringValue(attr)};
-                    return callMethod(obj, "__getattr__", a, ctx);
+                    out = callMethod(obj, "__getattr__", a, ctx);
+                    return true;
                 }
             }
         }
-        // A missing attribute of an instance or a class: hasattr / getattr
-        // see it as missing. A plain read still gives none - library code
-        // (lib/gui.ny above all) probes optional attributes that way
-        // (`if w.rect != none`, `widget.is_layout == true`); raising
-        // AttributeError there is one switch away once those idioms are
-        // ported to hasattr/getattr. Calling a missing method does raise
-        // (callMethod).
-        std::string err;
-        if (attributeErrorFor(obj, attr, err)) {
-            if (soft) return UNDEFINED_VALUE;
-            if (kStrictAttributeReads) throw err;
+        // A builtin value's method, or the object protocol (c.to_string),
+        // read as a value.
+        if (bind) {
+            nypy::MemberKind k = memberKindOf(obj);
+            if (k != nypy::MemberKind::Other && nypy::kind_has_method(k, attr)) { out = boundMember(obj, attr); return true; }
         }
-        return NONE_VALUE;
+        return false;
     }
-    static constexpr bool kStrictAttributeReads = false;
 
     // ─── RETURN ─────────────────────────────────────────────────────────
     Value evalReturn(node_ptr node, Context* ctx) {
@@ -6959,7 +7221,13 @@ public:
     Value evalDelete(node_ptr node, Context* ctx) {
         auto dn = static_pointer_cast<DeleteNode>(node);
         if (dn->target->type() == NodeType::VARIABLE) {
-            ctx->defineByName(dn->target->value(), UNDEFINED_VALUE);
+            // del x unbinds the nearest x: reading it afterwards is a
+            // NameError (x used to stay bound, to undefined here and to
+            // none on the VM).
+            const std::string n = dn->target->value();
+            for (Context* c = ctx; c; c = c->parent)
+                if (c->container && c->container->erase(n)) return NONE_VALUE;
+            pyRaise("NameError", "name '" + n + "' is not defined");
         } else if (dn->target->type() == NodeType::SUBSCRIPT) {
             // del dict[key] or del list[idx]
             auto sub = static_pointer_cast<SubscriptNode>(dn->target);
@@ -7017,13 +7285,36 @@ public:
             // del obj.attr
             auto attr = static_pointer_cast<AttributeNode>(dn->target);
             Value obj = evalNode(attr->object, ctx);
-            if (obj.type == ValueType::USERDATA && obj.value.p) {
-                auto pit = instance_properties.find(obj.value.p);
-                if (pit != instance_properties.end())
-                    pit->second->defineByName(attr->attr, UNDEFINED_VALUE);
-            }
+            delAttrValue(obj, attr->attr);
         }
         return NONE_VALUE;
+    }
+    // del obj.name / delattr(obj, name): an instance's field, a class
+    // attribute or a namespace/dict entry is removed; anything else is an
+    // AttributeError. (A deleted field used to stay, holding undefined.)
+    void delAttrValue(const Value& obj, const std::string& name) {
+        if (obj.type == ValueType::USERDATA && obj.value.p) {
+            auto pit = instance_properties.find(obj.value.p);
+            if (pit != instance_properties.end() && pit->second && pit->second->container) {
+                if (pit->second->container->erase(name)) return;
+            } else if (fnTag(func_names, obj.value.p).rfind("__class__:", 0) == 0) {
+                auto cit = class_ctx_map_.find(obj.value.p);
+                auto ast_it = func_ast_nodes.find(obj.value.p);
+                if (cit == class_ctx_map_.end() && ast_it != func_ast_nodes.end()) cit = class_ctx_map_.find(ast_it->second);
+                if (cit != class_ctx_map_.end() && cit->second && cit->second->container && cit->second->container->erase(name)) {
+                    if (auto* cn = dynamic_cast<ClassNode*>((Node*)(ast_it != func_ast_nodes.end() ? ast_it->second : obj.value.p)))
+                        class_vars_.erase(cn->name + "." + name);
+                    return;
+                }
+            }
+        } else if (Container* cont = contOf(obj)) {
+            if (seqLen(cont) < 0 && cont->container->erase(name)) return;
+        }
+        if (obj.type == ValueType::USERDATA && obj.value.p) {
+            auto fa = func_attrs_.find(obj.value.p);
+            if (fa != func_attrs_.end() && fa->second.erase(name)) return;
+        }
+        throw std::string("__exc__:AttributeError:" + attributeErrorText(obj, name));
     }
 
 
@@ -7380,21 +7671,37 @@ public:
         // hasattr / getattr on instances and classes: the full attribute
         // lookup (methods, class attributes, properties, __getattr__); only
         // an instance's own fields were seen.
-        if ((name == "hasattr" || name == "getattr") && args.size() >= 2 && isStringValue(args[1])) {
-            std::string err;
-            if (attributeErrorFor(args[0], getStringValue(args[1]), err)) {
-                Value v;
-                try { v = lookupAttribute(args[0], getStringValue(args[1]), ctx); }
-                catch (std::string& e) {
-                    if (!excTypeMatches(e, "AttributeError")) throw;
-                    v = UNDEFINED_VALUE;
-                }
-                bool has = v.type != ValueType::UNDEFINED;
-                if (name == "hasattr") { out = Value(has); return true; }
-                if (has) { out = v; return true; }
-                if (args.size() >= 3) { out = args[2]; return true; }
-                throw err;
+        // hasattr / getattr / setattr / delattr, for every kind of value, as
+        // in Python: hasattr and getattr with a default see an AttributeError
+        // (a missing attribute, or one a property / __getattr__ raises) as
+        // absence; other errors propagate.
+        if ((name == "hasattr" || name == "getattr" || name == "setattr" || name == "delattr") && args.size() >= 2) {
+            if (!isStringValue(args[1]))
+                pyRaise("TypeError", name + "(): attribute name must be string, not '" + typeNameOf(args[1]) + "'");
+            std::string an = getStringValue(args[1]);
+            if (name == "setattr") {
+                if (args.size() != 3) pyRaise("TypeError", "setattr expected 3 arguments, got " + std::to_string(args.size()));
+                setAttr(args[0], an, args[2]);
+                out = NONE_VALUE; return true;
             }
+            if (name == "delattr") {
+                if (args.size() != 2) pyRaise("TypeError", "delattr expected 2 arguments, got " + std::to_string(args.size()));
+                delAttrValue(args[0], an);
+                out = NONE_VALUE; return true;
+            }
+            if (args.size() > 3 || (name == "hasattr" && args.size() != 2))
+                pyRaise("TypeError", name + " expected " + (name == "hasattr" ? "2" : "at most 3") + " arguments, got " + std::to_string(args.size()));
+            Value v;
+            bool has;
+            try { has = getAttrValue(args[0], an, ctx, v); }
+            catch (std::string& e) {
+                if (!excTypeMatches(e, "AttributeError")) throw;
+                has = false;
+            }
+            if (name == "hasattr") { out = Value(has); return true; }
+            if (has) { out = v; return true; }
+            if (args.size() >= 3) { out = args[2]; return true; }
+            throw std::string("__exc__:AttributeError:" + attributeErrorText(args[0], an));
         }
         if (name == "callable" && args.size() == 1) {
             const Value& v = args[0];
@@ -7491,7 +7798,7 @@ public:
     bool isFunctionValue(const Value& v) {
         if (v.type != ValueType::USERDATA || !v.value.p) return false;
         std::string t = fnTag(func_names, v.value.p);
-        return t.rfind("__func__:", 0) == 0 || t.rfind("__lambda__", 0) == 0 || t.rfind("__builtin__:", 0) == 0;
+        return t.rfind("__func__:", 0) == 0 || t.rfind("__lambda__", 0) == 0 || t.rfind("__builtin__:", 0) == 0 || t.rfind("__bmethod__:", 0) == 0;
     }
     // Runs the constructor of a new instance: the first class in its MRO
     // that defines __init__ or init.
