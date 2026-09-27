@@ -96,7 +96,7 @@ std::string Sstr(const Val& v, const char* what) {
 // an empty tensor.
 Vec& V(Val& v, const char* what) {
     if (v.k == Val::VEC) return v.v;
-    if (v.is_num()) { double x = v.as_double(); v = Val::vec({x}); return v.v; }
+    if (v.is_num()) { bool ints = v.k != Val::FLOAT; double x = v.as_double(); v = Val::vec({x}, ints); return v.v; }
     if (v.k == Val::LIST && v.items.empty()) { v = Val::vec({}); return v.v; }
     fail("TypeError", std::string(what) + " must be a flat list of numbers");
 }
@@ -2233,53 +2233,96 @@ NT_OP("tensor", {
     if (a[0].k == Val::VEC) return Val::vec(std::move(a[0].v));
     return a[0];          // nested / mixed lists pass through unchanged
 });
-NT_OP("tensor_add", { return Val::vec(flat_bin(a, bin_fn("add"), "tensor_add(a, b)")); });
-NT_OP("tensor_sub", { return Val::vec(flat_bin(a, bin_fn("sub"), "tensor_sub(a, b)")); });
-NT_OP("tensor_mul", { return Val::vec(flat_bin(a, bin_fn("mul"), "tensor_mul(a, b)")); });
+// The result type follows the operation, as NumPy's promotion rule: integer
+// operands stay integers through the operations closed over the integers
+// (+ - *, dot, sum, max/min, abs, neg, sign) and become floats through the
+// ones that are not (/, mean, sqrt, exp, ...). A flat list of floats - what
+// every nytorch model passes - is unaffected. An integer result that a double
+// cannot hold exactly (|x| >= 2^53) is left a float rather than rounded.
+bool all_int(std::vector<Val>& a, size_t n) {
+    for (size_t i = 0; i < n && i < a.size(); i++) {
+        const Val& v = a[i];
+        if (v.k == Val::VEC ? !v.v_int : v.k == Val::FLOAT || !v.is_num()) return false;
+    }
+    return true;
+}
+bool exact_ints(const Vec& r) {
+    for (double x : r) if (!(std::fabs(x) < 9007199254740992.0)) return false;
+    return true;
+}
+Val ivec_or_vec(Vec&& r, bool ints) { bool ok = ints && exact_ints(r); return Val::vec(std::move(r), ok); }
+Val inum_or_num(double x, bool ints) {
+    if (ints && std::fabs(x) < 9007199254740992.0) return Val::integer((int64_t)x);
+    return Val::num(x);
+}
+// Integer dot/sum accumulate in int64 (exact); overflow falls back to double.
+bool isum(const Vec& x, const Vec* y, int64_t& out) {
+    int64_t s = 0;
+    for (size_t i = 0; i < x.size(); i++) {
+        int64_t t = (int64_t)x[i];
+        if (y && __builtin_mul_overflow(t, (int64_t)(*y)[i], &t)) return false;
+        if (__builtin_add_overflow(s, t, &s)) return false;
+    }
+    out = s;
+    return true;
+}
+NT_OP("tensor_add", { bool ints = all_int(a, 2); return ivec_or_vec(flat_bin(a, bin_fn("add"), "tensor_add(a, b)"), ints); });
+NT_OP("tensor_sub", { bool ints = all_int(a, 2); return ivec_or_vec(flat_bin(a, bin_fn("sub"), "tensor_sub(a, b)"), ints); });
+NT_OP("tensor_mul", { bool ints = all_int(a, 2); return ivec_or_vec(flat_bin(a, bin_fn("mul"), "tensor_mul(a, b)"), ints); });
 NT_OP("tensor_div", { return Val::vec(flat_bin(a, bin_fn("div"), "tensor_div(a, b)")); });
 NT_OP("tensor_dot", {
     need(a, 2, "tensor_dot(a, b)");
+    bool ints = all_int(a, 2);
     Vec& x = V(a[0], "a"); Vec& y = V(a[1], "b");
     if (x.size() != y.size()) fail("ValueError", "length mismatch: " + std::to_string(x.size()) + " vs " + std::to_string(y.size()));
+    int64_t is = 0;
+    if (ints && isum(x, &y, is)) return Val::integer(is);
     double s = 0; for (size_t i = 0; i < x.size(); i++) s += x[i] * y[i];
     return Val::num(s);
 });
 static Adder nt_alias_dot_product("tensor_dot_product", find("tensor_dot")->fn);
 NT_OP("tensor_scale", {
     need(a, 2, "tensor_scale(t, factor)");
-    if (a[1].is_seq()) return Val::vec(flat_bin(a, bin_fn("mul"), "tensor_scale(t, factor)"));
+    bool ints = all_int(a, 2);
+    if (a[1].is_seq()) return ivec_or_vec(flat_bin(a, bin_fn("mul"), "tensor_scale(t, factor)"), ints);
     Vec& x = V(a[0], "t"); double s = D(a[1], "factor");
     Vec r(x.size()); for (size_t i = 0; i < x.size(); i++) r[i] = x[i] * s;
-    return Val::vec(std::move(r));
+    return ivec_or_vec(std::move(r), ints);
 });
 Val flat_reduce(std::vector<Val>& a, const std::string& op) {
     need(a, 1, "tensor reduction(t)");
+    bool ints = all_int(a, 1);
     Vec& x = V(a[0], "t");
+    int64_t is = 0;
+    if (op == "sum" && ints && isum(x, nullptr, is)) return Val::integer(is);
     if (op == "sum") { double s = 0; for (auto v : x) s += v; return Val::num(s); }
     if (op == "mean") { if (x.empty()) return Val::num(0.0); double s = 0; for (auto v : x) s += v; return Val::num(s / (double)x.size()); }
     if (x.empty()) fail("ValueError", op + " of an empty tensor");
     double m = x[0];
     for (auto v : x) m = op == "max" ? std::max(m, v) : std::min(m, v);
-    return Val::num(m);
+    return inum_or_num(m, ints);
 }
 NT_OP("tensor_sum", { return flat_reduce(a, "sum"); });
 NT_OP("tensor_mean", { return flat_reduce(a, "mean"); });
 NT_OP("tensor_max", { return flat_reduce(a, "max"); });
 NT_OP("tensor_min", { return flat_reduce(a, "min"); });
-Val flat_un(std::vector<Val>& a, double (*f)(double)) {
+// int_closed: f maps integers to integers (abs, neg, sign), so integer input
+// keeps its type; every other f (exp, log, sqrt) returns floats.
+Val flat_un(std::vector<Val>& a, double (*f)(double), bool int_closed = false) {
     need(a, 1, "tensor op(t)");
-    if (a[0].is_num()) return Val::num(f(a[0].as_double()));
+    bool ints = int_closed && all_int(a, 1);
+    if (a[0].is_num()) return inum_or_num(f(a[0].as_double()), ints);
     Vec& x = V(a[0], "t"); Vec r(x.size());
     for (size_t i = 0; i < x.size(); i++) r[i] = f(x[i]);
-    return Val::vec(std::move(r));
+    return ivec_or_vec(std::move(r), ints);
 }
 NT_OP("tensor_exp", { return flat_un(a, [](double x) { return std::exp(x); }); });
 NT_OP("tensor_log", { return flat_un(a, [](double x) { return std::log(x); }); });
 // Legacy contract (both engines agreed): negative input clamps to 0.
 NT_OP("tensor_sqrt", { return flat_un(a, [](double x) { return std::sqrt(std::max(0.0, x)); }); });
-NT_OP("tensor_abs", { return flat_un(a, [](double x) { return std::fabs(x); }); });
-NT_OP("tensor_neg", { return flat_un(a, [](double x) { return -x; }); });
-NT_OP("tensor_sign", { return flat_un(a, [](double x) { return x > 0 ? 1.0 : (x < 0 ? -1.0 : 0.0); }); });
+NT_OP("tensor_abs", { return flat_un(a, [](double x) { return std::fabs(x); }, true); });
+NT_OP("tensor_neg", { return flat_un(a, [](double x) { return -x; }, true); });
+NT_OP("tensor_sign", { return flat_un(a, [](double x) { return x > 0 ? 1.0 : (x < 0 ? -1.0 : 0.0); }, true); });
 NT_OP("tensor_pow", {
     need(a, 2, "tensor_pow(t, exponent)");
     if (a[1].is_seq()) return Val::vec(flat_bin(a, bin_fn("pow"), "tensor_pow(t, exponent)"));

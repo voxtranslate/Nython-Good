@@ -1626,7 +1626,8 @@ class IDEOps(IDECore):
         body = body + "tab_size = " + str(self.default_tab_size) + "\n"
         body = body + "insert_spaces = " + str(self.default_insert_spaces) + "\n"
         body = body + "detect_indentation = " + str(self.detect_indent) + "\n"
-        body = body + "sidebar_width = " + str(self.SIDEBAR_W) + "\n"
+        # In layout units, so the width survives a move to another display scale.
+        body = body + "sidebar_width = " + str(int(self.SIDEBAR_W / self.dpi + 0.5)) + "\n"
         body = body + "minimap = " + str(self.minimap_on) + "\n"
         body = body + "panel = " + str(self.panel_open) + "\n"
         body = body + "sidebar = " + str(self.sidebar_open) + "\n"
@@ -1679,7 +1680,7 @@ class IDEOps(IDECore):
                     elif k == "sidebar_width":
                         var sw = self._int_or(v, 258)
                         if sw >= 150 and sw <= 700:
-                            self.SIDEBAR_W = sw
+                            self.SIDEBAR_W = self.dp(sw)
                     elif k == "minimap":
                         self.minimap_on = (v == "true")
                     elif k == "panel":
@@ -2247,6 +2248,10 @@ class IDEOps(IDECore):
         st["breaks"] = self.break_list
         st["watches"] = self.watches
         st["font_size"] = self.font_size
+        st["dpi"] = self.dpi
+        st["W"] = self.W
+        st["H"] = self.H
+        st["sidebar_w"] = self.SIDEBAR_W
         st["status"] = self.status_msg
         st["clipboard"] = self._get_clipboard()
         self._tools_dump(st)
