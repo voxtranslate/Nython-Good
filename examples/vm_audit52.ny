@@ -69,10 +69,10 @@ def except_body_raises():
         try:
             raise ValueError("a")
         except ValueError:
-            raise KeyError("b")
+            raise IndexError("b")
         finally:
             log2.append("fin")
-    except KeyError as e:
+    except IndexError as e:
         log2.append("outer " + str(e))
 except_body_raises()
 check("finally after a raising except body", log2, ["fin", "outer b"])
@@ -253,10 +253,10 @@ def with_propagates():
     var m3 = Manager(false)
     try:
         with m3:
-            raise KeyError("k")
-    except KeyError:
+            raise IndexError("k")
+    except IndexError:
         return m3.seen
-check("a false __exit__ lets it go on", with_propagates(), ["enter", "exit KeyError k"])
+check("a false __exit__ lets it go on", with_propagates(), ["enter", "exit IndexError k"])
 
 def with_return():
     var m4 = Manager(false)
