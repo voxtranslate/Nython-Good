@@ -42,7 +42,7 @@ bool SetRenderViewport(SDL_Renderer* r, const SDL_Rect* rc);
 bool SetRenderDrawColor(SDL_Renderer* r, Uint8 cr, Uint8 cg, Uint8 cb, Uint8 ca);
 SDL_Renderer* CreateRenderer(SDL_Window* w, const char* name);
 void DestroyRenderer(SDL_Renderer* r);
-SDL_Window* CreateWindow(const char* title, int w, int h, SDL_WindowFlags flags);
+SDL_Window* CreateWin(const char* title, int w, int h, SDL_WindowFlags flags);
 void DestroyWindow(SDL_Window* w);
 SDL_Texture* CreateTextureFromSurface(SDL_Renderer* r, SDL_Surface* s);
 void DestroyTexture(SDL_Texture* t);
@@ -78,7 +78,7 @@ void ShowOpenFolderDialog(SDL_DialogFileCallback cb, void* ud, SDL_Window* w, co
 #define SDL_SetRenderDrawColor     nyh::SetRenderDrawColor
 #define SDL_CreateRenderer         nyh::CreateRenderer
 #define SDL_DestroyRenderer        nyh::DestroyRenderer
-#define SDL_CreateWindow           nyh::CreateWindow
+#define SDL_CreateWindow           nyh::CreateWin
 #define SDL_DestroyWindow          nyh::DestroyWindow
 #define SDL_CreateTextureFromSurface nyh::CreateTextureFromSurface
 #define SDL_DestroyTexture         nyh::DestroyTexture

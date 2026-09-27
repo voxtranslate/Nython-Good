@@ -39,7 +39,9 @@
 #include <unordered_set>
 #include <vector>
 #include <sys/stat.h>
-#include <dirent.h>
+#ifndef _WIN32
+#include <dirent.h>     // Windows: platform_compat.hpp's emulation
+#endif
 
 #include "NythonExecutor.hpp"
 #include "NyFuzzy.hpp"

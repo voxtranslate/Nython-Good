@@ -1488,10 +1488,10 @@ public:   // NythonExecutor is a struct: members default to public
         } else if (kind == 2) {
             auto attr = static_pointer_cast<AttributeNode>(an->target);
             obj = evalNode(attr->object, ctx);
-            receiver_cache_[attr->object.get()] = obj;
+            receiver_cache()[attr->object.get()] = obj;
             try { old_val = evalNode(an->target, ctx); }
-            catch (...) { receiver_cache_.erase(attr->object.get()); throw; }
-            receiver_cache_.erase(attr->object.get());
+            catch (...) { receiver_cache().erase(attr->object.get()); throw; }
+            receiver_cache().erase(attr->object.get());
         } else {
             old_val = evalNode(an->target, ctx);
         }
@@ -4729,12 +4729,12 @@ public:
                 // side effect fired twice — and because the doubling compounds
                 // through nesting, an n-deep method chain performed 2^n - 1
                 // calls instead of n (v.add(1).add(1).add(1) incremented by 7).
-                // Reuse it via receiver_cache_ instead of evaluating again.
-                receiver_cache_[attr->object.get()] = obj;
+                // Reuse it via receiver_cache() instead of evaluating again.
+                receiver_cache()[attr->object.get()] = obj;
                 Value callee_val;
                 try { callee_val = evalAttribute(cn->callee, ctx, true); }
-                catch (...) { receiver_cache_.erase(attr->object.get()); throw; }
-                receiver_cache_.erase(attr->object.get());
+                catch (...) { receiver_cache().erase(attr->object.get()); throw; }
+                receiver_cache().erase(attr->object.get());
                 // Only use the fallback for builtin functions stored in dict namespaces
                 // (e.g. math.sqrt). For class methods (__func__), let callMethod handle
                 // self-binding correctly.
@@ -5227,7 +5227,14 @@ public:
     // Receivers already evaluated by evalCall, keyed by the object node. Lets
     // the callee-lookup fallback reuse a receiver instead of re-running it.
     // Per OS thread (round 74): two threads can run the same call node.
-    static inline thread_local std::unordered_map<const void*, Value> receiver_cache_;
+    // A function-local thread_local, not an `inline thread_local` member:
+    // MinGW (the Windows build) emits the member's TLS init function in every
+    // object that includes this header and the link fails with "multiple
+    // definition of TLS init function".
+    static std::unordered_map<const void*, Value>& receiver_cache() {
+        static thread_local std::unordered_map<const void*, Value> m;
+        return m;
+    }
 
     // soft: a missing attribute of an instance or class reads UNDEFINED
     // instead of raising AttributeError (for hasattr/getattr, and for the
@@ -5236,8 +5243,8 @@ public:
         auto an = static_pointer_cast<AttributeNode>(node);
         Value obj;
         {
-            auto rc = receiver_cache_.find(an->object.get());
-            if (rc != receiver_cache_.end()) obj = rc->second;
+            auto rc = receiver_cache().find(an->object.get());
+            if (rc != receiver_cache().end()) obj = rc->second;
             else obj = evalNode(an->object, ctx);
         }
         // Check instance properties first (and invoke @property getters)
@@ -5377,12 +5384,12 @@ public:
     Value lookupAttribute(const Value& obj, const std::string& name, Context* ctx) {
         auto objn = std::make_shared<VariableNode>(Token());
         auto an = std::make_shared<AttributeNode>(Token(), objn, name);
-        receiver_cache_[objn.get()] = obj;
+        receiver_cache()[objn.get()] = obj;
         try {
             Value v = evalAttribute(an, ctx, true);
-            receiver_cache_.erase(objn.get());
+            receiver_cache().erase(objn.get());
             return v;
-        } catch (...) { receiver_cache_.erase(objn.get()); throw; }
+        } catch (...) { receiver_cache().erase(objn.get()); throw; }
     }
     // The AttributeError for obj.name, when obj is an instance or a class.
     bool attributeErrorFor(const Value& obj, const std::string& name, std::string& err) {
