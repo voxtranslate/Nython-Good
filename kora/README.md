@@ -110,6 +110,7 @@ Verified (CPU, this environment):
 - The real NLLB-600M reads SAB's `inputs_embeds` exactly like tokens (max |Δ| = 0).
 - `tests/sab_learnability.py`: SAB with the real NLLB-600M on synthetic character-coded speech (see §6).
 - `tests/test_data_alignment.py`: every training/evaluation pair checked with independent models (see §7).
+- `tests/test_pairing_trace.py`: real items traced through tokenizer → `Collator` → labels / CTC targets / subword spans for every task (see §9).
 
 Not verified:
 - **Full-scale GPU training and the final WER/BLEU/MOS numbers.** Memory and speed figures are estimates.
@@ -176,5 +177,24 @@ The smoke test now asserts that every loss term of every task is actually produc
 
 Checked and left as is:
 - The `no_sab_anchor` ablation starts from the anchored Stage-1 model with a freshly initialised acoustic head. It measures swapping the bridge after the warm start, not training it from scratch; §6 is the controlled comparison, and the report states this.
-- Keep-best snapshots are stored in fp16. Restoring one perturbs weights by about 5·10⁻⁴ relative, which is negligible.
+
+## 9. Third pass: independent cross-check
+
+Four fresh reviewers each re-read one part of `kora.py`, and every finding was re-checked before it was fixed. In parallel, a trace pushed real YFACC, BibleTTS, eBible and FLEURS items through the real NLLB tokenizer, w2v-BERT feature extractor, `Collator` and segmentation. It checks, per task, that each example reaches the model with the right label, language tag, CTC target, token weights and subword spans. It found 0 errors.
+
+| Finding | Effect | Fix |
+|---|---|---|
+| The BibleTTS readers read the Bible's **section headings** aloud inside verse clips (e.g. *"Fifikon Kiristi"* before COL 1:15). Some Hausa clips hold only part of a long verse. A fuzzy ratio ≥ 80 still accepted such clips as "the whole verse" | The speech-translation reference did not match the audio: an untranslated heading, or a sentence missing from the audio | A whole-verse clip must also be 0.9–1.1 times the verse's length and be the only clip of that verse. Otherwise it keeps its exact transcript (ASR) but gets no English reference. Live sample: Hausa 73 → 56 references, Lingala 98 → 91, Yorùbá 75 → 75 |
+| WEB renumbers verses where the critical-text editions omit one (MAT 23:13/14 swapped; MAT 17:21, 18:11, JHN 5:4, … omitted) | Mistranslated Bible-MT pairs and English references next to the gaps | `_versification_suspects`: the known swap plus both neighbours of every isolated omission are excluded (24 verses ha/yo, 2 ln) |
+| `’` is both the apostrophe and the closing quote; `normalize_text` kept `zo.’` as `zo '` | Perfect hypotheses scored WER > 0; stray `'` words in CTC targets | Word-final and stand-alone apostrophes are dropped; word-initial/internal ones (`'ya'yan`, `sa'ad`) are kept |
+| `WER_ortho` removed the Hausa breve but not the macron (`sāke`), and the Hausa Bible has 3 551 macrons | The spelling-normalised WER still counted vowel-length marks as errors | The macron is added to `ORTHO_MARKS`. For Yorùbá it is the optional mid-tone mark, and an unmarked vowel already reads as mid |
+| Parallel passages across BibleTTS splits (1KI 12 ≈ 2CH 10) | A test verse could be heard and read in the adaptation split (TTS gold, UDA audio) | `near_duplicate_mask` (shared with the Bible-MT filter) drops adaptation clips that repeat a held-out verse |
+| The KD teacher and the encoder-matching targets ran with NLLB/LoRA **dropout on** | Two identical teacher passes differed by up to 2.6 per element, so the targets were noisy | The teacher pass runs in eval mode |
+| Route-balanced MBR added same-route agreement to the utility, and the cascade offered 1 candidate against 4 direct | The route with more near-duplicates won (direct 284/300 on exchangeable routes) | Same-route agreement is only a tie-break, and both routes offer n-best lists of the same size (147/300) |
+| The KORA-joint rows used λ = 0.5 whenever another mode won on dev | An untuned system in t02 | The best joint λ on dev is always stored |
+| S2ST ASR-BLEU was scored on raw references against the lowercase, unpunctuated ASR output | A perfect S2ST scored ASR-BLEU 54 | Both sides are normalised (standard ASR-BLEU); text_BLEU stays on raw text |
+| PL word-error labels compared the normalised hypothesis with raw gold | Hyphens and quotes produced false "errors" (AUROC/precision in t13) | Gold is normalised |
+| Resuming a phase rebuilt every loader at epoch 0 | Each Kaggle session re-trained on the same leading slice of `mt_bible`/MPD data | Loader seeds depend on the resume step |
+| Ablations used different task schedules/data orders, `no_sab_anchor` also changed the greedy-segmentation share (0.8 → 0.25), and `no_pl` kept the silver MMT pseudo-labels | Ablation deltas mixed in effects other than the one named | Shared seed key and RNG reseed for all ablations; the same segmentation mix; `no_pl` = no pseudo-labels of any kind |
+| Other | — | An empty cascade translation no longer aborts the MMS-TTS S2ST baseline. The TTS crop can now reach the last frame. The anchored bridge output is fp32 (an exact cascade at init under fp16 autocast). The duration predictor reads detached encoder features (Glow-TTS/Matcha-TTS). The keep-best snapshot is fp32 |
 

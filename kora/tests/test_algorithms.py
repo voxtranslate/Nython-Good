@@ -181,6 +181,24 @@ def test_asr_bleu_is_scored_on_normalised_text():
     gold = K.normalize_text(refs[0])
     assert all(K.word_agreement(gold, gold))
 
+
+def test_route_mbr_same_route_support_never_outweighs_cross_route_agreement():
+    # direct: 4 near-duplicates (strong same-route support); cascade: one hypothesis that agrees better with
+    # the direct list than any direct entry agrees with the cascade -> the cascade must be selected
+    rng = K.random.Random(0)
+    wins = {"direct": 0, "cascade": 0}
+    words = "the king said that they should come to the house of the lord today".split()
+    for _ in range(60):
+        base = [w for w in words if rng.random() > 0.2]
+        direct = [" ".join(w for w in base if rng.random() > 0.1) for _ in range(4)]
+        casc = [" ".join(w for w in words if rng.random() > 0.2)]
+        best_cross = max(K.route_mbr({"direct": direct, "cascade": casc}, selectable=[r], within=0.0)[2]
+                         for r in ("direct", "cascade"))
+        c, r, u = K.route_mbr({"direct": direct, "cascade": casc}, within=0.1)
+        assert u >= best_cross - 0.1 - 1e-9, (u, best_cross)  # the selected utility is (near-)maximal
+        wins[r] += 1
+    assert wins["cascade"] > 0, wins
+
 if __name__ == "__main__":
     for name, fn in list(globals().items()):
         if name.startswith("test_") and callable(fn):

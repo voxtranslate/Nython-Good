@@ -372,7 +372,7 @@ class PLConfig:
     tts_pl_retention: float = 0.5  # only when TTS is trained on pseudo-labels (tts_use_bible_gold=False)
     kde_keep: float = 0.9          # Gheini et al. (2023) Ratio-KDE baseline
     xsim_keep: float = 0.9         # Gheini et al. (2023) LASER-style filter, computed with SONAR
-    mbr_within_route: float = 0.1  # weight of same-route support in route-balanced MBR (tie-breaking)
+    mbr_within_route: float = 0.1  # route-balanced MBR: utilities within 0.1 chrF are tied; same-route support breaks ties
 
 
 @dataclass
@@ -652,7 +652,8 @@ def trim_silence(wav: np.ndarray, sr: int, top_db: float = 40.0, margin_s: float
 
 # ------------------------------------------------------------------- text helpers -----------
 TONE_MARKS = {"̀", "́", "̂", "̄", "̌", "̋", "̏"}  # not the dot-below
-ORTHO_MARKS = {"̆"}  # breve: the Hausa Bible marks short vowels ('yă', 'tă'); FLEURS Hausa does not
+ORTHO_MARKS = {"̆", "̄"}  # breve / macron: the Hausa Bible marks vowel length ('yă', 'sāke'); FLEURS Hausa
+# does not. (For Yorùbá the macron is the optional mid-tone mark; an unmarked vowel already reads as mid.)
 
 
 def normalize_text(s: str, strip_tones: bool = False, strip_ortho: bool = False) -> str:
@@ -674,6 +675,10 @@ def normalize_text(s: str, strip_tones: bool = False, strip_ortho: bool = False)
         else:
             out.append(" ")
     s = unicodedata.normalize("NFC", "".join(out))
+    # U+2019 is both the apostrophe and the closing quotation mark: an apostrophe that ends a word or stands
+    # alone ('Ku zo.’ -> "zo '") is a quote, not part of the word. Word-initial / -internal ones ('ya'yan,
+    # sa'ad) are kept.
+    s = re.sub(r"'+(?=\s|$)", " ", s)
     return re.sub(r"\s+", " ", s).strip()
 
 
@@ -685,6 +690,40 @@ def ctc_text(s: str) -> str:
 def tts_text(s: str) -> str:
     """TTS / alignment text: canonical characters without orthography-only marks."""
     return normalize_text(s, strip_ortho=True)
+
+
+def near_duplicate_mask(queries: List[str], refs: List[str], ratio: float = 90.0, cover: float = 0.4) -> np.ndarray:
+    """True for every query that is a near-duplicate of some ref (rapidfuzz ratio >= `ratio`), or that contains
+    or is contained in one (>= `cover` of either text's word 4-grams shared; texts of >= 6 words). Both sides
+    are compared after normalize_text. Used to keep repeated Bible passages (GEN/1CH genealogies, 1KI 12 ~
+    2CH 10, 2CH 36:22 = EZR 1:1, ...) from crossing the held-out boundary."""
+    from rapidfuzz import fuzz
+    from rapidfuzz.process import cdist
+    out = np.zeros(len(queries), dtype=bool)
+    if not queries or not refs:
+        return out
+    q, r = [normalize_text(x) for x in queries], [normalize_text(x) for x in refs]
+    for s in range(0, len(q), 2000):
+        out[s:s + 2000] = cdist(q[s:s + 2000], r, scorer=fuzz.ratio, dtype=np.uint8, workers=-1).max(1) >= ratio
+
+    def grams(t: str) -> set:
+        w = t.split()
+        return {tuple(w[i:i + 4]) for i in range(len(w) - 3)} if len(w) >= 6 else set()
+
+    index: Dict[tuple, List[int]] = defaultdict(list)
+    n_ref = []
+    for ci, t in enumerate(r):
+        g = grams(t)
+        n_ref.append(len(g))
+        for x in g:
+            index[x].append(ci)
+    for i, t in enumerate(q):
+        g = grams(t)
+        if out[i] or not g:
+            continue
+        hits = Counter(ci for x in g for ci in index.get(x, ()))
+        out[i] = any(c >= cover * n_ref[ci] or c >= cover * len(g) for ci, c in hits.items())
+    return out
 
 
 def detok_caption(s: str) -> str:
@@ -1174,6 +1213,26 @@ class DataHub:
         c, vv = cv.split(":")
         return book, int(c), int(vv)
 
+    WEB_RENUMBERED = {"MAT 23:13", "MAT 23:14"}  # WEB (Majority Text) has these two verses in the other order
+
+    @classmethod
+    def _versification_suspects(cls, ebible: Dict[str, Dict[str, str]], lang: str,
+                                lang_ranges: Dict[str, List[str]]) -> set:
+        """Verse ids whose English (WEB) text may not translate the `lang` verse of the same number: the known
+        WEB renumberings, and both neighbours of an isolated verse that the `lang` edition omits (a text-
+        critical omission such as MAT 23:14 is where editions renumber). Merged-range members are not gaps."""
+        out = set(cls.WEB_RENUMBERED)
+        L = ebible.get(lang, {})
+        merged = {x for members in lang_ranges.values() for x in members}
+        for v in ebible.get("en", {}):
+            if v in L or v in merged:
+                continue
+            b, c, n = cls._parse_vref(v)
+            prev, nxt = f"{b} {c}:{n - 1}", f"{b} {c}:{n + 1}"
+            if prev in L and nxt in L:
+                out.update([prev, nxt])
+        return out
+
     def _match_verses(self, lang: str, recs: List[dict], ebible: Dict[str, Dict[str, str]],
                       ranges: Dict[str, Dict[str, List[str]]], min_score: float = 80.0):
         """BibleTTS file names are NOT reliable verse ids (e.g. Yorùbá COL_001_Verse_010 holds the text of
@@ -1186,6 +1245,7 @@ class DataHub:
             b, c, _ = self._parse_vref(v)
             by_ch[(b, c)].append((v, normalize_text(t)))
         en, rg = ebible.get("en", {}), ranges.get(lang, {})
+        suspects = self._versification_suspects(ebible, lang, rg)
         for r in recs:
             r["vref_file"], r["vref"], r["vref_score"], r["en"] = r.get("vref"), None, 0.0, None
             m = self._VREF_RE.match(r["stem"].split("__")[-1])
@@ -1197,9 +1257,12 @@ class DataHub:
             if not cands:
                 continue
             best_v, best_s = max(((v, fuzz.ratio(q, t)) for v, t in cands), key=lambda x: x[1])
-            if best_s >= min_score:  # the clip is the whole verse (line): its English reference is exact
+            best_t = next(t for v, t in cands if v == best_v)
+            # ratio >= 80 alone also accepts ~70 % of a long verse, or a verse plus part of the next one
+            if best_s >= min_score and 0.9 <= len(q) / max(1, len(best_t)) <= 1.1:
+                # the clip is the whole verse (line): its English reference is exact
                 members = rg.get(best_v, [best_v])
-                ref = " ".join(en[x] for x in members if x in en).strip()
+                ref = "" if any(x in suspects for x in members) else " ".join(en[x] for x in members if x in en).strip()
                 r["vref"], r["vref_score"], r["en"] = best_v, float(best_s), ref or None
                 r["vrefs_covered"] = members
             elif len(q) >= 20:
@@ -1209,6 +1272,11 @@ class DataHub:
                 pv, ps = max(((v, fuzz.partial_ratio(q, t)) for v, t in cands), key=lambda x: x[1])
                 if ps >= 95:
                     r["vref"], r["vref_score"], r["vrefs_covered"], r["partial"] = pv, float(ps), [pv], True
+        # a verse read by more than one clip is split across them: none of them is the whole verse
+        n_clips = Counter(v for r in recs for v in r.get("vrefs_covered", []))
+        for r in recs:
+            if not r.get("partial") and r["vref"] and any(n_clips[v] > 1 for v in r.get("vrefs_covered", [])):
+                r["partial"], r["en"] = True, None
 
     # ------------------------------------------------------------------------- BibleTTS ----
     _VREF_RE = re.compile(r"^([0-9A-Z]{3})_(\d+)_Verse_(\d+)$")
@@ -1314,6 +1382,12 @@ class DataHub:
                 train = [r for rows in by_ch.values() for r in rows]
             if not dev or not test:
                 raise RuntimeError(f"BibleTTS[{lang}]: empty dev ({len(dev)}) or test ({len(test)}) split")
+            # repeated passages (1KI 12 ~ 2CH 10, GEN ~ 1CH genealogies, ...): an adaptation clip that repeats a
+            # held-out one would train the TTS voice (gold text) and the UDA branches on a test sentence
+            twin = near_duplicate_mask([r["text"] for r in train], [r["text"] for r in dev + test if r["text"]])
+            if twin.any():
+                LOG.info(f"BibleTTS[{lang}]: {int(twin.sum())} adaptation clips repeat a held-out verse, dropped")
+                train = [r for r, t in zip(train, twin) if not t]
             for split, rows in [("target_dev", dev), ("target_test", test), ("target_adapt", train)]:
                 for r in rows:
                     manifest.append(dict(uid=f"bible_{lang}_{r['stem']}", lang=lang, split=split, audio=r["audio"],
@@ -1339,8 +1413,8 @@ class DataHub:
         match) is excluded, so no transcript or translation of a used clip can reach the model through text.
         The Bible also repeats itself across chapters (Genesis genealogies in 1 Chronicles, 2 Chr 36:22 =
         Ezra 1:1, Nehemiah 7 ~ Ezra 2): a verse whose text in ANY language — English included — is a
-        near-duplicate (ratio >= 90) of a clip's transcript or English reference, or CONTAINS most of one
-        (>= 40% of the clip's word 4-grams, e.g. GEN 10:18 ⊃ 1CH 1:16), is excluded as well.
+        near-duplicate of a clip's transcript or English reference, contains one or is contained in one
+        (near_duplicate_mask; e.g. GEN 10:18 ⊃ 1CH 1:16), is excluded as well.
         Verses merged into multi-verse lines in any language are skipped (no 1:1 alignment)."""
         used_ch = set()
         for b in bible:
@@ -1350,6 +1424,8 @@ class DataHub:
                     bk, c, _ = self._parse_vref(v)
                     used_ch.add(f"{bk}_{c:03d}")
         merged = {v for rg in ranges.values() for members in rg.values() for v in members}
+        merged |= set().union(*[self._versification_suspects(ebible, l, ranges.get(l, {}))
+                                for l in self.cfg.all_langs if l != "en"])  # not 1:1 with WEB either
         langs = self.cfg.all_langs
         pool = []
         for v in ebible.get("en", {}):
@@ -1357,8 +1433,6 @@ class DataHub:
             if f"{bk}_{c:03d}" not in used_ch and v not in merged:
                 pool.append(v)
         pool = sorted(pool, key=lambda v: stable_hash("ebible|" + v))
-        from rapidfuzz import fuzz
-        from rapidfuzz.process import cdist
         used_txt = defaultdict(set)
         for b in bible:
             if b.get("text"):
@@ -1366,35 +1440,14 @@ class DataHub:
             if b.get("en"):
                 used_txt["en"].add(normalize_text(b["en"]))
         used_txt = {l: sorted(t) for l, t in used_txt.items()}
-
-        def grams(t: str) -> set:
-            w = t.split()
-            return {tuple(w[i:i + 4]) for i in range(len(w) - 3)}
-
-        gram_index: Dict[str, Dict[tuple, List[int]]] = {}
-        gram_n: Dict[str, List[int]] = {}
-        for l, texts in used_txt.items():
-            gram_index[l], gram_n[l] = defaultdict(list), []
-            for ci, t in enumerate(texts):
-                g = grams(t) if len(t.split()) >= 6 else set()
-                gram_n[l].append(max(1, len(g)))
-                for x in g:
-                    gram_index[l][x].append(ci)
         out, n_dup = [], 0
         for s in range(0, len(pool), 2000):
             rows = [{l: ebible[l][v] for l in langs if v in ebible.get(l, {})} for v in pool[s:s + 2000]]
             dup = np.zeros(len(rows), dtype=bool)
             for l, choices in used_txt.items():
                 idx = [i for i, r in enumerate(rows) if l in r]
-                if idx and choices:
-                    sim = cdist([normalize_text(rows[i][l]) for i in idx], choices, scorer=fuzz.ratio,
-                                dtype=np.uint8, workers=-1)
-                    dup[np.asarray(idx)[sim.max(1) >= 90]] = True
-                for i in idx:
-                    if dup[i]:
-                        continue
-                    hits = Counter(ci for x in grams(normalize_text(rows[i][l])) for ci in gram_index[l].get(x, ()))
-                    dup[i] = any(c >= 0.4 * gram_n[l][ci] for ci, c in hits.items())
+                if idx:
+                    dup[np.asarray(idx)] |= near_duplicate_mask([rows[i][l] for i in idx], choices)
             n_dup += int(dup.sum())
             out += [dict(vref=v, **r) for v, r, d in zip(pool[s:s + 2000], rows, dup) if not d and len(r) >= 2]
             if len(out) >= self.d.ebible_max_verses:
@@ -2544,7 +2597,7 @@ class SubwordAnchoredBridge(nn.Module):
         if base is None:
             return self.norm(self.out(p)) * self.emb_rms
         x = torch.cat([p, (base / self.emb_rms).to(p.dtype), conf.to(p.dtype)[..., None]], -1)
-        return base.to(p.dtype) + self.res(x) * self.emb_rms.to(p.dtype)
+        return base.float() + self.res(x).float() * self.emb_rms  # fp32: exact cascade at init under autocast
 
 
 class VisualUtilityGate(nn.Module):
@@ -2655,7 +2708,7 @@ class FlowTTS(nn.Module):
         x = self.emb(chars) + sinusoid(torch.arange(chars.shape[1], device=chars.device), self.emb.embedding_dim)[None]
         for blk in self.enc:
             x = blk(x, cmask, cond)
-        logd = self.dur(x.transpose(1, 2)).squeeze(1)
+        logd = self.dur(x.detach().transpose(1, 2)).squeeze(1)  # as Glow-TTS/Matcha: no duration grads into x
         return x, logd
 
     @staticmethod
@@ -2695,7 +2748,7 @@ class FlowTTS(nn.Module):
         C = mc.tts_crop_frames
         if C and T > C:
             lens = mask.sum(1)
-            starts = (torch.rand(B, device=x1.device) * (lens - C).clamp(min=0).float()).long()
+            starts = (torch.rand(B, device=x1.device) * (lens - C + 1).clamp(min=1).float()).long()
             idx = (starts[:, None] + torch.arange(C, device=x1.device)[None]).clamp(max=T - 1)
             pick = lambda t: t.gather(1, idx[..., None].expand(-1, -1, t.shape[-1]))
             x1c, muc, huc, maskc = pick(x1), pick(mu), pick(hu), mask.gather(1, idx)
@@ -3105,9 +3158,11 @@ def route_mbr(routes: Dict[str, List[str]], normalized: bool = False, within: fl
               selectable: Optional[Sequence[str]] = None) -> Tuple[str, str, float]:
     """ROUTE-BALANCED MBR. v1 pooled all hypotheses, so a route contributing 4 near-identical n-best entries
     always out-voted a route contributing one (KORA-mbr == KORA-direct). Here a hypothesis is scored by
-    its mean chrF agreement with every OTHER route (each route = one vote, whatever its n-best size),
-    plus a small same-route term that only breaks ties. With a single non-empty route this reduces to
-    ordinary MBR. Returns (selected hypothesis, its route, utility)."""
+    its mean chrF agreement with every OTHER route (each route = one vote, whatever its n-best size).
+    Agreement inside its own route is used ONLY to break (near-)ties: added to the utility, it would hand a
+    route with several near-duplicate n-best entries a bonus that a single-hypothesis route can never get.
+    With a single non-empty route this reduces to ordinary MBR. Returns (hypothesis, its route, utility).
+    `within` > 0 enables the tie-break (utilities equal to within `within` chrF points count as tied)."""
     key = normalize_text if normalized else (lambda s: s)
     R = {}
     for r, cs in routes.items():
@@ -3118,16 +3173,19 @@ def route_mbr(routes: Dict[str, List[str]], normalized: bool = False, within: fl
         return "", "", 0.0
     cand_routes = [r for r in R if selectable is None or r in selectable] or list(R)
     keys = {r: [key(c) for c in cs] for r, cs in R.items()}
-    best = ("", "", -1.0)
+    scored = []
     for r in cand_routes:
         for i, c in enumerate(R[r]):
             ci = keys[r][i]
             others = [float(np.mean([sent_chrf(o, ci) for o in keys[q]])) for q in R if q != r]
             same = [sent_chrf(o, ci) for j, o in enumerate(keys[r]) if j != i]
-            u = (float(np.mean(others)) if others else 0.0) + within * (float(np.mean(same)) if same else 0.0)
-            if u > best[2] + 1e-9:
-                best = (c, r, u)
-    return best
+            s_same = float(np.mean(same)) if same else 0.0
+            u = float(np.mean(others)) if others else s_same  # single route: ordinary MBR
+            scored.append((u, s_same, c, r))
+    top = max(u for u, _, _, _ in scored)
+    tied = [x for x in scored if x[0] >= top - max(within, 1e-9)]  # candidates in the scan order
+    u, _, c, r = max(tied, key=lambda x: x[1]) if within > 0 else tied[0]
+    return c, r, u
 
 
 def word_agreement(hyp: str, alt: str) -> List[bool]:
@@ -3323,8 +3381,11 @@ class PseudoLabeler:
         # translation routes: direct (the same SAB memory, built on the CTC hypothesis' own segmentation and
         # therefore independent of the selected transcript) and cascade (MT of the selected transcript)
         st_nb = D.nbest(mem, mm, ["en"] * n, pc.beams, pc.nbest)
-        y_casc = [y[0] for y in D.translate_texts(t_star, langs, "en", pc.beams)[0]]
-        y_sel = [route_mbr({"cascade": [y_casc[i]], "direct": st_nb[i]}, within=pc.mbr_within_route)
+        # both translation routes contribute an n-best of the same size (a 1-best against a 4-best would
+        # hand the larger route more chances to win the max, whatever the evidence)
+        y_casc_nb = D.translate_texts(t_star, langs, "en", pc.beams, n=pc.nbest)[0]
+        y_casc = [y[0] for y in y_casc_nb]
+        y_sel = [route_mbr({"cascade": y_casc_nb[i], "direct": st_nb[i]}, within=pc.mbr_within_route)
                  for i in range(n)]
         y_star = [y for y, _, _ in y_sel]
         y_route = [r for _, r, _ in y_sel]
@@ -3804,8 +3865,7 @@ class Trainer:
         token-synchronous NLLB-encoder matching wherever the segmentation's subwords equal the gold ones.
         The 'no_sab_anchor' ablation uses acoustic-only vectors and CE only."""
         m, tc, dev = self.model, self.tc, self.device
-        p_greedy = tc.sab_greedy_prob if variant.sab_anchor else 0.25
-        greedy = random.random() < p_greedy
+        greedy = random.random() < tc.sab_greedy_prob
         seg = m.segment(enc, batch["seg_text"], "greedy" if greedy else "viterbi")
         # diagnostics (logged, not optimised): share of utterances whose CTC alignment failed (uniform /
         # pseudo-token fallback) — high values mean the bridge is fed without a usable alignment
@@ -3826,9 +3886,14 @@ class Trainer:
         t_src = [[self.tok.lang_ids[l]] + g + [self.tok.eos_id] for l, g in zip(batch["src_lang"], gold)]
         t_ids = _pad_labels(t_src, self.tok.pad_id).to(dev)
         t_am = (t_ids != self.tok.pad_id).long()
-        with torch.no_grad():
-            t_mem = m.encode_text(t_ids, t_am)
-            t_prob, t_idx = m.teacher_topk(t_mem, t_am.bool(), dec_in, sel, tc.kd_topk)
+        was_training = m.nllb.training
+        m.nllb.eval()  # the teacher is deterministic: no dropout / LoRA dropout in its targets
+        try:
+            with torch.no_grad():
+                t_mem = m.encode_text(t_ids, t_am)
+                t_prob, t_idx = m.teacher_topk(t_mem, t_am.bool(), dec_in, sel, tc.kd_topk)
+        finally:
+            m.nllb.train(was_training)
         parts["kd"] = tc.lambda_kd * m.kd_loss(logp, sel, t_prob, t_idx, batch)
         # token-synchronous NLLB-encoder matching: same subwords at the same positions -> position-wise MSE
         rows = torch.tensor([seg.tok_ids[b] is not None and seg.tok_ids[b] == gold[b] for b in range(len(gold))],
@@ -3972,7 +4037,9 @@ class Trainer:
 
     def train_phase(self, phase: str, total_steps: int, weights: Dict[str, float], variant: Variant,
                     pl_entries=None, silver=None, tts_entries=None, mpd_warmup: int = 0, ctc_warmup: int = 0,
-                    dev_eval: bool = True):
+                    dev_eval: bool = True, seed_key: Optional[str] = None):
+        """seed_key (default: the phase name) fixes the task schedule and the data order; ablations share one
+        key so that they differ only in what their variant changes."""
         if self.done(f"{phase}_done"):
             LOG.info(f"[{phase}] already complete — skipping")
             return
@@ -3982,11 +4049,11 @@ class Trainer:
             raise RuntimeError(f"[{phase}] no task has data")
         self._ctc_warmup = ctc_warmup
         self.model.sab_mode = "anchored" if variant.sab_anchor else "acoustic"
-        loaders = self.make_loaders(w, pl_entries, silver, tts_entries, seed=stable_hash(phase) % 10000)
+        seed_key = seed_key or phase
         tasks = list(w.keys())
         probs = np.asarray([w[t] for t in tasks], dtype=np.float64)
         probs = probs / probs.sum()
-        schedule = self._task_schedule(phase, tasks, probs, total_steps, mpd_warmup)
+        schedule = self._task_schedule(seed_key, tasks, probs, total_steps, mpd_warmup)
         opt, sched, scaler = self.build_optimizer(total_steps)
         start = 0
         last = self.ckpt.latest_for_phase(phase)
@@ -4006,6 +4073,10 @@ class Trainer:
             LOG.info(f"[{phase}] resumed from {os.path.basename(last)} at step {start}")
             del st
             free_memory()
+        # data order: a session resumed at step `start` draws a fresh permutation instead of replaying the
+        # batches the interrupted session already consumed (loaders keep no position across sessions)
+        loaders = self.make_loaders(w, pl_entries, silver, tts_entries,
+                                    seed=(stable_hash(seed_key) + 7919 * start) % 1_000_003)
         LOG.info(f"[{phase}] training {total_steps} steps | tasks {dict(zip(tasks, [round(float(p), 3) for p in probs]))}")
         self.model.train()
         agg = defaultdict(list)
@@ -4069,7 +4140,7 @@ class Trainer:
                     if keep_best and step + 1 > ctc_warmup and (best is None or last_dev > best):
                         best = last_dev
                         self.ckpt.save(f"best_{phase}.pt", dict(step=step + 1, score=best, sab_mode=self.model.sab_mode,
-                                                                model=trainable_state_dict(self.model, half=True)))
+                                                                model=trainable_state_dict(self.model)))
                         self.mark(f"best_{phase}", best)
                 if (step + 1) % self.tc.save_every == 0 and step + 1 < total_steps:
                     self.ckpt.save(f"step_{phase}_{step + 1:06d}.pt",
@@ -4292,9 +4363,12 @@ class Trainer:
             self.load_snapshot("final_stage1.pt")
             pl_entries, silver = self.entries_from_pl(recs, v, self.cfg.pl.retention_schedule[0], 1)
             w = dict(tc.round_task_weights)
-            if not v.use_pl:
+            if not v.use_pl:  # no pseudo-labels of any kind: neither RAPL speech labels nor silver MMT text
                 w["pl"] = 0.0
-            self.train_phase(phase, tc.ablation_steps, w, v, pl_entries, silver)
+                silver = None
+            if not self.ckpt.latest_for_phase(phase):  # same RNG stream for every variant (resume restores its own)
+                seed_everything(tc.seed)
+            self.train_phase(phase, tc.ablation_steps, w, v, pl_entries, silver, seed_key="ablations")
         return names
 
 
@@ -4352,16 +4426,16 @@ class KoraInferencer:
         if route not in ("cascade", "mbr"):
             raise ValueError(route)
         transcripts = self._transcripts_from_enc(enc, src_langs, beams)
-        casc, _ = D.translate_texts(transcripts, src_langs, tgt_lang, beams, vis_rows, gate_mode)
-        casc = [c[0] for c in casc]
+        casc_nb, _ = D.translate_texts(transcripts, src_langs, tgt_lang, beams, vis_rows, gate_mode, n=nret)
         if route == "cascade":
-            return casc, gates
-        # the cascade route also proposes the MT of the greedy CTC transcript. It is a second CANDIDATE of the
-        # same route, not a route of its own: two cascades share the MT system (and usually the transcript),
-        # and as separate routes they would out-vote the direct route (the v1 failure route_mbr prevents)
+            return [c[0] for c in casc_nb], gates
+        # the cascade route also proposes the MT of the greedy CTC transcript. It is a CANDIDATE of the same
+        # route, not a route of its own (two cascades share the MT system and usually the transcript, and would
+        # out-vote the direct route), and it takes the place of the last n-best entry so that both routes offer
+        # the same number of candidates
         greedy = D.ctc_greedy(enc)
         casc_g = [c[0] for c in D.translate_texts(greedy, src_langs, tgt_lang, beams, vis_rows, gate_mode)[0]]
-        out = [route_mbr({"direct": direct[i], "cascade": [casc[i], casc_g[i]]},
+        out = [route_mbr({"direct": direct[i], "cascade": casc_nb[i][:max(1, nret - 1)] + [casc_g[i]]},
                          within=self.cfg.pl.mbr_within_route)[0] for i in range(n)]
         return out, gates
 
@@ -4383,9 +4457,10 @@ class KoraInferencer:
         enc = D.encode(wavs)
         transcripts = self._transcripts_from_enc(enc, langs, beams)
         mem, mm, _, _ = D.memory(enc, langs, "greedy")
-        direct = D.nbest(mem, mm, [tgt_lang] * len(wavs), beams, min(beams, 4))
-        casc = [c[0] for c in D.translate_texts(transcripts, langs, tgt_lang, beams)[0]]
-        trans = [route_mbr({"direct": direct[i], "cascade": [casc[i]]}, within=self.cfg.pl.mbr_within_route)[0]
+        k = min(beams, 4)
+        direct = D.nbest(mem, mm, [tgt_lang] * len(wavs), beams, k)
+        casc = D.translate_texts(transcripts, langs, tgt_lang, beams, n=k)[0]
+        trans = [route_mbr({"direct": direct[i], "cascade": casc[i]}, within=self.cfg.pl.mbr_within_route)[0]
                  for i in range(len(wavs))]
         return [dict(transcript=a, translation=b) for a, b in zip(transcripts, trans)]
 
@@ -5841,7 +5916,9 @@ class ReportWriter:
         "excluded from it. Bible-domain speech translation is scored against the World English Bible (public domain).",
         "BibleTTS file names are not reliable verse ids (all Yorùbá clips and many Hausa clips are shifted; many Hausa "
         "clips are sub-verse segments). Verses are identified by matching the transcript against the same translation "
-        "in eBible; only whole-verse clips receive an English reference.",
+        "in eBible. Only clips that are exactly one whole verse (same text and length, no section heading read "
+        "aloud, no second clip of that verse) receive an English reference; verses next to a WEB renumbering are "
+        "never used as references or MT pairs.",
         "MMS-1B-all and MMS-TTS were trained on MMS-lab New-Testament recordings; comparisons on the BibleTTS "
         "domain may therefore favour the MMS baselines.",
         "MMS-TTS has no Lingala model: the MMS-TTS and MMS cascade S2ST baselines are reported for Hausa and "
