@@ -388,11 +388,16 @@ node_ptr Parser::statement(){
     if(see(TokenType::NameSpace)) return namespaceDecl();
 
     // Flow statements
-    if(see(TokenType::Global)) {
-        next(); // consume 'global'
-        // global x, y, z - just consume identifiers
-        identifier();
-        while(have(TokenType::Comma)) identifier();
+    // global x, y / nonlocal x, y. Assignment already rebinds an existing
+    // variable; the declaration matters for a `for` loop variable, which is
+    // otherwise a new local.
+    if(see(TokenType::Global) || (see(TokenType::Identifier) && token().value == "nonlocal"
+                                  && peek(1).type() == TokenType::Identifier)) {
+        next(); // consume 'global' / 'nonlocal'
+        do {
+            std::string n = identifier();
+            if(!outer_decls_.empty()) outer_decls_.back().push_back(n);
+        } while(have(TokenType::Comma));
         have(TokenType::SemiColon); have(TokenType::NewLine);
         return make_node<BlockNode>(token()); // no-op
     }
@@ -847,8 +852,11 @@ node_ptr Parser::addition(){
 
 node_ptr Parser::multiplication(){
     node_ptr left = power();
-    while(have(TokenType::Mul)||have(TokenType::Div)||have(TokenType::Mod)||have(TokenType::RevDiv)){
-        Token op = prev(); node_ptr right = power();
+    // `a @ b` (matrix multiplication: __matmul__). At the start of a
+    // statement `@` is a decorator; statement() takes that before this.
+    while(have(TokenType::Mul)||have(TokenType::Div)||have(TokenType::Mod)||have(TokenType::RevDiv)||have(TokenType::At)){
+        Token op = prev(); if(op.type() == TokenType::At) op.value = "@";
+        node_ptr right = power();
         left = make_node<BinaryNode>(op, left, right);
     }
     return left;
@@ -1726,6 +1734,13 @@ node_ptr Parser::forStmt(){
     have(TokenType::Colon);
     node_ptr body = blockOrStmt();
     auto fnode = make_node<ForNode>(tok, var, iter, body);
+    if(!outer_decls_.empty()){
+        auto& d = outer_decls_.back();
+        auto declared = [&](const std::string& n){ return std::find(d.begin(), d.end(), n) != d.end(); };
+        bool rb = declared(var->value());
+        for(auto& u : unpack_vars) rb = rb || declared(u->value());
+        static_cast<ForNode*>(fnode.get())->rebinds = rb;
+    }
     static_cast<ForNode*>(fnode.get())->unpack_vars = std::move(unpack_vars);
     return fnode;
 }
@@ -1741,7 +1756,11 @@ node_ptr Parser::functionDecl(bool is_method){
         mustBe(TokenType::ParenClose);
     }
     have(TokenType::Colon);
+    outer_decls_.emplace_back();
+    auto saved_defaults = std::move(param_defaults_);
     node_ptr body = blockOrStmt();
+    param_defaults_ = std::move(saved_defaults);
+    outer_decls_.pop_back();
     auto fn = make_node<FunctionNode>(tok, name, body, is_method);
     for(auto& p : params) fn->add(p);
     static_cast<FunctionNode*>(fn.get())->defaults = std::move(param_defaults_);

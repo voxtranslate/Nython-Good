@@ -42,6 +42,8 @@ private:
 
     /// Temporary storage for parameter default values during function parsing
     std::vector<node_ptr> param_defaults_;
+    // Per function being parsed: the names it declared `global`/`nonlocal`.
+    std::vector<std::vector<std::string>> outer_decls_;
     // Set when a statement was terminated by ';' rather than a newline.
     // Statement parsers consume the semicolon themselves, so blockOrStmt()
     // cannot otherwise tell that an inline suite continues.

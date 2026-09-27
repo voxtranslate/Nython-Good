@@ -1231,6 +1231,7 @@ public:   // NythonExecutor is a struct: members default to public
             Value res;
             if (binaryDunder(bn->op, lv, rv, ctx, res)) return res;
         }
+        if (bn->op == "@") throw std::string("__exc__:TypeError:unsupported operand type(s) for @");
 
         if (bn->op == "+") {
             // List concatenation
@@ -1766,6 +1767,7 @@ return lv * rv;
             {"<", {"__lt__", "__gt__"}}, {">", {"__gt__", "__lt__"}},
             {"<=", {"__le__", "__ge__"}}, {">=", {"__ge__", "__le__"}},
             {"==", {"__eq__", "__eq__"}}, {"!=", {"__ne__", "__ne__"}},
+            {"@", {"__matmul__", "__rmatmul__"}},
         };
         auto it = m.find(op);
         if (it == m.end()) return false;
@@ -2066,12 +2068,28 @@ return lv * rv;
         Value iter_val = evalNode(fn->iterable, ctx);
         std::string var_name = fn->var->value();
         Value result = NONE_VALUE;
+        // The loop variable is a local, unless the function declared it
+        // `global`/`nonlocal` (then the existing binding is rebound).
+        auto bindv = [&](const std::string& n, const Value& v) {
+            if (fn->rebinds) ctx->setByName(n, v); else ctx->defineByName(n, v);
+        };
+        // An object whose __iter__ returns a list, a generator or iter(...):
+        // the loop runs over that. (The loop below called __next__ on the
+        // list, got none forever and never ended.)
+        Value pre_iterator; bool have_pre_iterator = false;
+        if (isInstanceValue(iter_val) && instanceHasMethod(iter_val, "__iter__")) {
+            std::vector<Value> no_args;
+            Value it = callMethod(iter_val, "__iter__", no_args, ctx);
+            if (isInstanceValue(it)) { pre_iterator = it; have_pre_iterator = true; }
+            else if (it.type != ValueType::NONE && it.type != ValueType::UNDEFINED) iter_val = it;
+            else throw std::string("__exc__:TypeError:iter() returned non-iterator of type 'NoneType'");
+        }
 
         // range() returns an integer — iterate 0..n-1
         if (iter_val.type == ValueType::INTEGER) {
             int64_t n = bigint_to_i64(iter_val.value.i);
             for (int64_t i = 0; i < n; i++) {
-                ctx->defineByName(var_name, Value((int)i));
+                bindv(var_name, Value((int)i));
                 try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
                 catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
                 NY_LOOP_FLOW(broke)
@@ -2093,7 +2111,7 @@ return lv * rv;
                     // Dict/map iteration — iterate all non-internal keys
                     for (auto& [key, val] : *cont->container) {
                         if (key.empty() || key[0] == '_') continue; // skip __len__ etc
-                        ctx->defineByName(var_name, makeStringValue(key));
+                        bindv(var_name, makeStringValue(key));
                         try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
                         catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
                         NY_LOOP_FLOW(broke)
@@ -2114,16 +2132,16 @@ return lv * rv;
                                 // First var gets index 0
                                 auto it0 = elem_cont->container->find("0");
                                 if (it0 != elem_cont->container->end())
-                                    ctx->defineByName(var_name, it0->second);
+                                    bindv(var_name, it0->second);
                                 // Remaining vars get indices 1, 2, ...
                                 for (size_t ui = 0; ui < fn->unpack_vars.size(); ui++) {
                                     auto itN = elem_cont->container->find(std::to_string(ui + 1));
                                     if (itN != elem_cont->container->end())
-                                        ctx->defineByName(fn->unpack_vars[ui]->value(), itN->second);
+                                        bindv(fn->unpack_vars[ui]->value(), itN->second);
                                 }
                             }
                         } else {
-                            ctx->defineByName(var_name, elem);
+                            bindv(var_name, elem);
                         }
                         try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
                         catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
@@ -2142,7 +2160,7 @@ return lv * rv;
                 std::string* sp = static_cast<std::string*>(iter_val.value.p);
                 for (size_t i = 0; i < sp->size(); i++) {
                     std::string ch(1, (*sp)[i]);
-                    ctx->defineByName(var_name, makeStringValue(ch));
+                    bindv(var_name, makeStringValue(ch));
                     try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
                     catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
                     NY_LOOP_FLOW(broke)
@@ -2156,11 +2174,9 @@ return lv * rv;
         if (iter_val.type == ValueType::USERDATA && iter_val.value.p && !string_ptrs_.count(iter_val.value.p) && instance_to_class.count(iter_val.value.p)) {
             // Call __iter__ if present to get the iterator (may return self)
             std::vector<Value> no_args;
-            Value iterator = iter_val;
-            if (instanceHasMethod(iter_val, "__iter__")) {
-                Value it = callMethod(iter_val, "__iter__", no_args, ctx);
-                if (it.type != ValueType::NONE && it.type != ValueType::UNDEFINED) iterator = it;
-            }
+            Value iterator = have_pre_iterator ? pre_iterator : iter_val;
+            if (!instanceHasMethod(iterator, "__next__"))
+                throw std::string("__exc__:TypeError:'" + instanceClassName(iterator) + "' object is not iterable");
             // Now call __next__ repeatedly until StopIteration
             while (true) {
                 Value item;
@@ -2170,23 +2186,23 @@ return lv * rv;
                 } catch (nython::node::ReturnSignal& rs) {
                     item = rs.value;
                 } catch (std::string& exc) {
-                    if (exc.find("StopIteration") != std::string::npos) { stop = true; }
+                    if (excTypeMatches(exc, "StopIteration") || exc.find("StopIteration") != std::string::npos) { stop = true; }
                     else throw;
-                } catch (...) { stop = true; }
+                }
                 if (stop) break;
                 // Unpack tuples for k,v iteration
                 if (!fn->unpack_vars.empty() && item.isCollectable()) {
                     auto* cont = dynamic_cast<Container*>(item.value.gc);
                     if (cont && cont->container) {
-                        ctx->defineByName(var_name, cont->container->count("0") ? (*cont->container)["0"] : NONE_VALUE);
+                        bindv(var_name, cont->container->count("0") ? (*cont->container)["0"] : NONE_VALUE);
                         for (size_t ui = 0; ui < fn->unpack_vars.size(); ui++) {
                             std::string uname = fn->unpack_vars[ui]->value();
                             auto uit = cont->container->find(std::to_string(ui + 1));
-                            ctx->defineByName(uname, uit != cont->container->end() ? uit->second : NONE_VALUE);
+                            bindv(uname, uit != cont->container->end() ? uit->second : NONE_VALUE);
                         }
                     }
                 } else {
-                    ctx->defineByName(var_name, item);
+                    bindv(var_name, item);
                 }
                 try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
                 catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
@@ -4426,6 +4442,9 @@ public:
                 if (pit != instance_properties.end()) {
                     try {
                         Value attr_val = pit->second->getByName(method_name);
+                        // An object with __call__ held in an attribute.
+                        if (isInstanceValue(attr_val) && instanceHasMethod(attr_val, "__call__"))
+                            return callMethod(attr_val, "__call__", args, ctx, &kw_args);
                         if (attr_val.type == ValueType::USERDATA && attr_val.value.p) {
                             auto fname_it = func_names.find(attr_val.value.p);
                             if (fname_it != func_names.end()) {
@@ -6972,6 +6991,18 @@ public:
     // __next__ / __getitem__: its items first. sorted/min/max over objects
     // order by __lt__ (or the other side's __gt__), sum adds with __add__ /
     // __radd__, issubclass walks the MRO, hash() uses __hash__.
+    bool isGenValue(const Value& v) {
+        if (!v.isCollectable() || !v.value.gc) return false;
+        auto* c = dynamic_cast<Container*>(v.value.gc);
+        return c && c->container && c->container->count("__gen__");
+    }
+    Value makeGenValue(const std::vector<Value>& items) {
+        Value g = makeListValue(items);
+        auto* c = dynamic_cast<Container*>(g.value.gc);
+        (*c->container)["__gen__"] = Value(1);
+        (*c->container)["__idx__"] = Value(0);
+        return g;
+    }
     bool iterableBuiltin(const std::string& name, std::vector<Value>& args, Context* ctx, Value& out) {
         static const std::unordered_set<std::string> takes = {
             "list","tuple","set","sorted","min","max","sum","any","all","enumerate","reversed","zip","frozenset"};
@@ -7002,6 +7033,57 @@ public:
             return true;
         }
         if (name == "bool" && args.size() == 1 && isInstanceValue(args[0])) { out = Value(isTruthy(args[0])); return true; }
+        // iter(x) and next(it[, default]). A generator here is its collected
+        // values with a read position (__gen__/__idx__), which next() already
+        // understands; iter() of a list, string or dict makes one of those,
+        // and objects go through __iter__/__next__. Both returned none.
+        if (name == "callable" && args.size() == 1) {
+            const Value& v = args[0];
+            bool r = isFunctionValue(v);
+            if (!r && v.type == ValueType::USERDATA && v.value.p) {
+                if (fnTag(func_names, v.value.p).rfind("__class__:", 0) == 0) r = true;
+                else if (isInstanceValue(v)) r = instanceHasMethod(v, "__call__");
+            }
+            out = Value(r); return true;
+        }
+        if (name == "iter" && !args.empty()) {
+            const Value& v = args[0];
+            if (isGenValue(v)) { out = v; return true; }
+            if (isInstanceValue(v)) {
+                std::vector<Value> none;
+                if (instanceHasMethod(v, "__iter__")) { out = callMethod(v, "__iter__", none, ctx); return true; }
+                if (instanceHasMethod(v, "__next__")) { out = v; return true; }
+                if (!instanceHasMethod(v, "__getitem__"))
+                    throw std::string("__exc__:TypeError:'" + instanceClassName(v) + "' object is not iterable");
+            }
+            out = makeGenValue(iterValues(v, ctx));
+            return true;
+        }
+        if (name == "next" && !args.empty()) {
+            if (isInstanceValue(args[0])) {
+                if (!instanceHasMethod(args[0], "__next__"))
+                    throw std::string("__exc__:TypeError:'" + instanceClassName(args[0]) + "' object is not an iterator");
+                std::vector<Value> none;
+                try { out = callMethod(args[0], "__next__", none, ctx); }
+                catch (std::string& e) {
+                    if (args.size() >= 2 && excTypeMatches(e, "StopIteration")) { out = args[1]; return true; }
+                    throw;
+                }
+                return true;
+            }
+            if (isGenValue(args[0])) {
+                auto* c = dynamic_cast<Container*>(args[0].value.gc);
+                auto ii = c->container->find("__idx__"), li = c->container->find("__len__");
+                int64_t idx = ii != c->container->end() ? bigint_to_i64(ii->second.value.i) : 0;
+                int64_t len = li != c->container->end() ? bigint_to_i64(li->second.value.i) : 0;
+                if (idx >= len) {
+                    if (args.size() >= 2) { out = args[1]; return true; }
+                    throw std::string("__exc__:StopIteration:");
+                }
+                return false;
+            }
+            throw std::string("__exc__:TypeError:object is not an iterator");
+        }
         if (!takes.count(name) || args.empty()) return false;
         size_t upto = (name == "zip") ? args.size() : 1;
         bool changed = false;

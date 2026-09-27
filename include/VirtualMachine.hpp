@@ -100,6 +100,7 @@ enum class Op : uint8_t {
     // END_FINALLY acts on the state once the finally body has run.
     FIN_NORMAL, FIN_RETURN, FIN_JUMP, END_FINALLY,
     WITH_ENTER, WITH_EXIT,
+    BINARY_MATMUL,   // a @ b: __matmul__ / __rmatmul__ only
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1410,6 +1411,7 @@ private:
         // exactly once — silently, with no error.
         loops_.push_back({start,{},{},true});
         int fi=C().here(); emit(Op::FOR_ITER,0,l);
+        auto bind_loop=[&](const std::string& n){ if(nd->rebinds) emit_sn(n,l); else emit_dn(n,l); };
         if(!nd->unpack_vars.empty()) {
             // for a, b, c in ...: FOR_ITER pushed [a_val, b_val,...]; unpack by index
             std::string tmp="__for_unpack__";
@@ -1417,15 +1419,19 @@ private:
             // Assign first var (nd->var)
             int idx0=C().add_const(VMVal::make_int(0));
             emit_ln(tmp,l); emit(Op::LOAD_CONST,idx0,l); emit(Op::LOAD_SUBSCR,0,l);
-            emit_sn(nd->var?nd->var->value():"_",l);
+            bind_loop(nd->var?nd->var->value():"_");
             // Assign rest (nd->unpack_vars)
             for(int ui=0;ui<(int)nd->unpack_vars.size();ui++){
                 int ci=C().add_const(VMVal::make_int(ui+1));
                 emit_ln(tmp,l); emit(Op::LOAD_CONST,ci,l); emit(Op::LOAD_SUBSCR,0,l);
-                emit_sn(nd->unpack_vars[ui]->value(),l);
+                bind_loop(nd->unpack_vars[ui]->value());
             }
         } else {
-            emit_sn(nd->var?nd->var->value():"_",l);
+            // The loop variable is a local of the running function (as on
+            // the interpreter): a STORE rebound a global of the same name,
+            // so `for i in ...` inside any function overwrote a module `i`.
+            // Declared global/nonlocal: the existing binding is rebound.
+            bind_loop(nd->var?nd->var->value():"_");
         }
         persist_depth_++;   // the iterator stays on the stack during the body
         visit_stmt(nd->body);
@@ -1717,6 +1723,7 @@ private:
         if(op=="==="||op=="equals") return Op::COMPARE_SEQ;
         if(op=="!==") return Op::COMPARE_SNE;
         if(op=="xor"||op=="^^") return Op::LOGICAL_XOR;
+        if(op=="@") return Op::BINARY_MATMUL;
         return Op::NOP;
     }
     static Op aug_op(const std::string& op) {
@@ -2870,6 +2877,10 @@ private:
             case Op::BINARY_MOD:      { VMVal r=pop(),l=pop(),res;
                 if(binary_dunder(l,r,"__mod__","__rmod__",res)){ push(res); break; }
                 push(op_mod(l,r));       break; }
+            case Op::BINARY_MATMUL:   { VMVal r=pop(),l=pop(),res;
+                if(binary_dunder(l,r,"__matmul__","__rmatmul__",res)){ push(res); break; }
+                throw_exception(make_exception("TypeError",{VMVal::make_str("unsupported operand type(s) for @")}));
+                break; }
             case Op::BINARY_POW:      { VMVal r=pop(),l=pop(),res;
                 if(binary_dunder(l,r,"__pow__","__rpow__",res)){ push(res); break; }
                 // Return int when both args are ints and exponent >= 0
@@ -5186,6 +5197,34 @@ private:
         // ── map / filter (call Nython functions) ────────────────────────
         // next(it[, default]): an exhausted iterator raises StopIteration
         // (or returns the default), as on the interpreter.
+        // iter(x): generators and iterators are their own; an object goes
+        // through __iter__ (or is its own iterator with __next__); a list,
+        // string or dict gives an iterator over its items. It was not defined,
+        // so `def __iter__(self): return iter(self.items)` iterated nothing.
+        globals_["iter"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.empty()) throw_exception(make_exception("TypeError",{VMVal::make_str("iter expected 1 argument, got 0")}));
+            const VMVal& v=a[0];
+            if(v.type==VMType::GENERATOR||v.type==VMType::ITERATOR) return v;
+            if(v.type==VMType::INSTANCE){
+                bool f=false;
+                VMVal r=call_dunder_f(v,"__iter__",{},f);
+                if(f) return r;
+                VMVal nx;
+                if(class_lookup(v.class_name,"__next__",nx)) return v;
+                return VMVal::make_iter(iter_items(v));
+            }
+            if(v.type==VMType::LIST||v.type==VMType::STRING||v.type==VMType::MAP)
+                return VMVal::make_iter(iter_items(v));
+            throw_exception(make_exception("TypeError",{VMVal::make_str("'"+std::string(v.type==VMType::INT?"int":v.type==VMType::FLOAT?"float":v.type==VMType::BOOL?"bool":v.type==VMType::NONE?"NoneType":"object")+"' object is not iterable")}));
+        });
+        // callable(x): functions, builtins, classes, and objects with __call__.
+        globals_["callable"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.empty()) return VMVal::make_bool(false);
+            const VMVal& v=a[0];
+            if(v.type==VMType::FUNCTION||v.type==VMType::NATIVE||v.type==VMType::CLASS) return VMVal::make_bool(true);
+            if(v.type==VMType::INSTANCE){ VMVal m; return VMVal::make_bool(class_lookup(v.class_name,"__call__",m)); }
+            return VMVal::make_bool(false);
+        });
         globals_["next"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.empty()) return VMVal::make_none();
             bool has_default=a.size()>=2;
@@ -6581,6 +6620,7 @@ private:
         case Op::BINARY_DIV:   return "BINARY_DIV";
         case Op::BINARY_MOD:   return "BINARY_MOD";
         case Op::BINARY_POW:   return "BINARY_POW";
+        case Op::BINARY_MATMUL:return "BINARY_MATMUL";
         case Op::BINARY_FLOOR_DIV: return "BINARY_FLOOR_DIV";
         case Op::BINARY_AND:   return "BINARY_AND";
         case Op::BINARY_OR:    return "BINARY_OR";

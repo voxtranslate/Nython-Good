@@ -513,6 +513,7 @@ struct ForNode : Node {
     node_ptr var, iterable, body;
     std::vector<node_ptr> unpack_vars;
     node_ptr else_branch; // for tuple unpacking: for k, v in ...
+    bool rebinds = false; // the loop variable was declared global/nonlocal
     ForNode(Token t, node_ptr v, node_ptr i, node_ptr b) : Node(t, NodeType::FOR), var(v), iterable(i), body(b), unpack_vars{}, else_branch{} {}
     Value eval(Context* ctx) override {
         Value iter_val = iterable->eval(ctx);
