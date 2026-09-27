@@ -294,7 +294,7 @@ class Connection:
         self.open()
         return self
 
-    def __exit__(self):
+    def __exit__(self, exc_type=none, exc_value=none, tb=none):
         self.close()
 
 # ─── Socket Selector (select/poll wrapper) ────────────────────────────────────

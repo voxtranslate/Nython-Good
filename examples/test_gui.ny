@@ -1540,7 +1540,7 @@ assert_eq("aw type", type(aw), "AudioWaveform")
 
 # ─── Spotlight ────────────────────────────────────────────────────────────────
 section("Spotlight")
-var sp = Spotlight(1280, 800)
+var sp = Spotlight(0, 0, 1280, 800)
 assert_eq("visible init", sp.visible, false)
 assert_eq("item count init", sp.item_count, 0)
 sp.register("new-file", "New File", "File", "📄", "Ctrl+N")

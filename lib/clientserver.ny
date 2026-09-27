@@ -79,8 +79,15 @@ class MessageBus:
     def unsubscribe(self, topic):
         self.sub_counts[topic] = 0
 
-    def get_history(self):
-        return self.history
+    # Every published message kept, or only those of `topic`.
+    def get_history(self, topic=none):
+        if topic == none:
+            return self.history
+        var out = []
+        for m in self.history:
+            if m.topic == topic:
+                out.append(m)
+        return out
 
 # ─── RPC Framework ───────────────────────────────────────────────────────────
 

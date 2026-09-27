@@ -108,9 +108,11 @@ class ImageAugmentor:
             return flipped
         return img
 
-    def add_noise(self, img):
+    def add_noise(self, img, std=none):
         var noise = tensor_randn([img.size()])
         var std_v = self.noise_std
+        if std != none:
+            std_v = std
         var scaled = tensor_scale(noise, std_v)
         var noisy_data = tensor_add(img.data, scaled)
         var result = ImageTensor(img.H, img.W, img.C)
