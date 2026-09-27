@@ -809,6 +809,14 @@ node_ptr Parser::multiplication(){
 }
 
 node_ptr Parser::power(){
+    // A sign binds looser than ** on its left, as in Python: -2**2 is
+    // -(2**2) == -4, not (-2)**2. The exponent is parsed here too, so it may
+    // carry its own sign (2**-1).
+    if(have(TokenType::Add)||have(TokenType::Sub)||have(TokenType::Complement)){
+        Token op = prev();
+        node_ptr operand = power();
+        return make_node<UnaryNode>(op, operand);
+    }
     node_ptr left = unary();
     if(have(TokenType::Exp)){
         Token op = prev(); op.value = "**"; node_ptr right = power();
@@ -889,7 +897,15 @@ node_ptr Parser::postfix(){
                     return make_node<UnaryNode>(dstar, operand);
                 }
                 // Keyword argument: name=value (must look ahead before expression() consumes it as assignment)
-                if(see(TokenType::Identifier) && peek(1).type() == TokenType::Assign
+                // A keyword spelled like a name is still a valid argument name
+                // here (`max(xs, default=0)`): no expression starts `default =`.
+                auto word_tok = [&](const Token& t) {
+                    if (t.type() == TokenType::Identifier) return true;
+                    if (t.kind() != TokenKind::Name || t.clazz() != TokenClass::Keyword || t.value.empty()) return false;
+                    for (char c : t.value) if (!(std::isalnum((unsigned char)c) || c == '_')) return false;
+                    return !std::isdigit((unsigned char)t.value[0]);
+                };
+                if(word_tok(token()) && peek(1).type() == TokenType::Assign
                    && peek(2).type() != TokenType::Assign) { // distinguish name=val from name==val
                     Token kw_tok = token();
                     std::string kw_name = kw_tok.value;
@@ -1003,7 +1019,15 @@ node_ptr Parser::postfix(){
             // name.
             Token tok = token();
             std::string attr;
-            if(token().clazz() == TokenClass::Operator
+            // Comparisons too (1.<(2, 3)); their tokens do not all carry
+            // their spelling, so it comes from the type.
+            const char* rel = see(TokenType::Equal) ? "==" : see(TokenType::NotEqual) ? "!="
+                            : see(TokenType::Less) ? "<" : see(TokenType::LessEqual) ? "<="
+                            : see(TokenType::Great) ? ">" : see(TokenType::GreatEqual) ? ">=" : nullptr;
+            if(rel){
+                attr = rel;
+                next();
+            } else if(token().clazz() == TokenClass::Operator
                && !see(TokenType::Dot) && !see(TokenType::ParenOpen)){
                 attr = token().value;
                 next();
