@@ -2733,8 +2733,13 @@ public:   // NythonExecutor is a struct: members default to public
         Value result = NONE_VALUE;
         // The loop variable is a local, unless the function declared it
         // `global`/`nonlocal` (then the existing binding is rebound).
+        // A name declared `global` is the module's (VariableNode::global_ref).
         auto bindv = [&](const std::string& n, const Value& v) {
-            if (fn->rebinds) ctx->setByName(n, v); else ctx->defineByName(n, v);
+            auto gref = [](const node_ptr& v) { return v && v->type() == NodeType::VARIABLE && static_cast<VariableNode*>(v.get())->global_ref; };
+            bool glob = n == var_name && gref(fn->var);
+            for (auto& u : fn->unpack_vars) if (!glob && u->value() == n) glob = gref(u);
+            if (glob) moduleCtx(ctx)->defineByName(n, v);
+            else if (fn->rebinds) ctx->setByName(n, v); else ctx->defineByName(n, v);
         };
         // An object whose __iter__ returns a list, a generator or iter(...):
         // the loop runs over that. (The loop below called __next__ on the

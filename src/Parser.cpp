@@ -1855,11 +1855,18 @@ node_ptr Parser::forStmt(){
         return block;
     }
     node_ptr var = make_node<VariableNode>(token());
+    auto mark_global = [&](const node_ptr& v) {
+        if(global_decls_.empty()) return;
+        auto& g = global_decls_.back();
+        static_cast<VariableNode*>(v.get())->global_ref = std::find(g.begin(), g.end(), v->value()) != g.end();
+    };
+    mark_global(var);
     next(); // consume variable name
     // Check for tuple unpacking: for k, v in ...
     std::vector<node_ptr> unpack_vars;
     while(have(TokenType::Comma)) {
         unpack_vars.push_back(make_node<VariableNode>(token()));
+        mark_global(unpack_vars.back());
         next();
     }
     mustBe(TokenType::In);

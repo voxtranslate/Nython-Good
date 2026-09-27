@@ -237,6 +237,7 @@ multi = p
     ?.x
 check("?. across lines", multi, none)
 check("assign to ?. is an error", len(ny_check_syntax("a?.b = 1")) > 0, true)
+check("formatter keeps ??= and ?.", text_format_nython("x??=1\ny=a??b\nz=a?.b?[1]\n", "    ", {}), "x ??= 1\ny = a ?? b\nz = a?.b?[1]\n")
 check("ternary still works", true ? 1 : 2, 1)
 check("ternary with list", false ? [1] : [2], [2])
 check("ternary with .5", true ? .5 : 1, 0.5)
@@ -415,6 +416,13 @@ def global_augment():
     sg += 40
 global_augment()
 check("global +=", sg, 42)
+def global_loop():
+    global gl_loop, gl_a, gl_b
+    for gl_loop in range(3):
+        pass
+    gl_a, gl_b = "a", "b"
+global_loop()
+check("global for variable and unpacking", [gl_loop, gl_a, gl_b], [2, "a", "b"])
 
 lv = "g"
 def loop_local():
@@ -457,6 +465,31 @@ def recursive(n):
 check("recursion has own locals", recursive(3), 3)
 let top_let = 5
 check("let at module level", top_let, 5)
+xe = "g"
+xw = "g"
+xdef = "g"
+xcls = "g"
+xp = "g"
+class Ctx:
+    def __enter__(self):
+        return "cm"
+    def __exit__(self, a, b, c):
+        return false
+def binders(xp):
+    try:
+        raise ValueError("v")
+    except ValueError as xe:
+        pass
+    with Ctx() as xw:
+        pass
+    def xdef():
+        return 1
+    class xcls:
+        pass
+    xp = "param rebound"
+    return [xw, xp]
+check("except-as / with-as / def / class / parameter are local", [binders(0), xe, xw, xdef, xcls, xp],
+      [["cm", "param rebound"], "g", "g", "g", "g", "g"])
 
 # ── 7. suffix literals ──────────────────────────────────────────────────────
 check("1k", 1k, 1000)

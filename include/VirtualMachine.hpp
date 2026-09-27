@@ -1590,7 +1590,15 @@ private:
         // exactly once — silently, with no error.
         loops_.push_back({start,{},{},true});
         int fi=C().here(); emit(Op::FOR_ITER,0,l);
-        auto bind_loop=[&](const std::string& n){ if(nd->rebinds) emit_sn(n,l); else emit_dn(n,l); };
+        // A name declared `global` is the module's (VariableNode::global_ref).
+        auto bind_loop=[&](const std::string& n){
+            bool glob=false;
+            auto gref=[](const np& v){ return v && v->type()==NT::VARIABLE && std::static_pointer_cast<nython::node::VariableNode>(v)->global_ref; };
+            if(nd->var && nd->var->value()==n) glob=gref(nd->var);
+            for(auto& u:nd->unpack_vars) if(!glob && u->value()==n) glob=gref(u);
+            if(glob) emit(Op::STORE_GLOBAL_NAME,C().add_name(n),l);
+            else if(nd->rebinds) emit_sn(n,l); else emit_dn(n,l);
+        };
         if(!nd->unpack_vars.empty()) {
             // for a, b, c in ...: FOR_ITER pushed [a_val, b_val,...]; unpack by index
             std::string tmp="__for_unpack__";

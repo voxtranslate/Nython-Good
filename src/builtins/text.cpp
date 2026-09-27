@@ -1097,8 +1097,10 @@ std::string space_ops(const std::string& code_in) {
         for (size_t k = out.size(); k > 0; k--) if (out[k - 1] != ' ') return out[k - 1];
         return 0;
     };
-    static const char* ops3[] = {"**=", "//=", ">>=", "<<=", "===", "!==", nullptr};
-    static const char* ops2[] = {"==", "!=", "<=", ">=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "->", ":=", nullptr};
+    // `??=` and `??` are operators too (a `??=` split into `?? =` would no
+    // longer parse); `?.` and `?[` are not spaced.
+    static const char* ops3[] = {"**=", "//=", ">>=", "<<=", "===", "!==", "??=", nullptr};
+    static const char* ops2[] = {"==", "!=", "<=", ">=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "->", ":=", "??", nullptr};
     while (i < s.size()) {
         char c = s[i];
         if (c == '"' || c == '\'') {
