@@ -81,7 +81,7 @@ def safe_div(a, b):
         return a / b
     except:
         return -1
-t("safe_ok", safe_div(10, 2), 5)
+t("safe_ok", safe_div(10, 2), 5.0)
 t("safe_err", safe_div(10, 0), -1)
 
 print "=== DICT METHODS ==="

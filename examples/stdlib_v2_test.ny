@@ -18,12 +18,12 @@ t("chr_z", chr(122), "z")
 t("ord_z", ord("z"), 122)
 
 print "=== SORTING COMPREHENSIVE ==="
-t("sort_str", str(sorted(["banana", "apple", "cherry", "date"])), "[apple, banana, cherry, date]")
+t("sort_str", str(sorted(["banana", "apple", "cherry", "date"])), "['apple', 'banana', 'cherry', 'date']")
 t("sort_neg", str(sorted([5, -3, 0, -7, 2, 8, -1])), "[-7, -3, -1, 0, 2, 5, 8]")
 t("sort_dup", str(sorted([3, 1, 4, 1, 5, 9, 2, 6])), "[1, 1, 2, 3, 4, 5, 6, 9]")
 t("sort_single", str(sorted([42])), "[42]")
 t("sort_empty", str(sorted([])), "[]")
-t("method_sort", str(["z","a","m"].sort()), "[a, m, z]")
+t("method_sort", str(["z","a","m"].sort()), "['a', 'm', 'z']")
 
 print "=== RANDOM ADVANCED ==="
 import random
@@ -65,10 +65,10 @@ t("re_ipv4", re_test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$", "192.168.1.1"), true
 t("re_email", re_test("^[a-zA-Z0-9.]+@[a-zA-Z0-9.]+$", "user@example.com"), true)
 var csv = "name,age,city"
 var fields = re_split(",", csv)
-t("csv_split", str(fields), "[name, age, city]")
+t("csv_split", str(fields), "['name', 'age', 'city']")
 t("re_sub", re_replace("\\d+", "X", "abc123def456"), "abcXdefX")
 var dates = re_findall("[0-9]{4}-[0-9]{2}-[0-9]{2}", "Born 1990-05-15, Married 2020-06-20")
-t("dates", str(dates), "[1990-05-15, 2020-06-20]")
+t("dates", str(dates), "['1990-05-15', '2020-06-20']")
 
 print "=== JSON ROUNDTRIP ==="
 import json

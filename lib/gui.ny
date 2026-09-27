@@ -3605,7 +3605,9 @@ class Toast:
             self._draw(renderer)
 
 class ToastManager:
-    def __init__(self, window_w):
+    # ToastManager() (test_ide_smoke) left window_w none, so show() computed
+    # none - width; toasts now default to a 1600-wide window, as the IDE's.
+    def __init__(self, window_w=1600):
         self.window_w = window_w
         self.toasts = []
         self.count = 0
@@ -10923,7 +10925,9 @@ class SpotlightItem:
 
 
 class Spotlight:
-    def __init__(self, x, y, w, h):
+    # Spotlight(x, y) is how callers size it to a window (test_gui); w and h
+    # defaulted to none, so the backdrop size below became x * 2 + none.
+    def __init__(self, x, y, w=0, h=0):
         self.x = x
         self.y = y
         self.w = w
