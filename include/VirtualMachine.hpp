@@ -2176,9 +2176,11 @@ private:
         for(int i=(int)call_stack_.size()-1;i>=0;i--){
             if(!frame_visible(i)) continue;
             auto& f=call_stack_[i];
-            bool in_locals=f.locals.count(n)>0;
+            auto li=f.locals.find(n);
+            bool in_locals=li!=f.locals.end();
             bool in_env=f.closure_env && f.closure_env->count(n);
             if(!in_locals && !in_env) continue;
+            if(!in_env){ li->second=std::move(v); return; }   // the common case: one lookup
             // A closure variable is one binding: write it to the shared
             // environment and to every still-running frame that holds a copy
             // (the enclosing function read its stale local after an inner
@@ -2601,7 +2603,7 @@ private:
                 }
             }
         }
-        if(err.empty()){
+        if(err.empty() && (!missing.empty() || (!has_varargs && pos.size()>max_pos))){
             size_t s = bound_self ? 1 : 0;
             err=nython::ny_arity_error(code.name=="<lambda>"?std::string():code.name, missing,
                                        min_pos+s, has_varargs ? -1L : (long)(max_pos+s), pos.size()+s);
@@ -3078,10 +3080,12 @@ private:
             case Op::LOAD_NAME: {
                 // Reading a name bound nowhere raises NameError (it read none).
                 const std::string& n=fr.code->names[ins.arg];
-                VMVal v=load_var(n);
-                if(v.type==VMType::NONE && !name_bound(n))
+                push(load_var(n));
+                if(stack_.back().type==VMType::NONE && !name_bound(n)){
+                    pop();
                     throw_exception(make_exception("NameError",{VMVal::make_str("name '"+n+"' is not defined")}));
-                push(std::move(v)); break;
+                }
+                break;
             }
             case Op::STORE_NAME: {
                 // A class body binds in the class namespace, always.
@@ -3222,8 +3226,8 @@ private:
             // the right operand's reflected one (__add__, then __radd__ -
             // so sum() of objects and 5 + v work); then Python's numeric
             // and sequence semantics (binop, shared with the interpreter).
-            case Op::BINARY_ADD: { VMVal r=pop(),lv=pop(),res;
-                if(binary_dunder(lv,r,"__add__","__radd__",res)){ push(res); break; }
+            case Op::BINARY_ADD: { VMVal r=pop(),lv=pop();
+                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(lv,r,"__add__","__radd__",res)){ push(std::move(res)); break; } }
                 // A string joined with an instance takes str(instance).
                 if(r.type==VMType::INSTANCE&&lv.type==VMType::STRING) r=VMVal::make_str(vm_str(r));
                 if(lv.type==VMType::INSTANCE&&r.type==VMType::STRING) lv=VMVal::make_str(vm_str(lv));
@@ -3231,19 +3235,19 @@ private:
                     int64_t sum; if(!nypy::add_ovf(lv.i,r.i,sum)){ push(VMVal::make_int(sum)); break; }
                 }
                 push(binop(nypy::A_ADD,lv,r)); break; }
-            case Op::BINARY_SUB: { VMVal r=pop(),lv=pop(),res;
-                if(binary_dunder(lv,r,"__sub__","__rsub__",res)){ push(res); break; }
+            case Op::BINARY_SUB: { VMVal r=pop(),lv=pop();
+                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(lv,r,"__sub__","__rsub__",res)){ push(std::move(res)); break; } }
                 push(binop(nypy::A_SUB,lv,r)); break; }
-            case Op::BINARY_MUL: { VMVal r=pop(),lv=pop(),res;
-                if(binary_dunder(lv,r,"__mul__","__rmul__",res)){ push(res); break; }
+            case Op::BINARY_MUL: { VMVal r=pop(),lv=pop();
+                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(lv,r,"__mul__","__rmul__",res)){ push(std::move(res)); break; } }
                 push(binop(nypy::A_MUL,lv,r)); break; }
-            case Op::BINARY_MATMUL: { VMVal r=pop(),l=pop(),res;
-                if(binary_dunder(l,r,"__matmul__","__rmatmul__",res)){ push(res); break; }
+            case Op::BINARY_MATMUL: { VMVal r=pop(),l=pop();
+                if(l.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(l,r,"__matmul__","__rmatmul__",res)){ push(std::move(res)); break; } }
                 throw_exception(make_exception("TypeError",{VMVal::make_str("unsupported operand type(s) for @")}));
                 break; }
             case Op::BINARY_DIV: case Op::BINARY_MOD: case Op::BINARY_POW: case Op::BINARY_FLOOR_DIV:
             case Op::BINARY_AND: case Op::BINARY_OR: case Op::BINARY_XOR: case Op::BINARY_LSHIFT: case Op::BINARY_RSHIFT: {
-                VMVal r=pop(),l=pop(),res;
+                VMVal r=pop(),l=pop();
                 int aop; const char* dunder; const char* rdunder;
                 switch(ins.op){
                     case Op::BINARY_DIV: aop=nypy::A_DIV; dunder="__truediv__"; rdunder="__rtruediv__"; break;
@@ -3256,8 +3260,11 @@ private:
                     case Op::BINARY_LSHIFT: aop=nypy::A_LSHIFT; dunder="__lshift__"; rdunder="__rlshift__"; break;
                     default: aop=nypy::A_RSHIFT; dunder="__rshift__"; rdunder="__rrshift__"; break;
                 }
-                if(binary_dunder(l,r,dunder,rdunder,res)){ push(res); break; }
-                if(aop==nypy::A_DIV && binary_dunder(l,r,"__div__","__rdiv__",res)){ push(res); break; }
+                if(l.type==VMType::INSTANCE||r.type==VMType::INSTANCE){
+                    VMVal res;
+                    if(binary_dunder(l,r,dunder,rdunder,res)){ push(std::move(res)); break; }
+                    if(aop==nypy::A_DIV && binary_dunder(l,r,"__div__","__rdiv__",res)){ push(std::move(res)); break; }
+                }
                 push(binop(aop,l,r)); break; }
             // Compares
             case Op::COMPARE_EQ: { VMVal r=pop(),lv=pop(); push(VMVal::make_bool(vm_eq(lv,r))); break; }
@@ -3280,23 +3287,23 @@ private:
                 push(VMVal::make_bool(lv.is_truthy()!=r.is_truthy())); break;
             }
             case Op::COMPARE_LT: {
-                VMVal r=pop(),lv=pop(),res;
-                if(rich_compare(lv,r,"__lt__","__gt__",res)){ push(res); break; }
+                VMVal r=pop(),lv=pop();
+                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__lt__","__gt__",res)){ push(std::move(res)); break; } }
                 push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)<0 : lv<r)); break;
             }
             case Op::COMPARE_LE: {
-                VMVal r=pop(),lv=pop(),res;
-                if(rich_compare(lv,r,"__le__","__ge__",res)){ push(res); break; }
+                VMVal r=pop(),lv=pop();
+                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__le__","__ge__",res)){ push(std::move(res)); break; } }
                 push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)<=0 : lv<=r)); break;
             }
             case Op::COMPARE_GT: {
-                VMVal r=pop(),lv=pop(),res;
-                if(rich_compare(lv,r,"__gt__","__lt__",res)){ push(res); break; }
+                VMVal r=pop(),lv=pop();
+                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__gt__","__lt__",res)){ push(std::move(res)); break; } }
                 push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)>0 : lv>r)); break;
             }
             case Op::COMPARE_GE: {
-                VMVal r=pop(),lv=pop(),res;
-                if(rich_compare(lv,r,"__ge__","__le__",res)){ push(res); break; }
+                VMVal r=pop(),lv=pop();
+                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__ge__","__le__",res)){ push(std::move(res)); break; } }
                 push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)>=0 : lv>=r)); break;
             }
             case Op::COMPARE_IN:       { VMVal c=pop(),it=pop(); push(VMVal::make_bool(op_in(it,c))); break; }

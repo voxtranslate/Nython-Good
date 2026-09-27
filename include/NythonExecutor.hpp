@@ -4128,7 +4128,7 @@ public:   // NythonExecutor is a struct: members default to public
             } else if (pname.size() > 2 && pname[0] == '*' && pname[1] == '*') {
                 kw_collect = pname.substr(2);
             } else {
-                named.insert(pname);
+                if (!kw_args.empty()) named.insert(pname);   // only read when keywords were passed
                 auto kw_it = kw_args.find(pname);
                 bool has_default = i < fn->defaults.size() && fn->defaults[i];
                 if (!star_seen) { max_pos++; if (!has_default) min_pos++; }

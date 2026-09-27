@@ -135,6 +135,8 @@ inline bool ny_split_exc_message(const std::string& m, std::string& type, std::s
 // < 0 for *args); given: how many were passed. "" when the call fits.
 inline std::string ny_arity_error(const std::string& fname, const std::vector<std::string>& missing,
                                   size_t min_pos, long max_pos, size_t given) {
+    bool too_many = max_pos >= 0 && given > (size_t)max_pos;
+    if (!too_many && missing.empty()) return std::string();   // the call fits: no strings built
     std::string f = (fname.empty() ? std::string("<lambda>") : fname) + "()";
     if (max_pos >= 0 && given > (size_t)max_pos) {
         std::string takes = min_pos == (size_t)max_pos ? std::to_string(max_pos)
