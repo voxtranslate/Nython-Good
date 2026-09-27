@@ -48,16 +48,14 @@ struct Context extends Container {
     void setByName(const std::string& varName, Value val) {
         if (!container) return;
         // Check if variable exists in current scope
-        if (container->count(varName)) {
-            (*container)[varName] = val;
-            return;
-        }
+        auto it = container->find(varName);
+        if (it != container->end()) { it->second = val; return; }
         // Walk up parent scopes
         Context* p = parent;
         while (p) {
-            if (p->container && p->container->count(varName)) {
-                (*p->container)[varName] = val;
-                return;
+            if (p->container) {
+                auto pit = p->container->find(varName);
+                if (pit != p->container->end()) { pit->second = val; return; }
             }
             p = p->parent;
         }

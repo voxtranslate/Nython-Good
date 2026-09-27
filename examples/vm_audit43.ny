@@ -143,7 +143,9 @@ check("only first nb lines used", ld.classify(["a"], ["a", "zzz"], 1), [0])
 # ── GitRepo in a throwaway repository ───────────────────────────────────────
 var gv = os_exec("git --version 2>&1")
 if gv != none and string_startswith(gv, "git version"):
-    var dir = "/tmp/ny_audit43_repo"
+    # Per run: the sweep runs both engines at once, and a shared path let
+    # one run delete the other's repository mid-test.
+    var dir = "/tmp/ny_audit43_repo_" + string_replace(str(time_ms()), ".", "_") + "_" + str(random_int(0, 999999))
     os_exec("rm -rf " + dir)
     os_mkdir(dir)
     write_file(dir + "/f.ny", "one\ntwo\n")

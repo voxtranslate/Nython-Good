@@ -6,6 +6,7 @@
 #include "Collectable.hpp"
 #include <functional>
 #include <cstring>
+#include "NyFormat.hpp"
 // ^ explicit: libstdc++ supplies these transitively, MinGW does not.
 
 
@@ -269,23 +270,21 @@ inline std::string _format(T value){
     return str.str();
 }
 
-// Format long double ensuring decimal point is always shown (5.0 not 5)
+// Python repr of a float: the shortest text that round-trips, with a '.0'
+// on integral values (5.0 not 5) - NyFormat.hpp, shared with the VM.
 static std::string format_long_double(long double value) {
-    char buf[64];
-    if (value == (long long)value && value >= -1e15L && value <= 1e15L) {
-        snprintf(buf, sizeof(buf), "%.1Lf", value);
-        return std::string(buf);
-    }
-    // Use up to 15 significant digits, strip trailing zeros after decimal
-    snprintf(buf, sizeof(buf), "%.15Lg", value);
-    // Check if decimal point present; if not, add .0
-    bool has_dot = false;
-    for (int i = 0; buf[i]; i++) {
-        char c = buf[i];
-        if (c == '.' || c == 'e' || c == 'E' || c == 'n' || c == 'i') { has_dot = true; break; }
-    }
-    if (!has_dot) strncat(buf, ".0", sizeof(buf) - strlen(buf) - 1);
-    return std::string(buf);
+    return nypy::float_repr((double)value);
+}
+// Ints: exact at any size (the library bigint's own decimal conversion is
+// quadratic and was the slow path of every str()).
+template<>
+inline std::string _format<bigint>(bigint value){
+    const auto& d = value.limbs();
+    nypy::BigInt r;
+    for (auto l : d) { r.mag.push_back((uint32_t)l); r.mag.push_back((uint32_t)((uint64_t)l >> 32)); }
+    r.neg = value.isNegative();
+    r.trim();
+    return r.to_string();
 }
 template<>
 inline std::string _format<long double>(long double value){ return format_long_double(value); }

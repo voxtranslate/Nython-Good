@@ -84,8 +84,7 @@ class Inspector:
     def truncate(self, s, n):
         if len(s) <= n:
             return s
-        # len() is characters and slicing is bytes, so a character count is
-        # always <= the safe byte count; slicing at it cannot overrun.
+        # len() and slicing both count characters.
         return s[0:n] + "…"
 
     def has_control(self, s):

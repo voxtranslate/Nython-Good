@@ -874,6 +874,14 @@ node_ptr Parser::multiplication(){
 }
 
 node_ptr Parser::power(){
+    // A sign binds looser than ** on its left, as in Python: -2**2 is
+    // -(2**2) == -4, not (-2)**2. The exponent is parsed here too, so it may
+    // carry its own sign (2**-1).
+    if(have(TokenType::Add)||have(TokenType::Sub)||have(TokenType::Complement)){
+        Token op = prev();
+        node_ptr operand = power();
+        return make_node<UnaryNode>(op, operand);
+    }
     node_ptr left = unary();
     if(have(TokenType::Exp)){
         Token op = prev(); op.value = "**"; node_ptr right = power();
@@ -954,7 +962,15 @@ node_ptr Parser::postfix(){
                     return make_node<UnaryNode>(dstar, operand);
                 }
                 // Keyword argument: name=value (must look ahead before expression() consumes it as assignment)
-                if(see(TokenType::Identifier) && peek(1).type() == TokenType::Assign
+                // A keyword spelled like a name is still a valid argument name
+                // here (`max(xs, default=0)`): no expression starts `default =`.
+                auto word_tok = [&](const Token& t) {
+                    if (t.type() == TokenType::Identifier) return true;
+                    if (t.kind() != TokenKind::Name || t.clazz() != TokenClass::Keyword || t.value.empty()) return false;
+                    for (char c : t.value) if (!(std::isalnum((unsigned char)c) || c == '_')) return false;
+                    return !std::isdigit((unsigned char)t.value[0]);
+                };
+                if(word_tok(token()) && peek(1).type() == TokenType::Assign
                    && peek(2).type() != TokenType::Assign) { // distinguish name=val from name==val
                     Token kw_tok = token();
                     std::string kw_name = kw_tok.value;
@@ -991,7 +1007,8 @@ node_ptr Parser::postfix(){
             // Check for [:...] (empty start)
             if(see(TokenType::Colon)) {
                 next(); // consume first :
-                node_ptr start_expr = make_int(0);
+                // An omitted start is none, not 0: s[::-1] starts at the end.
+                node_ptr start_expr = make_none_node();
                 node_ptr end_expr = nullptr;
                 node_ptr step_expr = nullptr;
                 if(see(TokenType::Colon)) {
@@ -1055,7 +1072,15 @@ node_ptr Parser::postfix(){
             // name.
             Token tok = token();
             std::string attr;
-            if(token().clazz() == TokenClass::Operator
+            // Comparisons too (1.<(2, 3)); their tokens do not all carry
+            // their spelling, so it comes from the type.
+            const char* rel = see(TokenType::Equal) ? "==" : see(TokenType::NotEqual) ? "!="
+                            : see(TokenType::Less) ? "<" : see(TokenType::LessEqual) ? "<="
+                            : see(TokenType::Great) ? ">" : see(TokenType::GreatEqual) ? ">=" : nullptr;
+            if(rel){
+                attr = rel;
+                next();
+            } else if(token().clazz() == TokenClass::Operator
                && !see(TokenType::Dot) && !see(TokenType::ParenOpen)){
                 attr = token().value;
                 next();
@@ -1165,6 +1190,98 @@ node_ptr Parser::primary(){
     return atom();
 }
 
+// An f-string: literal text and {expr[!conv][:spec]} fields, joined with +.
+// Each field becomes __format_value__(expr, spec, conv) - one builtin on both
+// engines that applies the conversion (!r/!s/!a) and the format spec with
+// Python's semantics; a spec may itself contain {fields}. Both used to be
+// dropped: f"{x:.2f}" printed x unformatted and f"{s!r}" printed s.
+node_ptr Parser::fstringNode(const Token& str_tok, const std::string& raw){
+    std::vector<node_ptr> parts;
+    std::string current;
+    auto lit = [&](const std::string& text) {
+        Token ltok = str_tok; ltok.value = text;
+        return make_node<StringNode>(ltok);
+    };
+    size_t fi = 0;
+    while (fi < raw.size()) {
+        if (raw[fi] == '{' && fi + 1 < raw.size() && raw[fi+1] != '{') {
+            if (!current.empty()) { parts.push_back(lit(current)); current.clear(); }
+            fi++;
+            // The field runs to the matching '}' (nested braces, brackets
+            // and quoted strings inside the expression are skipped over).
+            std::string field;
+            int depth = 1;
+            char quote = 0;
+            while (fi < raw.size()) {
+                char c = raw[fi];
+                if (quote) { if (c == quote) quote = 0; }
+                else if (c == '\'' || c == '"') quote = c;
+                else if (c == '{' || c == '[' || c == '(') depth++;
+                else if (c == ']' || c == ')') depth--;
+                else if (c == '}') { depth--; if (depth == 0) break; }
+                field += c; fi++;
+            }
+            if (fi < raw.size()) fi++;   // the closing '}'
+            // Split expr / !conv / :spec at the top level.
+            size_t k = 0; int lvl = 0; quote = 0;
+            std::string expr_str, conv, spec;
+            bool has_spec = false;
+            for (; k < field.size(); k++) {
+                char c = field[k];
+                if (quote) { if (c == quote) quote = 0; continue; }
+                if (c == '\'' || c == '"') { quote = c; continue; }
+                if (c == '(' || c == '[' || c == '{') lvl++;
+                else if (c == ')' || c == ']' || c == '}') lvl--;
+                else if (lvl == 0 && c == '!' && k + 1 < field.size() && field[k+1] != '=' &&
+                         (k + 2 >= field.size() || field[k+2] == ':')) break;
+                else if (lvl == 0 && c == ':') break;
+            }
+            expr_str = field.substr(0, k);
+            if (k < field.size() && field[k] == '!') {
+                conv = field.substr(k + 1, 1);
+                k += 2;
+            }
+            if (k < field.size() && field[k] == ':') { spec = field.substr(k + 1); has_spec = true; }
+            if (expr_str.empty()) continue;
+            node_ptr expr_node;
+            try {
+                reader::SourceCode sub_src(expr_str);
+                nython::exception::Reporter sub_reporter(sub_src);
+                auto sub_lex = std::make_shared<Lexer>(sub_src);
+                sub_lex->tokenize();
+                Parser sub_parser(&sub_reporter, runner, sub_lex.get());
+                expr_node = sub_parser.expression();
+            } catch(...) {
+                Token vtok = str_tok; vtok.value = expr_str;
+                expr_node = make_node<VariableNode>(vtok);
+            }
+            Token sfn = str_tok; sfn.value = "__format_value__";
+            auto call = make_node<CallNode>(str_tok, make_node<VariableNode>(sfn));
+            call->add(expr_node);
+            call->add(has_spec && spec.find('{') != std::string::npos ? fstringNode(str_tok, spec) : lit(spec));
+            call->add(lit(conv));
+            parts.push_back(call);
+        } else if (raw[fi] == '{' && fi + 1 < raw.size() && raw[fi+1] == '{') {
+            current += '{'; fi += 2;
+        } else if (raw[fi] == '}' && fi + 1 < raw.size() && raw[fi+1] == '}') {
+            current += '}'; fi += 2;
+        } else { current += raw[fi]; fi++; }
+    }
+    if (!current.empty()) parts.push_back(lit(current));
+    if (parts.empty()) return lit("");
+    node_ptr result = parts[0];
+    // A single field still yields a string.
+    if (parts.size() == 1 && result->type() != NodeType::STRING) {
+        Token op_tok = str_tok; op_tok.value = "+";
+        return make_node<BinaryNode>(op_tok, lit(""), result);
+    }
+    for (size_t pi = 1; pi < parts.size(); pi++) {
+        Token op_tok = str_tok; op_tok.value = "+";
+        result = make_node<BinaryNode>(op_tok, result, parts[pi]);
+    }
+    return result;
+}
+
 node_ptr Parser::atom(){
     Token tok = token();
 
@@ -1194,63 +1311,8 @@ node_ptr Parser::atom(){
             goto parse_fstring;
         }
         return make_node<StringNode>(str_tok);
-        parse_fstring: {
-            // Reuse f-string interpolation logic
-            std::string raw = str_tok.value;
-            std::vector<node_ptr> parts;
-            std::string current;
-            size_t fi = 0;
-            while (fi < raw.size()) {
-                if (raw[fi] == '{' && fi+1 < raw.size() && raw[fi+1] != '{') {
-                    if(!current.empty()) {
-                        Token ltok = str_tok; ltok.value = current;
-                        parts.push_back(make_node<StringNode>(ltok)); current.clear();
-                    }
-                    fi++;
-                    std::string expr_str; int depth=1;
-                    while(fi < raw.size() && depth>0) {
-                        if(raw[fi]=='{') depth++;
-                        else if(raw[fi]=='}') { depth--; if(depth==0) break; }
-                        expr_str += raw[fi]; fi++;
-                    }
-                    if(fi < raw.size()) fi++;
-                    if(!expr_str.empty()) {
-                        node_ptr expr_node;
-                        try {
-                            reader::SourceCode sub_src(expr_str);
-                            nython::exception::Reporter sub_reporter(sub_src);
-                            auto sub_lex = std::make_shared<Lexer>(sub_src);
-                            sub_lex->tokenize();
-                            Parser sub_parser(&sub_reporter, runner, sub_lex.get());
-                            expr_node = sub_parser.expression();
-                        } catch(...) {
-                            Token vtok = str_tok; vtok.value = expr_str;
-                            expr_node = make_node<VariableNode>(vtok);
-                        }
-                        Token sfn = str_tok; sfn.value = "str";
-                        auto str_fn = make_node<VariableNode>(sfn);
-                        auto call = make_node<CallNode>(str_tok, str_fn);
-                        call->add(expr_node);
-                        parts.push_back(call);
-                    }
-                } else if(raw[fi]=='{' && fi+1<raw.size() && raw[fi+1]=='{') {
-                    current += '{'; fi += 2;
-                } else if(raw[fi]=='}' && fi+1<raw.size() && raw[fi+1]=='}') {
-                    current += '}'; fi += 2;
-                } else { current += raw[fi]; fi++; }
-            }
-            if(!current.empty()) {
-                Token ltok = str_tok; ltok.value = current;
-                parts.push_back(make_node<StringNode>(ltok));
-            }
-            if(parts.empty()) { Token etok = str_tok; etok.value=""; return make_node<StringNode>(etok); }
-            node_ptr result = parts[0];
-            for(size_t pi=1; pi<parts.size(); pi++) {
-                Token op_tok = str_tok; op_tok.value="+";
-                result = make_node<BinaryNode>(op_tok, result, parts[pi]);
-            }
-            return result;
-        }
+        parse_fstring:
+            return fstringNode(str_tok, str_tok.value);
     }
     if(have(TokenType::Complex)) return make_node<ComplexNode>(prev());
     if(have(TokenType::True)) return make_node<BoolNode>(prev(), true);
@@ -1274,75 +1336,7 @@ node_ptr Parser::atom(){
         if (id_tok.value == "f" && (see(TokenType::String) || token().kind() == TokenKind::String)) {
             Token str_tok = token();
             next(); // consume the string
-            std::string raw = str_tok.value;
-            // Parse f-string: split on { and } to extract expressions
-            std::vector<node_ptr> parts;
-            std::string current;
-            size_t fi = 0;
-            while (fi < raw.size()) {
-                if (raw[fi] == '{' && fi + 1 < raw.size() && raw[fi+1] != '{') {
-                    if (!current.empty()) {
-                        Token ltok = str_tok; ltok.value = current;
-                        parts.push_back(make_node<StringNode>(ltok));
-                        current.clear();
-                    }
-                    fi++;
-                    std::string expr_str;
-                    int depth = 1;
-                    while (fi < raw.size() && depth > 0) {
-                        if (raw[fi] == '{') depth++;
-                        else if (raw[fi] == '}') { depth--; if (depth == 0) break; }
-                        expr_str += raw[fi];
-                        fi++;
-                    }
-                    if (fi < raw.size()) fi++;
-                    if (!expr_str.empty()) {
-                        // Sub-parse the expression string
-                        node_ptr expr_node;
-                        try {
-                            reader::SourceCode sub_src(expr_str);
-                            nython::exception::Reporter sub_reporter(sub_src);
-                            auto sub_lex = std::make_shared<Lexer>(sub_src);
-                            sub_lex->tokenize(); // must populate token stream
-                            Parser sub_parser(&sub_reporter, runner, sub_lex.get());
-                            expr_node = sub_parser.expression();
-                        } catch(nython::exception::SyntaxError& e) {
-                            // SyntaxError in sub-parser — print for debug then fallback
-                            Token vtok = str_tok; vtok.value = expr_str;
-                            expr_node = make_node<VariableNode>(vtok);
-                        } catch(...) {
-                            Token vtok = str_tok; vtok.value = expr_str;
-                            expr_node = make_node<VariableNode>(vtok);
-                        }
-                        // Wrap in str() call
-                        Token sfn = str_tok; sfn.value = "str";
-                        auto str_fn = make_node<VariableNode>(sfn);
-                        auto call = make_node<CallNode>(str_tok, str_fn);
-                        call->add(expr_node);
-                        parts.push_back(call);
-                    }
-                } else if (raw[fi] == '{' && fi + 1 < raw.size() && raw[fi+1] == '{') {
-                    current += '{'; fi += 2;
-                } else if (raw[fi] == '}' && fi + 1 < raw.size() && raw[fi+1] == '}') {
-                    current += '}'; fi += 2;
-                } else {
-                    current += raw[fi]; fi++;
-                }
-            }
-            if (!current.empty()) {
-                Token ltok = str_tok; ltok.value = current;
-                parts.push_back(make_node<StringNode>(ltok));
-            }
-            if (parts.empty()) {
-                Token etok = str_tok; etok.value = "";
-                return make_node<StringNode>(etok);
-            }
-            node_ptr result = parts[0];
-            for (size_t pi = 1; pi < parts.size(); pi++) {
-                Token op_tok = str_tok; op_tok.value = "+";
-                result = make_node<BinaryNode>(op_tok, result, parts[pi]);
-            }
-            return result;
+            return fstringNode(str_tok, str_tok.value);
         }
         return make_node<VariableNode>(id_tok);
     }

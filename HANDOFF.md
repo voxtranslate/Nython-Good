@@ -8,8 +8,9 @@ text services and a responsive layout ladder; the Code::Blocks feature set;
 non-throwing control flow on both engines; the build system) and **§0f**
 (the OS layer: files, paths, processes, environment and time, with one
 implementation for both engines) **§0g** (threads, synchronisation and
-async on both engines) and **§0h** (nytorch: one native tensor engine for
-both engines, real models). §0d is
+async on both engines) **§0h** (nytorch: one native tensor engine for
+both engines, real models) and **§0i** (Python values and builtins on both
+engines). §0d is
 round 73 (the IDE to VS Code's model, verified by driving it). Earlier
 rounds: §0/§0b language-level work, §5.3 terminal command line / undo /
 multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
@@ -217,6 +218,71 @@ Defects found while driving these, all fixed:
 
 e2e scenarios added: `build`, `cbedit`, `cbtools`, `cbdebug`, `responsive`,
 `session`, `columns`, `split`, `window`.
+
+---
+
+## 0i. Round 74 — Python values and builtins on both engines
+
+Merged from `round74-lang2`.
+- `examples/vm_audit60.ny` (284 checks) passes on both engines and gives
+  the same results under `python3`.
+- `vm_audit61` (33 checks) covers behaviour only Nython has.
+- Divergence batteries (snippets where Python, the interpreter and the VM
+  all agree), values and builtins: 36 → 109 of 120.
+
+- **Shared libraries.** `NyBigInt`, `NyStr`, `NyFormat`, `NyOrderedMap` and
+  `builtins/pycore.cpp` are used by both engines.
+- **Dicts.** Insertion order is kept. Keys are typed: `1`, `"1"` and `1.0`
+  follow Python, and tuple keys work. `__len__` is an ordinary key.
+  `copy()`, `dict(a=1)`, `list(d)` and `sorted(d)` work.
+- **Integers.** Exact at any size. The VM promotes past 64 bits and never
+  overflows. Literals past 64 bits used to read as 0.
+- **Formatting.** One formatter serves f-strings (with format specs and
+  `!r`/`!s`/`!a`), `format()`, `str.format` and `%`. Float repr and
+  `round` half-to-even follow Python.
+- **Operators.**
+  - `not`/`and`/`or` follow truthiness, and `and`/`or` return an operand.
+  - `L += it`, `L *= n` and `s *= 3` work in place.
+  - `3*"ab"`, `true+true` and `7.5//2`.
+  - `divmod`, `pow(b, e, m)`, and `hex`/`oct`/`bin` of negatives.
+  - `-2**2 == -4`.
+- **Tuples** are real on the VM and distinct from lists on the interpreter.
+- **Strings.**
+  - Indexing, slicing and `len` count UTF-8 characters.
+  - 74 string methods have one implementation.
+  - List and string reads out of range raise IndexError.
+  - `del` / `pop` of a missing key raise KeyError.
+- **Deliberately lenient**, because library code relies on it:
+  - reading a missing dict key gives `none`
+  - assigning past the end of a list grows it
+  - `len(none) == 0`
+  - `"a" + 1` concatenates
+- **Behaviour change.** Arithmetic on unsupported types (`1 + none`, an
+  instance + int) raises TypeError on both engines. It used to give `none`
+  on the interpreter and `1` on the VM. `lib/gui.ny`'s `Spotlight` and
+  `ToastManager` defaults were fixed for it.
+- **VM method calls with keyword arguments** (`obj.f(1, b=2)`) returned
+  `none` for every method. `**kw` is `{}` rather than `none` when no
+  keywords are passed. On the VM, a native's keyword map carries
+  `class_name "__kwargs__"`, and natives take it off with `take_kwargs()`.
+- **The VM builtin bridge** passes exact values both ways. Changed
+  arguments reach the caller (`tensor2d_set(t, …)` changes `t`), and
+  returned containers keep their identity.
+- **Stale expectations.** 34 checks in 17 example files (HANDOFF §5.8) now
+  expect Python's values.
+- **Test isolation.** `vm_audit24` and `vm_audit43` use per-run temp paths.
+  The sweep runs both engines at once, and a shared path let one run delete
+  the other's git repository (fixed on merge).
+- **Speed.** Interpreter: list −52%, map −44%, call −24%. The VM is +1–6%,
+  from the ordered map in frame locals.
+- **Not done.** Still open on the VM:
+  - `@property` (vm_audit25 now stops at a TypeError instead of failing
+    quietly)
+  - name resolution (`var n = self.ws.rows[i]` reads 1 in test_12)
+  - `except X as e` at top level
+
+  These belong to the other language branch (§0e language work, merged
+  next).
 
 ---
 

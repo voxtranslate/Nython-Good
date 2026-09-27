@@ -23,7 +23,7 @@ t("not_in_comp", 15 in [x*x for x in range(1, 10)], false)
 print "=== 4. TERNARY IN LIST ==="
 var grades = [95, 82, 67, 91, 74, 88]
 var letters = [("A" if g >= 90 else ("B" if g >= 80 else "C")) for g in grades]
-t("ternary_comp", str(letters), "[A, B, C, A, C, B]")
+t("ternary_comp", str(letters), "['A', 'B', 'C', 'A', 'C', 'B']")
 
 print "=== 5. MULTI-RETURN WITH MAP ==="
 def stats(lst):
@@ -34,7 +34,7 @@ def stats(lst):
 var s = stats([10, 20, 30, 40, 50])
 t("stats_sum", s["sum"], 150)
 t("stats_count", s["count"], 5)
-t("stats_avg", s["avg"], 30)
+t("stats_avg", s["avg"], 30.0)
 
 print "=== 6. RECURSIVE CLASS ==="
 class LinkedList:
@@ -81,7 +81,7 @@ emitter.on("data", lambda d: log.append("got:" + str(d)))
 emitter.on("data", lambda d: log.append("also:" + str(d)))
 emitter.on("error", lambda d: log.append("err:" + str(d)))
 emitter.emit("data", 42).emit("error", "oops")
-t("emitter", str(log), "[got:42, also:42, err:oops]")
+t("emitter", str(log), "['got:42', 'also:42', 'err:oops']")
 
 print "=== 8. STDLIB INTEGRATION ==="
 import re
@@ -90,7 +90,7 @@ import crypto
 
 var text = "Contact: john@example.com or jane@test.org"
 var emails = re_findall("[a-zA-Z0-9.]+@[a-zA-Z0-9.]+", text)
-t("re_emails", str(emails), "[john@example.com, jane@test.org]")
+t("re_emails", str(emails), "['john@example.com', 'jane@test.org']")
 
 var config = {"host": "localhost", "port": 8080, "debug": true}
 var json_str = json_encode(config)
@@ -111,13 +111,13 @@ t("items_len", len(items), 3)
 print "=== 10. LIST SORT STABILITY ==="
 var nums = [5, -3, 8, -1, 0, -7, 4, 2]
 t("sort_neg", str(sorted(nums)), "[-7, -3, -1, 0, 2, 4, 5, 8]")
-t("sort_strs", str(sorted(["banana", "apple", "cherry"])), "[apple, banana, cherry]")
+t("sort_strs", str(sorted(["banana", "apple", "cherry"])), "['apple', 'banana', 'cherry']")
 
 print "=== 11. STRING EDGE CASES ==="
 t("empty_join", "".join([]), "")
 t("join_single", ",".join(["a"]), "a")
 t("replace_all", "aaa".replace("a", "bb"), "bbbbbb")
-t("split_empty", str("".split(",")), "[]")
+t("split_empty", str("".split(",")), "['']")
 t("startswith", "hello".startswith("hel"), true)
 t("endswith", "hello".endswith("llo"), true)
 t("repeat", "*" * 5, "*****")

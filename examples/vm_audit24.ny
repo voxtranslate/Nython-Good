@@ -257,16 +257,18 @@ check("tensor sum", tensor_sum(t1), 6.0)
 check("tensor mean", tensor_mean(t1), 2.0)
 
 # ── KV store ─────────────────────────────────────────────────────
-kv_set("/tmp/ny_audit24.kv", "test_key", "test_value")
-var kv_val = kv_get("/tmp/ny_audit24.kv", "test_key")
+# Per-run file names: the sweep runs both engines at once.
+var tmp24 = "/tmp/ny_audit24_" + string_replace(str(time_ms()), ".", "_") + "_" + str(random_int(0, 999999))
+kv_set(tmp24 + ".kv", "test_key", "test_value")
+var kv_val = kv_get(tmp24 + ".kv", "test_key")
 check("kv roundtrip", kv_val, "test_value")
-kv_del("/tmp/ny_audit24.kv", "test_key")
-var kv_del_val = kv_get("/tmp/ny_audit24.kv", "test_key")
+kv_del(tmp24 + ".kv", "test_key")
+var kv_del_val = kv_get(tmp24 + ".kv", "test_key")
 check("kv deleted", kv_del_val, "none")
 
 # ── File I/O ─────────────────────────────────────────────────────
-write_file("/tmp/ny_audit24.txt", "hello nython")
-var content = read_file("/tmp/ny_audit24.txt")
+write_file(tmp24 + ".txt", "hello nython")
+var content = read_file(tmp24 + ".txt")
 check("file roundtrip", content, "hello nython")
 
 print ""

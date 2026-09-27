@@ -5,6 +5,7 @@
 #include "Value.hpp"
 #include <functional>
 #include <unordered_map>
+#include "NyOrderedMap.hpp"
 #include "Location.hpp"
 #include "Collectable.hpp"
 
@@ -14,8 +15,9 @@ using gc::Collectable;
 using lexer::Location;
 
 // Underlying type of every Value which has its own
-// Value container (e.g. Object, Function, Class)
-using ContainerType = std::unordered_map<std::string, Value>;
+// Value container (e.g. Object, Function, Class). Insertion-ordered, so a
+// dict iterates in the order its keys were added (as in Python).
+using ContainerType = nypy::OrderedMap<Value>;
 class Container: public Collectable {
 public:
     Container(const Container&) = default;
