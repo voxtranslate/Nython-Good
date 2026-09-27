@@ -825,6 +825,23 @@ public:   // NythonExecutor is a struct: members default to public
         } else if (an->target->type() == NodeType::ATTRIBUTE) {
             auto attr = static_pointer_cast<AttributeNode>(an->target);
             Value obj = evalNode(attr->object, ctx);
+            // A property defined on the class: its setter runs, and a
+            // read-only one refuses (the value used to be written into the
+            // instance, silently hiding the property).
+            if (any_property_ && isInstanceValue(obj)) {
+                Node* cls = classNodeOfInstance(obj);
+                Value m; Node* owner = nullptr;
+                if (cls && findClassMember(cls, attr->attr, m, &owner) && m.type == ValueType::USERDATA && m.value.p
+                    && fnTag(func_names, m.value.p).find("__property__") != std::string::npos) {
+                    auto st = prop_setters_.find(m.value.p);
+                    if (st == prop_setters_.end())
+                        throw std::string("__exc__:AttributeError:can't set attribute '" + attr->attr + "'");
+                    std::vector<Value> a{val};
+                    std::unordered_map<std::string, Value> nokw;
+                    invokeMember(st->second, owner, obj, a, nokw, ctx);
+                    return val;
+                }
+            }
             // Store on instance properties (USERDATA instances)
             if (obj.type == ValueType::USERDATA && obj.value.p) {
                 auto pit = instance_properties.find(obj.value.p);
@@ -4877,10 +4894,19 @@ public:
             Value r;
             if (iterableBuiltin(name_orig, args, ctx, r)) return r;
         }
+        if (name_orig.rfind("__prop_setter__:", 0) == 0) {
+            uintptr_t gp = 0;
+            std::istringstream iss(name_orig.substr(16));
+            iss >> std::hex >> gp;
+            if (!args.empty()) prop_setters_[reinterpret_cast<void*>(gp)] = args[0];
+            Value g; g.type = ValueType::USERDATA; g.value.p = reinterpret_cast<void*>(gp);
+            return g;
+        }
         // ── Exception type constructors ─────────────────────────────────────────
         // ── property() and staticmethod() ─────────────────────────────────────
         if (name_orig == "property") {
             // property(fn) — tag the function value with __property__ marker
+            any_property_ = true;
             if (!args.empty() && args[0].type == ValueType::USERDATA && args[0].value.p) {
                 func_names[args[0].value.p] += "__property__";
                 return args[0];
@@ -5129,9 +5155,24 @@ public:
     // Attributes every value answers: __name__ of a function or class (and of
     // the name string type() returns), an instance's __class__, and what an
     // instance's __getattr__ supplies for anything it does not have.
+    // Properties: a getter function tagged __property__; its setter, from
+    // @prop.setter, is kept here.
+    std::unordered_map<void*, Value> prop_setters_;
+    bool any_property_ = false;   // no property anywhere: attribute stores skip the class lookup
+    std::vector<std::unique_ptr<std::string>> prop_setter_ids_;
     Value specialAttribute(const Value& obj, const std::string& attr, Context* ctx) {
         if (obj.type == ValueType::USERDATA && obj.value.p) {
             auto fit = func_names.find(obj.value.p);
+            // prop.setter: a callable that records its argument as the
+            // property's setter and returns the property.
+            if (attr == "setter" && fit != func_names.end() && fit->second.find("__property__") != std::string::npos) {
+                std::ostringstream os; os << "__prop_setter__:" << obj.value.p;
+                prop_setter_ids_.push_back(std::make_unique<std::string>(os.str()));
+                void* id = prop_setter_ids_.back().get();
+                func_names[id] = "__builtin__:" + os.str();
+                Value v; v.type = ValueType::USERDATA; v.value.p = id;
+                return v;
+            }
             if (attr == "__name__") {
                 if (fit != func_names.end()) {
                     const std::string& t = fit->second;
@@ -6716,8 +6757,9 @@ public:
     // left-to-right. Bases that are not user classes (a builtin exception,
     // an interface) have no node and are left out here.
     std::unordered_map<Node*, std::vector<Node*>> mro_cache_;
-    std::vector<Node*> classMro(Node* cls) {
-        if (!cls || cls->type() != NodeType::CLASS) return {};
+    const std::vector<Node*>& classMro(Node* cls) {
+        static const std::vector<Node*> empty;
+        if (!cls || cls->type() != NodeType::CLASS) return empty;
         auto it = mro_cache_.find(cls);
         if (it != mro_cache_.end()) return it->second;
         mro_cache_[cls] = {cls};                    // guards against a cycle
@@ -6726,7 +6768,7 @@ public:
         for (auto& b : static_cast<ClassNode*>(cls)->bases) {
             Node* bn = classNodeByName(b->value());
             if (!bn || bn == cls) continue;
-            seqs.push_back(classMro(bn));
+            seqs.push_back(std::vector<Node*>(classMro(bn)));
             direct.push_back(bn);
         }
         seqs.push_back(direct);
@@ -6764,14 +6806,14 @@ public:
             }
         }
         mro_cache_[cls] = out;
-        return out;
+        return mro_cache_[cls];
     }
     // A member defined in the body of class `cls` or a class after it in its
     // MRO: its value in that class's own namespace (not the enclosing
     // scope's), and the class that defines it.
     bool findClassMember(Node* cls, const std::string& name, Value& out, Node** owner = nullptr,
                          Node* after = nullptr) {
-        std::vector<Node*> mro = classMro(cls);
+        const std::vector<Node*>& mro = classMro(cls);
         size_t start = 0;
         if (after) {
             for (size_t i = 0; i < mro.size(); i++) if (mro[i] == after) { start = i + 1; break; }
