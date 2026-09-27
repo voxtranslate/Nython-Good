@@ -97,7 +97,14 @@ struct InterpEngine : nyconc::Engine {
         std::vector<Value> av;
         for (auto& a : args) av.push_back(unbox_value(a));
         try { return box(invoke(f, av)); }
-        catch (std::string& s) { nyconc::NyError e; e.raw = s; throw e; }
+        catch (std::string& s) {
+            nyconc::NyError e; e.raw = s;
+            // A raised exception object: its type and message for the
+            // runtime's error text (the raw form still re-raises the object).
+            Value inst = E.excInstanceOf(s);
+            if (inst.type != ValueType::NONE) { e.type = E.instanceClassName(inst); e.msg = E.exceptionMessage(inst); }
+            throw e;
+        }
         catch (nython::node::ReturnSignal& r) { return box(r.value); }
         catch (nyconc::NyError&) { throw; }
         catch (std::exception& x) { throw nyconc::NyError::make("RuntimeError", x.what()); }

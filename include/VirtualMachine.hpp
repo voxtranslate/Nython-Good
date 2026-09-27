@@ -41,6 +41,7 @@
 #include "NyTensor.hpp"
 #include "NyJson.hpp"
 #include "NyFuzzy.hpp"
+#include "NyExcTypes.hpp"
 #include "NyOrderedMap.hpp"
 #include "NyBigInt.hpp"
 #include "NyStr.hpp"
@@ -101,6 +102,14 @@ enum class Op : uint8_t {
     // the operands were left on the stack instead of being combined and
     // consumed, corrupting whatever ran next (see HANDOFF.md).
     COMPARE_SEQ, COMPARE_SNE, LOGICAL_XOR,
+    // try/finally and with (see ExceptionEntry): FIN_NORMAL pushes the
+    // "fell off the end" state, FIN_RETURN turns the returned value into a
+    // pending-return state, FIN_JUMP a pending break/continue to arg;
+    // END_FINALLY acts on the state once the finally body has run.
+    FIN_NORMAL, FIN_RETURN, FIN_JUMP, END_FINALLY,
+    WITH_ENTER, WITH_EXIT,
+    BINARY_MATMUL,   // a @ b: __matmul__ / __rmatmul__ only
+    MAP_MERGE,       // f(**d): TOS (a map) merged into the map below it
     // A tuple display `(a, b)`: BUILD_LIST's items, as a tuple (VMVal::is_tuple).
     BUILD_TUPLE,
 };
@@ -247,6 +256,14 @@ struct VMVal {
         case VMType::INSTANCE:
             // Two instances are equal only if same pointer (identity comparison)
             return map.get()==o.map.get();
+        // Functions, classes, generators and iterators compare by identity
+        // (f == f was false, so a handler could not be found in a list).
+        case VMType::FUNCTION:
+            return code.get()==o.code.get() && closure_env.get()==o.closure_env.get() && list.get()==o.list.get();
+        case VMType::CLASS:  return code.get()==o.code.get() && class_name==o.class_name;
+        case VMType::GENERATOR: return gen.get()==o.gen.get();
+        case VMType::ITERATOR:  return iter.get()==o.iter.get();
+        case VMType::NATIVE: return !class_name.empty() && class_name==o.class_name;
         default:             return false;
         }
     }
@@ -303,41 +320,49 @@ struct VMVal {
 // VMCODE — compiled code object
 // ═══════════════════════════════════════════════════════════════════════════
 struct ExceptionEntry {
+    // One try (or with) statement. Its body [try_start, try_end) is covered
+    // by the except clauses and then the finally; the handlers and the else
+    // [try_end, finally_start) by the finally only. An exception that no
+    // clause matches runs the finally and propagates (it used to be silently
+    // dropped); one raised by a handler or the else runs the finally too.
     int try_start = 0;
     int try_end   = 0;
-    // One entry per `except` clause, tried in source order - mirrors the
-    // interpreter's evalTry (NythonExecutor.hpp), which walks tn->except_clauses
-    // and runs the first one whose declared type matches (or is a parent of)
-    // the raised exception's type, or that has no declared type at all. The
-    // VM used to have a single `handler`/`alias` here and always ran the
-    // FIRST except clause's body regardless of its declared type - every
-    // other clause's body wasn't even compiled.
     struct Clause {
-        std::string type_name;   // empty = catch-all, matches any exception
-        std::string bind_var;    // empty = don't bind (bare "except:")
-        int handler = 0;         // bytecode offset of this clause's body
+        std::vector<std::string> types;  // empty = catch-all
+        std::string bind_var;            // empty = don't bind
+        int handler = 0;                 // offset of the clause body
     };
     std::vector<Clause> clauses;
-    // Bytecode offset of the `else` clause's body (runs only if the try body
-    // did NOT raise), or -1 if there is none. Previously not compiled at all.
     int else_handler = -1;
-    // Offset immediately after the whole try/except/else, used when an
-    // exception is raised but no clause's type matches - the interpreter
-    // silently falls through to `finally` in that case rather than
-    // re-raising, so the VM matches that instead of leaving the exception
-    // to propagate further up.
+    // Offset of the finally body, -1 if there is none. The body runs with a
+    // pending state (normal / exception / return / break-continue) on the
+    // stack, consumed by the END_FINALLY that closes it.
+    int finally_start = -1;
+    // Values that stay on the operand stack across the statement - one per
+    // enclosing `for` loop's iterator, one per enclosing finally's pending
+    // state - so a handler can drop whatever a half-evaluated expression
+    // left behind when it raised (a raise in the middle of a list literal
+    // inside a for loop otherwise left the literal's items above the loop's
+    // iterator, and the loop stopped).
+    int depth = 0;
     int end = 0;
 };
 
 struct VMCode {
     std::string              name;
     std::string              parent_class;
+    std::vector<std::string> bases;         // every base class, in order (parent_class is bases[0])
     std::string              owner_class;   // class that defines this method
     std::vector<Instruction> instructions;
     std::vector<VMVal>       constants;
     std::vector<std::string> names;
     std::vector<std::string> param_names;
     std::vector<VMVal>       param_defaults; // parallel to param_names; UNDEFINED = no default
+    // For each default value MAKE_FUNCTION pops, the param_names index it
+    // belongs to (defaults used to be aligned to the END of the parameter
+    // list, which put them on the wrong parameters when *args, keyword-only
+    // parameters or **kwargs followed).
+    std::vector<int>         default_idx;
     bool                     is_class      = false;
     bool                     is_method     = false;
     bool                     is_static     = false;
@@ -369,14 +394,46 @@ struct VMCode {
         return (int)instructions.size()-1;
     }
     void patch(int idx, int arg) { instructions[idx].arg=arg; }
+    // Whether this function is a generator: a yield in its own body. A yield
+    // in a nested function belongs to that function - searching sub_codes
+    // made every function that merely defines a generator a generator
+    // itself (make(k) returning an inner generator function returned a
+    // generator instead).
     bool has_yield() const {
-        for(auto& ins:instructions) if(ins.op==Op::YIELD_VALUE||ins.op==Op::YIELD_FROM_OP) return true;
-        for(auto& sub:sub_codes) if(sub && sub->has_yield()) return true;
-        return false;
+        if(yield_known) return yield_cached;
+        bool y=false;
+        for(auto& ins:instructions) if(ins.op==Op::YIELD_VALUE||ins.op==Op::YIELD_FROM_OP){ y=true; break; }
+        yield_cached=y; yield_known=true;
+        return y;
     }
+    mutable bool yield_known=false, yield_cached=false;
     int  here() const { return (int)instructions.size(); }
 };
 
+
+// Class names that derive from BaseException - builtin or user-defined -
+// filled in as classes are made, so a bare VMVal can tell an exception
+// instance (which prints as its message) from any other instance.
+inline std::unordered_set<std::string>& vm_exc_classes() {
+    static std::unordered_set<std::string> s; return s;
+}
+// Python's BaseException.__str__: no args -> "", one -> str(arg), more ->
+// the args tuple.
+inline std::string vm_exc_message(const VMVal& e) {
+    if(!e.map) return std::string();
+    auto it=e.map->find("args");
+    if(it!=e.map->end()&&it->second.type==VMType::LIST&&it->second.list){
+        auto& a=*it->second.list;
+        if(a.empty()) return std::string();
+        if(a.size()==1) return a[0].to_string();
+        std::string r="(";
+        for(size_t k=0;k<a.size();k++){ if(k) r+=", "; r+=a[k].repr(); }
+        return r+")";
+    }
+    auto mt=e.map->find("msg");
+    if(mt!=e.map->end()) return mt->second.to_string();
+    return std::string();
+}
 
 // ── VMVal method bodies (defined after VMCode is complete) ────────────────
 // Object dict keys (instances, functions) by identity: the key text holds an
@@ -438,11 +495,10 @@ inline std::string VMVal::to_string() const {
     case VMType::FUNCTION: return "<function "+(code?code->name:"?")+">"; 
     case VMType::CLASS:    return "<class "+class_name+">";
     case VMType::INSTANCE: {
-        if(map){
-            auto it=map->find("msg");
-            if(it!=map->end()&&it->second.type==VMType::STRING)
-                return class_name+": "+it->second.s;
-        }
+        // An exception reads as its message, as in Python: str(e) is the
+        // message, not "Type: message" (that is how an uncaught one is
+        // reported, not what the value is).
+        if(map && vm_exc_classes().count(class_name)) return vm_exc_message(*this);
         return "<"+class_name+" instance>";
     }
     case VMType::NATIVE:
@@ -457,6 +513,14 @@ inline std::string VMVal::repr() const {
     // Python's repr of a string (quotes and escapes chosen as Python does),
     // matching the interpreter.
     if(type==VMType::STRING) return nypy::str_repr(s);
+    // An exception instance: Type(args...), as Python shows it.
+    if(type==VMType::INSTANCE && map && vm_exc_classes().count(class_name)){
+        std::string r=class_name+"(";
+        auto it=map->find("args");
+        if(it!=map->end()&&it->second.type==VMType::LIST&&it->second.list)
+            for(size_t k=0;k<it->second.list->size();k++){ if(k) r+=", "; r+=(*it->second.list)[k].repr(); }
+        return r+")";
+    }
     return to_string();
 }
 
@@ -488,8 +552,16 @@ class Compiler {
     void push_code(const std::string& name, bool is_class=false) {
         auto c=std::make_shared<VMCode>(); c->name=name; c->is_class=is_class;
         code_stack_.push_back(code_); code_=c;
+        body_saves_.push_back({std::move(loops_),std::move(fin_stack_),persist_depth_,std::move(exc_vars_)});
+        loops_.clear(); fin_stack_.clear(); persist_depth_=0; exc_vars_.clear();
     }
     std::shared_ptr<VMCode> pop_code() {
+        {
+            auto& sv=body_saves_.back();
+            loops_=std::move(sv.loops); fin_stack_=std::move(sv.fins);
+            persist_depth_=sv.depth; exc_vars_=std::move(sv.ev);
+            body_saves_.pop_back();
+        }
         auto c=code_; code_=code_stack_.back(); code_stack_.pop_back();
         // If this code is a method inside a class, tag its owner_class
         if(code_->is_class && c->owner_class.empty())
@@ -500,9 +572,38 @@ class Compiler {
 
     void emit(Op op,int arg=0,int ln=0)    { C().emit(op,arg,ln); }
     void emit_lc(VMVal v,int ln=0)         { emit(Op::LOAD_CONST,  C().add_const(std::move(v)),ln); }
-    void emit_ln(const std::string& n,int l=0){ emit(Op::LOAD_NAME,  C().add_name(n),l); }
-    void emit_sn(const std::string& n,int l=0){ emit(Op::STORE_NAME, C().add_name(n),l); }
-    void emit_dn(const std::string& n,int l=0){ emit(Op::DEFINE_NAME,C().add_name(n),l); }
+    void emit_ln(const std::string& n,int l=0){ emit(Op::LOAD_NAME,  C().add_name(rn(n)),l); }
+    void emit_sn(const std::string& n,int l=0){ emit(Op::STORE_NAME, C().add_name(rn(n)),l); }
+    void emit_dn(const std::string& n,int l=0){ emit(Op::DEFINE_NAME,C().add_name(rn(n)),l); }
+
+    // Comprehension targets are compiled under hidden names (the
+    // comprehension's own scope, so they no longer overwrite a same-named
+    // variable of the enclosing one). Innermost scope last; a function or
+    // lambda parameter maps to itself, shadowing an outer rename.
+    std::vector<std::unordered_map<std::string,std::string>> renames_;
+    std::string rn(const std::string& n) const {
+        for(auto it=renames_.rbegin(); it!=renames_.rend(); ++it){
+            auto f=it->find(n);
+            if(f!=it->end()) return f->second;
+        }
+        return n;
+    }
+    static void target_names(const nython::node::node_ptr& t, std::vector<std::string>& out){
+        if(!t) return;
+        if(t->type()==nython::node::NodeType::TUPLE||t->type()==nython::node::NodeType::LIST){ for(auto& e:t->statements()) target_names(e,out); return; }
+        out.push_back(t->token().value);
+    }
+    // Stores TOS into a comprehension/for target, unpacking tuples.
+    void store_target(const nython::node::node_ptr& t, int l){
+        if(t->type()==nython::node::NodeType::TUPLE||t->type()==nython::node::NodeType::LIST){
+            auto el=t->statements();
+            emit(Op::UNPACK_SEQ,(int)el.size(),l);
+            for(auto& e:el) store_target(e,l);
+            return;
+        }
+        emit_dn(t->token().value,l);
+    }
+    int comp_id_ = 0;
     int  ln(nython::node::node_ptr nd) { return nd?nd->token().location().row:0; }
 
     // Integer literal tokens keep their source spelling verbatim
@@ -533,6 +634,33 @@ class Compiler {
     struct LoopCtx { int start; std::vector<int> breaks,conts; bool is_for=false; };
     std::vector<LoopCtx> loops_;
 
+    // try/finally and with: the finally blocks the code being compiled is
+    // inside (innermost last), so return/break/continue can run them first.
+    struct FinCtx { int entry; size_t loop_depth; std::vector<int> jumps; };
+    std::vector<FinCtx> fin_stack_;
+    // Operand-stack values held across statements here (ExceptionEntry::depth).
+    int persist_depth_ = 0;
+    // Hidden variables holding the exception each enclosing except clause is
+    // handling, for a bare `raise`.
+    std::vector<std::string> exc_vars_;
+    int try_counter_ = 0;
+    // Emits a jump to the innermost enclosing finally (patched when its
+    // offset is known).
+    void jump_to_finally(int l){
+        fin_stack_.back().jumps.push_back(C().here());
+        emit(Op::JUMP_ABSOLUTE,-1,l);
+    }
+    // True when a break/continue here leaves a try/with inside the innermost
+    // loop, and so must run that statement's finally first.
+    bool loop_exit_crosses_finally() const {
+        return !loops_.empty() && !fin_stack_.empty() && fin_stack_.back().loop_depth >= loops_.size();
+    }
+    // A function, lambda or class body starts with none of the above: a
+    // `break` in a nested function does not belong to the enclosing loop and
+    // a `return` there does not run the enclosing function's finally blocks.
+    struct SavedBody { std::vector<LoopCtx> loops; std::vector<FinCtx> fins; int depth; std::vector<std::string> ev; };
+    std::vector<SavedBody> body_saves_;
+
 public:
     Compiler() : code_(std::make_shared<VMCode>()) { code_->name="<module>"; }
 
@@ -548,20 +676,51 @@ private:
     using np = nython::node::node_ptr;
 
     // ─── statement wrapper — pops discarded expression results ─────────────
+    // Every expression used as a statement leaves its value on the operand
+    // stack and must be popped. Only calls, tuples and lists used to be: any
+    // other expression statement - a docstring, `x == 1`, `a[i]` - left a
+    // value behind, and inside a `for` loop FOR_ITER then read that value
+    // instead of the loop's iterator and the loop silently ended after one
+    // pass.
+    static bool pushes_value(const np& nd) {
+        switch(nd->type()){
+        case NT::INTEGER: case NT::FLOAT: case NT::STRING: case NT::TRUE:
+        case NT::FALSE: case NT::NONE: case NT::VARIABLE: case NT::SELF:
+        case NT::SUPER: case NT::ATTRIBUTE: case NT::SUBSCRIPT: case NT::UNARY:
+        case NT::BINARY: case NT::CALL: case NT::LIST: case NT::TUPLE:
+        case NT::MAP: case NT::COMPLEX: case NT::LAMBDA: case NT::WALRUS: case NT::COMPREHENSION:
+        case NT::RANGE: case NT::SLICE: case NT::YIELD:
+            return true;
+        case NT::IF:
+            return std::static_pointer_cast<nython::node::IfNode>(nd)->is_expr;
+        default:
+            return false;
+        }
+    }
     void visit_stmt(np nd) {
         if(!nd) return;
-        auto nt=nd->type();
+        // `super()` on its own as a statement is Nython's shorthand for
+        // calling the parent constructor (super(args) with arguments is
+        // handled at run time: see vm_call's SUPER_PROXY case).
+        if(nd->type()==NT::CALL){
+            auto cn=std::static_pointer_cast<nython::node::CallNode>(nd);
+            if(cn->callee && cn->callee->type()==NT::SUPER && cn->args.empty()){
+                int l=ln(nd);
+                emit(Op::LOAD_SUPER,0,l);
+                emit_lc(VMVal::make_str("__init__"),l);
+                emit(Op::CALL_METHOD,0,l);
+                emit(Op::POP_TOP,0,l);
+                return;
+            }
+        }
         visit(nd);
-        // Pop the result if this is a call-as-statement (result unused)
-        bool is_expr_stmt = (nt==NT::CALL || nt==NT::TUPLE || nt==NT::LIST);
-        if(is_expr_stmt) emit(Op::POP_TOP,0,ln(nd));
+        if(pushes_value(nd)) emit(Op::POP_TOP,0,ln(nd));
     }
 
     // ─── dispatch ──────────────────────────────────────────────────────────
     void visit(np nd) {
         if(!nd) return;
         int l=ln(nd);
-        if(nd->type()==NT::WALRUS) std::cerr<<"[DBG] visit WALRUS node!\n";
         switch(nd->type()) {
         // Literals
         case NT::INTEGER: emit_lc(int_literal(nd->token().value),l); break;
@@ -718,9 +877,21 @@ private:
                && b->right->type()==NT::VARIABLE){
                 const std::string& tn=b->right->token().value;
                 if(isTypeNameToken(tn)){
+                    // A builtin type word (int, list, ...) is always a type
+                    // test. Any other capitalised name is decided at run time
+                    // (COMPARE_IS_TYPE arg 1): a type test when it names a
+                    // class, identity when it is an ordinary value - `L is L`
+                    // for a list named L was compiled as a type test and read
+                    // false.
+                    static const std::set<std::string> words = {
+                        "int","Integer","integer","float","Float","double","Double",
+                        "str","String","string","bool","Boolean","boolean",
+                        "list","List","array","Array","map","Map","dict","Dict",
+                        "tuple","Tuple","set","Set",
+                        "none","None","function","Function","Object","object","any","Any"};
                     visit(b->left);
                     emit_lc(VMVal::make_str(tn),l);
-                    emit(op=="is not"?Op::COMPARE_IS_NOT_TYPE:Op::COMPARE_IS_TYPE,0,l);
+                    emit(op=="is not"?Op::COMPARE_IS_NOT_TYPE:Op::COMPARE_IS_TYPE, words.count(tn)?0:1, l);
                     break;
                 }
             }
@@ -750,7 +921,10 @@ private:
         case NT::RETURN: {
             auto rn=std::static_pointer_cast<nython::node::ReturnNode>(nd);
             if(rn->expr) visit(rn->expr); else emit_lc(VMVal::make_none(),l);
-            emit(Op::RETURN_VALUE,0,l); break;
+            // Inside try/finally or with: run the finally blocks first.
+            if(!fin_stack_.empty()){ emit(Op::FIN_RETURN,0,l); jump_to_finally(l); }
+            else emit(Op::RETURN_VALUE,0,l);
+            break;
         }
 
         // If
@@ -765,14 +939,32 @@ private:
         case NT::LAMBDA: {
             auto lm=std::static_pointer_cast<nython::node::LambdaNode>(nd);
             push_code("<lambda>");
+            renames_.emplace_back();
             for(auto& p:lm->params){
                 std::string pn=p->value(); if(pn=="self") continue;
                 C().param_names.push_back(pn); C().add_name(pn);
+                renames_.back()[pn]=pn;
             }
             if(lm->body){ visit(lm->body); emit(Op::RETURN_VALUE,0,l); }
             else{ emit_lc(VMVal::make_none(),l); emit(Op::RETURN_VALUE,0,l); }
+            renames_.pop_back();
+            C().param_defaults.assign(C().param_names.size(), VMVal{VMType::UNDEFINED});
             pop_code();
-            emit(Op::MAKE_FUNCTION,(int)C().sub_codes.size()-1,l); break;
+            {
+                // Lambda defaults (`lambda x, y=2: ...`) were ignored.
+                auto lcode=C().sub_codes.back();
+                int n_def=0, pn_idx=0;
+                for(int i=0;i<(int)lm->params.size();i++){
+                    if(lm->params[i]->value()=="self") continue;
+                    if(i<(int)lm->defaults.size()&&lm->defaults[i]){
+                        visit(lm->defaults[i]); n_def++;
+                        lcode->default_idx.push_back(pn_idx);
+                    }
+                    pn_idx++;
+                }
+                emit(Op::MAKE_FUNCTION,((int)C().sub_codes.size()-1)|(n_def<<16),l);
+            }
+            break;
         }
         // Tuple
         case NT::TUPLE: {
@@ -799,8 +991,6 @@ private:
             visit(wn->init);
             emit(Op::DUP_TOP,0,l);
             emit_dn(wn->name,l);
-            // DEBUG: verify DUP_TOP leaves a value
-            std::cerr<<"[DBG] WALRUS compiled: init, DUP_TOP, DEFINE_NAME("<<wn->name<<")\n";
             break;
         }
         // Pass / global / nonlocal
@@ -840,42 +1030,36 @@ private:
         }
         // Switch/match
         case NT::WITH: {
+            // with E as x: body  ==  ctx = E; x = ctx.__enter__() (or ctx
+            // itself when it has none); try: body; finally: ctx.__exit__(...)
+            // __exit__ gets (type, value, none) for an exception, and a truthy
+            // result suppresses it; every other way out - falling off the
+            // end, return, break, continue - gets (none, none, none).
             auto wn=std::static_pointer_cast<nython::node::WithNode>(nd);
             int l2=ln(wn);
-            // Store ctx manager in a hidden temp var
-            static int with_cnt=0;
-            std::string ctx_tmp="__with_ctx"+std::to_string(with_cnt++)+"__";
+            std::string ctx_tmp="__with_ctx"+std::to_string(try_counter_++)+"__";
             visit(wn->expr);
             emit_dn(ctx_tmp,l2);
-            // Call __enter__, bind result to alias
             emit_ln(ctx_tmp,l2);
-            emit_lc(VMVal::make_str("__enter__"),l2);
-            emit(Op::CALL_METHOD,0,l2);
+            emit(Op::WITH_ENTER,0,l2);
             if(!wn->alias.empty()) emit_dn(wn->alias,l2);
             else emit(Op::POP_TOP,0,l2);
-            // Body protected by SETUP_EXCEPT
-            int exc_entry=C().here(); emit(Op::SETUP_EXCEPT,0,l2);
+            int idx=(int)C().exc_table.size();
+            C().exc_table.emplace_back();
+            C().exc_table[idx].depth=persist_depth_;
+            fin_stack_.push_back({idx,loops_.size(),{}});
+            C().exc_table[idx].try_start=C().here();
             if(wn->body) visit_stmt(wn->body);
-            emit(Op::END_EXCEPT,0,l2);
-            // Normal exit: ctx.__exit__(none,none,none)
+            C().exc_table[idx].try_end=C().here();
+            FinCtx fc=std::move(fin_stack_.back()); fin_stack_.pop_back();
+            emit(Op::FIN_NORMAL,0,l2);
+            int fs=C().here();
+            C().exc_table[idx].finally_start=fs;
+            for(int j:fc.jumps) C().patch(j,fs);
             emit_ln(ctx_tmp,l2);
-            emit_lc(VMVal::make_str("__exit__"),l2);
-            emit_lc(VMVal::make_none(),l2);
-            emit_lc(VMVal::make_none(),l2);
-            emit_lc(VMVal::make_none(),l2);
-            emit(Op::CALL_METHOD,3,l2);
-            emit(Op::POP_TOP,0,l2);
-            int end_jmp=C().here(); emit(Op::JUMP_FORWARD,0,l2);
-            // Exception exit: ctx.__exit__(exc_type,exc_val,tb)
-            C().patch(exc_entry,C().here());
-            emit_ln(ctx_tmp,l2);
-            emit_lc(VMVal::make_str("__exit__"),l2);
-            emit_lc(VMVal::make_none(),l2);
-            emit_lc(VMVal::make_none(),l2);
-            emit_lc(VMVal::make_none(),l2);
-            emit(Op::CALL_METHOD,3,l2);
-            emit(Op::POP_TOP,0,l2);
-            C().patch(end_jmp,C().here());
+            emit(Op::WITH_EXIT,0,l2);
+            emit(Op::END_FINALLY, fin_stack_.empty()?-1:fin_stack_.back().entry, l2);
+            C().exc_table[idx].end=C().here();
             break;
         }
         case NT::SWITCH: {
@@ -894,7 +1078,7 @@ private:
                 // on the VM.
                 if(cn->value_node && cn->value_node->value()=="_"){
                     emit(Op::POP_TOP,0,l);
-                    if(cn->body) visit(cn->body);
+                    if(cn->body) visit_stmt(cn->body);
                     wildcard_handled=true;
                     break;
                 }
@@ -903,13 +1087,19 @@ private:
                 emit(Op::COMPARE_EQ,0,l);
                 int jf=C().here(); emit(Op::JUMP_IF_FALSE,0,l);
                 emit(Op::POP_TOP,0,l);
-                if(cn->body) visit(cn->body);
+                if(cn->body) visit_stmt(cn->body);
                 end_jumps.push_back(C().here()); emit(Op::JUMP_FORWARD,0,l);
                 C().patch(jf,C().here());
             }
             if(!wildcard_handled){
                 emit(Op::POP_TOP,0,l);
-                if(sw->default_case) visit(sw->default_case);
+                // default_case is a DefaultNode wrapping the body; visiting
+                // the wrapper itself compiled to a NOP, so `default:` never
+                // ran on the VM.
+                if(sw->default_case){
+                    auto dn=std::static_pointer_cast<nython::node::DefaultNode>(sw->default_case);
+                    if(dn->body) visit_stmt(dn->body);
+                }
             }
             int end=C().here();
             for(int j:end_jumps) C().patch(j,end);
@@ -957,7 +1147,7 @@ private:
                 else if(stmt->type()==NT::CLASS) mn=std::static_pointer_cast<nython::node::ClassNode>(stmt)->name;
                 if(!mn.empty()) member_names.push_back(mn);
             }
-            if(nn->body) for(auto& s:nn->body->statements()) visit(s);
+            if(nn->body) for(auto& s:nn->body->statements()) visit_stmt(s);
             for(auto& mn:member_names){ emit_lc(VMVal::make_str(mn),l); emit_ln(mn,l); }
             emit(Op::BUILD_MAP,(int)member_names.size(),l);
             emit_dn(nn->name,l);
@@ -974,7 +1164,7 @@ private:
             auto in_=std::static_pointer_cast<nython::node::InterfaceNode>(nd);
             push_code(in_->name,true);
             code_->is_class=true;
-            if(in_->body) for(auto& s:in_->body->statements()) visit(s);
+            if(in_->body) for(auto& s:in_->body->statements()) visit_stmt(s);
             emit(Op::HALT,0,l);
             pop_code();
             int idx=(int)C().sub_codes.size()-1;
@@ -992,6 +1182,9 @@ private:
         // List comprehension (ComplexNode)
         case NT::COMPLEX: {
             auto cn=std::static_pointer_cast<nython::node::ComplexNode>(nd);
+            // Comprehensions are ComprehensionNodes now; a ComplexNode is a
+            // complex-number literal (`2j`), which has no items to index.
+            if(cn->items.size()<2){ emit_lc(VMVal::make_none(),l); break; }
             // items: [0]=expr, [1]=iterable, [2]=filter(or null), 
             //        optionally [3]=var2, [4]=iterable2
             std::string var_name = cn->token().value;
@@ -1065,6 +1258,57 @@ private:
             break;
         }
 
+        case NT::COMPREHENSION: {
+            auto cn=std::static_pointer_cast<nython::node::ComprehensionNode>(nd);
+            using CK=nython::node::ComprehensionNode;
+            int id=comp_id_++;
+            std::string acc="__comp"+std::to_string(id)+"__";
+            if(cn->kind==CK::DICT) emit(Op::BUILD_MAP,0,l); else emit(Op::BUILD_LIST,0,l);
+            emit(Op::DEFINE_NAME,C().add_name(acc),l);
+            // The first iterable is evaluated in the enclosing scope.
+            if(!cn->clauses.empty()) visit(cn->clauses[0].iter);
+            renames_.emplace_back();
+            for(auto& cl:cn->clauses){
+                std::vector<std::string> names; target_names(cl.target,names);
+                for(auto& n:names) renames_.back()[n]="__c"+std::to_string(id)+"_"+n;
+            }
+            std::vector<int> exits;
+            std::vector<int> tops;
+            for(size_t k=0;k<cn->clauses.size();k++){
+                auto& cl=cn->clauses[k];
+                if(k>0) visit(cl.iter);
+                emit(Op::GET_ITER,0,l);
+                int top=C().here(); tops.push_back(top);
+                exits.push_back(C().here()); emit(Op::FOR_ITER,0,l);
+                store_target(cl.target,l);
+                for(auto& c:cl.conds){ visit(c); emit(Op::JUMP_IF_FALSE,top,l); }
+            }
+            if(cn->kind==CK::DICT){
+                visit(cn->value);
+                emit(Op::LOAD_NAME,C().add_name(acc),l);
+                visit(cn->elt);
+                emit(Op::STORE_SUBSCR,0,l);
+            } else {
+                emit(Op::LOAD_NAME,C().add_name(acc),l);
+                visit(cn->elt);
+                emit(Op::LIST_APPEND,0,l);
+                emit(Op::POP_TOP,0,l);
+            }
+            // Close the loops innermost first: each jumps back to its own
+            // FOR_ITER; an exhausted inner loop falls through to the next
+            // iteration of the one around it.
+            for(int k=(int)cn->clauses.size()-1;k>=0;k--){
+                emit(Op::JUMP_ABSOLUTE,tops[k],l);
+                C().patch(exits[k],C().here());
+            }
+            renames_.pop_back();
+            if(cn->kind==CK::SET){
+                emit_ln("set",l);
+                emit(Op::LOAD_NAME,C().add_name(acc),l);
+                emit(Op::CALL_FUNCTION,1,l);
+            } else emit(Op::LOAD_NAME,C().add_name(acc),l);
+            break;
+        }
         case NT::LIST: {
             auto ln_=std::static_pointer_cast<nython::node::ListNode>(nd);
             for(auto& e:ln_->elements) visit(e);
@@ -1085,8 +1329,13 @@ private:
             // A break in a `for` must discard the iterator FOR_ITER would have
             // popped on natural exit; otherwise it outlives the loop.
             if(!loops_.empty() && loops_.back().is_for) emit(Op::POP_TOP,0,l);
-            emit(Op::JUMP_ABSOLUTE,-9991,l); break;
-        case NT::CONTINUE: emit(Op::JUMP_ABSOLUTE,-9992,l); break;
+            if(loop_exit_crosses_finally()){ emit(Op::FIN_JUMP,-9991,l); jump_to_finally(l); }
+            else emit(Op::JUMP_ABSOLUTE,-9991,l);
+            break;
+        case NT::CONTINUE:
+            if(loop_exit_crosses_finally()){ emit(Op::FIN_JUMP,-9992,l); jump_to_finally(l); }
+            else emit(Op::JUMP_ABSOLUTE,-9992,l);
+            break;
 
         // Import
         case NT::IMPORT: {
@@ -1106,71 +1355,80 @@ private:
         // Raise
         case NT::RAISE: {
             auto rn=std::static_pointer_cast<nython::node::RaiseNode>(nd);
-            if(rn->expr) visit(rn->expr);
-            else emit_lc(VMVal::make_str("Exception"),l);
-            emit(Op::RAISE_ERROR,0,l); break;
+            if(!rn->expr){
+                // Bare `raise` re-raises the exception the enclosing except
+                // clause is handling. It used to raise the string "Exception",
+                // which no typed clause matched.
+                if(!exc_vars_.empty()){ emit_ln(exc_vars_.back(),l); emit(Op::RAISE_ERROR,1,l); }
+                else { emit_lc(VMVal::make_str("RuntimeError: No active exception to reraise"),l); emit(Op::RAISE_ERROR,0,l); }
+                break;
+            }
+            visit(rn->expr);
+            if(rn->cause){ visit(rn->cause); emit(Op::RAISE_ERROR,2,l); }
+            else emit(Op::RAISE_ERROR,0,l);
+            break;
         }
-        // Assert
+        // Assert: raises AssertionError(message) - it raised the bare message
+        // string (or the string "AssertionError"), which `except
+        // AssertionError` could not catch.
         case NT::ASSERT: {
             auto an=std::static_pointer_cast<nython::node::AssertNode>(nd);
             visit(an->condition);
             int jt=C().here(); emit(Op::JUMP_IF_TRUE,0,l);
-            if(an->message) visit(an->message);
-            else emit_lc(VMVal::make_str("AssertionError"),l);
+            emit_ln("AssertionError",l);
+            if(an->message){ visit(an->message); emit(Op::CALL_FUNCTION,1,l); }
+            else emit(Op::CALL_FUNCTION,0,l);
             emit(Op::RAISE_ERROR,0,l);
             C().patch(jt,C().here()); break;
         }
-        // Try/except — exception table approach
         case NT::TRY: {
             auto tn=std::static_pointer_cast<nython::node::TryNode>(nd);
-            ExceptionEntry ee;
-            ee.try_start = C().here();
-            // Compile try body
-            if(tn->body) visit(tn->body);
-            ee.try_end = C().here();
+            int idx=(int)C().exc_table.size();
+            C().exc_table.emplace_back();
+            C().exc_table[idx].depth=persist_depth_;
+            bool has_fin=(bool)tn->finally_clause;
+            if(has_fin) fin_stack_.push_back({idx,loops_.size(),{}});
+            C().exc_table[idx].try_start=C().here();
+            if(tn->body) visit_stmt(tn->body);
+            C().exc_table[idx].try_end=C().here();
             // Jump over the handlers when no exception was raised.
-            int jmp_over = C().here(); emit(Op::JUMP_FORWARD,0,l);
-            // Compile EVERY except clause as its own handler entry point -
-            // previously only the first clause's body was even compiled, so
-            // `except TypeError:` after `except ValueError:` was dead code
-            // and every exception ran the ValueError handler regardless of
-            // its actual type. Which handler to jump to is decided at
-            // runtime by match_except_handler(), comparing the raised
-            // exception's type against each clause's type_name in order -
-            // mirroring the interpreter's evalTry (NythonExecutor.hpp).
-            std::vector<int> end_jumps;
-            auto compile_clause=[&](const std::string& type_filter, const std::string& bind_var, node_ptr body){
-                ExceptionEntry::Clause cl;
-                cl.type_name=type_filter; cl.bind_var=bind_var;
-                cl.handler=C().here();
-                if(!bind_var.empty()) emit_dn(bind_var,l);
-                else emit(Op::POP_TOP,0,l);
-                if(body) visit(body);
-                end_jumps.push_back(C().here()); emit(Op::JUMP_FORWARD,0,l);
-                ee.clauses.push_back(std::move(cl));
-            };
+            int jmp_over=C().here(); emit(Op::JUMP_FORWARD,0,l);
+            // Every except clause is its own handler entry point; which one
+            // runs is decided at runtime (match_except_handler) from the
+            // raised exception's class and each clause's types. The
+            // exception is kept in a hidden variable for a bare `raise`.
+            std::string held="__exc"+std::to_string(try_counter_++)+"__";
+            std::vector<int> to_exit;
             for(auto& ec:tn->except_clauses){
                 auto en=std::static_pointer_cast<nython::node::ExceptNode>(ec);
-                // 'except e:'          -> name="e", alias=""    -> catch-all, bind "e"
-                // 'except Err as e:'    -> name="Err", alias="e"  -> type "Err", bind "e"
-                // 'except:'            -> name="", alias=""     -> catch-all, no bind
-                bool has_type = !en->alias.empty();
-                compile_clause(has_type?en->name:std::string(), has_type?en->alias:en->name, en->body);
+                ExceptionEntry::Clause cl;
+                cl.types=en->types; cl.bind_var=en->var;
+                cl.handler=C().here();
+                emit_dn(held,l);
+                if(!en->var.empty()){ emit_ln(held,l); emit_dn(en->var,l); }
+                exc_vars_.push_back(held);
+                if(en->body) visit_stmt(en->body);
+                exc_vars_.pop_back();
+                to_exit.push_back(C().here()); emit(Op::JUMP_FORWARD,0,l);
+                C().exc_table[idx].clauses.push_back(std::move(cl));
             }
-            if(tn->except_clauses.empty()){
-                // try/finally with no except at all: give the dispatch a
-                // catch-all landing spot that just discards the exception.
-                compile_clause(std::string(),std::string(),nullptr);
-            }
-            // No-exception path (and "no clause matched") lands here.
             C().patch(jmp_over,C().here());
-            ee.else_handler = tn->else_clause ? C().here() : -1;
-            if(tn->else_clause) visit(tn->else_clause);
-            int end_pos=C().here();
-            for(int j:end_jumps) C().patch(j,end_pos);
-            ee.end=end_pos;
-            C().exc_table.push_back(ee);
-            if(tn->finally_clause) visit(tn->finally_clause);
+            C().exc_table[idx].else_handler = tn->else_clause ? C().here() : -1;
+            if(tn->else_clause) visit_stmt(tn->else_clause);
+            int exit_pt=C().here();
+            for(int j:to_exit) C().patch(j,exit_pt);
+            if(has_fin){
+                FinCtx fc=std::move(fin_stack_.back()); fin_stack_.pop_back();
+                emit(Op::FIN_NORMAL,0,l);
+                int fs=C().here();
+                C().exc_table[idx].finally_start=fs;
+                for(int j:fc.jumps) C().patch(j,fs);
+                persist_depth_++;
+                visit_stmt(tn->finally_clause);
+                persist_depth_--;
+                emit(Op::END_FINALLY, fin_stack_.empty()?-1:fin_stack_.back().entry, l);
+            }
+            C().exc_table[idx].end=C().here();
             break;
         }
         // Expression statement (discard result)
@@ -1215,9 +1473,12 @@ private:
     // needs the parser to distinguish statement-ifs from ternaries first.
     void visit_if(std::shared_ptr<nython::node::IfNode> nd) {
         int l=ln(nd);
+        // An expression-if's branches are values; a statement-if's are
+        // statements (IfNode::is_expr, set by the parser for ternaries).
+        auto branch=[&](np b){ if(nd->is_expr) visit(b); else visit_stmt(b); };
         visit(nd->condition);
         int jf=C().here(); emit(Op::JUMP_IF_FALSE,0,l);
-        visit(nd->then_branch);
+        branch(nd->then_branch);
         std::vector<int> ends; ends.push_back(C().here());
         emit(Op::JUMP_FORWARD,0,l);
         C().patch(jf,C().here());
@@ -1225,11 +1486,12 @@ private:
             auto eif=std::static_pointer_cast<nython::node::IfNode>(ei);
             visit(eif->condition);
             int jf2=C().here(); emit(Op::JUMP_IF_FALSE,0,l);
-            visit(eif->then_branch);
+            branch(eif->then_branch);
             ends.push_back(C().here()); emit(Op::JUMP_FORWARD,0,l);
             C().patch(jf2,C().here());
         }
-        if(nd->else_branch) visit(nd->else_branch);
+        if(nd->else_branch) branch(nd->else_branch);
+        else if(nd->is_expr) emit_lc(VMVal::make_none(),l);
         int end=C().here();
         for(int j:ends) C().patch(j,end);
     }
@@ -1254,7 +1516,7 @@ private:
             // Re-patch break jumps: JUMP_ABSOLUTE to 'end' → jump to 'else_end'
             for(int i=start;i<end;i++){
                 auto& ins=C().instructions[i];
-                if(ins.op==Op::JUMP_ABSOLUTE&&ins.arg==end)
+                if((ins.op==Op::JUMP_ABSOLUTE||ins.op==Op::FIN_JUMP)&&ins.arg==end)
                     ins.arg=else_end;
             }
         }
@@ -1274,6 +1536,7 @@ private:
         // exactly once — silently, with no error.
         loops_.push_back({start,{},{},true});
         int fi=C().here(); emit(Op::FOR_ITER,0,l);
+        auto bind_loop=[&](const std::string& n){ if(nd->rebinds) emit_sn(n,l); else emit_dn(n,l); };
         if(!nd->unpack_vars.empty()) {
             // for a, b, c in ...: FOR_ITER pushed [a_val, b_val,...]; unpack by index
             std::string tmp="__for_unpack__";
@@ -1281,17 +1544,23 @@ private:
             // Assign first var (nd->var)
             int idx0=C().add_const(VMVal::make_int(0));
             emit_ln(tmp,l); emit(Op::LOAD_CONST,idx0,l); emit(Op::LOAD_SUBSCR,0,l);
-            emit_sn(nd->var?nd->var->value():"_",l);
+            bind_loop(nd->var?nd->var->value():"_");
             // Assign rest (nd->unpack_vars)
             for(int ui=0;ui<(int)nd->unpack_vars.size();ui++){
                 int ci=C().add_const(VMVal::make_int(ui+1));
                 emit_ln(tmp,l); emit(Op::LOAD_CONST,ci,l); emit(Op::LOAD_SUBSCR,0,l);
-                emit_sn(nd->unpack_vars[ui]->value(),l);
+                bind_loop(nd->unpack_vars[ui]->value());
             }
         } else {
-            emit_sn(nd->var?nd->var->value():"_",l);
+            // The loop variable is a local of the running function (as on
+            // the interpreter): a STORE rebound a global of the same name,
+            // so `for i in ...` inside any function overwrote a module `i`.
+            // Declared global/nonlocal: the existing binding is rebound.
+            bind_loop(nd->var?nd->var->value():"_");
         }
+        persist_depth_++;   // the iterator stays on the stack during the body
         visit_stmt(nd->body);
+        persist_depth_--;
         emit(Op::JUMP_ABSOLUTE,start,l);
         int end=C().here(); C().patch(fi,end);
         patch_loop(start,end);
@@ -1307,7 +1576,7 @@ private:
             // Re-patch break jumps: change JUMP_ABSOLUTE to 'end' → jump to 'else_end' (skip else)
             for(int i=start; i<else_start; i++){
                 auto& ins=C().instructions[i];
-                if(ins.op==Op::JUMP_ABSOLUTE && ins.arg==end)
+                if((ins.op==Op::JUMP_ABSOLUTE||ins.op==Op::FIN_JUMP) && ins.arg==end)
                     ins.arg=else_end;
             }
         }
@@ -1316,7 +1585,7 @@ private:
     void patch_loop(int start, int end) {
         for(int i=start;i<end;i++){
             auto& ins=C().instructions[i];
-            if(ins.op==Op::JUMP_ABSOLUTE){
+            if(ins.op==Op::JUMP_ABSOLUTE||ins.op==Op::FIN_JUMP){
                 if(ins.arg==-9991) ins.arg=end;
                 if(ins.arg==-9992) ins.arg=start;
             }
@@ -1390,21 +1659,28 @@ private:
                 // Use a "constant folding" trick: for simple literals.
             }
         }
-        if(fn->body) visit(fn->body);
+        renames_.emplace_back();
+        for(auto& p:fn->params){ std::string pn=p->value(); renames_.back()[pn]=pn; }
+        if(fn->body) visit_stmt(fn->body);
+        renames_.pop_back();
         emit_lc(VMVal::make_none(),l); emit(Op::RETURN_VALUE,0,l);
         // Now store defaults: compile each default expr and store result
         // We can't easily do this at compile time for non-literal defaults.
         // Store default AST nodes → evaluate at MAKE_FUNCTION time (runtime).
-        auto& sub=C().sub_codes.back(); // last pushed sub_code
         pop_code();
         int idx=(int)C().sub_codes.size()-1;
-        // Compile defaults: emit instructions to evaluate each default, 
-        // collect them at MAKE_FUNCTION time using a separate "defaults code"
-        // For now: use a simpler approach - emit them into the parent context
-        // and have MAKE_FUNCTION pop N defaults from stack.
-        int n_defaults=0;
-        for(int i=0;i<(int)fn->defaults.size();i++){
-            if(fn->defaults[i]){ visit(fn->defaults[i]); n_defaults++; }
+        auto fcode=C().sub_codes.back();
+        // Every default is evaluated here, once, when the def runs, in the
+        // scope the def is in - and MAKE_FUNCTION keeps the values with that
+        // function value (VMVal::list), not in the shared code object.
+        int n_defaults=0, pn_idx=0;
+        for(int i=0;i<(int)fn->params.size();i++){
+            if(fn->params[i]->value()=="self") continue;
+            if(i<(int)fn->defaults.size()&&fn->defaults[i]){
+                visit(fn->defaults[i]); n_defaults++;
+                fcode->default_idx.push_back(pn_idx);
+            }
+            pn_idx++;
         }
         // MAKE_FUNCTION arg = idx | (n_defaults << 16)
         emit(Op::MAKE_FUNCTION, idx|(n_defaults<<16), l);
@@ -1416,11 +1692,9 @@ private:
         int l=ln(cn);
         push_code(cn->name,true);
         code_->is_class=true;  // mark this sub_code as a class
-        if(!cn->bases.empty()){
-            auto base=std::static_pointer_cast<nython::node::VariableNode>(cn->bases[0]);
-            code_->parent_class=base->token().value;
-        }
-        if(cn->body) for(auto& s:cn->body->statements()) visit(s);
+        for(auto& b:cn->bases) code_->bases.push_back(b->token().value);
+        if(!code_->bases.empty()) code_->parent_class=code_->bases[0];
+        if(cn->body) for(auto& s:cn->body->statements()) visit_stmt(s);
         // A method defined twice in one class body: the LAST definition wins,
         // as in Python and on the interpreter. Methods are found by scanning
         // sub_codes for the first name match, so the VM used to keep the
@@ -1477,35 +1751,45 @@ private:
             }
         }
         bool has_kw=!kw_names.empty();
+        bool has_dstar=false;
+        for(auto& arg:pos_args)
+            if(arg->type()==NT::UNARY && std::static_pointer_cast<nython::node::UnaryNode>(arg)->op=="**") has_dstar=true;
         int argc=(int)pos_args.size();
-        // ── *args spread call: fn(*list) ─────────────────────────────────
-        if(has_star){
-            // Build a combined positional args list:
-            // emit [] then for each arg: if *x → LIST_EXTEND, else push x + LIST_APPEND
-            if(cn->callee->type()==NT::ATTRIBUTE){
+        // ── Spread call: f(*xs, **d), with any keywords ──────────────────
+        // The positionals are gathered into one fresh list (*xs extends
+        // it) and the keywords into one fresh map (**d merges into it);
+        // CALL_EX's arg is 1 (list) or 2 (list and map), negative for a
+        // method call. `**d` used to be passed as a positional, and the
+        // keywords of a call with *xs were dropped.
+        if(has_star||has_dstar){
+            bool method=cn->callee->type()==NT::ATTRIBUTE;
+            if(method){
                 auto a=std::static_pointer_cast<nython::node::AttributeNode>(cn->callee);
                 visit(a->object); emit_lc(VMVal::make_str(a->attr),l);
-                emit(Op::BUILD_LIST,0,l); // fresh empty list per call (not a constant!)
-                for(auto& arg:pos_args){
-                    if(arg->type()==NT::UNARY){
-                        auto u=std::static_pointer_cast<nython::node::UnaryNode>(arg);
-                        if(u->op=="*"){ visit(u->operand); emit(Op::LIST_EXTEND,0,l); continue; }
-                    }
-                    visit(arg); emit(Op::LIST_APPEND,0,l);
+            } else visit(cn->callee);
+            emit(Op::BUILD_LIST,0,l); // fresh empty list per call (not a constant!)
+            for(auto& arg:pos_args){
+                if(arg->type()==NT::UNARY){
+                    auto u=std::static_pointer_cast<nython::node::UnaryNode>(arg);
+                    if(u->op=="*"){ visit(u->operand); emit(Op::LIST_EXTEND,0,l); continue; }
+                    if(u->op=="**") continue;
                 }
-                emit(Op::CALL_EX,-1,l); // method mode, 1 combined list arg
-            } else {
-                visit(cn->callee);
-                emit(Op::BUILD_LIST,0,l); // fresh empty list per call (not a constant!)
-                for(auto& arg:pos_args){
-                    if(arg->type()==NT::UNARY){
-                        auto u=std::static_pointer_cast<nython::node::UnaryNode>(arg);
-                        if(u->op=="*"){ visit(u->operand); emit(Op::LIST_EXTEND,0,l); continue; }
-                    }
-                    visit(arg); emit(Op::LIST_APPEND,0,l);
-                }
-                emit(Op::CALL_EX,1,l); // 1 combined list arg
+                visit(arg); emit(Op::LIST_APPEND,0,l);
             }
+            int n=1;
+            if(has_kw||has_dstar){
+                for(size_t i=0;i<kw_names.size();i++){
+                    emit_lc(VMVal::make_str(kw_names[i]),l); visit(kw_vals[i]);
+                }
+                emit(Op::BUILD_MAP,(int)kw_names.size(),l);
+                for(auto& arg:pos_args){
+                    if(arg->type()!=NT::UNARY) continue;
+                    auto u=std::static_pointer_cast<nython::node::UnaryNode>(arg);
+                    if(u->op=="**"){ visit(u->operand); emit(Op::MAP_MERGE,0,l); }
+                }
+                n=2;
+            }
+            emit(Op::CALL_EX,method?-n:n,l);
             return;
         }
         if(cn->callee->type()==NT::ATTRIBUTE){
@@ -1517,10 +1801,7 @@ private:
                     emit_lc(VMVal::make_str(kw_names[i]),l); visit(kw_vals[i]);
                 }
                 emit(Op::BUILD_MAP,(int)kw_names.size(),l);
-                // Negative count = method mode, [obj, name, args..., kwargs]
-                // on the stack (as CALL_EX does). The positive form took the
-                // method NAME for the callee: obj.f(1, b=2) returned none.
-                emit(Op::CALL_KW,-(argc+1),l);
+                emit(Op::CALL_KW,-(argc+1),l);   // negative: a method call
             } else emit(Op::CALL_METHOD,argc,l);
         } else {
             visit(cn->callee);
@@ -1595,6 +1876,7 @@ private:
         if(op=="==="||op=="equals") return Op::COMPARE_SEQ;
         if(op=="!==") return Op::COMPARE_SNE;
         if(op=="xor"||op=="^^") return Op::LOGICAL_XOR;
+        if(op=="@") return Op::BINARY_MATMUL;
         return Op::NOP;
     }
     static Op aug_op(const std::string& op) {
@@ -1636,6 +1918,12 @@ struct GenState {
     // yielded value, read (and cleared) by gen_next: a yield and a return
     // both leave run_loop by an ordinary return now, not a C++ exception.
     bool yielded=false;
+    // Suspended at a `yield` expression: resuming pushes the value sent in
+    // (none for next()), which is the yield's value. Resuming used to push
+    // nothing, so `v = yield x` stored whatever was below it on the stack -
+    // the loop's iterator - and the generator stopped.
+    bool at_yield=false;
+    bool started=false;
 };
 
 
@@ -1703,10 +1991,33 @@ struct CallFrame {
     }
     void define(const std::string& n, VMVal v) { locals[n]=std::move(v); }
     std::shared_ptr<GenState>  gen_state;   // non-null when executing a generator
+    // Operand-stack height when the frame was entered; an exception handler
+    // truncates to stack_base + ExceptionEntry::depth.
+    size_t stack_base = 0;
 };
 
 struct VMReturn   { VMVal value; };
 struct VMYield    { VMVal value; };
+// A raised exception travelling up the C++ stack: the exception object itself
+// (an instance of an exception class, or whatever value was raised), so it
+// reaches an `except` in an outer frame intact. what() is the uncaught form,
+// "Type: message". It used to be a plain runtime_error whose object rode in a
+// VM member that the first frame it passed through cleared, so every
+// exception raised in a called function arrived as a bare string that no
+// typed clause could match.
+struct VMException : std::runtime_error {
+    VMVal value;
+    VMException(VMVal v, const std::string& what) : std::runtime_error(what), value(std::move(v)) {}
+};
+// Pending state of a finally body (see ExceptionEntry): a VMVal of type
+// UNDEFINED tagged "__fin__", kind in i, payload in list[0], jump target in d.
+enum { FIN_K_NORMAL=0, FIN_K_RETURN=1, FIN_K_JUMP=2, FIN_K_EXC=3 };
+inline VMVal make_fin_state(int kind, VMVal payload=VMVal::make_none(), int target=-1){
+    VMVal v; v.type=VMType::UNDEFINED; v.s="__fin__"; v.i=kind; v.d=(double)target;
+    v.list=std::make_shared<std::vector<VMVal>>(); v.list->push_back(std::move(payload));
+    return v;
+}
+inline bool is_fin_state(const VMVal& v){ return v.type==VMType::UNDEFINED && v.s=="__fin__" && v.list; }
 enum   class VMResult { SUCCESS, COMPILE_ERROR, RUNTIME_ERROR };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1743,6 +2054,13 @@ class VirtualMachine : public Runnable {
     std::vector<nython::node::node_ptr> prelude_asts_;
     bool vm_trace_ = getenv("NY_VM_TRACE") != nullptr;
     bool export_to_globals_ = false;   // true while executing an import
+    // The call depth of the importing module's own frame: only ITS top-level
+    // names are exported. Every `var` in every function the module's code
+    // called was written to the globals too, so two functions' locals of
+    // the same name overwrote each other (the IDE, run from an import,
+    // called methods on a Command where it meant `self`).
+    int export_depth_ = -1;
+    bool exporting() const { return export_to_globals_ && (int)call_stack_.size()==export_depth_; }
     std::string cwd_ = ".";            // working directory for imports
     // ── Threads (round 74, src/VMConc.cpp) ──────────────────────────────────
     // Module-level variables live in the main thread's bottom frame and are
@@ -1795,8 +2113,33 @@ public:
     }
 
 private:
+    // Names resolve lexically: the running frame's locals and closure, the
+    // frames of the functions it is nested in (they share its closure
+    // environment - MAKE_FUNCTION), the main module's frame, then globals.
+    // Every frame on the call stack used to be searched, so a function read
+    // and assigned its CALLER's local variables (dynamic scoping): a helper
+    // doing `i = 99` changed the i of whichever function called it.
+    bool frame_visible(int i) const {
+        int top=(int)call_stack_.size()-1;
+        if(i==top || i==0) return true;
+        const auto& env=call_stack_[top].closure_env;
+        return env && call_stack_[i].closure_env.get()==env.get();
+    }
+    // Whether `n` names anything a LOAD_NAME can find (a variable in a
+    // visible scope, a global, or an interpreter builtin).
+    bool name_bound(const std::string& n) {
+        for(int i=(int)call_stack_.size()-1;i>=0;i--){
+            if(!frame_visible(i)) continue;
+            const auto& f=call_stack_[i];
+            if(f.locals.count(n) || (f.closure_env && f.closure_env->count(n))) return true;
+        }
+        if(in_other_thread() && module_frame_ && module_frame_->get_local(n).type!=VMType::UNDEFINED) return true;
+        if(globals_.count(n)) return true;
+        return bridge_exists() && bridge_exists()(n);
+    }
     VMVal load_var(const std::string& n) {
         for(int i=(int)call_stack_.size()-1;i>=0;i--){
+            if(!frame_visible(i)) continue;
             auto v=call_stack_[i].get_local(n);
             if(v.type!=VMType::UNDEFINED) return v;
         }
@@ -1805,7 +2148,13 @@ private:
             if(mv.type!=VMType::UNDEFINED) return mv;
         }
         auto it=globals_.find(n);
-        if(it!=globals_.end()) return it->second;
+        if(it!=globals_.end()){
+            // A builtin carries its name, so two reads of it compare equal
+            // (len == len).
+            if(it->second.type==VMType::NATIVE && it->second.class_name.empty())
+                it->second.class_name="__native__:"+n;
+            return it->second;
+        }
         // Fall back to an interpreter builtin of this name, wrapped as a native.
         // Only names the interpreter actually registers are wrapped, so an
         // undefined variable still reads as none rather than becoming callable.
@@ -1821,14 +2170,30 @@ private:
         return VMVal::make_none();
     }
     void store_var(const std::string& n, VMVal v) {
-        // Walk frames: if found in locals or closure_env, update there
+        // An existing binding in a lexically visible scope is rebound
+        // (Nython's `x = ...` updates an enclosing variable); otherwise the
+        // name becomes a local of the running frame.
         for(int i=(int)call_stack_.size()-1;i>=0;i--){
-            auto li=call_stack_[i].locals.find(n);
-            if(li!=call_stack_[i].locals.end()){ li->second=std::move(v); return; }
-            if(call_stack_[i].closure_env){
-                auto ci=call_stack_[i].closure_env->find(n);
-                if(ci!=call_stack_[i].closure_env->end()){ ci->second=std::move(v); return; }
+            if(!frame_visible(i)) continue;
+            auto& f=call_stack_[i];
+            auto li=f.locals.find(n);
+            bool in_locals=li!=f.locals.end();
+            bool in_env=f.closure_env && f.closure_env->count(n);
+            if(!in_locals && !in_env) continue;
+            if(!in_env){ li->second=std::move(v); return; }   // the common case: one lookup
+            // A closure variable is one binding: write it to the shared
+            // environment and to every still-running frame that holds a copy
+            // (the enclosing function read its stale local after an inner
+            // function assigned the variable: x += 1 in inc() left outer's x
+            // unchanged).
+            if(in_env) (*f.closure_env)[n]=v;
+            if(in_locals) f.locals[n]=v;
+            if(in_env){
+                for(int j=(int)call_stack_.size()-1;j>=0;j--)
+                    if(j!=i && frame_visible(j) && call_stack_[j].closure_env==f.closure_env && call_stack_[j].locals.count(n))
+                        call_stack_[j].locals[n]=v;
             }
+            return;
         }
         if(in_other_thread() && module_frame_->has_local(n)){    // round 74
             module_frame_->set(n,std::move(v)); return;
@@ -1837,7 +2202,7 @@ private:
         else globals_[n]=std::move(v);
     }
     void define_var(const std::string& n, VMVal v) {
-        if(export_to_globals_) { globals_[n]=std::move(v); return; }
+        if(exporting()) { globals_[n]=std::move(v); return; }
         if(!call_stack_.empty()) call_stack_.back().set(n,std::move(v));
         else globals_[n]=std::move(v);
     }
@@ -1878,7 +2243,69 @@ public:
         register_nt_natives();
         register_pycore();        // after register_builtins: these replace its copies
         tag_type_builtins();      // again: register_pycore replaced the tagged ones
+        wrap_iterable_natives();  // after the tensor and pycore natives, so it wraps those
         VMConc::install(*this);   // last: its GIL-aware sleep natives win
+    }
+    // Builtins that consume an iterable get its items first when it is a
+    // generator, an iterator, or an object with __iter__/__getitem__ -
+    // list(gen()), sorted(obj), sum(x for ...), zip(gen(), ...) returned []
+    // or [<generator>] for those. sum() of objects adds with __add__ /
+    // __radd__, and set() of objects dedupes by __hash__/__eq__ (or identity)
+    // instead of by their shared "<C instance>" text, which kept only one.
+    void wrap_iterable_natives() {
+        struct W { const char* name; size_t from; bool all; };
+        const W ws[] = {{"list",0,false},{"tuple",0,false},{"set",0,false},{"sorted",0,false},
+            {"sum",0,false},{"min",0,false},{"max",0,false},{"any",0,false},{"all",0,false},
+            {"enumerate",0,false},{"reversed",0,false},{"zip",0,true},{"zip_list",0,true},
+            {"map",1,true},{"filter",1,true},{"frozenset",0,false}};
+        for(const W& w : ws){
+            auto it=globals_.find(w.name);
+            if(it==globals_.end()||it->second.type!=VMType::NATIVE) continue;
+            NativeFunc orig=it->second.native;
+            std::string nm=w.name;
+            size_t from=w.from; bool all=w.all;
+            it->second.native=[this,orig,nm,from,all](std::vector<VMVal>& a)->VMVal{
+                size_t end = all ? a.size() : std::min(a.size(), from+1);
+                for(size_t i=from;i<end;i++){
+                    VMVal& x=a[i];
+                    if(x.type==VMType::GENERATOR||x.type==VMType::ITERATOR) x=VMVal::make_list(iter_items(x));
+                    else if(x.type==VMType::INSTANCE){
+                        VMVal m;
+                        if(class_lookup(x.class_name,"__iter__",m)||class_lookup(x.class_name,"__getitem__",m)
+                           ||class_lookup(x.class_name,"__next__",m))
+                            x=VMVal::make_list(iter_items(x));
+                    }
+                }
+                bool has_inst=false;
+                if(!a.empty()&&a[0].type==VMType::LIST&&a[0].list)
+                    for(auto& e:*a[0].list) if(e.type==VMType::INSTANCE){ has_inst=true; break; }
+                if(nm=="sum"&&has_inst){
+                    VMVal acc = a.size()>=2 ? a[1] : VMVal::make_int(0);
+                    for(auto& e:*a[0].list){
+                        VMVal r;
+                        if(binary_dunder(acc,e,"__add__","__radd__",r)) acc=r;
+                        else acc=binop(nypy::A_ADD,acc,e);
+                    }
+                    return acc;
+                }
+                if((nm=="set"||nm=="frozenset")&&has_inst){
+                    std::vector<VMVal> out;
+                    std::unordered_map<int64_t,std::vector<size_t>> buckets;
+                    for(auto& e:*a[0].list){
+                        int64_t h;
+                        if(e.type==VMType::INSTANCE){
+                            bool f=false; VMVal hv=call_dunder_f(e,"__hash__",{},f);
+                            h = f ? (hv.type==VMType::INT?hv.i:(int64_t)to_d(hv)) : (int64_t)(uintptr_t)e.map.get();
+                        } else h=(int64_t)std::hash<std::string>{}(e.to_string());
+                        bool dup=false;
+                        for(size_t k:buckets[h]) if(vm_eq(out[k],e)){ dup=true; break; }
+                        if(!dup){ buckets[h].push_back(out.size()); out.push_back(e); }
+                    }
+                    return VMVal::make_list(std::move(out));
+                }
+                return orig(a);
+            };
+        }
     }
     void tag_type_builtins() {
         for(auto& nm_canon : std::vector<std::pair<std::string,std::string>>{
@@ -1917,6 +2344,11 @@ public:
             return VMResult::SUCCESS;
         } catch(std::exception& e) {
             std::cerr<<"\x1b[31m[VMError] "<<e.what()<<"\x1b[0m\n";
+            return VMResult::RUNTIME_ERROR;
+        } catch(std::string& m) {
+            std::string type, msg;
+            if(nython::ny_split_exc_message(m,type,msg)) std::cerr<<"\x1b[31m[VMError] "<<type<<": "<<msg<<"\x1b[0m\n";
+            else std::cerr<<"\x1b[31m[VMError] "<<m<<"\x1b[0m\n";
             return VMResult::RUNTIME_ERROR;
         }
     }
@@ -2111,6 +2543,7 @@ private:
         if(self) fr.self_val=self;
         fr.closure_env=closure;
         fr.locals=std::move(locs);
+        fr.stack_base=stack_.size();
         call_stack_.push_back(std::move(fr));
         VMVal result=VMVal::make_none();
         try { result=run_loop(); }
@@ -2119,38 +2552,85 @@ private:
         call_stack_.pop_back();
         return result;
     }
+    // Binds positional arguments `pos` and keyword arguments `kw` (a MAP, or
+    // null) to code's parameters, Python's way: positionals fill the plain
+    // parameters in order, `*name` takes the rest of them, a bare `*` ends
+    // the positional ones, keywords fill parameters by name, `**name` takes
+    // the keywords no parameter named, and a missing parameter takes its
+    // default. `defaults` is the function value's own (MAKE_FUNCTION), else
+    // the code's literal defaults. Returns an error message for a call that
+    // does not fit (reported as TypeError by the caller when strict).
+    // `bound_self`: the call supplies self (a method), counted as Python
+    // counts it in the messages.
+    std::string bind_args(const VMCode& code, const std::vector<VMVal>* defaults,
+                          const std::vector<VMVal>& pos, const VMVal* kw,
+                          VMMap& locs, bool bound_self=false) {
+        const auto& pnames=code.param_names;
+        const std::vector<VMVal>& dflts = defaults ? *defaults : code.param_defaults;
+        size_t ai=0;
+        bool star_seen=false, has_varargs=false, has_varkw=false;
+        std::unordered_set<std::string> used_kw;
+        std::string err;
+        std::string kw_name;
+        std::vector<std::string> missing;
+        size_t min_pos=0, max_pos=0;
+        for(size_t pi=0;pi<pnames.size();pi++){
+            const std::string& pn=pnames[pi];
+            if(pn.size()>=2&&pn[0]=='*'&&pn[1]=='*'){ has_varkw=true; kw_name=pn.substr(2); continue; }
+            if(pn=="*"){ star_seen=true; continue; }
+            if(!pn.empty()&&pn[0]=='*'){
+                std::vector<VMVal> rest;
+                if(!star_seen) for(;ai<pos.size();ai++) rest.push_back(pos[ai]);
+                locs[pn.substr(1)]=VMVal::make_list(std::move(rest));
+                star_seen=true; has_varargs=true; continue;
+            }
+            bool have=false;
+            bool has_default = pi<dflts.size()&&dflts[pi].type!=VMType::UNDEFINED;
+            if(!star_seen){ max_pos++; if(!has_default) min_pos++; }
+            if(!star_seen && ai<pos.size()){ locs[pn]=pos[ai++]; have=true; }
+            if(kw && kw->map){
+                auto it=kw->map->find(pn);
+                if(it!=kw->map->end()){
+                    if(have && err.empty()) err=code.name+"() got multiple values for argument '"+pn+"'";
+                    locs[pn]=it->second; used_kw.insert(pn); have=true;
+                }
+            }
+            if(!have){
+                if(has_default){ locs[pn]=dflts[pi]; }
+                else {
+                    locs[pn]=VMVal::make_none();
+                    missing.push_back(pn);
+                }
+            }
+        }
+        if(err.empty() && (!missing.empty() || (!has_varargs && pos.size()>max_pos))){
+            size_t s = bound_self ? 1 : 0;
+            err=nython::ny_arity_error(code.name=="<lambda>"?std::string():code.name, missing,
+                                       min_pos+s, has_varargs ? -1L : (long)(max_pos+s), pos.size()+s);
+        }
+        if(kw && kw->map){
+            VMVal extra=VMVal::make_map();
+            for(auto& [k,v]:*kw->map) if(!used_kw.count(k)) (*extra.map)[k]=v;
+            if(has_varkw) locs[kw_name]=extra;
+            else if(!extra.map->empty() && err.empty())
+                err=code.name+"() got an unexpected keyword argument '"+extra.map->begin()->first+"'";
+        } else if(has_varkw) locs[kw_name]=VMVal::make_map();
+        return err;
+    }
     VMVal exec_code(std::shared_ptr<VMCode> code,
                     std::vector<VMVal> args,
                     std::optional<VMVal> self,
-                    std::shared_ptr<VMMap> closure=nullptr) {
+                    std::shared_ptr<VMMap> closure=nullptr,
+                    const std::vector<VMVal>* defaults=nullptr,
+                    const VMVal* kwargs=nullptr) {
         size_t _stack_base=stack_.size();
         CallFrame fr; fr.code=code; fr.ip=0;
+        fr.stack_base=_stack_base;
         if(self) fr.self_val=self;
         // Store closure env in frame (shared reference, not copy)
         fr.closure_env = closure;
-        // Parameters go into locals; apply defaults and *args
-        int n_params=(int)code->param_names.size();
-        int arg_idx=0;
-        for(int i=0;i<n_params;i++){
-            const std::string& pn=code->param_names[i];
-            if(pn.size()>=2&&pn[0]=='*'&&pn[1]=='*'){
-                // **kw with no keyword arguments: an empty dict, not none
-                fr.define(pn.substr(2), VMVal::make_map());
-                continue;
-            }
-            if(!pn.empty()&&pn[0]=='*'){
-                // *args: collect all remaining positional args into a list
-                std::string vararg_name=pn.substr(1); // strip *
-                std::vector<VMVal> rest(args.begin()+arg_idx,args.end());
-                fr.define(vararg_name, VMVal::make_list(std::move(rest)));
-                arg_idx=(int)args.size(); // consumed all
-            } else if(arg_idx<(int)args.size()){
-                fr.define(pn, args[arg_idx++]);
-            } else if(!code->param_defaults.empty()&&i<(int)code->param_defaults.size()
-                      &&code->param_defaults[i].type!=VMType::UNDEFINED){
-                fr.define(pn, code->param_defaults[i]);
-            }
-        }
+        std::string err=bind_args(*code, defaults, args, kwargs, fr.locals, self.has_value() && code->is_method);
+        if(!err.empty() && strict_args_) throw_exception(make_exception("TypeError",{VMVal::make_str(err)}));
         call_stack_.push_back(std::move(fr));
         VMVal result=VMVal::make_none();
         try { result=run_loop(); }
@@ -2160,17 +2640,40 @@ private:
         if(stack_.size()>_stack_base) stack_.resize(_stack_base);
         return result;
     }
+    // Calling a user function value: its own defaults and closure, a new
+    // generator for a generator function, `self` for a method.
+    VMVal call_function(const VMVal& fn, std::vector<VMVal>& args, std::optional<VMVal> self,
+                        const VMVal* kwargs=nullptr) {
+        if(fn.type!=VMType::FUNCTION||!fn.code) return VMVal::make_none();
+        const std::vector<VMVal>* d = fn.list ? fn.list.get() : nullptr;
+        if(fn.code->has_yield()){
+            VMVal g=make_generator_val(fn.code, args, self, fn.closure_env);
+            // Re-bind with the function's own defaults and keywords.
+            VMMap locs;
+            std::string err=bind_args(*fn.code, d, args, kwargs, locs, self.has_value() && fn.code->is_method);
+            if(!err.empty() && strict_args_) throw_exception(make_exception("TypeError",{VMVal::make_str(err)}));
+            g.gen->locals=std::move(locs);
+            return g;
+        }
+        return exec_code(fn.code, args, self, fn.closure_env, d, kwargs);
+    }
+    // A call that does not fit the parameters raises TypeError (it bound
+    // none to the missing ones and dropped the extra ones).
+    bool strict_args_ = true;
 
     // ── Main dispatch loop ───────────────────────────────────────────────
     // Resume a generator; returns {value, done} as VMVal (NONE if done)
-    VMVal gen_next(VMVal& gv) {
+    VMVal gen_next(VMVal& gv, VMVal sent=VMVal::make_none()) {
         if(gv.type!=VMType::GENERATOR||!gv.gen||gv.gen->done) return VMVal::make_none();
         auto& gs=*gv.gen;
         // Restore saved stack (iterators held across yields)
         gs.stack_base = stack_.size();
         for(auto& sv : gs.saved_stack) stack_.push_back(sv);
         gs.saved_stack.clear();
+        gs.started=true;
+        if(gs.at_yield){ gs.at_yield=false; push(std::move(sent)); }
         CallFrame fr; fr.code=gs.code; fr.ip=gs.ip;
+        fr.stack_base=gs.stack_base;
         fr.locals=gs.locals;
         fr.self_val=gs.self_val;
         fr.closure_env=gs.closure;
@@ -2205,7 +2708,22 @@ private:
         return result;
     }
 
-    static int cmp_val(const VMVal& a, const VMVal& b) {
+    // Ordering for sorted/min/max: an instance's __lt__ (or the other
+    // side's __gt__), lists element by element.
+    int cmp_val(const VMVal& a, const VMVal& b) {
+        if(a.type==VMType::INSTANCE||b.type==VMType::INSTANCE){
+            if(vm_less(a,b)) return -1;
+            if(vm_less(b,a)) return 1;
+            return 0;
+        }
+        if(a.type==VMType::LIST&&b.type==VMType::LIST&&a.list&&b.list){
+            size_t n=std::min(a.list->size(),b.list->size());
+            for(size_t k=0;k<n;k++){ int c=cmp_val((*a.list)[k],(*b.list)[k]); if(c) return c; }
+            return a.list->size()<b.list->size()?-1:(a.list->size()>b.list->size()?1:0);
+        }
+        return cmp_basic(a,b);
+    }
+    static int cmp_basic(const VMVal& a, const VMVal& b) {
         if(a.type==VMType::INT&&b.type==VMType::INT) return a.i<b.i?-1:(a.i>b.i?1:0);
         if((a.type==VMType::INT||a.type==VMType::FLOAT)&&
            (b.type==VMType::INT||b.type==VMType::FLOAT)){
@@ -2218,29 +2736,327 @@ private:
         return a.to_string()<b.to_string()?-1:(a.to_string()>b.to_string()?1:0);
     }
 
-        VMVal call_dunder(const VMVal& obj, const std::string& dunder, std::vector<VMVal> args) {
+    // Like call_dunder, and reports whether the method exists at all - a
+    // dunder that returns none is not the same as one that is missing.
+    // Like call_dunder, and reports whether the method exists at all - a
+    // dunder that returns none is not the same as one that is missing.
+    VMVal call_dunder_f(const VMVal& obj, const std::string& dunder, std::vector<VMVal> args, bool& found) {
+        found=false;
         if(obj.type!=VMType::INSTANCE) return VMVal::make_none();
-        std::string cls=obj.class_name;
-        while(!cls.empty()){
-            auto cit=class_reg_.find(cls);
-            if(cit==class_reg_.end()) break;
-            for(auto& sub:cit->second->sub_codes)
-                if(sub->name==dunder&&!sub->is_class){
-                    // Generator method (has yield) → return lazy generator
-                    if(sub->has_yield())
-                        return make_generator_val(sub, args, obj);
-                    return exec_code(sub,args,obj);
-                }
-            cls=cit->second->parent_class;
-        }
-        return VMVal::make_none();
+        VMVal m;
+        if(!class_lookup(obj.class_name, dunder, m)) return VMVal::make_none();
+        found=true;
+        return invoke_method(m, obj, args, obj.class_name);
+    }
+    VMVal call_dunder(const VMVal& obj, const std::string& dunder, std::vector<VMVal> args) {
+        bool found=false;
+        return call_dunder_f(obj, dunder, std::move(args), found);
     }
     bool instance_truthy(VMVal& v) {
-        VMVal r = call_dunder(v, "__bool__", {});
-        if(r.type != VMType::NONE) return r.is_truthy();
-        VMVal lr = call_dunder(v, "__len__", {});
-        if(lr.type != VMType::NONE) return lr.i != 0;
+        bool found=false;
+        VMVal r = call_dunder_f(v, "__bool__", {}, found);
+        if(found) return r.type==VMType::INSTANCE ? true : r.is_truthy();
+        VMVal lr = call_dunder_f(v, "__len__", {}, found);
+        if(found) return lr.type==VMType::INT ? lr.i != 0 : lr.is_truthy();
         return true; // default: instances are truthy
+    }
+
+    // ── Operator protocol ────────────────────────────────────────────────
+    bool vm_truthy(const VMVal& v) {
+        if(v.type==VMType::INSTANCE){ VMVal c=v; return instance_truthy(c); }
+        return v.is_truthy();
+    }
+    // A comparison dunder of `a`, else the reflected one of `b` (Python
+    // tries a.__lt__(b), then b.__gt__(a)). Returns false when neither
+    // side defines one.
+    bool rich_compare(const VMVal& a, const VMVal& b, const char* op, const char* rop, VMVal& out) {
+        bool f=false;
+        if(a.type==VMType::INSTANCE){ out=call_dunder_f(a,op,{b},f); if(f) return true; }
+        if(b.type==VMType::INSTANCE){ out=call_dunder_f(b,rop,{a},f); if(f) return true; }
+        return false;
+    }
+    bool vm_less(const VMVal& a, const VMVal& b) {
+        VMVal r;
+        if(rich_compare(a,b,"__lt__","__gt__",r)) return vm_truthy(r);
+        if(a.type==VMType::LIST&&b.type==VMType::LIST) return cmp_val(a,b)<0;
+        return a<b;
+    }
+    // ==, through __eq__ (either side); __ne__ falls back to not __eq__.
+    bool vm_eq(const VMVal& a, const VMVal& b) {
+        VMVal r;
+        if(rich_compare(a,b,"__eq__","__eq__",r)) return vm_truthy(r);
+        if(a.type==VMType::LIST&&b.type==VMType::LIST&&a.list&&b.list){
+            if(a.b!=b.b) return false;           // a tuple never equals a list
+            if(a.list->size()!=b.list->size()) return false;
+            for(size_t k=0;k<a.list->size();k++) if(!vm_eq((*a.list)[k],(*b.list)[k])) return false;
+            return true;
+        }
+        return a==b;
+    }
+    bool vm_ne(const VMVal& a, const VMVal& b) {
+        VMVal r;
+        if(rich_compare(a,b,"__ne__","__ne__",r)) return vm_truthy(r);
+        return !vm_eq(a,b);
+    }
+    // A binary operator's dunder on the left operand, else the reflected one
+    // on the right (__add__, then __radd__ - so sum() of objects and 5 + v
+    // work).
+    // -obj / ~obj / +obj: its dunder, or TypeError.
+    VMVal unary_dunder(const VMVal& v, const char* name, const char* sym) {
+        bool f=false;
+        VMVal r=call_dunder_f(v,name,{},f);
+        if(!f) throw_exception(make_exception("TypeError",{VMVal::make_str(std::string("bad operand type for unary ")+sym+": '"+v.class_name+"'")}));
+        return r;
+    }
+    bool binary_dunder(const VMVal& l, const VMVal& r, const char* name, const char* rname, VMVal& out) {
+        bool f=false;
+        if(l.type==VMType::INSTANCE){ out=call_dunder_f(l,name,{r},f); if(f) return true; }
+        if(r.type==VMType::INSTANCE && rname){ out=call_dunder_f(r,rname,{l},f); if(f) return true; }
+        return false;
+    }
+    // The items of anything iterable, for natives that take an iterable:
+    // lists, strings, maps (keys), iterators, generators, and instances with
+    // __iter__, __next__ or a __getitem__ sequence.
+    static bool is_iterable_object(const VMVal& v) {
+        return v.type==VMType::INSTANCE||v.type==VMType::GENERATOR||v.type==VMType::ITERATOR;
+    }
+
+    // str(v) and repr(v) with the user's __str__/__repr__, also for the
+    // items of a list or map (which rendered as "<C instance>" through
+    // VMVal::repr, which cannot call into the program).
+    std::string vm_str(const VMVal& v) {
+        if(v.type==VMType::INSTANCE){
+            for(auto dname : {"__str__","__repr__"}){
+                bool found=false;
+                VMVal r=call_dunder_f(v,dname,{},found);
+                if(found) return r.to_string();
+            }
+            return v.to_string();
+        }
+        if(v.type==VMType::LIST||v.type==VMType::MAP) return vm_repr(v);
+        return v.to_string();
+    }
+    std::string vm_repr(const VMVal& v) {
+        if(v.type==VMType::INSTANCE){
+            for(auto dname : {"__repr__","__str__"}){
+                bool found=false;
+                VMVal r=call_dunder_f(v,dname,{},found);
+                if(found) return r.to_string();
+            }
+            return v.repr();
+        }
+        if(v.type==VMType::LIST&&v.list){
+            std::string r=v.b?"(":"[";
+            for(size_t k=0;k<v.list->size();k++){
+                if(k) r+=", ";
+                const VMVal& e=(*v.list)[k];
+                r+=(e.type==VMType::LIST&&e.list==v.list)?(v.b?"(...)":"[...]"):vm_repr(e);
+            }
+            if(v.b&&v.list->size()==1) r+=",";
+            return r+(v.b?")":"]");
+        }
+        if(v.type==VMType::MAP&&v.class_name=="__bound_method__"&&v.map){
+            auto f=v.map->find("__fn__");
+            std::string nm = (f!=v.map->end()&&f->second.code) ? f->second.code->name : std::string("?");
+            return "<bound method "+nm+">";
+        }
+        if(v.type==VMType::MAP&&v.map&&v.class_name.empty()){
+            std::string r="{"; bool first=true;
+            for(auto& [k,x]:*v.map){
+                if(vm_internal_key(k)) continue;
+                if(!first) r+=", ";
+                r+=vm_key_value(k).repr()+": "+((x.type==VMType::MAP&&x.map==v.map)?std::string("{...}"):vm_repr(x));
+                first=false;
+            }
+            return r+"}";
+        }
+        return v.repr();
+    }
+
+    // ── Classes ──────────────────────────────────────────────────────────
+    // A class's namespace (class_vars_[name]) is what running its body
+    // defined: methods (function values, carrying their defaults and
+    // closure), decorated members (property, staticmethod, classmethod),
+    // class variables, nested classes. Lookups follow the MRO - C3 over every
+    // base, as on the interpreter. The VM used to scan the body's bytecode
+    // for `name = constant` pairs and find methods among its compiled code
+    // objects, so a class variable computed by an expression, a decorator,
+    // @property, a second base, and any class-level statement were ignored.
+    std::unordered_map<std::string,std::shared_ptr<std::vector<std::string>>> mro_cache_;
+    std::shared_ptr<std::vector<std::string>> class_mro(const std::string& cls) {
+        auto it=mro_cache_.find(cls);
+        if(it!=mro_cache_.end()) return it->second;
+        mro_cache_[cls]=std::make_shared<std::vector<std::string>>(std::vector<std::string>{cls}); // cycle guard
+        std::vector<std::vector<std::string>> seqs;
+        std::vector<std::string> direct;
+        auto rit=class_reg_.find(cls);
+        if(rit!=class_reg_.end()&&rit->second){
+            std::vector<std::string> bases=rit->second->bases;
+            if(bases.empty()&&!rit->second->parent_class.empty()) bases.push_back(rit->second->parent_class);
+            for(auto& b:bases){
+                if(b==cls) continue;
+                seqs.push_back(*class_mro(b));
+                direct.push_back(b);
+            }
+        }
+        seqs.push_back(direct);
+        std::vector<std::string> out{cls};
+        bool ok=true;
+        while(true){
+            bool any=false;
+            for(auto& sq:seqs) if(!sq.empty()){ any=true; break; }
+            if(!any) break;
+            std::string pick; bool found=false;
+            for(auto& sq:seqs){
+                if(sq.empty()) continue;
+                const std::string& cand=sq[0];
+                bool in_tail=false;
+                for(auto& sq2:seqs) for(size_t k=1;k<sq2.size();k++) if(sq2[k]==cand){ in_tail=true; break; }
+                if(!in_tail){ pick=cand; found=true; break; }
+            }
+            if(!found){ ok=false; break; }
+            out.push_back(pick);
+            for(auto& sq:seqs) if(!sq.empty()&&sq[0]==pick) sq.erase(sq.begin());
+        }
+        if(!ok){
+            // Not C3-consistent: depth-first, left to right, first occurrence.
+            out={cls};
+            std::vector<std::string> todo=direct;
+            while(!todo.empty()){
+                std::string k=todo.front(); todo.erase(todo.begin());
+                if(std::find(out.begin(),out.end(),k)!=out.end()) continue;
+                out.push_back(k);
+                auto kit=class_reg_.find(k);
+                if(kit!=class_reg_.end()&&kit->second){
+                    size_t at=0;
+                    for(auto& b:kit->second->bases) todo.insert(todo.begin()+(long)(at++), b);
+                }
+            }
+        }
+        auto res=std::make_shared<std::vector<std::string>>(std::move(out));
+        mro_cache_[cls]=res;
+        return res;
+    }
+    // `attr` in the namespace of `cls` or a class after it in its MRO
+    // (strictly after `after`, when given - for super()).
+    bool class_lookup(const std::string& cls, const std::string& attr, VMVal& out,
+                      std::string* owner=nullptr, const std::string* after=nullptr) {
+        auto mro=class_mro(cls);
+        size_t i=0;
+        if(after){
+            size_t k=0;
+            for(;k<mro->size();k++) if((*mro)[k]==*after) break;
+            i = k<mro->size() ? k+1 : mro->size();
+        }
+        for(;i<mro->size();i++){
+            auto cv=class_vars_.find((*mro)[i]);
+            if(cv==class_vars_.end()) continue;
+            auto f=cv->second.find(attr);
+            if(f==cv->second.end()) continue;
+            out=f->second;
+            if(owner) *owner=(*mro)[i];
+            return true;
+        }
+        return false;
+    }
+    VMVal class_value(const std::string& name) {
+        auto it=class_reg_.find(name);
+        if(it==class_reg_.end()) return VMVal::make_none();
+        return VMVal::make_class(it->second, name);
+    }
+    static bool is_property_desc(const VMVal& v) {
+        return v.type==VMType::MAP && v.map && v.map->count("__is_property__");
+    }
+    VMVal property_get(const VMVal& desc, const VMVal& obj) {
+        auto git=desc.map->find("__get__");
+        if(git==desc.map->end()) return VMVal::make_none();
+        std::vector<VMVal> no_args;
+        if(git->second.type==VMType::FUNCTION) return call_function(git->second, no_args, obj);
+        std::vector<VMVal> a{obj};
+        return vm_call(git->second, a, std::nullopt);
+    }
+    static VMVal make_bound(const VMVal& fn, const VMVal& self, bool as_cls=false) {
+        VMVal bound=VMVal::make_map();
+        bound.class_name="__bound_method__";
+        (*bound.map)["__fn__"]=fn;
+        (*bound.map)["__self__"]=self;
+        if(as_cls) (*bound.map)["__cls__"]=VMVal::make_bool(true);
+        return bound;
+    }
+    // A class member read through an instance: a property is read, a method
+    // is bound to the instance, a classmethod to the class, a staticmethod
+    // (or a Nython method without self) stays a plain function.
+    VMVal bind_member(const VMVal& m, const VMVal& obj, const std::string& cls) {
+        if(is_property_desc(m)) return property_get(m, obj);
+        if(m.type==VMType::FUNCTION&&m.code){
+            if(m.code->is_static) return m;
+            if(m.code->is_classmethod) return make_bound(m, class_value(cls), true);
+            if(!m.code->is_method) return m;
+            return make_bound(m, obj);
+        }
+        return m;
+    }
+    // Calls class member `m` as a method of `self`.
+    VMVal invoke_method(const VMVal& m, const VMVal& self, std::vector<VMVal>& args,
+                        const std::string& cls, const VMVal* kwargs=nullptr) {
+        if(m.type==VMType::FUNCTION&&m.code){
+            if(m.code->is_static) return call_function(m, args, std::nullopt, kwargs);
+            if(m.code->is_classmethod){
+                std::vector<VMVal> a2; a2.reserve(args.size()+1);
+                a2.push_back(class_value(cls)); for(auto& x:args) a2.push_back(x);
+                return call_function(m, a2, std::nullopt, kwargs);
+            }
+            return call_function(m, args, self, kwargs);
+        }
+        if(is_property_desc(m)){ VMVal v=property_get(m, self); return vm_call(v, args, std::nullopt, kwargs); }
+        return vm_call(m, args, std::nullopt, kwargs);
+    }
+    // The constructor, first class in the MRO defining __init__ (or init).
+    bool find_ctor(const std::string& cls, VMVal& out) {
+        auto mro=class_mro(cls);
+        for(auto& c:*mro){
+            auto cv=class_vars_.find(c);
+            if(cv==class_vars_.end()) continue;
+            auto f=cv->second.find("__init__");
+            if(f==cv->second.end()) f=cv->second.find("init");
+            if(f!=cv->second.end()&&(f->second.type==VMType::FUNCTION||f->second.type==VMType::NATIVE)){ out=f->second; return true; }
+        }
+        return false;
+    }
+    VMVal instantiate(const VMVal& cls, std::vector<VMVal>& args, const VMVal* kwargs=nullptr) {
+        auto attrs=std::make_shared<VMMap>();
+        VMVal inst=VMVal::make_instance(cls.class_name,attrs);
+        if(!class_reg_.count(cls.class_name)&&cls.code) class_reg_[cls.class_name]=cls.code;
+        // An exception's args are the constructor's arguments whatever its
+        // __init__ does (Python's BaseException.__new__); a class that calls
+        // super().__init__(...) replaces them there.
+        if(vm_exc_classes().count(cls.class_name)){
+            (*attrs)["args"]=VMVal::make_list(args);
+            (*attrs)["msg"]=VMVal::make_str(args.size()==1?args[0].to_string():std::string());
+        }
+        VMVal init;
+        if(find_ctor(cls.class_name, init)) invoke_method(init, inst, args, cls.class_name, kwargs);
+        return inst;
+    }
+    // Runs a class body in its own frame; what it defines is the namespace.
+    VMMap run_class_body(std::shared_ptr<VMCode> sub, CallFrame& outer) {
+        CallFrame cf; cf.code=sub; cf.ip=0; cf.stack_base=stack_.size();
+        bool outer_fn = outer.code && outer.code->name!="<module>" && !outer.code->is_class;
+        if(outer_fn){
+            // Methods of a class defined in a function close over it.
+            if(!outer.closure_env) outer.closure_env=std::make_shared<VMMap>(outer.locals);
+            else for(auto& kv:outer.locals) if(!outer.closure_env->count(kv.first)) (*outer.closure_env)[kv.first]=kv.second;
+            if(outer.self_val && !outer.closure_env->count("self")) (*outer.closure_env)["self"]=*outer.self_val;
+            cf.closure_env=outer.closure_env;
+        } else if(outer.closure_env) cf.closure_env=outer.closure_env;
+        size_t base=stack_.size();
+        call_stack_.push_back(std::move(cf));
+        try { run_loop(); }
+        catch(...){ call_stack_.pop_back(); if(stack_.size()>base) stack_.resize(base); throw; }
+        auto ns=std::move(call_stack_.back().locals);
+        call_stack_.pop_back();
+        if(stack_.size()>base) stack_.resize(base);
+        return ns;
     }
 
         VMVal run_loop() {
@@ -2261,9 +3077,20 @@ private:
             case Op::HALT: return VMVal::make_none();
 
             case Op::LOAD_CONST:  push(fr.code->constants[ins.arg]); break;
-            case Op::LOAD_NAME:   push(load_var(fr.code->names[ins.arg])); break;
+            case Op::LOAD_NAME: {
+                // Reading a name bound nowhere raises NameError (it read none).
+                const std::string& n=fr.code->names[ins.arg];
+                push(load_var(n));
+                if(stack_.back().type==VMType::NONE && !name_bound(n)){
+                    pop();
+                    throw_exception(make_exception("NameError",{VMVal::make_str("name '"+n+"' is not defined")}));
+                }
+                break;
+            }
             case Op::STORE_NAME: {
-                if(export_to_globals_&&!call_stack_.empty()&&call_stack_.size()==1)
+                // A class body binds in the class namespace, always.
+                if(fr.code->is_class){ fr.locals[fr.code->names[ins.arg]]=pop(); break; }
+                if(exporting())
                     globals_[fr.code->names[ins.arg]]=pop();
                 else {
                     VMVal sv=pop();
@@ -2275,6 +3102,7 @@ private:
                 break;
             }
             case Op::DEFINE_NAME: {
+                if(fr.code->is_class){ fr.locals[fr.code->names[ins.arg]]=pop(); break; }
                 VMVal dv=pop();
                 define_var(fr.code->names[ins.arg], dv);
                 // Sync to shared closure_env if it exists
@@ -2282,22 +3110,31 @@ private:
                     (*fr.closure_env)[fr.code->names[ins.arg]] = dv;
                 break;
             }
-            case Op::LOAD_SELF:   push(fr.self_val.value_or(VMVal::make_none())); break;
+            case Op::LOAD_SELF: {
+                if(fr.self_val){ push(*fr.self_val); break; }
+                // A lambda or nested def inside a method: the method's self,
+                // captured with the closure (MAKE_FUNCTION).
+                if(fr.closure_env){
+                    auto it=fr.closure_env->find("self");
+                    if(it!=fr.closure_env->end()){ push(it->second); break; }
+                }
+                push(VMVal::make_none()); break;
+            }
 
             case Op::LOAD_SUPER: {
-                // Push a SUPER_PROXY: find parent of the DEFINING class (owner_class),
-                // not self's runtime class (which would break chained super() calls)
+                // A SUPER_PROXY for the class that DEFINES the running method
+                // (owner_class) and its self: super().m() looks m up in
+                // type(self)'s MRO after that class (next in line, not simply
+                // the first base).
                 VMVal self_v = fr.self_val.value_or(VMVal::make_none());
-                std::string cur_cls = fr.code->owner_class.empty() ? self_v.class_name : fr.code->owner_class;
-                std::string parent_cls;
-                if(!cur_cls.empty()){
-                    auto it=class_reg_.find(cur_cls);
-                    if(it!=class_reg_.end()&&it->second&&!it->second->parent_class.empty())
-                        parent_cls=it->second->parent_class;
+                if(!fr.self_val && fr.closure_env){
+                    auto it=fr.closure_env->find("self");
+                    if(it!=fr.closure_env->end()) self_v=it->second;
                 }
+                std::string cur_cls = fr.code->owner_class.empty() ? self_v.class_name : fr.code->owner_class;
                 VMVal proxy;
                 proxy.type=VMType::SUPER_PROXY;
-                proxy.s=parent_cls.empty()?cur_cls:parent_cls;
+                proxy.s=cur_cls;
                 proxy.list=std::make_shared<std::vector<VMVal>>();
                 proxy.list->push_back(self_v);
                 push(proxy);
@@ -2313,19 +3150,22 @@ private:
             }
             case Op::LOAD_SUBSCR: {
                 VMVal idx=pop(),obj=pop();
-                if(obj.type==VMType::INSTANCE){VMVal res=call_dunder(obj,"__getitem__",{idx});if(res.type!=VMType::NONE){push(res);break;}}
+                if(obj.type==VMType::INSTANCE){bool f=false;VMVal res=call_dunder_f(obj,"__getitem__",{idx},f);if(f){push(res);break;}
+                    throw_exception(make_exception("TypeError",{VMVal::make_str("'"+obj.class_name+"' object is not subscriptable")}));}
                 push(get_sub(obj,idx)); break;
             }
             case Op::STORE_SUBSCR:{
                 VMVal idx=pop(),obj=pop(),val=pop();
-                if(obj.type==VMType::INSTANCE){VMVal res=call_dunder(obj,"__setitem__",{idx,val});if(res.type!=VMType::NONE) break;}
+                if(obj.type==VMType::INSTANCE){bool f=false;call_dunder_f(obj,"__setitem__",{idx,val},f);if(f) break;
+                    throw_exception(make_exception("TypeError",{VMVal::make_str("'"+obj.class_name+"' object does not support item assignment")}));}
                 set_sub(obj,idx,std::move(val)); break;
             }
             case Op::DELETE_SUBSCR: {
                 VMVal key=pop(), obj=pop();
-                if(obj.type==VMType::INSTANCE&&obj.map){
-                    VMVal res=call_dunder(obj,"__delitem__",{key});
-                    if(res.type==VMType::NONE) obj.map->erase(key.to_string());
+                if(obj.type==VMType::INSTANCE){
+                    bool f=false; call_dunder_f(obj,"__delitem__",{key},f);
+                    if(f) break;
+                    throw_exception(make_exception("TypeError",{VMVal::make_str("'"+obj.class_name+"' object doesn't support item deletion")}));
                 }
                 else if(obj.type==VMType::MAP&&obj.map){
                     if(obj.map->erase(vkey(key))==0) raise_native_exception("KeyError",key.repr());
@@ -2382,56 +3222,53 @@ private:
             case Op::ROT_TWO:  { VMVal a=pop(),b=pop(); push(a); push(b); break; }
             case Op::ROT_THREE:{ VMVal a=pop(),b=pop(),c=pop(); push(a); push(c); push(b); break; }
 
-            // Arithmetic
+            // Arithmetic. Objects first: the left operand's dunder, else
+            // the right operand's reflected one (__add__, then __radd__ -
+            // so sum() of objects and 5 + v work); then Python's numeric
+            // and sequence semantics (binop, shared with the interpreter).
             case Op::BINARY_ADD: { VMVal r=pop(),lv=pop();
-                if(lv.type==VMType::INSTANCE){VMVal res=call_dunder(lv,"__add__",{r});if(res.type!=VMType::NONE){push(res);break;}}
-                if(r.type==VMType::INSTANCE&&lv.type==VMType::STRING){
-                    VMVal sv=call_dunder(r,"__str__",{});
-                    r=sv.type!=VMType::NONE?sv:VMVal::make_str(r.to_string());
-                }
+                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(lv,r,"__add__","__radd__",res)){ push(std::move(res)); break; } }
+                // A string joined with an instance takes str(instance).
+                if(r.type==VMType::INSTANCE&&lv.type==VMType::STRING) r=VMVal::make_str(vm_str(r));
+                if(lv.type==VMType::INSTANCE&&r.type==VMType::STRING) lv=VMVal::make_str(vm_str(lv));
                 if(lv.type==VMType::INT&&r.type==VMType::INT&&lv.s.empty()&&r.s.empty()){
-                    int64_t res; if(!nypy::add_ovf(lv.i,r.i,res)){ push(VMVal::make_int(res)); break; }
+                    int64_t sum; if(!nypy::add_ovf(lv.i,r.i,sum)){ push(VMVal::make_int(sum)); break; }
                 }
                 push(binop(nypy::A_ADD,lv,r)); break; }
             case Op::BINARY_SUB: { VMVal r=pop(),lv=pop();
-                if(lv.type==VMType::INSTANCE){VMVal res=call_dunder(lv,"__sub__",{r});if(res.type!=VMType::NONE){push(res);break;}}
+                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(lv,r,"__sub__","__rsub__",res)){ push(std::move(res)); break; } }
                 push(binop(nypy::A_SUB,lv,r)); break; }
             case Op::BINARY_MUL: { VMVal r=pop(),lv=pop();
-                if(lv.type==VMType::INSTANCE){VMVal res=call_dunder(lv,"__mul__",{r});if(res.type!=VMType::NONE){push(res);break;}}
-                if(r.type==VMType::INSTANCE){VMVal res=call_dunder(r,"__rmul__",{lv});if(res.type!=VMType::NONE){push(res);break;}}
+                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(lv,r,"__mul__","__rmul__",res)){ push(std::move(res)); break; } }
                 push(binop(nypy::A_MUL,lv,r)); break; }
+            case Op::BINARY_MATMUL: { VMVal r=pop(),l=pop();
+                if(l.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(l,r,"__matmul__","__rmatmul__",res)){ push(std::move(res)); break; } }
+                throw_exception(make_exception("TypeError",{VMVal::make_str("unsupported operand type(s) for @")}));
+                break; }
             case Op::BINARY_DIV: case Op::BINARY_MOD: case Op::BINARY_POW: case Op::BINARY_FLOOR_DIV:
             case Op::BINARY_AND: case Op::BINARY_OR: case Op::BINARY_XOR: case Op::BINARY_LSHIFT: case Op::BINARY_RSHIFT: {
                 VMVal r=pop(),l=pop();
-                int aop; const char* dunder;
+                int aop; const char* dunder; const char* rdunder;
                 switch(ins.op){
-                    case Op::BINARY_DIV: aop=nypy::A_DIV; dunder="__truediv__"; break;
-                    case Op::BINARY_MOD: aop=nypy::A_MOD; dunder="__mod__"; break;
-                    case Op::BINARY_POW: aop=nypy::A_POW; dunder="__pow__"; break;
-                    case Op::BINARY_FLOOR_DIV: aop=nypy::A_FLOORDIV; dunder="__floordiv__"; break;
-                    case Op::BINARY_AND: aop=nypy::A_AND; dunder="__and__"; break;
-                    case Op::BINARY_OR: aop=nypy::A_OR; dunder="__or__"; break;
-                    case Op::BINARY_XOR: aop=nypy::A_XOR; dunder="__xor__"; break;
-                    case Op::BINARY_LSHIFT: aop=nypy::A_LSHIFT; dunder="__lshift__"; break;
-                    default: aop=nypy::A_RSHIFT; dunder="__rshift__"; break;
+                    case Op::BINARY_DIV: aop=nypy::A_DIV; dunder="__truediv__"; rdunder="__rtruediv__"; break;
+                    case Op::BINARY_MOD: aop=nypy::A_MOD; dunder="__mod__"; rdunder="__rmod__"; break;
+                    case Op::BINARY_POW: aop=nypy::A_POW; dunder="__pow__"; rdunder="__rpow__"; break;
+                    case Op::BINARY_FLOOR_DIV: aop=nypy::A_FLOORDIV; dunder="__floordiv__"; rdunder="__rfloordiv__"; break;
+                    case Op::BINARY_AND: aop=nypy::A_AND; dunder="__and__"; rdunder="__rand__"; break;
+                    case Op::BINARY_OR: aop=nypy::A_OR; dunder="__or__"; rdunder="__ror__"; break;
+                    case Op::BINARY_XOR: aop=nypy::A_XOR; dunder="__xor__"; rdunder="__rxor__"; break;
+                    case Op::BINARY_LSHIFT: aop=nypy::A_LSHIFT; dunder="__lshift__"; rdunder="__rlshift__"; break;
+                    default: aop=nypy::A_RSHIFT; dunder="__rshift__"; rdunder="__rrshift__"; break;
                 }
-                if(l.type==VMType::INSTANCE){
-                    VMVal res=call_dunder(l,dunder,{r});
-                    if(res.type==VMType::NONE&&aop==nypy::A_DIV) res=call_dunder(l,"__div__",{r});
-                    if(res.type!=VMType::NONE){push(res);break;}
+                if(l.type==VMType::INSTANCE||r.type==VMType::INSTANCE){
+                    VMVal res;
+                    if(binary_dunder(l,r,dunder,rdunder,res)){ push(std::move(res)); break; }
+                    if(aop==nypy::A_DIV && binary_dunder(l,r,"__div__","__rdiv__",res)){ push(std::move(res)); break; }
                 }
                 push(binop(aop,l,r)); break; }
             // Compares
-            case Op::COMPARE_EQ: {
-                VMVal r=pop(),lv=pop();
-                if(lv.type==VMType::INSTANCE){VMVal res=call_dunder(lv,"__eq__",{r});if(res.type!=VMType::NONE){push(res);break;}}
-                push(VMVal::make_bool(lv==r)); break;
-            }
-            case Op::COMPARE_NE: {
-                VMVal r=pop(),lv=pop();
-                if(lv.type==VMType::INSTANCE){VMVal res=call_dunder(lv,"__ne__",{r});if(res.type!=VMType::NONE){push(res);break;}}
-                push(VMVal::make_bool(lv!=r)); break;
-            }
+            case Op::COMPARE_EQ: { VMVal r=pop(),lv=pop(); push(VMVal::make_bool(vm_eq(lv,r))); break; }
+            case Op::COMPARE_NE: { VMVal r=pop(),lv=pop(); push(VMVal::make_bool(vm_ne(lv,r))); break; }
             case Op::COMPARE_SEQ: {
                 // Strict equality: same type AND same value, no int/float
                 // coercion (unlike ==) - matches the interpreter's "===".
@@ -2451,48 +3288,59 @@ private:
             }
             case Op::COMPARE_LT: {
                 VMVal r=pop(),lv=pop();
-                if(lv.type==VMType::INSTANCE){VMVal res=call_dunder(lv,"__lt__",{r});if(res.type!=VMType::NONE){push(res);break;}}
-                push(VMVal::make_bool(lv<r)); break;
+                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__lt__","__gt__",res)){ push(std::move(res)); break; } }
+                push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)<0 : lv<r)); break;
             }
             case Op::COMPARE_LE: {
                 VMVal r=pop(),lv=pop();
-                if(lv.type==VMType::INSTANCE){VMVal res=call_dunder(lv,"__le__",{r});if(res.type!=VMType::NONE){push(res);break;}}
-                push(VMVal::make_bool(lv<=r)); break;
+                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__le__","__ge__",res)){ push(std::move(res)); break; } }
+                push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)<=0 : lv<=r)); break;
             }
             case Op::COMPARE_GT: {
                 VMVal r=pop(),lv=pop();
-                if(lv.type==VMType::INSTANCE){VMVal res=call_dunder(lv,"__gt__",{r});if(res.type!=VMType::NONE){push(res);break;}}
-                push(VMVal::make_bool(lv>r)); break;
+                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__gt__","__lt__",res)){ push(std::move(res)); break; } }
+                push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)>0 : lv>r)); break;
             }
             case Op::COMPARE_GE: {
                 VMVal r=pop(),lv=pop();
-                if(lv.type==VMType::INSTANCE){VMVal res=call_dunder(lv,"__ge__",{r});if(res.type!=VMType::NONE){push(res);break;}}
-                push(VMVal::make_bool(lv>=r)); break;
+                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__ge__","__le__",res)){ push(std::move(res)); break; } }
+                push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)>=0 : lv>=r)); break;
             }
             case Op::COMPARE_IN:       { VMVal c=pop(),it=pop(); push(VMVal::make_bool(op_in(it,c))); break; }
             case Op::COMPARE_NOT_IN:   { VMVal c=pop(),it=pop(); push(VMVal::make_bool(!op_in(it,c))); break; }
             case Op::COMPARE_IS:       { VMVal r=pop(),l=pop(); push(VMVal::make_bool(op_is(l,r))); break; }
             case Op::COMPARE_IS_NOT:   { VMVal r=pop(),l=pop(); push(VMVal::make_bool(!op_is(l,r))); break; }
-            case Op::COMPARE_IS_TYPE:  { VMVal t=pop(),v=pop(); push(VMVal::make_bool(value_is_type(v,t.s))); break; }
-            case Op::COMPARE_IS_NOT_TYPE:{ VMVal t=pop(),v=pop(); push(VMVal::make_bool(!value_is_type(v,t.s))); break; }
+            case Op::COMPARE_IS_TYPE:
+            case Op::COMPARE_IS_NOT_TYPE: {
+                VMVal t=pop(),v=pop();
+                bool r;
+                VMVal named;
+                if(ins.arg==1 && (named=load_var(t.s)).type!=VMType::NONE && named.type!=VMType::CLASS
+                   && named.type!=VMType::UNDEFINED)
+                    r=op_is(v,named);          // an ordinary value: identity
+                else
+                    r=value_is_type(v,t.s);
+                push(VMVal::make_bool(ins.op==Op::COMPARE_IS_TYPE ? r : !r)); break;
+            }
             // Unary
             case Op::UNARY_NEG: {
                 VMVal v=pop();
                 nypy::NumV nv;
                 if(v.to_numv(nv)) push(VMVal::from_numv(nypy::num_neg(nv)));
-                else if(v.type==VMType::INSTANCE){
-                    VMVal r=call_dunder(v,"__neg__",{});
-                    push(r.type!=VMType::NONE?r:VMVal::make_none());
-                }
-                else push(VMVal::make_none()); break;
+                else if(v.type==VMType::INSTANCE) push(unary_dunder(v,"__neg__","-"));
+                else throw_exception(make_exception("TypeError",{VMVal::make_str("bad operand type for unary -")}));
+                break;
             }
-            case Op::UNARY_NOT:    push(VMVal::make_bool(!pop().is_truthy())); break;
+            // not: Python truthiness, including __bool__ / __len__.
+            case Op::UNARY_NOT:    { VMVal v=pop(); push(VMVal::make_bool(!vm_truthy(v))); break; }
             case Op::UNARY_BITNOT: { VMVal v=pop(); nypy::NumV nv;
                 if(v.to_numv(nv)){ push(nycall([&]{ return VMVal::from_numv(nypy::num_invert(nv)); })); break; }
-                if(v.type==VMType::INSTANCE){ VMVal r=call_dunder(v,"__invert__",{}); push(r); break; }
-                push(VMVal::make_none()); break; }
+                if(v.type==VMType::INSTANCE){ push(unary_dunder(v,"__invert__","~")); break; }
+                throw_exception(make_exception("TypeError",{VMVal::make_str("bad operand type for unary ~")}));
+                break; }
             case Op::UNARY_POS:
                 if(!stack_.empty()&&stack_.back().type==VMType::BOOL) stack_.back()=VMVal::make_int(stack_.back().b?1:0);
+                else if(!stack_.empty()&&stack_.back().type==VMType::INSTANCE){ VMVal v=pop(); push(unary_dunder(v,"__pos__","+")); }
                 break;
 
             // Jumps
@@ -2508,24 +3356,26 @@ private:
                 bool t = (v.type==VMType::INSTANCE) ? instance_truthy(v) : v.is_truthy();
                 if(t) fr.ip=ins.arg; break;
             }
-            case Op::JUMP_IF_FALSE_OR_POP: { if(!peek().is_truthy()) fr.ip=ins.arg; else pop(); break; }
-            case Op::JUMP_IF_TRUE_OR_POP:  { if(peek().is_truthy())  fr.ip=ins.arg; else pop(); break; }
+            case Op::JUMP_IF_FALSE_OR_POP: { VMVal t=peek(); if(!vm_truthy(t)) fr.ip=ins.arg; else pop(); break; }
+            case Op::JUMP_IF_TRUE_OR_POP:  { VMVal t=peek(); if(vm_truthy(t))  fr.ip=ins.arg; else pop(); break; }
 
             // Make function/class
             case Op::MAKE_FUNCTION: {
                 int fn_idx = ins.arg & 0xFFFF;
                 int n_defs = (ins.arg >> 16) & 0xFF;
-                // Pop defaults from stack (pushed in order, last default on top)
+                // Defaults were pushed in parameter order, last on top.
                 std::vector<VMVal> defs(n_defs);
                 for(int i=n_defs-1;i>=0;i--) defs[i]=pop();
                 auto fn_val = VMVal::make_func(fr.code->sub_codes[fn_idx]);
-                // Store defaults into the function's sub_code
                 if(n_defs>0 && fn_val.code){
-                    int n_params=(int)fn_val.code->param_names.size();
-                    fn_val.code->param_defaults.resize(n_params, VMVal{VMType::UNDEFINED});
-                    // Defaults align to the END of param list
-                    for(int i=0;i<n_defs&&i<n_params;i++)
-                        fn_val.code->param_defaults[n_params-n_defs+i]=defs[i];
+                    auto& fc=*fn_val.code;
+                    auto d=std::make_shared<std::vector<VMVal>>(fc.param_defaults);
+                    d->resize(fc.param_names.size(), VMVal{VMType::UNDEFINED});
+                    for(int i=0;i<n_defs && i<(int)fc.default_idx.size();i++){
+                        int pi=fc.default_idx[i];
+                        if(pi>=0 && pi<(int)d->size()) (*d)[pi]=defs[i];
+                    }
+                    fn_val.list=d;   // this function value's own defaults
                 }
                 // Capture enclosing locals as closure environment ONLY when inside a function
                 bool in_function = (fr.code->name != "<module>" && !fr.code->is_class);
@@ -2540,6 +3390,9 @@ private:
                             if(!fr.closure_env->count(kv.first))
                                 (*fr.closure_env)[kv.first] = kv.second;
                     }
+                    // A closure made inside a method sees its `self`.
+                    if(fr.self_val && !fr.closure_env->count("self"))
+                        (*fr.closure_env)["self"]=*fr.self_val;
                     fn_val.closure_env = fr.closure_env;
                 }
                 if(!fn_val.closure_env && fr.closure_env && !fr.closure_env->empty()){
@@ -2549,79 +3402,46 @@ private:
             }
             case Op::MAKE_CLASS: {
                 auto sub=fr.code->sub_codes[ins.arg];
-                // Statically scan class body to collect class-level variable initializations
-                // (LOAD_CONST followed by DEFINE_NAME = class variable)
-                {
-                    VMMap cvars;
-                    const auto& insts = sub->instructions;
-                    for(size_t ci=0;ci+1<insts.size();ci++){
-                        const auto& prev_ins = insts[ci];
-                        const auto& cur_ins  = insts[ci+1];
-                        if(cur_ins.op==Op::DEFINE_NAME&&
-                           prev_ins.op==Op::LOAD_CONST){
-                            std::string vname=sub->names.size()>(size_t)cur_ins.arg?
-                                              sub->names[cur_ins.arg]:"";
-                            if(!vname.empty()){
-                                VMVal val=VMVal::make_none();
-                                if(sub->constants.size()>(size_t)prev_ins.arg)
-                                    val=sub->constants[prev_ins.arg];
-                                cvars[vname]=val;
-                            }
-                        }
-                        // Nested class: MAKE_CLASS followed by DEFINE_NAME
-                        if(cur_ins.op==Op::DEFINE_NAME&&prev_ins.op==Op::MAKE_CLASS){
-                            std::string vname=sub->names.size()>(size_t)cur_ins.arg?
-                                              sub->names[cur_ins.arg]:"";
-                            if(!vname.empty()&&prev_ins.arg<(int)sub->sub_codes.size()){
-                                auto nsub=sub->sub_codes[prev_ins.arg];
-                                VMVal cv=VMVal::make_class(nsub,nsub->name);
-                                cvars[vname]=cv;
-                                class_reg_[nsub->name]=nsub;
-                            }
-                        }
-                    }
-                    if(!cvars.empty()) class_vars_[sub->name]=std::move(cvars);
-                }
+                class_reg_[sub->name]=sub;
+                mro_cache_.clear();
+                class_vars_[sub->name]=run_class_body(sub, fr);
+                if(is_exception_class(sub->name)) vm_exc_classes().insert(sub->name);
+                else vm_exc_classes().erase(sub->name);
                 push(VMVal::make_class(sub,sub->name));
-                class_reg_[sub->name]=sub; break;
+                break;
             }
 
             // Calls
             case Op::CALL_KW: {
-                bool method_mode=ins.arg<0;
-                int total=method_mode?-ins.arg:ins.arg;
+                // Stack: callee (or obj, "name" for a method call), the
+                // positional arguments, then a MAP of the keyword arguments.
+                // arg = number of positionals + 1; arg < 0 marks a method call.
+                bool method_mode = ins.arg < 0;
+                int total = method_mode ? -ins.arg : ins.arg;
                 std::vector<VMVal> all_args(total);
                 for(int i=total-1;i>=0;i--) all_args[i]=pop();
                 VMVal kwargs_map=all_args.back(); all_args.pop_back();
                 if(method_mode){
                     VMVal mname=pop(); VMVal obj=pop();
-                    std::shared_ptr<VMCode> mcode; std::optional<VMVal> mself; std::shared_ptr<VMMap> menv;
-                    if(resolve_user_method(obj,mname.s,all_args,mcode,mself,menv)){
-                        push(exec_code_bound(mcode,bind_kw_locals(mcode,all_args,kwargs_map),mself,menv));
-                    } else {
-                        if(kwargs_map.type==VMType::MAP){ kwargs_map.class_name="__kwargs__"; all_args.push_back(kwargs_map); }
-                        push(vm_call_method(obj,mname.s,all_args));
-                    }
-                    break;
-                }
-                VMVal callee=pop();
-                if(callee.type==VMType::FUNCTION&&callee.code){
-                    push(exec_code_bound(callee.code,bind_kw_locals(callee.code,all_args,kwargs_map),std::nullopt,callee.closure_env));
+                    push(vm_call_method(obj,mname.s,all_args,&kwargs_map));
                 } else {
-                    // Native: append kwargs_map as last arg so natives can check by name
-                    // (marked, so a positional dict argument is not taken for it).
-                    if(kwargs_map.type==VMType::MAP){ kwargs_map.class_name="__kwargs__"; all_args.push_back(kwargs_map); }
-                    std::optional<VMVal> no_self=std::nullopt;
-                    push(vm_call(callee,all_args,no_self));
+                    VMVal callee=pop();
+                    push(vm_call(callee,all_args,std::nullopt,&kwargs_map));
                 }
                 break;
             }
             case Op::LIST_EXTEND: {
                 // TOS = iterable to extend with; TOS1 = list to extend
-                VMVal ext=pop(); VMVal& lst=stack_.back();
+                VMVal ext=pop();
+                // *x over any iterable (a generator, a string, an object),
+                // not only a list.
+                std::vector<VMVal> items;
+                if(ext.type!=VMType::LIST) items=iter_items(ext);
+                VMVal& lst=stack_.back();
                 if(lst.type==VMType::LIST&&lst.list){
                     if(ext.type==VMType::LIST&&ext.list)
                         for(auto& v:*ext.list) lst.list->push_back(v);
+                    else for(auto& v:items) lst.list->push_back(v);
                 }
                 break;
             }
@@ -2645,6 +3465,9 @@ private:
                 // ins.arg for non-method = n_pos_args (counting star as 1 item)
                 // We need to pop n_pos_args items + the callee.
                 int n_pushed = method_mode ? (-ins.arg) : ins.arg;
+                // 2: the positionals list, then a map of the keywords.
+                VMVal ex_kw; bool has_ex_kw=false;
+                if(n_pushed==2){ ex_kw=pop(); has_ex_kw=true; n_pushed=1; }
                 std::vector<VMVal> raw(n_pushed);
                 for(int i=n_pushed-1;i>=0;i--) raw[i]=pop();
                 // The last element of raw is the star-list; spread it
@@ -2655,11 +3478,19 @@ private:
                 else args.push_back(star_arg); // not a list, just append
                 if(method_mode){
                     VMVal mname=pop(); VMVal obj=pop();
-                    push(vm_call_method(obj,mname.s,args));
+                    push(vm_call_method(obj,mname.s,args,has_ex_kw?&ex_kw:nullptr));
                 } else {
                     VMVal callee=pop();
-                    push(vm_call(callee,args,std::nullopt));
+                    push(vm_call(callee,args,std::nullopt,has_ex_kw?&ex_kw:nullptr));
                 }
+                break;
+            }
+            case Op::MAP_MERGE: {
+                VMVal src=pop(); VMVal& dst=stack_.back();
+                if(src.type!=VMType::MAP||!src.map)
+                    throw_exception(make_exception("TypeError",{VMVal::make_str("argument after ** must be a mapping")}));
+                if(dst.type==VMType::MAP&&dst.map)
+                    for(auto& kv:*src.map) (*dst.map)[kv.first]=kv.second;
                 break;
             }
             case Op::CALL_FUNCTION: {
@@ -2712,6 +3543,7 @@ private:
                         stack_.resize(base);
                     }
                     cfr.gen_state->yielded=true;
+                    cfr.gen_state->at_yield=true;
                     return yv;
                 }
                 throw VMYield{yv};
@@ -2774,9 +3606,18 @@ private:
                 if(it.type==VMType::GENERATOR){push(it);break;}
                 if(it.type==VMType::ITERATOR){push(it);break;}
                 if(it.type==VMType::INSTANCE){
-                    // Call __iter__ if defined, else push as-is for __next__ protocol
-                    VMVal iter_res=call_dunder(it,"__iter__",{});
-                    push(iter_res.type!=VMType::NONE?iter_res:it); break;
+                    // __iter__'s result; else the object itself when it has
+                    // __next__; else a __getitem__ sequence, indexed from 0.
+                    bool f=false;
+                    VMVal iter_res=call_dunder_f(it,"__iter__",{},f);
+                    if(f){
+                        if(iter_res.type==VMType::LIST&&iter_res.list){ std::vector<VMVal> c=*iter_res.list; push(VMVal::make_iter(std::move(c))); }
+                        else push(iter_res);
+                        break;
+                    }
+                    VMVal nx;
+                    if(class_lookup(it.class_name,"__next__",nx)){ push(it); break; }
+                    push(VMVal::make_iter(iter_items(it))); break;
                 }
                 if(it.type==VMType::LIST&&it.list){
                     std::vector<VMVal> copy=*it.list; push(VMVal::make_iter(std::move(copy))); break;
@@ -2796,11 +3637,15 @@ private:
                 if(it_type==VMType::INSTANCE){
                     VMVal it_copy = stack_[it_idx]; // copy since stack may reallocate
                     VMVal nv;
-                    bool stop_iter=false;
-                    try { nv=call_dunder(it_copy,"__next__",{}); }
-                    catch(std::runtime_error&){ stop_iter=true; }
-                    // Sync back in case gen_next moved it
-                    if(stop_iter||nv.type==VMType::NONE){ pop(); fr.ip=ins.arg; break; }
+                    bool stop_iter=false, found=false;
+                    // Only StopIteration ends the loop: any other exception
+                    // raised by __next__ propagates (it used to end the loop
+                    // silently, as did a __next__ that returned none).
+                    try { nv=call_dunder_f(it_copy,"__next__",{},found); }
+                    catch(VMException& e){ if(is_stop_iteration(e.value)) stop_iter=true; else throw; }
+                    if(!stop_iter && !found)
+                        throw_exception(make_exception("TypeError",{VMVal::make_str("'"+it_copy.class_name+"' object is not an iterator")}));
+                    if(stop_iter){ pop(); fr.ip=ins.arg; break; }
                     push(nv); break;
                 }
                 if(it_type==VMType::GENERATOR){
@@ -2827,22 +3672,7 @@ private:
             }
 
             case Op::PRINT: {
-                auto str_of=[&](const VMVal& v)->std::string{
-                    if(v.type!=VMType::INSTANCE) return v.to_string();
-                    for(auto dname : {"__str__","__repr__"}){
-                        std::string cls=v.class_name;
-                        while(!cls.empty()){
-                            auto cit=class_reg_.find(cls);
-                            if(cit==class_reg_.end()) break;
-                            for(auto& sub:cit->second->sub_codes)
-                                if(sub->name==dname&&!sub->is_class){
-                                    std::vector<VMVal> na; return exec_code(sub,na,v).to_string();
-                                }
-                            cls=cit->second->parent_class;
-                        }
-                    }
-                    return v.to_string();
-                };
+                auto str_of=[&](const VMVal& v)->std::string{ return vm_str(v); };
                 // Old single-value encoding (arg 0) or the packed call form.
                 int argc=1, flags=0;
                 if(ins.arg&(1<<20)){ argc=ins.arg&0xFFFF; flags=(ins.arg>>16)&3; }
@@ -2860,32 +3690,8 @@ private:
             case Op::IMPORT_NAME: vm_import(fr.code->names[ins.arg]); break;
 
             // Exception handling
-            case Op::RAISE: {
-                VMVal ev=pop();
-                std::string msg;
-                if(ev.type==VMType::INSTANCE){
-                    // Store the instance as the current exception object (for except as e:)
-                    std::string cls=ev.class_name;
-                    bool found=false;
-                    while(!cls.empty()&&!found){
-                        auto cit=class_reg_.find(cls);
-                        if(cit==class_reg_.end()) break;
-                        for(auto& sub:cit->second->sub_codes)
-                            if(sub->name=="__str__"&&!sub->is_class){
-                                std::vector<VMVal> na; msg=exec_code(sub,na,ev).to_string(); found=true; break;
-                            }
-                        cls=cit->second->parent_class;
-                    }
-                    if(!found) msg=ev.to_string();
-                    // Encode the instance into the error message so it survives the catch
-                    // We wrap: encode as JSON-like to recover in except handler
-                    last_exception_obj_=ev;
-                } else {
-                    msg=ev.to_string();
-                    last_exception_obj_=VMVal::make_none();
-                }
-                throw std::runtime_error(msg);
-            }
+            case Op::RAISE:
+                throw_exception(pop());
             case Op::SETUP_EXCEPT: break;   // marker only; handled structurally
             case Op::END_EXCEPT:   break;   // marker only
             case Op::STORE_EXCEPT_AS: {
@@ -2904,36 +3710,66 @@ private:
             }
 
             case Op::RAISE_ERROR: {
-                VMVal ev=pop();
-                std::string msg;
-                VMVal exc_obj;
-                if(ev.type==VMType::INSTANCE){
-                    // Raised an instance — call __str__ for the message
-                    exc_obj=ev;
-                    last_exception_obj_=ev;
-                    VMVal s=call_dunder(ev,"__str__",{});
-                    msg=s.type!=VMType::NONE?s.to_string():ev.to_string();
-                } else {
-                    msg=ev.to_string();
-                    exc_obj=VMVal::make_str(msg);
-                    last_exception_obj_=VMVal::make_none();
-                }
-                // Check exception table for a matching handler
-                int ip_at_raise = fr.ip - 1;
-                bool handled = false;
-                for(auto& ee : fr.code->exc_table){
-                    if(ip_at_raise >= ee.try_start && ip_at_raise < ee.try_end){
-                        push(exc_obj);
-                        fr.ip = match_except_handler(ee, exc_obj);
-                        handled = true;
-                        last_exception_obj_=VMVal::make_none();
-                        break;
+                // arg 0: raise X   1: bare raise (re-raise)   2: raise X from Y
+                VMVal cause; if(ins.arg==2) cause=pop();
+                VMVal ev=normalize_exception(pop());
+                if(ins.arg==2 && ev.type==VMType::INSTANCE && ev.map)
+                    (*ev.map)["__cause__"]=cause.type==VMType::NONE?cause:normalize_exception(cause);
+                throw_exception(std::move(ev));
+            }
+
+            // ── try/finally, with (see ExceptionEntry) ─────────────────────
+            case Op::FIN_NORMAL: push(make_fin_state(FIN_K_NORMAL)); break;
+            case Op::FIN_RETURN: push(make_fin_state(FIN_K_RETURN, pop())); break;
+            case Op::FIN_JUMP:   push(make_fin_state(FIN_K_JUMP, VMVal::make_none(), ins.arg)); break;
+            case Op::END_FINALLY: {
+                VMVal st=pop();
+                if(!is_fin_state(st)) break;
+                int outer=ins.arg;
+                switch((int)st.i){
+                case FIN_K_EXC:
+                    throw_exception((*st.list)[0]);
+                case FIN_K_RETURN:
+                    if(outer>=0){ push(st); fr.ip=fr.code->exc_table[outer].finally_start; break; }
+                    return (*st.list)[0];
+                case FIN_K_JUMP: {
+                    int t=(int)st.d;
+                    if(outer>=0){
+                        auto& oe=fr.code->exc_table[outer];
+                        // Leaving the enclosing try as well: run its finally.
+                        if(!(t>=oe.try_start && t<oe.finally_start)){ push(st); fr.ip=oe.finally_start; break; }
                     }
+                    fr.ip=t; break;
                 }
-                if(!handled) throw std::runtime_error(msg);
+                default: break;
+                }
                 break;
             }
-                push(VMVal::make_str(pop().to_string())); break;
+            case Op::WITH_ENTER: {
+                VMVal cm=pop();
+                bool found=false;
+                VMVal r=call_dunder_f(cm,"__enter__",{},found);
+                // No __enter__: bind the object itself (both engines).
+                push(found?r:cm); break;
+            }
+            case Op::WITH_EXIT: {
+                VMVal cm=pop();
+                // By index: __exit__ runs code that can grow (reallocate) the
+                // operand stack, so no reference into it may be held across.
+                size_t st_idx=stack_.size()-1;
+                VMVal st=stack_[st_idx];
+                if(is_fin_state(st) && st.i==FIN_K_EXC){
+                    VMVal exc=(*st.list)[0];
+                    bool found=false;
+                    VMVal r=call_dunder_f(cm,"__exit__",{class_of_exception(exc),exc,VMVal::make_none()},found);
+                    bool truthy = r.type==VMType::INSTANCE ? instance_truthy(r) : r.is_truthy();
+                    if(found && truthy) stack_[st_idx]=make_fin_state(FIN_K_NORMAL);
+                } else {
+                    bool found=false;
+                    call_dunder_f(cm,"__exit__",{VMVal::make_none(),VMVal::make_none(),VMVal::make_none()},found);
+                }
+                break;
+            }
 
             case Op::IADD: {
                 VMVal r=pop(),l=pop();
@@ -2960,47 +3796,164 @@ private:
             default: break;
             } // end switch
             } catch(VMReturn& r) { throw; }  // propagate returns
-              catch(std::runtime_error& exc) {
-                CallFrame& fr2=call_stack_.back();
-                std::string emsg=exc.what();
-                // Use the exception object if available (raised via 'raise instance')
-                VMVal exc_val = (last_exception_obj_.type==VMType::INSTANCE) ?
-                    last_exception_obj_ : VMVal::make_str(emsg);
-                last_exception_obj_ = VMVal::make_none(); // clear after use
-                bool handled=false;
-                // 1) Check exc_table (structured try/except blocks)
-                int ip_at_raise=fr2.ip-1;
-                for(auto& ee:fr2.code->exc_table){
-                    if(ip_at_raise>=ee.try_start && ip_at_raise<=ee.try_end){
-                        push(exc_val);
-                        fr2.ip=match_except_handler(ee, exc_val);
-                        handled=true; break;
-                    }
-                }
-                // 2) Fallback: find SETUP_EXCEPT instruction (used by `with`,
-                // see NT::WITH). Must skip any SETUP_EXCEPT whose block
-                // already exited normally (reached its matching END_EXCEPT)
-                // - otherwise an exception raised anywhere after a completed
-                // `with` block, with nothing else to catch it, walked back
-                // into that `with`'s stale handler instead of propagating,
-                // re-ran the code after the `with` block, hit the same raise
-                // again, and looped forever.
-                if(!handled){
-                    int skip=0;
-                    for(int i=fr2.ip-1;i>=0;i--){
-                        Op op2=fr2.code->instructions[i].op;
-                        if(op2==Op::END_EXCEPT){ skip++; continue; }
-                        if(op2==Op::SETUP_EXCEPT){
-                            if(skip>0){ skip--; continue; }
-                            push(exc_val);
-                            fr2.ip=fr2.code->instructions[i].arg;
-                            handled=true; break;
-                        }
-                    }
-                }
-                if(!handled) throw;
+              catch(VMYield&) { throw; }
+              catch(VMException& ex) {
+                if(!dispatch_exception(call_stack_.back(), ex.value)) throw;
+              }
+              catch(std::string& m) {
+                // Interpreter builtins reached through the bridge, and a few
+                // VM paths, report errors as "__exc__:Type:message" strings.
+                VMVal ev=exception_from_message(m);
+                if(!dispatch_exception(call_stack_.back(), ev)) throw VMException(ev, describe_exception(ev));
+              }
+              catch(std::exception& exc) {
+                // Runtime errors raised as "Type: message" (ZeroDivisionError
+                // from a division, ValueError from int(), ...) become instances
+                // of that builtin class, so `except ZeroDivisionError` catches
+                // them like any raised exception. Native code that built the
+                // instance itself (the tensor and concurrency runtimes, the
+                // builtin bridge) leaves it in last_exception_obj_.
+                VMVal ev=take_native_exception(exc.what());
+                if(!dispatch_exception(call_stack_.back(), ev)) throw VMException(ev, describe_exception(ev));
               }
         }
+    }
+
+    // ── Exceptions ───────────────────────────────────────────────────────
+    // Finds the handler for `ev` raised at the current instruction of `f`:
+    // the innermost try whose body covers it and has a matching clause, or
+    // whose body/handlers cover it and has a finally. Truncates the operand
+    // stack to that statement's depth, pushes the exception (or, for a
+    // finally, its pending-exception state) and jumps there.
+    bool dispatch_exception(CallFrame& f, const VMVal& ev) {
+        if(!f.code) return false;
+        int ip=f.ip-1;
+        auto& tbl=f.code->exc_table;
+        if(tbl.empty()) return false;
+        std::vector<int> cands;
+        for(int i=0;i<(int)tbl.size();i++){
+            auto& e=tbl[i];
+            bool in_body = ip>=e.try_start && ip<e.try_end;
+            bool in_rest = e.finally_start>=0 && ip>=e.try_end && ip<e.finally_start;
+            if(in_body||in_rest) cands.push_back(i);
+        }
+        // Innermost first. Nested statements can start at the same offset
+        // (a try whose first statement is a try); the inner one's entry was
+        // created later, so the higher index wins a tie.
+        std::sort(cands.begin(),cands.end(),[&](int a,int b){
+            if(tbl[a].try_start!=tbl[b].try_start) return tbl[a].try_start>tbl[b].try_start;
+            return a>b; });
+        for(int i:cands){
+            auto& e=tbl[i];
+            size_t want=f.stack_base+(size_t)e.depth;
+            if(ip>=e.try_start && ip<e.try_end){
+                int h=match_except_handler(e, ev);
+                if(h>=0){
+                    if(stack_.size()>want) stack_.resize(want);
+                    push(ev); f.ip=h; return true;
+                }
+            }
+            if(e.finally_start>=0){
+                if(stack_.size()>want) stack_.resize(want);
+                push(make_fin_state(FIN_K_EXC, ev)); f.ip=e.finally_start; return true;
+            }
+        }
+        return false;
+    }
+    [[noreturn]] void throw_exception(VMVal ev) {
+        std::string what=describe_exception(ev);
+        throw VMException(std::move(ev), what);
+    }
+    // The uncaught form: "Type: message" (just "Type" without a message).
+    std::string describe_exception(const VMVal& ev) {
+        if(ev.type==VMType::INSTANCE){
+            std::string m=exception_str(ev);
+            return m.empty()?ev.class_name:ev.class_name+": "+m;
+        }
+        return ev.to_string();
+    }
+    // str(e): the class's own __str__ when it has one, else the message.
+    std::string exception_str(const VMVal& ev) {
+        if(ev.type==VMType::INSTANCE){
+            bool found=false;
+            VMVal r=call_dunder_f(ev,"__str__",{},found);
+            if(found) return r.to_string();
+        }
+        return ev.to_string();
+    }
+    // A new instance of builtin exception class `type` with the given args.
+    VMVal make_exception(const std::string& type, std::vector<VMVal> args) {
+        if(!class_reg_.count(type)) vm_exc_classes().insert(type);
+        auto attrs=std::make_shared<VMMap>();
+        std::string msg = args.size()==1 ? args[0].to_string() : std::string();
+        (*attrs)["args"]=VMVal::make_list(std::move(args));
+        (*attrs)["msg"]=VMVal::make_str(msg);
+        return VMVal::make_instance(type, attrs);
+    }
+    // The exception a native raised as last_exception_obj_ + a "Type: msg"
+    // runtime_error, when the two agree; else one made from the message.
+    VMVal take_native_exception(const std::string& what) {
+        if(last_exception_obj_.type==VMType::INSTANCE){
+            VMVal ev=last_exception_obj_;
+            last_exception_obj_=VMVal::make_none();
+            const std::string& cn=ev.class_name;
+            if(what.compare(0, cn.size(), cn)==0 && (what.size()==cn.size() || what[cn.size()]==':'))
+                return ev;
+        }
+        return exception_from_message(what);
+    }
+    VMVal exception_from_message(const std::string& m) {
+        std::string type, msg;
+        if(!nython::ny_split_exc_message(m, type, msg)){ type="Exception"; msg=m; }
+        std::vector<VMVal> a; a.push_back(VMVal::make_str(msg));
+        return make_exception(type, std::move(a));
+    }
+    // `raise X`: a class is instantiated with no arguments; an instance is
+    // raised as is; anything else (Nython lets a string be raised) as well.
+    VMVal normalize_exception(VMVal ev) {
+        if(ev.type==VMType::CLASS){
+            std::vector<VMVal> none_args;
+            return vm_call(ev, none_args, std::nullopt);
+        }
+        return ev;
+    }
+    VMVal class_of_exception(const VMVal& ev) {
+        std::string cn = ev.type==VMType::INSTANCE ? ev.class_name : std::string("Exception");
+        auto it=class_reg_.find(cn);
+        if(it==class_reg_.end()) return VMVal::make_none();
+        return VMVal::make_class(it->second, cn);
+    }
+    // Whether class `cls` is `want` or derives from it (first base chain,
+    // then the builtin exception table).
+    bool class_derives(const std::string& cls, const std::string& want) {
+        if(cls==want) return true;
+        if(cls.empty()) return false;
+        if(!class_reg_.count(cls)){
+            if(nython::ny_is_builtin_exc(cls)) return nython::ny_builtin_exc_is(cls, want);
+            // A typed error from a builtin ("__exc__:SomeError:...") whose
+            // class is known to neither table is at least an Exception.
+            return vm_exc_classes().count(cls) && (want=="Exception"||want=="BaseException");
+        }
+        for(auto& c:*class_mro(cls)) if(c==want) return true;
+        return false;
+    }
+    bool is_exception_class(const std::string& cls) { return class_derives(cls, "BaseException"); }
+    bool exception_matches(const VMVal& ev, const std::string& t) {
+        if(ev.type==VMType::INSTANCE){
+            if(t=="Error" && is_exception_class(ev.class_name)
+               && !class_derives(ev.class_name,"SystemExit") && !class_derives(ev.class_name,"KeyboardInterrupt")
+               && !class_derives(ev.class_name,"GeneratorExit")) return true;
+            return class_derives(ev.class_name, t);
+        }
+        // A raised non-exception value (Nython allows `raise "msg"`): the
+        // generic names catch it, and a string naming a class matches that
+        // class (`raise "StopIteration"`).
+        if(t=="Exception"||t=="BaseException"||t=="Error") return true;
+        return ev.type==VMType::STRING && ev.s==t;
+    }
+    bool is_stop_iteration(const VMVal& ev) {
+        if(ev.type==VMType::INSTANCE) return class_derives(ev.class_name,"StopIteration");
+        return ev.type==VMType::STRING && ev.s.find("StopIteration")!=std::string::npos;
     }
 
     // ── JSON parser ─────────────────────────────────────────────────────────
@@ -3220,23 +4173,6 @@ private:
             default: return nypy::FmtVal::of_other(vm_str(v),vm_type_name(v));
         }
     }
-    // str(v) / repr(v), honouring __str__/__repr__ on instances.
-    std::string vm_str(const VMVal& v) {
-        if(v.type==VMType::INSTANCE){
-            VMVal r=call_dunder(v,"__str__",{});
-            if(r.type==VMType::STRING) return r.s;
-            r=call_dunder(v,"__repr__",{});
-            if(r.type==VMType::STRING) return r.s;
-        }
-        return v.to_string();
-    }
-    std::string vm_repr(const VMVal& v) {
-        if(v.type==VMType::INSTANCE){
-            VMVal r=call_dunder(v,"__repr__",{});
-            if(r.type==VMType::STRING) return r.s;
-        }
-        return v.repr();
-    }
     std::string format_value(const VMVal& v, const std::string& spec) {
         if(v.type==VMType::INSTANCE){
             VMVal r=call_dunder(v,"__format__",{VMVal::make_str(spec)});
@@ -3331,19 +4267,34 @@ private:
                 return out;
             }
             case VMType::INSTANCE: {
-                VMVal it=call_dunder(v,"__iter__",{});
-                if(it.type!=VMType::NONE&&it.type!=VMType::INSTANCE) return iter_items(it);
-                if(it.type==VMType::NONE) it=v;
+                // __iter__'s result (a list, iter(...), a generator, or an
+                // iterator object), else the object itself with __next__,
+                // else a __getitem__ sequence indexed from 0 until
+                // IndexError; anything else is not iterable.
                 std::vector<VMVal> out;
-                for(int guard=0;guard<100000000;guard++){
-                    VMVal item;
-                    try { item=call_dunder(it,"__next__",{}); }
-                    catch(std::runtime_error& e){
-                        std::string m=e.what();
-                        if(m.find("StopIteration")!=std::string::npos){ last_exception_obj_=VMVal::make_none(); break; }
-                        throw;
+                bool f=false;
+                VMVal it=call_dunder_f(v,"__iter__",{},f);
+                if(f && it.type!=VMType::INSTANCE) return iter_items(it);
+                VMVal iterator = f ? it : v;
+                VMVal m;
+                if(!class_lookup(iterator.class_name,"__next__",m)){
+                    VMVal gi;
+                    if(!f && class_lookup(v.class_name,"__getitem__",gi)){
+                        for(int64_t k=0;;k++){
+                            std::vector<VMVal> ka{VMVal::make_int(k)};
+                            try { out.push_back(invoke_method(gi, v, ka, v.class_name)); }
+                            catch(VMException& e){
+                                if(class_derives(e.value.class_name,"IndexError")||is_stop_iteration(e.value)) break;
+                                throw;
+                            }
+                        }
+                        return out;
                     }
-                    out.push_back(item);
+                    throw_exception(make_exception("TypeError",{VMVal::make_str("'"+v.class_name+"' object is not iterable")}));
+                }
+                while(true){
+                    try { out.push_back(call_dunder(iterator,"__next__",{})); }
+                    catch(VMException& e){ if(is_stop_iteration(e.value)) break; throw; }
                 }
                 return out;
             }
@@ -3379,13 +4330,21 @@ private:
     }
     bool op_in(const VMVal& item, const VMVal& cont) {
         if(cont.type==VMType::INSTANCE){
-            VMVal res=call_dunder(cont,"__contains__",{item});
-            if(res.type!=VMType::NONE) return res.is_truthy();
+            bool f=false;
+            VMVal res=call_dunder_f(cont,"__contains__",{item},f);
+            if(f) return vm_truthy(res);
+            // No __contains__: search what it iterates over.
+            for(auto& v:iter_items(cont)) if(vm_eq(v,item)) return true;
+            return false;
+        }
+        if(cont.type==VMType::GENERATOR||cont.type==VMType::ITERATOR){
+            for(auto& v:iter_items(cont)) if(vm_eq(v,item)) return true;
+            return false;
         }
         if(cont.type==VMType::STRING&&item.type==VMType::STRING)
             return cont.s.find(item.s)!=std::string::npos;
         if(cont.type==VMType::LIST&&cont.list)
-            for(auto& v:*cont.list) if(v==item) return true;
+            for(auto& v:*cont.list) if(vm_eq(v,item)) return true;
         if(cont.type==VMType::MAP&&cont.map)
             return cont.map->count(vkey(item))>0;
         return false;
@@ -3396,23 +4355,14 @@ private:
     // type, or a parent of it. Mirrors the interpreter's evalTry
     // (NythonExecutor.hpp) type-matching, including its silent fall-through
     // to `finally` (ee.end) when nothing matches rather than re-raising.
+    // The first clause (in source order) that catches exc_val, -1 if none.
     int match_except_handler(const ExceptionEntry& ee, const VMVal& exc_val) {
-        std::string exc_type = exc_val.type==VMType::INSTANCE ? exc_val.class_name : std::string();
         for(auto& cl : ee.clauses){
-            if(cl.type_name.empty()) return cl.handler;
-            if(exc_type.empty()) continue; // typed clause, untyped exception: no match
-            if(exc_type==cl.type_name || cl.type_name=="Exception"
-               || cl.type_name=="BaseException" || cl.type_name=="Error")
-                return cl.handler;
-            std::string cur=exc_type; int guard=0;
-            while(!cur.empty() && guard++<16){
-                auto cit=class_reg_.find(cur);
-                if(cit==class_reg_.end()) break;
-                cur=cit->second->parent_class;
-                if(cur==cl.type_name) return cl.handler;
-            }
+            if(cl.types.empty()) return cl.handler;
+            for(auto& t : cl.types)
+                if(exception_matches(exc_val, t)) return cl.handler;
         }
-        return ee.end;
+        return -1;
     }
     bool value_is_type(const VMVal& v, const std::string& want) {
         // Everything is an Object.
@@ -3445,17 +4395,8 @@ private:
                                 return want=="function"||want=="Function";
             default: break;
         }
-        if(v.type==VMType::INSTANCE){
-            // Walk the inheritance chain so `child is Base` holds.
-            std::string cur=v.class_name;
-            int guard=0;
-            while(!cur.empty() && guard++<64){
-                if(cur==want) return true;
-                auto it=class_reg_.find(cur);
-                if(it==class_reg_.end()||!it->second) break;
-                cur=it->second->parent_class;
-            }
-        }
+        // Every base counts (`child is Base`, a second base too).
+        if(v.type==VMType::INSTANCE) return class_derives(v.class_name, want);
         return false;
     }
 
@@ -3477,91 +4418,123 @@ private:
     }
 
     // ── Attribute access ────────────────────────────────────────────────
-    VMVal get_attr(const VMVal& obj, const std::string& attr) {
+    // A missing attribute of an instance or class: `probe` (hasattr /
+    // getattr) raises AttributeError for try_get_attr to catch; a plain read
+    // gives none, as on the interpreter (see kStrictAttributeReads there).
+    // Calling a missing method raises (vm_call_method).
+    static constexpr bool kStrictAttributeReads = false;
+    VMVal get_attr(const VMVal& obj, const std::string& attr, bool probe=false) {
         // Instance / map fields — check for property descriptors
         if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map){
             auto it=obj.map->find(attr);
             if(it!=obj.map->end()){
                 VMVal& v=it->second;
-                // Property descriptor: {__is_property__: true, __get__: func}
-                if(v.type==VMType::MAP&&v.map&&v.map->count("__is_property__")){
+                // A property stored on the instance itself: self.x = property(get)
+                if(obj.type==VMType::INSTANCE&&is_property_desc(v)) return property_get(v, obj);
+                if(obj.type==VMType::MAP&&is_property_desc(v)){
                     auto git=v.map->find("__get__");
                     if(git!=v.map->end()&&git->second.type==VMType::FUNCTION){
                         std::vector<VMVal> no_args;
-                        return exec_code(git->second.code, no_args, obj);
+                        return call_function(git->second, no_args, obj);
                     }
                 }
                 return v;
             }
         }
-        // Method lookup via class registry — also check for property descriptors in class
         if(obj.type==VMType::INSTANCE){
-            std::string cls=obj.class_name;
-            while(!cls.empty()){
-                auto cit=class_reg_.find(cls);
-                if(cit==class_reg_.end()) break;
-                for(auto& sub:cit->second->sub_codes){
-                    if(sub->name==attr&&!sub->is_class){
-                        // Carry the instance with the method. Returning a bare
-                        // function meant `var f = obj.m` lost `self`, so calling
-                        // f later shifted every argument left — the same defect
-                        // the interpreter had (round 4). Reuses the existing
-                        // __super_bound__ convention that vm_call understands.
-                        VMVal bound=VMVal::make_map();
-                        bound.class_name="__bound_method__";
-                        (*bound.map)["__fn__"]=VMVal::make_func(sub);
-                        (*bound.map)["__self__"]=obj;
-                        return bound;
-                    }
-                }
-                cls=cit->second->parent_class;
+            VMVal m;
+            if(class_lookup(obj.class_name, attr, m)) return bind_member(m, obj, obj.class_name);
+            if(attr=="__class__") return class_value(obj.class_name);
+            if(attr=="__dict__"){
+                VMVal d=VMVal::make_map();
+                if(obj.map) for(auto& kv:*obj.map) (*d.map)[kv.first]=kv.second;
+                return d;
             }
+            VMVal ga;
+            if(class_lookup(obj.class_name, "__getattr__", ga)){
+                std::vector<VMVal> a{VMVal::make_str(attr)};
+                return invoke_method(ga, obj, a, obj.class_name);
+            }
+            if(probe || kStrictAttributeReads)
+                throw_exception(make_exception("AttributeError",{VMVal::make_str(
+                    "'"+obj.class_name+"' object has no attribute '"+attr+"'")}));
+            return VMVal::make_none();
         }
-        if(obj.type==VMType::STRING) return str_method(obj,attr);
+        if(obj.type==VMType::STRING){
+            // type(x).__name__: type() gives a name string on this engine.
+            if(attr=="__name__") return obj;
+            return str_method(obj,attr);
+        }
         if(obj.type==VMType::LIST)   return list_method(obj,attr);
-        // CLASS type: look for nested classes and class-level vars in class_vars_
+        if(obj.type==VMType::FUNCTION&&attr=="__name__") return VMVal::make_str(obj.code?obj.code->name:"");
         if(obj.type==VMType::CLASS){
             std::string cname = obj.class_name.empty() ? obj.s : obj.class_name;
-            // Check class_vars_ (class-level variables)
-            auto cit = class_vars_.find(cname);
-            if(cit != class_vars_.end()){
-                auto vit = cit->second.find(attr);
-                if(vit != cit->second.end()) return vit->second;
+            VMVal m;
+            if(class_lookup(cname, attr, m)){
+                if(m.type==VMType::FUNCTION&&m.code&&m.code->is_classmethod) return make_bound(m, obj, true);
+                return m;   // a method read from the class is the plain function
             }
-            // Check sub-codes for nested class or static method
-            auto rit = class_reg_.find(cname);
-            if(rit != class_reg_.end()){
-                for(auto& sub: rit->second->sub_codes){
-                    if(sub->name == attr && sub->is_class){
-                        // Return nested class as a CLASS VMVal
-                        VMVal cv; cv.type=VMType::CLASS; cv.class_name=attr; cv.code=sub;
-                        return cv;
-                    }
-                    if(sub->name == attr && !sub->is_class){
-                        return VMVal::make_func(sub);
-                    }
-                }
+            if(attr=="__name__") return VMVal::make_str(cname);
+            if(attr=="__mro__"){
+                std::vector<VMVal> r;
+                for(auto& c:*class_mro(cname)){ VMVal cv=class_value(c); if(cv.type!=VMType::NONE) r.push_back(cv); }
+                return VMVal::make_list(std::move(r));
             }
+            if(attr=="__bases__"){
+                std::vector<VMVal> r;
+                auto rit=class_reg_.find(cname);
+                if(rit!=class_reg_.end()&&rit->second) for(auto& b:rit->second->bases){ VMVal cv=class_value(b); if(cv.type!=VMType::NONE) r.push_back(cv); }
+                return VMVal::make_list(std::move(r));
+            }
+            if(class_reg_.count(cname) && (probe || kStrictAttributeReads))
+                throw_exception(make_exception("AttributeError",{VMVal::make_str(
+                    "type object '"+cname+"' has no attribute '"+attr+"'")}));
         }
         return VMVal::make_none();
+    }
+    // obj.attr, or false when it has none (hasattr / getattr with a default).
+    bool try_get_attr(const VMVal& obj, const std::string& attr, VMVal& out) {
+        try { out=get_attr(obj, attr, true); }
+        catch(VMException& e){
+            if(class_derives(e.value.class_name,"AttributeError")) return false;
+            throw;
+        }
+        return true;
     }
     void set_attr(VMVal& obj, const std::string& attr, VMVal val) {
         if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map){
             auto it=obj.map->find(attr);
             if(it!=obj.map->end()){
                 VMVal& v=it->second;
-                if(v.type==VMType::MAP&&v.map&&v.map->count("__is_property__")){
+                if(is_property_desc(v)){
                     auto sit=v.map->find("__set__");
                     if(sit!=v.map->end()&&sit->second.type==VMType::FUNCTION){
                         std::vector<VMVal> args={val};
-                        exec_code(sit->second.code, args, obj);
+                        call_function(sit->second, args, obj);
                         return;
                     }
                 }
             }
+            // A property defined on the class: its setter, or an error for a
+            // read-only one (writing the value into the instance used to
+            // shadow the property silently).
+            if(obj.type==VMType::INSTANCE && it==obj.map->end()){
+                VMVal m;
+                if(class_lookup(obj.class_name, attr, m) && is_property_desc(m)){
+                    auto sit=m.map->find("__set__");
+                    if(sit!=m.map->end()){
+                        std::vector<VMVal> args={val};
+                        if(sit->second.type==VMType::FUNCTION) call_function(sit->second, args, obj);
+                        else { std::vector<VMVal> a2{obj,val}; vm_call(sit->second, a2, std::nullopt); }
+                        return;
+                    }
+                    throw_exception(make_exception("AttributeError",{VMVal::make_str("can't set attribute '"+attr+"'")}));
+                }
+            }
             (*obj.map)[attr]=std::move(val);
+            return;
         }
-        // CLASS type: update class_vars_
+        // Class.attr = value: the class namespace
         if(obj.type==VMType::CLASS){
             std::string cname = obj.class_name.empty() ? obj.s : obj.class_name;
             class_vars_[cname][attr] = std::move(val);
@@ -3686,89 +4659,70 @@ private:
         return std::string();
     }
 
-    VMVal vm_call(VMVal callee, std::vector<VMVal>& args, std::optional<VMVal> self) {
+    VMVal vm_call(VMVal callee, std::vector<VMVal>& args, std::optional<VMVal> self,
+                  const VMVal* kwargs=nullptr) {
         if(callee.type==VMType::NONE||callee.type==VMType::UNDEFINED)
             return VMVal::make_none();
         // __call__: instance used as callable
         if(callee.type==VMType::INSTANCE){
-            VMVal r=call_dunder(callee,"__call__",args);
-            return r;
+            bool found=false;
+            VMVal m;
+            if(class_lookup(callee.class_name, "__call__", m)) return invoke_method(m, callee, args, callee.class_name, kwargs);
+            (void)found;
+            throw_exception(make_exception("TypeError",{VMVal::make_str("'"+callee.class_name+"' object is not callable")}));
         }
-        // __super_bound__: bound method from super() proxy
-        if(callee.type==VMType::MAP&&callee.class_name=="__bound_method__"&&callee.map){
+        // A method bound to its instance (obj.m read as a value), or a
+        // classmethod bound to its class.
+        if(callee.type==VMType::MAP&&(callee.class_name=="__bound_method__"||callee.class_name=="__super_bound__")&&callee.map){
             auto& bm=*callee.map;
             VMVal fn=bm.count("__fn__")?bm["__fn__"]:VMVal::make_none();
             VMVal sv=bm.count("__self__")?bm["__self__"]:VMVal::make_none();
-            if(fn.type==VMType::FUNCTION&&fn.code) return exec_code(fn.code,args,sv);
-            return VMVal::make_none();
+            if(bm.count("__cls__")){
+                std::vector<VMVal> a2; a2.reserve(args.size()+1);
+                a2.push_back(sv); for(auto& x:args) a2.push_back(x);
+                return fn.type==VMType::FUNCTION ? call_function(fn, a2, std::nullopt, kwargs) : vm_call(fn, a2, std::nullopt, kwargs);
+            }
+            if(fn.type==VMType::FUNCTION&&fn.code) return call_function(fn,args,sv,kwargs);
+            return vm_call(fn,args,std::nullopt,kwargs);
         }
-        if(callee.type==VMType::MAP&&callee.class_name=="__super_bound__"&&callee.map){
-            auto& m=*callee.map;
-            VMVal fn=m.count("__fn__")?m["__fn__"]:VMVal::make_none();
-            VMVal sv=m.count("__self__")?m["__self__"]:VMVal::make_none();
-            if(fn.type==VMType::FUNCTION&&fn.code)
-                return exec_code(fn.code,args,sv);
-            return VMVal::make_none();
+        // super(...): with no arguments the proxy itself; super(Class, obj)
+        // Python's explicit form; any other arguments are Nython's shorthand
+        // for calling the parent constructor, super(name, 4).
+        if(callee.type==VMType::SUPER_PROXY){
+            if(args.empty()) return callee;
+            if(args.size()==2&&args[0].type==VMType::CLASS){
+                VMVal proxy=callee;
+                proxy.s=args[0].class_name;
+                proxy.list=std::make_shared<std::vector<VMVal>>();
+                proxy.list->push_back(args[1]);
+                return proxy;
+            }
+            return vm_call_method(callee, "__init__", args, kwargs);
         }
-        // SUPER_PROXY called directly as super() → return itself
-        if(callee.type==VMType::SUPER_PROXY) return callee;
-        if(callee.type==VMType::NATIVE) return callee.native(args);
-        if(callee.type==VMType::FUNCTION&&callee.code&&callee.code->has_yield()){
-            // Generator function: collect all yielded values into a list
-            std::vector<VMVal> yielded;
-            std::vector<VMVal> gen_args=args;
-            // Apply self-extraction if needed
-            std::optional<VMVal> gen_self=self;
-            if(!gen_self&&!gen_args.empty()&&!callee.code->param_names.empty()
-               &&callee.code->param_names[0]=="self"
-               &&(gen_args[0].type==VMType::INSTANCE||gen_args[0].type==VMType::MAP)){
-                gen_self=gen_args[0];
-                gen_args=std::vector<VMVal>(gen_args.begin()+1,gen_args.end());}
-            // Return a lazy generator (coroutine-style)
-            return make_generator_val(callee.code, gen_args, gen_self, callee.closure_env);
+        if(callee.type==VMType::NATIVE){
+            if(kwargs && kwargs->type==VMType::MAP && kwargs->map && !kwargs->map->empty()){
+                // Natives take the keywords as a trailing map marked
+                // "__kwargs__" (take_kwargs; the builtin bridge forwards it as
+                // the map nyos::Args reads), so a positional dict is not
+                // taken for it.
+                std::vector<VMVal> a2=args; a2.push_back(*kwargs);
+                a2.back().class_name="__kwargs__";
+                return callee.native(a2);
+            }
+            return callee.native(args);
         }
         if(callee.type==VMType::FUNCTION&&callee.code){
-            // If no explicit self but first param is "self" and first arg is an instance,
-            // extract self from args (e.g. Animal.__init__(self, name) pattern)
-            if(!self && !args.empty() && !callee.code->param_names.empty()
-               && callee.code->param_names[0]=="self"
-               && (args[0].type==VMType::INSTANCE||args[0].type==VMType::MAP)) {
+            // Class.method taken as a value and called with the instance
+            // first: f = Animal.speak; f(dog).
+            if(!self && callee.code->is_method && !callee.code->is_static && !args.empty()
+               && args[0].type==VMType::INSTANCE){
                 VMVal self_val = args[0];
                 std::vector<VMVal> rest(args.begin()+1, args.end());
-                return exec_code(callee.code, rest, self_val, callee.closure_env);
+                return call_function(callee, rest, self_val, kwargs);
             }
-            return exec_code(callee.code,args,self,callee.closure_env);
+            return call_function(callee,args,self,kwargs);
         }
-        if(callee.type==VMType::CLASS&&callee.code){
-            auto attrs=std::make_shared<VMMap>();
-            VMVal inst=VMVal::make_instance(callee.class_name,attrs);
-            if(!class_reg_.count(callee.class_name)) class_reg_[callee.class_name]=callee.code;
-            {
-                // Find __init__ in class hierarchy
-                std::string search_cls=callee.class_name;
-                bool found_init=false;
-                while(!search_cls.empty()&&!found_init){
-                    auto cit=class_reg_.find(search_cls);
-                    if(cit==class_reg_.end()){
-                        // Try callee.code if it's this class:
-                        if(search_cls==callee.class_name){
-                            for(auto& sub:callee.code->sub_codes)
-                                if(is_ctor_name(sub->name)&&!sub->is_class){exec_code(sub,args,inst);found_init=true;break;}
-                        }
-                        break;
-                    }
-                    for(auto& sub:cit->second->sub_codes)
-                        if(is_ctor_name(sub->name)&&!sub->is_class){exec_code(sub,args,inst);found_init=true;break;}
-                    if(!found_init) search_cls=cit->second->parent_class;
-                }
-                if(!found_init){
-                    // Fallback: search callee.code->sub_codes directly:
-                    for(auto& sub:callee.code->sub_codes)
-                        if(is_ctor_name(sub->name)&&!sub->is_class){exec_code(sub,args,inst);break;}
-                }
-            }
-            return inst;
-        }
+        if(callee.type==VMType::CLASS&&callee.code) return instantiate(callee, args, kwargs);
         return VMVal::make_none();
     }
     // The interpreter accepts either `init` or `__init__` as the constructor
@@ -3779,78 +4733,6 @@ private:
     static bool is_ctor_name(const std::string& n) {
         return n=="__init__" || n=="init";
     }
-    // Positional + keyword arguments bound to a code object's parameters
-    // (*rest, **kw, defaults), as locals for exec_code_bound.
-    VMMap bind_kw_locals(const std::shared_ptr<VMCode>& code, const std::vector<VMVal>& all_args, const VMVal& kwargs_map) {
-        auto& pnames=code->param_names;
-        int n_pos=(int)all_args.size(), arg_idx=0;
-        VMMap locs;
-        for(int pi=0;pi<(int)pnames.size();pi++){
-            const std::string& pn=pnames[pi];
-            if(pn.size()>=2&&pn[0]=='*'&&pn[1]=='*'){ locs[pn.substr(2)]=kwargs_map; arg_idx=n_pos; }
-            else if(!pn.empty()&&pn[0]=='*'){ std::vector<VMVal> rest(all_args.begin()+arg_idx,all_args.end()); locs[pn.substr(1)]=VMVal::make_list(std::move(rest)); arg_idx=n_pos; }
-            else if(arg_idx<n_pos) locs[pn]=all_args[arg_idx++];
-            else if(kwargs_map.map&&kwargs_map.map->count(pn)) locs[pn]=kwargs_map.map->at(pn);
-            else if(pi<(int)code->param_defaults.size()&&code->param_defaults[pi].type!=VMType::UNDEFINED) locs[pn]=code->param_defaults[pi];
-            else locs[pn]=VMVal::make_none();
-        }
-        return locs;
-    }
-    // The user-defined function obj.method(...) runs, with its self and
-    // closure, following vm_call_method's lookup order; false for builtin
-    // methods (str/list/map/natives), which take keyword arguments as a
-    // trailing "__kwargs__" map instead. May drop a leading self from args
-    // (Class.method(self, ...)).
-    bool resolve_user_method(const VMVal& obj, const std::string& method, std::vector<VMVal>& args,
-                             std::shared_ptr<VMCode>& code, std::optional<VMVal>& self, std::shared_ptr<VMMap>& env) {
-        if(obj.type==VMType::SUPER_PROXY){
-            VMVal self_v=(!obj.list||obj.list->empty())?VMVal::make_none():(*obj.list)[0];
-            std::string cls=obj.s;
-            while(!cls.empty()){
-                auto cit=class_reg_.find(cls);
-                if(cit==class_reg_.end()) break;
-                for(auto& sub:cit->second->sub_codes)
-                    if(sub->name==method&&!sub->is_class){ code=sub; self=self_v; return true; }
-                cls=cit->second->parent_class;
-            }
-            return false;
-        }
-        if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map){
-            auto it=obj.map->find(method);
-            if(it!=obj.map->end()){
-                const VMVal& held=it->second;
-                if(held.type==VMType::FUNCTION&&held.code){
-                    code=held.code; env=held.closure_env; self=obj;
-                    return true;
-                }
-                return false;
-            }
-        }
-        if(obj.type==VMType::INSTANCE){
-            std::string cls=obj.class_name;
-            while(!cls.empty()){
-                auto cit=class_reg_.find(cls);
-                if(cit==class_reg_.end()) break;
-                for(auto& sub:cit->second->sub_codes)
-                    if(sub->name==method&&!sub->is_class){ code=sub; self=obj; return true; }
-                cls=cit->second->parent_class;
-            }
-            return false;
-        }
-        if(obj.type==VMType::CLASS&&obj.code){
-            for(auto& sub:obj.code->sub_codes){
-                if(sub->name==method&&!sub->is_class){
-                    code=sub;
-                    if(!args.empty()&&(args[0].type==VMType::INSTANCE||args[0].type==VMType::MAP)){
-                        self=args[0]; args.erase(args.begin());
-                    } else self=VMVal::make_none();
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
     // Members every plain value answers: an operator used as a method name
     // (1.+(2, 3) is 1 + 2 + 3; a comparison chains, 1.<(2, 3) is 1 < 2 < 3)
     // and the object protocol's class_name / type_name / to_string. The
@@ -3892,22 +4774,50 @@ private:
         return false;
     }
 
-    VMVal vm_call_method(VMVal obj, const std::string& method, std::vector<VMVal>& args) {
+    VMVal vm_call_method(VMVal obj, const std::string& method, std::vector<VMVal>& args,
+                         const VMVal* kwargs=nullptr) {
+        // Generator protocol: send(v) resumes with v as the value of the
+        // pending yield; close() finishes it.
+        if(obj.type==VMType::GENERATOR&&obj.gen){
+            if(method=="send"||method=="__next__"||method=="next"){
+                VMVal sent = (method=="send"&&!args.empty()) ? args[0] : VMVal::make_none();
+                if(method=="send" && !obj.gen->started && sent.type!=VMType::NONE)
+                    throw_exception(make_exception("TypeError",{VMVal::make_str("can't send non-None value to a just-started generator")}));
+                if(obj.gen->done) throw_exception(make_exception("StopIteration",{}));
+                VMVal v=gen_next(obj, sent);
+                if(obj.gen->done) throw_exception(make_exception("StopIteration",{}));
+                return v;
+            }
+            if(method=="close"){ obj.gen->done=true; obj.gen->saved_stack.clear(); return VMVal::make_none(); }
+            if(method=="__iter__") return obj;
+        }
         {
             VMVal pm;
             if(primitive_member(obj,method,args,pm)) return pm;
         }
-        // SUPER_PROXY: call method on parent class with self
+        // super().m(...): m from the class after the defining one in
+        // type(self)'s MRO, bound to self.
         if(obj.type==VMType::SUPER_PROXY){
-            std::string parent=obj.s;
+            std::string owner=obj.s;
             VMVal self_v=(!obj.list||obj.list->empty())?VMVal::make_none():(*obj.list)[0];
-            std::string cls=parent;
-            while(!cls.empty()){
-                auto cit=class_reg_.find(cls);
-                if(cit==class_reg_.end()) break;
-                for(auto& sub:cit->second->sub_codes)
-                    if(sub->name==method&&!sub->is_class) return exec_code(sub,args,self_v);
-                cls=cit->second->parent_class;
+            std::string mro_of = self_v.type==VMType::INSTANCE ? self_v.class_name : owner;
+            VMVal m; std::string where;
+            if(class_lookup(mro_of, method, m, &where, &owner))
+                return invoke_method(m, self_v, args, mro_of, kwargs);
+            // The constructor goes by either name (init / __init__).
+            if(is_ctor_name(method)){
+                std::string other = method=="init" ? "__init__" : "init";
+                if(class_lookup(mro_of, other, m, &where, &owner))
+                    return invoke_method(m, self_v, args, mro_of, kwargs);
+            }
+            if(is_ctor_name(method)){
+                // super().__init__(...) reaching a builtin exception class
+                // sets the exception's args; reaching object, nothing.
+                if(self_v.type==VMType::INSTANCE && self_v.map && is_exception_class(mro_of)){
+                    (*self_v.map)["args"]=VMVal::make_list(args);
+                    (*self_v.map)["msg"]=VMVal::make_str(args.size()==1?args[0].to_string():std::string());
+                }
+                return VMVal::make_none();
             }
             return VMVal::make_none();
         }
@@ -3922,27 +4832,29 @@ private:
                 // all. Only a bare FUNCTION keeps the historical behaviour of
                 // being treated as a method of this object.
                 if(held.type==VMType::MAP&&held.class_name=="__bound_method__")
-                    return vm_call(held,args,std::nullopt);
+                    return vm_call(held,args,std::nullopt,kwargs);
                 if(held.type==VMType::NATIVE)
-                    return vm_call(held,args,std::nullopt);
+                    return vm_call(held,args,std::nullopt,kwargs);
                 if(held.type==VMType::FUNCTION)
-                    // held.closure_env must come along too, or a closure
-                    // stored in an attribute and invoked as obj.attr()
-                    // silently loses every captured variable (they read
-                    // back as none) the moment it's called this way instead
-                    // of via a plain local reference (`f = obj.attr; f()`,
-                    // which already passed callee.closure_env correctly).
-                    return exec_code(held.code,args,obj,held.closure_env);
+                    // A function stored in an attribute is called with its
+                    // own closure and defaults (a closure stored as obj.cb
+                    // and called obj.cb() used to lose its captured values).
+                    return call_function(held,args,obj,kwargs);
+                if(held.type==VMType::CLASS||held.type==VMType::INSTANCE)
+                    return vm_call(held,args,std::nullopt,kwargs);
             }
         }
         if(obj.type==VMType::INSTANCE){
-            std::string cls=obj.class_name;
-            while(!cls.empty()){
-                auto cit=class_reg_.find(cls);
-                if(cit==class_reg_.end()) break;
-                for(auto& sub:cit->second->sub_codes)
-                    if(sub->name==method&&!sub->is_class) return exec_code(sub,args,obj);
-                cls=cit->second->parent_class;
+            VMVal m;
+            if(class_lookup(obj.class_name, method, m)) return invoke_method(m, obj, args, obj.class_name, kwargs);
+            // __getattr__ supplies attributes that do not exist otherwise.
+            {
+                VMVal ga;
+                if(class_lookup(obj.class_name, "__getattr__", ga)){
+                    std::vector<VMVal> ga_args{VMVal::make_str(method)};
+                    VMVal target=invoke_method(ga, obj, ga_args, obj.class_name);
+                    return vm_call(target, args, std::nullopt, kwargs);
+                }
             }
             // Universal object protocol — mirrors NythonExecutor::objectProtocol
             // on the interpreter (see test_25_object_protocol.ny, which probes
@@ -3965,16 +4877,8 @@ private:
             }
             if(method=="is_a"||method=="instance_of"){
                 if(args.empty()) return VMVal::make_bool(false);
-                std::string want=args[0].to_string();
-                std::string cur=obj.class_name;
-                int guard=0;
-                while(!cur.empty()&&guard++<64){
-                    if(cur==want) return VMVal::make_bool(true);
-                    auto cit=class_reg_.find(cur);
-                    if(cit==class_reg_.end()) break;
-                    cur=cit->second->parent_class;
-                }
-                return VMVal::make_bool(false);
+                std::string want = args[0].type==VMType::CLASS ? args[0].class_name : args[0].to_string();
+                return VMVal::make_bool(class_derives(obj.class_name, want));
             }
             if(method=="equals_to"||method=="same_as"){
                 if(args.empty()||args[0].type!=VMType::INSTANCE) return VMVal::make_bool(false);
@@ -3985,24 +4889,53 @@ private:
                 if(obj.map) for(auto& kv:*obj.map) r.push_back(VMVal::make_str(kv.first));
                 return VMVal::make_list(std::move(r));
             }
+            // No such method: AttributeError (the call returned none, which
+            // hid misspelt method names).
+            throw_exception(make_exception("AttributeError",{VMVal::make_str(
+                "'"+obj.class_name+"' object has no attribute '"+method+"'")}));
         }
-        // CLASS.method(self, args...) — parent class method call pattern
-        // e.g. Animal.__init__(self, name) → args[0] is the instance, args[1:] are method args
+        // Class.method(...): a static method or a Nython method without self
+        // takes the arguments as they are, a classmethod gets the class, and
+        // a method with self takes it from the first argument
+        // (Animal.__init__(self, name)).
         if(obj.type==VMType::CLASS&&obj.code){
-            for(auto& sub:obj.code->sub_codes){
-                if(sub->name==method&&!sub->is_class){
-                    // Extract self from first arg if args[0] is an instance
-                    if(!args.empty()&&(args[0].type==VMType::INSTANCE||args[0].type==VMType::MAP)){
+            VMVal m;
+            if(class_lookup(obj.class_name, method, m)){
+                if(m.type==VMType::FUNCTION&&m.code){
+                    if(m.code->is_classmethod) return invoke_method(m, obj, args, obj.class_name, kwargs);
+                    if(m.code->is_static||!m.code->is_method) return call_function(m, args, std::nullopt, kwargs);
+                    if(!args.empty()){
                         VMVal self_val=args[0];
                         std::vector<VMVal> rest(args.begin()+1,args.end());
-                        return exec_code(sub,rest,self_val);
+                        return call_function(m, rest, self_val, kwargs);
                     }
-                    return exec_code(sub,args,std::nullopt);
+                    return call_function(m, args, std::nullopt, kwargs);
                 }
+                return vm_call(m, args, std::nullopt, kwargs);
             }
+            // Exception.__init__(self, msg) on a builtin exception class.
+            if(is_ctor_name(method) && !args.empty() && args[0].type==VMType::INSTANCE && args[0].map
+               && is_exception_class(obj.class_name)){
+                std::vector<VMVal> rest(args.begin()+1,args.end());
+                (*args[0].map)["args"]=VMVal::make_list(rest);
+                (*args[0].map)["msg"]=VMVal::make_str(rest.size()==1?rest[0].to_string():std::string());
+                return VMVal::make_none();
+            }
+            if(!is_ctor_name(method) && class_reg_.count(obj.class_name))
+                throw_exception(make_exception("AttributeError",{VMVal::make_str(
+                    "type object '"+obj.class_name+"' has no attribute '"+method+"'")}));
         }
-        if(obj.type==VMType::STRING) return call_str_method(obj,method,args);
-        if(obj.type==VMType::LIST)   return call_list_method(obj,method,args);
+        // str/list/dict methods and natives take keywords as a trailing map
+        // marked "__kwargs__" (take_kwargs): L.sort(reverse=true),
+        // "{n}".format(n=1).
+        auto with_kw=[&]()->std::vector<VMVal>&{
+            if(kwargs && kwargs->type==VMType::MAP && kwargs->map && !kwargs->map->empty()){
+                args.push_back(*kwargs); args.back().class_name="__kwargs__";
+            }
+            return args;
+        };
+        if(obj.type==VMType::STRING) return call_str_method(obj,method,with_kw());
+        if(obj.type==VMType::LIST)   return call_list_method(obj,method,with_kw());
         if(obj.type==VMType::MAP){
             // A map member that is itself callable — a class or function held in
             // a namespace, as `import "m" as ns` produces — must be CALLED, not
@@ -4016,18 +4949,18 @@ private:
                     const VMVal& member=mit->second;
                     if(member.type==VMType::CLASS||member.type==VMType::FUNCTION
                        ||member.type==VMType::NATIVE)
-                        return vm_call(member,args,std::nullopt);
+                        return vm_call(member,args,std::nullopt,kwargs);
                 }
             }
-            return call_map_method(obj,method,args);
+            return call_map_method(obj,method,with_kw());
         }
         // CLASS type: support nested class instantiation via CALL_METHOD (e.g. Outer.Inner(v))
         if(obj.type==VMType::CLASS){
             VMVal nested = get_attr(obj, method);
-            if(nested.type == VMType::CLASS) return vm_call(nested, args, std::nullopt);
+            if(nested.type == VMType::CLASS) return vm_call(nested, args, std::nullopt, kwargs);
             // Static method call
             if(nested.type == VMType::FUNCTION && nested.code)
-                return exec_code(nested.code, args, VMVal::make_none());
+                return exec_code(nested.code, args, VMVal::make_none(), nullptr, nullptr, kwargs);
         }
         // A builtin used as a namespace: `import time` then time.time(),
         // time.sleep(1), time.monotonic() - the builtin time_X, else X.
@@ -4036,14 +4969,14 @@ private:
                 [&](const std::string& n){ return bridge_exists()&&bridge_exists()(n); });
             if(!target.empty()){
                 VMVal fn=load_var(target);
-                if(fn.type==VMType::NATIVE) return fn.native(args);
+                if(fn.type==VMType::NATIVE) return fn.native(with_kw());
             }
             return VMVal::make_none();
         }
         // Fallback: check globals
         auto git=globals_.find(method);
         if(git!=globals_.end()&&git->second.type==VMType::NATIVE)
-            return git->second.native(args);
+            return git->second.native(with_kw());
         return VMVal::make_none();
     }
 
@@ -4290,6 +5223,9 @@ private:
             if(!ast) return;
             Compiler c; auto code=c.compile(ast);
             bool old_exp=export_to_globals_; export_to_globals_=true;
+            int old_depth=export_depth_; export_depth_=(int)call_stack_.size()+1;
+            struct ExportRestore { VirtualMachine* vm; bool e; int d;
+                ~ExportRestore(){ vm->export_to_globals_=e; vm->export_depth_=d; } } _export_restore{this, old_exp, old_depth};
             // Snapshot the global names so the alias namespace can be built from
             // whatever the module adds, matching the interpreter.
             // The module's OWN top-level names, read from its AST. Diffing
@@ -4325,7 +5261,7 @@ private:
               catch(std::exception& e){ std::cerr<<"[VM import error] "<<filepath<<": "<<e.what()<<"\n"; }
             globals_["__name__"]=prev_name;
             globals_["__file__"]=prev_file;
-            export_to_globals_=old_exp;
+            export_to_globals_=old_exp; export_depth_=old_depth;
             if(!alias.empty()){
                 auto ns=std::make_shared<VMMap>();
                 for(const auto& n : own_names){
@@ -4594,20 +5530,20 @@ private:
             for(auto& x:v) r.push_back(VMVal::make_float(to_d(x)/rms));
             return VMVal::make_list(std::move(r));});
         // ── hasattr, ord, chr ────────────────────────────────────────────────
-        globals_["hasattr"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
+        // hasattr: the full attribute lookup (methods and class attributes
+        // too; only an instance's own fields were seen).
+        globals_["hasattr"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()<2) return VMVal::make_bool(false);
             std::string attr=a[1].to_string();
-            if((a[0].type==VMType::INSTANCE||a[0].type==VMType::MAP)&&a[0].map)
-                return VMVal::make_bool(a[0].map->count(attr)>0);
+            if(a[0].type==VMType::MAP) return VMVal::make_bool(a[0].map&&a[0].map->count(attr)>0);
+            if(a[0].type==VMType::INSTANCE||a[0].type==VMType::CLASS){
+                VMVal v; return VMVal::make_bool(try_get_attr(a[0],attr,v));
+            }
             return VMVal::make_bool(false);});
         globals_["repr"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.empty()) return VMVal::make_str("none");
-            if(a[0].type==VMType::INSTANCE){
-                VMVal res=call_dunder(a[0],"__repr__",{});
-                if(res.type!=VMType::NONE) return res;
-                res=call_dunder(a[0],"__str__",{});
-                if(res.type!=VMType::NONE) return res;
-            }
+            if(a[0].type==VMType::INSTANCE||a[0].type==VMType::LIST||a[0].type==VMType::MAP)
+                return VMVal::make_str(vm_repr(a[0]));
             // repr of a string must be quoted; returning to_string() here made
             // repr identical to str(), so repr("abc") gave abc, not "abc".
             if(a[0].type==VMType::STRING){
@@ -4622,6 +5558,11 @@ private:
         });
         globals_["getattr"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()<2) return a.size()>=3?a[2]:VMVal::make_none();
+            if(a[0].type==VMType::INSTANCE||a[0].type==VMType::CLASS){
+                VMVal v;
+                if(a.size()>=3) return try_get_attr(a[0],a[1].to_string(),v) ? v : a[2];
+                return get_attr(a[0],a[1].to_string(),true);
+            }
             VMVal result=get_attr(a[0],a[1].to_string());
             if(result.type==VMType::NONE&&a.size()>=3) return a[2];
             return result;
@@ -4633,6 +5574,11 @@ private:
         });
         globals_["getattr"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()<2) return a.size()>=3?a[2]:VMVal::make_none();
+            if(a[0].type==VMType::INSTANCE||a[0].type==VMType::CLASS){
+                VMVal v;
+                if(a.size()>=3) return try_get_attr(a[0],a[1].to_string(),v) ? v : a[2];
+                return get_attr(a[0],a[1].to_string(),true);
+            }
             VMVal result=get_attr(a[0],a[1].to_string());
             if(result.type==VMType::NONE&&a.size()>=3) return a[2]; // default
             return result;
@@ -4741,18 +5687,56 @@ private:
             return VMVal::make_list(std::move(r));});
         // ── any / all / map / filter / list / set ──────────────────────────
         // ── map / filter (call Nython functions) ────────────────────────
+        // next(it[, default]): an exhausted iterator raises StopIteration
+        // (or returns the default), as on the interpreter.
+        // iter(x): generators and iterators are their own; an object goes
+        // through __iter__ (or is its own iterator with __next__); a list,
+        // string or dict gives an iterator over its items. It was not defined,
+        // so `def __iter__(self): return iter(self.items)` iterated nothing.
+        globals_["iter"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.empty()) throw_exception(make_exception("TypeError",{VMVal::make_str("iter expected 1 argument, got 0")}));
+            const VMVal& v=a[0];
+            if(v.type==VMType::GENERATOR||v.type==VMType::ITERATOR) return v;
+            if(v.type==VMType::INSTANCE){
+                bool f=false;
+                VMVal r=call_dunder_f(v,"__iter__",{},f);
+                if(f) return r;
+                VMVal nx;
+                if(class_lookup(v.class_name,"__next__",nx)) return v;
+                return VMVal::make_iter(iter_items(v));
+            }
+            if(v.type==VMType::LIST||v.type==VMType::STRING||v.type==VMType::MAP)
+                return VMVal::make_iter(iter_items(v));
+            throw_exception(make_exception("TypeError",{VMVal::make_str("'"+std::string(v.type==VMType::INT?"int":v.type==VMType::FLOAT?"float":v.type==VMType::BOOL?"bool":v.type==VMType::NONE?"NoneType":"object")+"' object is not iterable")}));
+        });
+        // callable(x): functions, builtins, classes, and objects with __call__.
+        globals_["callable"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.empty()) return VMVal::make_bool(false);
+            const VMVal& v=a[0];
+            if(v.type==VMType::FUNCTION||v.type==VMType::NATIVE||v.type==VMType::CLASS) return VMVal::make_bool(true);
+            if(v.type==VMType::INSTANCE){ VMVal m; return VMVal::make_bool(class_lookup(v.class_name,"__call__",m)); }
+            return VMVal::make_bool(false);
+        });
         globals_["next"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.empty()) return VMVal::make_none();
-            if(a[0].type==VMType::GENERATOR) return gen_next(a[0]);
+            bool has_default=a.size()>=2;
+            auto exhausted=[&]()->VMVal{
+                if(has_default) return a[1];
+                throw_exception(make_exception("StopIteration",{}));
+            };
+            if(a[0].type==VMType::GENERATOR){
+                if(!a[0].gen||a[0].gen->done) return exhausted();
+                VMVal v=gen_next(a[0]);
+                if(a[0].gen->done) return exhausted();
+                return v;
+            }
             if(a[0].type==VMType::INSTANCE){
-                VMVal nv;
-                try { nv=call_dunder(a[0],"__next__",{}); }
-                catch(std::runtime_error&){ return VMVal::make_none(); }
-                return nv;
+                try { return call_dunder(a[0],"__next__",{}); }
+                catch(VMException& e){ if(is_stop_iteration(e.value)) return exhausted(); throw; }
             }
             if(a[0].type!=VMType::ITERATOR||!a[0].iter) return VMVal::make_none();
             auto&[cur,items]=*a[0].iter;
-            if(cur>=(int)items.size()) return VMVal::make_none();
+            if(cur>=(int)items.size()) return exhausted();
             return items[cur++];});
         globals_["map"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()<2||a[1].type!=VMType::LIST||!a[1].list) return VMVal::make_list();
@@ -5700,22 +6684,7 @@ private:
         globals_["str"]=globals_["string"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.empty()) return VMVal::make_str("");
             VMVal& v=a[0];
-            if(v.type==VMType::INSTANCE){
-                // Try __str__ first, then __repr__ as fallback
-                for(auto dname : {"__str__","__repr__"}){
-                    std::string cls=v.class_name;
-                    while(!cls.empty()){
-                        auto cit=class_reg_.find(cls);
-                        if(cit==class_reg_.end()) break;
-                        for(auto& sub:cit->second->sub_codes)
-                            if(sub->name==dname&&!sub->is_class){
-                                std::vector<VMVal> na; return exec_code(sub,na,v);
-                            }
-                        cls=cit->second->parent_class;
-                    }
-                }
-            }
-            return VMVal::make_str(v.to_string());
+            return VMVal::make_str(vm_str(v));
         });
         globals_["int"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             if(a.empty())return VMVal::make_int(0);
@@ -5759,18 +6728,12 @@ private:
         globals_["float"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             return a.empty()?VMVal::make_float(0.0):VMVal::make_float(to_d(a[0]));});
         globals_["bool"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
-            if(!a.empty()&&a[0].type==VMType::INSTANCE){
-                VMVal r=call_dunder(a[0],"__bool__",{});
-                if(r.type!=VMType::NONE) return VMVal::make_bool(r.is_truthy());
-                // no __bool__: check __len__
-                VMVal lr=call_dunder(a[0],"__len__",{});
-                if(lr.type!=VMType::NONE) return VMVal::make_bool(lr.i!=0||to_d(lr)!=0.0);
-            }
-            return VMVal::make_bool(!a.empty()&&a[0].is_truthy());});
+            return VMVal::make_bool(!a.empty()&&vm_truthy(a[0]));});
         globals_["len"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.empty())return VMVal::make_int(0);
             auto& v=a[0];
-            if(v.type==VMType::INSTANCE){VMVal res=call_dunder(v,"__len__",{});if(res.type!=VMType::NONE)return res;}
+            if(v.type==VMType::INSTANCE){bool f=false;VMVal res=call_dunder_f(v,"__len__",{},f);if(f)return res;
+                throw_exception(make_exception("TypeError",{VMVal::make_str("object of type '"+v.class_name+"' has no len()")}));}
             if(v.type==VMType::STRING)return VMVal::make_int((int64_t)u8_chars(v.s));
             if(v.type==VMType::LIST&&v.list)return VMVal::make_int((int64_t)v.list->size());
             if(v.type==VMType::MAP&&v.map)return VMVal::make_int((int64_t)v.map->size());
@@ -5945,6 +6908,14 @@ private:
         tag_type_builtins();
         globals_["isinstance"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()<2) return VMVal::make_bool(false);
+            if(a[1].type==VMType::LIST&&a[1].list){
+                // isinstance(x, (A, B)): any of them.
+                for(auto& c:*a[1].list){
+                    std::vector<VMVal> one{a[0], c};
+                    if(globals_["isinstance"].native(one).b) return VMVal::make_bool(true);
+                }
+                return VMVal::make_bool(false);
+            }
             VMVal& obj=a[0]; VMVal& cls=a[1];
             std::string cls_name;
             if(cls.type==VMType::CLASS) cls_name=cls.class_name;
@@ -5969,15 +6940,21 @@ private:
                 if(cls_name=="function") return VMVal::make_bool(obj.type==VMType::FUNCTION||obj.type==VMType::NATIVE);
                 return VMVal::make_bool(false);
             }
-            // Walk inheritance chain
-            std::string cur=obj.class_name;
-            while(!cur.empty()){
-                if(cur==cls_name) return VMVal::make_bool(true);
-                auto cit=class_reg_.find(cur);
-                if(cit==class_reg_.end()) break;
-                cur=cit->second->parent_class;
+            return VMVal::make_bool(class_derives(obj.class_name, cls_name));
+        });
+        // issubclass(B, A): B's MRO contains A (a tuple of classes: any).
+        globals_["issubclass"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.size()<2||a[0].type!=VMType::CLASS) return VMVal::make_bool(false);
+            auto one=[&](const VMVal& c){
+                if(c.type==VMType::CLASS) return class_derives(a[0].class_name, c.class_name);
+                if(c.type==VMType::STRING) return class_derives(a[0].class_name, c.s);
+                return false;
+            };
+            if(a[1].type==VMType::LIST&&a[1].list){
+                for(auto& c:*a[1].list) if(one(c)) return VMVal::make_bool(true);
+                return VMVal::make_bool(false);
             }
-            return VMVal::make_bool(false);
+            return VMVal::make_bool(one(a[1]));
         });
         globals_["hex"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             if(a.empty())return VMVal::make_str("0x0");
@@ -5994,26 +6971,21 @@ private:
         globals_["none"]=VMVal::make_none();
         globals_["true"]=VMVal::make_bool(true);
         // ── Built-in exception classes ────────────────────────────────────────
-        auto make_exc_class = [this](const std::string& cname) {
-            globals_[cname] = VMVal::make_native([cname](std::vector<VMVal>& a) -> VMVal {
-                auto attrs = std::make_shared<VMMap>();
-                std::string msg = a.empty() ? cname : a[0].to_string();
-                (*attrs)["msg"] = VMVal::make_str(msg);
-                (*attrs)["args"] = VMVal::make_list(a);
-                return VMVal::make_instance(cname, attrs);
-            });
-        };
-        for(auto& en : std::vector<std::string>{
-            "Exception","BaseException","ValueError","TypeError","ZeroDivisionError",
-            "KeyError","IndexError","AttributeError","RuntimeError","NameError",
-            "StopIteration","NotImplementedError","OverflowError","OSError","IOError",
-            "FileNotFoundError","PermissionError","TimeoutError","ConnectionError",
-            "ImportError","SyntaxError","AssertionError","ArithmeticError",
-            "IsADirectoryError","NotADirectoryError","FileExistsError","ChildProcessError",
-            "ProcessLookupError","InterruptedError","BlockingIOError","BrokenPipeError",
-            "ConnectionRefusedError","ConnectionResetError","LookupError","EOFError",
-            "ModuleNotFoundError","UnicodeError"
-        }) make_exc_class(en);
+        // Builtin exception classes are real classes - registered like a
+        // user class, with Python's hierarchy - so `class E(ValueError)`,
+        // `except LookupError`, isinstance(e, Exception) and super().__init__
+        // all work on them. They used to be natives returning an instance,
+        // unrelated to one another and impossible to subclass.
+        for(auto& en : nython::ny_builtin_exc_names()){
+            auto code=std::make_shared<VMCode>();
+            code->name=en; code->is_class=true;
+            const char* par=nython::ny_builtin_exc_parent(en);
+            if(par && *par){ code->parent_class=par; code->bases.push_back(par); }
+            code->instructions.emplace_back(Op::HALT);
+            class_reg_[en]=code;
+            globals_[en]=VMVal::make_class(code,en);
+            vm_exc_classes().insert(en);
+        }
         globals_["false"]=VMVal::make_bool(false);
         globals_["null"]=VMVal::make_none();
         globals_["PI"]  =VMVal::make_float(3.14159265358979323846);
@@ -6100,7 +7072,7 @@ private:
                 }
             }
             std::stable_sort(decorated.begin(),decorated.end(),
-                [rev](const std::pair<VMVal,VMVal>& x,const std::pair<VMVal,VMVal>& y){
+                [this,rev](const std::pair<VMVal,VMVal>& x,const std::pair<VMVal,VMVal>& y){
                     int c2=cmp_val(x.first,y.first);
                     return rev?c2>0:c2<0;
                 });
@@ -6185,12 +7157,15 @@ private:
             if(raw) return VMVal::make_int((int64_t)(raw & 0x7fffffffffffffffULL));
             uint64_t h=std::hash<std::string>{}(v.to_string()+"|"+std::to_string((int)v.type));
             return VMVal::make_int((int64_t)(h & 0x7fffffffffffffffULL));});
-        // As the interpreter's (pycore.cpp B_HASH): nypy::hash_of_key.
+        // As the interpreter's (pycore.cpp B_HASH): nypy::hash_of_key; an
+        // object's __hash__, else its identity.
         globals_["hash"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.empty()) raise_native_exception("TypeError","hash() takes exactly one argument (0 given)");
             if(a[0].type==VMType::INSTANCE){
-                VMVal h=call_dunder(a[0],"__hash__",{});
-                if(h.type!=VMType::NONE) return h;
+                bool f=false; VMVal r=call_dunder_f(a[0],"__hash__",{},f);
+                if(f) return r;
+                uintptr_t raw=a[0].map?(uintptr_t)a[0].map.get():0;
+                return VMVal::make_int((int64_t)(raw>>4));
             }
             return VMVal::make_int(nypy::hash_of_key(vkey(a[0])));});
         globals_["random"]=VMVal::make_native([](std::vector<VMVal>&)->VMVal{return VMVal::make_float((double)rand()/(double)RAND_MAX);});
@@ -6407,6 +7382,7 @@ private:
         case Op::BINARY_DIV:   return "BINARY_DIV";
         case Op::BINARY_MOD:   return "BINARY_MOD";
         case Op::BINARY_POW:   return "BINARY_POW";
+        case Op::BINARY_MATMUL:return "BINARY_MATMUL";
         case Op::BINARY_FLOOR_DIV: return "BINARY_FLOOR_DIV";
         case Op::BINARY_AND:   return "BINARY_AND";
         case Op::BINARY_OR:    return "BINARY_OR";
@@ -6439,6 +7415,7 @@ private:
         case Op::CALL_FUNCTION:return "CALL_FUNCTION";
         case Op::CALL_METHOD:  return "CALL_METHOD";
         case Op::CALL_EX:      return "CALL_EX";
+        case Op::MAP_MERGE:    return "MAP_MERGE";
         case Op::LIST_EXTEND:  return "LIST_EXTEND";
         case Op::LIST_APPEND:  return "LIST_APPEND";
         case Op::LOAD_SUPER:   return "LOAD_SUPER";
@@ -6456,6 +7433,12 @@ private:
         case Op::RAISE_ERROR:  return "RAISE_ERROR";
         case Op::SETUP_EXCEPT: return "SETUP_EXCEPT";
         case Op::END_EXCEPT:   return "END_EXCEPT";
+        case Op::FIN_NORMAL:   return "FIN_NORMAL";
+        case Op::FIN_RETURN:   return "FIN_RETURN";
+        case Op::FIN_JUMP:     return "FIN_JUMP";
+        case Op::END_FINALLY:  return "END_FINALLY";
+        case Op::WITH_ENTER:   return "WITH_ENTER";
+        case Op::WITH_EXIT:    return "WITH_EXIT";
         default:               return "???";
         }
     }

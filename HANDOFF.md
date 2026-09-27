@@ -9,7 +9,8 @@ non-throwing control flow on both engines; the build system) and **§0f**
 (the OS layer: files, paths, processes, environment and time, with one
 implementation for both engines) **§0g** (threads, synchronisation and
 async on both engines) **§0h** (nytorch: one native tensor engine for
-both engines, real models) and **§0i** (Python values and builtins on both
+both engines, real models) **§0i** (Python values and builtins on both
+engines) and **§0j** (exceptions, classes, scope and syntax on both
 engines). §0d is
 round 73 (the IDE to VS Code's model, verified by driving it). Earlier
 rounds: §0/§0b language-level work, §5.3 terminal command line / undo /
@@ -221,6 +222,92 @@ e2e scenarios added: `build`, `cbedit`, `cbtools`, `cbdebug`, `responsive`,
 
 ---
 
+## 0j. Round 74 — the language engines: exceptions, classes, scope, syntax
+
+Merged from `round74-lang1`, on top of §0i. After this merge the sweep
+has 0 not-ok runs on either engine, for the first time: the long-standing
+VM failures of `vm_audit23`/`25` (`@property`) are fixed. New tests:
+`vm_audit52` (exceptions), `vm_audit53` (classes) and `vm_audit54`
+(comprehensions, patterns, calls).
+
+A divergence battery of 286 programs is compared on the interpreter, the
+VM and `python3`:
+
+| Build | All three agree | Interpreter ≠ Python | VM ≠ Python | Interpreter ≠ VM |
+|---|---|---|---|---|
+| f284623 | 87 | 165 | 171 | 119 |
+| before this branch | 179 | 79 | 89 | 66 |
+| after | 262 | 23 | 17 | 9 |
+
+- **Exceptions are objects.**
+  - Builtin exceptions are real classes.
+  - Typed `except` catches exceptions from called functions and runtime
+    errors on both engines. The VM lost the exception object whenever it
+    unwound a frame.
+  - An unmatched `except` passes the error on after `finally`, and
+    `finally` runs when an `except` body raises. A bare `raise` re-raises.
+  - `with` gives `__exit__` the exception, and a true return from
+    `__exit__` suppresses it.
+  - `assert` raises AssertionError. `str(e)` is the message.
+  - The four PENDING checks in `vm_audit46` are now real, passing checks.
+- **Silent errors now raise.**
+  - NameError for undefined names.
+  - AttributeError for calling a missing method.
+  - TypeError when a call does not fit its parameters: too few or too many
+    arguments, an unexpected keyword, or multiple values for one parameter.
+  - Library calls that were silently wrong were fixed: `EventBus.off`,
+    `get_history`, `save_model`, `add_noise`, and two `__exit__`
+    signatures.
+- **Classes.**
+  - C3 MRO over every base; `super()` walks it, forwards keyword arguments
+    and passes through a class without `__init__`.
+  - On the VM, class bodies run: class attributes, decorators,
+    `@property` with setter, `@staticmethod` and `@classmethod`.
+  - Defaults are evaluated at definition, including lambda defaults,
+    method defaults such as `-1` and `[]`, and `f(**d)`.
+  - The operator and object protocols: `__eq__`, including inside
+    containers, `in`, `index`, `count` and `remove`; `__iter__`;
+    reflected and unary operators; `__mro__` and `__bases__`.
+  - The interpreter segfault on `class E(Exception)` is fixed.
+- **Scope.**
+  - The VM resolves names lexically; it used to search every frame on the
+    stack.
+  - Comprehensions have their own scope, and loop variables no longer leak
+    to globals.
+  - VM imports export only the module's own names.
+  - `x is Name` is decided at run time.
+- **Syntax.**
+  - `match` with `|`, guards, sequence, star, mapping, class and `as`
+    patterns. Each case is evaluated once, and values are no longer
+    compared as strings.
+  - Walrus in `if` and `while`. `while (a) < 3` parses.
+  - Raw strings, general decorators, starred and nested unpacking.
+  - Several `for`/`if` clauses in one comprehension, including over
+    strings, dicts and generators.
+  - The `@` operator.
+  - The VM `switch` default runs, and the stray walrus debug output is
+    gone.
+- **Speed.** A benchmark of 200k calls, 100k method calls and fib(22):
+  interpreter 1.35 → 0.85 s; VM 0.53 → 0.52 s. Removing five hot-path costs
+  that the arity and NameError checks had added kept the VM from being
+  15–20% slower.
+- **Not done.**
+  - Interpreter generators are still eager: an infinite generator hangs,
+    and `send()` behaves like `next()`. The VM does both correctly.
+  - Interpreter lambdas bind loop variables by value.
+  - Reading a missing attribute still gives `none`, because `lib/gui.ny`
+    relies on it (`kStrictAttributeReads`).
+  - Reading a name after `del x` gives `undefined` or `none`, not
+    NameError.
+  - Unpacking with the wrong count raises no ValueError.
+  - There is no `object` builtin.
+  - Assigning to a global inside a function needs no `global` (to be
+    ruled on).
+  - Exception names are listed in both `NyExcTypes.hpp` and
+    `NyRuntime.hpp`.
+
+---
+
 ## 0i. Round 74 — Python values and builtins on both engines
 
 Merged from `round74-lang2`.
@@ -275,14 +362,9 @@ Merged from `round74-lang2`.
   the other's git repository (fixed on merge).
 - **Speed.** Interpreter: list −52%, map −44%, call −24%. The VM is +1–6%,
   from the ordered map in frame locals.
-- **Not done.** Still open on the VM:
-  - `@property` (vm_audit25 now stops at a TypeError instead of failing
-    quietly)
-  - name resolution (`var n = self.ws.rows[i]` reads 1 in test_12)
-  - `except X as e` at top level
-
-  These belong to the other language branch (§0e language work, merged
-  next).
+- **Not done.** The VM gaps listed here when this was merged were
+  `@property`, name resolution and top-level `except X as e`. §0j fixed
+  all of them.
 
 ---
 

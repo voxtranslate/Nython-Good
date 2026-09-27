@@ -361,6 +361,18 @@ Value dispatch_tensor(NythonExecutor& E,
             return makeStringValue(line);
         }
         if (name == "isinstance") {
+            // isinstance(x, (A, B)): any of them.
+            if (args.size() >= 2 && args[1].isCollectable() && args[1].value.gc) {
+                auto* tc = dynamic_cast<Container*>(args[1].value.gc);
+                if (tc && tc->container && tc->container->count("__len__")) {
+                    for (auto& t : E.listItems(args[1])) {
+                        std::vector<Value> one{args[0], t};
+                        Value r = callBuiltin("isinstance", one, ctx);
+                        if (r.type == ValueType::BOOLEAN && r.value.b) return Value(true);
+                    }
+                    return Value(false);
+                }
+            }
             if (args.size() >= 2) {
                 // Extract type name: handle builtin funcs (int, str, float...) and class objects
                 std::string type_name;
@@ -428,7 +440,13 @@ Value dispatch_tensor(NythonExecutor& E,
                 }
                 if (type_name == "none") return Value(args[0].type == ValueType::NONE);
                 if (type_name == "function") return Value(args[0].type == ValueType::USERDATA && args[0].value.p && !E.string_ptrs_.count(args[0].value.p) && func_names.count(args[0].value.p));
-                // Check class instances (user-defined classes) — type_name is the class name
+                // Check class instances (user-defined classes) — type_name is the class name.
+                // Every base counts, and a builtin exception base too
+                // (isinstance(e, Exception) for class E(Exception)).
+                if (E.isInstanceValue(args[0])) {
+                    std::string icn = E.instanceClassName(args[0]);
+                    if (!icn.empty() && E.classDerivesFrom(icn, type_name)) return Value(true);
+                }
                 if (args[0].type == ValueType::USERDATA && args[0].value.p && !E.string_ptrs_.count(args[0].value.p)) {
                     auto cit2 = instance_to_class.find(args[0].value.p);
                     if (cit2 != instance_to_class.end()) {

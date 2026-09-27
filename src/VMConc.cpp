@@ -113,6 +113,12 @@ struct VMConcEngine : nyconc::Engine {
         for (auto& a : args) av.push_back(unbox(a));
         try { return box(vm.vm_call(f, av, std::nullopt)); }
         catch (nyconc::NyError&) { throw; }
+        catch (VMException& x) {
+            // The VM's own exceptions carry their object.
+            nyconc::NyError e; e.raw = x.what(); e.obj = box(x.value);
+            vm.last_exception_obj_ = VMVal::make_none();
+            throw e;
+        }
         catch (std::runtime_error& x) {
             nyconc::NyError e; e.raw = x.what();
             if (vm.last_exception_obj_.type == VMType::INSTANCE) e.obj = box(vm.last_exception_obj_);
@@ -223,6 +229,10 @@ void VMConc::install(VirtualMachine& vm) {
     }
     for (const auto& en : nyconc::exception_names()) {
         std::string cname = en;
+        // Already a real exception class of the VM (NyExcTypes.hpp): keep it,
+        // so it can be subclassed and used with isinstance.
+        auto cur = vm.globals_.find(cname);
+        if (cur != vm.globals_.end() && cur->second.type == VMType::CLASS) continue;
         vm.globals_[cname] = VMVal::make_native([cname](std::vector<VMVal>& a) -> VMVal {
             std::string msg = a.empty() ? cname : a[0].to_string();
             return exception_instance(cname, msg);

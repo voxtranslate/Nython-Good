@@ -278,6 +278,9 @@ These were aligned to match how the IDE calls them:
 | vm_audit51 | 52 | native editor text services (symbols, syntax check, diff, search, folding, format, completion index) |
 | vm_audit60 | 284 | Python values and builtins: dicts, ints, formatting, operators, tuples, strings (same results under python3) |
 | vm_audit61 | 33 | Nython-only value behaviour |
+| vm_audit52 | — | exceptions as objects: typed except across calls, finally/raise, with protocol, NameError/AttributeError/TypeError |
+| vm_audit53 | — | classes: C3 MRO, super(), class bodies, properties, the operator and object protocols |
+| vm_audit54 | — | comprehensions, match patterns, walrus, unpacking, generators, calls (`**d`, arity) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `for t in examples/test_*.ny examples/vm_audit*.ny; do ./build/nython-cli "$t"; done`
@@ -342,17 +345,26 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
   the biggest *avoidable* sources: string literals, one-byte strings and the
   per-method-call parent-class name are now made once and shared (a loop
   with two literals: 48 MB → 10 MB at 200k iterations).
-- The VM has no tuple type: `print((1, 2))` shows `[1, 2]` there.
-- `len()` counts characters but `s[i]` / `s[a:b]` index bytes.
-- `1.+(2, 3)` parses but evaluates to `none` — primitives have no members.
+- ~~The VM has no tuple type~~ — **resolved (round 74)**: real tuples on both engines.
+- ~~`len()` counts characters but `s[i]` / `s[a:b]` index bytes~~ — **resolved
+  (round 74)**: indexing, slicing and `len` all count UTF-8 characters.
+- ~~`1.+(2, 3)` evaluates to `none`~~ — **resolved (round 74)**: operators as members.
 - ~~Integer `/` differs between engines~~ — **resolved (round 71)**: `/` is
   always true division (float), `//`/`\` are floor division (int) on both
   engines. See "Round 71 fixes" below.
-- `generator.send()` not implemented (eager-collection architecture).
+- **Interpreter generators are still eager** (the whole sequence is collected
+  first): an infinite generator hangs there, and `send()` on the interpreter
+  behaves like `next()`. The VM's generators are lazy, with `send`/`close`.
 - Video builtins are stubs (need ffmpeg).
-- `@property` as decorator syntax on a class method doesn't work on the VM
-  (the explicit `x = property(getter)` form does) — see HANDOFF 5.9.
-  Interpreter-only-correct, not yet ported.
+- ~~`@property` doesn't work on the VM~~ — **resolved (round 74)**: VM class
+  bodies run (properties with setters, static/class methods, decorators).
+- Reading a missing attribute gives `none`, not AttributeError
+  (`lib/gui.ny` relies on it); *calling* a missing method raises
+  AttributeError. Reading a missing dict key gives `none` too.
+- A plain `x = ...` inside a function rebinds an existing global of that
+  name (no `global` needed) — a design choice still to be ruled on.
+- Interpreter lambdas capture loop variables by value
+  (`[lambda: i for i in range(3)]` gives 0, 1, 2; Python gives 2, 2, 2).
 
 ## Session Workflow
 
@@ -648,6 +660,27 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
 - VM natives receive keyword arguments as a trailing map marked
   `class_name "__kwargs__"` (`take_kwargs()`); OS builtins read the same
   map with `nyos::Args`.
+
+## Round 74: the language engines (see `HANDOFF.md` §0j)
+
+- **Exceptions are objects on both engines**: builtin exceptions are real
+  classes (`ZeroDivisionError` is an `ArithmeticError`); typed `except`
+  catches errors raised in called functions and by the runtime; an
+  unmatched `except` passes the error on after `finally`; `with` passes
+  `(type, value, tb)` to `__exit__` and a true return suppresses.
+- **Errors that used to be silent**: undefined names raise NameError;
+  calling a missing method raises AttributeError; a call that does not fit
+  the parameters raises TypeError (Python's messages).
+- **Classes**: C3 MRO over every base, `super()`, class bodies on the VM
+  (`@property`/setter, `@staticmethod`/`@classmethod`), defaults evaluated at
+  definition, the operator/object protocols (`__eq__` in containers,
+  `__iter__`, `__radd__`, …), `__mro__`/`__bases__`.
+- **VM name resolution is lexical** (it used to search every frame).
+- **Syntax**: match patterns (`|`, guards, sequence/mapping/class/`as`),
+  walrus in `if`/`while`, raw strings, general decorators, starred and
+  nested unpacking, several `for`/`if` clauses in comprehensions, `@`.
+- Divergence battery (286 programs, interpreter / VM / python3 all agree):
+  87 at f284623 → 262 now.
 
 ## Transcripts
 

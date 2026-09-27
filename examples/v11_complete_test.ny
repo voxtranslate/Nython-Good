@@ -71,7 +71,7 @@ class Ctx:
     def __enter__(self):
         self.state = "entered"
         return self
-    def __exit__(self):
+    def __exit__(self, exc_type=none, exc_value=none, tb=none):
         self.state = "exited"
 var ctx = Ctx()
 with ctx as c:

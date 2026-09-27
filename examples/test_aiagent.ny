@@ -69,7 +69,7 @@ assert_true("line count", lines_found > 0)
 section("CodeGenerator")
 var gen = CodeGenerator()
 assert_eq("type", type(gen), "CodeGenerator")
-var template = gen.class_template("Animal", "name, sound")
+var template = gen.class_template("Animal", ["name", "sound"], [])
 assert_true("has class", string_contains(template, "class Animal"))
 
 section("DocumentLearner")
@@ -80,7 +80,7 @@ print "  DocumentLearner OK"
 
 section("OnlineLearner")
 var ol = OnlineLearner(kb)
-ol.learn_from_conversation("user", "I love Nython!")
+ol.learn_from_conversation("user", "I love Nython!", 0.6)
 passed = passed + 1
 print "  OnlineLearner OK"
 

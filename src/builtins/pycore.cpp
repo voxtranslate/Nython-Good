@@ -121,7 +121,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             }
             return intValue(E.dictSize(c));
         }
-        if (E.isInstanceVal(v)) {
+        if (E.isInstanceVal(v) && E.instanceHasMethod(v, "__len__")) {
             std::vector<Value> no;
             Value r = E.callMethod(v, "__len__", no, ctx);
             if (r.type != ValueType::NONE) return r;
@@ -192,7 +192,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
                 E.pyRaise("ValueError", "invalid literal for int() with base 10: " + nypy::str_repr(s));
             return intValue(out);
         }
-        if (E.isInstanceVal(v)) {
+        if (E.isInstanceVal(v) && E.instanceHasMethod(v, "__int__")) {
             std::vector<Value> no;
             Value r = E.callMethod(v, "__int__", no, ctx);
             if (r.type != ValueType::NONE) return r;
@@ -210,7 +210,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             if (!nypy::parse_float_str(s, d)) E.pyRaise("ValueError", "could not convert string to float: " + nypy::str_repr(s));
             return Value(d);
         }
-        if (E.isInstanceVal(v)) {
+        if (E.isInstanceVal(v) && E.instanceHasMethod(v, "__float__")) {
             std::vector<Value> no;
             Value r = E.callMethod(v, "__float__", no, ctx);
             if (r.type != ValueType::NONE) return r;
@@ -228,7 +228,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             nypy::BigInt b = NythonExecutor::numBig(n); b.neg = false;
             return intValue(b);
         }
-        if (E.isInstanceVal(args[0])) {
+        if (E.isInstanceVal(args[0]) && E.instanceHasMethod(args[0], "__abs__")) {
             std::vector<Value> no;
             Value r = E.callMethod(args[0], "__abs__", no, ctx);
             if (r.type != ValueType::NONE) return r;
@@ -239,7 +239,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         need(1, "round()");
         NythonExecutor::Num n;
         if (!NythonExecutor::asNum(args[0], n)) {
-            if (E.isInstanceVal(args[0])) {
+            if (E.isInstanceVal(args[0]) && E.instanceHasMethod(args[0], "__round__")) {
                 std::vector<Value> a;
                 if (const Value* nd = arg(1, "ndigits")) a.push_back(*nd);
                 Value r = E.callMethod(args[0], "__round__", a, ctx);
@@ -380,7 +380,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
     }
     case B_REVERSED: {
         need(1, "reversed()");
-        if (E.isInstanceVal(args[0])) {
+        if (E.isInstanceVal(args[0]) && E.instanceHasMethod(args[0], "__reversed__")) {
             std::vector<Value> no;
             Value r = E.callMethod(args[0], "__reversed__", no, ctx);
             if (r.type != ValueType::NONE) return r;

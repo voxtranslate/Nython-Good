@@ -727,8 +727,22 @@ class EventBus:
             if handler != none:
                 self.handlers[key](data)
             i = i + 1
-    def off(self, event):
-        self.handler_counts[event] = 0
+    # off(event) drops every handler of the event; off(event, handler)
+    # only that one (the test called it that way, and the handler argument
+    # was silently dropped).
+    def off(self, event, handler_name=none):
+        if handler_name == none:
+            self.handler_counts[event] = 0
+            return
+        var count = self.handler_counts[event]
+        if count == none:
+            return
+        var i = 0
+        while i < count:
+            var key = event + "_" + str(i)
+            if self.handlers[key] == handler_name:
+                self.handlers[key] = none
+            i = i + 1
 
 # ─── Observable ──────────────────────────────────────────────────────────────
 

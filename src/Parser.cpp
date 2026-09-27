@@ -1,6 +1,9 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-but-set-variable"
 #include "Parser.hpp"
+#include <functional>
+#include <set>
+#include "NyExcTypes.hpp"
 #include "SourceCode.hpp"
 #include "Except.hpp"
 #include "Script.hpp"
@@ -107,6 +110,15 @@ bool Parser::isCompoundStatement(){
 }
 
 bool Parser::isImportStatement(){ return see(TokenType::From)||see(TokenType::Import); }
+
+static bool isAugAssignType(TokenType t){
+    return t==TokenType::AddAssign||t==TokenType::SubAssign||t==TokenType::MulAssign
+        ||t==TokenType::DivAssign||t==TokenType::AndAssign||t==TokenType::OrAssign
+        ||t==TokenType::XorAssign||t==TokenType::BinAndAssign||t==TokenType::BinOrAssign
+        ||t==TokenType::BinXorAssign||t==TokenType::ModAssign||t==TokenType::RevDivAssign
+        ||t==TokenType::ExpAssign||t==TokenType::ShiftLeftAssign||t==TokenType::ShiftRightAssign
+        ||t==TokenType::ShiftAssign||t==TokenType::ComplementAssign;
+}
 
 bool Parser::isAugAssign(){
     return see(TokenType::AddAssign)||see(TokenType::SubAssign)||see(TokenType::MulAssign)
@@ -261,7 +273,15 @@ node_ptr Parser::statement(){
     if(see(TokenType::Repeat)) return repeatStmt();
 
     // Definitions
-    // Decorator: @name before def/class
+    // Decorator: @expr before def/class, where expr is a name, a dotted
+    // name (@prop.setter, @mod.deco) or either called (@deco(args)).
+    //   @D
+    //   def f(...): ...
+    // becomes
+    //   __decN__ = D          (evaluated first, as in Python: for
+    //                          @x.setter, x must still be the property)
+    //   def f(...): ...
+    //   f = __decN__(f)
     if(have(TokenType::At)) {
         Token dec_tok = token();
         // Allow keywords as decorator names (e.g. @repeat)
@@ -272,13 +292,21 @@ node_ptr Parser::statement(){
             decorator_name = token().value;
             next();
         }
+        Token call_tok = dec_tok; call_tok.value = decorator_name;
+        node_ptr dec_expr = make_node<VariableNode>(call_tok);
+        while(see(TokenType::Dot)) {
+            next();
+            Token at = token();
+            std::string an = at.value;
+            next();
+            dec_expr = make_node<AttributeNode>(at, dec_expr, an);
+        }
         // Optional (args) after decorator: @decorator(arg1, arg2)
-        std::vector<node_ptr> dec_args;
-        bool has_dec_args = false;
         if(have(TokenType::ParenOpen)) {
-            has_dec_args = true;
-            dec_args = argList();
+            auto factory_call = make_node<CallNode>(call_tok, dec_expr);
+            for(auto& a : argList()) factory_call->add(a);
             mustBe(TokenType::ParenClose);
+            dec_expr = factory_call;
         }
         have(TokenType::NewLine);
         // Parse the decorated function or class
@@ -304,25 +332,15 @@ node_ptr Parser::statement(){
             }
         }
         if(!target_name.empty()) {
+            static int dec_counter = 0;
+            std::string tmp = "__dec" + std::to_string(dec_counter++) + "__";
             auto block = make_node<BlockNode>(dec_tok);
+            Token tmp_tok = dec_tok; tmp_tok.value = tmp;
+            block->add(make_node<AssignmentNode>(dec_tok, make_node<VariableNode>(tmp_tok), dec_expr));
             block->add(target);
-            Token call_tok = dec_tok; call_tok.value = decorator_name;
-            auto dec_var = make_node<VariableNode>(call_tok);
             Token tgt_tok = dec_tok; tgt_tok.value = target_name;
-            node_ptr final_call;
-            if(has_dec_args) {
-                // @decorator(args) -> target = decorator(args)(target)
-                // Step 1: call decorator(args)
-                auto factory_call = make_node<CallNode>(call_tok, dec_var);
-                for(auto& a : dec_args) factory_call->add(a);
-                // Step 2: call result(target)
-                final_call = make_node<CallNode>(call_tok, factory_call);
-                final_call->add(make_node<VariableNode>(tgt_tok));
-            } else {
-                // @decorator -> target = decorator(target)
-                final_call = make_node<CallNode>(call_tok, dec_var);
-                final_call->add(make_node<VariableNode>(tgt_tok));
-            }
+            auto final_call = make_node<CallNode>(tmp_tok, make_node<VariableNode>(tmp_tok));
+            final_call->add(make_node<VariableNode>(tgt_tok));
             auto assign_target = make_node<VariableNode>(tgt_tok);
             block->add(make_node<AssignmentNode>(dec_tok, assign_target, final_call));
             return block;
@@ -381,11 +399,16 @@ node_ptr Parser::statement(){
     if(see(TokenType::NameSpace)) return namespaceDecl();
 
     // Flow statements
-    if(see(TokenType::Global)) {
-        next(); // consume 'global'
-        // global x, y, z - just consume identifiers
-        identifier();
-        while(have(TokenType::Comma)) identifier();
+    // global x, y / nonlocal x, y. Assignment already rebinds an existing
+    // variable; the declaration matters for a `for` loop variable, which is
+    // otherwise a new local.
+    if(see(TokenType::Global) || (see(TokenType::Identifier) && token().value == "nonlocal"
+                                  && peek(1).type() == TokenType::Identifier)) {
+        next(); // consume 'global' / 'nonlocal'
+        do {
+            std::string n = identifier();
+            if(!outer_decls_.empty()) outer_decls_.back().push_back(n);
+        } while(have(TokenType::Comma));
         have(TokenType::SemiColon); have(TokenType::NewLine);
         return make_node<BlockNode>(token()); // no-op
     }
@@ -497,61 +520,89 @@ node_ptr Parser::statement(){
     // Block
     if(see(TokenType::BraceOpen)) return block();
 
-    // Multi-target assignment: a, b = expr, expr (only at statement level)
-    // Use peek() lookahead to detect pattern: ident , ident [, ident]* =
-    if(see(TokenType::Identifier)) {
-        bool is_multi_assign = false;
-        int look = 1;
-        // Check pattern: ident (, ident)+ =
-        while(peek(look).ident.id() == TokenType::Comma && 
-              peek(look+1).ident.id() == TokenType::Identifier) {
-            look += 2;
-        }
-        if(look > 1 && peek(look).ident.id() == TokenType::Assign) {
-            is_multi_assign = true;
-        }
-        if(is_multi_assign) {
-            // Parse targets
-            std::vector<node_ptr> targets;
-            targets.push_back(make_node<VariableNode>(token()));
-            next();
-            while(have(TokenType::Comma)) {
-                targets.push_back(make_node<VariableNode>(token()));
-                next();
+    // Multi-target assignment at statement level:
+    //   a, b = b, a        x.y, z[0] = f()        a, *rest = seq
+    //   (a, b), c = (1, 2), 3
+    // Found by scanning for a comma before the `=` outside any brackets.
+    if(see(TokenType::Identifier) || see(TokenType::Mul) || see(TokenType::ParenOpen) || see(TokenType::BracketOpen)) {
+        bool multi = false;
+        {
+            int depth = 0; bool comma = false;
+            for(int k = 0; k < 4096; k++) {
+                Token t;
+                try { t = peek(k); } catch(...) { break; }
+                auto tt = t.type();
+                if(tt == TokenType::End || ((tt == TokenType::NewLine || tt == TokenType::SemiColon
+                   || tt == TokenType::Indent || tt == TokenType::Dedent) && depth == 0)) break;
+                if(tt == TokenType::ParenOpen || tt == TokenType::BracketOpen || tt == TokenType::BraceOpen) { depth++; continue; }
+                if(tt == TokenType::ParenClose || tt == TokenType::BracketClose || tt == TokenType::BraceClose) { if(--depth < 0) break; continue; }
+                if(depth != 0) continue;
+                if(tt == TokenType::Lambda || tt == TokenType::Colon) break;
+                if(tt == TokenType::Comma) { comma = true; continue; }
+                if(tt == TokenType::Assign) { multi = comma && t.value == "="; break; }
+                if(isAugAssignType(tt)) break;
             }
+        }
+        if(multi) {
             Token op = token();
+            std::vector<node_ptr> targets;
+            int star = -1;
+            do {
+                if(see(TokenType::Assign)) break;
+                if(have(TokenType::Mul)) { star = (int)targets.size(); targets.push_back(postfix()); }
+                else targets.push_back(postfix());
+            } while(have(TokenType::Comma));
+            op = token();
             mustBe(TokenType::Assign);
-            // Parse RHS values
             std::vector<node_ptr> vals;
             vals.push_back(ternary());
-            while(have(TokenType::Comma)) vals.push_back(ternary());
-            // Generate swap-safe assignments via temps
+            while(have(TokenType::Comma)) { if(see(TokenType::NewLine) || see(TokenType::SemiColon)) break; vals.push_back(ternary()); }
+            have(TokenType::SemiColon); have(TokenType::NewLine);
             auto block = make_node<BlockNode>(op);
-            if (vals.size() == 1 && targets.size() > 1) {
-                // Single RHS value with multiple targets -> list unpacking
-                // Evaluate the single value, then subscript it for each target
-                std::string tmp = "__unpack_src__";
-                block->add(make_node<VarDeclNode>(op, tmp, vals[0], false, false));
-                for(size_t i = 0; i < targets.size(); i++) {
-                    Token tmp_tok = op; tmp_tok.value = tmp;
-                    auto tmp_var = make_node<VariableNode>(tmp_tok);
-                    Token idx_tok = op; idx_tok.value = std::to_string(i);
-                    auto idx_node = make_node<IntegerNode>(idx_tok);
-                    auto subscript = make_node<SubscriptNode>(op, tmp_var, idx_node);
-                    block->add(make_node<AssignmentNode>(op, targets[i], subscript));
+            static int unpack_counter = 0;
+            auto tmp_name = [&]() { return "__unpack" + std::to_string(unpack_counter++) + "__"; };
+            auto var_ref = [&](const std::string& n) { Token t = op; t.value = n; return make_node<VariableNode>(t); };
+            auto int_node = [&](long v) { Token t = op; t.value = std::to_string(v); t.type(TokenType::Integer); return make_node<IntegerNode>(t); };
+            std::function<void(const std::vector<node_ptr>&, int, const std::string&)> unpack;
+            std::function<void(node_ptr, node_ptr)> assign_to = [&](node_ptr t, node_ptr value) {
+                if(t->type() == NodeType::TUPLE || t->type() == NodeType::LIST) {
+                    std::string tn = tmp_name();
+                    block->add(make_node<VarDeclNode>(op, tn, value, false, false));
+                    std::vector<node_ptr> inner; int istar = -1;
+                    for(auto& e : t->statements()) {
+                        if(e->type() == NodeType::UNARY && e->value() == "*") {
+                            istar = (int)inner.size();
+                            inner.push_back(static_cast<UnaryNode*>(e.get())->operand);
+                        } else inner.push_back(e);
+                    }
+                    unpack(inner, istar, tn);
+                    return;
                 }
-            } else {
-                for(size_t i = 0; i < vals.size(); i++) {
-                    std::string tmp = "__swap_tmp_" + std::to_string(i) + "__";
-                    block->add(make_node<VarDeclNode>(op, tmp, vals[i], false, false));
-                }
-                for(size_t i = 0; i < targets.size() && i < vals.size(); i++) {
-                    std::string tmp = "__swap_tmp_" + std::to_string(i) + "__";
-                    Token tmp_tok = op; tmp_tok.value = tmp;
-                    auto tmp_var = make_node<VariableNode>(tmp_tok);
-                    block->add(make_node<AssignmentNode>(op, targets[i], tmp_var));
-                }
+                block->add(make_node<AssignmentNode>(op, t, value));
+            };
+            unpack = [&](const std::vector<node_ptr>& ts, int si, const std::string& src) {
+                int n = (int)ts.size();
+                int n_before = si < 0 ? n : si;
+                for(int i = 0; i < n_before; i++)
+                    assign_to(ts[i], make_node<SubscriptNode>(op, var_ref(src), int_node(i)));
+                if(si < 0) return;
+                int n_after = n - si - 1;
+                auto sl = make_node<CallNode>(op, make_node<AttributeNode>(op, var_ref(src), "slice"));
+                sl->add(int_node(si));
+                if(n_after > 0) sl->add(int_node(-n_after));
+                assign_to(ts[si], sl);
+                for(int j = 0; j < n_after; j++)
+                    assign_to(ts[si + 1 + j], make_node<SubscriptNode>(op, var_ref(src), int_node(-(n_after - j))));
+            };
+            std::string src = tmp_name();
+            if(vals.size() == 1) block->add(make_node<VarDeclNode>(op, src, vals[0], false, false));
+            else {
+                // Several values: evaluated first, all of them (a, b = b, a).
+                auto lst = make_node<ListNode>(op);
+                for(auto& v : vals) lst->add(v);
+                block->add(make_node<VarDeclNode>(op, src, lst, false, false));
             }
+            unpack(targets, star, src);
             return block;
         }
     }
@@ -576,6 +627,15 @@ node_ptr Parser::expression(){
 
 node_ptr Parser::assignment(){
     node_ptr left = ternary();
+    // name := value (the lexer gives := the Assign token type with value
+    // ":="): an expression that binds and yields the value. It used to parse
+    // as a plain assignment, which is a statement - `if (n := len(L)) > 2`
+    // compared against a leftover stack value on the VM.
+    if(see(TokenType::Assign) && token().value == ":=" && left && left->type() == NodeType::VARIABLE){
+        Token op = token(); next();
+        node_ptr init = ternary();
+        return make_node<WalrusNode>(op, left->value(), init);
+    }
     if(have(TokenType::Assign)){
         Token op = prev();
         node_ptr right = assignment(); // right-associative
@@ -613,6 +673,7 @@ node_ptr Parser::ternary(){
         node_ptr else_expr = expression();
         auto node = make_node<IfNode>(tok, expr, then_expr);
         std::static_pointer_cast<IfNode>(node)->else_branch = else_expr;
+        std::static_pointer_cast<IfNode>(node)->is_expr = true;
         return node;
     }
     // Python-style ternary: value if cond else other
@@ -623,6 +684,7 @@ node_ptr Parser::ternary(){
         node_ptr else_expr = expression();
         auto node = make_node<IfNode>(tok, condition, expr);
         std::static_pointer_cast<IfNode>(node)->else_branch = else_expr;
+        std::static_pointer_cast<IfNode>(node)->is_expr = true;
         return node;
     }
     return expr;
@@ -801,8 +863,11 @@ node_ptr Parser::addition(){
 
 node_ptr Parser::multiplication(){
     node_ptr left = power();
-    while(have(TokenType::Mul)||have(TokenType::Div)||have(TokenType::Mod)||have(TokenType::RevDiv)){
-        Token op = prev(); node_ptr right = power();
+    // `a @ b` (matrix multiplication: __matmul__). At the start of a
+    // statement `@` is a decorator; statement() takes that before this.
+    while(have(TokenType::Mul)||have(TokenType::Div)||have(TokenType::Mod)||have(TokenType::RevDiv)||have(TokenType::At)){
+        Token op = prev(); if(op.type() == TokenType::At) op.value = "@";
+        node_ptr right = power();
         left = make_node<BinaryNode>(op, left, right);
     }
     return left;
@@ -915,21 +980,9 @@ node_ptr Parser::postfix(){
                     return make_node<KeywordArgNode>(kw_tok, kw_name, kw_val);
                 }
                 node_ptr first_expr = expression();
-                // Generator expression: expr for var in iter [if cond]
-                if(have(TokenType::For)){
-                    Token comp_tok = prev();
-                    comp_tok.value = identifier(); // var name
-                    mustBe(TokenType::In);
-                    node_ptr iterable = logicalOr();
-                    node_ptr filter_expr = nullptr;
-                    if(have(TokenType::If)) filter_expr = expression();
-                    auto comp = make_node<ComplexNode>(comp_tok);
-                    auto cp = std::static_pointer_cast<ComplexNode>(comp);
-                    cp->items.push_back(first_expr);
-                    cp->items.push_back(iterable);
-                    cp->items.push_back(filter_expr);
-                    return comp;
-                }
+                // Generator expression argument: f(expr for t in it if c ...)
+                if(have(TokenType::For))
+                    return comprehension(prev(), ComprehensionNode::GEN, first_expr, nullptr);
                 return first_expr;
             };
             if(!see(TokenType::ParenClose)){
@@ -1304,20 +1357,10 @@ node_ptr Parser::atom(){
             return make_node<WalrusNode>(tok, wname, init);
         }
         node_ptr expr = expression();
-        // Standalone generator expression: (expr for var in iter [if cond])
+        // Standalone generator expression: (expr for t in it if c ...)
         if(have(TokenType::For)){
-            std::string var_name = identifier();
-            mustBe(TokenType::In);
-            node_ptr iterable = logicalOr();
-            node_ptr filter_expr = nullptr;
-            if(have(TokenType::If)) filter_expr = expression();
+            node_ptr comp = comprehension(tok, ComprehensionNode::GEN, expr, nullptr);
             mustBe(TokenType::ParenClose);
-            auto comp = make_node<ComplexNode>(tok);
-            auto cp = std::static_pointer_cast<ComplexNode>(comp);
-            cp->items.push_back(expr);
-            cp->items.push_back(iterable);
-            cp->items.push_back(filter_expr);
-            cp->_token.value = var_name;
             return comp;
         }
         if(have(TokenType::Comma)){
@@ -1635,7 +1678,14 @@ node_ptr Parser::ifStmt(){
 node_ptr Parser::whileStmt(){
     Token tok = token();
     mustBe(TokenType::While);
-    bool hp = have(TokenType::ParenOpen);
+    // The paren is consumed only for the walrus form `while (var n = e)`;
+    // otherwise it belongs to the condition, as for `if`: `while (a) < 3:`
+    // was a syntax error.
+    bool walrus_form = see(TokenType::ParenOpen)
+                    && peek(1).type()==TokenType::Var
+                    && peek(2).type()==TokenType::Identifier
+                    && peek(3).type()==TokenType::Assign;
+    bool hp = walrus_form && have(TokenType::ParenOpen);
     node_ptr cond;
     // Walrus operator inside while: while (var name = expr) != 0:
     if(hp && see(TokenType::Var) && peek(1).type()==TokenType::Identifier && peek(2).type()==TokenType::Assign) {
@@ -1708,6 +1758,13 @@ node_ptr Parser::forStmt(){
     have(TokenType::Colon);
     node_ptr body = blockOrStmt();
     auto fnode = make_node<ForNode>(tok, var, iter, body);
+    if(!outer_decls_.empty()){
+        auto& d = outer_decls_.back();
+        auto declared = [&](const std::string& n){ return std::find(d.begin(), d.end(), n) != d.end(); };
+        bool rb = declared(var->value());
+        for(auto& u : unpack_vars) rb = rb || declared(u->value());
+        static_cast<ForNode*>(fnode.get())->rebinds = rb;
+    }
     static_cast<ForNode*>(fnode.get())->unpack_vars = std::move(unpack_vars);
     return fnode;
 }
@@ -1777,7 +1834,11 @@ node_ptr Parser::functionDecl(bool is_method){
         mustBe(TokenType::ParenClose);
     }
     have(TokenType::Colon);
+    outer_decls_.emplace_back();
+    auto saved_defaults = std::move(param_defaults_);
     node_ptr body = blockOrStmt();
+    param_defaults_ = std::move(saved_defaults);
+    outer_decls_.pop_back();
     auto fn = make_node<FunctionNode>(tok, name, body, is_method);
     for(auto& p : params) fn->add(p);
     static_cast<FunctionNode*>(fn.get())->defaults = std::move(param_defaults_);
@@ -1816,6 +1877,14 @@ std::vector<node_ptr> Parser::paramList(){
     if(!see(TokenType::ParenClose)){
         // Check for *args or **kwargs
         auto parse_one_param = [&]() {
+            // A bare `*`: the parameters after it are keyword-only.
+            if(see(TokenType::Mul) && (peek(1).type() == TokenType::Comma || peek(1).type() == TokenType::ParenClose)){
+                Token st = token(); next();
+                st.value = "*";
+                params.push_back(make_node<VariableNode>(st));
+                param_defaults_.push_back(nullptr);
+                return;
+            }
             bool va = have(TokenType::Mul);
             bool kw = !va && have(TokenType::Exp);
             // Accept identifier or keyword as param name
@@ -2154,20 +2223,53 @@ node_ptr Parser::tryStmt(){
     auto try_node = make_node<TryNode>(tok, body);
     auto tn = std::static_pointer_cast<TryNode>(try_node);
     while(have(TokenType::NewLine)) {}
+    // A bare name after `except` is a TYPE when it names an exception class
+    // (a builtin one, or anything capitalised, as class names are) and the
+    // Nython catch-all binding `except e:` otherwise. Both engines used to
+    // read every bare name as a binding, so `except ValueError:` caught
+    // everything - and rebound the name ValueError to the exception.
+    auto is_type_name = [](const std::string& n) {
+        return nython::ny_is_builtin_exc(n) || (!n.empty() && n[0] >= 'A' && n[0] <= 'Z');
+    };
+    auto dotted = [&]() {
+        std::string n = identifier();
+        while (see(TokenType::Dot) && peek(1).type() == TokenType::Identifier) {
+            next(); n = identifier();   // mod.Error -> Error (classes are global by name)
+        }
+        return n;
+    };
     while(see(TokenType::Except)){
         next(); // consume 'except'
         std::string ename, ealias;
+        std::vector<std::string> types;
+        std::string var;
         if(see(TokenType::As)){
             // "except as e:" — catch-all with alias
             next(); // consume 'as'
             if(see(TokenType::Identifier)) ealias = identifier();
+            var = ealias;
+        } else if(have(TokenType::ParenOpen)){
+            // except (A, B) as e:
+            while(!see(TokenType::ParenClose) && !see(TokenType::End)){
+                types.push_back(dotted());
+                if(!have(TokenType::Comma)) break;
+            }
+            mustBe(TokenType::ParenClose);
+            if(!types.empty()) ename = types[0];
+            if(have(TokenType::As)) { ealias = identifier(); var = ealias; }
         } else if(see(TokenType::Identifier)){
-            ename = identifier();
-            if(have(TokenType::As)) ealias = identifier();
+            ename = dotted();
+            if(have(TokenType::As)) { ealias = identifier(); types.push_back(ename); var = ealias; }
+            else if(is_type_name(ename)) types.push_back(ename);
+            else var = ename;
         }
         have(TokenType::Colon);
         node_ptr ebody = blockOrStmt();
-        tn->except_clauses.push_back(make_node<ExceptNode>(tok, ename, ealias, ebody));
+        auto en = make_node<ExceptNode>(tok, ename, ealias, ebody);
+        auto enp = std::static_pointer_cast<ExceptNode>(en);
+        enp->types = std::move(types);
+        enp->var = std::move(var);
+        tn->except_clauses.push_back(en);
         while(have(TokenType::NewLine)) {}
     }
     return try_node;
@@ -2176,9 +2278,17 @@ node_ptr Parser::tryStmt(){
 node_ptr Parser::raiseStmt(){
     Token tok = token(); next(); // consume raise/throw
     node_ptr expr = nullptr;
-    if(!see(TokenType::NewLine)&&!see(TokenType::SemiColon)) expr = expression();
+    node_ptr cause = nullptr;
+    if(!see(TokenType::NewLine)&&!see(TokenType::SemiColon)&&!see(TokenType::End)
+       &&!see(TokenType::Dedent)) {
+        expr = expression();
+        // raise X from Y
+        if(have(TokenType::From)) cause = expression();
+    }
     have(TokenType::SemiColon); have(TokenType::NewLine);
-    return make_node<RaiseNode>(tok, expr);
+    auto rn = make_node<RaiseNode>(tok, expr);
+    std::static_pointer_cast<RaiseNode>(rn)->cause = cause;
+    return rn;
 }
 
 node_ptr Parser::assertStmt(){
@@ -2192,6 +2302,7 @@ node_ptr Parser::assertStmt(){
 
 node_ptr Parser::switchStmt(){
     Token tok = token(); mustBe(TokenType::Switch);
+    if(tok.value == "match") return matchStmt(tok, expression());
     bool hp = have(TokenType::ParenOpen);
     node_ptr subject = expression();
     if(hp) mustBe(TokenType::ParenClose);
@@ -2229,6 +2340,361 @@ node_ptr Parser::switchStmt(){
     if(has_brace) have(TokenType::BraceClose);
     have(TokenType::NewLine);
     return sw;
+}
+
+// ── match: Python's structural pattern matching ──────────────────────────
+//
+// `match` used to be `switch` under another name: every case was an
+// expression compared with ==, so `case x if x > 5`, `case [a, b]`,
+// `case 1 | 2` (which evaluated 1|2 == 3) and `case Point(x=0)` all
+// misbehaved. The patterns now parse into MatchPat and the statement
+// desugars, on both engines alike, into
+//
+//     var __msN__ = subject
+//     var __mdN__ = false
+//     if not __mdN__ and <structural test>:
+//         <bindings>
+//         if <guard>:                 (when there is one)
+//             __mdN__ = true
+//             <body>
+//
+// one `if` per case. The test reads the subject only through isinstance,
+// len, ==, `in`, hasattr/getattr, [] and attribute access, and binds
+// nothing, so the bindings are made only once a case's shape matched.
+
+std::shared_ptr<Parser::MatchPat> Parser::matchPattern(){
+    // Top level: an open sequence `case a, *rest:` is a sequence pattern.
+    auto seq = std::make_shared<MatchPat>(); seq->kind = MatchPat::SEQ;
+    auto item = [&](){
+        if(have(TokenType::Mul)){
+            seq->star = (int)seq->subs.size(); seq->star_name = identifier();
+            seq->subs.push_back(std::make_shared<MatchPat>());
+        } else seq->subs.push_back(matchOrPattern());
+    };
+    item();
+    if(!see(TokenType::Comma) && seq->star < 0) return seq->subs[0];
+    while(have(TokenType::Comma)){
+        if(see(TokenType::Colon) || see(TokenType::If)) break;
+        item();
+    }
+    return seq;
+}
+
+std::shared_ptr<Parser::MatchPat> Parser::matchOrPattern(){
+    auto first = matchClosedPattern();
+    std::shared_ptr<MatchPat> p = first;
+    if(see(TokenType::BinOr)){
+        p = std::make_shared<MatchPat>(); p->kind = MatchPat::OR;
+        p->subs.push_back(first);
+        while(have(TokenType::BinOr)) p->subs.push_back(matchClosedPattern());
+    }
+    if(have(TokenType::As)){
+        if(!p->as_name.empty()){
+            auto w = std::make_shared<MatchPat>(); w->kind = MatchPat::OR;
+            w->subs.push_back(p); p = w;
+        }
+        p->as_name = identifier();
+    }
+    return p;
+}
+
+std::shared_ptr<Parser::MatchPat> Parser::matchClosedPattern(){
+    auto p = std::make_shared<MatchPat>();
+    Token tok = token();
+    // Items of a bracketed sequence, `*name` allowed once.
+    auto seq_items = [&](TokenType close){
+        p->kind = MatchPat::SEQ;
+        while(!see(close)){
+            while(have(TokenType::NewLine)) {}
+            if(see(close)) break;
+            if(have(TokenType::Mul)){
+                p->star = (int)p->subs.size(); p->star_name = identifier();
+                p->subs.push_back(std::make_shared<MatchPat>());
+            } else p->subs.push_back(matchOrPattern());
+            while(have(TokenType::NewLine)) {}
+            if(!have(TokenType::Comma)) break;
+        }
+        while(have(TokenType::NewLine)) {}
+        mustBe(close);
+    };
+    if(see(TokenType::Identifier)){
+        std::string name = tok.value; next();
+        node_ptr expr;
+        if(see(TokenType::Dot) || see(TokenType::ParenOpen)){
+            expr = make_node<VariableNode>(tok);
+            while(see(TokenType::Dot)){
+                next(); Token at = token(); std::string an = at.value; next();
+                expr = make_node<AttributeNode>(at, expr, an);
+            }
+        }
+        if(!expr){
+            if(name == "_") p->kind = MatchPat::WILD;
+            else { p->kind = MatchPat::CAPTURE; p->name = name; }
+            return p;
+        }
+        if(!have(TokenType::ParenOpen)){ p->kind = MatchPat::VALUE; p->value = expr; return p; }
+        // Class pattern: Cls(p1, p2, attr=p3)
+        p->kind = MatchPat::CLASS; p->value = expr;
+        while(!see(TokenType::ParenClose)){
+            while(have(TokenType::NewLine)) {}
+            if(see(TokenType::ParenClose)) break;
+            if(see(TokenType::Identifier) && peek(1).type() == TokenType::Assign && peek(1).value == "="){
+                std::string kn = token().value; next(); next();
+                p->kw.push_back({kn, matchOrPattern()});
+            } else p->subs.push_back(matchOrPattern());
+            while(have(TokenType::NewLine)) {}
+            if(!have(TokenType::Comma)) break;
+        }
+        mustBe(TokenType::ParenClose);
+        return p;
+    }
+    if(have(TokenType::BracketOpen)){ seq_items(TokenType::BracketClose); return p; }
+    if(have(TokenType::ParenOpen)){
+        if(have(TokenType::ParenClose)){ p->kind = MatchPat::SEQ; return p; }
+        // (p) groups; (p,) and (p, q) are sequences.
+        if(!see(TokenType::Mul)){
+            auto inner = matchOrPattern();
+            if(have(TokenType::ParenClose)) return inner;
+            p->kind = MatchPat::SEQ; p->subs.push_back(inner);
+            mustBe(TokenType::Comma);
+            seq_items(TokenType::ParenClose);
+            return p;
+        }
+        seq_items(TokenType::ParenClose); return p;
+    }
+    if(have(TokenType::BraceOpen)){
+        p->kind = MatchPat::MAP;
+        while(!see(TokenType::BraceClose)){
+            while(have(TokenType::NewLine)) {}
+            if(see(TokenType::BraceClose)) break;
+            if(have(TokenType::Exp)){ p->rest = identifier(); }
+            else {
+                node_ptr key = unary();
+                mustBe(TokenType::Colon);
+                p->items.push_back({key, matchOrPattern()});
+            }
+            while(have(TokenType::NewLine)) {}
+            if(!have(TokenType::Comma)) break;
+        }
+        while(have(TokenType::NewLine)) {}
+        mustBe(TokenType::BraceClose);
+        return p;
+    }
+    if(see(TokenType::Integer) || see(TokenType::Float) || see(TokenType::String)
+       || see(TokenType::Sub) || see(TokenType::True) || see(TokenType::False) || see(TokenType::None)){
+        p->kind = MatchPat::VALUE; p->value = unary(); return p;
+    }
+    throw SyntaxError(tok.location(), "Unexpected token in a case pattern: " + tok.value);
+}
+
+node_ptr Parser::matchStmt(Token tok, node_ptr subject){
+    static int match_counter = 0;
+    int id = match_counter++;
+    std::string subj = "__ms" + std::to_string(id) + "__";
+    std::string done = "__md" + std::to_string(id) + "__";
+    auto T = [&](const std::string& v){ Token t = tok; t.value = v; return t; };
+    auto var_ref = [&](const std::string& n){ return make_node<VariableNode>(T(n)); };
+    auto int_node = [&](long v){ Token t = T(std::to_string(v)); t.type(TokenType::Integer); return make_node<IntegerNode>(t); };
+    auto str_node = [&](const std::string& v){ Token t = T(v); t.type(TokenType::String); return make_node<StringNode>(t); };
+    auto bin = [&](const std::string& op, node_ptr a, node_ptr b){ return make_node<BinaryNode>(T(op), a, b); };
+    auto call = [&](const std::string& fn, std::vector<node_ptr> args){
+        auto c = make_node<CallNode>(T(fn), var_ref(fn));
+        for(auto& a : args) c->add(a);
+        return c;
+    };
+    auto conj = [&](node_ptr a, node_ptr b) -> node_ptr { if(!a) return b; if(!b) return a; return bin("and", a, b); };
+    using Path = std::function<node_ptr()>;
+    auto sub = [&](Path base, node_ptr idx) -> Path { return [=]() -> node_ptr { return make_node<SubscriptNode>(T("["), base(), idx); }; };
+    auto builtin_type = [](node_ptr cls){
+        static const std::set<std::string> t = {"int","float","str","bool","list","dict","set","tuple","bytes","bytearray","frozenset"};
+        return cls && cls->type() == NodeType::VARIABLE && t.count(cls->value());
+    };
+    // Where the i-th positional sub-pattern of a class pattern reads from.
+    auto positional = [&](std::shared_ptr<MatchPat> p, Path path, size_t i) -> Path {
+        if(builtin_type(p->value) && p->subs.size() == 1) return path;
+        node_ptr cls = p->value;
+        return [=, &T, &int_node]() -> node_ptr {
+            auto names = make_node<AttributeNode>(T("__match_args__"), cls, "__match_args__");
+            auto c = make_node<CallNode>(T("getattr"), make_node<VariableNode>(T("getattr")));
+            c->add(path());
+            c->add(make_node<SubscriptNode>(T("["), names, int_node((long)i)));
+            return c;
+        };
+    };
+    std::function<node_ptr(std::shared_ptr<MatchPat>, Path)> test;
+    test = [&](std::shared_ptr<MatchPat> p, Path path) -> node_ptr {
+        switch(p->kind){
+        case MatchPat::WILD: case MatchPat::CAPTURE: return nullptr;
+        case MatchPat::VALUE: return bin("==", path(), p->value);
+        case MatchPat::OR: {
+            node_ptr r;
+            for(auto& a : p->subs){
+                node_ptr t = test(a, path);
+                if(!t) return nullptr;
+                r = r ? bin("or", r, t) : t;
+            }
+            return r;
+        }
+        case MatchPat::SEQ: {
+            long n = (long)p->subs.size();
+            node_ptr r = call("isinstance", {path(), var_ref("list")});
+            if(p->star < 0) r = conj(r, bin("==", call("len", {path()}), int_node(n)));
+            else r = conj(r, bin(">=", call("len", {path()}), int_node(n - 1)));
+            for(long i = 0; i < n; i++){
+                if(i == p->star) continue;
+                long idx = (p->star >= 0 && i > p->star) ? -(n - i) : i;
+                r = conj(r, test(p->subs[i], sub(path, int_node(idx))));
+            }
+            return r;
+        }
+        case MatchPat::CLASS: {
+            node_ptr r = call("isinstance", {path(), p->value});
+            for(size_t i = 0; i < p->subs.size(); i++)
+                r = conj(r, test(p->subs[i], positional(p, path, i)));
+            for(auto& kv : p->kw){
+                std::string an = kv.first;
+                r = conj(r, call("hasattr", {path(), str_node(an)}));
+                Path ap = [=, &T]() -> node_ptr { return make_node<AttributeNode>(T(an), path(), an); };
+                r = conj(r, test(kv.second, ap));
+            }
+            return r;
+        }
+        case MatchPat::MAP: {
+            node_ptr r = call("isinstance", {path(), var_ref("dict")});
+            for(auto& kv : p->items){
+                r = conj(r, bin("in", kv.first, path()));
+                r = conj(r, test(kv.second, sub(path, kv.first)));
+            }
+            return r;
+        }
+        }
+        return nullptr;
+    };
+    std::function<bool(std::shared_ptr<MatchPat>)> binds_any = [&](std::shared_ptr<MatchPat> p) -> bool {
+        if(!p->as_name.empty() || p->kind == MatchPat::CAPTURE || !p->rest.empty()) return true;
+        if(p->kind == MatchPat::SEQ && p->star >= 0 && !p->star_name.empty() && p->star_name != "_") return true;
+        for(auto& s : p->subs) if(binds_any(s)) return true;
+        for(auto& kv : p->kw) if(binds_any(kv.second)) return true;
+        for(auto& kv : p->items) if(binds_any(kv.second)) return true;
+        return false;
+    };
+    std::function<void(std::shared_ptr<MatchPat>, Path, node_ptr)> bind;
+    bind = [&](std::shared_ptr<MatchPat> p, Path path, node_ptr out) {
+        auto assign = [&](const std::string& n, node_ptr v){ out->add(make_node<AssignmentNode>(T("="), var_ref(n), v)); };
+        switch(p->kind){
+        case MatchPat::CAPTURE: assign(p->name, path()); break;
+        case MatchPat::OR: {
+            if(!binds_any(p)) break;
+            // The alternative that matched decides the bindings.
+            node_ptr chain, last;
+            for(auto& a : p->subs){
+                auto blk = make_node<BlockNode>(tok);
+                bind(a, path, blk);
+                node_ptr t = test(a, path);
+                if(!t){
+                    if(last) std::static_pointer_cast<IfNode>(last)->else_branch = blk; else chain = blk;
+                    break;
+                }
+                auto ifn = make_node<IfNode>(tok, t, blk);
+                if(last) std::static_pointer_cast<IfNode>(last)->else_branch = ifn; else chain = ifn;
+                last = ifn;
+            }
+            if(chain) out->add(chain);
+            break;
+        }
+        case MatchPat::SEQ: {
+            long n = (long)p->subs.size();
+            for(long i = 0; i < n; i++){
+                if(i == p->star){
+                    if(p->star_name.empty() || p->star_name == "_") continue;
+                    long after = n - i - 1;
+                    auto sl = make_node<CallNode>(T("slice"), make_node<AttributeNode>(T("slice"), path(), "slice"));
+                    sl->add(int_node(i));
+                    if(after > 0) sl->add(int_node(-after));
+                    assign(p->star_name, sl);
+                    continue;
+                }
+                long idx = (p->star >= 0 && i > p->star) ? -(n - i) : i;
+                bind(p->subs[i], sub(path, int_node(idx)), out);
+            }
+            break;
+        }
+        case MatchPat::CLASS:
+            for(size_t i = 0; i < p->subs.size(); i++) bind(p->subs[i], positional(p, path, i), out);
+            for(auto& kv : p->kw){
+                std::string an = kv.first;
+                Path ap = [=, &T]() -> node_ptr { return make_node<AttributeNode>(T(an), path(), an); };
+                bind(kv.second, ap, out);
+            }
+            break;
+        case MatchPat::MAP:
+            for(auto& kv : p->items) bind(kv.second, sub(path, kv.first), out);
+            if(!p->rest.empty()){
+                // rest = {k: path[k] for k in path if k not in [keys]}
+                std::string k = "__mk" + std::to_string(id) + "__";
+                auto comp = std::make_shared<ComprehensionNode>(tok, ComprehensionNode::DICT);
+                comp->elt = var_ref(k);
+                comp->value = make_node<SubscriptNode>(T("["), path(), var_ref(k));
+                ComprehensionNode::Clause cl;
+                cl.target = var_ref(k); cl.iter = path();
+                auto keys = make_node<ListNode>(tok);
+                for(auto& kv : p->items) keys->add(kv.first);
+                cl.conds.push_back(bin("not in", var_ref(k), keys));
+                comp->clauses.push_back(cl);
+                assign(p->rest, comp);
+            }
+            break;
+        default: break;
+        }
+        if(!p->as_name.empty()) assign(p->as_name, path());
+    };
+
+    have(TokenType::Colon);
+    bool has_brace = have(TokenType::BraceOpen);
+    have(TokenType::NewLine);
+    bool has_indent = have(TokenType::Indent);
+    auto out = make_node<BlockNode>(tok);
+    out->add(make_node<VarDeclNode>(tok, subj, subject, false, false));
+    out->add(make_node<VarDeclNode>(tok, done, make_node<BoolNode>(T("false"), false), false, false));
+    auto at_end = [&]() -> bool {
+        if(has_brace && see(TokenType::BraceClose)) return true;
+        if(has_indent && see(TokenType::Dedent)) return true;
+        return see(TokenType::End);
+    };
+    Path root = [&, subj]() -> node_ptr { return var_ref(subj); };
+    auto not_done = [&](){ return make_node<UnaryNode>(T("not"), var_ref(done)); };
+    auto set_done = [&](){ return make_node<AssignmentNode>(T("="), var_ref(done), make_node<BoolNode>(T("true"), true)); };
+    while(!at_end()){
+        while(have(TokenType::NewLine)) {}
+        if(at_end()) break;
+        if(have(TokenType::Case)){
+            auto pat = matchPattern();
+            node_ptr guard;
+            if(have(TokenType::If)) guard = expression();
+            mustBe(TokenType::Colon);
+            node_ptr body = blockOrStmt();
+            auto inner = make_node<BlockNode>(tok);
+            bind(pat, root, inner);
+            auto run = make_node<BlockNode>(tok);
+            run->add(set_done());
+            run->add(body);
+            if(guard) inner->add(make_node<IfNode>(tok, guard, run));
+            else inner->add(run);
+            out->add(make_node<IfNode>(tok, conj(not_done(), test(pat, root)), inner));
+        } else if(have(TokenType::Default)){
+            mustBe(TokenType::Colon);
+            auto run = make_node<BlockNode>(tok);
+            run->add(set_done());
+            run->add(blockOrStmt());
+            out->add(make_node<IfNode>(tok, not_done(), run));
+        } else {
+            throw SyntaxError(token().location(), "Expected 'case' in a match statement, got: " + token().value);
+        }
+    }
+    if(has_indent) have(TokenType::Dedent);
+    if(has_brace) have(TokenType::BraceClose);
+    have(TokenType::NewLine);
+    return out;
 }
 
 node_ptr Parser::deleteStmt(){
@@ -2344,6 +2810,64 @@ node_ptr Parser::blockOrStmt(){
 // COLLECTION LITERALS
 // ═══════════════════════════════════════════════════════════════════════════
 
+// A comprehension's clauses, the first `for` already consumed:
+//   for T in ITER (if COND)* (for T in ITER (if COND)*)*
+// Conditions and iterables stop before a ternary's `if`/`else` (logicalOr),
+// so `[x for x in xs if a if b]` has two conditions rather than being read
+// as a malformed conditional expression.
+node_ptr Parser::comprehension(Token tok, int kind, node_ptr elt, node_ptr value){
+    auto comp = make_node<ComprehensionNode>(tok, kind);
+    auto cp = std::static_pointer_cast<ComprehensionNode>(comp);
+    cp->elt = elt; cp->value = value;
+    do {
+        ComprehensionNode::Clause cl;
+        cl.target = compTarget();
+        mustBe(TokenType::In);
+        cl.iter = logicalOr();
+        while(have(TokenType::If)) cl.conds.push_back(logicalOr());
+        cp->clauses.push_back(std::move(cl));
+    } while(have(TokenType::For));
+    return comp;
+}
+
+// A comprehension target: a name, or a (possibly nested, possibly
+// parenthesised) comma-separated list of targets.
+node_ptr Parser::compTargetOne(){
+    Token tok = token();
+    if(have(TokenType::ParenOpen)){
+        node_ptr t = compTarget();
+        mustBe(TokenType::ParenClose);
+        if(t->type() != NodeType::TUPLE){
+            auto tup = make_node<TupleNode>(tok); tup->add(t); return tup;
+        }
+        return t;
+    }
+    if(have(TokenType::BracketOpen)){
+        node_ptr t = compTarget();
+        mustBe(TokenType::BracketClose);
+        if(t->type() != NodeType::TUPLE){
+            auto tup = make_node<TupleNode>(tok); tup->add(t); return tup;
+        }
+        return t;
+    }
+    Token id = token();
+    id.value = identifier();
+    return make_node<VariableNode>(id);
+}
+
+node_ptr Parser::compTarget(){
+    Token tok = token();
+    node_ptr first = compTargetOne();
+    if(!see(TokenType::Comma)) return first;
+    auto tup = make_node<TupleNode>(tok);
+    tup->add(first);
+    while(have(TokenType::Comma)){
+        if(see(TokenType::In) || see(TokenType::ParenClose) || see(TokenType::BracketClose)) break;
+        tup->add(compTargetOne());
+    }
+    return tup;
+}
+
 node_ptr Parser::listLiteral(){
     Token tok = token();
     mustBe(TokenType::BracketOpen);
@@ -2353,46 +2877,10 @@ node_ptr Parser::listLiteral(){
     }
     // Parse first expression
     node_ptr first = expression();
-    // Check for list comprehension: [expr for var in iterable (for var2 in iter2)*]
+    // List comprehension: [expr for t in it if c ... for t2 in it2 ...]
     if(have(TokenType::For)){
-        // Support tuple unpacking: for a, b in ...
-        std::string var_name = identifier();
-        std::string var_names_combined = var_name;
-        while(see(TokenType::Comma)){
-            have(TokenType::Comma);
-            if(see(TokenType::In)) break; // trailing comma
-            var_names_combined += "," + identifier();
-        }
-        var_name = var_names_combined;
-        mustBe(TokenType::In);
-        node_ptr iterable = logicalOr();
-        // Check for nested for:
-        std::string var_name2;
-        node_ptr iterable2 = nullptr;
-        if(have(TokenType::For)) {
-            var_name2 = identifier();
-            mustBe(TokenType::In);
-            iterable2 = logicalOr();
-        }
-        node_ptr filter_expr = nullptr;
-        if(have(TokenType::If)){
-            filter_expr = expression();
-        }
-mustBe(TokenType::BracketClose);
-        // Build a ComprehensionNode
-        auto comp = make_node<ComplexNode>(tok);
-        auto comp_ptr = std::static_pointer_cast<ComplexNode>(comp);
-        comp_ptr->items.push_back(first);        // [0] = expr to evaluate
-        comp_ptr->items.push_back(iterable);     // [1] = iterable
-        if(filter_expr) comp_ptr->items.push_back(filter_expr); // [2] = optional filter
-        else comp_ptr->items.push_back(nullptr);
-        // Nested for: store var2 and iterable2
-        if(iterable2) {
-            Token v2tok = tok; v2tok.value = var_name2;
-            comp_ptr->items.push_back(make_node<VariableNode>(v2tok)); // [3] = var2
-            comp_ptr->items.push_back(iterable2);                      // [4] = iterable2
-        }
-        comp_ptr->_token.value = var_name;
+        node_ptr comp = comprehension(tok, ComprehensionNode::LIST, first, nullptr);
+        mustBe(TokenType::BracketClose);
         return comp;
     }
     // Regular list literal
@@ -2486,59 +2974,11 @@ node_ptr Parser::mapLiteral(){
     if(have(TokenType::Colon)){
         // It's a map
         node_ptr val = expression();
-        // Check for dict comprehension: {k: v for var in iterable if cond}
-        if(see(TokenType::For)) {
-            next(); // consume 'for'
-            std::string var_name = identifier();
-            // Check for tuple unpacking: for k, v in ...
-            std::string var_name2;
-            if(have(TokenType::Comma)) {
-                var_name2 = identifier();
-            }
-            mustBe(TokenType::In);
-            node_ptr iter = logicalOr(); // don't consume 'if' as ternary
-            // Optional filter
-            node_ptr filter_expr = nullptr;
-            if(have(TokenType::If)) {
-                filter_expr = expression();
-            }
+        // Dict comprehension: {k: v for t in it if c ...}
+        if(have(TokenType::For)) {
+            node_ptr comp = comprehension(tok, ComprehensionNode::DICT, key, val);
             mustBe(TokenType::BraceClose);
-            // Transform into: (lambda: var __d={} \n for var_name in iter: __d[key_expr]=val_expr \n return __d)()
-            // Simpler: create a special ComprehensionNode that builds a map
-            // For now, generate equivalent AST:
-            auto block = make_node<BlockNode>(tok);
-            // var __dictcomp__ = {}
-            auto empty_map = make_node<MapNode>(tok);
-            block->add(make_node<VarDeclNode>(tok, "__dictcomp__", empty_map, false, false));
-            // for var_name in iter:
-            Token var_tok = tok; var_tok.value = var_name;
-            auto loop_var = make_node<VariableNode>(var_tok);
-            // __dictcomp__[key] = val
-            Token dc_tok = tok; dc_tok.value = "__dictcomp__";
-            auto dc_var = make_node<VariableNode>(dc_tok);
-            auto subscr = make_node<SubscriptNode>(tok, dc_var, key);
-            auto assign = make_node<AssignmentNode>(tok, subscr, val);
-            // Build for body: optionally wrap in if filter
-            node_ptr for_body;
-            if (filter_expr) {
-                // Create: if cond: assign (with no else)
-                auto if_block = make_node<IfNode>(tok, filter_expr, assign);
-                for_body = if_block;
-            } else {
-                for_body = assign;
-            }
-            auto for_node = make_node<ForNode>(tok, loop_var, iter, for_body);
-            // Add tuple unpacking vars
-            if (!var_name2.empty()) {
-                Token v2tok = tok; v2tok.value = var_name2;
-                for_node->add(make_node<VariableNode>(v2tok));
-                static_cast<ForNode*>(for_node.get())->unpack_vars.push_back(make_node<VariableNode>(v2tok));
-            }
-            block->add(for_node);
-            // return __dictcomp__
-            Token dc_tok2 = tok; dc_tok2.value = "__dictcomp__";
-            block->add(make_node<VariableNode>(dc_tok2));
-            return block;
+            return comp;
         }
         map->add(make_node<MapEntryNode>(tok, key, val));
         while(have(TokenType::Comma)&&!see(TokenType::BraceClose)){
@@ -2553,45 +2993,11 @@ node_ptr Parser::mapLiteral(){
     // Set literal: {expr1, expr2, ...}
     // Build as: set([expr1, expr2, ...])
     // Set literal or set comprehension: {expr ...}
-    // Check for set comprehension: {expr for var in iter [if cond]}
-    if (see(TokenType::For)) {
-        next(); // consume 'for'
-        std::string var_name = identifier();
-        std::string var_name2;
-        if (have(TokenType::Comma)) var_name2 = identifier();
-        mustBe(TokenType::In);
-        node_ptr iter = logicalOr();
-        node_ptr filter_expr = nullptr;
-        if (have(TokenType::If)) filter_expr = expression();
+    // Set comprehension: {e for t in it if c ...}
+    if (have(TokenType::For)) {
+        node_ptr comp = comprehension(tok, ComprehensionNode::SET, key, nullptr);
         mustBe(TokenType::BraceClose);
-        // Generate: var __setcomp__ = set([]) \n for var in iter: if cond: __setcomp__.add(key)\n return __setcomp__
-        auto block = make_node<BlockNode>(tok);
-        // var __setcomp__ = set([])
-        auto empty_list = make_node<ListNode>(tok);
-        Token set_tok2 = tok; set_tok2.value = "set";
-        auto set_var2 = make_node<VariableNode>(set_tok2);
-        auto set_call = make_node<CallNode>(tok, set_var2);
-        set_call->add(empty_list);
-        block->add(make_node<VarDeclNode>(tok, "__setcomp__", set_call, false, false));
-        // for var_name in iter: __setcomp__.add(key)
-        Token sc_tok = tok; sc_tok.value = "__setcomp__";
-        auto sc_var = make_node<VariableNode>(sc_tok);
-        Token add_tok = tok; add_tok.value = "add";
-        auto add_attr = make_node<AttributeNode>(tok, sc_var, "add");
-        auto add_call = make_node<CallNode>(tok, add_attr);
-        add_call->add(key);
-        node_ptr for_body = filter_expr ? (node_ptr)make_node<IfNode>(tok, filter_expr, add_call) : (node_ptr)add_call;
-        Token var_tok = tok; var_tok.value = var_name;
-        auto loop_var = make_node<VariableNode>(var_tok);
-        auto for_node = make_node<ForNode>(tok, loop_var, iter, for_body);
-        if (!var_name2.empty()) {
-            Token v2tok = tok; v2tok.value = var_name2;
-            static_cast<ForNode*>(for_node.get())->unpack_vars.push_back(make_node<VariableNode>(v2tok));
-        }
-        block->add(for_node);
-        Token sc_tok2 = tok; sc_tok2.value = "__setcomp__";
-        block->add(make_node<VariableNode>(sc_tok2));
-        return block;
+        return comp;
     }
     auto list = make_node<ListNode>(tok);
     list->add(key);

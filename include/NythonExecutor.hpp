@@ -25,6 +25,7 @@
 // Windows: winsock2.h MUST come before windows.h (which some headers pull in)
 #include "Nython.hpp"
 #include "NythonREPL.hpp"
+#include "NyExcTypes.hpp"
 #include "NyRuntime.hpp"
 #include "NyPrelude.hpp"
 #include <algorithm>
@@ -399,6 +400,30 @@ struct NythonExecutor {
     // Nython source every program starts with (include/NyPrelude.hpp): the
     // file objects open() returns. The VM runs the same text.
     void loadPrelude() {
+        // The builtin exception classes are real classes, as on the VM:
+        // `except ValueError as e` binds an instance (isinstance, e.args,
+        // type(e).__name__, __cause__), `raise ValueError` instantiates it
+        // and user classes derive from them. They were builtin constructors
+        // of message strings.
+        try {
+            std::string src;
+            for (auto& n : nython::ny_builtin_exc_names()) {
+                const char* par = nython::ny_builtin_exc_parent(n);
+                src += "class " + n + (par && *par ? std::string("(") + par + ")" : std::string()) + ":\n    pass\n";
+            }
+            auto source = SourceCode(src);
+            auto reporter = std::make_shared<Reporter>(source);
+            auto lex = std::make_shared<Lexer>(source);
+            lex->tokenize();
+            auto parser = std::make_shared<Parser>(reporter.get(), (Runnable*)runner, lex.get());
+            auto ast = parser->parse();
+            if (ast) {
+                imported_asts.push_back(ast);
+                evalNode(ast, global_ctx);
+            }
+        } catch (...) {
+            std::cerr << "[Nython] builtin exception classes failed to load\n";
+        }
         try {
             auto source = SourceCode(std::string(nyrt::prelude_source()));
             auto reporter = std::make_shared<Reporter>(source);
@@ -670,7 +695,16 @@ public:   // NythonExecutor is a struct: members default to public
 
     Value execute(node_ptr ast) {
         if (!ast) return NONE_VALUE;
-        return evalNode(ast, global_ctx);
+        try {
+            return evalNode(ast, global_ctx);
+        } catch (std::string& flow) {
+            // An uncaught raised instance travels as "__exc__:C:__obj__:<ptr>";
+            // resolve it to "__exc__:C:message" while the instance still
+            // exists, so the top level reports the message, not a pointer.
+            if (flow.find(":__obj__:") != std::string::npos)
+                throw std::string("__exc__:" + excTypeOf(flow) + ":" + excMessageOf(flow));
+            throw;
+        }
     }
 
     // ── return / break / continue without C++ exceptions ─────────────────
@@ -789,6 +823,7 @@ public:   // NythonExecutor is a struct: members default to public
             case NodeType::SUBSCRIPT: return evalSubscript(node, ctx);
             case NodeType::LIST: return evalList(node, ctx);
             case NodeType::COMPLEX: return evalComprehension(node, ctx);
+            case NodeType::COMPREHENSION: return evalComprehensionNode(node, ctx);
             case NodeType::MAP: return evalMap(node, ctx);
             case NodeType::TUPLE: return evalList(node, ctx);
             case NodeType::ARRAY: return evalList(node, ctx);
@@ -807,7 +842,17 @@ public:   // NythonExecutor is a struct: members default to public
             case NodeType::WITH: { SuspendFast _sf; return evalWith(node, ctx); }
             case NodeType::NAMESPACE: { SuspendFast _sf; return evalNamespace(node, ctx); }
             case NodeType::INTERFACE: { SuspendFast _sf; return evalInterfaceDecl(node, ctx); }
-            case NodeType::YIELD: { auto yn = static_pointer_cast<YieldNode>(node); Value yv = yn->expr ? evalNode(yn->expr, ctx) : NONE_VALUE; if (yield_sink_) { yield_sink_->push_back(yv); return NONE_VALUE; } throw nython::node::YieldSignal(yv); }
+            case NodeType::YIELD: { auto yn = static_pointer_cast<YieldNode>(node); Value yv = yn->expr ? evalNode(yn->expr, ctx) : NONE_VALUE; if (yield_sink_) { yieldValue(yv); return NONE_VALUE; } throw nython::node::YieldSignal(yv); }
+            case NodeType::YIELD_FROM: {
+                // yield from it: every value of `it`, yielded in turn.
+                auto yf = static_pointer_cast<YieldFromNode>(node);
+                Value src = evalNode(yf->expr, ctx);
+                // (what is left of a generator, which this consumes)
+                std::vector<Value> items = iterValues(src, ctx);
+                if (!yield_sink_) throw nython::node::YieldSignal(items.empty() ? NONE_VALUE : items[0]);
+                for (auto& item : items) yieldValue(item);
+                return NONE_VALUE;
+            }
             case NodeType::GLOBAL: return NONE_VALUE;
             case NodeType::SELF: return ctx->getByName("self");
             case NodeType::SUPER: return ctx->getByName("super");
@@ -920,7 +965,29 @@ public:   // NythonExecutor is a struct: members default to public
             func_names[nullptr] = "__builtin__:" + vn->name; // temporary, overwritten each call
             return v;
         }
+        // A name bound nowhere: NameError (it read as undefined and the
+        // program carried on). Bound-to-undefined (`x = undefined`) and names
+        // that resolve by another route (a class or function an imported
+        // module registered) are not errors.
+        if (!ctx->hasByName(vn->name) && !knownName(vn->name)) {
+            std::string hint = suggestName(vn->name);
+            if (!hint.empty()) hint = "  (did you mean '" + hint + "'?)";
+            throw std::string("__exc__:NameError:name '" + vn->name + "' is not defined" + hint);
+        }
         return found;
+    }
+    // A function, class or builtin registered under this name.
+    bool knownName(const std::string& called) {
+        if (builtin_set.count(called)) return true;
+        for (auto& kv : func_names) {
+            const std::string& n = kv.second;
+            if (n == called
+                || (n.rfind("__func__:", 0) == 0  && n.compare(9, std::string::npos, called) == 0)
+                || (n.rfind("__class__:", 0) == 0 && n.compare(10, std::string::npos, called) == 0)
+                || (n.rfind("__builtin__:", 0) == 0 && n.compare(12, std::string::npos, called) == 0))
+                return true;
+        }
+        return false;
     }
 
     Value evalVarDecl(node_ptr node, Context* ctx) {
@@ -935,7 +1002,12 @@ public:   // NythonExecutor is a struct: members default to public
         Value val = evalNode(an->value_node, ctx);
         if (an->target->type() == NodeType::VARIABLE) {
             auto vn = static_pointer_cast<VariableNode>(an->target);
-            ctx->setByName(vn->name, val);
+            // In a class body a name is always bound in the class namespace:
+            // setByName found a same-named variable in an enclosing scope and
+            // rebound IT (`items = []` in a class body overwrote the global
+            // builtin `items`, and the class never got the attribute).
+            if (ctx->inClass) ctx->defineByName(vn->name, val);
+            else ctx->setByName(vn->name, val);
         } else if (an->target->type() == NodeType::ATTRIBUTE) {
             auto attr = static_pointer_cast<AttributeNode>(an->target);
             Value obj = evalNode(attr->object, ctx);
@@ -1243,26 +1315,32 @@ public:   // NythonExecutor is a struct: members default to public
             res = la < lb ? -1 : la > lb ? 1 : 0;
             return true;
         }
-        if (isInstanceVal(a) && ctx) {
-            std::vector<Value> args1 = {b};
-            Value lt = callMethod(a, "__lt__", args1, ctx);
-            if (lt.type == ValueType::BOOLEAN) {
-                if (lt.value.b) { res = -1; return true; }
-                std::vector<Value> args2 = {b};
-                Value eq = callMethod(a, "__eq__", args2, ctx);
-                res = (eq.type == ValueType::BOOLEAN && eq.value.b) ? 0 : 1;
-                return true;
-            }
+        // Objects: __lt__ (or the other side's __gt__), then __eq__.
+        if ((isInstanceVal(a) || isInstanceVal(b)) && ctx) {
+            Value lt;
+            if (!binaryDunder("<", a, b, ctx, lt)) return false;
+            if (isTruthy(lt)) { res = -1; return true; }
+            Value eq;
+            res = (binaryDunder("==", a, b, ctx, eq) ? isTruthy(eq) : identical(a, b)) ? 0 : 1;
+            return true;
         }
         return false;
     }
 
     // `x in c`
     bool containsValue(const Value& c, const Value& x, Context* ctx) {
+        // An object: __contains__, else a search of what it iterates over
+        // (__iter__ / __getitem__), as in Python.
         if (isInstanceVal(c)) {
-            std::vector<Value> args = {x};
-            Value r = callMethod(c, "__contains__", args, ctx);
-            if (r.type == ValueType::BOOLEAN) return r.value.b;
+            if (instanceHasMethod(c, "__contains__")) {
+                std::vector<Value> args = {x};
+                return isTruthy(callMethod(c, "__contains__", args, ctx));
+            }
+            if (instanceHasMethod(c, "__iter__") || instanceHasMethod(c, "__getitem__") || instanceHasMethod(c, "__next__")) {
+                for (auto& v : iterValues(c, ctx)) if (pyEquals(x, v, ctx)) return true;
+                return false;
+            }
+            pyRaise("TypeError", "argument of type '" + instanceClassName(c) + "' is not iterable");
         }
         if (isStringValue(c)) {
             if (!isStringValue(x)) pyRaise("TypeError", "'in <string>' requires string as left operand");
@@ -1290,31 +1368,20 @@ public:   // NythonExecutor is a struct: members default to public
                 + typeNameOf(lv) + "' and '" + typeNameOf(rv) + "'");
     }
     Value binaryOp(int opc, Value lv, Value rv, Context* ctx) {
-        // Operator overloading on instances.
-        if (isInstanceVal(lv)) {
-            const char* dunder = nullptr;
-            switch (opc) {
-                case OP_ADD: dunder = "__add__"; break; case OP_SUB: dunder = "__sub__"; break;
-                case OP_MUL: dunder = "__mul__"; break; case OP_DIV: dunder = "__truediv__"; break;
-                case OP_MOD: dunder = "__mod__"; break; case OP_POW: dunder = "__pow__"; break;
-                case OP_FLOORDIV: dunder = "__floordiv__"; break; case OP_BAND: dunder = "__and__"; break;
-                case OP_BOR: dunder = "__or__"; break; case OP_BXOR: dunder = "__xor__"; break;
-                case OP_LSHIFT: dunder = "__lshift__"; break; case OP_RSHIFT: dunder = "__rshift__"; break;
-                case OP_LT: dunder = "__lt__"; break; case OP_GT: dunder = "__gt__"; break;
-                case OP_LE: dunder = "__le__"; break; case OP_GE: dunder = "__ge__"; break;
-                case OP_EQ: dunder = "__eq__"; break; case OP_NE: dunder = "__ne__"; break;
-                default: break;
+        // Operator overloading: the left operand's dunder, else the right
+        // operand's reflected one (a.__lt__(b), then b.__gt__(a); __add__,
+        // then __radd__ - so sum() of objects and 5 + v work). A dunder that
+        // exists is used even when it returns none; != falls back to not ==.
+        if (isInstanceVal(lv) || isInstanceVal(rv)) {
+            Value res;
+            if (binaryDunder(opSymbol(opc), lv, rv, ctx, res)) return res;
+            if (opc == OP_EQ || opc == OP_NE) {       // no __eq__: identity
+                bool same = identical(lv, rv);
+                return Value(opc == OP_EQ ? same : !same);
             }
-            if (dunder) {
-                std::vector<Value> call_args = {rv};
-                Value result = callMethod(lv, dunder, call_args, ctx);
-                if (result.type != ValueType::NONE) return result;
-                if (opc == OP_DIV) {
-                    std::vector<Value> call_args2 = {rv};
-                    result = callMethod(lv, "__div__", call_args2, ctx);
-                    if (result.type != ValueType::NONE) return result;
-                }
-            }
+            if (opc == OP_LT || opc == OP_LE || opc == OP_GT || opc == OP_GE)
+                pyRaise("TypeError", std::string("'") + opSymbol(opc) + "' not supported between instances of '"
+                        + typeNameOf(lv) + "' and '" + typeNameOf(rv) + "'");
         }
         Num x, y;
         bool nums = asNum(lv, x) && asNum(rv, y);
@@ -1484,6 +1551,23 @@ public:   // NythonExecutor is a struct: members default to public
 
     // ─── ATTRIBUTE / ITEM STORES ────────────────────────────────────────
     void setAttr(const Value& obj, const std::string& name, const Value& val) {
+        // A property defined on the class: its setter runs, and a read-only
+        // one refuses (the value used to be written into the instance,
+        // silently hiding the property).
+        if (any_property_ && isInstanceValue(obj)) {
+            Node* cls = classNodeOfInstance(obj);
+            Value m; Node* owner = nullptr;
+            if (cls && findClassMember(cls, name, m, &owner) && m.type == ValueType::USERDATA && m.value.p
+                && fnTag(func_names, m.value.p).find("__property__") != std::string::npos) {
+                auto st = prop_setters_.find(m.value.p);
+                if (st == prop_setters_.end())
+                    throw std::string("__exc__:AttributeError:can't set attribute '" + name + "'");
+                std::vector<Value> a{val};
+                std::unordered_map<std::string, Value> nokw;
+                invokeMember(st->second, owner, obj, a, nokw, global_ctx);
+                return;
+            }
+        }
         // Store on instance properties (USERDATA instances)
         if (obj.type == ValueType::USERDATA && obj.value.p) {
             auto pit = instance_properties.find(obj.value.p);
@@ -1496,7 +1580,9 @@ public:   // NythonExecutor is a struct: members default to public
                 auto ast_it = func_ast_nodes.find(class_ptr);
                 if (ast_it != func_ast_nodes.end()) ast_ptr = ast_it->second;
                 Node* class_node = (Node*)ast_ptr;
-                if (class_node && func_names.find(class_ptr) != func_names.end() && class_node->type() == NodeType::CLASS) {
+                // Only a class's pointer is a Node (a builtin's or a
+                // function's is not).
+                if (class_node && fnTag(func_names, class_ptr).rfind("__class__:", 0) == 0 && class_node->type() == NodeType::CLASS) {
                     auto* cn = static_cast<ClassNode*>(class_node);
                     class_vars_[cn->name + "." + name] = val;
                     // Also update class_ctx_map_ so subsequent reads via evalAttribute see the new value
@@ -1517,6 +1603,13 @@ public:   // NythonExecutor is a struct: members default to public
     // == true. A list never equals a tuple.
     bool valuesEqual(const Value& a, const Value& b, int depth) {
         if (depth > 100) return false;
+        // Objects compare through __eq__ (inside containers, for `in`,
+        // index(), count(), remove()), as in Python.
+        if (isInstanceVal(a) || isInstanceVal(b)) {
+            Value r;
+            if (binaryDunder("==", a, b, global_ctx, r)) return isTruthy(r);
+            return identical(a, b);
+        }
         Num x, y;
         if (asNum(a, x) && asNum(b, y)) return numCmp(x, y) == 0;
         bool as = isStringValue(a), bs = isStringValue(b);
@@ -1960,9 +2053,10 @@ public:   // NythonExecutor is a struct: members default to public
         }
         // __getitem__ on instances
         if (isInstanceVal(obj)) {
+            if (!instanceHasMethod(obj, "__getitem__"))
+                pyRaise("TypeError", "'" + instanceClassName(obj) + "' object is not subscriptable");
             std::vector<Value> call_args = {idx};
-            Value result = callMethod(obj, "__getitem__", call_args, ctx);
-            if (result.type != ValueType::NONE) return result;
+            return callMethod(obj, "__getitem__", call_args, ctx);
         }
         return NONE_VALUE;
     }
@@ -1970,6 +2064,8 @@ public:   // NythonExecutor is a struct: members default to public
     // obj[idx] = val
     void setItem(const Value& obj, const Value& idx, const Value& val, Context* ctx) {
         if (isInstanceVal(obj)) {
+            if (!instanceHasMethod(obj, "__setitem__"))
+                throw std::string("__exc__:TypeError:'" + instanceClassName(obj) + "' object does not support item assignment");
             std::vector<Value> call_args = {idx, val};
             Value result = callMethod(obj, "__setitem__", call_args, ctx);
             if (result.type != ValueType::NONE) return;
@@ -2029,24 +2125,8 @@ public:   // NythonExecutor is a struct: members default to public
             for (auto& ch : nypy::u8_chars(*(std::string*)v.value.p)) out.push_back(makeStringValue(ch));
             return out;
         }
-        if (isInstanceVal(v)) {
-            std::vector<Value> out, no_args;
-            Value iterator = v;
-            Value itv = callMethod(v, "__iter__", no_args, ctx);
-            if (itv.type != ValueType::NONE && itv.type != ValueType::UNDEFINED) iterator = itv;
-            if (contOf(iterator)) return iterItems(iterator, ctx);
-            for (int guard = 0; guard < 100000000; guard++) {
-                Value item;
-                try { item = callMethod(iterator, "__next__", no_args, ctx); }
-                catch (nython::node::ReturnSignal& rs) { item = rs.value; }
-                catch (std::string& exc) {
-                    if (exc.find("StopIteration") != std::string::npos) break;
-                    throw;
-                }
-                out.push_back(item);
-            }
-            return out;
-        }
+        // An object: __iter__ / __next__ / a __getitem__ sequence (iterValues).
+        if (isInstanceVal(v)) return iterValues(v, ctx);
         pyRaise("TypeError", "'" + typeNameOf(v) + "' object is not iterable");
     }
     // Python's type name for messages.
@@ -2101,16 +2181,25 @@ public:   // NythonExecutor is a struct: members default to public
             if (instance_to_class.count(v.value.p)) {
                 std::vector<Value> no_args;
                 Context* c = ctx ? ctx : global_ctx;
-                if (!repr) {
+                if (!repr && instanceHasMethod(v, "__str__")) {
                     Value r;
                     try { r = callMethod(v, "__str__", no_args, c); }
                     catch (nython::node::ReturnSignal& rs) { r = rs.value; }
                     if (r.type != ValueType::NONE && r.type != ValueType::UNDEFINED) return getStringValue(r);
                 }
-                Value r;
-                try { r = callMethod(v, "__repr__", no_args, c); }
-                catch (nython::node::ReturnSignal& rs) { r = rs.value; }
-                if (r.type != ValueType::NONE && r.type != ValueType::UNDEFINED) return getStringValue(r);
+                if (instanceHasMethod(v, "__repr__")) {
+                    Value r;
+                    try { r = callMethod(v, "__repr__", no_args, c); }
+                    catch (nython::node::ReturnSignal& rs) { r = rs.value; }
+                    if (r.type != ValueType::NONE && r.type != ValueType::UNDEFINED) return getStringValue(r);
+                }
+                // An exception: its message for str(), Type('message') for
+                // repr(), as in Python and on the VM.
+                std::string cn0 = instanceClassName(v);
+                if (!cn0.empty() && isExceptionClass(cn0)) {
+                    std::string msg = exceptionMessage(v);
+                    return repr ? cn0 + "(" + nypy::str_repr(msg) + ")" : msg;
+                }
                 return "<" + typeNameOf(v) + " instance>";
             }
             auto fit = func_names.find(v.value.p);
@@ -2181,7 +2270,7 @@ public:   // NythonExecutor is a struct: members default to public
     }
     // format(value, spec), with __format__ on instances.
     std::string formatValue(const Value& v, const std::string& spec, Context* ctx) {
-        if (isInstanceVal(v)) {
+        if (isInstanceVal(v) && instanceHasMethod(v, "__format__")) {
             std::vector<Value> a = {makeStringValue(spec)};
             Value r = callMethod(v, "__format__", a, ctx ? ctx : global_ctx);
             if (r.type != ValueType::NONE && r.type != ValueType::UNDEFINED) return getStringValue(r);
@@ -2327,7 +2416,15 @@ public:   // NythonExecutor is a struct: members default to public
         }
         Value lv = evalNode(bn->left, ctx);
         Value rv = evalNode(bn->right, ctx);
-        if (opc == OP_UNKNOWN) return NONE_VALUE;
+        if (opc == OP_UNKNOWN) {
+            // a @ b: __matmul__ / __rmatmul__ only.
+            if (bn->op == "@") {
+                Value res;
+                if (binaryDunder("@", lv, rv, ctx, res)) return res;
+                pyRaise("TypeError", "unsupported operand type(s) for @: '" + typeNameOf(lv) + "' and '" + typeNameOf(rv) + "'");
+            }
+            return NONE_VALUE;
+        }
         return binaryOp(opc, lv, rv, ctx);
     }
 
@@ -2370,9 +2467,11 @@ public:   // NythonExecutor is a struct: members default to public
                 return intValue(-(numBig(n) + nypy::BigInt(1)));
             }
             if (isInstanceVal(v)) {
+                const char* d = op == "-" ? "__neg__" : op == "+" ? "__pos__" : "__invert__";
+                if (!instanceHasMethod(v, d))
+                    pyRaise("TypeError", "bad operand type for unary " + op + ": '" + instanceClassName(v) + "'");
                 std::vector<Value> no_args;
-                Value r = callMethod(v, op == "-" ? "__neg__" : op == "+" ? "__pos__" : "__invert__", no_args, ctx);
-                if (r.type != ValueType::NONE) return r;
+                return callMethod(v, d, no_args, ctx);
             }
             if (op == "+") return v;
             if (op == "~") return intValue(0);
@@ -2398,6 +2497,63 @@ public:   // NythonExecutor is a struct: members default to public
             return v; // return OLD value (post-increment)
         }
         return v;
+    }
+
+    // The dunder pair (method, reflected method) of a binary operator.
+    static bool opDunders(const std::string& op, const char*& d, const char*& rd) {
+        static const std::unordered_map<std::string, std::pair<const char*, const char*>> m = {
+            {"+", {"__add__", "__radd__"}}, {"-", {"__sub__", "__rsub__"}},
+            {"*", {"__mul__", "__rmul__"}}, {"/", {"__truediv__", "__rtruediv__"}},
+            {"%", {"__mod__", "__rmod__"}}, {"**", {"__pow__", "__rpow__"}},
+            {"//", {"__floordiv__", "__rfloordiv__"}}, {"&", {"__and__", "__rand__"}},
+            {"|", {"__or__", "__ror__"}}, {"^", {"__xor__", "__rxor__"}},
+            {"<<", {"__lshift__", "__rlshift__"}}, {">>", {"__rshift__", "__rrshift__"}},
+            {"<", {"__lt__", "__gt__"}}, {">", {"__gt__", "__lt__"}},
+            {"<=", {"__le__", "__ge__"}}, {">=", {"__ge__", "__le__"}},
+            {"==", {"__eq__", "__eq__"}}, {"!=", {"__ne__", "__ne__"}},
+            {"@", {"__matmul__", "__rmatmul__"}},
+        };
+        auto it = m.find(op);
+        if (it == m.end()) return false;
+        d = it->second.first; rd = it->second.second;
+        return true;
+    }
+    bool binaryDunder(const std::string& op, const Value& lv, const Value& rv, Context* ctx, Value& out) {
+        const char* d; const char* rd;
+        if (!opDunders(op, d, rd)) return false;
+        bool li = isInstanceValue(lv), ri = isInstanceValue(rv);
+        auto call = [&](const Value& self, const char* name, const Value& arg) {
+            std::vector<Value> a{arg};
+            out = callMethod(self, name, a, ctx);
+        };
+        if (li && instanceHasMethod(lv, d)) { call(lv, d, rv); return true; }
+        if (op == "/" && li && instanceHasMethod(lv, "__div__")) { call(lv, "__div__", rv); return true; }
+        if (ri && instanceHasMethod(rv, rd)) { call(rv, rd, lv); return true; }
+        if (op == "!=") {
+            Value eq;
+            if (binaryDunder("==", lv, rv, ctx, eq)) { out = Value(!isTruthy(eq)); return true; }
+        }
+        return false;
+    }
+    // ==, through __eq__ when either side defines it.
+    bool pyEquals(const Value& a, const Value& b, Context* ctx) {
+        if (isInstanceValue(a) || isInstanceValue(b)) {
+            Value r;
+            if (binaryDunder("==", a, b, ctx, r)) return isTruthy(r);
+        }
+        return valuesEqual(a, b, 0);
+    }
+    // <, through __lt__ / __gt__, for sorted/min/max over objects.
+    bool pyLess(const Value& a, const Value& b, Context* ctx) {
+        Value r;
+        if ((isInstanceValue(a) || isInstanceValue(b)) && binaryDunder("<", a, b, ctx, r)) return isTruthy(r);
+        std::vector<Value> none;
+        Value lt = evalBinaryValues("<", a, b, ctx);
+        return isTruthy(lt);
+    }
+    // Evaluates a binary operator on two values (no AST).
+    Value evalBinaryValues(const std::string& op, const Value& a, const Value& b, Context* ctx) {
+        return binaryOp(binOpCode(op), a, b, ctx);
     }
 
     // ─── PRINT ──────────────────────────────────────────────────────────
@@ -2479,12 +2635,28 @@ public:   // NythonExecutor is a struct: members default to public
         Value iter_val = evalNode(fn->iterable, ctx);
         std::string var_name = fn->var->value();
         Value result = NONE_VALUE;
+        // The loop variable is a local, unless the function declared it
+        // `global`/`nonlocal` (then the existing binding is rebound).
+        auto bindv = [&](const std::string& n, const Value& v) {
+            if (fn->rebinds) ctx->setByName(n, v); else ctx->defineByName(n, v);
+        };
+        // An object whose __iter__ returns a list, a generator or iter(...):
+        // the loop runs over that. (The loop below called __next__ on the
+        // list, got none forever and never ended.)
+        Value pre_iterator; bool have_pre_iterator = false;
+        if (isInstanceValue(iter_val) && instanceHasMethod(iter_val, "__iter__")) {
+            std::vector<Value> no_args;
+            Value it = callMethod(iter_val, "__iter__", no_args, ctx);
+            if (isInstanceValue(it)) { pre_iterator = it; have_pre_iterator = true; }
+            else if (it.type != ValueType::NONE && it.type != ValueType::UNDEFINED) iter_val = it;
+            else throw std::string("__exc__:TypeError:iter() returned non-iterator of type 'NoneType'");
+        }
 
         // range() returns an integer — iterate 0..n-1
         if (iter_val.type == ValueType::INTEGER) {
             int64_t n = bigint_to_i64(iter_val.value.i);
             for (int64_t i = 0; i < n; i++) {
-                ctx->defineByName(var_name, Value((int)i));
+                bindv(var_name, Value((int)i));
                 try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
                 catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
                 NY_LOOP_FLOW(broke)
@@ -2508,7 +2680,7 @@ public:   // NythonExecutor is a struct: members default to public
                     // delete entries.
                     std::vector<Value> keys = iterItems(iter_val, ctx);
                     for (auto& key : keys) {
-                        ctx->defineByName(var_name, key);
+                        bindv(var_name, key);
                         try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
                         catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
                         NY_LOOP_FLOW(broke)
@@ -2529,16 +2701,16 @@ public:   // NythonExecutor is a struct: members default to public
                                 // First var gets index 0
                                 auto it0 = elem_cont->container->find("0");
                                 if (it0 != elem_cont->container->end())
-                                    ctx->defineByName(var_name, it0->second);
+                                    bindv(var_name, it0->second);
                                 // Remaining vars get indices 1, 2, ...
                                 for (size_t ui = 0; ui < fn->unpack_vars.size(); ui++) {
                                     auto itN = elem_cont->container->find(std::to_string(ui + 1));
                                     if (itN != elem_cont->container->end())
-                                        ctx->defineByName(fn->unpack_vars[ui]->value(), itN->second);
+                                        bindv(fn->unpack_vars[ui]->value(), itN->second);
                                 }
                             }
                         } else {
-                            ctx->defineByName(var_name, elem);
+                            bindv(var_name, elem);
                         }
                         try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
                         catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
@@ -2557,7 +2729,7 @@ public:   // NythonExecutor is a struct: members default to public
                 // By character, not byte.
                 std::vector<std::string> chars = nypy::u8_chars(*static_cast<std::string*>(iter_val.value.p));
                 for (auto& ch : chars) {
-                    ctx->defineByName(var_name, makeStringValue(ch));
+                    bindv(var_name, makeStringValue(ch));
                     try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
                     catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
                     NY_LOOP_FLOW(broke)
@@ -2571,11 +2743,9 @@ public:   // NythonExecutor is a struct: members default to public
         if (iter_val.type == ValueType::USERDATA && iter_val.value.p && !string_ptrs_.count(iter_val.value.p) && instance_to_class.count(iter_val.value.p)) {
             // Call __iter__ if present to get the iterator (may return self)
             std::vector<Value> no_args;
-            Value iterator = iter_val;
-            try {
-                Value it = callMethod(iter_val, "__iter__", no_args, ctx);
-                if (it.type != ValueType::NONE && it.type != ValueType::UNDEFINED) iterator = it;
-            } catch (...) {}
+            Value iterator = have_pre_iterator ? pre_iterator : iter_val;
+            if (!instanceHasMethod(iterator, "__next__"))
+                throw std::string("__exc__:TypeError:'" + instanceClassName(iterator) + "' object is not iterable");
             // Now call __next__ repeatedly until StopIteration
             while (true) {
                 Value item;
@@ -2585,23 +2755,23 @@ public:   // NythonExecutor is a struct: members default to public
                 } catch (nython::node::ReturnSignal& rs) {
                     item = rs.value;
                 } catch (std::string& exc) {
-                    if (exc.find("StopIteration") != std::string::npos) { stop = true; }
+                    if (excTypeMatches(exc, "StopIteration") || exc.find("StopIteration") != std::string::npos) { stop = true; }
                     else throw;
-                } catch (...) { stop = true; }
+                }
                 if (stop) break;
                 // Unpack tuples for k,v iteration
                 if (!fn->unpack_vars.empty() && item.isCollectable()) {
                     auto* cont = dynamic_cast<Container*>(item.value.gc);
                     if (cont && cont->container) {
-                        ctx->defineByName(var_name, cont->container->count("0") ? (*cont->container)["0"] : NONE_VALUE);
+                        bindv(var_name, cont->container->count("0") ? (*cont->container)["0"] : NONE_VALUE);
                         for (size_t ui = 0; ui < fn->unpack_vars.size(); ui++) {
                             std::string uname = fn->unpack_vars[ui]->value();
                             auto uit = cont->container->find(std::to_string(ui + 1));
-                            ctx->defineByName(uname, uit != cont->container->end() ? uit->second : NONE_VALUE);
+                            bindv(uname, uit != cont->container->end() ? uit->second : NONE_VALUE);
                         }
                     }
                 } else {
-                    ctx->defineByName(var_name, item);
+                    bindv(var_name, item);
                 }
                 try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
                 catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
@@ -2693,6 +2863,7 @@ public:   // NythonExecutor is a struct: members default to public
         markEscaped(ctx);
         // Also store the AST node pointer so we can find the FunctionNode later
         func_ast_nodes[unique_ptr] = (void*)node.get();
+        captureDefaults(fn.get(), unique_ptr, ctx);
 
         ctx->defineByName(fn->name, func_val);
         return func_val;
@@ -2712,37 +2883,52 @@ public:   // NythonExecutor is a struct: members default to public
         yield_cache_[body.get()] = y;
         return y;
     }
+    // Whether a function body contains yield / yield from anywhere outside
+    // nested functions, lambdas and classes: in expressions (x = yield v,
+    // f((yield v))), and in every compound statement - match (an if-chain),
+    // with, except/else/finally clauses and switch cases were not looked at,
+    // so such a function ran as a plain function and its yield aborted the
+    // process with an uncaught YieldSignal.
     bool hasYield(node_ptr node) {
         if (!node) return false;
-        if (node->type() == NodeType::YIELD) return true;
-        // Check children via dynamic casts of common container nodes
-        if (auto* blk = dynamic_cast<BlockNode*>(node.get())) {
-            for (auto& s : blk->statements()) if (hasYield(s)) return true;
+        switch (node->type()) {
+            case NodeType::YIELD: case NodeType::YIELD_FROM: return true;
+            case NodeType::FUNCTION: case NodeType::LAMBDA: case NodeType::CLASS:
+            case NodeType::COMPREHENSION:
+                return false;
+            default: break;
         }
-        if (auto* fn = dynamic_cast<FunctionNode*>(node.get())) {
-            // Don't recurse into nested function defs (they are separate generators)
-            return false;
-        }
-        if (auto* ifn = dynamic_cast<IfNode*>(node.get())) {
-            return hasYield(ifn->then_branch) || hasYield(ifn->else_branch);
-        }
-        if (auto* wn = dynamic_cast<WhileNode*>(node.get())) {
-            return hasYield(wn->body);
-        }
-        if (auto* forn = dynamic_cast<ForNode*>(node.get())) {
-            return hasYield(forn->body);
-        }
-        if (auto* tryn = dynamic_cast<TryNode*>(node.get())) {
-            return hasYield(tryn->body);
-        }
-        // Check inside var declarations and assignments (yield as expression)
-        if (auto* vd = dynamic_cast<VarDeclNode*>(node.get())) {
-            return vd->init && hasYield(vd->init);
-        }
-        if (auto* an = dynamic_cast<AssignmentNode*>(node.get())) {
-            return hasYield(an->value_node);
-        }
-        return false;
+        Node* n = node.get();
+        auto any = [&](std::initializer_list<node_ptr> xs) { for (auto& x : xs) if (hasYield(x)) return true; return false; };
+        auto anyv = [&](const std::vector<node_ptr>& xs) { for (auto& x : xs) if (hasYield(x)) return true; return false; };
+        if (auto* ifn = dynamic_cast<IfNode*>(n))
+            return any({ifn->condition, ifn->then_branch, ifn->else_branch}) || anyv(ifn->elseif_branches);
+        if (auto* wn = dynamic_cast<WhileNode*>(n)) return any({wn->condition, wn->body, wn->else_branch});
+        if (auto* forn = dynamic_cast<ForNode*>(n)) return any({forn->iterable, forn->body, forn->else_branch});
+        if (auto* tryn = dynamic_cast<TryNode*>(n))
+            return any({tryn->body, tryn->else_clause, tryn->finally_clause}) || anyv(tryn->except_clauses);
+        if (auto* en = dynamic_cast<ExceptNode*>(n)) return hasYield(en->body);
+        if (auto* wn = dynamic_cast<WithNode*>(n)) return any({wn->expr, wn->body});
+        if (auto* sw = dynamic_cast<SwitchNode*>(n)) return any({sw->subject, sw->default_case}) || anyv(sw->cases);
+        if (auto* cs = dynamic_cast<CaseNode*>(n)) return any({cs->value_node, cs->body});
+        if (auto* dn = dynamic_cast<DefaultNode*>(n)) return hasYield(dn->body);
+        if (auto* rn = dynamic_cast<ReturnNode*>(n)) return hasYield(rn->expr);
+        if (auto* vd = dynamic_cast<VarDeclNode*>(n)) return hasYield(vd->init);
+        if (auto* an = dynamic_cast<AssignmentNode*>(n)) return any({an->target, an->value_node});
+        if (auto* an = dynamic_cast<AugAssignNode*>(n)) return any({an->target, an->value_node});
+        if (auto* wl = dynamic_cast<WalrusNode*>(n)) return hasYield(wl->init);
+        if (auto* un = dynamic_cast<UnaryNode*>(n)) return hasYield(un->operand);
+        if (auto* bn = dynamic_cast<BinaryNode*>(n)) return any({bn->left, bn->right});
+        if (auto* cn = dynamic_cast<CallNode*>(n)) return hasYield(cn->callee) || anyv(cn->args);
+        if (auto* kn = dynamic_cast<KeywordArgNode*>(n)) return hasYield(kn->val);
+        if (auto* at = dynamic_cast<AttributeNode*>(n)) return hasYield(at->object);
+        if (auto* sb = dynamic_cast<SubscriptNode*>(n)) return any({sb->object, sb->index});
+        if (auto* me = dynamic_cast<MapEntryNode*>(n)) return any({me->key, me->val});
+        if (auto* pn = dynamic_cast<PrintNode*>(n)) return anyv(pn->args);
+        if (auto* rn = dynamic_cast<RaiseNode*>(n)) return any({rn->expr, rn->cause});
+        if (auto* as = dynamic_cast<AssertNode*>(n)) return any({as->condition, as->message});
+        // Blocks, statement lists, list/tuple/map literals.
+        return anyv(n->statements());
     }
 
     // Wrap a plain function Value into a method bound to `self_val`.
@@ -2811,6 +2997,11 @@ public:   // NythonExecutor is a struct: members default to public
         if (fn_val.type != ValueType::USERDATA || !fn_val.value.p) return NONE_VALUE;
         auto fit = func_names.find(fn_val.value.p);
         if (fit == func_names.end()) return NONE_VALUE;
+        // A class passed as a callable (map(Point, xs), a factory argument).
+        if (fit->second.rfind("__class__:", 0) == 0) {
+            static const std::unordered_map<std::string, Value> no_kw;
+            return instantiateClass(fn_val, call_args, no_kw, ctx);
+        }
         // A builtin, an instance or a class is not an AST function: treating its
         // pointer as a Node* crashed (thread_create(print), key=len, map(str, xs)).
         if (fit->second.rfind("__builtin__:", 0) == 0) return callBuiltin(fit->second.substr(12), call_args, ctx);
@@ -2831,37 +3022,10 @@ public:   // NythonExecutor is a struct: members default to public
             Context* closure_parent = ctx;
             auto cit = closure_contexts.find(fn_val.value.p);
             if (cit != closure_contexts.end()) closure_parent = cit->second;
-            // Generator detection: run with yield_sink_ set so yield appends and continues
-            if (bodyYields(fn_node->body)) {
-                std::vector<Value> yielded;
-                yield_sink_ = &yielded;
-                Context* fn_ctx_probe = new Context(runner, fn_node->name, nullptr, nullptr, closure_parent);
-                CtxReaper _reap_fn_ctx_probe2003(this, fn_ctx_probe);
-                bindParams(fn_node, call_args, fn_ctx_probe, ctx, fn_val.value.p);
-                try { evalBody(fn_node->body, fn_ctx_probe); }
-                catch (nython::node::ReturnSignal&) {}
-                catch (...) {}
-                yield_sink_ = nullptr;
-                if (!yielded.empty()) {
-                    Object* gen_obj = new Object((Runnable*)runner, "__gen__", Type::LIST);
-                    int len = (int)yielded.size();
-                    for (int i = 0; i < len; i++) gen_obj->set(std::to_string(i), yielded[(size_t)i]);
-                    gen_obj->set("__len__", Value(len));
-                    gen_obj->set("__gen__", Value(1));
-                    gen_obj->set("__idx__", Value(0));
-                    return Value((Collectable*)gen_obj);
-                }
-            }
-            // Normal (non-generator) function
             Context* fn_ctx = new Context(runner, fn_node->name, nullptr, nullptr, closure_parent);
             CtxReaper _reap_fn_ctx2020(this, fn_ctx);
             bindParams(fn_node, call_args, fn_ctx, ctx, fn_val.value.p);
-            try {
-                Value rv = evalBody(fn_node->body, fn_ctx);
-                return rv;
-            } catch (nython::node::ReturnSignal& r) { return r.value; }
-            catch (std::string& _ex) { throw; }
-            catch (...) { return NONE_VALUE; }
+            return runFunctionBody(fn_node, fn_ctx);
         } else if (raw->type() == NodeType::LAMBDA) {
             auto* lam = static_cast<LambdaNode*>(raw);
             Context* closure_parent = ctx;
@@ -2869,26 +3033,8 @@ public:   // NythonExecutor is a struct: members default to public
             if (cit != closure_contexts.end()) closure_parent = cit->second;
             Context* fn_ctx = new Context(runner, "<lambda>", nullptr, nullptr, closure_parent);
             CtxReaper _reap_fn_ctx2033(this, fn_ctx);
-            {
-                size_t arg_idx = 0;
-                for (size_t i = 0; i < lam->params.size(); i++) {
-                    std::string pname = lam->params[i]->value();
-                    if (pname.size() > 1 && pname[0] == '*' && pname[1] != '*') {
-                        std::string real_name = pname.substr(1);
-                        Object* varargs = new Object((Runnable*)runner, "list", Type::LIST);
-                        int va_idx = 0;
-                        while (arg_idx < call_args.size()) {
-                            varargs->set(std::to_string(va_idx++), call_args[arg_idx++]);
-                        }
-                        varargs->set("__len__", Value(va_idx));
-                        fn_ctx->defineByName(real_name, Value((Collectable*)varargs));
-                    } else if (arg_idx < call_args.size()) {
-                        fn_ctx->defineByName(pname, call_args[arg_idx++]);
-                    } else {
-                        fn_ctx->defineByName(pname, NONE_VALUE);
-                    }
-                }
-            }
+            static const std::unordered_map<std::string, Value> no_kw;
+            bindLambdaParams(lam, call_args, no_kw, fn_ctx, closure_parent);
             return evalNode(lam->body, fn_ctx);
         }
         return NONE_VALUE;
@@ -2936,6 +3082,20 @@ public:   // NythonExecutor is a struct: members default to public
                      const std::unordered_map<std::string, Value>* kw_in = nullptr) {
         static const std::unordered_map<std::string, Value> kEmptyKw;
         const std::unordered_map<std::string, Value>& kw_args_in = kw_in ? *kw_in : kEmptyKw;
+        // A generator (eager, see collectGenerator): send(v) advances it as
+        // next() does - the value is not delivered, `x = yield` reads none
+        // on this engine (the VM delivers it) - and close() exhausts it.
+        if (isGenValue(obj)) {
+            if (method_name == "send" || method_name == "__next__") {
+                std::vector<Value> a{obj};
+                return callBuiltin("next", a, ctx);
+            }
+            if (method_name == "close") {
+                auto* c = dynamic_cast<Container*>(obj.value.gc);
+                (*c->container)["__idx__"] = (*c->container)["__len__"];
+                return NONE_VALUE;
+            }
+        }
         {
             Value pm;
             if (primitiveMember(obj, method_name, args, ctx, pm)) return pm;
@@ -3435,26 +3595,26 @@ public:   // NythonExecutor is a struct: members default to public
         }
 
 
-        if (class_node && func_names.find(class_ptr) != func_names.end() && class_node->type() == NodeType::CLASS) {
+        // Methods through the class namespaces and the C3 MRO.
+        if (class_node && class_node->type() == NodeType::CLASS) {
+            Value out;
+            if (callClassMethod(obj, method_name, args, kw_args_in, ctx, out)) return out;
+        }
+
+        if (class_node && fnTag(func_names, class_ptr).rfind("__class__:", 0) == 0 && class_node->type() == NodeType::CLASS) {
             auto* cn = static_cast<ClassNode*>(class_node);
 
             // Check class_ctx_map_ first — this respects @staticmethod/@property/@classmethod decorators
             auto class_ctx_it = class_ctx_map_.find((void*)class_node);
             if (class_ctx_it != class_ctx_map_.end()) {
                 Context* ccx = class_ctx_it->second;
+                // The class's own namespace only: getByName went on into the
+                // enclosing scopes, so a global of the method's name (the
+                // builtin hash for obj.hash()) was taken for a method.
                 Value method_val;
-                try { method_val = ccx->getByName(method_name); } catch (...) {}
-                // The lookup reaches global builtins too; one the class does
-                // not hold itself is no member (c.hash() is the object
-                // protocol's), and its pointer is no AST node to inspect.
-                if (method_val.type == ValueType::USERDATA && method_val.value.p) {
-                    auto bit = func_names.find(method_val.value.p);
-                    if (bit != func_names.end() && bit->second.rfind("__builtin__:", 0) == 0) {
-                        bool own = false;
-                        ccx->access_container_shared([&](ContainerType* c) { own = c && c->count(method_name); });
-                        if (own) return callBuiltin(bit->second.substr(12), args, ctx);
-                        method_val = Value();
-                    }
+                if (ccx && ccx->container) {
+                    auto own = ccx->container->find(method_name);
+                    if (own != ccx->container->end()) method_val = own->second;
                 }
                 if (method_val.type == ValueType::USERDATA && method_val.value.p) {
                     void* ast_ptr = method_val.value.p;
@@ -3552,16 +3712,14 @@ public:   // NythonExecutor is a struct: members default to public
                                 size_t ai = i - ps;
                                 if (ai < args.size()) fc->defineByName(fn->params[i]->value(), args[ai]);
                                 else if (i < fn->defaults.size() && fn->defaults[i])
-                                    fc->defineByName(fn->params[i]->value(), evalNode(fn->defaults[i], ctx));
+                                    fc->defineByName(fn->params[i]->value(), paramDefault(fn, i, ctx));
                                 else fc->defineByName(fn->params[i]->value(), NONE_VALUE);
                             }
                         }
                         // Set __parent_class__ so super() works in this method
                         if (cn->bases.size() > 0)
                             fc->defineByName("__parent_class__", internString(cn->bases[0]->value()));
-                        try { Value r = evalBody(fn->body, fc); return r; }
-                        catch (nython::node::ReturnSignal& r) { return r.value; }
-                        catch (std::string& e) { throw; }
+                        return runFunctionBody(fn, fc);
                     }
                 }
             }
@@ -3602,15 +3760,7 @@ public:   // NythonExecutor is a struct: members default to public
                                 if (arg_idx < args.size())
                                     fn_ctx->defineByName(fn->params[i]->value(), args[arg_idx]);
                             }
-                            try {
-                                Value result = evalBody(fn->body, fn_ctx);
-                                return result;
-                            } catch (nython::node::ReturnSignal& ret) {
-                                return ret.value;
-                            } catch (std::string& flow) {
-                                if (flow.size()>7 && flow.substr(0,7)=="__exc__") throw;
-                                return NONE_VALUE;
-                            }
+                            return runFunctionBody(fn, fn_ctx);
                         }
                     }
                 }
@@ -3618,18 +3768,12 @@ public:   // NythonExecutor is a struct: members default to public
         }
 
         // Check ALL parent classes (multiple inheritance via MRO)
-        if (class_node && func_names.find(class_ptr) != func_names.end() && class_node->type() == NodeType::CLASS) {
+        if (class_node && fnTag(func_names, class_ptr).rfind("__class__:", 0) == 0 && class_node->type() == NodeType::CLASS) {
             auto* cn_check = static_cast<ClassNode*>(class_node);
             for (auto& base_node : cn_check->bases) {
                 std::string parent_name = base_node->value();
-                Value parent_class_val;
-                try { parent_class_val = ctx->getByName(parent_name); } catch (...) { continue; }
-                if (parent_class_val.type != ValueType::USERDATA || !parent_class_val.value.p) continue;
-                void* parent_ast = parent_class_val.value.p;
-                auto past_it = func_ast_nodes.find(parent_ast);
-                if (past_it != func_ast_nodes.end()) parent_ast = past_it->second;
-                Node* parent_node = (Node*)parent_ast;
-                if (!parent_node || parent_node->type() != NodeType::CLASS) continue;
+                Node* parent_node = classNodeByName(parent_name);
+                if (!parent_node) continue;
                 auto* pcn = static_cast<ClassNode*>(parent_node);
                 if (!pcn->body) continue;
                 for (auto& stmt : pcn->body->statements()) {
@@ -3644,9 +3788,7 @@ public:   // NythonExecutor is a struct: members default to public
                     // arguments left a missing parameter undefined, so an
                     // inherited `def m(self, x=5)` saw x as "" (round 74).
                     bindParamsKw(fn, args, kw_args_in, fn_ctx, ctx, param_start);
-                    try { return evalBody(fn->body, fn_ctx); }
-                    catch (nython::node::ReturnSignal& ret) { return ret.value; }
-                    catch (std::string& _exc) { if (_exc.size()>7 && _exc.substr(0,7)=="__exc__") throw; return NONE_VALUE; }
+                    return runFunctionBody(fn, fn_ctx);
                 }
             }
         }
@@ -3673,9 +3815,7 @@ public:   // NythonExecutor is a struct: members default to public
                                     size_t param_start = 0;
                                     if (!fn->params.empty() && fn->params[0]->value() == "self") param_start = 1;
                                     bindParamsKw(fn, args, kw_args_in, fn_ctx, ctx, param_start);   // defaults too (round 74)
-                                    try { Value result = evalBody(fn->body, fn_ctx); return result; }
-                                    catch (nython::node::ReturnSignal& ret) { return ret.value; }
-                                    catch (std::string& flow) { if (flow=="break"||flow=="continue") throw; if (flow.size()>7&&flow.substr(0,7)=="__exc__") throw; return NONE_VALUE; }
+                                    return runFunctionBody(fn, fn_ctx);
                                 }
                             }
                         }
@@ -3686,7 +3826,7 @@ public:   // NythonExecutor is a struct: members default to public
         }
 
          // Try parent class methods (inheritance)
-        if (class_node && func_names.find(class_ptr) != func_names.end() && class_node->type() == NodeType::CLASS) {
+        if (class_node && fnTag(func_names, class_ptr).rfind("__class__:", 0) == 0 && class_node->type() == NodeType::CLASS) {
             auto parent_it = class_parent.find(class_ptr);
             if (parent_it != class_parent.end()) {
                 auto parent_class_it = class_by_name.find(parent_it->second);
@@ -3705,9 +3845,7 @@ public:   // NythonExecutor is a struct: members default to public
                                         size_t param_start = 0;
                                         if (!fn->params.empty() && fn->params[0]->value() == "self") param_start = 1;
                                         bindParamsKw(fn, args, kw_args_in, fn_ctx, ctx, param_start);   // defaults too (round 74)
-                                        try { Value result = evalBody(fn->body, fn_ctx); return result; }
-                                        catch (nython::node::ReturnSignal& ret) { return ret.value; }
-                                        catch (std::string& flow) { if (flow.size()>7&&flow.substr(0,7)=="__exc__") throw; return NONE_VALUE; }
+                                        return runFunctionBody(fn, fn_ctx);
                                     }
                                 }
                             }
@@ -3731,9 +3869,20 @@ public:   // NythonExecutor is a struct: members default to public
             if (r.type != ValueType::UNDEFINED) return r;
         }
 
-        // Fallback: try calling as a regular attribute
-        Value method_val = evalAttribute(std::make_shared<AttributeNode>(
-            Token(), std::make_shared<VariableNode>(Token()), method_name), ctx);
+        // Nothing of that name: __getattr__ may supply it; otherwise an
+        // instance or a class raises AttributeError (the call returned none,
+        // which hid misspelt method names).
+        if (isInstanceValue(obj) && method_name != "__getattr__" && instanceHasMethod(obj, "__getattr__")) {
+            std::vector<Value> a{makeStringValue(method_name)};
+            Value target = callMethod(obj, "__getattr__", a, ctx);
+            if (isInstanceValue(target) && instanceHasMethod(target, "__call__"))
+                return callMethod(target, "__call__", args, ctx, kw_in);
+            return callFunctionValue(target, args, ctx);
+        }
+        {
+            std::string err;
+            if (attributeErrorFor(obj, method_name, err)) throw err;
+        }
         return NONE_VALUE;
     }
 
@@ -3749,6 +3898,10 @@ public:   // NythonExecutor is a struct: members default to public
         class_val.value.p = (void*)node.get();
         func_names[(void*)node.get()] = "__class__:" + cn->name;
         class_by_name[cn->name] = (void*)node.get();
+        mro_cache_.clear();
+        if (cn->body)
+            for (auto& st : cn->body->statements())
+                if (st && st->type() == NodeType::FUNCTION) direct_methods_.insert(st.get());
         // Store parent class if exists
         if (!cn->bases.empty()) {
             // bases[0] is a VariableNode with parent class name
@@ -3757,6 +3910,7 @@ public:   // NythonExecutor is a struct: members default to public
         ctx->defineByName(cn->name, class_val);
         if (cn->body) {
             Context* class_ctx = new Context(runner, cn->name, nullptr, nullptr, ctx);
+            class_ctx->inClass = true;
             evalNode(cn->body, class_ctx);
             // Store the evaluated class context so decorators (@property, @staticmethod) are visible
             class_ctx_map_[(void*)node.get()] = class_ctx;
@@ -3850,21 +4004,12 @@ public:   // NythonExecutor is a struct: members default to public
                 auto un = static_pointer_cast<UnaryNode>(a);
                 if (un->op == "*") {
                     // *iterable spread: unpack list/range into positional args
+                    // (any iterable: a string's characters, a dict's keys,
+                    // an object's __iter__ - a string was passed whole)
                     Value spread_val = evalNode(un->operand, ctx);
-                    if (spread_val.isCollectable() && spread_val.value.gc) {
-                        auto* cont = dynamic_cast<Container*>(spread_val.value.gc);
-                        if (cont && cont->container) {
-                            auto len_it = cont->container->find("__len__");
-                            int len = len_it != cont->container->end()
-                                      ? static_cast<int>(bigint_to_i64(len_it->second.value.i)) : 0;
-                            for (int i = 0; i < len; i++) {
-                                auto it = cont->container->find(std::to_string(i));
-                                if (it != cont->container->end()) call_args.push_back(it->second);
-                            }
-                        }
-                    } else if (spread_val.type == ValueType::INTEGER) {
-                        int64_t n = bigint_to_i64(spread_val.value.i);
-                        for (int64_t i = 0; i < n; i++) call_args.push_back(Value((int)i));
+                    if ((spread_val.isCollectable() && spread_val.value.gc) || spread_val.type == ValueType::INTEGER
+                        || isInstanceValue(spread_val) || isStringValue(spread_val)) {
+                        for (auto& v : iterValues(spread_val, ctx)) call_args.push_back(v);
                     } else {
                         call_args.push_back(spread_val);
                     }
@@ -3917,44 +4062,135 @@ public:   // NythonExecutor is a struct: members default to public
             }
         }
         std::vector<Value>& args_in = *argp;
-        bindParamsImpl(fn, args_in, kw_args, fn_ctx, eval_ctx, skip_params);
+        bindParamsImpl(fn, args_in, kw_args, fn_ctx, eval_ctx, skip_params, callee_ptr);
     }
+    // Default values, evaluated once when the def statement runs, in the
+    // scope it runs in (Python's rule). They used to be evaluated at every
+    // call, in the CALLER's scope: `n = 5; def f(x=n)` then `n = 10; f()`
+    // gave 10, `def f(L=[])` got a new list each call, and `def f(i=i)` in a
+    // loop read an undefined i.
+    std::unordered_map<void*, std::vector<Value>> fn_defaults_val_;
+    std::unordered_map<const Node*, std::vector<Value>> fn_defaults_node_;
+    void captureDefaults(FunctionNode* fn, void* fn_ptr, Context* ctx) {
+        bool any = false;
+        for (auto& d : fn->defaults) if (d) { any = true; break; }
+        if (!any) return;
+        std::vector<Value> vals(fn->params.size(), UNDEFINED_VALUE);
+        for (size_t i = 0; i < fn->params.size() && i < fn->defaults.size(); i++)
+            if (fn->defaults[i]) vals[i] = evalNode(fn->defaults[i], ctx);
+        fn_defaults_node_[fn] = vals;
+        if (fn_ptr) fn_defaults_val_[fn_ptr] = std::move(vals);
+    }
+    Value paramDefault(FunctionNode* fn, size_t i, Context* eval_ctx, void* callee_ptr = nullptr) {
+        if (callee_ptr) {
+            auto it = fn_defaults_val_.find(callee_ptr);
+            if (it != fn_defaults_val_.end() && i < it->second.size() && it->second[i].type != ValueType::UNDEFINED)
+                return it->second[i];
+        }
+        auto nt = fn_defaults_node_.find(fn);
+        if (nt != fn_defaults_node_.end() && i < nt->second.size() && nt->second[i].type != ValueType::UNDEFINED)
+            return nt->second[i];
+        return evalNode(fn->defaults[i], eval_ctx);
+    }
+    // Python's binding: positional arguments fill the plain parameters in
+    // order, `*name` takes the rest, a bare `*` ends the positional ones,
+    // keywords fill parameters by name, `**name` takes only the keywords no
+    // parameter named (they were all copied into it), and a parameter given
+    // neither takes its default. A keyword used to win over a positional
+    // argument for the same parameter without consuming it, so the
+    // positional one shifted onto the next parameter.
     void bindParamsImpl(FunctionNode* fn, std::vector<Value>& call_args,
                         const std::unordered_map<std::string, Value>& kw_args,
-                        Context* fn_ctx, Context* eval_ctx, size_t skip_params) {
+                        Context* fn_ctx, Context* eval_ctx, size_t skip_params,
+                        void* callee_ptr = nullptr) {
         size_t arg_idx = 0;
+        bool star_seen = false, has_varargs = false;
+        std::string kw_collect;
+        std::unordered_set<std::string> named;
+        std::vector<std::string> missing;
+        std::string err;
+        size_t min_pos = 0, max_pos = 0;
         for (size_t i = skip_params; i < fn->params.size(); i++) {
             std::string pname = fn->params[i]->value();
+            if (pname == "*") { star_seen = true; continue; }
             if (pname.size() > 1 && pname[0] == '*' && pname[1] != '*') {
+                has_varargs = true;
                 // *args: collect remaining positional args into a list
                 std::string real_name = pname.substr(1);
                 Object* varargs = new Object((Runnable*)runner, "list", Type::LIST);
                 int va_idx = 0;
-                while (arg_idx < call_args.size()) {
+                while (!star_seen && arg_idx < call_args.size()) {
                     varargs->set(std::to_string(va_idx++), call_args[arg_idx++]);
                 }
                 varargs->set("__len__", Value(va_idx));
                 fn_ctx->defineByName(real_name, Value((Collectable*)varargs));
+                star_seen = true;
             } else if (pname.size() > 2 && pname[0] == '*' && pname[1] == '*') {
-                // **kwargs: collect all keyword args into a dict
-                std::string real_name = pname.substr(2);
-                Object* kwargs_obj = new Object((Runnable*)runner, "map", Type::LIST);
-                for (auto& [k, v] : kw_args) kwargs_obj->set(k, v);
-                fn_ctx->defineByName(real_name, Value((Collectable*)kwargs_obj));
+                kw_collect = pname.substr(2);
             } else {
-                // Named match: check kw_args first, then positional
+                if (!kw_args.empty()) named.insert(pname);   // only read when keywords were passed
                 auto kw_it = kw_args.find(pname);
-                if (kw_it != kw_args.end()) {
-                    fn_ctx->defineByName(pname, kw_it->second);
-                } else if (arg_idx < call_args.size()) {
+                bool has_default = i < fn->defaults.size() && fn->defaults[i];
+                if (!star_seen) { max_pos++; if (!has_default) min_pos++; }
+                if (!star_seen && arg_idx < call_args.size()) {
+                    if (kw_it != kw_args.end() && err.empty())
+                        err = fn->name + "() got multiple values for argument '" + pname + "'";
                     fn_ctx->defineByName(pname, call_args[arg_idx++]);
-                } else if (i < fn->defaults.size() && fn->defaults[i]) {
-                    fn_ctx->defineByName(pname, evalNode(fn->defaults[i], eval_ctx));
+                } else if (kw_it != kw_args.end()) {
+                    fn_ctx->defineByName(pname, kw_it->second);
+                } else if (has_default) {
+                    fn_ctx->defineByName(pname, paramDefault(fn, i, eval_ctx, callee_ptr));
                 } else {
                     fn_ctx->defineByName(pname, NONE_VALUE);
+                    missing.push_back(pname);
                 }
             }
         }
+        if (!kw_collect.empty()) {
+            Object* kwargs_obj = new Object((Runnable*)runner, "map", Type::MAP);
+            for (auto& [k, v] : kw_args) if (!named.count(k)) kwargs_obj->set(k, v);
+            fn_ctx->defineByName(kw_collect, Value((Collectable*)kwargs_obj));
+        } else if (err.empty()) {
+            for (auto& [k, v] : kw_args)
+                if (!named.count(k)) { err = fn->name + "() got an unexpected keyword argument '" + k + "'"; break; }
+        }
+        // A call that does not fit raises TypeError, in Python's words (the
+        // missing parameters were none and extra arguments were dropped).
+        // A bound self counts, as Python counts it.
+        if (err.empty())
+            err = nython::ny_arity_error(fn->name, missing, min_pos + skip_params,
+                                         has_varargs ? -1L : (long)(max_pos + skip_params),
+                                         call_args.size() + skip_params);
+        if (!err.empty()) throw std::string("__exc__:TypeError:" + err);
+    }
+    // The same for a lambda: binds its parameters (positional, keyword,
+    // *args, defaults evaluated in `def_ctx`) and checks the call fits.
+    void bindLambdaParams(LambdaNode* lam, std::vector<Value>& args,
+                          const std::unordered_map<std::string, Value>& kw, Context* fc, Context* def_ctx) {
+        size_t ai = 0, min_pos = 0, max_pos = 0;
+        bool has_varargs = false;
+        std::vector<std::string> missing;
+        for (size_t i = 0; i < lam->params.size(); i++) {
+            std::string pname = lam->params[i]->value();
+            if (pname.size() > 1 && pname[0] == '*' && pname[1] != '*') {
+                Object* varargs = new Object((Runnable*)runner, "list", Type::LIST);
+                int va_idx = 0;
+                while (ai < args.size()) varargs->set(std::to_string(va_idx++), args[ai++]);
+                varargs->set("__len__", Value(va_idx));
+                fc->defineByName(pname.substr(1), Value((Collectable*)varargs));
+                has_varargs = true;
+                continue;
+            }
+            bool has_default = i < lam->defaults.size() && lam->defaults[i];
+            max_pos++; if (!has_default) min_pos++;
+            auto kw_it = kw.find(pname);
+            if (ai < args.size()) fc->defineByName(pname, args[ai++]);
+            else if (kw_it != kw.end()) fc->defineByName(pname, kw_it->second);
+            else if (has_default) fc->defineByName(pname, evalNode(lam->defaults[i], def_ctx));
+            else { fc->defineByName(pname, NONE_VALUE); missing.push_back(pname); }
+        }
+        std::string err = nython::ny_arity_error("", missing, min_pos, has_varargs ? -1L : (long)max_pos, args.size());
+        if (!err.empty()) throw std::string("__exc__:TypeError:" + err);
     }
 
     // Helper: bind function params with *args/*kwargs support
@@ -4304,6 +4540,19 @@ public:
                 if (call_node->callee && call_node->callee->type() == NodeType::SUPER)
                     is_super_call = true;
             }
+            if (is_super_call && !owner_stack_.empty() && owner_stack_.back()) {
+                // super().m(...): m from the class after the one defining the
+                // running method, in the MRO of self's class, called with the
+                // keyword arguments; its exceptions propagate. (Only the
+                // first base of the class was searched, keyword arguments were
+                // dropped and every exception was swallowed.)
+                Value self_val = ctx->getByName("self");
+                std::vector<Value> sargs; std::unordered_map<std::string, Value> skw;
+                evalCallArgs(cn->args, ctx, sargs, skw);
+                Value out;
+                if (superCall(self_val, owner_stack_.back(), method_name, sargs, skw, ctx, out)) return out;
+                return NONE_VALUE;
+            }
             if (is_super_call) {
                 Value self_val = ctx->getByName("self");
                 // Find parent class name from __parent_class__ (set by child init dispatch)
@@ -4321,6 +4570,12 @@ public:
                 }
                 std::vector<Value> args; std::unordered_map<std::string, Value> kw_args;
                 evalCallArgs(cn->args, ctx, args, kw_args);
+                // super().__init__(...) reaching a builtin exception class.
+                if ((method_name == "__init__" || method_name == "init") && !parent_name.empty()
+                    && !classNodeByName(parent_name) && nython::ny_is_builtin_exc(parent_name)) {
+                    setExceptionArgs(self_val, args);
+                    return NONE_VALUE;
+                }
                 if (!parent_name.empty()) {
                     auto pcit = class_by_name.find(parent_name);
                     if (pcit != class_by_name.end()) {
@@ -4340,16 +4595,14 @@ public:
                                         size_t ai = i - ps;
                                         if (ai < args.size()) fn_ctx->defineByName(fn->params[i]->value(), args[ai]);
                                         else if (i < fn->defaults.size() && fn->defaults[i])
-                                            fn_ctx->defineByName(fn->params[i]->value(), evalNode(fn->defaults[i], ctx));
+                                            fn_ctx->defineByName(fn->params[i]->value(), paramDefault(fn, i, ctx));
                                         else fn_ctx->defineByName(fn->params[i]->value(), NONE_VALUE);
                                     }
                                     // Set parent chain for chained super() calls
                                     if (!pcn->bases.empty())
                                         fn_ctx->defineByName("__parent_class__", internString(pcn->bases[0]->value()));
                                     fn_ctx->defineByName("__instance__", self_val);
-                                    try { Value r = evalBody(fn->body, fn_ctx); return r; }
-                                    catch (nython::node::ReturnSignal& r) { return r.value; }
-                                    catch (...) {}
+                                    return runFunctionBody(fn, fn_ctx);
                                 }
                             }
                         }
@@ -4366,45 +4619,8 @@ public:
 
             // Check class_ctx_map_ FIRST for decorated methods (e.g. @decorator on class method)
             // This ensures we call the decorated wrapper with self injected into *args.
-            if (obj.type == ValueType::USERDATA && obj.value.p && !string_ptrs_.count(obj.value.p) && instance_to_class.count(obj.value.p)) {
-                void* cp2 = instance_to_class[obj.value.p];
-                void* ast2 = cp2;
-                auto ai2 = func_ast_nodes.find(cp2);
-                if (ai2 != func_ast_nodes.end()) ast2 = ai2->second;
-                Node* cn2 = (Node*)ast2;
-                auto cctx_it = class_ctx_map_.find((void*)cn2);
-                if (cctx_it == class_ctx_map_.end()) cctx_it = class_ctx_map_.find(cp2);
-                if (cctx_it != class_ctx_map_.end()) {
-                    Value decorated_method;
-                    try { decorated_method = cctx_it->second->getByName(method_name); } catch (...) {}
-                    if (decorated_method.type == ValueType::USERDATA && decorated_method.value.p &&
-                        func_names.count(decorated_method.value.p)) {
-                        const std::string& dmt = func_names[decorated_method.value.p];
-                        bool is_deco_fn = dmt.find("__func__:") == 0;
-                        bool is_deco_lam = dmt.find("__lambda__") == 0;
-                        if (is_deco_fn || is_deco_lam) {
-                            // Check if it's a decorated wrapper (first param != "self")
-                            void* ast3 = decorated_method.value.p;
-                            auto ai3 = func_ast_nodes.find(decorated_method.value.p);
-                            if (ai3 != func_ast_nodes.end()) ast3 = ai3->second;
-                            Node* raw3 = (Node*)ast3;
-                            bool is_decorated_wrapper = false;
-                            if (raw3 && raw3->type() == NodeType::FUNCTION) {
-                                auto* fn3 = static_cast<FunctionNode*>(raw3);
-                                is_decorated_wrapper = (fn3->params.empty() || 
-                                    (fn3->params[0]->value() != "self" && fn3->params[0]->value() != "this"));
-                            }
-                            if (is_decorated_wrapper) {
-                                // Prepend self to args so *args wrapper receives all
-                                std::vector<Value> with_self2;
-                                with_self2.push_back(obj);
-                                for (auto& a : args) with_self2.push_back(a);
-                                return callFunctionValue(decorated_method, with_self2, ctx);
-                            }
-                        }
-                    }
-                }
-            }
+            // (Decorated methods - functions a decorator returned into the
+            // class namespace - are called by callMethod through the MRO.)
 
             // In Nython, everything is an object. Attributes can store callables
             // (functions, lambdas, closures). Check the attribute VALUE first;
@@ -4414,6 +4630,9 @@ public:
                 if (pit != instance_properties.end()) {
                     try {
                         Value attr_val = pit->second->getByName(method_name);
+                        // An object with __call__ held in an attribute.
+                        if (isInstanceValue(attr_val) && instanceHasMethod(attr_val, "__call__"))
+                            return callMethod(attr_val, "__call__", args, ctx, &kw_args);
                         if (attr_val.type == ValueType::USERDATA && attr_val.value.p) {
                             auto fname_it = func_names.find(attr_val.value.p);
                             if (fname_it != func_names.end()) {
@@ -4449,8 +4668,7 @@ public:
                                         if (cit != closure_contexts.end()) cp = cit->second;
                                         Context* fc = new Context(runner, "<lambda>", nullptr, nullptr, cp);
                                         CtxReaper _reap_fc3618(this, fc);
-                                        for (size_t i = 0; i < lam->params.size() && i < args.size(); i++)
-                                            fc->defineByName(lam->params[i]->value(), args[i]);
+                                        bindLambdaParams(lam, args, kw_args, fc, cp);
                                         return evalNode(lam->body, fc);
                                     } else if (raw->type() == NodeType::FUNCTION) {
                                         auto fn = static_cast<FunctionNode*>(raw);
@@ -4460,14 +4678,12 @@ public:
                                         Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
                                         CtxReaper _reap_fc3627(this, fc);
                                         bindParams(fn, args, fc, ctx, attr_val.value.p);
-                                        try { return evalBody(fn->body, fc); }
-                                        catch (nython::node::ReturnSignal& r) { return r.value; }
-                                        catch (...) { return NONE_VALUE; }
+                                        return runFunctionBody(fn, fc);
                                     }
                                 }
                             }
                         }
-                    } catch (...) {}
+                    } catch (...) { throw; }   // the call's exceptions propagate
                 }
             }
 
@@ -4496,9 +4712,7 @@ public:
                                         Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
                                         CtxReaper _reap_fc3662(this, fc);
                                         bindParamsKw(fn, args, kw_args, fc, ctx, 0, attr_val.value.p);
-                                        try { Value r = evalBody(fn->body, fc); return r; }
-                                        catch (nython::node::ReturnSignal& r) { return r.value; }
-                                        catch (...) { return NONE_VALUE; }
+                                        return runFunctionBody(fn, fc);
                                     }
                                 }
                             }
@@ -4517,7 +4731,9 @@ public:
                 // calls instead of n (v.add(1).add(1).add(1) incremented by 7).
                 // Reuse it via receiver_cache_ instead of evaluating again.
                 receiver_cache_[attr->object.get()] = obj;
-                Value callee_val = evalNode(cn->callee, ctx);
+                Value callee_val;
+                try { callee_val = evalAttribute(cn->callee, ctx, true); }
+                catch (...) { receiver_cache_.erase(attr->object.get()); throw; }
                 receiver_cache_.erase(attr->object.get());
                 // Only use the fallback for builtin functions stored in dict namespaces
                 // (e.g. math.sqrt). For class methods (__func__), let callMethod handle
@@ -4553,38 +4769,8 @@ public:
                             func_names[instance.value.p] = "__instance__:" + className;
                             Context* props = new Context(runner, className + "_props", nullptr, nullptr, nullptr);
                             instance_properties[instance.value.p] = props;
-                            // Find and call init
-                            Node* class_node_raw = (Node*)callee_val.value.p;
-                            if (class_node_raw && class_node_raw->type() == NodeType::CLASS) {
-                                auto* cn_inner = static_cast<ClassNode*>(class_node_raw);
-                                if (cn_inner->body) {
-                                    for (auto& stmt : cn_inner->body->statements()) {
-                                        if (stmt->type() == NodeType::FUNCTION) {
-                                            auto* fn = static_cast<FunctionNode*>(stmt.get());
-                                            if (fn->name == "init" || fn->name == "__init__") {
-                                                Context* fn_ctx = new Context(runner, "init", nullptr, nullptr, ctx);
-                                                CtxReaper _reap_fn_ctx3711(this, fn_ctx);
-                                                fn_ctx->defineByName("self", instance);
-                                                size_t ps = (!fn->params.empty() && fn->params[0]->value() == "self") ? 1 : 0;
-                                                for (size_t i = ps; i < fn->params.size(); i++) {
-                                                    size_t ai = i - ps;
-                                                    if (ai < args.size()) fn_ctx->defineByName(fn->params[i]->value(), args[ai]);
-                                                    else if (i < fn->defaults.size() && fn->defaults[i]) fn_ctx->defineByName(fn->params[i]->value(), evalNode(fn->defaults[i], ctx));
-                                                    else fn_ctx->defineByName(fn->params[i]->value(), NONE_VALUE);
-                                                }
-                                                // A bare `return` inside __init__ is legitimate control
-                                                // flow (ReturnSignal) and is swallowed here; anything
-                                                // else — NameError, a user exception, IndexError — must
-                                                // propagate like it does for every other function call,
-                                                // not be silently discarded (see NythonExecutor.hpp's
-                                                // other ReturnSignal-only catches for the same pattern).
-                                                try { evalBody(fn->body, fn_ctx); } catch (nython::node::ReturnSignal&) {}
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            if (isExceptionClass(className)) setExceptionArgs(instance, args);
+                            runConstructor(instance, args, kw_args, ctx);
                             return instance;
                         }
                     }
@@ -4599,6 +4785,17 @@ public:
                 else if (key_it != kw_args.end()) args.insert(args.begin(), key_it->second);
             }
             return callMethod(obj, method_name, args, ctx, &kw_args);
+        }
+
+        // super(args) / a bare super() call: Nython's shorthand for calling
+        // the parent class's constructor (super(name, 4)). It did nothing.
+        if (cn->callee->type() == NodeType::SUPER && !owner_stack_.empty() && owner_stack_.back()) {
+            Value self_val = ctx->getByName("self");
+            std::vector<Value> sargs; std::unordered_map<std::string, Value> skw;
+            evalCallArgs(cn->args, ctx, sargs, skw);
+            Value out;
+            superCall(self_val, owner_stack_.back(), "__init__", sargs, skw, ctx, out);
+            return NONE_VALUE;
         }
 
         Value callee = evalNode(cn->callee, ctx);
@@ -4702,39 +4899,11 @@ public:
                     Context* closure_parent = ctx;
                     auto cit = closure_contexts.find(callee.value.p);
                     if (cit != closure_contexts.end()) closure_parent = cit->second;
-                    // Generator detection: run with yield_sink_ set (only if yield exists in AST)
-                    if (bodyYields(fn->body)) {
-                        std::vector<Value> yielded;
-                        yield_sink_ = &yielded;
-                        Context* probe_ctx = new Context(runner, fn->name, nullptr, nullptr, closure_parent);
-                        CtxReaper _reapProbe(this, probe_ctx);
-                        bindParamsKw(fn, args, kw_args, probe_ctx, ctx, 0, callee.value.p);
-                        try { evalBody(fn->body, probe_ctx); }
-                        catch (nython::node::ReturnSignal&) {}
-                        catch (...) {}
-                        yield_sink_ = nullptr;
-                        if (!yielded.empty()) {
-                            Object* gen_obj = new Object((Runnable*)runner, "__gen__", Type::LIST);
-                            int glen = (int)yielded.size();
-                            for (int gi = 0; gi < glen; gi++) gen_obj->set(std::to_string(gi), yielded[(size_t)gi]);
-                            gen_obj->set("__len__", Value(glen));
-                            gen_obj->set("__gen__", Value(1));
-                            gen_obj->set("__idx__", Value(0));
-                            return Value((Collectable*)gen_obj);
-                        }
-                    }
                     Context* fn_ctx = new Context(runner, fn->name, nullptr, nullptr, closure_parent);
                     CtxReaper _reap(this, fn_ctx);
                     // Bind parameters with keyword arg and *args support
                     bindParamsKw(fn, args, kw_args, fn_ctx, ctx, 0, callee.value.p);
-                    try {
-                        Value result = evalBody(fn->body, fn_ctx);
-                        return result;
-                    } catch (nython::node::ReturnSignal& ret) {
-                        return ret.value;
-                    } catch (std::string& _ex) {
-                        throw; // re-propagate user exceptions (__exc__) and flow signals
-                    }
+                    return runFunctionBody(fn, fn_ctx);
                 } else if (raw->type() == NodeType::LAMBDA) {
                     auto lam = static_cast<LambdaNode*>(raw);
                     // Use closure context if available (for returned lambdas)
@@ -4743,19 +4912,7 @@ public:
                     if (cit2 != closure_contexts.end()) closure_parent = cit2->second;
                     Context* fn_ctx = new Context(runner, "<lambda>", nullptr, nullptr, closure_parent);
                     CtxReaper _reap_fn_ctx3854(this, fn_ctx);
-                    for (size_t i = 0; i < lam->params.size(); i++) {
-                        std::string pname = lam->params[i]->value();
-                        auto kw_it = kw_args.find(pname);
-                        if (kw_it != kw_args.end()) {
-                            fn_ctx->defineByName(pname, kw_it->second);
-                        } else if (i < args.size()) {
-                            fn_ctx->defineByName(pname, args[i]);
-                        } else if (i < lam->defaults.size() && lam->defaults[i]) {
-                            fn_ctx->defineByName(pname, evalNode(lam->defaults[i], closure_parent));
-                        } else {
-                            fn_ctx->defineByName(pname, NONE_VALUE);
-                        }
-                    }
+                    bindLambdaParams(lam, args, kw_args, fn_ctx, closure_parent);
                     Value result = evalNode(lam->body, fn_ctx);
                     return result;
                 }
@@ -4765,7 +4922,9 @@ public:
         // __call__ protocol: if callee is an instance with __call__ method, invoke it
         if (callee.type == ValueType::USERDATA && callee.value.p && !string_ptrs_.count(callee.value.p) &&
             fname.find("__instance__:") == 0 && instance_to_class.count(callee.value.p)) {
-            Value call_result = callMethod(callee, "__call__", args, ctx);
+            if (!instanceHasMethod(callee, "__call__"))
+                throw std::string("__exc__:TypeError:'" + instanceClassName(callee) + "' object is not callable");
+            Value call_result = callMethod(callee, "__call__", args, ctx, &kw_args);
             if (call_result.type != ValueType::NONE) return call_result;
             // __call__ returned none — still return it (it IS the result)
             // Check if __call__ method exists at all before returning NONE
@@ -4794,117 +4953,8 @@ public:
         }
 
         // Class instantiation: __class__:Name
-        if (callee.type == ValueType::USERDATA && callee.value.p && fname.find("__class__:") == 0) {
-            std::string className = fname.substr(10);
-            // Create new instance object
-            Value instance;
-            instance.type = ValueType::USERDATA;
-            auto inst_ptr = std::make_unique<std::string>("__instance__:" + className);
-            instance.value.p = (void*)inst_ptr.get();
-            instance_store.push_back(std::move(inst_ptr));
-            instance_to_class[instance.value.p] = callee.value.p; // track class
-            func_names[instance.value.p] = "__instance__:" + className;
-            // Create property storage for this instance
-            Context* props = new Context(runner, className + "_props", nullptr, nullptr, nullptr);
-            instance_properties[instance.value.p] = props;
-
-            // Create instance context inheriting class methods
-            Context* inst_ctx = new Context(runner, className + "_instance", nullptr, nullptr, ctx);
-            inst_ctx->defineByName("self", instance);
-
-            // Look for __init__ / init method and call it
-            Node* class_node = (Node*)callee.value.p;
-            bool found_init = false;
-            if (class_node->type() == NodeType::CLASS) {
-                auto* cn_raw = static_cast<ClassNode*>(class_node);
-                if (cn_raw->body) {
-                    // Look for init method in class body
-                    for (auto& stmt : cn_raw->body->statements()) {
-                        if (stmt->type() == NodeType::FUNCTION) {
-                            auto* fn = static_cast<FunctionNode*>(stmt.get());
-                            if (fn->name == "init" || fn->name == "__init__") {
-                                found_init = true;
-                                Context* fn_ctx = new Context(runner, "init", nullptr, nullptr, ctx);
-                                fn_ctx->defineByName("self", instance);
-                                fn_ctx->defineByName("this", instance);
-                                size_t ps = 0;
-                                if (!fn->params.empty() && fn->params[0]->value() == "self") ps = 1;
-                                for (size_t i = ps; i < fn->params.size(); i++) {
-                                    size_t ai = i - ps;
-                                    if (ai < args.size()) {
-                                        fn_ctx->defineByName(fn->params[i]->value(), args[ai]);
-                                    } else if (i < fn->defaults.size() && fn->defaults[i]) {
-                                        fn_ctx->defineByName(fn->params[i]->value(), evalNode(fn->defaults[i], ctx));
-                                    } else {
-                                        fn_ctx->defineByName(fn->params[i]->value(), NONE_VALUE);
-                                    }
-                                }
-                                // Set up super() - find parent class and bind its init
-                                if (cn_raw->bases.size() > 0) {
-                                    std::string pname = cn_raw->bases[0]->value();
-                                    fn_ctx->defineByName("__parent_class__", internString(pname));
-                                    fn_ctx->defineByName("__instance__", instance);
-                                }
-                                // See the identical comment on the other __init__ call sites in
-                                // this file: only ReturnSignal (a bare `return`) is swallowed here.
-                                try { evalBody(fn->body, fn_ctx); } catch (nython::node::ReturnSignal&) {}
-                            }
-                        }
-                    }
-                }
-            }
-            // If no init found in child, walk full inheritance chain to find init
-            if (!found_init) {
-                // Walk the MRO: start from current class, go to its parent, then grandparent, etc.
-                Node* search_node = class_node;
-                for (int depth = 0; depth < 10 && !found_init; depth++) {
-                    if (!search_node || search_node->type() != NodeType::CLASS) break;
-                    auto* cn_walk = static_cast<ClassNode*>(search_node);
-                    if (cn_walk->bases.empty()) break;
-                    // Try each base
-                    bool advanced = false;
-                    for (auto& base_node_ptr : cn_walk->bases) {
-                        std::string parent_name = base_node_ptr->value();
-                        Value parent_val;
-                        try { parent_val = ctx->getByName(parent_name); } catch (...) { continue; }
-                        if (parent_val.type != ValueType::USERDATA || !parent_val.value.p) continue;
-                        void* past = parent_val.value.p;
-                        auto pit = func_ast_nodes.find(past);
-                        if (pit != func_ast_nodes.end()) past = pit->second;
-                        Node* pnode = (Node*)past;
-                        if (!pnode || pnode->type() != NodeType::CLASS) continue;
-                        auto* pcn = static_cast<ClassNode*>(pnode);
-                        if (pcn->body) {
-                            for (auto& stmt : pcn->body->statements()) {
-                                if (stmt->type() == NodeType::FUNCTION) {
-                                    auto* fn = static_cast<FunctionNode*>(stmt.get());
-                                    if (fn->name == "init" || fn->name == "__init__") {
-                                        found_init = true;
-                                        Context* fn_ctx = new Context(runner, "init", nullptr, nullptr, ctx);
-                                        fn_ctx->defineByName("self", instance);
-                                        size_t ps = (!fn->params.empty() && fn->params[0]->value() == "self") ? 1 : 0;
-                                        for (size_t i = ps; i < fn->params.size(); i++) {
-                                            size_t ai = i - ps;
-                                            if (ai < args.size()) fn_ctx->defineByName(fn->params[i]->value(), args[ai]);
-                                            else if (i < fn->defaults.size() && fn->defaults[i])
-                                                fn_ctx->defineByName(fn->params[i]->value(), evalNode(fn->defaults[i], ctx));
-                                            else fn_ctx->defineByName(fn->params[i]->value(), NONE_VALUE);
-                                        }
-                                        try { evalBody(fn->body, fn_ctx); }
-                                        catch (nython::node::ReturnSignal&) {}
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if (!advanced) { search_node = pnode; advanced = true; }
-                        if (found_init) break;
-                    }
-                    if (!advanced) break;
-                }
-            }
-            return instance;
-        }
+        if (callee.type == ValueType::USERDATA && callee.value.p && fname.find("__class__:") == 0)
+            return instantiateClass(callee, args, kw_args, ctx);
 
         // Check for Object.call if callee is collectable
         if (callee.isCollectable() && callee.value.gc) {
@@ -5034,10 +5084,23 @@ public:
 
     // Public (struct default) so the VM builtin bridge can dispatch by name.
     Value callBuiltin(const std::string& name_orig, std::vector<Value>& args, Context* ctx) {
+        {
+            Value r;
+            if (iterableBuiltin(name_orig, args, ctx, r)) return r;
+        }
+        if (name_orig.rfind("__prop_setter__:", 0) == 0) {
+            uintptr_t gp = 0;
+            std::istringstream iss(name_orig.substr(16));
+            iss >> std::hex >> gp;
+            if (!args.empty()) prop_setters_[reinterpret_cast<void*>(gp)] = args[0];
+            Value g; g.type = ValueType::USERDATA; g.value.p = reinterpret_cast<void*>(gp);
+            return g;
+        }
         // ── Exception type constructors ─────────────────────────────────────────
         // ── property() and staticmethod() ─────────────────────────────────────
         if (name_orig == "property") {
             // property(fn) — tag the function value with __property__ marker
+            any_property_ = true;
             if (!args.empty() && args[0].type == ValueType::USERDATA && args[0].value.p) {
                 func_names[args[0].value.p] += "__property__";
                 return args[0];
@@ -5166,7 +5229,10 @@ public:
     // Per OS thread (round 74): two threads can run the same call node.
     static inline thread_local std::unordered_map<const void*, Value> receiver_cache_;
 
-    Value evalAttribute(node_ptr node, Context* ctx) {
+    // soft: a missing attribute of an instance or class reads UNDEFINED
+    // instead of raising AttributeError (for hasattr/getattr, and for the
+    // method-call path, where callMethod decides).
+    Value evalAttribute(node_ptr node, Context* ctx, bool soft = false) {
         auto an = static_pointer_cast<AttributeNode>(node);
         Value obj;
         {
@@ -5196,9 +5262,7 @@ public:
                                 if (cit != closure_contexts.end()) closure_parent = cit->second;
                                 Context* fc = new Context(runner, fn->name, nullptr, nullptr, closure_parent);
                                 fc->defineByName("self", obj);
-                                try { Value r = evalBody(fn->body, fc); return r; }
-                                catch (nython::node::ReturnSignal& r) { return r.value; }
-                                catch (...) {}
+                                return runFunctionBody(fn, fc);
                             }
                         }
                     }
@@ -5238,38 +5302,31 @@ public:
             auto ast_it = func_ast_nodes.find(class_ptr);
             if (ast_it != func_ast_nodes.end()) ast_ptr = ast_it->second;
             Node* class_node = (Node*)ast_ptr;
-            if (class_node && func_names.find(class_ptr) != func_names.end() && class_node->type() == NodeType::CLASS) {
+            if (class_node && fnTag(func_names, class_ptr).rfind("__class__:", 0) == 0 && class_node->type() == NodeType::CLASS) {
               // The class itself, then its bases depth-first, left to right.
               // Only the instance's own class used to be searched here, so a
               // method inherited from a base read as `none` when taken as a
               // value (`cb = self.on_resize` in a subclass) even though
               // calling it directly worked - the call path walks the chain.
-              std::vector<Node*> mro;
-              {
-                  std::vector<Node*> todo{class_node};
-                  while (!todo.empty() && mro.size() < 64) {
-                      Node* k = todo.front();
-                      todo.erase(todo.begin());
-                      if (!k || k->type() != NodeType::CLASS) continue;
-                      if (std::find(mro.begin(), mro.end(), k) != mro.end()) continue;
-                      mro.push_back(k);
-                      size_t at = 0;
-                      for (auto& b : static_cast<ClassNode*>(k)->bases) {
-                          auto bit = class_by_name.find(b->value());
-                          if (bit != class_by_name.end())
-                              todo.insert(todo.begin() + (long)(at++), (Node*)bit->second);
-                      }
-                  }
-              }
+              // C3 MRO, as the VM and method calls use.
+              std::vector<Node*> mro = classMro(class_node);
               for (Node* mro_node : mro) {
                 class_node = mro_node;
                 auto* cn = static_cast<ClassNode*>(class_node);
-                // Check class body context (handles @staticmethod, @property, class vars)
+                // Check class body context (handles @staticmethod, @property, class vars).
+                // Only the class's own namespace: getByName walked on into the
+                // scope the class was defined in, so reading a missing
+                // attribute returned any same-named variable there (a global
+                // `a` read as obj.a).
                 auto ctx_it = class_ctx_map_.find((void*)class_node);
-                if (ctx_it != class_ctx_map_.end()) {
-                    Value cv;
-                    try { cv = ctx_it->second->getByName(an->attr); } catch (...) {}
-                    if (cv.type != ValueType::UNDEFINED && cv.type != ValueType::NONE) {
+                if (ctx_it != class_ctx_map_.end() && ctx_it->second && ctx_it->second->container) {
+                    Value cv = UNDEFINED_VALUE;
+                    {
+                        auto own = ctx_it->second->container->find(an->attr);
+                        if (own != ctx_it->second->container->end()) cv = own->second;
+                    }
+                    if (cv.type == ValueType::NONE) return cv;   // `x = None` in the class body
+                    if (cv.type != ValueType::UNDEFINED) {
                         // Check if this is a @property getter — invoke it with self
                         if (cv.type == ValueType::USERDATA && cv.value.p) {
                             auto fn_it = func_names.find(cv.value.p);
@@ -5285,9 +5342,7 @@ public:
                                     if (cit2 != closure_contexts.end()) cp = cit2->second;
                                     Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
                                     fc->defineByName("self", obj);
-                                    try { Value r = evalBody(fn->body, fc); return r; }
-                                    catch (nython::node::ReturnSignal& r) { return r.value; }
-                                    catch (...) {}
+                                    return runFunctionBody(fn, fc);
                                 }
                             }
                         }
@@ -5316,8 +5371,109 @@ public:
               }
             }
         }
+        return specialAttribute(obj, an->attr, ctx, soft);
+    }
+    // obj.name for a value in hand: UNDEFINED when it has no such attribute.
+    Value lookupAttribute(const Value& obj, const std::string& name, Context* ctx) {
+        auto objn = std::make_shared<VariableNode>(Token());
+        auto an = std::make_shared<AttributeNode>(Token(), objn, name);
+        receiver_cache_[objn.get()] = obj;
+        try {
+            Value v = evalAttribute(an, ctx, true);
+            receiver_cache_.erase(objn.get());
+            return v;
+        } catch (...) { receiver_cache_.erase(objn.get()); throw; }
+    }
+    // The AttributeError for obj.name, when obj is an instance or a class.
+    bool attributeErrorFor(const Value& obj, const std::string& name, std::string& err) {
+        if (isInstanceValue(obj)) {
+            err = "__exc__:AttributeError:'" + instanceClassName(obj) + "' object has no attribute '" + name + "'";
+            return true;
+        }
+        if (obj.type == ValueType::USERDATA && obj.value.p) {
+            std::string t = fnTag(func_names, obj.value.p);
+            if (t.rfind("__class__:", 0) == 0) {
+                std::string cn = t.substr(10);
+                size_t tag = cn.find("__");
+                if (tag != std::string::npos && tag > 0) cn = cn.substr(0, tag);
+                err = "__exc__:AttributeError:type object '" + cn + "' has no attribute '" + name + "'";
+                return true;
+            }
+        }
+        return false;
+    }
+    // Attributes every value answers: __name__ of a function or class (and of
+    // the name string type() returns), an instance's __class__, and what an
+    // instance's __getattr__ supplies for anything it does not have.
+    // Properties: a getter function tagged __property__; its setter, from
+    // @prop.setter, is kept here.
+    std::unordered_map<void*, Value> prop_setters_;
+    bool any_property_ = false;   // no property anywhere: attribute stores skip the class lookup
+    std::vector<std::unique_ptr<std::string>> prop_setter_ids_;
+    Value specialAttribute(const Value& obj, const std::string& attr, Context* ctx, bool soft = false) {
+        if (obj.type == ValueType::USERDATA && obj.value.p) {
+            auto fit = func_names.find(obj.value.p);
+            // prop.setter: a callable that records its argument as the
+            // property's setter and returns the property.
+            if (attr == "setter" && fit != func_names.end() && fit->second.find("__property__") != std::string::npos) {
+                std::ostringstream os; os << "__prop_setter__:" << obj.value.p;
+                prop_setter_ids_.push_back(std::make_unique<std::string>(os.str()));
+                void* id = prop_setter_ids_.back().get();
+                func_names[id] = "__builtin__:" + os.str();
+                Value v; v.type = ValueType::USERDATA; v.value.p = id;
+                return v;
+            }
+            // C.__mro__ / C.__bases__: the classes, in C3 order / as written.
+            if ((attr == "__mro__" || attr == "__bases__") && fit != func_names.end()
+                && fit->second.rfind("__class__:", 0) == 0) {
+                Node* cn = classNodeByName(fit->second.substr(10));
+                std::vector<Value> out;
+                if (cn) {
+                    std::vector<Node*> seq;
+                    if (attr == "__mro__") seq = classMro(cn);
+                    else for (auto& b : static_cast<ClassNode*>(cn)->bases) if (Node* bn = classNodeByName(b->value())) seq.push_back(bn);
+                    for (Node* c : seq) { Value cv; cv.type = ValueType::USERDATA; cv.value.p = (void*)c; out.push_back(cv); }
+                }
+                return makeListValue(out, attr == "__mro__");
+            }
+            if (attr == "__name__") {
+                if (fit != func_names.end()) {
+                    const std::string& t = fit->second;
+                    size_t c = t.find(':');
+                    std::string nm = c == std::string::npos ? t : t.substr(c + 1);
+                    size_t tag = nm.find("__");
+                    if (tag != std::string::npos && tag > 0) nm = nm.substr(0, tag);   // name__static__ etc
+                    return makeStringValue(nm);
+                }
+                if (isStringValue(obj)) return obj;
+            }
+            if (isInstanceValue(obj)) {
+                if (attr == "__class__") {
+                    Value cv; cv.type = ValueType::USERDATA;
+                    cv.value.p = instance_to_class[obj.value.p];
+                    return cv;
+                }
+                if (instanceHasMethod(obj, "__getattr__")) {
+                    std::vector<Value> a{makeStringValue(attr)};
+                    return callMethod(obj, "__getattr__", a, ctx);
+                }
+            }
+        }
+        // A missing attribute of an instance or a class: hasattr / getattr
+        // see it as missing. A plain read still gives none - library code
+        // (lib/gui.ny above all) probes optional attributes that way
+        // (`if w.rect != none`, `widget.is_layout == true`); raising
+        // AttributeError there is one switch away once those idioms are
+        // ported to hasattr/getattr. Calling a missing method does raise
+        // (callMethod).
+        std::string err;
+        if (attributeErrorFor(obj, attr, err)) {
+            if (soft) return UNDEFINED_VALUE;
+            if (kStrictAttributeReads) throw err;
+        }
         return NONE_VALUE;
     }
+    static constexpr bool kStrictAttributeReads = false;
 
     // ─── RETURN ─────────────────────────────────────────────────────────
     Value evalReturn(node_ptr node, Context* ctx) {
@@ -5329,6 +5485,111 @@ public:
     }
 
     // ─── TRY / EXCEPT ───────────────────────────────────────────────────
+    // ── Iteration protocol ─────────────────────────────────────────────
+    // The values a `for` over `v` visits, in order: a list's items (a
+    // generator here is a list), a map's keys, a string's characters, the
+    // numbers below an integer (what range() returns on this engine), or an
+    // instance's __iter__/__next__ protocol (a __getitem__ sequence without
+    // __iter__ is indexed from 0 until IndexError).
+    std::vector<Value> iterValues(const Value& v, Context* ctx) {
+        std::vector<Value> out;
+        if (v.type == ValueType::INTEGER) {
+            int64_t n = bigint_to_i64(v.value.i);
+            for (int64_t i = 0; i < n; i++) out.push_back(Value((int)i));
+            return out;
+        }
+        // Lists, tuples, sets, generators, dicts (their typed keys) and
+        // strings (by character): the shared iteration (iterItems).
+        if ((v.isCollectable() && v.value.gc) || isStringValue(v)) return iterItems(v, ctx);
+        if (isInstanceValue(v)) {
+            std::vector<Value> no_args;
+            Value iterator = v;
+            if (instanceHasMethod(v, "__iter__")) {
+                iterator = callMethod(v, "__iter__", no_args, ctx);
+                if (!isInstanceValue(iterator)) return iterValues(iterator, ctx);
+            } else if (!instanceHasMethod(v, "__next__") && instanceHasMethod(v, "__getitem__")) {
+                for (int i = 0; ; i++) {
+                    std::vector<Value> ia{Value(i)};
+                    try { out.push_back(callMethod(v, "__getitem__", ia, ctx)); }
+                    catch (std::string& flow) {
+                        if (excTypeMatches(flow, "IndexError") || excTypeMatches(flow, "StopIteration")) break;
+                        throw;
+                    }
+                }
+                return out;
+            }
+            if (!instanceHasMethod(iterator, "__next__"))
+                throw std::string("__exc__:TypeError:'" + instanceClassName(v) + "' object is not iterable");
+            while (true) {
+                try { out.push_back(callMethod(iterator, "__next__", no_args, ctx)); }
+                catch (std::string& flow) {
+                    if (excTypeMatches(flow, "StopIteration") || flow.find("StopIteration") != std::string::npos) break;
+                    throw;
+                }
+            }
+            return out;
+        }
+        if (v.type == ValueType::USERDATA && v.value.p && !func_names.count(v.value.p)) {
+            const std::string& sv = *static_cast<std::string*>(v.value.p);
+            for (size_t i = 0; i < sv.size(); i++) out.push_back(makeStringValue(std::string(1, sv[i])));
+        }
+        return out;
+    }
+    // Binds a for/comprehension target: a name, or a (nested) tuple of
+    // targets unpacked from the value.
+    void bindTarget(node_ptr target, const Value& v, Context* ctx) {
+        if (!target) return;
+        if (target->type() == NodeType::TUPLE || target->type() == NodeType::LIST) {
+            std::vector<Value> items = iterValues(v, ctx);
+            auto elems = target->statements();
+            for (size_t i = 0; i < elems.size(); i++)
+                bindTarget(elems[i], i < items.size() ? items[i] : NONE_VALUE, ctx);
+            return;
+        }
+        ctx->defineByName(target->value(), v);
+    }
+
+    Value evalComprehensionNode(node_ptr node, Context* ctx) {
+        auto cn = static_pointer_cast<ComprehensionNode>(node);
+        // The targets live in the comprehension's own scope, as in Python 3:
+        // `x = 10; [x for x in range(3)]` leaves x == 10.
+        Context* cc = new Context(runner, "<comprehension>", nullptr, nullptr, ctx);
+        CtxReaper _reap_cc(this, cc);
+        std::vector<Value> items;
+        std::vector<std::pair<Value, Value>> kvs;
+        std::function<void(size_t)> clause = [&](size_t k) {
+            auto& cl = cn->clauses[k];
+            // The first iterable is evaluated in the enclosing scope.
+            Value itv = evalNode(cl.iter, k == 0 ? ctx : cc);
+            for (auto& item : iterValues(itv, cc)) {
+                bindTarget(cl.target, item, cc);
+                bool keep = true;
+                for (auto& c : cl.conds) if (!isTruthy(evalNode(c, cc))) { keep = false; break; }
+                if (!keep) continue;
+                if (k + 1 < cn->clauses.size()) clause(k + 1);
+                else if (cn->kind == ComprehensionNode::DICT) {
+                    Value kv = evalNode(cn->elt, cc);
+                    kvs.push_back({kv, evalNode(cn->value, cc)});
+                }
+                else items.push_back(evalNode(cn->elt, cc));
+            }
+        };
+        if (!cn->clauses.empty()) clause(0);
+        if (cn->kind == ComprehensionNode::DICT) {
+            // Keys keep their type (1, "1" and 1.0 as Python treats them).
+            Value d = makeDictValue();
+            Container* cont = contOf(d);
+            for (auto& [k, v] : kvs) dictSet(cont, k, v);
+            return d;
+        }
+        Value lst = makeListValue(items);
+        if (cn->kind == ComprehensionNode::SET) {
+            std::vector<Value> sa{lst};
+            return callBuiltin("set", sa, ctx);
+        }
+        return lst;
+    }
+
     Value evalComprehension(node_ptr node, Context* ctx) {
         auto cn = static_pointer_cast<ComplexNode>(node);
         if (cn->items.size() < 2) return NONE_VALUE;
@@ -5389,157 +5650,294 @@ public:
 
     }
 
+    // The ClassNode declared under `name`, or nullptr (an interface, a
+    // builtin, or nothing).
+    Node* classNodeByName(const std::string& name) {
+        auto it = class_by_name.find(name);
+        if (it == class_by_name.end()) return nullptr;
+        Node* n = (Node*)it->second;
+        return (n && n->type() == NodeType::CLASS) ? n : nullptr;
+    }
+    std::string instanceClassName(const Value& v) {
+        if (v.type != ValueType::USERDATA || !v.value.p) return std::string();
+        auto fn_it = func_names.find(v.value.p);
+        if (fn_it != func_names.end() && fn_it->second.rfind("__instance__:", 0) == 0)
+            return fn_it->second.substr(13);
+        auto cit = instance_to_class.find(v.value.p);
+        if (cit != instance_to_class.end())
+            for (auto& kv : class_by_name) if (kv.second == cit->second) return kv.first;
+        return std::string();
+    }
+    // A list value holding `items`.
+    // The items of a list-like value, in order.
+    std::vector<Value> listItems(const Value& v) {
+        std::vector<Value> out;
+        if (!v.isCollectable() || !v.value.gc) return out;
+        auto* cont = dynamic_cast<Container*>(v.value.gc);
+        if (!cont || !cont->container) return out;
+        auto li = cont->container->find("__len__");
+        int n = li != cont->container->end() ? (int)bigint_to_i64(li->second.value.i) : 0;
+        for (int i = 0; i < n; i++) {
+            auto it = cont->container->find(std::to_string(i));
+            out.push_back(it != cont->container->end() ? it->second : NONE_VALUE);
+        }
+        return out;
+    }
+    // Sets an exception instance's args (and the legacy msg) from the
+    // constructor or super().__init__ arguments.
+    void setExceptionArgs(const Value& inst, const std::vector<Value>& args) {
+        auto pit = instance_properties.find(inst.value.p);
+        if (pit == instance_properties.end()) return;
+        pit->second->defineByName("args", makeListValue(args));
+        pit->second->defineByName("msg", makeStringValue(args.size() == 1 ? valueToDisplay(args[0]) : std::string()));
+    }
+    std::string valueToDisplay(const Value& v) {
+        if (v.type == ValueType::USERDATA && v.value.p && instance_to_class.count(v.value.p))
+            return instanceString(v, global_ctx);
+        if (isStringValue(v)) return getStringValue(v);
+        if (v.type == ValueType::USERDATA) return getStringValue(v);
+        std::vector<Value> sa{v};
+        return getStringValue(callBuiltin("str", sa, global_ctx));
+    }
+    // Python's BaseException.__str__ over the instance's args.
+    std::string exceptionMessage(const Value& inst) {
+        auto pit = instance_properties.find(inst.value.p);
+        if (pit == instance_properties.end()) return std::string();
+        Value a = pit->second->getByName("args");
+        std::vector<Value> items = listItems(a);
+        if (a.type == ValueType::UNDEFINED) {
+            Value m = pit->second->getByName("msg");
+            return m.type == ValueType::UNDEFINED ? std::string() : valueToDisplay(m);
+        }
+        if (items.empty()) return std::string();
+        if (items.size() == 1) return valueToDisplay(items[0]);
+        std::string r = "(";
+        for (size_t i = 0; i < items.size(); i++) { if (i) r += ", "; r += valueToDisplay(items[i]); }
+        return r + ")";
+    }
+    // str(instance): its __str__/__repr__, an exception's message, or
+    // "<Class instance>".
+    std::string instanceString(const Value& inst, Context* ctx) {
+        std::vector<Value> sa{inst};
+        return getStringValue(callBuiltin("str", sa, ctx ? ctx : global_ctx));
+    }
+
+    // ── Exceptions ──────────────────────────────────────────────────────
+    // An exception travels as a std::string: "__exc__:Type:message" for a
+    // builtin exception, "__exc__:Class:__obj__:<ptr>" for a raised instance
+    // (the instance itself is kept in exc_instance_map_), or any other string
+    // for a plain `raise "text"`.
+    std::vector<std::string> handling_exc_;   // except clauses running, innermost last (bare raise)
+
+    static std::string excTypeOf(const std::string& flow) {
+        if (flow.size() > 8 && flow.compare(0, 8, "__exc__:") == 0) {
+            size_t c = flow.find(':', 8);
+            return flow.substr(8, c == std::string::npos ? std::string::npos : c - 8);
+        }
+        return std::string();
+    }
+    Value excInstanceOf(const std::string& flow) {
+        size_t op = flow.find(":__obj__:");
+        if (op == std::string::npos || flow.compare(0, 8, "__exc__:") != 0) return NONE_VALUE;
+        uintptr_t ptr_val = 0;
+        std::istringstream iss(flow.substr(op + 9));
+        iss >> std::hex >> ptr_val;
+        auto eit = exc_instance_map_.find(reinterpret_cast<void*>(ptr_val));
+        return eit != exc_instance_map_.end() ? eit->second : NONE_VALUE;
+    }
+    // The exception object an except clause binds: the raised instance, or
+    // for an error raised as "__exc__:Type:message" (runtime errors, native
+    // builtins) a new instance of that builtin class with the message as its
+    // argument; a plain message string when no such class exists.
+    Value exceptionObject(const std::string& flow) {
+        Value inst = excInstanceOf(flow);
+        if (inst.type != ValueType::NONE) return inst;
+        std::string t = excTypeOf(flow);
+        Node* cn = t.empty() ? nullptr : classNodeByName(t);
+        if (cn && flow.rfind("__exc__:", 0) == 0) {
+            Value cv; cv.type = ValueType::USERDATA; cv.value.p = (void*)cn;
+            if (fnTag(func_names, cv.value.p).rfind("__class__:", 0) == 0) {
+                std::vector<Value> a{makeStringValue(excMessageOf(flow))};
+                static const std::unordered_map<std::string, Value> no_kw;
+                Value obj = instantiateClass(cv, a, no_kw, global_ctx);
+                exc_instance_map_[obj.value.p] = obj;
+                return obj;
+            }
+        }
+        return makeStringValue(excMessageOf(flow));
+    }
+    // The message of an exception string: what str(e) gives in an except.
+    std::string excMessageOf(const std::string& flow) {
+        Value inst = excInstanceOf(flow);
+        if (inst.type != ValueType::NONE) return instanceString(inst, global_ctx);
+        if (flow.size() > 8 && flow.compare(0, 8, "__exc__:") == 0) {
+            size_t c = flow.find(':', 8);
+            return c == std::string::npos ? std::string() : flow.substr(c + 1);
+        }
+        return flow;
+    }
+    // "Type: message", the uncaught form.
+    std::string describeException(const std::string& flow) {
+        std::string t = excTypeOf(flow);
+        std::string m = excMessageOf(flow);
+        if (t.empty()) return m;
+        return m.empty() ? t : t + ": " + m;
+    }
+    // Whether class `cls` is `want` or derives from it - through every base
+    // of a user class, then Python's builtin exception hierarchy.
+    bool classDerivesFrom(const std::string& cls, const std::string& want, int depth = 0) {
+        if (cls == want) return true;
+        if (depth > 32 || cls.empty()) return false;
+        auto it = class_by_name.find(cls);
+        if (it != class_by_name.end()) {
+            Node* n = (Node*)it->second;
+            if (n && n->type() == NodeType::CLASS)
+                for (auto& b : static_cast<ClassNode*>(n)->bases)
+                    if (classDerivesFrom(b->value(), want, depth + 1)) return true;
+            return false;
+        }
+        return nython::ny_builtin_exc_is(cls, want);
+    }
+    bool isExceptionClass(const std::string& cls) { return classDerivesFrom(cls, "BaseException"); }
+    // Python's rule for one type named in an except clause, plus Nython's
+    // leniency: Exception/Error also catch a raised non-exception (a plain
+    // string or an instance of an unrelated class).
+    bool excTypeMatches(const std::string& flow, const std::string& t) {
+        std::string t0 = excTypeOf(flow);
+        if (t == "BaseException") return true;
+        if (t == "Exception" || t == "Error")
+            return !(classDerivesFrom(t0, "SystemExit") || classDerivesFrom(t0, "KeyboardInterrupt")
+                     || classDerivesFrom(t0, "GeneratorExit"));
+        if (t0.empty()) return flow == t;           // raise "StopIteration"
+        return classDerivesFrom(t0, t);
+    }
+    bool excClauseMatches(ExceptNode* en, const std::string& flow) {
+        if (en->types.empty()) return true;
+        for (auto& t : en->types) if (excTypeMatches(flow, t)) return true;
+        return false;
+    }
+    // A C++ exception from a builtin, as a tagged exception string.
+    static std::string excFromCpp(const std::string& what) {
+        std::string t, m;
+        if (nython::ny_split_exc_message(what, t, m)) return "__exc__:" + t + ":" + m;
+        return "__exc__:Exception:" + what;
+    }
+
     Value evalTry(node_ptr node, Context* ctx) {
         auto tn = static_pointer_cast<TryNode>(node);
         Value result = NONE_VALUE;
-
+        // The finally body runs on every way out: normal completion, return,
+        // break/continue, an exception no clause matches (which then
+        // propagates - it used to be silently dropped), and an exception
+        // raised by a handler or the else clause (it used to skip finally).
+        auto run_finally = [&]() { if (tn->finally_clause) evalNode(tn->finally_clause, ctx); };
+        std::string exc;
+        bool raised = false;
         try {
             result = evalNode(tn->body, ctx);
         }
-        catch (nython::node::ReturnSignal& rs) {
-            // Return signals: run finally, then re-throw
-            if (tn->finally_clause) evalNode(tn->finally_clause, ctx);
-            throw;
-        }
+        catch (nython::node::ReturnSignal&) { run_finally(); throw; }
+        catch (nython::node::YieldSignal&) { throw; }
         catch (std::string& flow) {
-            if (flow == "break" || flow == "continue") {
-                if (tn->finally_clause) evalNode(tn->finally_clause, ctx);
-                throw;
-            }
-            // Determine exception type and message from tagged "__exc__:TypeName:msg" or plain string
-            std::string exc_type, exc_msg;
-            if (flow.size() > 7 && flow.substr(0, 7) == "__exc__") {
-                // Format: "__exc__:TypeName:message"
-                size_t colon1 = flow.find(':', 7);
-                if (colon1 != std::string::npos) {
-                    size_t colon2 = flow.find(':', colon1 + 1);
-                    exc_type = flow.substr(colon1 + 1, colon2 == std::string::npos ? std::string::npos : colon2 - colon1 - 1);
-                    exc_msg = colon2 != std::string::npos ? flow.substr(colon2 + 1) : "";
-                }
-            } else {
-                exc_msg = flow;
-            }
-            // Find a matching except clause: typed or untyped
-            for (auto& ec : tn->except_clauses) {
-                auto en = static_pointer_cast<ExceptNode>(ec);
-                bool has_type = !en->alias.empty();
-                std::string type_filter = has_type ? en->name : "";
-                std::string err_var = has_type ? en->alias : en->name;
-                // Type filter: match exc_type or its parent classes, or generic Exception
-                bool matches = type_filter.empty()
-                    || exc_type == type_filter
-                    || type_filter == "Exception" || type_filter == "BaseException" || type_filter == "Error";
-                // Walk inheritance chain for user-defined exception classes
-                if (!matches && !exc_type.empty() && !type_filter.empty()) {
-                    std::string cur = exc_type;
-                    for (int depth = 0; depth < 16 && !cur.empty(); depth++) {
-                        auto cbit = class_by_name.find(cur);
-                        if (cbit == class_by_name.end()) break;
-                        auto pit = class_parent.find(cbit->second);
-                        if (pit == class_parent.end()) break;
-                        cur = pit->second;
-                        if (cur == type_filter) { matches = true; break; }
-                    }
-                }
-                if (!matches) continue;
-                if (!err_var.empty()) {
-                    // Check if this is a class instance exception: __exc__:Type:__obj__:<ptr>
-                    bool bound_instance = false;
-                    if (flow.find("__obj__:") != std::string::npos) {
-                        size_t obj_pos = flow.find("__obj__:");
-                        if (obj_pos != std::string::npos) {
-                            uintptr_t ptr_val = 0;
-                            std::istringstream iss(flow.substr(obj_pos + 8));
-                            iss >> std::hex >> ptr_val;
-                            void* inst_ptr = reinterpret_cast<void*>(ptr_val);
-                            auto eit = exc_instance_map_.find(inst_ptr);
-                            if (eit != exc_instance_map_.end()) {
-                                ctx->defineByName(err_var, eit->second);
-                                bound_instance = true;
-                            }
-                        }
-                    }
-                    if (!bound_instance) ctx->defineByName(err_var, makeStringValue(exc_msg));
-                }
-                try { result = evalNode(en->body, ctx); }
-                catch (nython::node::ReturnSignal&) { if (tn->finally_clause) evalNode(tn->finally_clause, ctx); throw; }
-                break;
-            }
-            if (tn->finally_clause) evalNode(tn->finally_clause, ctx);
-            return result;
+            if (flow == "break" || flow == "continue") { run_finally(); throw; }
+            exc = flow; raised = true;
         }
-        catch (std::exception& e) {
-            std::string exc_msg = e.what();
-            for (auto& ec : tn->except_clauses) {
-                auto en = static_pointer_cast<ExceptNode>(ec);
-                bool has_type = !en->alias.empty();
-                std::string err_var = has_type ? en->alias : en->name;
-                if (!err_var.empty()) ctx->defineByName(err_var, makeStringValue(exc_msg));
-                try { result = evalNode(en->body, ctx); }
-                catch (nython::node::ReturnSignal&) { if (tn->finally_clause) evalNode(tn->finally_clause, ctx); throw; }
-                break;
+        catch (std::exception& e) { exc = excFromCpp(e.what()); raised = true; }
+
+        if (!raised) {
+            if (tn->else_clause) {
+                try { result = evalNode(tn->else_clause, ctx); }
+                catch (nython::node::YieldSignal&) { throw; }
+                catch (...) { run_finally(); throw; }
             }
-            if (tn->finally_clause) evalNode(tn->finally_clause, ctx);
-            return result;
-        }
-        catch (...) {
-            for (auto& ec : tn->except_clauses) {
-                auto en = static_pointer_cast<ExceptNode>(ec);
-                bool has_type = !en->alias.empty();
-                std::string err_var = has_type ? en->alias : en->name;
-                if (!err_var.empty()) ctx->defineByName(err_var, makeStringValue("unknown error"));
-                try { result = evalNode(en->body, ctx); }
-                catch (nython::node::ReturnSignal&) { if (tn->finally_clause) evalNode(tn->finally_clause, ctx); throw; }
-                break;
-            }
-            if (tn->finally_clause) evalNode(tn->finally_clause, ctx);
+            run_finally();
             return result;
         }
 
-        // No exception: run else clause, then finally
-        if (tn->else_clause) result = evalNode(tn->else_clause, ctx);
-        if (tn->finally_clause) evalNode(tn->finally_clause, ctx);
+        ExceptNode* match = nullptr;
+        for (auto& ec : tn->except_clauses) {
+            auto* en = static_cast<ExceptNode*>(ec.get());
+            if (excClauseMatches(en, exc)) { match = en; break; }
+        }
+        if (!match) { run_finally(); throw exc; }
+
+        if (!match->var.empty()) {
+            ctx->defineByName(match->var, exceptionObject(exc));
+        }
+        handling_exc_.push_back(exc);
+        struct PopHandling { std::vector<std::string>& v; ~PopHandling() { v.pop_back(); } } _ph{handling_exc_};
+        try { result = evalNode(match->body, ctx); }
+        catch (nython::node::YieldSignal&) { throw; }
+        catch (...) { run_finally(); throw; }
+        run_finally();
         return result;
     }
 
+    // A new instance of a user class: its storage, an exception's args (the
+    // constructor's arguments whatever its __init__ does, as in Python;
+    // super().__init__(...) replaces them), then the constructor - __init__
+    // (or init) from the first class in the MRO that defines one, called
+    // like any method: keyword arguments, defaults evaluated at definition,
+    // the class's own scope as its parent (not the caller's), exceptions
+    // propagate.
+    Value instantiateClass(const Value& cls, std::vector<Value>& args,
+                           const std::unordered_map<std::string, Value>& kw, Context* ctx) {
+        std::string className = fnTag(func_names, cls.value.p).substr(10);
+        Value instance;
+        instance.type = ValueType::USERDATA;
+        auto inst_ptr = std::make_unique<std::string>("__instance__:" + className);
+        instance.value.p = (void*)inst_ptr.get();
+        instance_store.push_back(std::move(inst_ptr));
+        instance_to_class[instance.value.p] = cls.value.p;
+        func_names[instance.value.p] = "__instance__:" + className;
+        Context* props = new Context(runner, className + "_props", nullptr, nullptr, nullptr);
+        instance_properties[instance.value.p] = props;
+        if (isExceptionClass(className)) setExceptionArgs(instance, args);
+        runConstructor(instance, args, kw, ctx);
+        return instance;
+    }
     Value evalRaise(node_ptr node, Context* ctx) {
         auto rn = static_pointer_cast<RaiseNode>(node);
-        if (rn->expr) {
-            Value v = evalNode(rn->expr, ctx);
-            // Class instance (user-defined exception class)
-            if (v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p)) {
-                // Check if it's a class instance
-                auto cit = instance_to_class.find(v.value.p);
-                if (cit != instance_to_class.end()) {
-                    // Get class name from func_names for the instance ("__instance__:ClassName")
-                    std::string class_name;
-                    auto fn_it = func_names.find(v.value.p);
-                    if (fn_it != func_names.end() && fn_it->second.find("__instance__:") == 0)
-                        class_name = fn_it->second.substr(13);
-                    if (class_name.empty()) {
-                        // fallback: search class_by_name
-                        for (auto& kv : class_by_name)
-                            if (kv.second == cit->second) { class_name = kv.first; break; }
-                    }
-                    std::ostringstream oss;
-                    oss << "__exc__:" << class_name << ":__obj__:" << std::hex << reinterpret_cast<uintptr_t>(v.value.p);
-                    exc_instance_map_[v.value.p] = v;
-                    throw std::string(oss.str());
+        if (!rn->expr) {
+            // Bare `raise`: the exception the enclosing except clause is
+            // handling (it used to raise the string "Exception").
+            if (!handling_exc_.empty()) throw std::string(handling_exc_.back());
+            throw std::string("__exc__:RuntimeError:No active exception to reraise");
+        }
+        Value v = evalNode(rn->expr, ctx);
+        // `raise SomeClass` raises a new instance of it.
+        if (v.type == ValueType::USERDATA && v.value.p) {
+            auto fit = func_names.find(v.value.p);
+            if (fit != func_names.end()) {
+                if (fit->second.rfind("__class__:", 0) == 0) {
+                    std::vector<Value> none_args;
+                    static const std::unordered_map<std::string, Value> no_kw;
+                    v = instantiateClass(v, none_args, no_kw, ctx);
+                } else if (fit->second.rfind("__builtin__:", 0) == 0
+                           && nython::ny_is_builtin_exc(fit->second.substr(12))) {
+                    throw std::string("__exc__:" + fit->second.substr(12) + ":");
                 }
-                // Check if it's a tagged __exc__ string
-                std::string msg = getStringValue(v);
-                if (msg.size() > 7 && msg.substr(0, 7) == "__exc__") throw msg;
-                throw msg;
-            } else if (v.type == ValueType::USERDATA && v.value.p && string_ptrs_.count(v.value.p)) {
-                // Plain string raise
-                throw getStringValue(v);
-            } else if (v.type == ValueType::NONE) {
-                throw std::string("Exception");
-            } else {
-                throw std::string(v.toString());
             }
         }
-        throw std::string("Exception");
+        if (v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p)) {
+            auto cit = instance_to_class.find(v.value.p);
+            if (cit != instance_to_class.end()) {
+                std::string class_name = instanceClassName(v);
+                if (rn->cause) {
+                    Value cause = evalNode(rn->cause, ctx);
+                    auto pit = instance_properties.find(v.value.p);
+                    if (pit != instance_properties.end()) pit->second->defineByName("__cause__", cause);
+                }
+                std::ostringstream oss;
+                oss << "__exc__:" << class_name << ":__obj__:" << std::hex << reinterpret_cast<uintptr_t>(v.value.p);
+                exc_instance_map_[v.value.p] = v;
+                throw std::string(oss.str());
+            }
+            throw getStringValue(v);
+        }
+        if (v.type == ValueType::USERDATA && v.value.p) throw getStringValue(v);   // a string
+        if (v.type == ValueType::NONE) throw std::string("__exc__:Exception:");
+        throw std::string(v.toString());
     }
 
     Value evalAssert(node_ptr node, Context* ctx) {
@@ -5735,7 +6133,8 @@ public:
             // not a description of the object. Use the same "<Class instance>"
             // form print uses, and honour a user __str__ if the class has one.
             std::vector<Value> noargs;
-            Value custom = callMethod(obj, "__str__", noargs, ctx);
+            Value custom = isInstanceValue(obj) && instanceHasMethod(obj, "__str__")
+                         ? callMethod(obj, "__str__", noargs, ctx) : NONE_VALUE;
             if (custom.type == ValueType::USERDATA && !getStringValue(custom).empty()
                 && getStringValue(custom).rfind("<function", 0) != 0)
                 return custom;
@@ -5783,7 +6182,7 @@ public:
             lst->set("__len__", Value((int)n));
             return Value((Collectable*)lst);
         }
-        return Value();   // UNDEFINED — not part of the protocol
+        return UNDEFINED_VALUE;   // not part of the protocol (Value() is none)
     }
 
     Value evalImport(node_ptr node, Context* ctx) {
@@ -6566,6 +6965,11 @@ public:
             auto sub = static_pointer_cast<SubscriptNode>(dn->target);
             Value obj = evalNode(sub->object, ctx);
             Value idx = evalNode(sub->index, ctx);
+            if (isInstanceValue(obj) && instanceHasMethod(obj, "__delitem__")) {
+                std::vector<Value> a{idx};
+                callMethod(obj, "__delitem__", a, ctx);
+                return NONE_VALUE;
+            }
             if (Container* cont = contOf(obj)) {
                 int64_t n = seqLen(cont);
                 if (n < 0) {
@@ -6675,51 +7079,520 @@ public:
         return NONE_VALUE;
     }
 
+    // ── Classes: method resolution order ────────────────────────────────
+    // C3 linearisation over the declared bases (resolved by class name),
+    // the order Python uses; a hierarchy C3 rejects falls back to depth-first
+    // left-to-right. Bases that are not user classes (a builtin exception,
+    // an interface) have no node and are left out here.
+    std::unordered_map<Node*, std::vector<Node*>> mro_cache_;
+    const std::vector<Node*>& classMro(Node* cls) {
+        static const std::vector<Node*> empty;
+        if (!cls || cls->type() != NodeType::CLASS) return empty;
+        auto it = mro_cache_.find(cls);
+        if (it != mro_cache_.end()) return it->second;
+        mro_cache_[cls] = {cls};                    // guards against a cycle
+        std::vector<std::vector<Node*>> seqs;
+        std::vector<Node*> direct;
+        for (auto& b : static_cast<ClassNode*>(cls)->bases) {
+            Node* bn = classNodeByName(b->value());
+            if (!bn || bn == cls) continue;
+            seqs.push_back(std::vector<Node*>(classMro(bn)));
+            direct.push_back(bn);
+        }
+        seqs.push_back(direct);
+        std::vector<Node*> out{cls};
+        bool ok = true;
+        while (true) {
+            bool any = false;
+            for (auto& sq : seqs) if (!sq.empty()) { any = true; break; }
+            if (!any) break;
+            Node* pick = nullptr;
+            for (auto& sq : seqs) {
+                if (sq.empty()) continue;
+                Node* cand = sq[0];
+                bool in_tail = false;
+                for (auto& sq2 : seqs)
+                    for (size_t k = 1; k < sq2.size(); k++) if (sq2[k] == cand) { in_tail = true; break; }
+                if (!in_tail) { pick = cand; break; }
+            }
+            if (!pick) { ok = false; break; }
+            out.push_back(pick);
+            for (auto& sq : seqs) if (!sq.empty() && sq[0] == pick) sq.erase(sq.begin());
+        }
+        if (!ok) {
+            out = {cls};
+            std::vector<Node*> todo(direct.begin(), direct.end());
+            while (!todo.empty()) {
+                Node* k = todo.front(); todo.erase(todo.begin());
+                if (std::find(out.begin(), out.end(), k) != out.end()) continue;
+                out.push_back(k);
+                size_t at = 0;
+                for (auto& b : static_cast<ClassNode*>(k)->bases) {
+                    Node* bn = classNodeByName(b->value());
+                    if (bn) todo.insert(todo.begin() + (long)(at++), bn);
+                }
+            }
+        }
+        mro_cache_[cls] = out;
+        return mro_cache_[cls];
+    }
+    // A member defined in the body of class `cls` or a class after it in its
+    // MRO: its value in that class's own namespace (not the enclosing
+    // scope's), and the class that defines it.
+    bool findClassMember(Node* cls, const std::string& name, Value& out, Node** owner = nullptr,
+                         Node* after = nullptr) {
+        const std::vector<Node*>& mro = classMro(cls);
+        size_t start = 0;
+        if (after) {
+            for (size_t i = 0; i < mro.size(); i++) if (mro[i] == after) { start = i + 1; break; }
+        }
+        for (size_t i = start; i < mro.size(); i++) {
+            auto cit = class_ctx_map_.find((void*)mro[i]);
+            if (cit == class_ctx_map_.end() || !cit->second || !cit->second->container) continue;
+            auto vit = cit->second->container->find(name);
+            if (vit == cit->second->container->end()) continue;
+            out = vit->second;
+            if (owner) *owner = mro[i];
+            return true;
+        }
+        return false;
+    }
+    Node* classNodeOfInstance(const Value& v) {
+        if (v.type != ValueType::USERDATA || !v.value.p) return nullptr;
+        auto it = instance_to_class.find(v.value.p);
+        if (it == instance_to_class.end()) return nullptr;
+        Node* n = (Node*)it->second;
+        return (n && n->type() == NodeType::CLASS) ? n : nullptr;
+    }
+    bool isInstanceValue(const Value& v) {
+        return v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p)
+               && instance_to_class.count(v.value.p);
+    }
+    bool instanceHasMethod(const Value& v, const std::string& name) {
+        Node* cn = classNodeOfInstance(v);
+        Value m;
+        return cn && findClassMember(cn, name, m);
+    }
+    // Methods run with the class that defines them on this stack, so a
+    // super() call inside knows where in the MRO to continue from.
+    std::vector<Node*> owner_stack_;
+    // FunctionNodes written directly in a class body (its methods), as
+    // opposed to functions a decorator returned into the class namespace.
+    std::unordered_set<const Node*> direct_methods_;
+    struct OwnerScope {
+        std::vector<Node*>& st;
+        OwnerScope(std::vector<Node*>& s_, Node* o) : st(s_) { st.push_back(o); }
+        ~OwnerScope() { st.pop_back(); }
+    };
+    template <typename M> static std::string fnTag(const M& fnames, void* p) {
+        auto it = fnames.find(p);
+        return it == fnames.end() ? std::string() : it->second;
+    }
+    // Calls class member `m` (defined in `owner`) as a method of `self`
+    // (an instance, or the class itself for Class.method(...)): a static
+    // method takes the arguments as they are, a classmethod gets the class,
+    // a method with self gets the instance (from the arguments when called
+    // on the class). Keyword arguments, defaults and exceptions all behave
+    // as for a plain call.
+    Value invokeMember(Value m, Node* owner, Value self, std::vector<Value>& args,
+                       const std::unordered_map<std::string, Value>& kw, Context* ctx) {
+        std::string tag = fnTag(func_names, m.value.p);
+        bool is_static = tag.find("__static__") != std::string::npos;
+        bool is_cm = tag.find("__classmethod__") != std::string::npos;
+        void* ast_ptr = m.value.p;
+        auto ai = func_ast_nodes.find(m.value.p);
+        if (ai != func_ast_nodes.end()) ast_ptr = ai->second;
+        Node* raw = (Node*)ast_ptr;
+        bool self_is_class = !isInstanceValue(self);
+        if (!raw || raw->type() != NodeType::FUNCTION) {
+            // A decorated method (a closure the decorator returned): it takes
+            // the instance as its first argument.
+            std::vector<Value> with_self;
+            if (!self_is_class) with_self.push_back(self);
+            for (auto& a : args) with_self.push_back(a);
+            return callFunctionValue(m, with_self, ctx);
+        }
+        auto* fn = static_cast<FunctionNode*>(raw);
+        if (!direct_methods_.count(fn) && !self_is_class && !is_static && !is_cm) {
+            // A function a decorator put in the class: called with the
+            // instance as its first argument, as Python binds any function.
+            std::vector<Value> with_self; with_self.reserve(args.size() + 1);
+            with_self.push_back(self);
+            for (auto& a : args) with_self.push_back(a);
+            Context* wp = global_ctx;
+            auto wc = closure_contexts.find(m.value.p);
+            if (wc != closure_contexts.end() && wc->second) wp = wc->second;
+            Context* wfc = new Context(runner, fn->name, nullptr, nullptr, wp);
+            CtxReaper _reap_w(this, wfc);
+            bindParamsKw(fn, with_self, kw, wfc, ctx, 0, m.value.p);
+            OwnerScope _osw(owner_stack_, owner);
+            return runFunctionBody(fn, wfc);
+        }
+        Context* cp = global_ctx;
+        auto cit = closure_contexts.find(m.value.p);
+        if (cit != closure_contexts.end() && cit->second) {
+            // The class body's scope, minus the class body itself: methods see
+            // the scope the class was defined in, not the caller's.
+            cp = cit->second->inClass && cit->second->parent ? cit->second->parent : cit->second;
+        }
+        Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
+        CtxReaper _reap(this, fc);
+        bool has_self = !fn->params.empty() && (fn->params[0]->value() == "self" || fn->params[0]->value() == "this");
+        if (is_cm) {
+            Value cls_val;
+            Node* cls_node = self_is_class ? (Node*)self.value.p : classNodeOfInstance(self);
+            cls_val.type = ValueType::USERDATA; cls_val.value.p = (void*)cls_node;
+            std::vector<Value> a2; a2.push_back(cls_val);
+            for (auto& a : args) a2.push_back(a);
+            bindParamsKw(fn, a2, kw, fc, ctx, 0, m.value.p);
+        } else if (is_static || !has_self) {
+            bindParamsKw(fn, args, kw, fc, ctx, 0, m.value.p);
+        } else if (self_is_class) {
+            // Class.method(instance, ...)
+            if (!args.empty()) {
+                fc->defineByName(fn->params[0]->value(), args[0]);
+                fc->defineByName("self", args[0]);
+                std::vector<Value> rest(args.begin() + 1, args.end());
+                bindParamsKw(fn, rest, kw, fc, ctx, 1, m.value.p);
+                self = args[0];
+            } else bindParamsKw(fn, args, kw, fc, ctx, 1, m.value.p);
+        } else {
+            fc->defineByName("self", self);
+            if (fn->params[0]->value() == "this") fc->defineByName("this", self);
+            bindParamsKw(fn, args, kw, fc, ctx, 1, m.value.p);
+        }
+        auto* ocn = owner ? static_cast<ClassNode*>(owner) : nullptr;
+        if (ocn && !ocn->bases.empty())
+            fc->defineByName("__parent_class__", internString(ocn->bases[0]->value()));
+        OwnerScope _os(owner_stack_, owner);
+        return runFunctionBody(fn, fc);
+    }
+    // super().name(...): `name` from the class after `owner` in the MRO of
+    // self's class. Returns false when nothing defines it there.
+    bool superCall(Value self, Node* owner, const std::string& name, std::vector<Value>& args,
+                   const std::unordered_map<std::string, Value>& kw, Context* ctx, Value& out) {
+        Node* start = isInstanceValue(self) ? classNodeOfInstance(self) : owner;
+        if (!start) return false;
+        Value m; Node* where = nullptr;
+        if (findClassMember(start, name, m, &where, owner) && m.type == ValueType::USERDATA && m.value.p
+            && func_names.count(m.value.p)) {
+            out = invokeMember(m, where, self, args, kw, ctx);
+            return true;
+        }
+        if (name == "__init__" || name == "init") {
+            std::string other = name == "init" ? "__init__" : "init";
+            if (findClassMember(start, other, m, &where, owner) && m.type == ValueType::USERDATA && m.value.p
+                && func_names.count(m.value.p)) {
+                out = invokeMember(m, where, self, args, kw, ctx);
+                return true;
+            }
+            // Reaching a builtin exception base sets the exception's args;
+            // reaching object, nothing.
+            if (isInstanceValue(self) && isExceptionClass(instanceClassName(self))) setExceptionArgs(self, args);
+            out = NONE_VALUE;
+            return true;
+        }
+        return false;
+    }
+    // Builtins that take an iterable, given an object with __iter__ /
+    // __next__ / __getitem__: its items first. sorted/min/max over objects
+    // order by __lt__ (or the other side's __gt__), sum adds with __add__ /
+    // __radd__, issubclass walks the MRO, hash() uses __hash__.
+    void yieldValue(const Value& v) {
+        if (yield_sink_->size() >= kMaxGeneratorValues)
+            throw std::string("__exc__:RuntimeError:generator produced more than 10000000 values (generators are "
+                              "collected eagerly by the interpreter; use the VM (--vm) for unbounded generators)");
+        yield_sink_->push_back(v);
+    }
+    bool isGenValue(const Value& v) {
+        if (!v.isCollectable() || !v.value.gc) return false;
+        auto* c = dynamic_cast<Container*>(v.value.gc);
+        return c && c->container && c->container->count("__gen__");
+    }
+    Value makeGenValue(const std::vector<Value>& items) {
+        Object* gen_obj = new Object((Runnable*)runner, "__gen__", Type::LIST);
+        int len = (int)items.size();
+        for (int i = 0; i < len; i++) gen_obj->set(std::to_string(i), items[(size_t)i]);
+        gen_obj->set("__len__", Value(len));
+        gen_obj->set("__gen__", Value(1));
+        gen_obj->set("__idx__", Value(0));
+        return Value((Collectable*)gen_obj);
+    }
+    // Generators on this engine are eager: calling a generator function
+    // runs its body to the end, collecting what it yields, and returns a
+    // generator over those values. The enclosing collection (a generator
+    // called from inside another) is restored afterwards - it was reset to
+    // none, so the outer generator's next yield aborted the process. An
+    // exception raised by the body propagates (it was swallowed), and a
+    // body that yields nothing is still a generator (it ran a second time
+    // as a plain function and returned none).
+    static constexpr size_t kMaxGeneratorValues = 10000000;
+    Value collectGenerator(const node_ptr& body, Context* fc) {
+        std::vector<Value> yielded;
+        std::vector<Value>* saved = yield_sink_;
+        yield_sink_ = &yielded;
+        try { evalBody(body, fc); }
+        catch (nython::node::ReturnSignal&) {}
+        catch (...) { yield_sink_ = saved; throw; }
+        yield_sink_ = saved;
+        return makeGenValue(yielded);
+    }
+    // A function body run to completion: its value, or the generator it is.
+    Value runFunctionBody(FunctionNode* fn, Context* fc) {
+        if (bodyYields(fn->body)) return collectGenerator(fn->body, fc);
+        try { return evalBody(fn->body, fc); }
+        catch (nython::node::ReturnSignal& r) { return r.value; }
+    }
+    bool iterableBuiltin(const std::string& name, std::vector<Value>& args, Context* ctx, Value& out) {
+        static const std::unordered_set<std::string> takes = {
+            "list","tuple","set","sorted","min","max","sum","any","all","enumerate","reversed","zip","frozenset"};
+        if (name == "issubclass" && args.size() >= 2) {
+            auto cls_name = [&](const Value& v) -> std::string {
+                if (v.type == ValueType::USERDATA && v.value.p) {
+                    std::string t = fnTag(func_names, v.value.p);
+                    if (t.rfind("__class__:", 0) == 0) return t.substr(10);
+                    if (t.rfind("__builtin__:", 0) == 0) return t.substr(12);
+                    if (isStringValue(v)) return getStringValue(v);
+                }
+                return std::string();
+            };
+            std::string c = cls_name(args[0]);
+            if (c.empty()) { out = Value(false); return true; }
+            std::vector<Value> targets;
+            auto items = listItems(args[1]);
+            if (!items.empty()) targets = items; else targets.push_back(args[1]);
+            for (auto& t : targets) {
+                std::string tn = cls_name(t);
+                if (!tn.empty() && (tn == "object" || tn == "Object" || classDerivesFrom(c, tn))) { out = Value(true); return true; }
+            }
+            out = Value(false); return true;
+        }
+        if (name == "hash" && !args.empty() && isInstanceValue(args[0]) && instanceHasMethod(args[0], "__hash__")) {
+            std::vector<Value> none;
+            out = callMethod(args[0], "__hash__", none, ctx);
+            return true;
+        }
+        if (name == "bool" && args.size() == 1 && isInstanceValue(args[0])) { out = Value(isTruthy(args[0])); return true; }
+        // iter(x) and next(it[, default]). A generator here is its collected
+        // values with a read position (__gen__/__idx__), which next() already
+        // understands; iter() of a list, string or dict makes one of those,
+        // and objects go through __iter__/__next__. Both returned none.
+        // hasattr / getattr on instances and classes: the full attribute
+        // lookup (methods, class attributes, properties, __getattr__); only
+        // an instance's own fields were seen.
+        if ((name == "hasattr" || name == "getattr") && args.size() >= 2 && isStringValue(args[1])) {
+            std::string err;
+            if (attributeErrorFor(args[0], getStringValue(args[1]), err)) {
+                Value v;
+                try { v = lookupAttribute(args[0], getStringValue(args[1]), ctx); }
+                catch (std::string& e) {
+                    if (!excTypeMatches(e, "AttributeError")) throw;
+                    v = UNDEFINED_VALUE;
+                }
+                bool has = v.type != ValueType::UNDEFINED;
+                if (name == "hasattr") { out = Value(has); return true; }
+                if (has) { out = v; return true; }
+                if (args.size() >= 3) { out = args[2]; return true; }
+                throw err;
+            }
+        }
+        if (name == "callable" && args.size() == 1) {
+            const Value& v = args[0];
+            bool r = isFunctionValue(v);
+            if (!r && v.type == ValueType::USERDATA && v.value.p) {
+                if (fnTag(func_names, v.value.p).rfind("__class__:", 0) == 0) r = true;
+                else if (isInstanceValue(v)) r = instanceHasMethod(v, "__call__");
+            }
+            out = Value(r); return true;
+        }
+        if (name == "iter" && !args.empty()) {
+            const Value& v = args[0];
+            if (isGenValue(v)) { out = v; return true; }
+            if (isInstanceValue(v)) {
+                std::vector<Value> none;
+                if (instanceHasMethod(v, "__iter__")) { out = callMethod(v, "__iter__", none, ctx); return true; }
+                if (instanceHasMethod(v, "__next__")) { out = v; return true; }
+                if (!instanceHasMethod(v, "__getitem__"))
+                    throw std::string("__exc__:TypeError:'" + instanceClassName(v) + "' object is not iterable");
+            }
+            out = makeGenValue(iterValues(v, ctx));
+            return true;
+        }
+        if (name == "next" && !args.empty()) {
+            if (isInstanceValue(args[0])) {
+                if (!instanceHasMethod(args[0], "__next__"))
+                    throw std::string("__exc__:TypeError:'" + instanceClassName(args[0]) + "' object is not an iterator");
+                std::vector<Value> none;
+                try { out = callMethod(args[0], "__next__", none, ctx); }
+                catch (std::string& e) {
+                    if (args.size() >= 2 && excTypeMatches(e, "StopIteration")) { out = args[1]; return true; }
+                    throw;
+                }
+                return true;
+            }
+            if (isGenValue(args[0])) {
+                auto* c = dynamic_cast<Container*>(args[0].value.gc);
+                auto ii = c->container->find("__idx__"), li = c->container->find("__len__");
+                int64_t idx = ii != c->container->end() ? bigint_to_i64(ii->second.value.i) : 0;
+                int64_t len = li != c->container->end() ? bigint_to_i64(li->second.value.i) : 0;
+                if (idx >= len) {
+                    if (args.size() >= 2) { out = args[1]; return true; }
+                    throw std::string("__exc__:StopIteration:");
+                }
+                return false;
+            }
+            throw std::string("__exc__:TypeError:object is not an iterator");
+        }
+        if (!takes.count(name) || args.empty()) return false;
+        size_t upto = (name == "zip") ? args.size() : 1;
+        bool changed = false;
+        for (size_t i = 0; i < upto && i < args.size(); i++) {
+            if (isInstanceValue(args[i]) && (instanceHasMethod(args[i], "__iter__") || instanceHasMethod(args[i], "__next__")
+                                             || instanceHasMethod(args[i], "__getitem__"))) {
+                args[i] = makeListValue(iterValues(args[i], ctx));
+                changed = true;
+            }
+        }
+        (void)changed;
+        if ((name == "set" || name == "frozenset") && args.size() == 1) {
+            // Objects are one element per __hash__/__eq__ class (identity
+            // without them); their text form, which the set builtin keyed on,
+            // is the same for every instance of a class.
+            std::vector<Value> items = listItems(args[0]);
+            bool any_inst = false;
+            for (auto& v : items) if (isInstanceValue(v)) { any_inst = true; break; }
+            if (!any_inst) return false;
+            std::vector<Value> uniq;
+            for (auto& v : items) {
+                bool dup = false;
+                for (auto& u : uniq) {
+                    if (isInstanceValue(v) != isInstanceValue(u)) continue;
+                    if (isInstanceValue(v) && !instanceHasMethod(v, "__eq__") && !instanceHasMethod(u, "__eq__")) {
+                        if (v.value.p == u.value.p) { dup = true; break; }
+                        continue;
+                    }
+                    if (isInstanceValue(v) && instanceHasMethod(v, "__hash__") && instanceHasMethod(u, "__hash__")) {
+                        std::vector<Value> none;
+                        if (!pyEquals(callMethod(v, "__hash__", none, ctx), callMethod(u, "__hash__", none, ctx), ctx)) continue;
+                    }
+                    if (pyEquals(v, u, ctx)) { dup = true; break; }
+                }
+                if (!dup) uniq.push_back(v);
+            }
+            Value lst = makeListValue(uniq);
+            if (auto* c = dynamic_cast<Container*>(lst.value.gc)) (*c->container)["__set__"] = Value(true);
+            out = lst; return true;
+        }
+        // sorted / min / max / sum over objects: pycore's, which order
+        // through orderValues (__lt__, reflected __gt__) and add through
+        // binaryOp (__add__ / __radd__), with key=, reverse= and default=.
+        return false;
+    }
+    bool isFunctionValue(const Value& v) {
+        if (v.type != ValueType::USERDATA || !v.value.p) return false;
+        std::string t = fnTag(func_names, v.value.p);
+        return t.rfind("__func__:", 0) == 0 || t.rfind("__lambda__", 0) == 0 || t.rfind("__builtin__:", 0) == 0;
+    }
+    // Runs the constructor of a new instance: the first class in its MRO
+    // that defines __init__ or init.
+    void runConstructor(Value inst, std::vector<Value>& args,
+                        const std::unordered_map<std::string, Value>& kw, Context* ctx) {
+        Node* cls = classNodeOfInstance(inst);
+        if (!cls) return;
+        for (Node* c : classMro(cls)) {
+            auto cit = class_ctx_map_.find((void*)c);
+            if (cit == class_ctx_map_.end() || !cit->second || !cit->second->container) continue;
+            auto& cont = *cit->second->container;
+            auto it = cont.find("__init__");
+            if (it == cont.end()) it = cont.find("init");
+            if (it == cont.end()) continue;
+            if (it->second.type != ValueType::USERDATA || !it->second.value.p || !func_names.count(it->second.value.p)) continue;
+            invokeMember(it->second, c, inst, args, kw, ctx);
+            return;
+        }
+    }
+    // Calls method `name` of an instance (or a class) through the class
+    // namespaces and the MRO. Returns false when no class defines it.
+    bool callClassMethod(Value obj, const std::string& name, std::vector<Value>& args,
+                         const std::unordered_map<std::string, Value>& kw, Context* ctx, Value& out) {
+        Node* cls = isInstanceValue(obj) ? classNodeOfInstance(obj) : nullptr;
+        if (!cls && obj.type == ValueType::USERDATA && obj.value.p
+            && fnTag(func_names, obj.value.p).rfind("__class__:", 0) == 0) {
+            Node* n = (Node*)obj.value.p;
+            if (n && n->type() == NodeType::CLASS) cls = n;
+        }
+        if (!cls) return false;
+        Value m; Node* owner = nullptr;
+        if (!findClassMember(cls, name, m, &owner)) return false;
+        if (m.type != ValueType::USERDATA || !m.value.p) return false;
+        std::string tag = fnTag(func_names, m.value.p);
+        if (tag.rfind("__func__:", 0) != 0 && tag.rfind("__lambda__", 0) != 0) {
+            // A class stored in the class (Outer.Inner(...)) or a builtin.
+            if (tag.rfind("__class__:", 0) == 0 || tag.rfind("__builtin__:", 0) == 0) {
+                out = callFunctionValue(m, args, ctx);
+                return true;
+            }
+            return false;
+        }
+        if (tag.find("__property__") != std::string::npos) return false;
+        out = invokeMember(m, owner, obj, args, kw, ctx);
+        return true;
+    }
+
+    // The class value of an exception string's type (the class itself for a
+    // user class, the builtin for a builtin exception), for __exit__.
+    Value exceptionClassValue(const std::string& flow) {
+        std::string t = excTypeOf(flow);
+        if (t.empty()) t = "Exception";
+        Node* cn = classNodeByName(t);
+        if (cn) { Value cv; cv.type = ValueType::USERDATA; cv.value.p = (void*)cn; return cv; }
+        Value bv = global_ctx->getByName(t);
+        return bv.type == ValueType::UNDEFINED ? makeStringValue(t) : bv;
+    }
+
+    // with E as x: body. __enter__'s result is bound (the object itself when
+    // it has none); __exit__ runs on every way out, with (type, value, none)
+    // for an exception - a truthy result suppresses it - and (none, none,
+    // none) otherwise. It used to be called with no arguments at all, and
+    // its result was ignored.
     Value evalWith(node_ptr node, Context* ctx) {
         auto wn = static_pointer_cast<WithNode>(node);
         Value v = evalNode(wn->expr, ctx);
-        // Call __enter__ if it exists
+        bool managed = isInstanceValue(v);
         Value ctx_val = v;
-        if (v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p) && instance_to_class.count(v.value.p)) {
+        if (managed && instanceHasMethod(v, "__enter__")) {
             std::vector<Value> no_args;
-            Value enter_result = callMethod(v, "__enter__", no_args, ctx);
-            if (enter_result.type != ValueType::NONE) ctx_val = enter_result;
+            ctx_val = callMethod(v, "__enter__", no_args, ctx);
         }
         if (!wn->alias.empty()) ctx->defineByName(wn->alias, ctx_val);
-        // Execute body, then call __exit__
+        auto exit_plain = [&]() {
+            if (!managed || !instanceHasMethod(v, "__exit__")) return;
+            std::vector<Value> a{NONE_VALUE, NONE_VALUE, NONE_VALUE};
+            callMethod(v, "__exit__", a, ctx);
+        };
+        auto exit_exc = [&](const std::string& flow) -> bool {
+            if (!managed || !instanceHasMethod(v, "__exit__")) return false;
+            Value ev = exceptionObject(flow);
+            std::vector<Value> a{exceptionClassValue(flow), ev, NONE_VALUE};
+            return isTruthy(callMethod(v, "__exit__", a, ctx));
+        };
         Value result = NONE_VALUE;
         try {
             result = evalNode(wn->body, ctx);
-        } catch (std::string& exc) {
-            // Call __exit__ even on exception, with (type, message, none) as
-            // Python does, so a context manager can tell the body failed (a
-            // task group cancels its children then) - round 74.
-            if (v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p) && instance_to_class.count(v.value.p)) {
-                std::string et = "Exception", em = exc;
-                if (exc.rfind("__exc__:", 0) == 0) {
-                    std::string rest = exc.substr(8);
-                    auto c = rest.find(':');
-                    et = rest.substr(0, c);
-                    em = c == std::string::npos ? std::string() : rest.substr(c + 1);
-                }
-                std::vector<Value> exc_args = {makeStringValue(et), makeStringValue(em), NONE_VALUE};
-                if (exc != "break" && exc != "continue") callMethod(v, "__exit__", exc_args, ctx);
-                else { std::vector<Value> no_args; callMethod(v, "__exit__", no_args, ctx); }
-            }
-            throw;
-        } catch (...) {
-            // Call __exit__ even on exception
-            if (v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p) && instance_to_class.count(v.value.p)) {
-                std::vector<Value> no_args;
-                callMethod(v, "__exit__", no_args, ctx);
-            }
+        }
+        catch (nython::node::ReturnSignal&) { exit_plain(); throw; }
+        catch (nython::node::YieldSignal&) { throw; }
+        catch (std::string& flow) {
+            if (flow == "break" || flow == "continue") { exit_plain(); throw; }
+            if (exit_exc(flow)) return NONE_VALUE;
             throw;
         }
-        // Call __exit__ on normal completion
-        if (v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p) && instance_to_class.count(v.value.p)) {
-            std::vector<Value> no_args;
-            callMethod(v, "__exit__", no_args, ctx);
+        catch (std::exception& e) {
+            std::string flow = excFromCpp(e.what());
+            if (exit_exc(flow)) return NONE_VALUE;
+            throw flow;
         }
+        exit_plain();
         return result;
     }
 

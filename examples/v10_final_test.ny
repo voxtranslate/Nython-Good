@@ -15,7 +15,7 @@ class Managed:
     def __enter__(self):
         self.state = "open"
         return self
-    def __exit__(self):
+    def __exit__(self, exc_type=none, exc_value=none, tb=none):
         self.state = "closed"
 var m = Managed("res")
 with m as r:

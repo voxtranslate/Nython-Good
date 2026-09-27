@@ -85,7 +85,7 @@ def frame(mx, my, down):
     ui2.io.mouse_y = my
     ui2.io.mouse_down = down
     ui2.begin_frame(10, 10, 300, 200)
-    var r = ui2.button("Run")
+    var r = ui2.button("Run", th)
     ui2.end_frame()
     return r
 
@@ -119,7 +119,7 @@ def tframe(mx, my, down):
     tw.io.mouse_y = my
     tw.io.mouse_down = down
     tw.begin_frame(0, 0, 200, 200)
-    var open = tw.tree_node("src")
+    var open = tw.tree_node("src", th)
     tw.end_frame()
     return open
 check("tree starts closed", tframe(500, 500, false), false)
@@ -143,18 +143,18 @@ var d = NyImGui()
 d.io.mouse_x = 500
 d.io.mouse_y = 500
 d.begin_frame(0, 0, 200, 200)
-d.button("A")
-d.button("B")
+d.button("A", th)
+d.button("B", th)
 check("two buttons emit four commands", d.draw.count, 4)
 check_true("first frame is a change", d.end_frame())
 d.begin_frame(0, 0, 200, 200)
-d.button("A")
-d.button("B")
+d.button("A", th)
+d.button("B", th)
 check("identical frame is skipped", d.end_frame(), false)
 check("skip counted", d.skipped_frames, 1)
 d.begin_frame(0, 0, 200, 200)
-d.button("A")
-d.button("C")
+d.button("A", th)
+d.button("C", th)
 check_true("different content redraws", d.end_frame())
 
 
