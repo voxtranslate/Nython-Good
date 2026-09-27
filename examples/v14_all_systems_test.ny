@@ -79,7 +79,7 @@ t("sha256_len", len(sha256("hello")), 64)
 print "=== ALL MODULES ==="
 import math
 t("pi", PI > 3.14, true)
-t("sqrt", sqrt(25), 5)
+t("sqrt", sqrt(25), 5.0)
 import collections
 var wc = Counter("a b a a".split(" "))
 t("counter", wc["a"], 3)
