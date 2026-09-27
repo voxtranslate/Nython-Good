@@ -12,8 +12,20 @@
 //                           (no other event pending), synthesize exactly one
 //                           SDL_EVENT_QUIT and never again (latched). Lets
 //                           GUI/IDE event loops terminate headlessly.
-//   NY_STUB_DPI_SCALE=<f>   Fake content/display scale returned by the
-//                           display- and window-scale queries.
+//   NY_STUB_DPI_SCALE=<f>   A display scaled f times (2 = a Retina / 200%
+//                           panel). `scale F` in the event script changes it
+//                           at run time, as moving the window to another
+//                           monitor does.
+//   NY_STUB_DPI_MODE=<m>    Which of SDL3's two HiDPI models the fake display
+//                           follows (SDL's docs/README-highdpi.md):
+//                             points (default) - macOS / Wayland: window
+//                               coordinates are points, the content scale is
+//                               1, and a SDL_WINDOW_HIGH_PIXEL_DENSITY window
+//                               has f pixels per point;
+//                             pixels - Windows / X11: window coordinates are
+//                               pixels for every window (density 1), the
+//                               content scale is f, and the display has f
+//                               times the pixels (a 4K panel at 200%).
 //   NY_STUB_EVENTS=<file>   Scripted input. One command per line, read
 //                           lazily — the file may still be growing (a
 //                           driver process appends to it), so EOF only
@@ -98,8 +110,10 @@ struct CapOp {
 };
 struct CapText { std::string text, family; float size; int style; };
 struct CapFrame {
-    int w = 0, h = 0;
+    int w = 0, h = 0;          // drawing surface, pixels
     long n = 0;
+    float density = 1.0f;      // pixels per window point
+    float scale = 1.0f;        // display content scale (UI scale)
     std::vector<CapOp> ops;
     std::vector<CapText> texts;
     void clear() { ops.clear(); texts.clear(); }
@@ -142,7 +156,8 @@ static bool write_frame(const CapFrame& fr, const std::string& path) {
     std::string tmp = path + ".tmp";
     FILE* f = fopen(tmp.c_str(), "w");
     if (!f) return false;
-    fprintf(f, "{\"op\":\"frame\",\"w\":%d,\"h\":%d,\"n\":%ld}\n", fr.w, fr.h, fr.n);
+    fprintf(f, "{\"op\":\"frame\",\"w\":%d,\"h\":%d,\"n\":%ld,\"density\":%g,\"scale\":%g,\"backend\":\"stub\"}\n",
+            fr.w, fr.h, fr.n, (double)fr.density, (double)fr.scale);
     for (const CapOp& o : fr.ops) {
         switch (o.kind) {
         case 'k': fprintf(f, "{\"op\":\"unclip\"}\n"); break;
@@ -321,17 +336,36 @@ bool SDL_RestoreWindow(SDL_Window* window)  { return window != nullptr; }
 bool SDL_StartTextInput(SDL_Window* window) { return window != nullptr; }
 bool SDL_StopTextInput(SDL_Window* window)  { return window != nullptr; }
 
+static float g_dpi_override = 0.0f;      // set by the `scale` script command
 static float dpi_scale_from_env() {
+    if (g_dpi_override > 0.0f) return g_dpi_override;
     const char* s = getenv("NY_STUB_DPI_SCALE");
     if (!s || !*s) return 1.0f;
     float f = (float)atof(s);
     return f > 0.0f ? f : 1.0f;
 }
-
-float SDL_GetWindowDisplayScale(SDL_Window* window) {
-    (void)window;
-    return dpi_scale_from_env();
+// Read on every call (like NY_STUB_DPI_SCALE), so a test can switch models.
+static bool dpi_pixels_mode() {
+    const char* s = getenv("NY_STUB_DPI_MODE");
+    return s && (!strcmp(s, "pixels") || !strcmp(s, "windows") || !strcmp(s, "x11"));
 }
+static float window_pixel_scale(SDL_Window* w);
+
+// SDL computes it the same way: pixels per point times the content scale.
+float SDL_GetWindowDisplayScale(SDL_Window* window) {
+    return window_pixel_scale(window) * (dpi_pixels_mode() ? dpi_scale_from_env() : 1.0f);
+}
+
+float SDL_GetWindowPixelDensity(SDL_Window* window) {
+    return window_pixel_scale(window);
+}
+
+SDL_DisplayID SDL_GetDisplayForWindow(SDL_Window* window) {
+    return window ? 1u : 0u;
+}
+
+// Window changes apply at once headlessly.
+bool SDL_SyncWindow(SDL_Window* window) { return window != nullptr; }
 
 const char* SDL_GetCurrentVideoDriver(void) {
     return "ny-stub";
@@ -344,14 +378,30 @@ SDL_DisplayID SDL_GetPrimaryDisplay(void) {
 
 float SDL_GetDisplayContentScale(SDL_DisplayID displayID) {
     (void)displayID;
-    return dpi_scale_from_env();
+    return dpi_pixels_mode() ? dpi_scale_from_env() : 1.0f;
 }
 
+// A 1920x1080-point display; in pixels mode that many points times the scale
+// in pixels, which is what window coordinates are there.
 bool SDL_GetDisplayUsableBounds(SDL_DisplayID displayID, SDL_Rect* rect) {
     (void)displayID;
     if (!rect) return false;
-    rect->x = 0; rect->y = 0; rect->w = 1920; rect->h = 1080;
+    float k = dpi_pixels_mode() ? dpi_scale_from_env() : 1.0f;
+    rect->x = 0; rect->y = 0; rect->w = (int)(1920 * k + 0.5f); rect->h = (int)(1080 * k + 0.5f);
     return true;
+}
+
+const SDL_DisplayMode* SDL_GetDesktopDisplayMode(SDL_DisplayID displayID) {
+    static SDL_DisplayMode m;
+    SDL_Rect r{};
+    SDL_GetDisplayUsableBounds(displayID, &r);
+    m = SDL_DisplayMode{};
+    m.displayID = displayID ? displayID : 1u;
+    m.w = r.w; m.h = r.h;
+    m.pixel_density = dpi_pixels_mode() ? 1.0f : dpi_scale_from_env();
+    m.refresh_rate = 60.0f;
+    m.refresh_rate_numerator = 60; m.refresh_rate_denominator = 1;
+    return &m;
 }
 
 bool SDL_GetDisplayBounds(SDL_DisplayID displayID, SDL_Rect* rect) {
@@ -412,12 +462,22 @@ bool SDL_RenderClear(SDL_Renderer* renderer) {
     return true;
 }
 
+static float window_pixel_scale(SDL_Window* w);
+static float dpi_scale_from_env();
+
 // Presenting ends a frame: it becomes "the screen" until the next present.
+// The header carries the drawing-surface size in pixels (what every op is
+// in), the pixels-per-point density a pointer position must be divided by,
+// and the display scale the UI multiplies its metrics by.
 bool SDL_RenderPresent(SDL_Renderer* renderer) {
     if (!renderer) return false;
     if (capture_enabled()) {
-        g_cur.w = g_win_w;
-        g_cur.h = g_win_h;
+        int ow = g_win_w, oh = g_win_h;
+        SDL_GetRenderOutputSize(renderer, &ow, &oh);
+        g_cur.w = ow;
+        g_cur.h = oh;
+        g_cur.density = window_pixel_scale(renderer->window);
+        g_cur.scale = SDL_GetWindowDisplayScale(renderer->window);
         g_cur.n = ++g_frame_no;
         std::swap(g_last, g_cur);
         g_cur.clear();
@@ -475,11 +535,12 @@ bool SDL_SetRenderViewport(SDL_Renderer* renderer, const SDL_Rect* rc) {
     return true;
 }
 
-// A window created with SDL_WINDOW_HIGH_PIXEL_DENSITY has a drawing surface
-// of NY_STUB_DPI_SCALE pixels per point, as on a Retina display; any other
-// window is scaled by the system and draws in points.
+// Points mode: a window created with SDL_WINDOW_HIGH_PIXEL_DENSITY has a
+// drawing surface of NY_STUB_DPI_SCALE pixels per point, as on a Retina
+// display; any other window is scaled by the system and draws in points.
+// Pixels mode: window coordinates are already pixels.
 static float window_pixel_scale(SDL_Window* w) {
-    if (!w || !(w->flags & SDL_WINDOW_HIGH_PIXEL_DENSITY)) return 1.0f;
+    if (!w || dpi_pixels_mode() || !(w->flags & SDL_WINDOW_HIGH_PIXEL_DENSITY)) return 1.0f;
     return dpi_scale_from_env();
 }
 
@@ -935,6 +996,33 @@ static void exec_command(const std::string& raw) {
         w.ev.wheel.x = wdx;
         w.ev.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
         g_pending.push_back(w);
+        return;
+    }
+    // scale F: the display scale becomes F (the window moved to another
+    // monitor, or the user changed the system scale). SDL reports it with
+    // DISPLAY_SCALE_CHANGED; in points mode a high-density window's pixel
+    // size follows, and in pixels mode the system resizes the window to keep
+    // its size on screen (Windows' WM_DPICHANGED), so a resize comes too.
+    if (cmd == "scale") {
+        float old = dpi_scale_from_env();
+        float nf = num(1, 1.0f);
+        if (!(nf > 0.0f)) nf = 1.0f;
+        g_dpi_override = nf;
+        PendingEvent e = blank_event(SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED, SDL_KMOD_NONE);
+        SDL_Window* tw = nullptr;
+        for (SDL_Window* w : g_all_windows) if (w->id == e.ev.window.windowID) tw = w;
+        e.batch_end = false;
+        g_pending.push_back(e);
+        if (tw && dpi_pixels_mode()) {
+            tw->w = (int)(tw->w * nf / old + 0.5f);
+            tw->h = (int)(tw->h * nf / old + 0.5f);
+            g_win_w = tw->w; g_win_h = tw->h;
+        }
+        PendingEvent r = blank_event(dpi_pixels_mode() ? SDL_EVENT_WINDOW_RESIZED : SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED, SDL_KMOD_NONE);
+        r.ev.window.data1 = tw ? tw->w : g_win_w;
+        r.ev.window.data2 = tw ? tw->h : g_win_h;
+        r.batch_end = true;
+        g_pending.push_back(r);
         return;
     }
     if (cmd == "resize") {

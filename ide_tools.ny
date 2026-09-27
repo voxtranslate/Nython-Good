@@ -1267,8 +1267,8 @@ class IDETools(IDEViews):
         self.ed_x = x
         self.ed_y = self.crumb_y + self.CRUMB_H
         self.ed_h = self._pane_bottom(g) - self.ed_y
-        if self.ed_h < 40:
-            self.ed_h = 40
+        if self.ed_h < self.dp(40):
+            self.ed_h = self.dp(40)
         self.mm_w = 0
         if self.minimap_on and w > self.dp(560):
             self.mm_w = self.MINIMAP_W

@@ -150,6 +150,31 @@ if scripted:
     check("resize event carries pixels", seen[0], "resize:0,0:800x600")
     check("pointer in pixels", seen[1], "mousemove:20,20:0x0")
     hw.destroy()
+
+    # Layout-unit windows: the size asked for is the size at scale 1, on
+    # either of SDL3's HiDPI models. On a Retina-style display (points,
+    # 2 pixels per point) 400x300 units is 400x300 points and 800x600
+    # pixels; on a 200% Windows/X11-style display (window coordinates are
+    # pixels) it is 800x600 points - both draw the same workbench at 2 px
+    # per unit.
+    def units_window(mode):
+        os_setenv("NY_STUB_DPI_MODE", mode)
+        var uw = Window(400, 300, "units")
+        uw.high_dpi = true
+        uw.layout_units = true
+        uw.create()
+        var r = [gui_get_window_size(uw._handle), uw.scale(), gui_display_density(), gui_display_scale()]
+        uw.destroy()
+        os_setenv("NY_STUB_DPI_MODE", "")
+        return r
+    var up = units_window("points")
+    check("units, points model: pixels", up[0], [800, 600])
+    check("units, points model: draw scale", up[1], 2.0)
+    check("units, points model: density x content = draw scale", up[2] * up[3], 2.0)
+    var ux = units_window("pixels")
+    check("units, pixels model: pixels", ux[0], [800, 600])
+    check("units, pixels model: draw scale", ux[1], 2.0)
+    check("units, pixels model: density x content = draw scale", ux[2] * ux[3], 2.0)
     os_setenv("NY_STUB_DPI_SCALE", "")
 
 # ── The loop sleeps while nothing changes ───────────────────────────────────

@@ -28,61 +28,54 @@ class NythonIDE(IDETools):
         self.th = IDETheme()
         self.session_id = time_ms() % 100000000
         # ── window ────────────────────────────────────────────────────────────
+        # The workbench is laid out in layout units - VS Code's metrics at
+        # 100% - and drawn at self.dpi pixels per unit. SDL3 has two HiDPI
+        # models (its docs/README-highdpi.md): on Windows and X11 window
+        # coordinates are device pixels and a 200% display asks for everything
+        # twice as big; on macOS and Wayland they are points and a
+        # high-density window has two pixels per point. A layout-unit window
+        # (Window.layout_units) is made the same number of units on both - so
+        # 1600x960 is twice the points on a 200% Windows panel and the same
+        # points, twice the pixels, on a Retina Mac. gui_get_display_size() is
+        # in points, and gui_display_scale() (the content scale) is points per
+        # unit on every platform SDL3 supports.
+        var k = gui_display_scale()
+        if k <= 0.0 or k > 8.0:
+            k = 1.0
         var want_w = 1600
         var want_h = 960
         var disp = gui_get_display_size()
         if disp != none and len(disp) >= 2:
-            if disp[0] > 0 and want_w > disp[0] - 40:
-                want_w = disp[0] - 40
-            if disp[1] > 0 and want_h > disp[1] - 90:
-                want_h = disp[1] - 90
+            var uw = int(disp[0] / k)
+            var uh = int(disp[1] / k)
+            if uw > 0 and want_w > uw - 40:
+                want_w = uw - 40
+            if uh > 0 and want_h > uh - 90:
+                want_h = uh - 90
         if want_w < 900:
             want_w = 900
         if want_h < 560:
             want_h = 560
         self.win = Window(want_w, want_h, "NythonIDE")
         self.win.resizable = true
-        # Every metric below is multiplied by the display scale, so the window
-        # must work in pixels: without high pixel density a Retina or scaled
-        # Wayland display reports scale 2 while the window is in points, and
-        # the whole workbench came out twice its size.
+        # A drawing surface in real pixels (sharp text on Retina / scaled
+        # Wayland); every coordinate the window reports is then in pixels.
         self.win.high_dpi = true
-        self.W = want_w
-        self.H = want_h
-        self.dpi = gui_display_scale()
-        if self.dpi <= 0.0 or self.dpi > 8.0:
+        self.win.layout_units = true
+        # Pixels per unit, predicted before the window exists (content scale
+        # times the pixels per point of a high-density window) so the fonts
+        # can be made now; the open window reports its real scale and
+        # on_scale() adopts it - also when it moves to another monitor.
+        self.dpi = k * gui_display_density()
+        if self.dpi <= 0.0 or self.dpi > 16.0:
             self.dpi = 1.0
-        # VS Code's smallest window; the layout ladder handles it.
-        self.win.set_min_size(int(400 * self.dpi), int(270 * self.dpi))
-        # ── metrics (VS Code's) ───────────────────────────────────────────────
-        self.TITLE_H = self.dp(30)
-        self.ACT_W = self.dp(48)
-        self.SIDEBAR_W = self.dp(270)
-        self.SIDE_HEAD = self.dp(35)
-        self.TAB_H = self.dp(35)
-        self.CRUMB_H = self.dp(22)
-        self.STATUS_H = self.dp(22)
-        self.PANEL_HEAD = self.dp(35)
-        self.MINIMAP_W = self.dp(80)
-        self.ROW_H = self.dp(22)
+        self.W = int(want_w * self.dpi)
+        self.H = int(want_h * self.dpi)
+        # VS Code's smallest window, in units; the layout ladder handles it.
+        self.win.set_min_size(400, 270)
         self.font_size = 13
-        self.LINE_H = int(self.dp(13) * 1.4)
-        # ── fonts ─────────────────────────────────────────────────────────────
-        self.f_ui = Font("sans-serif", self.dp(13), false, false)
-        self.f_ui_bold = Font("sans-serif", self.dp(13), true, false)
-        self.f_small = Font("sans-serif", self.dp(11), false, false)
-        self.f_small_bold = Font("sans-serif", self.dp(11), true, false)
-        self.f_tiny = Font("sans-serif", self.dp(10), false, false)
-        self.f_tab = Font("sans-serif", self.dp(11), false, false)
-        self.f_code = Font("monospace", self.dp(13), false, false)
-        self.f_mono_small = Font("monospace", self.dp(12), false, false)
-        self.f_title = Font("sans-serif", self.dp(34), false, false)
-        self.f_h2 = Font("sans-serif", self.dp(17), false, false)
-        self.ui_h = self.dp(17)
-        self.small_h = self.dp(15)
-        self.code_h = self.dp(17)
-        self.tab_h = self.dp(15)
-        self.code_small_h = self.dp(16)
+        self.SIDEBAR_W = self.dp(270)
+        self._metrics()
         self.char_w = 8
         self.want_col = -1
         # ── model objects ─────────────────────────────────────────────────────
@@ -678,7 +671,7 @@ class NythonIDE(IDETools):
 
     def _minimap_to(self, y):
         var d = self.doc()
-        var row = self.mm_first + int((y - self.ed_y) / 2)
+        var row = self.mm_first + int((y - self.ed_y) / self.MM_PH)
         if row >= d.buf.line_count:
             row = d.buf.line_count - 1
         d.scroll_y = (self._row_to_vrow(d, row) - int(self._rows_visible() / 2)) * self.LINE_H
@@ -2654,9 +2647,81 @@ class NythonIDE(IDETools):
         self.draw(renderer)
         return true
 
+    # Every size the painters use, at self.dpi pixels per layout unit. Run
+    # again by on_scale() when the display scale changes.
+    def _metrics(self):
+        # ── metrics (VS Code's) ───────────────────────────────────────────────
+        self.TITLE_H = self.dp(30)
+        self.ACT_W = self.dp(48)
+        self.SIDE_HEAD = self.dp(35)
+        self.TAB_H = self.dp(35)
+        self.CRUMB_H = self.dp(22)
+        self.STATUS_H = self.dp(22)
+        self.PANEL_HEAD = self.dp(35)
+        self.MINIMAP_W = self.dp(80)
+        self.ROW_H = self.dp(22)
+        self.LINE_H = int(self.dp(self.font_size) * 1.4)
+        # ── fonts ─────────────────────────────────────────────────────────────
+        self.f_ui = Font("sans-serif", self.dp(13), false, false)
+        self.f_ui_bold = Font("sans-serif", self.dp(13), true, false)
+        self.f_small = Font("sans-serif", self.dp(11), false, false)
+        self.f_small_bold = Font("sans-serif", self.dp(11), true, false)
+        self.f_tiny = Font("sans-serif", self.dp(10), false, false)
+        self.f_tab = Font("sans-serif", self.dp(11), false, false)
+        self.f_code = Font("monospace", self.dp(self.font_size), false, false)
+        self.f_mono_small = Font("monospace", self.dp(12), false, false)
+        self.f_title = Font("sans-serif", self.dp(34), false, false)
+        self.f_h2 = Font("sans-serif", self.dp(17), false, false)
+        self.ui_h = self.dp(17)
+        self.small_h = self.dp(15)
+        self.code_h = self.dp(17)
+        self.tab_h = self.dp(15)
+        self.code_small_h = self.dp(16)
+        # Minimap: a source line is 2 units high and a character 1 unit wide.
+        self.MM_PH = self.dp(2)
+        self.MM_BAR = self.dp(1)
+        if self.MM_BAR < 1:
+            self.MM_BAR = 1
+
+    # The window's display scale changed - it opened at a scale other than
+    # predicted, moved to a monitor of another scale, or the system setting
+    # changed. Every metric and font is rebuilt at the new scale; the sizes a
+    # person chose (side bar width, scroll positions) keep their size in
+    # units. The resize that follows lays the workbench out again.
+    def on_scale(self, s):
+        if s <= 0.0 or s > 16.0:
+            return
+        if s > self.dpi - 0.001 and s < self.dpi + 0.001:
+            return
+        var r = s / self.dpi
+        self.dpi = s
+        self.SIDEBAR_W = int(self.SIDEBAR_W * r + 0.5)
+        for d in self.docs:
+            d.scroll_y = int(d.scroll_y * r)
+            d.scroll_x = int(d.scroll_x * r)
+        self._metrics()
+        self.f_code.ensure_loaded()
+        self.char_w = self.f_code.width("M")
+        self._hl_reset()
+        self.W = int(self.W * r + 0.5)
+        self.H = int(self.H * r + 0.5)
+        var sz = gui_get_window_size(self.win._handle)
+        if sz != none and len(sz) >= 2 and sz[0] > 0 and sz[1] > 0:
+            self.W = sz[0]
+            self.H = sz[1]
+        self._layout()
+        self._dirty = true
+
     def run(self):
         self.win.on_resize(self.on_resize)
+        self.win.on_scale(self.on_scale)
         self.win.on_close(self._on_window_close)
+        # The window's real scale, now that it exists: the prediction made in
+        # __init__ can miss (a Wayland output of fractional scale, a driver
+        # that refused high pixel density). If opening fails, run() reports
+        # why.
+        if self.win.create():
+            self.on_scale(gui_window_scale(self.win._handle))
         self.win.run(self._frame)
 
     def _on_window_close(self):
