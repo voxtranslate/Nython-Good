@@ -101,6 +101,7 @@ enum class Op : uint8_t {
     FIN_NORMAL, FIN_RETURN, FIN_JUMP, END_FINALLY,
     WITH_ENTER, WITH_EXIT,
     BINARY_MATMUL,   // a @ b: __matmul__ / __rmatmul__ only
+    MAP_MERGE,       // f(**d): TOS (a map) merged into the map below it
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1608,35 +1609,45 @@ private:
             }
         }
         bool has_kw=!kw_names.empty();
+        bool has_dstar=false;
+        for(auto& arg:pos_args)
+            if(arg->type()==NT::UNARY && std::static_pointer_cast<nython::node::UnaryNode>(arg)->op=="**") has_dstar=true;
         int argc=(int)pos_args.size();
-        // ── *args spread call: fn(*list) ─────────────────────────────────
-        if(has_star){
-            // Build a combined positional args list:
-            // emit [] then for each arg: if *x → LIST_EXTEND, else push x + LIST_APPEND
-            if(cn->callee->type()==NT::ATTRIBUTE){
+        // ── Spread call: f(*xs, **d), with any keywords ──────────────────
+        // The positionals are gathered into one fresh list (*xs extends
+        // it) and the keywords into one fresh map (**d merges into it);
+        // CALL_EX's arg is 1 (list) or 2 (list and map), negative for a
+        // method call. `**d` used to be passed as a positional, and the
+        // keywords of a call with *xs were dropped.
+        if(has_star||has_dstar){
+            bool method=cn->callee->type()==NT::ATTRIBUTE;
+            if(method){
                 auto a=std::static_pointer_cast<nython::node::AttributeNode>(cn->callee);
                 visit(a->object); emit_lc(VMVal::make_str(a->attr),l);
-                emit(Op::BUILD_LIST,0,l); // fresh empty list per call (not a constant!)
-                for(auto& arg:pos_args){
-                    if(arg->type()==NT::UNARY){
-                        auto u=std::static_pointer_cast<nython::node::UnaryNode>(arg);
-                        if(u->op=="*"){ visit(u->operand); emit(Op::LIST_EXTEND,0,l); continue; }
-                    }
-                    visit(arg); emit(Op::LIST_APPEND,0,l);
+            } else visit(cn->callee);
+            emit(Op::BUILD_LIST,0,l); // fresh empty list per call (not a constant!)
+            for(auto& arg:pos_args){
+                if(arg->type()==NT::UNARY){
+                    auto u=std::static_pointer_cast<nython::node::UnaryNode>(arg);
+                    if(u->op=="*"){ visit(u->operand); emit(Op::LIST_EXTEND,0,l); continue; }
+                    if(u->op=="**") continue;
                 }
-                emit(Op::CALL_EX,-1,l); // method mode, 1 combined list arg
-            } else {
-                visit(cn->callee);
-                emit(Op::BUILD_LIST,0,l); // fresh empty list per call (not a constant!)
-                for(auto& arg:pos_args){
-                    if(arg->type()==NT::UNARY){
-                        auto u=std::static_pointer_cast<nython::node::UnaryNode>(arg);
-                        if(u->op=="*"){ visit(u->operand); emit(Op::LIST_EXTEND,0,l); continue; }
-                    }
-                    visit(arg); emit(Op::LIST_APPEND,0,l);
-                }
-                emit(Op::CALL_EX,1,l); // 1 combined list arg
+                visit(arg); emit(Op::LIST_APPEND,0,l);
             }
+            int n=1;
+            if(has_kw||has_dstar){
+                for(size_t i=0;i<kw_names.size();i++){
+                    emit_lc(VMVal::make_str(kw_names[i]),l); visit(kw_vals[i]);
+                }
+                emit(Op::BUILD_MAP,(int)kw_names.size(),l);
+                for(auto& arg:pos_args){
+                    if(arg->type()!=NT::UNARY) continue;
+                    auto u=std::static_pointer_cast<nython::node::UnaryNode>(arg);
+                    if(u->op=="**"){ visit(u->operand); emit(Op::MAP_MERGE,0,l); }
+                }
+                n=2;
+            }
+            emit(Op::CALL_EX,method?-n:n,l);
             return;
         }
         if(cn->callee->type()==NT::ATTRIBUTE){
@@ -3082,10 +3093,16 @@ private:
             }
             case Op::LIST_EXTEND: {
                 // TOS = iterable to extend with; TOS1 = list to extend
-                VMVal ext=pop(); VMVal& lst=stack_.back();
+                VMVal ext=pop();
+                // *x over any iterable (a generator, a string, an object),
+                // not only a list.
+                std::vector<VMVal> items;
+                if(ext.type!=VMType::LIST) items=iter_items(ext);
+                VMVal& lst=stack_.back();
                 if(lst.type==VMType::LIST&&lst.list){
                     if(ext.type==VMType::LIST&&ext.list)
                         for(auto& v:*ext.list) lst.list->push_back(v);
+                    else for(auto& v:items) lst.list->push_back(v);
                 }
                 break;
             }
@@ -3109,6 +3126,9 @@ private:
                 // ins.arg for non-method = n_pos_args (counting star as 1 item)
                 // We need to pop n_pos_args items + the callee.
                 int n_pushed = method_mode ? (-ins.arg) : ins.arg;
+                // 2: the positionals list, then a map of the keywords.
+                VMVal ex_kw; bool has_ex_kw=false;
+                if(n_pushed==2){ ex_kw=pop(); has_ex_kw=true; n_pushed=1; }
                 std::vector<VMVal> raw(n_pushed);
                 for(int i=n_pushed-1;i>=0;i--) raw[i]=pop();
                 // The last element of raw is the star-list; spread it
@@ -3119,11 +3139,19 @@ private:
                 else args.push_back(star_arg); // not a list, just append
                 if(method_mode){
                     VMVal mname=pop(); VMVal obj=pop();
-                    push(vm_call_method(obj,mname.s,args));
+                    push(vm_call_method(obj,mname.s,args,has_ex_kw?&ex_kw:nullptr));
                 } else {
                     VMVal callee=pop();
-                    push(vm_call(callee,args,std::nullopt));
+                    push(vm_call(callee,args,std::nullopt,has_ex_kw?&ex_kw:nullptr));
                 }
+                break;
+            }
+            case Op::MAP_MERGE: {
+                VMVal src=pop(); VMVal& dst=stack_.back();
+                if(src.type!=VMType::MAP||!src.map)
+                    throw_exception(make_exception("TypeError",{VMVal::make_str("argument after ** must be a mapping")}));
+                if(dst.type==VMType::MAP&&dst.map)
+                    for(auto& kv:*src.map) (*dst.map)[kv.first]=kv.second;
                 break;
             }
             case Op::CALL_FUNCTION: {
@@ -6653,6 +6681,7 @@ private:
         case Op::CALL_FUNCTION:return "CALL_FUNCTION";
         case Op::CALL_METHOD:  return "CALL_METHOD";
         case Op::CALL_EX:      return "CALL_EX";
+        case Op::MAP_MERGE:    return "MAP_MERGE";
         case Op::LIST_EXTEND:  return "LIST_EXTEND";
         case Op::LIST_APPEND:  return "LIST_APPEND";
         case Op::LOAD_SUPER:   return "LOAD_SUPER";

@@ -683,7 +683,23 @@ public:   // NythonExecutor is a struct: members default to public
             case NodeType::WITH: { SuspendFast _sf; return evalWith(node, ctx); }
             case NodeType::NAMESPACE: { SuspendFast _sf; return evalNamespace(node, ctx); }
             case NodeType::INTERFACE: { SuspendFast _sf; return evalInterfaceDecl(node, ctx); }
-            case NodeType::YIELD: { auto yn = static_pointer_cast<YieldNode>(node); Value yv = yn->expr ? evalNode(yn->expr, ctx) : NONE_VALUE; if (yield_sink_) { yield_sink_->push_back(yv); return NONE_VALUE; } throw nython::node::YieldSignal(yv); }
+            case NodeType::YIELD: { auto yn = static_pointer_cast<YieldNode>(node); Value yv = yn->expr ? evalNode(yn->expr, ctx) : NONE_VALUE; if (yield_sink_) { yieldValue(yv); return NONE_VALUE; } throw nython::node::YieldSignal(yv); }
+            case NodeType::YIELD_FROM: {
+                // yield from it: every value of `it`, yielded in turn.
+                auto yf = static_pointer_cast<YieldFromNode>(node);
+                Value src = evalNode(yf->expr, ctx);
+                std::vector<Value> items = iterValues(src, ctx);
+                size_t from = 0;
+                if (isGenValue(src)) {
+                    auto* c = dynamic_cast<Container*>(src.value.gc);
+                    auto ii = c->container->find("__idx__");
+                    if (ii != c->container->end()) from = (size_t)bigint_to_i64(ii->second.value.i);
+                    (*c->container)["__idx__"] = Value((int)items.size());
+                }
+                if (!yield_sink_) throw nython::node::YieldSignal(items.empty() ? NONE_VALUE : items[0]);
+                for (size_t i = from; i < items.size(); i++) yieldValue(items[i]);
+                return NONE_VALUE;
+            }
             case NodeType::GLOBAL: return NONE_VALUE;
             case NodeType::SELF: return ctx->getByName("self");
             case NodeType::SUPER: return ctx->getByName("super");
@@ -2314,37 +2330,52 @@ return lv * rv;
         yield_cache_[body.get()] = y;
         return y;
     }
+    // Whether a function body contains yield / yield from anywhere outside
+    // nested functions, lambdas and classes: in expressions (x = yield v,
+    // f((yield v))), and in every compound statement - match (an if-chain),
+    // with, except/else/finally clauses and switch cases were not looked at,
+    // so such a function ran as a plain function and its yield aborted the
+    // process with an uncaught YieldSignal.
     bool hasYield(node_ptr node) {
         if (!node) return false;
-        if (node->type() == NodeType::YIELD) return true;
-        // Check children via dynamic casts of common container nodes
-        if (auto* blk = dynamic_cast<BlockNode*>(node.get())) {
-            for (auto& s : blk->statements()) if (hasYield(s)) return true;
+        switch (node->type()) {
+            case NodeType::YIELD: case NodeType::YIELD_FROM: return true;
+            case NodeType::FUNCTION: case NodeType::LAMBDA: case NodeType::CLASS:
+            case NodeType::COMPREHENSION:
+                return false;
+            default: break;
         }
-        if (auto* fn = dynamic_cast<FunctionNode*>(node.get())) {
-            // Don't recurse into nested function defs (they are separate generators)
-            return false;
-        }
-        if (auto* ifn = dynamic_cast<IfNode*>(node.get())) {
-            return hasYield(ifn->then_branch) || hasYield(ifn->else_branch);
-        }
-        if (auto* wn = dynamic_cast<WhileNode*>(node.get())) {
-            return hasYield(wn->body);
-        }
-        if (auto* forn = dynamic_cast<ForNode*>(node.get())) {
-            return hasYield(forn->body);
-        }
-        if (auto* tryn = dynamic_cast<TryNode*>(node.get())) {
-            return hasYield(tryn->body);
-        }
-        // Check inside var declarations and assignments (yield as expression)
-        if (auto* vd = dynamic_cast<VarDeclNode*>(node.get())) {
-            return vd->init && hasYield(vd->init);
-        }
-        if (auto* an = dynamic_cast<AssignmentNode*>(node.get())) {
-            return hasYield(an->value_node);
-        }
-        return false;
+        Node* n = node.get();
+        auto any = [&](std::initializer_list<node_ptr> xs) { for (auto& x : xs) if (hasYield(x)) return true; return false; };
+        auto anyv = [&](const std::vector<node_ptr>& xs) { for (auto& x : xs) if (hasYield(x)) return true; return false; };
+        if (auto* ifn = dynamic_cast<IfNode*>(n))
+            return any({ifn->condition, ifn->then_branch, ifn->else_branch}) || anyv(ifn->elseif_branches);
+        if (auto* wn = dynamic_cast<WhileNode*>(n)) return any({wn->condition, wn->body, wn->else_branch});
+        if (auto* forn = dynamic_cast<ForNode*>(n)) return any({forn->iterable, forn->body, forn->else_branch});
+        if (auto* tryn = dynamic_cast<TryNode*>(n))
+            return any({tryn->body, tryn->else_clause, tryn->finally_clause}) || anyv(tryn->except_clauses);
+        if (auto* en = dynamic_cast<ExceptNode*>(n)) return hasYield(en->body);
+        if (auto* wn = dynamic_cast<WithNode*>(n)) return any({wn->expr, wn->body});
+        if (auto* sw = dynamic_cast<SwitchNode*>(n)) return any({sw->subject, sw->default_case}) || anyv(sw->cases);
+        if (auto* cs = dynamic_cast<CaseNode*>(n)) return any({cs->value_node, cs->body});
+        if (auto* dn = dynamic_cast<DefaultNode*>(n)) return hasYield(dn->body);
+        if (auto* rn = dynamic_cast<ReturnNode*>(n)) return hasYield(rn->expr);
+        if (auto* vd = dynamic_cast<VarDeclNode*>(n)) return hasYield(vd->init);
+        if (auto* an = dynamic_cast<AssignmentNode*>(n)) return any({an->target, an->value_node});
+        if (auto* an = dynamic_cast<AugAssignNode*>(n)) return any({an->target, an->value_node});
+        if (auto* wl = dynamic_cast<WalrusNode*>(n)) return hasYield(wl->init);
+        if (auto* un = dynamic_cast<UnaryNode*>(n)) return hasYield(un->operand);
+        if (auto* bn = dynamic_cast<BinaryNode*>(n)) return any({bn->left, bn->right});
+        if (auto* cn = dynamic_cast<CallNode*>(n)) return hasYield(cn->callee) || anyv(cn->args);
+        if (auto* kn = dynamic_cast<KeywordArgNode*>(n)) return hasYield(kn->val);
+        if (auto* at = dynamic_cast<AttributeNode*>(n)) return hasYield(at->object);
+        if (auto* sb = dynamic_cast<SubscriptNode*>(n)) return any({sb->object, sb->index});
+        if (auto* me = dynamic_cast<MapEntryNode*>(n)) return any({me->key, me->val});
+        if (auto* pn = dynamic_cast<PrintNode*>(n)) return anyv(pn->args);
+        if (auto* rn = dynamic_cast<RaiseNode*>(n)) return any({rn->expr, rn->cause});
+        if (auto* as = dynamic_cast<AssertNode*>(n)) return any({as->condition, as->message});
+        // Blocks, statement lists, list/tuple/map literals.
+        return anyv(n->statements());
     }
 
     // Wrap a plain function Value into a method bound to `self_val`.
@@ -2428,35 +2459,10 @@ return lv * rv;
             Context* closure_parent = ctx;
             auto cit = closure_contexts.find(fn_val.value.p);
             if (cit != closure_contexts.end()) closure_parent = cit->second;
-            // Generator detection: run with yield_sink_ set so yield appends and continues
-            if (bodyYields(fn_node->body)) {
-                std::vector<Value> yielded;
-                yield_sink_ = &yielded;
-                Context* fn_ctx_probe = new Context(runner, fn_node->name, nullptr, nullptr, closure_parent);
-                CtxReaper _reap_fn_ctx_probe2003(this, fn_ctx_probe);
-                bindParams(fn_node, call_args, fn_ctx_probe, ctx, fn_val.value.p);
-                try { evalBody(fn_node->body, fn_ctx_probe); }
-                catch (nython::node::ReturnSignal&) {}
-                catch (...) {}
-                yield_sink_ = nullptr;
-                if (!yielded.empty()) {
-                    Object* gen_obj = new Object((Runnable*)runner, "__gen__", Type::LIST);
-                    int len = (int)yielded.size();
-                    for (int i = 0; i < len; i++) gen_obj->set(std::to_string(i), yielded[(size_t)i]);
-                    gen_obj->set("__len__", Value(len));
-                    gen_obj->set("__gen__", Value(1));
-                    gen_obj->set("__idx__", Value(0));
-                    return Value((Collectable*)gen_obj);
-                }
-            }
-            // Normal (non-generator) function
             Context* fn_ctx = new Context(runner, fn_node->name, nullptr, nullptr, closure_parent);
             CtxReaper _reap_fn_ctx2020(this, fn_ctx);
             bindParams(fn_node, call_args, fn_ctx, ctx, fn_val.value.p);
-            try {
-                Value rv = evalBody(fn_node->body, fn_ctx);
-                return rv;
-            } catch (nython::node::ReturnSignal& r) { return r.value; }
+            return runFunctionBody(fn_node, fn_ctx);
         } else if (raw->type() == NodeType::LAMBDA) {
             auto* lam = static_cast<LambdaNode*>(raw);
             Context* closure_parent = ctx;
@@ -2498,6 +2504,20 @@ return lv * rv;
                      const std::unordered_map<std::string, Value>* kw_in = nullptr) {
         static const std::unordered_map<std::string, Value> kEmptyKw;
         const std::unordered_map<std::string, Value>& kw_args_in = kw_in ? *kw_in : kEmptyKw;
+        // A generator (eager, see collectGenerator): send(v) advances it as
+        // next() does - the value is not delivered, `x = yield` reads none
+        // on this engine (the VM delivers it) - and close() exhausts it.
+        if (isGenValue(obj)) {
+            if (method_name == "send" || method_name == "__next__") {
+                std::vector<Value> a{obj};
+                return callBuiltin("next", a, ctx);
+            }
+            if (method_name == "close") {
+                auto* c = dynamic_cast<Container*>(obj.value.gc);
+                (*c->container)["__idx__"] = (*c->container)["__len__"];
+                return NONE_VALUE;
+            }
+        }
         // Built-in string methods
         if (obj.type == ValueType::USERDATA && obj.value.p) {
             std::string s = getStringValue(obj);
@@ -3567,9 +3587,7 @@ return lv * rv;
                         // Set __parent_class__ so super() works in this method
                         if (cn->bases.size() > 0)
                             fc->defineByName("__parent_class__", internString(cn->bases[0]->value()));
-                        try { Value r = evalBody(fn->body, fc); return r; }
-                        catch (nython::node::ReturnSignal& r) { return r.value; }
-                        catch (std::string& e) { throw; }
+                        return runFunctionBody(fn, fc);
                     }
                 }
             }
@@ -3610,12 +3628,7 @@ return lv * rv;
                                 if (arg_idx < args.size())
                                     fn_ctx->defineByName(fn->params[i]->value(), args[arg_idx]);
                             }
-                            try {
-                                Value result = evalBody(fn->body, fn_ctx);
-                                return result;
-                            } catch (nython::node::ReturnSignal& ret) {
-                                return ret.value;
-                            }
+                            return runFunctionBody(fn, fn_ctx);
                         }
                     }
                 }
@@ -3643,9 +3656,7 @@ return lv * rv;
                         size_t arg_idx = i - param_start;
                         if (arg_idx < args.size()) fn_ctx->defineByName(fn->params[i]->value(), args[arg_idx]);
                     }
-                    try { return evalBody(fn->body, fn_ctx); }
-                    catch (nython::node::ReturnSignal& ret) { return ret.value; }
-                    catch (std::string&) { throw; }
+                    return runFunctionBody(fn, fn_ctx);
                 }
             }
         }
@@ -3675,9 +3686,7 @@ return lv * rv;
                                         size_t arg_idx = i - param_start;
                                         if (arg_idx < args.size()) fn_ctx->defineByName(fn->params[i]->value(), args[arg_idx]);
                                     }
-                                    try { Value result = evalBody(fn->body, fn_ctx); return result; }
-                                    catch (nython::node::ReturnSignal& ret) { return ret.value; }
-                                    catch (std::string&) { throw; }
+                                    return runFunctionBody(fn, fn_ctx);
                                 }
                             }
                         }
@@ -3710,9 +3719,7 @@ return lv * rv;
                                             size_t arg_idx = i - param_start;
                                             if (arg_idx < args.size()) fn_ctx->defineByName(fn->params[i]->value(), args[arg_idx]);
                                         }
-                                        try { Value result = evalBody(fn->body, fn_ctx); return result; }
-                                        catch (nython::node::ReturnSignal& ret) { return ret.value; }
-                                        catch (std::string&) { throw; }
+                                        return runFunctionBody(fn, fn_ctx);
                                     }
                                 }
                             }
@@ -3860,21 +3867,12 @@ return lv * rv;
                 auto un = static_pointer_cast<UnaryNode>(a);
                 if (un->op == "*") {
                     // *iterable spread: unpack list/range into positional args
+                    // (any iterable: a string's characters, a dict's keys,
+                    // an object's __iter__ - a string was passed whole)
                     Value spread_val = evalNode(un->operand, ctx);
-                    if (spread_val.isCollectable() && spread_val.value.gc) {
-                        auto* cont = dynamic_cast<Container*>(spread_val.value.gc);
-                        if (cont && cont->container) {
-                            auto len_it = cont->container->find("__len__");
-                            int len = len_it != cont->container->end()
-                                      ? static_cast<int>(bigint_to_i64(len_it->second.value.i)) : 0;
-                            for (int i = 0; i < len; i++) {
-                                auto it = cont->container->find(std::to_string(i));
-                                if (it != cont->container->end()) call_args.push_back(it->second);
-                            }
-                        }
-                    } else if (spread_val.type == ValueType::INTEGER) {
-                        int64_t n = bigint_to_i64(spread_val.value.i);
-                        for (int64_t i = 0; i < n; i++) call_args.push_back(Value((int)i));
+                    if ((spread_val.isCollectable() && spread_val.value.gc) || spread_val.type == ValueType::INTEGER
+                        || isInstanceValue(spread_val) || isStringValue(spread_val)) {
+                        for (auto& v : iterValues(spread_val, ctx)) call_args.push_back(v);
                     } else {
                         call_args.push_back(spread_val);
                     }
@@ -4413,8 +4411,7 @@ public:
                                     if (!pcn->bases.empty())
                                         fn_ctx->defineByName("__parent_class__", internString(pcn->bases[0]->value()));
                                     fn_ctx->defineByName("__instance__", self_val);
-                                    try { Value r = evalBody(fn->body, fn_ctx); return r; }
-                                    catch (nython::node::ReturnSignal& r) { return r.value; }
+                                    return runFunctionBody(fn, fn_ctx);
                                 }
                             }
                         }
@@ -4482,8 +4479,7 @@ public:
                                         Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
                                         CtxReaper _reap_fc3627(this, fc);
                                         bindParams(fn, args, fc, ctx, attr_val.value.p);
-                                        try { return evalBody(fn->body, fc); }
-                                        catch (nython::node::ReturnSignal& r) { return r.value; }
+                                        return runFunctionBody(fn, fc);
                                     }
                                 }
                             }
@@ -4517,8 +4513,7 @@ public:
                                         Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
                                         CtxReaper _reap_fc3662(this, fc);
                                         bindParamsKw(fn, args, kw_args, fc, ctx, 0, attr_val.value.p);
-                                        try { Value r = evalBody(fn->body, fc); return r; }
-                                        catch (nython::node::ReturnSignal& r) { return r.value; }
+                                        return runFunctionBody(fn, fc);
                                     }
                                 }
                             }
@@ -4663,39 +4658,11 @@ public:
                     Context* closure_parent = ctx;
                     auto cit = closure_contexts.find(callee.value.p);
                     if (cit != closure_contexts.end()) closure_parent = cit->second;
-                    // Generator detection: run with yield_sink_ set (only if yield exists in AST)
-                    if (bodyYields(fn->body)) {
-                        std::vector<Value> yielded;
-                        yield_sink_ = &yielded;
-                        Context* probe_ctx = new Context(runner, fn->name, nullptr, nullptr, closure_parent);
-                        CtxReaper _reapProbe(this, probe_ctx);
-                        bindParamsKw(fn, args, kw_args, probe_ctx, ctx, 0, callee.value.p);
-                        try { evalBody(fn->body, probe_ctx); }
-                        catch (nython::node::ReturnSignal&) {}
-                        catch (...) {}
-                        yield_sink_ = nullptr;
-                        if (!yielded.empty()) {
-                            Object* gen_obj = new Object((Runnable*)runner, "__gen__", Type::LIST);
-                            int glen = (int)yielded.size();
-                            for (int gi = 0; gi < glen; gi++) gen_obj->set(std::to_string(gi), yielded[(size_t)gi]);
-                            gen_obj->set("__len__", Value(glen));
-                            gen_obj->set("__gen__", Value(1));
-                            gen_obj->set("__idx__", Value(0));
-                            return Value((Collectable*)gen_obj);
-                        }
-                    }
                     Context* fn_ctx = new Context(runner, fn->name, nullptr, nullptr, closure_parent);
                     CtxReaper _reap(this, fn_ctx);
                     // Bind parameters with keyword arg and *args support
                     bindParamsKw(fn, args, kw_args, fn_ctx, ctx, 0, callee.value.p);
-                    try {
-                        Value result = evalBody(fn->body, fn_ctx);
-                        return result;
-                    } catch (nython::node::ReturnSignal& ret) {
-                        return ret.value;
-                    } catch (std::string& _ex) {
-                        throw; // re-propagate user exceptions (__exc__) and flow signals
-                    }
+                    return runFunctionBody(fn, fn_ctx);
                 } else if (raw->type() == NodeType::LAMBDA) {
                     auto lam = static_cast<LambdaNode*>(raw);
                     // Use closure context if available (for returned lambdas)
@@ -5073,8 +5040,7 @@ public:
                                 if (cit != closure_contexts.end()) closure_parent = cit->second;
                                 Context* fc = new Context(runner, fn->name, nullptr, nullptr, closure_parent);
                                 fc->defineByName("self", obj);
-                                try { Value r = evalBody(fn->body, fc); return r; }
-                                catch (nython::node::ReturnSignal& r) { return r.value; }
+                                return runFunctionBody(fn, fc);
                             }
                         }
                     }
@@ -5139,8 +5105,7 @@ public:
                                     if (cit2 != closure_contexts.end()) cp = cit2->second;
                                     Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
                                     fc->defineByName("self", obj);
-                                    try { Value r = evalBody(fn->body, fc); return r; }
-                                    catch (nython::node::ReturnSignal& r) { return r.value; }
+                                    return runFunctionBody(fn, fc);
                                 }
                             }
                         }
@@ -6917,8 +6882,7 @@ public:
             CtxReaper _reap_w(this, wfc);
             bindParamsKw(fn, with_self, kw, wfc, ctx, 0, m.value.p);
             OwnerScope _osw(owner_stack_, owner);
-            try { return evalBody(fn->body, wfc); }
-            catch (nython::node::ReturnSignal& r) { return r.value; }
+            return runFunctionBody(fn, wfc);
         }
         Context* cp = global_ctx;
         auto cit = closure_contexts.find(m.value.p);
@@ -6957,8 +6921,7 @@ public:
         if (ocn && !ocn->bases.empty())
             fc->defineByName("__parent_class__", internString(ocn->bases[0]->value()));
         OwnerScope _os(owner_stack_, owner);
-        try { return evalBody(fn->body, fc); }
-        catch (nython::node::ReturnSignal& r) { return r.value; }
+        return runFunctionBody(fn, fc);
     }
     // super().name(...): `name` from the class after `owner` in the MRO of
     // self's class. Returns false when nothing defines it there.
@@ -6991,17 +6954,50 @@ public:
     // __next__ / __getitem__: its items first. sorted/min/max over objects
     // order by __lt__ (or the other side's __gt__), sum adds with __add__ /
     // __radd__, issubclass walks the MRO, hash() uses __hash__.
+    void yieldValue(const Value& v) {
+        if (yield_sink_->size() >= kMaxGeneratorValues)
+            throw std::string("__exc__:RuntimeError:generator produced more than 10000000 values (generators are "
+                              "collected eagerly by the interpreter; use the VM (--vm) for unbounded generators)");
+        yield_sink_->push_back(v);
+    }
     bool isGenValue(const Value& v) {
         if (!v.isCollectable() || !v.value.gc) return false;
         auto* c = dynamic_cast<Container*>(v.value.gc);
         return c && c->container && c->container->count("__gen__");
     }
     Value makeGenValue(const std::vector<Value>& items) {
-        Value g = makeListValue(items);
-        auto* c = dynamic_cast<Container*>(g.value.gc);
-        (*c->container)["__gen__"] = Value(1);
-        (*c->container)["__idx__"] = Value(0);
-        return g;
+        Object* gen_obj = new Object((Runnable*)runner, "__gen__", Type::LIST);
+        int len = (int)items.size();
+        for (int i = 0; i < len; i++) gen_obj->set(std::to_string(i), items[(size_t)i]);
+        gen_obj->set("__len__", Value(len));
+        gen_obj->set("__gen__", Value(1));
+        gen_obj->set("__idx__", Value(0));
+        return Value((Collectable*)gen_obj);
+    }
+    // Generators on this engine are eager: calling a generator function
+    // runs its body to the end, collecting what it yields, and returns a
+    // generator over those values. The enclosing collection (a generator
+    // called from inside another) is restored afterwards - it was reset to
+    // none, so the outer generator's next yield aborted the process. An
+    // exception raised by the body propagates (it was swallowed), and a
+    // body that yields nothing is still a generator (it ran a second time
+    // as a plain function and returned none).
+    static constexpr size_t kMaxGeneratorValues = 10000000;
+    Value collectGenerator(const node_ptr& body, Context* fc) {
+        std::vector<Value> yielded;
+        std::vector<Value>* saved = yield_sink_;
+        yield_sink_ = &yielded;
+        try { evalBody(body, fc); }
+        catch (nython::node::ReturnSignal&) {}
+        catch (...) { yield_sink_ = saved; throw; }
+        yield_sink_ = saved;
+        return makeGenValue(yielded);
+    }
+    // A function body run to completion: its value, or the generator it is.
+    Value runFunctionBody(FunctionNode* fn, Context* fc) {
+        if (bodyYields(fn->body)) return collectGenerator(fn->body, fc);
+        try { return evalBody(fn->body, fc); }
+        catch (nython::node::ReturnSignal& r) { return r.value; }
     }
     bool iterableBuiltin(const std::string& name, std::vector<Value>& args, Context* ctx, Value& out) {
         static const std::unordered_set<std::string> takes = {
