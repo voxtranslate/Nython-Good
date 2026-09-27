@@ -4634,6 +4634,13 @@ private:
     // the interpreter (NythonExecutor::evalAttribute). getattr(o, n, d),
     // hasattr, `o?.attr` and `o?.attr ?? d` are the graceful forms.
     VMVal get_attr(const VMVal& obj, const std::string& attr) {
+        // The common read, a field present on an instance or a map (not a
+        // property), straight from the map: a VMVal is costly to default-
+        // construct and copy twice.
+        if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map){
+            auto it=obj.map->find(attr);
+            if(it!=obj.map->end()&&!is_property_desc(it->second)) return it->second;
+        }
         VMVal v;
         if(lookup_attr(obj, attr, v)) return v;
         return missing_attr(obj, attr);

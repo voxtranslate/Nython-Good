@@ -5345,9 +5345,23 @@ public:
     Value evalAttribute(node_ptr node, Context* ctx) {
         auto* an = static_cast<AttributeNode*>(node.get());
         Value obj = evalNode(an->object, ctx);
+        // The common read, an instance's own field, straight from its
+        // namespace (a Value is not cheap to copy: it carries a Token).
+        if (obj.type == ValueType::USERDATA && obj.value.p) {
+            auto pit = instance_properties.find(obj.value.p);
+            if (pit != instance_properties.end() && pit->second && pit->second->container) {
+                auto fit = pit->second->container->find(an->attr);
+                if (fit != pit->second->container->end() && !isPropertyGetter(fit->second)) return fit->second;
+            }
+        }
         Value v;
         if (getAttrValue(obj, an->attr, ctx, v)) return v;
         return missingAttribute(obj, an->attr, node.get());
+    }
+    bool isPropertyGetter(const Value& v) {
+        if (v.type != ValueType::USERDATA || !v.value.p) return false;
+        auto fn_it = func_names.find(v.value.p);
+        return fn_it != func_names.end() && fn_it->second.find("__property__") != std::string::npos;
     }
 
     // a?.b  a?[k]  a?.m(x)  a?[i:j]  f?.(x), and the chain after the link
@@ -5418,7 +5432,7 @@ public:
                 // Present even when it holds undefined (self.x = undefined).
                 auto fit0 = pit->second->container->find(attr);
                 if (fit0 != pit->second->container->end()) {
-                    Value v = fit0->second;
+                    const Value& v = fit0->second;
                     // Check if this is a @property — if so, call it with self
                     if (v.type == ValueType::USERDATA && v.value.p) {
                         auto fn_it = func_names.find(v.value.p);
