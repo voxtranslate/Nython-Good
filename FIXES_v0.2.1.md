@@ -5389,3 +5389,39 @@ Full account in `HANDOFF.md` §0d. The log entry, by defect:
 New: `fuzzy_score`/`fuzzy_positions`/`fuzzy_rank`, `file_mtime`, allocation
 columns in `--profile`, `NY_PROFILE_OUT` for the IDE, `tools/sweep.py`,
 `tools/ide_lint.py`, `tools/ide_memprobe.py`, `examples/vm_audit42`–`45.ny`.
+
+## Round 74 — responsive IDE, Code::Blocks features, and every layer under it
+
+Full detail in `HANDOFF.md`:
+- §0e: the IDE, engine speed and the build
+- §0f: OS
+- §0g: threads and async
+- §0h: nytorch
+- §0i: values and builtins
+- §0j: exceptions, classes, scope and syntax
+
+Final state: the both-engine sweep has 202 runs and 0 not-ok runs, the
+first with no failing run on either engine. `ide_e2e` passes 354 of 354.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| A one-line call cost 20 µs (interpreter) / 70 µs (VM) | every `return` threw a C++ exception, and every `break`/`continue` threw a `std::string` | pending-flow flag on the interpreter; `RETURN_VALUE` returns from `run_loop` |
+| `while` swallowed every exception in its body (interpreter) | a catch-all around the body | rethrow what is not break/continue |
+| Resizing never relaid out the IDE | an inherited method read as a value gave `none` | MRO walk in `evalAttribute` |
+| 381 ms per keystroke in an 1,800-line file | completion rescanned the document; the syntax check spawned an interpreter; Myers diff ran in the painter; search read every file in script | native `text.cpp` services and a completion index |
+| Completion, replace, paste over a selection, format and case change each took two undo steps | a delete and an insert recorded as separate groups | `open_group`/`close_group` |
+| Ctrl+wheel zoom never worked | wheel events carried no modifiers | modifiers on wheel events (gui.cpp and the stub) |
+| `echo $GREET` in a user tool printed nothing | `K=v cmd` expands `$K` before the assignment | `export K=v;` first |
+| The UI drew at double size on Retina / scaled Wayland | metrics were scaled by the display scale while the window was in points | high pixel density; the window works in pixels |
+| Background threads froze while a GUI window idled | `SDL_WaitEventTimeout` held the GIL | released around the wait |
+| `test_nytorch17` failed about 4% of runs | the prune threshold `‖w‖·s/n` sometimes pruned nothing | exact magnitude pruning |
+| `Queue`/`PriorityQueue`/`Timer` depended on import order | defined in both `stdlib.ny` and `thread.ny` | one definition; `tools/ny_classcheck.py` |
+| `vm_audit24`/`43` failed only in parallel sweeps | both engines' runs shared one temp path | per-run paths |
+| VM typed `except` missed errors raised in callees | the exception object was lost on unwind | exceptions carried as objects |
+| Undefined names, missing methods and bad calls gave `none` | no checks | NameError / AttributeError / TypeError |
+
+New:
+- **IDE:** `ide_tools.ny` (Code::Blocks features, split editor, column selection).
+- **Natives and runtimes:** `src/builtins/text.cpp`, the OS layer (`os_proc.cpp`, `os_time.cpp`), `NyConc`, `NyTensor`, and the nypy value libraries.
+- **Tools:** `tools/ny_classcheck.py`.
+- **Tests:** `vm_audit46`–`54`, `60`, `61`.
