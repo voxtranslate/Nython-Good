@@ -383,6 +383,8 @@ Value dispatch_tensor(NythonExecutor& E,
             if (args.size() >= 1 && args[0].type == ValueType::USERDATA && args[0].value.p 
                 && !E.string_ptrs_.count(args[0].value.p)
                 && instance_to_class.count(args[0].value.p)) {
+                if (!E.instanceHasMethod(args[0], "__len__"))
+                    throw std::string("__exc__:TypeError:object of type '" + E.instanceClassName(args[0]) + "' has no len()");
                 std::vector<Value> no_args;
                 Value result = callMethod(args[0], "__len__", no_args, ctx);
                 if (result.type != ValueType::NONE) return result;
@@ -1125,11 +1127,21 @@ Value dispatch_tensor(NythonExecutor& E,
             // Check for __repr__ method on instances
             if (v.type == ValueType::USERDATA && v.value.p && instance_to_class.count(v.value.p)) {
                 std::vector<Value> no_args;
-                Value result = callMethod(v, "__repr__", no_args, ctx);
-                if (result.type != ValueType::NONE) return result;
+                Value result;
+                if (E.instanceHasMethod(v, "__repr__")) {
+                    result = callMethod(v, "__repr__", no_args, ctx);
+                    if (result.type != ValueType::NONE) return result;
+                }
                 // Fall back to __str__
-                result = callMethod(v, "__str__", no_args, ctx);
-                if (result.type != ValueType::NONE) return result;
+                if (E.instanceHasMethod(v, "__str__")) {
+                    result = callMethod(v, "__str__", no_args, ctx);
+                    if (result.type != ValueType::NONE) return result;
+                }
+                // An exception: Type('message'), as Python and the VM show it.
+                std::string cn0 = E.instanceClassName(v);
+                if (!cn0.empty() && E.isExceptionClass(cn0))
+                    return makeStringValue(cn0 + "('" + E.exceptionMessage(v) + "')");
+                return makeStringValue("<" + cn0 + " instance>");
             }
             if (v.type == ValueType::INTEGER) return makeStringValue(std::to_string(bigint_to_i64(v.value.i)));
             if (v.type == ValueType::DOUBLE) return makeStringValue(std::to_string(static_cast<double>(v.value.d)));

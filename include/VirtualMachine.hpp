@@ -6005,7 +6005,8 @@ private:
         globals_["len"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.empty())return VMVal::make_int(0);
             auto& v=a[0];
-            if(v.type==VMType::INSTANCE){bool f=false;VMVal res=call_dunder_f(v,"__len__",{},f);if(f)return res;}
+            if(v.type==VMType::INSTANCE){bool f=false;VMVal res=call_dunder_f(v,"__len__",{},f);if(f)return res;
+                throw_exception(make_exception("TypeError",{VMVal::make_str("object of type '"+v.class_name+"' has no len()")}));}
             if(v.type==VMType::STRING)return VMVal::make_int((int64_t)u8_chars(v.s));
             if(v.type==VMType::LIST&&v.list)return VMVal::make_int((int64_t)v.list->size());
             if(v.type==VMType::MAP&&v.map)return VMVal::make_int((int64_t)v.map->size());

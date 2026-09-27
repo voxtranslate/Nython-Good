@@ -351,6 +351,30 @@ struct NythonExecutor {
     // Nython source every program starts with (include/NyPrelude.hpp): the
     // file objects open() returns. The VM runs the same text.
     void loadPrelude() {
+        // The builtin exception classes are real classes, as on the VM:
+        // `except ValueError as e` binds an instance (isinstance, e.args,
+        // type(e).__name__, __cause__), `raise ValueError` instantiates it
+        // and user classes derive from them. They were builtin constructors
+        // of message strings.
+        try {
+            std::string src;
+            for (auto& n : nython::ny_builtin_exc_names()) {
+                const char* par = nython::ny_builtin_exc_parent(n);
+                src += "class " + n + (par && *par ? std::string("(") + par + ")" : std::string()) + ":\n    pass\n";
+            }
+            auto source = SourceCode(src);
+            auto reporter = std::make_shared<Reporter>(source);
+            auto lex = std::make_shared<Lexer>(source);
+            lex->tokenize();
+            auto parser = std::make_shared<Parser>(reporter.get(), (Runnable*)runner, lex.get());
+            auto ast = parser->parse();
+            if (ast) {
+                imported_asts.push_back(ast);
+                evalNode(ast, global_ctx);
+            }
+        } catch (...) {
+            std::cerr << "[Nython] builtin exception classes failed to load\n";
+        }
         try {
             auto source = SourceCode(std::string(nyrt::prelude_source()));
             auto reporter = std::make_shared<Reporter>(source);
@@ -2125,6 +2149,8 @@ return lv * rv;
         if (isInstanceValue(v)) {
             std::vector<Value> none;
             if (instanceHasMethod(v, "__repr__")) { std::cout << getStringValue(callMethod(v, "__repr__", none, ctx ? ctx : global_ctx)); return; }
+            std::string cn0 = instanceClassName(v);
+            if (!cn0.empty() && isExceptionClass(cn0)) { std::cout << cn0 << "('" << exceptionMessage(v) << "')"; return; }
         }
         if (v.type == ValueType::USERDATA && v.value.p && func_names.count(v.value.p)
             && !instance_to_class.count(v.value.p) && !string_ptrs_.count(v.value.p)) {
@@ -2632,6 +2658,11 @@ return lv * rv;
         if (fn_val.type != ValueType::USERDATA || !fn_val.value.p) return NONE_VALUE;
         auto fit = func_names.find(fn_val.value.p);
         if (fit == func_names.end()) return NONE_VALUE;
+        // A class passed as a callable (map(Point, xs), a factory argument).
+        if (fit->second.rfind("__class__:", 0) == 0) {
+            static const std::unordered_map<std::string, Value> no_kw;
+            return instantiateClass(fn_val, call_args, no_kw, ctx);
+        }
         // A builtin, an instance or a class is not an AST function: treating its
         // pointer as a Node* crashed (e.g. thread_create(print)).
         if (fit->second.rfind("__builtin__:", 0) == 0) return callBuiltin(fit->second.substr(12), call_args, ctx);
@@ -4962,31 +4993,8 @@ public:
         }
 
         // Class instantiation: __class__:Name
-        if (callee.type == ValueType::USERDATA && callee.value.p && fname.find("__class__:") == 0) {
-            std::string className = fname.substr(10);
-            // Create new instance object
-            Value instance;
-            instance.type = ValueType::USERDATA;
-            auto inst_ptr = std::make_unique<std::string>("__instance__:" + className);
-            instance.value.p = (void*)inst_ptr.get();
-            instance_store.push_back(std::move(inst_ptr));
-            instance_to_class[instance.value.p] = callee.value.p; // track class
-            func_names[instance.value.p] = "__instance__:" + className;
-            // Create property storage for this instance
-            Context* props = new Context(runner, className + "_props", nullptr, nullptr, nullptr);
-            instance_properties[instance.value.p] = props;
-            // An exception's args are the constructor's arguments whatever its
-            // __init__ does (as in Python); super().__init__(...) replaces them.
-            if (isExceptionClass(className)) setExceptionArgs(instance, args);
-
-            // The constructor: __init__ (or init) from the first class in the
-            // MRO that defines one, called like any method - keyword
-            // arguments, defaults evaluated at definition, the class's own
-            // scope as its parent (not the caller's: a constructor read the
-            // caller's local variables), exceptions propagate.
-            runConstructor(instance, args, kw_args, ctx);
-            return instance;
-        }
+        if (callee.type == ValueType::USERDATA && callee.value.p && fname.find("__class__:") == 0)
+            return instantiateClass(callee, args, kw_args, ctx);
 
         // Check for Object.call if callee is collectable
         if (callee.isCollectable() && callee.value.gc) {
@@ -5830,6 +5838,27 @@ public:
         auto eit = exc_instance_map_.find(reinterpret_cast<void*>(ptr_val));
         return eit != exc_instance_map_.end() ? eit->second : NONE_VALUE;
     }
+    // The exception object an except clause binds: the raised instance, or
+    // for an error raised as "__exc__:Type:message" (runtime errors, native
+    // builtins) a new instance of that builtin class with the message as its
+    // argument; a plain message string when no such class exists.
+    Value exceptionObject(const std::string& flow) {
+        Value inst = excInstanceOf(flow);
+        if (inst.type != ValueType::NONE) return inst;
+        std::string t = excTypeOf(flow);
+        Node* cn = t.empty() ? nullptr : classNodeByName(t);
+        if (cn && flow.rfind("__exc__:", 0) == 0) {
+            Value cv; cv.type = ValueType::USERDATA; cv.value.p = (void*)cn;
+            if (fnTag(func_names, cv.value.p).rfind("__class__:", 0) == 0) {
+                std::vector<Value> a{makeStringValue(excMessageOf(flow))};
+                static const std::unordered_map<std::string, Value> no_kw;
+                Value obj = instantiateClass(cv, a, no_kw, global_ctx);
+                exc_instance_map_[obj.value.p] = obj;
+                return obj;
+            }
+        }
+        return makeStringValue(excMessageOf(flow));
+    }
     // The message of an exception string: what str(e) gives in an except.
     std::string excMessageOf(const std::string& flow) {
         Value inst = excInstanceOf(flow);
@@ -5926,9 +5955,7 @@ public:
         if (!match) { run_finally(); throw exc; }
 
         if (!match->var.empty()) {
-            Value inst = excInstanceOf(exc);
-            if (inst.type != ValueType::NONE) ctx->defineByName(match->var, inst);
-            else ctx->defineByName(match->var, makeStringValue(excMessageOf(exc)));
+            ctx->defineByName(match->var, exceptionObject(exc));
         }
         handling_exc_.push_back(exc);
         struct PopHandling { std::vector<std::string>& v; ~PopHandling() { v.pop_back(); } } _ph{handling_exc_};
@@ -5939,6 +5966,29 @@ public:
         return result;
     }
 
+    // A new instance of a user class: its storage, an exception's args (the
+    // constructor's arguments whatever its __init__ does, as in Python;
+    // super().__init__(...) replaces them), then the constructor - __init__
+    // (or init) from the first class in the MRO that defines one, called
+    // like any method: keyword arguments, defaults evaluated at definition,
+    // the class's own scope as its parent (not the caller's), exceptions
+    // propagate.
+    Value instantiateClass(const Value& cls, std::vector<Value>& args,
+                           const std::unordered_map<std::string, Value>& kw, Context* ctx) {
+        std::string className = fnTag(func_names, cls.value.p).substr(10);
+        Value instance;
+        instance.type = ValueType::USERDATA;
+        auto inst_ptr = std::make_unique<std::string>("__instance__:" + className);
+        instance.value.p = (void*)inst_ptr.get();
+        instance_store.push_back(std::move(inst_ptr));
+        instance_to_class[instance.value.p] = cls.value.p;
+        func_names[instance.value.p] = "__instance__:" + className;
+        Context* props = new Context(runner, className + "_props", nullptr, nullptr, nullptr);
+        instance_properties[instance.value.p] = props;
+        if (isExceptionClass(className)) setExceptionArgs(instance, args);
+        runConstructor(instance, args, kw, ctx);
+        return instance;
+    }
     Value evalRaise(node_ptr node, Context* ctx) {
         auto rn = static_pointer_cast<RaiseNode>(node);
         if (!rn->expr) {
@@ -5954,7 +6004,8 @@ public:
             if (fit != func_names.end()) {
                 if (fit->second.rfind("__class__:", 0) == 0) {
                     std::vector<Value> none_args;
-                    v = callFunctionValue(v, none_args, ctx);
+                    static const std::unordered_map<std::string, Value> no_kw;
+                    v = instantiateClass(v, none_args, no_kw, ctx);
                 } else if (fit->second.rfind("__builtin__:", 0) == 0
                            && nython::ny_is_builtin_exc(fit->second.substr(12))) {
                     throw std::string("__exc__:" + fit->second.substr(12) + ":");
@@ -7622,8 +7673,7 @@ public:
         };
         auto exit_exc = [&](const std::string& flow) -> bool {
             if (!managed || !instanceHasMethod(v, "__exit__")) return false;
-            Value inst = excInstanceOf(flow);
-            Value ev = inst.type != ValueType::NONE ? inst : makeStringValue(excMessageOf(flow));
+            Value ev = exceptionObject(flow);
             std::vector<Value> a{exceptionClassValue(flow), ev, NONE_VALUE};
             return isTruthy(callMethod(v, "__exit__", a, ctx));
         };
