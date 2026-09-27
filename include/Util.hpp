@@ -800,13 +800,15 @@ inline std::vector<long double> range(long double stop){
 	return vect();
 }
 
-inline void _merge(Object* clazz,std::unordered_map<std::string,Value>* table){
+template<class Table>
+inline void _merge(Object* clazz,Table* table){
 	for(auto it = clazz->container->begin();it!=clazz->container->end();it++){
 		(*table)[it->first] = it->second;
 	}
 }
 
-inline void merge(Object* clazz,std::unordered_map<std::string,Value>* table){
+template<class Table>
+inline void merge(Object* clazz,Table* table){
 	if(!clazz || clazz->container) return;
 	if(clazz!=nullptr&&clazz->getParent()!=nullptr&&clazz!=clazz->getParent()){
 		merge(clazz->getParent(),table);

@@ -276,6 +276,8 @@ These were aligned to match how the IDE calls them:
 | vm_audit49 | 41 | async/await: tasks, gather, wait_for, cancellation, deterministic order |
 | vm_audit50 | 51 | `lib/thread.ny` over the native runtime |
 | vm_audit51 | 52 | native editor text services (symbols, syntax check, diff, search, folding, format, completion index) |
+| vm_audit60 | 284 | Python values and builtins: dicts, ints, formatting, operators, tuples, strings (same results under python3) |
+| vm_audit61 | 33 | Nython-only value behaviour |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `for t in examples/test_*.ny examples/vm_audit*.ny; do ./build/nython-cli "$t"; done`
@@ -633,6 +635,19 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
 - **One definition per class name under `lib/`**: `python3
   tools/ny_classcheck.py` fails on duplicates (a later same-named class
   silently replaces the earlier one). Run it after adding a class.
+
+## Round 74: Python values and builtins (see `HANDOFF.md` §0i)
+
+- Shared value libraries for both engines: `NyBigInt`, `NyStr`,
+  `NyFormat`, `NyOrderedMap`, `builtins/pycore.cpp`.
+- Dicts keep insertion order with typed keys; ints are exact at any size;
+  one formatter (f-strings with specs, `format`, `str.format`, `%`);
+  tuples; UTF-8 character indexing; IndexError/KeyError on out-of-range.
+- Arithmetic on unsupported types raises TypeError (it used to give none /
+  1). Reading a missing dict key still gives none, on purpose.
+- VM natives receive keyword arguments as a trailing map marked
+  `class_name "__kwargs__"` (`take_kwargs()`); OS builtins read the same
+  map with `nyos::Args`.
 
 ## Transcripts
 

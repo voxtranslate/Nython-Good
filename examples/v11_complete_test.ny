@@ -62,7 +62,7 @@ var evens_sq = sum(map(lambda x: x * x, filter(lambda x: x % 2 == 0, data)))
 t("pipeline", evens_sq, 220)
 var names = ["alice", "bob"]
 var uppers = map(lambda s: s.upper(), names)
-t("map_str", str(uppers), "[ALICE, BOB]")
+t("map_str", str(uppers), "['ALICE', 'BOB']")
 
 print "=== WITH __enter__/__exit__ ==="
 class Ctx:

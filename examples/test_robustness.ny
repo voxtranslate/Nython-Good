@@ -26,7 +26,7 @@ check("keys on string",   keys("abc"),   none)
 check("values on string", values("abc"), none)
 
 print "=== container builtins on real containers still work ==="
-check("items on map", str(items({"a": 1})), "[['a', 1]]")
+check("items on map", str(items({"a": 1})), "[('a', 1)]")
 check("keys count",   len(keys({"a": 1, "b": 2})), 2)
 
 print "=== matrix builtins on non-matrices ==="
@@ -44,8 +44,8 @@ check("transpose shape", str(mat_shape(t)), "[2, 2]")
 check("transpose value", mat_get(t, 0, 1), 3.0)   # transposed: m[1][0]
 
 print "=== float formatting is identical on both engines ==="
-check("third",   str(1.0 / 3.0), "0.333333333333333")
-check("seventh", str(2.0 / 7.0), "0.285714285714286")
+check("third",   str(1.0 / 3.0), "0.3333333333333333")   # shortest round-trip repr
+check("seventh", str(2.0 / 7.0), "0.2857142857142857")
 check("exact",   str(1.5), "1.5")
 check("whole",   str(100.0), "100.0")
 

@@ -11,6 +11,7 @@
 #pragma once
 
 #include <charconv>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -67,7 +68,7 @@ struct Node {
     bool b = false;
     long long i = 0;
     double d = 0.0;
-    std::string s;
+    std::string s;                                      // Str; an Int's digits past 64 bits
     std::vector<Node> items;                            // Arr
     std::vector<std::pair<std::string, Node>> fields;   // Obj, in document order
 };
@@ -265,7 +266,12 @@ private:
             long long v = 0;
             auto r = std::from_chars(b, e, v);
             if (r.ec == std::errc() && r.ptr == e) { out.kind = Node::Int; out.i = v; return true; }
-            // Too large for 64 bits: keep the magnitude as a float.
+            // Too large for 64 bits: an exact big integer, as Python's json
+            // gives. `s` holds its decimal digits, `i` the saturated value.
+            out.kind = Node::Int;
+            out.s.assign(b, e);
+            out.i = *b == '-' ? LLONG_MIN : LLONG_MAX;
+            return true;
         }
         double d = 0.0;
         auto r = std::from_chars(b, e, d);

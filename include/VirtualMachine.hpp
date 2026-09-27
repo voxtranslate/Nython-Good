@@ -41,6 +41,10 @@
 #include "NyTensor.hpp"
 #include "NyJson.hpp"
 #include "NyFuzzy.hpp"
+#include "NyOrderedMap.hpp"
+#include "NyBigInt.hpp"
+#include "NyStr.hpp"
+#include "NyFormat.hpp"
 #include "NyRuntime.hpp"
 #include "NyPrelude.hpp"
 #include "NyConc.hpp"   // concurrency runtime shared with the interpreter
@@ -97,6 +101,8 @@ enum class Op : uint8_t {
     // the operands were left on the stack instead of being combined and
     // consumed, corrupting whatever ran next (see HANDOFF.md).
     COMPARE_SEQ, COMPARE_SNE, LOGICAL_XOR,
+    // A tuple display `(a, b)`: BUILD_LIST's items, as a tuple (VMVal::is_tuple).
+    BUILD_TUPLE,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -118,6 +124,10 @@ enum class VMType : uint8_t {
 };
 
 struct VMCode;  // forward declaration (defined after VMVal)
+struct VMVal;
+// Dicts, instance fields and closure environments: insertion-ordered, so a
+// dict iterates in the order its keys were added (as in Python).
+using VMMap = nypy::OrderedMap<VMVal>;
 using NativeFunc = std::function<struct VMVal(std::vector<struct VMVal>&)>;
 
 struct VMVal {
@@ -127,15 +137,31 @@ struct VMVal {
     double  d   = 0.0;
     std::string s;
     std::shared_ptr<std::vector<VMVal>>                        list;
-    std::shared_ptr<std::unordered_map<std::string,VMVal>>     map;
+    std::shared_ptr<VMMap>     map;
     std::shared_ptr<VMCode>                                    code;
     NativeFunc                                                 native;
     std::shared_ptr<std::pair<int,std::vector<VMVal>>>         iter;
     std::shared_ptr<struct GenState>                           gen;
     std::string class_name;
     // Closure environment: captured variables from enclosing scope
-    std::shared_ptr<std::unordered_map<std::string,VMVal>>     closure_env;
+    std::shared_ptr<VMMap>     closure_env;
 
+    // A LIST with b == true is a tuple: immutable, printed with parentheses,
+    // never equal to a list, hashable as a dict key. An INT whose s is not
+    // empty is a big int: s holds its exact decimal value and i the value
+    // saturated to 64 bits (for code that only needs an index or a count).
+    bool is_tuple() const { return type==VMType::LIST && b; }
+    bool is_bigint() const { return type==VMType::INT && !s.empty(); }
+    static VMVal make_tuple(std::vector<VMVal> items={}) {
+        VMVal x=make_list(std::move(items)); x.b=true; return x;
+    }
+    static VMVal make_bigint(const nypy::BigInt& v) {
+        int64_t t;
+        if(v.to_i64(t)) return make_int(t);
+        VMVal x; x.type=VMType::INT; x.s=v.to_string();
+        x.i=v.neg?INT64_MIN:INT64_MAX;
+        return x;
+    }
     static VMVal make_none()              { return {}; }
     static VMVal make_bool(bool v)        { VMVal x; x.type=VMType::BOOL;  x.b=v; return x; }
     static VMVal make_int(int64_t v)      { VMVal x; x.type=VMType::INT;   x.i=v; return x; }
@@ -147,7 +173,7 @@ struct VMVal {
     }
     static VMVal make_map() {
         VMVal x; x.type=VMType::MAP;
-        x.map=std::make_shared<std::unordered_map<std::string,VMVal>>(); return x;
+        x.map=std::make_shared<VMMap>(); return x;
     }
     static VMVal make_func(std::shared_ptr<VMCode> c) {
         VMVal x; x.type=VMType::FUNCTION; x.code=c; return x;
@@ -156,7 +182,7 @@ struct VMVal {
         VMVal x; x.type=VMType::CLASS; x.code=c; x.class_name=std::move(name); return x;
     }
     static VMVal make_instance(std::string cname,
-        std::shared_ptr<std::unordered_map<std::string,VMVal>> attrs) {
+        std::shared_ptr<VMMap> attrs) {
         VMVal x; x.type=VMType::INSTANCE; x.class_name=std::move(cname); x.map=attrs; return x;
     }
     static VMVal make_native(NativeFunc f) {
@@ -171,7 +197,7 @@ struct VMVal {
         switch(type){
         case VMType::NONE:   return false;
         case VMType::BOOL:   return b;
-        case VMType::INT:    return i!=0;
+        case VMType::INT:    return i!=0||!s.empty();
         case VMType::FLOAT:  return d!=0.0;
         case VMType::STRING: return !s.empty();
         case VMType::LIST:   return list&&!list->empty();
@@ -185,8 +211,10 @@ struct VMVal {
 
     bool operator==(const VMVal& o) const {
         if(type!=o.type){
-            if(type==VMType::INT&&o.type==VMType::FLOAT) return (double)i==o.d;
-            if(type==VMType::FLOAT&&o.type==VMType::INT) return d==(double)o.i;
+            if((type==VMType::INT&&o.type==VMType::FLOAT)||(type==VMType::FLOAT&&o.type==VMType::INT)){
+                if(!s.empty()||!o.s.empty()) return num_compare(*this,o)==0;
+                return type==VMType::INT ? (double)i==o.d : d==(double)o.i;
+            }
             // true == 1 and false == 0, as on the interpreter (and in Python).
             if(type==VMType::BOOL&&o.type==VMType::INT) return (int64_t)b==o.i;
             if(type==VMType::INT&&o.type==VMType::BOOL) return i==(int64_t)o.b;
@@ -197,10 +225,11 @@ struct VMVal {
         switch(type){
         case VMType::NONE:   return true;
         case VMType::BOOL:   return b==o.b;
-        case VMType::INT:    return i==o.i;
+        case VMType::INT:    return i==o.i&&s==o.s;
         case VMType::FLOAT:  return d==o.d;
         case VMType::STRING: return s==o.s;
         case VMType::LIST:
+            if(b!=o.b) return false;   // a list is never equal to a tuple
             if(!list&&!o.list) return true;
             if(!list||!o.list) return false;
             if(list->size()!=o.list->size()) return false;
@@ -222,17 +251,50 @@ struct VMVal {
         }
     }
     bool operator!=(const VMVal& o) const { return !(*this==o); }
+    // Python ordering for numbers (bool is an int), strings and lists/tuples
+    // (element by element); anything else is unordered and reads false.
     bool operator<(const VMVal& o) const {
-        if(type==VMType::INT&&o.type==VMType::INT) return i<o.i;
-        if(type==VMType::FLOAT||o.type==VMType::FLOAT){
-            double a=type==VMType::FLOAT?d:(double)i;
-            double bb=o.type==VMType::FLOAT?o.d:(double)o.i;
-            return a<bb;
-        }
+        if(type==VMType::INT&&o.type==VMType::INT&&s.empty()&&o.s.empty()) return i<o.i;
+        if(is_num()&&o.is_num()) { int c=num_compare(*this,o); return c==-1; }
         if(type==VMType::STRING&&o.type==VMType::STRING) return s<o.s;
+        if(type==VMType::LIST&&o.type==VMType::LIST&&list&&o.list){
+            size_t n=std::min(list->size(),o.list->size());
+            for(size_t k=0;k<n;k++){
+                const VMVal& x=(*list)[k]; const VMVal& y=(*o.list)[k];
+                if(x==y) continue;
+                return x<y;
+            }
+            return list->size()<o.list->size();
+        }
         return false;
     }
-    bool operator<=(const VMVal& o) const { return *this==o||*this<o; }
+    bool is_num() const { return type==VMType::INT||type==VMType::FLOAT||type==VMType::BOOL; }
+    // This number as a nypy::NumV (false if it is not a number).
+    bool to_numv(nypy::NumV& n) const {
+        switch(type){
+            case VMType::BOOL: n=nypy::NumV::I(b?1:0); return true;
+            case VMType::INT:
+                if(s.empty()){ n=nypy::NumV::I(i); return true; }
+                { nypy::BigInt bi; nypy::BigInt::parse(s,10,bi); n=nypy::NumV::B(bi); return true; }
+            case VMType::FLOAT: n=nypy::NumV::F(d); return true;
+            default: return false;
+        }
+    }
+    static VMVal from_numv(const nypy::NumV& n){
+        if(n.k==3) return make_float(n.d);
+        if(n.k==1) return make_int(n.i);
+        return make_bigint(n.b);
+    }
+    // -1/0/1, or 2 when unordered (NaN).
+    static int num_compare(const VMVal& a, const VMVal& b){
+        nypy::NumV x,y;
+        if(!a.to_numv(x)||!b.to_numv(y)) return 2;
+        return nypy::num_cmp(x,y);
+    }
+    bool operator<=(const VMVal& o) const {
+        if(is_num()&&o.is_num()){ int c=num_compare(*this,o); return c==-1||c==0; }
+        return *this==o||*this<o;
+    }
     bool operator> (const VMVal& o) const { return o<*this; }
     bool operator>=(const VMVal& o) const { return o<=*this; }
 };
@@ -281,7 +343,7 @@ struct VMCode {
     bool                     is_static     = false;
     bool                     is_classmethod= false;
     bool                     is_generator  = false;
-    std::shared_ptr<std::unordered_map<std::string,VMVal>> closure_env;
+    std::shared_ptr<VMMap> closure_env;
     std::vector<std::shared_ptr<VMCode>> sub_codes;
     std::vector<ExceptionEntry>          exc_table;
 
@@ -317,31 +379,60 @@ struct VMCode {
 
 
 // ── VMVal method bodies (defined after VMCode is complete) ────────────────
+// Object dict keys (instances, functions) by identity: the key text holds an
+// id, this holds the value it stands for.
+inline std::unordered_map<std::string, VMVal>& vm_key_objs() {
+    static std::unordered_map<std::string, VMVal> m; return m;
+}
+// A dict key's stored text (NyStr.hpp: nypy::key_of_*) back to a value.
+inline VMVal vm_key_value(const std::string& k) {
+    switch(nypy::key_kind(k)){
+        case nypy::K_STR: return VMVal::make_str(nypy::key_payload(k));
+        case nypy::K_INT: { nypy::BigInt b; nypy::BigInt::parse(k.substr(2),10,b); return VMVal::make_bigint(b); }
+        case nypy::K_FLOAT: return VMVal::make_float(std::strtod(k.c_str()+2,nullptr));
+        case nypy::K_NONE: return VMVal::make_none();
+        case nypy::K_TUPLE: {
+            std::vector<VMVal> items;
+            for(auto& part:nypy::key_tuple_parts(k)) items.push_back(vm_key_value(part));
+            return VMVal::make_tuple(std::move(items));
+        }
+        case nypy::K_OBJ: {
+            auto it=vm_key_objs().find(k.substr(2));
+            return it!=vm_key_objs().end()?it->second:VMVal::make_none();
+        }
+    }
+    return VMVal::make_none();
+}
+inline bool vm_internal_key(const std::string& k){ return k.size()>=2&&k[0]=='_'&&k[1]=='_'; }
+
 inline std::string VMVal::to_string() const {
     switch(type){
     case VMType::NONE:    return "none";
     case VMType::BOOL:    return b?"true":"false";
-    case VMType::INT:     return std::to_string(i);
-    case VMType::FLOAT:{
-        // 15 significant digits, matching the interpreter. The default stream
-        // precision is 6, so the same computation printed differently
-        // depending on which engine ran it: 1.0/3.0 gave 0.333333 here and
-        // 0.333333333333333 there.
-        std::ostringstream oss; oss<<std::setprecision(15)<<d;
-        std::string r=oss.str();
-        if(r.find('.')==std::string::npos&&r.find('e')==std::string::npos
-           &&r.find("inf")==std::string::npos&&r.find("nan")==std::string::npos) r+=".0";
-        return r;
-    }
+    case VMType::INT:     return s.empty()?std::to_string(i):s;
+    // Shortest text that reads back as the same float, as Python prints it
+    // (0.1 + 0.2 -> 0.30000000000000004, 2.0, 1e+16) - NyFormat.hpp, the
+    // same function the interpreter uses.
+    case VMType::FLOAT:   return nypy::float_repr(d);
     case VMType::STRING:  return s;
     case VMType::LIST:{
-        std::string r="[";
-        if(list) for(size_t k=0;k<list->size();k++){if(k)r+=", ";r+=(*list)[k].repr();}
-        return r+"]";
+        std::string r=b?"(":"[";
+        if(list) for(size_t k=0;k<list->size();k++){
+            if(k)r+=", ";
+            const VMVal& e=(*list)[k];
+            r+=(e.type==VMType::LIST&&e.list==list)?(b?"(...)":"[...]"):e.repr();
+        }
+        if(b&&list&&list->size()==1) r+=",";
+        return r+(b?")":"]");
     }
     case VMType::MAP:{
         std::string r="{"; bool first=true;
-        if(map) for(auto&[k,v]:*map){if(!first)r+=", ";r+=k+": "+v.repr();first=false;}
+        if(map) for(auto&[k,v]:*map){
+            if(vm_internal_key(k)) continue;
+            if(!first)r+=", ";
+            r+=vm_key_value(k).repr()+": "+((v.type==VMType::MAP&&v.map==map)?std::string("{...}"):v.repr());
+            first=false;
+        }
         return r+"}";
     }
     case VMType::FUNCTION: return "<function "+(code?code->name:"?")+">"; 
@@ -354,17 +445,18 @@ inline std::string VMVal::to_string() const {
         }
         return "<"+class_name+" instance>";
     }
-    case VMType::NATIVE:   return "<native>";
+    case VMType::NATIVE:
+        if(class_name.rfind("__builtin__:",0)==0) return "<built-in function "+class_name.substr(12)+">";
+        return "<native>";
     case VMType::ITERATOR: return "<iterator>";
         case VMType::GENERATOR: return "<generator>";
     default:               return "undefined";
     }
 }
 inline std::string VMVal::repr() const {
-    // Single quotes, matching the interpreter: str(["a"]) must render the same
-    // on both engines, otherwise any test or program comparing stringified
-    // containers gets different answers depending on how it was run.
-    if(type==VMType::STRING) return "'"+s+"'";
+    // Python's repr of a string (quotes and escapes chosen as Python does),
+    // matching the interpreter.
+    if(type==VMType::STRING) return nypy::str_repr(s);
     return to_string();
 }
 
@@ -381,6 +473,7 @@ inline bool isTypeNameToken(const std::string& n) {
         "int","Integer","integer","float","Float","double","Double",
         "str","String","string","bool","Boolean","boolean",
         "list","List","array","Array","map","Map","dict","Dict",
+        "tuple","Tuple","set","Set",
         "none","None","function","Function","Object","object","any","Any"
     };
     if(t.count(n)) return true;
@@ -418,6 +511,11 @@ class Compiler {
     // parsed just the leading "0" of every one of these and returned 0,
     // instead of 255/15/10. Matches the interpreter's evalInteger
     // (NythonExecutor.hpp), which already does this prefix check.
+    // Exact at any size: a literal past 64 bits is a big int (it used to
+    // throw out of std::stoll).
+    static VMVal int_literal(const std::string& v){
+        return VMVal::make_bigint(nypy::parse_int_literal(v));
+    }
     static int64_t parse_int_literal(const std::string& v){
         if(v.size()>2 && v[0]=='0'){
             if(v[1]=='x'||v[1]=='X') return std::stoll(v,nullptr,16);
@@ -466,7 +564,7 @@ private:
         if(nd->type()==NT::WALRUS) std::cerr<<"[DBG] visit WALRUS node!\n";
         switch(nd->type()) {
         // Literals
-        case NT::INTEGER: emit_lc(VMVal::make_int(parse_int_literal(nd->token().value)),l); break;
+        case NT::INTEGER: emit_lc(int_literal(nd->token().value),l); break;
         case NT::FLOAT:   emit_lc(VMVal::make_float(std::stod(nd->token().value)),l); break;
         case NT::STRING:  emit_lc(VMVal::make_str(nd->token().value),l); break;
         case NT::TRUE:    emit_lc(VMVal::make_bool(true),l); break;
@@ -494,15 +592,16 @@ private:
                 auto cn=std::static_pointer_cast<nython::node::CallNode>(an->target);
                 if(cn->callee && cn->callee->type()==NT::ATTRIBUTE) {
                     auto attr=std::static_pointer_cast<nython::node::AttributeNode>(cn->callee);
-                    if(attr->attr=="slice" && cn->args.size()>=2) {
+                    if(attr->attr=="slice" && cn->args.size()>=1 && cn->args.size()<=3) {
                         // STORE_SUBSCR pops: idx=TOS, obj=TOS1, val=TOS2
-                        // So emit order (bottom→top): val, obj, [start,end]
+                        // So emit order (bottom→top): val, obj, [start,stop(,step)]
+                        // (L[a:] = x has no stop: none).
                         visit(an->value_node);         // push val FIRST (lands at bottom)
                         visit(attr->object);           // push obj
-                        visit(cn->args[0]);            // push start
-                        visit(cn->args[1]);            // push end
-                        emit(Op::BUILD_LIST,2,l);      // pop start,end → push [start,end]
-                        emit(Op::STORE_SUBSCR,0,l);    // idx=TOS=[s,e], obj=TOS1=obj, val=TOS2=val ✓
+                        for(auto& sa:cn->args) visit(sa);
+                        if(cn->args.size()==1) emit_lc(VMVal::make_none(),l);
+                        emit(Op::BUILD_LIST,(int)std::max<size_t>(2,cn->args.size()),l);
+                        emit(Op::STORE_SUBSCR,0,l);
                         break;
                     }
                 }
@@ -675,11 +774,11 @@ private:
             pop_code();
             emit(Op::MAKE_FUNCTION,(int)C().sub_codes.size()-1,l); break;
         }
-        // Tuple (treat as list)
+        // Tuple
         case NT::TUPLE: {
             auto tn=std::static_pointer_cast<nython::node::TupleNode>(nd);
             for(auto& e:tn->elements) visit(e);
-            emit(Op::BUILD_LIST,(int)tn->elements.size(),l); break;
+            emit(Op::BUILD_TUPLE,(int)tn->elements.size(),l); break;
         }
         case NT::YIELD: {
             auto yn=std::static_pointer_cast<nython::node::YieldNode>(nd);
@@ -723,7 +822,18 @@ private:
                 auto a=std::static_pointer_cast<nython::node::AttributeNode>(dn->target);
                 visit(a->object); emit(Op::DELETE_ATTR,C().add_name(a->attr),l);
             } else if(dn->target->type()==NT::CALL){
-                // del lst[s:e] — slice delete (no-op for now)
+                // del lst[a:b:c] - the parser spells the slice obj.slice(a, b, c)
+                auto cn=std::static_pointer_cast<nython::node::CallNode>(dn->target);
+                if(cn->callee && cn->callee->type()==NT::ATTRIBUTE){
+                    auto attr=std::static_pointer_cast<nython::node::AttributeNode>(cn->callee);
+                    if(attr->attr=="slice" && cn->args.size()>=1 && cn->args.size()<=3){
+                        visit(attr->object);
+                        for(auto& sa:cn->args) visit(sa);
+                        if(cn->args.size()==1) emit_lc(VMVal::make_none(),l);
+                        emit(Op::BUILD_LIST,(int)std::max<size_t>(2,cn->args.size()),l);
+                        emit(Op::DELETE_SUBSCR,0,l);
+                    }
+                }
                 break;
             }
             break;
@@ -1235,7 +1345,7 @@ private:
             if(i<(int)fn->defaults.size()&&fn->defaults[i]){
                 auto& dn=fn->defaults[i];
                 switch(dn->type()){
-                    case NT::INTEGER: dflt=VMVal::make_int(parse_int_literal(dn->token().value)); break;
+                    case NT::INTEGER: dflt=int_literal(dn->token().value); break;
                     case NT::FLOAT:   dflt=VMVal::make_float(std::stod(dn->token().value)); break;
                     case NT::STRING:  dflt=VMVal::make_str(dn->token().value); break;
                     case NT::TRUE:    dflt=VMVal::make_bool(true); break;
@@ -1407,7 +1517,10 @@ private:
                     emit_lc(VMVal::make_str(kw_names[i]),l); visit(kw_vals[i]);
                 }
                 emit(Op::BUILD_MAP,(int)kw_names.size(),l);
-                emit(Op::CALL_KW,argc+1,l);
+                // Negative count = method mode, [obj, name, args..., kwargs]
+                // on the stack (as CALL_EX does). The positive form took the
+                // method NAME for the callee: obj.f(1, b=2) returned none.
+                emit(Op::CALL_KW,-(argc+1),l);
             } else emit(Op::CALL_METHOD,argc,l);
         } else {
             visit(cn->callee);
@@ -1513,9 +1626,9 @@ private:
 struct GenState {
     std::shared_ptr<VMCode> code;
     size_t ip=0;
-    std::unordered_map<std::string,VMVal> locals;
+    VMMap locals;
     std::optional<VMVal> self_val;
-    std::shared_ptr<std::unordered_map<std::string,VMVal>> closure;
+    std::shared_ptr<VMMap> closure;
     bool done=false;
     std::vector<VMVal> saved_stack; // intermediate stack at yield point
     size_t stack_base=0;           // stack level when generator was entered
@@ -1529,7 +1642,7 @@ struct GenState {
 inline VMVal make_generator_val(std::shared_ptr<VMCode> code,
                             std::vector<VMVal> args,
                             std::optional<VMVal> self,
-                            std::shared_ptr<std::unordered_map<std::string,VMVal>> closure=nullptr) {
+                            std::shared_ptr<VMMap> closure=nullptr) {
     VMVal g; g.type=VMType::GENERATOR;
     g.gen=std::make_shared<GenState>();
     g.gen->code=code; g.gen->ip=0; g.gen->self_val=self; g.gen->closure=closure;
@@ -1560,10 +1673,10 @@ inline VMVal make_generator_val(std::shared_ptr<VMCode> code,
 struct CallFrame {
     std::shared_ptr<VMCode>                       code;
     int                                           ip = 0;
-    std::unordered_map<std::string,VMVal>         locals;
+    VMMap         locals;
     std::optional<VMVal>                          self_val;
     // Shared closure environment (shared with enclosing scope)
-    std::shared_ptr<std::unordered_map<std::string,VMVal>> closure_env;
+    std::shared_ptr<VMMap> closure_env;
 
     bool has_local(const std::string& n) const {
         if(locals.count(n)) return true;
@@ -1580,11 +1693,13 @@ struct CallFrame {
     VMVal& local(const std::string& n)           { return locals[n]; }
     void   set(const std::string& n, VMVal v)    {
         // If var exists in closure_env (and is NOT a local param), update closure_env
-        if(closure_env && closure_env->count(n) && !locals.count(n)){
-            (*closure_env)[n]=std::move(v);
-        } else {
-            locals[n]=std::move(v);
+        auto li=locals.find(n);
+        if(li!=locals.end()){ li->second=std::move(v); return; }
+        if(closure_env){
+            auto ci=closure_env->find(n);
+            if(ci!=closure_env->end()){ ci->second=std::move(v); return; }
         }
+        locals[n]=std::move(v);
     }
     void define(const std::string& n, VMVal v) { locals[n]=std::move(v); }
     std::shared_ptr<GenState>  gen_state;   // non-null when executing a generator
@@ -1620,9 +1735,9 @@ class VirtualMachine : public Runnable {
     // sorted(xs, key=...). deque::push_back does not invalidate references to
     // existing elements.
     std::deque<CallFrame>                              call_stack_;
-    std::unordered_map<std::string,VMVal>              globals_;
+    VMMap              globals_;
     std::unordered_map<std::string,std::shared_ptr<VMCode>> class_reg_;
-    std::unordered_map<std::string,std::unordered_map<std::string,VMVal>> class_vars_;
+    std::unordered_map<std::string,VMMap> class_vars_;
     VMVal last_exception_obj_;
     bool prelude_loaded_=false;
     std::vector<nython::node::node_ptr> prelude_asts_;
@@ -1708,11 +1823,11 @@ private:
     void store_var(const std::string& n, VMVal v) {
         // Walk frames: if found in locals or closure_env, update there
         for(int i=(int)call_stack_.size()-1;i>=0;i--){
-            if(call_stack_[i].locals.count(n)){
-                call_stack_[i].locals[n]=std::move(v); return;
-            }
-            if(call_stack_[i].closure_env && call_stack_[i].closure_env->count(n)){
-                (*call_stack_[i].closure_env)[n]=std::move(v); return;
+            auto li=call_stack_[i].locals.find(n);
+            if(li!=call_stack_[i].locals.end()){ li->second=std::move(v); return; }
+            if(call_stack_[i].closure_env){
+                auto ci=call_stack_[i].closure_env->find(n);
+                if(ci!=call_stack_[i].closure_env->end()){ ci->second=std::move(v); return; }
             }
         }
         if(in_other_thread() && module_frame_->has_local(n)){    // round 74
@@ -1761,7 +1876,19 @@ public:
         register_nytorch_builtins();
         register_builtins();
         register_nt_natives();
+        register_pycore();        // after register_builtins: these replace its copies
+        tag_type_builtins();      // again: register_pycore replaced the tagged ones
         VMConc::install(*this);   // last: its GIL-aware sleep natives win
+    }
+    void tag_type_builtins() {
+        for(auto& nm_canon : std::vector<std::pair<std::string,std::string>>{
+                {"int","int"},{"float","float"},{"bool","bool"},{"str","str"},
+                {"string","str"},{"list","list"},{"tuple","tuple"},
+                {"dict","map"},{"set","list"}}){
+            auto git=globals_.find(nm_canon.first);
+            if(git!=globals_.end()&&git->second.type==VMType::NATIVE)
+                git->second.class_name=nm_canon.second;
+        }
     }
 
     ~VirtualMachine() override = default;
@@ -1903,7 +2030,7 @@ public:
     // builtins): the same instance and runtime_error an Op::RAISE of
     // Type(msg) produces, so it takes the VM's normal raise path.
     [[noreturn]] void raise_native_exception(const std::string& type, const std::string& msg) {
-        auto attrs=std::make_shared<std::unordered_map<std::string,VMVal>>();
+        auto attrs=std::make_shared<VMMap>();
         (*attrs)["msg"]=VMVal::make_str(msg);
         (*attrs)["args"]=VMVal::make_list(std::vector<VMVal>{VMVal::make_str(msg)});
         last_exception_obj_=VMVal::make_instance(type.empty()?std::string("Exception"):type, attrs);
@@ -1977,9 +2104,9 @@ private:
     }
 
     VMVal exec_code_bound(std::shared_ptr<VMCode> code,
-                          std::unordered_map<std::string,VMVal> locs,
+                          VMMap locs,
                           std::optional<VMVal> self,
-                          std::shared_ptr<std::unordered_map<std::string,VMVal>> closure=nullptr) {
+                          std::shared_ptr<VMMap> closure=nullptr) {
         CallFrame fr; fr.code=code; fr.ip=0;
         if(self) fr.self_val=self;
         fr.closure_env=closure;
@@ -1995,7 +2122,7 @@ private:
     VMVal exec_code(std::shared_ptr<VMCode> code,
                     std::vector<VMVal> args,
                     std::optional<VMVal> self,
-                    std::shared_ptr<std::unordered_map<std::string,VMVal>> closure=nullptr) {
+                    std::shared_ptr<VMMap> closure=nullptr) {
         size_t _stack_base=stack_.size();
         CallFrame fr; fr.code=code; fr.ip=0;
         if(self) fr.self_val=self;
@@ -2006,6 +2133,11 @@ private:
         int arg_idx=0;
         for(int i=0;i<n_params;i++){
             const std::string& pn=code->param_names[i];
+            if(pn.size()>=2&&pn[0]=='*'&&pn[1]=='*'){
+                // **kw with no keyword arguments: an empty dict, not none
+                fr.define(pn.substr(2), VMVal::make_map());
+                continue;
+            }
             if(!pn.empty()&&pn[0]=='*'){
                 // *args: collect all remaining positional args into a list
                 std::string vararg_name=pn.substr(1); // strip *
@@ -2191,13 +2323,31 @@ private:
             }
             case Op::DELETE_SUBSCR: {
                 VMVal key=pop(), obj=pop();
-                if((obj.type==VMType::MAP||obj.type==VMType::INSTANCE)&&obj.map)
-                    obj.map->erase(key.to_string());
+                if(obj.type==VMType::INSTANCE&&obj.map){
+                    VMVal res=call_dunder(obj,"__delitem__",{key});
+                    if(res.type==VMType::NONE) obj.map->erase(key.to_string());
+                }
+                else if(obj.type==VMType::MAP&&obj.map){
+                    if(obj.map->erase(vkey(key))==0) raise_native_exception("KeyError",key.repr());
+                }
                 else if(obj.type==VMType::LIST&&obj.list){
-                    int i=(int)to_d(key);
-                    if(i<0) i+=(int)obj.list->size();
-                    if(i>=0&&i<(int)obj.list->size())
-                        obj.list->erase(obj.list->begin()+i);
+                    if(obj.b) raise_native_exception("TypeError","'tuple' object doesn't support item deletion");
+                    if(key.type==VMType::LIST&&key.list&&!key.b){
+                        // del L[a:b:c] (the slice spec, as STORE_SUBSCR takes it)
+                        auto& L=*obj.list;
+                        int64_t len=(int64_t)L.size(),st,step,n=slice_spec(*key.list,len,st,step);
+                        if(n<=0) break;
+                        std::vector<bool> gone((size_t)len,false);
+                        for(int64_t k=0,i=st;k<n;k++,i+=step) gone[(size_t)i]=true;
+                        size_t w=0;
+                        for(size_t r=0;r<L.size();r++) if(!gone[r]) L[w++]=std::move(L[r]);
+                        L.resize(w);
+                        break;
+                    }
+                    int64_t i=index_of(key,"list"), n=(int64_t)obj.list->size();
+                    if(i<0) i+=n;
+                    if(i<0||i>=n) raise_native_exception("IndexError","list assignment index out of range");
+                    obj.list->erase(obj.list->begin()+i);
                 }
                 break;
             }
@@ -2213,12 +2363,17 @@ private:
                 for(int i=n-1;i>=0;i--) items[i]=pop();
                 push(VMVal::make_list(std::move(items))); break;
             }
+            case Op::BUILD_TUPLE: {
+                int n=ins.arg; std::vector<VMVal> items(n);
+                for(int i=n-1;i>=0;i--) items[i]=pop();
+                push(VMVal::make_tuple(std::move(items))); break;
+            }
             case Op::BUILD_MAP: {
                 int n=ins.arg;
                 std::vector<std::pair<VMVal,VMVal>> pairs(n);
                 for(int i=n-1;i>=0;i--){pairs[i].second=pop();pairs[i].first=pop();}
                 auto m=VMVal::make_map();
-                for(auto&[k,v]:pairs) (*m.map)[k.to_string()]=std::move(v);
+                for(auto&[k,v]:pairs) (*m.map)[vkey(k)]=std::move(v);
                 push(std::move(m)); break;
             }
 
@@ -2234,55 +2389,38 @@ private:
                     VMVal sv=call_dunder(r,"__str__",{});
                     r=sv.type!=VMType::NONE?sv:VMVal::make_str(r.to_string());
                 }
-                push(op_add(lv,r)); break; }
+                if(lv.type==VMType::INT&&r.type==VMType::INT&&lv.s.empty()&&r.s.empty()){
+                    int64_t res; if(!nypy::add_ovf(lv.i,r.i,res)){ push(VMVal::make_int(res)); break; }
+                }
+                push(binop(nypy::A_ADD,lv,r)); break; }
             case Op::BINARY_SUB: { VMVal r=pop(),lv=pop();
                 if(lv.type==VMType::INSTANCE){VMVal res=call_dunder(lv,"__sub__",{r});if(res.type!=VMType::NONE){push(res);break;}}
-                push(op_arith(lv,r,'-')); break; }
+                push(binop(nypy::A_SUB,lv,r)); break; }
             case Op::BINARY_MUL: { VMVal r=pop(),lv=pop();
                 if(lv.type==VMType::INSTANCE){VMVal res=call_dunder(lv,"__mul__",{r});if(res.type!=VMType::NONE){push(res);break;}}
                 if(r.type==VMType::INSTANCE){VMVal res=call_dunder(r,"__rmul__",{lv});if(res.type!=VMType::NONE){push(res);break;}}
-                // list * int  or  int * list  → replicate list
-                if(lv.type==VMType::LIST&&r.type==VMType::INT&&lv.list){
-                    std::vector<VMVal> rep; for(int64_t k=0;k<r.i;k++) for(auto& x:*lv.list) rep.push_back(x);
-                    push(VMVal::make_list(std::move(rep))); break;
+                push(binop(nypy::A_MUL,lv,r)); break; }
+            case Op::BINARY_DIV: case Op::BINARY_MOD: case Op::BINARY_POW: case Op::BINARY_FLOOR_DIV:
+            case Op::BINARY_AND: case Op::BINARY_OR: case Op::BINARY_XOR: case Op::BINARY_LSHIFT: case Op::BINARY_RSHIFT: {
+                VMVal r=pop(),l=pop();
+                int aop; const char* dunder;
+                switch(ins.op){
+                    case Op::BINARY_DIV: aop=nypy::A_DIV; dunder="__truediv__"; break;
+                    case Op::BINARY_MOD: aop=nypy::A_MOD; dunder="__mod__"; break;
+                    case Op::BINARY_POW: aop=nypy::A_POW; dunder="__pow__"; break;
+                    case Op::BINARY_FLOOR_DIV: aop=nypy::A_FLOORDIV; dunder="__floordiv__"; break;
+                    case Op::BINARY_AND: aop=nypy::A_AND; dunder="__and__"; break;
+                    case Op::BINARY_OR: aop=nypy::A_OR; dunder="__or__"; break;
+                    case Op::BINARY_XOR: aop=nypy::A_XOR; dunder="__xor__"; break;
+                    case Op::BINARY_LSHIFT: aop=nypy::A_LSHIFT; dunder="__lshift__"; break;
+                    default: aop=nypy::A_RSHIFT; dunder="__rshift__"; break;
                 }
-                if(r.type==VMType::LIST&&lv.type==VMType::INT&&r.list){
-                    std::vector<VMVal> rep; for(int64_t k=0;k<lv.i;k++) for(auto& x:*r.list) rep.push_back(x);
-                    push(VMVal::make_list(std::move(rep))); break;
+                if(l.type==VMType::INSTANCE){
+                    VMVal res=call_dunder(l,dunder,{r});
+                    if(res.type==VMType::NONE&&aop==nypy::A_DIV) res=call_dunder(l,"__div__",{r});
+                    if(res.type!=VMType::NONE){push(res);break;}
                 }
-                // string * int  (already handled by op_arith but make explicit)
-                push(op_arith(lv,r,'*')); break; }
-            case Op::BINARY_DIV:      { VMVal r=pop(),l=pop(); push(op_div(l,r,false)); break; }
-            case Op::BINARY_MOD:      { VMVal r=pop(),l=pop(); push(op_mod(l,r));       break; }
-            case Op::BINARY_POW:      { VMVal r=pop(),l=pop();
-                // Return int when both args are ints and exponent >= 0
-                if(l.type==VMType::INT&&r.type==VMType::INT&&r.i>=0){
-                    int64_t base=l.i,exp=r.i,res2=1;
-                    for(int64_t k=0;k<exp;k++) res2*=base;
-                    push(VMVal::make_int(res2)); break;
-                }
-                push(VMVal::make_float(std::pow(to_d(l),to_d(r)))); break; }
-            case Op::BINARY_FLOOR_DIV:{ VMVal r=pop(),l=pop(); push(op_div(l,r,true));  break; }
-            case Op::BINARY_AND:      { VMVal r=pop(),l=pop();
-                if(l.type==VMType::LIST&&r.type==VMType::LIST&&l.list&&r.list){
-                    std::unordered_set<std::string> other; for(auto& v:*r.list) other.insert(v.to_string());
-                    std::vector<VMVal> res;
-                    for(auto& v:*l.list) if(other.count(v.to_string())) res.push_back(v);
-                    push(VMVal::make_list(std::move(res))); break;
-                }
-                push(op_bit(l,r,'&')); break; }
-            case Op::BINARY_OR:       { VMVal r=pop(),l=pop();
-                if(l.type==VMType::LIST&&r.type==VMType::LIST&&l.list&&r.list){
-                    // set union
-                    auto res=*l.list;
-                    std::unordered_set<std::string> seen; for(auto& v:res) seen.insert(v.to_string());
-                    for(auto& v:*r.list) if(!seen.count(v.to_string())){seen.insert(v.to_string());res.push_back(v);}
-                    push(VMVal::make_list(std::move(res))); break;
-                }
-                push(op_bit(l,r,'|')); break; }
-            case Op::BINARY_XOR:      { VMVal r=pop(),l=pop(); push(op_bit(l,r,'^'));    break; }
-            case Op::BINARY_LSHIFT:   { VMVal r=pop(),l=pop(); push(op_bit(l,r,'<'));    break; }
-            case Op::BINARY_RSHIFT:   { VMVal r=pop(),l=pop(); push(op_bit(l,r,'>'));    break; }
+                push(binop(aop,l,r)); break; }
             // Compares
             case Op::COMPARE_EQ: {
                 VMVal r=pop(),lv=pop();
@@ -2340,8 +2478,8 @@ private:
             // Unary
             case Op::UNARY_NEG: {
                 VMVal v=pop();
-                if(v.type==VMType::INT)   push(VMVal::make_int(-v.i));
-                else if(v.type==VMType::FLOAT) push(VMVal::make_float(-v.d));
+                nypy::NumV nv;
+                if(v.to_numv(nv)) push(VMVal::from_numv(nypy::num_neg(nv)));
                 else if(v.type==VMType::INSTANCE){
                     VMVal r=call_dunder(v,"__neg__",{});
                     push(r.type!=VMType::NONE?r:VMVal::make_none());
@@ -2349,8 +2487,13 @@ private:
                 else push(VMVal::make_none()); break;
             }
             case Op::UNARY_NOT:    push(VMVal::make_bool(!pop().is_truthy())); break;
-            case Op::UNARY_BITNOT: { VMVal v=pop(); push(v.type==VMType::INT?VMVal::make_int(~v.i):VMVal::make_none()); break; }
-            case Op::UNARY_POS:    break;
+            case Op::UNARY_BITNOT: { VMVal v=pop(); nypy::NumV nv;
+                if(v.to_numv(nv)){ push(nycall([&]{ return VMVal::from_numv(nypy::num_invert(nv)); })); break; }
+                if(v.type==VMType::INSTANCE){ VMVal r=call_dunder(v,"__invert__",{}); push(r); break; }
+                push(VMVal::make_none()); break; }
+            case Op::UNARY_POS:
+                if(!stack_.empty()&&stack_.back().type==VMType::BOOL) stack_.back()=VMVal::make_int(stack_.back().b?1:0);
+                break;
 
             // Jumps
             case Op::JUMP_FORWARD:         fr.ip=ins.arg; break;
@@ -2390,7 +2533,7 @@ private:
                     // Create shared closure_env on first inner function in this frame
                     // so ALL inner functions share the SAME cell for mutable variables
                     if(!fr.closure_env){
-                        fr.closure_env = std::make_shared<std::unordered_map<std::string,VMVal>>(fr.locals);
+                        fr.closure_env = std::make_shared<VMMap>(fr.locals);
                     } else {
                         // Sync any new locals into the shared closure_env
                         for(auto& kv : fr.locals)
@@ -2409,7 +2552,7 @@ private:
                 // Statically scan class body to collect class-level variable initializations
                 // (LOAD_CONST followed by DEFINE_NAME = class variable)
                 {
-                    std::unordered_map<std::string,VMVal> cvars;
+                    VMMap cvars;
                     const auto& insts = sub->instructions;
                     for(size_t ci=0;ci+1<insts.size();ci++){
                         const auto& prev_ins = insts[ci];
@@ -2445,36 +2588,29 @@ private:
 
             // Calls
             case Op::CALL_KW: {
-                int total=ins.arg;
+                bool method_mode=ins.arg<0;
+                int total=method_mode?-ins.arg:ins.arg;
                 std::vector<VMVal> all_args(total);
                 for(int i=total-1;i>=0;i--) all_args[i]=pop();
-                VMVal callee=pop();
                 VMVal kwargs_map=all_args.back(); all_args.pop_back();
-                int n_pos=(int)all_args.size();
+                if(method_mode){
+                    VMVal mname=pop(); VMVal obj=pop();
+                    std::shared_ptr<VMCode> mcode; std::optional<VMVal> mself; std::shared_ptr<VMMap> menv;
+                    if(resolve_user_method(obj,mname.s,all_args,mcode,mself,menv)){
+                        push(exec_code_bound(mcode,bind_kw_locals(mcode,all_args,kwargs_map),mself,menv));
+                    } else {
+                        if(kwargs_map.type==VMType::MAP){ kwargs_map.class_name="__kwargs__"; all_args.push_back(kwargs_map); }
+                        push(vm_call_method(obj,mname.s,all_args));
+                    }
+                    break;
+                }
+                VMVal callee=pop();
                 if(callee.type==VMType::FUNCTION&&callee.code){
-                    auto& pnames=callee.code->param_names;
-                    std::vector<VMVal> bound;
-                    int arg_idx=0;
-                    for(int pi=0;pi<(int)pnames.size();pi++){
-                        const std::string& pn=pnames[pi];
-                        if(pn.size()>=2&&pn[0]=='*'&&pn[1]=='*'){bound.push_back(kwargs_map);arg_idx=(int)all_args.size();}
-                        else if(!pn.empty()&&pn[0]=='*'){std::vector<VMVal> rest(all_args.begin()+arg_idx,all_args.end());bound.push_back(VMVal::make_list(std::move(rest)));arg_idx=(int)all_args.size();}
-                        else if(arg_idx<n_pos) bound.push_back(all_args[arg_idx++]);
-                        else if(kwargs_map.map&&kwargs_map.map->count(pn)) bound.push_back((*kwargs_map.map)[pn]);
-                        else if(pi<(int)callee.code->param_defaults.size()&&callee.code->param_defaults[pi].type!=VMType::UNDEFINED) bound.push_back(callee.code->param_defaults[pi]);
-                        else bound.push_back(VMVal::make_none());
-                    }
-                    // Build locals map and call without re-expansion
-                    std::unordered_map<std::string,VMVal> locs;
-                    for(int bi=0;bi<(int)pnames.size()&&bi<(int)bound.size();bi++){
-                        const std::string& pn2=pnames[bi];
-                        std::string ln2=(pn2.size()>=2&&pn2[0]=='*'&&pn2[1]=='*')?pn2.substr(2):(!pn2.empty()&&pn2[0]=='*')?pn2.substr(1):pn2;
-                        locs[ln2]=bound[bi];
-                    }
-                    push(exec_code_bound(callee.code,std::move(locs),std::nullopt,callee.closure_env));
+                    push(exec_code_bound(callee.code,bind_kw_locals(callee.code,all_args,kwargs_map),std::nullopt,callee.closure_env));
                 } else {
                     // Native: append kwargs_map as last arg so natives can check by name
-                    if(kwargs_map.type==VMType::MAP) all_args.push_back(kwargs_map);
+                    // (marked, so a positional dict argument is not taken for it).
+                    if(kwargs_map.type==VMType::MAP){ kwargs_map.class_name="__kwargs__"; all_args.push_back(kwargs_map); }
                     std::optional<VMVal> no_self=std::nullopt;
                     push(vm_call(callee,all_args,no_self));
                 }
@@ -2645,15 +2781,9 @@ private:
                 if(it.type==VMType::LIST&&it.list){
                     std::vector<VMVal> copy=*it.list; push(VMVal::make_iter(std::move(copy))); break;
                 }
-                if(it.type==VMType::MAP&&it.map){
-                    std::vector<VMVal> keys;
-                    for(auto& [k,v]:*it.map) keys.push_back(VMVal::make_str(k));
-                    push(VMVal::make_iter(std::move(keys))); break;
-                }
-                if(it.type==VMType::STRING){
-                    std::vector<VMVal> chars;
-                    for(char ch:it.s) chars.push_back(VMVal::make_str(std::string(1,ch)));
-                    push(VMVal::make_iter(std::move(chars))); break;
+                if((it.type==VMType::MAP&&it.map)||it.type==VMType::STRING){
+                    // a dict's (typed) keys; a string's characters
+                    push(make_iter(it)); break;
                 }
                 // Fallback: use the old make_iter(VMVal&) helper
                 push(make_iter(it)); break;
@@ -2690,8 +2820,8 @@ private:
                 VMVal seq=pop(); int n=ins.arg;
                 std::vector<VMVal> items;
                 if(seq.type==VMType::LIST&&seq.list) items=*seq.list;
-                else if(seq.type==VMType::STRING)
-                    for(char c:seq.s) items.push_back(VMVal::make_str(std::string(1,c)));
+                else if(seq.type==VMType::STRING||seq.type==VMType::MAP||seq.type==VMType::ITERATOR||seq.type==VMType::GENERATOR)
+                    items=iter_items(seq);   // by character / key / item
                 while((int)items.size()<n) items.push_back(VMVal::make_none());
                 for(int i=n-1;i>=0;i--) push(items[i]); break;
             }
@@ -2810,17 +2940,22 @@ private:
                 if(l.type==VMType::INSTANCE){
                     VMVal res=call_dunder(l,"__iadd__",{r});
                     if(res.type!=VMType::NONE){push(res);break;}
+                    res=call_dunder(l,"__add__",{r});
+                    if(res.type!=VMType::NONE){push(res);break;}
                 }
-                push(op_add(l,r)); break;
+                if(l.type==VMType::INT&&r.type==VMType::INT&&l.s.empty()&&r.s.empty()){
+                    int64_t res; if(!nypy::add_ovf(l.i,r.i,res)){ push(VMVal::make_int(res)); break; }
+                }
+                push(binop_inplace(nypy::A_ADD,l,r)); break;
             }
             case Op::ISUB: { VMVal r=pop(),l=pop();
-                if(l.type==VMType::INSTANCE){ VMVal res=call_dunder(l,"__isub__",{r}); if(res.type!=VMType::NONE){push(res);break;} }
-                push(op_arith(l,r,'-')); break; }
+                if(l.type==VMType::INSTANCE){ VMVal res=call_dunder(l,"__isub__",{r}); if(res.type==VMType::NONE) res=call_dunder(l,"__sub__",{r}); if(res.type!=VMType::NONE){push(res);break;} }
+                push(binop(nypy::A_SUB,l,r)); break; }
             case Op::IMUL: { VMVal r=pop(),l=pop();
-                if(l.type==VMType::INSTANCE){ VMVal res=call_dunder(l,"__imul__",{r}); if(res.type!=VMType::NONE){push(res);break;} }
-                push(op_arith(l,r,'*')); break; }
-            case Op::IDIV: { VMVal r=pop(),l=pop(); push(op_div(l,r,false)); break; }
-            case Op::IMOD: { VMVal r=pop(),l=pop(); push(op_mod(l,r)); break; }
+                if(l.type==VMType::INSTANCE){ VMVal res=call_dunder(l,"__imul__",{r}); if(res.type==VMType::NONE) res=call_dunder(l,"__mul__",{r}); if(res.type!=VMType::NONE){push(res);break;} }
+                push(binop_inplace(nypy::A_MUL,l,r)); break; }
+            case Op::IDIV: { VMVal r=pop(),l=pop(); push(binop(nypy::A_DIV,l,r)); break; }
+            case Op::IMOD: { VMVal r=pop(),l=pop(); push(binop(nypy::A_MOD,l,r)); break; }
 
             default: break;
             } // end switch
@@ -2891,7 +3026,7 @@ private:
         }
         if(c=='{') {
             // Parse object
-            auto map=std::make_shared<std::unordered_map<std::string,VMVal>>();
+            auto map=std::make_shared<VMMap>();
             pos++;
             while(pos<s.size()){
                 while(pos<s.size()&&(s[pos]==' '||s[pos]=='\t'||s[pos]=='\r'||s[pos]=='\n')) pos++;
@@ -2941,141 +3076,306 @@ private:
         if(v.type==VMType::STRING){ try{return std::stod(v.s);}catch(...){} }
         return 0.0;
     }
-    static VMVal op_add(const VMVal& l, const VMVal& r) {
-        if(l.type==VMType::STRING||r.type==VMType::STRING)
-            return VMVal::make_str(l.to_string()+r.to_string());
-        if(l.type==VMType::LIST&&r.type==VMType::LIST){
-            auto res=VMVal::make_list(*l.list);
-            if(r.list) for(auto& v:*r.list) res.list->push_back(v);
-            return res;
-        }
-        if(l.type==VMType::FLOAT||r.type==VMType::FLOAT)
-            return VMVal::make_float(to_d(l)+to_d(r));
-        return VMVal::make_int(l.i+r.i);
+    // ── Operators ───────────────────────────────────────────────────────
+    // Arithmetic goes through nypy::arith (NyBigInt.hpp), the code the
+    // interpreter uses: ints grow into big ints instead of wrapping at 2^64,
+    // `/` is true division, `//` and `%` floor, bool is an int. The op codes
+    // are nypy::ArithOp's.
+    // Runs shared-library code, turning its errors into VM exceptions.
+    template<class F> auto nycall(F&& f) -> decltype(f()) {
+        try { return f(); }
+        catch(nypy::PyError& e){ raise_native_exception(e.type, e.msg); }
     }
-    static VMVal op_arith(const VMVal& l, const VMVal& r, char op) {
-        if(l.type==VMType::FLOAT||r.type==VMType::FLOAT){
-            double a=to_d(l),b=to_d(r);
-            return op=='-'?VMVal::make_float(a-b):VMVal::make_float(a*b);
+    static bool seq_times(const VMVal& n, int64_t& times){
+        if(n.type==VMType::BOOL){ times=n.b?1:0; return true; }
+        if(n.type!=VMType::INT) return false;
+        times=n.s.empty()?n.i:(n.s[0]=='-'?0:INT64_MAX);
+        return true;
+    }
+    static std::string vm_type_name(const VMVal& v){
+        switch(v.type){
+            case VMType::NONE: return "NoneType"; case VMType::BOOL: return "bool";
+            case VMType::INT: return "int"; case VMType::FLOAT: return "float";
+            case VMType::STRING: return "str";
+            case VMType::LIST: return v.b?"tuple":"list";
+            case VMType::MAP: return "dict";
+            case VMType::FUNCTION: return "function";
+            case VMType::NATIVE: return "builtin_function_or_method";
+            case VMType::CLASS: return "type";
+            case VMType::INSTANCE: return v.class_name;
+            case VMType::GENERATOR: return "generator";
+            case VMType::ITERATOR: return "iterator";
+            default: return "object";
         }
-        int64_t a=l.type==VMType::INT?l.i:(int64_t)to_d(l);
-        int64_t b=r.type==VMType::INT?r.i:(int64_t)to_d(r);
-        if(op=='-') return VMVal::make_int(a-b);
-        // multiply: str * int
-        if(op=='*'){
-            if(l.type==VMType::STRING&&r.type==VMType::INT){
-                std::string s; for(int64_t i=0;i<r.i;i++) s+=l.s;
-                return VMVal::make_str(s);
+    }
+    VMVal binop(int op, const VMVal& l, const VMVal& r) {
+        nypy::NumV x,y;
+        if(l.to_numv(x)&&r.to_numv(y)){
+            if((op==nypy::A_AND||op==nypy::A_OR||op==nypy::A_XOR)&&l.type==VMType::BOOL&&r.type==VMType::BOOL){
+                bool v=op==nypy::A_AND?(l.b&&r.b):op==nypy::A_OR?(l.b||r.b):(l.b!=r.b);
+                return VMVal::make_bool(v);
             }
-            return VMVal::make_int(a*b);
-        }
-        return VMVal::make_none();
-    }
-    static VMVal op_div(const VMVal& l, const VMVal& r, bool floor_div) {
-        double a=to_d(l),b=to_d(r);
-        if(b==0.0) throw std::runtime_error("ZeroDivisionError: division by zero");
-        if(floor_div) return VMVal::make_int((int64_t)std::floor(a/b));
-        // `/` is true division and always returns a float, matching the
-        // interpreter (NythonExecutor.hpp: "Return float (true division) -
-        // use // for integer division") and Python. This used to return an
-        // int whenever the division was exact (10/2 -> int 5), which is a
-        // real engine divergence documented in HANDOFF.md 5.4 - resolved by
-        // an explicit ruling: 10/2 == 5.0, 10//2 == 10\2 == 5.
-        return VMVal::make_float(a/b);
-    }
-    static VMVal op_mod(const VMVal& l, const VMVal& r) {
-        if(l.type==VMType::STRING){
-            const std::string& fmt=l.s;
-            std::vector<VMVal> args;
-            if(r.type==VMType::LIST&&r.list) args=*r.list;
-            else args={r};
-            size_t ai=0; std::string out;
-            for(size_t i=0;i<fmt.size();i++){
-                if(fmt[i]=='%'&&i+1<fmt.size()){
-                    char spec=fmt[i+1];
-                    if(spec=='%'){out+='%';i++;continue;}
-                    VMVal av=(ai<args.size())?args[ai++]:VMVal::make_none();
-                    // collect width/precision: %-10.2f etc.
-                    size_t spec_start=i+1;
-                    while(spec_start<fmt.size()&&(std::isdigit((unsigned char)fmt[spec_start])||fmt[spec_start]=='.'||fmt[spec_start]=='-'||fmt[spec_start]=='+'||fmt[spec_start]==' '))
-                        spec_start++;
-                    std::string fmtmod="%";
-                    if(spec_start>i+1) fmtmod+=fmt.substr(i+1,spec_start-i-1);
-                    spec=(spec_start<fmt.size())?fmt[spec_start]:'?';
-                    fmtmod+=spec;
-                    i=spec_start;
-                    if(spec=='s'||spec=='r') out+=av.to_string();
-                    else if(spec=='d'||spec=='i'){
-                        char buf[64]; std::snprintf(buf,sizeof(buf),fmtmod.c_str(),(long)(av.type==VMType::FLOAT?(int64_t)av.d:av.i)); out+=buf;
-                    } else if(spec=='f'||spec=='g'||spec=='e'||spec=='E'||spec=='G'){
-                        char buf[64]; double dv=av.type==VMType::INT?(double)av.i:av.d;
-                        std::snprintf(buf,sizeof(buf),fmtmod.c_str(),dv); out+=buf;
-                    } else if(spec=='x'||spec=='X'){
-                        char buf[64]; std::snprintf(buf,sizeof(buf),fmtmod.c_str(),(long)av.i); out+=buf;
-                    } else out+='%',out+=spec;
-                } else { out+=fmt[i]; }
+            if(op<=nypy::A_SUB&&x.k==1&&y.k==1){   // the common case, inline
+                int64_t res;
+                if(!(op==nypy::A_ADD?nypy::add_ovf(x.i,y.i,res):nypy::sub_ovf(x.i,y.i,res))) return VMVal::make_int(res);
             }
-            return VMVal::make_str(std::move(out));
+            return nycall([&]{ return VMVal::from_numv(nypy::arith(op,x,y)); });
         }
-
-        if(l.type==VMType::STRING){
-            // Python-style % formatting
-            const std::string& fmt=l.s;
-            std::vector<VMVal> args;
-            if(r.type==VMType::LIST&&r.list) args=*r.list;
-            else args={r};
-            size_t ai=0;
-            std::string out;
-            for(size_t i=0;i<fmt.size();i++){
-                if(fmt[i]=='%'&&i+1<fmt.size()){
-                    char spec=fmt[i+1];
-                    if(spec=='%'){out+='%';i++;continue;}
-                    VMVal av=(ai<args.size())?args[ai++]:VMVal::make_none();
-                    // collect width/precision between % and the format spec
-                    size_t spec_start=i+1;
-                    while(spec_start<fmt.size()&&(std::isdigit(fmt[spec_start])||fmt[spec_start]=='.'||fmt[spec_start]=='-'||fmt[spec_start]=='+'||fmt[spec_start]==' '))
-                        spec_start++;
-                    std::string fmtmod(fmt.begin()+i,fmt.begin()+spec_start+1); // e.g. "%.2f"
-                    spec=(spec_start<fmt.size())?fmt[spec_start]:'?';
-                    i=spec_start;
-                    if(spec=='s'||spec=='r') out+=av.to_string();
-                    else if(spec=='d'||spec=='i'){
-                        char buf[64]; std::string f2=fmtmod; f2.back()='d';
-                        std::snprintf(buf,sizeof(buf),f2.c_str(),(long)(av.type==VMType::FLOAT?(int64_t)av.d:av.i)); out+=buf;
-                    } else if(spec=='f'||spec=='g'||spec=='e'||spec=='E'||spec=='G'){
-                        char buf[64]; double dv=av.type==VMType::INT?(double)av.i:av.d;
-                        std::snprintf(buf,sizeof(buf),fmtmod.c_str(),dv); out+=buf;
-                    } else if(spec=='x'||spec=='X'){
-                        char buf[64]; std::string f2=fmtmod; f2.back()=spec;
-                        std::snprintf(buf,sizeof(buf),f2.c_str(),(long)av.i); out+=buf;
-                    } else out+='%',out+=spec;
-                } else { out+=fmt[i]; }
-            }
-            return VMVal::make_str(std::move(out));
-        }
-
-        if(l.type==VMType::FLOAT||r.type==VMType::FLOAT){
-            double a=to_d(l),b=to_d(r);
-            if(b==0.0) return VMVal::make_none();
-            double res=std::fmod(a,b);
-            if(res!=0.0&&((res<0)!=(b<0))) res+=b; // Python-style
-            return VMVal::make_float(res);
-        }
-        if(r.i==0) throw std::runtime_error("ZeroDivisionError: division by zero");
-        int64_t res=l.i%r.i;
-        if(res!=0&&((res<0)!=(r.i<0))) res+=r.i; // Python-style
-        return VMVal::make_int(res);
-    }
-    static VMVal op_bit(const VMVal& l, const VMVal& r, char op) {
-        int64_t a=(int64_t)to_d(l),b=(int64_t)to_d(r);
         switch(op){
-        case '&': return VMVal::make_int(a&b);
-        case '|': return VMVal::make_int(a|b);
-        case '^': return VMVal::make_int(a^b);
-        case '<': return VMVal::make_int(a<<b);
-        case '>': return VMVal::make_int(a>>b);
-        default:  return VMVal::make_none();
+        case nypy::A_ADD:
+            if(l.type==VMType::STRING&&r.type==VMType::STRING) return VMVal::make_str(l.s+r.s);
+            if(l.type==VMType::LIST&&r.type==VMType::LIST){
+                std::vector<VMVal> out; if(l.list) out=*l.list;
+                if(r.list) out.insert(out.end(),r.list->begin(),r.list->end());
+                VMVal res=VMVal::make_list(std::move(out)); res.b=l.b&&r.b; return res;
+            }
+            // Lenient, as on the interpreter: a string on either side
+            // concatenates the other's text.
+            if(l.type==VMType::STRING||r.type==VMType::STRING) return VMVal::make_str(l.to_string()+r.to_string());
+            break;
+        case nypy::A_MUL: {
+            int64_t times;
+            const VMVal* seq=nullptr;
+            if(seq_times(r,times)) seq=&l; else if(seq_times(l,times)) seq=&r;
+            if(seq&&seq->type==VMType::STRING){
+                if(times>0&&seq->s.size()*(uint64_t)times>(1ull<<32)) raise_native_exception("MemoryError","repeated string is too long");
+                return VMVal::make_str(nypy::repeat_str(seq->s,times));
+            }
+            if(seq&&seq->type==VMType::LIST){
+                std::vector<VMVal> out;
+                if(seq->list) for(int64_t t=0;t<times;t++) out.insert(out.end(),seq->list->begin(),seq->list->end());
+                VMVal res=VMVal::make_list(std::move(out)); res.b=seq->b; return res;
+            }
+            break;
         }
+        case nypy::A_MOD:
+            if(l.type==VMType::STRING) return VMVal::make_str(percent_format(l.s,r));
+            break;
+        case nypy::A_SUB: case nypy::A_AND: case nypy::A_OR: case nypy::A_XOR:
+            // Sets are deduplicated lists here.
+            if(l.type==VMType::LIST&&r.type==VMType::LIST&&l.list&&r.list){
+                std::unordered_set<std::string> other,seen;
+                for(auto& v:*r.list) other.insert(v.repr());
+                std::vector<VMVal> res;
+                if(op==nypy::A_OR){
+                    for(auto& v:*l.list) if(seen.insert(v.repr()).second) res.push_back(v);
+                    for(auto& v:*r.list) if(seen.insert(v.repr()).second) res.push_back(v);
+                } else {
+                    for(auto& v:*l.list){
+                        bool in=other.count(v.repr())>0;
+                        if((op==nypy::A_AND)==in||(op==nypy::A_XOR&&!in)) res.push_back(v);
+                    }
+                    if(op==nypy::A_XOR){
+                        std::unordered_set<std::string> mine; for(auto& v:*l.list) mine.insert(v.repr());
+                        for(auto& v:*r.list) if(!mine.count(v.repr())) res.push_back(v);
+                    }
+                }
+                return VMVal::make_list(std::move(res));
+            }
+            break;
+        default: break;
+        }
+        if(op==nypy::A_DIV||op==nypy::A_FLOORDIV||op==nypy::A_MOD||op==nypy::A_POW||op==nypy::A_SUB||op==nypy::A_ADD||op==nypy::A_MUL)
+            raise_native_exception("TypeError",std::string("unsupported operand type(s) for ")+nypy::arith_symbol(op)+": '"+vm_type_name(l)+"' and '"+vm_type_name(r)+"'");
+        return VMVal::make_int(0);
+    }
+    // In place: `L += it` extends and `L *= n` repeats the list object itself,
+    // so every alias sees it; anything else is the binary operator.
+    VMVal binop_inplace(int op, VMVal& l, const VMVal& r) {
+        if(l.type==VMType::LIST&&!l.b&&l.list){
+            if(op==nypy::A_ADD){
+                std::vector<VMVal> more=iter_items(r);
+                l.list->insert(l.list->end(),more.begin(),more.end());
+                return l;
+            }
+            int64_t times;
+            if(op==nypy::A_MUL&&seq_times(r,times)){
+                std::vector<VMVal> orig=*l.list;
+                l.list->clear();
+                for(int64_t t=0;t<times;t++) l.list->insert(l.list->end(),orig.begin(),orig.end());
+                return l;
+            }
+        }
+        return binop(op,l,r);
+    }
+    // A value as the shared formatter sees it (NyFormat.hpp); conv 's'/'r'/'a'
+    // passes its str/repr/ascii text.
+    nypy::FmtVal to_fmtval(const VMVal& v, char conv) {
+        if(conv=='s') return nypy::FmtVal::of_str(vm_str(v));
+        if(conv=='r') return nypy::FmtVal::of_str(vm_repr(v));
+        if(conv=='a'){
+            std::string rr=vm_repr(v),out;
+            for(size_t k=0;k<rr.size();){ size_t j=k; uint32_t cp=nypy::u8_decode(rr,j); if(cp<0x80) out+=(char)cp; else out+=nypy::hex_esc(cp); k=j; }
+            return nypy::FmtVal::of_str(out);
+        }
+        switch(v.type){
+            case VMType::NONE: return nypy::FmtVal::of_none();
+            case VMType::BOOL: return nypy::FmtVal::of_bool(v.b);
+            case VMType::INT: {
+                if(v.s.empty()) return nypy::FmtVal::of_int(v.i);
+                nypy::BigInt bi; nypy::BigInt::parse(v.s,10,bi); return nypy::FmtVal::of_big(bi);
+            }
+            case VMType::FLOAT: return nypy::FmtVal::of_float(v.d);
+            case VMType::STRING: return nypy::FmtVal::of_str(v.s);
+            default: return nypy::FmtVal::of_other(vm_str(v),vm_type_name(v));
+        }
+    }
+    // str(v) / repr(v), honouring __str__/__repr__ on instances.
+    std::string vm_str(const VMVal& v) {
+        if(v.type==VMType::INSTANCE){
+            VMVal r=call_dunder(v,"__str__",{});
+            if(r.type==VMType::STRING) return r.s;
+            r=call_dunder(v,"__repr__",{});
+            if(r.type==VMType::STRING) return r.s;
+        }
+        return v.to_string();
+    }
+    std::string vm_repr(const VMVal& v) {
+        if(v.type==VMType::INSTANCE){
+            VMVal r=call_dunder(v,"__repr__",{});
+            if(r.type==VMType::STRING) return r.s;
+        }
+        return v.repr();
+    }
+    std::string format_value(const VMVal& v, const std::string& spec) {
+        if(v.type==VMType::INSTANCE){
+            VMVal r=call_dunder(v,"__format__",{VMVal::make_str(spec)});
+            if(r.type==VMType::STRING) return r.s;
+            if(spec.empty()) return vm_str(v);
+        }
+        return nycall([&]{ return nypy::format_value(to_fmtval(v,0),spec); });
+    }
+    // "fmt" % args
+    std::string percent_format(const std::string& fmt, const VMVal& r) {
+        std::vector<VMVal> args;
+        bool mapping=false;
+        if(r.is_tuple()&&r.list) args=*r.list;
+        else { args.push_back(r); mapping=r.type==VMType::MAP; }
+        return nycall([&]{
+            return nypy::percent_format(fmt,(int64_t)args.size(),mapping,
+                [&](int64_t idx,const std::string& key,char conv)->nypy::FmtVal{
+                    if(idx<0){
+                        auto it=r.map->find(nypy::key_of_str(key));
+                        if(it==r.map->end()) raise_native_exception("KeyError",nypy::str_repr(key));
+                        return to_fmtval(it->second,conv);
+                    }
+                    return to_fmtval(args[(size_t)idx],conv);
+                });
+        });
+    }
+    // str.format
+    std::string str_format(const std::string& fmt, const std::vector<VMVal>& args, const VMVal* kw) {
+        return nycall([&]{
+            return nypy::str_format(fmt,[&](const nypy::FieldRef& f,char conv)->nypy::FmtVal{
+                VMVal v;
+                if(f.numeric){
+                    if(f.index<0||(size_t)f.index>=args.size())
+                        raise_native_exception("IndexError","Replacement index "+std::to_string(f.index)+" out of range for positional args tuple");
+                    v=args[(size_t)f.index];
+                } else {
+                    VMMap::iterator it;
+                    if(!kw||!kw->map||(it=kw->map->find(nypy::key_of_str(f.name)))==kw->map->end())
+                        raise_native_exception("KeyError",nypy::str_repr(f.name));
+                    v=it->second;
+                }
+                for(auto& step:f.chain){
+                    if(step.first=='.') v=get_attr(v,step.second);
+                    else {
+                        bool digits=!step.second.empty()&&std::all_of(step.second.begin(),step.second.end(),[](char c){return c>='0'&&c<='9';});
+                        v=get_sub(v,digits?VMVal::make_int(std::stoll(step.second)):VMVal::make_str(step.second));
+                    }
+                }
+                if(conv) return to_fmtval(v,conv);
+                if(v.type==VMType::INSTANCE) return nypy::FmtVal::of_other(vm_str(v),v.class_name);
+                return to_fmtval(v,0);
+            });
+        });
+    }
+    // Every element an iterable yields: a list/tuple's items, a string's
+    // characters, a dict's keys, what is left of an iterator or a
+    // generator (consuming it), an instance's __iter__/__next__ sequence.
+    std::vector<VMVal> iter_items(const VMVal& v) {
+        switch(v.type){
+            case VMType::LIST: return v.list?*v.list:std::vector<VMVal>{};
+            case VMType::STRING: {
+                std::vector<VMVal> out;
+                for(auto& ch:nypy::u8_chars(v.s)) out.push_back(VMVal::make_str(ch));
+                return out;
+            }
+            case VMType::MAP: {
+                std::vector<VMVal> out;
+                if(v.map) for(auto& kv:*v.map) if(!vm_internal_key(kv.first)) out.push_back(vm_key_value(kv.first));
+                return out;
+            }
+            case VMType::ITERATOR: {
+                std::vector<VMVal> out;
+                if(v.iter){
+                    for(size_t k=(size_t)std::max(0,v.iter->first);k<v.iter->second.size();k++) out.push_back(v.iter->second[k]);
+                    v.iter->first=(int)v.iter->second.size();
+                }
+                return out;
+            }
+            case VMType::GENERATOR: {
+                std::vector<VMVal> out;
+                VMVal g=v;
+                while(g.gen&&!g.gen->done){
+                    VMVal item=gen_next(g);
+                    if(g.gen&&g.gen->done) break;
+                    out.push_back(item);
+                }
+                return out;
+            }
+            case VMType::INT: {   // for i in n: 0..n-1, as the VM always allowed
+                std::vector<VMVal> out;
+                for(int64_t k=0;k<v.i;k++) out.push_back(VMVal::make_int(k));
+                return out;
+            }
+            case VMType::INSTANCE: {
+                VMVal it=call_dunder(v,"__iter__",{});
+                if(it.type!=VMType::NONE&&it.type!=VMType::INSTANCE) return iter_items(it);
+                if(it.type==VMType::NONE) it=v;
+                std::vector<VMVal> out;
+                for(int guard=0;guard<100000000;guard++){
+                    VMVal item;
+                    try { item=call_dunder(it,"__next__",{}); }
+                    catch(std::runtime_error& e){
+                        std::string m=e.what();
+                        if(m.find("StopIteration")!=std::string::npos){ last_exception_obj_=VMVal::make_none(); break; }
+                        throw;
+                    }
+                    out.push_back(item);
+                }
+                return out;
+            }
+            default: break;
+        }
+        raise_native_exception("TypeError","'"+vm_type_name(v)+"' object is not iterable");
+    }
+    // A dict key's stored text (NyStr.hpp): 1 and "1" differ, 1 == 1.0 ==
+    // true, tuples are keys, lists are not.
+    std::string vkey(const VMVal& k) {
+        switch(k.type){
+            case VMType::STRING: return nypy::key_of_str(k.s);
+            case VMType::INT:
+                if(k.s.empty()) return nypy::key_of_int(k.i);
+                { nypy::BigInt bi; nypy::BigInt::parse(k.s,10,bi); return nypy::key_of_big(bi); }
+            case VMType::BOOL: return nypy::key_of_int(k.b?1:0);
+            case VMType::FLOAT: return nypy::key_of_float(k.d);
+            case VMType::NONE: case VMType::UNDEFINED: return nypy::key_of_none();
+            case VMType::LIST:
+                if(k.b){
+                    std::vector<std::string> parts;
+                    if(k.list) for(auto& e:*k.list) parts.push_back(vkey(e));
+                    return nypy::key_of_tuple(parts);
+                }
+                raise_native_exception("TypeError","unhashable type: 'list'");
+            case VMType::MAP: raise_native_exception("TypeError","unhashable type: 'dict'");
+            default: break;
+        }
+        const void* id=k.map?(const void*)k.map.get():k.code?(const void*)k.code.get():k.gen?(const void*)k.gen.get():(const void*)k.iter.get();
+        char buf[40]; snprintf(buf,sizeof buf,"v%p",id);
+        vm_key_objs()[buf]=k;
+        return nypy::key_of_obj(buf);
     }
     bool op_in(const VMVal& item, const VMVal& cont) {
         if(cont.type==VMType::INSTANCE){
@@ -3087,7 +3387,7 @@ private:
         if(cont.type==VMType::LIST&&cont.list)
             for(auto& v:*cont.list) if(v==item) return true;
         if(cont.type==VMType::MAP&&cont.map)
-            return cont.map->count(item.to_string())>0;
+            return cont.map->count(vkey(item))>0;
         return false;
     }
     // Which except clause (if any) a raised exception should run: the first
@@ -3117,13 +3417,29 @@ private:
     bool value_is_type(const VMVal& v, const std::string& want) {
         // Everything is an Object.
         if(want=="Object"||want=="object"||want=="any"||want=="Any") return true;
+        // type(x) returns the type's name, so `type(t) is tuple` compares
+        // that name with the type, as on the interpreter.
+        if(v.type==VMType::STRING&&want!="str"&&want!="String"&&want!="string"){
+            static const std::unordered_map<std::string,std::string> canon={
+                {"int","int"},{"float","float"},{"bool","bool"},{"string","str"},{"list","list"},
+                {"map","dict"},{"tuple","tuple"},{"none","none"},{"function","function"},{"builtin","function"},{"set","set"}};
+            static const std::unordered_map<std::string,std::string> wantc={
+                {"int","int"},{"Integer","int"},{"integer","int"},{"float","float"},{"Float","float"},{"double","float"},{"Double","float"},
+                {"bool","bool"},{"Boolean","bool"},{"boolean","bool"},{"list","list"},{"List","list"},{"array","list"},{"Array","list"},
+                {"map","dict"},{"Map","dict"},{"dict","dict"},{"Dict","dict"},{"tuple","tuple"},{"Tuple","tuple"},{"none","none"},{"None","none"},
+                {"function","function"},{"Function","function"},{"set","set"},{"Set","set"}};
+            auto a=canon.find(v.s); auto w=wantc.find(want);
+            if(a!=canon.end()&&w!=wantc.end()&&a->second==w->second) return true;
+        }
         switch(v.type){
             case VMType::INT:   return want=="int"||want=="Integer"||want=="integer";
             case VMType::FLOAT: return want=="float"||want=="Float"||want=="double"||want=="Double";
             case VMType::BOOL:  return want=="bool"||want=="Boolean"||want=="boolean";
             case VMType::NONE:  return want=="none"||want=="None";
             case VMType::STRING:return want=="str"||want=="String"||want=="string";
-            case VMType::LIST:  return want=="list"||want=="List"||want=="array"||want=="Array";
+            case VMType::LIST:
+                if(v.b) return want=="tuple"||want=="Tuple";
+                return want=="list"||want=="List"||want=="array"||want=="Array";
             case VMType::MAP:   return want=="map"||want=="Map"||want=="dict"||want=="Dict";
             case VMType::FUNCTION: case VMType::NATIVE:
                                 return want=="function"||want=="Function";
@@ -3254,130 +3570,94 @@ private:
     // Resolve a [start,end,step] slice against a sequence of length sz,
     // returning the indices to take in order. NONE start/end mean "the natural
     // end for this direction", which differs by the sign of the step.
-    static std::vector<int64_t> slice_indices(const std::vector<VMVal>& sl, int64_t sz) {
-        auto num=[](const VMVal& v)->int64_t{
-            return v.type==VMType::INT?v.i:(int64_t)to_d(v); };
-        int64_t step = sl.size()>=3 ? num(sl[2]) : 1;
-        if(step==0) step=1;                       // step 0 would never terminate
-        bool no_s = sl[0].type==VMType::NONE, no_e = sl[1].type==VMType::NONE;
-        int64_t s,e;
-        if(step>0){
-            s = no_s ? 0  : num(sl[0]);
-            e = no_e ? sz : num(sl[1]);
-            if(s<0) s+=sz; if(e<0) e+=sz;
-            s=std::max((int64_t)0,std::min(s,sz));
-            e=std::max((int64_t)0,std::min(e,sz));
-        } else {
-            // The parser substitutes a literal 0 for an omitted start, so an
-            // absent start is indistinguishable from an explicit [0:...] here.
-            // The interpreter resolves that with a heuristic — start 0 together
-            // with an omitted end means "from the far end" — and this mirrors it
-            // so both engines agree. It does mean L[0::-1] yields the whole
-            // reversed sequence rather than just element 0, on both engines.
-            e = no_e ? -1 : num(sl[1]);
-            if(no_s || (sl[0].type==VMType::INT && sl[0].i==0 && no_e)) s = sz-1;
-            else { s = num(sl[0]); if(s<0) s+=sz; }
-            if(e<0&&!no_e) e+=sz;
-            s=std::max((int64_t)-1,std::min(s,sz-1));
-            e=std::max((int64_t)-1,std::min(e,sz));
-        }
-        std::vector<int64_t> out;
-        if(step>0) for(int64_t i=s;i<e;i+=step) out.push_back(i);
-        else       for(int64_t i=s;i>e;i+=step) out.push_back(i);
-        return out;
+    // An index: an int (or bool); anything else raises TypeError.
+    int64_t index_of(const VMVal& idx, const char* what) {
+        if(idx.type==VMType::INT) return idx.s.empty()?idx.i:(idx.s[0]=='-'?INT64_MIN/2:INT64_MAX/2);
+        if(idx.type==VMType::BOOL) return idx.b?1:0;
+        raise_native_exception("TypeError",std::string(what)+" indices must be integers or slices, not "+vm_type_name(idx));
+    }
+    // A slice spec [start, stop(, step)] (none = omitted) against length len:
+    // the number of items and the adjusted start/step (PySlice_AdjustIndices).
+    int64_t slice_spec(const std::vector<VMVal>& sp, int64_t len, int64_t& st, int64_t& step) {
+        int64_t en=0; st=0; step=1;
+        bool hs=false,he=false;
+        auto bound=[&](const VMVal& v,int64_t& out)->bool{
+            if(v.type==VMType::NONE||v.type==VMType::UNDEFINED) return false;
+            if(v.type!=VMType::INT&&v.type!=VMType::BOOL) raise_native_exception("TypeError","slice indices must be integers or None or have an __index__ method");
+            out=index_of(v,"slice"); return true;
+        };
+        if(sp.size()>=1) hs=bound(sp[0],st);
+        if(sp.size()>=2) he=bound(sp[1],en);
+        if(sp.size()>=3&&sp[2].type!=VMType::NONE) bound(sp[2],step);
+        return nycall([&]{ return nypy::slice_adjust(len,hs,st,he,en,step); });
     }
     VMVal get_sub(const VMVal& obj, const VMVal& idx) {
         if(obj.type==VMType::LIST&&obj.list){
-            if(idx.type==VMType::LIST&&idx.list&&idx.list->size()==3){
+            auto& L=*obj.list;
+            if(idx.type==VMType::LIST&&idx.list&&!idx.b){
+                int64_t st,step,n=slice_spec(*idx.list,(int64_t)L.size(),st,step);
                 std::vector<VMVal> out;
-                for(int64_t i:slice_indices(*idx.list,(int64_t)obj.list->size()))
-                    out.push_back((*obj.list)[(size_t)i]);
-                return VMVal::make_list(std::move(out));
+                for(int64_t k=0,i=st;k<n;k++,i+=step) out.push_back(L[(size_t)i]);
+                VMVal r=VMVal::make_list(std::move(out)); r.b=obj.b; return r;
             }
-            // Slice: idx is a LIST [start, end]
-            if(idx.type==VMType::LIST&&idx.list&&idx.list->size()==2){
-                int64_t sz=(int64_t)obj.list->size();
-                int64_t s=(*idx.list)[0].type==VMType::INT?(*idx.list)[0].i:(int64_t)to_d((*idx.list)[0]);
-                int64_t e=(*idx.list)[1].type==VMType::INT?(*idx.list)[1].i:(int64_t)to_d((*idx.list)[1]);
-                if(s<0) s+=sz; if(e<0) e+=sz;
-                if(e==-1||e>sz) e=sz;
-                s=std::max((int64_t)0,std::min(s,sz));
-                e=std::max(s,std::min(e,sz));
-                std::vector<VMVal> slice;
-                for(int64_t i=s;i<e;i++) slice.push_back((*obj.list)[(size_t)i]);
-                return VMVal::make_list(std::move(slice));
-            }
-            int64_t i=idx.type==VMType::INT?idx.i:(int64_t)to_d(idx);
-            if(i<0) i+=(int64_t)obj.list->size();
-            if(i>=0&&i<(int64_t)obj.list->size()) return (*obj.list)[(size_t)i];
-            return VMVal::make_none();
+            int64_t i=index_of(idx,obj.b?"tuple":"list");
+            int64_t sz=(int64_t)L.size();
+            if(i<0) i+=sz;
+            if(i<0||i>=sz) raise_native_exception("IndexError",std::string(obj.b?"tuple":"list")+" index out of range");
+            return L[(size_t)i];
         }
         if(obj.type==VMType::MAP&&obj.map){
-            auto it=obj.map->find(idx.to_string());
+            // A missing key reads none, as on the interpreter (library code
+            // relies on it); d.get() is the same.
+            auto it=obj.map->find(vkey(idx));
             return it!=obj.map->end()?it->second:VMVal::make_none();
         }
         if(obj.type==VMType::STRING){
-            if(idx.type==VMType::LIST&&idx.list&&idx.list->size()==3){
-                std::string out;
-                for(int64_t i:slice_indices(*idx.list,(int64_t)obj.s.size()))
-                    out+=obj.s[(size_t)i];
-                return VMVal::make_str(out);
+            if(idx.type==VMType::LIST&&idx.list&&!idx.b){
+                std::vector<VMVal> sp=*idx.list;
+                bool hs=false,he=false; int64_t st=0,en=0,step=1;
+                if(sp.size()>=1&&sp[0].type!=VMType::NONE){ hs=true; st=index_of(sp[0],"slice"); }
+                if(sp.size()>=2&&sp[1].type!=VMType::NONE){ he=true; en=index_of(sp[1],"slice"); }
+                if(sp.size()>=3&&sp[2].type!=VMType::NONE) step=index_of(sp[2],"slice");
+                return VMVal::make_str(nycall([&]{ return nypy::str_slice(obj.s,hs,st,he,en,step); }));
             }
-            if(idx.type==VMType::LIST&&idx.list&&idx.list->size()==2){
-                int64_t sz=(int64_t)obj.s.size();
-                int64_t s=(*idx.list)[0].type==VMType::INT?(*idx.list)[0].i:(int64_t)to_d((*idx.list)[0]);
-                int64_t e=(*idx.list)[1].type==VMType::INT?(*idx.list)[1].i:(int64_t)to_d((*idx.list)[1]);
-                if(s<0) s+=sz; if(e<0) e+=sz;
-                if(e==-1||e>sz) e=sz;
-                s=std::max((int64_t)0,std::min(s,sz));
-                e=std::max(s,std::min(e,sz));
-                return VMVal::make_str(obj.s.substr((size_t)s,(size_t)(e-s)));
-            }
-            if(idx.type==VMType::INT){
-                int64_t i=idx.i;
-                if(i<0) i+=(int64_t)obj.s.size();
-                if(i>=0&&i<(int64_t)obj.s.size())
-                    return VMVal::make_str(std::string(1,obj.s[(size_t)i]));
-            }
+            int64_t i=index_of(idx,"string");
+            return VMVal::make_str(nycall([&]{ return nypy::str_getitem(obj.s,i); }));
         }
         return VMVal::make_none();
     }
     void set_sub(VMVal& obj, const VMVal& idx, VMVal val) {
         if(obj.type==VMType::LIST&&obj.list){
-            // Slice assignment: idx is [start, end], val should be a list
-            if(idx.type==VMType::LIST&&idx.list&&idx.list->size()==2){
-                int64_t sz=(int64_t)obj.list->size();
-                int64_t s=(*idx.list)[0].type==VMType::INT?(*idx.list)[0].i:(int64_t)to_d((*idx.list)[0]);
-                int64_t e=(*idx.list)[1].type==VMType::INT?(*idx.list)[1].i:(int64_t)to_d((*idx.list)[1]);
-                if(s<0) s+=sz; if(e<0) e+=sz;
-                if(e==-1||e>sz) e=sz;
-                s=std::max((int64_t)0,std::min(s,sz));
-                e=std::max(s,std::min(e,sz));
-                std::vector<VMVal>* src=nullptr;
-                std::vector<VMVal> single_wrap;
-                if(val.type==VMType::LIST&&val.list) src=val.list.get();
-                else { single_wrap.push_back(std::move(val)); src=&single_wrap; }
-                // Replace elements s..e with src contents
-                auto it_start=obj.list->begin()+s;
-                auto it_end=obj.list->begin()+e;
-                obj.list->erase(it_start,it_end);
-                for(size_t k=0;k<src->size();k++)
-                    obj.list->insert(obj.list->begin()+s+k, (*src)[k]);
+            if(obj.b) raise_native_exception("TypeError","'tuple' object does not support item assignment");
+            auto& L=*obj.list;
+            if(idx.type==VMType::LIST&&idx.list&&!idx.b){
+                // L[a:b] = it / L[a:b:c] = it
+                std::vector<VMVal> repl=iter_items(val);
+                int64_t len=(int64_t)L.size(),st,step,n=slice_spec(*idx.list,len,st,step);
+                if(step==1){
+                    if(n<0) n=0;
+                    if(st>len) st=len;
+                    L.erase(L.begin()+st,L.begin()+st+n);
+                    L.insert(L.begin()+st,repl.begin(),repl.end());
+                } else {
+                    if((int64_t)repl.size()!=n)
+                        raise_native_exception("ValueError","attempt to assign sequence of size "+std::to_string(repl.size())+" to extended slice of size "+std::to_string(n));
+                    for(int64_t k=0,i=st;k<n;k++,i+=step) L[(size_t)i]=repl[(size_t)k];
+                }
                 return;
             }
-            int64_t i=idx.type==VMType::INT?idx.i:(int64_t)to_d(idx);
-            if(i<0) i+=(int64_t)obj.list->size();
-            if(i==(int64_t)obj.list->size()){
-                obj.list->push_back(std::move(val)); // append on exact boundary
-            } else if(i>=(int64_t)obj.list->size()){
-                // grow to fit
-                obj.list->resize((size_t)i+1, VMVal::make_none());
-                (*obj.list)[(size_t)i]=std::move(val);
-            } else if(i>=0){
-                (*obj.list)[(size_t)i]=std::move(val);
-            }
+            int64_t i=index_of(idx,"list");
+            int64_t sz=(int64_t)L.size();
+            if(i<0) i+=sz;
+            if(i<0) raise_native_exception("IndexError","list assignment index out of range");
+            // Past the end the list grows (padded with none), on both engines:
+            // library code appends with `a[len] = x`.
+            if(i>=sz) L.resize((size_t)i+1,VMVal::make_none());
+            L[(size_t)i]=std::move(val);
         } else if(obj.type==VMType::MAP&&obj.map) {
-            (*obj.map)[idx.to_string()]=std::move(val);
+            (*obj.map)[vkey(idx)]=std::move(val);
+        } else if(obj.type==VMType::STRING) {
+            raise_native_exception("TypeError","'str' object does not support item assignment");
         }
     }
 
@@ -3460,7 +3740,7 @@ private:
             return exec_code(callee.code,args,self,callee.closure_env);
         }
         if(callee.type==VMType::CLASS&&callee.code){
-            auto attrs=std::make_shared<std::unordered_map<std::string,VMVal>>();
+            auto attrs=std::make_shared<VMMap>();
             VMVal inst=VMVal::make_instance(callee.class_name,attrs);
             if(!class_reg_.count(callee.class_name)) class_reg_[callee.class_name]=callee.code;
             {
@@ -3499,7 +3779,124 @@ private:
     static bool is_ctor_name(const std::string& n) {
         return n=="__init__" || n=="init";
     }
+    // Positional + keyword arguments bound to a code object's parameters
+    // (*rest, **kw, defaults), as locals for exec_code_bound.
+    VMMap bind_kw_locals(const std::shared_ptr<VMCode>& code, const std::vector<VMVal>& all_args, const VMVal& kwargs_map) {
+        auto& pnames=code->param_names;
+        int n_pos=(int)all_args.size(), arg_idx=0;
+        VMMap locs;
+        for(int pi=0;pi<(int)pnames.size();pi++){
+            const std::string& pn=pnames[pi];
+            if(pn.size()>=2&&pn[0]=='*'&&pn[1]=='*'){ locs[pn.substr(2)]=kwargs_map; arg_idx=n_pos; }
+            else if(!pn.empty()&&pn[0]=='*'){ std::vector<VMVal> rest(all_args.begin()+arg_idx,all_args.end()); locs[pn.substr(1)]=VMVal::make_list(std::move(rest)); arg_idx=n_pos; }
+            else if(arg_idx<n_pos) locs[pn]=all_args[arg_idx++];
+            else if(kwargs_map.map&&kwargs_map.map->count(pn)) locs[pn]=kwargs_map.map->at(pn);
+            else if(pi<(int)code->param_defaults.size()&&code->param_defaults[pi].type!=VMType::UNDEFINED) locs[pn]=code->param_defaults[pi];
+            else locs[pn]=VMVal::make_none();
+        }
+        return locs;
+    }
+    // The user-defined function obj.method(...) runs, with its self and
+    // closure, following vm_call_method's lookup order; false for builtin
+    // methods (str/list/map/natives), which take keyword arguments as a
+    // trailing "__kwargs__" map instead. May drop a leading self from args
+    // (Class.method(self, ...)).
+    bool resolve_user_method(const VMVal& obj, const std::string& method, std::vector<VMVal>& args,
+                             std::shared_ptr<VMCode>& code, std::optional<VMVal>& self, std::shared_ptr<VMMap>& env) {
+        if(obj.type==VMType::SUPER_PROXY){
+            VMVal self_v=(!obj.list||obj.list->empty())?VMVal::make_none():(*obj.list)[0];
+            std::string cls=obj.s;
+            while(!cls.empty()){
+                auto cit=class_reg_.find(cls);
+                if(cit==class_reg_.end()) break;
+                for(auto& sub:cit->second->sub_codes)
+                    if(sub->name==method&&!sub->is_class){ code=sub; self=self_v; return true; }
+                cls=cit->second->parent_class;
+            }
+            return false;
+        }
+        if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map){
+            auto it=obj.map->find(method);
+            if(it!=obj.map->end()){
+                const VMVal& held=it->second;
+                if(held.type==VMType::FUNCTION&&held.code){
+                    code=held.code; env=held.closure_env; self=obj;
+                    return true;
+                }
+                return false;
+            }
+        }
+        if(obj.type==VMType::INSTANCE){
+            std::string cls=obj.class_name;
+            while(!cls.empty()){
+                auto cit=class_reg_.find(cls);
+                if(cit==class_reg_.end()) break;
+                for(auto& sub:cit->second->sub_codes)
+                    if(sub->name==method&&!sub->is_class){ code=sub; self=obj; return true; }
+                cls=cit->second->parent_class;
+            }
+            return false;
+        }
+        if(obj.type==VMType::CLASS&&obj.code){
+            for(auto& sub:obj.code->sub_codes){
+                if(sub->name==method&&!sub->is_class){
+                    code=sub;
+                    if(!args.empty()&&(args[0].type==VMType::INSTANCE||args[0].type==VMType::MAP)){
+                        self=args[0]; args.erase(args.begin());
+                    } else self=VMVal::make_none();
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // Members every plain value answers: an operator used as a method name
+    // (1.+(2, 3) is 1 + 2 + 3; a comparison chains, 1.<(2, 3) is 1 < 2 < 3)
+    // and the object protocol's class_name / type_name / to_string. The
+    // interpreter's primitiveMember is the same.
+    static int operator_member_code(const std::string& m) {
+        if(m.empty()||std::isalnum((unsigned char)m[0])||m[0]=='_') return 0;   // every ordinary method
+        static const std::unordered_map<std::string,int> ops={
+            {"+",nypy::A_ADD},{"-",nypy::A_SUB},{"*",nypy::A_MUL},{"/",nypy::A_DIV},{"//",nypy::A_FLOORDIV},
+            {"\\",nypy::A_FLOORDIV},{"%",nypy::A_MOD},{"**",nypy::A_POW},{"&",nypy::A_AND},{"|",nypy::A_OR},
+            {"^",nypy::A_XOR},{"<<",nypy::A_LSHIFT},{">>",nypy::A_RSHIFT},
+            {"==",100},{"!=",101},{"<",102},{"<=",103},{">",104},{">=",105}};
+        auto it=ops.find(m);
+        return it==ops.end()?0:it->second;
+    }
+    bool primitive_member(const VMVal& obj, const std::string& m, std::vector<VMVal>& args, VMVal& out) {
+        switch(obj.type){
+            case VMType::INT: case VMType::FLOAT: case VMType::BOOL: case VMType::NONE:
+            case VMType::STRING: case VMType::LIST: break;
+            default: return false;
+        }
+        if(int op=operator_member_code(m)){
+            if(args.empty())
+                raise_native_exception("TypeError",vm_type_name(obj)+"."+m+"() takes at least 1 argument (0 given)");
+            if(op<100){
+                VMVal acc=obj;
+                for(auto& a:args) acc=binop(op,acc,a);
+                out=acc; return true;
+            }
+            VMVal l=obj;
+            for(auto& r:args){
+                bool ok=op==100?l==r:op==101?l!=r:op==102?l<r:op==103?l<=r:op==104?l>r:l>=r;
+                if(!ok){ out=VMVal::make_bool(false); return true; }
+                l=r;
+            }
+            out=VMVal::make_bool(true); return true;
+        }
+        if(m=="class_name"||m=="type_name"){ out=VMVal::make_str(vm_type_name(obj)); return true; }
+        if(m=="to_string"){ out=VMVal::make_str(vm_str(obj)); return true; }
+        return false;
+    }
+
     VMVal vm_call_method(VMVal obj, const std::string& method, std::vector<VMVal>& args) {
+        {
+            VMVal pm;
+            if(primitive_member(obj,method,args,pm)) return pm;
+        }
         // SUPER_PROXY: call method on parent class with self
         if(obj.type==VMType::SUPER_PROXY){
             std::string parent=obj.s;
@@ -3650,61 +4047,92 @@ private:
         return VMVal::make_none();
     }
 
+    // dict methods, typed keys (vkey / vm_key_value), as the interpreter's
+    // dictMethod.
     VMVal call_map_method(VMVal obj, const std::string& m, std::vector<VMVal>& a) {
         if(!obj.map) return VMVal::make_none();
         auto& mp=*obj.map;
-        // size()/length() on a map returned none; the interpreter reports the
-        // entry count.
-        if(m=="size"||m=="length") return VMVal::make_int((int64_t)mp.size());
-        if(m=="keys") {
-            std::vector<VMVal> r;
-            for(auto& [k,v]:mp) r.push_back(VMVal::make_str(k));
-            return VMVal::make_list(std::move(r));
+        VMVal kw=take_kwargs(a);
+        auto need=[&](size_t lo,size_t hi){
+            if(a.size()<lo||a.size()>hi) raise_native_exception("TypeError",m+"() takes "+(lo==hi?"exactly "+std::to_string(lo):"at most "+std::to_string(hi))+" argument"+(hi==1?"":"s")+" ("+std::to_string(a.size())+" given)");
+        };
+        if(m=="size"||m=="length"||m=="__len__"){
+            int64_t n=0; for(auto& kv:mp) if(!vm_internal_key(kv.first)) n++;
+            return VMVal::make_int(n);
         }
-        if(m=="values") {
-            std::vector<VMVal> r;
-            for(auto& [k,v]:mp) r.push_back(v);
-            return VMVal::make_list(std::move(r));
-        }
-        if(m=="items") {
+        if(m=="keys"||m=="values"||m=="items"||m=="entries"){
             std::vector<VMVal> r;
             for(auto& [k,v]:mp){
-                std::vector<VMVal> pair={VMVal::make_str(k),v};
-                r.push_back(VMVal::make_list(std::move(pair)));}
+                if(vm_internal_key(k)) continue;
+                if(m=="keys") r.push_back(vm_key_value(k));
+                else if(m=="values") r.push_back(v);
+                else r.push_back(VMVal::make_tuple({vm_key_value(k),v}));
+            }
             return VMVal::make_list(std::move(r));
         }
-        if(m=="get") {
-            std::string key=a.empty()?"":a[0].to_string();
-            auto it=mp.find(key);
+        if(m=="get"){
+            need(1,2);
+            auto it=mp.find(vkey(a[0]));
             if(it!=mp.end()) return it->second;
             return a.size()>=2?a[1]:VMVal::make_none();
         }
-        if(m=="has"||m=="contains"||m=="has_key") {
-            std::string key=a.empty()?"":a[0].to_string();
-            return VMVal::make_bool(mp.count(key)>0);
+        if(m=="has"||m=="contains"||m=="has_key"||m=="containsKey"){
+            need(1,1);
+            return VMVal::make_bool(mp.count(vkey(a[0]))>0);
         }
-        // "remove"/"delete" are the names the interpreter uses for erase-by-key;
-        // the VM only had "pop", so map.remove(k) silently returned none and
-        // left the key in place.
-        if(m=="pop"||m=="remove"||m=="delete") {
+        if(m=="pop"){
+            need(1,2);
+            std::string key=vkey(a[0]);
+            auto it=mp.find(key);
+            if(it==mp.end()){
+                if(a.size()>=2) return a[1];
+                raise_native_exception("KeyError",a[0].repr());
+            }
+            VMVal v=it->second; mp.erase(key); return v;
+        }
+        // Nython's map.remove(key[, default]) / delete: erase and return.
+        if(m=="remove"||m=="delete"){
             if(a.empty()) return VMVal::make_none();
-            std::string key=a[0].to_string();
+            std::string key=vkey(a[0]);
             auto it=mp.find(key);
             if(it==mp.end()) return a.size()>=2?a[1]:VMVal::make_none();
-            VMVal v=it->second; mp.erase(it); return v;
+            VMVal v=it->second; mp.erase(key); return v;
         }
-        if(m=="update") {
-            if(!a.empty()&&a[0].type==VMType::MAP&&a[0].map)
-                for(auto& [k,v]:*a[0].map) mp[k]=v;
+        if(m=="popitem"){
+            std::string last; bool found=false;
+            for(auto& kv:mp) if(!vm_internal_key(kv.first)){ last=kv.first; found=true; }
+            if(!found) raise_native_exception("KeyError","'popitem(): dictionary is empty'");
+            VMVal item=VMVal::make_tuple({vm_key_value(last),mp[last]});
+            mp.erase(last); return item;
+        }
+        if(m=="update"||m=="merge"){
+            if(!a.empty()){
+                if(a[0].type==VMType::MAP&&a[0].map){ for(auto& [k,v]:*a[0].map) if(!vm_internal_key(k)) mp[k]=v; }
+                else for(auto& pr:iter_items(a[0])){
+                    std::vector<VMVal> kv=iter_items(pr);
+                    if(kv.size()!=2) raise_native_exception("ValueError","dictionary update sequence element has length "+std::to_string(kv.size())+"; 2 is required");
+                    mp[vkey(kv[0])]=kv[1];
+                }
+            }
+            if(kw.map) for(auto& [k,v]:*kw.map) mp[k]=v;
+            return m=="merge"?obj:VMVal::make_none();
+        }
+        if(m=="clear"){
+            std::vector<std::pair<std::string,VMVal>> keep;
+            for(auto& kv:mp) if(vm_internal_key(kv.first)) keep.push_back(kv);
+            mp.clear();
+            for(auto& kv:keep) mp[kv.first]=kv.second;
             return VMVal::make_none();
         }
-        if(m=="clear") { mp.clear(); return VMVal::make_none(); }
-        if(m=="copy") { return obj; }
-        if(m=="setdefault") {
-            if(a.empty()) return VMVal::make_none();
-            std::string key=a[0].to_string();
-            if(!mp.count(key)) mp[key]=a.size()>=2?a[1]:VMVal::make_none();
-            return mp[key];
+        // A copy, not the same dict (the copy used to alias the original).
+        if(m=="copy"){ VMVal c=VMVal::make_map(); *c.map=mp; return c; }
+        if(m=="setdefault"){
+            need(1,2);
+            std::string key=vkey(a[0]);
+            auto it=mp.find(key);
+            if(it!=mp.end()) return it->second;
+            VMVal d=a.size()>=2?a[1]:VMVal::make_none();
+            mp[key]=d; return d;
         }
         return VMVal::make_none();
     }
@@ -3899,7 +4327,7 @@ private:
             globals_["__file__"]=prev_file;
             export_to_globals_=old_exp;
             if(!alias.empty()){
-                auto ns=std::make_shared<std::unordered_map<std::string,VMVal>>();
+                auto ns=std::make_shared<VMMap>();
                 for(const auto& n : own_names){
                     auto it=globals_.find(n);
                     if(it!=globals_.end()){ (*ns)[n]=it->second; continue; }
@@ -4021,7 +4449,7 @@ private:
                 } catch (nt::Error& e) {
                     // A typed instance, so `except ValueError as e:` matches
                     // (a bare runtime_error only reaches untyped handlers).
-                    auto attrs = std::make_shared<std::unordered_map<std::string, VMVal>>();
+                    auto attrs = std::make_shared<VMMap>();
                     (*attrs)["msg"] = VMVal::make_str(e.msg);
                     (*attrs)["args"] = VMVal::make_list({VMVal::make_str(e.msg)});
                     last_exception_obj_ = VMVal::make_instance(e.type, attrs);
@@ -4105,7 +4533,7 @@ private:
             double v=a.empty()?0:to_d(a[0]); return VMVal::make_float(v*std::tanh(std::log(1+std::exp(v))));});
         // ── device_info() ─────────────────────────────────────────────────────
         globals_["device_info"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            auto m=std::make_shared<std::unordered_map<std::string,VMVal>>();
+            auto m=std::make_shared<VMMap>();
             (*m)["backend"]=VMVal::make_str("cpu");
             (*m)["cpu_cores"]=VMVal::make_int((int64_t)std::max(1u,std::thread::hardware_concurrency()));
             (*m)["gpu_available"]=VMVal::make_bool(false);
@@ -4124,7 +4552,7 @@ private:
             std::sort(iv.begin(),iv.end(),[](auto& a,auto& b){return a.first>b.first;});
             std::vector<VMVal> r;
             for(int i=0;i<k;i++){
-                auto m=std::make_shared<std::unordered_map<std::string,VMVal>>();
+                auto m=std::make_shared<VMMap>();
                 (*m)["value"]=VMVal::make_float(iv[i].first);
                 (*m)["index"]=VMVal::make_int(iv[i].second);
                 VMVal entry; entry.type=VMType::MAP; entry.map=m; r.push_back(entry);}
@@ -4393,7 +4821,7 @@ private:
                 if(!seen.count(k)){seen.insert(k);r.push_back(v);}}
             return VMVal::make_list(std::move(r));});
         globals_["dict"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            auto m=std::make_shared<std::unordered_map<std::string,VMVal>>();
+            auto m=std::make_shared<VMMap>();
             if(!a.empty()&&a[0].type==VMType::LIST&&a[0].list){
                 for(auto& item:vm_arg_list(a,0)){
                     if(item.type==VMType::LIST&&item.list&&item.list->size()>=2)
@@ -4461,7 +4889,7 @@ private:
                 if(depth>200){ out+="null"; return; }
                 if(v.type==VMType::NONE){ out+="null"; return; }
                 if(v.type==VMType::BOOL){ out+=v.b?"true":"false"; return; }
-                if(v.type==VMType::INT){ out+=std::to_string(v.i); return; }
+                if(v.type==VMType::INT){ out+=v.to_string(); return; }
                 if(v.type==VMType::FLOAT){ out+=nyjson::number(v.d); return; }
                 if(v.type==VMType::STRING){ nyjson::quote_to(out, v.s); return; }
                 if(v.type==VMType::LIST&&v.list){
@@ -4469,17 +4897,19 @@ private:
                     for(auto& e:*v.list){ if(!f) out+=", "; enc(e,out,depth+1); f=false; }
                     out+="]"; return; }
                 if((v.type==VMType::MAP||v.type==VMType::INSTANCE)&&v.map){
-                    std::vector<std::string> keys;
+                    // Sorted keys, each written as its str() (1 -> "1"), as
+                    // on the interpreter.
+                    std::vector<std::pair<std::string,std::string>> keys;
                     for(auto& kv:*v.map){
                         const std::string& k=kv.first;
                         if(k=="__len__"||k=="__type__"||k=="__name__"||k=="__class__") continue;
-                        keys.push_back(k); }
+                        keys.push_back({vm_key_value(k).to_string(),k}); }
                     std::sort(keys.begin(),keys.end());
                     out+="{"; bool f=true;
                     for(auto& k:keys){
                         if(!f) out+=", ";
-                        nyjson::quote_to(out,k); out+=": ";
-                        enc(v.map->find(k)->second,out,depth+1); f=false; }
+                        nyjson::quote_to(out,k.first); out+=": ";
+                        enc(v.map->find(k.second)->second,out,depth+1); f=false; }
                     out+="}"; return; }
                 out+="null"; };
             std::string out;
@@ -4519,7 +4949,9 @@ private:
                 switch(n.kind){
                     case nyjson::Node::Null: return VMVal::make_none();
                     case nyjson::Node::Bool: return VMVal::make_bool(n.b);
-                    case nyjson::Node::Int: return VMVal::make_int(n.i);
+                    case nyjson::Node::Int:
+                        if(!n.s.empty()){ nypy::BigInt big; if(nypy::BigInt::parse(n.s,10,big)) return VMVal::make_bigint(big); }
+                        return VMVal::make_int(n.i);
                     case nyjson::Node::Float: return VMVal::make_float(n.d);
                     case nyjson::Node::Str: return VMVal::make_str(n.s);
                     case nyjson::Node::Arr: {
@@ -4528,7 +4960,7 @@ private:
                         return VMVal::make_list(std::move(lst)); }
                     case nyjson::Node::Obj: {
                         auto m=VMVal::make_map();
-                        for(auto& f:n.fields) (*m.map)[f.first]=conv(f.second);
+                        for(auto& f:n.fields) (*m.map)[nypy::key_of_str(f.first)]=conv(f.second);
                         return m; }
                 }
                 return VMVal::make_none(); };
@@ -4548,148 +4980,82 @@ private:
         }
         if(v.type==VMType::STRING){
             std::vector<VMVal> items;
-            for(char c:v.s) items.push_back(VMVal::make_str(std::string(1,c)));
+            for(auto& ch:nypy::u8_chars(v.s)) items.push_back(VMVal::make_str(ch));
             return VMVal::make_iter(std::move(items));
         }
         if(v.type==VMType::MAP&&v.map){
             std::vector<VMVal> items;
-            for(auto&[k,val]:*v.map) items.push_back(VMVal::make_str(k));
+            for(auto&[k,val]:*v.map) if(!vm_internal_key(k)) items.push_back(vm_key_value(k));
             return VMVal::make_iter(std::move(items));
         }
         return VMVal::make_iter({});
     }
 
     // ── Built-in string methods ─────────────────────────────────────────
-    static VMVal str_method(VMVal obj, const std::string& m) {
-        return VMVal::make_native([obj,m](std::vector<VMVal>& a)->VMVal{
-            const std::string& s=obj.s;
-            if(m=="upper"){std::string r=s;for(auto&c:r)c=toupper(c);return VMVal::make_str(r);}
-            if(m=="lower"){std::string r=s;for(auto&c:r)c=tolower(c);return VMVal::make_str(r);}
-            if(m=="strip"||m=="trim"){
-                auto f=s.find_first_not_of(" \t\r\n"),l=s.find_last_not_of(" \t\r\n");
-                return VMVal::make_str(f==std::string::npos?"":s.substr(f,l-f+1));}
-            if(m=="len"||m=="length") return VMVal::make_int((int64_t)s.size());
-            if(m=="split"){
-                std::string d=a.empty()?" ":a[0].to_string();
-                std::vector<VMVal> parts; size_t p=0,f;
-                while((f=s.find(d,p))!=std::string::npos){
-                    parts.push_back(VMVal::make_str(s.substr(p,f-p)));p=f+d.size();}
-                parts.push_back(VMVal::make_str(s.substr(p)));
-                return VMVal::make_list(std::move(parts));}
-            if(m=="startswith"||m=="starts_with"){
-                if(a.empty()) return VMVal::make_bool(false);
-                std::string p=a[0].to_string();
-                return VMVal::make_bool(s.size()>=p.size()&&s.substr(0,p.size())==p);}
-            if(m=="endswith"||m=="ends_with"){
-                if(a.empty()) return VMVal::make_bool(false);
-                std::string p=a[0].to_string();
-                return VMVal::make_bool(s.size()>=p.size()&&s.substr(s.size()-p.size())==p);}
-            if(m=="find"||m=="index"){
-                if(a.empty()) return VMVal::make_int(-1);
-                auto pos=s.find(a[0].to_string());
-                return VMVal::make_int(pos==std::string::npos?-1:(int64_t)pos);}
-            if(m=="replace"){
-                if(a.size()<2) return VMVal::make_str(s);
-                std::string from=a[0].to_string(),to=a[1].to_string(),r=s; size_t p=0;
-                while((p=r.find(from,p))!=std::string::npos){r.replace(p,from.size(),to);p+=to.size();}
-                return VMVal::make_str(r);}
-            if(m=="slice"||m=="substr"){
-                if(a.size()>=3&&a[2].type!=VMType::NONE){
-                    std::string out;
-                    for(int64_t i:VirtualMachine::slice_indices(a,(int64_t)s.size()))
-                        out+=s[(size_t)i];
-                    return VMVal::make_str(out);
+    // One implementation for both engines: nypy::str_method (NyStr.hpp);
+    // only str.format needs the VM's values.
+    nypy::SArg to_sarg(const VMVal& v) {
+        nypy::SArg a; a.tname=vm_type_name(v);
+        switch(v.type){
+            case VMType::NONE: a.k=nypy::SArg::NONE; return a;
+            case VMType::BOOL: a.k=nypy::SArg::BOOL; a.i=v.b?1:0; return a;
+            case VMType::INT: a.k=nypy::SArg::INT; a.i=v.i; return a;
+            case VMType::STRING: a.k=nypy::SArg::STR; a.s=v.s; return a;
+            case VMType::LIST: case VMType::MAP: case VMType::ITERATOR: case VMType::GENERATOR: case VMType::INSTANCE: {
+                std::vector<VMVal> items=iter_items(v);
+                a.k=nypy::SArg::STRS;
+                for(size_t k=0;k<items.size();k++){
+                    if(items[k].type!=VMType::STRING)
+                        raise_native_exception("TypeError","sequence item "+std::to_string(k)+": expected str instance, "+vm_type_name(items[k])+" found");
+                    a.v.push_back(items[k].s);
                 }
-                int64_t st=a.empty()?0:a[0].i,en=(int64_t)s.size();
-                if(a.size()>=2) en=a[1].i;
-                if(st<0)st+=(int64_t)s.size();if(en<0)en+=(int64_t)s.size();
-                st=std::max((int64_t)0,st);en=std::min((int64_t)s.size(),en);
-                return VMVal::make_str(st<en?s.substr(st,en-st):"");}
-            if(m=="contains"){
-                if(a.empty()) return VMVal::make_bool(false);
-                return VMVal::make_bool(s.find(a[0].to_string())!=std::string::npos);}
-            if(m=="format"){
-                std::string r=s;
-                for(size_t i=0;i<a.size();i++){
-                    std::string ph="{"+std::to_string(i)+"}"; size_t pos;
-                    while((pos=r.find(ph))!=std::string::npos) r.replace(pos,ph.size(),a[i].to_string());
-                }
-                size_t pos;
-                for(size_t i=0;i<a.size();i++){
-                    pos=r.find("{}");
-                    if(pos!=std::string::npos) r.replace(pos,2,a[i].to_string());
-                }
-                return VMVal::make_str(r);}
-            if(m=="join"){
-                if(a.empty()||a[0].type!=VMType::LIST) return VMVal::make_str("");
-                std::string r; bool first=true;
-                for(auto& v:*a[0].list){if(!first)r+=s;r+=v.to_string();first=false;}
-                return VMVal::make_str(r);}
-            if(m=="isdigit"){
-                return VMVal::make_bool(!s.empty()&&std::all_of(s.begin(),s.end(),::isdigit));}
-            if(m=="isalpha"){
-                return VMVal::make_bool(!s.empty()&&std::all_of(s.begin(),s.end(),::isalpha));}
-            if(m=="isspace"){
-                return VMVal::make_bool(!s.empty()&&std::all_of(s.begin(),s.end(),[](char c){return isspace((unsigned char)c);}));}
-            if(m=="isupper"){
-                return VMVal::make_bool(!s.empty()&&std::all_of(s.begin(),s.end(),[](char c){return !isalpha((unsigned char)c)||isupper((unsigned char)c);}));}
-            if(m=="islower"){
-                return VMVal::make_bool(!s.empty()&&std::all_of(s.begin(),s.end(),[](char c){return !isalpha((unsigned char)c)||islower((unsigned char)c);}));}
-            if(m=="count"){
-                if(a.empty()) return VMVal::make_int(0);
-                std::string sub=a[0].to_string(); int cnt=0; size_t p=0;
-                while((p=s.find(sub,p))!=std::string::npos){cnt++;p+=sub.size();}
-                return VMVal::make_int(cnt);}
-            if(m=="lstrip"){
-                std::string chars=a.empty()?" \t\r\n":a[0].s;
-                auto f=s.find_first_not_of(chars);
-                return VMVal::make_str(f==std::string::npos?"":s.substr(f));}
-            if(m=="rstrip"){
-                std::string chars=a.empty()?" \t\r\n":a[0].s;
-                auto l=s.find_last_not_of(chars);
-                return VMVal::make_str(l==std::string::npos?"":s.substr(0,l+1));}
-            if(m=="rfind"){
-                if(a.empty()) return VMVal::make_int(-1);
-                auto pos=s.rfind(a[0].to_string());
-                return VMVal::make_int(pos==std::string::npos?-1:(int64_t)pos);}
-            if(m=="rindex"){
-                if(a.empty()) return VMVal::make_none();
-                auto pos=s.rfind(a[0].to_string());
-                return pos==std::string::npos?VMVal::make_none():VMVal::make_int((int64_t)pos);}
-            if(m=="join"){
-                if(a.empty()||a[0].type!=VMType::LIST) return VMVal::make_str("");
-                std::string r; bool f=true;
-                for(auto& v:*a[0].list){if(!f)r+=s;r+=v.to_string();f=false;}
-                return VMVal::make_str(r);}
-            if(m=="zfill"){
-                if(a.empty()) return VMVal::make_str(s);
-                int64_t w=a[0].type==VMType::INT?a[0].i:(int64_t)to_d(a[0]);
-                if((int64_t)s.size()>=w) return VMVal::make_str(s);
-                return VMVal::make_str(std::string((size_t)(w-s.size()),'0')+s);}
-            if(m=="center"){int64_t w=a.empty()?0:(a[0].type==VMType::INT?a[0].i:(int64_t)to_d(a[0]));char fill=a.size()>=2&&!a[1].s.empty()?a[1].s[0]:' ';if((int64_t)s.size()>=w)return VMVal::make_str(s);size_t pad=w-s.size();size_t lp=pad/2,rp=pad-lp;return VMVal::make_str(std::string(lp,fill)+s+std::string(rp,fill));}
-            if(m=="ljust"){int64_t w=a.empty()?0:(a[0].type==VMType::INT?a[0].i:(int64_t)to_d(a[0]));char fill=a.size()>=2&&!a[1].s.empty()?a[1].s[0]:' ';if((int64_t)s.size()>=w)return VMVal::make_str(s);return VMVal::make_str(s+std::string((size_t)(w-s.size()),fill));}
-            if(m=="rjust"){int64_t w=a.empty()?0:(a[0].type==VMType::INT?a[0].i:(int64_t)to_d(a[0]));char fill=a.size()>=2&&!a[1].s.empty()?a[1].s[0]:' ';if((int64_t)s.size()>=w)return VMVal::make_str(s);return VMVal::make_str(std::string((size_t)(w-s.size()),fill)+s);}
-            if(m=="capitalize"){if(s.empty())return VMVal::make_str(s);std::string r=s;r[0]=toupper((unsigned char)r[0]);for(size_t i=1;i<r.size();i++)r[i]=tolower((unsigned char)r[i]);return VMVal::make_str(r);}
-            if(m=="isalnum"){for(char c:s)if(!isalnum((unsigned char)c))return VMVal::make_bool(false);return VMVal::make_bool(!s.empty());}
-            if(m=="islower"){bool has=false;for(char c:s){if(isupper((unsigned char)c))return VMVal::make_bool(false);if(islower((unsigned char)c))has=true;}return VMVal::make_bool(has);}
-            if(m=="isupper"){bool has=false;for(char c:s){if(islower((unsigned char)c))return VMVal::make_bool(false);if(isupper((unsigned char)c))has=true;}return VMVal::make_bool(has);}
-            if(m=="isspace"){for(char c:s)if(!isspace((unsigned char)c))return VMVal::make_bool(false);return VMVal::make_bool(!s.empty());}
-            if(m=="swapcase"){std::string r=s;for(char& c:r)c=isupper((unsigned char)c)?tolower(c):islower((unsigned char)c)?toupper(c):c;return VMVal::make_str(r);}
-            if(m=="removeprefix"){if(!a.empty()&&s.substr(0,a[0].s.size())==a[0].s)return VMVal::make_str(s.substr(a[0].s.size()));return VMVal::make_str(s);}
-            if(m=="removesuffix"){if(!a.empty()&&s.size()>=a[0].s.size()&&s.substr(s.size()-a[0].s.size())==a[0].s)return VMVal::make_str(s.substr(0,s.size()-a[0].s.size()));return VMVal::make_str(s);}
-            if(m=="title"){
-                std::string r=s; bool cap=true;
-                for(char& c:r){if(isspace((unsigned char)c))cap=true;else if(cap){c=toupper(c);cap=false;}else c=tolower(c);}
-                return VMVal::make_str(r);}
-            if(m=="encode"){return VMVal::make_str(s);}  // stub: return as-is
-            if(m=="decode"){return VMVal::make_str(s);}  // stub
-            if(m=="splitlines"){
-                std::vector<VMVal> lines; std::string line;
-                for(char c:s){if(c=='\n'){lines.push_back(VMVal::make_str(line));line="";}else line+=c;}
-                if(!line.empty()||(!s.empty()&&s.back()!='\n')) lines.push_back(VMVal::make_str(line));
-                return VMVal::make_list(std::move(lines));}
-            if(m=="to_int"||m=="to_integer"){try{return VMVal::make_int(std::stoll(s));}catch(...){return VMVal::make_int(0);}}
-            if(m=="to_float"||m=="to_number"){try{return VMVal::make_float(std::stod(s));}catch(...){return VMVal::make_float(0.0);}}
+                return a;
+            }
+            default: a.k=nypy::SArg::OTHER; return a;
+        }
+    }
+    static VMVal from_sres(const nypy::SRes& r) {
+        switch(r.k){
+            case nypy::SRes::INT: return VMVal::make_int(r.i);
+            case nypy::SRes::BOOL: return VMVal::make_bool(r.b);
+            case nypy::SRes::STR:
+                if(r.i==1){ double d=0; nypy::parse_float_str(r.s,d); return VMVal::make_float(d); }
+                return VMVal::make_str(r.s);
+            case nypy::SRes::LIST: case nypy::SRes::TUPLE: {
+                std::vector<VMVal> items; items.reserve(r.v.size());
+                for(auto& x:r.v) items.push_back(VMVal::make_str(x));
+                VMVal out=VMVal::make_list(std::move(items)); out.b=r.k==nypy::SRes::TUPLE; return out;
+            }
+            default: return VMVal::make_none();
+        }
+    }
+    // Keyword arguments reach a native as a trailing map marked "__kwargs__"
+    // (CALL_KW); this takes it off the argument list.
+    static VMVal take_kwargs(std::vector<VMVal>& a) {
+        if(!a.empty()&&a.back().type==VMType::MAP&&a.back().class_name=="__kwargs__"){
+            VMVal kw=a.back(); a.pop_back(); return kw;
+        }
+        return VMVal::make_none();
+    }
+    static const VMVal* kwarg(const VMVal& kw, const char* name) {
+        if(kw.type!=VMType::MAP||!kw.map) return nullptr;
+        auto it=kw.map->find(name);
+        return it==kw.map->end()?nullptr:&it->second;
+    }
+    VMVal str_method(VMVal obj, const std::string& m) {
+        VirtualMachine* vm=this;
+        return VMVal::make_native([obj,m,vm](std::vector<VMVal>& a)->VMVal{
+            VMVal kw=take_kwargs(a);
+            if(m=="format") return VMVal::make_str(vm->str_format(obj.s,a,kw.type==VMType::MAP?&kw:nullptr));
+            if(m=="format_map"){
+                VMVal mp=a.empty()?VMVal::make_none():a[0];
+                std::vector<VMVal> none;
+                return VMVal::make_str(vm->str_format(obj.s,none,mp.type==VMType::MAP?&mp:nullptr));
+            }
+            std::vector<nypy::SArg> sa; sa.reserve(a.size());
+            for(auto& v:a) sa.push_back(vm->to_sarg(v));
+            nypy::SRes r;
+            if(vm->nycall([&]{ return nypy::str_method(obj.s,m,sa,r); })) return from_sres(r);
             return VMVal::make_none();
         });
     }
@@ -4699,13 +5065,107 @@ private:
     }
 
     // ── Built-in list methods ───────────────────────────────────────────
+    // Python list/tuple methods, as the interpreter's listMethod; false when
+    // `m` is not one of them (the Nython extras follow in list_method).
+    bool list_method_py(const VMVal& obj, const std::string& m, std::vector<VMVal>& a, const VMVal& kw, VMVal& out) {
+        static const std::unordered_set<std::string> mine = {
+            "sort","index","indexOf","count","pop","insert","copy","reverse","clear","extend","append","push","remove"};
+        if(!mine.count(m)) return false;
+        static const std::unordered_set<std::string> mutating = {"sort","pop","insert","reverse","clear","extend","append","push","remove"};
+        if(obj.b&&mutating.count(m)) raise_native_exception("AttributeError","'tuple' object has no attribute '"+m+"'");
+        auto& L=*obj.list;
+        int64_t n=(int64_t)L.size();
+        auto nargs=[&](size_t k,const char* what){ if(a.size()!=k) raise_native_exception("TypeError",std::string(what)+" takes exactly "+std::to_string(k)+" argument ("+std::to_string(a.size())+" given)"); };
+        if(m=="append"||m=="push"){ nargs(1,"list.append()"); L.push_back(a[0]); out=VMVal::make_none(); return true; }
+        if(m=="extend"){ nargs(1,"list.extend()"); std::vector<VMVal> more=iter_items(a[0]); L.insert(L.end(),more.begin(),more.end()); out=VMVal::make_none(); return true; }
+        if(m=="remove"){
+            nargs(1,"list.remove()");
+            for(size_t k=0;k<L.size();k++) if(L[k]==a[0]){ L.erase(L.begin()+(long)k); out=VMVal::make_none(); return true; }
+            raise_native_exception("ValueError","list.remove(x): x not in list");
+        }
+        if(m=="sort"){
+            VMVal keyfn=VMVal::make_none(); bool rev=false;
+            if(const VMVal* k=kwarg(kw,"key")) keyfn=*k;
+            if(const VMVal* r=kwarg(kw,"reverse")) rev=r->is_truthy();
+            for(auto& v:a){
+                if(v.type==VMType::BOOL) rev=v.b;
+                else if((v.type==VMType::FUNCTION||v.type==VMType::NATIVE)&&keyfn.type==VMType::NONE) keyfn=v;
+            }
+            std::vector<VMVal> keys;
+            if(keyfn.type!=VMType::NONE) for(auto& v:L){ std::vector<VMVal> ka={v}; keys.push_back(vm_call(keyfn,ka,std::nullopt)); }
+            std::vector<size_t> order(L.size());
+            for(size_t k=0;k<order.size();k++) order[k]=k;
+            std::stable_sort(order.begin(),order.end(),[&](size_t x,size_t y){
+                const VMVal& kx=keys.empty()?L[x]:keys[x];
+                const VMVal& ky=keys.empty()?L[y]:keys[y];
+                return rev?sort_less(ky,kx):sort_less(kx,ky);
+            });
+            std::vector<VMVal> sorted_items; sorted_items.reserve(L.size());
+            for(size_t k:order) sorted_items.push_back(L[k]);
+            L.swap(sorted_items);
+            out=obj; return true;   // the list itself, as on the interpreter
+        }
+        if(m=="index"||m=="indexOf"){
+            if(a.empty()) raise_native_exception("TypeError","index expected at least 1 argument, got 0");
+            int64_t st=0,en=n;
+            if(a.size()>=2&&a[1].type!=VMType::NONE){ st=index_of(a[1],"slice"); if(st<0) st=std::max<int64_t>(0,st+n); }
+            if(a.size()>=3&&a[2].type!=VMType::NONE){ en=index_of(a[2],"slice"); if(en<0) en+=n; en=std::min(en,n); }
+            for(int64_t k=st;k<en;k++) if(L[(size_t)k]==a[0]){ out=VMVal::make_int(k); return true; }
+            if(m=="indexOf"){ out=VMVal::make_int(-1); return true; }
+            raise_native_exception("ValueError",vm_repr(a[0])+" is not in list");
+        }
+        if(m=="count"){ nargs(1,"count()"); int64_t c=0; for(auto& v:L) if(v==a[0]) c++; out=VMVal::make_int(c); return true; }
+        if(m=="pop"){
+            if(!a.empty()&&a[0].type!=VMType::INT&&a[0].type!=VMType::BOOL) return false;
+            if(n==0) raise_native_exception("IndexError","pop from empty list");
+            int64_t i=a.empty()?n-1:index_of(a[0],"list");
+            if(i<0) i+=n;
+            if(i<0||i>=n) raise_native_exception("IndexError","pop index out of range");
+            out=L[(size_t)i]; L.erase(L.begin()+i); return true;
+        }
+        if(m=="insert"){
+            if(a.size()!=2) raise_native_exception("TypeError","insert expected 2 arguments, got "+std::to_string(a.size()));
+            int64_t i=index_of(a[0],"list");
+            if(i<0) i=std::max<int64_t>(0,i+n);
+            if(i>n) i=n;
+            L.insert(L.begin()+i,a[1]); out=VMVal::make_none(); return true;
+        }
+        if(m=="copy"){ out=VMVal::make_list(std::vector<VMVal>(L)); out.b=obj.b; return true; }
+        if(m=="reverse"){ std::reverse(L.begin(),L.end()); out=obj; return true; }
+        if(m=="clear"){ L.clear(); out=VMVal::make_none(); return true; }
+        return false;
+    }
+    // sorted()/min()/max()/list.sort() ordering: Python's where defined;
+    // values Python cannot compare fall back to type name then text.
+    bool sort_less(const VMVal& x, const VMVal& y) {
+        if(x.is_num()&&y.is_num()) return VMVal::num_compare(x,y)==-1;
+        if(x.type==VMType::STRING&&y.type==VMType::STRING) return x.s<y.s;
+        if(x.type==VMType::LIST&&y.type==VMType::LIST&&x.list&&y.list){
+            size_t n=std::min(x.list->size(),y.list->size());
+            for(size_t k=0;k<n;k++){
+                const VMVal& p=(*x.list)[k]; const VMVal& q=(*y.list)[k];
+                if(p==q) continue;
+                return sort_less(p,q);
+            }
+            return x.list->size()<y.list->size();
+        }
+        if(x.type==VMType::INSTANCE){
+            VMVal r=call_dunder(x,"__lt__",{y});
+            if(r.type==VMType::BOOL) return r.b;
+        }
+        std::string tx=vm_type_name(x), ty=vm_type_name(y);
+        if(tx!=ty) return tx<ty;
+        return x.to_string()<y.to_string();
+    }
     VMVal list_method(VMVal obj, const std::string& m) {
         VirtualMachine* vm=this;
         return VMVal::make_native([obj,m,vm](std::vector<VMVal>& a)->VMVal{
             if(!obj.list) return VMVal::make_none();
             auto& lst=*obj.list;
+            VMVal kw=take_kwargs(a);
+            VMVal res;
+            if(vm->list_method_py(obj,m,a,kw,res)) return res;
             if(m=="len"||m=="length"||m=="size") return VMVal::make_int((int64_t)lst.size());
-            if(m=="append"||m=="push"){if(!a.empty())lst.push_back(a[0]);return VMVal::make_none();}
             // Functional list methods. Without these, xs.filter(...) evaluated
             // to none — and because printing none still exits 0, the example
             // sweep counted chain2.ny as passing while it produced nothing.
@@ -4809,17 +5269,13 @@ private:
                     return VMVal::make_list(std::move(res));}
                 return VMVal::make_list(std::vector<VMVal>(lst));}
             if(m=="slice"){
-                if(a.size()>=3&&a[2].type!=VMType::NONE){
-                    std::vector<VMVal> sub;
-                    for(int64_t i:VirtualMachine::slice_indices(a,(int64_t)lst.size()))
-                        sub.push_back(lst[(size_t)i]);
-                    return VMVal::make_list(std::move(sub));
-                }
-                int64_t st=a.empty()?0:a[0].i,en=(int64_t)lst.size();
-                if(a.size()>=2)en=a[1].i;if(st<0)st+=(int64_t)lst.size();if(en<0)en+=(int64_t)lst.size();
-                st=std::max((int64_t)0,st);en=std::min((int64_t)lst.size(),en);
-                std::vector<VMVal> sub;for(int64_t i=st;i<en;i++)sub.push_back(lst[i]);
-                return VMVal::make_list(std::move(sub));}
+                // L[a:b:c] (the parser emits L.slice(a, b, c), none for an
+                // omitted bound): Python's slice semantics; a tuple slice is
+                // a tuple.
+                int64_t st,step,n=vm->slice_spec(a,(int64_t)lst.size(),st,step);
+                std::vector<VMVal> sub;
+                for(int64_t k=0,i=st;k<n;k++,i+=step) sub.push_back(lst[(size_t)i]);
+                VMVal r=VMVal::make_list(std::move(sub)); r.b=obj.b; return r;}
             return VMVal::make_none();
         });
     }
@@ -4829,17 +5285,390 @@ private:
     }
 
     // ── Built-in registration ───────────────────────────────────────────
+    // The Python core builtins, with the semantics of the interpreter's
+    // builtins/pycore.cpp and the same shared libraries (NyBigInt/NyStr/
+    // NyFormat): any iterable (lists, tuples, strings, dicts, generators,
+    // __iter__ instances), keyword arguments by name, exact big ints.
+    void register_pycore() {
+        VirtualMachine* vm=this;
+        auto def=[&](const char* name, std::function<VMVal(std::vector<VMVal>&, const VMVal&)> fn){
+            globals_[name]=VMVal::make_native([fn](std::vector<VMVal>& a)->VMVal{
+                VMVal kw=take_kwargs(a);
+                return fn(a,kw);
+            });
+        };
+        auto need=[vm](const std::vector<VMVal>& a, size_t n, const char* what){
+            if(a.size()<n) vm->raise_native_exception("TypeError",std::string(what)+" expected "+std::to_string(n)+" argument"+(n==1?"":"s")+", got "+std::to_string(a.size()));
+        };
+        auto as_int=[vm](const VMVal& v)->nypy::NumV{
+            nypy::NumV n;
+            if(!v.to_numv(n)||n.k==3) vm->raise_native_exception("TypeError","'"+vm_type_name(v)+"' object cannot be interpreted as an integer");
+            return n;
+        };
+        auto call1=[vm](const VMVal& fn, const VMVal& x){ std::vector<VMVal> a={x}; return vm->vm_call(fn,a,std::nullopt); };
+        def("len",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            if(a.empty()) vm->raise_native_exception("TypeError","len() takes exactly one argument (0 given)");
+            const VMVal& v=a[0];
+            switch(v.type){
+                case VMType::STRING: return VMVal::make_int((int64_t)nypy::str_width(v.s));
+                case VMType::LIST: return VMVal::make_int(v.list?(int64_t)v.list->size():0);
+                case VMType::MAP: { int64_t n=0; if(v.map) for(auto& kv:*v.map) if(!vm_internal_key(kv.first)) n++; return VMVal::make_int(n); }
+                case VMType::INSTANCE: { VMVal r=vm->call_dunder(v,"__len__",{}); if(r.type!=VMType::NONE) return r; break; }
+                case VMType::ITERATOR: return VMVal::make_int(v.iter?(int64_t)v.iter->second.size()-v.iter->first:0);
+                case VMType::NONE: case VMType::UNDEFINED: return VMVal::make_int(0);   // as the interpreter
+                default: break;
+            }
+            vm->raise_native_exception("TypeError","object of type '"+vm_type_name(v)+"' has no len()");
+        });
+        def("str",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            if(a.empty()) return VMVal::make_str("");
+            if(a[0].type==VMType::STRING) return a[0];
+            return VMVal::make_str(vm->vm_str(a[0]));
+        });
+        globals_["string"]=globals_["str"];
+        def("repr",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            if(a.empty()) vm->raise_native_exception("TypeError","repr() takes exactly one argument (0 given)");
+            return VMVal::make_str(vm->vm_repr(a[0]));
+        });
+        def("ascii",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            if(a.empty()) vm->raise_native_exception("TypeError","ascii() takes exactly one argument (0 given)");
+            return VMVal::make_str(vm->to_fmtval(a[0],'a').s);
+        });
+        def("format",[vm](std::vector<VMVal>& a,const VMVal& kw)->VMVal{
+            if(a.empty()) vm->raise_native_exception("TypeError","format() takes at least 1 argument (0 given)");
+            const VMVal* sp=a.size()>=2?&a[1]:kwarg(kw,"format_spec");
+            return VMVal::make_str(vm->format_value(a[0],sp?sp->to_string():std::string()));
+        });
+        // An f-string field: __format_value__(value, spec, conversion).
+        def("__format_value__",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            if(a.size()<3) return VMVal::make_str(a.empty()?std::string():vm->vm_str(a[0]));
+            const std::string& spec=a[1].s; const std::string& conv=a[2].s;
+            if(conv.empty()){
+                if(spec.empty()) return VMVal::make_str(a[0].type==VMType::STRING?a[0].s:vm->vm_str(a[0]));
+                return VMVal::make_str(vm->format_value(a[0],spec));
+            }
+            nypy::FmtVal fv=vm->to_fmtval(a[0],conv[0]);
+            return VMVal::make_str(vm->nycall([&]{ return nypy::format_value(fv,spec); }));
+        });
+        def("int",[vm,as_int](std::vector<VMVal>& a,const VMVal& kw)->VMVal{
+            if(a.empty()) return VMVal::make_int(0);
+            const VMVal& v=a[0];
+            const VMVal* bv=a.size()>=2?&a[1]:kwarg(kw,"base");
+            if(bv){
+                if(v.type!=VMType::STRING) vm->raise_native_exception("TypeError","int() can't convert non-string with explicit base");
+                nypy::NumV b=as_int(*bv);
+                int base=(int)b.i;
+                if(b.k!=1||(base!=0&&(base<2||base>36))) vm->raise_native_exception("ValueError","int() base must be >= 2 and <= 36, or 0");
+                nypy::BigInt out;
+                if(!nypy::parse_int_str(v.s,base,out))
+                    vm->raise_native_exception("ValueError","invalid literal for int() with base "+std::to_string(base)+": "+nypy::str_repr(v.s));
+                return VMVal::make_bigint(out);
+            }
+            switch(v.type){
+                case VMType::INT: return v;
+                case VMType::BOOL: return VMVal::make_int(v.b?1:0);
+                case VMType::FLOAT: {
+                    if(std::isnan(v.d)) vm->raise_native_exception("ValueError","cannot convert float NaN to integer");
+                    if(std::isinf(v.d)) vm->raise_native_exception("OverflowError","cannot convert float infinity to integer");
+                    double t=std::trunc(v.d);
+                    if(t>=-9.2e18&&t<=9.2e18) return VMVal::make_int((int64_t)t);
+                    return VMVal::make_bigint(nypy::BigInt::from_double(t));
+                }
+                case VMType::STRING: {
+                    nypy::BigInt out;
+                    if(!nypy::parse_int_default(v.s,out))
+                        vm->raise_native_exception("ValueError","invalid literal for int() with base 10: "+nypy::str_repr(v.s));
+                    return VMVal::make_bigint(out);
+                }
+                case VMType::INSTANCE: { VMVal r=vm->call_dunder(v,"__int__",{}); if(r.type!=VMType::NONE) return r; break; }
+                default: break;
+            }
+            vm->raise_native_exception("TypeError","int() argument must be a string, a bytes-like object or a real number, not '"+vm_type_name(v)+"'");
+        });
+        def("float",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            if(a.empty()) return VMVal::make_float(0.0);
+            const VMVal& v=a[0];
+            nypy::NumV n;
+            if(v.to_numv(n)) return VMVal::make_float(n.dbl());
+            if(v.type==VMType::STRING){
+                double d;
+                if(!nypy::parse_float_str(v.s,d)) vm->raise_native_exception("ValueError","could not convert string to float: "+nypy::str_repr(v.s));
+                return VMVal::make_float(d);
+            }
+            if(v.type==VMType::INSTANCE){ VMVal r=vm->call_dunder(v,"__float__",{}); if(r.type!=VMType::NONE) return r; }
+            vm->raise_native_exception("TypeError","float() argument must be a string or a real number, not '"+vm_type_name(v)+"'");
+        });
+        def("abs",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            if(a.empty()) vm->raise_native_exception("TypeError","abs() takes exactly one argument (0 given)");
+            nypy::NumV n;
+            if(a[0].to_numv(n)) return VMVal::from_numv(nypy::num_abs(n));
+            if(a[0].type==VMType::INSTANCE){ VMVal r=vm->call_dunder(a[0],"__abs__",{}); if(r.type!=VMType::NONE) return r; }
+            vm->raise_native_exception("TypeError","bad operand type for abs(): '"+vm_type_name(a[0])+"'");
+        });
+        def("round",[vm,as_int](std::vector<VMVal>& a,const VMVal& kw)->VMVal{
+            if(a.empty()) vm->raise_native_exception("TypeError","round() missing required argument 'number' (pos 1)");
+            nypy::NumV n;
+            const VMVal* ndv=a.size()>=2?&a[1]:kwarg(kw,"ndigits");
+            if(ndv&&ndv->type==VMType::NONE) ndv=nullptr;
+            if(!a[0].to_numv(n)){
+                if(a[0].type==VMType::INSTANCE){
+                    VMVal r=ndv?vm->call_dunder(a[0],"__round__",{*ndv}):vm->call_dunder(a[0],"__round__",{});
+                    if(r.type!=VMType::NONE) return r;
+                }
+                vm->raise_native_exception("TypeError","type "+vm_type_name(a[0])+" doesn't define __round__ method");
+            }
+            if(n.k==3){
+                if(!ndv){
+                    if(std::isnan(n.d)) vm->raise_native_exception("ValueError","cannot convert float NaN to integer");
+                    if(std::isinf(n.d)) vm->raise_native_exception("OverflowError","cannot convert float infinity to integer");
+                    double r=std::nearbyint(n.d);   // ties to even
+                    if(r>=-9.2e18&&r<=9.2e18) return VMVal::make_int((int64_t)r);
+                    return VMVal::make_bigint(nypy::BigInt::from_double(r));
+                }
+                nypy::NumV d=as_int(*ndv);
+                return VMVal::make_float(nypy::round_ndigits(n.d,d.k==1?d.i:(d.neg()?-1000:1000)));
+            }
+            if(!ndv) return VMVal::from_numv(n.k==1?n:nypy::NumV::B(n.big()));
+            nypy::NumV d=as_int(*ndv);
+            if(d.k!=1||d.i>=0) return VMVal::from_numv(n);
+            nypy::BigInt p=nypy::BigInt(10).pow((uint64_t)(-d.i)),q,r;
+            nypy::BigInt::floordivmod(n.big(),p,q,r);
+            int c=nypy::BigInt::cmp(r+r,p);
+            if(c>0||(c==0&&!q.mag.empty()&&(q.mag[0]&1))) q=q+nypy::BigInt(1);
+            return VMVal::make_bigint(q*p);
+        });
+        def("pow",[vm](std::vector<VMVal>& a,const VMVal& kw)->VMVal{
+            if(a.size()<2) vm->raise_native_exception("TypeError","pow() expected 2 arguments");
+            const VMVal* mv=a.size()>=3?&a[2]:kwarg(kw,"mod");
+            if(mv&&mv->type!=VMType::NONE){
+                nypy::NumV b,e,m;
+                if(!a[0].to_numv(b)||!a[1].to_numv(e)||!mv->to_numv(m)) vm->raise_native_exception("TypeError","unsupported operand type(s) for pow()");
+                return vm->nycall([&]{ return VMVal::from_numv(nypy::pow_mod(b,e,m)); });
+            }
+            return vm->binop(nypy::A_POW,a[0],a[1]);
+        });
+        def("divmod",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            if(a.size()<2) vm->raise_native_exception("TypeError","divmod expected 2 arguments");
+            return VMVal::make_tuple({vm->binop(nypy::A_FLOORDIV,a[0],a[1]),vm->binop(nypy::A_MOD,a[0],a[1])});
+        });
+        for(const char* nm:{"hex","oct","bin"}){
+            std::string spec=std::string(nm)=="hex"?"#x":std::string(nm)=="oct"?"#o":"#b";
+            def(nm,[vm,as_int,spec](std::vector<VMVal>& a,const VMVal&)->VMVal{
+                if(a.empty()) vm->raise_native_exception("TypeError","expected 1 argument");
+                nypy::NumV n=as_int(a[0]);
+                return VMVal::make_str(nypy::format_value(n.k==1?nypy::FmtVal::of_int(n.i):nypy::FmtVal::of_big(n.big()),spec));
+            });
+        }
+        def("chr",[vm,as_int](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            if(a.empty()) vm->raise_native_exception("TypeError","chr() takes exactly one argument (0 given)");
+            nypy::NumV n=as_int(a[0]);
+            return VMVal::make_str(vm->nycall([&]{ return nypy::str_chr(n.k==1?n.i:-1); }));
+        });
+        def("ord",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            if(a.empty()||a[0].type!=VMType::STRING) vm->raise_native_exception("TypeError","ord() expected string of length 1, but "+(a.empty()?std::string("nothing"):vm_type_name(a[0]))+" found");
+            return VMVal::make_int(vm->nycall([&]{ return nypy::str_ord(a[0].s); }));
+        });
+        for(const char* nm:{"min","max"}){
+            bool is_min=std::string(nm)=="min";
+            std::string name=nm;
+            def(nm,[vm,call1,is_min,name](std::vector<VMVal>& a,const VMVal& kw)->VMVal{
+                const VMVal* keyv=kwarg(kw,"key");
+                const VMVal* defv=kwarg(kw,"default");
+                if(keyv&&keyv->type==VMType::NONE) keyv=nullptr;
+                std::vector<VMVal> items;
+                if(a.size()==1) items=vm->iter_items(a[0]);
+                else if(a.empty()) vm->raise_native_exception("TypeError",name+" expected at least 1 argument, got 0");
+                else items=a;
+                if(items.empty()){
+                    if(defv) return *defv;
+                    vm->raise_native_exception("ValueError",name+"() arg is an empty sequence");
+                }
+                size_t best=0;
+                VMVal bk=keyv?call1(*keyv,items[0]):items[0];
+                for(size_t k=1;k<items.size();k++){
+                    VMVal kk=keyv?call1(*keyv,items[k]):items[k];
+                    if(is_min?vm->sort_less(kk,bk):vm->sort_less(bk,kk)){ best=k; bk=kk; }
+                }
+                return items[best];
+            });
+        }
+        def("sum",[vm](std::vector<VMVal>& a,const VMVal& kw)->VMVal{
+            if(a.empty()) vm->raise_native_exception("TypeError","sum() takes at least 1 positional argument (0 given)");
+            std::vector<VMVal> items=vm->iter_items(a[0]);
+            const VMVal* sv=a.size()>=2?&a[1]:kwarg(kw,"start");
+            VMVal acc=sv?*sv:VMVal::make_int(0);
+            if(acc.type==VMType::STRING) vm->raise_native_exception("TypeError","sum() can't sum strings [use ''.join(seq) instead]");
+            for(auto& v:items){
+                if(acc.type==VMType::INT&&v.type==VMType::INT&&acc.s.empty()&&v.s.empty()){
+                    int64_t r; if(!nypy::add_ovf(acc.i,v.i,r)){ acc.i=r; continue; }
+                }
+                if(acc.type==VMType::INSTANCE){ VMVal r=vm->call_dunder(acc,"__add__",{v}); if(r.type!=VMType::NONE){ acc=r; continue; } }
+                if(v.type==VMType::INSTANCE){ VMVal r=vm->call_dunder(v,"__radd__",{acc}); if(r.type!=VMType::NONE){ acc=r; continue; } }
+                acc=vm->binop(nypy::A_ADD,acc,v);
+            }
+            return acc;
+        });
+        def("sorted",[vm,call1](std::vector<VMVal>& a,const VMVal& kw)->VMVal{
+            if(a.empty()) vm->raise_native_exception("TypeError","sorted expected 1 argument, got 0");
+            std::vector<VMVal> items=vm->iter_items(a[0]);
+            VMVal keyfn=VMVal::make_none(); bool rev=false;
+            if(const VMVal* k=kwarg(kw,"key")) keyfn=*k;
+            if(const VMVal* r=kwarg(kw,"reverse")) rev=r->is_truthy();
+            for(size_t k=1;k<a.size();k++){   // old positional forms: sorted(xs, keyfn) / sorted(xs, true)
+                if(a[k].type==VMType::BOOL) rev=a[k].b;
+                else if((a[k].type==VMType::FUNCTION||a[k].type==VMType::NATIVE)&&keyfn.type==VMType::NONE) keyfn=a[k];
+            }
+            std::vector<VMVal> keys;
+            if(keyfn.type!=VMType::NONE) for(auto& v:items) keys.push_back(call1(keyfn,v));
+            std::vector<size_t> order(items.size());
+            for(size_t k=0;k<order.size();k++) order[k]=k;
+            std::stable_sort(order.begin(),order.end(),[&](size_t x,size_t y){
+                const VMVal& kx=keys.empty()?items[x]:keys[x];
+                const VMVal& ky=keys.empty()?items[y]:keys[y];
+                return rev?vm->sort_less(ky,kx):vm->sort_less(kx,ky);
+            });
+            std::vector<VMVal> out; out.reserve(items.size());
+            for(size_t k:order) out.push_back(items[k]);
+            return VMVal::make_list(std::move(out));
+        });
+        def("reversed",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            if(a.empty()) vm->raise_native_exception("TypeError","reversed expected 1 argument, got 0");
+            if(a[0].type==VMType::INSTANCE){ VMVal r=vm->call_dunder(a[0],"__reversed__",{}); if(r.type!=VMType::NONE) return r; }
+            std::vector<VMVal> items=vm->iter_items(a[0]);
+            std::reverse(items.begin(),items.end());
+            return VMVal::make_list(std::move(items));
+        });
+        def("list",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            if(a.empty()) return VMVal::make_list();
+            return VMVal::make_list(vm->iter_items(a[0]));
+        });
+        def("tuple",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            if(a.empty()) return VMVal::make_tuple();
+            if(a[0].is_tuple()) return a[0];
+            return VMVal::make_tuple(vm->iter_items(a[0]));
+        });
+        def("set",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            std::vector<VMVal> out;
+            if(!a.empty()){
+                std::unordered_set<std::string> seen;
+                for(auto& v:vm->iter_items(a[0])) if(seen.insert(v.repr()).second) out.push_back(v);
+            }
+            return VMVal::make_list(std::move(out));
+        });
+        def("dict",[vm](std::vector<VMVal>& a,const VMVal& kw)->VMVal{
+            VMVal d=VMVal::make_map();
+            if(!a.empty()){
+                if(a[0].type==VMType::MAP&&a[0].map){ for(auto& [k,v]:*a[0].map) if(!vm_internal_key(k)) (*d.map)[k]=v; }
+                else for(auto& pr:vm->iter_items(a[0])){
+                    std::vector<VMVal> kv=vm->iter_items(pr);
+                    if(kv.size()!=2) vm->raise_native_exception("ValueError","dictionary update sequence element has length "+std::to_string(kv.size())+"; 2 is required");
+                    (*d.map)[vm->vkey(kv[0])]=kv[1];
+                }
+            }
+            if(kw.map) for(auto& [k,v]:*kw.map) (*d.map)[k]=v;
+            return d;
+        });
+        def("enumerate",[vm,as_int](std::vector<VMVal>& a,const VMVal& kw)->VMVal{
+            if(a.empty()) vm->raise_native_exception("TypeError","enumerate() missing required argument 'iterable'");
+            std::vector<VMVal> items=vm->iter_items(a[0]);
+            const VMVal* sv=a.size()>=2?&a[1]:kwarg(kw,"start");
+            VMVal idx=sv?VMVal::from_numv(as_int(*sv)):VMVal::make_int(0);
+            std::vector<VMVal> out; out.reserve(items.size());
+            for(auto& v:items){
+                out.push_back(VMVal::make_tuple({idx,v}));
+                idx=vm->binop(nypy::A_ADD,idx,VMVal::make_int(1));
+            }
+            return VMVal::make_list(std::move(out));
+        });
+        def("zip",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            std::vector<std::vector<VMVal>> cols;
+            size_t n=a.empty()?0:SIZE_MAX;
+            for(auto& x:a){ cols.push_back(vm->iter_items(x)); n=std::min(n,cols.back().size()); }
+            std::vector<VMVal> out;
+            for(size_t k=0;k<n;k++){
+                std::vector<VMVal> row; for(auto& c:cols) row.push_back(c[k]);
+                out.push_back(VMVal::make_tuple(std::move(row)));
+            }
+            return VMVal::make_list(std::move(out));
+        });
+        globals_["zip_list"]=globals_["zip"];
+        def("map",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            if(a.size()<2) vm->raise_native_exception("TypeError","map() must have at least two arguments.");
+            std::vector<std::vector<VMVal>> cols;
+            size_t n=SIZE_MAX;
+            for(size_t k=1;k<a.size();k++){ cols.push_back(vm->iter_items(a[k])); n=std::min(n,cols.back().size()); }
+            std::vector<VMVal> out;
+            for(size_t k=0;k<n;k++){
+                std::vector<VMVal> ca; for(auto& c:cols) ca.push_back(c[k]);
+                out.push_back(vm->vm_call(a[0],ca,std::nullopt));
+            }
+            return VMVal::make_list(std::move(out));
+        });
+        def("filter",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            if(a.size()<2) vm->raise_native_exception("TypeError","filter expected 2 arguments");
+            std::vector<VMVal> out;
+            for(auto& v:vm->iter_items(a[1])){
+                bool keep;
+                if(a[0].type==VMType::NONE) keep=v.is_truthy();
+                else { std::vector<VMVal> ca={v}; keep=vm->truthy(vm->vm_call(a[0],ca,std::nullopt)); }
+                if(keep) out.push_back(v);
+            }
+            return VMVal::make_list(std::move(out));
+        });
+        def("any",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            if(a.empty()) vm->raise_native_exception("TypeError","any() takes exactly one argument (0 given)");
+            for(auto& v:vm->iter_items(a[0])) if(vm->truthy(v)) return VMVal::make_bool(true);
+            return VMVal::make_bool(false);
+        });
+        def("all",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            if(a.empty()) vm->raise_native_exception("TypeError","all() takes exactly one argument (0 given)");
+            for(auto& v:vm->iter_items(a[0])) if(!vm->truthy(v)) return VMVal::make_bool(false);
+            return VMVal::make_bool(true);
+        });
+        def("bool",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            return VMVal::make_bool(!a.empty()&&vm->truthy(a[0]));
+        });
+        def("type",[](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            if(a.empty())return VMVal::make_str("none");
+            switch(a[0].type){
+            case VMType::NONE:return VMVal::make_str("none");
+            case VMType::BOOL:return VMVal::make_str("bool");
+            case VMType::INT:return VMVal::make_str("int");
+            case VMType::FLOAT:return VMVal::make_str("float");
+            case VMType::STRING:return VMVal::make_str("string");  // as the interpreter reports it
+            case VMType::LIST:return VMVal::make_str(a[0].b?"tuple":"list");
+            case VMType::MAP:return VMVal::make_str("map");   // as the interpreter reports it
+            case VMType::FUNCTION:return VMVal::make_str("function");
+            case VMType::NATIVE:return VMVal::make_str("builtin");
+            case VMType::CLASS:return VMVal::make_str("class");
+            case VMType::INSTANCE:return VMVal::make_str(a[0].class_name);
+            case VMType::GENERATOR:case VMType::ITERATOR:return VMVal::make_str("generator");
+            default:return VMVal::make_str("unknown");}});
+        globals_["typeof"]=globals_["type"];
+    }
+    // Truthiness with __bool__ / __len__ on instances.
+    bool truthy(const VMVal& v) {
+        if(v.type==VMType::INSTANCE){
+            VMVal r=call_dunder(v,"__bool__",{});
+            if(r.type!=VMType::NONE) return r.is_truthy();
+            r=call_dunder(v,"__len__",{});
+            if(r.type!=VMType::NONE) return r.is_truthy();
+            return true;
+        }
+        return v.is_truthy();
+    }
+
     void register_builtins() {
                 // property() builtin — create a property descriptor
         globals_["property"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             VMVal desc; desc.type=VMType::MAP;
-            desc.map=std::make_shared<std::unordered_map<std::string,VMVal>>();
+            desc.map=std::make_shared<VMMap>();
             if(!a.empty()) (*desc.map)["__get__"]=a[0];
             (*desc.map)["__is_property__"]=VMVal::make_bool(true);
             // Add .setter(fn) method to the descriptor so @prop.setter works:
             (*desc.map)["setter"]=VMVal::make_native([desc](std::vector<VMVal>& b) mutable ->VMVal{
                 VMVal d2; d2.type=VMType::MAP;
-                d2.map=std::make_shared<std::unordered_map<std::string,VMVal>>(*desc.map);
+                d2.map=std::make_shared<VMMap>(*desc.map);
                 if(!b.empty()) (*d2.map)["__set__"]=b[0];
                 (*d2.map)["setter"]=(*desc.map)["setter"]; // keep setter method
                 return d2;
@@ -5113,14 +5942,7 @@ private:
         // has taken its final binding (list/dict are each registered twice;
         // this reads whichever registration actually won), rather than at
         // each individual registration site.
-        for(auto& nm_canon : std::vector<std::pair<std::string,std::string>>{
-                {"int","int"},{"float","float"},{"bool","bool"},{"str","str"},
-                {"string","str"},{"list","list"},{"tuple","list"},
-                {"dict","map"},{"set","list"}}){
-            auto git=globals_.find(nm_canon.first);
-            if(git!=globals_.end()&&git->second.type==VMType::NATIVE)
-                git->second.class_name=nm_canon.second;
-        }
+        tag_type_builtins();
         globals_["isinstance"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()<2) return VMVal::make_bool(false);
             VMVal& obj=a[0]; VMVal& cls=a[1];
@@ -5136,11 +5958,12 @@ private:
                 // Only the class-instance case below was handled, so this
                 // always read false; mirrors the interpreter's alias set
                 // (dispatch_tensor's isinstance in src/builtins/tensor.cpp).
-                if(cls_name=="int"||cls_name=="integer") return VMVal::make_bool(obj.type==VMType::INT);
+                if(cls_name=="int"||cls_name=="integer") return VMVal::make_bool(obj.type==VMType::INT||obj.type==VMType::BOOL);
                 if(cls_name=="float"||cls_name=="double") return VMVal::make_bool(obj.type==VMType::FLOAT);
                 if(cls_name=="bool"||cls_name=="boolean") return VMVal::make_bool(obj.type==VMType::BOOL);
                 if(cls_name=="str"||cls_name=="string") return VMVal::make_bool(obj.type==VMType::STRING);
-                if(cls_name=="list"||cls_name=="array") return VMVal::make_bool(obj.type==VMType::LIST);
+                if(cls_name=="list"||cls_name=="array") return VMVal::make_bool(obj.type==VMType::LIST&&!obj.b);
+                if(cls_name=="tuple") return VMVal::make_bool(obj.type==VMType::LIST&&obj.b);
                 if(cls_name=="map"||cls_name=="dict") return VMVal::make_bool(obj.type==VMType::MAP);
                 if(cls_name=="none") return VMVal::make_bool(obj.type==VMType::NONE);
                 if(cls_name=="function") return VMVal::make_bool(obj.type==VMType::FUNCTION||obj.type==VMType::NATIVE);
@@ -5173,7 +5996,7 @@ private:
         // ── Built-in exception classes ────────────────────────────────────────
         auto make_exc_class = [this](const std::string& cname) {
             globals_[cname] = VMVal::make_native([cname](std::vector<VMVal>& a) -> VMVal {
-                auto attrs = std::make_shared<std::unordered_map<std::string,VMVal>>();
+                auto attrs = std::make_shared<VMMap>();
                 std::string msg = a.empty() ? cname : a[0].to_string();
                 (*attrs)["msg"] = VMVal::make_str(msg);
                 (*attrs)["args"] = VMVal::make_list(a);
@@ -5211,30 +6034,39 @@ private:
         globals_["println"]=globals_["print"];
 
         // ── Map / collection builtins ─────────────────────────────────────
-        globals_["keys"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
+        globals_["keys"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.empty()) return VMVal::make_list();
+            // A dict answers as d.keys() does (typed keys, none values kept,
+            // pairs as tuples), like the interpreter's builtin.
+            if(a[0].type==VMType::MAP&&a[0].map){ std::vector<VMVal> none; return call_map_method(a[0],"keys",none); }
             if((a[0].type==VMType::MAP||a[0].type==VMType::INSTANCE)&&a[0].map){
                 std::vector<VMVal> ks;
                 for(auto& [k,v]:*a[0].map) if(v.type!=VMType::NONE) ks.push_back(VMVal::make_str(k));
                 return VMVal::make_list(std::move(ks));}
             // Not a container: the interpreter returns none here, not [].
             return VMVal::make_none();});
-        globals_["values"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
+        globals_["values"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.empty()) return VMVal::make_list();
+            // A dict answers as d.values() does (typed keys, none values kept,
+            // pairs as tuples), like the interpreter's builtin.
+            if(a[0].type==VMType::MAP&&a[0].map){ std::vector<VMVal> none; return call_map_method(a[0],"values",none); }
             if((a[0].type==VMType::MAP||a[0].type==VMType::INSTANCE)&&a[0].map){
                 std::vector<VMVal> vs;
                 for(auto& [k,v]:*a[0].map) if(v.type!=VMType::NONE) vs.push_back(v);
                 return VMVal::make_list(std::move(vs));}
             // Not a container: the interpreter returns none here, not [].
             return VMVal::make_none();});
-        globals_["items"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
+        globals_["items"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.empty()) return VMVal::make_list();
+            // A dict answers as d.items() does (typed keys, none values kept,
+            // pairs as tuples), like the interpreter's builtin.
+            if(a[0].type==VMType::MAP&&a[0].map){ std::vector<VMVal> none; return call_map_method(a[0],"items",none); }
             if((a[0].type==VMType::MAP||a[0].type==VMType::INSTANCE)&&a[0].map){
                 std::vector<VMVal> its;
                 for(auto& [k,v]:*a[0].map){
                     if(v.type==VMType::NONE) continue;
                     std::vector<VMVal> pair={VMVal::make_str(k),v};
-                    its.push_back(VMVal::make_list(std::move(pair)));}
+                    its.push_back(VMVal::make_tuple(std::move(pair)));}
                 return VMVal::make_list(std::move(its));}
             // Not a container: the interpreter returns none here, not [].
             return VMVal::make_none();});
@@ -5353,10 +6185,14 @@ private:
             if(raw) return VMVal::make_int((int64_t)(raw & 0x7fffffffffffffffULL));
             uint64_t h=std::hash<std::string>{}(v.to_string()+"|"+std::to_string((int)v.type));
             return VMVal::make_int((int64_t)(h & 0x7fffffffffffffffULL));});
-        globals_["hash"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty()) return VMVal::make_int(0);
-            uint64_t h=std::hash<std::string>{}(a[0].to_string());
-            return VMVal::make_int((int64_t)(h & 0x7fffffffffffffffULL));});
+        // As the interpreter's (pycore.cpp B_HASH): nypy::hash_of_key.
+        globals_["hash"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.empty()) raise_native_exception("TypeError","hash() takes exactly one argument (0 given)");
+            if(a[0].type==VMType::INSTANCE){
+                VMVal h=call_dunder(a[0],"__hash__",{});
+                if(h.type!=VMType::NONE) return h;
+            }
+            return VMVal::make_int(nypy::hash_of_key(vkey(a[0])));});
         globals_["random"]=VMVal::make_native([](std::vector<VMVal>&)->VMVal{return VMVal::make_float((double)rand()/(double)RAND_MAX);});
         globals_["randint"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             int64_t lo=a.size()>0?(a[0].type==VMType::INT?a[0].i:(int64_t)to_d(a[0])):0;
@@ -5560,6 +6396,7 @@ private:
         case Op::LOAD_SUBSCR:  return "LOAD_SUBSCR";
         case Op::STORE_SUBSCR: return "STORE_SUBSCR";
         case Op::BUILD_LIST:   return "BUILD_LIST";
+        case Op::BUILD_TUPLE:  return "BUILD_TUPLE";
         case Op::BUILD_MAP:    return "BUILD_MAP";
         case Op::DUP_TOP:      return "DUP_TOP";
         case Op::POP_TOP:      return "POP_TOP";

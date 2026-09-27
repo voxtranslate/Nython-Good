@@ -15,7 +15,7 @@ func mul_func(a, b): return a * b
 t("func_keyword", mul_func(3, 4), 12)
 
 function div_function(a, b): return a / b
-t("function_keyword", div_function(10, 2), 5)
+t("function_keyword", div_function(10, 2), 5.0)
 
 def add_def(a, b): return a + b
 t("def_keyword", add_def(5, 6), 11)
@@ -230,7 +230,7 @@ print "=== STRING OPS ==="
 t("upper", "hello".upper(), "HELLO")
 t("lower", "HELLO".lower(), "hello")
 t("strip", "  hi  ".strip(), "hi")
-t("split", str("a,b,c".split(",")), "[a, b, c]")
+t("split", str("a,b,c".split(",")), "['a', 'b', 'c']")
 t("replace", "hello".replace("l", "r"), "herro")
 t("join", "-".join(["a", "b", "c"]), "a-b-c")
 t("startswith", "nython".startswith("ny"), true)
@@ -247,8 +247,8 @@ t("max", max(3, 1, 4, 1, 5), 5)
 t("sum", sum([1, 2, 3, 4, 5]), 15)
 t("sorted", str(sorted([3, 1, 4, 1, 5])), "[1, 1, 3, 4, 5]")
 t("reversed", str(reversed([1, 2, 3])), "[3, 2, 1]")
-t("enumerate_b", str(enumerate(["a", "b"])), "[[0, a], [1, b]]")
-t("zip_b", str(zip([1, 2], [3, 4])), "[[1, 3], [2, 4]]")
+t("enumerate_b", str(enumerate(["a", "b"])), "[(0, 'a'), (1, 'b')]")
+t("zip_b", str(zip([1, 2], [3, 4])), "[(1, 3), (2, 4)]")
 t("chr_ord", chr(ord("A")), "A")
 
 print ""

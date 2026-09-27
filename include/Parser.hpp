@@ -188,6 +188,8 @@ private:
     node_ptr postfix();
     node_ptr primary();
     node_ptr atom();
+    // f"..." / `...${}...` interpolation: literal parts and fields, joined by +
+    node_ptr fstringNode(const Token& str_tok, const std::string& raw);
 
     // Statement parsing
     node_ptr statement();

@@ -163,7 +163,7 @@ var unique = Set(words)
 t("set_len", len(unique), 3)
 
 var d = {"name": "Nython", "ver": "0.3"}
-t("keys", str(sorted(d.keys())), "[name, ver]")
+t("keys", str(sorted(d.keys())), "['name', 'ver']")
 t("values", len(d.values()), 2)
 t("items", len(d.items()), 2)
 

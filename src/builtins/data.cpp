@@ -137,8 +137,7 @@ Value dispatch_data(NythonExecutor& E,
                 if (v.isNone() || v.type == ValueType::UNDEFINED) { out += "null"; return; }
                 if (v.type == ValueType::BOOLEAN) { out += v.value.b ? "true" : "false"; return; }
                 if (v.type == ValueType::INTEGER) {
-                    std::string digits = v.value.i.toString(10);
-                    out += digits.empty() ? "0" : digits;
+                    out += intToString(v.value.i);
                     return;
                 }
                 if (v.type == ValueType::DOUBLE) { out += nyjson::number((double)v.value.d); return; }
@@ -159,13 +158,14 @@ Value dispatch_data(NythonExecutor& E,
                             out += "]";
                             return;
                         }
-                        // Sorted keys: the container is a hash map, so its own
-                        // order is arbitrary and would differ run to run.
-                        std::vector<std::string> keys;
+                        // Sorted keys (as always; the VM does the same). A key
+                        // is written as its str() - 1 becomes "1", as in
+                        // Python's json.
+                        std::vector<std::pair<std::string, std::string>> keys;
                         for (auto& kv : *cont->container) {
                             const std::string& k = kv.first;
                             if (k == "__len__" || k == "__type__" || k == "__name__" || k == "__class__") continue;
-                            keys.push_back(k);
+                            keys.push_back({nypy::key_kind(k) == nypy::K_STR ? nypy::key_payload(k) : E.strOf(E.keyValue(k), ctx), k});
                         }
                         std::sort(keys.begin(), keys.end());
                         out += "{";
@@ -173,9 +173,9 @@ Value dispatch_data(NythonExecutor& E,
                         for (auto& k : keys) {
                             if (!first) out += ", ";
                             first = false;
-                            nyjson::quote_to(out, k);
+                            nyjson::quote_to(out, k.first);
                             out += ": ";
-                            enc(cont->container->find(k)->second, out, depth + 1);
+                            enc(cont->container->find(k.second)->second, out, depth + 1);
                         }
                         out += "}";
                         return;
@@ -196,7 +196,9 @@ Value dispatch_data(NythonExecutor& E,
                 switch (n.kind) {
                     case nyjson::Node::Null: return NONE_VALUE;
                     case nyjson::Node::Bool: return Value(n.b);
-                    case nyjson::Node::Int: return Value(bigint((long long)n.i));
+                    case nyjson::Node::Int:
+                        if (!n.s.empty()) { nypy::BigInt big; if (nypy::BigInt::parse(n.s, 10, big)) return intValue(big); }
+                        return Value(bigint((long long)n.i));
                     case nyjson::Node::Float: return Value(n.d);
                     case nyjson::Node::Str: return makeStringValue(n.s);
                     case nyjson::Node::Arr: {
@@ -208,7 +210,7 @@ Value dispatch_data(NythonExecutor& E,
                     }
                     case nyjson::Node::Obj: {
                         auto* obj = new Object((Runnable*)runner, "map", Type::LIST);
-                        for (auto& f : n.fields) obj->set(f.first, conv(f.second));
+                        for (auto& f : n.fields) (*obj->container)[nypy::key_of_str(f.first)] = conv(f.second);
                         return Value((Collectable*)obj);
                     }
                 }
@@ -420,38 +422,6 @@ Value dispatch_data(NythonExecutor& E,
             return Value((Collectable*)result);
         }
 
-        if (name == "any") {
-            if (args.size() >= 1 && args[0].isCollectable()) {
-                auto* cont = dynamic_cast<Container*>(args[0].value.gc);
-                if (cont && cont->container) {
-                    auto li = cont->container->find("__len__");
-                    if (li != cont->container->end()) {
-                        int len = (int)bigint_to_i64(li->second.value.i);
-                        for (int i = 0; i < len; i++) {
-                            auto it = cont->container->find(std::to_string(i));
-                            if (it != cont->container->end() && isTruthy(it->second)) return Value(true);
-                        }
-                    }
-                }
-            }
-            return Value(false);
-        }
-        if (name == "all") {
-            if (args.size() >= 1 && args[0].isCollectable()) {
-                auto* cont = dynamic_cast<Container*>(args[0].value.gc);
-                if (cont && cont->container) {
-                    auto li = cont->container->find("__len__");
-                    if (li != cont->container->end()) {
-                        int len = (int)bigint_to_i64(li->second.value.i);
-                        for (int i = 0; i < len; i++) {
-                            auto it = cont->container->find(std::to_string(i));
-                            if (it != cont->container->end() && !isTruthy(it->second)) return Value(false);
-                        }
-                    }
-                }
-            }
-            return Value(true);
-        }
         if (name == "exit" || name == "quit") {
             int code = (args.size() >= 1) ? (int)bigint_to_i64(args[0].value.i) : 0;
             std::exit(code);
@@ -459,20 +429,6 @@ Value dispatch_data(NythonExecutor& E,
         }
         // (An `open` returning a map lived here; io.cpp is dispatched first,
         // so it never ran. open() is now the prelude's file object.)
-        if (name == "chr") {
-            if (args.size() >= 1) {
-                int code = (int)bigint_to_i64(args[0].value.i);
-                return makeStringValue(std::string(1, static_cast<char>(code)));
-            }
-            return makeStringValue("");
-        }
-        if (name == "ord") {
-            if (args.size() >= 1) {
-                std::string s = getStringValue(args[0]);
-                if (!s.empty()) return Value((int)(unsigned char)s[0]);
-            }
-            return Value(0);
-        }
     return UNDEFINED_VALUE;  // not handled by this module
 }
 
