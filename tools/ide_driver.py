@@ -40,10 +40,16 @@ class DriverError(RuntimeError):
 
 class IDE:
     def __init__(self, binary=None, args=None, cwd=None, env=None, script=None, boot_frames=12):
-        self.binary = binary or os.path.join(REPO, "build", "nython")
+        # NY_IDE_BINARY picks the build to drive (build-sdl/nython for the
+        # real-SDL3 build); NY_IDE_ENV adds "K=V K=V" to its environment,
+        # e.g. "SDL_VIDEODRIVER=x11 DISPLAY=:99".
+        self.binary = binary or os.environ.get("NY_IDE_BINARY") or os.path.join(REPO, "build", "nython")
+        if not os.path.isabs(self.binary):
+            self.binary = os.path.join(REPO, self.binary)
         self.args = args if args is not None else ["--ide"]
         self.cwd = cwd or REPO
-        self.extra_env = env or {}
+        self.extra_env = dict(kv.split("=", 1) for kv in os.environ.get("NY_IDE_ENV", "").split() if "=" in kv)
+        self.extra_env.update(env or {})
         self.script = script
         self.boot_frames = boot_frames
         self.tmp = None
@@ -109,19 +115,36 @@ class IDE:
             shutil.rmtree(self.tmp, ignore_errors=True)
 
     # ── raw input ─────────────────────────────────────────────────────────
-    # Pointer positions in the stub script are in window points, as SDL
+    # Pointer positions in the event script are in window points, as SDL
     # reports them; frames are in pixels. On a high-pixel-density window
-    # (NY_STUB_DPI_SCALE, and the IDE opts in) they differ, so coordinates
-    # taken from a frame are divided by the scale on the way out.
+    # (a Retina/scaled display, NY_STUB_DPI_SCALE on the stub, and the IDE
+    # opts in) they differ, so coordinates taken from a frame are divided by
+    # the density the last frame reported on the way out.
     POINTER_CMDS = {"move": 2, "down": 2, "up": 2, "click": 2, "dblclick": 2, "drag": 4, "wheel": 2}
 
     def _scale(self):
+        if self.last is not None:
+            return self.last.density
         v = self.extra_env.get("NY_STUB_DPI_SCALE", os.environ.get("NY_STUB_DPI_SCALE", ""))
         try:
             f = float(v)
         except ValueError:
             return 1.0
         return f if f > 0 else 1.0
+
+    @property
+    def ui_scale(self):
+        """The display scale the IDE multiplies its metrics by (1 normally)."""
+        return self.last.scale if self.last is not None else 1.0
+
+    def dp(self, v):
+        """A scale-1 distance in the IDE's pixels, as the IDE's own dp()."""
+        return int(float(v) * self.ui_scale + 0.5)
+
+    def region(self, x, y, w, h):
+        """A scale-1 region (x, y, w, h) in the current frame's pixels."""
+        s = self.ui_scale
+        return (x * s, y * s, w * s, h * s)
 
     def _to_points(self, ln):
         sc = self._scale()
@@ -176,7 +199,11 @@ class IDE:
         self.send("type " + esc)
 
     def resize(self, w, h):
-        self.send("resize %d %d" % (w, h))
+        """Resize to what a scale-1 window of w x h would show: on a display
+        scaled by S the window is made S times larger, so the IDE lays out
+        the same workbench (window points = w * scale / density)."""
+        k = self.ui_scale / self._scale()
+        self.send("resize %d %d" % (int(w * k + 0.5), int(h * k + 0.5)))
 
     # ── observation ───────────────────────────────────────────────────────
     def snap(self, timeout=30, settle=3):

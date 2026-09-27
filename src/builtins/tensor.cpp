@@ -740,6 +740,9 @@ Value dispatch_tensor(NythonExecutor& E,
         if (name == "relu" || name == "sigmoid" || name == "tanh_fn") {
             if (!args.empty()) {
                 double x = args[0].type == ValueType::DOUBLE ? static_cast<double>(args[0].value.d) : static_cast<double>(bigint_to_i64(args[0].value.i));
+                // relu is closed over the integers: relu(-5) is 0, relu(3) is 3.
+                if (name == "relu" && args[0].type == ValueType::INTEGER)
+                    return bigint_to_i64(args[0].value.i) > 0 ? args[0] : Value((long int)0);
                 if (name == "relu") return Value(x > 0 ? x : 0.0);
                 if (name == "sigmoid") return Value(1.0 / (1.0 + std::exp(-x)));
                 if (name == "tanh_fn") return Value(std::tanh(x));

@@ -127,7 +127,7 @@ def bfs(graph, start):
     return visited
 
 var g = {"A": ["B", "C"], "B": ["D"], "C": ["D", "E"], "D": [], "E": []}
-t("bfs", str(bfs(g, "A")), "[A, B, C, D, E]")
+t("bfs", str(bfs(g, "A")), "['A', 'B', 'C', 'D', 'E']")
 
 print "=== 10. GENERIC SORT ==="
 def insertion_sort(lst):

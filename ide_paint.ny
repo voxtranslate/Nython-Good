@@ -250,8 +250,8 @@ class IDEPaint(IDEOps):
         self.content_y = self.TITLE_H
         self.status_y = H - self.STATUS_H
         var ch = self.status_y - self.content_y
-        if ch < 120:
-            ch = 120
+        if ch < self.dp(120):
+            ch = self.dp(120)
         self.content_h = ch
         self.side_x = self.ACT_W
         # Responsive ladder. Each step has two thresholds (hysteresis), so a
@@ -274,8 +274,8 @@ class IDEPaint(IDEOps):
         if self.side_overlay:
             if sw > W - self.ACT_W - self.dp(40):
                 sw = W - self.ACT_W - self.dp(40)
-        elif sw > W - self.ACT_W - 320:
-            sw = W - self.ACT_W - 320
+        elif sw > W - self.ACT_W - self.dp(320):
+            sw = W - self.ACT_W - self.dp(320)
         if sw < 0:
             sw = 0
         self.side_w = 0
@@ -291,11 +291,11 @@ class IDEPaint(IDEOps):
             self.col_w = self.dp(120)
         var ph = int(float(ch) * self.panel_ratio)
         if self.panel_max:
-            ph = ch - self.TAB_H - 40
-        if ph < 100:
-            ph = 100
-        if ph > ch - self.TAB_H - 60:
-            ph = ch - self.TAB_H - 60
+            ph = ch - self.TAB_H - self.dp(40)
+        if ph < self.dp(100):
+            ph = self.dp(100)
+        if ph > ch - self.TAB_H - self.dp(60):
+            ph = ch - self.TAB_H - self.dp(60)
         if ph < 0:
             ph = 0
         self.panel_h = int(float(ph) * self.panel_anim)
@@ -305,15 +305,15 @@ class IDEPaint(IDEOps):
         self.ed_x = self.col_x
         self.ed_y = self.crumb_y + self.CRUMB_H
         self.ed_h = self.panel_y - self.ed_y
-        if self.ed_h < 40:
-            self.ed_h = 40
+        if self.ed_h < self.dp(40):
+            self.ed_h = self.dp(40)
         self.mm_w = 0
         if self.minimap_on and self.col_w > self.dp(560):
             self.mm_w = self.MINIMAP_W
         self.vs_w = self.dp(14)
         self.ed_w = self.col_w - self.mm_w - self.vs_w
-        self.workshop.set_pos(self.col_x + 10, self.panel_y + self.PANEL_HEAD + 6)
-        self.workshop.set_size(self.col_w - 20, self.panel_h - self.PANEL_HEAD - 12)
+        self.workshop.set_pos(self.col_x + self.dp(10), self.panel_y + self.PANEL_HEAD + self.dp(6))
+        self.workshop.set_size(self.col_w - self.dp(20), self.panel_h - self.PANEL_HEAD - self.dp(12))
         self._gutter_calc()
         self._split_layout()
 
@@ -1360,7 +1360,9 @@ class IDEPaint(IDEOps):
         var y0 = self.ed_y
         r.fill_xywh(x, y0, self.mm_w, self.ed_h, th.editor_bg)
         var cols = self._mm_colors()
-        var ph = 2
+        # One source line is 2 dp high and a character 1 dp wide, as VS Code's
+        # minimap, so it shows the same span of the file at any display scale.
+        var ph = self.MM_PH
         var cap = int(self.ed_h / ph)
         var n = b.line_count
         # Scroll the minimap with the editor once the file is taller than it.
@@ -1381,7 +1383,7 @@ class IDEPaint(IDEOps):
                 var w = ln - ind
                 if w > 60:
                     w = 60
-                r.fill_xywh(x + self.dp(6) + ind, y0 + i * ph, w, 1, cols[code % 4])
+                r.fill_xywh(x + self.dp(6) + int(ind * self.dpi), y0 + i * ph, int(w * self.dpi + 0.5), self.MM_BAR, cols[code % 4])
             i = i + 1
         var top = int(d.scroll_y / self.LINE_H)
         var vis = self._rows_visible()
@@ -1581,7 +1583,7 @@ class IDEPaint(IDEOps):
         if focused:
             r.rect_xywh(x, y, w, h, th.focus, 1)
         var ty = y + int((h - self.ui_h) / 2)
-        r.clip_xywh(x + 2, y, w - 4, h)
+        r.clip_xywh(x + self.dp(2), y, w - self.dp(4), h)
         var vx = x + self.dp(6)
         if value == "":
             r.text(placeholder, vx, ty, self.f_ui, th.placeholder)

@@ -130,8 +130,27 @@ NY_STUB_AUTOQUIT=120 ./build/nython --ide    # IDE runs and exits cleanly
 ```
 
 `NY_STUB_AUTOQUIT=<n>` makes the stub deliver one quit event after *n* empty
-polls so event loops terminate; `NY_STUB_DPI_SCALE=<f>` fakes a HiDPI display.
-Full detail in `HANDOFF.md`.
+polls so event loops terminate; `NY_STUB_DPI_SCALE=<f>` fakes a HiDPI display,
+following macOS/Wayland's model (`NY_STUB_DPI_MODE=points`, the default) or
+Windows/X11's (`=pixels`). Full detail in `HANDOFF.md`.
+
+### Real SDL3 in a container (round 75)
+
+The stub is not the only option: `tools/build_sdl3.sh` builds the real SDL3,
+SDL3_ttf (with HarfBuzz, as releases are) and SDL3_image into `/opt/sdl3`, and
+the IDE then runs on a real X server, Xvfb, or SDL's offscreen driver - with
+the same scripted-input / frame-capture test harness as the stub
+(`src/builtins/gui_harness.cpp`), so the whole e2e suite runs against it:
+
+```bash
+tools/build_sdl3.sh
+PKG_CONFIG_PATH=/opt/sdl3/lib/pkgconfig make cli BUILD=build-sdl NYTHON_SDL_STUB=0
+PKG_CONFIG_PATH=/opt/sdl3/lib/pkgconfig make     BUILD=build-sdl NYTHON_SDL_STUB=0
+Xvfb :99 -screen 0 1920x1080x24 &
+NY_IDE_BINARY=build-sdl/nython NY_IDE_ENV="SDL_VIDEODRIVER=x11 DISPLAY=:99" python3 tools/ide_e2e.py
+```
+
+`NY_REAL_PIXELS=1` makes each `snap` also write a PNG of the real rendering.
 
 ### Key build flags
 - `-DNYTHON_WITH_IDE=1` (default) — no-arg launch opens IDE; `=0` opens REPL
@@ -244,7 +263,7 @@ These were aligned to match how the IDE calls them:
 | test_vm | 12 | Core VM |
 | test_vm2 | 48 | Core VM |
 | test_vm3 | 27 | Core VM |
-| test_vm4 | 56 | Core VM |
+| test_vm4 | 57 | Core VM |
 | test_vm_extended | 30 | Core VM |
 | test_vm_stress | 37 | Core VM |
 | vm_audit22 | 88 | Advanced patterns |
@@ -278,12 +297,16 @@ These were aligned to match how the IDE calls them:
 | vm_audit51 | 52 | native editor text services (symbols, syntax check, diff, search, folding, format, completion index) |
 | vm_audit60 | 284 | Python values and builtins: dicts, ints, formatting, operators, tuples, strings (same results under python3) |
 | vm_audit61 | 33 | Nython-only value behaviour |
+| vm_audit62 | 29 | tensor type promotion: integer results for integer-closed ops (NumPy's rule), floats otherwise, exact 64-bit sums |
 | vm_audit52 | — | exceptions as objects: typed except across calls, finally/raise, with protocol, NameError/AttributeError/TypeError |
 | vm_audit53 | — | classes: C3 MRO, super(), class bodies, properties, the operator and object protocols |
 | vm_audit54 | — | comprehensions, match patterns, walrus, unpacking, generators, calls (`**d`, arity) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
-Run all: `for t in examples/test_*.ny examples/vm_audit*.ny; do ./build/nython-cli "$t"; done`
+Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
+(the older feature suites, stdlib_test/stdlib_v2_test included since round 75),
+`examples/vm_audit*.ny` and `examples/gui_tests/test_*.ny`, on both engines,
+failing on "N failed" output as well as on the exit code.
 
 ## Language changes since this file was written
 
@@ -681,6 +704,24 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   nested unpacking, several `for`/`if` clauses in comprehensions, `@`.
 - Divergence battery (286 programs, interpreter / VM / python3 all agree):
   87 at f284623 → 262 now.
+
+## Round 75: real SDL3 and HiDPI (see `HANDOFF.md` §0n)
+
+- **Real SDL3** builds (`tools/build_sdl3.sh`, `make BUILD=build-sdl
+  NYTHON_SDL_STUB=0`) and passes the whole e2e suite on X11, at 1× and at
+  200%; the test harness gives the real backend the stub's event scripts and
+  display-list capture, plus real-pixel PNGs.
+- **HiDPI, both of SDL3's models**: windows can be sized in layout units
+  (`Window.layout_units`, `gui_create_window` flag 16) - the same workbench on
+  a 200% Windows/X11 panel (twice the points) and a Retina Mac (twice the
+  pixels per point). Draw at the window's display scale (`Window.scale()`,
+  predicted by `gui_display_scale() * gui_display_density()`), not the
+  content scale. `"scale"` events (`Window.on_scale`) report a move to a
+  monitor of another scale; the IDE rebuilds its metrics and fonts.
+- The e2e suite is scale-independent (`R()`/`D()` in `tools/ide_e2e.py`) and
+  passes in full at 2× in both stub models.
+- Legacy flat tensor ops follow NumPy's promotion rule: integer inputs stay
+  integers through `+ - *`, dot, sum, max/min, abs/neg/sign, `relu`.
 
 ## Transcripts
 

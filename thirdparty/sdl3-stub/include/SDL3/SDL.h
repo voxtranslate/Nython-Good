@@ -152,6 +152,19 @@ SDL_DisplayID SDL_GetPrimaryDisplay(void);
 float SDL_GetDisplayContentScale(SDL_DisplayID displayID);
 bool SDL_GetDisplayUsableBounds(SDL_DisplayID displayID, SDL_Rect* rect);
 bool SDL_GetDisplayBounds(SDL_DisplayID displayID, SDL_Rect* rect);
+typedef struct SDL_DisplayMode {
+    SDL_DisplayID displayID;
+    Uint32 format;
+    int w, h;
+    float pixel_density;
+    float refresh_rate;
+    int refresh_rate_numerator, refresh_rate_denominator;
+    void* internal;
+} SDL_DisplayMode;
+const SDL_DisplayMode* SDL_GetDesktopDisplayMode(SDL_DisplayID displayID);
+SDL_DisplayID SDL_GetDisplayForWindow(SDL_Window* window);
+float SDL_GetWindowPixelDensity(SDL_Window* window);
+bool SDL_SyncWindow(SDL_Window* window);
 
 // ── Cursors ──────────────────────────────────────────────────────────────
 typedef enum SDL_SystemCursor {

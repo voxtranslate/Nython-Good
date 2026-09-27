@@ -1300,7 +1300,7 @@ def gui_dispatch(children, count, event):
 
 # Event names by the code gui_next_event returns (the backend's kEventTypes,
 # same order); the wheel is "scroll", as widgets expect.
-var GUI_EVENT_TYPES = ["", "quit", "resize", "expose", "focusgained", "focuslost", "mouseleave", "mousemove", "mousedown", "mouseup", "scroll", "keydown", "keyup", "textinput", "textedit", "dropfile", "droptext", "dialog"]
+var GUI_EVENT_TYPES = ["", "quit", "resize", "expose", "focusgained", "focuslost", "mouseleave", "mousemove", "mousedown", "mouseup", "scroll", "keydown", "keyup", "textinput", "textedit", "dropfile", "droptext", "dialog", "scale"]
 
 # ─── Window ───────────────────────────────────────────────────────────────────
 
@@ -1319,6 +1319,7 @@ class Window:
         self.theme = Theme()
         self._on_close = none
         self._on_resize = none
+        self._on_scale = none
         self.resizable = true
         self.borderless = false
         self.always_on_top = false
@@ -1328,6 +1329,12 @@ class Window:
         # sizes by. Off, the system scales the window up (blurry, but the same
         # size as on a standard screen).
         self.high_dpi = false
+        # Sizes (width/height, set_min_size, set_size) in layout units: the
+        # window is made that many units big on any display - twice the points
+        # on a 200% Windows/X11 panel, the same points on a Retina Mac - so an
+        # application that draws at scale() px per unit looks the same on
+        # both. Events and drawing stay in pixels.
+        self.layout_units = false
         self.min_w = 0
         self.min_h = 0
         # Longest the loop sleeps while nothing changes. Input still wakes it
@@ -1357,6 +1364,8 @@ class Window:
             flags = flags + 4
         if self.high_dpi:
             flags = flags + 8
+        if self.layout_units:
+            flags = flags + 16
         self._handle = gui_create_window(self.title, self.x, self.y, self.width, self.height, flags)
         if self._handle == none:
             return false
@@ -1433,6 +1442,12 @@ class Window:
     def on_resize(self, fn):
         self._on_resize = fn
 
+    # fn(scale): the window's display scale changed (moved to a monitor of
+    # another scale, or the system setting changed). A resize follows when
+    # the pixel size changes with it.
+    def on_scale(self, fn):
+        self._on_scale = fn
+
     # A backend event map (gui_poll_events / gui_wait_events) handled as run()
     # handles an event: quit, resize, then the overlay and the widget tree.
     def _process_event(self, raw_event):
@@ -1451,6 +1466,10 @@ class Window:
             self.running = false
             if self._on_close != none:
                 self._on_close()
+            return
+        if etype == "scale":
+            if self._on_scale != none:
+                self._on_scale(ev.dx)
             return
         if etype == "resize":
             self.width = ev.w
@@ -1540,7 +1559,7 @@ class Window:
             ev.text = gui_event_get("text")
         else:
             ev.text = ""
-        if code == 10:
+        if code == 10 or code == 18:
             ev.dx = gui_event_get("dx")
             ev.dy = gui_event_get("dy")
         else:
