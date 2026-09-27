@@ -1949,6 +1949,17 @@ private:
         const auto& env=call_stack_[top].closure_env;
         return env && call_stack_[i].closure_env.get()==env.get();
     }
+    // Whether `n` names anything a LOAD_NAME can find (a variable in a
+    // visible scope, a global, or an interpreter builtin).
+    bool name_bound(const std::string& n) {
+        for(int i=(int)call_stack_.size()-1;i>=0;i--){
+            if(!frame_visible(i)) continue;
+            const auto& f=call_stack_[i];
+            if(f.locals.count(n) || (f.closure_env && f.closure_env->count(n))) return true;
+        }
+        if(globals_.count(n)) return true;
+        return bridge_exists() && bridge_exists()(n);
+    }
     VMVal load_var(const std::string& n) {
         for(int i=(int)call_stack_.size()-1;i>=0;i--){
             if(!frame_visible(i)) continue;
@@ -2745,7 +2756,14 @@ private:
             case Op::HALT: return VMVal::make_none();
 
             case Op::LOAD_CONST:  push(fr.code->constants[ins.arg]); break;
-            case Op::LOAD_NAME:   push(load_var(fr.code->names[ins.arg])); break;
+            case Op::LOAD_NAME: {
+                // Reading a name bound nowhere raises NameError (it read none).
+                const std::string& n=fr.code->names[ins.arg];
+                VMVal v=load_var(n);
+                if(v.type==VMType::NONE && !name_bound(n))
+                    throw_exception(make_exception("NameError",{VMVal::make_str("name '"+n+"' is not defined")}));
+                push(std::move(v)); break;
+            }
             case Op::STORE_NAME: {
                 // A class body binds in the class namespace, always.
                 if(fr.code->is_class){ fr.locals[fr.code->names[ins.arg]]=pop(); break; }

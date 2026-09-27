@@ -817,7 +817,29 @@ public:   // NythonExecutor is a struct: members default to public
             func_names[nullptr] = "__builtin__:" + vn->name; // temporary, overwritten each call
             return v;
         }
+        // A name bound nowhere: NameError (it read as undefined and the
+        // program carried on). Bound-to-undefined (`x = undefined`) and names
+        // that resolve by another route (a class or function an imported
+        // module registered) are not errors.
+        if (!ctx->hasByName(vn->name) && !knownName(vn->name)) {
+            std::string hint = suggestName(vn->name);
+            if (!hint.empty()) hint = "  (did you mean '" + hint + "'?)";
+            throw std::string("__exc__:NameError:name '" + vn->name + "' is not defined" + hint);
+        }
         return found;
+    }
+    // A function, class or builtin registered under this name.
+    bool knownName(const std::string& called) {
+        if (builtin_set.count(called)) return true;
+        for (auto& kv : func_names) {
+            const std::string& n = kv.second;
+            if (n == called
+                || (n.rfind("__func__:", 0) == 0  && n.compare(9, std::string::npos, called) == 0)
+                || (n.rfind("__class__:", 0) == 0 && n.compare(10, std::string::npos, called) == 0)
+                || (n.rfind("__builtin__:", 0) == 0 && n.compare(12, std::string::npos, called) == 0))
+                return true;
+        }
+        return false;
     }
 
     Value evalVarDecl(node_ptr node, Context* ctx) {
@@ -1235,7 +1257,15 @@ public:   // NythonExecutor is a struct: members default to public
         }
 
         Value lv = evalNode(bn->left, ctx);
-        Value rv = evalNode(bn->right, ctx);
+        Value rv;
+        // `x is Integer`: the right operand of is / instanceof may be a type
+        // word bound to nothing (evalIsOp reads it from the node); reading it
+        // as a variable would raise NameError.
+        if ((bn->op == "is" || bn->op == "is not" || bn->op == "instanceof") && bn->right
+            && bn->right->type() == NodeType::VARIABLE && !ctx->hasByName(bn->right->value())
+            && !knownName(bn->right->value()))
+            rv = UNDEFINED_VALUE;
+        else rv = evalNode(bn->right, ctx);
         return evalBinaryOperands(bn, lv, rv, ctx);
     }
     Value evalBinaryOperands(std::shared_ptr<BinaryNode> bn, Value lv, Value rv, Context* ctx) {
