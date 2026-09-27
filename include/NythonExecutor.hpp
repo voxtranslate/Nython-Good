@@ -7482,47 +7482,10 @@ public:
             if (auto* c = dynamic_cast<Container*>(lst.value.gc)) (*c->container)["__set__"] = Value(true);
             out = lst; return true;
         }
-        if (name != "sorted" && name != "min" && name != "max" && name != "sum") return false;
-        std::vector<Value> items;
-        bool multi = (name == "min" || name == "max") && args.size() >= 2 && !isFunctionValue(args[1]);
-        if (multi) items = args;
-        else items = listItems(args[0]);
-        bool any_inst = false;
-        for (auto& v : items) if (isInstanceValue(v)) { any_inst = true; break; }
-        Value key_fn = NONE_VALUE; bool reverse = false;
-        if (!multi) for (size_t i = 1; i < args.size(); i++) {
-            if (isFunctionValue(args[i])) key_fn = args[i];
-            else if (args[i].type == ValueType::BOOLEAN) reverse = args[i].value.b;
-        }
-        if (name == "sum") {
-            if (!any_inst) return false;
-            Value acc = args.size() >= 2 ? args[1] : Value(0);
-            for (auto& v : items) acc = evalBinaryValues("+", acc, v, ctx);
-            out = acc; return true;
-        }
-        std::vector<Value> keys = items;
-        if (key_fn.type != ValueType::NONE) {
-            for (size_t i = 0; i < items.size(); i++) {
-                std::vector<Value> a{items[i]};
-                keys[i] = callFunctionValue(key_fn, a, ctx);
-            }
-        }
-        bool key_inst = false;
-        for (auto& k : keys) if (isInstanceValue(k)) { key_inst = true; break; }
-        if (!key_inst) return false;
-        std::vector<size_t> idx(items.size());
-        for (size_t i = 0; i < idx.size(); i++) idx[i] = i;
-        auto less = [&](size_t a, size_t b) { return pyLess(keys[a], keys[b], ctx); };
-        if (name == "sorted") {
-            std::stable_sort(idx.begin(), idx.end(), [&](size_t a, size_t b) { return reverse ? less(b, a) : less(a, b); });
-            std::vector<Value> res; for (size_t i : idx) res.push_back(items[i]);
-            out = makeListValue(res); return true;
-        }
-        if (items.empty()) { out = NONE_VALUE; return true; }
-        size_t best = 0;
-        for (size_t i = 1; i < items.size(); i++)
-            if (name == "min" ? less(i, best) : less(best, i)) best = i;
-        out = items[best]; return true;
+        // sorted / min / max / sum over objects: pycore's, which order
+        // through orderValues (__lt__, reflected __gt__) and add through
+        // binaryOp (__add__ / __radd__), with key=, reverse= and default=.
+        return false;
     }
     bool isFunctionValue(const Value& v) {
         if (v.type != ValueType::USERDATA || !v.value.p) return false;
