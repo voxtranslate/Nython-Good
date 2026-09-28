@@ -737,6 +737,8 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   iteratively (a 30k-node list used to crash the VM when dropped).
 - `__del__` runs once, at the next statement/instruction boundary, never
   inside a decrement; cyclic garbage is finalized first (PEP 442).
+- Full collections also run when the heap has doubled since the last one
+  (`mallinfo2`), then `malloc_trim`: memory stays within ~2x what is live.
 - **A pointer kept outside a `Value` must hold a reference** (`nygc::incref`)
   or be erased when the object dies - a freed address is reused at once, and
   a stale entry then describes a different object. Collections run only at

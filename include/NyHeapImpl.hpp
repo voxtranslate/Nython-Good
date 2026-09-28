@@ -93,14 +93,16 @@ inline Inst::~Inst() {
     props = nullptr;
     if (p) nygc::decref(p);
 }
+// The field scope is not tracked on its own (newInstance): its references
+// are reported as the instance's.
 inline void Inst::gc_traverse(GcVisitFn visit, void* arg) {
-    if (props) visit(props, arg);
+    if (props) props->gc_traverse(visit, arg);
 }
 inline void Inst::gc_clear() {
     if (E && executor_alive(E)) E->instance_properties.erase((void*)&tag);
     Context* p = props;
     props = nullptr;
-    if (p) nygc::decref(p);
+    if (p) { p->gc_clear(); nygc::decref(p); }
 }
 inline bool Inst::gc_has_finalizer() {
     return E && executor_alive(E) && E->classHasFinalizer(cls);

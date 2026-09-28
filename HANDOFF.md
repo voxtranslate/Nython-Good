@@ -186,7 +186,10 @@ note; this is the summary and the traps.
   referenced from outside - a C++ local, another thread's stack, a native
   table - and survives with all it reaches; the rest is cleared). Three
   generations, thresholds 700/10/10, collections only at safe points
-  (statement boundaries / instruction boundaries).
+  (statement boundaries / instruction boundaries), plus a full collection
+  whenever the allocator's in-use bytes have doubled since the last one
+  (object counts alone let a few hundred parameter-heavy objects pile up),
+  followed by `malloc_trim`.
 - **Interpreter heap objects** (`include/NyHeap.hpp`): `Str`, `Func`,
   `Bound`, `Inst`, `Weak`. The identity `value.p` points at is a member of
   the owning object, and its destructor erases every side-table entry keyed
@@ -239,11 +242,43 @@ note; this is the summary and the traps.
 
 ### Numbers
 
-HANDOFF_NUMBERS_PLACEHOLDER
+Peak RSS, pre-round-75 build → this one (interpreter / VM, MB):
+
+| | interpreter | VM |
+|---|---|---|
+| 200k container literals (GC_NOTES benchmark) | 598 → 11 | 11 → 11 |
+| 200k string-building iterations | 140 → 11 | 11 → 11 |
+| 100k self-cycles | 473 → 11 | 445 → 12 |
+| 50k closure-over-self instances | 266 → 11 | 107 → 11 |
+| drop a 200k-node linked list | 442 → 419 (live data) | crash → 189 |
+| test_nytorch13 / 14 / 15 / 16 / 17 | 714 / 689 / 1068 / 1114 / 51 → 88 / 182 / 76 / 151 / 46 | 283 / 157 / 233 / 268 / 34 → 55 / 116 / 47 / 86 / 34 |
+
+What remains in test_nytorch14 is live: the test keeps every section's
+models in globals, and a float in an interpreter list is ~280 bytes.
+IDE (`ide_memprobe.py`): idle 0, hover 0, typing 0 KB/key, scroll 0.05.
+
+Speed (callgrind instructions, before → after): calls +2.1% / +0.4%
+(interpreter / VM), method calls -2.2% / +0.8%, fib +2.4% / +1.4%,
+containers +7.1% / +7.1%, instances +9.8% / +5.3% (the last two include
+freeing everything at exit). Full table in `GC_NOTES.md`.
 
 ### Not done
 
-HANDOFF_NOTDONE_PLACEHOLDER
+- Objects used as dict keys are kept until the executor ends
+  (`key_objs_`; the key is a string and carries no reference).
+- The VM collector cannot see references inside natives' `std::function`
+  captures or code-object constants: cycles through them leak (safely).
+- The interpreter's value representation (208-byte `Value`, string-keyed
+  maps for lists) is unchanged, so live data is still large.
+- The old `GarbageCollector.cpp` is still compiled and unused.
+- round75-sem merge: `func_attrs_` needs the three lines in `GC_NOTES.md`
+  ("Remaining limits"); its `bound_members_` keep receivers alive.
+- The lazy-generator branch (round75-gen): a suspended coroutine holds
+  `Value`s on its own stack; they are counted like any other, so nothing
+  has to be registered, but a generator destroyed while suspended must
+  unwind that stack (its `close()`) or its references leak. A generator
+  object that holds values should also report them in `gc_traverse`, or a
+  cycle through a suspended generator is not collected.
 
 ---
 

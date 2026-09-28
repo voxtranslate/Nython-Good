@@ -5946,6 +5946,10 @@ public:
         instance_to_class[ip] = class_ptr;
         func_names[ip] = "__instance__:" + className;
         io->props = new Context(runner, className + "_props", nullptr, nullptr, nullptr);   // adopts the creator's reference
+        // Only the instance refers to its field scope, so the collector sees
+        // the pair as one object (Inst::gc_traverse walks the fields): half
+        // the tracked objects for instance-heavy programs.
+        nygc::untrack(io->props);
         instance_properties[ip] = io->props;
         nygc::track(io);
         return instance;

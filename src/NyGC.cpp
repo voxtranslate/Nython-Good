@@ -11,6 +11,7 @@
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <algorithm>
 #include <limits>
 #include <vector>
 
@@ -37,7 +38,7 @@ List lists[kLists];
 // Allocations minus deallocations since generation 0 was last collected;
 // for generations 1 and 2, collections of the generation below.
 long counts[kGenerations] = {0, 0, 0};
-long thresholds[kGenerations] = {700, 10, 10};
+long thresholds[kGenerations] = {2000, 10, 10};   // CPython 3.13's young threshold
 bool enabled = true;
 bool collecting = false;
 bool in_safe_point = false;
@@ -216,6 +217,7 @@ void release_free_pages() {
 }
 
 size_t heap_after_full = 0;
+size_t heap_factor = 2;
 
 void collect_due() {
     // The generation thresholds count objects, not bytes: a few hundred
@@ -225,10 +227,16 @@ void collect_due() {
     // (263 MB). So a full collection also runs when the heap has doubled
     // since the last one (and grown by 16 MB): memory stays within about
     // twice what is live, and the work is amortised over what was allocated.
+    //
+    // While a program is only building (the full collections find little),
+    // the factor backs off to 4 and 8, so growing a large live structure
+    // does not pay a full collection at every doubling.
     size_t h = heap_bytes();
     if (h && !heap_after_full) heap_after_full = h;
-    if (h > 2 * heap_after_full && h > heap_after_full + ((size_t)16 << 20)) {
-        collect_impl(kGenerations - 1);
+    if (h > heap_factor * heap_after_full && h > heap_after_full + ((size_t)16 << 20)) {
+        long long before = tracked_objects();
+        long n = collect_impl(kGenerations - 1);
+        heap_factor = (n * 8 < before) ? std::min<size_t>(heap_factor * 2, 8) : 2;
         release_free_pages();
         heap_after_full = heap_bytes();
         return;

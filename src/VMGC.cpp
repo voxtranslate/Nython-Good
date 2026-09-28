@@ -31,7 +31,7 @@ std::deque<std::pair<std::string, std::shared_ptr<Map>>>& final_queue() {
 }
 
 long counts[3] = {0, 0, 0};
-long thresholds[3] = {700, 10, 10};
+long thresholds[3] = {2000, 10, 10};
 bool enabled = true;
 bool collecting = false;
 bool in_safe_point = false;
@@ -84,6 +84,38 @@ void clear(const Entry& e) {
     }
 }
 
+// Pointer -> candidate index, open addressing (std::unordered_map allocated
+// a node per candidate and dominated a collection of 50,000 instances).
+struct PtrIndex {
+    std::vector<std::pair<void*, size_t>> slots;
+    size_t mask = 0;
+    explicit PtrIndex(size_t n) {
+        size_t cap = 16;
+        while (cap < n * 2) cap <<= 1;
+        slots.assign(cap, {nullptr, 0});
+        mask = cap - 1;
+    }
+    static size_t hash(void* p) {
+        uint64_t x = (uint64_t)(uintptr_t)p;
+        x ^= x >> 33; x *= 0xff51afd7ed558ccdULL; x ^= x >> 33;
+        return (size_t)x;
+    }
+    void put(void* p, size_t i) {
+        size_t h = hash(p) & mask;
+        while (slots[h].first) h = (h + 1) & mask;
+        slots[h] = {p, i};
+    }
+    // SIZE_MAX when absent.
+    size_t find(void* p) const {
+        size_t h = hash(p) & mask;
+        while (slots[h].first) {
+            if (slots[h].first == p) return slots[h].second;
+            h = (h + 1) & mask;
+        }
+        return (size_t)-1;
+    }
+};
+
 long collect_impl(VirtualMachine& vm, int g) {
     if (collecting) return 0;
     collecting = true;
@@ -111,15 +143,14 @@ long collect_impl(VirtualMachine& vm, int g) {
     cand.clear();
     cand.shrink_to_fit();
     size_t n = alive.size();
-    std::unordered_map<void*, size_t> idx;
-    idx.reserve(n * 2);
-    for (size_t i = 0; i < n; i++) idx.emplace(ents[i].raw, i);
+    PtrIndex idx(n);
+    for (size_t i = 0; i < n; i++) idx.put(ents[i].raw, i);
     std::vector<int64_t> refs(n);
     for (size_t i = 0; i < n; i++) refs[i] = (int64_t)alive[i].use_count() - 1;
     // Trial deletion: subtract the references the candidates hold on each other.
     auto subtract = [&](void* p) {
-        auto it = idx.find(p);
-        if (it != idx.end()) refs[it->second]--;
+        size_t k = idx.find(p);
+        if (k != (size_t)-1) refs[k]--;
     };
     for (size_t i = 0; i < n; i++) traverse(ents[i], subtract);
     // Reachable from outside.
@@ -127,8 +158,8 @@ long collect_impl(VirtualMachine& vm, int g) {
     std::vector<size_t> work;
     for (size_t i = 0; i < n; i++) if (refs[i] > 0) { reach[i] = 1; work.push_back(i); }
     auto mark = [&](void* p) {
-        auto it = idx.find(p);
-        if (it != idx.end() && !reach[it->second]) { reach[it->second] = 1; work.push_back(it->second); }
+        size_t k = idx.find(p);
+        if (k != (size_t)-1 && !reach[k]) { reach[k] = 1; work.push_back(k); }
     };
     while (!work.empty()) {
         size_t i = work.back();
@@ -184,14 +215,18 @@ long collect_impl(VirtualMachine& vm, int g) {
 }
 
 size_t heap_after_full = 0;
+size_t heap_factor = 2;
 
 void collect_due(VirtualMachine& vm) {
     // A full collection also when the heap has doubled since the last one
-    // (NyGC.cpp explains why object counts alone are not enough).
+    // (NyGC.cpp explains why object counts alone are not enough; the factor
+    // backs off to 4 and 8 while collections find little).
     size_t h = nygc::heap_bytes();
     if (h && !heap_after_full) heap_after_full = h;
-    if (h > 2 * heap_after_full && h > heap_after_full + ((size_t)16 << 20)) {
-        collect_impl(vm, 2);
+    if (h > heap_factor * heap_after_full && h > heap_after_full + ((size_t)16 << 20)) {
+        size_t before = gen(0).size() + gen(1).size() + gen(2).size();
+        long n = collect_impl(vm, 2);
+        heap_factor = ((size_t)n * 8 < before) ? std::min<size_t>(heap_factor * 2, 8) : 2;
         nygc::trim_heap();
         heap_after_full = nygc::heap_bytes();
         return;
