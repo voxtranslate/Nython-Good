@@ -440,8 +440,13 @@ check("GraphSAGE takes (in, hidden, out, layers, aggregator)", GraphSAGE(4, 5, 2
 check("DDPMScheduler is the full scheduler", len(DDPMScheduler(10, 0.0001, 0.02).alphas_cumprod), 10)
 var kbase = KnowledgeBase("/tmp/vm_audit47_kb")
 check("KnowledgeBase is the storage one", kbase.has("nothing"), false)
-var cc = os_exec("python3 tools/ny_classcheck.py")
-check("tools/ny_classcheck.py finds no duplicate class names", string_find(cc, "no duplicate") >= 0, true)
+# Needs a Python 3 on PATH (python3, or python on Windows); skipped without.
+var py = which("python3") ?? which("python")
+if py != none:
+    var cc = os_run([py, "tools/ny_classcheck.py"], merge=true)["stdout"]
+    check("tools/ny_classcheck.py finds no duplicate class names", string_find(cc, "no duplicate") >= 0, true)
+else:
+    print("  (no python3 on PATH: tools/ny_classcheck.py not run)")
 
 print("")
 print("Results: " + str(pass_n) + " passed, " + str(fail_n) + " failed")
