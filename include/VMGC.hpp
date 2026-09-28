@@ -26,6 +26,7 @@
 // Unreachable cycles are finalized before they are cleared and survive if a
 // finalizer resurrected them (PEP 442).
 #include <atomic>
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <utility>
@@ -46,29 +47,41 @@ using IterPair = std::pair<int, std::vector<VMVal>>;
 
 // Freeing a long chain (a linked list of instances, nested lists) used to
 // recurse once per link through the destructors - a 30,000-node list
-// crashed the VM when it was dropped. A VMVal's container pointers are
-// DeepPtrs: when one holds the last reference and the destructors are
-// already nested deeply, the object is parked and freed by the outermost
-// release, iteratively.
-void release_deep(std::shared_ptr<void>&& p);
-template<class T> struct DeepPtr : std::shared_ptr<T> {
-    using Base = std::shared_ptr<T>;
-    using Base::Base;
-    DeepPtr() noexcept = default;
-    DeepPtr(const Base& b) noexcept : Base(b) {}
-    DeepPtr(Base&& b) noexcept : Base(std::move(b)) {}
-    DeepPtr(const DeepPtr&) noexcept = default;
-    DeepPtr(DeepPtr&&) noexcept = default;
-    DeepPtr& operator=(const DeepPtr&) noexcept = default;
-    DeepPtr& operator=(DeepPtr&&) noexcept = default;
-    DeepPtr& operator=(const Base& b) noexcept { Base::operator=(b); return *this; }
-    DeepPtr& operator=(Base&& b) noexcept { Base::operator=(std::move(b)); return *this; }
-    DeepPtr& operator=(std::nullptr_t) noexcept { Base::reset(); return *this; }
-    ~DeepPtr() {
-        if (this->get() && this->use_count() == 1)
-            release_deep(std::shared_ptr<void>(std::move(static_cast<Base&>(*this))));
+// crashed the VM when it was dropped. Lists, maps and iterators are
+// allocated with DeepAlloc: when its destroy() runs already nested deeply,
+// the object's contents are moved out and parked, and the outermost
+// destruction frees what was parked, iteratively. The cost is paid once per
+// container destroyed, not per value.
+constexpr int kMaxDeepDepth = 200;
+inline thread_local int t_deep_depth = 0;
+void deep_park(void* obj, void (*destroy)(void*));
+void deep_drain();
+template<class U> inline void deep_destroy(U* p) {
+    if (t_deep_depth < kMaxDeepDepth) {
+        ++t_deep_depth;
+        p->~U();
+        --t_deep_depth;
+        if (t_deep_depth == 0) deep_drain();
+    } else {
+        U* q = new U(std::move(*p));
+        p->~U();
+        deep_park(q, [](void* x) { delete static_cast<U*>(x); });
     }
+}
+template<class T> struct DeepAlloc {
+    using value_type = T;
+    DeepAlloc() noexcept = default;
+    template<class U> DeepAlloc(const DeepAlloc<U>&) noexcept {}
+    T* allocate(std::size_t n) { return std::allocator<T>().allocate(n); }
+    void deallocate(T* p, std::size_t n) noexcept { std::allocator<T>().deallocate(p, n); }
+    template<class U, class... A> void construct(U* p, A&&... a) { ::new ((void*)p) U(std::forward<A>(a)...); }
+    template<class U> void destroy(U* p) { deep_destroy(p); }
+    template<class U> bool operator==(const DeepAlloc<U>&) const noexcept { return true; }
+    template<class U> bool operator!=(const DeepAlloc<U>&) const noexcept { return false; }
 };
+template<class T, class... A> inline std::shared_ptr<T> make_deep(A&&... a) {
+    return std::allocate_shared<T>(DeepAlloc<T>(), std::forward<A>(a)...);
+}
 
 // Register a container where it is created (exactly once per object).
 void track_list(const std::shared_ptr<List>& p);

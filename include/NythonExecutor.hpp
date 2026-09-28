@@ -869,7 +869,7 @@ public:   // NythonExecutor is a struct: members default to public
         Value result = NONE_VALUE;
         FlowState& f = flow();
         for (auto& child : node->statements()) {
-            result = Value();
+            if (result.value.o) result = Value();
             noteStatement(child, ctx);
             result = evalNode(child, ctx);
             if (f.pending) return result;
@@ -881,7 +881,7 @@ public:   // NythonExecutor is a struct: members default to public
         Value result = NONE_VALUE;
         FlowState& f = flow();
         for (auto& child : node->statements()) {
-            result = Value();
+            if (result.value.o) result = Value();
             noteStatement(child, ctx);
             result = evalNode(child, ctx);
             if (f.pending) return result;
@@ -2610,7 +2610,7 @@ public:   // NythonExecutor is a struct: members default to public
         bool broke = false;
         FlowState& lf = flow();
         while (isTruthy(evalNode(wn->condition, ctx))) {
-            try { LoopBody _lb(lf); result = Value(); result = evalNode(wn->body, ctx); }
+            try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(wn->body, ctx); }
             catch (std::string& flow) {
                 if (flow == "break") { broke = true; break; }
                 if (flow == "continue") continue;
@@ -2656,7 +2656,7 @@ public:   // NythonExecutor is a struct: members default to public
             int64_t n = bigint_to_i64(iter_val.value.i);
             for (int64_t i = 0; i < n; i++) {
                 bindv(var_name, Value((int)i));
-                try { LoopBody _lb(lf); result = Value(); result = evalNode(fn->body, ctx); }
+                try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
                 catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
                 NY_LOOP_FLOW(broke)
             }
@@ -2680,7 +2680,7 @@ public:   // NythonExecutor is a struct: members default to public
                     std::vector<Value> keys = iterItems(iter_val, ctx);
                     for (auto& key : keys) {
                         bindv(var_name, key);
-                        try { LoopBody _lb(lf); result = Value(); result = evalNode(fn->body, ctx); }
+                        try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
                         catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
                         NY_LOOP_FLOW(broke)
                     }
@@ -2711,7 +2711,7 @@ public:   // NythonExecutor is a struct: members default to public
                         } else {
                             bindv(var_name, elem);
                         }
-                        try { LoopBody _lb(lf); result = Value(); result = evalNode(fn->body, ctx); }
+                        try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
                         catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
                         NY_LOOP_FLOW(broke)
                     }
@@ -2729,7 +2729,7 @@ public:   // NythonExecutor is a struct: members default to public
                 std::vector<std::string> chars = nypy::u8_chars(*static_cast<std::string*>(iter_val.value.p));
                 for (auto& ch : chars) {
                     bindv(var_name, makeStringValue(ch));
-                    try { LoopBody _lb(lf); result = Value(); result = evalNode(fn->body, ctx); }
+                    try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
                     catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
                     NY_LOOP_FLOW(broke)
                 }
@@ -2772,7 +2772,7 @@ public:   // NythonExecutor is a struct: members default to public
                 } else {
                     bindv(var_name, item);
                 }
-                try { LoopBody _lb(lf); result = Value(); result = evalNode(fn->body, ctx); }
+                try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
                 catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
                 NY_LOOP_FLOW(broke)
             }
@@ -2795,7 +2795,7 @@ public:   // NythonExecutor is a struct: members default to public
         bool broke = false;
         FlowState& lf = flow();
         for (int64_t i = 0; i < n; i++) {
-            try { LoopBody _lb(lf); result = Value(); result = evalNode(rn->body, ctx); }
+            try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(rn->body, ctx); }
             catch (std::string& flow) {
                 if (flow == "break") break;
                 if (flow == "continue") continue;
@@ -2984,7 +2984,6 @@ public:   // NythonExecutor is a struct: members default to public
         if (cit != closure_contexts.end()) closure_contexts[bp] = cit->second;   // kept alive by bo->fn
         bound_self_[bp] = bo;
         bound_cache_[ck] = bo;
-        heap_owner_[bp] = bo;
         nygc::track(bo);
         return out;
     }
@@ -4732,8 +4731,13 @@ public:
                 // Reuse it via receiver_cache_ instead of evaluating again.
                 receiver_cache_[attr->object.get()] = obj;
                 Value callee_val;
+                // Only its kind is looked at below (callMethod binds self
+                // itself): a method need not be bound into a heap object
+                // that would be freed again right after the call.
+                no_bind_ = true;
                 try { callee_val = evalAttribute(cn->callee, ctx, true); }
-                catch (...) { receiver_cache_.erase(attr->object.get()); throw; }
+                catch (...) { no_bind_ = false; receiver_cache_.erase(attr->object.get()); throw; }
+                no_bind_ = false;
                 receiver_cache_.erase(attr->object.get());
                 // Only use the fallback for builtin functions stored in dict namespaces
                 // (e.g. math.sqrt). For class methods (__func__), let callMethod handle
@@ -5242,7 +5246,13 @@ public:
     // soft: a missing attribute of an instance or class reads UNDEFINED
     // instead of raising AttributeError (for hasattr/getattr, and for the
     // method-call path, where callMethod decides).
+    // Set by evalCall around the one attribute read whose result is only
+    // inspected, never called (see there); consumed on entry, so nothing
+    // evaluated inside (a property getter's body) sees it.
+    static inline thread_local bool no_bind_ = false;
     Value evalAttribute(node_ptr node, Context* ctx, bool soft = false) {
+        const bool no_bind = no_bind_;
+        no_bind_ = false;
         auto an = static_pointer_cast<AttributeNode>(node);
         Value obj;
         {
@@ -5360,7 +5370,7 @@ public:
                         }
                         // A method read as a value off an INSTANCE must carry its
                         // instance with it, or `self` is lost at call time.
-                        if (instance_to_class.count(obj.value.p))
+                        if (!no_bind && instance_to_class.count(obj.value.p))
                             return makeBoundMethod(cv, obj);
                         return cv;
                     }
@@ -5934,7 +5944,6 @@ public:
         func_names[ip] = "__instance__:" + className;
         io->props = new Context(runner, className + "_props", nullptr, nullptr, nullptr);   // adopts the creator's reference
         instance_properties[ip] = io->props;
-        heap_owner_[ip] = io;
         nygc::track(io);
         return instance;
     }
@@ -7704,9 +7713,9 @@ public:
         return v.isCollectable() ? v.value.gc != nullptr : true;
     }
     // ── Heap objects: side tables, finalizers, teardown (round 75) ─────────
-    // The heap object behind each function, bound method and instance
-    // identity (not owning), so a value can be rebuilt from a bare pointer
-    // (a property getter named by a setter's builtin tag) with its reference.
+    // The heap object behind each function identity (not owning), so a
+    // value can be rebuilt from a bare pointer (a property getter named by a
+    // setter's builtin tag) with its reference.
     std::unordered_map<void*, nython::gc::Collectable*> heap_owner_;
     bool finalizers_off_ = false;   // teardown: no __del__
     Value ownedValue(void* p) {
@@ -7737,7 +7746,6 @@ public:
         func_ast_nodes.erase(p);
         closure_contexts.erase(p);
         bound_self_.erase(p);
-        heap_owner_.erase(p);
         auto ck = std::make_pair(b->key_fn, b->key_self);
         auto cit = bound_cache_.find(ck);
         if (cit != bound_cache_.end() && cit->second == b) bound_cache_.erase(cit);
@@ -7746,14 +7754,12 @@ public:
         instance_to_class.erase(p);
         func_names.erase(p);
         instance_properties.erase(p);
-        heap_owner_.erase(p);
     }
     // weakref(): its objects by id, for the builtin tag that calls them.
     std::unordered_map<int64_t, nyheap::Weak*> weak_by_id_;
     int64_t weak_serial_ = 0;
     void forgetWeak(nyheap::Weak* w) {
         func_names.erase((void*)&w->tag);
-        heap_owner_.erase((void*)&w->tag);
         weak_by_id_.erase(w->id);
     }
     Value makeWeakRef(const Value& obj) {
@@ -7766,7 +7772,6 @@ public:
         nyheap::weak_register(w);
         weak_by_id_[w->id] = w;
         func_names[(void*)&w->tag] = "__builtin__:" + w->tag;
-        heap_owner_[(void*)&w->tag] = w;
         return nyheap::userValue(w, (void*)&w->tag);
     }
     // Whether instances of this class run __del__ when they are freed.

@@ -149,16 +149,15 @@ struct VMVal {
     int64_t i   = 0;
     double  d   = 0.0;
     std::string s;
-    // Container pointers free deep structures iteratively (VMGC.hpp).
-    vmgc::DeepPtr<std::vector<VMVal>>                          list;
-    vmgc::DeepPtr<VMMap>       map;
+    std::shared_ptr<std::vector<VMVal>>                        list;
+    std::shared_ptr<VMMap>     map;
     std::shared_ptr<VMCode>                                    code;
     NativeFunc                                                 native;
-    vmgc::DeepPtr<std::pair<int,std::vector<VMVal>>>           iter;
-    vmgc::DeepPtr<struct GenState>                             gen;
+    std::shared_ptr<std::pair<int,std::vector<VMVal>>>         iter;
+    std::shared_ptr<struct GenState>                           gen;
     std::string class_name;
     // Closure environment: captured variables from enclosing scope
-    vmgc::DeepPtr<VMMap>       closure_env;
+    std::shared_ptr<VMMap>     closure_env;
 
     // A LIST with b == true is a tuple: immutable, printed with parentheses,
     // never equal to a list, hashable as a dict key. An INT whose s is not
@@ -183,13 +182,13 @@ struct VMVal {
     static VMVal make_str(std::string v)  { VMVal x; x.type=VMType::STRING;x.s=std::move(v); return x; }
     static VMVal make_list(std::vector<VMVal> items={}) {
         VMVal x; x.type=VMType::LIST;
-        x.list=std::make_shared<std::vector<VMVal>>(std::move(items));
+        x.list=vmgc::make_deep<std::vector<VMVal>>(std::move(items));
         vmgc::track_list(x.list);
         return x;
     }
     static VMVal make_map() {
         VMVal x; x.type=VMType::MAP;
-        x.map=std::make_shared<VMMap>();
+        x.map=vmgc::make_deep<VMMap>();
         vmgc::track_map(x.map);
         return x;
     }
@@ -208,7 +207,7 @@ struct VMVal {
     }
     static VMVal make_iter(std::vector<VMVal> items) {
         VMVal x; x.type=VMType::ITERATOR;
-        x.iter=std::make_shared<std::pair<int,std::vector<VMVal>>>(0,std::move(items));
+        x.iter=vmgc::make_deep<std::pair<int,std::vector<VMVal>>>(0,std::move(items));
         vmgc::track_iter(x.iter);
         return x;
     }
@@ -2344,7 +2343,7 @@ public:
         if (it != has_del_cache_.end()) has_del = it->second;
         else { VMVal m; has_del = class_lookup(cls, "__del__", m); has_del_cache_[cls] = has_del; }
         if (has_del && !vm_finalizers_off_) return vmgc::new_finalizable_map(cls);
-        auto attrs = std::make_shared<VMMap>();
+        auto attrs = vmgc::make_deep<VMMap>();
         vmgc::track_map(attrs);
         return attrs;
     }
@@ -3167,7 +3166,7 @@ private:
         bool outer_fn = outer.code && outer.code->name!="<module>" && !outer.code->is_class;
         if(outer_fn){
             // Methods of a class defined in a function close over it.
-            if(!outer.closure_env){ outer.closure_env=std::make_shared<VMMap>(outer.locals); vmgc::track_map(outer.closure_env); }
+            if(!outer.closure_env){ outer.closure_env=vmgc::make_deep<VMMap>(outer.locals); vmgc::track_map(outer.closure_env); }
             else for(auto& kv:outer.locals) if(!outer.closure_env->count(kv.first)) (*outer.closure_env)[kv.first]=kv.second;
             if(outer.self_val && !outer.closure_env->count("self")) (*outer.closure_env)["self"]=*outer.self_val;
             cf.closure_env=outer.closure_env;
@@ -3509,7 +3508,7 @@ private:
                     // Create shared closure_env on first inner function in this frame
                     // so ALL inner functions share the SAME cell for mutable variables
                     if(!fr.closure_env){
-                        fr.closure_env = std::make_shared<VMMap>(fr.locals);
+                        fr.closure_env = vmgc::make_deep<VMMap>(fr.locals);
                         vmgc::track_map(fr.closure_env);
                     } else {
                         // Sync any new locals into the shared closure_env

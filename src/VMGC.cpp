@@ -192,10 +192,6 @@ void collect_due(VirtualMachine& vm) {
     }
 }
 
-thread_local int t_depth = 0;
-thread_local std::vector<std::shared_ptr<void>>* t_parked = nullptr;
-constexpr int kMaxDepth = 256;
-
 std::mutex& queue_mutex() { static auto* m = new std::mutex(); return *m; }
 
 template<class P> void track_any(const std::shared_ptr<P>& p, Kind k) {
@@ -206,24 +202,22 @@ template<class P> void track_any(const std::shared_ptr<P>& p, Kind k) {
 
 } // namespace
 
-void release_deep(std::shared_ptr<void>&& p) {
-    if (t_depth >= kMaxDepth) {
-        if (!t_parked) t_parked = new std::vector<std::shared_ptr<void>>();
-        t_parked->push_back(std::move(p));
-        return;
+namespace {
+thread_local std::vector<std::pair<void*, void (*)(void*)>>* t_parked = nullptr;
+}
+void deep_park(void* obj, void (*destroy)(void*)) {
+    if (!t_parked) t_parked = new std::vector<std::pair<void*, void (*)(void*)>>();
+    t_parked->emplace_back(obj, destroy);
+}
+void deep_drain() {
+    if (!t_parked || t_parked->empty()) return;
+    ++t_deep_depth;
+    while (!t_parked->empty()) {
+        auto item = t_parked->back();
+        t_parked->pop_back();
+        item.second(item.first);
     }
-    ++t_depth;
-    p.reset();
-    --t_depth;
-    if (t_depth == 0 && t_parked && !t_parked->empty()) {
-        ++t_depth;
-        while (!t_parked->empty()) {
-            std::shared_ptr<void> q = std::move(t_parked->back());
-            t_parked->pop_back();
-            q.reset();
-        }
-        --t_depth;
-    }
+    --t_deep_depth;
 }
 
 void track_list(const std::shared_ptr<List>& p) { track_any(p, K_LIST); }
@@ -232,9 +226,13 @@ void track_iter(const std::shared_ptr<IterPair>& p) { track_any(p, K_ITER); }
 void track_gen(const std::shared_ptr<GenState>& p) { track_any(p, K_GEN); }
 
 void FinalDeleter::operator()(Map* m) const {
-    if (finalized || g_shutdown) { delete m; return; }
+    if (finalized || g_shutdown) {
+        deep_destroy(m);
+        ::operator delete(static_cast<void*>(m));
+        return;
+    }
     // Alive again under a new identity, for __del__ at the next safe point.
-    auto fresh = std::make_shared<Map>(std::move(*m));
+    auto fresh = make_deep<Map>(std::move(*m));
     delete m;
     {
         // The last reference can be dropped by a thread in a blocking wait
