@@ -5368,11 +5368,15 @@ public:
 
     // ─── COLLECTIONS ────────────────────────────────────────────────────
     Value evalList(node_ptr node, Context* ctx) {
-        auto ln = static_pointer_cast<ListNode>(node);
+        // A TupleNode is not a ListNode (only laid out alike): read the
+        // elements through the node's own type.
         bool is_tuple = (node->type() == NodeType::TUPLE);
+        const std::vector<node_ptr>& elements = is_tuple
+            ? static_pointer_cast<TupleNode>(node)->elements
+            : static_pointer_cast<ListNode>(node)->elements;
         auto* obj = new Object((Runnable*)runner, is_tuple ? "tuple" : "list", Type::LIST);
         int idx = 0;
-        for (auto& el : ln->elements) {
+        for (auto& el : elements) {
             obj->set(std::to_string(idx++), evalNode(el, ctx));
         }
         obj->set("__len__", Value((int)idx));

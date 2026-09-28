@@ -1290,7 +1290,9 @@ private:
     }
     static __Int abs(const __SInt & a)
     {
-        return (a < 0 ? -a : a);
+        // Negate in the unsigned type: -a overflows for the most negative
+        // value (-2^63), whose magnitude only the unsigned type can hold.
+        return (a < 0 ? __Int(0) - __Int(a) : __Int(a));
     }
     static int plus(__Int & a, const __Int & b)
     {

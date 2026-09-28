@@ -430,6 +430,14 @@ check("isinstance", [isinstance([1], list), isinstance((1,), tuple), isinstance(
                     isinstance([1], tuple), isinstance(true, int), isinstance(1, int), isinstance(1.5, float)],
       [true, true, false, false, true, true, true])
 
+# The most negative 64-bit value: its magnitude only fits unsigned (the
+# bigint conversion negated it in the signed type - undefined behaviour).
+var i64min = -9223372036854775808
+check("-2**63", [i64min, -(2**63), abs(i64min), i64min - 1, i64min // 3, -i64min, int("-9223372036854775808")],
+      [-9223372036854775808, -9223372036854775808, 9223372036854775808, -9223372036854775809,
+       -3074457345618258603, 9223372036854775808, -9223372036854775808])
+check("(-2**63,) tuple", (i64min, 1), (-9223372036854775808, 1))
+
 print("Results: " + str(pass_n) + " passed, " + str(fail_n) + " failed")
 if fail_n == 0:
     print("=== VM_AUDIT60 PASSED ===")
