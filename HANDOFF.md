@@ -462,6 +462,31 @@ stdout pipe in order (subprocess's `stderr=STDOUT`), on both platforms - the
 IDE's BgProc and Toolchain use it (argv lists, no shell text) instead of
 `2>&1`, `< /dev/null` and `$?`.
 
+The rest of what running the whole sweep under Wine found:
+
+| Defect | Fix |
+|---|---|
+| Files written by a Windows program end lines with `\r\n`; text reads kept the `\r` | text-mode handles (`open(p)`, `file_open(p, "r")`) read with universal newlines, as Python does; `"rb"` handles, `read_file` and `file_readlines` stay byte-exact |
+| `os_stat`/`file_mtime` used the CRT's whole-second `stat` | Windows reads the FILETIME (100 ns), so "changed since" checks see sub-second edits |
+| `os_getppid` was POSIX-only | Toolhelp32 snapshot on Windows |
+| `os_chdir` on a file | raises NotADirectoryError on both platforms (Windows reported ENOENT) |
+| `process_exec` on Windows used `_popen` | the same CreateProcess path as `os_run`, stderr merged |
+| the IDE's toolchain ran `./ny_test` from the checkout - a Linux binary beside `nython.exe` | `NYTHON_EXE`, then `sys.executable`, then the checkout's candidates |
+| tests sharing `/tmp` paths raced when the sweep runs both engines at once | per-run temporary directories (temp dir + pid + a random suffix) |
+| `NyCoro.cpp` called `GetCurrentThreadStackLimits` (Windows 8+) while the project targets Vista (`_WIN32_WINNT 0x0600`) | looked up at run time; `VirtualQuery`'s allocation base where it is missing |
+| a PE executable reserves a 2 MB main stack (Linux gives 8 MB) | `-Wl,--stack,8388608` in `nython.cbp` and the cross build: the 600-deep `yield from` chain in vm_audit56 hit the VM's native-stack guard (a clean RecursionError, not a crash) |
+
+`tools/cross_windows.sh` installs busybox-w32 as `sh.exe` and as the POSIX
+programs Git for Windows keeps beside it (`echo`, `cat`, `sleep`, `kill`,
+`grep`, ...), so the tests that start POSIX programs run there as they would
+on a Windows machine with Git installed; tests that need a program that is
+not there (or a symlink privilege Wine does not grant) skip those checks
+and say so rather than fail.
+
+**Result:** the full sweep under Wine, both engines, every file -
+346 runs, 0 not ok (the tree before the generators merge). vm_audit46 (the OS layer) is 247/0 there (255/0 on Linux;
+the 8 skipped are symlinks and `which`-dependent checks).
+
 ### Every test file in the sweep
 
 `tools/sweep.py` now also runs every `examples/*_test.ny` (70 files). The two
