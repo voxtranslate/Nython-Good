@@ -82,6 +82,31 @@ waits = thread_wait_count() - waits0
 check("long critical sections", counter[0], 3200)
 check("no lock-holder preemption (" + str(waits) + " waits for 3200 critical sections)", waits < 800, true)
 
+# A holder that blocks while holding the lock (here: sleeps) makes the others
+# queue on it whatever the GIL does. A released mutex is not handed to one of
+# them - that would make the next owner a thread still waiting for the GIL,
+# and the convoy would never end (60k waits here); one waiter is woken and
+# competes for it when it runs.
+def sleepy_holder():
+    var i = 0
+    while i < 5000:
+        mutex_lock(lock)
+        counter[0] = counter[0] + 1
+        if i % 1000 == 0:
+            thread_sleep(2)
+        mutex_unlock(lock)
+        i = i + 1
+counter[0] = 0
+waits0 = thread_wait_count()
+var sh = []
+for k in range(8):
+    sh.append(thread_create(sleepy_holder))
+for h in sh:
+    thread_join(h, 20000)
+waits = thread_wait_count() - waits0
+check("holders that block", counter[0], 40000)
+check("a convoy dissolves (" + str(waits) + " waits for 40000 lock operations)", waits < 6000, true)
+
 # atomics: the same with no lock at all
 var at = atomic_new(0)
 def atomic_worker():
