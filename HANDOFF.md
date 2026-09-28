@@ -609,7 +609,9 @@ Peak RSS, pre-round-75 build → this one (interpreter / VM, MB):
 | drop a 200k-node linked list | 442 → 419 (live data) | crash → 189 |
 | test_nytorch13 / 14 / 15 / 16 / 17 | 714 / 689 / 1068 / 1114 / 51 → 88 / 182 / 76 / 151 / 46 | 283 / 157 / 233 / 268 / 34 → 55 / 116 / 47 / 86 / 34 |
 
-What remains in test_nytorch14 is live: the test keeps every section's
+(Before the generators/strict-reads merge; after it the interpreter's
+nytorch peaks are 98 / 193 / 80 / 151 / 47 MB, the VM's 61 / 119 / 47 / 87 /
+34.) What remains in test_nytorch14 is live: the test keeps every section's
 models in globals, and a float in an interpreter list is ~280 bytes.
 IDE (`ide_memprobe.py`): idle 0, hover 0, typing 0 KB/key, scroll 0.05.
 

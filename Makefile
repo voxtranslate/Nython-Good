@@ -175,7 +175,8 @@ $(OBJDIR)/sdl3_stub.o: $(STUB_SRC)
 # AddressSanitizer (use-after-free, double free, overflows) + LeakSanitizer
 # (leaks at exit) + UBSan, in its own tree so it never mixes with the normal
 # objects:  make asan  ->  build-asan/nython-cli
-#   ASAN_OPTIONS=detect_leaks=1 build-asan/nython-cli examples/vm_audit55.ny
+#   ulimit -s 65536   # ASan frames overflow 8 MB in the deep-recursion tests
+#   LSAN_OPTIONS=suppressions=tools/lsan.supp build-asan/nython-cli examples/vm_audit55.ny
 # UBSan reports and continues ("runtime error:" lines); grep the output.
 ASAN_CXXOPT = -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
 asan:

@@ -215,6 +215,10 @@ Peak resident size (KB of RSS, `ru_maxrss`), the pre-round-75 build
 | test_nytorch16 | 1,114,368 | 150,768 | 267,772 | 86,424 |
 | test_nytorch17 | 50,820 | 46,156 | 33,908 | 34,164 |
 
+(Measured before merging the lazy generators and strict reads. After that
+merge the interpreter's nytorch peaks are 98 / 193 / 80 / 151 / 47 MB and the
+VM's 61 / 119 / 47 / 87 / 34 MB; the loop benchmarks are unchanged.)
+
 What is left is live data. test_nytorch14 keeps every section's models in
 global variables to the end, and a float in an interpreter list costs about
 280 bytes (a 208-byte `Value` plus its slot in a string-keyed map), so a
@@ -245,29 +249,43 @@ bookkeeping) is 1.4% of the instructions; `mallinfo2` 0.002%.
 
 - `examples/vm_audit55.ny`: 4059 checks, identical output on both engines
   (counts compared to bounds, not between engines).
-- `python3 tools/sweep.py --base <main head ea36a05>`: 346 runs, 0
-  regressions; the 8 not-ok runs are the four `v3/v4/v5/v9` `1k`-suffix
-  tests, which fail the same way on the main head (the suffix ruling lives
-  on another branch). Against `/tmp/r73`: 0 regressions, 110 fixed.
+- `python3 tools/sweep.py --base /tmp/r73/build/nython-cli -j 3` after
+  merging the lazy generators and strict reads (5956169/e2b60b6): 350
+  runs, 0 not ok, 0 regressions. Before that merge, against the main head
+  (ea36a05): 346 runs, 0 regressions.
+- `vm_audit56` (lazy generators) on both engines: 120 passed, 0 pending -
+  the interpreter's one PENDING check (dropping the last reference to a
+  suspended generator runs its `finally`) passes with reference counting.
+- Windows (MinGW-w64, `tools/cross_windows.sh build`, under Wine):
+  vm_audit55 and vm_audit56 pass on both engines. There `mem_rss_kb()` is 0
+  and the heap-growth trigger is off (no `mallinfo2`).
 - ASan + UBSan + LSan (`make asan`, `LSAN_OPTIONS=suppressions=tools/lsan.supp`,
   `ulimit -s 65536` because ASan frames overflow the default stack in the
-  deep-recursion tests): every
-  `test_*.ny`, `*_test.ny`, `vm_audit*.ny` and `gui_tests/test_*.ny` on both
-  engines (346 runs): **no AddressSanitizer error** (no use-after-free,
-  double free or overflow) and **no leak** apart from UBSan's own
-  demangler buffer when it prints a report. UBSan reports two
-  pre-existing sites, unrelated to memory management: `evalList`
-  `static_pointer_cast<ListNode>` on a tuple node (vm_audit27/54/60/61) and
-  `bigint::abs(INT64_MIN)` negating past the range (vm_audit60). The 8
-  failing runs are the four `1k`-suffix tests, as in the normal build.
-  (The ASan run came after the defects in HANDOFF §0k were fixed; the
+  deep-recursion tests), every `test_*.ny`, `*_test.ny`, `vm_audit*.ny` and
+  `gui_tests/test_*.ny` on both engines, on the merged tree (350 runs):
+  **no AddressSanitizer error** (no use-after-free, double free or
+  overflow) and **no leak** apart from UBSan's own demangler buffer when it
+  prints a report. UBSan reports two pre-existing sites, unrelated to
+  memory management: `evalList`'s `static_pointer_cast<ListNode>` on a
+  tuple node (vm_audit27/54/56/60/61) and `bigint::abs(INT64_MIN)`
+  (vm_audit60). One run fails for the instrumented build only: vm_audit56
+  on the VM raises RecursionError in its 500-level recursive generator
+  test, because ASan's frames exhaust the native stack that
+  `nycoro::native_stack_exhausted()` guards (with a 512 MB stack ASan then
+  flags `sigaltstack` inside the coroutine runtime) - the normal build
+  passes it on Linux and under Wine. Before the merge the same run (346
+  runs) was clean in the same way.
+  (The ASan runs came after the defects in HANDOFF §0k were fixed; the
   normal build's tests found those. One kind ASan cannot see at all: a
   stale side-table entry keyed by a freed object's address is never
   dereferenced, and ASan's quarantine delays the address reuse that makes
   it visible - the property-getter bug showed up only in the normal build.)
-- Concurrency: vm_audit48/49/50 three times each on both engines, all pass;
-  vm_audit55 has four threads collecting concurrently.
-- `tools/ide_e2e.py` 365 passed, 0 failed; `tools/ide_lint.py` 0
+- Concurrency: vm_audit48 (130 checks) four copies at once on each engine,
+  vm_audit49/50 on both engines, all pass; vm_audit55 has four threads
+  collecting concurrently. The collector adds no blocking wait and no
+  cross-thread pause: it runs on the thread that holds the GIL, at its own
+  safe points.
+- `tools/ide_e2e.py` 365 passed, 0 failed (merged tree); `tools/ide_lint.py` 0
   unresolved; `tools/ide_memprobe.py --check` passes;
   `tools/ny_classcheck.py` no duplicates.
 
