@@ -617,12 +617,20 @@ short-lived generators) does not grow the mappings: VmSize tracks VmRSS.
 
 ### Verification
 
-- `examples/vm_audit56.ny`: 117 checks, identical on both engines and
+- `examples/vm_audit56.ny`: 120 checks, identical on both engines and
   `python3` (threads are skipped there); one `pending` on the interpreter.
-- The sweep (`tools/sweep.py --base /tmp/r73/build/nython-cli`, now 346
-  runs with every `*_test.ny`): 0 regressions; the only not-ok runs are the
-  four `*_test.ny` files that fail on the branch head too (the `1k` suffix
-  ruling, §0m).
+- The sweep (`tools/sweep.py --base /tmp/r73/build/nython-cli`, 348 runs
+  with every `*_test.ny`), after merging the branch head 0042232
+  (round75-sem): 0 regressions; the only not-ok runs are
+  `test_nytorch12.ny` on both engines, which fails the same way on the
+  branch head's own build (`KeyError: 'role'` at line 142, a strict-read
+  migration gap of §0m, not a generator issue).
+- Strict reads (§0m) and generators: a generator's methods are members
+  (`MemberKind::Generator` in `NyMembers.hpp`, both engines), so
+  `g.send` read as a value, `hasattr(g, "send")` and `g?.send(x)` work and
+  `g.nosuch` raises AttributeError. The optional-chain placeholder
+  (`HoleNode::slot`) is read before anything else in its expression runs,
+  so a generator can never suspend between setting and reading it.
 - ASan build (`make cli OBJDIR=build-asan/obj CLI_TARGET=build-asan/nython-cli
   CXXOPT="-O1 -g -fsanitize=address -fno-omit-frame-pointer"`, run with
   `detect_stack_use_after_return=1`): vm_audit22-26, 48, 49, 52-54, 60,

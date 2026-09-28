@@ -5651,6 +5651,7 @@ public:
             default: break;
         }
         if (isStringValue(v)) return nypy::MemberKind::Str;
+        if (nygen::is_gen(v)) return nypy::MemberKind::Generator;
         if (Container* c = contOf(v)) {
             if (seqLen(c) < 0) return nypy::MemberKind::Dict;
             if (isTupleCont(c)) return nypy::MemberKind::Tuple;

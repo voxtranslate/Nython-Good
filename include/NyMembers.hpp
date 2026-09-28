@@ -18,7 +18,7 @@
 namespace nypy {
 
 // Other: a function, class, builtin, undefined ... - no builtin methods.
-enum class MemberKind { None, Bool, Int, Float, Str, List, Tuple, Dict, Set, Instance, Other };
+enum class MemberKind { None, Bool, Int, Float, Str, List, Tuple, Dict, Set, Instance, Generator, Other };
 
 // The object protocol every value answers (Nython-only; both engines).
 inline const std::unordered_set<std::string>& protocol_members() {
@@ -62,6 +62,9 @@ inline bool kind_has_method(MemberKind k, const std::string& m) {
         "__contains__", "add", "clear", "contains", "copy", "difference", "discard", "has", "includes",
         "intersection", "len", "length", "pop", "remove", "size", "union", "update",
         "symmetric_difference", "issubset", "issuperset", "isdisjoint"};
+    // Generators and the lazy iterators (round 75, NyGen.hpp).
+    static const std::unordered_set<std::string> gen_m = {
+        "__iter__", "__next__", "close", "next", "send", "throw"};
     if (k == MemberKind::Other) return false;
     if (protocol_members().count(m)) return true;
     switch (k) {
@@ -70,6 +73,7 @@ inline bool kind_has_method(MemberKind k, const std::string& m) {
         case MemberKind::Tuple: return tuple_m.count(m) > 0;
         case MemberKind::Dict:  return dict_m.count(m) > 0;
         case MemberKind::Set:   return set_m.count(m) > 0;
+        case MemberKind::Generator: return gen_m.count(m) > 0;
         case MemberKind::Int: case MemberKind::Float: case MemberKind::Bool:
             return is_operator_member(m);
         default: return false;

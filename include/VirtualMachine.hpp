@@ -5284,6 +5284,7 @@ private:
             case VMType::LIST:   return v.b?nypy::MemberKind::Tuple:nypy::MemberKind::List;
             case VMType::MAP:    return nypy::MemberKind::Dict;
             case VMType::INSTANCE: return nypy::MemberKind::Instance;
+            case VMType::GENERATOR: case VMType::ITERATOR: return nypy::MemberKind::Generator;
             default:             return nypy::MemberKind::Other;
         }
     }

@@ -301,7 +301,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit52 | — | exceptions as objects: typed except across calls, finally/raise, with protocol, NameError/AttributeError/TypeError |
 | vm_audit53 | — | classes: C3 MRO, super(), class bodies, properties, the operator and object protocols |
 | vm_audit54 | — | comprehensions, match patterns, walrus, unpacking, generators, calls (`**d`, arity) |
-| vm_audit56 | 117 | lazy generators: infinite ones with islice/take/zip/any, side-effect order, send/throw/close/GeneratorExit/finally, StopIteration.value, `yield from` (600 deep), genexps, `__iter__` generators, unpacking, errors, threads (same results under python3) |
+| vm_audit56 | 120 | lazy generators: infinite ones with islice/take/zip/any, side-effect order, send/throw/close/GeneratorExit/finally, StopIteration.value, `yield from` (600 deep), genexps, `__iter__` generators, unpacking, errors, threads (same results under python3) |
 | vm_audit57 | 212 | strict reads (AttributeError/KeyError), getattr/hasattr/setattr/delattr/get/setdefault, `?.` `?[` `??` `??=`, `undefined`, var/let/const/global/nonlocal scope rules in every context, suffix literals (round 75) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 

@@ -74,6 +74,8 @@ def error_of(f):
         return "KeyError"
     except GeneratorExit:
         return "GeneratorExit"
+    except AttributeError:
+        return "AttributeError"
 
 try:
     islice
@@ -591,6 +593,13 @@ next(sw)
 check("except around a yield catches a throw", sw.throw(KeyError("k")), "caught")
 
 check("a generator has no len()", error_of(lambda: len(naturals())), "TypeError")
+nat2 = naturals()
+send_it = nat2.send
+check("a generator's method read as a value", [next(nat2), send_it(None)], [0, 1])
+check("hasattr on a generator", [hasattr(nat2, "send"), hasattr(nat2, "throw"), hasattr(nat2, "nosuch")], [True, True, False])
+def missing_attr():
+    return nat2.nosuch
+check("a missing generator attribute", error_of(missing_attr), "AttributeError")
 check("a generator is always true", bool(x for x in []), True)
 
 # ── threads (Nython only) ──────────────────────────────────────────────────
