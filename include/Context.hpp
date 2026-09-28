@@ -29,6 +29,10 @@ struct Context extends Container {
 	Context(Runnable* runner,const std::string& name, Collectable* self = nullptr, Collectable* klass = nullptr, Context* parent = nullptr);
 	~Context();
 
+	// Its variables and its parent are counted references (NyGC.hpp).
+	void gc_traverse(nython::gc::GcVisitFn visit, void* arg) override;
+	void gc_clear() override;
+
 	Context& operator=(Context&& that);
 
 	Context* makeChildContext(const std::string& name);

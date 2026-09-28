@@ -8,6 +8,7 @@
 #include "Class.hpp"
 #include "Object.hpp"
 #include "Collectable.hpp"
+#include "NyGC.hpp"
 
 
 
@@ -23,8 +24,10 @@ Collectable::Collectable(Runnable* runner_arg, Type type_arg): type{type_arg}, m
 }
 
 Collectable::~Collectable() {
-    collectables_created()--;
-    clean();
+    if (gc_counted) collectables_created()--;
+    // An object destroyed by any route other than its count reaching zero
+    // (a legacy delete) must still leave the generation lists intact.
+    if (gc_flags & 1u) nygc::untrack(this);
 }
 
 void Collectable::clean() {

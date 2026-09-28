@@ -1,6 +1,7 @@
 // NyGen.cpp — lazy generators on the interpreter; see include/NyGen.hpp.
 #include "NythonExecutor.hpp"
 #include "NyGen.hpp"
+#include "NyGC.hpp"
 #include "NyCoro.hpp"
 
 #include <cstdio>
@@ -109,24 +110,19 @@ thread_local std::vector<Gen*> t_pending_list;   // dropped while suspended, to 
 size_t g_created = 0;
 size_t g_suspended = 0;
 
-struct Pin { int count = 0; bool deferred = false; };
-std::unordered_map<Context*, Pin>& pins() { static auto* m = new std::unordered_map<Context*, Pin>(); return *m; }
-
+// A generator running in a context (or a generator expression reading one)
+// holds a counted reference to it (NyGC.hpp): the call that made the context
+// releases its own reference when it returns, and the context lives on until
+// the generator finishes. (Before reference counting, reapContext asked
+// defer_reap and the last unpin reaped.)
 void pin(Context* c) {
     if (!c) return;
-    pins()[c].count++;
-    g_pinned = (int)pins().size();
+    nygc::incref(c);
 }
 void unpin(NythonExecutor& E, Context* c) {
+    (void)E;
     if (!c) return;
-    auto& P = pins();
-    auto it = P.find(c);
-    if (it == P.end()) return;
-    if (--it->second.count > 0) return;
-    bool deferred = it->second.deferred;
-    P.erase(it);
-    g_pinned = (int)P.size();
-    if (deferred) E.reapContext(c);
+    nygc::decref(c);
 }
 
 void list_add(Gen* g) {
@@ -1199,12 +1195,12 @@ Value make_iter(NythonExecutor& E, const Value& v, Context* ctx) {
 }
 
 // ── Contexts ───────────────────────────────────────────────────────────────
+// Nothing is deferred any more: a pinned context is kept alive by the
+// generator's own reference (pin). g_pinned stays 0, so reapContext never
+// asks.
 bool defer_reap(Context* c) {
-    auto& P = pins();
-    auto it = P.find(c);
-    if (it == P.end()) return false;
-    it->second.deferred = true;
-    return true;
+    (void)c;
+    return false;
 }
 
 // ── Finalization ────────────────────────────────────────────────────────────

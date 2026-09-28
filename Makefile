@@ -124,7 +124,7 @@ CLI_OBJS       = $(OBJDIR)/main_cli.o $(COMMON_OBJS)
 CLI_TARGET     = $(BUILD)/nython-cli$(EXE)
 CLI_CXXFLAGS   = $(BASE_CXXFLAGS) -DNYTHON_WITH_IDE=0
 
-.PHONY: all ide cli clean help
+.PHONY: all ide cli clean help asan
 
 # ── Default: IDE build ──────────────────────────────────────────────
 all: ide
@@ -171,13 +171,24 @@ $(OBJDIR)/sdl3_stub.o: $(STUB_SRC)
 
 -include $(COMMON_OBJS:.o=.d) $(OBJDIR)/main_ide.d $(OBJDIR)/main_cli.d
 
+# ── Sanitizer build (round 75) ─────────────────────────────────────
+# AddressSanitizer (use-after-free, double free, overflows) + LeakSanitizer
+# (leaks at exit) + UBSan, in its own tree so it never mixes with the normal
+# objects:  make asan  ->  build-asan/nython-cli
+#   ulimit -s 65536   # ASan frames overflow 8 MB in the deep-recursion tests
+#   LSAN_OPTIONS=suppressions=tools/lsan.supp build-asan/nython-cli examples/vm_audit55.ny
+# UBSan reports and continues ("runtime error:" lines); grep the output.
+ASAN_CXXOPT = -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
+asan:
+	$(MAKE) cli BUILD=build-asan CXXOPT="$(ASAN_CXXOPT)"
+
 # ── Directories ────────────────────────────────────────────────────
 $(BUILD):
 	mkdir -p $(BUILD)
 
 # ── Clean ──────────────────────────────────────────────────────────
 clean:
-	rm -rf $(BUILD)
+	rm -rf $(BUILD) build-asan
 
 # ── Help ───────────────────────────────────────────────────────────
 help:
@@ -187,6 +198,7 @@ help:
 	@echo "  make          Build IDE version → build/nython"
 	@echo "  make ide      Same as above"
 	@echo "  make cli      Build CLI version → build/nython-cli"
+	@echo "  make asan     ASan+UBSan+LSan CLI build → build-asan/nython-cli"
 	@echo "  make clean    Remove all build artifacts"
 	@echo ""
 	@echo "  SDL3 is always required:"

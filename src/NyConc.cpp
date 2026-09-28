@@ -164,6 +164,7 @@ static thread_local unsigned t_tick = 0;
 static thread_local bool t_async_token = false;   // run the next async body
 
 bool active() { return g_active.load(std::memory_order_acquire); }
+bool holds_gil() { return !g_active.load(std::memory_order_acquire) || t_holds; }
 
 static void gil_acquire() {
     auto& g = G();

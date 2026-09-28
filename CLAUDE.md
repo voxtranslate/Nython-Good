@@ -82,7 +82,7 @@ nython/
 │                                SDL3 is found (see "Development environment")
 ├── HANDOFF.md                ← START HERE when resuming
 ├── FIXES_v0.2.1.md           ← round-by-round log: every bug and why
-├── GC_NOTES.md               ← the container leak: diagnosis and three fixes
+├── GC_NOTES.md               ← memory management: refcounting + cycle collector (round 75)
 ├── MEMORY_NOTES.md           ← writing Nython the runtime can afford
 ├── IDE_FILES.md              ← which IDE file is real (this has bitten before)
 ├── nython.cbp                ← Code::Blocks project (SDL3 pre-configured)
@@ -313,6 +313,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit60 | 284 | Python values and builtins: dicts, ints, formatting, operators, tuples, strings (same results under python3) |
 | vm_audit61 | 33 | Nython-only value behaviour |
 | vm_audit62 | 29 | tensor type promotion: integer results for integer-closed ops (NumPy's rule), floats otherwise, exact 64-bit sums |
+| vm_audit55 | 4059 | memory: refcounting frees at once, cycles (self, pair, ring, closure over its instance, bound method on its instance, self-containing list/dict) collected, `__del__` once + resurrection, nothing reachable freed (2000-node graph), loops do not grow the heap, threads collecting concurrently, `weakref` |
 | vm_audit52 | — | exceptions as objects: typed except across calls, finally/raise, with protocol, NameError/AttributeError/TypeError |
 | vm_audit53 | — | classes: C3 MRO, super(), class bodies, properties, the operator and object protocols |
 | vm_audit54 | — | comprehensions, match patterns, walrus, unpacking, generators, calls (`**d`, arity) |
@@ -386,11 +387,12 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
 
 ### Known limitations
 
-- **Containers are never reclaimed by the interpreter** — see `GC_NOTES.md`.
-  The VM does not have this problem (it uses `shared_ptr`). Round 73 removed
-  the biggest *avoidable* sources: string literals, one-byte strings and the
-  per-method-call parent-class name are now made once and shared (a loop
-  with two literals: 48 MB → 10 MB at 200k iterations).
+- ~~**Containers are never reclaimed by the interpreter**~~ — **resolved
+  (round 75)**: reference counting plus a generational cycle collector on
+  both engines (the VM leaked every reference cycle). Lists, dicts,
+  strings, functions, bound methods, instances and scopes are freed, cycles
+  included; `__del__` runs once; `gc_collect()`/`gc_stats()`/`weakref()`.
+  200k container literals: 598 MB → 11 MB. See `GC_NOTES.md`.
 - ~~The VM has no tuple type~~ — **resolved (round 74)**: real tuples on both engines.
 - ~~`len()` counts characters but `s[i]` / `s[a:b]` index bytes~~ — **resolved
   (round 74)**: indexing, slicing and `len` all count UTF-8 characters.
@@ -762,6 +764,29 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   passes in full at 2× in both stub models.
 - Legacy flat tensor ops follow NumPy's promotion rule: integer inputs stay
   integers through `+ - *`, dot, sum, max/min, abs/neg/sign, `relu`.
+
+## Round 75: memory management on both engines (see `HANDOFF.md` §0k, `GC_NOTES.md`)
+
+- **Interpreter**: exact reference counting (`Collectable::gc_rc`, counted by
+  every `Value` copy through `TValue::o`) plus a generational cycle collector
+  (trial deletion, `src/NyGC.cpp`). Strings, functions, bound methods and
+  instances are heap objects (`include/NyHeap.hpp`) that erase their
+  side-table entries when freed; scopes are counted (`CtxReaper` releases).
+- **VM**: `shared_ptr` counts as before, plus a cycle collector over
+  weak_ptr-registered containers (`src/VMGC.cpp`); deep chains are freed
+  iteratively (a 30k-node list used to crash the VM when dropped).
+- `__del__` runs once, at the next statement/instruction boundary, never
+  inside a decrement; cyclic garbage is finalized first (PEP 442).
+- Full collections also run when the heap has doubled since the last one
+  (`mallinfo2`), then `malloc_trim`: memory stays within ~2x what is live.
+- **A pointer kept outside a `Value` must hold a reference** (`nygc::incref`)
+  or be erased when the object dies - a freed address is reused at once, and
+  a stale entry then describes a different object. Collections run only at
+  safe points; counts are touched only with the GIL held.
+- Builtins (both engines): `gc_collect`, `gc_enable`/`gc_disable`/
+  `gc_is_enabled`, `gc_set_threshold`/`gc_get_threshold`, `gc_stats`,
+  `gc_live_objects`, `mem_rss_kb`, `mem_peak_rss_kb`, `weakref`.
+- `make asan` → `build-asan/nython-cli` (ASan + UBSan + LSan).
 
 ## Round 75: lazy generators (see `HANDOFF.md` §0l)
 

@@ -34,6 +34,7 @@
 #include <chrono>
 #include <iomanip>
 #include <map>
+#include <deque>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -209,6 +210,9 @@ inline double to_double(const Value& v) {
 
 // Forward-declare struct so dispatch function signatures compile cleanly.
 struct NythonExecutor;
+// Reference-counted heap payloads and the collector (round 75).
+#include "NyGC.hpp"
+#include "NyHeap.hpp"
 
 // ── Forward declarations of module dispatch functions ─────────────────────
 // Each is implemented in src/builtins/X.cpp
@@ -237,40 +241,23 @@ struct NythonExecutor {
     std::map<int, FILE*> file_handles{};
     int next_file_handle{1000};
     std::map<void*, Context*> closure_contexts;
-    // ── Per-call context reclamation ────────────────────────────────────────
-    // Every interpreted call allocated a Context that was never freed (~550
-    // bytes a call: the Context plus the ContainerType map it news in its
-    // constructor and no destructor releases).
+    // ── Scope lifetime (round 75) ───────────────────────────────────────────
+    // A Context is reference counted like every heap object (NyGC.hpp) and
+    // is born holding one reference, its creator's. A call's scope is
+    // released by its CtxReaper when the call returns; it survives only if
+    // something took its own counted reference to it: a function defined in
+    // it (nyheap::Func::scope), a child scope (Context::parent), an
+    // instance's fields (nyheap::Inst::props), a class body kept in
+    // class_ctx_map_. A scope and a function defined in it refer to each
+    // other; the cycle collector frees the pair when nothing else does.
     //
-    // A context may outlive its call only if something retained a pointer to
-    // it: a closure, a class body, or a child context that itself escaped.
-    // Those are the only three retainers in this file, and each marks the
-    // context AND its whole parent chain. Anything unmarked when the call
-    // returns is provably unreachable and is freed.
-    //
-    // This is deliberately conservative: a missed retainer must cause a leak,
-    // never a use-after-free, so escape marking walks upward and reaping only
-    // ever happens for contexts this executor created for a single call.
-    // unordered_set: this is probed once per call return, so an O(log n) lookup
-    // against a set that grows with every closure and class is a per-call tax.
-    std::unordered_set<Context*> escaped_ctxs_;
-    void markEscaped(Context* c) {
-        while (c && escaped_ctxs_.insert(c).second) c = c->parent;
-    }
-    void reapContext(Context* c) {
-        if (!c) return;
-        // A generator still runs in it, or a generator expression reads it:
-        // freed when the last of them finishes (nygen).
-        if (nygen::g_pinned && nygen::defer_reap(c)) return;
-        if (escaped_ctxs_.count(c)) return;
-        // Container news its map and its destructor does not free it, and the
-        // copy constructor is defaulted (shallow), so the shared destructor
-        // cannot safely own it. Release it here, where this context is known
-        // dead and known not to have been copied.
-        if (c->container) { delete c->container; c->container = nullptr; }
-        delete c;
-    }
-    // Frees the context on scope exit unless it escaped, including when the
+    // (Before round 75 an "escaped" set kept every scope a closure or class
+    // had ever referred to alive for the life of the process.) A generator
+    // running in a scope holds its own reference to it (nygen), so nothing
+    // needs to be deferred here.
+    void markEscaped(Context*) {}
+    void reapContext(Context* c) { if (c) nygc::decref(c); }
+    // Releases the creator's reference on scope exit, including when the
     // body exits via a ReturnSignal or a user exception.
     struct CtxReaper {
         NythonExecutor* e;
@@ -284,32 +271,46 @@ struct NythonExecutor {
     int64_t closure_id_counter = 0;
     std::map<int64_t, Context*> closure_by_id;
     std::map<void*, int64_t> value_closure_id;
-    std::vector<std::unique_ptr<std::string>> string_store; // keeps strings alive
+    // Unused since round 75 (strings are nyheap::Str objects, freed with
+    // their last reference); kept so code that names it still compiles.
+    std::vector<std::unique_ptr<std::string>> string_store;
     std::unordered_set<void*> string_ptrs_; // fast positive lookup for string pointers
 
-    // Create a Value that stores a string (persists across Value copies)
-    // Strings made so far and their bytes; like heap objects they are kept for
-    // the life of the process, and --profile attributes them per function.
+    // Strings made so far and their bytes; --profile attributes them per
+    // function. Since round 75 a string is freed with its last reference
+    // (nyheap::Str); gc_stats() reports the ones alive.
     static long long& strings_created() { static long long n = 0; return n; }
     static long long& string_bytes_created() { static long long n = 0; return n; }
 
-    // The empty string and the 256 one-byte strings are made once and shared.
-    // Strings are immutable and never freed here, so a character loop
-    // (line[i:i+1], string_lower(ch), ch == "a") used to leave one permanent
-    // string behind per character examined.
+    // The empty string and the 256 one-byte strings are made once and shared
+    // (immortal: the tables below hold them for the executor's life), so a
+    // character loop (line[i:i+1], string_lower(ch), ch == "a") makes no
+    // string per character examined.
     Value small_strs_[257];
     bool small_made_[257] = {};
 
     // One shared string per distinct text, for names the interpreter itself
     // binds over and over (the parent class set up on every method call of a
-    // subclass). Those used to cost a new permanent string per call.
+    // subclass). Immortal, like the one-byte strings.
     std::unordered_map<std::string, Value> interned_;
     Value internString(const std::string& s) {
         auto it = interned_.find(s);
         if (it != interned_.end()) return it->second;
-        Value v = makeStringValue(s);
+        Value v = newString(s);
         interned_.emplace(s, v);
         return v;
+    }
+
+    // A new string object and the value that holds it.
+    Value newString(const std::string& s) {
+        auto* so = new nyheap::Str(this, s);
+        string_ptrs_.insert((void*)&so->s);
+        return nyheap::userValue(so, (void*)&so->s);
+    }
+    Value newString(std::string&& s) {
+        auto* so = new nyheap::Str(this, std::move(s));
+        string_ptrs_.insert((void*)&so->s);
+        return nyheap::userValue(so, (void*)&so->s);
     }
 
     Value makeStringValue(const std::string& s) {
@@ -317,35 +318,21 @@ struct NythonExecutor {
             int k = s.empty() ? 256 : (unsigned char)s[0];
             if (small_made_[k]) return small_strs_[k];
             small_made_[k] = true;
-            string_store.push_back(std::make_unique<std::string>(s));
-            Value sv;
-            sv.type = ValueType::USERDATA;
-            sv.value.p = (void*)string_store.back().get();
-            string_ptrs_.insert(sv.value.p);
-            small_strs_[k] = sv;
-            return sv;
+            small_strs_[k] = newString(s);
+            return small_strs_[k];
         }
         // A single multi-byte character (indexing and iterating a string go
         // by character): shared too, like the one-byte strings.
         if (s.size() <= 4 && (unsigned char)s[0] >= 0xC0 && nypy::u8_seq((unsigned char)s[0]) == s.size()) {
             auto it = interned_.find(s);
             if (it != interned_.end()) return it->second;
-            string_store.push_back(std::make_unique<std::string>(s));
-            Value cv;
-            cv.type = ValueType::USERDATA;
-            cv.value.p = (void*)string_store.back().get();
-            string_ptrs_.insert(cv.value.p);
+            Value cv = newString(s);
             interned_.emplace(s, cv);
             return cv;
         }
         strings_created()++;
         string_bytes_created() += (long long)s.size();
-        string_store.push_back(std::make_unique<std::string>(s));
-        Value v;
-        v.type = ValueType::USERDATA;
-        v.value.p = (void*)string_store.back().get();
-        string_ptrs_.insert(v.value.p);
-        return v;
+        return newString(s);
     }
 
     // Get string from a string Value
@@ -397,6 +384,7 @@ struct NythonExecutor {
         func_id_store{}, func_ast_nodes{}, imported_asts{},
         instance_store{}, instance_to_class{}, instance_properties{},
         class_by_name{}, super_parent_stack{}, class_parent{} {
+        nyheap::executor_born(this);
         global_ctx = new Context(r, "global");
         registerBuiltins();
         loadPrelude();
@@ -448,7 +436,8 @@ struct NythonExecutor {
     }
 
     ~NythonExecutor() {
-        delete global_ctx;
+        heapTeardown();
+        nyheap::executor_died(this);
     }
 
     void registerBuiltin(const std::string& name) {
@@ -607,7 +596,10 @@ public:   // NythonExecutor is a struct: members default to public
             "perf_counter","time_process","process_time","time_strftime","time_localtime",
             "time_gmtime","time_mktime","time_timegm","time_strptime","time_iso",
             "time_parse_iso","uuid","gen_uuid","sleep_ms",
-            "file_open_or_raise","file_seek","file_tell","file_flush"
+            "file_open_or_raise","file_seek","file_tell","file_flush",
+            // ── Memory management (round 75; the same names on the VM) ─────
+            "gc_collect","gc_enable","gc_disable","gc_is_enabled","gc_isenabled","gc_stats",
+            "gc_live_objects","gc_set_threshold","gc_get_threshold","mem_rss_kb","mem_peak_rss_kb","weakref"
         };
         for (auto& name : builtins) registerBuiltin(name);
         // Concurrency runtime (src/NyConc.cpp): threads, locks, channels,
@@ -879,10 +871,15 @@ public:   // NythonExecutor is a struct: members default to public
     }
 
     // ─── SCRIPT / STATEMENTS ────────────────────────────────────────────
+    // The value of each statement is dropped before the next one starts (a
+    // body's last value is still what it evaluates to): holding it kept an
+    // object that `L.pop()` removed alive for one more statement, so its
+    // __del__ ran late.
     Value evalScript(node_ptr node, Context* ctx) {
         Value result = NONE_VALUE;
         FlowState& f = flow();
         for (auto& child : node->statements()) {
+            if (result.value.o) result = Value();
             noteStatement(child, ctx);
             result = evalNode(child, ctx);
             if (f.pending) return result;
@@ -894,6 +891,7 @@ public:   // NythonExecutor is a struct: members default to public
         Value result = NONE_VALUE;
         FlowState& f = flow();
         for (auto& child : node->statements()) {
+            if (result.value.o) result = Value();
             noteStatement(child, ctx);
             result = evalNode(child, ctx);
             if (f.pending) return result;
@@ -2718,7 +2716,7 @@ public:   // NythonExecutor is a struct: members default to public
         bool broke = false;
         FlowState& lf = flow();
         while (isTruthy(evalNode(wn->condition, ctx))) {
-            try { LoopBody _lb(lf); result = evalNode(wn->body, ctx); }
+            try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(wn->body, ctx); }
             catch (std::string& flow) {
                 if (flow == "break") { broke = true; break; }
                 if (flow == "continue") continue;
@@ -2780,7 +2778,7 @@ public:   // NythonExecutor is a struct: members default to public
             int64_t n = bigint_to_i64(iter_val.value.i);
             for (int64_t i = 0; i < n; i++) {
                 bindv(var_name, Value((int)i));
-                try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
+                try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
                 catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
                 NY_LOOP_FLOW(broke)
             }
@@ -2804,7 +2802,7 @@ public:   // NythonExecutor is a struct: members default to public
                     std::vector<Value> keys = iterItems(iter_val, ctx);
                     for (auto& key : keys) {
                         bindv(var_name, key);
-                        try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
+                        try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
                         catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
                         NY_LOOP_FLOW(broke)
                     }
@@ -2835,7 +2833,7 @@ public:   // NythonExecutor is a struct: members default to public
                         } else {
                             bindv(var_name, elem);
                         }
-                        try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
+                        try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
                         catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
                         NY_LOOP_FLOW(broke)
                     }
@@ -2853,7 +2851,7 @@ public:   // NythonExecutor is a struct: members default to public
                 std::vector<std::string> chars = nypy::u8_chars(*static_cast<std::string*>(iter_val.value.p));
                 for (auto& ch : chars) {
                     bindv(var_name, makeStringValue(ch));
-                    try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
+                    try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
                     catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
                     NY_LOOP_FLOW(broke)
                 }
@@ -2896,7 +2894,7 @@ public:   // NythonExecutor is a struct: members default to public
                 } else {
                     bindv(var_name, item);
                 }
-                try { LoopBody _lb(lf); result = evalNode(fn->body, ctx); }
+                try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
                 catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
                 NY_LOOP_FLOW(broke)
             }
@@ -2919,7 +2917,7 @@ public:   // NythonExecutor is a struct: members default to public
         bool broke = false;
         FlowState& lf = flow();
         for (int64_t i = 0; i < n; i++) {
-            try { LoopBody _lb(lf); result = evalNode(rn->body, ctx); }
+            try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(rn->body, ctx); }
             catch (std::string& flow) {
                 if (flow == "break") break;
                 if (flow == "continue") continue;
@@ -2972,20 +2970,18 @@ public:   // NythonExecutor is a struct: members default to public
     // ─── FUNCTION / CLASS / LAMBDA ──────────────────────────────────────
     Value evalFunctionDecl(node_ptr node, Context* ctx) {
         auto fn = static_pointer_cast<FunctionNode>(node);
-        // Create a unique identity per function instance using a counter
-        int64_t fid = ++closure_id_counter;
-        auto unique_key = std::make_unique<int64_t>(fid);
-        void* unique_ptr = (void*)unique_key.get();
-        func_id_store.push_back(std::move(unique_key));
-
-        Value func_val;
-        func_val.type = ValueType::USERDATA;
-        func_val.value.p = unique_ptr;
+        // A unique identity per function value: the id inside its heap
+        // object (nyheap::Func), which owns every side-table entry below.
+        auto* fo = new nyheap::Func(this, ++closure_id_counter);
+        void* unique_ptr = (void*)&fo->id;
+        Value func_val = nyheap::userValue(fo, unique_ptr);
         func_names[unique_ptr] = "__func__:" + fn->name;
         closure_contexts[unique_ptr] = ctx;
-        markEscaped(ctx);
+        fo->setScope(ctx);
         // Also store the AST node pointer so we can find the FunctionNode later
         func_ast_nodes[unique_ptr] = (void*)node.get();
+        heap_owner_[unique_ptr] = fo;
+        nygc::track(fo);
         captureDefaults(fn.get(), unique_ptr, ctx);
 
         ctx->defineByName(fn->name, func_val);
@@ -3088,27 +3084,29 @@ public:   // NythonExecutor is a struct: members default to public
         // iterations reached 109 MB and 2M reached 1023 MB. The earlier check
         // looked up fn_val.value.p in bound_self_, but that map is keyed by the
         // NEW bound pointer, so it could never hit.
+        //
+        // The binding is a heap object (nyheap::Bound) holding the function
+        // and the instance; the cache refers to it without owning it and
+        // loses the entry when it is freed.
         auto ck = std::make_pair(fn_val.value.p, self_val.value.p);
         auto cached = bound_cache_.find(ck);
-        if (cached != bound_cache_.end()) {
-            Value hit;
-            hit.type    = ValueType::USERDATA;
-            hit.value.p = cached->second;
-            return hit;
-        }
+        if (cached != bound_cache_.end())
+            return nyheap::userValue(cached->second, (void*)&cached->second->tag);
 
-        auto holder = std::make_unique<std::string>("__bound__:" + fn->name);
-        void* bp = (void*)holder.get();
-        bound_store_.push_back(std::move(holder));
+        auto* bo = new nyheap::Bound(this, "__bound__:" + fn->name);
+        void* bp = (void*)&bo->tag;
+        Value out = nyheap::userValue(bo, bp);
+        bo->fn = fn_val;
+        bo->self = self_val;
+        bo->key_fn = ck.first;
+        bo->key_self = ck.second;
         func_names[bp]      = tag;          // keep "__func__:name" so call paths match
         func_ast_nodes[bp]  = ast_ptr;      // same body
         auto cit = closure_contexts.find(fn_val.value.p);
-        if (cit != closure_contexts.end()) { closure_contexts[bp] = cit->second; markEscaped(cit->second); }
-        bound_self_[bp] = self_val;
-        bound_cache_[ck] = bp;
-        Value out;
-        out.type    = ValueType::USERDATA;
-        out.value.p = bp;
+        if (cit != closure_contexts.end()) closure_contexts[bp] = cit->second;   // kept alive by bo->fn
+        bound_self_[bp] = bo;
+        bound_cache_[ck] = bo;
+        nygc::track(bo);
         return out;
     }
 
@@ -4029,11 +4027,11 @@ public:   // NythonExecutor is a struct: members default to public
         ctx->defineByName(cn->name, class_val);
         if (cn->body) {
             Context* class_ctx = new Context(runner, cn->name, nullptr, nullptr, ctx);
+            CtxReaper _class_creator(this, class_ctx);
             class_ctx->inClass = true;
             evalNode(cn->body, class_ctx);
             // Store the evaluated class context so decorators (@property, @staticmethod) are visible
-            class_ctx_map_[(void*)node.get()] = class_ctx;
-            markEscaped(class_ctx);
+            setClassContext((void*)node.get(), class_ctx);
         }
         return class_val;
     }
@@ -4058,22 +4056,22 @@ public:   // NythonExecutor is a struct: members default to public
         ctx->defineByName(in_->name, class_val);
         if (in_->body) {
             Context* iface_ctx = new Context(runner, in_->name, nullptr, nullptr, ctx);
+            CtxReaper _iface_creator(this, iface_ctx);
             evalNode(in_->body, iface_ctx);
-            class_ctx_map_[(void*)node.get()] = iface_ctx;
-            markEscaped(iface_ctx);
+            setClassContext((void*)node.get(), iface_ctx);
         }
         return class_val;
     }
 
     Value evalLambda(node_ptr node, Context* ctx) {
-        int64_t fid = ++closure_id_counter;
-        auto unique_key = std::make_unique<int64_t>(fid);
-        void* unique_ptr = (void*)unique_key.get();
-        func_id_store.push_back(std::move(unique_key));
+        auto* fo = new nyheap::Func(this, ++closure_id_counter);
+        void* unique_ptr = (void*)&fo->id;
+        Value fn_val = nyheap::userValue(fo, unique_ptr);
 
         // Create a persistent closure context that copies current bindings
         // This prevents dangling pointers when the enclosing function returns
         Context* closure_ctx = new Context(runner, "__closure__", nullptr, nullptr, ctx->parent);
+        CtxReaper _closure_creator(this, closure_ctx);   // the lambda takes its own reference
         if (ctx->container) {
             for (auto& [k, v] : *ctx->container) {
                 closure_ctx->defineByName(k, v);
@@ -4098,13 +4096,12 @@ public:   // NythonExecutor is a struct: members default to public
             walk = walk->parent;
         }
 
-        Value fn_val;
-        fn_val.type = ValueType::USERDATA;
-        fn_val.value.p = unique_ptr;
         func_names[unique_ptr] = "__lambda__";
         closure_contexts[unique_ptr] = closure_ctx;
-        markEscaped(closure_ctx);
+        fo->setScope(closure_ctx);
         func_ast_nodes[unique_ptr] = (void*)node.get();
+        heap_owner_[unique_ptr] = fo;
+        nygc::track(fo);
         return fn_val;
     }
 
@@ -4175,7 +4172,7 @@ public:   // NythonExecutor is a struct: members default to public
             auto bs = bound_self_.find(callee_ptr);
             if (bs != bound_self_.end()) {
                 bound_args.reserve(call_args.size() + 1);
-                bound_args.push_back(bs->second);
+                bound_args.push_back(bs->second->self);
                 for (auto& a : call_args) bound_args.push_back(a);
                 argp = &bound_args;
             }
@@ -4555,6 +4552,7 @@ public:
 
     inline void noteStatement(const node_ptr& st, Context* ctx) {
         nyconc::tick();          // GIL switch point (no-op until a thread exists)
+        nygc::safe_point();      // queued __del__ and due collections (one load)
         // Generators dropped while suspended are closed here, between
         // statements, not inside the destructor that dropped them.
         if (__builtin_expect(nygen::t_pending, 0)) nygen::run_pending(*this);
@@ -4930,15 +4928,7 @@ public:
                             // Build a synthetic call: reuse current evalCall non-ATTRIBUTE path
                             std::string class_fname = fn_it->second;
                             std::string className = class_fname.substr(10);
-                            Value instance;
-                            instance.type = ValueType::USERDATA;
-                            auto inst_ptr = std::make_unique<std::string>("__instance__:" + className);
-                            instance.value.p = (void*)inst_ptr.get();
-                            instance_store.push_back(std::move(inst_ptr));
-                            instance_to_class[instance.value.p] = callee_val.value.p;
-                            func_names[instance.value.p] = "__instance__:" + className;
-                            Context* props = new Context(runner, className + "_props", nullptr, nullptr, nullptr);
-                            instance_properties[instance.value.p] = props;
+                            Value instance = newInstance(className, callee_val.value.p);
                             if (isExceptionClass(className)) setExceptionArgs(instance, args);
                             runConstructor(instance, args, kw_args, ctx);
                             return instance;
@@ -5245,11 +5235,13 @@ public:
     //     f = obj.m; f(a, b)  ->  self=a, x=b, y=none (silently wrong)
     // That shift is invisible — attribute reads on the wrong `self` just yield
     // none — so it corrupts callback-driven code without raising an error.
-    std::vector<std::unique_ptr<std::string>> bound_store_;
-    std::map<void*, Value> bound_self_;   // bound-method ptr -> the instance
-    // (method ptr, instance ptr) -> bound-method ptr, so re-reading the same
-    // method off the same object reuses one binding instead of leaking a new one.
-    std::map<std::pair<void*, void*>, void*> bound_cache_;
+    std::vector<std::unique_ptr<std::string>> bound_store_;   // unused since round 75
+    // bound-method ptr -> its heap object (which holds the instance); not
+    // owning: the object removes its entries when it is freed.
+    std::unordered_map<void*, nyheap::Bound*> bound_self_;
+    // (method ptr, instance ptr) -> binding, so re-reading the same method off
+    // the same object reuses one binding while it is alive.
+    std::map<std::pair<void*, void*>, nyheap::Bound*> bound_cache_;
     std::map<void*, void*> instance_to_class; // instance ptr -> class node ptr
     std::map<void*, Context*> instance_properties;
     std::map<std::string, void*> class_by_name; // className -> class node ptr
@@ -5257,7 +5249,14 @@ public:
     std::map<void*, std::string> class_parent; // class node ptr -> parent class name
     std::unordered_map<void*, Value> exc_instance_map_; // raised instance ptr -> Value
     std::map<std::string, Value> class_vars_; // "ClassName.varName" -> Value (shared class-level variables)
-    std::map<void*, Context*> class_ctx_map_; // class node ptr -> evaluated class body context (for decorators)
+    std::map<void*, Context*> class_ctx_map_; // class node ptr -> evaluated class body context (for decorators); owns a reference
+    void setClassContext(void* class_node, Context* c) {
+        nygc::incref(c);
+        Context*& slot = class_ctx_map_[class_node];
+        Context* old = slot;
+        slot = c;
+        if (old) nygc::decref(old);
+    }
 
 
     // Public (struct default) so the VM builtin bridge can dispatch by name.
@@ -5271,14 +5270,23 @@ public:
         {
             Value r;
             if (iterableBuiltin(name_orig, args, ctx, r)) return r;
+            if (gcBuiltin(name_orig, args, r)) return r;
         }
         if (name_orig.rfind("__prop_setter__:", 0) == 0) {
-            uintptr_t gp = 0;
-            std::istringstream iss(name_orig.substr(16));
-            iss >> std::hex >> gp;
-            if (!args.empty()) prop_setters_[reinterpret_cast<void*>(gp)] = args[0];
-            Value g; g.type = ValueType::USERDATA; g.value.p = reinterpret_cast<void*>(gp);
-            return g;
+            // The getter, held since `prop.setter` was read: the def that
+            // follows rebinds the property's name, which used to leave the
+            // getter unreferenced (and its address free for the next def).
+            Value getter;
+            auto pt = prop_setter_target_.find(name_orig);
+            if (pt != prop_setter_target_.end()) { getter = pt->second; prop_setter_target_.erase(pt); }
+            else {
+                uintptr_t gp = 0;
+                std::istringstream iss(name_orig.substr(16));
+                iss >> std::hex >> gp;
+                getter = ownedValue(reinterpret_cast<void*>(gp));
+            }
+            if (!args.empty()) prop_setters_[getter.value.p] = args[0];
+            return getter;
         }
         // ── Exception type constructors ─────────────────────────────────────────
         // ── property() and staticmethod() ─────────────────────────────────────
@@ -5518,6 +5526,7 @@ public:
                                 auto cit = closure_contexts.find(v.value.p);
                                 if (cit != closure_contexts.end()) closure_parent = cit->second;
                                 Context* fc = new Context(runner, fn->name, nullptr, nullptr, closure_parent);
+                                CtxReaper _reap_prop(this, fc);
                                 fc->defineByName("self", obj);
                                 out = runFunctionBody(fn, fc);
                                 return true;
@@ -5603,6 +5612,7 @@ public:
                                     auto cit2 = closure_contexts.find(cv.value.p);
                                     if (cit2 != closure_contexts.end()) cp = cit2->second;
                                     Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
+                                    CtxReaper _reap_prop2(this, fc);
                                     fc->defineByName("self", obj);
                                     out = runFunctionBody(fn, fc);
                                     return true;
@@ -5611,7 +5621,10 @@ public:
                         }
                         // A method read as a value off an INSTANCE must carry its
                         // instance with it, or `self` is lost at call time.
-                        if (instance_to_class.count(obj.value.p)) { out = makeBoundMethod(cv, obj); return true; }
+                        // bind=false (evalCall's method path, hasMemberNoEval):
+                        // only the kind is looked at, so no heap object is made
+                        // for a binding that would be freed right after the call.
+                        if (bind && instance_to_class.count(obj.value.p)) { out = makeBoundMethod(cv, obj); return true; }
                         out = cv;
                         return true;
                     }
@@ -5749,6 +5762,7 @@ public:
     // Properties: a getter function tagged __property__; its setter, from
     // @prop.setter, is kept here.
     std::unordered_map<void*, Value> prop_setters_;
+    std::unordered_map<std::string, Value> prop_setter_target_;   // "__prop_setter__:<p>" -> the getter
     bool any_property_ = false;   // no property anywhere: attribute stores skip the class lookup
     std::vector<std::unique_ptr<std::string>> prop_setter_ids_;
     bool specialAttribute(const Value& obj, const std::string& attr, Context* ctx, Value& out, bool bind = true) {
@@ -5765,10 +5779,11 @@ public:
             // property's setter and returns the property.
             if (attr == "setter" && fit != func_names.end() && fit->second.find("__property__") != std::string::npos) {
                 std::ostringstream os; os << "__prop_setter__:" << obj.value.p;
+                prop_setter_target_[os.str()] = obj;
                 prop_setter_ids_.push_back(std::make_unique<std::string>(os.str()));
                 void* id = prop_setter_ids_.back().get();
                 func_names[id] = "__builtin__:" + os.str();
-                out.type = ValueType::USERDATA; out.value.p = id;
+                out = Value(); out.type = ValueType::USERDATA; out.value.p = id;
                 return true;
             }
             // C.__mro__ / C.__bases__: the classes, in C3 order / as written.
@@ -5799,8 +5814,8 @@ public:
             }
             if (isInstanceValue(obj)) {
                 if (attr == "__class__") {
-                    out.type = ValueType::USERDATA;
-                    out.value.p = instance_to_class[obj.value.p];
+                    void* cls = instance_to_class[obj.value.p];
+                    out = Value(); out.type = ValueType::USERDATA; out.value.p = cls;
                     return true;
                 }
                 if (attr == "__dict__") {
@@ -6106,7 +6121,34 @@ public:
         std::istringstream iss(flow.substr(op + 9));
         iss >> std::hex >> ptr_val;
         auto eit = exc_instance_map_.find(reinterpret_cast<void*>(ptr_val));
-        return eit != exc_instance_map_.end() ? eit->second : NONE_VALUE;
+        if (eit != exc_instance_map_.end()) return eit->second;
+        // Evicted from the ring below while an except clause still handles it.
+        for (auto it = handling_obj_.rbegin(); it != handling_obj_.rend(); ++it)
+            if (it->first == flow) return it->second;
+        return NONE_VALUE;
+    }
+    // A raised instance travels inside the exception string as a serial
+    // number ("__exc__:C:__obj__:<serial>"), and this ring keeps the last
+    // kExcRing raised instances alive for it to find (plus those an except
+    // clause is handling, handling_obj_). A serial, not the address: a string
+    // that outlives its entry must not find a newer object that reuses the
+    // address. (Before round 75 every raised instance was kept forever.)
+    static constexpr size_t kExcRing = 256;
+    uint64_t exc_serial_ = 0;
+    std::deque<void*> exc_ring_;
+    std::vector<std::pair<std::string, Value>> handling_obj_;
+    std::string rememberRaised(const std::string& class_name, const Value& v) {
+        uint64_t serial = ++exc_serial_;
+        void* key = reinterpret_cast<void*>((uintptr_t)serial);
+        exc_instance_map_[key] = v;
+        exc_ring_.push_back(key);
+        while (exc_ring_.size() > kExcRing) {
+            exc_instance_map_.erase(exc_ring_.front());
+            exc_ring_.pop_front();
+        }
+        std::ostringstream oss;
+        oss << "__exc__:" << class_name << ":__obj__:" << std::hex << serial;
+        return oss.str();
     }
     // The exception object an except clause binds: the raised instance, or
     // for an error raised as "__exc__:Type:message" (runtime errors, native
@@ -6126,7 +6168,6 @@ public:
                 if ((t == "StopIteration" || t == "GeneratorExit") && excMessageOf(flow).empty()) a.clear();
                 static const std::unordered_map<std::string, Value> no_kw;
                 Value obj = instantiateClass(cv, a, no_kw, global_ctx);
-                exc_instance_map_[obj.value.p] = obj;
                 return obj;
             }
         }
@@ -6138,6 +6179,9 @@ public:
         if (inst.type != ValueType::NONE) return instanceString(inst, global_ctx);
         if (flow.size() > 8 && flow.compare(0, 8, "__exc__:") == 0) {
             size_t c = flow.find(':', 8);
+            // A raised instance no longer in the ring (rememberRaised): its
+            // serial number is not a message.
+            if (c != std::string::npos && flow.compare(c + 1, 8, "__obj__:") == 0) return std::string();
             return c == std::string::npos ? std::string() : flow.substr(c + 1);
         }
         return flow;
@@ -6231,7 +6275,11 @@ public:
             ctx->defineByName(match->var, exceptionObject(exc));
         }
         handling_exc_.push_back(exc);
-        struct PopHandling { std::vector<std::string>& v; ~PopHandling() { v.pop_back(); } } _ph{handling_exc_};
+        handling_obj_.emplace_back(exc, excInstanceOf(exc));
+        struct PopHandling {
+            std::vector<std::string>& v; std::vector<std::pair<std::string, Value>>& o;
+            ~PopHandling() { v.pop_back(); o.pop_back(); }
+        } _ph{handling_exc_, handling_obj_};
         try { result = evalNode(match->body, ctx); }
         catch (nython::node::YieldSignal&) { throw; }
         catch (...) { run_finally(); throw; }
@@ -6246,18 +6294,27 @@ public:
     // like any method: keyword arguments, defaults evaluated at definition,
     // the class's own scope as its parent (not the caller's), exceptions
     // propagate.
+    // The storage of a new instance: a heap object (nyheap::Inst) that owns
+    // its field scope and every side-table entry keyed by its identity.
+    Value newInstance(const std::string& className, void* class_ptr) {
+        auto* io = new nyheap::Inst(this, "__instance__:" + className, class_ptr);
+        void* ip = (void*)&io->tag;
+        Value instance = nyheap::userValue(io, ip);
+        instance_to_class[ip] = class_ptr;
+        func_names[ip] = "__instance__:" + className;
+        io->props = new Context(runner, className + "_props", nullptr, nullptr, nullptr);   // adopts the creator's reference
+        // Only the instance refers to its field scope, so the collector sees
+        // the pair as one object (Inst::gc_traverse walks the fields): half
+        // the tracked objects for instance-heavy programs.
+        nygc::untrack(io->props);
+        instance_properties[ip] = io->props;
+        nygc::track(io);
+        return instance;
+    }
     Value instantiateClass(const Value& cls, std::vector<Value>& args,
                            const std::unordered_map<std::string, Value>& kw, Context* ctx) {
         std::string className = fnTag(func_names, cls.value.p).substr(10);
-        Value instance;
-        instance.type = ValueType::USERDATA;
-        auto inst_ptr = std::make_unique<std::string>("__instance__:" + className);
-        instance.value.p = (void*)inst_ptr.get();
-        instance_store.push_back(std::move(inst_ptr));
-        instance_to_class[instance.value.p] = cls.value.p;
-        func_names[instance.value.p] = "__instance__:" + className;
-        Context* props = new Context(runner, className + "_props", nullptr, nullptr, nullptr);
-        instance_properties[instance.value.p] = props;
+        Value instance = newInstance(className, cls.value.p);
         if (isExceptionClass(className)) setExceptionArgs(instance, args);
         runConstructor(instance, args, kw, ctx);
         return instance;
@@ -6294,10 +6351,7 @@ public:
                     auto pit = instance_properties.find(v.value.p);
                     if (pit != instance_properties.end()) pit->second->defineByName("__cause__", cause);
                 }
-                std::ostringstream oss;
-                oss << "__exc__:" << class_name << ":__obj__:" << std::hex << reinterpret_cast<uintptr_t>(v.value.p);
-                exc_instance_map_[v.value.p] = v;
-                throw std::string(oss.str());
+                throw rememberRaised(class_name, v);
             }
             throw getStringValue(v);
         }
@@ -7966,6 +8020,7 @@ public:
     Value evalNamespace(node_ptr node, Context* ctx) {
         auto nn = static_pointer_cast<NameSpaceNode>(node);
         Context* ns_ctx = new Context(runner, nn->name, nullptr, nullptr, ctx);
+        CtxReaper _ns_creator(this, ns_ctx);   // its functions hold their own references
         if (nn->body) evalNode(nn->body, ns_ctx);
         // The body ran in ns_ctx, but ns_ctx itself was never exposed under
         // the namespace's own name in the OUTER scope - `namespace ns: var
@@ -8023,6 +8078,227 @@ public:
         }
         return v.isCollectable() ? v.value.gc != nullptr : true;
     }
+    // ── Heap objects: side tables, finalizers, teardown (round 75) ─────────
+    // The heap object behind each function identity (not owning), so a
+    // value can be rebuilt from a bare pointer (a property getter named by a
+    // setter's builtin tag) with its reference.
+    std::unordered_map<void*, nython::gc::Collectable*> heap_owner_;
+    bool finalizers_off_ = false;   // teardown: no __del__
+    Value ownedValue(void* p) {
+        auto it = heap_owner_.find(p);
+        if (it != heap_owner_.end()) return nyheap::userValue(it->second, p);
+        Value v; v.type = ValueType::USERDATA; v.value.p = p;
+        return v;
+    }
+    // A function object is being freed: everything keyed by its identity goes.
+    void forgetFunction(void* p) {
+        func_names.erase(p);
+        closure_contexts.erase(p);
+        func_ast_nodes.erase(p);
+        value_closure_id.erase(p);
+        heap_owner_.erase(p);
+        // Released after the table no longer lists them: releasing a default
+        // can free more functions, which erase their own entries.
+        std::vector<Value> dead_defaults;
+        auto dit = fn_defaults_val_.find(p);
+        if (dit != fn_defaults_val_.end()) { dead_defaults.swap(dit->second); fn_defaults_val_.erase(dit); }
+        Value dead_setter;
+        auto sit = prop_setters_.find(p);
+        if (sit != prop_setters_.end()) { dead_setter = sit->second; prop_setters_.erase(sit); }
+        // f.attr = v: the attributes go with the function; a new function
+        // at this address must not inherit them.
+        std::unordered_map<std::string, Value> dead_attrs;
+        auto fa = func_attrs_.find(p);
+        if (fa != func_attrs_.end()) { dead_attrs.swap(fa->second); func_attrs_.erase(fa); }
+    }
+    void forgetBound(nyheap::Bound* b) {
+        void* p = (void*)&b->tag;
+        func_names.erase(p);
+        func_ast_nodes.erase(p);
+        closure_contexts.erase(p);
+        bound_self_.erase(p);
+        auto ck = std::make_pair(b->key_fn, b->key_self);
+        auto cit = bound_cache_.find(ck);
+        if (cit != bound_cache_.end() && cit->second == b) bound_cache_.erase(cit);
+    }
+    void forgetInstance(void* p) {
+        instance_to_class.erase(p);
+        func_names.erase(p);
+        instance_properties.erase(p);
+    }
+    // weakref(): its objects by id, for the builtin tag that calls them.
+    std::unordered_map<int64_t, nyheap::Weak*> weak_by_id_;
+    int64_t weak_serial_ = 0;
+    void forgetWeak(nyheap::Weak* w) {
+        func_names.erase((void*)&w->tag);
+        weak_by_id_.erase(w->id);
+    }
+    Value makeWeakRef(const Value& obj) {
+        if (!isInstanceVal(obj) || !obj.value.o)
+            pyRaise("TypeError", "cannot create weak reference to '" + typeNameOf(obj) + "' object");
+        nygc::g_weak_hook = &nyheap::weak_target_died;
+        auto* w = new nyheap::Weak(this, ++weak_serial_);
+        w->target = obj.value.o;
+        w->payload = obj.value.p;
+        nyheap::weak_register(w);
+        weak_by_id_[w->id] = w;
+        func_names[(void*)&w->tag] = "__builtin__:" + w->tag;
+        return nyheap::userValue(w, (void*)&w->tag);
+    }
+    // Whether instances of this class run __del__ when they are freed.
+    std::unordered_map<void*, bool> has_del_;
+    bool classHasFinalizer(void* cls) {
+        if (finalizers_off_ || !cls) return false;
+        auto it = has_del_.find(cls);
+        if (it != has_del_.end()) return it->second;
+        bool d = classDefines(cls, "__del__");
+        has_del_[cls] = d;
+        return d;
+    }
+    // __del__, at a safe point (NyGC.hpp): with the instance alive again for
+    // the call. An exception it raises is reported and ignored, as in Python.
+    void runFinalizer(nyheap::Inst* in) {
+        Value self = nyheap::userValue(in, (void*)&in->tag);
+        node_ptr saved_stmt = last_stmt();
+        std::vector<Value> no_args;
+        try { callMethod(self, "__del__", no_args, global_ctx); }
+        catch (std::string& flow) {
+            std::cerr << "Exception ignored in: <function " << instanceClassName(self) << ".__del__>\n"
+                      << describeException(flow) << "\n";
+        }
+        catch (nython::node::ReturnSignal&) {}
+        catch (std::exception& e) {
+            std::cerr << "Exception ignored in: <function " << instanceClassName(self) << ".__del__>\n" << e.what() << "\n";
+        }
+        catch (...) {}
+        last_stmt() = saved_stmt;
+    }
+    // Statement boundaries are the safe points: queued finalizers run and
+    // due collections happen here (one load when there is nothing to do).
+    static inline void gcSafePoint() { nygc::safe_point(); }
+
+    // The executor is going away: release what it holds for the program (the
+    // global scope, class bodies, class variables, raised exceptions, dict
+    // key objects) so reference counting and a last collection free the
+    // program's objects while the side tables they clean up still exist.
+    // No finalizer runs during teardown (on the VM neither).
+    void heapTeardown() {
+        if (!global_ctx) return;
+        // Objects whose last reference went with the program's last statement
+        // still get their __del__ (there was no statement boundary after it).
+        nygc::safe_point();
+        finalizers_off_ = true;
+        {
+            std::vector<Value> dead;
+            for (auto& kv : exc_instance_map_) dead.push_back(kv.second);
+            exc_instance_map_.clear();
+            exc_ring_.clear();
+            handling_obj_.clear();
+            for (auto& kv : key_objs_) dead.push_back(kv.second);
+            key_objs_.clear();
+            for (auto& kv : class_vars_) dead.push_back(kv.second);
+            class_vars_.clear();
+            for (auto& kv : prop_setters_) dead.push_back(kv.second);
+            prop_setters_.clear();
+            for (auto& kv : prop_setter_target_) dead.push_back(kv.second);
+            prop_setter_target_.clear();
+            for (auto& kv : fn_defaults_node_) for (auto& v : kv.second) dead.push_back(v);
+            fn_defaults_node_.clear();
+            for (auto& kv : func_attrs_) for (auto& a : kv.second) dead.push_back(a.second);
+            func_attrs_.clear();
+            for (auto& kv : bound_members_) dead.push_back(kv.second.recv);
+            bound_members_.clear();
+            bound_member_cache_.clear();
+            flow().value = Value();
+        }
+        std::vector<Context*> bodies;
+        for (auto& kv : class_ctx_map_) if (kv.second) bodies.push_back(kv.second);
+        class_ctx_map_.clear();
+        for (Context* c : bodies) { c->gc_clear(); nygc::decref(c); }
+        global_ctx->gc_clear();
+        nygc::collect(nygc::kGenerations - 1);
+        Context* g = global_ctx;
+        global_ctx = nullptr;
+        nygc::decref(g);
+        nygc::collect(nygc::kGenerations - 1);
+    }
+
+    // gc_* builtins (the same names on the VM, src/VMGC.cpp).
+    bool gcBuiltin(const std::string& name, std::vector<Value>& args, Value& out) {
+        if (name.size() < 3 || !(name[0] == 'g' || name[0] == 'm' || name[0] == 'w' || name[0] == '_')) return false;
+        if (name.rfind("__weakref__:", 0) == 0) {
+            auto it = weak_by_id_.find(std::strtoll(name.c_str() + 12, nullptr, 10));
+            if (it == weak_by_id_.end() || !it->second->target) { out = NONE_VALUE; return true; }
+            out = nyheap::userValue(it->second->target, it->second->payload);
+            return true;
+        }
+        if (name == "weakref") {
+            if (args.empty()) pyRaise("TypeError", "weakref() takes exactly one argument (0 given)");
+            out = makeWeakRef(args[0]);
+            return true;
+        }
+        auto argInt = [&](size_t i, int64_t dflt) -> int64_t {
+            if (i < args.size() && args[i].type == ValueType::INTEGER) return bigint_to_i64(args[i].value.i);
+            return dflt;
+        };
+        if (name == "gc_collect") {
+            // Queued finalizers first (they would have run at the next statement).
+            nygc::safe_point();
+            out = intValue((int64_t)nygc::collect((int)argInt(0, nygc::kGenerations - 1)));
+            nygc::safe_point();
+            return true;
+        }
+        if (name == "gc_enable") { nygc::set_enabled(true); out = NONE_VALUE; return true; }
+        if (name == "gc_disable") { nygc::set_enabled(false); out = NONE_VALUE; return true; }
+        if (name == "gc_is_enabled" || name == "gc_isenabled") { out = Value(nygc::is_enabled()); return true; }
+        if (name == "gc_live_objects") { out = intValue((int64_t)nython::gc::collectables_created()); return true; }
+        if (name == "gc_set_threshold") {
+            for (size_t i = 0; i < args.size() && i < (size_t)nygc::kGenerations; i++)
+                nygc::set_threshold((int)i, (long)argInt(i, nygc::threshold((int)i)));
+            out = NONE_VALUE;
+            return true;
+        }
+        if (name == "gc_get_threshold") {
+            std::vector<Value> t;
+            for (int g = 0; g < nygc::kGenerations; g++) t.push_back(intValue((int64_t)nygc::threshold(g)));
+            out = makeListValue(t, true);
+            return true;
+        }
+        if (name == "gc_stats") {
+            nygc::Stats st = nygc::stats();
+            auto* m = new Object((Runnable*)runner, "map", Type::MAP);
+            Value mv((Collectable*)m);
+            long long coll = 0, freed = 0;
+            std::vector<Value> per;
+            for (int g = 0; g < nygc::kGenerations; g++) {
+                coll += st.collections[g];
+                freed += st.collected[g];
+                per.push_back(intValue((int64_t)st.collections[g]));
+            }
+            dictSet(m, internString("engine"), internString("interpreter"));
+            dictSet(m, internString("enabled"), Value(nygc::is_enabled()));
+            dictSet(m, internString("collections"), intValue((int64_t)coll));
+            dictSet(m, internString("collections_per_gen"), makeListValue(per));
+            dictSet(m, internString("collected"), intValue((int64_t)freed));
+            dictSet(m, internString("uncollectable"), intValue((int64_t)st.uncollectable));
+            dictSet(m, internString("finalized"), intValue((int64_t)st.finalized));
+            dictSet(m, internString("freed_by_refcount"), intValue((int64_t)st.freed_by_refcount));
+            dictSet(m, internString("tracked"), intValue((int64_t)st.tracked));
+            dictSet(m, internString("gen0"), intValue((int64_t)st.gen_count[0]));
+            dictSet(m, internString("gen1"), intValue((int64_t)st.gen_count[1]));
+            dictSet(m, internString("gen2"), intValue((int64_t)st.gen_count[2]));
+            dictSet(m, internString("live_objects"), intValue((int64_t)nython::gc::collectables_created()));
+            dictSet(m, internString("live_strings"), intValue((int64_t)st.live_strings));
+            dictSet(m, internString("string_bytes"), intValue((int64_t)st.string_bytes));
+            dictSet(m, internString("rss_kb"), intValue((int64_t)nygc::rss_kb()));
+            out = mv;
+            return true;
+        }
+        if (name == "mem_rss_kb") { out = intValue((int64_t)nygc::rss_kb()); return true; }
+        if (name == "mem_peak_rss_kb") { out = intValue((int64_t)nygc::peak_rss_kb()); return true; }
+        return false;
+    }
+
     // 0 = neither, 1 = __bool__, 2 = __len__, per class.
     std::unordered_map<void*, int> truthy_proto_;
     bool classDefines(void* class_ptr, const std::string& name, int depth = 0) {
@@ -8058,3 +8334,5 @@ public:
     }
 };
 
+// Heap object members that need the whole executor (round 75).
+#include "NyHeapImpl.hpp"

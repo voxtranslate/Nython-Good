@@ -53,7 +53,7 @@ VMVal ret_to_vm(const nyconc::Ret& r) {
 }
 
 VMVal exception_instance(const std::string& type, const std::string& msg) {
-    auto attrs = std::make_shared<VMMap>();
+    auto attrs = std::make_shared<VMMap>(); vmgc::track_map(attrs);
     (*attrs)["msg"] = VMVal::make_str(msg);
     (*attrs)["args"] = VMVal::make_list({VMVal::make_str(msg)});
     return VMVal::make_instance(type, attrs);
@@ -204,6 +204,10 @@ void VMConc::install(VirtualMachine& vm) {
     // One engine per VM, never freed: threads may outlive the call that created
     // them (daemon threads at exit).
     auto* eng = new VMConcEngine(vm);
+    // Listed in a table that is never freed either, so a leak checker sees
+    // the engine as still referenced at exit (deliberate, not a leak).
+    static auto* engines = new std::vector<VMConcEngine*>();
+    engines->push_back(eng);
     for (const auto& name : nyconc::builtin_names()) {
         std::string nm = name;
         vm.globals_[nm] = VMVal::make_native([eng, nm](std::vector<VMVal>& a) -> VMVal {
