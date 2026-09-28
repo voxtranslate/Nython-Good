@@ -38,7 +38,7 @@ struct IntegerNode : Node {
             }
             long long val = std::stoll(v);
             if (val >= INT_MIN && val <= INT_MAX) return Value((int)val);
-            return Value((long int)val);
+            return Value(nython::kernel::bigint(val));   // not (long): 32 bits on Windows
         } catch(...) { return Value(0); }
     }
     void writeToStdOut(PrettyPrinter p) { p.printf("<Integer value=\"%s\" line=\"%d\"/>\n", _token.value.c_str(), line()); }

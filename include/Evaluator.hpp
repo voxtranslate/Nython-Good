@@ -134,7 +134,7 @@ private:
             }
             long long ll = std::stoll(v);
             if (ll >= INT_MIN && ll <= INT_MAX) return Value((int)ll);
-            return Value((long int)ll);
+            return Value(nython::kernel::bigint(ll));   // not (long): 32 bits on Windows
         } catch (...) {
             return Value(0);
         }

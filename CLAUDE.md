@@ -115,6 +115,17 @@ loudly if not found) if auto-detection picks the wrong one.
 - Link libraries: `ws2_32`, `SDL3`, `SDL3_ttf`, `SDL3_image`
 - Copy `SDL3.dll`, `SDL3_ttf.dll`, `SDL3_image.dll` next to `nython.exe`
 - See `SDL3_SETUP.md` for detailed instructions
+- The `.cbp` lists its units: **a new `src/**.cpp` must be added to it** (seven
+  were missing after round 74 and the Windows build could not link).
+- Command strings (`os_exec`, `os_run("...")`, `os_spawn("...")`, the IDE's git,
+  build and tool commands) run through a POSIX `sh` when one is found - Git for
+  Windows' (Source Control needs git anyway), MSYS2's, or `NY_SH` - else
+  through `cmd.exe`. `os_shell()` says which.
+- Tested from Linux without Windows: `tools/cross_windows.sh deps && tools/cross_windows.sh build`
+  cross-compiles with MinGW against SDL3 built for Windows; `build-win/nywin`
+  runs it under Wine and `python3 tools/sweep.py --bin build-win/nywin` sweeps it.
+- `long` is 32 bits on Windows: never cast a Nython integer through `long`
+  (use `int64_t`/`long long`, `intValue()`, `bigint_to_i64()`).
 
 ### Development environment (no SDL3 available)
 

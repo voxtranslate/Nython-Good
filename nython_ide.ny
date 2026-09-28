@@ -27,6 +27,12 @@ class NythonIDE(IDETools):
     def __init__(self):
         self.th = IDETheme()
         self.session_id = time_ms() % 100000000
+        # Scratch files (runs, jobs, recordings, the commit message) live in
+        # the system's temporary directory - "/tmp" does not exist on Windows.
+        # Forward slashes suit both the native APIs and a POSIX sh.
+        self.tmp = string_replace(os_gettempdir(), "\\", "/").rstrip("/")
+        if self.tmp == "":
+            self.tmp = "/tmp"
         # ── window ────────────────────────────────────────────────────────────
         # The workbench is laid out in layout units - VS Code's metrics at
         # 100% - and drawn at self.dpi pixels per unit. SDL3 has two HiDPI
@@ -1902,7 +1908,7 @@ class NythonIDE(IDETools):
             self._term_print("A command is still running (Ctrl+C stops it)", "warn")
             return
         self.term_seq = self.term_seq + 1
-        self.term_proc = BgProc("/tmp/nyide_term_" + str(self.session_id) + "_" + str(self.term_seq))
+        self.term_proc = BgProc(self.tmp + "/nyide_term_" + str(self.session_id) + "_" + str(self.term_seq))
         self.term_proc.start(c, self.term_cwd)
 
     def _poll_term(self):

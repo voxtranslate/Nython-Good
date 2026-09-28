@@ -960,6 +960,13 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
         return Value((int64_t)(h & 0x7fffffffu));
     }
 
+    // gui_video_driver() -> the SDL video driver in use ("windows", "x11",
+    // "wayland", "cocoa", "offscreen", ...; "ny-stub" for the headless stub),
+    // "" when there is no video.
+    if(name=="gui_video_driver"){
+        const char* d = ensure_sdl_for_window() ? SDL_GetCurrentVideoDriver() : nullptr;
+        return E.makeStringValue(d ? d : "");
+    }
     if(name=="gui_display_scale"){
         float sc = 1.0f;
         SDL_DisplayID d = SDL_GetPrimaryDisplay();
@@ -1524,28 +1531,42 @@ Value dispatch_gui(NythonExecutor& E,const std::string& name,std::vector<Value>&
             for(auto& c:tail) c=(char)tolower((unsigned char)c);
             if(tail==".ttf"||tail==".otf"||tail==".ttc") paths.push_back(family);
         }
+        bool mono = family=="monospace"||family=="mono"||family=="Consolas"||family=="Menlo";
 #ifdef _WIN32
-        if(bold && (family=="monospace"||family=="mono"||family=="Consolas"))
-            paths.push_back("C:\\Windows\\Fonts\\consolab.ttf");
-        if(family=="monospace"||family=="mono"||family=="Consolas")
-            paths.push_back("C:\\Windows\\Fonts\\consola.ttf");
-        if(bold) paths.push_back("C:\\Windows\\Fonts\\segoeuib.ttf");
-        paths.push_back("C:\\Windows\\Fonts\\segoeui.ttf");
-        if(bold) paths.push_back("C:\\Windows\\Fonts\\arialbd.ttf");
-        paths.push_back("C:\\Windows\\Fonts\\arial.ttf");
-        paths.push_back("C:\\Windows\\Fonts\\tahoma.ttf");
+        // %WINDIR%\Fonts: Windows is not always on C:.
+        std::string fd = "C:\\Windows";
+        if(const char* wd=getenv("WINDIR")) fd=wd; else if(const char* sr=getenv("SystemRoot")) fd=sr;
+        fd += "\\Fonts\\";
+        if(bold && mono) paths.push_back(fd+"consolab.ttf");
+        if(mono) { paths.push_back(fd+"consola.ttf"); paths.push_back(fd+"cour.ttf"); }
+        if(bold) paths.push_back(fd+"segoeuib.ttf");
+        paths.push_back(fd+"segoeui.ttf");
+        if(bold) paths.push_back(fd+"arialbd.ttf");
+        paths.push_back(fd+"arial.ttf");
+        paths.push_back(fd+"tahoma.ttf");
+#elif defined(__APPLE__)
+        if(mono){
+            paths.push_back("/System/Library/Fonts/SFNSMono.ttf");
+            paths.push_back("/System/Library/Fonts/Menlo.ttc");
+            paths.push_back("/System/Library/Fonts/Monaco.ttf");
+        }
+        paths.push_back("/System/Library/Fonts/SFNS.ttf");
+        paths.push_back("/System/Library/Fonts/Helvetica.ttc");
+        paths.push_back("/System/Library/Fonts/Supplemental/Arial.ttf");
+        paths.push_back("/Library/Fonts/Arial.ttf");
 #else
-        if(family=="monospace"||family=="mono"){
-            if(bold)
-                paths.push_back("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf");
-            paths.push_back("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf");
+        // Debian/Ubuntu, then Arch and Fedora layouts.
+        static const char* kDirs[] = {"/usr/share/fonts/truetype/dejavu/", "/usr/share/fonts/TTF/",
+                                      "/usr/share/fonts/dejavu-sans-fonts/", "/usr/share/fonts/dejavu-sans-mono-fonts/",
+                                      "/usr/share/fonts/dejavu/"};
+        if(mono){
+            for(const char* d:kDirs){ if(bold) paths.push_back(std::string(d)+"DejaVuSansMono-Bold.ttf"); paths.push_back(std::string(d)+"DejaVuSansMono.ttf"); }
+            paths.push_back("/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf");
         }
-        if(bold){
-            paths.push_back("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf");
-            paths.push_back("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf");
-        }
-        paths.push_back("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf");
+        for(const char* d:kDirs){ if(bold) paths.push_back(std::string(d)+"DejaVuSans-Bold.ttf"); paths.push_back(std::string(d)+"DejaVuSans.ttf"); }
+        if(bold) paths.push_back("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf");
         paths.push_back("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf");
+        paths.push_back("/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf");
         paths.push_back("/usr/share/fonts/truetype/freefont/FreeSans.ttf");
 #endif
         paths.insert(paths.begin(),family);

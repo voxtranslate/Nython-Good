@@ -174,7 +174,9 @@ inline nython::kernel::bigint nbig_to_bigint(const nypy::BigInt& n) {
     r.assignLimbs(n.neg, std::move(d));
     return r;
 }
-inline Value intValue(int64_t v) { return Value((long int)v); }
+// Through bigint(long long): `long` is 32 bits on Windows (LLP64), and the
+// old Value((long int)v) truncated every integer above 2^31 there.
+inline Value intValue(int64_t v) { return Value(nython::kernel::bigint((long long)v)); }
 inline Value intValue(const nypy::BigInt& n) {
     int64_t v;
     if (n.to_i64(v)) return intValue(v);
@@ -506,7 +508,7 @@ public:   // NythonExecutor is a struct: members default to public
             "text_fold_ranges","text_line_stats","text_todos","fs_todos","text_format_nython",
             "ac_index_new","ac_index_set_base","ac_index_scan","ac_index_rank","text_diff_classify","fs_symbols","ny_check_file","fs_line_stats",
             // ── GUI builtins — value-returning ──────────────────────────────
-            "gui_get_error","gui_sdl_version","gui_get_display_size","gui_get_window_size","gui_set_window_size","gui_set_cursor","gui_hash_id","gui_display_scale","gui_display_density","gui_window_scale","gui_measure_text_w","gui_set_clipboard","gui_get_clipboard",
+            "gui_get_error","gui_sdl_version","gui_get_display_size","gui_get_window_size","gui_set_window_size","gui_set_cursor","gui_hash_id","gui_display_scale","gui_display_density","gui_video_driver","gui_window_scale","gui_measure_text_w","gui_set_clipboard","gui_get_clipboard",
             "gui_wait_events","gui_set_min_size","gui_set_fullscreen","gui_is_fullscreen","gui_show_open_dialog","gui_show_save_dialog","gui_set_text_input_area","gui_draw_arc","gui_draw_text_wrapped","gui_wrap_text","gui_font_metrics","gui_image_size","gui_free_image","gui_push_clip","gui_pop_clip","gui_push_offset","gui_pop_offset","gui_ticks","gui_next_event","gui_event_get",
             // ── Previously implemented but never registered ──────────────
             // The module dispatchers implement 537 builtins; only 197 were
@@ -596,7 +598,7 @@ public:   // NythonExecutor is a struct: members default to public
             "os_unsetenv","os_environ","os_platform","os_cpu_count","os_hostname",
             "os_username","os_home","os_uname",
             "os_system","os_run","subprocess_run","os_spawn","os_proc_read","os_poll",
-            "os_wait","os_kill","os_getpid","os_getppid","shell_quote","os_shell_quote",
+            "os_wait","os_kill","os_getpid","os_getppid","shell_quote","os_shell_quote","os_shell",
             "which","os_which","sys_argv",
             "time","clock","time_ns","time_monotonic","monotonic","time_perf_counter",
             "perf_counter","time_process","process_time","time_strftime","time_localtime",
