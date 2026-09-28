@@ -554,8 +554,10 @@ extension stack:
   allocating and saves XMM registers. The 64-bit cross build runs it after
   linking. It flags a 12-line reproduction and passes its fixed form.
 
-**32-bit result:** the full sweep on the 32-bit build under 32-bit Wine,
-both engines, every file: 350 runs, 0 not ok. Each build runs under its own
+**Result at e4108e6** (the full sweep, both engines, every file, plus the
+`nython.cbp` unit check: 351 runs each): Linux 0 not ok (0 regressions
+against round 73); the 64-bit build of `nython.cbp` under Wine 0 not ok; the
+32-bit build under 32-bit Wine 0 not ok. Each build runs under its own
 Wine loader (`/usr/lib/wine/wine64`, `/usr/lib/wine/wine`): with `wine32`
 installed, a plain `wine` picks the 32-bit one, which cannot open a 64-bit
 prefix.
