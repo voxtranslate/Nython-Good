@@ -36,6 +36,11 @@ def locked_worker():
         i = i + 1
     return "done"
 
+# The GIL is not handed over while a thread holds a Nython lock (unless it
+# keeps it past a second switch interval): switching out a lock holder makes
+# the other threads block on the lock, and from then on every lock operation
+# is a thread switch (a convoy - 625k switches for these 240k operations).
+var waits0 = thread_wait_count()
 var round_i = 0
 while round_i < 3:
     counter[0] = 0
@@ -50,6 +55,32 @@ while round_i < 3:
     check("locked counter round " + str(round_i), counter[0], 80000)
     check("join results round " + str(round_i), results, ["done", "done", "done", "done", "done", "done", "done", "done"])
     round_i = round_i + 1
+var waits = thread_wait_count() - waits0
+check("no lock convoy (" + str(waits) + " waits for 240000 lock operations)", waits < 24000, true)
+
+# The same with a lock held for most of each iteration: the hand-over is
+# deferred until the lock is released (unlocked, a thread holding it would be
+# switched out at almost every hand-over).
+def long_holder():
+    var i = 0
+    while i < 400:
+        mutex_lock(lock)
+        var j = 0
+        while j < 60:
+            j = j + 1
+        counter[0] = counter[0] + 1
+        mutex_unlock(lock)
+        i = i + 1
+counter[0] = 0
+waits0 = thread_wait_count()
+var lh = []
+for k in range(8):
+    lh.append(thread_create(long_holder))
+for h in lh:
+    thread_join(h, 20000)
+waits = thread_wait_count() - waits0
+check("long critical sections", counter[0], 3200)
+check("no lock-holder preemption (" + str(waits) + " waits for 3200 critical sections)", waits < 800, true)
 
 # atomics: the same with no lock at all
 var at = atomic_new(0)

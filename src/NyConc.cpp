@@ -143,6 +143,9 @@ static int64_t add_obj(std::shared_ptr<T> o, bool async_range = false) {
 // ════════════════════════════════════════════════════════════════════════════
 
 std::atomic<int> g_gil_waiters{0};
+// Times a thread went to sleep: queued for the GIL, or blocked on a lock,
+// condition, queue, join, ... (thread_wait_count()).
+static std::atomic<int64_t> g_waits{0};
 static std::atomic<bool> g_active{false};
 static const auto kSwitchInterval = std::chrono::milliseconds(5);
 
@@ -168,6 +171,7 @@ static void gil_acquire() {
         std::unique_lock<std::mutex> l(g.m);
         uint64_t my = g.next_ticket++;
         if (my != g.serving) {
+            g_waits.fetch_add(1, std::memory_order_relaxed);
             g_gil_waiters.fetch_add(1, std::memory_order_relaxed);
             g.cv.wait(l, [&] { return g.serving == my; });
             g_gil_waiters.fetch_sub(1, std::memory_order_relaxed);
@@ -194,7 +198,18 @@ static void gil_release() {
 void tick_slow() {
     if (!t_holds) return;
     if ((++t_tick & 15u) != 0) return;
-    if (Clock::now() - G().since < kSwitchInterval) return;
+    auto held_for = Clock::now() - G().since;
+    if (held_for < kSwitchInterval) return;
+    // Lock-holder preemption (the problem paravirtualised spinlocks and
+    // Linux's time-slice extension address for vCPUs and threads): handing
+    // the GIL over while this thread holds a Nython lock makes every thread
+    // that wants that lock block on it, after which each lock operation is an
+    // OS context switch - a convoy (8 threads x 10k lock/unlock: 625k context
+    // switches, 6 s; 20 s and more under Wine). So while a lock is held the
+    // hand-over waits for its release (held_erase makes the next tick check
+    // again), for at most one more switch interval, so a thread that keeps a
+    // lock for long still lets the others run.
+    if (t_self && !t_self->held.empty() && held_for < 2 * kSwitchInterval) return;
     // Hand over: the ticket queue puts us behind every waiting thread.
     gil_release();
     gil_acquire();
@@ -319,6 +334,7 @@ static bool block(std::unique_lock<std::mutex>& lk, ThreadRec* self,
         }
     } unreg{self, regs};
     if (self->blocked_forever) check_all_blocked_locked(self);
+    g_waits.fetch_add(1, std::memory_order_relaxed);
     while (true) {
         self->woken = false;
         if (self->task) task_park(lk, self, dl);
@@ -535,7 +551,13 @@ static void lockdep_note_locked(ThreadRec* self, int64_t id) {
 }
 static void held_erase(ThreadRec* self, int64_t id) {
     for (auto it = self->held.rbegin(); it != self->held.rend(); ++it)
-        if (*it == id) { self->held.erase(std::next(it).base()); return; }
+        if (*it == id) {
+            self->held.erase(std::next(it).base());
+            // Its last lock released: a GIL hand-over tick_slow deferred for
+            // it happens at the next tick, not up to 16 ticks later.
+            if (self->held.empty() && self == t_self) t_tick |= 15u;
+            return;
+        }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1584,6 +1606,13 @@ static std::unordered_map<std::string, Handler>& table() {
             int64_t n = 0;
             for (auto* t : RT().live) if (!t->task) n++;
             return Ret::integer(n);
+        };
+        // How many times a thread has gone to sleep - queued for the GIL or
+        // blocked on a lock, condition, queue, join... - since the program
+        // started: the cost of switching, in a unit that does not depend on
+        // the machine's speed.
+        T["thread_wait_count"] = [](Engine&, const Args&) {
+            return Ret::integer(g_waits.load(std::memory_order_relaxed));
         };
         T["thread_list"] = [](Engine& e, const Args&) {
             current(e);

@@ -306,7 +306,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit45 | 45 | JSON codec, print call form, list pop/insert, deep equality, file_mtime |
 | vm_audit46 | 252 | OS layer: paths, files, file objects, typed errors, os_run/os_spawn, env, time, full-width ints, sys.argv |
 | vm_audit47 | 153 | nytorch: kernels, autograd, Module/optimizers, XOR and a toy CNN, checked against PyTorch numbers and finite differences; one definition per class name |
-| vm_audit48 | 125 | threads and synchronisation: mutex/rwlock/condition/semaphore/barrier/latch/atomics/channels/queues/futures/pools, deadlock detection |
+| vm_audit48 | 128 | threads and synchronisation: mutex/rwlock/condition/semaphore/barrier/latch/atomics/channels/queues/futures/pools, deadlock detection, no lock convoys |
 | vm_audit49 | 41 | async/await: tasks, gather, wait_for, cancellation, deterministic order |
 | vm_audit50 | 51 | `lib/thread.ny` over the native runtime |
 | vm_audit51 | 52 | native editor text services (symbols, syntax check, diff, search, folding, format, completion index) |
@@ -687,7 +687,10 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
 - One concurrency runtime for both engines: `include/NyConc.hpp`,
   `src/NyConc.cpp` (engine adapters: `threading.cpp`, `src/VMConc.cpp`).
 - One process-wide GIL (FIFO ticket lock, 5 ms hand-over). It is off
-  until the first thread starts. **Any native code that blocks must release
+  until the first thread starts. A due hand-over waits while the thread holds
+  a Nython lock (at most one more interval) and happens right after its last
+  unlock, so lock holders are not preempted into convoys (round 75;
+  `thread_wait_count()` measures it). **Any native code that blocks must release
   it**: wrap the wait in `nyconc::GilRelease unlocked;` and touch no engine
   state inside it.
 - `async def` / `await`; channels with `select`; futures, pools, task

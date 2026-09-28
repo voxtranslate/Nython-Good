@@ -21,6 +21,9 @@
 //   and the holder has had the GIL for longer than the switch interval (5 ms,
 //   as CPython) it hands the GIL over. The GIL is a FIFO ticket lock, so a
 //   yielding thread queues behind the waiters instead of re-grabbing it.
+//   A hand-over that falls due while the thread holds a Nython lock waits
+//   for its release (at most one more interval): a preempted lock holder
+//   makes every other thread block on the lock, a convoy (tick_slow).
 //   Nothing of this is active until the first thread is created, so a
 //   single-threaded program pays one relaxed atomic load per statement.
 //
