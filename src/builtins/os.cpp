@@ -457,19 +457,25 @@ double ts_of(const struct stat& st, char which) {
 #endif
 }
 
-Value stat_map(NythonExecutor& E, const struct stat* st, bool link) {
+Value stat_map(NythonExecutor& E, const struct stat* st, bool link, const std::string* path = nullptr) {
     using nyos::make_int;
     bool ok = st != nullptr;
+    double mt = ok ? ts_of(*st, 'm') : 0.0, at = ok ? ts_of(*st, 'a') : 0.0, ct = ok ? ts_of(*st, 'c') : 0.0;
+#ifdef _WIN32
+    if (ok && path) { nyos::precise_time(*path, 'm', mt); nyos::precise_time(*path, 'a', at); nyos::precise_time(*path, 'c', ct); }
+#else
+    (void)path;
+#endif
     std::vector<std::pair<std::string, Value>> m = {
         {"exists",  Value(ok)},
         {"size",    make_int(ok ? (long long)st->st_size : 0)},
         {"is_file", Value(ok && S_ISREG(st->st_mode))},
         {"is_dir",  Value(ok && S_ISDIR(st->st_mode))},
         {"is_link", Value(link)},
-        {"mtime",   Value(ok ? ts_of(*st, 'm') : 0.0)},
-        {"atime",   Value(ok ? ts_of(*st, 'a') : 0.0)},
-        {"ctime",   Value(ok ? ts_of(*st, 'c') : 0.0)},
-        {"mtime_ms", make_int(ok ? (long long)(ts_of(*st, 'm') * 1000.0) : 0)},
+        {"mtime",   Value(mt)},
+        {"atime",   Value(at)},
+        {"ctime",   Value(ct)},
+        {"mtime_ms", make_int((long long)(mt * 1000.0))},
         {"mode",    make_int(ok ? (long long)st->st_mode : 0)},
         {"permissions", make_int(ok ? (long long)(st->st_mode & 07777) : 0)},
         {"uid",     make_int(ok ? (long long)st->st_uid : 0)},
@@ -900,7 +906,7 @@ Value dispatch_os(NythonExecutor& E,
         std::string p = S(0);
         struct stat st;
         bool link = is_link(p);
-        if (path_stat(p, st)) return stat_map(E, &st, link);
+        if (path_stat(p, st)) return stat_map(E, &st, link, &p);
         return stat_map(E, nullptr, link);
     }
     if (name == "os_stat" || name == "os_lstat") {
@@ -908,7 +914,7 @@ Value dispatch_os(NythonExecutor& E,
         struct stat st;
         bool ok = name == "os_stat" ? path_stat(p, st) : path_lstat(p, st);
         if (!ok) raise_errno(errno, p);
-        return stat_map(E, &st, is_link(p));
+        return stat_map(E, &st, is_link(p), &p);
     }
 
     // ── Directories ──────────────────────────────────────────────────────────
@@ -1193,7 +1199,13 @@ Value dispatch_os(NythonExecutor& E,
     if (name == "chdir" || name == "cd" || name == "os_chdir") {
         if (args.empty()) return Value(false);
         bool ok = ::chdir(S(0).c_str()) == 0;
-        if (!ok && name == "os_chdir") raise_errno(errno, S(0));
+        if (!ok && name == "os_chdir") {
+            // A file is NotADirectoryError everywhere, as in Python (Windows'
+            // _chdir reports EINVAL for it).
+            int e = errno;
+            if (exists(S(0)) && !is_dir(S(0))) e = ENOTDIR;
+            raise_errno(e, S(0));
+        }
         return Value(ok);
     }
 

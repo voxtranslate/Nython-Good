@@ -86,4 +86,23 @@ std::pair<std::string, std::string> split(const std::string& p);
 std::pair<std::string, std::string> splitext(const std::string& p);
 bool fnmatch(const std::string& name, const std::string& pat);
 
+// Modification/access/creation times at full precision on Windows, whose
+// _stat gives whole seconds (a rewrite within the same second looked
+// unchanged to file watchers). which: 'm', 'a' or 'c'. false when the path
+// cannot be read; not used elsewhere, where struct stat is exact.
+#ifdef _WIN32
+inline bool precise_time(const std::string& path, char which, double& out) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    if (n <= 0) return false;
+    std::wstring w((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &w[0], n);
+    WIN32_FILE_ATTRIBUTE_DATA d;
+    if (!GetFileAttributesExW(w.c_str(), GetFileExInfoStandard, &d)) return false;
+    const FILETIME& ft = which == 'm' ? d.ftLastWriteTime : which == 'a' ? d.ftLastAccessTime : d.ftCreationTime;
+    unsigned long long t = ((unsigned long long)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    out = (double)(t - 116444736000000000ULL) / 1e7;     // 100 ns ticks since 1601 -> s since 1970
+    return true;
+}
+#endif
+
 } // namespace nyos

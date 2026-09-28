@@ -61,6 +61,7 @@
 extern char** environ;
 #else
 #  include <process.h>
+#  include <tlhelp32.h>
 #endif
 
 using namespace std;
@@ -752,7 +753,16 @@ Value dispatch_os_proc(NythonExecutor& E,
         // command text, so it only applied to its LAST simple command.
         if (args.empty()) return Str("");
 #ifdef _WIN32
-        return Str(capture(S(0) + " 2>&1", false));
+        // stderr merged at the pipe: " 2>&1" on the text only redirected
+        // its last command.
+        Cmd c;
+        c.shell = true;
+        c.line = S(0);
+        std::string out, err;
+        int code = 0;
+        bool timed_out = false;
+        run_to_end(c, "", {}, false, "", true, -1, out, err, code, timed_out);
+        return Str(out);
 #else
         return Str(capture("{ " + S(0) + "\n} 2>&1", false));
 #endif
@@ -905,7 +915,17 @@ Value dispatch_os_proc(NythonExecutor& E,
     }
     if (name == "os_getppid") {
 #ifdef _WIN32
-        return Value(0);
+        // The parent's pid from a process snapshot, as Python's os.getppid.
+        DWORD me = GetCurrentProcessId(), parent = 0;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (snap != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W pe{};
+            pe.dwSize = sizeof pe;
+            for (BOOL ok = Process32FirstW(snap, &pe); ok; ok = Process32NextW(snap, &pe))
+                if (pe.th32ProcessID == me) { parent = pe.th32ParentProcessID; break; }
+            CloseHandle(snap);
+        }
+        return Value((int)parent);
 #else
         return Value((int)::getppid());
 #endif

@@ -79,7 +79,13 @@ build() {
     cp "$PREFIX"/bin/*.dll "$OUT/"
     cp /usr/lib/gcc/x86_64-w64-mingw32/*-posix/libstdc++-6.dll /usr/lib/gcc/x86_64-w64-mingw32/*-posix/libgcc_s_seh-1.dll \
        /usr/x86_64-w64-mingw32/lib/libwinpthread-1.dll "$OUT/"
-    [ -f /opt/busybox-w32/busybox.exe ] && cp /opt/busybox-w32/busybox.exe "$OUT/sh/sh.exe"
+    # busybox-w32 as the POSIX sh, and as the tools Git for Windows keeps
+    # beside its sh.exe (busybox picks the applet by its file name).
+    if [ -f /opt/busybox-w32/busybox.exe ]; then
+        for t in sh echo cat pwd sleep true false printf kill ls grep; do
+            cp /opt/busybox-w32/busybox.exe "$OUT/sh/$t.exe"
+        done
+    fi
     # The Wine prefix, with Arial/Consolas stand-ins (Liberation / DejaVu).
     export WINEPREFIX="$OUT/wineprefix" WINEDEBUG=-all
     [ -d "$WINEPREFIX" ] || DISPLAY=${DISPLAY:-:99} wineboot -i >/dev/null 2>&1 || true

@@ -21,10 +21,12 @@ t("h_line3", file_readline(h), "gamma")
 t("h_eof", file_readline(h), none)
 file_close(h)
 
-# keep_newline=true: the ending stays and EOF is "" (what file objects need)
+# keep_newline=true: the ending stays and EOF is "" (what file objects need).
+# A text-mode handle reads \r\n as \n (Python's universal newlines), on
+# every platform; "rb" keeps the bytes.
 var k = file_open(path, "r")
 t("k_line1", file_readline(k, true), "alpha\n")
-t("k_line2", file_readline(k, true), "beta\r\n")
+t("k_line2", file_readline(k, true), "beta\n")
 t("k_line3", file_readline(k, true), "gamma")
 t("k_eof", file_readline(k, true), "")
 file_close(k)
@@ -32,7 +34,7 @@ file_close(k)
 # file objects from open(), as in Python
 var f = open(path, "r")
 t("o_line1", f.readline(), "alpha\n")
-t("o_rest", f.readlines(), ["beta\r\n", "gamma"])
+t("o_rest", f.readlines(), ["beta\n", "gamma"])
 t("o_eof", f.readline(), "")
 f.close()
 var n = 0
@@ -40,6 +42,11 @@ with open(path) as g:
     for line in g:
         n += 1
 t("o_iter", n, 3)
+
+var b = file_open(path, "rb")
+file_readline(b, true)
+t("rb_keeps_crlf", file_readline(b, true), "beta\r\n")
+file_close(b)
 
 os_remove(path)
 print "  READLINE: " + str(pass_n) + " passed, " + str(fail_n) + " failed"

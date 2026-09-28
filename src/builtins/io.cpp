@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <set>
 #include <sstream>
 #include <regex>
 #include <cstdlib>
@@ -142,6 +143,32 @@ bool kv_save(const std::string& store, const std::map<std::string, std::string>&
     if (!fout.is_open()) return false;
     for (auto& kv : db) fout << kv_escape(kv.first) << '\x1F' << kv_escape(kv.second) << '\n';
     return true;
+}
+
+// Handles opened in text mode (no "b"): reading them turns \r\n into \n,
+// Python's universal newlines. The Windows C runtime does that itself for
+// a text-mode FILE*; elsewhere it is done here, so a CRLF file reads the same
+// on every platform. Binary handles stay byte-exact.
+std::set<FILE*>& text_handles() {
+    static std::set<FILE*> s;
+    return s;
+}
+void text_newlines(FILE* f, std::string& s) {
+#ifndef _WIN32
+    if (!text_handles().count(f) || s.find('\r') == std::string::npos) return;
+    std::string o;
+    o.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+        if (s[i] == '\r' && i + 1 < s.size() && s[i + 1] == '\n') continue;
+        o += s[i];
+    }
+    s.swap(o);
+#else
+    (void)f; (void)s;
+#endif
+}
+void track_text(FILE* f, const std::string& mode) {
+    if (f && mode.find('b') == std::string::npos) text_handles().insert(f);
 }
 
 } // namespace
@@ -301,6 +328,7 @@ Value dispatch_io(NythonExecutor& E,
                 if (raise) nyos::raise_errno(errno ? errno : ENOENT, path);
                 return Value(-1);
             }
+            track_text(f, mode);
             int handle = next_file_handle++;
             file_handles[handle] = f;
             return Value(handle);
@@ -312,6 +340,7 @@ Value dispatch_io(NythonExecutor& E,
             std::string mode = args.size() >= 2 ? getStringValue(args[1]) : "r";
             FILE* f = fopen(getStringValue(args[0]).c_str(), fopen_mode(mode).c_str());
             if (!f) return Value(-1);
+            track_text(f, mode);
             int handle = next_file_handle++;
             file_handles[handle] = f;
             return Value(handle);
@@ -327,6 +356,7 @@ Value dispatch_io(NythonExecutor& E,
             long long h = handle_of(E, args[0]);
             auto it = file_handles.find((int)h);
             if (it == file_handles.end()) return Value(false);
+            text_handles().erase(it->second);
             fclose(it->second);
             file_handles.erase(it);
             return Value(true);
@@ -348,6 +378,7 @@ Value dispatch_io(NythonExecutor& E,
                 size_t r = fread(&content[0], 1, (size_t)size, f);
                 content.resize(r);
             }
+            text_newlines(f, content);
             return makeStringValue(content);
         }
         if (name == "file_write" || name == "fwrite") {
@@ -374,6 +405,7 @@ Value dispatch_io(NythonExecutor& E,
                 if (c == '\n') break;
             }
             if (!any) return keep ? makeStringValue("") : NONE_VALUE;
+            text_newlines(f, line);
             if (!keep) while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
             return makeStringValue(line);
         }
@@ -460,7 +492,9 @@ Value dispatch_io(NythonExecutor& E,
 #if defined(__APPLE__)
                     long long ms = (long long)st.st_mtimespec.tv_sec * 1000 + st.st_mtimespec.tv_nsec / 1000000;
 #elif defined(_WIN32)
-                    long long ms = (long long)st.st_mtime * 1000;
+                    double t = (double)st.st_mtime;
+                    nyos::precise_time(path, 'm', t);         // _stat has whole seconds
+                    long long ms = (long long)(t * 1000.0);
 #else
                     long long ms = (long long)st.st_mtim.tv_sec * 1000 + st.st_mtim.tv_nsec / 1000000;
 #endif
