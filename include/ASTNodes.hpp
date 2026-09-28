@@ -308,6 +308,11 @@ struct AugAssignNode : Node {
 
 struct VarDeclNode : Node {
     std::string name; node_ptr init; bool is_const, is_let;
+    // The hidden temporary of an unpacking assignment (a, b = rhs), which the
+    // targets then index: n targets (-1 with a starred one). A generator or
+    // iterator on the right is read into a list first (both engines); -2 for
+    // any other declaration.
+    int unpack = -2;
     VarDeclNode(Token t, const std::string& n, node_ptr i, bool c=false, bool l=false) : Node(t, NodeType::VARIABLE_DECL), name(n), init(i), is_const(c), is_let(l) {}
     Value eval(Context* ctx) override {
         Value val = init ? init->eval(ctx) : NONE_VALUE;

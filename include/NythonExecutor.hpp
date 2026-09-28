@@ -104,6 +104,8 @@ static std::string utf8_lower(const std::string& s) {
 #include "ASTNodes.hpp"
 #include "DynamicLang.hpp"
 #include "Runtime.hpp"
+#include "NyCoro.hpp"   // stackful coroutines (round 75)
+#include "NyGen.hpp"    // lazy generators on those coroutines (src/NyGen.cpp)
 
 using namespace std;
 using namespace nython;
@@ -232,9 +234,6 @@ struct NythonExecutor {
     Context* global_ctx;
     Runnable* runner;
     std::map<void*, std::string> func_names;
-    // Per OS thread: generator collection in one thread must not capture the
-    // yields of another (round 74, threads).
-    static inline thread_local std::vector<Value>* yield_sink_ = nullptr; // set during generator collection
     std::map<int, FILE*> file_handles{};
     int next_file_handle{1000};
     std::map<void*, Context*> closure_contexts;
@@ -260,6 +259,9 @@ struct NythonExecutor {
     }
     void reapContext(Context* c) {
         if (!c) return;
+        // A generator still runs in it, or a generator expression reads it:
+        // freed when the last of them finishes (nygen).
+        if (nygen::g_pinned && nygen::defer_reap(c)) return;
         if (escaped_ctxs_.count(c)) return;
         // Container news its map and its destructor does not free it, and the
         // copy constructor is defaulted (shallow), so the shared destructor
@@ -491,6 +493,7 @@ public:   // NythonExecutor is a struct: members default to public
             "pow","divmod","input","dict","display","show","is_int","is_float","is_string","is_list","is_none","is_bool","to_int","to_float","to_str","clamp","lerp","map_range","repeat_str","repeat","flatten","flat","shell","system","ls","cat","pwd","mkdir","write","exists","env","all","any","complex","slice","super","property",
             "staticmethod","classmethod","callable","dir","vars","globals","locals",
             "iter","next","help","Set","Counter","OrderedDict","deque","defaultdict","assert",
+            "islice","take",   // lazy iteration (src/NyGen.cpp), both engines
             "sqrt","sin","cos","tan","log","floor","ceil",
             "keys","values","items",
             "read_file","write_file","file_exists",
@@ -847,16 +850,19 @@ public:   // NythonExecutor is a struct: members default to public
             case NodeType::WITH: { SuspendFast _sf; return evalWith(node, ctx); }
             case NodeType::NAMESPACE: { SuspendFast _sf; return evalNamespace(node, ctx); }
             case NodeType::INTERFACE: { SuspendFast _sf; return evalInterfaceDecl(node, ctx); }
-            case NodeType::YIELD: { auto yn = static_pointer_cast<YieldNode>(node); Value yv = yn->expr ? evalNode(yn->expr, ctx) : NONE_VALUE; if (yield_sink_) { yieldValue(yv); return NONE_VALUE; } throw nython::node::YieldSignal(yv); }
+            case NodeType::YIELD: {
+                // Suspends the generator's coroutine; the value is what
+                // send() delivers (none for next()) - src/NyGen.cpp.
+                auto yn = static_pointer_cast<YieldNode>(node);
+                Value yv = yn->expr ? evalNode(yn->expr, ctx) : NONE_VALUE;
+                return nygen::yield_value(*this, yv);
+            }
             case NodeType::YIELD_FROM: {
-                // yield from it: every value of `it`, yielded in turn.
+                // Delegates next/send/throw/close to the subiterator; the
+                // value is the subgenerator's return value.
                 auto yf = static_pointer_cast<YieldFromNode>(node);
                 Value src = evalNode(yf->expr, ctx);
-                // (what is left of a generator, which this consumes)
-                std::vector<Value> items = iterValues(src, ctx);
-                if (!yield_sink_) throw nython::node::YieldSignal(items.empty() ? NONE_VALUE : items[0]);
-                for (auto& item : items) yieldValue(item);
-                return NONE_VALUE;
+                return nygen::yield_from(*this, src, ctx);
             }
             case NodeType::GLOBAL: return NONE_VALUE;
             case NodeType::SELF: return ctx->getByName("self");
@@ -1012,6 +1018,8 @@ public:   // NythonExecutor is a struct: members default to public
     Value evalVarDecl(node_ptr node, Context* ctx) {
         auto vd = static_pointer_cast<VarDeclNode>(node);
         Value val = vd->init ? evalNode(vd->init, ctx) : NONE_VALUE;
+        // a, b = gen(): the targets index a list of its values (nygen).
+        if (vd->unpack != -2 && nygen::is_gen(val)) val = nygen::unpack_list(*this, val, vd->unpack, ctx);
         ctx->defineByName(vd->name, val);
         return val;
     }
@@ -1348,17 +1356,17 @@ public:   // NythonExecutor is a struct: members default to public
 
     // `x in c`
     bool containsValue(const Value& c, const Value& x, Context* ctx) {
+        // A generator: consumed up to the first match.
+        if (nygen::Gen* g = nygen::gen_of(c)) return nygen::contains(*this, g, x, ctx);
         // An object: __contains__, else a search of what it iterates over
-        // (__iter__ / __getitem__), as in Python.
+        // (__iter__ / __getitem__), stopping at the first match, as in Python.
         if (isInstanceVal(c)) {
             if (instanceHasMethod(c, "__contains__")) {
                 std::vector<Value> args = {x};
                 return isTruthy(callMethod(c, "__contains__", args, ctx));
             }
-            if (instanceHasMethod(c, "__iter__") || instanceHasMethod(c, "__getitem__") || instanceHasMethod(c, "__next__")) {
-                for (auto& v : iterValues(c, ctx)) if (pyEquals(x, v, ctx)) return true;
-                return false;
-            }
+            if (instanceHasMethod(c, "__iter__") || instanceHasMethod(c, "__getitem__") || instanceHasMethod(c, "__next__"))
+                return nygen::contains_iter(*this, c, x, ctx);
             pyRaise("TypeError", "argument of type '" + instanceClassName(c) + "' is not iterable");
         }
         if (isStringValue(c)) {
@@ -1676,6 +1684,7 @@ public:   // NythonExecutor is a struct: members default to public
         }
         if (a.isCollectable() && b.isCollectable() && a.value.gc && b.value.gc) {
             if (a.value.gc == b.value.gc) return true;
+            if (nygen::is_gen(a) || nygen::is_gen(b)) return false;   // generators: identity
             auto* lc = dynamic_cast<Container*>(a.value.gc);
             auto* rc = dynamic_cast<Container*>(b.value.gc);
             if (!lc || !rc || !lc->container || !rc->container) return a == b;
@@ -1978,7 +1987,7 @@ public:   // NythonExecutor is a struct: members default to public
         }
         if (name == "update" || name == "merge") {
             if (!args.empty()) {
-                if (Container* src = contOf(args[0]); src && seqLen(src) < 0) dictUpdate(cont, src);
+                if (Container* src = contOf(args[0]); src && seqLen(src) < 0 && !nygen::is_gen(args[0])) dictUpdate(cont, src);
                 else for (auto& pairv : iterItems(args[0], ctx)) {
                     std::vector<Value> kv = iterItems(pairv, ctx);
                     if (kv.size() != 2) pyRaise("ValueError", "dictionary update sequence element has length " + std::to_string(kv.size()) + "; 2 is required");
@@ -2076,6 +2085,7 @@ public:   // NythonExecutor is a struct: members default to public
 
     // obj[idx]
     Value getItem(const Value& obj, const Value& idx, Context* ctx) {
+        if (nygen::is_gen(obj)) pyRaise("TypeError", "'generator' object is not subscriptable");
         // String indexing, in characters: s[0], s[-1]
         if (obj.type == ValueType::USERDATA && obj.value.p && !func_names.count(obj.value.p)) {
             const std::string& s = *(std::string*)obj.value.p;
@@ -2203,17 +2213,14 @@ public:   // NythonExecutor is a struct: members default to public
     // order, a dict's keys, a string's characters, or an instance's
     // __iter__/__next__ sequence.
     std::vector<Value> iterItems(const Value& v, Context* ctx) {
+        // A generator: what is left of it, pulled one value at a time.
+        if (nygen::Gen* g = nygen::gen_of(v)) {
+            std::vector<Value> out;
+            nygen::drain(*this, g, out, ctx);
+            return out;
+        }
         if (Container* c = contOf(v)) {
-            if (seqLen(c) >= 0) {
-                if (!isGenCont(c)) return seqItems(c);
-                // A generator: what is left of it, which this consumes.
-                auto ix = c->container->find("__idx__");
-                int64_t from = ix != c->container->end() ? bigint_to_i64(ix->second.value.i) : 0;
-                std::vector<Value> all = seqItems(c);
-                (*c->container)["__idx__"] = intValue((int64_t)all.size());
-                if (from <= 0) return all;
-                return std::vector<Value>(all.begin() + std::min<int64_t>(from, (int64_t)all.size()), all.end());
-            }
+            if (seqLen(c) >= 0) return seqItems(c);
             return dictKeys(c);
         }
         if (isStringValue(v)) {
@@ -2236,6 +2243,7 @@ public:   // NythonExecutor is a struct: members default to public
             default: break;
         }
         if (isStringValue(v)) return "str";
+        if (nygen::is_gen(v)) return "generator";
         if (Container* c = contOf(v)) {
             if (seqLen(c) < 0) return "dict";
             return isTupleCont(c) ? "tuple" : isSetCont(c) ? "set" : isGenCont(c) ? "generator" : "list";
@@ -2306,6 +2314,7 @@ public:   // NythonExecutor is a struct: members default to public
             const std::string& s = *(std::string*)v.value.p;
             return repr ? nypy::str_repr(s) : s;
         }
+        if (nygen::is_gen(v)) return v.value.gc->toString();   // <generator object f at 0x...>
         Container* c = contOf(v);
         if (!c) return v.value.gc ? v.value.gc->toString() : "none";
         int64_t n = seqLen(c);
@@ -2466,7 +2475,7 @@ public:   // NythonExecutor is a struct: members default to public
         bool mapping = false;
         Container* rc = contOf(rv);
         if (rc && seqLen(rc) >= 0 && isTupleCont(rc)) args = seqItems(rc);
-        else { args.push_back(rv); mapping = rc && seqLen(rc) < 0; }
+        else { args.push_back(rv); mapping = rc && seqLen(rc) < 0 && !nygen::is_gen(rv); }
         std::string out = nyCall([&] {
             return nypy::percent_format(fmt, (int64_t)args.size(), mapping,
                 [&](int64_t i, const std::string& key, char conv) -> nypy::FmtVal {
@@ -2730,7 +2739,12 @@ public:   // NythonExecutor is a struct: members default to public
         auto fn = static_pointer_cast<ForNode>(node);
         bool broke = false;
         FlowState& lf = flow();
+        uint64_t gen_s0 = nygen::serial_now();
         Value iter_val = evalNode(fn->iterable, ctx);
+        // A generator the iterable expression made itself belongs to this
+        // loop alone: it is closed when the loop ends (break, return, error),
+        // as CPython's reference counting does (nygen::fresh).
+        bool gen_owned = gen_s0 != nygen::serial_now() && nygen::fresh(iter_val, fn->iterable, call_depth_, gen_s0);
         std::string var_name = fn->var->value();
         Value result = NONE_VALUE;
         // The loop variable is a local, unless the function declared it
@@ -2749,11 +2763,17 @@ public:   // NythonExecutor is a struct: members default to public
         Value pre_iterator; bool have_pre_iterator = false;
         if (isInstanceValue(iter_val) && instanceHasMethod(iter_val, "__iter__")) {
             std::vector<Value> no_args;
+            uint64_t s1 = nygen::serial_now();
             Value it = callMethod(iter_val, "__iter__", no_args, ctx);
             if (isInstanceValue(it)) { pre_iterator = it; have_pre_iterator = true; }
-            else if (it.type != ValueType::NONE && it.type != ValueType::UNDEFINED) iter_val = it;
+            else if (it.type != ValueType::NONE && it.type != ValueType::UNDEFINED) {
+                iter_val = it;
+                gen_owned = nygen::fresh_implicit(it, call_depth_, s1);   // `def __iter__(self): yield ...`
+            }
             else throw std::string("__exc__:TypeError:iter() returned non-iterator of type 'NoneType'");
         }
+        // A generator: one value per iteration, pulled lazily (src/NyGen.cpp).
+        if (nygen::is_gen(iter_val)) return nygen::for_loop(*this, fn.get(), iter_val, ctx, gen_owned);
 
         // range() returns an integer — iterate 0..n-1
         if (iter_val.type == ValueType::INTEGER) {
@@ -3186,19 +3206,13 @@ public:   // NythonExecutor is a struct: members default to public
                      const std::unordered_map<std::string, Value>* kw_in = nullptr) {
         static const std::unordered_map<std::string, Value> kEmptyKw;
         const std::unordered_map<std::string, Value>& kw_args_in = kw_in ? *kw_in : kEmptyKw;
-        // A generator (eager, see collectGenerator): send(v) advances it as
-        // next() does - the value is not delivered, `x = yield` reads none
-        // on this engine (the VM delivers it) - and close() exhausts it.
-        if (isGenValue(obj)) {
-            if (method_name == "send" || method_name == "__next__") {
-                std::vector<Value> a{obj};
-                return callBuiltin("next", a, ctx);
-            }
-            if (method_name == "close") {
-                auto* c = dynamic_cast<Container*>(obj.value.gc);
-                (*c->container)["__idx__"] = (*c->container)["__len__"];
-                return NONE_VALUE;
-            }
+        // A generator: send / throw / close / __next__ / __iter__ (NyGen.cpp),
+        // then the object protocol; nothing else.
+        if (nygen::is_gen(obj)) {
+            Value r;
+            if (nygen::method(*this, obj, method_name, args, ctx, r)) return r;
+            if (primitiveMember(obj, method_name, args, ctx, r)) return r;
+            pyRaise("AttributeError", "'generator' object has no attribute '" + method_name + "'");
         }
         {
             Value pm;
@@ -4541,6 +4555,9 @@ public:
 
     inline void noteStatement(const node_ptr& st, Context* ctx) {
         nyconc::tick();          // GIL switch point (no-op until a thread exists)
+        // Generators dropped while suspended are closed here, between
+        // statements, not inside the destructor that dropped them.
+        if (__builtin_expect(nygen::t_pending, 0)) nygen::run_pending(*this);
         last_stmt() = st;
         if (trace_on()) traceStatement(st, ctx);
     }
@@ -4604,6 +4621,45 @@ public:
         fflush(T.f);
     }
 
+    // A builtin call some of whose arguments are generators their own
+    // argument expressions just made (nygen::fresh), so nothing else refers
+    // to them: lazy wrappers (zip, map, islice...) take them over, and a
+    // builtin that consumes its argument (any, next, sum...) closes them when
+    // it returns. Their finally blocks run then, as under CPython's reference
+    // counting, and nothing is left suspended behind any(x for x in ...).
+    Value callBuiltinTemps(const std::string& b, std::vector<Value>& args, Context* ctx,
+                           const std::shared_ptr<CallNode>& cn, uint64_t s0) {
+        uint32_t mask = 0;
+        size_t pos = 0;
+        bool simple = true;
+        std::vector<std::pair<size_t, node_ptr>> at;
+        for (auto& a : cn->args) {
+            if (a->type() == NodeType::KEYWORD_ARG) continue;
+            if (a->type() == NodeType::UNARY) {
+                auto un = static_pointer_cast<UnaryNode>(a);
+                if (un->op == "*" || un->op == "**") { simple = false; break; }
+            }
+            at.push_back({pos++, a});
+        }
+        if (simple)
+            for (auto& [i, a] : at)
+                if (i < args.size() && i < 32 && nygen::fresh(args[i], a, call_depth_, s0)) mask |= 1u << i;
+        if (!mask) return callBuiltin(b, args, ctx);
+        bool consumes = nygen::consumes(b);
+        auto close_temps = [&]() {
+            if (!consumes) return;
+            for (size_t i = 0; i < args.size() && i < 32; i++)
+                if ((mask >> i) & 1u) nygen::close_temp(*this, args[i]);
+        };
+        nygen::t_fresh_args = mask;
+        Value r;
+        try { r = callBuiltin(b, args, ctx); }
+        catch (...) { nygen::t_fresh_args = 0; close_temps(); throw; }
+        nygen::t_fresh_args = 0;
+        close_temps();
+        return r;
+    }
+
     // Best-effort display name for a call site: `f()`, `obj.m()` -> "obj.m".
     std::string callTargetName(const std::shared_ptr<CallNode>& cn) {
         if (!cn || !cn->callee) return std::string();
@@ -4626,6 +4682,9 @@ public:
             throw std::string("__exc__:RecursionError:maximum call depth exceeded ("
                               + std::to_string(kMaxCallDepth) + ") — check for unintended "
                               "self-recursion, e.g. a method with the same name as a builtin");
+        // Inside a generator the body runs on the generator's own stack;
+        // near its end, the call continues on an extension stack (nygen).
+        if (nycoro::stack_exhausted()) return nygen::call_on_new_stack(*this, node, ctx);
         DepthGuard _depth_guard(call_depth_);
         auto cn = static_pointer_cast<CallNode>(node);
         // Zero cost when profiling is off: ProfScope short-circuits on the flag.
@@ -4914,6 +4973,7 @@ public:
         // Evaluate arguments (handles keyword args, *spread, **spread)
         std::vector<Value> args;
         std::unordered_map<std::string, Value> kw_args;
+        uint64_t gen_s0 = nygen::serial_now();
         evalCallArgs(cn->args, ctx, args, kw_args);
 
         // Check for built-in functions
@@ -4958,6 +5018,7 @@ public:
                 for (auto& an : cn->args)
                     if (an->type() == NodeType::KEYWORD_ARG) cur_kw_order_.push_back(static_pointer_cast<KeywordArgNode>(an)->name);
                 KwScope ks(this, kw_args.empty() ? nullptr : &kw_args);
+                if (gen_s0 != nygen::serial_now()) return callBuiltinTemps(builtin, args, ctx, cn, gen_s0);
                 return callBuiltin(builtin, args, ctx);
             }
             static const std::unordered_set<std::string> kw_builtins = {
@@ -4988,6 +5049,7 @@ public:
                 for (auto& kv : kw_args) kw->set(kv.first, kv.second);
                 args.push_back(Value((Collectable*)kw));
             }
+            if (gen_s0 != nygen::serial_now()) return callBuiltinTemps(builtin, args, ctx, cn, gen_s0);
             return callBuiltin(builtin, args, ctx);
         }
         // A builtin value's method read as a value (f = xs.append; f(1)).
@@ -5200,6 +5262,12 @@ public:
 
     // Public (struct default) so the VM builtin bridge can dispatch by name.
     Value callBuiltin(const std::string& name_orig, std::vector<Value>& args, Context* ctx) {
+        // islice/take, and iter/next/any/all/zip/map/filter/enumerate given a
+        // generator: lazy (src/NyGen.cpp).
+        if (nygen::builtin_candidate(name_orig, args)) {
+            Value r;
+            if (nygen::builtin(*this, name_orig, args, ctx, r)) return r;
+        }
         {
             Value r;
             if (iterableBuiltin(name_orig, args, ctx, r)) return r;
@@ -5585,6 +5653,7 @@ public:
             default: break;
         }
         if (isStringValue(v)) return nypy::MemberKind::Str;
+        if (nygen::is_gen(v)) return nypy::MemberKind::Generator;
         if (Container* c = contOf(v)) {
             if (seqLen(c) < 0) return nypy::MemberKind::Dict;
             if (isTupleCont(c)) return nypy::MemberKind::Tuple;
@@ -5834,6 +5903,8 @@ public:
 
     Value evalComprehensionNode(node_ptr node, Context* ctx) {
         auto cn = static_pointer_cast<ComprehensionNode>(node);
+        // (x for x in it): a lazy generator, not a list (src/NyGen.cpp).
+        if (cn->kind == ComprehensionNode::GEN) return nygen::make_genexpr(*this, node, ctx);
         // The targets live in the comprehension's own scope, as in Python 3:
         // `x = 10; [x for x in range(3)]` leaves x == 10.
         Context* cc = new Context(runner, "<comprehension>", nullptr, nullptr, ctx);
@@ -5844,17 +5915,23 @@ public:
             auto& cl = cn->clauses[k];
             // The first iterable is evaluated in the enclosing scope.
             Value itv = evalNode(cl.iter, k == 0 ? ctx : cc);
-            for (auto& item : iterValues(itv, cc)) {
+            auto one = [&](const Value& item) {
                 bindTarget(cl.target, item, cc);
-                bool keep = true;
-                for (auto& c : cl.conds) if (!isTruthy(evalNode(c, cc))) { keep = false; break; }
-                if (!keep) continue;
+                for (auto& c : cl.conds) if (!isTruthy(evalNode(c, cc))) return;
                 if (k + 1 < cn->clauses.size()) clause(k + 1);
                 else if (cn->kind == ComprehensionNode::DICT) {
                     Value kv = evalNode(cn->elt, cc);
                     kvs.push_back({kv, evalNode(cn->value, cc)});
                 }
                 else items.push_back(evalNode(cn->elt, cc));
+            };
+            // Over a generator, one value at a time: its side effects and
+            // the element's interleave, as in Python.
+            if (nygen::Gen* g = nygen::gen_of(itv)) {
+                Value item;
+                while (nygen::next(*this, g, item, cc)) one(item);
+            } else {
+                for (auto& item : iterValues(itv, cc)) one(item);
             }
         };
         if (!cn->clauses.empty()) clause(0);
@@ -5973,6 +6050,9 @@ public:
         if (pit == instance_properties.end()) return;
         pit->second->defineByName("args", makeListValue(args));
         pit->second->defineByName("msg", makeStringValue(args.size() == 1 ? valueToDisplay(args[0]) : std::string()));
+        // StopIteration.value: a generator's return value (both engines).
+        if (classDerivesFrom(instanceClassName(inst), "StopIteration"))
+            pit->second->defineByName("value", args.empty() ? NONE_VALUE : args[0]);
     }
     std::string valueToDisplay(const Value& v) {
         if (v.type == ValueType::USERDATA && v.value.p && instance_to_class.count(v.value.p))
@@ -6041,6 +6121,9 @@ public:
             Value cv; cv.type = ValueType::USERDATA; cv.value.p = (void*)cn;
             if (fnTag(func_names, cv.value.p).rfind("__class__:", 0) == 0) {
                 std::vector<Value> a{makeStringValue(excMessageOf(flow))};
+                // StopIteration() / GeneratorExit() raised by the runtime
+                // carry no argument (value is none, args empty).
+                if ((t == "StopIteration" || t == "GeneratorExit") && excMessageOf(flow).empty()) a.clear();
                 static const std::unordered_map<std::string, Value> no_kw;
                 Value obj = instantiateClass(cv, a, no_kw, global_ctx);
                 exc_instance_map_[obj.value.p] = obj;
@@ -7610,48 +7693,14 @@ public:
     // __next__ / __getitem__: its items first. sorted/min/max over objects
     // order by __lt__ (or the other side's __gt__), sum adds with __add__ /
     // __radd__, issubclass walks the MRO, hash() uses __hash__.
-    void yieldValue(const Value& v) {
-        if (yield_sink_->size() >= kMaxGeneratorValues)
-            throw std::string("__exc__:RuntimeError:generator produced more than 10000000 values (generators are "
-                              "collected eagerly by the interpreter; use the VM (--vm) for unbounded generators)");
-        yield_sink_->push_back(v);
-    }
-    bool isGenValue(const Value& v) {
-        if (!v.isCollectable() || !v.value.gc) return false;
-        auto* c = dynamic_cast<Container*>(v.value.gc);
-        return c && c->container && c->container->count("__gen__");
-    }
-    Value makeGenValue(const std::vector<Value>& items) {
-        Object* gen_obj = new Object((Runnable*)runner, "__gen__", Type::LIST);
-        int len = (int)items.size();
-        for (int i = 0; i < len; i++) gen_obj->set(std::to_string(i), items[(size_t)i]);
-        gen_obj->set("__len__", Value(len));
-        gen_obj->set("__gen__", Value(1));
-        gen_obj->set("__idx__", Value(0));
-        return Value((Collectable*)gen_obj);
-    }
-    // Generators on this engine are eager: calling a generator function
-    // runs its body to the end, collecting what it yields, and returns a
-    // generator over those values. The enclosing collection (a generator
-    // called from inside another) is restored afterwards - it was reset to
-    // none, so the outer generator's next yield aborted the process. An
-    // exception raised by the body propagates (it was swallowed), and a
-    // body that yields nothing is still a generator (it ran a second time
-    // as a plain function and returned none).
-    static constexpr size_t kMaxGeneratorValues = 10000000;
-    Value collectGenerator(const node_ptr& body, Context* fc) {
-        std::vector<Value> yielded;
-        std::vector<Value>* saved = yield_sink_;
-        yield_sink_ = &yielded;
-        try { evalBody(body, fc); }
-        catch (nython::node::ReturnSignal&) {}
-        catch (...) { yield_sink_ = saved; throw; }
-        yield_sink_ = saved;
-        return makeGenValue(yielded);
-    }
-    // A function body run to completion: its value, or the generator it is.
+    // A function body run to completion: its value. A generator function's
+    // body does not run here: the call makes the generator, which runs the
+    // body on a coroutine of its own, a step per next() (src/NyGen.cpp).
     Value runFunctionBody(FunctionNode* fn, Context* fc) {
-        if (bodyYields(fn->body)) return collectGenerator(fn->body, fc);
+        if (bodyYields(fn->body)) return nygen::make_function_gen(*this, fn, fc);
+        // Calls that do not pass through evalCall (operators, callbacks of
+        // builtins) meet the same stack check (see evalCall).
+        if (nycoro::stack_exhausted()) return nygen::body_on_new_stack(*this, fn, fc);
         try { return evalBody(fn->body, fc); }
         catch (nython::node::ReturnSignal& r) { return r.value; }
     }
@@ -7685,10 +7734,10 @@ public:
             return true;
         }
         if (name == "bool" && args.size() == 1 && isInstanceValue(args[0])) { out = Value(isTruthy(args[0])); return true; }
-        // iter(x) and next(it[, default]). A generator here is its collected
-        // values with a read position (__gen__/__idx__), which next() already
-        // understands; iter() of a list, string or dict makes one of those,
-        // and objects go through __iter__/__next__. Both returned none.
+        // iter(x) and next(it[, default]). Generators are handled first, by
+        // nygen::builtin; iter() of a list, string, dict, set or range makes
+        // a lazy iterator (nygen::make_iter), and objects go through
+        // __iter__/__next__.
         // hasattr / getattr on instances and classes: the full attribute
         // lookup (methods, class attributes, properties, __getattr__); only
         // an instance's own fields were seen.
@@ -7735,7 +7784,7 @@ public:
         }
         if (name == "iter" && !args.empty()) {
             const Value& v = args[0];
-            if (isGenValue(v)) { out = v; return true; }
+            if (nygen::is_gen(v)) { out = v; return true; }
             if (isInstanceValue(v)) {
                 std::vector<Value> none;
                 if (instanceHasMethod(v, "__iter__")) { out = callMethod(v, "__iter__", none, ctx); return true; }
@@ -7743,7 +7792,8 @@ public:
                 if (!instanceHasMethod(v, "__getitem__"))
                     throw std::string("__exc__:TypeError:'" + instanceClassName(v) + "' object is not iterable");
             }
-            out = makeGenValue(iterValues(v, ctx));
+            // A lazy iterator over a list, string, dict, set or range.
+            out = nygen::make_iter(*this, v, ctx);
             return true;
         }
         if (name == "next" && !args.empty()) {
@@ -7758,18 +7808,7 @@ public:
                 }
                 return true;
             }
-            if (isGenValue(args[0])) {
-                auto* c = dynamic_cast<Container*>(args[0].value.gc);
-                auto ii = c->container->find("__idx__"), li = c->container->find("__len__");
-                int64_t idx = ii != c->container->end() ? bigint_to_i64(ii->second.value.i) : 0;
-                int64_t len = li != c->container->end() ? bigint_to_i64(li->second.value.i) : 0;
-                if (idx >= len) {
-                    if (args.size() >= 2) { out = args[1]; return true; }
-                    throw std::string("__exc__:StopIteration:");
-                }
-                return false;
-            }
-            throw std::string("__exc__:TypeError:object is not an iterator");
+            throw std::string("__exc__:TypeError:'" + typeNameOf(args[0]) + "' object is not an iterator");
         }
         if (!takes.count(name) || args.empty()) return false;
         size_t upto = (name == "zip") ? args.size() : 1;
@@ -7974,6 +8013,7 @@ public:
                 return !static_cast<std::string*>(v.value.p)->empty();
             default: break;
         }
+        if (nygen::is_gen(v)) return true;   // lazy: no length to test
         if (Container* c = contOf(v)) {
             int64_t n = seqLen(c);
             if (n >= 0) return n != 0;

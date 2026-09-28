@@ -136,6 +136,8 @@
         <Unit filename="src/Util.cpp" />
         <Unit filename="src/Value.cpp" />
         <Unit filename="src/VirtualMachine.cpp" />
+        <Unit filename="src/NyCoro.cpp" />
+        <Unit filename="src/NyGen.cpp" />
         <!-- ═══════════ Builtin modules ═══════════ -->
         <Unit filename="src/builtins/audio.cpp" />
         <Unit filename="src/builtins/core.cpp" />
@@ -161,6 +163,8 @@
         <Unit filename="include/platform_compat.hpp" />
         <Unit filename="include/NythonExecutor.hpp" />
         <Unit filename="include/VirtualMachine.hpp" />
+        <Unit filename="include/NyCoro.hpp" />
+        <Unit filename="include/NyGen.hpp" />
         <Unit filename="include/Definitions.hpp" />
         <Unit filename="include/Value.hpp" />
         <Unit filename="include/ASTNodes.hpp" />

@@ -312,6 +312,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit52 | — | exceptions as objects: typed except across calls, finally/raise, with protocol, NameError/AttributeError/TypeError |
 | vm_audit53 | — | classes: C3 MRO, super(), class bodies, properties, the operator and object protocols |
 | vm_audit54 | — | comprehensions, match patterns, walrus, unpacking, generators, calls (`**d`, arity) |
+| vm_audit56 | 120 | lazy generators: infinite ones with islice/take/zip/any, side-effect order, send/throw/close/GeneratorExit/finally, StopIteration.value, `yield from` (600 deep), genexps, `__iter__` generators, unpacking, errors, threads (same results under python3) |
 | vm_audit57 | 212 | strict reads (AttributeError/KeyError), getattr/hasattr/setattr/delattr/get/setdefault, `?.` `?[` `??` `??=`, `undefined`, var/let/const/global/nonlocal scope rules in every context, suffix literals (round 75) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
@@ -393,9 +394,13 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
 - ~~Integer `/` differs between engines~~ — **resolved (round 71)**: `/` is
   always true division (float), `//`/`\` are floor division (int) on both
   engines. See "Round 71 fixes" below.
-- **Interpreter generators are still eager** (the whole sequence is collected
-  first): an infinite generator hangs there, and `send()` on the interpreter
-  behaves like `next()`. The VM's generators are lazy, with `send`/`close`.
+- ~~Interpreter generators are still eager~~ — **resolved (round 75)**:
+  generator bodies run on stackful coroutines (`NyCoro`/`NyGen`), lazily,
+  with the whole protocol (send/throw/close, `yield from`, StopIteration.value)
+  on both engines; generator expressions are lazy on both. See HANDOFF §0l.
+  Still open there: a generator dropped mid-iteration is finalized when its
+  loop/consumer ends or at program exit, not the moment its last reference
+  goes (that needs the interpreter's reference counting).
 - Video builtins are stubs (need ffmpeg).
 - ~~`@property` doesn't work on the VM~~ — **resolved (round 74)**: VM class
   bodies run (properties with setters, static/class methods, decorators).
@@ -749,6 +754,28 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   passes in full at 2× in both stub models.
 - Legacy flat tensor ops follow NumPy's promotion rule: integer inputs stay
   integers through `+ - *`, dot, sum, max/min, abs/neg/sign, `relu`.
+
+## Round 75: lazy generators (see `HANDOFF.md` §0l)
+
+- **Interpreter**: a generator function's body runs on a stackful coroutine
+  (`include/NyCoro.hpp`, `src/NyCoro.cpp`: mmap'd 1 MB stacks committed as
+  touched, guard page, pooled; x86-64/AArch64 register switch, ucontext
+  elsewhere, pooled Windows fibers - tested under Wine only) driven by `src/NyGen.cpp`
+  (`include/NyGen.hpp`); the hooks in `NythonExecutor.hpp` are small and
+  marked `nygen`. `NY_GEN_STACK_KB` sets the stack size.
+- **Both engines**: `send`/`throw`/`close` with GeneratorExit and finally at the
+  paused yield; StopIteration.value; `yield from` delegates all four and
+  evaluates to the subgenerator's return value; StopIteration escaping a body
+  is RuntimeError; "generator already executing"; lazy generator expressions;
+  `zip`/`map`/`filter`/`enumerate` over a generator and `iter()` are lazy
+  (over lists they still return lists); new `islice` and `take(n, it)`;
+  `any`/`all`/`next`/`in` stop early; `a, b = gen()` unpacks.
+- **Rules**: a started generator is resumed only by the thread that started
+  it (RuntimeError, both engines); a generator a `for` loop or a consuming
+  builtin made itself is closed when that consumer is done (as CPython's
+  reference counting would); every generator still paused at program end is
+  closed, oldest first. The VM raises RecursionError at 1000 frames (it
+  crashed with SIGSEGV at ~1400).
 
 ## Round 75: strict reads, optional chaining, declarations, suffix literals (see `HANDOFF.md` §0m)
 

@@ -171,6 +171,11 @@ int run_file(const std::string& filename, bool show_ast = false) {
             }
         }
         exec.execute(ast);
+        // Generators the program left suspended are closed now, oldest
+        // first, so their finally blocks and __exit__ run (as when CPython
+        // shuts down).
+        nygen::close_all(exec);
+        nygen::shutdown();
         // --profile: emit measured per-function counts and timings after the
         // program finishes. Delimited so a caller can separate the report from
         // the program's own stdout.
