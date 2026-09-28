@@ -38,10 +38,10 @@ public:
 private:
     struct Slot {
         value_type kv;
-        size_t hash = 0;
+        uint64_t hash = 0;
         bool live = false;
-        Slot(value_type&& p, size_t h) : kv(std::move(p)), hash(h), live(true) {}
-        Slot(std::string&& k, V&& v, size_t h) : kv(std::move(k), std::move(v)), hash(h), live(true) {}
+        Slot(value_type&& p, uint64_t h) : kv(std::move(p)), hash(h), live(true) {}
+        Slot(std::string&& k, V&& v, uint64_t h) : kv(std::move(k), std::move(v)), hash(h), live(true) {}
         Slot(const Slot&) = default;
         Slot(Slot&&) = default;
     };
@@ -86,7 +86,7 @@ private:
         Slot& back() { return (*this)[n_ - 1]; }
         const Slot* chunk(size_t c) const { return chunk_ptr(c); }
         void push(Slot&& s) { new (place()) Slot(std::move(s)); n_++; }
-        void emplace(std::string&& k, V&& v, size_t h) { new (place()) Slot(std::move(k), std::move(v), h); n_++; }
+        void emplace(std::string&& k, V&& v, uint64_t h) { new (place()) Slot(std::move(k), std::move(v), h); n_++; }
         void pop_back() { n_--; (*this)[n_].~Slot(); }
         void clear() {
             for (size_t i = 0; i < n_; i++) (*this)[i].~Slot();
@@ -106,16 +106,18 @@ private:
 
     static constexpr uint64_t kEmpty = ~(uint64_t)0, kDeleted = ~(uint64_t)0 - 1;
     static bool is_ref(uint64_t c) { return c < kDeleted; }
-    static uint64_t cell_of(size_t h, size_t n) { return ((uint64_t)(h >> 32) << 32) | (uint64_t)n; }
+    // The hash is 64 bits on every platform (a 32-bit size_t would leave no
+    // high half for the tag, and h >> 32 would be undefined there).
+    static uint64_t cell_of(uint64_t h, size_t n) { return ((h >> 32) << 32) | (uint64_t)n; }
     static size_t slot_of(uint64_t c) { return (size_t)(c & 0xFFFFFFFFu); }
     // FNV-1a plus a multiplicative finaliser: cheap on the short identifiers
     // and index keys ("0", "1", ...) these maps mostly hold, and the
     // finaliser spreads them over the low bits the index masks with.
-    static size_t hash_of(std::string_view k) {
+    static uint64_t hash_of(std::string_view k) {
         uint64_t h = 1469598103934665603ull;
         for (unsigned char c : k) { h ^= c; h *= 1099511628211ull; }
         h ^= h >> 32; h *= 0x9E3779B97F4A7C15ull; h ^= h >> 29;
-        return (size_t)h;
+        return h;
     }
 
     // Keys are mostly short names: compared inline rather than via memcmp.
@@ -136,7 +138,7 @@ private:
         size_t mask = c - 1;
         for (size_t n = 0; n < slots_.size(); n++) {
             if (!slots_[n].live) continue;
-            size_t i = slots_[n].hash & mask;
+            size_t i = (size_t)(slots_[n].hash & mask);
             while (index_[i] != kEmpty) i = (i + 1) & mask;
             index_[i] = cell_of(slots_[n].hash, n);
             used_++;
@@ -146,9 +148,9 @@ private:
         if ((used_ + 1) * 2 > index_.size()) rebuild_index(live_ * 4 + 8);
     }
     // Index cell holding key, or -1 (hashed mode only); *sp is its slot.
-    long find_cell(std::string_view k, size_t h, const Slot** sp = nullptr) const {
-        size_t mask = index_.size() - 1, i = h & mask;
-        const uint64_t tag = (uint64_t)(h >> 32);
+    long find_cell(std::string_view k, uint64_t h, const Slot** sp = nullptr) const {
+        size_t mask = index_.size() - 1, i = (size_t)(h & mask);
+        const uint64_t tag = h >> 32;
         while (true) {
             uint64_t c = index_[i];
             if (c == kEmpty) return -1;
@@ -202,9 +204,9 @@ private:
             index_all();
             rebuild_index(live_ * 4 + 8);
         }
-        size_t h = hash_of(k);
+        uint64_t h = hash_of(k);
         grow_if_needed();
-        size_t mask = index_.size() - 1, i = h & mask;
+        size_t mask = index_.size() - 1, i = (size_t)(h & mask);
         while (is_ref(index_[i])) i = (i + 1) & mask;
         if (index_[i] == kEmpty) used_++;
         size_t n = slots_.size();

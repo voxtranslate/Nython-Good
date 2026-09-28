@@ -55,9 +55,9 @@
                  ═══════════════════════════════════════════════════════════ -->
             <Target title="Debug">
                 <ExtraCommands>
-                    <After>cmd /c "if exist C:\SDL3\bin\SDL3.dll copy C:\SDL3\bin\*.dll bin\Debug\ >nul 2>&1"</After>
-                    <After>cmd /c "if not exist bin\Debug\nython_ide.ny copy nython_ide.ny bin\Debug\ >nul 2>&1"</After>
-                    <After>cmd /c "if not exist bin\Debug\lib xcopy /e /q /y lib bin\Debug\lib\ >nul 2>&1"</After>
+                    <After>cmd /c "if exist C:\SDL3\bin\SDL3.dll copy C:\SDL3\bin\*.dll bin\Debug\ >nul 2>&amp;1"</After>
+                    <After>cmd /c "if not exist bin\Debug\nython_ide.ny copy nython_ide.ny bin\Debug\ >nul 2>&amp;1"</After>
+                    <After>cmd /c "if not exist bin\Debug\lib xcopy /e /q /y lib bin\Debug\lib\ >nul 2>&amp;1"</After>
                 </ExtraCommands>
                 <Option output="bin/Debug/nython" prefix_auto="1" extension_auto="1" />
                 <Option object_output="obj/Debug/" />
@@ -141,6 +141,8 @@
         <Unit filename="src/VirtualMachine.cpp" />
         <Unit filename="src/NyCoro.cpp" />
         <Unit filename="src/NyGen.cpp" />
+        <Unit filename="src/NyGC.cpp" />
+        <Unit filename="src/VMGC.cpp" />
         <!-- ═══════════ Builtin modules ═══════════ -->
         <Unit filename="src/builtins/audio.cpp" />
         <Unit filename="src/builtins/core.cpp" />
@@ -168,6 +170,13 @@
         <Unit filename="include/VirtualMachine.hpp" />
         <Unit filename="include/NyCoro.hpp" />
         <Unit filename="include/NyGen.hpp" />
+        <Unit filename="include/NyGC.hpp" />
+        <Unit filename="include/VMGC.hpp" />
+        <Unit filename="include/NyHeap.hpp" />
+        <Unit filename="include/NyHeapImpl.hpp" />
+        <Unit filename="include/NyMembers.hpp" />
+        <Unit filename="include/NyConc.hpp" />
+        <Unit filename="include/NyOrderedMap.hpp" />
         <Unit filename="include/Definitions.hpp" />
         <Unit filename="include/Value.hpp" />
         <Unit filename="include/ASTNodes.hpp" />

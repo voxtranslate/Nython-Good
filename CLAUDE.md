@@ -124,8 +124,24 @@ loudly if not found) if auto-detection picks the wrong one.
 - Tested from Linux without Windows: `tools/cross_windows.sh deps && tools/cross_windows.sh build`
   cross-compiles with MinGW against SDL3 built for Windows; `build-win/nywin`
   runs it under Wine and `python3 tools/sweep.py --bin build-win/nywin` sweeps it.
+  The build takes its units, flags and libraries from `nython.cbp` itself
+  (`tools/cbp.py`), so it builds exactly what Code::Blocks builds.
+  `ARCH=i686` builds and runs the **32-bit** edition (w64devkit i686, 32-bit
+  MSYS2) into `build-win32/`.
+- **`python3 tools/cbp.py check`** (every sweep runs it) fails when a
+  `src/**.cpp` is not a `<Unit>` of `nython.cbp` - a unit missing there links
+  on Linux and fails only in Code::Blocks (it happened twice).
 - `long` is 32 bits on Windows: never cast a Nython integer through `long`
   (use `int64_t`/`long long`, `intValue()`, `bigint_to_i64()`).
+- 32-bit builds: `size_t` is 32 bits (never `>> 32` a `size_t`; keep hashes
+  `uint64_t`) and there is no `unsigned __int128`.
+- Write `"??="` in C++ string literals as `"?\?="` (a trigraph otherwise:
+  a warning on every file that includes the line).
+- Never use `__builtin_frame_address` in code that can be inlined into the
+  engines (use `nycoro::stack_position()`). On Windows x64 it gives a large
+  function a frame pointer whose XMM-save unwind info GCC records wrongly,
+  so exceptions corrupt XMM registers or crash; `tools/pe_unwind_check.py`
+  (run by the 64-bit cross build) rejects any such function.
 - The project targets Vista (`_WIN32_WINNT=0x0600`): a newer Win32 API must be
   looked up with `GetProcAddress` (see `stack_limits` in `src/NyCoro.cpp`).
 - It links with an 8 MB main stack (`-Wl,--stack,8388608`), as Linux gives;

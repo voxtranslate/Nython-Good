@@ -79,7 +79,12 @@ def main(argv):
         elif argv[i] == "-v":
             verbose = True
         i += 1
+    # The Windows build is defined by nython.cbp's unit list: a source file
+    # it does not list links on Linux and fails only in Code::Blocks.
+    cbp = subprocess.run([sys.executable, os.path.join(REPO, "tools", "cbp.py"), "check"],
+                         capture_output=True, text=True)
     cur = sweep(binary, timeout, jobs)
+    cur[("nython.cbp", "units")] = ("ok" if cbp.returncode == 0 else "fail", cbp.stdout)
     bad = sorted(k for k, v in cur.items() if v[0] != "ok")
     print("%d runs, %d not ok" % (len(cur), len(bad)))
     for k in bad:

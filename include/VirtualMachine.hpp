@@ -865,7 +865,7 @@ private:
         }
         case NT::ASSIGNMENT_AUG: {
             auto an=std::static_pointer_cast<nython::node::AugAssignNode>(nd);
-            if(an->op=="??="){ visit_coalesce_assign(an.get(),l); break; }
+            if(an->op=="?\?="){ visit_coalesce_assign(an.get(),l); break; }
             if(an->op=="~="){
                 // No natural binary reading of "complement" exists (see the
                 // identical comment on the interpreter's evalAugAssignment,

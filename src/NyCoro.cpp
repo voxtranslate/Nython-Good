@@ -27,6 +27,13 @@
 #    define NOMINMAX
 #  endif
 #  include <windows.h>
+// NtCurrentTeb() and GetCurrentFiber() read the TEB through a segment
+// register at a constant address, which GCC 12+ reports as an out-of-bounds
+// access of an object at address zero (a known false positive, GCC bug
+// 99578); it is silenced for this file's Windows code only.
+#  if defined(__GNUC__) && !defined(__clang__)
+#    pragma GCC diagnostic ignored "-Warray-bounds"
+#  endif
 // GetCurrentThreadStackLimits is Windows 8+ and the project targets Vista
 // (_WIN32_WINNT 0x0600 in nython.cbp), so it is looked up at run time; where
 // it is missing, the allocation base VirtualQuery reports for a local (the

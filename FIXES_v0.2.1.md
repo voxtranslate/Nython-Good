@@ -5463,10 +5463,14 @@ Final state:
 | A property's getter could be freed and its identity reused by the next `def` | `@prop.setter` dropped the getter's reference | found by vm_audit53 under the collector; fixed |
 | Seven older `*_test.ny` files failed; `rl_test` read a stray `/tmp` file | never swept; stale expectations | every `*_test.ny` in the sweep; own temp files; legacy tensor ops follow NumPy's type promotion |
 | `test_nytorch10`/`12` failed only in parallel sweeps | both engines shared one on-disk store under `/tmp` | per-run directories |
+| The Code::Blocks build did not link after the memory-management merge (undefined `nygc::*` / `vmgc::*`) | `src/NyGC.cpp` and `src/VMGC.cpp` were never added to `nython.cbp`; the cross build compiled `src/*.cpp` with its own flags, so it could not notice | added; the cross build now builds from `nython.cbp` itself (`tools/cbp.py`), and every sweep runs `cbp.py check` |
+| A 32-bit build (w64devkit i686): `unsigned __int128` does not exist; `NyOrderedMap` shifted a 32-bit `size_t` right by 32 (undefined) | written and tested for 64-bit only | Mersenne reduction in 64-bit arithmetic for `hash()` (still Python's values); a 64-bit hash on every platform; `ARCH=i686` cross build and sweep |
+| ~580 warnings in a Code::Blocks build | trigraph `"??="` literals; the shift above; `-Warray-bounds` false positive on MinGW's `NtCurrentTeb()` (GCC bug 99578); a maybe-uninitialised `cp` in NyJson | `"?\?="`; the 64-bit hash; silenced in NyCoro's Windows code only; initialised - 0 warnings under the project's `-Wall -O2`, 32- and 64-bit |
+| 64-bit Windows at the project's `-O2`: a raise from deep recursion inside a generator crashed; any exception through `evalCall` restored XMM6/XMM7 from the wrong address | `__builtin_frame_address(0)` inlined into the engines forced a frame pointer set before the stack allocation, and GCC records the XMM saves relative to the final RSP while the Windows unwinder reads them relative to the frame pointer | `nycoro::stack_position()` (the address of a local); `tools/pe_unwind_check.py` rejects such functions after every 64-bit cross build |
 | UBSan: a tuple literal read its elements through a `ListNode` pointer; `-2**63` negated in `long long` | a cast to the wrong node type; a signed negation that overflows | read through `TupleNode`; negate in the unsigned type (vm_audit60 checks -2**63) |
 
 New:
 - **Runtimes:** `NyGC`/`NyHeap` and `VMGC`; `NyCoro`/`NyGen`; `NyMembers.hpp`; `gui_harness.cpp`.
 - **Builtins:** `gc_*`, `mem_rss_kb`, `weakref`, `thread_wait_count`, `gui_display_density`, `gui_video_driver` and `os_shell`.
-- **Tools:** `tools/build_sdl3.sh`, `tools/cross_windows.sh`, `tools/ny_attrcheck.py`, `tools/lsan.supp` and `make asan`.
+- **Tools:** `tools/build_sdl3.sh`, `tools/cross_windows.sh` (`ARCH=i686` too), `tools/cbp.py`, `tools/pe_unwind_check.py`, `tools/ny_attrcheck.py`, `tools/lsan.supp` and `make asan`.
 - **Tests:** `vm_audit55`–`57` and `62`, and `gui_tests/test_28`–`29`.

@@ -670,7 +670,7 @@ void Lexer::read_token() {
             bool glued = before != '\0' && !std::isspace((unsigned char)before);
             if (n1 == '?' && n2 == '=') {
                 source.read_char(); source.read_char();
-                this->token.value = "??=";
+                this->token.value = "?\?=";
                 make_token(TokenType::NullCoalesceAssign,TokenKind::QuestionMark,TokenClass::Assignment);
             } else if (n1 == '?') {
                 source.read_char();

@@ -922,8 +922,14 @@ inline int64_t hash_of_key(const std::string& k) {
         case K_INT: {
             const std::string d = k.substr(2);
             bool neg = !d.empty() && d[0] == '-';
-            unsigned __int128 h = 0;
-            for (size_t i = neg ? 1 : 0; i < d.size(); i++) h = (h * 10 + (unsigned)(d[i] - '0')) % P;
+            // h*10 + digit mod P, P = 2**61 - 1 (a Mersenne prime), in 64-bit
+            // arithmetic on every platform (unsigned __int128 does not exist
+            // on 32-bit targets): x mod P = (x & P) + (x >> 61), and
+            // h*10 = (h << 3) + (h << 1) with h < 2**61, so no term overflows.
+            auto mod_p = [P](uint64_t x) { x = (x & P) + (x >> 61); return x >= P ? x - P : x; };
+            uint64_t h = 0;
+            for (size_t i = neg ? 1 : 0; i < d.size(); i++)
+                h = mod_p(mod_p(h << 3) + mod_p(h << 1) + (uint64_t)(d[i] - '0'));
             int64_t r = (int64_t)h;
             return fin(neg ? -r : r);
         }

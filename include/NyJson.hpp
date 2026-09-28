@@ -216,7 +216,7 @@ private:
                 case 'r': o += '\r'; break;
                 case 't': o += '\t'; break;
                 case 'u': {
-                    uint32_t cp;
+                    uint32_t cp = 0;
                     if (!hex4(cp)) return false;
                     if (cp >= 0xD800 && cp <= 0xDBFF) {
                         // A high surrogate must pair with a following low one.

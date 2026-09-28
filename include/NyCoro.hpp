@@ -106,14 +106,23 @@ struct Tls {
     static inline thread_local uintptr_t os_floor = 1;   // 1: not looked up yet
 };
 bool stack_exhausted_slow(uintptr_t frame);
+// The caller's position on its stack: the address of a local. Not
+// __builtin_frame_address(0), which forces a frame pointer in every function
+// this is inlined into (evalCall, runFunctionBody, ...) - and for a Windows
+// x64 function that has a frame pointer and also saves XMM registers, GCC's
+// unwind info records those saves relative to the final RSP while the
+// unwinder reads them relative to the frame pointer. Every exception
+// unwinding through such a frame then restored XMM6/XMM7 from the wrong
+// address, and at the top of a fiber's stack read past its end (the crash a
+// deep recursion raising inside a generator hit, 64-bit Windows, -O2).
+inline uintptr_t stack_position() {
+    volatile char here = 0;
+    return (uintptr_t)&here;
+}
 // Whether the calling frame is below the running coroutine's floor: the
 // caller should raise RecursionError instead of going deeper.
 inline bool stack_exhausted() {
-#if defined(_MSC_VER) && !defined(__clang__)
-    uintptr_t fp = (uintptr_t)_AddressOfReturnAddress();
-#else
-    uintptr_t fp = (uintptr_t)__builtin_frame_address(0);
-#endif
+    uintptr_t fp = stack_position();
 #if defined(_MSC_VER) && !defined(__clang__)
     if (fp < Tls::mark) return stack_exhausted_slow(fp);
 #else
@@ -128,11 +137,7 @@ inline bool stack_exhausted() {
 uintptr_t os_stack_floor();
 inline bool native_stack_exhausted() {
     if (Tls::cur) return stack_exhausted();
-#if defined(_MSC_VER) && !defined(__clang__)
-    uintptr_t fp = (uintptr_t)_AddressOfReturnAddress();
-#else
-    uintptr_t fp = (uintptr_t)__builtin_frame_address(0);
-#endif
+    uintptr_t fp = stack_position();
     uintptr_t f = Tls::os_floor;
     if (f == 1) f = os_stack_floor();
     return fp < f;

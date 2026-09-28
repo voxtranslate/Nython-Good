@@ -489,6 +489,77 @@ and say so rather than fail.
 348 runs, 0 not ok (with the lazy generators and the lock changes; the same set is clean on Linux, run at the same time). vm_audit46 (the OS layer) is 247/0 there (255/0 on Linux;
 the 8 skipped are symlinks and `which`-dependent checks).
 
+#### Building what Code::Blocks builds, 32-bit included
+
+A user's Code::Blocks build (w64devkit, **32-bit**) failed after the
+garbage-collection merge while every test here passed. There were three
+reasons:
+- **Missing units:** `src/NyGC.cpp` and `src/VMGC.cpp` were never added to
+  `nython.cbp`.
+- **A build that bypassed the project:** the cross build compiled every
+  `src/*.cpp` with flags copied into the script, so it could not see what the
+  project left out.
+- **64-bit only:** all testing was 64-bit.
+
+The fixes:
+- **`tools/cbp.py`** reads `nython.cbp` the way Code::Blocks does (its
+  units, the project's then the target's options, the libraries, the GUI
+  subsystem of a type-0 target).
+  - `tools/cross_windows.sh` builds only from it, and keeps the compiler's
+    warnings in `$OUT/warnings.log`.
+  - `cbp.py check` fails on a source file the project does not list, and
+    every sweep runs it.
+  - The project itself was not well-formed XML: a bare `&` in the Debug
+    target's `2>&1` post-build commands (Code::Blocks' TinyXML accepts it,
+    a strict parser does not); now `&amp;`.
+- **`ARCH=i686`** builds and runs the 32-bit edition (SDL for i686 in
+  `/opt/sdl3-mingw32`, `wine32:i386`). What it found:
+  - `unsigned __int128` in `hash()` of ints, which does not exist on 32-bit
+    GCC. Replaced by Mersenne reduction mod 2^61-1 in 64-bit arithmetic;
+    `hash()` still equals Python's for every int, `2**200+17` included.
+  - `NyOrderedMap` shifted a 32-bit `size_t` hash right by 32, which is
+    undefined behaviour, and its index tag was empty. The hash is `uint64_t`
+    on every platform now.
+- **Warnings a Code::Blocks build showed:**
+  - Trigraph `"??="` literals (now `"?\?="`).
+  - An uninitialised-looking `cp` in `NyJson`.
+  - GCC's `-Warray-bounds` false positive on MinGW's `NtCurrentTeb()`
+    (GCC bug 99578), silenced in `NyCoro.cpp`'s Windows code only.
+- **Result:** the 64-bit and 32-bit builds of the project file both compile
+  with **0 warnings** under the project's own `-Wall -O2`.
+
+Building at the project's `-O2` found one more bug, in the 64-bit build only:
+**a raise from deep recursion inside a generator crashed** (vm_audit56). The
+trace in Wine showed the unwinder losing its way at the first frame of an
+extension stack:
+
+- **The cause:** `nycoro::stack_exhausted()` read `__builtin_frame_address(0)`.
+  Inlined into `evalCall`, `runFunctionBody` and others, it forced those
+  functions to keep a frame pointer. For a function with a large frame, GCC
+  then sets `rbp` right after `push rbp`, before the stack allocation, but
+  records the XMM6/XMM7 saves relative to the final RSP.
+- **Why that breaks:** the Windows x64 unwinder (and Wine's, which follows
+  it) reads those saves relative to the frame base, `rbp - FrameOffset*16`.
+  - Every exception unwinding through such a frame restored XMM registers
+    from the wrong address. That is a silent corruption on a real 64-bit
+    Windows machine.
+  - At the top of a fiber's stack the read went past the stack's end: the
+    crash.
+  - `-O1` hid it: smaller frames, so 900 calls fitted in one 1 MB generator
+    stack and no extension stack was used.
+- **The fix:** `nycoro::stack_position()` takes the address of a local, so no
+  frame pointer is forced.
+- **The guard:** `tools/pe_unwind_check.py` scans a Windows x64 image's
+  unwind tables for any function that sets its frame pointer before
+  allocating and saves XMM registers. The 64-bit cross build runs it after
+  linking. It flags a 12-line reproduction and passes its fixed form.
+
+**32-bit result:** the full sweep on the 32-bit build under 32-bit Wine,
+both engines, every file: 350 runs, 0 not ok. Each build runs under its own
+Wine loader (`/usr/lib/wine/wine64`, `/usr/lib/wine/wine`): with `wine32`
+installed, a plain `wine` picks the 32-bit one, which cannot open a 64-bit
+prefix.
+
 ### Every test file in the sweep
 
 `tools/sweep.py` now also runs every `examples/*_test.ny` (70 files). The two

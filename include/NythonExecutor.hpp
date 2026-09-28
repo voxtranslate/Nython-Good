@@ -1499,7 +1499,7 @@ public:   // NythonExecutor is a struct: members default to public
     Value evalAugAssignment(node_ptr node, Context* ctx) {
         auto an = static_pointer_cast<AugAssignNode>(node);
         const std::string& op = an->op;
-        if (op == "??=") return evalCoalesceAssign(an.get(), ctx);
+        if (op == "?\?=") return evalCoalesceAssign(an.get(), ctx);
         std::string base = op.substr(0, op.size() > 0 ? op.size() - 1 : 0);
         if (op == ">>>=") base = ">>";
         int opc = binOpCode(base);
