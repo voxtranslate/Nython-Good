@@ -143,6 +143,9 @@ static int64_t add_obj(std::shared_ptr<T> o, bool async_range = false) {
 // ════════════════════════════════════════════════════════════════════════════
 
 std::atomic<int> g_gil_waiters{0};
+// Times a thread went to sleep: queued for the GIL, or blocked on a lock,
+// condition, queue, join, ... (thread_wait_count()).
+static std::atomic<int64_t> g_waits{0};
 static std::atomic<bool> g_active{false};
 static const auto kSwitchInterval = std::chrono::milliseconds(5);
 
@@ -169,6 +172,7 @@ static void gil_acquire() {
         std::unique_lock<std::mutex> l(g.m);
         uint64_t my = g.next_ticket++;
         if (my != g.serving) {
+            g_waits.fetch_add(1, std::memory_order_relaxed);
             g_gil_waiters.fetch_add(1, std::memory_order_relaxed);
             g.cv.wait(l, [&] { return g.serving == my; });
             g_gil_waiters.fetch_sub(1, std::memory_order_relaxed);
@@ -195,7 +199,18 @@ static void gil_release() {
 void tick_slow() {
     if (!t_holds) return;
     if ((++t_tick & 15u) != 0) return;
-    if (Clock::now() - G().since < kSwitchInterval) return;
+    auto held_for = Clock::now() - G().since;
+    if (held_for < kSwitchInterval) return;
+    // Lock-holder preemption (the problem paravirtualised spinlocks and
+    // Linux's time-slice extension address for vCPUs and threads): handing
+    // the GIL over while this thread holds a Nython lock makes every thread
+    // that wants that lock block on it, after which each lock operation is an
+    // OS context switch - a convoy (8 threads x 10k lock/unlock: 625k context
+    // switches, 6 s; 20 s and more under Wine). So while a lock is held the
+    // hand-over waits for its release (held_erase makes the next tick check
+    // again), for at most one more switch interval, so a thread that keeps a
+    // lock for long still lets the others run.
+    if (t_self && !t_self->held.empty() && held_for < 2 * kSwitchInterval) return;
     // Hand over: the ticket queue puts us behind every waiting thread.
     gil_release();
     gil_acquire();
@@ -320,6 +335,7 @@ static bool block(std::unique_lock<std::mutex>& lk, ThreadRec* self,
         }
     } unreg{self, regs};
     if (self->blocked_forever) check_all_blocked_locked(self);
+    g_waits.fetch_add(1, std::memory_order_relaxed);
     while (true) {
         self->woken = false;
         if (self->task) task_park(lk, self, dl);
@@ -536,7 +552,13 @@ static void lockdep_note_locked(ThreadRec* self, int64_t id) {
 }
 static void held_erase(ThreadRec* self, int64_t id) {
     for (auto it = self->held.rbegin(); it != self->held.rend(); ++it)
-        if (*it == id) { self->held.erase(std::next(it).base()); return; }
+        if (*it == id) {
+            self->held.erase(std::next(it).base());
+            // Its last lock released: a GIL hand-over tick_slow deferred for
+            // it happens at the next tick, not up to 16 ticks later.
+            if (self->held.empty() && self == t_self) t_tick |= 15u;
+            return;
+        }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -604,6 +626,7 @@ struct Mutex : Obj, Waitable {
     ThreadRec* owner = nullptr;
     int count = 0;
     WQ wq;
+    ThreadRec* heir = nullptr;      // the waiter woken to compete for it (mutex_wake_heir)
     void owners(std::vector<ThreadRec*>& out) const override { if (owner) out.push_back(owner); }
     std::string describe() const override { return (recursive ? "rmutex#" : "mutex#") + std::to_string(id); }
 };
@@ -641,27 +664,66 @@ struct Latch : Obj { int64_t count = 0; WQ wq; };
 struct Atom : Obj { int64_t v = 0; };
 
 // ── mutex ───────────────────────────────────────────────────────────────────
+// Competitive succession, as HotSpot's monitors, Windows' critical sections
+// (since Vista) and futex-based mutexes do it: a released mutex is not handed
+// to a sleeping waiter. Handing it over makes the new owner a thread that
+// must first wait for the GIL, so the releasing thread - still running -
+// blocks on its next lock, and from then on every lock operation is a thread
+// switch: a convoy that, once formed, never dissolves (8 threads x 10k
+// lock/unlock went from 0.8 s to 6 s whenever one formed). Instead one
+// waiter, the heir, is woken and competes for the mutex once it runs again
+// with the GIL; while an heir is awake no other waiter is woken, so a thread
+// that locks and unlocks in a loop does not wake anyone in vain.
+static void mutex_wake_heir(Mutex* m) {
+    if (m->heir || m->owner || m->wq.empty()) return;
+    m->heir = m->wq.front();
+    wake(m->heir);
+}
+// The heir gave up (timed out, cancelled): pass the wake-up on.
+static void mutex_heir_quit(Mutex* m, ThreadRec* self) {
+    if (m->heir != self) return;
+    m->heir = nullptr;
+    mutex_wake_heir(m);
+}
 static bool mutex_acquire(Engine& e, int64_t h, double timeout_ms) {
     ThreadRec* self = current(e);
-    Mutex* m;
-    {
-        std::lock_guard<std::mutex> l(RT().m);
-        m = get_obj<Mutex>(h, "mutex");
-        if (m->owner == self) {
-            if (m->recursive) { m->count++; return true; }
-            raise("DeadlockError", "deadlock detected: thread " + self->label() + " tried to lock " +
-                  m->describe() + ", which it already holds (not recursive)");
+    const Deadline dl = Deadline::in_ms(timeout_ms);
+    while (true) {
+        Mutex* m;
+        {
+            std::lock_guard<std::mutex> l(RT().m);
+            m = get_obj<Mutex>(h, "mutex");
+            try {
+                if (m->owner == self) {
+                    if (m->recursive) { m->count++; return true; }
+                    raise("DeadlockError", "deadlock detected: thread " + self->label() + " tried to lock " +
+                          m->describe() + ", which it already holds (not recursive)");
+                }
+                check_cancel_locked(self);
+                lockdep_check_locked(self, h);
+            } catch (...) { mutex_heir_quit(m, self); throw; }
+            if (m->heir == self) m->heir = nullptr;      // the heir competes now
+            if (!m->owner) { m->owner = self; m->count = 1; lockdep_note_locked(self, h); return true; }
+            if (timeout_ms == 0 || dl.expired()) return false;
         }
-        check_cancel_locked(self);
-        lockdep_check_locked(self, h);
-        if (!m->owner) { m->owner = self; m->count = 1; lockdep_note_locked(self, h); return true; }
-        if (timeout_ms == 0) return false;
+        bool woken;
+        try {
+            // Woken as the heir - or the mutex is free with no heir on the way:
+            // it was released between the attempt above and this wait (the
+            // GIL is released first), when there was no waiter to wake yet.
+            woken = block_released(self, {&m->wq},
+                [m, self] { return m->heir == self || (!m->owner && !m->heir); }, dl, m);
+        } catch (...) {
+            std::lock_guard<std::mutex> l(RT().m);
+            mutex_heir_quit(m, self);
+            throw;
+        }
+        if (!woken) {
+            std::lock_guard<std::mutex> l(RT().m);
+            mutex_heir_quit(m, self);
+            return false;
+        }
     }
-    bool ok = block_released(self, {&m->wq},
-        [m, self] { if (!m->owner) { m->owner = self; m->count = 1; return true; } return false; },
-        Deadline::in_ms(timeout_ms), m);
-    if (ok) { std::lock_guard<std::mutex> l(RT().m); lockdep_note_locked(self, h); }
-    return ok;
 }
 static void mutex_release(Engine& e, int64_t h) {
     ThreadRec* self = current(e);
@@ -672,7 +734,7 @@ static void mutex_release(Engine& e, int64_t h) {
     if (--m->count > 0) return;
     m->owner = nullptr;
     held_erase(self, h);
-    wake_all(m->wq);
+    mutex_wake_heir(m);
 }
 
 // ── rwlock ──────────────────────────────────────────────────────────────────
@@ -764,7 +826,7 @@ static bool cond_wait(Engine& e, int64_t ch, int64_t mh, double timeout_ms) {
         saved = m->count;
         m->owner = nullptr; m->count = 0;
         held_erase(self, mh);
-        wake_all(m->wq);
+        mutex_wake_heir(m);
         self->cond_signaled = false;
         c->waiters.push_back(self);
     }
@@ -782,8 +844,15 @@ static bool cond_wait(Engine& e, int64_t ch, int64_t mh, double timeout_ms) {
         }
         // Re-acquire the mutex whatever happened (as Python's Condition.wait).
         try {
+            // (It takes the mutex as soon as it is free - a condition waiter
+            // is woken by a notify, not in a lock loop - and as an heir that
+            // finds it taken it lets the next release wake someone again.)
             block(lk, self, {&m->wq},
-                  [m, self] { if (!m->owner) { m->owner = self; return true; } return false; },
+                  [m, self] {
+                      if (m->heir == self) m->heir = nullptr;
+                      if (!m->owner) { m->owner = self; return true; }
+                      return false;
+                  },
                   Deadline::never(), m, false);
         } catch (NyError& x) { if (!have_pending) { pending = x; have_pending = true; } }
         if (m->owner == self) { m->count = saved; self->held.push_back(mh); }
@@ -1585,6 +1654,13 @@ static std::unordered_map<std::string, Handler>& table() {
             int64_t n = 0;
             for (auto* t : RT().live) if (!t->task) n++;
             return Ret::integer(n);
+        };
+        // How many times a thread has gone to sleep - queued for the GIL or
+        // blocked on a lock, condition, queue, join... - since the program
+        // started: the cost of switching, in a unit that does not depend on
+        // the machine's speed.
+        T["thread_wait_count"] = [](Engine&, const Args&) {
+            return Ret::integer(g_waits.load(std::memory_order_relaxed));
         };
         T["thread_list"] = [](Engine& e, const Args&) {
             current(e);

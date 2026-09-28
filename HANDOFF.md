@@ -475,6 +475,7 @@ The rest of what running the whole sweep under Wine found:
 | the IDE's toolchain ran `./ny_test` from the checkout - a Linux binary beside `nython.exe` | `NYTHON_EXE`, then `sys.executable`, then the checkout's candidates |
 | tests sharing `/tmp` paths raced when the sweep runs both engines at once | per-run temporary directories (temp dir + pid + a random suffix) |
 | `NyCoro.cpp` called `GetCurrentThreadStackLimits` (Windows 8+) while the project targets Vista (`_WIN32_WINNT 0x0600`) | looked up at run time; `VirtualQuery`'s allocation base where it is missing |
+| vm_audit48 timed out joining its lock-counting threads (interpreter, under Wine) - a **lock convoy on every platform**, from two causes. (1) The interpreter could hand the GIL over at any statement, so often while the running thread held a Nython mutex, and the others then blocked on it. (2) A released mutex was *handed* to a sleeping waiter, which first had to wait for the GIL, so the releasing thread blocked on its next lock - every lock operation became a thread switch, and once formed the convoy never dissolved (8 threads x 10k lock/unlock: 40k blocking waits, 625k context switches, 6 s on Linux, over 20 s under Wine) | (1) lock-holder preemption avoidance, as paravirtualised spinlocks and Linux's time-slice extension do for vCPUs and threads: a due GIL hand-over waits while the thread holds a lock (at most one more switch interval) and happens at the first tick after its last unlock. (2) competitive succession, as HotSpot's monitors, Windows' critical sections since Vista and futex mutexes: unlock wakes one waiter, the *heir*, which competes for the mutex once it runs with the GIL; while an heir is awake no one else is woken. 0.8 s and ~160 waits; a lock held for most of each iteration 2,500 waits -> 48; holders that sleep with the lock held 60k waits / 3.2 s -> 268 / 0.5 s (the VM: 17.5k -> 127). `thread_wait_count()` (sleeps for the GIL or on a sync object) makes all three testable independently of machine speed, and vm_audit48 checks them; each check fails on the build without its half of the change. rwlocks still hand over (not measured) |
 | a PE executable reserves a 2 MB main stack (Linux gives 8 MB) | `-Wl,--stack,8388608` in `nython.cbp` and the cross build: the 600-deep `yield from` chain in vm_audit56 hit the VM's native-stack guard (a clean RecursionError, not a crash) |
 
 `tools/cross_windows.sh` installs busybox-w32 as `sh.exe` and as the POSIX
@@ -485,7 +486,7 @@ not there (or a symlink privilege Wine does not grant) skip those checks
 and say so rather than fail.
 
 **Result:** the full sweep under Wine, both engines, every file -
-346 runs, 0 not ok (the tree before the generators merge). vm_audit46 (the OS layer) is 247/0 there (255/0 on Linux;
+348 runs, 0 not ok (with the lazy generators and the lock changes; the same set is clean on Linux, run at the same time). vm_audit46 (the OS layer) is 247/0 there (255/0 on Linux;
 the 8 skipped are symlinks and `which`-dependent checks).
 
 ### Every test file in the sweep
