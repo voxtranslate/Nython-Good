@@ -265,10 +265,10 @@ bookkeeping) is 1.4% of the instructions; `mallinfo2` 0.002%.
   `gui_tests/test_*.ny` on both engines, on the merged tree (350 runs):
   **no AddressSanitizer error** (no use-after-free, double free or
   overflow) and **no leak** apart from UBSan's own demangler buffer when it
-  prints a report. UBSan reports two pre-existing sites, unrelated to
-  memory management: `evalList`'s `static_pointer_cast<ListNode>` on a
-  tuple node (vm_audit27/54/56/60/61) and `bigint::abs(INT64_MIN)`
-  (vm_audit60). One run fails for the instrumented build only: vm_audit56
+  prints a report. UBSan reported two pre-existing sites, unrelated to
+  memory management, since fixed: `evalList` read a tuple node through a
+  `ListNode` pointer, and `bigint`'s signed-to-magnitude conversion
+  negated -2**63 in the signed type (0 reports on vm_audit27/54/60/61 now). One run fails for the instrumented build only: vm_audit56
   on the VM raises RecursionError in its 500-level recursive generator
   test, because ASan's frames exhaust the native stack that
   `nycoro::native_stack_exhausted()` guards (with a 512 MB stack ASan then

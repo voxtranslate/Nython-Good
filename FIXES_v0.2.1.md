@@ -5463,6 +5463,7 @@ Final state:
 | A property's getter could be freed and its identity reused by the next `def` | `@prop.setter` dropped the getter's reference | found by vm_audit53 under the collector; fixed |
 | Seven older `*_test.ny` files failed; `rl_test` read a stray `/tmp` file | never swept; stale expectations | every `*_test.ny` in the sweep; own temp files; legacy tensor ops follow NumPy's type promotion |
 | `test_nytorch10`/`12` failed only in parallel sweeps | both engines shared one on-disk store under `/tmp` | per-run directories |
+| UBSan: a tuple literal read its elements through a `ListNode` pointer; `-2**63` negated in `long long` | a cast to the wrong node type; a signed negation that overflows | read through `TupleNode`; negate in the unsigned type (vm_audit60 checks -2**63) |
 
 New:
 - **Runtimes:** `NyGC`/`NyHeap` and `VMGC`; `NyCoro`/`NyGen`; `NyMembers.hpp`; `gui_harness.cpp`.
