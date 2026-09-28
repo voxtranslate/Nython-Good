@@ -48,16 +48,20 @@ t("year_format", len(formatted), 4)
 
 print "=== OS ADVANCED ==="
 import os
-os_mkdir("/tmp/ny_test_dir")
-t("mkdir", os_isdir("/tmp/ny_test_dir"), true)
-write_file("/tmp/ny_test_dir/hello.txt", "Hello Nython!")
-var files = os_listdir("/tmp/ny_test_dir")
+# Per-run paths: the sweep runs this file on both engines at once, and a
+# shared directory let one run's cleanup see the other run's file.
+var tdir = "/tmp/ny_test_dir_" + str(os_getpid())
+var tfobj = "/tmp/ny_fobj_test_" + str(os_getpid()) + ".txt"
+os_mkdir(tdir)
+t("mkdir", os_isdir(tdir), true)
+write_file(tdir + "/hello.txt", "Hello Nython!")
+var files = os_listdir(tdir)
 t("dir_file", "hello.txt" in files, true)
 var abs_path = os_path_abs("/tmp")
 t("abs_path", len(abs_path) > 0, true)
-os_remove("/tmp/ny_test_dir/hello.txt")
-os_exec("rmdir /tmp/ny_test_dir")
-t("cleanup", os_isdir("/tmp/ny_test_dir"), false)
+os_remove(tdir + "/hello.txt")
+os_exec("rmdir " + tdir)
+t("cleanup", os_isdir(tdir), false)
 
 print "=== REGEX ADVANCED ==="
 import re
@@ -111,13 +115,14 @@ semaphore_release(sem)
 t("sem1_reacq", semaphore_acquire(sem), true)
 
 print "=== FILE OBJECT ==="
-write_file("/tmp/ny_fobj_test.txt", "line1\nline2\nline3")
-var fobj = open("/tmp/ny_fobj_test.txt", "r")
+write_file(tfobj, "line1\nline2\nline3")
+var fobj = open(tfobj, "r")
 t("fobj_open", fobj > 0, true)
 var fc = file_read(fobj)
 file_close(fobj)
-t("fobj_name", exists("/tmp/ny_fobj_test.txt"), true)
+t("fobj_name", exists(tfobj), true)
 t("fobj_content", true, true) # file handle API works
+os_remove(tfobj)
 
 print ""
 print "============================================"
