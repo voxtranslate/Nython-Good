@@ -105,7 +105,7 @@ class MemoryStore:
 
     def store(self, key, value, source, confidence):
         var cell = MemoryCell(key, value, source, confidence)
-        var existing = self.cells[key]
+        var existing = self.cells.get(key)
         if existing == none:
             self.cell_count = self.cell_count + 1
         self.cells[key] = cell
@@ -113,7 +113,7 @@ class MemoryStore:
         return cell
 
     def recall(self, key):
-        var cell = self.cells[key]
+        var cell = self.cells.get(key)
         if cell == none:
             return none
         cell.touch()

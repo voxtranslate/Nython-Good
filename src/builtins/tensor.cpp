@@ -742,7 +742,7 @@ Value dispatch_tensor(NythonExecutor& E,
                 double x = args[0].type == ValueType::DOUBLE ? static_cast<double>(args[0].value.d) : static_cast<double>(bigint_to_i64(args[0].value.i));
                 // relu is closed over the integers: relu(-5) is 0, relu(3) is 3.
                 if (name == "relu" && args[0].type == ValueType::INTEGER)
-                    return bigint_to_i64(args[0].value.i) > 0 ? args[0] : Value((long int)0);
+                    return bigint_to_i64(args[0].value.i) > 0 ? args[0] : Value(0);
                 if (name == "relu") return Value(x > 0 ? x : 0.0);
                 if (name == "sigmoid") return Value(1.0 / (1.0 + std::exp(-x)));
                 if (name == "tanh_fn") return Value(std::tanh(x));
@@ -2781,14 +2781,14 @@ Value nt_to_ny(NythonExecutor& E, nt::Val& v) {
     switch (v.k) {
         case nt::Val::NONE:  return NONE_VALUE;
         case nt::Val::BOOL:  return Value(v.b);
-        case nt::Val::INT:   return Value((long int)v.i);
+        case nt::Val::INT:   return Value(bigint((long long)v.i));
         case nt::Val::FLOAT: return Value(v.d);
         case nt::Val::STR:   return E.makeStringValue(v.s);
         case nt::Val::VEC: {
             auto* lst = new Object((Runnable*)E.runner, "list", Type::LIST);
             lst->container->reserve(v.v.size() + 1);
             for (size_t i = 0; i < v.v.size(); i++)
-                (*lst->container)[std::to_string(i)] = v.v_int ? Value((long int)v.v[i]) : Value(v.v[i]);
+                (*lst->container)[std::to_string(i)] = v.v_int ? Value(bigint((long long)v.v[i])) : Value(v.v[i]);
             (*lst->container)["__len__"] = Value((int)v.v.size());
             return Value(static_cast<Collectable*>(lst));
         }

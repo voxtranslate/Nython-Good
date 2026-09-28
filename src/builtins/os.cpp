@@ -370,9 +370,57 @@ bool path_lstat(const std::string& p, struct stat& st) {
 bool is_dir(const std::string& p) { struct stat st; return path_stat(p, st) && S_ISDIR(st.st_mode); }
 bool is_file(const std::string& p) { struct stat st; return path_stat(p, st) && S_ISREG(st.st_mode); }
 bool exists(const std::string& p) { struct stat st; return path_stat(p, st); }
+#ifdef _WIN32
+std::wstring widen_os(const std::string& s) {
+    if (s.empty()) return std::wstring();
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), nullptr, 0);
+    std::wstring w((size_t)n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
+    return w;
+}
+std::string narrow_os(const std::wstring& w) {
+    if (w.empty()) return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+    std::string s((size_t)n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), &s[0], n, nullptr, nullptr);
+    return s;
+}
+// A symbolic link's target, from its reparse point (REPARSE_DATA_BUFFER is
+// in the driver kit's headers only; this is its symlink layout).
+bool win_readlink(const std::string& p, std::string& out) {
+    HANDLE h = CreateFileW(widen_os(p).c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    std::vector<unsigned char> buf(16 * 1024 + 64);
+    DWORD n = 0;
+    BOOL ok = DeviceIoControl(h, 0x000900A8 /* FSCTL_GET_REPARSE_POINT */, nullptr, 0, buf.data(), (DWORD)buf.size(), &n, nullptr);
+    CloseHandle(h);
+    if (!ok || n < 20) return false;
+    auto u32 = [&](size_t o) { uint32_t v; std::memcpy(&v, buf.data() + o, 4); return v; };
+    auto u16 = [&](size_t o) { uint16_t v; std::memcpy(&v, buf.data() + o, 2); return v; };
+    if (u32(0) != 0xA000000CUL) return false;                     // IO_REPARSE_TAG_SYMLINK
+    size_t sub_off = u16(8), sub_len = u16(10), pr_off = u16(12), pr_len = u16(14), base = 20;
+    auto wide_at = [&](size_t off, size_t len) {
+        std::wstring w(len / 2, L'\0');
+        if (base + off + len <= n) std::memcpy(&w[0], buf.data() + base + off, len);
+        return w;
+    };
+    std::wstring w = wide_at(pr_off, pr_len);
+    if (w.empty()) {
+        w = wide_at(sub_off, sub_len);
+        if (w.rfind(L"\\??\\", 0) == 0) w = w.substr(4);
+    }
+    out = narrow_os(w);
+    return true;
+}
+#endif
+
 bool is_link(const std::string& p) {
 #ifdef _WIN32
-    (void)p; return false;
+    DWORD a = GetFileAttributesW(widen_os(p).c_str());
+    if (a == INVALID_FILE_ATTRIBUTES || !(a & FILE_ATTRIBUTE_REPARSE_POINT)) return false;
+    std::string t;
+    return win_readlink(p, t);        // a symbolic link, not another reparse point
 #else
     struct stat st; return ::lstat(p.c_str(), &st) == 0 && S_ISLNK(st.st_mode);
 #endif
@@ -386,10 +434,15 @@ std::vector<std::string> list_names(const std::string& dir) {
 
 // Join for walk/glob output: always '/' after a relative/absolute prefix the
 // caller wrote, keeping the caller's own spelling.
+// dir joined with name as os.path.join does: the platform's separator.
 std::string child_path(const std::string& dir, const std::string& name) {
     if (dir.empty()) return name;
     if (is_any_sep(dir.back())) return dir + name;
+#ifdef _WIN32
+    return dir + "\\" + name;
+#else
     return dir + "/" + name;
+#endif
 }
 
 double ts_of(const struct stat& st, char which) {
@@ -404,19 +457,25 @@ double ts_of(const struct stat& st, char which) {
 #endif
 }
 
-Value stat_map(NythonExecutor& E, const struct stat* st, bool link) {
+Value stat_map(NythonExecutor& E, const struct stat* st, bool link, const std::string* path = nullptr) {
     using nyos::make_int;
     bool ok = st != nullptr;
+    double mt = ok ? ts_of(*st, 'm') : 0.0, at = ok ? ts_of(*st, 'a') : 0.0, ct = ok ? ts_of(*st, 'c') : 0.0;
+#ifdef _WIN32
+    if (ok && path) { nyos::precise_time(*path, 'm', mt); nyos::precise_time(*path, 'a', at); nyos::precise_time(*path, 'c', ct); }
+#else
+    (void)path;
+#endif
     std::vector<std::pair<std::string, Value>> m = {
         {"exists",  Value(ok)},
         {"size",    make_int(ok ? (long long)st->st_size : 0)},
         {"is_file", Value(ok && S_ISREG(st->st_mode))},
         {"is_dir",  Value(ok && S_ISDIR(st->st_mode))},
         {"is_link", Value(link)},
-        {"mtime",   Value(ok ? ts_of(*st, 'm') : 0.0)},
-        {"atime",   Value(ok ? ts_of(*st, 'a') : 0.0)},
-        {"ctime",   Value(ok ? ts_of(*st, 'c') : 0.0)},
-        {"mtime_ms", make_int(ok ? (long long)(ts_of(*st, 'm') * 1000.0) : 0)},
+        {"mtime",   Value(mt)},
+        {"atime",   Value(at)},
+        {"ctime",   Value(ct)},
+        {"mtime_ms", make_int((long long)(mt * 1000.0))},
         {"mode",    make_int(ok ? (long long)st->st_mode : 0)},
         {"permissions", make_int(ok ? (long long)(st->st_mode & 07777) : 0)},
         {"uid",     make_int(ok ? (long long)st->st_uid : 0)},
@@ -555,14 +614,27 @@ std::vector<std::string> glob(const std::string& pattern) {
         if (path_lstat(pattern, st)) out.push_back(pattern);
         return out;
     }
+    // As Python's glob: the directory part before the first component with a
+    // wildcard is kept exactly as written; what matches below it is joined
+    // with the platform's separator (os.path.join).
     std::vector<std::string> comps;
     std::string cur, prefix;
-    size_t i = 0;
+    size_t i = 0, root = 0;
 #ifdef _WIN32
-    if (pattern.size() >= 2 && pattern[1] == ':') { prefix = pattern.substr(0, 2); i = 2; }
+    if (pattern.size() >= 2 && pattern[1] == ':') root = 2;
 #endif
-    if (i < pattern.size() && is_any_sep(pattern[i])) { prefix += pattern[i]; i++; }
-    for (; i < pattern.size(); i++) {
+    if (root < pattern.size() && is_any_sep(pattern[root])) root++;
+    size_t start = root, first_magic = std::string::npos;
+    for (i = root; i <= pattern.size(); i++) {
+        if (i == pattern.size() || is_any_sep(pattern[i])) {
+            if (i > start && first_magic == std::string::npos && has_magic(pattern.substr(start, i - start))) first_magic = start;
+            start = i + 1;
+        }
+    }
+    size_t head_end = first_magic == std::string::npos ? pattern.size() : first_magic;
+    prefix = pattern.substr(0, head_end);
+    while (prefix.size() > root && is_any_sep(prefix.back())) prefix.pop_back();
+    for (i = head_end; i < pattern.size(); i++) {
         if (is_any_sep(pattern[i])) { if (!cur.empty()) comps.push_back(cur); cur.clear(); }
         else cur += pattern[i];
     }
@@ -834,7 +906,7 @@ Value dispatch_os(NythonExecutor& E,
         std::string p = S(0);
         struct stat st;
         bool link = is_link(p);
-        if (path_stat(p, st)) return stat_map(E, &st, link);
+        if (path_stat(p, st)) return stat_map(E, &st, link, &p);
         return stat_map(E, nullptr, link);
     }
     if (name == "os_stat" || name == "os_lstat") {
@@ -842,7 +914,7 @@ Value dispatch_os(NythonExecutor& E,
         struct stat st;
         bool ok = name == "os_stat" ? path_stat(p, st) : path_lstat(p, st);
         if (!ok) raise_errno(errno, p);
-        return stat_map(E, &st, is_link(p));
+        return stat_map(E, &st, is_link(p), &p);
     }
 
     // ── Directories ──────────────────────────────────────────────────────────
@@ -966,7 +1038,23 @@ Value dispatch_os(NythonExecutor& E,
     if (name == "os_symlink") {
         std::string src = S(0), dst = S(1);
 #ifdef _WIN32
-        raise("OSError", "symbolic links are not supported on this platform");
+        // Without Developer Mode (or admin rights) Windows refuses, as in
+        // Python: OSError [WinError 1314].
+        DWORD flags = 0x2;                                   // SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE
+        if (is_dir(src)) flags |= 0x1;                       // SYMBOLIC_LINK_FLAG_DIRECTORY
+        std::wstring wd = widen_os(dst), ws = widen_os(src);
+        BOOLEAN ok = CreateSymbolicLinkW(wd.c_str(), ws.c_str(), flags);
+        if (!ok && GetLastError() == ERROR_INVALID_PARAMETER)    // before Windows 10 1703
+            ok = CreateSymbolicLinkW(wd.c_str(), ws.c_str(), flags & 0x1);
+        if (!ok) {
+            DWORD e = GetLastError();
+            if (e == ERROR_ALREADY_EXISTS || e == ERROR_FILE_EXISTS) raise_errno(EEXIST, src, dst);
+            raise("OSError", "[WinError " + std::to_string(e) + "] cannot create a symbolic link: '" + src + "' -> '" + dst + "'");
+        }
+        // Success is believed only when the link is there (Wine's
+        // CreateSymbolicLinkW reports success and creates nothing).
+        if (!is_link(dst)) raise("OSError", "the symbolic link was not created: '" + src + "' -> '" + dst + "'");
+        return Value(true);
 #else
         if (::symlink(src.c_str(), dst.c_str()) != 0) raise_errno(errno, src, dst);
         return Value(true);
@@ -975,7 +1063,12 @@ Value dispatch_os(NythonExecutor& E,
     if (name == "os_readlink") {
         std::string p = S(0);
 #ifdef _WIN32
-        raise("OSError", "symbolic links are not supported on this platform");
+        std::string t;
+        if (!win_readlink(p, t)) {
+            if (!exists(p) && !is_link(p)) raise_errno(ENOENT, p);
+            raise("OSError", "[WinError 4390] The file or directory is not a reparse point: '" + p + "'");
+        }
+        return Str(t);
 #else
         char buf[8192];
         ssize_t k = ::readlink(p.c_str(), buf, sizeof(buf) - 1);
@@ -1106,7 +1199,13 @@ Value dispatch_os(NythonExecutor& E,
     if (name == "chdir" || name == "cd" || name == "os_chdir") {
         if (args.empty()) return Value(false);
         bool ok = ::chdir(S(0).c_str()) == 0;
-        if (!ok && name == "os_chdir") raise_errno(errno, S(0));
+        if (!ok && name == "os_chdir") {
+            // A file is NotADirectoryError everywhere, as in Python (Windows'
+            // _chdir reports EINVAL for it).
+            int e = errno;
+            if (exists(S(0)) && !is_dir(S(0))) e = ENOTDIR;
+            raise_errno(e, S(0));
+        }
         return Value(ok);
     }
 

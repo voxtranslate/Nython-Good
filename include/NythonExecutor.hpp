@@ -47,6 +47,7 @@
 #include "NyBigInt.hpp"
 #include "NyStr.hpp"
 #include "NyFormat.hpp"
+#include "NyMembers.hpp"
 
 // Platform compat (sockets, dirent, stat, getcwd, etc.) in platform_compat.hpp
 #include <locale>
@@ -104,6 +105,8 @@ static std::string utf8_lower(const std::string& s) {
 #include "ASTNodes.hpp"
 #include "DynamicLang.hpp"
 #include "Runtime.hpp"
+#include "NyCoro.hpp"   // stackful coroutines (round 75)
+#include "NyGen.hpp"    // lazy generators on those coroutines (src/NyGen.cpp)
 
 using namespace std;
 using namespace nython;
@@ -174,7 +177,9 @@ inline nython::kernel::bigint nbig_to_bigint(const nypy::BigInt& n) {
     r.assignLimbs(n.neg, std::move(d));
     return r;
 }
-inline Value intValue(int64_t v) { return Value((long int)v); }
+// Through bigint(long long): `long` is 32 bits on Windows (LLP64), and the
+// old Value((long int)v) truncated every integer above 2^31 there.
+inline Value intValue(int64_t v) { return Value(nython::kernel::bigint((long long)v)); }
 inline Value intValue(const nypy::BigInt& n) {
     int64_t v;
     if (n.to_i64(v)) return intValue(v);
@@ -233,9 +238,6 @@ struct NythonExecutor {
     Context* global_ctx;
     Runnable* runner;
     std::map<void*, std::string> func_names;
-    // Per OS thread: generator collection in one thread must not capture the
-    // yields of another (round 74, threads).
-    static inline thread_local std::vector<Value>* yield_sink_ = nullptr; // set during generator collection
     std::map<int, FILE*> file_handles{};
     int next_file_handle{1000};
     std::map<void*, Context*> closure_contexts;
@@ -250,7 +252,9 @@ struct NythonExecutor {
     // other; the cycle collector frees the pair when nothing else does.
     //
     // (Before round 75 an "escaped" set kept every scope a closure or class
-    // had ever referred to alive for the life of the process.)
+    // had ever referred to alive for the life of the process.) A generator
+    // running in a scope holds its own reference to it (nygen), so nothing
+    // needs to be deferred here.
     void markEscaped(Context*) {}
     void reapContext(Context* c) { if (c) nygc::decref(c); }
     // Releases the creator's reference on scope exit, including when the
@@ -472,12 +476,13 @@ public:   // NythonExecutor is a struct: members default to public
             "print","println","range","len","type","str","int","float","bool",
             "input","abs","min","max","round","sorted","reversed",
             "list","tuple","dict","set","map","filter","reduce","zip",
-            "enumerate","sum","any","all","hasattr","getattr","setattr",
+            "enumerate","sum","any","all","hasattr","getattr","setattr","delattr",
             "isinstance","issubclass","id","hash","hex","oct","bin",
             "chr","ord","repr","format","open","exit","quit",
             "pow","divmod","input","dict","display","show","is_int","is_float","is_string","is_list","is_none","is_bool","to_int","to_float","to_str","clamp","lerp","map_range","repeat_str","repeat","flatten","flat","shell","system","ls","cat","pwd","mkdir","write","exists","env","all","any","complex","slice","super","property",
             "staticmethod","classmethod","callable","dir","vars","globals","locals",
             "iter","next","help","Set","Counter","OrderedDict","deque","defaultdict","assert",
+            "islice","take",   // lazy iteration (src/NyGen.cpp), both engines
             "sqrt","sin","cos","tan","log","floor","ceil",
             "keys","values","items",
             "read_file","write_file","file_exists",
@@ -495,7 +500,7 @@ public:   // NythonExecutor is a struct: members default to public
             "text_fold_ranges","text_line_stats","text_todos","fs_todos","text_format_nython",
             "ac_index_new","ac_index_set_base","ac_index_scan","ac_index_rank","text_diff_classify","fs_symbols","ny_check_file","fs_line_stats",
             // ── GUI builtins — value-returning ──────────────────────────────
-            "gui_get_error","gui_sdl_version","gui_get_display_size","gui_get_window_size","gui_set_window_size","gui_set_cursor","gui_hash_id","gui_display_scale","gui_display_density","gui_window_scale","gui_measure_text_w","gui_set_clipboard","gui_get_clipboard",
+            "gui_get_error","gui_sdl_version","gui_get_display_size","gui_get_window_size","gui_set_window_size","gui_set_cursor","gui_hash_id","gui_display_scale","gui_display_density","gui_video_driver","gui_window_scale","gui_measure_text_w","gui_set_clipboard","gui_get_clipboard",
             "gui_wait_events","gui_set_min_size","gui_set_fullscreen","gui_is_fullscreen","gui_show_open_dialog","gui_show_save_dialog","gui_set_text_input_area","gui_draw_arc","gui_draw_text_wrapped","gui_wrap_text","gui_font_metrics","gui_image_size","gui_free_image","gui_push_clip","gui_pop_clip","gui_push_offset","gui_pop_offset","gui_ticks","gui_next_event","gui_event_get",
             // ── Previously implemented but never registered ──────────────
             // The module dispatchers implement 537 builtins; only 197 were
@@ -585,7 +590,7 @@ public:   // NythonExecutor is a struct: members default to public
             "os_unsetenv","os_environ","os_platform","os_cpu_count","os_hostname",
             "os_username","os_home","os_uname",
             "os_system","os_run","subprocess_run","os_spawn","os_proc_read","os_poll",
-            "os_wait","os_kill","os_getpid","os_getppid","shell_quote","os_shell_quote",
+            "os_wait","os_kill","os_getpid","os_getppid","shell_quote","os_shell_quote","os_shell",
             "which","os_which","sys_argv",
             "time","clock","time_ns","time_monotonic","monotonic","time_perf_counter",
             "perf_counter","time_process","process_time","time_strftime","time_localtime",
@@ -813,6 +818,8 @@ public:   // NythonExecutor is a struct: members default to public
             case NodeType::PASS: return NONE_VALUE;
             case NodeType::CALL: return evalCall(node, ctx);
             case NodeType::ATTRIBUTE: return evalAttribute(node, ctx);
+            case NodeType::OPT_CHAIN: return evalOptChain(static_cast<OptChainNode*>(node.get()), ctx);
+            case NodeType::CHAIN_HOLE: return static_cast<HoleNode*>(node.get())->slot;
             case NodeType::SUBSCRIPT: return evalSubscript(node, ctx);
             case NodeType::LIST: return evalList(node, ctx);
             case NodeType::COMPLEX: return evalComprehension(node, ctx);
@@ -835,16 +842,19 @@ public:   // NythonExecutor is a struct: members default to public
             case NodeType::WITH: { SuspendFast _sf; return evalWith(node, ctx); }
             case NodeType::NAMESPACE: { SuspendFast _sf; return evalNamespace(node, ctx); }
             case NodeType::INTERFACE: { SuspendFast _sf; return evalInterfaceDecl(node, ctx); }
-            case NodeType::YIELD: { auto yn = static_pointer_cast<YieldNode>(node); Value yv = yn->expr ? evalNode(yn->expr, ctx) : NONE_VALUE; if (yield_sink_) { yieldValue(yv); return NONE_VALUE; } throw nython::node::YieldSignal(yv); }
+            case NodeType::YIELD: {
+                // Suspends the generator's coroutine; the value is what
+                // send() delivers (none for next()) - src/NyGen.cpp.
+                auto yn = static_pointer_cast<YieldNode>(node);
+                Value yv = yn->expr ? evalNode(yn->expr, ctx) : NONE_VALUE;
+                return nygen::yield_value(*this, yv);
+            }
             case NodeType::YIELD_FROM: {
-                // yield from it: every value of `it`, yielded in turn.
+                // Delegates next/send/throw/close to the subiterator; the
+                // value is the subgenerator's return value.
                 auto yf = static_pointer_cast<YieldFromNode>(node);
                 Value src = evalNode(yf->expr, ctx);
-                // (what is left of a generator, which this consumes)
-                std::vector<Value> items = iterValues(src, ctx);
-                if (!yield_sink_) throw nython::node::YieldSignal(items.empty() ? NONE_VALUE : items[0]);
-                for (auto& item : items) yieldValue(item);
-                return NONE_VALUE;
+                return nygen::yield_from(*this, src, ctx);
             }
             case NodeType::GLOBAL: return NONE_VALUE;
             case NodeType::SELF: return ctx->getByName("self");
@@ -951,10 +961,24 @@ public:   // NythonExecutor is a struct: members default to public
     // ─── VARIABLES ──────────────────────────────────────────────────────
 
 
+    // The module scope a context belongs to: the root of its scope chain.
+    static Context* moduleCtx(Context* ctx) {
+        while (ctx && ctx->parent) ctx = ctx->parent;
+        return ctx;
+    }
+    // Stores a plain `name = value`: in a class body the class namespace;
+    // a name declared `global` at module level; otherwise the nearest
+    // existing binding, or a new local (Context::setByName).
+    void assignName(VariableNode* vn, const Value& val, Context* ctx) {
+        if (vn->global_ref) moduleCtx(ctx)->defineByName(vn->name, val);
+        else if (ctx->inClass) ctx->defineByName(vn->name, val);
+        else ctx->setByName(vn->name, val);
+    }
+
     Value evalVariable(node_ptr node, Context* ctx) {
         auto vn = static_pointer_cast<VariableNode>(node);
         // Check user-defined first
-        Value found = ctx->getByName(vn->name);
+        Value found = vn->global_ref ? moduleCtx(ctx)->getByName(vn->name) : ctx->getByName(vn->name);
         if (found.type != ValueType::UNDEFINED) return found;
         // Then check builtins — return a USERDATA marker
         if (builtin_set.count(vn->name)) {
@@ -968,7 +992,7 @@ public:   // NythonExecutor is a struct: members default to public
         // program carried on). Bound-to-undefined (`x = undefined`) and names
         // that resolve by another route (a class or function an imported
         // module registered) are not errors.
-        if (!ctx->hasByName(vn->name) && !knownName(vn->name)) {
+        if (!(vn->global_ref ? moduleCtx(ctx) : ctx)->hasByName(vn->name) && !knownName(vn->name)) {
             std::string hint = suggestName(vn->name);
             if (!hint.empty()) hint = "  (did you mean '" + hint + "'?)";
             throw std::string("__exc__:NameError:name '" + vn->name + "' is not defined" + hint);
@@ -992,6 +1016,8 @@ public:   // NythonExecutor is a struct: members default to public
     Value evalVarDecl(node_ptr node, Context* ctx) {
         auto vd = static_pointer_cast<VarDeclNode>(node);
         Value val = vd->init ? evalNode(vd->init, ctx) : NONE_VALUE;
+        // a, b = gen(): the targets index a list of its values (nygen).
+        if (vd->unpack != -2 && nygen::is_gen(val)) val = nygen::unpack_list(*this, val, vd->unpack, ctx);
         ctx->defineByName(vd->name, val);
         return val;
     }
@@ -1005,8 +1031,7 @@ public:   // NythonExecutor is a struct: members default to public
             // setByName found a same-named variable in an enclosing scope and
             // rebound IT (`items = []` in a class body overwrote the global
             // builtin `items`, and the class never got the attribute).
-            if (ctx->inClass) ctx->defineByName(vn->name, val);
-            else ctx->setByName(vn->name, val);
+            assignName(vn.get(), val, ctx);
         } else if (an->target->type() == NodeType::ATTRIBUTE) {
             auto attr = static_pointer_cast<AttributeNode>(an->target);
             Value obj = evalNode(attr->object, ctx);
@@ -1230,7 +1255,7 @@ public:   // NythonExecutor is a struct: members default to public
         OP_UNKNOWN = 0, OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_FLOORDIV, OP_MOD, OP_POW,
         OP_BAND, OP_BOR, OP_BXOR, OP_LSHIFT, OP_RSHIFT,
         OP_EQ, OP_NE, OP_LT, OP_LE, OP_GT, OP_GE, OP_SEQ, OP_SNE,
-        OP_IS, OP_ISNOT, OP_IN, OP_NOTIN, OP_AND, OP_OR, OP_LXOR
+        OP_IS, OP_ISNOT, OP_IN, OP_NOTIN, OP_AND, OP_OR, OP_LXOR, OP_COALESCE
     };
     static int binOpCode(const std::string& op) {
         switch (op.size()) {
@@ -1248,6 +1273,7 @@ public:   // NythonExecutor is a struct: members default to public
                 if (op == "is") return OP_IS; if (op == "in") return OP_IN;
                 if (op == "or" || op == "||") return OP_OR; if (op == "&&") return OP_AND;
                 if (op == "^^") return OP_LXOR;
+                if (op == "??") return OP_COALESCE;
                 return OP_UNKNOWN;
             case 3:
                 if (op == "and") return OP_AND; if (op == "xor") return OP_LXOR;
@@ -1262,7 +1288,7 @@ public:   // NythonExecutor is a struct: members default to public
     }
     static const char* opSymbol(int opc) {
         static const char* s[] = {"?", "+", "-", "*", "/", "//", "%", "**", "&", "|", "^", "<<", ">>",
-                                  "==", "!=", "<", "<=", ">", ">=", "===", "!==", "is", "is not", "in", "not in", "and", "or", "xor"};
+                                  "==", "!=", "<", "<=", ">", ">=", "===", "!==", "is", "is not", "in", "not in", "and", "or", "xor", "??"};
         return (opc >= 0 && opc <= OP_LXOR) ? s[opc] : "?";
     }
     // Arithmetic on two numbers: nypy::arith (NyBigInt.hpp), shared with
@@ -1328,17 +1354,17 @@ public:   // NythonExecutor is a struct: members default to public
 
     // `x in c`
     bool containsValue(const Value& c, const Value& x, Context* ctx) {
+        // A generator: consumed up to the first match.
+        if (nygen::Gen* g = nygen::gen_of(c)) return nygen::contains(*this, g, x, ctx);
         // An object: __contains__, else a search of what it iterates over
-        // (__iter__ / __getitem__), as in Python.
+        // (__iter__ / __getitem__), stopping at the first match, as in Python.
         if (isInstanceVal(c)) {
             if (instanceHasMethod(c, "__contains__")) {
                 std::vector<Value> args = {x};
                 return isTruthy(callMethod(c, "__contains__", args, ctx));
             }
-            if (instanceHasMethod(c, "__iter__") || instanceHasMethod(c, "__getitem__") || instanceHasMethod(c, "__next__")) {
-                for (auto& v : iterValues(c, ctx)) if (pyEquals(x, v, ctx)) return true;
-                return false;
-            }
+            if (instanceHasMethod(c, "__iter__") || instanceHasMethod(c, "__getitem__") || instanceHasMethod(c, "__next__"))
+                return nygen::contains_iter(*this, c, x, ctx);
             pyRaise("TypeError", "argument of type '" + instanceClassName(c) + "' is not iterable");
         }
         if (isStringValue(c)) {
@@ -1473,6 +1499,7 @@ public:   // NythonExecutor is a struct: members default to public
     Value evalAugAssignment(node_ptr node, Context* ctx) {
         auto an = static_pointer_cast<AugAssignNode>(node);
         const std::string& op = an->op;
+        if (op == "??=") return evalCoalesceAssign(an.get(), ctx);
         std::string base = op.substr(0, op.size() > 0 ? op.size() - 1 : 0);
         if (op == ">>>=") base = ">>";
         int opc = binOpCode(base);
@@ -1487,10 +1514,7 @@ public:   // NythonExecutor is a struct: members default to public
         } else if (kind == 2) {
             auto attr = static_pointer_cast<AttributeNode>(an->target);
             obj = evalNode(attr->object, ctx);
-            receiver_cache_[attr->object.get()] = obj;
-            try { old_val = evalNode(an->target, ctx); }
-            catch (...) { receiver_cache_.erase(attr->object.get()); throw; }
-            receiver_cache_.erase(attr->object.get());
+            if (!getAttrValue(obj, attr->attr, ctx, old_val)) old_val = missingAttribute(obj, attr->attr, an->target.get());
         } else {
             old_val = evalNode(an->target, ctx);
         }
@@ -1544,8 +1568,40 @@ public:   // NythonExecutor is a struct: members default to public
         if (kind == 1) setItem(obj, idx, result, ctx);
         else if (kind == 2) setAttr(obj, static_pointer_cast<AttributeNode>(an->target)->attr, result);
         else if (an->target->type() == NodeType::VARIABLE)
-            ctx->setByName(static_pointer_cast<VariableNode>(an->target)->name, result);
+            assignName(static_cast<VariableNode*>(an->target.get()), result, ctx);
         return result;
+    }
+
+    // t ??= v: v is evaluated and assigned only when t is absent - none or
+    // undefined, or, for an attribute or a key, missing (a name must exist:
+    // an unbound one is a NameError, as a read of it is). The target's
+    // object and index are evaluated once. The value is t's, old or new.
+    Value evalCoalesceAssign(AugAssignNode* an, Context* ctx) {
+        NodeType tt = an->target->type();
+        if (tt == NodeType::SUBSCRIPT) {
+            auto* sub = static_cast<SubscriptNode*>(an->target.get());
+            Value obj = evalNode(sub->object, ctx);
+            Value idx = evalNode(sub->index, ctx);
+            Value cur;
+            if (tryGetItem(obj, idx, ctx, cur) && !isAbsent(cur)) return cur;
+            Value nv = evalNode(an->value_node, ctx);
+            setItem(obj, idx, nv, ctx);
+            return nv;
+        }
+        if (tt == NodeType::ATTRIBUTE) {
+            auto* at = static_cast<AttributeNode*>(an->target.get());
+            Value obj = evalNode(at->object, ctx);
+            Value cur;
+            if (getAttrValue(obj, at->attr, ctx, cur) && !isAbsent(cur)) return cur;
+            Value nv = evalNode(an->value_node, ctx);
+            setAttr(obj, at->attr, nv);
+            return nv;
+        }
+        Value cur = evalNode(an->target, ctx);
+        if (!isAbsent(cur)) return cur;
+        Value nv = evalNode(an->value_node, ctx);
+        if (tt == NodeType::VARIABLE) assignName(static_cast<VariableNode*>(an->target.get()), nv, ctx);
+        return nv;
     }
 
     // ─── ATTRIBUTE / ITEM STORES ────────────────────────────────────────
@@ -1584,17 +1640,25 @@ public:   // NythonExecutor is a struct: members default to public
                 if (class_node && fnTag(func_names, class_ptr).rfind("__class__:", 0) == 0 && class_node->type() == NodeType::CLASS) {
                     auto* cn = static_cast<ClassNode*>(class_node);
                     class_vars_[cn->name + "." + name] = val;
-                    // Also update class_ctx_map_ so subsequent reads via evalAttribute see the new value
+                    // Also update class_ctx_map_ so subsequent reads via evalAttribute see the new value.
+                    // In the class's own namespace: setByName walked on into
+                    // the scope the class was defined in, so C.x = v rebound a
+                    // same-named global when the class had no x yet.
                     auto cctx_it = class_ctx_map_.find((void*)class_node);
-                    if (cctx_it != class_ctx_map_.end()) {
-                        try { cctx_it->second->setByName(name, val); }
-                        catch (...) { cctx_it->second->defineByName(name, val); }
-                    }
+                    if (cctx_it != class_ctx_map_.end()) cctx_it->second->defineByName(name, val);
+                    return;
                 }
             }
+            if (pit != instance_properties.end()) return;
         }
         // Store on Collectable containers (namespaces, modules)
-        if (Container* cont = contOf(obj)) (*cont->container)[name] = val;
+        if (Container* cont = contOf(obj)) { (*cont->container)[name] = val; return; }
+        if (isPlainFunction(obj)) { func_attrs_[obj.value.p][name] = val; return; }
+        // none.x = v, 5.x = v, "s".x = v, len.x = v: nothing can hold it
+        // (AttributeError, as in Python - it was dropped silently).
+        std::string msg = attributeErrorText(obj, name);
+        if (nypy::lenient_reads_log()) { logLenientRead(nullptr, "AttributeError (store): " + msg); return; }
+        throw std::string("__exc__:AttributeError:" + msg);
     }
 
     // Structural equality, recursive, as on the VM (and in Python): lists
@@ -1618,6 +1682,7 @@ public:   // NythonExecutor is a struct: members default to public
         }
         if (a.isCollectable() && b.isCollectable() && a.value.gc && b.value.gc) {
             if (a.value.gc == b.value.gc) return true;
+            if (nygen::is_gen(a) || nygen::is_gen(b)) return false;   // generators: identity
             auto* lc = dynamic_cast<Container*>(a.value.gc);
             auto* rc = dynamic_cast<Container*>(b.value.gc);
             if (!lc || !rc || !lc->container || !rc->container) return a == b;
@@ -1920,7 +1985,7 @@ public:   // NythonExecutor is a struct: members default to public
         }
         if (name == "update" || name == "merge") {
             if (!args.empty()) {
-                if (Container* src = contOf(args[0]); src && seqLen(src) < 0) dictUpdate(cont, src);
+                if (Container* src = contOf(args[0]); src && seqLen(src) < 0 && !nygen::is_gen(args[0])) dictUpdate(cont, src);
                 else for (auto& pairv : iterItems(args[0], ctx)) {
                     std::vector<Value> kv = iterItems(pairv, ctx);
                     if (kv.size() != 2) pyRaise("ValueError", "dictionary update sequence element has length " + std::to_string(kv.size()) + "; 2 is required");
@@ -2018,6 +2083,7 @@ public:   // NythonExecutor is a struct: members default to public
 
     // obj[idx]
     Value getItem(const Value& obj, const Value& idx, Context* ctx) {
+        if (nygen::is_gen(obj)) pyRaise("TypeError", "'generator' object is not subscriptable");
         // String indexing, in characters: s[0], s[-1]
         if (obj.type == ValueType::USERDATA && obj.value.p && !func_names.count(obj.value.p)) {
             const std::string& s = *(std::string*)obj.value.p;
@@ -2044,10 +2110,10 @@ public:   // NythonExecutor is a struct: members default to public
             }
             auto it = dictFind(cont, idx);
             if (it != cont->container->end()) return it->second;
-            // A missing dict key reads none: the libraries and the IDE are
-            // written against that (`v = d[k]` then `if v == none`) in too
-            // many places to raise KeyError here; d.get() is the same.
-            if (n < 0) return NONE_VALUE;
+            // A missing dict key raises KeyError, as in Python (round 75: it
+            // read none). d.get(k, default), `k in d` and d?[k] are the
+            // graceful forms.
+            if (n < 0) return missingKey(idx, ctx);
             pyRaise("TypeError", std::string(isTupleCont(cont) ? "tuple" : "list") + " indices must be integers or slices, not " + typeNameOf(idx));
         }
         // __getitem__ on instances
@@ -2057,7 +2123,46 @@ public:   // NythonExecutor is a struct: members default to public
             std::vector<Value> call_args = {idx};
             return callMethod(obj, "__getitem__", call_args, ctx);
         }
-        return NONE_VALUE;
+        // none[k], 5[0], f[0]: TypeError (they read none).
+        std::string msg = "'" + typeNameOf(obj) + "' object is not subscriptable";
+        if (nypy::lenient_reads_log()) { logLenientRead(nullptr, "TypeError: " + msg); return NONE_VALUE; }
+        pyRaise("TypeError", msg);
+    }
+    // obj[idx] for d?[k]: false when the key or index does not exist - a
+    // missing dict key, an index out of range, or __getitem__ raising
+    // KeyError / IndexError. Other errors (an unhashable key, a type that is
+    // not subscriptable) raise as obj[idx] does.
+    bool tryGetItem(const Value& obj, const Value& idx, Context* ctx, Value& out) {
+        if (Container* cont = contOf(obj)) {
+            int64_t n = seqLen(cont);
+            if (n < 0) {
+                auto it = dictFind(cont, idx);
+                if (it == cont->container->end()) return false;
+                out = it->second;
+                return true;
+            }
+            Num k;
+            if (asNum(idx, k) && k.k == 1) {
+                int64_t j = k.i < 0 ? k.i + n : k.i;
+                if (j < 0 || j >= n) return false;
+            }
+        } else if (isStringValue(obj)) {
+            Num k;
+            if (asNum(idx, k) && k.k == 1) {
+                int64_t n = (int64_t)nypy::u8_len(*(std::string*)obj.value.p);
+                int64_t j = k.i < 0 ? k.i + n : k.i;
+                if (j < 0 || j >= n) return false;
+            }
+        } else if (isInstanceVal(obj) && instanceHasMethod(obj, "__getitem__")) {
+            try { out = getItem(obj, idx, ctx); }
+            catch (std::string& e) {
+                if (excTypeMatches(e, "KeyError") || excTypeMatches(e, "IndexError")) return false;
+                throw;
+            }
+            return true;
+        }
+        out = getItem(obj, idx, ctx);
+        return true;
     }
 
     // obj[idx] = val
@@ -2106,17 +2211,14 @@ public:   // NythonExecutor is a struct: members default to public
     // order, a dict's keys, a string's characters, or an instance's
     // __iter__/__next__ sequence.
     std::vector<Value> iterItems(const Value& v, Context* ctx) {
+        // A generator: what is left of it, pulled one value at a time.
+        if (nygen::Gen* g = nygen::gen_of(v)) {
+            std::vector<Value> out;
+            nygen::drain(*this, g, out, ctx);
+            return out;
+        }
         if (Container* c = contOf(v)) {
-            if (seqLen(c) >= 0) {
-                if (!isGenCont(c)) return seqItems(c);
-                // A generator: what is left of it, which this consumes.
-                auto ix = c->container->find("__idx__");
-                int64_t from = ix != c->container->end() ? bigint_to_i64(ix->second.value.i) : 0;
-                std::vector<Value> all = seqItems(c);
-                (*c->container)["__idx__"] = intValue((int64_t)all.size());
-                if (from <= 0) return all;
-                return std::vector<Value>(all.begin() + std::min<int64_t>(from, (int64_t)all.size()), all.end());
-            }
+            if (seqLen(c) >= 0) return seqItems(c);
             return dictKeys(c);
         }
         if (isStringValue(v)) {
@@ -2139,6 +2241,7 @@ public:   // NythonExecutor is a struct: members default to public
             default: break;
         }
         if (isStringValue(v)) return "str";
+        if (nygen::is_gen(v)) return "generator";
         if (Container* c = contOf(v)) {
             if (seqLen(c) < 0) return "dict";
             return isTupleCont(c) ? "tuple" : isSetCont(c) ? "set" : isGenCont(c) ? "generator" : "list";
@@ -2148,7 +2251,7 @@ public:   // NythonExecutor is a struct: members default to public
             if (fit != func_names.end()) {
                 if (fit->second.rfind("__instance__:", 0) == 0) return fit->second.substr(13);
                 if (fit->second.rfind("__class__:", 0) == 0) return "type";
-                if (fit->second.rfind("__builtin__:", 0) == 0) return "builtin_function_or_method";
+                if (fit->second.rfind("__builtin__:", 0) == 0 || fit->second.rfind("__bmethod__:", 0) == 0) return "builtin_function_or_method";
                 return "function";
             }
         }
@@ -2209,6 +2312,7 @@ public:   // NythonExecutor is a struct: members default to public
             const std::string& s = *(std::string*)v.value.p;
             return repr ? nypy::str_repr(s) : s;
         }
+        if (nygen::is_gen(v)) return v.value.gc->toString();   // <generator object f at 0x...>
         Container* c = contOf(v);
         if (!c) return v.value.gc ? v.value.gc->toString() : "none";
         int64_t n = seqLen(c);
@@ -2369,7 +2473,7 @@ public:   // NythonExecutor is a struct: members default to public
         bool mapping = false;
         Container* rc = contOf(rv);
         if (rc && seqLen(rc) >= 0 && isTupleCont(rc)) args = seqItems(rc);
-        else { args.push_back(rv); mapping = rc && seqLen(rc) < 0; }
+        else { args.push_back(rv); mapping = rc && seqLen(rc) < 0 && !nygen::is_gen(rv); }
         std::string out = nyCall([&] {
             return nypy::percent_format(fmt, (int64_t)args.size(), mapping,
                 [&](int64_t i, const std::string& key, char conv) -> nypy::FmtVal {
@@ -2393,6 +2497,8 @@ public:   // NythonExecutor is a struct: members default to public
         // to test only for false/none and always produced a bool for `and`.
         case OP_AND: { Value lv = evalNode(bn->left, ctx); if (!isTruthy(lv)) return lv; return evalNode(bn->right, ctx); }
         case OP_OR:  { Value lv = evalNode(bn->left, ctx); if (isTruthy(lv)) return lv; return evalNode(bn->right, ctx); }
+        // a ?? b: b only when a is none or undefined (and only then evaluated).
+        case OP_COALESCE: { Value lv = evalNode(bn->left, ctx); if (!isAbsent(lv)) return lv; return evalNode(bn->right, ctx); }
         case OP_IS: case OP_ISNOT: {
             // `is` answers "does the left operand belong to the right?" in the
             // widest useful sense, not only pointer identity:
@@ -2631,13 +2737,23 @@ public:   // NythonExecutor is a struct: members default to public
         auto fn = static_pointer_cast<ForNode>(node);
         bool broke = false;
         FlowState& lf = flow();
+        uint64_t gen_s0 = nygen::serial_now();
         Value iter_val = evalNode(fn->iterable, ctx);
+        // A generator the iterable expression made itself belongs to this
+        // loop alone: it is closed when the loop ends (break, return, error),
+        // as CPython's reference counting does (nygen::fresh).
+        bool gen_owned = gen_s0 != nygen::serial_now() && nygen::fresh(iter_val, fn->iterable, call_depth_, gen_s0);
         std::string var_name = fn->var->value();
         Value result = NONE_VALUE;
         // The loop variable is a local, unless the function declared it
         // `global`/`nonlocal` (then the existing binding is rebound).
+        // A name declared `global` is the module's (VariableNode::global_ref).
         auto bindv = [&](const std::string& n, const Value& v) {
-            if (fn->rebinds) ctx->setByName(n, v); else ctx->defineByName(n, v);
+            auto gref = [](const node_ptr& v) { return v && v->type() == NodeType::VARIABLE && static_cast<VariableNode*>(v.get())->global_ref; };
+            bool glob = n == var_name && gref(fn->var);
+            for (auto& u : fn->unpack_vars) if (!glob && u->value() == n) glob = gref(u);
+            if (glob) moduleCtx(ctx)->defineByName(n, v);
+            else if (fn->rebinds) ctx->setByName(n, v); else ctx->defineByName(n, v);
         };
         // An object whose __iter__ returns a list, a generator or iter(...):
         // the loop runs over that. (The loop below called __next__ on the
@@ -2645,11 +2761,17 @@ public:   // NythonExecutor is a struct: members default to public
         Value pre_iterator; bool have_pre_iterator = false;
         if (isInstanceValue(iter_val) && instanceHasMethod(iter_val, "__iter__")) {
             std::vector<Value> no_args;
+            uint64_t s1 = nygen::serial_now();
             Value it = callMethod(iter_val, "__iter__", no_args, ctx);
             if (isInstanceValue(it)) { pre_iterator = it; have_pre_iterator = true; }
-            else if (it.type != ValueType::NONE && it.type != ValueType::UNDEFINED) iter_val = it;
+            else if (it.type != ValueType::NONE && it.type != ValueType::UNDEFINED) {
+                iter_val = it;
+                gen_owned = nygen::fresh_implicit(it, call_depth_, s1);   // `def __iter__(self): yield ...`
+            }
             else throw std::string("__exc__:TypeError:iter() returned non-iterator of type 'NoneType'");
         }
+        // A generator: one value per iteration, pulled lazily (src/NyGen.cpp).
+        if (nygen::is_gen(iter_val)) return nygen::for_loop(*this, fn.get(), iter_val, ctx, gen_owned);
 
         // range() returns an integer — iterate 0..n-1
         if (iter_val.type == ValueType::INTEGER) {
@@ -3004,6 +3126,7 @@ public:   // NythonExecutor is a struct: members default to public
         // A builtin, an instance or a class is not an AST function: treating its
         // pointer as a Node* crashed (thread_create(print), key=len, map(str, xs)).
         if (fit->second.rfind("__builtin__:", 0) == 0) return callBuiltin(fit->second.substr(12), call_args, ctx);
+        if (fit->second.rfind("__bmethod__:", 0) == 0) { Value r; callBoundMember(fn_val, call_args, nullptr, ctx, r); return r; }
         if (fit->second.rfind("__instance__:", 0) == 0 || instance_to_class.count(fn_val.value.p)) return callMethod(fn_val, "__call__", call_args, ctx);
         if (fit->second.rfind("__class__:", 0) == 0) return NONE_VALUE;
         // Bound-method `self` is supplied centrally in bindParamsKw via the
@@ -3081,19 +3204,13 @@ public:   // NythonExecutor is a struct: members default to public
                      const std::unordered_map<std::string, Value>* kw_in = nullptr) {
         static const std::unordered_map<std::string, Value> kEmptyKw;
         const std::unordered_map<std::string, Value>& kw_args_in = kw_in ? *kw_in : kEmptyKw;
-        // A generator (eager, see collectGenerator): send(v) advances it as
-        // next() does - the value is not delivered, `x = yield` reads none
-        // on this engine (the VM delivers it) - and close() exhausts it.
-        if (isGenValue(obj)) {
-            if (method_name == "send" || method_name == "__next__") {
-                std::vector<Value> a{obj};
-                return callBuiltin("next", a, ctx);
-            }
-            if (method_name == "close") {
-                auto* c = dynamic_cast<Container*>(obj.value.gc);
-                (*c->container)["__idx__"] = (*c->container)["__len__"];
-                return NONE_VALUE;
-            }
+        // A generator: send / throw / close / __next__ / __iter__ (NyGen.cpp),
+        // then the object protocol; nothing else.
+        if (nygen::is_gen(obj)) {
+            Value r;
+            if (nygen::method(*this, obj, method_name, args, ctx, r)) return r;
+            if (primitiveMember(obj, method_name, args, ctx, r)) return r;
+            pyRaise("AttributeError", "'generator' object has no attribute '" + method_name + "'");
         }
         {
             Value pm;
@@ -3878,11 +3995,12 @@ public:   // NythonExecutor is a struct: members default to public
                 return callMethod(target, "__call__", args, ctx, kw_in);
             return callFunctionValue(target, args, ctx);
         }
-        {
-            std::string err;
-            if (attributeErrorFor(obj, method_name, err)) throw err;
-        }
-        return NONE_VALUE;
+        // Any other value without such a method raises too: `none.m()` and
+        // `"s".nosuch()` returned none (round 75). `x?.m()` is the graceful
+        // spelling.
+        if (isInstanceValue(obj) || fnTag(func_names, obj.value.p).rfind("__class__:", 0) == 0)
+            throw std::string("__exc__:AttributeError:" + attributeErrorText(obj, method_name));
+        return missingAttribute(obj, method_name, nullptr);
     }
 
     std::vector<std::unique_ptr<int64_t>> func_id_store;
@@ -4435,6 +4553,9 @@ public:
     inline void noteStatement(const node_ptr& st, Context* ctx) {
         nyconc::tick();          // GIL switch point (no-op until a thread exists)
         nygc::safe_point();      // queued __del__ and due collections (one load)
+        // Generators dropped while suspended are closed here, between
+        // statements, not inside the destructor that dropped them.
+        if (__builtin_expect(nygen::t_pending, 0)) nygen::run_pending(*this);
         last_stmt() = st;
         if (trace_on()) traceStatement(st, ctx);
     }
@@ -4498,6 +4619,45 @@ public:
         fflush(T.f);
     }
 
+    // A builtin call some of whose arguments are generators their own
+    // argument expressions just made (nygen::fresh), so nothing else refers
+    // to them: lazy wrappers (zip, map, islice...) take them over, and a
+    // builtin that consumes its argument (any, next, sum...) closes them when
+    // it returns. Their finally blocks run then, as under CPython's reference
+    // counting, and nothing is left suspended behind any(x for x in ...).
+    Value callBuiltinTemps(const std::string& b, std::vector<Value>& args, Context* ctx,
+                           const std::shared_ptr<CallNode>& cn, uint64_t s0) {
+        uint32_t mask = 0;
+        size_t pos = 0;
+        bool simple = true;
+        std::vector<std::pair<size_t, node_ptr>> at;
+        for (auto& a : cn->args) {
+            if (a->type() == NodeType::KEYWORD_ARG) continue;
+            if (a->type() == NodeType::UNARY) {
+                auto un = static_pointer_cast<UnaryNode>(a);
+                if (un->op == "*" || un->op == "**") { simple = false; break; }
+            }
+            at.push_back({pos++, a});
+        }
+        if (simple)
+            for (auto& [i, a] : at)
+                if (i < args.size() && i < 32 && nygen::fresh(args[i], a, call_depth_, s0)) mask |= 1u << i;
+        if (!mask) return callBuiltin(b, args, ctx);
+        bool consumes = nygen::consumes(b);
+        auto close_temps = [&]() {
+            if (!consumes) return;
+            for (size_t i = 0; i < args.size() && i < 32; i++)
+                if ((mask >> i) & 1u) nygen::close_temp(*this, args[i]);
+        };
+        nygen::t_fresh_args = mask;
+        Value r;
+        try { r = callBuiltin(b, args, ctx); }
+        catch (...) { nygen::t_fresh_args = 0; close_temps(); throw; }
+        nygen::t_fresh_args = 0;
+        close_temps();
+        return r;
+    }
+
     // Best-effort display name for a call site: `f()`, `obj.m()` -> "obj.m".
     std::string callTargetName(const std::shared_ptr<CallNode>& cn) {
         if (!cn || !cn->callee) return std::string();
@@ -4520,6 +4680,9 @@ public:
             throw std::string("__exc__:RecursionError:maximum call depth exceeded ("
                               + std::to_string(kMaxCallDepth) + ") — check for unintended "
                               "self-recursion, e.g. a method with the same name as a builtin");
+        // Inside a generator the body runs on the generator's own stack;
+        // near its end, the call continues on an extension stack (nygen).
+        if (nycoro::stack_exhausted()) return nygen::call_on_new_stack(*this, node, ctx);
         DepthGuard _depth_guard(call_depth_);
         auto cn = static_pointer_cast<CallNode>(node);
         // Zero cost when profiling is off: ProfScope short-circuits on the flag.
@@ -4632,6 +4795,10 @@ public:
                         // An object with __call__ held in an attribute.
                         if (isInstanceValue(attr_val) && instanceHasMethod(attr_val, "__call__"))
                             return callMethod(attr_val, "__call__", args, ctx, &kw_args);
+                        {
+                            Value r;
+                            if (callBoundMember(attr_val, args, &kw_args, ctx, r)) return r;
+                        }
                         if (attr_val.type == ValueType::USERDATA && attr_val.value.p) {
                             auto fname_it = func_names.find(attr_val.value.p);
                             if (fname_it != func_names.end()) {
@@ -4693,6 +4860,10 @@ public:
                     auto attr_it = cont->container->find(method_name);
                     if (attr_it != cont->container->end()) {
                         Value attr_val = attr_it->second;
+                        {
+                            Value r;
+                            if (callBoundMember(attr_val, args, &kw_args, ctx, r)) return r;
+                        }
                         if (attr_val.type == ValueType::USERDATA && attr_val.value.p) {
                             auto fn_it = func_names.find(attr_val.value.p);
                             if (fn_it != func_names.end()) {
@@ -4728,17 +4899,10 @@ public:
                 // side effect fired twice — and because the doubling compounds
                 // through nesting, an n-deep method chain performed 2^n - 1
                 // calls instead of n (v.add(1).add(1).add(1) incremented by 7).
-                // Reuse it via receiver_cache_ instead of evaluating again.
-                receiver_cache_[attr->object.get()] = obj;
+                // The attribute of the receiver in hand (a builtin's method is
+                // left to callMethod, not bound).
                 Value callee_val;
-                // Only its kind is looked at below (callMethod binds self
-                // itself): a method need not be bound into a heap object
-                // that would be freed again right after the call.
-                no_bind_ = true;
-                try { callee_val = evalAttribute(cn->callee, ctx, true); }
-                catch (...) { no_bind_ = false; receiver_cache_.erase(attr->object.get()); throw; }
-                no_bind_ = false;
-                receiver_cache_.erase(attr->object.get());
+                if (!getAttrValue(obj, method_name, ctx, callee_val, false)) callee_val = UNDEFINED_VALUE;
                 // Only use the fallback for builtin functions stored in dict namespaces
                 // (e.g. math.sqrt). For class methods (__func__), let callMethod handle
                 // self-binding correctly.
@@ -4799,6 +4963,7 @@ public:
         // Evaluate arguments (handles keyword args, *spread, **spread)
         std::vector<Value> args;
         std::unordered_map<std::string, Value> kw_args;
+        uint64_t gen_s0 = nygen::serial_now();
         evalCallArgs(cn->args, ctx, args, kw_args);
 
         // Check for built-in functions
@@ -4843,6 +5008,7 @@ public:
                 for (auto& an : cn->args)
                     if (an->type() == NodeType::KEYWORD_ARG) cur_kw_order_.push_back(static_pointer_cast<KeywordArgNode>(an)->name);
                 KwScope ks(this, kw_args.empty() ? nullptr : &kw_args);
+                if (gen_s0 != nygen::serial_now()) return callBuiltinTemps(builtin, args, ctx, cn, gen_s0);
                 return callBuiltin(builtin, args, ctx);
             }
             static const std::unordered_set<std::string> kw_builtins = {
@@ -4873,7 +5039,13 @@ public:
                 for (auto& kv : kw_args) kw->set(kv.first, kv.second);
                 args.push_back(Value((Collectable*)kw));
             }
+            if (gen_s0 != nygen::serial_now()) return callBuiltinTemps(builtin, args, ctx, cn, gen_s0);
             return callBuiltin(builtin, args, ctx);
+        }
+        // A builtin value's method read as a value (f = xs.append; f(1)).
+        if (fname.rfind("__bmethod__:", 0) == 0) {
+            Value r;
+            if (callBoundMember(callee, args, &kw_args, ctx, r)) return r;
         }
         // Also check callee token for builtin (for print etc parsed as keywords)
 
@@ -5089,6 +5261,12 @@ public:
 
     // Public (struct default) so the VM builtin bridge can dispatch by name.
     Value callBuiltin(const std::string& name_orig, std::vector<Value>& args, Context* ctx) {
+        // islice/take, and iter/next/any/all/zip/map/filter/enumerate given a
+        // generator: lazy (src/NyGen.cpp).
+        if (nygen::builtin_candidate(name_orig, args)) {
+            Value r;
+            if (nygen::builtin(*this, name_orig, args, ctx, r)) return r;
+        }
         {
             Value r;
             if (iterableBuiltin(name_orig, args, ctx, r)) return r;
@@ -5238,34 +5416,101 @@ public:
     }
 
     // ─── ATTRIBUTE / SUBSCRIPT ──────────────────────────────────────────
-    // Receivers already evaluated by evalCall, keyed by the object node. Lets
-    // the callee-lookup fallback reuse a receiver instead of re-running it.
-    // Per OS thread (round 74): two threads can run the same call node.
-    static inline thread_local std::unordered_map<const void*, Value> receiver_cache_;
-
-    // soft: a missing attribute of an instance or class reads UNDEFINED
-    // instead of raising AttributeError (for hasattr/getattr, and for the
-    // method-call path, where callMethod decides).
-    // Set by evalCall around the one attribute read whose result is only
-    // inspected, never called (see there); consumed on entry, so nothing
-    // evaluated inside (a property getter's body) sees it.
-    static inline thread_local bool no_bind_ = false;
-    Value evalAttribute(node_ptr node, Context* ctx, bool soft = false) {
-        const bool no_bind = no_bind_;
-        no_bind_ = false;
-        auto an = static_pointer_cast<AttributeNode>(node);
-        Value obj;
-        {
-            auto rc = receiver_cache_.find(an->object.get());
-            if (rc != receiver_cache_.end()) obj = rc->second;
-            else obj = evalNode(an->object, ctx);
+    // obj.attr. Reading an attribute the object does not have raises
+    // AttributeError, whatever the object (round 75: it read none, and
+    // library code probed optional attributes that way). Graceful forms:
+    // getattr(o, n, d), hasattr, `o?.attr` and `o?.attr ?? d`.
+    Value evalAttribute(node_ptr node, Context* ctx) {
+        auto* an = static_cast<AttributeNode*>(node.get());
+        Value obj = evalNode(an->object, ctx);
+        // The common read, an instance's own field, straight from its
+        // namespace (a Value is not cheap to copy: it carries a Token).
+        if (obj.type == ValueType::USERDATA && obj.value.p) {
+            auto pit = instance_properties.find(obj.value.p);
+            if (pit != instance_properties.end() && pit->second && pit->second->container) {
+                auto fit = pit->second->container->find(an->attr);
+                if (fit != pit->second->container->end() && !isPropertyGetter(fit->second)) return fit->second;
+            }
         }
+        Value v;
+        if (getAttrValue(obj, an->attr, ctx, v)) return v;
+        return missingAttribute(obj, an->attr, node.get());
+    }
+    bool isPropertyGetter(const Value& v) {
+        if (v.type != ValueType::USERDATA || !v.value.p) return false;
+        auto fn_it = func_names.find(v.value.p);
+        return fn_it != func_names.end() && fn_it->second.find("__property__") != std::string::npos;
+    }
+
+    // a?.b  a?[k]  a?.m(x)  a?[i:j]  f?.(x), and the chain after the link
+    // (OptChainNode, ASTNodes.hpp). none/undefined is absent (isAbsent).
+    static bool isAbsent(const Value& v) { return v.type == ValueType::NONE || v.type == ValueType::UNDEFINED; }
+    Value evalOptChain(OptChainNode* oc, Context* ctx) {
+        Value r = evalNode(oc->recv, ctx);
+        if (isAbsent(r)) return NONE_VALUE;
+        Value v;
+        switch (oc->kind) {
+            case OptChainNode::ATTR:
+                if (!getAttrValue(r, oc->name, ctx, v)) return NONE_VALUE;
+                break;
+            case OptChainNode::INDEX: {
+                Value idx = evalNode(oc->index, ctx);
+                if (!tryGetItem(r, idx, ctx, v)) return NONE_VALUE;
+                break;
+            }
+            case OptChainNode::METHOD: {
+                if (!hasMemberNoEval(r, oc->name, ctx)) return NONE_VALUE;
+                oc->recv_hole->slot = r;
+                v = evalNode(oc->call, ctx);
+                break;
+            }
+            default:   // SLICE, CALL
+                oc->recv_hole->slot = r;
+                v = evalNode(oc->call, ctx);
+                break;
+        }
+        if (!oc->rest) return v;
+        oc->hole->slot = v;
+        return evalNode(oc->rest, ctx);
+    }
+    // Whether obj.m(...) finds a method the call path supplies itself (a
+    // builtin kind's method or the object protocol) - the methods a read
+    // with bind=false leaves to callMethod.
+    bool hasMethodMember(const Value& obj, const std::string& m) {
+        nypy::MemberKind k = memberKindOf(obj);
+        return k != nypy::MemberKind::Other && nypy::kind_has_method(k, m);
+    }
+    // Whether obj has a member `name`, without running a property getter or
+    // __getattr__ (an object with __getattr__ counts as having every name):
+    // the test `obj?.m(...)` makes before calling.
+    bool hasMemberNoEval(const Value& obj, const std::string& name, Context* ctx) {
+        if (isInstanceValue(obj)) {
+            auto pit = instance_properties.find(obj.value.p);
+            if (pit != instance_properties.end() && pit->second && pit->second->container
+                && pit->second->container->count(name)) return true;
+            Value m;
+            if (Node* cls = classNodeOfInstance(obj); cls && findClassMember(cls, name, m)) return true;
+            if (name == "__class__" || name == "__dict__" || instanceHasMethod(obj, "__getattr__")) return true;
+            return hasMethodMember(obj, name);
+        }
+        Value v;
+        return getAttrValue(obj, name, ctx, v, false) || hasMethodMember(obj, name);
+    }
+
+    // obj.attr for a value in hand: true with the value in `out`, false when
+    // obj has no such attribute - nothing is raised for that. Property
+    // getters and __getattr__ run, and what they raise propagates. `bind`
+    // false: a builtin method (list.append ...) is left to the method call
+    // that is about to happen instead of being read as a bound value.
+    bool getAttrValue(const Value& obj, const std::string& attr, Context* ctx, Value& out, bool bind = true) {
         // Check instance properties first (and invoke @property getters)
         if (obj.type == ValueType::USERDATA && obj.value.p) {
             auto pit = instance_properties.find(obj.value.p);
-            if (pit != instance_properties.end()) {
-                Value v = pit->second->getByName(an->attr);
-                if (v.type != ValueType::UNDEFINED) {
+            if (pit != instance_properties.end() && pit->second && pit->second->container) {
+                // Present even when it holds undefined (self.x = undefined).
+                auto fit0 = pit->second->container->find(attr);
+                if (fit0 != pit->second->container->end()) {
+                    const Value& v = fit0->second;
                     // Check if this is a @property — if so, call it with self
                     if (v.type == ValueType::USERDATA && v.value.p) {
                         auto fn_it = func_names.find(v.value.p);
@@ -5283,19 +5528,24 @@ public:
                                 Context* fc = new Context(runner, fn->name, nullptr, nullptr, closure_parent);
                                 CtxReaper _reap_prop(this, fc);
                                 fc->defineByName("self", obj);
-                                return runFunctionBody(fn, fc);
+                                out = runFunctionBody(fn, fc);
+                                return true;
                             }
                         }
                     }
-                    return v;
+                    out = v;
+                    return true;
                 }
             }
         }
         if (obj.isCollectable() && obj.value.gc) {
             auto* cont = dynamic_cast<Container*>(obj.value.gc);
             if (cont && cont->container) {
-                auto it = cont->container->find(an->attr);
-                if (it != cont->container->end()) return it->second;
+                auto it = cont->container->find(attr);
+                if (it != cont->container->end()) { out = it->second; return true; }
+                // A dict / list / tuple / set method read as a value.
+                if (bind && nypy::kind_has_method(memberKindOf(obj), attr)) { out = boundMember(obj, attr); return true; }
+                return false;
             }
         }
         // A builtin used as a namespace: `import time` then time.time(),
@@ -5306,10 +5556,10 @@ public:
         if (obj.type == ValueType::USERDATA && obj.value.p) {
             auto bit = func_names.find(obj.value.p);
             if (bit != func_names.end() && bit->second.rfind("__builtin__:", 0) == 0) {
-                std::string target = nyrt::builtin_member(bit->second.substr(12), an->attr,
+                std::string target = nyrt::builtin_member(bit->second.substr(12), attr,
                     [&](const std::string& n) { return builtin_ptrs.count(n) > 0; });
-                if (!target.empty()) return builtinValue(target);
-                return NONE_VALUE;
+                if (!target.empty()) { out = builtinValue(target); return true; }
+                return false;
             }
         }
         // Class variable / static method lookup: ClassName.var or ClassName.staticmethod
@@ -5343,10 +5593,10 @@ public:
                 if (ctx_it != class_ctx_map_.end() && ctx_it->second && ctx_it->second->container) {
                     Value cv = UNDEFINED_VALUE;
                     {
-                        auto own = ctx_it->second->container->find(an->attr);
+                        auto own = ctx_it->second->container->find(attr);
                         if (own != ctx_it->second->container->end()) cv = own->second;
                     }
-                    if (cv.type == ValueType::NONE) return cv;   // `x = None` in the class body
+                    if (cv.type == ValueType::NONE) { out = cv; return true; }   // `x = None` in the class body
                     if (cv.type != ValueType::UNDEFINED) {
                         // Check if this is a @property getter — invoke it with self
                         if (cv.type == ValueType::USERDATA && cv.value.p) {
@@ -5364,28 +5614,33 @@ public:
                                     Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
                                     CtxReaper _reap_prop2(this, fc);
                                     fc->defineByName("self", obj);
-                                    return runFunctionBody(fn, fc);
+                                    out = runFunctionBody(fn, fc);
+                                    return true;
                                 }
                             }
                         }
                         // A method read as a value off an INSTANCE must carry its
                         // instance with it, or `self` is lost at call time.
-                        if (!no_bind && instance_to_class.count(obj.value.p))
-                            return makeBoundMethod(cv, obj);
-                        return cv;
+                        // bind=false (evalCall's method path, hasMemberNoEval):
+                        // only the kind is looked at, so no heap object is made
+                        // for a binding that would be freed right after the call.
+                        if (bind && instance_to_class.count(obj.value.p)) { out = makeBoundMethod(cv, obj); return true; }
+                        out = cv;
+                        return true;
                     }
                 }
                 // Check class_vars_ (mutable class-level variables set at runtime)
-                std::string cv_key = cn->name + "." + an->attr;
+                std::string cv_key = cn->name + "." + attr;
                 auto cv_it = class_vars_.find(cv_key);
-                if (cv_it != class_vars_.end()) return cv_it->second;
+                if (cv_it != class_vars_.end()) { out = cv_it->second; return true; }
                 // Not yet set — evaluate class-level default from body
                 if (cn->body) {
                     for (auto& stmt : cn->body->statements()) {
                         if (stmt->type() == NodeType::ASSIGNMENT) {
                             auto as = static_pointer_cast<AssignmentNode>(stmt);
-                            if (as->target->type() == NodeType::VARIABLE && as->target->value() == an->attr) {
-                                return evalNode(as->value_node, ctx);
+                            if (as->target->type() == NodeType::VARIABLE && as->target->value() == attr) {
+                                out = evalNode(as->value_node, ctx);
+                                return true;
                             }
                         }
                     }
@@ -5393,48 +5648,132 @@ public:
               }
             }
         }
-        return specialAttribute(obj, an->attr, ctx, soft);
+        return specialAttribute(obj, attr, ctx, out, bind);
     }
     // obj.name for a value in hand: UNDEFINED when it has no such attribute.
     Value lookupAttribute(const Value& obj, const std::string& name, Context* ctx) {
-        auto objn = std::make_shared<VariableNode>(Token());
-        auto an = std::make_shared<AttributeNode>(Token(), objn, name);
-        receiver_cache_[objn.get()] = obj;
-        try {
-            Value v = evalAttribute(an, ctx, true);
-            receiver_cache_.erase(objn.get());
-            return v;
-        } catch (...) { receiver_cache_.erase(objn.get()); throw; }
+        Value v;
+        return getAttrValue(obj, name, ctx, v) ? v : UNDEFINED_VALUE;
     }
-    // The AttributeError for obj.name, when obj is an instance or a class.
-    bool attributeErrorFor(const Value& obj, const std::string& name, std::string& err) {
-        if (isInstanceValue(obj)) {
-            err = "__exc__:AttributeError:'" + instanceClassName(obj) + "' object has no attribute '" + name + "'";
-            return true;
+    // Which builtin kind a value is, for the method tables (NyMembers.hpp).
+    nypy::MemberKind memberKindOf(const Value& v) {
+        switch (v.type) {
+            case ValueType::NONE: return nypy::MemberKind::None;
+            case ValueType::BOOLEAN: return nypy::MemberKind::Bool;
+            case ValueType::INTEGER: return nypy::MemberKind::Int;
+            case ValueType::DOUBLE: return nypy::MemberKind::Float;
+            case ValueType::UNDEFINED: return nypy::MemberKind::Other;
+            default: break;
         }
+        if (isStringValue(v)) return nypy::MemberKind::Str;
+        if (nygen::is_gen(v)) return nypy::MemberKind::Generator;
+        if (Container* c = contOf(v)) {
+            if (seqLen(c) < 0) return nypy::MemberKind::Dict;
+            if (isTupleCont(c)) return nypy::MemberKind::Tuple;
+            if (isSetCont(c)) return nypy::MemberKind::Set;
+            return nypy::MemberKind::List;
+        }
+        if (isInstanceVal(v)) return nypy::MemberKind::Instance;
+        return nypy::MemberKind::Other;
+    }
+    // A method of a builtin value (or an object-protocol member) read as a
+    // value: a callable that calls it on `recv`. One per receiver and name
+    // (the interpreter keeps what it allocates, so it is cached).
+    // Attributes stored on a function (f.calls = 0), as in Python: per
+    // function value (each `def` evaluation is its own value).
+    std::unordered_map<void*, std::unordered_map<std::string, Value>> func_attrs_;
+    bool isPlainFunction(const Value& v) {
+        if (v.type != ValueType::USERDATA || !v.value.p) return false;
+        std::string t = fnTag(func_names, v.value.p);
+        return t.rfind("__func__:", 0) == 0 || t.rfind("__lambda__", 0) == 0;
+    }
+    struct BoundMember { Value recv; std::string name; };
+    std::unordered_map<void*, BoundMember> bound_members_;
+    std::map<std::pair<uintptr_t, std::string>, void*> bound_member_cache_;
+    std::vector<std::unique_ptr<std::string>> bound_member_store_;
+    Value boundMember(const Value& recv, const std::string& name) {
+        uintptr_t id = 0;
+        if (recv.type == ValueType::USERDATA) id = (uintptr_t)recv.value.p;
+        else if (recv.isCollectable()) id = (uintptr_t)recv.value.gc;
+        if (id) {
+            auto it = bound_member_cache_.find({id, name});
+            if (it != bound_member_cache_.end()) { Value v; v.type = ValueType::USERDATA; v.value.p = it->second; return v; }
+        }
+        bound_member_store_.push_back(std::make_unique<std::string>("__bmethod__:" + name));
+        void* p = bound_member_store_.back().get();
+        func_names[p] = "__bmethod__:" + name;
+        bound_members_[p] = BoundMember{recv, name};
+        if (id) bound_member_cache_[{id, name}] = p;
+        Value v; v.type = ValueType::USERDATA; v.value.p = p;
+        return v;
+    }
+    // Calls a bound member made by boundMember; false if `fn` is not one.
+    bool callBoundMember(const Value& fn, std::vector<Value>& args, const std::unordered_map<std::string, Value>* kw,
+                         Context* ctx, Value& out) {
+        if (fn.type != ValueType::USERDATA || !fn.value.p) return false;
+        auto it = bound_members_.find(fn.value.p);
+        if (it == bound_members_.end()) return false;
+        BoundMember bm = it->second;
+        out = callMethod(bm.recv, bm.name, args, ctx, kw);
+        return true;
+    }
+    // The text of the AttributeError for obj.name.
+    std::string attributeErrorText(const Value& obj, const std::string& name) {
+        if (isInstanceValue(obj))
+            return "'" + instanceClassName(obj) + "' object has no attribute '" + name + "'";
         if (obj.type == ValueType::USERDATA && obj.value.p) {
             std::string t = fnTag(func_names, obj.value.p);
             if (t.rfind("__class__:", 0) == 0) {
                 std::string cn = t.substr(10);
                 size_t tag = cn.find("__");
                 if (tag != std::string::npos && tag > 0) cn = cn.substr(0, tag);
-                err = "__exc__:AttributeError:type object '" + cn + "' has no attribute '" + name + "'";
-                return true;
+                return "type object '" + cn + "' has no attribute '" + name + "'";
             }
         }
-        return false;
+        return "'" + typeNameOf(obj) + "' object has no attribute '" + name + "'";
+    }
+    // A missing attribute read: AttributeError, or - NY_LENIENT_READS=log, a
+    // porting aid - a line on stderr and none.
+    Value missingAttribute(const Value& obj, const std::string& name, Node* where) {
+        std::string msg = attributeErrorText(obj, name);
+        if (nypy::lenient_reads_log()) { logLenientRead(where, "AttributeError: " + msg); return NONE_VALUE; }
+        throw std::string("__exc__:AttributeError:" + msg);
+    }
+    // A missing dict key read: KeyError(key), or the NY_LENIENT_READS=log line.
+    Value missingKey(const Value& key, Context* ctx) {
+        std::string k = reprOf(key, ctx);
+        if (nypy::lenient_reads_log()) { logLenientRead(nullptr, "KeyError: " + k); return NONE_VALUE; }
+        throw std::string("__exc__:KeyError:" + k);
+    }
+    void logLenientRead(Node* where, const std::string& what) {
+        std::string loc;
+        if (where) { auto tk = where->token(); loc = tk.fileName() + ":" + std::to_string(tk.line()); }
+        else loc = last_stmt_where();
+        static std::mutex mu;
+        static std::set<std::string> seen;
+        std::lock_guard<std::mutex> lk(mu);
+        if (!seen.insert(loc + " " + what).second) return;
+        fprintf(stderr, "[lenient-read] %s: %s\n", loc.c_str(), what.c_str());
     }
     // Attributes every value answers: __name__ of a function or class (and of
-    // the name string type() returns), an instance's __class__, and what an
-    // instance's __getattr__ supplies for anything it does not have.
+    // the name string type() returns), an instance's __class__ and __dict__,
+    // what an instance's __getattr__ supplies for anything it does not have,
+    // and a builtin value's methods (NyMembers.hpp) read as bound values.
     // Properties: a getter function tagged __property__; its setter, from
     // @prop.setter, is kept here.
     std::unordered_map<void*, Value> prop_setters_;
     std::unordered_map<std::string, Value> prop_setter_target_;   // "__prop_setter__:<p>" -> the getter
     bool any_property_ = false;   // no property anywhere: attribute stores skip the class lookup
     std::vector<std::unique_ptr<std::string>> prop_setter_ids_;
-    Value specialAttribute(const Value& obj, const std::string& attr, Context* ctx, bool soft = false) {
+    bool specialAttribute(const Value& obj, const std::string& attr, Context* ctx, Value& out, bool bind = true) {
         if (obj.type == ValueType::USERDATA && obj.value.p) {
+            if (!func_attrs_.empty()) {
+                auto fa = func_attrs_.find(obj.value.p);
+                if (fa != func_attrs_.end()) {
+                    auto it = fa->second.find(attr);
+                    if (it != fa->second.end()) { out = it->second; return true; }
+                }
+            }
             auto fit = func_names.find(obj.value.p);
             // prop.setter: a callable that records its argument as the
             // property's setter and returns the property.
@@ -5444,21 +5783,22 @@ public:
                 prop_setter_ids_.push_back(std::make_unique<std::string>(os.str()));
                 void* id = prop_setter_ids_.back().get();
                 func_names[id] = "__builtin__:" + os.str();
-                Value v; v.type = ValueType::USERDATA; v.value.p = id;
-                return v;
+                out = Value(); out.type = ValueType::USERDATA; out.value.p = id;
+                return true;
             }
             // C.__mro__ / C.__bases__: the classes, in C3 order / as written.
             if ((attr == "__mro__" || attr == "__bases__") && fit != func_names.end()
                 && fit->second.rfind("__class__:", 0) == 0) {
                 Node* cn = classNodeByName(fit->second.substr(10));
-                std::vector<Value> out;
+                std::vector<Value> seq_vals;
                 if (cn) {
                     std::vector<Node*> seq;
                     if (attr == "__mro__") seq = classMro(cn);
                     else for (auto& b : static_cast<ClassNode*>(cn)->bases) if (Node* bn = classNodeByName(b->value())) seq.push_back(bn);
-                    for (Node* c : seq) { Value cv; cv.type = ValueType::USERDATA; cv.value.p = (void*)c; out.push_back(cv); }
+                    for (Node* c : seq) { Value cv; cv.type = ValueType::USERDATA; cv.value.p = (void*)c; seq_vals.push_back(cv); }
                 }
-                return makeListValue(out, attr == "__mro__");
+                out = makeListValue(seq_vals, attr == "__mro__");
+                return true;
             }
             if (attr == "__name__") {
                 if (fit != func_names.end()) {
@@ -5467,37 +5807,40 @@ public:
                     std::string nm = c == std::string::npos ? t : t.substr(c + 1);
                     size_t tag = nm.find("__");
                     if (tag != std::string::npos && tag > 0) nm = nm.substr(0, tag);   // name__static__ etc
-                    return makeStringValue(nm);
+                    out = makeStringValue(nm);
+                    return true;
                 }
-                if (isStringValue(obj)) return obj;
+                if (isStringValue(obj)) { out = obj; return true; }
             }
             if (isInstanceValue(obj)) {
                 if (attr == "__class__") {
-                    Value cv; cv.type = ValueType::USERDATA;
-                    cv.value.p = instance_to_class[obj.value.p];
-                    return cv;
+                    void* cls = instance_to_class[obj.value.p];
+                    out = Value(); out.type = ValueType::USERDATA; out.value.p = cls;
+                    return true;
+                }
+                if (attr == "__dict__") {
+                    auto* d = new Object((Runnable*)runner, "map", Type::MAP);
+                    auto pit = instance_properties.find(obj.value.p);
+                    if (pit != instance_properties.end() && pit->second && pit->second->container)
+                        for (auto& kv : *pit->second->container) d->set(kv.first, kv.second);
+                    out = Value((Collectable*)d);
+                    return true;
                 }
                 if (instanceHasMethod(obj, "__getattr__")) {
                     std::vector<Value> a{makeStringValue(attr)};
-                    return callMethod(obj, "__getattr__", a, ctx);
+                    out = callMethod(obj, "__getattr__", a, ctx);
+                    return true;
                 }
             }
         }
-        // A missing attribute of an instance or a class: hasattr / getattr
-        // see it as missing. A plain read still gives none - library code
-        // (lib/gui.ny above all) probes optional attributes that way
-        // (`if w.rect != none`, `widget.is_layout == true`); raising
-        // AttributeError there is one switch away once those idioms are
-        // ported to hasattr/getattr. Calling a missing method does raise
-        // (callMethod).
-        std::string err;
-        if (attributeErrorFor(obj, attr, err)) {
-            if (soft) return UNDEFINED_VALUE;
-            if (kStrictAttributeReads) throw err;
+        // A builtin value's method, or the object protocol (c.to_string),
+        // read as a value.
+        if (bind) {
+            nypy::MemberKind k = memberKindOf(obj);
+            if (k != nypy::MemberKind::Other && nypy::kind_has_method(k, attr)) { out = boundMember(obj, attr); return true; }
         }
-        return NONE_VALUE;
+        return false;
     }
-    static constexpr bool kStrictAttributeReads = false;
 
     // ─── RETURN ─────────────────────────────────────────────────────────
     Value evalReturn(node_ptr node, Context* ctx) {
@@ -5575,6 +5918,8 @@ public:
 
     Value evalComprehensionNode(node_ptr node, Context* ctx) {
         auto cn = static_pointer_cast<ComprehensionNode>(node);
+        // (x for x in it): a lazy generator, not a list (src/NyGen.cpp).
+        if (cn->kind == ComprehensionNode::GEN) return nygen::make_genexpr(*this, node, ctx);
         // The targets live in the comprehension's own scope, as in Python 3:
         // `x = 10; [x for x in range(3)]` leaves x == 10.
         Context* cc = new Context(runner, "<comprehension>", nullptr, nullptr, ctx);
@@ -5585,17 +5930,23 @@ public:
             auto& cl = cn->clauses[k];
             // The first iterable is evaluated in the enclosing scope.
             Value itv = evalNode(cl.iter, k == 0 ? ctx : cc);
-            for (auto& item : iterValues(itv, cc)) {
+            auto one = [&](const Value& item) {
                 bindTarget(cl.target, item, cc);
-                bool keep = true;
-                for (auto& c : cl.conds) if (!isTruthy(evalNode(c, cc))) { keep = false; break; }
-                if (!keep) continue;
+                for (auto& c : cl.conds) if (!isTruthy(evalNode(c, cc))) return;
                 if (k + 1 < cn->clauses.size()) clause(k + 1);
                 else if (cn->kind == ComprehensionNode::DICT) {
                     Value kv = evalNode(cn->elt, cc);
                     kvs.push_back({kv, evalNode(cn->value, cc)});
                 }
                 else items.push_back(evalNode(cn->elt, cc));
+            };
+            // Over a generator, one value at a time: its side effects and
+            // the element's interleave, as in Python.
+            if (nygen::Gen* g = nygen::gen_of(itv)) {
+                Value item;
+                while (nygen::next(*this, g, item, cc)) one(item);
+            } else {
+                for (auto& item : iterValues(itv, cc)) one(item);
             }
         };
         if (!cn->clauses.empty()) clause(0);
@@ -5714,6 +6065,9 @@ public:
         if (pit == instance_properties.end()) return;
         pit->second->defineByName("args", makeListValue(args));
         pit->second->defineByName("msg", makeStringValue(args.size() == 1 ? valueToDisplay(args[0]) : std::string()));
+        // StopIteration.value: a generator's return value (both engines).
+        if (classDerivesFrom(instanceClassName(inst), "StopIteration"))
+            pit->second->defineByName("value", args.empty() ? NONE_VALUE : args[0]);
     }
     std::string valueToDisplay(const Value& v) {
         if (v.type == ValueType::USERDATA && v.value.p && instance_to_class.count(v.value.p))
@@ -5809,6 +6163,9 @@ public:
             Value cv; cv.type = ValueType::USERDATA; cv.value.p = (void*)cn;
             if (fnTag(func_names, cv.value.p).rfind("__class__:", 0) == 0) {
                 std::vector<Value> a{makeStringValue(excMessageOf(flow))};
+                // StopIteration() / GeneratorExit() raised by the runtime
+                // carry no argument (value is none, args empty).
+                if ((t == "StopIteration" || t == "GeneratorExit") && excMessageOf(flow).empty()) a.clear();
                 static const std::unordered_map<std::string, Value> no_kw;
                 Value obj = instantiateClass(cv, a, no_kw, global_ctx);
                 return obj;
@@ -7022,7 +7379,13 @@ public:
     Value evalDelete(node_ptr node, Context* ctx) {
         auto dn = static_pointer_cast<DeleteNode>(node);
         if (dn->target->type() == NodeType::VARIABLE) {
-            ctx->defineByName(dn->target->value(), UNDEFINED_VALUE);
+            // del x unbinds the nearest x: reading it afterwards is a
+            // NameError (x used to stay bound, to undefined here and to
+            // none on the VM).
+            const std::string n = dn->target->value();
+            for (Context* c = ctx; c; c = c->parent)
+                if (c->container && c->container->erase(n)) return NONE_VALUE;
+            pyRaise("NameError", "name '" + n + "' is not defined");
         } else if (dn->target->type() == NodeType::SUBSCRIPT) {
             // del dict[key] or del list[idx]
             auto sub = static_pointer_cast<SubscriptNode>(dn->target);
@@ -7080,13 +7443,36 @@ public:
             // del obj.attr
             auto attr = static_pointer_cast<AttributeNode>(dn->target);
             Value obj = evalNode(attr->object, ctx);
-            if (obj.type == ValueType::USERDATA && obj.value.p) {
-                auto pit = instance_properties.find(obj.value.p);
-                if (pit != instance_properties.end())
-                    pit->second->defineByName(attr->attr, UNDEFINED_VALUE);
-            }
+            delAttrValue(obj, attr->attr);
         }
         return NONE_VALUE;
+    }
+    // del obj.name / delattr(obj, name): an instance's field, a class
+    // attribute or a namespace/dict entry is removed; anything else is an
+    // AttributeError. (A deleted field used to stay, holding undefined.)
+    void delAttrValue(const Value& obj, const std::string& name) {
+        if (obj.type == ValueType::USERDATA && obj.value.p) {
+            auto pit = instance_properties.find(obj.value.p);
+            if (pit != instance_properties.end() && pit->second && pit->second->container) {
+                if (pit->second->container->erase(name)) return;
+            } else if (fnTag(func_names, obj.value.p).rfind("__class__:", 0) == 0) {
+                auto cit = class_ctx_map_.find(obj.value.p);
+                auto ast_it = func_ast_nodes.find(obj.value.p);
+                if (cit == class_ctx_map_.end() && ast_it != func_ast_nodes.end()) cit = class_ctx_map_.find(ast_it->second);
+                if (cit != class_ctx_map_.end() && cit->second && cit->second->container && cit->second->container->erase(name)) {
+                    if (auto* cn = dynamic_cast<ClassNode*>((Node*)(ast_it != func_ast_nodes.end() ? ast_it->second : obj.value.p)))
+                        class_vars_.erase(cn->name + "." + name);
+                    return;
+                }
+            }
+        } else if (Container* cont = contOf(obj)) {
+            if (seqLen(cont) < 0 && cont->container->erase(name)) return;
+        }
+        if (obj.type == ValueType::USERDATA && obj.value.p) {
+            auto fa = func_attrs_.find(obj.value.p);
+            if (fa != func_attrs_.end() && fa->second.erase(name)) return;
+        }
+        throw std::string("__exc__:AttributeError:" + attributeErrorText(obj, name));
     }
 
 
@@ -7361,48 +7747,14 @@ public:
     // __next__ / __getitem__: its items first. sorted/min/max over objects
     // order by __lt__ (or the other side's __gt__), sum adds with __add__ /
     // __radd__, issubclass walks the MRO, hash() uses __hash__.
-    void yieldValue(const Value& v) {
-        if (yield_sink_->size() >= kMaxGeneratorValues)
-            throw std::string("__exc__:RuntimeError:generator produced more than 10000000 values (generators are "
-                              "collected eagerly by the interpreter; use the VM (--vm) for unbounded generators)");
-        yield_sink_->push_back(v);
-    }
-    bool isGenValue(const Value& v) {
-        if (!v.isCollectable() || !v.value.gc) return false;
-        auto* c = dynamic_cast<Container*>(v.value.gc);
-        return c && c->container && c->container->count("__gen__");
-    }
-    Value makeGenValue(const std::vector<Value>& items) {
-        Object* gen_obj = new Object((Runnable*)runner, "__gen__", Type::LIST);
-        int len = (int)items.size();
-        for (int i = 0; i < len; i++) gen_obj->set(std::to_string(i), items[(size_t)i]);
-        gen_obj->set("__len__", Value(len));
-        gen_obj->set("__gen__", Value(1));
-        gen_obj->set("__idx__", Value(0));
-        return Value((Collectable*)gen_obj);
-    }
-    // Generators on this engine are eager: calling a generator function
-    // runs its body to the end, collecting what it yields, and returns a
-    // generator over those values. The enclosing collection (a generator
-    // called from inside another) is restored afterwards - it was reset to
-    // none, so the outer generator's next yield aborted the process. An
-    // exception raised by the body propagates (it was swallowed), and a
-    // body that yields nothing is still a generator (it ran a second time
-    // as a plain function and returned none).
-    static constexpr size_t kMaxGeneratorValues = 10000000;
-    Value collectGenerator(const node_ptr& body, Context* fc) {
-        std::vector<Value> yielded;
-        std::vector<Value>* saved = yield_sink_;
-        yield_sink_ = &yielded;
-        try { evalBody(body, fc); }
-        catch (nython::node::ReturnSignal&) {}
-        catch (...) { yield_sink_ = saved; throw; }
-        yield_sink_ = saved;
-        return makeGenValue(yielded);
-    }
-    // A function body run to completion: its value, or the generator it is.
+    // A function body run to completion: its value. A generator function's
+    // body does not run here: the call makes the generator, which runs the
+    // body on a coroutine of its own, a step per next() (src/NyGen.cpp).
     Value runFunctionBody(FunctionNode* fn, Context* fc) {
-        if (bodyYields(fn->body)) return collectGenerator(fn->body, fc);
+        if (bodyYields(fn->body)) return nygen::make_function_gen(*this, fn, fc);
+        // Calls that do not pass through evalCall (operators, callbacks of
+        // builtins) meet the same stack check (see evalCall).
+        if (nycoro::stack_exhausted()) return nygen::body_on_new_stack(*this, fn, fc);
         try { return evalBody(fn->body, fc); }
         catch (nython::node::ReturnSignal& r) { return r.value; }
     }
@@ -7436,28 +7788,44 @@ public:
             return true;
         }
         if (name == "bool" && args.size() == 1 && isInstanceValue(args[0])) { out = Value(isTruthy(args[0])); return true; }
-        // iter(x) and next(it[, default]). A generator here is its collected
-        // values with a read position (__gen__/__idx__), which next() already
-        // understands; iter() of a list, string or dict makes one of those,
-        // and objects go through __iter__/__next__. Both returned none.
+        // iter(x) and next(it[, default]). Generators are handled first, by
+        // nygen::builtin; iter() of a list, string, dict, set or range makes
+        // a lazy iterator (nygen::make_iter), and objects go through
+        // __iter__/__next__.
         // hasattr / getattr on instances and classes: the full attribute
         // lookup (methods, class attributes, properties, __getattr__); only
         // an instance's own fields were seen.
-        if ((name == "hasattr" || name == "getattr") && args.size() >= 2 && isStringValue(args[1])) {
-            std::string err;
-            if (attributeErrorFor(args[0], getStringValue(args[1]), err)) {
-                Value v;
-                try { v = lookupAttribute(args[0], getStringValue(args[1]), ctx); }
-                catch (std::string& e) {
-                    if (!excTypeMatches(e, "AttributeError")) throw;
-                    v = UNDEFINED_VALUE;
-                }
-                bool has = v.type != ValueType::UNDEFINED;
-                if (name == "hasattr") { out = Value(has); return true; }
-                if (has) { out = v; return true; }
-                if (args.size() >= 3) { out = args[2]; return true; }
-                throw err;
+        // hasattr / getattr / setattr / delattr, for every kind of value, as
+        // in Python: hasattr and getattr with a default see an AttributeError
+        // (a missing attribute, or one a property / __getattr__ raises) as
+        // absence; other errors propagate.
+        if ((name == "hasattr" || name == "getattr" || name == "setattr" || name == "delattr") && args.size() >= 2) {
+            if (!isStringValue(args[1]))
+                pyRaise("TypeError", name + "(): attribute name must be string, not '" + typeNameOf(args[1]) + "'");
+            std::string an = getStringValue(args[1]);
+            if (name == "setattr") {
+                if (args.size() != 3) pyRaise("TypeError", "setattr expected 3 arguments, got " + std::to_string(args.size()));
+                setAttr(args[0], an, args[2]);
+                out = NONE_VALUE; return true;
             }
+            if (name == "delattr") {
+                if (args.size() != 2) pyRaise("TypeError", "delattr expected 2 arguments, got " + std::to_string(args.size()));
+                delAttrValue(args[0], an);
+                out = NONE_VALUE; return true;
+            }
+            if (args.size() > 3 || (name == "hasattr" && args.size() != 2))
+                pyRaise("TypeError", name + " expected " + (name == "hasattr" ? "2" : "at most 3") + " arguments, got " + std::to_string(args.size()));
+            Value v;
+            bool has;
+            try { has = getAttrValue(args[0], an, ctx, v); }
+            catch (std::string& e) {
+                if (!excTypeMatches(e, "AttributeError")) throw;
+                has = false;
+            }
+            if (name == "hasattr") { out = Value(has); return true; }
+            if (has) { out = v; return true; }
+            if (args.size() >= 3) { out = args[2]; return true; }
+            throw std::string("__exc__:AttributeError:" + attributeErrorText(args[0], an));
         }
         if (name == "callable" && args.size() == 1) {
             const Value& v = args[0];
@@ -7470,7 +7838,7 @@ public:
         }
         if (name == "iter" && !args.empty()) {
             const Value& v = args[0];
-            if (isGenValue(v)) { out = v; return true; }
+            if (nygen::is_gen(v)) { out = v; return true; }
             if (isInstanceValue(v)) {
                 std::vector<Value> none;
                 if (instanceHasMethod(v, "__iter__")) { out = callMethod(v, "__iter__", none, ctx); return true; }
@@ -7478,7 +7846,8 @@ public:
                 if (!instanceHasMethod(v, "__getitem__"))
                     throw std::string("__exc__:TypeError:'" + instanceClassName(v) + "' object is not iterable");
             }
-            out = makeGenValue(iterValues(v, ctx));
+            // A lazy iterator over a list, string, dict, set or range.
+            out = nygen::make_iter(*this, v, ctx);
             return true;
         }
         if (name == "next" && !args.empty()) {
@@ -7493,18 +7862,7 @@ public:
                 }
                 return true;
             }
-            if (isGenValue(args[0])) {
-                auto* c = dynamic_cast<Container*>(args[0].value.gc);
-                auto ii = c->container->find("__idx__"), li = c->container->find("__len__");
-                int64_t idx = ii != c->container->end() ? bigint_to_i64(ii->second.value.i) : 0;
-                int64_t len = li != c->container->end() ? bigint_to_i64(li->second.value.i) : 0;
-                if (idx >= len) {
-                    if (args.size() >= 2) { out = args[1]; return true; }
-                    throw std::string("__exc__:StopIteration:");
-                }
-                return false;
-            }
-            throw std::string("__exc__:TypeError:object is not an iterator");
+            throw std::string("__exc__:TypeError:'" + typeNameOf(args[0]) + "' object is not an iterator");
         }
         if (!takes.count(name) || args.empty()) return false;
         size_t upto = (name == "zip") ? args.size() : 1;
@@ -7554,7 +7912,7 @@ public:
     bool isFunctionValue(const Value& v) {
         if (v.type != ValueType::USERDATA || !v.value.p) return false;
         std::string t = fnTag(func_names, v.value.p);
-        return t.rfind("__func__:", 0) == 0 || t.rfind("__lambda__", 0) == 0 || t.rfind("__builtin__:", 0) == 0;
+        return t.rfind("__func__:", 0) == 0 || t.rfind("__lambda__", 0) == 0 || t.rfind("__builtin__:", 0) == 0 || t.rfind("__bmethod__:", 0) == 0;
     }
     // Runs the constructor of a new instance: the first class in its MRO
     // that defines __init__ or init.
@@ -7710,6 +8068,7 @@ public:
                 return !static_cast<std::string*>(v.value.p)->empty();
             default: break;
         }
+        if (nygen::is_gen(v)) return true;   // lazy: no length to test
         if (Container* c = contOf(v)) {
             int64_t n = seqLen(c);
             if (n >= 0) return n != 0;
@@ -7746,6 +8105,11 @@ public:
         Value dead_setter;
         auto sit = prop_setters_.find(p);
         if (sit != prop_setters_.end()) { dead_setter = sit->second; prop_setters_.erase(sit); }
+        // f.attr = v: the attributes go with the function; a new function
+        // at this address must not inherit them.
+        std::unordered_map<std::string, Value> dead_attrs;
+        auto fa = func_attrs_.find(p);
+        if (fa != func_attrs_.end()) { dead_attrs.swap(fa->second); func_attrs_.erase(fa); }
     }
     void forgetBound(nyheap::Bound* b) {
         void* p = (void*)&b->tag;
@@ -7840,7 +8204,11 @@ public:
             prop_setter_target_.clear();
             for (auto& kv : fn_defaults_node_) for (auto& v : kv.second) dead.push_back(v);
             fn_defaults_node_.clear();
-            receiver_cache_.clear();
+            for (auto& kv : func_attrs_) for (auto& a : kv.second) dead.push_back(a.second);
+            func_attrs_.clear();
+            for (auto& kv : bound_members_) dead.push_back(kv.second.recv);
+            bound_members_.clear();
+            bound_member_cache_.clear();
             flow().value = Value();
         }
         std::vector<Context*> bodies;

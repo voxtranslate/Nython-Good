@@ -107,7 +107,7 @@ class Icons:
 
     # v4's icon names differ from the codicon set's; map them.
     def _codicon_name(self, name):
-        var m = self.name_map[name]
+        var m = self.name_map.get(name)
         if m == none:
             return name
         return m

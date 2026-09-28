@@ -663,7 +663,10 @@ Value dispatch_core(NythonExecutor& E,
                 struct stat dst;
                 if (stat(fname.c_str(), &dst) == 0 && S_ISDIR(dst.st_mode))
                     throw std::string("__exc__:IsADirectoryError:[Errno 21] Is a directory: '" + fname + "'");
-                std::ifstream f(fname);
+                // Binary: the bytes as they are. Text mode translated line
+                // endings on Windows, so a file never round-tripped there (a
+                // CRLF document saved back came out with \r\r\n).
+                std::ifstream f(fname, std::ios::binary);
                 if (f.is_open()) {
                     std::string content((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
                     return makeStringValue(content);
@@ -675,7 +678,7 @@ Value dispatch_core(NythonExecutor& E,
             if (args.size() >= 2) {
                 std::string fname = getStringValue(args[0]);
                 std::string content = getStringValue(args[1]);
-                std::ofstream f(fname);
+                std::ofstream f(fname, std::ios::binary | std::ios::trunc);   // byte-exact, as read_file
                 if (f.is_open()) { f << content; return Value(true); }
             }
             return Value(false);

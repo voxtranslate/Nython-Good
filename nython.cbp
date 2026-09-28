@@ -136,6 +136,8 @@
         <Unit filename="src/Util.cpp" />
         <Unit filename="src/Value.cpp" />
         <Unit filename="src/VirtualMachine.cpp" />
+        <Unit filename="src/NyCoro.cpp" />
+        <Unit filename="src/NyGen.cpp" />
         <!-- ═══════════ Builtin modules ═══════════ -->
         <Unit filename="src/builtins/audio.cpp" />
         <Unit filename="src/builtins/core.cpp" />
@@ -150,10 +152,19 @@
         <Unit filename="src/builtins/tensor.cpp" />
         <Unit filename="src/builtins/nytensor.cpp" />
         <Unit filename="src/builtins/threading.cpp" />
+        <Unit filename="src/builtins/text.cpp" />
+        <Unit filename="src/builtins/os_time.cpp" />
+        <Unit filename="src/builtins/os_proc.cpp" />
+        <Unit filename="src/builtins/pycore.cpp" />
+        <Unit filename="src/builtins/gui_harness.cpp" />
+        <Unit filename="src/NyConc.cpp" />
+        <Unit filename="src/VMConc.cpp" />
         <!-- ═══════════ Key headers (for IDE navigation) ═══════════ -->
         <Unit filename="include/platform_compat.hpp" />
         <Unit filename="include/NythonExecutor.hpp" />
         <Unit filename="include/VirtualMachine.hpp" />
+        <Unit filename="include/NyCoro.hpp" />
+        <Unit filename="include/NyGen.hpp" />
         <Unit filename="include/Definitions.hpp" />
         <Unit filename="include/Value.hpp" />
         <Unit filename="include/ASTNodes.hpp" />
@@ -173,5 +184,7 @@
         <Unit filename="include/builtins/data.hpp" />
         <Unit filename="include/builtins/threading.hpp" />
         <Unit filename="include/builtins/gui.hpp" />
+        <Unit filename="include/builtins/gui_harness.hpp" />
+        <Unit filename="include/builtins/text.hpp" />
     </Project>
 </CodeBlocks_project_file>

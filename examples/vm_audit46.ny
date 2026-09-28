@@ -65,10 +65,14 @@ var here = os_getcwd()
 var exe = sys.executable
 
 # ── Paths ───────────────────────────────────────────────────────────────────
-check("join 3", os_path_join("a", "b", "c"), "a/b/c")
+# Results use the platform's separator, as Python's os.path does (ntpath on
+# Windows); NATIVE() writes an expected path with it.
+def NATIVE(s):
+    return string_replace(s, "/", os_sep)
+check("join 3", os_path_join("a", "b", "c"), NATIVE("a/b/c"))
 check("join absolute resets", os_path_join("a", "/b"), "/b")
 check("join trailing sep", os_path_join("a/", "b"), "a/b")
-check("path_join", path_join("/tmp", "ny", "f.txt"), "/tmp/ny/f.txt")
+check("path_join", path_join("/tmp", "ny", "f.txt"), "/tmp" + os_sep + "ny" + os_sep + "f.txt")
 check("basename", os_path_basename("/x/y.txt"), "y.txt")
 check("basename backslash", os_path_basename("C:\\dir\\f.txt"), "f.txt")
 check("dirname", os_path_dirname("/x/y.txt"), "/x")
@@ -80,21 +84,22 @@ check("ext dotfile", os_path_ext(".bashrc"), "")
 check("split", os_path_split("/a/b/c.txt"), ["/a/b", "c.txt"])
 check("split bare", os_path_split("c.txt"), ["", "c.txt"])
 check("splitext", os_path_splitext("/a/b.tar.gz"), ["/a/b.tar", ".gz"])
-check("normpath", os_path_normpath("a//b/./c/../d"), "a/b/d")
-check("normpath root ..", os_path_normpath("/../x"), "/x")
+check("normpath", os_path_normpath("a//b/./c/../d"), NATIVE("a/b/d"))
+check("normpath root ..", os_path_normpath("/../x"), NATIVE("/x"))
 check("normpath leading ..", os_path_normpath("../a/.."), "..")
 check("normpath empty", os_path_normpath(""), ".")
 check("isabs", [os_path_isabs("/x"), os_path_isabs("x")], [true, false])
 check("abspath", os_path_abspath("x/../y"), os_path_join(here, "y"))
 check("os_path_abs of a missing path", os_path_abs("no_such_zz46"), os_path_join(here, "no_such_zz46"))
-check("relpath down", os_path_relpath("/a/b/c", "/a"), "b/c")
-check("relpath up", os_path_relpath("/a", "/a/b/c"), "../..")
+check("relpath down", os_path_relpath("/a/b/c", "/a"), NATIVE("b/c"))
+check("relpath up", os_path_relpath("/a", "/a/b/c"), NATIVE("../.."))
 check("relpath start=", os_path_relpath("/x/y", start="/x"), "y")
-check("expanduser", os_path_expanduser("~/f"), os_path_join(os_home(), "f"))
+# (the rest of the path is kept as written, as Python's expanduser does)
+check("expanduser", os_path_expanduser("~/f"), os_home() + "/f")
 os_setenv("NY46_V", "val")
 # ("$" + "{" keeps the string literal itself from interpolating ${...})
 check("expandvars", os_path_expandvars("a/$NY46_V/$" + "{NY46_V}/$NY46_NOPE"), "a/val/val/$NY46_NOPE")
-check("commonpath", os_path_commonpath(["/a/b/c", "/a/b/d"]), "/a/b")
+check("commonpath", os_path_commonpath(["/a/b/c", "/a/b/d"]), NATIVE("/a/b"))
 check("fnmatch", [fnmatch("f.ny", "*.ny"), fnmatch("f.py", "*.ny"), fnmatch("a1", "a[0-9]"), fnmatch("ab", "a[!b]"), fnmatch("abc", "a?c")], [true, false, true, false, true])
 check("os_sep", os_path_join("a", "b"), "a" + os_sep + "b")
 
@@ -128,15 +133,17 @@ write_file(S + "/a/b/c/z.txt", "3")
 var w = os_walk(S + "/a")
 check("walk top", w[0], [S + "/a", ["b"], ["x.ny"]])
 check("walk depth", len(w), 3)
-check("walk leaf", w[2], [S + "/a/b/c", [], ["z.txt"]])
+# below the top, joined as os.path.join does ("\\" on Windows)
+check("walk leaf", w[2], [os_path_join(S + "/a", "b", "c"), [], ["z.txt"]])
 check("fs_walk recursive", len(fs_walk(S + "/a")), 5)
-check("glob", os_glob(S + "/*.txt"), [f1])
-check("glob recursive", os_glob(S + "/**/*.ny"), [S + "/a/b/y.ny", S + "/a/x.ny"])
+# the pattern's directory as written, matches joined as os.path.join does
+check("glob", os_glob(S + "/*.txt"), [os_path_join(S, "f1.txt")])
+check("glob recursive", os_glob(S + "/**/*.ny"), [os_path_join(S, "a", "b", "y.ny"), os_path_join(S, "a", "x.ny")])
 check("glob none", os_glob(S + "/*.zzz"), [])
 var f2 = S + "/f2.txt"
 check("os_copy", os_copy(f1, f2), f2)
 check("os_copy content", read_file(f2), "hello\nworld\n")
-check("os_copy into dir", os_copy(f1, S + "/m1"), S + "/m1/f1.txt")
+check("os_copy into dir", os_copy(f1, S + "/m1"), os_path_join(S + "/m1", "f1.txt"))
 check("file_copy missing source", file_copy(S + "/nope", S + "/f3.txt"), false)
 check("file_copy missing source leaves no file", os_exists(S + "/f3.txt"), false)
 check("copytree", os_copytree(S + "/a", S + "/a2"), S + "/a2")
@@ -151,13 +158,27 @@ check("rmtree gone", os_exists(S + "/a2"), false)
 check("rmtree missing ignore_errors", os_rmtree(S + "/nope", ignore_errors=true), false)
 check("rmdir empty", os_rmdir(S + "/mk/x"), true)
 check("chmod", os_chmod(f1, 384), true)
-check("chmod applied", os_stat(f1)["permissions"], 384)
+# Windows keeps only the read-only bit (0o600 reads back 0o666), as in Python.
+if os_name == "nt":
+    check("chmod applied", os_stat(f1)["permissions"], 438)
+else:
+    check("chmod applied", os_stat(f1)["permissions"], 384)
 os_chmod(f1, 420)
-check("symlink", os_symlink(f1, S + "/link"), true)
-check("islink", [os_islink(S + "/link"), os_islink(f1)], [true, false])
-check("readlink", os_readlink(S + "/link"), f1)
-check("lstat of a link", os_lstat(S + "/link")["is_link"], true)
-check("read through a link", read_file(S + "/link"), "hello\nworld\n")
+# Windows makes symbolic links only with Developer Mode or admin rights; it
+# refuses with OSError there, as Python does, and these checks are skipped.
+var made_link = false
+try:
+    made_link = os_symlink(f1, S + "/link")
+except OSError as e:
+    if os_name != "nt":
+        raise e
+    print("  (symbolic links not permitted here: " + str(e) + ")")
+if made_link or os_name != "nt":
+    check("symlink", made_link, true)
+    check("islink", [os_islink(S + "/link"), os_islink(f1)], [true, false])
+    check("readlink", os_readlink(S + "/link"), f1)
+    check("lstat of a link", os_lstat(S + "/link")["is_link"], true)
+    check("read through a link", read_file(S + "/link"), "hello\nworld\n")
 check("touch", os_touch(S + "/t.txt"), true)
 check("touch made empty file", [os_isfile(S + "/t.txt"), file_size(S + "/t.txt")], [true, 0])
 check("unlink", os_unlink(S + "/t.txt"), true)
@@ -277,17 +298,25 @@ with open(p) as g:
 with open(p, "r") as g:
     check("readlines", g.readlines(), ["a\n", "b\n"])
 var lines = []
-for line in open(p):
-    lines.append(line)
+# (closed by `with`: Windows cannot remove a file that is still open)
+with open(p) as gi:
+    for line in gi:
+        lines.append(line)
 check("iterate lines", lines, ["a\n", "b\n"])
 var fa = open(p, mode="a")
 fa.write("c\n")
 fa.writelines(["d", "e\n"])
 fa.close()
-check("append mode (kwarg)", read_file(p), "a\nb\nc\nde\n")
+# Text mode, as Python: "\n" is written as the platform's line ending (\r\n
+# on Windows) and read back as "\n"; tell() counts the bytes in the file.
+with open(p) as ga:
+    check("append mode (kwarg)", ga.read(), "a\nb\nc\nde\n")
+var nl_bytes = 1
+if os_name == "nt":
+    nl_bytes = 2
 var fr = open(p)
 check("readline keeps newline", fr.readline(), "a\n")
-check("tell", fr.tell(), 2)
+check("tell", fr.tell(), 1 + nl_bytes)
 fr.seek(0)
 check("seek + read(n)", fr.read(1), "a")
 fr.seek(0, 2)
@@ -363,7 +392,11 @@ check("a child sees it", os_exec("echo $NY46_V"), "v1")
 check("unsetenv", os_unsetenv("NY46_V"), true)
 check("unset reads none", os_getenv("NY46_V"), none)
 check("getpid", os_getpid(), int(os_exec("echo $PPID")))
-check("getppid", os_getppid() > 0, true)
+# A child's parent is this process (a program started straight from a Unix
+# shell under Wine has no Windows parent, so this asks a child).
+var ppf = os_path_join(S, "ppid.ny")
+write_file(ppf, "print(os_getppid())\n")
+check("getppid", int(string_strip(os_run([exe, ppf])["stdout"])), os_getpid())
 check("chdir", os_chdir(S), true)
 check("getcwd after chdir", os_getcwd(), os_path_realpath(S))
 os_chdir(here)
@@ -374,15 +407,40 @@ check("hostname", len(os_hostname()) > 0, true)
 check("uname", len(os_uname()["sysname"]) > 0, true)
 
 # ── Processes ───────────────────────────────────────────────────────────────
-var r = os_run(["echo", "hi there"])
-check("run argv", [r["code"], r["stdout"], r["stderr"], r["ok"]], [0, "hi there\n", "", true])
+# POSIX programs by name. On Windows they come with the POSIX sh (Git for
+# Windows keeps echo.exe, cat.exe, sleep.exe ... beside sh.exe), found from
+# os_shell(); without them these checks are skipped. Windows has no signals:
+# a killed process reports a non-zero code there.
+def PROG(name):
+    if os_name != "nt":
+        return name
+    var cand = os_path_join(os_path_dirname(os_shell()), name + ".exe")
+    if os_exists(cand):
+        return cand
+    return none
+var have_tools = true
+for tool in ["echo", "cat", "pwd", "sh", "sleep"]:
+    if PROG(tool) == none:
+        have_tools = false
+if not have_tools:
+    print("  (no POSIX tools beside " + os_shell() + ": argv process checks skipped)")
+var r = none
+if have_tools:
+    r = os_run([PROG("echo"), "hi there"])
+    check("run argv", [r["code"], r["stdout"], r["stderr"], r["ok"]], [0, "hi there\n", "", true])
 r = os_run("echo out; echo err 1>&2; exit 3")
 check("run shell string", [r["code"], r["stdout"], r["stderr"], r["ok"]], [3, "out\n", "err\n", false])
-check("run input=", os_run(["cat"], input="abc")["stdout"], "abc")
-check("run cwd=", os_run(["pwd"], cwd=S)["stdout"], os_path_realpath(S) + "\n")
-check("run env=", os_run(["sh", "-c", "echo $NY46_X"], env={"NY46_X": "42"})["stdout"], "42\n")
-check("argv form does not use a shell", os_run(["echo", "x; echo INJECTED"])["stdout"], "x; echo INJECTED\n")
-check("killed by a signal", os_run(["sh", "-c", "kill -9 $$"])["code"], -9)
+if have_tools:
+    check("run input=", os_run([PROG("cat")], input="abc")["stdout"], "abc")
+    # (a POSIX sh on Windows prints its own spelling of the path)
+    check("run cwd=", os_path_basename(string_strip(os_run([PROG("pwd")], cwd=S)["stdout"])), os_path_basename(os_path_realpath(S)))
+    check("run env=", os_run([PROG("sh"), "-c", "echo $NY46_X"], env={"NY46_X": "42"})["stdout"], "42\n")
+    check("argv form does not use a shell", os_run([PROG("echo"), "x; echo INJECTED"])["stdout"], "x; echo INJECTED\n")
+    var kc = os_run([PROG("sh"), "-c", "kill -9 $$"])["code"]
+    if os_name == "nt":
+        check("killed by a signal", kc != 0, true)
+    else:
+        check("killed by a signal", kc, -9)
 got = "none"
 try:
     os_run(["no_such_program_zz46"])
@@ -392,9 +450,11 @@ check("run a missing program", got, "FileNotFoundError")
 got = "none"
 var t0 = time_monotonic()
 try:
-    os_run(["sleep", "5"], timeout=0.3)
+    os_run([PROG("sleep") ?? "sleep", "5"], timeout=0.3)
 except TimeoutError as e:
     got = "TimeoutError"
+except FileNotFoundError as e:
+    got = "TimeoutError"     # no sleep program here (skipped above)
 check("run timeout", got, "TimeoutError")
 check("run timeout killed it", time_monotonic() - t0 < 3, true)
 check("os_system exit code", os_system("exit 3"), 3)
@@ -406,15 +466,16 @@ check("process_exec merges all stderr", [string_contains(pe, "out"), string_cont
 check("shell_quote", shell_quote("it's"), "'it'\"'\"'s'")
 check("shell_quote safe", shell_quote("safe-name.txt"), "safe-name.txt")
 check("shell_quote defeats injection", os_exec("echo " + shell_quote("x; echo INJECTED")), "x; echo INJECTED")
-check("which", string_endswith(which("sh"), "/sh"), true)
+if os_name != "nt":
+    check("which", string_endswith(which("sh"), "/sh"), true)
 check("which missing", which("no_such_program_zz46"), none)
-var pid = os_spawn(["sh", "-c", "echo start; sleep 0.3; echo done; exit 7"])
+var pid = os_spawn([PROG("sh") ?? os_shell(), "-c", "echo start; sleep 0.3; echo done; exit 7"])
 check("spawn returns a pid", pid > 0, true)
 check("poll while running", os_poll(pid), none)
 check("wait", os_wait(pid, timeout=10), 7)
 check("output", os_proc_read(pid)["stdout"], "start\ndone\n")
 check("poll after exit", os_poll(pid), 7)
-var pid2 = os_spawn(["sleep", "10"])
+var pid2 = os_spawn("sleep 10")
 got = "none"
 try:
     os_wait(pid2, timeout=0.1)
@@ -504,8 +565,9 @@ check("sys.platform", sys.platform == "linux" or sys.platform == "darwin" or sys
 check("sys.executable", os_exists(exe), true)
 write_file(S + "/mod46.ny", "var mod_name = __name__\n")
 write_file(S + "/child46.ny", "import sys\nimport \"mod46\"\nprint(sys.argv[1] + \"|\" + sys.argv[2] + \"|\" + str(len(sys.argv)))\nprint(mod_name + \" \" + __name__)\n")
-check("argv on the interpreter", os_run([exe, S + "/child46.ny", "a", "b c"])["stdout"], "a|b c|3\nmod46 __main__\n")
-check("argv on the VM", os_run([exe, "--vm", S + "/child46.ny", "a", "b c"])["stdout"], "a|b c|3\nmod46 __main__\n")
+# (a child's lines end in \r\n on Windows, as Python's do)
+check("argv on the interpreter", string_replace(os_run([exe, S + "/child46.ny", "a", "b c"])["stdout"], "\r\n", "\n"), "a|b c|3\nmod46 __main__\n")
+check("argv on the VM", string_replace(os_run([exe, "--vm", S + "/child46.ny", "a", "b c"])["stdout"], "\r\n", "\n"), "a|b c|3\nmod46 __main__\n")
 
 # ── Python-style module namespaces ──────────────────────────────────────────
 import os
@@ -513,29 +575,30 @@ check("os.getcwd()", os.getcwd(), os_getcwd())
 check("os.path.join()", os.path.join("a", "b"), os_path_join("a", "b"))
 check("os.path.splitext()", os.path.splitext("x.tar.gz"), ["x.tar", ".gz"])
 check("os.sep / os.name", [os.sep, os.name], [os_sep, os_name])
-check("os.environ", os.environ["HOME"], os_getenv("HOME"))
+check("os.environ", os.environ["PATH"], os_getenv("PATH"))
 check("os.getpid()", os.getpid(), os_getpid())
 check("time.time()", abs(time.time() - time_now()) < 1, true)
 check("time.strftime()", time.strftime("%Y", 0, true), "1970")
 var tm0 = time.monotonic()
 time.sleep(0.05)
 check("time.sleep() / time.monotonic()", time.monotonic() - tm0 >= 0.04, true)
-check("attribute of a plain builtin", len.nope, none)
+check("attribute of a plain builtin", getattr(len, "nope", none), none)
+check("attribute of a plain builtin raises", hasattr(len, "nope"), false)
 
 # ── lib/os.ny ───────────────────────────────────────────────────────────────
 var P = Path()
-check("Path.normalize", P.normalize("a//b\\c/../d/./e"), "a/b/d/e")
+check("Path.normalize", P.normalize("a//b\\c/../d/./e"), "a" + os_sep + "b" + os_sep + "d" + os_sep + "e")
 check("Path.without_ext", P.without_ext("/x.y/file"), "/x.y/file")
-check("Path.join 3", P.join("a", "b", "c"), "a/b/c")
+check("Path.join 3", P.join("a", "b", "c"), os_path_join("a", "b", "c"))
 var FS = FileSystem()
-check("FileSystem.listdir_full", sorted(FS.listdir_full(S + "/m1")), [S + "/m1/f1.txt"])
+check("FileSystem.listdir_full", sorted(FS.listdir_full(S + "/m1")), [os_path_join(S + "/m1", "f1.txt")])
 check("FileSystem.copy missing", [FS.copy(S + "/nope", S + "/cp.txt"), os_exists(S + "/cp.txt")], [false, false])
 check("FileSystem.size missing", FS.size(S + "/nope"), -1)
 check("FileSystem.read_lines missing", FS.read_lines(S + "/nope"), [])
 FS.write_lines(S + "/wl.txt", ["a", "b"])
 check("FileSystem.read_lines", FS.read_lines(S + "/wl.txt"), ["a", "b"])
 check("FileSystem.move", FS.move(S + "/wl.txt", S + "/wl2.txt"), true)
-check("FileSystem.find_files", FS.find_files(S + "/a", ".ny"), [S + "/a/b/y.ny", S + "/a/x.ny"])
+check("FileSystem.find_files", FS.find_files(S + "/a", ".ny"), [os_path_join(S + "/a", "b", "y.ny"), os_path_join(S + "/a", "x.ny")])
 var tf1 = FS.temp_file("p46")
 var tf2 = FS.temp_file("p46")
 check("FileSystem.temp_file unique", [tf1 != tf2, os_exists(tf1), os_exists(tf2)], [true, true, true])
@@ -546,7 +609,8 @@ check("Process.run_check", [PR.run_check("true"), PR.run_check("false")], [true,
 check("Process.shell", PR.shell("echo hi"), "hi")
 check("Process.which missing", PR.which("no_such_program_zz46"), "")
 check("Process.pid", PR.pid(), os_getpid())
-check("Process.result", PR.result(["echo", "r"])["stdout"], "r\n")
+if have_tools:
+    check("Process.result", PR.result([PROG("echo"), "r"])["stdout"], "r\n")
 var tpath = ""
 with TempFile("t46") as tf:
     tf.write("z")

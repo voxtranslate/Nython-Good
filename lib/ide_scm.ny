@@ -56,8 +56,10 @@ class GitRepo:
         self.head_commit = ""
         self.last_output = ""
 
+    # Quoted for the shell os_exec/os_spawn run command strings with - a POSIX
+    # sh, or cmd.exe on a Windows without one (see os_shell()).
     def _q(self, s):
-        return "'" + string_replace(s, "'", "'\\''") + "'"
+        return shell_quote(s)
 
     def _git(self, args):
         var out = os_exec("git -C " + self._q(self.root) + " " + args + " 2>&1")

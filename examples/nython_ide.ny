@@ -1101,8 +1101,8 @@ class NythonIDE:
         self.use_vm    = false
 
         self.icons = Icons()
-        self.icon_font    = Font(self.icons.font_path, 16, false, false)
-        self.icon_font_sm = Font(self.icons.font_path, 13, false, false)
+        self.icon_font    = Font(self.icons?.font_path, 16, false, false)
+        self.icon_font_sm = Font(self.icons?.font_path, 13, false, false)
 
         # ── Files / buffers ─────────────────────────────────────────────────
         self.buffers = []

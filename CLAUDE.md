@@ -115,6 +115,17 @@ loudly if not found) if auto-detection picks the wrong one.
 - Link libraries: `ws2_32`, `SDL3`, `SDL3_ttf`, `SDL3_image`
 - Copy `SDL3.dll`, `SDL3_ttf.dll`, `SDL3_image.dll` next to `nython.exe`
 - See `SDL3_SETUP.md` for detailed instructions
+- The `.cbp` lists its units: **a new `src/**.cpp` must be added to it** (seven
+  were missing after round 74 and the Windows build could not link).
+- Command strings (`os_exec`, `os_run("...")`, `os_spawn("...")`, the IDE's git,
+  build and tool commands) run through a POSIX `sh` when one is found - Git for
+  Windows' (Source Control needs git anyway), MSYS2's, or `NY_SH` - else
+  through `cmd.exe`. `os_shell()` says which.
+- Tested from Linux without Windows: `tools/cross_windows.sh deps && tools/cross_windows.sh build`
+  cross-compiles with MinGW against SDL3 built for Windows; `build-win/nywin`
+  runs it under Wine and `python3 tools/sweep.py --bin build-win/nywin` sweeps it.
+- `long` is 32 bits on Windows: never cast a Nython integer through `long`
+  (use `int64_t`/`long long`, `intValue()`, `bigint_to_i64()`).
 
 ### Development environment (no SDL3 available)
 
@@ -302,6 +313,8 @@ These were aligned to match how the IDE calls them:
 | vm_audit52 | — | exceptions as objects: typed except across calls, finally/raise, with protocol, NameError/AttributeError/TypeError |
 | vm_audit53 | — | classes: C3 MRO, super(), class bodies, properties, the operator and object protocols |
 | vm_audit54 | — | comprehensions, match patterns, walrus, unpacking, generators, calls (`**d`, arity) |
+| vm_audit56 | 120 | lazy generators: infinite ones with islice/take/zip/any, side-effect order, send/throw/close/GeneratorExit/finally, StopIteration.value, `yield from` (600 deep), genexps, `__iter__` generators, unpacking, errors, threads (same results under python3) |
+| vm_audit57 | 212 | strict reads (AttributeError/KeyError), getattr/hasattr/setattr/delattr/get/setdefault, `?.` `?[` `??` `??=`, `undefined`, var/let/const/global/nonlocal scope rules in every context, suffix literals (round 75) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -361,6 +374,12 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
 | `file_mtime(path)` | ms since epoch, -1 if missing (folders too) |
 | `--trace OUT file.ny` | statement-level recording for the IDE's debugger |
 | `--profile` allocations | per function: objects and strings kept (`NY_PROFILE_SORT=alloc`); `NY_PROFILE_OUT=f nython --ide` profiles the IDE |
+| `a?.b` `a?.m(x)` `a?[k]` `a?.[k]` `f?.(x)` | optional chaining (round 75): none when the receiver is none/undefined **or** the member/key/index is missing; the rest of the chain is skipped, arguments included. A present link and every plain step after it stay strict (`a?.b.c` raises if `a.b` is none). Not assignable. |
+| `a ?? b`, `t ??= v` | null coalescing (round 75): `b` only when `a` is none or undefined (lazy); `??=` assigns only when `t` is none/undefined or, for an attribute/key, missing; object and index evaluated once |
+| `delattr`, `del obj.x` | remove an attribute (AttributeError if absent); `getattr`/`hasattr`/`setattr` work on every kind of value, as in Python |
+| `global x` | a real declaration now: creates the module variable and skips an enclosing function's `x` (round 75) |
+| suffix literals | `1k == 1000` (int), `2.5k == 2500`, `1.1k == 1100`; a float only when fractional (`1m == 0.001`, `1500m == 1.5`) |
+| `NY_LENIENT_READS=log` | porting aid: a missing attribute/key read prints `[lenient-read] file:line: ...` once and yields none instead of raising |
 
 ### Known limitations
 
@@ -377,17 +396,30 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
 - ~~Integer `/` differs between engines~~ — **resolved (round 71)**: `/` is
   always true division (float), `//`/`\` are floor division (int) on both
   engines. See "Round 71 fixes" below.
-- **Interpreter generators are still eager** (the whole sequence is collected
-  first): an infinite generator hangs there, and `send()` on the interpreter
-  behaves like `next()`. The VM's generators are lazy, with `send`/`close`.
+- ~~Interpreter generators are still eager~~ — **resolved (round 75)**:
+  generator bodies run on stackful coroutines (`NyCoro`/`NyGen`), lazily,
+  with the whole protocol (send/throw/close, `yield from`, StopIteration.value)
+  on both engines; generator expressions are lazy on both. See HANDOFF §0l.
+  Still open there: a generator dropped mid-iteration is finalized when its
+  loop/consumer ends or at program exit, not the moment its last reference
+  goes (that needs the interpreter's reference counting).
 - Video builtins are stubs (need ffmpeg).
 - ~~`@property` doesn't work on the VM~~ — **resolved (round 74)**: VM class
   bodies run (properties with setters, static/class methods, decorators).
-- Reading a missing attribute gives `none`, not AttributeError
-  (`lib/gui.ny` relies on it); *calling* a missing method raises
-  AttributeError. Reading a missing dict key gives `none` too.
-- A plain `x = ...` inside a function rebinds an existing global of that
-  name (no `global` needed) — a design choice still to be ruled on.
+- ~~Reading a missing attribute gives `none`~~ — **ruled and done (round
+  75)**: reading a missing attribute raises AttributeError and a missing
+  dict key KeyError, as in Python, on both engines (so do `none.x`,
+  `none[k]`, `none.m()`); absence is handled on purpose with `getattr(o, n,
+  d)` / `hasattr` / `d.get(k, d)` / `k in d` / `o?.x` / `d?[k]` / `x ?? d`.
+  Every library, the IDE and the tests were migrated (HANDOFF §0m).
+- ~~A plain `x = ...` rebinds a global — to be ruled on~~ — **ruled (round
+  75)**: kept. Inside a function a plain assignment rebinds the nearest
+  existing binding (enclosing functions, then the module); if there is none
+  it creates a local. `var`/`let`/`const` (equivalent, function-scoped)
+  declare a local that shadows any outer name for the rest of that function
+  from the point it runs; `global` names the module's variable, `nonlocal`
+  the enclosing function's. for-loop targets, parameters, comprehension
+  variables and `except ... as` are local declarations too.
 - Interpreter lambdas capture loop variables by value
   (`[lambda: i for i in range(3)]` gives 0, 1, 2; Python gives 2, 2, 2).
 
@@ -681,7 +713,7 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   one formatter (f-strings with specs, `format`, `str.format`, `%`);
   tuples; UTF-8 character indexing; IndexError/KeyError on out-of-range.
 - Arithmetic on unsupported types raises TypeError (it used to give none /
-  1). Reading a missing dict key still gives none, on purpose.
+  1). Reading a missing dict key raises KeyError since round 75 (§0m).
 - VM natives receive keyword arguments as a trailing map marked
   `class_name "__kwargs__"` (`take_kwargs()`); OS builtins read the same
   map with `nyos::Args`.
@@ -747,6 +779,62 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   `gc_is_enabled`, `gc_set_threshold`/`gc_get_threshold`, `gc_stats`,
   `gc_live_objects`, `mem_rss_kb`, `mem_peak_rss_kb`, `weakref`.
 - `make asan` → `build-asan/nython-cli` (ASan + UBSan + LSan).
+
+## Round 75: lazy generators (see `HANDOFF.md` §0l)
+
+- **Interpreter**: a generator function's body runs on a stackful coroutine
+  (`include/NyCoro.hpp`, `src/NyCoro.cpp`: mmap'd 1 MB stacks committed as
+  touched, guard page, pooled; x86-64/AArch64 register switch, ucontext
+  elsewhere, pooled Windows fibers - tested under Wine only) driven by `src/NyGen.cpp`
+  (`include/NyGen.hpp`); the hooks in `NythonExecutor.hpp` are small and
+  marked `nygen`. `NY_GEN_STACK_KB` sets the stack size.
+- **Both engines**: `send`/`throw`/`close` with GeneratorExit and finally at the
+  paused yield; StopIteration.value; `yield from` delegates all four and
+  evaluates to the subgenerator's return value; StopIteration escaping a body
+  is RuntimeError; "generator already executing"; lazy generator expressions;
+  `zip`/`map`/`filter`/`enumerate` over a generator and `iter()` are lazy
+  (over lists they still return lists); new `islice` and `take(n, it)`;
+  `any`/`all`/`next`/`in` stop early; `a, b = gen()` unpacks.
+- **Rules**: a started generator is resumed only by the thread that started
+  it (RuntimeError, both engines); a generator a `for` loop or a consuming
+  builtin made itself is closed when that consumer is done (as CPython's
+  reference counting would); every generator still paused at program end is
+  closed, oldest first. The VM raises RecursionError at 1000 frames (it
+  crashed with SIGSEGV at ~1400).
+
+## Round 75: strict reads, optional chaining, declarations, suffix literals (see `HANDOFF.md` §0m)
+
+- **Missing reads raise, on both engines**: `obj.missing` → AttributeError
+  (instances, classes, none, dicts read with `.`, str/list/int/functions...),
+  `d[missing]` → KeyError, `none[k]`/`5[0]` → TypeError, `none.m()` /
+  `"s".nosuch()` → AttributeError, `none.x = v` → AttributeError. A builtin
+  value's method read as a value is bound (`f = xs.append`), from one table
+  both engines share (`include/NyMembers.hpp`).
+- **Absence on purpose**: `getattr`/`hasattr`/`setattr`/`delattr` for every
+  value, `d.get`/`setdefault`/`in`; `a?.b`, `a?.m(x)`, `a?[k]`, `a?.[k]`,
+  `f?.(x)` (none when the receiver is none/undefined or the member is
+  missing; the rest of the chain is skipped); `a ?? b`; `t ??= v`. The C
+  ternary still parses (`c ? .5 : 1`, `c ? [1] : [2]`: `?[` is optional
+  indexing only when glued to its receiver). AST: `OptChainNode`/`HoleNode`
+  (`ASTNodes.hpp`); VM ops `JUMP_IF_NONE_KEEP`, `JUMP_IF_MISSING_KEEP`,
+  `JUMP_IF_NOT_NONE_OR_POP`, `LOAD_ATTR_OPT`, `LOAD_SUBSCR_OPT`,
+  `CHECK_MEMBER`, `DUP_TOP_TWO`.
+- **`undefined`** is a value distinct from none on both engines (the VM
+  compiled the literal to nothing); the runtime never produces it for
+  absence. `??`/`?.` treat it as absent. `del x` unbinds `x` (NameError
+  after).
+- **Scope ruling**: plain assignment rebinds the nearest binding, `var`/
+  `let`/`const` declare a local, `global x` creates/targets the module
+  variable (`LOAD_GLOBAL_NAME`/`STORE_GLOBAL_NAME` on the VM).
+- **Suffix literals** are ints when whole (`1k`, `2.5k`, `1.1k`), floats
+  when fractional (`1m`), decided on the digits in the lexer.
+- **Migration**: every read the libraries, the IDE and the tests made of a
+  missing attribute/key was found with `NY_LENIENT_READS=log` (both engines,
+  every example and test, the whole IDE e2e) plus two static scans, and fixed
+  idiomatically (`.get`, `?.`, attributes initialised in `__init__`).
+  `tools/ny_attrcheck.py` finds `self.x` reads of attributes set only lazily;
+  `tools/ide_e2e.py` now fails on AttributeError/KeyError/NameError/TypeError
+  or `[lenient-read]` in the IDE log.
 
 ## Transcripts
 

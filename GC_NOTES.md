@@ -294,12 +294,17 @@ bookkeeping) is 1.4% of the instructions; `mallinfo2` 0.002%.
   shrink live data.
 - The old `GarbageCollector` (`src/GarbageCollector.cpp`) is still compiled
   and still unused.
-- **After merging round75-sem**: its `func_attrs_` (attributes on function
-  values, keyed by the function's identity) must be erased in
-  `forgetFunction`, traversed by `Func::gc_traverse` and dropped by
-  `Func::gc_clear`, or a new function at a freed address inherits them;
-  its `bound_members_` keep their receivers alive for the process; its VM
-  `func_attrs_` are roots keyed by raw pointers (see the round-75 report).
+- **Function attributes** (`f.x = v`, round75-sem) are freed with their
+  function on the interpreter; on the VM `func_attrs_` is keyed by raw
+  code/scope pointers and holds its values as roots: a function attribute
+  that refers back to the function is never collected there, and an entry
+  can outlive its function's scope. Bound builtin members
+  (`lst.append` read as a value) keep their receivers for the process.
+- **Suspended generators** (round75-gen): their coroutine stacks and
+  `Gen` fields hold references the collector cannot see, so a cycle through
+  a suspended generator is not collected. A generator dropped while
+  suspended is closed at the next statement (reference counting destroys
+  its object; `~GenObject` queues it for `nygen::run_pending`).
 
 ## History: the leak this replaced (rounds 51-74)
 

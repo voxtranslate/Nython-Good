@@ -97,14 +97,18 @@ check("mtime of a missing file", file_mtime("/tmp/ny_audit45_missing"), -1)
 check("mtime of a folder", file_mtime("/tmp") > 0, true)
 
 # ── print, both engines, checked through a subprocess ───────────────────────
-var exe = "./ny_test"
-if not os_exists(exe):
-    exe = "./build/nython-cli"
+# The interpreter running this test (a binary for this platform), a file in
+# the system's temporary directory, and argv (no shell): the same on Windows.
+import sys
+var exe = sys.executable
 if os_exists(exe):
-    write_file("/tmp/ny_audit45_print.ny", "var r = 6\nprint(\"total\", r)\nprint(\"x\", \"y\", sep=\"-\")\nprint(\"no\", end=\"\")\nprint(\"-nl\")\nprint([1, 2], none, 2.5)\nprint()\nprint (1 + 2) * 3\nprint \"b\", 3\n")
-    var want = "total 6\nx-y\nno-nl\n[1, 2] none 2.5\n\n9\nb 3"
-    check("print on the interpreter", os_exec(exe + " /tmp/ny_audit45_print.ny"), want)
-    check("print on the VM", os_exec(exe + " --vm /tmp/ny_audit45_print.ny"), want)
+    var pf = os_path_join(os_gettempdir(), "ny_audit45_print_" + str(os_getpid()) + ".ny")
+    write_file(pf, "var r = 6\nprint(\"total\", r)\nprint(\"x\", \"y\", sep=\"-\")\nprint(\"no\", end=\"\")\nprint(\"-nl\")\nprint([1, 2], none, 2.5)\nprint()\nprint (1 + 2) * 3\nprint \"b\", 3\n")
+    var want = "total 6\nx-y\nno-nl\n[1, 2] none 2.5\n\n9\nb 3\n"
+    # (a Windows program ends its lines with \r\n)
+    check("print on the interpreter", string_replace(os_run([exe, pf])["stdout"], "\r\n", "\n"), want)
+    check("print on the VM", string_replace(os_run([exe, "--vm", pf])["stdout"], "\r\n", "\n"), want)
+    os_remove(pf)
 else:
     print("(no nython binary found: print checks skipped)")
 

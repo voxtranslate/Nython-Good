@@ -416,8 +416,8 @@ Value Value::operator+(Value that) {
     if (type == ValueType::INTEGER && that.type == ValueType::INTEGER)
         return Value(value.i + that.value.i);
     if (type == ValueType::DOUBLE || that.type == ValueType::DOUBLE) {
-        double l = (type == ValueType::DOUBLE) ? value.d : (double)(long)value.i;
-        double r = (that.type == ValueType::DOUBLE) ? that.value.d : (double)(long)that.value.i;
+        double l = (type == ValueType::DOUBLE) ? value.d : (double)static_cast<long double>(value.i);
+        double r = (that.type == ValueType::DOUBLE) ? that.value.d : (double)static_cast<long double>(that.value.i);
         return Value(l + r);
     }
     if (type == ValueType::BOOLEAN && that.type == ValueType::BOOLEAN)
@@ -431,8 +431,8 @@ Value Value::operator-(Value that) {
     if (type == ValueType::INTEGER && that.type == ValueType::INTEGER)
         return Value(value.i - that.value.i);
     if (type == ValueType::DOUBLE || that.type == ValueType::DOUBLE) {
-        double l = (type == ValueType::DOUBLE) ? value.d : (double)(long)value.i;
-        double r = (that.type == ValueType::DOUBLE) ? that.value.d : (double)(long)that.value.i;
+        double l = (type == ValueType::DOUBLE) ? value.d : (double)static_cast<long double>(value.i);
+        double r = (that.type == ValueType::DOUBLE) ? that.value.d : (double)static_cast<long double>(that.value.i);
         return Value(l - r);
     }
     return NONE_VALUE;
@@ -442,8 +442,8 @@ Value Value::operator*(Value that) {
     if (type == ValueType::INTEGER && that.type == ValueType::INTEGER)
         return Value(value.i * that.value.i);
     if (type == ValueType::DOUBLE || that.type == ValueType::DOUBLE) {
-        double l = (type == ValueType::DOUBLE) ? value.d : (double)(long)value.i;
-        double r = (that.type == ValueType::DOUBLE) ? that.value.d : (double)(long)that.value.i;
+        double l = (type == ValueType::DOUBLE) ? value.d : (double)static_cast<long double>(value.i);
+        double r = (that.type == ValueType::DOUBLE) ? that.value.d : (double)static_cast<long double>(that.value.i);
         return Value(l * r);
     }
     return NONE_VALUE;
@@ -455,8 +455,8 @@ Value Value::operator/(Value that) {
         return Value(value.i / that.value.i);
     }
     if (type == ValueType::DOUBLE || that.type == ValueType::DOUBLE) {
-        double l = (type == ValueType::DOUBLE) ? value.d : (double)(long)value.i;
-        double r = (that.type == ValueType::DOUBLE) ? that.value.d : (double)(long)that.value.i;
+        double l = (type == ValueType::DOUBLE) ? value.d : (double)static_cast<long double>(value.i);
+        double r = (that.type == ValueType::DOUBLE) ? that.value.d : (double)static_cast<long double>(that.value.i);
         if (r == 0.0) return NONE_VALUE;
         return Value(l / r);
     }

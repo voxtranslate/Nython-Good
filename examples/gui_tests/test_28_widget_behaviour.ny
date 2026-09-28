@@ -409,9 +409,17 @@ var pb = ProgressBar(0, 0, 100, 10)
 pb.min_val = 1.0
 pb.max_val = 1.0
 check("progress with an empty range", pb.percent(), 0.0)
+# Just inside the end of the label as measured with the font actually in use
+# (DejaVu on Linux, Segoe UI on Windows: widths differ, so no fixed x), and
+# just past it.
 var cb = Checkbox(0, 0, "A fairly long checkbox label")
-cb.handle_event(ev("mousedown", 200, 10))
+var cb_end = cb.rect.x + cb.rect.w + 8 + cb.font.width(cb.label)
+check_true("checkbox label measured", cb.font.width(cb.label) > 100)
+cb.handle_event(ev("mousedown", cb_end - 4, 10))
 check("checkbox label is clickable (measured)", cb.checked, true)
+var cb2 = Checkbox(0, 0, "A fairly long checkbox label")
+cb2.handle_event(ev("mousedown", cb_end + 12, 10))
+check("checkbox: past the label is not the checkbox", cb2.checked, false)
 var tabs = Tabs(0, 0, 300, 30)
 tabs.draw(rr)
 tabs.handle_event(ev("mousedown", 10, 10))

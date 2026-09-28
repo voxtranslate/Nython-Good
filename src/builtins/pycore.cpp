@@ -110,15 +110,11 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         need(1, "len()");
         const Value& v = args[0];
         if (E.isStringValue(v)) return intValue((int64_t)nypy::u8_len(*(std::string*)v.value.p));
+        // A generator has no length (it is lazy), as in Python.
+        if (nygen::is_gen(v)) E.pyRaise("TypeError", "object of type 'generator' has no len()");
         if (Container* c = E.contOf(v)) {
             int64_t n = NythonExecutor::seqLen(c);
-            if (n >= 0) {
-                if (NythonExecutor::isGenCont(c)) {
-                    auto ix = c->container->find("__idx__");
-                    if (ix != c->container->end()) n -= bigint_to_i64(ix->second.value.i);
-                }
-                return intValue(n);
-            }
+            if (n >= 0) return intValue(n);
             return intValue(E.dictSize(c));
         }
         if (E.isInstanceVal(v) && E.instanceHasMethod(v, "__len__")) {
@@ -400,7 +396,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         Value d = E.makeDictValue();
         Container* dc = E.contOf(d);
         if (!args.empty()) {
-            if (Container* src = E.contOf(args[0]); src && NythonExecutor::seqLen(src) < 0) {
+            if (Container* src = E.contOf(args[0]); src && NythonExecutor::seqLen(src) < 0 && !nygen::is_gen(args[0])) {
                 E.dictUpdate(dc, src);
             } else {
                 for (auto& pairv : E.iterItems(args[0], ctx)) {
@@ -504,6 +500,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             case ValueType::BOOLEAN: return str_("bool");
             case ValueType::INTEGER: return str_("int");
             case ValueType::DOUBLE: return str_("float");
+            case ValueType::UNDEFINED: return str_("undefined");
             default: break;
         }
         if (Container* c = E.contOf(v)) {
@@ -521,7 +518,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             auto fit = E.func_names.find(v.value.p);
             if (fit != E.func_names.end()) {
                 if (fit->second.find("__func__:") == 0 || fit->second.find("__lambda__") == 0) return str_("function");
-                if (fit->second.find("__builtin__:") == 0) return str_("builtin");
+                if (fit->second.find("__builtin__:") == 0 || fit->second.find("__bmethod__:") == 0) return str_("builtin");
                 if (fit->second.find("__class__:") == 0) return str_("class");
                 if (fit->second.find("__instance__:") == 0) return str_(fit->second.substr(13));
             }

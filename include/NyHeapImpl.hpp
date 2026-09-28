@@ -56,6 +56,9 @@ inline void Func::gc_traverse(GcVisitFn visit, void* arg) {
         auto it = E->fn_defaults_val_.find((void*)&id);
         if (it != E->fn_defaults_val_.end())
             for (auto& v : it->second) if (v.value.o) visit(v.value.o, arg);
+        auto fa = E->func_attrs_.find((void*)&id);
+        if (fa != E->func_attrs_.end())
+            for (auto& kv : fa->second) if (kv.second.value.o) visit(kv.second.value.o, arg);
     }
 }
 inline void Func::gc_clear() {
@@ -64,6 +67,9 @@ inline void Func::gc_clear() {
         std::vector<Value> dead;
         auto it = E->fn_defaults_val_.find((void*)&id);
         if (it != E->fn_defaults_val_.end()) { dead.swap(it->second); E->fn_defaults_val_.erase(it); }
+        std::unordered_map<std::string, Value> dead_attrs;
+        auto fa = E->func_attrs_.find((void*)&id);
+        if (fa != E->func_attrs_.end()) { dead_attrs.swap(fa->second); E->func_attrs_.erase(fa); }
     }
     setScope(nullptr);
 }

@@ -7,10 +7,15 @@
 #pragma GCC diagnostic ignored "-Wmisleading-indentation"
 
 #include <memory>
+#include <mutex>
 #include <vector>
 #include <deque>
 #include <string>
 #include <unordered_map>
+#include <set>
+#include <map>
+#include <tuple>
+#include <mutex>
 #include <functional>
 #include <unordered_set>
 #include <optional>
@@ -47,8 +52,10 @@
 #include "NyStr.hpp"
 #include "NyFormat.hpp"
 #include "NyRuntime.hpp"
+#include "NyMembers.hpp"
 #include "NyPrelude.hpp"
 #include "NyConc.hpp"   // concurrency runtime shared with the interpreter
+#include "NyCoro.hpp"   // thread tokens: a started generator stays on its thread
 #include <random>
 
 #include "Value.hpp"
@@ -113,6 +120,22 @@ enum class Op : uint8_t {
     MAP_MERGE,       // f(**d): TOS (a map) merged into the map below it
     // A tuple display `(a, b)`: BUILD_LIST's items, as a tuple (VMVal::is_tuple).
     BUILD_TUPLE,
+    // Optional chaining and ?? / ??= (round 75; OptChainNode in ASTNodes.hpp).
+    // JUMP_IF_NONE_KEEP: TOS none/undefined -> TOS = none, jump.
+    // JUMP_IF_MISSING_KEEP: TOS the absent marker -> TOS = none, jump.
+    // JUMP_IF_NOT_NONE_OR_POP: TOS neither none, undefined nor absent -> jump
+    //   keeping it; else pop it.
+    // LOAD_ATTR_OPT / LOAD_SUBSCR_OPT: as LOAD_ATTR / LOAD_SUBSCR, but a
+    //   missing member / key / index pushes the absent marker.
+    // CHECK_MEMBER: TOS lacks member names[arg] -> TOS = the absent marker.
+    // DUP_TOP_TWO: a b -> a b a b.
+    JUMP_IF_NONE_KEEP, JUMP_IF_MISSING_KEEP, JUMP_IF_NOT_NONE_OR_POP,
+    LOAD_ATTR_OPT, LOAD_SUBSCR_OPT, CHECK_MEMBER, DUP_TOP_TWO,
+    // A name declared `global` in the running function (VariableNode::
+    // global_ref): read / bound at module level, created there if new.
+    LOAD_GLOBAL_NAME, STORE_GLOBAL_NAME,
+    // del x: unbinds the nearest x (a later read is a NameError).
+    DELETE_NAME,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -176,6 +199,18 @@ struct VMVal {
         return x;
     }
     static VMVal make_none()              { return {}; }
+    // UNDEFINED carries a tag in s: "undefined" is the language's
+    // `undefined` value (distinct from none, falsy, absent to ?? and ?.);
+    // untagged is the "not found" sentinel frames and defaults use;
+    // "__absent__" is what an optional read (?. / ?[) pushes for a missing
+    // member or key, consumed by the jump that follows it; "__fin__" is a
+    // try/finally state (make_fin_state).
+    static VMVal make_undefined()         { VMVal x; x.type=VMType::UNDEFINED; x.s="undefined"; return x; }
+    static VMVal make_absent()            { VMVal x; x.type=VMType::UNDEFINED; x.s="__absent__"; return x; }
+    bool is_missing() const               { return type==VMType::UNDEFINED && s.empty(); }
+    bool is_absent_marker() const         { return type==VMType::UNDEFINED && s=="__absent__"; }
+    // none or undefined: what ?? replaces and ?. short-circuits on
+    bool is_nullish() const               { return type==VMType::NONE || type==VMType::UNDEFINED; }
     static VMVal make_bool(bool v)        { VMVal x; x.type=VMType::BOOL;  x.b=v; return x; }
     static VMVal make_int(int64_t v)      { VMVal x; x.type=VMType::INT;   x.i=v; return x; }
     static VMVal make_float(double v)     { VMVal x; x.type=VMType::FLOAT; x.d=v; return x; }
@@ -215,6 +250,7 @@ struct VMVal {
     bool is_truthy() const {
         switch(type){
         case VMType::NONE:   return false;
+        case VMType::UNDEFINED: return false;
         case VMType::BOOL:   return b;
         case VMType::INT:    return i!=0||!s.empty();
         case VMType::FLOAT:  return d!=0.0;
@@ -274,6 +310,7 @@ struct VMVal {
         case VMType::GENERATOR: return gen.get()==o.gen.get();
         case VMType::ITERATOR:  return iter.get()==o.iter.get();
         case VMType::NATIVE: return !class_name.empty() && class_name==o.class_name;
+        case VMType::UNDEFINED: return s==o.s;   // undefined == undefined
         default:             return false;
         }
     }
@@ -360,6 +397,7 @@ struct ExceptionEntry {
 
 struct VMCode {
     std::string              name;
+    std::string              file;          // source file (diagnostics)
     std::string              parent_class;
     std::vector<std::string> bases;         // every base class, in order (parent_class is bases[0])
     std::string              owner_class;   // class that defines this method
@@ -471,6 +509,8 @@ inline VMVal vm_key_value(const std::string& k) {
     return VMVal::make_none();
 }
 inline bool vm_internal_key(const std::string& k){ return k.size()>=2&&k[0]=='_'&&k[1]=='_'; }
+struct GenState;
+inline std::string vm_gen_repr(const GenState* g);   // after GenState
 
 inline std::string VMVal::to_string() const {
     switch(type){
@@ -514,8 +554,12 @@ inline std::string VMVal::to_string() const {
     case VMType::NATIVE:
         if(class_name.rfind("__builtin__:",0)==0) return "<built-in function "+class_name.substr(12)+">";
         return "<native>";
-    case VMType::ITERATOR: return "<iterator>";
-        case VMType::GENERATOR: return "<generator>";
+    case VMType::ITERATOR: {
+        char buf[32];
+        std::snprintf(buf, sizeof buf, "0x%llx", (unsigned long long)(uintptr_t)iter.get());
+        return std::string("<generator object iterator at ") + buf + ">";
+    }
+    case VMType::GENERATOR: return vm_gen_repr(gen.get());
     default:               return "undefined";
     }
 }
@@ -614,7 +658,11 @@ class Compiler {
         emit_dn(t->token().value,l);
     }
     int comp_id_ = 0;
-    int  ln(nython::node::node_ptr nd) { return nd?nd->token().location().row:0; }
+    int  ln(nython::node::node_ptr nd) {
+        if(!nd) return 0;
+        if(C().file.empty()) C().file=nd->token().fileName();
+        return nd->token().location().row;
+    }
 
     // Integer literal tokens keep their source spelling verbatim
     // ("0xFF", "0o17", "0b1010"), but plain std::stoll(s) - base 10 by
@@ -695,11 +743,11 @@ private:
     static bool pushes_value(const np& nd) {
         switch(nd->type()){
         case NT::INTEGER: case NT::FLOAT: case NT::STRING: case NT::TRUE:
-        case NT::FALSE: case NT::NONE: case NT::VARIABLE: case NT::SELF:
+        case NT::FALSE: case NT::NONE: case NT::UNDEFINED: case NT::OPT_CHAIN: case NT::VARIABLE: case NT::SELF:
         case NT::SUPER: case NT::ATTRIBUTE: case NT::SUBSCRIPT: case NT::UNARY:
         case NT::BINARY: case NT::CALL: case NT::LIST: case NT::TUPLE:
         case NT::MAP: case NT::COMPLEX: case NT::LAMBDA: case NT::WALRUS: case NT::COMPREHENSION:
-        case NT::RANGE: case NT::SLICE: case NT::YIELD:
+        case NT::RANGE: case NT::SLICE: case NT::YIELD: case NT::YIELD_FROM:
             return true;
         case NT::IF:
             return std::static_pointer_cast<nython::node::IfNode>(nd)->is_expr;
@@ -739,15 +787,32 @@ private:
         case NT::TRUE:    emit_lc(VMVal::make_bool(true),l); break;
         case NT::FALSE:   emit_lc(VMVal::make_bool(false),l); break;
         case NT::NONE:    emit_lc(VMVal::make_none(),l); break;
+        case NT::UNDEFINED: emit_lc(VMVal::make_undefined(),l); break;
+        // Optional chaining: the hole's value is already on the stack.
+        case NT::CHAIN_HOLE: break;
+        case NT::OPT_CHAIN: visit_opt_chain(std::static_pointer_cast<nython::node::OptChainNode>(nd)); break;
 
         // Names
-        case NT::VARIABLE: emit_ln(nd->token().value,l); break;
+        case NT::VARIABLE:
+            if(std::static_pointer_cast<nython::node::VariableNode>(nd)->global_ref)
+                emit(Op::LOAD_GLOBAL_NAME,C().add_name(nd->token().value),l);
+            else emit_ln(nd->token().value,l);
+            break;
         case NT::SELF:     emit(Op::LOAD_SELF,0,l); break;
         case NT::SUPER:    emit(Op::LOAD_SUPER,0,l); break;
 
         // Var decl
         case NT::VARIABLE_DECL: {
             auto vd=std::static_pointer_cast<nython::node::VarDeclNode>(nd);
+            if(vd->unpack!=-2 && vd->init){
+                // a, b = rhs: a generator or iterator is read into a list
+                // first (__unpack_seq__), which the targets then index.
+                emit(Op::LOAD_NAME,C().add_name("__unpack_seq__"),l);
+                visit(vd->init);
+                emit_lc(VMVal::make_int(vd->unpack),l);
+                emit(Op::CALL_FUNCTION,2,l);
+                emit_dn(vd->name,l); break;
+            }
             if(vd->init) visit(vd->init); else emit_lc(VMVal::make_none(),l);
             emit_dn(vd->name,l); break;
         }
@@ -800,6 +865,7 @@ private:
         }
         case NT::ASSIGNMENT_AUG: {
             auto an=std::static_pointer_cast<nython::node::AugAssignNode>(nd);
+            if(an->op=="??="){ visit_coalesce_assign(an.get(),l); break; }
             if(an->op=="~="){
                 // No natural binary reading of "complement" exists (see the
                 // identical comment on the interpreter's evalAugAssignment,
@@ -869,6 +935,12 @@ private:
             if(op=="or"||op=="||") {
                 visit(b->left); int j=C().here();
                 emit(Op::JUMP_IF_TRUE_OR_POP,0,l); visit(b->right);
+                C().patch(j,C().here()); break;
+            }
+            // a ?? b: b only when a is none or undefined (and only then evaluated).
+            if(op=="??") {
+                visit(b->left); int j=C().here();
+                emit(Op::JUMP_IF_NOT_NONE_OR_POP,0,l); visit(b->right);
                 C().patch(j,C().here()); break;
             }
             // `x is int` / `x is MyClass`: the right operand names a TYPE, not
@@ -1011,8 +1083,7 @@ private:
             auto dn=std::static_pointer_cast<nython::node::DeleteNode>(nd);
             if(!dn->target) break;
             if(dn->target->type()==NT::VARIABLE){
-                emit_lc(VMVal::make_none(),l);
-                emit_sn(dn->target->token().value,l);
+                emit(Op::DELETE_NAME,C().add_name(rn(dn->target->token().value)),l);
             } else if(dn->target->type()==NT::SUBSCRIPT){
                 // del obj[key] — emit: LOAD obj, LOAD key, DELETE_SUBSCR
                 auto s=std::static_pointer_cast<nython::node::SubscriptNode>(dn->target);
@@ -1271,6 +1342,49 @@ private:
         case NT::COMPREHENSION: {
             auto cn=std::static_pointer_cast<nython::node::ComprehensionNode>(nd);
             using CK=nython::node::ComprehensionNode;
+            if(cn->kind==CK::GEN && !cn->clauses.empty()){
+                // (elt for t in it if c ...) is lazy (round 75): a generator
+                // function of its own,
+                //     def <genexpr>(.0): for t in .0: if c: yield elt
+                // called with iter(it) - the first iterable is evaluated, and
+                // iter() applied, now, in the enclosing scope (as in Python).
+                push_code("<genexpr>");
+                C().param_names.push_back(".0"); C().add_name(".0");
+                renames_.emplace_back();
+                renames_.back()[".0"]=".0";
+                for(auto& cl:cn->clauses){
+                    std::vector<std::string> names; target_names(cl.target,names);
+                    for(auto& n:names) renames_.back()[n]=n;
+                }
+                std::vector<int> gexits, gtops;
+                for(size_t k=0;k<cn->clauses.size();k++){
+                    auto& cl=cn->clauses[k];
+                    if(k==0) emit(Op::LOAD_NAME,C().add_name(".0"),l);
+                    else visit(cl.iter);
+                    emit(Op::GET_ITER,0,l);
+                    int top=C().here(); gtops.push_back(top);
+                    gexits.push_back(C().here()); emit(Op::FOR_ITER,0,l);
+                    store_target(cl.target,l);
+                    for(auto& c:cl.conds){ visit(c); emit(Op::JUMP_IF_FALSE,top,l); }
+                }
+                visit(cn->elt);
+                emit(Op::YIELD_VALUE,0,l);
+                emit(Op::POP_TOP,0,l);
+                for(int k=(int)cn->clauses.size()-1;k>=0;k--){
+                    emit(Op::JUMP_ABSOLUTE,gtops[k],l);
+                    C().patch(gexits[k],C().here());
+                }
+                emit_lc(VMVal::make_none(),l);
+                emit(Op::RETURN_VALUE,0,l);
+                renames_.pop_back();
+                C().param_defaults.assign(C().param_names.size(), VMVal{VMType::UNDEFINED});
+                pop_code();
+                emit(Op::MAKE_FUNCTION,(int)C().sub_codes.size()-1,l);
+                visit(cn->clauses[0].iter);
+                emit(Op::GET_ITER,0,l);
+                emit(Op::CALL_FUNCTION,1,l);
+                break;
+            }
             int id=comp_id_++;
             std::string acc="__comp"+std::to_string(id)+"__";
             if(cn->kind==CK::DICT) emit(Op::BUILD_MAP,0,l); else emit(Op::BUILD_LIST,0,l);
@@ -1546,7 +1660,15 @@ private:
         // exactly once — silently, with no error.
         loops_.push_back({start,{},{},true});
         int fi=C().here(); emit(Op::FOR_ITER,0,l);
-        auto bind_loop=[&](const std::string& n){ if(nd->rebinds) emit_sn(n,l); else emit_dn(n,l); };
+        // A name declared `global` is the module's (VariableNode::global_ref).
+        auto bind_loop=[&](const std::string& n){
+            bool glob=false;
+            auto gref=[](const np& v){ return v && v->type()==NT::VARIABLE && std::static_pointer_cast<nython::node::VariableNode>(v)->global_ref; };
+            if(nd->var && nd->var->value()==n) glob=gref(nd->var);
+            for(auto& u:nd->unpack_vars) if(!glob && u->value()==n) glob=gref(u);
+            if(glob) emit(Op::STORE_GLOBAL_NAME,C().add_name(n),l);
+            else if(nd->rebinds) emit_sn(n,l); else emit_dn(n,l);
+        };
         if(!nd->unpack_vars.empty()) {
             // for a, b, c in ...: FOR_ITER pushed [a_val, b_val,...]; unpack by index
             std::string tmp="__for_unpack__";
@@ -1630,6 +1752,7 @@ private:
                     case NT::TRUE:    dflt=VMVal::make_bool(true); break;
                     case NT::FALSE:   dflt=VMVal::make_bool(false); break;
                     case NT::NONE:    dflt=VMVal::make_none(); break;
+                    case NT::UNDEFINED: dflt=VMVal::make_undefined(); break;
                     default: break;
                 }
             }
@@ -1826,10 +1949,88 @@ private:
         }
     }
 
+    // ─── optional chaining (OptChainNode) ─────────────────────────────────
+    // recv; if none/undefined -> none, done. The link: an attribute or key
+    // (missing -> none, done), a method call (receiver lacks the member ->
+    // none, done), a slice or a call. Then the rest of the chain, compiled
+    // against the value left on the stack (its hole compiles to nothing:
+    // every postfix step evaluates its receiver first).
+    void visit_opt_chain(std::shared_ptr<nython::node::OptChainNode> oc) {
+        using OC=nython::node::OptChainNode;
+        int l=ln(oc);
+        std::vector<int> ends;
+        visit(oc->recv);
+        ends.push_back(C().emit(Op::JUMP_IF_NONE_KEEP,0,l));
+        switch(oc->kind){
+            case OC::ATTR:
+                emit(Op::LOAD_ATTR_OPT,C().add_name(oc->name),l);
+                ends.push_back(C().emit(Op::JUMP_IF_MISSING_KEEP,0,l));
+                break;
+            case OC::INDEX:
+                visit(oc->index);
+                emit(Op::LOAD_SUBSCR_OPT,0,l);
+                ends.push_back(C().emit(Op::JUMP_IF_MISSING_KEEP,0,l));
+                break;
+            case OC::METHOD:
+                emit(Op::CHECK_MEMBER,C().add_name(oc->name),l);
+                ends.push_back(C().emit(Op::JUMP_IF_MISSING_KEEP,0,l));
+                visit(oc->call);
+                break;
+            default:   // SLICE, CALL
+                visit(oc->call);
+                break;
+        }
+        if(oc->rest) visit(oc->rest);
+        int end=C().here();
+        for(int j:ends) C().patch(j,end);
+    }
+    // t ??= v (the interpreter's evalCoalesceAssign): v is evaluated and
+    // stored only when t is none/undefined or, for an attribute or a key,
+    // missing; the target's object and index are evaluated once.
+    void visit_coalesce_assign(nython::node::AugAssignNode* an, int l) {
+        auto tt=an->target->type();
+        int j, jend;
+        if(tt==NT::ATTRIBUTE){
+            auto a=std::static_pointer_cast<nython::node::AttributeNode>(an->target);
+            int ni=C().add_name(a->attr);
+            visit(a->object);                                   // obj
+            emit(Op::DUP_TOP,0,l);                              // obj obj
+            emit(Op::LOAD_ATTR_OPT,ni,l);                       // obj cur
+            j=C().emit(Op::JUMP_IF_NOT_NONE_OR_POP,0,l);        // obj
+            visit(an->value_node);                              // obj val
+            emit(Op::ROT_TWO,0,l);                              // val obj
+            emit(Op::STORE_ATTR,ni,l);
+            jend=C().emit(Op::JUMP_FORWARD,0,l);
+            C().patch(j,C().here());                            // obj cur
+            emit(Op::POP_TOP,0,l); emit(Op::POP_TOP,0,l);
+        } else if(tt==NT::SUBSCRIPT){
+            auto sb=std::static_pointer_cast<nython::node::SubscriptNode>(an->target);
+            visit(sb->object); visit(sb->index);                // obj idx
+            emit(Op::DUP_TOP_TWO,0,l);                          // obj idx obj idx
+            emit(Op::LOAD_SUBSCR_OPT,0,l);                      // obj idx cur
+            j=C().emit(Op::JUMP_IF_NOT_NONE_OR_POP,0,l);        // obj idx
+            visit(an->value_node);                              // obj idx val
+            emit(Op::ROT_THREE,0,l);                            // val obj idx
+            emit(Op::STORE_SUBSCR,0,l);
+            jend=C().emit(Op::JUMP_FORWARD,0,l);
+            C().patch(j,C().here());                            // obj idx cur
+            emit(Op::POP_TOP,0,l); emit(Op::POP_TOP,0,l); emit(Op::POP_TOP,0,l);
+        } else {
+            load_target(an->target,l);                          // cur
+            j=C().emit(Op::JUMP_IF_NOT_NONE_OR_POP,0,l);
+            visit(an->value_node);
+            store(an->target,l);
+            jend=C().emit(Op::JUMP_FORWARD,0,l);
+            C().patch(j,C().here());                            // cur
+            emit(Op::POP_TOP,0,l);
+        }
+        C().patch(jend,C().here());
+    }
+
     // ─── load target value (for augmented assignment) ──────────────────────────
     void load_target(np tgt, int l) {
         if(tgt->type()==NT::VARIABLE) {
-            emit_ln(tgt->token().value,l);
+            visit(tgt);
         } else if(tgt->type()==NT::ATTRIBUTE) {
             auto a=std::static_pointer_cast<nython::node::AttributeNode>(tgt);
             visit(a->object); emit(Op::LOAD_ATTR,C().add_name(a->attr),l);
@@ -1842,7 +2043,9 @@ private:
     // ─── store target ───────────────────────────────────────────────────
     void store(np tgt, int l) {
         if(tgt->type()==NT::VARIABLE) {
-            emit_sn(tgt->token().value,l);
+            if(std::static_pointer_cast<nython::node::VariableNode>(tgt)->global_ref)
+                emit(Op::STORE_GLOBAL_NAME,C().add_name(tgt->token().value),l);
+            else emit_sn(tgt->token().value,l);
         } else if(tgt->type()==NT::ATTRIBUTE) {
             auto a=std::static_pointer_cast<nython::node::AttributeNode>(tgt);
             visit(a->object); emit(Op::STORE_ATTR,C().add_name(a->attr),l);
@@ -1915,7 +2118,8 @@ private:
 // CALLFRAME
 // ═══════════════════════════════════════════════════════════════════════════
 
-struct GenState {
+class VirtualMachine;
+struct GenState : std::enable_shared_from_this<GenState> {
     std::shared_ptr<VMCode> code;
     size_t ip=0;
     VMMap locals;
@@ -1925,7 +2129,7 @@ struct GenState {
     std::vector<VMVal> saved_stack; // intermediate stack at yield point
     size_t stack_base=0;           // stack level when generator was entered
     // Set by YIELD_VALUE / YIELD_FROM_OP just before run_loop returns the
-    // yielded value, read (and cleared) by gen_next: a yield and a return
+    // yielded value, read (and cleared) by gen_resume: a yield and a return
     // both leave run_loop by an ordinary return now, not a C++ exception.
     bool yielded=false;
     // Suspended at a `yield` expression: resuming pushes the value sent in
@@ -1934,8 +2138,31 @@ struct GenState {
     // the loop's iterator - and the generator stopped.
     bool at_yield=false;
     bool started=false;
+    // ── Round 75: the whole protocol (VirtualMachine::gen_resume) ──────────
+    bool running=false;          // resumed and not yet paused or finished
+    bool in_yield_from=false;    // paused in YIELD_FROM_OP (its iterator on saved_stack)
+    bool is_genexpr=false;       // a generator expression: not bound to a thread
+    uint64_t owner=0;            // nycoro::thread_token() of the thread that started it
+    uint64_t serial=0;           // order started in (closed oldest first at exit)
+    int mode=0;                  // this resume: 0 next/send, 1 throw, 2 close
+    VMVal sent;                  // send()'s value, for a paused `yield from`
+    VMVal pending;               // what throw() raises at a paused `yield from`
+    VMVal retval;                // `return v`: StopIteration.value
+    std::string name;            // the function's name, "<genexpr>", "zip", ...
+    // A lazy builtin (zip, map, filter, enumerate, islice) runs this instead
+    // of code: the next value, or false once exhausted.
+    std::function<bool(VMVal&)> native;
+    VirtualMachine* vm=nullptr;  // the VM that runs it (its registry of live generators)
+    GenState() = default;
+    GenState(const GenState&) = delete;
+    GenState& operator=(const GenState&) = delete;
+    ~GenState();                 // after VirtualMachine: a paused one is closed
 };
-
+inline std::string vm_gen_repr(const GenState* g) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "0x%llx", (unsigned long long)(uintptr_t)g);
+    return "<generator object " + (g ? g->name : std::string("?")) + " at " + buf + ">";
+}
 
 inline VMVal make_generator_val(std::shared_ptr<VMCode> code,
                             std::vector<VMVal> args,
@@ -1945,6 +2172,8 @@ inline VMVal make_generator_val(std::shared_ptr<VMCode> code,
     g.gen=std::make_shared<GenState>();
     vmgc::track_gen(g.gen);
     g.gen->code=code; g.gen->ip=0; g.gen->self_val=self; g.gen->closure=closure;
+    g.gen->name=code->name;
+    g.gen->is_genexpr=code->name=="<genexpr>";
     int n=(int)code->param_names.size();
     int arg_idx=0;
     for(int i=0;i<n;i++){
@@ -1961,7 +2190,7 @@ inline VMVal make_generator_val(std::shared_ptr<VMCode> code,
         } else if(arg_idx<(int)args.size()){
             g.gen->locals[pn]=args[arg_idx++];
         } else if(!code->param_defaults.empty()&&i<(int)code->param_defaults.size()
-                  &&code->param_defaults[i].type!=VMType::UNDEFINED){
+                  &&!code->param_defaults[i].is_missing()){
             g.gen->locals[pn]=code->param_defaults[i];
         }
     }
@@ -2048,6 +2277,17 @@ class VirtualMachine : public Runnable {
     using gc_ptr = std::shared_ptr<GarbageCollector>;
 
     gc_ptr                                             gc_;
+    // ── Generators (round 75) ───────────────────────────────────────────────
+    // Declared before the stacks and globals, so they outlive every value a
+    // destructor can reach them from. gen_live_: started, unfinished code
+    // generators by start order (closed oldest first at the end of the
+    // program); gen_zombies_: paused ones whose last reference went away
+    // inside a try/with, closed between two instructions (gen_dropped).
+    std::map<uint64_t, GenState*>                      gen_live_;
+    std::vector<std::shared_ptr<GenState>>             gen_zombies_;
+    uint64_t                                           gen_serial_ = 0;
+    bool                                               gen_zombie_flag_ = false;
+    bool                                               gen_finalize_ = false;   // a program is running
     std::vector<VMVal>                                 stack_;
     // deque, not vector: run_loop() holds `CallFrame& fr = call_stack_.back()`
     // for the duration of an instruction, and several opcodes (CALL_KW, and any
@@ -2144,7 +2384,7 @@ private:
             const auto& f=call_stack_[i];
             if(f.locals.count(n) || (f.closure_env && f.closure_env->count(n))) return true;
         }
-        if(in_other_thread() && module_frame_ && module_frame_->get_local(n).type!=VMType::UNDEFINED) return true;
+        if(in_other_thread() && module_frame_ && !module_frame_->get_local(n).is_missing()) return true;
         if(globals_.count(n)) return true;
         return bridge_exists() && bridge_exists()(n);
     }
@@ -2152,11 +2392,11 @@ private:
         for(int i=(int)call_stack_.size()-1;i>=0;i--){
             if(!frame_visible(i)) continue;
             auto v=call_stack_[i].get_local(n);
-            if(v.type!=VMType::UNDEFINED) return v;
+            if(!v.is_missing()) return v;
         }
         if(in_other_thread()){                                   // round 74
             auto mv=module_frame_->get_local(n);
-            if(mv.type!=VMType::UNDEFINED) return mv;
+            if(!mv.is_missing()) return mv;
         }
         auto it=globals_.find(n);
         if(it!=globals_.end()){
@@ -2179,6 +2419,28 @@ private:
             return nv;
         }
         return VMVal::make_none();
+    }
+    // del x: the nearest binding of x goes (the scopes store_var looks in).
+    bool delete_var(const std::string& n) {
+        for(int i=(int)call_stack_.size()-1;i>=0;i--){
+            if(!frame_visible(i)) continue;
+            auto& f=call_stack_[i];
+            bool hit=f.locals.erase(n)>0;
+            if(f.closure_env && f.closure_env->erase(n)>0) hit=true;
+            if(hit) return true;
+        }
+        if(in_other_thread() && module_frame_ && module_frame_->locals.erase(n)>0) return true;
+        return globals_.erase(n)>0;
+    }
+    // A `global` name: the main module's frame, then globals (an imported
+    // module's names and builtins), then an interpreter builtin.
+    bool load_global(const std::string& n, VMVal& out) {
+        CallFrame* mf=in_other_thread()?module_frame_:(call_stack_.empty()?nullptr:&call_stack_.front());
+        if(mf){ out=mf->get_local(n); if(!out.is_missing()) return true; }
+        auto it=globals_.find(n);
+        if(it!=globals_.end()){ out=it->second; return true; }
+        if(bridge_exists() && bridge_exists()(n)){ out=load_var(n); return true; }
+        return false;
     }
     void store_var(const std::string& n, VMVal v) {
         // An existing binding in a lexically visible scope is rebound
@@ -2235,11 +2497,11 @@ public:
     explicit VirtualMachine(Reporter* r=nullptr)
         : Runnable(r, RunnableType::COMPILER)
         , gc_(std::make_shared<GarbageCollector>(GarbageCollectorConfig{},this))
-    { register_all_builtins(); }
+    { vm_live(this, 1); register_all_builtins(); }
     explicit VirtualMachine(Runnable* r)
         : Runnable((Reporter*)r, RunnableType::COMPILER)
         , gc_(std::make_shared<GarbageCollector>(GarbageCollectorConfig{},this))
-    { register_all_builtins(); }
+    { vm_live(this, 1); register_all_builtins(); }
 
     // 171 general-purpose builtins (map, filter, reduce, any, all, next, set,
     // tuple, getattr, exp, log, sin, read_file, mkdir, ...) were only ever
@@ -2255,6 +2517,7 @@ public:
         register_pycore();        // after register_builtins: these replace its copies
         tag_type_builtins();      // again: register_pycore replaced the tagged ones
         wrap_iterable_natives();  // after the tensor and pycore natives, so it wraps those
+        register_generator_natives();   // islice, take (round 75)
         VMConc::install(*this);   // last: its GIL-aware sleep natives win
         register_gc_natives();
     }
@@ -2277,6 +2540,23 @@ public:
             std::string nm=w.name;
             size_t from=w.from; bool all=w.all;
             it->second.native=[this,orig,nm,from,all](std::vector<VMVal>& a)->VMVal{
+                // Given a generator or iterator: any/all pull values until
+                // they know the answer; zip/map/filter/enumerate return lazy
+                // iterators (round 75, both engines).
+                if((nm=="any"||nm=="all") && a.size()==1 && vm_lazy_arg(a[0])){
+                    VMVal itv=a[0], v;
+                    bool want_any = nm=="any";
+                    while(vm_iter_step(itv,v)){
+                        bool t=vm_truthy(v);
+                        if(want_any&&t) return VMVal::make_bool(true);
+                        if(!want_any&&!t) return VMVal::make_bool(false);
+                    }
+                    return VMVal::make_bool(!want_any);
+                }
+                if(nm=="zip"||nm=="map"||nm=="filter"||nm=="enumerate"){
+                    VMVal lazy;
+                    if(gen_lazy_builtin(nm,a,lazy)) return lazy;
+                }
                 size_t end = all ? a.size() : std::min(a.size(), from+1);
                 for(size_t i=from;i<end;i++){
                     VMVal& x=a[i];
@@ -2330,7 +2610,6 @@ public:
         }
     }
 
-    ~VirtualMachine() override { gc_teardown(); }
 
     // ── Memory (round 75, VMGC.hpp) ──────────────────────────────────────
     bool vm_finalizers_off_ = false;
@@ -2442,6 +2721,21 @@ public:
         globals_["mem_peak_rss_kb"] = VMVal::make_native([I](std::vector<VMVal>&) -> VMVal { return I(nygc::peak_rss_kb()); });
     }
 
+    // Teardown frees the program's values first (gc_teardown), while the
+    // generator registry they report to still exists.
+    ~VirtualMachine() override { gc_teardown(); vm_live(this, -1); }
+    // The VMs alive now: a generator can be destroyed after its VM (a value
+    // kept in a static table), and ~GenState must not call into a dead one.
+    // op: 1 add, -1 remove, 0 query.
+    static bool vm_live(VirtualMachine* vm, int op) {
+        static std::mutex* mu = new std::mutex();
+        static auto* live = new std::unordered_set<VirtualMachine*>();
+        std::lock_guard<std::mutex> lk(*mu);
+        if(op>0){ live->insert(vm); return true; }
+        if(op<0){ live->erase(vm); return false; }
+        return live->count(vm)>0;
+    }
+
     // Compile + run an AST
     VMResult run(nython::node::node_ptr ast) {
         try {
@@ -2453,16 +2747,21 @@ public:
             size_t base=stack_.size();
             CallFrame fr; fr.code=code; fr.ip=0;
             call_stack_.push_back(std::move(fr));
+            gen_finalize_=true;
             struct PopModule {
                 VirtualMachine* vm; size_t base;
                 ~PopModule(){
                     nyconc::join_nondaemon_at_exit();
+                    vm->gen_finalize_=false;
                     vm->module_frame_=nullptr;
                     vm->call_stack_.pop_back();
                     if(vm->stack_.size()>base) vm->stack_.resize(base);
                 }
             } pop_module{this, base};
             try { run_loop(); } catch(VMReturn&) {}
+            // Generators the program left paused: closed now, so their
+            // finally blocks run (the interpreter does the same).
+            gen_close_all();
             return VMResult::SUCCESS;
         } catch(std::exception& e) {
             std::cerr<<"\x1b[31m[VMError] "<<e.what()<<"\x1b[0m\n";
@@ -2657,10 +2956,19 @@ private:
         return chars;
     }
 
+    // Deep recursion raises RecursionError (it crashed the process with
+    // SIGSEGV at ~1400 frames): at most kMaxFrames frames, and never past the
+    // stack's own floor (smaller thread stacks, instrumented builds).
+    static const size_t kMaxFrames = 1000;
+    void check_depth() {
+        if(call_stack_.size() >= kMaxFrames || nycoro::native_stack_exhausted())
+            throw_exception(make_exception("RecursionError",{VMVal::make_str("maximum recursion depth exceeded")}));
+    }
     VMVal exec_code_bound(std::shared_ptr<VMCode> code,
                           VMMap locs,
                           std::optional<VMVal> self,
                           std::shared_ptr<VMMap> closure=nullptr) {
+        check_depth();
         CallFrame fr; fr.code=code; fr.ip=0;
         if(self) fr.self_val=self;
         fr.closure_env=closure;
@@ -2707,7 +3015,7 @@ private:
                 star_seen=true; has_varargs=true; continue;
             }
             bool have=false;
-            bool has_default = pi<dflts.size()&&dflts[pi].type!=VMType::UNDEFINED;
+            bool has_default = pi<dflts.size()&&!dflts[pi].is_missing();
             if(!star_seen){ max_pos++; if(!has_default) min_pos++; }
             if(!star_seen && ai<pos.size()){ locs[pn]=pos[ai++]; have=true; }
             if(kw && kw->map){
@@ -2745,6 +3053,7 @@ private:
                     std::shared_ptr<VMMap> closure=nullptr,
                     const std::vector<VMVal>* defaults=nullptr,
                     const VMVal* kwargs=nullptr) {
+        check_depth();
         size_t _stack_base=stack_.size();
         CallFrame fr; fr.code=code; fr.ip=0;
         fr.stack_base=_stack_base;
@@ -2783,51 +3092,412 @@ private:
     // none to the missing ones and dropped the extra ones).
     bool strict_args_ = true;
 
-    // ── Main dispatch loop ───────────────────────────────────────────────
-    // Resume a generator; returns {value, done} as VMVal (NONE if done)
-    VMVal gen_next(VMVal& gv, VMVal sent=VMVal::make_none()) {
-        if(gv.type!=VMType::GENERATOR||!gv.gen||gv.gen->done) return VMVal::make_none();
-        auto& gs=*gv.gen;
-        // Restore saved stack (iterators held across yields)
-        gs.stack_base = stack_.size();
-        for(auto& sv : gs.saved_stack) stack_.push_back(sv);
+    // ── Generators (round 75) ───────────────────────────────────────────
+    // Resumes a generator: true when it yields (the value in `out`), false
+    // when it finishes (its return value in gs.retval, for StopIteration).
+    // mode 0: next/send (`sent` is what the paused yield evaluates to),
+    // 1: throw (`sent` is the exception, raised at the pause), 2: close
+    // (GeneratorExit at the pause). What the body raises propagates; a
+    // StopIteration becomes RuntimeError (PEP 479). `internal`: closing on
+    // the program's behalf (finalization), whatever thread started it.
+    bool gen_resume(GenState& gs, int mode, const VMVal& sent, VMVal& out, bool internal=false) {
+        if(gs.done){ if(mode==1) throw_exception(sent); return false; }
+        if(gs.running) throw_exception(make_exception("ValueError",{VMVal::make_str("generator already executing")}));
+        if(gs.native){
+            gs.started=true;
+            if(mode!=0){ gen_finish(gs); if(mode==1) throw_exception(sent); return false; }
+            gs.running=true;
+            bool got=false;
+            try { got=gs.native(out); }
+            catch(...){ gs.running=false; gen_finish(gs); throw; }
+            gs.running=false;
+            if(!got) gen_finish(gs);
+            return got;
+        }
+        if(!gs.started && mode!=0){ gen_finish(gs); if(mode==1) throw_exception(sent); return false; }
+        check_depth();
+        uint64_t me=nycoro::thread_token();
+        if(gs.started && !gs.is_genexpr && !internal && gs.owner && gs.owner!=me)
+            throw_exception(make_exception("RuntimeError",{VMVal::make_str("generator '"+gs.name+"' was started on another "
+                "thread; a started generator can only be resumed by the thread that started it")}));
+        if(!gs.started){
+            gs.started=true; gs.owner=me; gs.vm=this;
+            gs.serial=++gen_serial_;
+            gen_live_[gs.serial]=&gs;
+        }
+        // Its operand stack (iterators of loops around the yield) and locals.
+        gs.stack_base=stack_.size();
+        for(auto& sv : gs.saved_stack) stack_.push_back(std::move(sv));
         gs.saved_stack.clear();
-        gs.started=true;
-        if(gs.at_yield){ gs.at_yield=false; push(std::move(sent)); }
-        CallFrame fr; fr.code=gs.code; fr.ip=gs.ip;
+        CallFrame fr; fr.code=gs.code; fr.ip=(int)gs.ip;
         fr.stack_base=gs.stack_base;
-        fr.locals=gs.locals;
+        fr.locals=std::move(gs.locals);
         fr.self_val=gs.self_val;
         fr.closure_env=gs.closure;
-        fr.gen_state=gv.gen;
+        fr.gen_state=gs.shared_from_this();
         call_stack_.push_back(std::move(fr));
-        VMVal result=VMVal::make_none();
+        gs.mode=mode; gs.running=true; gs.yielded=false;
+        bool at_yield=gs.at_yield;
+        gs.at_yield=false;
+        VMVal r;
         try {
-            gs.yielded=false;
-            VMVal out=run_loop();
-            if(gs.yielded){
-                gs.yielded=false;
-                result=out;          // stack state was saved by the yield
-            } else {
-                // Returned (or ran off the end) without yielding: done. A
-                // `return v` still hands v back, as the VMReturn path did.
-                gs.done=true; result=out;
-                if(stack_.size() > gs.stack_base) stack_.resize(gs.stack_base);
+            if(gs.in_yield_from){
+                // YIELD_FROM_OP runs again and passes this on to its iterator.
+                gs.sent = mode==0 ? sent : VMVal::make_none();
+                gs.pending = mode==1 ? sent : VMVal::make_none();
+            } else if(at_yield){
+                if(mode==0) push(sent);
+                else {
+                    // Raised at the paused yield: the generator's own
+                    // except/finally/with see it first.
+                    VMVal ev = mode==1 ? sent : make_exception("GeneratorExit",{});
+                    if(!dispatch_exception(call_stack_.back(), ev)) throw VMException(ev, describe_exception(ev));
+                }
             }
-        } catch(VMYield& y) {
-            result=y.value;
-            // Stack state was already saved in YIELD_VALUE handler
-        } catch(VMReturn& r) {
-            gs.done=true; result=r.value;
-            if(stack_.size() > gs.stack_base) stack_.resize(gs.stack_base);
-        } catch(...) {
-            if(!call_stack_.empty()) call_stack_.pop_back();
-            gs.done=true;
-            if(stack_.size() > gs.stack_base) stack_.resize(gs.stack_base);
+            r=run_loop();
+        } catch(VMReturn& rv){
+            r=rv.value;
+        } catch(VMException& e){
+            gen_unwind(gs);
+            if(is_stop_iteration(e.value))
+                throw_exception(make_exception("RuntimeError",{VMVal::make_str("generator raised StopIteration")}));
+            throw;
+        } catch(...){
+            gen_unwind(gs);
             throw;
         }
+        gs.running=false;
+        if(gs.yielded){
+            gs.yielded=false;
+            call_stack_.pop_back();          // the yield saved its stack and locals
+            out=std::move(r);
+            return true;
+        }
+        if(stack_.size()>gs.stack_base) stack_.resize(gs.stack_base);
+        call_stack_.pop_back();
+        gs.retval=std::move(r);
+        gen_finish(gs);
+        return false;
+    }
+    // An exception is leaving the generator's frame.
+    void gen_unwind(GenState& gs) {
         if(!call_stack_.empty()) call_stack_.pop_back();
-        return result;
+        if(stack_.size()>gs.stack_base) stack_.resize(gs.stack_base);
+        gen_finish(gs);
+    }
+    void gen_finish(GenState& gs) {
+        gs.done=true; gs.running=false; gs.at_yield=false; gs.in_yield_from=false;
+        gs.locals.clear(); gs.saved_stack.clear(); gs.native=nullptr;
+        gs.sent=VMVal::make_none(); gs.pending=VMVal::make_none();
+        if(gs.serial){ gen_live_.erase(gs.serial); gs.serial=0; }
+    }
+    // The value of the next yield, or none once it is exhausted (gv.gen->done).
+    VMVal gen_next(VMVal& gv, VMVal sent=VMVal::make_none()) {
+        if(gv.type!=VMType::GENERATOR||!gv.gen||gv.gen->done) return VMVal::make_none();
+        GenState& gs=*gv.gen;
+        VMVal out;
+        if(gen_resume(gs, 0, sent, out)) return out;
+        return VMVal::make_none();
+    }
+    // StopIteration carrying the return value (then forgotten: a second
+    // next() raises a plain StopIteration, as in Python).
+    [[noreturn]] void gen_raise_stop(GenState& gs) {
+        VMVal rv=gs.retval;
+        gs.retval=VMVal::make_none();
+        std::vector<VMVal> a;
+        if(rv.type!=VMType::NONE) a.push_back(rv);
+        throw_exception(make_exception("StopIteration",a));
+    }
+    // g.close(): GeneratorExit at the pause; an error if it yields again.
+    void gen_close(GenState& gs, bool internal=false) {
+        if(gs.done) return;
+        if(gs.running) throw_exception(make_exception("ValueError",{VMVal::make_str("generator already executing")}));
+        if(!gs.started || gs.native){ gen_finish(gs); return; }
+        VMVal out;
+        bool yielded=false;
+        try { yielded=gen_resume(gs, 2, VMVal::make_none(), out, internal); }
+        catch(VMException& e){
+            if(class_derives(e.value.class_name,"GeneratorExit")||is_stop_iteration(e.value)) return;
+            throw;
+        }
+        if(yielded) throw_exception(make_exception("RuntimeError",{VMVal::make_str("generator ignored GeneratorExit")}));
+    }
+    // What g.throw(...) raises: a class is instantiated (with the extra
+    // arguments), an instance or string as it is.
+    VMVal gen_throw_value(std::vector<VMVal>& args) {
+        if(args.empty()) throw_exception(make_exception("TypeError",{VMVal::make_str("throw expected at least 1 argument, got 0")}));
+        VMVal ev=args[0];
+        if(ev.type==VMType::CLASS){
+            std::vector<VMVal> cargs(args.begin()+1, args.end());
+            ev=instantiate(ev, cargs);
+        } else if(ev.type==VMType::NATIVE && ev.class_name.rfind("__builtin__:",0)==0
+                  && nython::ny_is_builtin_exc(ev.class_name.substr(12))){
+            std::vector<VMVal> cargs(args.begin()+1, args.end());
+            ev=make_exception(ev.class_name.substr(12), cargs);
+        }
+        return normalize_exception(ev);
+    }
+    // Whether a try/except/finally/with covers the point where a generator
+    // is paused - only then can closing it run code of the program.
+    bool gen_pause_covered(const GenState& gs) const {
+        if(!gs.code) return false;
+        int pause = gs.in_yield_from ? (int)gs.ip : (int)gs.ip-1;
+        for(auto& e : gs.code->exc_table){
+            bool in_body = pause>=e.try_start && pause<e.try_end;
+            bool in_rest = e.finally_start>=0 && pause>=e.try_end && pause<e.finally_start;
+            if(in_body||in_rest) return true;
+        }
+        return false;
+    }
+public:
+    // The last reference to a generator is gone (~GenState). Paused inside a
+    // try/with while a program runs: its state moves to a zombie that is
+    // closed between two instructions (never here, in the middle of whatever
+    // dropped it), so its finally blocks and __exit__ run - as CPython's
+    // reference counting finalizes a generator.
+    void gen_dropped(GenState& gs) {
+        if(gs.serial){ gen_live_.erase(gs.serial); gs.serial=0; }
+        if(!gen_finalize_ || gs.done || !gs.started || gs.native || !gs.code) return;
+        if(!gs.at_yield && !gs.in_yield_from) return;
+        if(!gen_pause_covered(gs)) return;
+        auto z=std::make_shared<GenState>();
+        z->code=std::move(gs.code); z->ip=gs.ip; z->locals=std::move(gs.locals);
+        z->self_val=std::move(gs.self_val); z->closure=std::move(gs.closure);
+        z->saved_stack=std::move(gs.saved_stack);
+        z->at_yield=gs.at_yield; z->in_yield_from=gs.in_yield_from;
+        z->started=true; z->owner=gs.owner; z->is_genexpr=gs.is_genexpr;
+        z->name=std::move(gs.name); z->vm=this;
+        gen_zombies_.push_back(std::move(z));
+        gen_zombie_flag_=true;
+    }
+private:
+    void gen_report_ignored(GenState& gs, const VMVal& ev) {
+        std::cerr<<"Exception ignored in: "<<vm_gen_repr(&gs)<<"\n"<<describe_exception(ev)<<"\n";
+    }
+    // Closes a generator nobody refers to; reports instead of raising.
+    void gen_finalize(const std::shared_ptr<GenState>& sp) {
+        GenState& gs=*sp;
+        try { gen_close(gs, true); }
+        catch(VMException& e){ gen_report_ignored(gs, e.value); }
+        catch(std::exception& e){ std::cerr<<"Exception ignored in: "<<vm_gen_repr(&gs)<<"\n"<<e.what()<<"\n"; }
+        if(!gs.done) gen_finish(gs);
+    }
+    void run_gen_zombies() {
+        gen_zombie_flag_=false;
+        std::vector<std::shared_ptr<GenState>> zs;
+        zs.swap(gen_zombies_);
+        for(auto& z : zs) gen_finalize(z);
+        if(!gen_zombies_.empty()) gen_zombie_flag_=true;
+    }
+public:
+    // End of the program: every generator this thread left paused is closed,
+    // oldest first, so its finally blocks run (as when CPython shuts down).
+    void gen_close_all() {
+        if(gen_zombie_flag_) run_gen_zombies();
+        uint64_t me=nycoro::thread_token();
+        for(int guard=0; guard<10000000; guard++){
+            GenState* victim=nullptr;
+            for(auto& kv : gen_live_){
+                GenState* g=kv.second;
+                if(!g->done && !g->running && (g->at_yield||g->in_yield_from) && (g->owner==me||g->is_genexpr)){ victim=g; break; }
+            }
+            if(!victim) break;
+            std::shared_ptr<GenState> sp;
+            try { sp=victim->shared_from_this(); } catch(...) {}
+            if(!sp){ gen_live_.erase(victim->serial); victim->serial=0; continue; }
+            gen_finalize(sp);
+            if(gen_zombie_flag_) run_gen_zombies();
+        }
+        gen_finalize_=false;
+    }
+private:
+    // ── Lazy iteration helpers (zip/map/filter/enumerate/islice/any/all) ──
+    // An iterator for anything iterable: generators and iterators as they
+    // are, objects through __iter__ / __next__, everything else a snapshot.
+    VMVal vm_iter_open(const VMVal& v) {
+        switch(v.type){
+            case VMType::GENERATOR: case VMType::ITERATOR: return v;
+            case VMType::LIST: { std::vector<VMVal> c; if(v.list) c=*v.list; return VMVal::make_iter(std::move(c)); }
+            case VMType::STRING: case VMType::MAP: case VMType::INT: return VMVal::make_iter(iter_items(v));
+            case VMType::INSTANCE: {
+                bool f=false;
+                VMVal r=call_dunder_f(v,"__iter__",{},f);
+                if(f){
+                    if(r.type==VMType::INSTANCE){
+                        VMVal m;
+                        if(!class_lookup(r.class_name,"__next__",m))
+                            throw_exception(make_exception("TypeError",{VMVal::make_str("iter() returned non-iterator of type '"+r.class_name+"'")}));
+                        return r;
+                    }
+                    return vm_iter_open(r);
+                }
+                VMVal m;
+                if(class_lookup(v.class_name,"__next__",m)) return v;
+                return VMVal::make_iter(iter_items(v));   // __getitem__, or TypeError
+            }
+            default: break;
+        }
+        throw_exception(make_exception("TypeError",{VMVal::make_str("'"+vm_type_name(v)+"' object is not iterable")}));
+    }
+    bool vm_iter_step(VMVal& it, VMVal& out) {
+        if(it.type==VMType::GENERATOR){
+            if(!it.gen) return false;
+            GenState& gs=*it.gen;
+            return gen_resume(gs, 0, VMVal::make_none(), out);
+        }
+        if(it.type==VMType::ITERATOR){
+            if(!it.iter) return false;
+            auto& [cur,items]=*it.iter;
+            if(cur>=(int)items.size()) return false;
+            out=items[cur++];
+            return true;
+        }
+        if(it.type==VMType::INSTANCE){
+            try { out=call_dunder(it,"__next__",{}); return true; }
+            catch(VMException& e){ if(is_stop_iteration(e.value)) return false; throw; }
+        }
+        return false;
+    }
+    VMVal gen_native(const std::string& name, std::function<bool(VMVal&)> fn) {
+        VMVal g; g.type=VMType::GENERATOR;
+        g.gen=std::make_shared<GenState>();
+        g.gen->name=name; g.gen->native=std::move(fn); g.gen->vm=this;
+        return g;
+    }
+    static bool vm_lazy_arg(const VMVal& v) { return v.type==VMType::GENERATOR||v.type==VMType::ITERATOR; }
+    // zip/map/filter/enumerate given a generator or iterator: lazy, like
+    // the interpreter's (src/NyGen.cpp). Over lists they still return lists.
+    bool gen_lazy_builtin(const std::string& nm, std::vector<VMVal>& a, VMVal& out) {
+        VMVal kw=take_kwargs(a);
+        size_t first = (nm=="map"||nm=="filter") ? 1 : 0;
+        size_t last = nm=="enumerate" ? std::min<size_t>(1,a.size()) : a.size();
+        bool lazy=false;
+        for(size_t i=first;i<last;i++) if(vm_lazy_arg(a[i])) lazy=true;
+        if(!lazy){ if(kw.type==VMType::MAP) a.push_back(kw); return false; }
+        if(nm=="zip"){
+            auto its=std::make_shared<std::vector<VMVal>>();
+            for(auto& x : a) its->push_back(vm_iter_open(x));
+            out=gen_native("zip",[this,its](VMVal& o)->bool{
+                if(its->empty()) return false;
+                std::vector<VMVal> row;
+                for(auto& it : *its){ VMVal v; if(!vm_iter_step(it,v)) return false; row.push_back(std::move(v)); }
+                o=VMVal::make_tuple(std::move(row));
+                return true;
+            });
+            return true;
+        }
+        if(nm=="map"){
+            if(a.size()<2) throw_exception(make_exception("TypeError",{VMVal::make_str("map() must have at least two arguments.")}));
+            VMVal fn=a[0];
+            auto its=std::make_shared<std::vector<VMVal>>();
+            for(size_t i=1;i<a.size();i++) its->push_back(vm_iter_open(a[i]));
+            out=gen_native("map",[this,its,fn](VMVal& o)->bool{
+                std::vector<VMVal> args;
+                for(auto& it : *its){ VMVal v; if(!vm_iter_step(it,v)) return false; args.push_back(std::move(v)); }
+                o=vm_call(fn,args,std::nullopt);
+                return true;
+            });
+            return true;
+        }
+        if(nm=="filter"){
+            if(a.size()!=2) throw_exception(make_exception("TypeError",{VMVal::make_str("filter expected 2 arguments, got "+std::to_string(a.size()))}));
+            VMVal fn=a[0];
+            auto it=std::make_shared<VMVal>(vm_iter_open(a[1]));
+            out=gen_native("filter",[this,it,fn](VMVal& o)->bool{
+                for(;;){
+                    VMVal v;
+                    if(!vm_iter_step(*it,v)) return false;
+                    bool keep;
+                    if(fn.type==VMType::NONE) keep=vm_truthy(v);
+                    else { std::vector<VMVal> args{v}; keep=vm_truthy(vm_call(fn,args,std::nullopt)); }
+                    if(keep){ o=std::move(v); return true; }
+                }
+            });
+            return true;
+        }
+        // enumerate(it, start=0)
+        VMVal start=VMVal::make_int(0);
+        if(a.size()>=2) start=a[1];
+        else if(kw.type==VMType::MAP&&kw.map&&kw.map->count("start")) start=(*kw.map)["start"];
+        auto it=std::make_shared<VMVal>(vm_iter_open(a[0]));
+        auto idx=std::make_shared<VMVal>(start);
+        out=gen_native("enumerate",[this,it,idx](VMVal& o)->bool{
+            VMVal v;
+            if(!vm_iter_step(*it,v)) return false;
+            o=VMVal::make_tuple({*idx, std::move(v)});
+            *idx=binop(nypy::A_ADD,*idx,VMVal::make_int(1));
+            return true;
+        });
+        return true;
+    }
+    // islice / take, the same on both engines.
+    void register_generator_natives() {
+        globals_["islice"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.size()<2||a.size()>4)
+                throw_exception(make_exception("TypeError",{VMVal::make_str("islice expected 2 to 4 arguments, got "+std::to_string(a.size()))}));
+            auto ival=[&](const VMVal& v, const char* msg)->int64_t{
+                if(v.type==VMType::NONE) return -1;
+                if(v.type!=VMType::INT||!v.s.empty()||v.i<0) throw_exception(make_exception("ValueError",{VMVal::make_str(msg)}));
+                return v.i;
+            };
+            const char* m_stop="Stop argument for islice() must be None or an integer: 0 <= x <= sys.maxsize.";
+            const char* m_idx="Indices for islice() must be None or an integer: 0 <= x <= sys.maxsize.";
+            int64_t start=0, stop=-1, step=1;
+            if(a.size()==2) stop=ival(a[1],m_stop);
+            else {
+                start=ival(a[1],m_idx); if(start<0) start=0;
+                stop=ival(a[2],m_idx);
+                if(a.size()==4 && a[3].type!=VMType::NONE){
+                    if(a[3].type!=VMType::INT||!a[3].s.empty()||a[3].i<=0)
+                        throw_exception(make_exception("ValueError",{VMVal::make_str("Step for islice() must be a positive integer or None.")}));
+                    step=a[3].i;
+                }
+            }
+            auto it=std::make_shared<VMVal>(vm_iter_open(a[0]));
+            // CPython's islice_next: skip to the next wanted index, never
+            // read past `stop`.
+            struct St { int64_t cnt=0, next=0, stop=-1, step=1; };
+            auto st=std::make_shared<St>();
+            st->next=start; st->stop=stop; st->step=step;
+            return gen_native("islice",[this,it,st](VMVal& o)->bool{
+                VMVal v;
+                while(st->cnt<st->next){ if(!vm_iter_step(*it,v)) return false; st->cnt++; }
+                if(st->stop!=-1 && st->cnt>=st->stop) return false;
+                if(!vm_iter_step(*it,v)) return false;
+                st->cnt++;
+                int64_t old=st->next;
+                st->next+=st->step;
+                if(st->next<old || (st->stop!=-1 && st->next>st->stop)) st->next=st->stop;
+                o=std::move(v);
+                return true;
+            });
+        });
+        // The right side of an unpacking assignment (see VarDeclNode::unpack).
+        globals_["__unpack_seq__"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.empty()) return VMVal::make_none();
+            if(!vm_lazy_arg(a[0])) return a[0];
+            int64_t n = a.size()>=2 && a[1].type==VMType::INT ? a[1].i : -1;
+            VMVal it=a[0], v;
+            std::vector<VMVal> items;
+            if(n<0){ while(vm_iter_step(it,v)) items.push_back(std::move(v)); }
+            else {
+                while((int64_t)items.size()<=n && vm_iter_step(it,v)) items.push_back(std::move(v));
+                if((int64_t)items.size()>n)
+                    throw_exception(make_exception("ValueError",{VMVal::make_str("too many values to unpack (expected "+std::to_string(n)+")")}));
+                if((int64_t)items.size()<n)
+                    throw_exception(make_exception("ValueError",{VMVal::make_str("not enough values to unpack (expected "+std::to_string(n)+", got "+std::to_string(items.size())+")")}));
+            }
+            return VMVal::make_list(std::move(items));
+        });
+        globals_["take"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.size()!=2) throw_exception(make_exception("TypeError",{VMVal::make_str("take() takes exactly 2 arguments ("+std::to_string(a.size())+" given)")}));
+            if(a[0].type!=VMType::INT) throw_exception(make_exception("TypeError",{VMVal::make_str("take(): n must be an integer")}));
+            VMVal it=vm_iter_open(a[1]);
+            std::vector<VMVal> out;
+            VMVal v;
+            for(int64_t i=0;i<a[0].i && vm_iter_step(it,v);i++) out.push_back(v);
+            return VMVal::make_list(std::move(out));
+        });
     }
 
     // Ordering for sorted/min/max: an instance's __lt__ (or the other
@@ -3155,6 +3825,7 @@ private:
         if(vm_exc_classes().count(cls.class_name)){
             (*attrs)["args"]=VMVal::make_list(args);
             (*attrs)["msg"]=VMVal::make_str(args.size()==1?args[0].to_string():std::string());
+            if(class_derives(cls.class_name,"StopIteration")) (*attrs)["value"]=args.empty()?VMVal::make_none():args[0];
         }
         VMVal init;
         if(find_ctor(cls.class_name, init)) invoke_method(init, inst, args, cls.class_name, kwargs);
@@ -3190,6 +3861,9 @@ private:
         while(true){
             // Queued __del__ calls and due cycle collections (one load).
             vmgc::safe_point(*this);
+            // Generators dropped while paused in a try/with are closed here,
+            // between two instructions (gen_dropped).
+            if(__builtin_expect(gen_zombie_flag_,0)) run_gen_zombies();
             CallFrame& fr=call_stack_.back();
             if(fr.ip>=(int)fr.code->instructions.size()) return VMVal::make_none();
             const Instruction& ins=fr.code->instructions[fr.ip++];
@@ -3223,6 +3897,29 @@ private:
                     if(fr.closure_env && fr.closure_env->count(fr.code->names[ins.arg]))
                         (*fr.closure_env)[fr.code->names[ins.arg]] = sv;
                 }
+                break;
+            }
+            case Op::DELETE_NAME: {
+                const std::string& n=fr.code->names[ins.arg];
+                if(!delete_var(n))
+                    throw_exception(make_exception("NameError",{VMVal::make_str("name '"+n+"' is not defined")}));
+                break;
+            }
+            case Op::LOAD_GLOBAL_NAME: {
+                const std::string& n=fr.code->names[ins.arg];
+                VMVal v;
+                if(!load_global(n,v))
+                    throw_exception(make_exception("NameError",{VMVal::make_str("name '"+n+"' is not defined")}));
+                push(std::move(v));
+                break;
+            }
+            case Op::STORE_GLOBAL_NAME: {
+                const std::string& n=fr.code->names[ins.arg];
+                VMVal v=pop();
+                CallFrame* mf=in_other_thread()?module_frame_:(call_stack_.empty()?nullptr:&call_stack_.front());
+                if(mf && mf->has_local(n)) mf->set(n,std::move(v));
+                else if(globals_.count(n) || !mf) globals_[n]=std::move(v);
+                else mf->set(n,std::move(v));
                 break;
             }
             case Op::DEFINE_NAME: {
@@ -3268,6 +3965,20 @@ private:
             case Op::LOAD_ATTR: {
                 VMVal obj=pop(); push(get_attr(obj,fr.code->names[ins.arg])); break;
             }
+            case Op::LOAD_ATTR_OPT: {
+                VMVal obj=pop(), v;
+                if(lookup_attr(obj,fr.code->names[ins.arg],v)) push(std::move(v)); else push(VMVal::make_absent());
+                break;
+            }
+            case Op::LOAD_SUBSCR_OPT: {
+                VMVal idx=pop(),obj=pop(),v;
+                if(try_get_sub(obj,idx,v)) push(std::move(v)); else push(VMVal::make_absent());
+                break;
+            }
+            case Op::CHECK_MEMBER:
+                if(!stack_.empty()&&!has_member_noeval(stack_.back(),fr.code->names[ins.arg])) stack_.back()=VMVal::make_absent();
+                break;
+            case Op::DUP_TOP_TWO: { VMVal b=peek(0), a=peek(1); push(a); push(b); break; }
             case Op::STORE_ATTR: {
                 VMVal obj=pop(); VMVal val=pop();
                 set_attr(obj,fr.code->names[ins.arg],std::move(val)); break;
@@ -3317,8 +4028,7 @@ private:
             }
             case Op::DELETE_ATTR: {
                 VMVal obj=pop();
-                if((obj.type==VMType::MAP||obj.type==VMType::INSTANCE)&&obj.map)
-                    obj.map->erase(fr.code->names[ins.arg]);
+                del_attr(obj, fr.code->names[ins.arg]);
                 break;
             }
 
@@ -3481,6 +4191,15 @@ private:
                 if(t) fr.ip=ins.arg; break;
             }
             case Op::JUMP_IF_FALSE_OR_POP: { VMVal t=peek(); if(!vm_truthy(t)) fr.ip=ins.arg; else pop(); break; }
+            case Op::JUMP_IF_NONE_KEEP:
+                if(!stack_.empty()&&stack_.back().is_nullish()){ stack_.back()=VMVal::make_none(); fr.ip=ins.arg; }
+                break;
+            case Op::JUMP_IF_MISSING_KEEP:
+                if(!stack_.empty()&&stack_.back().is_absent_marker()){ stack_.back()=VMVal::make_none(); fr.ip=ins.arg; }
+                break;
+            case Op::JUMP_IF_NOT_NONE_OR_POP:
+                if(!stack_.empty()&&!stack_.back().is_nullish()) fr.ip=ins.arg; else pop();
+                break;
             case Op::JUMP_IF_TRUE_OR_POP:  { VMVal t=peek(); if(vm_truthy(t))  fr.ip=ins.arg; else pop(); break; }
 
             // Make function/class
@@ -3660,71 +4379,92 @@ private:
                 VMVal yv=pop();
                 auto& cfr=call_stack_.back();
                 if(cfr.gen_state){
-                    cfr.gen_state->ip=cfr.ip;   // ip points past YIELD_VALUE
-                    cfr.gen_state->locals=cfr.locals;
+                    GenState& gs=*cfr.gen_state;
+                    gs.ip=cfr.ip;   // ip points past YIELD_VALUE
+                    // Moved, not copied: the frame is popped right after.
+                    gs.locals=std::move(cfr.locals);
                     // Save stack slice above stack_base (holds loop iterators etc.)
-                    size_t base=cfr.gen_state->stack_base;
-                    cfr.gen_state->saved_stack.clear();
+                    size_t base=gs.stack_base;
+                    gs.saved_stack.clear();
                     if(stack_.size() > base){
-                        cfr.gen_state->saved_stack.assign(stack_.begin()+base, stack_.end());
+                        gs.saved_stack.assign(std::make_move_iterator(stack_.begin()+base), std::make_move_iterator(stack_.end()));
                         stack_.resize(base);
                     }
-                    cfr.gen_state->yielded=true;
-                    cfr.gen_state->at_yield=true;
+                    gs.yielded=true;
+                    gs.at_yield=true;
+                    gs.in_yield_from=false;
                     return yv;
                 }
                 throw VMYield{yv};
             }
 
-            // yield from: get iterator from TOS, yield each item in turn
+            // yield from it: delegates next/send/throw/close to the iterator
+            // (PEP 380) and evaluates to the subgenerator's return value. It
+            // pauses AT this instruction with the iterator on the saved stack;
+            // resuming runs it again with the resume request in the GenState.
             case Op::YIELD_FROM_OP: {
-                VMVal src=pop();
-                // Convert to iterator
-                VMVal it_val;
-                if(src.type==VMType::GENERATOR||src.type==VMType::ITERATOR){it_val=src;}
-                else if(src.type==VMType::LIST&&src.list){
-                    std::vector<VMVal> copy=*src.list; it_val=VMVal::make_iter(std::move(copy));
-                } else if(src.type==VMType::INSTANCE){
-                    VMVal ir=call_dunder(src,"__iter__",{});
-                    it_val=(ir.type!=VMType::NONE?ir:src);
-                } else {it_val=src;}
-                // Yield each item one by one
-                // We re-use the stack save mechanism: save it_val above stack_base, re-enter YIELD_FROM_OP
-                // by decrementing ip. But simpler: collect all & yield via FOR_ITER pattern.
-                // For correctness: just iterate fully and yield each item inline.
-                while(true){
-                    VMVal item;
-                    bool got=false;
-                    if(it_val.type==VMType::GENERATOR){
-                        if(!it_val.gen||it_val.gen->done) break;
-                        item=gen_next(it_val);
-                        if(it_val.gen&&it_val.gen->done) break;
-                        got=true;
-                    } else if(it_val.type==VMType::ITERATOR){
-                        if(!it_val.iter||it_val.iter->first>=(int)it_val.iter->second.size()) break;
-                        item=it_val.iter->second[it_val.iter->first++];
-                        got=true;
-                    } else break;
-                    if(!got) break;
-                    // Yield item: save generator state with it_val on saved_stack
-                    auto& cfr=call_stack_.back();
-                    if(cfr.gen_state){
-                        cfr.gen_state->ip=cfr.ip-1; // re-execute YIELD_FROM_OP on resume
-                        cfr.gen_state->locals=cfr.locals;
-                        size_t base=cfr.gen_state->stack_base;
-                        cfr.gen_state->saved_stack.clear();
-                        // Save it_val (with updated iterator position) so resume can continue
-                        push(it_val);
-                        if(stack_.size()>base){
-                            cfr.gen_state->saved_stack.assign(stack_.begin()+base,stack_.end());
-                            stack_.resize(base);
-                        }
-                        cfr.gen_state->yielded=true;
-                        return item;
-                    }
-                    // Not in a generator context (shouldn't happen) - just push
+                auto& cfr=call_stack_.back();
+                std::shared_ptr<GenState> gsp=cfr.gen_state;
+                VMVal it=pop();
+                if(!gsp) throw_exception(make_exception("SyntaxError",{VMVal::make_str("'yield from' outside function")}));
+                GenState& gs=*gsp;
+                int mode=0;
+                VMVal sent, exc;
+                if(!gs.in_yield_from) it=vm_iter_open(it);
+                else {
+                    mode=gs.mode; sent=gs.sent; exc=gs.pending;
+                    gs.sent=VMVal::make_none(); gs.pending=VMVal::make_none();
+                    gs.in_yield_from=false;
+                    if(mode==1 && exc.type==VMType::INSTANCE && class_derives(exc.class_name,"GeneratorExit")) mode=2;
                 }
-                break;
+                if(mode==2){
+                    // The subiterator is closed first, then GeneratorExit is
+                    // raised here.
+                    if(it.type==VMType::GENERATOR&&it.gen) gen_close(*it.gen);
+                    else if(it.type==VMType::INSTANCE){ bool f=false; call_dunder_f(it,"close",{},f); }
+                    throw_exception(exc.type==VMType::INSTANCE?exc:make_exception("GeneratorExit",{}));
+                }
+                VMVal v, result;
+                bool got=false;
+                if(it.type==VMType::GENERATOR&&it.gen){
+                    GenState& sub=*it.gen;
+                    if(mode==1){
+                        if(sub.done||!sub.started){ if(!sub.started) gen_finish(sub); throw_exception(exc); }
+                        got=gen_resume(sub,1,exc,v);
+                    } else got=gen_resume(sub,0,sent,v);
+                    if(!got){ result=sub.retval; sub.retval=VMVal::make_none(); }
+                } else if(mode==1){
+                    VMVal m;
+                    if(it.type!=VMType::INSTANCE||!class_lookup(it.class_name,"throw",m)) throw_exception(exc);
+                    try { v=call_dunder(it,"throw",{exc}); got=true; }
+                    catch(VMException& e){
+                        if(!is_stop_iteration(e.value)) throw;
+                        if(e.value.type==VMType::INSTANCE&&e.value.map&&e.value.map->count("value")) result=(*e.value.map)["value"];
+                    }
+                } else if(it.type==VMType::INSTANCE){
+                    VMVal m;
+                    bool use_send = sent.type!=VMType::NONE && class_lookup(it.class_name,"send",m);
+                    try { v = use_send ? call_dunder(it,"send",{sent}) : call_dunder(it,"__next__",{}); got=true; }
+                    catch(VMException& e){
+                        if(!is_stop_iteration(e.value)) throw;
+                        if(e.value.type==VMType::INSTANCE&&e.value.map&&e.value.map->count("value")) result=(*e.value.map)["value"];
+                    }
+                } else got=vm_iter_step(it,v);
+                if(!got){ push(result); break; }   // the value of `yield from`
+                // Pass v up; pause here with the iterator saved.
+                gs.ip=cfr.ip-1;
+                gs.locals=std::move(cfr.locals);
+                push(std::move(it));
+                size_t base=gs.stack_base;
+                gs.saved_stack.clear();
+                if(stack_.size()>base){
+                    gs.saved_stack.assign(std::make_move_iterator(stack_.begin()+base), std::make_move_iterator(stack_.end()));
+                    stack_.resize(base);
+                }
+                gs.yielded=true;
+                gs.at_yield=false;
+                gs.in_yield_from=true;
+                return v;
             }
 
             // Iteration
@@ -4013,6 +4753,8 @@ private:
         if(!class_reg_.count(type)) vm_exc_classes().insert(type);
         auto attrs=std::make_shared<VMMap>(); vmgc::track_map(attrs);
         std::string msg = args.size()==1 ? args[0].to_string() : std::string();
+        // StopIteration.value: a generator's return value (both engines).
+        if(class_derives(type,"StopIteration")) (*attrs)["value"]=args.empty()?VMVal::make_none():args[0];
         (*attrs)["args"]=VMVal::make_list(std::move(args));
         (*attrs)["msg"]=VMVal::make_str(msg);
         return VMVal::make_instance(type, attrs);
@@ -4185,6 +4927,7 @@ private:
             case VMType::INSTANCE: return v.class_name;
             case VMType::GENERATOR: return "generator";
             case VMType::ITERATOR: return "iterator";
+            case VMType::UNDEFINED: return "undefined";
             default: return "object";
         }
     }
@@ -4465,7 +5208,9 @@ private:
             return false;
         }
         if(cont.type==VMType::GENERATOR||cont.type==VMType::ITERATOR){
-            for(auto& v:iter_items(cont)) if(vm_eq(v,item)) return true;
+            // Consumed up to the first match (an infinite one terminates).
+            VMVal it=cont, v;
+            while(vm_iter_step(it,v)) if(vm_eq(v,item)) return true;
             return false;
         }
         if(cont.type==VMType::STRING&&item.type==VMType::STRING)
@@ -4545,88 +5290,223 @@ private:
     }
 
     // ── Attribute access ────────────────────────────────────────────────
-    // A missing attribute of an instance or class: `probe` (hasattr /
-    // getattr) raises AttributeError for try_get_attr to catch; a plain read
-    // gives none, as on the interpreter (see kStrictAttributeReads there).
-    // Calling a missing method raises (vm_call_method).
-    static constexpr bool kStrictAttributeReads = false;
-    VMVal get_attr(const VMVal& obj, const std::string& attr, bool probe=false) {
+    // obj.attr. Reading an attribute the object does not have raises
+    // AttributeError, whatever the object (round 75: it read none), as on
+    // the interpreter (NythonExecutor::evalAttribute). getattr(o, n, d),
+    // hasattr, `o?.attr` and `o?.attr ?? d` are the graceful forms.
+    VMVal get_attr(const VMVal& obj, const std::string& attr) {
+        // The common read, a field present on an instance or a map (not a
+        // property), straight from the map: a VMVal is costly to default-
+        // construct and copy twice.
+        if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map){
+            auto it=obj.map->find(attr);
+            if(it!=obj.map->end()&&!is_property_desc(it->second)) return it->second;
+        }
+        VMVal v;
+        if(lookup_attr(obj, attr, v)) return v;
+        return missing_attr(obj, attr);
+    }
+    // obj.attr for a value in hand: true with the value in `out`, false when
+    // obj has no such attribute - nothing is raised for that. Property
+    // getters and __getattr__ run, and what they raise propagates. `bind`
+    // false: a builtin's method is not made into a bound value.
+    bool lookup_attr(const VMVal& obj, const std::string& attr, VMVal& out, bool bind=true) {
         // Instance / map fields — check for property descriptors
         if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map){
             auto it=obj.map->find(attr);
             if(it!=obj.map->end()){
                 VMVal& v=it->second;
                 // A property stored on the instance itself: self.x = property(get)
-                if(obj.type==VMType::INSTANCE&&is_property_desc(v)) return property_get(v, obj);
+                if(obj.type==VMType::INSTANCE&&is_property_desc(v)){ out=property_get(v, obj); return true; }
                 if(obj.type==VMType::MAP&&is_property_desc(v)){
                     auto git=v.map->find("__get__");
                     if(git!=v.map->end()&&git->second.type==VMType::FUNCTION){
                         std::vector<VMVal> no_args;
-                        return call_function(git->second, no_args, obj);
+                        out=call_function(git->second, no_args, obj);
+                        return true;
                     }
                 }
-                return v;
+                out=v;
+                return true;
             }
         }
-        if(obj.type==VMType::INSTANCE){
+        switch(obj.type){
+        case VMType::INSTANCE: {
             VMVal m;
-            if(class_lookup(obj.class_name, attr, m)) return bind_member(m, obj, obj.class_name);
-            if(attr=="__class__") return class_value(obj.class_name);
+            if(class_lookup(obj.class_name, attr, m)){ out=bind_member(m, obj, obj.class_name); return true; }
+            if(attr=="__class__"){ out=class_value(obj.class_name); return true; }
             if(attr=="__dict__"){
                 VMVal d=VMVal::make_map();
                 if(obj.map) for(auto& kv:*obj.map) (*d.map)[kv.first]=kv.second;
-                return d;
+                out=d; return true;
             }
             VMVal ga;
             if(class_lookup(obj.class_name, "__getattr__", ga)){
                 std::vector<VMVal> a{VMVal::make_str(attr)};
-                return invoke_method(ga, obj, a, obj.class_name);
+                out=invoke_method(ga, obj, a, obj.class_name);
+                return true;
             }
-            if(probe || kStrictAttributeReads)
-                throw_exception(make_exception("AttributeError",{VMVal::make_str(
-                    "'"+obj.class_name+"' object has no attribute '"+attr+"'")}));
-            return VMVal::make_none();
+            break;
         }
-        if(obj.type==VMType::STRING){
+        case VMType::STRING:
             // type(x).__name__: type() gives a name string on this engine.
-            if(attr=="__name__") return obj;
-            return str_method(obj,attr);
+            if(attr=="__name__"){ out=obj; return true; }
+            break;
+        case VMType::FUNCTION: {
+            if(!func_attrs_.empty()){
+                auto fa=func_attrs_.find(func_key(obj));
+                if(fa!=func_attrs_.end()){ auto it=fa->second.find(attr); if(it!=fa->second.end()){ out=it->second; return true; } }
+            }
+            if(attr=="__name__"){ out=VMVal::make_str(obj.code?obj.code->name:""); return true; }
+            return false;
         }
-        if(obj.type==VMType::LIST)   return list_method(obj,attr);
-        if(obj.type==VMType::FUNCTION&&attr=="__name__") return VMVal::make_str(obj.code?obj.code->name:"");
-        if(obj.type==VMType::CLASS){
+        case VMType::CLASS: {
             std::string cname = obj.class_name.empty() ? obj.s : obj.class_name;
             VMVal m;
             if(class_lookup(cname, attr, m)){
-                if(m.type==VMType::FUNCTION&&m.code&&m.code->is_classmethod) return make_bound(m, obj, true);
-                return m;   // a method read from the class is the plain function
+                if(m.type==VMType::FUNCTION&&m.code&&m.code->is_classmethod) out=make_bound(m, obj, true);
+                else out=m;   // a method read from the class is the plain function
+                return true;
             }
-            if(attr=="__name__") return VMVal::make_str(cname);
+            if(attr=="__name__"){ out=VMVal::make_str(cname); return true; }
             if(attr=="__mro__"){
                 std::vector<VMVal> r;
                 for(auto& c:*class_mro(cname)){ VMVal cv=class_value(c); if(cv.type!=VMType::NONE) r.push_back(cv); }
-                return VMVal::make_list(std::move(r));
+                out=VMVal::make_list(std::move(r)); return true;
             }
             if(attr=="__bases__"){
                 std::vector<VMVal> r;
                 auto rit=class_reg_.find(cname);
                 if(rit!=class_reg_.end()&&rit->second) for(auto& b:rit->second->bases){ VMVal cv=class_value(b); if(cv.type!=VMType::NONE) r.push_back(cv); }
-                return VMVal::make_list(std::move(r));
+                out=VMVal::make_list(std::move(r)); return true;
             }
-            if(class_reg_.count(cname) && (probe || kStrictAttributeReads))
-                throw_exception(make_exception("AttributeError",{VMVal::make_str(
-                    "type object '"+cname+"' has no attribute '"+attr+"'")}));
+            return false;
         }
-        return VMVal::make_none();
+        case VMType::NATIVE:
+            // A builtin used as a namespace: time.time, os.path ...
+            if(obj.class_name.rfind("__builtin__:",0)==0){
+                std::string target=nyrt::builtin_member(obj.class_name.substr(12),attr,
+                    [&](const std::string& n){ return bridge_exists()&&bridge_exists()(n); });
+                if(!target.empty()){ out=load_var(target); return true; }
+            }
+            return false;
+        default: break;
+        }
+        // A builtin value's method, or the object protocol, read as a value.
+        if(bind){
+            nypy::MemberKind k=vm_member_kind(obj);
+            if(k!=nypy::MemberKind::Other&&nypy::kind_has_method(k,attr)){ out=bound_member(obj,attr); return true; }
+        }
+        return false;
     }
-    // obj.attr, or false when it has none (hasattr / getattr with a default).
+    // Attributes stored on a function (f.calls = 0), as in Python, keyed by
+    // the function value's identity (VMVal::operator== for FUNCTION).
+    using FuncKey=std::tuple<const void*,const void*,const void*>;
+    std::map<FuncKey,std::unordered_map<std::string,VMVal>> func_attrs_;
+    static FuncKey func_key(const VMVal& f){ return FuncKey{f.code.get(),f.closure_env.get(),f.list.get()}; }
+    static nypy::MemberKind vm_member_kind(const VMVal& v){
+        switch(v.type){
+            case VMType::NONE:   return nypy::MemberKind::None;
+            case VMType::BOOL:   return nypy::MemberKind::Bool;
+            case VMType::INT:    return nypy::MemberKind::Int;
+            case VMType::FLOAT:  return nypy::MemberKind::Float;
+            case VMType::STRING: return nypy::MemberKind::Str;
+            case VMType::LIST:   return v.b?nypy::MemberKind::Tuple:nypy::MemberKind::List;
+            case VMType::MAP:    return nypy::MemberKind::Dict;
+            case VMType::INSTANCE: return nypy::MemberKind::Instance;
+            case VMType::GENERATOR: case VMType::ITERATOR: return nypy::MemberKind::Generator;
+            default:             return nypy::MemberKind::Other;
+        }
+    }
+    // A builtin value's method read as a value: a native calling it on obj.
+    VMVal bound_member(const VMVal& obj, const std::string& m){
+        if(obj.type==VMType::STRING) return str_method(obj,m);
+        if(obj.type==VMType::LIST)   return list_method(obj,m);
+        VirtualMachine* vm=this;
+        return VMVal::make_native([vm,obj,m](std::vector<VMVal>& a)->VMVal{
+            VMVal kw=take_kwargs(a);
+            VMVal o=obj;
+            return vm->vm_call_method(o,m,a,kw.type==VMType::MAP?&kw:nullptr);
+        });
+    }
+    // Whether obj has a member `name`, without running a property getter or
+    // __getattr__ (an object with __getattr__ counts as having every name):
+    // the test `obj?.m(...)` makes before calling.
+    bool has_member_noeval(const VMVal& obj, const std::string& name){
+        if(obj.type==VMType::INSTANCE){
+            if(obj.map&&obj.map->count(name)) return true;
+            VMVal m;
+            if(class_lookup(obj.class_name,name,m)) return true;
+            if(name=="__class__"||name=="__dict__"||class_lookup(obj.class_name,"__getattr__",m)) return true;
+            return nypy::kind_has_method(nypy::MemberKind::Instance,name);
+        }
+        VMVal v;
+        if(lookup_attr(obj,name,v,false)) return true;
+        nypy::MemberKind k=vm_member_kind(obj);
+        return k!=nypy::MemberKind::Other&&nypy::kind_has_method(k,name);
+    }
+    // obj.attr, or false when it has none (hasattr / getattr with a default):
+    // an AttributeError from a property getter or __getattr__ counts as none.
     bool try_get_attr(const VMVal& obj, const std::string& attr, VMVal& out) {
-        try { out=get_attr(obj, attr, true); }
+        try { return lookup_attr(obj, attr, out); }
         catch(VMException& e){
             if(class_derives(e.value.class_name,"AttributeError")) return false;
             throw;
         }
-        return true;
+    }
+    std::string attr_error_text(const VMVal& obj, const std::string& attr){
+        if(obj.type==VMType::INSTANCE) return "'"+obj.class_name+"' object has no attribute '"+attr+"'";
+        if(obj.type==VMType::CLASS){
+            std::string cname = obj.class_name.empty() ? obj.s : obj.class_name;
+            return "type object '"+cname+"' has no attribute '"+attr+"'";
+        }
+        return "'"+vm_type_name(obj)+"' object has no attribute '"+attr+"'";
+    }
+    // A missing attribute read: AttributeError, or - NY_LENIENT_READS=log, a
+    // porting aid - a line on stderr and none.
+    VMVal missing_attr(const VMVal& obj, const std::string& attr){
+        std::string msg=attr_error_text(obj,attr);
+        if(nypy::lenient_reads_log()){ log_lenient_read("AttributeError: "+msg); return VMVal::make_none(); }
+        throw_exception(make_exception("AttributeError",{VMVal::make_str(msg)}));
+        return VMVal::make_none();
+    }
+    VMVal missing_key(const VMVal& key){
+        if(nypy::lenient_reads_log()){ log_lenient_read("KeyError: "+key.repr()); return VMVal::make_none(); }
+        raise_native_exception("KeyError",key.repr());
+        return VMVal::make_none();
+    }
+    // "file:line" of the running instruction.
+    std::string vm_where(){
+        if(call_stack_.empty()) return "?";
+        auto& fr=call_stack_.back();
+        int ip=fr.ip-1;
+        int line=(fr.code&&ip>=0&&ip<(int)fr.code->instructions.size())?fr.code->instructions[(size_t)ip].line:0;
+        std::string f=fr.code?(fr.code->file.empty()?fr.code->name:fr.code->file):std::string("?");
+        return f+":"+std::to_string(line);
+    }
+    void log_lenient_read(const std::string& what){
+        static std::mutex mu;
+        static std::set<std::string> seen;
+        std::string loc=vm_where();
+        std::lock_guard<std::mutex> lk(mu);
+        if(!seen.insert(loc+" "+what).second) return;
+        fprintf(stderr,"[lenient-read] %s: %s\n",loc.c_str(),what.c_str());
+    }
+    // del obj.name / delattr(obj, name): an instance's field, a class
+    // attribute or a namespace/dict entry is removed; anything else is an
+    // AttributeError (it was ignored).
+    void del_attr(const VMVal& obj, const std::string& attr) {
+        if((obj.type==VMType::MAP||obj.type==VMType::INSTANCE)&&obj.map&&obj.map->erase(attr)) return;
+        if(obj.type==VMType::CLASS){
+            std::string cname = obj.class_name.empty() ? obj.s : obj.class_name;
+            auto it=class_vars_.find(cname);
+            if(it!=class_vars_.end()&&it->second.erase(attr)) return;
+        }
+        if(obj.type==VMType::FUNCTION){
+            auto fa=func_attrs_.find(func_key(obj));
+            if(fa!=func_attrs_.end()&&fa->second.erase(attr)) return;
+        }
+        throw_exception(make_exception("AttributeError",{VMVal::make_str(attr_error_text(obj,attr))}));
     }
     void set_attr(VMVal& obj, const std::string& attr, VMVal val) {
         if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map){
@@ -4665,7 +5545,14 @@ private:
         if(obj.type==VMType::CLASS){
             std::string cname = obj.class_name.empty() ? obj.s : obj.class_name;
             class_vars_[cname][attr] = std::move(val);
+            return;
         }
+        if(obj.type==VMType::FUNCTION&&obj.code){ func_attrs_[func_key(obj)][attr]=std::move(val); return; }
+        // none.x = v, 5.x = v, "s".x = v, len.x = v: nothing can hold it
+        // (AttributeError, as in Python - it was dropped silently).
+        std::string msg=attr_error_text(obj,attr);
+        if(nypy::lenient_reads_log()){ log_lenient_read("AttributeError (store): "+msg); return; }
+        throw_exception(make_exception("AttributeError",{VMVal::make_str(msg)}));
     }
     // Resolve a [start,end,step] slice against a sequence of length sz,
     // returning the indices to take in order. NONE start/end mean "the natural
@@ -4707,10 +5594,11 @@ private:
             return L[(size_t)i];
         }
         if(obj.type==VMType::MAP&&obj.map){
-            // A missing key reads none, as on the interpreter (library code
-            // relies on it); d.get() is the same.
+            // A missing key raises KeyError, as in Python (round 75: it read
+            // none). d.get(k, default), `k in d` and d?[k] are the graceful
+            // forms.
             auto it=obj.map->find(vkey(idx));
-            return it!=obj.map->end()?it->second:VMVal::make_none();
+            return it!=obj.map->end()?it->second:missing_key(idx);
         }
         if(obj.type==VMType::STRING){
             if(idx.type==VMType::LIST&&idx.list&&!idx.b){
@@ -4724,7 +5612,43 @@ private:
             int64_t i=index_of(idx,"string");
             return VMVal::make_str(nycall([&]{ return nypy::str_getitem(obj.s,i); }));
         }
+        // none[k], 5[0], f[0]: TypeError (they read none).
+        std::string msg="'"+vm_type_name(obj)+"' object is not subscriptable";
+        if(nypy::lenient_reads_log()){ log_lenient_read("TypeError: "+msg); return VMVal::make_none(); }
+        raise_native_exception("TypeError",msg);
         return VMVal::make_none();
+    }
+    // obj[idx] for d?[k]: false when the key or index does not exist - a
+    // missing dict key, an index out of range, or __getitem__ raising
+    // KeyError / IndexError. Other errors raise as obj[idx] does.
+    bool try_get_sub(const VMVal& obj, const VMVal& idx, VMVal& out) {
+        if(obj.type==VMType::MAP&&obj.map){
+            auto it=obj.map->find(vkey(idx));
+            if(it==obj.map->end()) return false;
+            out=it->second; return true;
+        }
+        if(obj.type==VMType::LIST&&obj.list&&(idx.type==VMType::INT||idx.type==VMType::BOOL)){
+            int64_t n=(int64_t)obj.list->size(), i=index_of(idx,"list");
+            if(i<0) i+=n;
+            if(i<0||i>=n) return false;
+        }
+        if(obj.type==VMType::STRING&&(idx.type==VMType::INT||idx.type==VMType::BOOL)){
+            int64_t n=(int64_t)nypy::u8_len(obj.s), i=index_of(idx,"string");
+            if(i<0) i+=n;
+            if(i<0||i>=n) return false;
+        }
+        if(obj.type==VMType::INSTANCE){
+            bool f=false;
+            try { out=call_dunder_f(obj,"__getitem__",{idx},f); }
+            catch(VMException& e){
+                if(class_derives(e.value.class_name,"KeyError")||class_derives(e.value.class_name,"IndexError")) return false;
+                throw;
+            }
+            if(f) return true;
+            raise_native_exception("TypeError","'"+obj.class_name+"' object is not subscriptable");
+        }
+        out=get_sub(obj,idx);
+        return true;
     }
     void set_sub(VMVal& obj, const VMVal& idx, VMVal val) {
         if(obj.type==VMType::LIST&&obj.list){
@@ -4903,20 +5827,33 @@ private:
 
     VMVal vm_call_method(VMVal obj, const std::string& method, std::vector<VMVal>& args,
                          const VMVal* kwargs=nullptr) {
-        // Generator protocol: send(v) resumes with v as the value of the
-        // pending yield; close() finishes it.
+        // Generator protocol (round 75): send(v) resumes with v as the value
+        // of the paused yield; throw(e) raises e there; close() raises
+        // GeneratorExit there, so finally blocks run; __next__; __iter__.
         if(obj.type==VMType::GENERATOR&&obj.gen){
+            std::shared_ptr<GenState> gsp=obj.gen;
+            GenState& gs=*gsp;
             if(method=="send"||method=="__next__"||method=="next"){
-                VMVal sent = (method=="send"&&!args.empty()) ? args[0] : VMVal::make_none();
-                if(method=="send" && !obj.gen->started && sent.type!=VMType::NONE)
+                if(method=="send" && args.size()!=1)
+                    throw_exception(make_exception("TypeError",{VMVal::make_str("generator.send() takes exactly one argument ("+std::to_string(args.size())+" given)")}));
+                VMVal sent = method=="send" ? args[0] : VMVal::make_none();
+                if(method=="send" && !gs.started && sent.type!=VMType::NONE)
                     throw_exception(make_exception("TypeError",{VMVal::make_str("can't send non-None value to a just-started generator")}));
-                if(obj.gen->done) throw_exception(make_exception("StopIteration",{}));
-                VMVal v=gen_next(obj, sent);
-                if(obj.gen->done) throw_exception(make_exception("StopIteration",{}));
-                return v;
+                VMVal v;
+                if(gen_resume(gs,0,sent,v)) return v;
+                gen_raise_stop(gs);
             }
-            if(method=="close"){ obj.gen->done=true; obj.gen->saved_stack.clear(); return VMVal::make_none(); }
+            if(method=="throw"){
+                VMVal ev=gen_throw_value(args);
+                VMVal v;
+                if(gen_resume(gs,1,ev,v)) return v;
+                gen_raise_stop(gs);
+            }
+            if(method=="close"){ gen_close(gs); return VMVal::make_none(); }
             if(method=="__iter__") return obj;
+            VMVal pm;
+            if(primitive_member(obj,method,args,pm)) return pm;
+            throw_exception(make_exception("AttributeError",{VMVal::make_str("'generator' object has no attribute '"+method+"'")}));
         }
         {
             VMVal pm;
@@ -4943,6 +5880,7 @@ private:
                 if(self_v.type==VMType::INSTANCE && self_v.map && is_exception_class(mro_of)){
                     (*self_v.map)["args"]=VMVal::make_list(args);
                     (*self_v.map)["msg"]=VMVal::make_str(args.size()==1?args[0].to_string():std::string());
+                    if(class_derives(self_v.class_name,"StopIteration")) (*self_v.map)["value"]=args.empty()?VMVal::make_none():args[0];
                 }
                 return VMVal::make_none();
             }
@@ -5083,7 +6021,8 @@ private:
         }
         // CLASS type: support nested class instantiation via CALL_METHOD (e.g. Outer.Inner(v))
         if(obj.type==VMType::CLASS){
-            VMVal nested = get_attr(obj, method);
+            VMVal nested;
+            lookup_attr(obj, method, nested, false);
             if(nested.type == VMType::CLASS) return vm_call(nested, args, std::nullopt, kwargs);
             // Static method call
             if(nested.type == VMType::FUNCTION && nested.code)
@@ -5098,13 +6037,12 @@ private:
                 VMVal fn=load_var(target);
                 if(fn.type==VMType::NATIVE) return fn.native(with_kw());
             }
-            return VMVal::make_none();
+            return missing_attr(obj, method);
         }
-        // Fallback: check globals
-        auto git=globals_.find(method);
-        if(git!=globals_.end()&&git->second.type==VMType::NATIVE)
-            return git->second.native(with_kw());
-        return VMVal::make_none();
+        // Nothing else has methods: none.m(), 5.m(), f.m() raise
+        // AttributeError (they returned none, or called a global native of
+        // that name with the receiver dropped). x?.m() is the graceful form.
+        return missing_attr(obj, method);
     }
 
     // dict methods, typed keys (vkey / vm_key_value), as the interpreter's
@@ -5194,7 +6132,7 @@ private:
             VMVal d=a.size()>=2?a[1]:VMVal::make_none();
             mp[key]=d; return d;
         }
-        return VMVal::make_none();
+        return missing_attr(obj,m);
     }
 
 
@@ -5662,14 +6600,34 @@ private:
         // ── hasattr, ord, chr ────────────────────────────────────────────────
         // hasattr: the full attribute lookup (methods and class attributes
         // too; only an instance's own fields were seen).
-        globals_["hasattr"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2) return VMVal::make_bool(false);
-            std::string attr=a[1].to_string();
-            if(a[0].type==VMType::MAP) return VMVal::make_bool(a[0].map&&a[0].map->count(attr)>0);
-            if(a[0].type==VMType::INSTANCE||a[0].type==VMType::CLASS){
-                VMVal v; return VMVal::make_bool(try_get_attr(a[0],attr,v));
-            }
-            return VMVal::make_bool(false);});
+        // hasattr / getattr / setattr / delattr for every kind of value, as
+        // in Python and as on the interpreter: hasattr and getattr with a
+        // default see an AttributeError (a missing attribute, or one a
+        // property / __getattr__ raises) as absence; other errors propagate.
+        auto attr_name=[this](std::vector<VMVal>& a, const char* fn)->std::string{
+            if(a[1].type!=VMType::STRING)
+                raise_native_exception("TypeError",std::string(fn)+"(): attribute name must be string, not '"+vm_type_name(a[1])+"'");
+            return a[1].s;
+        };
+        globals_["hasattr"]=VMVal::make_native([this,attr_name](std::vector<VMVal>& a)->VMVal{
+            if(a.size()!=2) raise_native_exception("TypeError","hasattr expected 2 arguments, got "+std::to_string(a.size()));
+            VMVal v; return VMVal::make_bool(try_get_attr(a[0],attr_name(a,"hasattr"),v));});
+        globals_["getattr"]=VMVal::make_native([this,attr_name](std::vector<VMVal>& a)->VMVal{
+            if(a.size()<2||a.size()>3) raise_native_exception("TypeError","getattr expected at most 3 arguments, got "+std::to_string(a.size()));
+            std::string n=attr_name(a,"getattr");
+            VMVal v;
+            if(try_get_attr(a[0],n,v)) return v;
+            if(a.size()==3) return a[2];
+            throw_exception(make_exception("AttributeError",{VMVal::make_str(attr_error_text(a[0],n))}));
+            return VMVal::make_none();});
+        globals_["setattr"]=VMVal::make_native([this,attr_name](std::vector<VMVal>& a)->VMVal{
+            if(a.size()!=3) raise_native_exception("TypeError","setattr expected 3 arguments, got "+std::to_string(a.size()));
+            set_attr(a[0],attr_name(a,"setattr"),a[2]);
+            return VMVal::make_none();});
+        globals_["delattr"]=VMVal::make_native([this,attr_name](std::vector<VMVal>& a)->VMVal{
+            if(a.size()!=2) raise_native_exception("TypeError","delattr expected 2 arguments, got "+std::to_string(a.size()));
+            del_attr(a[0],attr_name(a,"delattr"));
+            return VMVal::make_none();});
         globals_["repr"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.empty()) return VMVal::make_str("none");
             if(a[0].type==VMType::INSTANCE||a[0].type==VMType::LIST||a[0].type==VMType::MAP)
@@ -5686,38 +6644,8 @@ private:
             }
             return VMVal::make_str(a[0].to_string());
         });
-        globals_["getattr"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2) return a.size()>=3?a[2]:VMVal::make_none();
-            if(a[0].type==VMType::INSTANCE||a[0].type==VMType::CLASS){
-                VMVal v;
-                if(a.size()>=3) return try_get_attr(a[0],a[1].to_string(),v) ? v : a[2];
-                return get_attr(a[0],a[1].to_string(),true);
-            }
-            VMVal result=get_attr(a[0],a[1].to_string());
-            if(result.type==VMType::NONE&&a.size()>=3) return a[2];
-            return result;
-        });
-        globals_["setattr"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<3) return VMVal::make_none();
-            set_attr(a[0],a[1].to_string(),a[2]);
-            return VMVal::make_none();
-        });
-        globals_["getattr"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<2) return a.size()>=3?a[2]:VMVal::make_none();
-            if(a[0].type==VMType::INSTANCE||a[0].type==VMType::CLASS){
-                VMVal v;
-                if(a.size()>=3) return try_get_attr(a[0],a[1].to_string(),v) ? v : a[2];
-                return get_attr(a[0],a[1].to_string(),true);
-            }
-            VMVal result=get_attr(a[0],a[1].to_string());
-            if(result.type==VMType::NONE&&a.size()>=3) return a[2]; // default
-            return result;
-        });
-        globals_["setattr"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
-            if(a.size()<3) return VMVal::make_none();
-            set_attr(a[0],a[1].to_string(),a[2]);
-            return VMVal::make_none();
-        });
+
+
         globals_["ord"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             if(a.empty()||a[0].s.empty()) return VMVal::make_int(0);
             return VMVal::make_int((int64_t)(unsigned char)a[0].s[0]);});
@@ -5844,6 +6772,8 @@ private:
             if(a.empty()) return VMVal::make_bool(false);
             const VMVal& v=a[0];
             if(v.type==VMType::FUNCTION||v.type==VMType::NATIVE||v.type==VMType::CLASS) return VMVal::make_bool(true);
+            // a bound method (obj.method read as a value)
+            if(v.type==VMType::MAP&&(v.class_name=="__bound_method__"||v.class_name=="__super_bound__")) return VMVal::make_bool(true);
             if(v.type==VMType::INSTANCE){ VMVal m; return VMVal::make_bool(class_lookup(v.class_name,"__call__",m)); }
             return VMVal::make_bool(false);
         });
@@ -5855,10 +6785,12 @@ private:
                 throw_exception(make_exception("StopIteration",{}));
             };
             if(a[0].type==VMType::GENERATOR){
-                if(!a[0].gen||a[0].gen->done) return exhausted();
-                VMVal v=gen_next(a[0]);
-                if(a[0].gen->done) return exhausted();
-                return v;
+                if(!a[0].gen) return exhausted();
+                std::shared_ptr<GenState> gsp=a[0].gen;
+                VMVal v;
+                if(gen_resume(*gsp,0,VMVal::make_none(),v)) return v;
+                if(has_default){ gsp->retval=VMVal::make_none(); return a[1]; }
+                gen_raise_stop(*gsp);   // StopIteration(return value)
             }
             if(a[0].type==VMType::INSTANCE){
                 try { return call_dunder(a[0],"__next__",{}); }
@@ -6170,7 +7102,7 @@ private:
             for(auto& v:a) sa.push_back(vm->to_sarg(v));
             nypy::SRes r;
             if(vm->nycall([&]{ return nypy::str_method(obj.s,m,sa,r); })) return from_sres(r);
-            return VMVal::make_none();
+            return vm->missing_attr(obj,m);
         });
     }
     VMVal call_str_method(VMVal obj, const std::string& m, std::vector<VMVal>& a) {
@@ -6390,7 +7322,7 @@ private:
                 std::vector<VMVal> sub;
                 for(int64_t k=0,i=st;k<n;k++,i+=step) sub.push_back(lst[(size_t)i]);
                 VMVal r=VMVal::make_list(std::move(sub)); r.b=obj.b; return r;}
-            return VMVal::make_none();
+            return vm->missing_attr(obj,m);
         });
     }
     VMVal call_list_method(VMVal obj, const std::string& m, std::vector<VMVal>& a) {
@@ -6757,6 +7689,7 @@ private:
             case VMType::CLASS:return VMVal::make_str("class");
             case VMType::INSTANCE:return VMVal::make_str(a[0].class_name);
             case VMType::GENERATOR:case VMType::ITERATOR:return VMVal::make_str("generator");
+            case VMType::UNDEFINED:return VMVal::make_str("undefined");
             default:return VMVal::make_str("unknown");}});
         globals_["typeof"]=globals_["type"];
     }
@@ -6892,6 +7825,7 @@ private:
             case VMType::FUNCTION:return VMVal::make_str("function");
             case VMType::CLASS:return VMVal::make_str("class");
             case VMType::INSTANCE:return VMVal::make_str(a[0].class_name);
+            case VMType::UNDEFINED:return VMVal::make_str("undefined");
             default:return VMVal::make_str("unknown");}});
         globals_["abs"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             if(a.empty())return VMVal::make_int(0);
@@ -7497,6 +8431,16 @@ private:
         case Op::STORE_NAME:   return "STORE_NAME";
         case Op::DEFINE_NAME:  return "DEFINE_NAME";
         case Op::LOAD_ATTR:    return "LOAD_ATTR";
+        case Op::LOAD_ATTR_OPT: return "LOAD_ATTR_OPT";
+        case Op::LOAD_SUBSCR_OPT: return "LOAD_SUBSCR_OPT";
+        case Op::CHECK_MEMBER: return "CHECK_MEMBER";
+        case Op::DUP_TOP_TWO:  return "DUP_TOP_TWO";
+        case Op::LOAD_GLOBAL_NAME: return "LOAD_GLOBAL_NAME";
+        case Op::DELETE_NAME:  return "DELETE_NAME";
+        case Op::STORE_GLOBAL_NAME: return "STORE_GLOBAL_NAME";
+        case Op::JUMP_IF_NONE_KEEP: return "JUMP_IF_NONE_KEEP";
+        case Op::JUMP_IF_MISSING_KEEP: return "JUMP_IF_MISSING_KEEP";
+        case Op::JUMP_IF_NOT_NONE_OR_POP: return "JUMP_IF_NOT_NONE_OR_POP";
         case Op::STORE_ATTR:   return "STORE_ATTR";
         case Op::LOAD_SUBSCR:  return "LOAD_SUBSCR";
         case Op::STORE_SUBSCR: return "STORE_SUBSCR";
@@ -7575,6 +8519,12 @@ private:
 };
 
 using VM = VirtualMachine;
+
+// A generator's last reference is gone: its VM decides whether closing it
+// can run code (a pause inside try/with) and queues it if so.
+inline GenState::~GenState() {
+    if(vm && VirtualMachine::vm_live(vm, 0)) vm->gen_dropped(*this);
+}
 
 } // namespace nython::vm
 

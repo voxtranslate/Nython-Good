@@ -19,13 +19,13 @@ class Icons_Codicon:
         self._register()
 
     def get(self, name):
-        var v = self.map[name]
+        var v = self.map.get(name)
         if v == none:
             return "?"
         return v
 
     def has(self, name):
-        return self.map[name] != none
+        return self.map.get(name) != none
 
     def count(self):
         return self.map.size()

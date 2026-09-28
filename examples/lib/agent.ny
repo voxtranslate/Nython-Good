@@ -11,7 +11,7 @@ class Agent:
     def learn(self, key, value):
         # Re-learning a key overwrites rather than double-counting, so memory()
         # reports distinct facts and not the number of learn() calls.
-        if self.facts[key] == none:
+        if self.facts.get(key) == none:
             self.fact_count = self.fact_count + 1
         self.facts[key] = value
         return true
@@ -19,16 +19,16 @@ class Agent:
     # An unknown key returns none, not "": the examples assert on none, and an
     # empty string would be indistinguishable from a fact whose value is empty.
     def ask(self, key):
-        return self.facts[key]
+        return self.facts.get(key)
 
     def knows(self, key):
-        return self.facts[key] != none
+        return self.facts.get(key) != none
 
     def memory(self):
         return self.fact_count
 
     def forget(self, key):
-        if self.facts[key] != none:
+        if self.facts.get(key) != none:
             self.facts[key] = none
             self.fact_count = self.fact_count - 1
             return true

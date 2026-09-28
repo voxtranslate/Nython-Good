@@ -1,10 +1,16 @@
 import "lib/nytorch.ny"
 
+# Every store in a directory of its own run: these persist (row counts,
+# queues), and a fixed /tmp path was shared by earlier runs and by both
+# engines running at once in the sweep, which lost rows to races.
+var T = os_path_join(os_gettempdir(), "ny_nytorch12_" + str(os_getpid()) + "_" + str(random_int(0, 999999)))
+os_makedirs(T, exist_ok=true)
+
 print "=== NyTorch v3.0 Part 12 Test Suite ==="
 
 # --- MessageQueue ---
 print "--- MessageQueue ---"
-var mq = MessageQueue("test_mq", "/tmp/ny_mq_test")
+var mq = MessageQueue("test_mq", T + "/ny_mq_test")
 mq.push("msg_a")
 mq.push("msg_b")
 mq.push("msg_c")
@@ -20,7 +26,7 @@ print "MessageQueue.PASS"
 
 # --- PubSubBus ---
 print "--- PubSubBus ---"
-var psb = PubSubBus("test_bus", "/tmp/ny_pubsub")
+var psb = PubSubBus("test_bus", T + "/ny_pubsub")
 psb.subscribe("events", "worker_1")
 psb.publish("events", "event_data_1")
 psb.publish("events", "event_data_2")
@@ -39,7 +45,7 @@ print "RPC.PASS"
 
 # --- PeerMesh ---
 print "--- PeerMesh ---"
-var mesh = PeerMesh("node_a", 23000, "/tmp/ny_mesh")
+var mesh = PeerMesh("node_a", 23000, T + "/ny_mesh")
 mesh.join("node_b", "127.0.0.1", 23001)
 mesh.join("node_c", "127.0.0.1", 23002)
 print "peer count: " + str(mesh.peer_count())
@@ -51,7 +57,7 @@ print "PeerMesh.PASS"
 
 # --- MeshNode ---
 print "--- MeshNode ---"
-var node = MeshNode("main_node", 23010, "/tmp/ny_mesh_node")
+var node = MeshNode("main_node", 23010, T + "/ny_mesh_node")
 node.start()
 node.connect("peer_1", "127.0.0.1", 23011)
 node.step()
@@ -65,7 +71,7 @@ print "MeshNode.PASS"
 
 # --- MeshServiceRegistry ---
 print "--- MeshServiceRegistry ---"
-var registry = MeshServiceRegistry("/tmp/ny_svc_reg")
+var registry = MeshServiceRegistry(T + "/ny_svc_reg")
 registry.register("inference_api", "127.0.0.1", 8080, "1.2.0", "ml,gpu")
 registry.register("training_service", "127.0.0.1", 8081, "2.0.1", "ml,cpu")
 registry.register("data_pipeline", "127.0.0.1", 8082, "1.0.0", "etl")
@@ -130,7 +136,7 @@ print "TokenBucketLimiter.PASS"
 
 # --- NyDB + NyTable + QueryBuilder ---
 print "--- NyDB / NyTable / QueryBuilder ---"
-var db = NyDB("test_db", "/tmp/ny_db")
+var db = NyDB("test_db", T + "/ny_db")
 var users = db.create_table("users", ["id", "name", "role", "score"])
 var r1 = users.insert(["1", "alice", "admin", "95"])
 var r2 = users.insert(["2", "bob", "user", "72"])
@@ -190,7 +196,7 @@ print "PrioritizedReplayBuffer.PASS"
 
 # --- DQNAgent ---
 print "--- DQNAgent ---"
-var dqn = DQNAgent(4, 2, "/tmp/ny_dqn")
+var dqn = DQNAgent(4, 2, T + "/ny_dqn")
 dqn.setup()
 var state = tensor([0.5, -0.2, 0.8, 0.1])
 var action = dqn.act(state)
@@ -262,7 +268,7 @@ print "RewardShaper.PASS"
 
 # --- TaskDistributor ---
 print "--- TaskDistributor ---"
-var td = TaskDistributor("test_td", "/tmp/ny_td", 4)
+var td = TaskDistributor("test_td", T + "/ny_td", 4)
 td.submit("task_1", "compute:batch_1")
 td.submit("task_2", "compute:batch_2")
 td.submit("task_3", "compute:batch_3")
@@ -295,3 +301,4 @@ print "ResultAggregator.PASS"
 
 print ""
 print "=== ALL NYTORCH12 TESTS PASSED ==="
+os_rmtree(T, ignore_errors=true)

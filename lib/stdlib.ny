@@ -99,7 +99,7 @@ class HashMap:
             self._keys.append(key)
         self.store[key] = value
     def get(self, key, default):
-        var v = self.store[key]
+        var v = self.store.get(key)
         if v == none:
             return default
         return v
@@ -141,7 +141,7 @@ class OrderedDict:
         self.key_order = []
         self.count = 0
     def set(self, key, value):
-        if self.data[key] == none:
+        if self.data.get(key) == none:
             self.key_order[self.count] = key
             self.count = self.count + 1
         self.data[key] = value
@@ -172,7 +172,7 @@ class Set:
 
     def contains(self, val):
         var key = str(val)
-        var v = self.store[key]
+        var v = self.store.get(key)
         return v != none
 
     def remove(self, val):
@@ -620,25 +620,25 @@ class Config:
         self.set(key, str(value))
 
     def get(self, key, default):
-        var v = self.data[key]
+        var v = self.data.get(key)
         if v == none:
             return default
         return v
 
     def get_int(self, key, default):
-        var v = self.data[key]
+        var v = self.data.get(key)
         if v == none:
             return default
         return int(v)
 
     def get_float(self, key, default):
-        var v = self.data[key]
+        var v = self.data.get(key)
         if v == none:
             return default
         return float(v)
 
     def get_bool(self, key, default):
-        var v = self.data[key]
+        var v = self.data.get(key)
         if v == none:
             return default
         return v == "true" or v == "True" or v == "1" or v == "yes"
@@ -690,7 +690,7 @@ class Config:
         var i = 0
         while i < len(self._key_list):
             var k = self._key_list[i]
-            var v = self.data[k]
+            var v = self.data.get(k)
             if v != none:
                 out = out + k + " = " + str(v) + "\n"
             i = i + 1
@@ -711,19 +711,19 @@ class EventBus:
         self.handlers = {}
         self.handler_counts = {}
     def on(self, event, handler_name):
-        var count = self.handler_counts[event]
+        var count = self.handler_counts.get(event)
         if count == none:
             count = 0
         self.handlers[event + "_" + str(count)] = handler_name
         self.handler_counts[event] = count + 1
     def emit(self, event, data):
-        var count = self.handler_counts[event]
+        var count = self.handler_counts.get(event)
         if count == none:
             return
         var i = 0
         while i < count:
             var key = event + "_" + str(i)
-            var handler = self.handlers[key]
+            var handler = self.handlers.get(key)
             if handler != none:
                 self.handlers[key](data)
             i = i + 1
@@ -734,7 +734,7 @@ class EventBus:
         if handler_name == none:
             self.handler_counts[event] = 0
             return
-        var count = self.handler_counts[event]
+        var count = self.handler_counts.get(event)
         if count == none:
             return
         var i = 0

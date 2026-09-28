@@ -80,13 +80,13 @@ class PubSubBus:
         fs_mkdirs(storage_dir)
 
     def subscribe(self, topic, subscriber_id):
-        if self.topics[topic] == none:
+        if self.topics.get(topic) == none:
             self.topics[topic] = MessageQueue(self.name + "_" + topic + "_" + subscriber_id, self.storage_dir)
             self.subscriber_count = self.subscriber_count + 1
         return self.topics[topic]
 
     def publish(self, topic, message):
-        var queue = self.topics[topic]
+        var queue = self.topics.get(topic)
         if queue != none:
             queue.push(message)
             return true
@@ -94,20 +94,20 @@ class PubSubBus:
 
     def consume(self, topic, subscriber_id):
         var key = topic + "_sub_" + subscriber_id
-        var queue = self.topics[key]
+        var queue = self.topics.get(key)
         if queue == none:
             var queue2 = self.subscribe(topic, subscriber_id)
             return queue2.pop()
         return queue.pop()
 
     def topic_size(self, topic):
-        var queue = self.topics[topic]
+        var queue = self.topics.get(topic)
         if queue == none:
             return 0
         return queue.size()
 
     def has_messages(self, topic):
-        var queue = self.topics[topic]
+        var queue = self.topics.get(topic)
         if queue == none:
             return false
         return not queue.empty()
