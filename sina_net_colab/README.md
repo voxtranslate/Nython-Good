@@ -47,6 +47,24 @@ local SSD in a few minutes. If you place extracted folders on Drive yourself, th
 keeps counting against your quota for 30 days. So rolling snapshots stay on the local disk. The two Drive files are
 refreshed every 30 minutes (`drive_sync_minutes`) and at every validation, stop, interrupt or crash.
 
+## Batch size on large GPUs
+
+The global batch of every stage follows Restormer's progressive schedule (64 at 128 px down to 8 at 384 px) and is
+never changed. What adapts is how that batch is split into micro-batch × GPUs × gradient-accumulation steps. The
+largest micro-batch that fits is used, so that accumulation is as low as possible:
+
+1. At start-up, an eager probe measures memory for each patch size.
+2. After `torch.compile`, the plan is recomputed from the measured compiled-to-eager activation-memory ratio.
+   Compiled blocks keep far fewer intermediate tensors, so eager figures over-state the memory needed.
+3. After `adapt_batch_after` (30) iterations of every stage, the running step's real peak memory is read. If a
+   larger split of the same global batch fits within `probe_memory_fraction` (85 %), the micro-batch grows, e.g.
+   32 × 2 → 64 × 1. This costs one recompilation. The measurement also refines the plan for the stages still to come.
+4. Each measurement is saved to `models/compiled_caps.json`, so later sessions start with the right split. An OOM
+   lowers the cap permanently, via `oom_caps.json`.
+
+Memory left free after this is not wasted time. It only means the fixed global batch needs less than the GPU
+provides; filling it would require changing the batch recipe.
+
 ## Datasets (full versions, verified)
 
 | Folder | Content | Archive size |

@@ -523,7 +523,10 @@ class Config:
         (0.000, 128, 64), (0.307, 160, 40), (0.520, 192, 32),
         (0.680, 256, 16), (0.800, 320, 8), (0.920, 384, 8)])
     max_micro_batch: int = 0         # 0 = auto-probe per patch size on each GPU; >0 = fixed cap
-    probe_memory_fraction: float = 0.85  # fraction of GPU memory the probe may plan to use
+    probe_memory_fraction: float = 0.85  # fraction of GPU memory the planner may use (allocated tensors)
+    # After this many iterations of every stage, the REAL peak memory of the (compiled) training step is
+    # measured and the micro-batch is raised (fewer accumulation steps, same global batch) when it fits.
+    adapt_batch_after: int = 30      # 0 = off
     max_session_hours: float = 11.5  # Colab: "at most 12 hours" (FAQ); 23.5 with Pro+ background execution
     log_every: int = 100
     val_every: int = 5_000           # validation + best.pth selection
@@ -2997,10 +3000,14 @@ class ModelTrainer:
             self._resume_checkpoint()
         self.caps: Dict[int, int] = {}
         self.speeds: Dict[int, Optional[float]] = {}
+        self.mem_model: Dict[int, Tuple[float, float]] = {}  # eager probe: patch -> (fixed bytes, bytes/sample)
+        self.eager_caps: Dict[int, int] = {}
+        self._adapt_at: Optional[int] = None
         self.plan: List[dict] = []
         self.compiled = False
         if self.train_sets and self.iteration < config.total_iters:
             self._measure_caps()      # eager probe (conservative for memory), BEFORE DDP wrapping
+            self.eager_caps = dict(self.caps)  # really executed in eager mode: a safe floor for the compiled step
             self.plan = self._build_plan()
             self.compiled = self._setup_compile()  # after the EMA copy (which stays eager)
             self._print_plan()
@@ -3034,7 +3041,7 @@ class ModelTrainer:
         allowed = dist_all_reduce([float(compile_guard_allows(c))], "min")[0]
         if not allowed:
             return False
-        ok, why, speedup = 1.0, "", 1.0
+        ok, why, speedup, rho = 1.0, "", 1.0, None
         t0 = time.time()
         st = self.plan[self.stage_at(self.iteration)]
         compile_guard_mark(c, "attempting")
@@ -3044,7 +3051,7 @@ class ModelTrainer:
             else:
                 print(f"  compiling the SINA / local blocks for {st['micro']}x{st['patch']}px and checking them "
                       f"against eager mode (one-time per stage, a few minutes)...")
-                err, speedup = self._compile_check(st["patch"], st["micro"])
+                err, speedup, rho = self._compile_check(st["patch"], st["micro"])
                 if not err < 2e-2:
                     ok, why = 0.0, f"compiled output differs from eager by {err:.2e}"
         except Exception as e:  # Triton / Inductor / Dynamo failure on this platform, or OOM
@@ -3059,8 +3066,108 @@ class ModelTrainer:
             if self.speeds[p]:
                 self.speeds[p] *= max(1.0, speedup)
         print(f"  torch.compile OK ({time.time() - t0:.0f} s incl. compilation): matches eager, "
-              f"{speedup:.1f}x faster per training step.")
+              f"{speedup:.1f}x faster per training step"
+              + (f", {rho:.2f}x the eager activation memory." if rho else "."))
+        rho = dist_all_reduce([rho if rho else 0.0], "max")[0] or None
+        self._plan_for_compiled_memory(rho)
         return True
+
+    # ------------------------------------------------ memory-aware micro-batch
+    # Global batch per stage is FIXED (Restormer's schedule); only its split micro x GPUs x accumulation
+    # changes. The eager probe over-estimates the memory of a compiled step (Inductor fuses element-wise
+    # chains and keeps far fewer intermediates), so the plan is re-derived for compiled memory at start-up
+    # and then CHECKED against the real peak of the running step at every stage (adapt_batch_after).
+    def _gpu_total(self) -> int:
+        return torch.cuda.get_device_properties(torch.device(self.config.device)).total_memory
+
+    def _mem_snapshot(self) -> Tuple[int, int]:
+        """(peak allocated since the stage started, currently allocated = persistent state)."""
+        dev = torch.device(self.config.device)
+        return torch.cuda.max_memory_allocated(dev), torch.cuda.memory_allocated(dev)
+
+    def _param_bytes(self) -> int:
+        return sum(p.numel() * p.element_size() for p in self.model.parameters())
+
+    def _oom_hint(self, patch: int) -> int:
+        return int(self._read_json("oom_caps.json").get(str(patch), 10 ** 9))
+
+    def _plan_for_compiled_memory(self, rho: Optional[float]):
+        c = self.config
+        if not (c.device.startswith("cuda") and c.max_micro_batch == 0):
+            return
+        measured = self._read_json("compiled_caps.json")
+        budget = c.probe_memory_fraction * self._gpu_total() - 2 * self._param_bytes()
+        changes = []
+        for p, gb in sorted(self._stage_global_batches().items()):
+            need = math.ceil(gb / DIST.total_gpus)
+            key = self._cache_key(p) + "|compiled"
+            if key in measured:                      # measured on this GPU in an earlier session
+                new = int(measured[key])
+            elif rho and p in self.mem_model:        # eager memory model x compiled/eager ratio (+10% margin)
+                fixed, per = self.mem_model[p]
+                new = int((budget - fixed) // max(1.0, per * min(1.0, rho) * 1.10))
+            else:
+                continue
+            new = max(1, min(need, max(new, self.eager_caps.get(p, 1)), self._oom_hint(p)))
+            if new != self.caps[p]:
+                changes.append((p, self.caps[p], new))
+                self.caps[p] = new
+        if DIST.ddp:
+            ps = sorted(self.caps)
+            for p_, v in zip(ps, dist_all_reduce([float(self.caps[q]) for q in ps], "min")):
+                self.caps[p_] = int(v)
+        if changes:
+            self.plan = self._build_plan()
+            print("  micro-batch caps re-planned for the compiled step: " +
+                  ", ".join(f"{p}px {a}->{b}" for p, a, b in changes) + " (verified against the real peak at each stage)")
+
+    def _adapt_micro_batch(self, st: dict) -> bool:
+        """Measures the running step's real peak memory and, if a larger micro-batch fits in
+        probe_memory_fraction of the GPU, re-splits the SAME global batch with fewer accumulation
+        steps. Also extrapolates the measurement to the stages still to come (memory ~ pixels)."""
+        c = self.config
+        p, gb = st["patch"], st["global_batch"]
+        micro = max(1, st["micro"] // DIST.gpus_per_proc)
+        total = self._gpu_total()
+        peak, base = self._mem_snapshot()
+        per = max(1.0, (peak - base) / micro)
+        budget = c.probe_memory_fraction * total
+        need = math.ceil(gb / DIST.total_gpus)
+        mem_fit = int((budget - base) // per)
+        fit = max(1, min(mem_fit, need, self._oom_hint(p)))
+        fit = int(dist_all_reduce([float(fit)], "min")[0])
+        meas = self._read_json("compiled_caps.json")
+        meas[self._cache_key(p) + ("|compiled" if self.compiled else "|eager-run")] = fit
+        self._write_json("compiled_caps.json", meas)
+        G = 2 ** 30
+        msg = (f"[batch] {p}px: peak {peak / G:.1f} GB of {total / G:.0f} GB at micro-batch {micro} "
+               f"({per / G:.2f} GB/sample + {base / G:.1f} GB persistent) -> {min(mem_fit, need)} fit in "
+               f"{c.probe_memory_fraction:.0%}" + (f" (capped at {fit} by an earlier OOM)" if fit < min(mem_fit, need) else ""))
+        cur_accum = st["accum"]
+        new_accum = max(1, math.ceil(gb / (fit * DIST.gpus_per_proc * DIST.world)))
+        # stages still to come: the measured per-sample memory (x pixel ratio, +10% margin) replaces the
+        # start-up estimate unless that stage was itself measured in an earlier session
+        for q, qgb in sorted(self._stage_global_batches().items()):
+            if q > p and (self._cache_key(q) + "|compiled") not in meas:
+                pred = int((budget - base) // (per * (q / p) ** 2 * 1.10))
+                self.caps[q] = max(1, min(max(pred, self.eager_caps.get(q, 1)), math.ceil(qgb / DIST.total_gpus),
+                                          self._oom_hint(q)))
+        if new_accum < cur_accum:
+            self.caps[p] = fit
+            self.plan = self._build_plan()
+            ns = self.plan[self.stage_at(self.iteration)]
+            print(f"\n{msg}: micro-batch {st['micro']} x {cur_accum} accumulation -> {ns['micro']} x {ns['accum']} "
+                  f"(global batch {gb} unchanged; one recompilation for the new shape)")
+            self._print_plan()
+            return True
+        if cur_accum == 1:
+            print(f"\n{msg}: the global batch {gb} already runs without accumulation.")
+        else:
+            nxt = math.ceil(gb / (DIST.world * (cur_accum - 1)))
+            print(f"\n{msg}: the next split ({nxt} x {cur_accum - 1}) would need ~{(base + nxt * per) / G:.0f} GB, "
+                  f"so {st['micro']} x {cur_accum} stays (the global batch is fixed by the schedule).")
+        self.plan = self._build_plan()
+        return False
 
     def _disable_compile(self, why: str):
         uncompile_blocks(self.model)
@@ -3074,44 +3181,54 @@ class ModelTrainer:
         self.compiled = False
         print(f"  torch.compile disabled ({why}); training in eager mode.")
 
-    def _compile_check(self, patch: int, b: int) -> Tuple[float, float]:
-        """(relative max difference compiled vs eager, eager_time / compiled_time)
-        for one training step (train mode, forward + backward, identical weights
-        and signature statistics)."""
+    def _compile_check(self, patch: int, b: int) -> Tuple[float, float, Optional[float]]:
+        """(relative max difference compiled vs eager, eager_time / compiled_time,
+        compiled / eager activation-memory ratio) for one training step (train mode,
+        forward + backward, identical weights and signature statistics)."""
         m = self.model
         stds = [x for x in m.modules() if isinstance(x, RunningStandardizer)]
         saved = [(x, (x.mean.clone(), x.sq.clone(), x.count.clone())) for x in stds]
         g = torch.Generator(device="cpu").manual_seed(0)
         x = torch.rand(b, 3, patch, patch, generator=g).to(self.config.device)
         m.train()
-        sync = (lambda: torch.cuda.synchronize()) if self.config.device.startswith("cuda") else (lambda: None)
+        cuda = self.config.device.startswith("cuda")
+        sync = (lambda: torch.cuda.synchronize()) if cuda else (lambda: None)
+        act = {}
 
-        def run():
+        def run(tag=None):
             self._restore_standardizers(saved)
             sync()
+            if cuda:
+                torch.cuda.reset_peak_memory_stats()
+                base = torch.cuda.memory_allocated()
             t = time.time()
             with torch.autocast(self.amp_device_type, dtype=self.amp_dtype, enabled=self.use_amp):
                 out, aux = m(x, return_aux=True)
             out.float().square().mean().backward()
             sync()
             dt = time.time() - t
+            if cuda and tag:
+                act[tag] = torch.cuda.max_memory_allocated() - base  # activation (+ gradient) memory of one step
             gnorm = torch.sqrt(sum((p.grad.float() ** 2).sum() for p in m.parameters() if p.grad is not None))
             m.zero_grad(set_to_none=True)
             return out.detach().float(), float(gnorm), dt
 
         try:
             run()                       # compiles
-            out_c, g_c, t_c = run()     # timed, compiled
+            out_c, g_c, t_c = run("compiled")     # timed, compiled
             with eager_mode(m):
                 run()                   # eager warm-up (cudnn autotune)
-                out_e, g_e, t_e = run()
+                out_e, g_e, t_e = run("eager")
         finally:
             self._restore_standardizers(saved)
             m.zero_grad(set_to_none=True)
+            if cuda:
+                torch.cuda.empty_cache()  # release the eager pool: nvidia-smi then shows what training really uses
         if not (torch.isfinite(out_c).all() and math.isfinite(g_c)):
-            return float("inf"), 1.0
+            return float("inf"), 1.0, None
         err = float((out_c - out_e).abs().max() / out_e.abs().max().clamp_min(1e-6))
-        return max(err, abs(g_c - g_e) / max(abs(g_e), 1e-12)), t_e / max(t_c, 1e-9)
+        rho = (act["compiled"] / max(act["eager"], 1)) if ("compiled" in act and "eager" in act) else None
+        return max(err, abs(g_c - g_e) / max(abs(g_e), 1e-12)), t_e / max(t_c, 1e-9), rho
 
     # -------------------------------------------------- batch-size planning
     def _stage_global_batches(self) -> Dict[int, int]:
@@ -3151,9 +3268,10 @@ class ModelTrainer:
         for m, (a, b, n) in saved:
             m.mean.copy_(a); m.sq.copy_(b); m.count.copy_(n)
 
-    def _probe(self, patch: int, need: int) -> Tuple[int, float]:
+    def _probe(self, patch: int, need: int) -> Tuple[int, float, float, float]:
         """Largest per-GPU micro-batch for `patch` within probe_memory_fraction of
-        GPU memory, plus measured training throughput (samples/s/GPU)."""
+        GPU memory, measured training throughput (samples/s/GPU) and the EAGER memory
+        model (fixed bytes, bytes per sample) used later to plan the compiled step."""
         c = self.config
         dev = torch.device(c.device)
         m, crit = self.model, self.criterion
@@ -3203,7 +3321,7 @@ class ModelTrainer:
             m.zero_grad(set_to_none=True)
             self._restore_standardizers(saved)
             torch.cuda.empty_cache()
-        return b, b / max(dt, 1e-6)
+        return b, b / max(dt, 1e-6), float(p1 - per), float(per)
 
     def _measure_caps(self):
         c = self.config
@@ -3220,12 +3338,15 @@ class ModelTrainer:
                 key = self._cache_key(p)
                 hit = cache.get(key)
                 # reuse a cached probe only if it was memory-limited or probed for at least this need
-                if hit and len(hit) == 3 and (hit[0] < hit[2] or hit[2] >= need):
+                if hit and len(hit) >= 3 and (hit[0] < hit[2] or hit[2] >= need):
                     cap, sps = min(int(hit[0]), need), hit[1]
+                    if len(hit) >= 5:
+                        self.mem_model[p] = (float(hit[3]), float(hit[4]))
                 else:
                     print(f"  probing max micro-batch at {p}x{p} ...")
-                    cap, sps = self._probe(p, need)
-                    cache[key] = [cap, sps, need]
+                    cap, sps, fixed, per = self._probe(p, need)
+                    cache[key] = [cap, sps, need, fixed, per]
+                    self.mem_model[p] = (fixed, per)
             if str(p) in hints:
                 cap = min(cap, int(hints[str(p)]))
             self.caps[p], self.speeds[p] = cap, sps
@@ -3524,6 +3645,10 @@ class ModelTrainer:
                     compile_guard_mark(c, "attempting")
                     self._compile_pending_ok = True
                 loader_it = iter(self._make_loader(si, self.iteration))
+                self._adapt_at = None
+                if c.device.startswith("cuda") and c.max_micro_batch == 0 and c.adapt_batch_after > 0:
+                    torch.cuda.reset_peak_memory_stats(torch.device(c.device))
+                    self._adapt_at = self.iteration + c.adapt_batch_after
             st = self.plan[stage_idx]
             accum = st["accum"]
             lr = self.lr_at(self.iteration)
@@ -3595,6 +3720,10 @@ class ModelTrainer:
             self.iteration += 1
             pbar.update(1)
             window.append((logs["psnr"], logs["in_psnr"]))
+            if self._adapt_at is not None and self.iteration >= self._adapt_at and self.iteration < st["end"]:
+                self._adapt_at = None
+                if self._adapt_micro_batch(st):
+                    replan = True
 
             if self.iteration % c.log_every == 0:
                 ps = np.mean([w[0] for w in window]); ip = np.mean([w[1] for w in window]); window.clear()
