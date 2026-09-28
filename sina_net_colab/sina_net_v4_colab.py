@@ -3754,6 +3754,7 @@ class ModelInferencer:
         self.compiled = bool(compile_ok) and compile_guard_allows(config) and compile_blocks(model) > 0
         self._compiled_shapes: set = set()
         self.max_compiled_shapes = 6  # datasets with many image sizes (Rain) run eagerly beyond this
+        self.compile_events = 0       # compilations triggered so far (their time is excluded from speed stats)
         os.makedirs(config.output_dir, exist_ok=True)
         self.amp_device_type = "cuda" if config.device.startswith("cuda") else "cpu"
         self.use_amp = config.use_amp and config.device.startswith("cuda")
@@ -3766,6 +3767,7 @@ class ModelInferencer:
         if self.compiled and shape not in self._compiled_shapes and len(self._compiled_shapes) < self.max_compiled_shapes:
             self._compiled_shapes.add(shape)
             new_shape = True
+            self.compile_events += 1
         ctx = contextlib.nullcontext() if (self.compiled and shape in self._compiled_shapes) else eager_mode(self.model)
         try:
             if new_shape:
@@ -3864,19 +3866,25 @@ class ModelInferencer:
         loader = DataLoader(torch.utils.data.Subset(ds, mine), batch_size=1, shuffle=False, num_workers=nw)
         records = []
         use_lpips = self.config.eval_lpips
+        seen_shapes = set()
         for idx, (degraded, clean, _) in zip(mine, tqdm(loader, desc=f"Evaluating {dataset_name}",
                                                           disable=not DIST.is_main, **_tqdm_kw())):
             degraded, clean = degraded.to(self.config.device), clean.to(self.config.device)
             self._sync()
+            c0 = self.compile_events
             t0 = time.perf_counter()
             pred = (self._self_ensemble_predict(degraded) if self_ensemble else self.predict(degraded)).clamp(0, 1)
             self._sync()
             ms = (time.perf_counter() - t0) * 1000
+            # the first image of a new size pays torch.compile and/or cuDNN autotuning: not model speed
+            warmup = self.compile_events > c0 or tuple(degraded.shape) not in seen_shapes
+            seen_shapes.add(tuple(degraded.shape))
             m = RestorationMetrics.compute(pred, clean, **proto)
             mi = RestorationMetrics.compute(degraded, clean, **proto)
             rec = {"idx": int(idx), "psnr": m["psnr"], "ssim": m["ssim"], "mae": m["mae"],
                    "in_psnr": mi["psnr"], "in_ssim": mi["ssim"], "in_mae": mi["mae"],
-                   "gain": m["psnr"] - mi["psnr"], "ms": ms, "H": int(clean.shape[-2]), "W": int(clean.shape[-1])}
+                   "gain": m["psnr"] - mi["psnr"], "ms": ms, "warmup": bool(warmup),
+                   "H": int(clean.shape[-2]), "W": int(clean.shape[-1])}
             if use_lpips:
                 lp = LPIPSMetric.compute(pred, clean)
                 if lp is None:
@@ -3897,7 +3905,12 @@ class ModelInferencer:
             parts = [None] * DIST.world
             dist.all_gather_object(parts, records)
             records = sorted([r for part in parts for r in part], key=lambda r: r["idx"])
-        res = {k: float(np.mean([r[k] for r in records])) for k in ("psnr", "ssim", "mae", "in_psnr", "in_ssim", "gain", "ms")}
+        res = {k: float(np.mean([r[k] for r in records])) for k in ("psnr", "ssim", "mae", "in_psnr", "in_ssim", "gain")}
+        steady = [r["ms"] for r in records if not r.get("warmup")]
+        timed = steady or [r["ms"] for r in records]
+        res["ms"] = float(np.median(timed))              # median steady-state time per image (end-to-end predict)
+        res["ms_mean_incl_warmup"] = float(np.mean([r["ms"] for r in records]))
+        res["ms_warmup_images"] = len(records) - len(steady)
         if records and "lpips" in records[0]:
             res["lpips"] = float(np.mean([r["lpips"] for r in records]))
             res["in_lpips"] = float(np.mean([r["in_lpips"] for r in records]))
@@ -3906,7 +3919,7 @@ class ModelInferencer:
         res["records"] = records
         print(f"  {dataset_name}: PSNR {res['psnr']:.2f} dB (input {res['in_psnr']:.2f}) | SSIM {res['ssim']:.4f} | "
               f"MAE {res['mae']:.4f}" + (f" | LPIPS {res['lpips']:.4f}" if "lpips" in res else "") +
-              f" | {res['ms']:.0f} ms/img | n={n} | protocol {proto}")
+              f" | {res['ms']:.0f} ms/img (median, {res['ms_warmup_images']} warm-up img excluded) | n={n} | protocol {proto}")
         return res
 
 
@@ -4375,7 +4388,7 @@ def fig_dataset_dashboard(name: str, recs: List[dict], out_dir: str) -> dict:
                  f"worst image    #{recs[int(np.argmin(gain))]['idx']}  ({gain.min():+.2f} dB)",
                  f"low-freq FRER  {frer[:N_ERROR_BANDS // 4].mean():+6.2f} dB",
                  f"high-freq FRER {frer[N_ERROR_BANDS // 2:].mean():+6.2f} dB",
-                 f"runtime        {np.mean([r['ms'] for r in recs]):7.1f} ms / image"]
+                 f"runtime        {np.median([r['ms'] for r in recs if not r.get('warmup')] or [r['ms'] for r in recs]):7.1f} ms / image (median)"]
         ax.text(0.02, 0.98, "\n".join(lines), va="top", ha="left", family="monospace", fontsize=10)
 
     painters = [("scatter", scatter, (6, 5.2)), ("gain_hist", hist, (6, 4.4)), ("transition_matrix", trans, (6.4, 5.4)),
@@ -7086,6 +7099,9 @@ def _main(config: Config):
                     f"{', x8 self-ensemble' if config.use_self_ensemble_tta else ''})",
                     ["Test set", "Images", "Input PSNR", "PSNR", "SSIM", "MAE", "LPIPS", "Gain dB [95% CI]",
                      "% images improved", "ms / image", "Protocol"], rows,
+                    notes=["ms / image = median end-to-end predict() time per image (signature + network, AMP, compiled "
+                           "when enabled), EXCLUDING the first image of every new size, which pays the one-off "
+                           "torch.compile / cuDNN autotuning cost. Pure network latency: see complexity_whole_model."],
                     fmt={"Input PSNR": "{:.2f}", "PSNR": "{:.2f}", "SSIM": "{:.4f}", "MAE": "{:.4f}", "LPIPS": "{:.4f}",
                          "% images improved": "{:.1f}", "ms / image": "{:.1f}"}
                     ).save(os.path.join(tabdir, "results_main"))
