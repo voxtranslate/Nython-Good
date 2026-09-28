@@ -5822,6 +5822,9 @@ public:
         if (inst.type != ValueType::NONE) return instanceString(inst, global_ctx);
         if (flow.size() > 8 && flow.compare(0, 8, "__exc__:") == 0) {
             size_t c = flow.find(':', 8);
+            // A raised instance no longer in the ring (rememberRaised): its
+            // serial number is not a message.
+            if (c != std::string::npos && flow.compare(c + 1, 8, "__obj__:") == 0) return std::string();
             return c == std::string::npos ? std::string() : flow.substr(c + 1);
         }
         return flow;

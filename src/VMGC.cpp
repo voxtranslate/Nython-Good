@@ -183,11 +183,24 @@ long collect_impl(VirtualMachine& vm, int g) {
     return found;
 }
 
+size_t heap_after_full = 0;
+
 void collect_due(VirtualMachine& vm) {
+    // A full collection also when the heap has doubled since the last one
+    // (NyGC.cpp explains why object counts alone are not enough).
+    size_t h = nygc::heap_bytes();
+    if (h && !heap_after_full) heap_after_full = h;
+    if (h > 2 * heap_after_full && h > heap_after_full + ((size_t)16 << 20)) {
+        collect_impl(vm, 2);
+        nygc::trim_heap();
+        heap_after_full = nygc::heap_bytes();
+        return;
+    }
     for (int g = 2; g >= 0; g--) {
         if (counts[g] <= thresholds[g]) continue;
         if (g == 2 && long_lived_pending < long_lived_total / 4) continue;
         collect_impl(vm, g);
+        if (g == 2) { nygc::trim_heap(); heap_after_full = nygc::heap_bytes(); }
         break;
     }
 }
@@ -277,7 +290,9 @@ long collect(VirtualMachine& vm, int generation) {
     if (generation > 2) generation = 2;
     if (collecting) return 0;
     if (!in_safe_point) safe_point_slow(vm);
-    return collect_impl(vm, generation);
+    long n = collect_impl(vm, generation);
+    if (generation == 2) { nygc::trim_heap(); heap_after_full = nygc::heap_bytes(); }
+    return n;
 }
 
 void set_enabled(bool on) {

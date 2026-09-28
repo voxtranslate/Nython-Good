@@ -32,6 +32,7 @@
 // includes Value.hpp, which needs it).
 #include "Value.hpp"
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -100,6 +101,14 @@ long long tracked_objects();
 // Strings (untracked, counted for gc_stats()).
 extern long long g_live_strings;
 extern long long g_string_bytes;
+
+// Bytes the C allocator has handed out and not got back (glibc; 0 where
+// unknown). Both engines run a full collection when it has doubled since
+// their last one.
+size_t heap_bytes();
+// Give the allocator's free pages back to the system (after a full
+// collection; glibc malloc_trim, a no-op elsewhere).
+void trim_heap();
 
 // Resident set size of the process in KB (Linux /proc; 0 where unknown).
 long long rss_kb();

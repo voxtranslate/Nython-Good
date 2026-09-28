@@ -5,6 +5,9 @@
 
 #include <cstdio>
 #include <cstdlib>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <cstring>
 #include <deque>
 #include <mutex>
@@ -203,11 +206,38 @@ long collect_impl(int gen) {
     return n;
 }
 
+// After a full collection, give the pages the allocator holds free back to
+// the system (glibc keeps them otherwise: a phase that built and dropped
+// 60 MB of floats kept the process 60 MB larger for the rest of its life).
+void release_free_pages() {
+#if defined(__GLIBC__)
+    malloc_trim(0);
+#endif
+}
+
+size_t heap_after_full = 0;
+
 void collect_due() {
+    // The generation thresholds count objects, not bytes: a few hundred
+    // objects that each hold 100,000 floats (a model's parameters) are old
+    // before they become garbage, and waited for a full collection that the
+    // object counts put off - four models built in turn kept all four
+    // (263 MB). So a full collection also runs when the heap has doubled
+    // since the last one (and grown by 16 MB): memory stays within about
+    // twice what is live, and the work is amortised over what was allocated.
+    size_t h = heap_bytes();
+    if (h && !heap_after_full) heap_after_full = h;
+    if (h > 2 * heap_after_full && h > heap_after_full + ((size_t)16 << 20)) {
+        collect_impl(kGenerations - 1);
+        release_free_pages();
+        heap_after_full = heap_bytes();
+        return;
+    }
     for (int g = kGenerations - 1; g >= 0; g--) {
         if (counts[g] <= thresholds[g]) continue;
         if (g == kGenerations - 1 && long_lived_pending < long_lived_total / 4) continue;
         collect_impl(g);
+        if (g == kGenerations - 1) { release_free_pages(); heap_after_full = heap_bytes(); }
         break;
     }
 }
@@ -303,7 +333,9 @@ long collect(int generation) {
     bool saved = in_safe_point;
     if (!in_safe_point && !final_queue.empty()) { safe_point_slow(); }
     in_safe_point = saved;
-    return collect_impl(generation);
+    long n = collect_impl(generation);
+    if (generation == kGenerations - 1) { release_free_pages(); heap_after_full = heap_bytes(); }
+    return n;
 }
 
 void set_enabled(bool on) { enabled = on; note_due(); }
@@ -342,6 +374,17 @@ static long long proc_status_kb(const char* key) {
     return v;
 }
 long long rss_kb() { return proc_status_kb("VmRSS:"); }
+
+void trim_heap() { release_free_pages(); }
+
+size_t heap_bytes() {
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
+    struct mallinfo2 mi = mallinfo2();
+    return mi.uordblks + mi.hblkhd;
+#else
+    return 0;   // no byte trigger: the generation counts alone
+#endif
+}
 long long peak_rss_kb() { return proc_status_kb("VmHWM:"); }
 
 } // namespace nygc

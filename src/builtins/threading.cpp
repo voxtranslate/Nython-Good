@@ -208,7 +208,9 @@ struct InterpArgs : nyconc::Args {
 InterpEngine& engine_for(NythonExecutor& E) {
     // One engine per executor, never freed: threads may outlive the call that
     // created them (daemons at process exit).
-    static std::unordered_map<NythonExecutor*, InterpEngine*> engines;
+    // The table is never destroyed either, so a leak checker sees the
+    // engines as referenced at exit.
+    static auto& engines = *new std::unordered_map<NythonExecutor*, InterpEngine*>();
     auto it = engines.find(&E);
     if (it != engines.end()) return *it->second;
     auto* eng = new InterpEngine(E);
