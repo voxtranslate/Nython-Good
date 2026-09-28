@@ -126,6 +126,10 @@ loudly if not found) if auto-detection picks the wrong one.
   runs it under Wine and `python3 tools/sweep.py --bin build-win/nywin` sweeps it.
 - `long` is 32 bits on Windows: never cast a Nython integer through `long`
   (use `int64_t`/`long long`, `intValue()`, `bigint_to_i64()`).
+- The project targets Vista (`_WIN32_WINNT=0x0600`): a newer Win32 API must be
+  looked up with `GetProcAddress` (see `stack_limits` in `src/NyCoro.cpp`).
+- It links with an 8 MB main stack (`-Wl,--stack,8388608`), as Linux gives;
+  the PE default of 2 MB made deep recursion and nested generators stop early.
 
 ### Development environment (no SDL3 available)
 

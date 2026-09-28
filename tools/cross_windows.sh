@@ -75,7 +75,7 @@ build() {
         if [ ! -f "$o" ] || [ -n "$(find {} include -newer "$o" -name "*.[ch]pp" -print -quit)" ]; then
             $CXX $flags -c {} -o "$o" || { echo "COMPILE FAIL {}"; exit 1; }
         fi'
-    $CXX -o "$OUT/nython.exe" "$OUT"/obj/*.o -L"$PREFIX/lib" -lmingw32 -lSDL3 -lSDL3_ttf -lSDL3_image -lws2_32 -lpthread
+    $CXX -o "$OUT/nython.exe" "$OUT"/obj/*.o -Wl,--stack,8388608 -L"$PREFIX/lib" -lmingw32 -lSDL3 -lSDL3_ttf -lSDL3_image -lws2_32 -lpthread
     cp "$PREFIX"/bin/*.dll "$OUT/"
     cp /usr/lib/gcc/x86_64-w64-mingw32/*-posix/libstdc++-6.dll /usr/lib/gcc/x86_64-w64-mingw32/*-posix/libgcc_s_seh-1.dll \
        /usr/x86_64-w64-mingw32/lib/libwinpthread-1.dll "$OUT/"

@@ -27,6 +27,21 @@
 #    define NOMINMAX
 #  endif
 #  include <windows.h>
+// GetCurrentThreadStackLimits is Windows 8+ and the project targets Vista
+// (_WIN32_WINNT 0x0600 in nython.cbp), so it is looked up at run time; where
+// it is missing, the allocation base VirtualQuery reports for a local (the
+// reserved low end of the stack the code runs on - a fiber's own, as the
+// TEB's stack fields are switched with the fiber) stands in for it.
+static void stack_limits(ULONG_PTR* lo, ULONG_PTR* hi) {
+    using Fn = VOID (WINAPI*)(PULONG_PTR, PULONG_PTR);
+    static Fn fn = (Fn)(void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"),
+                                             "GetCurrentThreadStackLimits");
+    if (fn) { fn(lo, hi); return; }
+    MEMORY_BASIC_INFORMATION mbi{};
+    VirtualQuery(&mbi, &mbi, sizeof mbi);
+    *lo = (ULONG_PTR)mbi.AllocationBase;
+    *hi = (ULONG_PTR)((NT_TIB*)NtCurrentTeb())->StackBase;
+}
 #else
 #  include <pthread.h>
 #  include <sys/mman.h>
@@ -449,7 +464,7 @@ static void nycoro_run(Coro* c) {
 #else
     {
         ULONG_PTR lo = 0, hi = 0;
-        GetCurrentThreadStackLimits(&lo, &hi);
+        stack_limits(&lo, &hi);
         size_t m = floor_margin((size_t)(hi - lo));
         c->floor = (uintptr_t)lo + m + 3 * 4096;   // + the fiber's guard pages
         c->hot = c->floor;
@@ -546,7 +561,7 @@ uintptr_t os_stack_floor() {
     uintptr_t lo = 0, size = 0;
 #if defined(NYCORO_FIBERS)
     ULONG_PTR l = 0, h = 0;
-    GetCurrentThreadStackLimits(&l, &h);
+    stack_limits(&l, &h);
     lo = (uintptr_t)l; size = (uintptr_t)(h - l);
 #elif defined(__APPLE__)
     char* top = (char*)pthread_get_stackaddr_np(pthread_self());

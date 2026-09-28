@@ -108,6 +108,9 @@
             <Add directory="include" />
         </Compiler>
         <Linker>
+            <!-- An 8 MB main-thread stack, as Linux gives (the PE default is 2 MB):
+                 deep recursion and nested generators get the same headroom -->
+            <Add option="-Wl,--stack,8388608" />
             <Add library="ws2_32" />
         </Linker>
         <!-- ═══════════ Source files ═══════════ -->
