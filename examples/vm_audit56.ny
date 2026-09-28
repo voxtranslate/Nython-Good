@@ -357,6 +357,9 @@ log = []
 check("any() closes a generator expression it stops early", any(True for x in guarded()), True)
 check("its finally ran", log, ["start", "finally"])
 log = []
+check("zip over a temporary generator", list(zip("a", guarded())), [("a", 1)])
+check("closes it with the zip", log, ["start", "finally"])
+log = []
 check("next() of a temporary", next(guarded()), 1)
 check("closes the temporary", log, ["start", "finally"])
 log = []
@@ -552,7 +555,26 @@ def deep(n):
     return deep(n + 1) + 1
 def calls_deep():
     yield deep(0)
-check("deep recursion inside a generator", error_of(lambda: next(calls_deep())), "RecursionError")
+check("runaway recursion inside a generator", error_of(lambda: next(calls_deep())), "RecursionError")
+def depth(n):
+    if n == 0:
+        return 0
+    return depth(n - 1) + 1
+def calls_depth(n):
+    yield depth(n)
+    yield depth(n // 2)
+check("a 500-deep recursion inside a generator", list(calls_depth(500)), [500, 250])
+class Node:
+    def __init__(self, child):
+        self.child = child
+    def size(self):
+        return 1 + (self.child.size() if self.child else 0)
+def sizes():
+    n = None
+    for i in range(400):
+        n = Node(n)
+    yield n.size()
+check("deep method recursion inside a generator", next(sizes()), 400)
 
 def self_driving():
     yield next(me)

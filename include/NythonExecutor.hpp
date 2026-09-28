@@ -4577,11 +4577,9 @@ public:
             throw std::string("__exc__:RecursionError:maximum call depth exceeded ("
                               + std::to_string(kMaxCallDepth) + ") — check for unintended "
                               "self-recursion, e.g. a method with the same name as a builtin");
-        // Inside a generator the body runs on the generator's own, smaller
-        // stack: stop before it overflows (NY_GEN_STACK_KB sets its size).
-        if (nycoro::stack_exhausted())
-            throw std::string("__exc__:RecursionError:maximum recursion depth exceeded in a generator "
-                              "(its stack is full; NY_GEN_STACK_KB sets the size, in KB)");
+        // Inside a generator the body runs on the generator's own stack;
+        // near its end, the call continues on an extension stack (nygen).
+        if (nycoro::stack_exhausted()) return nygen::call_on_new_stack(*this, node, ctx);
         DepthGuard _depth_guard(call_depth_);
         auto cn = static_pointer_cast<CallNode>(node);
         // Zero cost when profiling is off: ProfScope short-circuits on the flag.
@@ -7387,6 +7385,9 @@ public:
     // body on a coroutine of its own, a step per next() (src/NyGen.cpp).
     Value runFunctionBody(FunctionNode* fn, Context* fc) {
         if (bodyYields(fn->body)) return nygen::make_function_gen(*this, fn, fc);
+        // Calls that do not pass through evalCall (operators, callbacks of
+        // builtins) meet the same stack check (see evalCall).
+        if (nycoro::stack_exhausted()) return nygen::body_on_new_stack(*this, fn, fc);
         try { return evalBody(fn->body, fc); }
         catch (nython::node::ReturnSignal& r) { return r.value; }
     }

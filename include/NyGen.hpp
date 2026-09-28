@@ -163,6 +163,19 @@ void run_pending(NythonExecutor& E);
 // its interpreter shuts down).
 void close_all(NythonExecutor& E);
 
+// The executor is going away: generator objects destroyed from now on only
+// release their own memory (no language code runs, no contexts are reaped).
+void shutdown();
+
+// ── Deep calls inside a generator ──────────────────────────────────────────
+// A generator body runs on a stack of NY_GEN_STACK_KB (1 MB by default). A
+// call made where that stack is nearly full runs on an extension stack of
+// its own instead (switched to and back like a nested call), so recursion
+// inside a generator reaches the interpreter's usual depth limit
+// (RecursionError at 900 calls) exactly as it does outside one.
+Value call_on_new_stack(NythonExecutor& E, const node_ptr& call_node, Context* ctx);
+Value body_on_new_stack(NythonExecutor& E, void* fn_node, Context* fc);
+
 struct Stats { size_t live_suspended; size_t created; size_t coroutines; };
 Stats stats();
 

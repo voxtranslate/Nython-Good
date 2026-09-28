@@ -66,6 +66,7 @@ struct Gen {
     bool orphan = false;          // its object died while it was running
     std::string name;
     uint64_t serial = 0;
+    uint64_t creator = 0;         // nycoro::thread_token() of the thread that made it
     int birth_depth = 0;
     Gen* lprev = nullptr;         // list of suspended function generators
     Gen* lnext = nullptr;
@@ -101,6 +102,7 @@ struct Gen {
 namespace {
 
 thread_local Gen* t_cur = nullptr;          // the generator whose body is running
+bool g_shutdown = false;                    // the executor is being torn down
 Gen* g_list_head = nullptr;                 // suspended function generators (GIL held)
 Gen* g_list_tail = nullptr;
 thread_local std::vector<Gen*> t_pending_list;   // dropped while suspended, to finalize
@@ -491,6 +493,7 @@ Gen* new_gen(NythonExecutor& E, Kind k, const std::string& name) {
     g->kind = k;
     g->name = name;
     g->serial = ++t_serial;
+    g->creator = nycoro::thread_token();
     g->birth_depth = NythonExecutor::call_depth_;
     g_created++;
     return g;
@@ -649,6 +652,17 @@ GenObject::~GenObject() {
     g = nullptr;
     if (!gg) return;
     gg->obj = nullptr;
+    if (g_shutdown) {
+        // The executor is gone or going: release memory only. A suspended
+        // generator's stack is left as it is (its frames were never unwound).
+        list_remove(gg);
+        if (gg->co && (!nycoro::started(gg->co) || nycoro::done(gg->co))) nycoro::destroy(gg->co);
+        gg->co = nullptr;
+        gg->cur.clear();
+        gg->src.clear();
+        delete gg;
+        return;
+    }
     if (gg->st == St::Running) { gg->orphan = true; return; }
     if (gg->kind == Kind::Function && gg->st == St::Suspended) {
         if (gg->co && nycoro::owner(gg->co) == nycoro::thread_token()) {
@@ -910,7 +924,9 @@ bool method(NythonExecutor& E, const Value& obj, const std::string& name, std::v
 
 // ── Builtins ────────────────────────────────────────────────────────────────
 namespace {
-bool owns_arg(size_t i) { return i < 32 && (t_fresh_args >> i) & 1u; }
+// Whether argument i of the builtin call being made is a temporary the
+// call's own argument expressions made (evalCall's callBuiltinTemps).
+bool owns_arg(uint32_t mask, size_t i) { return i < 32 && (mask >> i) & 1u; }
 
 Value make_native(NythonExecutor& E, Op op, const char* name) {
     Gen* g = new_gen(E, Kind::Native, name);
@@ -940,9 +956,8 @@ bool consumes(const std::string& name) {
 }
 
 bool builtin(NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx, Value& out) {
-    uint32_t fresh_mask = t_fresh_args;
+    const uint32_t fresh_mask = t_fresh_args;   // taken: nested builtins must not see it
     t_fresh_args = 0;
-    (void)fresh_mask;
     auto kwv = [&](const char* k) -> const Value* {
         if (!E.cur_kwargs_) return nullptr;
         auto it = E.cur_kwargs_->find(k);
@@ -978,7 +993,7 @@ bool builtin(NythonExecutor& E, const std::string& name, std::vector<Value>& arg
         Value res = make_native(E, Op::Islice, "islice");
         Gen* g = gen_of(res);
         g->src.emplace_back();
-        open(E, args[0], ctx, g->src.back(), owns_arg(0));
+        open(E, args[0], ctx, g->src.back(), owns_arg(fresh_mask, 0));
         g->nxt = start;
         g->stop = stop;
         g->step = stp;
@@ -1035,7 +1050,7 @@ bool builtin(NythonExecutor& E, const std::string& name, std::vector<Value>& arg
             Value res = make_native(E, Op::Zip, "zip");
             Gen* g = gen_of(res);
             g->src.resize(args.size());
-            for (size_t i = 0; i < args.size(); i++) open(E, args[i], ctx, g->src[i], owns_arg(i));
+            for (size_t i = 0; i < args.size(); i++) open(E, args[i], ctx, g->src[i], owns_arg(fresh_mask, i));
             out = res;
             return true;
         }
@@ -1046,7 +1061,7 @@ bool builtin(NythonExecutor& E, const std::string& name, std::vector<Value>& arg
             Gen* g = gen_of(res);
             g->fnv = args[0];
             g->src.resize(args.size() - 1);
-            for (size_t i = 1; i < args.size(); i++) open(E, args[i], ctx, g->src[i - 1], owns_arg(i));
+            for (size_t i = 1; i < args.size(); i++) open(E, args[i], ctx, g->src[i - 1], owns_arg(fresh_mask, i));
             out = res;
             return true;
         }
@@ -1057,7 +1072,7 @@ bool builtin(NythonExecutor& E, const std::string& name, std::vector<Value>& arg
             Gen* g = gen_of(res);
             g->fnv = args[0];
             g->src.resize(1);
-            open(E, args[1], ctx, g->src[0], owns_arg(1));
+            open(E, args[1], ctx, g->src[0], owns_arg(fresh_mask, 1));
             out = res;
             return true;
         }
@@ -1069,7 +1084,7 @@ bool builtin(NythonExecutor& E, const std::string& name, std::vector<Value>& arg
         Gen* g = gen_of(res);
         g->idx = start;
         g->src.resize(1);
-        open(E, args[0], ctx, g->src[0], owns_arg(0));
+        open(E, args[0], ctx, g->src[0], owns_arg(fresh_mask, 0));
         out = res;
         return true;
     }
@@ -1081,7 +1096,7 @@ bool builtin(NythonExecutor& E, const std::string& name, std::vector<Value>& arg
 
 bool fresh(const Value& v, const node_ptr& node, int depth, uint64_t s0) {
     Gen* g = gen_of(v);
-    if (!g || g->serial <= s0 || !node) return false;
+    if (!g || g->serial <= s0 || !node || g->creator != nycoro::thread_token()) return false;
     if (node->type() == NodeType::CALL) return g->kind != Kind::GenExpr && g->birth_depth == depth + 1;
     if (node->type() == NodeType::COMPREHENSION) return g->kind == Kind::GenExpr && g->birth_depth == depth;
     return false;
@@ -1089,7 +1104,8 @@ bool fresh(const Value& v, const node_ptr& node, int depth, uint64_t s0) {
 
 bool fresh_implicit(const Value& v, int depth, uint64_t s0) {
     Gen* g = gen_of(v);
-    return g && g->serial > s0 && g->kind == Kind::Function && g->birth_depth == depth;
+    return g && g->serial > s0 && g->kind == Kind::Function && g->birth_depth == depth
+        && g->creator == nycoro::thread_token();
 }
 
 void close_temp(NythonExecutor& E, const Value& v) {
@@ -1215,6 +1231,56 @@ void close_all(NythonExecutor& E) {
         finalize(E, victim);
         if (victim->st == St::Suspended) list_remove(victim);   // cannot happen; never loop on it
     }
+}
+
+void shutdown() { g_shutdown = true; }
+
+// ── Deep calls inside a generator ──────────────────────────────────────────
+namespace {
+struct Extension {
+    NythonExecutor* E = nullptr;
+    const node_ptr* call = nullptr;   // evalCall(call, ctx), or
+    FunctionNode* fn = nullptr;       // runFunctionBody(fn, fc)
+    Context* ctx = nullptr;
+    Value result;
+    std::exception_ptr exc;
+};
+void extension_entry(void* p) {
+    auto* x = (Extension*)p;
+    try {
+        if (x->call) x->result = x->E->evalCall(*x->call, x->ctx);
+        else x->result = x->E->runFunctionBody(x->fn, x->ctx);
+    } catch (...) {
+        x->exc = std::current_exception();
+    }
+}
+Value run_extension(Extension& x) {
+    nycoro::Coro* co = nullptr;
+    try { co = nycoro::create(&extension_entry, &x); }
+    catch (std::bad_alloc&) {
+        raise("RecursionError", "maximum recursion depth exceeded in a generator (no stack left to extend it)");
+    }
+    // A plain nested call: runs to the end, never suspends (a yield inside
+    // it belongs to another generator, which has a coroutine of its own).
+    nycoro::resume(co);
+    bool finished = nycoro::done(co);
+    if (finished) nycoro::destroy(co);
+    if (!finished) raise("RuntimeError", "internal error: a call on an extension stack suspended");
+    if (x.exc) std::rethrow_exception(x.exc);
+    return x.result;
+}
+}  // namespace
+
+Value call_on_new_stack(NythonExecutor& E, const node_ptr& call_node, Context* ctx) {
+    Extension x;
+    x.E = &E; x.call = &call_node; x.ctx = ctx;
+    return run_extension(x);
+}
+
+Value body_on_new_stack(NythonExecutor& E, void* fn_node, Context* fc) {
+    Extension x;
+    x.E = &E; x.fn = static_cast<FunctionNode*>(fn_node); x.ctx = fc;
+    return run_extension(x);
 }
 
 Stats stats() {

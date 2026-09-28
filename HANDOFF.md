@@ -156,6 +156,241 @@ closed by this: those files are swept now and pass.
 
 ---
 
+## 0l. Round 75 — lazy generators on the interpreter
+
+The request: "Generators: on the interpreter they still collect every value
+up front, so an infinite generator hangs there. The VM handles them
+correctly." The interpreter ran a generator function's whole body when it
+was called and returned a list in disguise (`__gen__`/`__idx__`), so an
+infinite generator hung, side effects ran early, `send()` delivered nothing
+and generator expressions were lists. The VM was lazy but had no `throw()`,
+its `close()` skipped `finally`, `return v` and `yield from`'s value were
+lost, generator expressions were eager and deep recursion crashed it.
+
+### Design as built
+
+- **`include/NyCoro.hpp`, `src/NyCoro.cpp` — stackful coroutines.** Each
+  generator body runs on a C stack of its own: `mmap` with `MAP_NORESERVE`,
+  a `PROT_NONE` guard page below, 1 MB reserved (`NY_GEN_STACK_KB`),
+  committed by the kernel as touched; finished stacks go to a pool of 64
+  (pages below the top 64 KB are `madvise`d away only if the stack went
+  that deep). The switch is 15 instructions of assembly on x86-64 SysV and
+  AArch64 (callee-saved registers, MXCSR/x87 CW, FPCR): 41 ns for a
+  resume + suspend pair, against 593 ns with `swapcontext` (a
+  `sigprocmask` system call each way), which stays as the fallback
+  (`-DNYCORO_FORCE_UCONTEXT`, and any other POSIX target). Windows uses
+  fibers (`CreateFiberEx`/`SwitchToFiber`) - **written, never compiled
+  here**. ASan builds call `__sanitizer_start/finish_switch_fiber` at every
+  switch. Threads are identified by never-reused tokens (`thread_token`),
+  not `std::thread::id`.
+- **`include/NyGen.hpp`, `src/NyGen.cpp` — the generator layer.** A
+  generator is a `GenObject` (a Container whose map holds only `__gen__`,
+  kernel type `Type::GENERATOR`) owning a `Gen`:
+  - *function generators*: calling the function makes the object and binds
+    the arguments; the first `next()` creates the coroutine. `yield`
+    stores the value and suspends; resuming returns the sent value, or
+    throws what `throw()` raised, or GeneratorExit (`close()`).
+  - *generator expressions*: a state machine over their clauses (no
+    coroutine - the element cannot yield).
+  - *lazy builtins*: `zip`/`map`/`filter`/`enumerate` given a generator,
+    `islice`, and `iter()` of a list/str/dict/set/range are state
+    machines too. Over lists they still return lists (existing code relies
+    on it).
+- **Hooks in `NythonExecutor.hpp`** (all marked `nygen`): YIELD /
+  YIELD_FROM, `runFunctionBody`, `evalFor` (a generator is pulled one value
+  per iteration), `evalComprehensionNode` (GEN is lazy; the others pull a
+  generator one value at a time), `iterItems` (drains), `callBuiltin`
+  (islice/take and generator arguments), `callMethod`, `containsValue`,
+  `getItem`, `isTruthy`, `typeNameOf`, `toText`, `valuesEqual`,
+  `evalVarDecl` (unpacking), `reapContext`, `noteStatement`, `evalCall`.
+  `yield_sink_`, `collectGenerator` and `makeGenValue` are gone.
+
+### Invariants
+
+1. **One body runs at a time per thread, nested like calls.** At every
+   switch `resume_function` swaps the executor's per-execution state:
+   FlowState (fast_ctx/brk_ok/pending/value), `last_stmt`, `call_depth_`
+   (the generator's own depth is kept relative), and the parts of
+   `handling_exc_`, `owner_stack_` (super()) and the `--trace` frame stack
+   that belong to the generator. The resumer never sees the generator's.
+2. **No C++ exception crosses a switch.** The coroutine's entry catches
+   everything into `std::exception_ptr`; the resumer rethrows it. A
+   StopIteration escaping a body becomes RuntimeError (PEP 479). An
+   uncaught error keeps the generator's `last_stmt`, so the location points
+   into the generator.
+3. **A started generator stays on its thread.** A frame on a coroutine
+   stack can hold the address of a `thread_local` (the compiler may keep it
+   in a register across the switch), so a coroutine must not migrate.
+   Resuming a started generator from another thread raises RuntimeError on
+   **both engines** (the VM could migrate, but the engines must agree on
+   what is an error). A generator not yet started may be run by any thread.
+4. **A suspended generator is never freed under live frames.** It is
+   finished by resuming it with GeneratorExit (finally blocks and
+   `__exit__` run; C++ destructors on its stack run). If it yields again,
+   `close()` raises RuntimeError("generator ignored GeneratorExit"); during
+   finalization it is then resumed with a forced unwind (`GenKill`, a C++
+   exception no `except` catches) up to four times, and only then is its
+   stack abandoned.
+5. **Stack depth.** `evalCall` and `runFunctionBody` check the stack pointer
+   against the running coroutine's floor (one thread-local load and a
+   compare; nothing on a thread's own stack). Near the floor the call
+   continues on an **extension stack** - another coroutine, resumed once,
+   run to the end - so recursion inside a generator reaches the usual limit
+   (RecursionError at 900 calls) exactly as outside one.
+6. **Contexts.** A generator's function context is pinned: the call site's
+   `CtxReaper` defers to it, and it is reaped when the generator finishes
+   (unless a closure captured it). A generator expression pins the
+   enclosing function's context the same way.
+
+### When a generator is finalized (the one gap left to reference counting)
+
+The interpreter still never frees containers (`GC_NOTES.md`), so "when its
+last reference goes" cannot be observed yet. What is done instead:
+
+- a generator that a `for` loop's iterable expression, or the arguments of a
+  consuming builtin (`any`, `all`, `next`, `sum`, `min`, `max`, `sorted`,
+  `list`, `tuple`, `set`, `dict`, `take`, `reversed`), **made itself** is
+  closed when the loop / builtin is done (`nygen::fresh`: made during that
+  expression, at that call depth, on this thread). So `for x in g(): break`
+  runs `g`'s finally at the break and `any(... for ...)` leaves nothing
+  suspended, as under CPython. A lazy wrapper (`zip(g(), ...)`) takes over
+  the temporaries it was given;
+- `GenObject::~GenObject` queues a suspended generator; `noteStatement`
+  closes queued ones between statements (never inside the destructor). This
+  is the hook for the reference-counting work (below). Until then it only
+  runs for objects something else deletes;
+- at the end of the program every generator still suspended on the main
+  thread is closed, oldest first (`nygen::close_all` in `run_file`), as
+  CPython finalizes at shutdown.
+
+`vm_audit56`'s one `pending(...)` check ("dropping the last reference closes
+it") is the case only reference counting can cover; it is reported, not
+failed, on the interpreter, and passes on the VM.
+
+### The VM (same behaviour, its own machinery)
+
+- `gen_resume(gs, mode, value)` replaces `gen_next`'s core: next/send, throw
+  (raised at the paused instruction through the frame's exception table, so
+  the generator's own except/finally/with handle it) and close
+  (GeneratorExit there). `return v` is StopIteration.value.
+- `YIELD_FROM_OP` pauses *at* itself with the subiterator on the saved
+  stack and passes send/throw/close on (PEP 380); its value is pushed (and
+  popped as a statement - it used to push nothing, so a loop around it lost
+  its iterator).
+- Generator expressions compile to a nested generator function over
+  `iter(first iterable)`.
+- A generator paused inside a try/with whose last reference goes (the
+  shared_ptr) is moved to a zombie and closed between two instructions;
+  every paused generator is closed at the end of `run()`.
+- `check_depth()`: RecursionError at 1000 frames or near the thread's stack
+  floor (it crashed with SIGSEGV at ~1400 frames; under ASan, `run_loop`'s
+  frame is ~120 KB and 8 MB holds ~60 frames).
+- `islice`, `take`, lazy `zip/map/filter/enumerate`, lazy `any/all/in`,
+  `__unpack_seq__` for unpacking, `StopIteration.value` everywhere an
+  exception is made.
+
+### Numbers (this container, 4 cores shared with two other builds)
+
+| | before | after |
+|---|---|---|
+| 300k yields through a `for` (wall) | interp 0.846 s (eager), VM 0.445 s | interp 0.660 s, VM 0.445 s |
+| same, 30k yields, instructions | interp 611 M, VM 482 M | interp 569 M, VM 436 M |
+| `sum(x*x for x in 300k list)` | interp 0.997 s, VM 0.699 s | interp 0.719 s, VM 0.823 s (lazy now) |
+| 100k `send()` | interp: hung (eager `while True`) | interp 0.376 s, VM 0.238 s |
+| 30k one-line calls, instructions (callgrind, minus startup) | interp 578.1 M, VM 398.3 M | interp 577.6 M, VM 400.2 M |
+| 200k calls + 100k method calls + fib(22) (wall, best of 3) | interp 0.933 s, VM 0.501 s | interp 0.932 s, VM ~0.50-0.57 s (noisy) |
+| resume + suspend (C++ microbenchmark) | - | 41 ns asm, 593 ns ucontext |
+| create + 4 resumes + destroy (pooled stack) | - | ~256 ns |
+
+The VM's generator expressions are ~20% slower than its eager list
+comprehension was (each value goes through a generator frame); that is the
+price of laziness there.
+
+10,000 suspended generators (each paused inside try/finally):
+
+| | VmSize | VmRSS |
+|---|---|---|
+| interpreter, stacks 256 KB / 1 MB / 8 MB | 2.6 / 10.3 / 82 GB | 142 MB in all three |
+| interpreter, no generators | 15 MB | 10.5 MB |
+| interpreter before (eager lists) | 58 MB | 51 MB |
+| VM | 36 MB | 30 MB |
+
+So a suspended interpreter generator costs ~9 KB more resident memory than
+the old eager list (two touched stack pages plus its records); the
+reservation is address space only. Each stack is two memory mappings, and
+Linux allows 65,530 per process: about 30,000 generators can be suspended
+at once (the next one raises MemoryError). Generator churn (40,000 × three
+short-lived generators) does not grow the mappings: VmSize tracks VmRSS.
+
+### Verification
+
+- `examples/vm_audit56.ny`: 117 checks, identical on both engines and
+  `python3` (threads are skipped there); one `pending` on the interpreter.
+- The sweep (`tools/sweep.py --base /tmp/r73/build/nython-cli`, now 346
+  runs with every `*_test.ny`): 0 regressions; the only not-ok runs are the
+  four `*_test.ny` files that fail on the branch head too (the `1k` suffix
+  ruling, §0m).
+- ASan build (`make cli OBJDIR=build-asan/obj CLI_TARGET=build-asan/nython-cli
+  CXXOPT="-O1 -g -fsanitize=address -fno-omit-frame-pointer"`, run with
+  `detect_stack_use_after_return=1`): vm_audit22-26, 48, 49, 52-54, 60,
+  test_vm3, test_vm_extended, the full vm_audit56 on the interpreter, a copy
+  of vm_audit56 with its recursion depths cut to 150/40 on both engines
+  (60 MB main stack), and the probe programs (deep recursion on extension
+  stacks, throw/close/ignored GeneratorExit, generator churn, 2,000
+  suspended generators, exit finalizers): no reports. The cut depths are
+  for the VM: under ASan `run_loop`'s frame is ~120 KB, so 600 nested
+  generators need more than 64 MB of stack, and past 64 MB ASan itself
+  warns that false positives may follow (sanitizers issue #189).
+- `tools/ide_e2e.py` 365/0, `ide_lint`, `ide_memprobe --check`,
+  `ny_classcheck`.
+
+### Not done
+
+- Finalization on the last reference (see above) - needs the reference
+  counting of round 75's GC work.
+- Windows fibers are not compiled or run in this container.
+- The lazy builtins report `type()` "generator" and print as
+  `<generator object zip at ...>`; Python has separate zip/map/... types.
+- `send()` to a lazy builtin or generator expression behaves as `next()`
+  (Python raises AttributeError for zip/map; a genexp ignores the value).
+- A generator dropped by another thread than the one that started it is
+  left suspended (only its own thread may run its finally blocks).
+- Found on the way, not generator bugs, not fixed: on the interpreter a
+  lambda that calls itself through the name it is assigned to
+  (`f = lambda n: ... f(n - 1)`) raises NameError, and `print(a(), b())`
+  prints each argument as soon as it is evaluated (`a`'s output, then
+  `a()`'s value, then `b`'s output); the VM evaluates all arguments first,
+  as Python does.
+- The end-of-program close runs only when the program ends normally (not
+  after an uncaught exception, where CPython would still finalize).
+- Async still runs each task on an OS thread. The coroutines here would
+  allow a single-threaded event loop (a task = a coroutine, `await` =
+  suspend), which would make tasks cheap and remove the GIL hand-offs from
+  async code; not attempted.
+
+### For the reference-counting merge
+
+- **Values live on a suspended coroutine's stack** (locals of the evalNode
+  frames between the body's entry and its `yield`: a `for`'s iterable, a
+  call's evaluated arguments, `with`'s manager...) and in `Gen` fields
+  (`xfer`, `retval`, `delegate`, the cursors' `hold`/`it`, `saved.value`)
+  hold references that no traversal of containers can see. A
+  trial-deletion cycle collector (CPython's) is safe with this: those
+  references stay "external" and keep everything they reach alive; a
+  suspended generator's cycles are then never collected (a leak, not a
+  use-after-free). A **tracing** collector that marks only from known roots
+  must treat every suspended generator's stack as a root, or it frees
+  objects a later `next()` uses.
+- `~GenObject` must only ever queue: it may run in the middle of any
+  container operation. `nygen::run_pending` (called from `noteStatement`)
+  closes the queued generators, which unwinds their stacks and so releases
+  those references. A destructor running on a thread other than the
+  generator's leaves it suspended.
+- Contexts: `reapContext` asks `nygen::defer_reap` first (a generator still
+  running in the context); the generator reaps it when it finishes.
+
+---
+
 ## 0e. Round 74 — responsive IDE, Code::Blocks features, faster engines
 
 The request: make the IDE "totally responsive", bring in features from
@@ -429,8 +664,7 @@ VM and `python3`:
   that the arity and NameError checks had added kept the VM from being
   15–20% slower.
 - **Not done.**
-  - Interpreter generators are still eager: an infinite generator hangs,
-    and `send()` behaves like `next()`. The VM does both correctly.
+  - ~~Interpreter generators are still eager~~ - lazy since round 75 (§0l).
   - Interpreter lambdas bind loop variables by value.
   - Reading a missing attribute still gives `none`, because `lib/gui.ny`
     relies on it (`kStrictAttributeReads`).
@@ -1822,6 +2056,7 @@ reproducible finding rather than a guess.
 | `examples/vm_audit44.ny` | `DebugSession` replay on a known recording and on a real `--trace` recording, including the uncaught exception (round 73) |
 | `examples/vm_audit45.ny` | JSON codec, `print` call form, `list.pop(i)`/`insert`, deep equality, `true == 1`, `file_mtime` (round 73) |
 | `examples/vm_audit46.ny` | the OS layer, 252 value checks: paths, files/dirs, file objects, typed errors, os_run/os_spawn, environment, time, full-width integers, sys.argv/`__name__`, lib/os.ny (round 74) |
+| `examples/vm_audit56.ny` | lazy generators, both engines and python3: infinite generators, side-effect order, send/throw/close/finally, StopIteration.value, `yield from`, genexps, lazy builtins, unpacking, deep recursion, threads, finalization (round 75, §0l) |
 | `tools/ide_e2e.py` | the shipped IDE driven through real input, 20 scenarios + dead-click audits (round 73) |
 | `gui_tests/test_13` | Codicons, Dark+ palette, HiDPI scaling |
 | `gui_tests/test_14` | toolchain — real compile/run/AST/disasm |

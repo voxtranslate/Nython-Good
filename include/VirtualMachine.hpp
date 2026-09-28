@@ -7,6 +7,7 @@
 #pragma GCC diagnostic ignored "-Wmisleading-indentation"
 
 #include <memory>
+#include <mutex>
 #include <vector>
 #include <deque>
 #include <string>
@@ -2320,11 +2321,11 @@ public:
     explicit VirtualMachine(Reporter* r=nullptr)
         : Runnable(r, RunnableType::COMPILER)
         , gc_(std::make_shared<GarbageCollector>(GarbageCollectorConfig{},this))
-    { register_all_builtins(); }
+    { vm_live(this, 1); register_all_builtins(); }
     explicit VirtualMachine(Runnable* r)
         : Runnable((Reporter*)r, RunnableType::COMPILER)
         , gc_(std::make_shared<GarbageCollector>(GarbageCollectorConfig{},this))
-    { register_all_builtins(); }
+    { vm_live(this, 1); register_all_builtins(); }
 
     // 171 general-purpose builtins (map, filter, reduce, any, all, next, set,
     // tuple, getattr, exp, log, sin, read_file, mkdir, ...) were only ever
@@ -2432,7 +2433,18 @@ public:
         }
     }
 
-    ~VirtualMachine() override = default;
+    ~VirtualMachine() override { vm_live(this, -1); }
+    // The VMs alive now: a generator can be destroyed after its VM (a value
+    // kept in a static table), and ~GenState must not call into a dead one.
+    // op: 1 add, -1 remove, 0 query.
+    static bool vm_live(VirtualMachine* vm, int op) {
+        static std::mutex* mu = new std::mutex();
+        static auto* live = new std::unordered_set<VirtualMachine*>();
+        std::lock_guard<std::mutex> lk(*mu);
+        if(op>0){ live->insert(vm); return true; }
+        if(op<0){ live->erase(vm); return false; }
+        return live->count(vm)>0;
+    }
 
     // Compile + run an AST
     VMResult run(nython::node::node_ptr ast) {
@@ -7987,7 +7999,7 @@ using VM = VirtualMachine;
 // A generator's last reference is gone: its VM decides whether closing it
 // can run code (a pause inside try/with) and queues it if so.
 inline GenState::~GenState() {
-    if(vm) vm->gen_dropped(*this);
+    if(vm && VirtualMachine::vm_live(vm, 0)) vm->gen_dropped(*this);
 }
 
 } // namespace nython::vm
