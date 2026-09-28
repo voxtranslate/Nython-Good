@@ -760,7 +760,7 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
 - **Interpreter**: a generator function's body runs on a stackful coroutine
   (`include/NyCoro.hpp`, `src/NyCoro.cpp`: mmap'd 1 MB stacks committed as
   touched, guard page, pooled; x86-64/AArch64 register switch, ucontext
-  elsewhere, Windows fibers untested) driven by `src/NyGen.cpp`
+  elsewhere, pooled Windows fibers - tested under Wine only) driven by `src/NyGen.cpp`
   (`include/NyGen.hpp`); the hooks in `NythonExecutor.hpp` are small and
   marked `nygen`. `NY_GEN_STACK_KB` sets the stack size.
 - **Both engines**: `send`/`throw`/`close` with GeneratorExit and finally at the

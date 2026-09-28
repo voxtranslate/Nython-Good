@@ -73,14 +73,12 @@ struct StackMem {
 
 std::atomic<size_t> g_live{0}, g_created{0}, g_mapped_bytes{0}, g_stacks_mapped{0};
 
+#if !defined(NYCORO_FIBERS)
 size_t page_size() {
-#if defined(NYCORO_FIBERS)
-    return 4096;
-#else
     static size_t p = (size_t)sysconf(_SC_PAGESIZE);
     return p ? p : 4096;
-#endif
 }
+#endif
 
 // Safety margin kept free below the RecursionError check: native code that
 // runs between two interpreter calls (formatting, regex, a builtin walking a
@@ -186,6 +184,7 @@ struct Coro {
     uint64_t owner = 0;
     bool is_started = false, is_done = false, is_running = false;
 #if defined(NYCORO_FIBERS)
+    struct FiberSlot* slot = nullptr;   // the fiber lent to this coroutine
     LPVOID fiber = nullptr;
     LPVOID caller_fiber = nullptr;
     size_t reserve = 0;
@@ -208,6 +207,8 @@ struct Coro {
 
 // Runs on the coroutine's stack: the function, then a final switch back.
 extern "C" void nycoro_main(Coro* c);
+// The function part of nycoro_main (every backend).
+static void nycoro_run(Coro* c);
 
 // ── Context switch ──────────────────────────────────────────────────────────
 #if defined(NYCORO_ASM_X64)
@@ -378,14 +379,57 @@ static inline void switch_in(Coro* c) { swapcontext(&c->caller_uc, &c->uc); }
 static inline void switch_out(Coro* c) { swapcontext(&c->uc, &c->caller_uc); }
 
 #elif defined(NYCORO_FIBERS)
-// Not compiled or tested in the Linux development container: written
-// against the documented Win32 fiber API. A thread becomes a fiber the first
-// time it resumes a coroutine (or uses the fiber it already is).
+// Written against the Win32 fiber API; built with MinGW-w64 and run under
+// Wine in the development container (never on a real Windows machine). A
+// thread becomes a fiber the first time it resumes a coroutine (or uses the
+// fiber it already is).
+//
+// Creating a fiber costs ~20 us, so finished fibers are pooled: a fiber's
+// start routine loops, running each coroutine it is lent to and parking
+// after the final switch until it is lent again.
+struct FiberSlot { LPVOID fiber = nullptr; Coro* cur = nullptr; size_t reserve = 0; };
 static thread_local LPVOID t_thread_fiber = nullptr;
-static VOID WINAPI fiber_entry(LPVOID p) { nycoro_main((Coro*)p); }
+static VOID WINAPI fiber_entry(LPVOID p) {
+    auto* s = (FiberSlot*)p;
+    for (;;) {
+        Coro* c = s->cur;
+        nycoro_run(c);
+        SwitchToFiber(c->caller_fiber);   // parked here until lent again
+    }
+}
+struct FiberPool { std::mutex mu; std::vector<FiberSlot*> free; };
+static FiberPool& fiber_pool() { static FiberPool* p = new FiberPool(); return *p; }
 static void prepare(Coro* c) {
-    c->fiber = CreateFiberEx(64 * 1024, c->reserve, FIBER_FLAG_FLOAT_SWITCH, fiber_entry, c);
-    if (!c->fiber) throw std::bad_alloc();
+    FiberSlot* s = nullptr;
+    {
+        FiberPool& P = fiber_pool();
+        std::lock_guard<std::mutex> lk(P.mu);
+        for (size_t i = P.free.size(); i-- > 0;)
+            if (P.free[i]->reserve == c->reserve) { s = P.free[i]; P.free[i] = P.free.back(); P.free.pop_back(); break; }
+    }
+    if (!s) {
+        s = new FiberSlot();
+        s->reserve = c->reserve;
+        s->fiber = CreateFiberEx(64 * 1024, c->reserve, FIBER_FLAG_FLOAT_SWITCH, fiber_entry, s);
+        if (!s->fiber) { delete s; throw std::bad_alloc(); }
+    }
+    s->cur = c;
+    c->slot = s;
+    c->fiber = s->fiber;
+}
+// A fiber that finished its coroutine (or never ran one) back to the pool.
+static void release_fiber(Coro* c) {
+    FiberSlot* s = c->slot;
+    if (!s) return;
+    c->slot = nullptr;
+    s->cur = nullptr;
+    {
+        FiberPool& P = fiber_pool();
+        std::lock_guard<std::mutex> lk(P.mu);
+        if (P.free.size() < 64) { P.free.push_back(s); return; }
+    }
+    DeleteFiber(s->fiber);
+    delete s;
 }
 static inline void switch_in(Coro* c) {
     if (!t_thread_fiber) {
@@ -399,7 +443,7 @@ static inline void switch_in(Coro* c) {
 static inline void switch_out(Coro* c) { SwitchToFiber(c->caller_fiber); }
 #endif
 
-extern "C" void nycoro_main(Coro* c) {
+static void nycoro_run(Coro* c) {
 #if !defined(NYCORO_FIBERS)
     ASAN_FINISH(nullptr, &c->caller_bottom, &c->caller_size);
 #else
@@ -421,6 +465,10 @@ extern "C" void nycoro_main(Coro* c) {
         std::abort();
     }
     c->is_done = true;
+}
+
+extern "C" void nycoro_main(Coro* c) {
+    nycoro_run(c);
     // The final switch: pass no fake-stack slot, so ASan frees this one.
     ASAN_START(nullptr, c->caller_bottom, c->caller_size);
     switch_out(c);
@@ -602,7 +650,7 @@ void destroy(Coro* c) {
         return;
     }
 #if defined(NYCORO_FIBERS)
-    if (c->fiber) DeleteFiber(c->fiber);
+    release_fiber(c);
 #else
     give_stack(c->stack, c->deep);
 #endif
@@ -619,6 +667,12 @@ Stats stats() {
 #if !defined(NYCORO_FIBERS)
     {
         Pool& P = pool();
+        std::lock_guard<std::mutex> lk(P.mu);
+        s.pooled = P.free.size();
+    }
+#else
+    {
+        FiberPool& P = fiber_pool();
         std::lock_guard<std::mutex> lk(P.mu);
         s.pooled = P.free.size();
     }

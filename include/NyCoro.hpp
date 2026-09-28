@@ -14,7 +14,8 @@
 //     control words, and swaps stack pointers (~20 ns, no system call);
 //   * everything else POSIX: ucontext (makecontext/swapcontext), which also
 //     saves the signal mask with a system call per switch;
-//   * Windows: fibers (CreateFiberEx / SwitchToFiber).
+//   * Windows: fibers (CreateFiberEx / SwitchToFiber), pooled; built with
+//     MinGW-w64 and run under Wine here, never on a real Windows machine.
 // Define NYCORO_FORCE_UCONTEXT to use ucontext on x86-64/AArch64 as well.
 //
 // Stacks are reserved with mmap and committed lazily by the kernel as they

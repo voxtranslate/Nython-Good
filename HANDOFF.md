@@ -509,8 +509,15 @@ lost, generator expressions were eager and deep recursion crashed it.
   resume + suspend pair, against 593 ns with `swapcontext` (a
   `sigprocmask` system call each way), which stays as the fallback
   (`-DNYCORO_FORCE_UCONTEXT`, and any other POSIX target). Windows uses
-  fibers (`CreateFiberEx`/`SwitchToFiber`) - **written, never compiled
-  here**. ASan builds call `__sanitizer_start/finish_switch_fiber` at every
+  fibers (`CreateFiberEx`/`SwitchToFiber`), pooled like the stacks (a
+  fiber's start routine loops over the coroutines it is lent to; creating
+  one costs ~20 us). The fiber backend was built with MinGW-w64 and its
+  standalone test (switching, exception transport, nesting, the stack
+  floor, FP state) run under Wine: 178 ns per resume + suspend, 1.1 us per
+  create + 4 resumes + destroy with the pool; never on a real Windows
+  machine, and the whole of nython.exe was not rebuilt with it here. The
+  AArch64 switch is written but not run (no cross toolchain or emulator in
+  the container). ASan builds call `__sanitizer_start/finish_switch_fiber` at every
   switch. Threads are identified by never-reused tokens (`thread_token`),
   not `std::thread::id`.
 - **`include/NyGen.hpp`, `src/NyGen.cpp` — the generator layer.** A
@@ -657,11 +664,8 @@ short-lived generators) does not grow the mappings: VmSize tracks VmRSS.
 - `examples/vm_audit56.ny`: 120 checks, identical on both engines and
   `python3` (threads are skipped there); one `pending` on the interpreter.
 - The sweep (`tools/sweep.py --base /tmp/r73/build/nython-cli`, 348 runs
-  with every `*_test.ny`), after merging the branch head 0042232
-  (round75-sem): 0 regressions; the only not-ok runs are
-  `test_nytorch12.ny` on both engines, which fails the same way on the
-  branch head's own build (`KeyError: 'role'` at line 142, a strict-read
-  migration gap of §0m, not a generator issue).
+  with every `*_test.ny`), after merging the branch head d3cae88
+  (round75-sem and the Windows work): 348 runs, 0 not ok, 0 regressions.
 - Strict reads (§0m) and generators: a generator's methods are members
   (`MemberKind::Generator` in `NyMembers.hpp`, both engines), so
   `g.send` read as a value, `hasattr(g, "send")` and `g?.send(x)` work and
@@ -686,7 +690,8 @@ short-lived generators) does not grow the mappings: VmSize tracks VmRSS.
 
 - Finalization on the last reference (see above) - needs the reference
   counting of round 75's GC work.
-- Windows fibers are not compiled or run in this container.
+- Windows fibers: tested standalone under Wine only (see above); the
+  AArch64 switch is untested.
 - The lazy builtins report `type()` "generator" and print as
   `<generator object zip at ...>`; Python has separate zip/map/... types.
 - `send()` to a lazy builtin or generator expression behaves as `next()`
