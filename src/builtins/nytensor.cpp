@@ -30,6 +30,9 @@
 #include <random>
 #include <sstream>
 #include <unordered_map>
+#ifndef M_PI   // not in strict C++20 on MinGW (the Windows build)
+#define M_PI 3.14159265358979323846
+#endif
 
 namespace nt {
 namespace {

@@ -121,7 +121,9 @@ enum class NodeType:uint8_t {
     LOOP,
     MACRO_CALL,
     DYN_BINOP,
-    COMPREHENSION
+    COMPREHENSION,
+    OPT_CHAIN,     // a?.b / a?[k] / a?.m(x) / f?.(x) and the chain after it
+    CHAIN_HOLE     // the value an OPT_CHAIN computed, where the chain resumes
 };
 
 struct INode{

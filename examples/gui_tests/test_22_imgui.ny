@@ -172,6 +172,11 @@ class TH2:
         self.button = Color(60,60,60,255)
         self.button_hover = Color(80,80,80,255)
         self.button_active = Color(0,122,204,255)
+        # what chips() draws with (the IDE's theme has them all)
+        self.accent_soft = Color(0,122,204,64)
+        self.hover = Color(42,45,46,255)
+        self.border = Color(60,60,60,255)
+        self.text_dim = Color(150,150,150,255)
 var th2 = TH2()
 var tb = NyImGui()
 var tlabels = ["Output", "Problems", "Terminal", "Debug", "Tokens", "Workshop"]

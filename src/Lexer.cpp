@@ -54,7 +54,8 @@ std::map<TokenType,std::string> TokenTypeNames = {
 	{TokenType::BraceClose,"BraceClose"},{TokenType::Comma,"Comma"},{TokenType::Colon,"Colon"},{TokenType::Dot,"Dot"},{TokenType::SemiColon,"SemiColon"},
 	{TokenType::BracketOpen,"BracketOpen"},{TokenType::BracketClose,"BracketClose"},{TokenType::ParenOpen,"ParenOpen"},{TokenType::Regex,"Regex"},{TokenType::New,"New"},{TokenType::Struct,"Struct"},
 	{TokenType::ParenClose,"ParenClose"},{TokenType::At,"At"},{TokenType::RightArrow,"RightArrow"},{TokenType::LeftArrow,"LeftArrow"},{TokenType::Var,"Var"},{TokenType::Block,"Block"},
-	{TokenType::Const,"Const"},{TokenType::Let,"Let"},{TokenType::Undefined,"Undefined"},{TokenType::Ref,"Ref"},{TokenType::QuestionMark,"QuestionMark"},{TokenType::Comment,"Comment"}
+	{TokenType::Const,"Const"},{TokenType::Let,"Let"},{TokenType::Undefined,"Undefined"},{TokenType::Ref,"Ref"},{TokenType::QuestionMark,"QuestionMark"},{TokenType::Comment,"Comment"},
+	{TokenType::NullCoalesce,"NullCoalesce"},{TokenType::NullCoalesceAssign,"NullCoalesceAssign"},{TokenType::OptDot,"OptDot"},{TokenType::OptBracket,"OptBracket"}
 };
 
 static const TokenDef KeywordTokens[] = {
@@ -659,8 +660,34 @@ void Lexer::read_token() {
           break;
         }
         case '?': {
-            this->token.value = "?";
-            make_token(TokenType::QuestionMark,TokenKind::QuestionMark,TokenClass::Delimiter);
+            // `??` / `??=` null-coalescing, `?.` / `?[` optional chaining,
+            // else the `?` of the C-style ternary `c ? a : b`. Two spellings
+            // stay the ternary's: `c ? .5 : 1` (a digit after `?.`) and
+            // `c ? [1] : [2]` - `?[` is optional indexing only when the `?`
+            // is glued to its receiver (`a?[k]`); `a?.[k]` always is.
+            char n1 = source.peek_char(), n2 = source.peek_char(1);
+            char before = source.peek_char(-2);
+            bool glued = before != '\0' && !std::isspace((unsigned char)before);
+            if (n1 == '?' && n2 == '=') {
+                source.read_char(); source.read_char();
+                this->token.value = "??=";
+                make_token(TokenType::NullCoalesceAssign,TokenKind::QuestionMark,TokenClass::Assignment);
+            } else if (n1 == '?') {
+                source.read_char();
+                this->token.value = "??";
+                make_token(TokenType::NullCoalesce,TokenKind::QuestionMark,TokenClass::Operator);
+            } else if (n1 == '.' && !std::isdigit((unsigned char)n2) && n2 != '.') {
+                source.read_char();
+                this->token.value = "?.";
+                make_token(TokenType::OptDot,TokenKind::QuestionMark,TokenClass::Delimiter);
+            } else if (n1 == '[' && glued) {
+                // the `[` stays for the parser: OptBracket then BracketOpen
+                this->token.value = "?[";
+                make_token(TokenType::OptBracket,TokenKind::QuestionMark,TokenClass::Delimiter);
+            } else {
+                this->token.value = "?";
+                make_token(TokenType::QuestionMark,TokenKind::QuestionMark,TokenClass::Delimiter);
+            }
           break;
         }
         case ':': {
@@ -1354,6 +1381,51 @@ inline bool isComplex(char cp) {
     return cp == 'j' or cp == 'J';
 }
 
+// The decimal digits of a suffixed number literal as the lexer spelled it
+// ("2.5e+3", "1500e-3", "1e3e+3": mantissa, then the exponents written and
+// implied by the suffix) when its value is a whole number; "" otherwise.
+static std::string scaled_suffix_integer(const std::string& lit) {
+    std::string mant;
+    long exp10 = 0;
+    size_t i = 0;
+    while (i < lit.size() && lit[i] != 'e' && lit[i] != 'E') mant += lit[i++];
+    while (i < lit.size()) {
+        i++;                                   // the 'e'
+        size_t start = i;
+        if (i < lit.size() && (lit[i] == '+' || lit[i] == '-')) i++;
+        while (i < lit.size() && std::isdigit((unsigned char)lit[i])) i++;
+        if (i == start) return std::string();
+        try { exp10 += std::stol(lit.substr(start, i - start)); } catch (...) { return std::string(); }
+    }
+    std::string digits;
+    long frac = 0;
+    bool point = false;
+    for (char c : mant) {
+        if (c == '.') { point = true; continue; }
+        if (!std::isdigit((unsigned char)c)) return std::string();
+        digits += c;
+        if (point) frac++;
+    }
+    if (digits.empty()) return std::string();
+    long shift = exp10 - frac;                 // value = digits * 10^shift
+    if (shift < 0) {
+        // Whole only if the digits dropped are all zeros.
+        long drop = -shift;
+        if (drop > (long)digits.size()) {
+            for (char c : digits) if (c != '0') return std::string();
+            return "0";
+        }
+        for (size_t k = digits.size() - (size_t)drop; k < digits.size(); k++)
+            if (digits[k] != '0') return std::string();
+        digits.resize(digits.size() - (size_t)drop);
+    } else {
+        if (shift > 4000) return std::string();
+        digits.append((size_t)shift, '0');
+    }
+    size_t nz = digits.find_first_not_of('0');
+    return nz == std::string::npos ? std::string("0") : digits.substr(nz);
+}
+
 void Lexer::consume_decimal() {
     char cp;
     char numchar;
@@ -1435,6 +1507,21 @@ void Lexer::consume_decimal() {
         }
     }
     this->token.value = decoder.str();
+    // A unit suffix (1k, 2.5M, 3m, 10u ...) scales the number by a power of
+    // ten. The literal is an exact integer when the scaled value is whole
+    // (1k == 1000, 2.5k == 2500, 2000m == 2) and a float only when it is
+    // fractional (1m == 0.001, 1500m == 1.5); arithmetic then follows the
+    // operation (1k / 3 is a float, 1k // 3 and 1k * 2 are ints). It used
+    // to be a float always. Worked out on the digits, not in binary
+    // floating point, so 1.1k is exactly 1100.
+    if ( units_passed && !complx_passed ) {
+        std::string whole = scaled_suffix_integer(this->token.value);
+        if (!whole.empty()) {
+            this->token.value = whole;
+            make_token(TokenType::Integer,TokenKind::Number,TokenClass::Literal);
+            return;
+        }
+    }
     //Check if we parsed a complex
     if ( complx_passed ) {
         source.read_char();

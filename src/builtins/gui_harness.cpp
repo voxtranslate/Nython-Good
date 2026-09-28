@@ -259,7 +259,7 @@ void DestroyRenderer(SDL_Renderer* r) {
     g_rs.erase(r);
     ::SDL_DestroyRenderer(r);
 }
-SDL_Window* CreateWindow(const char* title, int w, int h, SDL_WindowFlags flags) {
+SDL_Window* CreateWin(const char* title, int w, int h, SDL_WindowFlags flags) {
     SDL_Window* win = ::SDL_CreateWindow(title, w, h, flags);
     if (win) g_windows.push_back(win);
     return win;

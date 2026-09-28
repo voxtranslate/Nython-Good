@@ -500,6 +500,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             case ValueType::BOOLEAN: return str_("bool");
             case ValueType::INTEGER: return str_("int");
             case ValueType::DOUBLE: return str_("float");
+            case ValueType::UNDEFINED: return str_("undefined");
             default: break;
         }
         if (Container* c = E.contOf(v)) {
@@ -517,7 +518,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             auto fit = E.func_names.find(v.value.p);
             if (fit != E.func_names.end()) {
                 if (fit->second.find("__func__:") == 0 || fit->second.find("__lambda__") == 0) return str_("function");
-                if (fit->second.find("__builtin__:") == 0) return str_("builtin");
+                if (fit->second.find("__builtin__:") == 0 || fit->second.find("__bmethod__:") == 0) return str_("builtin");
                 if (fit->second.find("__class__:") == 0) return str_("class");
                 if (fit->second.find("__instance__:") == 0) return str_(fit->second.substr(13));
             }

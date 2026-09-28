@@ -111,8 +111,12 @@ class Scenario:
             log = self.ide.log()
             code = self.ide.close()
             self.res.check(alive, name + ": IDE still running at the end", log[-1500:])
-            self.res.check("[IDE Error]" not in log and "Uncaught" not in log and "RuntimeError" not in log,
-                           name + ": no runtime errors in the IDE log", log[-1500:])
+            # Since round 75 a missing attribute or dict key raises; any of
+            # these in the log is a read the IDE did not expect to miss.
+            # [lenient-read] lines appear when run with NY_LENIENT_READS=log.
+            bad = [w for w in ("[IDE Error]", "Uncaught", "RuntimeError", "AttributeError", "KeyError",
+                               "NameError", "TypeError", "[lenient-read]") if w in log]
+            self.res.check(not bad, name + ": no runtime errors in the IDE log " + str(bad), log[-1500:])
             self.res.check(code == 0, name + ": clean exit on quit", code)
             self.ide.cleanup()
         shutil.rmtree(self.root, ignore_errors=True)

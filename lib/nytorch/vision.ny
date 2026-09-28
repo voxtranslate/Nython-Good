@@ -278,7 +278,7 @@ class Vocabulary:
         self.add_token("<EOS>")
 
     def add_token(self, token):
-        if self.word2id[token] == none:
+        if self.word2id.get(token) == none:
             self.word2id[token] = self.size
             self.id2word = self.id2word + [token]
             self.counts[token] = 0
@@ -290,7 +290,7 @@ class Vocabulary:
         var n = len(tokens)
         while i < n:
             var t = tokens[i]
-            var existing_count = self.counts[t]
+            var existing_count = self.counts.get(t)
             if existing_count == none:
                 self.add_token(t)
                 self.counts[t] = 1
@@ -300,7 +300,7 @@ class Vocabulary:
         return self
 
     def encode(self, token):
-        var id_val = self.word2id[token]
+        var id_val = self.word2id.get(token)
         if id_val == none:
             return 1
         return id_val
@@ -333,7 +333,7 @@ class Vocabulary:
         var n = len(self.id2word)
         while i < n:
             var w = self.id2word[i]
-            var c = self.counts[w]
+            var c = self.counts.get(w)
             if c == none:
                 c = 0
             pairs.append([c, w])
@@ -509,9 +509,9 @@ class TFIDFVectorizer:
         var n = len(tokens)
         while i < n:
             var t = tokens[i]
-            if seen[t] == none:
+            if seen.get(t) == none:
                 seen[t] = true
-                if self.df_store[t] == none:
+                if self.df_store.get(t) == none:
                     self.df_store[t] = 1
                 else:
                     self.df_store[t] = self.df_store[t] + 1
@@ -531,7 +531,7 @@ class TFIDFVectorizer:
         return to_float(count) / to_float(n)
 
     def idf(self, term):
-        var df_val = self.df_store[term]
+        var df_val = self.df_store.get(term)
         if df_val == none:
             var df_val = 0
         var total = self.doc_count

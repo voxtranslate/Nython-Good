@@ -112,7 +112,7 @@ class CommandLine:
         if len(parts) == 0:
             return CommandResult(false, "empty command")
         var verb = string_lower(parts[0])
-        var alias = self.aliases[verb]
+        var alias = self.aliases.get(verb)
         if alias != none:
             verb = alias
         var arg = ""

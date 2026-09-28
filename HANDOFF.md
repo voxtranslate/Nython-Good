@@ -3,7 +3,10 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 74. This round is **§0e** (IDE responsiveness: native
+Last updated: round 75 — **§0n** (real SDL3, HiDPI, every test in the
+sweep) and **§0m** (strict attribute and key reads with optional chaining
+and `??`, the scope ruling and `global`, suffix literals; both engines).
+Round 74 is **§0e** (IDE responsiveness: native
 text services and a responsive layout ladder; the Code::Blocks feature set;
 non-throwing control flow on both engines; the build system) and **§0f**
 (the OS layer: files, paths, processes, environment and time, with one
@@ -16,6 +19,296 @@ round 73 (the IDE to VS Code's model, verified by driving it). Earlier
 rounds: §0/§0b language-level work, §5.3 terminal command line / undo /
 multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
+
+---
+
+## 0m. Round 75 — strict reads, optional chaining, declarations, suffix literals
+
+Three rulings from the user, implemented on both engines with identical
+behaviour. `examples/vm_audit57.ny` pins all of it (212 value checks, both
+engines). Branch `round75-sem`.
+
+### 1. Missing attributes and dict keys raise; absence has its own syntax
+
+The ruling: *"reading a missing attribute or dict key still returns none,
+because the GUI library relies on it. but you should be able to handle like
+that with none or undefined, just fix everything so that it works"*. Done as:
+reads raise as in Python, the language gives first-class ways to handle
+absence, and everything that relied on the lenient reads was migrated.
+
+| On both engines | Now | Before |
+|---|---|---|
+| `obj.name`, `name` missing | AttributeError: `'C' object has no attribute 'name'`; `type object 'C' ...` for a class; `'NoneType' ...`, `'dict' ...` (a dict read with `.`), `'str'`/`'list'`/`'int'`/`'function'` ... | none |
+| `d[k]`, `k` missing | KeyError; `str(e)` is `repr(k)` | none |
+| `none[k]`, `5[0]`, `f[0]` | TypeError: `'NoneType' object is not subscriptable` | none |
+| `none.m()`, `"s".nosuch()`, `[].nosuch()` | AttributeError | none (the VM called a global native of that name, dropping the receiver) |
+| `none.x = v`, `5.x = v`, `len.x = v` | AttributeError | silently dropped |
+| `f.x = v`, `f` a function | kept and readable, as in Python | silently dropped |
+| `xs.append` read as a value | a bound method | none on the interpreter; on the VM a native even for names that do not exist |
+| `del obj.x` | removes it; AttributeError if absent | left `x` holding undefined |
+| `del x` | unbinds `x` (a later read is a NameError) | `x` read undefined (interpreter) / none (VM) |
+
+Which methods a builtin value has (for a read, `hasattr` and `?.m()`) comes
+from one table both engines use, `include/NyMembers.hpp`: the union of the
+names their method dispatch implements, plus the object protocol.
+
+**The graceful forms.**
+- `getattr(o, n)`, `getattr(o, n, d)`, `hasattr`, `setattr` and the new
+  `delattr` work on every kind of value, as in Python: an AttributeError
+  raised by a property or by `__getattr__` counts as absence; any other
+  error propagates.
+- `d.get(k)`, `d.get(k, d)`, `d.setdefault(k, v)`, `k in d`, `d.pop(k, d)`.
+- **Optional chaining.** A `?.` / `?[` link is *absent* when its receiver is
+  none or undefined, or when the attribute, key or index it names does not
+  exist (a missing attribute, a missing dict key, an index out of range, or
+  `__getitem__` raising KeyError / IndexError). An absent link makes the
+  whole rest of its postfix chain none, and nothing more in the chain is
+  evaluated: not the arguments of a call, not a later index. A present link
+  behaves exactly like `.`/`[]`/`()`, and every plain step after it stays
+  strict: `a?.b.c` raises when `a.b` exists but is none (write `a?.b?.c`).
+  Spellings: `a?.b`, `a?.m(args)` (skipped when `a` has no member `m`),
+  `a?[k]` and `a?.[k]`, `a?[i:j]`, `f?.(args)` (skipped when `f` is
+  none/undefined). A type error is not absence: `5?[0]` raises TypeError.
+  An optional chain cannot be assigned to (SyntaxError).
+- `a ?? b` is `a` unless `a` is none or undefined; `b` is evaluated only
+  then. It binds looser than `or` and tighter than both ternaries, groups to
+  the right, and may be the condition of `x if c else y`.
+- `t ??= v` assigns `v` (evaluated only then) when `t` is none or undefined,
+  or - for an attribute or key target - missing; the target's object and
+  index are evaluated once. For a plain name the name must exist (an unbound
+  name is a NameError, as a read of it is).
+
+The C-style ternary keeps working. `??`, `??=` and `?.` are tokens, except
+`?.` followed by a digit (`c ? .5 : 1`). `?[` is optional indexing only when
+the `?` is glued to its receiver (`a?[k]`), so `c ? [1] : [2]` is still a
+ternary; `a?.[k]` is always optional indexing. A user-registered dynamic
+`??` operator could never have worked (`?` is lexed before the dynamic
+operator scan); `lib/langdef.ny`'s example now uses `$$`.
+
+**`undefined` and none.** Both engines have a value `undefined` distinct from
+none (`undefined == none` is false, `undefined == undefined` true, it is
+falsy, prints `undefined`, `type()` is `"undefined"`). Where each appears:
+- none: the `none` literal, `var x` with no initialiser, a function that
+  returns nothing, `d.get(k)` for a missing key, `?.`/`?[` for an absent
+  link, `getattr(o, n, none)`.
+- undefined: only where the program writes it (the literal, a default
+  `b=undefined`, a value copied from one). The runtime never produces it for
+  absence: missing reads raise, and `del x` now unbinds.
+- `??`, `??=`, `?.` and `?[` treat both as absent.
+- The VM compiled the `undefined` literal to nothing (the stack was off by
+  one after it) and read a variable holding undefined as none. It is now
+  `VMType::UNDEFINED` tagged `"undefined"`, distinct from the untagged
+  "not found" sentinel that frames and parameter defaults use
+  (`VMVal::is_missing`).
+
+**Implementation.**
+- Interpreter: `getAttrValue(obj, name, ctx, out)` is the one non-throwing
+  attribute lookup; `evalAttribute`, `hasattr`/`getattr`, `?.`, `??=` and the
+  method-call fallback all use it (the `receiver_cache_` hash lookup every
+  attribute read used to make is gone). `missingAttribute` / `missingKey`
+  raise. `tryGetItem` serves `?[`. A builtin's method read as a value is a
+  `__bmethod__:` userdata, cached per receiver and name. Function attributes
+  live in `func_attrs_`.
+- VM: `lookup_attr` (non-throwing), `get_attr` (raises), `try_get_attr`,
+  `try_get_sub`, `bound_member`, `missing_attr` / `missing_key`; new ops
+  `JUMP_IF_NONE_KEEP`, `JUMP_IF_MISSING_KEEP`, `JUMP_IF_NOT_NONE_OR_POP`,
+  `LOAD_ATTR_OPT`, `LOAD_SUBSCR_OPT`, `CHECK_MEMBER`, `DUP_TOP_TWO`,
+  `DELETE_NAME`. Function attributes live in `func_attrs_`, keyed by the
+  function value's identity.
+- The parser turns `recv?<link> rest...` into an `OptChainNode` (receiver,
+  one link, and the rest of the chain written against a `HoleNode`). A hole
+  is always the leftmost leaf of the expression that reads it, so the
+  interpreter keeps its value in the node (set immediately before, read
+  before anything else runs); the VM compiles a hole to nothing - the value
+  is already on the stack.
+- `NY_LENIENT_READS=log` is a porting aid: a missing attribute/key read (or
+  a store on a value that cannot hold it) prints
+  `[lenient-read] file:line: AttributeError: ...` once per line and yields
+  none, the old behaviour. The build's own tests never set it.
+
+**How the reads that relied on leniency were found.**
+1. `NY_LENIENT_READS=log` over every `examples/**/*.ny` and `tests/*.ny` on
+   both engines (826 runs): 246 distinct reads at 95 source lines, 77 of
+   them in library code (the rest in tests); after the migration only the
+   deliberate ones in `vm_audit57` remain.
+2. `NY_LENIENT_READS=log python3 tools/ide_e2e.py`: all 354 checks, no
+   missing read in any IDE log; the same on the VM-hosted IDE (365 checks,
+   after the merge).
+3. Static scans: every `v = d[k]` / `d[k] == none` probe in `lib/`, the IDE
+   and `examples/lib` (57 hits; the ~45 dict reads became `.get`); every
+   `x.name` read in `lib/` and the IDE whose name is assigned or defined
+   nowhere (none left); and `tools/ny_attrcheck.py` (new), which lists
+   `self.x` reads of attributes assigned only outside construction time
+   (none left; run it after adding a class).
+
+**Files migrated** (idiomatic fixes: `.get`, `?.`/`??`, attributes set in
+`__init__`):
+- `lib/gui.ny`: every event-handler table read (`_eh_counts` /
+  `_event_handlers`, 43 reads in about 20 widget classes), the backend event
+  fields in `_fill_event`, `c?._in_overlay`, `widget?.is_layout` in
+  `gui_place`, `Calendar.has_event`, row/item dicts in the table, status
+  bar, command bar and tree widgets.
+- `lib/network.ny` (`EventSource.connected` now exists and follows
+  connect/disconnect; header, DNS, MIME and cache tables), `lib/webserver.ny`,
+  `lib/clientserver.ny`, `lib/sockets.ny`, `lib/stdlib.ny`, `lib/aiagent.ny`,
+  `lib/icons.ny`, `lib/nyimgui.ny`, `lib/ide_commands.ny`,
+  `lib/ide_debugger.ny`, `lib/langdef.ny` (docstring), `ide_icons.ny`.
+- `lib/nytorch/`: `vision.ny` (vocabulary / document-frequency tables),
+  `distributed.ny`, `serving.ny`, `compute.ny`, `tensor.ny` (`_mat_es` reads
+  the legacy `.rows`/`.cols` with `self?.rows ?? 0`).
+- Tests and examples that relied on it: `gui_tests/test_22_imgui.ny` (its
+  theme stub lacked the chip colours, so `nyimgui` read none colours),
+  `gui_tests/test_23_editor_selection.ny` (IDE stub without `tabs`),
+  `test_network.ny` (a missing key expected to read none),
+  `vm_audit46.ny` (`len.nope` expected none), `tests/test_webserver.ny`
+  (read `.sid` off the session id string - it passed by accident),
+  `examples/lib/agent.ny`, `examples/nython_ide.ny` (the v3 demo).
+- The shipped IDE (`nython_ide.ny` and its chain, `ide_editor.ny`,
+  `ide_project.ny`, `ide_workshop.ny`, `lib/ide_*.ny`) needed no change
+  beyond `ide_icons.ny`: `tools/ide_lint.py` had kept it free of missing
+  members for rounds.
+- `src/builtins/text.cpp`: the formatter spaces `??` / `??=` as operators
+  (it would have split `x ??= 1` into the invalid `x ?? = 1`).
+- `tools/ide_e2e.py` now also fails when the IDE log contains
+  AttributeError, KeyError, NameError, TypeError or `[lenient-read]`.
+
+### 2. Global rebinding: kept, with declarations
+
+The ruling: *"yes if the variable inside the function has not been declared
+using let or anything else for declaring variables in our language."* Most
+of it was already how both engines behave; it is now specified, and pinned
+in `vm_audit57` for every context below.
+- A plain `x = v` in a function rebinds the nearest existing binding: the
+  enclosing functions' (innermost first), then the module's. When nothing
+  binds `x` yet, it creates a local of the function (a later module `x` is
+  then rebound by the same function, since it exists).
+- `var x`, `let x`, `const x` (equivalent; function-scoped, as `var` always
+  was - there is no block scope) declare a local that shadows every outer
+  `x` for the rest of that function, from the point the declaration runs:
+  an earlier read in the same function still sees the outer `x`, and a
+  declaration in an `if` that did not run declares nothing. Invisible to the
+  caller and to other calls (recursion has its own).
+- Nested functions: an inner plain assignment to a name the enclosing
+  function declared rebinds the enclosing local (no `nonlocal` needed); an
+  inner `var` shadows it.
+- `for` targets, parameters, comprehension variables (their own scope),
+  `except ... as`, `with ... as`, `def` and `class` names are local
+  declarations.
+- Class bodies: a plain assignment defines a class attribute and never
+  rebinds an outer name. Methods: the enclosing scope is the module, not the
+  class body and not the caller - `count = 5` in a method rebinds a module
+  `count`, not `Class.count`, and never a caller's local.
+- `global x` (fixed): every later use of `x` in that function is the
+  module's - an assignment creates it if it does not exist (it created a
+  local) and skips an enclosing function's `x` (it rebound that one). Also
+  for `for` targets, unpacking and `+=`. `nonlocal x` rebinds the enclosing
+  function's `x`. Parser: `VariableNode::global_ref`; interpreter
+  `moduleCtx`/`assignName`; VM `LOAD_GLOBAL_NAME`/`STORE_GLOBAL_NAME`.
+- `const` is not enforced (a later assignment is allowed), as before.
+
+### 3. Suffix literals
+
+The ruling: *"it would depend on the operation performs."* A unit suffix
+(`T G M K k m u n p f a`) scales by a power of ten; the literal is an exact
+integer when the scaled value is whole and a float only when it is
+fractional, worked out on the digits in the lexer (not in binary floating
+point): `1k == 1000`, `2.5k == 2500`, `1.1k == 1100`, `1T == 10**12`,
+`2000m == 2` are ints; `1m == 0.001`, `1500m == 1.5`, `5n` are floats. From
+there the operation decides: `1k / 3` is a float, `1k // 3`, `1k * 2`,
+`1k % 7`, `1k ** 2` ints, `1k + 0.5` a float. They were always floats; the
+suffix checks in `v3_comprehensive_test`, `v4_lambda_functional_test`,
+`v5_spec_compliance_test` and `v9_lexer_features_test` (§5.8) expected ints
+all along and now pass.
+
+### Verification
+
+- `examples/vm_audit57.ny`: 212 passed, 0 failed on both engines.
+- `python3 tools/sweep.py --base /tmp/r73/build/nython-cli` before merging
+  the branch head: 204 runs, 0 not ok, 0 regressions. After merging ea36a05
+  (the sweep now runs every `examples/*_test.ny`): 346 runs, 0 not ok; `v3`,
+  `v4`, `v5` and `v9` pass on both engines. (A base binary cannot parse the
+  migrated libraries - they use `?.` and `??` - so its failures there say
+  nothing.)
+- Every example and test on both engines with `NY_LENIENT_READS=log`: the
+  only missing reads left are the deliberate ones in `vm_audit57`.
+- `python3 tools/ide_e2e.py`: 365 passed, 0 failed after the merge (354/0
+  before it), strict, with the new log checks.
+- `tools/ide_lint.py`: 0 unresolved; `tools/ny_classcheck.py`: no
+  duplicates; `tools/ny_attrcheck.py`: 0 reads to check;
+  `tools/ide_memprobe.py --check`: passes (idle 0, hover 0, typing ~21
+  KB/key, scroll 0.15 KB/event, split 0).
+- The IDE on the VM: `nython-cli --vm nython_ide.ny` driven through the
+  whole e2e suite (the driver pointed at that command instead of
+  `nython --ide`) with `NY_LENIENT_READS=log`: 365 passed, 0 failed, no
+  missing read in any log. (`--ide` itself always runs the interpreter.)
+
+### Performance
+
+The machine was shared with two other builds (load average ~12 on 4 cores),
+so wall-clock timings were noise; these are callgrind instruction counts per
+loop iteration (deterministic), main (e45ac52) against this branch. Each
+loop iteration is `s = s + <two reads>` plus the loop's own work.
+
+| Loop body | Interpreter before → after | VM before → after |
+|---|---|---|
+| `p.x + p.y` (fields) | 15,635 → 14,914 (−4.6%) | 11,537 → 11,490 (−0.4%) |
+| `d["a"] + d["b"]` | 16,911 → 16,902 (0%) | 12,796 → 12,831 (+0.3%) |
+| `p.m()` reading `self.x` | 26,979 → 25,731 (−4.6%) | 13,830 → 13,806 (−0.2%) |
+| `d.get("zz", 1)` (missing) | 19,892 → 18,872 (−5.1%) | 12,939 → 12,974 (+0.3%) |
+| `getattr(p, "zz", 1)` (missing) | 26,493 → 21,374 (−19%) | 78,199 → 14,579 (−81%) |
+| `(p?.x ?? 0) + (p?.zz ?? 1)` | new: 21,741 | new: 14,073 |
+
+A first version was ~4% slower per field read on both engines: the new
+lookup default-constructed and copied one more `Value` (it carries a `Token`
+with a `std::string`) / `VMVal` per read. A fast path for the common case - a
+plain field of an instance or map - restored it; the interpreter also lost
+the `receiver_cache_` probe it used to make on every attribute read.
+`getattr` with a default no longer goes through a C++ exception on the VM.
+
+### Notes for merging
+
+- `round75-gc` (reference counting): conflicts expected in
+  `NythonExecutor.hpp` around `evalAttribute`/`getAttrValue`,
+  `specialAttribute`, `getItem`, `setAttr`, `evalDelete`, `callMethod`'s
+  tail, and in `VirtualMachine.hpp` around `get_attr`/`lookup_attr`,
+  `set_attr`, `get_sub`, the `DELETE_ATTR`/`LOAD_ATTR` ops, the `hasattr`/
+  `getattr`/`setattr` natives, `store_var`/`load_var` neighbours
+  (`delete_var`, `load_global`) and the `VMVal` helpers. The interpreter's new
+  side tables (`bound_members_`, `func_attrs_`) and the VM's `func_attrs_`
+  hold values and must count as roots if values become reference counted.
+  The interpreter's attribute fast path returns an instance field by value
+  straight from its namespace.
+- `round75-gen` (stackful coroutines): the interpreter's `HoleNode::slot` is
+  written immediately before the expression that reads it and read before
+  anything else in that expression runs, so a coroutine switch cannot fall
+  between the two - but a switch inside `evalOptChain`'s `evalNode(oc->recv)`
+  is fine too, because the slot is written after it returns. The lenient-read
+  log's dedupe set is process-global (mutex-guarded).
+
+### Not done
+
+- `const` is not enforced (a later assignment is allowed), and `var`/`let`
+  have no block scope - both as before; not part of the rulings.
+- `global x` covers reads, assignments, `+=`, unpacking and `for` targets;
+  a walrus, `with ... as` or `except ... as` of a global-declared name still
+  binds a local. `nonlocal x` with no enclosing `x` is not a SyntaxError (it
+  rebinds a global or creates a local); `del x` unbinds the nearest `x`
+  (Python would say UnboundLocalError for a global not declared).
+- Which methods builtin values have is a union table (`NyMembers.hpp`): a
+  name in it that a kind does not really implement reads as a bound method
+  whose call then raises - never a spurious AttributeError on the read.
+- VM function attributes are keyed by the function value's identity (code,
+  closure environment, defaults); two functions made by the same `def` in
+  the same frame share them.
+- The migration is as complete as the runs and scans that found it: every
+  example, test and the IDE e2e ran clean in log mode, and no `x.name` read
+  in `lib/` or the IDE names an attribute defined nowhere, but a library
+  path no test runs could still read an attribute some objects lack (the
+  networking and web-server paths that need real sockets are the least
+  exercised).
+- The interpreter still prints `print(a, b)`'s arguments one by one while
+  evaluating them (the VM evaluates all first) - seen while testing, not
+  touched.
 
 ---
 
@@ -666,13 +959,16 @@ VM and `python3`:
 - **Not done.**
   - ~~Interpreter generators are still eager~~ - lazy since round 75 (§0l).
   - Interpreter lambdas bind loop variables by value.
-  - Reading a missing attribute still gives `none`, because `lib/gui.ny`
-    relies on it (`kStrictAttributeReads`).
-  - Reading a name after `del x` gives `undefined` or `none`, not
+  - ~~Reading a missing attribute still gives `none`~~ — round 75 (§0m):
+    it raises AttributeError, and a missing dict key KeyError.
+  - ~~Reading a name after `del x` gives `undefined` or `none`~~ (round 75:
+    `del x` unbinds, NameError after), not
     NameError.
   - Unpacking with the wrong count raises no ValueError.
   - There is no `object` builtin.
-  - Assigning to a global inside a function needs no `global` (to be
+  - ~~Assigning to a global inside a function needs no `global` (to be
+    ruled on)~~ — ruled in round 75 (§0m): kept; `var`/`let`/`const` declare
+    a local, `global` names the module's variable. (Was: to be
     ruled on).
   - Exception names are listed in both `NyExcTypes.hpp` and
     `NyRuntime.hpp`.
@@ -711,7 +1007,7 @@ Merged from `round74-lang2`.
   - List and string reads out of range raise IndexError.
   - `del` / `pop` of a missing key raise KeyError.
 - **Deliberately lenient**, because library code relies on it:
-  - reading a missing dict key gives `none`
+  - ~~reading a missing dict key gives `none`~~ (round 75: KeyError, §0m)
   - assigning past the end of a list grows it
   - `len(none) == 0`
   - `"a" + 1` concatenates
@@ -1702,9 +1998,11 @@ shipped. Six rounds of work went into the wrong one. See `IDE_FILES.md`.
 `ide_icons.ny`; `lib/gui.ny` supplies only Window/Renderer/Font. A palette
 written into `lib/gui.ny` was invisible for eighteen rounds for this reason.
 
-**Nython returns `none` for a missing member instead of raising.** A typo'd
-method name or an attribute never assigned just evaluates to `none` and the
-IDE carries on, drawing at y=0 or doing nothing on a click. Run
+**Before round 75 Nython returned `none` for a missing member.** A typo'd
+method name or an attribute never assigned just evaluated to `none` and the
+IDE carried on, drawing at y=0 or doing nothing on a click. Since §0m such
+a read raises AttributeError (KeyError for a dict key) - but only when the
+line runs, so an untested path can still hide one. Run
 `python3 tools/ide_lint.py` after any IDE change.
 
 **Anything allocated while painting is kept forever** on the interpreter
@@ -1910,6 +2208,10 @@ headlessly: `ide.screenshot("x.png")` in `tools/ide_driver.py`, or
 Every `examples/*_test.ny` is in `tools/sweep.py` now and passes on both
 engines; what follows is the round-70 record.
 
+(Round 75: the suffix-literal checks in `v3`/`v4`/`v5`/`v9` - `1k` expected
+to be `1000`, not `1000.0` - pass now that a whole suffix literal is an int;
+§0m.)
+
 Round 70's content-level sweep (§0/§2) found real `N failed` output — not
 crashes, not caught by any exit-code sweep — in about three dozen files:
 `arith_test.ny`, `enhance_test.ny`, `features_test.ny`, `features_v2_test.ny`,
@@ -2057,6 +2359,7 @@ reproducible finding rather than a guess.
 | `examples/vm_audit45.ny` | JSON codec, `print` call form, `list.pop(i)`/`insert`, deep equality, `true == 1`, `file_mtime` (round 73) |
 | `examples/vm_audit46.ny` | the OS layer, 252 value checks: paths, files/dirs, file objects, typed errors, os_run/os_spawn, environment, time, full-width integers, sys.argv/`__name__`, lib/os.ny (round 74) |
 | `examples/vm_audit56.ny` | lazy generators, both engines and python3: infinite generators, side-effect order, send/throw/close/finally, StopIteration.value, `yield from`, genexps, lazy builtins, unpacking, deep recursion, threads, finalization (round 75, §0l) |
+| `examples/vm_audit57.ny` | strict reads (AttributeError/KeyError/TypeError), getattr/hasattr/setattr/delattr, get/setdefault/in, `?.`/`?[`/`?.()`/`??`/`??=` including laziness, `undefined`, the scope rules (plain assignment, var/let/const, global/nonlocal, loops, comprehensions, class bodies, methods, closures), suffix literals (round 75, 212 checks) |
 | `tools/ide_e2e.py` | the shipped IDE driven through real input, 20 scenarios + dead-click audits (round 73) |
 | `gui_tests/test_13` | Codicons, Dark+ palette, HiDPI scaling |
 | `gui_tests/test_14` | toolchain — real compile/run/AST/disasm |
