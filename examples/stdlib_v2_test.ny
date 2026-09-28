@@ -48,16 +48,19 @@ t("year_format", len(formatted), 4)
 
 print "=== OS ADVANCED ==="
 import os
-os_mkdir("/tmp/ny_test_dir")
-t("mkdir", os_isdir("/tmp/ny_test_dir"), true)
-write_file("/tmp/ny_test_dir/hello.txt", "Hello Nython!")
-var files = os_listdir("/tmp/ny_test_dir")
+# In the system's temporary directory, under a per-run name, and removed
+# with os_rmdir: "/tmp" and a shelled-out rmdir are POSIX-only.
+var tdir = os_path_join(os_gettempdir(), "ny_test_dir_" + str(os_getpid()))
+os_mkdir(tdir)
+t("mkdir", os_isdir(tdir), true)
+write_file(os_path_join(tdir, "hello.txt"), "Hello Nython!")
+var files = os_listdir(tdir)
 t("dir_file", "hello.txt" in files, true)
-var abs_path = os_path_abs("/tmp")
+var abs_path = os_path_abs(os_gettempdir())
 t("abs_path", len(abs_path) > 0, true)
-os_remove("/tmp/ny_test_dir/hello.txt")
-os_exec("rmdir /tmp/ny_test_dir")
-t("cleanup", os_isdir("/tmp/ny_test_dir"), false)
+os_remove(os_path_join(tdir, "hello.txt"))
+os_rmdir(tdir)
+t("cleanup", os_isdir(tdir), false)
 
 print "=== REGEX ADVANCED ==="
 import re

@@ -119,7 +119,12 @@ else:
     check("window of the event (two windows open)", got["resize"]["window"], h)
     check("window size follows", gui_get_window_size(h)[0], 640)
     # The key for window 2 waited in its own queue.
-    var evs2 = gui_poll_events(h2)
+    # (Input only: a real SDL window also gets its own shown/exposed/focus
+    # events, which the stub does not make.)
+    var evs2 = []
+    for e2 in gui_poll_events(h2):
+        if e2["type"] == "keydown" or e2["type"] == "keyup" or e2["type"] == "textinput":
+            evs2.append(e2)
     check("second window's input kept for it", len(evs2), 2)
     check("second window's key", evs2[0]["key"], "a")
     check("tagged with its window", evs2[0]["window"], h2)
@@ -130,8 +135,9 @@ os_remove(script_path)
 # ── High pixel density: everything in pixels ────────────────────────────────
 # NY_STUB_DPI_SCALE=2 makes the stub behave like a Retina display for windows
 # that ask for high pixel density: the drawing surface is 2x the window size
-# and the pointer is reported in pixels too.
-if scripted:
+# and the pointer is reported in pixels too. Stub only: a real display's
+# scale cannot be faked from a script.
+if scripted and gui_video_driver() == "ny-stub":
     os_setenv("NY_STUB_DPI_SCALE", "2")
     var hw = Window(400, 300, "hidpi")
     hw.high_dpi = true
@@ -188,12 +194,18 @@ def idle_cb(r, e):
 var w1 = Window(320, 200, "idle")
 check_true("window started", w1.start())
 var s1 = 0
+# Turns in which the callback ran - with the idle event, or on a real window
+# with one of its own shown/exposed/focus events instead (the stub has none).
+var turns_called = 0
 while s1 < 10:
+    var before = idle_calls[0]
     w1.step(idle_cb)
+    if idle_calls[0] > before:
+        turns_called = turns_called + 1
     s1 = s1 + 1
 check("idle turns wait for input", w1.waits, 9)
 check("idle turns present nothing", w1.frames, 0)
-check("idle callback called each turn", idle_calls[0], 10)
+check("idle callback called each turn", turns_called, 10)
 def paint_cb(r, e):
     r.clear(Color(0, 0, 0, 255))
 var waits_before = w1.waits

@@ -12,12 +12,12 @@ import "lib/ide_selection.ny"
 # incrementally. Run, Build, tools, the debugger's recording and the
 # terminal all use it, so none of them can freeze the IDE.
 #
-# It runs on the OS layer's process API: os_spawn starts `sh -c` in its own
-# process group with stdout and stderr on pipes, os_proc_read drains them
-# without blocking, os_poll reaps the exit code and os_kill signals the whole
-# group. Nothing touches the disk and polling starts no process. Where
-# os_spawn is not available (Windows), the older route is used: the command
-# runs in the background with its output in a file, read with `tail`.
+# It runs on the OS layer's process API: os_spawn starts the shell command in
+# its own process group (a Job Object on Windows) with stdout and stderr on
+# one pipe, os_proc_read drains it without blocking, os_poll reaps the exit
+# code and os_kill ends the whole group. Nothing touches the disk and polling
+# starts no process. Should os_spawn fail, the older route is used: the
+# command runs in the background with its output in a file, read with `tail`.
 class BgProc:
     def __init__(self, base):
         self.base = base
@@ -34,8 +34,10 @@ class BgProc:
         self.pid = -1              # process route: the os_spawn pid, -1 for the file route
         self.partial = ""          # process route: output after the last newline
 
+    # Quoted for the shell os_exec/os_spawn run command strings with - a POSIX
+    # sh, or cmd.exe on a Windows without one (see os_shell()).
     def _q(self, s):
-        return "'" + string_replace(s, "'", "'\\''") + "'"
+        return shell_quote(s)
 
     # `inner` is a shell command line; stdout and stderr are captured together.
     def start(self, inner, cwd):
@@ -48,11 +50,13 @@ class BgProc:
         self.poll_t = 0
         self.partial = ""
         self.pid = -1
-        # A subshell, not a { } group: `exit 3` in the command must end the
-        # command, not the wrapper. stderr joins stdout so the two stay in
-        # the order they were written.
+        # stdin is empty and closed (input=""), and stderr joins stdout at the
+        # descriptor (merge) so the two stay in the order they were written -
+        # the OS layer does both, so the command line carries no POSIX
+        # redirections and runs the same on Windows (os_spawn uses a POSIX sh
+        # there when there is one, else cmd.exe).
         try:
-            self.pid = os_spawn("( " + inner + "\n) < /dev/null 2>&1", cwd=cwd)
+            self.pid = os_spawn(inner, cwd=cwd, input="", merge=true)
             return
         except Exception as e:
             self.pid = -1
@@ -1243,8 +1247,10 @@ class IDEOps(IDECore):
             i = i + 1
         return "nython"
 
+    # Quoted for the shell os_exec/os_spawn run command strings with - a POSIX
+    # sh, or cmd.exe on a Windows without one (see os_shell()).
     def _q(self, s):
-        return "'" + string_replace(s, "'", "'\\''") + "'"
+        return shell_quote(s)
 
     # The file to hand the interpreter: saved first if it lives on disk, else
     # a temporary copy of the buffer (an untitled editor can still be run).
@@ -1254,7 +1260,7 @@ class IDEOps(IDECore):
                 self._write_doc(d, d.path)
             return d.path
         self.run_seq = self.run_seq + 1
-        var tmp = "/tmp/nyide_run_" + str(self.run_seq) + ".ny"
+        var tmp = self.tmp + "/nyide_run_" + str(self.run_seq) + ".ny"
         write_file(tmp, d.buf.get_all_text())
         return tmp
 
@@ -1303,7 +1309,7 @@ class IDEOps(IDECore):
     # panel as it is produced (see BgProc).
     def _start_job(self, cmdline, path, cwd):
         self.job_seq = self.job_seq + 1
-        self.job = BgProc("/tmp/nyide_job_" + str(self.session_id) + "_" + str(self.job_seq))
+        self.job = BgProc(self.tmp + "/nyide_job_" + str(self.session_id) + "_" + str(self.job_seq))
         var parts = string_split(cmdline, " ")
         var exe = parts[0]
         var flag = string_slice(cmdline, len(exe), len(cmdline))
@@ -1595,7 +1601,7 @@ class IDEOps(IDECore):
                     self._activate(k)
                     self._goto(row, col)
                 k = k + 1
-        elif string_startswith(path, "/tmp/nyide_run_"):
+        elif string_startswith(path, self.tmp + "/nyide_run_"):
             if self.job_doc != none:
                 var ji = self._index_of(self.job_doc)
                 if ji >= 0:
@@ -1754,7 +1760,7 @@ class IDEOps(IDECore):
         write_file(p, body)
 
     def _remember_recent(self, path):
-        if path == "" or string_startswith(path, "/tmp/nyide_"):
+        if path == "" or string_startswith(path, self.tmp + "/nyide_"):
             return
         self.frecency.touch("file:" + path, time_ms())
         var keep = [path]
@@ -2180,7 +2186,7 @@ class IDEOps(IDECore):
     def _dump_hitmap(self):
         var p = getenv("NY_IDE_DUMP")
         if p == none or p == "":
-            p = "/tmp/nyide_hitmap.tsv"
+            p = self.tmp + "/nyide_hitmap.tsv"
         write_file(p + ".tmp", self.hits.dump())
         os_rename(p + ".tmp", p)
         self.status_msg = str(self.hits.count()) + " clickable regions written to " + p
@@ -2191,7 +2197,7 @@ class IDEOps(IDECore):
     def _dump_state(self):
         var p = getenv("NY_IDE_STATE")
         if p == none or p == "":
-            p = "/tmp/nyide_state.json"
+            p = self.tmp + "/nyide_state.json"
         var d = self.doc()
         var st = {}
         st["frame"] = self.frames

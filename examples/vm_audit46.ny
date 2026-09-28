@@ -65,10 +65,14 @@ var here = os_getcwd()
 var exe = sys.executable
 
 # ── Paths ───────────────────────────────────────────────────────────────────
-check("join 3", os_path_join("a", "b", "c"), "a/b/c")
+# Results use the platform's separator, as Python's os.path does (ntpath on
+# Windows); P() writes an expected path with it.
+def P(s):
+    return string_replace(s, "/", os_sep)
+check("join 3", os_path_join("a", "b", "c"), P("a/b/c"))
 check("join absolute resets", os_path_join("a", "/b"), "/b")
 check("join trailing sep", os_path_join("a/", "b"), "a/b")
-check("path_join", path_join("/tmp", "ny", "f.txt"), "/tmp/ny/f.txt")
+check("path_join", path_join("/tmp", "ny", "f.txt"), "/tmp" + os_sep + "ny" + os_sep + "f.txt")
 check("basename", os_path_basename("/x/y.txt"), "y.txt")
 check("basename backslash", os_path_basename("C:\\dir\\f.txt"), "f.txt")
 check("dirname", os_path_dirname("/x/y.txt"), "/x")
@@ -80,21 +84,22 @@ check("ext dotfile", os_path_ext(".bashrc"), "")
 check("split", os_path_split("/a/b/c.txt"), ["/a/b", "c.txt"])
 check("split bare", os_path_split("c.txt"), ["", "c.txt"])
 check("splitext", os_path_splitext("/a/b.tar.gz"), ["/a/b.tar", ".gz"])
-check("normpath", os_path_normpath("a//b/./c/../d"), "a/b/d")
-check("normpath root ..", os_path_normpath("/../x"), "/x")
+check("normpath", os_path_normpath("a//b/./c/../d"), P("a/b/d"))
+check("normpath root ..", os_path_normpath("/../x"), P("/x"))
 check("normpath leading ..", os_path_normpath("../a/.."), "..")
 check("normpath empty", os_path_normpath(""), ".")
 check("isabs", [os_path_isabs("/x"), os_path_isabs("x")], [true, false])
 check("abspath", os_path_abspath("x/../y"), os_path_join(here, "y"))
 check("os_path_abs of a missing path", os_path_abs("no_such_zz46"), os_path_join(here, "no_such_zz46"))
-check("relpath down", os_path_relpath("/a/b/c", "/a"), "b/c")
-check("relpath up", os_path_relpath("/a", "/a/b/c"), "../..")
+check("relpath down", os_path_relpath("/a/b/c", "/a"), P("b/c"))
+check("relpath up", os_path_relpath("/a", "/a/b/c"), P("../.."))
 check("relpath start=", os_path_relpath("/x/y", start="/x"), "y")
-check("expanduser", os_path_expanduser("~/f"), os_path_join(os_home(), "f"))
+# (the rest of the path is kept as written, as Python's expanduser does)
+check("expanduser", os_path_expanduser("~/f"), os_home() + "/f")
 os_setenv("NY46_V", "val")
 # ("$" + "{" keeps the string literal itself from interpolating ${...})
 check("expandvars", os_path_expandvars("a/$NY46_V/$" + "{NY46_V}/$NY46_NOPE"), "a/val/val/$NY46_NOPE")
-check("commonpath", os_path_commonpath(["/a/b/c", "/a/b/d"]), "/a/b")
+check("commonpath", os_path_commonpath(["/a/b/c", "/a/b/d"]), P("/a/b"))
 check("fnmatch", [fnmatch("f.ny", "*.ny"), fnmatch("f.py", "*.ny"), fnmatch("a1", "a[0-9]"), fnmatch("ab", "a[!b]"), fnmatch("abc", "a?c")], [true, false, true, false, true])
 check("os_sep", os_path_join("a", "b"), "a" + os_sep + "b")
 
@@ -128,15 +133,17 @@ write_file(S + "/a/b/c/z.txt", "3")
 var w = os_walk(S + "/a")
 check("walk top", w[0], [S + "/a", ["b"], ["x.ny"]])
 check("walk depth", len(w), 3)
-check("walk leaf", w[2], [S + "/a/b/c", [], ["z.txt"]])
+# below the top, joined as os.path.join does ("\\" on Windows)
+check("walk leaf", w[2], [os_path_join(S + "/a", "b", "c"), [], ["z.txt"]])
 check("fs_walk recursive", len(fs_walk(S + "/a")), 5)
-check("glob", os_glob(S + "/*.txt"), [f1])
-check("glob recursive", os_glob(S + "/**/*.ny"), [S + "/a/b/y.ny", S + "/a/x.ny"])
+# the pattern's directory as written, matches joined as os.path.join does
+check("glob", os_glob(S + "/*.txt"), [os_path_join(S, "f1.txt")])
+check("glob recursive", os_glob(S + "/**/*.ny"), [os_path_join(S, "a", "b", "y.ny"), os_path_join(S, "a", "x.ny")])
 check("glob none", os_glob(S + "/*.zzz"), [])
 var f2 = S + "/f2.txt"
 check("os_copy", os_copy(f1, f2), f2)
 check("os_copy content", read_file(f2), "hello\nworld\n")
-check("os_copy into dir", os_copy(f1, S + "/m1"), S + "/m1/f1.txt")
+check("os_copy into dir", os_copy(f1, S + "/m1"), os_path_join(S + "/m1", "f1.txt"))
 check("file_copy missing source", file_copy(S + "/nope", S + "/f3.txt"), false)
 check("file_copy missing source leaves no file", os_exists(S + "/f3.txt"), false)
 check("copytree", os_copytree(S + "/a", S + "/a2"), S + "/a2")
@@ -151,13 +158,27 @@ check("rmtree gone", os_exists(S + "/a2"), false)
 check("rmtree missing ignore_errors", os_rmtree(S + "/nope", ignore_errors=true), false)
 check("rmdir empty", os_rmdir(S + "/mk/x"), true)
 check("chmod", os_chmod(f1, 384), true)
-check("chmod applied", os_stat(f1)["permissions"], 384)
+# Windows keeps only the read-only bit (0o600 reads back 0o666), as in Python.
+if os_name == "nt":
+    check("chmod applied", os_stat(f1)["permissions"], 438)
+else:
+    check("chmod applied", os_stat(f1)["permissions"], 384)
 os_chmod(f1, 420)
-check("symlink", os_symlink(f1, S + "/link"), true)
-check("islink", [os_islink(S + "/link"), os_islink(f1)], [true, false])
-check("readlink", os_readlink(S + "/link"), f1)
-check("lstat of a link", os_lstat(S + "/link")["is_link"], true)
-check("read through a link", read_file(S + "/link"), "hello\nworld\n")
+# Windows makes symbolic links only with Developer Mode or admin rights; it
+# refuses with OSError there, as Python does, and these checks are skipped.
+var made_link = false
+try:
+    made_link = os_symlink(f1, S + "/link")
+except OSError as e:
+    if os_name != "nt":
+        raise e
+    print("  (symbolic links not permitted here: " + str(e) + ")")
+if made_link or os_name != "nt":
+    check("symlink", made_link, true)
+    check("islink", [os_islink(S + "/link"), os_islink(f1)], [true, false])
+    check("readlink", os_readlink(S + "/link"), f1)
+    check("lstat of a link", os_lstat(S + "/link")["is_link"], true)
+    check("read through a link", read_file(S + "/link"), "hello\nworld\n")
 check("touch", os_touch(S + "/t.txt"), true)
 check("touch made empty file", [os_isfile(S + "/t.txt"), file_size(S + "/t.txt")], [true, 0])
 check("unlink", os_unlink(S + "/t.txt"), true)

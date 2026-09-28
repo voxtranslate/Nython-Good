@@ -190,7 +190,7 @@ Object::operator bigint(){
     if(count("__int__")) {
 		return (*container)["__int__"].toObject()->call(std::vector<Value>({Value(this)})).value.i;
 	}
-    return atol(toString().c_str());
+    return atoll(toString().c_str());   // atol is 32 bits on Windows
 }
 
 Object::operator float(){

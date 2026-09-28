@@ -513,7 +513,7 @@ class IDEViews(IDEPaint):
                 self.scm_again = true
                 return
             self.scm_seq = self.scm_seq + 1
-            self.scm_job = BgProc("/tmp/nyide_git_" + str(self.session_id) + "_" + str(self.scm_seq))
+            self.scm_job = BgProc(self.tmp + "/nyide_git_" + str(self.session_id) + "_" + str(self.scm_seq))
             self.scm_out = []
             self.scm_job.start(self.git.refresh_command(), self.git.root)
             return
@@ -694,7 +694,7 @@ class IDEViews(IDEPaint):
             if len(self.git.staged()) == 0 and len(self.git.unstaged()) > 0:
                 # VS Code's "smart commit": nothing staged means commit everything.
                 self.git.stage_all()
-            if self.git.commit(msg, "/tmp/nyide_commit_" + str(self.session_id) + ".txt"):
+            if self.git.commit(msg, self.tmp + "/nyide_commit_" + str(self.session_id) + ".txt"):
                 self._notify("Committed to " + self.git.branch + ": " + msg, "ok")
                 self.scm_msg = ""
             else:
@@ -1088,7 +1088,7 @@ class IDEViews(IDEPaint):
         var path = self._path_for_run(d)
         self.dbg_doc = d
         self.dbg_run_path = path
-        self.dbg_trace = "/tmp/nyide_trace_" + str(self.session_id) + ".jsonl"
+        self.dbg_trace = self.tmp + "/nyide_trace_" + str(self.session_id) + ".jsonl"
         write_file(self.dbg_trace, "")
         self._dbg_rebuild_breaks()
         self.dbgcon_lines = []

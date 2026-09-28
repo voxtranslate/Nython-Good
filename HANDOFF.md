@@ -425,6 +425,43 @@ needs the stub's `scale` command - a real display's scale cannot be changed
 from a script. Before this round, the 200% X11 window came out 1600×960
 pixels, an 800×480 workbench; now it is 3200×1920, the same 1600×960 units.)
 
+### Windows: it builds, links and runs again
+
+Nothing had compiled the Windows build since round 74. `tools/cross_windows.sh`
+now cross-compiles `nython.exe` from Linux with MinGW, using `nython.cbp`'s
+own flags and units, against SDL3/SDL3_ttf/SDL3_image cross-built for
+Windows, and runs it under Wine (`build-win/nywin`, which the sweep can take
+as `--bin`). What that found, all fixed:
+
+| Defect | Effect on Windows |
+|---|---|
+| `nython.cbp` missing 7 units (NyConc, VMConc, os_proc, os_time, pycore, text, gui_harness) | Code::Blocks build could not link |
+| `text.cpp` included `<dirent.h>` unguarded | clashed with platform_compat's emulation: compile error |
+| `M_PI` in nytensor.cpp | not defined by strict C++20 on MinGW: compile error |
+| `inline thread_local` member of a non-trivial type | MinGW emits its TLS init per object: "multiple definition" link error |
+| harness `nyh::CreateWindow` | collided with the Win32 `CreateWindow` macro |
+| `ConsoleManager::setupConsole` called `exit(GetLastError())` when stdin/stdout was not a console | **every run with redirected output exited at once with code 6** - `nython s.ny > out.txt`, Code::Blocks' output capture, the IDE's own Run; it also turned echo off for every script (and left a Linux terminal that way) |
+| `Value((long int)x)` in `intValue`, integer literals, tensor results; `(double)(long)bigint` in Value's operators | `long` is 32 bits on Windows (LLP64): every integer above 2^31 wrapped (`123456789012` read as `-1097262572`); the bigint cast also dropped the sign on every platform |
+| `os_spawn`/`os_poll`/`os_proc_read`/`os_wait`/`os_kill` raised "not supported on Windows" | **the IDE's Run, Build, terminal and git refresh did not work** (BgProc's fallback was POSIX-only too) |
+| IDE scratch files under `/tmp`, toolchain via `{ ...; } 2>&1; echo $?` | no `/tmp`, no POSIX shell |
+| fonts from `C:\Windows\Fonts` only | Windows on another drive had no text; macOS had no font list at all |
+
+The process layer on Windows is now the same API as on POSIX
+(`src/builtins/os_proc.cpp`): `CreateProcessW` with pipes, spawns serialised so
+no child inherits another's pipe ends, `CREATE_NO_WINDOW` (a GUI IDE running
+a console program flashes no console), one **Job Object** per process so
+`os_kill` ends the whole tree as a POSIX process group does and reports
+`-sig`, non-blocking reads through `PeekNamedPipe`, stdin fed from its own
+thread, a real `timeout`. Command **strings** run through a POSIX `sh` when
+one is found - `NY_SH`, `sh.exe` on `PATH`, Git for Windows or MSYS2 in
+their usual places - so the IDE's POSIX command lines (git, build targets,
+tools) run unchanged on Windows; otherwise through `cmd.exe` (`NY_SH=cmd`
+forces it). `os_shell()` says which; `shell_quote()` quotes for it.
+`os_run(..., merge=true)` / `os_spawn(..., merge=true)` send stderr into the
+stdout pipe in order (subprocess's `stderr=STDOUT`), on both platforms - the
+IDE's BgProc and Toolchain use it (argv lists, no shell text) instead of
+`2>&1`, `< /dev/null` and `$?`.
+
 ### Every test file in the sweep
 
 `tools/sweep.py` now also runs every `examples/*_test.ny` (70 files). The two

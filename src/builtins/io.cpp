@@ -401,7 +401,7 @@ Value dispatch_io(NythonExecutor& E,
             // Read all lines from a file path
             if (args.size() >= 1) {
                 std::string path = getStringValue(args[0]);
-                std::ifstream file(path);
+                std::ifstream file(path, std::ios::binary);   // \r stripped below, on every platform
                 if (file.is_open()) {
                     Object* result = new Object((Runnable*)runner, "list", Type::LIST);
                     int idx = 0;

@@ -873,7 +873,7 @@ class IDETools(IDEViews):
     # A background job from a complete shell command line (see BgProc).
     def _start_job_line(self, line, cwd):
         self.job_seq = self.job_seq + 1
-        self.job = BgProc("/tmp/nyide_job_" + str(self.session_id) + "_" + str(self.job_seq))
+        self.job = BgProc(self.tmp + "/nyide_job_" + str(self.session_id) + "_" + str(self.job_seq))
         self.job.start(line, cwd)
         self.job_running = true
         self.job_t0 = time_ms()
