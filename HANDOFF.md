@@ -485,7 +485,7 @@ not there (or a symlink privilege Wine does not grant) skip those checks
 and say so rather than fail.
 
 **Result:** the full sweep under Wine, both engines, every file -
-346 runs, 0 not ok (the tree before the generators merge). vm_audit46 (the OS layer) is 247/0 there (255/0 on Linux;
+348 runs, 0 not ok (with the lazy generators and the lock changes; the same set is clean on Linux, run at the same time). vm_audit46 (the OS layer) is 247/0 there (255/0 on Linux;
 the 8 skipped are symlinks and `which`-dependent checks).
 
 ### Every test file in the sweep
