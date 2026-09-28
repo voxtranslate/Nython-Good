@@ -5425,3 +5425,47 @@ New:
 - **Natives and runtimes:** `src/builtins/text.cpp`, the OS layer (`os_proc.cpp`, `os_time.cpp`), `NyConc`, `NyTensor`, and the nypy value libraries.
 - **Tools:** `tools/ny_classcheck.py`.
 - **Tests:** `vm_audit46`–`54`, `60`, `61`.
+
+## Round 75 — memory, lazy generators, strict reads, real SDL3, HiDPI, Windows
+
+Full detail in `HANDOFF.md`:
+- §0k: reference counting and a cycle collector on both engines (and `GC_NOTES.md`)
+- §0l: lazy generators on the interpreter; the VM's generator protocol completed
+- §0m: strict attribute and key reads, `?.` / `??`, the scope ruling, suffix literals
+- §0n: real SDL3, HiDPI on both of SDL3's models, every test in the sweep, the Windows build
+
+Final state:
+- **Sweep:** 350 runs, 0 not ok, on Linux (both engines, 0 regressions against round 73's build) and on Windows (the MinGW build under Wine).
+- **`ide_e2e`:**
+  - On the stub: 365 of 365 at 1×, at 2× in the macOS/Wayland model and at 2× in the Windows/X11 model.
+  - On real SDL3 under X11: 357 of 357 at 1920×1080 and at 4K 200%. The 8 missing checks are the live-scale checks, which only the stub can drive.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| The interpreter never freed a container (598 MB for 200k literals; `test_nytorch15`/`16` peaked near 1.1 GB) | no reclamation at all: values were raw pointers kept forever | exact reference counting plus a generational cycle collector (trial deletion) on both engines; 11 MB, 80 MB and 151 MB |
+| The VM leaked every cycle (100k self-cycles: 445 MB) and crashed dropping a 200k-node list | `shared_ptr` alone; the recursive destructor overflowed the stack | the same cycle collector over the VM's containers; iterative freeing |
+| An infinite generator hung the interpreter; `send()` acted like `next()` | the body ran to completion into a list before the first value | stackful coroutines (hand-written switch on x86-64/AArch64, pooled fibers on Windows) with the full protocol; genexps, `zip`/`map`/`filter`/`enumerate` lazy |
+| The VM crashed with SIGSEGV at ~1,400 frames of recursion | no depth check | RecursionError at 1,000 frames or at the native stack's floor |
+| A misspelt attribute or dict key read as `none` and failed far away | lenient reads, which the GUI library relied on | AttributeError / KeyError, as Python; absence handled on purpose with `?.`, `?[`, `??`, `??=`, `getattr`, `hasattr`, `.get`; every library, the IDE and the tests migrated (found with `NY_LENIENT_READS=log` and `tools/ny_attrcheck.py`) |
+| `undefined` compiled to nothing on the VM | no constant for it | a value distinct from none on both engines |
+| `global x` in a function did not create `x`; `1.1k` was a float | undecided rulings | plain assignment rebinds the nearest binding, `var`/`let`/`const` declare, `global` names the module variable; suffix literals are ints when whole |
+| A 200% X11/Windows display got an 800×480 workbench; a Retina Mac would have drawn it at half size | window sized in pixels, drawn at the content scale | layout-unit windows (flag 16) drawn at the window's display scale; `scale` events |
+| HiDPI tests passed in a model no platform has | the stub scaled pixels and points at once | `NY_STUB_DPI_MODE=points` (macOS/Wayland) / `=pixels` (Windows/X11) |
+| Nothing had ever run on real SDL3 | only the stub was built | `tools/build_sdl3.sh`; the scripted-input / display-list harness on the real backend; real-pixel PNGs |
+| Text mis-kerned on real SDL3 | SDL_ttf built without HarfBuzz | vendored HarfBuzz, as releases are |
+| Windows: every run with redirected output exited at once with code 6 | `setupConsole` called `exit(GetLastError())` when stdout was not a console | VT processing only on a console; never exits |
+| Windows: integers above 2^31 wrapped | casts through `long`, 32 bits on LLP64 | `long long` / `bigint` everywhere |
+| Windows: the IDE's Run, Build, terminal and git refresh did nothing | `os_spawn` and friends raised "not supported" | a Win32 process layer: CreateProcessW, Job Objects, non-blocking pipes, POSIX `sh` discovery, `merge=` |
+| Windows: `\r` at the end of every line read from a Windows program's file; mtimes to the second | binary reads for text handles; the CRT's `stat` | universal newlines for text handles; FILETIME times |
+| Windows: the Code::Blocks build did not link | seven units missing from `nython.cbp` | added; the generators build for Vista; an 8 MB main stack as on Linux |
+| Threads that lock in a loop crawled (8 × 10k lock/unlock: 6 s; over 20 s under Wine) | lock convoys: the GIL switched out lock holders, and unlock handed the mutex to a thread still waiting for the GIL | a GIL hand-over waits for the holder's unlock; competitive succession for mutexes; 0.8 s |
+| `gui_poll_events` handed out a freed list | a static empty list held no reference | found by the collector's invariants; fixed |
+| A property's getter could be freed and its identity reused by the next `def` | `@prop.setter` dropped the getter's reference | found by vm_audit53 under the collector; fixed |
+| Seven older `*_test.ny` files failed; `rl_test` read a stray `/tmp` file | never swept; stale expectations | every `*_test.ny` in the sweep; own temp files; legacy tensor ops follow NumPy's type promotion |
+| `test_nytorch10`/`12` failed only in parallel sweeps | both engines shared one on-disk store under `/tmp` | per-run directories |
+
+New:
+- **Runtimes:** `NyGC`/`NyHeap` and `VMGC`; `NyCoro`/`NyGen`; `NyMembers.hpp`; `gui_harness.cpp`.
+- **Builtins:** `gc_*`, `mem_rss_kb`, `weakref`, `thread_wait_count`, `gui_display_density`, `gui_video_driver` and `os_shell`.
+- **Tools:** `tools/build_sdl3.sh`, `tools/cross_windows.sh`, `tools/ny_attrcheck.py`, `tools/lsan.supp` and `make asan`.
+- **Tests:** `vm_audit55`–`57` and `62`, and `gui_tests/test_28`–`29`.
