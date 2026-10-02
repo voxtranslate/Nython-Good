@@ -1,75 +1,93 @@
 """
-OmniMorph v3 - penta-task network on PASCAL VOC 2012 (single GPU)
+OmniMorph v4 - penta-task network on PASCAL VOC 2012 (single GPU)
 =================================================================
 Tasks: 4x super-resolution | semantic segmentation | multi-label classification |
        object-instance edges | object detection (DETR-style).
 
 Usage
 -----
-    python omnimorph_v3.py                # full pipeline: train -> best ckpt -> test metrics -> visualisations
-    python omnimorph_v3.py --smoke-test    # one forward/backward on random tensors (shape / gradient sanity check)
-    python omnimorph_v3.py --unit-test     # dataset-pipeline sanity check on synthetic VOC-shaped files (no GPU,
-                                            # no real dataset needed) -- exercises letterboxing, augmentation,
-                                            # denoising-query targets and cross-task region mixing end to end.
+    python omnimorph.py                 # full pipeline: train -> best ckpt -> test metrics -> visualisations
+    python omnimorph.py --smoke-test    # one forward/backward on random tensors (shape / gradient sanity check)
+    python omnimorph.py --unit-test     # dataset-pipeline sanity check on synthetic VOC-shaped files (no GPU,
+                                         # no real dataset needed)
+    python omnimorph.py --overfit-test  # tiny end-to-end training run through the real trainer (CPU, minutes)
+                                         # that asserts every task learns -- incl. confident detections
+(v3 documented `--smoke-test` / `--unit-test` but its `__main__` never parsed them; v4 wires all three, and uses
+`parse_known_args` so running the file as a Kaggle/Jupyter cell -- which injects `-f kernel.json` -- still works.)
 
-Why v3 exists
--------------
-v2 fixed the numerical/metric bugs in v1 (degenerate per-batch metrics, dead modules, broken inits, blurry SR,
-leaky void handling, etc.) and trained cleanly, but the six-panel training curves and the qualitative dumps it
-produced exposed a *second* layer of problems that are architectural/statistical rather than "typos":
+Why v4 exists -- what the v3 qualitative dumps show, and the root cause behind each
+-----------------------------------------------------------------------------------
+(1) Restoration: "Predicted HR" is visually the bicubic upsample of the LR canvas.
+    a. The SR head decoded only from the shared, GroupNorm'd pixel-decoder tensor `ms[0]` that segmentation,
+       edges, classification and detection all pull on. Every SR network since EDSR/RCAN keeps a dedicated,
+       normalisation-free path from a shallow conv of the LR pixels to the output (a long skip) -- that is what
+       carries the high frequencies. v3 had none.
+    b. One global `clip_grad_norm_(model.parameters(), 1.0)`: the detection terms (Hungarian + denoising + aux
+       layers) dominate the total gradient norm, so the shared clip factor shrinks the SR gradient towards zero
+       on every step.
+    c. Dropout2d on SR features, *raised* by ATHM whenever PSNR plateaued (channel dropout inside an SR body
+       hurts reconstruction -- Kong et al., CVPR'22) -- and ATHM's health = sigmoid(slope) read a plateau
+       (slope ~ 0 -> 0.5) as sickness, so the reconstruction loss weight was also halved exactly at convergence.
+(2) Segmentation: silhouettes are roughly right but hair is labelled dog / cat -- recognition fails, not
+    localisation. A from-scratch encoder sees a 128px bicubic-degraded image and 1,464 labelled examples; every
+    competitive VOC segmenter starts from ImageNet features. Nothing tied the per-pixel classes to what the
+    image-level head believes is present (v3 can say "person" globally and "dog" on the hair at the same time).
+(3) Detection: boxes land near the right objects, but every score is 0.03-0.06.
+    a. score = softmax-focal probability x sigmoid(IoU head): two separately under-confident numbers multiplied;
+       the IoU head's target is 0 for 31 of the 32 queries of every image.
+    b. v3's ICCD trained that IoU head on the denoising queries towards IoU(noised INPUT box, GT) -- the quality of
+       what a query was handed, not of what it predicted -- which systematically under-rates refined boxes.
+    c. Content-only queries without reference boxes or iterative refinement (DAB-DETR / Deformable DETR show these
+       converge ~10x slower), no pretrained features, and only the 1,464 images that happen to have masks.
+(4) Edges: the predicted map fires on every intensity edge (CPU case, faces, shirt print) while the target holds
+    only annotated-object boundaries: nothing told the edge head which edges belong to objects.
 
-  1. Every task overfits hard and at a different epoch (train/val mIoU 73/19, ClsMAP 95/37, DetMAP 46/7) while the
-     checkpoint/early-stopping logic only watched a composite of (mIoU, EdgeF1, DetMAP, ClsMAP) -- it never looked
-     at reconstruction fidelity (PSNR/SSIM) *or* at the total validation loss, which visibly bottoms out around
-     epoch ~90-100 and then climbs for another ~80 epochs while training kept going.
-  2. The DETR-style detector is essentially uncalibrated (scores of 0.01-0.21 everywhere, duplicated un-suppressed
-     boxes, whole objects missed) -- a well known symptom of training bipartite-matching decoders from scratch on
-     a dataset as small as VOC's ~2,900 boxed images.
-  3. Segmentation masks show isolated wrong-class islands and holes inside otherwise-correct silhouettes: the
-     dense conv segmentation head is purely local and never sees the object-centric queries the network already
-     computes (in v2 those queries feed only classification and detection).
-  4. SR quality plateaus at ~25.4 dB on val: nothing beyond plain L1+SSIM pushes the network to recover
-     high-frequency detail, and the shared trunk is being pulled by four other losses at once (classic multi-task
-     negative transfer) with no mechanism protecting the reconstruction path.
-  5. Every image is *squashed* to a square (`img.resize((S, S))`), destroying the true aspect ratio of every
-     non-square VOC photo, for masks, edges, boxes and the final visualisations alike -- so the pictures the
-     inferencer produces are warped, undersized (256x256) crops of what the photo actually looks like.
+What v4 changes (each item says what it is built on and what is new; per the request that novelty be a real,
+working combination and not a renamed method)
+------------------------------------------------------------------------------------------------------------
+  * Restore-then-Recognise (RtR, section 3b) -- a dedicated RCAN-lite restoration stream (own long skip, no norm,
+    no dropout), SFT-conditioned on the jointly-trained LR encoder, whose output (stop-gradient) is what an
+    ImageNet-pretrained recognition stream (ResNet-50 by default) reads; its stride-4..32 features land exactly on
+    the LR encoder's four grids and are fused into the pixel decoder. Information flows both ways, gradients only
+    one way each. Built on RCAN, SFT-GAN and SR4IR (which, unlike RtR, backpropagates task loss INTO the SR net).
+  * Stream-Isolated Gradient Clipping (SIGC, Trainer) -- one clip budget per stream (restoration / pretrained
+    semantic / everything else) instead of one global norm, so detection's large gradients can no longer scale
+    the restoration update to nothing. A single-backward-pass alternative to PCGrad/GradNorm-style surgery.
+  * Anchor-refined decoder (section 4) -- DAB-DETR anchors + Deformable-DETR iterative refinement, per-class
+    sigmoid scores; positional queries live in the same normalised sine space as the memory encoding; initial
+    anchors are selected per image from scored multi-scale proposals (DINO's mixed query selection), so the
+    decoder never starts from image-agnostic boxes.
+  * Quality-Annealed IoU-aware Classification (QAIC, MultiTaskLoss._vfl) -- one score per box whose target is
+    IoU(pred, GT)^beta (Varifocal loss); beta is annealed 0 -> 1, from hard labels (fast recognition while early
+    IoUs are ~0) to full IoU calibration. Replaces the score x IoU-head product.
+  * ICCD v2 (section 5) -- noised GT boxes now enter as reference anchors (where DN-DETR puts them), contrastive
+    negatives teach duplicate rejection (DINO CDN), the IoU-consistency target is computed from each query's OWN
+    output box, every decoder layer is supervised, and the noise curriculum is kept from v3.
+  * Presence-Prior Segmentation Calibration (PPSC) -- adds g * log sigmoid(cls_c) to segmentation logit c (learned
+    g >= 0): a Bayesian image-level prior that stops absent classes from winning pixel islands.
+  * Label-Disagreement Boundary Coupling (LDBC) -- the edge head gets the closed-form probability that adjacent
+    pixels carry different segmentation labels, 1 - sum_c p_c(x) p_c(x+d), so only object boundaries survive;
+    the edge loss also sharpens segmentation boundaries through it at reduced gradient scale.
+  * Mixed-Supervision Batch Sampler (MSBS, section 7) -- the ~10k ImageSets/Main train+val images that have boxes
+    and labels but no mask (Segmentation-val excluded, so val/test never leak) join training with segmentation /
+    edge targets set to `ignore`; every batch keeps a fixed quota of fully-labelled images so segmentation
+    supervision never thins out. ~7x more data for detection / classification / SR.
+  * ATHM v2 -- a dead-banded health score that only penalises a *declining* validation metric (a plateau is not
+    overfitting), modulating dropout on the seg / edge / cls heads only.
+  * Flip test-time self-ensemble for the final evaluation and the visualisations (dense outputs + classifier).
+  * Fixes: all-ignore-mask cross-entropy returned NaN (silently skipped steps); the inferencer now upsamples
+    segmentation *logits* to the original resolution before the argmax (instead of nearest-resizing labels).
 
-v3 fixes the correctness issues directly and adds five original, deliberately-scoped components (each section
-below states plainly what published idea it is inspired by and what specifically is different -- per the request
-that novelty here be a real, working combination, not a rename of an existing method):
+Kept from v3 (unchanged): letterboxed preprocessing and exact un-letterboxing, PCSR (now fed the sigmoid scores),
+CTCRM, the Laplacian-pyramid fidelity loss, deep supervision, EMA, atomic checkpointing, CPHE horizon extension.
 
-  * Letterboxed (aspect-ratio preserving) preprocessing everywhere, with the transform recorded per-sample so the
-    inferencer can put every prediction back onto the *original* photo at its *original* resolution.
-  * Prototype-Conditioned Segmentation Refinement (PCSR): the existing object queries' own classification
-    probabilities are used to marginalise a query-to-pixel affinity map, which is added *on top of* (not instead
-    of) the dense conv head. Inspired by Mask2Former's per-query dot-product mask logits, but class-marginalised
-    through the detector's own softmax instead of a 1:1 Hungarian query<->mask assignment, fused additively with a
-    zero-initialised gain so it starts as a strict no-op.
-  * IoU-Consistent Curriculum Denoising (ICCD) for the detector: noised copies of the ground-truth boxes are fed
-    in as extra, attention-isolated decoder queries and supervised to reconstruct their box/label (inspired by
-    DN-DETR), *and* to predict their own exact IoU against the clean box through the existing IoU branch (not
-    present in DN-DETR, which only reconstructs box/label) -- turning the IoU head's calibration into a dense,
-    self-supervised curriculum whose noise magnitude anneals coarse-to-fine over training.
-  * Adaptive Task-Health Modulation (ATHM): each task's *validation-metric slope* (not its loss magnitude) is
-    turned into a bounded "health" score every epoch, which both down-weights that task's loss term and turns up
-    that task's own head-only dropout -- a single-backward-pass alternative to gradient-surgery methods
-    (PCGrad/GradNorm), which would need one backward pass per task and are unaffordable on the single-GPU budget
-    this project is built around.
-  * Cross-Task Consistent Region Mixing (CTCRM): a ClassMix/CutMix-style region is pasted between two training
-    images, but consistently across *all five* targets at once (image, mask, edge map, multi-label vector and
-    detection boxes) -- ClassMix is segmentation-only and CutMix is classification/detection-only; keeping every
-    task's target consistent under one shared pasted region for a joint SR+seg+edge+cls+det network is the new
-    part here.
-
-None of this is presented as beating a paper's numbers -- there is no GPU or copy of VOC2012 in the environment
-this was written in, so nothing below has been trained to convergence. What has been verified in this environment
-is that every new code path is shape-correct, produces finite gradients, and round-trips coordinates correctly
-(see `--smoke-test` and `--unit-test`). Also, 4x SR from a real bicubic-downsampled input is information-theoretically
-lossy, so "identical to ground truth" cannot be literally guaranteed by any model; what v3 does is remove the
-structural reasons the reconstruction was capped well below its achievable fidelity (blind checkpoint selection,
-undersupervised high-frequency content, uncontrolled task interference) so the *achievable* fidelity is higher and
-is what gets kept.
+Honest scope: there is no GPU or copy of VOC2012 in the environment this was written in, so nothing here has been
+trained on VOC and no VOC number is claimed. What has been verified is that every path is shape-correct with
+finite gradients (`--smoke-test`), that the data pipeline, the no-leak sampler, ICCD v2, LDBC and QAIC behave as
+specified (`--unit-test`), and that a tiny instance trained through the real trainer makes every task learn,
+including confident detections (`--overfit-test`). 4x SR from a bicubic-downsampled input is information-
+theoretically lossy, so "identical to ground truth" cannot be guaranteed by any model; v4 removes the structural
+reasons the reconstruction was capped near bicubic quality.
 """
 import os
 import sys
@@ -111,7 +129,7 @@ FLIP_LR = getattr(Image, "Transpose", Image).FLIP_LEFT_RIGHT
 # ============================================================================
 @dataclass
 class OmniMorphConfig:
-    experiment_name: str = "omnimorph_voc2012_penta_task_singlegpu_v3"
+    experiment_name: str = "omnimorph_voc2012_penta_task_singlegpu_v4"
     checkpoint_dir: str = "./models"
     visualization_dir: str = "./visualizations"
     # Kaggle mounts a notebook's attached dataset at /kaggle/input/<URL-SLUG>/... -- for
@@ -145,6 +163,11 @@ class OmniMorphConfig:
     # object/person/animal proportions are preserved for every task and the padded border is excluded from every
     # pixel-domain loss/metric via an explicit valid-pixel mask (segmentation/edge use ignore_index instead).
     letterbox_fill: float = 0.5
+    # ---- mixed-supervision training set (MSBS, section 7) -------------------------------------------------
+    # Adds the ImageSets/Main train+val images (boxes + labels, no mask) minus Segmentation-val to TRAINING only;
+    # every batch carries `full_label_per_batch` fully-labelled (mask + edge) images, the rest box/label-only.
+    use_partial_label_images: bool = True
+    full_label_per_batch: int = 4
     # ---- cross-task consistent region mixing (CTCRM, see module docstring near the dataset) ------------------
     use_ctcrm: bool = True
     ctcrm_prob: float = 0.3
@@ -159,7 +182,8 @@ class OmniMorphConfig:
     lora_rank_ratio: float = 0.25
     lora_min_rank: int = 4
     ffn_ratio: int = 3
-    num_queries: int = 32
+    num_queries: int = 48                # VOC images hold up to ~40 objects; 32 left little slack for one-to-one
+    use_query_selection: bool = True     # image-conditioned anchors (DINO mixed query selection), see QueryDecoder
     pixel_dec_dim: int = 128
     num_prompts: int = 8
     prompt_dim: int = 64
@@ -177,10 +201,24 @@ class OmniMorphConfig:
     attn_logit_scale_init: float = 10.0  # cosine attention needs a large scale over N=4096 tokens
     attn_logit_scale_max: float = 100.0
     rope_base: float = 10000.0
-    sr_channels_1: int = 128
-    sr_channels_2: int = 64
-    sr_up_factor: int = 4               # channel multiplier of the PixelShuffle convs (= pixel_shuffle_factor ** 2)
     edge_hidden_channels: int = 32
+    # ---- Restore-then-Recognise (RtR, section 3b) -----------------------------------------------------------
+    # restoration stream (RCAN-lite, SFT-conditioned on the LR encoder)
+    rs_channels: int = 64
+    rs_groups: int = 4
+    rs_blocks_per_group: int = 4
+    rs_ca_reduction: int = 16
+    restoration_weight_decay: float = 0.0  # EDSR/RCAN train without weight decay; it only shrinks SR filters
+    # semantic stream (ImageNet-pretrained; reads the restored canvas)
+    backbone_name: str = "resnet50"      # resnet18 | resnet34 | resnet50 | convnext_tiny | none
+    backbone_pretrained: bool = True     # torchvision download (needs Internet ON in a Kaggle notebook)
+    backbone_weights_path: str = ""      # ...or a local torchvision checkpoint, e.g. attached as a Kaggle dataset
+    backbone_freeze_stem: bool = True    # freeze stem + first stage (DETR practice)
+    backbone_lr_mult: float = 0.1
+    semantic_input: str = "restored"     # "restored" (SR output, stop-gradient) | "bicubic"
+    # ---- segmentation / edge coupling -------------------------------------------------------------------------
+    use_presence_prior: bool = True      # PPSC
+    ldbc_grad_to_seg: float = 0.1        # LDBC: scale of the edge-loss gradient that reaches the seg logits
     # ---- losses ------------------------------------------------------------------
     ssim_kernel: int = 11
     ssim_sigma: float = 1.5
@@ -194,7 +232,8 @@ class OmniMorphConfig:
     lambda_ssim: float = 0.5
     lambda_pyramid: float = 0.5          # Laplacian-pyramid fidelity loss (see MultiTaskLoss)
     pyramid_levels: int = 3
-    lambda_mid_sr: float = 0.3           # deep supervision at the intermediate 2x (128px) SR resolution
+    lambda_perceptual: float = 0.05      # frozen-ImageNet-feature term (only active with a pretrained stream)
+    lambda_mid_sr: float = 0.3           # deep supervision at the intermediate 2x (256px) SR resolution
     lambda_mask_ce: float = 1.5
     lambda_mask_dice: float = 1.0
     lambda_aux_seg: float = 0.4
@@ -208,72 +247,70 @@ class OmniMorphConfig:
     lambda_det_ce: float = 2.0
     lambda_bbox: float = 5.0
     lambda_giou: float = 2.0
-    lambda_iou_branch: float = 0.5
-    lambda_aux_det: float = 0.5
-    bg_class_weight: float = 0.1
-    # Focal weighting (Lin et al., ICCV'17) on the query classification head, the way Deformable DETR / DINO-DETR
-    # apply it (Zhu et al., ICLR'21; Zhang et al., CVPR'22): with only a handful of real objects among
-    # `num_queries` slots per VOC image, plain weighted CE lets the many easy correctly-classified "no-object"
-    # queries dominate the gradient -- see MultiTaskLoss._focal_ce.
-    use_focal_det_cls: bool = True
+    lambda_aux_det: float = 1.0          # every decoder layer is supervised like the last (DETR practice)
+    # Sigmoid-focal matching cost (Deformable DETR) + Quality-Annealed IoU-aware Classification (QAIC) loss
+    focal_alpha: float = 0.25
     focal_gamma: float = 2.0
-    # ---- IoU-Consistent Curriculum Denoising (ICCD) -----------------------------------------------------------
+    vfl_alpha: float = 0.75              # Varifocal negative weight
+    quality_anneal_epochs: int = 20      # QAIC: beta goes 0 (hard labels) -> 1 (IoU targets) over these epochs
+    # ---- ICCD v2 (IoU-Consistent Curriculum Denoising) ------------------------------------------------------
     use_denoising: bool = True
     dn_max_gt_per_image: int = 24
-    dn_box_noise_scale_start: float = 0.4
-    dn_box_noise_scale_end: float = 0.1
+    dn_use_negatives: bool = True        # contrastive negatives (DINO CDN)
+    dn_box_noise_scale_start: float = 1.0
+    dn_box_noise_scale_end: float = 0.4
     dn_label_noise_prob: float = 0.2
-    lambda_dn_cls: float = 1.0
+    lambda_dn_cls: float = 2.0
     lambda_dn_bbox: float = 5.0
     lambda_dn_giou: float = 2.0
-    lambda_dn_iou_consistency: float = 1.0
-    # ---- Adaptive Task-Health Modulation (ATHM) --------------------------------------------------------------
+    # ---- Adaptive Task-Health Modulation (ATHM v2) ------------------------------------------------------------
     use_athm: bool = True
     athm_start_epoch: int = 10
     athm_window: int = 6
     athm_health_floor: float = 0.35
+    athm_deadband: float = 0.5           # normalised slope a metric may fall by before it counts as declining
     head_dropout_base: float = 0.05
     head_dropout_max_extra: float = 0.25
     # ---- regularisation ------------------------------------------------------------
     drop_path_rate: float = 0.15
-    num_refine_rounds: int = 3          # number of decoder layers
+    num_refine_rounds: int = 6          # number of decoder layers (cycling coarse -> fine pixel-decoder scales)
     # ---- optimisation ----------------------------------------------------------------
     batch_size: int = 8
     num_workers: int = 4
-    epochs: int = 500                    # v3.1: was 120 -- a DETR-style detection head on ~1.5k training images
-                                          # is documented (DN-DETR, Deformable DETR) to need far more than 120
-                                          # epochs to leave the near-zero-mAP warm-up regime; see OmniMorphTrainer.
+    epochs: int = 150                    # v4: an epoch is now len(fully-labelled) / full_label_per_batch steps
+                                          # (2x v3's) over ~7x more distinct images, with ImageNet initialisation
+                                          # and anchor-refined, denoised queries -- the regime in which DN-/DAB-
+                                          # DETR converge in tens of epochs rather than v3's 500.
     warmup_epochs: int = 5
-    lr: float = 3e-4
+    lr: float = 2e-4
     min_lr: float = 1e-6
     weight_decay: float = 0.05
-    clip_grad_norm: float = 1.0
+    clip_grad_norm: float = 1.0          # applied PER STREAM (SIGC, see OmniMorphTrainer)
     use_amp: bool = True                 # only used when running on CUDA
     use_ema: bool = True
     ema_decay: float = 0.999
-    early_stop_patience: int = 80        # epochs without improvement of the composite val score (0 = off);
-                                          # scaled up together with `epochs` -- 25/120 patience would fire well
-                                          # before a 500-epoch cosine schedule has even annealed halfway down.
-    loss_early_stop_patience: int = 60   # epochs without improvement of the val TOTAL LOSS (0 = off); the
+    early_stop_patience: int = 40        # epochs without improvement of the composite val score (0 = off)
+    loss_early_stop_patience: int = 50   # epochs without improvement of the val TOTAL LOSS (0 = off); the
                                           # composite score alone was not enough to catch the v2 run's overfitting
                                           # (val loss visibly troughed ~epoch 90 and climbed for ~80 more epochs)
-    # ---- long-horizon / multi-session resumability (Kaggle sessions get killed well before 500 epochs finish
+    # ---- long-horizon / multi-session resumability (Kaggle sessions get killed well before a long run finishes
     #      in one sitting -- see OmniMorphTrainer.save/resume/_lr_lambda) --------------------------------------
     auto_resume: bool = True             # resume from `latest_checkpoint.pth` (or a safety snapshot) if present
     checkpoint_every_n_epochs: int = 5   # rotating safety snapshot cadence, independent of "latest"/"best"
     checkpoint_keep_last_n: int = 2      # how many rotating safety snapshots to retain on disk
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     # ---- evaluation / inference ------------------------------------------------------
+    test_flip_tta: bool = True           # flip self-ensemble for the final Val/Test evaluation + visualisations
     edge_tolerance: int = 1              # pixels of tolerance for the edge precision / recall
     edge_eval_thresholds: Tuple[float, ...] = (0.2, 0.35, 0.5, 0.65, 0.8)
     det_iou_thresh: float = 0.5
     det_score_thresh: float = 0.01
     det_max_per_image: int = 50
     max_infer_batches: int = 10          # -1 = whole test set (slow: 3 matplotlib figures per image)
-    det_conf_threshold: float = 0.3
+    det_conf_threshold: float = 0.3      # boxes drawn as confident detections
     det_nms_iou_thresh: float = 0.5      # visualisation-only NMS (the AP metric itself stays NMS-free / raw)
     det_vis_topk: int = 12
-    det_vis_min_score: float = 0.03      # a floor so a confidently-empty image still shows *something*
+    det_vis_min_score: float = 0.05      # fallback floor: best low-confidence guesses, drawn in a separate style
 
 
 # ============================================================================
@@ -339,6 +376,55 @@ def paired_box_giou(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-7) -> Tupl
     area_c = wh_c[:, 0] * wh_c[:, 1]
     giou = iou - (area_c - union) / (area_c + eps)
     return giou, iou
+
+
+def inverse_sigmoid(x: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+    x = x.clamp(0.0, 1.0)
+    return torch.log(x.clamp(min=eps) / (1.0 - x).clamp(min=eps))
+
+
+def sine_embed(t: torch.Tensor, num_feats: int, temperature: float = 10000.0) -> torch.Tensor:
+    """DETR-style sine/cosine embedding of normalised coordinates in [0, 1]: (...,) -> (..., num_feats). The memory
+    positional encoding and the anchor-box positional queries (QueryDecoder) both use it, so query and key
+    positions live in the same space."""
+    dim_t = torch.arange(num_feats, device=t.device, dtype=torch.float32)
+    dim_t = temperature ** (2.0 * torch.div(dim_t, 2, rounding_mode="floor") / num_feats)
+    pos = t.float()[..., None] * (2.0 * math.pi) / dim_t
+    return torch.stack((pos[..., 0::2].sin(), pos[..., 1::2].cos()), dim=-1).flatten(-2)
+
+
+class _GradScale(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, scale):
+        ctx.scale = scale
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad * ctx.scale, None
+
+
+def grad_scale(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """Identity in the forward pass; multiplies the gradient by `scale` in the backward pass."""
+    if scale == 1.0:
+        return x
+    if scale == 0.0:
+        return x.detach()
+    return _GradScale.apply(x, scale)
+
+
+def label_disagreement_boundary(seg_logits: torch.Tensor) -> torch.Tensor:
+    """LDBC (see OmniMorphNet.forward): probability that a pixel and at least its most-disagreeing 4-neighbour carry
+    different labels under the per-pixel softmax, 1 - sum_c p_c(x) p_c(x + d), max over d. (B,C,H,W) -> (B,1,H,W)
+    in [0, 1]; exactly 0 inside a confidently uniform region and -> 1 on a confident label change."""
+    p = F.softmax(seg_logits.float(), dim=1)
+    p_right = F.pad(p, (0, 1, 0, 0), mode="replicate")[..., :, 1:]
+    p_down = F.pad(p, (0, 0, 0, 1), mode="replicate")[..., 1:, :]
+    d_right = 1.0 - (p * p_right).sum(dim=1, keepdim=True)
+    d_down = 1.0 - (p * p_down).sum(dim=1, keepdim=True)
+    d_left = F.pad(d_right, (1, 0, 0, 0))[..., :, :-1]
+    d_up = F.pad(d_down, (0, 0, 1, 0))[..., :-1, :]
+    return torch.stack([d_right, d_left, d_down, d_up], dim=0).amax(dim=0).clamp(0.0, 1.0)
 
 
 def voc_colormap(n: int = 256) -> np.ndarray:
@@ -556,8 +642,10 @@ def describe_voc2012_root(root: str) -> Dict[str, int]:
     print(f"    ImageSets/Main train/val: {counts['main_train']}/{counts['main_val']} "
           f"(official: {off['main_train']}/{off['main_val']})")
     print(f"    ImageSets/Segmentation train/val: {counts['segmentation_train']}/{counts['segmentation_val']} "
-          f"(official: {off['segmentation_train']}/{off['segmentation_val']}) <- this is the subset actually used "
-          f"below: every task here needs a pixel mask per image, and only these have one.")
+          f"(official: {off['segmentation_train']}/{off['segmentation_val']}) <- the fully-labelled subset (mask + "
+          f"edge + boxes + labels); Segmentation-val is split into val/test and never enters training.")
+    print("    With `use_partial_label_images`, the ImageSets/Main train+val images that are NOT in "
+          "Segmentation-val additionally join TRAINING as box/label-only samples (mask/edge = ignore).")
     for key in ("segmentation_train", "segmentation_val"):
         n, expected = counts[key], off[key]
         if n >= 0 and abs(n - expected) > max(30, int(expected * 0.05)):
@@ -580,9 +668,10 @@ class DetectionEvaluator:
         self.n_images = 0
 
     @torch.no_grad()
-    def update(self, pred_boxes, pred_logits, pred_iou, gt_boxes, gt_labels, gt_difficult):
-        probs = pred_logits.float().softmax(dim=-1)[..., :-1]
-        scores = (probs * torch.sigmoid(pred_iou.float()).unsqueeze(-1)).cpu().numpy()
+    def update(self, pred_boxes, pred_logits, gt_boxes, gt_labels, gt_difficult):
+        # v4: per-class sigmoid logits trained IoU-aware (QAIC), so the score already encodes localisation
+        # quality -- no separate IoU-head factor to multiply in (that product is what produced 0.03-0.06 scores).
+        scores = torch.sigmoid(pred_logits.float()).cpu().numpy()
         boxes = pred_boxes.float().cpu().numpy()
         for b in range(scores.shape[0]):
             img = self.n_images
@@ -835,12 +924,20 @@ class HybridEncoderBlock(nn.Module):
 
 
 class MultiScalePixelDecoder(nn.Module):
-    def __init__(self, in_dims: List[int], config: OmniMorphConfig):
+    """FPN-style top-down decoder with learned deformable alignment (unchanged from v3), extended in v4 with a
+    second lateral per scale for the pretrained semantic stream (section 3b). The two laterals are summed *before*
+    the shared GroupNorm/GELU, so LR-encoder and ImageNet features are fused at every scale with one 1x1
+    projection each and no extra smoothing cost."""
+    def __init__(self, in_dims: List[int], config: OmniMorphConfig, sem_dims: Optional[List[int]] = None):
         super().__init__()
         self.cfg = config
         pd = config.pixel_dec_dim
-        self.laterals = nn.ModuleList([
-            nn.Sequential(nn.Conv2d(d, pd, 1), nn.GroupNorm(config.norm_groups, pd), nn.GELU()) for d in in_dims
+        self.laterals = nn.ModuleList([nn.Conv2d(d, pd, 1) for d in in_dims])
+        self.sem_laterals = nn.ModuleList([nn.Conv2d(d, pd, 1) for d in sem_dims]) if sem_dims else None
+        if self.sem_laterals is not None:
+            assert len(sem_dims) == len(in_dims), "the semantic stream must provide one feature map per encoder stage"
+        self.lateral_post = nn.ModuleList([
+            nn.Sequential(nn.GroupNorm(config.norm_groups, pd), nn.GELU()) for _ in in_dims
         ])
         self.smooth = nn.ModuleList([
             nn.Sequential(nn.Conv2d(pd, pd, config.conv_kernel, padding=config.conv_padding),
@@ -863,10 +960,17 @@ class MultiScalePixelDecoder(nn.Module):
         return F.grid_sample(prev_up, grid.to(prev_up.dtype), mode="bilinear",
                              padding_mode="border", align_corners=False)
 
-    def forward(self, features: List[torch.Tensor]) -> List[torch.Tensor]:
+    def forward(self, features: List[torch.Tensor],
+                sem_features: Optional[List[torch.Tensor]] = None) -> List[torch.Tensor]:
         results, prev = [], None
         for i in reversed(range(len(features))):
             lateral = self.laterals[i](features[i])
+            if self.sem_laterals is not None and sem_features is not None:
+                s = self.sem_laterals[i](sem_features[i])
+                if s.shape[-2:] != lateral.shape[-2:]:
+                    s = F.interpolate(s, size=lateral.shape[-2:], mode="bilinear", align_corners=False)
+                lateral = lateral + s.to(lateral.dtype)
+            lateral = self.lateral_post[i](lateral)
             if prev is not None:
                 lateral = lateral + self._deformable_align(prev, lateral, self.align_offsets[i])
             smoothed = self.smooth[i](lateral)
@@ -875,24 +979,275 @@ class MultiScalePixelDecoder(nn.Module):
         return results
 
 
-class StyleModulatedConv(nn.Module):
-    """Conv + norm + FiLM (scale/shift) from a style vector."""
-    def __init__(self, in_channels: int, out_channels: int, style_dim: int, config: OmniMorphConfig):
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=config.conv_kernel, padding=config.conv_padding)
-        self.norm = nn.GroupNorm(config.norm_groups, out_channels)
-        self.style_gamma = small_init_(nn.Linear(style_dim, out_channels))
-        self.style_beta = small_init_(nn.Linear(style_dim, out_channels))
+# ============================================================================
+# 3b. RESTORE-THEN-RECOGNISE (RtR): a dedicated restoration stream + a pretrained semantic stream
+# ============================================================================
+# Why: in v3 every task decoded from the same shared pixel-decoder tensor. The SR head therefore had no
+# normalisation-free path from the LR pixels to the output (the long skip that carries high-frequency detail in
+# every SR network since EDSR/RCAN), and the recognition heads had to learn ImageNet-level semantics from 1,464
+# bicubic-degraded 128px images -- the "Predicted HR = blurred bicubic" and "hair labelled dog/cat" panels.
+#
+# RtR splits the network into two streams with *one-way* gradient flow in each direction:
+#   restoration stream   LR --(RCAN-lite body, SFT-conditioned on the LR encoder)--> HR prediction
+#   semantic stream      HR prediction (stop-gradient) --(ImageNet-pretrained CNN)--> multi-scale features
+# The recognition stream sees the *restored* image, so better SR directly means better recognition input, while
+# the stop-gradient keeps the four recognition losses from bending the reconstruction away from fidelity.
+# Semantics still reach the restoration stream, but only through SFT modulation by the jointly-trained LR
+# encoder (whose features the recognition losses do shape) -- information flows both ways, gradients do not.
+#
+# Lineage: RCAN (Zhang et al., ECCV'18) residual channel-attention blocks; SFT (Wang et al., CVPR'18) per-pixel
+# affine conditioning, there driven by a separately trained segmentation network rather than a jointly-trained
+# multi-task encoder; SR4IR (Kim et al., CVPR'24) feeds SR output to a recogniser but deliberately *backpropagates*
+# the task loss into the SR network (task-driven perceptual loss). RtR inverts that coupling (stop-gradient into
+# SR, SFT conditioning out of the shared encoder) because here PSNR/SSIM fidelity is itself one of the targets.
+def _icnr_(conv: nn.Conv2d, upscale: int) -> None:
+    """ICNR init (Aitken et al., 2017) for a conv feeding PixelShuffle: all r*r sub-pixels of an output channel
+    start from the same kernel, so the shuffled output starts as a nearest-neighbour upsample of one conv --
+    no checkerboard pattern at initialisation."""
+    out_c, in_c, kh, kw = conv.weight.shape
+    sub = torch.empty(out_c // (upscale ** 2), in_c, kh, kw)
+    nn.init.kaiming_normal_(sub, mode="fan_in", nonlinearity="relu")
+    with torch.no_grad():
+        conv.weight.copy_(sub.repeat_interleave(upscale ** 2, dim=0))
+        if conv.bias is not None:
+            conv.bias.zero_()
+    conv._custom_init = True
 
-    def forward(self, x: torch.Tensor, style_vector: torch.Tensor) -> torch.Tensor:
-        out = self.norm(self.conv(x))
-        gamma = torch.tanh(self.style_gamma(style_vector)).unsqueeze(-1).unsqueeze(-1)
-        beta = torch.tanh(self.style_beta(style_vector)).unsqueeze(-1).unsqueeze(-1)
-        return F.gelu(out * (1.0 + gamma) + beta)
+
+class ChannelAttention(nn.Module):
+    def __init__(self, channels: int, reduction: int):
+        super().__init__()
+        hidden = max(4, channels // reduction)
+        self.body = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Conv2d(channels, hidden, 1), nn.ReLU(inplace=True),
+                                  nn.Conv2d(hidden, channels, 1), nn.Sigmoid())
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.body(x)
+
+
+class RCAB(nn.Module):
+    """Residual channel-attention block (RCAN): conv-ReLU-conv-CA with an identity skip and NO normalisation
+    (EDSR showed batch/group norm discards the range information SR needs)."""
+    def __init__(self, channels: int, reduction: int):
+        super().__init__()
+        self.body = nn.Sequential(nn.Conv2d(channels, channels, 3, padding=1), nn.ReLU(inplace=True),
+                                  nn.Conv2d(channels, channels, 3, padding=1), ChannelAttention(channels, reduction))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.body(x)
+
+
+class SFTLayer(nn.Module):
+    """Spatial Feature Transform: per-pixel scale/shift of restoration features from a conditioning map.
+    Zero-initialised output convs make it an exact identity at init."""
+    def __init__(self, channels: int, cond_channels: int):
+        super().__init__()
+        self.shared = nn.Sequential(nn.Conv2d(cond_channels, channels, 1), nn.LeakyReLU(0.1, inplace=True))
+        self.gamma = nn.Conv2d(channels, channels, 1)
+        self.beta = nn.Conv2d(channels, channels, 1)
+        for conv in (self.gamma, self.beta):
+            nn.init.zeros_(conv.weight)
+            nn.init.zeros_(conv.bias)
+            conv._custom_init = True
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        h = self.shared(cond)
+        return x * (1.0 + self.gamma(h)) + self.beta(h)
+
+
+class RestorationStream(nn.Module):
+    """RCAN-lite x4 super-resolution stream: shallow conv -> G residual groups (each SFT-conditioned on the LR
+    encoder's first-stage features) -> long skip -> PixelShuffle x2 (mid-resolution deep supervision) ->
+    PixelShuffle x2 -> residual on top of the bicubic upsample. No dropout, no normalisation, its own weight-decay
+    group and its own gradient-clipping budget (see OmniMorphTrainer: Stream-Isolated Gradient Clipping)."""
+    def __init__(self, config: OmniMorphConfig):
+        super().__init__()
+        C, r = config.rs_channels, config.pixel_shuffle_factor
+        self.head = nn.Conv2d(config.in_channels, C, 3, padding=1)
+        self.cond_proj = nn.Sequential(nn.Conv2d(config.embed_dims[0], C, 1), nn.LeakyReLU(0.1, inplace=True))
+        self.groups = nn.ModuleList([
+            nn.Sequential(*[RCAB(C, config.rs_ca_reduction) for _ in range(config.rs_blocks_per_group)],
+                          nn.Conv2d(C, C, 3, padding=1))
+            for _ in range(config.rs_groups)
+        ])
+        self.sfts = nn.ModuleList([SFTLayer(C, C) for _ in range(config.rs_groups)])
+        self.body_tail = nn.Conv2d(C, C, 3, padding=1)
+        self.up1 = nn.Sequential(nn.Conv2d(C, C * r * r, 3, padding=1), nn.PixelShuffle(r), nn.LeakyReLU(0.1, inplace=True))
+        self.mid_head = nn.Conv2d(C, config.in_channels, 3, padding=1)
+        self.up2 = nn.Sequential(nn.Conv2d(C, C * r * r, 3, padding=1), nn.PixelShuffle(r), nn.LeakyReLU(0.1, inplace=True))
+        self.hr_conv = nn.Sequential(nn.Conv2d(C, C, 3, padding=1), nn.LeakyReLU(0.1, inplace=True))
+        self.tail = nn.Conv2d(C, config.in_channels, 3, padding=1)
+        _icnr_(self.up1[0], r)
+        _icnr_(self.up2[0], r)
+        for conv in (self.mid_head, self.tail):            # start exactly at the bicubic upsample
+            nn.init.zeros_(conv.weight)
+            nn.init.zeros_(conv.bias)
+            conv._custom_init = True
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d) and not getattr(m, "_custom_init", False):
+                nn.init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+                m._custom_init = True
+        with torch.no_grad():                                 # ESRGAN-style residual scaling at init
+            for g in self.groups:
+                for blk in g:
+                    if isinstance(blk, RCAB):
+                        blk.body[2].weight.mul_(0.1)
+
+    def forward(self, x_lr: torch.Tensor, cond: torch.Tensor, out_size: Tuple[int, int]):
+        f0 = self.head(x_lr - 0.5)
+        c = self.cond_proj(cond)
+        if c.shape[-2:] != f0.shape[-2:]:
+            c = F.interpolate(c, size=f0.shape[-2:], mode="bilinear", align_corners=False)
+        h = f0
+        for group, sft in zip(self.groups, self.sfts):
+            h = h + group(sft(h, c))
+        h = f0 + self.body_tail(h)                           # long skip
+        mid_size = (out_size[0] // 2, out_size[1] // 2)
+        f_mid = self.up1(h)
+        if f_mid.shape[-2:] != mid_size:
+            f_mid = F.interpolate(f_mid, size=mid_size, mode="bilinear", align_corners=False)
+        mid_base = F.interpolate(x_lr, size=mid_size, mode="bicubic", align_corners=False).clamp(0.0, 1.0)
+        pred_mid = mid_base + self.mid_head(f_mid)
+        f_hr = self.up2(f_mid)
+        if f_hr.shape[-2:] != tuple(out_size):
+            f_hr = F.interpolate(f_hr, size=out_size, mode="bilinear", align_corners=False)
+        f_hr = self.hr_conv(f_hr)
+        base = F.interpolate(x_lr, size=out_size, mode="bicubic", align_corners=False).clamp(0.0, 1.0)
+        return base + self.tail(f_hr), pred_mid, f_hr
+
+
+class SemanticBackbone(nn.Module):
+    """ImageNet-pretrained recognition stream of RtR. Reads the restored HR canvas (stop-gradient), so with the
+    default 4x setting its stride-4/8/16/32 features land exactly on the LR encoder's 1/1, 1/2, 1/4, 1/8 grids.
+    Pretrained ResNets use FrozenBatchNorm2d (batch 8 is far too small for live BN statistics; this is the
+    standard DETR / Deformable DETR / DINO practice) and keep stem+layer1 frozen; the whole stream trains at
+    `backbone_lr_mult` x the base LR. If no ImageNet weights can be obtained (offline session, no
+    `backbone_weights_path`), it falls back -- loudly -- to a randomly initialised GroupNorm variant, because a
+    frozen-BN ResNet without pretrained statistics has no normalisation at all and diverges."""
+    _TV_WEIGHTS = {"resnet18": "ResNet18_Weights", "resnet34": "ResNet34_Weights",
+                   "resnet50": "ResNet50_Weights", "convnext_tiny": "ConvNeXt_Tiny_Weights"}
+
+    def __init__(self, config: OmniMorphConfig):
+        super().__init__()
+        import torchvision.models as tvm
+        name = config.backbone_name.lower()
+        if name not in self._TV_WEIGHTS:
+            raise ValueError(f"unsupported backbone_name '{config.backbone_name}' "
+                             f"(choose one of {sorted(self._TV_WEIGHTS)} or 'none')")
+        self.name = name
+        self.pretrained_loaded = False
+        net = None
+        path = config.backbone_weights_path
+        if path and os.path.isfile(path):
+            try:
+                net = self._build(tvm, name, pretrained=True)
+                sd = torch.load(path, map_location="cpu", weights_only=True)
+                if isinstance(sd, dict) and "state_dict" in sd:
+                    sd = sd["state_dict"]
+                missing, _unexpected = net.load_state_dict(sd, strict=False)
+                missing = [k for k in missing if not k.endswith("num_batches_tracked")]
+                if len(missing) > 0.1 * len(net.state_dict()):
+                    raise RuntimeError(f"{len(missing)} parameters missing from '{path}' (e.g. {missing[:3]})")
+                self.pretrained_loaded = True
+                print(f"[*] Semantic stream: {name} ImageNet weights loaded from {path}")
+            except Exception as e:
+                print(f"[!] Semantic stream: could not load '{path}' ({type(e).__name__}: {e}).")
+                net = None
+        if net is None and config.backbone_pretrained:
+            try:
+                weights = getattr(tvm, self._TV_WEIGHTS[name]).DEFAULT
+                net = self._build(tvm, name, pretrained=True, weights=weights)
+                self.pretrained_loaded = True
+                print(f"[*] Semantic stream: {name} ImageNet weights ({weights}) loaded.")
+            except Exception as e:
+                print(f"[!] Semantic stream: ImageNet weights for {name} unavailable ({type(e).__name__}: {e}). "
+                      f"On Kaggle, enable Internet for the notebook or attach the torchvision checkpoint and set "
+                      f"`backbone_weights_path`.")
+                net = None
+        if net is None:
+            net = self._build(tvm, name, pretrained=False)
+            print(f"[!] Semantic stream: {name} is RANDOMLY initialised -- segmentation/detection/classification "
+                  f"quality will be far below what this architecture is designed for.")
+        if name.startswith("resnet"):
+            self.stem = nn.Sequential(net.conv1, net.bn1, net.relu, net.maxpool)
+            self.stages = nn.ModuleList([net.layer1, net.layer2, net.layer3, net.layer4])
+            mult = 4 if name == "resnet50" else 1
+            self.out_dims = [64 * mult, 128 * mult, 256 * mult, 512 * mult]
+            frozen = [self.stem, self.stages[0]]
+        else:
+            f = net.features
+            self.stem = nn.Identity()
+            self.stages = nn.ModuleList([nn.Sequential(f[0], f[1]), nn.Sequential(f[2], f[3]),
+                                         nn.Sequential(f[4], f[5]), nn.Sequential(f[6], f[7])])
+            self.out_dims = [96, 192, 384, 768]
+            frozen = [self.stages[0]]
+        if self.pretrained_loaded:
+            for m in self.modules():
+                m._custom_init = True                         # OmniMorphNet._init_weights must not touch these
+            if config.backbone_freeze_stem:
+                for mod in frozen:
+                    for p in mod.parameters():
+                        p.requires_grad_(False)
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1), persistent=False)
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1), persistent=False)
+
+    @staticmethod
+    def _build(tvm, name: str, pretrained: bool, weights=None) -> nn.Module:
+        ctor = getattr(tvm, name)
+        if name.startswith("resnet"):
+            from torchvision.ops.misc import FrozenBatchNorm2d
+            norm = FrozenBatchNorm2d if pretrained else (lambda c: nn.GroupNorm(32, c))
+            return ctor(weights=weights, norm_layer=norm)
+        return ctor(weights=weights, stochastic_depth_prob=0.1)
+
+    def normalise(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.mean.to(x.dtype)) / self.std.to(x.dtype)
+
+    def forward(self, x01: torch.Tensor) -> List[torch.Tensor]:
+        x = self.stem(self.normalise(x01))
+        feats = []
+        for stage in self.stages:
+            x = stage(x)
+            feats.append(x)
+        return feats
+
+
+class PerceptualExtractor(nn.Module):
+    """Frozen copy (taken at construction time, i.e. of the ImageNet weights, before any fine-tuning drift) of the
+    semantic stream's first two stages, used for a small LPIPS-style feature-matching term on the SR output.
+    Pixel losses alone regress towards the conditional mean (blur) under 4x ambiguity; a light feature term
+    restores texture contrast at a small PSNR cost, which is why its weight is kept low by default."""
+    def __init__(self, backbone: SemanticBackbone):
+        super().__init__()
+        self.stem = copy.deepcopy(backbone.stem)
+        self.stage1 = copy.deepcopy(backbone.stages[0])
+        self.stage2 = copy.deepcopy(backbone.stages[1])
+        self.register_buffer("mean", backbone.mean.clone(), persistent=False)
+        self.register_buffer("std", backbone.std.clone(), persistent=False)
+        for p in self.parameters():
+            p.requires_grad_(False)
+        self.eval()
+
+    def train(self, mode: bool = True):
+        return super().train(False)                           # always frozen, including stochastic depth
+
+    def forward(self, x01: torch.Tensor) -> List[torch.Tensor]:
+        x = self.stem((x01 - self.mean.to(x01.dtype)) / self.std.to(x01.dtype))
+        f1 = self.stage1(x)
+        return [f1, self.stage2(f1)]
+
+
+def build_perceptual_extractor(model: nn.Module, cfg: OmniMorphConfig) -> Optional[PerceptualExtractor]:
+    sb = getattr(model, "semantic_backbone", None)
+    if cfg.lambda_perceptual <= 0 or sb is None or not sb.pretrained_loaded:
+        return None
+    return PerceptualExtractor(sb)
 
 
 # ============================================================================
-# 4. QUERY DECODER (+ IoU-Consistent Curriculum Denoising)  AND  COMPLETE 5-TASK ARCHITECTURE
+# 4. ANCHOR-REFINED QUERY DECODER (+ ICCD v2 denoising)  AND  COMPLETE 5-TASK ARCHITECTURE
 # ============================================================================
 def _cxcywh_to_boxes(cxcywh: torch.Tensor) -> torch.Tensor:
     cx, cy, w, h = cxcywh.unbind(-1)
@@ -931,8 +1286,9 @@ def build_denoising_attn_mask(B: int, n_match: int, n_dn: int, dn_valid: torch.T
     'matching' object queries and the denoising queries of ICCD (section 5).  Matching queries must never see the
     denoising queries (they are built directly from noised ground truth -- letting the matching branch attend to
     them would leak GT into the very predictions bipartite matching is supposed to discover on its own).
-    Denoising queries may attend to the matching queries and to each other; a deliberate simplification versus
-    DN-DETR's multiple, mutually-isolated noise groups, since ICCD uses a single group per image."""
+    Denoising queries (positives AND their contrastive negatives, v4) may attend to the matching queries and to
+    each other; a deliberate simplification versus DN-DETR's multiple, mutually-isolated noise groups, since ICCD
+    uses a single group per image."""
     N = n_match + n_dn
     mask = torch.zeros(B, N, N, dtype=torch.bool, device=device)
     mask[:, :n_match, n_match:] = True                              # matching -> denoising: blocked
@@ -945,79 +1301,169 @@ def build_denoising_attn_mask(B: int, n_match: int, n_dn: int, dn_valid: torch.T
 
 
 class DenoisingQueryEncoder(nn.Module):
-    """Turns a noised (box, label) pair into a decoder query embedding. A dedicated, small, from-scratch module
-    (not shared with the learned matching-query embeddings) so its content is entirely determined by the noised
-    box/label rather than by a learned per-slot identity."""
+    """Content half of an ICCD denoising query: an embedding of its (possibly label-flipped) class. In v4 the
+    noised box is no longer squeezed into this content vector -- it becomes the query's *reference anchor*,
+    exactly where a matching query keeps its own learned anchor, so both kinds of query are refined by the same
+    per-layer box-delta heads (DN-DETR's original design; v3's content-only box MLP left the decoder without the
+    positional prior it is supposed to learn to refine)."""
     def __init__(self, dim: int, num_classes: int):
         super().__init__()
-        self.box_mlp = nn.Sequential(nn.Linear(4, dim), nn.GELU(), nn.Linear(dim, dim))
         self.label_embed = nn.Embedding(num_classes + 1, dim)   # index `num_classes` = padding / no label
-        self.fuse = nn.Sequential(nn.Linear(2 * dim, dim), nn.GELU(), nn.LayerNorm(dim))
+        self.fuse = nn.Sequential(nn.Linear(dim, dim), nn.GELU(), nn.LayerNorm(dim))
 
-    def forward(self, boxes_cxcywh: torch.Tensor, labels: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-        b = self.box_mlp(boxes_cxcywh)
-        l = self.label_embed(labels.clamp(min=0))
-        out = self.fuse(torch.cat([b, l], dim=-1))
+    def forward(self, labels: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        out = self.fuse(self.label_embed(labels.clamp(min=0)))
         return out * valid.unsqueeze(-1).to(out.dtype)
 
 
+class MLP(nn.Module):
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, num_layers: int):
+        super().__init__()
+        dims = [in_dim] + [hidden_dim] * (num_layers - 1) + [out_dim]
+        self.layers = nn.ModuleList([nn.Linear(a, b) for a, b in zip(dims[:-1], dims[1:])])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        for i, layer in enumerate(self.layers):
+            x = layer(x)
+            if i < len(self.layers) - 1:
+                x = F.relu(x)
+        return x
+
+
 class QueryDecoder(nn.Module):
-    """Object-query decoder. Each layer attends to a different pixel-decoder scale (coarse -> fine) and returns
-    its queries so that every layer can be deeply supervised. Optionally carries ICCD's denoising queries
-    alongside the normal learned matching queries in the same forward pass (see `build_denoising_attn_mask`)."""
+    """Object-query decoder with anchor boxes and layer-wise iterative box refinement.
+
+    v3's queries were pure learned content vectors with a learned positional token, re-predicting every box from
+    scratch at every layer. DAB-DETR (Liu et al., ICLR'22) and Deformable DETR (Zhu et al., ICLR'21) show that this
+    is the main reason DETR-style decoders converge an order of magnitude slower than anchor-based detectors:
+    cross-attention has no explicit notion of *where* a query is looking. Here every query carries a 4-D anchor
+    (cx, cy, w, h); its positional query is an MLP of the anchor's sine embedding (in the same normalised-coordinate
+    sine space as the memory's positional encoding, so query/key positions are directly comparable), and every
+    layer predicts a delta in inverse-sigmoid space that refines the anchor for the next layer (detached between
+    layers, as in Deformable DETR). Each layer cross-attends one pixel-decoder scale, cycling coarse -> fine.
+    Classification is per-class sigmoid (IoU-aware, see MultiTaskLoss._vfl) with focal-prior bias init.
+    ICCD's denoising queries ride along in the same pass with their noised GT boxes as anchors.
+
+    Image-conditioned anchors (`use_query_selection`): learned anchors are the same for every image, so early in
+    training the decoder emits image-agnostic boxes -- the false positives in empty regions of the qualitative
+    dumps. Following Deformable DETR's two-stage proposals and DINO's "mixed query selection" (Zhang et al.,
+    ICLR'23), every memory token of every scale predicts a class score and a box relative to a grid anchor sized
+    by its scale; the top-`num_queries` tokens' boxes (detached) become this image's initial anchors, while the
+    content queries stay learned. All proposals are supervised as one more Hungarian-matched output."""
     def __init__(self, config: OmniMorphConfig):
         super().__init__()
         self.cfg = config
         self.dim = config.pixel_dec_dim
         assert self.dim % 4 == 0
         self.heads = config.num_heads[1]
-        self.layers = nn.ModuleList([DecoderLayer(self.dim, self.heads) for _ in range(config.num_refine_rounds)])
+        L = config.num_refine_rounds
+        self.layers = nn.ModuleList([DecoderLayer(self.dim, self.heads) for _ in range(L)])
         self.query_feat = nn.Embedding(config.num_queries, self.dim)
-        self.query_pos = nn.Embedding(config.num_queries, self.dim)
-        self.dn_pos_embed = nn.Parameter(torch.zeros(1, 1, self.dim))   # one shared positional token for all
-                                                                          # denoising queries: their identity comes
-                                                                          # from their noised box/label content,
-                                                                          # not from a fixed learned slot
+        self.use_query_selection = config.use_query_selection
+        if not self.use_query_selection:                     # static learned anchors (DAB-DETR)
+            anchors = torch.empty(config.num_queries, 4)
+            anchors[:, :2].uniform_(0.05, 0.95)
+            anchors[:, 2:].uniform_(0.1, 0.6)
+            self.query_anchor = nn.Parameter(inverse_sigmoid(anchors))
+        self.ref_point_head = MLP(2 * self.dim, self.dim, self.dim, 2)
+        self.box_heads = nn.ModuleList([MLP(self.dim, self.dim, 4, 3) for _ in range(L)])
+        self.cls_heads = nn.ModuleList([nn.Linear(self.dim, config.num_classes) for _ in range(L)])
         self.out_norm = nn.LayerNorm(self.dim)
+        if self.use_query_selection:
+            self.enc_proj = nn.Sequential(nn.Linear(self.dim, self.dim), nn.LayerNorm(self.dim))
+            self.enc_cls_head = nn.Linear(self.dim, config.num_classes)
+            self.enc_box_head = MLP(self.dim, self.dim, 4, 3)
         self._pe_cache: Dict[tuple, torch.Tensor] = {}
+        self._anchor_cache: Dict[tuple, torch.Tensor] = {}
+
+    def init_heads(self) -> None:
+        """Called by OmniMorphNet._special_inits AFTER the generic init pass: focal prior p=0.01 on the class
+        logits (Lin et al.), and zero box deltas so every layer starts by returning its anchor unchanged."""
+        bias = -math.log((1.0 - 0.01) / 0.01)
+        for head in self.cls_heads:
+            nn.init.constant_(head.bias, bias)
+        for head in self.box_heads:
+            nn.init.zeros_(head.layers[-1].weight)
+            nn.init.zeros_(head.layers[-1].bias)
+        if self.use_query_selection:
+            nn.init.constant_(self.enc_cls_head.bias, bias)
+            nn.init.zeros_(self.enc_box_head.layers[-1].weight)
+            nn.init.zeros_(self.enc_box_head.layers[-1].bias)
 
     def _pos_enc_2d(self, H: int, W: int, device) -> torch.Tensor:
         key = (H, W, str(device))
         if key not in self._pe_cache:
-            d4 = self.dim // 4
-            omega = 1.0 / (self.cfg.rope_base ** (torch.arange(d4, device=device, dtype=torch.float32) / d4))
-            ys = torch.arange(H, device=device, dtype=torch.float32)
-            xs = torch.arange(W, device=device, dtype=torch.float32)
-            out_y = ys.unsqueeze(-1) * omega.unsqueeze(0)
-            out_x = xs.unsqueeze(-1) * omega.unsqueeze(0)
-            pe_y = torch.cat([out_y.sin(), out_y.cos()], dim=-1)          # (H, dim/2)
-            pe_x = torch.cat([out_x.sin(), out_x.cos()], dim=-1)          # (W, dim/2)
-            pe = torch.cat([pe_y[:, None, :].expand(H, W, -1), pe_x[None, :, :].expand(H, W, -1)], dim=-1)
-            self._pe_cache[key] = pe.reshape(1, H * W, self.dim)
+            ys = (torch.arange(H, device=device, dtype=torch.float32) + 0.5) / H
+            xs = (torch.arange(W, device=device, dtype=torch.float32) + 0.5) / W
+            yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+            pe = torch.cat([sine_embed(yy.reshape(-1), self.dim // 2), sine_embed(xx.reshape(-1), self.dim // 2)], dim=-1)
+            self._pe_cache[key] = pe.unsqueeze(0)                                   # (1, HW, dim)
         return self._pe_cache[key]
 
-    def forward(self, memory_levels: List[torch.Tensor], dn_embed: Optional[torch.Tensor] = None,
-                dn_valid: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
+    def _grid_anchors(self, shapes: List[Tuple[int, int]], device) -> torch.Tensor:
+        """(N, 4) cxcywh grid anchors for the concatenated memory levels; `shapes` is ordered coarse -> fine and
+        anchor size halves with every finer level (0.2, 0.1, 0.05 of the canvas), as in Deformable DETR."""
+        key = (tuple(shapes), str(device))
+        if key not in self._anchor_cache:
+            anchors = []
+            for lvl, (H, W) in enumerate(shapes):
+                ys = (torch.arange(H, device=device, dtype=torch.float32) + 0.5) / H
+                xs = (torch.arange(W, device=device, dtype=torch.float32) + 0.5) / W
+                yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+                wh = torch.full_like(xx, 0.2 / (2.0 ** lvl))
+                anchors.append(torch.stack([xx, yy, wh, wh], dim=-1).reshape(-1, 4))
+            self._anchor_cache[key] = torch.cat(anchors, dim=0)
+        return self._anchor_cache[key]
+
+    def _select_queries(self, memory_levels: List[torch.Tensor]):
+        """Returns (initial anchors (B, Q, 4) cxcywh, detached; dict of ALL proposals for the loss)."""
+        mem = torch.cat([f.flatten(2).transpose(1, 2) for f in memory_levels], dim=1)        # (B, N, dim)
+        anchors = self._grid_anchors([tuple(f.shape[-2:]) for f in memory_levels], mem.device)
+        h = self.enc_proj(mem)
+        logits = self.enc_cls_head(h)                                                         # (B, N, C)
+        ref = torch.sigmoid(inverse_sigmoid(anchors).unsqueeze(0) + self.enc_box_head(h).float())
+        top = logits.float().amax(dim=-1).topk(self.cfg.num_queries, dim=1).indices          # (B, Q)
+        init_ref = torch.gather(ref, 1, top.unsqueeze(-1).expand(-1, -1, 4)).detach()
+        return init_ref, {"boxes": _cxcywh_to_boxes(ref), "logits": logits}
+
+    def _anchor_pos(self, ref: torch.Tensor) -> torch.Tensor:
+        d = self.dim // 2
+        emb = torch.cat([sine_embed(ref[..., 1], d), sine_embed(ref[..., 0], d),
+                         sine_embed(ref[..., 2], d), sine_embed(ref[..., 3], d)], dim=-1)   # (y, x, w, h)
+        return self.ref_point_head(emb)
+
+    def forward(self, memory_levels: List[torch.Tensor], dn_content: Optional[torch.Tensor] = None,
+                dn_ref: Optional[torch.Tensor] = None, dn_valid: Optional[torch.Tensor] = None
+                ) -> Tuple[List[Dict[str, torch.Tensor]], Optional[Dict[str, torch.Tensor]]]:
         B = memory_levels[0].shape[0]
-        q_match = self.query_feat.weight.unsqueeze(0).expand(B, -1, -1)
-        q_pos_match = self.query_pos.weight.unsqueeze(0).expand(B, -1, -1)
-        attn_mask = None
-        if dn_embed is not None:
-            n_dn = dn_embed.shape[1]
-            q = torch.cat([q_match, dn_embed], dim=1)
-            q_pos = torch.cat([q_pos_match, self.dn_pos_embed.expand(B, n_dn, -1)], dim=1)
-            attn_mask = build_denoising_attn_mask(B, self.cfg.num_queries, n_dn, dn_valid, self.heads, q.device)
+        Q = self.cfg.num_queries
+        q = self.query_feat.weight.unsqueeze(0).expand(B, -1, -1)
+        enc_out = None
+        if self.use_query_selection:
+            n_tokens = sum(f.shape[-2] * f.shape[-1] for f in memory_levels)
+            assert n_tokens >= Q, f"query selection needs >= num_queries ({Q}) memory tokens, got {n_tokens}"
+            ref, enc_out = self._select_queries(memory_levels)
         else:
-            q, q_pos = q_match, q_pos_match
+            ref = torch.sigmoid(self.query_anchor.float()).unsqueeze(0).expand(B, -1, -1)
+        attn_mask = None
+        if dn_content is not None:
+            n_dn = dn_content.shape[1]
+            q = torch.cat([q, dn_content.to(q.dtype)], dim=1)
+            ref = torch.cat([ref, dn_ref.float().clamp(1e-4, 1.0 - 1e-4)], dim=1)
+            attn_mask = build_denoising_attn_mask(B, Q, n_dn, dn_valid, self.heads, q.device)
         outs = []
-        for r, layer in enumerate(self.layers):
-            feat = memory_levels[r % len(memory_levels)]
+        for li, layer in enumerate(self.layers):
+            feat = memory_levels[li % len(memory_levels)]
             _, _, H, W = feat.shape
             mem = feat.flatten(2).transpose(1, 2)
             mem_pos = self._pos_enc_2d(H, W, feat.device).to(mem.dtype)
+            q_pos = self._anchor_pos(ref)
             q = layer(q, q_pos, mem, mem_pos, self_attn_mask=attn_mask)
-            outs.append(self.out_norm(q))
-        return outs
+            h = self.out_norm(q)
+            new_ref = torch.sigmoid(inverse_sigmoid(ref) + self.box_heads[li](h).float())
+            outs.append({"queries": h, "boxes": _cxcywh_to_boxes(new_ref), "logits": self.cls_heads[li](h)})
+            ref = new_ref.detach()
+        return outs, enc_out
 
 
 class QueryPixelAffinityRefiner(nn.Module):
@@ -1028,16 +1474,17 @@ class QueryPixelAffinityRefiner(nn.Module):
     of thing that produces the wrong-class islands and holes seen inside otherwise-correct silhouettes in the v2
     qualitative dumps (no object-level consistency term anywhere in the segmentation path).
 
-    Each matching query already has a class distribution over the 20 VOC classes + "no object" (reused directly
-    from `bbox_cls_head`, no new classifier). We project each query to a key vector and dot it against the
-    pixel-decoder feature map to get a per-query spatial affinity map, then marginalise those affinity maps over
-    classes using the SAME class probabilities (no-object -> segmentation background, class c -> segmentation
-    class c+1). The result is added, with a zero-initialised learned gain, on top of the dense head's own logits
-    -- so PCSR starts as an exact no-op and can only help once training shows it does.
+    Each matching query already has a class distribution over the 20 VOC classes + "no object" (v4: the
+    detector's per-class sigmoid scores plus an explicit no-object probability 1 - max_c p_c, no new classifier).
+    We project each query to a key vector and dot it against the pixel-decoder feature map to get a per-query
+    spatial affinity map, then marginalise those affinity maps over classes using the SAME class probabilities
+    (no-object -> segmentation background, class c -> segmentation class c+1). The result is added, with a
+    zero-initialised learned gain, on top of the dense head's own logits -- so PCSR starts as an exact no-op and
+    can only help once training shows it does.
 
     Lineage: inspired by Mask2Former's per-query dot-product mask logits, but marginalised over classes through
-    the detector's own softmax rather than a 1:1 Hungarian query<->mask assignment, and fused additively with a
-    parallel dense head instead of replacing it.
+    the detector's own class scores rather than a 1:1 Hungarian query<->mask assignment, and fused additively with
+    a parallel dense head instead of replacing it.
     """
     def __init__(self, pd: int, num_seg_classes: int, num_det_classes: int):
         super().__init__()
@@ -1065,7 +1512,9 @@ class QueryPixelAffinityRefiner(nn.Module):
 class OmniMorphNet(nn.Module):
     def __init__(self, config: OmniMorphConfig):
         super().__init__()
-        assert config.sr_up_factor == config.pixel_shuffle_factor ** 2
+        r = config.pixel_shuffle_factor
+        assert config.hr_image_size == config.lr_image_size * r * r, \
+            "the restoration stream is a fixed x(pixel_shuffle_factor**2) upsampler: hr_image_size must equal it"
         self.config = config
         P, D = config.num_prompts, config.prompt_dim
         # Learned task prompts + an image-conditioned residual computed at the start of every stage.
@@ -1092,12 +1541,16 @@ class OmniMorphNet(nn.Module):
                     nn.GroupNorm(config.norm_groups, config.embed_dims[i + 1]), nn.GELU(),
                 ))
         pd = config.pixel_dec_dim
-        self.pixel_decoder = MultiScalePixelDecoder(config.embed_dims, config)
+        # ---- Restore-then-Recognise (section 3b) ----
+        self.restoration = RestorationStream(config)
+        self.semantic_backbone = SemanticBackbone(config) if config.backbone_name.lower() != "none" else None
+        sem_dims = self.semantic_backbone.out_dims if self.semantic_backbone is not None else None
+        self.pixel_decoder = MultiScalePixelDecoder(config.embed_dims, config, sem_dims=sem_dims)
         self.query_decoder = QueryDecoder(config)
         self.dn_encoder = DenoisingQueryEncoder(pd, config.num_classes) if config.use_denoising else None
         self.global_fuse = nn.Sequential(nn.Linear(2 * pd, pd), nn.GELU())
-        # ---- semantic segmentation (dense head + PCSR refinement, + deep supervision at 1/2 resolution) ----
-        self.seg_dropout = nn.Dropout2d(config.head_dropout_base)     # p mutated at runtime by ATHM (section 7)
+        # ---- semantic segmentation (dense head + PCSR + PPSC, + deep supervision at 1/2 resolution) ----
+        self.seg_dropout = nn.Dropout2d(config.head_dropout_base)     # p mutated at runtime by ATHM (section 8)
         self.seg_head = nn.Sequential(
             nn.Conv2d(pd, pd, kernel_size=config.conv_kernel, padding=config.conv_padding),
             nn.GroupNorm(config.norm_groups, pd), nn.GELU(),
@@ -1105,43 +1558,22 @@ class OmniMorphNet(nn.Module):
         )
         self.seg_refiner = QueryPixelAffinityRefiner(pd, config.num_mask_classes, config.num_classes)
         self.aux_seg_head = nn.Conv2d(pd, config.num_mask_classes, kernel_size=1)
+        # PPSC gain, passed through softplus -> always >= 0; softplus(-2) ~= 0.13 at init (see forward)
+        self.seg_presence_gain = nn.Parameter(torch.tensor(-2.0))
         # ---- multi-label classification from pooled top-level features + queries ----
         self.cls_dropout = nn.Dropout(config.head_dropout_base)       # p mutated at runtime by ATHM
         self.cls_pre = nn.Linear(pd, pd)
         self.cls_act = nn.GELU()
         self.cls_out = nn.Linear(pd, config.num_classes)
-        # ---- detection heads (shared across decoder layers AND the denoising queries, DETR-style) ----
-        self.det_dropout = nn.Dropout(config.head_dropout_base)       # applied to matching queries only
-        self.bbox_coord_head = nn.Sequential(nn.Linear(pd, pd), nn.ReLU(), nn.Linear(pd, 4))
-        self.bbox_cls_head = nn.Linear(pd, config.num_classes + 1)
-        self.bbox_iou_head = nn.Sequential(nn.Linear(pd, pd // 2), nn.GELU(), nn.Linear(pd // 2, 1))
-        # ---- super-resolution: bicubic base + learned residual (+ mid-resolution deep supervision) ----
-        self.sr_dropout = nn.Dropout2d(config.head_dropout_base)      # p mutated at runtime by ATHM
-        self.sr_block1 = StyleModulatedConv(pd, config.sr_channels_1, style_dim=pd, config=config)
-        self.sr_up1 = nn.Sequential(
-            nn.Conv2d(config.sr_channels_1, config.sr_channels_1 * config.sr_up_factor,
-                      kernel_size=config.conv_kernel, padding=config.conv_padding),
-            nn.PixelShuffle(config.pixel_shuffle_factor), nn.GELU(),
-        )
-        self.sr_block2 = StyleModulatedConv(config.sr_channels_1, config.sr_channels_2, style_dim=pd, config=config)
-        self.sr_mid_head = nn.Conv2d(config.sr_channels_2, config.in_channels, kernel_size=config.conv_kernel,
-                                     padding=config.conv_padding)
-        self.sr_up2 = nn.Sequential(
-            nn.Conv2d(config.sr_channels_2, config.sr_channels_2 * config.sr_up_factor,
-                      kernel_size=config.conv_kernel, padding=config.conv_padding),
-            nn.PixelShuffle(config.pixel_shuffle_factor), nn.GELU(),
-        )
-        self.sr_head = nn.Conv2d(config.sr_channels_2, config.in_channels, kernel_size=config.conv_kernel,
-                                 padding=config.conv_padding)
-        # ---- edges predicted at HR resolution ----
-        eh = config.edge_hidden_channels
+        # ---- edges predicted at HR resolution (+ LDBC semantic boundary channel, see forward) ----
+        eh, rc = config.edge_hidden_channels, config.rs_channels
         self.edge_dropout = nn.Dropout2d(config.head_dropout_base)    # p mutated at runtime by ATHM
         self.edge_coarse = nn.Sequential(
-            nn.Conv2d(pd, config.sr_channels_2, kernel_size=config.conv_kernel, padding=config.conv_padding),
-            nn.GroupNorm(config.norm_groups, config.sr_channels_2), nn.GELU(),
+            nn.Conv2d(pd, rc, kernel_size=config.conv_kernel, padding=config.conv_padding),
+            nn.GroupNorm(config.norm_groups, rc), nn.GELU(),
         )
         self.edge_fuse = nn.Sequential(
-            nn.Conv2d(config.sr_channels_2 * 2, eh, kernel_size=config.conv_kernel, padding=config.conv_padding),
+            nn.Conv2d(rc * 2 + 1, eh, kernel_size=config.conv_kernel, padding=config.conv_padding),
             nn.GroupNorm(config.norm_groups, eh), nn.GELU(),
             nn.Conv2d(eh, 1, kernel_size=1),
         )
@@ -1166,23 +1598,20 @@ class OmniMorphNet(nn.Module):
             nn.init.normal_(m.weight, std=0.02)
 
     def _special_inits(self):
-        nn.init.zeros_(self.sr_head.weight)                    # SR starts exactly at the bicubic upsampling
-        nn.init.zeros_(self.sr_head.bias)
-        nn.init.zeros_(self.sr_mid_head.weight)                 # mid-resolution SR also starts at bicubic
-        nn.init.zeros_(self.sr_mid_head.bias)
         for conv in (self.seg_head[-1], self.aux_seg_head):
             nn.init.normal_(conv.weight, std=0.01)
             nn.init.zeros_(conv.bias)
         nn.init.normal_(self.edge_fuse[-1].weight, std=0.01)
         nn.init.constant_(self.edge_fuse[-1].bias, -3.0)       # edges are sparse: start with a low edge prior
-        nn.init.normal_(self.bbox_coord_head[-1].weight, std=0.01)
-        nn.init.zeros_(self.bbox_coord_head[-1].bias)
+        self.query_decoder.init_heads()
 
     def set_task_health(self, health: Dict[str, float]) -> None:
         """Adaptive Task-Health Modulation (ATHM), model side: turns up head-only dropout for whichever task's
-        validation metric has stopped improving (see MultiTaskLoss.set_task_health for the loss-weight side and
-        OmniMorphTrainer._update_athm for how `health` is computed). The shared trunk's own DropPath is left
-        untouched so tasks that are still improving keep full gradient signal through it."""
+        validation metric is declining (see MultiTaskLoss.set_task_health for the loss-weight side and
+        OmniMorphTrainer._update_athm for how `health` is computed). v4: only the segmentation / edge /
+        classification heads are modulated. The restoration stream has no dropout at all (channel dropout inside
+        an SR body hurts reconstruction -- Kong et al., CVPR'22) and dropout on decoder queries perturbs the very
+        one-to-one assignment Hungarian matching relies on, so neither is touched."""
         cfg = self.config
 
         def p_for(h):
@@ -1191,28 +1620,15 @@ class OmniMorphNet(nn.Module):
         self.seg_dropout.p = p_for(health.get("seg", 1.0))
         self.edge_dropout.p = p_for(health.get("edge", 1.0))
         self.cls_dropout.p = p_for(health.get("cls", 1.0))
-        self.det_dropout.p = p_for(health.get("det", 1.0))
-        self.sr_dropout.p = p_for(health.get("rec", 1.0))
-
-    def _decode_boxes(self, raw: torch.Tensor) -> torch.Tensor:
-        raw = raw.float()
-        cx = torch.sigmoid(raw[..., 0])
-        cy = torch.sigmoid(raw[..., 1])
-        w = torch.sigmoid(raw[..., 2]) * 0.98 + 0.02           # full-image boxes remain reachable
-        h = torch.sigmoid(raw[..., 3]) * 0.98 + 0.02
-        return _cxcywh_to_boxes(torch.stack([cx, cy, w, h], dim=-1))
-
-    def _det_heads(self, q: torch.Tensor):
-        return self._decode_boxes(self.bbox_coord_head(q)), self.bbox_cls_head(q), self.bbox_iou_head(q).squeeze(-1)
 
     def _stage_prompts(self, i: int, x: torch.Tensor) -> torch.Tensor:
         B = x.shape[0]
         delta = self.prompt_gens[i](x.mean(dim=(2, 3))).view(B, self.config.num_prompts, self.config.prompt_dim)
         return self.global_prompts + delta
 
-    def forward(self, x_lr: torch.Tensor, dn_boxes: Optional[torch.Tensor] = None,
+    def forward(self, x_lr: torch.Tensor, dn_ref: Optional[torch.Tensor] = None,
                 dn_labels: Optional[torch.Tensor] = None, dn_valid: Optional[torch.Tensor] = None
-                ) -> Dict[str, torch.Tensor]:
+                ) -> Dict[str, Any]:
         cfg = self.config
         size = (cfg.hr_image_size, cfg.hr_image_size)
         x = self.stem((x_lr - 0.5) / 0.5)
@@ -1224,93 +1640,124 @@ class OmniMorphNet(nn.Module):
             features.append(x)
             if i < len(self.downsamplers):
                 x = self.downsamplers[i](x)
-        ms = self.pixel_decoder(features)
+
+        # ---- (1) restoration stream: own normalisation-free LR->HR path, SFT-conditioned on the LR encoder ----
+        pred_hr, pred_hr_mid, sr_feat_hr = self.restoration(x_lr, features[0], size)
+
+        # ---- (2) semantic stream reads the RESTORED canvas (stop-gradient: recognition never bends SR) ----
+        sem_feats = None
+        if self.semantic_backbone is not None:
+            if cfg.semantic_input == "restored":
+                sem_src = pred_hr.detach().float().clamp(0.0, 1.0)
+            else:
+                sem_src = F.interpolate(x_lr, size=size, mode="bicubic", align_corners=False).clamp(0.0, 1.0)
+            sem_feats = self.semantic_backbone(sem_src)
+        ms = self.pixel_decoder(features, sem_feats)
         high_res_feat = ms[0]
 
-        dn_embed = None
-        use_dn = dn_boxes is not None and self.dn_encoder is not None
+        # ---- (3) anchor-refined query decoder (+ ICCD denoising queries during training) ----
+        dn_content = None
+        use_dn = dn_ref is not None and self.dn_encoder is not None
         if use_dn:
-            dn_embed = self.dn_encoder(dn_boxes, dn_labels, dn_valid)
-        q_layers = self.query_decoder(list(reversed(ms[1:])), dn_embed=dn_embed, dn_valid=dn_valid)
-        queries_all = q_layers[-1]
+            dn_content = self.dn_encoder(dn_labels, dn_valid)
+        dec, enc_out = self.query_decoder(list(reversed(ms[1:])), dn_content=dn_content,
+                                          dn_ref=dn_ref if use_dn else None, dn_valid=dn_valid)
         Q = cfg.num_queries
-        queries = queries_all[:, :Q]
+        queries = dec[-1]["queries"][:, :Q]
+        boxes, logits = dec[-1]["boxes"][:, :Q], dec[-1]["logits"][:, :Q]
         global_vec = self.global_fuse(torch.cat([ms[-1].mean(dim=(2, 3)), queries.mean(dim=1)], dim=-1))
 
-        # ---- segmentation: dense head + PCSR additive refinement ----
-        seg_feat = self.seg_dropout(high_res_feat)
-        dense_logits = self.seg_head(seg_feat)
-        query_probs = F.softmax(self.bbox_cls_head(queries).float(), dim=-1).detach()   # detached: keep the
-        # segmentation loss from reshaping the detector's own classification calibration (an explicit
-        # interference-control choice, in the same spirit as ATHM below).
-        seg_refine = self.seg_refiner(high_res_feat, queries, query_probs)
-        pred_masks = F.interpolate(dense_logits + seg_refine, size=size, mode="bilinear", align_corners=False)
-
-        # ---- classification ----
+        # ---- classification (computed before segmentation, which uses it as a presence prior) ----
         cls_feat = self.cls_dropout(global_vec)
         pred_cls = self.cls_out(self.cls_act(self.cls_pre(cls_feat)))
 
-        # ---- super-resolution: bicubic(LR) + learned residual, with a mid-resolution auxiliary output ----
-        sr = self.sr_block1(high_res_feat, global_vec)
-        sr = self.sr_up1(sr)
-        sr = self.sr_block2(sr, global_vec)
-        sr = self.sr_dropout(sr)
-        mid_size = (size[0] // 2, size[1] // 2)
-        mid_base = F.interpolate(x_lr, size=mid_size, mode="bicubic", align_corners=False).clamp(0.0, 1.0)
-        pred_hr_mid = mid_base + self.sr_mid_head(sr)
-        sr_hr = self.sr_up2(sr)
-        base = F.interpolate(x_lr, size=size, mode="bicubic", align_corners=False).clamp(0.0, 1.0)
-        pred_hr = base + self.sr_head(sr_hr)
+        # ---- segmentation: dense head + PCSR + Presence-Prior Segmentation Calibration (PPSC) ----
+        dense_logits = self.seg_head(self.seg_dropout(high_res_feat))
+        det_probs = torch.sigmoid(logits.float()).detach()     # detached: segmentation must not reshape the
+        # detector's own score calibration (an explicit interference-control choice, as in v3)
+        query_probs = torch.cat([det_probs, 1.0 - det_probs.amax(dim=-1, keepdim=True)], dim=-1)
+        seg_logits = dense_logits.float() + self.seg_refiner(high_res_feat, queries, query_probs)
+        if cfg.use_presence_prior:
+            # PPSC: p(class c at pixel | image) ∝ p(pixel looks like c) * p(c present in image)  ->  add
+            # g * log sigmoid(cls_logit_c) to the c-th segmentation logit (background untouched), g = softplus(.)
+            # >= 0 learned. A class the image-level head is confident is ABSENT can no longer win an island of
+            # pixels (the v3 "hair -> dog/cat" failure), while a present class is unaffected (log sigma -> 0).
+            # Not detached on purpose: segmentation evidence also sharpens the image-level head.
+            # Lineage: EncNet's SE-loss (Zhang et al., CVPR'18) uses image-level presence to re-weight feature
+            # channels; here it enters as an explicit, gain-controlled Bayesian log-prior on the logits instead.
+            prior = F.softplus(self.seg_presence_gain) * F.logsigmoid(pred_cls.float())
+            prior = torch.cat([torch.zeros_like(prior[:, :1]), prior], dim=1)
+            seg_logits = seg_logits + prior[:, :, None, None]
+        pred_masks = F.interpolate(seg_logits, size=size, mode="bilinear", align_corners=False)
 
-        # ---- edges ----
-        edge_feat = self.edge_dropout(high_res_feat)
-        edge_coarse = F.interpolate(self.edge_coarse(edge_feat), size=size, mode="bilinear", align_corners=False)
-        pred_edges = self.edge_fuse(torch.cat([edge_coarse, sr_hr.to(edge_coarse.dtype)], dim=1))
-
-        # ---- detection (matching branch) ----
-        queries_det = self.det_dropout(queries)
-        boxes, logits, iou = self._det_heads(queries_det)
+        # ---- edges: Label-Disagreement Boundary Coupling (LDBC) ----
+        # The v3 edge head fired on every intensity edge (CPU case, faces, shirt print) because nothing told it
+        # which edges belong to annotated objects. LDBC feeds it one extra channel: the exact probability that a
+        # pixel and its 4-neighbour carry DIFFERENT segmentation labels, 1 - sum_c p_c(x) p_c(x+d), maxed over
+        # neighbours -- a closed-form, differentiable semantic boundary computed from the network's own
+        # segmentation posterior. The edge loss flows back into segmentation through it at a reduced scale
+        # (`ldbc_grad_to_seg`), sharpening segmentation boundaries without letting the edge loss dominate.
+        # Lineage: Gated-SCNN (Takikawa et al., ICCV'19) couples a shape stream to segmentation through learned
+        # gates plus a dual-task regulariser; LDBC replaces both with this analytic boundary probability.
+        boundary = label_disagreement_boundary(grad_scale(seg_logits, cfg.ldbc_grad_to_seg))
+        boundary = F.interpolate(boundary, size=size, mode="bilinear", align_corners=False)
+        edge_coarse = F.interpolate(self.edge_coarse(self.edge_dropout(high_res_feat)), size=size,
+                                    mode="bilinear", align_corners=False)
+        pred_edges = self.edge_fuse(torch.cat([edge_coarse, sr_feat_hr.detach().to(edge_coarse.dtype),
+                                               (2.0 * boundary - 1.0).to(edge_coarse.dtype)], dim=1))
 
         out = {
             "pred_hr": pred_hr, "pred_hr_mid": pred_hr_mid, "pred_masks": pred_masks, "pred_cls": pred_cls,
-            "pred_edges": pred_edges, "pred_det_boxes": boxes, "pred_det_logits": logits, "pred_det_iou": iou,
-            "queries": queries,
+            "pred_edges": pred_edges, "pred_det_boxes": boxes, "pred_det_logits": logits, "queries": queries,
         }
         if use_dn:
-            n_match = Q
-            dn_queries = queries_all[:, n_match:]
-            dn_boxes_pred, dn_logits_pred, dn_iou_pred = self._det_heads(dn_queries)
-            out["dn_pred_boxes"] = dn_boxes_pred
-            out["dn_pred_logits"] = dn_logits_pred
-            out["dn_pred_iou"] = dn_iou_pred
+            out["dn_layers"] = [{"boxes": d["boxes"][:, Q:], "logits": d["logits"][:, Q:]} for d in dec]
         if self.training:
             out["pred_masks_aux"] = F.interpolate(self.aux_seg_head(ms[1]), size=size, mode="bilinear",
                                                   align_corners=False)
-            aux = []
-            for q in q_layers[:-1]:
-                b_, l_, i_ = self._det_heads(q[:, :Q])
-                aux.append({"boxes": b_, "logits": l_, "iou": i_})
-            out["aux_det"] = aux
+            out["aux_det"] = [{"boxes": d["boxes"][:, :Q], "logits": d["logits"][:, :Q]} for d in dec[:-1]]
+            if enc_out is not None:
+                out["aux_det"].append(enc_out)               # all query-selection proposals, Hungarian-matched
+        return out
+
+    @torch.no_grad()
+    def forward_tta(self, x_lr: torch.Tensor) -> Dict[str, Any]:
+        """Horizontal-flip test-time self-ensemble (as EDSR+/RCAN+ do for SR) for the dense outputs and the
+        image-level classifier. Detection keeps the un-flipped pass: merging two sets of one-to-one DETR
+        predictions would need its own box-fusion step and is deliberately not attempted here."""
+        out = self.forward(x_lr)
+        out_f = self.forward(torch.flip(x_lr, dims=[-1]))
+        for k in ("pred_hr", "pred_hr_mid", "pred_masks", "pred_edges"):
+            out[k] = 0.5 * (out[k] + torch.flip(out_f[k], dims=[-1]))
+        out["pred_cls"] = 0.5 * (out["pred_cls"] + out_f["pred_cls"])
         return out
 
 
 # ============================================================================
-# 5. IoU-CONSISTENT CURRICULUM DENOISING (ICCD) -- ground-truth noising utility
+# 5. ICCD v2 -- IoU-CONSISTENT CURRICULUM DENOISING: ground-truth noising utility
 # ============================================================================
 def build_dn_batch(gt_boxes: List[torch.Tensor], gt_labels: List[torch.Tensor], cfg: OmniMorphConfig,
                     noise_scale: float, device) -> Optional[Dict[str, torch.Tensor]]:
     """Builds one padded batch of noised decoder queries (+ their clean reconstruction targets) from the ragged
-    per-image ground truth. `noise_scale` is annealed coarse -> fine over training by the caller (Trainer), which
-    is the "curriculum" half of ICCD; the IoU-consistency target (`target_iou`, the true IoU between each noised
-    box and its clean source box) is the half that is not present in DN-DETR, which only reconstructs box/label."""
+    per-image ground truth. Slots [0, M) are positives; with `dn_use_negatives`, slots [M, 2M) are contrastive
+    negatives of the same objects (DINO's CDN, Zhang et al. ICLR'23: corner noise strictly larger than any
+    positive's, supervised as "no object"), which teaches the decoder to *reject* near-duplicates -- the
+    duplicated, un-suppressed boxes of the v2/v3 dumps. Noise is DINO-style per-corner jitter proportional to the
+    box's half-extent, scaled by `noise_scale`, which the Trainer anneals coarse -> fine (the curriculum half of
+    ICCD). What is NOT built here any more is v3's `target_iou` = IoU(noised input, GT): that measured the quality
+    of what a query was *handed*, not of what it *predicted*, and trained the score head to under-estimate refined
+    boxes. ICCD v2 computes the IoU-consistency target from the decoder's own output box inside the loss
+    (MultiTaskLoss.get_dn_loss) instead."""
     B = len(gt_boxes)
     M = cfg.dn_max_gt_per_image
-    noised_boxes = torch.zeros(B, M, 4, device=device)
-    noised_labels = torch.full((B, M), cfg.num_classes, dtype=torch.long, device=device)
-    valid = torch.zeros(B, M, dtype=torch.bool, device=device)
-    target_boxes_xyxy = torch.zeros(B, M, 4, device=device)
-    target_labels = torch.full((B, M), cfg.num_classes, dtype=torch.long, device=device)
-    target_iou = torch.zeros(B, M, device=device)
+    groups = 2 if cfg.dn_use_negatives else 1
+    N = groups * M
+    dn_ref = torch.zeros(B, N, 4, device=device)
+    dn_labels = torch.full((B, N), cfg.num_classes, dtype=torch.long, device=device)
+    valid = torch.zeros(B, N, dtype=torch.bool, device=device)
+    is_pos = torch.zeros(B, N, dtype=torch.bool, device=device)
+    target_boxes_xyxy = torch.zeros(B, N, 4, device=device)
+    target_labels = torch.full((B, N), cfg.num_classes, dtype=torch.long, device=device)
     any_valid = False
     for i in range(B):
         boxes = gt_boxes[i]
@@ -1324,56 +1771,54 @@ def build_dn_batch(gt_boxes: List[torch.Tensor], gt_labels: List[torch.Tensor], 
             idx = torch.randperm(n_total, device=device)[:n]
         else:
             idx = torch.arange(n_total, device=device)
-        b = boxes[idx].to(device)             # xyxy, normalised
+        b = boxes[idx].to(device).float()     # xyxy, normalised
         l = labels[idx].to(device)
-        cx = (b[:, 0] + b[:, 2]) / 2
-        cy = (b[:, 1] + b[:, 3]) / 2
-        w = (b[:, 2] - b[:, 0]).clamp(min=1e-4)
-        h = (b[:, 3] - b[:, 1]).clamp(min=1e-4)
-        cxcywh = torch.stack([cx, cy, w, h], dim=-1)
-        shift = (torch.rand(n, 2, device=device) * 2 - 1) * noise_scale * torch.stack([w, h], dim=-1)
-        scale_jit = 1.0 + (torch.rand(n, 2, device=device) * 2 - 1) * noise_scale
-        noisy_cxcywh = cxcywh.clone()
-        noisy_cxcywh[:, :2] = (cxcywh[:, :2] + shift).clamp(0.0, 1.0)
-        noisy_cxcywh[:, 2:] = (cxcywh[:, 2:] * scale_jit).clamp(0.01, 1.0)
-        noisy_xyxy = _cxcywh_to_boxes(noisy_cxcywh)
-        noisy_l = l.clone()
-        flip_mask = torch.rand(n, device=device) < cfg.dn_label_noise_prob
-        if flip_mask.any() and cfg.num_classes > 1:
-            rand_l = torch.randint(0, cfg.num_classes, (n,), device=device)
-            noisy_l = torch.where(flip_mask, rand_l, noisy_l)
-        _, iou_ni = paired_box_giou(noisy_xyxy, b)
-        noised_boxes[i, :n] = noisy_cxcywh
-        noised_labels[i, :n] = noisy_l
-        valid[i, :n] = True
-        target_boxes_xyxy[i, :n] = b
-        target_labels[i, :n] = l
-        target_iou[i, :n] = iou_ni.clamp(0.0, 1.0)
+        half = (b[:, 2:] - b[:, :2]).clamp(min=1e-4).repeat(1, 2) / 2.0
+        for g in range(groups):
+            sign = torch.randint(0, 2, (n, 4), device=device).float() * 2.0 - 1.0
+            part = torch.rand(n, 4, device=device)
+            if g == 1:
+                part = part + 1.0                 # negatives: strictly larger perturbation than any positive
+            noisy = (b + sign * part * half * noise_scale).clamp(0.0, 1.0)
+            x1, x2 = torch.min(noisy[:, 0], noisy[:, 2]), torch.max(noisy[:, 0], noisy[:, 2])
+            y1, y2 = torch.min(noisy[:, 1], noisy[:, 3]), torch.max(noisy[:, 1], noisy[:, 3])
+            ref = torch.stack([(x1 + x2) / 2, (y1 + y2) / 2, (x2 - x1).clamp(min=1e-3), (y2 - y1).clamp(min=1e-3)], -1)
+            noisy_l = l.clone()
+            flip_mask = torch.rand(n, device=device) < cfg.dn_label_noise_prob
+            if flip_mask.any() and cfg.num_classes > 1:
+                rand_l = torch.randint(0, cfg.num_classes, (n,), device=device)
+                noisy_l = torch.where(flip_mask, rand_l, noisy_l)
+            sl = slice(g * M, g * M + n)
+            dn_ref[i, sl] = ref.clamp(1e-4, 1.0)
+            dn_labels[i, sl] = noisy_l
+            valid[i, sl] = True
+            is_pos[i, sl] = (g == 0)
+            target_boxes_xyxy[i, sl] = b
+            target_labels[i, sl] = l
     if not any_valid:
         return None
-    return {"noised_boxes": noised_boxes, "noised_labels": noised_labels, "valid": valid,
-            "target_boxes_xyxy": target_boxes_xyxy, "target_labels": target_labels, "target_iou": target_iou}
+    return {"dn_ref": dn_ref, "dn_labels": dn_labels, "valid": valid, "is_pos": is_pos,
+            "target_boxes_xyxy": target_boxes_xyxy, "target_labels": target_labels}
 
 
 # ============================================================================
 # 6. LOSS FUNCTIONS
 # ============================================================================
 class MultiTaskLoss(nn.Module):
-    def __init__(self, config: OmniMorphConfig):
+    def __init__(self, config: OmniMorphConfig, perceptual: Optional[PerceptualExtractor] = None):
         super().__init__()
         self.cfg = config
         seg_w = torch.ones(config.num_mask_classes)
         seg_w[0] = config.seg_bg_weight
-        det_w = torch.ones(config.num_classes + 1)
-        det_w[-1] = config.bg_class_weight
         self.register_buffer("seg_class_weights", seg_w, persistent=False)
-        self.register_buffer("det_class_weights", det_w, persistent=False)
         self.register_buffer("edge_pos_weight", torch.tensor([config.edge_pos_weight]), persistent=False)
         self.register_buffer("ssim_window", self._gaussian_window(config.ssim_kernel, config.ssim_sigma,
                                                                   config.in_channels), persistent=False)
         self.register_buffer("pyramid_kernel", self._gaussian_pyramid_kernel(config.in_channels), persistent=False)
         self.bce_loss = nn.BCEWithLogitsLoss()
-        self.task_health: Dict[str, float] = {}     # updated once per epoch by the Trainer (ATHM, section 7)
+        self.perceptual = perceptual
+        self.task_health: Dict[str, float] = {}     # updated once per epoch by the Trainer (ATHM, section 8)
+        self.quality_exponent = 0.0                 # QAIC beta, annealed 0 -> 1 by the Trainer (see _vfl)
 
     # ---- Adaptive Task-Health Modulation (loss-weight side; see OmniMorphNet.set_task_health for the other) ----
     def set_task_health(self, health: Dict[str, float]) -> None:
@@ -1381,6 +1826,9 @@ class MultiTaskLoss(nn.Module):
 
     def _eff_lambda(self, task: str, base: float) -> float:
         return base * self.task_health.get(task, 1.0)
+
+    def set_quality_exponent(self, beta: float) -> None:
+        self.quality_exponent = float(min(max(beta, 0.0), 1.0))
 
     # ---- image reconstruction ----
     @staticmethod
@@ -1463,7 +1911,33 @@ class MultiTaskLoss(nn.Module):
             vm = F.interpolate(vm, size=p_down.shape[-2:], mode="nearest")
         return total / max(weight_sum, 1e-8)
 
+    def perceptual_loss(self, pred: torch.Tensor, target: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        """LPIPS-style distance (Zhang et al., CVPR'18, without the learned per-channel weights): squared L2
+        between channel-unit-normalised frozen ImageNet features, masked to the letterbox's valid region."""
+        use_amp = pred.is_cuda
+        with torch.autocast(device_type=pred.device.type, dtype=torch.float16 if use_amp else torch.bfloat16,
+                            enabled=use_amp):
+            feats_p = self.perceptual(pred)
+            with torch.no_grad():
+                feats_t = self.perceptual(target)
+        total = pred.new_zeros(())
+        for fp, ft in zip(feats_p, feats_t):
+            fp = F.normalize(fp.float(), dim=1, eps=1e-6)
+            ft = F.normalize(ft.float(), dim=1, eps=1e-6)
+            vm = F.interpolate(valid_mask, size=fp.shape[-2:], mode="nearest")
+            total = total + ((fp - ft).pow(2).sum(dim=1, keepdim=True) * vm).sum() / vm.sum().clamp(min=1.0)
+        return total / max(len(feats_p), 1)
+
     # ---- segmentation ----
+    def seg_ce(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Weighted, label-smoothed, ignore-aware CE. Guarded for batches whose masks are entirely `ignore` (v4's
+        box/label-only training images, a fully-padded crop): F.cross_entropy returns 0/0 = NaN there, which the
+        trainer's non-finite check would have silently turned into a skipped optimisation step."""
+        if not bool((target != self.cfg.ignore_index).any()):
+            return logits.sum() * 0.0
+        return F.cross_entropy(logits, target, weight=self.seg_class_weights, ignore_index=self.cfg.ignore_index,
+                               label_smoothing=self.cfg.label_smoothing_seg)
+
     def dice_loss(self, logits: torch.Tensor, target_mask: torch.Tensor) -> torch.Tensor:
         """Batch-level soft dice averaged over the classes PRESENT in the batch (absent classes are excluded so
         they cannot push every pixel towards background)."""
@@ -1493,6 +1967,10 @@ class MultiTaskLoss(nn.Module):
     # ---- detection (bipartite matching branch) ----
     @torch.no_grad()
     def match(self, pred_boxes, pred_logits, gt_boxes, gt_labels):
+        """Hungarian matching with the sigmoid-focal classification cost of Deformable DETR (the cost the
+        classification loss below is actually consistent with), plus L1 and GIoU box costs."""
+        cfg = self.cfg
+        a, g = cfg.focal_alpha, cfg.focal_gamma
         B = pred_boxes.shape[0]
         empty = torch.empty(0, dtype=torch.int64, device=pred_boxes.device)
         indices = []
@@ -1500,110 +1978,113 @@ class MultiTaskLoss(nn.Module):
             if len(gt_boxes[i]) == 0:
                 indices.append((empty, empty))
                 continue
-            out_prob = pred_logits[i].softmax(-1)
+            prob = pred_logits[i].float().sigmoid()
             out_bbox = pred_boxes[i]
             tgt_bbox, tgt_ids = gt_boxes[i], gt_labels[i]
-            cost_class = -out_prob[:, tgt_ids]
+            neg_cost = (1 - a) * prob.pow(g) * -(1 - prob + 1e-8).log()
+            pos_cost = a * (1 - prob).pow(g) * -(prob + 1e-8).log()
+            cost_class = pos_cost[:, tgt_ids] - neg_cost[:, tgt_ids]
             cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
             cost_giou = -generalized_box_iou(out_bbox, tgt_bbox)
-            C = self.cfg.lambda_bbox * cost_bbox + self.cfg.lambda_giou * cost_giou + cost_class
+            C = cfg.lambda_bbox * cost_bbox + cfg.lambda_giou * cost_giou + cfg.lambda_det_ce * cost_class
             C = torch.nan_to_num(C, nan=1e6, posinf=1e6, neginf=-1e6)
             src_ind, tgt_ind = linear_sum_assignment(C.cpu().numpy())
             indices.append((torch.as_tensor(src_ind, dtype=torch.int64, device=pred_boxes.device),
                             torch.as_tensor(tgt_ind, dtype=torch.int64, device=pred_boxes.device)))
         return indices
 
-    @staticmethod
-    def _focal_ce(logits: torch.Tensor, targets: torch.Tensor, weight: Optional[torch.Tensor],
-                   gamma: float) -> torch.Tensor:
-        """Focal cross-entropy (Lin et al., ICCV'17), adopted for the DETR-style query classification head the
-        way Deformable DETR / DINO-DETR use it (Zhu et al., ICLR'21; Zhang et al., CVPR'22): with only a handful
-        of real objects among `num_queries` slots per VOC image, plain weighted CE lets the many easy,
-        correctly-classified "no-object" queries dominate the gradient -- consistent with the near-zero
-        prediction confidences (0.04-0.13) visible on every predicted box across the qualitative detection
-        panels. The (1-p_t)^gamma term down-weights those easy queries so gradient mass concentrates on the few
-        still-uncertain ones, without needing `bg_class_weight` re-tuned against the query count to get the same
-        effect. `weight` still applies its per-class (mainly background-vs-object) scale on top, exactly as the
-        plain-CE path did, so this is a strict refinement, not a different weighting philosophy."""
-        nll = F.cross_entropy(logits, targets, reduction="none")
-        p_t = torch.exp(-nll.clamp(max=20.0))
-        w = weight[targets] if weight is not None else torch.ones_like(nll)
-        focal = w * (1.0 - p_t).pow(gamma) * nll
-        return focal.sum() / w.sum().clamp(min=1e-6)
+    def _vfl(self, logits: torch.Tensor, pos_mask: torch.Tensor, quality: torch.Tensor) -> torch.Tensor:
+        """Quality-Annealed IoU-aware Classification (QAIC) -- the fix for the 0.03-0.06 scores.
 
-    def get_det_loss(self, pred_boxes, pred_logits, pred_iou, gt_boxes, gt_labels, num_boxes):
+        v3 scored a box as softmax-focal-probability x sigmoid(IoU head): two separately under-confident numbers
+        multiplied together. v4 has ONE per-class sigmoid score whose training target for a matched query is the
+        localisation quality of its own box, q = IoU(pred, GT)^beta (Varifocal loss, Zhang et al. CVPR'21: BCE
+        towards q, positives weighted by q, negatives by alpha*p^gamma), so a confident score *means* a
+        well-localised box and no product is needed. The new part is beta: Varifocal / Stable-DINO (Liu et al.,
+        ICCV'23) / Align-DETR use a fixed target, but early in DETR training matched IoUs are near zero, which
+        would make every positive target ~0 and stall class learning. beta is annealed 0 -> 1 over
+        `quality_anneal_epochs` (Trainer), so training starts with hard 1/0 labels (fast recognition) and ends
+        fully IoU-calibrated; the matching branch and ICCD's denoising queries share the same schedule.
+        Returns the SUM (caller normalises by the number of GT boxes)."""
         cfg = self.cfg
+        p = torch.sigmoid(logits)
+        target = torch.where(pos_mask, quality, torch.zeros_like(quality))
+        weight = torch.where(pos_mask, quality, cfg.vfl_alpha * p.detach().pow(cfg.focal_gamma))
+        bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+        return (bce * weight).sum()
+
+    def get_det_loss(self, pred_boxes, pred_logits, gt_boxes, gt_labels, num_boxes):
+        beta = self.quality_exponent
         indices = self.match(pred_boxes, pred_logits, gt_boxes, gt_labels)
         B, Q, C = pred_logits.shape
-        target_classes = torch.full((B, Q), cfg.num_classes, dtype=torch.long, device=pred_logits.device)
-        b_idx, s_idx, src_boxes, tgt_boxes = [], [], [], []
+        pos_mask = torch.zeros(B, Q, C, dtype=torch.bool, device=pred_logits.device)
+        quality = torch.zeros(B, Q, C, device=pred_logits.device)
+        src_boxes, tgt_boxes = [], []
         for i, (src, tgt) in enumerate(indices):
             if len(src) == 0:
                 continue
-            target_classes[i, src] = gt_labels[i][tgt]
-            b_idx.append(torch.full_like(src, i))
-            s_idx.append(src)
-            src_boxes.append(pred_boxes[i, src])
-            tgt_boxes.append(gt_boxes[i][tgt])
-        if cfg.use_focal_det_cls:
-            loss_ce = self._focal_ce(pred_logits.reshape(-1, C), target_classes.reshape(-1),
-                                      self.det_class_weights, cfg.focal_gamma)
-        else:
-            loss_ce = F.cross_entropy(pred_logits.transpose(1, 2), target_classes, weight=self.det_class_weights)
-        iou_target = torch.zeros_like(pred_iou)
+            sb, tb = pred_boxes[i, src], gt_boxes[i][tgt]
+            _, iou = paired_box_giou(sb.detach(), tb)
+            lbl = gt_labels[i][tgt]
+            pos_mask[i, src, lbl] = True
+            quality[i, src, lbl] = iou.clamp(min=1e-2).pow(beta)
+            src_boxes.append(sb)
+            tgt_boxes.append(tb)
+        loss_ce = self._vfl(pred_logits.reshape(-1, C), pos_mask.reshape(-1, C), quality.reshape(-1, C)) / num_boxes
         loss_bbox = pred_boxes.sum() * 0.0
         loss_giou = pred_boxes.sum() * 0.0
         if src_boxes:
             sb, tb = torch.cat(src_boxes), torch.cat(tgt_boxes)
-            giou, iou = paired_box_giou(sb, tb)
+            giou, _ = paired_box_giou(sb, tb)
             loss_bbox = F.l1_loss(sb, tb, reduction="sum") / num_boxes
             loss_giou = (1.0 - giou).sum() / num_boxes
-            iou_target[torch.cat(b_idx), torch.cat(s_idx)] = iou.detach()
-        loss_iou = F.binary_cross_entropy_with_logits(pred_iou, iou_target) * cfg.lambda_iou_branch
-        return loss_ce, loss_bbox, loss_giou, loss_iou
+        return loss_ce, loss_bbox, loss_giou
 
     def _weighted_det(self, parts):
-        ce, bbox, giou, iou = parts
+        ce, bbox, giou = parts
         c = self.cfg
-        return c.lambda_det_ce * ce + c.lambda_bbox * bbox + c.lambda_giou * giou + iou
+        return c.lambda_det_ce * ce + c.lambda_bbox * bbox + c.lambda_giou * giou
 
-    # ---- ICCD: denoising queries, supervised directly (no Hungarian matching -- correspondence is by
-    #      construction) with box/label reconstruction AND an IoU-consistency term against the exact IoU
-    #      between each noised box and its clean source box ----
-    def get_dn_loss(self, dn_pred_boxes, dn_pred_logits, dn_pred_iou, dn_batch):
+    # ---- ICCD v2: denoising queries, supervised directly at EVERY decoder layer (no Hungarian matching --
+    #      correspondence is by construction). Positives reconstruct box + label, with the QAIC quality target
+    #      computed from the query's OWN refined output box (the IoU-consistency term, now measuring the right
+    #      thing); contrastive negatives are pushed to "no object" ----
+    def get_dn_loss(self, dn_layers: List[Dict[str, torch.Tensor]], dn_batch: Dict[str, torch.Tensor]):
         cfg = self.cfg
+        beta = self.quality_exponent
         valid = dn_batch["valid"]
-        valid_f = valid.float()
-        n_valid = valid_f.sum().clamp(min=1.0)
-        logits_flat = dn_pred_logits.reshape(-1, dn_pred_logits.shape[-1])
-        labels_flat = dn_batch["target_labels"].reshape(-1)
-        flat_valid = valid.reshape(-1)
-        if cfg.use_focal_det_cls:
-            loss_cls = (self._focal_ce(logits_flat[flat_valid], labels_flat[flat_valid], self.det_class_weights,
-                                        cfg.focal_gamma) if flat_valid.any() else logits_flat.sum() * 0.0)
-        else:
-            ce_per = F.cross_entropy(logits_flat, labels_flat, weight=self.det_class_weights, reduction="none")
-            loss_cls = (ce_per.view_as(valid_f) * valid_f).sum() / n_valid
-        pred_boxes_flat = dn_pred_boxes.reshape(-1, 4)[flat_valid]
-        tgt_boxes_flat = dn_batch["target_boxes_xyxy"].reshape(-1, 4)[flat_valid]
-        if pred_boxes_flat.numel() > 0:
-            giou, iou = paired_box_giou(pred_boxes_flat, tgt_boxes_flat)
-            loss_bbox = F.l1_loss(pred_boxes_flat, tgt_boxes_flat, reduction="sum") / n_valid
-            loss_giou = (1.0 - giou).sum() / n_valid
-        else:
-            loss_bbox = dn_pred_boxes.sum() * 0.0
-            loss_giou = dn_pred_boxes.sum() * 0.0
-        iou_target_flat = dn_batch["target_iou"].reshape(-1)[flat_valid]
-        iou_pred_flat = dn_pred_iou.reshape(-1)[flat_valid]
-        if iou_pred_flat.numel() > 0:
-            loss_iou_consistency = F.binary_cross_entropy_with_logits(iou_pred_flat, iou_target_flat.clamp(0, 1))
-        else:
-            loss_iou_consistency = dn_pred_iou.sum() * 0.0
-        loss_dn = (cfg.lambda_dn_cls * loss_cls + cfg.lambda_dn_bbox * loss_bbox
-                   + cfg.lambda_dn_giou * loss_giou + cfg.lambda_dn_iou_consistency * loss_iou_consistency)
-        return loss_dn, loss_cls, loss_bbox, loss_giou, loss_iou_consistency
+        pos = valid & dn_batch["is_pos"]
+        n_pos = float(max(int(pos.sum()), 1))
+        tgt_boxes, tgt_labels = dn_batch["target_boxes_xyxy"], dn_batch["target_labels"]
+        rows = valid.reshape(-1)
+        total = None
+        last = None
+        for li, layer in enumerate(dn_layers):
+            boxes, logits = layer["boxes"].float(), layer["logits"].float()
+            C = logits.shape[-1]
+            pos_mask = torch.zeros_like(logits, dtype=torch.bool)
+            quality = torch.zeros_like(logits)
+            loss_bbox = boxes.sum() * 0.0
+            loss_giou = boxes.sum() * 0.0
+            if bool(pos.any()):
+                pb, tb = boxes[pos], tgt_boxes[pos]
+                giou, _ = paired_box_giou(pb, tb)
+                _, iou = paired_box_giou(pb.detach(), tb)
+                b_idx, s_idx = pos.nonzero(as_tuple=True)
+                lbl = tgt_labels[pos]
+                pos_mask[b_idx, s_idx, lbl] = True
+                quality[b_idx, s_idx, lbl] = iou.clamp(min=1e-2).pow(beta)
+                loss_bbox = F.l1_loss(pb, tb, reduction="sum") / n_pos
+                loss_giou = (1.0 - giou).sum() / n_pos
+            loss_cls = self._vfl(logits.reshape(-1, C)[rows], pos_mask.reshape(-1, C)[rows],
+                                 quality.reshape(-1, C)[rows]) / n_pos
+            layer_loss = cfg.lambda_dn_cls * loss_cls + cfg.lambda_dn_bbox * loss_bbox + cfg.lambda_dn_giou * loss_giou
+            w = 1.0 if li == len(dn_layers) - 1 else cfg.lambda_aux_det
+            total = w * layer_loss if total is None else total + w * layer_loss
+            last = (loss_cls, loss_bbox, loss_giou)
+        return total, last[0], last[1], last[2]
 
-    def forward(self, predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor],
+    def forward(self, predictions: Dict[str, Any], targets: Dict[str, Any],
                 dn_batch: Optional[Dict[str, torch.Tensor]] = None):
         cfg = self.cfg
         valid_mask = targets.get("valid_mask")
@@ -1616,6 +2097,10 @@ class MultiTaskLoss(nn.Module):
         ssim_loss_val, ssim_val = self.masked_ssim(pred_hr, targets["hr_image"], valid_mask)
         pyramid_val = self.laplacian_pyramid_loss(pred_hr, targets["hr_image"], valid_mask, cfg.pyramid_levels)
         loss_rec = l1_val + cfg.lambda_ssim * ssim_loss_val + cfg.lambda_pyramid * pyramid_val
+        loss_perc = pred_hr.sum() * 0.0
+        if self.perceptual is not None and cfg.lambda_perceptual > 0:
+            loss_perc = self.perceptual_loss(pred_hr, targets["hr_image"], valid_mask)
+            loss_rec = loss_rec + cfg.lambda_perceptual * loss_perc
         loss_mid = pred_hr.sum() * 0.0
         if "pred_hr_mid" in predictions:
             pred_mid = predictions["pred_hr_mid"].float()
@@ -1628,14 +2113,11 @@ class MultiTaskLoss(nn.Module):
         # ---- segmentation ----
         pred_masks = predictions["pred_masks"].float()
         target_mask = targets["mask"].squeeze(1).long()
-        loss_mask_ce = F.cross_entropy(pred_masks, target_mask, weight=self.seg_class_weights,
-                                       ignore_index=cfg.ignore_index, label_smoothing=cfg.label_smoothing_seg)
+        loss_mask_ce = self.seg_ce(pred_masks, target_mask)
         loss_mask_dice = self.dice_loss(pred_masks, target_mask)
         loss_seg = loss_mask_ce * cfg.lambda_mask_ce + loss_mask_dice * cfg.lambda_mask_dice
         if "pred_masks_aux" in predictions:
-            aux_ce = F.cross_entropy(predictions["pred_masks_aux"].float(), target_mask,
-                                     weight=self.seg_class_weights, ignore_index=cfg.ignore_index,
-                                     label_smoothing=cfg.label_smoothing_seg)
+            aux_ce = self.seg_ce(predictions["pred_masks_aux"].float(), target_mask)
             loss_seg = loss_seg + cfg.lambda_aux_seg * cfg.lambda_mask_ce * aux_ce
 
         # ---- classification (label-smoothed multi-label BCE) ----
@@ -1654,32 +2136,29 @@ class MultiTaskLoss(nn.Module):
         loss_edge_dice = self.edge_dice_loss(pred_edges, target_bin, valid_e)
         loss_edge = (loss_edge_bce + cfg.lambda_edge_dice * loss_edge_dice) * cfg.lambda_edge
 
-        # ---- detection (+ deep supervision of intermediate decoder layers) ----
+        # ---- detection (+ deep supervision of every intermediate decoder layer) ----
         gt_boxes, gt_labels = targets["boxes"], targets["box_labels"]
         num_boxes = float(max(sum(len(b) for b in gt_boxes), 1))
         main_parts = self.get_det_loss(predictions["pred_det_boxes"].float(), predictions["pred_det_logits"].float(),
-                                       predictions["pred_det_iou"].float(), gt_boxes, gt_labels, num_boxes)
+                                       gt_boxes, gt_labels, num_boxes)
         loss_det = self._weighted_det(main_parts)
         for aux in predictions.get("aux_det", []):
-            parts = self.get_det_loss(aux["boxes"].float(), aux["logits"].float(), aux["iou"].float(),
-                                      gt_boxes, gt_labels, num_boxes)
+            parts = self.get_det_loss(aux["boxes"].float(), aux["logits"].float(), gt_boxes, gt_labels, num_boxes)
             loss_det = loss_det + cfg.lambda_aux_det * self._weighted_det(parts)
-        loss_det_ce, loss_bbox, loss_giou, loss_iou = main_parts
+        loss_det_ce, loss_bbox, loss_giou = main_parts
 
-        # ---- ICCD denoising (training-only auxiliary; NOT health-modulated -- see forward's docstring note) ----
+        # ---- ICCD v2 denoising (training-only auxiliary; NOT health-modulated) ----
         loss_dn = pred_hr.sum() * 0.0
-        loss_dn_cls = loss_dn_bbox = loss_dn_giou = loss_dn_iouc = pred_hr.sum() * 0.0
-        if dn_batch is not None and "dn_pred_boxes" in predictions:
-            loss_dn, loss_dn_cls, loss_dn_bbox, loss_dn_giou, loss_dn_iouc = self.get_dn_loss(
-                predictions["dn_pred_boxes"].float(), predictions["dn_pred_logits"].float(),
-                predictions["dn_pred_iou"].float(), dn_batch)
+        loss_dn_cls = loss_dn_bbox = loss_dn_giou = pred_hr.sum() * 0.0
+        if dn_batch is not None and "dn_layers" in predictions:
+            loss_dn, loss_dn_cls, loss_dn_bbox, loss_dn_giou = self.get_dn_loss(predictions["dn_layers"], dn_batch)
 
-        # ATHM: down-weight (never below `athm_health_floor`) whichever task's own validation metric has stopped
-        # improving; ICCD's denoising loss is deliberately excluded -- it exists specifically to fix detection's
-        # collapse, so damping it exactly when detection looks unhealthy would be self-defeating.
+        # ATHM: down-weight (never below `athm_health_floor`) whichever task's own validation metric is declining;
+        # ICCD's denoising loss is deliberately excluded -- it exists specifically to fix detection's collapse, so
+        # damping it exactly when detection looks unhealthy would be self-defeating.
         total_loss = (self._eff_lambda("rec", cfg.lambda_rec) * loss_rec
                       + self._eff_lambda("seg", 1.0) * loss_seg
-                      + loss_cls
+                      + self._eff_lambda("cls", 1.0) * loss_cls
                       + self._eff_lambda("edge", 1.0) * loss_edge
                       + self._eff_lambda("det", 1.0) * loss_det
                       + loss_dn)
@@ -1687,12 +2166,12 @@ class MultiTaskLoss(nn.Module):
         d = lambda t: t.detach()
         return total_loss, {
             "loss_total": d(total_loss), "loss_rec": d(loss_rec), "loss_l1": d(l1_val), "loss_ssim": d(ssim_loss_val),
-            "loss_pyramid": d(pyramid_val), "loss_mid_sr": d(loss_mid),
+            "loss_pyramid": d(pyramid_val), "loss_perceptual": d(loss_perc), "loss_mid_sr": d(loss_mid),
             "loss_seg_ce": d(loss_mask_ce), "loss_seg_dice": d(loss_mask_dice), "loss_cls": d(loss_cls),
             "loss_edge": d(loss_edge), "loss_det": d(loss_det), "loss_det_ce": d(loss_det_ce),
-            "loss_bbox": d(loss_bbox), "loss_giou": d(loss_giou), "loss_iou_branch": d(loss_iou),
+            "loss_bbox": d(loss_bbox), "loss_giou": d(loss_giou),
             "loss_dn": d(loss_dn), "loss_dn_cls": d(loss_dn_cls), "loss_dn_bbox": d(loss_dn_bbox),
-            "loss_dn_giou": d(loss_dn_giou), "loss_dn_iou_consistency": d(loss_dn_iouc),
+            "loss_dn_giou": d(loss_dn_giou),
         }
 
 
@@ -1706,12 +2185,16 @@ class PascalVOC2012MultiTaskDataset(Dataset):
     (`meta['lb']`, consumed by the inferencer in section 9). Cross-Task Consistent Region Mixing (CTCRM, see
     `_apply_ctcrm`) is applied after that canonical per-sample loading step, train-only.
 
-    Which images this actually trains on: the official VOC2012 trainval package has 17,125 images total
-    (JPEGImages/Annotations), but only the 1,464 + 1,449 = 2,913 of them listed in
-    ImageSets/Segmentation/{train,val}.txt have a pixel-level SegmentationClass/SegmentationObject mask -- and
-    every task here needs one, so `root` is read strictly from that split, never from the larger
-    ImageSets/Main split or from JPEGImages directly (see `VOC2012_OFFICIAL_COUNTS`, `resolve_voc2012_root` and
-    `describe_voc2012_root` in section 2 for how `root` is located and cross-checked against those numbers).
+    Which images this trains on: the official VOC2012 trainval package has 17,125 images (JPEGImages /
+    Annotations); only the 1,464 + 1,449 = 2,913 listed in ImageSets/Segmentation/{train,val}.txt have a
+    SegmentationClass/SegmentationObject mask. val/test are always carved out of Segmentation-val. v3 trained on
+    Segmentation-train alone, i.e. its detector and classifier saw 1,464 images. v4 ("mixed supervision") also
+    trains on every ImageSets/Main train+val image that is NOT in Segmentation-val (~10k extra images with
+    complete box/label annotations): their mask and edge targets are all `ignore`, so they supervise SR,
+    classification and detection only. `full_label_indices` / `partial_label_indices` expose the two groups to
+    MixedSupervisionBatchSampler, which keeps a fixed per-batch quota of fully-labelled images. See
+    `VOC2012_OFFICIAL_COUNTS`, `resolve_voc2012_root` and `describe_voc2012_root` (section 2) for how `root` is
+    located and cross-checked against the official numbers.
     """
     def __init__(self, root: str, split: str, config: OmniMorphConfig, augment: bool = False,
                  _resolved: bool = False):
@@ -1737,31 +2220,60 @@ class PascalVOC2012MultiTaskDataset(Dataset):
         fv = int(round(255 * config.letterbox_fill))
         self.fill_rgb = (fv, fv, fv)
         off = VOC2012_OFFICIAL_COUNTS
+        self.image_ids: List[str] = []
+        self.full_label_indices: List[int] = []
+        self.partial_label_indices: List[int] = []
+        extra_ids: List[str] = []
         try:
             if split == "train":
-                self.image_ids = self._read_ids("train.txt")
-                self._warn_if_off_official(len(self.image_ids), off["segmentation_train"], "train")
+                seg_ids = self._read_ids("train.txt")
+                self._warn_if_off_official(len(seg_ids), off["segmentation_train"], "train")
+                if config.use_partial_label_images:
+                    extra_ids = self._read_partial_label_ids(set(seg_ids))
             elif not config.separate_test_split:
-                self.image_ids = self._read_ids("val.txt")     # legacy behaviour: test == val (leaky)
-                self._warn_if_off_official(len(self.image_ids), off["segmentation_val"], "val")
+                seg_ids = self._read_ids("val.txt")     # legacy behaviour: test == val (leaky)
+                self._warn_if_off_official(len(seg_ids), off["segmentation_val"], "val")
             else:
                 all_val = self._read_ids("val.txt")
                 self._warn_if_off_official(len(all_val), off["segmentation_val"], "val (pre train/test split)")
                 shuffled = all_val[:]
                 random.Random(config.seed).shuffle(shuffled)
                 n_val = int(round(len(shuffled) * config.val_fraction))
-                self.image_ids = sorted(shuffled[:n_val]) if split == "val" else sorted(shuffled[n_val:])
+                seg_ids = sorted(shuffled[:n_val]) if split == "val" else sorted(shuffled[n_val:])
         except (FileNotFoundError, OSError) as e:
             print(f"[*] Dataset split not found: {e}. Ensure VOC2012 is extracted correctly.")
-            self.image_ids = []
             return
+        seg_ids = self._drop_missing(seg_ids, split)
+        extra_ids = self._drop_missing(extra_ids, f"{split} (box/label-only)")
+        self.image_ids = seg_ids + extra_ids
+        self.full_label_indices = list(range(len(seg_ids)))
+        self.partial_label_indices = list(range(len(seg_ids), len(self.image_ids)))
+
+    def _drop_missing(self, ids: List[str], label: str) -> List[str]:
         # a listed id with no matching JPEGImages file (partial/corrupted download) is dropped here, with a
         # count printed, rather than crashing deep inside a DataLoader worker at some later, random epoch.
-        missing = [i for i in self.image_ids if not os.path.isfile(os.path.join(self.img_dir, f"{i}.jpg"))]
+        missing = {i for i in ids if not os.path.isfile(os.path.join(self.img_dir, f"{i}.jpg"))}
         if missing:
-            print(f"[!] {len(missing)} image id(s) in the '{split}' split have no matching JPEGImages/*.jpg "
-                  f"file and were dropped (e.g. {missing[:3]}).")
-            self.image_ids = [i for i in self.image_ids if i not in set(missing)]
+            print(f"[!] {len(missing)} image id(s) in the '{label}' split have no matching JPEGImages/*.jpg "
+                  f"file and were dropped (e.g. {sorted(missing)[:3]}).")
+            ids = [i for i in ids if i not in missing]
+        return ids
+
+    def _read_partial_label_ids(self, seg_train_ids: set) -> List[str]:
+        """ImageSets/Main train+val ids (complete box/label annotations, no mask) that are neither already in the
+        fully-labelled training set nor in Segmentation-val -- excluding Segmentation-val is what keeps the
+        reported val/test numbers leak-free."""
+        main_dir = os.path.join(self.root, "ImageSets", "Main")
+        ids = set()
+        for name in ("train.txt", "val.txt"):
+            if os.path.isfile(os.path.join(main_dir, name)):
+                ids |= set(self._read_ids(name, main_dir))
+        if not ids:
+            print("[!] ImageSets/Main/{train,val}.txt not found -- training on the fully-labelled split only.")
+            return []
+        seg_val = set(self._read_ids("val.txt"))
+        return sorted(i for i in ids - seg_train_ids - seg_val
+                      if os.path.isfile(os.path.join(self.ann_dir, f"{i}.xml")))
 
     @staticmethod
     def _warn_if_off_official(n: int, expected: int, label: str) -> None:
@@ -1771,8 +2283,8 @@ class PascalVOC2012MultiTaskDataset(Dataset):
                   f"full ~17.1k-image trainval package -- if it does, `dataset_root` is pointing at the wrong "
                   f"directory (see describe_voc2012_root()).")
 
-    def _read_ids(self, name: str) -> List[str]:
-        with open(os.path.join(self.split_dir, name), "r") as f:
+    def _read_ids(self, name: str, split_dir: Optional[str] = None) -> List[str]:
+        with open(os.path.join(split_dir or self.split_dir, name), "r") as f:
             return sorted({line.strip().split()[0] for line in f if line.strip()})
 
     def __len__(self) -> int:
@@ -2025,7 +2537,11 @@ class PascalVOC2012MultiTaskDataset(Dataset):
         cfg = self.cfg
         A = self._load_one(idx)
         if self.augment and cfg.use_ctcrm and len(self.image_ids) > 1 and random.random() < cfg.ctcrm_prob:
-            j = random.randrange(len(self.image_ids))
+            # v4: the pasted partner is always a fully-labelled image, so a mix never dilutes segmentation /
+            # edge supervision -- and pasting its labelled objects into a box/label-only image gives that image
+            # some pixel-level supervision it would otherwise never get.
+            pool = self.full_label_indices or list(range(len(self.image_ids)))
+            j = random.choice(pool)
             if j != idx:
                 mixed = self._apply_ctcrm(A, self._load_one(j))
                 if mixed is not None:
@@ -2079,6 +2595,43 @@ def move_batch(batch: Dict, device) -> Dict:
         else:
             out[k] = v
     return out
+
+
+class MixedSupervisionBatchSampler(torch.utils.data.Sampler):
+    """Mixed-Supervision Batch Sampler (MSBS). Every batch holds exactly `full_per_batch` fully-labelled images
+    (mask + edges + boxes + labels; each seen once per epoch, reshuffled every epoch) and fills the remaining slots
+    from the box/label-only pool, which is cycled through in its own reshuffled order ACROSS epochs, so the whole
+    ~10k-image pool is covered over the run while an epoch stays len(full) / full_per_batch steps long.
+
+    A plain shuffle over the union would put ~13% fully-labelled images in a batch (often zero in a batch of 8),
+    making the segmentation / edge gradient vanish on most steps -- and an all-ignore batch used to turn the
+    segmentation CE into NaN. Fixing the quota per batch is the standard trick of semi-/partially-supervised
+    segmentation (labelled + unlabelled halves per batch, e.g. Mean Teacher / FixMatch-style pipelines), applied
+    here to *partially-labelled* multi-task data."""
+    def __init__(self, full_indices: List[int], partial_indices: List[int], batch_size: int, full_per_batch: int,
+                 seed: int = 0):
+        self.full = list(full_indices)
+        self.partial = list(partial_indices)
+        self.batch_size = int(batch_size)
+        self.full_per_batch = self.batch_size if not self.partial else max(1, min(int(full_per_batch), self.batch_size))
+        self.rng = random.Random(seed)
+        self._partial_queue: List[int] = []
+
+    def _next_partial(self) -> int:
+        if not self._partial_queue:
+            self._partial_queue = self.partial[:]
+            self.rng.shuffle(self._partial_queue)
+        return self._partial_queue.pop()
+
+    def __len__(self) -> int:
+        return len(self.full) // self.full_per_batch
+
+    def __iter__(self):
+        full = self.full[:]
+        self.rng.shuffle(full)
+        fpb = self.full_per_batch
+        for b in range(len(self)):
+            yield full[b * fpb:(b + 1) * fpb] + [self._next_partial() for _ in range(self.batch_size - fpb)]
 
 
 # ============================================================================
@@ -2145,7 +2698,7 @@ class MetricTracker:
         self.cls_scores.append(torch.sigmoid(preds["pred_cls"].float()).cpu())
         self.cls_labels.append(batch["label"].cpu())
         # --- detection ---
-        self.det.update(preds["pred_det_boxes"], preds["pred_det_logits"], preds["pred_det_iou"],
+        self.det.update(preds["pred_det_boxes"], preds["pred_det_logits"],
                         batch["boxes"], batch["box_labels"], batch["box_difficult"])
 
     def compute(self) -> Dict[str, float]:
@@ -2204,19 +2757,41 @@ class OmniMorphTrainer:
         self.use_amp = bool(config.use_amp and self.device.type == "cuda")
         self.ckpt_dir = os.path.join(config.checkpoint_dir, config.experiment_name)
         os.makedirs(self.ckpt_dir, exist_ok=True)
-        # no weight decay on biases / norms / prompts / queries / scales
-        decay, no_decay = [], []
+        # Parameter groups: no weight decay on biases / norms / prompts / queries / scales; the restoration stream
+        # gets its own (default zero) weight decay; the pretrained semantic stream trains at backbone_lr_mult x lr.
+        groups: Dict[str, List[nn.Parameter]] = defaultdict(list)
         for name, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            if (p.ndim <= 1 or name.endswith(".bias") or "global_prompts" in name or "query_" in name
-                    or "tap_weights" in name or "logit_scale" in name or "dn_pos_embed" in name):
-                no_decay.append(p)
+            no_wd = (p.ndim <= 1 or name.endswith(".bias") or "global_prompts" in name or "query_" in name
+                     or "tap_weights" in name or "logit_scale" in name or "presence_gain" in name)
+            if name.startswith("semantic_backbone."):
+                groups["backbone_no_decay" if no_wd else "backbone_decay"].append(p)
+            elif name.startswith("restoration."):
+                groups["restoration"].append(p)
             else:
-                decay.append(p)
-        self.optimizer = torch.optim.AdamW(
-            [{"params": decay, "weight_decay": config.weight_decay}, {"params": no_decay, "weight_decay": 0.0}],
-            lr=config.lr, betas=(0.9, 0.999))
+                groups["no_decay" if no_wd else "decay"].append(p)
+        sb = getattr(model, "semantic_backbone", None)
+        # the reduced fine-tuning LR only makes sense for ImageNet weights; a random-init fallback trains at full LR
+        bb_lr = config.lr * (config.backbone_lr_mult if sb is not None and sb.pretrained_loaded else 1.0)
+        param_groups = [
+            {"params": groups["decay"], "weight_decay": config.weight_decay, "lr": config.lr},
+            {"params": groups["no_decay"], "weight_decay": 0.0, "lr": config.lr},
+            {"params": groups["restoration"], "weight_decay": config.restoration_weight_decay, "lr": config.lr},
+            {"params": groups["backbone_decay"], "weight_decay": config.weight_decay, "lr": bb_lr},
+            {"params": groups["backbone_no_decay"], "weight_decay": 0.0, "lr": bb_lr},
+        ]
+        self.optimizer = torch.optim.AdamW([g for g in param_groups if g["params"]], lr=config.lr, betas=(0.9, 0.999))
+        # Stream-Isolated Gradient Clipping (SIGC): one clip budget per stream instead of one global norm. With a
+        # global norm the largest gradient source (detection: Hungarian + denoising + every aux layer) sets a
+        # common shrink factor that also scales the restoration stream's update towards zero -- one of the three
+        # reasons v3's SR output stayed at bicubic quality. Per-stream clipping keeps each stream's step size
+        # governed by its own gradients, at zero extra backward passes.
+        self.clip_streams = [s_ for s_ in (
+            groups["restoration"],
+            groups["backbone_decay"] + groups["backbone_no_decay"],
+            groups["decay"] + groups["no_decay"],
+        ) if s_]
         # ---- Continuity-Preserving Horizon Extension (CPHE) state -- see _lr_lambda()/resume(). `schedule_horizon`
         # is the total-epoch horizon the cosine LR (and the ICCD noise-scale anneal) is currently annealing over;
         # `restart_anchor_epoch` is the elapsed-epoch point the *current* cosine leg began at (0 for an
@@ -2278,6 +2853,11 @@ class OmniMorphTrainer:
         horizon = max(self.schedule_horizon, anchor + 1)
         return min(max((epoch - 1 - anchor) / max(1, horizon - anchor - 1), 0.0), 1.0)
 
+    def _quality_exponent(self, epoch: int) -> float:
+        """QAIC beta (see MultiTaskLoss._vfl): 0 -> 1 linearly over `quality_anneal_epochs`, a pure function of the
+        epoch so it resumes exactly."""
+        return min(1.0, max(0.0, (epoch - 1) / max(1, self.cfg.quality_anneal_epochs)))
+
     @staticmethod
     def composite_score(m: Dict[str, float]) -> float:
         """Model-selection score: mean of the four 'quality' metrics (all already 0-100) PLUS an SR-fidelity term
@@ -2303,7 +2883,12 @@ class OmniMorphTrainer:
             y = np.asarray(vals, dtype=np.float64)
             slope = float(np.polyfit(x, y, 1)[0])
             scale = max(float(np.std(y)), 1e-3)
-            h = 1.0 / (1.0 + math.exp(-slope / scale))
+            # v4: v3 used h = sigmoid(slope / scale), which reads a *plateau* (slope ~ 0) as health 0.5 -- so every
+            # converged task had its loss halved and its dropout raised, exactly when it should be left alone.
+            # Now only a metric that is genuinely declining (beyond a dead-band absorbing epoch-to-epoch noise)
+            # loses health; improving or flat metrics keep h = 1.
+            z = slope / scale + cfg.athm_deadband
+            h = 1.0 if z >= 0.0 else math.exp(z)
             health[task] = float(max(cfg.athm_health_floor, min(1.0, h)))
         self.task_health = health
         self.criterion.set_task_health(health)
@@ -2365,8 +2950,8 @@ class OmniMorphTrainer:
         compatible = (set(saved.keys()) == set(current.keys())
                       and all(saved[k].shape == current[k].shape for k in saved))
         if not compatible:
-            print("[!] Checkpoint architecture differs from the current model (expected when resuming a v2 run "
-                  "into v3's new modules) -> starting from scratch (model left untouched).")
+            print("[!] Checkpoint architecture differs from the current model (expected when resuming a v3 run "
+                  "into v4's new modules) -> starting from scratch (model left untouched).")
             return
         self.model.load_state_dict(saved)
         if self.ema is not None and ckpt.get("ema_state") is not None:
@@ -2443,7 +3028,8 @@ class OmniMorphTrainer:
         print(f"[*] Loaded best checkpoint (epoch {ckpt['epoch']}).")
 
     # ---- one epoch -------------------------------------------------------------------------------------------
-    def run_epoch(self, epoch: int, loader: DataLoader, is_train: bool, tag: Optional[str] = None) -> Dict[str, float]:
+    def run_epoch(self, epoch: int, loader: DataLoader, is_train: bool, tag: Optional[str] = None,
+                  use_tta: bool = False) -> Dict[str, float]:
         model = self.model if is_train else self.eval_model
         model.train(is_train)
         tracker = MetricTracker(self.cfg, self.device, self.criterion)
@@ -2460,8 +3046,8 @@ class OmniMorphTrainer:
                 self.optimizer.zero_grad(set_to_none=True)
                 with self._autocast():
                     if dn_batch is not None:
-                        preds = model(batch["lr_image"], dn_boxes=dn_batch["noised_boxes"],
-                                     dn_labels=dn_batch["noised_labels"], dn_valid=dn_batch["valid"])
+                        preds = model(batch["lr_image"], dn_ref=dn_batch["dn_ref"],
+                                      dn_labels=dn_batch["dn_labels"], dn_valid=dn_batch["valid"])
                     else:
                         preds = model(batch["lr_image"])
                 loss, loss_dict = self.criterion(preds, batch, dn_batch=dn_batch)
@@ -2470,7 +3056,8 @@ class OmniMorphTrainer:
                     continue
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), self.cfg.clip_grad_norm)
+                for stream_params in self.clip_streams:
+                    nn.utils.clip_grad_norm_(stream_params, self.cfg.clip_grad_norm)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 if self.ema is not None:
@@ -2478,7 +3065,7 @@ class OmniMorphTrainer:
             else:
                 with torch.no_grad():
                     with self._autocast():
-                        preds = model(batch["lr_image"])
+                        preds = model.forward_tta(batch["lr_image"]) if use_tta else model(batch["lr_image"])
                     loss, loss_dict = self.criterion(preds, batch)
             tracker.update(preds, batch, loss_dict)
             if it % 10 == 0:
@@ -2487,8 +3074,9 @@ class OmniMorphTrainer:
             print(f"[!] {skipped} non-finite batches skipped in epoch {epoch}.")
         return tracker.compute()
 
-    def evaluate(self, loader: DataLoader, name: str = "Test") -> Dict[str, float]:
-        m = self.run_epoch(0, loader, False, tag=f"{name} eval")
+    def evaluate(self, loader: DataLoader, name: str = "Test", use_tta: Optional[bool] = None) -> Dict[str, float]:
+        use_tta = self.cfg.test_flip_tta if use_tta is None else use_tta
+        m = self.run_epoch(0, loader, False, tag=f"{name} eval{' (flip-TTA)' if use_tta else ''}", use_tta=use_tta)
         print(f"[{name}] loss {m['loss']:.3f} | PSNR {m['psnr']:.2f}dB | SSIM {m['ssim']:.3f} | mIoU {m['miou']:.1f}% "
               f"| PixAcc {m['pix_acc']:.1f}% | EdgeF1 {m['edge_f1']:.1f}% (P {m['edge_prec']:.1f} / R {m['edge_rec']:.1f}, "
               f"thr {m['edge_thr']:.2f}) | Det mAP@{self.cfg.det_iou_thresh:.1f} {m['det_map']:.1f}% | Cls mAP {m['cls_map']:.1f}%")
@@ -2510,6 +3098,7 @@ class OmniMorphTrainer:
             epoch_frac = self._dn_noise_progress(epoch)
             self.current_dn_noise_scale = (cfg.dn_box_noise_scale_start
                                             + (cfg.dn_box_noise_scale_end - cfg.dn_box_noise_scale_start) * epoch_frac)
+            self.criterion.set_quality_exponent(self._quality_exponent(epoch))
             t = self.run_epoch(epoch, self.train_loader, True)
             v = self.run_epoch(epoch, self.val_loader, False)
             self.scheduler.step()
@@ -2536,7 +3125,8 @@ class OmniMorphTrainer:
                   f"score {score:.2f}{' *' if is_best else ''} | health[{health_str}]")
             print(f"      val components: rec {v['loss_rec']:.3f} | seg_ce {v['loss_seg_ce']:.3f} | "
                   f"seg_dice {v['loss_seg_dice']:.3f} | cls {v['loss_cls']:.3f} | edge {v['loss_edge']:.3f} | "
-                  f"det {v['loss_det']:.3f} | dn {v['loss_dn']:.3f}")
+                  f"det {v['loss_det']:.3f} | train dn {t['loss_dn']:.3f} | QAIC beta "
+                  f"{self.criterion.quality_exponent:.2f} | DN noise {self.current_dn_noise_scale:.2f}")
             stop_composite = cfg.early_stop_patience > 0 and self.bad_epochs >= cfg.early_stop_patience
             stop_loss = cfg.loss_early_stop_patience > 0 and self.loss_bad_epochs >= cfg.loss_early_stop_patience
             if stop_composite or stop_loss:
@@ -2574,7 +3164,11 @@ class OmniMorphInferencer:
     as far as the forward pass; every plotted panel is unletterboxed back onto the image's OWN original
     resolution and aspect ratio using the per-sample transform recorded by the dataset (`meta['lb']`), and ground
     truth panels are re-read from the original files on disk for pixel-perfect reference quality rather than a
-    round-tripped copy of the (downsampled-then-upsampled) canvas tensor."""
+    round-tripped copy of the (downsampled-then-upsampled) canvas tensor. v4: predictions use the flip
+    self-ensemble (`test_flip_tta`), segmentation LOGITS are resized to the original resolution before the argmax
+    (v3 nearest-resized the label map, which blocks every boundary), and detections are the calibrated QAIC scores
+    -- boxes at or above `det_conf_threshold` are drawn as detections; only if none qualify are the best
+    low-confidence guesses drawn, in a visibly different (dotted orange) style."""
     def __init__(self, model: nn.Module, config: OmniMorphConfig, dataset: Optional[PascalVOC2012MultiTaskDataset] = None):
         self.model, self.cfg = model, config
         self.model.eval()
@@ -2606,6 +3200,12 @@ class OmniMorphInferencer:
         pil = Image.fromarray(np.clip(arr_hw, 0, 255).astype(np.uint8))
         inner = pil.crop((lb["pad_left"], lb["pad_top"], lb["pad_left"] + lb["new_w"], lb["pad_top"] + lb["new_h"]))
         return np.array(inner.resize((lb["orig_w"], lb["orig_h"]), NEAREST))
+
+    @staticmethod
+    def _unletterbox_logits_argmax(logits_chw: torch.Tensor, lb: Dict[str, Any]) -> np.ndarray:
+        inner = logits_chw[:, lb["pad_top"]:lb["pad_top"] + lb["new_h"], lb["pad_left"]:lb["pad_left"] + lb["new_w"]]
+        up = F.interpolate(inner[None].float(), size=(lb["orig_h"], lb["orig_w"]), mode="bilinear", align_corners=False)
+        return up[0].argmax(dim=0).cpu().numpy().astype(np.uint8)
 
     @staticmethod
     def _unletterbox_prob_map(arr_hw: np.ndarray, lb: Dict[str, Any]) -> np.ndarray:
@@ -2654,7 +3254,10 @@ class OmniMorphInferencer:
             if 0 < cfg.max_infer_batches <= batch_idx:
                 break
             batch = move_batch(batch, self.device)
-            preds = self.model(batch["lr_image"])
+            if cfg.test_flip_tta and hasattr(self.model, "forward_tta"):
+                preds = self.model.forward_tta(batch["lr_image"])
+            else:
+                preds = self.model(batch["lr_image"])
             for i in range(batch["lr_image"].shape[0]):
                 image_id = batch["image_id"][i]
                 lb = batch["meta"][i]["lb"]
@@ -2685,8 +3288,7 @@ class OmniMorphInferencer:
                 plt.savefig(os.path.join(self.dirs[0], f"{sid}_sr.png"), bbox_inches="tight")
                 plt.close(fig)
 
-                pred_mask_canvas = preds["pred_masks"][i].float().argmax(dim=0).cpu().numpy()
-                pred_mask_full = self._unletterbox_label_map(pred_mask_canvas, lb)
+                pred_mask_full = self._unletterbox_logits_argmax(preds["pred_masks"][i], lb)
                 tgt_mask_full = self._load_original_gt_mask(image_id, (W0, H0))
                 if tgt_mask_full is None:
                     tgt_mask_full = self._unletterbox_label_map(batch["mask"][i, 0].cpu().numpy(), lb)
@@ -2701,22 +3303,20 @@ class OmniMorphInferencer:
 
                 fig, ax = plt.subplots(1, 1, figsize=(8, 8 * H0 / max(W0, 1)))
                 ax.imshow(original)
-                ax.set_title("Predicted (green) vs ground-truth (red) boxes -- original resolution")
-                probs = torch.softmax(preds["pred_det_logits"][i].float(), dim=-1)
-                iou_scores = torch.sigmoid(preds["pred_det_iou"][i].float())
-                cls_idx_all = torch.argmax(probs[:, :-1], dim=-1)
-                scores_all = (probs[torch.arange(probs.shape[0]), cls_idx_all] * iou_scores).cpu().numpy()
-                boxes_canvas_norm = preds["pred_det_boxes"][i].float().cpu().numpy()
-                is_obj = (cls_idx_all.cpu().numpy() < cfg.num_classes) & (
-                    torch.argmax(probs, dim=-1).cpu().numpy() != cfg.num_classes)
-                boxes_px = unletterbox_boxes_to_pixels(boxes_canvas_norm, lb)
-                keep_mask = is_obj & (scores_all >= cfg.det_vis_min_score)
-                if not keep_mask.any() and is_obj.any():
-                    # nothing cleared the floor: still show the network's best guesses rather than an empty plot,
-                    # clearly labelled with their (low) confidence so this stays an honest diagnostic picture
-                    top = np.argsort(-scores_all * is_obj)[:3]
-                    keep_mask = np.zeros_like(is_obj)
-                    keep_mask[top] = True & is_obj[top]
+                ax.set_title(f"Detections (green: score >= {cfg.det_conf_threshold:.2f}) vs ground truth (red) -- "
+                             f"original resolution", fontsize=9)
+                probs = torch.sigmoid(preds["pred_det_logits"][i].float())          # (Q, C) QAIC scores
+                scores_t, cls_t = probs.max(dim=-1)
+                scores_all = scores_t.cpu().numpy()
+                cls_idx_all = cls_t.cpu().numpy()
+                boxes_px = unletterbox_boxes_to_pixels(preds["pred_det_boxes"][i].float().cpu().numpy(), lb)
+                confident = scores_all >= cfg.det_conf_threshold
+                keep_mask = confident.copy()
+                if not keep_mask.any():
+                    # nothing is confident: show the best guesses instead of an empty plot, drawn in a distinct
+                    # dotted style so they cannot be mistaken for real detections (honest diagnostic picture)
+                    top = np.argsort(-scores_all)[:3]
+                    keep_mask[top] = scores_all[top] >= cfg.det_vis_min_score
                 sel = np.nonzero(keep_mask)[0]
                 if len(sel) > 0:
                     nms_keep = greedy_nms(boxes_px[sel], scores_all[sel], cfg.det_nms_iou_thresh)
@@ -2725,11 +3325,12 @@ class OmniMorphInferencer:
                     sel = sel[order]
                 for q_idx in sel:
                     x0, y0, x1, y1 = boxes_px[q_idx]
-                    cls_name = cfg.voc_classes[int(cls_idx_all[q_idx].item())]
+                    color, style = ("lime", "-") if confident[q_idx] else ("orange", ":")
+                    cls_name = cfg.voc_classes[int(cls_idx_all[q_idx])]
                     ax.add_patch(patches.Rectangle((x0, y0), x1 - x0, y1 - y0, linewidth=2,
-                                                   edgecolor="lime", facecolor="none"))
+                                                   edgecolor=color, facecolor="none", linestyle=style))
                     ax.text(x0, max(y0 - 5, 0), f"{cls_name} {scores_all[q_idx]:.2f}",
-                            color="black", fontsize=10, backgroundcolor="lime")
+                            color="black", fontsize=10, backgroundcolor=color)
                 gt_boxes_px, gt_labels = self._load_original_gt_boxes(image_id, W0, H0)
                 if len(gt_boxes_px) == 0:
                     gt_boxes_px = unletterbox_boxes_to_pixels(batch["boxes"][i].cpu().numpy(), lb)
@@ -2745,11 +3346,21 @@ class OmniMorphInferencer:
 
 
 # ============================================================================
-# 10. MAIN EXECUTION / SMOKE TEST / DATASET UNIT TEST
+# 10. MAIN EXECUTION / SMOKE TEST / DATASET UNIT TEST / OVERFIT (LEARNABILITY) TEST
 # ============================================================================
 def build_loader(ds, cfg: OmniMorphConfig, shuffle: bool, drop_last: bool) -> DataLoader:
     kwargs = dict(batch_size=cfg.batch_size, shuffle=shuffle, num_workers=cfg.num_workers, drop_last=drop_last,
                   collate_fn=omnimorph_collate_fn, pin_memory=torch.cuda.is_available())
+    if cfg.num_workers > 0:
+        kwargs["persistent_workers"] = True
+    return DataLoader(ds, **kwargs)
+
+
+def build_train_loader(ds: "PascalVOC2012MultiTaskDataset", cfg: OmniMorphConfig) -> DataLoader:
+    sampler = MixedSupervisionBatchSampler(ds.full_label_indices, ds.partial_label_indices, cfg.batch_size,
+                                           cfg.full_label_per_batch, cfg.seed)
+    kwargs = dict(batch_sampler=sampler, num_workers=cfg.num_workers, collate_fn=omnimorph_collate_fn,
+                  pin_memory=torch.cuda.is_available())
     if cfg.num_workers > 0:
         kwargs["persistent_workers"] = True
     return DataLoader(ds, **kwargs)
@@ -2770,21 +3381,27 @@ def main(config: Optional[OmniMorphConfig] = None):
     train_ds = PascalVOC2012MultiTaskDataset(voc_root, "train", config, augment=config.augment, _resolved=True)
     val_ds = PascalVOC2012MultiTaskDataset(voc_root, "val", config, augment=False, _resolved=True)
     test_ds = PascalVOC2012MultiTaskDataset(voc_root, "test", config, augment=False, _resolved=True)
-    print(f"[*] Discovered Data - Train: {len(train_ds)}, Val: {len(val_ds)}, Test: {len(test_ds)} "
-          f"(sum={len(train_ds) + len(val_ds) + len(test_ds)}, well under the {VOC2012_OFFICIAL_COUNTS['total_images']}"
-          f"-image full VOC2012 package by design -- see the class docstring)"
+    print(f"[*] Discovered Data - Train: {len(train_ds)} ({len(train_ds.full_label_indices)} fully labelled + "
+          f"{len(train_ds.partial_label_indices)} box/label-only), Val: {len(val_ds)}, Test: {len(test_ds)} "
+          f"(val/test are both carved out of Segmentation-val, which never enters training)"
           f"{'  (WARNING: test == val)' if not config.separate_test_split else ''}")
-    if len(train_ds) == 0:
+    if len(train_ds.full_label_indices) == 0:
         print("[!] No training data found. Please ensure VOC2012 is extracted correctly.")
         return
-    train_loader = build_loader(train_ds, config, shuffle=True, drop_last=True)
+    train_loader = build_train_loader(train_ds, config)
     val_loader = build_loader(val_ds, config, shuffle=False, drop_last=False)
     test_loader = build_loader(test_ds, config, shuffle=False, drop_last=False)
+    print(f"[*] {len(train_loader)} optimisation steps per epoch "
+          f"({config.full_label_per_batch} fully-labelled + "
+          f"{config.batch_size - config.full_label_per_batch if train_ds.partial_label_indices else 0} "
+          f"box/label-only images per batch)")
     print("[*] Initializing OmniMorphNet...")
     model = OmniMorphNet(config).to(config.device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"[*] Single-GPU execution on {config.device} | parameters: {n_params / 1e6:.2f}M")
-    criterion = MultiTaskLoss(config).to(config.device)
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[*] Single-GPU execution on {config.device} | parameters: {n_params / 1e6:.2f}M "
+          f"({n_train / 1e6:.2f}M trainable)")
+    criterion = MultiTaskLoss(config, perceptual=build_perceptual_extractor(model, config)).to(config.device)
     trainer = OmniMorphTrainer(model, train_loader, val_loader, criterion, config)
     trainer.fit()
     trainer.load_best()
@@ -2796,16 +3413,19 @@ def main(config: Optional[OmniMorphConfig] = None):
 
 def smoke_test(config: Optional[OmniMorphConfig] = None, batch_size: int = 2):
     """One forward / backward / metric pass on random tensors: checks shapes, finite grads and the metric code,
-    including the new ICCD denoising path (with a synthetic ragged set of GT boxes) and the letterbox-aware
-    valid-pixel mask plumbing."""
+    including the ICCD v2 denoising path (positives + contrastive negatives, with a synthetic ragged set of GT
+    boxes), the letterbox-aware valid-pixel mask plumbing, ATHM and the flip-TTA evaluation path."""
     cfg = config or OmniMorphConfig()
     cfg.use_amp = False
     dev = torch.device(cfg.device)
     set_seed(cfg.seed)
     model = OmniMorphNet(cfg).to(dev)
-    criterion = MultiTaskLoss(cfg).to(dev)
+    criterion = MultiTaskLoss(cfg, perceptual=build_perceptual_extractor(model, cfg)).to(dev)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"[smoke] parameters: {n_params / 1e6:.2f}M")
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    sb = model.semantic_backbone
+    print(f"[smoke] parameters: {n_params / 1e6:.2f}M ({n_train / 1e6:.2f}M trainable) | semantic stream: "
+          f"{'none' if sb is None else sb.name + (' (ImageNet)' if sb.pretrained_loaded else ' (random init)')}")
     S, L, B = cfg.hr_image_size, cfg.lr_image_size, batch_size
     mask = torch.randint(0, cfg.num_mask_classes, (B, 1, S, S), device=dev)
     mask[:, :, :8] = cfg.ignore_index
@@ -2824,16 +3444,19 @@ def smoke_test(config: Optional[OmniMorphConfig] = None, batch_size: int = 2):
 
     dn_batch = build_dn_batch(boxes, labels, cfg, cfg.dn_box_noise_scale_start, dev) if cfg.use_denoising else None
     print(f"[smoke] denoising batch built: {'yes' if dn_batch is not None else 'no (no GT boxes in this synthetic batch)'}")
+    criterion.set_quality_exponent(0.5)
 
     model.train()
     if dn_batch is not None:
-        preds = model(batch["lr_image"], dn_boxes=dn_batch["noised_boxes"], dn_labels=dn_batch["noised_labels"],
-                     dn_valid=dn_batch["valid"])
+        preds = model(batch["lr_image"], dn_ref=dn_batch["dn_ref"], dn_labels=dn_batch["dn_labels"],
+                      dn_valid=dn_batch["valid"])
     else:
         preds = model(batch["lr_image"])
     for k, v in preds.items():
         if torch.is_tensor(v):
             print(f"[smoke]   {k:<16s} {tuple(v.shape)}")
+        elif isinstance(v, list):
+            print(f"[smoke]   {k:<16s} {len(v)} decoder layers")
     loss, ld = criterion(preds, batch, dn_batch=dn_batch)
     loss.backward()
     bad = [n for n, p in model.named_parameters() if p.grad is not None and not torch.isfinite(p.grad).all()]
@@ -2842,17 +3465,19 @@ def smoke_test(config: Optional[OmniMorphConfig] = None, batch_size: int = 2):
     if no_grad:
         print("[smoke]   e.g.", no_grad[:5])
     print("[smoke]   components:", {k: round(float(v), 4) for k, v in ld.items()})
+    assert torch.isfinite(loss) and not bad, "non-finite loss or gradients"
 
     # ATHM plumbing sanity check (loss-weight + head-dropout mutation)
     if hasattr(model, "set_task_health"):
-        model.set_task_health({"rec": 0.4, "seg": 1.0, "edge": 0.6, "cls": 1.0, "det": 0.35})
-        criterion.set_task_health({"rec": 0.4, "seg": 1.0, "edge": 0.6, "cls": 1.0, "det": 0.35})
-        assert abs(model.sr_dropout.p - (cfg.head_dropout_base + 0.6 * cfg.head_dropout_max_extra)) < 1e-6
-        print(f"[smoke] ATHM dropout mutation OK (sr_dropout.p={model.sr_dropout.p:.3f})")
+        health = {"rec": 0.4, "seg": 0.6, "edge": 1.0, "cls": 1.0, "det": 0.35}
+        model.set_task_health(health)
+        criterion.set_task_health(health)
+        assert abs(model.seg_dropout.p - (cfg.head_dropout_base + 0.4 * cfg.head_dropout_max_extra)) < 1e-6
+        print(f"[smoke] ATHM dropout mutation OK (seg_dropout.p={model.seg_dropout.p:.3f})")
 
     model.eval()
     with torch.no_grad():
-        preds = model(batch["lr_image"])
+        preds = model.forward_tta(batch["lr_image"])
         _, ld = criterion(preds, batch)
         tracker = MetricTracker(cfg, dev, criterion)
         tracker.update(preds, batch, ld)
@@ -2860,10 +3485,12 @@ def smoke_test(config: Optional[OmniMorphConfig] = None, batch_size: int = 2):
     print("[smoke] OK")
 
 
-def _write_fake_voc_sample(root: str, image_id: str, W: int, H: int, cfg: OmniMorphConfig, rng: random.Random):
+def _write_fake_voc_sample(root: str, image_id: str, W: int, H: int, cfg: OmniMorphConfig, rng: random.Random,
+                           with_seg: bool = True):
     """Writes one synthetic-but-structurally-valid VOC2012 sample (JPEG + class mask + instance mask + XML
     annotation) so the dataset pipeline (letterboxing, augmentation, CTCRM, denoising targets) can be exercised
-    end to end without downloading the real ~2GB dataset."""
+    end to end without downloading the real ~2GB dataset. `with_seg=False` writes a box/label-only sample, like
+    the ImageSets/Main images that have no SegmentationClass/SegmentationObject PNG."""
     os.makedirs(os.path.join(root, "JPEGImages"), exist_ok=True)
     os.makedirs(os.path.join(root, "SegmentationClass"), exist_ok=True)
     os.makedirs(os.path.join(root, "SegmentationObject"), exist_ok=True)
@@ -2889,8 +3516,9 @@ def _write_fake_voc_sample(root: str, image_id: str, W: int, H: int, cfg: OmniMo
         boxes_xml.append((cfg.voc_classes[cls_id - 1], x0 + 1, y0 + 1, x1, y1))   # VOC boxes are 1-based
 
     Image.fromarray(img).save(os.path.join(root, "JPEGImages", f"{image_id}.jpg"), quality=95)
-    Image.fromarray(cls_mask).save(os.path.join(root, "SegmentationClass", f"{image_id}.png"))
-    Image.fromarray(obj_mask).save(os.path.join(root, "SegmentationObject", f"{image_id}.png"))
+    if with_seg:
+        Image.fromarray(cls_mask).save(os.path.join(root, "SegmentationClass", f"{image_id}.png"))
+        Image.fromarray(obj_mask).save(os.path.join(root, "SegmentationObject", f"{image_id}.png"))
 
     objs_xml = "".join(
         f"<object><name>{name}</name><difficult>0</difficult>"
@@ -2901,30 +3529,44 @@ def _write_fake_voc_sample(root: str, image_id: str, W: int, H: int, cfg: OmniMo
         f.write(xml)
 
 
+def _write_split(root: str, task: str, name: str, ids: List[str]) -> None:
+    os.makedirs(os.path.join(root, "ImageSets", task), exist_ok=True)
+    with open(os.path.join(root, "ImageSets", task, name), "w") as f:
+        f.write("\n".join(ids) + "\n")
+
+
 def unit_test(cfg: Optional[OmniMorphConfig] = None):
     """Dataset-pipeline sanity check: builds a tiny synthetic VOC2012-shaped tree covering a wide, a tall, and a
-    square image, then exercises letterboxing, train-time augmentation (crop/flip/color-jitter/CTCRM), the
-    val-time (unaugmented) path, batch collation, `move_batch`, and the ICCD denoising-target builder -- all the
-    new code paths that `--smoke-test`'s random tensors never touch."""
+    square image (plus box/label-only ImageSets/Main images), then exercises letterboxing, train-time augmentation
+    (crop/flip/color-jitter/CTCRM), the val-time (unaugmented) path, the mixed-supervision sampler and its
+    no-leak guarantee, batch collation, `move_batch`, the ICCD v2 denoising-target builder, the LDBC boundary and
+    the QAIC loss -- all the code paths that `--smoke-test`'s random tensors never touch."""
     cfg = cfg or OmniMorphConfig()
     cfg.batch_size = 3
+    cfg.full_label_per_batch = 2
     cfg.num_workers = 0
     rng = random.Random(cfg.seed)
     with tempfile.TemporaryDirectory() as root:
-        os.makedirs(os.path.join(root, "ImageSets", "Segmentation"), exist_ok=True)
         sizes = [(500, 333), (333, 500), (256, 256), (640, 200), (200, 640), (480, 360)]
         ids = [f"synth_{i:03d}" for i in range(len(sizes))]
         for image_id, (W, H) in zip(ids, sizes):
             _write_fake_voc_sample(root, image_id, W, H, cfg, rng)
-        with open(os.path.join(root, "ImageSets", "Segmentation", "train.txt"), "w") as f:
-            f.write("\n".join(ids[:4]) + "\n")
-        with open(os.path.join(root, "ImageSets", "Segmentation", "val.txt"), "w") as f:
-            f.write("\n".join(ids[4:]) + "\n")
+        extra_sizes = [(400, 300), (300, 400), (512, 384)]
+        extra_ids = [f"synth_main_{i:03d}" for i in range(len(extra_sizes))]
+        for image_id, (W, H) in zip(extra_ids, extra_sizes):
+            _write_fake_voc_sample(root, image_id, W, H, cfg, rng, with_seg=False)
+        _write_split(root, "Segmentation", "train.txt", ids[:4])
+        _write_split(root, "Segmentation", "val.txt", ids[4:])
+        _write_split(root, "Main", "train.txt", ids[:4] + extra_ids[:2])
+        _write_split(root, "Main", "val.txt", ids[4:] + extra_ids[2:])
 
         cfg.separate_test_split = False
         train_ds = PascalVOC2012MultiTaskDataset(root, "train", cfg, augment=True)
         val_ds = PascalVOC2012MultiTaskDataset(root, "val", cfg, augment=False)
-        assert len(train_ds) == 4 and len(val_ds) == 2, "split sizes do not match the synthetic tree"
+        assert len(train_ds.full_label_indices) == 4 and len(train_ds.partial_label_indices) == 3, \
+            "mixed-supervision split sizes do not match the synthetic tree"
+        assert len(val_ds) == 2, "val split size does not match the synthetic tree"
+        assert not set(train_ds.image_ids) & set(ids[4:]), "a Segmentation-val image leaked into training"
         S = cfg.hr_image_size
 
         # ---- per-sample shape / range checks, including several CTCRM-triggering draws ----
@@ -2944,7 +3586,22 @@ def unit_test(cfg: Optional[OmniMorphConfig] = None):
             s = val_ds[i]
             assert s["hr_image"].shape == (3, S, S)
             assert float(s["valid_mask"].sum()) > 0.0
-        print("[unit-test] per-sample shape/range checks OK")
+        plain = PascalVOC2012MultiTaskDataset(root, "train", cfg, augment=False)
+        s = plain[plain.partial_label_indices[0]]
+        assert bool((s["mask"] == cfg.ignore_index).all()) and bool((s["edge_mask"] == cfg.ignore_index).all()), \
+            "a box/label-only image must contribute no segmentation / edge supervision"
+        assert s["boxes"].shape[0] > 0 and float(s["label"].sum()) > 0, "box/label-only image lost its boxes/labels"
+        print("[unit-test] per-sample shape/range checks OK (incl. box/label-only samples)")
+
+        # ---- mixed-supervision batch sampler ----
+        sampler = MixedSupervisionBatchSampler(train_ds.full_label_indices, train_ds.partial_label_indices,
+                                               cfg.batch_size, cfg.full_label_per_batch, cfg.seed)
+        batches = list(iter(sampler))
+        full_set = set(train_ds.full_label_indices)
+        assert len(batches) == len(sampler) == 2
+        for bt in batches:
+            assert len(bt) == cfg.batch_size and sum(i in full_set for i in bt) == cfg.full_label_per_batch
+        print("[unit-test] mixed-supervision batch sampler OK")
 
         # ---- letterbox round-trip: original-space boxes -> canvas -> back to original-space pixels ----
         lb = compute_letterbox_params(640, 200, S)
@@ -2956,7 +3613,7 @@ def unit_test(cfg: Optional[OmniMorphConfig] = None):
         print("[unit-test] letterbox box round-trip OK")
 
         # ---- collate + move_batch (meta/image_id must survive un-mangled; this is the bug v2's move_batch had) ----
-        loader = build_loader(train_ds, cfg, shuffle=False, drop_last=False)
+        loader = build_train_loader(train_ds, cfg)
         batch = next(iter(loader))
         batch = move_batch(batch, torch.device("cpu"))
         assert isinstance(batch["image_id"], list) and isinstance(batch["image_id"][0], str)
@@ -2964,17 +3621,151 @@ def unit_test(cfg: Optional[OmniMorphConfig] = None):
         assert batch["hr_image"].shape[0] == len(batch["image_id"])
         print("[unit-test] collate_fn / move_batch OK")
 
-        # ---- ICCD denoising target builder on a real ragged batch ----
+        # ---- ICCD v2 denoising target builder on a real ragged batch ----
         dn = build_dn_batch(batch["boxes"], batch["box_labels"], cfg, cfg.dn_box_noise_scale_start, torch.device("cpu"))
         if dn is not None:
-            assert dn["noised_boxes"].shape == (len(batch["boxes"]), cfg.dn_max_gt_per_image, 4)
+            groups = 2 if cfg.dn_use_negatives else 1
+            assert dn["dn_ref"].shape == (len(batch["boxes"]), groups * cfg.dn_max_gt_per_image, 4)
             assert bool(dn["valid"].any()), "no valid denoising slots were produced despite having GT boxes"
-            assert float(dn["target_iou"][dn["valid"]].min()) >= 0.0 and float(dn["target_iou"][dn["valid"]].max()) <= 1.0
-        print(f"[unit-test] ICCD denoising batch builder OK (produced={'yes' if dn is not None else 'no'})")
+            assert int((dn["valid"] & dn["is_pos"]).sum()) * groups == int(dn["valid"].sum())
+            r = dn["dn_ref"][dn["valid"]]
+            assert float(r.min()) > 0.0 and float(r.max()) <= 1.0
+        print(f"[unit-test] ICCD v2 denoising batch builder OK (produced={'yes' if dn is not None else 'no'})")
 
+    # ---- LDBC: two flat regions -> boundary probability 1 exactly on the seam, 0 elsewhere ----
+    lg = torch.full((1, cfg.num_mask_classes, 8, 8), -10.0)
+    lg[:, 0, :, :4] = 10.0
+    lg[:, 15, :, 4:] = 10.0
+    bd = label_disagreement_boundary(lg)[0, 0]
+    assert float(bd[:, 3:5].min()) > 0.99 and float(bd[:, :3].max()) < 1e-3 and float(bd[:, 5:].max()) < 1e-3
+    print("[unit-test] LDBC label-disagreement boundary OK")
+
+    # ---- QAIC: hard target at beta=0 equals plain BCE on the positive; a negative is weighted by alpha*p^gamma ----
+    crit = MultiTaskLoss(cfg)
+    logit = torch.tensor([[0.3, -1.0]])
+    pos = torch.tensor([[True, False]])
+    q = torch.tensor([[1.0, 0.0]])
+    p_neg = torch.sigmoid(torch.tensor(-1.0))
+    expected = (F.binary_cross_entropy_with_logits(torch.tensor(0.3), torch.tensor(1.0))
+                + cfg.vfl_alpha * p_neg ** cfg.focal_gamma * F.binary_cross_entropy_with_logits(torch.tensor(-1.0), torch.tensor(0.0)))
+    assert abs(float(crit._vfl(logit, pos, q)) - float(expected)) < 1e-5
+    print("[unit-test] QAIC / varifocal loss OK")
     print("[unit-test] ALL CHECKS PASSED")
 
 
+def overfit_test(out_dir: Optional[str] = None, epochs: int = 120) -> Dict[str, float]:
+    """End-to-end learning check that runs on a CPU in a few minutes: a tiny OmniMorph is trained through the REAL
+    OmniMorphTrainer (mixed-supervision sampler, ICCD v2, QAIC annealing, stream-isolated clipping, checkpointing,
+    resume with horizon extension, flip-TTA evaluation, the inferencer) on a synthetic VOC-shaped tree, then
+    evaluated on its own training images. It asserts the property the v3 dumps show was missing: every task
+    actually learns -- the restored image beats bicubic, segmentation / edges / classification are well above
+    chance, and detection produces CONFIDENT boxes on the right objects instead of v3's 0.03-0.06 scores. This is
+    a plumbing-and-learnability test, not a benchmark: it says nothing about VOC2012 accuracy."""
+    cfg = OmniMorphConfig(
+        experiment_name="overfit_test", lr_image_size=32, hr_image_size=128,
+        embed_dims=[16, 32, 32, 48], depths=[1, 1, 1, 1], num_heads=[1, 2, 2, 4], num_prompts=4, prompt_dim=16,
+        pixel_dec_dim=32, num_queries=8, num_refine_rounds=3, rs_channels=16, rs_groups=2, rs_blocks_per_group=2,
+        rs_ca_reduction=4, edge_hidden_channels=8, backbone_name="resnet18", dn_max_gt_per_image=4,
+        batch_size=4, full_label_per_batch=3, num_workers=0, epochs=epochs, warmup_epochs=3, lr=1e-3,
+        use_amp=False, use_ema=False, augment=False, use_ctcrm=False, drop_path_rate=0.0, head_dropout_base=0.0,
+        early_stop_patience=0, loss_early_stop_patience=0, athm_start_epoch=10 ** 6, quality_anneal_epochs=epochs // 3,
+        checkpoint_every_n_epochs=0, separate_test_split=False, max_infer_batches=1, device="cpu")
+    set_seed(cfg.seed)
+    rng = random.Random(cfg.seed)
+    with tempfile.TemporaryDirectory() as tmp:
+        work = out_dir or tmp
+        root = os.path.join(work, "voc")
+        cfg.checkpoint_dir = os.path.join(work, "models")
+        cfg.visualization_dir = os.path.join(work, "visualizations")
+        sizes = [(160, 120), (120, 160), (128, 128), (200, 100), (100, 200), (150, 150)]
+        ids = [f"fit_{i:03d}" for i in range(len(sizes))]
+        for image_id, (W, H) in zip(ids, sizes):
+            _write_fake_voc_sample(root, image_id, W, H, cfg, rng)
+        extra = [f"fit_main_{i:03d}" for i in range(3)]
+        for image_id in extra:
+            _write_fake_voc_sample(root, image_id, 140, 110, cfg, rng, with_seg=False)
+        _write_split(root, "Segmentation", "train.txt", ids)
+        _write_split(root, "Segmentation", "val.txt", ids)          # evaluate on the training images: overfit test
+        _write_split(root, "Main", "train.txt", ids + extra)
+        _write_split(root, "Main", "val.txt", [])
+        train_ds = PascalVOC2012MultiTaskDataset(root, "train", cfg, augment=False)
+        val_ds = PascalVOC2012MultiTaskDataset(root, "val", cfg, augment=False)
+        train_loader = build_train_loader(train_ds, cfg)
+        val_loader = build_loader(val_ds, cfg, shuffle=False, drop_last=False)
+
+        model = OmniMorphNet(cfg)
+        criterion = MultiTaskLoss(cfg, perceptual=build_perceptual_extractor(model, cfg))
+        trainer = OmniMorphTrainer(model, train_loader, val_loader, criterion, cfg)
+        trainer.fit(auto_resume=False)
+
+        # resume + horizon extension from the checkpoint just written (exercises CPHE and the new param groups)
+        cfg2 = copy.deepcopy(cfg)
+        cfg2.epochs = cfg.epochs + 2
+        model2 = OmniMorphNet(cfg2)
+        trainer2 = OmniMorphTrainer(model2, train_loader, val_loader,
+                                    MultiTaskLoss(cfg2, perceptual=build_perceptual_extractor(model2, cfg2)), cfg2)
+        trainer2.fit(auto_resume=True)
+        assert trainer2.start_epoch == cfg.epochs + 1, "resume did not pick up the saved checkpoint"
+        trainer2.criterion.set_quality_exponent(1.0)
+        m = trainer2.evaluate(val_loader, "Overfit")
+
+        # bicubic reference PSNR on exactly the same canvases / valid pixels
+        psnr_sum, n = 0.0, 0
+        for batch in val_loader:
+            base = F.interpolate(batch["lr_image"], size=batch["hr_image"].shape[-2:], mode="bicubic",
+                                 align_corners=False).clamp(0, 1)
+            vm = batch["valid_mask"]
+            mse = (((base - batch["hr_image"]) ** 2) * vm).sum(dim=(1, 2, 3)) / (vm.sum(dim=(1, 2, 3)) * 3)
+            psnr_sum += float((10 * torch.log10(1.0 / (mse + cfg.psnr_eps))).sum())
+            n += batch["hr_image"].shape[0]
+        m["bicubic_psnr"] = psnr_sum / max(n, 1)
+
+        # detection confidence on the training images: the best score per GT object
+        conf = []
+        eval_model = trainer2.eval_model.eval()
+        with torch.no_grad():
+            for batch in val_loader:
+                preds = eval_model(batch["lr_image"])
+                probs = torch.sigmoid(preds["pred_det_logits"].float())
+                for i in range(probs.shape[0]):
+                    for gb, gl in zip(batch["boxes"][i], batch["box_labels"][i]):
+                        _, iou = paired_box_giou(preds["pred_det_boxes"][i].float(), gb.expand_as(preds["pred_det_boxes"][i]))
+                        good = iou >= 0.5
+                        conf.append(float(probs[i, :, gl][good].max()) if bool(good.any()) else 0.0)
+        m["det_median_gt_conf"] = float(np.median(conf)) if conf else 0.0
+
+        OmniMorphInferencer(eval_model, cfg2, dataset=val_ds).run_inference_on_dataset(val_loader)
+        n_vis = sum(len(os.listdir(d)) for d in [os.path.join(cfg2.visualization_dir, x)
+                                                for x in ("restoration", "segmentation", "detection")])
+
+        print(f"[overfit] PSNR {m['psnr']:.2f} dB vs bicubic {m['bicubic_psnr']:.2f} dB | mIoU {m['miou']:.1f}% | "
+              f"PixAcc {m['pix_acc']:.1f}% | EdgeF1 {m['edge_f1']:.1f}% | ClsmAP {m['cls_map']:.1f}% | "
+              f"DetmAP {m['det_map']:.1f}% | median GT-matched det score {m['det_median_gt_conf']:.2f} | "
+              f"{n_vis} visualisations")
+        assert m["psnr"] > m["bicubic_psnr"] + 1.0, "restoration stream did not beat bicubic"
+        assert m["pix_acc"] > 85.0 and m["miou"] > 50.0, "segmentation did not learn"
+        assert m["cls_map"] > 80.0, "classification did not learn"
+        assert m["edge_f1"] > 30.0, "edges did not learn"
+        assert m["det_map"] > 50.0 and m["det_median_gt_conf"] > 0.5, "detection is not confident / not localised"
+        assert n_vis == 3 * min(len(val_ds), cfg.batch_size), "inferencer did not write every visualisation"
+    print("[overfit] ALL TASKS LEARN")
+    return m
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="OmniMorph v4 -- penta-task PASCAL VOC 2012 network")
+    parser.add_argument("--smoke-test", action="store_true", help="one forward/backward on random tensors")
+    parser.add_argument("--unit-test", action="store_true", help="dataset-pipeline checks on synthetic VOC files")
+    parser.add_argument("--overfit-test", action="store_true", help="tiny end-to-end learning check (CPU-friendly)")
+    # parse_known_args: Jupyter / Kaggle kernels append their own argv (e.g. `-f kernel.json`) when this file is
+    # run as a notebook cell -- that must not crash the script or be mistaken for a flag.
+    args, _unknown = parser.parse_known_args()
     cfg = OmniMorphConfig()
-    main(cfg)
+    if args.smoke_test:
+        smoke_test(cfg)
+    elif args.unit_test:
+        unit_test(cfg)
+    elif args.overfit_test:
+        overfit_test()
+    else:
+        main(cfg)
