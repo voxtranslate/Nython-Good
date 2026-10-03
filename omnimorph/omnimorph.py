@@ -22,7 +22,7 @@ and still rising ~2 points/epoch, PSNR 26.77 dB vs 25.4 dB), but the run itself 
   * 2.0 s/step at batch_size=5 -> ~14 min/epoch -> ~35 h for 150 epochs, over Kaggle's 30 h/week GPU quota. Measured
     per image (real config): ~350 forward GFLOPs and 2.6 GB of saved activations. The biggest single item was
     GLOBAL attention over all 16,384 tokens of the stride-1 encoder stage (~137 GFLOPs for two blocks); then a
-    3x3 conv at full 512x512 resolution in the restoration tail and a 129-channel edge-fusion conv at 512x512.
+    129-channel edge-fusion conv at 512x512.
     Batch 8 did not fit, hence batch 5, which left the mixed-supervision sampler with 4 fully-labelled + 1
     box/label-only image per batch: 9k of the 10.7k training images were barely used.
   * The log could not be read at face value: T-Loss (123 -> 56) summed ~13 detection outputs + denoising while
@@ -31,11 +31,12 @@ and still rising ~2 points/epoch, PSNR 26.77 dB vs 25.4 dB), but the run itself 
     warning claimed counts would be inflated although only one copy is ever read.
   v4.1 changes (all exactness-tested in --unit-test / --smoke-test where they are meant to be pure speed-ups):
   shifted-window attention (Swin) on the two high-resolution stages, one fused grid_sample for the 9 deformable
-  taps, activation checkpointing of the first three encoder stages, no 512x512 conv in the restoration tail, a
-  narrow edge-fusion conv, FrozenBN evaluated in fp16, the perceptual term off by default (and at half resolution
+  taps, activation checkpointing of the first three encoder stages, a narrow edge-fusion conv, FrozenBN in fp16, the perceptual term off by default (and at half resolution
   when on), one host transfer per Hungarian batch, fused EMA updates, train metrics on every 4th batch. Measured on
-  CPU at the real config: forward FLOPs ~350 -> ~168 G/image, saved activations 2.6 -> ~1.2 GB/image (fp32),
-  CPU step 20.3 s -> 6.4 s; so batch 8 (4 + 4 images) fits again. Plus: comparable train/val loss, true LR, PSNR
+  CPU at the real config: forward FLOPs ~350 -> ~187 G/image, saved activations 2.6 -> ~1.3 GB/image (fp32), so
+  batch 8 (4 + 4 images) fits again. Ablated on the overfit test: windowed attention matches global attention
+  (PSNR/mIoU within run-to-run noise); removing the restoration stream's 512x512 conv did NOT (-0.5..0.9 dB), so
+  it was kept. Plus: comparable train/val loss, true LR, PSNR
   gain vs bicubic, a step profiler with projected run time, a Kaggle session budget (training stops in time for
   the final evaluation + visualisations, the next session resumes), and a warm start that carries 99.9% of a v4
   checkpoint's weights into v4.1 instead of discarding the epochs already trained.
@@ -248,7 +249,8 @@ class OmniMorphConfig:
     rs_blocks_per_group: int = 4
     rs_ca_reduction: int = 16
     restoration_weight_decay: float = 0.0  # EDSR/RCAN train without weight decay; it only shrinks SR filters
-    rs_hr_refine: bool = False           # extra 3x3 conv at full output resolution before the RGB tail
+    rs_hr_refine: bool = True            # 3x3 conv at full output resolution before the RGB tail: ~19 GFLOPs/img,
+                                          # but removing it cost ~0.5-0.9 dB PSNR in the overfit ablation
     # semantic stream (ImageNet-pretrained; reads the restored canvas)
     backbone_name: str = "resnet50"      # resnet18 | resnet34 | resnet50 | convnext_tiny | none
     backbone_pretrained: bool = True     # torchvision download (needs Internet ON in a Kaggle notebook)
@@ -1173,8 +1175,9 @@ class RestorationStream(nn.Module):
         self.up1 = nn.Sequential(nn.Conv2d(C, C * r * r, 3, padding=1), nn.PixelShuffle(r), nn.LeakyReLU(0.1, inplace=True))
         self.mid_head = nn.Conv2d(C, config.in_channels, 3, padding=1)
         self.up2 = nn.Sequential(nn.Conv2d(C, C * r * r, 3, padding=1), nn.PixelShuffle(r), nn.LeakyReLU(0.1, inplace=True))
-        # optional C->C 3x3 refinement conv at the full output resolution (v4 always had it: 19 GFLOPs and
-        # ~130 MiB of saved activations per image; EDSR/RCAN tails go straight to RGB) -- see `rs_hr_refine`
+        # C->C 3x3 refinement conv at the full output resolution (19 GFLOPs and ~130 MiB of saved activations per
+        # image). EDSR/RCAN tails go straight to RGB, but dropping it here measurably cost PSNR (0.5-0.9 dB in the
+        # overfit ablation), so it stays on by default -- see `rs_hr_refine`
         self.hr_conv = (nn.Sequential(nn.Conv2d(C, C, 3, padding=1), nn.LeakyReLU(0.1, inplace=True))
                         if config.rs_hr_refine else None)
         self.tail = nn.Conv2d(C, config.in_channels, 3, padding=1)
