@@ -1,6 +1,6 @@
 """
-OmniMorph v4 - penta-task network on PASCAL VOC 2012 (single GPU)
-=================================================================
+OmniMorph v4.1 - penta-task network on PASCAL VOC 2012 (single GPU)
+===================================================================
 Tasks: 4x super-resolution | semantic segmentation | multi-label classification |
        object-instance edges | object detection (DETR-style).
 
@@ -14,6 +14,31 @@ Usage
                                          # that asserts every task learns -- incl. confident detections
 (v3 documented `--smoke-test` / `--unit-test` but its `__main__` never parsed them; v4 wires all three, and uses
 `parse_known_args` so running the file as a Kaggle/Jupyter cell -- which injects `-f kernel.json` -- still works.)
+
+v4.1 -- what the first 14-epoch Kaggle run of v4 showed
+------------------------------------------------------
+Quality was moving the right way from v3 (val mIoU 67.3% vs v3's 19%, cls mAP 90.5% vs 37%, det mAP 20.5% vs 7%
+and still rising ~2 points/epoch, PSNR 26.77 dB vs 25.4 dB), but the run itself was not viable:
+  * 2.0 s/step at batch_size=5 -> ~14 min/epoch -> ~35 h for 150 epochs, over Kaggle's 30 h/week GPU quota. Measured
+    per image (real config): ~350 forward GFLOPs and 2.6 GB of saved activations. The biggest single item was
+    GLOBAL attention over all 16,384 tokens of the stride-1 encoder stage (~137 GFLOPs for two blocks); then a
+    3x3 conv at full 512x512 resolution in the restoration tail and a 129-channel edge-fusion conv at 512x512.
+    Batch 8 did not fit, hence batch 5, which left the mixed-supervision sampler with 4 fully-labelled + 1
+    box/label-only image per batch: 9k of the 10.7k training images were barely used.
+  * The log could not be read at face value: T-Loss (123 -> 56) summed ~13 detection outputs + denoising while
+    V-Loss (15 -> 7) holds only the final outputs (an apparent 8x gap that is not a gap); the printed LR was the
+    next epoch's; PSNR had no bicubic reference, so the SR gain (+0.8 dB) was invisible; the "duplicated copy"
+    warning claimed counts would be inflated although only one copy is ever read.
+  v4.1 changes (all exactness-tested in --unit-test / --smoke-test where they are meant to be pure speed-ups):
+  shifted-window attention (Swin) on the two high-resolution stages, one fused grid_sample for the 9 deformable
+  taps, activation checkpointing of the first three encoder stages, no 512x512 conv in the restoration tail, a
+  narrow edge-fusion conv, FrozenBN evaluated in fp16, the perceptual term off by default (and at half resolution
+  when on), one host transfer per Hungarian batch, fused EMA updates, train metrics on every 4th batch. Measured on
+  CPU at the real config: forward FLOPs ~350 -> ~168 G/image, saved activations 2.6 -> ~1.2 GB/image (fp32),
+  CPU step 20.3 s -> 6.4 s; so batch 8 (4 + 4 images) fits again. Plus: comparable train/val loss, true LR, PSNR
+  gain vs bicubic, a step profiler with projected run time, a Kaggle session budget (training stops in time for
+  the final evaluation + visualisations, the next session resumes), and a warm start that carries 99.9% of a v4
+  checkpoint's weights into v4.1 instead of discarding the epochs already trained.
 
 Why v4 exists -- what the v3 qualitative dumps show, and the root cause behind each
 -----------------------------------------------------------------------------------
@@ -97,6 +122,7 @@ import copy
 import random
 import argparse
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
@@ -110,6 +136,8 @@ from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 from torchvision.ops import generalized_box_iou
+from torchvision.ops.misc import FrozenBatchNorm2d
+from torch.utils.checkpoint import checkpoint
 from scipy import ndimage
 from scipy.optimize import linear_sum_assignment
 from PIL import Image
@@ -119,6 +147,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from tqdm import tqdm
 
+_PROCESS_START = time.time()          # session-budget reference (Kaggle's 12 h limit counts from session start)
 _RESAMPLING = getattr(Image, "Resampling", Image)
 BICUBIC, NEAREST, BILINEAR = _RESAMPLING.BICUBIC, _RESAMPLING.NEAREST, _RESAMPLING.BILINEAR
 FLIP_LR = getattr(Image, "Transpose", Image).FLIP_LEFT_RIGHT
@@ -166,8 +195,11 @@ class OmniMorphConfig:
     # ---- mixed-supervision training set (MSBS, section 7) -------------------------------------------------
     # Adds the ImageSets/Main train+val images (boxes + labels, no mask) minus Segmentation-val to TRAINING only;
     # every batch carries `full_label_per_batch` fully-labelled (mask + edge) images, the rest box/label-only.
+    # 0 = automatic: round(batch_size * full_label_fraction), so lowering batch_size keeps the mix balanced
+    # (v4 hard-coded 4, which at batch_size=5 left a single box/label-only image per batch).
     use_partial_label_images: bool = True
-    full_label_per_batch: int = 4
+    full_label_per_batch: int = 0
+    full_label_fraction: float = 0.5
     # ---- cross-task consistent region mixing (CTCRM, see module docstring near the dataset) ------------------
     use_ctcrm: bool = True
     ctcrm_prob: float = 0.3
@@ -200,8 +232,15 @@ class OmniMorphConfig:
     curvature_scale: float = 0.1
     attn_logit_scale_init: float = 10.0  # cosine attention needs a large scale over N=4096 tokens
     attn_logit_scale_max: float = 100.0
+    attn_window: int = 16                # v4.1: (shifted-)window attention on maps with more tokens than ...
+    attn_global_max_tokens: int = 1024   # ... this; smaller maps (the 32x32 / 16x16 stages) stay global
+    grad_checkpoint: bool = True         # activation checkpointing of the high-resolution encoder stages (their
+    checkpoint_encoder_stages: int = 3   # LoRA gates/deformable taps were ~45% of activation memory; cheap to redo)
+    checkpoint_restoration: bool = False  # also checkpoint the restoration groups (~40 GFLOPs/img recompute for
+                                          # ~0.13 GB/img saved): only if batch_size still does not fit
     rope_base: float = 10000.0
     edge_hidden_channels: int = 32
+    edge_branch_channels: int = 16       # width of each 512x512 input of the edge fusion conv
     # ---- Restore-then-Recognise (RtR, section 3b) -----------------------------------------------------------
     # restoration stream (RCAN-lite, SFT-conditioned on the LR encoder)
     rs_channels: int = 64
@@ -209,6 +248,7 @@ class OmniMorphConfig:
     rs_blocks_per_group: int = 4
     rs_ca_reduction: int = 16
     restoration_weight_decay: float = 0.0  # EDSR/RCAN train without weight decay; it only shrinks SR filters
+    rs_hr_refine: bool = False           # extra 3x3 conv at full output resolution before the RGB tail
     # semantic stream (ImageNet-pretrained; reads the restored canvas)
     backbone_name: str = "resnet50"      # resnet18 | resnet34 | resnet50 | convnext_tiny | none
     backbone_pretrained: bool = True     # torchvision download (needs Internet ON in a Kaggle notebook)
@@ -232,7 +272,10 @@ class OmniMorphConfig:
     lambda_ssim: float = 0.5
     lambda_pyramid: float = 0.5          # Laplacian-pyramid fidelity loss (see MultiTaskLoss)
     pyramid_levels: int = 3
-    lambda_perceptual: float = 0.05      # frozen-ImageNet-feature term (only active with a pretrained stream)
+    lambda_perceptual: float = 0.0       # frozen-ImageNet-feature term (needs a pretrained stream). v4.1: off by
+                                          # default -- two extra ResNet passes per step for a term that trades PSNR
+                                          # for texture; set e.g. 0.05 for sharper-looking, lower-PSNR output
+    perceptual_scale: float = 0.5        # the feature term is computed on 2x-downsampled images (4x cheaper)
     lambda_mid_sr: float = 0.3           # deep supervision at the intermediate 2x (256px) SR resolution
     lambda_mask_ce: float = 1.5
     lambda_mask_dice: float = 1.0
@@ -277,10 +320,9 @@ class OmniMorphConfig:
     # ---- optimisation ----------------------------------------------------------------
     batch_size: int = 8
     num_workers: int = 4
-    epochs: int = 150                    # v4: an epoch is now len(fully-labelled) / full_label_per_batch steps
-                                          # (2x v3's) over ~7x more distinct images, with ImageNet initialisation
-                                          # and anchor-refined, denoised queries -- the regime in which DN-/DAB-
-                                          # DETR converge in tens of epochs rather than v3's 500.
+    epochs: int = 100                    # an epoch = len(fully-labelled) / full_label_per_batch steps (366 at the
+                                          # defaults). v4.1: 150 -> 100 so the whole run fits Kaggle's 30 h/week GPU
+                                          # quota; the step profiler prints the projected wall-clock at epoch 1.
     warmup_epochs: int = 5
     lr: float = 2e-4
     min_lr: float = 1e-6
@@ -298,6 +340,11 @@ class OmniMorphConfig:
     auto_resume: bool = True             # resume from `latest_checkpoint.pth` (or a safety snapshot) if present
     checkpoint_every_n_epochs: int = 5   # rotating safety snapshot cadence, independent of "latest"/"best"
     checkpoint_keep_last_n: int = 2      # how many rotating safety snapshots to retain on disk
+    session_time_budget_hours: float = 11.0  # Kaggle kills a session at 12 h: stop training early enough that the
+                                          # final Val/Test evaluation and visualisations still run (0 = off); the
+                                          # next session resumes from the last epoch automatically
+    profile_steps: int = 20              # time data/forward/loss/backward for the first N steps of a session
+    train_metric_every: int = 4          # full train-set metrics (SSIM, edges, AP, ...) on every Nth batch only
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     # ---- evaluation / inference ------------------------------------------------------
     test_flip_tta: bool = True           # flip self-ensemble for the final Val/Test evaluation + visualisations
@@ -601,11 +648,12 @@ def resolve_voc2012_root(candidate_root: str, max_search_depth: int = 4) -> str:
             f"'pascal-voc-2012', never a path containing '/datasets/<owner>/').")
     matches = sorted(set(matches), key=lambda p: p.count(os.sep))
     if len(matches) > 1:
-        print(f"[!] Found {len(matches)} candidate VOC2012 directories -- this usually means the download "
-              f"contains a duplicated/mirrored copy, which would silently inflate every split's image count:")
+        print(f"[*] Found {len(matches)} VOC2012 directories (this Kaggle upload ships the dataset more than "
+              f"once):")
         for m in matches:
             print(f"      {m}")
-        print(f"    Using the shallowest one: {matches[0]}")
+        print(f"    Using ONLY the shallowest one, {matches[0]}; the other copies are never read, so nothing is "
+              f"double-counted (the split counts printed next are checked against the official numbers).")
     return matches[0]
 
 
@@ -816,24 +864,30 @@ class PromptGuidedDeformableConv(nn.Module):
         offsets = torch.tanh(offsets / self.max_offset) * self.max_offset
         base_grid = make_base_grid(H, W, x.device)
         scale = px_to_norm(H, W, x.device)
-        x = x.contiguous()
-        out = torch.zeros_like(x)
-        idx = 0
-        for ky in range(-self.pad, self.pad + 1):
-            for kx in range(-self.pad, self.pad + 1):
-                disp = torch.tensor([float(kx), float(ky)], device=x.device)
-                off = offsets[:, idx].permute(0, 2, 3, 1).float()             # (B,H,W,2)
-                grid = base_grid + (off + disp) * scale
-                s = F.grid_sample(x, grid.to(x.dtype), mode="bilinear", padding_mode="zeros", align_corners=False)
-                w_k = self.tap_weights[:, idx].view(1, C, 1, 1)
-                out = out + s * modulation[:, idx:idx + 1] * w_k
-                idx += 1
-        return self.proj(out)
+        # v4.1: all K*K taps are sampled by ONE grid_sample over a (K*K*H, W) grid instead of K*K separate calls
+        # (identical maths -- verified in --unit-test against the per-tap loop -- but one kernel launch and one
+        # fp32 autocast copy of `x` instead of nine, in the block that runs at full LR resolution).
+        disp = torch.tensor([[float(kx), float(ky)] for ky in range(-self.pad, self.pad + 1)
+                             for kx in range(-self.pad, self.pad + 1)], device=x.device)   # (K*K, 2) row-major
+        grid = base_grid.unsqueeze(1) + (offsets.permute(0, 1, 3, 4, 2).float() + disp.view(1, K * K, 1, 1, 2)) * scale
+        s = F.grid_sample(x.contiguous(), grid.reshape(B, K * K * H, W, 2).to(x.dtype), mode="bilinear",
+                          padding_mode="zeros", align_corners=False).view(B, C, K * K, H, W)
+        taps = modulation.unsqueeze(1) * self.tap_weights.view(1, C, K * K, 1, 1)          # (B, C, K*K, H, W)
+        return self.proj((s * taps.to(s.dtype)).sum(dim=2))
 
 
 class PromptGuidedSDTA(nn.Module):
-    """Prompt-guided spatial self-attention with 2-D RoPE and cosine attention."""
-    def __init__(self, dim: int, num_heads: int, config: OmniMorphConfig):
+    """Prompt-guided spatial self-attention with 2-D RoPE and cosine attention.
+
+    v4.1: on maps with more than `attn_global_max_tokens` tokens (the 128x128 and 64x64 stages at the default
+    128px LR input) attention is computed inside non-overlapping `attn_window` x `attn_window` windows, shifted by
+    half a window on every other block (Swin, Liu et al. ICCV'21; SwinIR for restoration). v3/v4 ran GLOBAL
+    attention over all 16,384 tokens of the stride-1 stage: ~137 GFLOPs per image for two blocks -- more than
+    the whole rest of the network -- and the main reason training ran at ~2 s/step. Global context is still
+    provided by the global-attention stages 3-4 and by the pretrained semantic stream. The projections, prompts,
+    cosine logits and RoPE are unchanged (RoPE encodes relative offsets, so it is exact inside a window), and so
+    are all parameter shapes: checkpoints from v4 load as they are."""
+    def __init__(self, dim: int, num_heads: int, config: OmniMorphConfig, shift: bool = False):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
@@ -847,7 +901,9 @@ class PromptGuidedSDTA(nn.Module):
         self.proj = PromptGuidedLoRaLin(dim, dim, config)
         self.temp_head = small_init_(nn.Linear(config.prompt_dim, num_heads))
         self.val_gate = small_init_(nn.Linear(config.prompt_dim, dim))
+        self.shift = shift
         self._rope_cache: Dict[tuple, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._mask_cache: Dict[tuple, torch.Tensor] = {}
 
     def _get_rope(self, H: int, W: int, device) -> Tuple[torch.Tensor, torch.Tensor]:
         key = (H, W, str(device))
@@ -876,6 +932,43 @@ class PromptGuidedSDTA(nn.Module):
         rot = torch.cat([-t2, t1], dim=-1)
         return t * cos_full + rot * sin_full
 
+    def _shift_mask(self, H: int, W: int, win: int, sh: int, device) -> torch.Tensor:
+        """Swin attention mask for cyclically-shifted windows: (n_windows, L, L), True = may attend (tokens that
+        were only brought together by the cyclic roll must not attend to each other)."""
+        key = (H, W, win, sh, str(device))
+        if key not in self._mask_cache:
+            region = torch.zeros(H, W, device=device)
+            cnt = 0
+            for hs in (slice(0, -win), slice(-win, -sh), slice(-sh, None)):
+                for ws in (slice(0, -win), slice(-win, -sh), slice(-sh, None)):
+                    region[hs, ws] = cnt
+                    cnt += 1
+            ids = region.view(H // win, win, W // win, win).permute(0, 2, 1, 3).reshape(-1, win * win)
+            self._mask_cache[key] = ids.unsqueeze(2) == ids.unsqueeze(1)
+        return self._mask_cache[key]
+
+    def _windowed(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, H: int, W: int, win: int) -> torch.Tensor:
+        B, h, N, d = q.shape
+        sh = win // 2 if self.shift else 0
+        nh, nw = H // win, W // win
+
+        def part(t):
+            t = t.reshape(B, h, H, W, d)
+            if sh:
+                t = torch.roll(t, shifts=(-sh, -sh), dims=(2, 3))
+            t = t.reshape(B, h, nh, win, nw, win, d).permute(0, 2, 4, 1, 3, 5, 6)
+            return t.reshape(B * nh * nw, h, win * win, d)
+
+        mask = None
+        if sh:
+            m = self._shift_mask(H, W, win, sh, q.device)                                # (nh*nw, L, L)
+            mask = m.unsqueeze(0).expand(B, -1, -1, -1).reshape(B * nh * nw, 1, win * win, win * win)
+        out = F.scaled_dot_product_attention(part(q), part(k), part(v), attn_mask=mask)
+        out = out.reshape(B, nh, nw, h, win, win, d).permute(0, 3, 1, 4, 2, 5, 6).reshape(B, h, H, W, d)
+        if sh:
+            out = torch.roll(out, shifts=(sh, sh), dims=(2, 3))
+        return out.reshape(B, h, N, d)
+
     def forward(self, x: torch.Tensor, prompt: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
         N, h, d = H * W, self.num_heads, self.head_dim
@@ -894,20 +987,25 @@ class PromptGuidedSDTA(nn.Module):
         # SDPA divides by sqrt(d): pre-multiply so that the logits are exactly  scale * cos(q, k)
         q = (q * (scale * math.sqrt(d))).to(v.dtype)
         k = k.to(v.dtype)
-        out = F.scaled_dot_product_attention(q, k, v)                       # (B,h,N,d)
+        win = self.cfg.attn_window
+        if win > 0 and N > self.cfg.attn_global_max_tokens and H % win == 0 and W % win == 0:
+            out = self._windowed(q, k, v, H, W, win)                         # (B,h,N,d)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v)                   # (B,h,N,d)
         out = out.transpose(1, 2).reshape(B, N, C)
         out = out * (1.0 + torch.tanh(self.val_gate(p_pool)).unsqueeze(1))
         return self.proj(out, prompt).transpose(1, 2).reshape(B, C, H, W)
 
 
 class HybridEncoderBlock(nn.Module):
-    def __init__(self, dim: int, num_heads: int, config: OmniMorphConfig, drop_path: float = 0.0):
+    def __init__(self, dim: int, num_heads: int, config: OmniMorphConfig, drop_path: float = 0.0,
+                 shift: bool = False):
         super().__init__()
         self.cfg = config
         self.norm1 = nn.GroupNorm(config.norm_groups, dim)
         self.spatial_deform = PromptGuidedDeformableConv(dim, config)
         self.norm2 = nn.GroupNorm(config.norm_groups, dim)
-        self.sdta = PromptGuidedSDTA(dim, num_heads, config)
+        self.sdta = PromptGuidedSDTA(dim, num_heads, config, shift=shift)
         self.norm3 = nn.GroupNorm(config.norm_groups, dim)
         self.ffn_down = PromptGuidedLoRaLin(dim, dim * config.ffn_ratio, config)
         self.act = nn.GELU()
@@ -1075,8 +1173,12 @@ class RestorationStream(nn.Module):
         self.up1 = nn.Sequential(nn.Conv2d(C, C * r * r, 3, padding=1), nn.PixelShuffle(r), nn.LeakyReLU(0.1, inplace=True))
         self.mid_head = nn.Conv2d(C, config.in_channels, 3, padding=1)
         self.up2 = nn.Sequential(nn.Conv2d(C, C * r * r, 3, padding=1), nn.PixelShuffle(r), nn.LeakyReLU(0.1, inplace=True))
-        self.hr_conv = nn.Sequential(nn.Conv2d(C, C, 3, padding=1), nn.LeakyReLU(0.1, inplace=True))
+        # optional C->C 3x3 refinement conv at the full output resolution (v4 always had it: 19 GFLOPs and
+        # ~130 MiB of saved activations per image; EDSR/RCAN tails go straight to RGB) -- see `rs_hr_refine`
+        self.hr_conv = (nn.Sequential(nn.Conv2d(C, C, 3, padding=1), nn.LeakyReLU(0.1, inplace=True))
+                        if config.rs_hr_refine else None)
         self.tail = nn.Conv2d(C, config.in_channels, 3, padding=1)
+        self.grad_checkpoint = config.grad_checkpoint and config.checkpoint_restoration
         _icnr_(self.up1[0], r)
         _icnr_(self.up2[0], r)
         for conv in (self.mid_head, self.tail):            # start exactly at the bicubic upsample
@@ -1095,14 +1197,20 @@ class RestorationStream(nn.Module):
                     if isinstance(blk, RCAB):
                         blk.body[2].weight.mul_(0.1)
 
+    def _group(self, gi: int, h: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        return self.groups[gi](self.sfts[gi](h, c))
+
     def forward(self, x_lr: torch.Tensor, cond: torch.Tensor, out_size: Tuple[int, int]):
         f0 = self.head(x_lr - 0.5)
         c = self.cond_proj(cond)
         if c.shape[-2:] != f0.shape[-2:]:
             c = F.interpolate(c, size=f0.shape[-2:], mode="bilinear", align_corners=False)
         h = f0
-        for group, sft in zip(self.groups, self.sfts):
-            h = h + group(sft(h, c))
+        for gi in range(len(self.groups)):
+            if self.grad_checkpoint and self.training and torch.is_grad_enabled():
+                h = h + checkpoint(self._group, gi, h, c, use_reentrant=False)
+            else:
+                h = h + self._group(gi, h, c)
         h = f0 + self.body_tail(h)                           # long skip
         mid_size = (out_size[0] // 2, out_size[1] // 2)
         f_mid = self.up1(h)
@@ -1113,9 +1221,20 @@ class RestorationStream(nn.Module):
         f_hr = self.up2(f_mid)
         if f_hr.shape[-2:] != tuple(out_size):
             f_hr = F.interpolate(f_hr, size=out_size, mode="bilinear", align_corners=False)
-        f_hr = self.hr_conv(f_hr)
+        if self.hr_conv is not None:
+            f_hr = self.hr_conv(f_hr)
         base = F.interpolate(x_lr, size=out_size, mode="bicubic", align_corners=False).clamp(0.0, 1.0)
         return base + self.tail(f_hr), pred_mid, f_hr
+
+
+class FrozenBatchNorm2dAct(FrozenBatchNorm2d):
+    """torchvision's FrozenBatchNorm2d multiplies fp16 activations by fp32 statistics, which silently promotes
+    every ResNet activation under AMP back to fp32 (double the memory of the whole semantic stream). Same frozen
+    affine transform, evaluated in the activation's own dtype; identical state_dict."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        scale = self.weight * (self.running_var + self.eps).rsqrt()
+        bias = self.bias - self.running_mean * scale
+        return x * scale.view(1, -1, 1, 1).to(x.dtype) + bias.view(1, -1, 1, 1).to(x.dtype)
 
 
 class SemanticBackbone(nn.Module):
@@ -1197,8 +1316,7 @@ class SemanticBackbone(nn.Module):
     def _build(tvm, name: str, pretrained: bool, weights=None) -> nn.Module:
         ctor = getattr(tvm, name)
         if name.startswith("resnet"):
-            from torchvision.ops.misc import FrozenBatchNorm2d
-            norm = FrozenBatchNorm2d if pretrained else (lambda c: nn.GroupNorm(32, c))
+            norm = FrozenBatchNorm2dAct if pretrained else (lambda c: nn.GroupNorm(32, c))
             return ctor(weights=weights, norm_layer=norm)
         return ctor(weights=weights, stochastic_depth_prob=0.1)
 
@@ -1530,8 +1648,9 @@ class OmniMorphNet(nn.Module):
         b = 0
         for i in range(len(config.embed_dims)):
             blocks = []
-            for _ in range(config.depths[i]):
-                blocks.append(HybridEncoderBlock(config.embed_dims[i], config.num_heads[i], config, drop_path=dpr[b]))
+            for j in range(config.depths[i]):
+                blocks.append(HybridEncoderBlock(config.embed_dims[i], config.num_heads[i], config, drop_path=dpr[b],
+                                                 shift=(j % 2 == 1)))
                 b += 1
             self.stages.append(nn.ModuleList(blocks))
             if i < len(config.embed_dims) - 1:
@@ -1566,14 +1685,17 @@ class OmniMorphNet(nn.Module):
         self.cls_act = nn.GELU()
         self.cls_out = nn.Linear(pd, config.num_classes)
         # ---- edges predicted at HR resolution (+ LDBC semantic boundary channel, see forward) ----
-        eh, rc = config.edge_hidden_channels, config.rs_channels
+        # v4.1: both 512x512 inputs of the fusion conv are narrowed to `edge_branch_channels` first (v4 fed it
+        # 2x64+1 channels at full resolution: 19.5 GFLOPs and ~225 MiB of activations per image for one edge map)
+        eh, ec = config.edge_hidden_channels, config.edge_branch_channels
         self.edge_dropout = nn.Dropout2d(config.head_dropout_base)    # p mutated at runtime by ATHM
         self.edge_coarse = nn.Sequential(
-            nn.Conv2d(pd, rc, kernel_size=config.conv_kernel, padding=config.conv_padding),
-            nn.GroupNorm(config.norm_groups, rc), nn.GELU(),
+            nn.Conv2d(pd, ec, kernel_size=config.conv_kernel, padding=config.conv_padding),
+            nn.GroupNorm(config.norm_groups, ec), nn.GELU(),
         )
+        self.edge_sr_proj = nn.Conv2d(config.rs_channels, ec, kernel_size=1)
         self.edge_fuse = nn.Sequential(
-            nn.Conv2d(rc * 2 + 1, eh, kernel_size=config.conv_kernel, padding=config.conv_padding),
+            nn.Conv2d(ec * 2 + 1, eh, kernel_size=config.conv_kernel, padding=config.conv_padding),
             nn.GroupNorm(config.norm_groups, eh), nn.GELU(),
             nn.Conv2d(eh, 1, kernel_size=1),
         )
@@ -1635,8 +1757,13 @@ class OmniMorphNet(nn.Module):
         features = []
         for i in range(len(self.stages)):
             prompts = self._stage_prompts(i, x)
+            ckpt = (cfg.grad_checkpoint and i < cfg.checkpoint_encoder_stages and self.training
+                    and torch.is_grad_enabled())
             for block in self.stages[i]:
-                x = block(x, prompts)
+                # activation checkpointing on the high-resolution stages: their deformable taps, LoRA gates and
+                # attention intermediates were ~45% of all saved activations; recomputing them in the backward
+                # pass is cheap now that their attention is windowed
+                x = checkpoint(block, x, prompts, use_reentrant=False) if ckpt else block(x, prompts)
             features.append(x)
             if i < len(self.downsamplers):
                 x = self.downsamplers[i](x)
@@ -1703,7 +1830,8 @@ class OmniMorphNet(nn.Module):
         boundary = F.interpolate(boundary, size=size, mode="bilinear", align_corners=False)
         edge_coarse = F.interpolate(self.edge_coarse(self.edge_dropout(high_res_feat)), size=size,
                                     mode="bilinear", align_corners=False)
-        pred_edges = self.edge_fuse(torch.cat([edge_coarse, sr_feat_hr.detach().to(edge_coarse.dtype),
+        edge_sr = self.edge_sr_proj(sr_feat_hr.detach())
+        pred_edges = self.edge_fuse(torch.cat([edge_coarse, edge_sr.to(edge_coarse.dtype),
                                                (2.0 * boundary - 1.0).to(edge_coarse.dtype)], dim=1))
 
         out = {
@@ -1914,6 +2042,12 @@ class MultiTaskLoss(nn.Module):
     def perceptual_loss(self, pred: torch.Tensor, target: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
         """LPIPS-style distance (Zhang et al., CVPR'18, without the learned per-channel weights): squared L2
         between channel-unit-normalised frozen ImageNet features, masked to the letterbox's valid region."""
+        sc = self.cfg.perceptual_scale
+        if sc != 1.0:
+            size = (max(8, int(pred.shape[-2] * sc)), max(8, int(pred.shape[-1] * sc)))
+            pred = F.interpolate(pred, size=size, mode="bilinear", align_corners=False, antialias=True)
+            target = F.interpolate(target, size=size, mode="bilinear", align_corners=False, antialias=True)
+            valid_mask = F.interpolate(valid_mask, size=size, mode="nearest")
         use_amp = pred.is_cuda
         with torch.autocast(device_type=pred.device.type, dtype=torch.float16 if use_amp else torch.bfloat16,
                             enabled=use_amp):
@@ -1973,10 +2107,10 @@ class MultiTaskLoss(nn.Module):
         a, g = cfg.focal_alpha, cfg.focal_gamma
         B = pred_boxes.shape[0]
         empty = torch.empty(0, dtype=torch.int64, device=pred_boxes.device)
-        indices = []
+        costs: List[Optional[torch.Tensor]] = []
         for i in range(B):
             if len(gt_boxes[i]) == 0:
-                indices.append((empty, empty))
+                costs.append(None)
                 continue
             prob = pred_logits[i].float().sigmoid()
             out_bbox = pred_boxes[i]
@@ -1987,8 +2121,19 @@ class MultiTaskLoss(nn.Module):
             cost_bbox = torch.cdist(out_bbox, tgt_bbox, p=1)
             cost_giou = -generalized_box_iou(out_bbox, tgt_bbox)
             C = cfg.lambda_bbox * cost_bbox + cfg.lambda_giou * cost_giou + cfg.lambda_det_ce * cost_class
-            C = torch.nan_to_num(C, nan=1e6, posinf=1e6, neginf=-1e6)
-            src_ind, tgt_ind = linear_sum_assignment(C.cpu().numpy())
+            costs.append(torch.nan_to_num(C, nan=1e6, posinf=1e6, neginf=-1e6))
+        # ONE device->host transfer for the whole batch (v4 synchronised once per image per decoder output, i.e.
+        # ~56 GPU stalls per step at batch 8 with 6 layers + the proposal output)
+        present = [c for c in costs if c is not None]
+        flat = torch.cat([c.reshape(-1) for c in present]).cpu().numpy() if present else None
+        indices, offset = [], 0
+        for c in costs:
+            if c is None:
+                indices.append((empty, empty))
+                continue
+            n = c.numel()
+            src_ind, tgt_ind = linear_sum_assignment(flat[offset:offset + n].reshape(c.shape))
+            offset += n
             indices.append((torch.as_tensor(src_ind, dtype=torch.int64, device=pred_boxes.device),
                             torch.as_tensor(tgt_ind, dtype=torch.int64, device=pred_boxes.device)))
         return indices
@@ -2116,6 +2261,7 @@ class MultiTaskLoss(nn.Module):
         loss_mask_ce = self.seg_ce(pred_masks, target_mask)
         loss_mask_dice = self.dice_loss(pred_masks, target_mask)
         loss_seg = loss_mask_ce * cfg.lambda_mask_ce + loss_mask_dice * cfg.lambda_mask_dice
+        loss_seg_main = loss_seg
         if "pred_masks_aux" in predictions:
             aux_ce = self.seg_ce(predictions["pred_masks_aux"].float(), target_mask)
             loss_seg = loss_seg + cfg.lambda_aux_seg * cfg.lambda_mask_ce * aux_ce
@@ -2142,6 +2288,7 @@ class MultiTaskLoss(nn.Module):
         main_parts = self.get_det_loss(predictions["pred_det_boxes"].float(), predictions["pred_det_logits"].float(),
                                        gt_boxes, gt_labels, num_boxes)
         loss_det = self._weighted_det(main_parts)
+        loss_det_main = loss_det
         for aux in predictions.get("aux_det", []):
             parts = self.get_det_loss(aux["boxes"].float(), aux["logits"].float(), gt_boxes, gt_labels, num_boxes)
             loss_det = loss_det + cfg.lambda_aux_det * self._weighted_det(parts)
@@ -2162,10 +2309,19 @@ class MultiTaskLoss(nn.Module):
                       + self._eff_lambda("edge", 1.0) * loss_edge
                       + self._eff_lambda("det", 1.0) * loss_det
                       + loss_dn)
+        # `loss_main`: the same terms the validation pass computes (final outputs only -- no denoising queries,
+        # no intermediate decoder layers, no query-selection proposals, no auxiliary segmentation head). Training
+        # minimises `loss_total`, but only `loss_main` is comparable between the train and val columns of the log:
+        # v4 printed `loss_total` as T-Loss, which at ~13 detection outputs per step looked like an 8x train/val gap.
+        loss_main = (self._eff_lambda("rec", cfg.lambda_rec) * loss_rec
+                     + self._eff_lambda("seg", 1.0) * loss_seg_main
+                     + self._eff_lambda("cls", 1.0) * loss_cls
+                     + self._eff_lambda("edge", 1.0) * loss_edge
+                     + self._eff_lambda("det", 1.0) * loss_det_main)
 
         d = lambda t: t.detach()
         return total_loss, {
-            "loss_total": d(total_loss), "loss_rec": d(loss_rec), "loss_l1": d(l1_val), "loss_ssim": d(ssim_loss_val),
+            "loss_total": d(total_loss), "loss_main": d(loss_main), "loss_rec": d(loss_rec), "loss_l1": d(l1_val), "loss_ssim": d(ssim_loss_val),
             "loss_pyramid": d(pyramid_val), "loss_perceptual": d(loss_perc), "loss_mid_sr": d(loss_mid),
             "loss_seg_ce": d(loss_mask_ce), "loss_seg_dice": d(loss_mask_dice), "loss_cls": d(loss_cls),
             "loss_edge": d(loss_edge), "loss_det": d(loss_det), "loss_det_ce": d(loss_det_ce),
@@ -2645,6 +2801,7 @@ class MetricTracker:
         self.loss_sums = defaultdict(lambda: torch.zeros((), device=device))
         self.n_batches = 0
         self.psnr_sum = torch.zeros((), device=device)
+        self.psnr_bicubic_sum = torch.zeros((), device=device)
         self.ssim_sum = torch.zeros((), device=device)
         self.n_images = 0
         C = cfg.num_mask_classes
@@ -2654,11 +2811,15 @@ class MetricTracker:
         self.det = DetectionEvaluator(cfg.num_classes, cfg.det_iou_thresh, cfg.det_score_thresh, cfg.det_max_per_image)
 
     @torch.no_grad()
-    def update(self, preds: Dict, batch: Dict, loss_dict: Dict[str, torch.Tensor]):
+    def update(self, preds: Dict, batch: Dict, loss_dict: Dict[str, torch.Tensor], metrics: bool = True):
+        """Losses are accumulated on every call; the (comparatively expensive) quality metrics only when
+        `metrics` is True -- the trainer passes False on most training batches (`train_metric_every`)."""
         cfg = self.cfg
         for k, v in loss_dict.items():
             self.loss_sums[k] += v
         self.n_batches += 1
+        if not metrics:
+            return
         # --- SR: PSNR/SSIM restricted to the letterbox's real (non-padded) pixels ---
         pred_hr = preds["pred_hr"].float().clamp(0.0, 1.0)
         hr = batch["hr_image"]
@@ -2670,6 +2831,12 @@ class MetricTracker:
         sq_err_sum = (((pred_hr - hr) ** 2) * valid_mask).sum(dim=(1, 2, 3))
         mse = sq_err_sum / (n_valid_px * C)
         self.psnr_sum += (10.0 * torch.log10(1.0 / (mse + cfg.psnr_eps))).sum()
+        # reference: plain bicubic upsampling of the same LR input, on the same valid pixels -- the number the
+        # restoration stream has to beat (v4 logs showed PSNR without it, so the SR gain was invisible)
+        bic = F.interpolate(batch["lr_image"].float(), size=hr.shape[-2:], mode="bicubic",
+                            align_corners=False).clamp(0.0, 1.0)
+        mse_b = (((bic - hr) ** 2) * valid_mask).sum(dim=(1, 2, 3)) / (n_valid_px * C)
+        self.psnr_bicubic_sum += (10.0 * torch.log10(1.0 / (mse_b + cfg.psnr_eps))).sum()
         _, ssim_val = self.criterion.masked_ssim(pred_hr, hr, valid_mask)
         self.ssim_sum += ssim_val * B
         self.n_images += B
@@ -2706,6 +2873,7 @@ class MetricTracker:
         out = {k: float(v / max(self.n_batches, 1)) for k, v in self.loss_sums.items()}
         out["loss"] = out.get("loss_total", 0.0)
         out["psnr"] = float(self.psnr_sum / max(self.n_images, 1))
+        out["psnr_bicubic"] = float(self.psnr_bicubic_sum / max(self.n_images, 1))
         out["ssim"] = float(self.ssim_sum / max(self.n_images, 1))
         C = cfg.num_mask_classes
         conf = self.conf.view(C, C).double()
@@ -2721,7 +2889,8 @@ class MetricTracker:
         best = int(np.argmax(f1))
         out["edge_f1"], out["edge_prec"], out["edge_rec"] = float(f1[best] * 100), float(prec[best] * 100), float(rec[best] * 100)
         out["edge_thr"] = float(cfg.edge_eval_thresholds[best])
-        out["cls_map"] = multilabel_map(torch.cat(self.cls_scores).numpy(), torch.cat(self.cls_labels).numpy())
+        out["cls_map"] = (multilabel_map(torch.cat(self.cls_scores).numpy(), torch.cat(self.cls_labels).numpy())
+                          if self.cls_scores else 0.0)
         out["det_map"] = self.det.compute()
         return out
 
@@ -2738,12 +2907,18 @@ class ModelEMA:
     def update(self, model: nn.Module):
         self.updates += 1
         d = min(self.decay, (1.0 + self.updates) / (10.0 + self.updates))
-        msd = model.state_dict()
-        for k, v in self.module.state_dict().items():
-            if v.dtype.is_floating_point:
-                v.mul_(d).add_(msd[k].detach(), alpha=1.0 - d)
-            else:
-                v.copy_(msd[k])
+        if not hasattr(self, "_float_pairs"):
+            # state_dict() tensors share storage with the live modules and load_state_dict() copies in place, so
+            # these references stay valid; built once instead of two state_dict() walks per step
+            msd, esd = model.state_dict(), self.module.state_dict()
+            self._float_pairs = ([v for k, v in esd.items() if v.dtype.is_floating_point],
+                                 [msd[k] for k, v in esd.items() if v.dtype.is_floating_point])
+            self._other_pairs = [(v, msd[k]) for k, v in esd.items() if not v.dtype.is_floating_point]
+        ema_t, model_t = self._float_pairs
+        torch._foreach_mul_(ema_t, d)                          # fused multi-tensor ops: a handful of kernels
+        torch._foreach_add_(ema_t, model_t, alpha=1.0 - d)     # instead of ~800 per step
+        for e, m in self._other_pairs:
+            e.copy_(m)
 
 
 class OmniMorphTrainer:
@@ -2813,6 +2988,7 @@ class OmniMorphTrainer:
         self.metric_history: Dict[str, List[float]] = defaultdict(list)     # for ATHM (section 6)
         self.task_health: Dict[str, float] = {}
         self.current_dn_noise_scale = config.dn_box_noise_scale_start
+        self._profile_left = config.profile_steps
 
     @property
     def eval_model(self) -> nn.Module:
@@ -2950,8 +3126,24 @@ class OmniMorphTrainer:
         compatible = (set(saved.keys()) == set(current.keys())
                       and all(saved[k].shape == current[k].shape for k in saved))
         if not compatible:
-            print("[!] Checkpoint architecture differs from the current model (expected when resuming a v3 run "
-                  "into v4's new modules) -> starting from scratch (model left untouched).")
+            # Warm start: transfer every tensor whose name and shape still match (the v4 -> v4.1 changes keep the
+            # encoder, semantic stream, pixel/query decoders and almost every head intact), keep fresh init for
+            # the rest, and restart optimiser + schedule + epoch counter -- their state cannot be mapped onto
+            # changed parameters. Below 50% overlap (e.g. a v3 checkpoint) it is cleaner to start from scratch.
+            matched = {k: v for k, v in saved.items() if k in current and v.shape == current[k].shape}
+            n_cur = sum(t.numel() for t in current.values())
+            n_hit = sum(t.numel() for t in matched.values())
+            if saved and n_hit >= 0.5 * n_cur:
+                self.model.load_state_dict(matched, strict=False)
+                if self.ema is not None:
+                    self.ema.module.load_state_dict(self.model.state_dict())
+                print(f"[*] Warm start from a checkpoint of an earlier version of this architecture (epoch "
+                      f"{ckpt.get('epoch', '?')}): {len(matched)}/{len(current)} tensors = {100.0 * n_hit / n_cur:.1f}% "
+                      f"of the weights transferred, the rest freshly initialised. Optimiser, LR schedule (incl. "
+                      f"warmup) and epoch counter restart from 1.")
+            else:
+                print(f"[!] Checkpoint architecture differs from the current model and only "
+                      f"{100.0 * n_hit / max(n_cur, 1):.0f}% of the weights match -> starting from scratch.")
             return
         self.model.load_state_dict(saved)
         if self.ema is not None and ckpt.get("ema_state") is not None:
@@ -3034,10 +3226,21 @@ class OmniMorphTrainer:
         model.train(is_train)
         tracker = MetricTracker(self.cfg, self.device, self.criterion)
         desc = tag or f"{'Train' if is_train else 'Val'} Ep {epoch}"
-        pbar = tqdm(loader, desc=desc, leave=False)
+        # notebooks/log files are not TTYs: refresh the bar every 30 s instead of every few batches (the empty
+        # blocks between epochs in Kaggle logs are erased progress-bar lines)
+        pbar = tqdm(loader, desc=desc, leave=False, mininterval=0.1 if sys.stderr.isatty() else 30.0)
         skipped = 0
+        sync = torch.cuda.synchronize if self.device.type == "cuda" else (lambda: None)
+        prof: Dict[str, float] = defaultdict(float)
+        n_prof, warm = 0, 3                      # skip the first steps (cuDNN autotuning, allocator warm-up)
+        t_prev = time.perf_counter()
         for it, batch in enumerate(pbar):
+            profiling = is_train and self._profile_left > 0 and it >= warm
             batch = move_batch(batch, self.device)
+            if profiling:
+                sync()
+                t0 = time.perf_counter()
+                prof["data"] += t0 - t_prev
             dn_batch = None
             if is_train and self.cfg.use_denoising:
                 dn_batch = build_dn_batch(batch["boxes"], batch["box_labels"], self.cfg,
@@ -3050,9 +3253,18 @@ class OmniMorphTrainer:
                                       dn_labels=dn_batch["dn_labels"], dn_valid=dn_batch["valid"])
                     else:
                         preds = model(batch["lr_image"])
+                if profiling:
+                    sync()
+                    t1 = time.perf_counter()
+                    prof["forward"] += t1 - t0
                 loss, loss_dict = self.criterion(preds, batch, dn_batch=dn_batch)
+                if profiling:
+                    sync()
+                    t2 = time.perf_counter()
+                    prof["loss (incl. Hungarian)"] += t2 - t1
                 if not torch.isfinite(loss):
                     skipped += 1
+                    t_prev = time.perf_counter()
                     continue
                 self.scaler.scale(loss).backward()
                 self.scaler.unscale_(self.optimizer)
@@ -3062,22 +3274,51 @@ class OmniMorphTrainer:
                 self.scaler.update()
                 if self.ema is not None:
                     self.ema.update(self.model)
+                if profiling:
+                    sync()
+                    t3 = time.perf_counter()
+                    prof["backward + step + EMA"] += t3 - t2
             else:
                 with torch.no_grad():
                     with self._autocast():
                         preds = model.forward_tta(batch["lr_image"]) if use_tta else model(batch["lr_image"])
                     loss, loss_dict = self.criterion(preds, batch)
-            tracker.update(preds, batch, loss_dict)
+            with_metrics = (not is_train) or it % max(1, self.cfg.train_metric_every) == 0
+            if profiling:
+                t4 = time.perf_counter()
+            tracker.update(preds, batch, loss_dict, metrics=with_metrics)
+            if profiling:
+                sync()
+                prof["metrics"] += time.perf_counter() - t4
+                n_prof += 1
+                self._profile_left -= 1
+                if self._profile_left == 0:
+                    self._report_profile(prof, n_prof, len(loader), epoch)
             if it % 10 == 0:
                 pbar.set_postfix(loss=f"{loss.item():.3f}")
+            t_prev = time.perf_counter()
         if skipped:
             print(f"[!] {skipped} non-finite batches skipped in epoch {epoch}.")
         return tracker.compute()
 
+    def _report_profile(self, prof: Dict[str, float], n: int, steps_per_epoch: int, epoch: int) -> None:
+        per = {k: v / max(n, 1) for k, v in prof.items()}
+        step = sum(per.values())
+        ep_min = step * steps_per_epoch / 60.0
+        left = max(0, self.cfg.epochs - epoch + 1)
+        parts = " | ".join(f"{k} {v:.2f}s" for k, v in per.items())
+        print(f"[profile] {n} steps at batch_size={self.cfg.batch_size}: {parts} -> {step:.2f} s/step, "
+              f"~{ep_min:.1f} min per training epoch (+ validation), ~{left * ep_min * 1.15 / 60.0:.1f} h for the "
+              f"{left} remaining epochs (Kaggle: 12 h per session, 30 h per week).")
+        if per.get("data", 0.0) > 0.25 * step:
+            print(f"[profile] data loading is {100 * per['data'] / step:.0f}% of the step: the GPU waits for the "
+                  f"{effective_workers(self.cfg)} loader workers (os.cpu_count()={os.cpu_count()}).")
+
     def evaluate(self, loader: DataLoader, name: str = "Test", use_tta: Optional[bool] = None) -> Dict[str, float]:
         use_tta = self.cfg.test_flip_tta if use_tta is None else use_tta
         m = self.run_epoch(0, loader, False, tag=f"{name} eval{' (flip-TTA)' if use_tta else ''}", use_tta=use_tta)
-        print(f"[{name}] loss {m['loss']:.3f} | PSNR {m['psnr']:.2f}dB | SSIM {m['ssim']:.3f} | mIoU {m['miou']:.1f}% "
+        print(f"[{name}] loss {m['loss']:.3f} | PSNR {m['psnr']:.2f}dB ({m['psnr'] - m['psnr_bicubic']:+.2f} vs "
+              f"bicubic {m['psnr_bicubic']:.2f}) | SSIM {m['ssim']:.3f} | mIoU {m['miou']:.1f}% "
               f"| PixAcc {m['pix_acc']:.1f}% | EdgeF1 {m['edge_f1']:.1f}% (P {m['edge_prec']:.1f} / R {m['edge_rec']:.1f}, "
               f"thr {m['edge_thr']:.2f}) | Det mAP@{self.cfg.det_iou_thresh:.1f} {m['det_map']:.1f}% | Cls mAP {m['cls_map']:.1f}%")
         with open(os.path.join(self.ckpt_dir, f"{name.lower()}_metrics.json"), "w") as f:
@@ -3094,13 +3335,18 @@ class OmniMorphTrainer:
                   f"further (this is exactly the 'training silently stops at the old target' situation; see "
                   f"resume()'s Continuity-Preserving Horizon Extension for what happens to the LR schedule when "
                   f"you do raise it).")
+        epoch_secs: List[float] = []
         for epoch in range(self.start_epoch, cfg.epochs + 1):
+            t_epoch = time.time()
             epoch_frac = self._dn_noise_progress(epoch)
             self.current_dn_noise_scale = (cfg.dn_box_noise_scale_start
                                             + (cfg.dn_box_noise_scale_end - cfg.dn_box_noise_scale_start) * epoch_frac)
             self.criterion.set_quality_exponent(self._quality_exponent(epoch))
             t = self.run_epoch(epoch, self.train_loader, True)
+            t_val = time.time()
             v = self.run_epoch(epoch, self.val_loader, False)
+            val_secs = time.time() - t_val
+            lr = self.optimizer.param_groups[0]["lr"]          # the LR this epoch actually trained with
             self.scheduler.step()
             for prefix, m in (("train", t), ("val", v)):
                 for k, val in m.items():
@@ -3117,16 +3363,18 @@ class OmniMorphTrainer:
             else:
                 self.loss_bad_epochs += 1
             self.save(epoch, is_best)
-            lr = self.optimizer.param_groups[0]["lr"]
             health_str = " ".join(f"{k}:{v_:.2f}" for k, v_ in self.task_health.items()) or "n/a"
-            print(f"Ep {epoch:03d} | lr {lr:.2e} | T-Loss {t['loss']:.3f} | V-Loss {v['loss']:.3f} | "
-                  f"V-PSNR {v['psnr']:.2f}dB | V-SSIM {v['ssim']:.3f} | V-mIoU {v['miou']:.1f}% | "
+            epoch_secs.append(time.time() - t_epoch)
+            print(f"Ep {epoch:03d} | lr {lr:.2e} | T-Loss {t['loss_main']:.3f} (optimised total {t['loss']:.1f}) | "
+                  f"V-Loss {v['loss_main']:.3f} | V-PSNR {v['psnr']:.2f}dB ({v['psnr'] - v['psnr_bicubic']:+.2f} vs "
+                  f"bicubic) | V-SSIM {v['ssim']:.3f} | V-mIoU {v['miou']:.1f}% | "
                   f"V-EdgeF1 {v['edge_f1']:.1f}% | V-mAP {v['det_map']:.1f}% | V-ClsmAP {v['cls_map']:.1f}% | "
                   f"score {score:.2f}{' *' if is_best else ''} | health[{health_str}]")
             print(f"      val components: rec {v['loss_rec']:.3f} | seg_ce {v['loss_seg_ce']:.3f} | "
                   f"seg_dice {v['loss_seg_dice']:.3f} | cls {v['loss_cls']:.3f} | edge {v['loss_edge']:.3f} | "
                   f"det {v['loss_det']:.3f} | train dn {t['loss_dn']:.3f} | QAIC beta "
-                  f"{self.criterion.quality_exponent:.2f} | DN noise {self.current_dn_noise_scale:.2f}")
+                  f"{self.criterion.quality_exponent:.2f} | DN noise {self.current_dn_noise_scale:.2f} | "
+                  f"{epoch_secs[-1] / 60.0:.1f} min")
             stop_composite = cfg.early_stop_patience > 0 and self.bad_epochs >= cfg.early_stop_patience
             stop_loss = cfg.loss_early_stop_patience > 0 and self.loss_bad_epochs >= cfg.loss_early_stop_patience
             if stop_composite or stop_loss:
@@ -3134,11 +3382,20 @@ class OmniMorphTrainer:
                 print(f"[*] Early stopping: no improvement of the {reason} for "
                       f"{self.bad_epochs if stop_composite else self.loss_bad_epochs} epochs.")
                 break
+            budget = cfg.session_time_budget_hours * 3600.0
+            if budget > 0 and epoch < cfg.epochs:
+                recent = epoch_secs[-3:]
+                reserve = 4.0 * val_secs + 600.0     # final Val + Test with flip-TTA, visualisations, slack
+                if (time.time() - _PROCESS_START) + sum(recent) / len(recent) + reserve > budget:
+                    print(f"[*] Session time budget ({cfg.session_time_budget_hours:.1f} h): stopping after epoch "
+                          f"{epoch} so the final evaluation and visualisations finish before the session limit. "
+                          f"Run the notebook again to resume from epoch {epoch + 1} (auto_resume).")
+                    break
         plot_history(self.history, os.path.join(self.ckpt_dir, "training_curves.png"))
 
 
 def plot_history(history, path: str):
-    panels = [("loss", "Total loss"), ("psnr", "PSNR (dB)"), ("miou", "mIoU (%)"),
+    panels = [("loss_main", "Loss (val-comparable terms)"), ("psnr", "PSNR (dB)"), ("miou", "mIoU (%)"),
               ("edge_f1", "Edge F1 (%)"), ("det_map", "Detection mAP (%)"), ("cls_map", "Classification mAP (%)")]
     fig, axes = plt.subplots(2, 3, figsize=(16, 8))
     for ax, (key, title) in zip(axes.ravel(), panels):
@@ -3349,20 +3606,35 @@ class OmniMorphInferencer:
 # 10. MAIN EXECUTION / SMOKE TEST / DATASET UNIT TEST / OVERFIT (LEARNABILITY) TEST
 # ============================================================================
 def build_loader(ds, cfg: OmniMorphConfig, shuffle: bool, drop_last: bool) -> DataLoader:
-    kwargs = dict(batch_size=cfg.batch_size, shuffle=shuffle, num_workers=cfg.num_workers, drop_last=drop_last,
+    nw = effective_workers(cfg)
+    kwargs = dict(batch_size=cfg.batch_size, shuffle=shuffle, num_workers=nw, drop_last=drop_last,
                   collate_fn=omnimorph_collate_fn, pin_memory=torch.cuda.is_available())
-    if cfg.num_workers > 0:
+    if nw > 0:
         kwargs["persistent_workers"] = True
     return DataLoader(ds, **kwargs)
 
 
+def full_per_batch(cfg: OmniMorphConfig) -> int:
+    if cfg.full_label_per_batch > 0:
+        return min(cfg.full_label_per_batch, cfg.batch_size)
+    return max(1, min(cfg.batch_size, int(round(cfg.batch_size * cfg.full_label_fraction))))
+
+
+def effective_workers(cfg: OmniMorphConfig) -> int:
+    """Never more loader workers than CPU cores minus one: Kaggle GPU sessions have 4 vCPUs, and the training
+    process itself needs a core to launch kernels and run Hungarian matching."""
+    return max(0, min(cfg.num_workers, (os.cpu_count() or 2) - 1))
+
+
 def build_train_loader(ds: "PascalVOC2012MultiTaskDataset", cfg: OmniMorphConfig) -> DataLoader:
     sampler = MixedSupervisionBatchSampler(ds.full_label_indices, ds.partial_label_indices, cfg.batch_size,
-                                           cfg.full_label_per_batch, cfg.seed)
-    kwargs = dict(batch_sampler=sampler, num_workers=cfg.num_workers, collate_fn=omnimorph_collate_fn,
+                                           full_per_batch(cfg), cfg.seed)
+    nw = effective_workers(cfg)
+    kwargs = dict(batch_sampler=sampler, num_workers=nw, collate_fn=omnimorph_collate_fn,
                   pin_memory=torch.cuda.is_available())
-    if cfg.num_workers > 0:
+    if nw > 0:
         kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = 4
     return DataLoader(ds, **kwargs)
 
 
@@ -3391,10 +3663,10 @@ def main(config: Optional[OmniMorphConfig] = None):
     train_loader = build_train_loader(train_ds, config)
     val_loader = build_loader(val_ds, config, shuffle=False, drop_last=False)
     test_loader = build_loader(test_ds, config, shuffle=False, drop_last=False)
-    print(f"[*] {len(train_loader)} optimisation steps per epoch "
-          f"({config.full_label_per_batch} fully-labelled + "
-          f"{config.batch_size - config.full_label_per_batch if train_ds.partial_label_indices else 0} "
-          f"box/label-only images per batch)")
+    fpb = full_per_batch(config) if train_ds.partial_label_indices else config.batch_size
+    print(f"[*] {len(train_loader)} optimisation steps per epoch ({fpb} fully-labelled + "
+          f"{config.batch_size - fpb} box/label-only images per batch, batch_size={config.batch_size}, "
+          f"{effective_workers(config)} loader workers)")
     print("[*] Initializing OmniMorphNet...")
     model = OmniMorphNet(config).to(config.device)
     n_params = sum(p.numel() for p in model.parameters())
@@ -3466,6 +3738,28 @@ def smoke_test(config: Optional[OmniMorphConfig] = None, batch_size: int = 2):
         print("[smoke]   e.g.", no_grad[:5])
     print("[smoke]   components:", {k: round(float(v), 4) for k, v in ld.items()})
     assert torch.isfinite(loss) and not bad, "non-finite loss or gradients"
+
+    # activation checkpointing must be a pure memory/compute trade: same loss, same gradients (both passes start
+    # from the same RNG state, so DropPath / dropout draw identical masks; checkpoint() replays them on recompute)
+    if cfg.grad_checkpoint and dn_batch is not None:
+        def run(ckpt_on: bool):
+            cfg.grad_checkpoint = ckpt_on
+            model.restoration.grad_checkpoint = ckpt_on
+            model.zero_grad(set_to_none=True)
+            set_seed(1234)
+            p_ = model(batch["lr_image"], dn_ref=dn_batch["dn_ref"], dn_labels=dn_batch["dn_labels"],
+                       dn_valid=dn_batch["valid"])
+            l_, _ = criterion(p_, batch, dn_batch=dn_batch)
+            l_.backward()
+            return float(l_), {n: q.grad.clone() for n, q in model.named_parameters() if q.grad is not None}
+        loss_c, g_c = run(True)
+        loss_n, g_n = run(False)
+        cfg.grad_checkpoint = True
+        model.restoration.grad_checkpoint = cfg.checkpoint_restoration
+        worst = max(float((g_n[n] - g).abs().max() / (g.abs().max() + 1e-8)) for n, g in g_c.items())
+        print(f"[smoke] gradient checkpointing: loss {loss_c:.5f} vs {loss_n:.5f} without, "
+              f"max relative grad difference {worst:.1e}")
+        assert abs(loss_c - loss_n) < 1e-4 * max(1.0, abs(loss_n)) and worst < 1e-3, "checkpointing changed the maths"
 
     # ATHM plumbing sanity check (loss-weight + head-dropout mutation)
     if hasattr(model, "set_task_health"):
@@ -3650,10 +3944,48 @@ def unit_test(cfg: Optional[OmniMorphConfig] = None):
                 + cfg.vfl_alpha * p_neg ** cfg.focal_gamma * F.binary_cross_entropy_with_logits(torch.tensor(-1.0), torch.tensor(0.0)))
     assert abs(float(crit._vfl(logit, pos, q)) - float(expected)) < 1e-5
     print("[unit-test] QAIC / varifocal loss OK")
+
+    # ---- v4.1 speed rewrites must be exact: fused deformable sampling == the original per-tap loop ----
+    torch.manual_seed(0)
+    small = OmniMorphConfig(prompt_dim=8)
+    dcn = PromptGuidedDeformableConv(6, small)
+    nn.init.normal_(dcn.offset_mod_conv.weight, std=0.3)              # non-trivial offsets / modulation
+    x, prompt = torch.randn(2, 6, 9, 11), torch.randn(2, 3, 8)
+    K, pad = dcn.K, dcn.pad
+    params = dcn.offset_mod_conv(x + dcn.prompt_proj(prompt.mean(dim=1)).view(2, 6, 1, 1))
+    res = params[:, 2:2 + 2 * K * K].reshape(2, K * K, 2, 9, 11)
+    cur = torch.tanh(params[:, 2 + 2 * K * K: 2 + 3 * K * K]).unsqueeze(2) * small.curvature_scale
+    offs = params[:, :2].unsqueeze(1) + res * (1.0 + cur)
+    offs = torch.tanh(offs / dcn.max_offset) * dcn.max_offset
+    mod = 2.0 * torch.sigmoid(params[:, 2 + 3 * K * K:])
+    ref, idx = torch.zeros_like(x), 0
+    for ky in range(-pad, pad + 1):
+        for kx in range(-pad, pad + 1):
+            grid = make_base_grid(9, 11, x.device) + (offs[:, idx].permute(0, 2, 3, 1) + torch.tensor([kx, ky]).float()) \
+                * px_to_norm(9, 11, x.device)
+            ref = ref + F.grid_sample(x, grid, mode="bilinear", padding_mode="zeros", align_corners=False) \
+                * mod[:, idx:idx + 1] * dcn.tap_weights[:, idx].view(1, 6, 1, 1)
+            idx += 1
+    assert torch.allclose(dcn(x, prompt), dcn.proj(ref), atol=1e-5), "fused deformable sampling diverged"
+    print("[unit-test] fused deformable sampling == per-tap loop OK")
+
+    # ---- windowed attention with one window covering the map == global attention ----
+    torch.manual_seed(0)
+    wcfg = OmniMorphConfig(prompt_dim=8, attn_window=8, attn_global_max_tokens=0)
+    gcfg = OmniMorphConfig(prompt_dim=8, attn_window=0)
+    att_w, att_g = PromptGuidedSDTA(16, 2, wcfg), PromptGuidedSDTA(16, 2, gcfg)
+    att_g.load_state_dict(att_w.state_dict())
+    xa, pa = torch.randn(2, 16, 8, 8), torch.randn(2, 3, 8)
+    assert torch.allclose(att_w(xa, pa), att_g(xa, pa), atol=1e-5), "single-window attention != global attention"
+    att_s = PromptGuidedSDTA(16, 2, OmniMorphConfig(prompt_dim=8, attn_window=4, attn_global_max_tokens=0), shift=True)
+    out_s = att_s(xa, pa)
+    assert out_s.shape == xa.shape and bool(torch.isfinite(out_s).all())
+    print("[unit-test] windowed / shifted-window attention OK")
     print("[unit-test] ALL CHECKS PASSED")
 
 
-def overfit_test(out_dir: Optional[str] = None, epochs: int = 120) -> Dict[str, float]:
+def overfit_test(out_dir: Optional[str] = None, epochs: int = 120,
+                 overrides: Optional[Dict[str, Any]] = None, strict: bool = True) -> Dict[str, float]:
     """End-to-end learning check that runs on a CPU in a few minutes: a tiny OmniMorph is trained through the REAL
     OmniMorphTrainer (mixed-supervision sampler, ICCD v2, QAIC annealing, stream-isolated clipping, checkpointing,
     resume with horizon extension, flip-TTA evaluation, the inferencer) on a synthetic VOC-shaped tree, then
@@ -3665,11 +3997,14 @@ def overfit_test(out_dir: Optional[str] = None, epochs: int = 120) -> Dict[str, 
         experiment_name="overfit_test", lr_image_size=32, hr_image_size=128,
         embed_dims=[16, 32, 32, 48], depths=[1, 1, 1, 1], num_heads=[1, 2, 2, 4], num_prompts=4, prompt_dim=16,
         pixel_dec_dim=32, num_queries=8, num_refine_rounds=3, rs_channels=16, rs_groups=2, rs_blocks_per_group=2,
-        rs_ca_reduction=4, edge_hidden_channels=8, backbone_name="resnet18", dn_max_gt_per_image=4,
+        rs_ca_reduction=4, edge_hidden_channels=8, edge_branch_channels=8, backbone_name="resnet18",
+        dn_max_gt_per_image=4, attn_window=8, attn_global_max_tokens=256, lambda_perceptual=0.05,
         batch_size=4, full_label_per_batch=3, num_workers=0, epochs=epochs, warmup_epochs=3, lr=1e-3,
         use_amp=False, use_ema=False, augment=False, use_ctcrm=False, drop_path_rate=0.0, head_dropout_base=0.0,
         early_stop_patience=0, loss_early_stop_patience=0, athm_start_epoch=10 ** 6, quality_anneal_epochs=epochs // 3,
         checkpoint_every_n_epochs=0, separate_test_split=False, max_infer_batches=1, device="cpu")
+    for k, v in (overrides or {}).items():
+        setattr(cfg, k, v)
     set_seed(cfg.seed)
     rng = random.Random(cfg.seed)
     with tempfile.TemporaryDirectory() as tmp:
@@ -3706,6 +4041,17 @@ def overfit_test(out_dir: Optional[str] = None, epochs: int = 120) -> Dict[str, 
                                     MultiTaskLoss(cfg2, perceptual=build_perceptual_extractor(model2, cfg2)), cfg2)
         trainer2.fit(auto_resume=True)
         assert trainer2.start_epoch == cfg.epochs + 1, "resume did not pick up the saved checkpoint"
+        # warm start: a checkpoint of a slightly different architecture (here: a wider edge branch) must transfer
+        # every matching tensor and restart the schedule, instead of being discarded
+        cfg3 = copy.deepcopy(cfg2)
+        cfg3.edge_branch_channels = cfg2.edge_branch_channels * 2
+        model3 = OmniMorphNet(cfg3)
+        trainer3 = OmniMorphTrainer(model3, train_loader, val_loader, MultiTaskLoss(cfg3), cfg3)
+        trainer3.resume()
+        assert trainer3.start_epoch == 1, "warm start must restart the epoch counter"
+        assert torch.equal(model3.restoration.tail.weight, trainer2.model.restoration.tail.weight), \
+            "warm start did not transfer the matching weights"
+
         trainer2.criterion.set_quality_exponent(1.0)
         m = trainer2.evaluate(val_loader, "Overfit")
 
@@ -3742,6 +4088,8 @@ def overfit_test(out_dir: Optional[str] = None, epochs: int = 120) -> Dict[str, 
               f"PixAcc {m['pix_acc']:.1f}% | EdgeF1 {m['edge_f1']:.1f}% | ClsmAP {m['cls_map']:.1f}% | "
               f"DetmAP {m['det_map']:.1f}% | median GT-matched det score {m['det_median_gt_conf']:.2f} | "
               f"{n_vis} visualisations")
+        if not strict:
+            return m
         assert m["psnr"] > m["bicubic_psnr"] + 1.0, "restoration stream did not beat bicubic"
         assert m["pix_acc"] > 85.0 and m["miou"] > 50.0, "segmentation did not learn"
         assert m["cls_map"] > 80.0, "classification did not learn"
@@ -3753,7 +4101,7 @@ def overfit_test(out_dir: Optional[str] = None, epochs: int = 120) -> Dict[str, 
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="OmniMorph v4 -- penta-task PASCAL VOC 2012 network")
+    parser = argparse.ArgumentParser(description="OmniMorph v4.1 -- penta-task PASCAL VOC 2012 network")
     parser.add_argument("--smoke-test", action="store_true", help="one forward/backward on random tensors")
     parser.add_argument("--unit-test", action="store_true", help="dataset-pipeline checks on synthetic VOC files")
     parser.add_argument("--overfit-test", action="store_true", help="tiny end-to-end learning check (CPU-friendly)")
