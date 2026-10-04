@@ -34,6 +34,10 @@ typedef uint64_t Uint64;
 
 // SDL3 uses C99 bool via <stdbool.h> in C, and plain bool in C++.
 
+#ifndef SDLCALL
+#define SDLCALL
+#endif
+
 // ── Geometry ─────────────────────────────────────────────────────────────
 typedef struct SDL_Rect {
     int x, y, w, h;
@@ -55,6 +59,10 @@ typedef struct SDL_FPoint {
 typedef struct SDL_Color {
     Uint8 r, g, b, a;
 } SDL_Color;
+
+typedef struct SDL_FColor {
+    float r, g, b, a;
+} SDL_FColor;
 
 // ── Opaque handle types ──────────────────────────────────────────────────
 struct SDL_Window;
@@ -112,7 +120,14 @@ bool SDL_SetError(const char* fmt, ...);
 int SDL_GetVersion(void);
 
 // ── Window management ────────────────────────────────────────────────────
+typedef Uint32 SDL_WindowID;
 SDL_Window* SDL_CreateWindow(const char* title, int w, int h, SDL_WindowFlags flags);
+SDL_WindowID SDL_GetWindowID(SDL_Window* window);
+SDL_WindowFlags SDL_GetWindowFlags(SDL_Window* window);
+bool SDL_SetWindowMinimumSize(SDL_Window* window, int min_w, int min_h);
+bool SDL_SetWindowFullscreen(SDL_Window* window, bool fullscreen);
+bool SDL_SetWindowIcon(SDL_Window* window, struct SDL_Surface* icon);
+bool SDL_SetTextInputArea(SDL_Window* window, const SDL_Rect* rect, int cursor);
 void SDL_DestroyWindow(SDL_Window* window);
 bool SDL_SetWindowPosition(SDL_Window* window, int x, int y);
 bool SDL_GetWindowPosition(SDL_Window* window, int* x, int* y);
@@ -137,6 +152,19 @@ SDL_DisplayID SDL_GetPrimaryDisplay(void);
 float SDL_GetDisplayContentScale(SDL_DisplayID displayID);
 bool SDL_GetDisplayUsableBounds(SDL_DisplayID displayID, SDL_Rect* rect);
 bool SDL_GetDisplayBounds(SDL_DisplayID displayID, SDL_Rect* rect);
+typedef struct SDL_DisplayMode {
+    SDL_DisplayID displayID;
+    Uint32 format;
+    int w, h;
+    float pixel_density;
+    float refresh_rate;
+    int refresh_rate_numerator, refresh_rate_denominator;
+    void* internal;
+} SDL_DisplayMode;
+const SDL_DisplayMode* SDL_GetDesktopDisplayMode(SDL_DisplayID displayID);
+SDL_DisplayID SDL_GetDisplayForWindow(SDL_Window* window);
+float SDL_GetWindowPixelDensity(SDL_Window* window);
+bool SDL_SyncWindow(SDL_Window* window);
 
 // ── Cursors ──────────────────────────────────────────────────────────────
 typedef enum SDL_SystemCursor {
@@ -158,6 +186,8 @@ typedef enum SDL_SystemCursor {
 SDL_Cursor* SDL_CreateSystemCursor(SDL_SystemCursor id);
 bool SDL_SetCursor(SDL_Cursor* cursor);
 void SDL_DestroyCursor(SDL_Cursor* cursor);
+bool SDL_HideCursor(void);
+bool SDL_ShowCursor(void);
 
 // ── Renderer ─────────────────────────────────────────────────────────────
 SDL_Renderer* SDL_CreateRenderer(SDL_Window* window, const char* name);
@@ -175,6 +205,16 @@ bool SDL_RenderTexture(SDL_Renderer* renderer, SDL_Texture* texture,
                         const SDL_FRect* srcrect, const SDL_FRect* dstrect);
 bool SDL_SetRenderClipRect(SDL_Renderer* renderer, const SDL_Rect* rect);
 bool SDL_SetRenderViewport(SDL_Renderer* renderer, const SDL_Rect* rect);
+bool SDL_GetRenderOutputSize(SDL_Renderer* renderer, int* w, int* h);
+
+typedef struct SDL_Vertex {
+    SDL_FPoint position;
+    SDL_FColor color;
+    SDL_FPoint tex_coord;
+} SDL_Vertex;
+bool SDL_RenderGeometry(SDL_Renderer* renderer, SDL_Texture* texture,
+                        const SDL_Vertex* vertices, int num_vertices,
+                        const int* indices, int num_indices);
 
 // ── Textures / surfaces ──────────────────────────────────────────────────
 SDL_Texture* SDL_CreateTextureFromSurface(SDL_Renderer* renderer, SDL_Surface* surface);
@@ -201,22 +241,61 @@ typedef Uint16 SDL_Keymod;
 SDL_Keymod SDL_GetModState(void);
 const char* SDL_GetKeyName(SDL_Keycode key);
 
+// ── Clipboard ────────────────────────────────────────────────────────────
+// Same signatures as real SDL3. SDL_GetClipboardText's result must be
+// released with SDL_free, exactly as with the real library.
+bool SDL_SetClipboardText(const char* text);
+char* SDL_GetClipboardText(void);
+bool SDL_HasClipboardText(void);
+void SDL_free(void* mem);
+char* SDL_strdup(const char* str);
+
+// ── File dialogs (SDL_dialog.h) ──────────────────────────────────────────
+typedef struct SDL_DialogFileFilter {
+    const char* name;
+    const char* pattern;
+} SDL_DialogFileFilter;
+typedef void (SDLCALL *SDL_DialogFileCallback)(void* userdata, const char* const* filelist, int filter);
+void SDL_ShowOpenFileDialog(SDL_DialogFileCallback callback, void* userdata, SDL_Window* window,
+                            const SDL_DialogFileFilter* filters, int nfilters,
+                            const char* default_location, bool allow_many);
+void SDL_ShowSaveFileDialog(SDL_DialogFileCallback callback, void* userdata, SDL_Window* window,
+                            const SDL_DialogFileFilter* filters, int nfilters,
+                            const char* default_location);
+void SDL_ShowOpenFolderDialog(SDL_DialogFileCallback callback, void* userdata, SDL_Window* window,
+                              const char* default_location, bool allow_many);
+
 // ── Events ───────────────────────────────────────────────────────────────
 typedef Uint32 SDL_EventType;
 #define SDL_EVENT_QUIT                     0x100u
+#define SDL_EVENT_WINDOW_FIRST             0x202u
 #define SDL_EVENT_WINDOW_SHOWN             0x202u
 #define SDL_EVENT_WINDOW_EXPOSED           0x205u
 #define SDL_EVENT_WINDOW_RESIZED           0x207u
+#define SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED 0x208u
 #define SDL_EVENT_WINDOW_RESTORED          0x20Bu
+#define SDL_EVENT_WINDOW_MOUSE_ENTER       0x20Cu
+#define SDL_EVENT_WINDOW_MOUSE_LEAVE       0x20Du
 #define SDL_EVENT_WINDOW_FOCUS_GAINED      0x20Fu
+#define SDL_EVENT_WINDOW_FOCUS_LOST        0x210u
 #define SDL_EVENT_WINDOW_CLOSE_REQUESTED   0x213u
+#define SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED 0x218u
+#define SDL_EVENT_WINDOW_LAST              0x21Fu
 #define SDL_EVENT_KEY_DOWN                 0x300u
 #define SDL_EVENT_KEY_UP                   0x301u
+#define SDL_EVENT_TEXT_EDITING             0x302u
 #define SDL_EVENT_TEXT_INPUT               0x303u
 #define SDL_EVENT_MOUSE_MOTION             0x400u
 #define SDL_EVENT_MOUSE_BUTTON_DOWN        0x401u
 #define SDL_EVENT_MOUSE_BUTTON_UP          0x402u
 #define SDL_EVENT_MOUSE_WHEEL              0x403u
+#define SDL_EVENT_DROP_FILE                0x1000u
+#define SDL_EVENT_DROP_TEXT                0x1001u
+#define SDL_EVENT_DROP_BEGIN               0x1002u
+#define SDL_EVENT_DROP_COMPLETE            0x1003u
+#define SDL_EVENT_DROP_POSITION            0x1004u
+#define SDL_EVENT_USER                     0x8000u
+#define SDL_EVENT_LAST                     0xFFFFu
 
 typedef struct SDL_CommonEvent {
     Uint32 type;
@@ -254,6 +333,36 @@ typedef struct SDL_TextInputEvent {
     Uint32 windowID;
     const char* text;
 } SDL_TextInputEvent;
+
+typedef struct SDL_TextEditingEvent {
+    Uint32 type;
+    Uint32 reserved;
+    Uint64 timestamp;
+    Uint32 windowID;
+    const char* text;
+    Sint32 start;
+    Sint32 length;
+} SDL_TextEditingEvent;
+
+typedef struct SDL_DropEvent {
+    Uint32 type;
+    Uint32 reserved;
+    Uint64 timestamp;
+    Uint32 windowID;
+    float x, y;
+    const char* source;
+    const char* data;
+} SDL_DropEvent;
+
+typedef struct SDL_UserEvent {
+    Uint32 type;
+    Uint32 reserved;
+    Uint64 timestamp;
+    Uint32 windowID;
+    Sint32 code;
+    void* data1;
+    void* data2;
+} SDL_UserEvent;
 
 typedef struct SDL_MouseMotionEvent {
     Uint32 type;
@@ -301,6 +410,9 @@ typedef union SDL_Event {
     SDL_WindowEvent window;
     SDL_KeyboardEvent key;
     SDL_TextInputEvent text;
+    SDL_TextEditingEvent edit;
+    SDL_DropEvent drop;
+    SDL_UserEvent user;
     SDL_MouseMotionEvent motion;
     SDL_MouseButtonEvent button;
     SDL_MouseWheelEvent wheel;
@@ -308,6 +420,10 @@ typedef union SDL_Event {
 } SDL_Event;
 
 bool SDL_PollEvent(SDL_Event* event);
+bool SDL_WaitEventTimeout(SDL_Event* event, Sint32 timeoutMS);
+bool SDL_PushEvent(SDL_Event* event);
+Uint32 SDL_RegisterEvents(int numevents);
+bool SDL_ConvertEventToRenderCoordinates(SDL_Renderer* renderer, SDL_Event* event);
 
 #ifdef __cplusplus
 }

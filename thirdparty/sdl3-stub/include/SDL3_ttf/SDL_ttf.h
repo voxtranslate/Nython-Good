@@ -35,6 +35,11 @@ SDL_Surface* TTF_RenderText_Blended(TTF_Font* font, const char* text, size_t tex
 bool TTF_GetStringSize(TTF_Font* font, const char* text, size_t text_len,
                         int* w, int* h);
 
+int TTF_GetFontHeight(const TTF_Font* font);
+int TTF_GetFontAscent(const TTF_Font* font);
+int TTF_GetFontDescent(const TTF_Font* font);
+int TTF_GetFontLineSkip(const TTF_Font* font);
+
 #ifdef __cplusplus
 }
 #endif

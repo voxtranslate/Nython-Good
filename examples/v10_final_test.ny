@@ -15,7 +15,7 @@ class Managed:
     def __enter__(self):
         self.state = "open"
         return self
-    def __exit__(self):
+    def __exit__(self, exc_type=none, exc_value=none, tb=none):
         self.state = "closed"
 var m = Managed("res")
 with m as r:
@@ -96,7 +96,7 @@ function fdiv(a, b) { return a / b }
 def fsub(a, b): return a - b
 t("fn", fadd(3, 4), 7)
 t("func", fmul(3, 4), 12)
-t("function", fdiv(10, 2), 5)
+t("function", fdiv(10, 2), 5.0)
 t("def", fsub(10, 3), 7)
 
 print ""

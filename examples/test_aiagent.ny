@@ -45,9 +45,9 @@ assert_eq("size after forget", store.size(), 1)
 var results = store.search("Nython")
 assert_true("search finds", len(results) > 0)
 
-section("KnowledgeBase")
-var kb = KnowledgeBase("/tmp/test_nyx_kb")
-assert_eq("type", type(kb), "KnowledgeBase")
+section("CodeKnowledgeBase")
+var kb = CodeKnowledgeBase("/tmp/test_nyx_kb")
+assert_eq("type", type(kb), "CodeKnowledgeBase")
 kb.add_document("intro", "Nython is a modern programming language.", "manual")
 kb.add_document("features", "Nython supports OOP and functional programming.", "manual")
 assert_eq("doc count", kb.doc_count, 2)
@@ -69,7 +69,7 @@ assert_true("line count", lines_found > 0)
 section("CodeGenerator")
 var gen = CodeGenerator()
 assert_eq("type", type(gen), "CodeGenerator")
-var template = gen.class_template("Animal", "name, sound")
+var template = gen.class_template("Animal", ["name", "sound"], [])
 assert_true("has class", string_contains(template, "class Animal"))
 
 section("DocumentLearner")
@@ -80,7 +80,7 @@ print "  DocumentLearner OK"
 
 section("OnlineLearner")
 var ol = OnlineLearner(kb)
-ol.learn_from_conversation("user", "I love Nython!")
+ol.learn_from_conversation("user", "I love Nython!", 0.6)
 passed = passed + 1
 print "  OnlineLearner OK"
 

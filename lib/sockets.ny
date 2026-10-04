@@ -294,7 +294,7 @@ class Connection:
         self.open()
         return self
 
-    def __exit__(self):
+    def __exit__(self, exc_type=none, exc_value=none, tb=none):
         self.close()
 
 # ─── Socket Selector (select/poll wrapper) ────────────────────────────────────
@@ -369,19 +369,19 @@ class AddressBook:
         self.entries[name] = entry
 
     def get_host(self, name):
-        var e = self.entries[name]
+        var e = self.entries.get(name)
         if e == none:
             return ""
         return e["host"]
 
     def get_port(self, name):
-        var e = self.entries[name]
+        var e = self.entries.get(name)
         if e == none:
             return 0
         return e["port"]
 
     def connect(self, name):
-        var e = self.entries[name]
+        var e = self.entries.get(name)
         if e == none:
             return none
         var conn = Connection(e["host"], e["port"])

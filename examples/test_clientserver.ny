@@ -63,7 +63,7 @@ assert_eq("cli host", rpc_cli.host, "127.0.0.1")
 
 # ─── PubSubBroker / PubSubClient ─────────────────────────────────────────────
 section("PubSubBroker")
-var broker = PubSubBroker()
+var broker = PubSubBroker("127.0.0.1", 9140)
 assert_eq("broker type", type(broker), "PubSubBroker")
 
 section("PubSubClient")

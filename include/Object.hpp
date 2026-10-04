@@ -20,6 +20,11 @@ public:
 
     Object(Runnable* runner, const std::string& name = "unnamed object", Type type = Type::OBJECT, Value klass = NONE_VALUE, uint32_t initial_capacity = 4);
 
+    // Lists, dicts, tuples and sets can hold references: tracked from birth
+    // by the cycle collector (NyGC.hpp).
+    void gc_traverse(nython::gc::GcVisitFn visit, void* arg) override;
+    void gc_clear() override;
+
     virtual bool is(Type type);
     virtual std::string toString();
     /**

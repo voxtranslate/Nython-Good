@@ -1,0 +1,8 @@
+build/
+build-asan/
+ny_test
+__pycache__/
+*.pyc
+.nyide
+build-sdl/
+build-*/

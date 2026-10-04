@@ -4,6 +4,7 @@
 #include "Object.hpp"
 #include "Container.hpp"
 #include "Collectable.hpp"
+#include "NyGC.hpp"
 #include <utility>
 #include <functional>
 // ^ explicit: libstdc++ supplies these transitively, MinGW does not.
@@ -21,7 +22,47 @@ Container::Container(Runnable* runner, Type type, uint32_t initial_capacity): Co
     this->container->reserve(initial_capacity);
 }
 
+Container::Container(const Container& o) : Collectable(o), location{o.location} {
+    this->container = o.container ? new ContainerType(*o.container) : nullptr;
+}
+
+Container& Container::operator=(const Container& o) {
+    if (this != &o) {
+        Collectable::operator=(o);
+        location = o.location;
+        ContainerType* fresh = o.container ? new ContainerType(*o.container) : nullptr;
+        ContainerType* old = this->container;
+        this->container = fresh;
+        delete old;
+    }
+    return *this;
+}
+
+// The map is this object's: its values are released with it (they are
+// counted references). It used to be leaked on purpose, because nothing
+// ever freed a container and a shallow copy could have shared the map.
 Container::~Container() {
+    ContainerType* m = this->container;
+    this->container = nullptr;
+    delete m;
+}
+
+void Container::gc_traverse(nython::gc::GcVisitFn visit, void* arg) {
+    if (!this->container) return;
+    for (auto& kv : *this->container) {
+        if (kv.second.value.o) visit(kv.second.value.o, arg);
+        // A full collection's reachability pass: the objects this dict's
+        // keys name are reached through it (NyGC.hpp, KeyTable).
+        if (nygc::g_key_edges) nygc::visit_key_objects(kv.first, visit, arg);
+    }
+}
+
+void Container::gc_clear() {
+    if (!this->container) return;
+    // Swap the entries out first: releasing them can run destructors that
+    // look at this (now empty, still valid) map.
+    ContainerType dead;
+    dead.swap(*this->container);
 }
 
 std::string Container::toString() {

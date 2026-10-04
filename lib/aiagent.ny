@@ -105,7 +105,7 @@ class MemoryStore:
 
     def store(self, key, value, source, confidence):
         var cell = MemoryCell(key, value, source, confidence)
-        var existing = self.cells[key]
+        var existing = self.cells.get(key)
         if existing == none:
             self.cell_count = self.cell_count + 1
         self.cells[key] = cell
@@ -113,7 +113,7 @@ class MemoryStore:
         return cell
 
     def recall(self, key):
-        var cell = self.cells[key]
+        var cell = self.cells.get(key)
         if cell == none:
             return none
         cell.touch()
@@ -185,7 +185,7 @@ class MemoryStore:
 
 # ─── Knowledge Base ──────────────────────────────────────────────────────────
 
-class KnowledgeBase:
+class CodeKnowledgeBase:
     def __init__(self, store_path):
         self.memory = MemoryStore(store_path)
         self.index = {}
@@ -734,7 +734,7 @@ class NyxAI:
 
         var kb_path = os_path_join(workspace, "nyx_memory.json")
         os_mkdir(workspace)
-        self.kb = KnowledgeBase(kb_path)
+        self.kb = CodeKnowledgeBase(kb_path)
         self.analyzer = CodeAnalyzer()
         self.generator = CodeGenerator()
         self.files = FileAssistant(workspace)

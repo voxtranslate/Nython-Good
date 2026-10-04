@@ -78,7 +78,7 @@ class Headers:
         self.data[lower] = value
 
     def get(self, name):
-        var v = self.data[string_lower(name)]
+        var v = self.data.get(string_lower(name))
         if v == none:
             return ""
         return v
@@ -282,7 +282,7 @@ class DNS:
         self.cache = {}
 
     def resolve(self, hostname):
-        var cached = self.cache[hostname]
+        var cached = self.cache.get(hostname)
         if cached != none:
             return cached
         var ip = dns_resolve(hostname)
@@ -411,7 +411,7 @@ class MimeTypes:
         self.types[".ts"]   = "application/typescript"
 
     def get(self, ext):
-        var m = self.types[ext]
+        var m = self.types.get(ext)
         if m == none:
             return "application/octet-stream"
         return m
@@ -437,6 +437,7 @@ class EventSource:
         self.url = url
         self.handlers = {}
         self.running = false
+        self.connected = false
         self.reconnect_delay = 3.0
 
     def on(self, event_type, handler):
@@ -447,12 +448,14 @@ class EventSource:
 
     def connect(self):
         self.running = true
+        self.connected = true
 
     def disconnect(self):
         self.running = false
+        self.connected = false
 
     def _dispatch(self, event_type, data):
-        var h = self.handlers[event_type]
+        var h = self.handlers.get(event_type)
         if h != none:
             h(data)
 
@@ -564,7 +567,7 @@ class HttpCache:
         self.max_entries = 1000
 
     def get(self, url):
-        var entry = self.entries[url]
+        var entry = self.entries.get(url)
         if entry == none:
             self.miss_count = self.miss_count + 1
             return none
@@ -578,7 +581,7 @@ class HttpCache:
         return entry.response
 
     def set(self, url, response, ttl):
-        var existing = self.entries[url]
+        var existing = self.entries.get(url)
         if existing == none and self.entry_count >= self.max_entries:
             return
         if existing == none:
@@ -589,7 +592,7 @@ class HttpCache:
         self.set(url, response, self.default_ttl)
 
     def invalidate(self, url):
-        if self.entries[url] != none:
+        if self.entries.get(url) != none:
             self.entries[url] = none
             self.entry_count = self.entry_count - 1
 

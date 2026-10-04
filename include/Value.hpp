@@ -40,6 +40,14 @@ namespace nython{
 namespace gc {
 class Collectable;
 }
+}
+// Reference counting (defined in Collectable.hpp, which can be included
+// after this file through Runnable.hpp).
+namespace nygc {
+inline void incref(nython::gc::Collectable* c);
+inline void decref(nython::gc::Collectable* c);
+}
+namespace nython{
 
 using gc::Collectable;
 
@@ -68,6 +76,12 @@ typedef struct TValue {
 	bool b = false;             /* boolean */
 	bigint i{};                 /* integer numbers */
 	long double d = 0.0L;       /* float numbers */
+	// The heap object this value keeps alive (NyGC.hpp): the Collectable
+	// itself for a COLLECTABLE value, the object that owns the payload `p`
+	// points into for a string, function, bound method or instance, and
+	// nullptr for everything that is not reference counted (numbers, AST
+	// classes, builtins). Every copy counts a reference.
+	Collectable* o = nullptr;
 
 	TValue() = default;
 
@@ -82,14 +96,45 @@ typedef struct TValue {
 	explicit TValue(double d_) : d{static_cast<long double>(d_)} {}
 	explicit TValue(long double d_) : d{d_} {}
 	explicit TValue(void* p_) : p{p_} {}
-	explicit TValue(Collectable* gc_) : gc{gc_} {}
+	explicit TValue(Collectable* gc_) : gc{gc_}, o{gc_} { if (o) nygc::incref(o); }
 
-	TValue(const TValue& that) = default;
-	TValue(TValue&& that) noexcept = default;
-	~TValue() = default;
+	TValue(const TValue& that) : gc{that.gc}, p{that.p}, b{that.b}, i{that.i}, d{that.d}, o{that.o} {
+		if (o) nygc::incref(o);
+	}
+	TValue(TValue&& that) noexcept : gc{that.gc}, p{that.p}, b{that.b}, i{std::move(that.i)}, d{that.d}, o{that.o} {
+		that.o = nullptr;
+	}
+	~TValue() { if (o) nygc::decref(o); }
 
-	TValue& operator=(const TValue& that) = default;
-	TValue& operator=(TValue&& that) noexcept = default;
+	// The new reference is taken before the old one is dropped, and every
+	// field is read from `that` first: dropping the old reference can free
+	// the object `that` lives in.
+	TValue& operator=(const TValue& that) {
+		if (this != &that) {
+			Collectable* old = o;
+			gc = that.gc; p = that.p; b = that.b; i = that.i; d = that.d; o = that.o;
+			if (o) nygc::incref(o);
+			if (old) nygc::decref(old);
+		}
+		return *this;
+	}
+	TValue& operator=(TValue&& that) noexcept {
+		if (this != &that) {
+			Collectable* old = o;
+			gc = that.gc; p = that.p; b = that.b; i = std::move(that.i); d = that.d; o = that.o;
+			that.o = nullptr;
+			if (old) nygc::decref(old);
+		}
+		return *this;
+	}
+	// Make `c` the owner (a counted reference), releasing the previous one.
+	void own(Collectable* c) {
+		if (c) nygc::incref(c);
+		Collectable* old = o;
+		o = c;
+		if (old) nygc::decref(old);
+	}
+	void release() { Collectable* old = o; o = nullptr; if (old) nygc::decref(old); }
 
 } TValue;
 
@@ -137,13 +182,15 @@ struct Value {
 	Value(const Value& that);
 	~Value();
 
+	// `value` is assigned last: releasing the old reference can free the
+	// object `that` is stored in (x = x.next through a container slot).
 	Value& operator=(const Value& that) {
 		if (this != &that) {
 			type   = that.type;
-			value  = that.value;
 			access = that.access;
 			kind   = that.kind;
 			token  = that.token;
+			value  = that.value;
 		}
 		return *this;
 	}
@@ -157,10 +204,10 @@ struct Value {
 	Value& operator=(Value&& that) noexcept {
 		if (this != &that) {
 			type   = that.type;
-			value  = std::move(that.value);
 			access = that.access;
 			kind   = that.kind;
 			token  = std::move(that.token);
+			value  = std::move(that.value);
 		}
 		return *this;
 	}

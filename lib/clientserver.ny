@@ -51,7 +51,7 @@ class MessageBus:
         self.hist_count = 0
 
     def subscribe(self, topic, handler):
-        var count = self.sub_counts[topic]
+        var count = self.sub_counts.get(topic)
         if count == none:
             var count = 0
         self.subscribers[topic + "_" + str(count)] = handler
@@ -59,12 +59,12 @@ class MessageBus:
 
     def publish(self, msg):
         var topic = msg.topic
-        var count = self.sub_counts[topic]
+        var count = self.sub_counts.get(topic)
         if count == none:
             return
         var i = 0
         while i < count:
-            var h = self.subscribers[topic + "_" + str(i)]
+            var h = self.subscribers.get(topic + "_" + str(i))
             if h != none:
                 h(msg)
             i = i + 1
@@ -79,8 +79,15 @@ class MessageBus:
     def unsubscribe(self, topic):
         self.sub_counts[topic] = 0
 
-    def get_history(self):
-        return self.history
+    # Every published message kept, or only those of `topic`.
+    def get_history(self, topic=none):
+        if topic == none:
+            return self.history
+        var out = []
+        for m in self.history:
+            if m.topic == topic:
+                out.append(m)
+        return out
 
 # ─── RPC Framework ───────────────────────────────────────────────────────────
 
@@ -108,7 +115,7 @@ class RpcServer:
             resp["error"] = "invalid request"
         else:
             var method = req["method"]
-            var fn = self.methods[method]
+            var fn = self.methods.get(method)
             if fn == none:
                 resp["error"] = "method not found: " + str(method)
             else:
@@ -166,7 +173,7 @@ class RpcClient:
         var resp = json_decode(resp_raw)
         if resp == none:
             return none
-        var err = resp["error"]
+        var err = resp.get("error")
         if err != none:
             print "RPC Error: " + str(err)
             return none
@@ -189,19 +196,19 @@ class PubSubBroker:
 
     def _subscribe(self, fd, topic):
         var cid = self._get_client_id(fd)
-        var count = self.topic_counts[topic]
+        var count = self.topic_counts.get(topic)
         if count == none:
             var count = 0
         self.topics[topic + "_" + str(count)] = fd
         self.topic_counts[topic] = count + 1
 
     def _publish(self, topic, msg):
-        var count = self.topic_counts[topic]
+        var count = self.topic_counts.get(topic)
         if count == none:
             return
         var i = 0
         while i < count:
-            var fd = self.topics[topic + "_" + str(i)]
+            var fd = self.topics.get(topic + "_" + str(i))
             if fd != none and fd >= 0:
                 tcp_send(fd, msg + "\n")
             i = i + 1
@@ -270,7 +277,7 @@ class PubSubClient:
             if sp >= 0:
                 var topic = line[0:sp]
                 var msg = line[sp + 1:]
-                var h = self._handlers[topic]
+                var h = self._handlers.get(topic)
                 if h != none:
                     h(msg)
 
@@ -299,7 +306,7 @@ class ChatRoom:
         self.broadcast("SYSTEM", user_id + " joined")
 
     def is_member(self, user_id):
-        var v = self.members[user_id]
+        var v = self.members.get(user_id)
         return v != none
 
     def leave(self, user_id):
@@ -336,7 +343,7 @@ class ChatServer:
         self.running = false
 
     def get_or_create_room(self, name):
-        var r = self.rooms[name]
+        var r = self.rooms.get(name)
         if r == none:
             var r = ChatRoom(name)
             self.rooms[name] = r
@@ -735,7 +742,7 @@ class ServiceRegistry:
         return svc.id
 
     def deregister(self, service_id):
-        var svc = self.services[service_id]
+        var svc = self.services.get(service_id)
         if svc != none:
             self.services[service_id] = none
             var kept = []
@@ -748,7 +755,7 @@ class ServiceRegistry:
             self.instance_count = len(kept)
 
     def heartbeat(self, service_id):
-        var svc = self.services[service_id]
+        var svc = self.services.get(service_id)
         if svc != none:
             svc.last_heartbeat = time_now()
             svc.healthy = true
@@ -784,7 +791,7 @@ class ServiceRegistry:
         var i = 0
         while i < self.instance_count:
             var n = self.instances[i].name
-            if seen[n] == none:
+            if seen.get(n) == none:
                 seen[n] = true
                 names.append(n)
             i = i + 1
@@ -836,7 +843,7 @@ class EventLog:
             self.entry_count = self.entry_count - 1
         self.entries.append(entry)
         self.entry_count = self.entry_count + 1
-        var count = self.level_counts[level]
+        var count = self.level_counts.get(level)
         if count == none:
             var count = 0
         self.level_counts[level] = count + 1

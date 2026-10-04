@@ -1,5 +1,6 @@
 #ifndef _WIN32
 #include <sys/resource.h>
+#include <unistd.h>
 #endif
 // main.cpp
 // ─────────────────────────────────────────────────────────────────────────────
@@ -18,6 +19,7 @@
 #include "ConsoleManager.hpp"
 #include <algorithm>
 #include <sstream>
+#include <fstream>
 // ^ explicit: libstdc++ supplies these transitively, MinGW does not.
 
 using namespace std;
@@ -85,11 +87,31 @@ static void report_compiler_error(const std::string& kind,
         while (n < loc.row && std::getline(in, line)) n++;
         if (n == loc.row) {
             std::cerr << "  " << line << "\n  ";
-            for (uint32_t i = 1; i < loc.column && i < line.size() + 1; ++i)
-                std::cerr << (line[i-1] == '\t' ? '\t' : ' ');
+            // loc.column counts characters (a UTF-8 sequence is one).
+            uint32_t col = 1;
+            for (size_t i = 0; i < line.size() && col < loc.column; ++i) {
+                unsigned char c = static_cast<unsigned char>(line[i]);
+                if ((c & 0xC0) == 0x80) continue;
+                std::cerr << (c == '\t' ? '\t' : ' ');
+                col++;
+            }
             std::cerr << "^\n";
         }
     }
+}
+
+// --trace <out.jsonl>: record every statement executed in the user's files
+// (see NythonExecutor::traceStatement). Used by the IDE's debugger.
+static std::string g_trace_path;
+
+// Where an uncaught runtime error happened. Most runtime errors carried no
+// location at all ("ValueError: bad thing"), so the Problems panel could not
+// point at a line; the executor now remembers the statement it was running.
+static void report_uncaught_where(const std::string& msg) {
+    NythonExecutor::traceException(msg);
+    if (msg.find(" at line ") != std::string::npos) return;
+    std::string where = NythonExecutor::last_stmt_where();
+    if (!where.empty()) std::cerr << "  at " << where << "\n";
 }
 
 int run_file(const std::string& filename, bool show_ast = false) {
@@ -98,6 +120,13 @@ int run_file(const std::string& filename, bool show_ast = false) {
         std::cerr << "[Nython] No such file: " << filename << "\n";
         return 2;
     }
+    // Closes a --trace recording on the way out. Declared outside the try:
+    // inside it, the unwinding exception closed the file before the catch
+    // below could record that exception in it.
+    struct TraceCloser { ~TraceCloser() {
+        auto& T = NythonExecutor::tracer();
+        if (T.f) { fclose(T.f); T.f = nullptr; }
+    } } trace_closer;
     try {
         auto source = SourceCode(filename);
         auto reporter = std::make_shared<Reporter>(source);
@@ -114,7 +143,45 @@ int run_file(const std::string& filename, bool show_ast = false) {
 
 
         NythonExecutor exec((Runnable*)vm_ptr.get());
+        // Wait for non-daemon threads before the executor is torn down, also
+        // when the main program ends with an uncaught exception (round 74).
+        struct JoinThreadsAtExit { ~JoinThreadsAtExit() { nyconc::join_nondaemon_at_exit(); } } join_threads_at_exit;
+        if (!g_trace_path.empty()) {
+            auto& T = NythonExecutor::tracer();
+            T.f = fopen(g_trace_path.c_str(), "w");
+            if (!T.f) { std::cerr << "[Nython] cannot write trace file " << g_trace_path << "\n"; return 2; }
+            T.main_file = filename;
+            auto cut = filename.find_last_of("/\\");
+            T.main_dir = cut == std::string::npos ? std::string() : filename.substr(0, cut + 1);
+            if (ast) exec.collectTopLevelNames(ast, T.globals);
+            // Module-level variables worth showing are the ones the user's own
+            // file mentions (loop variables included), not the hundreds of
+            // names an import defines.
+            {
+                std::ifstream in(filename);
+                std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                size_t i = 0;
+                while (i < src.size()) {
+                    unsigned char c = (unsigned char)src[i];
+                    if (isalpha(c) || c == '_') {
+                        size_t j = i;
+                        while (j < src.size() && (isalnum((unsigned char)src[j]) || src[j] == '_')) j++;
+                        T.globals.insert(src.substr(i, j - i));
+                        i = j;
+                    } else i++;
+                }
+            }
+            if (const char* mx = getenv("NY_TRACE_MAX")) {
+                long v = atol(mx);
+                if (v > 0) T.max_events = v;
+            }
+        }
         exec.execute(ast);
+        // Generators the program left suspended are closed now, oldest
+        // first, so their finally blocks and __exit__ run (as when CPython
+        // shuts down).
+        nygen::close_all(exec);
+        nygen::shutdown();
         // --profile: emit measured per-function counts and timings after the
         // program finishes. Delimited so a caller can separate the report from
         // the program's own stdout.
@@ -136,11 +203,17 @@ int run_file(const std::string& filename, bool show_ast = false) {
             if (colon != std::string::npos)
                 msg = msg.substr(0, colon) + ": " + msg.substr(colon + 1);
         }
-        std::cerr << "[Nython] Uncaught exception — " << msg << "\n"; return 1;
+        std::cerr << "[Nython] Uncaught exception — " << msg << "\n";
+        report_uncaught_where(msg);
+        return 1;
     } catch (std::runtime_error& e) {
-        std::cerr << "runtime error: " << e.what() << "\n"; return 1;
+        std::cerr << "runtime error: " << e.what() << "\n";
+        report_uncaught_where(e.what());
+        return 1;
     } catch (std::exception& e) {
-        std::cerr << "error: " << e.what() << "\n"; return 1;
+        std::cerr << "error: " << e.what() << "\n";
+        report_uncaught_where(e.what());
+        return 1;
     }
     return 0;
 }
@@ -175,6 +248,38 @@ static std::string get_binary_dir(const char* argv0) {
     else if (slash != std::string::npos) sep = slash;
     else if (bslash != std::string::npos) sep = bslash;
     return (sep != std::string::npos) ? p.substr(0, sep) : ".";
+}
+
+// Absolute path of the running executable. argv[0] is only a name when the
+// binary was started through PATH, which made get_binary_dir() return ".".
+static std::string g_argv0;
+[[maybe_unused]] static std::string get_exe_path() {
+#ifdef _WIN32
+    wchar_t wpath[4096] = {};
+    if (GetModuleFileNameW(nullptr, wpath, 4095) > 0) {
+        char path[4096] = {};
+        WideCharToMultiByte(CP_UTF8, 0, wpath, -1, path, sizeof(path)-1, nullptr, nullptr);
+        return path;
+    }
+    return g_argv0;
+#else
+    char buf[4096];
+    ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n > 0) { buf[n] = 0; return buf; }
+    char rp[4096];
+    if (!g_argv0.empty() && realpath(g_argv0.c_str(), rp)) return rp;
+    return g_argv0;
+#endif
+}
+
+[[maybe_unused]] static void set_env_default(const char* key, const std::string& val) {
+    const char* cur = getenv(key);
+    if (cur && *cur) return;       // an explicit setting always wins
+#ifdef _WIN32
+    _putenv_s(key, val.c_str());
+#else
+    setenv(key, val.c_str(), 0);
+#endif
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -218,6 +323,21 @@ static bool launch_ide(const std::string& binary_dir) {
 #endif
         return false;
     }
+    // Tell the IDE where it lives and which binary is running it. Its assets
+    // (assets/fonts/codicon.ttf) and the interpreter it runs programs with
+    // were both looked up relative to the working directory, so opening the
+    // IDE anywhere but its own folder lost every icon and could not Run.
+    {
+        std::string home = ide_path;
+#ifndef _WIN32
+        char rp[4096];
+        if (realpath(ide_path.c_str(), rp)) home = rp;
+#endif
+        auto cut = home.find_last_of("/\\");
+        home = (cut == std::string::npos) ? std::string(".") : home.substr(0, cut);
+        set_env_default("NYTHON_HOME", home);
+        set_env_default("NYTHON_EXE", get_exe_path());
+    }
     try {
         auto source = SourceCode(ide_path);
         auto reporter = std::make_shared<Reporter>(source);
@@ -241,12 +361,51 @@ static bool launch_ide(const std::string& binary_dir) {
         //
         // run_file() already uses NythonExecutor; the IDE must use it too.
         if (ast) {
+            // NY_PROFILE_OUT=<file>: profile the IDE itself (time and, per
+            // function, the objects and strings it allocates - which on the
+            // interpreter is what it keeps), written when the IDE exits.
+            const char* prof_out = getenv("NY_PROFILE_OUT");
+            if (prof_out && *prof_out) NythonExecutor::profiling_enabled() = true;
             NythonExecutor exec((Runnable*)vm2.get());
             exec.execute(ast);
+            if (prof_out && *prof_out) {
+                std::ofstream pf(prof_out);
+                pf << exec.profile_report();
+            }
         }
         return true;
+    } catch (exception::UnexpectedCharError& e) {
+        // A syntax error in the IDE's own source, or in a module it imports,
+        // located like any other; this used to reach std::terminate.
+        report_compiler_error("error", e.location(), e.message());
+        std::cerr << "[IDE Error] the IDE could not be loaded\n";
+        return false;
+    } catch (exception::SyntaxError& e) {
+        report_compiler_error("syntax error", e.location(), e.message());
+        std::cerr << "[IDE Error] the IDE could not be loaded\n";
+        return false;
     } catch (std::exception& e) {
         std::string msg = std::string("[IDE Error] ") + e.what();
+#ifdef _WIN32
+        MessageBoxA(nullptr, msg.c_str(), "NythonIDE — Runtime Error", MB_OK | MB_ICONERROR);
+#else
+        std::cerr << msg << "\n";
+#endif
+        return false;
+    } catch (std::string& s) {
+        // Nython raises uncaught exceptions as tagged std::string (run_file()
+        // already handles this). Only std::exception was caught here, so any
+        // uncaught error while the IDE started - an ImportError from launching
+        // outside the repository, say - killed the process via std::terminate
+        // with no message at all.
+        std::string msg = s;
+        if (msg.rfind("__exc__:", 0) == 0) {
+            msg = msg.substr(8);
+            auto colon = msg.find(':');
+            if (colon != std::string::npos)
+                msg = msg.substr(0, colon) + ": " + msg.substr(colon + 1);
+        }
+        msg = "[IDE Error] " + msg;
 #ifdef _WIN32
         MessageBoxA(nullptr, msg.c_str(), "NythonIDE — Runtime Error", MB_OK | MB_ICONERROR);
 #else
@@ -420,64 +579,183 @@ namespace {
 
 using nython::vm::VMVal;
 using nython::vm::VMType;
+using nython::vm::VMMap;
 
-VMVal value_to_vm(const Value& v, NythonExecutor& exec);
+// One bridged call's conversions. Each VM list/map/instance argument becomes
+// one interpreter container (shared parts stay shared, a cycle stays a cycle),
+// and a container coming back that started as a VM value converts back to
+// that same VM object - so a builtin that returns (part of) its argument
+// hands back the caller's object, not a copy. After the call, every VM
+// container whose interpreter copy the builtin changed is updated in place:
+// a builtin that mutates its argument (shuffle, heappush, dict updates, ...)
+// mutated a copy before, and the caller never saw it.
+struct BridgeConv {
+    NythonExecutor& exec;
+    std::unordered_map<const void*, Value> to_interp;   // VM list/map ptr -> container
+    std::vector<std::pair<Container*, VMVal>> origin;   // container -> VM original
+    std::unordered_map<const Container*, size_t> origin_of;
+    explicit BridgeConv(NythonExecutor& e) : exec(e) {}
 
-Value vm_to_value(const VMVal& v, NythonExecutor& exec) {
-    switch (v.type) {
-        case VMType::NONE:   return NONE_VALUE;
-        case VMType::BOOL:   return Value(v.b);
-        case VMType::INT:    return Value((int64_t)v.i);
-        case VMType::FLOAT:  return Value(v.d);
-        case VMType::STRING: return exec.makeStringValue(v.s);
-        case VMType::LIST: {
-            auto* lst = new Object((Runnable*)exec.runner, "list", Type::LIST);
-            int n = 0;
-            if (v.list) for (auto& e : *v.list) lst->set(std::to_string(n++), vm_to_value(e, exec));
-            lst->set("__len__", Value(n));
-            return Value(static_cast<Collectable*>(lst));
-        }
-        case VMType::MAP: {
-            auto* mp = new Object((Runnable*)exec.runner, "map", Type::MAP);
-            if (v.map) for (auto& kv : *v.map) mp->set(kv.first, vm_to_value(kv.second, exec));
-            return Value(static_cast<Collectable*>(mp));
-        }
-        default: return NONE_VALUE;
+    static const void* key_of(const VMVal& v) {
+        if (v.type == VMType::LIST) return v.list.get();
+        if (v.type == VMType::MAP || v.type == VMType::INSTANCE) return v.map.get();
+        return nullptr;
     }
-}
 
-VMVal value_to_vm(const Value& v, NythonExecutor& exec) {
-    if (exec.isStringValue(v)) return VMVal::make_str(exec.getStringValue(v));
-    switch (v.type) {
-        case ValueType::NONE:    return VMVal::make_none();
-        case ValueType::BOOLEAN: return VMVal::make_bool(v.value.b);
-        case ValueType::INTEGER: return VMVal::make_int(bigint_to_i64(v.value.i));
-        case ValueType::DOUBLE:  return VMVal::make_float((double)v.value.d);
-        default: break;
-    }
-    // Containers: a list carries "__len__" and numeric keys, a map does not.
-    // The collectable lives in Value::value.gc, not value.p — reading the wrong
-    // union member made every container convert to none, so bridged builtins
-    // that return a list or map (os_listdir, fs_stat, ...) came back empty.
-    auto* c = dynamic_cast<Container*>(as_collectable(v));
-    if (c && c->container) {
-        auto len_it = c->container->find("__len__");
-        if (len_it != c->container->end()) {
-            std::vector<VMVal> out;
-            int n = (int)bigint_to_i64(len_it->second.value.i);
-            for (int i = 0; i < n; i++) {
-                auto it = c->container->find(std::to_string(i));
-                out.push_back(it == c->container->end() ? VMVal::make_none()
-                                                        : value_to_vm(it->second, exec));
+    Value to_value(const VMVal& v) {
+        switch (v.type) {
+            case VMType::NONE:   return NONE_VALUE;
+            case VMType::BOOL:   return Value(v.b);
+            case VMType::INT: {
+                if (!v.s.empty()) {
+                    nypy::BigInt b;
+                    if (nypy::BigInt::parse(v.s, 10, b)) return intValue(b);
+                }
+                return Value((int64_t)v.i);
             }
-            return VMVal::make_list(std::move(out));
+            case VMType::FLOAT:  return Value(v.d);
+            case VMType::STRING: return exec.makeStringValue(v.s);
+            case VMType::LIST:
+            case VMType::MAP:
+            case VMType::INSTANCE: {
+                const void* k = key_of(v);
+                if (!k) return NONE_VALUE;
+                auto hit = to_interp.find(k);
+                if (hit != to_interp.end()) return hit->second;
+                bool is_list = v.type == VMType::LIST;
+                auto* obj = new Object((Runnable*)exec.runner, is_list ? (v.b ? "tuple" : "list") : "map",
+                                       is_list ? Type::LIST : Type::MAP);
+                Value out(static_cast<Collectable*>(obj));
+                to_interp.emplace(k, out);
+                origin_of.emplace(obj, origin.size());
+                origin.emplace_back(obj, v);
+                if (is_list) {
+                    int64_t n = 0;
+                    for (auto& e : *v.list) (*obj->container)[std::to_string(n++)] = to_value(e);
+                    (*obj->container)["__len__"] = intValue(n);
+                    if (v.b) (*obj->container)["__tuple__"] = Value(1);
+                } else {
+                    // An instance crosses as a map of its attributes plus
+                    // "__class__" - enough for builtins that read fields (the
+                    // file functions take a file object's "handle").
+                    for (auto& kv : *v.map) (*obj->container)[kv.first] = to_value(kv.second);
+                    if (v.type == VMType::INSTANCE)
+                        (*obj->container)["__class__"] = exec.makeStringValue(v.class_name);
+                }
+                return out;
+            }
+            default: return NONE_VALUE;
         }
-        VMVal m = VMVal::make_map();
-        for (auto& kv : *c->container) (*m.map)[kv.first] = value_to_vm(kv.second, exec);
-        return m;
     }
-    return VMVal::make_none();
-}
+
+    // A fresh VM value for an interpreter value; containers that began as VM
+    // values come back as those same VM objects.
+    VMVal to_vm(const Value& v) {
+        if (exec.isStringValue(v)) return VMVal::make_str(exec.getStringValue(v));
+        switch (v.type) {
+            case ValueType::NONE:    return VMVal::make_none();
+            case ValueType::BOOLEAN: return VMVal::make_bool(v.value.b);
+            case ValueType::INTEGER: {
+                int64_t i;
+                if (bigint_fits_i64(v.value.i, i)) return VMVal::make_int(i);
+                return VMVal::make_bigint(bigint_to_nbig(v.value.i));
+            }
+            case ValueType::DOUBLE:  return VMVal::make_float((double)v.value.d);
+            default: break;
+        }
+        // The collectable lives in Value::value.gc, not value.p.
+        auto* c = dynamic_cast<Container*>(as_collectable(v));
+        if (!c || !c->container) return VMVal::make_none();
+        auto oit = origin_of.find(c);
+        if (oit != origin_of.end()) return origin[oit->second].second;
+        return build(c);
+    }
+
+    // Converts a container's contents, without consulting its own origin.
+    VMVal build(Container* c) {
+        auto& m = *c->container;
+        auto len_it = m.find("__len__");
+        if (len_it != m.end()) {
+            std::vector<VMVal> out;
+            int64_t n = bigint_to_i64(len_it->second.value.i);
+            out.reserve((size_t)std::max<int64_t>(n, 0));
+            for (int64_t i = 0; i < n; i++) {
+                auto it = m.find(std::to_string(i));
+                out.push_back(it == m.end() ? VMVal::make_none() : to_vm(it->second));
+            }
+            return m.count("__tuple__") ? VMVal::make_tuple(std::move(out)) : VMVal::make_list(std::move(out));
+        }
+        VMVal r = VMVal::make_map();
+        for (auto& kv : m) (*r.map)[kv.first] = to_vm(kv.second);
+        return r;
+    }
+
+    // True when the interpreter value still is what the VM value was.
+    bool same(const Value& a, const VMVal& b) {
+        if (exec.isStringValue(a)) return b.type == VMType::STRING && exec.getStringValue(a) == b.s;
+        switch (a.type) {
+            case ValueType::NONE:    return b.type == VMType::NONE;
+            case ValueType::BOOLEAN: return b.type == VMType::BOOL && b.b == a.value.b;
+            case ValueType::INTEGER: {
+                if (b.type != VMType::INT) return false;
+                int64_t i;
+                if (bigint_fits_i64(a.value.i, i)) return b.s.empty() && b.i == i;
+                return !b.s.empty() && bigint_to_nbig(a.value.i).to_string() == b.s;
+            }
+            case ValueType::DOUBLE:  return b.type == VMType::FLOAT && (b.d == (double)a.value.d || (b.d != b.d && a.value.d != a.value.d));
+            default: break;
+        }
+        auto* c = dynamic_cast<Container*>(as_collectable(a));
+        if (!c) return b.type == VMType::NONE;
+        auto oit = origin_of.find(c);
+        return oit != origin_of.end() && key_of(origin[oit->second].second) == key_of(b);
+    }
+
+    // Writes back every VM container whose interpreter copy was changed.
+    void copy_back() {
+        for (size_t oi = 0; oi < origin.size(); oi++) {
+            Container* c = origin[oi].first;
+            VMVal vm = origin[oi].second;   // shares the list/map
+            auto& m = *c->container;
+            if (vm.type == VMType::LIST) {
+                if (vm.b) continue;          // tuples are immutable
+                auto len_it = m.find("__len__");
+                if (len_it == m.end()) continue;
+                int64_t n = bigint_to_i64(len_it->second.value.i);
+                bool changed = n != (int64_t)vm.list->size();
+                for (int64_t i = 0; !changed && i < n; i++) {
+                    auto it = m.find(std::to_string(i));
+                    changed = it == m.end() || !same(it->second, (*vm.list)[(size_t)i]);
+                }
+                if (!changed) continue;
+                std::vector<VMVal> out;
+                out.reserve((size_t)std::max<int64_t>(n, 0));
+                for (int64_t i = 0; i < n; i++) {
+                    auto it = m.find(std::to_string(i));
+                    out.push_back(it == m.end() ? VMVal::make_none() : to_vm(it->second));
+                }
+                *vm.list = std::move(out);
+            } else {
+                bool inst = vm.type == VMType::INSTANCE;
+                size_t n = 0;
+                bool changed = false;
+                for (auto& kv : m) {
+                    if (inst && kv.first == "__class__") continue;
+                    n++;
+                    auto it = vm.map->find(kv.first);
+                    if (it == vm.map->end() || !same(kv.second, it->second)) { changed = true; break; }
+                }
+                if (!changed && n == vm.map->size()) continue;
+                VMMap fresh;
+                for (auto& kv : m) {
+                    if (inst && kv.first == "__class__") continue;
+                    fresh[kv.first] = to_vm(kv.second);
+                }
+                *vm.map = std::move(fresh);
+            }
+        }
+    }
+};
 
 // Kept alive for the process: the bridge closures capture it.
 std::shared_ptr<NythonExecutor> g_bridge_exec;
@@ -486,16 +764,44 @@ void install_vm_builtin_bridge(Runnable* runner) {
     if (g_bridge_exec) return;
     g_bridge_exec = std::make_shared<NythonExecutor>(runner);
     NythonExecutor* ex = g_bridge_exec.get();
+    auto* vm = static_cast<nython::vm::VirtualMachine*>(runner);
     nython::vm::VirtualMachine::bridge_exists() = [ex](const std::string& n) {
         return ex->hasBuiltin(n);
     };
+    nython::vm::VirtualMachine::bridge_names() = [ex]() {
+        std::vector<std::string> out;
+        for (auto& kv : ex->builtin_ptrs) out.push_back(kv.first);
+        return out;
+    };
     nython::vm::VirtualMachine::bridge_call() =
-        [ex](const std::string& n, std::vector<VMVal>& a) -> VMVal {
+        [ex, vm](const std::string& n, std::vector<VMVal>& a) -> VMVal {
+            BridgeConv conv(*ex);
             std::vector<Value> args;
             args.reserve(a.size());
-            for (auto& v : a) args.push_back(vm_to_value(v, *ex));
-            Value r = ex->callBuiltin(n, args, ex->globalContext());
-            return value_to_vm(r, *ex);
+            for (auto& v : a) args.push_back(conv.to_value(v));
+            Value r;
+            // Interpreter builtins raise Nython exceptions as a tagged
+            // std::string ("__exc__:FileNotFoundError:msg"), which the VM's
+            // exception handling does not see: it unwound past every try and
+            // ended the program. Raise it the way Op::RAISE would instead -
+            // an instance of the builtin exception type.
+            try {
+                r = ex->callBuiltin(n, args, ex->globalContext());
+            } catch (std::string& s) {
+                std::string type, msg;
+                nyrt::parse_exc(s, type, msg);
+                vm->raise_native_exception(type.empty() ? "Exception" : type, msg);
+            } catch (std::runtime_error& e) {
+                // e.g. std::ios_base::failure from a stream
+                vm->raise_native_exception(nyrt::native_exc_type(e), e.what());
+            } catch (std::logic_error& e) {
+                // std::out_of_range, std::invalid_argument, ...
+                vm->raise_native_exception(nyrt::native_exc_type(e), e.what());
+            } catch (std::bad_alloc& e) {
+                vm->raise_native_exception("MemoryError", e.what());
+            }
+            conv.copy_back();
+            return conv.to_vm(r);
         };
 }
 
@@ -503,6 +809,8 @@ void install_vm_builtin_bridge(Runnable* runner) {
 
 
 int main(int argc, char** argv, char** env) {
+    g_argv0 = (argc > 0 && argv[0]) ? argv[0] : "";
+    nyrt::executable_path() = get_exe_path();
     try {
         setlocale(LC_ALL, "");
         nython::ConsoleManager cm; cm.setupConsole();
@@ -532,6 +840,7 @@ int main(int argc, char** argv, char** env) {
                     << "  --vm <file>        Run script via Bytecode VM\n"
                     << "  -d, --disasm       Disassemble file to bytecode listing\n"
                     << "  -p, --profile      Run with the profiler; measured per-function timings\n"
+                    << "      --trace OUT F  Run F, recording every executed statement to OUT (JSON lines)\n"
                     << "  --ide              Launch NythonIDE GUI\n"
                     << "  --console          Force terminal REPL (no GUI, shows all output)\n"
                     << "  --cli, --repl      Same as --console\n"
@@ -572,11 +881,25 @@ int main(int argc, char** argv, char** env) {
 
             // ── Bytecode VM ──────────────────────────────────────────────
             if (arg1 == "--vm" && argc >= 3) {
+                // SourceCode treats a string that is not an existing file as
+                // program TEXT, so a mistyped path used to be run as code
+                // (`--vm t/x.ny` evaluated `t / x.ny`). Refuse it like the
+                // interpreter's run_file() does.
+                {
+                    struct stat vm_st;
+                    if (stat(argv[2], &vm_st) != 0) {
+                        std::cerr << "[Nython] No such file: " << argv[2] << "\n";
+                        return 2;
+                    }
+                }
+                nyrt::set_command_line(argv[2], argc, argv, 3);
                 try {
                     auto source = SourceCode(std::string(argv[2]));
                     auto reporter = std::make_shared<Reporter>(source);
                     auto lexer2 = std::make_shared<Lexer>(source);
                     auto vm2 = std::make_shared<nython::vm::VirtualMachine>(reporter.get());
+                    // Non-daemon threads finish before the VM goes away (round 74).
+                    struct JoinThreadsAtExit { ~JoinThreadsAtExit() { nyconc::join_nondaemon_at_exit(); } } join_threads_at_exit;
                     // Imports must resolve relative to the script, not the
                     // working directory — and must do so on BOTH engines. The
                     // interpreter already did; without this the same file's
@@ -587,7 +910,14 @@ int main(int argc, char** argv, char** env) {
                     install_vm_builtin_bridge((Runnable*)vm2.get());
                     lexer2->tokenize();
                     auto ast = parser2->parse();
-                    if (ast) vm2->run(ast);
+                    // run() reports an uncaught exception itself and returns
+                    // RUNTIME_ERROR; that result used to be ignored, so a
+                    // failed program exited 0 on the VM and 1 on the
+                    // interpreter.
+                    if (ast) {
+                        auto res = vm2->run(ast);
+                        if (res == decltype(res)::RUNTIME_ERROR) return 1;
+                    }
                 } catch (exception::SyntaxError& e) {
                     // The VM compiler rejects some constructs the interpreter
                     // accepts. Report it rather than letting the exception
@@ -604,12 +934,26 @@ int main(int argc, char** argv, char** env) {
             }
 
             // ── Disassemble ──────────────────────────────────────────────
+            if (arg1 == "--trace" && argc >= 4) {
+                nyrt::set_command_line(argv[3], argc, argv, 4);
+                g_trace_path = argv[2];
+                return run_file(argv[3]);
+            }
+
             if ((arg1 == "--profile" || arg1 == "-p") && argc >= 3) {
+                nyrt::set_command_line(argv[2], argc, argv, 3);
                 NythonExecutor::profiling_enabled() = true;
                 return run_file(argv[2]);
             }
 
             if ((arg1 == "--disasm" || arg1 == "-d") && argc >= 3) {
+                {
+                    struct stat da_st;
+                    if (stat(argv[2], &da_st) != 0) {
+                        std::cerr << "[Nython] No such file: " << argv[2] << "\n";
+                        return 2;
+                    }
+                }
                 try {
                     auto source = SourceCode(std::string(argv[2]));
                     auto reporter = std::make_shared<Reporter>(source);
@@ -629,6 +973,9 @@ int main(int argc, char** argv, char** env) {
             }
 
             // ── Run script (tree-walk) ───────────────────────────────────
+            // Everything after the script path is the script's own command
+            // line (sys.argv[1:]).
+            nyrt::set_command_line(arg1, argc, argv, 2);
             return run_file(arg1);
 
         } else {

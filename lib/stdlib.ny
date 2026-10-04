@@ -3,6 +3,7 @@ import nytorch
 import os
 import time
 import json
+import "lib/thread.ny"
 
 # stdlib.ny — Nython Standard Library
 # Collections, algorithms, math, string utils, date/time, error handling,
@@ -41,89 +42,11 @@ class Stack:
             i = i + 1
         return result
 
-class Queue:
-    def __init__(self):
-        self.items = []
-        self.size = 0
-    def enqueue(self, val):
-        self.items.append(val)
-        self.size = self.size + 1
-    def dequeue(self):
-        if self.size == 0:
-            return none
-        var val = self.items[0]
-        var new_items = []
-        var i = 1
-        while i < self.size:
-            new_items.append(self.items[i])
-            i = i + 1
-        self.items = new_items
-        self.size = self.size - 1
-        return val
-    def peek(self):
-        if self.size == 0:
-            return none
-        return self.items[0]
-    def front(self):
-        return self.peek()
-    def is_empty(self):
-        return self.size == 0
-    def length(self):
-        return self.size
+# Queue: lib/thread.ny's (imported above) - thread-safe, and it answers
+# this library's original API too; one definition per class name.
 
-class PriorityQueue:
-    def __init__(self):
-        self.items = []
-        self.priorities = []
-        self.size = 0
-    def push(self, priority, value):
-        var pos = 0
-        var i = 0
-        while i < self.size:
-            if self.priorities[i] > priority:
-                var pos = i
-                var i = self.size
-            else:
-                pos = i + 1
-            i = i + 1
-        var new_items = []
-        var new_pris = []
-        var j = 0
-        while j < pos:
-            new_items.append(self.items[j])
-            new_pris.append(self.priorities[j])
-            j = j + 1
-        new_items.append(value)
-        new_pris.append(priority)
-        j = pos
-        while j < self.size:
-            new_items.append(self.items[j])
-            new_pris.append(self.priorities[j])
-            j = j + 1
-        self.items = new_items
-        self.priorities = new_pris
-        self.size = self.size + 1
-    def pop(self):
-        if self.size == 0:
-            return none
-        var val = self.items[0]
-        var new_items = []
-        var new_pris = []
-        var i = 1
-        while i < self.size:
-            new_items.append(self.items[i])
-            new_pris.append(self.priorities[i])
-            i = i + 1
-        self.items = new_items
-        self.priorities = new_pris
-        self.size = self.size - 1
-        return val
-    def peek(self):
-        if self.size == 0:
-            return none
-        return self.items[0]
-    def is_empty(self):
-        return self.size == 0
+# PriorityQueue: lib/thread.ny's (imported above) - thread-safe, and it answers
+# this library's original API too; one definition per class name.
 
 
 class LinkedList:
@@ -176,7 +99,7 @@ class HashMap:
             self._keys.append(key)
         self.store[key] = value
     def get(self, key, default):
-        var v = self.store[key]
+        var v = self.store.get(key)
         if v == none:
             return default
         return v
@@ -218,7 +141,7 @@ class OrderedDict:
         self.key_order = []
         self.count = 0
     def set(self, key, value):
-        if self.data[key] == none:
+        if self.data.get(key) == none:
             self.key_order[self.count] = key
             self.count = self.count + 1
         self.data[key] = value
@@ -249,7 +172,7 @@ class Set:
 
     def contains(self, val):
         var key = str(val)
-        var v = self.store[key]
+        var v = self.store.get(key)
         return v != none
 
     def remove(self, val):
@@ -582,27 +505,8 @@ class StringUtils:
 
 # ─── Date / Time ─────────────────────────────────────────────────────────────
 
-class Timer:
-    def __init__(self):
-        self.start_time = 0.0
-        self.elapsed = 0.0
-        self.running = false
-    def start(self):
-        self.start_time = time_now()
-        self.running = true
-    def stop(self):
-        if self.running:
-            self.elapsed = self.elapsed + time_now() - self.start_time
-            self.running = false
-    def reset(self):
-        self.elapsed = 0.0
-        self.running = false
-    def seconds(self):
-        if self.running:
-            return self.elapsed + time_now() - self.start_time
-        return self.elapsed
-    def ms(self):
-        return self.seconds() * 1000.0
+# Timer: lib/thread.ny's (imported above) - thread-safe, and it answers
+# this library's original API too; one definition per class name.
 
 class Stopwatch:
     def __init__(self):
@@ -716,25 +620,25 @@ class Config:
         self.set(key, str(value))
 
     def get(self, key, default):
-        var v = self.data[key]
+        var v = self.data.get(key)
         if v == none:
             return default
         return v
 
     def get_int(self, key, default):
-        var v = self.data[key]
+        var v = self.data.get(key)
         if v == none:
             return default
         return int(v)
 
     def get_float(self, key, default):
-        var v = self.data[key]
+        var v = self.data.get(key)
         if v == none:
             return default
         return float(v)
 
     def get_bool(self, key, default):
-        var v = self.data[key]
+        var v = self.data.get(key)
         if v == none:
             return default
         return v == "true" or v == "True" or v == "1" or v == "yes"
@@ -786,7 +690,7 @@ class Config:
         var i = 0
         while i < len(self._key_list):
             var k = self._key_list[i]
-            var v = self.data[k]
+            var v = self.data.get(k)
             if v != none:
                 out = out + k + " = " + str(v) + "\n"
             i = i + 1
@@ -807,24 +711,38 @@ class EventBus:
         self.handlers = {}
         self.handler_counts = {}
     def on(self, event, handler_name):
-        var count = self.handler_counts[event]
+        var count = self.handler_counts.get(event)
         if count == none:
             count = 0
         self.handlers[event + "_" + str(count)] = handler_name
         self.handler_counts[event] = count + 1
     def emit(self, event, data):
-        var count = self.handler_counts[event]
+        var count = self.handler_counts.get(event)
         if count == none:
             return
         var i = 0
         while i < count:
             var key = event + "_" + str(i)
-            var handler = self.handlers[key]
+            var handler = self.handlers.get(key)
             if handler != none:
                 self.handlers[key](data)
             i = i + 1
-    def off(self, event):
-        self.handler_counts[event] = 0
+    # off(event) drops every handler of the event; off(event, handler)
+    # only that one (the test called it that way, and the handler argument
+    # was silently dropped).
+    def off(self, event, handler_name=none):
+        if handler_name == none:
+            self.handler_counts[event] = 0
+            return
+        var count = self.handler_counts.get(event)
+        if count == none:
+            return
+        var i = 0
+        while i < count:
+            var key = event + "_" + str(i)
+            if self.handlers[key] == handler_name:
+                self.handlers[key] = none
+            i = i + 1
 
 # ─── Observable ──────────────────────────────────────────────────────────────
 
@@ -983,32 +901,9 @@ class Random:
     def randfloat(self, lo, hi):
         return lo + self.random() * (hi - lo)
 
-    def choice(self, arr):
-        var n = len(arr)
-        if n == 0:
-            return none
-        var idx = self._next() % n
-        return arr[idx]
-
-    def shuffle(self, arr):
-        var n = len(arr)
-        var i = n - 1
-        while i > 0:
-            var j = self._next() % (i + 1)
-            var tmp = arr[i]
-            arr[i] = arr[j]
-            arr[j] = tmp
-            i = i - 1
-        return arr
-
-    def sample(self, arr, k):
-        var copy = self.shuffle(arr)
-        var result = []
-        var i = 0
-        while i < k and i < len(copy):
-            result.append(copy[i])
-            i = i + 1
-        return result
+    # choice/shuffle/sample were each defined twice in this class; the
+    # interpreter kept the second set and the VM the first, and the second
+    # sample() never advanced its loop counters. One set, both engines.
     def choice(self, arr, n=none):
         if n == none:
             var ln = len(arr)
@@ -1032,13 +927,15 @@ class Random:
     def sample(self, arr, n, k):
         var copy = []
         var i = 0
-        while i < n:
+        while i < n and i < len(arr):
             copy.append(arr[i])
-        self.shuffle(copy, n)
+            i = i + 1
+        self.shuffle(copy, len(copy))
         var result = []
         i = 0
-        while i < k:
+        while i < k and i < len(copy):
             result.append(copy[i])
+            i = i + 1
         return result
     def normal(self, mean, std):
         var u1 = self.random()
@@ -1050,7 +947,7 @@ class Random:
 
 # ─── Pipeline / Functional ───────────────────────────────────────────────────
 
-class Pipeline:
+class FnPipeline:
     def __init__(self):
         self.steps = []
         self.step_count = 0
@@ -1107,7 +1004,7 @@ class CSV:
 
 # ─── Template engine ─────────────────────────────────────────────────────────
 
-class Template:
+class TextTemplate:
     def __init__(self, text):
         self.text = text
     def render(self, vars):

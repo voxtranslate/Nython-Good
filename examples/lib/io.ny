@@ -23,7 +23,7 @@ class File:
     def __enter__(self):
         return self
 
-    def __exit__(self):
+    def __exit__(self, exc_type=none, exc_value=none, tb=none):
         self.close()
         return false
 

@@ -1,242 +1,203 @@
-# import nytorch
+# ─── nytorch activations ─────────────────────────────────────────────────────
+# Activation modules (torch.nn names) over the Tensor autograd engine. The
+# `Tensor` class that used to live here is now lib/nytorch/tensor.ny (an ND
+# tensor with autograd); its elementwise methods (t.relu(), t.mish(), ...)
+# return Tensors.
+#
+# The older *Layer names are kept as factories returning the same modules.
+# Before, Tensor.mish()/.softsign()/.hardsigmoid()/.hardswish() were wrong on
+# the interpreter (a bare log()/abs()/max()/min() inside a Tensor method
+# resolved to Tensor.log/abs/max/min); these now run in native kernels.
 
-# A method named identically to a global builtin it calls bare — relu,
-# sigmoid, gelu, silu, swish, elu, softmax below — resolves that bare call
-# back to itself instead of the builtin: self-recursion, which either
-# overflows the call stack directly or, crossing into tensor_apply's native
-# per-element callback, comes back as `none` for every element instead of
-# raising. tanh already dodged this by calling the builtin under its other
-# registered name, tanh_fn; these give the rest of the same treatment rather
-# than leaving Tensor.relu()/.sigmoid()/.gelu()/.silu()/.swish()/.elu()/
-# .softmax() silently wrong.
-def _relu_bi(v):
-    return relu(v)
-def _sigmoid_bi(v):
-    return sigmoid(v)
-def _gelu_bi(v):
-    return gelu(v)
-def _silu_bi(v):
-    return silu(v)
-def _swish_bi(v):
-    return swish(v)
-def _elu_bi(v):
-    return elu(v)
-def _softmax_bi(v):
-    return softmax(v)
+import "lib/nytorch/tensor.ny"
+import "lib/nytorch/module.ny"
 
-
-class Tensor:
-    def init(self, data):
-        if type(data) == "list":
-            self.data = tensor(data)
-        else:
-            self.data = data
-
-    # Arithmetic (return Tensor - safe because Tensor already defined here)
-    def __add__(self, other):
-        var res = Tensor([0.0])
-        res.data = tensor_add(self.data, other.data)
-        return res
-    def __sub__(self, other):
-        var res = Tensor([0.0])
-        res.data = tensor_sub(self.data, other.data)
-        return res
-    def __mul__(self, other):
-        var res = Tensor([0.0])
-        var t = type(other)
-        if t == "int" or t == "float" or t == "bool":
-            res.data = tensor_scale(self.data, float(other))
-        else:
-            res.data = tensor_mul(self.data, other.data)
-        return res
-
-    # Reductions    scalar
-    def sum(self):
-        return tensor_sum(self.data)
-    def mean(self):
-        return tensor_mean(self.data)
-    def max(self):
-        return tensor_max(self.data)
-    def min(self):
-        return tensor_min(self.data)
-    def var(self):
-        return tensor_var(self.data)
-    def std(self):
-        return tensor_std(self.data)
-    def norm(self):
-        return tensor_norm(self.data)
-    def argmax(self):
-        return tensor_argmax(self.data)
-    def argmin(self):
-        return tensor_argmin(self.data)
-    def dot(self, other):
-        return tensor_dot(self.data, other.data)
-
-    # Element-wise    raw tensor
-    def exp(self):
-        return tensor_exp(self.data)
-    def log(self):
-        return tensor_log(self.data)
-    def sqrt(self):
-        return tensor_sqrt(self.data)
-    def abs(self):
-        return tensor_abs(self.data)
-    def neg(self):
-        return tensor_neg(self.data)
-    def pow(self, e):
-        return tensor_pow(self.data, e)
-    def scale(self, s):
-        return tensor_scale(self.data, s)
-
-    # Activations    raw tensor
-    def relu(self):
-        return tensor_apply(self.data, lambda v: _relu_bi(v))
-    def sigmoid(self):
-        return tensor_apply(self.data, lambda v: _sigmoid_bi(v))
-    def tanh(self):
-        return tensor_apply(self.data, lambda v: tanh_fn(v))
-    def gelu(self):
-        return tensor_apply(self.data, lambda v: _gelu_bi(v))
-    def silu(self):
-        return tensor_apply(self.data, lambda v: _silu_bi(v))
-    def swish(self):
-        return tensor_apply(self.data, lambda v: _swish_bi(v))
-    def elu(self):
-        return tensor_apply(self.data, lambda v: _elu_bi(v))
-    def softmax(self):
-        return _softmax_bi(self.data)
-    def mish(self):
-        return tensor_apply(self.data, lambda v: v * tanh_fn(log(1.0 + 2.71828182845904 ** v)))
-    def hardsigmoid(self):
-        return tensor_apply(self.data, lambda v: max(0.0, min(1.0, v / 6.0 + 0.5)))
-    def hardswish(self):
-        return tensor_apply(self.data, lambda v: v * max(0.0, min(6.0, v + 3.0)) / 6.0)
-    def softsign(self):
-        return tensor_apply(self.data, lambda v: v / (1.0 + abs(v)))
-
-    # Tensor ops    raw tensor
-    def concat(self, other):
-        return tensor_concat(self.data, other.data)
-    def normalize(self):
-        return tensor_normalize(self.data)
-    def clip(self, lo, hi):
-        return tensor_clip(self.data, lo, hi)
-    def slice(self, start, stop):
-        return tensor_slice(self.data, start, stop)
-    def cumsum(self):
-        return tensor_cumsum(self.data)
-    def diff(self):
-        return tensor_diff(self.data)
-    def outer(self, other):
-        return tensor_outer(self.data, other.data)
-
-    # Indexing
-    def __getitem__(self, i):
-        return self.data[i]
-    def __len__(self):
-        return len(self.data)
-
-
-# ---------------------------------------------
-# SECTION 2: ACTIVATION LAYERS
-# ---------------------------------------------
-
-class ReLULayer:
+class ReLU(Module):
+    def __init__(self):
+        super().__init__()
     def forward(self, x):
-        var res = Tensor([0.0])
-        res.data = tensor_apply(x.data, lambda v: relu(v))
-        return res
+        return _t_wrap(x).relu()
 
-class SigmoidLayer:
+class Sigmoid(Module):
+    def __init__(self):
+        super().__init__()
     def forward(self, x):
-        var res = Tensor([0.0])
-        res.data = tensor_apply(x.data, lambda v: sigmoid(v))
-        return res
+        return _t_wrap(x).sigmoid()
 
-class TanhLayer:
+class Tanh(Module):
+    def __init__(self):
+        super().__init__()
     def forward(self, x):
-        var res = Tensor([0.0])
-        res.data = tensor_apply(x.data, lambda v: tanh_fn(v))
-        return res
+        return _t_wrap(x).tanh()
 
-class SoftmaxLayer:
+class GELU(Module):
+    def __init__(self):
+        super().__init__()
     def forward(self, x):
-        var res = Tensor([0.0])
-        res.data = softmax(x.data)
-        return res
+        return _t_wrap(x).gelu()
 
-class GeLULayer:
+class SiLU(Module):
+    def __init__(self):
+        super().__init__()
     def forward(self, x):
-        var res = Tensor([0.0])
-        res.data = tensor_apply(x.data, lambda v: gelu(v))
-        return res
+        return _t_wrap(x).silu()
 
-class SiLULayer:
+class Mish(Module):
+    def __init__(self):
+        super().__init__()
     def forward(self, x):
-        var res = Tensor([0.0])
-        res.data = tensor_apply(x.data, lambda v: silu(v))
-        return res
+        return _t_wrap(x).mish()
 
-class ELULayer:
-    def init(self, alpha):
+class Hardsigmoid(Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x):
+        return _t_wrap(x).hardsigmoid()
+
+class Hardswish(Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x):
+        return _t_wrap(x).hardswish()
+
+class Softsign(Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x):
+        return _t_wrap(x).softsign()
+
+class Identity(Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x):
+        return x
+
+class LeakyReLU(Module):
+    def __init__(self, negative_slope=0.01):
+        super().__init__()
+        self.negative_slope = negative_slope
+    def forward(self, x):
+        return _t_uns("leaky_relu", _t_wrap(x), self.negative_slope)
+
+class ELU(Module):
+    def __init__(self, alpha=1.0):
+        super().__init__()
         self.alpha = alpha
     def forward(self, x):
-        var a = self.alpha
-        var res = Tensor([0.0])
-        res.data = tensor_apply(x.data, lambda v: elu(v, a))
-        return res
+        return _t_uns("elu", _t_wrap(x), self.alpha)
 
-class LeakyReLULayer:
-    def init(self, alpha):
+class CELU(Module):
+    def __init__(self, alpha=1.0):
+        super().__init__()
         self.alpha = alpha
     def forward(self, x):
-        var a = self.alpha
-        var res = Tensor([0.0])
-        res.data = tensor_apply(x.data, lambda v: leaky_relu(v, a))
-        return res
+        return _t_uns("celu", _t_wrap(x), self.alpha)
 
-class MishLayer:
-    def forward(self, x):
-        var res = Tensor([0.0])
-        res.data = tensor_apply(x.data, lambda v: v * tanh_fn(log(1.0 + 2.71828182845904 ** v)))
-        return res
-
-class HardswishLayer:
-    def forward(self, x):
-        var res = Tensor([0.0])
-        res.data = tensor_apply(x.data, lambda v: v * max(0.0, min(6.0, v + 3.0)) / 6.0)
-        return res
-
-class SoftsignLayer:
-    def forward(self, x):
-        var res = Tensor([0.0])
-        res.data = tensor_apply(x.data, lambda v: v / (1.0 + abs(v)))
-        return res
-
-class PReLULayer:
-    def init(self, init_val):
-        self.alpha = init_val
-    def forward(self, x):
-        var a = self.alpha
-        var res = Tensor([0.0])
-        res.data = tensor_apply(x.data, lambda v: v if v >= 0.0 else a * v)
-        return res
-
-class SoftplusLayer:
-    def init(self, beta):
+class Softplus(Module):
+    # (1/beta) * log(1 + exp(beta * x))
+    def __init__(self, beta=1.0):
+        super().__init__()
         self.beta = beta
     def forward(self, x):
-        var b = self.beta
-        var res = Tensor([0.0])
-        res.data = tensor_apply(x.data, lambda v: log(1.0 + 2.71828182845904 ** (b * v)) / b)
-        return res
+        var t = _t_wrap(x)
+        if self.beta == 1.0:
+            return t.softplus()
+        return (t * self.beta).softplus() * (1.0 / self.beta)
 
-class HardshrinkLayer:
-    def init(self, lambd):
+class Hardshrink(Module):
+    def __init__(self, lambd=0.5):
+        super().__init__()
         self.lambd = lambd
     def forward(self, x):
-        var lam = self.lambd
-        var res = Tensor([0.0])
-        res.data = tensor_apply(x.data, lambda v: v if abs(v) > lam else 0.0)
-        return res
+        return _t_uns("hardshrink", _t_wrap(x), self.lambd)
 
+class Softshrink(Module):
+    def __init__(self, lambd=0.5):
+        super().__init__()
+        self.lambd = lambd
+    def forward(self, x):
+        return _t_uns("softshrink", _t_wrap(x), self.lambd)
+
+class Threshold(Module):
+    # y = x if x > threshold else value
+    def __init__(self, threshold, value):
+        super().__init__()
+        self.threshold = threshold
+        self.value = value
+    def forward(self, x):
+        var t = _t_wrap(x)
+        return _t_where(t.gt(self.threshold).detach(), t, self.value)
+
+class PReLU(Module):
+    # learnable negative slope: max(0, x) + a * min(0, x)
+    def __init__(self, num_parameters=1, init_value=0.25):
+        super().__init__()
+        self.weight = Parameter(Tensor(nt_full([num_parameters], init_value), false, [num_parameters]))
+    def forward(self, x):
+        var t = _t_wrap(x)
+        var a = self.weight
+        if self.weight.numel() > 1 and t.dim() >= 2:
+            var s = [1, self.weight.numel()]
+            var i = 2
+            while i < t.dim():
+                s.append(1)
+                i = i + 1
+            a = self.weight.reshape(s)
+        return t.relu() - a * t.neg().relu()
+
+class Softmax(Module):
+    def __init__(self, dim=none):
+        if dim == none:
+            dim = -1
+        super().__init__()
+        self.dim = dim
+    def forward(self, x):
+        return _t_softmax(_t_wrap(x), self.dim, false)
+
+class LogSoftmax(Module):
+    def __init__(self, dim=none):
+        if dim == none:
+            dim = -1
+        super().__init__()
+        self.dim = dim
+    def forward(self, x):
+        return _t_softmax(_t_wrap(x), self.dim, true)
+
+
+# ── older names ─────────────────────────────────────────────────────────────
+def ReLULayer():
+    return ReLU()
+def SigmoidLayer():
+    return Sigmoid()
+def TanhLayer():
+    return Tanh()
+def SoftmaxLayer():
+    return Softmax(-1)
+def GeLULayer():
+    return GELU()
+def SiLULayer():
+    return SiLU()
+def MishLayer():
+    return Mish()
+def HardswishLayer():
+    return Hardswish()
+def SoftsignLayer():
+    return Softsign()
+def ELULayer(alpha):
+    return ELU(alpha)
+def LeakyReLULayer(alpha):
+    return LeakyReLU(alpha)
+def SoftplusLayer(beta):
+    return Softplus(beta)
+def HardshrinkLayer(lambd):
+    return Hardshrink(lambd)
+def SoftshrinkLayer(lambd):
+    return Softshrink(lambd)
+def CELULayer(alpha):
+    return CELU(alpha)
+def ThresholdLayer(threshold, value):
+    return Threshold(threshold, value)
+# PReLULayer(a) is a FIXED-slope leaky ReLU in the older API (no learnable
+# parameter); PReLU above is the learnable torch.nn.PReLU.
+def PReLULayer(init_val):
+    return LeakyReLU(init_val)

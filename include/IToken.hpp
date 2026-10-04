@@ -191,6 +191,10 @@ DECLARE_ENUM_WITH_TYPE (
 	Regex,
 	New,
 	Struct,
+	NullCoalesce,/// '??'
+	NullCoalesceAssign,/// '??='
+	OptDot,/// '?.'
+	OptBracket,/// '?[' (glued to its receiver: a?[k])
 	TokenTypeCount
 );
 

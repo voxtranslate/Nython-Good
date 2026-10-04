@@ -8,6 +8,59 @@ import "lib/gui.ny"
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ─── EditorBuffer ─────────────────────────────────────────────────────────────
+# Guesses a file's indentation from its content: [insert_spaces, size], or
+# none when nothing is indented. Tabs versus spaces is a vote over indented
+# lines; the size is the most common positive step between consecutive
+# space-indented lines (after VS Code's guessIndentation, simplified), ties
+# going to 4, then 2, then 8.
+def detect_indentation(b):
+    var tabs = 0
+    var spaces = 0
+    var hist = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+    var prev = 0
+    var lim = b.line_count
+    if lim > 4000:
+        lim = 4000
+    var r = 0
+    while r < lim:
+        var line = b.get_line(r)
+        var j = 0
+        var only_spaces = true
+        var going = true
+        while going and j < len(line):
+            var ch = string_slice(line, j, j + 1)
+            if ch == " ":
+                j = j + 1
+            elif ch == "\t":
+                only_spaces = false
+                j = j + 1
+            else:
+                going = false
+        if j < len(line):
+            if string_slice(line, 0, 1) == "\t":
+                tabs = tabs + 1
+            elif j > 0:
+                spaces = spaces + 1
+            if only_spaces:
+                var d = j - prev
+                if d > 0 and d <= 8:
+                    hist[d] = hist[d] + 1
+                prev = j
+        r = r + 1
+    if tabs == 0 and spaces == 0:
+        return none
+    var best = 0
+    var bestn = 0
+    var order = [4, 2, 8, 3, 6, 5, 7, 1]
+    var k = 0
+    while k < len(order):
+        if hist[order[k]] > bestn:
+            best = order[k]
+            bestn = hist[order[k]]
+        k = k + 1
+    return [spaces >= tabs, best]
+
+
 class EditorBuffer:
     def __init__(self, name, content):
         self.name = name
@@ -27,7 +80,36 @@ class EditorBuffer:
         self.redo_ops = []
         self.redo_n = 0
         self.max_undo_ops = 1000
+        # ── undo stops ──────────────────────────────────────────────────────
+        # With coalesce on (the IDE turns it on; direct API users keep the
+        # original one-entry-per-operation behaviour vm_audit36 pins), a run of
+        # typing is ONE undo step, the way every editor behaves: one Ctrl+Z
+        # after typing a word removes the word, not its last letter. Entries
+        # carry a group id; undo/redo pop every entry of the top group.
+        self.coalesce = false
+        self.group = 0
+        self.hold = false          # multi-caret edits: everything joins one group
+        self.join_next = false     # the next edit continues the current group
+        self.last_kind = ""
+        self.last_row = -1
+        self.last_end = -1
+        # ── dirty tracking ──────────────────────────────────────────────────
+        # Every entry gets a unique id that survives undo/redo. The document is
+        # clean when the id on top of the undo stack is the one saved, so
+        # undoing back to the saved text clears the dirty dot again.
+        self.op_seq = 0
+        self.saved_id = 0
+        # Line endings are preserved on save (a CRLF file used to come back
+        # LF). A file that ends with a newline has an empty last line, as in
+        # VS Code: Ctrl+End lands below the last line of text, and the final
+        # newline survives a save because it is part of the lines themselves.
+        self.eol = "\n"
+        self.indent_unit = "    "   # what Enter adds after ':' (the IDE sets it per file)
         self._parse_content(content)
+        # Line count as of the IDE's last look (ide_tools.ny moves bookmarks
+        # and folds by the difference after each edit). Kept on the buffer so
+        # a reloaded document starts from its own count.
+        self.track_lines = self.line_count
 
     def _parse_content(self, text):
         # Single split instead of the previous character walk.
@@ -40,15 +122,11 @@ class EditorBuffer:
         # 13,000-line file was killed by the OOM reaper before it opened.
         if text == none:
             text = ""
+        if string_find(text, "\r\n") >= 0:
+            self.eol = "\r\n"
+            text = string_replace(text, "\r\n", "\n")
         self.lines = string_split(text, "\n")
         var n = len(self.lines)
-        # A trailing newline yields one empty element; that is the end of the
-        # last line, not an extra line.
-        # Drop it by shortening the count rather than rebuilding the list: a
-        # copy loop here would be O(n^2) again, which is the very thing this
-        # rewrite exists to remove.
-        if n > 1 and self.lines[n - 1] == "":
-            n = n - 1
         if n == 0:
             self.lines = [""]
             n = 1
@@ -68,6 +146,277 @@ class EditorBuffer:
             out = out + self.lines[i]
             i = i + 1
         return out
+
+    # Text as it goes to disk, with the file's own line ending.
+    def text_for_save(self):
+        return string_join(self.lines_view(), self.eol)
+
+    def lines_view(self):
+        if len(self.lines) == self.line_count:
+            return self.lines
+        var out = []
+        var i = 0
+        while i < self.line_count:
+            out.append(self.lines[i])
+            i = i + 1
+        return out
+
+    # ── dirty state ─────────────────────────────────────────────────────────
+    def state_id(self):
+        if self.undo_n == 0:
+            return 0
+        return self.undo_ops[self.undo_n - 1]["id"]
+
+    def is_dirty(self):
+        return self.state_id() != self.saved_id
+
+    def mark_saved(self):
+        self.saved_id = self.state_id()
+        self.modified = false
+
+    # Ends the current typing run: the next edit starts a new undo step.
+    def begin_group(self):
+        self.last_kind = ""
+
+    # Several primitive edits recorded as one undo step:
+    #     var was = b.open_group()  ...edits...  b.close_group(was)
+    def open_group(self):
+        var was = self.hold
+        if not was:
+            self.last_kind = ""
+            self.group = self.group + 1
+            self.hold = true
+        return was
+
+    def close_group(self, was):
+        self.hold = was
+        self.last_kind = ""
+
+    def insert_at(self, row, col, text):
+        self.cursor_row = row
+        self.cursor_col = col
+        self.insert_text(text)
+
+    # Typing over a selection is one undo step in VS Code: the deletion of the
+    # selection and the text typed in its place come back together.
+    def continue_group(self):
+        self.join_next = true
+
+    # ── multi-line text operations ──────────────────────────────────────────
+    # One undo entry each, holding only the text involved: a paste or a
+    # selection delete no longer copies the whole document.
+    def insert_text(self, text):
+        if text == none or text == "":
+            return
+        text = string_replace(text, "\r\n", "\n")
+        var row = self.cursor_row
+        var col = self.cursor_col
+        var end = self._raw_insert_text(row, col, text)
+        self._record_op({"op": "instext", "row": row, "col": col, "text": text, "pad": 0})
+        self.cursor_row = end[0]
+        self.cursor_col = end[1]
+        self.modified = true
+
+    # Typed text: a single-line insert records as "insert" so a run of typing
+    # coalesces into one undo step; anything multi-line is one "instext".
+    def insert_text_typed(self, text):
+        if text == none or text == "":
+            return
+        if string_find(text, "\n") >= 0:
+            self.insert_text(text)
+        else:
+            self.insert_char(text)
+
+    def delete_range(self, r1, c1, r2, c2):
+        if r1 == r2 and c1 == c2:
+            return ""
+        var removed = self._raw_delete_text(r1, c1, r2, c2)
+        self._record_op({"op": "deltext", "row": r1, "col": c1, "text": removed, "pad": 0})
+        self.cursor_row = r1
+        self.cursor_col = c1
+        self.modified = true
+        return removed
+
+    def text_range(self, r1, c1, r2, c2):
+        if r1 == r2:
+            return string_slice(self.get_line(r1), c1, c2)
+        var out = string_slice(self.get_line(r1), c1, len(self.get_line(r1)))
+        var i = r1 + 1
+        while i < r2:
+            out = out + "\n" + self.get_line(i)
+            i = i + 1
+        return out + "\n" + string_slice(self.get_line(r2), 0, c2)
+
+    # Delete key: the character after the caret, or join the next line.
+    def delete_char_forward(self):
+        var row = self.cursor_row
+        var col = self.cursor_col
+        var line = self.get_line(row)
+        if col < len(line):
+            var removed = line[col:col + 1]
+            self._raw_delete(row, col, 1)
+            self._record_op({"op": "fdelete", "row": row, "col": col, "text": removed, "pad": 0})
+            self.modified = true
+        elif row + 1 < self.line_count:
+            self._raw_join(row, 0)
+            self._record_op({"op": "join", "row": row, "col": col, "text": "", "pad": 0})
+            self.modified = true
+
+    # Newline with no auto-indent, for pasted text and programmatic edits.
+    def insert_newline_raw(self):
+        var row = self.cursor_row
+        var col = self.cursor_col
+        self._raw_split(row, col, "")
+        self._record_op({"op": "newline", "row": row, "col": col, "text": "", "pad": 0})
+        self.cursor_row = row + 1
+        self.cursor_col = 0
+        self.modified = true
+
+    # ── word boundaries (Ctrl+Left/Right, double-click, F12) ────────────────
+    def _is_word(self, ch):
+        return (ch >= "a" and ch <= "z") or (ch >= "A" and ch <= "Z") or (ch >= "0" and ch <= "9") or ch == "_"
+
+    def word_left(self, row, col):
+        if col == 0:
+            if row > 0:
+                return [row - 1, len(self.get_line(row - 1))]
+            return [0, 0]
+        var line = self.get_line(row)
+        var c = col
+        while c > 0 and string_slice(line, c - 1, c) == " ":
+            c = c - 1
+        if c > 0 and self._is_word(string_slice(line, c - 1, c)):
+            while c > 0 and self._is_word(string_slice(line, c - 1, c)):
+                c = c - 1
+        elif c > 0:
+            c = c - 1
+        return [row, c]
+
+    def word_right(self, row, col):
+        var line = self.get_line(row)
+        var n = len(line)
+        if col >= n:
+            if row + 1 < self.line_count:
+                return [row + 1, 0]
+            return [row, n]
+        var c = col
+        while c < n and string_slice(line, c, c + 1) == " ":
+            c = c + 1
+        if c < n and self._is_word(string_slice(line, c, c + 1)):
+            while c < n and self._is_word(string_slice(line, c, c + 1)):
+                c = c + 1
+        elif c < n:
+            c = c + 1
+        return [row, c]
+
+    # [start, end) columns of the word touching col, or [col, col].
+    def word_at(self, row, col):
+        var line = self.get_line(row)
+        var n = len(line)
+        var a = col
+        var b = col
+        if a > n:
+            a = n
+            b = n
+        while a > 0 and self._is_word(string_slice(line, a - 1, a)):
+            a = a - 1
+        while b < n and self._is_word(string_slice(line, b, b + 1)):
+            b = b + 1
+        return [a, b]
+
+    # ── range indentation (Tab / Shift+Tab over a selection, Ctrl+] / Ctrl+[) ─
+    def indent_lines(self, a, b, unit):
+        var was = self.hold
+        if not was:
+            self.group = self.group + 1
+            self.hold = true
+        self._indent_lines_body(a, b, unit)
+        self.hold = was
+
+    def _indent_lines_body(self, a, b, unit):
+        var r = a
+        while r <= b:
+            if string_strip(self.get_line(r)) != "":
+                var save_r = self.cursor_row
+                var save_c = self.cursor_col
+                self.cursor_row = r
+                self.cursor_col = 0
+                self.insert_text(unit)
+                self.cursor_row = save_r
+                self.cursor_col = save_c
+            r = r + 1
+
+    def outdent_lines(self, a, b, unit):
+        var was = self.hold
+        if not was:
+            self.group = self.group + 1
+            self.hold = true
+        self._outdent_lines_body(a, b, unit)
+        self.hold = was
+
+    def _outdent_lines_body(self, a, b, unit):
+        var r = a
+        while r <= b:
+            var line = self.get_line(r)
+            var k = 0
+            if string_slice(line, 0, 1) == "\t":
+                k = 1
+            else:
+                while k < len(unit) and k < len(line) and string_slice(line, k, k + 1) == " ":
+                    k = k + 1
+            if k > 0:
+                self._raw_delete_text(r, 0, r, k)
+                self._record_op({"op": "deltext", "row": r, "col": 0, "text": string_slice(line, 0, k), "pad": 0})
+                self.modified = true
+            r = r + 1
+
+    # Rewrites every line's leading whitespace as tabs (plus spaces for any
+    # remainder) or as spaces, preserving its visual width at `size`. One
+    # undo step. Returns the number of lines changed.
+    def convert_indentation(self, to_tabs, size):
+        var was = self.hold
+        if not was:
+            self.group = self.group + 1
+            self.hold = true
+        var save_r = self.cursor_row
+        var save_c = self.cursor_col
+        var changed = 0
+        var r = 0
+        while r < self.line_count:
+            var line = self.get_line(r)
+            var j = 0
+            var vis = 0
+            var going = true
+            while going and j < len(line):
+                var ch = string_slice(line, j, j + 1)
+                if ch == " ":
+                    vis = vis + 1
+                    j = j + 1
+                elif ch == "\t":
+                    vis = vis + size - (vis % size)
+                    j = j + 1
+                else:
+                    going = false
+            var want = ""
+            if to_tabs:
+                want = "\t" * int(vis / size) + " " * (vis % size)
+            else:
+                want = " " * vis
+            if want != string_slice(line, 0, j) and j < len(line):
+                self.delete_range(r, 0, r, j)
+                self.cursor_row = r
+                self.cursor_col = 0
+                self.insert_text(want)
+                if r == save_r:
+                    save_c = save_c - j + len(want)
+                    if save_c < 0:
+                        save_c = 0
+                changed = changed + 1
+            r = r + 1
+        self.cursor_row = save_r
+        self.cursor_col = save_c
+        self.hold = was
+        return changed
 
     def insert_char(self, ch):
         var row = self.cursor_row
@@ -105,21 +454,19 @@ class EditorBuffer:
         var col = self.cursor_col
         var line = self.get_line(row)
         var before = line[0:col]
-        var indent = 0
+        # The new line keeps this line's leading whitespace exactly (tabs
+        # included) and opens one more level after a ':'.
         var li = 0
-        while li < len(before):
-            if before[li:li + 1] == " ":
-                indent = indent + 1
-            else:
-                li = len(before)
+        while li < len(before) and (before[li:li + 1] == " " or before[li:li + 1] == "\t"):
             li = li + 1
+        var pad = before[0:li]
         var ends_colon = len(string_strip(before)) > 0 and before[len(before) - 1:] == ":"
         if ends_colon:
-            indent = indent + 4
-        self._raw_split(row, col, indent)
-        self._record_op({"op": "newline", "row": row, "col": col, "text": "", "pad": indent})
+            pad = pad + self.indent_unit
+        self._raw_split(row, col, pad)
+        self._record_op({"op": "newline", "row": row, "col": col, "text": pad, "pad": len(pad)})
         self.cursor_row = row + 1
-        self.cursor_col = indent
+        self.cursor_col = len(pad)
         self.modified = true
 
     # ── raw mutation primitives ─────────────────────────────────────────────
@@ -137,25 +484,82 @@ class EditorBuffer:
     # Splits lines[row] at col into two lines, indenting the new second line
     # by pad_len spaces. The forward half of insert_newline, and the inverse
     # of _raw_join.
-    def _raw_split(self, row, col, pad_len):
+    # In-place list edits (insert/pop) rather than rebuilding self.lines:
+    # the interpreter never reclaims a list (GC_NOTES.md), so the old
+    # copy-the-whole-document per Enter cost a document-sized allocation per
+    # keystroke that was never given back.
+    def _raw_split(self, row, col, pad):
         var line = self.lines[row]
-        var before = line[0:col]
-        var after = line[col:]
-        var pad = ""
-        var pi = 0
-        while pi < pad_len:
-            pad = pad + " "
-            pi = pi + 1
-        self.lines[row] = before
-        var new_lines = []
+        self.lines[row] = line[0:col]
+        self.lines.insert(row + 1, pad + line[col:])
+        self.line_count = self.line_count + 1
+
+    # Inserts possibly multi-line text at (row, col); returns [end_row, end_col].
+    def _raw_insert_text(self, row, col, text):
+        var parts = string_split(text, "\n")
+        if len(parts) == 1:
+            self._raw_insert(row, col, text)
+            return [row, col + len(text)]
+        var line = self.lines[row]
+        var head = line[0:col]
+        var tail = line[col:]
+        var np = len(parts)
+        if np <= 64:
+            self.lines[row] = head + parts[0]
+            var k = 1
+            while k < np:
+                var piece = parts[k]
+                if k == np - 1:
+                    piece = piece + tail
+                self.lines.insert(row + k, piece)
+                k = k + 1
+            self.line_count = self.line_count + np - 1
+        else:
+            # A large paste: one rebuild beats np shifts of the whole list.
+            var out = []
+            var i = 0
+            while i < self.line_count:
+                if i == row:
+                    out.append(head + parts[0])
+                    var k2 = 1
+                    while k2 < np - 1:
+                        out.append(parts[k2])
+                        k2 = k2 + 1
+                    out.append(parts[np - 1] + tail)
+                else:
+                    out.append(self.lines[i])
+                i = i + 1
+            self.lines = out
+            self.line_count = len(out)
+        return [row + len(parts) - 1, len(parts[len(parts) - 1])]
+
+    # Removes [(r1,c1), (r2,c2)) and returns the removed text.
+    def _raw_delete_text(self, r1, c1, r2, c2):
+        var removed = self.text_range(r1, c1, r2, c2)
+        if r1 == r2:
+            self._raw_delete(r1, c1, c2 - c1)
+            return removed
+        var head = string_slice(self.lines[r1], 0, c1)
+        var tail = string_slice(self.lines[r2], c2, len(self.lines[r2]))
+        if r2 - r1 <= 64:
+            self.lines[r1] = head + tail
+            var k = r1 + 1
+            while k <= r2:
+                self.lines.pop(r1 + 1)
+                k = k + 1
+            self.line_count = self.line_count - (r2 - r1)
+            return removed
+        var out = []
         var i = 0
         while i < self.line_count:
-            new_lines.append(self.lines[i])
-            if i == row:
-                new_lines.append(pad + after)
+            if i == r1:
+                out.append(head + tail)
+            elif i < r1 or i > r2:
+                out.append(self.lines[i])
             i = i + 1
-        self.lines = new_lines
-        self.line_count = self.line_count + 1
+        self.lines = out
+        self.line_count = len(out)
+        return removed
 
     # Merges lines[row+1] into lines[row], dropping pad_len leading characters
     # from lines[row+1] first. The forward half of delete_char_back's line
@@ -164,17 +568,14 @@ class EditorBuffer:
         var prev = self.lines[row]
         var cur = self.lines[row + 1]
         self.lines[row] = prev + cur[pad_len:]
-        var new_lines = []
-        var i = 0
-        while i < self.line_count:
-            if i != row + 1:
-                new_lines.append(self.lines[i])
-            i = i + 1
-        self.lines = new_lines
+        self.lines.pop(row + 1)
         self.line_count = self.line_count - 1
 
     # ── operation-based undo/redo ───────────────────────────────────────────
     def _record_op(self, e):
+        self.op_seq = self.op_seq + 1
+        e["id"] = self.op_seq
+        e["g"] = self._group_for(e)
         self.undo_ops.append(e)
         self.undo_n = self.undo_n + 1
         self.redo_ops = []
@@ -209,6 +610,47 @@ class EditorBuffer:
             self.undo_ops = kept2
             self.undo_n = len(kept2)
 
+    # Decides whether e continues the current undo step. Typing continues a
+    # typing run (including Enter, so a line typed and its newline undo
+    # together); consecutive backspaces/deletes continue a deletion run;
+    # anything else - or a switch between typing and deleting, or the caret
+    # having moved in between - starts a new step.
+    def _group_for(self, e):
+        if self.hold:
+            return self.group
+        var kind = "other"
+        var op = e["op"]
+        if op == "insert" or op == "newline":
+            kind = "type"
+        elif op == "delete" or op == "fdelete" or op == "join":
+            kind = "del"
+        var cont = false
+        if self.join_next:
+            self.join_next = false
+            cont = self.group > 0
+        elif self.coalesce and kind != "other" and kind == self.last_kind:
+            cont = (e["row"] == self.last_row and e["col"] == self.last_end) or op == "newline" or op == "join"
+            if kind == "del" and op == "delete":
+                cont = cont or (e["row"] == self.last_row and e["col"] == self.last_end - 1)
+            if kind == "type" and self.last_row + 1 == e["row"] and e["col"] == self.last_end:
+                cont = true
+        if not cont:
+            self.group = self.group + 1
+        self.last_kind = kind
+        self.last_row = e["row"]
+        if op == "insert":
+            self.last_end = e["col"] + len(e["text"])
+        elif op == "newline":
+            self.last_row = e["row"] + 1
+            self.last_end = e["pad"]
+        elif op == "delete":
+            self.last_end = e["col"]
+        else:
+            self.last_end = e["col"]
+        if not self.coalesce:
+            self.last_kind = ""
+        return self.group
+
     # For edits too coarse to express as insert/delete/newline/join (cut
     # line, paste, comment toggle, move line, indent/dedent a range,
     # find/replace-all) - one full-text copy per discrete user action, not
@@ -219,7 +661,11 @@ class EditorBuffer:
                           "text": self.get_all_text(), "pad": 0})
 
     def _restore_text(self, text):
+        # A snapshot holds get_all_text() (LF); keep the file's own line
+        # ending across the restore.
+        var eol = self.eol
         self._parse_content(text)
+        self.eol = eol
 
     # Applies the inverse of entry e and returns the entry that would undo
     # THIS change, for the opposite stack - same shape as
@@ -240,12 +686,40 @@ class EditorBuffer:
             self._raw_join(e["row"], e["pad"])
             self.cursor_row = e["row"]
             self.cursor_col = e["col"]
-            return {"op": "join", "row": e["row"], "col": e["col"], "text": "", "pad": e["pad"]}
+            return {"op": "join", "row": e["row"], "col": e["col"], "text": e["text"], "pad": e["pad"]}
         if op == "join":
-            self._raw_split(e["row"], e["col"], e["pad"])
+            var pt = e["text"]
+            if len(pt) != e["pad"]:
+                pt = " " * e["pad"]
+            self._raw_split(e["row"], e["col"], pt)
             self.cursor_row = e["row"] + 1
             self.cursor_col = e["pad"]
-            return {"op": "newline", "row": e["row"], "col": e["col"], "text": "", "pad": e["pad"]}
+            return {"op": "newline", "row": e["row"], "col": e["col"], "text": pt, "pad": e["pad"]}
+        if op == "fdelete":
+            self._raw_insert(e["row"], e["col"], e["text"])
+            self.cursor_row = e["row"]
+            self.cursor_col = e["col"]
+            return {"op": "unfdelete", "row": e["row"], "col": e["col"], "text": e["text"], "pad": 0}
+        if op == "unfdelete":
+            self._raw_delete(e["row"], e["col"], len(e["text"]))
+            self.cursor_row = e["row"]
+            self.cursor_col = e["col"]
+            return {"op": "fdelete", "row": e["row"], "col": e["col"], "text": e["text"], "pad": 0}
+        if op == "instext":
+            var parts = string_split(e["text"], "\n")
+            var er = e["row"] + len(parts) - 1
+            var ec = len(parts[len(parts) - 1])
+            if len(parts) == 1:
+                ec = e["col"] + len(e["text"])
+            self._raw_delete_text(e["row"], e["col"], er, ec)
+            self.cursor_row = e["row"]
+            self.cursor_col = e["col"]
+            return {"op": "deltext", "row": e["row"], "col": e["col"], "text": e["text"], "pad": 0}
+        if op == "deltext":
+            var end = self._raw_insert_text(e["row"], e["col"], e["text"])
+            self.cursor_row = end[0]
+            self.cursor_col = end[1]
+            return {"op": "instext", "row": e["row"], "col": e["col"], "text": e["text"], "pad": 0}
         # "snapshot": the buffer's current text IS the "after" state, since
         # undo/redo only ever pop the most recent entry - capture it for the
         # opposite stack before overwriting.
@@ -263,38 +737,45 @@ class EditorBuffer:
     def can_redo(self):
         return self.redo_n > 0
 
+    # Pops the top entry of `stack` (a list plus its length held on self),
+    # applies its inverse and returns [inverse_entry, group].
+    def _pop_apply(self, from_undo):
+        var e = none
+        if from_undo:
+            e = self.undo_ops[self.undo_n - 1]
+            self.undo_ops.pop()
+            self.undo_n = self.undo_n - 1
+        else:
+            e = self.redo_ops[self.redo_n - 1]
+            self.redo_ops.pop()
+            self.redo_n = self.redo_n - 1
+        var inv = self._apply_inverse(e)
+        inv["id"] = e["id"]
+        inv["g"] = e["g"]
+        return inv
+
     def undo(self):
         if self.undo_n == 0:
             return false
-        var e = self.undo_ops[self.undo_n - 1]
-        var kept = []
-        var i = 0
-        while i < self.undo_n - 1:
-            kept.append(self.undo_ops[i])
-            i = i + 1
-        self.undo_ops = kept
-        self.undo_n = self.undo_n - 1
-        var inv = self._apply_inverse(e)
-        self.redo_ops.append(inv)
-        self.redo_n = self.redo_n + 1
+        var g = self.undo_ops[self.undo_n - 1]["g"]
+        while self.undo_n > 0 and self.undo_ops[self.undo_n - 1]["g"] == g:
+            var inv = self._pop_apply(true)
+            self.redo_ops.append(inv)
+            self.redo_n = self.redo_n + 1
         self.modified = true
+        self.last_kind = ""
         return true
 
     def redo(self):
         if self.redo_n == 0:
             return false
-        var e = self.redo_ops[self.redo_n - 1]
-        var kept = []
-        var i = 0
-        while i < self.redo_n - 1:
-            kept.append(self.redo_ops[i])
-            i = i + 1
-        self.redo_ops = kept
-        self.redo_n = self.redo_n - 1
-        var inv = self._apply_inverse(e)
-        self.undo_ops.append(inv)
-        self.undo_n = self.undo_n + 1
+        var g = self.redo_ops[self.redo_n - 1]["g"]
+        while self.redo_n > 0 and self.redo_ops[self.redo_n - 1]["g"] == g:
+            var inv = self._pop_apply(false)
+            self.undo_ops.append(inv)
+            self.undo_n = self.undo_n + 1
         self.modified = true
+        self.last_kind = ""
         return true
 
     def move_cursor(self, drow, dcol):
@@ -330,15 +811,23 @@ class EditorBuffer:
 # ─── SyntaxHighlighter  -  full Nython tokeniser ────────────────────────────────
 class SyntaxHighlighter:
     def __init__(self):
-        self.keywords = ["def", "class", "if", "elif", "else", "while", "for", "in",
-                         "return", "import", "var", "not", "and", "or", "true", "false",
-                         "none", "print", "self", "do", "end", "break", "continue",
-                         "try", "except", "finally", "raise", "with", "as", "pass",
-                         "lambda", "yield", "from", "global", "del", "assert"]
+        # Control-flow keywords (VS Code colours these purple in Dark+) ...
+        self.keywords = ["if", "elif", "else", "while", "for", "in", "return",
+                         "not", "and", "or", "print", "do", "end", "break", "continue",
+                         "try", "except", "catch", "finally", "raise", "throw", "with",
+                         "pass", "yield", "assert", "match", "case", "switch", "is",
+                         "instanceof", "xor", "repeat", "until", "await", "async"]
+        # ... and declaration / storage keywords plus language constants
+        # (blue). One undifferentiated keyword colour was the main reason the
+        # editor did not read like VS Code.
+        self.storage = ["def", "class", "var", "lambda", "import", "from", "as",
+                        "global", "del", "struct", "enum", "interface", "namespace",
+                        "module", "new", "package", "implements", "extends", "self",
+                        "super", "true", "false", "none", "undefined"]
         self.builtins = ["len", "str", "int", "float", "bool", "type", "range",
                          "list", "dict", "set", "tuple", "abs", "min", "max",
                          "sum", "sorted", "reversed", "enumerate", "zip", "map",
-                         "filter", "input", "open", "print", "repr", "hash",
+                         "filter", "input", "open", "repr", "hash",
                          "isinstance", "hasattr", "getattr", "setattr", "dir",
                          "string_find", "string_split", "string_strip", "string_upper",
                          "string_lower", "string_replace", "string_startswith",
@@ -356,7 +845,36 @@ class SyntaxHighlighter:
         # `custom_names` keeps insertion order for listing them back.
         self.custom = {}
         self.custom_names = []
+        self._kw = {}
+        self._st = {}
+        self._bi = {}
+        self._ty = {}
+        self._index_words()
         self.set_dark(true)
+
+    # Word -> category lookups as maps: _word_color used to scan four lists
+    # linearly for every identifier on every line it tokenised.
+    def _index_words(self):
+        self._kw = {}
+        self._st = {}
+        self._bi = {}
+        self._ty = {}
+        var i = 0
+        while i < len(self.keywords):
+            self._kw[self.keywords[i]] = true
+            i = i + 1
+        i = 0
+        while i < len(self.storage):
+            self._st[self.storage[i]] = true
+            i = i + 1
+        i = 0
+        while i < len(self.builtins):
+            self._bi[self.builtins[i]] = true
+            i = i + 1
+        i = 0
+        while i < len(self.type_names):
+            self._ty[self.type_names[i]] = true
+            i = i + 1
 
     # ── extension API ────────────────────────────────────────────────────────
     # add_keyword / add_builtin / add_type put a word into an existing category
@@ -364,16 +882,19 @@ class SyntaxHighlighter:
     def add_keyword(self, word):
         if not self._has(self.keywords, word):
             self.keywords.append(word)
+        self._kw[word] = true
         return true
 
     def add_builtin(self, word):
         if not self._has(self.builtins, word):
             self.builtins.append(word)
+        self._bi[word] = true
         return true
 
     def add_type(self, word):
         if not self._has(self.type_names, word):
             self.type_names.append(word)
+        self._ty[word] = true
         return true
 
     # add_token gives a word its own colour, independent of the categories.
@@ -463,37 +984,48 @@ class SyntaxHighlighter:
             i = i + 1
         return applied
 
+    # VS Code Default Dark+ / Default Light+ token colours.
     def set_dark(self, on):
         self.dark = on
         if on:
-            self.c_keyword  = Color(196, 148, 255, 255)
-            self.c_builtin  = Color(86, 196, 255, 255)
-            self.c_string   = Color(206, 145, 120, 255)
-            self.c_comment  = Color(106, 153, 85, 200)
-            self.c_number   = Color(180, 215, 120, 255)
-            self.c_class_n  = Color(78, 201, 176, 255)
-            self.c_type     = Color(252, 176, 98, 255)
-            self.c_operator = Color(248, 186, 80, 220)
-            self.c_self     = Color(196, 148, 255, 230)
-            self.c_default  = Color(212, 214, 220, 230)
-            self.c_decorator= Color(220, 175, 85, 240)
-            self.c_lineno   = Color(80, 84, 112, 180)
-            self.c_active_ln= Color(200, 200, 255, 220)
+            self.c_keyword  = Color(197, 134, 192, 255)   # #C586C0 control flow
+            self.c_storage  = Color(86, 156, 214, 255)    # #569CD6 def/class/var, constants
+            self.c_builtin  = Color(220, 220, 170, 255)   # #DCDCAA functions
+            self.c_func     = Color(220, 220, 170, 255)   # #DCDCAA
+            self.c_string   = Color(206, 145, 120, 255)   # #CE9178
+            self.c_escape   = Color(215, 186, 125, 255)   # #D7BA7D
+            self.c_comment  = Color(106, 153, 85, 255)    # #6A9955
+            self.c_number   = Color(181, 206, 168, 255)   # #B5CEA8
+            self.c_class_n  = Color(78, 201, 176, 255)    # #4EC9B0
+            self.c_type     = Color(78, 201, 176, 255)    # #4EC9B0
+            self.c_operator = Color(212, 212, 212, 255)   # #D4D4D4
+            self.c_self     = Color(86, 156, 214, 255)    # #569CD6
+            self.c_var      = Color(156, 220, 254, 255)   # #9CDCFE variables
+            self.c_default  = Color(212, 212, 212, 255)   # #D4D4D4
+            self.c_decorator= Color(220, 220, 170, 255)
+            self.c_lineno   = Color(133, 133, 133, 255)
+            self.c_active_ln= Color(198, 198, 198, 255)
         else:
-            self.c_keyword  = Color(126, 42, 190, 255)
-            self.c_builtin  = Color(20, 105, 175, 255)
-            self.c_string   = Color(150, 62, 30, 255)
-            self.c_comment  = Color(38, 128, 60, 235)
-            self.c_number   = Color(96, 118, 24, 255)
-            self.c_class_n  = Color(20, 130, 118, 255)
-            self.c_type     = Color(152, 92, 10, 255)
-            self.c_operator = Color(124, 88, 12, 240)
-            self.c_self     = Color(126, 42, 190, 235)
-            self.c_default  = Color(40, 44, 60, 240)
-            self.c_decorator= Color(140, 92, 10, 245)
-            self.c_lineno   = Color(150, 155, 175, 200)
-            self.c_active_ln= Color(60, 66, 120, 230)
+            self.c_keyword  = Color(175, 0, 219, 255)     # #AF00DB
+            self.c_storage  = Color(0, 0, 255, 255)       # #0000FF
+            self.c_builtin  = Color(121, 94, 38, 255)     # #795E26
+            self.c_func     = Color(121, 94, 38, 255)
+            self.c_string   = Color(163, 21, 21, 255)     # #A31515
+            self.c_escape   = Color(238, 0, 0, 255)       # #EE0000
+            self.c_comment  = Color(0, 128, 0, 255)       # #008000
+            self.c_number   = Color(9, 134, 88, 255)      # #098658
+            self.c_class_n  = Color(38, 127, 153, 255)    # #267F99
+            self.c_type     = Color(38, 127, 153, 255)
+            self.c_operator = Color(0, 0, 0, 255)
+            self.c_self     = Color(0, 0, 255, 255)
+            self.c_var      = Color(0, 16, 128, 255)      # #001080
+            self.c_default  = Color(0, 0, 0, 255)
+            self.c_decorator= Color(121, 94, 38, 255)
+            self.c_lineno   = Color(35, 120, 147, 255)
+            self.c_active_ln= Color(11, 33, 111, 255)
 
+    # One line -> [{"text", "color"}]. Called only when a line's layout is
+    # not already cached, never per frame.
     def tokenise_line(self, line):
         var segments = []
         if len(line) == 0:
@@ -505,43 +1037,66 @@ class SyntaxHighlighter:
         if string_startswith(stripped, "@"):
             segments.append({"text": line, "color": self.c_decorator})
             return segments
+        var n = len(line)
         var i = 0
         var j = 0
         var ch = ""
         var word = ""
-        var wc = Color(0,0,0,0)
-        while i < len(line):
+        var wc = none
+        var prev_word = ""
+        while i < n:
             ch = line[i:i + 1]
             if ch == "#":
                 segments.append({"text": line[i:], "color": self.c_comment})
-                i = len(line)
-            elif ch == "\"":
+                i = n
+            elif ch == "\"" or ch == "'":
+                # Strings, with backslash escapes, so a \" inside a string no
+                # longer ends it early and colours the rest of the line wrong.
                 j = i + 1
-                while j < len(line) and line[j:j + 1] != "\"":
+                while j < n and line[j:j + 1] != ch:
+                    if line[j:j + 1] == "\\":
+                        j = j + 1
                     j = j + 1
-                if j < len(line):
+                if j < n:
                     j = j + 1
                 segments.append({"text": line[i:j], "color": self.c_string})
                 i = j
             elif (ch >= "0" and ch <= "9"):
                 j = i
-                while j < len(line) and line[j:j+1] >= "0" and line[j:j+1] <= "9":
+                if ch == "0" and i + 1 < n and (line[i + 1:i + 2] == "x" or line[i + 1:i + 2] == "b" or line[i + 1:i + 2] == "o"):
+                    j = i + 2
+                while j < n and (self._is_id_char(line[j:j + 1]) or (line[j:j + 1] == "." and j + 1 < n and line[j + 1:j + 2] >= "0" and line[j + 1:j + 2] <= "9")):
                     j = j + 1
                 segments.append({"text": line[i:j], "color": self.c_number})
                 i = j
-            elif self._is_id_char(ch) and (ch < "0" or ch > "9"):
+            elif self._is_id_char(ch):
                 j = i
-                while j < len(line) and self._is_id_char(line[j:j+1]):
+                while j < n and self._is_id_char(line[j:j + 1]):
                     j = j + 1
                 word = line[i:j]
                 wc = self._word_color(word)
+                if prev_word == "def":
+                    wc = self.c_func
+                elif prev_word == "class" or prev_word == "struct" or prev_word == "enum" or prev_word == "interface":
+                    wc = self.c_class_n
+                elif wc == self.c_var:
+                    # An identifier followed by "(" is a call.
+                    var k = j
+                    while k < n and line[k:k + 1] == " ":
+                        k = k + 1
+                    if k < n and line[k:k + 1] == "(":
+                        wc = self.c_func
                 segments.append({"text": word, "color": wc})
+                prev_word = word
                 i = j
-            elif self._is_op_char(ch):
-                segments.append({"text": ch, "color": self.c_operator})
-                i = i + 1
+            elif ch == " ":
+                j = i
+                while j < n and line[j:j + 1] == " ":
+                    j = j + 1
+                segments.append({"text": line[i:j], "color": self.c_default})
+                i = j
             else:
-                segments.append({"text": ch, "color": self.c_default})
+                segments.append({"text": ch, "color": self.c_operator})
                 i = i + 1
         return segments
 
@@ -569,33 +1124,17 @@ class SyntaxHighlighter:
             return self.custom[word]
         if word == "self":
             return self.c_self
-        var found_kw = false
-        var ki = 0
-        while ki < len(self.keywords):
-            if word == self.keywords[ki]:
-                found_kw = true
-            ki = ki + 1
-        if found_kw:
+        if self._kw.has_key(word):
             return self.c_keyword
-        var found_bi = false
-        var bi = 0
-        while bi < len(self.builtins):
-            if word == self.builtins[bi]:
-                found_bi = true
-            bi = bi + 1
-        if found_bi:
+        if self._st.has_key(word):
+            return self.c_storage
+        if self._bi.has_key(word):
             return self.c_builtin
-        var found_ty = false
-        var ti = 0
-        while ti < len(self.type_names):
-            if word == self.type_names[ti]:
-                found_ty = true
-            ti = ti + 1
-        if found_ty:
+        if self._ty.has_key(word):
             return self.c_type
         if len(word) > 0 and word[0:1] >= "A" and word[0:1] <= "Z":
             return self.c_type
-        return self.c_default
+        return self.c_var
 
 
 # ─── RichEditor  -  GPU-style syntax-highlighted editor ─────────────────────────
