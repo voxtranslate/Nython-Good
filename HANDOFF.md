@@ -257,9 +257,10 @@ generators) on the thread that runs its loop:
   regressions against the baseline; `ide_e2e` 365/365; `ide_memprobe
   --check` (idle, hover, typing 0 KB); `ide_lint`, `ny_classcheck`,
   `cbp.py check` clean.
-- Windows under Wine, built from `nython.cbp`: 64-bit 355 runs, 0 not ok;
-  0 warnings; `pe_unwind_check` passes. `mem_rss_kb()` reads the working
-  set.
+- Windows under Wine, built from `nython.cbp` (`tools/cross_windows.sh`):
+  64-bit and 32-bit both 355 runs, 0 not ok, 0 warnings; `pe_unwind_check`
+  passes on the 64-bit build. `mem_rss_kb()` reads the working set. (Final
+  runs at 04926df; the Linux sweep and `ide_e2e` 365/365 there too.)
 - AArch64 (`make cli BUILD=build-arm64 CXX=aarch64-linux-gnu-g++`, run
   with `qemu-aarch64 -L /usr/aarch64-linux-gnu`): vm_audit54, 55 (4059),
   56, 60, 64 and 49 pass on both engines (the asm context switch, async
