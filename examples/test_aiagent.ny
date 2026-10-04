@@ -30,7 +30,10 @@ cell.touch()
 assert_true("access count inc", cell.access_count > 0)
 
 section("MemoryStore")
-var store = MemoryStore("/tmp/test_nyx_mem")
+# This run's own directory (the sweep runs this file on both engines at once).
+var tmp = "/tmp/nyx_run_" + str(os_getpid())
+os_makedirs(tmp)
+var store = MemoryStore(tmp + "/test_nyx_mem")
 assert_eq("type", type(store), "MemoryStore")
 assert_eq("size init", store.size(), 0)
 store.store("name", "Nython", "user", 0.9)
@@ -46,7 +49,7 @@ var results = store.search("Nython")
 assert_true("search finds", len(results) > 0)
 
 section("CodeKnowledgeBase")
-var kb = CodeKnowledgeBase("/tmp/test_nyx_kb")
+var kb = CodeKnowledgeBase(tmp + "/test_nyx_kb")
 assert_eq("type", type(kb), "CodeKnowledgeBase")
 kb.add_document("intro", "Nython is a modern programming language.", "manual")
 kb.add_document("features", "Nython supports OOP and functional programming.", "manual")
@@ -94,16 +97,16 @@ var conclusion = re_eng.infer("code review")
 assert_true("infer not none", conclusion != none)
 
 section("FileAssistant")
-var fa = FileAssistant("/tmp/nyx_workspace")
-assert_eq("workspace", fa.workspace, "/tmp/nyx_workspace")
+var fa = FileAssistant(tmp + "/nyx_workspace")
+assert_eq("workspace", fa.workspace, tmp + "/nyx_workspace")
 fa.create_file("hello.ny", "print \"Hello from NyxAI!\"")
 var fcontent = fa.read_file("hello.ny")
 assert_true("read file", string_contains(fcontent, "Hello"))
 
 section("NyxAI")
-var nyx = NyxAI("Nyx", "/tmp/nyx_test")
+var nyx = NyxAI("Nyx", tmp + "/nyx_test")
 assert_eq("name", nyx.name, "Nyx")
-assert_eq("workspace", nyx.workspace, "/tmp/nyx_test")
+assert_eq("workspace", nyx.workspace, tmp + "/nyx_test")
 assert_true("has kb", nyx.kb != none)
 var rem_result = nyx.remember("lang", "Nython")
 assert_true("remember ok", len(rem_result) > 0)
@@ -113,9 +116,9 @@ assert_true("ask response", len(ask_result) > 0)
 section("NyxFactory")
 var factory = NyxFactory()
 assert_eq("type", type(factory), "NyxFactory")
-var agent1 = factory.create("Agent1", "/tmp/agent1")
+var agent1 = factory.create("Agent1", tmp + "/agent1")
 assert_eq("agent name", agent1.name, "Agent1")
-var cluster = factory.create_cluster(["Alpha", "Beta", "Gamma"], "/tmp/cluster")
+var cluster = factory.create_cluster(["Alpha", "Beta", "Gamma"], tmp + "/cluster")
 assert_eq("cluster size", len(cluster), 3)
 
 print ""
@@ -124,3 +127,4 @@ if failed == 0:
     print "=== ALL AIAGENT TESTS PASSED ==="
 else:
     print "=== SOME AIAGENT TESTS FAILED ==="
+os_rmtree(tmp)

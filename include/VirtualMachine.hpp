@@ -2506,7 +2506,7 @@ public:
 
     // 171 general-purpose builtins (map, filter, reduce, any, all, next, set,
     // tuple, getattr, exp, log, sin, read_file, mkdir, ...) were only ever
-    // registered by register_nytorch_builtins(), which runs on `import nytorch`
+    // registered by register_nytorch_builtins(), which ran on `import nytorch`
     // and nowhere else — so without that import they resolved to none on the VM
     // while working fine on the interpreter. They are registered first so that
     // the 11 names both blocks define keep register_builtins()' versions, which
@@ -6169,7 +6169,14 @@ private:
         // nothing and the alias is empty. Matches the interpreter.
         if(globals_.count(guard_key) && alias.empty()) return;
         globals_[guard_key] = VMVal::make_bool(true);
-        if(name=="nytorch"){ register_nytorch_builtins(); return; }
+        // The tensor natives (register_nytorch_builtins) are registered when
+        // the VM starts (register_all_builtins). Registering them again here
+        // put back that block's older copies of 171 general builtins over
+        // the ones registered after it - repr, ord, chr, sorted, sum, set,
+        // list, the GIL-aware sleeps, ... - so on the VM any program that
+        // imported nytorch (lib/aiagent.ny does) got repr("a\nb") unescaped,
+        // among others. An acknowledgement now (round 76).
+        if(name=="nytorch") return;
         // "nytorch_classes" used to sit in builtin_modules below - a no-op
         // acknowledgement, on the theory its functions were "already
         // registered as globals". That's true of the native tensor_* ops
@@ -6182,7 +6189,7 @@ private:
         // the same here; the VM's shared_ptr-backed containers don't have
         // the interpreter's container-leak problem that made loading this
         // 220+-class file risky there (see GC_NOTES.md).
-        if(name=="nytorch_classes"){ register_nytorch_builtins(); }
+        // (its natives are registered at start-up, as for `import nytorch`)
         // os/shell/time/io: their functions are the interpreter's, reached
         // through the builtin bridge - one implementation for both engines.
         // These imports used to install VM copies that differed (time_ms()

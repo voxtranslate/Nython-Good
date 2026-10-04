@@ -180,6 +180,34 @@ generators) on the thread that runs its loop:
 - **`mem_rss_kb()` / `mem_peak_rss_kb()` work on Windows** (the working set,
   through `K32GetProcessMemoryInfo`, or `psapi.dll`'s on Vista); they read 0.
 
+### Found while verifying
+- **VM: `import nytorch` replaced 171 builtins with older copies.**
+  `register_nytorch_builtins()` holds an old block of general builtins as
+  well as the tensor natives; the VM registers it first at start-up and the
+  current versions over it, but `import nytorch` (and `nytorch_classes`)
+  registered it again. After the import - `lib/aiagent.ny` does it - `repr`
+  left newlines unescaped, `ord("é")` gave 195, `chr(233)` a broken byte,
+  `sorted(gen)` a list holding the generator, and the GIL-aware sleeps were
+  gone. The import is an acknowledgement now (vm_audit63 checks it).
+- **Tests that shared a port or a file between their two sweep runs.** The
+  sweep runs each file on both engines at once: `v18_network_test` and
+  `v19_io_net_test` bound fixed ports (one run's client could reach the
+  other's listener: a hang to the 180 s timeout, an empty recv), and
+  `test_os` / `test_aiagent` wrote fixed `/tmp` paths. They bind port 0 and
+  read it back (`socket_getsockname`) and use per-pid paths now. This is
+  what made the Windows sweep under Wine fail now and then (a different
+  file each run; round 75's build did the same).
+- **Windows: `socket_bind` set SO_REUSEADDR**, which on Windows lets a second
+  socket bind a port in use (both then get connections). Not set there any
+  more (Windows' default already rebinds past TIME_WAIT), as Python's
+  `socket.create_server` does: a second listener gets a bind error.
+- `lib/aiagent.ny`'s `IdeIntegration.format_code` never advanced its loop
+  (an infinite loop on any input) and indexed an empty list; fixed. Nothing
+  called it.
+- On AArch64 under qemu-user, `vm_audit48`'s interpreter run times out its
+  20 s thread joins (8 threads x 10k locks run ~10x slower emulated); the
+  same work scaled down gives the exact counts, and the VM run passes.
+
 ### Not done
 - The VM collector still cannot see references held in natives'
   `std::function` captures or code-object constants (cycles through them
@@ -195,6 +223,21 @@ generators) on the thread that runs its loop:
   normal exit.
 - Code strings run at run time and REPL lines are not scope-checked against
   each other (see above).
+
+### Verification
+- Linux: the sweep (every file, both engines) 355 runs, 0 not ok, no
+  regressions against the baseline; `ide_e2e` 365/365; `ide_memprobe
+  --check` (idle, hover, typing 0 KB); `ide_lint`, `ny_classcheck`,
+  `cbp.py check` clean.
+- Windows under Wine, built from `nython.cbp`: 64-bit 355 runs, 0 not ok;
+  0 warnings; `pe_unwind_check` passes. `mem_rss_kb()` reads the working
+  set.
+- AArch64 (`make cli BUILD=build-arm64 CXX=aarch64-linux-gnu-g++`, run
+  with `qemu-aarch64 -L /usr/aarch64-linux-gnu`): vm_audit54, 55 (4059),
+  56, 60, 64 and 49 pass on both engines (the asm context switch, async
+  tasks on it, generators relaying); vm_audit63 passes but for its 4
+  subprocess checks (an AArch64 binary cannot be exec'd without binfmt);
+  vm_audit48 passes on the VM and times out on the interpreter (above).
 
 ---
 
@@ -1094,8 +1137,9 @@ short-lived generators) does not grow the mappings: VmSize tracks VmRSS.
 
 - Finalization on the last reference (see above) - needs the reference
   counting of round 75's GC work.
-- Windows fibers: tested standalone under Wine only (see above); the
-  AArch64 switch is untested.
+- Windows fibers: tested under Wine only (see above). ~~The AArch64 switch
+  is untested~~ - round 76 cross-built for AArch64 and ran the generator,
+  async, memory and value suites under qemu-user, both engines (§0o).
 - Lazy builtins: they print as Python's (`<zip object at ...>`) and `send()`
   raises AttributeError since round 76 (§0o); `type()` stays "generator"
   (ruled there: Nython's dict is the type "map").

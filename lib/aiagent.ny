@@ -682,15 +682,16 @@ class IdeIntegration:
 
     def format_code(self, code):
         var lines = string_split(code, "\n")
-        formatted = []
+        var formatted = []
         var i = 0
         while i < len(lines):
             var line = lines[i]
             var stripped = string_strip(line)
             if len(stripped) == 0:
-                formatted[i] = ""
+                formatted.append("")
             else:
                 formatted.append(line)
+            i = i + 1
         return string_join(formatted, "\n")
 
     def start_server(self):

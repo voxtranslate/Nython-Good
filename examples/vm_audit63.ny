@@ -267,6 +267,17 @@ check("isinstance of a lazy zip", isinstance(zip(three()), "generator"), true)
 check("a list is not one", isinstance([1], "generator"), false)
 check("type of each", [type(three()), type(zip(three())), type(enumerate(three()))], ["generator", "generator", "generator"])
 
+# ── import nytorch leaves the builtins alone ─────────────────────────────
+# On the VM it registered an older block of 171 general builtins again, over
+# the current ones: repr of a string with a newline came out unescaped,
+# ord() read one byte of UTF-8, sorted() of a generator...
+import nytorch
+check("repr after import nytorch", repr("a\nb"), "'a\\nb'")
+check("ord after import nytorch", ord("\u00e9"), 233)
+check("chr after import nytorch", chr(233), "\u00e9")
+check("sorted after import nytorch", sorted(x for x in [3, 1, 2]), [1, 2, 3])
+check("sum after import nytorch", sum(x for x in [1, 2, 3]), 6)
+
 print("Results: " + str(pass_n) + " passed, " + str(fail_n) + " failed")
 if fail_n == 0:
     print("=== VM_AUDIT63 PASSED ===")

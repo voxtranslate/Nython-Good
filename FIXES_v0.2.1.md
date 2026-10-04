@@ -5497,4 +5497,9 @@ Full detail in `HANDOFF.md` §0o. New tests: `vm_audit63` (59 checks) and `vm_au
 | `mem_rss_kb()` read 0 on Windows | `/proc` only | the working set through `K32GetProcessMemoryInfo` (psapi.dll's on Vista) |
 | IndexError read "index 5 out of range (length 2)" on the interpreter, "list index out of range" on the VM | two messages | Python's, on both |
 
+| VM: after `import nytorch`, `repr("a\nb")` was unescaped, `ord("é")` gave 195, `sorted(gen)` returned `[<generator>]` | the import registered an old block of 171 general builtins again, over the current ones | the builtins are registered once, at start-up; the import is an acknowledgement |
+| The Windows sweep under Wine failed a different network or file test each run (a hang to the timeout, an empty recv) | the sweep runs a file on both engines at once, and four tests used fixed ports or `/tmp` paths | port 0 read back with `socket_getsockname`; per-pid paths |
+| Windows: a second program could bind a port another was listening on, both receiving connections | `socket_bind` set SO_REUSEADDR, which means that on Windows | not set on Windows (its default already rebinds past TIME_WAIT), as Python's `create_server` |
+| `IdeIntegration.format_code` never returned | its loop never advanced | fixed |
+
 Removed: `src/GarbageCollector.cpp`, `include/GarbageCollector.hpp`, `include/GarbageCollectorConfig.hpp` (unused since round 75) and `include/Evaluator.hpp` (never used; the only caller of the old allocator).
