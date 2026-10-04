@@ -111,11 +111,16 @@ Extensions for real blur, motion blur and noise (no new network parameters):
 
 Dataset roles (enforced by a start-up audit)
 --------------------------------------------
-  CLEAN images only as ground truth for synthetic degradations: train_data_dir (+ GoPro train
-  SHARP), val_data_dir, test_data_dir = GoPro test SHARP. Real blurred photos: real_images_dir =
-  HIDE test BLUR (ground truth read from .../sharp/NAME). Real pairs: DBlur <subset>/<split>/
-  {blur,sharp}. The previous config used Gopro/test/BLUR as clean ground truth and HIDE/test/SHARP
-  as the photos to deblur; the audit now stops on such a configuration.
+  CLEAN images only as ground truth for synthetic degradations: train_data_dir + the SHARP frames of
+  the real TRAIN pairs (GoPro, HIDE, RealBlur-J/-R, TextOCR; at most real_sharp_max_per_subset each),
+  val_data_dir, test_data_dir = GoPro test SHARP. Real pairs for TRAINING: the train splits of
+  real_train_subsets, balanced per dataset (real_subset_balance); real pairs for VALIDATION /
+  BENCHMARKS: the test splits of real_test_subsets (never trained on). Real blurred photos:
+  real_images_dir = HIDE test BLUR (ground truth read from the sibling sharp/gt folder). Layouts:
+  DBlur <subset>/<split>/{blur,sharp} or <subset>/<split>/<scene>/{blur,sharp}; subset names match
+  case- and separator-insensitively ('RealBlur' -> RealBlur_J + RealBlur_R). The previous config used
+  Gopro/test/BLUR as clean ground truth and HIDE/test/SHARP as the photos to deblur; the audit stops
+  on such a configuration, and reports every requested real dataset it could not find.
 
 Bugs of the previous version that are fixed here (the main ones)
 -----------------------------------------------------------------
@@ -222,6 +227,23 @@ Fixed in this revision
     crash for nested folders); the heat-kernel spectrum cache grew without bound with the image size;
     invalid Config strings (sampler, schedule, ...) silently fell back to other code paths.
 
+Second round (log of the first Kaggle run with the fixes above)
+---------------------------------------------------------------
+  * The search finished (3081 folders, 77 s) but found no checkpoint, and require_pretrained=True then
+    stopped the run. The search now (a) also accepts checkpoint_epoch_*.pt and, if nothing else fits, other
+    *.pt / *.pth / *.ckpt files whose tensors match the model exactly, (b) visits notebook outputs / models
+    first, '<input>/datasets/...' next and the trees of the configured data sets (and their aliases under
+    the other Kaggle layout) last - not at all once a checkpoint is found, (c) probes the checkpoint names in
+    image folders it does not crawl, and (d) also looks in /kaggle/working. With no checkpoint at all, the run
+    now trains from scratch behind a banner that lists where it looked (require_pretrained=True restores the
+    error); a found checkpoint of this pipeline that does not fit the architecture still stops the run.
+  * Training data: real pairs from GoPro, HIDE, RealBlur (J and R) and TextOCR train splits, balanced per
+    dataset; their sharp frames also feed the synthetic degradations; per-epoch real validation covers every
+    real test set (with per-dataset PSNR), and the best-model score is reset when that set changes.
+  * Real-pair folders: fuzzy subset names, blur/sharp synonyms (input/target, lq/gt, ...), per-scene layouts,
+    differently named sides (blur_12 / gt_12), mirror padding of images smaller than the crop (the batch could
+    not be collated), and folder listings cached for the whole run (each listing is slow on /kaggle/input).
+
 Everything runs without argparse/sys: edit `Config` (or pass one to `main(cfg)`).
 """
 
@@ -316,7 +338,8 @@ class Config:
     # ----------------------------- Paths -----------------------------
     # CLEAN (sharp) images only -> degraded on the fly by the cold-diffusion operators.
     train_data_dir: str = "/kaggle/input/imagenet1kmediumtest-10k/test_10000/test_10000"
-    extra_clean_dirs: Tuple[str, ...] = (f"{DBLUR_ROOT}/Gopro/train/sharp",)  # more clean training images (sharp only!)
+    extra_clean_dirs: Tuple[str, ...] = ()  # more CLEAN training folders (sharp only!). The sharp frames of the real
+    #                                         training pairs are added automatically (real_sharp_as_clean)
     val_data_dir: str = "/kaggle/input/unsplash/1k/1k"
     # Clean held-out set for the synthetic evaluation. The previous config pointed at .../Gopro/test/BLUR,
     # i.e. blurred images were used as ground truth.
@@ -326,8 +349,14 @@ class Config:
     real_images_dir: str = f"{DBLUR_ROOT}/HIDE/test/blur"
     # Real paired data (DBlur layout <root>/<subset>/<split>/{blur,sharp}, identical file names).
     paired_root: str = DBLUR_ROOT
-    real_train_subsets: Tuple[str, ...] = ("Gopro",)  # real blur->sharp pairs mixed into training
-    real_test_subsets: Tuple[str, ...] = ("Gopro", "HIDE")  # real benchmarks (evaluation)
+    # Real blur->sharp datasets under paired_root. Names are matched case- and separator-insensitively, and a name
+    # that is not an exact folder matches every folder starting with it: 'RealBlur' -> RealBlur_J + RealBlur_R.
+    # The audit prints what was found, what is missing and the folders that exist.
+    real_train_subsets: Tuple[str, ...] = ("Gopro", "HIDE", "RealBlur", "TextOCR")  # real pairs mixed into training
+    real_test_subsets: Tuple[str, ...] = ("Gopro", "HIDE", "RealBlur", "TextOCR")  # real benchmarks (held-out test splits)
+    real_subset_balance: str = "equal"  # share of each requested dataset in the real steps: 'equal' | 'sqrt' | 'size'
+    real_sharp_as_clean: bool = True  # sharp frames of the real TRAIN pairs are also clean images for synthetic blur
+    real_sharp_max_per_subset: int = 3000  # (evenly thinned, so a huge set such as TextOCR does not dominate; 0 = all)
     strict_dataset_audit: bool = True  # stop if a blurred folder is used as ground truth / pairs look swapped
     output_dir: str = "./results"
     checkpoint_dir: str = "./runnings"
@@ -415,7 +444,7 @@ class Config:
     # ----------------------------- Real paired data  [N11] -----------------------------
     real_pair_prob: float = 0.5  # fraction of optimiser steps trained on real blur->sharp pairs (0 = off)
     real_val_images: int = 24  # real pairs (fixed 256 crops) validated every epoch
-    real_eval_max_images: int = 20  # per real benchmark in the final evaluation (0 = all; ~1 min/image at 1280x720)
+    real_eval_max_images: int = 10  # per real benchmark in the final evaluation (0 = all; ~30 s/image at 1280x720)
     infer_amp: bool = True  # fp16 autocast for the real benchmark at native resolution (T4; NaN-guarded)
     real_eval_max_side: int = 0  # 0 = native resolution (falls back to 768 px on out-of-memory)
     real_eval_samplers: Tuple[str, ...] = ("direct", "srn")
@@ -516,10 +545,12 @@ class Config:
     resume_from: str = "auto"  # 'auto': checkpoint_dir, then the newest checkpoint_latest/best.pt under /kaggle/input
     #                            (e.g. a previous notebook version attached as input) | explicit file or folder | ''
     #                            An explicit path skips the search below entirely (fastest start-up).
-    resume_search_roots: Tuple[str, ...] = ("/kaggle/input",)  # where resume_from='auto' looks for checkpoints
+    resume_search_roots: Tuple[str, ...] = ("/kaggle/input", "/kaggle/working")  # where resume_from='auto' looks
     resume_search_depth: int = 6  # folder levels below each root (notebook outputs / models sit 1-5 levels deep)
     resume_search_timeout_s: float = 120.0  # the search stops after this long and uses what it found
-    require_pretrained: bool = True  # stop with an error instead of silently training from scratch
+    require_pretrained: bool = False  # True: stop with an error when no checkpoint is found. False: train from scratch
+    #                                   behind a loud banner that says where it looked (a found checkpoint that does
+    #                                   not match the architecture always stops the run - it is never replaced)
     protect_pretrained: bool = True  # one-time copy of the start-up checkpoints to <checkpoint_dir>/pretrained_backup
     checkpoint_every_min: float = 30.0  # mid-epoch checkpoint (a Kaggle session can end without warning); 0 = off
     time_budget_hours: float = -1.0  # stop training cleanly after this long: -1 = auto (11 h on Kaggle, else off), 0 = off
@@ -563,6 +594,8 @@ class Config:
         lo, hi = self.rollout_delta
         if not 0 < lo <= hi <= 1:
             raise ValueError(f"rollout_delta {self.rollout_delta} must satisfy 0 < lo <= hi <= 1 (log-uniform sampling)")
+        if self.real_subset_balance not in ("equal", "sqrt", "size"):
+            raise ValueError(f"Unknown real_subset_balance={self.real_subset_balance!r}; expected 'equal' | 'sqrt' | 'size'")
         if self.grad_accum_steps < 1 or self.batch_size < 1:
             raise ValueError("batch_size and grad_accum_steps must be >= 1")
 
@@ -698,48 +731,110 @@ def save_json(obj: Any, path: Union[str, Path]):
 
 
 CHECKPOINT_NAMES: Tuple[str, ...] = ("checkpoint_latest.pt", "checkpoint_best.pt", "final_model.pt")
+WEIGHT_EXTENSIONS: Tuple[str, ...] = (".pt", ".pth", ".ckpt")
 
 
-def find_checkpoints(roots: Sequence[Union[str, Path]], names: Sequence[str] = CHECKPOINT_NAMES, max_depth: int = 6,
-                     timeout_s: float = 120.0, skip: Sequence[Union[str, Path]] = (), max_images_per_dir: int = 64,
-                     verbose: bool = True) -> List[Path]:
+def _checkpoint_rank(name: str) -> Optional[int]:
+    """Priority of a checkpoint file name: latest, best, checkpoint_epoch_*, final_model (None = not a checkpoint)."""
+    if name == "checkpoint_latest.pt":
+        return 0
+    if name == "checkpoint_best.pt":
+        return 1
+    if name.startswith("checkpoint_epoch_") and name.endswith(".pt"):
+        return 2
+    if name == "final_model.pt":
+        return 3
+    return None
+
+
+def _dataset_trees(paths: Sequence[Union[str, Path]], roots: Sequence[str]) -> Tuple[set, set]:
+    """Dataset root folders (and their names) of the configured DATA folders: <root>/<slug> or
+    <root>/datasets/<owner>/<slug> (both Kaggle input layouts). The same dataset is often visible under both
+    layouts, so its name marks an alias wherever it appears near the top."""
+    trees, slugs = set(), set()
+    for p in paths:
+        if not p:
+            continue
+        ap = os.path.abspath(str(p))
+        for r in roots:
+            if ap.startswith(r.rstrip(os.sep) + os.sep):
+                parts = Path(ap).relative_to(r).parts
+                k = 3 if (parts and parts[0] == "datasets" and len(parts) >= 3) else 1
+                if len(parts) >= k:
+                    trees.add(os.path.join(r, *parts[:k]))
+                    if len(parts[k - 1]) >= 5:
+                        slugs.add(parts[k - 1])
+    return trees, slugs
+
+
+def find_checkpoints(roots: Sequence[Union[str, Path]], max_depth: int = 6, timeout_s: float = 120.0,
+                     skip: Sequence[Union[str, Path]] = (), data_dirs: Sequence[Union[str, Path]] = (),
+                     max_images_per_dir: int = 64, verbose: bool = True) -> Tuple[List[Path], List[Path]]:
     """
-    Bounded, shallow-first search for checkpoint files under `roots` (e.g. /kaggle/input).
+    Bounded, shallow-first search for checkpoints under `roots` (e.g. /kaggle/input, /kaggle/working).
 
-    The previous version ran Path('/kaggle/input').rglob(name) once per file name. /kaggle/input holds every
-    attached dataset (here ImageNet-10k, Unsplash and the whole DBlur collection: hundreds of thousands of
-    files on a network-backed, read-only mount), so the walk took tens of minutes to hours and the run looked
-    frozen right after "Creating trainer ...". This search
-      * visits folders breadth-first (notebook outputs and model uploads sit 1-5 levels deep),
-      * never enters the configured data folders (`skip`) or folders holding many images,
-      * stops at `max_depth` levels and after `timeout_s` seconds, keeping what it found so far,
-      * follows symbolic links once (a visited set prevents loops) and reports what it did.
-    Returns the matches ordered by name priority (latest, best, final) and newest first within a name.
+    The first version ran Path('/kaggle/input').rglob(name) once per file name, i.e. it read every file of every
+    attached dataset (ImageNet-10k, Unsplash, all of DBlur, ...) on a network-backed mount and looked frozen after
+    "Creating trainer ...". This search
+      * never enters the exact data / output folders (`skip`), never descends into folders full of images (the
+        checkpoint names are still probed there, so a checkpoint saved next to images is not missed),
+      * visits folders in three tiers: (0) everything else - notebook outputs, models, uploads; (1) the
+        '<root>/datasets/...' subtree; (2) the dataset trees of the configured data folders (and aliases of them),
+        only their top two levels, and not at all once a checkpoint was found,
+      * stops at `max_depth` levels and after `timeout_s` seconds with what it found, follows symlinks once.
+    Returns (checkpoints, other weight files): checkpoints = checkpoint_latest / best / epoch_* / final_model,
+    ordered by that priority and newest first; other weight files = *.pt / *.pth / *.ckpt under other names
+    (tried last, and only if their tensors match the model exactly).
     """
-    prio = {n: i for i, n in enumerate(names)}
-    skip_set = {os.path.normpath(os.path.abspath(str(s))) for s in skip if s}
+    skip_set = set()
+    for s in skip:
+        if s:
+            skip_set.add(os.path.normpath(os.path.abspath(str(s))))
+            skip_set.add(os.path.realpath(str(s)))
     roots = [os.path.abspath(str(r)) for r in roots if r and os.path.isdir(str(r))]
+    trees, slugs = _dataset_trees(data_dirs, roots)
     t0 = time.time()
-    queue = deque((r, 0) for r in roots)
+    tiers: List[deque] = [deque(), deque(), deque()]  # items: (folder, depth, depth at which tier 2 was entered)
+    for r in roots:
+        tiers[0].append((r, 0, -1))
     seen = {os.path.realpath(r) for r in roots}
     found: List[Path] = []
-    n_dirs, timed_out = 0, False
-    while queue:
+    weights: List[Path] = []
+    n_dirs, timed_out, skipped_tier2 = 0, False, 0
+
+    def tier_of(path: str, name: str, depth: int, parent_tier: int) -> int:
+        if parent_tier == 2 or os.path.normpath(path) in trees or (depth <= 3 and name in slugs):
+            return 2
+        if parent_tier == 1 or (depth == 1 and name == "datasets"):
+            return 1
+        return 0
+
+    while True:
+        t = next((i for i in range(3) if tiers[i]), None)
+        if t is None:
+            break
+        if t == 2 and found:  # a checkpoint exists outside the data trees -> do not crawl the datasets
+            skipped_tier2 = len(tiers[2])
+            break
         if time.time() - t0 > timeout_s:
             timed_out = True
             break
-        d, depth = queue.popleft()
+        d, depth, t2_depth = tiers[t].popleft()
         subdirs, n_img = [], 0
         try:
             with os.scandir(d) as it:  # read lazily: an image folder is abandoned after a few entries
                 for e in it:
                     try:
-                        if e.name in prio:
+                        name = e.name
+                        if _checkpoint_rank(name) is not None:
                             found.append(Path(e.path))
-                        elif e.name.lower().endswith(IMAGE_EXTENSIONS):
+                        elif name.lower().endswith(IMAGE_EXTENSIONS):
                             n_img += 1
-                            if n_img >= max_images_per_dir:  # an image folder never holds the checkpoints
+                            if n_img >= max_images_per_dir:
                                 break
+                        elif name.lower().endswith(WEIGHT_EXTENSIONS):
+                            if len(weights) < 50:
+                                weights.append(Path(e.path))
                         elif e.is_dir():
                             subdirs.append(e)
                     except OSError:
@@ -747,7 +842,13 @@ def find_checkpoints(roots: Sequence[Union[str, Path]], names: Sequence[str] = C
         except OSError:
             continue
         n_dirs += 1
-        if depth >= max_depth or n_img >= max_images_per_dir:
+        if n_img >= max_images_per_dir:  # image folder: never descend, but probe the checkpoint names directly
+            for name in CHECKPOINT_NAMES:
+                q = os.path.join(d, name)
+                if os.path.isfile(q):
+                    found.append(Path(q))
+            continue
+        if depth >= max_depth or (t == 2 and depth - t2_depth >= 2):  # data-set trees: top 2 levels only
             continue
         for e in sorted(subdirs, key=lambda e: e.name):
             if e.name.startswith(".") or e.name in ("pretrained_backup", "pretrained_backup.partial", "__pycache__"):
@@ -756,10 +857,11 @@ def find_checkpoints(roots: Sequence[Union[str, Path]], names: Sequence[str] = C
                 continue
             if e.is_symlink():
                 real = os.path.realpath(e.path)
-                if real in seen or os.path.normpath(real) in skip_set:
+                if real in seen or real in skip_set:
                     continue
                 seen.add(real)
-            queue.append((e.path, depth + 1))
+            child_tier = tier_of(e.path, e.name, depth + 1, t)
+            tiers[child_tier].append((e.path, depth + 1, t2_depth if t == 2 else (depth + 1 if child_tier == 2 else -1)))
 
     def _mtime(p: Path) -> float:
         try:
@@ -767,12 +869,15 @@ def find_checkpoints(roots: Sequence[Union[str, Path]], names: Sequence[str] = C
         except OSError:
             return 0.0
 
-    found = sorted(set(found), key=lambda p: (prio[p.name], -_mtime(p)))
+    found = sorted(set(found), key=lambda p: (_checkpoint_rank(p.name), -_mtime(p)))
+    weights = sorted(set(weights), key=lambda p: -_mtime(p))
     if verbose:
         print(f"  searched {n_dirs} folders in {time.time() - t0:.1f} s"
               + (f" - stopped at the {timeout_s:g} s limit (set Config.resume_from to the checkpoint path to skip the "
-                 f"search)" if timed_out else "") + f": {len(found)} checkpoint file(s) found")
-    return found
+                 f"search)" if timed_out else "")
+              + (f" - {skipped_tier2} data-set folders not searched (a checkpoint was found)" if skipped_tier2 else "")
+              + f": {len(found)} checkpoint(s), {len(weights)} other weight file(s)")
+    return found, weights
 
 
 def is_multi_kind(cfg: Config) -> bool:
@@ -824,6 +929,53 @@ class EpochSampler(Sampler):
 
     def __len__(self):
         return max(0, self.num_samples - self.skip)
+
+
+class BalancedEpochSampler(Sampler):
+    """
+    Seeded sampler over a ConcatDataset of real pair sets that balances the requested DATASETS (groups) instead of
+    letting the largest one dominate (TextOCR alone can be larger than GoPro + HIDE + RealBlur together). Every
+    draw picks a group with probability ~ its weight ('equal' | 'sqrt' | 'size' of the group), a member subset
+    proportionally to its size ('RealBlur' -> RealBlur_J / RealBlur_R) and an image without replacement within
+    the subset until it is exhausted. One "epoch" = as many draws as there are pairs; sharded like
+    DistributedSampler (identical draws on every rank, each rank takes its slice).
+    """
+
+    def __init__(self, sizes: Sequence[int], groups: Sequence[str], mode: str = "equal", seed: int = 0,
+                 rank: int = 0, world_size: int = 1):
+        self.sizes = [int(s) for s in sizes]
+        self.offsets = [int(o) for o in np.cumsum([0] + self.sizes[:-1])]
+        self.seed, self.rank, self.world = seed, rank, world_size
+        self.num_samples = int(math.ceil(sum(self.sizes) / world_size))
+        self.epoch = 0
+        group_size: Dict[str, int] = {}
+        for s, g in zip(self.sizes, groups):
+            group_size[g] = group_size.get(g, 0) + s
+        weight = {g: 1.0 if mode == "equal" else (math.sqrt(n) if mode == "sqrt" else float(n)) for g, n in group_size.items()}
+        total = sum(weight.values())
+        self.probs = torch.tensor([weight[g] / total * s / max(group_size[g], 1) for s, g in zip(self.sizes, groups)],
+                                  dtype=torch.float64)
+
+    def set_epoch(self, epoch: int, skip_samples: int = 0):
+        self.epoch = int(epoch)
+
+    def __iter__(self):
+        g = torch.Generator().manual_seed(self.seed + 7919 * self.epoch)
+        total = self.num_samples * self.world
+        which = torch.multinomial(self.probs, total, replacement=True, generator=g).tolist()
+        perms: Dict[int, List[int]] = {}
+        ptr: Dict[int, int] = {}
+        idx = []
+        for k in which:
+            if ptr.get(k, self.sizes[k]) >= self.sizes[k]:  # (re)shuffle this subset when it is exhausted
+                perms[k] = torch.randperm(self.sizes[k], generator=g).tolist()
+                ptr[k] = 0
+            idx.append(self.offsets[k] + perms[k][ptr[k]])
+            ptr[k] += 1
+        return iter(idx[self.rank:total:self.world])
+
+    def __len__(self):
+        return self.num_samples
 
 
 # ---------------------------------- multi-GPU (Kaggle T4 x2) ----------------------------------
@@ -1532,29 +1684,67 @@ class ColdDegradation(nn.Module):
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
 
 
+_LIST_CACHE: Dict[str, Tuple[str, ...]] = {}
+_DIR_CACHE: Dict[str, Tuple[str, ...]] = {}
+
+
 def list_images(folder: Union[str, Path]) -> List[Path]:
+    """Sorted image files below `folder` (recursive). Listings are cached for the whole process: the inputs are
+    read-only, and the audit, the datasets, the trainer and the inference list the same folders (every listing
+    is slow on Kaggle's network-backed /kaggle/input). Paths are returned relative to `folder` as given."""
     folder = Path(folder)
-    if not folder.exists():
-        return []
-    return sorted(p for p in folder.rglob("*") if p.suffix.lower() in IMAGE_EXTENSIONS)
+    key = os.path.abspath(str(folder))
+    rel = _LIST_CACHE.get(key)
+    if rel is None:
+        if not folder.is_dir():
+            return []
+        rel = tuple(sorted((p.relative_to(folder).as_posix() for p in folder.rglob("*")
+                            if p.suffix.lower() in IMAGE_EXTENSIONS), key=lambda r: r.split("/")))
+        _LIST_CACHE[key] = rel
+    return [folder / r for r in rel]
+
+
+def _subdirs(d: Union[str, Path]) -> List[Path]:
+    """Immediate sub-folders of d, sorted by name (cached like list_images)."""
+    d = Path(d)
+    key = os.path.abspath(str(d))
+    names = _DIR_CACHE.get(key)
+    if names is None:
+        try:
+            with os.scandir(d) as it:
+                names = tuple(sorted(e.name for e in it if e.is_dir()))
+        except OSError:
+            return []
+        _DIR_CACHE[key] = names
+    return [d / n for n in names]
+
+
+def _spread(items: List[Any], n: int) -> List[Any]:
+    """n items evenly spread over the list (every scene / sequence represented), not the first n."""
+    if n and 0 < n < len(items):
+        return [items[int(i)] for i in np.linspace(0, len(items) - 1, n)]
+    return items
 
 
 class ImageDataset(Dataset):
-    """Folder of clean images -> dict(image in [-1, 1], path, idx)."""
+    """Clean images (a folder, or an explicit list of files) -> dict(image in [-1, 1], path, idx)."""
 
-    def __init__(self, data_dir: str, image_size: Tuple[int, int] = (256, 256),
-                 split: str = "train", augment: bool = True, max_images: int = 0):
+    def __init__(self, data_dir: Optional[Union[str, Path]], image_size: Tuple[int, int] = (256, 256),
+                 split: str = "train", augment: bool = True, max_images: int = 0,
+                 paths: Optional[Sequence[Union[str, Path]]] = None, name: str = ""):
         super().__init__()
-        self.data_dir = Path(data_dir)
+        self.data_dir = Path(data_dir) if data_dir else None
         self.image_size = tuple(image_size)
         self.split = split
         self.augment = augment
-        self.image_paths = list_images(self.data_dir)
-        if max_images and max_images > 0:
-            self.image_paths = self.image_paths[:max_images]
+        if paths is not None:
+            self.image_paths = [Path(p) for p in paths]
+        else:
+            self.image_paths = list_images(self.data_dir) if self.data_dir is not None else []
+        self.image_paths = _spread(self.image_paths, max_images)  # (was: the first N files = the first scenes only)
         if not self.image_paths:
-            raise ValueError(f"No images found in {data_dir}")
-        print(f"Found {len(self.image_paths)} images in {data_dir}")
+            raise ValueError(f"No images found in {name or data_dir}")
+        print(f"Found {len(self.image_paths)} images in {name or data_dir}")
         self.transform = self._build_transforms()
 
     def _build_transforms(self):
@@ -1636,30 +1826,87 @@ class SyntheticImageDataset(Dataset):
         return {"image": t * 2 - 1, "path": f"synthetic_{idx:05d}", "idx": idx}
 
 
+_PAIR_TOKENS = ("blurred", "blurry", "blur", "sharp", "gt", "lq", "hq", "input", "target")
+
+
+def _pair_keys(files: List[Path], base: Path, loose: bool = False) -> Dict[str, Path]:
+    """Matching keys of the files of one side of a pair: the relative path; loose=True also drops the side
+    tokens ('blur_12.png' and 'gt_12.png' -> '12') and the extension, for copies that name the sides differently."""
+    out = {}
+    for p in files:
+        rel = p.relative_to(base)
+        if loose:
+            stem = rel.stem.lower()
+            for tok in _PAIR_TOKENS:
+                stem = stem.replace(tok, "")
+            key = (rel.parent / "".join(ch for ch in stem if ch.isalnum())).as_posix()
+        else:
+            key = rel.as_posix()
+        out[key] = p
+    return out
+
+
+def match_pair_files(blur_dir: Path, sharp_dir: Path) -> Tuple[List[Tuple[str, Path, Path]], int]:
+    """([(key, blur file, sharp file)], number of unmatched files) for one blur / sharp folder pair: identical
+    relative paths, or - when no name matches at all - names without the side tokens (blur_12 <-> gt_12)."""
+    bl, sh = list_images(blur_dir), list_images(sharp_dir)
+    blur, sharp = _pair_keys(bl, blur_dir), _pair_keys(sh, sharp_dir)
+    if not set(blur) & set(sharp):  # e.g. the original RealBlur release: blur/blur_12.png <-> gt/gt_12.png
+        blur, sharp = _pair_keys(bl, blur_dir, True), _pair_keys(sh, sharp_dir, True)
+    keys = sorted(set(blur) & set(sharp))
+    return [(k, blur[k], sharp[k]) for k in keys], len(set(blur) ^ set(sharp))
+
+
+def _pad_to(t: torch.Tensor, h: int, w: int) -> torch.Tensor:
+    """Mirror-pads (C, H, W) at the bottom / right to at least (h, w). The mirror (even) extension is exactly the
+    Neumann boundary the heat operator assumes, so a padded real pair stays consistent with the blur model.
+    Images smaller than the crop (text crops, small RealBlur frames) used to give smaller crops -> the batch
+    could not be collated."""
+    while t.shape[-2] < h or t.shape[-1] < w:
+        ph = min(h - t.shape[-2], t.shape[-2] - 1) if t.shape[-2] < h else 0
+        pw = min(w - t.shape[-1], t.shape[-1] - 1) if t.shape[-1] < w else 0
+        if ph <= 0 and pw <= 0:  # a 1-pixel side cannot be mirrored
+            return F.pad(t[None], (0, max(0, w - t.shape[-1]), 0, max(0, h - t.shape[-2])), mode="replicate")[0]
+        t = F.pad(t[None], (0, max(pw, 0), 0, max(ph, 0)), mode="reflect")[0]
+    return t
+
+
 class PairedImageDataset(Dataset):
     """
-    Real degraded -> sharp pairs (DBlur layout: <split>/blur/NAME <-> <split>/sharp/NAME).
+    Real degraded -> sharp pairs. Layouts: <split>/blur/NAME <-> <split>/sharp/NAME (DBlur) and per scene
+    <split>/<scene>/blur/NAME <-> <split>/<scene>/sharp/NAME (original GoPro / RealBlur style); the folders may also
+    be called input/target, lq/gt, blurred/groundtruth, ... (see _BLUR_DIR_NAMES / _SHARP_DIR_NAMES).
       mode 'train': the SAME random crop / flip on both images, at native resolution (the blur size
                     of real photos is preserved; resizing would shrink the blur).
       mode 'val'  : deterministic centre crop.
       mode 'test' : full image (optionally resized so that the longer side <= max_side).
-    Returns {"image": sharp, "degraded": blurred, "path": blurred path} in [-1, 1].
+    Images smaller than the crop are mirror-padded in 'train' / 'val' (one size per batch).
+    Returns {"image": sharp, "degraded": blurred, "path": blurred path, "subset": dataset name} in [-1, 1].
+    `group` is the requested dataset name it was matched from ('RealBlur' for RealBlur_J): the training mix is
+    balanced per group.
     """
 
-    def __init__(self, blur_dir: Union[str, Path], sharp_dir: Union[str, Path], crop: Tuple[int, int] = (256, 256),
-                 mode: str = "train", max_images: int = 0, max_side: int = 0, name: str = ""):
-        self.blur_dir, self.sharp_dir = Path(blur_dir), Path(sharp_dir)
+    def __init__(self, blur_dir: Optional[Union[str, Path]] = None, sharp_dir: Optional[Union[str, Path]] = None,
+                 crop: Tuple[int, int] = (256, 256), mode: str = "train", max_images: int = 0, max_side: int = 0,
+                 name: str = "", dir_pairs: Optional[Sequence[Tuple[Union[str, Path], Union[str, Path]]]] = None,
+                 group: str = ""):
+        if dir_pairs is None:
+            dir_pairs = [(blur_dir, sharp_dir)]
+        dir_pairs = [(Path(b), Path(s)) for b, s in dir_pairs]
+        self.blur_dir, self.sharp_dir = dir_pairs[0]
         self.crop, self.mode, self.max_side = tuple(crop), mode, max_side
         self.name = name or self.blur_dir.parent.parent.name
-        blur = {p.relative_to(self.blur_dir).as_posix(): p for p in list_images(self.blur_dir)}
-        sharp = {p.relative_to(self.sharp_dir).as_posix(): p for p in list_images(self.sharp_dir)}
-        keys = sorted(set(blur) & set(sharp))
-        self.unmatched = len(set(blur) ^ set(sharp))
-        if max_images and max_images > 0 and len(keys) > max_images:  # evenly spread subset (all scenes)
-            keys = [keys[int(i)] for i in np.linspace(0, len(keys) - 1, max_images)]
-        if not keys:
-            raise ValueError(f"No matching blur/sharp file names in {self.blur_dir} / {self.sharp_dir}")
-        self.pairs = [(blur[k], sharp[k]) for k in keys]
+        self.group = group or self.name
+        pairs, self.unmatched = [], 0
+        for bd, sd in dir_pairs:
+            matched, unmatched = match_pair_files(bd, sd)
+            pairs += [(b, s) for _, b, s in matched]
+            self.unmatched += unmatched
+        pairs = _spread(pairs, max_images)  # evenly spread subset (all scenes)
+        if not pairs:
+            raise ValueError(f"No matching blur/sharp file names in {self.blur_dir} / {self.sharp_dir}"
+                             + (f" (and {len(dir_pairs) - 1} more scene folders)" if len(dir_pairs) > 1 else ""))
+        self.pairs = pairs
 
     def __len__(self):
         return len(self.pairs)
@@ -1674,6 +1921,9 @@ class PairedImageDataset(Dataset):
         if y.shape != x.shape:  # should not happen in DBlur; keep the pair usable
             y = F.interpolate(y[None], size=x.shape[-2:], mode="bilinear", align_corners=False)[0]
         H, W = x.shape[-2:]
+        if self.mode in ("train", "val") and (H < self.crop[0] or W < self.crop[1]):
+            x, y = _pad_to(x, *self.crop), _pad_to(y, *self.crop)
+            H, W = x.shape[-2:]
         ch, cw = min(self.crop[0], H), min(self.crop[1], W)
         if self.mode == "train":
             i, j = random.randint(0, H - ch), random.randint(0, W - cw)
@@ -1688,44 +1938,112 @@ class PairedImageDataset(Dataset):
             size = (max(8, int(round(H * s / 8)) * 8), max(8, int(round(W * s / 8)) * 8))
             x = F.interpolate(x[None], size=size, mode="bicubic", align_corners=False, antialias=True)[0].clamp(-1, 1)
             y = F.interpolate(y[None], size=size, mode="bicubic", align_corners=False, antialias=True)[0].clamp(-1, 1)
-        return {"image": x.contiguous(), "degraded": y.contiguous(), "path": str(bp), "idx": idx}
+        return {"image": x.contiguous(), "degraded": y.contiguous(), "path": str(bp), "idx": idx, "subset": self.name}
 
 
-def find_pair_dirs(root: Union[str, Path], subsets: Sequence[str], split: str) -> List[Tuple[str, Path, Path]]:
-    """[(subset, blur_dir, sharp_dir)] for <root>/<subset>/<split>/{blur,sharp} (case-insensitive)."""
-    root = Path(root)
-    if not root.is_dir():
-        return []
-    splits = {"train": ("train", "training"), "test": ("test", "testing"), "val": ("val", "validation", "valid")}
-    out = []
-    children = {c.name.lower(): c for c in root.iterdir() if c.is_dir()}
-    for s in subsets:
-        d = children.get(s.lower())
-        if d is None:
-            continue
-        for sp in splits.get(split, (split,)):
-            cand = {c.name.lower(): c for c in d.iterdir() if c.is_dir()}.get(sp)
-            if cand is None:
-                continue
-            sub = {c.name.lower(): c for c in cand.iterdir() if c.is_dir()}
-            if "blur" in sub and "sharp" in sub:
-                out.append((d.name, sub["blur"], sub["sharp"]))
-                break
+_BLUR_DIR_NAMES = ("blur", "blurred", "blurry", "input", "inputs", "lq", "degraded")
+_SHARP_DIR_NAMES = ("sharp", "gt", "groundtruth", "target", "targets", "hq", "clean")
+_SPLIT_NAMES = {"train": ("train", "training", "trainset", "trainingset"), "test": ("test", "testing", "testset"),
+                "val": ("val", "validation", "valid", "valset")}
+
+
+def _norm_name(s: str) -> str:
+    """'RealBlur_J' / 'realblur-j' / 'RealBlur J' -> 'realblurj' (folder names differ between dataset copies)."""
+    return "".join(ch for ch in s.lower() if ch.isalnum())
+
+
+def _blur_sharp_dirs(d: Path) -> Optional[Tuple[Path, Path]]:
+    sub = {_norm_name(c.name): c for c in _subdirs(d)}
+    b = next((sub[n] for n in _BLUR_DIR_NAMES if n in sub), None)
+    s = next((sub[n] for n in _SHARP_DIR_NAMES if n in sub), None)
+    return (b, s) if (b is not None and s is not None) else None
+
+
+def match_subsets(root: Union[str, Path], wanted: Sequence[str]) -> List[Tuple[str, Path]]:
+    """[(requested name, subset folder)]: an exact match of the normalised name first, otherwise every folder whose
+    normalised name starts with it ('RealBlur' -> RealBlur_J and RealBlur_R). The old lookup was an exact,
+    case-insensitive match only, so 'RealBlur' or 'Text-OCR' silently found nothing."""
+    children = _subdirs(root)
+    out, used = [], set()
+    for want in wanted:
+        w = _norm_name(want)
+        hits = ([c for c in children if _norm_name(c.name) == w]
+                or [c for c in children if w and _norm_name(c.name).startswith(w)])
+        for c in hits:
+            if c not in used:
+                used.add(c)
+                out.append((want, c))
     return out
 
 
-def build_real_pairs(cfg: Config, split: str, mode: str, max_images: int = 0, max_side: int = 0,
-                     first_only: bool = False) -> List[PairedImageDataset]:
-    """first_only: stop at the first usable subset (per-epoch validation uses one; listing the others was wasted IO)."""
-    subsets = cfg.real_train_subsets if split == "train" else cfg.real_test_subsets
+def find_pair_dirs(root: Union[str, Path], subsets: Sequence[str], split: str) -> List[Tuple[str, List[Tuple[Path, Path]], str]]:
+    """[(subset folder name, [(blur_dir, sharp_dir), ...], requested name)] for <root>/<subset>/<split>/{blur,sharp}
+    or <root>/<subset>/<split>/<scene>/{blur,sharp}."""
+    root = Path(root)
+    if not root.is_dir():
+        return []
+    split_names = _SPLIT_NAMES.get(split, (split,))
     out = []
-    for name, bd, sd in find_pair_dirs(cfg.paired_root, subsets, split):
+    for want, d in match_subsets(root, subsets):
+        split_dir = next((c for c in _subdirs(d) if _norm_name(c.name) in split_names), None)
+        if split_dir is None:
+            continue
+        bs = _blur_sharp_dirs(split_dir)
+        pairs = [bs] if bs else [p for p in (_blur_sharp_dirs(s) for s in _subdirs(split_dir)) if p]
+        if pairs:
+            out.append((d.name, pairs, want))
+    return out
+
+
+def describe_real_subsets(cfg: Config) -> List[str]:
+    """What happened to every requested real dataset that was NOT found (and which folders do exist), so a
+    different folder name or layout is visible instead of the dataset being silently left out."""
+    root = Path(cfg.paired_root)
+    if not root.is_dir():
+        return [f"paired_root '{cfg.paired_root}' does not exist -> no real pairs are used"]
+    lines = []
+    for split, wanted in (("train", cfg.real_train_subsets), ("test", cfg.real_test_subsets)):
+        got = {w for _, _, w in find_pair_dirs(root, wanted, split)}
+        for w in wanted:
+            if w in got:
+                continue
+            folders = [d.name for _, d in match_subsets(root, [w])]
+            why = (f"folder(s) {folders} have no '{split}' split with blur/sharp sub-folders" if folders
+                   else "no folder of that name")
+            lines.append(f"real {split} set {w!r} not used: {why}")
+    if lines:
+        lines.append(f"folders under {root}: {', '.join(c.name for c in _subdirs(root)) or '(none)'}")
+    return lines
+
+
+def build_real_pairs(cfg: Config, split: str, mode: str, max_images: int = 0, max_side: int = 0,
+                     max_total: int = 0) -> List[PairedImageDataset]:
+    """One PairedImageDataset per resolved subset folder ('RealBlur' -> RealBlur_J and RealBlur_R).
+    max_total > 0 spreads that many pairs evenly over the subsets (per-epoch validation on every real dataset)."""
+    subsets = cfg.real_train_subsets if split == "train" else cfg.real_test_subsets
+    found = find_pair_dirs(cfg.paired_root, subsets, split)
+    if max_total and found:
+        max_images = max(1, int(math.ceil(max_total / len(found))))
+    out = []
+    for name, pairs, want in found:
         try:
-            out.append(PairedImageDataset(bd, sd, cfg.image_size, mode, max_images, max_side, name=name))
+            out.append(PairedImageDataset(crop=cfg.image_size, mode=mode, max_images=max_images, max_side=max_side,
+                                          name=name, dir_pairs=pairs, group=want))
         except ValueError as e:
             print(f"[data] {e}")
-        if first_only and out:
-            break
+    return out
+
+
+def real_sharp_frames(cfg: Config) -> List[Tuple[str, List[Path]]]:
+    """Sharp frames of the real TRAIN pairs (per subset, evenly thinned to real_sharp_max_per_subset): additional
+    CLEAN images for the synthetic blur-family / noise degradations. Test splits are never used here."""
+    if not cfg.real_sharp_as_clean:
+        return []
+    out = []
+    for name, pairs, _ in find_pair_dirs(cfg.paired_root, cfg.real_train_subsets, "train"):
+        files = _spread([p for _, sd in pairs for p in list_images(sd)], cfg.real_sharp_max_per_subset)
+        if files:
+            out.append((name, files))
     return out
 
 
@@ -1765,6 +2083,11 @@ def audit_datasets(cfg: Config, n_check: int = 8) -> Dict[str, Any]:
         report["clean"][role] = {"path": d, "images": n}
         if n and _looks_degraded(d):
             problems.append(f"{role} = '{d}' is a degraded (blurred) folder but is used as CLEAN ground truth.")
+    for name, files in real_sharp_frames(cfg):  # sharp frames of the real TRAIN pairs, also used as clean images
+        report["clean"][f"{name}/train sharp"] = {"path": str(files[0].parent), "images": len(files)}
+        degraded = [f for f in files[:50] if _looks_degraded(str(f.parent))]
+        if degraded:
+            problems.append(f"{name}/train sharp frames look like degraded images ({degraded[0]}).")
     if cfg.real_images_dir and list_images(cfg.real_images_dir):
         leaf = Path(cfg.real_images_dir).name.lower()
         report["real_images"] = {"path": cfg.real_images_dir, "images": len(list_images(cfg.real_images_dir))}
@@ -1772,29 +2095,37 @@ def audit_datasets(cfg: Config, n_check: int = 8) -> Dict[str, Any]:
             problems.append(f"real_images_dir = '{cfg.real_images_dir}' contains SHARP images; it must contain the "
                             f"blurred photos to restore (e.g. .../HIDE/test/blur).")
     for split, subsets in (("train", cfg.real_train_subsets), ("test", cfg.real_test_subsets)):
-        for name, bd, sd in find_pair_dirs(cfg.paired_root, subsets, split):
+        for name, dir_pairs, want in find_pair_dirs(cfg.paired_root, subsets, split):
             # relative paths, exactly as PairedImageDataset pairs them (bare file names paired the wrong files - or
             # crashed - when scenes live in sub-folders with repeated frame names)
-            b = {p.relative_to(bd).as_posix() for p in list_images(bd)}
-            s = {p.relative_to(sd).as_posix() for p in list_images(sd)}
-            both = sorted(b & s)
-            info = {"blur": str(bd), "sharp": str(sd), "pairs": len(both), "unmatched": len(b ^ s)}
+            both, unmatched = [], 0
+            for bd, sd in dir_pairs:  # exactly the pairing PairedImageDataset uses
+                matched, n_un = match_pair_files(bd, sd)
+                both += [(b, s) for _, b, s in matched]
+                unmatched += n_un
+            info = {"blur": str(dir_pairs[0][0]), "sharp": str(dir_pairs[0][1]), "pairs": len(both),
+                    "unmatched": unmatched, "scene_folders": len(dir_pairs), "requested_as": want}
             if both:
-                pick = [both[int(i)] for i in np.linspace(0, len(both) - 1, min(n_check, len(both)))]
-                sharper = [sharpness_score(sd / k) > sharpness_score(bd / k) for k in pick]
+                pick = _spread(both, min(n_check, len(both)))
+                sharper = [sharpness_score(s) > sharpness_score(b) for b, s in pick]
                 info["sharp_is_sharper"] = f"{sum(sharper)}/{len(sharper)}"
                 if sum(sharper) < 0.75 * len(sharper):
                     problems.append(f"{name}/{split}: the 'sharp' images are not sharper than the 'blur' images in "
                                     f"{len(sharper) - sum(sharper)}/{len(sharper)} checked pairs -> folders swapped?")
             report["pairs"][f"{name}/{split}"] = info
+    notes = describe_real_subsets(cfg)
+    report["notes"] = notes
     print("Dataset audit:")
     for role, v in report["clean"].items():
         print(f"  CLEAN  {role:22s} {v['images']:6d} images  {v['path']}")
     for k, v in report["pairs"].items():
+        scenes = f", {v['scene_folders']} scene folders" if v["scene_folders"] > 1 else ""
         print(f"  PAIRS  {k:22s} {v['pairs']:6d} pairs (unmatched {v['unmatched']}, sharp sharper: "
-              f"{v.get('sharp_is_sharper', '-')})")
+              f"{v.get('sharp_is_sharper', '-')}{scenes}; requested as {v['requested_as']!r})")
     if report["real_images"]:
         print(f"  REAL   real_images_dir        {report['real_images']['images']:6d} blurred photos  {report['real_images']['path']}")
+    for n in notes:
+        print(f"  NOTE   {n}")
     for p in problems:
         print(f"  PROBLEM: {p}")
     report["problems"] = problems
@@ -1804,15 +2135,26 @@ def audit_datasets(cfg: Config, n_check: int = 8) -> Dict[str, Any]:
 
 
 def build_datasets(cfg: Config) -> Tuple[Dataset, Dataset]:
-    """Returns (train, val) of CLEAN images: train_data_dir + extra_clean_dirs, val_data_dir.
-    Falls back to procedural data if the folders are missing."""
+    """Returns (train, val) of CLEAN images: train_data_dir + extra_clean_dirs + the sharp frames of the real
+    TRAIN pairs (GoPro / HIDE / RealBlur / TextOCR ...), val_data_dir. Falls back to procedural data if the
+    folders are missing."""
     try:
         parts = [ImageDataset(cfg.train_data_dir, cfg.image_size, "train", cfg.augment, cfg.max_train_images)]
+        covered = [os.path.abspath(cfg.train_data_dir)]
         for d in cfg.extra_clean_dirs:
+            if d and os.path.abspath(d) in covered:
+                continue
             if d and list_images(d):
                 parts.append(ImageDataset(d, cfg.image_size, "train", cfg.augment, cfg.max_train_images))
+                covered.append(os.path.abspath(d))
             elif d:
                 print(f"[data] extra clean folder not found, skipped: {d}")
+        for name, files in real_sharp_frames(cfg):
+            # files already present through train_data_dir / extra_clean_dirs are not added twice
+            files = [f for f in files if not any(os.path.abspath(f).startswith(c + os.sep) for c in covered)]
+            if files:
+                parts.append(ImageDataset(None, cfg.image_size, "train", cfg.augment, paths=files,
+                                          name=f"{name}/train sharp frames (real-pair training split)"))
         train = parts[0] if len(parts) == 1 else torch.utils.data.ConcatDataset(parts)
         val = ImageDataset(cfg.val_data_dir, cfg.image_size, "val", False, cfg.max_val_images)
         return train, val
@@ -3429,20 +3771,27 @@ class Trainer:
         self.real_iter = None
         self.real_train_names: List[str] = []
         if cfg.real_pair_prob > 0:
-            parts = build_real_pairs(cfg, "train", "train")
+            parts = build_real_pairs(cfg, "train", "train")  # GoPro, HIDE, RealBlur_J/R, TextOCR ... (train splits)
             if parts:
                 real_ds = parts[0] if len(parts) == 1 else torch.utils.data.ConcatDataset(parts)
-                self.real_sampler = EpochSampler(len(real_ds), cfg.seed + 99991, self.rank, self.world_size)
+                # balanced per requested dataset (a plain uniform sampler let the largest set dominate)
+                self.real_sampler = BalancedEpochSampler([len(p) for p in parts], [p.group for p in parts],
+                                                         cfg.real_subset_balance, cfg.seed + 99991, self.rank,
+                                                         self.world_size)
+                n_real_workers = max(2, nw // 2) if nw > 0 else 0  # real steps decode full-size photo pairs
                 self.real_loader = DataLoader(real_ds, batch_size=loader_bs, sampler=self.real_sampler,
-                                              num_workers=min(2, nw), pin_memory=pin,
+                                              num_workers=n_real_workers, pin_memory=pin,
                                               drop_last=self.real_sampler.num_samples >= loader_bs,  # per rank
-                                              persistent_workers=min(2, nw) > 0)
+                                              persistent_workers=n_real_workers > 0)
                 self.real_iter = self._real_batches()
-                self.real_train_names = [f"{p.name} ({len(p)} pairs)" for p in parts]
-        real_val = build_real_pairs(cfg, "test", "val", max_images=cfg.real_val_images, first_only=True)
-        self.real_val_loader = (DataLoader(real_val[0], batch_size=cfg.batch_size, shuffle=False, num_workers=0)
-                                if real_val else None)
-        self.real_val_name = real_val[0].name if real_val else ""
+                shares = self.real_sampler.probs.tolist()
+                self.real_train_names = [f"{p.name} ({len(p)} pairs, {sh:.0%} of real steps)" for p, sh in zip(parts, shares)]
+        # Real validation on EVERY real test set (fixed centre crops, spread evenly over the subsets), not just the first.
+        real_val = build_real_pairs(cfg, "test", "val", max_total=cfg.real_val_images)
+        real_val_ds = (real_val[0] if len(real_val) == 1 else torch.utils.data.ConcatDataset(real_val)) if real_val else None
+        self.real_val_loader = (DataLoader(real_val_ds, batch_size=cfg.batch_size, shuffle=False, num_workers=0)
+                                if real_val_ds is not None else None)
+        self.real_val_name = "+".join(p.name for p in real_val)
         print(f"  [trainer] real pairs: train {', '.join(self.real_train_names) or 'none'} | validation "
               f"{self.real_val_name or 'none'} ({time.time() - t_phase:.1f} s); building optimiser / EMA / "
               f"{'DDP' if self.mode == 'ddp' else ('DataParallel' if self.mode == 'dp' else 'model')} ...")
@@ -3487,7 +3836,10 @@ class Trainer:
         self.current_epoch = 0
         self.global_step = 0
         self.best_metric = -float("inf")
-        self.best_metric_name = ("real_ema_psnr" if (cfg.select_best_by == "real" and self.real_val_loader is not None)
+        # The name carries the real validation set: scores of another set (e.g. the old GoPro-only one) are not
+        # comparable, so a changed set resets the best score instead of blocking every new 'best'.
+        self.best_metric_name = (f"real_ema_psnr[{self.real_val_name}:{len(self.real_val_loader.dataset)}]"
+                                 if (cfg.select_best_by == "real" and self.real_val_loader is not None)
                                  else "synthetic_ema_psnr")
         self.history: Dict[str, List[Any]] = {"epoch": []}
         self.lr_history: List[float] = []
@@ -3669,7 +4021,9 @@ class Trainer:
         print(f"Pretrained checkpoints protected: copied {', '.join(p.name for p in files)} "
               f"({need / 1e9:.2f} GB) -> {backup}")
 
-    def _candidate_checkpoints(self) -> List[Path]:
+    def _candidate_checkpoints(self) -> List[Tuple[Path, str]]:
+        """[(path, source)]: 'workdir' (checkpoint_dir, the continuation - always wins), 'explicit' (resume_from),
+        'found' (checkpoint names found by the search) and 'weights' (other weight files found by the search)."""
         def in_dir(d: Path) -> List[Path]:
             if not d.is_dir():
                 return []
@@ -3678,57 +4032,80 @@ class Trainer:
             c.append(d / "final_model.pt")
             return [p for p in c if p.is_file()]
 
-        cands = in_dir(self.checkpoint_dir)  # the working copy always wins (it is the continuation)
+        cfg = self.cfg
+        self._search_report = [f"{self.checkpoint_dir} (checkpoint_dir): nothing"]
+        cands = [(p, "workdir") for p in in_dir(self.checkpoint_dir)]
         if cands:
             print(f"  found {len(cands)} checkpoint(s) in {self.checkpoint_dir}")
-        rf = (self.cfg.resume_from or "").strip()
-        if not cands and rf and rf != "auto":
+            return cands
+        rf = (cfg.resume_from or "").strip()
+        if rf and rf != "auto":
             p = Path(rf)
-            cands = in_dir(p) if p.is_dir() else ([p] if p.is_file() else [])
+            cands = [(q, "explicit") for q in (in_dir(p) if p.is_dir() else ([p] if p.is_file() else []))]
             if not cands:
                 print(f"  resume_from='{rf}': no checkpoint there")
-        elif not cands and rf == "auto":
-            roots = [r for r in self.cfg.resume_search_roots if r and Path(r).is_dir()]
-            if roots:
-                cfg = self.cfg
-                print(f"  no checkpoint in '{self.checkpoint_dir}' -> searching {', '.join(roots)} (depth <= "
-                      f"{cfg.resume_search_depth}, <= {cfg.resume_search_timeout_s:g} s, data folders skipped) ...")
-                skip = [cfg.train_data_dir, cfg.val_data_dir, cfg.test_data_dir, cfg.real_images_dir, cfg.paired_root,
-                        *cfg.extra_clean_dirs, cfg.output_dir, cfg.visualization_dir]
-                cands = find_checkpoints(roots, CHECKPOINT_NAMES, cfg.resume_search_depth, cfg.resume_search_timeout_s, skip)
-                if cands:
-                    print("  checkpoints found (read-only inputs, therefore safe; the first readable one is used):")
-                    for q in cands[:10]:
-                        print(f"    {q}")
-                    if len(cands) > 10:
-                        print(f"    ... and {len(cands) - 10} more")
-        return cands
+                self._search_report.append(f"resume_from='{rf}': no checkpoint there")
+            return cands
+        if rf != "auto":
+            return []
+        roots = [r for r in cfg.resume_search_roots if r and Path(r).is_dir()]
+        if not roots:
+            return []
+        print(f"  no checkpoint in '{self.checkpoint_dir}' -> searching {', '.join(roots)} (depth <= "
+              f"{cfg.resume_search_depth}, <= {cfg.resume_search_timeout_s:g} s, data sets last) ...")
+        data_dirs = [cfg.train_data_dir, cfg.val_data_dir, cfg.test_data_dir, cfg.real_images_dir, cfg.paired_root,
+                     *cfg.extra_clean_dirs]
+        skip = data_dirs + [cfg.output_dir, cfg.visualization_dir, str(self.checkpoint_dir)]
+        found, weights = find_checkpoints(roots, cfg.resume_search_depth, cfg.resume_search_timeout_s, skip, data_dirs)
+        self._search_report.append(f"{', '.join(roots)}: {len(found)} checkpoint(s), {len(weights)} other weight file(s)")
+        if found:
+            print("  checkpoints found (read-only inputs are safe; the first compatible one is used):")
+            for q in found[:10]:
+                print(f"    {q}")
+            if len(found) > 10:
+                print(f"    ... and {len(found) - 10} more")
+        if weights:
+            print(f"  other weight files (tried last, only if they match this model exactly): "
+                  f"{', '.join(str(q) for q in weights[:5])}{' ...' if len(weights) > 5 else ''}")
+        return [(q, "found") for q in found] + [(q, "weights") for q in weights[:5]]
+
+    @staticmethod
+    def _state_dict_of(ckpt: Any) -> Optional[Dict[str, torch.Tensor]]:
+        if isinstance(ckpt, dict):
+            for key in ("model_state_dict", "ema_state_dict", "state_dict", "model"):
+                if isinstance(ckpt.get(key), dict):
+                    return ckpt[key]
+            if ckpt and all(isinstance(v, torch.Tensor) for v in ckpt.values()):
+                return ckpt
+        return None
+
+    def _mismatch(self, sd: Optional[Dict[str, torch.Tensor]]) -> str:
+        """'' when sd fits this model exactly, otherwise a short reason."""
+        if sd is None:
+            return "no model state_dict in the file"
+        own = self.model.state_dict()
+        missing, extra = set(own) - set(sd), set(sd) - set(own)
+        if missing or extra:
+            return f"{len(missing)} missing / {len(extra)} unexpected tensors"
+        bad = [k for k in own if tuple(sd[k].shape) != tuple(own[k].shape)]
+        return f"{len(bad)} tensors of a different shape (e.g. {bad[0]})" if bad else ""
 
     def _load_checkpoint(self, path: Optional[Union[str, Path]] = None) -> bool:
         self._protect_pretrained()
+        self._search_report: List[str] = []
         if path:
-            cands = [Path(path)]
+            cands = [(Path(path), "explicit")]
         else:
             # One search (rank 0) and the SAME decision on every rank: two independent searches could disagree
             # (time limit), and a rank that resumes while the other starts from scratch deadlocks DDP.
             cands = self._candidate_checkpoints() if self.is_main else []
             if self.distributed:
-                box = [[str(p) for p in cands]]
+                box = [[(str(p), src) for p, src in cands], list(self._search_report)]
                 dist.broadcast_object_list(box, src=0)
-                cands = [Path(p) for p in box[0]]
-        if not cands:
-            if self.cfg.require_pretrained:
-                raise RuntimeError(
-                    f"No pretrained checkpoint found in '{self.checkpoint_dir}'"
-                    + (f" or under {', '.join(self.cfg.resume_search_roots)}" if self.cfg.resume_from == "auto" else "")
-                    + ". Refusing to silently start from scratch. "
-                    "Attach the notebook output / dataset holding checkpoint_latest.pt (Add Input), or set "
-                    "Config.resume_from='/kaggle/input/.../checkpoint_latest.pt'. For a genuinely new run set "
-                    "Config.require_pretrained=False.")
-            print("No checkpoint found. Starting from scratch.")
-            return False
-        errors = []
-        for p in cands:
+                cands = [(Path(p), src) for p, src in box[0]]
+                self._search_report = box[1]
+        errors, mismatched, skipped = [], [], []
+        for p, src in cands:
             t0 = time.time()
             print(f"  reading {p} ...")
             try:
@@ -3736,12 +4113,40 @@ class Trainer:
                 # parameters' device, so mapping to the GPU only doubled the peak GPU memory at start-up.
                 ckpt = torch.load(p, map_location="cpu", weights_only=False)
             except Exception as e:  # noqa: BLE001 (truncated / corrupt file -> next candidate)
-                errors.append(f"{p}: {e}")
+                errors.append((p, src, str(e)))
                 print(f"  could not read {p} ({e}) -> trying the next candidate")
                 continue
+            if src in ("found", "weights"):
+                # Files found by the search may belong to another project: only an exact fit is used. A misfit
+                # checkpoint of THIS pipeline is reported below (it is probably the pretrained run with other
+                # architecture settings) - it is never silently replaced by a model trained from scratch.
+                why = self._mismatch(self._state_dict_of(ckpt))
+                if why:
+                    print(f"  {p} does not fit this model ({why}) -> next candidate")
+                    (mismatched if src == "found" else skipped).append((p, why, ckpt))
+                    continue
+                if src == "weights":
+                    ckpt = {"model_state_dict": self._state_dict_of(ckpt)}
             print(f"Loading checkpoint from {p} (read in {time.time() - t0:.1f} s)")
             return self._restore(ckpt, p)
-        raise RuntimeError("Checkpoints exist but none could be read - nothing was modified:\n" + "\n".join(errors))
+        if any(src in ("workdir", "explicit") for _, src, _ in errors):
+            raise RuntimeError("Checkpoints exist but none could be read - nothing was modified:\n"
+                               + "\n".join(f"{p}: {e}" for p, _, e in errors))
+        if mismatched:  # a checkpoint of this pipeline exists but does not fit: show which settings differ
+            p, why, ckpt = mismatched[0]
+            return self._restore(ckpt, p)  # raises the architecture error with the Config diff
+        report = self._search_report + [f"{p}: {why}" for p, why, _ in skipped] + [f"{p}: unreadable ({e})"
+                                                                                for p, _, e in errors]
+        hint = ("Attach the notebook version (its Output) or the dataset / model that holds checkpoint_latest.pt with "
+                "'Add Input', or set Config.resume_from='/kaggle/input/.../checkpoint_latest.pt'.")
+        if self.cfg.require_pretrained:
+            raise RuntimeError("No pretrained checkpoint found:\n  " + "\n  ".join(report) + "\n" + hint
+                               + " For a genuinely new run set Config.require_pretrained=False.")
+        bar = "!" * 78
+        print(f"\n{bar}\nNO PRETRAINED CHECKPOINT FOUND -> TRAINING STARTS FROM SCRATCH.\n  "
+              + "\n  ".join(report) + f"\nTo continue a pretrained model instead: {hint}\n"
+              "(Config.require_pretrained=True turns this into an error.)\n" + bar + "\n")
+        return False
 
     def _restore(self, ckpt: Dict[str, Any], path: Path) -> bool:
         saved_cfg = ckpt.get("config") or {}
@@ -3755,7 +4160,9 @@ class Trainer:
             raise RuntimeError(
                 f"{path} does not match the current architecture. Nothing was moved or overwritten. Put the "
                 f"architecture settings of the pretrained run back into Config"
-                + (":\n" + "\n".join(diff) if diff else ".") + f"\n{str(e)[:2000]}") from None
+                + (":\n" + "\n".join(diff) if diff else ".")
+                + "\n(If this file is not your model, set Config.resume_from to your checkpoint, or to '' to start "
+                  "from scratch.)" + f"\n{str(e)[:2000]}") from None
         sem = self._config_diff(saved_cfg, self.SEMANTIC_KEYS)
         if sem:
             print("  WARNING: these settings differ from the pretrained run and change what the network was trained on:\n"
@@ -3994,6 +4401,10 @@ class Trainer:
                     "real_ssim_direct": ssim(rd["output"], x0)}
             for k, v in vals.items():
                 acc.setdefault(k, []).extend(v.float().cpu().tolist())
+            # per real dataset (GoPro / HIDE / RealBlur_J / ...): input, direct and SRN PSNR
+            for i, name in enumerate(batch.get("subset") or []):
+                for k in ("real_psnr_input", "real_psnr_direct", "real_psnr_srn"):
+                    acc.setdefault(f"{k}@{name}", []).append(float(vals[k][i]))
         out = {k: float(np.mean(v)) for k, v in acc.items()}
         if out:
             out["real_psnr_best"] = max(out["real_psnr_direct"], out["real_psnr_srn"])
@@ -4055,6 +4466,9 @@ class Trainer:
                   "sampler_nonfinite", "real_psnr_input", "real_psnr_direct", "real_psnr_srn", "real_ssim_srn",
                   "real_ssim_direct", "real_psnr_best"):
             if k in ve:
+                self._append(f"val_ema_{k}", ve[k])
+        for k in ve:  # per real dataset ('real_psnr_srn@HIDE', ...)
+            if "@" in k:
                 self._append(f"val_ema_{k}", ve[k])
         self._append("lr", self.optimizer.param_groups[0]["lr"])
         n = len(self.history["epoch"])
@@ -4140,7 +4554,7 @@ class Trainer:
                   if (do_val and self.ema is not None) else {})
             self._record(epoch, tr, va, ve)
             sel = ve or va
-            if self.best_metric_name == "real_ema_psnr":
+            if self.best_metric_name.startswith("real_ema_psnr"):
                 metric = sel.get("real_psnr_best", float("nan"))
             else:
                 metric = sel.get("psnr", float("nan"))
@@ -4162,6 +4576,11 @@ class Trainer:
                       f"SRN {sel['real_psnr_srn']:.2f} dB (SSIM {sel['real_ssim_srn']:.4f})"
                       + (f" | train on real pairs: {tr['real_psnr']:.2f} dB (input {tr.get('real_psnr_input', float('nan')):.2f})"
                          if "real_psnr" in tr else ""))
+                per = sorted({k.split("@", 1)[1] for k in sel if k.startswith("real_psnr_srn@")})
+                if per:
+                    print("         per dataset (input -> direct / SRN dB): " + " | ".join(
+                        f"{n} {sel[f'real_psnr_input@{n}']:.2f} -> {sel[f'real_psnr_direct@{n}']:.2f} / "
+                        f"{sel[f'real_psnr_srn@{n}']:.2f}" for n in per))
             barrier()
             if self.stop_requested:  # budget hit on the last batch of an epoch: the epoch was saved complete
                 print("\nTime budget reached at the end of the epoch; the next run starts the next epoch.")
@@ -4513,9 +4932,9 @@ class Inferencer:
         """Blind restoration: the Spectral Clock Estimator reads tau(x) from the photo itself.
         For DBlur-style folders (.../blur/NAME) the sharp frame .../sharp/NAME is used as ground truth."""
         image_path = Path(image_path)
-        if gt is None and image_path.parent.name.lower() == "blur":
-            cand = image_path.parent.parent / "sharp" / image_path.name
-            gt = cand if cand.is_file() else None
+        if gt is None and _norm_name(image_path.parent.name) in _BLUR_DIR_NAMES:  # blur/NAME -> sharp/NAME (or gt/...)
+            sharp_dirs = [d for d in _subdirs(image_path.parent.parent) if _norm_name(d.name) in _SHARP_DIR_NAMES]
+            gt = next((d / image_path.name for d in sharp_dirs if (d / image_path.name).is_file()), None)
         save_dir = save_dir or self._dir("real", image_path.stem)
         save_dir.mkdir(parents=True, exist_ok=True)
         y, orig_size = load_image_tensor(image_path, self.cfg.real_max_side)
