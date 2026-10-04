@@ -7009,6 +7009,8 @@ public:
                 ns->set("platform", makeStringValue(plat));
                 ns->set("executable", makeStringValue(nyrt::executable_path()));
                 ns->set("version", makeStringValue(NYTHON_VERSION));
+                // Python's: 2**31 - 1 on a 32-bit build, 2**63 - 1 on a 64-bit one.
+                ns->set("maxsize", intValue((int64_t)PTRDIFF_MAX));
                 ctx->defineByName(in_node->alias.empty() ? "sys" : in_node->alias, Value((Collectable*)ns));
                 ctx->defineByName("argv", argv_list);
                 ctx->defineByName("platform", makeStringValue(plat));

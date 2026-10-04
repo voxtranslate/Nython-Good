@@ -267,6 +267,10 @@ check("isinstance of a lazy zip", isinstance(zip(three()), "generator"), true)
 check("a list is not one", isinstance([1], "generator"), false)
 check("type of each", [type(three()), type(zip(three())), type(enumerate(three()))], ["generator", "generator", "generator"])
 
+# ── sys.maxsize ──────────────────────────────────────────────────────────
+import sys
+check("sys.maxsize is Python's", sys.maxsize == 2 ** 31 - 1 or sys.maxsize == 2 ** 63 - 1, true)
+
 # ── import nytorch leaves the builtins alone ─────────────────────────────
 # On the VM it registered an older block of 171 general builtins again, over
 # the current ones: repr of a string with a newline came out unescaped,

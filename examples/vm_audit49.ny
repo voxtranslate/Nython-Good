@@ -333,9 +333,17 @@ async def many_main(n):
     for r in rs:
         total = total + r
     return [total, threads_during, thread_count()]
+# Each suspended task holds a stack: 2000 of them where the address space
+# allows. A 32-bit build has 2 GB, and Wine reserves at least 1 MB per fiber
+# stack (Windows itself rounds to 64 KB): 1500 there - the thread per task
+# this replaced stopped near 200 on 32-bit Windows (8 MB reserved each).
+import sys
+var n_tasks = 2000
+if sys.maxsize <= 2147483647:
+    n_tasks = 1500
 var threads_before = thread_count()
 var waits_before = thread_wait_count()
-check("2000 tasks", async_run(many_main(2000)), [1999000, threads_before, threads_before])
+check(str(n_tasks) + " tasks", async_run(many_main(n_tasks)), [n_tasks * (n_tasks - 1) // 2, threads_before, threads_before])
 check("no thread slept for them", thread_wait_count() - waits_before < 20, true)
 if os_threads() > 0:
     # (each task used to be an OS thread: 2000 of them here)

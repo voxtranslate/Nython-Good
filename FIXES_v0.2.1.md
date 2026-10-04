@@ -5502,7 +5502,7 @@ Full detail in `HANDOFF.md` §0o. New tests: `vm_audit63` (59 checks) and `vm_au
 | Windows: a second program could bind a port another was listening on, both receiving connections | `socket_bind` set SO_REUSEADDR, which means that on Windows | not set on Windows (its default already rebinds past TIME_WAIT), as Python's `create_server` |
 | `IdeIntegration.format_code` never returned | its loop never advanced | fixed |
 | Two IDEs (or a test run on both engines at once) ran each other's REPL/command-line programs | the toolchain's staged files were `nyide_<n>_<name>` with `n` from 1 in every process; untitled runs `nyide_run_<n>.ny` | process / session id in the names; staged files removed after the run |
-| 32-bit Windows: 2000 async tasks raised MemoryError | 1 MB of stack address space per task (2 GB in all) | 256 KB task stacks there; deep calls continue on extension stacks on both engines (the VM's `run_frame`, as the interpreter's generators) |
+| 32-bit Windows: 2000 async tasks raised MemoryError | 1 MB of stack address space per task (2 GB in all) | 256 KB task stacks there; deep calls continue on extension stacks on both engines (the VM's `run_frame`, as the interpreter's generators). Under Wine a fiber still reserves 1 MB at least (about 1800 tasks on 32-bit); vm_audit49 sizes its count by the new `sys.maxsize` |
 | A builtin called near the floor of a small coroutine stack crashed | `dispatch_io`/`dispatch_network` (and the pipe drain) held a 64 KB buffer on the stack, reserved on every call of the dispatcher | heap buffers |
 
 Removed: `src/GarbageCollector.cpp`, `include/GarbageCollector.hpp`, `include/GarbageCollectorConfig.hpp` (unused since round 75) and `include/Evaluator.hpp` (never used; the only caller of the old allocator).

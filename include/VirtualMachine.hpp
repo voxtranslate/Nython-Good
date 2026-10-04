@@ -2890,6 +2890,7 @@ public:
         (*ns.map)["platform"]=VMVal::make_str(plat);
         (*ns.map)["executable"]=VMVal::make_str(nyrt::executable_path());
         (*ns.map)["version"]=VMVal::make_str(NYTHON_VERSION);
+        (*ns.map)["maxsize"]=VMVal::make_int((int64_t)PTRDIFF_MAX);   // as the interpreter's
         ns.class_name=as_name;
         globals_[as_name]=ns;
         globals_["argv"]=argv_list;

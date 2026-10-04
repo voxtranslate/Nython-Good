@@ -145,6 +145,13 @@ generators) on the thread that runs its loop:
   too (it raised RecursionError there) - so a task recurses to the engine's
   depth limit whatever its stack, and blocks there (relayed through the
   extension). vm_audit49 passes with 64 KB stacks on both engines.
+  **Wine** reserves at least 1 MB per fiber stack whatever is asked for
+  (Windows itself rounds to 64 KB), so the 32-bit build under Wine holds
+  about 1800 suspended tasks (2 GB); vm_audit49 uses 1500 when
+  `sys.maxsize` (new, Python's: 2**31 - 1 on 32-bit, 2**63 - 1 on 64-bit,
+  both engines) says 32-bit, 2000 otherwise. Linking the 32-bit build
+  large-address-aware would give it 4 GB on 64-bit Windows - not done (it
+  needs an audit for pointers read as signed 32-bit values).
 - `dispatch_io` and `dispatch_network` kept a 64 KB read buffer on the stack
   (and `os_run`'s pipe drain): GCC reserves it for every call of the
   dispatcher, so every builtin the chain passes through them touched 64 KB
