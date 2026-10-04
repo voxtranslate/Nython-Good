@@ -163,10 +163,12 @@ if gv != none and string_startswith(gv, "git version"):
     repo.stage("f.ny")
     check("staged", len(repo.staged()), 1)
     os_exec("cd " + dir + " && git config user.name t && git config user.email t@t")
-    check("commit", repo.commit("change two", dir + "/../ny_audit43_msg.txt"), true)
+    # The message file is this run's too (a shared /tmp/ny_audit43_msg.txt
+    # let the other engine's run remove it mid-commit).
+    check("commit", repo.commit("change two", dir + "_msg.txt"), true)
     check("log", string_find(repo.log(1)[0], "change two") >= 0, true)
     check("unstaged left", len(repo.unstaged()), 1)
-    os_exec("rm -rf " + dir)
+    os_exec("rm -rf " + dir + " " + dir + "_msg.txt")
 else:
     print("(git not installed: repository checks skipped)")
 

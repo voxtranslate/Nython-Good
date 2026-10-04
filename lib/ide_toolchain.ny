@@ -82,17 +82,33 @@ class Toolchain:
             return ""
 
     # ── temp file plumbing ───────────────────────────────────────────────────
+    # This process's own name (the counter starts at 1 in every process: two
+    # IDEs, or a test run on both engines at once, wrote each other's files).
     def _temp_path(self, name):
         self.seq = self.seq + 1
         var safe = name
         if len(safe) == 0:
             safe = "buffer"
-        return self.tmp_dir + "/nyide_" + str(self.seq) + "_" + safe
+        return self.tmp_dir + "/nyide_" + str(os_getpid()) + "_" + str(self.seq) + "_" + safe
 
     def _stage(self, source, name):
         var p = self._temp_path(name)
         write_file(p, source)
         return p
+
+    # Runs argv + [the staged source] and removes the staged file (its output
+    # is captured whole; the files used to pile up in the temp directory).
+    def _staged(self, argv, source, name):
+        var p = self._stage(source, name)
+        var res = self._timed(argv + [p])
+        self._unstage(p)
+        return res
+
+    def _unstage(self, p):
+        try:
+            os_remove(p)
+        except Exception:
+            pass
 
     # Runs a program (argv list, no shell - nothing in a path is interpreted,
     # on any platform), capturing stdout and stderr together, in order, and
@@ -131,29 +147,24 @@ class Toolchain:
 
     # ── pipeline modes ───────────────────────────────────────────────────────
     def run(self, source, name, use_vm):
-        var p = self._stage(source, name)
         if use_vm:
-            return self._timed([self.exe, "--vm", p])
-        return self._timed([self.exe, p])
+            return self._staged([self.exe, "--vm"], source, name)
+        return self._staged([self.exe], source, name)
 
     def tokenize(self, source, name):
-        var p = self._stage(source, name)
-        return self._timed([self.exe, "-t", p])
+        return self._staged([self.exe, "-t"], source, name)
 
     def ast(self, source, name):
-        var p = self._stage(source, name)
-        return self._timed([self.exe, "-a", p])
+        return self._staged([self.exe, "-a"], source, name)
 
     def disasm(self, source, name):
-        var p = self._stage(source, name)
-        return self._timed([self.exe, "-d", p])
+        return self._staged([self.exe, "-d"], source, name)
 
     # ── profiling ────────────────────────────────────────────────────────────
     # Runs under `--profile` and splits the measured report off the program's
     # own stdout. Rows are [name, calls, total_ms, self_ms], hottest first.
     def profile(self, source, name):
-        var p = self._stage(source, name)
-        var res = self._timed([self.exe, "--profile", p])
+        var res = self._staged([self.exe, "--profile"], source, name)
         var rows = []
         var in_report = false
         var i = 0
@@ -191,6 +202,7 @@ class Toolchain:
         var out = []
         var p = self._stage(source, name)
         var res = self._exec([self.exe, "-a", p])
+        self._unstage(p)
         var i = 0
         while i < res.line_count:
             var ln = res.lines[i]

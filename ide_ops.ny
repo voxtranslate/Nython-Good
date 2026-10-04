@@ -1260,7 +1260,8 @@ class IDEOps(IDECore):
                 self._write_doc(d, d.path)
             return d.path
         self.run_seq = self.run_seq + 1
-        var tmp = self.tmp + "/nyide_run_" + str(self.run_seq) + ".ny"
+        # The session's own name, as the job and terminal files have.
+        var tmp = self.tmp + "/nyide_run_" + str(self.session_id) + "_" + str(self.run_seq) + ".ny"
         write_file(tmp, d.buf.get_all_text())
         return tmp
 

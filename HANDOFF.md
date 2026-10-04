@@ -213,6 +213,15 @@ generators) on the thread that runs its loop:
   socket bind a port in use (both then get connections). Not set there any
   more (Windows' default already rebinds past TIME_WAIT), as Python's
   `socket.create_server` does: a second listener gets a bind error.
+- **Two processes overwrote each other's staged programs.** `Toolchain`
+  (`lib/ide_toolchain.ny`, the IDE's REPL, command line, profiler and
+  PROBLEMS check) staged source as `nyide_<n>_<name>` in the temp directory
+  with `n` counting from 1 in every process, and the IDE ran an untitled
+  buffer as `nyide_run_<n>.ny`: two IDEs - or a test run on both engines at
+  once (`gui_tests/test_27`, 3 failures in 48 parallel runs) - ran each
+  other's programs. The names carry the process / session id now, and a
+  staged file is removed once its output is captured (they piled up).
+  `vm_audit43` committed with a shared `/tmp/ny_audit43_msg.txt` (1 in 40).
 - `lib/aiagent.ny`'s `IdeIntegration.format_code` never advanced its loop
   (an infinite loop on any input) and indexed an empty list; fixed. Nothing
   called it.
