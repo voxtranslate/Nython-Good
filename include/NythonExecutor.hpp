@@ -100,9 +100,11 @@ static std::string utf8_lower(const std::string& s) {
 }
 // utf8_charcount removed (unused, functionality inlined)
 
-#include "Evaluator.hpp"
 #include "Context.hpp"
 #include "ASTNodes.hpp"
+#include "Interpreter.hpp"
+#include "Class.hpp"
+#include "VirtualMachine.hpp"
 #include "DynamicLang.hpp"
 #include "Runtime.hpp"
 #include "NyCoro.hpp"   // stackful coroutines (round 75)
@@ -863,7 +865,7 @@ public:   // NythonExecutor is a struct: members default to public
                 // Walrus operator: (var name = expr) — evaluates expr, stores it, returns value
                 auto wn = static_pointer_cast<WalrusNode>(node);
                 Value v = evalNode(wn->init, ctx);
-                ctx->defineByName(wn->name, v);
+                (wn->global_ref ? moduleCtx(ctx) : ctx)->defineByName(wn->name, v);
                 return v;
             }
             default: return NONE_VALUE;
@@ -1765,9 +1767,38 @@ public:   // NythonExecutor is a struct: members default to public
         char buf[32]; snprintf(buf, sizeof buf, "%p", k.type == ValueType::USERDATA ? k.value.p : (void*)k.value.gc);
         std::string id = std::string(k.type == ValueType::USERDATA ? "u" : "g") + buf;
         key_objs_[id] = k;
+        if (!keys_owner_) {
+            keys_owner_ = this;
+            nygc::g_keys.any = &keysAny;
+            nygc::g_keys.each = &keysEach;
+            nygc::g_keys.lookup = &keysLookup;
+            nygc::g_keys.drop_garbage = &keysDropGarbage;
+        }
         return nypy::key_of_obj(id);
     }
-    std::unordered_map<std::string, Value> key_objs_;   // object keys, by identity
+    // Object keys, by identity. An entry does not keep its object alive by
+    // itself: full collections treat its reference as the dicts' (NyGC.hpp,
+    // KeyTable) and drop it with the object. Entries made only to look a key
+    // up go at the next full collection.
+    std::unordered_map<std::string, Value> key_objs_;
+    static inline NythonExecutor* keys_owner_ = nullptr;
+    static bool keysAny() { return keys_owner_ && !keys_owner_->key_objs_.empty(); }
+    static void keysEach(nython::gc::GcVisitFn visit, void* arg) {
+        for (auto& kv : keys_owner_->key_objs_) if (kv.second.value.o) visit(kv.second.value.o, arg);
+    }
+    static nython::gc::Collectable* keysLookup(const std::string& id) {
+        auto it = keys_owner_->key_objs_.find(id);
+        return it == keys_owner_->key_objs_.end() ? nullptr : it->second.value.o;
+    }
+    static void keysDropGarbage() {
+        std::vector<Value> dead;   // released after the loop; the collector still holds them
+        auto& t = keys_owner_->key_objs_;
+        for (auto it = t.begin(); it != t.end();) {
+            auto* o = it->second.value.o;
+            if (o && (o->gc_flags & nygc::F_COLLECTING)) { dead.push_back(it->second); it = t.erase(it); }
+            else ++it;
+        }
+    }
     Value keyValue(const std::string& k) {
         switch (nypy::key_kind(k)) {
             case nypy::K_STR: return nypy::key_is_plain(k) ? internString(k) : makeStringValue(k.substr(2));
@@ -2105,7 +2136,9 @@ public:   // NythonExecutor is a struct: members default to public
                         auto it = cont->container->find(std::to_string(j));
                         if (it != cont->container->end()) return it->second;
                     }
-                    throw std::string("__exc__:IndexError:index " + std::to_string(i) + " out of range (length " + std::to_string(n) + ")");
+                    // Python's words, as the VM says them (it said "index 5
+                    // out of range (length 2)" here).
+                    throw std::string(std::string("__exc__:IndexError:") + (isTupleCont(cont) ? "tuple" : "list") + " index out of range");
                 }
             }
             auto it = dictFind(cont, idx);
@@ -2670,13 +2703,19 @@ public:   // NythonExecutor is a struct: members default to public
         std::streambuf* saved = nullptr;
         if (trace_on() && !tracer().in_repr) saved = std::cout.rdbuf(cap.rdbuf());
         struct Restore { std::streambuf* s; ~Restore() { if (s) std::cout.rdbuf(s); } } restore{saved};
+        // Every argument is evaluated before anything is written, as in
+        // Python and on the VM: `print(a(), b())` shows the output of a()
+        // and b() first, then the line (it printed a()'s value between
+        // them).
+        std::vector<Value> vals;
+        vals.reserve(pn->args.size());
+        for (auto& a : pn->args) vals.push_back(evalNode(a, ctx));
         std::string sep = " ", end = "\n";
         if (pn->sep) { Value sv = evalNode(pn->sep, ctx); if (!sv.isNone()) sep = getStringValue(sv); }
         if (pn->end) { Value ev = evalNode(pn->end, ctx); if (!ev.isNone()) end = getStringValue(ev); }
-        for (size_t i = 0; i < pn->args.size(); i++) {
+        for (size_t i = 0; i < vals.size(); i++) {
             if (i > 0) std::cout << sep;
-            Value v = evalNode(pn->args[i], ctx);
-            printValue(v, ctx);
+            printValue(vals[i], ctx);
         }
         if (saved) {
             std::cout.rdbuf(saved);
@@ -3156,7 +3195,7 @@ public:   // NythonExecutor is a struct: members default to public
             Context* fn_ctx = new Context(runner, "<lambda>", nullptr, nullptr, closure_parent);
             CtxReaper _reap_fn_ctx2033(this, fn_ctx);
             static const std::unordered_map<std::string, Value> no_kw;
-            bindLambdaParams(lam, call_args, no_kw, fn_ctx, closure_parent);
+            bindLambdaParams(lam, call_args, no_kw, fn_ctx, closure_parent, fn_val.value.p);
             return evalNode(lam->body, fn_ctx);
         }
         return NONE_VALUE;
@@ -4068,37 +4107,27 @@ public:   // NythonExecutor is a struct: members default to public
         void* unique_ptr = (void*)&fo->id;
         Value fn_val = nyheap::userValue(fo, unique_ptr);
 
-        // Create a persistent closure context that copies current bindings
-        // This prevents dangling pointers when the enclosing function returns
-        Context* closure_ctx = new Context(runner, "__closure__", nullptr, nullptr, ctx->parent);
-        CtxReaper _closure_creator(this, closure_ctx);   // the lambda takes its own reference
-        if (ctx->container) {
-            for (auto& [k, v] : *ctx->container) {
-                closure_ctx->defineByName(k, v);
-            }
-        }
-        // Also walk up and copy parent bindings for nested closures
-        Context* walk = ctx->parent;
-        while (walk) {
-            if (walk->container) {
-                for (auto& [k, v] : *walk->container) {
-                    // Only copy if not already defined (local takes priority)
-                    try {
-                        Value existing = closure_ctx->getByName(k);
-                        if (existing.type == ValueType::UNDEFINED) {
-                            closure_ctx->defineByName(k, v);
-                        }
-                    } catch (...) {
-                        closure_ctx->defineByName(k, v);
-                    }
-                }
-            }
-            walk = walk->parent;
-        }
-
+        // A lambda closes over the scope it is made in, as a `def` does
+        // (evalFunctionDecl): it sees later assignments there, so a lambda
+        // can call itself through the name it is assigned to, and
+        // `[lambda: i for i in range(3)]` all return 2, as in Python and on
+        // the VM. It used to copy every visible binding when it was made
+        // (from before scopes were reference-counted), which broke both and
+        // copied the whole module for each lambda.
         func_names[unique_ptr] = "__lambda__";
-        closure_contexts[unique_ptr] = closure_ctx;
-        fo->setScope(closure_ctx);
+        closure_contexts[unique_ptr] = ctx;
+        fo->setScope(ctx);
+        // Defaults are evaluated now, as a def's are (captureDefaults):
+        // `[lambda i=i: i for i in range(3)]` keeps 0, 1, 2.
+        auto* lam = static_cast<LambdaNode*>(node.get());
+        bool any_default = false;
+        for (auto& d : lam->defaults) if (d) { any_default = true; break; }
+        if (any_default) {
+            std::vector<Value> vals(lam->params.size(), UNDEFINED_VALUE);
+            for (size_t i = 0; i < lam->params.size() && i < lam->defaults.size(); i++)
+                if (lam->defaults[i]) vals[i] = evalNode(lam->defaults[i], ctx);
+            fn_defaults_val_[unique_ptr] = std::move(vals);
+        }
         func_ast_nodes[unique_ptr] = (void*)node.get();
         heap_owner_[unique_ptr] = fo;
         nygc::track(fo);
@@ -4282,7 +4311,13 @@ public:   // NythonExecutor is a struct: members default to public
     // The same for a lambda: binds its parameters (positional, keyword,
     // *args, defaults evaluated in `def_ctx`) and checks the call fits.
     void bindLambdaParams(LambdaNode* lam, std::vector<Value>& args,
-                          const std::unordered_map<std::string, Value>& kw, Context* fc, Context* def_ctx) {
+                          const std::unordered_map<std::string, Value>& kw, Context* fc, Context* def_ctx,
+                          void* callee_ptr = nullptr) {
+        const std::vector<Value>* made = nullptr;   // defaults evaluated by evalLambda
+        if (callee_ptr) {
+            auto it = fn_defaults_val_.find(callee_ptr);
+            if (it != fn_defaults_val_.end()) made = &it->second;
+        }
         size_t ai = 0, min_pos = 0, max_pos = 0;
         bool has_varargs = false;
         std::vector<std::string> missing;
@@ -4302,7 +4337,11 @@ public:   // NythonExecutor is a struct: members default to public
             auto kw_it = kw.find(pname);
             if (ai < args.size()) fc->defineByName(pname, args[ai++]);
             else if (kw_it != kw.end()) fc->defineByName(pname, kw_it->second);
-            else if (has_default) fc->defineByName(pname, evalNode(lam->defaults[i], def_ctx));
+            else if (has_default) {
+                if (made && i < made->size() && (*made)[i].type != ValueType::UNDEFINED)
+                    fc->defineByName(pname, (*made)[i]);
+                else fc->defineByName(pname, evalNode(lam->defaults[i], def_ctx));
+            }
             else { fc->defineByName(pname, NONE_VALUE); missing.push_back(pname); }
         }
         std::string err = nython::ny_arity_error("", missing, min_pos, has_varargs ? -1L : (long)max_pos, args.size());
@@ -4834,7 +4873,7 @@ public:
                                         if (cit != closure_contexts.end()) cp = cit->second;
                                         Context* fc = new Context(runner, "<lambda>", nullptr, nullptr, cp);
                                         CtxReaper _reap_fc3618(this, fc);
-                                        bindLambdaParams(lam, args, kw_args, fc, cp);
+                                        bindLambdaParams(lam, args, kw_args, fc, cp, attr_val.value.p);
                                         return evalNode(lam->body, fc);
                                     } else if (raw->type() == NodeType::FUNCTION) {
                                         auto fn = static_cast<FunctionNode*>(raw);
@@ -5080,7 +5119,7 @@ public:
                     if (cit2 != closure_contexts.end()) closure_parent = cit2->second;
                     Context* fn_ctx = new Context(runner, "<lambda>", nullptr, nullptr, closure_parent);
                     CtxReaper _reap_fn_ctx3854(this, fn_ctx);
-                    bindLambdaParams(lam, args, kw_args, fn_ctx, closure_parent);
+                    bindLambdaParams(lam, args, kw_args, fn_ctx, closure_parent, callee.value.p);
                     Value result = evalNode(lam->body, fn_ctx);
                     return result;
                 }
@@ -5691,25 +5730,38 @@ public:
         std::string t = fnTag(func_names, v.value.p);
         return t.rfind("__func__:", 0) == 0 || t.rfind("__lambda__", 0) == 0;
     }
-    struct BoundMember { Value recv; std::string name; };
-    std::unordered_map<void*, BoundMember> bound_members_;
-    std::map<std::pair<uintptr_t, std::string>, void*> bound_member_cache_;
-    std::vector<std::unique_ptr<std::string>> bound_member_store_;
+    // A heap object (nyheap::BMember) holding the receiver; the tables refer
+    // to it without owning it and lose its entries when it is freed.
+    std::unordered_map<void*, nyheap::BMember*> bound_members_;
+    std::map<std::pair<uintptr_t, std::string>, nyheap::BMember*> bound_member_cache_;
     Value boundMember(const Value& recv, const std::string& name) {
         uintptr_t id = 0;
         if (recv.type == ValueType::USERDATA) id = (uintptr_t)recv.value.p;
         else if (recv.isCollectable()) id = (uintptr_t)recv.value.gc;
         if (id) {
             auto it = bound_member_cache_.find({id, name});
-            if (it != bound_member_cache_.end()) { Value v; v.type = ValueType::USERDATA; v.value.p = it->second; return v; }
+            if (it != bound_member_cache_.end()) return nyheap::userValue(it->second, (void*)&it->second->tag);
         }
-        bound_member_store_.push_back(std::make_unique<std::string>("__bmethod__:" + name));
-        void* p = bound_member_store_.back().get();
-        func_names[p] = "__bmethod__:" + name;
-        bound_members_[p] = BoundMember{recv, name};
-        if (id) bound_member_cache_[{id, name}] = p;
-        Value v; v.type = ValueType::USERDATA; v.value.p = p;
+        auto* bm = new nyheap::BMember(this, "__bmethod__:" + name);
+        void* p = (void*)&bm->tag;
+        Value v = nyheap::userValue(bm, p);
+        bm->recv = recv;
+        bm->name = name;
+        bm->key_id = id;
+        func_names[p] = bm->tag;
+        bound_members_[p] = bm;
+        if (id) bound_member_cache_[{id, name}] = bm;
+        nygc::track(bm);
         return v;
+    }
+    void forgetBoundMember(nyheap::BMember* bm) {
+        void* p = (void*)&bm->tag;
+        func_names.erase(p);
+        bound_members_.erase(p);
+        if (bm->key_id) {
+            auto it = bound_member_cache_.find({bm->key_id, bm->name});
+            if (it != bound_member_cache_.end() && it->second == bm) bound_member_cache_.erase(it);
+        }
     }
     // Calls a bound member made by boundMember; false if `fn` is not one.
     bool callBoundMember(const Value& fn, std::vector<Value>& args, const std::unordered_map<std::string, Value>* kw,
@@ -5717,8 +5769,9 @@ public:
         if (fn.type != ValueType::USERDATA || !fn.value.p) return false;
         auto it = bound_members_.find(fn.value.p);
         if (it == bound_members_.end()) return false;
-        BoundMember bm = it->second;
-        out = callMethod(bm.recv, bm.name, args, ctx, kw);
+        Value recv = it->second->recv;          // kept while the call runs
+        std::string name = it->second->name;
+        out = callMethod(recv, name, args, ctx, kw);
         return true;
     }
     // The text of the AttributeError for obj.name.
@@ -6276,7 +6329,7 @@ public:
         if (!match) { run_finally(); throw exc; }
 
         if (!match->var.empty()) {
-            ctx->defineByName(match->var, exceptionObject(exc));
+            (match->var_global ? moduleCtx(ctx) : ctx)->defineByName(match->var, exceptionObject(exc));
         }
         handling_exc_.push_back(exc);
         handling_obj_.emplace_back(exc, excInstanceOf(exc));
@@ -7989,7 +8042,7 @@ public:
             std::vector<Value> no_args;
             ctx_val = callMethod(v, "__enter__", no_args, ctx);
         }
-        if (!wn->alias.empty()) ctx->defineByName(wn->alias, ctx_val);
+        if (!wn->alias.empty()) (wn->alias_global ? moduleCtx(ctx) : ctx)->defineByName(wn->alias, ctx_val);
         auto exit_plain = [&]() {
             if (!managed || !instanceHasMethod(v, "__exit__")) return;
             std::vector<Value> a{NONE_VALUE, NONE_VALUE, NONE_VALUE};
@@ -8200,6 +8253,7 @@ public:
             handling_obj_.clear();
             for (auto& kv : key_objs_) dead.push_back(kv.second);
             key_objs_.clear();
+            if (keys_owner_ == this) { keys_owner_ = nullptr; nygc::g_keys = nygc::KeyTable(); }
             for (auto& kv : class_vars_) dead.push_back(kv.second);
             class_vars_.clear();
             for (auto& kv : prop_setters_) dead.push_back(kv.second);
@@ -8210,8 +8264,8 @@ public:
             fn_defaults_node_.clear();
             for (auto& kv : func_attrs_) for (auto& a : kv.second) dead.push_back(a.second);
             func_attrs_.clear();
-            for (auto& kv : bound_members_) dead.push_back(kv.second.recv);
-            bound_members_.clear();
+            bound_members_.clear();          // the BMember objects own their receivers
+            bound_member_cache_.clear();
             bound_member_cache_.clear();
             flow().value = Value();
         }

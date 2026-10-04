@@ -26,9 +26,9 @@ struct Location {
     Location& operator=(Location&&) noexcept = default;
     ~Location() = default;
 
-    void reset(uint32_t new_row = 1, uint32_t /*new_column*/ = 1) {
+    void reset(uint32_t new_row = 1, uint32_t new_column = 1) {
         row    = new_row;
-        column = 1;
+        column = new_column;
     }
 
     bool operator==(const Location& other) const = default;

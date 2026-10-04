@@ -39,6 +39,7 @@ struct Lexer extends ILexer{
 
     SourceCode& source;
     Token token;
+    Location token_start;   // where the token being read began (reset_token)
     char first_indet_char         = 0;
     int level_                    = 0;
     int tab                       = TabSize;/// default tabulation.

@@ -69,10 +69,14 @@ struct Engine {
     virtual bool   is_callable(const BoxPtr& b) = 0;
     // Human-readable text of a boxed value (task/thread names, errors).
     virtual std::string describe(const BoxPtr& b) = 0;
-    // Per-thread engine state. The runtime creates one per thread and calls
-    // swap_in right after the thread acquires the GIL and swap_out right before
-    // it releases it (the VM keeps one operand stack/frame stack per thread by
-    // swapping them in and out of the single VirtualMachine object).
+    // Per-thread engine state. The runtime creates one per thread (and one
+    // per async task) and calls swap_in right after the thread acquires the
+    // GIL and swap_out right before it releases it, and both when it switches
+    // between a loop and its tasks on one thread (the VM keeps one operand
+    // stack/frame stack per thread by swapping them in and out of the single
+    // VirtualMachine object; the interpreter its call depth, control flow and
+    // exception stack). A swap exchanges the live state with the record's, so
+    // swap_in and swap_out may be the same operation.
     // Called (GIL held) on the thread that is about to start another thread or
     // an event loop.
     virtual void  on_thread_start() {}
@@ -141,6 +145,17 @@ struct GilRelease {
     GilRelease(const GilRelease&) = delete;
     GilRelease& operator=(const GilRelease&) = delete;
 };
+
+// ── Async tasks inside generators ───────────────────────────────────────────
+// An async task runs on a coroutine of the thread running its loop. When it
+// blocks inside an interpreter generator's body (another coroutine, nested
+// in the task's), the generator's coroutine suspends with a relay request:
+// whoever resumed it (src/NyGen.cpp) must save the generator's state as at
+// a yield, call relay_park() - which leaves through its own coroutine the
+// same way, or switches to the loop - and, when that returns, resume the
+// generator again. GIL held.
+bool relay_requested();   // true once per request
+void relay_park();
 
 // Wait for every non-daemon thread before the process tears the engine down
 // (both engines' run paths call this after the main program). Never throws;

@@ -90,6 +90,19 @@ inline void Bound::gc_clear() {
     self = Value();
 }
 
+// ── BMember ──────────────────────────────────────────────────────────────
+inline BMember::BMember(NythonExecutor* e, const std::string& t) : Collectable(nython::kernel::Type::METHOD), tag(t), E(e) {}
+inline BMember::~BMember() {
+    if (E && executor_alive(E)) E->forgetBoundMember(this);
+}
+inline void BMember::gc_traverse(GcVisitFn visit, void* arg) {
+    if (recv.value.o) visit(recv.value.o, arg);
+}
+inline void BMember::gc_clear() {
+    Value r = recv;
+    recv = Value();
+}
+
 // ── Inst ─────────────────────────────────────────────────────────────────
 inline Inst::Inst(NythonExecutor* e, const std::string& t, void* class_node)
     : Collectable(nython::kernel::Type::INSTANCE), tag(t), E(e), cls(class_node) {}

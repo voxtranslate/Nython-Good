@@ -305,6 +305,124 @@ check("async with", log, ["enter", "body", "exit"])
 var await = "a name"
 check("await is still usable as a name", str(await), "a name")
 
+# ── 8. tasks are coroutines on the loop's thread (round 76) ─────────────────
+# A task used to be an OS thread handed a baton through the GIL: every switch
+# put one thread to sleep and woke another. Now it is a stack on the loop's
+# thread and a switch is a stack switch.
+# The process's OS threads, where the system says (Linux), else -1.
+def os_threads():
+    if not os_exists("/proc/self/status"):
+        return -1
+    for line in string_split(read_file("/proc/self/status"), "\n"):
+        if string_find(line, "Threads:") == 0:
+            return int(string_strip(string_replace(line, "Threads:", "")))
+    return -1
+var most_threads = [0]
+async def leaf(i):
+    await async_sleep(0)
+    if i % 100 == 0:
+        most_threads[0] = max(most_threads[0], os_threads())
+    return i
+async def many_main(n):
+    var threads_during = thread_count()
+    var cs = []
+    for i in range(n):
+        cs.append(leaf(i))
+    var rs = await gather(*cs)
+    var total = 0
+    for r in rs:
+        total = total + r
+    return [total, threads_during, thread_count()]
+var threads_before = thread_count()
+var waits_before = thread_wait_count()
+check("2000 tasks", async_run(many_main(2000)), [1999000, threads_before, threads_before])
+check("no thread slept for them", thread_wait_count() - waits_before < 20, true)
+if os_threads() > 0:
+    # (each task used to be an OS thread: 2000 of them here)
+    check("no OS thread per task (" + str(most_threads[0]) + " threads)", most_threads[0] < 10, true)
+
+async def pinger(n, log2, name):
+    for i in range(n):
+        log2.append(name)
+        await async_sleep(0)
+    return n
+async def ping_main():
+    var log2 = []
+    var rs = await gather(pinger(200, log2, "a"), pinger(200, log2, "b"), pinger(200, log2, "c"))
+    return [rs, len(log2), log2[0:6]]
+waits_before = thread_wait_count()
+check("600 switches in program order", async_run(ping_main()), [[200, 200, 200], 600, ["a", "b", "c", "a", "b", "c"]])
+check("switching is not sleeping", thread_wait_count() - waits_before < 20, true)
+
+# A task that blocks inside a generator's body (a sleep, a lock, a queue)
+# leaves through the generator: the other tasks run meanwhile, and the
+# generator carries on where it was when the task comes back.
+def ticking(n, log3, name):
+    for i in range(n):
+        thread_sleep(1)
+        log3.append(name + str(i))
+        yield i
+def outer_ticks(n, log3, name):
+    yield from ticking(n, log3, name)
+async def consume(name, log3, nested):
+    var total = 0
+    var g = outer_ticks(3, log3, name) if nested else ticking(3, log3, name)
+    for v in g:
+        total = total + v
+    return total
+async def gen_main(nested):
+    var log3 = []
+    var rs = await gather(consume("a", log3, nested), consume("b", log3, nested))
+    var order_a = [x for x in log3 if x[0] == "a"]
+    return [rs, len(log3), order_a]
+check("blocking inside a generator", async_run(gen_main(false)), [[3, 3], 6, ["a0", "a1", "a2"]])
+check("inside yield from", async_run(gen_main(true)), [[3, 3], 6, ["a0", "a1", "a2"]])
+
+# Each task has its own exception being handled (a bare raise), call depth
+# and thread-local values, as each thread does.
+async def handler(name):
+    try:
+        raise ValueError(name)
+    except ValueError:
+        await async_sleep(0.002)
+        try:
+            raise
+        except ValueError as e:
+            return str(e)
+check("bare raise per task", async_run(gather(handler("first"), handler("second"))), ["first", "second"])
+
+async def tls_task(v):
+    thread_local_set("k", v)
+    await async_sleep(0.001)
+    return thread_local_get("k")
+check("thread-local values per task", async_run(gather(tls_task(1), tls_task(2), tls_task(3))), [1, 2, 3])
+
+def depth(n):
+    if n == 0:
+        return 0
+    return 1 + depth(n - 1)
+async def deep_task(n):
+    await async_sleep(0)
+    var d = depth(n)
+    await async_sleep(0)
+    return d
+check("recursion inside tasks", async_run(gather(deep_task(400), deep_task(300))), [400, 300])
+
+# A task waiting on a thread (a queue it fills) still lets the others run.
+async def from_thread():
+    var q = queue_create(0)
+    var t = thread_create(lambda: queue_put(q, "from a thread"))
+    var v = queue_get(q)
+    thread_join(t)
+    return v
+async def meanwhile():
+    var n = 0
+    for i in range(5):
+        await async_sleep(0)
+        n = n + 1
+    return n
+check("a task blocked on a thread", async_run(gather(from_thread(), meanwhile())), ["from a thread", 5])
+
 print("Results: " + str(pass_n) + " passed, " + str(fail_n) + " failed")
 if fail_n == 0:
     print("=== VM_AUDIT49 PASSED ===")

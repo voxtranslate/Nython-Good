@@ -338,6 +338,85 @@ check("write lock when free", rwlock_try_write_lock(rw), true)
 check("reader excluded by the writer", thread_join(thread_create(lambda: rwlock_try_read_lock(rw)), 5000), false)
 rwlock_write_unlock(rw)
 
+# Writers first: while a writer waits, a new reader does not get in.
+rwlock_read_lock(rw)
+var wrote = atomic_new(0)
+def waiting_writer():
+    rwlock_write_lock(rw)
+    atomic_set(wrote, 1)
+    rwlock_write_unlock(rw)
+    return "wrote"
+var ww = thread_create(waiting_writer)
+var spins = 0
+while rwlock_waiting_writers(rw) == 0 and spins < 500:
+    thread_sleep(1)
+    spins = spins + 1
+check("a writer is waiting", rwlock_waiting_writers(rw), 1)
+check("a new reader waits behind it", thread_join(thread_create(lambda: rwlock_try_read_lock(rw)), 5000), false)
+rwlock_read_unlock(rw)
+check("the writer gets it", thread_join(ww, 5000), "wrote")
+check("the writer wrote", atomic_get(wrote), 1)
+
+# A writer that gives up lets the readers it held back in.
+rwlock_read_lock(rw)
+check("write lock times out", thread_join(thread_create(lambda: rwlock_write_lock_timeout(rw, 30)), 5000), false)
+def read_and_release():
+    var ok = rwlock_try_read_lock(rw)
+    if ok:
+        rwlock_read_unlock(rw)
+    return ok
+check("readers go after the writer gave up", thread_join(thread_create(read_and_release), 5000), true)
+rwlock_read_unlock(rw)
+check("no waiting writer left", rwlock_waiting_writers(rw), 0)
+
+# Competitive succession, as for the mutex: a released rwlock is not given
+# to a sleeping thread (which would hold it until it got the GIL, with every
+# other thread queued behind it: 34k thread sleeps here). One waiting writer
+# is woken to compete for it, or every waiting reader when no writer waits.
+var rw_count = [0]
+var rw_reads = [0]
+def sleepy_writer():
+    var i = 0
+    while i < 3000:
+        rwlock_write_lock(rw)
+        rw_count[0] = rw_count[0] + 1
+        if i % 1000 == 0:
+            thread_sleep(2)
+        rwlock_write_unlock(rw)
+        i = i + 1
+def sleepy_reader():
+    var i = 0
+    while i < 3000:
+        rwlock_read_lock(rw)
+        rw_reads[0] = rw_reads[0] + 1
+        if i % 1000 == 0:
+            thread_sleep(2)
+        rwlock_read_unlock(rw)
+        i = i + 1
+waits0 = thread_wait_count()
+var rwh = []
+for k in range(6):
+    rwh.append(thread_create(sleepy_writer))
+for h in rwh:
+    thread_join(h, 30000)
+waits = thread_wait_count() - waits0
+check("writers", rw_count[0], 18000)
+check("no rwlock convoy (" + str(waits) + " waits for 18000 write locks)", waits < 3000, true)
+rw_count[0] = 0
+waits0 = thread_wait_count()
+rwh = []
+for k in range(3):
+    rwh.append(thread_create(sleepy_writer))
+for k in range(5):
+    rwh.append(thread_create(sleepy_reader))
+for h in rwh:
+    thread_join(h, 30000)
+waits = thread_wait_count() - waits0
+check("mixed writers", rw_count[0], 9000)
+check("mixed readers", rw_reads[0], 15000)
+check("no convoy with readers (" + str(waits) + " waits for 24000 locks)", waits < 4000, true)
+check("rwlock free at the end", [rwlock_readers(rw), rwlock_writer(rw), rwlock_waiting_writers(rw)], [0, 0, 0])
+
 # ── 8. queues ───────────────────────────────────────────────────────────────
 var pq = queue_create(0, "priority")
 queue_put(pq, [5, "e"])

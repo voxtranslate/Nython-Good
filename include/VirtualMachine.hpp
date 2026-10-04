@@ -63,7 +63,6 @@
 #include "Lexer.hpp"
 #include "Parser.hpp"
 #include "Runnable.hpp"
-#include "GarbageCollector.hpp"
 #include "ASTNodes.hpp"
 #include "Context.hpp"
 #include "NyGC.hpp"     // rss_kb (round 75)
@@ -72,7 +71,6 @@ using nython::Runnable;
 using nython::kernel::Value;
 using nython::kernel::ValueType;
 using nython::kernel::Object;
-using nython::gc::GarbageCollector;
 
 namespace nython::vm {
 
@@ -557,7 +555,7 @@ inline std::string VMVal::to_string() const {
     case VMType::ITERATOR: {
         char buf[32];
         std::snprintf(buf, sizeof buf, "0x%llx", (unsigned long long)(uintptr_t)iter.get());
-        return std::string("<generator object iterator at ") + buf + ">";
+        return std::string("<iterator object at ") + buf + ">";
     }
     case VMType::GENERATOR: return vm_gen_repr(gen.get());
     default:               return "undefined";
@@ -1072,7 +1070,8 @@ private:
             auto wn=std::static_pointer_cast<nython::node::WalrusNode>(nd);
             visit(wn->init);
             emit(Op::DUP_TOP,0,l);
-            emit_dn(wn->name,l);
+            if(wn->global_ref) emit(Op::STORE_GLOBAL_NAME,C().add_name(wn->name),l);
+            else emit_dn(wn->name,l);
             break;
         }
         // Pass / global / nonlocal
@@ -1123,8 +1122,9 @@ private:
             emit_dn(ctx_tmp,l2);
             emit_ln(ctx_tmp,l2);
             emit(Op::WITH_ENTER,0,l2);
-            if(!wn->alias.empty()) emit_dn(wn->alias,l2);
-            else emit(Op::POP_TOP,0,l2);
+            if(wn->alias.empty()) emit(Op::POP_TOP,0,l2);
+            else if(wn->alias_global) emit(Op::STORE_GLOBAL_NAME,C().add_name(wn->alias),l2);
+            else emit_dn(wn->alias,l2);
             int idx=(int)C().exc_table.size();
             C().exc_table.emplace_back();
             C().exc_table[idx].depth=persist_depth_;
@@ -1529,7 +1529,11 @@ private:
                 cl.types=en->types; cl.bind_var=en->var;
                 cl.handler=C().here();
                 emit_dn(held,l);
-                if(!en->var.empty()){ emit_ln(held,l); emit_dn(en->var,l); }
+                if(!en->var.empty()){
+                    emit_ln(held,l);
+                    if(en->var_global) emit(Op::STORE_GLOBAL_NAME,C().add_name(en->var),l);
+                    else emit_dn(en->var,l);
+                }
                 exc_vars_.push_back(held);
                 if(en->body) visit_stmt(en->body);
                 exc_vars_.pop_back();
@@ -2161,6 +2165,8 @@ struct GenState : std::enable_shared_from_this<GenState> {
 inline std::string vm_gen_repr(const GenState* g) {
     char buf[32];
     std::snprintf(buf, sizeof buf, "0x%llx", (unsigned long long)(uintptr_t)g);
+    // A lazy zip/map/filter/enumerate/islice prints as Python prints it.
+    if (g && g->native) return "<" + g->name + " object at " + buf + ">";
     return "<generator object " + (g ? g->name : std::string("?")) + " at " + buf + ">";
 }
 
@@ -2271,12 +2277,9 @@ struct VMConc { static void install(VirtualMachine& vm); };
 struct VMConcEngine;
 
 class VirtualMachine : public Runnable {
-    friend class gc::GarbageCollector;
     friend struct VMConc;
     friend struct VMConcEngine;
-    using gc_ptr = std::shared_ptr<GarbageCollector>;
 
-    gc_ptr                                             gc_;
     // ── Generators (round 75) ───────────────────────────────────────────────
     // Declared before the stacks and globals, so they outlive every value a
     // destructor can reach them from. gen_live_: started, unfinished code
@@ -2496,11 +2499,9 @@ public:
 
     explicit VirtualMachine(Reporter* r=nullptr)
         : Runnable(r, RunnableType::COMPILER)
-        , gc_(std::make_shared<GarbageCollector>(GarbageCollectorConfig{},this))
     { vm_live(this, 1); register_all_builtins(); }
     explicit VirtualMachine(Runnable* r)
         : Runnable((Reporter*)r, RunnableType::COMPILER)
-        , gc_(std::make_shared<GarbageCollector>(GarbageCollectorConfig{},this))
     { vm_live(this, 1); register_all_builtins(); }
 
     // 171 general-purpose builtins (map, filter, reduce, any, all, next, set,
@@ -2641,6 +2642,23 @@ public:
         }
         catch (...) {}
         last_exception_obj_ = saved_exc;
+    }
+    // A suspended generator in unreachable garbage (a cycle through it) is
+    // closed before anything is cleared, as Python's collector does, so its
+    // finally blocks run (round 76; it used to be cleared without them).
+    // Only the thread that started it may; an error is reported and ignored.
+    bool gc_close_generator(GenState& gs) {
+        if (vm_finalizers_off_ || gs.done || gs.running || !gs.started || gs.native) return false;
+        if (!gs.is_genexpr && gs.owner && gs.owner != nycoro::thread_token()) return false;
+        VMVal saved_exc = last_exception_obj_;
+        try { gen_close(gs); }
+        catch (std::exception& e) {
+            std::cerr << "Exception ignored in: <generator object " << gs.name << ">\n" << e.what() << "\n";
+        }
+        catch (...) {}
+        if (!gs.done) gen_finish(gs);
+        last_exception_obj_ = saved_exc;
+        return true;
     }
     // Teardown: drop the program's roots so reference counting and a last
     // collection free its objects (no finalizer runs, as on the interpreter).
@@ -2921,16 +2939,6 @@ public:
         }
         for(auto& sub:code.sub_codes) oss<<"\n"<<disassemble(*sub,depth+1);
         return oss.str();
-    }
-
-    template<typename T> T* create() {
-        auto cell=gc_->allocate(); T* o=new T(this); cell->value=o; return o;
-    }
-    template<typename T, typename First, typename... Args>
-    T* create(First&& first, Args&&... args) {
-        auto cell=gc_->allocate();
-        T* o=new T(this, std::forward<First>(first), std::forward<Args>(args)...);
-        cell->value=o; return o;
     }
 
 private:
@@ -5833,6 +5841,10 @@ private:
         if(obj.type==VMType::GENERATOR&&obj.gen){
             std::shared_ptr<GenState> gsp=obj.gen;
             GenState& gs=*gsp;
+            // A lazy zip/map/... is an iterator: no send or throw (send()
+            // used to behave as next()).
+            if(gs.native && (method=="send"||method=="throw"))
+                throw_exception(make_exception("AttributeError",{VMVal::make_str("'"+gs.name+"' object has no attribute '"+method+"'")}));
             if(method=="send"||method=="__next__"||method=="next"){
                 if(method=="send" && args.size()!=1)
                     throw_exception(make_exception("TypeError",{VMVal::make_str("generator.send() takes exactly one argument ("+std::to_string(args.size())+" given)")}));
@@ -8001,6 +8013,8 @@ private:
                 if(cls_name=="tuple") return VMVal::make_bool(obj.type==VMType::LIST&&obj.b);
                 if(cls_name=="map"||cls_name=="dict") return VMVal::make_bool(obj.type==VMType::MAP);
                 if(cls_name=="none") return VMVal::make_bool(obj.type==VMType::NONE);
+                // Every lazy iterator (it read false for all of them).
+                if(cls_name=="generator") return VMVal::make_bool(obj.type==VMType::GENERATOR||obj.type==VMType::ITERATOR);
                 if(cls_name=="function") return VMVal::make_bool(obj.type==VMType::FUNCTION||obj.type==VMType::NATIVE);
                 return VMVal::make_bool(false);
             }

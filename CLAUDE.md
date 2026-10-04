@@ -270,6 +270,8 @@ def make_fn(n):
 
 ### GarbageCollector lock bug (fixed)
 Lines 77 and 228 in `GarbageCollector.cpp` had temporary locks that were immediately destroyed. Fixed to named variables (`gc_lock`, `dealloc_lock`).
+The old `GarbageCollector` itself was removed in round 76 (unused since
+round 75's `NyGC`/`VMGC`).
 
 ### IDE import weight
 `nython_ide.ny` must NOT import `"lib/nytorch.ny"` (loads 220+ classes, causes OOM). The builtins are already registered via `gui.ny`'s bare `import nytorch`.
@@ -322,8 +324,8 @@ These were aligned to match how the IDE calls them:
 | vm_audit45 | 45 | JSON codec, print call form, list pop/insert, deep equality, file_mtime |
 | vm_audit46 | 252 | OS layer: paths, files, file objects, typed errors, os_run/os_spawn, env, time, full-width ints, sys.argv |
 | vm_audit47 | 153 | nytorch: kernels, autograd, Module/optimizers, XOR and a toy CNN, checked against PyTorch numbers and finite differences; one definition per class name |
-| vm_audit48 | 130 | threads and synchronisation: mutex/rwlock/condition/semaphore/barrier/latch/atomics/channels/queues/futures/pools, deadlock detection, no lock convoys |
-| vm_audit49 | 41 | async/await: tasks, gather, wait_for, cancellation, deterministic order |
+| vm_audit48 | 143 | threads and synchronisation: mutex/rwlock/condition/semaphore/barrier/latch/atomics/channels/queues/futures/pools, deadlock detection, no lock convoys (rwlock too, round 76) |
+| vm_audit49 | 52 | async/await: tasks, gather, wait_for, cancellation, deterministic order; tasks are coroutines (no OS thread per task, blocking inside a generator, per-task exception state) |
 | vm_audit50 | 51 | `lib/thread.ny` over the native runtime |
 | vm_audit51 | 52 | native editor text services (symbols, syntax check, diff, search, folding, format, completion index) |
 | vm_audit60 | 284 | Python values and builtins: dicts, ints, formatting, operators, tuples, strings (same results under python3) |
@@ -335,6 +337,8 @@ These were aligned to match how the IDE calls them:
 | vm_audit54 | — | comprehensions, match patterns, walrus, unpacking, generators, calls (`**d`, arity) |
 | vm_audit56 | 120 | lazy generators: infinite ones with islice/take/zip/any, side-effect order, send/throw/close/GeneratorExit/finally, StopIteration.value, `yield from` (600 deep), genexps, `__iter__` generators, unpacking, errors, threads (same results under python3) |
 | vm_audit57 | 212 | strict reads (AttributeError/KeyError), getattr/hasattr/setattr/delattr/get/setdefault, `?.` `?[` `??` `??=`, `undefined`, var/let/const/global/nonlocal scope rules in every context, suffix literals (round 75) |
+| vm_audit63 | 59 | round 76: const/nonlocal/global checks (static, SyntaxError), lambda closures and defaults, print's argument order, error columns, lazy iterators |
+| vm_audit64 | 26 | round 76: objects used as dict keys freed (cycles through keys too), suspended-generator cycles collected with their finally blocks run, bound builtin members freed |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -440,8 +444,10 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
   from the point it runs; `global` names the module's variable, `nonlocal`
   the enclosing function's. for-loop targets, parameters, comprehension
   variables and `except ... as` are local declarations too.
-- Interpreter lambdas capture loop variables by value
-  (`[lambda: i for i in range(3)]` gives 0, 1, 2; Python gives 2, 2, 2).
+- ~~Interpreter lambdas capture loop variables by value~~ — **resolved
+  (round 76)**: lambdas close over their scope by reference, as `def` does
+  (`[lambda: i for i in range(3)]` gives 2, 2, 2, as Python), and a lambda
+  can call itself through the name it is assigned to.
 
 ## Session Workflow
 
@@ -859,6 +865,39 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   `tools/ny_attrcheck.py` finds `self.x` reads of attributes set only lazily;
   `tools/ide_e2e.py` now fails on AttributeError/KeyError/NameError/TypeError
   or `[lenient-read]` in the IDE log.
+
+## Round 76: the "Not done" lists closed (see `HANDOFF.md` §0o)
+
+- **Static scope checks, both engines** (`src/NyScope.cpp`, run by
+  `Parser::parse`): `const` is enforced (assign/augment/delete/redeclare/
+  unpack/loop over it is a SyntaxError before the program runs);
+  `nonlocal x` needs an enclosing function binding x; a walrus,
+  `except ... as` and `with ... as` of a `global` name bind the module's.
+- **Interpreter**: lambdas close over their scope by reference (self-
+  recursion, Python's late binding; defaults evaluated when made);
+  `print(a(), b())` evaluates every argument first; IndexError reads
+  `list index out of range`.
+- **Error columns**: every syntax error said column 2 (`Location::reset`
+  ignored its column); tokens are located where they start, a column counts
+  characters, and the caret is placed by characters.
+- **Lazy iterators** print as Python's (`<zip object at ...>`), have no
+  `send`/`throw`, and `isinstance(x, "generator")` is true for them; `type()`
+  stays "generator" (Nython's dict is the type "map").
+- **rwlock competitive succession**: a released lock wakes one writer heir
+  or every reader, and is taken only by a running thread (6 writers x 3000:
+  33,922 thread sleeps -> 144). New `rwlock_waiting_writers`.
+- **Async tasks are coroutines** on their loop's thread (`NyCoro`), not OS
+  threads: no thread per task (2000 tasks: 2002 threads -> 1), switches
+  3-12x faster; a task blocking inside a generator relays out through it
+  (`nyconc::relay_requested`/`relay_park`). The interpreter's per-thread
+  state is swapped for threads and tasks (`InterpEngine::State`): a bare
+  `raise` could re-raise another thread's exception.
+- **Memory**: objects used as dict keys are freed (`nygc::KeyTable`, and in
+  `VMGC.cpp`), cycles through keys included; a cycle through a suspended
+  generator is collected, its finally blocks run first (both engines); bound
+  builtin members are heap objects (`nyheap::BMember`); the old
+  `GarbageCollector` and the unused `Evaluator.hpp` are removed;
+  `mem_rss_kb` works on Windows.
 
 ## Transcripts
 

@@ -104,7 +104,7 @@ if os_exists(exe):
     check("real load", real.load("/tmp/ny_audit44_real.jsonl"), true)
     check("real steps", real.n, 15)
     check("real output (print with two arguments)", real.outputs, ["total 3"])
-    check("real exception", real.exception, "IndexError: index 5 out of range (length 2)")
+    check("real exception", real.exception, "IndexError: list index out of range")
     check("real exception line", real.exception_at, prog + ":12")
     real.start({})
     real.seek(real.n - 1)

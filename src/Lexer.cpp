@@ -376,6 +376,7 @@ std::string Lexer::fileName() {
 
 void Lexer::reset_token() {
     source.location.reset(source.location.row, source.location.column);
+    token_start = source.location;
     TokenIdent ident(TokenType::Invalid, TokenKind::Invalid, TokenClass::Invalid);
     token = Token(ident, "invalid" , source.location);
 }
@@ -453,7 +454,14 @@ bool Lexer::is_binary(char cp) {
 
 Token& Lexer::make_token(TokenIdent ident) {
 	this->token.ident     = ident;
+	// A token is located where it starts. The column used to be reset to 1
+	// for every token, so every error said column 2. A token that spans
+	// lines (a triple-quoted string, a newline) keeps the position where it
+	// ends, as before: statement line numbers (tracing, the debugger, error
+	// lines) are taken from those rows.
 	this->token._location = source.location;
+	if (token_start.row == source.location.row)
+	    this->token._location.column = token_start.column;
 	return this->token;
 }
 

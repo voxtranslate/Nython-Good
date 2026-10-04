@@ -5,13 +5,14 @@
 //   2. GIL
 //   3. threads: registry, start/finish, the generic blocking wait
 //   4. deadlock detection (wait-for graph) and lock-order validation
-//   5. async event loop core (baton passing)
+//   5. async event loop core (tasks are coroutines on the loop's thread)
 //   6. primitives: mutex, rwlock, condition, semaphore, event, barrier, latch,
 //      atomics, channels/queues + select, futures, pool, timer, task group
 //   7. async: coroutines, tasks, await, gather, wait_for
 //   8. builtin dispatch table
 // ─────────────────────────────────────────────────────────────────────────────
 #include "NyConc.hpp"
+#include "NyCoro.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -21,6 +22,7 @@
 #include <iostream>
 #include <map>
 #include <mutex>
+#include <new>
 #include <set>
 #include <sstream>
 #include <thread>
@@ -335,7 +337,8 @@ static bool block(std::unique_lock<std::mutex>& lk, ThreadRec* self,
         }
     } unreg{self, regs};
     if (self->blocked_forever) check_all_blocked_locked(self);
-    g_waits.fetch_add(1, std::memory_order_relaxed);
+    // A thread goes to sleep; a task only switches back to its loop.
+    if (!self->task) g_waits.fetch_add(1, std::memory_order_relaxed);
     while (true) {
         self->woken = false;
         if (self->task) task_park(lk, self, dl);
@@ -565,18 +568,34 @@ static void held_erase(ThreadRec* self, int64_t id) {
 // 5. Async event loop core
 // ════════════════════════════════════════════════════════════════════════════
 
+// An async task is a coroutine (NyCoro.hpp) on the thread that runs its
+// loop, not a thread of its own. Starting one maps a stack (or takes one from
+// the pool) instead of creating an OS thread, and switching between tasks is
+// a stack switch on that thread instead of handing a baton between threads
+// through the GIL's queue - each switch used to put one thread to sleep and
+// wake another. Everything else is unchanged: a task still has a ThreadRec
+// (its id, its locals, its place in the wait-for graph), every blocking
+// primitive still goes through block(), and a blocked task gives control
+// back to its loop there (task_park), so a task waiting on a thread's mutex,
+// queue or join lets the loop's other tasks run.
+//
+// At every switch the thread holds the GIL and not the runtime mutex, and
+// the engine state (Engine::swap_in/swap_out: the VM's stacks, the
+// interpreter's call depth, control flow and exception stack) moves with
+// it: switch_state.
 struct Task : Obj {
     Loop* loop = nullptr;
     Engine* engine = nullptr;
     std::shared_ptr<ThreadRec> thr;
-    bool in_ready = false, has_baton = false, started = false;
+    nycoro::Coro* co = nullptr;              // its stack, from the first grant until it finishes
+    bool in_ready = false, started = false;
     bool done = false, cancelled = false, failed = false;
     bool cancel_before_start = false;
     BoxPtr result; NyError err;
     WQ wq;                                   // awaiters
     uint64_t done_seq = 0;
     std::string name;
-    std::function<BoxPtr(Engine&)> entry;    // runs on the task's thread, GIL held
+    std::function<BoxPtr(Engine&)> entry;    // runs on the task's coroutine, GIL held
     bool timer_set = false;
     std::multimap<std::pair<TP, uint64_t>, Task*>::iterator timer_it;
 };
@@ -588,7 +607,7 @@ struct Loop {
     ThreadRec* thread = nullptr;
     std::vector<std::shared_ptr<Task>> tasks;
     uint64_t seq = 0;
-    std::condition_variable cv;
+    std::condition_variable cv;              // wakes an idle loop (another thread made a task ready)
 };
 
 static void make_ready(Task* t) {
@@ -601,8 +620,51 @@ static void make_ready(Task* t) {
     L->cv.notify_all();
 }
 
-// A task gives the baton back to its loop and sleeps until the loop hands it
-// back (because it was made ready, or its timer fired).
+// The stack a task runs on: as large as a thread's on a 64-bit system (the
+// address space is reserved, the memory committed only as it is used), so
+// a task recurses as deep as a thread did; the generators' size elsewhere.
+static size_t task_stack_size() {
+    if (sizeof(void*) >= 8) return std::max<size_t>(nycoro::default_stack_size(), (size_t)8 << 20);
+    return nycoro::default_stack_size();
+}
+
+// Move the engine's per-thread state and the runtime's notion of "this
+// thread" from one record to another. GIL held.
+static void switch_state(ThreadRec* from, ThreadRec* to) {
+    if (from->engine) from->engine->swap_out(from->estate);
+    t_self = to;
+    if (to->engine) to->engine->swap_in(to->estate);
+}
+
+// A task blocked inside a generator body (the interpreter runs each on a
+// coroutine of its own, nested in the task's): it leaves through every
+// coroutine it is nested in. relay asks the resumer to step out too.
+static thread_local bool t_relay = false;
+
+// Give control back to the loop, from the task's own stack or from a
+// coroutine nested in it. GIL held, runtime mutex not held. Returns when the
+// loop runs the task again.
+static void task_switch_out(ThreadRec* self) {
+    Task* T = self->task;
+    if (nycoro::current() != T->co) {
+        t_relay = true;
+        nycoro::suspend();          // to the generator layer, which relays and resumes us
+        return;
+    }
+    switch_state(self, T->loop->thread);
+    nycoro::suspend();              // grant() switched our state back in
+}
+
+bool relay_requested() {
+    bool r = t_relay;
+    t_relay = false;
+    return r;
+}
+void relay_park() { task_switch_out(t_self); }
+
+// A task gives control back to its loop until the loop runs it again
+// (because it was made ready, or its timer fired). Called from block() with
+// the runtime mutex held and the GIL released; returns the same way.
 static void task_park(std::unique_lock<std::mutex>& lk, ThreadRec* self, const Deadline& dl) {
     Task* T = self->task;
     Loop* L = T->loop;
@@ -610,10 +672,14 @@ static void task_park(std::unique_lock<std::mutex>& lk, ThreadRec* self, const D
         T->timer_it = L->timers.emplace(std::make_pair(dl.tp, ++L->seq), T);
         T->timer_set = true;
     }
-    T->has_baton = false;
+    // Not current any more: a wake from another thread from here on queues
+    // it (it is run once it has switched out).
     if (L->current == T) L->current = nullptr;
-    L->cv.notify_all();
-    self->cv.wait(lk, [T] { return T->has_baton; });
+    lk.unlock();
+    gil_acquire();
+    task_switch_out(self);
+    gil_release();
+    lk.lock();
     if (T->timer_set) { L->timers.erase(T->timer_it); T->timer_set = false; }
 }
 
@@ -635,7 +701,8 @@ struct RWLock : Obj {
     ThreadRec* writer = nullptr;
     std::multiset<ThreadRec*> readers;
     int waiting_writers = 0;
-    WQ wq;
+    WQ rq, wq;                      // waiting readers, waiting writers
+    ThreadRec* heir = nullptr;      // the writer woken to compete for it (rw_wake)
 };
 struct RWWait : Waitable {
     RWLock* rw; bool write;
@@ -738,62 +805,111 @@ static void mutex_release(Engine& e, int64_t h) {
 }
 
 // ── rwlock ──────────────────────────────────────────────────────────────────
+// Writers first: a reader does not take the lock while a writer waits. And
+// competitive succession, as for the mutex: a released lock is not given to a
+// sleeping waiter - its predicate used to take it as the waiter woke, before
+// that thread had the GIL, so the lock sat with a thread that could not run
+// and every other thread queued behind it (6 writers x 3000 operations: 34k
+// thread sleeps). Now the lock is taken only by a running thread. When it
+// becomes free, one waiting writer - the heir - is woken to compete for it
+// (no other writer is woken while the heir is on its way), or, with no
+// writer waiting, every waiting reader (they can all hold it at once).
+static void rw_wake(RWLock* rw) {
+    if (rw->writer) return;
+    if (rw->waiting_writers > 0) {
+        if (!rw->readers.empty() || rw->heir || rw->wq.empty()) return;
+        rw->heir = rw->wq.front();
+        wake(rw->heir);
+        return;
+    }
+    wake_all(rw->rq);
+}
+// A woken writer gave up (timed out, cancelled): pass the wake-up on.
+static void rw_heir_quit(RWLock* rw, ThreadRec* self) {
+    if (rw->heir != self) return;
+    rw->heir = nullptr;
+    rw_wake(rw);
+}
 static bool rw_read_lock(Engine& e, int64_t h, double timeout_ms) {
     ThreadRec* self = current(e);
-    RWLock* rw;
-    {
-        std::lock_guard<std::mutex> l(RT().m);
-        rw = get_obj<RWLock>(h, "rwlock");
-        if (rw->writer == self)
-            raise("DeadlockError", "deadlock detected: thread " + self->label() + " holds rwlock#" +
-                  std::to_string(h) + " for writing and asked to read it");
-        check_cancel_locked(self);
-        if (rw->readers.count(self)) { rw->readers.insert(self); return true; }   // re-entrant read
-        lockdep_check_locked(self, h);
-        if (!rw->writer && rw->waiting_writers == 0) { rw->readers.insert(self); lockdep_note_locked(self, h); return true; }
-        if (timeout_ms == 0) return false;
+    const Deadline dl = Deadline::in_ms(timeout_ms);
+    while (true) {
+        RWLock* rw;
+        {
+            std::lock_guard<std::mutex> l(RT().m);
+            rw = get_obj<RWLock>(h, "rwlock");
+            if (rw->writer == self)
+                raise("DeadlockError", "deadlock detected: thread " + self->label() + " holds rwlock#" +
+                      std::to_string(h) + " for writing and asked to read it");
+            check_cancel_locked(self);
+            if (rw->readers.count(self)) { rw->readers.insert(self); return true; }   // re-entrant read
+            lockdep_check_locked(self, h);
+            if (!rw->writer && rw->waiting_writers == 0) { rw->readers.insert(self); lockdep_note_locked(self, h); return true; }
+            if (timeout_ms == 0 || dl.expired()) return false;
+        }
+        RWWait w(rw, false);
+        bool woken = block_released(self, {&rw->rq},
+            [rw] { return !rw->writer && rw->waiting_writers == 0; }, dl, &w);
+        if (!woken) return false;
     }
-    RWWait w(rw, false);
-    bool ok = block_released(self, {&rw->wq},
-        [rw, self] { if (!rw->writer && rw->waiting_writers == 0) { rw->readers.insert(self); return true; } return false; },
-        Deadline::in_ms(timeout_ms), &w);
-    if (ok) { std::lock_guard<std::mutex> l(RT().m); lockdep_note_locked(self, h); }
-    return ok;
 }
 static bool rw_write_lock(Engine& e, int64_t h, double timeout_ms) {
     ThreadRec* self = current(e);
-    RWLock* rw;
-    {
-        std::lock_guard<std::mutex> l(RT().m);
-        rw = get_obj<RWLock>(h, "rwlock");
-        if (rw->writer == self)
-            raise("DeadlockError", "deadlock detected: thread " + self->label() + " already holds rwlock#" +
-                  std::to_string(h) + " for writing (not recursive)");
-        if (rw->readers.count(self))
-            raise("DeadlockError", "deadlock detected: thread " + self->label() + " holds rwlock#" +
-                  std::to_string(h) + " for reading; upgrading to write would wait for itself");
-        check_cancel_locked(self);
-        lockdep_check_locked(self, h);
-        if (!rw->writer && rw->readers.empty()) { rw->writer = self; lockdep_note_locked(self, h); return true; }
-        if (timeout_ms == 0) return false;
-        rw->waiting_writers++;
+    const Deadline dl = Deadline::in_ms(timeout_ms);
+    bool counted = false;           // in waiting_writers
+    while (true) {
+        RWLock* rw;
+        {
+            std::lock_guard<std::mutex> l(RT().m);
+            rw = get_obj<RWLock>(h, "rwlock");
+            try {
+                if (rw->writer == self)
+                    raise("DeadlockError", "deadlock detected: thread " + self->label() + " already holds rwlock#" +
+                          std::to_string(h) + " for writing (not recursive)");
+                if (rw->readers.count(self))
+                    raise("DeadlockError", "deadlock detected: thread " + self->label() + " holds rwlock#" +
+                          std::to_string(h) + " for reading; upgrading to write would wait for itself");
+                check_cancel_locked(self);
+                lockdep_check_locked(self, h);
+            } catch (...) {
+                if (counted) { rw->waiting_writers--; rw_heir_quit(rw, self); rw_wake(rw); }
+                throw;
+            }
+            if (rw->heir == self) rw->heir = nullptr;      // the heir competes now
+            if (!rw->writer && rw->readers.empty()) {
+                rw->writer = self;
+                if (counted) rw->waiting_writers--;
+                lockdep_note_locked(self, h);
+                return true;
+            }
+            if (timeout_ms == 0 || dl.expired()) {
+                if (counted) { rw->waiting_writers--; rw_wake(rw); }   // readers held back by us may go
+                return false;
+            }
+            if (!counted) { rw->waiting_writers++; counted = true; }
+        }
+        RWWait w(rw, true);
+        bool woken;
+        try {
+            // Woken as the heir - or the lock is free with no heir on the way
+            // (it was released between the attempt above and this wait).
+            woken = block_released(self, {&rw->wq},
+                [rw, self] { return rw->heir == self || (!rw->writer && rw->readers.empty() && !rw->heir); }, dl, &w);
+        } catch (...) {
+            std::lock_guard<std::mutex> l(RT().m);
+            rw->waiting_writers--;
+            rw_heir_quit(rw, self);
+            rw_wake(rw);
+            throw;
+        }
+        if (!woken) {
+            std::lock_guard<std::mutex> l(RT().m);
+            rw->waiting_writers--;
+            rw_heir_quit(rw, self);
+            rw_wake(rw);
+            return false;
+        }
     }
-    RWWait w(rw, true);
-    bool ok = false;
-    try {
-        ok = block_released(self, {&rw->wq},
-            [rw, self] { if (!rw->writer && rw->readers.empty()) { rw->writer = self; return true; } return false; },
-            Deadline::in_ms(timeout_ms), &w);
-    } catch (...) {
-        std::lock_guard<std::mutex> l(RT().m);
-        rw->waiting_writers--; wake_all(rw->wq);
-        throw;
-    }
-    std::lock_guard<std::mutex> l(RT().m);
-    rw->waiting_writers--;
-    if (ok) lockdep_note_locked(self, h);
-    else wake_all(rw->wq);          // readers held back by our pending write may go
-    return ok;
 }
 static void rw_unlock(Engine& e, int64_t h, bool write) {
     ThreadRec* self = current(e);
@@ -809,7 +925,7 @@ static void rw_unlock(Engine& e, int64_t h, bool write) {
         rw->readers.erase(it);
         if (!rw->readers.count(self)) held_erase(self, h);
     }
-    wake_all(rw->wq);
+    rw_wake(rw);
 }
 
 // ── condition ───────────────────────────────────────────────────────────────
@@ -1261,53 +1377,65 @@ static bool task_cancel_locked(Task* t) {
     return true;
 }
 
-// Start (first grant) or resume a task: hand it the baton and wait until it
-// gives it back. Loop thread, runtime mutex held, GIL released.
+static void task_finish_locked(Task* t, const BoxPtr& res, bool failed, const NyError& err);
+
+// A task's coroutine: the body, then its outcome. Switched in by grant() with
+// the GIL held and the task's (fresh) engine state in.
+static void task_entry(void* arg) {
+    Task* tp = static_cast<Task*>(arg);
+    ThreadRec* r = tp->thr.get();
+    BoxPtr res; bool failed = false; NyError err;
+    // Nothing may unwind across the stack switch: everything is caught here.
+    try { res = tp->entry(*tp->engine); }
+    catch (NyError& x) { failed = true; err = x; }
+    catch (std::exception& x) { failed = true; err = NyError::make("RuntimeError", x.what()); }
+    catch (...) { failed = true; err = NyError::make("RuntimeError", "task '" + tp->name + "' was ended by an unknown exception"); }
+    tp->entry = nullptr;      // captured engine values go while the GIL is held
+    {
+        std::lock_guard<std::mutex> l(RT().m);
+        task_finish_locked(tp, res, failed, err);
+        finish_thread_locked(r, res, failed, err);
+    }
+    res = nullptr; err = NyError();
+    switch_state(r, tp->loop->thread);
+}
+
+// Start (first grant) or resume a task: run it on its coroutine until it
+// parks or finishes. Loop thread, runtime mutex held, GIL released.
 static void grant(std::unique_lock<std::mutex>& lk, Loop* L, Task* t) {
     t->in_ready = false;
     L->current = t;
-    t->has_baton = true;
     if (!t->thr) {
         t->started = true;
         auto rec = new_thread_rec(*t->engine, "task-" + t->name, true);
         rec->task = t;
         rec->cancel_sticky = false;
+        rec->started = true;
         rec->estate = t->engine->state_new();
         t->thr = rec;
-        Task* tp = t;
-        Body body = [tp](ThreadRec*) -> BoxPtr { return tp->entry(*tp->engine); };
-        std::shared_ptr<ThreadRec> r = rec;
-        std::thread th([r, body, tp, L]() mutable {
-            t_self = r.get();
-            {
-                std::unique_lock<std::mutex> l(RT().m);
-                r->cv.wait(l, [tp] { return tp->has_baton; });
-            }
-            gil_acquire();
-            r->started = true;
-            BoxPtr res; bool failed = false; NyError err;
-            try { res = body(r.get()); }
-            catch (NyError& x) { failed = true; err = x; }
-            catch (std::exception& x) { failed = true; err = NyError::make("RuntimeError", x.what()); }
-            body = nullptr;
-            tp->entry = nullptr;      // captured engine values go while the GIL is held
-            {
-                std::lock_guard<std::mutex> l(RT().m);
-                task_finish_locked(tp, res, failed, err);
-                finish_thread_locked(r.get(), res, failed, err);
-                tp->has_baton = false;
-                if (L->current == tp) L->current = nullptr;
-                L->cv.notify_all();
-            }
-            gil_release();
-            if (r->engine) r->engine->state_free(r->estate);
-            r->estate = nullptr;
-        });
-        th.detach();
-    } else {
-        t->thr->cv.notify_all();
+        try { t->co = nycoro::create(&task_entry, t, task_stack_size()); }
+        catch (std::bad_alloc&) {
+            NyError err = NyError::make("MemoryError", "cannot allocate a stack for task '" + t->name + "'");
+            task_finish_locked(t, nullptr, true, err);
+            finish_thread_locked(rec.get(), nullptr, true, err);
+            L->current = nullptr;
+            return;
+        }
     }
-    L->cv.wait(lk, [L] { return L->current == nullptr; });
+    ThreadRec* loop_rec = L->thread;
+    lk.unlock();
+    gil_acquire();
+    switch_state(loop_rec, t->thr.get());
+    nycoro::resume(t->co);           // until it parks or returns; either switched the state back
+    if (nycoro::done(t->co)) {
+        nycoro::destroy(t->co);
+        t->co = nullptr;
+        t->engine->state_free(t->thr->estate);
+        t->thr->estate = nullptr;
+    }
+    gil_release();
+    lk.lock();
+    if (L->current == t) L->current = nullptr;
 }
 
 // Run loop L until `until` holds. Loop thread, runtime mutex held, GIL released.
@@ -1349,6 +1477,15 @@ static BoxPtr async_run(Engine& e, const Awaitable::Item& main_item) {
     ensure_active(e);
     auto L = std::make_shared<Loop>();
     L->thread = self;
+    // Tasks still suspended at the end (blocked even after cancellation)
+    // keep pointing at the loop: it is then kept, as their stacks are.
+    struct KeepIfStuck {
+        std::shared_ptr<Loop>& L;
+        ~KeepIfStuck() {
+            for (auto& t : L->tasks)
+                if (t->co) { new std::shared_ptr<Loop>(L); return; }
+        }
+    } keep{L};
     Task* main_task;
     {
         std::lock_guard<std::mutex> l(RT().m);
@@ -1429,10 +1566,7 @@ static BoxPtr await_value(Engine& e, int64_t h, bool is_handle, const BoxPtr& v)
             check_cancel_locked(self);
             Task* T = self->task;
             T->loop->ready.push_back(T); T->in_ready = true;
-            T->has_baton = false;
-            if (T->loop->current == T) T->loop->current = nullptr;
-            T->loop->cv.notify_all();
-            self->cv.wait(lk, [T] { return T->has_baton; });
+            task_park(lk, self, Deadline::never());
             check_cancel_locked(self);
             return e.box_none();
         }
@@ -1776,6 +1910,10 @@ static std::unordered_map<std::string, Handler>& table() {
             std::lock_guard<std::mutex> l(RT().m);
             auto* rw = get_obj<RWLock>(H(a, 0, "rwlock_writer"), "rwlock");
             return Ret::integer(rw->writer ? rw->writer->id : 0);
+        };
+        T["rwlock_waiting_writers"] = [](Engine&, const Args& a) {
+            std::lock_guard<std::mutex> l(RT().m);
+            return Ret::integer(get_obj<RWLock>(H(a, 0, "rwlock_waiting_writers"), "rwlock")->waiting_writers);
         };
 
         // ── condition ───────────────────────────────────────────────────────

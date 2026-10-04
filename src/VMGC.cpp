@@ -5,6 +5,7 @@
 #include <limits>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace nython::vm::vmgc {
 
@@ -50,6 +51,17 @@ template<class F> inline void visit_val(const VMVal& x, F& f) {
     if (x.iter) f((void*)x.iter.get());
     if (x.gen) f((void*)x.gen.get());
     if (x.closure_env) f((void*)x.closure_env.get());
+}
+// The objects a stored dict key names (an object key, or object keys inside
+// a tuple key), from the VM's key table.
+template<class F> void vm_visit_key_objects(const std::string& key, std::unordered_map<std::string, VMVal>& tab, F& f) {
+    if (key.size() < 2 || key[0] != '\x01') return;
+    if (key[1] == 'o') {
+        auto it = tab.find(key.substr(2));
+        if (it != tab.end()) visit_val(it->second, f);
+    } else if (key[1] == 't') {
+        for (auto& part : nypy::key_tuple_parts(key)) vm_visit_key_objects(part, tab, f);
+    }
 }
 template<class F> void traverse(const Entry& e, F& f) {
     switch (e.k) {
@@ -153,6 +165,18 @@ long collect_impl(VirtualMachine& vm, int g) {
         if (k != (size_t)-1) refs[k]--;
     };
     for (size_t i = 0; i < n; i++) traverse(ents[i], subtract);
+    // Objects used as dict keys (round 76; NyGC.hpp, KeyTable, for the
+    // interpreter): the table vm_key_objs() keeps them by, in a full
+    // collection, counts as the dicts' references - discounted here, and
+    // followed from the dicts reached below - and loses the ones found
+    // unreachable. It kept every object ever used as a key alive.
+    auto& keytab = vm_key_objs();
+    const bool keys = g == 2 && !keytab.empty();
+    if (keys) for (auto& kv : keytab) visit_val(kv.second, subtract);
+    auto key_edges = [&](const Entry& e, auto& f) {
+        if (!keys || e.k != K_MAP) return;
+        for (auto& kv : *static_cast<Map*>(e.raw)) vm_visit_key_objects(kv.first, keytab, f);
+    };
     // Reachable from outside.
     std::vector<char> reach(n, 0);
     std::vector<size_t> work;
@@ -165,6 +189,7 @@ long collect_impl(VirtualMachine& vm, int g) {
         size_t i = work.back();
         work.pop_back();
         traverse(ents[i], mark);
+        key_edges(ents[i], mark);
     }
     int older = g + 1 < 3 ? g + 1 : g;
     std::vector<size_t> garbage;
@@ -181,6 +206,11 @@ long collect_impl(VirtualMachine& vm, int g) {
     // Finalizers first (PEP 442), on the objects themselves.
     bool ran = false;
     for (size_t i : garbage) {
+        if (ents[i].k == K_GEN) {
+            // A suspended generator: closed first (its finally blocks run).
+            if (vm.gc_close_generator(*static_cast<GenState*>(ents[i].raw))) { st.finalized++; ran = true; }
+            continue;
+        }
         if (ents[i].k != K_MAP) continue;
         auto* d = std::get_deleter<FinalDeleter>(alive[i]);
         if (!d || d->finalized) continue;
@@ -197,6 +227,7 @@ long collect_impl(VirtualMachine& vm, int g) {
         for (size_t k = 0; k < garbage.size(); k++) r2[k] = (int64_t)alive[garbage[k]].use_count() - 1;
         auto sub2 = [&](void* p) { auto it = gidx.find(p); if (it != gidx.end()) r2[it->second]--; };
         for (size_t k = 0; k < garbage.size(); k++) traverse(ents[garbage[k]], sub2);
+        if (keys) for (auto& kv : keytab) visit_val(kv.second, sub2);
         bool resurrected = false;
         for (auto v : r2) if (v > 0) { resurrected = true; break; }
         if (resurrected) {
@@ -204,6 +235,19 @@ long collect_impl(VirtualMachine& vm, int g) {
             st.uncollectable += found;
             collecting = false;
             return 0;
+        }
+    }
+    if (keys) {
+        // `alive` still holds the garbage: dropping an entry frees nothing yet.
+        std::unordered_set<void*> dead;
+        for (size_t i : garbage) dead.insert(ents[i].raw);
+        std::vector<VMVal> dropped;
+        for (auto it = keytab.begin(); it != keytab.end();) {
+            const VMVal& v = it->second;
+            void* id = v.map ? (void*)v.map.get() : v.gen ? (void*)v.gen.get() : v.iter ? (void*)v.iter.get() : nullptr;
+            bool gone = (id && dead.count(id)) || (!id && v.closure_env && dead.count(v.closure_env.get()));
+            if (gone) { dropped.push_back(v); it = keytab.erase(it); }
+            else ++it;
         }
     }
     for (size_t i : garbage) clear(ents[i]);

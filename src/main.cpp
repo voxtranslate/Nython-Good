@@ -87,8 +87,14 @@ static void report_compiler_error(const std::string& kind,
         while (n < loc.row && std::getline(in, line)) n++;
         if (n == loc.row) {
             std::cerr << "  " << line << "\n  ";
-            for (uint32_t i = 1; i < loc.column && i < line.size() + 1; ++i)
-                std::cerr << (line[i-1] == '\t' ? '\t' : ' ');
+            // loc.column counts characters (a UTF-8 sequence is one).
+            uint32_t col = 1;
+            for (size_t i = 0; i < line.size() && col < loc.column; ++i) {
+                unsigned char c = static_cast<unsigned char>(line[i]);
+                if ((c & 0xC0) == 0x80) continue;
+                std::cerr << (c == '\t' ? '\t' : ' ');
+                col++;
+            }
             std::cerr << "^\n";
         }
     }

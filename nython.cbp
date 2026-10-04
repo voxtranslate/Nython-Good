@@ -122,7 +122,6 @@
         <Unit filename="src/Container.cpp" />
         <Unit filename="src/Context.cpp" />
         <Unit filename="src/DynamicLang.cpp" />
-        <Unit filename="src/GarbageCollector.cpp" />
         <Unit filename="src/Interpreter.cpp" />
         <Unit filename="src/Lexer.cpp" />
         <Unit filename="src/List.cpp" />
@@ -142,6 +141,7 @@
         <Unit filename="src/NyCoro.cpp" />
         <Unit filename="src/NyGen.cpp" />
         <Unit filename="src/NyGC.cpp" />
+        <Unit filename="src/NyScope.cpp" />
         <Unit filename="src/VMGC.cpp" />
         <!-- ═══════════ Builtin modules ═══════════ -->
         <Unit filename="src/builtins/audio.cpp" />
@@ -171,6 +171,7 @@
         <Unit filename="include/NyCoro.hpp" />
         <Unit filename="include/NyGen.hpp" />
         <Unit filename="include/NyGC.hpp" />
+        <Unit filename="include/NyScope.hpp" />
         <Unit filename="include/VMGC.hpp" />
         <Unit filename="include/NyHeap.hpp" />
         <Unit filename="include/NyHeapImpl.hpp" />

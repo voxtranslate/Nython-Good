@@ -56,6 +56,13 @@ struct GenObject : nython::kernel::Object {
     GenObject(Runnable* r, Gen* gen);
     ~GenObject() override;
     std::string toString() override;
+    // The collector sees what the generator holds through its record (its
+    // scope, values in flight, the iterators it reads), and a suspended one
+    // is finalizable: an unreachable cycle through it is closed (finally
+    // blocks run, its stack unwinds and lets go) and then freed (round 76).
+    void gc_traverse(nython::gc::GcVisitFn visit, void* arg) override;
+    bool gc_has_finalizer() override;
+    void gc_finalize() override;
     GenObject(const GenObject&) = delete;
     GenObject& operator=(const GenObject&) = delete;
 };
@@ -178,5 +185,9 @@ Value body_on_new_stack(NythonExecutor& E, void* fn_node, Context* fc);
 
 struct Stats { size_t live_suspended; size_t created; size_t coroutines; };
 Stats stats();
+
+// The generator whose body this thread (or async task) is running: part of
+// the interpreter's per-thread state that NyConc swaps (threading.cpp).
+Gen*& running();
 
 }  // namespace nygen

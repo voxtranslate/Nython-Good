@@ -4,6 +4,7 @@
 #include "Object.hpp"
 #include "Container.hpp"
 #include "Collectable.hpp"
+#include "NyGC.hpp"
 #include <utility>
 #include <functional>
 // ^ explicit: libstdc++ supplies these transitively, MinGW does not.
@@ -48,8 +49,12 @@ Container::~Container() {
 
 void Container::gc_traverse(nython::gc::GcVisitFn visit, void* arg) {
     if (!this->container) return;
-    for (auto& kv : *this->container)
+    for (auto& kv : *this->container) {
         if (kv.second.value.o) visit(kv.second.value.o, arg);
+        // A full collection's reachability pass: the objects this dict's
+        // keys name are reached through it (NyGC.hpp, KeyTable).
+        if (nygc::g_key_edges) nygc::visit_key_objects(kv.first, visit, arg);
+    }
 }
 
 void Container::gc_clear() {

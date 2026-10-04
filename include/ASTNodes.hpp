@@ -584,6 +584,7 @@ struct YieldFromNode : Node {
 struct WalrusNode : Node {
     std::string name;
     node_ptr init;
+    bool global_ref = false;     // `name` was declared `global` (set by NyScope)
     WalrusNode(Token t, std::string n, node_ptr e) : Node(t, NodeType::WALRUS), name(std::move(n)), init(e) {}
     Value eval(Context* ctx) override { return init ? init->eval(ctx) : NONE_VALUE; }
 };
@@ -635,6 +636,7 @@ struct ExceptNode : Node {
     //   except (A, B) as e:     types {A, B}  var "e"
     // `name`/`alias` keep their historical spelling for older consumers.
     std::vector<std::string> types; std::string var;
+    bool var_global = false;     // `var` was declared `global` (set by NyScope)
     ExceptNode(Token t, const std::string& n, const std::string& a, node_ptr b) : Node(t, NodeType::EXCEPT), name(n), alias(a), body(b) {}
     Value eval(Context* ctx) override { return body->eval(ctx); }
 };
@@ -818,12 +820,14 @@ struct DeleteNode : Node {
 
 struct GlobalNode : Node {
     std::string name;
-    GlobalNode(Token t, const std::string& n) : Node(t, NodeType::GLOBAL), name(n) {}
+    bool is_nonlocal = false;   // `nonlocal name` (else `global name`); read by NyScope
+    GlobalNode(Token t, const std::string& n, bool nl = false) : Node(t, NodeType::GLOBAL), name(n), is_nonlocal(nl) {}
     Value eval(Context* ctx) override { return NONE_VALUE; }
 };
 
 struct WithNode : Node {
     node_ptr expr; std::string alias; node_ptr body;
+    bool alias_global = false;   // the alias was declared `global` (set by NyScope)
     WithNode(Token t, node_ptr e, const std::string& a, node_ptr b) : Node(t, NodeType::WITH), expr(e), alias(a), body(b) {}
     Value eval(Context* ctx) override {
         Value val = expr->eval(ctx);

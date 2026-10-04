@@ -52,6 +52,29 @@ enum : uint16_t {
 // then give none).
 extern void (*g_weak_hook)(Collectable*);
 
+// Objects used as dict keys (round 76). A dict keyed by an instance or a
+// function stores the object's identity as the key's text, and the engine
+// keeps the object in a table to give it back (NythonExecutor::key_objs_).
+// That table used to keep every such object alive until the program ended.
+// Now, in a full collection, the table's own references are discounted, a
+// live dict reaches the objects its keys name (Container::gc_traverse while
+// g_key_edges is set), and the entries whose objects turn out unreachable
+// are dropped: the table keeps nothing alive by itself, and a cycle through
+// a key (a node keyed in a dict the node holds) is collected. Collections
+// of the young generations leave the table alone (an old dict's keys are
+// not traversed there), so its entries are roots then.
+struct KeyTable {
+    bool (*any)() = nullptr;                                      // has entries
+    void (*each)(nython::gc::GcVisitFn visit, void* arg) = nullptr;  // every object in it
+    Collectable* (*lookup)(const std::string& id) = nullptr;      // the object an id names
+    void (*drop_garbage)() = nullptr;    // drop the entries of objects still F_COLLECTING
+};
+extern KeyTable g_keys;
+extern bool g_key_edges;
+// The objects a stored dict key names: an object key, or object keys inside
+// a tuple key.
+void visit_key_objects(const std::string& key, nython::gc::GcVisitFn visit, void* arg);
+
 constexpr int kGenerations = 3;
 
 // Link a new object that can hold references into generation 0 / unlink it.

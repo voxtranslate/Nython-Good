@@ -5474,3 +5474,27 @@ New:
 - **Builtins:** `gc_*`, `mem_rss_kb`, `weakref`, `thread_wait_count`, `gui_display_density`, `gui_video_driver` and `os_shell`.
 - **Tools:** `tools/build_sdl3.sh`, `tools/cross_windows.sh` (`ARCH=i686` too), `tools/cbp.py`, `tools/pe_unwind_check.py`, `tools/ny_attrcheck.py`, `tools/lsan.supp` and `make asan`.
 - **Tests:** `vm_audit55`–`57` and `62`, and `gui_tests/test_28`–`29`.
+
+## Round 76 — the "Not done" lists closed
+
+Full detail in `HANDOFF.md` §0o. New tests: `vm_audit63` (59 checks) and `vm_audit64` (26), plus new sections of `vm_audit48` (rwlock) and `vm_audit49` (tasks as coroutines). The new checks fail on round 75's build: vm_audit64 12 of 26 on the interpreter and 10 on the VM; vm_audit49 2002 OS threads for 2000 tasks, and a bare `raise` that re-raised the other task's exception.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `const K = 5` then `K = 6` was allowed | nothing checked it | a static scope pass over every parsed program (`src/NyScope.cpp`, both engines): assigning, augmenting, deleting, re-declaring, unpacking into or looping over a const is a SyntaxError before the program runs |
+| `nonlocal zz` with no enclosing `zz` rebound a global or made a local | not checked | SyntaxError, as Python (also at module level, and together with `global`) |
+| A walrus, `except ... as` or `with ... as` of a `global` name bound a local | the parser marks only plain variable nodes | the scope pass marks those binding forms; both engines bind the module's variable |
+| `fact = lambda n: ... fact(n - 1)` raised NameError on the interpreter; `[lambda: i for i in range(3)]` gave 0, 1, 2 | a lambda copied every visible binding when it was made | it closes over its scope by reference, as `def` does; defaults evaluated when it is made |
+| `print(a(), b())` printed `a`'s output, then `a()`'s value, then `b`'s output | evaluated and printed one argument at a time | all arguments evaluated first |
+| Every syntax error said column 2; the IDE's diagnostics landed at the start of the line | `Location::reset` ignored its column argument, so each token restarted at column 1 | tokens located where they start; columns count characters (tab and UTF-8 sequences are one); the caret is placed by characters |
+| `isinstance(g, "generator")` was false for a generator; `zip(gen).send(1)` acted as `next()`; lazy iterators printed as `<generator object zip>` | not handled | true for every lazy iterator; AttributeError for send/throw; Python's repr (`type()` stays "generator": Nython's dict is the type "map") |
+| 6 threads writing under an rwlock: 33,922 thread sleeps for 18,000 locks (17,699 on the VM) | a waiter's predicate took the lock as it woke, before it had the GIL; every unlock woke every waiter | competitive succession, as for the mutex: one writer heir or all readers woken, the lock taken by a running thread (144 / 61 sleeps) |
+| 2000 async tasks were 2000 OS threads; each switch was a thread hand-off | a task was a thread passed a baton through the GIL | a task is a coroutine on its loop's thread (2000 tasks: 1 thread; 0.60 s -> 0.23 s, VM 0.31 s -> 0.07 s; switches 3-12x faster); a task blocking inside a generator relays out through it |
+| A bare `raise` in one thread or task could re-raise another's exception | the interpreter's exception stack (and owner stack) were shared by all threads | a per-thread interpreter state swapped with the GIL and at task switches (`InterpEngine::State`) |
+| Every object ever used as a dict key - or only looked up as one - lived until the program ended (both engines) | the key table held it | full collections count the table's references as the dicts': objects no live dict uses are freed, cycles through keys included |
+| A cycle through a suspended generator leaked on the interpreter; the VM freed it without running its finally blocks | the generator's references were invisible; the VM just cleared it | the collector sees the generator's record, and closes a suspended generator found unreachable before freeing it (PEP 442's order), on both engines |
+| `f = xs.append` kept `xs` alive forever (2000 reads: 2000 lists) | bound builtin members were never freed | heap objects (`nyheap::BMember`) freed with their last reference |
+| `mem_rss_kb()` read 0 on Windows | `/proc` only | the working set through `K32GetProcessMemoryInfo` (psapi.dll's on Vista) |
+| IndexError read "index 5 out of range (length 2)" on the interpreter, "list index out of range" on the VM | two messages | Python's, on both |
+
+Removed: `src/GarbageCollector.cpp`, `include/GarbageCollector.hpp`, `include/GarbageCollectorConfig.hpp` (unused since round 75) and `include/Evaluator.hpp` (never used; the only caller of the old allocator).

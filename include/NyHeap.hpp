@@ -61,6 +61,21 @@ struct Func final : Collectable {
     void gc_clear() override;
 };
 
+// A builtin value's method read as a value (`f = xs.append`, an object-
+// protocol member): value.p == &tag. Holds the receiver. These were kept
+// for the life of the process, receivers included (round 76).
+struct BMember final : Collectable {
+    std::string tag;
+    NythonExecutor* E;
+    Value recv;                          // counted
+    std::string name;
+    uintptr_t key_id = 0;                // its bound_member_cache_ key
+    BMember(NythonExecutor* e, const std::string& t);
+    ~BMember() override;
+    void gc_traverse(GcVisitFn visit, void* arg) override;
+    void gc_clear() override;
+};
+
 // A method read off an instance as a value: value.p == &tag. Holds the
 // function and the instance.
 struct Bound final : Collectable {

@@ -291,10 +291,17 @@ bookkeeping) is 1.4% of the instructions; `mallinfo2` 0.002%.
 
 ## Remaining limits
 
-- **Objects used as dict keys** are kept until the executor ends
-  (`key_objs_`): a key is a string inside the dict and cannot carry a
-  reference. The objects are kept, not reused, so this is a leak, not an
-  aliasing bug.
+- ~~Objects used as dict keys are kept for the process~~ - **round 76**: the
+  key table (`key_objs_`, the VM's `vm_key_objs()`) no longer keeps anything
+  alive by itself. A key is a string inside the dict and cannot carry a
+  reference, so in a **full** collection the table's references are
+  discounted (as if the dicts held them), a reached dict reaches the objects
+  its keys name - object keys, and object keys inside tuple keys
+  (`Container::gc_traverse` while `nygc::g_key_edges` is set) - and the
+  entries of objects found unreachable are dropped before they are cleared
+  (`nygc::KeyTable`). Young collections leave the table alone: an old dict is
+  not traversed there, so its keys' objects must be kept. A key looked up
+  but never stored goes at the next full collection.
 - **The VM's collector cannot see references held by natives**: a
   `std::function`'s captures (a `property` descriptor's `setter`, a
   `weakref` closure) and compiled code objects' constants. Cycles through
@@ -310,17 +317,24 @@ bookkeeping) is 1.4% of the instructions; `mallinfo2` 0.002%.
 - The **interpreter's value representation** is unchanged (above): a float
   in a list is ~280 bytes, an instance ~2 KB. Reclaiming garbage does not
   shrink live data.
-- The old `GarbageCollector` (`src/GarbageCollector.cpp`) is still compiled
-  and still unused.
+- ~~The old `GarbageCollector` is still compiled~~ - removed in round 76.
 - **Function attributes** (`f.x = v`, round75-sem) are freed with their
   function on the interpreter; on the VM `func_attrs_` is keyed by raw
   code/scope pointers and holds its values as roots: a function attribute
   that refers back to the function is never collected there, and an entry
   can outlive its function's scope. Bound builtin members
-  (`lst.append` read as a value) keep their receivers for the process.
-- **Suspended generators** (round75-gen): their coroutine stacks and
-  `Gen` fields hold references the collector cannot see, so a cycle through
-  a suspended generator is not collected. A generator dropped while
+  (`lst.append` read as a value) are heap objects (`nyheap::BMember`) since
+  round 76, freed with their last reference.
+- **Suspended generators** (round75-gen; round 76): `GenObject` traverses
+  what the generator's record holds (its pinned scope, values in flight,
+  the iterators it reads) and is finalizable while suspended: an
+  unreachable one is closed before anything is cleared - finally blocks
+  run, the coroutine stack unwinds - and the group is then freed unless the
+  recount finds it resurrected. References on a suspended stack still look
+  external (they keep what they reach alive). Another thread's suspended
+  generator reports no edges, so it is never found unreachable. The VM
+  closes a suspended generator in its garbage the same way
+  (`VirtualMachine::gc_close_generator`). A generator dropped while
   suspended is closed at the next statement (reference counting destroys
   its object; `~GenObject` queues it for `nygen::run_pending`).
 
@@ -330,8 +344,8 @@ Until round 75 the interpreter never freed a container, string, function,
 bound method or instance: 200,000 iterations of `var L = [1,2,3]` and
 `var m = {"a":1}` peaked at 494-598 MB, and the largest nytorch tests near
 1.1 GB. `Object`s were allocated with raw `new` and never deleted; the
-`GarbageCollector` class (mark/sweep over `MemoryCell`s, still in
-`src/GarbageCollector.cpp`, unused) was never wired: no allocation went
+`GarbageCollector` class (mark/sweep over `MemoryCell`s, in
+`src/GarbageCollector.cpp` until round 76 removed it) was never wired: no allocation went
 through it, nothing registered temporaries, and `do_collect()` was
 unreachable from `NythonExecutor`. Round 73 reduced the garbage made
 (shared literals and one-byte strings); round 75 reclaims it. The VM was

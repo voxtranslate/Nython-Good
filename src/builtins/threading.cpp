@@ -38,6 +38,7 @@
 
 // Full executor definition (needed for E.getStringValue etc.)
 #include "NythonExecutor.hpp"
+#include "NyGen.hpp"
 #include "builtins/threading.hpp"
 
 #include "NyConc.hpp"
@@ -160,6 +161,38 @@ struct InterpEngine : nyconc::Engine {
             return c == std::string::npos ? t : t.substr(c + 1);
         }
         return E.isStringValue(v) ? E.getStringValue(v) : v.toString();
+    }
+
+    // What the interpreter keeps per thread of execution - an OS thread, or
+    // an async task on its loop's thread (NyConc.cpp: a task is a coroutine
+    // there, and thread_local variables are the thread's, not the task's).
+    // Swapped with the live state when the runtime changes who runs: the
+    // GIL changing hands, a loop switching to a task and back. Before async
+    // tasks were coroutines only the thread_local parts were per thread, and
+    // the exception stack (bare `raise`) and owner stack were shared by all
+    // threads.
+    struct State {
+        int depth = 0;
+        NythonExecutor::FlowState flow;
+        nython::node::node_ptr last;
+        decltype(NythonExecutor::handling_exc_) handling;
+        decltype(NythonExecutor::owner_stack_) owners;
+        decltype(NythonExecutor::TraceState::fn_stack) trace;
+        nygen::Gen* gen = nullptr;
+    };
+    void* state_new() override { return new State(); }
+    void state_free(void* p) override { delete static_cast<State*>(p); }
+    void swap_in(void* p) override { swap(static_cast<State*>(p)); }
+    void swap_out(void* p) override { swap(static_cast<State*>(p)); }
+    void swap(State* st) {
+        if (!st) return;
+        std::swap(NythonExecutor::call_depth_, st->depth);
+        std::swap(NythonExecutor::flow(), st->flow);
+        std::swap(NythonExecutor::last_stmt(), st->last);
+        std::swap(E.handling_exc_, st->handling);
+        std::swap(E.owner_stack_, st->owners);
+        std::swap(NythonExecutor::tracer().fn_stack, st->trace);
+        std::swap(nygen::running(), st->gen);
     }
 };
 

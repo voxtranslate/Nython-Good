@@ -36,6 +36,7 @@
 
 // Full executor definition (needed for E.getStringValue etc.)
 #include "NythonExecutor.hpp"
+#include "NyGen.hpp"
 #include "builtins/tensor.hpp"
 #include "NyTensor.hpp"
 
@@ -439,6 +440,10 @@ Value dispatch_tensor(NythonExecutor& E,
                     return Value(false);
                 }
                 if (type_name == "none") return Value(args[0].type == ValueType::NONE);
+                // Every lazy iterator: a generator, a generator expression,
+                // zip/map/filter/enumerate/islice over one, iter() (it read
+                // false for all of them).
+                if (type_name == "generator") return Value(nygen::is_gen(args[0]));
                 if (type_name == "function") return Value(args[0].type == ValueType::USERDATA && args[0].value.p && !E.string_ptrs_.count(args[0].value.p) && func_names.count(args[0].value.p));
                 // Check class instances (user-defined classes) — type_name is the class name.
                 // Every base counts, and a builtin exception base too

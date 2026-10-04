@@ -2,6 +2,14 @@
 // interpreter's heap. See include/NyGC.hpp for the model and its invariants,
 // and GC_NOTES.md for how the engine's objects plug into it.
 #include "NyGC.hpp"
+#include "NyStr.hpp"
+#if defined(_WIN32)
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <windows.h>
+#  include <psapi.h>
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -19,6 +27,17 @@ namespace nygc {
 
 std::atomic<bool> g_pending{false};
 void (*g_weak_hook)(Collectable*) = nullptr;
+KeyTable g_keys;
+bool g_key_edges = false;
+
+void visit_key_objects(const std::string& key, nython::gc::GcVisitFn visit, void* arg) {
+    if (key.size() < 2 || key[0] != '\x01' || !g_keys.lookup) return;
+    if (key[1] == 'o') {
+        if (Collectable* o = g_keys.lookup(key.substr(2))) visit(o, arg);
+    } else if (key[1] == 't') {
+        for (auto& part : nypy::key_tuple_parts(key)) visit_key_objects(part, visit, arg);
+    }
+}
 bool g_shutdown = false;
 long long g_live_strings = 0;
 long long g_string_bytes = 0;
@@ -132,16 +151,22 @@ long collect_impl(int gen) {
         c->gc_refs = c->gc_rc == 0 ? (std::numeric_limits<int64_t>::max() / 2) : (int64_t)c->gc_rc;
     }
     for (Collectable* c = lists[kYoung].head; c; c = c->gc_next) c->gc_traverse(visit_subtract, nullptr);
+    // The object-key table's references are the dicts' (NyGC.hpp, KeyTable):
+    // discounted here, and followed from the dicts that are reached.
+    const bool keys = gen == kGenerations - 1 && g_keys.any && g_keys.any();
+    if (keys) g_keys.each(visit_subtract, nullptr);
 
     // 2. What is still referenced from outside, and everything it reaches.
     std::vector<Collectable*> work;
     for (Collectable* c = lists[kYoung].head; c; c = c->gc_next)
         if (c->gc_refs > 0) { c->gc_flags |= F_REACHABLE; work.push_back(c); }
+    g_key_edges = keys;
     while (!work.empty()) {
         Collectable* c = work.back();
         work.pop_back();
         c->gc_traverse(visit_reach, &work);
     }
+    g_key_edges = false;
 
     // 3. Survivors move up a generation; the rest is garbage.
     int older = gen + 1 < kGenerations ? gen + 1 : gen;
@@ -184,6 +209,7 @@ long collect_impl(int gen) {
     if (ran) {
         for (Collectable* u : unreachable) u->gc_refs = (int64_t)u->gc_rc - 1;
         for (Collectable* u : unreachable) u->gc_traverse(visit_subtract, nullptr);
+        if (keys) g_keys.each(visit_subtract, nullptr);
         bool resurrected = false;
         for (Collectable* u : unreachable) if (u->gc_refs > 0) { resurrected = true; break; }
         if (resurrected) {
@@ -196,7 +222,9 @@ long collect_impl(int gen) {
         }
     }
 
-    // 5. Break the cycles; dropping the holds then frees the objects.
+    // 5. Break the cycles; dropping the holds then frees the objects. The
+    //    key table lets go of the garbage first (the holds keep it alive).
+    if (keys) g_keys.drop_garbage();
     for (Collectable* u : unreachable) u->gc_flags &= (uint16_t)~(F_REACHABLE | F_COLLECTING);
     for (Collectable* u : unreachable) u->gc_clear();
     st.collected[gen] += n;
@@ -369,6 +397,31 @@ Stats stats() {
     return s;
 }
 
+#if defined(_WIN32)
+// The process's working set (resident memory), current and peak, in KB.
+// GetProcessMemoryInfo is K32GetProcessMemoryInfo in kernel32 from Windows 7
+// on, and only in psapi.dll on Vista (the oldest target): looked up, so the
+// program links and runs on both. mem_rss_kb() used to read 0 on Windows.
+static bool win_memory(long long& rss, long long& peak) {
+    using Fn = BOOL (WINAPI*)(HANDLE, PROCESS_MEMORY_COUNTERS*, DWORD);
+    static Fn fn = [] {
+        Fn f = (Fn)(void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32GetProcessMemoryInfo");
+        if (!f) {
+            if (HMODULE ps = LoadLibraryW(L"psapi.dll")) f = (Fn)(void*)GetProcAddress(ps, "GetProcessMemoryInfo");
+        }
+        return f;
+    }();
+    if (!fn) return false;
+    PROCESS_MEMORY_COUNTERS pmc;
+    std::memset(&pmc, 0, sizeof pmc);
+    pmc.cb = sizeof pmc;
+    if (!fn(GetCurrentProcess(), &pmc, sizeof pmc)) return false;
+    rss = (long long)(pmc.WorkingSetSize / 1024);
+    peak = (long long)(pmc.PeakWorkingSetSize / 1024);
+    return true;
+}
+#endif
+
 static long long proc_status_kb(const char* key) {
     FILE* f = std::fopen("/proc/self/status", "r");
     if (!f) return 0;
@@ -381,7 +434,14 @@ static long long proc_status_kb(const char* key) {
     std::fclose(f);
     return v;
 }
-long long rss_kb() { return proc_status_kb("VmRSS:"); }
+long long rss_kb() {
+#if defined(_WIN32)
+    long long rss = 0, peak = 0;
+    return win_memory(rss, peak) ? rss : 0;
+#else
+    return proc_status_kb("VmRSS:");
+#endif
+}
 
 void trim_heap() { release_free_pages(); }
 
@@ -393,6 +453,13 @@ size_t heap_bytes() {
     return 0;   // no byte trigger: the generation counts alone
 #endif
 }
-long long peak_rss_kb() { return proc_status_kb("VmHWM:"); }
+long long peak_rss_kb() {
+#if defined(_WIN32)
+    long long rss = 0, peak = 0;
+    return win_memory(rss, peak) ? peak : 0;
+#else
+    return proc_status_kb("VmHWM:");
+#endif
+}
 
 } // namespace nygc

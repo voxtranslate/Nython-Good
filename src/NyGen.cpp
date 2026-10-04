@@ -3,6 +3,7 @@
 #include "NyGen.hpp"
 #include "NyGC.hpp"
 #include "NyCoro.hpp"
+#include "NyConc.hpp"
 
 #include <cstdio>
 #include <exception>
@@ -394,45 +395,53 @@ bool resume_function(NythonExecutor& E, Gen* g, Mode m) {
     Gen* r_gen = t_cur;
     size_t h0 = H.size(), o0 = O.size(), t0 = T.size();
     bool tracing = NythonExecutor::trace_on() && !NythonExecutor::tracer().in_repr;
-    // The generator's.
-    f.fast_ctx = g->saved.fast_ctx;
-    f.brk_ok = g->saved.brk_ok;
-    f.pending = g->saved.pending;
-    f.value = g->saved.value;
-    if (g->saved.last) NythonExecutor::last_stmt() = g->saved.last;
-    NythonExecutor::call_depth_ = rd + 1 + g->saved.rel_depth;
-    H.insert(H.end(), g->saved.handling.begin(), g->saved.handling.end());
-    O.insert(O.end(), g->saved.owners.begin(), g->saved.owners.end());
-    if (tracing) T.push_back(g->name);
-    size_t t1 = T.size();
-    T.insert(T.end(), g->saved.trace.begin(), g->saved.trace.end());
-    t_cur = g;
-    g->st = St::Running;
-    g->mode = m;
-    g->yielded = false;
-    {
-        NythonExecutor::ProfScope prof(&E, NythonExecutor::profiling_enabled() ? g->name : std::string());
-        nycoro::resume(g->co);
+    bool first = true;
+    for (;;) {
+        // The generator's.
+        f.fast_ctx = g->saved.fast_ctx;
+        f.brk_ok = g->saved.brk_ok;
+        f.pending = g->saved.pending;
+        f.value = g->saved.value;
+        if (g->saved.last) NythonExecutor::last_stmt() = g->saved.last;
+        NythonExecutor::call_depth_ = rd + 1 + g->saved.rel_depth;
+        H.insert(H.end(), g->saved.handling.begin(), g->saved.handling.end());
+        O.insert(O.end(), g->saved.owners.begin(), g->saved.owners.end());
+        if (tracing) T.push_back(g->name);
+        size_t t1 = T.size();
+        T.insert(T.end(), g->saved.trace.begin(), g->saved.trace.end());
+        t_cur = g;
+        g->st = St::Running;
+        if (first) { g->mode = m; g->yielded = false; first = false; }
+        {
+            NythonExecutor::ProfScope prof(&E, NythonExecutor::profiling_enabled() ? g->name : std::string());
+            nycoro::resume(g->co);
+        }
+        // Back: keep the generator's state, put the resumer's back.
+        g->saved.fast_ctx = f.fast_ctx;
+        g->saved.brk_ok = f.brk_ok;
+        g->saved.pending = f.pending;
+        g->saved.value = f.value;
+        g->saved.last = NythonExecutor::last_stmt();
+        g->saved.rel_depth = NythonExecutor::call_depth_ - (rd + 1);
+        g->saved.handling.assign(H.size() > h0 ? H.begin() + (long)h0 : H.end(), H.end());
+        H.resize(std::min(H.size(), h0));
+        g->saved.owners.assign(O.size() > o0 ? O.begin() + (long)o0 : O.end(), O.end());
+        O.resize(std::min(O.size(), o0));
+        g->saved.trace.assign(T.size() > t1 ? T.begin() + (long)t1 : T.end(), T.end());
+        T.resize(std::min(T.size(), t0));
+        f.fast_ctx = r_fast;
+        f.brk_ok = r_brk;
+        f.pending = r_pend;
+        f.value = r_val;
+        NythonExecutor::call_depth_ = rd;
+        t_cur = r_gen;
+        if (nycoro::done(g->co) || !nyconc::relay_requested()) break;
+        // An async task blocked inside this body: leave through this stack
+        // too, and come back in when the task runs again. The generator
+        // stays Running meanwhile (nothing else may resume it).
+        NythonExecutor::last_stmt() = r_last;
+        nyconc::relay_park();
     }
-    // Back: keep the generator's state, put the resumer's back.
-    g->saved.fast_ctx = f.fast_ctx;
-    g->saved.brk_ok = f.brk_ok;
-    g->saved.pending = f.pending;
-    g->saved.value = f.value;
-    g->saved.last = NythonExecutor::last_stmt();
-    g->saved.rel_depth = NythonExecutor::call_depth_ - (rd + 1);
-    g->saved.handling.assign(H.size() > h0 ? H.begin() + (long)h0 : H.end(), H.end());
-    H.resize(std::min(H.size(), h0));
-    g->saved.owners.assign(O.size() > o0 ? O.begin() + (long)o0 : O.end(), O.end());
-    O.resize(std::min(O.size(), o0));
-    g->saved.trace.assign(T.size() > t1 ? T.begin() + (long)t1 : T.end(), T.end());
-    T.resize(std::min(T.size(), t0));
-    f.fast_ctx = r_fast;
-    f.brk_ok = r_brk;
-    f.pending = r_pend;
-    f.value = r_val;
-    NythonExecutor::call_depth_ = rd;
-    t_cur = r_gen;
     bool finished = nycoro::done(g->co);
     // An exception keeps the generator's statement as the last one run, so
     // an uncaught error reports where it was raised.
@@ -686,7 +695,62 @@ GenObject::~GenObject() {
     delete gg;
 }
 
+namespace {
+void visit_value(const Value& v, nython::gc::GcVisitFn visit, void* arg) {
+    if (v.value.o) visit(v.value.o, arg);
+}
+void visit_cursor(const Cursor& c, nython::gc::GcVisitFn visit, void* arg) {
+    visit_value(c.hold, visit, arg);
+    visit_value(c.it, visit, arg);
+    visit_value(c.stop_value, visit, arg);
+    for (auto& v : c.v) visit_value(v, visit, arg);
+}
+// Whether this thread may resume (and so close) the generator.
+bool closable_here(const Gen* g) {
+    return g->co && nycoro::started(g->co) && nycoro::owner(g->co) == nycoro::thread_token();
+}
+}  // namespace
+
+// A suspended generator's coroutine stack also holds references, which the
+// collector cannot see: they look external, so whatever they reach stays
+// alive (missing a reference never frees anything). A cycle is found when
+// every reference into it is one of those it can see - the usual case:
+// the generator's scope holds the object that holds the generator - and
+// closing the generator (gc_finalize, PEP 442's order: before anything is
+// cleared) unwinds the stack, after which the cycle is plain garbage.
+void GenObject::gc_traverse(nython::gc::GcVisitFn visit, void* arg) {
+    Object::gc_traverse(visit, arg);
+    Gen* gg = g;
+    if (!gg || gg->st == St::Running) return;
+    // Another thread's suspended generator: only that thread may close it,
+    // so it must not be found unreachable here.
+    if (gg->kind == Kind::Function && gg->st == St::Suspended && !closable_here(gg)) return;
+    if (gg->fc_pinned && gg->fc) visit(gg->fc, arg);
+    if (gg->outer_pinned && gg->outer) visit(gg->outer, arg);
+    if (gg->cc) visit(gg->cc, arg);
+    visit_value(gg->xfer, visit, arg);
+    visit_value(gg->retval, visit, arg);
+    visit_value(gg->saved.value, visit, arg);
+    visit_value(gg->delegate, visit, arg);
+    visit_value(gg->fnv, visit, arg);
+    visit_value(gg->idx, visit, arg);
+    for (auto& c : gg->cur) visit_cursor(c, visit, arg);
+    for (auto& c : gg->src) visit_cursor(c, visit, arg);
+}
+
+bool GenObject::gc_has_finalizer() {
+    return g && g->E && g->kind == Kind::Function && g->st == St::Suspended && closable_here(g);
+}
+
+void GenObject::gc_finalize() {
+    if (gc_has_finalizer()) finalize(*g->E, g);   // never raises
+}
+
 std::string GenObject::toString() {
+    // zip/map/filter/enumerate/islice/iter print as Python prints them
+    // (`<zip object at 0x...>`); their type() stays "generator", since
+    // Nython's dict is already the type "map".
+    if (g && g->kind == Kind::Native) return "<" + g->name + " object at " + hex_ptr(this) + ">";
     return "<generator object " + (g ? g->name : std::string("?")) + " at " + hex_ptr(this) + ">";
 }
 
@@ -882,6 +946,11 @@ bool method(NythonExecutor& E, const Value& obj, const std::string& name, std::v
         return true;
     }
     if (name == "__iter__") { out = obj; return true; }
+    // A lazy zip/map/filter/enumerate/islice/iter is an iterator, not a
+    // generator: no send or throw (Python's AttributeError). send() used to
+    // behave as next().
+    if (g->kind == Kind::Native && (name == "send" || name == "throw"))
+        raise("AttributeError", "'" + g->name + "' object has no attribute '" + name + "'");
     if (name == "send") {
         if (args.size() != 1) raise("TypeError", "generator.send() takes exactly one argument (" + std::to_string(args.size()) + " given)");
         const Value& v = args[0];
@@ -1231,6 +1300,8 @@ void close_all(NythonExecutor& E) {
 
 void shutdown() { g_shutdown = true; }
 
+Gen*& running() { return t_cur; }
+
 // ── Deep calls inside a generator ──────────────────────────────────────────
 namespace {
 struct Extension {
@@ -1259,6 +1330,11 @@ Value run_extension(Extension& x) {
     // A plain nested call: runs to the end, never suspends (a yield inside
     // it belongs to another generator, which has a coroutine of its own).
     nycoro::resume(co);
+    // ...except an async task blocking in it: leave through it (relay).
+    while (!nycoro::done(co) && nyconc::relay_requested()) {
+        nyconc::relay_park();
+        nycoro::resume(co);
+    }
     bool finished = nycoro::done(co);
     if (finished) nycoro::destroy(co);
     if (!finished) raise("RuntimeError", "internal error: a call on an extension stack suspended");

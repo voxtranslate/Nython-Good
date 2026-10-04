@@ -9,6 +9,7 @@
 #include "Script.hpp"
 #include "ASTNodes.hpp"
 #include "DynamicLang.hpp"
+#include "NyScope.hpp"
 
 // Set by stmt() when `async` precedes a def; consumed by functionDecl().
 static bool s_async_def_next = false;
@@ -35,7 +36,11 @@ std::vector<std::string> binaries = {
 Parser::Parser(Reporter* reporter, Runnable* runner_arg, Lexer* lexer): IParser(reporter), runner{runner_arg}, scanner{lexer}, param_defaults_{} {}
 
 node_ptr Parser::parse() {
-    try { return script(); }
+    try {
+        node_ptr root = script();
+        nython::scope::check(root);   // nonlocal / const / global binding forms (NyScope.hpp)
+        return root;
+    }
     catch (SyntaxError& ex) { throw ex; }
 }
 
@@ -410,13 +415,20 @@ node_ptr Parser::statement(){
                                   && peek(1).type() == TokenType::Identifier)) {
         bool is_global = see(TokenType::Global);
         next(); // consume 'global' / 'nonlocal'
+        // The declarations stay in the tree as GlobalNodes (no-ops on both
+        // engines) so NyScope can check them: `nonlocal x` needs an
+        // enclosing function's x, and a walrus / `except ... as` / `with
+        // ... as` of a global-declared name binds the module's.
+        auto decls = make_node<BlockNode>(token());
         do {
+            Token ntok = token();
             std::string n = identifier();
             if(!outer_decls_.empty()) outer_decls_.back().push_back(n);
             if(is_global && !global_decls_.empty()) global_decls_.back().push_back(n);
+            decls->add(make_node<GlobalNode>(ntok, n, !is_global));
         } while(have(TokenType::Comma));
         have(TokenType::SemiColon); have(TokenType::NewLine);
-        return make_node<BlockNode>(token()); // no-op
+        return decls;
     }
     if(see(TokenType::Return)) return returnStmt();
     if(see(TokenType::Break)) return breakStmt();

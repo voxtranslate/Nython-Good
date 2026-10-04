@@ -3,7 +3,10 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 75 — **§0n** (real SDL3, HiDPI, every test in the
+Last updated: round 76 — **§0o** (the "Not done" lists of rounds 74-75
+closed: static scope checks, lambda closures, error columns, async tasks
+as coroutines, rwlock succession, objects used as dict keys and suspended
+generators collected; both engines). Round 75 — **§0n** (real SDL3, HiDPI, every test in the
 sweep), **§0m** (strict attribute and key reads with optional chaining
 and `??`, the scope ruling and `global`, suffix literals; both engines),
 **§0l** (lazy generators) and **§0k** (garbage collection on both
@@ -20,6 +23,178 @@ round 73 (the IDE to VS Code's model, verified by driving it). Earlier
 rounds: §0/§0b language-level work, §5.3 terminal command line / undo /
 multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
+
+---
+
+## 0o. Round 76 — the "Not done" lists closed
+
+Every item the round 74-75 sections listed as not done was taken up; what
+is still open is listed at the end. Tests: `examples/vm_audit63.ny` (scope,
+lambdas, print, columns, lazy iterators; 59 checks), `examples/vm_audit64.ny`
+(memory; 26 checks), and new sections of `vm_audit48` (rwlock) and
+`vm_audit49` (tasks as coroutines). The new checks were run against round
+75's build too: they fail there (vm_audit64: 12 of 26 on the interpreter,
+10 on the VM; vm_audit49: 2002 OS threads for 2000 tasks, and the bare
+`raise` below).
+
+### Static scope checks (`include/NyScope.hpp`, `src/NyScope.cpp`)
+
+One pass over every parsed program (`Parser::parse`), shared by both
+engines, after the whole tree exists. It builds the scopes (module,
+functions and lambdas, class bodies, comprehensions), resolves every write
+by the round-75 ruling, and:
+- **`const` is enforced.** Assigning, augmenting, deleting, re-declaring,
+  unpacking into or looping over a const - in its scope, or in a function
+  whose plain assignment would rebind it, or through `global`/`nonlocal` -
+  is a SyntaxError before the program runs (`cannot assign to constant 'K'
+  (declared on line 1)`). A `const` statement that runs again (a loop, a
+  second call) re-initialises the same declaration and is fine; a local
+  (`var`, a parameter) shadows it; a class attribute of the same name is
+  the class's.
+- **`nonlocal x` needs an enclosing function that binds x** (class bodies
+  skipped, a later binding in that function counts), and is an error at
+  module level or together with `global x` - Python's three SyntaxErrors.
+- **`global` reaches the binding forms the parser cannot see**: a walrus,
+  `except ... as` and `with ... as` of a name declared global bind the
+  module's variable (`WalrusNode::global_ref`, `ExceptNode::var_global`,
+  `WithNode::alias_global`; `STORE_GLOBAL_NAME` on the VM). The parser now
+  keeps `global`/`nonlocal` in the tree as `GlobalNode`s (no-ops on both
+  engines) so the pass can see them.
+- Not checked: bindings made at run time (code strings run by `lang_eval`,
+  `setattr` on a module), and each REPL line is checked on its own.
+
+### Lambdas, print, error columns (interpreter)
+- **A lambda closes over its scope by reference**, as `def` does: it calls
+  itself through the name it is assigned to (`fact = lambda n: ... fact(n -
+  1)` raised NameError), and `[lambda: i for i in range(3)]` gives 2, 2, 2
+  (it gave 0, 1, 2, Python and the VM 2, 2, 2). It used to copy every
+  visible binding when made, the whole module for each lambda. Its default
+  values are evaluated when it is made, as a def's are (`lambda i=i: i`
+  keeps each i).
+- **`print(a(), b())` evaluates both arguments before printing** (it printed
+  `a`'s output, then `a()`'s value, then `b`'s output).
+- **Syntax errors name the right column.** `Location::reset` ignored its
+  column argument, so every token's column was reset to 1 and every error
+  said column 2 (the IDE's diagnostics landed at the start of the line). A
+  token is now located where it starts; a column counts characters (a tab
+  is one, a UTF-8 sequence is one), and the caret under the source line in
+  the command line's report is placed by characters. Tokens that span
+  lines keep the row where they end, as before (statement lines for
+  tracing and the debugger come from those rows).
+- **IndexError reads `list index out of range`** (or tuple) on the
+  interpreter too, as on the VM and in Python.
+
+### Lazy iterators
+`zip`/`map`/`filter`/`enumerate`/`islice` over a generator, and `iter()`,
+print as Python prints them (`<zip object at 0x...>`) and have no `send` or
+`throw` (AttributeError; `send()` acted as `next()`). `isinstance(x,
+"generator")` is true for every lazy iterator - it read false even for a
+generator, on both engines. **Ruling:** `type()` stays `"generator"` for all
+of them. Python's names would be `zip`, `map`, ..., but Nython's dict is
+already the type `"map"`, and `isinstance(x, "map")` cannot mean both.
+
+### rwlock: competitive succession (`src/NyConc.cpp`)
+A waiting reader's or writer's predicate took the lock as the thread woke,
+before it had the GIL: the lock sat with a thread that could not run while
+every other thread queued behind it, and every unlock woke every waiter.
+Now, as for the mutex since round 75, a lock is taken only by a running
+thread: an unlock wakes one waiting writer (the heir; no other writer is
+woken while it is on its way) or, with no writer waiting, every waiting
+reader. Writers still go first. Readers and writers wait in separate
+queues. New builtin `rwlock_waiting_writers(rw)`.
+
+| 6 writers x 3000 locks, each sleeping now and then | waits before | after | time before | after |
+|---|---|---|---|---|
+| interpreter | 33,922 | 144 | 1.48 s | 0.26 s |
+| VM | 17,699 | 61 | 0.65 s | 0.09 s |
+| 3 writers + 5 readers (interpreter / VM) | 17,597 / 6,649 | 169 / 96 | | |
+
+### Async tasks are coroutines on the loop's thread
+A task was an OS thread handed a baton through the GIL's queue: each switch
+put one thread to sleep and woke another, and 2000 tasks were 2000 threads.
+A task is now a stackful coroutine (`NyCoro`, as the interpreter's
+generators) on the thread that runs its loop:
+- `grant()` resumes the task's coroutine; a task that blocks - any blocking
+  primitive, through the one `block()` they all use - switches back to the
+  loop in `task_park()`. At every switch the thread holds the GIL and not
+  the runtime mutex, and the engine state moves with it (`switch_state`:
+  `Engine::swap_out`/`swap_in`). Everything else is as it was: a task keeps
+  its `ThreadRec` (id, thread-locals, its place in the wait-for graph),
+  cancellation, timers, `gather`, `wait_for`, and a task blocked on a real
+  thread's queue, lock or join still lets the loop's other tasks run.
+- **A task blocking inside a generator's body** (the interpreter runs each on
+  a coroutine of its own, nested in the task's) leaves through every
+  coroutine it is nested in: the generator's coroutine suspends with a
+  relay request; the resumer (`nygen::resume_function`, and calls running
+  on an extension stack) saves the generator's state as at a yield, calls
+  `nyconc::relay_park()` - which relays again or switches to the loop - and
+  resumes the generator when the task runs again (`NyConc.hpp`).
+- **The interpreter got a real per-thread state swap** (`InterpEngine::State`
+  in `threading.cpp`: call depth, control flow, last statement, the
+  exceptions being handled, the owner stack, the trace stack, the running
+  generator). Before, only the `thread_local` parts were per thread, so
+  every thread shared one exception stack: a bare `raise` in one thread or
+  task could re-raise another's exception (vm_audit49 "bare raise per task"
+  gave `['second', 'first']` on round 75's build).
+- A task's stack is 8 MB of address space on 64-bit systems (committed as
+  used), so a task recurses as deep as a thread did; 1 MB on 32-bit.
+- `thread_wait_count()` counts OS-level sleeps: a task switch is not one.
+
+| | round 75 | round 76 |
+|---|---|---|
+| 2000 tasks gathered, interpreter / VM | 0.60 s / 0.31 s | 0.23 s / 0.07 s |
+| 8000 task switches, interpreter / VM | 0.27 s / 0.25 s | 0.09 s / 0.02 s |
+| OS threads while 2000 tasks are alive | 2002 | 1 |
+
+### Memory (both engines)
+- **Objects used as dict keys are freed.** A dict keyed by an object stores
+  the object's identity as the key text, and the engine keeps the object in
+  a table to give it back (`key_objs_`, `vm_key_objs()`); that table kept
+  every object ever used - or only looked up - as a key alive until the
+  program ended. In a full collection its references are now discounted, a
+  dict that is reached reaches the objects its keys name (object keys and
+  object keys inside tuple keys), and the entries of objects found
+  unreachable are dropped (`nygc::KeyTable` in `NyGC.hpp`; the same steps
+  in `VMGC.cpp`). A cycle through a key (a node keyed in a dict it holds)
+  is collected. Young collections leave the table alone (an old dict is not
+  traversed there), so its entries are roots then.
+- **A cycle through a suspended generator is collected** on the interpreter
+  (it leaked: a suspended generator's references were invisible). The
+  collector now sees what a generator holds through its record (its scope,
+  the values in flight, the iterators it reads), and a suspended generator
+  is finalizable: an unreachable one is closed before anything is cleared
+  (PEP 442's order) - its finally blocks run and its stack unwinds - and
+  then freed. References on its suspended stack still look external (they
+  keep what they reach alive), so a cycle is found when every reference
+  into it is one the collector sees, the usual case. Another thread's
+  suspended generator is never found unreachable (only that thread may close
+  it). **The VM** collected such cycles already but cleared the generator
+  without its finally blocks; it now closes it first, as Python does.
+- **Bound builtin members** (`f = xs.append`, an object-protocol member read
+  as a value) are heap objects (`nyheap::BMember`) freed with their last
+  reference; they were kept, receivers included, for the life of the
+  process (2000 `xs.append` reads kept 2000 lists).
+- **The old `GarbageCollector` is gone** (`src/GarbageCollector.cpp`, its
+  headers, and `include/Evaluator.hpp`, the only code that allocated
+  through it and which nothing used).
+- **`mem_rss_kb()` / `mem_peak_rss_kb()` work on Windows** (the working set,
+  through `K32GetProcessMemoryInfo`, or `psapi.dll`'s on Vista); they read 0.
+
+### Not done
+- The VM collector still cannot see references held in natives'
+  `std::function` captures or code-object constants (cycles through them
+  leak, safely), and the interpreter's `Value` is still 208 bytes.
+- A finalizer that resurrects a dict keyed by an object whose table entry
+  was dropped in the same collection would find that key's object gone
+  (`keys()` gives none for it). Not seen in practice.
+- An async task that blocks inside a generator's finally block while the
+  collector is closing that generator would switch out in the middle of a
+  collection (a `__del__` that blocks has the same problem).
+- A generator dropped by another thread than the one that started it is
+  still left suspended; the end-of-program close still runs only after a
+  normal exit.
+- Code strings run at run time and REPL lines are not scope-checked against
+  each other (see above).
 
 ---
 
@@ -288,13 +463,12 @@ the `receiver_cache_` probe it used to make on every attribute read.
 
 ### Not done
 
-- `const` is not enforced (a later assignment is allowed), and `var`/`let`
-  have no block scope - both as before; not part of the rulings.
-- `global x` covers reads, assignments, `+=`, unpacking and `for` targets;
-  a walrus, `with ... as` or `except ... as` of a global-declared name still
-  binds a local. `nonlocal x` with no enclosing `x` is not a SyntaxError (it
-  rebinds a global or creates a local); `del x` unbinds the nearest `x`
-  (Python would say UnboundLocalError for a global not declared).
+- ~~`const` is not enforced~~ - enforced since round 76 (§0o). `var`/`let`
+  have no block scope - as before; not part of the rulings.
+- ~~a walrus, `with ... as` or `except ... as` of a global-declared name
+  binds a local; `nonlocal x` with no enclosing `x` is not a SyntaxError~~ -
+  both fixed in round 76 (§0o). `del x` unbinds the nearest `x` (Python
+  would say UnboundLocalError for a global not declared).
 - Which methods builtin values have is a union table (`NyMembers.hpp`): a
   name in it that a kind does not really implement reads as a bound method
   whose call then raises - never a spurious AttributeError on the read.
@@ -307,9 +481,8 @@ the `receiver_cache_` probe it used to make on every attribute read.
   path no test runs could still read an attribute some objects lack (the
   networking and web-server paths that need real sockets are the least
   exercised).
-- The interpreter still prints `print(a, b)`'s arguments one by one while
-  evaluating them (the VM evaluates all first) - seen while testing, not
-  touched.
+- ~~The interpreter prints `print(a, b)`'s arguments one by one while
+  evaluating them~~ - fixed in round 76 (§0o).
 
 ---
 
@@ -695,17 +868,17 @@ freeing everything at exit). Full table in `GC_NOTES.md`.
 
 ### Not done
 
-- Objects used as dict keys are kept until the executor ends
-  (`key_objs_`; the key is a string and carries no reference).
+- ~~Objects used as dict keys are kept until the executor ends~~ - freed
+  since round 76 (§0o), on both engines.
 - The VM collector cannot see references inside natives' `std::function`
   captures or code-object constants: cycles through them leak (safely).
 - The interpreter's value representation (208-byte `Value`, string-keyed
   maps for lists) is unchanged, so live data is still large.
-- The old `GarbageCollector.cpp` is still compiled and unused.
+- ~~The old `GarbageCollector.cpp` is still compiled and unused~~ - removed
+  in round 76.
 - round75-sem (merged): function attributes (`func_attrs_`) go with their
-  function (`forgetFunction`, `Func::gc_traverse`/`gc_clear`); its bound
-  builtin members (`bound_members_`) are immortal and keep their receivers
-  alive for the process (a leak, not an aliasing bug).
+  function (`forgetFunction`, `Func::gc_traverse`/`gc_clear`). ~~Its bound
+  builtin members are immortal~~ - heap objects since round 76 (§0o).
 - round75-gen (merged): a generator's hold on the scope it runs in is a
   counted reference (`nygen::pin`/`unpin`; `defer_reap` is no longer
   needed). A generator dropped while suspended is destroyed at refcount
@@ -923,24 +1096,17 @@ short-lived generators) does not grow the mappings: VmSize tracks VmRSS.
   counting of round 75's GC work.
 - Windows fibers: tested standalone under Wine only (see above); the
   AArch64 switch is untested.
-- The lazy builtins report `type()` "generator" and print as
-  `<generator object zip at ...>`; Python has separate zip/map/... types.
-- `send()` to a lazy builtin or generator expression behaves as `next()`
-  (Python raises AttributeError for zip/map; a genexp ignores the value).
+- Lazy builtins: they print as Python's (`<zip object at ...>`) and `send()`
+  raises AttributeError since round 76 (§0o); `type()` stays "generator"
+  (ruled there: Nython's dict is the type "map").
 - A generator dropped by another thread than the one that started it is
   left suspended (only its own thread may run its finally blocks).
-- Found on the way, not generator bugs, not fixed: on the interpreter a
-  lambda that calls itself through the name it is assigned to
-  (`f = lambda n: ... f(n - 1)`) raises NameError, and `print(a(), b())`
-  prints each argument as soon as it is evaluated (`a`'s output, then
-  `a()`'s value, then `b`'s output); the VM evaluates all arguments first,
-  as Python does.
+- ~~A lambda calling itself through its own name raised NameError, and
+  `print(a(), b())` printed as it evaluated~~ - both fixed in round 76 (§0o).
 - The end-of-program close runs only when the program ends normally (not
   after an uncaught exception, where CPython would still finalize).
-- Async still runs each task on an OS thread. The coroutines here would
-  allow a single-threaded event loop (a task = a coroutine, `await` =
-  suspend), which would make tasks cheap and remove the GIL hand-offs from
-  async code; not attempted.
+- ~~Async still runs each task on an OS thread~~ - a task is a coroutine on
+  its loop's thread since round 76 (§0o).
 
 ### For the reference-counting merge
 
@@ -2431,45 +2597,27 @@ and replacing them would be churn with regression risk and no visible gain.
 The same reasoning is why `nyimgui.ny`'s `slider`/`scrollbar`/`panel` were
 left alone this round rather than swapped in speculatively.
 
-### 5.4 Remaining engine divergences
-- `L is L` on a list: true on the interpreter, false on the VM. The VM appears to
-  copy list values on load. Deeper than the `is` operator.
-- `print is function`: the engines classify native builtins differently.
-- ~~Integer `/`: `5.0` on the interpreter, `5` on the VM~~ — **CLOSED (round
-  71)**: owner's ruling is `/` is always true division (float,
-  `10 / 2 == 5.0`), `//` and `\` are floor division (int, `10 // 2 == 10 \
-  2 == 5`). VM's `op_div()` no longer special-cases exact int/int division;
-  `examples/arith_test.ny` updated to match. See §0b.
-- Still undecided: dict/set iteration order, tuples (the VM has no tuple
-  type), `undefined` vs `none`, out-of-range indexing (interpreter throws, VM
-  returns `none`).
+### 5.4 Remaining engine divergences — CLOSED (rounds 71-76)
+Every item once listed here was checked again in round 76, on both engines:
+- `L is L` on a list is true on both (the VM keeps list identity).
+- `print is function` is true on both (and `isinstance(print, "function")`).
+- `/` is true division and `//` / `\` floor division on both (round 71, §0b).
+- Dicts keep insertion order with typed keys, and tuples are real, on both
+  (round 74, §0i); `undefined` is a value distinct from none (round 75,
+  §0m); out-of-range indexing raises IndexError on both, with Python's words
+  (`list index out of range`) since round 76.
 
 ### 5.5 Language gaps
-- `len()` counts **characters** but `s[i]` and `s[a:b]` index **bytes**. Both
-  engines agree, so it is a semantics question. Making indexing character-based
-  matches what `len()` implies but changes every string slice in the codebase.
-- `1.+(2, 3)` parses (operators are legal member names) but evaluates to `none` —
-  integers have no `+` member. Needs primitives boxed or dispatched to a root
-  type.
-- PyTorch breadth: GPU dispatch is absent (not attempted — no GPU hardware
-  in any environment this has been developed in, so there is nothing to
-  verify against), and most of `torch.nn` beyond activations/losses/a
-  handful of layers is thin. Names match PyTorch where the capability
-  exists (`L1Loss`, `SmoothL1Loss`, `LRScheduler`, `ExponentialLR`, …).
-  ~~autograd absent~~ — **closed, round 72**: `lib/nytorch/autograd.ny`'s
-  `Variable`/`.backward()` is a real reverse-mode automatic differentiation
-  engine (dynamic graph + topological sort) — see §0c. ~~real ND tensors
-  absent~~ — **closed differently than a native fix would, round 72**: real
-  2D matrix support (`matmul`/`add_bias_row`/`select_row`, shape metadata
-  on `Variable` over the same flat `.data`) was added as a pure Nython,
-  script-level extension rather than a native `src/builtins/tensor.cpp`
-  change — see §0c for why (the native representation is depended on by
-  ~15,000 existing nytorch lines; the script-level route gets the same
-  capability — real batched matmul-based layers — without that risk).
-  Still genuinely thinner than PyTorch: no rank >2, no broadcasting beyond
-  the one bias-row case, no native-speed matmul (it's three nested Nython
-  loops, fine for the small demos here, not for anything performance-
-  sensitive).
+- ~~`len()` counts characters but `s[i]` indexes bytes~~ — **CLOSED (round
+  74)**: indexing, slicing and `len` all count UTF-8 characters.
+- ~~`1.+(2, 3)` evaluates to `none`~~ — **CLOSED (round 74)**: operators are
+  members of every value; it gives 6.
+- PyTorch breadth: nytorch has one native tensor engine for both engines
+  since round 74 (§0h: ND tensors, broadcasting, batched matmul, conv/pool/
+  norm, autograd, Module/optimizers, checked against PyTorch numbers). GPU
+  dispatch is still absent - no GPU in any environment this was developed
+  in, so nothing to verify against - and `torch.nn` beyond the layers,
+  losses and optimizers listed in §0h is thin.
 
 ### 5.6 End-of-input errors lose their location — CLOSED (round 70)
 
@@ -2517,66 +2665,13 @@ file — it just hasn't been given it yet. Left alone this round rather than
 fixed blind, given the volume (~50 individual assertions across ~35 files)
 and the risk of a wrong fix in a file nobody has looked at closely before.
 
-### 5.9 VM/interpreter divergences found this round
-
-**Typed `except`, `try`/`else`, and `int()` raising — CLOSED (round 70, second pass).**
-`ExceptionEntry` used to be `{try_start, try_end, handler, alias}` — one
-handler total — so only the *first* `except` clause's body was even
-compiled; every clause after it was dead code, and which one ran had nothing
-to do with the raised exception's type (`vm_audit24`'s "typed except type":
-raising `TypeError` was caught by the `except ValueError` clause). `try`/`else`
-wasn't compiled at all and read `none`. Rewrote `ExceptionEntry` to hold one
-`{type_name, bind_var, handler}` per clause plus an `else_handler`, and added
-`match_except_handler()` to pick the right one at runtime — by type equality,
-the generic `Exception`/`BaseException`/`Error` names, or a walk up the raised
-type's parent chain via `class_reg_` — mirroring the interpreter's `evalTry`
-(`NythonExecutor.hpp`), including its behaviour when *no* clause matches
-(silently falls through to `finally` rather than re-raising). `vm_audit24` now
-passes 49/49.
-
-Fixing this exposed two more real bugs on the way to green, both worth noting
-because of what they reveal about testing this codebase:
-- **`int(s)` on the VM silently returned `0`** for anything `std::stoll`
-  couldn't parse, instead of raising — `int("abc")` looked like a successful
-  parse of `0`, not an error a `try`/`except` could catch. It also never
-  supported the base argument or `0x`/`0b`/`0o` prefix auto-detection. Brought
-  to parity with the interpreter's `int()` (`src/builtins/tensor.cpp`).
-- **Fixing `int()` to actually raise surfaced an independent, older bug that
-  was previously unreachable**: an uncaught exception raised anywhere after a
-  completed `with` block, with nothing else to catch it, walked backward into
-  that block's now-stale `SETUP_EXCEPT` handler instead of propagating — the
-  backward scan for a `with`'s exception handler never checked whether that
-  block had already exited normally via a matching `END_EXCEPT`. This re-ran
-  the code after the `with` block, hit the same raise again, and **looped
-  forever** (`examples/v10_final_test.ny` and `v11_complete_test.ny` hung on
-  `--vm` for the first time only once `int()` started raising). Fixed by
-  tracking `SETUP_EXCEPT`/`END_EXCEPT` nesting depth in the backward scan.
-  This is exactly why §3's "run the full sweep before *and* after" matters: a
-  fix that is locally correct (`int()` raising is right) can awaken a
-  completely unrelated latent bug the moment something finally exercises the
-  path it lives on. Verified with a full exit-code sweep (no hangs, no new
-  crashes) and a full content-level sweep (no new `N failed` files) across
-  every example/test file on both engines before committing.
-
-**`@property`-decorated class methods still don't work on the VM.** Not
-attempted — an architectural gap in a different part of the compiler, same
-risk class as §5.1. `x = property(x)` written as an explicit call
-(`self.x = property(getter)`) works fine — `get_attr` checks for a
-`{__is_property__: ...}` map and calls `__get__`. But `@property` as
-*decorator syntax* on a class method desugars at parse time to
-`name = property(name)` as a synthesized assignment following the `def`
-(`src/Parser.cpp`, the general decorator path) — and the VM's class compiler
-(`visit_class`/`visit_func`) doesn't execute class bodies as a live sequence
-of statements the way the interpreter does; it extracts `FUNCTION` nodes
-straight into `sub_codes` and has no mechanism for a later statement to
-retroactively mark one of them as a property. `obj.decorated_prop` returns the
-raw `{__self__:..., __fn__:...}` bound-method map instead of calling it
-(`vm_audit23`'s "property fahrenheit", `vm_audit25`'s "prop area"/"prop circ" —
-these are now the *only* remaining failures in either file on either engine).
-A real fix needs the compiler to recognize the `name = property(name)`
-pattern immediately after a same-named method definition, at class-compile
-time, and tag that `sub_codes` entry — touching class compilation and every
-method-resolution path (`get_attr`, `set_attr`, `vm_call_method`).
+### 5.9 VM/interpreter divergences found in round 70 — CLOSED
+Typed `except`, `try`/`else` and `int()` raising were fixed on the VM in
+round 70 (FIXES_v0.2.1.md has the account, including the `with`-block
+handler that looped once `int()` raised). The last item, `@property` as a
+decorator on the VM, was closed in round 74 (§0j): VM class bodies run as
+statements, so properties with setters, static and class methods and every
+decorator work.
 
 ### 5.10 nytorch class-name collisions across submodules — CLOSED (round 74, §0h)
 
