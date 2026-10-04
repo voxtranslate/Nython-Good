@@ -37,9 +37,11 @@ and still rising ~2 points/epoch, PSNR 26.77 dB vs 25.4 dB), but the run itself 
   batch 8 (4 + 4 images) fits again. Ablated on the overfit test: windowed attention matches global attention
   (PSNR/mIoU within run-to-run noise); removing the restoration stream's 512x512 conv did NOT (-0.5..0.9 dB), so
   it was kept. Plus: comparable train/val loss, true LR, PSNR
-  gain vs bicubic, a step profiler with projected run time, a Kaggle session budget (training stops in time for
-  the final evaluation + visualisations, the next session resumes), and a warm start that carries 99.9% of a v4
-  checkpoint's weights into v4.1 instead of discarding the epochs already trained.
+  gain vs bicubic, a step profiler with projected run time, a Kaggle session budget measured from when the session
+  started (training stops in time for the final evaluation + visualisations), automatic pick-up of an earlier
+  session's checkpoint from an attached read-only input (a new Kaggle session starts with an empty /kaggle/working),
+  and a warm start that carries 99.9% of a v4 checkpoint's weights into v4.1 instead of discarding the epochs
+  already trained.
 
 Why v4 exists -- what the v3 qualitative dumps show, and the root cause behind each
 -----------------------------------------------------------------------------------
@@ -121,6 +123,7 @@ import math
 import json
 import copy
 import random
+import shutil
 import argparse
 import tempfile
 import time
@@ -342,9 +345,14 @@ class OmniMorphConfig:
     auto_resume: bool = True             # resume from `latest_checkpoint.pth` (or a safety snapshot) if present
     checkpoint_every_n_epochs: int = 5   # rotating safety snapshot cadence, independent of "latest"/"best"
     checkpoint_keep_last_n: int = 2      # how many rotating safety snapshots to retain on disk
-    session_time_budget_hours: float = 11.0  # Kaggle kills a session at 12 h: stop training early enough that the
-                                          # final Val/Test evaluation and visualisations still run (0 = off); the
-                                          # next session resumes from the last epoch automatically
+    session_time_budget_hours: float = -1.0  # Kaggle kills a session at 12 h (counted from when the SESSION started,
+                                          # not this cell): stop training early enough that the final Val/Test
+                                          # evaluation and visualisations still run. -1 = auto: 11 h on Kaggle, off
+                                          # elsewhere; 0 = off; > 0 = that many hours anywhere
+    resume_search_dirs: Tuple[str, ...] = ("/kaggle/input",)  # where to look for an earlier session's checkpoint
+                                          # when ./models has none: a new Kaggle session starts with an empty
+                                          # /kaggle/working, so the previous run's output has to come back as an
+                                          # attached (read-only) input -- it is found there automatically
     profile_steps: int = 20              # time data/forward/loss/backward for the first N steps of a session
     train_metric_every: int = 4          # full train-set metrics (SSIM, edges, AP, ...) on every Nth batch only
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -365,6 +373,34 @@ class OmniMorphConfig:
 # ============================================================================
 # 2. UTILITIES
 # ============================================================================
+def on_kaggle() -> bool:
+    return "KAGGLE_KERNEL_RUN_TYPE" in os.environ or os.path.isdir("/kaggle/working")
+
+
+def session_start_time() -> float:
+    """When the current session started. On Kaggle that is when the session's container started (its PID 1), which
+    is what the 12 h limit counts from -- a notebook that sat open for two hours before this cell ran has two hours
+    less than the cell's own clock suggests. Elsewhere, and whenever /proc cannot be read, the process start."""
+    if on_kaggle():
+        try:
+            with open("/proc/stat") as f:
+                btime = next(int(line.split()[1]) for line in f if line.startswith("btime"))
+            with open("/proc/1/stat") as f:
+                start_ticks = int(f.read().rsplit(")", 1)[1].split()[19])     # field 22: starttime (clock ticks)
+            t = btime + start_ticks / os.sysconf("SC_CLK_TCK")
+            if 0.0 <= _PROCESS_START - t < 86400.0:
+                return t
+        except (OSError, ValueError, IndexError, StopIteration):
+            pass
+    return _PROCESS_START
+
+
+def session_budget_hours(cfg: "OmniMorphConfig") -> float:
+    if cfg.session_time_budget_hours < 0:
+        return 11.0 if on_kaggle() else 0.0
+    return cfg.session_time_budget_hours
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -3102,7 +3138,7 @@ class OmniMorphTrainer:
         training -- it just falls back to the newest snapshot that still loads cleanly."""
         candidates = [self._ckpt_path("latest_checkpoint.pth")] + self._safety_paths()
         if not any(os.path.exists(p) for p in candidates):
-            return None
+            return self._load_external_checkpoint()
         for i, path in enumerate(candidates):
             if not os.path.exists(path):
                 continue
@@ -3119,6 +3155,47 @@ class OmniMorphTrainer:
             return ckpt
         print("[!] Every checkpoint file (primary + all safety snapshots) failed to load -- starting from "
               "scratch; the model/optimizer/schedule state before this point could not be recovered.")
+        return None
+
+    def _external_checkpoint_dirs(self) -> List[str]:
+        """Directories named like this experiment under `resume_search_dirs` that hold checkpoints from an earlier
+        session, newest first. Dataset trees (JPEGImages, Annotations, ...) are pruned so walking /kaggle/input
+        does not stat the 2 x 17k VOC files."""
+        skip = {"JPEGImages", "Annotations", "SegmentationClass", "SegmentationObject", "ImageSets"}
+        own = os.path.realpath(self.ckpt_dir)
+        found = []
+        for root in self.cfg.resume_search_dirs:
+            if not os.path.isdir(root):
+                continue
+            base = root.rstrip(os.sep).count(os.sep)
+            for dirpath, dirnames, filenames in os.walk(root):
+                depth = dirpath.rstrip(os.sep).count(os.sep) - base
+                dirnames[:] = [d for d in dirnames if d not in skip] if depth < 6 else []
+                if (os.path.basename(dirpath) == self.cfg.experiment_name and os.path.realpath(dirpath) != own
+                        and any(f.endswith(".pth") and ("checkpoint" in f) for f in filenames)):
+                    found.append(dirpath)
+        newest = lambda d: max(os.path.getmtime(os.path.join(d, f)) for f in os.listdir(d) if f.endswith(".pth"))
+        return sorted(found, key=newest, reverse=True)
+
+    def _load_external_checkpoint(self) -> Optional[Dict[str, Any]]:
+        for d in self._external_checkpoint_dirs():
+            safety = sorted((f for f in os.listdir(d) if f.startswith("safety_checkpoint_") and f.endswith(".pth")),
+                            key=lambda f: os.path.getmtime(os.path.join(d, f)), reverse=True)
+            for name in ["latest_checkpoint.pth"] + safety:
+                path = os.path.join(d, name)
+                if not os.path.exists(path):
+                    continue
+                try:
+                    ckpt = torch.load(path, map_location=self.device, weights_only=False)
+                except Exception as e:
+                    print(f"[!] '{path}' failed to load ({type(e).__name__}: {e}); trying the next one.")
+                    continue
+                best_src, best_dst = os.path.join(d, "best_model.pth"), self._ckpt_path("best_model.pth")
+                if os.path.exists(best_src) and not os.path.exists(best_dst):
+                    shutil.copy2(best_src, best_dst)          # so load_best() finds the true best of the whole run
+                print(f"[*] Continuing from an earlier session's checkpoint: {path} (epoch {ckpt.get('epoch', '?')}). "
+                      f"New checkpoints are written to {self.ckpt_dir}.")
+                return ckpt
         return None
 
     def resume(self):
@@ -3217,9 +3294,15 @@ class OmniMorphTrainer:
             print(f"[!] 'best_model.pth' failed to load ({type(e).__name__}: {e}); keeping the current weights "
                   f"(typically the in-memory model from the end of fit(), which is usually close to as good).")
             return
-        self.model.load_state_dict(ckpt["model_state"])
-        if self.ema is not None and ckpt.get("ema_state") is not None:
-            self.ema.module.load_state_dict(ckpt["ema_state"])
+        try:
+            self.model.load_state_dict(ckpt["model_state"])
+            if self.ema is not None and ckpt.get("ema_state") is not None:
+                self.ema.module.load_state_dict(ckpt["ema_state"])
+        except RuntimeError:
+            # e.g. a best_model.pth left by an earlier architecture (warm-started run) that this run never beat
+            print("[!] 'best_model.pth' belongs to a different version of the architecture; keeping the current "
+                  "weights for the final evaluation.")
+            return
         print(f"[*] Loaded best checkpoint (epoch {ckpt['epoch']}).")
 
     # ---- one epoch -------------------------------------------------------------------------------------------
@@ -3339,6 +3422,11 @@ class OmniMorphTrainer:
                   f"resume()'s Continuity-Preserving Horizon Extension for what happens to the LR schedule when "
                   f"you do raise it).")
         epoch_secs: List[float] = []
+        session_start, budget_h = session_start_time(), session_budget_hours(cfg)
+        if budget_h > 0:
+            print(f"[*] Session time budget {budget_h:.1f} h; this session started "
+                  f"{(time.time() - session_start) / 3600.0:.2f} h ago. Training stops early enough for the final "
+                  f"evaluation and visualisations to finish.")
         for epoch in range(self.start_epoch, cfg.epochs + 1):
             t_epoch = time.time()
             epoch_frac = self._dn_noise_progress(epoch)
@@ -3385,14 +3473,17 @@ class OmniMorphTrainer:
                 print(f"[*] Early stopping: no improvement of the {reason} for "
                       f"{self.bad_epochs if stop_composite else self.loss_bad_epochs} epochs.")
                 break
-            budget = cfg.session_time_budget_hours * 3600.0
+            budget = budget_h * 3600.0
             if budget > 0 and epoch < cfg.epochs:
                 recent = epoch_secs[-3:]
                 reserve = 4.0 * val_secs + 600.0     # final Val + Test with flip-TTA, visualisations, slack
-                if (time.time() - _PROCESS_START) + sum(recent) / len(recent) + reserve > budget:
-                    print(f"[*] Session time budget ({cfg.session_time_budget_hours:.1f} h): stopping after epoch "
-                          f"{epoch} so the final evaluation and visualisations finish before the session limit. "
-                          f"Run the notebook again to resume from epoch {epoch + 1} (auto_resume).")
+                if (time.time() - session_start) + sum(recent) / len(recent) + reserve > budget:
+                    print(f"[*] Session time budget ({budget_h:.1f} h): stopping after epoch {epoch} so the final "
+                          f"evaluation and visualisations finish before the session limit. To continue from epoch "
+                          f"{epoch + 1} in a NEW session, the checkpoints in {self.ckpt_dir} must come back: "
+                          f"keep them with the notebook's file persistence if your Kaggle settings offer it, or save "
+                          f"this version and attach its output as an input -- they are then found under "
+                          f"{', '.join(cfg.resume_search_dirs)} automatically.")
                     break
         plot_history(self.history, os.path.join(self.ckpt_dir, "training_curves.png"))
 
@@ -4044,6 +4135,19 @@ def overfit_test(out_dir: Optional[str] = None, epochs: int = 120,
                                     MultiTaskLoss(cfg2, perceptual=build_perceptual_extractor(model2, cfg2)), cfg2)
         trainer2.fit(auto_resume=True)
         assert trainer2.start_epoch == cfg.epochs + 1, "resume did not pick up the saved checkpoint"
+        # a NEW session (empty checkpoint dir) with the previous run's output attached read-only -- the Kaggle
+        # situation -- must continue from that checkpoint and bring the run's best_model.pth along
+        attached = os.path.join(work, "attached_input", "previous-version-output")
+        shutil.copytree(cfg2.checkpoint_dir, os.path.join(attached, "models"))
+        cfg4 = copy.deepcopy(cfg2)
+        cfg4.checkpoint_dir = os.path.join(work, "fresh_session_models")
+        cfg4.resume_search_dirs = (os.path.join(work, "attached_input"),)
+        trainer4 = OmniMorphTrainer(OmniMorphNet(cfg4), train_loader, val_loader, MultiTaskLoss(cfg4), cfg4)
+        trainer4.resume()
+        assert trainer4.start_epoch == cfg2.epochs + 1, "a new session did not pick up the attached checkpoint"
+        assert os.path.exists(trainer4._ckpt_path("best_model.pth")), "best_model.pth was not carried over"
+        assert session_start_time() <= time.time() and (on_kaggle() or session_budget_hours(cfg4) == 0.0)
+
         # warm start: a checkpoint of a slightly different architecture (here: a wider edge branch) must transfer
         # every matching tensor and restart the schedule, instead of being discarded
         cfg3 = copy.deepcopy(cfg2)
