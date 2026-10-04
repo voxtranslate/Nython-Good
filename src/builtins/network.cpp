@@ -794,7 +794,17 @@ Value dispatch_network(NythonExecutor& E,
                 addr.sin_addr.s_addr = INADDR_ANY;
                 addr.sin_port = htons(static_cast<uint16_t>(port));
                 int opt = 1;
+#ifdef _WIN32
+                // Windows' SO_REUSEADDR lets a second socket bind a port that
+                // is in use - both then get connections - where POSIX's only
+                // allows rebinding past TIME_WAIT. Windows' default already
+                // allows the latter, so it is left alone there, as Python's
+                // socket.create_server does: a second listener gets a bind
+                // error, as on Linux (a program can still ask for "reuseaddr").
+                (void)opt;
+#else
                 NY_SETSOCKOPT(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#endif
                 return Value(bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) == 0);
             }
             return Value(false);
