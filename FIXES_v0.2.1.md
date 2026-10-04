@@ -5501,5 +5501,7 @@ Full detail in `HANDOFF.md` §0o. New tests: `vm_audit63` (59 checks) and `vm_au
 | The Windows sweep under Wine failed a different network or file test each run (a hang to the timeout, an empty recv) | the sweep runs a file on both engines at once, and four tests used fixed ports or `/tmp` paths | port 0 read back with `socket_getsockname`; per-pid paths |
 | Windows: a second program could bind a port another was listening on, both receiving connections | `socket_bind` set SO_REUSEADDR, which means that on Windows | not set on Windows (its default already rebinds past TIME_WAIT), as Python's `create_server` |
 | `IdeIntegration.format_code` never returned | its loop never advanced | fixed |
+| 32-bit Windows: 2000 async tasks raised MemoryError | 1 MB of stack address space per task (2 GB in all) | 256 KB task stacks there; deep calls continue on extension stacks on both engines (the VM's `run_frame`, as the interpreter's generators) |
+| A builtin called near the floor of a small coroutine stack crashed | `dispatch_io`/`dispatch_network` (and the pipe drain) held a 64 KB buffer on the stack, reserved on every call of the dispatcher | heap buffers |
 
 Removed: `src/GarbageCollector.cpp`, `include/GarbageCollector.hpp`, `include/GarbageCollectorConfig.hpp` (unused since round 75) and `include/Evaluator.hpp` (never used; the only caller of the old allocator).

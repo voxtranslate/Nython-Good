@@ -2969,8 +2969,40 @@ private:
     // stack's own floor (smaller thread stacks, instrumented builds).
     static const size_t kMaxFrames = 1000;
     void check_depth() {
-        if(call_stack_.size() >= kMaxFrames || nycoro::native_stack_exhausted())
+        if(call_stack_.size() >= kMaxFrames)
             throw_exception(make_exception("RecursionError",{VMVal::make_str("maximum recursion depth exceeded")}));
+        // On a coroutine's stack (an async task) a deep call goes on to an
+        // extension stack instead (run_frame); a thread's own stack ends here.
+        if(!nycoro::current() && nycoro::native_stack_exhausted())
+            throw_exception(make_exception("RecursionError",{VMVal::make_str("maximum recursion depth exceeded")}));
+    }
+    // Runs the frame just pushed. On a coroutine's stack that is nearly used
+    // up, it runs on an extension stack of its own (switched to and back as
+    // a nested call), as the interpreter does for calls inside a generator:
+    // an async task's stack can then be small (2000 tasks on a 32-bit
+    // system) and a task still recurses to kMaxFrames (round 76).
+    struct Extension { VirtualMachine* vm; VMVal result; std::exception_ptr exc; };
+    static void extension_entry(void* p) {
+        auto* x = static_cast<Extension*>(p);
+        try { x->result = x->vm->run_loop(); }
+        catch (...) { x->exc = std::current_exception(); }   // nothing unwinds across the switch
+    }
+    VMVal run_frame() {
+        if(!nycoro::current() || !nycoro::stack_exhausted()) return run_loop();
+        Extension x{this, VMVal::make_none(), nullptr};
+        nycoro::Coro* co = nullptr;
+        try { co = nycoro::create(&extension_entry, &x); }
+        catch(std::bad_alloc&) {
+            throw_exception(make_exception("RecursionError",{VMVal::make_str("maximum recursion depth exceeded (no stack left to extend it)")}));
+        }
+        nycoro::resume(co);
+        // An async task that blocks in it leaves through it (NyConc.hpp).
+        while(!nycoro::done(co) && nyconc::relay_requested()) { nyconc::relay_park(); nycoro::resume(co); }
+        bool finished = nycoro::done(co);
+        if(finished) nycoro::destroy(co);
+        if(!finished) throw std::runtime_error("internal error: a call on an extension stack suspended");
+        if(x.exc) std::rethrow_exception(x.exc);
+        return x.result;
     }
     VMVal exec_code_bound(std::shared_ptr<VMCode> code,
                           VMMap locs,
@@ -2984,7 +3016,7 @@ private:
         fr.stack_base=stack_.size();
         call_stack_.push_back(std::move(fr));
         VMVal result=VMVal::make_none();
-        try { result=run_loop(); }
+        try { result=run_frame(); }
         catch(VMReturn& r){ result=r.value; }
         catch(...){ call_stack_.pop_back(); throw; }
         call_stack_.pop_back();
@@ -3072,7 +3104,7 @@ private:
         if(!err.empty() && strict_args_) throw_exception(make_exception("TypeError",{VMVal::make_str(err)}));
         call_stack_.push_back(std::move(fr));
         VMVal result=VMVal::make_none();
-        try { result=run_loop(); }
+        try { result=run_frame(); }
         catch(VMReturn& r){ result=r.value; }
         catch(...){ call_stack_.pop_back(); if(stack_.size()>_stack_base) stack_.resize(_stack_base); throw; }
         call_stack_.pop_back();
@@ -3162,7 +3194,7 @@ private:
                     if(!dispatch_exception(call_stack_.back(), ev)) throw VMException(ev, describe_exception(ev));
                 }
             }
-            r=run_loop();
+            r=run_frame();
         } catch(VMReturn& rv){
             r=rv.value;
         } catch(VMException& e){

@@ -136,8 +136,20 @@ generators) on the thread that runs its loop:
   every thread shared one exception stack: a bare `raise` in one thread or
   task could re-raise another's exception (vm_audit49 "bare raise per task"
   gave `['second', 'first']` on round 75's build).
-- A task's stack is 8 MB of address space on 64-bit systems (committed as
-  used), so a task recurses as deep as a thread did; 1 MB on 32-bit.
+- A task's stack is the generators' (NY_GEN_STACK_KB, 1 MB, committed as
+  used) on a 64-bit system and 256 KB on a 32-bit one, where 2000 tasks of
+  1 MB took the whole 2 GB address space (the 32-bit Windows sweep:
+  MemoryError). A call that finds a coroutine's stack nearly used continues
+  on an extension stack on **both engines** now - the interpreter did this
+  for generators (`nygen::call_on_new_stack`); the VM's `run_frame` does it
+  too (it raised RecursionError there) - so a task recurses to the engine's
+  depth limit whatever its stack, and blocks there (relayed through the
+  extension). vm_audit49 passes with 64 KB stacks on both engines.
+- `dispatch_io` and `dispatch_network` kept a 64 KB read buffer on the stack
+  (and `os_run`'s pipe drain): GCC reserves it for every call of the
+  dispatcher, so every builtin the chain passes through them touched 64 KB
+  of stack - a crash near the floor of a small coroutine stack. On the heap
+  now.
 - `thread_wait_count()` counts OS-level sleeps: a task switch is not one.
 
 | | round 75 | round 76 |

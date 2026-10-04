@@ -370,9 +370,13 @@ Value dispatch_io(NythonExecutor& E,
             long long size = args.size() >= 2 ? nyos::to_int(args[1], -1) : -1;
             std::string content;
             if (size < 0) {
-                char buf[65536];
+                // On the heap: a 64 KB array here made every call of
+                // dispatch_io - every builtin the chain passes through it -
+                // take 64 KB of stack, which overflowed the small stacks of
+                // async tasks and generators (round 76).
+                std::vector<char> buf(65536);
                 size_t n;
-                while ((n = fread(buf, 1, sizeof buf, f)) > 0) content.append(buf, n);
+                while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) content.append(buf.data(), n);
             } else if (size > 0) {
                 content.resize((size_t)size);
                 size_t r = fread(&content[0], 1, (size_t)size, f);

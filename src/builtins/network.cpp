@@ -200,10 +200,10 @@ Value dispatch_network(NythonExecutor& E,
                 if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) { ny_close_socket(sock); return NONE_VALUE; }
                 struct timeval tv{0, (suseconds_t)(timeout_ms * 1000)};
                 NY_SETSOCKOPT(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-                char buf[65536];
-                ssize_t n = recv(sock, buf, sizeof(buf)-1, 0);
+                std::vector<char> buf(65536);   // heap: see dispatch_io's (io.cpp)
+                ssize_t n = recv(sock, buf.data(), (int)buf.size() - 1, 0);
                 ny_close_socket(sock);
-                if (n > 0) { buf[n] = '\0'; return makeStringValue(std::string(buf, (size_t)n)); }
+                if (n > 0) return makeStringValue(std::string(buf.data(), (size_t)n));
             }
 #endif
             return NONE_VALUE;
@@ -247,9 +247,10 @@ Value dispatch_network(NythonExecutor& E,
                 if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) { ny_close_socket(sock); return NONE_VALUE; }
                 struct timeval tv{0, (suseconds_t)(timeout_ms * 1000)};
                 NY_SETSOCKOPT(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-                char buf[65536];
+                std::vector<char> buf_v(65536);   // heap: see dispatch_io's (io.cpp)
+                char* buf = buf_v.data();
                 struct sockaddr_in sender{}; socklen_t slen = sizeof(sender);
-                ssize_t n = recvfrom(sock, buf, sizeof(buf)-1, 0, (struct sockaddr*)&sender, &slen);
+                ssize_t n = recvfrom(sock, buf, (int)buf_v.size() - 1, 0, (struct sockaddr*)&sender, &slen);
                 ny_close_socket(sock);
                 if (n > 0) {
                     buf[n] = '\0';

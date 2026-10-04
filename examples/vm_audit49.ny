@@ -407,6 +407,17 @@ async def deep_task(n):
     await async_sleep(0)
     return d
 check("recursion inside tasks", async_run(gather(deep_task(400), deep_task(300))), [400, 300])
+# Deeper than a task's own stack holds (256 KB on a 32-bit system): the
+# calls go on to extension stacks, on both engines.
+check("deep recursion inside tasks", async_run(gather(deep_task(850), deep_task(850))), [850, 850])
+def deep_then_wait(n):
+    if n == 0:
+        thread_sleep(1)          # blocks the task at the bottom of the recursion
+        return 0
+    return 1 + deep_then_wait(n - 1)
+async def deep_blocking(n):
+    return deep_then_wait(n)
+check("a task blocking deep inside extension stacks", async_run(gather(deep_blocking(700), deep_blocking(650))), [700, 650])
 
 # A task waiting on a thread (a queue it fills) still lets the others run.
 async def from_thread():

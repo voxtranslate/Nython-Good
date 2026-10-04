@@ -284,10 +284,12 @@ int decode_status(int st) {
 
 // Read whatever is available without blocking. Returns false at EOF.
 bool drain(int fd, std::string& into) {
-    char buf[65536];
+    // Per thread, on the heap: 64 KB of stack is too much for the small
+    // stacks async tasks and generators run on (round 76).
+    static thread_local std::vector<char> buf(65536);
     while (true) {
-        ssize_t n = ::read(fd, buf, sizeof buf);
-        if (n > 0) { into.append(buf, (size_t)n); continue; }
+        ssize_t n = ::read(fd, buf.data(), buf.size());
+        if (n > 0) { into.append(buf.data(), (size_t)n); continue; }
         if (n == 0) return false;
         if (errno == EINTR) continue;
         return true;   // EAGAIN: nothing more for now
@@ -503,13 +505,16 @@ WinChild start_process(const Cmd& c, const std::string& cwd,
 
 // Read whatever is available without blocking. Returns false at EOF.
 bool drain(HANDLE h, std::string& into) {
-    char buf[65536];
+    // Per thread, on the heap (see the POSIX drain above).
+    static thread_local std::vector<char> buf_v(65536);
+    char* buf = buf_v.data();
+    const size_t buf_size = buf_v.size();
     while (true) {
         DWORD avail = 0;
         if (!PeekNamedPipe(h, nullptr, 0, nullptr, &avail, nullptr)) return false;   // broken pipe: EOF
         if (avail == 0) return true;
         DWORD n = 0;
-        if (!ReadFile(h, buf, avail < sizeof buf ? avail : (DWORD)sizeof buf, &n, nullptr)) return false;
+        if (!ReadFile(h, buf, avail < buf_size ? avail : (DWORD)buf_size, &n, nullptr)) return false;
         into.append(buf, n);
     }
 }

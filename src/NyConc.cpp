@@ -620,12 +620,14 @@ static void make_ready(Task* t) {
     L->cv.notify_all();
 }
 
-// The stack a task runs on: as large as a thread's on a 64-bit system (the
-// address space is reserved, the memory committed only as it is used), so
-// a task recurses as deep as a thread did; the generators' size elsewhere.
+// The stack a task runs on: the generators' (NY_GEN_STACK_KB, 1 MB) on a
+// 64-bit system, 256 KB on a 32-bit one, where 2000 tasks of 1 MB would use
+// the whole 2 GB address space. A call that finds it nearly used continues on
+// an extension stack, on both engines (nygen::call_on_new_stack, the VM's
+// run_frame), so a task still recurses as deep as a thread.
 static size_t task_stack_size() {
-    if (sizeof(void*) >= 8) return std::max<size_t>(nycoro::default_stack_size(), (size_t)8 << 20);
-    return nycoro::default_stack_size();
+    if (sizeof(void*) >= 8) return nycoro::default_stack_size();
+    return std::min<size_t>(nycoro::default_stack_size(), (size_t)256 << 10);
 }
 
 // Move the engine's per-thread state and the runtime's notion of "this
