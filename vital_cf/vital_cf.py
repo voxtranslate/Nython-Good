@@ -150,7 +150,8 @@ Running on Kaggle "GPU T4 x2" (Settings -> Accelerator -> GPU T4 x2)
     * Faster: put `%%writefile vital_cf.py` as the first line of the cell, run it, then run
           !torchrun --nproc_per_node=2 vital_cf.py
       -> DistributedDataParallel, one process per T4 (rank 0 validates, saves and runs inference).
-      If NCCL ever hangs at start-up, use  !NCCL_P2P_DISABLE=1 torchrun --nproc_per_node=2 vital_cf.py
+      NCCL peer-to-peer (which can block forever on the two PCIe T4s) is disabled automatically on Kaggle / T4
+      (Config.nccl_safe_mode); setting NCCL_P2P_DISABLE yourself overrides it.
   In both modes the *whole* training objective (degradation, both network passes of the SCR
   rollout, clock estimator, every loss) runs on each GPU for its share of the batch.
   `batch_size` is per GPU, so the global batch is 2 x batch_size on T4 x2.
@@ -193,6 +194,34 @@ What the last log showed and what changed
   * Evaluation took ~1 h in fp32 with 50 steps and the naive sampler -> fp16 autocast, 20 steps,
     naive dropped, blind 'direct' added (the realistic use case), the chosen kind is logged.
 
+Fixed in this revision
+----------------------
+  * THE START-UP HANG after "Creating trainer (auto-resumes ...)": with an empty checkpoint_dir (every new
+    Kaggle session) resume_from='auto' ran Path('/kaggle/input').rglob(...) twice, i.e. it walked EVERY
+    attached dataset file by file (ImageNet-10k + Unsplash + the whole DBlur collection: hundreds of
+    thousands of files on a network-backed mount) before printing anything. The search is now a bounded,
+    shallow-first walk (find_checkpoints) that skips the configured data folders and image folders, has a
+    depth and time limit, prints what it does, runs on rank 0 only and broadcasts the result under DDP.
+  * DDP on T4 x2 could also block in the first NCCL collective (inside the DDP constructor, i.e. at the same
+    spot): NCCL peer-to-peer is disabled by default on Kaggle / T4 (Config.nccl_safe_mode).
+  * Checkpoints are loaded to the CPU (optimiser state no longer takes GPU memory twice at start-up).
+  * Under DDP every rank drew its own rollout / real-pair decision (one GPU idled while the other ran two
+    network passes); the decisions now come from a generator seeded by (seed, epoch, batch) - identical on
+    every rank and reproducible after a mid-epoch resume.
+  * An epoch with drop_last was never recognised as finished when the time budget hit its last batch.
+  * The fine-tuning LR restart used Config.learning_rate instead of the optimiser's base LR.
+  * A checkpoint already BEYOND Config.epochs counted as "not complete" (no inference, no prior fit).
+  * The time budget was measured from the module import, so re-running the notebook cell reset it and the
+    11 h budget could overrun Kaggle's 12 h limit; it is now measured from the process start.
+  * Swin windows attended to zero-padded tokens for inputs whose latent size is not a multiple of the window
+    (every real 1280x720 photo); padded tokens are now masked (training at 256 px is unchanged).
+  * Generation applied the maximal blur a second time to a sample that was already drawn from the prior of
+    maximally blurred images (the sampler started at sigma_max * sqrt(2)).
+  * The real benchmark mixed resolutions after an out-of-memory fallback (crash in the example grid,
+    inconsistent metrics); the dataset audit compared blur/sharp pairs by file NAME only (wrong files or a
+    crash for nested folders); the heat-kernel spectrum cache grew without bound with the image size;
+    invalid Config strings (sampler, schedule, ...) silently fell back to other code paths.
+
 Everything runs without argparse/sys: edit `Config` (or pass one to `main(cfg)`).
 """
 
@@ -208,10 +237,12 @@ import math
 import os
 import random
 import shutil
+import threading
 import time
 import traceback
 import warnings
-from dataclasses import asdict, dataclass, field, fields
+from collections import deque
+from dataclasses import asdict, dataclass, fields
 from datetime import timedelta
 from functools import partial
 from pathlib import Path
@@ -236,7 +267,25 @@ from matplotlib import cm
 from tqdm.auto import tqdm
 
 warnings.filterwarnings("ignore")
-SESSION_START = time.time()  # reference for the training time budget (Kaggle sessions are limited to 12 h)
+
+
+def _process_start_time() -> float:
+    """Wall-clock start of this Python process (Linux /proc), i.e. of the notebook kernel / torchrun worker.
+    time.time() at import was reset every time the notebook cell was re-run, so the training budget could
+    overrun Kaggle's 12 h session limit. Falls back to 'now' where /proc is unavailable."""
+    try:
+        with open("/proc/self/stat") as f:
+            after_comm = f.read().rsplit(")", 1)[1].split()
+        start_ticks = int(after_comm[19])  # field 22 of /proc/self/stat: start time in clock ticks after boot
+        with open("/proc/stat") as f:
+            boot = next(int(line.split()[1]) for line in f if line.startswith("btime"))
+        t = boot + start_ticks / os.sysconf("SC_CLK_TCK")
+        return t if 0 < t <= time.time() + 1 else time.time()
+    except Exception:  # noqa: BLE001
+        return time.time()
+
+
+SESSION_START = _process_start_time()  # reference for the training time budget (Kaggle sessions are limited to 12 h)
 
 try:  # optional perceptual metrics (LPIPS etc.)
     import pyiqa
@@ -461,10 +510,15 @@ class Config:
     amp_dtype: str = "auto"  # 'auto' (fp16 on T4 / pre-Ampere, bf16 on Ampere+) | 'fp16' | 'bf16'
     expected_gpus: int = 2  # a warning is printed if fewer GPUs are visible (Kaggle accelerator not set)
     ddp_timeout_min: int = 60  # collective timeout (rank 0 validates / checkpoints while the others wait)
+    nccl_safe_mode: bool = True  # DDP on Kaggle / T4: NCCL_P2P_DISABLE=1, NCCL_IB_DISABLE=1 unless already set
 
     # ----------------------------- Pretrained-model safety / Kaggle sessions -----------------------------
     resume_from: str = "auto"  # 'auto': checkpoint_dir, then the newest checkpoint_latest/best.pt under /kaggle/input
     #                            (e.g. a previous notebook version attached as input) | explicit file or folder | ''
+    #                            An explicit path skips the search below entirely (fastest start-up).
+    resume_search_roots: Tuple[str, ...] = ("/kaggle/input",)  # where resume_from='auto' looks for checkpoints
+    resume_search_depth: int = 6  # folder levels below each root (notebook outputs / models sit 1-5 levels deep)
+    resume_search_timeout_s: float = 120.0  # the search stops after this long and uses what it found
     require_pretrained: bool = True  # stop with an error instead of silently training from scratch
     protect_pretrained: bool = True  # one-time copy of the start-up checkpoints to <checkpoint_dir>/pretrained_backup
     checkpoint_every_min: float = 30.0  # mid-epoch checkpoint (a Kaggle session can end without warning); 0 = off
@@ -489,6 +543,28 @@ class Config:
             raise ValueError("image_size must be divisible by 8 (three stride-2 stages).")
         if self.run_inference not in ("when_done", "always", "never"):
             raise ValueError(f"Unknown run_inference: {self.run_inference}")
+        # String options used to fall through to another code path when misspelled (e.g. an unknown sampler ran
+        # Algorithm 2, an unknown anchor schedule anchored at every step) -> fail at construction instead.
+        samplers = ("direct", "naive", "improved", "srn")
+        choices = {"schedule_type": ("linear", "cosine", "sqrt", "log"), "tau_sampling": ("uniform", "logit_normal", "mixed"),
+                   "sampler": samplers, "real_sampler": samplers + ("auto",), "residual_gate": ("off", "known", "all"),
+                   "anchor_schedule": ("every", "final", "distributed"), "blind_anchor": ("every", "final", "distributed"),
+                   "amp_dtype": ("auto", "fp16", "bf16")}
+        for name, ok in choices.items():
+            if getattr(self, name) not in ok:
+                raise ValueError(f"Unknown {name}={getattr(self, name)!r}; expected one of {ok}")
+        for name in ("eval_samplers", "eval_blind_samplers", "real_eval_samplers"):
+            bad = [s for s in getattr(self, name) if s not in samplers]
+            if bad:
+                raise ValueError(f"{name} contains unknown samplers {bad}; expected {samplers}")
+        bad = [s for s in self.eval_blur_shapes if s not in BLUR_SHAPES]
+        if bad or len(self.blur_shape_probs) != len(BLUR_SHAPES) or sum(self.blur_shape_probs) <= 0:
+            raise ValueError(f"eval_blur_shapes {self.eval_blur_shapes} / blur_shape_probs {self.blur_shape_probs} are invalid")
+        lo, hi = self.rollout_delta
+        if not 0 < lo <= hi <= 1:
+            raise ValueError(f"rollout_delta {self.rollout_delta} must satisfy 0 < lo <= hi <= 1 (log-uniform sampling)")
+        if self.grad_accum_steps < 1 or self.batch_size < 1:
+            raise ValueError("batch_size and grad_accum_steps must be >= 1")
 
     # ---- (de)serialisation -------------------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:
@@ -621,6 +697,84 @@ def save_json(obj: Any, path: Union[str, Path]):
         json.dump(obj, f, indent=2, default=_default)
 
 
+CHECKPOINT_NAMES: Tuple[str, ...] = ("checkpoint_latest.pt", "checkpoint_best.pt", "final_model.pt")
+
+
+def find_checkpoints(roots: Sequence[Union[str, Path]], names: Sequence[str] = CHECKPOINT_NAMES, max_depth: int = 6,
+                     timeout_s: float = 120.0, skip: Sequence[Union[str, Path]] = (), max_images_per_dir: int = 64,
+                     verbose: bool = True) -> List[Path]:
+    """
+    Bounded, shallow-first search for checkpoint files under `roots` (e.g. /kaggle/input).
+
+    The previous version ran Path('/kaggle/input').rglob(name) once per file name. /kaggle/input holds every
+    attached dataset (here ImageNet-10k, Unsplash and the whole DBlur collection: hundreds of thousands of
+    files on a network-backed, read-only mount), so the walk took tens of minutes to hours and the run looked
+    frozen right after "Creating trainer ...". This search
+      * visits folders breadth-first (notebook outputs and model uploads sit 1-5 levels deep),
+      * never enters the configured data folders (`skip`) or folders holding many images,
+      * stops at `max_depth` levels and after `timeout_s` seconds, keeping what it found so far,
+      * follows symbolic links once (a visited set prevents loops) and reports what it did.
+    Returns the matches ordered by name priority (latest, best, final) and newest first within a name.
+    """
+    prio = {n: i for i, n in enumerate(names)}
+    skip_set = {os.path.normpath(os.path.abspath(str(s))) for s in skip if s}
+    roots = [os.path.abspath(str(r)) for r in roots if r and os.path.isdir(str(r))]
+    t0 = time.time()
+    queue = deque((r, 0) for r in roots)
+    seen = {os.path.realpath(r) for r in roots}
+    found: List[Path] = []
+    n_dirs, timed_out = 0, False
+    while queue:
+        if time.time() - t0 > timeout_s:
+            timed_out = True
+            break
+        d, depth = queue.popleft()
+        subdirs, n_img = [], 0
+        try:
+            with os.scandir(d) as it:  # read lazily: an image folder is abandoned after a few entries
+                for e in it:
+                    try:
+                        if e.name in prio:
+                            found.append(Path(e.path))
+                        elif e.name.lower().endswith(IMAGE_EXTENSIONS):
+                            n_img += 1
+                            if n_img >= max_images_per_dir:  # an image folder never holds the checkpoints
+                                break
+                        elif e.is_dir():
+                            subdirs.append(e)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+        n_dirs += 1
+        if depth >= max_depth or n_img >= max_images_per_dir:
+            continue
+        for e in sorted(subdirs, key=lambda e: e.name):
+            if e.name.startswith(".") or e.name in ("pretrained_backup", "pretrained_backup.partial", "__pycache__"):
+                continue
+            if os.path.normpath(e.path) in skip_set:
+                continue
+            if e.is_symlink():
+                real = os.path.realpath(e.path)
+                if real in seen or os.path.normpath(real) in skip_set:
+                    continue
+                seen.add(real)
+            queue.append((e.path, depth + 1))
+
+    def _mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    found = sorted(set(found), key=lambda p: (prio[p.name], -_mtime(p)))
+    if verbose:
+        print(f"  searched {n_dirs} folders in {time.time() - t0:.1f} s"
+              + (f" - stopped at the {timeout_s:g} s limit (set Config.resume_from to the checkpoint path to skip the "
+                 f"search)" if timed_out else "") + f": {len(found)} checkpoint file(s) found")
+    return found
+
+
 def is_multi_kind(cfg: Config) -> bool:
     """Several degradation kinds are trained -> the clock estimator's type head decides in blind mode."""
     return cfg.degradation_type in ("mixed", "allinone")
@@ -723,13 +877,25 @@ def setup_distributed(cfg: Config) -> bool:
     if dist_is_on():
         return get_world_size() > 1
     world = int(os.environ.get("WORLD_SIZE", "1"))
-    if not cfg.multi_gpu or world <= 1:
+    if world <= 1:
+        return False
+    if not cfg.multi_gpu:
+        # Launched by torchrun but multi-GPU disabled: every process would train the same model and write the same
+        # checkpoint files concurrently. main() lets rank 0 run alone and the other processes exit.
         return False
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)  # before any CUDA work: keeps rank 1 (and its pin-memory thread) off cuda:0
         backend = "nccl"
         cfg.device = f"cuda:{local_rank}"
+        if cfg.nccl_safe_mode:
+            # NCCL peer-to-peer between the two PCIe T4s of a Kaggle VM can block forever in the first collective,
+            # which is issued inside the DDP constructor -> the run froze right after "Creating trainer ...".
+            # Shared-memory transport is what those GPUs use anyway (no NVLink). User settings are kept.
+            name = torch.cuda.get_device_name(local_rank)
+            if Path("/kaggle").is_dir() or "T4" in name:
+                os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+                os.environ.setdefault("NCCL_IB_DISABLE", "1")
     else:  # CPU fallback (smoke tests)
         backend = "gloo"
         cfg.device = "cpu"
@@ -802,16 +968,28 @@ class HeatKernel:
     and it is cheap even for sigma = 30 px.
     """
 
-    _cache: Dict[Tuple[int, int, str], torch.Tensor] = {}
+    _cache: Dict[tuple, Any] = {}
+    _cache_max = 64  # real photos come in many sizes: the cache used to grow without bound (GPU memory)
+    _cache_lock = threading.Lock()  # nn.DataParallel runs its replicas in threads
+
+    @staticmethod
+    def _cached(key: tuple, make):
+        with HeatKernel._cache_lock:
+            value = HeatKernel._cache.get(key)
+            if value is None:
+                if len(HeatKernel._cache) >= HeatKernel._cache_max:  # drop the oldest entry
+                    HeatKernel._cache.pop(next(iter(HeatKernel._cache)))
+                value = HeatKernel._cache[key] = make()
+            return value
 
     @staticmethod
     def omega_sq(h: int, w: int, device) -> torch.Tensor:
-        key = (h, w, str(device))
-        if key not in HeatKernel._cache:
+        def make():
             wy = torch.fft.fftfreq(2 * h, device=device) * (2 * math.pi)
             wx = torch.fft.rfftfreq(2 * w, device=device) * (2 * math.pi)
-            HeatKernel._cache[key] = (wy[:, None] ** 2 + wx[None, :] ** 2).float()
-        return HeatKernel._cache[key]
+            return (wy[:, None] ** 2 + wx[None, :] ** 2).float()
+
+        return HeatKernel._cached((h, w, str(device)), make)
 
     @staticmethod
     def spectrum(x: torch.Tensor) -> torch.Tensor:
@@ -840,25 +1018,25 @@ class HeatKernel:
     @staticmethod
     def freq_xy(h: int, w: int, device) -> Tuple[torch.Tensor, torch.Tensor]:
         """(wy (2h, 1), wx (1, w+1)) angular frequencies of the even-extended rfft grid."""
-        key = (h, w, str(device), "xy")
-        if key not in HeatKernel._cache:
+        def make():
             wy = (torch.fft.fftfreq(2 * h, device=device) * (2 * math.pi)).float()[:, None]
             wx = (torch.fft.rfftfreq(2 * w, device=device) * (2 * math.pi)).float()[None, :]
-            HeatKernel._cache[key] = (wy, wx)
-        return HeatKernel._cache[key]
+            return wy, wx
+
+        return HeatKernel._cached((h, w, str(device), "xy"), make)
 
     @staticmethod
     def white_floor(h: int, w: int, device) -> torch.Tensor:
         """E|spectrum(n)|^2 of unit white noise on the even-extended rfft grid, (2h, w+1).
         Per axis of length N: 2N (1 + [k = 0] - [k = N]) (the Nyquist row is identically zero)."""
-        key = (h, w, str(device), "floor")
-        if key not in HeatKernel._cache:
+        def make():
             ky = torch.arange(2 * h, device=device)
             kx = torch.arange(w + 1, device=device)
             a = 2 * h * (1.0 + (ky == 0).float() - (ky == h).float())
             b = 2 * w * (1.0 + (kx == 0).float() - (kx == w).float())
-            HeatKernel._cache[key] = (a[:, None] * b[None, :]).float()
-        return HeatKernel._cache[key]
+            return (a[:, None] * b[None, :]).float()
+
+        return HeatKernel._cached((h, w, str(device), "floor"), make)
 
 
 def residual_spectral_gate(r: torch.Tensor, win: int = 5) -> torch.Tensor:
@@ -1536,7 +1714,9 @@ def find_pair_dirs(root: Union[str, Path], subsets: Sequence[str], split: str) -
     return out
 
 
-def build_real_pairs(cfg: Config, split: str, mode: str, max_images: int = 0, max_side: int = 0) -> List[PairedImageDataset]:
+def build_real_pairs(cfg: Config, split: str, mode: str, max_images: int = 0, max_side: int = 0,
+                     first_only: bool = False) -> List[PairedImageDataset]:
+    """first_only: stop at the first usable subset (per-epoch validation uses one; listing the others was wasted IO)."""
     subsets = cfg.real_train_subsets if split == "train" else cfg.real_test_subsets
     out = []
     for name, bd, sd in find_pair_dirs(cfg.paired_root, subsets, split):
@@ -1544,6 +1724,8 @@ def build_real_pairs(cfg: Config, split: str, mode: str, max_images: int = 0, ma
             out.append(PairedImageDataset(bd, sd, cfg.image_size, mode, max_images, max_side, name=name))
         except ValueError as e:
             print(f"[data] {e}")
+        if first_only and out:
+            break
     return out
 
 
@@ -1591,8 +1773,10 @@ def audit_datasets(cfg: Config, n_check: int = 8) -> Dict[str, Any]:
                             f"blurred photos to restore (e.g. .../HIDE/test/blur).")
     for split, subsets in (("train", cfg.real_train_subsets), ("test", cfg.real_test_subsets)):
         for name, bd, sd in find_pair_dirs(cfg.paired_root, subsets, split):
-            b = {p.name for p in list_images(bd)}
-            s = {p.name for p in list_images(sd)}
+            # relative paths, exactly as PairedImageDataset pairs them (bare file names paired the wrong files - or
+            # crashed - when scenes live in sub-folders with repeated frame names)
+            b = {p.relative_to(bd).as_posix() for p in list_images(bd)}
+            s = {p.relative_to(sd).as_posix() for p in list_images(sd)}
             both = sorted(b & s)
             info = {"blur": str(bd), "sharp": str(sd), "pairs": len(both), "unmatched": len(b ^ s)}
             if both:
@@ -1812,23 +1996,38 @@ class SwinTransformerBlock(nn.Module):
             nn.init.constant_(self.norm1.weight, self.init_values)
             nn.init.constant_(self.norm2.weight, self.init_values)
 
-    def _attention_mask(self, Hp: int, Wp: int, device) -> Optional[torch.Tensor]:
-        if not any(self.shift_size):
+    def _attention_mask(self, H: int, W: int, Hp: int, Wp: int, device) -> Optional[torch.Tensor]:
+        padded = Hp != H or Wp != W
+        if not any(self.shift_size) and not padded:
             return None
-        key = (Hp, Wp, str(device))
-        if key not in self._mask_cache:
+        key = (H, W, str(device))
+        mask = self._mask_cache.get(key)
+        if mask is None:
             wh, ww = self.window_size
             sh, sw = self.shift_size
             img_mask = torch.zeros((1, Hp, Wp, 1), device=device)
-            cnt = 0
-            for hs in (slice(0, -wh), slice(-wh, -sh), slice(-sh, None)):
-                for ws in (slice(0, -ww), slice(-ww, -sw), slice(-sw, None)):
-                    img_mask[:, hs, ws, :] = cnt
-                    cnt += 1
+            if sh or sw:
+                cnt = 0
+                for hs in (slice(0, -wh), slice(-wh, -sh), slice(-sh, None)):
+                    for ws in (slice(0, -ww), slice(-ww, -sw), slice(-sw, None)):
+                        img_mask[:, hs, ws, :] = cnt
+                        cnt += 1
+            if padded:
+                # Zero-padded tokens form a region of their own: real tokens never attend to them (they did before,
+                # for every input whose latent size is not a multiple of the window, e.g. 1280x720 photos).
+                pad = torch.zeros((1, Hp, Wp, 1), device=device)
+                pad[:, H:] = 1.0
+                pad[:, :, W:] = 1.0
+                if sh or sw:  # the mask lives in the rolled coordinates
+                    pad = torch.roll(pad, shifts=(-sh, -sw), dims=(1, 2))
+                img_mask = img_mask + 16.0 * pad
             mw = window_partition(img_mask, self.window_size).view(-1, self.window_area)
             m = mw.unsqueeze(1) - mw.unsqueeze(2)
-            self._mask_cache[key] = m.masked_fill(m != 0, -100.0).masked_fill(m == 0, 0.0)
-        return self._mask_cache[key]
+            mask = m.masked_fill(m != 0, -100.0).masked_fill(m == 0, 0.0)
+            if len(self._mask_cache) >= 16:  # many photo sizes at inference -> bounded cache
+                self._mask_cache.clear()
+            self._mask_cache[key] = mask
+        return mask
 
     def _shifted_window_attention(self, x):
         B, H, W, C = x.shape
@@ -1840,7 +2039,7 @@ class SwinTransformerBlock(nn.Module):
         if sh or sw:
             x = torch.roll(x, shifts=(-sh, -sw), dims=(1, 2))
         xw = window_partition(x, self.window_size).view(-1, self.window_area, C)
-        aw = self.attn(xw, mask=self._attention_mask(Hp, Wp, x.device)).view(-1, wh, ww, C)
+        aw = self.attn(xw, mask=self._attention_mask(H, W, Hp, Wp, x.device)).view(-1, wh, ww, C)
         x = window_reverse(aw, self.window_size, (Hp, Wp))
         if sh or sw:
             x = torch.roll(x, shifts=(sh, sw), dims=(1, 2))
@@ -2819,7 +3018,14 @@ class ColdDiffusionModel(nn.Module):
         kind = torch.full((n,), KINDS.index(name), dtype=torch.long, device=dev)
         tau = torch.ones(n, 1, *image_size, device=dev)
         st = self.degradation.new_state(x, generator, shape="iso")
-        x_T, _ = self.degradation.apply(x, tau, kind, st)
+        if name == "blur":
+            # The prior was fitted on thumbnails of D(x0, 1), so an upsampled prior sample already IS an observation
+            # at tau = 1. Applying D(., 1) again (as before) blurred it to sigma_max * sqrt(2) and started the sampler
+            # outside its training distribution. Only the bicubic thumbnail grid is smoothed away (half a cell).
+            cell = max(image_size) / float(p)
+            x_T = HeatKernel.blur(x, min(0.5 * cell, float(self.degradation.sigma(torch.tensor(1.0)))))
+        else:  # noise: the prior holds clean thumbnails -> degrade; downsample: D(., 1) is (nearly) idempotent
+            x_T, _ = self.degradation.apply(x, tau, kind, st)
         res = self.restore(x_T, tau_obs=tau, kind=kind, steps=steps or self.cfg.generate_steps, sampler="srn",
                            churn=self.cfg.gen_churn if churn is None else churn, record=record, generator=generator,
                            op_state=st, residual_gate=False)  # the injected diversity noise is kept
@@ -3217,6 +3423,9 @@ class Trainer:
         self.val_loader = DataLoader(val_dataset, batch_size=cfg.batch_size, shuffle=False, num_workers=nw,
                                      pin_memory=pin, persistent_workers=nw > 0)
         # ---- REAL blur->sharp pairs (training mix + per-epoch validation)  [N11] ----
+        # Every phase of the start-up announces itself, so a slow step is visible instead of a silent "hang".
+        t_phase = time.time()
+        print(f"  [trainer] mode={self.mode}, loader batch {loader_bs}, {nw} workers; indexing real blur/sharp pairs ...")
         self.real_iter = None
         self.real_train_names: List[str] = []
         if cfg.real_pair_prob > 0:
@@ -3225,14 +3434,18 @@ class Trainer:
                 real_ds = parts[0] if len(parts) == 1 else torch.utils.data.ConcatDataset(parts)
                 self.real_sampler = EpochSampler(len(real_ds), cfg.seed + 99991, self.rank, self.world_size)
                 self.real_loader = DataLoader(real_ds, batch_size=loader_bs, sampler=self.real_sampler,
-                                              num_workers=min(2, nw), pin_memory=pin, drop_last=len(real_ds) >= loader_bs,
+                                              num_workers=min(2, nw), pin_memory=pin,
+                                              drop_last=self.real_sampler.num_samples >= loader_bs,  # per rank
                                               persistent_workers=min(2, nw) > 0)
                 self.real_iter = self._real_batches()
                 self.real_train_names = [f"{p.name} ({len(p)} pairs)" for p in parts]
-        real_val = build_real_pairs(cfg, "test", "val", max_images=cfg.real_val_images)
+        real_val = build_real_pairs(cfg, "test", "val", max_images=cfg.real_val_images, first_only=True)
         self.real_val_loader = (DataLoader(real_val[0], batch_size=cfg.batch_size, shuffle=False, num_workers=0)
                                 if real_val else None)
         self.real_val_name = real_val[0].name if real_val else ""
+        print(f"  [trainer] real pairs: train {', '.join(self.real_train_names) or 'none'} | validation "
+              f"{self.real_val_name or 'none'} ({time.time() - t_phase:.1f} s); building optimiser / EMA / "
+              f"{'DDP' if self.mode == 'ddp' else ('DataParallel' if self.mode == 'dp' else 'model')} ...")
         self.loss_fn = ColdDiffusionLoss(cfg).to(self.device)
         self.optimizer = optim.AdamW(self._param_groups(), lr=cfg.learning_rate, betas=tuple(cfg.betas), eps=1e-8)
         self.batches_per_epoch = len(self.train_loader)
@@ -3293,10 +3506,14 @@ class Trainer:
         self.epoch_samples_done = 0  # samples (all GPUs) of the current epoch already trained (mid-epoch checkpoints)
         self.resume_skip_samples = 0  # per rank, set when resuming an interrupted epoch
         self._last_ckpt_time = time.time()
+        self.epoch_loop_completed = False  # the last train_epoch() ran through its whole loader (no budget stop)
         # Resume *after* every piece of state exists (the old code reset the metrics afterwards).
         self.saved_extra = None
+        print("  [trainer] looking for a checkpoint to resume from ...")
         self._load_checkpoint()
         self._apply_extra_epochs()
+        self.session_start_step = self.global_step
+        print("  [trainer] ready.")
 
     def _apply_extra_epochs(self):
         """
@@ -3326,8 +3543,11 @@ class Trainer:
             remaining = max(1, (cfg.epochs - self.current_epoch) * self.steps_per_epoch
                             - self.resume_skip_samples * self.world_size // max(1, self.global_batch))
             warm = min(cfg.finetune_warmup_steps, max(1, remaining // 10))  # never longer than 10% of the run
+            # LambdaLR multiplies the base LR restored from the checkpoint, which differs from Config.learning_rate
+            # whenever the pretrained run used another value -> the peak must be relative to that base LR.
+            base_lr = float(self.scheduler.base_lrs[0]) if self.scheduler.base_lrs else cfg.learning_rate
             self.sched = {"start": self.global_step, "warmup": warm, "total": remaining,
-                          "peak": cfg.finetune_lr / cfg.learning_rate}
+                          "peak": cfg.finetune_lr / max(base_lr, 1e-12)}
             self.scheduler.last_epoch = self.global_step - 1
             self.scheduler.step()  # applies the new schedule now
         print(f"  extra_epochs={cfg.extra_epochs}: training epochs {self.current_epoch}..{cfg.epochs - 1} "
@@ -3459,32 +3679,48 @@ class Trainer:
             return [p for p in c if p.is_file()]
 
         cands = in_dir(self.checkpoint_dir)  # the working copy always wins (it is the continuation)
+        if cands:
+            print(f"  found {len(cands)} checkpoint(s) in {self.checkpoint_dir}")
         rf = (self.cfg.resume_from or "").strip()
         if not cands and rf and rf != "auto":
             p = Path(rf)
             cands = in_dir(p) if p.is_dir() else ([p] if p.is_file() else [])
             if not cands:
                 print(f"  resume_from='{rf}': no checkpoint there")
-        elif not cands and rf == "auto" and Path("/kaggle/input").is_dir():
-            found: List[Path] = []
-            for name in ("checkpoint_latest.pt", "checkpoint_best.pt"):
-                hits = [q for q in Path("/kaggle/input").rglob(name) if "pretrained_backup" not in q.parts]
-                found += sorted(hits, key=lambda q: q.stat().st_mtime, reverse=True)
-            if found:
-                print("Checkpoints found under /kaggle/input (read-only, therefore safe):")
-                for q in found:
-                    print(f"    {q}")
-            cands = found
+        elif not cands and rf == "auto":
+            roots = [r for r in self.cfg.resume_search_roots if r and Path(r).is_dir()]
+            if roots:
+                cfg = self.cfg
+                print(f"  no checkpoint in '{self.checkpoint_dir}' -> searching {', '.join(roots)} (depth <= "
+                      f"{cfg.resume_search_depth}, <= {cfg.resume_search_timeout_s:g} s, data folders skipped) ...")
+                skip = [cfg.train_data_dir, cfg.val_data_dir, cfg.test_data_dir, cfg.real_images_dir, cfg.paired_root,
+                        *cfg.extra_clean_dirs, cfg.output_dir, cfg.visualization_dir]
+                cands = find_checkpoints(roots, CHECKPOINT_NAMES, cfg.resume_search_depth, cfg.resume_search_timeout_s, skip)
+                if cands:
+                    print("  checkpoints found (read-only inputs, therefore safe; the first readable one is used):")
+                    for q in cands[:10]:
+                        print(f"    {q}")
+                    if len(cands) > 10:
+                        print(f"    ... and {len(cands) - 10} more")
         return cands
 
     def _load_checkpoint(self, path: Optional[Union[str, Path]] = None) -> bool:
         self._protect_pretrained()
-        cands = [Path(path)] if path else self._candidate_checkpoints()
+        if path:
+            cands = [Path(path)]
+        else:
+            # One search (rank 0) and the SAME decision on every rank: two independent searches could disagree
+            # (time limit), and a rank that resumes while the other starts from scratch deadlocks DDP.
+            cands = self._candidate_checkpoints() if self.is_main else []
+            if self.distributed:
+                box = [[str(p) for p in cands]]
+                dist.broadcast_object_list(box, src=0)
+                cands = [Path(p) for p in box[0]]
         if not cands:
             if self.cfg.require_pretrained:
                 raise RuntimeError(
                     f"No pretrained checkpoint found in '{self.checkpoint_dir}'"
-                    + (" or under /kaggle/input" if self.cfg.resume_from == "auto" else "")
+                    + (f" or under {', '.join(self.cfg.resume_search_roots)}" if self.cfg.resume_from == "auto" else "")
                     + ". Refusing to silently start from scratch. "
                     "Attach the notebook output / dataset holding checkpoint_latest.pt (Add Input), or set "
                     "Config.resume_from='/kaggle/input/.../checkpoint_latest.pt'. For a genuinely new run set "
@@ -3493,13 +3729,17 @@ class Trainer:
             return False
         errors = []
         for p in cands:
+            t0 = time.time()
+            print(f"  reading {p} ...")
             try:
-                ckpt = torch.load(p, map_location=self.device, weights_only=False)
+                # CPU first: load_state_dict copies into the parameters and the optimiser moves its state to the
+                # parameters' device, so mapping to the GPU only doubled the peak GPU memory at start-up.
+                ckpt = torch.load(p, map_location="cpu", weights_only=False)
             except Exception as e:  # noqa: BLE001 (truncated / corrupt file -> next candidate)
                 errors.append(f"{p}: {e}")
                 print(f"  could not read {p} ({e}) -> trying the next candidate")
                 continue
-            print(f"Loading checkpoint from {p}")
+            print(f"Loading checkpoint from {p} (read in {time.time() - t0:.1f} s)")
             return self._restore(ckpt, p)
         raise RuntimeError("Checkpoints exist but none could be read - nothing was modified:\n" + "\n".join(errors))
 
@@ -3575,7 +3815,8 @@ class Trainer:
                 np.random.set_state(rng["numpy"])
                 torch.set_rng_state(rng["torch"].cpu())
                 if rng.get("cuda") is not None and torch.cuda.is_available():
-                    torch.cuda.set_rng_state_all([s.cpu() for s in rng["cuda"]])
+                    states = [s.cpu() for s in rng["cuda"]][:torch.cuda.device_count()]  # fewer GPUs than saved
+                    torch.cuda.set_rng_state_all(states)
             else:  # DDP: other ranks keep their own streams (different degradations for different images)
                 seed_everything(self.cfg.seed + 1000 * self.rank + self.global_step, self.cfg.deterministic)
         except Exception:  # noqa: BLE001
@@ -3629,15 +3870,21 @@ class Trainer:
         counts: Dict[str, int] = {}
         accum = max(1, cfg.grad_accum_steps)
         n_batches = len(self.train_loader)
+        batch0 = skip // max(1, self.loader_batch)  # batches of this epoch already trained before a resume
+        self.epoch_loop_completed = False
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch} - Training", leave=False, disable=not self.is_main)
         self.optimizer.zero_grad(set_to_none=True)
         for i, batch in enumerate(pbar):
             x0 = batch["image"].to(self.device, non_blocking=True)
             is_step = (i + 1) % accum == 0 or (i + 1) == n_batches
+            # Per-batch decisions from a generator seeded by (seed, epoch, batch): identical on every DDP rank (the
+            # global RNG differs per rank, so one GPU ran a 2-pass rollout / real-pair step while the other waited)
+            # and reproducible after a mid-epoch resume.
+            dec = torch.Generator().manual_seed(cfg.seed * 1_000_003 + 100_003 * self.current_epoch + batch0 + i)
             # SCR rollout [N4]: one decision per batch, shared by every GPU replica of that batch.
-            rollout = float(torch.rand(1)) < cfg.rollout_prob
+            rollout = float(torch.rand(1, generator=dec)) < cfg.rollout_prob
             # Real-pair step [N11]: the model learns real (motion) blur from real blurred photos + sharp frames.
-            use_real = self.real_iter is not None and float(torch.rand(1)) < cfg.real_pair_prob
+            use_real = self.real_iter is not None and float(torch.rand(1, generator=dec)) < cfg.real_pair_prob
             if use_real:
                 rb = next(self.real_iter)
                 inp, y_real = rb["image"].to(self.device, non_blocking=True), rb["degraded"].to(self.device, non_blocking=True)
@@ -3659,7 +3906,9 @@ class Trainer:
                 self.scaler.scale(total / accum).backward()
             if is_step:
                 self.scaler.unscale_(self.optimizer)
-                logs["grad_norm"] = float(torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.grad_clip))
+                grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), cfg.grad_clip)
+                if bool(torch.isfinite(grad_norm)):  # fp16 overflow steps are skipped by the scaler: keep them
+                    logs["grad_norm"] = float(grad_norm)  # out of the epoch mean (it read 'inf' before)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -3677,11 +3926,14 @@ class Trainer:
                               "lr": f"{self.optimizer.param_groups[0]['lr']:.2e}"})
             if is_step:
                 if self.stop_requested:  # time budget (all ranks agree) -> train() saves the exact position
+                    self.epoch_loop_completed = (i + 1) == n_batches  # stopped on the last batch = epoch finished
                     break
                 if (cfg.checkpoint_every_min > 0 and (i + 1) < n_batches
                         and time.time() - self._last_ckpt_time > 60.0 * cfg.checkpoint_every_min):
                     self.save_checkpoint(epoch_complete=False)  # rank 0 writes; a killed session loses <= N min
                     self._last_ckpt_time = time.time()
+        else:  # no break: the whole (possibly drop_last-shortened) epoch was trained
+            self.epoch_loop_completed = True
         return self._merge_epoch_logs(sums, counts)
 
     @torch.no_grad()
@@ -3832,12 +4084,18 @@ class Trainer:
             left = self.time_budget_s - (time.time() - SESSION_START)
             print(f"Time budget: training stops cleanly after {self.time_budget_s / 3600:.2f} h of session time "
                   f"({left / 3600:.2f} h left); mid-epoch checkpoint every {self.cfg.checkpoint_every_min:g} min.")
+            if left <= 0:
+                print("  WARNING: this kernel has been running longer than the budget already (the budget counts from "
+                      "the process start, like Kaggle's session limit): training stops after the first step. Restart "
+                      "the session or raise Config.time_budget_hours (0 = off).")
         self.training_complete = False
         self.status = "trained"
         if self.current_epoch >= cfg.epochs:  # the previous version printed 'Training completed successfully!' here
             interrupted = self.resume_skip_samples > 0
             self.status = "nothing_to_train"
-            self.training_complete = (not interrupted) and self.current_epoch == cfg.epochs
+            # current_epoch == number of COMPLETED epochs (an interrupted epoch is not counted), so this branch always
+            # means "finished"; a checkpoint BEYOND Config.epochs used to count as unfinished (no inference / prior)
+            self.training_complete = self.current_epoch >= cfg.epochs
             bar = "!" * 78
             print(f"\n{bar}\nNOTHING TO TRAIN: the checkpoint is at epoch {self.current_epoch}"
                   + (f" (interrupted after {self.resume_skip_samples * self.world_size} samples)" if interrupted else "")
@@ -3858,7 +4116,9 @@ class Trainer:
             self.current_epoch = epoch
             t0 = time.time()
             tr = self.train_epoch()
-            epoch_finished = self.epoch_samples_done >= self.train_sampler.num_samples * self.world_size
+            # (the sample count never reached num_samples with drop_last, so a budget stop on the last batch
+            # was saved as an interrupted epoch that the next session then 'resumed' with zero batches)
+            epoch_finished = self.epoch_loop_completed
             if self.stop_requested and not epoch_finished:  # time budget: save exactly here, next session resumes here
                 self.save_checkpoint(epoch_complete=False)
                 n_ep = self.train_sampler.num_samples * self.world_size
@@ -3928,7 +4188,8 @@ class Trainer:
 
     def finalize(self):
         """Fit the degraded prior (generation) and store it in every relevant checkpoint."""
-        loader = DataLoader(self.train_dataset, batch_size=self.cfg.batch_size, shuffle=True, num_workers=0)
+        loader = DataLoader(self.train_dataset, batch_size=self.cfg.batch_size, shuffle=True,
+                            num_workers=self.cfg.num_workers)  # (decoding up to prior_max_images photos serially was slow)
         if not self.model.fit_prior(loader, self.device):
             return
         if self.ema is not None:
@@ -4073,7 +4334,7 @@ class Inferencer:
                 return
         else:
             path = Path(checkpoint)
-        ck = torch.load(path, map_location=self.device, weights_only=False)
+        ck = torch.load(path, map_location="cpu", weights_only=False)  # (the optimiser state never needs the GPU)
         if use_ema and ck.get("ema_state_dict") is not None:
             sd, which = ck["ema_state_dict"], "EMA"
         else:
@@ -4876,37 +5137,42 @@ class Inferencer:
             if cfg.real_eval_max_side and max(x0.shape[-2:]) > cfg.real_eval_max_side:
                 x0, y = self._resize_pair(x0, y, cfg.real_eval_max_side)
             row = {"image": Path(item["path"]).name, "psnr_input": psnr(y, x0).item(), "ssim_input": ssim(y, x0).item()}
-            outs = {}
-            for s in samplers:
-                t0 = time.time()
-                try:
+
+            def run_samplers(x0, y, i=i):
+                outs, vals = {}, {}
+                for s in samplers:
+                    t0 = time.time()
                     with self._infer_autocast():
                         r = self.model.restore(y, sampler=s, steps=cfg.val_sampler_steps, lam=cfg.rn_lambda_real,
                                                generator=self._gen(i))
-                except RuntimeError as e:  # CUDA OOM at native resolution -> 768 px
-                    if "out of memory" not in str(e).lower():
-                        raise
-                    torch.cuda.empty_cache()
-                    x0, y = self._resize_pair(x0, y, 768)
-                    row.update({"psnr_input": psnr(y, x0).item(), "ssim_input": ssim(y, x0).item(), "resized": 768})
-                    with self._infer_autocast():
-                        r = self.model.restore(y, sampler=s, steps=cfg.val_sampler_steps, lam=cfg.rn_lambda_real,
-                                               generator=self._gen(i))
-                out = r["output"].float()
-                outs[s] = out
-                row[f"psnr_{s}"] = psnr(out, x0).item()
-                row[f"ssim_{s}"] = ssim(out, x0).item()
-                row[f"sec_{s}"] = time.time() - t0
-                if self.lpips is not None:
-                    v = self.lpips(out, x0)
-                    if v is not None:
-                        row[f"lpips_{s}"] = v.mean().item()
-                if "blur_shape" in r:
-                    row["blur_direction_deg"] = float(torch.rad2deg(r["blur_shape"]["theta"][0]))
-                    row["blur_axis_ratio"] = float(r["blur_shape"]["rho"][0])
-                row["mean_tau"] = float(r["tau_obs"].mean())
-                row["kind"] = KINDS[int(r["kind"][0])]
-                row["is_blur"] = float(int(r["kind"][0]) == BLUR)
+                    out = r["output"].float()
+                    outs[s] = out
+                    vals[f"psnr_{s}"] = psnr(out, x0).item()
+                    vals[f"ssim_{s}"] = ssim(out, x0).item()
+                    vals[f"sec_{s}"] = time.time() - t0
+                    if self.lpips is not None:
+                        v = self.lpips(out, x0)
+                        if v is not None:
+                            vals[f"lpips_{s}"] = v.mean().item()
+                    if "blur_shape" in r:
+                        vals["blur_direction_deg"] = float(torch.rad2deg(r["blur_shape"]["theta"][0]))
+                        vals["blur_axis_ratio"] = float(r["blur_shape"]["rho"][0])
+                    vals["mean_tau"] = float(r["tau_obs"].mean())
+                    vals["kind"] = KINDS[int(r["kind"][0])]
+                    vals["is_blur"] = float(int(r["kind"][0]) == BLUR)
+                return outs, vals
+
+            try:
+                outs, vals = run_samplers(x0, y)
+            except RuntimeError as e:  # CUDA OOM at native resolution -> the WHOLE image (every sampler) at 768 px;
+                if "out of memory" not in str(e).lower():  # before, samplers already run stayed at native size
+                    raise  # (mixed-resolution metrics and a crash in the example grid)
+                outs = None
+                torch.cuda.empty_cache()
+                x0, y = self._resize_pair(x0, y, 768)
+                row.update({"psnr_input": psnr(y, x0).item(), "ssim_input": ssim(y, x0).item(), "resized": 768})
+                outs, vals = run_samplers(x0, y)
+            row.update(vals)
             rows.append(row)
             if j < n_examples:
                 tiles = [to01(y[0]), to01(x0[0])] + [to01(outs[s][0]) for s in samplers]
@@ -4949,6 +5215,19 @@ def build_model(cfg: Config) -> ColdDiffusionModel:
     return ColdDiffusionModel(ViTAL.from_config(cfg), cfg)
 
 
+def _safe_save(trainer: "Trainer"):
+    """Emergency checkpoint after an exception. A failure while saving (e.g. after a CUDA error) must not hide
+    the original error, and nothing is written if not a single optimiser step was taken (the files on disk are
+    then already the newest state - rewriting them only risks a truncated file)."""
+    if trainer.global_step == getattr(trainer, "session_start_step", -1):
+        print("  (no optimiser step in this session - existing checkpoints left untouched)")
+        return
+    try:
+        trainer.save_checkpoint(epoch_complete=False)
+    except Exception as e:  # noqa: BLE001
+        print(f"  could not save the emergency checkpoint: {e}")
+
+
 def main(cfg: Optional[Config] = None):
     """Train (auto-resuming), then run every inference / interpretability capability.
     No argparse / sys: edit `Config` (or pass a Config instance).
@@ -4956,6 +5235,11 @@ def main(cfg: Optional[Config] = None):
     `torchrun --nproc_per_node=2 <this file>` (DDP)."""
     cfg = cfg or Config()
     setup_distributed(cfg)  # DDP under torchrun (sets cfg.device = cuda:<local_rank>); no-op otherwise
+    if not dist_is_on() and int(os.environ.get("RANK", "0")) > 0:
+        # torchrun with Config.multi_gpu=False: only rank 0 trains (two independent copies would overwrite each
+        # other's checkpoints)
+        print(f"[rank {os.environ.get('RANK')}] Config.multi_gpu=False -> this process exits; rank 0 runs alone.")
+        return None, None, None
     print("=" * 78)
     print("ViTAL-CF  |  Clock-Field Cold Diffusion - Training & Inference Pipeline")
     print("=" * 78)
@@ -4994,12 +5278,12 @@ def main(cfg: Optional[Config] = None):
             print("\nTraining completed successfully!" if trainer.training_complete else
                   "\nTraining stopped (time budget) - checkpoint saved, the next run resumes.")
     except KeyboardInterrupt:
-        print("\nTraining interrupted by user - saving an 'interrupted' checkpoint (resume will redo this epoch).")
-        trainer.save_checkpoint(epoch_complete=False)
+        print("\nTraining interrupted by user - saving an 'interrupted' checkpoint (resume continues at the exact sample).")
+        _safe_save(trainer)
     except Exception as e:  # noqa: BLE001
         print(f"\nTraining failed with error: {e}")
         traceback.print_exc()
-        trainer.save_checkpoint(epoch_complete=False)
+        _safe_save(trainer)
 
     # DDP: training is over - rank 0 alone runs inference on cuda:0, the other ranks exit.
     is_main = is_main_process()
