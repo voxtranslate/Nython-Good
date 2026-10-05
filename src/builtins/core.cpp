@@ -580,6 +580,18 @@ Value dispatch_core(NythonExecutor& E,
         if (name == "compile") return E.compileBuiltin(args, ctx);
         if (name == "locals") return E.reflectLocals(ctx);
         if (name == "globals") return E.reflectGlobals(ctx);
+        // The __main__ module's globals, from anywhere (a library module's
+        // globals() is its own): unittest.main() finds the program's
+        // TestCase classes here, as Python's reads sys.modules["__main__"].
+        if (name == "_ny_main_globals") return E.reflectGlobals(nullptr);
+        // The exception an except clause is handling now, here or in a
+        // caller (sys.exc_info()[1]); none outside every except clause.
+        if (name == "_ny_exc_current") {
+            if (E.handling_exc_.empty()) return NONE_VALUE;
+            const Value& held = E.handling_obj_.back().second;
+            if (held.type != ValueType::NONE) return held;
+            return E.exceptionObject(E.handling_exc_.back());
+        }
         if (name == "vars") return E.reflectVars(args, ctx);
         if (name == "dir") return E.reflectDir(args, ctx);
         if (name == "issubclass" || name == "property" || name == "staticmethod" || name == "classmethod" || name == "iter" || name == "help" || name == "slice" || name == "complex") {

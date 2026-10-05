@@ -26,6 +26,12 @@
 // Exit codes: a process killed by signal N reports -N, as in Python.
 // merge=True (os_run, os_spawn) sends stderr into the stdout pipe, in the
 // order it was written (Python's stderr=subprocess.STDOUT).
+// inherit="012" (os_run, os_spawn; any of the three digits) leaves those
+// standard streams shared with this process instead of piped (subprocess's
+// stdin/stdout/stderr=None); stdin without input= is /dev/null otherwise.
+// POSIX only: on Windows the streams are still captured.
+// env_replace=True (os_run, os_spawn) makes env= the child's whole
+// environment instead of additions to ours (subprocess's env=).
 // Windows: the same API on Win32 (CreateProcessW, pipes, one Job Object per
 // process so os_kill ends the tree). Command strings run through a POSIX sh
 // when one is found (NY_SH, sh.exe on PATH, Git for Windows, MSYS2), so shell
@@ -142,6 +148,7 @@ struct Cmd {
     bool shell = false;
     std::string line{};                 // shell form
     std::vector<std::string> argv{};    // direct form
+    bool env_replace = false;           // env= is the whole environment (subprocess's env=)
 };
 
 Cmd parse_cmd(NythonExecutor& E, const Value& v) {
@@ -188,9 +195,16 @@ void ignore_sigpipe() {
 // fork + exec with pipes for stdin/stdout/stderr. Returns the pid; the
 // parent's ends are returned in in_fd/out_fd/err_fd (in_fd == -1 when there is
 // no input). Raises when the program cannot be started.
+// `inherit` names the standard streams the child shares with us instead of
+// a pipe ("0", "1", "2" in any combination: subprocess's stdin/stdout/
+// stderr=None); their fds come back -1.
 pid_t start_process(const Cmd& c, const std::string& cwd,
                     const std::vector<std::pair<std::string, std::string>>& env,
-                    bool want_stdin, int& in_fd, int& out_fd, int& err_fd, bool merge = false) {
+                    bool want_stdin, int& in_fd, int& out_fd, int& err_fd, bool merge = false,
+                    const std::string& inherit = "") {
+    const bool inh_in = inherit.find('0') != std::string::npos;
+    const bool inh_out = inherit.find('1') != std::string::npos;
+    const bool inh_err = inherit.find('2') != std::string::npos;
     ignore_sigpipe();
     int in_p[2] = {-1, -1}, out_p[2], err_p[2], ex_p[2];
     if (want_stdin && !make_pipe(in_p)) raise_errno(errno, "pipe");
@@ -204,8 +218,8 @@ pid_t start_process(const Cmd& c, const std::string& cwd,
     // thread held it at the moment of fork.
     std::vector<std::string> env_strs;
     std::vector<char*> envp;
-    if (!env.empty()) {
-        for (char** e = environ; e && *e; e++) {
+    if (!env.empty() || c.env_replace) {
+        for (char** e = environ; !c.env_replace && e && *e; e++) {
             std::string kv = *e;
             std::string k = kv.substr(0, kv.find('='));
             bool overridden = false;
@@ -229,9 +243,10 @@ pid_t start_process(const Cmd& c, const std::string& cwd,
         ::setpgid(0, 0);
         int devnull = -1;
         if (want_stdin) ::dup2(in_p[0], 0);
-        else { devnull = ::open("/dev/null", O_RDONLY); if (devnull >= 0) ::dup2(devnull, 0); }
-        ::dup2(out_p[1], 1);
-        ::dup2(merge ? out_p[1] : err_p[1], 2);   // merge: stderr into the stdout pipe
+        else if (!inh_in) { devnull = ::open("/dev/null", O_RDONLY); if (devnull >= 0) ::dup2(devnull, 0); }
+        if (!inh_out) ::dup2(out_p[1], 1);
+        if (merge) ::dup2(1, 2);                  // merge: stderr where stdout goes
+        else if (!inh_err) ::dup2(err_p[1], 2);
         ::signal(SIGPIPE, SIG_DFL);
         int err = 0;
         if (!cwd.empty() && ::chdir(cwd.c_str()) != 0) err = errno;
@@ -271,8 +286,12 @@ pid_t start_process(const Cmd& c, const std::string& cwd,
     if (in_fd >= 0) set_cloexec_nonblock(in_fd, true);
     out_fd = out_p[0];
     err_fd = err_p[0];
-    set_cloexec_nonblock(out_fd, true);
-    set_cloexec_nonblock(err_fd, true);
+    // An inherited stream (or stderr merged into an inherited stdout) has
+    // no pipe to read: the child never wrote to these.
+    if (inh_out) { ::close(out_fd); out_fd = -1; }
+    if (inh_err || (merge && inh_out)) { ::close(err_fd); err_fd = -1; }
+    if (out_fd >= 0) set_cloexec_nonblock(out_fd, true);
+    if (err_fd >= 0) set_cloexec_nonblock(err_fd, true);
     return pid;
 }
 
@@ -411,11 +430,13 @@ std::string win_cmdline(const Cmd& c) {
 
 // The child's environment block: ours with `env` over it (names compare
 // without case, as Windows does), sorted as CreateProcess expects.
-std::wstring env_block(const std::vector<std::pair<std::string, std::string>>& env) {
+std::wstring env_block(const std::vector<std::pair<std::string, std::string>>& env, bool replace = false) {
     std::vector<std::wstring> vars;
-    LPWCH cur = GetEnvironmentStringsW();
-    for (LPWCH q = cur; q && *q; q += wcslen(q) + 1) vars.push_back(q);
-    if (cur) FreeEnvironmentStringsW(cur);
+    if (!replace) {
+        LPWCH cur = GetEnvironmentStringsW();
+        for (LPWCH q = cur; q && *q; q += wcslen(q) + 1) vars.push_back(q);
+        if (cur) FreeEnvironmentStringsW(cur);
+    }
     auto name_of = [](const std::wstring& kv) { return kv.substr(0, kv.find(L'=', 1)); };
     for (auto& o : env) {
         std::wstring k = widen(o.first);
@@ -428,6 +449,7 @@ std::wstring env_block(const std::vector<std::pair<std::string, std::string>>& e
     });
     std::wstring block;
     for (auto& v : vars) { block += v; block.push_back(L'\0'); }
+    if (vars.empty()) block.push_back(L'\0');    // an empty block is two NULs
     block.push_back(L'\0');
     return block;
 }
@@ -477,7 +499,7 @@ WinChild start_process(const Cmd& c, const std::string& cwd,
     std::vector<wchar_t> clbuf(cl.begin(), cl.end());
     clbuf.push_back(L'\0');
     std::wstring wcwd = widen(cwd), envb;
-    if (!env.empty()) envb = env_block(env);
+    if (!env.empty() || c.env_replace) envb = env_block(env, c.env_replace);
     // No console window flashes up when the (GUI) IDE runs a console program.
     DWORD flags = CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT;
     BOOL created = CreateProcessW(nullptr, clbuf.data(), nullptr, nullptr, 1, flags,
@@ -649,9 +671,10 @@ void run_to_end(const Cmd& c, const std::string& cwd,
 #endif  // _WIN32
 
 Value run(NythonExecutor& E, std::vector<Value>& args) {
-    nyos::Args A(E, args, {"cwd", "env", "input", "timeout", "shell", "check", "merge"});
+    nyos::Args A(E, args, {"cwd", "env", "input", "timeout", "shell", "check", "merge", "inherit", "env_replace"});
     if (!A.has(0, "cmd")) raise("TypeError", "os_run() missing the command");
     Cmd c = parse_cmd(E, A.get(0, "cmd"));
+    c.env_replace = A.flag(99, "env_replace", false);
     std::string cwd = A.str(1, "cwd", "");
     auto env = A.has(2, "env") ? parse_env(E, A.get(2, "env")) : std::vector<std::pair<std::string, std::string>>{};
     bool has_input = A.has(3, "input");
@@ -659,11 +682,14 @@ Value run(NythonExecutor& E, std::vector<Value>& args) {
     double timeout = A.num(4, "timeout", -1.0);
     bool check = A.flag(99, "check", false);
     bool merge = A.flag(99, "merge", false);     // stderr into stdout, in order
+    // inherit="012": streams shared with this process, not captured (POSIX;
+    // Windows still captures them - lib/subprocess.ny forwards the output).
+    std::string inherit = A.str(99, "inherit", "");
     std::string out, err;
     int code = -1;
 #ifndef _WIN32
     int in_fd, out_fd, err_fd;
-    pid_t pid = start_process(c, cwd, env, has_input, in_fd, out_fd, err_fd, merge);
+    pid_t pid = start_process(c, cwd, env, has_input, in_fd, out_fd, err_fd, merge, inherit);
     size_t written = 0;
     if (in_fd >= 0 && input.empty()) { ::close(in_fd); in_fd = -1; }
     double deadline = timeout > 0 ? now_s() + timeout : -1;
@@ -709,7 +735,25 @@ Value run(NythonExecutor& E, std::vector<Value>& args) {
         if (err_fd >= 0) { drain(err_fd, err); ::close(err_fd); }
     }
     int st = 0;
-    { nyconc::GilRelease unlocked; while (::waitpid(pid, &st, 0) < 0 && errno == EINTR) {} }
+    bool reaped = false;
+    if (!timed_out && deadline > 0) {
+        // The pipes are closed (or there were none: inherited streams), but
+        // the timeout still holds for the process itself.
+        while (true) {
+            pid_t r;
+            { nyconc::GilRelease unlocked; r = ::waitpid(pid, &st, WNOHANG); }
+            if (r == pid) { reaped = true; break; }
+            if (r < 0 && errno != EINTR) break;
+            if (now_s() >= deadline) {
+                timed_out = true;
+                ::kill(-pid, SIGKILL);
+                ::kill(pid, SIGKILL);
+                break;
+            }
+            { nyconc::GilRelease unlocked; std::this_thread::sleep_for(std::chrono::milliseconds(5)); }
+        }
+    }
+    if (!reaped) { nyconc::GilRelease unlocked; while (::waitpid(pid, &st, 0) < 0 && errno == EINTR) {} }
     code = decode_status(st);
     if (timed_out) {
         std::ostringstream m;
@@ -815,9 +859,10 @@ Value dispatch_os_proc(NythonExecutor& E,
     // ── Background processes ─────────────────────────────────────────────────
     if (name == "os_spawn") {
 #ifdef _WIN32
-        nyos::Args A(E, args, {"cwd", "env", "input", "merge", "stdin"});
+        nyos::Args A(E, args, {"cwd", "env", "input", "merge", "stdin", "inherit", "env_replace"});
         if (!A.has(0, "cmd")) raise("TypeError", "os_spawn() missing the command");
         Cmd c = parse_cmd(E, A.get(0, "cmd"));
+        c.env_replace = A.flag(99, "env_replace", false);
         auto env = A.has(2, "env") ? parse_env(E, A.get(2, "env")) : std::vector<std::pair<std::string, std::string>>{};
         bool keep_stdin = A.flag(99, "stdin", false);
         bool has_input = A.has(3, "input") || keep_stdin;
@@ -842,15 +887,17 @@ Value dispatch_os_proc(NythonExecutor& E,
         procs()[ch.pid] = std::move(p);
         return Value((int)ch.pid);
 #else
-        nyos::Args A(E, args, {"cwd", "env", "input", "merge", "stdin"});
+        nyos::Args A(E, args, {"cwd", "env", "input", "merge", "stdin", "inherit", "env_replace"});
         if (!A.has(0, "cmd")) raise("TypeError", "os_spawn() missing the command");
         Cmd c = parse_cmd(E, A.get(0, "cmd"));
+        c.env_replace = A.flag(99, "env_replace", false);
         auto env = A.has(2, "env") ? parse_env(E, A.get(2, "env")) : std::vector<std::pair<std::string, std::string>>{};
         bool keep_stdin = A.flag(99, "stdin", false);
         bool has_input = A.has(3, "input") || keep_stdin;
         std::string input = A.str(3, "input", "");
         int in_fd, out_fd, err_fd;
-        pid_t pid = start_process(c, A.str(1, "cwd", ""), env, has_input, in_fd, out_fd, err_fd, A.flag(99, "merge", false));
+        pid_t pid = start_process(c, A.str(1, "cwd", ""), env, has_input, in_fd, out_fd, err_fd, A.flag(99, "merge", false),
+                                  A.str(99, "inherit", ""));
         int kept_in = -1;
         if (in_fd >= 0 && keep_stdin) {
             // stdin stays open: os_proc_write feeds it, os_proc_close_stdin ends it

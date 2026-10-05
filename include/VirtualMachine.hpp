@@ -1610,6 +1610,9 @@ private:
                 exc_vars_.push_back(held);
                 if(en->body) visit_stmt(en->body);
                 exc_vars_.pop_back();
+                // The clause is done with the exception: _ny_exc_current()
+                // (sys.exc_info's source) no longer reports it.
+                emit(Op::DELETE_NAME,C().add_name(rn(held)),l);
                 to_exit.push_back(C().here()); emit(Op::JUMP_FORWARD,0,l);
                 C().exc_table[idx].clauses.push_back(std::move(cl));
             }
@@ -2292,9 +2295,9 @@ inline VMVal make_generator_val(std::shared_ptr<VMCode> code,
             g.gen->locals[pn.substr(2)]=args.size()>(size_t)arg_idx?args[arg_idx]:VMVal::make_map();
             arg_idx=(int)args.size();
         } else if(!pn.empty()&&pn[0]=='*'){
-            // *args: collect ALL remaining positional args into a list
+            // *args: ALL remaining positional args, as a tuple (Python's type)
             std::vector<VMVal> rest(args.begin()+arg_idx, args.end());
-            g.gen->locals[pn.substr(1)]=VMVal::make_list(std::move(rest));
+            g.gen->locals[pn.substr(1)]=VMVal::make_tuple(std::move(rest));
             arg_idx=(int)args.size();
         } else if(arg_idx<(int)args.size()){
             g.gen->locals[pn]=args[arg_idx++];
@@ -3066,6 +3069,11 @@ public:
             };
             VMVal path=args.size()>0?args[0]:kwget("file");
             if(path.type==VMType::NONE) path=kwget("path");
+            if(path.type==VMType::INSTANCE){            // a path-like object: open(Path(...))
+                bool found=false;
+                VMVal s=call_dunder_f(path,"__fspath__",{},found);
+                if(found) path=s;
+            }
             VMVal mode=args.size()>1?args[1]:kwget("mode");
             if(mode.type==VMType::NONE) mode=VMVal::make_str("r");
             std::vector<VMVal> oa={path,mode};
@@ -3149,6 +3157,24 @@ public:
     // bridge uses it for "__exc__:Type:msg" errors from interpreter
     // builtins): the same instance and runtime_error an Op::RAISE of
     // Type(msg) produces, so it takes the VM's normal raise path.
+    // A path-like argument (an object with __fspath__, e.g. pathlib.Path)
+    // given to a builtin that takes paths (nyrt::takes_paths): the string
+    // its __fspath__ returns, positionally or as a keyword argument. The
+    // builtin bridge applies it before converting the arguments.
+    void fspath_args(std::vector<VMVal>& a) {
+        auto conv=[&](VMVal& v){
+            if(v.type!=VMType::INSTANCE) return;
+            bool found=false;
+            VMVal r=call_dunder_f(v,"__fspath__",{},found);
+            if(found) v=r;
+        };
+        for(auto& v:a){
+            conv(v);
+            if(v.type==VMType::MAP&&v.map&&v.class_name=="__kwargs__")
+                for(auto& kv:*v.map) conv(kv.second);
+        }
+    }
+
     [[noreturn]] void raise_native_exception(const std::string& type, const std::string& msg) {
         auto attrs=std::make_shared<VMMap>(); vmgc::track_map(attrs);
         (*attrs)["msg"]=VMVal::make_str(msg);
@@ -3301,7 +3327,7 @@ private:
             if(!pn.empty()&&pn[0]=='*'){
                 std::vector<VMVal> rest;
                 if(!star_seen) for(;ai<pos.size();ai++) rest.push_back(pos[ai]);
-                locs[pn.substr(1)]=VMVal::make_list(std::move(rest));
+                locs[pn.substr(1)]=VMVal::make_tuple(std::move(rest));   // *args is a tuple
                 star_seen=true; has_varargs=true; continue;
             }
             bool have=false;
@@ -4555,8 +4581,10 @@ private:
             }
             case Op::DELETE_NAME: {
                 const std::string& n=fr.code->names[ins.arg];
-                if(!delete_var(n))
+                if(!delete_var(n)){
+                    if(n.rfind("__exc",0)==0) break;   // an except clause's hidden name (see TRY)
                     throw_exception(make_exception("NameError",{VMVal::make_str("name '"+n+"' is not defined")}));
+                }
                 break;
             }
             case Op::LOAD_GLOBAL_NAME: {
@@ -8395,6 +8423,46 @@ private:
         globals_["exec"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_eval_exec(true,a); });
         globals_["compile"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_compile(a); });
         globals_["globals"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return vm_globals_map(); });
+        // The __main__ module's globals from anywhere (a library module's
+        // globals() is its own): unittest.main() finds the program's
+        // TestCase classes here, as Python's reads sys.modules["__main__"].
+        // The exception an except clause is handling right now, in this
+        // frame or a caller's (Python's sys.exc_info()[1]); none outside
+        // any except clause. A clause keeps its exception in a hidden
+        // "__excN__" variable for a bare `raise` and deletes it when it
+        // completes; the innermost clause has the highest N in its frame.
+        globals_["_ny_exc_current"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{
+            auto best_in=[](const VMMap& m, VMVal& out)->bool{
+                long best=-1;
+                for(auto& kv:m){
+                    const std::string& k=kv.first;
+                    if(k.size()<8||k.compare(0,5,"__exc")!=0||k.compare(k.size()-2,2,"__")!=0) continue;
+                    std::string mid=k.substr(5,k.size()-7);
+                    if(mid.empty()||mid.find_first_not_of("0123456789")!=std::string::npos) continue;
+                    long nn=std::stol(mid);
+                    if(nn>best && kv.second.type!=VMType::NONE){ best=nn; out=kv.second; }
+                }
+                return best>=0;
+            };
+            VMVal out=VMVal::make_none();
+            for(int i=(int)call_stack_.size()-1;i>=0;i--){
+                auto& f=call_stack_[i];
+                if(best_in(f.locals,out)) return out;
+                if(f.own_env&&f.closure_env&&best_in(*f.closure_env,out)) return out;
+            }
+            if(VMMap* me=menv()) if(best_in(*me,out)) return out;
+            return VMVal::make_none();
+        });
+        globals_["_ny_main_globals"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{
+            VMVal d=VMVal::make_map();
+            for(auto& kv:globals_){
+                if(reflect_hidden(kv.first)||base_global_names_.count(kv.first)) continue;
+                (*d.map)[kv.first]=kv.second;
+            }
+            CallFrame* mf=in_other_thread()?module_frame_:(call_stack_.empty()?nullptr:&call_stack_.front());
+            if(mf) for(auto& kv:mf->locals) if(!reflect_hidden(kv.first)) (*d.map)[kv.first]=kv.second;
+            return d;
+        });
         globals_["locals"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return vm_locals_map(); });
         globals_["vars"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_vars(a); });
         globals_["dir"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_dir(a); });

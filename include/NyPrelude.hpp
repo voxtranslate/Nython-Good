@@ -703,6 +703,8 @@ def quit(code=none):
     raise SystemExit(code)
 
 def open(path, mode="r", encoding="utf-8", errors=none, newline=none, buffering=-1):
+    if hasattr(path, "__fspath__"):
+        path = path.__fspath__()
     if "b" in mode and encoding != "utf-8" and encoding is not none:
         raise ValueError("binary mode doesn't take an encoding argument")
     return NythonFile(path, mode, file_open_or_raise(path, mode), encoding if encoding is not none else "utf-8")

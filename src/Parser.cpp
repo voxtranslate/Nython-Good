@@ -937,10 +937,23 @@ node_ptr Parser::logicalOr(){
 // is, ...), |, ^, &, shifts, arithmetic. The bitwise operators used to sit
 // below the comparisons, as in C, so `d & 1 == 0` read d & (1 == 0).
 node_ptr Parser::logicalAnd(){
-    node_ptr left = equality();
+    // `not` binds looser than every comparison, as in Python: `not a < b`
+    // is `not (a < b)` and `not x in s` is `not (x in s)`. It used to be
+    // parsed only as a unary prefix (unary()), so `not 1 < 0` was
+    // `(not 1) < 0`, false.
+    std::function<node_ptr()> notLevel = [&]() -> node_ptr {
+        if(see(TokenType::Not) && peek().type()!=TokenType::In){
+            next();
+            Token op = prev(); op.value = "not";
+            node_ptr operand = notLevel();
+            return make_node<UnaryNode>(op, operand);
+        }
+        return equality();
+    };
+    node_ptr left = notLevel();
     while(have(TokenType::And)){
         Token op = prev(); op.value = "and";
-        node_ptr right = equality();
+        node_ptr right = notLevel();
         left = make_node<BinaryNode>(op, left, right);
     }
     return left;

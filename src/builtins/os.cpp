@@ -52,6 +52,8 @@
 #  include <sys/time.h>
 #  include <pwd.h>
 #  include <utime.h>
+#  include <fcntl.h>
+#  include <sys/stat.h>
 extern char** environ;
 #else
 #  include <sys/utime.h>
@@ -483,6 +485,7 @@ Value stat_map(NythonExecutor& E, const struct stat* st, bool link, const std::s
         {"gid",     make_int(ok ? (long long)st->st_gid : 0)},
         {"nlink",   make_int(ok ? (long long)st->st_nlink : 0)},
         {"ino",     make_int(ok ? (long long)st->st_ino : 0)},
+        {"dev",     make_int(ok ? (long long)st->st_dev : 0)},
     };
     return nyos::make_map(E, m);
 }
@@ -1091,6 +1094,64 @@ Value dispatch_os(NythonExecutor& E,
         if (::utime(p.c_str(), nullptr) != 0) raise_errno(errno, p);
 #endif
         return Value(true);
+    }
+    if (name == "os_utime") {
+        // os_utime(path, times=None, ns=None): Python's os.utime. times is
+        // (atime, mtime) in seconds, ns the same in integer nanoseconds;
+        // neither sets both to now. Used by shutil.copystat / copy2.
+        Args A(E, args, {"times", "ns"});
+        std::string p = A.str(0, "path");
+        Value tv = A.get(1, "times"), nv = A.get(2, "ns");
+        bool now = true;
+        long long at_ns = 0, mt_ns = 0;
+        if (tv.type != ValueType::NONE && nv.type != ValueType::NONE)
+            raise("ValueError", "utime: you may specify either 'times' or 'ns' but not both");
+        auto pair_of = [&](const Value& v, const char* what) {
+            auto it = list_items(v);
+            if (!is_list(v) || it.size() != 2)
+                raise("TypeError", std::string("utime: '") + what + "' must be a tuple of two " +
+                                   (what[0] == 'n' ? "ints" : "ints or floats"));
+            return it;
+        };
+        if (tv.type != ValueType::NONE) {
+            auto it = pair_of(tv, "times");
+            at_ns = (long long)std::floor(to_num(it[0], 0) * 1e9 + 0.5);
+            mt_ns = (long long)std::floor(to_num(it[1], 0) * 1e9 + 0.5);
+            now = false;
+        } else if (nv.type != ValueType::NONE) {
+            auto it = pair_of(nv, "ns");
+            at_ns = to_int(it[0], 0);
+            mt_ns = to_int(it[1], 0);
+            now = false;
+        }
+        auto split_ns = [](long long t, long long& sec, long long& nsec) {
+            sec = t / 1000000000LL;
+            nsec = t % 1000000000LL;
+            if (nsec < 0) { nsec += 1000000000LL; sec -= 1; }
+        };
+#ifndef _WIN32
+        struct timespec ts[2];
+        if (now) {
+            ts[0].tv_sec = ts[1].tv_sec = 0;
+            ts[0].tv_nsec = ts[1].tv_nsec = UTIME_NOW;
+        } else {
+            long long s, n;
+            split_ns(at_ns, s, n); ts[0].tv_sec = (time_t)s; ts[0].tv_nsec = (long)n;
+            split_ns(mt_ns, s, n); ts[1].tv_sec = (time_t)s; ts[1].tv_nsec = (long)n;
+        }
+        if (::utimensat(AT_FDCWD, p.c_str(), ts, 0) != 0) raise_errno(errno, p);
+#else
+        if (now) {
+            if (::_utime(p.c_str(), nullptr) != 0) raise_errno(errno, p);
+        } else {
+            long long s, n;
+            struct _utimbuf ub;
+            split_ns(at_ns, s, n); ub.actime = (time_t)s;
+            split_ns(mt_ns, s, n); ub.modtime = (time_t)s;
+            if (::_utime(p.c_str(), &ub) != 0) raise_errno(errno, p);
+        }
+#endif
+        return NONE_VALUE;
     }
     if (name == "read_bytes") {
         std::string data;
