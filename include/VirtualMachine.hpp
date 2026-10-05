@@ -4491,6 +4491,9 @@ private:
                 auto sub=fr.code->sub_codes[ins.arg];
                 // Bases are looked up in scope (NythonExecutor::evalClassDecl)
                 for(auto& b:sub->bases){
+                    // A module's own base is already "module.Class" (the
+                    // parser qualified it): keep it.
+                    if(b.find('.')!=std::string::npos&&class_reg_.count(b)) continue;
                     std::string rn=exc_class_name(b);
                     if(rn!=b && (class_reg_.count(rn) || nython::ny_is_builtin_exc(rn))) b=rn;
                 }
@@ -5903,13 +5906,13 @@ private:
             if(attr=="__mro__"){
                 std::vector<VMVal> r;
                 for(auto& c:*class_mro(cname)){ VMVal cv=class_value(c); if(cv.type!=VMType::NONE) r.push_back(cv); }
-                out=VMVal::make_list(std::move(r)); return true;
+                out=VMVal::make_tuple(std::move(r)); return true;
             }
             if(attr=="__bases__"){
                 std::vector<VMVal> r;
                 auto rit=class_reg_.find(cname);
                 if(rit!=class_reg_.end()&&rit->second) for(auto& b:rit->second->bases){ VMVal cv=class_value(b); if(cv.type!=VMType::NONE) r.push_back(cv); }
-                out=VMVal::make_list(std::move(r)); return true;
+                out=VMVal::make_tuple(std::move(r)); return true;
             }
             return false;
         }
@@ -6964,6 +6967,24 @@ private:
         for(auto& ld:nyrt::library_dirs()) dirs.push_back(ld);
         return dirs;
     }
+    // Whether a directory can be a namespace package: it holds a .ny file or
+    // a folder that does (platform_compat.hpp's ny_fs::holds_modules).
+    static bool holds_modules(const std::string& dir, int depth=1) {
+        DIR* d=opendir(dir.c_str());
+        if(!d) return false;
+        std::vector<std::string> names;
+        while(struct dirent* e=readdir(d)){ std::string n=e->d_name; if(n!="."&&n!="..") names.push_back(n); }
+        closedir(d);
+        for(auto& n:names){
+            if(n.size()>3&&n.compare(n.size()-3,3,".ny")==0) return true;
+            if(depth>0&&n[0]!='.'){
+                struct stat st;
+                std::string sub=dir+"/"+n;
+                if(::stat(sub.c_str(),&st)==0&&S_ISDIR(st.st_mode)&&holds_modules(sub,depth-1)) return true;
+            }
+        }
+        return false;
+    }
     std::string find_module_path(const std::string& dotted, bool* is_dir=nullptr) {
         std::string rel=dotted;
         std::replace(rel.begin(),rel.end(),'.','/');
@@ -6975,7 +6996,7 @@ private:
         }
         if(is_dir) for(auto& d:dirs){
             std::string p=d.empty()?rel:d+rel;
-            if(::stat(p.c_str(),&st)==0 && S_ISDIR(st.st_mode)){ *is_dir=true; return p; }
+            if(::stat(p.c_str(),&st)==0 && S_ISDIR(st.st_mode) && holds_modules(p)){ *is_dir=true; return p; }
         }
         return std::string();
     }

@@ -4734,7 +4734,11 @@ public:   // NythonExecutor is a struct: members default to public
         // own name, which everything after this reads.
         for (auto& b : cn->bases) {
             if (!b) continue;
-            std::string bn = b->value(), rn = excClassName(bn, ctx);
+            std::string bn = b->value();
+            // A module's own base is already "module.Class" (the parser
+            // qualified it): keep it.
+            if (bn.find('.') != std::string::npos && classNodeByName(bn)) continue;
+            std::string rn = excClassName(bn, ctx);
             if (rn != bn && (classNodeByName(rn) || nython::ny_is_builtin_exc(rn))) {
                 Token t = b->token();
                 t.value = rn;
@@ -7502,9 +7506,10 @@ public:
             if (stat((d + rel + ".ny").c_str(), &st) == 0 && !S_ISDIR(st.st_mode)) return d + rel + ".ny";
             if (stat((d + rel + "/__init__.ny").c_str(), &st) == 0) return d + rel + "/__init__.ny";
         }
-        if (is_dir) for (auto& d : dirs)
-            if (!d.empty() && stat((d + rel).c_str(), &st) == 0 && S_ISDIR(st.st_mode)) { *is_dir = true; return d + rel; }
-            else if (d.empty() && stat(rel.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) { *is_dir = true; return rel; }
+        if (is_dir) for (auto& d : dirs) {
+            std::string p = d.empty() ? rel : d + rel;
+            if (stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode) && ny_fs::holds_modules(p)) { *is_dir = true; return p; }
+        }
         return std::string();
     }
     // Whether `name` is a package (a directory of modules) rather than a file.
