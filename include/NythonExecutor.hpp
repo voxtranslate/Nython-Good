@@ -1101,7 +1101,27 @@ public:   // NythonExecutor is a struct: members default to public
     Value evalVarDecl(node_ptr node, Context* ctx) {
         auto vd = static_pointer_cast<VarDeclNode>(node);
         Value val = vd->init ? evalNode(vd->init, ctx) : NONE_VALUE;
-        // a, b = gen(): the targets index a list of its values (nygen).
+        // a, b = gen(): the targets index a list of its values (nygen); an
+        // object with __iter__ / __next__ is iterated the same way, as Python
+        // unpacks (it was indexed: "'It' object is not subscriptable").
+        if (vd->unpack != -2 && !nygen::is_gen(val) && isInstanceValue(val)
+            && (instanceHasMethod(val, "__iter__") || instanceHasMethod(val, "__next__")))
+            val = nygen::make_iter(*this, val, ctx);
+        if (vd->unpack != -2 && isInstanceValue(val) && instanceHasMethod(val, "__next__")) {
+            std::vector<Value> items, no_args;
+            int n = vd->unpack;
+            while (n < 0 || (int)items.size() <= n) {
+                Value item;
+                try { item = callMethod(val, "__next__", no_args, ctx); }
+                catch (std::string& exc) { if (excTypeMatches(exc, "StopIteration")) break; throw; }
+                items.push_back(item);
+            }
+            if (n >= 0 && (int)items.size() > n)
+                pyRaise("ValueError", "too many values to unpack (expected " + std::to_string(n) + ")");
+            if (n >= 0 && (int)items.size() < n)
+                pyRaise("ValueError", "not enough values to unpack (expected " + std::to_string(n) + ", got " + std::to_string(items.size()) + ")");
+            val = makeListValue(items);
+        }
         if (vd->unpack != -2 && nygen::is_gen(val)) val = nygen::unpack_list(*this, val, vd->unpack, ctx);
         ctx->defineByName(vd->name, val);
         return val;
@@ -2681,6 +2701,19 @@ public:   // NythonExecutor is a struct: members default to public
         KwScope(const KwScope&) = delete;
         KwScope& operator=(const KwScope&) = delete;
     };
+    // A builtin called with keyword arguments from a path other than a
+    // direct call by name - one held in an attribute or passed as a value
+    // (partial(int, base=2), self.func(x, key=k)) - reads them as a direct
+    // call does: they were dropped (int("101", base=2) gave 101).
+    Value callBuiltinKw(const std::string& bn, std::vector<Value>& args,
+                        const nyrt::OrderedKw<Value>* kw, Context* ctx) {
+        if (!kw || kw->empty()) return callBuiltin(bn, args, ctx);
+        if (isKwmapBuiltin(bn)) { appendKwMap(args, *kw); return callBuiltin(bn, args, ctx); }
+        cur_kw_order_.clear();
+        for (auto& kv : *kw) cur_kw_order_.push_back(kv.first);
+        KwScope ks(this, kw);
+        return callBuiltin(bn, args, ctx);
+    }
 
     // A slice bound: false when omitted (none); raises for a non-integer.
     bool sliceArg(const std::vector<Value>& args, size_t i, int64_t& out) {
@@ -3443,6 +3476,19 @@ public:   // NythonExecutor is a struct: members default to public
         std::string sep = " ", end = "\n";
         if (pn->sep) { Value sv = evalNode(pn->sep, ctx); if (!sv.isNone()) sep = getStringValue(sv); }
         if (pn->end) { Value ev = evalNode(pn->end, ctx); if (!ev.isNone()) end = getStringValue(ev); }
+        {
+            // sys.stdout replaced (contextlib.redirect_stdout, a StringIO):
+            // the line goes to its write(), as Python's print does
+            Value target;
+            if (stdoutRedirected(target)) {
+                std::string line;
+                for (size_t i = 0; i < vals.size(); i++) { if (i > 0) line += sep; line += strOf(vals[i], ctx); }
+                line += end;
+                std::vector<Value> wa{makeStringValue(line)};
+                callMethod(target, "write", wa, ctx);
+                return NONE_VALUE;
+            }
+        }
         for (size_t i = 0; i < vals.size(); i++) {
             if (i > 0) std::cout << sep;
             printValue(vals[i], ctx);
@@ -3460,6 +3506,24 @@ public:   // NythonExecutor is a struct: members default to public
         if (end != "\n") std::cout.flush();
         else std::cout.flush();
         return NONE_VALUE;
+    }
+
+    // The sys module, once imported (one namespace for every import).
+    Value sys_ns_ = UNDEFINED_VALUE;
+    // Whether sys.stdout is something else than the standard stream it
+    // starts as; `target` is then that object.
+    bool stdoutRedirected(Value& target) {
+        if (sys_ns_.type == ValueType::UNDEFINED || !sys_ns_.isCollectable() || !sys_ns_.value.gc) return false;
+        auto* cont = dynamic_cast<Container*>(sys_ns_.value.gc);
+        if (!cont || !cont->container) return false;
+        auto it = cont->container->find("stdout");
+        if (it == cont->container->end()) return false;
+        const Value& so = it->second;
+        if (so.type == ValueType::NONE || so.type == ValueType::UNDEFINED) return false;
+        Value orig = global_ctx->getByName("_ny_stdout");
+        if (so.type == orig.type && so.value.p == orig.value.p) return false;
+        target = so;
+        return true;
     }
 
     void printValueRepr(Value v, Context* ctx = nullptr) { std::cout << reprOf(v, ctx); }
@@ -3868,9 +3932,16 @@ public:   // NythonExecutor is a struct: members default to public
         Node* raw = (Node*)ast_ptr;
         if (!raw || raw->type() != NodeType::FUNCTION) return fn_val;
         auto* fn = static_cast<FunctionNode*>(raw);
-        if (fn->params.empty()) return fn_val;
-        const std::string p0 = fn->params[0]->value();
-        if (p0 != "self" && p0 != "this") return fn_val;
+        // One written in the class body binds when it takes self (a Nython
+        // method without self stays a plain function); one put in the class
+        // from elsewhere - a decorator's wrapper(*args) - binds whatever its
+        // parameters, as Python binds any function (`f = obj.m; f(x)` lost
+        // the instance; a call obj.m(x) already supplied it, invokeMember).
+        if (direct_methods_.count(fn)) {
+            if (fn->params.empty()) return fn_val;
+            const std::string p0 = fn->params[0]->value();
+            if (p0 != "self" && p0 != "this") return fn_val;
+        }
         // Reuse an existing binding for this exact (method, instance) pair.
         //
         // Without this, every read of `obj.method` as a VALUE allocated a fresh
@@ -3948,20 +4019,21 @@ public:   // NythonExecutor is a struct: members default to public
     // Supplying a bound method's captured instance happens in exactly one
     // place — bindParamsKw() — so no invocation path can forget to do it.
 
-    Value callFunctionValue(Value fn_val, std::vector<Value>& call_args, Context* ctx) {
+    // `kw`: keyword arguments, when the call has them.
+    Value callFunctionValue(Value fn_val, std::vector<Value>& call_args, Context* ctx,
+                            const nyrt::OrderedKw<Value>* kw = nullptr) {
+        static const nyrt::OrderedKw<Value> no_kw;
         if (fn_val.type != ValueType::USERDATA || !fn_val.value.p) return NONE_VALUE;
         auto fit = func_names.find(fn_val.value.p);
         if (fit == func_names.end()) return NONE_VALUE;
         // A class passed as a callable (map(Point, xs), a factory argument).
-        if (fit->second.rfind("__class__:", 0) == 0) {
-            static const nyrt::OrderedKw<Value> no_kw;
-            return instantiateClass(fn_val, call_args, no_kw, ctx);
-        }
+        if (fit->second.rfind("__class__:", 0) == 0)
+            return instantiateClass(fn_val, call_args, kw ? *kw : no_kw, ctx);
         // A builtin, an instance or a class is not an AST function: treating its
         // pointer as a Node* crashed (thread_create(print), key=len, map(str, xs)).
-        if (fit->second.rfind("__builtin__:", 0) == 0) return callBuiltin(fit->second.substr(12), call_args, ctx);
-        if (fit->second.rfind("__bmethod__:", 0) == 0) { Value r; callBoundMember(fn_val, call_args, nullptr, ctx, r); return r; }
-        if (fit->second.rfind("__instance__:", 0) == 0 || instance_to_class.count(fn_val.value.p)) return callMethod(fn_val, "__call__", call_args, ctx);
+        if (fit->second.rfind("__builtin__:", 0) == 0) return callBuiltinKw(fit->second.substr(12), call_args, kw, ctx);
+        if (fit->second.rfind("__bmethod__:", 0) == 0) { Value r; callBoundMember(fn_val, call_args, kw, ctx, r); return r; }
+        if (fit->second.rfind("__instance__:", 0) == 0 || instance_to_class.count(fn_val.value.p)) return callMethod(fn_val, "__call__", call_args, ctx, kw);
         if (fit->second.rfind("__class__:", 0) == 0) return NONE_VALUE;
         // Bound-method `self` is supplied centrally in bindParamsKw via the
         // callee pointer. Lambdas are never bound (makeBoundMethod only binds
@@ -3980,7 +4052,7 @@ public:   // NythonExecutor is a struct: members default to public
             if (cit != closure_contexts.end()) closure_parent = scopeOf(cit->second);
             Context* fn_ctx = new Context(runner, fn_node->name, nullptr, nullptr, closure_parent);
             CtxReaper _reap_fn_ctx2020(this, fn_ctx);
-            bindParams(fn_node, call_args, fn_ctx, ctx, fn_val.value.p);
+            bindParamsKw(fn_node, call_args, kw ? *kw : no_kw, fn_ctx, ctx, 0, fn_val.value.p);
             return runFunctionBody(fn_node, fn_ctx);
         } else if (raw->type() == NodeType::LAMBDA) {
             auto* lam = static_cast<LambdaNode*>(raw);
@@ -3989,8 +4061,7 @@ public:   // NythonExecutor is a struct: members default to public
             if (cit != closure_contexts.end()) closure_parent = scopeOf(cit->second);
             Context* fn_ctx = new Context(runner, "<lambda>", nullptr, nullptr, closure_parent);
             CtxReaper _reap_fn_ctx2033(this, fn_ctx);
-            static const nyrt::OrderedKw<Value> no_kw;
-            bindLambdaParams(lam, call_args, no_kw, fn_ctx, closure_parent, fn_val.value.p);
+            bindLambdaParams(lam, call_args, kw ? *kw : no_kw, fn_ctx, closure_parent, fn_val.value.p);
             return evalNode(lam->body, fn_ctx);
         }
         return NONE_VALUE;
@@ -5074,6 +5145,16 @@ public:   // NythonExecutor is a struct: members default to public
             }
             // Store the evaluated class context so decorators (@property, @staticmethod) are visible
             setClassContext((void*)node.get(), class_ctx);
+            // __set_name__(owner, name) of each class attribute that defines
+            // it (a descriptor learning its name), in order, as Python does.
+            std::vector<std::pair<std::string, Value>> set_names;
+            if (class_ctx->container)
+                for (auto& kv : *class_ctx->container)
+                    if (isInstanceValue(kv.second) && instanceHasMethod(kv.second, "__set_name__")) set_names.push_back(kv);
+            for (auto& sn : set_names) {
+                std::vector<Value> a{class_val, makeStringValue(sn.first)};
+                callMethod(sn.second, "__set_name__", a, ctx);
+            }
         }
         classCreated(class_val, node.get(), class_kw, ctx);
         return class_val;
@@ -5935,11 +6016,7 @@ public:
                                     if (!own) is_bi = false;
                                 }
                                 if (is_fn || is_lam || is_bi) {
-                                    if (is_bi) {
-                                        std::string bn = fn_type.substr(12);
-                                        if (!kw_args.empty() && isKwmapBuiltin(bn)) appendKwMap(args, kw_args);
-                                        return callBuiltin(bn, args, ctx);
-                                    }
+                                    if (is_bi) return callBuiltinKw(fn_type.substr(12), args, &kw_args, ctx);
                                     // A bound method can be STORED in an attribute
                                     // (e.g. win.on_resize(self.on_resize) keeps it
                                     // in self._on_resize, then calls
@@ -5974,6 +6051,20 @@ public:
                             }
                         }
                     } catch (...) { throw; }   // the call's exceptions propagate
+                }
+            }
+
+            // A value stored as an attribute of a function: f.cache_info(),
+            // f.register(int). It was looked for as a method of the function
+            // and not found (AttributeError), though reading it worked.
+            if (!func_attrs_.empty() && obj.type == ValueType::USERDATA && obj.value.p) {
+                auto fa = func_attrs_.find(obj.value.p);
+                if (fa != func_attrs_.end()) {
+                    auto fit = fa->second.find(method_name);
+                    if (fit != fa->second.end()) {
+                        Value target = fit->second;   // kept while the call runs
+                        return callFunctionValue(target, args, ctx, &kw_args);
+                    }
                 }
             }
 
@@ -6409,7 +6500,7 @@ public:
         if (!args.empty() && nyrt::takes_paths(name_orig)) fspathArgs(args, ctx);
         // islice/take, and iter/next/any/all/zip/map/filter/enumerate given a
         // generator: lazy (src/NyGen.cpp).
-        if (nygen::builtin_candidate(name_orig, args)) {
+        if (nygen::builtin_candidate(name_orig, args) || (nygen::lazy_builtin_name(name_orig) && anyIteratorObject(args))) {
             Value r;
             if (nygen::builtin(*this, name_orig, args, ctx, r)) return r;
         }
@@ -6805,6 +6896,10 @@ public:
                                 }
                             }
                         }
+                        // A descriptor (an object whose class defines __get__):
+                        // the attribute is what its __get__ gives. Not with
+                        // bind=false: the call that follows runs it (once).
+                        if (bind && descriptorGet(cv, obj, class_ptr, ctx, out)) return true;
                         // A method read as a value off an INSTANCE must carry its
                         // instance with it, or `self` is lost at call time.
                         // bind=false (evalCall's method path, hasMemberNoEval):
@@ -6830,7 +6925,11 @@ public:
                 // Check class_vars_ (mutable class-level variables set at runtime)
                 std::string cv_key = cn->name + "." + attr;
                 auto cv_it = class_vars_.find(cv_key);
-                if (cv_it != class_vars_.end()) { out = cv_it->second; return true; }
+                if (cv_it != class_vars_.end()) {
+                    if (bind && descriptorGet(cv_it->second, obj, class_ptr, ctx, out)) return true;
+                    out = cv_it->second;
+                    return true;
+                }
                 // Not yet set — evaluate class-level default from body
                 if (cn->body) {
                     for (auto& stmt : cn->body->statements()) {
@@ -7223,6 +7322,27 @@ public:
             if (nygen::Gen* g = nygen::gen_of(itv)) {
                 Value item;
                 while (nygen::next(*this, g, item, cc)) one(item);
+            } else if (isInstanceValue(itv)) {
+                // An iterator object too (or an object whose __iter__ gives
+                // one): it was read to the end before the first element was
+                // made, so `[list(g) for k, g in groupby(...)]` saw every
+                // group already invalidated.
+                Value hold = nygen::make_iter(*this, itv, cc);
+                if (nygen::Gen* g2 = nygen::gen_of(hold)) {
+                    Value item;
+                    while (nygen::next(*this, g2, item, cc)) one(item);
+                } else {
+                    std::vector<Value> no_args;
+                    while (true) {
+                        Value item;
+                        try { item = callMethod(hold, "__next__", no_args, cc); }
+                        catch (std::string& exc) {
+                            if (excTypeMatches(exc, "StopIteration")) break;
+                            throw;
+                        }
+                        one(item);
+                    }
+                }
             } else {
                 for (auto& item : iterValues(itv, cc)) one(item);
             }
@@ -8487,6 +8607,21 @@ public:
                 registerBuiltin("softmax"); registerBuiltin("tensor_softmax"); registerBuiltin("kb_save"); registerBuiltin("kb_load");
                 return NONE_VALUE;
         }
+        if (module_name == "sys" && sys_ns_.type != ValueType::UNDEFINED) {
+                // one sys module: a stream replaced through one import
+                // (contextlib.redirect_stdout) is the stream of every other
+                imported_modules_.erase(module_name);
+                if (from_import) bindFromNamespace(sys_ns_, in_node->names, "sys", ctx);
+                else ctx->defineByName(in_node->alias.empty() ? std::string("sys") : in_node->alias, sys_ns_);
+                // argv and platform bare, as every import of sys binds them
+                if (auto* sc = dynamic_cast<Container*>(sys_ns_.value.gc); sc && sc->container) {
+                    auto a = sc->container->find("argv");
+                    if (a != sc->container->end()) ctx->defineByName("argv", a->second);
+                    auto pl = sc->container->find("platform");
+                    if (pl != sc->container->end()) ctx->defineByName("platform", pl->second);
+                }
+                return NONE_VALUE;
+        }
         if (module_name == "sys") {
                 // `sys` is a namespace: sys.argv (the script path, then the
                 // arguments after it on the command line), sys.platform,
@@ -8522,7 +8657,9 @@ public:
                     ns->set(st, sv);
                     ns->set(std::string("__") + st + "__", sv);
                 }
-                ctx->defineByName(in_node->alias.empty() ? "sys" : in_node->alias, Value((Collectable*)ns));
+                sys_ns_ = Value((Collectable*)ns);
+                if (from_import) bindFromNamespace(sys_ns_, in_node->names, "sys", ctx);
+                else ctx->defineByName(in_node->alias.empty() ? "sys" : in_node->alias, sys_ns_);
                 ctx->defineByName("argv", argv_list);
                 ctx->defineByName("platform", makeStringValue(plat));
                 imported_modules_.erase(module_name);   // `import sys as s` after `import sys`
@@ -9488,10 +9625,26 @@ public:
         for (auto& n : names) out.push_back(makeStringValue(n));
         return makeListValue(out);
     }
+    bool anyIteratorObject(const std::vector<Value>& args) {
+        for (auto& a : args) if (isInstanceValue(a) && instanceHasMethod(a, "__next__")) return true;
+        return false;
+    }
     bool instanceHasMethod(const Value& v, const std::string& name) {
         Node* cn = classNodeOfInstance(v);
         Value m;
         return cn && findClassMember(cn, name, m);
+    }
+    // A descriptor: a class attribute `d` holding an object whose class
+    // defines __get__ (cached_property, partialmethod...). Read through an
+    // instance the attribute is d.__get__(instance, owner); through the
+    // class, d.__get__(None, owner). An instance's own attribute of that
+    // name is found before it (a non-data descriptor, as in Python).
+    bool descriptorGet(const Value& d, const Value& obj, void* owner_ptr, Context* ctx, Value& out) {
+        if (!isInstanceValue(d) || !instanceHasMethod(d, "__get__")) return false;
+        Value owner; owner.type = ValueType::USERDATA; owner.value.p = owner_ptr;
+        std::vector<Value> a{isInstanceValue(obj) ? obj : NONE_VALUE, owner};
+        out = callMethod(d, "__get__", a, ctx);
+        return true;
     }
     // Methods run with the class that defines them on this stack, so a
     // super() call inside knows where in the MRO to continue from.
@@ -9801,6 +9954,13 @@ public:
         Value m; Node* owner = nullptr;
         if (!findClassMember(cls, name, m, &owner)) return false;
         if (m.type != ValueType::USERDATA || !m.value.p) return false;
+        {
+            // a descriptor (partialmethod, singledispatchmethod...): what its
+            // __get__ gives is called
+            Value got;
+            void* owner_ptr = isInstanceValue(obj) ? instance_to_class[obj.value.p] : obj.value.p;
+            if (descriptorGet(m, obj, owner_ptr, ctx, got)) { out = callFunctionValue(got, args, ctx, &kw); return true; }
+        }
         std::string tag = fnTag(func_names, m.value.p);
         if (tag.rfind("__func__:", 0) != 0 && tag.rfind("__lambda__", 0) != 0) {
             // A class stored in the class (Outer.Inner(...)) or a builtin.

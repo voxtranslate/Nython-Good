@@ -1021,6 +1021,10 @@ bool consumes(const std::string& name) {
     return names.count(name) > 0;
 }
 
+bool iterator_object(NythonExecutor& E, const Value& v) {
+    return E.isInstanceValue(v) && E.instanceHasMethod(v, "__next__");
+}
+
 bool builtin(NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx, Value& out) {
     const uint32_t fresh_mask = t_fresh_args;   // taken: nested builtins must not see it
     t_fresh_args = 0;
@@ -1109,7 +1113,8 @@ bool builtin(NythonExecutor& E, const std::string& name, std::vector<Value>& arg
         size_t first = (name == "map" || name == "filter") ? 1 : 0;
         size_t last = name == "enumerate" ? 1 : args.size();
         bool lazy = false;
-        for (size_t i = first; i < last && i < args.size(); i++) if (is_gen(args[i])) lazy = true;
+        for (size_t i = first; i < last && i < args.size(); i++)
+            if (is_gen(args[i]) || iterator_object(E, args[i])) lazy = true;
         if (!lazy) return false;
         if (name == "zip") {
             E.cur_kwargs_ = nullptr;

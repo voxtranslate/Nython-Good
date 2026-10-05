@@ -244,7 +244,12 @@ def _ny_print(*args, **kw):
     elif not isinstance(end, "str"):
         raise TypeError("end must be None or a string, not " + type(end))
     if file is none:
-        file = _ny_stdout
+        # the print statement: to sys.stdout as it is now (it may have
+        # been replaced, contextlib.redirect_stdout)
+        print(sep.join([str(a) for a in args]), end=end)
+        if kw.get("flush", false):
+            _ny_stdout.flush()
+        return none
     file.write(sep.join([str(a) for a in args]) + end)
     if kw.get("flush", false):
         file.flush()

@@ -3121,7 +3121,25 @@ public:
     // `import sys`: a namespace with argv (the script path, then the
     // arguments after it), platform, executable and version; argv and
     // platform are also bound bare, as on the interpreter.
+    // The sys module, once made: one namespace for every import, so a
+    // stream replaced through one (contextlib.redirect_stdout) is the
+    // stream of all.
+    VMVal sys_ns_;
+    // Whether sys.stdout is something else than the standard stream it
+    // starts as; `target` is then that object.
+    bool stdout_redirected(VMVal& target) {
+        if(sys_ns_.type!=VMType::MAP||!sys_ns_.map) return false;
+        auto it=sys_ns_.map->find("stdout");
+        if(it==sys_ns_.map->end()) return false;
+        const VMVal& so=it->second;
+        if(so.type==VMType::NONE) return false;
+        auto ot=globals_.find("_ny_stdout");
+        if(ot!=globals_.end()&&ot->second.type==so.type&&ot->second.map==so.map) return false;
+        target=so;
+        return true;
+    }
     void define_sys_module(const std::string& as_name) {
+        if(sys_ns_.type==VMType::MAP&&sys_ns_.map){ globals_[as_name]=sys_ns_; return; }
         std::vector<VMVal> av;
         for(auto& a : nyrt::argv()) av.push_back(VMVal::make_str(a));
         VMVal argv_list=VMVal::make_list(std::move(av));
@@ -3147,7 +3165,8 @@ public:
         (*ns.map)["version"]=VMVal::make_str(NYTHON_VERSION);
         (*ns.map)["maxsize"]=VMVal::make_int((int64_t)PTRDIFF_MAX);   // as the interpreter's
         { const uint16_t probe=1; (*ns.map)["byteorder"]=VMVal::make_str(*(const uint8_t*)&probe?"little":"big"); }
-        ns.class_name=as_name;
+        ns.class_name="sys";
+        sys_ns_=ns;
         globals_[as_name]=ns;
         globals_["argv"]=argv_list;
         globals_["platform"]=VMVal::make_str(plat);
@@ -3687,6 +3706,15 @@ private:
         return g;
     }
     static bool vm_lazy_arg(const VMVal& v) { return v.type==VMType::GENERATOR||v.type==VMType::ITERATOR; }
+    // An iterator object (an instance with __next__: itertools.count(), a
+    // user iterator): zip/map/filter/enumerate over one are lazy too, as
+    // over a generator - it was read to the end first, forever for an
+    // infinite one (zip("abc", count())).
+    bool vm_iterator_object(const VMVal& v) {
+        if(v.type!=VMType::INSTANCE) return false;
+        VMVal m;
+        return class_lookup(v.class_name,"__next__",m);
+    }
     // zip/map/filter/enumerate given a generator or iterator: lazy, like
     // the interpreter's (src/NyGen.cpp). Over lists they still return lists.
     bool gen_lazy_builtin(const std::string& nm, std::vector<VMVal>& a, VMVal& out) {
@@ -3694,7 +3722,7 @@ private:
         size_t first = (nm=="map"||nm=="filter") ? 1 : 0;
         size_t last = nm=="enumerate" ? std::min<size_t>(1,a.size()) : a.size();
         bool lazy=false;
-        for(size_t i=first;i<last;i++) if(vm_lazy_arg(a[i])) lazy=true;
+        for(size_t i=first;i<last;i++) if(vm_lazy_arg(a[i])||vm_iterator_object(a[i])) lazy=true;
         if(!lazy){ if(kw.type==VMType::MAP) a.push_back(kw); return false; }
         if(nm=="zip"){
             auto its=std::make_shared<std::vector<VMVal>>();
@@ -3797,9 +3825,16 @@ private:
         // The right side of an unpacking assignment (see VarDeclNode::unpack).
         globals_["__unpack_seq__"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.empty()) return VMVal::make_none();
-            if(!vm_lazy_arg(a[0])) return a[0];
+            // an object with __iter__ / __next__ is iterated too, as Python
+            // unpacks (it was indexed: "'It' object is not subscriptable")
+            bool inst_iter=false;
+            if(a[0].type==VMType::INSTANCE){
+                VMVal m;
+                inst_iter=class_lookup(a[0].class_name,"__iter__",m)||class_lookup(a[0].class_name,"__next__",m);
+            }
+            if(!vm_lazy_arg(a[0])&&!inst_iter) return a[0];
             int64_t n = a.size()>=2 && a[1].type==VMType::INT ? a[1].i : -1;
-            VMVal it=a[0], v;
+            VMVal it=inst_iter?vm_iter_open(a[0]):a[0], v;
             std::vector<VMVal> items;
             if(n<0){ while(vm_iter_step(it,v)) items.push_back(std::move(v)); }
             else {
@@ -4343,15 +4378,37 @@ private:
         if(as_cls) (*bound.map)["__cls__"]=VMVal::make_bool(true);
         return bound;
     }
+    // A descriptor: a class attribute holding an object whose class defines
+    // __get__ (cached_property, partialmethod...). Read through an instance
+    // the attribute is __get__(instance, owner); through the class,
+    // __get__(None, owner). An instance's own attribute of that name is
+    // found before it (a non-data descriptor, as Python's).
+    bool descriptor_get(const VMVal& d, const VMVal& inst, const std::string& owner, VMVal& out) {
+        if(d.type!=VMType::INSTANCE) return false;
+        VMVal g;
+        if(!class_lookup(d.class_name,"__get__",g)) return false;
+        std::vector<VMVal> a{inst.type==VMType::INSTANCE?inst:VMVal::make_none(), class_value(owner)};
+        out=invoke_method(g, d, a, d.class_name);
+        return true;
+    }
     // A class member read through an instance: a property is read, a method
     // is bound to the instance, a classmethod to the class, a staticmethod
     // (or a Nython method without self) stays a plain function.
     VMVal bind_member(const VMVal& m, const VMVal& obj, const std::string& cls) {
         if(is_property_desc(m)) return property_get(m, obj);
+        if(m.type==VMType::INSTANCE){ VMVal r; if(descriptor_get(m, obj, cls, r)) return r; }
         if(m.type==VMType::FUNCTION&&m.code){
             if(m.code->is_static) return m;
             if(m.code->is_classmethod) return make_bound(m, class_value(cls), true);
-            if(!m.code->is_method) return m;
+            if(!m.code->is_method){
+                // A function put in the class from elsewhere (a decorator's
+                // wrapper(*args), `f = some_function`) is bound as Python
+                // binds any function: the instance becomes its first
+                // argument (the __cls__ form passes it so). One written in
+                // the class body without self is Nython's plain function.
+                if(m.code->owner_class.empty()&&obj.type==VMType::INSTANCE) return make_bound(m, obj, true);
+                return m;
+            }
             return make_bound(m, obj);
         }
         return m;
@@ -4366,9 +4423,22 @@ private:
                 a2.push_back(class_value(cls)); for(auto& x:args) a2.push_back(x);
                 return call_function(m, a2, std::nullopt, kwargs);
             }
+            if(!m.code->is_method&&m.code->owner_class.empty()&&self.type==VMType::INSTANCE){
+                // a function put in the class from elsewhere (a decorator's
+                // wrapper): the instance is its first argument, as Python
+                // (it got none, and the wrapped method saw self = None)
+                std::vector<VMVal> a2; a2.reserve(args.size()+1);
+                a2.push_back(self); for(auto& x:args) a2.push_back(x);
+                return call_function(m, a2, std::nullopt, kwargs);
+            }
             return call_function(m, args, self, kwargs);
         }
         if(is_property_desc(m)){ VMVal v=property_get(m, self); return vm_call(v, args, std::nullopt, kwargs); }
+        if(m.type==VMType::INSTANCE){
+            // a descriptor: what its __get__ gives is called
+            VMVal b;
+            if(descriptor_get(m, self, cls, b)) return vm_call(b, args, std::nullopt, kwargs);
+        }
         return vm_call(m, args, std::nullopt, kwargs);
     }
     // The constructor, first class in the MRO defining __init__ (or init).
@@ -5019,6 +5089,23 @@ private:
                 has_del_cache_.clear();
                 no_new_.clear();
                 class_vars_[sub->name]=run_class_body(sub, fr);
+                {
+                    // __set_name__(owner, name) of each class attribute that
+                    // defines it (a descriptor learning its name), as type()
+                    std::vector<std::pair<std::string,VMVal>> sn;
+                    for(auto& kv:class_vars_[sub->name]){
+                        VMVal g;
+                        if(kv.second.type==VMType::INSTANCE&&class_lookup(kv.second.class_name,"__set_name__",g)) sn.push_back(kv);
+                    }
+                    if(!sn.empty()){
+                        VMVal cv=VMVal::make_class(sub,sub->name);
+                        for(auto& p:sn){
+                            VMVal g; class_lookup(p.second.class_name,"__set_name__",g);
+                            std::vector<VMVal> a{cv, VMVal::make_str(p.first)};
+                            invoke_method(g, p.second, a, p.second.class_name);
+                        }
+                    }
+                }
                 if(is_exception_class(sub->name)) vm_exc_classes().insert(sub->name);
                 else vm_exc_classes().erase(sub->name);
                 {
@@ -5328,6 +5415,16 @@ private:
                 for(int i=argc-1;i>=0;--i) vals[i]=pop();
                 std::string out;
                 for(int i=0;i<argc;++i){ if(i) out+=sep; out+=str_of(vals[i]); }
+                {
+                    // sys.stdout replaced (contextlib.redirect_stdout, a
+                    // StringIO): the line goes to its write(), as Python's
+                    VMVal target;
+                    if(stdout_redirected(target)){
+                        std::vector<VMVal> wa{VMVal::make_str(out+end)};
+                        vm_call_method(target,"write",wa);
+                        break;
+                    }
+                }
                 std::cout<<out<<end;
                 if(end!="\n") std::cout.flush();
                 break;
@@ -6465,6 +6562,7 @@ private:
             VMVal m;
             if(class_lookup(cname, attr, m)){
                 if(m.type==VMType::FUNCTION&&m.code&&m.code->is_classmethod) out=make_bound(m, obj, true);
+                else if(m.type==VMType::INSTANCE&&descriptor_get(m, VMVal::make_none(), cname, out)) {}
                 else out=m;   // a method read from the class is the plain function
                 return true;
             }
@@ -7100,6 +7198,16 @@ private:
             if(primitive_member(obj,method,args,pm)) return pm;
             throw_exception(make_exception("AttributeError",{VMVal::make_str("'generator' object has no attribute '"+method+"'")}));
         }
+        // A value stored as an attribute of a function: f.cache_info(),
+        // f.register(int). It was looked for as a method of the function and
+        // not found (AttributeError), though reading it worked.
+        if(obj.type==VMType::FUNCTION&&obj.code&&!func_attrs_.empty()){
+            auto fa=func_attrs_.find(func_key(obj));
+            if(fa!=func_attrs_.end()){
+                auto it=fa->second.find(method);
+                if(it!=fa->second.end()){ VMVal target=it->second; return vm_call(target,args,std::nullopt,kwargs); }
+            }
+        }
         {
             VMVal pm;
             if(primitive_member(obj,method,args,pm)) return pm;
@@ -7154,8 +7262,12 @@ private:
                 if(held.type==VMType::FUNCTION)
                     // A function stored in an attribute is called with its
                     // own closure and defaults (a closure stored as obj.cb
-                    // and called obj.cb() used to lose its captured values).
-                    return call_function(held,args,std::nullopt,kwargs);
+                    // and called obj.cb() used to lose its captured values),
+                    // through vm_call: a method taken from its class gets
+                    // its instance from the first argument there
+                    // (cached_property's self.func(instance) raised "takes
+                    // 0 positional arguments").
+                    return vm_call(held,args,std::nullopt,kwargs);
                 if(held.type==VMType::CLASS||held.type==VMType::INSTANCE)
                     return vm_call(held,args,std::nullopt,kwargs);
             }
@@ -7791,6 +7903,11 @@ private:
             if(!alias.empty()&&mc!=module_ns_.end()){ globals_[alias]=mc->second; return; }
             if(implicit&&globals_.count(guard_key)) return;
         }
+        // from sys import x after sys was imported: from the one sys namespace
+        if(name=="sys"&&!from_names.empty()&&sys_ns_.type==VMType::MAP&&sys_ns_.map){
+            bind_from_namespace(sys_ns_, from_names, "sys");
+            return;
+        }
         // An aliased import must still run so its namespace can be built, even
         // if the module was already loaded — otherwise the name diff sees
         // nothing and the alias is empty. Matches the interpreter.
@@ -7824,7 +7941,12 @@ private:
         // status); now they are acknowledgements only.
         if(name=="os"){ define_os_module(alias.empty()?std::string("os"):alias); return; }
         if(name=="shell"||name=="sh"){ return; }
-        if(name=="sys"){ define_sys_module(alias.empty()?std::string("sys"):alias); return; }
+        if(name=="sys"){
+            define_sys_module(alias.empty()?std::string("sys"):alias);
+            // from sys import stdout, maxsize: the one sys namespace's
+            if(!from_names.empty()) bind_from_namespace(sys_ns_, from_names, "sys");
+            return;
+        }
         if(name=="math"){
             // `from math import gcd` bound nothing (NameError); the namespace
             // is cached so later imports, from any module, bind it

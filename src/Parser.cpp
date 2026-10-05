@@ -340,9 +340,11 @@ node_ptr Parser::statement(){
         }
         // Optional (args) after decorator: @decorator(arg1, arg2)
         if(have(TokenType::ParenOpen)) {
-            auto factory_call = make_node<CallNode>(call_tok, dec_expr);
-            for(auto& a : argList()) factory_call->add(a);
-            mustBe(TokenType::ParenClose);
+            // the arguments of an ordinary call: `@lru_cache(typed=True)`
+            // was read by argList() as the assignment typed = True, an
+            // argument passed by position (to maxsize) on the interpreter
+            auto factory_call = std::make_shared<CallNode>(call_tok, dec_expr);
+            parseCallArgs(factory_call);
             dec_expr = factory_call;
         }
         have(TokenType::NewLine);
