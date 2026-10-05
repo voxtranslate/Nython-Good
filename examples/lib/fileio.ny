@@ -1,4 +1,4 @@
-# ─── examples/lib/io.ny ──────────────────────────────────────────────────────
+# ─── examples/lib/fileio.ny ──────────────────────────────────────────────────────
 # Object wrappers over the io builtins: File (usable with `with`), TextFile and
 # Logger.
 #
@@ -7,6 +7,8 @@
 # examples appeared to import successfully and then failed on
 # `File is not defined` with nothing pointing at the missing import. The API
 # below is exactly what those two examples call, and nothing more.
+# (It was examples/lib/io.ny: a bare `import io` from examples/ found it
+# before Python's io module, lib/io.ny.)
 
 class File:
     def __init__(self, path, mode):

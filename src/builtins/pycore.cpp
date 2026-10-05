@@ -305,6 +305,16 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
     }
     case B_DIVMOD: {
         need(2, "divmod()");
+        // an object's __divmod__ (or the right operand's __rdivmod__) first;
+        // it was skipped for // and %, which a class may define differently
+        if (E.isInstanceValue(args[0]) && E.instanceHasMethod(args[0], "__divmod__")) {
+            std::vector<Value> a1 = {args[1]};
+            return E.callMethod(args[0], "__divmod__", a1, ctx);
+        }
+        if (E.isInstanceValue(args[1]) && E.instanceHasMethod(args[1], "__rdivmod__")) {
+            std::vector<Value> a0 = {args[0]};
+            return E.callMethod(args[1], "__rdivmod__", a0, ctx);
+        }
         Value q = E.binaryOp(NythonExecutor::OP_FLOORDIV, args[0], args[1], ctx);
         Value r = E.binaryOp(NythonExecutor::OP_MOD, args[0], args[1], ctx);
         return E.makeListValue({q, r}, true);
