@@ -644,6 +644,31 @@ up = Upper()
 print("shout", file=up)
 check("TextIOBase subclass", ["".join(up.parts), up.writable(), errtype(lambda: up.read())], ["SHOUT\n", False, "UnsupportedOperation"])
 
+# open(newline=...): "" and "\n" write text untouched, "\r\n" translates each
+# \n, "" reads line ends as they are, None (the default) reads them as \n
+import tempfile
+import os
+nl_dir = tempfile.mkdtemp()
+nl_path = os.path.join(nl_dir, "nl.txt")
+with open(nl_path, "w", newline="\r\n") as nl_f:
+    nl_n = nl_f.write("a\nb\n")
+with open(nl_path, "rb") as nl_f:
+    nl_raw = nl_f.read()
+with open(nl_path, "r", newline="") as nl_f:
+    nl_kept = nl_f.read()
+with open(nl_path, "r") as nl_f:
+    nl_universal = nl_f.read()
+with open(nl_path, "w", newline="") as nl_f:
+    nl_f.write("x\r\ny\n")
+with open(nl_path, "rb") as nl_f:
+    nl_raw2 = nl_f.read()
+check("open newline=", [nl_n, nl_raw, nl_kept, nl_universal, nl_raw2],
+      [4, b"a\r\nb\r\n", "a\r\nb\r\n", "a\nb\n", b"x\r\ny\n"])
+check("open newline= errors", [errtype(lambda: open(nl_path, "r", newline="x")), errtype(lambda: open(nl_path, "rb", newline=""))],
+      ["ValueError", "ValueError"])
+os.remove(nl_path)
+os.rmdir(nl_dir)
+
 # ── engine fixes ─────────────────────────────────────────────────────────────
 check("float literal underflow", [5e-324, 2.5e-320 > 0, 1e400, -1e400], [5e-324, True, float("inf"), float("-inf")])
 

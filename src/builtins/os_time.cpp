@@ -66,7 +66,43 @@ double now_seconds() {
     return (double)us / 1e6;
 }
 
+// UTC from the calendar alone (Howard Hinnant's civil_from_days), the same
+// on every platform: Windows' gmtime_s refuses times before 1970 (so
+// datetime.fromtimestamp(-1.5, timezone.utc) raised there) and a 32-bit
+// time_t ends in 2038. Round 77.
+bool utc_tm(double ts, std::tm& out) {
+    double fl = std::floor(ts);
+    if (!(fl > -1e15 && fl < 1e15)) return false;
+    int64_t t = (int64_t)fl;
+    int64_t days = t / 86400, secs = t % 86400;
+    if (secs < 0) { secs += 86400; days -= 1; }
+    int64_t z = days + 719468;
+    int64_t era = (z >= 0 ? z : z - 146096) / 146097;
+    int64_t doe = z - era * 146097;
+    int64_t yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    int64_t y = yoe + era * 400;
+    int64_t doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    int64_t mp = (5 * doy + 2) / 153;
+    int64_t d = doy - (153 * mp + 2) / 5 + 1;
+    int64_t m = mp < 10 ? mp + 3 : mp - 9;
+    if (m <= 2) y += 1;
+    static const int cum[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
+    bool leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    out = std::tm{};
+    out.tm_year = (int)(y - 1900);
+    out.tm_mon = (int)(m - 1);
+    out.tm_mday = (int)d;
+    out.tm_hour = (int)(secs / 3600);
+    out.tm_min = (int)(secs % 3600 / 60);
+    out.tm_sec = (int)(secs % 60);
+    out.tm_wday = (int)(((days % 7) + 11) % 7);   // 1970-01-01 was a Thursday
+    out.tm_yday = cum[m - 1] + (int)d - 1 + (leap && m > 2 ? 1 : 0);
+    out.tm_isdst = 0;
+    return true;
+}
+
 bool to_tm(double ts, bool utc, std::tm& out) {
+    if (utc) return utc_tm(ts, out);
     std::time_t t = (std::time_t)std::floor(ts);
 #ifdef _WIN32
     return (utc ? gmtime_s(&out, &t) : localtime_s(&out, &t)) == 0;

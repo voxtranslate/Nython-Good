@@ -381,6 +381,39 @@ std::wstring widen_os(const std::string& s) {
     MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), &w[0], n);
     return w;
 }
+// A file's or directory's access and modification times, to 100 ns
+// (SetFileTime, as Python's os.utime): the CRT's _utime cannot open a
+// directory (PermissionError) and keeps whole seconds. now: both are now.
+// Returns 0 or an errno value (round 77).
+int win_set_times(const std::string& p, bool now, long long at_ns, long long mt_ns) {
+    HANDLE h = CreateFileW(widen_os(p).c_str(), FILE_WRITE_ATTRIBUTES,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD e = GetLastError();
+        return e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND ? ENOENT
+             : e == ERROR_ACCESS_DENIED || e == ERROR_SHARING_VIOLATION ? EACCES : EINVAL;
+    }
+    FILETIME fa, fm;
+    if (now) {
+        GetSystemTimeAsFileTime(&fa);
+        fm = fa;
+    } else {
+        // FILETIME counts 100 ns from 1601-01-01
+        auto to_ft = [](long long ns, FILETIME& ft) {
+            long long t = ns / 100;
+            if (ns % 100 < 0) t -= 1;
+            unsigned long long u = (unsigned long long)(t + 116444736000000000LL);
+            ft.dwLowDateTime = (DWORD)(u & 0xFFFFFFFFULL);
+            ft.dwHighDateTime = (DWORD)(u >> 32);
+        };
+        to_ft(at_ns, fa);
+        to_ft(mt_ns, fm);
+    }
+    BOOL ok = SetFileTime(h, nullptr, &fa, &fm);
+    CloseHandle(h);
+    return ok ? 0 : EACCES;
+}
 std::string narrow_os(const std::wstring& w) {
     if (w.empty()) return std::string();
     int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), (int)w.size(), nullptr, 0, nullptr, nullptr);
@@ -1089,7 +1122,7 @@ Value dispatch_os(NythonExecutor& E,
             if (!f.is_open()) raise_errno(errno ? errno : EACCES, p);
         }
 #ifdef _WIN32
-        if (::_utime(p.c_str(), nullptr) != 0) raise_errno(errno, p);
+        if (int e = win_set_times(p, true, 0, 0)) raise_errno(e, p);
 #else
         if (::utime(p.c_str(), nullptr) != 0) raise_errno(errno, p);
 #endif
@@ -1141,15 +1174,8 @@ Value dispatch_os(NythonExecutor& E,
         }
         if (::utimensat(AT_FDCWD, p.c_str(), ts, 0) != 0) raise_errno(errno, p);
 #else
-        if (now) {
-            if (::_utime(p.c_str(), nullptr) != 0) raise_errno(errno, p);
-        } else {
-            long long s, n;
-            struct _utimbuf ub;
-            split_ns(at_ns, s, n); ub.actime = (time_t)s;
-            split_ns(mt_ns, s, n); ub.modtime = (time_t)s;
-            if (::_utime(p.c_str(), &ub) != 0) raise_errno(errno, p);
-        }
+        (void)split_ns;
+        if (int e = win_set_times(p, now, at_ns, mt_ns)) raise_errno(e, p);
 #endif
         return NONE_VALUE;
     }

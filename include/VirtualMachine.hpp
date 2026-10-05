@@ -3083,7 +3083,7 @@ public:
                 bool all_kw=true;
                 for(auto& kv:*args.back().map)
                     if(kv.first!="mode"&&kv.first!="encoding"&&kv.first!="file"&&kv.first!="path"&&kv.first!="errors"
-                       &&kv.first!="newline"&&kv.first!="buffering") all_kw=false;
+                       &&kv.first!="newline"&&kv.first!="buffering"&&kv.first!="closefd"&&kv.first!="opener") all_kw=false;
                 if((all_kw||args.back().class_name=="__kwargs__")&&!args.back().map->empty()){ kw=args.back(); args.pop_back(); }
             }
             auto kwget=[&](const char* k)->VMVal{
@@ -3099,18 +3099,32 @@ public:
             }
             VMVal mode=args.size()>1?args[1]:kwget("mode");
             if(mode.type==VMType::NONE) mode=VMVal::make_str("r");
-            std::vector<VMVal> oa={path,mode};
+            // open(file, mode, buffering, encoding, errors, newline), Python's
+            // order; newline= as the prelude's open (NythonFile.newline):
+            // an explicit one opens the handle raw (round 77)
+            VMVal newline=args.size()>5?args[5]:kwget("newline");
+            bool binary=mode.type==VMType::STRING&&mode.s.find('b')!=std::string::npos;
+            if(newline.type!=VMType::NONE){
+                if(newline.type!=VMType::STRING||!(newline.s.empty()||newline.s=="\n"||newline.s=="\r"||newline.s=="\r\n"))
+                    raise_native_exception("ValueError","illegal newline value: "+vm_repr(newline));
+                if(binary) raise_native_exception("ValueError","binary mode doesn't take a newline argument");
+            }
+            VMVal native_mode=mode;
+            if(newline.type!=VMType::NONE&&!binary) native_mode=VMVal::make_str(mode.s+"b");
+            std::vector<VMVal> oa={path,native_mode};
             VMVal opener=load_var("file_open_or_raise");
             VMVal h=vm_call(opener,oa,std::nullopt);
             auto cit=class_reg_.find("NythonFile");
             if(cit==class_reg_.end()) return h;
             VMVal cls=VMVal::make_class(cit->second,"NythonFile");
-            VMVal enc=args.size()>2?args[2]:kwget("encoding");
+            VMVal enc=args.size()>3?args[3]:kwget("encoding");
             if(enc.type==VMType::NONE) enc=VMVal::make_str("utf-8");
             if(mode.type==VMType::STRING&&mode.s.find('b')!=std::string::npos&&enc.type==VMType::STRING&&enc.s!="utf-8")
                 raise_native_exception("ValueError","binary mode doesn't take an encoding argument");
             std::vector<VMVal> ca={path,mode,h,enc};
-            return vm_call(cls,ca,std::nullopt);
+            VMVal f=vm_call(cls,ca,std::nullopt);
+            if(f.type==VMType::INSTANCE&&f.map) (*f.map)["newline"]=newline;
+            return f;
         });
     }
 

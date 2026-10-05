@@ -5548,3 +5548,7 @@ Full detail in `HANDOFF.md` §0p. New tests: `vm_audit65` (bytes, 149 checks), `
 | VM: `{int: 1, str: 2}` had one entry | natives had no key of their own | keyed by what they are |
 | VM: `def size(cls)` as a property getter or metaclass method got no argument | only a first parameter named `self` made a method | the object is the first argument |
 | There was no `re`; `re.match(r"(a+)+$", "a" * 30 + "b")` does not finish in 10 s under CPython 3.11 | — | `re` on a native engine with selective memoization (Davis et al., IEEE S&P 2021): well under a second on both engines |
+| Windows: csv files written with `open(..., newline="")` had `\r\r\n` line ends | `newline=` was ignored and the C runtime translated `\n` underneath | Python's `newline=` on both engines; an explicit one opens the handle raw |
+| `open(p, "w", -1, "utf-8")` took -1 as the encoding | encoding was the third parameter | Python's order: file, mode, buffering, encoding, errors, newline |
+| Windows: `datetime.fromtimestamp(-1.5, timezone.utc)` raised OverflowError | `gmtime_s` refuses negative times | UTC computed from the calendar (`utc_tm`), every platform |
+| Windows: `os.utime(directory, ...)` raised PermissionError | the CRT's `_utime` cannot open a directory | `SetFileTime` with backup semantics, to 100 ns |

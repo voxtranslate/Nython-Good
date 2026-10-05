@@ -354,10 +354,10 @@ These were aligned to match how the IDE calls them:
 | vm_audit70 | 79 | round 77: http.client/server, urllib, cookies, WebSockets (RFC 6455), TLS with a throwaway CA, network/webserver/sockets/clientserver libraries, math, hashlib |
 | vm_audit71 | 97 | round 77: the command line on each engine (-c/-m/-i/-, sys.argv, SystemExit statuses, the prompt), argparse against python3's output, sys.stdin/stdout/stderr, print(file=), a running program's stdin (os_spawn(stdin=true), input requests), locals/globals/vars/dir, kwargs order |
 | vm_audit72 | 56 | round 77: Python compatibility, passes under python3 too - starred displays, annotations, f"{x=}", slice objects, eval/exec/compile, complex, per-execution classes, collections, object/issubclass, __setattr__/__delattr__, threading.local, docstrings, positional-only parameters, keyword module names |
-| vm_audit73 | 292 | round 77: json, random (CPython's sequences for a seed), datetime, time, io |
+| vm_audit73 | 292 | round 77: itertools, functools, operator, heapq, bisect, copy, contextlib |
 | vm_audit75 | 1004 | round 77: string, textwrap, pprint, csv, statistics, fractions, struct, calendar, uuid |
 | vm_audit76 | 273 | round 77: fnmatch, glob, shutil, tempfile, pathlib, subprocess, platform, getpass, logging, unittest, queue |
-| vm_audit77 | 272 | round 77: itertools, functools, operator, heapq, bisect, copy, contextlib |
+| vm_audit77 | 274 | round 77: json, random (CPython's sequences for a seed), datetime, time, io, open(newline=) |
 | vm_audit78 | 147 | round 77: re - Python's syntax and messages over a native engine immune to catastrophic backtracking (selective memoization) |
 | vm_audit79 | 43 | round 77: class machinery, passes under python3 - annotations, PEP 487 (__init_subclass__, __set_name__), __new__, PEP 560/604 generics and unions, metaclasses, NotImplemented and reflected operators, __mro__/__bases__/__subclasses__ |
 | vm_audit80 | 15 | round 77: type() gives type objects (type(5) is int, type(obj) is its class, x.__class__), equal to their legacy names on Nython; typeof(x) is the name |

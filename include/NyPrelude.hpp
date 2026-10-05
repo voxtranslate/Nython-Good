@@ -27,6 +27,10 @@ class NythonFile:
         self.closed = false
         self.binary = "b" in mode
         self.encoding = none if self.binary else encoding
+        # open(newline=...): None translates as the platform does (\r\n on
+        # Windows); "" and "\n" write text untouched; "\r" and "\r\n"
+        # replace each \n (round 77)
+        self.newline = none
 
     def _check(self):
         if self.closed:
@@ -64,8 +68,11 @@ class NythonFile:
         if isinstance(data, "bytes") or isinstance(data, "bytearray"):
             raise TypeError("write() argument must be str, not " + data.type_name())
         var text = str(data)
+        var n = len(text)
+        if self.newline == "\r\n" or self.newline == "\r":
+            text = text.replace("\n", self.newline)
         file_write(self.handle, text)
-        return len(text)
+        return n
 
     def writelines(self, lines):
         self._check()
@@ -735,12 +742,23 @@ def exit(code=none):
 def quit(code=none):
     raise SystemExit(code)
 
-def open(path, mode="r", encoding="utf-8", errors=none, newline=none, buffering=-1):
+def open(path, mode="r", buffering=-1, encoding="utf-8", errors=none, newline=none, closefd=true, opener=none):
+    # Python's parameters in Python's order (round 77: encoding was third)
     if hasattr(path, "__fspath__"):
         path = path.__fspath__()
     if "b" in mode and encoding != "utf-8" and encoding is not none:
         raise ValueError("binary mode doesn't take an encoding argument")
-    return NythonFile(path, mode, file_open_or_raise(path, mode), encoding if encoding is not none else "utf-8")
+    if newline is not none and not (newline == "" or newline == "\n" or newline == "\r" or newline == "\r\n"):
+        raise ValueError("illegal newline value: " + repr(newline))
+    if "b" in mode and newline is not none:
+        raise ValueError("binary mode doesn't take a newline argument")
+    # an explicit newline= means no platform translation underneath: the
+    # handle is opened raw and NythonFile applies newline itself (csv's
+    # open(..., newline="") wrote \r\r\n on Windows)
+    var native_mode = mode if (newline is none or "b" in mode) else mode + "b"
+    var f = NythonFile(path, mode, file_open_or_raise(path, native_mode), encoding if encoding is not none else "utf-8")
+    f.newline = newline
+    return f
 
 class _NyAsyncCM:
     def __init__(self, m):
