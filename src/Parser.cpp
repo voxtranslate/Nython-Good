@@ -69,9 +69,10 @@ std::string Parser::dottedName(){
     if (have(TokenType::String)) {
         return prev().value;
     }
-    mustBe(TokenType::Identifier);
-    std::string name = prev().value;
-    while(have(TokenType::Dot)){ mustBe(TokenType::Identifier); name += "."+prev().value; }
+    // A module may be named by a word that is a Nython keyword (`import
+    // enum`, `import struct`): identifier() takes those.
+    std::string name = identifier();
+    while(have(TokenType::Dot)) name += "." + identifier();
     return name;
 }
 
@@ -2198,6 +2199,7 @@ node_ptr Parser::functionDecl(bool is_method){
         params = paramList();
         mustBe(TokenType::ParenClose);
     }
+    size_t posonly = param_posonly_;   // the body's own functions reset it
     // `-> T` (a return annotation, parsed and dropped)
     if(have(TokenType::RightArrow)) ternary();
     have(TokenType::Colon);
@@ -2218,6 +2220,7 @@ node_ptr Parser::functionDecl(bool is_method){
     }
     for(auto& p : params) fn->add(p);
     static_cast<FunctionNode*>(fn.get())->defaults = std::move(param_defaults_);
+    static_cast<FunctionNode*>(fn.get())->posonly = posonly;
     if(is_async) return async_def_desugar(tok, fn, is_gen);
     return fn;
 }
@@ -2250,6 +2253,7 @@ std::vector<node_ptr> Parser::lambdaParamList(){
 std::vector<node_ptr> Parser::paramList(){
     std::vector<node_ptr> params;
     param_defaults_.clear();
+    param_posonly_ = 0;
     if(!see(TokenType::ParenClose)){
         // Check for *args or **kwargs
         auto parse_one_param = [&]() {
@@ -2262,10 +2266,11 @@ std::vector<node_ptr> Parser::paramList(){
                 return;
             }
             // A bare `/` (PEP 570): the parameters before it are
-            // positional-only. Accepted; passing them by keyword is not
-            // refused.
+            // positional-only (FunctionNode::posonly; both engines refuse
+            // them as keywords, and a **kwargs parameter takes such a keyword).
             if(see(TokenType::Div) && (peek(1).type() == TokenType::Comma || peek(1).type() == TokenType::ParenClose)){
                 next();
+                param_posonly_ = params.size();
                 return;
             }
             bool va = have(TokenType::Mul);
@@ -2645,8 +2650,22 @@ node_ptr Parser::importStmt(){
         if(have(TokenType::Mul)){
             names.push_back("*");
         } else {
-            names.push_back(identifier());
-            while(have(TokenType::Comma)) names.push_back(identifier());
+            // `from m import a, b as c` and the parenthesised form over
+            // several lines with a trailing comma; an alias travels as
+            // "a\x05c" (nyrt::import_name_alias).
+            bool paren = have(TokenType::ParenOpen);
+            auto skip_nl = [&]() { if(paren) while(have(TokenType::NewLine) || have(TokenType::Indent) || have(TokenType::Dedent)) {} };
+            skip_nl();
+            while(true){
+                std::string n = identifier();
+                if(have(TokenType::As)) n += std::string(1, '\x05') + identifier();
+                names.push_back(n);
+                skip_nl();
+                if(!have(TokenType::Comma)) break;
+                skip_nl();
+                if(paren && see(TokenType::ParenClose)) break;
+            }
+            if(paren) mustBe(TokenType::ParenClose);
         }
         have(TokenType::SemiColon); have(TokenType::NewLine);
         return imp;

@@ -43,6 +43,7 @@ private:
 
     /// Temporary storage for parameter default values during function parsing
     std::vector<node_ptr> param_defaults_;
+    size_t param_posonly_ = 0;   // paramList: parameters before a bare `/`
     // Per function being parsed: the names it declared `global`/`nonlocal`.
     std::vector<std::vector<std::string>> outer_decls_;
     std::vector<std::vector<std::string>> global_decls_;   // `global` only, per function

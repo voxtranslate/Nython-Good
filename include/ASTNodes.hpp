@@ -697,6 +697,7 @@ struct FunctionNode : Node {
     std::string name; std::vector<node_ptr> params; node_ptr body; bool is_method;
     std::string doc; bool has_doc = false;   // its docstring (__doc__, round 77)
     std::vector<node_ptr> defaults; // default values for parameters
+    size_t posonly = 0;   // how many parameters precede a bare `/` (PEP 570): never bound by keyword
     FunctionNode(Token t, const std::string& n, node_ptr b, bool m=false) : Node(t, NodeType::FUNCTION), name(n), params{}, body(b), is_method(m), defaults{} {}
     Node* add(node_ptr n) override { params.push_back(n); return this; }
     Value eval(Context* ctx) override {

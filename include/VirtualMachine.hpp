@@ -438,6 +438,7 @@ struct VMCode {
     // list, which put them on the wrong parameters when *args, keyword-only
     // parameters or **kwargs followed).
     std::vector<int>         default_idx;
+    size_t                   posonly = 0;   // param_names before a bare `/` (PEP 570)
     bool                     is_class      = false;
     bool                     is_method     = false;
     bool                     is_static     = false;
@@ -1797,6 +1798,7 @@ private:
         int param_idx=0;
         for(int i=0;i<(int)fn->params.size();i++){
             std::string pn=fn->params[i]->value(); if(pn=="self") continue;
+            if((size_t)i<fn->posonly) C().posonly=C().param_names.size()+1;
             C().param_names.push_back(pn); C().add_name(pn);
             // Defaults used to be left UNDEFINED here and filled in at runtime by
             // MAKE_FUNCTION. Class methods never go through MAKE_FUNCTION — they
@@ -3251,6 +3253,7 @@ private:
         std::string err;
         std::string kw_name;
         std::vector<std::string> missing;
+        std::string posonly_kw;   // positional-only parameters given as keywords
         size_t min_pos=0, max_pos=0;
         for(size_t pi=0;pi<pnames.size();pi++){
             const std::string& pn=pnames[pi];
@@ -3266,7 +3269,10 @@ private:
             bool has_default = pi<dflts.size()&&!dflts[pi].is_missing();
             if(!star_seen){ max_pos++; if(!has_default) min_pos++; }
             if(!star_seen && ai<pos.size()){ locs[pn]=pos[ai++]; have=true; }
-            if(kw && kw->map){
+            if(kw && kw->map && pi<code.posonly){
+                // never bound by keyword: the keyword goes to **kwargs, or is an error
+                if(kw->map->count(pn)) posonly_kw += (posonly_kw.empty() ? "" : ", ") + pn;
+            } else if(kw && kw->map){
                 auto it=kw->map->find(pn);
                 if(it!=kw->map->end()){
                     if(have && err.empty()) err=code.name+"() got multiple values for argument '"+pn+"'";
@@ -3290,6 +3296,8 @@ private:
             VMVal extra=VMVal::make_map();
             for(auto& [k,v]:*kw->map) if(!used_kw.count(k)) (*extra.map)[k]=v;
             if(has_varkw) locs[kw_name]=extra;
+            else if(!posonly_kw.empty())
+                err=code.name+"() got some positional-only arguments passed as keyword arguments: '"+posonly_kw+"'";
             else if(!extra.map->empty() && err.empty())
                 err=code.name+"() got an unexpected keyword argument '"+extra.map->begin()->first+"'";
         } else if(has_varkw) locs[kw_name]=VMVal::make_map();
@@ -7338,11 +7346,12 @@ private:
             for(auto& kv:ns) if(!kv.first.empty() && kv.first[0]!='_') define_var(kv.first, kv.second);
             return;
         }
-        for(auto& n:names){
+        for(auto& entry:names){
+            auto [n, bound]=nyrt::import_name_alias(entry);
             auto hit=ns.find(n);
             if(hit==ns.end())
                 throw_exception(make_exception("ImportError",{VMVal::make_str("cannot import name '"+n+"' from '"+module_name+"'")}));
-            define_var(n, hit->second);
+            define_var(bound, hit->second);
         }
     }
     // `import m` / `import m as x` / `from m import ...` of a module file
@@ -7429,7 +7438,8 @@ private:
             prev=ns;
         }
         if(!from_names.empty()){
-            for(auto& n:from_names){
+            for(auto& entry:from_names){
+                std::string n=nyrt::import_name_alias(entry).first;
                 if(n=="*"||!prev.map||prev.map->count(n)) continue;
                 bool dir=false;
                 if(!find_module_path(name+"."+n,&dir).empty()) (*prev.map)[n]=load_module(name+"."+n);
@@ -7523,13 +7533,14 @@ private:
                 import_dotted(name, alias, from_names, explicit_alias);
                 return;
             }
-            // `import threading` binds Python's threading module (lib/threading.ny)
-            if(name=="threading" && bare){
-                std::string p=find_module_path("threading");
+            // `import threading` / `json` / `re` / ... binds the Python module
+            // in lib/ when there is one (nyrt::prefers_lib_module)
+            if(bare && nyrt::prefers_lib_module(name)){
+                std::string p=find_module_path(name);
                 if(!p.empty()){
-                    VMVal nsv=module_ns_.count("threading")?module_ns_["threading"]:load_module_file(p,"threading");
-                    if(!from_names.empty()) bind_from_namespace(nsv, from_names, "threading");
-                    else define_var(alias.empty()?std::string("threading"):alias, nsv);
+                    VMVal nsv=module_ns_.count(name)?module_ns_[name]:load_module_file(p,name);
+                    if(!from_names.empty()) bind_from_namespace(nsv, from_names, name);
+                    else define_var(alias.empty()?name:alias, nsv);
                     return;
                 }
             }

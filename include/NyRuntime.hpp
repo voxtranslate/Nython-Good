@@ -257,4 +257,24 @@ inline std::string native_exc_type(const std::exception& e) {
     return "RuntimeError";
 }
 
+// `from m import a as b`: ImportNode::names holds "a\x05b" (the parser);
+// both engines bind it with this split - {name in the module, name bound}.
+inline std::pair<std::string, std::string> import_name_alias(const std::string& n) {
+    size_t p = n.find('\x05');
+    if (p == std::string::npos) return {n, n};
+    return {n.substr(0, p), n.substr(p + 1)};
+}
+
+// Standard module names a bare `import` binds to the Python module in
+// lib/<name>.ny when there is one (round 77). They were acknowledgements of
+// builtin groups - `import json` bound no `json`, so json.dumps was a
+// NameError; the legacy flat builtins (json_encode, re_match, random_int,
+// ...) stay registered regardless.
+inline bool prefers_lib_module(const std::string& name) {
+    static const char* const names[] = {"json", "re", "random", "datetime", "time",
+                                        "io", "string", "threading", "struct", "math_lib"};
+    for (const char* n : names) if (name == n) return true;
+    return false;
+}
+
 } // namespace nyrt

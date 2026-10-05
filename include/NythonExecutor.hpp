@@ -5074,6 +5074,7 @@ public:   // NythonExecutor is a struct: members default to public
         std::unordered_set<std::string> named;
         std::vector<std::string> missing;
         std::string err;
+        std::string posonly_kw;   // positional-only parameters given as keywords
         size_t min_pos = 0, max_pos = 0;
         for (size_t i = skip_params; i < fn->params.size(); i++) {
             std::string pname = fn->params[i]->value();
@@ -5093,8 +5094,13 @@ public:   // NythonExecutor is a struct: members default to public
             } else if (pname.size() > 2 && pname[0] == '*' && pname[1] == '*') {
                 kw_collect = pname.substr(2);
             } else {
-                if (!kw_args.empty()) named.insert(pname);   // only read when keywords were passed
-                auto kw_it = kw_args.find(pname);
+                // A positional-only parameter is never bound by keyword: a
+                // keyword of its name goes to **kwargs, or is an error.
+                bool posonly = i < fn->posonly;
+                if (!kw_args.empty() && !posonly) named.insert(pname);   // only read when keywords were passed
+                auto kw_it = posonly ? kw_args.end() : kw_args.find(pname);
+                if (posonly && !kw_args.empty() && kw_args.count(pname))
+                    posonly_kw += (posonly_kw.empty() ? "" : ", ") + pname;
                 bool has_default = i < fn->defaults.size() && fn->defaults[i];
                 if (!star_seen) { max_pos++; if (!has_default) min_pos++; }
                 if (!star_seen && arg_idx < call_args.size()) {
@@ -5115,6 +5121,8 @@ public:   // NythonExecutor is a struct: members default to public
             Object* kwargs_obj = new Object((Runnable*)runner, "map", Type::MAP);
             for (auto& [k, v] : kw_args) if (!named.count(k)) kwargs_obj->set(k, v);
             fn_ctx->defineByName(kw_collect, Value((Collectable*)kwargs_obj));
+        } else if (!posonly_kw.empty()) {
+            err = fn->name + "() got some positional-only arguments passed as keyword arguments: '" + posonly_kw + "'";
         } else if (err.empty()) {
             for (auto& [k, v] : kw_args)
                 if (!named.count(k)) { err = fn->name + "() got an unexpected keyword argument '" + k + "'"; break; }
@@ -7620,11 +7628,12 @@ public:
                 if (!kv.first.empty() && kv.first[0] != '_') ctx->defineByName(kv.first, kv.second);
             return;
         }
-        for (const auto& n : names) {
+        for (const auto& entry : names) {
+            auto [n, bound] = nyrt::import_name_alias(entry);
             auto it = ns->container->find(n);
             if (it == ns->container->end())
                 throw std::string("__exc__:ImportError:cannot import name '" + n + "' from '" + module_name + "'");
-            ctx->defineByName(n, it->second);
+            ctx->defineByName(bound, it->second);
         }
     }
 
@@ -7719,7 +7728,8 @@ public:
         }
         if (!in_node->names.empty()) {
             auto* po = dynamic_cast<Object*>(prev.value.gc);
-            for (auto& n : in_node->names) {
+            for (auto& entry : in_node->names) {
+                std::string n = nyrt::import_name_alias(entry).first;
                 if (n == "*" || !po || po->container->count(n)) continue;
                 bool dir = false;
                 if (!findModulePath(node, module_name + "." + n, &dir).empty())
@@ -7835,6 +7845,18 @@ public:
         paths.push_back("./" + module_name + ".ny");
         paths.push_back("./lib/" + module_name + ".ny");
 
+        // A standard module written in Nython (lib/json.ny, lib/re.ny, ...)
+        // is the module `import json` binds; the names below were bare
+        // acknowledgements of builtin groups (nyrt::prefers_lib_module).
+        if (!quoted && nyrt::prefers_lib_module(module_name)) {
+            std::string p = findModulePath(node, module_name);
+            if (!p.empty()) {
+                Value nsv = module_ns_.count(module_name) ? module_ns_[module_name] : runModuleFile(p, module_name);
+                if (from_import) bindFromNamespace(nsv, in_node->names, module_name, ctx);
+                else ctx->defineByName(!in_node->alias.empty() ? in_node->alias : module_name, nsv);
+                return NONE_VALUE;
+            }
+        }
         // Check builtin modules first
         if (module_name == "string") {
                 registerBuiltin("isdigit_str");

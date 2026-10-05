@@ -20,6 +20,8 @@
 #   docstrings   __doc__ of functions, methods, classes and instances
 #   hooks        __setattr__ / __delattr__ (object.__setattr__ and
 #                super().__setattr__ store), frozen objects, threading.local
+#   params       positional-only parameters (`/`) refused as keywords and
+#                collected by **kwargs; `from m import a as b`, `(a, b,)`
 #
 # Must pass on both engines (and python3):
 #     ./build/nython-cli examples/vm_audit72.ny
@@ -274,6 +276,29 @@ class DocClass:
         return 1
 check("__doc__", [documented.__doc__, DocClass.__doc__, DocClass.m.__doc__, DocClass().m.__doc__, DocClass().__doc__, DocClass.bare.__doc__],
       ["Add things.\n\n    More text.", "A class.", "A method.", "A method.", "A class.", None])
+
+# ── positional-only parameters, import forms ────────────────────────────────
+def po(a, b, /, c, *, d=4):
+    return [a, b, c, d]
+def po_kw(a, /, **kw):
+    return [a, kw]
+def po_err(f, *args, **kw):
+    try:
+        f(*args, **kw)
+        return "no error"
+    except TypeError as e:
+        return str(e)
+check("positional-only", [po(1, 2, 3), po(1, 2, c=3, d=5), po_kw(1, a=2, z=3)], [[1, 2, 3, 4], [1, 2, 3, 5], [1, {"a": 2, "z": 3}]])
+check("positional-only errors", [po_err(po, 1, b=2, c=3), po_err(po, a=1, b=2, c=3), po_err(po_kw, a=1)],
+      ["po() got some positional-only arguments passed as keyword arguments: 'b'",
+       "po() got some positional-only arguments passed as keyword arguments: 'a, b'",
+       "po_kw() missing 1 required positional argument: 'a'"])
+from collections import OrderedDict as OD, deque as dq
+from collections import (
+    Counter as Ctr,
+    defaultdict,
+)
+check("from-import aliases", [type(OD()).__name__, list(dq([1, 2])), Ctr("aab")["a"], defaultdict(int)["x"]], ["OrderedDict", [1, 2], 2, 0])
 
 for r in results:
     if r[1]:
