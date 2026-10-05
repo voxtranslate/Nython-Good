@@ -15,6 +15,16 @@
 #                isinstance(x, int | str)
 #   classes      C.__dict__, Python's class reprs, one-line class bodies,
 #                bound method attributes, `...` / Ellipsis
+#   metaclasses  __new__/__init__/__call__, dunders and methods through the
+#                class, __instancecheck__/__subclasscheck__, type(n, b, ns)
+#   operators    NotImplemented and the reflected-method protocol, a
+#                subclass's reflected method first, __mro__/__bases__ with
+#                builtin bases and object, __subclasses__(), mro()
+#   metaclasses  metaclass= with __new__ / __init__ (super() reaching type),
+#                the class-object dunders (__iter__, __len__, __contains__,
+#                __getitem__, __repr__, __call__, __instancecheck__,
+#                __subclasscheck__), metaclass methods and properties,
+#                inheritance, type(name, bases, ns), a metaclass called
 #
 # Must pass on both engines (and python3):
 #     ./build/nython-cli examples/vm_audit79.ny
@@ -183,6 +193,174 @@ check("bound method attributes", [bm.__func__ == BM.m, id(bm.__self__) == id(bm_
 def stub():
     ...
 check("Ellipsis", [stub(), repr(...), id(...) == id(Ellipsis), repr(Ellipsis)], [None, "Ellipsis", True, "Ellipsis"])
+
+# ── metaclasses ──────────────────────────────────────────────────────────────
+class Meta(type):
+    def __new__(mcs, name, bases, ns, **kw):
+        ns["tag"] = name.lower()
+        cls = super().__new__(mcs, name, bases, ns)
+        cls.made_by = "Meta"
+        return cls
+    def __init__(cls, name, bases, ns, **kw):
+        super().__init__(name, bases, ns)
+        cls.inited = True
+    def __iter__(cls):
+        return iter(cls.items)
+    def __len__(cls):
+        return len(cls.items)
+    def __contains__(cls, x):
+        return x in cls.items
+    def __getitem__(cls, k):
+        return cls.items[k]
+    def __repr__(cls):
+        return "<Meta " + cls.__name__ + ">"
+    def describe(cls):
+        return "class " + cls.__name__
+    @property
+    def size(cls):
+        return len(cls.items)
+class Bag(metaclass=Meta):
+    items = [1, 2, 3]
+check("metaclass __new__ / __init__", [Bag.tag, Bag.made_by, Bag.inited], ["bag", "Meta", True])
+check("metaclass dunders", [list(Bag), len(Bag), 2 in Bag, 5 in Bag, Bag[0], repr(Bag), [x * 2 for x in Bag]],
+      [[1, 2, 3], 3, True, False, 1, "<Meta Bag>", [2, 4, 6]])
+check("metaclass methods and properties", [Bag.describe(), Bag.size], ["class Bag", 3])
+check("the type of a class with a metaclass", [type(Bag) == Meta, isinstance(Bag, Meta), isinstance(Bag, type)], [True, True, True])
+class SubBag(Bag):
+    items = [9]
+check("a metaclass is inherited", [SubBag.tag, list(SubBag), SubBag.inited, repr(SubBag)], ["subbag", [9], True, "<Meta SubBag>"])
+
+class SingletonMeta(type):
+    instances = {}
+    def __call__(cls, *args, **kw):
+        if cls not in SingletonMeta.instances:
+            SingletonMeta.instances[cls] = super().__call__(*args, **kw)
+        return SingletonMeta.instances[cls]
+class Config(metaclass=SingletonMeta):
+    def __init__(self, v):
+        self.v = v
+c1 = Config(1)
+c2 = Config(2)
+check("metaclass __call__", [id(c1) == id(c2), c1.v, type(c1).__name__], [True, 1, "Config"])
+
+class CountMeta(type):
+    calls = []
+    def __call__(cls, *args, **kw):
+        CountMeta.calls.append(cls.__name__)
+        return super().__call__(*args, **kw)
+class Inner(metaclass=CountMeta):
+    pass
+class Outer(metaclass=CountMeta):
+    def __init__(self):
+        self.inner = Inner()
+outer = Outer()
+check("a metaclass __call__ inside another's __init__", [CountMeta.calls, type(outer.inner).__name__], [["Outer", "Inner"], "Inner"])
+
+class DuckMeta(type):
+    def __instancecheck__(cls, obj):
+        return hasattr(obj, "quack")
+    def __subclasscheck__(cls, sub):
+        return hasattr(sub, "quack")
+class Duck(metaclass=DuckMeta):
+    pass
+class Robot:
+    def quack(self):
+        return "beep"
+check("__instancecheck__ / __subclasscheck__", [isinstance(Robot(), Duck), isinstance(5, Duck), issubclass(Robot, Duck), issubclass(int, Duck)],
+      [True, False, True, False])
+
+def greet(self):
+    return "hi " + self.name
+Dyn = type("Dyn", (), {"name": "dyn", "greet": greet})
+check("type(name, bases, ns)", [Dyn.__name__, Dyn().greet(), Dyn.name], ["Dyn", "hi dyn", "dyn"])
+SubDyn = type("SubDyn", (Dyn,), {"extra": 1})
+check("type() with a base", [SubDyn().greet(), SubDyn.extra, issubclass(SubDyn, Dyn)], ["hi dyn", 1, True])
+Made = Meta("Made", (), {"items": [7, 8]})
+check("a metaclass called", [Made.tag, list(Made), Made.inited, repr(Made)], ["made", [7, 8], True, "<Meta Made>"])
+
+# ── NotImplemented, the reflected-operator protocol, __mro__, __subclasses__ ──
+class V:
+    def __init__(self, x):
+        self.x = x
+    def __add__(self, o):
+        if isinstance(o, V):
+            return V(self.x + o.x)
+        return NotImplemented
+    def __radd__(self, o):
+        if isinstance(o, int):
+            return V(self.x + o)
+        return NotImplemented
+    def __eq__(self, o):
+        if not isinstance(o, V):
+            return NotImplemented
+        return self.x == o.x
+    def __lt__(self, o):
+        if not isinstance(o, V):
+            return NotImplemented
+        return self.x < o.x
+class W:
+    def __radd__(self, o):
+        return "W.radd"
+    def __eq__(self, o):
+        return "W.eq"
+check("NotImplemented falls through to the reflected method",
+      [repr(NotImplemented), (V(1) + V(2)).x, (3 + V(4)).x, V(1) + W()], ["NotImplemented", 3, 7, "W.radd"])
+def raises(f):
+    try:
+        f()
+        return "no error"
+    except TypeError as e:
+        return str(e)
+check("every method declining is a TypeError",
+      [raises(lambda: V(1) + "s"), raises(lambda: V(1) < 5)],
+      ["unsupported operand type(s) for +: 'V' and 'str'", "'<' not supported between instances of 'V' and 'int'"])
+vv = V(1)
+check("== falls back to identity; the reflected __eq__ result as it is",
+      [V(1) == V(1), V(1) == 1, V(1) != 2, V(1) == W(), 1 == V(1), vv == vv, vv != vv, sorted([V(3), V(1), V(2)])[0].x],
+      [True, False, True, "W.eq", False, True, False, 1])
+class OpBase:
+    def __add__(self, o):
+        return "OpBase.add"
+    def __radd__(self, o):
+        return "OpBase.radd"
+class OpDerived(OpBase):
+    def __radd__(self, o):
+        return "OpDerived.radd"
+check("a subclass's reflected method first", [OpBase() + OpDerived(), OpDerived() + OpBase(), OpBase() + OpBase()],
+      ["OpDerived.radd", "OpBase.add", "OpBase.add"])
+class Acc:
+    def __init__(self):
+        self.n = 0
+    def __iadd__(self, o):
+        if isinstance(o, int):
+            self.n += o
+            return self
+        return NotImplemented
+    def __add__(self, o):
+        return "Acc.add"
+acc = Acc()
+acc += 5
+acc_n = acc.n
+acc += "x"
+check("__iadd__ declining falls back to __add__", [acc_n, acc], [5, "Acc.add"])
+class MA:
+    pass
+class MB(MA):
+    pass
+class MC(MA):
+    pass
+class MD(MB, MC):
+    pass
+class MM(type):
+    pass
+class DD(dict):
+    pass
+check("__subclasses__, __mro__, __bases__, mro()",
+      [[k.__name__ for k in MA.__subclasses__()], [k.__name__ for k in MD.__mro__], [k.__name__ for k in MA.__bases__],
+       repr(MM.__mro__), repr(DD.__mro__), repr(MM.__bases__), [k.__name__ for k in MD.mro()], Exception.__mro__[-1] is object],
+      [["MB", "MC"], ["MD", "MB", "MC", "MA", "object"], ["object"],
+       "(<class '__main__.MM'>, <class 'type'>, <class 'object'>)", "(<class '__main__.DD'>, <class 'dict'>, <class 'object'>)",
+       "(<class 'type'>,)", ["MD", "MB", "MC", "MA", "object"], True])
 
 for r in results:
     if r[1]:

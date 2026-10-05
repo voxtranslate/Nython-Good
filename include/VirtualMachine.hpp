@@ -3919,14 +3919,43 @@ private:
     // tries a.__lt__(b), then b.__gt__(a)). Returns false when neither
     // side defines one.
     bool rich_compare(const VMVal& a, const VMVal& b, const char* op, const char* rop, VMVal& out) {
+        // NotImplemented declines (the other side is next); a subclass's
+        // reflected method comes first (round 77)
         bool f=false;
-        if(a.type==VMType::INSTANCE){ out=call_dunder_f(a,op,{b},f); if(f) return true; }
-        if(b.type==VMType::INSTANCE){ out=call_dunder_f(b,rop,{a},f); if(f) return true; }
+        bool r_first=right_overrides(a,b,rop);
+        if(r_first){ out=call_dunder_f(b,rop,{a},f); if(f&&!is_ni(out)) return true; }
+        if(a.type==VMType::INSTANCE){ out=call_dunder_f(a,op,{b},f); if(f&&!is_ni(out)) return true; }
+        if(!r_first&&b.type==VMType::INSTANCE){ out=call_dunder_f(b,rop,{a},f); if(f&&!is_ni(out)) return true; }
         return false;
+    }
+    static std::string op_symbol_of(const std::string& dunder) {
+        static const std::unordered_map<std::string,const char*> m={
+            {"__add__","+"},{"__sub__","-"},{"__mul__","*"},{"__truediv__","/"},{"__floordiv__","//"},
+            {"__mod__","%"},{"__pow__","** or pow()"},{"__and__","&"},{"__or__","|"},{"__xor__","^"},
+            {"__lshift__","<<"},{"__rshift__",">>"},{"__matmul__","@"},{"__div__","/"}};
+        auto it=m.find(dunder);
+        return it==m.end()?dunder:std::string(it->second);
+    }
+    [[noreturn]] void order_unsupported(const char* sym, const VMVal& a, const VMVal& b) {
+        raise_native_exception("TypeError",std::string("'")+sym+"' not supported between instances of '"+vm_type_name(a)+"' and '"+vm_type_name(b)+"'");
+        throw 0;   // not reached
+    }
+    // The prelude's NotImplemented singleton.
+    static bool is_ni(const VMVal& v){ return v.type==VMType::INSTANCE&&v.class_name=="_NyNotImplementedType"; }
+    static VMVal ni_none(VMVal v){ return is_ni(v)?VMVal::make_none():v; }
+    // r's class is a subclass of l's and defines `rname` below l's class.
+    bool right_overrides(const VMVal& l, const VMVal& r, const char* rname) {
+        if(!rname||l.type!=VMType::INSTANCE||r.type!=VMType::INSTANCE||l.class_name==r.class_name) return false;
+        if(!class_derives(r.class_name,l.class_name)) return false;
+        VMVal m; std::string owner;
+        if(!class_lookup(r.class_name,rname,m,&owner)) return false;
+        auto lm=class_mro(l.class_name);
+        return std::find(lm->begin(),lm->end(),owner)==lm->end();
     }
     bool vm_less(const VMVal& a, const VMVal& b) {
         VMVal r;
         if(rich_compare(a,b,"__lt__","__gt__",r)) return vm_truthy(r);
+        if(a.type==VMType::INSTANCE||b.type==VMType::INSTANCE) order_unsupported("<",a,b);
         if((a.type==VMType::BYTES)!=(b.type==VMType::BYTES))
             raise_native_exception("TypeError","'<' not supported between instances of '"+vm_type_name(a)+"' and '"+vm_type_name(b)+"'");
         if(a.type==VMType::LIST&&b.type==VMType::LIST) return cmp_val(a,b)<0;
@@ -3961,9 +3990,13 @@ private:
         return r;
     }
     bool binary_dunder(const VMVal& l, const VMVal& r, const char* name, const char* rname, VMVal& out) {
-        bool f=false;
-        if(l.type==VMType::INSTANCE){ out=call_dunder_f(l,name,{r},f); if(f) return true; }
-        if(r.type==VMType::INSTANCE && rname){ out=call_dunder_f(r,rname,{l},f); if(f) return true; }
+        bool f=false, declined=false;
+        bool r_first=right_overrides(l,r,rname);
+        if(r_first){ out=call_dunder_f(r,rname,{l},f); if(f&&!is_ni(out)) return true; declined|=f; }
+        if(l.type==VMType::INSTANCE){ out=call_dunder_f(l,name,{r},f); if(f&&!is_ni(out)) return true; declined|=f; }
+        if(!r_first&&r.type==VMType::INSTANCE && rname){ out=call_dunder_f(r,rname,{l},f); if(f&&!is_ni(out)) return true; declined|=f; }
+        // every method declined (NotImplemented): TypeError, as Python
+        if(declined) raise_native_exception("TypeError","unsupported operand type(s) for "+op_symbol_of(name)+": '"+vm_type_name(l)+"' and '"+vm_type_name(r)+"'");
         return false;
     }
     // The items of anything iterable, for natives that take an iterable:
@@ -3977,6 +4010,10 @@ private:
     // items of a list or map (which rendered as "<C instance>" through
     // VMVal::repr, which cannot call into the program).
     std::string vm_str(const VMVal& v) {
+        if(v.type==VMType::CLASS&&!class_meta_.empty()){
+            VMVal r;
+            if(meta_call(v,"__str__",{},r)||meta_call(v,"__repr__",{},r)) return r.to_string();
+        }
         if(v.type==VMType::INSTANCE){
             for(auto dname : {"__str__","__repr__"}){
                 bool found=false;
@@ -3989,6 +4026,10 @@ private:
         return v.to_string();
     }
     std::string vm_repr(const VMVal& v) {
+        if(v.type==VMType::CLASS&&!class_meta_.empty()){
+            VMVal r;
+            if(meta_call(v,"__repr__",{},r)) return r.to_string();
+        }
         if(v.type==VMType::INSTANCE){
             for(auto dname : {"__repr__","__str__"}){
                 bool found=false;
@@ -4116,6 +4157,10 @@ private:
             if(owner) *owner=(*mro)[i];
             return true;
         }
+        // every class reaches object's __subclasses__ and mro (round 77)
+        if(!after&&(attr=="__subclasses__"||attr=="mro")&&cls!="object"
+           &&std::find(mro->begin(),mro->end(),std::string("object"))==mro->end())
+            return class_lookup("object",attr,out,owner);
         return false;
     }
     // ── eval / exec / compile (round 77; as NythonExecutor's) ──
@@ -4366,7 +4411,9 @@ private:
         auto git=desc.map->find("__get__");
         if(git==desc.map->end()) return VMVal::make_none();
         std::vector<VMVal> no_args;
-        if(git->second.type==VMType::FUNCTION) return call_function(git->second, no_args, obj);
+        // a getter whose first parameter is not named self (a metaclass's
+        // `def size(cls)`) takes the object as its first argument
+        if(git->second.type==VMType::FUNCTION) return call_with_first(git->second, obj, no_args, nullptr);
         std::vector<VMVal> a{obj};
         return vm_call(git->second, a, std::nullopt);
     }
@@ -4453,6 +4500,130 @@ private:
         }
         return false;
     }
+    // ── metaclasses (round 77) ──────────────────────────────────────────
+    // A class's metaclass: its statement's metaclass=, else the nearest
+    // base's (MRO order); none for a plain class.
+    std::unordered_set<std::string> metaclass_types_;   // classes deriving from type
+    std::vector<std::pair<VMVal,bool>> constructing_;   // see type_new
+    bool type_call_skip_=false;                         // see instantiate
+    VMVal metaclass_of(const std::string& cname) {
+        if(class_meta_.empty()) return VMVal::make_none();
+        for(auto& c:*class_mro(cname)){
+            auto it=class_meta_.find(c);
+            if(it!=class_meta_.end()&&it->second.type==VMType::CLASS) return it->second;
+        }
+        return VMVal::make_none();
+    }
+    static std::string class_key(const VMVal& c){ return c.class_name.empty()?c.s:c.class_name; }
+    bool meta_member(const VMVal& cls, const std::string& name, VMVal& m) {
+        if(class_meta_.empty()||cls.type!=VMType::CLASS) return false;
+        VMVal M=metaclass_of(class_key(cls));
+        if(M.type!=VMType::CLASS) return false;
+        std::string owner;
+        return class_lookup(class_key(M),name,m,&owner)&&nyrt::shown_class_name(owner)!="object"
+               &&(m.type==VMType::FUNCTION||m.type==VMType::NATIVE);
+    }
+    // m called with `first` as its first argument (self, cls or mcs).
+    VMVal call_with_first(const VMVal& m, const VMVal& first, std::vector<VMVal> rest, const VMVal* kw) {
+        if(m.type==VMType::FUNCTION&&m.code&&m.code->is_method&&!m.code->is_static) return call_function(m, rest, first, kw);
+        std::vector<VMVal> a;
+        a.reserve(rest.size()+1);
+        a.push_back(first);
+        for(auto& x:rest) a.push_back(x);
+        return vm_call(m, a, std::nullopt, kw);
+    }
+    bool meta_call(const VMVal& cls, const char* name, std::vector<VMVal> args, VMVal& out) {
+        VMVal m;
+        if(!meta_member(cls,name,m)) return false;
+        out=call_with_first(m, cls, std::move(args), nullptr);
+        return true;
+    }
+    VMVal class_namespace(const std::string& cname) {
+        VMVal d=VMVal::make_map();
+        auto cv=class_vars_.find(cname);
+        if(cv!=class_vars_.end()) for(auto& kv:cv->second) (*d.map)[nypy::key_of_str(kv.first)]=kv.second;
+        return d;
+    }
+    // A class statement with a metaclass: M.__new__ (whose type.__new__
+    // returns the class already made), then M.__init__.
+    VMVal run_metaclass(const VMVal& meta, const VMVal& clsv, VMCode& sub, const VMVal& kw) {
+        VMVal name=VMVal::make_str(nyrt::shown_class_name(sub.name));
+        std::vector<VMVal> bv;
+        for(auto& b:sub.bases){ VMVal c=class_value(b); if(c.type==VMType::CLASS) bv.push_back(c); }
+        VMVal bases=VMVal::make_tuple(bv);
+        VMVal ns=class_namespace(sub.name);
+        bool has_kw=kw.type==VMType::MAP&&kw.map&&!kw.map->empty();
+        VMVal made=clsv, m;
+        std::string owner;
+        if(class_lookup(class_key(meta),"__new__",m,&owner)&&nyrt::shown_class_name(owner)!="object"&&m.type==VMType::FUNCTION){
+            constructing_.push_back({clsv,false});
+            std::vector<VMVal> a{meta,name,bases,ns};
+            try{ made=vm_call(m, a, std::nullopt, has_kw?&kw:nullptr); }
+            catch(...){ constructing_.pop_back(); throw; }
+            bool ran=constructing_.back().second;
+            constructing_.pop_back();
+            if(!ran) class_created(clsv, kw);
+        } else {
+            class_meta_[sub.name]=meta;
+            class_created(clsv, kw);
+        }
+        if(made.type==VMType::CLASS&&class_lookup(class_key(meta),"__init__",m,&owner)&&nyrt::shown_class_name(owner)!="object"&&m.type==VMType::FUNCTION)
+            call_with_first(m, made, {name,bases,ns}, has_kw?&kw:nullptr);
+        return made;
+    }
+    // type.__new__(mcs, name, bases, ns, **kw): the class a class statement
+    // is building, or a new class (type(name, bases, ns), M(name, bases, ns)).
+    VMVal type_new(std::vector<VMVal>& a, const VMVal* kw) {
+        if(a.size()<4) raise_native_exception("TypeError","type.__new__() takes exactly 3 arguments ("+std::to_string(a.empty()?0:a.size()-1)+" given)");
+        VMVal kwv=kw&&kw->type==VMType::MAP?*kw:VMVal::make_map();
+        std::string name=a[1].type==VMType::STRING?a[1].s:a[1].to_string();
+        if(!constructing_.empty()&&!constructing_.back().second){
+            VMVal cls=constructing_.back().first;
+            if(nyrt::shown_class_name(class_key(cls))==name){
+                constructing_.back().second=true;
+                auto& ns=class_vars_[class_key(cls)];
+                if(a[3].type==VMType::MAP&&a[3].map) for(auto& kv:*a[3].map) ns[kv.first]=kv.second;
+                if(a[0].type==VMType::CLASS) class_meta_[class_key(cls)]=a[0];
+                mro_cache_.clear(); attr_hook_cache_[0].clear(); attr_hook_cache_[1].clear();
+                class_created(cls, kwv);
+                return cls;
+            }
+        }
+        auto code=std::make_shared<VMCode>();
+        code->name=class_reg_.count(name)?name+"#"+std::to_string(++class_generation_):name;
+        code->is_class=true;
+        for(auto& b:iter_items(a[2])){
+            std::string n;
+            if(b.type==VMType::CLASS) n=class_key(b);
+            else if(b.type==VMType::NATIVE) n=b.class_name.rfind("__builtin__:",0)==0?b.class_name.substr(12):b.class_name;
+            if(n.empty()) raise_native_exception("TypeError","bases must be types");
+            code->bases.push_back(n);
+        }
+        if(!code->bases.empty()) code->parent_class=code->bases[0];
+        class_reg_[code->name]=code;
+        mro_cache_.clear(); attr_hook_cache_[0].clear(); attr_hook_cache_[1].clear(); no_new_.clear(); has_del_cache_.clear();
+        VMMap vars;
+        if(a[3].type==VMType::MAP&&a[3].map) for(auto& kv:*a[3].map) vars[kv.first]=kv.second;
+        class_vars_[code->name]=vars;
+        if(is_exception_class(code->name)) vm_exc_classes().insert(code->name);
+        VMVal clsv=VMVal::make_class(code, code->name);
+        if(a[0].type==VMType::CLASS) class_meta_[code->name]=a[0];
+        class_created(clsv, kwv);
+        return clsv;
+    }
+    // A metaclass called: M(name, bases, ns) makes a class.
+    VMVal call_metaclass(const VMVal& M, std::vector<VMVal>& args, const VMVal* kw) {
+        VMVal m, made;
+        std::string owner;
+        std::vector<VMVal> a{M};
+        for(auto& x:args) a.push_back(x);
+        if(class_lookup(class_key(M),"__new__",m,&owner)&&nyrt::shown_class_name(owner)!="object"&&m.type==VMType::FUNCTION)
+            made=vm_call(m, a, std::nullopt, kw);
+        else made=type_new(a, kw);
+        if(made.type==VMType::CLASS&&class_lookup(class_key(M),"__init__",m,&owner)&&nyrt::shown_class_name(owner)!="object"&&m.type==VMType::FUNCTION)
+            call_with_first(m, made, args, kw);
+        return made;
+    }
     // A class's own __new__ (not object's); classes without one are
     // remembered until the next class is made.
     std::unordered_set<std::string> no_new_;
@@ -4467,8 +4638,21 @@ private:
     // What a class statement has made: the hooks of PEP 487 - __set_name__
     // of its attributes, then __init_subclass__ of the nearest base defining
     // it (an implicit classmethod) with the statement's keywords (round 77).
+    // C.__subclasses__(): each class's direct subclasses, in creation order.
+    std::unordered_map<std::string,std::vector<std::string>> subclasses_;
     void class_created(const VMVal& clsv, const VMVal& kw) {
         const std::string& cname=clsv.class_name;
+        {
+            auto rit=class_reg_.find(cname);
+            std::vector<std::string> bs;
+            if(rit!=class_reg_.end()&&rit->second) bs=rit->second->bases;
+            if(bs.empty()&&cname!="object") bs.push_back("object");
+            for(auto& b:bs){
+                auto& v=subclasses_[b];
+                if(b!=cname&&std::find(v.begin(),v.end(),cname)==v.end()) v.push_back(cname);
+            }
+        }
+        if(class_derives(cname,"type")) metaclass_types_.insert(cname);
         {
             std::vector<std::pair<std::string,VMVal>> attrs;
             auto cv=class_vars_.find(cname);
@@ -4546,6 +4730,16 @@ private:
         return nyrt::is_builtin_type_name(native_name(v));
     }
     VMVal instantiate(const VMVal& cls, std::vector<VMVal>& args, const VMVal* kwargs=nullptr) {
+        // type.__call__ (a metaclass's super().__call__) sets the flag for
+        // the one instantiation it makes, which must not run the
+        // metaclass's __call__ again; nested ones still do
+        bool skip_meta_call=type_call_skip_;
+        type_call_skip_=false;
+        if(!class_meta_.empty()||!metaclass_types_.empty()){
+            VMVal m;
+            if(!skip_meta_call&&meta_member(cls,"__call__",m)) return call_with_first(m, cls, args, kwargs);
+            if(metaclass_types_.count(cls.class_name)&&args.size()==3) return call_metaclass(cls, args, kwargs);
+        }
         // __new__(cls, *args, **kw) makes the object; __init__ runs when it
         // returned an instance of the class (round 77).
         {
@@ -4702,6 +4896,12 @@ private:
                     VMMap* se=env_find(fr.closure_env.get(), "self");
                     if(se) self_v=(*se)["self"];
                 }
+                // def __call__(cls, ...) / def __new__(mcs, ...): the first
+                // argument (round 77)
+                if(self_v.type==VMType::NONE&&!fr.code->param_names.empty()){
+                    auto fa=fr.locals.find(fr.code->param_names[0]);
+                    if(fa!=fr.locals.end()) self_v=fa->second;
+                }
                 std::string cur_cls = fr.code->owner_class.empty() ? self_v.class_name : fr.code->owner_class;
                 VMVal proxy;
                 proxy.type=VMType::SUPER_PROXY;
@@ -4742,6 +4942,7 @@ private:
                 }
                 if(obj.type==VMType::INSTANCE){bool f=false;VMVal res=call_dunder_f(obj,"__getitem__",{idx},f);if(f){push(res);break;}
                     throw_exception(make_exception("TypeError",{VMVal::make_str("'"+obj.class_name+"' object is not subscriptable")}));}
+                if(obj.type==VMType::CLASS&&!class_meta_.empty()){ VMVal r; if(meta_call(obj,"__getitem__",{idx},r)){ push(std::move(r)); break; } }
                 if(obj.type==VMType::CLASS||obj.type==VMType::NATIVE){ VMVal cg; if(class_subscript(obj,idx,cg)){ push(std::move(cg)); break; } }
                 push(get_sub(obj,idx)); break;
             }
@@ -4887,8 +5088,23 @@ private:
                 }
                 push(binop(aop,l,r)); break; }
             // Compares
-            case Op::COMPARE_EQ: { VMVal r=pop(),lv=pop(); push(VMVal::make_bool(vm_eq(lv,r))); break; }
-            case Op::COMPARE_NE: { VMVal r=pop(),lv=pop(); push(VMVal::make_bool(vm_ne(lv,r))); break; }
+            case Op::COMPARE_EQ: { VMVal r=pop(),lv=pop();
+                // an object's __eq__ result as it is (a numpy-style
+                // elementwise == stays an object); identity when declined
+                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){
+                    VMVal res;
+                    if(rich_compare(lv,r,"__eq__","__eq__",res)){ push(std::move(res)); break; }
+                    push(VMVal::make_bool(op_is(lv,r))); break;
+                }
+                push(VMVal::make_bool(vm_eq(lv,r))); break; }
+            case Op::COMPARE_NE: { VMVal r=pop(),lv=pop();
+                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){
+                    VMVal res;
+                    if(rich_compare(lv,r,"__ne__","__ne__",res)){ push(std::move(res)); break; }
+                    if(rich_compare(lv,r,"__eq__","__eq__",res)){ push(VMVal::make_bool(!vm_truthy(res))); break; }
+                    push(VMVal::make_bool(!op_is(lv,r))); break;
+                }
+                push(VMVal::make_bool(vm_ne(lv,r))); break; }
             case Op::COMPARE_SEQ: {
                 // Strict equality: same type AND same value, no int/float
                 // coercion (unlike ==) - matches the interpreter's "===".
@@ -4911,7 +5127,7 @@ private:
                 if(lv.is_set()&&r.is_set()){ push(VMVal::make_bool(lv.list->size()<r.list->size()&&set_subset(lv,r))); break; }
                 if((lv.type==VMType::BYTES)!=(r.type==VMType::BYTES)&&lv.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
                     raise_native_exception("TypeError","'<' not supported between instances of '"+vm_type_name(lv)+"' and '"+vm_type_name(r)+"'");
-                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__lt__","__gt__",res)){ push(std::move(res)); break; } }
+                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__lt__","__gt__",res)){ push(std::move(res)); break; } order_unsupported("<",lv,r); }
                 push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)<0 : lv<r)); break;
             }
             case Op::COMPARE_LE: {
@@ -4919,7 +5135,7 @@ private:
                 if(lv.is_set()&&r.is_set()){ push(VMVal::make_bool(set_subset(lv,r))); break; }
                 if((lv.type==VMType::BYTES)!=(r.type==VMType::BYTES)&&lv.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
                     raise_native_exception("TypeError","'<=' not supported between instances of '"+vm_type_name(lv)+"' and '"+vm_type_name(r)+"'");
-                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__le__","__ge__",res)){ push(std::move(res)); break; } }
+                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__le__","__ge__",res)){ push(std::move(res)); break; } order_unsupported("<=",lv,r); }
                 push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)<=0 : lv<=r)); break;
             }
             case Op::COMPARE_GT: {
@@ -4927,7 +5143,7 @@ private:
                 if(lv.is_set()&&r.is_set()){ push(VMVal::make_bool(lv.list->size()>r.list->size()&&set_subset(r,lv))); break; }
                 if((lv.type==VMType::BYTES)!=(r.type==VMType::BYTES)&&lv.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
                     raise_native_exception("TypeError","'>' not supported between instances of '"+vm_type_name(lv)+"' and '"+vm_type_name(r)+"'");
-                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__gt__","__lt__",res)){ push(std::move(res)); break; } }
+                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__gt__","__lt__",res)){ push(std::move(res)); break; } order_unsupported(">",lv,r); }
                 push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)>0 : lv>r)); break;
             }
             case Op::COMPARE_GE: {
@@ -4935,7 +5151,7 @@ private:
                 if(lv.is_set()&&r.is_set()){ push(VMVal::make_bool(set_subset(r,lv))); break; }
                 if((lv.type==VMType::BYTES)!=(r.type==VMType::BYTES)&&lv.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
                     raise_native_exception("TypeError","'>=' not supported between instances of '"+vm_type_name(lv)+"' and '"+vm_type_name(r)+"'");
-                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__ge__","__le__",res)){ push(std::move(res)); break; } }
+                if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__ge__","__le__",res)){ push(std::move(res)); break; } order_unsupported(">=",lv,r); }
                 push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)>=0 : lv>=r)); break;
             }
             case Op::COMPARE_IN:       { VMVal c=pop(),it=pop(); push(VMVal::make_bool(op_in(it,c))); break; }
@@ -5099,8 +5315,9 @@ private:
                             if(kv.first=="metaclass") class_meta_[sub->name]=kv.second;
                             else (*kw.map)[kv.first]=kv.second;
                         }
-                    class_created(clsv, kw);
-                    push(clsv);
+                    VMVal meta=metaclass_of(sub->name);
+                    if(meta.type==VMType::CLASS) push(run_metaclass(meta, clsv, *sub, kw));
+                    else { class_created(clsv, kw); push(clsv); }
                 }
                 break;
             }
@@ -5318,6 +5535,15 @@ private:
             // Iteration
             case Op::GET_ITER: {
                 VMVal it=pop();
+                if(it.type==VMType::CLASS&&!class_meta_.empty()){
+                    // a class whose metaclass defines __iter__ (round 77)
+                    VMVal r;
+                    if(meta_call(it,"__iter__",{},r)){
+                        if(r.type==VMType::LIST&&r.list){ std::vector<VMVal> c=*r.list; push(VMVal::make_iter(std::move(c))); }
+                        else push(r);
+                        break;
+                    }
+                }
                 if(it.type==VMType::GENERATOR){push(it);break;}
                 if(it.type==VMType::ITERATOR){push(it);break;}
                 if(it.type==VMType::INSTANCE){
@@ -5499,9 +5725,9 @@ private:
             case Op::IADD: {
                 VMVal r=pop(),l=pop();
                 if(l.type==VMType::INSTANCE){
-                    VMVal res=call_dunder(l,"__iadd__",{r});
+                    VMVal res=ni_none(call_dunder(l,"__iadd__",{r}));
                     if(res.type!=VMType::NONE){push(res);break;}
-                    res=call_dunder(l,"__add__",{r});
+                    res=ni_none(call_dunder(l,"__add__",{r}));
                     if(res.type!=VMType::NONE){push(res);break;}
                 }
                 // 10 += obj: the right operand's __radd__, as for 10 + obj
@@ -5513,11 +5739,11 @@ private:
                 push(binop_inplace(nypy::A_ADD,l,r)); break;
             }
             case Op::ISUB: { VMVal r=pop(),l=pop();
-                if(l.type==VMType::INSTANCE){ VMVal res=call_dunder(l,"__isub__",{r}); if(res.type==VMType::NONE) res=call_dunder(l,"__sub__",{r}); if(res.type!=VMType::NONE){push(res);break;} }
+                if(l.type==VMType::INSTANCE){ VMVal res=ni_none(call_dunder(l,"__isub__",{r})); if(res.type==VMType::NONE) res=ni_none(call_dunder(l,"__sub__",{r})); if(res.type!=VMType::NONE){push(res);break;} }
                 if(r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(l,r,"__sub__","__rsub__",res)){push(res);break;} }
                 push(binop(nypy::A_SUB,l,r)); break; }
             case Op::IMUL: { VMVal r=pop(),l=pop();
-                if(l.type==VMType::INSTANCE){ VMVal res=call_dunder(l,"__imul__",{r}); if(res.type==VMType::NONE) res=call_dunder(l,"__mul__",{r}); if(res.type!=VMType::NONE){push(res);break;} }
+                if(l.type==VMType::INSTANCE){ VMVal res=ni_none(call_dunder(l,"__imul__",{r})); if(res.type==VMType::NONE) res=ni_none(call_dunder(l,"__mul__",{r})); if(res.type!=VMType::NONE){push(res);break;} }
                 if(r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(l,r,"__mul__","__rmul__",res)){push(res);break;} }
                 push(binop_inplace(nypy::A_MUL,l,r)); break; }
             case Op::IDIV: { VMVal r=pop(),l=pop(); push(binop(nypy::A_DIV,l,r)); break; }
@@ -6090,6 +6316,10 @@ private:
     // characters, a dict's keys, what is left of an iterator or a
     // generator (consuming it), an instance's __iter__/__next__ sequence.
     std::vector<VMVal> iter_items(const VMVal& v) {
+        if(v.type==VMType::CLASS&&!class_meta_.empty()){
+            VMVal r;
+            if(meta_call(v,"__iter__",{},r)) return iter_items(r);
+        }
         switch(v.type){
             case VMType::LIST: return v.list?*v.list:std::vector<VMVal>{};
             case VMType::STRING: {
@@ -6331,6 +6561,12 @@ private:
     }
 
     bool op_in(const VMVal& item, const VMVal& cont) {
+        if(cont.type==VMType::CLASS&&!class_meta_.empty()){
+            VMVal r;
+            if(meta_call(cont,"__contains__",{item},r)) return vm_truthy(r);
+            for(auto& v:iter_items(cont)) if(vm_eq(v,item)) return true;
+            return false;
+        }
         if(cont.type==VMType::INSTANCE){
             bool f=false;
             VMVal res=call_dunder_f(cont,"__contains__",{item},f);
@@ -6566,8 +6802,15 @@ private:
                 return true;
             }
             if(attr=="__mro__"){
+                // builtin bases as their builtin values; object last (round 77)
                 std::vector<VMVal> r;
-                for(auto& c:*class_mro(cname)){ VMVal cv=class_value(c); if(cv.type!=VMType::NONE) r.push_back(cv); }
+                for(auto& c:*class_mro(cname)){
+                    if(c=="object") continue;
+                    VMVal cv=class_value(c);
+                    if(cv.type==VMType::NONE&&nyrt::is_builtin_type_name(c)) cv=load_var(c);
+                    if(cv.type!=VMType::NONE) r.push_back(cv);
+                }
+                if(cname!="object"){ VMVal o=class_value("object"); if(o.type!=VMType::NONE) r.push_back(o); }
                 out=VMVal::make_tuple(std::move(r)); return true;
             }
             // C.__dict__: the class's own namespace (a copy; a mappingproxy is read-only)
@@ -6580,8 +6823,34 @@ private:
             if(attr=="__bases__"){
                 std::vector<VMVal> r;
                 auto rit=class_reg_.find(cname);
-                if(rit!=class_reg_.end()&&rit->second) for(auto& b:rit->second->bases){ VMVal cv=class_value(b); if(cv.type!=VMType::NONE) r.push_back(cv); }
+                if(rit!=class_reg_.end()&&rit->second) for(auto& b:rit->second->bases){
+                    VMVal cv=class_value(b);
+                    if(cv.type==VMType::NONE&&nyrt::is_builtin_type_name(b)) cv=load_var(b);
+                    if(cv.type!=VMType::NONE) r.push_back(cv);
+                }
+                if(r.empty()&&cname!="object"){ VMVal o=class_value("object"); if(o.type!=VMType::NONE) r.push_back(o); }
                 out=VMVal::make_tuple(std::move(r)); return true;
+            }
+            // the metaclass's members: methods bound to the class, its
+            // properties read with the class, its attributes, __getattr__
+            if(!class_meta_.empty()&&attr!="__init__"&&attr!="__new__"){
+                VMVal M=metaclass_of(cname);
+                if(M.type==VMType::CLASS){
+                    VMVal m; std::string owner;
+                    if(class_lookup(class_key(M),attr,m,&owner)&&nyrt::shown_class_name(owner)!="object"){
+                        if(is_property_desc(m)){ out=property_get(m, obj); return true; }
+                        if(m.type==VMType::FUNCTION&&m.code&&!m.code->is_static){
+                            std::vector<VMVal> a{m, obj};
+                            out=vm_call(load_var("_NyMetaBound"), a, std::nullopt, nullptr);
+                            return true;
+                        }
+                        out=m; return true;
+                    }
+                    if(attr.rfind("__",0)!=0){
+                        VMVal r;
+                        if(meta_call(obj,"__getattr__",{VMVal::make_str(attr)},r)){ out=r; return true; }
+                    }
+                }
             }
             return false;
         }
@@ -7088,7 +7357,7 @@ private:
             // Class.method taken as a value and called with the instance
             // first: f = Animal.speak; f(dog).
             if(!self && callee.code->is_method && !callee.code->is_static && !args.empty()
-               && args[0].type==VMType::INSTANCE){
+               && (args[0].type==VMType::INSTANCE||args[0].type==VMType::CLASS)){
                 VMVal self_val = args[0];
                 std::vector<VMVal> rest(args.begin()+1, args.end());
                 return call_function(callee, rest, self_val, kwargs);
@@ -7202,6 +7471,17 @@ private:
             VMVal self_v=(!obj.list||obj.list->empty())?VMVal::make_none():(*obj.list)[0];
             std::string mro_of = self_v.type==VMType::INSTANCE ? self_v.class_name : owner;
             VMVal m; std::string where;
+            // past a metaclass's own bases is type: type.__new__ / __call__
+            // / __init__ (round 77)
+            if((method=="__new__"||method=="__call__"||method=="__init__")&&class_derives(owner,"type")){
+                bool own=class_lookup(mro_of, method, m, &where, &owner)&&nyrt::shown_class_name(where)!="object";
+                if(!own){
+                    if(method=="__init__") return VMVal::make_none();
+                    if(method=="__new__") return type_new(args, kwargs);
+                    type_call_skip_=true;
+                    return instantiate(self_v, args, kwargs);
+                }
+            }
             if(class_lookup(mro_of, method, m, &where, &owner))
                 return invoke_method(m, self_v, args, mro_of, kwargs);
             // The constructor goes by either name (init / __init__).
@@ -7340,6 +7620,17 @@ private:
                 if(class_derives(args[0].class_name,"SystemExit")) (*args[0].map)["code"]=rest.empty()?VMVal::make_none():rest.size()==1?rest[0]:VMVal::make_tuple(rest);
                 (*args[0].map)["msg"]=VMVal::make_str(rest.size()==1?rest[0].to_string():std::string());
                 return VMVal::make_none();
+            }
+            // a method of the class's metaclass, or anything else the
+            // metaclass gives the class (round 77)
+            if(!class_meta_.empty()&&!is_ctor_name(method)){
+                VMVal mm;
+                if(meta_member(obj, method, mm)){
+                    if(mm.type==VMType::FUNCTION&&mm.code&&mm.code->is_static) return call_function(mm, args, std::nullopt, kwargs);
+                    return call_with_first(mm, obj, args, kwargs);
+                }
+                VMVal target;
+                if(lookup_attr(obj, method, target)) return vm_call(target, args, std::nullopt, kwargs);
             }
             if(!is_ctor_name(method) && class_reg_.count(obj.class_name))
                 throw_exception(make_exception("AttributeError",{VMVal::make_str(
@@ -8518,6 +8809,13 @@ private:
             if(vm_exc_classes().count(cls.class_name)){ (*attrs)["args"]=VMVal::make_tuple({}); (*attrs)["msg"]=VMVal::make_str(""); }
             return inst;
         });
+        globals_["_ny_subclasses"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            std::vector<VMVal> r;
+            if(!a.empty()&&a[0].type==VMType::CLASS){
+                auto it=subclasses_.find(class_key(a[0]));
+                if(it!=subclasses_.end()) for(auto& n:it->second){ VMVal cv=class_value(n); if(cv.type==VMType::CLASS) r.push_back(cv); }
+            }
+            return VMVal::make_list(std::move(r)); });
         globals_["_ny_setattr_raw"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()>=3){ RawAttr raw; VMVal o=a[0]; set_attr(o,a[1].to_string(),a[2]); }
             return VMVal::make_none(); });
@@ -9272,6 +9570,8 @@ private:
                 case VMType::LIST: return VMVal::make_int(v.list?(int64_t)v.list->size():0);
                 case VMType::MAP: { int64_t n=0; if(v.map) for(auto& kv:*v.map) if(!vm_internal_key(kv.first)) n++; return VMVal::make_int(n); }
                 case VMType::INSTANCE: { VMVal r=vm->call_dunder(v,"__len__",{}); if(r.type!=VMType::NONE) return r; break; }
+                // a class whose metaclass defines __len__ (round 77)
+                case VMType::CLASS: { VMVal r; if(!vm->class_meta_.empty()&&vm->meta_call(v,"__len__",{},r)) return r; break; }
                 case VMType::ITERATOR: return VMVal::make_int(v.iter?(int64_t)v.iter->second.size()-v.iter->first:0);
                 case VMType::NONE: case VMType::UNDEFINED: return VMVal::make_int(0);   // as the interpreter
                 default: break;
@@ -9622,8 +9922,12 @@ private:
         def("bool",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
             return VMVal::make_bool(!a.empty()&&vm->truthy(a[0]));
         });
-        def("type",[](std::vector<VMVal>& a,const VMVal&)->VMVal{
+        def("type",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            // type(name, bases, ns): a new class (round 77)
+            if(a.size()==3){ std::vector<VMVal> t{VMVal::make_none(),a[0],a[1],a[2]}; return vm->type_new(t,nullptr); }
             if(a.empty())return VMVal::make_str("none");
+            // a class with a metaclass: the metaclass
+            if(a[0].type==VMType::CLASS){ VMVal meta=vm->metaclass_of(class_key(a[0])); if(meta.type==VMType::CLASS) return meta; }
             switch(a[0].type){
             case VMType::NONE:return VMVal::make_str("none");
             case VMType::BOOL:return VMVal::make_str("bool");
@@ -9744,16 +10048,8 @@ private:
             return a.empty()?VMVal::make_float(0.0):VMVal::make_float(to_d(a[0]));});
         globals_["bool"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             return VMVal::make_bool(!a.empty()&&vm_truthy(a[0]));});
-        globals_["len"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_int(0);
-            auto& v=a[0];
-            if(v.type==VMType::INSTANCE){bool f=false;VMVal res=call_dunder_f(v,"__len__",{},f);if(f)return res;
-                throw_exception(make_exception("TypeError",{VMVal::make_str("object of type '"+v.class_name+"' has no len()")}));}
-            if(v.type==VMType::STRING)return VMVal::make_int((int64_t)u8_chars(v.s));
-            if(v.type==VMType::LIST&&v.list)return VMVal::make_int((int64_t)v.list->size());
-            if(v.type==VMType::MAP&&v.map)return VMVal::make_int((int64_t)v.map->size());
-            return VMVal::make_int(0);
-        });
+        // len and type: register_pycore (it runs after this and replaced
+        // the copies that were here)
         globals_["range"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             int64_t st=0,en=0,step=1;
             if(a.size()==1)en=a[0].i;
@@ -9764,21 +10060,6 @@ private:
             if(step>0)for(int64_t i=st;i<en;i+=step)items.push_back(VMVal::make_int(i));
             else for(int64_t i=st;i>en;i+=step)items.push_back(VMVal::make_int(i));
             return VMVal::make_list(std::move(items));});
-        globals_["type"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(a.empty())return VMVal::make_str("none");
-            switch(a[0].type){
-            case VMType::NONE:return VMVal::make_str("none");
-            case VMType::BOOL:return VMVal::make_str("bool");
-            case VMType::INT:return VMVal::make_str("int");
-            case VMType::FLOAT:return VMVal::make_str("float");
-            case VMType::STRING:return VMVal::make_str("string");  // as the interpreter reports it
-            case VMType::LIST:return VMVal::make_str("list");
-            case VMType::MAP:return VMVal::make_str("map");   // as the interpreter reports it
-            case VMType::FUNCTION:return VMVal::make_str("function");
-            case VMType::CLASS:return VMVal::make_str("class");
-            case VMType::INSTANCE:return VMVal::make_str(nyrt::shown_class_name(a[0].class_name));
-            case VMType::UNDEFINED:return VMVal::make_str("undefined");
-            default:return VMVal::make_str("unknown");}});
         globals_["abs"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             if(a.empty())return VMVal::make_int(0);
             if(a[0].type==VMType::INT)return VMVal::make_int(std::abs(a[0].i));
@@ -9953,6 +10234,17 @@ private:
                 return VMVal::make_bool(false);
             }
             VMVal& obj=a[0]; VMVal& cls=a[1];
+            // a metaclass's __instancecheck__; isinstance(C, type) / (C, M)
+            if(cls.type==VMType::CLASS){
+                VMVal r;
+                if(!class_meta_.empty()&&meta_call(cls,"__instancecheck__",{obj},r)) return VMVal::make_bool(vm_truthy(r));
+                if(obj.type==VMType::CLASS){
+                    VMVal meta=metaclass_of(class_key(obj));
+                    return VMVal::make_bool(meta.type==VMType::CLASS&&class_derives(class_key(meta),class_key(cls)));
+                }
+            }
+            if(obj.type==VMType::CLASS&&cls.type==VMType::NATIVE&&native_name(cls)=="type")
+                return VMVal::make_bool(true);
             std::string cls_name;
             if(cls.type==VMType::CLASS) cls_name=cls.class_name;
             else if(cls.type==VMType::STRING) cls_name=cls.s;
@@ -9986,6 +10278,10 @@ private:
         });
         // issubclass(B, A): B's MRO contains A (a tuple of classes: any).
         globals_["issubclass"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.size()>=2&&a[1].type==VMType::CLASS&&!class_meta_.empty()){
+                VMVal r;
+                if(meta_call(a[1],"__subclasscheck__",{a[0]},r)) return VMVal::make_bool(vm_truthy(r));
+            }
             // a builtin type (int, bool ...) is a tagged native
             auto builtin_name=[](const VMVal& v)->std::string{
                 if(v.type!=VMType::NATIVE) return std::string();

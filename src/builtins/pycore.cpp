@@ -122,6 +122,11 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
     case B_LEN: {
         need(1, "len()");
         const Value& v = args[0];
+        // a class whose metaclass defines __len__ (round 77)
+        if (!E.class_meta_.empty() && E.classNodeOfValue(v)) {
+            Value r;
+            if (E.metaCall(v, "__len__", {}, ctx, r)) return r;
+        }
         if (auto* bo = E.bytesOf(v)) return intValue((int64_t)bo->s.size());
         if (E.isStringValue(v)) return intValue((int64_t)nypy::u8_len(*(std::string*)v.value.p));
         // A generator has no length (it is lazy), as in Python.
@@ -544,6 +549,12 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         return Value((Collectable*)obj);
     }
     case B_TYPE: {
+        // type(name, bases, ns): a new class (round 77)
+        if (args.size() == 3) {
+            std::vector<Value> a{NONE_VALUE, args[0], args[1], args[2]};
+            static const nyrt::OrderedKw<Value> no_kw;
+            return E.typeNew(a, no_kw, ctx);
+        }
         need(1, "type()");
         const Value& v = args[0];
         switch (v.type) {
@@ -571,7 +582,12 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             if (fit != E.func_names.end()) {
                 if (fit->second.find("__func__:") == 0 || fit->second.find("__lambda__") == 0) return str_("function");
                 if (fit->second.find("__builtin__:") == 0 || fit->second.find("__bmethod__:") == 0) return str_("builtin");
-                if (fit->second.find("__class__:") == 0) return str_("class");
+                if (fit->second.find("__class__:") == 0) {
+                    // a class with a metaclass: the metaclass (round 77)
+                    Value meta = E.metaclassOf(E.classNodeOfValue(v));
+                    if (meta.type != ValueType::NONE) return meta;
+                    return str_("class");
+                }
                 if (fit->second.find("__instance__:") == 0) return str_(NythonExecutor::shownClassName(fit->second.substr(13)));
             }
             return str_("string");

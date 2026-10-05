@@ -382,6 +382,23 @@ Value dispatch_tensor(NythonExecutor& E,
                 }
                 return Value(false);
             }
+            // a metaclass's __instancecheck__; isinstance(C, type) / (C, M)
+            if (args.size() >= 2 && E.classNodeOfValue(args[1])) {
+                if (!E.class_meta_.empty()) {
+                    Value r;
+                    if (E.metaCall(args[1], "__instancecheck__", {args[0]}, ctx, r)) return Value(E.isTruthy(r));
+                }
+                if (nython::node::Node* xc = E.classNodeOfValue(args[0])) {
+                    Value meta = E.metaclassOf(xc);
+                    std::string want = static_cast<nython::node::ClassNode*>(E.classNodeOfValue(args[1]))->name;
+                    if (meta.type != ValueType::NONE)
+                        return Value(E.classDerivesFrom(static_cast<nython::node::ClassNode*>(E.classNodeOfValue(meta))->name, want));
+                    return Value(false);
+                }
+            }
+            if (args.size() >= 2 && E.classNodeOfValue(args[0]) && args[1].type == ValueType::USERDATA
+                && E.fnTag(E.func_names, args[1].value.p) == "__builtin__:type")
+                return Value(true);
             // isinstance(x, (A, B)): any of them.
             if (args.size() >= 2 && args[1].isCollectable() && args[1].value.gc) {
                 auto* tc = dynamic_cast<Container*>(args[1].value.gc);

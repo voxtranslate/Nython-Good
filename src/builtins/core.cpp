@@ -566,6 +566,7 @@ Value dispatch_core(NythonExecutor& E,
             if (E.isExceptionClass(cname)) { std::vector<Value> none; E.setExceptionArgs(inst, none); }
             return inst;
         }
+        if (name == "_ny_subclasses") return E.subclassesOf(args.empty() ? NONE_VALUE : args[0]);
         if (name == "_ny_setattr_raw" && args.size() >= 3) {
             NythonExecutor::RawAttr raw;
             E.setAttr(args[0], E.getStringValue(args[1]), args[2]);

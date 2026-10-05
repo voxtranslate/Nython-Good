@@ -263,6 +263,17 @@ class ellipsis:
         return "Ellipsis"
 Ellipsis = ellipsis()
 
+class _NyMetaBound:
+    # A metaclass method read through a class (Color.from_name): the class is
+    # its first argument (round 77).
+    def __init__(self, fn, cls):
+        self.__func__ = fn
+        self.__self__ = cls
+    def __call__(self, *args, **kw):
+        return self.__func__(self.__self__, *args, **kw)
+    def __repr__(self):
+        return "<bound method " + getattr(self.__func__, "__name__", "?") + " of " + repr(self.__self__) + ">"
+
 def _ny_ann(thunk, text):
     # An annotation's value for __annotations__ (round 77): evaluated when
     # its statement runs, as Python does; one that cannot be evaluated yet - a
@@ -428,7 +439,24 @@ class _NyCode:
     def __repr__(self):
         return "<code object <module>, file \"" + self.co_filename + "\", line 1>"
 
+class _NyNotImplementedType:
+    # What a binary or comparison dunder returns for an operand it does not
+    # handle: the other operand's reflected method is tried next, then
+    # TypeError (== falls back to identity) - round 77.
+    def __repr__(self):
+        return "NotImplemented"
+    def __reduce__(self):
+        return "NotImplemented"
+NotImplemented = _NyNotImplementedType()
+
 class object:
+    @classmethod
+    def __subclasses__(cls):
+        # the classes naming cls as a base, in the order they were made
+        return _ny_subclasses(cls)
+    @classmethod
+    def mro(cls):
+        return list(cls.__mro__)
     def __new__(cls, *args, **kw):
         # object.__new__(cls) / super().__new__(cls): a bare instance
         # (round 77; a class's own __new__ runs before __init__)

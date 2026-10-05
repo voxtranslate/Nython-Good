@@ -537,7 +537,7 @@ public:   // NythonExecutor is a struct: members default to public
             "isinstance","issubclass","id","hash","hex","oct","bin",
             "chr","ord","repr","format","open","exit","quit",
             "pow","divmod","input","dict","display","show","is_int","is_float","is_string","is_list","is_none","is_bool","to_int","to_float","to_str","clamp","lerp","map_range","repeat_str","repeat","flatten","flat","shell","system","ls","cat","pwd","mkdir","write","exists","env","all","any","complex","slice","super","property",
-            "staticmethod","classmethod","callable","dir","vars","globals","locals","eval","exec","compile","_ny_setattr_raw","_ny_delattr_raw","_ny_object_new",
+            "staticmethod","classmethod","callable","dir","vars","globals","locals","eval","exec","compile","_ny_setattr_raw","_ny_delattr_raw","_ny_object_new","_ny_subclasses","_ny_type_new","_ny_type_call",
             "_ny_main_globals","_ny_exc_current",
             "iter","next","help","Set","Counter","OrderedDict","deque","defaultdict","assert",
             "islice","take",   // lazy iteration (src/NyGen.cpp), both engines
@@ -1608,6 +1608,13 @@ public:   // NythonExecutor is a struct: members default to public
     bool containsValue(const Value& c, const Value& x, Context* ctx) {
         // A generator: consumed up to the first match.
         if (nygen::Gen* g = nygen::gen_of(c)) return nygen::contains(*this, g, x, ctx);
+        // A class whose metaclass defines __contains__ / __iter__ (round 77)
+        if (!class_meta_.empty() && classNodeOfValue(c)) {
+            Value r;
+            if (metaCall(c, "__contains__", {x}, ctx, r)) return isTruthy(r);
+            for (auto& v : iterItems(c, ctx)) if (valuesEqual(v, x, 0)) return true;
+            return false;
+        }
         // An object: __contains__, else a search of what it iterates over
         // (__iter__ / __getitem__), stopping at the first match, as in Python.
         if (isInstanceVal(c)) {
@@ -2138,7 +2145,7 @@ public:   // NythonExecutor is a struct: members default to public
                 if (it != idunder.end() && instanceHasMethod(old_val, it->second)) {
                     std::vector<Value> a = {new_val};
                     Value r = callMethod(old_val, it->second, a, ctx);
-                    if (r.type != ValueType::NONE) { result = r; done = true; }
+                    if (r.type != ValueType::NONE && !isNotImplemented(r)) { result = r; done = true; }
                 }
             }
             if (!done) {
@@ -2872,6 +2879,8 @@ public:   // NythonExecutor is a struct: members default to public
         }
         {
             Value cg;
+            // a metaclass's __getitem__ comes before __class_getitem__
+            if (!class_meta_.empty() && metaCall(obj, "__getitem__", {idx}, ctx, cg)) return cg;
             if (classSubscript(obj, idx, ctx, cg)) return cg;
         }
         // none[k], 5[0], f[0]: TypeError (they read none).
@@ -3009,6 +3018,11 @@ public:   // NythonExecutor is a struct: members default to public
         }
         // An object: __iter__ / __next__ / a __getitem__ sequence (iterValues).
         if (isInstanceVal(v)) return iterValues(v, ctx);
+        // A class whose metaclass defines __iter__ (round 77)
+        if (!class_meta_.empty()) {
+            Value it;
+            if (metaCall(v, "__iter__", {}, ctx, it)) return iterItems(it, ctx);
+        }
         pyRaise("TypeError", "'" + typeNameOf(v) + "' object is not iterable");
     }
     // Python's type name for messages.
@@ -3063,6 +3077,11 @@ public:   // NythonExecutor is a struct: members default to public
             if (string_ptrs_.count(v.value.p)) {
                 const std::string& s = *(std::string*)v.value.p;
                 return repr ? nypy::str_repr(s) : s;
+            }
+            if (!class_meta_.empty() && classNodeOfValue(v)) {
+                Value r;
+                Context* c = ctx ? ctx : global_ctx;
+                if ((!repr && metaCall(v, "__str__", {}, c, r)) || metaCall(v, "__repr__", {}, c, r)) return getStringValue(r);
             }
             if (instance_to_class.count(v.value.p)) {
                 std::vector<Value> no_args;
@@ -3423,18 +3442,52 @@ public:   // NythonExecutor is a struct: members default to public
         const char* d; const char* rd;
         if (!opDunders(op, d, rd)) return false;
         bool li = isInstanceValue(lv), ri = isInstanceValue(rv);
+        // A method returning NotImplemented declines: the other operand's
+        // is tried next, then the caller's fallback (round 77).
+        bool declined = false;
         auto call = [&](const Value& self, const char* name, const Value& arg) {
             std::vector<Value> a{arg};
             out = callMethod(self, name, a, ctx);
+            if (!isNotImplemented(out)) return true;
+            declined = true;
+            return false;
         };
-        if (li && instanceHasMethod(lv, d)) { call(lv, d, rv); return true; }
-        if (op == "/" && li && instanceHasMethod(lv, "__div__")) { call(lv, "__div__", rv); return true; }
-        if (ri && instanceHasMethod(rv, rd)) { call(rv, rd, lv); return true; }
+        // The right operand's reflected method comes first when its class
+        // is a subclass of the left's that provides its own (Python's rule:
+        // a subclass can take an operation over from its base).
+        bool r_first = li && ri && rightOverrides(lv, rv, rd);
+        if (r_first && call(rv, rd, lv)) return true;
+        if (li && instanceHasMethod(lv, d) && call(lv, d, rv)) return true;
+        if (op == "/" && li && instanceHasMethod(lv, "__div__") && call(lv, "__div__", rv)) return true;
+        if (!r_first && ri && instanceHasMethod(rv, rd) && call(rv, rd, lv)) return true;
         if (op == "!=") {
             Value eq;
             if (binaryDunder("==", lv, rv, ctx, eq)) { out = Value(!isTruthy(eq)); return true; }
         }
+        // Every method declined an arithmetic operator: TypeError, as Python
+        // (a str operand would otherwise be concatenated leniently).
+        if (declined && op != "==" && op != "!=" && op != "<" && op != ">" && op != "<=" && op != ">=")
+            unsupportedOperands(binOpCode(op), lv, rv);
         return false;
+    }
+    // The prelude's NotImplemented singleton.
+    Node* ni_class_ = nullptr;
+    bool isNotImplemented(const Value& v) {
+        if (!isInstanceValue(v)) return false;
+        if (!ni_class_) ni_class_ = classNodeByName("_NyNotImplementedType");
+        return ni_class_ && classNodeOfInstance(v) == ni_class_;
+    }
+    // rv's class is a subclass of lv's and defines `rd` below lv's class.
+    bool rightOverrides(const Value& lv, const Value& rv, const char* rd) {
+        Node* lc = classNodeOfInstance(lv);
+        Node* rc = classNodeOfInstance(rv);
+        if (!lc || !rc || lc == rc) return false;
+        const auto& rm = classMro(rc);
+        if (std::find(rm.begin(), rm.end(), lc) == rm.end()) return false;
+        Value m; Node* where = nullptr;
+        if (!findClassMember(rc, rd, m, &where) || !where) return false;
+        const auto& lm = classMro(lc);
+        return std::find(lm.begin(), lm.end(), where) == lm.end();
     }
     // ==, through __eq__ when either side defines it.
     bool pyEquals(const Value& a, const Value& b, Context* ctx) {
@@ -4997,6 +5050,18 @@ public:   // NythonExecutor is a struct: members default to public
                 }
             }
         }
+        // A method of a class's metaclass, called through the class
+        // (Color.from_name(...)), or anything else the metaclass gives the
+        // class (round 77).
+        if (!class_meta_.empty() && classNodeOfValue(obj)) {
+            Value m; Node* where = nullptr;
+            if (metaMember(obj, method_name, m, where)) {
+                if (fnTag(func_names, m.value.p).find("__static__") != std::string::npos) return callFunctionValue(m, args, ctx);
+                return callMeta(m, where, obj, args, kw_args_in, ctx);
+            }
+            Value target;
+            if (getAttrValue(obj, method_name, ctx, target)) return callFunctionValue(target, args, ctx);
+        }
         // Any other value without such a method raises too: `none.m()` and
         // `"s".nosuch()` returned none (round 75). `x?.m()` is the graceful
         // spelling.
@@ -5147,15 +5212,233 @@ public:   // NythonExecutor is a struct: members default to public
             setClassContext((void*)node.get(), class_ctx);
         }
         // (__set_name__ runs in classCreated, before __init_subclass__)
+        // A metaclass (the statement's metaclass=, or a base's): its __new__
+        // and __init__ run on the class just made; what __new__ returns is
+        // what the statement binds (round 77).
+        Value meta = metaclassOf(node.get());
+        if (meta.type != ValueType::NONE) {
+            Value made = runMetaclass(meta, class_val, node.get(), cn.get(), class_kw, ctx);
+            if (!(made.type == class_val.type && made.value.p == class_val.value.p))
+                ctx->defineByName(cn->bind_name.empty() ? cn->name : cn->bind_name, made);
+            return made;
+        }
         classCreated(class_val, node.get(), class_kw, ctx);
         return class_val;
+    }
+    // ── metaclasses (round 77) ──────────────────────────────────────────
+    // A class's metaclass: its statement's metaclass=, else the nearest
+    // base's in MRO order; none for a plain class (its metaclass is type).
+    Value metaclassOf(Node* cn) {
+        if (class_meta_.empty() || !cn) return NONE_VALUE;
+        for (Node* c : classMro(cn)) {
+            auto it = class_meta_.find((void*)c);
+            if (it != class_meta_.end() && classNodeOfValue(it->second)) return it->second;
+        }
+        return NONE_VALUE;
+    }
+    // A member of cls's metaclass (cls a class with a metaclass).
+    bool metaMember(const Value& cls, const std::string& name, Value& m, Node*& where) {
+        if (class_meta_.empty()) return false;
+        Node* cn = classNodeOfValue(cls);
+        if (!cn) return false;
+        Node* mn = classNodeOfValue(metaclassOf(cn));
+        if (!mn) return false;
+        return findClassMember(mn, name, m, &where) && m.type == ValueType::USERDATA && m.value.p && func_names.count(m.value.p);
+    }
+    // Calls the metaclass member found by metaMember with the class first.
+    Value callMeta(const Value& m, Node* where, const Value& cls, const std::vector<Value>& args,
+                   const nyrt::OrderedKw<Value>& kw, Context* ctx) {
+        std::vector<Value> a;
+        a.reserve(args.size() + 1);
+        a.push_back(cls);
+        for (auto& x : args) a.push_back(x);
+        return invokeMember(m, where, cls, a, kw, ctx);
+    }
+    bool metaCall(const Value& cls, const char* name, const std::vector<Value>& args, Context* ctx, Value& out) {
+        Value m; Node* where = nullptr;
+        if (!metaMember(cls, name, m, where)) return false;
+        static const nyrt::OrderedKw<Value> no_kw;
+        out = callMeta(m, where, cls, args, no_kw, ctx);
+        return true;
+    }
+    Value classValueOfNode(Node* n) { Value v; v.type = ValueType::USERDATA; v.value.p = (void*)n; return v; }
+    // The class namespace as the dict a metaclass gets.
+    Value classNamespace(Node* cnode) {
+        auto* d = new Object((Runnable*)runner, "map", Type::MAP);
+        auto cit = class_ctx_map_.find((void*)cnode);
+        if (cit != class_ctx_map_.end() && cit->second && cit->second->container)
+            for (auto& kv : *cit->second->container)
+                if (!kv.first.empty() && (unsigned char)kv.first[0] >= 0x20 && kv.first != "__parent_class__")
+                    d->set(kv.first, kv.second);
+        return Value((Collectable*)d);
+    }
+    // The classes a class statement is building, for type.__new__ called by
+    // a metaclass's __new__ (it returns the class already made); `second`:
+    // type.__new__ has run for it.
+    std::vector<std::pair<Value, bool>> constructing_;
+    Value runMetaclass(const Value& meta, const Value& cls, Node* cnode, ClassNode* cn,
+                       const nyrt::OrderedKw<Value>& kw, Context* ctx) {
+        Node* mn = classNodeOfValue(meta);
+        Node* objn = classNodeByName("object");
+        Value name = makeStringValue(shownClassName(cn->name));
+        std::vector<Value> bvals;
+        for (auto& b : cn->bases) if (Node* bn = classNodeByName(b->value())) bvals.push_back(classValueOfNode(bn));
+        Value bases = makeListValue(bvals, true);
+        Value ns = classNamespace(cnode);
+        Value made = cls;
+        Value m; Node* where = nullptr;
+        if (findClassMember(mn, "__new__", m, &where) && where != objn && func_names.count(m.value.p)) {
+            constructing_.push_back({cls, false});
+            std::vector<Value> a{meta, name, bases, ns};
+            try { made = invokeMember(m, where, meta, a, kw, ctx); }
+            catch (...) { constructing_.pop_back(); throw; }
+            bool ran = constructing_.back().second;
+            constructing_.pop_back();
+            if (!ran) classCreated(cls, cnode, kw, ctx);
+        } else {
+            class_meta_[cnode] = meta;
+            classCreated(cls, cnode, kw, ctx);
+        }
+        if (classNodeOfValue(made) && findClassMember(mn, "__init__", m, &where) && where != objn && func_names.count(m.value.p)) {
+            std::vector<Value> a{made, name, bases, ns};
+            invokeMember(m, where, made, a, kw, ctx);
+        }
+        return made;
+    }
+    // type.__new__(mcs, name, bases, ns, **kw): the class a class statement
+    // is building (its namespace updated from ns, its metaclass mcs, then
+    // __set_name__ / __init_subclass__), or a new class made from the
+    // arguments - type(name, bases, ns) and a metaclass called directly.
+    Value typeNew(std::vector<Value>& args, const nyrt::OrderedKw<Value>& kw, Context* ctx) {
+        if (args.size() < 4) pyRaise("TypeError", "type.__new__() takes exactly 3 arguments (" + std::to_string(args.size() ? args.size() - 1 : 0) + " given)");
+        Value mcs = args[0];
+        std::string name = getStringValue(args[1]);
+        if (!constructing_.empty() && !constructing_.back().second) {
+            Value cls = constructing_.back().first;
+            Node* cnode = classNodeOfValue(cls);
+            if (cnode && shownClassName(static_cast<ClassNode*>(cnode)->name) == name) {
+                constructing_.back().second = true;
+                auto cit = class_ctx_map_.find((void*)cnode);
+                if (Container* nc = contOf(args[3]); nc && cit != class_ctx_map_.end() && cit->second) {
+                    for (auto& k : dictKeys(nc)) {
+                        if (!isStringValue(k)) continue;
+                        auto it = dictFind(nc, k);
+                        if (it != nc->container->end()) cit->second->defineByName(getStringValue(k), it->second);
+                    }
+                }
+                if (classNodeOfValue(mcs)) class_meta_[(void*)cnode] = mcs;
+                mro_cache_.clear();
+                attr_hook_cache_[0].clear();
+                attr_hook_cache_[1].clear();
+                classCreated(cls, cnode, kw, ctx);
+                return cls;
+            }
+        }
+        return makeDynamicClass(mcs, name, args[2], args[3], kw, ctx);
+    }
+    // A class made by a call (type(name, bases, ns), M(name, bases, ns)):
+    // a class node without a body, its namespace the dict's items.
+    std::vector<node_ptr> dynamic_classes_;
+    Value makeDynamicClass(const Value& mcs, const std::string& name, const Value& bases, const Value& ns,
+                           const nyrt::OrderedKw<Value>& kw, Context* ctx) {
+        Token t;
+        t.value = name;
+        std::string full = name;
+        if (class_by_name.count(full)) full = name + "#" + std::to_string(++class_generation_);
+        auto node = std::make_shared<ClassNode>(t, full, std::make_shared<BlockNode>(t));
+        node->bind_name = name;
+        for (auto& b : listItems(bases)) {
+            std::string bn;
+            if (Node* bcn = classNodeOfValue(b)) bn = static_cast<ClassNode*>(bcn)->name;
+            else {
+                std::string tag = fnTag(func_names, b.value.p);
+                if (b.type == ValueType::USERDATA && tag.rfind("__builtin__:", 0) == 0) bn = tag.substr(12);
+            }
+            if (bn.empty()) pyRaise("TypeError", "bases must be types");
+            Token bt = t; bt.value = bn;
+            node->bases.push_back(std::make_shared<VariableNode>(bt));
+        }
+        dynamic_classes_.push_back(node);
+        Value cls = classValueOfNode(node.get());
+        func_names[(void*)node.get()] = "__class__:" + full;
+        class_by_name[full] = (void*)node.get();
+        if (!node->bases.empty()) class_parent[(void*)node.get()] = node->bases[0]->value();
+        mro_cache_.clear();
+        attr_hook_cache_[0].clear();
+        attr_hook_cache_[1].clear();
+        no_new_.clear();
+        Context* class_ctx = new Context(runner, full, nullptr, nullptr, global_ctx);
+        CtxReaper _class_creator(this, class_ctx);
+        class_ctx->inClass = true;
+        if (Container* nc = contOf(ns)) {
+            for (auto& k : dictKeys(nc)) {
+                if (!isStringValue(k)) continue;
+                auto it = dictFind(nc, k);
+                if (it != nc->container->end()) class_ctx->defineByName(getStringValue(k), it->second);
+            }
+        }
+        setClassContext((void*)node.get(), class_ctx);
+        if (classNodeOfValue(mcs) && !(classNodeByName("type") && classNodeOfValue(mcs) == classNodeByName("type")))
+            class_meta_[(void*)node.get()] = mcs;
+        classCreated(cls, node.get(), kw, ctx);
+        return cls;
+    }
+    // A metaclass called: M(name, bases, ns) makes a class (type.__call__):
+    // M.__new__ (else type.__new__), then M.__init__ on a class it returned.
+    Value callMetaclass(const Value& M, std::vector<Value>& args, const nyrt::OrderedKw<Value>& kw, Context* ctx) {
+        Node* mn = classNodeOfValue(M);
+        Node* objn = classNodeByName("object");
+        Value m; Node* where = nullptr;
+        Value made;
+        if (findClassMember(mn, "__new__", m, &where) && where != objn && func_names.count(m.value.p)) {
+            std::vector<Value> a{M};
+            for (auto& x : args) a.push_back(x);
+            made = invokeMember(m, where, M, a, kw, ctx);
+        } else {
+            std::vector<Value> a{M};
+            for (auto& x : args) a.push_back(x);
+            made = typeNew(a, kw, ctx);
+        }
+        if (classNodeOfValue(made) && findClassMember(mn, "__init__", m, &where) && where != objn && func_names.count(m.value.p)) {
+            std::vector<Value> a{made};
+            for (auto& x : args) a.push_back(x);
+            invokeMember(m, where, made, a, kw, ctx);
+        }
+        return made;
     }
     // What a class statement has made: metaclass of each class (class_meta_),
     // and the hooks of PEP 487 run once the class exists - __set_name__ of
     // its attributes, then __init_subclass__ of the nearest base defining it
     // (an implicit classmethod) with the statement's keywords (round 77).
     std::unordered_map<void*, Value> class_meta_;
+    // C.__subclasses__(): each class's direct subclasses, in creation order.
+    std::unordered_map<Node*, std::vector<Node*>> subclasses_;
+    Value subclassesOf(const Value& cls) {
+        std::vector<Value> r;
+        if (Node* cn = classNodeOfValue(cls)) {
+            auto it = subclasses_.find(cn);
+            if (it != subclasses_.end())
+                for (Node* s : it->second) { Value v; v.type = ValueType::USERDATA; v.value.p = (void*)s; r.push_back(v); }
+        }
+        return makeListValue(r, false);
+    }
     void classCreated(const Value& cls, Node* cnode, const nyrt::OrderedKw<Value>& kw, Context* ctx) {
+        {
+            bool any = false;
+            for (auto& b : static_cast<ClassNode*>(cnode)->bases)
+                if (Node* bn = classNodeByName(b->value()); bn && bn != cnode) {
+                    auto& v = subclasses_[bn];
+                    if (std::find(v.begin(), v.end(), cnode) == v.end()) v.push_back(cnode);
+                    any = true;
+                }
+            Node* objn = any ? nullptr : classNodeByName("object");
+            if (objn && objn != cnode) {
+                auto& v = subclasses_[objn];
+                if (std::find(v.begin(), v.end(), cnode) == v.end()) v.push_back(cnode);
+            }
+        }
+        // a class deriving from type is a metaclass (callable to make classes)
+        if (classDerivesFrom(static_cast<ClassNode*>(cnode)->name, "type")) metaclass_types_.insert(cnode);
         auto cit = class_ctx_map_.find((void*)cnode);
         if (cit != class_ctx_map_.end() && cit->second && cit->second->container) {
             std::vector<std::pair<std::string, Value>> attrs;
@@ -5900,6 +6183,12 @@ public:
                 // first base of the class was searched, keyword arguments were
                 // dropped and every exception was swallowed.)
                 Value self_val = ctx->getByName("self");
+                // def __call__(cls, ...) / def __new__(mcs, ...): the first
+                // argument (round 77)
+                if (self_val.type == ValueType::UNDEFINED || self_val.type == ValueType::NONE) {
+                    Value fa = ctx->getByName("\x01first_arg");
+                    if (fa.type != ValueType::UNDEFINED) self_val = fa;
+                }
                 std::vector<Value> sargs; nyrt::OrderedKw<Value> skw;
                 evalCallArgs(cn->args, ctx, sargs, skw);
                 Value out;
@@ -7102,6 +7391,35 @@ public:
                     return true;
                 }
             }
+            // A class's metaclass members (methods bound to the class, its
+            // properties read with the class), then its __getattr__ (round 77).
+            if (!class_meta_.empty() && classNodeOfValue(obj) && attr != "__init__" && attr != "__new__") {
+                Value m; Node* where = nullptr;
+                if (metaMember(obj, attr, m, where)) {
+                    std::string tag = fnTag(func_names, m.value.p);
+                    static const nyrt::OrderedKw<Value> no_kw;
+                    if (tag.find("__property__") != std::string::npos) {
+                        std::vector<Value> a{obj};
+                        out = callFunctionValue(m, a, ctx);
+                        return true;
+                    }
+                    if (tag.find("__static__") != std::string::npos) { out = m; return true; }
+                    std::vector<Value> a{m, obj};
+                    out = callFunctionValue(global_ctx->getByName("_NyMetaBound"), a, ctx);
+                    return true;
+                }
+                if (Node* mn = classNodeOfValue(metaclassOf(classNodeOfValue(obj)))) {
+                    auto mit = class_ctx_map_.find((void*)mn);
+                    if (mit != class_ctx_map_.end() && mit->second && mit->second->container) {
+                        auto vit = mit->second->container->find(attr);
+                        if (vit != mit->second->container->end()) { out = vit->second; return true; }
+                    }
+                }
+                if (attr.size() < 2 || attr.substr(0, 2) != "__") {
+                    std::vector<Value> a{makeStringValue(attr)};
+                    if (metaCall(obj, "__getattr__", a, ctx, out)) return true;
+                }
+            }
             // A function without annotations has an empty __annotations__
             // dict, made on first read and kept (writes to it stay).
             if (attr == "__annotations__" && isPlainFunction(obj)) {
@@ -7127,12 +7445,36 @@ public:
                 Node* cn = classNodeByName(fit->second.substr(10));
                 std::vector<Value> seq_vals;
                 if (cn) {
-                    std::vector<Node*> seq;
-                    if (attr == "__mro__") seq = classMro(cn);
-                    else for (auto& b : static_cast<ClassNode*>(cn)->bases) if (Node* bn = classNodeByName(b->value())) seq.push_back(bn);
-                    for (Node* c : seq) { Value cv; cv.type = ValueType::USERDATA; cv.value.p = (void*)c; seq_vals.push_back(cv); }
+                    // builtin bases (type, dict, int, ...) as their builtin
+                    // values; object ends every __mro__ and is the base of
+                    // a class that names none (round 77)
+                    Node* objn = classNodeByName("object");
+                    auto builtin = [&](const std::string& n, Value& v) {
+                        if (classNodeByName(n) || !nyrt::is_builtin_type_name(n) || n == "object") return false;
+                        v = global_ctx->getByName(n);
+                        return v.type != ValueType::UNDEFINED && v.type != ValueType::NONE;
+                    };
+                    auto push = [&](Node* c) { Value cv; cv.type = ValueType::USERDATA; cv.value.p = (void*)c; seq_vals.push_back(cv); };
+                    if (attr == "__mro__") {
+                        std::vector<Node*> seq = classMro(cn);
+                        std::vector<std::string> extra;
+                        for (Node* c : seq) {
+                            if (c != objn) push(c);
+                            for (auto& b : static_cast<ClassNode*>(c)->bases)
+                                if (std::find(extra.begin(), extra.end(), b->value()) == extra.end()) extra.push_back(b->value());
+                        }
+                        for (auto& n : extra) { Value v; if (builtin(n, v)) seq_vals.push_back(v); }
+                        if (objn && cn != objn) push(objn);
+                    } else {
+                        for (auto& b : static_cast<ClassNode*>(cn)->bases) {
+                            Value v;
+                            if (Node* bn = classNodeByName(b->value())) push(bn);
+                            else if (builtin(b->value(), v)) seq_vals.push_back(v);
+                        }
+                        if (seq_vals.empty() && objn && cn != objn) push(objn);
+                    }
                 }
-                out = makeListValue(seq_vals, attr == "__mro__");
+                out = makeListValue(seq_vals, true);   // both are tuples
                 return true;
             }
             // __doc__: the docstring of a function, method, class, or an
@@ -7236,6 +7578,8 @@ public:
         // Lists, tuples, sets, generators, dicts (their typed keys) and
         // strings (by character): the shared iteration (iterItems).
         if ((v.isCollectable() && v.value.gc) || isStringValue(v) || isBytesValue(v)) return iterItems(v, ctx);
+        // a class whose metaclass defines __iter__ (round 77)
+        if (!class_meta_.empty() && classNodeOfValue(v)) return iterItems(v, ctx);
         if (isInstanceValue(v)) {
             std::vector<Value> no_args;
             Value iterator = v;
@@ -7738,9 +8082,25 @@ public:
         no_new_.insert(cn);
         return false;
     }
+    // Set by type.__call__ (a metaclass's super().__call__) for the one
+    // instantiation it makes, which must not run the metaclass's __call__
+    // again; consumed at once, so instantiations nested in that object's
+    // __init__ still go through their metaclasses.
+    bool type_call_skip_ = false;
     Value instantiateClass(const Value& cls, std::vector<Value>& args,
                            const nyrt::OrderedKw<Value>& kw, Context* ctx) {
         std::string className = fnTag(func_names, cls.value.p).substr(10);
+        bool skip_meta_call = type_call_skip_;
+        type_call_skip_ = false;
+        if (!class_meta_.empty() || !metaclass_types_.empty()) {
+            // a metaclass's __call__ (round 77)
+            Value m; Node* where = nullptr;
+            if (!skip_meta_call && metaMember(cls, "__call__", m, where))
+                return callMeta(m, where, cls, args, kw, ctx);
+            // a metaclass itself called: it makes a class
+            if (Node* cn = classNodeOfValue(cls); cn && isMetaclassNode(cn) && args.size() == 3)
+                return callMetaclass(cls, args, kw, ctx);
+        }
         // __new__(cls, *args, **kw) makes the object; __init__ runs when it
         // returned an instance of the class (round 77).
         {
@@ -9400,6 +9760,13 @@ public:
             if (owner) *owner = mro[i];
             return true;
         }
+        // every class reaches object's __subclasses__ and mro (round 77;
+        // a class naming no base has no object in its MRO here)
+        if (!after && (name == "__subclasses__" || name == "mro")) {
+            Node* objn = classNodeByName("object");
+            if (objn && objn != cls && std::find(mro.begin(), mro.end(), objn) == mro.end())
+                return findClassMember(objn, name, out, owner);
+        }
         return false;
     }
     Node* classNodeOfInstance(const Value& v) {
@@ -9711,6 +10078,9 @@ public:
             bindParamsKw(fn, a2, kw, fc, ctx, 0, m.value.p);
         } else if (is_static || !has_self) {
             bindParamsKw(fn, args, kw, fc, ctx, 0, m.value.p);
+            // what super() takes as the receiver in a method whose first
+            // parameter is cls / mcs (round 77)
+            if (!is_static && !args.empty()) fc->defineByName("\x01first_arg", args[0]);
         } else if (self_is_class) {
             // Class.method(instance, ...)
             if (!args.empty()) {
@@ -9733,10 +10103,32 @@ public:
     }
     // super().name(...): `name` from the class after `owner` in the MRO of
     // self's class. Returns false when nothing defines it there.
+    // A class deriving from type (a metaclass); cached by node.
+    std::unordered_set<const Node*> metaclass_types_;
+    bool isMetaclassNode(Node* cn) {
+        if (!cn) return false;
+        if (metaclass_types_.count(cn)) return true;
+        if (classDerivesFrom(static_cast<ClassNode*>(cn)->name, "type")) { metaclass_types_.insert(cn); return true; }
+        return false;
+    }
     bool superCall(Value self, Node* owner, const std::string& name, std::vector<Value>& args,
                    const nyrt::OrderedKw<Value>& kw, Context* ctx, Value& out) {
         Node* start = isInstanceValue(self) ? classNodeOfInstance(self) : owner;
         if (!start) return false;
+        // past a metaclass's own bases is type: type.__new__ / __call__ /
+        // __init__ (round 77)
+        if (isMetaclassNode(owner) && (name == "__new__" || name == "__call__" || name == "__init__")) {
+            Value m0; Node* w0 = nullptr;
+            if (!(findClassMember(start, name, m0, &w0, owner) && w0 != classNodeByName("object"))) {
+                if (name == "__init__") { out = NONE_VALUE; return true; }
+                if (name == "__new__") { out = typeNew(args, kw, ctx); return true; }
+                // type.__call__(cls, *args): make the instance, the metaclass's
+                // __call__ not run again
+                type_call_skip_ = true;
+                out = instantiateClass(self, args, kw, ctx);
+                return true;
+            }
+        }
         Value m; Node* where = nullptr;
         if (findClassMember(start, name, m, &where, owner) && m.type == ValueType::USERDATA && m.value.p
             && func_names.count(m.value.p)) {
@@ -9794,6 +10186,11 @@ public:
                 }
                 return std::string();
             };
+            // a metaclass's __subclasscheck__ (round 77)
+            if (!class_meta_.empty() && classNodeOfValue(args[1])) {
+                Value r;
+                if (metaCall(args[1], "__subclasscheck__", {args[0]}, ctx, r)) { out = Value(isTruthy(r)); return true; }
+            }
             std::string c = cls_name(args[0]);
             if (c.empty()) { out = Value(false); return true; }
             std::vector<Value> targets;
