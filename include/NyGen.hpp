@@ -125,6 +125,13 @@ inline bool builtin_candidate(const std::string& name, const std::vector<Value>&
 }
 // islice, take; iter/next/any/all/zip/map/filter/enumerate over generators.
 bool builtin(NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx, Value& out);
+// An iterator object (an instance with __next__): zip/map/filter/enumerate
+// over one are lazy, as over a generator (it was read to the end first,
+// forever for an infinite one: zip("abc", itertools.count())).
+bool iterator_object(NythonExecutor& E, const Value& v);
+inline bool lazy_builtin_name(const std::string& name) {
+    return name == "zip" || name == "map" || name == "filter" || name == "enumerate";
+}
 
 // ── Ownership of temporaries ────────────────────────────────────────────────
 // A generator made by the expression a `for` loop or a builtin call
