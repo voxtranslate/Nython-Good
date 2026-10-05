@@ -3138,6 +3138,7 @@ public:
         (*ns.map)["executable"]=VMVal::make_str(nyrt::executable_path());
         (*ns.map)["version"]=VMVal::make_str(NYTHON_VERSION);
         (*ns.map)["maxsize"]=VMVal::make_int((int64_t)PTRDIFF_MAX);   // as the interpreter's
+        { const uint16_t probe=1; (*ns.map)["byteorder"]=VMVal::make_str(*(const uint8_t*)&probe?"little":"big"); }
         ns.class_name=as_name;
         globals_[as_name]=ns;
         globals_["argv"]=argv_list;
@@ -5395,6 +5396,9 @@ private:
                     res=call_dunder(l,"__add__",{r});
                     if(res.type!=VMType::NONE){push(res);break;}
                 }
+                // 10 += obj: the right operand's __radd__, as for 10 + obj
+                // (it raised TypeError)
+                if(r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(l,r,"__add__","__radd__",res)){push(res);break;} }
                 if(l.type==VMType::INT&&r.type==VMType::INT&&l.s.empty()&&r.s.empty()){
                     int64_t res; if(!nypy::add_ovf(l.i,r.i,res)){ push(VMVal::make_int(res)); break; }
                 }
@@ -5402,9 +5406,11 @@ private:
             }
             case Op::ISUB: { VMVal r=pop(),l=pop();
                 if(l.type==VMType::INSTANCE){ VMVal res=call_dunder(l,"__isub__",{r}); if(res.type==VMType::NONE) res=call_dunder(l,"__sub__",{r}); if(res.type!=VMType::NONE){push(res);break;} }
+                if(r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(l,r,"__sub__","__rsub__",res)){push(res);break;} }
                 push(binop(nypy::A_SUB,l,r)); break; }
             case Op::IMUL: { VMVal r=pop(),l=pop();
                 if(l.type==VMType::INSTANCE){ VMVal res=call_dunder(l,"__imul__",{r}); if(res.type==VMType::NONE) res=call_dunder(l,"__mul__",{r}); if(res.type!=VMType::NONE){push(res);break;} }
+                if(r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(l,r,"__mul__","__rmul__",res)){push(res);break;} }
                 push(binop_inplace(nypy::A_MUL,l,r)); break; }
             case Op::IDIV: { VMVal r=pop(),l=pop(); push(binop(nypy::A_DIV,l,r)); break; }
             case Op::IMOD: { VMVal r=pop(),l=pop(); push(binop(nypy::A_MOD,l,r)); break; }
@@ -5961,10 +5967,12 @@ private:
                 }
                 if(conv) return to_fmtval(v,conv);
                 if(v.type==VMType::INSTANCE){
-                    // its __format__ with the field's spec, as format(v, spec)
-                    nypy::FmtVal r=nypy::FmtVal::of_other(format_value(v,f.spec),v.class_name);
-                    r.done=true;
-                    return r;
+                    // the object's __format__ (as the interpreter's strFormat)
+                    nypy::FmtVal fv=nypy::FmtVal::of_other(vm_str(v),v.class_name);
+                    VMVal m;
+                    if(class_lookup(v.class_name,"__format__",m))
+                        fv.custom=[this,v](const std::string& spec){ return format_value(v,spec); };
+                    return fv;
                 }
                 return to_fmtval(v,0);
             });
@@ -7789,7 +7797,15 @@ private:
         if(name=="os"){ define_os_module(alias.empty()?std::string("os"):alias); return; }
         if(name=="shell"||name=="sh"){ return; }
         if(name=="sys"){ define_sys_module(alias.empty()?std::string("sys"):alias); return; }
-        if(name=="math"){ register_math_builtins(); define_math_module(alias.empty()?std::string("math"):alias); return; }
+        if(name=="math"){
+            // `from math import gcd` bound nothing (NameError); the namespace
+            // is cached so later imports, from any module, bind it
+            register_math_builtins();
+            VMVal mns=define_math_module(alias.empty()?std::string("math"):alias);
+            module_ns_["math"]=mns;
+            if(!from_names.empty()) bind_from_namespace(mns, from_names, "math");
+            return;
+        }
         if(name=="time"){ return; }
         if(name=="json"){ register_json_builtins(); return; }
         if(name=="io"||name=="fs"||name=="file"){ return; }
@@ -8583,12 +8599,29 @@ private:
     // `import math`: a namespace of builtins/pymath.cpp's math_* functions
     // (through the bridge, so both engines run the same code) and the
     // constants. `math` used to be undefined on this engine.
-    void define_math_module(const std::string& as_name) {
+    VMVal define_math_module(const std::string& as_name) {
         VMVal ns=VMVal::make_map();
         std::vector<std::string> names;
         if(bridge_names()) names=bridge_names()();
         for(auto& n:names)
             if(n.compare(0,5,"math_")==0){ VMVal fn=load_var(n); if(fn.type!=VMType::NONE) (*ns.map)[n.substr(5)]=fn; }
+        // floor/ceil/trunc of an object: its __floor__/__ceil__/__trunc__,
+        // here, before the bridge (which lost self: "takes 1 argument (0
+        // given)" for math.floor(Fraction(7, 2))).
+        for(const char* nm:{"floor","ceil","trunc"}){
+            auto it=ns.map->find(nm);
+            if(it==ns.map->end()) continue;
+            VMVal inner=it->second;
+            std::string dunder=std::string("__")+nm+"__";
+            VirtualMachine* vm=this;
+            (*ns.map)[nm]=VMVal::make_native([vm,inner,dunder](std::vector<VMVal>& a)->VMVal{
+                if(a.size()==1&&a[0].type==VMType::INSTANCE){
+                    bool f=false; VMVal r=vm->call_dunder_f(a[0],dunder,{},f);
+                    if(f) return r;
+                }
+                return vm->vm_call(inner,a,std::nullopt);
+            });
+        }
         (*ns.map)["pi"]=VMVal::make_float(3.14159265358979323846);
         (*ns.map)["e"]=VMVal::make_float(2.71828182845904523536);
         (*ns.map)["tau"]=VMVal::make_float(6.28318530717958647692);
@@ -8596,6 +8629,7 @@ private:
         (*ns.map)["nan"]=VMVal::make_float(std::numeric_limits<double>::quiet_NaN());
         ns.class_name=as_name;
         globals_[as_name]=ns;
+        return ns;
     }
 
     void register_math_builtins() {
@@ -8891,9 +8925,11 @@ private:
             }
             return x.list->size()<y.list->size();
         }
-        if(x.type==VMType::INSTANCE){
-            VMVal r=call_dunder(x,"__lt__",{y});
-            if(r.type==VMType::BOOL) return r.b;
+        if(x.type==VMType::INSTANCE||y.type==VMType::INSTANCE){
+            // x.__lt__(y), else y.__gt__(x): sorted([F(3), 1, F(2)]) sorts
+            // an int against objects (it compared type names)
+            VMVal r;
+            if(rich_compare(x,y,"__lt__","__gt__",r)) return vm_truthy(r);
         }
         std::string tx=vm_type_name(x), ty=vm_type_name(y);
         if(tx!=ty) return tx<ty;

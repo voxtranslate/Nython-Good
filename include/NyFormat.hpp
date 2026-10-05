@@ -63,6 +63,9 @@ struct FmtVal {
     std::string s;          // str() of the value for STR / NONE / OTHER
     std::string type_name;  // for error messages
     bool done = false;      // s is already the formatted text (an object's __format__)
+    // An object with __format__: the engine's call of it, given the spec
+    // (str.format's fields; format() and f-strings call it themselves).
+    std::function<std::string(const std::string&)> custom;
     static FmtVal of_int(int64_t v) { FmtVal f; f.kind = INT; f.i = v; f.type_name = "int"; return f; }
     static FmtVal of_big(const BigInt& v) {
         int64_t t; if (v.to_i64(t)) return of_int(t);
@@ -277,6 +280,7 @@ inline std::string format_str(const std::string& str, const Spec& s) {
 // format(value, spec)
 inline std::string format_value(const FmtVal& v, const std::string& spec) {
     if (v.done) return v.s;
+    if (v.custom) return v.custom(spec);
     if (spec.empty()) {
         switch (v.kind) {
             case FmtVal::INT: return v.is_big ? v.big.to_string() : std::to_string(v.i);

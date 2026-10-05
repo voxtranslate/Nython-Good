@@ -76,7 +76,7 @@ struct ComplexNode : Node {
     std::vector<node_ptr> items;
     ComplexNode(Token t) : Node(t, NodeType::COMPLEX), items{} {}
     Value eval(Context* ctx) override {
-        try { return Value(std::stod(_token.value)); } catch(...) { return Value(0.0); }
+        return Value(std::strtod(_token.value.c_str(), nullptr));
     }
 };
 
