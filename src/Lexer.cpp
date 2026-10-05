@@ -1308,7 +1308,9 @@ void Lexer::consume_numeric() {
                 break;
             }
 			case 'j': case 'J':{
-                this->consume_cplx();
+                // 0j: the decimal path reads imaginary literals (consume_cplx
+                // lost the character after them: print(0j) was a syntax error)
+                this->consume_decimal();
                 break;
             }
 			case '.': case 'e': case 'E':{

@@ -377,8 +377,11 @@ struct NythonExecutor {
     // func_names stores internal identifiers ("__func__:inner", "__lambda__",
     // "__class__:Point"); render them the way the VM does so the two engines
     // print the same thing.
+    // A class statement run again makes a new class, registered as
+    // "Name#n" (evalClassDecl); what is shown is Name.
+    static std::string shownClassName(const std::string& n) { return nyrt::shown_class_name(n); }
     static std::string funcDisplayName(const std::string& fn) {
-        if (fn.rfind("__class__:", 0) == 0) return "<class " + fn.substr(10) + ">";
+        if (fn.rfind("__class__:", 0) == 0) return "<class " + shownClassName(fn.substr(10)) + ">";
         std::string n = fn;
         if (n.rfind("__func__:", 0) == 0) n = n.substr(9);
         if (n == "__lambda__" || n.empty()) n = "<lambda>";
@@ -526,7 +529,7 @@ public:   // NythonExecutor is a struct: members default to public
             "isinstance","issubclass","id","hash","hex","oct","bin",
             "chr","ord","repr","format","open","exit","quit",
             "pow","divmod","input","dict","display","show","is_int","is_float","is_string","is_list","is_none","is_bool","to_int","to_float","to_str","clamp","lerp","map_range","repeat_str","repeat","flatten","flat","shell","system","ls","cat","pwd","mkdir","write","exists","env","all","any","complex","slice","super","property",
-            "staticmethod","classmethod","callable","dir","vars","globals","locals",
+            "staticmethod","classmethod","callable","dir","vars","globals","locals","eval","exec","compile",
             "iter","next","help","Set","Counter","OrderedDict","deque","defaultdict","assert",
             "islice","take",   // lazy iteration (src/NyGen.cpp), both engines
             "sqrt","sin","cos","tan","log","floor","ceil",
@@ -2603,6 +2606,11 @@ public:   // NythonExecutor is a struct: members default to public
     }
     // L[a:b] = it and L[a:b:c] = it (extended slices must match in length).
     void assignSlice(const Value& obj, const std::vector<Value>& sargs, const Value& val, Context* ctx) {
+        if (wantsSliceObject(obj, "__setitem__")) {
+            std::vector<Value> a{makeSliceObject(sargs, ctx), val};
+            callMethod(obj, "__setitem__", a, ctx);
+            return;
+        }
         if (auto* bo = bytesOf(obj)) {
             if (!bo->mut) pyRaise("TypeError", "'bytes' object does not support item assignment");
             // the replacement: a bytes-like, or an iterable of ints
@@ -2657,8 +2665,41 @@ public:   // NythonExecutor is a struct: members default to public
     }
 
     // obj[idx]
+    // ── slice objects (round 77) ──
+    // a[i:j:k] is spelt a.slice(i, j, k) by the parser. An object whose
+    // class has __getitem__ / __setitem__ / __delitem__ (and no slice
+    // method of its own) gets a `slice` (the prelude's class) instead, as
+    // in Python; a slice object used as an index of a builtin sequence
+    // slices it.
+    Value makeSliceObject(const std::vector<Value>& sargs, Context* ctx) {
+        Value cls = global_ctx->getByName("slice");
+        std::vector<Value> a{sargs.size() > 0 ? sargs[0] : NONE_VALUE, sargs.size() > 1 ? sargs[1] : NONE_VALUE,
+                             sargs.size() > 2 ? sargs[2] : NONE_VALUE};
+        return callFunctionValue(cls, a, ctx);
+    }
+    bool sliceObjectParts(const Value& v, std::vector<Value>& out) {
+        if (!isInstanceValue(v) || shownClassName(instanceClassName(v)) != "slice") return false;
+        auto pit = instance_properties.find(v.value.p);
+        if (pit == instance_properties.end() || !pit->second || !pit->second->container) return false;
+        auto& c = *pit->second->container;
+        for (const char* f : {"start", "stop", "step"}) {
+            auto it = c.find(f);
+            out.push_back(it != c.end() ? it->second : NONE_VALUE);
+        }
+        return true;
+    }
+    bool wantsSliceObject(const Value& obj, const char* dunder) {
+        return isInstanceValue(obj) && !instanceHasMethod(obj, "slice") && instanceHasMethod(obj, dunder);
+    }
     Value getItem(const Value& obj, const Value& idx, Context* ctx) {
         if (nygen::is_gen(obj)) pyRaise("TypeError", "'generator' object is not subscriptable");
+        {
+            std::vector<Value> parts;
+            if (!isInstanceValue(obj) && sliceObjectParts(idx, parts)) {
+                Value o = obj;
+                return callMethod(o, "slice", parts, ctx);
+            }
+        }
         if (Container* sc = setOf(obj)) pyRaise("TypeError", "'" + std::string(isFrozenCont(sc) ? "frozenset" : "set") + "' object is not subscriptable");
         if (auto* bo = bytesOf(obj)) {
             Num k;
@@ -2761,6 +2802,10 @@ public:   // NythonExecutor is a struct: members default to public
 
     // obj[idx] = val
     void setItem(const Value& obj, const Value& idx, const Value& val, Context* ctx) {
+        {
+            std::vector<Value> parts;
+            if (!isInstanceValue(obj) && sliceObjectParts(idx, parts)) { assignSlice(obj, parts, val, ctx); return; }
+        }
         if (Container* sc = setOf(obj)) pyRaise("TypeError", "'" + std::string(isFrozenCont(sc) ? "frozenset" : "set") + "' object does not support item assignment");
         if (isInstanceVal(obj)) {
             if (!instanceHasMethod(obj, "__setitem__"))
@@ -2863,7 +2908,7 @@ public:   // NythonExecutor is a struct: members default to public
         if (v.type == ValueType::USERDATA && v.value.p) {
             auto fit = func_names.find(v.value.p);
             if (fit != func_names.end()) {
-                if (fit->second.rfind("__instance__:", 0) == 0) return fit->second.substr(13);
+                if (fit->second.rfind("__instance__:", 0) == 0) return shownClassName(fit->second.substr(13));
                 if (fit->second.rfind("__class__:", 0) == 0) return "type";
                 if (fit->second.rfind("__builtin__:", 0) == 0 || fit->second.rfind("__bmethod__:", 0) == 0) return "builtin_function_or_method";
                 return "function";
@@ -3889,6 +3934,10 @@ public:   // NythonExecutor is a struct: members default to public
                      const nyrt::OrderedKw<Value>* kw_in = nullptr) {
         static const nyrt::OrderedKw<Value> kEmptyKw;
         const nyrt::OrderedKw<Value>& kw_args_in = kw_in ? *kw_in : kEmptyKw;
+        if (method_name == "slice" && wantsSliceObject(obj, "__getitem__")) {
+            std::vector<Value> a{makeSliceObject(args, ctx)};
+            return callMethod(obj, "__getitem__", a, ctx);
+        }
         // A generator: send / throw / close / __next__ / __iter__ (NyGen.cpp),
         // then the object protocol; nothing else.
         if (nygen::is_gen(obj)) {
@@ -4737,8 +4786,28 @@ public:   // NythonExecutor is a struct: members default to public
     std::vector<node_ptr> imported_asts; // keep imported ASTs alive // unique_ptr -> AST node ptr
     std::unordered_set<std::string> imported_modules_; // prevent circular imports
 
+    // Each execution of a class statement makes a new class (round 77). A
+    // class statement run again - in a function called twice, a factory, a
+    // loop - rebound the one class: instances of the first saw the second
+    // one's methods, closures and class attributes. A re-run registers a
+    // copy of the node as "Name#n" (shown as Name); the plain name keeps
+    // naming the newest, for bases looked up by name.
+    std::unordered_set<const Node*> class_ran_;
+    std::vector<node_ptr> class_copies_;
+    int class_generation_ = 0;
     Value evalClassDecl(node_ptr node, Context* ctx) {
         auto cn = static_pointer_cast<ClassNode>(node);
+        std::string plain_name = cn->name;
+        if (class_ran_.count(node.get())) {
+            auto copy = std::make_shared<ClassNode>(*cn);
+            copy->name = cn->name + "#" + std::to_string(++class_generation_);
+            if (copy->bind_name.empty()) copy->bind_name = plain_name;
+            class_copies_.push_back(copy);
+            node = copy;
+            cn = copy;
+        } else {
+            class_ran_.insert(node.get());
+        }
         // Bases are looked up in scope (round 77): a module's class (named
         // "module.Class"), one imported with `from m import C`, an alias,
         // a dotted base (threading.Thread). The base node takes the class's
@@ -4749,6 +4818,20 @@ public:   // NythonExecutor is a struct: members default to public
             // A module's own base is already "module.Class" (the parser
             // qualified it): keep it.
             if (bn.find('.') != std::string::npos && classNodeByName(bn)) continue;
+            // A class bound in scope under that name: that class (the one a
+            // factory made in this call, not the newest of the name).
+            if (bn.find('.') == std::string::npos) {
+                Value bv = ctx->getByName(shownClassName(bn));
+                if (Node* bcn = classNodeOfValue(bv)) {
+                    const std::string& full = static_cast<ClassNode*>(bcn)->name;
+                    if (full != bn) {
+                        Token t = b->token();
+                        t.value = full;
+                        b = std::make_shared<VariableNode>(t);
+                    }
+                    continue;
+                }
+            }
             std::string rn = excClassName(bn, ctx);
             if (rn != bn && (classNodeByName(rn) || nython::ny_is_builtin_exc(rn))) {
                 Token t = b->token();
@@ -6618,6 +6701,7 @@ public:
                     std::string nm = c == std::string::npos ? t : t.substr(c + 1);
                     size_t tag = nm.find("__");
                     if (tag != std::string::npos && tag > 0) nm = nm.substr(0, tag);   // name__static__ etc
+                    nm = shownClassName(nm);
                     // A module's class is "module.Class" (round 77): __name__
                     // is the class's own name, __module__ the module's.
                     bool is_class = t.rfind("__class__:", 0) == 0;
@@ -8511,6 +8595,10 @@ public:
                 callMethod(obj, "__delitem__", a, ctx);
                 return NONE_VALUE;
             }
+            {
+                std::vector<Value> parts;
+                if (sliceObjectParts(idx, parts)) { delSlice(obj, parts, ctx); return NONE_VALUE; }
+            }
             if (auto* bo = bytesOf(obj)) {
                 if (!bo->mut) pyRaise("TypeError", "'bytes' object doesn't support item deletion");
                 Num k;
@@ -8547,37 +8635,7 @@ public:
                 Value obj = evalNode(static_pointer_cast<AttributeNode>(cn->callee)->object, ctx);
                 std::vector<Value> sargs;
                 for (auto& a : cn->args) sargs.push_back(evalNode(a, ctx));
-                if (auto* bo = bytesOf(obj)) {
-                    if (!bo->mut) pyRaise("TypeError", "'bytes' object doesn't support item deletion");
-                    int64_t len = (int64_t)bo->s.size(), st = 0, en = 0, step = 1;
-                    bool hs = sliceArg(sargs, 0, st), he = sliceArg(sargs, 1, en);
-                    if (sargs.size() >= 3 && sargs[2].type != ValueType::NONE) sliceArg(sargs, 2, step);
-                    int64_t cnt = nyCall([&] { return nypy::slice_adjust(len, hs, st, he, en, step); });
-                    if (cnt > 0) {
-                        std::vector<bool> gone((size_t)len, false);
-                        for (int64_t k = 0, i = st; k < cnt; k++, i += step) gone[(size_t)i] = true;
-                        std::string kept;
-                        for (int64_t k = 0; k < len; k++) if (!gone[(size_t)k]) kept += bo->s[(size_t)k];
-                        bo->s = std::move(kept);
-                    }
-                    return NONE_VALUE;
-                }
-                Container* cont = contOf(obj);
-                if (!cont || seqLen(cont) < 0) pyRaise("TypeError", "'" + typeNameOf(obj) + "' object does not support item deletion");
-                if (isTupleCont(cont)) pyRaise("TypeError", "'tuple' object doesn't support item deletion");
-                std::vector<Value> items = seqItems(cont);
-                int64_t len = (int64_t)items.size(), st = 0, en = 0, step = 1;
-                bool hs = sliceArg(sargs, 0, st), he = sliceArg(sargs, 1, en);
-                if (sargs.size() >= 3 && sargs[2].type != ValueType::NONE) sliceArg(sargs, 2, step);
-                int64_t cnt = nyCall([&] { return nypy::slice_adjust(len, hs, st, he, en, step); });
-                if (cnt > 0) {
-                    std::vector<bool> gone((size_t)len, false);
-                    for (int64_t k = 0, i = st; k < cnt; k++, i += step) gone[(size_t)i] = true;
-                    for (int64_t k = 0; k < len; k++) cont->container->erase(std::to_string(k));
-                    int64_t w = 0;
-                    for (int64_t k = 0; k < len; k++) if (!gone[(size_t)k]) (*cont->container)[std::to_string(w++)] = items[(size_t)k];
-                    (*cont->container)["__len__"] = intValue(w);
-                }
+                delSlice(obj, sargs, ctx);
             }
         } else if (dn->target->type() == NodeType::ATTRIBUTE) {
             // del obj.attr
@@ -8586,6 +8644,46 @@ public:
             delAttrValue(obj, attr->attr);
         }
         return NONE_VALUE;
+    }
+    // del obj[a:b:c] (the parser spells the slice obj.slice(a, b, c)), and
+    // del obj[slice_object]
+    void delSlice(const Value& obj, std::vector<Value>& sargs, Context* ctx) {
+        if (wantsSliceObject(obj, "__delitem__")) {
+            std::vector<Value> a{makeSliceObject(sargs, ctx)};
+            callMethod(obj, "__delitem__", a, ctx);
+            return;
+        }
+        if (auto* bo = bytesOf(obj)) {
+            if (!bo->mut) pyRaise("TypeError", "'bytes' object doesn't support item deletion");
+            int64_t len = (int64_t)bo->s.size(), st = 0, en = 0, step = 1;
+            bool hs = sliceArg(sargs, 0, st), he = sliceArg(sargs, 1, en);
+            if (sargs.size() >= 3 && sargs[2].type != ValueType::NONE) sliceArg(sargs, 2, step);
+            int64_t cnt = nyCall([&] { return nypy::slice_adjust(len, hs, st, he, en, step); });
+            if (cnt > 0) {
+                std::vector<bool> gone((size_t)len, false);
+                for (int64_t k = 0, i = st; k < cnt; k++, i += step) gone[(size_t)i] = true;
+                std::string kept;
+                for (int64_t k = 0; k < len; k++) if (!gone[(size_t)k]) kept += bo->s[(size_t)k];
+                bo->s = std::move(kept);
+            }
+            return;
+        }
+        Container* cont = contOf(obj);
+        if (!cont || seqLen(cont) < 0) pyRaise("TypeError", "'" + typeNameOf(obj) + "' object does not support item deletion");
+        if (isTupleCont(cont)) pyRaise("TypeError", "'tuple' object doesn't support item deletion");
+        std::vector<Value> items = seqItems(cont);
+        int64_t len = (int64_t)items.size(), st = 0, en = 0, step = 1;
+        bool hs = sliceArg(sargs, 0, st), he = sliceArg(sargs, 1, en);
+        if (sargs.size() >= 3 && sargs[2].type != ValueType::NONE) sliceArg(sargs, 2, step);
+        int64_t cnt = nyCall([&] { return nypy::slice_adjust(len, hs, st, he, en, step); });
+        if (cnt > 0) {
+            std::vector<bool> gone((size_t)len, false);
+            for (int64_t k = 0, i = st; k < cnt; k++, i += step) gone[(size_t)i] = true;
+            for (int64_t k = 0; k < len; k++) cont->container->erase(std::to_string(k));
+            int64_t w = 0;
+            for (int64_t k = 0; k < len; k++) if (!gone[(size_t)k]) (*cont->container)[std::to_string(w++)] = items[(size_t)k];
+            (*cont->container)["__len__"] = intValue(w);
+        }
     }
     // del obj.name / delattr(obj, name): an instance's field, a class
     // attribute or a namespace/dict entry is removed; anything else is an
@@ -8757,6 +8855,95 @@ public:
         return v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p)
                && instance_to_class.count(v.value.p);
     }
+    // ── eval / exec / compile (round 77; there were none) ──────────────
+    // Source text - a str, bytes, or what compile() made - parsed and run:
+    // eval gives the value of one expression, exec runs statements. With a
+    // globals (and locals) dict the code runs in a scope of its own made
+    // from them, the builtins visible but not the program's names, and exec
+    // writes what it binds back into the dict; without one, in the caller's
+    // scope.
+    std::string snippetSource(const Value& v, std::string& mode, std::string& fname, const char* who) {
+        if (isInstanceValue(v) && shownClassName(instanceClassName(v)) == "_NyCode") {
+            auto pit = instance_properties.find(v.value.p);
+            if (pit != instance_properties.end() && pit->second && pit->second->container) {
+                auto& c = *pit->second->container;
+                auto g = [&](const char* k) { auto it = c.find(k); return it != c.end() ? getStringValue(it->second) : std::string(); };
+                mode = g("mode");
+                fname = g("co_filename");
+                return g("source");
+            }
+        }
+        if (auto* bo = bytesOf(v)) return bo->s;
+        if (isStringValue(v)) return getStringValue(v);
+        pyRaise("TypeError", std::string(who) + "() arg 1 must be a string, bytes or code object");
+        return std::string();
+    }
+    node_ptr parseSnippet(const std::string& src, const std::string& fname) {
+        try {
+            auto source = SourceCode::from_text(src, fname);
+            auto rep = std::make_shared<Reporter>(source);
+            auto lex = std::make_shared<Lexer>(source);
+            lex->tokenize();
+            Parser par(rep.get(), (Runnable*)runner, lex.get());
+            node_ptr ast = par.parse();
+            if (ast) imported_asts.push_back(ast);   // what it defines outlives the call
+            return ast;
+        } catch (nython::exception::SyntaxError& e) {
+            pyRaise("SyntaxError", e.message());
+        } catch (nython::exception::UnexpectedCharError& e) {
+            pyRaise("SyntaxError", e.message());
+        }
+        return nullptr;
+    }
+    Value evalExecBuiltin(bool is_exec, std::vector<Value>& args, Context* ctx) {
+        const char* who = is_exec ? "exec" : "eval";
+        if (args.empty()) pyRaise("TypeError", std::string(who) + "() missing required argument 'source' (pos 1)");
+        std::string mode = is_exec ? "exec" : "eval", fname = "<string>";
+        std::string src = snippetSource(args[0], mode, fname, who);
+        if (mode == "exec") is_exec = true;    // eval(compile(..., "exec")) runs it
+        if (!is_exec) {
+            size_t b = src.find_first_not_of(" \t");
+            src = b == std::string::npos ? std::string() : src.substr(b);
+        }
+        node_ptr ast = parseSnippet(src, fname);
+        if (!ast) return NONE_VALUE;
+        if (!is_exec && !nython::node::is_expression_program(ast)) pyRaise("SyntaxError", "invalid syntax");
+        bool has_g = args.size() > 1 && !args[1].isNone(), has_l = args.size() > 2 && !args[2].isNone();
+        Container* gd = has_g ? contOf(args[1]) : nullptr;
+        Container* ld = has_l ? contOf(args[2]) : nullptr;
+        if (has_g && (!gd || seqLen(gd) >= 0)) pyRaise("TypeError", std::string(who) + "() globals must be a dict, not " + typeNameOf(args[1]));
+        if (!gd && !ld) {
+            Value r = evalNode(ast, ctx);
+            return is_exec ? NONE_VALUE : r;
+        }
+        Context* sc = new Context(runner, "<string>", nullptr, nullptr, global_ctx);
+        CtxReaper reap(this, sc);
+        sc->inModule = true;
+        sc->parentFilter = &module_filter_;
+        auto load = [&](Container* d) {
+            for (auto& kv : *d->container) if (!isInternalKey(kv.first)) sc->defineByName(nypy::key_payload(kv.first), kv.second);
+        };
+        if (gd) load(gd);
+        if (ld) load(ld);
+        Value r = evalNode(ast, sc);
+        if (!is_exec) return r;
+        Container* out = ld ? ld : gd;
+        for (auto& kv : *sc->container) if (!reflectHidden(kv.first)) dictSet(out, makeStringValue(kv.first), kv.second);
+        return NONE_VALUE;
+    }
+    Value compileBuiltin(std::vector<Value>& args, Context* ctx) {
+        if (args.size() < 3) pyRaise("TypeError", "compile() missing required argument (source, filename, mode)");
+        std::string fname = getStringValue(args[1]), mode = getStringValue(args[2]);
+        if (mode != "exec" && mode != "eval" && mode != "single") pyRaise("ValueError", "compile() mode must be 'exec', 'eval' or 'single'");
+        std::string m2 = mode, f2 = fname;
+        std::string src = snippetSource(args[0], m2, f2, "compile");
+        node_ptr ast = parseSnippet(src, fname);   // a syntax error is raised now, as Python's
+        if (mode == "eval" && ast && !nython::node::is_expression_program(ast)) pyRaise("SyntaxError", "invalid syntax");
+        Value cls = global_ctx->getByName("_NyCode");
+        std::vector<Value> a{makeStringValue(src), makeStringValue(fname), makeStringValue(mode == "single" ? "exec" : mode)};
+        return callFunctionValue(cls, a, ctx);
+    }
+
     // ── Reflection: locals(), globals(), vars(), dir() (round 77) ──────
     // All four were placeholders returning none. locals() is the calling
     // scope's names (at module level, globals()); globals() the module's
@@ -9032,7 +9219,7 @@ public:
             if (!items.empty()) targets = items; else targets.push_back(args[1]);
             for (auto& t : targets) {
                 std::string tn = cls_name(t);
-                if (!tn.empty() && (tn == "object" || tn == "Object" || classDerivesFrom(c, tn))) { out = Value(true); return true; }
+                if (!tn.empty() && (tn == "object" || tn == "Object" || classDerivesFrom(c, tn) || nyrt::builtin_type_derives(c, tn))) { out = Value(true); return true; }
             }
             out = Value(false); return true;
         }

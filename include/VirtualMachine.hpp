@@ -580,13 +580,13 @@ inline std::string VMVal::to_string() const {
         return r+"}";
     }
     case VMType::FUNCTION: return "<function "+(code?code->name:"?")+">"; 
-    case VMType::CLASS:    return "<class "+class_name+">";
+    case VMType::CLASS:    return "<class "+nyrt::shown_class_name(class_name)+">";
     case VMType::INSTANCE: {
         // An exception reads as its message, as in Python: str(e) is the
         // message, not "Type: message" (that is how an uncaught one is
         // reported, not what the value is).
         if(map && vm_exc_classes().count(class_name)) return vm_exc_message(*this);
-        return "<"+class_name+" instance>";
+        return "<"+nyrt::shown_class_name(class_name)+" instance>";
     }
     case VMType::NATIVE:
         if(class_name.rfind("__builtin__:",0)==0) return "<built-in function "+class_name.substr(12)+">";
@@ -880,7 +880,7 @@ private:
                         for(auto& sa:cn->args) visit(sa);
                         if(cn->args.size()==1) emit_lc(VMVal::make_none(),l);
                         emit(Op::BUILD_LIST,(int)std::max<size_t>(2,cn->args.size()),l);
-                        emit(Op::STORE_SUBSCR,0,l);
+                        emit(Op::STORE_SUBSCR,1,l);   // 1: the index is a slice spec
                         break;
                     }
                 }
@@ -1148,7 +1148,7 @@ private:
                         for(auto& sa:cn->args) visit(sa);
                         if(cn->args.size()==1) emit_lc(VMVal::make_none(),l);
                         emit(Op::BUILD_LIST,(int)std::max<size_t>(2,cn->args.size()),l);
-                        emit(Op::DELETE_SUBSCR,0,l);
+                        emit(Op::DELETE_SUBSCR,1,l);   // 1: the index is a slice spec
                     }
                 }
                 break;
@@ -4005,6 +4005,132 @@ private:
         }
         return false;
     }
+    // ── eval / exec / compile (round 77; as NythonExecutor's) ──
+    std::string snippet_source(const VMVal& v, std::string& mode, std::string& fname, const char* who) {
+        if(v.type==VMType::INSTANCE&&nyrt::shown_class_name(v.class_name)=="_NyCode"&&v.map){
+            auto g=[&](const char* k){ auto it=v.map->find(k); return it!=v.map->end()?it->second.to_string():std::string(); };
+            mode=g("mode"); fname=g("co_filename");
+            return g("source");
+        }
+        if(v.type==VMType::BYTES) return v.bdata();
+        if(v.type==VMType::STRING) return v.s;
+        raise_native_exception("TypeError",std::string(who)+"() arg 1 must be a string, bytes or code object");
+        return std::string();
+    }
+    nython::node::node_ptr parse_snippet(const std::string& src, const std::string& fname) {
+        try {
+            auto source=nython::reader::SourceCode::from_text(src,fname);
+            auto reporter=std::make_shared<nython::exception::Reporter>(source);
+            auto lx=std::make_shared<nython::lexer::Lexer>(source);
+            lx->tokenize();
+            nython::parser::Parser pr(reporter.get(),(nython::Runnable*)this,lx.get());
+            auto ast=pr.parse();
+            if(ast) prelude_asts_.push_back(ast);   // what it defines outlives the call
+            return ast;
+        } catch(nython::exception::SyntaxError& e){
+            raise_native_exception("SyntaxError",e.message());
+        } catch(nython::exception::UnexpectedCharError& e){
+            raise_native_exception("SyntaxError",e.message());
+        }
+        return nullptr;
+    }
+    // Runs module-level code in a frame of its own whose variables start as
+    // `locals` and are handed back in it.
+    void run_code_with_locals(std::shared_ptr<VMCode> code, VMMap& locals) {
+        check_depth();
+        size_t base=stack_.size();
+        CallFrame fr; fr.code=code; fr.ip=0; fr.stack_base=base;
+        fr.locals=locals;
+        call_stack_.push_back(std::move(fr));
+        try { run_frame(); } catch(VMReturn&){}
+        catch(...){ call_stack_.pop_back(); if(stack_.size()>base) stack_.resize(base); throw; }
+        locals=call_stack_.back().locals;
+        call_stack_.pop_back();
+        if(stack_.size()>base) stack_.resize(base);
+    }
+    VMVal vm_eval_exec(bool is_exec, std::vector<VMVal>& a) {
+        const char* who=is_exec?"exec":"eval";
+        if(a.empty()) raise_native_exception("TypeError",std::string(who)+"() missing required argument 'source' (pos 1)");
+        std::string mode=is_exec?"exec":"eval", fname="<string>";
+        std::string src=snippet_source(a[0],mode,fname,who);
+        if(mode=="exec") is_exec=true;
+        if(!is_exec){
+            size_t b=src.find_first_not_of(" \t");
+            src=b==std::string::npos?std::string():src.substr(b);
+        }
+        auto ast=parse_snippet(src,fname);
+        if(!ast) return VMVal::make_none();
+        if(!is_exec){
+            if(!nython::node::is_expression_program(ast)) raise_native_exception("SyntaxError","invalid syntax");
+            ast=parse_snippet("__ny_eval__ = (" + src + "\n)",fname);   // its value lands in a variable
+        }
+        bool has_g=a.size()>1&&a[1].type!=VMType::NONE, has_l=a.size()>2&&a[2].type!=VMType::NONE;
+        if(has_g&&a[1].type!=VMType::MAP) raise_native_exception("TypeError",std::string(who)+"() globals must be a dict, not "+vm_type_name(a[1]));
+        Compiler c; auto code=c.compile(ast);
+        if(has_g||has_l){
+            // a module scope of its own made from the dicts (vm_import's
+            // mechanism): what it defines sees those names, not the program's
+            auto env=std::make_shared<VMMap>(); vmgc::track_map(env);
+            if(has_g&&a[1].map) for(auto& kv:*a[1].map) if(!vm_internal_key(kv.first)) (*env)[kv.first]=kv.second;
+            if(has_l&&a[2].type==VMType::MAP&&a[2].map) for(auto& kv:*a[2].map) if(!vm_internal_key(kv.first)) (*env)[kv.first]=kv.second;
+            tag_module_code(code,env);
+            code->module_top=true;
+            try{ exec_code(code,{},std::nullopt); } catch(VMReturn&){}
+            if(!is_exec){
+                auto it=env->find("__ny_eval__");
+                return it!=env->end()?it->second:VMVal::make_none();
+            }
+            VMVal out=has_l&&a[2].type==VMType::MAP?a[2]:a[1];
+            for(auto& kv:*env) if(!reflect_hidden(kv.first)) (*out.map)[kv.first]=kv.second;
+            return VMVal::make_none();
+        }
+        VMMap locals;
+        {
+            VMVal l=vm_locals_map();
+            if(l.map) for(auto& kv:*l.map) locals[kv.first]=kv.second;
+        }
+        VMMap seed=locals;
+        run_code_with_locals(code,locals);
+        if(!is_exec){
+            auto it=locals.find("__ny_eval__");
+            return it!=locals.end()?it->second:VMVal::make_none();
+        }
+        {
+            // what it bound or rebound, into the caller's scope
+            for(auto& kv:locals){
+                if(reflect_hidden(kv.first)) continue;
+                auto sit=seed.find(kv.first);
+                if(sit==seed.end()||!vm_same(sit->second,kv.second)) store_var(kv.first,kv.second);
+            }
+        }
+        return VMVal::make_none();
+    }
+    static bool vm_same(const VMVal& x, const VMVal& y) {
+        if(x.type!=y.type) return false;
+        switch(x.type){
+            case VMType::INT: return x.i==y.i && x.s==y.s;
+            case VMType::FLOAT: return x.d==y.d;
+            case VMType::BOOL: return x.b==y.b;
+            case VMType::STRING: return x.s==y.s;
+            case VMType::NONE: return true;
+            case VMType::LIST: return x.list==y.list;
+            case VMType::MAP: case VMType::INSTANCE: return x.map==y.map;
+            case VMType::FUNCTION: case VMType::CLASS: return x.code==y.code && x.class_name==y.class_name;
+            default: return false;
+        }
+    }
+    VMVal vm_compile(std::vector<VMVal>& a) {
+        if(a.size()<3) raise_native_exception("TypeError","compile() missing required argument (source, filename, mode)");
+        std::string fname=a[1].to_string(), mode=a[2].to_string();
+        if(mode!="exec"&&mode!="eval"&&mode!="single") raise_native_exception("ValueError","compile() mode must be 'exec', 'eval' or 'single'");
+        std::string m2=mode, f2=fname;
+        std::string src=snippet_source(a[0],m2,f2,"compile");
+        auto ast=parse_snippet(src,fname);
+        if(mode=="eval"&&ast&&!nython::node::is_expression_program(ast)) raise_native_exception("SyntaxError","invalid syntax");
+        std::vector<VMVal> ca{VMVal::make_str(src),VMVal::make_str(fname),VMVal::make_str(mode=="single"?"exec":mode)};
+        return vm_call(load_var("_NyCode"),ca,std::nullopt,nullptr);
+    }
+
     // ── Reflection (round 77) ──
     static bool reflect_hidden(const std::string& k) {
         if(k.empty()||(unsigned char)k[0]<0x20) return true;
@@ -4097,6 +4223,24 @@ private:
         for(auto& n:names) out.push_back(VMVal::make_str(n));
         return VMVal::make_list(std::move(out));
     }
+    // slice objects (round 77): the prelude's `slice` for a slice spec
+    // [start, stop(, step)], and a slice object's parts
+    VMVal make_slice_object(const VMVal& spec) {
+        std::vector<VMVal> a{VMVal::make_none(),VMVal::make_none(),VMVal::make_none()};
+        if(spec.type==VMType::LIST&&spec.list) for(size_t i=0;i<spec.list->size()&&i<3;i++) a[i]=(*spec.list)[i];
+        return vm_call(load_var("slice"),a,std::nullopt,nullptr);
+    }
+    std::vector<VMVal> slice_parts(const VMVal& sl) {
+        std::vector<VMVal> out;
+        for(const char* f:{"start","stop","step"}){
+            VMVal v=VMVal::make_none();
+            if(sl.map){ auto it=sl.map->find(f); if(it!=sl.map->end()) v=it->second; }
+            out.push_back(v);
+        }
+        return out;
+    }
+    std::unordered_set<const VMCode*> class_ran_;
+    int class_generation_=0;
     VMVal class_value(const std::string& name) {
         auto it=class_reg_.find(name);
         if(it==class_reg_.end()) return VMVal::make_none();
@@ -4332,18 +4476,29 @@ private:
             }
             case Op::LOAD_SUBSCR: {
                 VMVal idx=pop(),obj=pop();
+                // a slice object as the index of a builtin sequence (round 77)
+                if(obj.type!=VMType::INSTANCE&&idx.type==VMType::INSTANCE&&nyrt::shown_class_name(idx.class_name)=="slice"){
+                    std::vector<VMVal> parts=slice_parts(idx);
+                    push(vm_call_method(obj,"slice",parts)); break;
+                }
                 if(obj.type==VMType::INSTANCE){bool f=false;VMVal res=call_dunder_f(obj,"__getitem__",{idx},f);if(f){push(res);break;}
                     throw_exception(make_exception("TypeError",{VMVal::make_str("'"+obj.class_name+"' object is not subscriptable")}));}
                 push(get_sub(obj,idx)); break;
             }
             case Op::STORE_SUBSCR:{
                 VMVal idx=pop(),obj=pop(),val=pop();
+                if(ins.arg==1&&obj.type==VMType::INSTANCE) idx=make_slice_object(idx);
+                else if(obj.type!=VMType::INSTANCE&&idx.type==VMType::INSTANCE&&nyrt::shown_class_name(idx.class_name)=="slice")
+                    idx=VMVal::make_list(slice_parts(idx));
                 if(obj.type==VMType::INSTANCE){bool f=false;call_dunder_f(obj,"__setitem__",{idx,val},f);if(f) break;
                     throw_exception(make_exception("TypeError",{VMVal::make_str("'"+obj.class_name+"' object does not support item assignment")}));}
                 set_sub(obj,idx,std::move(val)); break;
             }
             case Op::DELETE_SUBSCR: {
                 VMVal key=pop(), obj=pop();
+                if(ins.arg==1&&obj.type==VMType::INSTANCE) key=make_slice_object(key);
+                else if(obj.type!=VMType::INSTANCE&&key.type==VMType::INSTANCE&&nyrt::shown_class_name(key.class_name)=="slice")
+                    key=VMVal::make_list(slice_parts(key));
                 if(obj.type==VMType::INSTANCE){
                     bool f=false; call_dunder_f(obj,"__delitem__",{key},f);
                     if(f) break;
@@ -4619,11 +4774,36 @@ private:
             }
             case Op::MAKE_CLASS: {
                 auto sub=fr.code->sub_codes[ins.arg];
+                // Each run of a class statement makes a new class (round 77;
+                // a factory's second call rebound the first one's class): a
+                // re-run is a copy registered as "Name#n", shown as Name.
+                if(class_ran_.count(sub.get())){
+                    auto copy=std::make_shared<VMCode>(*sub);
+                    copy->name=sub->name+"#"+std::to_string(++class_generation_);
+                    // its methods are owned by it (super() starts from the
+                    // method's owner_class)
+                    for(auto& sc:copy->sub_codes){
+                        if(sc&&sc->owner_class==sub->name){
+                            auto m=std::make_shared<VMCode>(*sc);
+                            m->owner_class=copy->name;
+                            sc=m;
+                        }
+                    }
+                    sub=copy;
+                } else class_ran_.insert(sub.get());
                 // Bases are looked up in scope (NythonExecutor::evalClassDecl)
                 for(auto& b:sub->bases){
                     // A module's own base is already "module.Class" (the
                     // parser qualified it): keep it.
                     if(b.find('.')!=std::string::npos&&class_reg_.count(b)) continue;
+                    // A class bound in scope under that name: that class.
+                    if(b.find('.')==std::string::npos){
+                        VMVal bv=load_var(nyrt::shown_class_name(b));
+                        if(bv.type==VMType::CLASS){
+                            std::string full=bv.class_name.empty()?bv.s:bv.class_name;
+                            if(!full.empty()&&class_reg_.count(full)){ b=full; continue; }
+                        }
+                    }
                     std::string rn=exc_class_name(b);
                     if(rn!=b && (class_reg_.count(rn) || nython::ny_is_builtin_exc(rn))) b=rn;
                 }
@@ -5307,7 +5487,7 @@ private:
             case VMType::FUNCTION: return "function";
             case VMType::NATIVE: return "builtin_function_or_method";
             case VMType::CLASS: return "type";
-            case VMType::INSTANCE: return v.class_name;
+            case VMType::INSTANCE: return nyrt::shown_class_name(v.class_name);
             case VMType::GENERATOR: return "generator";
             case VMType::ITERATOR: return "iterator";
             case VMType::UNDEFINED: return "undefined";
@@ -6008,8 +6188,9 @@ private:
             // type(x).__name__: type() gives a name string on this engine
             // (a module class "m.C" is named "C").
             if(attr=="__name__"||attr=="__qualname__"){
-                size_t dot=obj.s.rfind('.');
-                out=dot==std::string::npos?obj:VMVal::make_str(obj.s.substr(dot+1)); return true;
+                std::string shown=nyrt::shown_class_name(obj.s);
+                size_t dot=shown.rfind('.');
+                out=VMVal::make_str(dot==std::string::npos?shown:shown.substr(dot+1)); return true;
             }
             break;
         case VMType::FUNCTION: {
@@ -6031,8 +6212,9 @@ private:
             // A module's class is "module.Class" (round 77): __name__ is the
             // class's own name, __module__ the module's.
             if(attr=="__name__"||attr=="__qualname__"){
-                size_t dot=cname.rfind('.');
-                out=VMVal::make_str(dot==std::string::npos?cname:cname.substr(dot+1)); return true;
+                std::string shown=nyrt::shown_class_name(cname);
+                size_t dot=shown.rfind('.');
+                out=VMVal::make_str(dot==std::string::npos?shown:shown.substr(dot+1)); return true;
             }
             if(attr=="__module__"){
                 size_t dot=cname.rfind('.');
@@ -6671,6 +6853,12 @@ private:
         if(obj.type==VMType::INSTANCE){
             VMVal m;
             if(class_lookup(obj.class_name, method, m)) return invoke_method(m, obj, args, obj.class_name, kwargs);
+            // obj[i:j:k] (spelt obj.slice(i, j, k)): __getitem__ gets a slice
+            if(method=="slice"&&class_lookup(obj.class_name,"__getitem__",m)){
+                VMVal spec=VMVal::make_list(std::vector<VMVal>(args.begin(),args.end()));
+                std::vector<VMVal> ga{make_slice_object(spec)};
+                return invoke_method(m, obj, ga, obj.class_name);
+            }
             // __getattr__ supplies attributes that do not exist otherwise.
             {
                 VMVal ga;
@@ -6686,10 +6874,12 @@ private:
             // Only reached once no user-defined method/attribute of this name
             // was found above, so a class's own to_string/class_name etc, if
             // it defines one, still wins.
+            // self.__class__(...): a new instance of the object's class
+            if(method=="__class__") return vm_call(class_value(obj.class_name), args, std::nullopt, kwargs);
             if(method=="class_name"||method=="type_name")
-                return VMVal::make_str(obj.class_name);
+                return VMVal::make_str(nyrt::shown_class_name(obj.class_name));
             if(method=="to_string"||method=="str")
-                return VMVal::make_str("<"+obj.class_name+" instance>");
+                return VMVal::make_str("<"+nyrt::shown_class_name(obj.class_name)+" instance>");
             if(method=="id"){
                 uintptr_t raw=obj.map?(uintptr_t)obj.map.get():0;
                 return VMVal::make_int((int64_t)(raw & 0x7fffffffffffffffULL));
@@ -6716,7 +6906,7 @@ private:
             // No such method: AttributeError (the call returned none, which
             // hid misspelt method names).
             throw_exception(make_exception("AttributeError",{VMVal::make_str(
-                "'"+obj.class_name+"' object has no attribute '"+method+"'")}));
+                "'"+nyrt::shown_class_name(obj.class_name)+"' object has no attribute '"+method+"'")}));
         }
         // Class.method(...): a static method or a Nython method without self
         // takes the arguments as they are, a classmethod gets the class, and
@@ -7907,6 +8097,9 @@ private:
             return VMVal::make_list(std::move(r));});
         // locals() / globals() / vars() / dir() (round 77; they read none):
         // as on the interpreter (NythonExecutor reflect*).
+        globals_["eval"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_eval_exec(false,a); });
+        globals_["exec"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_eval_exec(true,a); });
+        globals_["compile"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_compile(a); });
         globals_["globals"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return vm_globals_map(); });
         globals_["locals"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return vm_locals_map(); });
         globals_["vars"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_vars(a); });
@@ -8946,7 +9139,7 @@ private:
             case VMType::FUNCTION:return VMVal::make_str("function");
             case VMType::NATIVE:return VMVal::make_str("builtin");
             case VMType::CLASS:return VMVal::make_str("class");
-            case VMType::INSTANCE:return VMVal::make_str(a[0].class_name);
+            case VMType::INSTANCE:return VMVal::make_str(nyrt::shown_class_name(a[0].class_name));
             case VMType::GENERATOR:case VMType::ITERATOR:return VMVal::make_str("generator");
             case VMType::UNDEFINED:return VMVal::make_str("undefined");
             case VMType::BYTES:return VMVal::make_str(a[0].b?"bytearray":"bytes");
@@ -9087,7 +9280,7 @@ private:
             case VMType::MAP:return VMVal::make_str("map");   // as the interpreter reports it
             case VMType::FUNCTION:return VMVal::make_str("function");
             case VMType::CLASS:return VMVal::make_str("class");
-            case VMType::INSTANCE:return VMVal::make_str(a[0].class_name);
+            case VMType::INSTANCE:return VMVal::make_str(nyrt::shown_class_name(a[0].class_name));
             case VMType::UNDEFINED:return VMVal::make_str("undefined");
             default:return VMVal::make_str("unknown");}});
         globals_["abs"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
@@ -9287,10 +9480,29 @@ private:
         });
         // issubclass(B, A): B's MRO contains A (a tuple of classes: any).
         globals_["issubclass"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            // a builtin type (int, bool ...) is a tagged native
+            auto builtin_name=[](const VMVal& v)->std::string{
+                if(v.type!=VMType::NATIVE) return std::string();
+                for(const char* p:{"__builtin__:","__native__:"})
+                    if(v.class_name.rfind(p,0)==0) return v.class_name.substr(std::string(p).size());
+                // the type natives carry their type's name (tag_type_builtins)
+                if(!v.class_name.empty()&&v.class_name.rfind("__",0)!=0) return v.class_name=="map"?std::string("dict"):v.class_name;
+                return std::string();
+            };
+            if(a.size()>=2&&a[0].type==VMType::NATIVE){
+                std::string sub=builtin_name(a[0]);
+                auto bone=[&](const VMVal& c){
+                    std::string sup=c.type==VMType::CLASS?nyrt::shown_class_name(c.class_name):c.type==VMType::STRING?c.s:builtin_name(c);
+                    return nyrt::builtin_type_derives(sub,sup);
+                };
+                if(a[1].type==VMType::LIST&&a[1].list){ for(auto& c:*a[1].list) if(bone(c)) return VMVal::make_bool(true); return VMVal::make_bool(false); }
+                return VMVal::make_bool(bone(a[1]));
+            }
             if(a.size()<2||a[0].type!=VMType::CLASS) return VMVal::make_bool(false);
             auto one=[&](const VMVal& c){
-                if(c.type==VMType::CLASS) return class_derives(a[0].class_name, c.class_name);
+                if(c.type==VMType::CLASS) return class_derives(a[0].class_name, c.class_name)||nyrt::shown_class_name(c.class_name)=="object";
                 if(c.type==VMType::STRING) return class_derives(a[0].class_name, c.s);
+                if(builtin_name(c)=="object") return true;
                 return false;
             };
             if(a[1].type==VMType::LIST&&a[1].list){

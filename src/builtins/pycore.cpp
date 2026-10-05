@@ -562,7 +562,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
                 if (fit->second.find("__func__:") == 0 || fit->second.find("__lambda__") == 0) return str_("function");
                 if (fit->second.find("__builtin__:") == 0 || fit->second.find("__bmethod__:") == 0) return str_("builtin");
                 if (fit->second.find("__class__:") == 0) return str_("class");
-                if (fit->second.find("__instance__:") == 0) return str_(fit->second.substr(13));
+                if (fit->second.find("__instance__:") == 0) return str_(NythonExecutor::shownClassName(fit->second.substr(13)));
             }
             return str_("string");
         }

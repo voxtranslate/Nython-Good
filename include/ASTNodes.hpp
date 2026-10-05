@@ -910,5 +910,33 @@ struct OptChainNode : Node {
     Value eval(Context*) override { return NONE_VALUE; } // handled in executor
 };
 
+// Whether a parsed program is one expression: the prompt shows its value,
+// eval() accepts it (round 77; main.cpp's, shared).
+inline bool is_expression_program(const node_ptr& ast) {
+    node_ptr n = ast;
+    for (int depth = 0; n && depth < 4; depth++) {
+        NodeType t = n->type();
+        if (t == NodeType::SCRIPT || t == NodeType::STATEMENTS || t == NodeType::BLOCK || t == NodeType::STATEMENT) {
+            auto st = n->statements();
+            if (st.size() != 1) return false;
+            n = st[0];
+            continue;
+        }
+        switch (t) {
+            case NodeType::TUPLE: case NodeType::LIST: case NodeType::MAP: case NodeType::FLOAT:
+            case NodeType::INTEGER: case NodeType::STRING: case NodeType::TRUE: case NodeType::FALSE:
+            case NodeType::NONE: case NodeType::CALL: case NodeType::INTERVAL: case NodeType::COMPLEX:
+            case NodeType::SLICE: case NodeType::RANGE: case NodeType::VARIABLE: case NodeType::ATTRIBUTE:
+            case NodeType::SUBSCRIPT: case NodeType::LAMBDA: case NodeType::UNARY: case NodeType::BINARY:
+            case NodeType::BINARY_OP: case NodeType::BINARY_RE: case NodeType::DYN_BINOP:
+            case NodeType::COMPREHENSION: case NodeType::OPT_CHAIN: case NodeType::BYTES: case NodeType::SELF:
+                return true;
+            default:
+                return false;
+        }
+    }
+    return false;
+}
+
 } // namespace nython::node
 #endif

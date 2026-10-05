@@ -1573,7 +1573,20 @@ node_ptr Parser::atom(){
         while(have(TokenType::Bytes)) bt.value += prev().value;
         return make_node<BytesNode>(bt);
     }
-    if(have(TokenType::Complex)) return make_node<ComplexNode>(prev());
+    // An imaginary literal, 2j / 1.5J: complex(0, 2.0) (round 77; it read none)
+    if(have(TokenType::Complex)){
+        Token ct = prev();
+        std::string num = ct.value;
+        if(!num.empty() && (num.back() == 'j' || num.back() == 'J')) num.pop_back();
+        if(num.find('.') == std::string::npos && num.find('e') == std::string::npos && num.find('E') == std::string::npos) num += ".0";
+        Token ft = ct; ft.value = "complex";
+        auto call = make_node<CallNode>(ct, make_node<VariableNode>(ft));
+        Token zt = ct; zt.value = "0"; zt.type(TokenType::Integer);
+        call->add(make_node<IntegerNode>(zt));
+        Token nt = ct; nt.value = num; nt.type(TokenType::Float);
+        call->add(make_node<FloatNode>(nt));
+        return call;
+    }
     if(have(TokenType::True)) return make_node<BoolNode>(prev(), true);
     if(have(TokenType::False)) return make_node<BoolNode>(prev(), false);
     if(have(TokenType::None)||have(TokenType::None)||have(TokenType::None)) return make_node<NoneNode>(prev());

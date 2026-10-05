@@ -268,6 +268,240 @@ def _ny_dict_merge(*parts):
             out[k] = p[k]
     return out
 
+class slice:
+    # slice(stop) / slice(start, stop[, step]): what a[i:j:k] hands an
+    # object's __getitem__ / __setitem__ / __delitem__, and an index that
+    # slices a list, str, tuple or bytes (round 77; slice() returned none)
+    def __init__(self, *args):
+        if len(args) == 0:
+            raise TypeError("slice expected at least 1 argument, got 0")
+        if len(args) > 3:
+            raise TypeError("slice expected at most 3 arguments, got " + str(len(args)))
+        if len(args) == 1:
+            self.start = none
+            self.stop = args[0]
+            self.step = none
+        else:
+            self.start = args[0]
+            self.stop = args[1]
+            self.step = args[2] if len(args) == 3 else none
+
+    def indices(self, length):
+        var step = 1 if self.step is none else self.step
+        if step == 0:
+            raise ValueError("slice step cannot be zero")
+        var lower = -1 if step < 0 else 0
+        var upper = length - 1 if step < 0 else length
+        var start = upper if step < 0 else lower
+        if self.start is not none:
+            start = self.start
+            if start < 0:
+                start = max(start + length, lower)
+            else:
+                start = min(start, upper)
+        var stop = lower if step < 0 else upper
+        if self.stop is not none:
+            stop = self.stop
+            if stop < 0:
+                stop = max(stop + length, lower)
+            else:
+                stop = min(stop, upper)
+        return (start, stop, step)
+
+    def __eq__(self, other):
+        return isinstance(other, slice) and [self.start, self.stop, self.step] == [other.start, other.stop, other.step]
+
+    def __repr__(self):
+        return "slice(" + repr(self.start) + ", " + repr(self.stop) + ", " + repr(self.step) + ")"
+
+class _NyCode:
+    # what compile(source, filename, mode) returns; eval() / exec() run it
+    def __init__(self, source, filename, mode):
+        self.source = source
+        self.co_filename = filename
+        self.mode = mode
+        self.co_name = "<module>"
+
+    def __repr__(self):
+        return "<code object <module>, file \"" + self.co_filename + "\", line 1>"
+
+class object:
+    # the root of the class tree (round 77; `object` was undefined):
+    # object(), class C(object), object.__init__(self) in a super() chain
+    def __init__(self, *args, **kwargs):
+        pass
+
+def _ny_complex_part(x):
+    # a component as Python shows it: 2.0 -> 2, 1.5 -> 1.5
+    var t = repr(float(x))
+    if t.endswith(".0"):
+        t = t[0:len(t) - 2]
+    return t
+
+def _ny_as_complex(o):
+    if isinstance(o, complex):
+        return o
+    if isinstance(o, "bool") or isinstance(o, "int") or isinstance(o, "float"):
+        return complex(o, 0)
+    return none
+
+class complex:
+    # complex(real=0, imag=0), complex("1+2j"); the literal 2j is complex(0, 2.0)
+    # (round 77; complex() and 2j read none)
+    def __init__(self, real=0, imag=0):
+        if isinstance(real, "str"):
+            var c = complex._parse(real)
+            real = c[0]
+            imag = c[1]
+        elif isinstance(real, complex):
+            var r0 = real
+            real = r0.real
+            imag = r0.imag + imag
+        self.real = float(real)
+        self.imag = float(imag)
+
+    @staticmethod
+    def _parse(text):
+        var t = text.strip().replace(" ", "")
+        if t.startswith("(") and t.endswith(")"):
+            t = t[1:len(t) - 1]
+        if t == "":
+            raise ValueError("complex() arg is a malformed string")
+        if not (t.endswith("j") or t.endswith("J")):
+            return [float(t), 0.0]
+        var body = t[0:len(t) - 1]
+        var split = -1
+        for i in range(len(body) - 1, 0, -1):
+            if (body[i] == "+" or body[i] == "-") and body[i - 1] != "e" and body[i - 1] != "E":
+                split = i
+                break
+        try:
+            if split < 0:
+                var im = 1.0 if body == "" or body == "+" else (-1.0 if body == "-" else float(body))
+                return [0.0, im]
+            var re = float(body[0:split])
+            var ims = body[split:]
+            var im2 = 1.0 if ims == "+" else (-1.0 if ims == "-" else float(ims))
+            return [re, im2]
+        except ValueError:
+            raise ValueError("complex() arg is a malformed string")
+
+    def __add__(self, o):
+        var c = _ny_as_complex(o)
+        if c is none:
+            raise TypeError("unsupported operand type(s) for +: 'complex' and '" + type(o) + "'")
+        return complex(self.real + c.real, self.imag + c.imag)
+
+    def __radd__(self, o):
+        return self.__add__(o)
+
+    def __sub__(self, o):
+        var c = _ny_as_complex(o)
+        if c is none:
+            raise TypeError("unsupported operand type(s) for -: 'complex' and '" + type(o) + "'")
+        return complex(self.real - c.real, self.imag - c.imag)
+
+    def __rsub__(self, o):
+        var c = _ny_as_complex(o)
+        if c is none:
+            raise TypeError("unsupported operand type(s) for -: '" + type(o) + "' and 'complex'")
+        return complex(c.real - self.real, c.imag - self.imag)
+
+    def __mul__(self, o):
+        var c = _ny_as_complex(o)
+        if c is none:
+            raise TypeError("unsupported operand type(s) for *: 'complex' and '" + type(o) + "'")
+        return complex(self.real * c.real - self.imag * c.imag, self.real * c.imag + self.imag * c.real)
+
+    def __rmul__(self, o):
+        return self.__mul__(o)
+
+    def __truediv__(self, o):
+        var c = _ny_as_complex(o)
+        if c is none:
+            raise TypeError("unsupported operand type(s) for /: 'complex' and '" + type(o) + "'")
+        var d = c.real * c.real + c.imag * c.imag
+        if d == 0:
+            raise ZeroDivisionError("complex division by zero")
+        return complex((self.real * c.real + self.imag * c.imag) / d, (self.imag * c.real - self.real * c.imag) / d)
+
+    def __rtruediv__(self, o):
+        var c = _ny_as_complex(o)
+        if c is none:
+            raise TypeError("unsupported operand type(s) for /: '" + type(o) + "' and 'complex'")
+        return c.__truediv__(self)
+
+    def __pow__(self, o):
+        var c = _ny_as_complex(o)
+        if c is none:
+            raise TypeError("unsupported operand type(s) for ** or pow(): 'complex' and '" + type(o) + "'")
+        if c.imag == 0 and c.real == int(c.real) and abs(c.real) <= 1000:
+            # an integer power: exact repeated squaring
+            var n = int(c.real)
+            var result = complex(1, 0)
+            var base = complex(self.real, self.imag) if n >= 0 else complex(1, 0) / self
+            n = abs(n)
+            while n > 0:
+                if n % 2 == 1:
+                    result = result * base
+                base = base * base
+                n = n // 2
+            return result
+        if self.real == 0 and self.imag == 0:
+            if c.real == 0 and c.imag == 0:
+                return complex(1, 0)
+            return complex(0, 0)
+        var r = sqrt(self.real * self.real + self.imag * self.imag)
+        var th = atan2(self.imag, self.real)
+        var lr = log(r)
+        var mag = exp(c.real * lr - c.imag * th)
+        var ang = c.imag * lr + c.real * th
+        return complex(mag * cos(ang), mag * sin(ang))
+
+    def __rpow__(self, o):
+        var c = _ny_as_complex(o)
+        if c is none:
+            raise TypeError("unsupported operand type(s) for ** or pow(): '" + type(o) + "' and 'complex'")
+        return c.__pow__(self)
+
+    def __neg__(self):
+        return complex(-self.real, -self.imag)
+
+    def __pos__(self):
+        return complex(self.real, self.imag)
+
+    def __abs__(self):
+        return sqrt(self.real * self.real + self.imag * self.imag)
+
+    def __bool__(self):
+        return self.real != 0 or self.imag != 0
+
+    def __eq__(self, o):
+        var c = _ny_as_complex(o)
+        return c is not none and self.real == c.real and self.imag == c.imag
+
+    def __ne__(self, o):
+        return not self.__eq__(o)
+
+    def __hash__(self):
+        if self.imag == 0:
+            return hash(self.real)
+        return hash(repr(self))
+
+    def conjugate(self):
+        return complex(self.real, -self.imag)
+
+    def __repr__(self):
+        if self.real == 0 and repr(self.real) == "0.0":
+            return _ny_complex_part(self.imag) + "j"
+        var im = _ny_complex_part(self.imag)
+        if not (im.startswith("-") or im == "nan"):
+            im = "+" + im
+        return "(" + _ny_complex_part(self.real) + im + "j)"
+
+    def __str__(self):
+        return self.__repr__()
+
 def exit(code=none):
     # Python's: SystemExit, so finally blocks run and `except SystemExit`
     # can stop it (round 77; it ended the process on the spot). The program

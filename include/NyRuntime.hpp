@@ -97,6 +97,24 @@ inline void set_command_line(const std::string& script, int argc, char** args, i
     for (int i = first_arg; i < argc; i++) argv().push_back(args[i] ? args[i] : "");
 }
 
+// ── Classes made by a class statement run again (round 77) ───────────────────
+// Each run of a class statement makes a new class; a re-run is registered as
+// "Name#n" on both engines (classes are keyed by name). What is shown -
+// type(x), __name__, reprs, messages - is Name.
+inline std::string shown_class_name(const std::string& n) {
+    size_t h = n.rfind('#');
+    if (h == std::string::npos || h == 0 || h + 1 >= n.size()) return n;
+    for (size_t i = h + 1; i < n.size(); i++) if (n[i] < '0' || n[i] > '9') return n;
+    return n.substr(0, h);
+}
+
+// issubclass over the builtin types (round 77): a type derives from itself
+// and from object, bool from int.
+inline bool builtin_type_derives(const std::string& sub, const std::string& sup) {
+    if (sub.empty() || sup.empty()) return false;
+    return sub == sup || sup == "object" || (sub == "bool" && sup == "int");
+}
+
 // ── Module namespaces over the flat builtins ─────────────────────────────────
 // `import os` binds a namespace so Python-style code works: os.getcwd() is
 // os_getcwd(), os.path.join() is os_path_join(). Given every builtin name,

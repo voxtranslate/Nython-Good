@@ -497,32 +497,7 @@ static std::string exc_text(const std::string& s) {
 }
 
 // Whether a parsed chunk is one expression (so the prompt shows its value).
-static bool is_expression_chunk(const nython::node::node_ptr& ast) {
-    using nython::node::NodeType;
-    nython::node::node_ptr n = ast;
-    for (int depth = 0; n && depth < 4; depth++) {
-        NodeType t = n->type();
-        if (t == NodeType::SCRIPT || t == NodeType::STATEMENTS || t == NodeType::BLOCK || t == NodeType::STATEMENT) {
-            auto st = n->statements();
-            if (st.size() != 1) return false;
-            n = st[0];
-            continue;
-        }
-        switch (t) {
-            case NodeType::TUPLE: case NodeType::LIST: case NodeType::MAP: case NodeType::FLOAT:
-            case NodeType::INTEGER: case NodeType::STRING: case NodeType::TRUE: case NodeType::FALSE:
-            case NodeType::NONE: case NodeType::CALL: case NodeType::INTERVAL: case NodeType::COMPLEX:
-            case NodeType::SLICE: case NodeType::RANGE: case NodeType::VARIABLE: case NodeType::ATTRIBUTE:
-            case NodeType::SUBSCRIPT: case NodeType::LAMBDA: case NodeType::UNARY: case NodeType::BINARY:
-            case NodeType::BINARY_OP: case NodeType::BINARY_RE: case NodeType::DYN_BINOP:
-            case NodeType::COMPREHENSION: case NodeType::OPT_CHAIN: case NodeType::BYTES: case NodeType::SELF:
-                return true;
-            default:
-                return false;
-        }
-    }
-    return false;
-}
+static bool is_expression_chunk(const nython::node::node_ptr& ast) { return nython::node::is_expression_program(ast); }
 
 // The prompt loop: run_chunk(code) runs what was typed.
 static void interactive_loop(const std::function<void(const std::string&)>& run_chunk, bool banner, const char* engine) {

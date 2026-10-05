@@ -556,6 +556,8 @@ Value dispatch_core(NythonExecutor& E,
             }
             return NONE_VALUE;
         }
+        if (name == "eval" || name == "exec") return E.evalExecBuiltin(name == "exec", args, ctx);
+        if (name == "compile") return E.compileBuiltin(args, ctx);
         if (name == "locals") return E.reflectLocals(ctx);
         if (name == "globals") return E.reflectGlobals(ctx);
         if (name == "vars") return E.reflectVars(args, ctx);
