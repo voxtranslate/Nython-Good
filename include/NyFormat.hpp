@@ -62,6 +62,7 @@ struct FmtVal {
     bool b = false;
     std::string s;          // str() of the value for STR / NONE / OTHER
     std::string type_name;  // for error messages
+    bool done = false;      // s is already the formatted text (an object's __format__)
     static FmtVal of_int(int64_t v) { FmtVal f; f.kind = INT; f.i = v; f.type_name = "int"; return f; }
     static FmtVal of_big(const BigInt& v) {
         int64_t t; if (v.to_i64(t)) return of_int(t);
@@ -275,6 +276,7 @@ inline std::string format_str(const std::string& str, const Spec& s) {
 }
 // format(value, spec)
 inline std::string format_value(const FmtVal& v, const std::string& spec) {
+    if (v.done) return v.s;
     if (spec.empty()) {
         switch (v.kind) {
             case FmtVal::INT: return v.is_big ? v.big.to_string() : std::to_string(v.i);
@@ -301,6 +303,7 @@ struct FieldRef {
     int64_t index = 0;
     std::string name;
     std::vector<std::pair<char, std::string>> chain;   // ('.', attr) or ('[', key)
+    std::string spec;   // the field's format spec, nested fields expanded (for __format__)
 };
 using FieldResolver = std::function<FmtVal(const FieldRef&, char conv)>;
 
@@ -367,6 +370,7 @@ inline std::string str_format_impl(const std::string& fmt, const FieldResolver& 
                 } else raise("ValueError", "Only '.' or '[' may follow ']' in format field specifier");
             }
             if (spec.find('{') != std::string::npos) spec = str_format_impl(spec, res, auto_idx, mode, depth + 1);
+            ref.spec = spec;
             out += format_value(res(ref, conv), spec);
         } else if (c == '}') {
             if (i + 1 < n && fmt[i+1] == '}') { out += '}'; i += 2; continue; }

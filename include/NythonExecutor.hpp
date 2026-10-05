@@ -234,7 +234,12 @@ Value dispatch_hash     (NythonExecutor& E, const std::string& name, std::vector
 std::vector<std::string> hash_builtin_names();
 Value dispatch_pymath   (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 std::vector<std::string> pymath_builtin_names();
-Value dispatch_math     (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
+// lib/json.ny's scanner/encoder and lib/random.ny's Mersenne Twister (_json_*, _mt_*)
+Value dispatch_pyjson   (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
+std::vector<std::string> pyjson_builtin_names();
+Value dispatch_pyrandom (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
+std::vector<std::string> pyrandom_builtin_names();
+Value dispatch_math    (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_os       (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_data     (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_threading(NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
@@ -665,6 +670,8 @@ public:   // NythonExecutor is a struct: members default to public
         for (auto& name : tls_builtin_names()) registerBuiltin(name);
         for (auto& name : hash_builtin_names()) registerBuiltin(name);
         for (auto& name : pymath_builtin_names()) registerBuiltin(name);
+        for (auto& name : pyjson_builtin_names()) registerBuiltin(name);
+        for (auto& name : pyrandom_builtin_names()) registerBuiltin(name);
         // Exception types
         std::vector<std::string> exc_types = {
             "Exception","BaseException","Error",
@@ -975,8 +982,10 @@ public:   // NythonExecutor is a struct: members default to public
     }
 
     Value evalFloat(node_ptr node) {
-        try { return Value(std::stod(node->token().value)); }
-        catch (...) { return Value(0.0); }
+        // strtod, not stod: a literal that underflows or overflows (5e-324,
+        // 1e400) is the nearest double or inf, as in Python; stod threw and
+        // the literal read 0.0.
+        return Value(std::strtod(node->token().value.c_str(), nullptr));
     }
 
     Value evalString(node_ptr node, Context* ctx = nullptr) {
@@ -2317,6 +2326,24 @@ public:   // NythonExecutor is a struct: members default to public
             if (isSetCont(c)) return setKey(k);       // a frozenset; a set raises
             if (!isInstanceVal(k)) pyRaise("TypeError", "unhashable type: '" + typeNameOf(k) + "'");
         }
+        if (isInstanceVal(k) && instanceHasMethod(k, "__hash__")) {
+            // An object with __hash__ is keyed by its class and hash, as a set
+            // element is (setKey): two equal dates are one key, as in Python
+            // (it was identity, so d[date(2024, 1, 1)] missed). The first
+            // object stored stands for the key.
+            std::vector<Value> none;
+            Value h = callMethod(k, "__hash__", none, global_ctx);
+            std::string hid = "h" + instanceClassName(k) + ":" + strOf(h, global_ctx);
+            key_objs_.emplace(hid, k);
+            if (!keys_owner_) {
+                keys_owner_ = this;
+                nygc::g_keys.any = &keysAny;
+                nygc::g_keys.each = &keysEach;
+                nygc::g_keys.lookup = &keysLookup;
+                nygc::g_keys.drop_garbage = &keysDropGarbage;
+            }
+            return nypy::key_of_obj(hid);
+        }
         char buf[32]; snprintf(buf, sizeof buf, "%p", k.type == ValueType::USERDATA ? k.value.p : (void*)k.value.gc);
         std::string id = std::string(k.type == ValueType::USERDATA ? "u" : "g") + buf;
         key_objs_[id] = k;
@@ -3168,7 +3195,13 @@ public:   // NythonExecutor is a struct: members default to public
                     }
                 }
                 if (conv) return toFmtVal(v, conv, ctx);
-                if (isInstanceVal(v)) return nypy::FmtVal::of_other(strOf(v, ctx), typeNameOf(v));
+                if (isInstanceVal(v)) {
+                    // its __format__ with the field's spec, as format(v, spec)
+                    // ("{:%Y-%m-%d}".format(date) raised "Invalid format specifier")
+                    nypy::FmtVal r = nypy::FmtVal::of_other(formatValue(v, f.spec, ctx), typeNameOf(v));
+                    r.done = true;
+                    return r;
+                }
                 return toFmtVal(v, 0, ctx);
             });
         });
@@ -6374,6 +6407,12 @@ public:
 
         // ── Module dispatch (try each module in priority order) ────────────────
         Value result;
+        // lib/random.ny's generator and lib/json's codec (builtins/pyrandom.cpp,
+        // pyjson.cpp: _mt_*, _json_*) are called in hot loops: straight to them.
+        if (name.size() > 4 && name[0] == '_' && (name[1] == 'm' || name[1] == 'j')) {
+            result = dispatch_pyrandom(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
+            result = dispatch_pyjson(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
+        }
         // Shared tensor kernels first: they replace the older per-module
         // implementations of the same names (see include/NyTensor.hpp).
         result = dispatch_nt(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
@@ -8569,7 +8608,11 @@ public:
                 for (auto& fn : {"sqrt","sin","cos","tan","log","floor","ceil","abs","pow","exp","asin","acos","atan","atan2"})
                     registerBuiltin(fn);
             }
-            ctx->defineByName("math", math_obj);
+            // `import math as m` binds m (the alias was dropped: m was a NameError)
+            ctx->defineByName(in_node->alias.empty() ? "math" : in_node->alias, math_obj);
+            // and every `import math` binds it: a second one, in another
+            // module's scope, returned early above and bound nothing there
+            imported_modules_.erase(module_name);
             // Also define pi/e as globals for convenience
             ctx->defineByName("PI", Value(3.14159265358979323846));
             ctx->defineByName("E", Value(2.71828182845904523536));

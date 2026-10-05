@@ -47,7 +47,7 @@ struct IntegerNode : Node {
 struct FloatNode : Node {
     FloatNode(Token t) : Node(t, NodeType::FLOAT) {}
     Value eval(Context* ctx) override {
-        try { return Value(std::stod(_token.value)); } catch(...) { return Value(0.0); }
+        return Value(std::strtod(_token.value.c_str(), nullptr));   // 5e-324 / 1e400 (stod threw)
     }
     void writeToStdOut(PrettyPrinter p) { p.printf("<Float value=\"%s\" line=\"%d\"/>\n", _token.value.c_str(), line()); }
 };

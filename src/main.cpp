@@ -672,6 +672,11 @@ struct BridgeConv {
     // bytearrays passed in: the interpreter copy and the VM original
     std::vector<std::pair<nyheap::Bytes*, VMVal>> barrays;
     nython::vm::VirtualMachine* vm = nullptr;   // builds sets (their keys are the VM's)
+    // What a VM value with no interpreter form (a function, a class, a
+    // generator) becomes: none - except for lib/json's encoder, which must
+    // see that such a value is there (undefined: not plain data, so the
+    // document goes to the Nython encoder and default=) rather than null.
+    Value opaque = NONE_VALUE;
     explicit BridgeConv(NythonExecutor& e) : exec(e) {}
 
     static const void* key_of(const VMVal& v) {
@@ -746,7 +751,7 @@ struct BridgeConv {
                 }
                 return out;
             }
-            default: return NONE_VALUE;
+            default: return opaque;
         }
     }
 
@@ -893,6 +898,7 @@ void install_vm_builtin_bridge(Runnable* runner) {
         [ex, vm](const std::string& n, std::vector<VMVal>& a) -> VMVal {
             BridgeConv conv(*ex);
             conv.vm = vm;
+            if (n.compare(0, 6, "_json_") == 0) conv.opaque = UNDEFINED_VALUE;
             std::vector<Value> args;
             args.reserve(a.size());
             for (auto& v : a) args.push_back(conv.to_value(v));

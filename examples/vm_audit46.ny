@@ -496,7 +496,7 @@ check("poll unknown pid", got, "ChildProcessError")
 # made time_ms() return seconds and sleep(0.2) not sleep.
 check("time_ms is milliseconds", time_ms() > 1000000000000, true)
 check("time_now is seconds", time_now() > 1000000000 and time_now() < 100000000000, true)
-check("time() == time_now()", abs(time() - time_now()) < 1, true)
+check("time.time() == time_now()", abs(time.time() - time_now()) < 1, true)   # `import time` binds lib/time.ny, Python's module
 var a0 = time_ms()
 sleep(0.2)
 var dt = time_ms() - a0

@@ -842,7 +842,7 @@ private:
         switch(nd->type()) {
         // Literals
         case NT::INTEGER: emit_lc(int_literal(nd->token().value),l); break;
-        case NT::FLOAT:   emit_lc(VMVal::make_float(std::stod(nd->token().value)),l); break;
+        case NT::FLOAT:   emit_lc(VMVal::make_float(std::strtod(nd->token().value.c_str(),nullptr)),l); break;   // 5e-324 / 1e400: strtod, not stod (it threw)
         case NT::STRING:  emit_lc(VMVal::make_str(nd->token().value),l); break;
         case NT::BYTES:   emit_lc(VMVal::make_bytes(nd->token().value),l); break;
         case NT::TRUE:    emit_lc(VMVal::make_bool(true),l); break;
@@ -1826,7 +1826,7 @@ private:
                 auto& dn=fn->defaults[i];
                 switch(dn->type()){
                     case NT::INTEGER: dflt=int_literal(dn->token().value); break;
-                    case NT::FLOAT:   dflt=VMVal::make_float(std::stod(dn->token().value)); break;
+                    case NT::FLOAT:   dflt=VMVal::make_float(std::strtod(dn->token().value.c_str(),nullptr)); break;
                     case NT::STRING:  dflt=VMVal::make_str(dn->token().value); break;
                     case NT::TRUE:    dflt=VMVal::make_bool(true); break;
                     case NT::FALSE:   dflt=VMVal::make_bool(false); break;
@@ -5960,7 +5960,12 @@ private:
                     }
                 }
                 if(conv) return to_fmtval(v,conv);
-                if(v.type==VMType::INSTANCE) return nypy::FmtVal::of_other(vm_str(v),v.class_name);
+                if(v.type==VMType::INSTANCE){
+                    // its __format__ with the field's spec, as format(v, spec)
+                    nypy::FmtVal r=nypy::FmtVal::of_other(format_value(v,f.spec),v.class_name);
+                    r.done=true;
+                    return r;
+                }
                 return to_fmtval(v,0);
             });
         });
@@ -6070,6 +6075,19 @@ private:
             case VMType::BYTES:
                 if(k.b) raise_native_exception("TypeError","unhashable type: 'bytearray'");
                 return nypy::key_of_bytes(k.s);
+            case VMType::INSTANCE: {
+                // An object with __hash__: keyed by its class and hash, as a
+                // set element is (set_key) - two equal dates are one key. The
+                // first object stored stands for the key.
+                bool f=false;
+                VMVal h=call_dunder_f(k,"__hash__",{},f);
+                if(f){
+                    std::string hid="vh"+k.class_name+":"+h.to_string();
+                    vm_key_objs().emplace(hid,k);
+                    return nypy::key_of_obj(hid);
+                }
+                break;
+            }
             default: break;
         }
         const void* id=k.map?(const void*)k.map.get():k.code?(const void*)k.code.get():k.gen?(const void*)k.gen.get():(const void*)k.iter.get();
@@ -9191,6 +9209,15 @@ private:
         });
         def("divmod",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
             if(a.size()<2) vm->raise_native_exception("TypeError","divmod expected 2 arguments");
+            if(a[0].type==VMType::INSTANCE||a[1].type==VMType::INSTANCE){
+                // __divmod__ / __rdivmod__, else the objects' // and %
+                // (divmod(timedelta, timedelta) was a TypeError)
+                VMVal res,q,r;
+                if(vm->binary_dunder(a[0],a[1],"__divmod__","__rdivmod__",res)) return res;
+                if(vm->binary_dunder(a[0],a[1],"__floordiv__","__rfloordiv__",q)&&vm->binary_dunder(a[0],a[1],"__mod__","__rmod__",r))
+                    return VMVal::make_tuple({q,r});
+                vm->raise_native_exception("TypeError","unsupported operand type(s) for divmod(): '"+vm_type_name(a[0])+"' and '"+vm_type_name(a[1])+"'");
+            }
             return VMVal::make_tuple({vm->binop(nypy::A_FLOORDIV,a[0],a[1]),vm->binop(nypy::A_MOD,a[0],a[1])});
         });
         for(const char* nm:{"hex","oct","bin"}){
