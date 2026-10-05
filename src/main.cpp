@@ -893,9 +893,18 @@ void install_vm_builtin_bridge(Runnable* runner) {
         [ex, vm](const std::string& n, std::vector<VMVal>& a) -> VMVal {
             BridgeConv conv(*ex);
             conv.vm = vm;
+            // Path-like objects (__fspath__) as the strings they stand for,
+            // in a copy: the caller's arguments are left as they were.
+            std::vector<VMVal> path_args;
+            std::vector<VMVal>* src = &a;
+            if (!a.empty() && nyrt::takes_paths(n)) {
+                path_args = a;
+                vm->fspath_args(path_args);
+                src = &path_args;
+            }
             std::vector<Value> args;
-            args.reserve(a.size());
-            for (auto& v : a) args.push_back(conv.to_value(v));
+            args.reserve(src->size());
+            for (auto& v : *src) args.push_back(conv.to_value(v));
             Value r;
             // Interpreter builtins raise Nython exceptions as a tagged
             // std::string ("__exc__:FileNotFoundError:msg"), which the VM's

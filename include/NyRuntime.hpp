@@ -277,4 +277,20 @@ inline bool prefers_lib_module(const std::string& name) {
     return false;
 }
 
+// Builtins that take file-system paths: an argument with __fspath__ (a
+// pathlib.Path, os.PathLike) reaches them as the string it returns, as
+// Python's os functions and open() accept path-like objects (both engines:
+// NythonExecutor::callBuiltin, and the VM's builtin bridge).
+inline bool takes_paths(const std::string& n) {
+    if (n.rfind("os_", 0) == 0 || n.rfind("file_", 0) == 0 || n.rfind("path_", 0) == 0 ||
+        n.rfind("fs_", 0) == 0)
+        return true;
+    static const char* const names[] = {"open", "read_file", "write_file", "append_file", "read_bytes",
+                                        "write_bytes", "read_text", "write_text", "load_text",
+                                        "save_text", "append_text", "listdir", "list_dir", "glob",
+                                        "fnmatch", "remove_file", "subprocess_run"};
+    for (const char* x : names) if (n == x) return true;
+    return false;
+}
+
 } // namespace nyrt

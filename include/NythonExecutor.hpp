@@ -530,6 +530,7 @@ public:   // NythonExecutor is a struct: members default to public
             "chr","ord","repr","format","open","exit","quit",
             "pow","divmod","input","dict","display","show","is_int","is_float","is_string","is_list","is_none","is_bool","to_int","to_float","to_str","clamp","lerp","map_range","repeat_str","repeat","flatten","flat","shell","system","ls","cat","pwd","mkdir","write","exists","env","all","any","complex","slice","super","property",
             "staticmethod","classmethod","callable","dir","vars","globals","locals","eval","exec","compile","_ny_setattr_raw","_ny_delattr_raw",
+            "_ny_main_globals","_ny_exc_current",
             "iter","next","help","Set","Counter","OrderedDict","deque","defaultdict","assert",
             "islice","take",   // lazy iteration (src/NyGen.cpp), both engines
             "sqrt","sin","cos","tan","log","floor","ceil",
@@ -636,7 +637,7 @@ public:   // NythonExecutor is a struct: members default to public
             "os_path_getsize","os_path_getmtime","os_fnmatch","fnmatch","os_glob","glob",
             "os_islink","os_access","os_stat","os_lstat","os_makedirs","os_rmdir","os_rmtree",
             "os_walk","os_unlink","os_copy","os_copyfile","os_copytree","os_move","os_chmod",
-            "os_symlink","os_readlink","os_touch","append","os_gettempdir","os_mkstemp",
+            "os_symlink","os_readlink","os_touch","os_utime","append","os_gettempdir","os_mkstemp",
             "os_mkdtemp","os_disk_usage","os_chdir","cd","sh",
             "os_unsetenv","os_environ","os_platform","os_cpu_count","os_hostname",
             "os_username","os_home","os_uname","os_get_terminal_size","os_terminal_size",
@@ -1723,9 +1724,19 @@ public:   // NythonExecutor is a struct: members default to public
     }
 
     // Builtins whose keyword arguments arrive as one trailing map (marked
-    // "__kwargs__"), beyond the fixed list in evalCall: the round 77 natives
-    // (network, signals, codecs) by prefix.
+    // "__kwargs__"): the OS/time natives named here and the round 77
+    // natives (network, signals, codecs) by prefix. Every call path uses
+    // this test - a call through a namespace (os.makedirs(p, exist_ok=True))
+    // used to check only the prefixes and dropped the keyword arguments.
     static bool isKwmapBuiltin(const std::string& n) {
+        static const std::unordered_set<std::string> named = {
+            "os_run", "subprocess_run", "os_spawn", "os_wait", "os_kill",
+            "os_getenv", "getenv", "env", "os_makedirs", "os_rmtree",
+            "os_mkstemp", "os_mkdtemp", "os_path_relpath", "os_utime",
+            "time_format", "time_date", "time_strftime", "time_iso",
+            "file_open", "file_open_or_raise", "os_proc_read", "os_poll"
+        };
+        if (named.count(n)) return true;
         static const char* pre[] = {"_net_", "_sig_", "_ws_", "_tls_", "_http_", "_struct_", "_codec_", "_cli_", "_hash_", "math_"};
         for (const char* p : pre) if (n.rfind(p, 0) == 0) return true;
         size_t dot = n.find('.');
@@ -3759,6 +3770,16 @@ public:   // NythonExecutor is a struct: members default to public
         return anyv(n->statements());
     }
 
+    // The scope a function's body resolves names in after its own: where it
+    // was defined, except that a class body is skipped (Python's rule: a
+    // method does not see the class's names). invokeMember always did this;
+    // the other call paths (a bound method called as a value, getattr(o, m)(),
+    // a function held in an attribute) used the class body itself, so a
+    // method calling the builtin open() got the class's own open method.
+    static Context* scopeOf(Context* c) {
+        return (c && c->inClass && c->parent) ? c->parent : c;
+    }
+
     // Wrap a plain function Value into a method bound to `self_val`.
     // Returns fn_val unchanged if it is not a user-defined function/lambda.
     Value makeBoundMethod(Value fn_val, Value self_val) {
@@ -3819,6 +3840,45 @@ public:   // NythonExecutor is a struct: members default to public
         return out;
     }
 
+    // A classmethod bound to a class (Cls.cm read as a value): the same
+    // nyheap::Bound as a method bound to an instance, its `self` the class,
+    // so bindParamsKw supplies `cls`. The binding's tag drops the
+    // __classmethod__ mark: the call paths that add `cls` themselves must
+    // not add it a second time.
+    Value makeBoundClassMethod(Value fn_val, Value cls_val) {
+        if (fn_val.type != ValueType::USERDATA || !fn_val.value.p) return fn_val;
+        auto fit = func_names.find(fn_val.value.p);
+        if (fit == func_names.end()) return fn_val;
+        std::string tag = fit->second;
+        size_t cm = tag.find("__classmethod__");
+        if (cm != std::string::npos) tag.erase(cm, std::string("__classmethod__").size());
+        void* ast_ptr = fn_val.value.p;
+        auto ast_it = func_ast_nodes.find(fn_val.value.p);
+        if (ast_it != func_ast_nodes.end()) ast_ptr = ast_it->second;
+        Node* raw = (Node*)ast_ptr;
+        if (!raw || raw->type() != NodeType::FUNCTION) return fn_val;
+        auto* fn = static_cast<FunctionNode*>(raw);
+        auto ck = std::make_pair(fn_val.value.p, cls_val.value.p);
+        auto cached = bound_cache_.find(ck);
+        if (cached != bound_cache_.end())
+            return nyheap::userValue(cached->second, (void*)&cached->second->tag);
+        auto* bo = new nyheap::Bound(this, "__bound__:" + fn->name);
+        void* bp = (void*)&bo->tag;
+        Value out = nyheap::userValue(bo, bp);
+        bo->fn = fn_val;
+        bo->self = cls_val;
+        bo->key_fn = ck.first;
+        bo->key_self = ck.second;
+        func_names[bp]      = tag;
+        func_ast_nodes[bp]  = ast_ptr;
+        auto cit = closure_contexts.find(fn_val.value.p);
+        if (cit != closure_contexts.end()) closure_contexts[bp] = cit->second;
+        bound_self_[bp] = bo;
+        bound_cache_[ck] = bo;
+        nygc::track(bo);
+        return out;
+    }
+
     // NOTE: there is deliberately no applyBoundSelf() helper any more.
     // Supplying a bound method's captured instance happens in exactly one
     // place — bindParamsKw() — so no invocation path can forget to do it.
@@ -3852,7 +3912,7 @@ public:   // NythonExecutor is a struct: members default to public
             auto* fn_node = static_cast<FunctionNode*>(raw);
             Context* closure_parent = ctx;
             auto cit = closure_contexts.find(fn_val.value.p);
-            if (cit != closure_contexts.end()) closure_parent = cit->second;
+            if (cit != closure_contexts.end()) closure_parent = scopeOf(cit->second);
             Context* fn_ctx = new Context(runner, fn_node->name, nullptr, nullptr, closure_parent);
             CtxReaper _reap_fn_ctx2020(this, fn_ctx);
             bindParams(fn_node, call_args, fn_ctx, ctx, fn_val.value.p);
@@ -3861,7 +3921,7 @@ public:   // NythonExecutor is a struct: members default to public
             auto* lam = static_cast<LambdaNode*>(raw);
             Context* closure_parent = ctx;
             auto cit = closure_contexts.find(fn_val.value.p);
-            if (cit != closure_contexts.end()) closure_parent = cit->second;
+            if (cit != closure_contexts.end()) closure_parent = scopeOf(cit->second);
             Context* fn_ctx = new Context(runner, "<lambda>", nullptr, nullptr, closure_parent);
             CtxReaper _reap_fn_ctx2033(this, fn_ctx);
             static const nyrt::OrderedKw<Value> no_kw;
@@ -4534,7 +4594,7 @@ public:   // NythonExecutor is a struct: members default to public
                         auto fn = static_cast<FunctionNode*>(raw);
                         Context* cp = ctx;
                         auto cit = closure_contexts.find(method_val.value.p);
-                        if (cit != closure_contexts.end()) cp = cit->second;
+                        if (cit != closure_contexts.end()) cp = scopeOf(cit->second);
                         Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
                         CtxReaper _reap_fc3025(this, fc);
                         if (is_classmethod) {
@@ -5081,14 +5141,16 @@ public:   // NythonExecutor is a struct: members default to public
             if (pname == "*") { star_seen = true; continue; }
             if (pname.size() > 1 && pname[0] == '*' && pname[1] != '*') {
                 has_varargs = true;
-                // *args: collect remaining positional args into a list
+                // *args: the remaining positional args, as a tuple (Python's
+                // type; it was a list, so `fmt % args` formatted the list)
                 std::string real_name = pname.substr(1);
-                Object* varargs = new Object((Runnable*)runner, "list", Type::LIST);
+                Object* varargs = new Object((Runnable*)runner, "tuple", Type::LIST);
                 int va_idx = 0;
                 while (!star_seen && arg_idx < call_args.size()) {
                     varargs->set(std::to_string(va_idx++), call_args[arg_idx++]);
                 }
                 varargs->set("__len__", Value(va_idx));
+                varargs->set("__tuple__", Value(1));
                 fn_ctx->defineByName(real_name, Value((Collectable*)varargs));
                 star_seen = true;
             } else if (pname.size() > 2 && pname[0] == '*' && pname[1] == '*') {
@@ -5152,10 +5214,11 @@ public:   // NythonExecutor is a struct: members default to public
         for (size_t i = 0; i < lam->params.size(); i++) {
             std::string pname = lam->params[i]->value();
             if (pname.size() > 1 && pname[0] == '*' && pname[1] != '*') {
-                Object* varargs = new Object((Runnable*)runner, "list", Type::LIST);
+                Object* varargs = new Object((Runnable*)runner, "tuple", Type::LIST);   // *args is a tuple
                 int va_idx = 0;
                 while (ai < args.size()) varargs->set(std::to_string(va_idx++), args[ai++]);
                 varargs->set("__len__", Value(va_idx));
+                varargs->set("__tuple__", Value(1));
                 fc->defineByName(pname.substr(1), Value((Collectable*)varargs));
                 has_varargs = true;
                 continue;
@@ -5704,7 +5767,7 @@ public:
                                         auto lam = static_cast<LambdaNode*>(raw);
                                         Context* cp = ctx;
                                         auto cit = closure_contexts.find(attr_val.value.p);
-                                        if (cit != closure_contexts.end()) cp = cit->second;
+                                        if (cit != closure_contexts.end()) cp = scopeOf(cit->second);
                                         Context* fc = new Context(runner, "<lambda>", nullptr, nullptr, cp);
                                         CtxReaper _reap_fc3618(this, fc);
                                         bindLambdaParams(lam, args, kw_args, fc, cp, attr_val.value.p);
@@ -5713,7 +5776,7 @@ public:
                                         auto fn = static_cast<FunctionNode*>(raw);
                                         Context* cp = ctx;
                                         auto cit = closure_contexts.find(attr_val.value.p);
-                                        if (cit != closure_contexts.end()) cp = cit->second;
+                                        if (cit != closure_contexts.end()) cp = scopeOf(cit->second);
                                         Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
                                         CtxReaper _reap_fc3627(this, fc);
                                         // keyword arguments too (self.fn(*a, **kw) dropped them)
@@ -5755,7 +5818,7 @@ public:
                                         auto fn = static_cast<FunctionNode*>(raw);
                                         Context* cp = ctx;
                                         auto ci = closure_contexts.find(attr_val.value.p);
-                                        if (ci != closure_contexts.end()) cp = ci->second;
+                                        if (ci != closure_contexts.end()) cp = scopeOf(ci->second);
                                         Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
                                         CtxReaper _reap_fc3662(this, fc);
                                         bindParamsKw(fn, args, kw_args, fc, ctx, 0, attr_val.value.p);
@@ -5908,14 +5971,7 @@ public:
             // Builtins that take named options receive them as one trailing
             // map - the convention the VM's CALL_KW already uses for natives,
             // so the same implementation serves both engines (nyos::Args).
-            static const std::unordered_set<std::string> kwmap_builtins = {
-                "os_run", "subprocess_run", "os_spawn", "os_wait", "os_kill",
-                "os_getenv", "getenv", "env", "os_makedirs", "os_rmtree",
-                "os_mkstemp", "os_mkdtemp", "os_path_relpath",
-                "time_format", "time_date", "time_strftime", "time_iso",
-                "file_open", "file_open_or_raise", "os_proc_read", "os_poll"
-            };
-            if (!kw_args.empty() && (kwmap_builtins.count(builtin) || isKwmapBuiltin(builtin))) {
+            if (!kw_args.empty() && isKwmapBuiltin(builtin)) {
                 auto* kw = new Object((Runnable*)runner, "map", Type::MAP);
                 for (auto& kv : kw_args) kw->set(kv.first, kv.second);
                 // marks the map as keyword arguments (internal key: dict
@@ -5950,7 +6006,7 @@ public:
                     // Use closure: parent is the context where function was defined
                     Context* closure_parent = ctx;
                     auto cit = closure_contexts.find(callee.value.p);
-                    if (cit != closure_contexts.end()) closure_parent = cit->second;
+                    if (cit != closure_contexts.end()) closure_parent = scopeOf(cit->second);
                     Context* fn_ctx = new Context(runner, fn->name, nullptr, nullptr, closure_parent);
                     CtxReaper _reap(this, fn_ctx);
                     // Bind parameters with keyword arg and *args support
@@ -5961,7 +6017,7 @@ public:
                     // Use closure context if available (for returned lambdas)
                     Context* closure_parent = ctx;
                     auto cit2 = closure_contexts.find(callee.value.p);
-                    if (cit2 != closure_contexts.end()) closure_parent = cit2->second;
+                    if (cit2 != closure_contexts.end()) closure_parent = scopeOf(cit2->second);
                     Context* fn_ctx = new Context(runner, "<lambda>", nullptr, nullptr, closure_parent);
                     CtxReaper _reap_fn_ctx3854(this, fn_ctx);
                     bindLambdaParams(lam, args, kw_args, fn_ctx, closure_parent, callee.value.p);
@@ -6144,7 +6200,26 @@ public:
 
 
     // Public (struct default) so the VM builtin bridge can dispatch by name.
+    // A path-like argument (an object with __fspath__, such as a
+    // pathlib.Path) given to a builtin that takes paths is passed as the
+    // string its __fspath__ returns, positionally or as a keyword argument
+    // (nyrt::takes_paths).
+    void fspathArgs(std::vector<Value>& args, Context* ctx) {
+        auto conv = [&](Value& v) {
+            if (!isInstanceValue(v) || !instanceHasMethod(v, "__fspath__")) return;
+            std::vector<Value> none;
+            v = callMethod(v, "__fspath__", none, ctx);
+        };
+        for (auto& a : args) {
+            conv(a);
+            Container* c = contOf(a);
+            if (c && c->container->count("__kwargs__"))
+                for (auto& kv : *c->container) conv(kv.second);
+        }
+    }
+
     Value callBuiltin(const std::string& name_orig, std::vector<Value>& args, Context* ctx) {
+        if (!args.empty() && nyrt::takes_paths(name_orig)) fspathArgs(args, ctx);
         // islice/take, and iter/next/any/all/zip/map/filter/enumerate given a
         // generator: lazy (src/NyGen.cpp).
         if (nygen::builtin_candidate(name_orig, args)) {
@@ -6426,7 +6501,7 @@ public:
                                 auto fn = static_cast<FunctionNode*>(raw);
                                 Context* closure_parent = ctx;
                                 auto cit = closure_contexts.find(v.value.p);
-                                if (cit != closure_contexts.end()) closure_parent = cit->second;
+                                if (cit != closure_contexts.end()) closure_parent = scopeOf(cit->second);
                                 Context* fc = new Context(runner, fn->name, nullptr, nullptr, closure_parent);
                                 CtxReaper _reap_prop(this, fc);
                                 fc->defineByName("self", obj);
@@ -6527,7 +6602,7 @@ public:
                                     auto fn = static_cast<FunctionNode*>(raw);
                                     Context* cp = ctx;
                                     auto cit2 = closure_contexts.find(cv.value.p);
-                                    if (cit2 != closure_contexts.end()) cp = cit2->second;
+                                    if (cit2 != closure_contexts.end()) cp = scopeOf(cit2->second);
                                     Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
                                     CtxReaper _reap_prop2(this, fc);
                                     fc->defineByName("self", obj);
@@ -6541,6 +6616,18 @@ public:
                         // bind=false (evalCall's method path, hasMemberNoEval):
                         // only the kind is looked at, so no heap object is made
                         // for a binding that would be freed right after the call.
+                        // A classmethod read as a value (getattr(Cls, "cm"),
+                        // f = obj.cm) is bound to the receiver's class, as
+                        // Python's classmethod descriptor binds it; it used to
+                        // come back unbound, so calling it lacked `cls`.
+                        if (bind && cv.type == ValueType::USERDATA && cv.value.p
+                            && fnTag(func_names, cv.value.p).find("__classmethod__") != std::string::npos) {
+                            Value clsv;
+                            clsv.type = ValueType::USERDATA;
+                            clsv.value.p = class_ptr;
+                            out = makeBoundClassMethod(cv, clsv);
+                            return true;
+                        }
                         if (bind && instance_to_class.count(obj.value.p)) { out = makeBoundMethod(cv, obj); return true; }
                         out = cv;
                         return true;
@@ -9185,7 +9272,7 @@ public:
             for (auto& a : args) with_self.push_back(a);
             Context* wp = global_ctx;
             auto wc = closure_contexts.find(m.value.p);
-            if (wc != closure_contexts.end() && wc->second) wp = wc->second;
+            if (wc != closure_contexts.end() && wc->second) wp = scopeOf(wc->second);
             Context* wfc = new Context(runner, fn->name, nullptr, nullptr, wp);
             CtxReaper _reap_w(this, wfc);
             bindParamsKw(fn, with_self, kw, wfc, ctx, 0, m.value.p);
