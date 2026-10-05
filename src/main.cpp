@@ -203,10 +203,17 @@ int run_file(const std::string& filename, bool show_ast = false) {
             if (colon != std::string::npos)
                 msg = msg.substr(0, colon) + ": " + msg.substr(colon + 1);
         }
+        if (msg.rfind("KeyboardInterrupt", 0) == 0) {
+            // As Python: the bare name, and the status of a process ended by SIGINT.
+            NythonExecutor::traceException(msg);
+            std::cerr << "KeyboardInterrupt\n";
+            return 130;
+        }
         std::cerr << "[Nython] Uncaught exception — " << msg << "\n";
         report_uncaught_where(msg);
         return 1;
     } catch (std::runtime_error& e) {
+        if (std::string(e.what()).rfind("KeyboardInterrupt", 0) == 0) { std::cerr << "KeyboardInterrupt\n"; return 130; }
         std::cerr << "runtime error: " << e.what() << "\n";
         report_uncaught_where(e.what());
         return 1;
@@ -596,6 +603,7 @@ struct BridgeConv {
     std::unordered_map<const Container*, size_t> origin_of;
     // bytearrays passed in: the interpreter copy and the VM original
     std::vector<std::pair<nyheap::Bytes*, VMVal>> barrays;
+    nython::vm::VirtualMachine* vm = nullptr;   // builds sets (their keys are the VM's)
     explicit BridgeConv(NythonExecutor& e) : exec(e) {}
 
     static const void* key_of(const VMVal& v) {
@@ -651,7 +659,11 @@ struct BridgeConv {
                 to_interp.emplace(k, out);
                 origin_of.emplace(obj, origin.size());
                 origin.emplace_back(obj, v);
-                if (is_list) {
+                if (is_list && v.is_set()) {
+                    (*obj->container)["__set__"] = intValue(v.is_frozenset() ? 2 : 1);
+                    (*obj->container)["__len__"] = intValue(0);
+                    for (auto& e : *v.list) exec.setAdd(obj, to_value(e));
+                } else if (is_list) {
                     int64_t n = 0;
                     for (auto& e : *v.list) (*obj->container)[std::to_string(n++)] = to_value(e);
                     (*obj->container)["__len__"] = intValue(n);
@@ -709,6 +721,7 @@ struct BridgeConv {
                 auto it = m.find(std::to_string(i));
                 out.push_back(it == m.end() ? VMVal::make_none() : to_vm(it->second));
             }
+            if (m.count("__set__") && vm) return vm->make_set_value(out, NythonExecutor::isFrozenCont(c));
             return m.count("__tuple__") ? VMVal::make_tuple(std::move(out)) : VMVal::make_list(std::move(out));
         }
         VMVal r = VMVal::make_map();
@@ -811,6 +824,7 @@ void install_vm_builtin_bridge(Runnable* runner) {
     nython::vm::VirtualMachine::bridge_call() =
         [ex, vm](const std::string& n, std::vector<VMVal>& a) -> VMVal {
             BridgeConv conv(*ex);
+            conv.vm = vm;
             std::vector<Value> args;
             args.reserve(a.size());
             for (auto& v : a) args.push_back(conv.to_value(v));
@@ -849,6 +863,9 @@ int main(int argc, char** argv, char** env) {
     try {
         setlocale(LC_ALL, "");
         nython::ConsoleManager cm; cm.setupConsole();
+        // Ctrl+C raises KeyboardInterrupt (it killed the process, skipping
+        // every finally block); signal.signal() installs the others.
+        nyconc::install_default_signals();
 
         if (argc >= 2) {
             std::string arg1 = argv[1];
@@ -951,7 +968,8 @@ int main(int argc, char** argv, char** env) {
                     // interpreter.
                     if (ast) {
                         auto res = vm2->run(ast);
-                        if (res == decltype(res)::RUNTIME_ERROR) return 1;
+                        if (res == decltype(res)::RUNTIME_ERROR)
+                            return nython::vm::VirtualMachine::keyboard_interrupted() ? 130 : 1;
                     }
                 } catch (exception::SyntaxError& e) {
                     // The VM compiler rejects some constructs the interpreter

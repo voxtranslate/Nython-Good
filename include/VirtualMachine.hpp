@@ -188,6 +188,10 @@ struct VMVal {
     // empty is a big int: s holds its exact decimal value and i the value
     // saturated to 64 bits (for code that only needs an index or a count).
     bool is_tuple() const { return type==VMType::LIST && b; }
+    // A set or frozenset (round 77): a list of its elements in insertion
+    // order, with `map` indexing them by key (VirtualMachine::set_key).
+    bool is_set() const { return type==VMType::LIST && map && (class_name=="__set__"||class_name=="__frozenset__"); }
+    bool is_frozenset() const { return is_set() && class_name=="__frozenset__"; }
     bool is_bigint() const { return type==VMType::INT && !s.empty(); }
     static VMVal make_tuple(std::vector<VMVal> items={}) {
         VMVal x=make_list(std::move(items)); x.b=true; return x;
@@ -298,6 +302,11 @@ struct VMVal {
         case VMType::STRING: return s==o.s;
         case VMType::BYTES:  return bdata()==o.bdata();   // bytes == bytearray by content
         case VMType::LIST:
+            if(is_set()||o.is_set()){   // sets: the same keys, in any order
+                if(!is_set()||!o.is_set()||map->size()!=o.map->size()) return false;
+                for(auto& kv:*map) if(!o.map->count(kv.first)) return false;
+                return true;
+            }
             if(b!=o.b) return false;   // a list is never equal to a tuple
             if(!list&&!o.list) return true;
             if(!list||!o.list) return false;
@@ -432,6 +441,11 @@ struct VMCode {
     bool                     is_classmethod= false;
     bool                     is_generator  = false;
     std::shared_ptr<VMMap> closure_env;
+    // Code of a module imported by name (round 77): the module's own scope,
+    // where its top level (module_top) defines its names and its functions
+    // find them - in place of the main program's frame.
+    std::shared_ptr<VMMap> module_env;
+    bool                   module_top = false;
     std::vector<std::shared_ptr<VMCode>> sub_codes;
     std::vector<ExceptionEntry>          exc_table;
 
@@ -539,6 +553,13 @@ inline std::string VMVal::to_string() const {
     case VMType::FLOAT:   return nypy::float_repr(d);
     case VMType::STRING:  return s;
     case VMType::LIST:{
+        if(is_set()){
+            bool fz=is_frozenset();
+            if(!list||list->empty()) return fz?"frozenset()":"set()";
+            std::string r=fz?"frozenset({":"{";
+            for(size_t k=0;k<list->size();k++){ if(k) r+=", "; r+=(*list)[k].repr(); }
+            return r+(fz?"})":"}");
+        }
         std::string r=b?"(":"[";
         if(list) for(size_t k=0;k<list->size();k++){
             if(k)r+=", ";
@@ -1496,10 +1517,18 @@ private:
             // runtime can bind the namespace. The interpreter now does this;
             // without it here the same program would bind an alias on one
             // engine and not the other.
-            if(!in->alias.empty())
+            bool bare=!in->quoted&&!in->module_name.empty()&&in->module_name[0]!='"'&&in->module_name[0]!='\'';
+            if(!in->names.empty()){
+                // `from m import a, b` (round 77): the names travel too
+                std::string ns;
+                for(auto& n:in->names){ if(!ns.empty()) ns+=","; ns+=n; }
+                mn = mn + "\x04" + ns;
+            }
+            else if(!in->alias.empty())
                 mn = mn + "\x01" + in->alias;
-            else if(!in->module_name.empty()&&in->module_name[0]!='"'&&in->module_name[0]!='\''&&is_ident_text(mn))
+            else if(bare&&is_ident_text(mn))
                 mn = mn + "\x03" + mn;     // `import name` binds name (round 77)
+            if(bare) mn = "\x02" + mn;     // a module named without quotes
             emit(Op::IMPORT_NAME,C().add_name(mn),l); break;
         }
 
@@ -1881,7 +1910,7 @@ private:
         emit(Op::HALT,0,l);
         pop_code();
         int idx=(int)C().sub_codes.size()-1;
-        emit(Op::MAKE_CLASS,idx,l); emit_dn(cn->name,l);
+        emit(Op::MAKE_CLASS,idx,l); emit_dn(cn->bind_name.empty()?cn->name:cn->bind_name,l);
     }
 
     // ─── call ───────────────────────────────────────────────────────────
@@ -2157,6 +2186,7 @@ struct GenState : std::enable_shared_from_this<GenState> {
     VMMap locals;
     std::optional<VMVal> self_val;
     std::shared_ptr<VMMap> closure;
+    bool own_env = false;          // closure is the generator frame's own environment
     bool done=false;
     std::vector<VMVal> saved_stack; // intermediate stack at yield point
     size_t stack_base=0;           // stack level when generator was entered
@@ -2232,35 +2262,68 @@ inline VMVal make_generator_val(std::shared_ptr<VMCode> code,
     return g;
 }
 
+// Closure environments are chained (round 77). A frame that makes a
+// closure gets an environment of its own (CallFrame::own_env) holding its
+// variables, whose reserved entry env_up_key() links the environment of the
+// function it runs in. They used to be one flat map per outermost function:
+// every call of a nested function wrote its locals into it, so closures made
+// by different calls shared one variable (`def mk(x): return lambda: x`
+// called three times gave three lambdas returning the first x).
+inline const std::string& env_up_key() { static const std::string k("\x01up"); return k; }
+inline VMMap* env_up(VMMap* e) {
+    if(!e) return nullptr;
+    auto it=e->find(env_up_key());
+    return it!=e->end() && it->second.map ? it->second.map.get() : nullptr;
+}
+// The nearest environment in the chain from e that binds n.
+inline VMMap* env_find(VMMap* e, const std::string& n) {
+    for(int d=0; e && d<256; e=env_up(e), d++) if(e->count(n)) return e;
+    return nullptr;
+}
+// Whether env `inner`'s chain reaches `outer`.
+inline bool env_reaches(VMMap* inner, VMMap* outer) {
+    for(int d=0; inner && d<256; inner=env_up(inner), d++) if(inner==outer) return true;
+    return false;
+}
+
 struct CallFrame {
     std::shared_ptr<VMCode>                       code;
     int                                           ip = 0;
     VMMap         locals;
     std::optional<VMVal>                          self_val;
-    // Shared closure environment (shared with enclosing scope)
+    // The environment this frame's names resolve in after its locals: the
+    // one its function closed over, or (own_env) its own, which links that.
     std::shared_ptr<VMMap> closure_env;
+    bool own_env = false;
 
     bool has_local(const std::string& n) const {
         if(locals.count(n)) return true;
-        if(closure_env && closure_env->count(n)) return true;
-        return false;
+        return env_find(closure_env.get(), n)!=nullptr;
     }
     VMVal get_local(const std::string& n) const {
+        // A frame with its own environment reads it first: a closure can
+        // have rebound one of its variables there, from another thread too.
+        if(own_env){
+            auto e=closure_env->find(n);
+            if(e!=closure_env->end()) return e->second;
+        }
         auto it=locals.find(n);
         if(it!=locals.end()) return it->second;
-        if(closure_env){ auto it2=closure_env->find(n); if(it2!=closure_env->end()) return it2->second; }
+        if(VMMap* e=env_find(own_env ? env_up(closure_env.get()) : closure_env.get(), n)) return (*e)[n];
         // Return undefined to signal not found
         VMVal undef; undef.type=VMType::UNDEFINED; return undef;
     }
     VMVal& local(const std::string& n)           { return locals[n]; }
     void   set(const std::string& n, VMVal v)    {
-        // If var exists in closure_env (and is NOT a local param), update closure_env
+        // A local (mirrored in the frame's own environment); else the
+        // nearest enclosing binding; else a new local.
         auto li=locals.find(n);
-        if(li!=locals.end()){ li->second=std::move(v); return; }
-        if(closure_env){
-            auto ci=closure_env->find(n);
-            if(ci!=closure_env->end()){ ci->second=std::move(v); return; }
+        if(li!=locals.end()){
+            if(own_env) (*closure_env)[n]=v;
+            li->second=std::move(v); return;
         }
+        if(VMMap* e=env_find(closure_env.get(), n)){ (*e)[n]=std::move(v); return; }
+        if(own_env) (*closure_env)[n]=v;
         locals[n]=std::move(v);
     }
     void define(const std::string& n, VMVal v) { locals[n]=std::move(v); }
@@ -2344,6 +2407,10 @@ class VirtualMachine : public Runnable {
     int export_depth_ = -1;
     bool exporting() const { return export_to_globals_ && (int)call_stack_.size()==export_depth_; }
     std::string cwd_ = ".";            // working directory for imports
+    // Runs the pending signal handlers (set by VMConc::install; round 77).
+    std::function<void()> signal_hook_;
+    // Raises a runtime NyError into the VM as its own exception (VMConc).
+    std::function<void(const nyconc::NyError&)> raise_nyerror_;
     // ── Threads (round 74, src/VMConc.cpp) ──────────────────────────────────
     // Module-level variables live in the main thread's bottom frame and are
     // found by walking the call stack. A thread has a call stack of its own, so
@@ -2383,6 +2450,10 @@ class VirtualMachine : public Runnable {
     // interpreter's Value are complete types (VirtualMachine.hpp is included by
     // NythonExecutor.hpp, so this header cannot name Value directly).
 public:
+    // An uncaught KeyboardInterrupt ended the program (exit status 130).
+    static bool& keyboard_interrupted() { static bool b=false; return b; }
+    // A set of these elements (the builtin bridge, src/main.cpp).
+    VMVal make_set_value(const std::vector<VMVal>& items, bool frozen) { return build_set(items, frozen); }
     static std::function<bool(const std::string&)>& bridge_exists() {
         static std::function<bool(const std::string&)> f; return f;
     }
@@ -2401,11 +2472,37 @@ private:
     // Every frame on the call stack used to be searched, so a function read
     // and assigned its CALLER's local variables (dynamic scoping): a helper
     // doing `i = 99` changed the i of whichever function called it.
+    // The module scope of the running code, when it belongs to a module
+    // imported by name (VMCode::module_env).
+    VMMap* menv() const {
+        return call_stack_.empty() || !call_stack_.back().code ? nullptr : call_stack_.back().code->module_env.get();
+    }
     bool frame_visible(int i) const {
         int top=(int)call_stack_.size()-1;
-        if(i==top || i==0) return true;
+        if(i==top) return true;
+        if(i==0) return !menv();       // a module's code does not see the program's frame
         const auto& env=call_stack_[top].closure_env;
-        return env && call_stack_[i].closure_env.get()==env.get();
+        const auto& fe=call_stack_[i].closure_env;
+        return env && fe && call_stack_[i].own_env && env_reaches(env.get(), fe.get());
+    }
+    // The frame's own closure environment, made on first need (a closure,
+    // a class body or a comprehension made in it): its variables, linked to
+    // the environment it already resolved names in.
+    static VMMap* ensure_own_env(CallFrame& f) {
+        if(!f.own_env){
+            auto e=vmgc::make_deep<VMMap>(f.locals);
+            vmgc::track_map(e);
+            if(f.closure_env){
+                VMVal up; up.type=VMType::MAP; up.map=f.closure_env;
+                (*e)[env_up_key()]=up;
+            }
+            f.closure_env=e;
+            f.own_env=true;
+        } else {
+            for(auto& kv : f.locals) (*f.closure_env)[kv.first]=kv.second;
+        }
+        if(f.self_val && !f.closure_env->count("self")) (*f.closure_env)["self"]=*f.self_val;
+        return f.closure_env.get();
     }
     // Whether `n` names anything a LOAD_NAME can find (a variable in a
     // visible scope, a global, or an interpreter builtin).
@@ -2413,9 +2510,10 @@ private:
         for(int i=(int)call_stack_.size()-1;i>=0;i--){
             if(!frame_visible(i)) continue;
             const auto& f=call_stack_[i];
-            if(f.locals.count(n) || (f.closure_env && f.closure_env->count(n))) return true;
+            if(f.has_local(n)) return true;
         }
-        if(in_other_thread() && module_frame_ && !module_frame_->get_local(n).is_missing()) return true;
+        if(VMMap* me=menv()){ if(me->count(n)) return true; }
+        else if(in_other_thread() && module_frame_ && !module_frame_->get_local(n).is_missing()) return true;
         if(globals_.count(n)) return true;
         return bridge_exists() && bridge_exists()(n);
     }
@@ -2425,7 +2523,10 @@ private:
             auto v=call_stack_[i].get_local(n);
             if(!v.is_missing()) return v;
         }
-        if(in_other_thread()){                                   // round 74
+        if(VMMap* me=menv()){
+            auto mi=me->find(n);
+            if(mi!=me->end()) return mi->second;
+        } else if(in_other_thread()){                            // round 74
             auto mv=module_frame_->get_local(n);
             if(!mv.is_missing()) return mv;
         }
@@ -2457,17 +2558,23 @@ private:
             if(!frame_visible(i)) continue;
             auto& f=call_stack_[i];
             bool hit=f.locals.erase(n)>0;
-            if(f.closure_env && f.closure_env->erase(n)>0) hit=true;
+            if(f.own_env && f.closure_env->erase(n)>0) hit=true;
             if(hit) return true;
         }
+        if(VMMap* me=menv()) return me->erase(n)>0;
         if(in_other_thread() && module_frame_ && module_frame_->locals.erase(n)>0) return true;
         return globals_.erase(n)>0;
     }
     // A `global` name: the main module's frame, then globals (an imported
     // module's names and builtins), then an interpreter builtin.
     bool load_global(const std::string& n, VMVal& out) {
-        CallFrame* mf=in_other_thread()?module_frame_:(call_stack_.empty()?nullptr:&call_stack_.front());
-        if(mf){ out=mf->get_local(n); if(!out.is_missing()) return true; }
+        if(VMMap* me=menv()){
+            auto mi=me->find(n);
+            if(mi!=me->end()){ out=mi->second; return true; }
+        } else {
+            CallFrame* mf=in_other_thread()?module_frame_:(call_stack_.empty()?nullptr:&call_stack_.front());
+            if(mf){ out=mf->get_local(n); if(!out.is_missing()) return true; }
+        }
         auto it=globals_.find(n);
         if(it!=globals_.end()){ out=it->second; return true; }
         if(bridge_exists() && bridge_exists()(n)){ out=load_var(n); return true; }
@@ -2482,32 +2589,50 @@ private:
             auto& f=call_stack_[i];
             auto li=f.locals.find(n);
             bool in_locals=li!=f.locals.end();
-            bool in_env=f.closure_env && f.closure_env->count(n);
-            if(!in_locals && !in_env) continue;
-            if(!in_env){ li->second=std::move(v); return; }   // the common case: one lookup
-            // A closure variable is one binding: write it to the shared
-            // environment and to every still-running frame that holds a copy
-            // (the enclosing function read its stale local after an inner
-            // function assigned the variable: x += 1 in inc() left outer's x
-            // unchanged).
-            if(in_env) (*f.closure_env)[n]=v;
+            VMMap* env=in_locals&&!f.own_env ? nullptr : env_find(f.closure_env.get(), n);
+            if(!in_locals && !env) continue;
+            if(!env){ li->second=std::move(v); return; }   // the common case: one lookup
+            // A closure variable is one binding: write it to the environment
+            // that holds it and to every still-running frame that keeps a
+            // copy of it (the enclosing function read its stale local after
+            // an inner function assigned the variable: x += 1 in inc() left
+            // outer's x unchanged).
+            (*env)[n]=v;
             if(in_locals) f.locals[n]=v;
-            if(in_env){
-                for(int j=(int)call_stack_.size()-1;j>=0;j--)
-                    if(j!=i && frame_visible(j) && call_stack_[j].closure_env==f.closure_env && call_stack_[j].locals.count(n))
-                        call_stack_[j].locals[n]=v;
+            for(int j=(int)call_stack_.size()-1;j>=0;j--){
+                auto& g=call_stack_[j];
+                if(j!=i && g.own_env && g.closure_env.get()==env && g.locals.count(n)) g.locals[n]=v;
             }
             return;
         }
-        if(in_other_thread() && module_frame_->has_local(n)){    // round 74
+        if(VMMap* me=menv()){
+            // A module's top level, or a module variable rebound by one of
+            // its functions.
+            if(call_stack_.back().code->module_top || me->count(n)){ (*me)[n]=std::move(v); return; }
+        } else if(in_other_thread() && module_frame_->has_local(n)){    // round 74
             module_frame_->set(n,std::move(v)); return;
         }
         if(!call_stack_.empty()) call_stack_.back().locals[n]=std::move(v);
         else globals_[n]=std::move(v);
     }
     void define_var(const std::string& n, VMVal v) {
-        if(exporting()) { globals_[n]=std::move(v); return; }
-        if(!call_stack_.empty()) call_stack_.back().set(n,std::move(v));
+        if(VMMap* me=menv()){
+            if(call_stack_.back().code->module_top){ (*me)[n]=std::move(v); return; }
+        }
+        if(exporting()) {
+            // An included file's name replaces the program's of the same
+            // name, as later definitions in one scope do (the interpreter).
+            if(!call_stack_.empty()) call_stack_.front().locals.erase(n);
+            globals_[n]=std::move(v); return;
+        }
+        // A declaration (var/let/const, def, class, import) binds a local of
+        // the running frame, shadowing an enclosing variable of that name
+        // (round 77: it rebound the enclosing one once environments chained).
+        if(!call_stack_.empty()){
+            auto& f=call_stack_.back();
+            if(f.own_env) (*f.closure_env)[n]=v;
+            f.locals[n]=std::move(v);
+        }
         else globals_[n]=std::move(v);
     }
 
@@ -2609,21 +2734,8 @@ public:
                     }
                     return acc;
                 }
-                if((nm=="set"||nm=="frozenset")&&has_inst){
-                    std::vector<VMVal> out;
-                    std::unordered_map<int64_t,std::vector<size_t>> buckets;
-                    for(auto& e:*a[0].list){
-                        int64_t h;
-                        if(e.type==VMType::INSTANCE){
-                            bool f=false; VMVal hv=call_dunder_f(e,"__hash__",{},f);
-                            h = f ? (hv.type==VMType::INT?hv.i:(int64_t)to_d(hv)) : (int64_t)(uintptr_t)e.map.get();
-                        } else h=(int64_t)std::hash<std::string>{}(e.to_string());
-                        bool dup=false;
-                        for(size_t k:buckets[h]) if(vm_eq(out[k],e)){ dup=true; break; }
-                        if(!dup){ buckets[h].push_back(out.size()); out.push_back(e); }
-                    }
-                    return VMVal::make_list(std::move(out));
-                }
+                if((nm=="set"||nm=="frozenset")&&has_inst)
+                    return build_set(*a[0].list, nm=="frozenset");   // set_key: __hash__ (round 77)
                 return orig(a);
             };
         }
@@ -2632,7 +2744,7 @@ public:
         for(auto& nm_canon : std::vector<std::pair<std::string,std::string>>{
                 {"int","int"},{"float","float"},{"bool","bool"},{"str","str"},
                 {"string","str"},{"list","list"},{"tuple","tuple"},
-                {"dict","map"},{"set","list"},{"bytes","bytes"},{"bytearray","bytearray"}}){
+                {"dict","map"},{"set","set"},{"frozenset","frozenset"},{"bytes","bytes"},{"bytearray","bytearray"}}){
             auto git=globals_.find(nm_canon.first);
             if(git!=globals_.end()&&git->second.type==VMType::NATIVE)
                 git->second.class_name=nm_canon.second;
@@ -2810,10 +2922,21 @@ public:
             gen_close_all();
             return VMResult::SUCCESS;
         } catch(std::exception& e) {
+            if(std::string(e.what()).rfind("KeyboardInterrupt",0)==0){
+                // as Python: the bare name, and the exit status of SIGINT (main.cpp)
+                std::cerr<<"KeyboardInterrupt\n";
+                keyboard_interrupted()=true;
+                return VMResult::RUNTIME_ERROR;
+            }
             std::cerr<<"\x1b[31m[VMError] "<<e.what()<<"\x1b[0m\n";
             return VMResult::RUNTIME_ERROR;
         } catch(std::string& m) {
             std::string type, msg;
+            if(nython::ny_split_exc_message(m,type,msg)&&type=="KeyboardInterrupt"){
+                std::cerr<<"KeyboardInterrupt\n";
+                keyboard_interrupted()=true;
+                return VMResult::RUNTIME_ERROR;
+            }
             if(nython::ny_split_exc_message(m,type,msg)) std::cerr<<"\x1b[31m[VMError] "<<type<<": "<<msg<<"\x1b[0m\n";
             else std::cerr<<"\x1b[31m[VMError] "<<m<<"\x1b[0m\n";
             return VMResult::RUNTIME_ERROR;
@@ -2835,9 +2958,14 @@ public:
             if(!ast) return;
             prelude_asts_.push_back(ast);
             Compiler c; auto code=c.compile(ast);
+            // The prelude's names become globals (round 77: export_depth_ was
+            // left unset, so only the native open() below and the classes
+            // registered here were ever visible - NythonFile, but none of the
+            // async helpers the parser desugars to).
             bool old_exp=export_to_globals_; export_to_globals_=true;
+            int old_depth=export_depth_; export_depth_=(int)call_stack_.size()+1;
             try{ exec_code(code,{},std::nullopt); } catch(VMReturn&){}
-            export_to_globals_=old_exp;
+            export_to_globals_=old_exp; export_depth_=old_depth;
             for(auto& sub:code->sub_codes) if(sub->is_class) class_reg_[sub->name]=sub;
         } catch(std::exception& e){ std::cerr<<"[VM] prelude failed to load: "<<e.what()<<"\n"; }
         // open() as a native: the prelude's `def open` raises from its own
@@ -3203,6 +3331,7 @@ private:
         fr.locals=std::move(gs.locals);
         fr.self_val=gs.self_val;
         fr.closure_env=gs.closure;
+        fr.own_env=gs.own_env;
         fr.gen_state=gs.shared_from_this();
         call_stack_.push_back(std::move(fr));
         gs.mode=mode; gs.running=true; gs.yielded=false;
@@ -3648,6 +3777,7 @@ private:
     bool vm_eq(const VMVal& a, const VMVal& b) {
         VMVal r;
         if(rich_compare(a,b,"__eq__","__eq__",r)) return vm_truthy(r);
+        if(a.is_set()||b.is_set()) return a==b;  // by keys, in any order
         if(a.type==VMType::LIST&&b.type==VMType::LIST&&a.list&&b.list){
             if(a.b!=b.b) return false;           // a tuple never equals a list
             if(a.list->size()!=b.list->size()) return false;
@@ -3707,6 +3837,13 @@ private:
                 if(found) return r.to_string();
             }
             return v.repr();
+        }
+        if(v.is_set()&&v.list){
+            bool fz=v.is_frozenset();
+            if(v.list->empty()) return fz?"frozenset()":"set()";
+            std::string r=fz?"frozenset({":"{";
+            for(size_t k=0;k<v.list->size();k++){ if(k) r+=", "; r+=vm_repr((*v.list)[k]); }
+            return r+(fz?"})":"}");
         }
         if(v.type==VMType::LIST&&v.list){
             std::string r=v.b?"(":"[";
@@ -3908,9 +4045,7 @@ private:
         bool outer_fn = outer.code && outer.code->name!="<module>" && !outer.code->is_class;
         if(outer_fn){
             // Methods of a class defined in a function close over it.
-            if(!outer.closure_env){ outer.closure_env=vmgc::make_deep<VMMap>(outer.locals); vmgc::track_map(outer.closure_env); }
-            else for(auto& kv:outer.locals) if(!outer.closure_env->count(kv.first)) (*outer.closure_env)[kv.first]=kv.second;
-            if(outer.self_val && !outer.closure_env->count("self")) (*outer.closure_env)["self"]=*outer.self_val;
+            ensure_own_env(outer);
             cf.closure_env=outer.closure_env;
         } else if(outer.closure_env) cf.closure_env=outer.closure_env;
         size_t base=stack_.size();
@@ -3929,6 +4064,7 @@ private:
         // swaps this thread's stacks out and back in; references into them
         // (`fr`) stay valid because deque elements never move.
         nyconc::tick();
+        if(__builtin_expect(nyconc::signal_pending(),0)&&signal_hook_) signal_hook_();
         while(true){
             // Queued __del__ calls and due cycle collections (one load).
             vmgc::safe_point(*this);
@@ -3959,13 +4095,16 @@ private:
             case Op::STORE_NAME: {
                 // A class body binds in the class namespace, always.
                 if(fr.code->is_class){ fr.locals[fr.code->names[ins.arg]]=pop(); break; }
-                if(exporting())
+                if(exporting()){
+                    call_stack_.front().locals.erase(fr.code->names[ins.arg]);
                     globals_[fr.code->names[ins.arg]]=pop();
+                }
                 else {
                     VMVal sv=pop();
                     store_var(fr.code->names[ins.arg], sv);
-                    // Also sync to shared closure_env so inner functions see update
-                    if(fr.closure_env && fr.closure_env->count(fr.code->names[ins.arg]))
+                    // Also into the frame's own environment, which closures
+                    // made here read.
+                    if(fr.own_env && fr.locals.count(fr.code->names[ins.arg]))
                         (*fr.closure_env)[fr.code->names[ins.arg]] = sv;
                 }
                 break;
@@ -3987,6 +4126,7 @@ private:
             case Op::STORE_GLOBAL_NAME: {
                 const std::string& n=fr.code->names[ins.arg];
                 VMVal v=pop();
+                if(VMMap* me=menv()){ (*me)[n]=std::move(v); break; }
                 CallFrame* mf=in_other_thread()?module_frame_:(call_stack_.empty()?nullptr:&call_stack_.front());
                 if(mf && mf->has_local(n)) mf->set(n,std::move(v));
                 else if(globals_.count(n) || !mf) globals_[n]=std::move(v);
@@ -3997,8 +4137,8 @@ private:
                 if(fr.code->is_class){ fr.locals[fr.code->names[ins.arg]]=pop(); break; }
                 VMVal dv=pop();
                 define_var(fr.code->names[ins.arg], dv);
-                // Sync to shared closure_env if it exists
-                if(fr.closure_env)
+                // Into the frame's own environment too, if it has one.
+                if(fr.own_env && fr.locals.count(fr.code->names[ins.arg]))
                     (*fr.closure_env)[fr.code->names[ins.arg]] = dv;
                 break;
             }
@@ -4006,10 +4146,7 @@ private:
                 if(fr.self_val){ push(*fr.self_val); break; }
                 // A lambda or nested def inside a method: the method's self,
                 // captured with the closure (MAKE_FUNCTION).
-                if(fr.closure_env){
-                    auto it=fr.closure_env->find("self");
-                    if(it!=fr.closure_env->end()){ push(it->second); break; }
-                }
+                if(VMMap* se=env_find(fr.closure_env.get(), "self")){ push((*se)["self"]); break; }
                 push(VMVal::make_none()); break;
             }
 
@@ -4020,8 +4157,8 @@ private:
                 // the first base).
                 VMVal self_v = fr.self_val.value_or(VMVal::make_none());
                 if(!fr.self_val && fr.closure_env){
-                    auto it=fr.closure_env->find("self");
-                    if(it!=fr.closure_env->end()) self_v=it->second;
+                    VMMap* se=env_find(fr.closure_env.get(), "self");
+                    if(se) self_v=(*se)["self"];
                 }
                 std::string cur_cls = fr.code->owner_class.empty() ? self_v.class_name : fr.code->owner_class;
                 VMVal proxy;
@@ -4212,6 +4349,7 @@ private:
             }
             case Op::COMPARE_LT: {
                 VMVal r=pop(),lv=pop();
+                if(lv.is_set()&&r.is_set()){ push(VMVal::make_bool(lv.list->size()<r.list->size()&&set_subset(lv,r))); break; }
                 if((lv.type==VMType::BYTES)!=(r.type==VMType::BYTES)&&lv.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
                     raise_native_exception("TypeError","'<' not supported between instances of '"+vm_type_name(lv)+"' and '"+vm_type_name(r)+"'");
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__lt__","__gt__",res)){ push(std::move(res)); break; } }
@@ -4219,6 +4357,7 @@ private:
             }
             case Op::COMPARE_LE: {
                 VMVal r=pop(),lv=pop();
+                if(lv.is_set()&&r.is_set()){ push(VMVal::make_bool(set_subset(lv,r))); break; }
                 if((lv.type==VMType::BYTES)!=(r.type==VMType::BYTES)&&lv.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
                     raise_native_exception("TypeError","'<=' not supported between instances of '"+vm_type_name(lv)+"' and '"+vm_type_name(r)+"'");
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__le__","__ge__",res)){ push(std::move(res)); break; } }
@@ -4226,6 +4365,7 @@ private:
             }
             case Op::COMPARE_GT: {
                 VMVal r=pop(),lv=pop();
+                if(lv.is_set()&&r.is_set()){ push(VMVal::make_bool(lv.list->size()>r.list->size()&&set_subset(r,lv))); break; }
                 if((lv.type==VMType::BYTES)!=(r.type==VMType::BYTES)&&lv.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
                     raise_native_exception("TypeError","'>' not supported between instances of '"+vm_type_name(lv)+"' and '"+vm_type_name(r)+"'");
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__gt__","__lt__",res)){ push(std::move(res)); break; } }
@@ -4233,6 +4373,7 @@ private:
             }
             case Op::COMPARE_GE: {
                 VMVal r=pop(),lv=pop();
+                if(lv.is_set()&&r.is_set()){ push(VMVal::make_bool(set_subset(r,lv))); break; }
                 if((lv.type==VMType::BYTES)!=(r.type==VMType::BYTES)&&lv.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
                     raise_native_exception("TypeError","'>=' not supported between instances of '"+vm_type_name(lv)+"' and '"+vm_type_name(r)+"'");
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__ge__","__le__",res)){ push(std::move(res)); break; } }
@@ -4277,7 +4418,11 @@ private:
 
             // Jumps
             case Op::JUMP_FORWARD:         fr.ip=ins.arg; break;
-            case Op::JUMP_ABSOLUTE:        nyconc::tick(); fr.ip=ins.arg; break;
+            case Op::JUMP_ABSOLUTE:
+                nyconc::tick();
+                // a signal's handler runs between iterations (round 77)
+                if(__builtin_expect(nyconc::signal_pending(),0)&&signal_hook_) signal_hook_();
+                fr.ip=ins.arg; break;
             case Op::JUMP_IF_FALSE: {
                 VMVal v=pop();
                 bool t = (v.type==VMType::INSTANCE) ? instance_truthy(v) : v.is_truthy();
@@ -4322,20 +4467,10 @@ private:
                 // Capture enclosing locals as closure environment ONLY when inside a function
                 bool in_function = (fr.code->name != "<module>" && !fr.code->is_class);
                 if(in_function){
-                    // Create shared closure_env on first inner function in this frame
-                    // so ALL inner functions share the SAME cell for mutable variables
-                    if(!fr.closure_env){
-                        fr.closure_env = vmgc::make_deep<VMMap>(fr.locals);
-                        vmgc::track_map(fr.closure_env);
-                    } else {
-                        // Sync any new locals into the shared closure_env
-                        for(auto& kv : fr.locals)
-                            if(!fr.closure_env->count(kv.first))
-                                (*fr.closure_env)[kv.first] = kv.second;
-                    }
+                    // The frame's own environment (made on its first closure),
+                    // shared by every closure it makes: one cell per variable.
                     // A closure made inside a method sees its `self`.
-                    if(fr.self_val && !fr.closure_env->count("self"))
-                        (*fr.closure_env)["self"]=*fr.self_val;
+                    ensure_own_env(fr);
                     fn_val.closure_env = fr.closure_env;
                 }
                 if(!fn_val.closure_env && fr.closure_env && !fr.closure_env->empty()){
@@ -4480,7 +4615,7 @@ private:
                     GenState& gs=*cfr.gen_state;
                     gs.ip=cfr.ip;   // ip points past YIELD_VALUE
                     // Moved, not copied: the frame is popped right after.
-                    gs.locals=std::move(cfr.locals);
+                    gs.locals=std::move(cfr.locals); gs.closure=cfr.closure_env; gs.own_env=cfr.own_env;
                     // Save stack slice above stack_base (holds loop iterators etc.)
                     size_t base=gs.stack_base;
                     gs.saved_stack.clear();
@@ -4551,7 +4686,7 @@ private:
                 if(!got){ push(result); break; }   // the value of `yield from`
                 // Pass v up; pause here with the iterator saved.
                 gs.ip=cfr.ip-1;
-                gs.locals=std::move(cfr.locals);
+                gs.locals=std::move(cfr.locals); gs.closure=cfr.closure_env; gs.own_env=cfr.own_env;
                 push(std::move(it));
                 size_t base=gs.stack_base;
                 gs.saved_stack.clear();
@@ -4909,7 +5044,8 @@ private:
         if(ev.type==VMType::INSTANCE){
             if(t=="Error" && is_exception_class(ev.class_name)
                && !class_derives(ev.class_name,"SystemExit") && !class_derives(ev.class_name,"KeyboardInterrupt")
-               && !class_derives(ev.class_name,"GeneratorExit")) return true;
+               && !class_derives(ev.class_name,"GeneratorExit")
+               && !class_derives(ev.class_name,"CancelledError")) return true;
             return class_derives(ev.class_name, t);
         }
         // A raised non-exception value (Nython allows `raise "msg"`): the
@@ -5017,7 +5153,7 @@ private:
             case VMType::NONE: return "NoneType"; case VMType::BOOL: return "bool";
             case VMType::INT: return "int"; case VMType::FLOAT: return "float";
             case VMType::STRING: return "str";
-            case VMType::LIST: return v.b?"tuple":"list";
+            case VMType::LIST: return v.is_set()?(v.is_frozenset()?"frozenset":"set"):v.b?"tuple":"list";
             case VMType::MAP: return "dict";
             case VMType::FUNCTION: return "function";
             case VMType::NATIVE: return "builtin_function_or_method";
@@ -5117,6 +5253,22 @@ private:
         return VMVal::make_bytes(nycall([&]{ return nypy::bytes_construct(ba,enc,err,has_enc,tn); }),mut);
     }
     VMVal binop(int op, const VMVal& l, const VMVal& r) {
+        if(l.is_set()||r.is_set()){
+            // | & - ^ between sets (round 77); anything else is a TypeError
+            char so=op==nypy::A_OR?'|':op==nypy::A_AND?'&':op==nypy::A_SUB?'-':op==nypy::A_XOR?'^':0;
+            if(so&&l.is_set()&&r.is_set()) return set_op(so,l,r);
+            static const char* names[]={"?","+","-","*","/","//","%","**","&","|","^","<<",">>"};
+            std::string sym=(op>=1&&op<=12)?names[op]:"?";
+            if(l.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
+                raise_native_exception("TypeError","unsupported operand type(s) for "+sym+": '"+vm_type_name(l)+"' and '"+vm_type_name(r)+"'");
+        }
+        if(op==nypy::A_OR&&l.type==VMType::MAP&&r.type==VMType::MAP&&l.map&&r.map&&l.class_name.empty()&&r.class_name.empty()){
+            // dict | dict: a merged copy, the right one winning (Python 3.9)
+            VMVal d=VMVal::make_map();
+            for(auto& kv:*l.map) (*d.map)[kv.first]=kv.second;
+            for(auto& kv:*r.map) (*d.map)[kv.first]=kv.second;
+            return d;
+        }
         nypy::NumV x,y;
         if(l.to_numv(x)&&r.to_numv(y)){
             if((op==nypy::A_AND||op==nypy::A_OR||op==nypy::A_XOR)&&l.type==VMType::BOOL&&r.type==VMType::BOOL){
@@ -5390,6 +5542,7 @@ private:
             case VMType::FLOAT: return nypy::key_of_float(k.d);
             case VMType::NONE: case VMType::UNDEFINED: return nypy::key_of_none();
             case VMType::LIST:
+                if(k.is_set()) return set_key(k);   // a frozenset; a set raises
                 if(k.b){
                     std::vector<std::string> parts;
                     if(k.list) for(auto& e:*k.list) parts.push_back(vkey(e));
@@ -5407,6 +5560,125 @@ private:
         vm_key_objs()[buf]=k;
         return nypy::key_of_obj(buf);
     }
+    // ── Sets (round 77; NythonExecutor's "SETS" section is the interpreter's)
+    // An element's key: the dict key (vkey: 1 == 1.0 == true, tuples and
+    // frozensets by content), an object with __hash__ by its hash.
+    std::string set_key(const VMVal& v) {
+        if(v.type==VMType::INSTANCE){
+            bool f=false;
+            VMVal h=call_dunder_f(v,"__hash__",{},f);
+            if(f) return "\x01h"+h.to_string();
+        }
+        if(v.is_set()){
+            if(!v.is_frozenset()) raise_native_exception("TypeError","unhashable type: 'set'");
+            std::vector<std::string> parts;
+            for(auto& kv:*v.map) parts.push_back(kv.first);
+            return nypy::key_of_frozenset(parts);
+        }
+        return vkey(v);
+    }
+    static VMVal new_set(bool frozen) {
+        VMVal x=VMVal::make_list();
+        x.class_name=frozen?"__frozenset__":"__set__";
+        x.map=std::make_shared<VMMap>();
+        return x;
+    }
+    bool set_has(const VMVal& s, const VMVal& v) { return s.map->count(set_key(v))>0; }
+    bool set_add(VMVal& s, const VMVal& v) {
+        std::string k=set_key(v);
+        if(s.map->count(k)) return false;
+        (*s.map)[k]=VMVal::make_int((int64_t)s.list->size());
+        s.list->push_back(v);
+        return true;
+    }
+    bool set_discard(VMVal& s, const VMVal& v) {
+        std::string k=set_key(v);
+        auto it=s.map->find(k);
+        if(it==s.map->end()) return false;
+        size_t at=(size_t)it->second.i;
+        s.map->erase(k);
+        s.list->erase(s.list->begin()+(long)at);
+        for(size_t i=at;i<s.list->size();i++) (*s.map)[set_key((*s.list)[i])]=VMVal::make_int((int64_t)i);
+        return true;
+    }
+    void set_clear(VMVal& s) { s.list->clear(); s.map->clear(); }
+    VMVal build_set(const std::vector<VMVal>& items, bool frozen) {
+        VMVal x=new_set(frozen);
+        for(auto& v:items) set_add(x,v);
+        return x;
+    }
+    // op: '|' '&' '-' '^'; b may be any iterable (the methods' operand).
+    VMVal set_op(char op, const VMVal& a, const VMVal& b) {
+        std::vector<VMVal> av=a.is_set()?*a.list:iter_items(a);
+        VMVal bs=b.is_set()?b:build_set(iter_items(b),true);
+        VMVal r=new_set(a.is_frozenset());
+        if(op=='|'){ for(auto& v:av) set_add(r,v); for(auto& v:*bs.list) set_add(r,v); }
+        else if(op=='&'){ for(auto& v:av) if(set_has(bs,v)) set_add(r,v); }
+        else if(op=='-'){ for(auto& v:av) if(!set_has(bs,v)) set_add(r,v); }
+        else {
+            VMVal as=a.is_set()?a:build_set(av,true);
+            for(auto& v:av) if(!set_has(bs,v)) set_add(r,v);
+            for(auto& v:*bs.list) if(!set_has(as,v)) set_add(r,v);
+        }
+        return r;
+    }
+    bool set_subset(const VMVal& a, const VMVal& b) {
+        std::vector<VMVal> av=a.is_set()?*a.list:iter_items(a);
+        VMVal bs=b.is_set()?b:build_set(iter_items(b),true);
+        for(auto& v:av) if(!set_has(bs,v)) return false;
+        return true;
+    }
+    bool set_method(VMVal& obj, const std::string& m, std::vector<VMVal>& a, VMVal& out) {
+        bool frozen=obj.is_frozenset();
+        std::string tn=frozen?"frozenset":"set";
+        auto need=[&](size_t n){
+            if(a.size()!=n) raise_native_exception("TypeError",tn+"."+m+"() takes exactly "+(n==1?std::string("one argument"):std::to_string(n)+" arguments")+" ("+std::to_string(a.size())+" given)");
+        };
+        auto mutating=[&](){ if(frozen) raise_native_exception("AttributeError","'frozenset' object has no attribute '"+m+"'"); };
+        out=VMVal::make_none();
+        if(m=="add"){ mutating(); need(1); set_add(obj,a[0]); return true; }
+        if(m=="discard"){ mutating(); need(1); set_discard(obj,a[0]); return true; }
+        if(m=="remove"){ mutating(); need(1); if(!set_discard(obj,a[0])) raise_native_exception("KeyError",vm_repr(a[0])); return true; }
+        if(m=="pop"){
+            mutating(); need(0);
+            if(obj.list->empty()) raise_native_exception("KeyError","'pop from an empty set'");
+            out=(*obj.list)[0]; set_discard(obj,out); return true;
+        }
+        if(m=="clear"){ mutating(); need(0); set_clear(obj); return true; }
+        if(m=="copy"){ need(0); out=build_set(*obj.list,frozen); return true; }
+        if(m=="update"||m=="intersection_update"||m=="difference_update"||m=="symmetric_difference_update"){
+            mutating();
+            if(m=="symmetric_difference_update") need(1);
+            for(auto& x:a){
+                if(m=="update"){ for(auto& v:iter_items(x)) set_add(obj,v); continue; }
+                char op=m=="intersection_update"?'&':m=="difference_update"?'-':'^';
+                VMVal r=set_op(op,obj,x);
+                std::vector<VMVal> keep=*r.list;
+                set_clear(obj);
+                for(auto& v:keep) set_add(obj,v);
+            }
+            return true;
+        }
+        if(m=="union"||m=="intersection"||m=="difference"){
+            char op=m=="union"?'|':m=="intersection"?'&':'-';
+            VMVal r=build_set(*obj.list,frozen);
+            for(auto& x:a) r=set_op(op,r,x);
+            out=r; return true;
+        }
+        if(m=="symmetric_difference"){ need(1); out=set_op('^',obj,a[0]); return true; }
+        if(m=="issubset"){ need(1); out=VMVal::make_bool(set_subset(obj,a[0])); return true; }
+        if(m=="issuperset"){ need(1); out=VMVal::make_bool(set_subset(a[0],obj)); return true; }
+        if(m=="isdisjoint"){
+            need(1);
+            for(auto& v:iter_items(a[0])) if(set_has(obj,v)){ out=VMVal::make_bool(false); return true; }
+            out=VMVal::make_bool(true); return true;
+        }
+        if(m=="__contains__"||m=="contains"||m=="has"){ need(1); out=VMVal::make_bool(set_has(obj,a[0])); return true; }
+        if(m=="len"||m=="length"||m=="size"||m=="__len__"){ out=VMVal::make_int((int64_t)obj.list->size()); return true; }
+        if(m=="slice") raise_native_exception("TypeError","'"+tn+"' object is not subscriptable");
+        return false;
+    }
+
     bool op_in(const VMVal& item, const VMVal& cont) {
         if(cont.type==VMType::INSTANCE){
             bool f=false;
@@ -5428,6 +5700,7 @@ private:
             nypy::BArg x=to_barg(item);
             return nycall([&]{ return nypy::bytes_contains(cont.bdata(),x); });
         }
+        if(cont.is_set()) return set_has(cont,item);   // one lookup (round 77)
         if(cont.type==VMType::LIST&&cont.list)
             for(auto& v:*cont.list) if(vm_eq(v,item)) return true;
         if(cont.type==VMType::MAP&&cont.map)
@@ -5445,9 +5718,30 @@ private:
         for(auto& cl : ee.clauses){
             if(cl.types.empty()) return cl.handler;
             for(auto& t : cl.types)
-                if(exception_matches(exc_val, t)) return cl.handler;
+                if(exception_matches(exc_val, exc_class_name(t))) return cl.handler;
         }
         return -1;
+    }
+    // The class an except clause names (NythonExecutor::excClassName): the
+    // name is looked up in scope, so a module's own class ("module.E"), an
+    // alias and a dotted name match what they name (round 77).
+    std::string exc_class_name(const std::string& t) {
+        if(t.empty() || nython::ny_is_builtin_exc(t)) return t;
+        size_t dot=t.find('.');
+        std::string head=dot==std::string::npos?t:t.substr(0,dot);
+        VMVal v;
+        bool ok=name_bound(head);
+        if(ok) v=load_var(head);
+        while(ok && dot!=std::string::npos){
+            size_t next=t.find('.',dot+1);
+            std::string part=t.substr(dot+1, next==std::string::npos?std::string::npos:next-dot-1);
+            VMVal a;
+            try { ok=try_get_attr(v, part, a); } catch(...) { ok=false; }
+            v=a; dot=next;
+        }
+        if(ok && v.type==VMType::CLASS) return v.class_name;
+        size_t last=t.rfind('.');
+        return last==std::string::npos?t:t.substr(last+1);
     }
     bool value_is_type(const VMVal& v, const std::string& want) {
         // Everything is an Object.
@@ -5646,7 +5940,7 @@ private:
             case VMType::INT:    return nypy::MemberKind::Int;
             case VMType::FLOAT:  return nypy::MemberKind::Float;
             case VMType::STRING: return nypy::MemberKind::Str;
-            case VMType::LIST:   return v.b?nypy::MemberKind::Tuple:nypy::MemberKind::List;
+            case VMType::LIST:   return v.is_set()?nypy::MemberKind::Set:v.b?nypy::MemberKind::Tuple:nypy::MemberKind::List;
             case VMType::MAP:    return nypy::MemberKind::Dict;
             case VMType::INSTANCE: return nypy::MemberKind::Instance;
             case VMType::GENERATOR: case VMType::ITERATOR: return nypy::MemberKind::Generator;
@@ -5815,6 +6109,7 @@ private:
         return nycall([&]{ return nypy::slice_adjust(len,hs,st,he,en,step); });
     }
     VMVal get_sub(const VMVal& obj, const VMVal& idx) {
+        if(obj.is_set()) raise_native_exception("TypeError","'"+vm_type_name(obj)+"' object is not subscriptable");
         if(obj.type==VMType::LIST&&obj.list){
             auto& L=*obj.list;
             if(idx.type==VMType::LIST&&idx.list&&!idx.b){
@@ -5906,6 +6201,7 @@ private:
         return true;
     }
     void set_sub(VMVal& obj, const VMVal& idx, VMVal val) {
+        if(obj.is_set()) raise_native_exception("TypeError","'"+vm_type_name(obj)+"' object does not support item assignment");
         if(obj.type==VMType::LIST&&obj.list){
             if(obj.b) raise_native_exception("TypeError","'tuple' object does not support item assignment");
             auto& L=*obj.list;
@@ -6582,12 +6878,103 @@ private:
     // ── Import system ───────────────────────────────────────────────────────
     // Modules imported by name, their namespaces (vm_import).
     std::unordered_map<std::string, VMVal> module_ns_;
+
+    static void tag_module_code(const std::shared_ptr<VMCode>& c, const std::shared_ptr<VMMap>& env) {
+        if(!c || c->module_env==env) return;
+        c->module_env=env;
+        for(auto& s:c->sub_codes) tag_module_code(s, env);
+        for(auto& k:c->constants) if(k.code) tag_module_code(k.code, env);
+    }
+    // `from m import a, b` / `*` (see the interpreter's bindFromNamespace).
+    void bind_from_namespace(const VMVal& nsv, const std::vector<std::string>& names, const std::string& module_name) {
+        if(nsv.type!=VMType::MAP || !nsv.map)
+            throw_exception(make_exception("ImportError",{VMVal::make_str("cannot import from \""+module_name+"\"")}));
+        auto& ns=*nsv.map;
+        if(names.size()==1 && names[0]=="*"){
+            auto all=ns.find("__all__");
+            if(all!=ns.end()){
+                std::vector<VMVal> items=iter_items(all->second);
+                for(auto& nm:items){
+                    std::string k=nm.type==VMType::STRING?nm.s:nm.to_string();
+                    auto hit=ns.find(k);
+                    if(hit==ns.end())
+                        throw_exception(make_exception("AttributeError",{VMVal::make_str("module '"+module_name+"' has no attribute '"+k+"'")}));
+                    define_var(k, hit->second);
+                }
+                return;
+            }
+            for(auto& kv:ns) if(!kv.first.empty() && kv.first[0]!='_') define_var(kv.first, kv.second);
+            return;
+        }
+        for(auto& n:names){
+            auto hit=ns.find(n);
+            if(hit==ns.end())
+                throw_exception(make_exception("ImportError",{VMVal::make_str("cannot import name '"+n+"' from '"+module_name+"'")}));
+            define_var(n, hit->second);
+        }
+    }
+    // `import m` / `import m as x` / `from m import ...` of a module file
+    // named without quotes (round 77; NythonExecutor::importModule is the
+    // interpreter's): the module runs once in a scope of its own
+    // (VMCode::module_env), and the importer binds only its namespace - the
+    // module scope as it was when the module finished - or the names asked
+    // for. A quoted import still includes the file (export_to_globals_).
+    void import_module(const std::string& filepath, const std::string& name, const std::string& bind_as,
+                       const std::vector<std::string>& from_names) {
+        auto source=nython::reader::SourceCode(filepath);
+        auto reporter=std::make_shared<nython::exception::Reporter>(source);
+        auto lx=std::make_shared<nython::lexer::Lexer>(source);
+        lx->tokenize();
+        auto pr=std::make_shared<nython::parser::Parser>(reporter.get(),(nython::Runnable*)this,lx.get());
+        auto ast=pr->parse();
+        if(!ast) throw_exception(make_exception("ImportError",{VMVal::make_str("cannot import \""+filepath+"\"")}));
+        nython::scope::qualify_module_classes(ast, name);
+        prelude_asts_.push_back(ast);    // kept alive with the code
+        Compiler c; auto code=c.compile(ast);
+        auto env=std::make_shared<VMMap>(); vmgc::track_map(env);
+        (*env)["__name__"]=VMVal::make_str(name);
+        (*env)["__file__"]=VMVal::make_str(filepath);
+        tag_module_code(code, env);
+        code->module_top=true;
+        // Registered before the module runs, so a circular import binds it.
+        auto nsmap=std::make_shared<VMMap>(); vmgc::track_map(nsmap);
+        VMVal nsv=VMVal::make_map(); nsv.map=nsmap; nsv.class_name=name;
+        module_ns_[name]=nsv;
+        bool old_exp=export_to_globals_; int old_depth=export_depth_;
+        export_to_globals_=false; export_depth_=-1;
+        struct Restore { VirtualMachine* vm; bool e; int d;
+            ~Restore(){ vm->export_to_globals_=e; vm->export_depth_=d; } } restore{this, old_exp, old_depth};
+        try{ exec_code(code,{},std::nullopt); }
+        catch(VMReturn&){}
+        catch(...){ module_ns_.erase(name); globals_.erase("__imported_"+name); throw; }
+        for(auto& kv:*env) (*nsmap)[kv.first]=kv.second;
+        for(auto& sub:code->sub_codes) if(sub->is_class) class_reg_[sub->name]=sub;
+        if(!from_names.empty()) bind_from_namespace(nsv, from_names, name);
+        else if(!bind_as.empty()) define_var(bind_as, nsv);
+    }
     void vm_import(const std::string& raw_name_in) {
         std::string tried_paths;
         // Split the alias the compiler appended, if any.
         std::string raw_name = raw_name_in;
         std::string alias;
         bool implicit=false;
+        bool bare=false;
+        if(!raw_name.empty() && raw_name[0]=='\x02'){ bare=true; raw_name=raw_name.substr(1); }
+        std::vector<std::string> from_names;
+        {
+            size_t fp=raw_name.find('\x04');
+            if(fp!=std::string::npos){
+                std::string lst=raw_name.substr(fp+1);
+                raw_name=raw_name.substr(0,fp);
+                size_t a=0;
+                while(a<=lst.size()){
+                    size_t b=lst.find(',',a);
+                    if(b==std::string::npos) b=lst.size();
+                    if(b>a) from_names.push_back(lst.substr(a,b-a));
+                    a=b+1;
+                }
+            }
+        }
         size_t sep = raw_name.find('\x01');
         if(sep != std::string::npos){
             alias = raw_name.substr(sep + 1);
@@ -6607,6 +6994,11 @@ private:
             // a module runs once: a later import (named or aliased) binds the
             // namespace its first import made
             auto mc=module_ns_.find(name);
+            if(bare && mc!=module_ns_.end()){
+                if(!from_names.empty()) bind_from_namespace(mc->second, from_names, name);
+                else if(!alias.empty()) define_var(alias, mc->second);
+                return;
+            }
             if(!alias.empty()&&mc!=module_ns_.end()){ globals_[alias]=mc->second; return; }
             if(implicit&&globals_.count(guard_key)) return;
         }
@@ -6725,6 +7117,7 @@ private:
             };
             for(auto& c:ancestors(name+".ny")) paths.push_back(c);
             for(auto& c:ancestors(name)) paths.push_back(c);
+            for(auto& d:nyrt::library_dirs()) paths.push_back(d+name+".ny");
             for(auto& p:paths){struct stat st;if(::stat(p.c_str(),&st)==0){filepath=p;break;}}
             // Kept for the error message below; `paths` goes out of scope here.
             for(size_t i=0;i<paths.size();++i){ if(i) tried_paths+=", "; tried_paths+=paths[i]; }
@@ -6742,6 +7135,11 @@ private:
             // was uncatchable on this engine while the interpreter caught it.
             throw std::runtime_error("__exc__:ImportError:cannot find module \"" + raw_name
                                      + "\" (looked in: " + tried_paths + ")");
+        }
+        // A module named without quotes runs in a scope of its own.
+        if(bare && it==lib_map.end()){
+            import_module(filepath, name, alias, from_names);
+            return;
         }
         try {
             auto source=nython::reader::SourceCode(filepath);
@@ -6782,6 +7180,30 @@ private:
             globals_["__name__"]=prev_name;
             globals_["__file__"]=prev_file;
             export_to_globals_=old_exp; export_depth_=old_depth;
+            // A module name it defines itself (socket's class socket): the
+            // module's names become attributes of that class or function, as
+            // on the interpreter (see evalImport there).
+            if(!alias.empty() && own_names.count(alias)){
+                VMVal same;
+                auto git=globals_.find(alias);
+                if(git!=globals_.end()) same=git->second;
+                else { auto cit=class_reg_.find(alias); if(cit!=class_reg_.end()) same=VMVal::make_class(cit->second, alias); }
+                if(same.type==VMType::CLASS||same.type==VMType::FUNCTION){
+                    for(const auto& n : own_names){
+                        if(n==alias) continue;
+                        auto it=globals_.find(n);
+                        VMVal v;
+                        if(it!=globals_.end()) v=it->second;
+                        else { auto cit=class_reg_.find(n); if(cit==class_reg_.end()) continue; v=VMVal::make_class(cit->second, n); }
+                        set_attr(same, n, v);
+                    }
+                    set_attr(same, alias, same);
+                    module_ns_[name]=same;
+                    globals_[alias]=same;
+                    for(auto& sub:code->sub_codes) if(sub->is_class) class_reg_[sub->name]=sub;
+                    return;
+                }
+            }
             if(!alias.empty()){
                 auto ns=std::make_shared<VMMap>(); vmgc::track_map(ns);
                 for(const auto& n : own_names){
@@ -7182,9 +7604,18 @@ private:
                 std::vector<VMVal> pair={(vm_arg_list(a,0))[i],(vm_arg_list(a,1))[i]};
                 r.push_back(VMVal::make_list(std::move(pair)));}
             return VMVal::make_list(std::move(r));});
-        globals_["input"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(!a.empty()) std::cout<<a[0].to_string();
-            std::string line; std::getline(std::cin,line);
+        globals_["input"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            // one line from stdin (NyConc.cpp: read_stdin_line); EOFError at
+            // the end of input, Ctrl+C raises KeyboardInterrupt
+            if(!a.empty()) std::cout<<vm_str(a[0])<<std::flush;
+            std::string line;
+            bool ok;
+            try { ok=nyconc::read_stdin_line(line); }
+            catch(nyconc::NyError& err){
+                if(raise_nyerror_) raise_nyerror_(err);
+                raise_native_exception(err.type,err.msg);
+            }
+            if(!ok) raise_native_exception("EOFError","EOF when reading a line");
             return VMVal::make_str(line);});
         globals_["langevin_step"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             // langevin_step(x, grad, step_size) -> x - step_size*grad + noise
@@ -7676,6 +8107,12 @@ private:
         VirtualMachine* vm=this;
         return VMVal::make_native([obj,m,vm](std::vector<VMVal>& a)->VMVal{
             if(!obj.list) return VMVal::make_none();
+            if(obj.is_set()){
+                VMVal so=obj, out;
+                take_kwargs(a);
+                if(vm->set_method(so,m,a,out)) return out;
+                return vm->missing_attr(obj,m);
+            }
             auto& lst=*obj.list;
             VMVal kw=take_kwargs(a);
             VMVal res;
@@ -8079,12 +8516,13 @@ private:
             return VMVal::make_tuple(vm->iter_items(a[0]));
         });
         def("set",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
-            std::vector<VMVal> out;
-            if(!a.empty()){
-                std::unordered_set<std::string> seen;
-                for(auto& v:vm->iter_items(a[0])) if(seen.insert(v.repr()).second) out.push_back(v);
-            }
-            return VMVal::make_list(std::move(out));
+            if(a.empty()) return new_set(false);
+            return vm->build_set(vm->iter_items(a[0]),false);
+        });
+        def("frozenset",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            if(a.empty()) return new_set(true);
+            if(a[0].is_frozenset()) return a[0];
+            return vm->build_set(vm->iter_items(a[0]),true);
         });
         def("dict",[vm](std::vector<VMVal>& a,const VMVal& kw)->VMVal{
             VMVal d=VMVal::make_map();
@@ -8167,7 +8605,7 @@ private:
             case VMType::INT:return VMVal::make_str("int");
             case VMType::FLOAT:return VMVal::make_str("float");
             case VMType::STRING:return VMVal::make_str("string");  // as the interpreter reports it
-            case VMType::LIST:return VMVal::make_str(a[0].b?"tuple":"list");
+            case VMType::LIST:return VMVal::make_str(a[0].is_set()?(a[0].is_frozenset()?"frozenset":"set"):a[0].b?"tuple":"list");
             case VMType::MAP:return VMVal::make_str("map");   // as the interpreter reports it
             case VMType::FUNCTION:return VMVal::make_str("function");
             case VMType::NATIVE:return VMVal::make_str("builtin");
@@ -8399,9 +8837,19 @@ private:
                 for(auto& v:*a[0].list){if(v.type==VMType::FLOAT){s+=v.d;hf=true;}else s+=to_d(v);}
                 return hf?VMVal::make_float(s):VMVal::make_int((int64_t)s);}
             return VMVal::make_int(0);});
-        globals_["input"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
-            if(!a.empty())std::cout<<a[0].to_string();
-            std::string line;std::getline(std::cin,line);return VMVal::make_str(line);});
+        globals_["input"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            // one line from stdin (NyConc.cpp: read_stdin_line); EOFError at
+            // the end of input, Ctrl+C raises KeyboardInterrupt
+            if(!a.empty()) std::cout<<vm_str(a[0])<<std::flush;
+            std::string line;
+            bool ok;
+            try { ok=nyconc::read_stdin_line(line); }
+            catch(nyconc::NyError& err){
+                if(raise_nyerror_) raise_nyerror_(err);
+                raise_native_exception(err.type,err.msg);
+            }
+            if(!ok) raise_native_exception("EOFError","EOF when reading a line");
+            return VMVal::make_str(line);});
         globals_["chr"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
             return a.empty()?VMVal::make_str(""):VMVal::make_str(std::string(1,(char)a[0].i));});
         globals_["ord"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
@@ -8486,7 +8934,9 @@ private:
                 if(cls_name=="float"||cls_name=="double") return VMVal::make_bool(obj.type==VMType::FLOAT);
                 if(cls_name=="bool"||cls_name=="boolean") return VMVal::make_bool(obj.type==VMType::BOOL);
                 if(cls_name=="str"||cls_name=="string") return VMVal::make_bool(obj.type==VMType::STRING);
-                if(cls_name=="list"||cls_name=="array") return VMVal::make_bool(obj.type==VMType::LIST&&!obj.b);
+                if(cls_name=="list"||cls_name=="array") return VMVal::make_bool(obj.type==VMType::LIST&&!obj.b&&!obj.is_set());
+                if(cls_name=="set") return VMVal::make_bool(obj.is_set()&&!obj.is_frozenset());
+                if(cls_name=="frozenset") return VMVal::make_bool(obj.is_frozenset());
                 if(cls_name=="tuple") return VMVal::make_bool(obj.type==VMType::LIST&&obj.b);
                 if(cls_name=="map"||cls_name=="dict") return VMVal::make_bool(obj.type==VMType::MAP);
                 if(cls_name=="bytes") return VMVal::make_bool(obj.type==VMType::BYTES&&!obj.b);

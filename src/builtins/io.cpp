@@ -289,16 +289,19 @@ Value dispatch_io(NythonExecutor& E,
         }
         // ===================== COMPLETE I/O MODULE =====================
         if (name == "input") {
-            // input(prompt) -> reads line from stdin
-            if (!args.empty()) {
-                std::string prompt = getStringValue(args[0]);
-                std::cout << prompt << std::flush;
-            }
+            // input(prompt): one line from stdin (NyConc.cpp: read_stdin_line -
+            // the GIL is released while it waits, Ctrl+C raises
+            // KeyboardInterrupt); EOFError at the end of input, as in Python.
+            if (!args.empty()) std::cout << E.strOf(args[0]) << std::flush;
             std::string line;
-            if (std::getline(std::cin, line)) {
-                return makeStringValue(line);
+            bool ok;
+            try { ok = nyconc::read_stdin_line(line); }
+            catch (nyconc::NyError& err) {
+                if (!err.raw.empty()) throw std::string(err.raw);
+                throw std::string("__exc__:" + err.type + ":" + err.msg);
             }
-            return makeStringValue("");
+            if (!ok) E.pyRaise("EOFError", "EOF when reading a line");
+            return E.makeStringValue(line);
         }
         // ── Handle-based files ───────────────────────────────────────────────
         // file_open(path, mode="r") -> int handle, or -1. Every handle

@@ -10,6 +10,10 @@
 // the handle functions still accept a NythonFile wherever they take a handle
 // and code written against `open()` returning an int keeps working
 // (`fh > 0`, `file_read(fh)`, `file_close(fh)`).
+//
+// Round 77: the asynchronous protocols the parser desugars to (Parser.cpp,
+// async_def_desugar / `async for` / `async with`): _ny_async_cm,
+// _ny_async_gen, _ny_aiter, and the aiter()/anext() builtins.
 
 namespace nyrt {
 
@@ -110,6 +114,95 @@ class NythonFile:
 
 def open(path, mode="r", encoding="utf-8"):
     return NythonFile(path, mode, file_open_or_raise(path, mode))
+
+class _NyAsyncCM:
+    def __init__(self, m):
+        self.m = m
+
+    def __enter__(self):
+        if hasattr(self.m, "__aenter__"):
+            return async_await(self.m.__aenter__())
+        if hasattr(self.m, "__enter__"):
+            return self.m.__enter__()
+        return self.m
+
+    def __exit__(self, t=none, v=none, tb=none):
+        if hasattr(self.m, "__aexit__"):
+            return async_await(self.m.__aexit__(t, v, tb))
+        if hasattr(self.m, "__exit__"):
+            return self.m.__exit__(t, v, tb)
+        return false
+
+def _ny_async_cm(m):
+    return _NyAsyncCM(m)
+
+class _NyAsyncGen:
+    def __init__(self, g):
+        self._g = g
+
+    def __aiter__(self):
+        return self
+
+    def __anext__(self):
+        try:
+            return next(self._g)
+        except StopIteration:
+            raise StopAsyncIteration()
+
+    def asend(self, value):
+        try:
+            return self._g.send(value)
+        except StopIteration:
+            raise StopAsyncIteration()
+
+    def athrow(self, *exc):
+        try:
+            return self._g.throw(*exc)
+        except StopIteration:
+            raise StopAsyncIteration()
+
+    def aclose(self):
+        self._g.close()
+
+    def __iter__(self):
+        return self._g
+
+    def __repr__(self):
+        return "<async_generator object>"
+
+def _ny_async_gen(g):
+    return _NyAsyncGen(g)
+
+def _ny_adrive(it):
+    while true:
+        var v = none
+        try:
+            v = async_await(it.__anext__())
+        except StopAsyncIteration:
+            return
+        yield v
+
+def _ny_aiter(o):
+    if isinstance(o, _NyAsyncGen):
+        return o._g
+    if hasattr(o, "__aiter__"):
+        return _ny_adrive(o.__aiter__())
+    return o
+
+def aiter(o):
+    if hasattr(o, "__aiter__"):
+        return o.__aiter__()
+    raise TypeError("'" + str(type(o)) + "' object is not an async iterable")
+
+def anext(it, *default):
+    if not hasattr(it, "__anext__"):
+        raise TypeError("'" + str(type(it)) + "' object is not an async iterator")
+    try:
+        return async_await(it.__anext__())
+    except StopAsyncIteration:
+        if len(default) > 0:
+            return default[0]
+        raise
 )NYPRELUDE";
 }
 

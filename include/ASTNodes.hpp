@@ -721,6 +721,10 @@ struct LambdaNode : Node {
 
 struct ClassNode : Node {
     std::string name; std::vector<node_ptr> bases; node_ptr body;
+    // A class of a module imported by name is named "module.Class" (its
+    // identity: both engines key classes by name) and bound as "Class"
+    // (nython::scope::qualify_module_classes, round 77).
+    std::string bind_name;
     ClassNode(Token t, const std::string& n, node_ptr b) : Node(t, NodeType::CLASS), name(n), bases{}, body(b) {}
     Value eval(Context* ctx) override {
         Runnable* r = getRunner(ctx);
@@ -774,6 +778,7 @@ struct EnumNode : Node {
 
 struct ImportNode : Node {
     std::string module_name, alias; std::vector<std::string> names;
+    bool quoted = false;   // `import "path"`: the lexer drops the quotes from module_name
     ImportNode(Token t, const std::string& m) : Node(t, NodeType::IMPORT), module_name(m), alias{}, names{} {}
     Value eval(Context* ctx) override { return NONE_VALUE; /* module loading not yet implemented */ }
 };

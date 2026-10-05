@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ny_classcheck.py - fail on top-level names defined more than once across lib/.
 
-Nython has no per-module namespace for `import "path"`: every top-level
+Nython has no per-module namespace for `import "path"` (an include): every top-level
 class and function a module defines lands in one global namespace, and a
 later definition silently replaces an earlier one. A caller written against
 the replaced definition then gets `none` back from every method the winner
@@ -24,10 +24,29 @@ CLASS_RE = re.compile(r"^class\s+([A-Za-z_]\w*)")
 DEF_RE = re.compile(r"^def\s+([A-Za-z_]\w*)")
 
 
+MODULE_MARK = "# nython: module"
+
+
+def is_module(path):
+    """A library meant to be imported by name (`import socket`) declares it
+    with a `# nython: module` line among its first 20. Such a module runs in
+    a scope of its own and its classes are named "module.Class" (round 77),
+    so its names cannot collide with anyone else's."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for n, line in enumerate(f):
+            if n >= 20:
+                break
+            if line.strip().startswith(MODULE_MARK):
+                return True
+    return False
+
+
 def scan(classes_only):
     defs = {}
     for path in sorted(glob.glob(os.path.join(REPO, "lib", "**", "*.ny"), recursive=True)):
         rel = os.path.relpath(path, REPO)
+        if is_module(path):
+            continue
         with open(path, encoding="utf-8", errors="replace") as f:
             for n, line in enumerate(f, 1):
                 m = CLASS_RE.match(line)

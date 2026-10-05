@@ -53,6 +53,7 @@ inline const char* ny_builtin_exc_parent(const std::string& name) {
         {"SyntaxError", "Exception"},
         {"AssertionError", "Exception"},
         {"StopIteration", "Exception"},
+        {"StopAsyncIteration", "Exception"},
         {"MemoryError", "Exception"},
         {"EOFError", "Exception"},
         // The OS layer's typed errors (include/builtins/os.hpp raises them).
@@ -70,10 +71,20 @@ inline const char* ny_builtin_exc_parent(const std::string& name) {
         // socket.gaierror / socket.herror (round 77, the network layer)
         {"gaierror", "OSError"},
         {"herror", "OSError"},
+        // ssl's (round 77, src/builtins/tls.cpp)
+        {"SSLError", "OSError"},
+        {"SSLCertVerificationError", "SSLError"},
+        {"SSLEOFError", "SSLError"},
+        {"SSLZeroReturnError", "SSLError"},
+        {"SSLWantReadError", "SSLError"},
+        {"SSLWantWriteError", "SSLError"},
+        {"SSLSyscallError", "SSLError"},
         // The concurrency runtime's (src/NyConc.cpp).
         {"DeadlockError", "RuntimeError"},
         {"LockOrderError", "RuntimeError"},
-        {"CancelledError", "Exception"},
+        // A BaseException, as in Python 3.8+: `except Exception` does not
+        // swallow a cancellation.
+        {"CancelledError", "BaseException"},
         {"ChannelClosedError", "Exception"},
     };
     auto it = parents.find(name);
@@ -109,7 +120,9 @@ inline const std::vector<std::string>& ny_builtin_exc_names() {
         "FileNotFoundError", "FileExistsError", "PermissionError",
         "TimeoutError", "ConnectionError", "ImportError",
         "ModuleNotFoundError", "SyntaxError", "AssertionError",
-        "StopIteration", "MemoryError", "EOFError", "EnvironmentError",
+        "StopIteration", "StopAsyncIteration", "MemoryError", "EOFError", "EnvironmentError",
+        "SSLError", "SSLCertVerificationError", "SSLEOFError", "SSLZeroReturnError",
+        "SSLWantReadError", "SSLWantWriteError", "SSLSyscallError",
         "IsADirectoryError", "NotADirectoryError", "InterruptedError",
         "ChildProcessError", "ProcessLookupError", "BlockingIOError",
         "BrokenPipeError", "ConnectionRefusedError", "ConnectionResetError",

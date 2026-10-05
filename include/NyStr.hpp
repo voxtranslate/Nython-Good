@@ -888,13 +888,22 @@ inline std::string key_of_obj(const std::string& id) { return "\x01o" + id; }
 // with the same characters, as in Python.
 inline std::string key_of_bytes(const std::string& b) { return std::string("\x01" "b") + b; }
 // Decoding: the kind of a stored key and its payload.
-enum KeyKind { K_STR, K_INT, K_FLOAT, K_NONE, K_TUPLE, K_OBJ, K_BYTES };
+enum KeyKind { K_STR, K_INT, K_FLOAT, K_NONE, K_TUPLE, K_OBJ, K_BYTES, K_FROZENSET };
 inline KeyKind key_kind(const std::string& k) {
     if (k.size() < 2 || k[0] != '\x01') return K_STR;
     switch (k[1]) {
         case 'i': return K_INT; case 'f': return K_FLOAT; case 'n': return K_NONE;
-        case 't': return K_TUPLE; case 'o': return K_OBJ; case 'b': return K_BYTES; default: return K_STR;
+        case 't': return K_TUPLE; case 'o': return K_OBJ; case 'b': return K_BYTES;
+        case 'F': return K_FROZENSET; default: return K_STR;
     }
+}
+// A frozenset key (round 77): its elements' keys, sorted, so equal
+// frozensets are one key whatever their order (key_tuple_parts reads them).
+inline std::string key_of_frozenset(std::vector<std::string> parts) {
+    std::sort(parts.begin(), parts.end());
+    std::string r = "\x01" "F";
+    for (auto& p : parts) { r += std::to_string(p.size()); r += ':'; r += p; }
+    return r;
 }
 inline std::string key_payload(const std::string& k) { return key_kind(k) == K_STR && key_is_plain(k) ? k : k.substr(2); }
 inline std::vector<std::string> key_tuple_parts(const std::string& k) {
@@ -970,6 +979,20 @@ inline int64_t hash_of_key(const std::string& k) {
             acc += (uint64_t)parts.size() ^ (X5 ^ 3527539ULL);
             if (acc == (uint64_t)-1) return 1546275796;
             return (int64_t)acc;
+        }
+        case K_FROZENSET: {
+            // order-independent: CPython's frozenset hash mixing
+            uint64_t h = 0;
+            auto parts = key_tuple_parts(k);
+            for (auto& p : parts) {
+                uint64_t x = (uint64_t)hash_of_key(p);
+                h ^= ((x ^ 89869747ULL) ^ (x << 16)) * 3644798167ULL;
+            }
+            h ^= ((uint64_t)parts.size() + 1) * 1927868237ULL;
+            h ^= (h >> 11) ^ (h >> 25);
+            h = h * 69069U + 907133923UL;
+            if (h == (uint64_t)-1) h = 590923713ULL;
+            return (int64_t)h;
         }
         default: return fnv(k);
     }

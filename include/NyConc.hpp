@@ -69,6 +69,12 @@ struct Engine {
     virtual bool   is_callable(const BoxPtr& b) = 0;
     // Human-readable text of a boxed value (task/thread names, errors).
     virtual std::string describe(const BoxPtr& b) = 0;
+    // `await obj` for an object with __await__: what obj.__await__() returns
+    // (nullptr when obj has none). Throws NyError if __await__ raises.
+    virtual BoxPtr await_target(const BoxPtr&) { return nullptr; }
+    // The exception object an error stands for (gather(return_exceptions=
+    // True) returns them); nullptr when the engine cannot make one.
+    virtual BoxPtr exception_object(const NyError&) { return nullptr; }
     // Per-thread engine state. The runtime creates one per thread (and one
     // per async task) and calls swap_in right after the thread acquires the
     // GIL and swap_out right before it releases it, and both when it switches
@@ -156,6 +162,39 @@ struct GilRelease {
 // generator again. GIL held.
 bool relay_requested();   // true once per request
 void relay_park();
+
+// ── Signals (round 77, section 9 of NyConc.cpp) ─────────────────────────────
+// The C handler records the signal; the Nython handlers run on the main
+// thread. Engines call run_signal_handlers() where signal_pending() at their
+// tick sites and turn a NyError it throws into their own exception (the
+// default SIGINT handler raises KeyboardInterrupt).
+extern std::atomic<int> g_sig_any;
+inline bool signal_pending() { return g_sig_any.load(std::memory_order_relaxed) != 0; }
+void install_default_signals();   // SIGINT -> KeyboardInterrupt; at program start
+void run_signal_handlers();       // GIL held; a no-op off the main thread
+bool is_main_thread();
+
+// ── I/O waits (round 77) ─────────────────────────────────────────────────────
+// Until fd is readable / writable, or timeout_ms passes (< 0: no limit).
+// Returns the ready events (IO_ERR on a socket error or hang-up), 0 on a
+// timeout. Called with the GIL held: a thread releases it while it waits; an
+// async task parks on its loop's poller, so the loop's other tasks run.
+// Signals are handled inside (the wait resumes after a handler returns);
+// throws NyError (CancelledError, a signal handler's exception).
+enum { IO_READ = 1, IO_WRITE = 2, IO_ERR = 4 };
+
+// One line from stdin for input(), without its newline: the GIL is released
+// while it waits (other threads run), a signal's handler runs (Ctrl+C
+// raises KeyboardInterrupt) and the read resumes when it returns. False at
+// the end of input (input() raises EOFError). Both engines.
+bool read_stdin_line(std::string& out);
+int wait_io(intptr_t fd, int events, double timeout_ms);
+// Several at once (select): fills each revents; returns how many are ready
+// (0 on a timeout).
+struct IoReq { intptr_t fd = -1; int events = 0; int revents = 0; };
+// True on an async task's coroutine (its waits park it on the loop).
+bool in_async_task();
+int wait_io_many(std::vector<IoReq>& reqs, double timeout_ms);
 
 // Wait for every non-daemon thread before the process tears the engine down
 // (both engines' run paths call this after the main program). Never throws;

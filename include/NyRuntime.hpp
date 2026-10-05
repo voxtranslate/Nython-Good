@@ -18,6 +18,8 @@
 #include <ios>
 #include <cctype>
 
+#include <cstdlib>
+
 namespace nyrt {
 
 // ── Command line ────────────────────────────────────────────────────────────
@@ -35,6 +37,45 @@ inline std::string& executable_path() {
     static std::string p;
     return p;
 }
+// Where `import name` also looks for name.ny, after the importing file's
+// directory and the working directory (round 77): every directory of
+// NYTHONPATH (':'-separated, ';' on Windows), then the standard library
+// beside the interpreter - <exe dir>/lib and <exe dir>/../lib (the build
+// directory sits in the project), so a program anywhere finds `import
+// socket`. Each entry ends with a separator.
+inline std::vector<std::string> library_dirs() {
+    std::vector<std::string> out;
+    auto add = [&](std::string d) {
+        if (d.empty()) return;
+        if (d.back() != '/' && d.back() != '\\') d += '/';
+        for (auto& o : out) if (o == d) return;
+        out.push_back(d);
+    };
+    if (const char* np = std::getenv("NYTHONPATH")) {
+#ifdef _WIN32
+        const char sep = ';';
+#else
+        const char sep = ':';
+#endif
+        std::string all = np;
+        size_t a = 0;
+        while (a <= all.size()) {
+            size_t b = all.find(sep, a);
+            if (b == std::string::npos) b = all.size();
+            add(all.substr(a, b - a));
+            a = b + 1;
+        }
+    }
+    std::string exe = executable_path();
+    size_t cut = exe.find_last_of("/\\");
+    if (cut != std::string::npos) {
+        std::string dir = exe.substr(0, cut + 1);
+        add(dir + "lib");
+        add(dir + "../lib");
+    }
+    return out;
+}
+
 inline void set_command_line(const std::string& script, int argc, char** args, int first_arg) {
     script_path() = script;
     argv().clear();
@@ -97,6 +138,10 @@ inline std::string builtin_exc_parent(const std::string& t) {
         {"AttributeError", "Exception"}, {"ImportError", "Exception"},
         {"ModuleNotFoundError", "ImportError"}, {"AssertionError", "Exception"},
         {"StopIteration", "Exception"}, {"MemoryError", "Exception"},
+        {"StopAsyncIteration", "Exception"}, {"CancelledError", "BaseException"},
+        {"SSLError", "OSError"}, {"SSLCertVerificationError", "SSLError"}, {"SSLEOFError", "SSLError"},
+        {"SSLZeroReturnError", "SSLError"}, {"SSLWantReadError", "SSLError"},
+        {"SSLWantWriteError", "SSLError"}, {"SSLSyscallError", "SSLError"},
         {"SyntaxError", "Exception"}, {"EOFError", "Exception"},
     };
     for (auto& row : table) if (t == row[0]) return row[1];
@@ -117,7 +162,8 @@ bool exc_matches(const std::string& type, const std::string& filter, ParentFn us
     // Anything that is not a system-exit style signal is an Exception; an
     // untyped raise (a plain string) is too.
     if (filter == "Exception" || filter == "Error") {
-        return type != "SystemExit" && type != "KeyboardInterrupt" && type != "GeneratorExit";
+        return type != "SystemExit" && type != "KeyboardInterrupt" && type != "GeneratorExit" &&
+               type != "CancelledError";
     }
     std::string cur = type;
     for (int depth = 0; depth < 32 && !cur.empty(); depth++) {

@@ -356,10 +356,19 @@ Value dispatch_tensor(NythonExecutor& E,
             return NONE_VALUE;
         }
         if (name == "input") {
-            if (args.size() >= 1) std::cout << getStringValue(args[0]);
+            // input(prompt): one line from stdin (NyConc.cpp: read_stdin_line -
+            // the GIL is released while it waits, Ctrl+C raises
+            // KeyboardInterrupt); EOFError at the end of input, as in Python.
+            if (!args.empty()) std::cout << E.strOf(args[0]) << std::flush;
             std::string line;
-            std::getline(std::cin, line);
-            return makeStringValue(line);
+            bool ok;
+            try { ok = nyconc::read_stdin_line(line); }
+            catch (nyconc::NyError& err) {
+                if (!err.raw.empty()) throw std::string(err.raw);
+                throw std::string("__exc__:" + err.type + ":" + err.msg);
+            }
+            if (!ok) E.pyRaise("EOFError", "EOF when reading a line");
+            return E.makeStringValue(line);
         }
         if (name == "isinstance") {
             // isinstance(x, (A, B)): any of them.
@@ -437,6 +446,10 @@ Value dispatch_tensor(NythonExecutor& E,
                                          && !cont->container->count("__gen__"));
                     }
                     return Value(false);
+                }
+                if (type_name == "set" || type_name == "frozenset") {
+                    Container* sc = E.setOf(args[0]);
+                    return Value(sc && NythonExecutor::isFrozenCont(sc) == (type_name == "frozenset"));
                 }
                 if (type_name == "map" || type_name == "dict") {
                     if (args[0].isCollectable() && args[0].value.gc) {

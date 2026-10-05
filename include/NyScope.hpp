@@ -41,5 +41,14 @@ void check(const nython::node::node_ptr& root);
 // declarations before, so `X = 5` in a module was missing from it).
 void module_names(const nython::node::node_ptr& root, std::set<std::string>& out);
 
+// A module imported by name (round 77) has a scope of its own, but both
+// engines identify a class by its name, so two modules' classes of one name
+// (asyncio's Queue, lib/thread.ny's Queue) would replace each other. Each
+// class the module's top level defines is renamed "module.Class" and bound
+// as "Class" (ClassNode::bind_name); its bases that name another of these
+// classes are renamed too. `except Name` finds the class through the scope
+// at run time, so the module's own clauses need no rewriting.
+void qualify_module_classes(const nython::node::node_ptr& root, const std::string& module);
+
 } // namespace nython::scope
 #endif

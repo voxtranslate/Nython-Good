@@ -124,6 +124,23 @@ struct InterpEngine : nyconc::Engine {
         catch (nyconc::NyError&) { throw; }
         catch (std::exception& x) { throw nyconc::NyError::make("RuntimeError", x.what()); }
     }
+    nyconc::BoxPtr exception_object(const nyconc::NyError& err) override {
+        std::string flow = !err.raw.empty() ? err.raw : "__exc__:" + err.type + ":" + err.msg;
+        return box(E.exceptionObject(flow));
+    }
+    nyconc::BoxPtr await_target(const nyconc::BoxPtr& b) override {
+        Value v = unbox_value(b);
+        if (!E.isInstanceValue(v) || !E.instanceHasMethod(v, "__await__")) return nullptr;
+        std::vector<Value> av;
+        try { return box(E.callMethod(v, "__await__", av, E.globalContext())); }
+        catch (std::string& s) {
+            nyconc::NyError e; e.raw = s;
+            Value inst = E.excInstanceOf(s);
+            if (inst.type != ValueType::NONE) { e.type = E.instanceClassName(inst); e.msg = E.exceptionMessage(inst); }
+            throw e;
+        }
+        catch (nython::node::ReturnSignal& r) { return box(r.value); }
+    }
     nyconc::BoxPtr box_int(int64_t v) override { return box(Value((int64_t)v)); }
     nyconc::BoxPtr box_none() override { return box(NONE_VALUE); }
     bool unbox_int(const nyconc::BoxPtr& b, int64_t& out) override {
@@ -252,6 +269,18 @@ InterpEngine& engine_for(NythonExecutor& E) {
 }
 
 } // namespace
+
+// A signal's handler, run at a statement boundary (noteStatement): its
+// exception (KeyboardInterrupt for SIGINT) is raised there.
+void ny_interp_check_signals(NythonExecutor& E) {
+    (void)E;
+    try { nyconc::run_signal_handlers(); }
+    catch (nyconc::NyError& err) {
+        if (!err.raw.empty()) throw std::string(err.raw);
+        throw std::string("__exc__:" + err.type + ":" + err.msg);
+    }
+}
+
 
 
 // ── Namespace imports (match main.cpp) ────────────────────────────────────────

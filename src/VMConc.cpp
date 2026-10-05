@@ -135,6 +135,19 @@ struct VMConcEngine : nyconc::Engine {
         catch (std::string& s) { nyconc::NyError e; e.raw = s; throw e; }
         catch (std::exception& x) { nyconc::NyError e; e.raw = x.what(); throw e; }
     }
+    nyconc::BoxPtr exception_object(const nyconc::NyError& err) override {
+        if (err.obj) return err.obj;
+        std::string t = err.type, m = err.msg;
+        if (t.empty() && !split_exception_text(err.raw, t, m)) { t = "Exception"; m = err.raw; }
+        return box(exception_instance(t, m));
+    }
+    nyconc::BoxPtr await_target(const nyconc::BoxPtr& b) override {
+        VMVal v = unbox(b);
+        if (v.type != VMType::INSTANCE) return nullptr;
+        VMVal m;
+        if (!vm.try_get_attr(v, "__await__", m)) return nullptr;
+        return call(box(m), {});
+    }
     nyconc::BoxPtr box_int(int64_t v) override { return box(VMVal::make_int(v)); }
     nyconc::BoxPtr box_none() override { return box(VMVal::make_none()); }
     bool unbox_int(const nyconc::BoxPtr& b, int64_t& out) override {
@@ -208,6 +221,13 @@ void VMConc::install(VirtualMachine& vm) {
     // the engine as still referenced at exit (deliberate, not a leak).
     static auto* engines = new std::vector<VMConcEngine*>();
     engines->push_back(eng);
+    // A signal's handler runs at the next tick site (frame entry, backward
+    // jump); its exception is raised into the VM there.
+    vm.raise_nyerror_ = [eng](const nyconc::NyError& err) { eng->raise_in_vm(err); };
+    vm.signal_hook_ = [eng] {
+        try { nyconc::run_signal_handlers(); }
+        catch (nyconc::NyError& err) { eng->raise_in_vm(err); }
+    };
     for (const auto& name : nyconc::builtin_names()) {
         std::string nm = name;
         vm.globals_[nm] = VMVal::make_native([eng, nm](std::vector<VMVal>& a) -> VMVal {

@@ -355,9 +355,24 @@ node_ptr Parser::statement(){
     }
     if(see(TokenType::Async)) {
         next();
-        // `async for` / `async with`: iterate / enter synchronously (the loop
-        // body can await). `async def`: functionDecl() turns the body into a
-        // coroutine (see async_def_desugar).
+        // `async for x in it`: the iterable goes through _ny_aiter, which
+        // drives __aiter__/__anext__ (awaiting each step) until
+        // StopAsyncIteration; an async generator or a plain iterable is
+        // iterated directly. `async with m`: the manager goes through
+        // _ny_async_cm, whose __enter__/__exit__ await m.__aenter__()/
+        // m.__aexit__() (or use m's __enter__/__exit__). Both helpers are in
+        // NyPrelude.hpp, so the engines run ordinary for/with statements.
+        // `async def`: functionDecl() turns the body into a coroutine (see
+        // async_def_desugar).
+        if(see(TokenType::For)){
+            node_ptr f = forStmt();
+            if(f && f->type() == NodeType::FOR){
+                auto* fn = static_cast<ForNode*>(f.get());
+                fn->iterable = wrap_call("_ny_aiter", fn->iterable);
+            }
+            return f;
+        }
+        if(see(TokenType::With)) return withStmt(true);
         if(!(see(TokenType::Def)||see(TokenType::Function)||see(TokenType::Fn)||see(TokenType::Fun)))
             return statement();
         s_async_def_next = true;
@@ -398,8 +413,16 @@ node_ptr Parser::statement(){
         return call;
     }
     if(see(TokenType::Abstract)) { next(); return classDecl(); } // abstract class
-    if(see(TokenType::Loop)) return loopStmt();
-    if(see(TokenType::Block)) return blockStmt();
+    // `loop:` / `block:` are statements; `loop.run(...)`, `loop = ...`,
+    // `block[0]` use them as names (asyncio's loop, round 77).
+    auto keyword_as_name = [&]() {
+        TokenType nt = peek().type();
+        return nt == TokenType::Dot || nt == TokenType::Assign || nt == TokenType::BracketOpen
+            || nt == TokenType::ParenOpen || nt == TokenType::Comma || nt == TokenType::AddAssign
+            || nt == TokenType::SubAssign || nt == TokenType::MulAssign || nt == TokenType::DivAssign;
+    };
+    if(see(TokenType::Loop) && !keyword_as_name()) return loopStmt();
+    if(see(TokenType::Block) && !keyword_as_name()) return blockStmt();
     if(see(TokenType::Repeat)) return repeatStmt();
     if(see(TokenType::Enum)) return enumDecl();
     if(see(TokenType::NameSpace)) return namespaceDecl();
@@ -681,6 +704,7 @@ node_ptr Parser::ternary(){
     // yield as expression: allows "var x = yield val" and "x = yield val"
     if(see(TokenType::Yield)) {
         Token tok = token(); next(); // consume 'yield'
+        if(!yield_seen_.empty()) yield_seen_.back() = true;
         if(have(TokenType::From)){
             node_ptr src = expression();
             return make_node<YieldFromNode>(tok, src);
@@ -1106,7 +1130,7 @@ void Parser::parseCallArgs(std::shared_ptr<CallNode> call){
         }
         node_ptr first_expr = expression();
         // Generator expression argument: f(expr for t in it if c ...)
-        if(have(TokenType::For))
+        if(haveCompFor())
             return comprehension(prev(), ComprehensionNode::GEN, first_expr, nullptr);
         return first_expr;
     };
@@ -1492,7 +1516,7 @@ node_ptr Parser::atom(){
         }
         node_ptr expr = expression();
         // Standalone generator expression: (expr for t in it if c ...)
-        if(have(TokenType::For)){
+        if(haveCompFor()){
             node_ptr comp = comprehension(tok, ComprehensionNode::GEN, expr, nullptr);
             mustBe(TokenType::ParenClose);
             return comp;
@@ -1923,38 +1947,88 @@ node_ptr Parser::forStmt(){
 // `async def` needs no engine support. It desugars to a gate at the top of the
 // body:
 //
-//     async def f(a, b=1, *rest):          def f(a, b=1, *rest):
-//         body                    ==>          if async_body_begin():
-//                                                  return async_coroutine_def(f, "f", a, b, *rest)
-//                                              body
+//     async def f(a, b=1, *rest, k=2, **kw):
+//         body
+//   ==>
+//     def f(a, b=1, *rest, k=2, **kw):
+//         if async_body_begin():
+//             return async_coroutine_def(lambda: f(a, b, *rest, k=k, **kw), "f")
+//         body
 //
-// Calling f binds the arguments as usual and returns a coroutine that captured
-// them. When the coroutine runs, the runtime sets a per-thread token and calls
-// f again with the captured arguments; async_body_begin() consumes the token and
-// the body executes. Methods (first parameter self/this) refer to themselves as
+// Calling f binds the arguments as usual and returns a coroutine holding a
+// closure over them. When the coroutine runs, the runtime sets a per-thread
+// token and calls the closure, which calls f again with the same arguments -
+// keyword-only ones and **kw as keywords (round 77: they were dropped, and a
+// bare `*` raised NameError); async_body_begin() consumes the token and the
+// body executes. Methods (first parameter self/this) refer to themselves as
 // self.name, so the coroutine holds the bound method.
-static node_ptr async_def_desugar(const Token& tok, node_ptr fn) {
+//
+// An `async def` whose body yields is an async generator (round 77):
+//
+//     async def g(a):                     def g(a):
+//         body (yield ...)       ==>          def _ny_agen_body(a):
+//                                                 body
+//                                             return _ny_async_gen(_ny_agen_body(a))
+//
+// The body is an ordinary generator whose awaits suspend the task iterating
+// it; _ny_async_gen (NyPrelude.hpp) gives it __aiter__/__anext__/asend/
+// athrow/aclose, so `async for`, anext() and the asyncio library drive it.
+
+// Adds f's parameters to `call` as the arguments that rebind them: positional
+// ones by position, *rest spread, the keyword-only ones (after `*` or *rest)
+// as keywords, **kw spread as keywords.
+static void forward_params(const Token& t, CallNode* call, const std::vector<node_ptr>& params, size_t from) {
+    auto name_tok = [&](const std::string& v) { Token x = t; x.value = v; return x; };
+    bool kwonly = false;
+    for (size_t i = from; i < params.size(); i++) {
+        std::string pn = params[i]->value();
+        if (pn == "*") { kwonly = true; continue; }
+        if (pn.rfind("**", 0) == 0) {
+            call->add(make_node<UnaryNode>(name_tok("**"), make_node<VariableNode>(name_tok(pn.substr(2)))));
+        } else if (pn.rfind("*", 0) == 0) {
+            call->add(make_node<UnaryNode>(name_tok("*"), make_node<VariableNode>(name_tok(pn.substr(1)))));
+            kwonly = true;
+        } else if (kwonly) {
+            call->add(make_node<KeywordArgNode>(name_tok(pn), pn, make_node<VariableNode>(name_tok(pn))));
+        } else {
+            call->add(make_node<VariableNode>(name_tok(pn)));
+        }
+    }
+}
+
+static node_ptr async_def_desugar(const Token& tok, node_ptr fn, bool is_generator) {
     auto* f = static_cast<FunctionNode*>(fn.get());
     Token t = tok;
     auto name_tok = [&](const std::string& v) { Token x = t; x.value = v; return x; };
+    if (is_generator) {
+        Token bt = name_tok("_ny_agen_body");
+        auto inner = make_node<FunctionNode>(bt, "_ny_agen_body", f->body, false);
+        auto* in = static_cast<FunctionNode*>(inner.get());
+        for (auto& p : f->params) in->add(p);
+        in->defaults.assign(f->params.size(), nullptr);
+        auto call = make_node<CallNode>(bt, make_node<VariableNode>(bt));
+        forward_params(t, static_cast<CallNode*>(call.get()), f->params, 0);
+        Token wt = name_tok("_ny_async_gen");
+        auto wrap = make_node<CallNode>(wt, make_node<VariableNode>(wt));
+        wrap->add(call);
+        auto body = make_node<BlockNode>(t);
+        body->add(inner);
+        body->add(make_node<ReturnNode>(t, wrap));
+        f->body = body;
+        return fn;
+    }
     bool method = !f->params.empty() &&
         (f->params[0]->value() == "self" || f->params[0]->value() == "this");
     node_ptr ref;
     if (method) ref = make_node<AttributeNode>(name_tok(f->name), make_node<SelfNode>(name_tok("self")), f->name);
     else ref = make_node<VariableNode>(name_tok(f->name));
+    auto again = make_node<CallNode>(t, ref);
+    forward_params(t, static_cast<CallNode*>(again.get()), f->params, method ? 1 : 0);
+    auto closure = make_node<LambdaNode>(name_tok("lambda"), again);
     Token mk = name_tok("async_coroutine_def");
     auto make = make_node<CallNode>(mk, make_node<VariableNode>(mk));
-    make->add(ref);
+    make->add(closure);
     make->add(make_node<StringNode>(name_tok(f->name)));
-    for (size_t i = method ? 1 : 0; i < f->params.size(); i++) {
-        std::string pn = f->params[i]->value();
-        if (pn.rfind("**", 0) == 0)
-            make->add(make_node<UnaryNode>(name_tok("**"), make_node<VariableNode>(name_tok(pn.substr(2)))));
-        else if (pn.rfind("*", 0) == 0)
-            make->add(make_node<UnaryNode>(name_tok("*"), make_node<VariableNode>(name_tok(pn.substr(1)))));
-        else
-            make->add(make_node<VariableNode>(name_tok(pn)));
-    }
     Token bt = name_tok("async_body_begin");
     auto begin = make_node<CallNode>(bt, make_node<VariableNode>(bt));
     auto then_blk = make_node<BlockNode>(t);
@@ -1986,14 +2060,17 @@ node_ptr Parser::functionDecl(bool is_method){
     outer_decls_.emplace_back();
     global_decls_.emplace_back();
     auto saved_defaults = std::move(param_defaults_);
+    yield_seen_.push_back(false);
     node_ptr body = blockOrStmt();
+    bool is_gen = yield_seen_.back();
+    yield_seen_.pop_back();
     param_defaults_ = std::move(saved_defaults);
     outer_decls_.pop_back();
     global_decls_.pop_back();
     auto fn = make_node<FunctionNode>(tok, name, body, is_method);
     for(auto& p : params) fn->add(p);
     static_cast<FunctionNode*>(fn.get())->defaults = std::move(param_defaults_);
-    if(is_async) return async_def_desugar(tok, fn);
+    if(is_async) return async_def_desugar(tok, fn, is_gen);
     return fn;
 }
 
@@ -2278,6 +2355,7 @@ node_ptr Parser::passStmt(){
 
 node_ptr Parser::yieldStmt(){
     Token tok = token(); mustBe(TokenType::Yield);
+    if(!yield_seen_.empty()) yield_seen_.back() = true;
     // yield from <iterable>
     if(have(TokenType::From)){
         node_ptr src = expression();
@@ -2343,9 +2421,11 @@ node_ptr Parser::printStmt(){
 node_ptr Parser::importStmt(){
     Token tok = token();
     if(have(TokenType::From)){
+        bool quoted = see(TokenType::String);
         std::string mod = dottedName();
         mustBe(TokenType::Import);
         auto imp = make_node<ImportNode>(tok, mod);
+        std::static_pointer_cast<ImportNode>(imp)->quoted = quoted;
         auto& names = std::static_pointer_cast<ImportNode>(imp)->names;
         if(have(TokenType::Mul)){
             names.push_back("*");
@@ -2357,8 +2437,10 @@ node_ptr Parser::importStmt(){
         return imp;
     }
     mustBe(TokenType::Import);
+    bool quoted = see(TokenType::String);
     std::string mod = dottedName();
     auto imp = make_node<ImportNode>(tok, mod);
+    std::static_pointer_cast<ImportNode>(imp)->quoted = quoted;
     if(have(TokenType::As)){
         std::static_pointer_cast<ImportNode>(imp)->alias = identifier();
     }
@@ -2380,12 +2462,16 @@ node_ptr Parser::tryStmt(){
     // read every bare name as a binding, so `except ValueError:` caught
     // everything - and rebound the name ValueError to the exception.
     auto is_type_name = [](const std::string& n) {
-        return nython::ny_is_builtin_exc(n) || (!n.empty() && n[0] >= 'A' && n[0] <= 'Z');
+        return nython::ny_is_builtin_exc(n) || (!n.empty() && n[0] >= 'A' && n[0] <= 'Z')
+               || n.find('.') != std::string::npos;
     };
+    // `except mod.Error`: the whole dotted name; both engines look it up in
+    // scope when matching (round 77; it was cut to "Error", and a lower-case
+    // last part - `except socket.error` - became a catch-all binding).
     auto dotted = [&]() {
         std::string n = identifier();
         while (see(TokenType::Dot) && peek(1).type() == TokenType::Identifier) {
-            next(); n = identifier();   // mod.Error -> Error (classes are global by name)
+            next(); n += "." + identifier();
         }
         return n;
     };
@@ -2855,14 +2941,49 @@ node_ptr Parser::deleteStmt(){
     return make_node<DeleteNode>(tok, target);
 }
 
-node_ptr Parser::withStmt(){
+// with A() as a, B() as b: body  ==  with A() as a: (with B() as b: body)
+// `async with` (is_async) passes each manager through _ny_async_cm.
+node_ptr Parser::withStmt(bool is_async){
     Token tok = token(); mustBe(TokenType::With);
-    node_ptr expr = expression();
-    std::string alias;
-    if(have(TokenType::As)) alias = identifier();
+    std::vector<std::pair<node_ptr, std::string>> items;
+    do {
+        node_ptr expr = expression();
+        if(is_async) expr = wrap_call("_ny_async_cm", expr);
+        std::string alias;
+        if(have(TokenType::As)) alias = identifier();
+        items.emplace_back(expr, alias);
+    } while(have(TokenType::Comma));
     have(TokenType::Colon);
     node_ptr body = blockOrStmt();
-    return make_node<WithNode>(tok, expr, alias, body);
+    for(size_t i = items.size(); i-- > 0;){
+        node_ptr w = make_node<WithNode>(tok, items[i].first, items[i].second, body);
+        if(i > 0){
+            auto blk = make_node<BlockNode>(tok);
+            blk->add(w);
+            body = blk;
+        } else body = w;
+    }
+    return body;
+}
+
+// helper(arg) as a call node located at arg
+node_ptr Parser::wrap_call(const std::string& helper, node_ptr arg){
+    Token t = arg ? arg->token() : token();
+    t.value = helper;
+    auto call = make_node<CallNode>(t, make_node<VariableNode>(t));
+    call->add(arg);
+    return call;
+}
+
+// `for` or `async for` in a comprehension; sets comp_async_ for the latter.
+bool Parser::haveCompFor(){
+    if(have(TokenType::For)){ comp_async_ = false; return true; }
+    if(see(TokenType::Async) && peek().type() == TokenType::For){
+        next(); next();
+        comp_async_ = true;
+        return true;
+    }
+    return false;
 }
 
 node_ptr Parser::lambdaExpr(){
@@ -2873,7 +2994,9 @@ node_ptr Parser::lambdaExpr(){
         params = lambdaParamList();
     }
     mustBe(TokenType::Colon);
+    yield_seen_.push_back(false);
     node_ptr body = expression();
+    yield_seen_.pop_back();
     auto lam = make_node<LambdaNode>(tok, body);
     for(auto& p : params) lam->add(p);
     static_cast<LambdaNode*>(lam.get())->defaults = std::move(param_defaults_);
@@ -2971,13 +3094,16 @@ node_ptr Parser::comprehension(Token tok, int kind, node_ptr elt, node_ptr value
     auto cp = std::static_pointer_cast<ComprehensionNode>(comp);
     cp->elt = elt; cp->value = value;
     do {
+        bool async_clause = comp_async_;
+        comp_async_ = false;
         ComprehensionNode::Clause cl;
         cl.target = compTarget();
         mustBe(TokenType::In);
         cl.iter = logicalOr();
+        if(async_clause) cl.iter = wrap_call("_ny_aiter", cl.iter);
         while(have(TokenType::If)) cl.conds.push_back(logicalOr());
         cp->clauses.push_back(std::move(cl));
-    } while(have(TokenType::For));
+    } while(haveCompFor());
     return comp;
 }
 
@@ -3029,7 +3155,7 @@ node_ptr Parser::listLiteral(){
     // Parse first expression
     node_ptr first = expression();
     // List comprehension: [expr for t in it if c ... for t2 in it2 ...]
-    if(have(TokenType::For)){
+    if(haveCompFor()){
         node_ptr comp = comprehension(tok, ComprehensionNode::LIST, first, nullptr);
         mustBe(TokenType::BracketClose);
         return comp;
@@ -3126,7 +3252,7 @@ node_ptr Parser::mapLiteral(){
         // It's a map
         node_ptr val = expression();
         // Dict comprehension: {k: v for t in it if c ...}
-        if(have(TokenType::For)) {
+        if(haveCompFor()) {
             node_ptr comp = comprehension(tok, ComprehensionNode::DICT, key, val);
             mustBe(TokenType::BraceClose);
             return comp;
@@ -3145,7 +3271,7 @@ node_ptr Parser::mapLiteral(){
     // Build as: set([expr1, expr2, ...])
     // Set literal or set comprehension: {expr ...}
     // Set comprehension: {e for t in it if c ...}
-    if (have(TokenType::For)) {
+    if (haveCompFor()) {
         node_ptr comp = comprehension(tok, ComprehensionNode::SET, key, nullptr);
         mustBe(TokenType::BraceClose);
         return comp;

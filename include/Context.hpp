@@ -2,6 +2,7 @@
 #define __CONTEXT__HPP
 
 #include <memory>
+#include <functional>
 #include "Value.hpp"
 #include "Object.hpp"
 #include "Runnable.hpp"
@@ -25,6 +26,10 @@ struct Context extends Container {
     bool inNameSpace = false;
     bool inBlock     = false;
     bool inModule    = false;
+    // A module's scope (inModule) sees only the names of its parent (the
+    // global scope) this accepts: the builtins and the prelude, not the
+    // importing program's own variables (NythonExecutor::importModule).
+    const std::function<bool(const std::string&)>* parentFilter = nullptr;
 
 	Context(Runnable* runner,const std::string& name, Collectable* self = nullptr, Collectable* klass = nullptr, Context* parent = nullptr);
 	~Context();
@@ -46,7 +51,10 @@ struct Context extends Container {
         if (!container) return NONE_VALUE;
         auto it = container->find(varName);
         if (it != container->end()) return it->second;
-        if (parent) return parent->getByName(varName);
+        if (parent) {
+            if (parentFilter && !(*parentFilter)(varName)) return UNDEFINED_VALUE;
+            return parent->getByName(varName);
+        }
         return UNDEFINED_VALUE;
     }
     void setByName(const std::string& varName, Value val) {
@@ -54,14 +62,15 @@ struct Context extends Container {
         // Check if variable exists in current scope
         auto it = container->find(varName);
         if (it != container->end()) { it->second = val; return; }
-        // Walk up parent scopes
-        Context* p = parent;
+        // Walk up parent scopes - not past a module's own scope (inModule):
+        // a module's code never rebinds the importing program's variables.
+        Context* p = inModule ? nullptr : parent;
         while (p) {
             if (p->container) {
                 auto pit = p->container->find(varName);
                 if (pit != p->container->end()) { pit->second = val; return; }
             }
-            p = p->parent;
+            p = p->inModule ? nullptr : p->parent;
         }
         // Fallback: define in current scope
         (*container)[varName] = val;
@@ -73,7 +82,10 @@ struct Context extends Container {
     bool hasByName(const std::string& varName) {
         if (!container) return false;
         if (container->count(varName)) return true;
-        if (parent) return parent->hasByName(varName);
+        if (parent) {
+            if (parentFilter && !(*parentFilter)(varName)) return false;
+            return parent->hasByName(varName);
+        }
         return false;
     }
 	Value getAt(int distance, const Value& name);

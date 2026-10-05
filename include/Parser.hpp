@@ -46,6 +46,11 @@ private:
     // Per function being parsed: the names it declared `global`/`nonlocal`.
     std::vector<std::vector<std::string>> outer_decls_;
     std::vector<std::vector<std::string>> global_decls_;   // `global` only, per function
+    // Per function being parsed: whether its body yields (an `async def`
+    // that yields is an async generator).
+    std::vector<bool> yield_seen_;
+    // The comprehension clause haveCompFor() just consumed was `async for`.
+    bool comp_async_ = false;
     // Set when a statement was terminated by ';' rather than a newline.
     // Statement parsers consume the semicolon themselves, so blockOrStmt()
     // cannot otherwise tell that an inline suite continues.
@@ -243,7 +248,9 @@ private:
     node_ptr lambdaExpr();
     node_ptr deleteStmt();
     node_ptr yieldStmt();
-    node_ptr withStmt();
+    node_ptr withStmt(bool is_async = false);
+    node_ptr wrap_call(const std::string& helper, node_ptr arg);
+    bool haveCompFor();
     node_ptr repeatStmt();
     node_ptr loopStmt();
     node_ptr blockStmt();

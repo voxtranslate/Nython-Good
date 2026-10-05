@@ -31,7 +31,7 @@ namespace {
 enum PyB {
     B_LEN = 1, B_STR, B_REPR, B_ASCII, B_FORMAT, B_INT, B_FLOAT, B_BOOL, B_ABS, B_ROUND,
     B_POW, B_DIVMOD, B_HEX, B_OCT, B_BIN, B_CHR, B_ORD, B_MIN, B_MAX, B_SUM, B_SORTED,
-    B_REVERSED, B_LIST, B_TUPLE, B_SET, B_DICT, B_ENUMERATE, B_ZIP, B_MAP, B_FILTER,
+    B_REVERSED, B_LIST, B_TUPLE, B_SET, B_FROZENSET, B_DICT, B_ENUMERATE, B_ZIP, B_MAP, B_FILTER,
     B_ANY, B_ALL, B_RANGE, B_TYPE, B_FMTVAL, B_HASH, B_BYTES, B_BYTEARRAY
 };
 }
@@ -43,7 +43,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         {"round", B_ROUND}, {"pow", B_POW}, {"divmod", B_DIVMOD}, {"hex", B_HEX}, {"oct", B_OCT},
         {"bin", B_BIN}, {"chr", B_CHR}, {"ord", B_ORD}, {"min", B_MIN}, {"max", B_MAX}, {"sum", B_SUM},
         {"sorted", B_SORTED}, {"reversed", B_REVERSED}, {"list", B_LIST}, {"tuple", B_TUPLE},
-        {"set", B_SET}, {"dict", B_DICT}, {"enumerate", B_ENUMERATE}, {"zip", B_ZIP}, {"map", B_MAP},
+        {"set", B_SET}, {"frozenset", B_FROZENSET}, {"dict", B_DICT}, {"enumerate", B_ENUMERATE}, {"zip", B_ZIP}, {"map", B_MAP},
         {"filter", B_FILTER}, {"any", B_ANY}, {"all", B_ALL}, {"range", B_RANGE},
         {"type", B_TYPE}, {"typeof", B_TYPE}, {"__format_value__", B_FMTVAL}, {"hash", B_HASH},
         {"bytes", B_BYTES}, {"bytearray", B_BYTEARRAY},
@@ -420,6 +420,10 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
     case B_SET:
         if (args.empty()) return E.build_set_val({});
         return E.build_set_val(E.iterItems(args[0], ctx));
+    case B_FROZENSET:
+        if (args.empty()) return E.build_set_val({}, true);
+        if (Container* c = E.setOf(args[0]); c && NythonExecutor::isFrozenCont(c)) return args[0];
+        return E.build_set_val(E.iterItems(args[0], ctx), true);
     case B_DICT: {
         Value d = E.makeDictValue();
         Container* dc = E.contOf(d);
@@ -532,7 +536,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             default: break;
         }
         if (Container* c = E.contOf(v)) {
-            if (c->container->count("__set__")) return str_("set");
+            if (c->container->count("__set__")) return str_(NythonExecutor::isFrozenCont(c) ? "frozenset" : "set");
             if (c->container->count("__gen__")) return str_("generator");
             if (c->container->count("__tuple__")) return str_("tuple");
             if (c->container->count("__len__")) return str_("list");

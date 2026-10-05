@@ -48,6 +48,7 @@
 #include "NyStr.hpp"
 #include "NyBytes.hpp"
 #include "NyScope.hpp"
+#include "builtins/net.hpp"
 #include "NyFormat.hpp"
 #include "NyMembers.hpp"
 
@@ -237,6 +238,10 @@ Value dispatch_text     (NythonExecutor& E, const std::string& name, std::vector
 Value dispatch_lang     (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_pycore   (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 
+
+struct NythonExecutor;
+// builtins/threading.cpp: runs the pending signal handlers, raising what they raise.
+void ny_interp_check_signals(NythonExecutor& E);
 
 struct NythonExecutor {
     Context* global_ctx;
@@ -452,7 +457,19 @@ struct NythonExecutor {
         } catch (...) {
             std::cerr << "[Nython] prelude failed to load\n";
         }
+        // What a module's scope sees of the global one (importModule): the
+        // builtins and the prelude, not the program's own names.
+        if (global_ctx && global_ctx->container)
+            for (auto& kv : *global_ctx->container) base_global_names_.insert(kv.first);
+        module_filter_ = [this](const std::string& n) {
+            return base_global_names_.count(n) > 0 || builtin_ptrs.count(n) > 0 || builtin_set.count(n) > 0;
+        };
     }
+    std::unordered_set<std::string> base_global_names_;
+    std::function<bool(const std::string&)> module_filter_;
+    // Functions and classes an imported module defined (importModule):
+    // knownName() does not count them for the program.
+    std::unordered_set<void*> module_owned_;
 
     ~NythonExecutor() {
         heapTeardown();
@@ -495,7 +512,7 @@ public:   // NythonExecutor is a struct: members default to public
             "print","println","range","len","type","str","int","float","bool",
             "bytes","bytearray",
             "input","abs","min","max","round","sorted","reversed",
-            "list","tuple","dict","set","map","filter","reduce","zip",
+            "list","tuple","dict","set","frozenset","map","filter","reduce","zip",
             "enumerate","sum","any","all","hasattr","getattr","setattr","delattr",
             "isinstance","issubclass","id","hash","hex","oct","bin",
             "chr","ord","repr","format","open","exit","quit",
@@ -629,6 +646,9 @@ public:   // NythonExecutor is a struct: members default to public
         // Shared tensor natives (include/NyTensor.hpp): the same kernels the
         // VM registers, so both engines resolve these names identically.
         for (auto& name : nt_builtin_names()) registerBuiltin(name);
+        // The socket and TLS layers (round 77): the VM reaches them through the bridge.
+        for (auto& name : net_builtin_names()) registerBuiltin(name);
+        for (auto& name : tls_builtin_names()) registerBuiltin(name);
         // Exception types
         std::vector<std::string> exc_types = {
             "Exception","BaseException","Error",
@@ -642,7 +662,9 @@ public:   // NythonExecutor is a struct: members default to public
             "BrokenPipeError","ConnectionRefusedError","ConnectionResetError",
             "LookupError","ArithmeticError","EOFError","ImportError","ModuleNotFoundError",
             "UnicodeError","UnicodeDecodeError","UnicodeEncodeError","UnicodeTranslateError",
-            "ConnectionAbortedError","gaierror","herror"
+            "ConnectionAbortedError","gaierror","herror","StopAsyncIteration",
+            "SSLError","SSLCertVerificationError","SSLEOFError","SSLZeroReturnError",
+            "SSLWantReadError","SSLWantWriteError","SSLSyscallError"
         };
         for (auto& name : exc_types) registerBuiltin(name);
         // OS constants (os.sep, os.pathsep, os.linesep, os.name)
@@ -984,8 +1006,10 @@ public:   // NythonExecutor is a struct: members default to public
 
 
     // The module scope a context belongs to: the root of its scope chain.
+    // The module scope a `global` name belongs to: an imported module's own
+    // scope (Context::inModule), else the program's global scope.
     static Context* moduleCtx(Context* ctx) {
-        while (ctx && ctx->parent) ctx = ctx->parent;
+        while (ctx && !ctx->inModule && ctx->parent) ctx = ctx->parent;
         return ctx;
     }
     // Stores a plain `name = value`: in a class body the class namespace;
@@ -1025,6 +1049,7 @@ public:   // NythonExecutor is a struct: members default to public
     bool knownName(const std::string& called) {
         if (builtin_set.count(called)) return true;
         for (auto& kv : func_names) {
+            if (!module_owned_.empty() && module_owned_.count(kv.first)) continue;
             const std::string& n = kv.second;
             if (n == called
                 || (n.rfind("__func__:", 0) == 0  && n.compare(9, std::string::npos, called) == 0)
@@ -1124,12 +1149,75 @@ public:   // NythonExecutor is a struct: members default to public
     // ─── EXPRESSIONS ────────────────────────────────────────────────────
 
     // ── Set union / intersection helpers ────────────────────────────────────────
-    std::string set_key_str(Value v) {
-        if (v.type == ValueType::INTEGER) return "i:" + std::to_string(bigint_to_i64(v.value.i));
-        if (v.type == ValueType::DOUBLE)  return "d:" + std::to_string(v.value.d);
-        if (v.type == ValueType::BOOLEAN) return std::string("b:") + (v.value.b ? "1" : "0");
-        if (v.type == ValueType::NONE)    return "none";
-        return "s:" + getStringValue(v);
+    // ─── SETS (round 77) ────────────────────────────────────────────────
+    // A set is a list-like Container ("0".."n-1" in insertion order, and
+    // "__len__") marked "__set__" (1: set, 2: frozenset), plus an index
+    // "\x02<key>" -> position, so membership is one lookup. The key is the
+    // one dicts use (dictKey: 1 == 1.0 == true, tuples and frozensets by
+    // content, bytes by value), except that an object with __hash__ is keyed
+    // by its hash (equal objects hash alike). The VM's sets follow the same
+    // rules (VirtualMachine.hpp, VMVal::is_set).
+    static std::string setSlot(const std::string& key) { return std::string(1, '\x02') + key; }
+    static bool isFrozenCont(Container* c) {
+        auto it = c->container->find("__set__");
+        return it != c->container->end() && it->second.type == ValueType::INTEGER && bigint_to_i64(it->second.value.i) == 2;
+    }
+    Container* setOf(const Value& v) { Container* c = contOf(v); return c && isSetCont(c) ? c : nullptr; }
+    std::string setKey(const Value& v) {
+        if (isInstanceValue(v) && instanceHasMethod(v, "__hash__")) {
+            std::vector<Value> none;
+            Value h = callMethod(v, "__hash__", none, global_ctx);
+            return "\x01h" + strOf(h, global_ctx);
+        }
+        if (Container* c = setOf(v)) {
+            if (!isFrozenCont(c)) pyRaise("TypeError", "unhashable type: 'set'");
+            std::vector<std::string> parts;
+            for (auto& e : seqItems(c)) parts.push_back(setKey(e));
+            return nypy::key_of_frozenset(parts);
+        }
+        return dictKey(v);
+    }
+    Value newSetValue(bool frozen) {
+        auto* obj = new Object((Runnable*)runner, "list", Type::LIST);
+        (*obj->container)["__set__"] = intValue(frozen ? 2 : 1);
+        (*obj->container)["__len__"] = intValue(0);
+        return Value((Collectable*)obj);
+    }
+    bool setHas(Container* c, const Value& v) { return c->container->count(setSlot(setKey(v))) > 0; }
+    bool setAdd(Container* c, const Value& v) {
+        std::string slot = setSlot(setKey(v));
+        if (c->container->count(slot)) return false;
+        int64_t n = seqLen(c);
+        (*c->container)[std::to_string(n)] = v;
+        (*c->container)[slot] = intValue(n);
+        (*c->container)["__len__"] = intValue(n + 1);
+        return true;
+    }
+    bool setDiscard(Container* c, const Value& v) {
+        auto it = c->container->find(setSlot(setKey(v)));
+        if (it == c->container->end()) return false;
+        int64_t at = bigint_to_i64(it->second.value.i), n = seqLen(c);
+        c->container->erase(it);
+        for (int64_t i = at; i + 1 < n; i++) {
+            Value nx = (*c->container)[std::to_string(i + 1)];
+            (*c->container)[std::to_string(i)] = nx;
+            (*c->container)[setSlot(setKey(nx))] = intValue(i);
+        }
+        c->container->erase(std::to_string(n - 1));
+        (*c->container)["__len__"] = intValue(n - 1);
+        return true;
+    }
+    void setClear(Container* c) {
+        std::vector<std::string> drop;
+        for (auto& kv : *c->container) if (kv.first != "__set__") drop.push_back(kv.first);
+        for (auto& k : drop) c->container->erase(k);
+        (*c->container)["__len__"] = intValue(0);
+    }
+    Value build_set_val(const std::vector<Value>& items, bool frozen = false) {
+        Value sv = newSetValue(frozen);
+        Container* c = contOf(sv);
+        for (auto& v : items) setAdd(c, v);
+        return sv;
     }
     std::vector<Value> collect_coll(const Value& v) {
         std::vector<Value> out;
@@ -1144,58 +1232,140 @@ public:   // NythonExecutor is a struct: members default to public
         }
         return out;
     }
-    Value build_set_val(const std::vector<Value>& items) {
-        auto* obj = new Object((Runnable*)runner, "list", Type::LIST);
-        obj->set("__set__", Value(1));
-        int64_t idx = 0;
-        std::unordered_set<std::string> seen;
-        for (auto& v : items) {
-            if (seen.insert(set_key_str(v)).second) (*obj->container)[std::to_string(idx++)] = v;
-        }
-        (*obj->container)["__len__"] = intValue(idx);
-        return Value((Collectable*)obj);
+    // The other operand of a set operation or method: a set (its index) or
+    // any iterable (the keys of its items).
+    struct SetKeys {
+        Container* set = nullptr;
+        std::unordered_set<std::string> keys;
+        std::vector<Value> items;
+    };
+    SetKeys setKeysOf(const Value& v, Context* ctx) {
+        SetKeys k;
+        if (Container* c = setOf(v)) { k.set = c; k.items = seqItems(c); return k; }
+        k.items = iterItems(v, ctx);
+        for (auto& e : k.items) k.keys.insert(setKey(e));
+        return k;
     }
-    Value setUnion(const Value& a, const Value& b) {
-        auto av = collect_coll(a); auto bv = collect_coll(b);
-        for (auto& v : bv) av.push_back(v);
-        return build_set_val(av);
+    bool setKeysHas(const SetKeys& k, const Value& v) {
+        return k.set ? setHas(k.set, v) : k.keys.count(setKey(v)) > 0;
     }
-    Value setIntersect(const Value& a, const Value& b) {
-        auto av = collect_coll(a); auto bv = collect_coll(b);
-        std::vector<Value> result;
-        for (auto& v : av) {
-            std::string k = set_key_str(v);
-            for (auto& w : bv) if (set_key_str(w)==k) { result.push_back(v); break; }
+    // op: '|' union, '&' intersection, '-' difference, '^' symmetric
+    // difference; the result is a set, or a frozenset when a is one.
+    Value setOp(char op, const Value& a, const Value& b, Context* ctx) {
+        Container* ac = setOf(a);
+        std::vector<Value> av = ac ? seqItems(ac) : iterItems(a, ctx);
+        SetKeys bk = setKeysOf(b, ctx);
+        Value r = newSetValue(ac && isFrozenCont(ac));
+        Container* rc = contOf(r);
+        if (op == '|') { for (auto& v : av) setAdd(rc, v); for (auto& v : bk.items) setAdd(rc, v); }
+        else if (op == '&') { for (auto& v : av) if (setKeysHas(bk, v)) setAdd(rc, v); }
+        else if (op == '-') { for (auto& v : av) if (!setKeysHas(bk, v)) setAdd(rc, v); }
+        else {
+            Value as = ac ? a : build_set_val(av);
+            Container* asc = contOf(as);
+            for (auto& v : av) if (!setKeysHas(bk, v)) setAdd(rc, v);
+            for (auto& v : bk.items) if (!setHas(asc, v)) setAdd(rc, v);
         }
-        return build_set_val(result);
+        return r;
     }
-    Value setDiff(const Value& a, const Value& b) {
-        auto av = collect_coll(a); auto bv = collect_coll(b);
-        std::vector<Value> result;
-        for (auto& v : av) {
-            std::string k = set_key_str(v);
-            bool inB = false;
-            for (auto& w : bv) if (set_key_str(w)==k) { inB=true; break; }
-            if (!inB) result.push_back(v);
-        }
-        return build_set_val(result);
+    Value setUnion(const Value& a, const Value& b) { return setOp('|', a, b, global_ctx); }
+    Value setIntersect(const Value& a, const Value& b) { return setOp('&', a, b, global_ctx); }
+    Value setDiff(const Value& a, const Value& b) { return setOp('-', a, b, global_ctx); }
+    Value setSymDiff(const Value& a, const Value& b) { return setOp('^', a, b, global_ctx); }
+    // a <= b (every element of a is in b)
+    bool setSubset(const Value& a, const Value& b, Context* ctx) {
+        Container* ac = setOf(a);
+        std::vector<Value> av = ac ? seqItems(ac) : iterItems(a, ctx);
+        SetKeys bk = setKeysOf(b, ctx);
+        for (auto& v : av) if (!setKeysHas(bk, v)) return false;
+        return true;
     }
-    Value setSymDiff(const Value& a, const Value& b) {
-        auto av = collect_coll(a); auto bv = collect_coll(b);
-        std::vector<Value> result;
-        for (auto& v : av) {
-            std::string k = set_key_str(v);
-            bool inB = false;
-            for (auto& w : bv) if (set_key_str(w)==k) { inB=true; break; }
-            if (!inB) result.push_back(v);
+    bool setEqual(Container* a, Container* b) {
+        if (seqLen(a) != seqLen(b)) return false;
+        for (auto& v : seqItems(a)) if (!setHas(b, v)) return false;
+        return true;
+    }
+    // A set's methods (Python's set / frozenset API). False: not one of them.
+    bool setMethod(Container* c, const Value& obj, const std::string& m, std::vector<Value>& args,
+                   Context* ctx, Value& out) {
+        bool frozen = isFrozenCont(c);
+        const std::string tn = frozen ? "frozenset" : "set";
+        auto need = [&](size_t n) {
+            if (args.size() != n)
+                pyRaise("TypeError", tn + "." + m + "() takes exactly " + (n == 1 ? std::string("one argument") : std::to_string(n) + " arguments")
+                        + " (" + std::to_string(args.size()) + " given)");
+        };
+        auto mutating = [&]() {
+            if (frozen) pyRaise("AttributeError", "'frozenset' object has no attribute '" + m + "'");
+        };
+        out = NONE_VALUE;
+        if (m == "add") { mutating(); need(1); setAdd(c, args[0]); return true; }
+        if (m == "discard") { mutating(); need(1); setDiscard(c, args[0]); return true; }
+        if (m == "remove") {
+            mutating(); need(1);
+            if (!setDiscard(c, args[0])) pyRaise("KeyError", toText(args[0], true, ctx, 0));
+            return true;
         }
-        for (auto& v : bv) {
-            std::string k = set_key_str(v);
-            bool inA = false;
-            for (auto& w : av) if (set_key_str(w)==k) { inA=true; break; }
-            if (!inA) result.push_back(v);
+        if (m == "pop") {
+            mutating(); need(0);
+            if (seqLen(c) == 0) pyRaise("KeyError", "'pop from an empty set'");
+            out = (*c->container)["0"];
+            setDiscard(c, out);
+            return true;
         }
-        return build_set_val(result);
+        if (m == "clear") { mutating(); need(0); setClear(c); return true; }
+        if (m == "copy") { need(0); out = build_set_val(seqItems(c), frozen); return true; }
+        if (m == "update" || m == "intersection_update" || m == "difference_update" || m == "symmetric_difference_update") {
+            mutating();
+            if (m == "symmetric_difference_update") need(1);
+            Value cur = obj;
+            for (auto& a : args) {
+                if (m == "update") { for (auto& v : iterItems(a, ctx)) setAdd(c, v); continue; }
+                char op = m == "intersection_update" ? '&' : m == "difference_update" ? '-' : '^';
+                Value r = setOp(op, cur, a, ctx);
+                std::vector<Value> keep = seqItems(contOf(r));
+                setClear(c);
+                for (auto& v : keep) setAdd(c, v);
+            }
+            return true;
+        }
+        if (m == "union" || m == "intersection" || m == "difference") {
+            char op = m == "union" ? '|' : m == "intersection" ? '&' : '-';
+            Value r = build_set_val(seqItems(c), frozen);
+            for (auto& a : args) r = setOp(op, r, a, ctx);
+            out = r;
+            return true;
+        }
+        if (m == "symmetric_difference") { need(1); out = setOp('^', obj, args[0], ctx); return true; }
+        if (m == "issubset") { need(1); out = Value(setSubset(obj, args[0], ctx)); return true; }
+        if (m == "issuperset") { need(1); out = Value(setSubset(args[0], obj, ctx)); return true; }
+        if (m == "isdisjoint") {
+            need(1);
+            for (auto& v : iterItems(args[0], ctx)) if (setHas(c, v)) { out = Value(false); return true; }
+            out = Value(true);
+            return true;
+        }
+        if (m == "__contains__" || m == "contains" || m == "has") { need(1); out = Value(setHas(c, args[0])); return true; }
+        if (m == "__len__" || m == "size" || m == "length" || m == "len") { out = intValue(seqLen(c)); return true; }
+        return false;
+    }
+    // A set operator, both operands sets/frozensets: | & - ^ and the
+    // subset comparisons. False when it is not one.
+    bool setBinary(int opc, const Value& lv, const Value& rv, Context* ctx, Value& out) {
+        Container* lc = setOf(lv);
+        Container* rc = setOf(rv);
+        if (!lc || !rc) return false;
+        switch (opc) {
+            case OP_BOR: out = setOp('|', lv, rv, ctx); return true;
+            case OP_BAND: out = setOp('&', lv, rv, ctx); return true;
+            case OP_SUB: out = setOp('-', lv, rv, ctx); return true;
+            case OP_BXOR: out = setOp('^', lv, rv, ctx); return true;
+            case OP_LE: out = Value(setSubset(lv, rv, ctx)); return true;
+            case OP_GE: out = Value(setSubset(rv, lv, ctx)); return true;
+            case OP_LT: out = Value(seqLen(lc) < seqLen(rc) && setSubset(lv, rv, ctx)); return true;
+            case OP_GT: out = Value(seqLen(lc) > seqLen(rc) && setSubset(rv, lv, ctx)); return true;
+            default: return false;
+        }
     }
 
     // ─── VALUE KINDS ────────────────────────────────────────────────────
@@ -1395,6 +1565,7 @@ public:   // NythonExecutor is a struct: members default to public
         }
         Container* cont = contOf(c);
         if (!cont) return false;
+        if (isSetCont(cont)) return setHas(cont, x);   // one lookup (round 77)
         int64_t n = seqLen(cont);
         if (n >= 0) {
             for (int64_t i = 0; i < n; i++) {
@@ -1415,6 +1586,12 @@ public:   // NythonExecutor is a struct: members default to public
                 + typeNameOf(lv) + "' and '" + typeNameOf(rv) + "'");
     }
     Value binaryOp(int opc, Value lv, Value rv, Context* ctx) {
+        // Sets: | & - ^ and the subset comparisons (round 77).
+        if (opc == OP_BOR || opc == OP_BAND || opc == OP_SUB || opc == OP_BXOR ||
+            opc == OP_LT || opc == OP_LE || opc == OP_GT || opc == OP_GE) {
+            Value sr;
+            if (setBinary(opc, lv, rv, ctx, sr)) return sr;
+        }
         // Operator overloading: the left operand's dunder, else the right
         // operand's reflected one (a.__lt__(b), then b.__gt__(a); __add__,
         // then __radd__ - so sum() of objects and 5 + v work). A dunder that
@@ -1443,6 +1620,7 @@ public:   // NythonExecutor is a struct: members default to public
             bool ls = isStringValue(lv), rs = isStringValue(rv);
             if (ls && rs) return makeStringValue(*(std::string*)lv.value.p + *(std::string*)rv.value.p);
             Container* lc = contOf(lv); Container* rc = contOf(rv);
+            if ((lc && isSetCont(lc)) || (rc && isSetCont(rc))) unsupportedOperands(opc, lv, rv);
             if (lc && rc && seqLen(lc) >= 0 && seqLen(rc) >= 0) {
                 std::vector<Value> items = seqItems(lc);
                 for (auto& v : seqItems(rc)) items.push_back(v);
@@ -1454,7 +1632,6 @@ public:   // NythonExecutor is a struct: members default to public
         }
         case OP_SUB:
             if (nums) return numArith(opc, x, y);
-            if (lv.isCollectable() && rv.isCollectable()) return setDiff(lv, rv);
             unsupportedOperands(opc, lv, rv);
         case OP_MUL: {
             if (nums) return numArith(opc, x, y);
@@ -1492,9 +1669,18 @@ public:   // NythonExecutor is a struct: members default to public
                 if (lv.type == ValueType::BOOLEAN && rv.type == ValueType::BOOLEAN) return Value(isTruthy(r));
                 return r;
             }
-            if (lv.isCollectable() && rv.isCollectable())
-                return opc == OP_BAND ? setIntersect(lv, rv) : opc == OP_BOR ? setUnion(lv, rv) : setSymDiff(lv, rv);
-            return intValue(0);
+            // dict | dict: a merged copy, the right one winning (Python 3.9)
+            if (opc == OP_BOR) {
+                Container* lc = contOf(lv);
+                Container* rc = contOf(rv);
+                if (lc && rc && seqLen(lc) < 0 && seqLen(rc) < 0 && !isInstanceVal(lv) && !isInstanceVal(rv) && !nygen::is_gen(lv) && !nygen::is_gen(rv)) {
+                    Value d = makeDictValue();
+                    dictUpdate(contOf(d), lc);
+                    dictUpdate(contOf(d), rc);
+                    return d;
+                }
+            }
+            unsupportedOperands(opc, lv, rv);
         }
         case OP_LSHIFT: case OP_RSHIFT:
             if (nums) return numArith(opc, x, y);
@@ -2020,19 +2206,7 @@ public:   // NythonExecutor is a struct: members default to public
                 if (isTupleCont(lc) != isTupleCont(rc)) return false;
                 bool lset = L.count("__set__") > 0, rset = R.count("__set__") > 0;
                 if (lset != rset) return false;
-                if (lset) {
-                    for (int64_t i = 0; i < ln; i++) {
-                        auto x2 = L.find(std::to_string(i));
-                        if (x2 == L.end()) return false;
-                        bool found = false;
-                        for (int64_t j = 0; j < rn && !found; j++) {
-                            auto y2 = R.find(std::to_string(j));
-                            if (y2 != R.end() && valuesEqual(x2->second, y2->second, depth + 1)) found = true;
-                        }
-                        if (!found) return false;
-                    }
-                    return true;
-                }
+                if (lset) return setEqual(lc, rc);   // set == frozenset by content
                 for (int64_t i = 0; i < ln; i++) {
                     auto x2 = L.find(std::to_string(i));
                     auto y2 = R.find(std::to_string(i));
@@ -2085,6 +2259,7 @@ public:   // NythonExecutor is a struct: members default to public
                 for (auto& e : seqItems(c)) parts.push_back(dictKey(e));
                 return nypy::key_of_tuple(parts);
             }
+            if (isSetCont(c)) return setKey(k);       // a frozenset; a set raises
             if (!isInstanceVal(k)) pyRaise("TypeError", "unhashable type: '" + typeNameOf(k) + "'");
         }
         char buf[32]; snprintf(buf, sizeof buf, "%p", k.type == ValueType::USERDATA ? k.value.p : (void*)k.value.gc);
@@ -2142,6 +2317,11 @@ public:   // NythonExecutor is a struct: members default to public
                 return it != key_objs_.end() ? it->second : NONE_VALUE;
             }
             case nypy::K_BYTES: return makeBytesValue(k.substr(2));
+            case nypy::K_FROZENSET: {
+                std::vector<Value> items;
+                for (auto& part : nypy::key_tuple_parts(k)) items.push_back(keyValue(part));
+                return build_set_val(items, true);
+            }
         }
         return NONE_VALUE;
     }
@@ -2464,6 +2644,7 @@ public:   // NythonExecutor is a struct: members default to public
     // obj[idx]
     Value getItem(const Value& obj, const Value& idx, Context* ctx) {
         if (nygen::is_gen(obj)) pyRaise("TypeError", "'generator' object is not subscriptable");
+        if (Container* sc = setOf(obj)) pyRaise("TypeError", "'" + std::string(isFrozenCont(sc) ? "frozenset" : "set") + "' object is not subscriptable");
         if (auto* bo = bytesOf(obj)) {
             Num k;
             if (!asNum(idx, k) || k.k == 3) pyRaise("TypeError", "byte indices must be integers or slices, not " + typeNameOf(idx));
@@ -2565,6 +2746,7 @@ public:   // NythonExecutor is a struct: members default to public
 
     // obj[idx] = val
     void setItem(const Value& obj, const Value& idx, const Value& val, Context* ctx) {
+        if (Container* sc = setOf(obj)) pyRaise("TypeError", "'" + std::string(isFrozenCont(sc) ? "frozenset" : "set") + "' object does not support item assignment");
         if (isInstanceVal(obj)) {
             if (!instanceHasMethod(obj, "__setitem__"))
                 throw std::string("__exc__:TypeError:'" + instanceClassName(obj) + "' object does not support item assignment");
@@ -2661,7 +2843,7 @@ public:   // NythonExecutor is a struct: members default to public
         if (nygen::is_gen(v)) return "generator";
         if (Container* c = contOf(v)) {
             if (seqLen(c) < 0) return "dict";
-            return isTupleCont(c) ? "tuple" : isSetCont(c) ? "set" : isGenCont(c) ? "generator" : "list";
+            return isTupleCont(c) ? "tuple" : isSetCont(c) ? (isFrozenCont(c) ? "frozenset" : "set") : isGenCont(c) ? "generator" : "list";
         }
         if (v.type == ValueType::USERDATA && v.value.p) {
             auto fit = func_names.find(v.value.p);
@@ -2737,8 +2919,9 @@ public:   // NythonExecutor is a struct: members default to public
         int64_t n = seqLen(c);
         if (n >= 0) {
             bool tup = isTupleCont(c), st = isSetCont(c);
-            if (st && n == 0) return "set()";
-            std::string r = tup ? "(" : st ? "{" : "[";
+            bool fz = st && isFrozenCont(c);
+            if (st && n == 0) return fz ? "frozenset()" : "set()";
+            std::string r = tup ? "(" : fz ? "frozenset({" : st ? "{" : "[";
             for (int64_t i = 0; i < n; i++) {
                 if (i) r += ", ";
                 auto it = c->container->find(std::to_string(i));
@@ -2748,7 +2931,7 @@ public:   // NythonExecutor is a struct: members default to public
                 }
             }
             if (tup && n == 1) r += ",";
-            return r + (tup ? ")" : st ? "}" : "]");
+            return r + (tup ? ")" : fz ? "})" : st ? "}" : "]");
         }
         std::string r = "{";
         bool first = true;
@@ -3739,6 +3922,11 @@ public:   // NythonExecutor is a struct: members default to public
             }
         }
 
+        // set / frozenset methods (round 77)
+        if (Container* sc = setOf(obj)) {
+            Value r;
+            if (setMethod(sc, obj, method_name, args, ctx, r)) return r;
+        }
         // dict methods first: the list block below also has pop/remove/clear.
         if (Container* dc = contOf(obj); dc && seqLen(dc) < 0) {
             Value r;
@@ -3810,11 +3998,11 @@ public:   // NythonExecutor is a struct: members default to public
                     if (!args.empty()) {
                         auto len_it = cont->container->find("__len__");
                         int len = len_it != cont->container->end() ? (int)bigint_to_i64(len_it->second.value.i) : 0;
-                        std::string target_key = set_key_str(args[0]);
+                        std::string target_key = setKey(args[0]);
                         int found_idx = -1;
                         for (int i = 0; i < len; i++) {
                             auto it = cont->container->find(std::to_string(i));
-                            if (it != cont->container->end() && set_key_str(it->second) == target_key) {
+                            if (it != cont->container->end() && setKey(it->second) == target_key) {
                                 found_idx = i; break;
                             }
                         }
@@ -4525,7 +4713,7 @@ public:   // NythonExecutor is a struct: members default to public
             // bases[0] is a VariableNode with parent class name
             class_parent[(void*)node.get()] = cn->bases[0]->value();
         }
-        ctx->defineByName(cn->name, class_val);
+        ctx->defineByName(cn->bind_name.empty() ? cn->name : cn->bind_name, class_val);
         if (cn->body) {
             Context* class_ctx = new Context(runner, cn->name, nullptr, nullptr, ctx);
             CtxReaper _class_creator(this, class_ctx);
@@ -5053,6 +5241,8 @@ public:
 
     inline void noteStatement(const node_ptr& st, Context* ctx) {
         nyconc::tick();          // GIL switch point (no-op until a thread exists)
+        // A signal arrived: its handler runs here, on the main thread (round 77).
+        if (__builtin_expect(nyconc::signal_pending(), 0)) ny_interp_check_signals(*this);
         nygc::safe_point();      // queued __del__ and due collections (one load)
         // Generators dropped while suspended are closed here, between
         // statements, not inside the destructor that dropped them.
@@ -5635,11 +5825,10 @@ public:
         if (callee.type == ValueType::USERDATA && callee.value.p && fname.find("__class__:") == 0)
             return instantiateClass(callee, args, kw_args, ctx);
 
-        // Check for Object.call if callee is collectable
-        if (callee.isCollectable() && callee.value.gc) {
-            auto* obj = dynamic_cast<Object*>(callee.value.gc);
-            if (obj) return obj->call(args);
-        }
+        // A dict, list or namespace is not callable (the old Object::call
+        // path threw a raw pointer here, which ended the process).
+        if (callee.isCollectable() && callee.value.gc && contOf(callee))
+            pyRaise("TypeError", "'" + typeNameOf(callee) + "' object is not callable");
 
         // Final fallback: if fname looks like a module builtin (contains '_' and callee was
         // unresolved), try dispatching through callBuiltin. This handles gui_*, os_*, etc.
@@ -5727,6 +5916,7 @@ public:
             if (d < best) { best = d; bestName = cand; }
         };
         for (auto& kv : func_names) {
+            if (!module_owned_.empty() && module_owned_.count(kv.first)) continue;
             const std::string& n = kv.second;
             if (n.rfind("__func__:", 0) == 0) consider(n.substr(9));
             else if (n.rfind("__class__:", 0) == 0) consider(n.substr(10));
@@ -5839,7 +6029,9 @@ public:
             "BrokenPipeError","ConnectionRefusedError","ConnectionResetError",
             "LookupError","ArithmeticError","EOFError","ImportError","ModuleNotFoundError",
             "UnicodeError","UnicodeDecodeError","UnicodeEncodeError","UnicodeTranslateError",
-            "ConnectionAbortedError","gaierror","herror"
+            "ConnectionAbortedError","gaierror","herror","StopAsyncIteration",
+            "SSLError","SSLCertVerificationError","SSLEOFError","SSLZeroReturnError",
+            "SSLWantReadError","SSLWantWriteError","SSLSyscallError"
         };
         if (exc_types_.count(name_orig)) {
             // Create exception Value tagged as "__exc__:TypeName:message"
@@ -5869,6 +6061,11 @@ public:
         result = dispatch_string(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         result = dispatch_io(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         result = dispatch_network(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
+        if (name.size() > 5 && name[0] == '_') {
+            // the round 77 socket and TLS layers (builtins/net.cpp, tls.cpp)
+            result = dispatch_net(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
+            result = dispatch_tls(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
+        }
         result = dispatch_math(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         result = dispatch_os(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         result = dispatch_data(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
@@ -6757,14 +6954,37 @@ public:
         if (t == "BaseException") return true;
         if (t == "Exception" || t == "Error")
             return !(classDerivesFrom(t0, "SystemExit") || classDerivesFrom(t0, "KeyboardInterrupt")
-                     || classDerivesFrom(t0, "GeneratorExit"));
+                     || classDerivesFrom(t0, "GeneratorExit") || classDerivesFrom(t0, "CancelledError"));
         if (t0.empty()) return flow == t;           // raise "StopIteration"
         return classDerivesFrom(t0, t);
     }
-    bool excClauseMatches(ExceptNode* en, const std::string& flow) {
+    bool excClauseMatches(ExceptNode* en, const std::string& flow, Context* ctx = nullptr) {
         if (en->types.empty()) return true;
-        for (auto& t : en->types) if (excTypeMatches(flow, t)) return true;
+        for (auto& t : en->types) if (excTypeMatches(flow, ctx ? excClassName(t, ctx) : t)) return true;
         return false;
+    }
+    // The class an except clause names, as the name the class is known by:
+    // `except E` looks E up in scope (round 77), so a module's own class
+    // (named "module.E"), an alias (`Err = ValueError`) and a dotted name
+    // (`except socket.error`, `except asyncio.QueueEmpty`) all match what
+    // they name. A builtin exception name, or a name that is not bound to a
+    // class, matches by name as before (the last part of a dotted one).
+    std::string excClassName(const std::string& t, Context* ctx) {
+        if (t.empty() || nython::ny_is_builtin_exc(t)) return t;
+        size_t dot = t.find('.');
+        Value v = ctx->getByName(dot == std::string::npos ? t : t.substr(0, dot));
+        while (v.type != ValueType::UNDEFINED && dot != std::string::npos) {
+            size_t next = t.find('.', dot + 1);
+            std::string part = t.substr(dot + 1, next == std::string::npos ? std::string::npos : next - dot - 1);
+            try { v = attrOf(v, part); } catch (...) { v = UNDEFINED_VALUE; }
+            dot = next;
+        }
+        if (v.type == ValueType::USERDATA && v.value.p) {
+            auto it = func_names.find(v.value.p);
+            if (it != func_names.end() && it->second.rfind("__class__:", 0) == 0) return it->second.substr(10);
+        }
+        size_t last = t.rfind('.');
+        return last == std::string::npos ? t : t.substr(last + 1);
     }
     // A C++ exception from a builtin, as a tagged exception string.
     static std::string excFromCpp(const std::string& what) {
@@ -6807,7 +7027,7 @@ public:
         ExceptNode* match = nullptr;
         for (auto& ec : tn->except_clauses) {
             auto* en = static_cast<ExceptNode*>(ec.get());
-            if (excClauseMatches(en, exc)) { match = en; break; }
+            if (excClauseMatches(en, exc, ctx)) { match = en; break; }
         }
         if (!match) { run_finally(); throw exc; }
 
@@ -7045,6 +7265,7 @@ public:
             if (t == "map")    return want=="map"||want=="Map"||want=="dict"||want=="Dict";
             if (t == "tuple")  return want=="tuple"||want=="Tuple";
             if (t == "set")    return want=="set"||want=="Set";
+            if (t == "frozenset") return want=="frozenset";
             // A builtin (print, len...) is a function like any other.
             if (t == "function" || t == "builtin") return want=="function"||want=="Function";
             if (t == "int")    return want=="int"||want=="Integer"||want=="integer";
@@ -7149,6 +7370,82 @@ public:
 
     // Modules imported by name, their namespaces (evalImport).
     std::unordered_map<std::string, Value> module_ns_;
+    // Scopes of the modules imported by name (importModule); a module lives
+    // as long as the program, so its scope is never released.
+    std::vector<Context*> module_ctxs_;
+
+    // `from m import a, b` / `from m import *`: binds names of module m's
+    // namespace in ctx (ImportError for a name m does not define). `*` binds
+    // the names in m's __all__, or every name not starting with "_".
+    void bindFromNamespace(const Value& nsv, const std::vector<std::string>& names,
+                           const std::string& module_name, Context* ctx) {
+        auto* ns = nsv.isCollectable() ? dynamic_cast<Object*>(nsv.value.gc) : nullptr;
+        if (!ns || !ns->container) throw std::string("__exc__:ImportError:cannot import from \"" + module_name + "\"");
+        if (names.size() == 1 && names[0] == "*") {
+            auto all = ns->container->find("__all__");
+            if (all != ns->container->end()) {
+                for (const Value& nm : iterItems(all->second, ctx)) {
+                    std::string k = isStringValue(nm) ? getStringValue(nm) : nm.toString();
+                    auto it = ns->container->find(k);
+                    if (it == ns->container->end())
+                        throw std::string("__exc__:AttributeError:module '" + module_name + "' has no attribute '" + k + "'");
+                    ctx->defineByName(k, it->second);
+                }
+                return;
+            }
+            for (auto& kv : *ns->container)
+                if (!kv.first.empty() && kv.first[0] != '_') ctx->defineByName(kv.first, kv.second);
+            return;
+        }
+        for (const auto& n : names) {
+            auto it = ns->container->find(n);
+            if (it == ns->container->end())
+                throw std::string("__exc__:ImportError:cannot import name '" + n + "' from '" + module_name + "'");
+            ctx->defineByName(n, it->second);
+        }
+    }
+
+    // `import m` / `import m as x` / `from m import ...` of a module FILE
+    // named without quotes: Python's module semantics (round 77). The module
+    // runs once, in a scope of its own (Context::inModule: its functions'
+    // plain assignments and `global` stop there), whose parent is the global
+    // scope, so builtins and the prelude are visible to it. The importer gets
+    // only the binding: the namespace (the module's scope as it was when the
+    // module finished running), or the names it asked for. A quoted import
+    // (`import "lib/x.ny"`) still includes the file into the importing scope,
+    // which the IDE's files and older programs rely on.
+    Value importModule(const std::string& filepath, const std::string& module_name,
+                       ImportNode* in_node, const std::string& bind_as, Context* ctx) {
+        auto source = SourceCode(filepath);
+        auto reporter = std::make_shared<Reporter>(source);
+        auto lex = std::make_shared<Lexer>(source);
+        lex->tokenize();
+        auto parser = std::make_shared<Parser>(reporter.get(), (Runnable*)runner, lex.get());
+        auto ast = parser->parse();
+        if (!ast) throw std::string("__exc__:ImportError:cannot import \"" + filepath + "\"");
+        nython::scope::qualify_module_classes(ast, module_name);
+        imported_asts.push_back(ast);
+        auto* ns = new Object((Runnable*)runner, module_name, Type::MAP);
+        Value nsv((Collectable*)ns);
+        // Registered before the module runs, so a circular import binds it.
+        module_ns_[module_name] = nsv;
+        Context* mctx = new Context(runner, module_name, nullptr, nullptr, global_ctx);
+        mctx->inModule = true;
+        mctx->parentFilter = &module_filter_;
+        module_ctxs_.push_back(mctx);
+        mctx->defineByName("__name__", makeStringValue(module_name));
+        mctx->defineByName("__file__", makeStringValue(filepath));
+        std::unordered_set<void*> before;
+        for (auto& kv : func_names) before.insert(kv.first);
+        try { evalNode(ast, mctx); }
+        catch (nython::node::ReturnSignal&) {}
+        catch (std::string&) { module_ns_.erase(module_name); imported_modules_.erase(module_name); throw; }
+        for (auto& kv : func_names) if (!before.count(kv.first)) module_owned_.insert(kv.first);
+        for (auto& kv : *mctx->container) ns->set(kv.first, kv.second);
+        if (!in_node->names.empty()) bindFromNamespace(nsv, in_node->names, module_name, ctx);
+        else if (!bind_as.empty()) ctx->defineByName(bind_as, nsv);
+        return NONE_VALUE;
+    }
     static bool isIdentifierText(const std::string& n) {
         if (n.empty() || !(std::isalpha((unsigned char)n[0]) || n[0] == '_')) return false;
         for (char c : n) if (!(std::isalnum((unsigned char)c) || c == '_')) return false;
@@ -7158,7 +7455,7 @@ public:
         auto in_node = static_pointer_cast<ImportNode>(node);
         std::string module_name = in_node->module_name;
         // Strip quotes if present
-        bool quoted = false;
+        bool quoted = in_node->quoted;
         if (module_name.size() >= 2 && (module_name[0] == '"' || module_name[0] == '\'')) {
             module_name = module_name.substr(1, module_name.size() - 2);
             quoted = true;
@@ -7168,13 +7465,17 @@ public:
         // defined in the importing scope, as every import here always did.
         // A module runs once: a later import binds the cached namespace.
         std::string implicit_alias;
-        if (!quoted && in_node->alias.empty() && isIdentifierText(module_name)) implicit_alias = module_name;
+        const bool from_import = !in_node->names.empty();
+        if (!quoted && in_node->alias.empty() && !from_import && isIdentifierText(module_name)) implicit_alias = module_name;
         {
             // a module runs once: a later import (named or aliased) binds the
             // namespace its first import made
             const std::string& want = !in_node->alias.empty() ? in_node->alias : implicit_alias;
             auto mc = module_ns_.find(module_name);
-            if (!want.empty() && mc != module_ns_.end()) { ctx->defineByName(want, mc->second); return NONE_VALUE; }
+            if (mc != module_ns_.end()) {
+                if (from_import && !quoted) { bindFromNamespace(mc->second, in_node->names, module_name, ctx); return NONE_VALUE; }
+                if (!want.empty()) { ctx->defineByName(want, mc->second); return NONE_VALUE; }
+            }
         }
 
         // Circular import guard.
@@ -7819,6 +8120,7 @@ public:
         search_paths.push_back("lib/" + module_name + "/" + module_name + ".ny");
         for (auto& c : ancestorCandidates(node, module_name + ".ny")) search_paths.push_back(c);
         for (auto& c : ancestorCandidates(node, module_name)) search_paths.push_back(c);
+        for (auto& d : nyrt::library_dirs()) search_paths.push_back(d + module_name + ".ny");
 
         std::string filepath;
         for (auto& p : search_paths) {
@@ -7836,6 +8138,17 @@ public:
             }
             throw std::string("__exc__:ImportError:cannot find module \"" + module_name
                               + "\" (looked in: " + tried + ")");
+        }
+
+        // A module named without quotes runs in a scope of its own.
+        if (!quoted) {
+            try {
+                return importModule(filepath, module_name, in_node.get(),
+                                    !in_node->alias.empty() ? in_node->alias : implicit_alias, ctx);
+            } catch (std::exception& e) {
+                std::cerr << "[Nython] Failed to import \"" << filepath << "\": " << e.what() << "\n";
+                throw std::string("__exc__:ImportError:cannot import \"" + filepath + "\": " + e.what());
+            }
         }
 
         // Read and execute the file
@@ -7895,14 +8208,35 @@ public:
                 evalNode(ast, ctx);
 
                 if (aliased) {
-                    auto* ns = new Object((Runnable*)runner, bind_as, Type::MAP);
-                    for (const auto& n : own) {
-                        Value v = ctx->getByName(n);
-                        if (v.type != ValueType::UNDEFINED) ns->set(n, v);
+                    // Modules share the importer's globals here, so binding the
+                    // namespace under a name the module itself defines (socket's
+                    // class socket, glob's def glob) would take that name from
+                    // the module's own code. Then the module's names become
+                    // attributes of its same-named class or function instead:
+                    // socket.socket(), socket.AF_INET and a call to socket()
+                    // inside the module all work (round 77).
+                    Value same = own.count(bind_as) ? ctx->getByName(bind_as) : UNDEFINED_VALUE;
+                    bool merge = same.type == ValueType::USERDATA && same.value.p && func_names.count(same.value.p)
+                                 && !instance_to_class.count(same.value.p);
+                    if (merge) {
+                        for (const auto& n : own) {
+                            if (n == bind_as) continue;
+                            Value v = ctx->getByName(n);
+                            if (v.type != ValueType::UNDEFINED) setAttr(same, n, v);
+                        }
+                        setAttr(same, bind_as, same);
+                        module_ns_[module_name] = same;
+                        ctx->defineByName(bind_as, same);
+                    } else {
+                        auto* ns = new Object((Runnable*)runner, bind_as, Type::MAP);
+                        for (const auto& n : own) {
+                            Value v = ctx->getByName(n);
+                            if (v.type != ValueType::UNDEFINED) ns->set(n, v);
+                        }
+                        Value nsv((Collectable*)ns);
+                        module_ns_[module_name] = nsv;
+                        ctx->defineByName(bind_as, nsv);
                     }
-                    Value nsv((Collectable*)ns);
-                    module_ns_[module_name] = nsv;
-                    ctx->defineByName(bind_as, nsv);
                 }
             }
         } catch (nython::node::ReturnSignal&) {
@@ -8470,33 +8804,9 @@ public:
         }
         (void)changed;
         if ((name == "set" || name == "frozenset") && args.size() == 1) {
-            // Objects are one element per __hash__/__eq__ class (identity
-            // without them); their text form, which the set builtin keyed on,
-            // is the same for every instance of a class.
-            std::vector<Value> items = listItems(args[0]);
-            bool any_inst = false;
-            for (auto& v : items) if (isInstanceValue(v)) { any_inst = true; break; }
-            if (!any_inst) return false;
-            std::vector<Value> uniq;
-            for (auto& v : items) {
-                bool dup = false;
-                for (auto& u : uniq) {
-                    if (isInstanceValue(v) != isInstanceValue(u)) continue;
-                    if (isInstanceValue(v) && !instanceHasMethod(v, "__eq__") && !instanceHasMethod(u, "__eq__")) {
-                        if (v.value.p == u.value.p) { dup = true; break; }
-                        continue;
-                    }
-                    if (isInstanceValue(v) && instanceHasMethod(v, "__hash__") && instanceHasMethod(u, "__hash__")) {
-                        std::vector<Value> none;
-                        if (!pyEquals(callMethod(v, "__hash__", none, ctx), callMethod(u, "__hash__", none, ctx), ctx)) continue;
-                    }
-                    if (pyEquals(v, u, ctx)) { dup = true; break; }
-                }
-                if (!dup) uniq.push_back(v);
-            }
-            Value lst = makeListValue(uniq);
-            if (auto* c = dynamic_cast<Container*>(lst.value.gc)) (*c->container)["__set__"] = Value(true);
-            out = lst; return true;
+            // set_key keys an object with __hash__ by it (round 77)
+            out = build_set_val(iterItems(args[0], ctx), name == "frozenset");
+            return true;
         }
         // sorted / min / max / sum over objects: pycore's, which order
         // through orderValues (__lt__, reflected __gt__) and add through

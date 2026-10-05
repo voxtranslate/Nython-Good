@@ -10,9 +10,30 @@
 //      atomics, channels/queues + select, futures, pool, timer, task group
 //   7. async: coroutines, tasks, await, gather, wait_for
 //   8. builtin dispatch table
+//   9. signals and I/O waits (round 77)
 // ─────────────────────────────────────────────────────────────────────────────
 #include "NyConc.hpp"
 #include "NyCoro.hpp"
+
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <csignal>
+#ifdef _WIN32
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <winsock2.h>
+#  include <windows.h>
+#else
+#  include <fcntl.h>
+#  include <sys/time.h>
+#  include <poll.h>
+#  include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -43,6 +64,12 @@ using WQ = std::vector<struct ThreadRec*>;
     throw NyError::make(type, msg);
 }
 
+// A builtin that a signal interrupts is run again once the handlers have
+// run (dispatch); the deadline it computed the first time is kept, so a
+// timeout counts from the original call (PEP 475).
+struct DeadlineMemo { bool on = false, have = false, reuse = false; TP tp{}; };
+static thread_local DeadlineMemo t_dl;
+
 struct Deadline {
     bool finite = false; TP tp{};
     static Deadline never() { return Deadline(); }
@@ -50,11 +77,27 @@ struct Deadline {
     static Deadline in_ms(double ms) {
         Deadline d; if (ms < 0) return d;
         d.finite = true;
+        if (t_dl.on && t_dl.reuse && t_dl.have) { d.tp = t_dl.tp; return d; }
         d.tp = Clock::now() + std::chrono::microseconds((long long)(ms * 1000.0));
+        if (t_dl.on && !t_dl.have) { t_dl.have = true; t_dl.tp = d.tp; }
         return d;
     }
     bool expired() const { return finite && Clock::now() >= tp; }
 };
+
+// ── signals: what the C handler touches (section 9 has the rest) ────────────
+std::atomic<int> g_sig_any{0};
+static constexpr int kMaxSig = 65;
+static std::atomic<int> g_sig_flags[kMaxSig];
+static std::atomic<bool> g_sig_armed{false};   // a handler of ours is installed
+static std::thread::id& main_tid() { static std::thread::id id = std::this_thread::get_id(); return id; }
+static const bool g_main_tid_set = (main_tid(), true);   // captured at load, on the main thread
+bool is_main_thread() { return std::this_thread::get_id() == main_tid(); }
+// The main thread wakes from a lock/queue/join wait at least this often to
+// see a signal (a condition variable cannot wait on the self-pipe).
+static const auto kSignalSlice = std::chrono::milliseconds(50);
+static bool sig_watch() { return g_sig_armed.load(std::memory_order_relaxed) && is_main_thread(); }
+static NyError signal_interrupt() { return NyError::make("__signal__", ""); }
 
 struct ThreadRec;
 // Something a thread can wait for that has owner threads: the edges of the
@@ -339,9 +382,16 @@ static bool block(std::unique_lock<std::mutex>& lk, ThreadRec* self,
     if (self->blocked_forever) check_all_blocked_locked(self);
     // A thread goes to sleep; a task only switches back to its loop.
     if (!self->task) g_waits.fetch_add(1, std::memory_order_relaxed);
+    const bool watch = !self->task && sig_watch();
     while (true) {
         self->woken = false;
+        if (watch && g_sig_any.load(std::memory_order_acquire)) throw signal_interrupt();
         if (self->task) task_park(lk, self, dl);
+        else if (watch) {
+            TP until = Clock::now() + kSignalSlice;
+            if (dl.finite && dl.tp < until) until = dl.tp;
+            self->cv.wait_until(lk, until);
+        }
         else if (dl.finite) self->cv.wait_until(lk, dl.tp);
         else self->cv.wait(lk);
         if (pred()) return true;
@@ -511,8 +561,13 @@ static void check_deadlock_locked(ThreadRec* self, const Waitable* on) {
 
 // `self` is about to block with no timeout. If every other live thread is
 // already blocked with no timeout, nothing can ever wake anyone.
+static bool signals_can_wake();   // section 9
 static void check_all_blocked_locked(ThreadRec* self) {
     auto& rt = RT();
+    // A program with a signal handler or a signal channel of its own may be
+    // woken by a signal: every thread blocked is then not a deadlock (the
+    // default Ctrl+C handler does not count - it only ends the program).
+    if (signals_can_wake()) return;
     std::string who;
     for (auto* t : rt.live) {
         if (t == self || t->done) continue;
@@ -600,6 +655,14 @@ struct Task : Obj {
     std::multimap<std::pair<TP, uint64_t>, Task*>::iterator timer_it;
 };
 
+// A task waiting for a socket or pipe to be ready (wait_io, section 9).
+struct IoWait {
+    Task* task = nullptr;
+    intptr_t fd = -1;
+    int events = 0;          // IO_READ | IO_WRITE
+    int revents = 0;         // what poll() reported; 0 while waiting
+};
+
 struct Loop {
     std::deque<Task*> ready;
     std::multimap<std::pair<TP, uint64_t>, Task*> timers;
@@ -608,7 +671,29 @@ struct Loop {
     std::vector<std::shared_ptr<Task>> tasks;
     uint64_t seq = 0;
     std::condition_variable cv;              // wakes an idle loop (another thread made a task ready)
+    // The I/O reactor (round 77): tasks blocked on a socket wait here, and
+    // the loop polls their descriptors when nothing is ready instead of
+    // sleeping on cv. A ready task from another thread interrupts the poll
+    // through the wake pipe.
+    std::vector<IoWait*> io;
+    bool polling = false;
+#ifndef _WIN32
+    int wake_r = -1, wake_w = -1;
+#endif
+    ~Loop() {
+#ifndef _WIN32
+        if (wake_r >= 0) { ::close(wake_r); ::close(wake_w); }
+#endif
+    }
 };
+
+static void loop_wake_poll(Loop* L) {
+#ifndef _WIN32
+    if (L->polling && L->wake_w >= 0) { char c = 1; ssize_t r = ::write(L->wake_w, &c, 1); (void)r; }
+#else
+    (void)L;   // a polling Windows loop wakes every 10 ms (WSAPoll cannot wait on an event)
+#endif
+}
 
 static void make_ready(Task* t) {
     Loop* L = t->loop;
@@ -618,6 +703,7 @@ static void make_ready(Task* t) {
     if (t->thr) { t->thr->blocked_forever = false; }
     if (L->thread) L->thread->blocked_forever = false;
     L->cv.notify_all();
+    loop_wake_poll(L);
 }
 
 // The stack a task runs on: the generators' (NY_GEN_STACK_KB, 1 MB) on a
@@ -1440,10 +1526,15 @@ static void grant(std::unique_lock<std::mutex>& lk, Loop* L, Task* t) {
     if (L->current == t) L->current = nullptr;
 }
 
+static void loop_poll_io(std::unique_lock<std::mutex>& lk, Loop* L);
+static void loop_run_signals(std::unique_lock<std::mutex>& lk);
+
 // Run loop L until `until` holds. Loop thread, runtime mutex held, GIL released.
 static void run_loop_until(std::unique_lock<std::mutex>& lk, Loop* L, const std::function<bool()>& until) {
     ThreadRec* self = L->thread;
+    const bool watch = sig_watch();
     while (!until()) {
+        if (watch && g_sig_any.load(std::memory_order_acquire)) { loop_run_signals(lk); continue; }
         TP now = Clock::now();
         while (!L->timers.empty() && L->timers.begin()->first.first <= now) {
             Task* t = L->timers.begin()->second;
@@ -1458,15 +1549,19 @@ static void run_loop_until(std::unique_lock<std::mutex>& lk, Loop* L, const std:
             grant(lk, L, t);
             continue;
         }
+        if (!L->io.empty()) { loop_poll_io(lk, L); continue; }
         if (!L->timers.empty()) {
-            L->cv.wait_until(lk, L->timers.begin()->first.first);
+            TP until_tp = L->timers.begin()->first.first;
+            if (watch) until_tp = std::min(until_tp, Clock::now() + kSignalSlice);
+            L->cv.wait_until(lk, until_tp);
             continue;
         }
         // Nothing ready, nothing timed: only another thread can wake a task.
         self->blocking = true; self->blocked_forever = true;
         try { check_all_blocked_locked(self); }
         catch (...) { self->blocking = false; self->blocked_forever = false; throw; }
-        L->cv.wait(lk);
+        if (watch) L->cv.wait_for(lk, kSignalSlice);
+        else L->cv.wait(lk);
         self->blocking = false; self->blocked_forever = false;
     }
 }
@@ -1549,7 +1644,17 @@ static BoxPtr await_value(Engine& e, int64_t h, bool is_handle, const BoxPtr& v)
             if (t->done) return task_outcome_locked(e, t);
             if (self->task == t) raise("DeadlockError", "deadlock detected: task '" + t->name + "' awaits itself");
         }
-        block_released(self, {&t->wq}, [t] { return t->done; }, Deadline::never(), nullptr);
+        try {
+            block_released(self, {&t->wq}, [t] { return t->done; }, Deadline::never(), nullptr);
+        } catch (NyError& err) {
+            // Cancelling a task cancels the task it awaits, as in Python
+            // (round 77; asyncio.shield waits without awaiting, to opt out).
+            if (is_cancel_error(err)) {
+                std::lock_guard<std::mutex> l(RT().m);
+                if (!t->done) task_cancel_locked(t);
+            }
+            throw;
+        }
         std::lock_guard<std::mutex> l(RT().m);
         return task_outcome_locked(e, t);
     }
@@ -1592,7 +1697,16 @@ static BoxPtr await_value(Engine& e, int64_t h, bool is_handle, const BoxPtr& v)
         std::lock_guard<std::mutex> l(RT().m);
         t = ensure_task_locked(L, e, a->target);
     }
-    bool ok = block_released(self, {&t->wq}, [t] { return t->done; }, Deadline::in_ms(a->secs * 1000.0), nullptr);
+    bool ok;
+    try {
+        ok = block_released(self, {&t->wq}, [t] { return t->done; }, Deadline::in_ms(a->secs * 1000.0), nullptr);
+    } catch (NyError& err) {
+        if (is_cancel_error(err)) {
+            std::lock_guard<std::mutex> l(RT().m);
+            if (!t->done) task_cancel_locked(t);
+        }
+        throw;
+    }
     if (!ok) {
         {
             std::lock_guard<std::mutex> l(RT().m);
@@ -1632,10 +1746,22 @@ static double priority_of(const Args& a, size_t i) {
     if (a.is_list(i)) { auto l = a.list(i); if (l->size() > 0 && l->is_number(0)) return l->as_num(0); }
     return 0;
 }
-static Awaitable::Item item_of(const Args& a, size_t i) {
+// An awaitable argument: a handle (coroutine, task, future, awaitable), or a
+// value. An object with __await__ stands for what __await__() returns
+// (round 77: asyncio's Task/Future objects, user awaitables); a plain value
+// awaits to itself. Called without the runtime mutex (__await__ is Nython).
+static Awaitable::Item item_of(Engine& e, const Args& a, size_t i) {
     Awaitable::Item it{false, 0, nullptr};
-    if (a.is_number(i) && a.as_num(i) == (double)a.as_int(i)) { it.is_handle = true; it.h = a.as_int(i); }
-    else it.v = a.box(i);
+    if (a.is_number(i) && a.as_num(i) == (double)a.as_int(i)) { it.is_handle = true; it.h = a.as_int(i); return it; }
+    BoxPtr v = a.box(i);
+    for (int depth = 0; depth < 16; depth++) {
+        BoxPtr r = e.await_target(v);
+        if (!r) break;
+        int64_t h;
+        if (e.unbox_int(r, h)) { it.is_handle = true; it.h = h; return it; }
+        v = r;
+    }
+    it.v = v;
     return it;
 }
 static Ret boxret(const BoxPtr& b) { return Ret::boxed(b); }
@@ -1650,11 +1776,16 @@ static Ret do_thread_create(Engine& e, const Args& a, size_t fn_at, const std::s
     return thread_ret(e, start_thread(e, [fn, args](ThreadRec* self) { return self->engine->call(fn, args); }, name, false));
 }
 
+static bool sig_sleep_until(const Deadline& dl);
 static Ret sleep_ms(Engine& e, double ms) {
     ThreadRec* self = current(e);
     if (!active()) {
-        // Single-threaded: a plain sleep, as before the runtime existed.
-        if (ms > 0) std::this_thread::sleep_for(std::chrono::microseconds((long long)(ms * 1000.0)));
+        // Single-threaded: a plain sleep, as before the runtime existed - but
+        // one a signal ends (its handler runs, then the rest is slept).
+        if (ms > 0) {
+            Deadline dl = Deadline::in_ms(ms);
+            if (sig_sleep_until(dl)) throw signal_interrupt();
+        }
         return Ret::none();
     }
     if (ms <= 0) {
@@ -1679,8 +1810,17 @@ bool dispatch(Engine& e, const std::string& name, const Args& a, Ret& out) {
     auto& t = table();
     auto it = t.find(name);
     if (it == t.end()) return false;
-    out = it->second(e, a);
-    return true;
+    // A wait a signal interrupts (main thread): run the handlers, then the
+    // call again with its original deadline; a handler that raises ends it.
+    DeadlineMemo saved = t_dl;
+    t_dl = DeadlineMemo(); t_dl.on = true;
+    struct Restore { DeadlineMemo s; ~Restore() { t_dl = s; } } restore{saved};
+    while (true) {
+        try { out = it->second(e, a); return true; }
+        catch (NyError& x) { if (x.type != "__signal__") throw; }
+        run_signal_handlers();
+        t_dl.reuse = true;
+    }
 }
 
 const std::vector<std::string>& builtin_names() {
@@ -1719,7 +1859,13 @@ static Ret gather_in_loop(Engine& e, Awaitable* a, ThreadRec* self, Loop* L) {
         for (auto* t : ts) { qs.push_back(&t->wq); t->wq.push_back(self); }
         struct Unreg { ThreadRec* s; std::vector<WQ*>& qs;
             ~Unreg() { for (auto* q : qs) { auto it = std::find(q->begin(), q->end(), s); if (it != q->end()) q->erase(it); } } } unreg{self, qs};
-        block(lk, self, {}, all_or_fail, Deadline::never(), nullptr);
+        try {
+            block(lk, self, {}, all_or_fail, Deadline::never(), nullptr);
+        } catch (NyError& err) {
+            // Cancelling the gather cancels its children (Python's rule).
+            if (is_cancel_error(err)) for (auto* t : ts) if (!t->done) task_cancel_locked(t);
+            throw;
+        }
     }
     std::lock_guard<std::mutex> l(RT().m);
     Task* first_fail = nullptr;
@@ -1727,12 +1873,16 @@ static Ret gather_in_loop(Engine& e, Awaitable* a, ThreadRec* self, Loop* L) {
     if (first_fail && !rex) throw first_fail->err;
     std::vector<Ret> out;
     for (auto* t : ts) {
-        if (t->failed) out.push_back(Ret::str(error_text(t->err)));
+        if (t->failed) {
+            BoxPtr ex = e.exception_object(t->err);
+            out.push_back(ex ? Ret::boxed(ex) : Ret::str(error_text(t->err)));
+        }
         else out.push_back(Ret::boxed(t->result ? t->result : e.box_none()));
     }
     return Ret::lst(std::move(out));
 }
 
+static void register_signal_builtins(std::unordered_map<std::string, Handler>& T);
 static std::unordered_map<std::string, Handler>& table() {
     static std::unordered_map<std::string, Handler>* tbl = [] {
         auto* m = new std::unordered_map<std::string, Handler>();
@@ -2607,7 +2757,7 @@ static std::unordered_map<std::string, Handler>& table() {
         };
         T["async_await"] = [](Engine& e, const Args& a) -> Ret {
             if (a.size() < 1) return Ret::none();
-            auto it = item_of(a, 0);
+            auto it = item_of(e, a, 0);
             return boxret(await_value(e, it.h, it.is_handle, it.v));
         };
         T["async_run"] = [](Engine& e, const Args& a) -> Ret {
@@ -2634,15 +2784,16 @@ static std::unordered_map<std::string, Handler>& table() {
             ThreadRec* self = current(e);
             if (!self->task) raise("RuntimeError", "create_task: no running event loop (call it inside async_run)");
             if (a.size() < 1) raise("TypeError", "create_task(coroutine)");
+            Awaitable::Item it = item_of(e, a, 0);
             std::lock_guard<std::mutex> l(RT().m);
-            return Ret::integer(ensure_task_locked(self->task->loop, e, item_of(a, 0))->id);
+            return Ret::integer(ensure_task_locked(self->task->loop, e, it)->id);
         };
         T["async_create_task"] = T["create_task"];
         T["gather"] = [](Engine& e, const Args& a) {
             current(e);
             auto aw = std::make_shared<Awaitable>();
             aw->kind = Awaitable::GATHER;
-            for (size_t i = 0; i < a.size(); i++) aw->items.push_back(item_of(a, i));
+            for (size_t i = 0; i < a.size(); i++) aw->items.push_back(item_of(e, a, i));
             std::lock_guard<std::mutex> l(RT().m);
             return Ret::integer(add_obj(aw, true));
         };
@@ -2652,7 +2803,7 @@ static std::unordered_map<std::string, Handler>& table() {
             auto aw = std::make_shared<Awaitable>();
             aw->kind = Awaitable::GATHER;
             aw->return_exceptions = true;
-            for (size_t i = 0; i < a.size(); i++) aw->items.push_back(item_of(a, i));
+            for (size_t i = 0; i < a.size(); i++) aw->items.push_back(item_of(e, a, i));
             std::lock_guard<std::mutex> l(RT().m);
             return Ret::integer(add_obj(aw, true));
         };
@@ -2661,7 +2812,7 @@ static std::unordered_map<std::string, Handler>& table() {
             if (a.size() < 2) raise("TypeError", "wait_for(awaitable, timeout_seconds)");
             auto aw = std::make_shared<Awaitable>();
             aw->kind = Awaitable::WAIT_FOR;
-            aw->target = item_of(a, 0);
+            aw->target = item_of(e, a, 0);
             aw->secs = a.as_num(1);
             std::lock_guard<std::mutex> l(RT().m);
             return Ret::integer(add_obj(aw, true));
@@ -2703,11 +2854,586 @@ static std::unordered_map<std::string, Handler>& table() {
             return Ret::integer(self->task ? self->task->id : 0);
         };
 
+        // ── signals (section 9) ─────────────────────────────────────────────
+        register_signal_builtins(T);
+
         // ── exception constructors ──────────────────────────────────────────
         // (engines turn the returned text into their own exception values)
         return m;
     }();
     return *tbl;
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// 9. Signals and I/O waits (round 77)
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Signals. The C-level handler only records the signal (one atomic flag per
+// signal) and wakes the main thread: through a self-pipe that its I/O polls
+// and its event loop also wait on (an event on Windows), and through the
+// 50 ms slices of its other waits. The handlers themselves - Nython
+// callables, or the default SIGINT one, which raises KeyboardInterrupt - run
+// on the main thread, as in Python: at the next statement (the engines check
+// signal_pending() where they call tick()), or, when the main thread was
+// waiting, inside the interrupted builtin, which then resumes its wait with
+// the deadline it started with (PEP 475; dispatch).
+//
+// A channel can subscribe to signals (signal_notify): every delivery is also
+// sent to it, without ever blocking (a full channel drops it) - Go's
+// signal.Notify, so one select can wait for signals and messages alike, and
+// a thread or an async task can wait for a signal without a handler.
+
+#ifdef _WIN32
+static HANDLE g_sig_event = nullptr;
+#else
+static int g_sig_pipe[2] = {-1, -1};
+#endif
+
+static void sig_wake_open() {
+#ifdef _WIN32
+    if (!g_sig_event) g_sig_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+#else
+    if (g_sig_pipe[0] >= 0) return;
+    int p[2];
+    if (::pipe(p) == 0) {
+        for (int k = 0; k < 2; k++) {
+            ::fcntl(p[k], F_SETFL, ::fcntl(p[k], F_GETFL) | O_NONBLOCK);
+            ::fcntl(p[k], F_SETFD, FD_CLOEXEC);
+        }
+        g_sig_pipe[0] = p[0];
+        g_sig_pipe[1] = p[1];
+    }
+#endif
+}
+static void sig_wake_drain() {
+#ifdef _WIN32
+    if (g_sig_event) ResetEvent(g_sig_event);
+#else
+    if (g_sig_pipe[0] < 0) return;
+    char buf[64];
+    while (::read(g_sig_pipe[0], buf, sizeof buf) > 0) {}
+#endif
+}
+// Async-signal-safe: atomics and write(2) only.
+static void ny_signal_trampoline(int sig) {
+    int saved = errno;
+    if (sig > 0 && sig < kMaxSig) g_sig_flags[sig].store(1, std::memory_order_relaxed);
+    g_sig_any.store(1, std::memory_order_release);
+#ifdef _WIN32
+    if (g_sig_event) SetEvent(g_sig_event);
+    std::signal(sig, ny_signal_trampoline);   // the CRT resets a handler once it runs
+#else
+    if (g_sig_pipe[1] >= 0) { char c = (char)sig; ssize_t r = ::write(g_sig_pipe[1], &c, 1); (void)r; }
+#endif
+    errno = saved;
+}
+
+struct SigEntry {
+    int kind = 0;                 // 0 SIG_DFL, 1 SIG_IGN, 2 a callable, 3 default_int_handler
+    Engine* eng = nullptr;
+    BoxPtr fn;
+    std::vector<std::pair<int64_t, Engine*>> chans;   // signal_notify subscribers
+};
+static std::mutex& sig_mu() { static std::mutex* m = new std::mutex(); return *m; }
+static std::map<int, SigEntry>& sig_tab() { static auto* t = new std::map<int, SigEntry>(); return *t; }
+
+static bool sig_valid(int sig) {
+#ifdef _WIN32
+    return sig == SIGINT || sig == SIGTERM || sig == SIGABRT || sig == SIGFPE || sig == SIGILL ||
+           sig == SIGSEGV || sig == SIGBREAK;
+#else
+    return sig > 0 && sig < kMaxSig;
+#endif
+}
+static void os_set_handler(int sig, bool ours, int kind) {
+#ifdef _WIN32
+    std::signal(sig, ours ? ny_signal_trampoline : kind == 1 ? SIG_IGN : SIG_DFL);
+#else
+    struct sigaction sa;
+    std::memset(&sa, 0, sizeof sa);
+    sigemptyset(&sa.sa_mask);
+    // No SA_RESTART: a blocking read returns EINTR, so input(), recv() and
+    // the process waits notice the signal (and retry when its handler
+    // returns), as in Python.
+    sa.sa_flags = 0;
+    sa.sa_handler = ours ? ny_signal_trampoline : kind == 1 ? SIG_IGN : SIG_DFL;
+    sigaction(sig, &sa, nullptr);
+#endif
+}
+static void sig_apply_locked(int sig, SigEntry& e) {
+    bool ours = e.kind >= 2 || !e.chans.empty();
+    os_set_handler(sig, ours, e.kind);
+    if (ours) g_sig_armed.store(true, std::memory_order_relaxed);
+}
+
+static bool signals_can_wake() {
+    std::lock_guard<std::mutex> l(sig_mu());
+    for (auto& kv : sig_tab()) if (kv.second.kind == 2 || !kv.second.chans.empty()) return true;
+    return false;
+}
+
+void install_default_signals() {
+    sig_wake_open();
+#ifndef _WIN32
+    // As Python: a write to a closed socket or pipe fails with EPIPE
+    // (BrokenPipeError) instead of killing the process.
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
+    std::lock_guard<std::mutex> l(sig_mu());
+    auto& e = sig_tab()[SIGINT];
+    if (e.kind == 0 && !e.fn && e.chans.empty()) { e.kind = 3; sig_apply_locked(SIGINT, e); }
+}
+
+static void mark_rest_pending(int from) {
+    for (int s = from; s < kMaxSig; s++)
+        if (g_sig_flags[s].load(std::memory_order_relaxed)) { g_sig_any.store(1, std::memory_order_release); return; }
+}
+
+void run_signal_handlers() {
+    if (!g_sig_any.load(std::memory_order_acquire) || !is_main_thread()) return;
+    g_sig_any.store(0, std::memory_order_release);
+    sig_wake_drain();
+    for (int sig = 1; sig < kMaxSig; sig++) {
+        if (!g_sig_flags[sig].exchange(0, std::memory_order_acq_rel)) continue;
+        SigEntry ent;
+        {
+            std::lock_guard<std::mutex> l(sig_mu());
+            auto it = sig_tab().find(sig);
+            if (it == sig_tab().end()) continue;
+            ent = it->second;
+        }
+        for (auto& ch : ent.chans) {
+            try { chan_send(*ch.second, ch.first, ch.second->box_int(sig), 0, 0); }
+            catch (NyError&) { /* a closed channel just misses it */ }
+        }
+        try {
+            if (ent.kind == 3) throw NyError::make("KeyboardInterrupt", "");
+            if (ent.kind == 2 && ent.eng && ent.fn)
+                ent.eng->call(ent.fn, {ent.eng->box_int(sig), ent.eng->box_none()});
+        } catch (...) {
+            mark_rest_pending(sig + 1);   // the others run at the next check
+            throw;
+        }
+    }
+}
+
+// Sleep until `dl`; on the main thread with handlers installed, wake for a
+// signal and return true (the caller lets dispatch run the handlers).
+static bool sig_sleep_until(const Deadline& dl) {
+    if (!sig_watch()) { std::this_thread::sleep_until(dl.tp); return false; }
+    while (true) {
+        if (g_sig_any.load(std::memory_order_acquire)) return true;
+        TP now = Clock::now();
+        if (now >= dl.tp) return false;
+        double ms = std::chrono::duration<double, std::milli>(dl.tp - now).count();
+        ms = std::min(ms + 1.0, 3600000.0);
+#ifdef _WIN32
+        if (g_sig_event) WaitForSingleObject(g_sig_event, (DWORD)ms);
+        else std::this_thread::sleep_for(std::chrono::milliseconds((long long)std::min(ms, 50.0)));
+#else
+        struct pollfd p;
+        p.fd = g_sig_pipe[0]; p.events = POLLIN; p.revents = 0;
+        if (g_sig_pipe[0] >= 0) ::poll(&p, 1, (int)ms);
+        else std::this_thread::sleep_for(std::chrono::milliseconds((long long)std::min(ms, 50.0)));
+#endif
+    }
+}
+
+// ── I/O waits ───────────────────────────────────────────────────────────────
+// One call for "until this descriptor is ready" that is right in every
+// context: a thread releases the GIL and polls; an async task parks on its
+// loop's reactor, so other tasks run meanwhile - the socket API is the same
+// in both ("colourless" I/O: a coroutine needs no separate async socket API).
+
+#ifdef _WIN32
+static short poll_events(int ev) { return (short)(((ev & IO_READ) ? POLLRDNORM : 0) | ((ev & IO_WRITE) ? POLLWRNORM : 0)); }
+static int io_revents(short r) {
+    int o = 0;
+    if (r & (POLLRDNORM | POLLRDBAND | POLLIN | POLLHUP)) o |= IO_READ;
+    if (r & (POLLWRNORM | POLLOUT)) o |= IO_WRITE;
+    if (r & (POLLERR | POLLNVAL | POLLHUP)) o |= IO_ERR;
+    return o;
+}
+#else
+static short poll_events(int ev) { return (short)(((ev & IO_READ) ? POLLIN : 0) | ((ev & IO_WRITE) ? POLLOUT : 0)); }
+static int io_revents(short r) {
+    int o = 0;
+    if (r & (POLLIN | POLLPRI | POLLHUP)) o |= IO_READ;
+    if (r & POLLOUT) o |= IO_WRITE;
+    if (r & (POLLERR | POLLNVAL | POLLHUP)) o |= IO_ERR;
+    return o;
+}
+#endif
+static int ms_until(const Deadline& dl) {
+    if (!dl.finite) return -1;
+    double ms = std::chrono::duration<double, std::milli>(dl.tp - Clock::now()).count();
+    if (ms <= 0) return 0;
+    return (int)std::min(ms + 0.999, 3600000.0);
+}
+
+static int wait_io_thread(std::vector<IoReq>& reqs, const Deadline& dl) {
+    const bool watch = sig_watch();
+    GilRelease rel;
+    while (true) {
+        if (watch && g_sig_any.load(std::memory_order_acquire)) throw signal_interrupt();
+        int ms = ms_until(dl);
+#ifdef _WIN32
+        if (watch && (ms < 0 || ms > 50)) ms = 50;   // WSAPoll cannot wait on the signal event
+        std::vector<WSAPOLLFD> p(reqs.size());
+        for (size_t i = 0; i < reqs.size(); i++) { p[i].fd = (SOCKET)reqs[i].fd; p[i].events = poll_events(reqs[i].events); p[i].revents = 0; }
+        int r = p.empty() ? (Sleep((DWORD)(ms < 0 ? 50 : ms)), 0) : WSAPoll(p.data(), (ULONG)p.size(), ms);
+        if (r < 0) { for (auto& q : reqs) q.revents = IO_ERR; return (int)reqs.size(); }
+        if (r == 0) { if (dl.finite && ms_until(dl) == 0) return 0; continue; }
+        int n = 0;
+        for (size_t i = 0; i < reqs.size(); i++) { reqs[i].revents = io_revents(p[i].revents); if (reqs[i].revents) n++; }
+        return n;
+#else
+        std::vector<struct pollfd> p(reqs.size());
+        for (size_t i = 0; i < reqs.size(); i++) { p[i].fd = (int)reqs[i].fd; p[i].events = poll_events(reqs[i].events); p[i].revents = 0; }
+        if (watch && g_sig_pipe[0] >= 0) { struct pollfd q; q.fd = g_sig_pipe[0]; q.events = POLLIN; q.revents = 0; p.push_back(q); }
+        int r = ::poll(p.data(), (nfds_t)p.size(), ms);
+        if (r < 0) { if (errno == EINTR) continue; for (auto& q : reqs) q.revents = IO_ERR; return (int)reqs.size(); }
+        if (r == 0) return 0;
+        int n = 0;
+        for (size_t i = 0; i < reqs.size(); i++) { reqs[i].revents = io_revents(p[i].revents); if (reqs[i].revents) n++; }
+        if (n) return n;
+        // only the signal pipe: the check at the top
+#endif
+    }
+}
+
+static int wait_io_task(ThreadRec* self, std::vector<IoReq>& reqs, const Deadline& dl) {
+    Task* T = self->task;
+    Loop* L = T->loop;
+    std::vector<IoWait> ws(reqs.size());
+    for (size_t i = 0; i < reqs.size(); i++) { ws[i].task = T; ws[i].fd = reqs[i].fd; ws[i].events = reqs[i].events; }
+    GilRelease rel;
+    std::unique_lock<std::mutex> lk(RT().m);
+    check_cancel_locked(self);
+    for (auto& w : ws) L->io.push_back(&w);
+    struct Unreg {
+        Loop* L; std::vector<IoWait>& ws;
+        ~Unreg() {
+            auto& v = L->io;
+            v.erase(std::remove_if(v.begin(), v.end(), [this](IoWait* p) {
+                return p >= ws.data() && p < ws.data() + ws.size(); }), v.end());
+        }
+    } unreg{L, ws};
+    auto ready = [&] { for (auto& w : ws) if (w.revents) return true; return false; };
+    while (!ready()) {
+        if (dl.expired()) return 0;
+        if (ws.empty() && !dl.finite) { check_cancel_locked(self); }
+        task_park(lk, self, dl);
+        if (self->cancel_requested) check_cancel_locked(self);
+    }
+    int n = 0;
+    for (size_t i = 0; i < ws.size(); i++) { reqs[i].revents = ws[i].revents; if (ws[i].revents) n++; }
+    return n;
+}
+
+int wait_io_many(std::vector<IoReq>& reqs, double timeout_ms) {
+    for (auto& q : reqs) q.revents = 0;
+    Deadline dl;
+    if (timeout_ms >= 0) {
+        dl.finite = true;
+        dl.tp = Clock::now() + std::chrono::microseconds((long long)(timeout_ms * 1000.0));
+    }
+    ThreadRec* self = t_self;
+    if (self && self->task) return wait_io_task(self, reqs, dl);
+    while (true) {
+        try { return wait_io_thread(reqs, dl); }
+        catch (NyError& x) { if (x.type != "__signal__") throw; }
+        run_signal_handlers();   // GIL held again; a handler that raises ends the wait
+    }
+}
+
+bool in_async_task() { return t_self && t_self->task; }
+
+int wait_io(intptr_t fd, int events, double timeout_ms) {
+    std::vector<IoReq> one(1);
+    one[0].fd = fd; one[0].events = events;
+    return wait_io_many(one, timeout_ms) ? one[0].revents : 0;
+}
+
+bool read_stdin_line(std::string& out) {
+    while (true) {
+        bool ok;
+        {
+            GilRelease rel;
+            ok = (bool)std::getline(std::cin, out);
+        }
+        if (ok) {
+            if (!out.empty() && out.back() == '\r') out.pop_back();
+            return true;
+        }
+        // A signal makes the read fail (EINTR, no SA_RESTART): run its
+        // handler, then read again. Otherwise it is the end of input.
+        std::cin.clear();
+        std::clearerr(stdin);
+        if (g_sig_any.load(std::memory_order_acquire) && is_main_thread()) { run_signal_handlers(); continue; }
+        return false;
+    }
+}
+
+// The loop's reactor: poll every waiting task's descriptor (and the wake
+// pipe, and on the main thread the signal pipe) until the next timer.
+// Runtime mutex held on entry and exit, released while polling.
+static void loop_poll_io(std::unique_lock<std::mutex>& lk, Loop* L) {
+    const bool watch = sig_watch();
+    int ms = -1;
+    if (!L->timers.empty()) {
+        double d = std::chrono::duration<double, std::milli>(L->timers.begin()->first.first - Clock::now()).count();
+        ms = d <= 0 ? 0 : (int)std::min(d + 0.999, 3600000.0);
+    }
+    std::vector<IoWait*> ws = L->io;
+#ifdef _WIN32
+    if (ms < 0 || ms > 10) ms = 10;   // no wake socket: other threads' wake-ups are seen within 10 ms
+    std::vector<WSAPOLLFD> fds(ws.size());
+    for (size_t i = 0; i < ws.size(); i++) { fds[i].fd = (SOCKET)ws[i]->fd; fds[i].events = poll_events(ws[i]->events); fds[i].revents = 0; }
+    L->polling = true;
+    lk.unlock();
+    int r = WSAPoll(fds.data(), (ULONG)fds.size(), ms);
+    lk.lock();
+    L->polling = false;
+    (void)watch;
+    if (r <= 0) return;
+    for (size_t i = 0; i < ws.size(); i++) {
+        if (!fds[i].revents) continue;
+        IoWait* w = ws[i];
+        if (std::find(L->io.begin(), L->io.end(), w) == L->io.end()) continue;
+        w->revents = io_revents(fds[i].revents);
+        make_ready(w->task);
+    }
+#else
+    if (L->wake_r < 0) {
+        int p[2];
+        if (::pipe(p) == 0) {
+            for (int k = 0; k < 2; k++) {
+                ::fcntl(p[k], F_SETFL, ::fcntl(p[k], F_GETFL) | O_NONBLOCK);
+                ::fcntl(p[k], F_SETFD, FD_CLOEXEC);
+            }
+            L->wake_r = p[0]; L->wake_w = p[1];
+        }
+    }
+    std::vector<struct pollfd> fds;
+    fds.reserve(ws.size() + 2);
+    for (auto* w : ws) { struct pollfd p; p.fd = (int)w->fd; p.events = poll_events(w->events); p.revents = 0; fds.push_back(p); }
+    if (L->wake_r >= 0) { struct pollfd p; p.fd = L->wake_r; p.events = POLLIN; p.revents = 0; fds.push_back(p); }
+    if (watch && g_sig_pipe[0] >= 0) { struct pollfd p; p.fd = g_sig_pipe[0]; p.events = POLLIN; p.revents = 0; fds.push_back(p); }
+    L->polling = true;
+    lk.unlock();
+    int r = ::poll(fds.data(), (nfds_t)fds.size(), ms);
+    lk.lock();
+    L->polling = false;
+    if (L->wake_r >= 0) { char buf[64]; while (::read(L->wake_r, buf, sizeof buf) > 0) {} }
+    if (r <= 0) return;
+    for (size_t i = 0; i < ws.size(); i++) {
+        if (!fds[i].revents) continue;
+        IoWait* w = ws[i];
+        if (std::find(L->io.begin(), L->io.end(), w) == L->io.end()) continue;
+        w->revents = io_revents(fds[i].revents);
+        make_ready(w->task);
+    }
+#endif
+}
+
+// The event loop's thread (the main thread) runs the signal handlers between
+// tasks. Runtime mutex held on entry and exit; a handler's exception leaves
+// through run_loop_until (async_run then cancels the tasks).
+static void loop_run_signals(std::unique_lock<std::mutex>& lk) {
+    lk.unlock();
+    gil_acquire();
+    struct Back {
+        std::unique_lock<std::mutex>& lk;
+        ~Back() { gil_release(); lk.lock(); }
+    } back{lk};
+    run_signal_handlers();
+}
+
+// ── signal builtins ─────────────────────────────────────────────────────────
+// lib/signal.ny is the Python-shaped module over these. A handler crosses as
+// 0 (SIG_DFL), 1 (SIG_IGN), "default_int_handler" or the callable itself.
+static Ret sig_handler_ret(const SigEntry& e) {
+    switch (e.kind) {
+        case 0: return Ret::integer(0);
+        case 1: return Ret::integer(1);
+        case 3: return Ret::str("default_int_handler");
+        default: return Ret::boxed(e.fn);
+    }
+}
+static int sig_arg(const Args& a, size_t i, const char* fn) {
+    if (i >= a.size() || !a.is_number(i)) raise("TypeError", std::string(fn) + "() expects a signal number");
+    int sig = (int)a.as_int(i);
+    if (!sig_valid(sig)) raise("ValueError", "signal number out of range");
+    return sig;
+}
+
+static void register_signal_builtins(std::unordered_map<std::string, Handler>& T) {
+    T["_sig_signal"] = [](Engine& e, const Args& a) {
+        int sig = sig_arg(a, 0, "signal");
+        if (!is_main_thread()) raise("ValueError", "signal only works in main thread of the main interpreter");
+#ifndef _WIN32
+        if (sig == SIGKILL || sig == SIGSTOP) raise("OSError", "[Errno 22] Invalid argument");
+#endif
+        if (a.size() < 2) raise("TypeError", "signal() missing required argument 'handler'");
+        SigEntry nw;
+        if (a.is_number(1)) {
+            int64_t k = a.as_int(1);
+            if (k != 0 && k != 1) raise("TypeError", "signal handler must be signal.SIG_IGN, signal.SIG_DFL, or a callable object");
+            nw.kind = (int)k;
+        } else if (a.is_string(1) && a.as_str(1) == "default_int_handler") {
+            nw.kind = 3;
+        } else {
+            BoxPtr fn = a.box(1);
+            if (!e.is_callable(fn)) raise("TypeError", "signal handler must be signal.SIG_IGN, signal.SIG_DFL, or a callable object");
+            nw.kind = 2; nw.eng = &e; nw.fn = fn;
+        }
+        sig_wake_open();
+        std::lock_guard<std::mutex> l(sig_mu());
+        auto& cur = sig_tab()[sig];
+        Ret prev = sig_handler_ret(cur);
+        nw.chans = cur.chans;
+        cur = nw;
+        sig_apply_locked(sig, cur);
+        return prev;
+    };
+    T["_sig_getsignal"] = [](Engine&, const Args& a) {
+        int sig = sig_arg(a, 0, "getsignal");
+        std::lock_guard<std::mutex> l(sig_mu());
+        auto it = sig_tab().find(sig);
+        if (it == sig_tab().end()) return Ret::integer(0);
+        return sig_handler_ret(it->second);
+    };
+    T["_sig_raise"] = [](Engine&, const Args& a) {
+        int sig = sig_arg(a, 0, "raise_signal");
+        if (std::raise(sig) != 0) raise("OSError", "raise_signal failed");
+        run_signal_handlers();   // as Python: the handler runs before raise_signal returns
+        return Ret::none();
+    };
+    T["_sig_notify"] = [](Engine& e, const Args& a) {
+        int64_t ch = H(a, 0, "signal_notify");
+        int sig = sig_arg(a, 1, "signal_notify");
+        sig_wake_open();
+        std::lock_guard<std::mutex> l(sig_mu());
+        auto& ent = sig_tab()[sig];
+        for (auto& c : ent.chans) if (c.first == ch) return Ret::none();
+        ent.chans.push_back({ch, &e});
+        // Delivered to the channel only: a subscribed SIGINT no longer raises
+        // KeyboardInterrupt (Go's rule), until signal_stop.
+        if (ent.kind == 3) ent.kind = 0;
+        sig_apply_locked(sig, ent);
+        return Ret::none();
+    };
+    T["_sig_stop"] = [](Engine&, const Args& a) {
+        int64_t ch = H(a, 0, "signal_stop");
+        std::lock_guard<std::mutex> l(sig_mu());
+        for (auto& kv : sig_tab()) {
+            auto& v = kv.second.chans;
+            size_t before = v.size();
+            v.erase(std::remove_if(v.begin(), v.end(), [ch](const std::pair<int64_t, Engine*>& c) { return c.first == ch; }), v.end());
+            if (v.size() != before) {
+                if (kv.first == SIGINT && kv.second.kind == 0 && !kv.second.fn && v.empty()) kv.second.kind = 3;
+                sig_apply_locked(kv.first, kv.second);
+            }
+        }
+        return Ret::none();
+    };
+    T["_sig_pause"] = [](Engine&, const Args&) {
+        // Until a signal arrives and its handler has run (POSIX pause()).
+        if (!is_main_thread()) raise("ValueError", "pause() only works in the main thread");
+        Deadline never; never.finite = true; never.tp = Clock::now() + std::chrono::hours(24 * 365);
+        sig_wake_open();
+        {
+            bool armed = g_sig_armed.load();
+            g_sig_armed.store(true);
+            struct Back { bool a; ~Back() { g_sig_armed.store(a); } } back{armed};
+            GilRelease rel;
+            while (!sig_sleep_until(never)) {}
+        }
+        run_signal_handlers();
+        return Ret::none();
+    };
+    T["_sig_alarm"] = [](Engine&, const Args& a) {
+#ifdef _WIN32
+        (void)a;
+        raise("OSError", "signal.alarm is not available on Windows");
+#else
+        int64_t sec = a.size() > 0 && a.is_number(0) ? a.as_int(0) : 0;
+        if (sec < 0) raise("ValueError", "alarm() argument must be non-negative");
+        return Ret::integer((int64_t)::alarm((unsigned)sec));
+#endif
+    };
+    T["_sig_setitimer"] = [](Engine&, const Args& a) {
+#ifdef _WIN32
+        (void)a;
+        raise("OSError", "signal.setitimer is not available on Windows");
+#else
+        int which = a.size() > 0 && a.is_number(0) ? (int)a.as_int(0) : ITIMER_REAL;
+        double secs = opt_num(a, 1, 0), interval = opt_num(a, 2, 0);
+        struct itimerval nv, ov;
+        auto put = [](struct timeval& tv, double x) { tv.tv_sec = (time_t)x; tv.tv_usec = (suseconds_t)((x - (double)tv.tv_sec) * 1e6); };
+        put(nv.it_value, secs); put(nv.it_interval, interval);
+        if (::setitimer(which, &nv, &ov) != 0) raise("OSError", "setitimer: invalid timer");
+        auto get = [](const struct timeval& tv) { return (double)tv.tv_sec + (double)tv.tv_usec / 1e6; };
+        return Ret::lst({Ret::number(get(ov.it_value)), Ret::number(get(ov.it_interval))});
+#endif
+    };
+    T["_sig_getitimer"] = [](Engine&, const Args& a) {
+#ifdef _WIN32
+        (void)a;
+        raise("OSError", "signal.getitimer is not available on Windows");
+#else
+        int which = a.size() > 0 && a.is_number(0) ? (int)a.as_int(0) : ITIMER_REAL;
+        struct itimerval ov;
+        if (::getitimer(which, &ov) != 0) raise("OSError", "getitimer: invalid timer");
+        auto get = [](const struct timeval& tv) { return (double)tv.tv_sec + (double)tv.tv_usec / 1e6; };
+        return Ret::lst({Ret::number(get(ov.it_value)), Ret::number(get(ov.it_interval))});
+#endif
+    };
+    T["_sig_constants"] = [](Engine&, const Args&) {
+        std::vector<Ret> out;
+        auto add = [&](const char* n, int v) { out.push_back(Ret::lst({Ret::str(n), Ret::integer(v)})); };
+        add("SIGINT", SIGINT); add("SIGTERM", SIGTERM); add("SIGABRT", SIGABRT);
+        add("SIGFPE", SIGFPE); add("SIGILL", SIGILL); add("SIGSEGV", SIGSEGV);
+#ifdef _WIN32
+        add("SIGBREAK", SIGBREAK);
+        add("CTRL_C_EVENT", 0); add("CTRL_BREAK_EVENT", 1);
+#else
+        add("SIGHUP", SIGHUP); add("SIGQUIT", SIGQUIT); add("SIGTRAP", SIGTRAP); add("SIGKILL", SIGKILL);
+        add("SIGBUS", SIGBUS); add("SIGUSR1", SIGUSR1); add("SIGUSR2", SIGUSR2); add("SIGPIPE", SIGPIPE);
+        add("SIGALRM", SIGALRM); add("SIGCHLD", SIGCHLD); add("SIGCONT", SIGCONT); add("SIGSTOP", SIGSTOP);
+        add("SIGTSTP", SIGTSTP); add("SIGTTIN", SIGTTIN); add("SIGTTOU", SIGTTOU); add("SIGURG", SIGURG);
+        add("SIGXCPU", SIGXCPU); add("SIGXFSZ", SIGXFSZ); add("SIGVTALRM", SIGVTALRM); add("SIGPROF", SIGPROF);
+        add("SIGWINCH", SIGWINCH); add("SIGIO", SIGIO); add("SIGSYS", SIGSYS);
+#  ifdef SIGPWR
+        add("SIGPWR", SIGPWR);
+#  endif
+        add("ITIMER_REAL", ITIMER_REAL); add("ITIMER_VIRTUAL", ITIMER_VIRTUAL); add("ITIMER_PROF", ITIMER_PROF);
+#endif
+        return Ret::lst(std::move(out));
+    };
+    T["_sig_valid"] = [](Engine&, const Args&) {
+        std::vector<Ret> out;
+        for (int s = 1; s < kMaxSig; s++) if (sig_valid(s)) out.push_back(Ret::integer(s));
+        return Ret::lst(std::move(out));
+    };
+    T["_sig_strsignal"] = [](Engine&, const Args& a) {
+        int sig = a.size() > 0 && a.is_number(0) ? (int)a.as_int(0) : 0;
+        if (!sig_valid(sig)) raise("ValueError", "signal number out of range");
+#ifdef _WIN32
+        switch (sig) {
+            case SIGINT: return Ret::str("Interrupt"); case SIGTERM: return Ret::str("Terminated");
+            case SIGABRT: return Ret::str("Aborted"); case SIGFPE: return Ret::str("Floating-point exception");
+            case SIGILL: return Ret::str("Illegal instruction"); case SIGSEGV: return Ret::str("Segmentation fault");
+            case SIGBREAK: return Ret::str("Break");
+        }
+        return Ret::none();
+#else
+        const char* d = ::strsignal(sig);
+        return d ? Ret::str(d) : Ret::none();
+#endif
+    };
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -2756,6 +3482,7 @@ void join_nondaemon_at_exit() {
             try {
                 block_released(self, {&t->joiners}, [t] { return t->done; }, Deadline::never(), t, false);
             } catch (NyError& x) {
+                if (x.type == "__signal__") return;   // Ctrl+C while waiting at exit: stop waiting
                 std::lock_guard<std::mutex> l(RT().m);
                 if (!t->done) {
                     // Blocked for good (a deadlock found while waiting): stop waiting.

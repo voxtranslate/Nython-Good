@@ -151,12 +151,14 @@
         <Unit filename="src/builtins/io.cpp" />
         <Unit filename="src/builtins/lang.cpp" />
         <Unit filename="src/builtins/math.cpp" />
+        <Unit filename="src/builtins/net.cpp" />
         <Unit filename="src/builtins/network.cpp" />
         <Unit filename="src/builtins/os.cpp" />
         <Unit filename="src/builtins/string.cpp" />
         <Unit filename="src/builtins/tensor.cpp" />
         <Unit filename="src/builtins/nytensor.cpp" />
         <Unit filename="src/builtins/threading.cpp" />
+        <Unit filename="src/builtins/tls.cpp" />
         <Unit filename="src/builtins/text.cpp" />
         <Unit filename="src/builtins/os_time.cpp" />
         <Unit filename="src/builtins/os_proc.cpp" />
