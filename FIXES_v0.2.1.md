@@ -5506,3 +5506,31 @@ Full detail in `HANDOFF.md` §0o. New tests: `vm_audit63` (59 checks) and `vm_au
 | A builtin called near the floor of a small coroutine stack crashed | `dispatch_io`/`dispatch_network` (and the pipe drain) held a 64 KB buffer on the stack, reserved on every call of the dispatcher | heap buffers |
 
 Removed: `src/GarbageCollector.cpp`, `include/GarbageCollector.hpp`, `include/GarbageCollectorConfig.hpp` (unused since round 75) and `include/Evaluator.hpp` (never used; the only caller of the old allocator).
+
+## Round 77 — bytes, the network stack, signals, modules, the CLI, Python compatibility
+
+Full detail in `HANDOFF.md` §0p. New tests: `vm_audit65` (bytes, 149 checks), `vm_audit66` (signals, 33), `vm_audit67` (modules/async, 44), `vm_audit68` (sockets, 32), `vm_audit69` (sets, 40), `vm_audit70` (HTTP/WebSockets/TLS/libraries, 79), `vm_audit71` (CLI/argparse/stdio/reflection, 82), `vm_audit72` (Python compatibility, 53 - passes under python3 too). Sweep at the end: 371 runs, 0 not ok.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `b"ab"` was a string; `"\xe9"` was the raw byte 0xE9 | no bytes type; escapes produced bytes | `bytes`/`bytearray` on both engines (`NyBytes.hpp`); escapes follow Python |
+| Ctrl+C killed the process, skipping every finally block | no signal handling | SIGINT raises KeyboardInterrupt (status 130); `signal` module; waits resume after a handler (PEP 475) |
+| A blocking socket call froze every thread; inside a task it froze the loop | the GIL was held; no poller | the GIL is released; tasks park on their loop's poller (colorless I/O) |
+| `http_get` deadlocked against a server thread in the same program | a duplicate implementation in string.cpp held the GIL | one implementation, GIL released, https/IPv6/chunked/redirects |
+| `import m` leaked m's names into the importer and saw the importer's | modules were included | a module runs in a scope of its own; classes named `m.Class`; packages |
+| `import sys` found Linux's `/sys` as a package | any directory counted | a namespace package must hold `.ny` files |
+| The VM's sets were lists deduplicated by repr | no set type | a real set with typed keys on both engines |
+| `nython -c`, `-m`, `-i`, `-` did not exist; `exit()` killed the process on the spot | no CLI; exit called std::exit | the CLI; `exit()`/`sys.exit()` raise SystemExit |
+| `def f(**kw)` saw `f(a=1, b=2)`'s keywords as `{'b': 2, 'a': 1}` on the interpreter | an unordered map | `nyrt::OrderedKw` (PEP 468) |
+| `locals()`, `globals()`, `vars()`, `dir()` returned none | placeholders | implemented on both engines |
+| `deque([1, 2])` was `[]`; `Counter`/`defaultdict`/`OrderedDict` likewise wrong | native stubs | `lib/collections.ny` |
+| `[*a, 3]`, `{**d}`, `x: int = 5`, `f"{x=}"`, `def f(a, /, b)` were syntax errors | not parsed | parsed (lowered to prelude helpers / dropped annotations) |
+| A class made in a function called twice: instances of the first used the second's methods and closures | one class per class statement (classes keyed by name) | each execution makes a new class (`Name#n`, shown as Name); bases resolved through the scope |
+| `obj[1:3]` never reached a user `__getitem__`; `slice()` returned none | slices were `.slice()` calls | a prelude `slice`; the dunders receive it; slice objects index builtins |
+| `eval`, `exec`, `compile` did not exist | — | both engines, with namespaces |
+| `2j` read none; `print(0j)` was a syntax error | no complex type; the lexer's `0j` path swallowed the next character | a prelude `complex`; `0j` lexed by the decimal path |
+| `o.x = 1` never reached a user `__setattr__`; `threading.local()` raised NameError | not dispatched; it called natives that never existed | `__setattr__`/`__delattr__` dispatched (cached per class); `threading.local` built on them |
+| VM: `super().missing()` returned none | silent | falls back to `object`, else AttributeError |
+| VM: `self.__class__()` raised AttributeError | the method-call path did not know it | constructs the object's class |
+| `f.__doc__` raised AttributeError; `help()` did nothing | docstrings not kept | the parser records them; `__doc__` on both engines; `help()` prints them |
+| `--profile` listed the prelude's stream objects | profiling started before the prelude | the table is cleared after it |

@@ -428,19 +428,30 @@ class Barrier:
             self._cond.notify_all()
 
 class local:
-    # Attributes per thread: setattr/getattr on a local() object are the
-    # calling thread's own.
+    # Attributes per thread (round 77: it called natives that never
+    # existed): each thread sees only what it set itself.
     def __init__(self):
-        self.__dict__["_key"] = "tlocal" + str(thread_local_new_key())
+        _ny_setattr_raw(self, "_ny_tl", {})
+
+    def _mine(self, make):
+        var tid = get_ident()
+        var d = self._ny_tl.get(tid)
+        if d == none and make:
+            d = {}
+            self._ny_tl[tid] = d
+        return d
 
     def __getattr__(self, name):
-        var k = self.__dict__["_key"] + ":" + name
-        if not thread_local_has(k):
+        var d = self._mine(false)
+        if d == none or not (name in d):
             raise AttributeError("'_thread._local' object has no attribute '" + name + "'")
-        return thread_local_get(k, none)
+        return d[name]
 
     def __setattr__(self, name, value):
-        thread_local_set(self.__dict__["_key"] + ":" + name, value)
+        self._mine(true)[name] = value
 
     def __delattr__(self, name):
-        thread_local_del(self.__dict__["_key"] + ":" + name)
+        var d = self._mine(false)
+        if d == none or not (name in d):
+            raise AttributeError(name)
+        del d[name]

@@ -51,6 +51,13 @@ nython/
 │   ├── ide_selection.ny      ← multi-cursor selection model
 │   ├── ide_inspector.ny      ← universal value inspector
 │   ├── stdlib.ny             ← standard library
+│   ├── argparse.ny, collections.ny, asyncio.ny, socket.ny, ssl.ny,
+│   │   select.ny, selectors.ny, signal.ny, websocket.ny, threading.ny,
+│   │   socketserver.ny, hashlib.ny, hmac.ny, base64.ny, secrets.ny
+│   │                         ← Python's modules (round 77; `# nython: module`
+│   │                            files run in a scope of their own)
+│   ├── http/, urllib/        ← packages: http.client/server/cookiejar,
+│   │                            urllib.request/parse/error
 │   ├── nytorch.ny            ← ML framework entry point
 │   ├── nytorch/              ← 17 nytorch sub-modules
 │   └── ...                   ← network.ny, thread.ny, os.ny, etc.
@@ -339,6 +346,14 @@ These were aligned to match how the IDE calls them:
 | vm_audit57 | 212 | strict reads (AttributeError/KeyError), getattr/hasattr/setattr/delattr/get/setdefault, `?.` `?[` `??` `??=`, `undefined`, var/let/const/global/nonlocal scope rules in every context, suffix literals (round 75) |
 | vm_audit63 | 59 | round 76: const/nonlocal/global checks (static, SyntaxError), lambda closures and defaults, print's argument order, error columns, lazy iterators |
 | vm_audit64 | 26 | round 76: objects used as dict keys freed (cycles through keys too), suspended-generator cycles collected with their finally blocks run, bound builtin members freed |
+| vm_audit65 | 149 | round 77: bytes/bytearray (literals, escapes, codecs, methods, bytearray mutation), builtin types as namespaces (same results under python3) |
+| vm_audit66 | 33 | round 77: signals - handlers, SIGINT as KeyboardInterrupt, interrupted waits resuming (PEP 475), signal channels |
+| vm_audit67 | 44 | round 77: modules with their own scope, from-imports, packages, async with/for/generators, asyncio, VM closures per call |
+| vm_audit68 | 32 | round 77: sockets - TCP/UDP/IPv6/AF_UNIX, timeouts, makefile, select/selectors, errors, colorless I/O in tasks |
+| vm_audit69 | 40 | round 77: sets and frozensets - typed keys, API, operators, subset comparisons |
+| vm_audit70 | 79 | round 77: http.client/server, urllib, cookies, WebSockets (RFC 6455), TLS with a throwaway CA, network/webserver/sockets/clientserver libraries, math, hashlib |
+| vm_audit71 | 82 | round 77: the command line on each engine (-c/-m/-i/-, sys.argv, SystemExit statuses, the prompt), argparse against python3's output, sys.stdin/stdout/stderr, print(file=), locals/globals/vars/dir, kwargs order |
+| vm_audit72 | 53 | round 77: Python compatibility, passes under python3 too - starred displays, annotations, f"{x=}", slice objects, eval/exec/compile, complex, per-execution classes, collections, object/issubclass, __setattr__/__delattr__, threading.local, docstrings |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -898,6 +913,39 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   builtin members are heap objects (`nyheap::BMember`); the old
   `GarbageCollector` and the unused `Evaluator.hpp` are removed;
   `mem_rss_kb` works on Windows.
+
+## Round 77: bytes, the network stack, the CLI, Python compatibility (see `HANDOFF.md` §0p)
+
+- **bytes/bytearray** (`include/NyBytes.hpp`), Python string escapes,
+  builtin types as namespaces (`str.upper(s)`, `int.from_bytes`).
+- **Signals**: `signal` module, SIGINT -> KeyboardInterrupt (status 130),
+  handlers at safe points and inside blocking waits (PEP 475).
+- **Network**: one non-blocking socket table (`src/builtins/net.cpp`) behind
+  `lib/socket.ny`/`select`/`selectors`; TLS loaded at run time
+  (`src/builtins/tls.cpp`, `lib/ssl.ny`); `lib/http/` (client, server,
+  cookiejar), `lib/urllib/`, `lib/websocket.ny` (RFC 6455), hashlib/hmac/
+  base64/secrets; network.ny, webserver.ny, sockets.ny, clientserver.ny are
+  real. Blocking calls release the GIL; in async tasks they park the task
+  (colorless I/O). `nython -m http.server` serves a directory.
+- **Async**: `async with/for`, async generators, `lib/asyncio.ny`.
+- **Modules**: `import name` runs a `.ny` file in its own scope (classes
+  named `m.Class`), `from m import ...`, packages, NYTHONPATH. **Sets** are
+  a real type; **math** is Python's module on both engines.
+- **CLI** (`src/main.cpp`): `-c/-m/-i/-q/-u/-E/-`, `--vm` for every form,
+  `--check`; the prompt shows reprs and keeps `_`; **SystemExit is real**
+  (`exit()` raises it). `sys.stdin/stdout/stderr`; `print(*xs, file=,
+  flush=)`; `lib/argparse.ny` is Python's algorithm with Python's help
+  layout.
+- **Python compatibility**: each execution of a class statement makes a
+  new class (re-runs are `Name#n`, shown as Name); `[*a]`, `{**d}`,
+  `[x, *y] = s`; annotations; `f"{x=}"`; slice objects reaching
+  `__getitem__`; `eval`/`exec`/`compile`; complex numbers and `2j`;
+  `object`; `__setattr__`/`__delattr__`; docstrings and `help()`;
+  `locals/globals/vars/dir`; `**kwargs` in call order; `lib/collections.ny`
+  (deque, Counter, defaultdict, OrderedDict, namedtuple, ChainMap).
+- **Gotchas**: `__dict__` is a copy (use `object.__setattr__`); coroutine
+  objects are task handles (ints); a prelude name (`slice`, `object`,
+  `complex`, `help`) shadows the old placeholder builtin of that name.
 
 ## Transcripts
 

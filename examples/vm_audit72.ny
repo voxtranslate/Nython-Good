@@ -17,6 +17,9 @@
 #   collections  deque, Counter, defaultdict, OrderedDict, namedtuple,
 #                ChainMap, dict(mapping)
 #   builtins     object, issubclass(bool, int), kwargs order, vars/dir
+#   docstrings   __doc__ of functions, methods, classes and instances
+#   hooks        __setattr__ / __delattr__ (object.__setattr__ and
+#                super().__setattr__ store), frozen objects, threading.local
 #
 # Must pass on both engines (and python3):
 #     ./build/nython-cli examples/vm_audit72.ny
@@ -211,6 +214,66 @@ class Thing:
     def method(self):
         return 1
 check("vars/dir", [vars(Thing()), [n for n in dir(Thing()) if not n.startswith("__")]], [{"a": 1}, ["a", "kind", "method"]])
+
+# ── attribute hooks and thread-local data ──────────────────────────────────
+class Tracked:
+    def __init__(self):
+        object.__setattr__(self, "log", [])
+        self.x = 1
+    def __setattr__(self, k, v):
+        self.log.append(k)
+        super().__setattr__(k, v * 2 if isinstance(v, int) else v)
+    def __delattr__(self, k):
+        self.log.append("del " + k)
+        object.__delattr__(self, k)
+tr = Tracked()
+tr.y = 5
+ty = tr.y
+del tr.y
+check("__setattr__ / __delattr__", [tr.x, ty, tr.log, hasattr(tr, "y")], [2, 10, ["x", "y", "del y"], False])
+
+class Frozen:
+    def __init__(self, v):
+        object.__setattr__(self, "v", v)
+    def __setattr__(self, k, v):
+        raise AttributeError("frozen")
+fz = Frozen(3)
+try:
+    fz.v = 4
+    frozen_result = "assigned"
+except AttributeError:
+    frozen_result = "refused"
+check("frozen object", [frozen_result, fz.v], ["refused", 3])
+
+import threading
+tl = threading.local()
+tl.v = "main"
+tl_out = []
+def tl_work(n):
+    tl.v = "t" + str(n)
+    tl_out.append(tl.v)
+tl_threads = [threading.Thread(target=tl_work, args=(i,)) for i in range(3)]
+for th in tl_threads:
+    th.start()
+for th in tl_threads:
+    th.join()
+check("threading.local", [sorted(tl_out), tl.v, hasattr(tl, "v")], [["t0", "t1", "t2"], "main", True])
+
+# ── docstrings ───────────────────────────────────────────────────────────────
+def documented(a, b=2):
+    """Add things.
+
+    More text."""
+    return a + b
+class DocClass:
+    "A class."
+    def m(self):
+        "A method."
+        pass
+    def bare(self):
+        return 1
+check("__doc__", [documented.__doc__, DocClass.__doc__, DocClass.m.__doc__, DocClass().m.__doc__, DocClass().__doc__, DocClass.bare.__doc__],
+      ["Add things.\n\n    More text.", "A class.", "A method.", "A method.", "A class.", None])
 
 for r in results:
     if r[1]:

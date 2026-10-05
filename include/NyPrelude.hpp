@@ -327,9 +327,17 @@ class _NyCode:
 
 class object:
     # the root of the class tree (round 77; `object` was undefined):
-    # object(), class C(object), object.__init__(self) in a super() chain
+    # object(), class C(object), object.__init__(self) in a super() chain,
+    # and the plain attribute store a __setattr__ hands on to
+    # (object.__setattr__(self, k, v) / super().__setattr__(k, v))
     def __init__(self, *args, **kwargs):
         pass
+
+    def __setattr__(self, name, value):
+        _ny_setattr_raw(self, name, value)
+
+    def __delattr__(self, name):
+        _ny_delattr_raw(self, name)
 
 def _ny_complex_part(x):
     # a component as Python shows it: 2.0 -> 2, 1.5 -> 1.5
@@ -501,6 +509,69 @@ class complex:
 
     def __str__(self):
         return self.__repr__()
+
+def _ny_doc_lines(doc, indent):
+    if doc is none:
+        return []
+    var lines = doc.split("\n")
+    # the docstring's own indentation, as inspect.cleandoc removes it
+    var margin = none
+    for ln in lines[1:]:
+        var st = ln.lstrip()
+        if st != "":
+            var m = len(ln) - len(st)
+            if margin is none or m < margin:
+                margin = m
+    var out = [indent + lines[0].strip()]
+    for ln in lines[1:]:
+        out.append(((indent + ln[margin:]) if margin is not none else indent + ln.strip()).rstrip())
+    while len(out) > 0 and out[len(out) - 1].strip() == "":
+        out.pop()
+    return out
+
+def help(obj=none):
+    # help(x): what x is, its docstring, and for a class its methods' (round
+    # 77; help() did nothing)
+    if obj is none:
+        print("Type help(object) for help about object; dir(object) lists its names.")
+        return none
+    var kind = type(obj)
+    var name = getattr(obj, "__name__", none)
+    if name is none:
+        name = type(obj)
+    var out = []
+    if kind == "class":
+        out.append("Help on class " + name + ":")
+        out.append("")
+        out.append("class " + name)
+        for ln in _ny_doc_lines(getattr(obj, "__doc__", none), " |  "):
+            out.append(ln)
+        var methods = [m for m in dir(obj) if not m.startswith("_") or m == "__init__"]
+        if len(methods) > 0:
+            out.append(" |")
+            out.append(" |  Methods defined here:")
+        for m in methods:
+            var member = getattr(obj, m, none)
+            if callable(member):
+                out.append(" |")
+                out.append(" |  " + m + "(...)")
+                for ln in _ny_doc_lines(getattr(member, "__doc__", none), " |      "):
+                    out.append(ln)
+    elif kind == "function" or kind == "builtin":
+        out.append("Help on " + ("built-in function " if kind == "builtin" else "function ") + name + ":")
+        out.append("")
+        out.append(name + "(...)")
+        for ln in _ny_doc_lines(getattr(obj, "__doc__", none), "    "):
+            out.append(ln)
+    else:
+        var cls_doc = getattr(obj, "__doc__", none)
+        out.append("Help on " + type(obj) + " object:")
+        out.append("")
+        for ln in _ny_doc_lines(cls_doc, "    "):
+            out.append(ln)
+        out.append("    " + ", ".join([n for n in dir(obj) if not n.startswith("_")]))
+    print("\n".join(out))
+    return none
 
 def exit(code=none):
     # Python's: SystemExit, so finally blocks run and `except SystemExit`

@@ -19,6 +19,20 @@ using namespace nython::node;
 
 namespace nython::parser {
 
+// A body's docstring: its first statement, when that is a string literal.
+static bool docstringOf(const node_ptr& body, std::string& out){
+    if(!body) return false;
+    node_ptr first = body;
+    for(int d = 0; d < 3 && first && first->type() != NodeType::STRING; d++){
+        auto st = first->statements();
+        if(st.empty() || first->type() == NodeType::CALL) return false;
+        first = st[0];
+    }
+    if(!first || first->type() != NodeType::STRING) return false;
+    out = first->token().value;
+    return true;
+}
+
 // A `*x` element of a display (Parser::starElem).
 static bool isStarElem(const node_ptr& n){
     return n && n->type() == NodeType::UNARY && static_cast<UnaryNode*>(n.get())->op == "*";
@@ -2198,6 +2212,10 @@ node_ptr Parser::functionDecl(bool is_method){
     outer_decls_.pop_back();
     global_decls_.pop_back();
     auto fn = make_node<FunctionNode>(tok, name, body, is_method);
+    {
+        auto* fnp = static_cast<FunctionNode*>(fn.get());
+        fnp->has_doc = docstringOf(body, fnp->doc);
+    }
     for(auto& p : params) fn->add(p);
     static_cast<FunctionNode*>(fn.get())->defaults = std::move(param_defaults_);
     if(is_async) return async_def_desugar(tok, fn, is_gen);
@@ -2348,6 +2366,10 @@ node_ptr Parser::classDecl(){
     node_ptr body = blockOrStmt();
     auto cls = make_node<ClassNode>(tok, name, body);
     std::static_pointer_cast<ClassNode>(cls)->bases = bases;
+    {
+        auto* cp = static_cast<ClassNode*>(cls.get());
+        cp->has_doc = docstringOf(body, cp->doc);
+    }
     return cls;
 }
 

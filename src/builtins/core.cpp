@@ -556,6 +556,16 @@ Value dispatch_core(NythonExecutor& E,
             }
             return NONE_VALUE;
         }
+        if (name == "_ny_setattr_raw" && args.size() >= 3) {
+            NythonExecutor::RawAttr raw;
+            E.setAttr(args[0], E.getStringValue(args[1]), args[2]);
+            return NONE_VALUE;
+        }
+        if (name == "_ny_delattr_raw" && args.size() >= 2) {
+            NythonExecutor::RawAttr raw;
+            E.delAttrValue(args[0], E.getStringValue(args[1]));
+            return NONE_VALUE;
+        }
         if (name == "eval" || name == "exec") return E.evalExecBuiltin(name == "exec", args, ctx);
         if (name == "compile") return E.compileBuiltin(args, ctx);
         if (name == "locals") return E.reflectLocals(ctx);

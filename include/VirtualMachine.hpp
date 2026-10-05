@@ -421,6 +421,8 @@ struct ExceptionEntry {
 
 struct VMCode {
     std::string              name;
+    std::string              doc;           // docstring (__doc__, round 77)
+    bool                     has_doc = false;
     std::string              file;          // source file (diagnostics)
     std::string              parent_class;
     std::vector<std::string> bases;         // every base class, in order (parent_class is bases[0])
@@ -1789,6 +1791,7 @@ private:
     void visit_func(std::shared_ptr<nython::node::FunctionNode> fn) {
         int l=ln(fn);
         push_code(fn->name);
+        C().doc=fn->doc; C().has_doc=fn->has_doc;
         C().is_method=!fn->params.empty()&&fn->params[0]->value()=="self";
         int param_idx=0;
         for(int i=0;i<(int)fn->params.size();i++){
@@ -1886,6 +1889,7 @@ private:
         int l=ln(cn);
         push_code(cn->name,true);
         code_->is_class=true;  // mark this sub_code as a class
+        code_->doc=cn->doc; code_->has_doc=cn->has_doc;
         for(auto& b:cn->bases) code_->bases.push_back(b->token().value);
         if(!code_->bases.empty()) code_->parent_class=code_->bases[0];
         if(cn->body) for(auto& s:cn->body->statements()) visit_stmt(s);
@@ -4810,6 +4814,8 @@ private:
                 if(!sub->bases.empty()) sub->parent_class=sub->bases[0];
                 class_reg_[sub->name]=sub;
                 mro_cache_.clear();
+                attr_hook_cache_[0].clear();
+                attr_hook_cache_[1].clear();
                 has_del_cache_.clear();
                 class_vars_[sub->name]=run_class_body(sub, fr);
                 if(is_exception_class(sub->name)) vm_exc_classes().insert(sub->name);
@@ -6147,6 +6153,14 @@ private:
     // getters and __getattr__ run, and what they raise propagates. `bind`
     // false: a builtin's method is not made into a bound value.
     bool lookup_attr(const VMVal& obj, const std::string& attr, VMVal& out, bool bind=true) {
+        // a bound method's __doc__ / __name__ / __func__ / __self__ are its function's
+        if(obj.type==VMType::MAP&&obj.class_name=="__bound_method__"&&obj.map&&(attr=="__doc__"||attr=="__name__"||attr=="__func__"||attr=="__self__"||attr=="__qualname__")){
+            auto fit=obj.map->find("__fn__");
+            if(attr=="__self__"){ auto sit=obj.map->find("__self__"); out=sit!=obj.map->end()?sit->second:VMVal::make_none(); return true; }
+            if(fit==obj.map->end()) return false;
+            if(attr=="__func__"){ out=fit->second; return true; }
+            return lookup_attr(fit->second, attr=="__qualname__"?std::string("__name__"):attr, out, bind);
+        }
         // Instance / map fields — check for property descriptors
         if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map){
             auto it=obj.map->find(attr);
@@ -6171,6 +6185,11 @@ private:
             VMVal m;
             if(class_lookup(obj.class_name, attr, m)){ out=bind_member(m, obj, obj.class_name); return true; }
             if(attr=="__class__"){ out=class_value(obj.class_name); return true; }
+            if(attr=="__doc__"){
+                auto cr=class_reg_.find(obj.class_name);
+                out=cr!=class_reg_.end()&&cr->second&&cr->second->has_doc?VMVal::make_str(cr->second->doc):VMVal::make_none();
+                return true;
+            }
             if(attr=="__dict__"){
                 VMVal d=VMVal::make_map();
                 if(obj.map) for(auto& kv:*obj.map) (*d.map)[kv.first]=kv.second;
@@ -6199,6 +6218,7 @@ private:
                 if(fa!=func_attrs_.end()){ auto it=fa->second.find(attr); if(it!=fa->second.end()){ out=it->second; return true; } }
             }
             if(attr=="__name__"){ out=VMVal::make_str(obj.code?obj.code->name:""); return true; }
+            if(attr=="__doc__"){ out=obj.code&&obj.code->has_doc?VMVal::make_str(obj.code->doc):VMVal::make_none(); return true; }
             return false;
         }
         case VMType::CLASS: {
@@ -6219,6 +6239,11 @@ private:
             if(attr=="__module__"){
                 size_t dot=cname.rfind('.');
                 out=VMVal::make_str(dot==std::string::npos?std::string("__main__"):cname.substr(0,dot)); return true;
+            }
+            if(attr=="__doc__"){
+                auto cr=class_reg_.find(cname);
+                out=cr!=class_reg_.end()&&cr->second&&cr->second->has_doc?VMVal::make_str(cr->second->doc):VMVal::make_none();
+                return true;
             }
             if(attr=="__mro__"){
                 std::vector<VMVal> r;
@@ -6382,7 +6407,33 @@ private:
     // del obj.name / delattr(obj, name): an instance's field, a class
     // attribute or a namespace/dict entry is removed; anything else is an
     // AttributeError (it was ignored).
+    // __setattr__ / __delattr__ (round 77, as NythonExecutor::setAttr): an
+    // instance whose class defines one (not object's) runs it; object's own
+    // store directly through _ny_setattr_raw / _ny_delattr_raw. Cached per
+    // class until the next class statement.
+    std::unordered_map<std::string, uint8_t> attr_hook_cache_[2];
+    static inline thread_local int raw_attr_depth_=0;
+    bool instance_attr_hook(const VMVal& obj, int which, VMVal& m) {
+        if(raw_attr_depth_>0||obj.type!=VMType::INSTANCE) return false;
+        auto& c=attr_hook_cache_[which];
+        auto it=c.find(obj.class_name);
+        if(it!=c.end()&&it->second==2) return false;
+        std::string owner;
+        bool has=class_lookup(obj.class_name, which?"__delattr__":"__setattr__", m, &owner)
+                 && nyrt::shown_class_name(owner)!="object";
+        c[obj.class_name]=has?1:2;
+        return has;
+    }
+    struct RawAttr { RawAttr(){ raw_attr_depth_++; } ~RawAttr(){ raw_attr_depth_--; } RawAttr(const RawAttr&)=delete; RawAttr& operator=(const RawAttr&)=delete; };
     void del_attr(const VMVal& obj, const std::string& attr) {
+        {
+            VMVal m;
+            if(instance_attr_hook(obj,1,m)){
+                std::vector<VMVal> a{VMVal::make_str(attr)};
+                invoke_method(m, obj, a, obj.class_name);
+                return;
+            }
+        }
         if((obj.type==VMType::MAP||obj.type==VMType::INSTANCE)&&obj.map&&obj.map->erase(attr)) return;
         if(obj.type==VMType::CLASS){
             std::string cname = obj.class_name.empty() ? obj.s : obj.class_name;
@@ -6396,6 +6447,14 @@ private:
         throw_exception(make_exception("AttributeError",{VMVal::make_str(attr_error_text(obj,attr))}));
     }
     void set_attr(VMVal& obj, const std::string& attr, VMVal val) {
+        {
+            VMVal m;
+            if(instance_attr_hook(obj,0,m)){
+                std::vector<VMVal> a{VMVal::make_str(attr), val};
+                invoke_method(m, obj, a, obj.class_name);
+                return;
+            }
+        }
         if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map){
             auto it=obj.map->find(attr);
             if(it!=obj.map->end()){
@@ -6824,7 +6883,11 @@ private:
                 }
                 return VMVal::make_none();
             }
-            return VMVal::make_none();
+            // past the last base is object, every class's implicit root
+            // (super().__setattr__(k, v) ...); otherwise AttributeError, as
+            // Python (it returned none)
+            if(class_lookup("object", method, m)) return invoke_method(m, self_v, args, "object", kwargs);
+            throw_exception(make_exception("AttributeError",{VMVal::make_str("'super' object has no attribute '"+method+"'")}));
         }
         if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map){
             auto it=obj.map->find(method);
@@ -8097,6 +8160,12 @@ private:
             return VMVal::make_list(std::move(r));});
         // locals() / globals() / vars() / dir() (round 77; they read none):
         // as on the interpreter (NythonExecutor reflect*).
+        globals_["_ny_setattr_raw"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.size()>=3){ RawAttr raw; VMVal o=a[0]; set_attr(o,a[1].to_string(),a[2]); }
+            return VMVal::make_none(); });
+        globals_["_ny_delattr_raw"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.size()>=2){ RawAttr raw; del_attr(a[0],a[1].to_string()); }
+            return VMVal::make_none(); });
         globals_["eval"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_eval_exec(false,a); });
         globals_["exec"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_eval_exec(true,a); });
         globals_["compile"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_compile(a); });

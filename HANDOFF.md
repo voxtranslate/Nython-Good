@@ -3,7 +3,12 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 76 — **§0o** (the "Not done" lists of rounds 74-75
+Last updated: round 77 — **§0p** (bytes; signals; sockets, TLS, HTTP,
+urllib, WebSockets and the network libraries made real; asyncio and the
+async protocols; modules with their own scope and packages; sets; the
+command line and argparse; per-execution classes, slices, eval/exec,
+complex numbers, `__setattr__`, docstrings, collections; both engines).
+Round 76 — **§0o** (the "Not done" lists of rounds 74-75
 closed: static scope checks, lambda closures, error columns, async tasks
 as coroutines, rwlock succession, objects used as dict keys and suspended
 generators collected; both engines). Round 75 — **§0n** (real SDL3, HiDPI, every test in the
@@ -25,6 +30,160 @@ multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
 
 ---
+
+## 0p. Round 77 — bytes, the network stack, signals, modules, the CLI, Python compatibility
+
+Everything here works on both engines; the tests named with each part pin
+it (all in the sweep: 371 runs, 0 not ok at the end of the round). Many
+suites are written in the subset Nython and Python share and pass under
+python3 too (vm_audit65, 72) - their expected values are CPython's.
+
+### bytes and strings (`include/NyBytes.hpp`; vm_audit65, 149 checks)
+- A real `bytes` and a mutable `bytearray`: literals (`b".."`, `rb".."`),
+  indexing to ints, slicing, iteration, comparison, hashing and dict keys,
+  `+ * in`, item/slice assignment and `del` on bytearray, `bytes()` /
+  `bytearray()` constructors, `str.encode` / `bytes.decode` (utf-8, ascii,
+  latin-1, utf-16/32, the `errors=` handlers). One method library serves
+  both engines; the VM bridge carries bytes and bytearray changes both ways.
+- Builtin types read as namespaces: `str.upper(s)`, `bytes.fromhex`,
+  `int.from_bytes`, `dict.fromkeys`; `int.to_bytes`/`bit_length`/...
+- String escapes follow Python (`"\xe9"` is U+00E9, octal escapes, `"\0"`,
+  an unknown escape keeps its backslash).
+
+### Signals (`src/NyConc.cpp`; vm_audit66)
+`signal` module; SIGINT raises KeyboardInterrupt (exit status 130);
+handlers run on the main thread at statement boundaries and inside blocking
+waits, which then resume with their remaining time (PEP 475); signal
+channels (Go's `signal.Notify`); `input()` raises EOFError /
+KeyboardInterrupt.
+
+### Sockets, TLS, HTTP, WebSockets (vm_audit68, vm_audit70)
+- `src/builtins/net.cpp`: one non-blocking socket table behind
+  `lib/socket.ny` (TCP/UDP/IPv6/AF_UNIX, timeouts, `makefile`, Python's
+  errors), `lib/select.ny`, `lib/selectors.ny`. Blocking calls release the
+  GIL; inside an async task they park the task on its loop's poller
+  ("colorless" I/O - the same `sock.recv()` works in both worlds).
+- `src/builtins/tls.cpp` loads OpenSSL at run time (no build dependency);
+  `lib/ssl.ny` is Python's module, verification and host-name checks on by
+  default, SNI, ALPN, `getpeercert`.
+- `lib/http/` (client: keep-alive, chunked, 100-continue, CONNECT, HTTPS;
+  server: Base/SimpleHTTPRequestHandler, ThreadingHTTPServer; cookiejar),
+  `lib/urllib/` (request with the handler chain - proxies from the
+  environment, redirects, basic auth, cookies, file:, data: - error, parse),
+  `lib/websocket.ny` (RFC 6455 client and server, ws/wss, fragmentation,
+  the close handshake, keepalive driven by an RFC 6298 RTT estimator),
+  `hashlib`/`hmac`/`base64`/`binascii`/`secrets` over a native digest
+  library, `threading`, `socketserver`. `nython -m http.server` serves a
+  directory.
+- The legacy libraries are real now: `network.ny` (HttpClient with
+  retries and Retry-After, RestClient, EventSource, HttpCache, signed
+  webhooks), `webserver.ny` (routes with parameters, middleware, sessions,
+  signed tokens, static files with 304, templates, WsServer),
+  `sockets.ny`, `clientserver.ny` (JSON-RPC 2.0, MQTT topic wildcards,
+  phi-accrual failure detection, smooth weighted round-robin).
+- `http_get`/`http_post`/`http_request` speak https, IPv6, chunked bodies
+  and redirects, with the GIL released (a duplicate in string.cpp held it
+  and deadlocked against server threads).
+
+### Async and asyncio (vm_audit67)
+`async with`, `async for`, async generators and comprehensions,
+StopAsyncIteration, `aiter`/`anext`, `__await__`; cancellation propagates
+into awaited tasks; `lib/asyncio.ny`: tasks, gather/wait/wait_for/
+as_completed/shield/timeout/TaskGroup, queues, sync primitives, futures,
+to_thread, Runner, streams (with `ssl=`).
+
+### Modules (vm_audit67)
+`import name` of a `.ny` file runs it in a scope of its own (its names no
+longer leak into the importer); `from m import a, b` / `*` (`__all__`);
+packages and dotted imports (`lib/http/__init__.ny`); a module's classes
+are named `m.Class` so same-named classes stay distinct; NYTHONPATH and
+the library beside the interpreter are searched. A namespace package must
+hold `.ny` files (`import sys` used to find Linux's `/sys`). Quoted imports
+still include the file.
+
+### Sets and math (vm_audit69, vm_audit70)
+Sets are a real type with a typed-key index (`1 == 1.0 == true`, O(1)
+membership), `frozenset`, the full API and operators; `dict | dict`.
+`math` is Python's whole module on both engines (`src/builtins/pymath.cpp`).
+
+### The command line (`src/main.cpp`; vm_audit71, 82 checks)
+- `nython [options] [-c cmd | -m mod | file | -] [args]`: `-i -q -u -E -V
+  -h`, bundles (`-iq`), `--vm`/`--interp` for every way of giving a
+  program, `--check`, `--tokenize/--ast/--disasm`, `--profile`, `--trace`;
+  `sys.argv` as Python sets it; unknown options exit 2.
+- The prompt (`interactive_loop`) shows an expression's repr and keeps `_`;
+  errors print as Python's last traceback line on both engines; with piped
+  input `-i` stays interactive; NYTHONSTARTUP runs first.
+- **SystemExit is real**: `exit()`/`quit()`/`sys.exit()` raise it, finally
+  blocks run, `except SystemExit` catches it, the process ends with its
+  code (`exit("msg")` prints msg, status 1); at the prompt it ends the
+  process with that status.
+- `sys.stdin/stdout/stderr` objects (prelude `_NyStdStream`) over the same
+  streams as print; `print(*xs, sep=, end=, file=, flush=)` (the extended
+  forms are lowered to the prelude's `_ny_print`); `os.get_terminal_size`.
+- `lib/argparse.ny` is Python's algorithm, not an imitation: arguments are
+  classified as O/A/- and positionals consume chunks against their nargs
+  patterns (a backtracking matcher over the same patterns argparse builds
+  regexes from), `-qn3` explicit-argument chaining, abbreviations,
+  ambiguity errors, negative numbers, REMAINDER/PARSER, Action classes
+  whose `__call__` a user subclass overrides, subcommands, mutually
+  exclusive groups, parents, fromfile, intermixed parsing. HelpFormatter
+  lays out usage and help byte for byte as Python's (checked against
+  python3's output). Two deliberate differences: unknown options and
+  mistyped choices get a "did you mean" (the runtime's fuzzy matcher), and
+  positionals that matched nothing just before an option wait for later
+  values (Python 3.13's rule; 3.11 left `cmd --foo x a b` unparsed).
+
+### Python compatibility (vm_audit72, 53 checks, passes under python3)
+- **Each execution of a class statement makes a new class.** A class
+  statement run again - a factory called twice, a loop - rebound the one
+  class, so instances of the first saw the second's methods, class
+  attributes and closures. A re-run registers a copy as `Name#n` (classes
+  are keyed by name on both engines; `nyrt::shown_class_name` strips the
+  suffix wherever a name is shown). Bases are resolved through the scope
+  (the class bound to that name), so a factory's `Derived(Base)` gets that
+  call's `Base`; on the VM a copy owns copies of its method code so
+  `super()` starts from it.
+- **Displays and unpacking**: `[*a, b]`, `(*a, b)`, `{*a}`, `{**d, k: v}`
+  (lowered to the prelude's `_ny_list_cat` / `_ny_dict_merge`), `[x, *y] =
+  seq` and `(a, b) = ...` targets.
+- **Annotations**: `x: int = 5`, `self.x: T = v`, `x: T` alone, parameter
+  annotations, `-> T`, `/` and `*` markers, trailing commas (parsed and
+  dropped; positional-only is not enforced). `f"{expr=}"`.
+- **slice objects**: the prelude's `slice`; `obj[i:j:k]` hands an
+  object's `__getitem__/__setitem__/__delitem__` a slice; a slice object
+  indexes lists, strings, tuples and bytes.
+- **eval / exec / compile**, with or without namespace dicts (on the VM a
+  namespace runs as a module scope, so functions defined inside see it).
+- **complex**: `2j` literals (the lexer's `0j` path swallowed the next
+  character), a prelude `complex` class with Python's arithmetic, powers,
+  parsing and repr. `object` exists; `issubclass(bool, int)`.
+- **`__setattr__` / `__delattr__`** run for assignments and `del`;
+  `object.__setattr__(self, k, v)` and `super().__setattr__(k, v)` store
+  directly (`_ny_setattr_raw`); a failed `super()` lookup falls back to
+  `object` and otherwise raises AttributeError (the VM returned none).
+  `threading.local` is built on it (it called natives that never existed).
+- **Docstrings**: `__doc__` of functions, methods, classes and instances
+  (the parser records them); `help(x)` prints them.
+- **Reflection**: `locals()`, `globals()`, `vars()`, `dir()` (all four
+  returned none); `**kwargs` keep the call order on the interpreter (PEP
+  468: `nyrt::OrderedKw` replaced the unordered map); `dict(mapping)` uses
+  `keys()`.
+- **`lib/collections.ny`**: deque (a ring buffer, maxlen, rotate),
+  Counter, defaultdict, OrderedDict, namedtuple, ChainMap, UserDict,
+  UserList - the native names returned an empty list whatever they were
+  given. `import collections` loads it; the bare stub names remain for old
+  programs that never import it.
+
+### Not done / known differences
+- `__dict__` is a copy on both engines: `self.__dict__[k] = v` does not
+  set an attribute (use `object.__setattr__`).
+- Coroutine objects are task handles (ints): `type(co())` is int, not
+  coroutine; awaiting and asyncio work.
+- `__getattribute__` is not dispatched; positional-only parameters are not
+  enforced; a class made by a re-run statement shows its plain name but
+  `type(x) == type(y)` compares names.
+- Video/audio builtins remain stubs (no codec library).
 
 ## 0o. Round 76 — the "Not done" lists closed
 

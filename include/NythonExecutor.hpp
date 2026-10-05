@@ -529,7 +529,7 @@ public:   // NythonExecutor is a struct: members default to public
             "isinstance","issubclass","id","hash","hex","oct","bin",
             "chr","ord","repr","format","open","exit","quit",
             "pow","divmod","input","dict","display","show","is_int","is_float","is_string","is_list","is_none","is_bool","to_int","to_float","to_str","clamp","lerp","map_range","repeat_str","repeat","flatten","flat","shell","system","ls","cat","pwd","mkdir","write","exists","env","all","any","complex","slice","super","property",
-            "staticmethod","classmethod","callable","dir","vars","globals","locals","eval","exec","compile",
+            "staticmethod","classmethod","callable","dir","vars","globals","locals","eval","exec","compile","_ny_setattr_raw","_ny_delattr_raw",
             "iter","next","help","Set","Counter","OrderedDict","deque","defaultdict","assert",
             "islice","take",   // lazy iteration (src/NyGen.cpp), both engines
             "sqrt","sin","cos","tan","log","floor","ceil",
@@ -2126,7 +2126,35 @@ public:   // NythonExecutor is a struct: members default to public
     }
 
     // ─── ATTRIBUTE / ITEM STORES ────────────────────────────────────────
+    // __setattr__ / __delattr__ (round 77): an assignment to (or del of)
+    // an attribute of an object whose class defines one runs it. object's
+    // own (the prelude's) store directly, through _ny_setattr_raw /
+    // _ny_delattr_raw, which also back super().__setattr__(name, value).
+    // Whether a class has such a hook is cached until the next class
+    // statement.
+    std::unordered_map<const Node*, uint8_t> attr_hook_cache_[2];
+    static inline thread_local int raw_attr_depth_ = 0;
+    bool instanceAttrHook(const Value& obj, int which) {
+        if (raw_attr_depth_ > 0) return false;
+        Node* cls = classNodeOfInstance(obj);
+        if (!cls) return false;
+        auto& c = attr_hook_cache_[which];
+        auto it = c.find(cls);
+        if (it != c.end()) return it->second == 1;
+        Value m; Node* owner = nullptr;
+        bool has = findClassMember(cls, which ? "__delattr__" : "__setattr__", m, &owner) && owner
+                   && owner->type() == NodeType::CLASS && shownClassName(static_cast<ClassNode*>(owner)->name) != "object";
+        c[cls] = has ? 1 : 2;
+        return has;
+    }
+    struct RawAttr { RawAttr() { raw_attr_depth_++; } ~RawAttr() { raw_attr_depth_--; } RawAttr(const RawAttr&) = delete; RawAttr& operator=(const RawAttr&) = delete; };
     void setAttr(const Value& obj, const std::string& name, const Value& val) {
+        if (isInstanceValue(obj) && instanceAttrHook(obj, 0)) {
+            std::vector<Value> a{makeStringValue(name), val};
+            Value o = obj;
+            callMethod(o, "__setattr__", a, global_ctx);
+            return;
+        }
         // A property defined on the class: its setter runs, and a read-only
         // one refuses (the value used to be written into the instance,
         // silently hiding the property).
@@ -4845,6 +4873,8 @@ public:   // NythonExecutor is a struct: members default to public
         func_names[(void*)node.get()] = "__class__:" + cn->name;
         class_by_name[cn->name] = (void*)node.get();
         mro_cache_.clear();
+        attr_hook_cache_[0].clear();
+        attr_hook_cache_[1].clear();
         if (cn->body)
             for (auto& st : cn->body->statements())
                 if (st && st->type() == NodeType::FUNCTION) direct_methods_.insert(st.get());
@@ -6692,6 +6722,22 @@ public:
                     for (Node* c : seq) { Value cv; cv.type = ValueType::USERDATA; cv.value.p = (void*)c; seq_vals.push_back(cv); }
                 }
                 out = makeListValue(seq_vals, attr == "__mro__");
+                return true;
+            }
+            // __doc__: the docstring of a function, method, class, or an
+            // instance's class (round 77)
+            if (attr == "__doc__" && fit != func_names.end()) {
+                const std::string& t = fit->second;
+                Node* n = nullptr;
+                if (t.rfind("__class__:", 0) == 0) n = (Node*)obj.value.p;
+                else if (t.rfind("__instance__:", 0) == 0) n = classNodeOfInstance(obj);
+                else {
+                    auto ait = func_ast_nodes.find(obj.value.p);
+                    if (ait != func_ast_nodes.end()) n = (Node*)ait->second;
+                }
+                out = NONE_VALUE;
+                if (auto* cn = dynamic_cast<ClassNode*>(n)) { if (cn->has_doc) out = makeStringValue(cn->doc); }
+                else if (auto* fnode = dynamic_cast<FunctionNode*>(n)) { if (fnode->has_doc) out = makeStringValue(fnode->doc); }
                 return true;
             }
             if (attr == "__name__" || attr == "__qualname__" || attr == "__module__") {
@@ -8689,6 +8735,12 @@ public:
     // attribute or a namespace/dict entry is removed; anything else is an
     // AttributeError. (A deleted field used to stay, holding undefined.)
     void delAttrValue(const Value& obj, const std::string& name) {
+        if (isInstanceValue(obj) && instanceAttrHook(obj, 1)) {
+            std::vector<Value> a{makeStringValue(name)};
+            Value o = obj;
+            callMethod(o, "__delattr__", a, global_ctx);
+            return;
+        }
         if (obj.type == ValueType::USERDATA && obj.value.p) {
             auto pit = instance_properties.find(obj.value.p);
             if (pit != instance_properties.end() && pit->second && pit->second->container) {
@@ -9181,6 +9233,14 @@ public:
             if (isInstanceValue(self) && isExceptionClass(instanceClassName(self))) setExceptionArgs(self, args);
             out = NONE_VALUE;
             return true;
+        }
+        // Past the last base is object (every class's implicit root):
+        // super().__setattr__(k, v) and the like (round 77)
+        if (Node* objn = classNodeByName("object")) {
+            if (findClassMember(objn, name, m, &where) && m.type == ValueType::USERDATA && m.value.p && func_names.count(m.value.p)) {
+                out = invokeMember(m, where, self, args, kw, ctx);
+                return true;
+            }
         }
         return false;
     }
