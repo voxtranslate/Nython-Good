@@ -5509,7 +5509,7 @@ Removed: `src/GarbageCollector.cpp`, `include/GarbageCollector.hpp`, `include/Ga
 
 ## Round 77 — bytes, the network stack, signals, modules, the CLI, Python compatibility
 
-Full detail in `HANDOFF.md` §0p. New tests: `vm_audit65` (bytes, 149 checks), `vm_audit66` (signals, 33), `vm_audit67` (modules/async, 44), `vm_audit68` (sockets, 32), `vm_audit69` (sets, 40), `vm_audit70` (HTTP/WebSockets/TLS/libraries, 79), `vm_audit71` (CLI/argparse/stdio/reflection, 82), `vm_audit72` (Python compatibility, 53 - passes under python3 too). Sweep at the end: 371 runs, 0 not ok.
+Full detail in `HANDOFF.md` §0p. New tests: `vm_audit65` (bytes, 149 checks), `vm_audit66` (signals, 33), `vm_audit67` (modules/async, 44), `vm_audit68` (sockets, 32), `vm_audit69` (sets, 40), `vm_audit70` (HTTP/WebSockets/TLS/libraries, 79), `vm_audit71` (CLI/argparse/stdio/program input/reflection, 97), `vm_audit72` (Python compatibility, 53 - passes under python3 too). Sweep at the end: 371 runs, 0 not ok.
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -5534,3 +5534,6 @@ Full detail in `HANDOFF.md` §0p. New tests: `vm_audit65` (bytes, 149 checks), `
 | VM: `self.__class__()` raised AttributeError | the method-call path did not know it | constructs the object's class |
 | `f.__doc__` raised AttributeError; `help()` did nothing | docstrings not kept | the parser records them; `__doc__` on both engines; `help()` prints them |
 | `--profile` listed the prelude's stream objects | profiling started before the prelude | the table is cleared after it |
+| A program run from the IDE got EOF at its first `input()`, and its prompt never appeared; the Terminal refused input while a command ran | the IDE closed the program's stdin (`input=""`) and showed output by whole lines (a prompt has no newline) | `os_spawn(..., stdin=true)` + `os_proc_write`/`os_proc_close_stdin`; with `NY_INPUT_REQUEST` set a program announces each read of stdin (an OSC mark on stdout, `nyconc::announce_input_request`); the Output panel shows the pending prompt with an input line, focused when the program asks; the Terminal sends typed lines to a running command; Ctrl+D ends input |
+| Windows: every line `os_run`/`os_exec`/`os_proc_read` returned ended in `\r` | Windows programs write `\r\n` and it was passed through | read as Python's text mode reads it (universal newlines), a split `\r\n` carried across reads |
+| The Windows cross-build no longer compiled | `ErrMode::STRICT/IGNORE/REPLACE` collided with Windows headers' macros; a POSIX `closedir` and lambdas without a return on the Windows paths | renamed (`ErrMode::Strict/...`), Windows paths fixed |

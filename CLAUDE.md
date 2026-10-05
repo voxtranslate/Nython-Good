@@ -352,7 +352,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit68 | 32 | round 77: sockets - TCP/UDP/IPv6/AF_UNIX, timeouts, makefile, select/selectors, errors, colorless I/O in tasks |
 | vm_audit69 | 40 | round 77: sets and frozensets - typed keys, API, operators, subset comparisons |
 | vm_audit70 | 79 | round 77: http.client/server, urllib, cookies, WebSockets (RFC 6455), TLS with a throwaway CA, network/webserver/sockets/clientserver libraries, math, hashlib |
-| vm_audit71 | 82 | round 77: the command line on each engine (-c/-m/-i/-, sys.argv, SystemExit statuses, the prompt), argparse against python3's output, sys.stdin/stdout/stderr, print(file=), locals/globals/vars/dir, kwargs order |
+| vm_audit71 | 97 | round 77: the command line on each engine (-c/-m/-i/-, sys.argv, SystemExit statuses, the prompt), argparse against python3's output, sys.stdin/stdout/stderr, print(file=), a running program's stdin (os_spawn(stdin=true), input requests), locals/globals/vars/dir, kwargs order |
 | vm_audit72 | 53 | round 77: Python compatibility, passes under python3 too - starred displays, annotations, f"{x=}", slice objects, eval/exec/compile, complex, per-execution classes, collections, object/issubclass, __setattr__/__delattr__, threading.local, docstrings |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
@@ -943,6 +943,12 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   `object`; `__setattr__`/`__delattr__`; docstrings and `help()`;
   `locals/globals/vars/dir`; `**kwargs` in call order; `lib/collections.ny`
   (deque, Counter, defaultdict, OrderedDict, namedtuple, ChainMap).
+- **Program input in the IDE**: `os_spawn(cmd, stdin=true)` +
+  `os_proc_write`/`os_proc_close_stdin`; with `NY_INPUT_REQUEST` set a
+  program announces each stdin read (`nyconc::INPUT_REQUEST_MARK` on
+  stdout). Run shows the pending prompt with an input line in the Output
+  panel (focus `"stdin"`), the Terminal forwards lines to a running
+  command, Ctrl+D ends input.
 - **Gotchas**: `__dict__` is a copy (use `object.__setattr__`); coroutine
   objects are task handles (ints); a prelude name (`slice`, `object`,
   `complex`, `help`) shadows the old placeholder builtin of that name.

@@ -646,6 +646,7 @@ Value dispatch_io(NythonExecutor& E,
             } else if (size > 0) {
                 std::vector<char> buf((size_t)size);
                 std::streamsize got;
+                nyconc::announce_input_request();
                 {
                     nyconc::GilRelease rel;
                     std::cin.read(buf.data(), (std::streamsize)size);

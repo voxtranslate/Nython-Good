@@ -3156,7 +3156,15 @@ int wait_io(intptr_t fd, int events, double timeout_ms) {
     return wait_io_many(one, timeout_ms) ? one[0].revents : 0;
 }
 
+void announce_input_request() {
+    const char* on = std::getenv("NY_INPUT_REQUEST");
+    if (!on || !*on || std::strcmp(on, "0") == 0) return;
+    std::cout << INPUT_REQUEST_MARK << std::flush;
+    std::fflush(stdout);
+}
+
 bool read_stdin_line(std::string& out) {
+    announce_input_request();
     while (true) {
         bool ok;
         {
@@ -3358,6 +3366,7 @@ static void register_signal_builtins(std::unordered_map<std::string, Handler>& T
 #ifdef _WIN32
         (void)a;
         raise("OSError", "signal.alarm is not available on Windows");
+        return Ret::none();
 #else
         int64_t sec = a.size() > 0 && a.is_number(0) ? a.as_int(0) : 0;
         if (sec < 0) raise("ValueError", "alarm() argument must be non-negative");
@@ -3368,6 +3377,7 @@ static void register_signal_builtins(std::unordered_map<std::string, Handler>& T
 #ifdef _WIN32
         (void)a;
         raise("OSError", "signal.setitimer is not available on Windows");
+        return Ret::none();
 #else
         int which = a.size() > 0 && a.is_number(0) ? (int)a.as_int(0) : ITIMER_REAL;
         double secs = opt_num(a, 1, 0), interval = opt_num(a, 2, 0);
@@ -3383,6 +3393,7 @@ static void register_signal_builtins(std::unordered_map<std::string, Handler>& T
 #ifdef _WIN32
         (void)a;
         raise("OSError", "signal.getitimer is not available on Windows");
+        return Ret::none();
 #else
         int which = a.size() > 0 && a.is_number(0) ? (int)a.as_int(0) : ITIMER_REAL;
         struct itimerval ov;

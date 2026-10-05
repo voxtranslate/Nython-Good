@@ -106,7 +106,7 @@ Sets are a real type with a typed-key index (`1 == 1.0 == true`, O(1)
 membership), `frozenset`, the full API and operators; `dict | dict`.
 `math` is Python's whole module on both engines (`src/builtins/pymath.cpp`).
 
-### The command line (`src/main.cpp`; vm_audit71, 82 checks)
+### The command line (`src/main.cpp`; vm_audit71, 97 checks with the input section below)
 - `nython [options] [-c cmd | -m mod | file | -] [args]`: `-i -q -u -E -V
   -h`, bundles (`-iq`), `--vm`/`--interp` for every way of giving a
   program, `--check`, `--tokenize/--ast/--disasm`, `--profile`, `--trace`;
@@ -174,6 +174,41 @@ membership), `frozenset`, the full API and operators; `dict | dict`.
   UserList - the native names returned an empty list whatever they were
   given. `import collections` loads it; the bare stub names remain for old
   programs that never import it.
+
+### A running program's input (vm_audit71, tools/ide_e2e.py `run`/`terminal`)
+- The IDE closed a program's stdin (`os_spawn(..., input="")`), so its first
+  `input()` raised EOFError, and since output was shown a line at a time a
+  prompt (no newline) never appeared. `os_spawn(cmd, stdin=true)` keeps the
+  pipe open: `os_proc_write(pid, text)` (GIL released; a duplicate descriptor,
+  so a concurrent close or reap cannot redirect the write) and
+  `os_proc_close_stdin(pid)` (EOF). BrokenPipeError once the child is gone.
+- **Input requests**: with `NY_INPUT_REQUEST` set, every read of stdin -
+  `input()`, `sys.stdin.readline()/read(n)`, both engines, all through
+  `nyconc::read_stdin_line` / `announce_input_request` - first writes
+  `nyconc::INPUT_REQUEST_MARK` (`ESC ] ny;input BEL`, an OSC sequence a
+  terminal ignores) to stdout. This is Jupyter's stdin channel
+  (`input_request`/`input_reply`) carried in-band on the output pipe: the host
+  learns that the program waits and that the text since the last newline is
+  its prompt, without a side channel or polling `/proc` for a blocked read.
+- `BgProc.start(cmd, cwd, interactive)` (ide_ops.ny) strips the marks
+  (`_take_requests`, a mark split across reads waits in `.partial`), and has
+  `wants_input`, `send_line` (returns the pending prompt + text, the line a
+  terminal would show) and `close_input`. Run/Debug jobs and Terminal
+  commands are interactive.
+- **Output panel**: while the program runs, its last row is the pending
+  prompt followed by an input field (`focus == "stdin"`, a LineEdit like
+  every other field); a bar marks it while the program waits. When the
+  program asks, the panel comes up and the field takes focus - unless text
+  was typed in the editor in the last 1.2 s. Enter sends, Up/Down recall
+  sent lines, Ctrl+D ends the input, Ctrl+C (no selection) stops the program.
+- **Terminal**: a running command reads typed lines (`read x`, `cat`, a
+  Nython program's `input()`); its pending prompt replaces the shell prompt;
+  Ctrl+D ends its input. It used to answer "A command is still running".
+- **Windows**: a child's output is read with `\n` line ends, as Python's text
+  mode reads it (universal newlines; `text_newlines` in os_proc.cpp, a `\r`
+  that ends one `os_proc_read` chunk waits for the next). Every line
+  `os_run`/`os_exec`/`os_proc_read` returned there ended in `\r`. POSIX output
+  is passed through byte for byte, as before.
 
 ### Not done / known differences
 - `__dict__` is a copy on both engines: `self.__dict__[k] = v` does not

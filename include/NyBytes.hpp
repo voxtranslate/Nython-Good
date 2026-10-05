@@ -126,14 +126,15 @@ inline const char* codec_name(Codec c) {
         default: return "utf-32-be";
     }
 }
-enum class ErrMode { STRICT, IGNORE, REPLACE, BACKSLASH, XMLCHARREF, NAMEREPLACE };
+// (not STRICT/IGNORE/...: windows.h defines those as macros)
+enum class ErrMode { Strict, Ignore, Replace, Backslash, XmlCharRef, NameReplace };
 inline ErrMode errmode_of(const std::string& e) {
-    if (e.empty() || e == "strict") return ErrMode::STRICT;
-    if (e == "ignore") return ErrMode::IGNORE;
-    if (e == "replace") return ErrMode::REPLACE;
-    if (e == "backslashreplace") return ErrMode::BACKSLASH;
-    if (e == "xmlcharrefreplace") return ErrMode::XMLCHARREF;
-    if (e == "namereplace") return ErrMode::NAMEREPLACE;
+    if (e.empty() || e == "strict") return ErrMode::Strict;
+    if (e == "ignore") return ErrMode::Ignore;
+    if (e == "replace") return ErrMode::Replace;
+    if (e == "backslashreplace") return ErrMode::Backslash;
+    if (e == "xmlcharrefreplace") return ErrMode::XmlCharRef;
+    if (e == "namereplace") return ErrMode::NameReplace;
     raise("LookupError", "unknown error handler name '" + e + "'");
 }
 
@@ -175,10 +176,10 @@ inline std::string hex2(unsigned char c) {
 inline void decode_bad(ErrMode e, Codec c, const std::string& s, size_t a, size_t b, const char* why, std::string& out) {
     static const char* hx = "0123456789abcdef";
     switch (e) {
-        case ErrMode::STRICT: decode_error(c, s, a, b, why);
-        case ErrMode::IGNORE: return;
-        case ErrMode::REPLACE: out += "\xEF\xBF\xBD"; return;
-        case ErrMode::BACKSLASH:
+        case ErrMode::Strict: decode_error(c, s, a, b, why);
+        case ErrMode::Ignore: return;
+        case ErrMode::Replace: out += "\xEF\xBF\xBD"; return;
+        case ErrMode::Backslash:
             for (size_t k = a; k < b; k++) { unsigned char x = (unsigned char)s[k]; out += "\\x"; out += hx[x >> 4]; out += hx[x & 15]; }
             return;
         default: raise("TypeError", "don't know how to handle UnicodeDecodeError in error callback");
@@ -276,7 +277,7 @@ inline std::string bytes_decode(const std::string& s, const std::string& encodin
 // utf-8 and counts as U+FFFD for the others.
 inline void encode_bad(ErrMode e, Codec c, const std::string& s, uint32_t cp, int64_t pos, int64_t limit, std::string& out) {
     switch (e) {
-        case ErrMode::STRICT: {
+        case ErrMode::Strict: {
             std::string m = std::string("'") + codec_name(c) + "' codec can't encode character '";
             char buf[16];
             if (cp <= 0xFF) std::snprintf(buf, sizeof buf, "\\x%02x", cp);
@@ -284,16 +285,16 @@ inline void encode_bad(ErrMode e, Codec c, const std::string& s, uint32_t cp, in
             else std::snprintf(buf, sizeof buf, "\\U%08x", cp);
             raise("UnicodeEncodeError", m + buf + "' in position " + std::to_string(pos) + ": ordinal not in range(" + std::to_string(limit) + ")");
         }
-        case ErrMode::IGNORE: return;
-        case ErrMode::REPLACE: out += '?'; return;
-        case ErrMode::BACKSLASH: case ErrMode::NAMEREPLACE: {
+        case ErrMode::Ignore: return;
+        case ErrMode::Replace: out += '?'; return;
+        case ErrMode::Backslash: case ErrMode::NameReplace: {
             char buf[16];
             if (cp <= 0xFF) std::snprintf(buf, sizeof buf, "\\x%02x", cp);
             else if (cp <= 0xFFFF) std::snprintf(buf, sizeof buf, "\\u%04x", cp);
             else std::snprintf(buf, sizeof buf, "\\U%08x", cp);
             out += buf; return;
         }
-        case ErrMode::XMLCHARREF: out += "&#" + std::to_string(cp) + ";"; return;
+        case ErrMode::XmlCharRef: out += "&#" + std::to_string(cp) + ";"; return;
     }
     (void)s;
 }

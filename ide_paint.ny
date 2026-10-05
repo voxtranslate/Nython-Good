@@ -353,7 +353,7 @@ class IDEPaint(IDEOps):
     def _toggle_panel_tab(self, key):
         if self.panel_open and self.active_panel == key:
             self.panel_open = false
-            if self.focus == "terminal" or self.focus == "dbgconsole":
+            if self.focus == "terminal" or self.focus == "dbgconsole" or self.focus == "stdin":
                 self.focus = "editor"
         else:
             self._show_panel(key)
@@ -1754,6 +1754,8 @@ class IDEPaint(IDEOps):
         var ap = self.active_panel
         if ap == "problems":
             self._draw_problems(r, x, by, w, bh)
+        elif ap == "output" and self._stdin_accepting():
+            self._draw_output_stdin(r, x, by, w, bh)
         elif ap == "output":
             self._draw_lines(r, x, by, w, bh, self.out_lines, self.out_kinds, "output", "No output yet. Run a file with Ctrl+F5 to see its output here.")
         elif ap == "terminal":
@@ -1797,6 +1799,8 @@ class IDEPaint(IDEOps):
             return th.warn
         if kind == "info" or kind == "cmd":
             return th.info
+        if kind == "in":
+            return th.ok
         if kind == "dim":
             return th.text_faint
         return th.text
@@ -1827,6 +1831,47 @@ class IDEPaint(IDEOps):
             i = i + 1
         self._hit(x, y, w, h, "@panel.body", which, "")
 
+    # The Output panel while a program that takes input runs: its output,
+    # then the line it is reading - the text it printed since its last newline
+    # (its prompt) followed by the input field. A bar marks the line while
+    # the program waits on it.
+    def _draw_output_stdin(self, r, x, y, w, h):
+        var th = self.th
+        var lh = self.dp(18)
+        var rows = int((h - self.dp(8)) / lh) - 1
+        if rows < 0:
+            rows = 0
+        var n = len(self.out_lines)
+        var first = self.panel_scroll
+        if self.out_follow:
+            first = n - rows
+        if first > n - rows:
+            first = n - rows
+        if first < 0:
+            first = 0
+        self.panel_scroll = first
+        var i = 0
+        var yy = y + self.dp(6)
+        while i < rows and first + i < n:
+            r.text(self.out_lines[first + i], x + self.dp(16), yy, self.f_mono_small, self._kind_color(self.out_kinds[first + i]))
+            yy = yy + lh
+            i = i + 1
+        var waiting = self.job.wants_input
+        if waiting:
+            r.fill_xywh(x + self.dp(6), yy, self.dp(3), lh - 2, th.ok)
+        var prompt = self._strip_ansi(self.job.partial)
+        r.text(prompt, x + self.dp(16), yy, self.f_mono_small, th.text)
+        var px = x + self.dp(16) + self.f_mono_small.width(prompt)
+        var focused = self.focus == "stdin"
+        self._prompt_line(r, "stdin", self.stdin_input, px, yy, lh, focused)
+        if self.stdin_input == "" and not focused:
+            var hint = "type here: Enter sends a line to the program, Ctrl+D ends its input"
+            if waiting:
+                hint = "the program is waiting for input - click here and type a line"
+            r.text(hint, px + self.dp(4), yy, self.f_mono_small, th.text_faint)
+        self.stdin_input_y = yy - self.dp(2)
+        self._hit(x, y, w, h, "@stdin", "", "")
+
     def _draw_terminal(self, r, x, y, w, h):
         var th = self.th
         var lh = self.dp(18)
@@ -1847,8 +1892,15 @@ class IDEPaint(IDEOps):
             yy = yy + lh
             i = i + 1
         var prompt = self.term_prompt
-        r.text(prompt, x + self.dp(16), yy, self.f_mono_small, th.ok)
-        var px = x + self.dp(16) + self.f_mono_small.width(prompt) + self.dp(6)
+        var px = 0
+        if self.term_proc != none and self.term_proc.accepts_input():
+            # The running command's pending output (its prompt) instead.
+            prompt = self._strip_ansi(self.term_proc.partial)
+            r.text(prompt, x + self.dp(16), yy, self.f_mono_small, th.text)
+            px = x + self.dp(16) + self.f_mono_small.width(prompt)
+        else:
+            r.text(prompt, x + self.dp(16), yy, self.f_mono_small, th.ok)
+            px = x + self.dp(16) + self.f_mono_small.width(prompt) + self.dp(6)
         self._prompt_line(r, "term", self.term_input, px, yy, lh, self.focus == "terminal")
         self.term_input_y = yy - self.dp(2)
         self._hit(x, y, w, h, "@term", "", "")

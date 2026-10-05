@@ -298,6 +298,7 @@ bool drain(int fd, std::string& into) {
 
 struct Proc {
     int out_fd = -1, err_fd = -1;
+    int in_fd = -1;          // os_spawn(..., stdin=true): kept open for os_proc_write
     std::string out{}, err{};
     bool done = false;
     int code = 0;
@@ -331,6 +332,7 @@ bool reap(long long pid, Proc& p) {
         }
         if (p.out_fd >= 0) { ::close(p.out_fd); p.out_fd = -1; }
         if (p.err_fd >= 0) { ::close(p.err_fd); p.err_fd = -1; }
+        if (p.in_fd >= 0) { ::close(p.in_fd); p.in_fd = -1; }
         return true;
     }
     if (r < 0 && errno == ECHILD) { p.done = true; p.code = -1; return true; }
@@ -534,10 +536,28 @@ std::thread feed_stdin(HANDLE in, std::string data) {
     });
 }
 
+// A child's text output reads with "\n" line ends, as Python's text mode
+// reads it (universal newlines: "\r\n" and a lone "\r" are "\n"). Windows
+// programs write "\r\n"; without this every captured line ended in "\r"
+// (round 77). `cr`: the chunk before ended in "\r" (its "\n" may come next).
+std::string text_newlines(const std::string& s, bool& cr, bool final) {
+    std::string r;
+    r.reserve(s.size());
+    for (char ch : s) {
+        if (cr) { cr = false; r += '\n'; if (ch == '\n') continue; }
+        if (ch == '\r') { cr = true; continue; }
+        r += ch;
+    }
+    if (final && cr) { cr = false; r += '\n'; }
+    return r;
+}
+
 struct Proc {
     HANDLE out_h = INVALID_HANDLE_VALUE, err_h = INVALID_HANDLE_VALUE;
+    HANDLE in_h = INVALID_HANDLE_VALUE;   // os_spawn(..., stdin=true)
     HANDLE proc = nullptr, job = nullptr;
     std::string out{}, err{};
+    bool out_cr = false, err_cr = false;   // text_newlines carry-over
     bool done = false;
     int code = 0;
     int killed_sig = 0;    // reported as -sig, as a signal is on POSIX
@@ -570,6 +590,7 @@ bool reap(long long, Proc& p) {
     }
     close_h(p.out_h);
     close_h(p.err_h);
+    close_h(p.in_h);
     CloseHandle(p.proc);
     p.proc = nullptr;
     if (p.job) { CloseHandle(p.job); p.job = nullptr; }
@@ -612,6 +633,12 @@ void run_to_end(const Cmd& c, const std::string& cwd,
     }
     close_h(ch.out);
     close_h(ch.err);
+    {
+        bool cr = false;
+        out = text_newlines(out, cr, true);
+        cr = false;
+        err = text_newlines(err, cr, true);
+    }
     if (writer.joinable()) { nyconc::GilRelease unlocked; writer.join(); }
     DWORD ec = 0;
     GetExitCodeProcess(ch.proc, &ec);
@@ -788,19 +815,26 @@ Value dispatch_os_proc(NythonExecutor& E,
     // ── Background processes ─────────────────────────────────────────────────
     if (name == "os_spawn") {
 #ifdef _WIN32
-        nyos::Args A(E, args, {"cwd", "env", "input", "merge"});
+        nyos::Args A(E, args, {"cwd", "env", "input", "merge", "stdin"});
         if (!A.has(0, "cmd")) raise("TypeError", "os_spawn() missing the command");
         Cmd c = parse_cmd(E, A.get(0, "cmd"));
         auto env = A.has(2, "env") ? parse_env(E, A.get(2, "env")) : std::vector<std::pair<std::string, std::string>>{};
-        bool has_input = A.has(3, "input");
+        bool keep_stdin = A.flag(99, "stdin", false);
+        bool has_input = A.has(3, "input") || keep_stdin;
         std::string input = A.str(3, "input", "");
         WinChild ch = start_process(c, A.str(1, "cwd", ""), env, has_input, A.flag(99, "merge", false));
+        HANDLE kept_in = INVALID_HANDLE_VALUE;
         if (ch.in != INVALID_HANDLE_VALUE) {
-            if (input.empty()) close_h(ch.in);
+            if (keep_stdin) {
+                kept_in = ch.in;
+                if (!input.empty()) { DWORD w = 0; WriteFile(kept_in, input.data(), (DWORD)input.size(), &w, nullptr); }
+            }
+            else if (input.empty()) close_h(ch.in);
             else feed_stdin(ch.in, input).detach();
         }
         std::lock_guard<std::mutex> lk(procs_mutex());
         Proc p;
+        p.in_h = kept_in;
         p.out_h = ch.out;
         p.err_h = ch.err;
         p.proc = ch.proc;
@@ -808,15 +842,28 @@ Value dispatch_os_proc(NythonExecutor& E,
         procs()[ch.pid] = std::move(p);
         return Value((int)ch.pid);
 #else
-        nyos::Args A(E, args, {"cwd", "env", "input", "merge"});
+        nyos::Args A(E, args, {"cwd", "env", "input", "merge", "stdin"});
         if (!A.has(0, "cmd")) raise("TypeError", "os_spawn() missing the command");
         Cmd c = parse_cmd(E, A.get(0, "cmd"));
         auto env = A.has(2, "env") ? parse_env(E, A.get(2, "env")) : std::vector<std::pair<std::string, std::string>>{};
-        bool has_input = A.has(3, "input");
+        bool keep_stdin = A.flag(99, "stdin", false);
+        bool has_input = A.has(3, "input") || keep_stdin;
         std::string input = A.str(3, "input", "");
         int in_fd, out_fd, err_fd;
         pid_t pid = start_process(c, A.str(1, "cwd", ""), env, has_input, in_fd, out_fd, err_fd, A.flag(99, "merge", false));
-        if (in_fd >= 0) {
+        int kept_in = -1;
+        if (in_fd >= 0 && keep_stdin) {
+            // stdin stays open: os_proc_write feeds it, os_proc_close_stdin ends it
+            fcntl(in_fd, F_SETFL, fcntl(in_fd, F_GETFL) & ~O_NONBLOCK);
+            fcntl(in_fd, F_SETFD, FD_CLOEXEC);
+            kept_in = in_fd;
+            size_t off = 0;
+            while (off < input.size()) {
+                ssize_t w = ::write(in_fd, input.data() + off, input.size() - off);
+                if (w <= 0) break;
+                off += (size_t)w;
+            }
+        } else if (in_fd >= 0) {
             // Small inputs fit the pipe; larger ones are written as the child
             // reads, bounded so a child that never reads cannot hang us.
             fcntl(in_fd, F_SETFL, fcntl(in_fd, F_GETFL) & ~O_NONBLOCK);
@@ -832,8 +879,60 @@ Value dispatch_os_proc(NythonExecutor& E,
         Proc p;
         p.out_fd = out_fd;
         p.err_fd = err_fd;
+        p.in_fd = kept_in;
         procs()[(long long)pid] = std::move(p);
         return Value((int)pid);
+#endif
+    }
+    // A running process's stdin (os_spawn(..., stdin=true)): text written
+    // to it, then closed for end-of-input (round 77: the IDE's Run takes
+    // the program's input this way).
+    if (name == "os_proc_write" || name == "os_proc_close_stdin") {
+        long long pid = args.size() > 0 ? nyos::to_int(args[0], -1) : -1;
+        std::string data = args.size() > 1 ? E.getStringValue(args[1]) : std::string();
+        std::unique_lock<std::mutex> lk(procs_mutex());
+        auto it = procs().find(pid);
+        if (it == procs().end()) raise("ChildProcessError", "no child process with pid " + std::to_string(pid) + " was started by os_spawn");
+        Proc& p = it->second;
+#ifdef _WIN32
+        if (name == "os_proc_close_stdin") { close_h(p.in_h); return NONE_VALUE; }
+        if (p.in_h == INVALID_HANDLE_VALUE) raise("OSError", "the process's stdin is not open (os_spawn(..., stdin=true))");
+        // A duplicate, so a close or reap on another thread while this one
+        // writes cannot hand the write a recycled handle.
+        HANDLE h = INVALID_HANDLE_VALUE;
+        if (!DuplicateHandle(GetCurrentProcess(), p.in_h, GetCurrentProcess(), &h, 0, 0 /* not inheritable */, DUPLICATE_SAME_ACCESS))
+            raise("OSError", "the process's stdin cannot be written");
+        lk.unlock();
+        DWORD w = 0;
+        BOOL ok;
+        {
+            nyconc::GilRelease rel;
+            ok = WriteFile(h, data.data(), (DWORD)data.size(), &w, nullptr);
+        }
+        CloseHandle(h);
+        if (!ok) raise("BrokenPipeError", "the process has closed its input");
+        return Value((int64_t)w);
+#else
+        if (name == "os_proc_close_stdin") { if (p.in_fd >= 0) { ::close(p.in_fd); p.in_fd = -1; } return NONE_VALUE; }
+        if (p.in_fd < 0) raise("OSError", "the process's stdin is not open (os_spawn(..., stdin=true))");
+        // A duplicate, so a close or reap on another thread while this one
+        // writes cannot hand the write a recycled descriptor.
+        int fd = ::fcntl(p.in_fd, F_DUPFD_CLOEXEC, 0);
+        if (fd < 0) raise_errno(errno, "stdin");
+        lk.unlock();
+        size_t off = 0;
+        {
+            nyconc::GilRelease rel;
+            while (off < data.size()) {
+                ssize_t w = ::write(fd, data.data() + off, data.size() - off);
+                if (w < 0 && errno == EINTR) continue;
+                if (w <= 0) break;
+                off += (size_t)w;
+            }
+        }
+        ::close(fd);
+        if (off < data.size()) raise("BrokenPipeError", "the process has closed its input");
+        return Value((int64_t)off);
 #endif
     }
     if (name == "os_proc_read" || name == "os_poll" || name == "os_wait") {
@@ -846,6 +945,10 @@ Value dispatch_os_proc(NythonExecutor& E,
         if (name == "os_proc_read") {
             pump(p);
             reap(pid, p);
+#ifdef _WIN32
+            p.out = text_newlines(p.out, p.out_cr, p.done);
+            p.err = text_newlines(p.err, p.err_cr, p.done);
+#endif
             Value r = nyos::make_map(E, {{"stdout", Str(p.out)}, {"stderr", Str(p.err)}, {"done", Value(p.done)}});
             p.out.clear();
             p.err.clear();

@@ -267,6 +267,67 @@ def test_stdio():
     check("stream attributes", [sys.stdout.fileno(), sys.stderr.fileno(), sys.stdin.fileno(), sys.stdout.writable(), sys.stdin.readable(), sys.__stdout__ is sys.stdout], [1, 2, 0, true, true, true])
     check("terminal size from COLUMNS", os_get_terminal_size()[0], 80)
 
+# ── a running program's stdin (os_spawn(stdin=true), the IDE's Run) ─────────
+var MARK = "\x1b]ny;input\x07"
+
+# Output of `pid` until it ends with `want_end` (or the process is done, or
+# `ms` have passed).
+def read_until(pid, acc, want_end, ms=20000):
+    var t0 = time_ms()
+    while time_ms() - t0 < ms:
+        var r = os_proc_read(pid)
+        acc = acc + r["stdout"]
+        if acc.endswith(want_end) or r["done"]:
+            return acc
+        time_sleep(0.01)
+    return acc
+
+def test_interactive_stdin():
+    var prog = "name = input('Name? ')\nprint('hi', name)\nimport sys\nprint(repr(sys.stdin.readline()))\ntry:\n    input('more? ')\nexcept EOFError:\n    print('eof')\n"
+    for engine in [[], ["--vm"]]:
+        var tag = "vm " if len(engine) > 0 else "interp "
+        var pid = os_spawn([EXE] + engine + ["-c", prog], stdin=true, merge=true, env={"NY_INPUT_REQUEST": "1"})
+        var out = read_until(pid, "", MARK)
+        check(tag + "prompt then request", out, "Name? " + MARK)
+        check(tag + "os_proc_write count", os_proc_write(pid, "ada\n"), 4)
+        out = read_until(pid, out, "hi ada\n" + MARK)
+        out = read_until(pid, out, MARK + "x", 300)   # nothing more until it reads
+        check(tag + "line read, next request", out, "Name? " + MARK + "hi ada\n" + MARK)
+        os_proc_write(pid, "second line\n")
+        out = read_until(pid, out, "more? " + MARK)
+        os_proc_close_stdin(pid)
+        out = read_until(pid, out, "eof\n")
+        check(tag + "readline and EOF", out, "Name? " + MARK + "hi ada\n" + MARK + "'second line\\n'\nmore? " + MARK + "eof\n")
+        check(tag + "exit", os_wait(pid), 0)
+        # without NY_INPUT_REQUEST nothing is announced
+        var p2 = os_spawn([EXE] + engine + ["-c", "print(input('? '))"], stdin=true, input="pre\n")
+        os_proc_close_stdin(p2)
+        check(tag + "no request without the variable", read_until(p2, "", "pre\n"), "? pre\n")
+        os_wait(p2)
+    # the errors
+    var p3 = os_spawn([EXE, "-c", "pass"])
+    try:
+        os_proc_write(p3, "x")
+        check("write without stdin=true", "no error", "OSError")
+    except OSError as e:
+        check("write without stdin=true", str(e), "the process's stdin is not open (os_spawn(..., stdin=true))")
+    os_wait(p3)
+    try:
+        os_proc_write(999999999, "x")
+        check("write to an unknown pid", "no error", "ChildProcessError")
+    except ChildProcessError as e:
+        check("write to an unknown pid", "os_spawn" in str(e), true)
+    # a child that exits without reading: the write fails, nothing crashes
+    var p4 = os_spawn([EXE, "-c", "pass"], stdin=true)
+    time_sleep(0.2)
+    var res = "wrote"
+    try:
+        os_proc_write(p4, "x" * 200000)
+    except OSError as e:
+        res = type(e).__name__
+    check("write to a child that has exited", res in ["BrokenPipeError", "OSError"], true)
+    os_wait(p4)
+
 # ── language pieces ──────────────────────────────────────────────────────────
 def kw_order(**kw):
     return list(kw.keys())
@@ -311,6 +372,7 @@ test_cli()
 test_argparse_parsing()
 test_argparse_help()
 test_stdio()
+test_interactive_stdin()
 test_language()
 os_rmtree(TMP)
 print("Results: " + str(pass_n) + " passed, " + str(fail_n) + " failed")

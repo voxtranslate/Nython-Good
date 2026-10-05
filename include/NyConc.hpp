@@ -188,6 +188,14 @@ enum { IO_READ = 1, IO_WRITE = 2, IO_ERR = 4 };
 // raises KeyboardInterrupt) and the read resumes when it returns. False at
 // the end of input (input() raises EOFError). Both engines.
 bool read_stdin_line(std::string& out);
+// With NY_INPUT_REQUEST set in the environment (the IDE sets it for the
+// programs it runs), a read of stdin first writes INPUT_REQUEST_MARK to
+// stdout: a host showing the output knows the program now waits for input
+// and that the text since the last newline is its prompt. An OSC sequence,
+// so a terminal that sees one ignores it. read_stdin_line does it; a reader
+// of its own calls announce_input_request() before it blocks.
+constexpr const char* INPUT_REQUEST_MARK = "\x1b]ny;input\x07";
+void announce_input_request();
 int wait_io(intptr_t fd, int events, double timeout_ms);
 // Several at once (select): fills each revents; returns how many are ready
 // (0 on a timeout).

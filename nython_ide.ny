@@ -308,6 +308,10 @@ class NythonIDE(IDETools):
         self.dbgcon_kinds = []
         self.dbgcon_follow = true
         self.dbgcon_input = ""
+        self.stdin_input = ""      # the Output panel's line for a running program's stdin
+        self.stdin_hist = []
+        self.stdin_hist_i = 0
+        self.key_t = 0             # when text was last typed (_stdin_requested)
         self.inspect_lines = []
         self.inspect_kind = ""
         self.inspect_scroll = 0
@@ -328,6 +332,7 @@ class NythonIDE(IDETools):
         self.run_seq = 0
         self.job = none
         self.job_running = false
+        self.job_asked = 0         # input requests seen from the running program
         self.job_mode = ""
         self.job_path = ""
         self.job_doc = none
@@ -385,6 +390,7 @@ class NythonIDE(IDETools):
         self.watch_git = -3
         self.term_input_y = 100000
         self.dbgcon_input_y = 100000
+        self.stdin_input_y = 100000
         self.field_vx = {}         # input name -> x of its first character, last frame
         # ── source control ────────────────────────────────────────────────────
         self.scm_stale = true
@@ -545,7 +551,7 @@ class NythonIDE(IDETools):
 
     def _set_cursor(self, cmd):
         var want = "arrow"
-        if cmd == "@editor" or cmd == "@qi.input" or cmd == "@find.field" or cmd == "@search.field" or cmd == "@scm.msg" or cmd == "@term" or cmd == "@dbgcon" or cmd == "@ext.search":
+        if cmd == "@editor" or cmd == "@qi.input" or cmd == "@find.field" or cmd == "@search.field" or cmd == "@scm.msg" or cmd == "@term" or cmd == "@dbgcon" or cmd == "@stdin" or cmd == "@ext.search":
             want = "ibeam"
         elif cmd == "@split.sidebar":
             want = "sizewe"
@@ -773,7 +779,7 @@ class NythonIDE(IDETools):
                 self.tab_scroll_px = strip - self.tabs_total_w
             if self.tab_scroll_px > 0:
                 self.tab_scroll_px = 0
-        elif c == "@panel.body" or c == "@term" or c == "@dbgcon" or c == "@problem" or c == "@problem.file":
+        elif c == "@panel.body" or c == "@term" or c == "@dbgcon" or c == "@stdin" or c == "@problem" or c == "@problem.file":
             self.panel_scroll = self.panel_scroll - dy * 3
             if self.panel_scroll < 0:
                 self.panel_scroll = 0
@@ -978,6 +984,13 @@ class NythonIDE(IDETools):
             self.focus = "dbgconsole"
             if e.y >= self.dbgcon_input_y:
                 self._field_click("dbgcon", e)
+            return
+        if cmd == "@stdin":
+            if e.y >= self.stdin_input_y and self._stdin_accepting():
+                self.focus = "stdin"
+                self._field_click("stdin", e)
+            else:
+                self.focus = "panel"
             return
         if cmd == "@find.field":
             self.focus = "find"
@@ -1383,7 +1396,7 @@ class NythonIDE(IDETools):
                 self._open_ctx(e.x, e.y, [["Copy Value", "@ctx.copytext", vs[h.arg][1]],
                                           ["Copy as Expression", "@ctx.copytext", vs[h.arg][0]],
                                           ["Add to Watch", "@ctx.watch", vs[h.arg][0]]])
-        elif c == "@term" or c == "@panel.body" or c == "@dbgcon":
+        elif c == "@term" or c == "@panel.body" or c == "@dbgcon" or c == "@stdin":
             self._open_ctx(e.x, e.y, [["Copy All", "@ctx.copypanel", ""], ["Clear", "workbench.action.terminal.clear", ""]])
 
     # ── keyboard ─────────────────────────────────────────────────────────────
@@ -1453,6 +1466,8 @@ class NythonIDE(IDETools):
             self._term_key(e)
         elif f == "dbgconsole":
             self._line_input_key(e, "dbgcon")
+        elif f == "stdin":
+            self._stdin_key(e)
         elif f == "extsearch":
             self._line_input_key(e, "ext")
         elif f == "explorer":
@@ -1724,6 +1739,8 @@ class NythonIDE(IDETools):
             return "term"
         if f == "dbgconsole":
             return "dbgcon"
+        if f == "stdin":
+            return "stdin"
         if f == "extsearch":
             return "ext"
         return ""
@@ -1750,6 +1767,8 @@ class NythonIDE(IDETools):
             return self.term_input
         if name == "dbgcon":
             return self.dbgcon_input
+        if name == "stdin":
+            return self.stdin_input
         if name == "ext":
             return self.ext_query
         return ""
@@ -1775,6 +1794,8 @@ class NythonIDE(IDETools):
             self.term_input = v
         elif name == "dbgcon":
             self.dbgcon_input = v
+        elif name == "stdin":
+            self.stdin_input = v
         elif name == "ext":
             self.ext_query = v
             self.tree_scroll = 0
@@ -1820,7 +1841,7 @@ class NythonIDE(IDETools):
         if self.field_vx.has_key(name):
             x0 = self.field_vx[name]
         var font = self.f_ui
-        if name == "term" or name == "dbgcon":
+        if name == "term" or name == "dbgcon" or name == "stdin":
             font = self.f_mono_small
         var i = 0
         var best = 0
@@ -1843,7 +1864,22 @@ class NythonIDE(IDETools):
         var k = e.key
         if self._field_key(e):
             return
-        if k == "enter":
+        if k == "enter" and self.term_proc != none and self.term_proc.accepts_input():
+            # A running command reads what is typed, as in a terminal.
+            var shown = self.term_proc.send_line(self.term_input)
+            self.term_input = ""
+            self._le("term").reset("", false)
+            self.term_follow = true
+            if shown == none:
+                self._term_print("[the command has closed its input]", "warn")
+            else:
+                self._term_print(shown, "in")
+        elif e.ctrl and not e.alt and k == "d" and self.term_input == "" and self.term_proc != none and self.term_proc.accepts_input():
+            var pend = self.term_proc.partial
+            if self.term_proc.close_input():
+                self.term_proc.partial = ""
+                self._term_print(pend + "^D", "in")
+        elif k == "enter":
             var cmd = self.term_input
             self._term_print(self.term_prompt + " " + cmd, "cmd")
             self.term_input = ""
@@ -1909,7 +1945,7 @@ class NythonIDE(IDETools):
             return
         self.term_seq = self.term_seq + 1
         self.term_proc = BgProc(self.tmp + "/nyide_term_" + str(self.session_id) + "_" + str(self.term_seq))
-        self.term_proc.start(c, self.term_cwd)
+        self.term_proc.start(c, self.term_cwd, true)
 
     def _poll_term(self):
         if self.term_proc == none or not self.term_proc.running:
@@ -1919,6 +1955,9 @@ class NythonIDE(IDETools):
         while i < len(lines):
             self._term_print(self._strip_ansi(lines[i]), "out")
             i = i + 1
+        if self.term_proc.fresh:
+            self.term_proc.fresh = false
+            self._dirty = true
         if not self.term_proc.running and self.term_proc.code != 0:
             self._term_print("[exit code " + str(self.term_proc.code) + "]", "dim")
 
@@ -2279,6 +2318,7 @@ class NythonIDE(IDETools):
         elif f == "explorer" or f == "panel":
             return
         else:
+            self.key_t = time_ms()
             self._editor_text(t)
 
     def _editor_text(self, t):
@@ -2633,7 +2673,7 @@ class NythonIDE(IDETools):
             self._layout()
         var now = time_ms()
         var f = self.focus
-        var blinking = f == "editor" or f == "terminal" or f == "find" or f == "search" or f == "qi" or f == "scm" or f == "dbgconsole" or f == "extsearch"
+        var blinking = f == "editor" or f == "terminal" or f == "find" or f == "search" or f == "qi" or f == "scm" or f == "dbgconsole" or f == "stdin" or f == "extsearch"
         if blinking and now - self.caret_t > 530:
             self.caret_t = now
             self.caret_on = not self.caret_on

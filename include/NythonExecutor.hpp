@@ -640,7 +640,7 @@ public:   // NythonExecutor is a struct: members default to public
             "os_mkdtemp","os_disk_usage","os_chdir","cd","sh",
             "os_unsetenv","os_environ","os_platform","os_cpu_count","os_hostname",
             "os_username","os_home","os_uname","os_get_terminal_size","os_terminal_size",
-            "os_system","os_run","subprocess_run","os_spawn","os_proc_read","os_poll",
+            "os_system","os_run","subprocess_run","os_spawn","os_proc_read","os_poll","os_proc_write","os_proc_close_stdin",
             "os_wait","os_kill","os_getpid","os_getppid","shell_quote","os_shell_quote","os_shell",
             "which","os_which","sys_argv",
             "time","clock","time_ns","time_monotonic","monotonic","time_perf_counter",

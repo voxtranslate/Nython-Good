@@ -625,6 +625,42 @@ def sc_terminal(s):
             break
         time.sleep(0.1)
     c(ok, "terminal: '>expr' evaluates Nython")
+    # a running command reads the lines typed into the terminal (round 77)
+    ide.type("read a; read b; echo got-$a-$b\n")
+    time.sleep(0.3)
+    ide.type("left\n")
+    ide.type("right\n")
+    ok = False
+    for _ in range(40):
+        if ide.snap().has("got-left-right", exact=True, region=R(318, 690, 1300, 250)):
+            ok = True
+            break
+        time.sleep(0.1)
+    c(ok, "terminal: a running command reads typed lines")
+    ide.type("cat\n")
+    time.sleep(0.3)
+    ide.type("meow\n")
+    ide.key("ctrl+d")
+    ide.type("echo after-eof\n")
+    ok = False
+    for _ in range(40):
+        f = ide.snap()
+        if f.has("after-eof", exact=True, region=R(318, 690, 1300, 250)):
+            ok = True
+            break
+        time.sleep(0.1)
+    c(ok, "terminal: Ctrl+D ends a command's input and the shell takes commands again")
+
+
+ASK = """var name = input("Name? ")
+print("hello " + name)
+var n = int(input("n? "))
+print("square " + str(n * n))
+try:
+    input("more? ")
+except EOFError:
+    print("eof seen")
+"""
 
 
 def sc_run(s):
@@ -642,6 +678,44 @@ def sc_run(s):
     c(ok, "run: Ctrl+F5 runs the file and shows its output")
     st = ide.state()
     c(st["panel"] in ("output", "terminal"), "run: output panel shown", st["panel"])
+    # a program that reads stdin: its prompt is shown, the input line takes
+    # focus when it asks, typed lines reach it, Ctrl+D is end of input
+    s.write("ask.ny", ASK)
+    s.open_file("ask.ny")
+    ide.key("ctrl+f5")
+    st = s.wait_until(lambda st: st["focus"] == "stdin")
+    c(st["focus"] == "stdin", "run/stdin: input line focused when the program asks", st["focus"])
+    c(ide.snap().has("Name? ", exact=False), "run/stdin: the prompt (no newline) is shown")
+    ide.type("ada\n")
+    ok = False
+    for _ in range(60):
+        f = ide.snap()
+        if f.has("hello ada", exact=True) and f.has("Name? ada", exact=True):
+            ok = True
+            break
+        time.sleep(0.1)
+    c(ok, "run/stdin: the line reaches the program and is echoed after its prompt")
+    s.wait_until(lambda st: st["focus"] == "stdin")
+    ide.type("7\n")
+    ok = False
+    for _ in range(60):
+        if ide.snap().has("square 49", exact=True):
+            ok = True
+            break
+        time.sleep(0.1)
+    c(ok, "run/stdin: a second read")
+    time.sleep(0.3)
+    ide.key("ctrl+d")
+    ok = False
+    for _ in range(60):
+        f = ide.snap()
+        if f.has("eof seen", exact=True) and f.has("process exited with code 0", exact=False):
+            ok = True
+            break
+        time.sleep(0.1)
+    c(ok, "run/stdin: Ctrl+D gives the program EOFError and it finishes")
+    st = ide.state()
+    c(st["focus"] != "stdin", "run/stdin: focus leaves the input line when the program ends", st["focus"])
     # a runtime error lands in Problems with its location
     s.write("bad.ny", "var a = 1\nprint(undefined_thing(a))\n")
     s.open_file("bad.ny")

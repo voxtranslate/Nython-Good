@@ -17,6 +17,7 @@
 #include <tuple>
 #include <mutex>
 #include <functional>
+#include "platform_compat.hpp"   // ny_fs (directories on every platform)
 #include <unordered_set>
 #include <optional>
 #include <cassert>
@@ -7373,22 +7374,7 @@ private:
     }
     // Whether a directory can be a namespace package: it holds a .ny file or
     // a folder that does (platform_compat.hpp's ny_fs::holds_modules).
-    static bool holds_modules(const std::string& dir, int depth=1) {
-        DIR* d=opendir(dir.c_str());
-        if(!d) return false;
-        std::vector<std::string> names;
-        while(struct dirent* e=readdir(d)){ std::string n=e->d_name; if(n!="."&&n!="..") names.push_back(n); }
-        closedir(d);
-        for(auto& n:names){
-            if(n.size()>3&&n.compare(n.size()-3,3,".ny")==0) return true;
-            if(depth>0&&n[0]!='.'){
-                struct stat st;
-                std::string sub=dir+"/"+n;
-                if(::stat(sub.c_str(),&st)==0&&S_ISDIR(st.st_mode)&&holds_modules(sub,depth-1)) return true;
-            }
-        }
-        return false;
-    }
+    static bool holds_modules(const std::string& dir, int depth=1) { return ny_fs::holds_modules(dir, depth); }
     std::string find_module_path(const std::string& dotted, bool* is_dir=nullptr) {
         std::string rel=dotted;
         std::replace(rel.begin(),rel.end(),'.','/');

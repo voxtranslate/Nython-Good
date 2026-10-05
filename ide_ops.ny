@@ -33,6 +33,11 @@ class BgProc:
         self.killed = false
         self.pid = -1              # process route: the os_spawn pid, -1 for the file route
         self.partial = ""          # process route: output after the last newline
+        self.interactive = false   # stdin stays open: send_line / close_input
+        self.input_closed = false
+        self.wants_input = false   # the program is reading stdin (its prompt is .partial)
+        self.requests = 0          # how many reads of stdin the program has announced
+        self.fresh = false         # output arrived since the host last looked (partial lines too)
 
     # Quoted for the shell os_exec/os_spawn run command strings with - a POSIX
     # sh, or cmd.exe on a Windows without one (see os_shell()).
@@ -40,7 +45,12 @@ class BgProc:
         return shell_quote(s)
 
     # `inner` is a shell command line; stdout and stderr are captured together.
-    def start(self, inner, cwd):
+    # Interactive: the program's stdin stays open for send_line/close_input,
+    # and NY_INPUT_REQUEST makes a Nython program announce each read of it
+    # (nyconc::announce_input_request), so the host knows when it waits and
+    # what its prompt is - the request/reply of Jupyter's stdin channel,
+    # carried in-band on the output pipe instead of on a socket of its own.
+    def start(self, inner, cwd, interactive=false):
         self.running = true
         self.code = 0
         self.read = 0
@@ -50,13 +60,21 @@ class BgProc:
         self.poll_t = 0
         self.partial = ""
         self.pid = -1
-        # stdin is empty and closed (input=""), and stderr joins stdout at the
-        # descriptor (merge) so the two stay in the order they were written -
-        # the OS layer does both, so the command line carries no POSIX
-        # redirections and runs the same on Windows (os_spawn uses a POSIX sh
-        # there when there is one, else cmd.exe).
+        self.interactive = false
+        self.input_closed = false
+        self.wants_input = false
+        self.requests = 0
+        # stderr joins stdout at the descriptor (merge) so the two stay in the
+        # order they were written; stdin is empty and closed (input="") unless
+        # interactive - the OS layer does both, so the command line carries no
+        # POSIX redirections and runs the same on Windows (os_spawn uses a
+        # POSIX sh there when there is one, else cmd.exe).
         try:
-            self.pid = os_spawn(inner, cwd=cwd, input="", merge=true)
+            if interactive:
+                self.pid = os_spawn(inner, cwd=cwd, stdin=true, merge=true, env={"NY_INPUT_REQUEST": "1"})
+                self.interactive = true
+            else:
+                self.pid = os_spawn(inner, cwd=cwd, input="", merge=true)
             return
         except Exception as e:
             self.pid = -1
@@ -85,7 +103,10 @@ class BgProc:
         var r = os_proc_read(self.pid)
         var chunk = r["stdout"]
         if chunk != "":
+            self.fresh = true
             var text = self.partial + chunk
+            if self.interactive:
+                text = self._take_requests(text)
             var lines = string_split(text, "\n")
             var n = len(lines)
             var i = 0
@@ -104,6 +125,51 @@ class BgProc:
                 self.code = 143
             self.running = false
         return out
+
+    # Removes the input-request marks from the output. The program waits for
+    # input when the output ends with one (anything after it means the read
+    # was satisfied from input already sent); a mark split across two reads
+    # stays in .partial until the rest arrives.
+    def _take_requests(self, text):
+        var mark = "\x1b]ny;input\x07"
+        if string_find(text, mark) < 0:
+            self.wants_input = false
+            return text
+        self.wants_input = string_endswith(text, mark)
+        var parts = string_split(text, mark)
+        self.requests = self.requests + len(parts) - 1
+        return string_join(parts, "")
+
+    def accepts_input(self):
+        return self.running and self.pid >= 0 and self.interactive and not self.input_closed
+
+    # Sends one line to the program's stdin. Returns what a terminal would
+    # show for it - the pending prompt followed by the text - or none when
+    # the program no longer takes input.
+    def send_line(self, text):
+        if not self.accepts_input():
+            return none
+        try:
+            os_proc_write(self.pid, text + "\n")
+        except Exception as e:
+            self.input_closed = true
+            return none
+        var shown = self.partial + text
+        self.partial = ""
+        self.wants_input = false
+        return shown
+
+    # End of input (Ctrl+D): the program's next read sees EOF.
+    def close_input(self):
+        if not self.accepts_input():
+            return false
+        try:
+            os_proc_close_stdin(self.pid)
+        except Exception as e:
+            pass
+        self.input_closed = true
+        self.wants_input = false
+        return true
 
     # Counted in lines, not bytes: os_exec strips trailing newlines from what
     # it returns and len() counts characters, so a byte offset drifted and a
@@ -1314,8 +1380,9 @@ class IDEOps(IDECore):
         var parts = string_split(cmdline, " ")
         var exe = parts[0]
         var flag = string_slice(cmdline, len(exe), len(cmdline))
-        self.job.start(self._q(exe) + flag + self._q(path), cwd)
+        self.job.start(self._q(exe) + flag + self._q(path), cwd, true)
         self.job_running = true
+        self.job_asked = 0
         self.job_t0 = time_ms()
         self.job_text = ""
         self.job_text_n = 0
@@ -1329,16 +1396,95 @@ class IDEOps(IDECore):
         while i < len(lines):
             self._job_line(lines[i])
             i = i + 1
-        if len(lines) > 0:
+        if len(lines) > 0 or self.job.fresh:
+            self.job.fresh = false
             self._dirty = true
+        if self.job.requests != self.job_asked:
+            self.job_asked = self.job.requests
+            self._dirty = true
+            if self.job.wants_input:
+                self._stdin_requested()
         if not self.job.running:
             self.job_running = false
             self.job_killed = self.job.killed
+            if self.focus == "stdin":
+                self.focus = "panel"
+            self.stdin_input = ""
             self._finish_job(self.job.code)
 
     def _stop_job(self):
         if self.job_running:
             self.job.stop()
+
+    # ── the running program's input (Output panel) ──────────────────────────
+    # The program asked for a line (BgProc.wants_input). The Output panel is
+    # brought up with its input line focused - unless the user is typing in
+    # the editor or another input right now, which keeps its focus: the input
+    # line then shows that the program waits, and a click or Ctrl+` reaches it.
+    def _stdin_accepting(self):
+        return self.job_running and self.job != none and self.job.accepts_input()
+
+    def _stdin_requested(self):
+        if not self.panel_open or self.active_panel != "output":
+            self._show_panel("output")
+        var f = self.focus
+        var idle = time_ms() - self.key_t > 1200
+        if f == "panel" or f == "stdin" or (f == "editor" and idle):
+            self.focus = "stdin"
+            self.caret_on = true
+            self.caret_t = time_ms()
+
+    def _stdin_send(self):
+        if not self._stdin_accepting():
+            return
+        var v = self.stdin_input
+        var shown = self.job.send_line(v)
+        self.stdin_input = ""
+        self._le("stdin").reset("", true)
+        if shown == none:
+            self._output_write("[the program has closed its input]", "warn")
+            return
+        self._output_write(shown, "in")
+        if v != "" and (len(self.stdin_hist) == 0 or self.stdin_hist[len(self.stdin_hist) - 1] != v):
+            self.stdin_hist.append(v)
+        self.stdin_hist_i = len(self.stdin_hist)
+
+    def _stdin_eof(self):
+        if self._stdin_accepting() and self.job.close_input():
+            var pend = self.job.partial
+            self._output_write(pend + "^D", "in")
+            self.job.partial = ""
+            self.focus = "panel"
+
+    def _stdin_key(self, e):
+        var k = e.key
+        if k == "enter":
+            self._stdin_send()
+            return
+        if e.ctrl and not e.alt and k == "d" and self.stdin_input == "":
+            self._stdin_eof()
+            return
+        if e.ctrl and not e.alt and not e.shift and k == "c" and not self._le("stdin").has_sel():
+            self._stop_job()
+            return
+        if k == "up" or k == "down":
+            var n = len(self.stdin_hist)
+            if n == 0:
+                return
+            if k == "up" and self.stdin_hist_i > 0:
+                self.stdin_hist_i = self.stdin_hist_i - 1
+            elif k == "down" and self.stdin_hist_i < n:
+                self.stdin_hist_i = self.stdin_hist_i + 1
+            var hv = ""
+            if self.stdin_hist_i < n:
+                hv = self.stdin_hist[self.stdin_hist_i]
+            self.stdin_input = hv
+            self._le("stdin").reset(hv, false)
+            return
+        if self._field_key(e):
+            return
+        if k == "escape":
+            self.focus = "editor"
 
     def _job_line(self, raw):
         var ln = self._strip_ansi(raw)
