@@ -2661,7 +2661,7 @@ class TestLoader:
     and returning them wrapped in a TestSuite
     """
     testMethodPrefix = "test"
-    sortTestMethodsUsing = three_way_cmp
+    sortTestMethodsUsing = staticmethod(three_way_cmp)
     testNamePatterns = none
     suiteClass = TestSuite
 

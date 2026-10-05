@@ -5089,23 +5089,6 @@ private:
                 has_del_cache_.clear();
                 no_new_.clear();
                 class_vars_[sub->name]=run_class_body(sub, fr);
-                {
-                    // __set_name__(owner, name) of each class attribute that
-                    // defines it (a descriptor learning its name), as type()
-                    std::vector<std::pair<std::string,VMVal>> sn;
-                    for(auto& kv:class_vars_[sub->name]){
-                        VMVal g;
-                        if(kv.second.type==VMType::INSTANCE&&class_lookup(kv.second.class_name,"__set_name__",g)) sn.push_back(kv);
-                    }
-                    if(!sn.empty()){
-                        VMVal cv=VMVal::make_class(sub,sub->name);
-                        for(auto& p:sn){
-                            VMVal g; class_lookup(p.second.class_name,"__set_name__",g);
-                            std::vector<VMVal> a{cv, VMVal::make_str(p.first)};
-                            invoke_method(g, p.second, a, p.second.class_name);
-                        }
-                    }
-                }
                 if(is_exception_class(sub->name)) vm_exc_classes().insert(sub->name);
                 else vm_exc_classes().erase(sub->name);
                 {

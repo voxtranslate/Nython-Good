@@ -287,7 +287,7 @@ check("partialmethod", [alive1, cell._alive], [True, False])
 bound_pm = cell.set_alive
 bound_pm()
 check("partialmethod read as a value", [cell._alive, bound_pm.args, bound_pm.keywords, type(bound_pm).__name__], [True, (True,), {}, "partial"])
-check("partialmethod repr", repr(Cell.__dict__["set_alive"])[:31] if isinstance(getattr(Cell, "__dict__", None), dict) else "functools.partialmethod(<funct", "functools.partialmethod(<funct")
+check("partialmethod repr", repr(Cell.__dict__["set_alive"])[:30] if isinstance(getattr(Cell, "__dict__", None), dict) else "functools.partialmethod(<funct", "functools.partialmethod(<funct")
 
 calls = []
 @lru_cache(maxsize=2)

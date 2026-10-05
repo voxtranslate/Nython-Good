@@ -5145,17 +5145,8 @@ public:   // NythonExecutor is a struct: members default to public
             }
             // Store the evaluated class context so decorators (@property, @staticmethod) are visible
             setClassContext((void*)node.get(), class_ctx);
-            // __set_name__(owner, name) of each class attribute that defines
-            // it (a descriptor learning its name), in order, as Python does.
-            std::vector<std::pair<std::string, Value>> set_names;
-            if (class_ctx->container)
-                for (auto& kv : *class_ctx->container)
-                    if (isInstanceValue(kv.second) && instanceHasMethod(kv.second, "__set_name__")) set_names.push_back(kv);
-            for (auto& sn : set_names) {
-                std::vector<Value> a{class_val, makeStringValue(sn.first)};
-                callMethod(sn.second, "__set_name__", a, ctx);
-            }
         }
+        // (__set_name__ runs in classCreated, before __init_subclass__)
         classCreated(class_val, node.get(), class_kw, ctx);
         return class_val;
     }
