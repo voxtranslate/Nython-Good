@@ -966,7 +966,7 @@ assert_eq("h", mb.h, 30)
 assert_eq("active init", mb.active_menu, -1)
 mb.close_all()
 assert_eq("all closed", mb.active_menu, -1)
-assert_eq("mb type", type(mb), "MenuBar")
+assert_eq("mb type", type(mb) == "MenuBar", true)
 
 # ─── StatusBar ────────────────────────────────────────────────────────────────
 section("StatusBar")
@@ -986,7 +986,7 @@ sb.clear_left()
 assert_eq("cleared left", sb.left_count, 0)
 sb.clear_right()
 assert_eq("cleared right", sb.right_count, 0)
-assert_eq("sb type", type(sb), "StatusBar")
+assert_eq("sb type", type(sb) == "StatusBar", true)
 
 # ─── Notification / NotificationCenter ───────────────────────────────────────
 section("Notification")
@@ -1536,7 +1536,7 @@ assert_eq("size w", aw.rect.w, 600)
 aw.hide()
 assert_eq("hidden", aw.visible, false)
 aw.show()
-assert_eq("aw type", type(aw), "AudioWaveform")
+assert_eq("aw type", type(aw) == "AudioWaveform", true)
 
 # ─── Spotlight ────────────────────────────────────────────────────────────────
 section("Spotlight")
@@ -1874,7 +1874,7 @@ otp.hide()
 assert_eq("hidden", otp.visible, false)
 otp.show()
 otp.disable()
-assert_eq("type", type(otp), "OTPInput")
+assert_eq("type", type(otp) == "OTPInput", true)
 otp.enable()
 
 # ─── CodeBlock ────────────────────────────────────────────────────────────────
@@ -2374,7 +2374,7 @@ def on_tp_run(cmd):
     run_cmd = cmd
 tp.on_run(on_tp_run)
 tp.update()
-assert_eq("type", type(tp), "TerminalPanel")
+assert_eq("type", type(tp) == "TerminalPanel", true)
 var lc_err = tp._line_color("error")
 assert_eq("error red", lc_err.r, 255)
 var lc_ok = tp._line_color("success")

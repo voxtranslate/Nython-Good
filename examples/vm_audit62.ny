@@ -57,6 +57,6 @@ check("exact int sum", tensor_sum([big, 1, -big]), 1)
 check("exact int dot", tensor_dot([3037000499, 1], [3037000499, 1]), 9223372030926249002)
 # a result a double cannot hold exactly is not rounded into a wrong integer
 var near = 9007199254740993
-check("element beyond 2^53 is a float, not a wrong int", type(tensor_add([near], [0])[0]), "float")
+check("element beyond 2^53 is a float, not a wrong int", type(tensor_add([near], [0])[0]) == "float", true)
 
 print "Results:", passed, "passed,", failed, "failed"

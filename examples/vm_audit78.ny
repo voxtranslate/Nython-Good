@@ -1,4 +1,4 @@
-# vm_audit78.ny - Python's re module, both engines (round 78).
+# vm_audit78.ny - Python's re module, both engines (round 77).
 #
 # Written in the subset Nython and Python share, so the same file runs
 # under python3 (`python3 examples/vm_audit78.ny` must also pass) - every

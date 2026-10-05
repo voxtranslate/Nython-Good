@@ -73,7 +73,7 @@ assert_eq("destroyed", gone, none)
 # ─── Middlewares ──────────────────────────────────────────────────────────────
 section("LoggingMiddleware")
 var lm = LoggingMiddleware()
-assert_eq("lm type", type(lm), "LoggingMiddleware")
+assert_eq("lm type", type(lm) == "LoggingMiddleware", true)
 
 section("CorsMiddleware")
 var cors = CorsMiddleware("https://myapp.com")
@@ -81,7 +81,7 @@ assert_eq("cors origin", cors.origin, "https://myapp.com")
 
 section("RateLimitMiddleware")
 var rlm = RateLimitMiddleware(100, 60.0)
-assert_eq("rlm type", type(rlm), "RateLimitMiddleware")
+assert_eq("rlm type", type(rlm) == "RateLimitMiddleware", true)
 
 section("AuthMiddleware")
 var auth = AuthMiddleware("my_secret_key")
@@ -89,11 +89,11 @@ assert_eq("secret", auth.secret, "my_secret_key")
 
 section("BodyParserMiddleware")
 var bp = BodyParserMiddleware()
-assert_eq("bp type", type(bp), "BodyParserMiddleware")
+assert_eq("bp type", type(bp) == "BodyParserMiddleware", true)
 
 section("StaticFilesMiddleware")
 var sf = StaticFilesMiddleware("/var/www/html", "/static")
-assert_eq("sf type", type(sf), "StaticFilesMiddleware")
+assert_eq("sf type", type(sf) == "StaticFilesMiddleware", true)
 
 # ─── ApiBuilder ───────────────────────────────────────────────────────────────
 section("ApiBuilder")

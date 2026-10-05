@@ -224,8 +224,8 @@ check("not false", not false, true)
 check("complex bool", (true and false) or (not false), true)
 
 # ── Type coercion ────────────────────────────────────────────────
-check("int+float", type(1 + 1.0), "float")
-check("int*float", type(2 * 3.14), "float")
+check("int+float", type(1 + 1.0) == "float", true)
+check("int*float", type(2 * 3.14) == "float", true)
 check("str+str", "a" + "b", "ab")
 
 # ── Walrus-style patterns ───────────────────────────────────────

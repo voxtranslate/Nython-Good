@@ -15,13 +15,13 @@ def test(name, actual, expected):
 
 print ""
 print "--- Types ---"
-test("int type", type(42), "int")
-test("float type", type(3.14), "float")
-test("bool type", type(true), "bool")
-test("string type", type("hi"), "string")
-test("list type", type([1,2]), "list")
-test("map type", type({"a":1}), "map")
-test("none type", type(none), "none")
+test("int type", type(42) == "int", true)
+test("float type", type(3.14) == "float", true)
+test("bool type", type(true) == "bool", true)
+test("string type", type("hi") == "string", true)
+test("list type", type([1,2]) == "list", true)
+test("map type", type({"a":1}) == "map", true)
+test("none type", type(none) == "none", true)
 
 print ""
 print "--- Arithmetic ---"

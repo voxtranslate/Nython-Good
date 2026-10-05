@@ -40,7 +40,17 @@ class Inspector:
 
     # ── type identification ──────────────────────────────────────────────────
     def type_of(self, v):
-        return type(v)
+        # the names the rows show and the views compare against: type()
+        # gives type objects since round 77 (type(5) is int)
+        var t = type(v)
+        if isinstance(t, "str"):
+            return t
+        var n = t.__name__
+        if n == "str":
+            return "string"
+        if n == "dict":
+            return "map"
+        return n
 
     def icon_for(self, v):
         var t = self.type_of(v)

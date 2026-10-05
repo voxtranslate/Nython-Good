@@ -282,7 +282,25 @@ struct VMVal {
     std::string to_string() const;
     std::string repr() const;
 
+    // A builtin type native's name (int, str, dict, ...), "" for anything else.
+    std::string builtin_type_name() const {
+        if(type!=VMType::NATIVE) return "";
+        const std::string& c=class_name;
+        std::string b=c.rfind("__builtin__:",0)==0?c.substr(12):c.rfind("__native__:",0)==0?c.substr(11):c;
+        if(b=="map") b="dict";
+        return nyrt::is_builtin_type_name(b)?b:std::string();
+    }
+    // A type object (a class or builtin type) named n: Python's name or the
+    // legacy one type() returned ("string", "map", "class") - round 77.
+    bool type_object_named(const std::string& n) const {
+        if(type==VMType::CLASS) return nyrt::shown_class_name(class_name)==n;
+        std::string b=builtin_type_name();
+        if(b.empty()) return false;
+        return n==b||(b=="str"&&n=="string")||(b=="dict"&&n=="map")||(b=="type"&&n=="class");
+    }
     bool operator==(const VMVal& o) const {
+        if(type==VMType::STRING&&(o.type==VMType::NATIVE||o.type==VMType::CLASS)) return o.type_object_named(s);
+        if(o.type==VMType::STRING&&(type==VMType::NATIVE||type==VMType::CLASS)) return type_object_named(o.s);
         if(type!=o.type){
             if((type==VMType::INT&&o.type==VMType::FLOAT)||(type==VMType::FLOAT&&o.type==VMType::INT)){
                 if(!s.empty()||!o.s.empty()) return num_compare(*this,o)==0;
@@ -333,7 +351,11 @@ struct VMVal {
         case VMType::CLASS:  return code.get()==o.code.get() && class_name==o.class_name;
         case VMType::GENERATOR: return gen.get()==o.gen.get();
         case VMType::ITERATOR:  return iter.get()==o.iter.get();
-        case VMType::NATIVE: return !class_name.empty() && class_name==o.class_name;
+        case VMType::NATIVE: {
+            std::string a=builtin_type_name(), b=o.builtin_type_name();
+            if(!a.empty()||!b.empty()) return a==b;
+            return !class_name.empty() && class_name==o.class_name;
+        }
         case VMType::UNDEFINED: return s==o.s;   // undefined == undefined
         default:             return false;
         }
@@ -2717,6 +2739,7 @@ public:
         register_builtins();
         register_nt_natives();
         register_pycore();        // after register_builtins: these replace its copies
+        capture_builtin_types();
         tag_type_builtins();      // again: register_pycore replaced the tagged ones
         wrap_iterable_natives();  // after the tensor and pycore natives, so it wraps those
         register_generator_natives();   // islice, take (round 75)
@@ -4716,6 +4739,38 @@ private:
         out=vm_call(load_var("_NyGenericAlias"), a, std::nullopt, nullptr);
         return true;
     }
+    // The builtin type values type() gives, taken when the builtins are
+    // registered (a program's own `list = ...` does not change them).
+    std::unordered_map<std::string,VMVal> builtin_types_;
+    void capture_builtin_types() {
+        for(const char* n:{"int","float","str","bool","list","dict","tuple","set","frozenset","bytes","bytearray","type","range","slice"}){
+            auto it=globals_.find(n);
+            if(it==globals_.end()&&std::string(n)=="dict") it=globals_.find("map");
+            if(it==globals_.end()||it->second.type!=VMType::NATIVE) continue;
+            VMVal v=it->second;
+            if(v.class_name.empty()) v.class_name=std::string("__native__:")+n;
+            builtin_types_[n]=v;
+        }
+    }
+    // type(v) as a type object; none for the kinds that keep a legacy name.
+    VMVal type_object_of(const VMVal& v) {
+        auto bt=[&](const char* n)->VMVal{ auto it=builtin_types_.find(n); return it==builtin_types_.end()?VMVal::make_none():it->second; };
+        switch(v.type){
+        case VMType::BOOL: return bt("bool");
+        case VMType::INT: return bt("int");
+        case VMType::FLOAT: return bt("float");
+        case VMType::STRING: return bt("str");
+        case VMType::BYTES: return bt(v.b?"bytearray":"bytes");
+        case VMType::LIST: return bt(v.is_set()?(v.is_frozenset()?"frozenset":"set"):v.b?"tuple":"list");
+        case VMType::MAP:
+            if(v.class_name=="__bound_method__"||is_property_desc(v)) return VMVal::make_none();
+            return bt("dict");
+        case VMType::INSTANCE: { VMVal c=class_value(v.class_name); return c.type==VMType::CLASS?c:VMVal::make_none(); }
+        case VMType::CLASS: { VMVal meta=metaclass_of(class_key(v)); if(meta.type==VMType::CLASS) return meta; return bt("type"); }
+        case VMType::NATIVE: if(!v.builtin_type_name().empty()) return bt("type"); return VMVal::make_none();
+        default: return VMVal::make_none();
+        }
+    }
     // The name a builtin native is tagged with ("__builtin__:x", the
     // "__native__:x" a global read gives it, or the type it builds).
     static std::string native_name(const VMVal& v) {
@@ -5163,6 +5218,17 @@ private:
                 VMVal t=pop(),v=pop();
                 bool r;
                 VMVal named;
+                if(v.type==VMType::CLASS||!v.builtin_type_name().empty()){
+                    // a type on the left (type(x) is int, C is C): identity,
+                    // as Python - a class is not an instance of itself
+                    VMVal rv;
+                    bool have=false;
+                    try{ rv=load_var(t.s); have=true; }catch(...){}
+                    if(have&&(rv.type==VMType::CLASS||!rv.builtin_type_name().empty())){
+                        r=v==rv;
+                        push(VMVal::make_bool(ins.op==Op::COMPARE_IS_TYPE ? r : !r)); break;
+                    }
+                }
                 if(ins.arg==1 && (named=load_var(t.s)).type!=VMType::NONE && named.type!=VMType::CLASS
                    && named.type!=VMType::UNDEFINED)
                     r=op_is(v,named);          // an ordinary value: identity
@@ -6434,6 +6500,16 @@ private:
                 }
                 break;
             }
+            case VMType::NATIVE: {
+                // a builtin (int, len, ...): keyed by what it is - every
+                // native has no pointer of its own, so {int: 1, str: 2}
+                // was one key (round 77)
+                std::string b=k.builtin_type_name();
+                std::string id="n"+(b.empty()?k.class_name:b);
+                if(id=="n") break;
+                vm_key_objs().emplace(id,k);
+                return nypy::key_of_obj(id);
+            }
             default: break;
         }
         const void* id=k.map?(const void*)k.map.get():k.code?(const void*)k.code.get():k.gen?(const void*)k.gen.get():(const void*)k.iter.get();
@@ -6679,7 +6755,8 @@ private:
         // Functions compare by identity, not by structural equality: two
         // distinct functions are not "the same function".
         if(l.type==VMType::FUNCTION) return l.code.get()==r.code.get();
-        if(l.type==VMType::NATIVE)   return false;
+        // builtins: the same one (int is int, len is len)
+        if(l.type==VMType::NATIVE)   return l==r;
         return l==r;
     }
 
@@ -6732,6 +6809,11 @@ private:
                 out=v;
                 return true;
             }
+        }
+        if(attr=="__class__"&&obj.type!=VMType::INSTANCE){
+            // (5).__class__ is int, C.__class__ is type (round 77)
+            VMVal t=type_object_of(obj);
+            if(t.type!=VMType::NONE){ out=t; return true; }
         }
         switch(obj.type){
         case VMType::INSTANCE: {
@@ -7357,7 +7439,8 @@ private:
             // Class.method taken as a value and called with the instance
             // first: f = Animal.speak; f(dog).
             if(!self && callee.code->is_method && !callee.code->is_static && !args.empty()
-               && (args[0].type==VMType::INSTANCE||args[0].type==VMType::CLASS)){
+               ){
+                // any first argument is self (Props.x.fget(None), as Python)
                 VMVal self_val = args[0];
                 std::vector<VMVal> rest(args.begin()+1, args.end());
                 return call_function(callee, rest, self_val, kwargs);
@@ -9926,8 +10009,10 @@ private:
             // type(name, bases, ns): a new class (round 77)
             if(a.size()==3){ std::vector<VMVal> t{VMVal::make_none(),a[0],a[1],a[2]}; return vm->type_new(t,nullptr); }
             if(a.empty())return VMVal::make_str("none");
-            // a class with a metaclass: the metaclass
-            if(a[0].type==VMType::CLASS){ VMVal meta=vm->metaclass_of(class_key(a[0])); if(meta.type==VMType::CLASS) return meta; }
+            // a type object (type(5) is int, type(obj) is its class), equal
+            // to its legacy name too (type(x) == "list") - round 77
+            VMVal t=vm->type_object_of(a[0]);
+            if(t.type!=VMType::NONE) return t;
             switch(a[0].type){
             case VMType::NONE:return VMVal::make_str("none");
             case VMType::BOOL:return VMVal::make_str("bool");
@@ -9944,7 +10029,22 @@ private:
             case VMType::UNDEFINED:return VMVal::make_str("undefined");
             case VMType::BYTES:return VMVal::make_str(a[0].b?"bytearray":"bytes");
             default:return VMVal::make_str("unknown");}});
-        globals_["typeof"]=globals_["type"];
+        // typeof(x): Nython's name of the type, the string type() gave
+        // before type objects ("int", "string", "map", "class", a class's
+        // name) - round 77
+        {
+            VMVal type_fn=globals_["type"];
+            def("typeof",[vm,type_fn](std::vector<VMVal>& a,const VMVal&)->VMVal{
+                if(a.empty()) return VMVal::make_str("none");
+                VMVal t=vm->type_object_of(a[0]);
+                if(t.type==VMType::CLASS) return VMVal::make_str(nyrt::shown_class_name(t.class_name));
+                std::string b=t.builtin_type_name();
+                if(!b.empty()) return VMVal::make_str(b=="str"?"string":b=="dict"?"map":b=="type"?"class":b);
+                std::vector<VMVal> one{a[0]};
+                VMVal r=type_fn.native(one);
+                return r.type==VMType::STRING?r:VMVal::make_str(r.to_string());
+            });
+        }
         // bytes(x) / bytearray(x) (round 77)
         globals_["bytes"]=VMVal::make_native([vm](std::vector<VMVal>& a)->VMVal{ return vm->construct_bytes(a,false); });
         globals_["bytearray"]=VMVal::make_native([vm](std::vector<VMVal>& a)->VMVal{ return vm->construct_bytes(a,true); });
@@ -9963,16 +10063,24 @@ private:
 
     void register_builtins() {
                 // property() builtin — create a property descriptor
-        globals_["property"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
+        globals_["property"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             VMVal desc; desc.type=VMType::MAP;
             desc.map=std::make_shared<VMMap>(); vmgc::track_map(desc.map);
             if(!a.empty()) (*desc.map)["__get__"]=a[0];
             (*desc.map)["__is_property__"]=VMVal::make_bool(true);
+            // fget / fset and an abstract getter's __isabstractmethod__, as
+            // Python's property (round 77; abc reads it)
+            (*desc.map)["fget"]=a.empty()?VMVal::make_none():a[0];
+            (*desc.map)["fset"]=VMVal::make_none();
+            if(a.size()>=2&&a[1].type!=VMType::NONE){ (*desc.map)["__set__"]=a[1]; (*desc.map)["fset"]=a[1]; }
+            bool abstract=false;
+            if(!a.empty()&&a[0].type==VMType::FUNCTION){ VMVal r; if(lookup_attr(a[0],"__isabstractmethod__",r)) abstract=vm_truthy(r); }
+            (*desc.map)["__isabstractmethod__"]=VMVal::make_bool(abstract);
             // Add .setter(fn) method to the descriptor so @prop.setter works:
             (*desc.map)["setter"]=VMVal::make_native([desc](std::vector<VMVal>& b) mutable ->VMVal{
                 VMVal d2; d2.type=VMType::MAP;
                 d2.map=std::make_shared<VMMap>(*desc.map); vmgc::track_map(d2.map);
-                if(!b.empty()) (*d2.map)["__set__"]=b[0];
+                if(!b.empty()){ (*d2.map)["__set__"]=b[0]; (*d2.map)["fset"]=b[0]; }
                 (*d2.map)["setter"]=(*desc.map)["setter"]; // keep setter method
                 return d2;
             });
@@ -10250,7 +10358,7 @@ private:
             else if(cls.type==VMType::STRING) cls_name=cls.s;
             // isinstance(x, list) / isinstance(x, int): the bare builtin, not
             // a string. These are tagged with the type they build above.
-            else if(cls.type==VMType::NATIVE&&!cls.class_name.empty()) cls_name=cls.class_name;
+            else if(cls.type==VMType::NATIVE&&!cls.class_name.empty()) cls_name=native_name(cls);
             else return VMVal::make_bool(false);
             if(obj.type!=VMType::INSTANCE){
                 // Builtin/primitive types by name, e.g. isinstance(42, "int").

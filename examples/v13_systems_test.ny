@@ -18,7 +18,7 @@ t("exists_f", exists("/tmp/nonexistent_xyz"), false)
 # PATH: set on every platform (Windows has no HOME)
 t("env", len(env("PATH")) > 0, true)
 var files = ls("/tmp")
-t("ls_type", type(files), "list")
+t("ls_type", type(files) == "list", true)
 t("ls_len", len(files) > 0, true)
 
 print "=== AI/ML TENSORS ==="

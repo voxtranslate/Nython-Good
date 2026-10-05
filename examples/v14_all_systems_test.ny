@@ -52,7 +52,7 @@ t("pwd", len(pwd()) > 0, true)
 # PATH: set on every platform (Windows has no HOME)
 t("env", len(env("PATH")) > 0, true)
 var files = ls("/tmp")
-t("ls_type", type(files), "list")
+t("ls_type", type(files) == "list", true)
 t("ls_len", len(files) > 0, true)
 
 print "=== ACTIVATION FUNCTIONS ==="

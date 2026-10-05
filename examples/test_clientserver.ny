@@ -64,7 +64,7 @@ assert_eq("cli host", rpc_cli.host, "127.0.0.1")
 # ─── PubSubBroker / PubSubClient ─────────────────────────────────────────────
 section("PubSubBroker")
 var broker = PubSubBroker("127.0.0.1", 9140)
-assert_eq("broker type", type(broker), "PubSubBroker")
+assert_eq("broker type", type(broker) == "PubSubBroker", true)
 
 section("PubSubClient")
 var pub = PubSubClient("127.0.0.1", 9150)
@@ -105,7 +105,7 @@ assert_eq("port", fsrv.port, 9300)
 
 section("FileClient")
 var fcli = FileClient("127.0.0.1", 9300)
-assert_eq("fcli type", type(fcli), "FileClient")
+assert_eq("fcli type", type(fcli) == "FileClient", true)
 
 # ─── HeartbeatServer / HeartbeatClient ───────────────────────────────────────
 section("HeartbeatServer")

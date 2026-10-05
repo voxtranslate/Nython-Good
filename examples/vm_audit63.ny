@@ -114,7 +114,7 @@ def except_global():
     try:
         raise ValueError("v")
     except ValueError as gy:
-        return type(read_gy())
+        return type(read_gy()).__name__
 check("except-as of a global", except_global(), "ValueError")
 
 ly = 1

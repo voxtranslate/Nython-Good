@@ -1,5 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
-# lib/re.ny - Python's re (round 78): regular expressions.
+# lib/re.ny - Python's re (round 77): regular expressions.
 #
 #     import re
 #     m = re.search(r"(?P<key>\w+)\s*=\s*(\d+)", line)

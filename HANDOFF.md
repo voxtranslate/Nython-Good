@@ -7,7 +7,10 @@ Last updated: round 77 — **§0p** (bytes; signals; sockets, TLS, HTTP,
 urllib, WebSockets and the network libraries made real; asyncio and the
 async protocols; modules with their own scope and packages; sets; the
 command line and argparse; per-execution classes, slices, eval/exec,
-complex numbers, `__setattr__`, docstrings, collections; both engines).
+complex numbers, `__setattr__`, docstrings, collections; positional-only
+parameters; annotations, `__new__`, PEP 487/560/604, metaclasses,
+NotImplemented; `type()` giving type objects; ~45 Python standard-library
+modules and a ReDoS-immune regex engine; both engines).
 Round 76 — **§0o** (the "Not done" lists of rounds 74-75
 closed: static scope checks, lambda closures, error columns, async tasks
 as coroutines, rwlock succession, objects used as dict keys and suspended
@@ -134,7 +137,7 @@ membership), `frozenset`, the full API and operators; `dict | dict`.
   positionals that matched nothing just before an option wait for later
   values (Python 3.13's rule; 3.11 left `cmd --foo x a b` unparsed).
 
-### Python compatibility (vm_audit72, 53 checks, passes under python3)
+### Python compatibility (vm_audit72, 56 checks, passes under python3)
 - **Each execution of a class statement makes a new class.** A class
   statement run again - a factory called twice, a loop - rebound the one
   class, so instances of the first saw the second's methods, class
@@ -148,8 +151,9 @@ membership), `frozenset`, the full API and operators; `dict | dict`.
   (lowered to the prelude's `_ny_list_cat` / `_ny_dict_merge`), `[x, *y] =
   seq` and `(a, b) = ...` targets.
 - **Annotations**: `x: int = 5`, `self.x: T = v`, `x: T` alone, parameter
-  annotations, `-> T`, `/` and `*` markers, trailing commas (parsed and
-  dropped; positional-only is not enforced). `f"{expr=}"`.
+  annotations, `-> T`, `/` and `*` markers, trailing commas; they are kept
+  (`__annotations__`) and positional-only parameters are enforced - see
+  "Classes" and "Parameters" below. `f"{expr=}"`.
 - **slice objects**: the prelude's `slice`; `obj[i:j:k]` hands an
   object's `__getitem__/__setitem__/__delitem__` a slice; a slice object
   indexes lists, strings, tuples and bytes.
@@ -174,6 +178,167 @@ membership), `frozenset`, the full API and operators; `dict | dict`.
   UserList - the native names returned an empty list whatever they were
   given. `import collections` loads it; the bare stub names remain for old
   programs that never import it.
+
+### Parameters, imports, `__future__` (vm_audit72)
+- **Positional-only parameters are enforced** (`def f(a, b, /, c)`): the
+  parser records how many lead the list (`FunctionNode::posonly`); a
+  keyword naming one of them raises Python's TypeError ("f() got some
+  positional-only arguments passed as keyword arguments: 'a'"), and a
+  `**kw` collector receives such a name instead. Both engines.
+- **Module names that are Nython keywords** (`import string`, `from
+  re import match`, `import queue`, `io`, `json`...) parse as names
+  (`Parser::identifier()` in dotted names); `from m import (a, b as c,)`
+  with parentheses and trailing commas; `nyrt::import_name_alias` splits
+  `a\x05b` (the parser's encoding of `a as b`) for both engines;
+  `nyrt::prefers_lib_module` decides when `import name` loads
+  `lib/name.ny` rather than the old builtin namespace of that name.
+- `from __future__ import annotations` (PEP 563) and the other `__future__`
+  names are accepted; `annotations` keeps annotations as text (below).
+
+### Classes: the machinery typing, dataclasses, enum and abc stand on (vm_audit79, 43 checks, passes under python3)
+- **Annotations are kept** (they were parsed and dropped): a function's
+  parameter and return annotations are its `__annotations__` (a dict display
+  the parser attaches to the FunctionNode, evaluated when the def runs -
+  before any decorator, so `@f.register` style decorators see them); `x: T =
+  v` in a class body or a module stores `__annotations__["x"]` after the
+  value, as CPython does (the parser lowers it; the scope starts with `var
+  __annotations__ = {}` when it annotates anything); annotations in a
+  function body are not kept. Each value goes through the prelude's
+  `_ny_ann(lambda: T, "T")`: an annotation that cannot be evaluated yet - a
+  forward reference, a name from a module not imported - is kept as its
+  source text (what typing's ForwardRef holds) instead of failing a program
+  that never reads it. `from __future__ import annotations` keeps them all
+  as text; the parser rebuilds the text from the tokens
+  (`Parser::tokenText`). An unannotated function's `__annotations__` is an
+  empty dict made on first read.
+- **PEP 487**: `class C(Base, flag=1)` passes its keywords to the nearest
+  base's `__init_subclass__` (an implicit classmethod; object's raises
+  "C.__init_subclass__() takes no keyword arguments" for leftovers), after
+  `__set_name__(owner, name)` has run for the class's attributes that define
+  it.
+- **`__new__`**: instantiation calls the class's own `__new__(cls, ...)`
+  (cached per class: classes without one pay nothing) and runs `__init__`
+  only when it returned an instance of the class; `object.__new__(cls)` /
+  `super().__new__(cls)` make a bare instance (`_ny_object_new`).
+- **PEP 560 / generics**: `C[x]` calls `__class_getitem__`; `list[int]`,
+  `dict[str, list[int]]`, `tuple[int, ...]`, `type[X]` are the prelude's
+  `_NyGenericAlias` (origin/args, Python's repr, callable,
+  `__mro_entries__`); `int | None`, `Foo | Bar` are `_NyUnionType` (PEP 604)
+  and `isinstance(x, int | str)` works; a base given by an expression
+  (`class C(Generic[T])`, `class P(namedtuple(...))`) is evaluated, with
+  `__mro_entries__`.
+- **Metaclasses**: `metaclass=M` (or a base's). `M.__new__(mcs, name, bases,
+  ns, **kw)` runs on the class the statement built - its `super().__new__`
+  reaches `type.__new__`, which returns that class with ns's entries applied
+  (both engines build classes from the class body, so type.__new__ *adopts*
+  the class rather than making one; `constructing_` holds it) - then
+  `M.__init__`. Operations on the class go to M: calling it (`__call__`,
+  whose `super().__call__` makes the instance - a one-shot flag,
+  `type_call_skip_`, so classes instantiated inside that instance's
+  `__init__` still go through their own metaclass), `iter`/`for`/
+  comprehensions, `len`, `in`, `C[k]`, `repr`/`str`,
+  `isinstance`/`issubclass` (`__instancecheck__`/`__subclasscheck__`), and
+  the attributes the class lacks (M's methods bound to the class -
+  `_NyMetaBound` -, its properties, its `__getattr__`). `type(C)` is M;
+  `type(name, bases, ns)` and `M(name, bases, ns)` make classes at run time
+  (a class node without a body on the interpreter, a bare VMCode on the VM).
+  `super()` in a method whose first parameter is `cls`/`mcs` takes that
+  argument as its receiver.
+- **The VM's method rule**: a class-body function was a method only when its
+  first parameter was literally `self` (the VM strips `self` from the
+  parameter list and binds it from the frame). A getter or method written
+  `def size(cls)` (metaclasses, property getters taking another name) now
+  gets the object as its first argument (`call_with_first`), and an
+  unbound method called with any first argument binds it as self
+  (`Props.x.fget(None)`).
+- **NotImplemented**: a binary or comparison dunder returning it declines -
+  the other operand's reflected method is tried, then TypeError (`==`/`!=`
+  fall back to identity); every method declining is a TypeError rather than
+  the lenient str concatenation; an `__iadd__` declining falls back to
+  `__add__`; the right operand's reflected method comes first when its class
+  is a subclass of the left's that provides its own (Python's rule). On the
+  VM `==` gives the dunder's own result (it was coerced to a bool), and
+  ordering objects without the dunder is a TypeError (it compared garbage).
+- `C.__mro__` ends with the builtin bases and `object` (`(M, type,
+  object)`), `C.__bases__` is a tuple with builtin bases (`(object,)` for a
+  class naming none), `C.__subclasses__()` (a registry filled by
+  `classCreated`/`class_created`) and `C.mro()` reach every class.
+- Also: `...` is the Ellipsis object; class reprs are Python's (`<class
+  '__main__.A'>`, `<class 'int'>`); `class A: x = 1` is a one-line body
+  (Nython's `class A : Base` read it as a base); `C.__dict__`; a bound
+  method's `__func__`, `__self__` and its function's attributes; a
+  function's last expression is no longer its return value on the
+  interpreter (`def f(): 5` returned 5).
+
+### type() gives type objects (vm_audit80, passes under python3)
+- `type(5) is int`, `type(obj)` is its class, `type(C)` is `type` (or C's
+  metaclass), `type(x)(v)` makes another, `type(x) in (int, float)`,
+  `{int: f}[type(x)]`; `x.__class__` for every value (`(5).__class__ is
+  int`). `type()` returned strings, so none of that worked, and libraries
+  carried `_tname()` helpers.
+- **Compatibility bridge** (`NythonExecutor::typeObjectNames`,
+  `VMVal::type_object_named`): a type object is `==` to its name - Python's
+  (`"int"`, `"str"`, `"dict"`, `"type"`, a class's name) *and* the legacy one
+  type() returned (`"string"`, `"map"`, `"class"`) - so the `type(x) ==
+  "list"` comparisons in the libraries and the IDE (about 70) keep working
+  unchanged. What
+  changed for old code: `str(type(x))` is `"<class 'int'>"` (Python's), so
+  tests that compared `str(type(x))` with a name were migrated to
+  `type(x) == "int"`. `typeof(x)` (Nython's keyword) is the legacy name as a
+  string (`"int"`, `"string"`, `"map"`); `x is int` keeps its membership
+  meaning, and the internal `valueIsOfType` uses the legacy name
+  (`legacyTypeName`).
+- `is` between types is identity: `int is int`, `C is C` were false (a
+  type on the left was asked whether it is an instance of the right).
+- The kinds without a type object here keep their legacy name strings:
+  `type(None)` is `"none"`, functions `"function"`, builtins `"builtin"`,
+  generators `"generator"`, typed maps (a `__type__` key) their tag;
+  `isinstance(f, "function")` accepts such a name.
+- VM: builtin natives were all one dict key (`vkey` had no pointer for
+  them: `{int: 1, str: 2}` had one entry) - keyed by what they are now;
+  `isinstance(x, T)` compares the native's name (`native_name`), not its
+  raw tag; `int is int` (natives were never identical); the dead
+  `register_builtins` copies of `len`/`type` that `register_pycore`
+  replaced are removed. VM property descriptors have `fget`, `fset` and an
+  abstract getter's `__isabstractmethod__` (abc reads it); the
+  interpreter's property (its tagged getter) answers `fget`/`fset`, and
+  `obj.m(...)` on a function value is `getattr(obj, "m")(...)`.
+
+### The Python standard library (vm_audit73, 75-78)
+Each module is CPython 3.12's API and algorithm, written in Nython, with a
+header comment saying what is there and what is not; all are `# nython:
+module` files (their own scope). Most tests pass under python3 too.
+- vm_audit73 (292): `json` (package: `JSONEncoder`/`JSONDecoder`,
+  `JSONDecodeError` with positions, `indent`/`sort_keys`/`default`/
+  `object_hook`/`parse_float`..., native scanner `src/builtins/pyjson.cpp`),
+  `random` (the Mersenne Twister, `seed` by CPython's algorithm - the same
+  sequences as CPython for the same seed - `getstate`/`setstate`, every
+  distribution, `src/builtins/pyrandom.cpp`), `datetime` (`_pydatetime`'s
+  algorithms with the C module's messages: date/time/datetime/timedelta/
+  timezone, strftime/strptime/isoformat/fromisoformat), `time`, `io`
+  (StringIO, BytesIO, the stream base classes, TextIOWrapper over a buffer).
+- vm_audit75 (1004): `string`, `textwrap`, `pprint`, `csv`, `statistics`,
+  `fractions`, `struct`, `calendar`, `uuid`.
+- vm_audit76 (273): `fnmatch`, `glob`, `shutil`, `tempfile`, `pathlib`,
+  `subprocess`, `platform`, `getpass`, `logging`, `unittest`, `queue`.
+- vm_audit77 (272): `itertools`, `functools`, `operator`, `heapq`, `bisect`,
+  `copy`, `contextlib`.
+- vm_audit78 (147): `re` over a native engine (`include/NyRe.hpp`,
+  `src/builtins/nyre.cpp`, Unicode tables generated by
+  `tools/gen_re_tables.py`): CPython's `_parser.py` syntax and error
+  messages, a backtracking machine with an explicit stack (no recursion,
+  so huge subjects and deep nesting cannot overflow), and **selective
+  memoization** (Davis, Servant and Lee, *Using Selective Memoization to
+  Defeat Regular Expression Denial of Service*, IEEE S&P 2021): the
+  (instruction, position) states reachable more than once are remembered
+  when they fail, so a pattern without backreferences runs in O(program x
+  subject) - `re.match(r"(a+)+$", "a" * 30 + "b")` answers in well under a
+  second on both engines; python3 3.11 had not finished after 10 s.
+- Gotcha met while merging: a module function stored as a class attribute
+  is bound as a method now (Python's rule), so CPython's own
+  `staticmethod(...)` wrappers are needed (`TestLoader.sortTestMethodsUsing
+  = staticmethod(three_way_cmp)`, the functions of `lib/time.ny`'s `time`
+  namespace class).
 
 ### A running program's input (vm_audit71, tools/ide_e2e.py `run`/`terminal`)
 - The IDE closed a program's stdin (`os_spawn(..., input="")`), so its first
@@ -215,9 +380,14 @@ membership), `frozenset`, the full API and operators; `dict | dict`.
   set an attribute (use `object.__setattr__`).
 - Coroutine objects are task handles (ints): `type(co())` is int, not
   coroutine; awaiting and asyncio work.
-- `__getattribute__` is not dispatched; positional-only parameters are not
-  enforced; a class made by a re-run statement shows its plain name but
-  `type(x) == type(y)` compares names.
+- `__getattribute__` is not dispatched.
+- `type(None)`, functions, builtins and generators have no type object yet
+  (their legacy name strings stand in); `types.FunctionType` and friends are
+  those names.
+- A metaclass's `__prepare__` is not called (the class body runs in the
+  engines' own namespace before the metaclass sees it), and `type.__new__`
+  called by a metaclass for a *different* name than the statement's makes a
+  new class rather than adopting it.
 - Video/audio builtins remain stubs (no codec library).
 
 ## 0o. Round 76 — the "Not done" lists closed

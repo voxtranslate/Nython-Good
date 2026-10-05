@@ -76,7 +76,7 @@ var q = Queue()
 var mq = audit67_mod.Queue()
 var lq = audit67_mod.LifoQueue()
 check("same-named classes stay distinct", [q.kind(), mq.kind(), lq.kind()], ["main.Queue", "audit67_mod.Queue", "audit67_mod.LifoQueue"])
-check("a module class is named after its module", type(mq), "audit67_mod.Queue")
+check("a module class is named after its module", type(mq) == "audit67_mod.Queue", true)
 check("isinstance across module classes", [isinstance(lq, audit67_mod.Queue), isinstance(q, audit67_mod.Queue), isinstance(mq, Queue)], [true, false, false])
 check("except inside the module", audit67_mod.safe_take(mq), "caught inside")
 var caught = []

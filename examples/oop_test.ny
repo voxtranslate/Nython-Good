@@ -144,12 +144,12 @@ var adder = lambda a, b: a + b
 t("lambda_multi", adder(3, 4), 7)
 
 print "=== TYPE INTROSPECTION ==="
-t("type_int", type(42), "int")
-t("type_str", type("hi"), "string")
-t("type_list", type([1,2]), "list")
-t("type_bool", type(true), "bool")
-t("type_float", type(3.14), "float")
-t("type_none", type(none), "none")
+t("type_int", type(42) == "int", true)
+t("type_str", type("hi") == "string", true)
+t("type_list", type([1,2]) == "list", true)
+t("type_bool", type(true) == "bool", true)
+t("type_float", type(3.14) == "float", true)
+t("type_none", type(none) == "none", true)
 t("isinstance_int", isinstance(42, "int"), true)
 t("isinstance_str", isinstance("x", "string"), true)
 

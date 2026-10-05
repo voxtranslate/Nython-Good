@@ -1,5 +1,5 @@
 #pragma once
-// NyRe.hpp - Python's regular expressions (round 78): an engine-neutral
+// NyRe.hpp - Python's regular expressions (round 77): an engine-neutral
 // parser, compiler and backtracking matcher with Python 3.12 `re` syntax and
 // results. src/builtins/nyre.cpp holds the engine and its thin bindings
 // (_re_* builtins, reached by the VM through the builtin bridge); lib/re.ny

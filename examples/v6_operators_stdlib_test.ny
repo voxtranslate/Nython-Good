@@ -112,12 +112,12 @@ t("all_i0", all([1, 0, 3]), false)
 t("any_i", any([0, 0, 1]), true)
 
 print "=== TYPE SYSTEM ==="
-t("type_int", type(42), "int")
-t("type_float", type(3.14), "float")
-t("type_str", type("hi"), "string")
-t("type_bool", type(true), "bool")
-t("type_list", type([1, 2]), "list")
-t("type_none", type(none), "none")
+t("type_int", type(42) == "int", true)
+t("type_float", type(3.14) == "float", true)
+t("type_str", type("hi") == "string", true)
+t("type_bool", type(true) == "bool", true)
+t("type_list", type([1, 2]) == "list", true)
+t("type_none", type(none) == "none", true)
 t("isinstance_i", isinstance(42, "int"), true)
 t("isinstance_s", isinstance("hi", "string"), true)
 

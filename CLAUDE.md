@@ -353,7 +353,14 @@ These were aligned to match how the IDE calls them:
 | vm_audit69 | 40 | round 77: sets and frozensets - typed keys, API, operators, subset comparisons |
 | vm_audit70 | 79 | round 77: http.client/server, urllib, cookies, WebSockets (RFC 6455), TLS with a throwaway CA, network/webserver/sockets/clientserver libraries, math, hashlib |
 | vm_audit71 | 97 | round 77: the command line on each engine (-c/-m/-i/-, sys.argv, SystemExit statuses, the prompt), argparse against python3's output, sys.stdin/stdout/stderr, print(file=), a running program's stdin (os_spawn(stdin=true), input requests), locals/globals/vars/dir, kwargs order |
-| vm_audit72 | 53 | round 77: Python compatibility, passes under python3 too - starred displays, annotations, f"{x=}", slice objects, eval/exec/compile, complex, per-execution classes, collections, object/issubclass, __setattr__/__delattr__, threading.local, docstrings |
+| vm_audit72 | 56 | round 77: Python compatibility, passes under python3 too - starred displays, annotations, f"{x=}", slice objects, eval/exec/compile, complex, per-execution classes, collections, object/issubclass, __setattr__/__delattr__, threading.local, docstrings, positional-only parameters, keyword module names |
+| vm_audit73 | 292 | round 77: json, random (CPython's sequences for a seed), datetime, time, io |
+| vm_audit75 | 1004 | round 77: string, textwrap, pprint, csv, statistics, fractions, struct, calendar, uuid |
+| vm_audit76 | 273 | round 77: fnmatch, glob, shutil, tempfile, pathlib, subprocess, platform, getpass, logging, unittest, queue |
+| vm_audit77 | 272 | round 77: itertools, functools, operator, heapq, bisect, copy, contextlib |
+| vm_audit78 | 147 | round 77: re - Python's syntax and messages over a native engine immune to catastrophic backtracking (selective memoization) |
+| vm_audit79 | 43 | round 77: class machinery, passes under python3 - annotations, PEP 487 (__init_subclass__, __set_name__), __new__, PEP 560/604 generics and unions, metaclasses, NotImplemented and reflected operators, __mro__/__bases__/__subclasses__ |
+| vm_audit80 | 15 | round 77: type() gives type objects (type(5) is int, type(obj) is its class, x.__class__), equal to their legacy names on Nython; typeof(x) is the name |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -952,6 +959,26 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
 - **Gotchas**: `__dict__` is a copy (use `object.__setattr__`); coroutine
   objects are task handles (ints); a prelude name (`slice`, `object`,
   `complex`, `help`) shadows the old placeholder builtin of that name.
+- **Classes** (vm_audit79): annotations are kept (`__annotations__`);
+  `__new__`, `__init_subclass__` with class keywords, `__set_name__`,
+  `__class_getitem__`, `__mro_entries__`, `list[int]`/`X | Y`;
+  **metaclasses** (`type.__new__` adopts the class the statement built;
+  M's dunders, methods and properties reach the class; `type(n, b, ns)`);
+  `NotImplemented` and the reflected-operator protocol; full
+  `__mro__`/`__bases__`, `__subclasses__()`. A module function stored as a
+  class attribute is bound as a method (wrap it in `staticmethod`, as
+  CPython's own code does).
+- **`type(x)` gives type objects** (vm_audit80): `type(5) is int`,
+  `type(obj) is its class`, `(5).__class__`; a type object `==` its name,
+  Python's or the legacy one (`type(x) == "list"`, `"string"`, `"map"`), so
+  old code keeps working - but `str(type(x))` is `"<class 'int'>"`. Use
+  `typeof(x)` for Nython's name as a string. `int is int` is identity.
+- **Standard library** (vm_audit73, 75-78): json, random, datetime, time,
+  io, string, textwrap, pprint, csv, statistics, fractions, struct,
+  calendar, uuid, fnmatch, glob, shutil, tempfile, pathlib, subprocess,
+  platform, getpass, logging, unittest, queue, itertools, functools,
+  operator, heapq, bisect, copy, contextlib, re (a native engine with
+  selective memoization - no catastrophic backtracking).
 
 ## Transcripts
 

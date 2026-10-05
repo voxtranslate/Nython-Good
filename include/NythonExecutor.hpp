@@ -239,7 +239,7 @@ Value dispatch_pyjson   (NythonExecutor& E, const std::string& name, std::vector
 std::vector<std::string> pyjson_builtin_names();
 Value dispatch_pyrandom (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 std::vector<std::string> pyrandom_builtin_names();
-// Regular expressions (round 78): the native engine of lib/re.ny (src/builtins/nyre.cpp).
+// Regular expressions (round 77): the native engine of lib/re.ny (src/builtins/nyre.cpp).
 Value dispatch_re       (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 std::vector<std::string> re_builtin_names();
 Value dispatch_math     (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
@@ -2280,6 +2280,92 @@ public:   // NythonExecutor is a struct: members default to public
     // Structural equality, recursive, as on the VM (and in Python): lists
     // and tuples element by element, maps key by key, sets as sets, 1 == 1.0
     // == true. A list never equals a tuple.
+    // ── type objects (round 77) ─────────────────────────────────────────
+    // A class, or a builtin type (int, str, dict, ...): what type() gives.
+    // Its names, for == with a string: Python's, and the legacy one type()
+    // returned before (str "string", dict "map", type "class").
+    bool typeObjectNames(const Value& v, std::string& py, std::string& legacy) {
+        if (v.type != ValueType::USERDATA || !v.value.p) return false;
+        auto fit = func_names.find(v.value.p);
+        if (fit == func_names.end()) return false;
+        const std::string& t = fit->second;
+        if (t.rfind("__class__:", 0) == 0) {
+            py = shownClassName(t.substr(10));
+            legacy = py;
+            return true;
+        }
+        if (t.rfind("__builtin__:", 0) == 0) {
+            std::string n = t.substr(12);
+            if (n == "map") n = "dict";
+            if (!nyrt::is_builtin_type_name(n)) return false;
+            py = n;
+            legacy = n == "str" ? "string" : n == "dict" ? "map" : n == "type" ? "class" : n;
+            return true;
+        }
+        return false;
+    }
+    bool isTypeObject(const Value& v) { std::string a, b; return typeObjectNames(v, a, b); }
+    // The name type() gave before type objects ("int", "string", "map",
+    // "class", a class's name): what `x is int` and the old string tests
+    // compare against.
+    std::string legacyTypeName(const Value& v) {
+        Value t = typeObjectOf(v);
+        std::string py, legacy;
+        if (typeObjectNames(t, py, legacy)) return legacy;
+        return getStringValue(t);
+    }
+    // type(v) as a type object, or the legacy name for the kinds without one
+    // here (none, functions, builtins, generators, typed maps).
+    Value typeObjectOf(const Value& v) {
+        auto builtin = [&](const char* n) { Value b = builtinValue(n); return b.type == ValueType::NONE ? makeStringValue(n) : b; };
+        switch (v.type) {
+            case ValueType::NONE: return makeStringValue("none");
+            case ValueType::BOOLEAN: return builtin("bool");
+            case ValueType::INTEGER: return builtin("int");
+            case ValueType::DOUBLE: return builtin("float");
+            case ValueType::UNDEFINED: return makeStringValue("undefined");
+            default: break;
+        }
+        if (isStringValue(v)) return builtin("str");
+        if (Container* c = contOf(v)) {
+            if (c->container->count("__set__")) return builtin(isFrozenCont(c) ? "frozenset" : "set");
+            if (c->container->count("__gen__")) return makeStringValue("generator");
+            if (c->container->count("__tuple__")) return builtin("tuple");
+            if (c->container->count("__len__")) return builtin("list");
+            auto type_it = c->container->find("__type__");
+            if (type_it != c->container->end()) return makeStringValue(getStringValue(type_it->second));
+            if (builtinValue("dict").type != ValueType::NONE) return builtin("dict");
+            return builtin("map");
+        }
+        if (v.isCollectable()) return makeStringValue("object");
+        if (v.type == ValueType::USERDATA && v.value.p) {
+            if (auto* bo = bytesOf(v)) return builtin(bo->mut ? "bytearray" : "bytes");
+            if (string_ptrs_.count(v.value.p)) return builtin("str");
+            if (isInstanceValue(v)) {
+                auto ic = instance_to_class.find(v.value.p);
+                if (ic != instance_to_class.end() && ic->second) { Value cv; cv.type = ValueType::USERDATA; cv.value.p = ic->second; return cv; }
+            }
+            auto fit = func_names.find(v.value.p);
+            if (fit != func_names.end()) {
+                if (fit->second.find("__func__:") == 0 || fit->second.find("__lambda__") == 0) return makeStringValue("function");
+                if (fit->second.find("__class__:") == 0) {
+                    // a class: its metaclass, else type
+                    Value meta = metaclassOf(classNodeOfValue(v));
+                    if (meta.type != ValueType::NONE) return meta;
+                    return builtin("type");
+                }
+                if (fit->second.find("__builtin__:") == 0) {
+                    // a builtin type is itself of type type
+                    if (isTypeObject(v)) return builtin("type");
+                    return makeStringValue("builtin");
+                }
+                if (fit->second.find("__bmethod__:") == 0) return makeStringValue("builtin");
+                if (fit->second.find("__instance__:") == 0) return makeStringValue(shownClassName(fit->second.substr(13)));
+            }
+            return makeStringValue("string");
+        }
+        return makeStringValue("unknown");
+    }
     bool valuesEqual(const Value& a, const Value& b, int depth) {
         if (depth > 100) return false;
         // Objects compare through __eq__ (inside containers, for `in`,
@@ -2296,6 +2382,14 @@ public:   // NythonExecutor is a struct: members default to public
             if (ab || bb) return ab && bb && ab->s == bb->s;   // bytes == bytearray by content
         }
         bool as = isStringValue(a), bs = isStringValue(b);
+        if (as != bs) {
+            // a type object and a name: type(x) == "list" (round 77)
+            std::string py, legacy;
+            if (typeObjectNames(as ? b : a, py, legacy)) {
+                const std::string& s = *(std::string*)(as ? a : b).value.p;
+                return s == py || s == legacy;
+            }
+        }
         if (as || bs) {
             if (!(as && bs)) return false;
             return a.value.p == b.value.p || *(std::string*)a.value.p == *(std::string*)b.value.p;
@@ -3328,6 +3422,14 @@ public:   // NythonExecutor is a struct: members default to public
             Value lv = evalNode(bn->left, ctx);
             std::string tn = typeNameOperand(bn->right, ctx);
             bool r;
+            if (!tn.empty() && isTypeObject(lv)) {
+                // a type on the left (type(x) is int, C is C): identity, as
+                // Python - a class is not an instance of itself (round 77)
+                Value rv;
+                bool have = false;
+                try { rv = evalNode(bn->right, ctx); have = true; } catch (std::string&) {}
+                if (have && isTypeObject(rv)) { r = identical(lv, rv); return Value(opc == OP_IS ? r : !r); }
+            }
             if (!tn.empty()) r = valueIsOfType(lv, tn, ctx);
             else r = identical(lv, evalNode(bn->right, ctx));
             return Value(opc == OP_IS ? r : !r);
@@ -5061,6 +5163,13 @@ public:   // NythonExecutor is a struct: members default to public
             }
             Value target;
             if (getAttrValue(obj, method_name, ctx, target)) return callFunctionValue(target, args, ctx);
+        }
+        // obj.m(...) is getattr(obj, "m")(...): an attribute that is not a
+        // method of its own - a property's fget, a function's attribute
+        // (round 77)
+        if (obj.type == ValueType::USERDATA && obj.value.p && !isInstanceValue(obj)) {
+            Value target;
+            if (specialAttribute(obj, method_name, ctx, target)) return callFunctionValue(target, args, ctx, kw_in);
         }
         // Any other value without such a method raises too: `none.m()` and
         // `"s".nosuch()` returned none (round 75). `x?.m()` is the graceful
@@ -7045,6 +7154,12 @@ public:
     // false: a builtin method (list.append ...) is left to the method call
     // that is about to happen instead of being read as a bound value.
     bool getAttrValue(const Value& obj, const std::string& attr, Context* ctx, Value& out, bool bind = true) {
+        if (attr == "__class__" && !isInstanceValue(obj)) {
+            // (5).__class__ is int, [].__class__ is list, C.__class__ is
+            // type (round 77)
+            Value t = typeObjectOf(obj);
+            if (isTypeObject(t)) { out = t; return true; }
+        }
         // Check instance properties first (and invoke @property getters)
         if (obj.type == ValueType::USERDATA && obj.value.p) {
             auto pit = instance_properties.find(obj.value.p);
@@ -7358,6 +7473,17 @@ public:
     bool any_property_ = false;   // no property anywhere: attribute stores skip the class lookup
     std::vector<std::unique_ptr<std::string>> prop_setter_ids_;
     bool specialAttribute(const Value& obj, const std::string& attr, Context* ctx, Value& out, bool bind = true) {
+        if (obj.type == ValueType::USERDATA && obj.value.p && (attr == "fget" || attr == "fset" || attr == "fdel")) {
+            // a property's fget / fset / fdel, as Python's (round 77): the
+            // property is its getter, tagged
+            auto pf = func_names.find(obj.value.p);
+            if (pf != func_names.end() && pf->second.find("__property__") != std::string::npos) {
+                if (attr == "fget") out = obj;
+                else if (attr == "fset") { auto ps = prop_setters_.find(obj.value.p); out = ps != prop_setters_.end() ? ps->second : NONE_VALUE; }
+                else out = NONE_VALUE;
+                return true;
+            }
+        }
         if (obj.type == ValueType::USERDATA && obj.value.p) {
             // A bound method: __self__, __func__, and everything else its
             // function's (__annotations__, __doc__, attributes set on it).
@@ -8302,8 +8428,7 @@ public:
         // Rather than duplicate the logic that tells them apart, ask the same
         // `type` builtin the language exposes — one source of truth, so `is`
         // and `type()` can never disagree.
-        std::vector<Value> targs{v};
-        std::string actual = getStringValue(callBuiltin("type", targs, ctx));
+        std::string actual = legacyTypeName(v);
         auto names_type = [&](const std::string& t) {
             if (t == "string") return want=="str"||want=="String"||want=="string";
             if (t == "list")   return want=="list"||want=="List"||want=="array"||want=="Array";

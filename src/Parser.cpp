@@ -442,7 +442,9 @@ node_ptr Parser::statement(){
     if(see(TokenType::Struct) && !soft_name()) return structDecl();
     if(see(TokenType::Typeof)||see(TokenType::Sizeof)) {
         Token tok = token();
-        std::string fn_name = tok.value == "typeof" ? "type" : "len";
+        // typeof(x) is Nython's name of x's type ("int", "string"); type(x)
+        // is Python's type object (round 77)
+        std::string fn_name = tok.value == "typeof" ? "typeof" : "len";
         next(); // consume keyword
         mustBe(TokenType::ParenOpen);
         auto arg = expression();
@@ -1494,7 +1496,7 @@ node_ptr Parser::primary(){
     // Handle typeof/sizeof as identifiers that resolve to builtins
     if(see(TokenType::Typeof)||see(TokenType::Sizeof)) {
         Token tok = token();
-        tok.value = (tok.value == "typeof") ? "type" : "len";
+        tok.value = (tok.value == "typeof") ? "typeof" : "len";
         next();
         return make_node<VariableNode>(tok);
     }

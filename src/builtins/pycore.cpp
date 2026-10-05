@@ -32,7 +32,7 @@ enum PyB {
     B_LEN = 1, B_STR, B_REPR, B_ASCII, B_FORMAT, B_INT, B_FLOAT, B_BOOL, B_ABS, B_ROUND,
     B_POW, B_DIVMOD, B_HEX, B_OCT, B_BIN, B_CHR, B_ORD, B_MIN, B_MAX, B_SUM, B_SORTED,
     B_REVERSED, B_LIST, B_TUPLE, B_SET, B_FROZENSET, B_DICT, B_ENUMERATE, B_ZIP, B_MAP, B_FILTER,
-    B_ANY, B_ALL, B_RANGE, B_TYPE, B_FMTVAL, B_HASH, B_BYTES, B_BYTEARRAY
+    B_ANY, B_ALL, B_RANGE, B_TYPE, B_TYPEOF, B_FMTVAL, B_HASH, B_BYTES, B_BYTEARRAY
 };
 }
 
@@ -45,7 +45,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         {"sorted", B_SORTED}, {"reversed", B_REVERSED}, {"list", B_LIST}, {"tuple", B_TUPLE},
         {"set", B_SET}, {"frozenset", B_FROZENSET}, {"dict", B_DICT}, {"enumerate", B_ENUMERATE}, {"zip", B_ZIP}, {"map", B_MAP},
         {"filter", B_FILTER}, {"any", B_ANY}, {"all", B_ALL}, {"range", B_RANGE},
-        {"type", B_TYPE}, {"typeof", B_TYPE}, {"__format_value__", B_FMTVAL}, {"hash", B_HASH},
+        {"type", B_TYPE}, {"typeof", B_TYPEOF}, {"__format_value__", B_FMTVAL}, {"hash", B_HASH},
         {"bytes", B_BYTES}, {"bytearray", B_BYTEARRAY},
     };
     auto idit = ids.find(name);
@@ -548,6 +548,11 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         (*obj->container)["__len__"] = intValue(idx);
         return Value((Collectable*)obj);
     }
+    case B_TYPEOF:
+        // Nython's name of the type, the string type() gave before type
+        // objects: "int", "string", "map", "class", a class's name (round 77)
+        need(1, "typeof()");
+        return str_(E.legacyTypeName(args[0]));
     case B_TYPE: {
         // type(name, bases, ns): a new class (round 77)
         if (args.size() == 3) {
@@ -556,6 +561,9 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             return E.typeNew(a, no_kw, ctx);
         }
         need(1, "type()");
+        // a type object (type(5) is int, type(obj) is its class), equal to
+        // its legacy name too (type(x) == "list") - round 77
+        return E.typeObjectOf(args[0]);
         const Value& v = args[0];
         switch (v.type) {
             case ValueType::NONE: return str_("none");
