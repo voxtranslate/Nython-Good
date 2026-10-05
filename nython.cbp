@@ -163,6 +163,7 @@
         <Unit filename="src/builtins/pymath.cpp" />
         <Unit filename="src/builtins/pyjson.cpp" />
         <Unit filename="src/builtins/pyrandom.cpp" />
+        <Unit filename="src/builtins/nyre.cpp" />
         <Unit filename="src/builtins/text.cpp" />
         <Unit filename="src/builtins/os_time.cpp" />
         <Unit filename="src/builtins/os_proc.cpp" />
