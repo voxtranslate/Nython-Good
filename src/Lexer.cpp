@@ -497,11 +497,31 @@ inline std::vector<Token> optimize(std::vector<Token> tk) {
 	for(auto i = 0; i < nb; ) {
         // Guard all tk[i+1] accesses with bounds check
         while(i < nb-1 && tk[i].type()==TokenType::NewLine && tk[i+1].type()==TokenType::NewLine) i++;
-        if(i < nb-1 && tk[i].type()==TokenType::String && tk[i+1].type()==TokenType::String) {
+        // Adjacent string literals are one string, as in Python: 'a' 'b'
+        // == 'ab', and inside brackets across lines too. The joined token
+        // used to be built and dropped, so 'a' 'b' 'c' read as 'c' and a
+        // literal continued on the next line inside parentheses was a
+        // syntax error. Line breaks skipped inside brackets keep their
+        // indentation bookkeeping (paren_indent_delta).
+        if(tk[i].type()==TokenType::String) {
             Token token = tk[i];
-            while(i < nb-1 && tk[i].type()==TokenType::String && tk[i+1].type()==TokenType::String) {
-                token.value.append(tk[i+1].value);
-                i++;
+            int j = i + 1, last = i, d = 0, d_last = 0;
+            while(j < nb) {
+                TokenType t = tk[j].type();
+                if(paren_depth > 0 && (t==TokenType::NewLine || t==TokenType::Indent || t==TokenType::Dedent)) {
+                    if(t==TokenType::Indent) d++;
+                    else if(t==TokenType::Dedent) d--;
+                    j++;
+                    continue;
+                }
+                if(t==TokenType::String) { token.value.append(tk[j].value); last = j; d_last = d; j++; continue; }
+                break;
+            }
+            if(last > i) {
+                paren_indent_delta += d_last;
+                ret.push_back(token);
+                i = last + 1;
+                continue;
             }
         }
         if(i >= nb) break;

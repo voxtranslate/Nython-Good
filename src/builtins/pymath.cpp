@@ -464,8 +464,19 @@ Value dispatch_pymath(NythonExecutor& E, const std::string& full, std::vector<Va
                 for (size_t i = 0; i < p.size(); i++) s = s + big(E, p[i], "sumprod") * big(E, q[i], "sumprod");
                 return intValue(s);
             }
+            // Each product exactly, as its rounded value plus the rounding
+            // error (fma), and fsum's correctly rounded total of those: the
+            // nearest double to the exact dot product, which is what
+            // Python's extended-precision sumprod gives. Summing the
+            // rounded products could be an ulp off (statistics.correlation
+            // and linear_regression differed from CPython's).
             std::vector<double> terms;
-            for (size_t i = 0; i < p.size(); i++) terms.push_back(real(E, p[i], ctx) * real(E, q[i], ctx));
+            for (size_t i = 0; i < p.size(); i++) {
+                double a = real(E, p[i], ctx), b = real(E, q[i], ctx);
+                double pr = a * b;
+                terms.push_back(pr);
+                if (std::isfinite(pr)) terms.push_back(std::fma(a, b, -pr));
+            }
             return F(fsum(terms));
         }
         need(1);

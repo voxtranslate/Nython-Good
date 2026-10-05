@@ -394,9 +394,14 @@ class complex:
         except ValueError:
             raise ValueError("complex() arg is a malformed string")
 
+    # An operand of a number type of its own (fractions.Fraction, ...):
+    # its reflected method, as Python's protocol does when complex's own
+    # declines (NotImplemented) - 2j + Fraction(1, 2) raised TypeError.
     def __add__(self, o):
         var c = _ny_as_complex(o)
         if c is none:
+            if not isinstance(o, "str") and hasattr(o, "__radd__"):
+                return o.__radd__(self)
             raise TypeError("unsupported operand type(s) for +: 'complex' and '" + type(o) + "'")
         return complex(self.real + c.real, self.imag + c.imag)
 
@@ -406,6 +411,8 @@ class complex:
     def __sub__(self, o):
         var c = _ny_as_complex(o)
         if c is none:
+            if not isinstance(o, "str") and hasattr(o, "__rsub__"):
+                return o.__rsub__(self)
             raise TypeError("unsupported operand type(s) for -: 'complex' and '" + type(o) + "'")
         return complex(self.real - c.real, self.imag - c.imag)
 
@@ -418,6 +425,8 @@ class complex:
     def __mul__(self, o):
         var c = _ny_as_complex(o)
         if c is none:
+            if not isinstance(o, "str") and hasattr(o, "__rmul__"):
+                return o.__rmul__(self)
             raise TypeError("unsupported operand type(s) for *: 'complex' and '" + type(o) + "'")
         return complex(self.real * c.real - self.imag * c.imag, self.real * c.imag + self.imag * c.real)
 
@@ -427,6 +436,8 @@ class complex:
     def __truediv__(self, o):
         var c = _ny_as_complex(o)
         if c is none:
+            if not isinstance(o, "str") and hasattr(o, "__rtruediv__"):
+                return o.__rtruediv__(self)
             raise TypeError("unsupported operand type(s) for /: 'complex' and '" + type(o) + "'")
         var d = c.real * c.real + c.imag * c.imag
         if d == 0:
@@ -442,6 +453,8 @@ class complex:
     def __pow__(self, o):
         var c = _ny_as_complex(o)
         if c is none:
+            if not isinstance(o, "str") and hasattr(o, "__rpow__"):
+                return o.__rpow__(self)
             raise TypeError("unsupported operand type(s) for ** or pow(): 'complex' and '" + type(o) + "'")
         if c.imag == 0 and c.real == int(c.real) and abs(c.real) <= 1000:
             # an integer power: exact repeated squaring

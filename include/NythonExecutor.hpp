@@ -970,9 +970,12 @@ public:   // NythonExecutor is a struct: members default to public
         return intValue(nypy::parse_int_literal(v));
     }
 
+    // strtod, not stod: a literal past the double range is inf and one below
+    // the normal range a subnormal (1e-320), as Python reads them; stod threw
+    // out_of_range for both, which made them 0.0 here and a compile error on
+    // the VM.
     Value evalFloat(node_ptr node) {
-        try { return Value(std::stod(node->token().value)); }
-        catch (...) { return Value(0.0); }
+        return Value(std::strtod(node->token().value.c_str(), nullptr));
     }
 
     Value evalString(node_ptr node, Context* ctx = nullptr) {
@@ -2075,7 +2078,10 @@ public:   // NythonExecutor is a struct: members default to public
                     {"//=", "__ifloordiv__"}, {"%=", "__imod__"}, {"**=", "__ipow__"}, {"&=", "__iand__"},
                     {"|=", "__ior__"}, {"^=", "__ixor__"}, {"<<=", "__ilshift__"}, {">>=", "__irshift__"}};
                 auto it = idunder.find(op);
-                if (it != idunder.end()) {
+                // No __iadd__: x += y is x = x + y (__add__, then the
+                // right operand's __radd__), as Python - it raised
+                // AttributeError for a class with only __add__.
+                if (it != idunder.end() && instanceHasMethod(old_val, it->second)) {
                     std::vector<Value> a = {new_val};
                     Value r = callMethod(old_val, it->second, a, ctx);
                     if (r.type != ValueType::NONE) { result = r; done = true; }
@@ -3151,7 +3157,14 @@ public:   // NythonExecutor is a struct: members default to public
                     }
                 }
                 if (conv) return toFmtVal(v, conv, ctx);
-                if (isInstanceVal(v)) return nypy::FmtVal::of_other(strOf(v, ctx), typeNameOf(v));
+                if (isInstanceVal(v)) {
+                    // "{:.2f}".format(Fraction(1, 3)): the object's __format__
+                    // (it was never called: unsupported format string)
+                    nypy::FmtVal fv = nypy::FmtVal::of_other(strOf(v, ctx), typeNameOf(v));
+                    if (instanceHasMethod(v, "__format__"))
+                        fv.custom = [this, v, ctx](const std::string& spec) { return formatValue(v, spec, ctx); };
+                    return fv;
+                }
                 return toFmtVal(v, 0, ctx);
             });
         });
@@ -8168,6 +8181,10 @@ public:
                 ns->set("version", makeStringValue(NYTHON_VERSION));
                 // Python's: 2**31 - 1 on a 32-bit build, 2**63 - 1 on a 64-bit one.
                 ns->set("maxsize", intValue((int64_t)PTRDIFF_MAX));
+                {   // the machine's byte order (struct, array, int.to_bytes callers)
+                    const uint16_t probe = 1;
+                    ns->set("byteorder", makeStringValue(*(const uint8_t*)&probe ? "little" : "big"));
+                }
                 ns->set("exit", global_ctx->getByName("exit"));
                 // the standard streams (NyPrelude _NyStdStream, round 77)
                 for (const char* st : {"stdin", "stdout", "stderr"}) {
@@ -8365,7 +8382,14 @@ public:
                 for (auto& fn : {"sqrt","sin","cos","tan","log","floor","ceil","abs","pow","exp","asin","acos","atan","atan2"})
                     registerBuiltin(fn);
             }
-            ctx->defineByName("math", math_obj);
+            // Cached like a .ny module's namespace, so `import math` (or
+            // `from math import gcd`) in a module run after the program
+            // imported math binds it there too: the circular-import guard
+            // above returned without binding anything (NameError: math in
+            // lib/fractions.ny when the program had imported math first).
+            module_ns_["math"] = math_obj;
+            if (!in_node->names.empty()) bindFromNamespace(math_obj, in_node->names, "math", ctx);
+            else ctx->defineByName(in_node->alias.empty() ? "math" : in_node->alias, math_obj);
             // Also define pi/e as globals for convenience
             ctx->defineByName("PI", Value(3.14159265358979323846));
             ctx->defineByName("E", Value(2.71828182845904523536));

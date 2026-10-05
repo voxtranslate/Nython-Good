@@ -72,16 +72,37 @@ struct BigInt {
         if (mag.size() > 1) u |= (uint64_t)mag[1] << 32;
         return neg ? (int64_t)((uint64_t)0 - u) : (int64_t)u;
     }
+    // Correctly rounded (half to even), as Python's float(int): the top 64
+    // bits with every lower bit folded into the last one (a sticky bit, far
+    // below a double's 53), converted once; inf past the double range. The
+    // top 96 bits through long double rounded twice and could be off by one
+    // ulp (stdlib statistics/fractions rely on Python's exact rounding).
     double to_double() const {
         if (mag.empty()) return 0.0;
-        // Top 96 bits are more than a double's 53; the rest only matter for
-        // the final rounding, which long double absorbs well enough.
-        long double r = 0;
-        size_t n = mag.size();
-        size_t take = std::min<size_t>(n, 4);
-        for (size_t k = 0; k < take; k++) r = r * 4294967296.0L + mag[n - 1 - k];
-        double d = (double)std::ldexp(r, (int)(32 * (n - take)));
+        size_t n = bit_length();
+        uint64_t top;
+        if (n <= 64) {
+            top = mag[0];
+            if (mag.size() > 1) top |= (uint64_t)mag[1] << 32;
+            double d = (double)top;
+            return neg ? -d : d;
+        }
+        size_t sh = n - 64;
+        BigInt t = abs_shr(sh);
+        top = t.mag[0] | ((uint64_t)t.mag[1] << 32);
+        bool sticky = false;
+        size_t limbs = sh / 32, bits = sh % 32;
+        for (size_t i = 0; i < limbs && !sticky; i++) sticky = mag[i] != 0;
+        if (!sticky && bits) sticky = (mag[limbs] & ((1u << bits) - 1)) != 0;
+        if (sticky) top |= 1;
+        double d = n - 64 > 2000 ? HUGE_VAL : std::ldexp((double)top, (int)sh);
         return neg ? -d : d;
+    }
+    // |this| >> n (to_double's helper; shr floors negative values).
+    BigInt abs_shr(size_t n) const {
+        BigInt a = *this;
+        a.neg = false;
+        return a.shr((int64_t)n);
     }
     // Exact conversion of an integral-valued double (the caller truncates).
     static BigInt from_double(double d) {
@@ -441,6 +462,47 @@ inline int num_cmp(const NumV& a, const NumV& b) {
     else { double nd = n.dbl(); r = nd < fd ? -1 : nd > fd ? 1 : 0; }
     return sgn == 1 ? r : -r;
 }
+// a / b for integers, correctly rounded as Python's (CPython's
+// long_true_divide): the quotient to at least 55 significant bits, a sticky
+// bit for a nonzero remainder, one rounding half to even - so 10**25 / 7 is
+// the nearest double and 10**400 / 10**399 is 10.0 (both were computed as
+// double / double: off by an ulp, and nan past the double range).
+inline double int_true_div(const BigInt& a, const BigInt& b) {
+    const int MANT = 53, MIN_EXP = -1021, MAX_EXP = 1024;
+    bool negr = a.neg != b.neg;
+    if (a.is_zero()) return negr ? -0.0 : 0.0;
+    BigInt x = a, y = b;
+    x.neg = false; y.neg = false;
+    int64_t na = (int64_t)x.bit_length(), nb = (int64_t)y.bit_length();
+    if (na <= MANT && nb <= MANT) {
+        double r = x.to_double() / y.to_double();     // exact operands, one rounding
+        return negr ? -r : r;
+    }
+    int64_t diff = na - nb;
+    if (diff > MAX_EXP) raise("OverflowError", "integer division result too large for a float");
+    if (diff < MIN_EXP - MANT - 1) return negr ? -0.0 : 0.0;
+    int64_t shift = std::max<int64_t>(diff, MIN_EXP) - MANT - 2;
+    BigInt q, r;
+    if (shift >= 0) BigInt::floordivmod(x, y.shl(shift), q, r);
+    else BigInt::floordivmod(x.shl(-shift), y, q, r);
+    uint64_t low = q.mag.empty() ? 0 : q.mag[0];
+    if (q.mag.size() > 1) low |= (uint64_t)q.mag[1] << 32;
+    int64_t xbits = (int64_t)q.bit_length();
+    int64_t extra = std::max<int64_t>(xbits, MIN_EXP - shift) - MANT;
+    if (!r.is_zero()) low |= 1;
+    uint64_t mask = (uint64_t)1 << (extra - 1);
+    if ((low & mask) && (low & (3 * mask - 1))) low += mask;
+    low &= ~(2 * mask - 1);
+    double dx = (double)low;                             // exact: <= 53 significant bits
+    if (shift + xbits >= MAX_EXP && (shift + xbits > MAX_EXP || dx == std::ldexp(1.0, (int)xbits)))
+        raise("OverflowError", "integer division result too large for a float");
+    double res = std::ldexp(dx, (int)shift);
+    return negr ? -res : res;
+}
+inline bool fits_mant53(const NumV& v) {
+    return v.k == 1 && v.i >= -9007199254740992LL && v.i <= 9007199254740992LL;
+}
+
 inline NumV arith(int op, const NumV& a, const NumV& b) {
     bool fl = a.k == 3 || b.k == 3;
     switch (op) {
@@ -456,9 +518,11 @@ inline NumV arith(int op, const NumV& a, const NumV& b) {
     }
     case A_DIV:
         if (b.zero()) raise("ZeroDivisionError", fl ? "float division by zero" : "division by zero");
+        if (!fl && !(fits_mant53(a) && fits_mant53(b))) return NumV::F(int_true_div(a.big(), b.big()));
         return NumV::F(a.dbl() / b.dbl());
     case A_FLOORDIV: case A_MOD: {
-        if (b.zero()) raise("ZeroDivisionError", fl ? (op == A_MOD ? "float modulo" : "float floor division by zero") : "integer division or modulo by zero");
+        if (b.zero()) raise("ZeroDivisionError", fl ? (op == A_MOD ? "float modulo" : "float floor division by zero")
+                                                    : (op == A_MOD ? "integer modulo by zero" : "integer division or modulo by zero"));
         if (fl) { double x = a.dbl(), y = b.dbl(); return NumV::F(op == A_MOD ? floormod_f(x, y) : floordiv_f(x, y)); }
         if (a.k == 1 && b.k == 1 && !(a.i == INT64_MIN && b.i == -1))
             return NumV::I(op == A_MOD ? floormod_i64(a.i, b.i) : floordiv_i64(a.i, b.i));

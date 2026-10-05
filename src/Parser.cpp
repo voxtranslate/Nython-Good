@@ -910,11 +910,14 @@ node_ptr Parser::logicalOr(){
     return left;
 }
 
+// Python's precedence, loosest first: or, and, comparisons (==, <, in,
+// is, ...), |, ^, &, shifts, arithmetic. The bitwise operators used to sit
+// below the comparisons, as in C, so `d & 1 == 0` read d & (1 == 0).
 node_ptr Parser::logicalAnd(){
-    node_ptr left = bitwiseOr();
+    node_ptr left = equality();
     while(have(TokenType::And)){
         Token op = prev(); op.value = "and";
-        node_ptr right = bitwiseOr();
+        node_ptr right = equality();
         left = make_node<BinaryNode>(op, left, right);
     }
     return left;
@@ -939,9 +942,9 @@ node_ptr Parser::bitwiseXor(){
 }
 
 node_ptr Parser::bitwiseAnd(){
-    node_ptr left = equality();
+    node_ptr left = shift();
     while(have(TokenType::BinAnd)){
-        Token op = prev(); node_ptr right = equality();
+        Token op = prev(); node_ptr right = shift();
         left = make_node<BinaryNode>(op, left, right);
     }
     return left;
@@ -962,7 +965,7 @@ node_ptr Parser::equality(){
 }
 
 node_ptr Parser::comparison(){
-    node_ptr left = shift();
+    node_ptr left = bitwiseOr();
     while(true){
         Token op = token();
         bool is_cmp = false;
@@ -975,7 +978,7 @@ node_ptr Parser::comparison(){
         if(is_cmp) {
             next(); // consume the operator
             op.value = cmp_op;
-            node_ptr right = shift();
+            node_ptr right = bitwiseOr();
             // Check for chained comparison
             if(left->type() == NodeType::BINARY) {
                 auto* left_bin = static_cast<BinaryNode*>(left.get());
@@ -1004,10 +1007,10 @@ node_ptr Parser::comparison(){
             }
             left = make_node<BinaryNode>(op, left, right);
         }
-        else if(have(TokenType::In))      { op.value = "in"; left = make_node<BinaryNode>(op, left, shift()); }
-        else if(see(TokenType::Not) && peek().type()==TokenType::In) { next(); next(); op.value = "not in"; left = make_node<BinaryNode>(op, left, shift()); }
-        else if(have(TokenType::Is))      { if(have(TokenType::Not)) op.value = "is not"; else op.value = "is"; left = make_node<BinaryNode>(op, left, shift()); }
-        else if(have(TokenType::Instanceof)){op.value = "instanceof"; left = make_node<BinaryNode>(op, left, shift()); }
+        else if(have(TokenType::In))      { op.value = "in"; left = make_node<BinaryNode>(op, left, bitwiseOr()); }
+        else if(see(TokenType::Not) && peek().type()==TokenType::In) { next(); next(); op.value = "not in"; left = make_node<BinaryNode>(op, left, bitwiseOr()); }
+        else if(have(TokenType::Is))      { if(have(TokenType::Not)) op.value = "is not"; else op.value = "is"; left = make_node<BinaryNode>(op, left, bitwiseOr()); }
+        else if(have(TokenType::Instanceof)){op.value = "instanceof"; left = make_node<BinaryNode>(op, left, bitwiseOr()); }
         else break;
     }
     return left;
@@ -2728,7 +2731,12 @@ node_ptr Parser::tryStmt(){
             mustBe(TokenType::ParenClose);
             if(!types.empty()) ename = types[0];
             if(have(TokenType::As)) { ealias = identifier(); var = ealias; }
-        } else if(see(TokenType::Identifier)){
+        } else if(see(TokenType::Identifier)
+                  // a module named like a declaration keyword: `except
+                  // struct.error` was a syntax error
+                  || ((see(TokenType::Struct) || see(TokenType::Enum) || see(TokenType::Interface)
+                       || see(TokenType::NameSpace) || see(TokenType::Package))
+                      && peek(1).type() == TokenType::Dot)){
             ename = dotted();
             if(have(TokenType::As)) { ealias = identifier(); types.push_back(ename); var = ealias; }
             else if(is_type_name(ename)) types.push_back(ename);
