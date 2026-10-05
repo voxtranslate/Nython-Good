@@ -27,6 +27,7 @@
 #include "NythonREPL.hpp"
 #include "NyExcTypes.hpp"
 #include "NyRuntime.hpp"
+#include "NyKwMap.hpp"
 #include "NyPrelude.hpp"
 #include <algorithm>
 #include <fstream>
@@ -34,6 +35,7 @@
 #include <chrono>
 #include <iomanip>
 #include <map>
+#include <set>
 #include <deque>
 #include <thread>
 #include <mutex>
@@ -461,6 +463,9 @@ struct NythonExecutor {
         } catch (...) {
             std::cerr << "[Nython] prelude failed to load\n";
         }
+        // --profile measures the program, not the startup prelude (its
+        // stream objects were the first calls profiled).
+        prof_.clear();
         // What a module's scope sees of the global one (importModule): the
         // builtins and the prelude, not the program's own names.
         if (global_ctx && global_ctx->container)
@@ -556,6 +561,7 @@ public:   // NythonExecutor is a struct: members default to public
             "embedding","embedding_lookup","env_get","eprint","exec_cmd","exp","fclose","fft_magnitude",
             "file_append","file_close","file_copy","file_delete","file_open","file_read","file_readline","file_readlines",
             "file_read_bytes","file_readline_bytes","file_truncate",
+            "stream_write","stream_flush","stream_isatty","stream_readline","stream_read",
             "file_rename","file_size","file_mtime","fuzzy_score","fuzzy_positions","fuzzy_rank","file_write","file_writelines","flush","fprint","fread","freadline",
             "fs_mkdirs","fs_stat","fs_walk","function","fwrite","gelu","getcwd","getenv",
             "gethostbyname","hash_md5","hash_sha256","hex_decode","hex_encode","html_strip","htonl","htons",
@@ -630,7 +636,7 @@ public:   // NythonExecutor is a struct: members default to public
             "os_symlink","os_readlink","os_touch","append","os_gettempdir","os_mkstemp",
             "os_mkdtemp","os_disk_usage","os_chdir","cd","sh",
             "os_unsetenv","os_environ","os_platform","os_cpu_count","os_hostname",
-            "os_username","os_home","os_uname",
+            "os_username","os_home","os_uname","os_get_terminal_size","os_terminal_size",
             "os_system","os_run","subprocess_run","os_spawn","os_proc_read","os_poll",
             "os_wait","os_kill","os_getpid","os_getppid","shell_quote","os_shell_quote","os_shell",
             "which","os_which","sys_argv",
@@ -1128,7 +1134,9 @@ public:   // NythonExecutor is a struct: members default to public
         std::vector<std::string> names;
         for (auto& kv : builtin_ptrs) names.push_back(kv.first);
         auto* ns = new Object((Runnable*)runner, "os", Type::MAP);
+        noteNamespace(ns);
         auto* path = new Object((Runnable*)runner, "path", Type::MAP);
+        noteNamespace(path);
         for (auto& m : nyrt::module_members("os", names)) {
             if (m.first == "environ") continue;   // a map, below (os.environ["HOME"])
             if (m.first.rfind("path.", 0) == 0) path->set(m.first.substr(5), builtinValue(m.second));
@@ -1721,7 +1729,7 @@ public:   // NythonExecutor is a struct: members default to public
         return dot != std::string::npos && nypy::type_kind(n.substr(0, dot)) != nypy::MemberKind::Other;
     }
     // Keyword arguments for a builtin that takes them as a trailing map.
-    void appendKwMap(std::vector<Value>& args, const std::unordered_map<std::string, Value>& kw) {
+    void appendKwMap(std::vector<Value>& args, const nyrt::OrderedKw<Value>& kw) {
         auto* m = new Object((Runnable*)runner, "map", Type::MAP);
         for (auto& kv : kw) m->set(kv.first, kv.second);
         (*m->container)["__kwargs__"] = Value(1);
@@ -1729,8 +1737,8 @@ public:   // NythonExecutor is a struct: members default to public
     }
     // Keyword arguments a builtin received as a trailing "__kwargs__" map
     // (isKwmapBuiltin): taken off `args`.
-    std::unordered_map<std::string, Value> takeKwMap(std::vector<Value>& args) {
-        std::unordered_map<std::string, Value> kw;
+    nyrt::OrderedKw<Value> takeKwMap(std::vector<Value>& args) {
+        nyrt::OrderedKw<Value> kw;
         if (args.empty()) return kw;
         Container* c = contOf(args.back());
         if (!c || !c->container->count("__kwargs__")) return kw;
@@ -1814,7 +1822,7 @@ public:   // NythonExecutor is a struct: members default to public
     }
     // int / float methods (round 77; NyBytes.hpp).
     bool numberMethod(const Value& obj, const std::string& m, std::vector<Value>& args,
-                      const std::unordered_map<std::string, Value>& kw, Context* ctx, Value& out) {
+                      const nyrt::OrderedKw<Value>& kw, Context* ctx, Value& out) {
         bool isint = obj.type == ValueType::INTEGER || obj.type == ValueType::BOOLEAN;
         if (isint && !nypy::int_methods().count(m)) return false;
         if (!isint && (obj.type != ValueType::DOUBLE || !nypy::float_methods().count(m))) return false;
@@ -2128,7 +2136,7 @@ public:   // NythonExecutor is a struct: members default to public
                 if (st == prop_setters_.end())
                     throw std::string("__exc__:AttributeError:can't set attribute '" + name + "'");
                 std::vector<Value> a{val};
-                std::unordered_map<std::string, Value> nokw;
+                nyrt::OrderedKw<Value> nokw;
                 invokeMember(st->second, owner, obj, a, nokw, global_ctx);
                 return;
             }
@@ -2348,7 +2356,7 @@ public:   // NythonExecutor is a struct: members default to public
     // list/tuple methods with Python semantics. Returns false when `name`
     // is not one of them.
     bool listMethod(Container* c, const Value& obj, const std::string& name, std::vector<Value>& args,
-                    const std::unordered_map<std::string, Value>& kw, Context* ctx, Value& out) {
+                    const nyrt::OrderedKw<Value>& kw, Context* ctx, Value& out) {
         static const std::unordered_set<std::string> mine = {
             "sort", "index", "indexOf", "count", "pop", "insert", "copy", "reverse", "clear", "extend", "append", "push"};
         if (!mine.count(name)) return false;
@@ -2462,7 +2470,7 @@ public:   // NythonExecutor is a struct: members default to public
 
     // dict methods. Returns false when `name` is not one.
     bool dictMethod(Container* cont, const Value& obj, const std::string& name, std::vector<Value>& args,
-                    const std::unordered_map<std::string, Value>& kw, Context* ctx, Value& out) {
+                    const nyrt::OrderedKw<Value>& kw, Context* ctx, Value& out) {
         auto& C = *cont->container;
         const bool is_dict = seqLen(cont) < 0;
         auto need = [&](size_t lo, size_t hi) {
@@ -2575,11 +2583,11 @@ public:   // NythonExecutor is a struct: members default to public
     }
     // Keyword arguments of the builtin call being dispatched (evalCall sets
     // it for the builtins that read them; dispatch_pycore takes it).
-    const std::unordered_map<std::string, Value>* cur_kwargs_ = nullptr;
+    const nyrt::OrderedKw<Value>* cur_kwargs_ = nullptr;
     std::vector<std::string> cur_kw_order_;   // their names in call order (dict(a=1, b=2))
     struct KwScope {
-        NythonExecutor* e; const std::unordered_map<std::string, Value>* prev;
-        KwScope(NythonExecutor* x, const std::unordered_map<std::string, Value>* k) : e(x), prev(x->cur_kwargs_) { e->cur_kwargs_ = k; }
+        NythonExecutor* e; const nyrt::OrderedKw<Value>* prev;
+        KwScope(NythonExecutor* x, const nyrt::OrderedKw<Value>* k) : e(x), prev(x->cur_kwargs_) { e->cur_kwargs_ = k; }
         ~KwScope() { e->cur_kwargs_ = prev; }
         KwScope(const KwScope&) = delete;
         KwScope& operator=(const KwScope&) = delete;
@@ -3049,7 +3057,7 @@ public:   // NythonExecutor is a struct: members default to public
     // str.format: positional {} / {0}, named {name}, {0.attr}, {0[key]},
     // !r/!s/!a and format specs, through nypy::str_format.
     std::string strFormat(const std::string& fmt, const std::vector<Value>& args,
-                          const std::unordered_map<std::string, Value>& kw, Context* ctx) {
+                          const nyrt::OrderedKw<Value>& kw, Context* ctx) {
         return nyCall([&] {
             return nypy::str_format(fmt, [&](const nypy::FieldRef& f, char conv) -> nypy::FmtVal {
                 Value v;
@@ -3748,7 +3756,7 @@ public:   // NythonExecutor is a struct: members default to public
         if (fit == func_names.end()) return NONE_VALUE;
         // A class passed as a callable (map(Point, xs), a factory argument).
         if (fit->second.rfind("__class__:", 0) == 0) {
-            static const std::unordered_map<std::string, Value> no_kw;
+            static const nyrt::OrderedKw<Value> no_kw;
             return instantiateClass(fn_val, call_args, no_kw, ctx);
         }
         // A builtin, an instance or a class is not an AST function: treating its
@@ -3783,7 +3791,7 @@ public:   // NythonExecutor is a struct: members default to public
             if (cit != closure_contexts.end()) closure_parent = cit->second;
             Context* fn_ctx = new Context(runner, "<lambda>", nullptr, nullptr, closure_parent);
             CtxReaper _reap_fn_ctx2033(this, fn_ctx);
-            static const std::unordered_map<std::string, Value> no_kw;
+            static const nyrt::OrderedKw<Value> no_kw;
             bindLambdaParams(lam, call_args, no_kw, fn_ctx, closure_parent, fn_val.value.p);
             return evalNode(lam->body, fn_ctx);
         }
@@ -3832,7 +3840,7 @@ public:   // NythonExecutor is a struct: members default to public
     // A method of a bytes / bytearray value (NyBytes.hpp: bytes_method).
     // Keyword arguments are placed where the method takes them.
     Value bytesMethodCall(const Value& obj, nyheap::Bytes* bo, const std::string& m, std::vector<Value>& args_in,
-                          const std::unordered_map<std::string, Value>& kw, Context* ctx) {
+                          const nyrt::OrderedKw<Value>& kw, Context* ctx) {
         std::vector<Value> args = args_in;
         if (!kw.empty()) {
             static const std::unordered_map<std::string, std::vector<const char*>> slots = {
@@ -3878,9 +3886,9 @@ public:   // NythonExecutor is a struct: members default to public
     }
 
     Value callMethod(Value obj, const std::string& method_name, std::vector<Value>& args, Context* ctx,
-                     const std::unordered_map<std::string, Value>* kw_in = nullptr) {
-        static const std::unordered_map<std::string, Value> kEmptyKw;
-        const std::unordered_map<std::string, Value>& kw_args_in = kw_in ? *kw_in : kEmptyKw;
+                     const nyrt::OrderedKw<Value>* kw_in = nullptr) {
+        static const nyrt::OrderedKw<Value> kEmptyKw;
+        const nyrt::OrderedKw<Value>& kw_args_in = kw_in ? *kw_in : kEmptyKw;
         // A generator: send / throw / close / __next__ / __iter__ (NyGen.cpp),
         // then the object protocol; nothing else.
         if (nygen::is_gen(obj)) {
@@ -3916,7 +3924,7 @@ public:   // NythonExecutor is a struct: members default to public
                     return makeBytesValue(nyCall([&] { return nypy::str_encode(s, enc, err); }));
                 }
                 if (method_name == "format_map" && !args.empty()) {
-                    std::unordered_map<std::string, Value> kw;
+                    nyrt::OrderedKw<Value> kw;
                     if (Container* mc = contOf(args[0])) for (auto& kv : *mc->container) if (!isInternalKey(kv.first)) kw[nypy::key_payload(kv.first)] = kv.second;
                     std::vector<Value> none;
                     return makeStringValue(strFormat(s, none, kw, ctx));
@@ -4838,7 +4846,7 @@ public:   // NythonExecutor is a struct: members default to public
     // Returns positional args in call_args, named args in kw_args (name->value)
     void evalCallArgs(const std::vector<node_ptr>& raw_args, Context* ctx,
                       std::vector<Value>& call_args,
-                      std::unordered_map<std::string, Value>& kw_args) {
+                      nyrt::OrderedKw<Value>& kw_args) {
         for (auto& a : raw_args) {
             if (a->type() == NodeType::KEYWORD_ARG) {
                 // Named argument: name=value
@@ -4891,7 +4899,7 @@ public:   // NythonExecutor is a struct: members default to public
     // shifted left and attribute reads yielding none. Every invocation must bind
     // parameters, so putting it here means a new call path cannot miss it.
     void bindParamsKw(FunctionNode* fn, std::vector<Value>& call_args,
-                      const std::unordered_map<std::string, Value>& kw_args,
+                      const nyrt::OrderedKw<Value>& kw_args,
                       Context* fn_ctx, Context* eval_ctx, size_t skip_params = 0,
                       void* callee_ptr = nullptr) {
         std::vector<Value> bound_args;
@@ -4944,7 +4952,7 @@ public:   // NythonExecutor is a struct: members default to public
     // argument for the same parameter without consuming it, so the
     // positional one shifted onto the next parameter.
     void bindParamsImpl(FunctionNode* fn, std::vector<Value>& call_args,
-                        const std::unordered_map<std::string, Value>& kw_args,
+                        const nyrt::OrderedKw<Value>& kw_args,
                         Context* fn_ctx, Context* eval_ctx, size_t skip_params,
                         void* callee_ptr = nullptr) {
         size_t arg_idx = 0;
@@ -5010,7 +5018,7 @@ public:   // NythonExecutor is a struct: members default to public
     // The same for a lambda: binds its parameters (positional, keyword,
     // *args, defaults evaluated in `def_ctx`) and checks the call fits.
     void bindLambdaParams(LambdaNode* lam, std::vector<Value>& args,
-                          const std::unordered_map<std::string, Value>& kw, Context* fc, Context* def_ctx,
+                          const nyrt::OrderedKw<Value>& kw, Context* fc, Context* def_ctx,
                           void* callee_ptr = nullptr) {
         const std::vector<Value>* made = nullptr;   // defaults evaluated by evalLambda
         if (callee_ptr) {
@@ -5449,7 +5457,7 @@ public:
                 // first base of the class was searched, keyword arguments were
                 // dropped and every exception was swallowed.)
                 Value self_val = ctx->getByName("self");
-                std::vector<Value> sargs; std::unordered_map<std::string, Value> skw;
+                std::vector<Value> sargs; nyrt::OrderedKw<Value> skw;
                 evalCallArgs(cn->args, ctx, sargs, skw);
                 Value out;
                 if (superCall(self_val, owner_stack_.back(), method_name, sargs, skw, ctx, out)) return out;
@@ -5470,7 +5478,7 @@ public:
                         }
                     }
                 }
-                std::vector<Value> args; std::unordered_map<std::string, Value> kw_args;
+                std::vector<Value> args; nyrt::OrderedKw<Value> kw_args;
                 evalCallArgs(cn->args, ctx, args, kw_args);
                 // super().__init__(...) reaching a builtin exception class.
                 if ((method_name == "__init__" || method_name == "init") && !parent_name.empty()
@@ -5516,7 +5524,7 @@ public:
             Value obj = evalNode(attr->object, ctx);
 
             // Evaluate arguments
-            std::vector<Value> args; std::unordered_map<std::string, Value> kw_args;
+            std::vector<Value> args; nyrt::OrderedKw<Value> kw_args;
             evalCallArgs(cn->args, ctx, args, kw_args);
 
             // Check class_ctx_map_ FIRST for decorated methods (e.g. @decorator on class method)
@@ -5702,7 +5710,7 @@ public:
         // the parent class's constructor (super(name, 4)). It did nothing.
         if (cn->callee->type() == NodeType::SUPER && !owner_stack_.empty() && owner_stack_.back()) {
             Value self_val = ctx->getByName("self");
-            std::vector<Value> sargs; std::unordered_map<std::string, Value> skw;
+            std::vector<Value> sargs; nyrt::OrderedKw<Value> skw;
             evalCallArgs(cn->args, ctx, sargs, skw);
             Value out;
             superCall(self_val, owner_stack_.back(), "__init__", sargs, skw, ctx, out);
@@ -5713,7 +5721,7 @@ public:
 
         // Evaluate arguments (handles keyword args, *spread, **spread)
         std::vector<Value> args;
-        std::unordered_map<std::string, Value> kw_args;
+        nyrt::OrderedKw<Value> kw_args;
         uint64_t gen_s0 = nygen::serial_now();
         evalCallArgs(cn->args, ctx, args, kw_args);
 
@@ -6340,6 +6348,13 @@ public:
                 std::string target = nyrt::builtin_member(base, attr,
                     [&](const std::string& n) { return builtin_ptrs.count(n) > 0; });
                 if (!target.empty()) { out = builtinValue(target); return true; }
+                // len.__name__, int.__name__ (argparse's "invalid int value")
+                if (attr == "__name__" || attr == "__qualname__") {
+                    size_t dot = base.rfind('.');
+                    out = makeStringValue(dot == std::string::npos ? base : base.substr(dot + 1));
+                    return true;
+                }
+                if (attr == "__module__") { out = makeStringValue("builtins"); return true; }
                 return false;
             }
         }
@@ -6503,7 +6518,7 @@ public:
         }
     }
     // Calls a bound member made by boundMember; false if `fn` is not one.
-    bool callBoundMember(const Value& fn, std::vector<Value>& args, const std::unordered_map<std::string, Value>* kw,
+    bool callBoundMember(const Value& fn, std::vector<Value>& args, const nyrt::OrderedKw<Value>* kw,
                          Context* ctx, Value& out) {
         if (fn.type != ValueType::USERDATA || !fn.value.p) return false;
         auto it = bound_members_.find(fn.value.p);
@@ -6880,6 +6895,9 @@ public:
         // StopIteration.value: a generator's return value (both engines).
         if (classDerivesFrom(instanceClassName(inst), "StopIteration"))
             pit->second->defineByName("value", args.empty() ? NONE_VALUE : args[0]);
+        // SystemExit.code: exit(n) / sys.exit(n) (round 77)
+        if (classDerivesFrom(instanceClassName(inst), "SystemExit"))
+            pit->second->defineByName("code", args.empty() ? NONE_VALUE : args.size() == 1 ? args[0] : makeListValue(args, true));
     }
     std::string valueToDisplay(const Value& v) {
         if (v.type == ValueType::USERDATA && v.value.p && instance_to_class.count(v.value.p))
@@ -6978,7 +6996,7 @@ public:
                 // StopIteration() / GeneratorExit() raised by the runtime
                 // carry no argument (value is none, args empty).
                 if ((t == "StopIteration" || t == "GeneratorExit") && excMessageOf(flow).empty()) a.clear();
-                static const std::unordered_map<std::string, Value> no_kw;
+                static const nyrt::OrderedKw<Value> no_kw;
                 Value obj = instantiateClass(cv, a, no_kw, global_ctx);
                 return obj;
             }
@@ -7147,7 +7165,7 @@ public:
         return instance;
     }
     Value instantiateClass(const Value& cls, std::vector<Value>& args,
-                           const std::unordered_map<std::string, Value>& kw, Context* ctx) {
+                           const nyrt::OrderedKw<Value>& kw, Context* ctx) {
         std::string className = fnTag(func_names, cls.value.p).substr(10);
         Value instance = newInstance(className, cls.value.p);
         if (isExceptionClass(className)) setExceptionArgs(instance, args);
@@ -7169,7 +7187,7 @@ public:
             if (fit != func_names.end()) {
                 if (fit->second.rfind("__class__:", 0) == 0) {
                     std::vector<Value> none_args;
-                    static const std::unordered_map<std::string, Value> no_kw;
+                    static const nyrt::OrderedKw<Value> no_kw;
                     v = instantiateClass(v, none_args, no_kw, ctx);
                 } else if (fit->second.rfind("__builtin__:", 0) == 0
                            && nython::ny_is_builtin_exc(fit->second.substr(12))) {
@@ -7540,6 +7558,7 @@ public:
         if (path.empty()) throw std::string("__exc__:ModuleNotFoundError:No module named '" + dotted + "'");
         if (dir) {
             auto* ns = new Object((Runnable*)runner, dotted, Type::MAP);
+            noteNamespace(ns);
             ns->set("__name__", makeStringValue(dotted));
             Value nsv((Collectable*)ns);
             module_ns_[dotted] = nsv;
@@ -7593,6 +7612,7 @@ public:
         nython::scope::qualify_module_classes(ast, module_name);
         imported_asts.push_back(ast);
         auto* ns = new Object((Runnable*)runner, module_name, Type::MAP);
+        noteNamespace(ns);
         Value nsv((Collectable*)ns);
         // Registered before the module runs, so a circular import binds it.
         module_ns_[module_name] = nsv;
@@ -7989,12 +8009,20 @@ public:
                 plat = "linux";
 #endif
                 auto* ns = new Object((Runnable*)runner, in_node->alias.empty() ? "sys" : in_node->alias, Type::MAP);
+                noteNamespace(ns);
                 ns->set("argv", argv_list);
                 ns->set("platform", makeStringValue(plat));
                 ns->set("executable", makeStringValue(nyrt::executable_path()));
                 ns->set("version", makeStringValue(NYTHON_VERSION));
                 // Python's: 2**31 - 1 on a 32-bit build, 2**63 - 1 on a 64-bit one.
                 ns->set("maxsize", intValue((int64_t)PTRDIFF_MAX));
+                ns->set("exit", global_ctx->getByName("exit"));
+                // the standard streams (NyPrelude _NyStdStream, round 77)
+                for (const char* st : {"stdin", "stdout", "stderr"}) {
+                    Value sv = global_ctx->getByName(std::string("_ny_") + st);
+                    ns->set(st, sv);
+                    ns->set(std::string("__") + st + "__", sv);
+                }
                 ctx->defineByName(in_node->alias.empty() ? "sys" : in_node->alias, Value((Collectable*)ns));
                 ctx->defineByName("argv", argv_list);
                 ctx->defineByName("platform", makeStringValue(plat));
@@ -8148,18 +8176,15 @@ public:
                 registerBuiltin("sha512");
                 return NONE_VALUE;
         }
-        if (module_name == "collections") {
-                registerBuiltin("OrderedDict");
-                registerBuiltin("Counter");
-                registerBuiltin("defaultdict");
-                registerBuiltin("deque");
-                registerBuiltin("Set");
-                return NONE_VALUE;
-        }
+        // `collections` is lib/collections.ny (round 77): real deque,
+        // Counter, defaultdict, OrderedDict, namedtuple, ChainMap. The bare
+        // Counter/deque/... builtins stay for programs that never import it.
         if (module_name == "math") {
-            // Create a math module object (collectable dict)
-            std::vector<Value> no_args;
-            Value math_obj = callBuiltin("dict", no_args, ctx);
+            // The math module: a namespace object, as `import os` makes
+            // (it was a plain dict, so dir(math) listed dict methods).
+            auto* math_ns = new Object((Runnable*)runner, "math", Type::MAP);
+            noteNamespace(math_ns);
+            Value math_obj((Collectable*)math_ns);
             if (!math_obj.isCollectable() || !math_obj.value.gc) {
                 // Fallback: just register as globals and return none
                 ctx->defineByName("PI", Value(3.14159265358979323846));
@@ -8415,6 +8440,7 @@ public:
                         ctx->defineByName(bind_as, same);
                     } else {
                         auto* ns = new Object((Runnable*)runner, bind_as, Type::MAP);
+                        noteNamespace(ns);
                         for (const auto& n : own) {
                             Value v = ctx->getByName(n);
                             if (v.type != ValueType::UNDEFINED) ns->set(n, v);
@@ -8731,6 +8757,120 @@ public:
         return v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p)
                && instance_to_class.count(v.value.p);
     }
+    // ── Reflection: locals(), globals(), vars(), dir() (round 77) ──────
+    // All four were placeholders returning none. locals() is the calling
+    // scope's names (at module level, globals()); globals() the module's
+    // own names - not the builtins and prelude every program starts with;
+    // vars(x) is x.__dict__ (a class: its namespace, a module: its names);
+    // dir(x) the sorted names x answers to.
+    static bool reflectHidden(const std::string& k) {
+        if (k.empty() || (unsigned char)k[0] < 0x20) return true;
+        if (k == "__name__" || k == "__file__" || k == "__doc__") return false;
+        return isInternalKey(k);
+    }
+    Value reflectGlobals(Context* ctx) {
+        Context* m = moduleCtx(ctx ? ctx : global_ctx);
+        auto* d = new Object((Runnable*)runner, "map", Type::MAP);
+        if (m && m->container)
+            for (auto& kv : *m->container) {
+                if (reflectHidden(kv.first)) continue;
+                if (m == global_ctx && base_global_names_.count(kv.first)) continue;
+                d->set(kv.first, kv.second);
+            }
+        return Value((Collectable*)d);
+    }
+    Value reflectLocals(Context* ctx) {
+        if (!ctx || ctx == global_ctx || ctx->inModule || !ctx->parent) return reflectGlobals(ctx);
+        auto* d = new Object((Runnable*)runner, "map", Type::MAP);
+        if (ctx->container)
+            for (auto& kv : *ctx->container) if (!reflectHidden(kv.first)) d->set(kv.first, kv.second);
+        return Value((Collectable*)d);
+    }
+    Node* classNodeOfValue(const Value& v) {
+        if (v.type != ValueType::USERDATA || !v.value.p) return nullptr;
+        auto fit = func_names.find(v.value.p);
+        if (fit == func_names.end() || fit->second.rfind("__class__:", 0) != 0) return nullptr;
+        Node* n = (Node*)v.value.p;
+        return n->type() == NodeType::CLASS ? n : nullptr;
+    }
+    void classMemberNames(Node* cls, std::set<std::string>& out) {
+        for (Node* c : classMro(cls)) {
+            auto cit = class_ctx_map_.find((void*)c);
+            if (cit == class_ctx_map_.end() || !cit->second || !cit->second->container) continue;
+            for (auto& kv : *cit->second->container)
+                if (!kv.first.empty() && (unsigned char)kv.first[0] >= 0x20) out.insert(kv.first);
+        }
+    }
+    // Module and namespace objects (import X, `namespace N:`, os, sys)
+    // are recorded where they are made, with their names: a freed one's
+    // address reused by a dict is not mistaken for it.
+    std::unordered_map<const void*, std::string> namespace_objs_;
+    void noteNamespace(Object* o) { if (o) namespace_objs_[(const void*)o] = o->getName(); }
+    bool isModuleNamespace(const Value& v) {
+        Container* c = contOf(v);
+        auto* o = c ? dynamic_cast<Object*>(c) : nullptr;
+        if (!o) return false;
+        auto it = namespace_objs_.find((const void*)o);
+        return it != namespace_objs_.end() && it->second == o->getName() && o->getName() != "map";
+    }
+    Value reflectVars(std::vector<Value>& args, Context* ctx) {
+        if (args.empty()) return reflectLocals(ctx);
+        const Value& o = args[0];
+        auto* d = new Object((Runnable*)runner, "map", Type::MAP);
+        Value dv((Collectable*)d);
+        if (isInstanceValue(o)) {
+            auto pit = instance_properties.find(o.value.p);
+            if (pit != instance_properties.end() && pit->second && pit->second->container)
+                for (auto& kv : *pit->second->container) if (!reflectHidden(kv.first)) d->set(kv.first, kv.second);
+            return dv;
+        }
+        if (Node* cn = classNodeOfValue(o)) {
+            auto cit = class_ctx_map_.find((void*)cn);
+            if (cit != class_ctx_map_.end() && cit->second && cit->second->container)
+                for (auto& kv : *cit->second->container)
+                    if (!kv.first.empty() && (unsigned char)kv.first[0] >= 0x20) d->set(kv.first, kv.second);
+            return dv;
+        }
+        if (isModuleNamespace(o)) {
+            for (auto& kv : *contOf(o)->container) if (!reflectHidden(kv.first)) d->set(kv.first, kv.second);
+            return dv;
+        }
+        pyRaise("TypeError", "vars() argument must have __dict__ attribute");
+        return NONE_VALUE;
+    }
+    Value reflectDir(std::vector<Value>& args, Context* ctx) {
+        std::set<std::string> names;
+        if (args.empty()) {
+            Value l = reflectLocals(ctx);
+            for (auto& kv : *contOf(l)->container) if (!isInternalKey(kv.first) || !reflectHidden(kv.first)) names.insert(nypy::key_payload(kv.first));
+        } else {
+            const Value& o = args[0];
+            if (isInstanceValue(o)) {
+                auto pit = instance_properties.find(o.value.p);
+                if (pit != instance_properties.end() && pit->second && pit->second->container)
+                    for (auto& kv : *pit->second->container) if (!reflectHidden(kv.first)) names.insert(kv.first);
+                if (Node* cn = classNodeOfInstance(o)) classMemberNames(cn, names);
+                names.insert("__class__"); names.insert("__dict__");
+            } else if (Node* cn = classNodeOfValue(o)) {
+                classMemberNames(cn, names);
+                for (const char* n : {"__bases__", "__mro__", "__module__", "__name__", "__qualname__"}) names.insert(n);
+            } else if (isModuleNamespace(o)) {
+                for (auto& kv : *contOf(o)->container) if (!reflectHidden(kv.first)) names.insert(kv.first);
+            } else {
+                nypy::MemberKind k = memberKindOf(o);
+                if (const auto* ms = nypy::kind_methods(k)) names.insert(ms->begin(), ms->end());
+                if (k != nypy::MemberKind::Other) {
+                    for (auto& m : nypy::protocol_members()) names.insert(m);
+                    names.insert("__class__");
+                } else if (o.type == ValueType::USERDATA) {
+                    for (const char* n : {"__module__", "__name__", "__qualname__"}) names.insert(n);
+                }
+            }
+        }
+        std::vector<Value> out;
+        for (auto& n : names) out.push_back(makeStringValue(n));
+        return makeListValue(out);
+    }
     bool instanceHasMethod(const Value& v, const std::string& name) {
         Node* cn = classNodeOfInstance(v);
         Value m;
@@ -8758,7 +8898,7 @@ public:
     // on the class). Keyword arguments, defaults and exceptions all behave
     // as for a plain call.
     Value invokeMember(Value m, Node* owner, Value self, std::vector<Value>& args,
-                       const std::unordered_map<std::string, Value>& kw, Context* ctx) {
+                       const nyrt::OrderedKw<Value>& kw, Context* ctx) {
         std::string tag = fnTag(func_names, m.value.p);
         bool is_static = tag.find("__static__") != std::string::npos;
         bool is_cm = tag.find("__classmethod__") != std::string::npos;
@@ -8833,7 +8973,7 @@ public:
     // super().name(...): `name` from the class after `owner` in the MRO of
     // self's class. Returns false when nothing defines it there.
     bool superCall(Value self, Node* owner, const std::string& name, std::vector<Value>& args,
-                   const std::unordered_map<std::string, Value>& kw, Context* ctx, Value& out) {
+                   const nyrt::OrderedKw<Value>& kw, Context* ctx, Value& out) {
         Node* start = isInstanceValue(self) ? classNodeOfInstance(self) : owner;
         if (!start) return false;
         Value m; Node* where = nullptr;
@@ -9007,7 +9147,7 @@ public:
     // Runs the constructor of a new instance: the first class in its MRO
     // that defines __init__ or init.
     void runConstructor(Value inst, std::vector<Value>& args,
-                        const std::unordered_map<std::string, Value>& kw, Context* ctx) {
+                        const nyrt::OrderedKw<Value>& kw, Context* ctx) {
         Node* cls = classNodeOfInstance(inst);
         if (!cls) return;
         for (Node* c : classMro(cls)) {
@@ -9025,7 +9165,7 @@ public:
     // Calls method `name` of an instance (or a class) through the class
     // namespaces and the MRO. Returns false when no class defines it.
     bool callClassMethod(Value obj, const std::string& name, std::vector<Value>& args,
-                         const std::unordered_map<std::string, Value>& kw, Context* ctx, Value& out) {
+                         const nyrt::OrderedKw<Value>& kw, Context* ctx, Value& out) {
         Node* cls = isInstanceValue(obj) ? classNodeOfInstance(obj) : nullptr;
         if (!cls && obj.type == ValueType::USERDATA && obj.value.p
             && fnTag(func_names, obj.value.p).rfind("__class__:", 0) == 0) {
@@ -9120,6 +9260,7 @@ public:
         // namespace map elsewhere in this file) into a map bound to its
         // name, so it can actually be used from outside.
         auto* obj = new Object((Runnable*)runner, nn->name, Type::MAP);
+        noteNamespace(obj);
         if (nn->body) {
             for (auto& stmt : nn->body->statements()) {
                 std::string member_name;

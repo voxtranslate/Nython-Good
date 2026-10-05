@@ -53,11 +53,11 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
     const int id = idit->second;
 
     // Keyword arguments for this call (empty when there are none).
-    static const std::unordered_map<std::string, Value> kNoKw;
+    static const nyrt::OrderedKw<Value> kNoKw;
     // Taken, not borrowed: a builtin this one calls internally must not see them.
-    const std::unordered_map<std::string, Value>* kwp = E.cur_kwargs_;
+    const nyrt::OrderedKw<Value>* kwp = E.cur_kwargs_;
     E.cur_kwargs_ = nullptr;
-    const std::unordered_map<std::string, Value>& kw = kwp ? *kwp : kNoKw;
+    const nyrt::OrderedKw<Value>& kw = kwp ? *kwp : kNoKw;
     auto kwarg = [&](const char* k) -> const Value* {
         auto it = kw.find(k);
         return it == kw.end() ? nullptr : &it->second;
@@ -431,6 +431,14 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         if (!args.empty()) {
             if (Container* src = E.contOf(args[0]); src && NythonExecutor::seqLen(src) < 0 && !nygen::is_gen(args[0])) {
                 E.dictUpdate(dc, src);
+            } else if (E.isInstanceValue(args[0]) && E.instanceHasMethod(args[0], "keys")) {
+                // a mapping: keys(), then obj[k] (Python's dict(mapping))
+                std::vector<Value> no_args;
+                Value ks = E.callMethod(args[0], "keys", no_args, ctx);
+                for (auto& k : E.iterItems(ks, ctx)) {
+                    std::vector<Value> ka{k};
+                    E.dictSet(dc, k, E.callMethod(args[0], "__getitem__", ka, ctx));
+                }
             } else {
                 for (auto& pairv : E.iterItems(args[0], ctx)) {
                     std::vector<Value> kv = E.iterItems(pairv, ctx);

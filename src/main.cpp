@@ -129,14 +129,46 @@ static int report_uncaught_string(const std::string& s) {
         std::cerr << "KeyboardInterrupt\n";
         return 130;
     }
+    if (msg.rfind("SystemExit", 0) == 0) {
+        // exit(n) / sys.exit(n): the status, no report
+        std::string rest = msg.size() > 12 ? msg.substr(12) : std::string();
+        return nyrt::system_exit_status(rest);
+    }
     std::cerr << "[Nython] Uncaught exception — " << msg << "\n";
     report_uncaught_where(msg);
     return 1;
 }
 
-int run_file(const std::string& filename, bool show_ast = false) {
+// What to run (round 77): a file, or program text (-c, stdin) with a name
+// for messages ("<string>", "<stdin>").
+struct Program {
+    bool is_file = true;
+    std::string path, text, name;
+    std::string display() const { return is_file ? path : name; }
+};
+static SourceCode source_of(const Program& p) {
+    return p.is_file ? SourceCode(p.path) : SourceCode::from_text(p.text, p.name);
+}
+// -i: the interactive prompt after the program, in its scope.
+static bool g_inspect = false;
+// SystemExit raised at the prompt: the status the process ends with (-1: none).
+static int g_repl_exit = -1;
+// -q: no banner on the prompt.
+static bool g_quiet = false;
+static void setenv_quiet() { g_quiet = true; }
+// -u / NYTHONUNBUFFERED: every write reaches the terminal or pipe at once.
+static void setenv_default_unbuffered() {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+    std::cout.setf(std::ios::unitbuf);
+    std::cerr.setf(std::ios::unitbuf);
+}
+static void interactive_interp(NythonExecutor& exec, Runnable* runner, bool banner);
+
+int run_program(const Program& prog, bool show_ast = false) {
+    const std::string filename = prog.display();
     struct stat buf;
-    if (stat(filename.c_str(), &buf) != 0) {
+    if (prog.is_file && stat(filename.c_str(), &buf) != 0) {
         std::cerr << "[Nython] No such file: " << filename << "\n";
         return 2;
     }
@@ -148,7 +180,7 @@ int run_file(const std::string& filename, bool show_ast = false) {
         if (T.f) { fclose(T.f); T.f = nullptr; }
     } } trace_closer;
     try {
-        auto source = SourceCode(filename);
+        auto source = source_of(prog);
         auto reporter = std::make_shared<Reporter>(source);
         auto lexer = std::make_shared<Lexer>(source);
         auto vm_ptr = std::make_shared<nython::vm::VirtualMachine>(reporter.get());
@@ -178,8 +210,11 @@ int run_file(const std::string& filename, bool show_ast = false) {
             // file mentions (loop variables included), not the hundreds of
             // names an import defines.
             {
-                std::ifstream in(filename);
-                std::string src((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                std::string src = prog.text;
+                if (prog.is_file) {
+                    std::ifstream in(filename);
+                    src.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+                }
                 size_t i = 0;
                 while (i < src.size()) {
                     unsigned char c = (unsigned char)src[i];
@@ -202,9 +237,11 @@ int run_file(const std::string& filename, bool show_ast = false) {
             // Reported before the program's threads are waited for, as
             // Python prints the traceback first.
             int rc = report_uncaught_string(s);
+            if (g_inspect) { interactive_interp(exec, (Runnable*)vm_ptr.get(), false); return g_repl_exit >= 0 ? g_repl_exit : rc; }
             nyconc::join_nondaemon_at_exit();
             return rc;
         }
+        if (g_inspect) interactive_interp(exec, (Runnable*)vm_ptr.get(), false);
         // Generators the program left suspended are closed now, oldest
         // first, so their finally blocks and __exit__ run (as when CPython
         // shuts down).
@@ -235,7 +272,13 @@ int run_file(const std::string& filename, bool show_ast = false) {
         report_uncaught_where(e.what());
         return 1;
     }
-    return 0;
+    return g_repl_exit >= 0 ? g_repl_exit : 0;
+}
+
+int run_file(const std::string& filename, bool show_ast = false) {
+    Program p;
+    p.path = filename;
+    return run_program(p, show_ast);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -439,152 +482,189 @@ static bool launch_ide(const std::string& binary_dir) {
 // ────────────────────────────────────────────────────────────────────────────
 // Terminal REPL
 // ────────────────────────────────────────────────────────────────────────────
-void repl() {
-    auto reporter_src = SourceCode(std::string("<repl>"));
-    auto reporter = std::make_shared<Reporter>(reporter_src);
-    auto vm_ptr = std::make_shared<nython::vm::VirtualMachine>(reporter.get());
-    NythonExecutor exec((Runnable*)vm_ptr.get());
+// ── The interactive prompt (round 77) ───────────────────────────────────────
+// One loop for both engines: a value typed at the prompt is shown as its
+// repr (as Python does: 0.1 + 0.2 is 0.30000000000000004, 'a' is quoted
+// with escapes) and kept in `_`; an exception reads "ValueError: message"
+// (it was the internal "__exc__:ValueError:message"). NYTHONSTARTUP runs
+// first, as PYTHONSTARTUP does.
 
-    // Non-interactive mode: read from pipe/redirect
+// "__exc__:Type:message" -> "Type: message"
+static std::string exc_text(const std::string& s) {
+    std::string type, msg;
+    if (nython::ny_split_exc_message(s, type, msg)) return msg.empty() ? type : type + ": " + msg;
+    return s;
+}
+
+// Whether a parsed chunk is one expression (so the prompt shows its value).
+static bool is_expression_chunk(const nython::node::node_ptr& ast) {
+    using nython::node::NodeType;
+    nython::node::node_ptr n = ast;
+    for (int depth = 0; n && depth < 4; depth++) {
+        NodeType t = n->type();
+        if (t == NodeType::SCRIPT || t == NodeType::STATEMENTS || t == NodeType::BLOCK || t == NodeType::STATEMENT) {
+            auto st = n->statements();
+            if (st.size() != 1) return false;
+            n = st[0];
+            continue;
+        }
+        switch (t) {
+            case NodeType::TUPLE: case NodeType::LIST: case NodeType::MAP: case NodeType::FLOAT:
+            case NodeType::INTEGER: case NodeType::STRING: case NodeType::TRUE: case NodeType::FALSE:
+            case NodeType::NONE: case NodeType::CALL: case NodeType::INTERVAL: case NodeType::COMPLEX:
+            case NodeType::SLICE: case NodeType::RANGE: case NodeType::VARIABLE: case NodeType::ATTRIBUTE:
+            case NodeType::SUBSCRIPT: case NodeType::LAMBDA: case NodeType::UNARY: case NodeType::BINARY:
+            case NodeType::BINARY_OP: case NodeType::BINARY_RE: case NodeType::DYN_BINOP:
+            case NodeType::COMPREHENSION: case NodeType::OPT_CHAIN: case NodeType::BYTES: case NodeType::SELF:
+                return true;
+            default:
+                return false;
+        }
+    }
+    return false;
+}
+
+// The prompt loop: run_chunk(code) runs what was typed.
+static void interactive_loop(const std::function<void(const std::string&)>& run_chunk, bool banner, const char* engine) {
+    if (banner && !g_quiet && isatty(STDIN_FILENO)) {
+        print_header();
+        std::cout << "\x1b[90m(" << engine << ")\x1b[0m\n";
+    }
+    if (const char* st = getenv("NYTHONSTARTUP")) {
+        std::ifstream in(st);
+        if (in) {
+            std::string code((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            run_chunk(code);
+        }
+    }
     if (!isatty(STDIN_FILENO)) {
-        std::string all_code;
-        {
-            char buf[4096];
-            while (true) {
-                ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
-                if (n <= 0) break;
-                all_code.append(buf, n);
-            }
-        }
-        // Strip exit/quit lines
-        {
-            std::string cleaned;
-            size_t pos = 0;
-            while (pos < all_code.size()) {
-                size_t nl = all_code.find('\n', pos);
-                std::string ln = (nl == std::string::npos) ? all_code.substr(pos) : all_code.substr(pos, nl - pos);
-                auto t = ln.find_first_not_of(" \t\r");
-                std::string trimmed = (t != std::string::npos) ? ln.substr(t) : "";
-                if (trimmed != "exit" && trimmed != "quit" && trimmed != "exit()" && trimmed != "quit()") {
-                    if (!cleaned.empty()) cleaned += "\n";
-                    cleaned += ln;
+        // Not a terminal (-i with piped input): plain lines, no line
+        // editing; a block (a line ending with ':' or '{') runs at the
+        // blank line or the next unindented line that ends it.
+        std::string block, line;
+        auto flush = [&]() {
+            if (block.find_first_not_of(" \t\r\n") != std::string::npos && g_repl_exit < 0) run_chunk(block);
+            block.clear();
+        };
+        while (std::getline(std::cin, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            std::string t = line;
+            while (!t.empty() && (t.back() == ' ' || t.back() == '\t')) t.pop_back();
+            bool opens = !t.empty() && (t.back() == ':' || t.back() == '{');
+            bool indented = !line.empty() && (line[0] == ' ' || line[0] == '\t');
+            if (!block.empty()) {
+                if (t.empty()) { flush(); continue; }
+                if (indented || t[0] == '}' || t.rfind("else", 0) == 0 || t.rfind("elif", 0) == 0 || t.rfind("except", 0) == 0 || t.rfind("finally", 0) == 0) {
+                    block += line + "\n";
+                    continue;
                 }
-                if (nl == std::string::npos) break;
-                pos = nl + 1;
+                flush();
+                if (g_repl_exit >= 0) return;
             }
-            all_code = cleaned;
+            if (t == "exit" || t == "quit" || t == "exit()" || t == "quit()") return;
+            if (opens) { block = line + "\n"; continue; }
+            run_chunk(line);
+            if (g_repl_exit >= 0) return;
         }
-        if (all_code.empty()) return;
-        try {
-            auto src = SourceCode(all_code);
-            auto rep = std::make_shared<Reporter>(src);
-            auto lex = std::make_shared<Lexer>(src);
-            lex->tokenize();
-            auto par = std::make_shared<Parser>(rep.get(), (Runnable*)vm_ptr.get(), lex.get());
-            auto ast = par->parse();
-            if (ast) {
-                Value val = exec.execute(ast);
-                if (val.type != ValueType::NONE && val.type != ValueType::UNDEFINED) {
-                    exec.printValue(val);
-                    std::cout << std::endl;
-                }
-            }
-        } catch (exception::SyntaxError& se) {
-            std::cerr << "SyntaxError: " << se.what() << std::endl;
-        } catch (std::string& err) {
-            std::cerr << "Error: " << err << std::endl;
-        } catch (std::exception& ex) {
-            std::cerr << "Error: " << ex.what() << std::endl;
-        } catch (...) {
-            std::cerr << "Unknown error" << std::endl;
-        }
+        flush();
         return;
     }
-
-    // Interactive REPL
-    print_header();
     nython::repl_engine::MultilineCollector collector;
     std::cout << "\n";
-
     while (true) {
         std::string code;
         auto result = collector.collect(code);
         if (result == nython::repl_engine::MultilineCollector::EXIT_REQ) break;
         if (result == nython::repl_engine::MultilineCollector::CANCEL) continue;
         if (result == nython::repl_engine::MultilineCollector::EMPTY) continue;
-
         auto s = code.find_first_not_of(" \t\r\n");
         if (s == std::string::npos) continue;
         code = code.substr(s);
         auto e = code.find_last_not_of(" \t\r\n");
         if (e != std::string::npos) code = code.substr(0, e + 1);
-
         if (code == "exit" || code == "quit" || code == "exit()" || code == "quit()") break;
         if (code == "help" || code == "help()") {
-            std::cout << "\x1b[1mNython " << NYTHON_VERSION << "\x1b[0m — AI-Powered Multi-Paradigm Language\n\n"
+            std::cout << "\x1b[1mNython " << NYTHON_VERSION << "\x1b[0m\n\n"
                       << "  \x1b[36mCommands:\x1b[0m  exit, help, version, clear\n"
-                      << "  \x1b[36mSyntax:\x1b[0m    Python (colon+indent), C/JS (braces), Lua (do/end)\n"
                       << "  \x1b[36mKeys:\x1b[0m      Up/Down=history, Ctrl+C=cancel, Ctrl+D=exit\n"
                       << "             Ctrl+L=clear, Ctrl+A=home, Ctrl+E=end, Tab=indent\n"
-                      << "  \x1b[36mMultiline:\x1b[0m Lines ending with : { or do auto-continue\n"
-                      << "             Empty line submits the block\n\n";
+                      << "  \x1b[36mMultiline:\x1b[0m Lines ending with : { or do continue; an empty line submits\n"
+                      << "  \x1b[36mValues:\x1b[0m    an expression's value is shown and kept in _\n\n";
             continue;
         }
         if (code == "version") { std::cout << "Nython " << NYTHON_VERSION << "\n"; continue; }
         if (code == "clear") { std::cout << "\x1b[2J\x1b[H"; continue; }
 #if NYTHON_WITH_IDE
-        if (code == "ide") {
-            std::cout << "Launching NythonIDE...\n";
-            launch_ide(".");
-            continue;
-        }
+        if (code == "ide") { std::cout << "Launching NythonIDE...\n"; launch_ide("."); continue; }
 #endif
-
-        try {
-            auto src = SourceCode(code);
-            auto rep = std::make_shared<Reporter>(src);
-            auto lex = std::make_shared<Lexer>(src);
-            lex->tokenize();
-            auto par = std::make_shared<Parser>(rep.get(), (Runnable*)vm_ptr.get(), lex.get());
-            auto ast = par->parse();
-            if (ast) {
-                Value val = exec.execute(ast);
-                if (val.type != ValueType::NONE && val.type != ValueType::UNDEFINED) {
-                    std::string repr;
-                    if (val.type == ValueType::INTEGER) repr = val.value.i.toString();
-                    else if (val.type == ValueType::DOUBLE) {
-                        std::ostringstream oss; oss << val.value.d; repr = oss.str();
-                    }
-                    else if (val.type == ValueType::BOOLEAN) repr = val.value.b ? "true" : "false";
-                    else if (val.type == ValueType::USERDATA && val.value.p) {
-                        repr = "\x1b[33m'" + exec.getStringValue(val) + "'\x1b[0m";
-                    }
-                    else if (val.type == ValueType::COLLECTABLE) {
-                        std::vector<Value> sa = {val};
-                        Value sv = exec.callBuiltin("str", sa, exec.global_ctx);
-                        repr = exec.getStringValue(sv);
-                    }
-                    if (!repr.empty()) std::cout << "\x1b[90m" << repr << "\x1b[0m" << std::endl;
-                }
-            }
-        } catch (exception::SyntaxError& se) {
-            std::cout << "\x1b[31mSyntaxError:\x1b[0m " << se.what() << "\n";
-        } catch (std::string& err) {
-            if (err == "break" || err == "continue")
-                std::cout << "\x1b[31mSyntaxError:\x1b[0m '" << err << "' outside loop\n";
-            else
-                std::cout << "\x1b[31mError:\x1b[0m " << err << "\n";
-        } catch (nython::node::ReturnSignal&) {
-            std::cout << "\x1b[31mSyntaxError:\x1b[0m 'return' outside function\n";
-        } catch (std::runtime_error& re) {
-            std::cout << "\x1b[31mRuntimeError:\x1b[0m " << re.what() << "\n";
-        } catch (std::exception& ex) {
-            std::cout << "\x1b[31mError:\x1b[0m " << ex.what() << "\n";
-        } catch (...) {
-            std::cout << "\x1b[31mUnknown error\x1b[0m\n";
-        }
+        run_chunk(code);
+        if (g_repl_exit >= 0) break;
     }
-    std::cout << "\x1b[1mGoodbye!\x1b[0m\n";
+    if (isatty(STDIN_FILENO)) std::cout << "\x1b[1mGoodbye!\x1b[0m\n";
+}
+
+// What a chunk defined (functions, classes) points into its AST: every
+// chunk's parse is kept for the session.
+static std::vector<std::shared_ptr<void>>& repl_keep() {
+    static auto* k = new std::vector<std::shared_ptr<void>>();
+    return *k;
+}
+
+// One chunk on the interpreter, in exec's global scope.
+static void interp_chunk(NythonExecutor& exec, Runnable* runner, const std::string& code, bool echo) {
+    try {
+        auto src = SourceCode::from_text(code, "<stdin>");
+        auto rep = std::make_shared<Reporter>(src);
+        auto lex = std::make_shared<Lexer>(src);
+        lex->tokenize();
+        auto par = std::make_shared<Parser>(rep.get(), runner, lex.get());
+        auto ast = par->parse();
+        if (!ast) return;
+        repl_keep().push_back(ast); repl_keep().push_back(par); repl_keep().push_back(lex); repl_keep().push_back(rep);
+        bool expr = is_expression_chunk(ast);
+        Value val = exec.execute(ast);
+        if (echo && expr && val.type != ValueType::NONE && val.type != ValueType::UNDEFINED) {
+            std::cout << exec.reprOf(val, exec.global_ctx) << std::endl;
+            exec.global_ctx->defineByName("_", val);
+        }
+    } catch (exception::SyntaxError& se) {
+        std::cerr << "SyntaxError: " << se.what() << std::endl;
+    } catch (exception::UnexpectedCharError& e) {
+        std::cerr << "SyntaxError: " << e.message() << std::endl;
+    } catch (std::string& err) {
+        std::string et, em;
+        if (err == "break" || err == "continue") std::cerr << "SyntaxError: '" << err << "' outside loop\n";
+        else if (nython::ny_split_exc_message(err, et, em) && et == "SystemExit") g_repl_exit = nyrt::system_exit_status(em);
+        else std::cerr << exc_text(err) << "\n";
+    } catch (nython::node::ReturnSignal&) {
+        std::cerr << "SyntaxError: 'return' outside function\n";
+    } catch (std::exception& ex) {
+        std::string w = ex.what();
+        std::cerr << (w.rfind("KeyboardInterrupt", 0) == 0 ? std::string("KeyboardInterrupt") : exc_text(w)) << "\n";
+    } catch (...) {
+        std::cerr << "Unknown error\n";
+    }
+}
+
+static void interactive_interp(NythonExecutor& exec, Runnable* runner, bool banner) {
+    interactive_loop([&](const std::string& code) { interp_chunk(exec, runner, code, true); }, banner, "interpreter");
+}
+
+void repl() {
+    auto reporter_src = SourceCode::from_text("", "<stdin>");
+    auto reporter = std::make_shared<Reporter>(reporter_src);
+    auto vm_ptr = std::make_shared<nython::vm::VirtualMachine>(reporter.get());
+    NythonExecutor exec((Runnable*)vm_ptr.get());
+    struct JoinThreadsAtExit { ~JoinThreadsAtExit() { nyconc::join_nondaemon_at_exit(); } } join_threads_at_exit;
+    // Not a terminal (a pipe, a file): the whole input is one program -
+    // unless -i asked for the prompt anyway (Python's: values echoed).
+    if (!isatty(STDIN_FILENO) && !g_inspect) {
+        std::string all_code((std::istreambuf_iterator<char>(std::cin)), std::istreambuf_iterator<char>());
+        if (all_code.find_first_not_of(" \t\r\n") == std::string::npos) return;
+        interp_chunk(exec, (Runnable*)vm_ptr.get(), all_code, false);
+        return;
+    }
+    interactive_interp(exec, (Runnable*)vm_ptr.get(), true);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -870,6 +950,217 @@ void install_vm_builtin_bridge(Runnable* runner) {
 } // namespace
 
 
+// ── The bytecode VM: a program, and the prompt on it (round 77) ─────────────
+static void interactive_vm(nython::vm::VirtualMachine& vm, VMMap& session, bool banner);
+
+static void vm_chunk(nython::vm::VirtualMachine& vm, VMMap& session, const std::string& code, bool echo) {
+    try {
+        auto src = SourceCode::from_text(code, "<stdin>");
+        auto rep = std::make_shared<Reporter>(src);
+        auto lex = std::make_shared<Lexer>(src);
+        lex->tokenize();
+        auto par = std::make_shared<Parser>(rep.get(), (Runnable*)&vm, lex.get());
+        auto ast = par->parse();
+        if (!ast) return;
+        repl_keep().push_back(ast); repl_keep().push_back(par); repl_keep().push_back(lex); repl_keep().push_back(rep);
+        bool expr = echo && is_expression_chunk(ast);
+        if (expr) {
+            // the value lands in a variable the prompt then shows
+            auto src2 = SourceCode::from_text("__ny_repl_v__ = (" + code + ")", "<stdin>");
+            auto rep2 = std::make_shared<Reporter>(src2);
+            auto lex2 = std::make_shared<Lexer>(src2);
+            lex2->tokenize();
+            auto par2 = std::make_shared<Parser>(rep2.get(), (Runnable*)&vm, lex2.get());
+            try {
+                auto a2 = par2->parse();
+                if (a2) { ast = a2; repl_keep().push_back(a2); repl_keep().push_back(par2); repl_keep().push_back(lex2); repl_keep().push_back(rep2); }
+                else expr = false;
+            }
+            catch (...) { expr = false; }
+        }
+        vm.run(ast, &session);
+        if (nython::vm::VirtualMachine::exit_status() >= 0) { g_repl_exit = nython::vm::VirtualMachine::exit_status(); return; }
+        if (expr) {
+            auto it = session.find("__ny_repl_v__");
+            if (it != session.end()) {
+                VMVal v = it->second;
+                session.erase("__ny_repl_v__");
+                if (v.type != VMType::NONE && v.type != VMType::UNDEFINED) {
+                    std::cout << vm.repr_of(v) << std::endl;
+                    session["_"] = v;
+                }
+            }
+        }
+    } catch (exception::SyntaxError& se) {
+        std::cerr << "SyntaxError: " << se.what() << std::endl;
+    } catch (exception::UnexpectedCharError& e) {
+        std::cerr << "SyntaxError: " << e.message() << std::endl;
+    } catch (std::string& err) {
+        std::cerr << exc_text(err) << "\n";
+    } catch (std::exception& ex) {
+        std::cerr << exc_text(ex.what()) << "\n";
+    }
+}
+
+static void interactive_vm(nython::vm::VirtualMachine& vm, VMMap& session, bool banner) {
+    interactive_loop([&](const std::string& code) { vm_chunk(vm, session, code, true); }, banner, "bytecode VM");
+}
+
+static int run_program_vm(const Program& prog, bool inspect) {
+    // SourceCode treats a string that is not an existing file as program
+    // TEXT, so a mistyped path used to be run as code (`--vm t/x.ny`
+    // evaluated `t / x.ny`). Refuse it like the interpreter does.
+    if (prog.is_file) {
+        struct stat vm_st;
+        if (stat(prog.path.c_str(), &vm_st) != 0) {
+            std::cerr << "[Nython] No such file: " << prog.path << "\n";
+            return 2;
+        }
+    }
+    try {
+        auto source = source_of(prog);
+        auto reporter = std::make_shared<Reporter>(source);
+        auto lexer2 = std::make_shared<Lexer>(source);
+        auto vm2 = std::make_shared<nython::vm::VirtualMachine>(reporter.get());
+        // Non-daemon threads finish before the VM goes away (round 74).
+        struct JoinThreadsAtExit { ~JoinThreadsAtExit() { nyconc::join_nondaemon_at_exit(); } } join_threads_at_exit;
+        // Imports resolve relative to the script (the interpreter's rule).
+        if (prog.is_file) vm2->set_script_dir(prog.path);
+        auto parser2 = std::make_shared<Parser>(reporter.get(), (Runnable*)vm2.get(), lexer2.get());
+        install_vm_builtin_bridge((Runnable*)vm2.get());
+        lexer2->tokenize();
+        auto ast = parser2->parse();
+        // run() reports an uncaught exception itself and returns RUNTIME_ERROR.
+        VMMap session;
+        int rc = 0;
+        if (ast) {
+            auto res = vm2->run(ast, inspect ? &session : nullptr);
+            if (res == decltype(res)::RUNTIME_ERROR) {
+                int st = nython::vm::VirtualMachine::exit_status();
+                rc = nython::vm::VirtualMachine::keyboard_interrupted() ? 130 : st >= 0 ? st : 1;
+            }
+        }
+        if (inspect) interactive_vm(*vm2, session, false);
+        return g_repl_exit >= 0 ? g_repl_exit : rc;
+    } catch (exception::SyntaxError& e) {
+        report_compiler_error("syntax error", e.location(), e.message()); return 1;
+    } catch (exception::UnexpectedCharError& e) {
+        report_compiler_error("error", e.location(), e.message()); return 1;
+    } catch (std::string& msg) {
+        std::cerr << "VM Error: " << exc_text(msg) << "\n"; return 1;
+    } catch (std::exception& e) {
+        std::cerr << "VM Error: " << e.what() << "\n"; return 1;
+    }
+}
+
+static void repl_vm() {
+    auto src = SourceCode::from_text("", "<stdin>");
+    auto reporter = std::make_shared<Reporter>(src);
+    auto vm = std::make_shared<nython::vm::VirtualMachine>(reporter.get());
+    install_vm_builtin_bridge((Runnable*)vm.get());
+    struct JoinThreadsAtExit { ~JoinThreadsAtExit() { nyconc::join_nondaemon_at_exit(); } } join_threads_at_exit;
+    VMMap session;
+    if (!isatty(STDIN_FILENO) && !g_inspect) {
+        std::string all((std::istreambuf_iterator<char>(std::cin)), std::istreambuf_iterator<char>());
+        if (all.find_first_not_of(" \t\r\n") != std::string::npos) vm_chunk(*vm, session, all, false);
+        return;
+    }
+    interactive_vm(*vm, session, true);
+}
+
+// --check: parse (and, on the VM, compile) without running: "ok", or the
+// error located as when running; status 0 or 1.
+static int check_program(const Program& prog, bool vm) {
+    if (prog.is_file) {
+        struct stat st;
+        if (stat(prog.path.c_str(), &st) != 0) { std::cerr << "[Nython] No such file: " << prog.path << "\n"; return 2; }
+    }
+    try {
+        auto source = source_of(prog);
+        auto reporter = std::make_shared<Reporter>(source);
+        auto lex = std::make_shared<Lexer>(source);
+        auto vmp = std::make_shared<nython::vm::VirtualMachine>(reporter.get());
+        auto par = std::make_shared<Parser>(reporter.get(), (Runnable*)vmp.get(), lex.get());
+        lex->tokenize();
+        auto ast = par->parse();
+        if (vm && ast) vmp->compile_ast(ast);
+        std::cout << prog.display() << ": ok\n";
+        return 0;
+    } catch (exception::SyntaxError& e) {
+        report_compiler_error("syntax error", e.location(), e.message()); return 1;
+    } catch (exception::UnexpectedCharError& e) {
+        report_compiler_error("error", e.location(), e.message()); return 1;
+    } catch (std::string& s) {
+        std::cerr << exc_text(s) << "\n"; return 1;
+    } catch (std::exception& e) {
+        std::cerr << e.what() << "\n"; return 1;
+    }
+}
+
+// -m: a library module's file (a/b.ny, or a package's a/b/__main__.ny),
+// looked up where `import` looks: the working directory and its lib/, then
+// NYTHONPATH and the library beside the interpreter.
+static bool find_module_file(const std::string& mod, std::string& out) {
+    std::string rel = mod;
+    std::replace(rel.begin(), rel.end(), '.', '/');
+    std::vector<std::string> dirs = {"", "lib/"};
+    for (auto& d : nyrt::library_dirs()) dirs.push_back(d);
+    struct stat st;
+    for (auto& d : dirs) {
+        std::string f = d + rel + ".ny";
+        if (stat(f.c_str(), &st) == 0 && !S_ISDIR(st.st_mode)) { out = f; return true; }
+        std::string m = d + rel + "/__main__.ny";
+        if (stat(m.c_str(), &st) == 0) { out = m; return true; }
+    }
+    return false;
+}
+
+static void print_usage() {
+    std::cout
+        << "Usage: nython [option] ... [-c cmd | -m mod | file | -] [arg] ...\n\n"
+        << "Options (short ones combine: -iq):\n"
+        << "  -c cmd            run the program text cmd (sys.argv[0] is \"-c\")\n"
+        << "  -m mod            run library module mod as the program (a package: its __main__.ny)\n"
+        << "  file              run the program in file; -  reads it from stdin\n"
+        << "  -i                after the program, the interactive prompt in its scope\n"
+        << "  -q                no banner on the interactive prompt\n"
+        << "  -u                unbuffered output (also NYTHONUNBUFFERED=1)\n"
+        << "  -E                ignore NYTHON* environment variables\n"
+        << "  --vm              run on the bytecode VM (default: the interpreter)\n"
+        << "  --interp          run on the tree-walking interpreter\n"
+        << "  --check           parse (and with --vm, compile) without running\n"
+        << "  -t, --tokenize    dump the tokens          -a, --ast      dump the AST\n"
+        << "  -d, --disasm      dump the VM bytecode     -p, --profile  per-function timings\n"
+        << "      --trace OUT   record each executed statement to OUT (JSON lines)\n"
+        << "  --cli, --repl     the interactive prompt (no IDE)\n"
+        << "  --ide             NythonIDE\n"
+        << "  -V, -v, --version the version          -h, --help     this text\n\n"
+        << "Environment: NYTHONPATH (module search path), NYTHONSTARTUP (run before the\n"
+        << "interactive prompt), NYTHONUNBUFFERED\n"
+#if NYTHON_WITH_IDE
+        << "\nWith no arguments on a terminal, NythonIDE opens; --cli gives the prompt instead.\n"
+#endif
+        ;
+}
+
+static void print_version() {
+    std::cout << "Nython " << NYTHON_VERSION;
+#if NYTHON_WITH_IDE
+    std::cout << " (IDE build)";
+#else
+    std::cout << " (CLI build)";
+#endif
+    std::cout << "\n";
+}
+
+static void unset_env(const char* k) {
+#ifdef _WIN32
+    _putenv_s(k, "");
+#else
+    unsetenv(k);
+#endif
+}
+
 int main(int argc, char** argv, char** env) {
     g_argv0 = (argc > 0 && argv[0]) ? argv[0] : "";
     nyrt::executable_path() = get_exe_path();
@@ -880,183 +1171,150 @@ int main(int argc, char** argv, char** env) {
         // every finally block); signal.signal() installs the others.
         nyconc::install_default_signals();
 
-        if (argc >= 2) {
-            std::string arg1 = argv[1];
-
-            // ── Version / Help ───────────────────────────────────────────
-            if (arg1 == "--version" || arg1 == "-v") {
-                std::cout << "Nython " << NYTHON_VERSION;
+        // ── The command line (round 77): options, then the program ─────
+        // (-c cmd | -m mod | file | -), then the program's own arguments.
+        // Options combine (-iq), and the engine choice applies to every
+        // way of giving a program. The old forms still work: --vm file,
+        // --trace OUT file, -p file, -t/-a/-d file.
+        bool use_vm = false, inspect = false, quiet = false, force_repl = false, profile = false, ide = false;
+        std::string tool, mode, target, trace_out;
+        int i = 1;
+        auto bad = [&](const std::string& m) { std::cerr << "nython: " << m << "\nTry 'nython -h' for more information.\n"; return 2; };
+        for (; i < argc; i++) {
+            std::string a = argv[i];
+            if (a == "--") { i++; if (i < argc) { mode = "file"; target = argv[i]; i++; } break; }
+            if (a == "-") { mode = "stdin"; i++; break; }
+            if (a.size() > 2 && a[0] == '-' && a[1] == '-') {
+                if (a == "--vm") use_vm = true;
+                else if (a == "--interp") use_vm = false;
+                else if (a == "--version") { print_version(); return 0; }
+                else if (a == "--help") { print_usage(); return 0; }
+                else if (a == "--ide") ide = true;
+                else if (a == "--cli" || a == "--repl" || a == "--console") force_repl = true;
+                else if (a == "--tokenize") tool = "tokenize";
+                else if (a == "--ast") tool = "ast";
+                else if (a == "--disasm") tool = "disasm";
+                else if (a == "--check") tool = "check";
+                else if (a == "--profile") profile = true;
+                else if (a == "--trace") {
+                    if (i + 1 >= argc) return bad("--trace needs an output file");
+                    trace_out = argv[++i];
+                }
+                else return bad("unknown option " + a);
+                continue;
+            }
+            if (a.size() > 1 && a[0] == '-') {
+                bool stop = false;
+                for (size_t k = 1; k < a.size() && !stop; k++) {
+                    char c = a[k];
+                    if (c == 'c' || c == 'm') {
+                        std::string val = a.substr(k + 1);
+                        if (val.empty()) {
+                            if (i + 1 >= argc) return bad(std::string("option -") + c + " needs an argument");
+                            val = argv[++i];
+                        }
+                        mode = c == 'c' ? "cmd" : "module";
+                        target = val;
+                        stop = true;
+                    }
+                    else if (c == 'i') inspect = true;
+                    else if (c == 'q') quiet = true;
+                    else if (c == 'u') setenv_default_unbuffered();
+                    else if (c == 'E') { unset_env("NYTHONPATH"); unset_env("NYTHONSTARTUP"); unset_env("NYTHONUNBUFFERED"); }
+                    else if (c == 'V' || c == 'v') { print_version(); return 0; }
+                    else if (c == 'h' || c == '?') { print_usage(); return 0; }
+                    else if (c == 't') tool = "tokenize";
+                    else if (c == 'a') tool = "ast";
+                    else if (c == 'd') tool = "disasm";
+                    else if (c == 'p') profile = true;
+                    else if (c == 'B' || c == 'O' || c == 's' || c == 'S' || c == 'b') {}   // Python's: nothing to do here
+                    else return bad(std::string("unknown option -") + c);
+                }
+                if (stop) { i++; break; }
+                continue;
+            }
+            mode = "file";
+            target = a;
+            i++;
+            break;
+        }
+        if (const char* ub = getenv("NYTHONUNBUFFERED")) if (*ub) setenv_default_unbuffered();
 #if NYTHON_WITH_IDE
-                std::cout << " (IDE build)";
+        if (ide) { launch_ide(get_binary_dir(argv[0])); return 0; }
 #else
-                std::cout << " (CLI build)";
+        (void)ide;
 #endif
-                std::cout << "\n";
-                return 0;
-            }
-            if (arg1 == "--help" || arg1 == "-h") {
-                std::cout
-                    << "Usage: nython [options] [script.ny]\n\n"
-                    << "Options:\n"
-                    << "  -v, --version      Show version and build type\n"
-                    << "  -h, --help         Show this help\n"
-                    << "  -t, --tokenize     Tokenize file and dump tokens\n"
-                    << "  -a, --ast          Show AST for file\n"
-                    << "  --vm <file>        Run script via Bytecode VM\n"
-                    << "  -d, --disasm       Disassemble file to bytecode listing\n"
-                    << "  -p, --profile      Run with the profiler; measured per-function timings\n"
-                    << "      --trace OUT F  Run F, recording every executed statement to OUT (JSON lines)\n"
-                    << "  --ide              Launch NythonIDE GUI\n"
-                    << "  --console          Force terminal REPL (no GUI, shows all output)\n"
-                    << "  --cli, --repl      Same as --console\n"
-                    << "  <file>             Run script (tree-walk interpreter)\n"
-#if NYTHON_WITH_IDE
-                    << "\nWhen launched with no arguments, NythonIDE opens automatically.\n"
-                    << "Use --cli to force the terminal REPL instead.\n"
-#endif
-                    ;
-                return 0;
-            }
-
-            // ── CLI / REPL override ──────────────────────────────────────
-            if (arg1 == "--cli" || arg1 == "--repl" || arg1 == "--console") {
-                repl();
-                return 0;
-            }
-
-            // ── IDE launch ───────────────────────────────────────────────
-#if NYTHON_WITH_IDE
-            if (arg1 == "--ide") {
-                launch_ide(get_binary_dir(argv[0]));
-                return 0;
-            }
-#endif
-
-            // ── Tokenize ─────────────────────────────────────────────────
-            if ((arg1 == "--tokenize" || arg1 == "-t") && argc >= 3) {
-                auto source = SourceCode(std::string(argv[2]));
+        // The program and sys.argv (Python's: "-c", the module's path, "-").
+        Program prog;
+        if (mode == "file") {
+            prog.path = target;
+            nyrt::set_command_line(target, argc, argv, i);
+        } else if (mode == "cmd") {
+            prog.is_file = false; prog.text = target; prog.name = "<string>";
+            nyrt::set_command_line("-c", argc, argv, i);
+        } else if (mode == "module") {
+            std::string path;
+            if (!find_module_file(target, path)) { std::cerr << "nython: No module named " << target << "\n"; return 1; }
+            prog.path = path;
+            nyrt::set_command_line(path, argc, argv, i);
+        } else if (mode == "stdin") {
+            prog.is_file = false; prog.name = "<stdin>";
+            prog.text.assign((std::istreambuf_iterator<char>(std::cin)), std::istreambuf_iterator<char>());
+            nyrt::set_command_line("-", argc, argv, i);
+        }
+        g_inspect = inspect;
+        if (!tool.empty()) {
+            if (mode.empty()) return bad("-" + tool.substr(0, 1) + " needs a program");
+            if (tool == "check") return check_program(prog, use_vm);
+            if (tool == "tokenize") {
+                auto source = source_of(prog);
                 auto lex = std::make_shared<Lexer>(source);
                 lex->tokenize(); std::cout << lex->toString(); return 0;
             }
-
-            // ── AST dump ─────────────────────────────────────────────────
-            if ((arg1 == "--ast" || arg1 == "-a") && argc >= 3) {
-                return run_file(argv[2], true);
-            }
-
-            // ── Bytecode VM ──────────────────────────────────────────────
-            if (arg1 == "--vm" && argc >= 3) {
-                // SourceCode treats a string that is not an existing file as
-                // program TEXT, so a mistyped path used to be run as code
-                // (`--vm t/x.ny` evaluated `t / x.ny`). Refuse it like the
-                // interpreter's run_file() does.
-                {
-                    struct stat vm_st;
-                    if (stat(argv[2], &vm_st) != 0) {
-                        std::cerr << "[Nython] No such file: " << argv[2] << "\n";
-                        return 2;
-                    }
-                }
-                nyrt::set_command_line(argv[2], argc, argv, 3);
+            if (tool == "ast") return run_program(prog, true);
+            if (tool == "disasm") {
                 try {
-                    auto source = SourceCode(std::string(argv[2]));
-                    auto reporter = std::make_shared<Reporter>(source);
-                    auto lexer2 = std::make_shared<Lexer>(source);
-                    auto vm2 = std::make_shared<nython::vm::VirtualMachine>(reporter.get());
-                    // Non-daemon threads finish before the VM goes away (round 74).
-                    struct JoinThreadsAtExit { ~JoinThreadsAtExit() { nyconc::join_nondaemon_at_exit(); } } join_threads_at_exit;
-                    // Imports must resolve relative to the script, not the
-                    // working directory — and must do so on BOTH engines. The
-                    // interpreter already did; without this the same file's
-                    // imports resolved under one engine and failed under the
-                    // other.
-                    vm2->set_script_dir(std::string(argv[2]));
-                    auto parser2 = std::make_shared<Parser>(reporter.get(), (Runnable*)vm2.get(), lexer2.get());
-                    install_vm_builtin_bridge((Runnable*)vm2.get());
-                    lexer2->tokenize();
-                    auto ast = parser2->parse();
-                    // run() reports an uncaught exception itself and returns
-                    // RUNTIME_ERROR; that result used to be ignored, so a
-                    // failed program exited 0 on the VM and 1 on the
-                    // interpreter.
-                    if (ast) {
-                        auto res = vm2->run(ast);
-                        if (res == decltype(res)::RUNTIME_ERROR)
-                            return nython::vm::VirtualMachine::keyboard_interrupted() ? 130 : 1;
-                    }
-                } catch (exception::SyntaxError& e) {
-                    // The VM compiler rejects some constructs the interpreter
-                    // accepts. Report it rather than letting the exception
-                    // escape main() and abort the process via std::terminate.
-                    report_compiler_error("syntax error", e.location(), e.message()); return 1;
-                } catch (exception::UnexpectedCharError& e) {
-                    report_compiler_error("error", e.location(), e.message()); return 1;
-                } catch (std::string& msg) {
-                    std::cerr << "VM Error: " << msg << "\n"; return 1;
-                } catch (std::exception& e) {
-                    std::cerr << "VM Error: " << e.what() << "\n"; return 1;
-                }
-                return 0;
-            }
-
-            // ── Disassemble ──────────────────────────────────────────────
-            if (arg1 == "--trace" && argc >= 4) {
-                nyrt::set_command_line(argv[3], argc, argv, 4);
-                g_trace_path = argv[2];
-                return run_file(argv[3]);
-            }
-
-            if ((arg1 == "--profile" || arg1 == "-p") && argc >= 3) {
-                nyrt::set_command_line(argv[2], argc, argv, 3);
-                NythonExecutor::profiling_enabled() = true;
-                return run_file(argv[2]);
-            }
-
-            if ((arg1 == "--disasm" || arg1 == "-d") && argc >= 3) {
-                {
-                    struct stat da_st;
-                    if (stat(argv[2], &da_st) != 0) {
-                        std::cerr << "[Nython] No such file: " << argv[2] << "\n";
-                        return 2;
-                    }
-                }
-                try {
-                    auto source = SourceCode(std::string(argv[2]));
+                    auto source = source_of(prog);
                     auto reporter = std::make_shared<Reporter>(source);
                     auto lexer2 = std::make_shared<Lexer>(source);
                     auto vm2 = std::make_shared<nython::vm::VirtualMachine>(reporter.get());
                     auto parser2 = std::make_shared<Parser>(reporter.get(), (Runnable*)vm2.get(), lexer2.get());
                     lexer2->tokenize();
                     auto ast = parser2->parse();
-                    if (ast) {
-                        auto code = vm2->compile_ast(ast);
-                        std::cout << vm2->disassemble(*code);
-                    }
+                    if (ast) { auto code = vm2->compile_ast(ast); std::cout << vm2->disassemble(*code); }
                 } catch (std::exception& e) {
                     std::cerr << "Disasm Error: " << e.what() << "\n"; return 1;
                 }
                 return 0;
             }
-
-            // ── Run script (tree-walk) ───────────────────────────────────
-            // Everything after the script path is the script's own command
-            // line (sys.argv[1:]).
-            nyrt::set_command_line(arg1, argc, argv, 2);
-            return run_file(arg1);
-
-        } else {
-            // No arguments: launch IDE (if built with IDE support) or REPL
-#if NYTHON_WITH_IDE
-            // Determine binary directory for IDE file lookup
-            if (!launch_ide(get_binary_dir(argv[0]))) {
-                // IDE file not found — fall back to REPL
-                repl();
-            }
-#else
-            repl();
-#endif
         }
-
+        if (mode.empty()) {
+            // No program: the prompt (or, with no arguments at all on a
+            // terminal, the IDE).
+#if NYTHON_WITH_IDE
+            if (argc == 1 && !force_repl && isatty(STDIN_FILENO)) {
+                if (!launch_ide(get_binary_dir(argv[0]))) repl();
+                cm.restoreConsole();
+                return 0;
+            }
+#endif
+            nyrt::set_command_line("", argc, argv, argc);
+            if (quiet) setenv_quiet();
+            if (use_vm) repl_vm(); else repl();
+            cm.restoreConsole();
+            return g_repl_exit >= 0 ? g_repl_exit : 0;
+        }
+        if (quiet) setenv_quiet();
+        if (!trace_out.empty()) {
+            if (use_vm) return bad("--trace records the interpreter (no --vm)");
+            g_trace_path = trace_out;
+        }
+        if (profile) {
+            if (use_vm) return bad("--profile measures the interpreter (no --vm)");
+            NythonExecutor::profiling_enabled() = true;
+        }
+        if (use_vm) return run_program_vm(prog, inspect);
+        return run_program(prog);
         cm.restoreConsole();
     } catch (std::exception& e) {
         std::string msg = std::string("Fatal error: ") + e.what();

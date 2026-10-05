@@ -160,7 +160,7 @@ std::string hex_ptr(const void* p) {
     Value cv; cv.type = ValueType::USERDATA; cv.value.p = (void*)cn;
     std::vector<Value> a;
     if (rv.type != ValueType::NONE && rv.type != ValueType::UNDEFINED) a.push_back(rv);
-    static const std::unordered_map<std::string, Value> no_kw;
+    static const nyrt::OrderedKw<Value> no_kw;
     Value inst = E.instantiateClass(cv, a, no_kw, ctx ? ctx : E.global_ctx);
     E.exc_instance_map_[inst.value.p] = inst;
     char buf[64];
@@ -177,7 +177,7 @@ std::string exc_string_for(NythonExecutor& E, Value v, const std::vector<Value>&
         if (fit != E.func_names.end()) {
             if (fit->second.rfind("__class__:", 0) == 0) {
                 std::vector<Value> a = cargs;
-                static const std::unordered_map<std::string, Value> no_kw;
+                static const nyrt::OrderedKw<Value> no_kw;
                 v = E.instantiateClass(v, a, no_kw, ctx);
             } else if (fit->second.rfind("__builtin__:", 0) == 0 && nython::ny_is_builtin_exc(fit->second.substr(12))) {
                 return "__exc__:" + fit->second.substr(12) + ":" + (cargs.empty() ? std::string() : E.strOf(cargs[0], ctx));

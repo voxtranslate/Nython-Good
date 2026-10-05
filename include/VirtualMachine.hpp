@@ -2895,7 +2895,10 @@ public:
     }
 
     // Compile + run an AST
-    VMResult run(nython::node::node_ptr ast) {
+    // session: a REPL's module variables (round 77): the chunk runs with
+    // them and leaves its own there; the program's threads are not waited
+    // for and its paused generators stay open between chunks.
+    VMResult run(nython::node::node_ptr ast, VMMap* session=nullptr) {
         try {
             load_prelude();
             Compiler c; auto code=c.compile(ast);
@@ -2904,18 +2907,21 @@ public:
             // joined before it is popped (round 74).
             size_t base=stack_.size();
             CallFrame fr; fr.code=code; fr.ip=0;
+            if(session) fr.locals=*session;
+            prompt_session_=session!=nullptr;
             call_stack_.push_back(std::move(fr));
             gen_finalize_=true;
             struct PopModule {
-                VirtualMachine* vm; size_t base;
+                VirtualMachine* vm; size_t base; VMMap* session;
                 ~PopModule(){
-                    nyconc::join_nondaemon_at_exit();
+                    if(session) *session=vm->call_stack_.back().locals;
+                    else nyconc::join_nondaemon_at_exit();
                     vm->gen_finalize_=false;
                     vm->module_frame_=nullptr;
                     vm->call_stack_.pop_back();
                     if(vm->stack_.size()>base) vm->stack_.resize(base);
                 }
-            } pop_module{this, base};
+            } pop_module{this, base, session};
             // An uncaught exception is reported here, before PopModule waits
             // for the program's threads (as Python prints the traceback first).
             try { run_loop(); } catch(VMReturn&) {}
@@ -2923,7 +2929,7 @@ public:
             catch(std::string& m) { return report_uncaught(m, true); }
             // Generators the program left paused: closed now, so their
             // finally blocks run (the interpreter does the same).
-            gen_close_all();
+            if(!session) gen_close_all();
             return VMResult::SUCCESS;
         } catch(std::exception& e) {
             return report_uncaught(e.what(), false);
@@ -2932,19 +2938,41 @@ public:
         }
     }
 
+    // repr() of a value as a program would see it (the prompt's echo).
+    std::string repr_of(const VMVal& v) { return vm_repr(v); }
+
+    // The status of a program ended by an uncaught SystemExit (round 77).
+    static int& exit_status() { static int s=-1; return s; }
+
     VMResult report_uncaught(const std::string& m, bool tagged) {
         std::string type, msg;
         bool split=tagged&&nython::ny_split_exc_message(m,type,msg);
+        if(!split&&!tagged&&m.rfind("SystemExit",0)==0){
+            split=true; type="SystemExit";
+            msg=m.size()>12?m.substr(12):std::string();
+        }
+        if(split&&type=="SystemExit"){
+            // sys.exit(n): status n, nothing printed; exit("text"): the
+            // text on stderr and status 1; exit() / exit(None): 0.
+            exit_status()=nyrt::system_exit_status(msg);
+            return VMResult::RUNTIME_ERROR;
+        }
         if((split&&type=="KeyboardInterrupt")||(!tagged&&m.rfind("KeyboardInterrupt",0)==0)){
             // as Python: the bare name, and the exit status of SIGINT (main.cpp)
             std::cerr<<"KeyboardInterrupt\n";
             keyboard_interrupted()=true;
             return VMResult::RUNTIME_ERROR;
         }
+        if(prompt_session_){
+            // at the prompt: Python's last traceback line, as the interpreter
+            std::cerr<<(split ? (msg.empty() ? type : type+": "+msg) : m)<<"\n";
+            return VMResult::RUNTIME_ERROR;
+        }
         if(split) std::cerr<<"\x1b[31m[VMError] "<<type<<": "<<msg<<"\x1b[0m\n";
         else std::cerr<<"\x1b[31m[VMError] "<<m<<"\x1b[0m\n";
         return VMResult::RUNTIME_ERROR;
     }
+    bool prompt_session_=false;
 
     // The Nython prelude (include/NyPrelude.hpp) - the same text the
     // interpreter runs at startup: file objects for open().
@@ -2971,6 +2999,7 @@ public:
             export_to_globals_=old_exp; export_depth_=old_depth;
             for(auto& sub:code->sub_codes) if(sub->is_class) class_reg_[sub->name]=sub;
         } catch(std::exception& e){ std::cerr<<"[VM] prelude failed to load: "<<e.what()<<"\n"; }
+        for(auto& kv:globals_) base_global_names_.insert(kv.first);   // globals() leaves these out
         // open() as a native: the prelude's `def open` raises from its own
         // frame, and an exception crossing a Nython frame is not yet
         // catchable by typed `except` in the caller on this engine. Opening
@@ -3052,6 +3081,14 @@ public:
 #endif
         VMVal ns=VMVal::make_map();
         (*ns.map)["argv"]=argv_list;
+        (*ns.map)["exit"]=load_var("exit");
+        // the standard streams (NyPrelude _NyStdStream, round 77)
+        for(const char* st : {"stdin","stdout","stderr"}){
+            auto it=globals_.find(std::string("_ny_")+st);
+            VMVal sv=it!=globals_.end()?it->second:VMVal::make_none();
+            (*ns.map)[st]=sv;
+            (*ns.map)[std::string("__")+st+"__"]=sv;
+        }
         (*ns.map)["platform"]=VMVal::make_str(plat);
         (*ns.map)["executable"]=VMVal::make_str(nyrt::executable_path());
         (*ns.map)["version"]=VMVal::make_str(NYTHON_VERSION);
@@ -3968,6 +4005,98 @@ private:
         }
         return false;
     }
+    // ── Reflection (round 77) ──
+    static bool reflect_hidden(const std::string& k) {
+        if(k.empty()||(unsigned char)k[0]<0x20) return true;
+        if(k=="__name__"||k=="__file__"||k=="__doc__") return false;
+        return k.size()>=2&&k[0]=='_'&&k[1]=='_';
+    }
+    std::unordered_set<std::string> base_global_names_;
+    VMVal vm_globals_map() {
+        VMVal d=VMVal::make_map();
+        if(VMMap* me=menv()){
+            for(auto& kv:*me) if(!reflect_hidden(kv.first)) (*d.map)[kv.first]=kv.second;
+            return d;
+        }
+        for(auto& kv:globals_){
+            if(reflect_hidden(kv.first)||base_global_names_.count(kv.first)) continue;
+            (*d.map)[kv.first]=kv.second;
+        }
+        if(!call_stack_.empty())
+            for(auto& kv:call_stack_.front().locals) if(!reflect_hidden(kv.first)) (*d.map)[kv.first]=kv.second;
+        return d;
+    }
+    VMVal vm_locals_map() {
+        if(call_stack_.size()<=1||!call_stack_.back().code||call_stack_.back().code->module_top) return vm_globals_map();
+        auto& fr=call_stack_.back();
+        VMVal d=VMVal::make_map();
+        for(auto& kv:fr.locals) if(!reflect_hidden(kv.first)) (*d.map)[kv.first]=kv.second;
+        if(fr.own_env&&fr.closure_env)
+            for(auto& kv:*fr.closure_env) if(!reflect_hidden(kv.first)&&fr.locals.count(kv.first)) (*d.map)[kv.first]=kv.second;
+        return d;
+    }
+    static bool is_module_ns(const VMVal& v) {
+        return v.type==VMType::MAP&&v.map&&!v.class_name.empty()&&v.class_name!="__kwargs__";
+    }
+    VMVal vm_vars(std::vector<VMVal>& a) {
+        if(a.empty()) return vm_locals_map();
+        const VMVal& o=a[0];
+        VMVal d=VMVal::make_map();
+        if(o.type==VMType::INSTANCE){
+            if(o.map) for(auto& kv:*o.map) if(!reflect_hidden(kv.first)) (*d.map)[kv.first]=kv.second;
+            return d;
+        }
+        if(o.type==VMType::CLASS){
+            auto cv=class_vars_.find(o.class_name);
+            if(cv!=class_vars_.end()) for(auto& kv:cv->second) if(!kv.first.empty()&&(unsigned char)kv.first[0]>=0x20) (*d.map)[kv.first]=kv.second;
+            return d;
+        }
+        if(is_module_ns(o)){
+            for(auto& kv:*o.map) if(!reflect_hidden(kv.first)) (*d.map)[kv.first]=kv.second;
+            return d;
+        }
+        raise_native_exception("TypeError","vars() argument must have __dict__ attribute");
+        return VMVal::make_none();
+    }
+    void class_member_names(const std::string& cls, std::set<std::string>& out) {
+        auto mro=class_mro(cls);
+        for(auto& c:*mro){
+            auto cv=class_vars_.find(c);
+            if(cv==class_vars_.end()) continue;
+            for(auto& kv:cv->second) if(!kv.first.empty()&&(unsigned char)kv.first[0]>=0x20) out.insert(kv.first);
+        }
+    }
+    VMVal vm_dir(std::vector<VMVal>& a) {
+        std::set<std::string> names;
+        if(a.empty()){
+            VMVal l=vm_locals_map();
+            for(auto& kv:*l.map) names.insert(kv.first);
+        } else {
+            const VMVal& o=a[0];
+            if(o.type==VMType::INSTANCE){
+                if(o.map) for(auto& kv:*o.map) if(!reflect_hidden(kv.first)) names.insert(kv.first);
+                class_member_names(o.class_name,names);
+                names.insert("__class__"); names.insert("__dict__");
+            } else if(o.type==VMType::CLASS){
+                class_member_names(o.class_name,names);
+                for(const char* n:{"__bases__","__mro__","__module__","__name__","__qualname__"}) names.insert(n);
+            } else if(is_module_ns(o)){
+                for(auto& kv:*o.map) if(!reflect_hidden(kv.first)) names.insert(kv.first);
+            } else {
+                nypy::MemberKind k=vm_member_kind(o);
+                if(const auto* ms=nypy::kind_methods(k)) names.insert(ms->begin(),ms->end());
+                if(k!=nypy::MemberKind::Other){
+                    for(auto& m:nypy::protocol_members()) names.insert(m);
+                    names.insert("__class__");
+                } else if(o.type==VMType::FUNCTION||o.type==VMType::NATIVE){
+                    for(const char* n:{"__module__","__name__","__qualname__"}) names.insert(n);
+                }
+            }
+        }
+        std::vector<VMVal> out;
+        for(auto& n:names) out.push_back(VMVal::make_str(n));
+        return VMVal::make_list(std::move(out));
+    }
     VMVal class_value(const std::string& name) {
         auto it=class_reg_.find(name);
         if(it==class_reg_.end()) return VMVal::make_none();
@@ -4043,6 +4172,7 @@ private:
             (*attrs)["args"]=VMVal::make_tuple(args);
             (*attrs)["msg"]=VMVal::make_str(args.size()==1?args[0].to_string():std::string());
             if(class_derives(cls.class_name,"StopIteration")) (*attrs)["value"]=args.empty()?VMVal::make_none():args[0];
+            if(class_derives(cls.class_name,"SystemExit")) (*attrs)["code"]=args.empty()?VMVal::make_none():args.size()==1?args[0]:VMVal::make_tuple(args);
         }
         VMVal init;
         if(find_ctor(cls.class_name, init)) invoke_method(init, inst, args, cls.class_name, kwargs);
@@ -5006,6 +5136,7 @@ private:
         std::string msg = args.size()==1 ? args[0].to_string() : std::string();
         // StopIteration.value: a generator's return value (both engines).
         if(class_derives(type,"StopIteration")) (*attrs)["value"]=args.empty()?VMVal::make_none():args[0];
+        if(class_derives(type,"SystemExit")) (*attrs)["code"]=args.empty()?VMVal::make_none():args.size()==1?args[0]:VMVal::make_tuple(args);
         (*attrs)["args"]=VMVal::make_tuple(std::move(args));
         (*attrs)["msg"]=VMVal::make_str(msg);
         return VMVal::make_instance(type, attrs);
@@ -5921,6 +6052,19 @@ private:
             return false;
         }
         case VMType::NATIVE:
+            // len.__name__, int.__name__: the name the builtin is tagged with
+            if(attr=="__name__"||attr=="__qualname__"||attr=="__module__"){
+                const std::string& c=obj.class_name;
+                size_t colon=c.find(':');
+                bool tagged=colon!=std::string::npos&&(c.rfind("__builtin__:",0)==0||c.rfind("__native__:",0)==0);
+                if(tagged||(!c.empty()&&colon==std::string::npos)){
+                    if(attr=="__module__"){ out=VMVal::make_str("builtins"); return true; }
+                    std::string nm=tagged?c.substr(colon+1):c;
+                    size_t dot=nm.rfind('.');
+                    out=VMVal::make_str(dot==std::string::npos?nm:nm.substr(dot+1));
+                    return true;
+                }
+            }
             // A builtin type (tagged with its name): str.upper, bytes.fromhex,
             // int.from_bytes, dict.fromkeys ... (round 77)
             if(!native_type_base(obj).empty()&&nypy::type_has_member(native_type_base(obj),attr)){
@@ -6494,6 +6638,7 @@ private:
                     (*self_v.map)["args"]=VMVal::make_tuple(args);
                     (*self_v.map)["msg"]=VMVal::make_str(args.size()==1?args[0].to_string():std::string());
                     if(class_derives(self_v.class_name,"StopIteration")) (*self_v.map)["value"]=args.empty()?VMVal::make_none():args[0];
+                    if(class_derives(self_v.class_name,"SystemExit")) (*self_v.map)["code"]=args.empty()?VMVal::make_none():args.size()==1?args[0]:VMVal::make_tuple(args);
                 }
                 return VMVal::make_none();
             }
@@ -6597,6 +6742,7 @@ private:
                && is_exception_class(obj.class_name)){
                 std::vector<VMVal> rest(args.begin()+1,args.end());
                 (*args[0].map)["args"]=VMVal::make_tuple(rest);
+                if(class_derives(args[0].class_name,"SystemExit")) (*args[0].map)["code"]=rest.empty()?VMVal::make_none():rest.size()==1?rest[0]:VMVal::make_tuple(rest);
                 (*args[0].map)["msg"]=VMVal::make_str(rest.size()==1?rest[0].to_string():std::string());
                 return VMVal::make_none();
             }
@@ -7209,7 +7355,7 @@ private:
         // functions themselves are already registered as globals; the import is
         // just an acknowledgement.
         static const std::set<std::string> builtin_modules = {
-            "random","collections","crypto","datetime","hash","http","re","regex",
+            "random","crypto","datetime","hash","http","re","regex",
             "sys","ml","ai","net","agent_net","threading",
             "thread","threads","threading_lib","string","math","time","json",
             "io","fs","file","os","sh","shell","gui","stdlib","oslib","os_lib",
@@ -7759,6 +7905,12 @@ private:
                 std::vector<VMVal> pair={(vm_arg_list(a,0))[i],(vm_arg_list(a,1))[i]};
                 r.push_back(VMVal::make_list(std::move(pair)));}
             return VMVal::make_list(std::move(r));});
+        // locals() / globals() / vars() / dir() (round 77; they read none):
+        // as on the interpreter (NythonExecutor reflect*).
+        globals_["globals"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return vm_globals_map(); });
+        globals_["locals"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return vm_locals_map(); });
+        globals_["vars"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_vars(a); });
+        globals_["dir"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_dir(a); });
         globals_["input"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             // one line from stdin (NyConc.cpp: read_stdin_line); EOFError at
             // the end of input, Ctrl+C raises KeyboardInterrupt
@@ -8701,7 +8853,17 @@ private:
         def("dict",[vm](std::vector<VMVal>& a,const VMVal& kw)->VMVal{
             VMVal d=VMVal::make_map();
             if(!a.empty()){
+                VMVal keys_m;
                 if(a[0].type==VMType::MAP&&a[0].map){ for(auto& [k,v]:*a[0].map) if(!vm_internal_key(k)) (*d.map)[k]=v; }
+                else if(a[0].type==VMType::INSTANCE&&vm->class_lookup(a[0].class_name,"keys",keys_m)){
+                    // a mapping: keys(), then obj[k] (Python's dict(mapping))
+                    std::vector<VMVal> no_args;
+                    VMVal ks=vm->vm_call_method(a[0],"keys",no_args);
+                    for(auto& k:vm->iter_items(ks)){
+                        std::vector<VMVal> ka{k};
+                        (*d.map)[vm->vkey(k)]=vm->vm_call_method(a[0],"__getitem__",ka);
+                    }
+                }
                 else for(auto& pr:vm->iter_items(a[0])){
                     std::vector<VMVal> kv=vm->iter_items(pr);
                     if(kv.size()!=2) vm->raise_native_exception("ValueError","dictionary update sequence element has length "+std::to_string(kv.size())+"; 2 is required");

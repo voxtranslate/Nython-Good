@@ -19,6 +19,7 @@
 #include <cctype>
 
 #include <cstdlib>
+#include <cstdio>
 
 namespace nyrt {
 
@@ -74,6 +75,19 @@ inline std::vector<std::string> library_dirs() {
         add(dir + "../lib");
     }
     return out;
+}
+
+// The exit status for an uncaught SystemExit whose message (str(e)) is
+// `msg`: "" or "None" -> 0, an integer -> it, anything else is printed on
+// stderr -> 1 (as Python).
+inline int system_exit_status(const std::string& msg) {
+    if (msg.empty() || msg == "None" || msg == "none") return 0;
+    size_t i = (msg[0] == '-' || msg[0] == '+') ? 1 : 0;
+    bool digits = i < msg.size();
+    for (size_t k = i; k < msg.size(); k++) if (msg[k] < '0' || msg[k] > '9') { digits = false; break; }
+    if (digits && msg.size() < 10) return std::atoi(msg.c_str());
+    std::fprintf(stderr, "%s\n", msg.c_str());
+    return 1;
 }
 
 inline void set_command_line(const std::string& script, int argc, char** args, int first_arg) {

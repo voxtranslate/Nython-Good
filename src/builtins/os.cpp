@@ -47,6 +47,7 @@
 
 #ifndef _WIN32
 #  include <sys/statvfs.h>
+#  include <sys/ioctl.h>
 #  include <sys/utsname.h>
 #  include <sys/time.h>
 #  include <pwd.h>
@@ -1261,6 +1262,33 @@ Value dispatch_os(NythonExecutor& E,
 #else
         return Str("linux");
 #endif
+    }
+    if (name == "os_get_terminal_size" || name == "os_terminal_size") {
+        // (columns, lines) as shutil.get_terminal_size: COLUMNS/LINES win,
+        // then the terminal on fd (stdout by default), else 80 x 24.
+        int fd = args.size() > 0 && args[0].type == ValueType::INTEGER ? (int)bigint_to_i64(args[0].value.i) : 1;
+        int cols = 0, lines = 0;
+        if (const char* c = std::getenv("COLUMNS")) cols = std::atoi(c);
+        if (const char* l = std::getenv("LINES")) lines = std::atoi(l);
+        if (cols <= 0 || lines <= 0) {
+            int tc = 0, tl = 0;
+#ifdef _WIN32
+            HANDLE h = GetStdHandle(fd == 2 ? STD_ERROR_HANDLE : fd == 0 ? STD_INPUT_HANDLE : STD_OUTPUT_HANDLE);
+            CONSOLE_SCREEN_BUFFER_INFO info;
+            if (h != INVALID_HANDLE_VALUE && GetConsoleScreenBufferInfo(h, &info)) {
+                tc = info.srWindow.Right - info.srWindow.Left + 1;
+                tl = info.srWindow.Bottom - info.srWindow.Top + 1;
+            }
+#else
+            struct winsize ws;
+            if (ioctl(fd, TIOCGWINSZ, &ws) == 0) { tc = ws.ws_col; tl = ws.ws_row; }
+#endif
+            if (cols <= 0) cols = tc > 0 ? tc : 80;
+            if (lines <= 0) lines = tl > 0 ? tl : 24;
+        }
+        Value t = make_list(E, {Value(cols), Value(lines)});
+        if (auto* o = dynamic_cast<Object*>((Collectable*)t.value.p)) o->set("__tuple__", Value(1));
+        return t;
     }
     if (name == "os_cpu_count") {
         unsigned n = std::thread::hardware_concurrency();

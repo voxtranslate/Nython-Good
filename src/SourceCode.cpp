@@ -39,7 +39,21 @@ namespace nython::reader {
         }
     }
 
-    SourceCode::SourceCode(const SourceCode& that): SourceCode(that.location.filename) {
+    // A copy reads the same file again; a copy of program text keeps the
+    // text (it used to become the text of its name, "stdin").
+    SourceCode::SourceCode(const SourceCode& that):_eof{false},code{},nb{-1},current{0},in{},source_lines_{},current_char{'\0'},location{},frame{},isfile{that.isfile} {
+        location.filename = that.location.filename;
+        if (isfile) in = std::ifstream(that.location.filename);
+        else code = that.code;
+    }
+
+    SourceCode SourceCode::from_text(const std::string& text, const std::string& name) {
+        SourceCode s{std::string()};
+        s.isfile = false;
+        s.code = text;
+        s.location.filename = name;
+        file_name = name;
+        return s;
     }
 
     SourceCode::~SourceCode() {

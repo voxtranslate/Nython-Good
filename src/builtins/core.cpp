@@ -440,7 +440,7 @@ Value dispatch_core(NythonExecutor& E,
             // A dict: its typed keys in insertion order, as d.keys() etc.
             if (Container* dc = E.contOf(args[0]); dc && NythonExecutor::seqLen(dc) < 0) {
                 std::vector<Value> none;
-                static const std::unordered_map<std::string, Value> nokw;
+                static const nyrt::OrderedKw<Value> nokw;
                 Value r;
                 if (E.dictMethod(dc, args[0], name, none, nokw, ctx, r)) return r;
             }
@@ -556,7 +556,11 @@ Value dispatch_core(NythonExecutor& E,
             }
             return NONE_VALUE;
         }
-        if (name == "issubclass" || name == "property" || name == "staticmethod" || name == "classmethod" || name == "dir" || name == "vars" || name == "globals" || name == "locals" || name == "iter" || name == "help" || name == "slice" || name == "complex") {
+        if (name == "locals") return E.reflectLocals(ctx);
+        if (name == "globals") return E.reflectGlobals(ctx);
+        if (name == "vars") return E.reflectVars(args, ctx);
+        if (name == "dir") return E.reflectDir(args, ctx);
+        if (name == "issubclass" || name == "property" || name == "staticmethod" || name == "classmethod" || name == "iter" || name == "help" || name == "slice" || name == "complex") {
             return NONE_VALUE; // placeholder
         }
         // id(x) / hash(x) — registered as recognised builtin names (see

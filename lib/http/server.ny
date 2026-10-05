@@ -509,3 +509,18 @@ def test(HandlerClass=SimpleHTTPRequestHandler, ServerClass=ThreadingHTTPServer,
         print("\nKeyboard interrupt received, exiting.")
     finally:
         httpd.server_close()
+
+# nython -m http.server [port] [--bind ADDR] [--directory DIR] [--protocol P]
+if __name__ == "__main__":
+    import sys
+    import argparse
+    var ap = argparse.ArgumentParser(prog="nython -m http.server", description="Serve a directory over HTTP.")
+    ap.add_argument("port", nargs="?", type=int, default=8000, help="the port to listen on (default: 8000)")
+    ap.add_argument("-b", "--bind", default="127.0.0.1", metavar="ADDRESS", help="the address to bind (default: 127.0.0.1)")
+    ap.add_argument("-d", "--directory", default=os_getcwd(), help="the directory to serve (default: the working directory)")
+    ap.add_argument("-p", "--protocol", default="HTTP/1.0", help="HTTP/1.0 or HTTP/1.1 (default: HTTP/1.0)")
+    var opts = ap.parse_args()
+    class _DirHandler(SimpleHTTPRequestHandler):
+        def __init__(self, *a):
+            SimpleHTTPRequestHandler.__init__(self, *a, directory=opts.directory)
+    test(_DirHandler, ThreadingHTTPServer, opts.protocol, opts.port, opts.bind)

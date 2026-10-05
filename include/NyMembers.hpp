@@ -68,7 +68,8 @@ inline bool type_classmethod(const std::string& t, const std::string& m) {
     return false;
 }
 
-inline bool kind_has_method(MemberKind k, const std::string& m) {
+// The methods each builtin kind has (dir() lists them).
+inline const std::unordered_set<std::string>* kind_methods(MemberKind k) {
     static const std::unordered_set<std::string> str_m = {
         "__contains__", "capitalize", "casefold", "center", "charAt", "char_at", "contains", "count",
         "decode", "encode", "ends_with", "endswith", "expandtabs", "find", "format", "format_map",
@@ -107,23 +108,32 @@ inline bool kind_has_method(MemberKind k, const std::string& m) {
     // Generators and the lazy iterators (round 75, NyGen.hpp).
     static const std::unordered_set<std::string> gen_m = {
         "__iter__", "__next__", "close", "next", "send", "throw"};
+    static const std::unordered_set<std::string> bytearray_all = [] {
+        std::unordered_set<std::string> u = bytes_m;
+        u.insert(bytearray_m.begin(), bytearray_m.end());
+        return u;
+    }();
+    switch (k) {
+        case MemberKind::Str:   return &str_m;
+        case MemberKind::List:  return &list_m;
+        case MemberKind::Tuple: return &tuple_m;
+        case MemberKind::Dict:  return &dict_m;
+        case MemberKind::Set:   return &set_m;
+        case MemberKind::Generator: return &gen_m;
+        case MemberKind::Bytes: return &bytes_m;
+        case MemberKind::ByteArray: return &bytearray_all;
+        case MemberKind::Int: case MemberKind::Bool: return &int_methods();
+        case MemberKind::Float: return &float_methods();
+        default: return nullptr;
+    }
+}
+
+inline bool kind_has_method(MemberKind k, const std::string& m) {
     if (k == MemberKind::Other) return false;
     if (protocol_members().count(m)) return true;
-    switch (k) {
-        case MemberKind::Str:   return str_m.count(m) > 0;
-        case MemberKind::List:  return list_m.count(m) > 0;
-        case MemberKind::Tuple: return tuple_m.count(m) > 0;
-        case MemberKind::Dict:  return dict_m.count(m) > 0;
-        case MemberKind::Set:   return set_m.count(m) > 0;
-        case MemberKind::Generator: return gen_m.count(m) > 0;
-        case MemberKind::Bytes: return bytes_m.count(m) > 0;
-        case MemberKind::ByteArray: return bytes_m.count(m) > 0 || bytearray_m.count(m) > 0;
-        case MemberKind::Int: case MemberKind::Bool:
-            return is_operator_member(m) || int_methods().count(m) > 0;
-        case MemberKind::Float:
-            return is_operator_member(m) || float_methods().count(m) > 0;
-        default: return false;
-    }
+    if ((k == MemberKind::Int || k == MemberKind::Bool || k == MemberKind::Float) && is_operator_member(m)) return true;
+    const std::unordered_set<std::string>* ms = kind_methods(k);
+    return ms && ms->count(m) > 0;
 }
 
 // Whether `T.m` names something for builtin type T.

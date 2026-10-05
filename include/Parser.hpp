@@ -263,6 +263,13 @@ private:
     std::vector<node_ptr> lambdaParamList();
     std::vector<node_ptr> argList();
     node_ptr listLiteral();
+    // Starred elements in displays (round 77): [*a, b], (*a, b), {*a},
+    // {**d, k: v}. Outside an assignment target they become calls of the
+    // prelude's _ny_list_cat / _ny_dict_merge; inside one they stay
+    // UnaryNode("*") targets.
+    node_ptr starElem();
+    node_ptr catStarred(Token tok, const std::vector<node_ptr>& elems, const char* wrap);
+    bool in_assign_target_ = false;
     // After the first `for` of a comprehension: its clauses.
     node_ptr comprehension(Token tok, int kind, node_ptr elt, node_ptr value);
     node_ptr compTarget();

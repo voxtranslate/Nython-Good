@@ -583,6 +583,79 @@ Value dispatch_io(NythonExecutor& E,
             std::cerr << std::endl;
             return NONE_VALUE;
         }
+        // ── sys.stdin / sys.stdout / sys.stderr (round 77) ──────────────
+        // The prelude's _NyStdStream objects sit on these: text goes through
+        // the same std::cout / std::cerr as print, so the two interleave in
+        // order.
+        if (name == "stream_write") {
+            // stream_write(fd, text): writes text as is; the characters written
+            long long fd = args.size() > 0 ? nyos::to_int(args[0], 1) : 1;
+            std::string s = args.size() > 1 ? getStringValue(args[1]) : std::string();
+            if (fd == 2) { std::cerr << s; std::cerr.flush(); }
+            else std::cout << s;
+            long long chars = 0;
+            for (unsigned char c : s) if ((c & 0xC0) != 0x80) chars++;
+            return Value((int64_t)chars);
+        }
+        if (name == "stream_flush") {
+            long long fd = args.size() > 0 ? nyos::to_int(args[0], 1) : 1;
+            if (fd == 2) { std::cerr.flush(); fflush(stderr); }
+            else { std::cout.flush(); fflush(stdout); }
+            return NONE_VALUE;
+        }
+        if (name == "stream_isatty") {
+            long long fd = args.size() > 0 ? nyos::to_int(args[0], 1) : 1;
+#ifdef _WIN32
+            return Value(_isatty((int)fd) != 0);
+#else
+            return Value(isatty((int)fd) != 0);
+#endif
+        }
+        if (name == "stream_readline") {
+            // one line of stdin with its "\n" ("" at the end of input; the
+            // last line has none when the input does not end with one)
+            std::string line;
+            bool ok;
+            try { ok = nyconc::read_stdin_line(line); }
+            catch (nyconc::NyError& err) {
+                if (!err.raw.empty()) throw std::string(err.raw);
+                throw std::string("__exc__:" + err.type + ":" + err.msg);
+            }
+            if (!ok) return makeStringValue("");
+            if (!std::cin.eof()) line += "\n";
+            return makeStringValue(line);
+        }
+        if (name == "stream_read") {
+            // stream_read(size=-1): the rest of stdin, or up to size bytes
+            long long size = args.size() > 0 ? nyos::to_int(args[0], -1) : -1;
+            std::string out;
+            if (size < 0) {
+                std::string line;
+                while (true) {
+                    bool ok;
+                    try { ok = nyconc::read_stdin_line(line); }
+                    catch (nyconc::NyError& err) {
+                        if (!err.raw.empty()) throw std::string(err.raw);
+                        throw std::string("__exc__:" + err.type + ":" + err.msg);
+                    }
+                    if (!ok) break;
+                    out += line;
+                    if (std::cin.eof()) break;
+                    out += "\n";
+                }
+            } else if (size > 0) {
+                std::vector<char> buf((size_t)size);
+                std::streamsize got;
+                {
+                    nyconc::GilRelease rel;
+                    std::cin.read(buf.data(), (std::streamsize)size);
+                    got = std::cin.gcount();
+                }
+                std::cin.clear();
+                out.assign(buf.data(), (size_t)got);
+            }
+            return makeStringValue(out);
+        }
         if (name == "flush") {
             std::cout << std::flush;
             fflush(stdout);

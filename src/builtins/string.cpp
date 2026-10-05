@@ -469,7 +469,7 @@ Value dispatch_string(NythonExecutor& E,
                     && !lst->container->count("__set__"))
                     vals = E.listItems(vals[0]);
             }
-            std::unordered_map<std::string, Value> kw;
+            nyrt::OrderedKw<Value> kw;
             return makeStringValue(E.strFormat(tmpl, vals, kw, ctx));
         }
         // ── string_count(s, sub) ─────────────────────────────────────────────────

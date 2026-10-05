@@ -139,6 +139,144 @@ class NythonFile:
     def __str__(self):
         return "<file '" + self.name + "' mode '" + self.mode + "'>"
 
+class _NyStdStream:
+    # sys.stdin / sys.stdout / sys.stderr (round 77): text streams over the
+    # same output as print, so writes and prints interleave in order.
+    def __init__(self, fd, name, mode):
+        self.fd = fd
+        self.name = name
+        self.mode = mode
+        self.encoding = "utf-8"
+        self.errors = "strict"
+        self.closed = false
+        self.line_buffering = fd != 2
+
+    def write(self, s):
+        if not isinstance(s, "str"):
+            raise TypeError("write() argument must be str, not " + type(s))
+        if self.fd == 0:
+            raise OSError("not writable")
+        return stream_write(self.fd, s)
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+        return none
+
+    def flush(self):
+        if self.fd != 0:
+            stream_flush(self.fd)
+        return none
+
+    def read(self, size=-1):
+        if self.fd != 0:
+            raise OSError("not readable")
+        return stream_read(-1 if size is none else size)
+
+    def readline(self, size=-1):
+        if self.fd != 0:
+            raise OSError("not readable")
+        return stream_readline()
+
+    def readlines(self, hint=-1):
+        var out = []
+        var line = self.readline()
+        while len(line) > 0:
+            out.append(line)
+            line = self.readline()
+        return out
+
+    def fileno(self):
+        return self.fd
+
+    def isatty(self):
+        return stream_isatty(self.fd)
+
+    def readable(self):
+        return self.fd == 0
+
+    def writable(self):
+        return self.fd != 0
+
+    def seekable(self):
+        return false
+
+    def close(self):
+        return none
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        var line = self.readline()
+        if len(line) == 0:
+            raise StopIteration("end of input")
+        return line
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type=none, exc_value=none, tb=none):
+        return false
+
+    def __repr__(self):
+        return "<_io.TextIOWrapper name='" + self.name + "' mode='" + self.mode + "' encoding='utf-8'>"
+
+_ny_stdin = _NyStdStream(0, "<stdin>", "r")
+_ny_stdout = _NyStdStream(1, "<stdout>", "w")
+_ny_stderr = _NyStdStream(2, "<stderr>", "w")
+
+def _ny_print(*args, **kw):
+    # print(...) with file=, flush= or *args (the parser hands those here;
+    # the plain forms stay the print statement)
+    for k in kw:
+        if k != "sep" and k != "end" and k != "file" and k != "flush":
+            raise TypeError("'" + k + "' is an invalid keyword argument for print()")
+    var sep = kw.get("sep")
+    var end = kw.get("end")
+    var file = kw.get("file")
+    if sep is none:
+        sep = " "
+    elif not isinstance(sep, "str"):
+        raise TypeError("sep must be None or a string, not " + type(sep))
+    if end is none:
+        end = "\n"
+    elif not isinstance(end, "str"):
+        raise TypeError("end must be None or a string, not " + type(end))
+    if file is none:
+        file = _ny_stdout
+    file.write(sep.join([str(a) for a in args]) + end)
+    if kw.get("flush", false):
+        file.flush()
+    return none
+
+def _ny_list_cat(*parts):
+    # [*a, b, *c] (the parser hands the pieces here)
+    var out = []
+    for p in parts:
+        for x in p:
+            out.append(x)
+    return out
+
+def _ny_dict_merge(*parts):
+    # {**a, k: v, **b}
+    var out = {}
+    for p in parts:
+        if not hasattr(p, "keys"):
+            raise TypeError("'" + type(p) + "' object is not a mapping")
+        for k in p.keys():
+            out[k] = p[k]
+    return out
+
+def exit(code=none):
+    # Python's: SystemExit, so finally blocks run and `except SystemExit`
+    # can stop it (round 77; it ended the process on the spot). The program
+    # ends with the code when nothing catches it.
+    raise SystemExit(code)
+
+def quit(code=none):
+    raise SystemExit(code)
+
 def open(path, mode="r", encoding="utf-8", errors=none, newline=none, buffering=-1):
     if "b" in mode and encoding != "utf-8" and encoding is not none:
         raise ValueError("binary mode doesn't take an encoding argument")

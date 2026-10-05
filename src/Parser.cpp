@@ -19,6 +19,12 @@ using namespace nython::node;
 
 namespace nython::parser {
 
+// A `*x` element of a display (Parser::starElem).
+static bool isStarElem(const node_ptr& n){
+    return n && n->type() == NodeType::UNARY && static_cast<UnaryNode*>(n.get())->op == "*";
+}
+
+
 std::vector<std::string> operators = {
     ">>>=",">>>","===","!==","**=","&&=","||=","^^=","<<=",">>=","**","++","--","&&","||","^^",
     "<<",">>",">=","<=","==","!=","+=","-=","*=","/=","\\=","%=","~=","&=","|=","^=",">","<","&",
@@ -74,6 +80,10 @@ std::string Parser::identifier(){
        || t == TokenType::Raise || t == TokenType::Pass || t == TokenType::Assert
        || t == TokenType::With || t == TokenType::Ref || t == TokenType::Let
        || t == TokenType::Var || t == TokenType::Const
+       // Declaration keywords double as names too (round 77): Python code
+       // says `namespace=` (argparse.parse_args), `struct`, `module`...
+       || t == TokenType::NameSpace || t == TokenType::Package || t == TokenType::Interface
+       || t == TokenType::Struct || t == TokenType::Enum
        // Async keywords double as ordinary names: lib/thread.ny declares
        // `def await(self)`, which the VM's import path rejected with
        // "Expected Identifier, but found Await".
@@ -395,9 +405,18 @@ node_ptr Parser::statement(){
         if (!used_as_var) return functionDecl();
         // Fall through to expression statement (identifier + assignment)
     }
+    // `interface`, `struct`, `enum`, `namespace` start a declaration unless
+    // used as a name (`namespace = ...`, `struct.pack(...)`).
+    auto soft_name = [&]() {
+        TokenType nt = peek().type();
+        return nt == TokenType::Dot || nt == TokenType::Assign || nt == TokenType::BracketOpen
+            || nt == TokenType::ParenOpen || nt == TokenType::Comma || nt == TokenType::AddAssign
+            || nt == TokenType::SubAssign || nt == TokenType::MulAssign || nt == TokenType::DivAssign
+            || nt == TokenType::NewLine || nt == TokenType::End;
+    };
     if(see(TokenType::Class)) return classDecl();
-    if(see(TokenType::Interface)) return interfaceDecl();
-    if(see(TokenType::Struct)) return structDecl();
+    if(see(TokenType::Interface) && !soft_name()) return interfaceDecl();
+    if(see(TokenType::Struct) && !soft_name()) return structDecl();
     if(see(TokenType::Typeof)||see(TokenType::Sizeof)) {
         Token tok = token();
         std::string fn_name = tok.value == "typeof" ? "type" : "len";
@@ -424,8 +443,8 @@ node_ptr Parser::statement(){
     if(see(TokenType::Loop) && !keyword_as_name()) return loopStmt();
     if(see(TokenType::Block) && !keyword_as_name()) return blockStmt();
     if(see(TokenType::Repeat)) return repeatStmt();
-    if(see(TokenType::Enum)) return enumDecl();
-    if(see(TokenType::NameSpace)) return namespaceDecl();
+    if(see(TokenType::Enum) && !soft_name()) return enumDecl();
+    if(see(TokenType::NameSpace) && !soft_name()) return namespaceDecl();
 
     // Flow statements
     // global x, y / nonlocal x, y. A plain assignment already rebinds the
@@ -561,6 +580,49 @@ node_ptr Parser::statement(){
     // Block
     if(see(TokenType::BraceOpen)) return block();
 
+    // Annotated assignment (PEP 526): `x: int = 5`, `self.x: T = v`,
+    // `x: int` (an annotation alone binds nothing). The annotation is
+    // parsed and dropped; `name: T = v` declares name in the current
+    // scope, as Python's annotated assignment makes it local.
+    if(see(TokenType::Identifier) || see(TokenType::Self) || see(TokenType::This)) {
+        int k = 0, depth = 0; bool annotated = false;
+        TokenType prevt = TokenType::Dot;
+        for(; k < 256; k++){
+            TokenType tt = peek(k).type();
+            if(depth > 0){
+                if(tt == TokenType::BracketOpen) depth++;
+                else if(tt == TokenType::BracketClose) { if(--depth == 0) prevt = TokenType::BracketClose; }
+                else if(tt == TokenType::End || tt == TokenType::NewLine) break;
+                continue;
+            }
+            if(tt == TokenType::Colon){
+                TokenType after = peek(k + 1).type();
+                annotated = k > 0 && prevt != TokenType::Dot && after != TokenType::NewLine && after != TokenType::Indent
+                            && after != TokenType::End && after != TokenType::SemiColon && after != TokenType::Dedent
+                            && peek(k + 1).clazz() != TokenClass::Keyword;
+                break;
+            }
+            bool name = tt == TokenType::Identifier || tt == TokenType::Self || tt == TokenType::This;
+            if(name && prevt == TokenType::Dot){ prevt = tt; continue; }
+            if(tt == TokenType::Dot && prevt != TokenType::Dot){ prevt = tt; continue; }
+            if(tt == TokenType::BracketOpen && prevt != TokenType::Dot){ depth++; continue; }
+            break;
+        }
+        if(annotated){
+            Token tok0 = token();
+            bool simple = k == 1 && see(TokenType::Identifier);
+            node_ptr target = postfix();
+            mustBe(TokenType::Colon);
+            ternary();   // the annotation (not expression(): `T = v` is not an assignment)
+            node_ptr value = nullptr;
+            if(have(TokenType::Assign)) value = expression();
+            have(TokenType::SemiColon); have(TokenType::NewLine);
+            if(!value) return make_node<PassNode>(tok0);
+            if(simple) return make_node<VarDeclNode>(tok0, target->value(), value);
+            return make_node<AssignmentNode>(tok0, target, value);
+        }
+    }
+
     // Multi-target assignment at statement level:
     //   a, b = b, a        x.y, z[0] = f()        a, *rest = seq
     //   (a, b), c = (1, 2), 3
@@ -580,7 +642,24 @@ node_ptr Parser::statement(){
                 if(depth != 0) continue;
                 if(tt == TokenType::Lambda || tt == TokenType::Colon) break;
                 if(tt == TokenType::Comma) { comma = true; continue; }
-                if(tt == TokenType::Assign) { multi = comma && t.value == "="; break; }
+                if(tt == TokenType::Assign) {
+                    // a, b = ...; also [a, *b] = ... / (a, b) = ... (one
+                    // bracketed target, unpacked)
+                    bool bracketed = k > 0 && (peek(0).type() == TokenType::ParenOpen || peek(0).type() == TokenType::BracketOpen)
+                                     && (peek(k - 1).type() == TokenType::ParenClose || peek(k - 1).type() == TokenType::BracketClose);
+                    if (bracketed) {
+                        // the brackets must close exactly before the `=`
+                        int d2 = 0; bool whole = true;
+                        for (int q = 0; q < k; q++) {
+                            auto qt = peek(q).type();
+                            if (qt == TokenType::ParenOpen || qt == TokenType::BracketOpen || qt == TokenType::BraceOpen) d2++;
+                            else if (qt == TokenType::ParenClose || qt == TokenType::BracketClose || qt == TokenType::BraceClose) { if (--d2 == 0 && q != k - 1) { whole = false; break; } }
+                        }
+                        bracketed = whole;
+                    }
+                    multi = (comma || bracketed) && t.value == "=";
+                    break;
+                }
                 if(isAugAssignType(tt)) break;
             }
         }
@@ -588,11 +667,15 @@ node_ptr Parser::statement(){
             Token op = token();
             std::vector<node_ptr> targets;
             int star = -1;
-            do {
-                if(see(TokenType::Assign)) break;
-                if(have(TokenType::Mul)) { star = (int)targets.size(); targets.push_back(postfix()); }
-                else targets.push_back(postfix());
-            } while(have(TokenType::Comma));
+            in_assign_target_ = true;
+            try {
+                do {
+                    if(see(TokenType::Assign)) break;
+                    if(have(TokenType::Mul)) { star = (int)targets.size(); targets.push_back(postfix()); }
+                    else targets.push_back(postfix());
+                } while(have(TokenType::Comma));
+            } catch(...) { in_assign_target_ = false; throw; }
+            in_assign_target_ = false;
             op = token();
             mustBe(TokenType::Assign);
             std::vector<node_ptr> vals;
@@ -637,6 +720,13 @@ node_ptr Parser::statement(){
                 for(int j = 0; j < n_after; j++)
                     assign_to(ts[si + 1 + j], make_node<SubscriptNode>(op, var_ref(src), int_node(-(n_after - j))));
             };
+            // One bracketed target, [a, *b] = v / (a, b) = v: its elements
+            // are the targets.
+            if(targets.size() == 1 && star < 0 && vals.size() == 1
+               && (targets[0]->type() == NodeType::TUPLE || targets[0]->type() == NodeType::LIST)) {
+                assign_to(targets[0], vals[0]);
+                return block;
+            }
             std::string src = tmp_name();
             if(vals.size() == 1) {
                 auto decl = make_node<VarDeclNode>(op, src, vals[0], false, false);
@@ -1115,7 +1205,9 @@ void Parser::parseCallArgs(std::shared_ptr<CallNode> call){
         // here (`max(xs, default=0)`): no expression starts `default =`.
         auto word_tok = [&](const Token& t) {
             if (t.type() == TokenType::Identifier) return true;
-            if (t.kind() != TokenKind::Name || t.clazz() != TokenClass::Keyword || t.value.empty()) return false;
+            // any keyword that is a word (fn=, func=, def=: `fn` is a keyword
+            // of its own kind, so `f(fn=x)` was a positional argument)
+            if (t.clazz() != TokenClass::Keyword || t.value.empty()) return false;
             for (char c : t.value) if (!(std::isalnum((unsigned char)c) || c == '_')) return false;
             return !std::isdigit((unsigned char)t.value[0]);
         };
@@ -1389,6 +1481,20 @@ node_ptr Parser::fstringNode(const Token& str_tok, const std::string& raw){
                 k += 2;
             }
             if (k < field.size() && field[k] == ':') { spec = field.substr(k + 1); has_spec = true; }
+            // {expr=} (Python 3.8): the expression's text, '=', then its
+            // repr - or str/format when a conversion or spec is given.
+            {
+                size_t e = expr_str.find_last_not_of(" \t");
+                if (e != std::string::npos && expr_str[e] == '=' && e > 0) {
+                    char before = expr_str[e - 1];
+                    if (before != '=' && before != '!' && before != '<' && before != '>') {
+                        current += expr_str;
+                        if (!current.empty()) { parts.push_back(lit(current)); current.clear(); }
+                        expr_str = expr_str.substr(0, e);
+                        if (conv.empty() && !has_spec) conv = "r";
+                    }
+                }
+            }
             if (expr_str.empty()) continue;
             node_ptr expr_node;
             try {
@@ -1514,9 +1620,9 @@ node_ptr Parser::atom(){
             mustBe(TokenType::ParenClose);
             return make_node<WalrusNode>(tok, wname, init);
         }
-        node_ptr expr = expression();
+        node_ptr expr = starElem();
         // Standalone generator expression: (expr for t in it if c ...)
-        if(haveCompFor()){
+        if(!isStarElem(expr) && haveCompFor()){
             node_ptr comp = comprehension(tok, ComprehensionNode::GEN, expr, nullptr);
             mustBe(TokenType::ParenClose);
             return comp;
@@ -1525,13 +1631,22 @@ node_ptr Parser::atom(){
             // Tuple
             auto tuple = make_node<TupleNode>(tok);
             tuple->add(expr);
+            bool starred = isStarElem(expr);
             if(!see(TokenType::ParenClose)){
-                tuple->add(expression());
-                while(have(TokenType::Comma)&&!see(TokenType::ParenClose)) tuple->add(expression());
+                node_ptr e = starElem();
+                starred = starred || isStarElem(e);
+                tuple->add(e);
+                while(have(TokenType::Comma)&&!see(TokenType::ParenClose)){
+                    node_ptr e2 = starElem();
+                    starred = starred || isStarElem(e2);
+                    tuple->add(e2);
+                }
             }
             mustBe(TokenType::ParenClose);
+            if(starred && !in_assign_target_) return catStarred(tok, tuple->statements(), "tuple");
             return tuple;
         }
+        if(isStarElem(expr)) throw SyntaxError(tok.location(), "cannot use starred expression here");
         mustBe(TokenType::ParenClose);
         return expr;
     }
@@ -1559,7 +1674,7 @@ node_ptr Parser::atom(){
            || t == TokenType::Lambda || t == TokenType::Then
            || t == TokenType::Extends || t == TokenType::Inherits
            || t == TokenType::Implements || t == TokenType::NameSpace
-           || t == TokenType::Package || t == TokenType::Interface
+           || t == TokenType::Package || t == TokenType::Interface || t == TokenType::Struct
            || t == TokenType::Repeat || t == TokenType::Execute || t == TokenType::Delete
            || t == TokenType::Default || t == TokenType::Final || t == TokenType::Loop
            || t == TokenType::Block || t == TokenType::Use || t == TokenType::Global
@@ -2056,6 +2171,8 @@ node_ptr Parser::functionDecl(bool is_method){
         params = paramList();
         mustBe(TokenType::ParenClose);
     }
+    // `-> T` (a return annotation, parsed and dropped)
+    if(have(TokenType::RightArrow)) ternary();
     have(TokenType::Colon);
     outer_decls_.emplace_back();
     global_decls_.emplace_back();
@@ -2113,6 +2230,13 @@ std::vector<node_ptr> Parser::paramList(){
                 param_defaults_.push_back(nullptr);
                 return;
             }
+            // A bare `/` (PEP 570): the parameters before it are
+            // positional-only. Accepted; passing them by keyword is not
+            // refused.
+            if(see(TokenType::Div) && (peek(1).type() == TokenType::Comma || peek(1).type() == TokenType::ParenClose)){
+                next();
+                return;
+            }
             bool va = have(TokenType::Mul);
             bool kw = !va && have(TokenType::Exp);
             // Accept identifier or keyword as param name
@@ -2124,11 +2248,13 @@ std::vector<node_ptr> Parser::paramList(){
             else if(kw) static_cast<VariableNode*>(pnode.get())->name = "**" + ptok.value;
             else static_cast<VariableNode*>(pnode.get())->name = ptok.value;
             params.push_back(pnode);
+            // `name: T` (an annotation, parsed and dropped)
+            if(have(TokenType::Colon)) ternary();
             if(have(TokenType::Assign)) param_defaults_.push_back(expression());
             else param_defaults_.push_back(nullptr);
         };
         parse_one_param();
-        while(have(TokenType::Comma)){
+        while(have(TokenType::Comma) && !see(TokenType::ParenClose)){
             parse_one_param();
         }
     }
@@ -2382,6 +2508,7 @@ node_ptr Parser::yieldStmt(){
     return make_node<YieldNode>(tok, expr);
 }
 
+
 // `print(` begins the call form when its matching `)` ends the statement;
 // otherwise the parentheses belong to an expression (`print (a + b) * 2`).
 static bool endsStatement(TokenType t){
@@ -2406,23 +2533,62 @@ node_ptr Parser::printStmt(){
         }
     }
     if(call_form){
+        // The arguments as a call's; print(*xs), file= and flush= (round
+        // 77) make it a call of the prelude's _ny_print, the rest stays the
+        // print statement both engines run natively.
         mustBe(TokenType::ParenOpen);
+        auto args_call = make_node<CallNode>(tok, make_node<VariableNode>(tok));
+        auto ac = std::static_pointer_cast<CallNode>(args_call);
         while(!see(TokenType::ParenClose) && !see(TokenType::End)){
             // `end` is also the block keyword (TokenType::EndBlock), so it is
             // matched by spelling as well as by identifier.
             if((see(TokenType::Identifier) || see(TokenType::EndBlock)) && (value() == "sep" || value() == "end")
                && peek().type() == TokenType::Assign){
+                Token kt = token();
                 std::string kw = value();
                 next();
                 mustBe(TokenType::Assign);
-                node_ptr e = expression();
-                if(kw == "sep") pn->sep = e; else pn->end = e;
+                ac->add(make_node<KeywordArgNode>(kt, kw, expression()));
+            } else if(see(TokenType::Mul) || see(TokenType::Exp)){
+                Token st = token();
+                next();
+                ac->add(make_node<UnaryNode>(st, expression()));
+            } else if((see(TokenType::Identifier) || token().clazz() == TokenClass::Keyword) && peek().type() == TokenType::Assign
+                      && peek(2).type() != TokenType::Assign){
+                Token kt = token();
+                std::string kw = value();
+                next();
+                mustBe(TokenType::Assign);
+                ac->add(make_node<KeywordArgNode>(kt, kw, expression()));
             } else {
-                node->add(expression());
+                ac->add(expression());
             }
             if(!have(TokenType::Comma)) break;
         }
         mustBe(TokenType::ParenClose);
+        bool plain = true;
+        for(auto& a : ac->args){
+            if(a->type() == NodeType::KEYWORD_ARG){
+                auto k = std::static_pointer_cast<KeywordArgNode>(a);
+                if(k->name != "sep" && k->name != "end") plain = false;
+            } else if(a->type() == NodeType::UNARY){
+                auto u = std::static_pointer_cast<UnaryNode>(a);
+                if(u->op == "*" || u->op == "**") plain = false;
+            }
+        }
+        if(!plain){
+            Token ft = tok; ft.value = "_ny_print";
+            auto call = make_node<CallNode>(tok, make_node<VariableNode>(ft));
+            for(auto& a : ac->args) call->add(a);
+            have(TokenType::SemiColon); have(TokenType::NewLine);
+            return call;
+        }
+        for(auto& a : ac->args){
+            if(a->type() == NodeType::KEYWORD_ARG){
+                auto k = std::static_pointer_cast<KeywordArgNode>(a);
+                if(k->name == "sep") pn->sep = k->val; else pn->end = k->val;
+            } else node->add(a);
+        }
         pn->call_form = true;
     } else if(!see(TokenType::NewLine)&&!see(TokenType::SemiColon)&&!see(TokenType::End)){
         node->add(expression());
@@ -3159,6 +3325,38 @@ node_ptr Parser::compTarget(){
     return tup;
 }
 
+node_ptr Parser::starElem(){
+    if(see(TokenType::Mul)){
+        Token st = token();
+        next();
+        st.value = "*";
+        return make_node<UnaryNode>(st, ternary());
+    }
+    return expression();
+}
+
+// [a, *b, c] -> _ny_list_cat([a], b, [c]); wrap names tuple/set around it.
+node_ptr Parser::catStarred(Token tok, const std::vector<node_ptr>& elems, const char* wrap){
+    Token ft = tok; ft.value = "_ny_list_cat";
+    auto call = make_node<CallNode>(tok, make_node<VariableNode>(ft));
+    std::shared_ptr<ListNode> run;
+    for(auto& e : elems){
+        if(isStarElem(e)){
+            if(run){ call->add(run); run.reset(); }
+            call->add(static_cast<UnaryNode*>(e.get())->operand);
+        } else {
+            if(!run) run = std::static_pointer_cast<ListNode>(make_node<ListNode>(tok));
+            run->add(e);
+        }
+    }
+    if(run) call->add(run);
+    if(!wrap) return call;
+    Token wt = tok; wt.value = wrap;
+    auto w = make_node<CallNode>(tok, make_node<VariableNode>(wt));
+    w->add(call);
+    return w;
+}
+
 node_ptr Parser::listLiteral(){
     Token tok = token();
     mustBe(TokenType::BracketOpen);
@@ -3167,9 +3365,9 @@ node_ptr Parser::listLiteral(){
         return make_node<ListNode>(tok); // empty list []
     }
     // Parse first expression
-    node_ptr first = expression();
+    node_ptr first = starElem();
     // List comprehension: [expr for t in it if c ... for t2 in it2 ...]
-    if(haveCompFor()){
+    if(!isStarElem(first) && haveCompFor()){
         node_ptr comp = comprehension(tok, ComprehensionNode::LIST, first, nullptr);
         mustBe(TokenType::BracketClose);
         return comp;
@@ -3177,9 +3375,14 @@ node_ptr Parser::listLiteral(){
     // Regular list literal
     auto list = make_node<ListNode>(tok);
     list->add(first);
-    while(have(TokenType::Comma)&&!see(TokenType::BracketClose))
-        list->add(expression());
+    bool starred = isStarElem(first);
+    while(have(TokenType::Comma)&&!see(TokenType::BracketClose)){
+        node_ptr e = starElem();
+        starred = starred || isStarElem(e);
+        list->add(e);
+    }
     mustBe(TokenType::BracketClose);
+    if(starred && !in_assign_target_) return catStarred(tok, list->statements(), nullptr);
     return list;
 }
 
@@ -3261,8 +3464,30 @@ node_ptr Parser::mapLiteral(){
         next(); return make_node<MapNode>(tok); // empty map
     }
     auto map = make_node<MapNode>(tok);
-    node_ptr key = expression();
-    if(have(TokenType::Colon)){
+    // {**d, k: v, **e}: _ny_dict_merge(d, {k: v}, e)
+    if(see(TokenType::Exp)){
+        Token ft = tok; ft.value = "_ny_dict_merge";
+        auto call = make_node<CallNode>(tok, make_node<VariableNode>(ft));
+        std::shared_ptr<MapNode> run;
+        do {
+            if(see(TokenType::BraceClose)) break;
+            if(have(TokenType::Exp)){
+                if(run){ call->add(run); run.reset(); }
+                call->add(ternary());
+            } else {
+                node_ptr k = expression();
+                mustBe(TokenType::Colon);
+                node_ptr v = expression();
+                if(!run) run = std::static_pointer_cast<MapNode>(make_node<MapNode>(tok));
+                run->add(make_node<MapEntryNode>(tok, k, v));
+            }
+        } while(have(TokenType::Comma));
+        if(run) call->add(run);
+        mustBe(TokenType::BraceClose);
+        return call;
+    }
+    node_ptr key = starElem();
+    if(!isStarElem(key) && have(TokenType::Colon)){
         // It's a map
         node_ptr val = expression();
         // Dict comprehension: {k: v for t in it if c ...}
@@ -3272,30 +3497,49 @@ node_ptr Parser::mapLiteral(){
             return comp;
         }
         map->add(make_node<MapEntryNode>(tok, key, val));
+        std::shared_ptr<CallNode> merged;   // set once a **e appears
         while(have(TokenType::Comma)&&!see(TokenType::BraceClose)){
+            if(have(TokenType::Exp)){
+                if(!merged){
+                    Token ft = tok; ft.value = "_ny_dict_merge";
+                    merged = std::static_pointer_cast<CallNode>(make_node<CallNode>(tok, make_node<VariableNode>(ft)));
+                }
+                if(!map->statements().empty()) merged->add(map);
+                map = make_node<MapNode>(tok);
+                merged->add(ternary());
+                continue;
+            }
             node_ptr k = expression();
             mustBe(TokenType::Colon);
             node_ptr v = expression();
             map->add(make_node<MapEntryNode>(tok, k, v));
         }
         mustBe(TokenType::BraceClose);
+        if(merged){
+            if(!map->statements().empty()) merged->add(map);
+            return merged;
+        }
         return map;
     }
     // Set literal: {expr1, expr2, ...}
     // Build as: set([expr1, expr2, ...])
     // Set literal or set comprehension: {expr ...}
     // Set comprehension: {e for t in it if c ...}
-    if (haveCompFor()) {
+    if (!isStarElem(key) && haveCompFor()) {
         node_ptr comp = comprehension(tok, ComprehensionNode::SET, key, nullptr);
         mustBe(TokenType::BraceClose);
         return comp;
     }
     auto list = make_node<ListNode>(tok);
     list->add(key);
+    bool starred = isStarElem(key);
     while(have(TokenType::Comma) && !see(TokenType::BraceClose)){
-        list->add(expression());
+        node_ptr e = starElem();
+        starred = starred || isStarElem(e);
+        list->add(e);
     }
     mustBe(TokenType::BraceClose);
+    if(starred) return catStarred(tok, list->statements(), "set");
     // Wrap in set([...]) call
     Token set_tok = tok; set_tok.value = "set";
     auto set_var = make_node<VariableNode>(set_tok);

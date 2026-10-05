@@ -102,6 +102,9 @@ class SourceCode extends IReader {
         // Format a location in the source
         std::string format(Location location);
 
+        // Program text (not a file) named `name` in messages ("<string>").
+        static SourceCode from_text(const std::string& text, const std::string& name);
+
         // Create a shared pointer to a source
         static source_ptr create(std::string source);
 

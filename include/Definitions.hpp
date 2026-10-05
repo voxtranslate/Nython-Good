@@ -19,10 +19,10 @@
  * Copyright (c) 2017-2026 Litet Li Mbeleg Perrin — MIT License
  *=============================================================================*/
 #ifndef NYTHON_VERSION
-#define NYTHON_VERSION "0.3.0"
+#define NYTHON_VERSION "0.2.1"
 #define NYTHON_VERSION_MAJOR 0
-#define NYTHON_VERSION_MINOR 3
-#define NYTHON_VERSION_PATCH 0
+#define NYTHON_VERSION_MINOR 2
+#define NYTHON_VERSION_PATCH 1
 #endif // NYTHON_VERSION
 
 // Platform
