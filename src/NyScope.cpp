@@ -436,4 +436,58 @@ void check(const node_ptr& root) {
     check_scope(c.root.get());
 }
 
+static void target_names(const node_ptr& t, std::set<std::string>& out) {
+    if (!t) return;
+    if (t->type() == NodeType::VARIABLE) { out.insert(t->value()); return; }
+    if (t->type() == NodeType::TUPLE || t->type() == NodeType::LIST)
+        for (auto& e : t->statements()) target_names(e, out);
+}
+
+static void module_stmt(const node_ptr& st, std::set<std::string>& out);
+// A branch: a block of statements, or one statement.
+static void module_branch(const node_ptr& b, std::set<std::string>& out) {
+    if (!b) return;
+    if (b->type() == NodeType::BLOCK || b->type() == NodeType::STATEMENTS || b->type() == NodeType::STATEMENT) {
+        for (auto& st : b->statements()) module_stmt(st, out);
+    } else module_stmt(b, out);
+}
+static void module_stmt(const node_ptr& st, std::set<std::string>& out) {
+    if (!st) return;
+    switch (st->type()) {
+        case NodeType::FUNCTION: out.insert(std::static_pointer_cast<FunctionNode>(st)->name); break;
+        case NodeType::CLASS: out.insert(std::static_pointer_cast<ClassNode>(st)->name); break;
+        case NodeType::INTERFACE: out.insert(std::static_pointer_cast<InterfaceNode>(st)->name); break;
+        case NodeType::ENUM: out.insert(std::static_pointer_cast<EnumNode>(st)->name); break;
+        case NodeType::NAMESPACE: out.insert(std::static_pointer_cast<NameSpaceNode>(st)->name); break;
+        case NodeType::VARIABLE_DECL: {
+            auto vd = std::static_pointer_cast<VarDeclNode>(st);
+            if (!vd->name.empty() && vd->name.rfind("__", 0) != 0) out.insert(vd->name);
+            break;
+        }
+        case NodeType::ASSIGNMENT: target_names(std::static_pointer_cast<AssignmentNode>(st)->target, out); break;
+        case NodeType::IF: {
+            auto in = std::static_pointer_cast<IfNode>(st);
+            if (in->is_expr) break;
+            module_branch(in->then_branch, out);
+            for (auto& b : in->elseif_branches) module_branch(b, out);
+            module_branch(in->else_branch, out);
+            break;
+        }
+        case NodeType::TRY: {
+            auto tn = std::static_pointer_cast<TryNode>(st);
+            module_branch(tn->body, out);
+            module_branch(tn->else_clause, out);
+            break;
+        }
+        case NodeType::BLOCK: case NodeType::STATEMENTS: case NodeType::STATEMENT:
+            for (auto& s2 : st->statements()) module_stmt(s2, out);
+            break;
+        default: break;
+    }
+}
+void module_names(const node_ptr& root, std::set<std::string>& out) {
+    if (!root) return;
+    for (auto& st : root->statements()) module_stmt(st, out);
+}
+
 } // namespace nython::scope

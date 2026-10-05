@@ -594,6 +594,8 @@ struct BridgeConv {
     std::unordered_map<const void*, Value> to_interp;   // VM list/map ptr -> container
     std::vector<std::pair<Container*, VMVal>> origin;   // container -> VM original
     std::unordered_map<const Container*, size_t> origin_of;
+    // bytearrays passed in: the interpreter copy and the VM original
+    std::vector<std::pair<nyheap::Bytes*, VMVal>> barrays;
     explicit BridgeConv(NythonExecutor& e) : exec(e) {}
 
     static const void* key_of(const VMVal& v) {
@@ -615,11 +617,31 @@ struct BridgeConv {
             }
             case VMType::FLOAT:  return Value(v.d);
             case VMType::STRING: return exec.makeStringValue(v.s);
+            case VMType::BYTES: {
+                // a bytearray converts to one interpreter bytearray, changes
+                // copied back after the call (copy_back)
+                if (!v.b) return exec.makeBytesValue(v.s, false);
+                const void* k = v.list.get();
+                auto hit = to_interp.find(k);
+                if (hit != to_interp.end()) return hit->second;
+                Value out = exec.makeBytesValue(v.bdata(), true);
+                to_interp.emplace(k, out);
+                barrays.emplace_back(exec.bytesOf(out), v);
+                return out;
+            }
             case VMType::LIST:
             case VMType::MAP:
             case VMType::INSTANCE: {
                 const void* k = key_of(v);
                 if (!k) return NONE_VALUE;
+                if (v.type == VMType::MAP && v.class_name == "__kwargs__") {
+                    // keyword arguments: one map marked as such
+                    auto* kwo = new Object((Runnable*)exec.runner, "map", Type::MAP);
+                    Value kout(static_cast<Collectable*>(kwo));
+                    for (auto& kv : *v.map) (*kwo->container)[kv.first] = to_value(kv.second);
+                    (*kwo->container)["__kwargs__"] = Value(1);
+                    return kout;
+                }
                 auto hit = to_interp.find(k);
                 if (hit != to_interp.end()) return hit->second;
                 bool is_list = v.type == VMType::LIST;
@@ -651,6 +673,10 @@ struct BridgeConv {
     // A fresh VM value for an interpreter value; containers that began as VM
     // values come back as those same VM objects.
     VMVal to_vm(const Value& v) {
+        if (auto* bo = exec.bytesOf(v)) {
+            for (auto& ba : barrays) if (ba.first == bo) return ba.second;   // the caller's own bytearray
+            return VMVal::make_bytes(bo->s, bo->mut);
+        }
         if (exec.isStringValue(v)) return VMVal::make_str(exec.getStringValue(v));
         switch (v.type) {
             case ValueType::NONE:    return VMVal::make_none();
@@ -692,6 +718,11 @@ struct BridgeConv {
 
     // True when the interpreter value still is what the VM value was.
     bool same(const Value& a, const VMVal& b) {
+        if (auto* bo = exec.bytesOf(a)) {
+            if (b.type != VMType::BYTES || b.b != bo->mut) return false;
+            for (auto& ba : barrays) if (ba.first == bo) return ba.second.list.get() == b.list.get();
+            return !bo->mut && bo->s == b.s;
+        }
         if (exec.isStringValue(a)) return b.type == VMType::STRING && exec.getStringValue(a) == b.s;
         switch (a.type) {
             case ValueType::NONE:    return b.type == VMType::NONE;
@@ -713,6 +744,10 @@ struct BridgeConv {
 
     // Writes back every VM container whose interpreter copy was changed.
     void copy_back() {
+        for (auto& ba : barrays) {
+            VMVal vm = ba.second;
+            if (vm.bdata() != ba.first->s) vm.bdata_mut() = ba.first->s;
+        }
         for (size_t oi = 0; oi < origin.size(); oi++) {
             Container* c = origin[oi].first;
             VMVal vm = origin[oi].second;   // shares the list/map

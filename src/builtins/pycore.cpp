@@ -32,7 +32,7 @@ enum PyB {
     B_LEN = 1, B_STR, B_REPR, B_ASCII, B_FORMAT, B_INT, B_FLOAT, B_BOOL, B_ABS, B_ROUND,
     B_POW, B_DIVMOD, B_HEX, B_OCT, B_BIN, B_CHR, B_ORD, B_MIN, B_MAX, B_SUM, B_SORTED,
     B_REVERSED, B_LIST, B_TUPLE, B_SET, B_DICT, B_ENUMERATE, B_ZIP, B_MAP, B_FILTER,
-    B_ANY, B_ALL, B_RANGE, B_TYPE, B_FMTVAL, B_HASH
+    B_ANY, B_ALL, B_RANGE, B_TYPE, B_FMTVAL, B_HASH, B_BYTES, B_BYTEARRAY
 };
 }
 
@@ -46,6 +46,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         {"set", B_SET}, {"dict", B_DICT}, {"enumerate", B_ENUMERATE}, {"zip", B_ZIP}, {"map", B_MAP},
         {"filter", B_FILTER}, {"any", B_ANY}, {"all", B_ALL}, {"range", B_RANGE},
         {"type", B_TYPE}, {"typeof", B_TYPE}, {"__format_value__", B_FMTVAL}, {"hash", B_HASH},
+        {"bytes", B_BYTES}, {"bytearray", B_BYTEARRAY},
     };
     auto idit = ids.find(name);
     if (idit == ids.end()) return UNDEFINED_VALUE;
@@ -106,9 +107,22 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
     };
 
     switch (id) {
+    case B_BYTES: case B_BYTEARRAY: {
+        // bytes(x) / bytearray(x): keyword arguments travel as a trailing
+        // map, as constructBytes expects them.
+        std::vector<Value> a = args;
+        if (!kw.empty()) {
+            auto* m = new Object((Runnable*)E.runner, "map", Type::MAP);
+            for (auto& kv : kw) m->set(kv.first, kv.second);
+            (*m->container)["__kwargs__"] = Value(1);
+            a.push_back(Value((Collectable*)m));
+        }
+        return E.constructBytes(a, id == B_BYTEARRAY, ctx);
+    }
     case B_LEN: {
         need(1, "len()");
         const Value& v = args[0];
+        if (auto* bo = E.bytesOf(v)) return intValue((int64_t)bo->s.size());
         if (E.isStringValue(v)) return intValue((int64_t)nypy::u8_len(*(std::string*)v.value.p));
         // A generator has no length (it is lazy), as in Python.
         if (nygen::is_gen(v)) E.pyRaise("TypeError", "object of type 'generator' has no len()");
@@ -129,6 +143,16 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
     }
     case B_STR:
         if (args.empty()) return str_("");
+        // str(b, encoding, errors) decodes; str(b) alone is its repr
+        if (auto* bo = E.bytesOf(args[0])) {
+            const Value* ev = arg(1, "encoding");
+            const Value* rv = arg(2, "errors");
+            if (ev || rv) {
+                std::string enc = ev ? E.strOf(*ev, ctx) : std::string("utf-8");
+                std::string err = rv ? E.strOf(*rv, ctx) : std::string("strict");
+                return str_(E.nyCall([&] { return nypy::bytes_decode(bo->s, enc, err); }));
+            }
+        }
         if (E.isStringValue(args[0])) return args[0];
         return str_(E.strOf(args[0], ctx));
     case B_REPR:
@@ -181,7 +205,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             }
             default: break;
         }
-        if (E.isStringValue(v)) {
+        if (E.isStringValue(v) || E.isBytesValue(v)) {
             const std::string& s = *(std::string*)v.value.p;
             nypy::BigInt out;
             if (!nypy::parse_int_default(s, out))
@@ -297,6 +321,10 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
     }
     case B_ORD: {
         need(1, "ord()");
+        if (auto* bo = E.bytesOf(args[0])) {
+            if (bo->s.size() != 1) E.pyRaise("TypeError", "ord() expected a character, but string of length " + std::to_string(bo->s.size()) + " found");
+            return intValue((int64_t)(unsigned char)bo->s[0]);
+        }
         if (!E.isStringValue(args[0])) E.pyRaise("TypeError", "ord() expected string of length 1, but " + E.typeNameOf(args[0]) + " found");
         return intValue(E.nyCall([&] { return nypy::str_ord(*(std::string*)args[0].value.p); }));
     }
@@ -514,6 +542,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         }
         if (v.isCollectable()) return str_("object");
         if (v.type == ValueType::USERDATA && v.value.p) {
+            if (auto* bo = E.bytesOf(v)) return str_(bo->mut ? "bytearray" : "bytes");
             if (E.string_ptrs_.count(v.value.p)) return str_("string");
             auto fit = E.func_names.find(v.value.p);
             if (fit != E.func_names.end()) {

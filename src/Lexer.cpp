@@ -29,7 +29,7 @@ std::map<TokenType,std::string> Warnings = {
 std::map<TokenType,std::string> TokenTypeNames = {
 	{TokenType::End,"End"},{TokenType::NewLine,"NewLine"},{TokenType::Indent,"Indent"},{TokenType::Dedent,"Dedent"},{TokenType::Comment,"Comment"},
 	{TokenType::Identifier,"Identifier"},{TokenType::Float,"Float"},{TokenType::Integer,"Integer"},{TokenType::Hex,"Hex"},{TokenType::Oct,"Oct"},{TokenType::Binary,"Binary"},
-	{TokenType::Complex,"Complex"},{TokenType::String,"String"},{TokenType::True,"True"},{TokenType::False,"False"},{TokenType::None,"None"},{TokenType::Not,"Not"},{TokenType::And,"And"},
+	{TokenType::Complex,"Complex"},{TokenType::String,"String"},{TokenType::Bytes,"Bytes"},{TokenType::True,"True"},{TokenType::False,"False"},{TokenType::None,"None"},{TokenType::Not,"Not"},{TokenType::And,"And"},
 	{TokenType::Or,"Or"},{TokenType::Xor,"Xor"},{TokenType::Class,"Class"},{TokenType::Abstract,"Abstract"},{TokenType::Continue,"Continue"},{TokenType::If,"If"},{TokenType::Else,"Else"},{TokenType::ElseIf,"ElseIf"},{TokenType::For,"For"},{TokenType::Default,"Default"},{TokenType::Do,"Do"},{TokenType::Extends,"Extends"},{TokenType::Finally,"Finally"},{TokenType::Final,"Final"},{TokenType::Implements,"Implements"},{TokenType::Import,"Import"},
 	{TokenType::In,"In"},{TokenType::Pass,"Pass"},{TokenType::Instanceof,"Instanceof"},{TokenType::Subclassof,"Subclassof"},{TokenType::Parentof,"Parentof"},{TokenType::Interface,"Interface"},{TokenType::Package,"Package"},
 	{TokenType::NameSpace,"NameSpace"},{TokenType::Private,"Private"},{TokenType::Protected,"Protected"},{TokenType::Public,"Public"},{TokenType::Return,"Return"},{TokenType::Static,"Static"},
@@ -1761,6 +1761,16 @@ void Lexer::consume_ident() {
         consume_raw_string(q);
         return;
     }
+    // b"..." / rb"..." (any case, either order): a bytes literal (round 77).
+    if (source.peek_char() == '"' || source.peek_char() == '\'') {
+        std::string lo;
+        for (char c : ident) lo += (char)((c >= 'A' && c <= 'Z') ? c + 32 : c);
+        if (lo == "b" || lo == "rb" || lo == "br") {
+            char q = source.read_char();
+            consume_bytes(q, lo != "b");
+            return;
+        }
+    }
     this->token.value = ident;
     make_token(TokenType::Identifier,TokenKind::Identifier,TokenClass::Identifier);
 }
@@ -1811,6 +1821,76 @@ void Lexer::consume_raw_string(char q) {
     }
     this->token.value = out;
     make_token(TokenType::String,TokenKind::String,TokenClass::Literal);
+}
+
+// The body of a bytes literal, its opening quote just read. Python's rules:
+// only ASCII characters may be written in it, \xhh and \ooo give any byte,
+// \u is not an escape, an unknown escape keeps its backslash; a raw one
+// (rb"...") keeps every backslash.
+void Lexer::consume_bytes(char q, bool raw) {
+    std::string out;
+    int n = 1;
+    if (source.peek_char() == q) {
+        source.read_char();
+        if (source.peek_char() == q) { source.read_char(); n = 3; }
+        else { this->token.value = ""; make_token(TokenType::Bytes,TokenKind::String,TokenClass::Literal); return; }
+    }
+    auto fail = [&](const char* why) {
+        this->token.value = why;
+        errors++;
+        make_token(TokenType::UnterminatedStringError,TokenKind::Error, TokenClass::Invalid);
+        add_info_item(LexerInfoLevel::Error,token);
+    };
+    while (true) {
+        char c = source.read_char();
+        if (c == '\0' || c == (char)-1) { fail("unterminated bytes literal"); return; }
+        if ((unsigned char)c >= 0x80) { fail("bytes can only contain ASCII literal characters"); return; }
+        if (c == '\n' && n == 1) { fail("unterminated bytes literal"); return; }
+        if (c == q) {
+            if (n == 1) break;
+            if (source.peek_char() == q) {
+                source.read_char();
+                if (source.peek_char() == q) { source.read_char(); break; }
+                out += q; out += q; continue;
+            }
+            out += q; continue;
+        }
+        if (c != '\\') { if (c != '\r') out += c; continue; }
+        char d = source.read_char();
+        if (d == '\0' || d == (char)-1) { fail("unterminated bytes literal"); return; }
+        if (raw) { out += '\\'; out += d; continue; }
+        switch (d) {
+            case '\n': break;                       // line continuation
+            case '\\': out += '\\'; break;
+            case '\'': out += '\''; break;
+            case '"': out += '"'; break;
+            case 'a': out += '\a'; break;
+            case 'b': out += '\b'; break;
+            case 'f': out += '\f'; break;
+            case 'n': out += '\n'; break;
+            case 'r': out += '\r'; break;
+            case 't': out += '\t'; break;
+            case 'v': out += '\v'; break;
+            case 'x': {
+                char h1 = source.read_char();
+                char h2 = source.read_char();
+                if (!is_hex(h1) || !is_hex(h2)) { fail("invalid \\x escape in bytes literal"); return; }
+                out += (char)((hex2num(h1) << 4) | hex2num(h2));
+                break;
+            }
+            default:
+                if (d >= '0' && d <= '7') {
+                    int v = d - '0';
+                    for (int k = 0; k < 2 && source.peek_char() >= '0' && source.peek_char() <= '7'; k++)
+                        v = v * 8 + (source.read_char() - '0');
+                    out += (char)(v & 0xFF);
+                } else {
+                    out += '\\'; out += d;            // unknown: kept as written
+                }
+        }
+    }
+    this->token.value = out;
+    make_token(TokenType::Bytes,TokenKind::String,TokenClass::Literal);
 }
 
 void Lexer::consume_regex(char first) {
@@ -1974,11 +2054,15 @@ void Lexer::consume_string(char first) {
                             break;
                         }
 						case 'x': case 'X': {
-                            // \xHH hex escape (exactly 2 hex digits)
+                            // \xHH: the code point U+00HH, as in Python ("\xe9"
+                            // is "é"; it used to be the raw byte 0xE9, which is
+                            // not UTF-8 - b"\xe9" is the byte).
                             char h1 = source.read_char();
                             char h2 = source.read_char();
                             if(is_hex(h1) && is_hex(h2)) {
-                                strbuff << (char)((hex2num(h1)<<4)|hex2num(h2));
+                                uint32_t cp = (uint32_t)((hex2num(h1)<<4)|hex2num(h2));
+                                if(cp < 0x80) strbuff << (char)cp;
+                                else { strbuff << (char)(0xC0|(cp>>6)); strbuff << (char)(0x80|(cp&0x3F)); }
                             } else {
                                 strbuff << '\\' << c;
                                 if(!is_hex(h1)) source.put_char();
@@ -1990,8 +2074,25 @@ void Lexer::consume_string(char first) {
                             this->unexpectedChar();
                             break;
                         }
+						case '0': case '1': case '2': case '3': case '4': case '5': case '6': case '7': {
+                            // \ooo: up to three octal digits, a code point
+                            uint32_t cp = (uint32_t)(c - '0');
+                            for(int k = 0; k < 2; k++) {
+                                char o = source.peek_char();
+                                if(o < '0' || o > '7') break;
+                                source.read_char();
+                                cp = cp * 8 + (uint32_t)(o - '0');
+                            }
+                            if(cp < 0x80) strbuff << (char)cp;
+                            else { strbuff << (char)(0xC0|(cp>>6)); strbuff << (char)(0x80|(cp&0x3F)); }
+                            break;
+                        }
+						case '\n':
+                            // a backslash at the end of a line continues it
+                            break;
 						default:
-						    strbuff << char(cur);
+						    // an unknown escape keeps its backslash, as in Python
+						    strbuff << '\\' << c;
 						break;
 					}
 				}

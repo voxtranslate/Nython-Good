@@ -46,6 +46,7 @@ DECLARE_ENUM_WITH_TYPE (
 	Binary,
 	Complex,
 	String,
+	Bytes,      /// b"..." (round 77)
 
 	True,
 	False,

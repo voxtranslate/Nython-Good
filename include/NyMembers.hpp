@@ -18,7 +18,7 @@
 namespace nypy {
 
 // Other: a function, class, builtin, undefined ... - no builtin methods.
-enum class MemberKind { None, Bool, Int, Float, Str, List, Tuple, Dict, Set, Instance, Generator, Other };
+enum class MemberKind { None, Bool, Int, Float, Str, List, Tuple, Dict, Set, Instance, Generator, Bytes, ByteArray, Other };
 
 // The object protocol every value answers (Nython-only; both engines).
 inline const std::unordered_set<std::string>& protocol_members() {
@@ -33,6 +33,39 @@ inline bool is_operator_member(const std::string& m) {
         "+", "-", "*", "/", "//", "%", "**", "&", "|", "^", "<<", ">>",
         "==", "!=", "<", "<=", ">", ">="};
     return s.count(m) > 0;
+}
+
+// int / float methods (round 77; NyBytes.hpp has the shared bodies).
+inline const std::unordered_set<std::string>& int_methods() {
+    static const std::unordered_set<std::string> s = {
+        "to_bytes", "bit_length", "bit_count", "conjugate", "as_integer_ratio", "is_integer"};
+    return s;
+}
+inline const std::unordered_set<std::string>& float_methods() {
+    static const std::unordered_set<std::string> s = {"is_integer", "as_integer_ratio", "hex", "conjugate"};
+    return s;
+}
+// The builtin types read as namespaces (round 77): `str.upper`,
+// `bytes.fromhex`, `int.from_bytes`, `dict.fromkeys` ...
+inline MemberKind type_kind(const std::string& t) {
+    if (t == "str") return MemberKind::Str;
+    if (t == "bytes") return MemberKind::Bytes;
+    if (t == "bytearray") return MemberKind::ByteArray;
+    if (t == "list") return MemberKind::List;
+    if (t == "tuple") return MemberKind::Tuple;
+    if (t == "dict") return MemberKind::Dict;
+    if (t == "set") return MemberKind::Set;
+    if (t == "int") return MemberKind::Int;
+    if (t == "float") return MemberKind::Float;
+    if (t == "bool") return MemberKind::Bool;
+    return MemberKind::Other;
+}
+inline bool type_classmethod(const std::string& t, const std::string& m) {
+    if (t == "int" || t == "bool") return m == "from_bytes";
+    if (t == "bytes" || t == "bytearray") return m == "fromhex" || m == "maketrans";
+    if (t == "dict") return m == "fromkeys";
+    if (t == "float") return m == "fromhex";
+    return false;
 }
 
 inline bool kind_has_method(MemberKind k, const std::string& m) {
@@ -62,6 +95,15 @@ inline bool kind_has_method(MemberKind k, const std::string& m) {
         "__contains__", "add", "clear", "contains", "copy", "difference", "discard", "has", "includes",
         "intersection", "len", "length", "pop", "remove", "size", "union", "update",
         "symmetric_difference", "issubset", "issuperset", "isdisjoint"};
+    // bytes and bytearray (round 77, NyBytes.hpp's bytes_method).
+    static const std::unordered_set<std::string> bytes_m = {
+        "capitalize", "center", "count", "decode", "endswith", "expandtabs", "find", "fromhex", "hex",
+        "index", "isalnum", "isalpha", "isascii", "isdigit", "islower", "isspace", "istitle", "isupper",
+        "join", "ljust", "lower", "lstrip", "partition", "removeprefix", "removesuffix", "replace",
+        "rfind", "rindex", "rjust", "rpartition", "rsplit", "rstrip", "slice", "split", "splitlines",
+        "startswith", "strip", "swapcase", "title", "translate", "upper", "zfill"};
+    static const std::unordered_set<std::string> bytearray_m = {
+        "append", "clear", "copy", "extend", "insert", "pop", "remove", "reverse"};
     // Generators and the lazy iterators (round 75, NyGen.hpp).
     static const std::unordered_set<std::string> gen_m = {
         "__iter__", "__next__", "close", "next", "send", "throw"};
@@ -74,10 +116,23 @@ inline bool kind_has_method(MemberKind k, const std::string& m) {
         case MemberKind::Dict:  return dict_m.count(m) > 0;
         case MemberKind::Set:   return set_m.count(m) > 0;
         case MemberKind::Generator: return gen_m.count(m) > 0;
-        case MemberKind::Int: case MemberKind::Float: case MemberKind::Bool:
-            return is_operator_member(m);
+        case MemberKind::Bytes: return bytes_m.count(m) > 0;
+        case MemberKind::ByteArray: return bytes_m.count(m) > 0 || bytearray_m.count(m) > 0;
+        case MemberKind::Int: case MemberKind::Bool:
+            return is_operator_member(m) || int_methods().count(m) > 0;
+        case MemberKind::Float:
+            return is_operator_member(m) || float_methods().count(m) > 0;
         default: return false;
     }
+}
+
+// Whether `T.m` names something for builtin type T.
+inline bool type_has_member(const std::string& t, const std::string& m) {
+    MemberKind k = type_kind(t);
+    if (k == MemberKind::Other) return false;
+    if (type_classmethod(t, m)) return true;
+    if (protocol_members().count(m) || is_operator_member(m)) return false;
+    return kind_has_method(k, m);
 }
 
 // How a missing read reports itself: NY_LENIENT_READS=log is a porting aid

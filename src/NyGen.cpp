@@ -214,6 +214,7 @@ void open(NythonExecutor& E, const Value& val, Context* ctx, Cursor& cu, bool ow
     if (val.type == ValueType::INTEGER) {   // range(n) is an integer on this engine
         cu.k = Cursor::RANGE; cu.n = bigint_to_i64(val.value.i); return;
     }
+    if (E.isBytesValue(val)) { cu.k = Cursor::VEC; cu.v = E.iterItems(val, ctx); return; }
     if (E.isStringValue(val)) {
         cu.k = Cursor::VEC;
         for (auto& ch : nypy::u8_chars(*(std::string*)val.value.p)) cu.v.push_back(E.makeStringValue(ch));

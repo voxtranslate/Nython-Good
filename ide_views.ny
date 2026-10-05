@@ -1336,7 +1336,7 @@ class IDEViews(IDEPaint):
                 var st = string_strip(ln)
                 if desc == "" and string_startswith(st, "#"):
                     var t = string_strip(string_slice(st, 1, len(st)))
-                    var ok = t != "" and not string_startswith(t, "=") and not string_startswith(t, "-") and not string_startswith(t, "\xe2") and not string_startswith(t, "Usage")
+                    var ok = t != "" and not string_startswith(t, "=") and not string_startswith(t, "-") and not (ord(t[0]) >= 0x2000 and ord(t[0]) < 0x3000) and not string_startswith(t, "Usage")
                     if ok:
                         desc = t
                 if string_startswith(ln, "class "):

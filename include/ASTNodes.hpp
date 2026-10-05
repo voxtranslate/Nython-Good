@@ -66,6 +66,12 @@ struct StringNode : Node {
     void writeToStdOut(PrettyPrinter p) { p.printf("<String value=\"%s\" line=\"%d\"/>\n", _token.value.c_str(), line()); }
 };
 
+// b"...": the token's value holds the bytes (round 77).
+struct BytesNode : Node {
+    BytesNode(Token t) : Node(t, NodeType::BYTES) {}
+    void writeToStdOut(PrettyPrinter p) { p.printf("<Bytes size=\"%zu\" line=\"%d\"/>\n", _token.value.size(), line()); }
+};
+
 struct ComplexNode : Node {
     std::vector<node_ptr> items;
     ComplexNode(Token t) : Node(t, NodeType::COMPLEX), items{} {}

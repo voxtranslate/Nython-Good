@@ -25,12 +25,21 @@
  * A static check cannot see bindings made at run time (exec of code
  * strings, setattr on a module); those are not checked.
  *=============================================================================*/
+#include <set>
+#include <string>
 #include "Node.hpp"
 
 namespace nython::scope {
 
 // Throws nython::exception::SyntaxError on the first violation.
 void check(const nython::node::node_ptr& root);
+
+// The names a module's top level binds: defs, classes, interfaces, enums,
+// namespaces, var/let/const and plain assignments (unpacking targets too),
+// including those inside top-level if/try blocks - what `import m` puts in
+// m's namespace (round 77; both engines read only defs, classes and var
+// declarations before, so `X = 5` in a module was missing from it).
+void module_names(const nython::node::node_ptr& root, std::set<std::string>& out);
 
 } // namespace nython::scope
 #endif

@@ -153,7 +153,7 @@ class IDECore:
                 self._notify("Could not read " + p, "err")
                 return false
             var bom = false
-            if string_startswith(text, "\xef\xbb\xbf"):
+            if string_startswith(text, "\ufeff"):
                 bom = true
                 text = string_slice(text, 3, len(text))
             var d = Doc("file", os_path_basename(p), p, EditorBuffer(os_path_basename(p), text))
@@ -221,7 +221,7 @@ class IDECore:
     def _write_doc(self, d, path):
         var text = d.buf.text_for_save()
         if d.bom:
-            text = "\xef\xbb\xbf" + text
+            text = "\ufeff" + text
         self._tools_before_write(path)
         var ok = write_file(path, text)
         if ok == false or not os_exists(path):
@@ -298,7 +298,7 @@ class IDECore:
         if text == none:
             return false
         var bom = false
-        if string_startswith(text, "\xef\xbb\xbf"):
+        if string_startswith(text, "\ufeff"):
             bom = true
             text = string_slice(text, 3, len(text))
         var row = 0

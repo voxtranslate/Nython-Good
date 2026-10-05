@@ -43,6 +43,18 @@ struct Str final : Collectable {
     ~Str() override;
 };
 
+// A bytes or bytearray value (round 77): value.p == &s, listed in the
+// executor's bytes_ptrs_ (never in string_ptrs_ - it is not a str). A
+// bytearray is the same object with `mut` set; it changes in place, so every
+// reference sees the change. Untracked (it refers to nothing).
+struct Bytes final : Collectable {
+    std::string s;
+    bool mut;
+    NythonExecutor* E;
+    Bytes(NythonExecutor* e, std::string x, bool m);
+    ~Bytes() override;
+};
+
 // A function or lambda: value.p == &id. Holds the scope it closes over and
 // the default values evaluated when its def ran (fn_defaults_val_).
 struct Func final : Collectable {

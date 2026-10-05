@@ -9,43 +9,45 @@ def t(name, actual, expected):
 
 print "=== FILE I/O ==="
 import io
-write("/tmp/ny19_a.txt", "hello nython")
-t("write_read", cat("/tmp/ny19_a.txt"), "hello nython")
-t("exists_t", exists("/tmp/ny19_a.txt"), true)
-t("exists_f", exists("/tmp/ny19_nonexist"), false)
-t("file_size", file_size("/tmp/ny19_a.txt"), 12)
+# per run: the sweep runs this file on both engines at once
+var P = os_path_join(os_gettempdir(), "ny19_" + str(os_getpid()) + "_")
+write((P + "a.txt"), "hello nython")
+t("write_read", cat((P + "a.txt")), "hello nython")
+t("exists_t", exists((P + "a.txt")), true)
+t("exists_f", exists((P + "nonexist")), false)
+t("file_size", file_size((P + "a.txt")), 12)
 
 print "=== READLINES ==="
-writelines("/tmp/ny19_lines.txt", ["alpha", "beta", "gamma"])
-var lines_data = readlines("/tmp/ny19_lines.txt")
+writelines((P + "lines.txt"), ["alpha", "beta", "gamma"])
+var lines_data = readlines((P + "lines.txt"))
 t("readlines", len(lines_data), 3)
 t("line0", lines_data[0], "alpha")
 t("line2", lines_data[2], "gamma")
 
 print "=== FILE HANDLE ==="
-var fh = open("/tmp/ny19_handle.txt", "w")
+var fh = open((P + "handle.txt"), "w")
 t("open", fh > 0, true)
 file_write(fh, "handle test data")
 file_close(fh)
-var fh2 = open("/tmp/ny19_handle.txt", "r")
+var fh2 = open((P + "handle.txt"), "r")
 t("fread", file_read(fh2), "handle test data")
 file_close(fh2)
 
 print "=== FILE OPS ==="
-write("/tmp/ny19_orig.txt", "original")
-file_copy("/tmp/ny19_orig.txt", "/tmp/ny19_cp.txt")
-t("copy", cat("/tmp/ny19_cp.txt"), "original")
-file_rename("/tmp/ny19_cp.txt", "/tmp/ny19_mv.txt")
-t("rename", cat("/tmp/ny19_mv.txt"), "original")
-t("old_gone", exists("/tmp/ny19_cp.txt"), false)
-file_delete("/tmp/ny19_mv.txt")
-t("delete", exists("/tmp/ny19_mv.txt"), false)
+write((P + "orig.txt"), "original")
+file_copy((P + "orig.txt"), (P + "cp.txt"))
+t("copy", cat((P + "cp.txt")), "original")
+file_rename((P + "cp.txt"), (P + "mv.txt"))
+t("rename", cat((P + "mv.txt")), "original")
+t("old_gone", exists((P + "cp.txt")), false)
+file_delete((P + "mv.txt"))
+t("delete", exists((P + "mv.txt")), false)
 
 print "=== APPEND ==="
-write("/tmp/ny19_app.txt", "A")
-file_append("/tmp/ny19_app.txt", "B")
-file_append("/tmp/ny19_app.txt", "C")
-t("append", cat("/tmp/ny19_app.txt"), "ABC")
+write((P + "app.txt"), "A")
+file_append((P + "app.txt"), "B")
+file_append((P + "app.txt"), "C")
+t("append", cat((P + "app.txt")), "ABC")
 
 print "=== NETWORK ==="
 import net
@@ -84,13 +86,16 @@ socket_close(ur)
 
 print "=== OUTPUT ==="
 import io
-write("/tmp/ny19_log.txt", "")
-print_to("/tmp/ny19_log.txt", "log entry 1")
-print_to("/tmp/ny19_log.txt", "log entry 2")
-var log_lines = readlines("/tmp/ny19_log.txt")
+write((P + "log.txt"), "")
+print_to((P + "log.txt"), "log entry 1")
+print_to((P + "log.txt"), "log entry 2")
+var log_lines = readlines((P + "log.txt"))
 t("print_to", len(log_lines), 2)
 
 print ""
 print "============================================"
 print "  V19 IO+NET: " + str(pass_n) + " passed, " + str(fail_n) + " failed"
 print "============================================"
+
+for f in os_glob(P + "*"):
+    os_remove(f)

@@ -31,6 +31,9 @@ inline const char* ny_builtin_exc_parent(const std::string& name) {
         {"IndexError", "LookupError"},
         {"ValueError", "Exception"},
         {"UnicodeError", "ValueError"},
+        {"UnicodeDecodeError", "UnicodeError"},
+        {"UnicodeEncodeError", "UnicodeError"},
+        {"UnicodeTranslateError", "UnicodeError"},
         {"TypeError", "Exception"},
         {"AttributeError", "Exception"},
         {"NameError", "Exception"},
@@ -63,6 +66,10 @@ inline const char* ny_builtin_exc_parent(const std::string& name) {
         {"BrokenPipeError", "ConnectionError"},
         {"ConnectionRefusedError", "ConnectionError"},
         {"ConnectionResetError", "ConnectionError"},
+        {"ConnectionAbortedError", "ConnectionError"},
+        // socket.gaierror / socket.herror (round 77, the network layer)
+        {"gaierror", "OSError"},
+        {"herror", "OSError"},
         // The concurrency runtime's (src/NyConc.cpp).
         {"DeadlockError", "RuntimeError"},
         {"LockOrderError", "RuntimeError"},
@@ -95,7 +102,8 @@ inline const std::vector<std::string>& ny_builtin_exc_names() {
         "BaseException", "Exception", "SystemExit", "KeyboardInterrupt",
         "GeneratorExit", "Error", "ArithmeticError", "ZeroDivisionError",
         "OverflowError", "FloatingPointError", "LookupError", "KeyError",
-        "IndexError", "ValueError", "UnicodeError", "TypeError",
+        "IndexError", "ValueError", "UnicodeError", "UnicodeDecodeError",
+        "UnicodeEncodeError", "UnicodeTranslateError", "TypeError",
         "AttributeError", "NameError", "UnboundLocalError", "RuntimeError",
         "NotImplementedError", "RecursionError", "OSError", "IOError",
         "FileNotFoundError", "FileExistsError", "PermissionError",
@@ -105,6 +113,7 @@ inline const std::vector<std::string>& ny_builtin_exc_names() {
         "IsADirectoryError", "NotADirectoryError", "InterruptedError",
         "ChildProcessError", "ProcessLookupError", "BlockingIOError",
         "BrokenPipeError", "ConnectionRefusedError", "ConnectionResetError",
+        "ConnectionAbortedError", "gaierror", "herror",
         "DeadlockError", "LockOrderError", "CancelledError", "ChannelClosedError",
     };
     return names;

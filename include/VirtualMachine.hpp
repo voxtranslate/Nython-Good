@@ -50,6 +50,8 @@
 #include "NyOrderedMap.hpp"
 #include "NyBigInt.hpp"
 #include "NyStr.hpp"
+#include "NyBytes.hpp"
+#include "NyScope.hpp"
 #include "NyFormat.hpp"
 #include "NyRuntime.hpp"
 #include "NyMembers.hpp"
@@ -152,6 +154,7 @@ struct Instruction {
 enum class VMType : uint8_t {
     NONE, BOOL, INT, FLOAT, STRING, LIST, MAP,
     FUNCTION, CLASS, INSTANCE, ITERATOR, GENERATOR, NATIVE, UNDEFINED, SUPER_PROXY,
+    BYTES,   // bytes (b false: data in s) or bytearray (b true: data in (*list)[0].s, shared)
 };
 
 struct VMCode;  // forward declaration (defined after VMVal)
@@ -196,6 +199,17 @@ struct VMVal {
         x.i=v.neg?INT64_MIN:INT64_MAX;
         return x;
     }
+    // bytes / bytearray (round 77). A bytearray's data lives in a shared
+    // one-element list, so every copy of the value sees a change.
+    static VMVal make_bytes(std::string data, bool mut=false) {
+        VMVal x; x.type=VMType::BYTES; x.b=mut;
+        if(mut){ x.list=std::make_shared<std::vector<VMVal>>(1); (*x.list)[0].s=std::move(data); }
+        else x.s=std::move(data);
+        return x;
+    }
+    bool is_bytearray() const { return type==VMType::BYTES&&b; }
+    const std::string& bdata() const { return (b&&list&&!list->empty())?(*list)[0].s:s; }
+    std::string& bdata_mut() { return (b&&list&&!list->empty())?(*list)[0].s:s; }
     static VMVal make_none()              { return {}; }
     // UNDEFINED carries a tag in s: "undefined" is the language's
     // `undefined` value (distinct from none, falsy, absent to ?? and ?.);
@@ -253,6 +267,7 @@ struct VMVal {
         case VMType::INT:    return i!=0||!s.empty();
         case VMType::FLOAT:  return d!=0.0;
         case VMType::STRING: return !s.empty();
+        case VMType::BYTES:  return !bdata().empty();
         case VMType::LIST:   return list&&!list->empty();
         case VMType::MAP:    return map&&!map->empty();
         default:             return true;
@@ -281,6 +296,7 @@ struct VMVal {
         case VMType::INT:    return i==o.i&&s==o.s;
         case VMType::FLOAT:  return d==o.d;
         case VMType::STRING: return s==o.s;
+        case VMType::BYTES:  return bdata()==o.bdata();   // bytes == bytearray by content
         case VMType::LIST:
             if(b!=o.b) return false;   // a list is never equal to a tuple
             if(!list&&!o.list) return true;
@@ -319,6 +335,7 @@ struct VMVal {
         if(type==VMType::INT&&o.type==VMType::INT&&s.empty()&&o.s.empty()) return i<o.i;
         if(is_num()&&o.is_num()) { int c=num_compare(*this,o); return c==-1; }
         if(type==VMType::STRING&&o.type==VMType::STRING) return s<o.s;
+        if(type==VMType::BYTES&&o.type==VMType::BYTES) return bdata()<o.bdata();
         if(type==VMType::LIST&&o.type==VMType::LIST&&list&&o.list){
             size_t n=std::min(list->size(),o.list->size());
             for(size_t k=0;k<n;k++){
@@ -499,6 +516,7 @@ inline VMVal vm_key_value(const std::string& k) {
             for(auto& part:nypy::key_tuple_parts(k)) items.push_back(vm_key_value(part));
             return VMVal::make_tuple(std::move(items));
         }
+        case nypy::K_BYTES: return VMVal::make_bytes(k.substr(2));
         case nypy::K_OBJ: {
             auto it=vm_key_objs().find(k.substr(2));
             return it!=vm_key_objs().end()?it->second:VMVal::make_none();
@@ -558,6 +576,7 @@ inline std::string VMVal::to_string() const {
         return std::string("<iterator object at ") + buf + ">";
     }
     case VMType::GENERATOR: return vm_gen_repr(gen.get());
+    case VMType::BYTES:    return nypy::bytes_repr(bdata(), b);
     default:               return "undefined";
     }
 }
@@ -594,6 +613,12 @@ inline bool isTypeNameToken(const std::string& n) {
     };
     if(t.count(n)) return true;
     return !n.empty() && n[0]>='A' && n[0]<='Z';
+}
+
+inline bool is_ident_text(const std::string& n) {
+    if(n.empty()||!(std::isalpha((unsigned char)n[0])||n[0]=='_')) return false;
+    for(char c:n) if(!(std::isalnum((unsigned char)c)||c=='_')) return false;
+    return true;
 }
 
 class Compiler {
@@ -740,7 +765,7 @@ private:
     // pass.
     static bool pushes_value(const np& nd) {
         switch(nd->type()){
-        case NT::INTEGER: case NT::FLOAT: case NT::STRING: case NT::TRUE:
+        case NT::INTEGER: case NT::FLOAT: case NT::STRING: case NT::BYTES: case NT::TRUE:
         case NT::FALSE: case NT::NONE: case NT::UNDEFINED: case NT::OPT_CHAIN: case NT::VARIABLE: case NT::SELF:
         case NT::SUPER: case NT::ATTRIBUTE: case NT::SUBSCRIPT: case NT::UNARY:
         case NT::BINARY: case NT::CALL: case NT::LIST: case NT::TUPLE:
@@ -782,6 +807,7 @@ private:
         case NT::INTEGER: emit_lc(int_literal(nd->token().value),l); break;
         case NT::FLOAT:   emit_lc(VMVal::make_float(std::stod(nd->token().value)),l); break;
         case NT::STRING:  emit_lc(VMVal::make_str(nd->token().value),l); break;
+        case NT::BYTES:   emit_lc(VMVal::make_bytes(nd->token().value),l); break;
         case NT::TRUE:    emit_lc(VMVal::make_bool(true),l); break;
         case NT::FALSE:   emit_lc(VMVal::make_bool(false),l); break;
         case NT::NONE:    emit_lc(VMVal::make_none(),l); break;
@@ -1472,6 +1498,8 @@ private:
             // engine and not the other.
             if(!in->alias.empty())
                 mn = mn + "\x01" + in->alias;
+            else if(!in->module_name.empty()&&in->module_name[0]!='"'&&in->module_name[0]!='\''&&is_ident_text(mn))
+                mn = mn + "\x03" + mn;     // `import name` binds name (round 77)
             emit(Op::IMPORT_NAME,C().add_name(mn),l); break;
         }
 
@@ -2604,7 +2632,7 @@ public:
         for(auto& nm_canon : std::vector<std::pair<std::string,std::string>>{
                 {"int","int"},{"float","float"},{"bool","bool"},{"str","str"},
                 {"string","str"},{"list","list"},{"tuple","tuple"},
-                {"dict","map"},{"set","list"}}){
+                {"dict","map"},{"set","list"},{"bytes","bytes"},{"bytearray","bytearray"}}){
             auto git=globals_.find(nm_canon.first);
             if(git!=globals_.end()&&git->second.type==VMType::NATIVE)
                 git->second.class_name=nm_canon.second;
@@ -3359,7 +3387,7 @@ private:
         switch(v.type){
             case VMType::GENERATOR: case VMType::ITERATOR: return v;
             case VMType::LIST: { std::vector<VMVal> c; if(v.list) c=*v.list; return VMVal::make_iter(std::move(c)); }
-            case VMType::STRING: case VMType::MAP: case VMType::INT: return VMVal::make_iter(iter_items(v));
+            case VMType::STRING: case VMType::MAP: case VMType::INT: case VMType::BYTES: return VMVal::make_iter(iter_items(v));
             case VMType::INSTANCE: {
                 bool f=false;
                 VMVal r=call_dunder_f(v,"__iter__",{},f);
@@ -3611,6 +3639,8 @@ private:
     bool vm_less(const VMVal& a, const VMVal& b) {
         VMVal r;
         if(rich_compare(a,b,"__lt__","__gt__",r)) return vm_truthy(r);
+        if((a.type==VMType::BYTES)!=(b.type==VMType::BYTES))
+            raise_native_exception("TypeError","'<' not supported between instances of '"+vm_type_name(a)+"' and '"+vm_type_name(b)+"'");
         if(a.type==VMType::LIST&&b.type==VMType::LIST) return cmp_val(a,b)<0;
         return a<b;
     }
@@ -4046,6 +4076,25 @@ private:
                 else if(obj.type==VMType::MAP&&obj.map){
                     if(obj.map->erase(vkey(key))==0) raise_native_exception("KeyError",key.repr());
                 }
+                else if(obj.type==VMType::BYTES){
+                    if(!obj.b) raise_native_exception("TypeError","'bytes' object doesn't support item deletion");
+                    std::string& d=obj.bdata_mut();
+                    int64_t len=(int64_t)d.size();
+                    if(key.type==VMType::LIST&&key.list&&!key.b){
+                        int64_t st,step,n=slice_spec(*key.list,len,st,step);
+                        if(n<=0) break;
+                        std::vector<bool> gone((size_t)len,false);
+                        for(int64_t k=0,i=st;k<n;k++,i+=step) gone[(size_t)i]=true;
+                        std::string kept;
+                        for(int64_t k=0;k<len;k++) if(!gone[(size_t)k]) kept+=d[(size_t)k];
+                        d=std::move(kept);
+                        break;
+                    }
+                    int64_t i=index_of(key,"bytearray");
+                    if(i<0) i+=len;
+                    if(i<0||i>=len) raise_native_exception("IndexError","bytearray index out of range");
+                    d.erase((size_t)i,1);
+                }
                 else if(obj.type==VMType::LIST&&obj.list){
                     if(obj.b) raise_native_exception("TypeError","'tuple' object doesn't support item deletion");
                     if(key.type==VMType::LIST&&key.list&&!key.b){
@@ -4163,21 +4212,29 @@ private:
             }
             case Op::COMPARE_LT: {
                 VMVal r=pop(),lv=pop();
+                if((lv.type==VMType::BYTES)!=(r.type==VMType::BYTES)&&lv.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
+                    raise_native_exception("TypeError","'<' not supported between instances of '"+vm_type_name(lv)+"' and '"+vm_type_name(r)+"'");
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__lt__","__gt__",res)){ push(std::move(res)); break; } }
                 push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)<0 : lv<r)); break;
             }
             case Op::COMPARE_LE: {
                 VMVal r=pop(),lv=pop();
+                if((lv.type==VMType::BYTES)!=(r.type==VMType::BYTES)&&lv.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
+                    raise_native_exception("TypeError","'<=' not supported between instances of '"+vm_type_name(lv)+"' and '"+vm_type_name(r)+"'");
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__le__","__ge__",res)){ push(std::move(res)); break; } }
                 push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)<=0 : lv<=r)); break;
             }
             case Op::COMPARE_GT: {
                 VMVal r=pop(),lv=pop();
+                if((lv.type==VMType::BYTES)!=(r.type==VMType::BYTES)&&lv.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
+                    raise_native_exception("TypeError","'>' not supported between instances of '"+vm_type_name(lv)+"' and '"+vm_type_name(r)+"'");
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__gt__","__lt__",res)){ push(std::move(res)); break; } }
                 push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)>0 : lv>r)); break;
             }
             case Op::COMPARE_GE: {
                 VMVal r=pop(),lv=pop();
+                if((lv.type==VMType::BYTES)!=(r.type==VMType::BYTES)&&lv.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
+                    raise_native_exception("TypeError","'>=' not supported between instances of '"+vm_type_name(lv)+"' and '"+vm_type_name(r)+"'");
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__ge__","__le__",res)){ push(std::move(res)); break; } }
                 push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)>=0 : lv>=r)); break;
             }
@@ -4969,8 +5026,95 @@ private:
             case VMType::GENERATOR: return "generator";
             case VMType::ITERATOR: return "iterator";
             case VMType::UNDEFINED: return "undefined";
+            case VMType::BYTES: return v.b?"bytearray":"bytes";
             default: return "object";
         }
+    }
+    // bytes / bytearray operands (round 77); false hands the operator back.
+    bool bytes_binop(int op, const VMVal& l, const VMVal& r, VMVal& out) {
+        bool lb=l.type==VMType::BYTES, rb=r.type==VMType::BYTES;
+        if(!lb&&!rb) return false;
+        switch(op){
+        case nypy::A_ADD:
+            if(lb&&rb){ out=VMVal::make_bytes(l.bdata()+r.bdata(),l.b); return true; }
+            if(lb) raise_native_exception("TypeError","can't concat "+vm_type_name(r)+" to "+vm_type_name(l));
+            if(l.type==VMType::STRING) raise_native_exception("TypeError","can only concatenate str (not \""+vm_type_name(r)+"\") to str");
+            raise_native_exception("TypeError","unsupported operand type(s) for +: '"+vm_type_name(l)+"' and '"+vm_type_name(r)+"'");
+        case nypy::A_MUL: {
+            int64_t times;
+            const VMVal* seq=nullptr;
+            if(lb&&!rb&&seq_times(r,times)) seq=&l; else if(rb&&!lb&&seq_times(l,times)) seq=&r;
+            if(!seq) raise_native_exception("TypeError","can't multiply sequence by non-int of type '"+vm_type_name(lb?r:l)+"'");
+            if(times>0&&seq->bdata().size()*(uint64_t)times>(1ull<<32)) raise_native_exception("MemoryError","repeated bytes are too long");
+            out=VMVal::make_bytes(nypy::repeat_str(seq->bdata(),times),seq->b);
+            return true;
+        }
+        case nypy::A_MOD:
+            if(lb) raise_native_exception("TypeError","%-formatting of bytes is not supported; use b''.join or .format on str and encode()");
+            return false;
+        default:
+            raise_native_exception("TypeError",std::string("unsupported operand type(s) for ")+nypy::arith_symbol(op)+": '"+vm_type_name(l)+"' and '"+vm_type_name(r)+"'");
+        }
+    }
+    // A value as an argument of a bytes method (NyBytes.hpp: BArg).
+    nypy::BArg to_barg(const VMVal& v, int depth=0) {
+        nypy::BArg a; a.tname=vm_type_name(v);
+        switch(v.type){
+            case VMType::NONE: case VMType::UNDEFINED: a.k=nypy::BArg::NONE; return a;
+            case VMType::BOOL: a.k=nypy::BArg::BOOL; a.i=v.b?1:0; return a;
+            case VMType::INT: a.k=nypy::BArg::INT; a.i=v.i; return a;
+            case VMType::BYTES: a.k=nypy::BArg::BYTES; a.s=v.bdata(); return a;
+            case VMType::STRING: a.k=nypy::BArg::STR; a.s=v.s; return a;
+            case VMType::LIST: case VMType::MAP: case VMType::ITERATOR: case VMType::GENERATOR: case VMType::INSTANCE:
+                if(depth==0){
+                    a.k=nypy::BArg::SEQ;
+                    for(auto& it:iter_items(v)) a.items.push_back(to_barg(it,1));
+                    return a;
+                }
+                a.k=nypy::BArg::OTHER; return a;
+            default: a.k=nypy::BArg::OTHER; return a;
+        }
+    }
+    static VMVal from_bres(const nypy::BRes& r) {
+        switch(r.k){
+            case nypy::BRes::INT: return VMVal::make_int(r.i);
+            case nypy::BRes::BOOL: return VMVal::make_bool(r.b);
+            case nypy::BRes::STR: return VMVal::make_str(r.s);
+            case nypy::BRes::BYTES: return VMVal::make_bytes(r.s,r.ba);
+            case nypy::BRes::LIST: case nypy::BRes::TUPLE: {
+                std::vector<VMVal> items; items.reserve(r.v.size());
+                for(auto& x:r.v) items.push_back(VMVal::make_bytes(x,r.ba));
+                VMVal out=VMVal::make_list(std::move(items)); out.b=r.k==nypy::BRes::TUPLE; return out;
+            }
+            default: return VMVal::make_none();
+        }
+    }
+    // bytes(x) / bytearray(x) with encoding/errors (positional or keyword).
+    VMVal construct_bytes(std::vector<VMVal>& a, bool mut) {
+        VMVal kw=take_kwargs(a);
+        std::string enc="utf-8", err="strict"; bool has_enc=false;
+        const char* tn=mut?"bytearray":"bytes";
+        if(kw.type==VMType::MAP&&kw.map) for(auto& kv:*kw.map){
+            std::string k=nypy::key_payload(kv.first);
+            if(vm_internal_key(kv.first)) continue;
+            if(k=="encoding"){ enc=vm_str(kv.second); has_enc=true; }
+            else if(k=="errors") err=vm_str(kv.second);
+            else raise_native_exception("TypeError",std::string(tn)+"() got an unexpected keyword argument '"+k+"'");
+        }
+        if(a.size()>3) raise_native_exception("TypeError",std::string(tn)+"() takes at most 3 arguments ("+std::to_string(a.size())+" given)");
+        if(a.size()>=2){ enc=vm_str(a[1]); has_enc=true; }
+        if(a.size()>=3) err=vm_str(a[2]);
+        if(!a.empty()&&a[0].type==VMType::INSTANCE){
+            bool f=false;
+            VMVal r=call_dunder_f(a[0],"__bytes__",{},f);
+            if(f){
+                if(r.type!=VMType::BYTES) raise_native_exception("TypeError","__bytes__ returned non-bytes (type "+vm_type_name(r)+")");
+                return VMVal::make_bytes(r.bdata(),mut);
+            }
+        }
+        std::vector<nypy::BArg> ba;
+        if(!a.empty()) ba.push_back(to_barg(a[0]));
+        return VMVal::make_bytes(nycall([&]{ return nypy::bytes_construct(ba,enc,err,has_enc,tn); }),mut);
     }
     VMVal binop(int op, const VMVal& l, const VMVal& r) {
         nypy::NumV x,y;
@@ -4985,6 +5129,7 @@ private:
             }
             return nycall([&]{ return VMVal::from_numv(nypy::arith(op,x,y)); });
         }
+        if(l.type==VMType::BYTES||r.type==VMType::BYTES){ VMVal out; if(bytes_binop(op,l,r,out)) return out; }
         switch(op){
         case nypy::A_ADD:
             if(l.type==VMType::STRING&&r.type==VMType::STRING) return VMVal::make_str(l.s+r.s);
@@ -5046,6 +5191,19 @@ private:
     // In place: `L += it` extends and `L *= n` repeats the list object itself,
     // so every alias sees it; anything else is the binary operator.
     VMVal binop_inplace(int op, VMVal& l, const VMVal& r) {
+        if(l.is_bytearray()&&(op==nypy::A_ADD||op==nypy::A_MUL)){
+            // bytearray += b / *= n change it in place
+            if(op==nypy::A_ADD){
+                if(r.type!=VMType::BYTES) raise_native_exception("TypeError","can't concat "+vm_type_name(r)+" to bytearray");
+                std::string add=r.bdata();
+                l.bdata_mut()+=add;
+                return l;
+            }
+            int64_t times;
+            if(!seq_times(r,times)) raise_native_exception("TypeError","can't multiply sequence by non-int of type '"+vm_type_name(r)+"'");
+            l.bdata_mut()=nypy::repeat_str(l.bdata(),times);
+            return l;
+        }
         if(l.type==VMType::LIST&&!l.b&&l.list){
             if(op==nypy::A_ADD){
                 std::vector<VMVal> more=iter_items(r);
@@ -5149,6 +5307,13 @@ private:
                 for(auto& ch:nypy::u8_chars(v.s)) out.push_back(VMVal::make_str(ch));
                 return out;
             }
+            case VMType::BYTES: {
+                std::vector<VMVal> out;
+                const std::string& d=v.bdata();
+                out.reserve(d.size());
+                for(unsigned char c:d) out.push_back(VMVal::make_int(c));
+                return out;
+            }
             case VMType::MAP: {
                 std::vector<VMVal> out;
                 if(v.map) for(auto& kv:*v.map) if(!vm_internal_key(kv.first)) out.push_back(vm_key_value(kv.first));
@@ -5232,6 +5397,9 @@ private:
                 }
                 raise_native_exception("TypeError","unhashable type: 'list'");
             case VMType::MAP: raise_native_exception("TypeError","unhashable type: 'dict'");
+            case VMType::BYTES:
+                if(k.b) raise_native_exception("TypeError","unhashable type: 'bytearray'");
+                return nypy::key_of_bytes(k.s);
             default: break;
         }
         const void* id=k.map?(const void*)k.map.get():k.code?(const void*)k.code.get():k.gen?(const void*)k.gen.get():(const void*)k.iter.get();
@@ -5256,6 +5424,10 @@ private:
         }
         if(cont.type==VMType::STRING&&item.type==VMType::STRING)
             return cont.s.find(item.s)!=std::string::npos;
+        if(cont.type==VMType::BYTES){
+            nypy::BArg x=to_barg(item);
+            return nycall([&]{ return nypy::bytes_contains(cont.bdata(),x); });
+        }
         if(cont.type==VMType::LIST&&cont.list)
             for(auto& v:*cont.list) if(vm_eq(v,item)) return true;
         if(cont.type==VMType::MAP&&cont.map)
@@ -5424,8 +5596,30 @@ private:
             return false;
         }
         case VMType::NATIVE:
+            // A builtin type (tagged with its name): str.upper, bytes.fromhex,
+            // int.from_bytes, dict.fromkeys ... (round 77)
+            if(!native_type_base(obj).empty()&&nypy::type_has_member(native_type_base(obj),attr)){
+                std::string base=native_type_base(obj);
+                VirtualMachine* vm=this;
+                out=VMVal::make_native([vm,base,attr](std::vector<VMVal>& a)->VMVal{
+                    VMVal kw=take_kwargs(a);
+                    return vm->type_member_call(base,attr,a,kw.type==VMType::MAP?&kw:nullptr);
+                });
+                out.class_name="__builtin__:"+base+"."+attr;
+                return true;
+            }
             // A builtin used as a namespace: time.time, os.path ...
             if(obj.class_name.rfind("__builtin__:",0)==0){
+                std::string base=obj.class_name.substr(12);
+                if(nypy::type_has_member(base,attr)){
+                    VirtualMachine* vm=this;
+                    out=VMVal::make_native([vm,base,attr](std::vector<VMVal>& a)->VMVal{
+                        VMVal kw=take_kwargs(a);
+                        return vm->type_member_call(base,attr,a,kw.type==VMType::MAP?&kw:nullptr);
+                    });
+                    out.class_name="__builtin__:"+base+"."+attr;
+                    return true;
+                }
                 std::string target=nyrt::builtin_member(obj.class_name.substr(12),attr,
                     [&](const std::string& n){ return bridge_exists()&&bridge_exists()(n); });
                 if(!target.empty()){ out=load_var(target); return true; }
@@ -5456,6 +5650,7 @@ private:
             case VMType::MAP:    return nypy::MemberKind::Dict;
             case VMType::INSTANCE: return nypy::MemberKind::Instance;
             case VMType::GENERATOR: case VMType::ITERATOR: return nypy::MemberKind::Generator;
+            case VMType::BYTES:  return v.b?nypy::MemberKind::ByteArray:nypy::MemberKind::Bytes;
             default:             return nypy::MemberKind::Other;
         }
     }
@@ -5641,6 +5836,20 @@ private:
             auto it=obj.map->find(vkey(idx));
             return it!=obj.map->end()?it->second:missing_key(idx);
         }
+        if(obj.type==VMType::BYTES){
+            const std::string& d=obj.bdata();
+            if(idx.type==VMType::LIST&&idx.list&&!idx.b){
+                int64_t st,step,n=slice_spec(*idx.list,(int64_t)d.size(),st,step);
+                std::string out;
+                if(step==1){ if(n>0) out=d.substr((size_t)st,(size_t)n); }
+                else for(int64_t k=0,i=st;k<n;k++,i+=step) out+=d[(size_t)i];
+                return VMVal::make_bytes(std::move(out),obj.b);
+            }
+            int64_t i=index_of(idx,obj.b?"bytearray":"byte"), sz=(int64_t)d.size();
+            if(i<0) i+=sz;
+            if(i<0||i>=sz) raise_native_exception("IndexError",obj.b?"bytearray index out of range":"index out of range");
+            return VMVal::make_int((unsigned char)d[(size_t)i]);
+        }
         if(obj.type==VMType::STRING){
             if(idx.type==VMType::LIST&&idx.list&&!idx.b){
                 std::vector<VMVal> sp=*idx.list;
@@ -5675,6 +5884,11 @@ private:
         }
         if(obj.type==VMType::STRING&&(idx.type==VMType::INT||idx.type==VMType::BOOL)){
             int64_t n=(int64_t)nypy::u8_len(obj.s), i=index_of(idx,"string");
+            if(i<0) i+=n;
+            if(i<0||i>=n) return false;
+        }
+        if(obj.type==VMType::BYTES&&(idx.type==VMType::INT||idx.type==VMType::BOOL)){
+            int64_t n=(int64_t)obj.bdata().size(), i=index_of(idx,"byte");
             if(i<0) i+=n;
             if(i<0||i>=n) return false;
         }
@@ -5723,6 +5937,33 @@ private:
             (*obj.map)[vkey(idx)]=std::move(val);
         } else if(obj.type==VMType::STRING) {
             raise_native_exception("TypeError","'str' object does not support item assignment");
+        } else if(obj.type==VMType::BYTES) {
+            if(!obj.b) raise_native_exception("TypeError","'bytes' object does not support item assignment");
+            std::string& d=obj.bdata_mut();
+            if(idx.type==VMType::LIST&&idx.list&&!idx.b){
+                nypy::BArg ra=to_barg(val);
+                if(ra.k==nypy::BArg::INT||ra.k==nypy::BArg::BOOL||ra.k==nypy::BArg::STR)
+                    raise_native_exception("TypeError","can assign only bytes, buffers, or iterables of ints in range(0, 256)");
+                std::string repl=ra.k==nypy::BArg::BYTES?ra.s:nycall([&]{
+                    std::vector<nypy::BArg> one={ra};
+                    return nypy::bytes_construct(one,"utf-8","strict",false,"bytearray"); });
+                int64_t len=(int64_t)d.size(),st,step,n=slice_spec(*idx.list,len,st,step);
+                if(step==1){
+                    if(n<0) n=0;
+                    if(st>len) st=len;
+                    d.replace((size_t)st,(size_t)n,repl);
+                } else {
+                    if((int64_t)repl.size()!=n)
+                        raise_native_exception("ValueError","attempt to assign bytes of size "+std::to_string(repl.size())+" to extended slice of size "+std::to_string(n));
+                    for(int64_t k=0,i=st;k<n;k++,i+=step) d[(size_t)i]=repl[(size_t)k];
+                }
+                return;
+            }
+            int64_t i=index_of(idx,"bytearray"), sz=(int64_t)d.size();
+            if(i<0) i+=sz;
+            if(i<0||i>=sz) raise_native_exception("IndexError","bytearray index out of range");
+            nypy::BArg b=to_barg(val);
+            d[(size_t)i]=(char)nycall([&]{ return nypy::byte_of(b); });
         }
     }
 
@@ -6045,6 +6286,11 @@ private:
             return args;
         };
         if(obj.type==VMType::STRING) return call_str_method(obj,method,with_kw());
+        if(obj.type==VMType::BYTES)  return call_bytes_method(obj,method,args,kwargs);
+        if(obj.type==VMType::INT||obj.type==VMType::BOOL||obj.type==VMType::FLOAT){
+            VMVal r;
+            if(number_method(obj,method,args,kwargs,r)) return r;
+        }
         if(obj.type==VMType::LIST)   return call_list_method(obj,method,with_kw());
         if(obj.type==VMType::MAP){
             // A map member that is itself callable — a class or function held in
@@ -6075,6 +6321,8 @@ private:
         }
         // A builtin used as a namespace: `import time` then time.time(),
         // time.sleep(1), time.monotonic() - the builtin time_X, else X.
+        if(obj.type==VMType::NATIVE&&!native_type_base(obj).empty()&&nypy::type_has_member(native_type_base(obj),method))
+            return type_member_call(native_type_base(obj),method,args,kwargs);
         if(obj.type==VMType::NATIVE&&obj.class_name.rfind("__builtin__:",0)==0){
             std::string target=nyrt::builtin_member(obj.class_name.substr(12),method,
                 [&](const std::string& n){ return bridge_exists()&&bridge_exists()(n); });
@@ -6088,6 +6336,156 @@ private:
         // AttributeError (they returned none, or called a global native of
         // that name with the receiver dropped). x?.m() is the graceful form.
         return missing_attr(obj, method);
+    }
+
+    // The builtin type a native stands for ("int" for int, "dict" for dict ...),
+    // "" for any other native.
+    static std::string native_type_base(const VMVal& f) {
+        if(f.type!=VMType::NATIVE) return std::string();
+        const std::string& c=f.class_name;
+        std::string b=c.rfind("__builtin__:",0)==0?c.substr(12):c;
+        if(b=="map") b="dict";
+        static const std::unordered_set<std::string> types={"int","float","bool","str","list","tuple","dict","bytes","bytearray"};
+        return types.count(b)?b:std::string();
+    }
+    // A keyword argument from a kwargs map, else the positional one at pos.
+    static const VMVal* kw_or_pos(const VMVal* kw, const char* name, std::vector<VMVal>& a, size_t pos) {
+        if(kw&&kw->type==VMType::MAP&&kw->map){
+            auto it=kw->map->find(nypy::key_of_str(name));
+            if(it!=kw->map->end()) return &it->second;
+        }
+        return pos<a.size()?&a[pos]:nullptr;
+    }
+    // bytes / bytearray methods (NyBytes.hpp: bytes_method).
+    VMVal call_bytes_method(VMVal obj, const std::string& m, std::vector<VMVal>& args_in, const VMVal* kw) {
+        std::vector<VMVal> a=args_in;
+        if(kw&&kw->type==VMType::MAP&&kw->map&&!kw->map->empty()){
+            static const std::unordered_map<std::string,std::vector<const char*>> slots={
+                {"decode",{"encoding","errors"}},{"hex",{"sep","bytes_per_sep"}},
+                {"split",{"sep","maxsplit"}},{"rsplit",{"sep","maxsplit"}},
+                {"splitlines",{"keepends"}},{"translate",{"table","delete"}},
+                {"count",{"sub","start","end"}},{"replace",{"old","new","count"}}};
+            auto it=slots.find(m);
+            for(auto& kv:*kw->map){
+                if(vm_internal_key(kv.first)) continue;
+                std::string k=nypy::key_payload(kv.first);
+                size_t pos=SIZE_MAX;
+                if(it!=slots.end()) for(size_t q=0;q<it->second.size();q++) if(k==it->second[q]) pos=q;
+                if(pos==SIZE_MAX) raise_native_exception("TypeError",m+"() got an unexpected keyword argument '"+k+"'");
+                if(a.size()<=pos) a.resize(pos+1,VMVal::make_none());
+                a[pos]=kv.second;
+            }
+        }
+        if(m=="fromhex"){
+            if(a.size()!=1||a[0].type!=VMType::STRING) raise_native_exception("TypeError","fromhex() argument must be str");
+            return VMVal::make_bytes(nycall([&]{ return nypy::bytes_fromhex(a[0].s); }),obj.b);
+        }
+        if(m=="slice"){
+            // b[a:b:c] spelled as a call (the parser's form for slices)
+            const std::string& d=obj.bdata();
+            int64_t st,step,n=slice_spec(a,(int64_t)d.size(),st,step);
+            std::string out;
+            if(step==1){ if(n>0) out=d.substr((size_t)st,(size_t)n); }
+            else for(int64_t k=0,i=st;k<n;k++,i+=step) out+=d[(size_t)i];
+            return VMVal::make_bytes(std::move(out),obj.b);
+        }
+        std::vector<nypy::BArg> ba; ba.reserve(a.size());
+        for(auto& v:a) ba.push_back(to_barg(v));
+        nypy::BRes r;
+        std::string& data=obj.bdata_mut();
+        if(nycall([&]{ return nypy::bytes_method(data,obj.b,m,ba,r); })) return from_bres(r);
+        if(m=="class_name"||m=="type_name") return VMVal::make_str(vm_type_name(obj));
+        if(m=="to_string"||m=="str") return VMVal::make_str(obj.to_string());
+        return missing_attr(obj,m);
+    }
+    // int / float methods (round 77; NyBytes.hpp).
+    bool number_method(const VMVal& obj, const std::string& m, std::vector<VMVal>& a, const VMVal* kw, VMVal& out) {
+        bool isint=obj.type==VMType::INT||obj.type==VMType::BOOL;
+        if(isint&&!nypy::int_methods().count(m)) return false;
+        if(!isint&&!nypy::float_methods().count(m)) return false;
+        if(isint){
+            nypy::BigInt v;
+            if(obj.type==VMType::BOOL) v=nypy::BigInt(obj.b?1:0);
+            else if(obj.s.empty()) v=nypy::BigInt(obj.i);
+            else nypy::BigInt::parse(obj.s,10,v);
+            if(m=="bit_length"){ out=VMVal::make_int(nypy::big_bit_length(v)); return true; }
+            if(m=="bit_count"){ out=VMVal::make_int(nypy::big_bit_count(v)); return true; }
+            if(m=="conjugate"){ out=VMVal::make_bigint(v); return true; }
+            if(m=="is_integer"){ out=VMVal::make_bool(true); return true; }
+            if(m=="as_integer_ratio"){ out=VMVal::make_tuple({VMVal::make_bigint(v),VMVal::make_int(1)}); return true; }
+            if(m=="to_bytes"){
+                const VMVal* lv=kw_or_pos(kw,"length",a,0);
+                int64_t len=1;
+                if(lv){ if(lv->type!=VMType::INT) raise_native_exception("TypeError","length must be an int"); len=lv->i; }
+                const VMVal* bo=kw_or_pos(kw,"byteorder",a,1);
+                std::string order=bo?vm_str(*bo):std::string("big");
+                if(order!="big"&&order!="little") raise_native_exception("ValueError","byteorder must be either 'little' or 'big'");
+                const VMVal* sg=kw_or_pos(kw,"signed",a,99);
+                bool sgn=sg&&vm_truthy(*sg);
+                out=VMVal::make_bytes(nycall([&]{ return nypy::int_to_bytes(v,len,order=="little",sgn); }));
+                return true;
+            }
+            return false;
+        }
+        double d=obj.d;
+        if(m=="is_integer"){ out=VMVal::make_bool(std::isfinite(d)&&d==std::floor(d)); return true; }
+        if(m=="hex"){ out=VMVal::make_str(nypy::float_hex(d)); return true; }
+        if(m=="conjugate"){ out=obj; return true; }
+        if(m=="as_integer_ratio"){
+            nypy::BigInt n,dd;
+            nycall([&]{ nypy::float_ratio(d,n,dd); return 0; });
+            out=VMVal::make_tuple({VMVal::make_bigint(n),VMVal::make_bigint(dd)});
+            return true;
+        }
+        return false;
+    }
+    // `T.m(...)` for a builtin type T (round 77), as the interpreter's
+    // typeMemberCall.
+    VMVal type_member_call(const std::string& t, const std::string& m, std::vector<VMVal>& a, const VMVal* kw) {
+        if(nypy::type_classmethod(t,m)){
+            if(m=="from_bytes"){
+                const VMVal* b=kw_or_pos(kw,"bytes",a,0);
+                if(!b) raise_native_exception("TypeError","from_bytes() missing required argument 'bytes' (pos 1)");
+                nypy::BArg ba=to_barg(*b);
+                std::string data=ba.k==nypy::BArg::BYTES?ba.s:nycall([&]{
+                    std::vector<nypy::BArg> one={ba};
+                    return nypy::bytes_construct(one,"utf-8","strict",false,"bytes"); });
+                const VMVal* bo=kw_or_pos(kw,"byteorder",a,1);
+                std::string order=bo?vm_str(*bo):std::string("big");
+                if(order!="big"&&order!="little") raise_native_exception("ValueError","byteorder must be either 'little' or 'big'");
+                const VMVal* sg=kw_or_pos(kw,"signed",a,99);
+                bool sgn=sg&&vm_truthy(*sg);
+                return VMVal::make_bigint(nycall([&]{ return nypy::int_from_bytes(data,order=="little",sgn); }));
+            }
+            if(m=="fromhex"){
+                if(a.size()!=1||a[0].type!=VMType::STRING) raise_native_exception("TypeError","fromhex() argument must be str");
+                if(t=="float") return VMVal::make_float(std::strtod(a[0].s.c_str(),nullptr));
+                return VMVal::make_bytes(nycall([&]{ return nypy::bytes_fromhex(a[0].s); }),t=="bytearray");
+            }
+            if(m=="maketrans"){
+                if(a.size()!=2||a[0].type!=VMType::BYTES||a[1].type!=VMType::BYTES) raise_native_exception("TypeError","maketrans expected 2 bytes-like arguments");
+                const std::string& x=a[0].bdata(); const std::string& y=a[1].bdata();
+                if(x.size()!=y.size()) raise_native_exception("ValueError","maketrans arguments must have same length");
+                std::string table(256,'\0');
+                for(int k=0;k<256;k++) table[(size_t)k]=(char)k;
+                for(size_t k=0;k<x.size();k++) table[(unsigned char)x[k]]=y[k];
+                return VMVal::make_bytes(table);
+            }
+            if(m=="fromkeys"){
+                if(a.empty()) raise_native_exception("TypeError","fromkeys expected at least 1 argument, got 0");
+                VMVal v=a.size()>=2?a[1]:VMVal::make_none();
+                VMVal d=VMVal::make_map();
+                for(auto& k:iter_items(a[0])) (*d.map)[vkey(k)]=v;
+                return d;
+            }
+        }
+        if(a.empty()) raise_native_exception("TypeError","unbound method "+t+"."+m+"() needs an argument");
+        std::string have=vm_type_name(a[0]);
+        if(!(have==t||(t=="int"&&have=="bool")))
+            raise_native_exception("TypeError","descriptor '"+m+"' for '"+t+"' objects doesn't apply to a '"+have+"' object");
+        VMVal self=a[0];
+        std::vector<VMVal> rest(a.begin()+1,a.end());
+        return vm_call_method(self,m,rest,kw);
     }
 
     // dict methods, typed keys (vkey / vm_key_value), as the interpreter's
@@ -6182,21 +6580,36 @@ private:
 
 
     // ── Import system ───────────────────────────────────────────────────────
+    // Modules imported by name, their namespaces (vm_import).
+    std::unordered_map<std::string, VMVal> module_ns_;
     void vm_import(const std::string& raw_name_in) {
         std::string tried_paths;
         // Split the alias the compiler appended, if any.
         std::string raw_name = raw_name_in;
         std::string alias;
+        bool implicit=false;
         size_t sep = raw_name.find('\x01');
         if(sep != std::string::npos){
             alias = raw_name.substr(sep + 1);
             raw_name = raw_name.substr(0, sep);
+        } else if((sep=raw_name.find('\x03'))!=std::string::npos){
+            // `import name`: binds name to the module's namespace (round 77)
+            alias = raw_name.substr(sep + 1);
+            raw_name = raw_name.substr(0, sep);
+            implicit = true;
         }
         std::string name = raw_name;
         if(name.size()>=2&&(name[0]=='"'||name[0]=='\'')){
             name=name.substr(1,name.size()-2);
         }
         std::string guard_key = "__imported_"+name;
+        {
+            // a module runs once: a later import (named or aliased) binds the
+            // namespace its first import made
+            auto mc=module_ns_.find(name);
+            if(!alias.empty()&&mc!=module_ns_.end()){ globals_[alias]=mc->second; return; }
+            if(implicit&&globals_.count(guard_key)) return;
+        }
         // An aliased import must still run so its namespace can be built, even
         // if the module was already loaded — otherwise the name diff sees
         // nothing and the alias is empty. Matches the interpreter.
@@ -6351,17 +6764,7 @@ private:
             // the namespace came out empty. Reading declarations directly is
             // independent of what is already defined.
             std::set<std::string> own_names;
-            if(!alias.empty() && ast){
-                for(auto& st : ast->statements()){
-                    if(!st) continue;
-                    if(st->type()==nython::node::NodeType::FUNCTION)
-                        own_names.insert(std::static_pointer_cast<nython::node::FunctionNode>(st)->name);
-                    else if(st->type()==nython::node::NodeType::CLASS)
-                        own_names.insert(std::static_pointer_cast<nython::node::ClassNode>(st)->name);
-                    else if(st->type()==nython::node::NodeType::VARIABLE_DECL)
-                        own_names.insert(std::static_pointer_cast<nython::node::VarDeclNode>(st)->name);
-                }
-            }
+            if(!alias.empty() && ast) nython::scope::module_names(ast, own_names);   // NyScope.cpp
             // __name__ / __file__ are the module's own while its top level
             // runs, so `if __name__ == "__main__":` does not fire on import.
             VMVal prev_name=globals_.count("__name__")?globals_["__name__"]:VMVal::make_str("__main__");
@@ -6397,6 +6800,7 @@ private:
                 nsv.map=ns;
                 nsv.class_name=alias;
                 globals_[alias]=nsv;
+                module_ns_[name]=nsv;
             }
             // Register classes from the imported module
             for(auto& sub:code->sub_codes) {
@@ -7086,6 +7490,11 @@ private:
             for(auto&[k,val]:*v.map) if(!vm_internal_key(k)) items.push_back(vm_key_value(k));
             return VMVal::make_iter(std::move(items));
         }
+        if(v.type==VMType::BYTES){
+            std::vector<VMVal> items;
+            for(unsigned char c:v.bdata()) items.push_back(VMVal::make_int(c));
+            return VMVal::make_iter(std::move(items));
+        }
         return VMVal::make_iter({});
     }
 
@@ -7149,6 +7558,14 @@ private:
                 VMVal mp=a.empty()?VMVal::make_none():a[0];
                 std::vector<VMVal> none;
                 return VMVal::make_str(vm->str_format(obj.s,none,mp.type==VMType::MAP?&mp:nullptr));
+            }
+            if(m=="encode"){
+                // str -> bytes (NyBytes.hpp: str_encode)
+                const VMVal* ev=kw_or_pos(kw.type==VMType::MAP?&kw:nullptr,"encoding",a,0);
+                const VMVal* rv=kw_or_pos(kw.type==VMType::MAP?&kw:nullptr,"errors",a,1);
+                std::string enc=(ev&&ev->type!=VMType::NONE)?vm->vm_str(*ev):std::string("utf-8");
+                std::string err=(rv&&rv->type!=VMType::NONE)?vm->vm_str(*rv):std::string("strict");
+                return VMVal::make_bytes(vm->nycall([&]{ return nypy::str_encode(obj.s,enc,err); }));
             }
             std::vector<nypy::SArg> sa; sa.reserve(a.size());
             for(auto& v:a) sa.push_back(vm->to_sarg(v));
@@ -7409,6 +7826,7 @@ private:
             const VMVal& v=a[0];
             switch(v.type){
                 case VMType::STRING: return VMVal::make_int((int64_t)nypy::str_width(v.s));
+                case VMType::BYTES: return VMVal::make_int((int64_t)v.bdata().size());
                 case VMType::LIST: return VMVal::make_int(v.list?(int64_t)v.list->size():0);
                 case VMType::MAP: { int64_t n=0; if(v.map) for(auto& kv:*v.map) if(!vm_internal_key(kv.first)) n++; return VMVal::make_int(n); }
                 case VMType::INSTANCE: { VMVal r=vm->call_dunder(v,"__len__",{}); if(r.type!=VMType::NONE) return r; break; }
@@ -7418,8 +7836,17 @@ private:
             }
             vm->raise_native_exception("TypeError","object of type '"+vm_type_name(v)+"' has no len()");
         });
-        def("str",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+        def("str",[vm](std::vector<VMVal>& a,const VMVal& kw)->VMVal{
             if(a.empty()) return VMVal::make_str("");
+            // str(b, encoding, errors) decodes; str(b) alone is its repr
+            if(a[0].type==VMType::BYTES){
+                const VMVal* ev=a.size()>=2?&a[1]:kwarg(kw,"encoding");
+                const VMVal* rv=a.size()>=3?&a[2]:kwarg(kw,"errors");
+                if(ev||rv){
+                    std::string enc=ev?vm->vm_str(*ev):std::string("utf-8"), err=rv?vm->vm_str(*rv):std::string("strict");
+                    return VMVal::make_str(vm->nycall([&]{ return nypy::bytes_decode(a[0].bdata(),enc,err); }));
+                }
+            }
             if(a[0].type==VMType::STRING) return a[0];
             return VMVal::make_str(vm->vm_str(a[0]));
         });
@@ -7472,10 +7899,11 @@ private:
                     if(t>=-9.2e18&&t<=9.2e18) return VMVal::make_int((int64_t)t);
                     return VMVal::make_bigint(nypy::BigInt::from_double(t));
                 }
-                case VMType::STRING: {
+                case VMType::STRING: case VMType::BYTES: {
                     nypy::BigInt out;
-                    if(!nypy::parse_int_default(v.s,out))
-                        vm->raise_native_exception("ValueError","invalid literal for int() with base 10: "+nypy::str_repr(v.s));
+                    const std::string& txt=v.type==VMType::BYTES?v.bdata():v.s;
+                    if(!nypy::parse_int_default(txt,out))
+                        vm->raise_native_exception("ValueError","invalid literal for int() with base 10: "+(v.type==VMType::BYTES?v.to_string():nypy::str_repr(v.s)));
                     return VMVal::make_bigint(out);
                 }
                 case VMType::INSTANCE: { VMVal r=vm->call_dunder(v,"__int__",{}); if(r.type!=VMType::NONE) return r; break; }
@@ -7563,6 +7991,11 @@ private:
             return VMVal::make_str(vm->nycall([&]{ return nypy::str_chr(n.k==1?n.i:-1); }));
         });
         def("ord",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
+            if(!a.empty()&&a[0].type==VMType::BYTES){
+                const std::string& d=a[0].bdata();
+                if(d.size()!=1) vm->raise_native_exception("TypeError","ord() expected a character, but string of length "+std::to_string(d.size())+" found");
+                return VMVal::make_int((unsigned char)d[0]);
+            }
             if(a.empty()||a[0].type!=VMType::STRING) vm->raise_native_exception("TypeError","ord() expected string of length 1, but "+(a.empty()?std::string("nothing"):vm_type_name(a[0]))+" found");
             return VMVal::make_int(vm->nycall([&]{ return nypy::str_ord(a[0].s); }));
         });
@@ -7742,8 +8175,12 @@ private:
             case VMType::INSTANCE:return VMVal::make_str(a[0].class_name);
             case VMType::GENERATOR:case VMType::ITERATOR:return VMVal::make_str("generator");
             case VMType::UNDEFINED:return VMVal::make_str("undefined");
+            case VMType::BYTES:return VMVal::make_str(a[0].b?"bytearray":"bytes");
             default:return VMVal::make_str("unknown");}});
         globals_["typeof"]=globals_["type"];
+        // bytes(x) / bytearray(x) (round 77)
+        globals_["bytes"]=VMVal::make_native([vm](std::vector<VMVal>& a)->VMVal{ return vm->construct_bytes(a,false); });
+        globals_["bytearray"]=VMVal::make_native([vm](std::vector<VMVal>& a)->VMVal{ return vm->construct_bytes(a,true); });
     }
     // Truthiness with __bool__ / __len__ on instances.
     bool truthy(const VMVal& v) {
@@ -8052,6 +8489,8 @@ private:
                 if(cls_name=="list"||cls_name=="array") return VMVal::make_bool(obj.type==VMType::LIST&&!obj.b);
                 if(cls_name=="tuple") return VMVal::make_bool(obj.type==VMType::LIST&&obj.b);
                 if(cls_name=="map"||cls_name=="dict") return VMVal::make_bool(obj.type==VMType::MAP);
+                if(cls_name=="bytes") return VMVal::make_bool(obj.type==VMType::BYTES&&!obj.b);
+                if(cls_name=="bytearray") return VMVal::make_bool(obj.type==VMType::BYTES&&obj.b);
                 if(cls_name=="none") return VMVal::make_bool(obj.type==VMType::NONE);
                 // Every lazy iterator (it read false for all of them).
                 if(cls_name=="generator") return VMVal::make_bool(obj.type==VMType::GENERATOR||obj.type==VMType::ITERATOR);

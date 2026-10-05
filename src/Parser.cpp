@@ -1437,6 +1437,12 @@ node_ptr Parser::atom(){
         parse_fstring:
             return fstringNode(str_tok, str_tok.value);
     }
+    if(have(TokenType::Bytes)) {
+        // adjacent bytes literals join, as in Python: b"a" b"b" == b"ab"
+        Token bt = prev();
+        while(have(TokenType::Bytes)) bt.value += prev().value;
+        return make_node<BytesNode>(bt);
+    }
     if(have(TokenType::Complex)) return make_node<ComplexNode>(prev());
     if(have(TokenType::True)) return make_node<BoolNode>(prev(), true);
     if(have(TokenType::False)) return make_node<BoolNode>(prev(), false);

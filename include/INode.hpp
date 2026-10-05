@@ -123,7 +123,8 @@ enum class NodeType:uint8_t {
     DYN_BINOP,
     COMPREHENSION,
     OPT_CHAIN,     // a?.b / a?[k] / a?.m(x) / f?.(x) and the chain after it
-    CHAIN_HOLE     // the value an OPT_CHAIN computed, where the chain resumes
+    CHAIN_HOLE,    // the value an OPT_CHAIN computed, where the chain resumes
+    BYTES          // b"..." (round 77)
 };
 
 struct INode{

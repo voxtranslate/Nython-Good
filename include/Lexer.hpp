@@ -109,6 +109,7 @@ public:
     void consume_regex(char first);
     void consume_string(char first);
     void consume_raw_string(char quote);
+    void consume_bytes(char quote, bool raw);
     void consume_comment();
     void consume_multiline_comment();
     void consume_ident();

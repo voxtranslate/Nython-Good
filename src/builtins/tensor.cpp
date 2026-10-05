@@ -403,6 +403,11 @@ Value dispatch_tensor(NythonExecutor& E,
                     auto* cont = args[0].isCollectable() ? dynamic_cast<Container*>(args[0].value.gc) : nullptr;
                     return Value(cont && cont->container && cont->container->count("__tuple__") > 0);
                 }
+                if (type_name == "bytes" || type_name == "bytearray") {
+                    auto* bo = E.bytesOf(args[0]);
+                    return Value(bo && bo->mut == (type_name == "bytearray"));
+                }
+                if (E.isBytesValue(args[0]) && (type_name == "str" || type_name == "string")) return Value(false);
                 if (type_name == "float" || type_name == "double") return Value(args[0].type == ValueType::DOUBLE);
                 if (type_name == "bool" || type_name == "boolean") return Value(args[0].type == ValueType::BOOLEAN);
                 if (type_name == "str" || type_name == "string") {

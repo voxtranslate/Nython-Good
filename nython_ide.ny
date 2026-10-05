@@ -2601,7 +2601,7 @@ class NythonIDE(IDETools):
         if d.kind != "welcome":
             var mark = ""
             if d.dirty():
-                mark = "\xe2\x97\x8f "
+                mark = "\u25cf "
             t = mark + d.title + " - " + t
         if t != self.win.title:
             self.win.set_title(t)

@@ -1446,7 +1446,7 @@ class IDEOps(IDECore):
                 var dash = string_find(ln, "exception")
                 if dash >= 0:
                     msg = string_strip(string_slice(ln, dash + 9, len(ln)))
-                    while len(msg) > 0 and (string_startswith(msg, "\xe2") or string_startswith(msg, "\x80") or string_startswith(msg, "\x94") or string_startswith(msg, "-") or string_startswith(msg, " ")):
+                    while len(msg) > 0 and (string_startswith(msg, "\u2014") or string_startswith(msg, "-") or string_startswith(msg, " ")):
                         msg = string_slice(msg, 1, len(msg))
                 if string_startswith(msg, "VM Error: __exc__:"):
                     msg = string_slice(msg, 18, len(msg))

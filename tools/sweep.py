@@ -50,9 +50,14 @@ def run_one(binary, path, vm, timeout):
 
 
 def sweep(binary, timeout, jobs):
-    tasks = [(f, vm) for f in files() for vm in (False, True)]
+    # A file's two engines run one after the other: many suites write fixed
+    # paths under /tmp, and running both engines of one file at once made
+    # them read each other's files (a different suite failed each sweep).
+    # Files still run in parallel.
+    def both(f):
+        return [((f, vm), run_one(binary, f, vm, timeout)) for vm in (False, True)]
     with ThreadPoolExecutor(max_workers=jobs) as ex:
-        res = list(ex.map(lambda t: (t, run_one(binary, t[0], t[1], timeout)), tasks))
+        res = [r for pair in ex.map(both, files()) for r in pair]
     return {(os.path.relpath(f, REPO), "vm" if vm else "interp"): r for (f, vm), r in res}
 
 

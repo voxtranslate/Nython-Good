@@ -884,13 +884,16 @@ inline std::string key_of_tuple(const std::vector<std::string>& parts) {
     return r;
 }
 inline std::string key_of_obj(const std::string& id) { return "\x01o" + id; }
+// bytes b"abc" -> "\x01b" + the bytes (round 77): never equal to the str
+// with the same characters, as in Python.
+inline std::string key_of_bytes(const std::string& b) { return std::string("\x01" "b") + b; }
 // Decoding: the kind of a stored key and its payload.
-enum KeyKind { K_STR, K_INT, K_FLOAT, K_NONE, K_TUPLE, K_OBJ };
+enum KeyKind { K_STR, K_INT, K_FLOAT, K_NONE, K_TUPLE, K_OBJ, K_BYTES };
 inline KeyKind key_kind(const std::string& k) {
     if (k.size() < 2 || k[0] != '\x01') return K_STR;
     switch (k[1]) {
         case 'i': return K_INT; case 'f': return K_FLOAT; case 'n': return K_NONE;
-        case 't': return K_TUPLE; case 'o': return K_OBJ; default: return K_STR;
+        case 't': return K_TUPLE; case 'o': return K_OBJ; case 'b': return K_BYTES; default: return K_STR;
     }
 }
 inline std::string key_payload(const std::string& k) { return key_kind(k) == K_STR && key_is_plain(k) ? k : k.substr(2); }

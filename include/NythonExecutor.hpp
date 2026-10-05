@@ -46,6 +46,8 @@
 #include <functional>
 #include "NyBigInt.hpp"
 #include "NyStr.hpp"
+#include "NyBytes.hpp"
+#include "NyScope.hpp"
 #include "NyFormat.hpp"
 #include "NyMembers.hpp"
 
@@ -315,6 +317,20 @@ struct NythonExecutor {
         return nyheap::userValue(so, (void*)&so->s);
     }
 
+    // bytes / bytearray values (round 77): nyheap::Bytes, keyed by &s.
+    std::unordered_map<void*, nyheap::Bytes*> bytes_ptrs_;
+    Value makeBytesValue(std::string s, bool mut = false) {
+        auto* bo = new nyheap::Bytes(this, std::move(s), mut);
+        bytes_ptrs_.emplace((void*)&bo->s, bo);
+        return nyheap::userValue(bo, (void*)&bo->s);
+    }
+    nyheap::Bytes* bytesOf(const Value& v) const {
+        if (v.type != ValueType::USERDATA || !v.value.p) return nullptr;
+        auto it = bytes_ptrs_.find(v.value.p);
+        return it == bytes_ptrs_.end() ? nullptr : it->second;
+    }
+    bool isBytesValue(const Value& v) const { return bytesOf(v) != nullptr; }
+
     Value makeStringValue(const std::string& s) {
         if (s.size() <= 1) {
             int k = s.empty() ? 256 : (unsigned char)s[0];
@@ -342,6 +358,7 @@ struct NythonExecutor {
         if (v.type == ValueType::USERDATA && v.value.p && string_ptrs_.count(v.value.p))
             return true;
         return v.type == ValueType::USERDATA && v.value.p 
+            && !bytes_ptrs_.count(v.value.p)
             && !func_names.count(v.value.p) 
             && !instance_to_class.count(v.value.p)
             && !instance_properties.count(v.value.p);
@@ -476,6 +493,7 @@ public:   // NythonExecutor is a struct: members default to public
         std::vector<std::string> builtins = {
             "__format_value__","ascii",
             "print","println","range","len","type","str","int","float","bool",
+            "bytes","bytearray",
             "input","abs","min","max","round","sorted","reversed",
             "list","tuple","dict","set","map","filter","reduce","zip",
             "enumerate","sum","any","all","hasattr","getattr","setattr","delattr",
@@ -623,7 +641,8 @@ public:   // NythonExecutor is a struct: members default to public
             "ProcessLookupError","InterruptedError","BlockingIOError","ConnectionError",
             "BrokenPipeError","ConnectionRefusedError","ConnectionResetError",
             "LookupError","ArithmeticError","EOFError","ImportError","ModuleNotFoundError",
-            "UnicodeError"
+            "UnicodeError","UnicodeDecodeError","UnicodeEncodeError","UnicodeTranslateError",
+            "ConnectionAbortedError","gaierror","herror"
         };
         for (auto& name : exc_types) registerBuiltin(name);
         // OS constants (os.sep, os.pathsep, os.linesep, os.name)
@@ -790,6 +809,7 @@ public:   // NythonExecutor is a struct: members default to public
             case NodeType::INTEGER: return evalInteger(node);
             case NodeType::FLOAT: return evalFloat(node);
             case NodeType::STRING: return evalString(node, ctx);
+            case NodeType::BYTES: return makeBytesValue(node->token().value);
             case NodeType::TRUE: return Value(true);
             case NodeType::FALSE: return Value(false);
             case NodeType::NONE: return NONE_VALUE;
@@ -1410,6 +1430,11 @@ public:   // NythonExecutor is a struct: members default to public
                 pyRaise("TypeError", std::string("'") + opSymbol(opc) + "' not supported between instances of '"
                         + typeNameOf(lv) + "' and '" + typeNameOf(rv) + "'");
         }
+        {
+            nyheap::Bytes* lb = bytesOf(lv); nyheap::Bytes* rb = bytesOf(rv);
+            Value res;
+            if ((lb || rb) && bytesBinary(opc, lv, rv, lb, rb, res, ctx)) return res;
+        }
         Num x, y;
         bool nums = asNum(lv, x) && asNum(rv, y);
         switch (opc) {
@@ -1493,6 +1518,282 @@ public:   // NythonExecutor is a struct: members default to public
         }
     }
 
+    // Builtins whose keyword arguments arrive as one trailing map (marked
+    // "__kwargs__"), beyond the fixed list in evalCall: the round 77 natives
+    // (network, signals, codecs) by prefix.
+    static bool isKwmapBuiltin(const std::string& n) {
+        static const char* pre[] = {"_net_", "_sig_", "_ws_", "_tls_", "_http_", "_struct_", "_codec_", "_cli_"};
+        for (const char* p : pre) if (n.rfind(p, 0) == 0) return true;
+        size_t dot = n.find('.');
+        return dot != std::string::npos && nypy::type_kind(n.substr(0, dot)) != nypy::MemberKind::Other;
+    }
+    // Keyword arguments for a builtin that takes them as a trailing map.
+    void appendKwMap(std::vector<Value>& args, const std::unordered_map<std::string, Value>& kw) {
+        auto* m = new Object((Runnable*)runner, "map", Type::MAP);
+        for (auto& kv : kw) m->set(kv.first, kv.second);
+        (*m->container)["__kwargs__"] = Value(1);
+        args.push_back(Value((Collectable*)m));
+    }
+    // Keyword arguments a builtin received as a trailing "__kwargs__" map
+    // (isKwmapBuiltin): taken off `args`.
+    std::unordered_map<std::string, Value> takeKwMap(std::vector<Value>& args) {
+        std::unordered_map<std::string, Value> kw;
+        if (args.empty()) return kw;
+        Container* c = contOf(args.back());
+        if (!c || !c->container->count("__kwargs__")) return kw;
+        for (auto& kv : *c->container) if (!isInternalKey(kv.first)) kw[nypy::key_payload(kv.first)] = kv.second;
+        args.pop_back();
+        return kw;
+    }
+    // `T.m(...)` for a builtin type T (round 77): its class methods
+    // (int.from_bytes, bytes.fromhex, dict.fromkeys ...) and its methods
+    // called through the type (str.upper(s) is s.upper()).
+    bool typeMemberCall(const std::string& name, std::vector<Value>& args_in, Context* ctx, Value& out) {
+        size_t dot = name.find('.');
+        if (dot == std::string::npos) return false;
+        const std::string t = name.substr(0, dot), m = name.substr(dot + 1);
+        if (!nypy::type_has_member(t, m)) return false;
+        std::vector<Value> args = args_in;
+        auto kw = takeKwMap(args);
+        auto kwv = [&](const char* k, size_t pos) -> const Value* {
+            auto it = kw.find(k);
+            if (it != kw.end()) return &it->second;
+            return pos < args.size() ? &args[pos] : nullptr;
+        };
+        if (nypy::type_classmethod(t, m)) {
+            if (m == "from_bytes") {
+                const Value* b = kwv("bytes", 0);
+                if (!b) pyRaise("TypeError", "from_bytes() missing required argument 'bytes' (pos 1)");
+                nypy::BArg ba = toBArg(*b, ctx);
+                std::string data = ba.k == nypy::BArg::BYTES ? ba.s : nyCall([&] {
+                    std::vector<nypy::BArg> one = {ba};
+                    return nypy::bytes_construct(one, "utf-8", "strict", false, "bytes"); });
+                const Value* bo = kwv("byteorder", 1);
+                std::string order = bo ? strOf(*bo, ctx) : std::string("big");
+                if (order != "big" && order != "little") pyRaise("ValueError", "byteorder must be either 'little' or 'big'");
+                auto sg = kw.find("signed");
+                bool sgn = sg != kw.end() && isTruthy(sg->second);
+                out = intValue(nyCall([&] { return nypy::int_from_bytes(data, order == "little", sgn); }));
+                return true;
+            }
+            if (m == "fromhex") {
+                if (args.size() != 1 || !isStringValue(args[0])) pyRaise("TypeError", "fromhex() argument must be str");
+                std::string h = *(std::string*)args[0].value.p;
+                if (t == "float") {
+                    double d = std::strtod(h.c_str(), nullptr);
+                    out = Value(d);
+                    return true;
+                }
+                out = makeBytesValue(nyCall([&] { return nypy::bytes_fromhex(h); }), t == "bytearray");
+                return true;
+            }
+            if (m == "maketrans") {
+                if (args.size() != 2) pyRaise("TypeError", "maketrans expected 2 arguments, got " + std::to_string(args.size()));
+                nypy::BArg a = toBArg(args[0], ctx), b = toBArg(args[1], ctx);
+                if (a.k != nypy::BArg::BYTES || b.k != nypy::BArg::BYTES) pyRaise("TypeError", "a bytes-like object is required");
+                if (a.s.size() != b.s.size()) pyRaise("ValueError", "maketrans arguments must have same length");
+                std::string table(256, '\0');
+                for (int k = 0; k < 256; k++) table[(size_t)k] = (char)k;
+                for (size_t k = 0; k < a.s.size(); k++) table[(unsigned char)a.s[k]] = b.s[k];
+                out = makeBytesValue(table);
+                return true;
+            }
+            if (m == "fromkeys") {
+                if (args.empty()) pyRaise("TypeError", "fromkeys expected at least 1 argument, got 0");
+                Value v = args.size() >= 2 ? args[1] : NONE_VALUE;
+                auto* obj = new Object((Runnable*)runner, "map", Type::MAP);
+                Value d((Collectable*)obj);
+                for (auto& k : iterItems(args[0], ctx)) dictSet(obj, k, v);
+                out = d;
+                return true;
+            }
+            return false;
+        }
+        // An instance method through its type: the receiver must be of it.
+        if (args.empty()) pyRaise("TypeError", "unbound method " + t + "." + m + "() needs an argument");
+        std::string have = typeNameOf(args[0]);
+        bool ok = have == t || (t == "int" && have == "bool");
+        if (!ok) pyRaise("TypeError", "descriptor '" + m + "' for '" + t + "' objects doesn't apply to a '" + have + "' object");
+        Value self = args[0];
+        std::vector<Value> rest(args.begin() + 1, args.end());
+        out = callMethod(self, m, rest, ctx, kw.empty() ? nullptr : &kw);
+        return true;
+    }
+    // int / float methods (round 77; NyBytes.hpp).
+    bool numberMethod(const Value& obj, const std::string& m, std::vector<Value>& args,
+                      const std::unordered_map<std::string, Value>& kw, Context* ctx, Value& out) {
+        bool isint = obj.type == ValueType::INTEGER || obj.type == ValueType::BOOLEAN;
+        if (isint && !nypy::int_methods().count(m)) return false;
+        if (!isint && (obj.type != ValueType::DOUBLE || !nypy::float_methods().count(m))) return false;
+        if (isint) {
+            nypy::BigInt v = obj.type == ValueType::BOOLEAN ? nypy::BigInt(obj.value.b ? 1 : 0) : bigint_to_nbig(obj.value.i);
+            if (m == "bit_length") { out = intValue(nypy::big_bit_length(v)); return true; }
+            if (m == "bit_count") { out = intValue(nypy::big_bit_count(v)); return true; }
+            if (m == "conjugate") { out = intValue(v); return true; }
+            if (m == "is_integer") { out = Value(true); return true; }
+            if (m == "as_integer_ratio") { out = makeListValue({intValue(v), intValue((int64_t)1)}, true); return true; }
+            if (m == "to_bytes") {
+                auto get = [&](const char* k, size_t pos) -> const Value* {
+                    auto it = kw.find(k);
+                    if (it != kw.end()) return &it->second;
+                    return pos < args.size() ? &args[pos] : nullptr;
+                };
+                const Value* lv = get("length", 0);
+                int64_t len = 1;
+                if (lv) { Num n; if (!asNum(*lv, n) || n.k != 1) pyRaise("TypeError", "length must be an int"); len = n.i; }
+                const Value* bo = get("byteorder", 1);
+                std::string order = bo ? strOf(*bo, ctx) : std::string("big");
+                if (order != "big" && order != "little") pyRaise("ValueError", "byteorder must be either 'little' or 'big'");
+                auto sg = kw.find("signed");
+                bool sgn = sg != kw.end() && isTruthy(sg->second);
+                out = makeBytesValue(nyCall([&] { return nypy::int_to_bytes(v, len, order == "little", sgn); }));
+                return true;
+            }
+            return false;
+        }
+        double d = (double)obj.value.d;
+        if (m == "is_integer") { out = Value(std::isfinite(d) && d == std::floor(d)); return true; }
+        if (m == "hex") { out = makeStringValue(nypy::float_hex(d)); return true; }
+        if (m == "conjugate") { out = obj; return true; }
+        if (m == "as_integer_ratio") {
+            nypy::BigInt n, dd;
+            nyCall([&] { nypy::float_ratio(d, n, dd); return 0; });
+            out = makeListValue({intValue(n), intValue(dd)}, true);
+            return true;
+        }
+        return false;
+    }
+    // bytes / bytearray operands (round 77). False hands the operation back
+    // to the general code (identity, `b in a_list`, and/or, ...).
+    bool bytesBinary(int opc, const Value& lv, const Value& rv, nyheap::Bytes* lb, nyheap::Bytes* rb, Value& out, Context* ctx) {
+        switch (opc) {
+        case OP_ADD:
+            if (lb && rb) { out = makeBytesValue(lb->s + rb->s, lb->mut); return true; }
+            if (lb) pyRaise("TypeError", "can't concat " + typeNameOf(rv) + " to " + typeNameOf(lv));
+            pyRaise("TypeError", isStringValue(lv) ? "can only concatenate str (not \"" + typeNameOf(rv) + "\") to str"
+                                                   : "unsupported operand type(s) for +: '" + typeNameOf(lv) + "' and '" + typeNameOf(rv) + "'");
+        case OP_MUL: {
+            nyheap::Bytes* b = lb ? lb : rb;
+            const Value& other = lb ? rv : lv;
+            Num cnt;
+            if ((lb && rb) || !asNum(other, cnt) || cnt.k == 3)
+                pyRaise("TypeError", "can't multiply sequence by non-int of type '" + typeNameOf(other) + "'");
+            int64_t n = cnt.k == 1 ? cnt.i : (numIsNeg(cnt) ? 0 : INT64_MAX);
+            if (n > 0 && b->s.size() * (uint64_t)n > (1ull << 32)) pyRaise("MemoryError", "repeated bytes are too long");
+            out = makeBytesValue(nypy::repeat_str(b->s, n), b->mut);
+            return true;
+        }
+        case OP_EQ: case OP_NE: {
+            bool eq = lb && rb && lb->s == rb->s;
+            out = Value(opc == OP_EQ ? eq : !eq);
+            return true;
+        }
+        case OP_SEQ: case OP_SNE: {
+            bool eq = lb && rb && lb->mut == rb->mut && lb->s == rb->s;
+            out = Value(opc == OP_SEQ ? eq : !eq);
+            return true;
+        }
+        case OP_LT: case OP_LE: case OP_GT: case OP_GE: {
+            if (!(lb && rb))
+                pyRaise("TypeError", std::string("'") + opSymbol(opc) + "' not supported between instances of '"
+                        + typeNameOf(lv) + "' and '" + typeNameOf(rv) + "'");
+            int c = nypy::bytes_compare(lb->s, rb->s);
+            out = Value(opc == OP_LT ? c < 0 : opc == OP_LE ? c <= 0 : opc == OP_GT ? c > 0 : c >= 0);
+            return true;
+        }
+        case OP_IN: case OP_NOTIN: {
+            if (!rb) return false;           // a bytes value looked up in a list, dict...
+            bool in = nyCall([&] { return nypy::bytes_contains(rb->s, toBArg(lv, ctx)); });
+            out = Value(opc == OP_IN ? in : !in);
+            return true;
+        }
+        case OP_MOD:
+            if (lb) pyRaise("TypeError", "%-formatting of bytes is not supported; use b''.join or .format on str and encode()");
+            return false;
+        case OP_SUB: case OP_DIV: case OP_FLOORDIV: case OP_POW: case OP_BAND: case OP_BOR: case OP_BXOR:
+        case OP_LSHIFT: case OP_RSHIFT:
+            unsupportedOperands(opc, lv, rv);
+        default:
+            return false;
+        }
+    }
+    // A value as an argument of a bytes method (NyBytes.hpp: BArg).
+    nypy::BArg toBArg(const Value& v, Context* ctx, int depth = 0) {
+        nypy::BArg a;
+        a.tname = typeNameOf(v);
+        switch (v.type) {
+            case ValueType::NONE: case ValueType::UNDEFINED: a.k = nypy::BArg::NONE; return a;
+            case ValueType::BOOLEAN: a.k = nypy::BArg::BOOL; a.i = v.value.b ? 1 : 0; return a;
+            case ValueType::INTEGER: {
+                a.k = nypy::BArg::INT;
+                int64_t i;
+                if (!bigint_fits_i64(v.value.i, i)) i = bigint_to_nbig(v.value.i).neg ? INT64_MIN : INT64_MAX;
+                a.i = i;
+                return a;
+            }
+            default: break;
+        }
+        if (auto* bo = bytesOf(v)) { a.k = nypy::BArg::BYTES; a.s = bo->s; return a; }
+        if (isStringValue(v)) { a.k = nypy::BArg::STR; a.s = *(std::string*)v.value.p; return a; }
+        if (depth == 0 && (contOf(v) || isInstanceVal(v) || nygen::is_gen(v))) {
+            a.k = nypy::BArg::SEQ;
+            for (auto& it : iterItems(v, ctx)) a.items.push_back(toBArg(it, ctx, 1));
+            return a;
+        }
+        a.k = nypy::BArg::OTHER;
+        return a;
+    }
+    Value fromBRes(const nypy::BRes& r) {
+        switch (r.k) {
+            case nypy::BRes::INT: return intValue(r.i);
+            case nypy::BRes::BOOL: return Value(r.b);
+            case nypy::BRes::STR: return makeStringValue(r.s);
+            case nypy::BRes::BYTES: return makeBytesValue(r.s, r.ba);
+            case nypy::BRes::LIST: case nypy::BRes::TUPLE: {
+                std::vector<Value> items;
+                items.reserve(r.v.size());
+                for (auto& x : r.v) items.push_back(makeBytesValue(x, r.ba));
+                return makeListValue(items, r.k == nypy::BRes::TUPLE);
+            }
+            default: return NONE_VALUE;
+        }
+    }
+    // bytes(x) / bytearray(x), with encoding= and errors=.
+    Value constructBytes(std::vector<Value>& args, bool mut, Context* ctx) {
+        std::string enc = "utf-8", err = "strict";
+        bool has_enc = false;
+        std::vector<Value> pos;
+        for (auto& a : args) {
+            if (Container* c = contOf(a)) {
+                if (c->container->count("__kwargs__")) {
+                    for (auto& kv : *c->container) {
+                        if (kv.first == "__kwargs__" || isInternalKey(kv.first)) continue;
+                        if (kv.first == "encoding") { enc = strOf(kv.second, ctx); has_enc = true; }
+                        else if (kv.first == "errors") err = strOf(kv.second, ctx);
+                        else pyRaise("TypeError", std::string(mut ? "bytearray" : "bytes") + "() got an unexpected keyword argument '" + kv.first + "'");
+                    }
+                    continue;
+                }
+            }
+            pos.push_back(a);
+        }
+        if (pos.size() > 3) pyRaise("TypeError", std::string(mut ? "bytearray" : "bytes") + "() takes at most 3 arguments (" + std::to_string(pos.size()) + " given)");
+        if (pos.size() >= 2) { enc = strOf(pos[1], ctx); has_enc = true; }
+        if (pos.size() >= 3) err = strOf(pos[2], ctx);
+        // An object with __bytes__ converts itself.
+        if (!pos.empty() && isInstanceVal(pos[0]) && instanceHasMethod(pos[0], "__bytes__")) {
+            std::vector<Value> none;
+            Value r = callMethod(pos[0], "__bytes__", none, ctx);
+            auto* bo = bytesOf(r);
+            if (!bo) pyRaise("TypeError", "__bytes__ returned non-bytes (type " + typeNameOf(r) + ")");
+            return makeBytesValue(bo->s, mut);
+        }
+        std::vector<nypy::BArg> ba;
+        if (!pos.empty()) ba.push_back(toBArg(pos[0], ctx));
+        std::string data = nyCall([&] { return nypy::bytes_construct(ba, enc, err, has_enc, mut ? "bytearray" : "bytes"); });
+        return makeBytesValue(std::move(data), mut);
+    }
+
     // ─── AUGMENTED ASSIGNMENT ───────────────────────────────────────────
     // `t op= v` evaluates the target's object and index once, computes with
     // the same operators as the binary form, and stores back. Lists are
@@ -1529,6 +1830,20 @@ public:   // NythonExecutor is a struct: members default to public
             Num y;
             if (!asNum(new_val, y) || y.k == 3) pyRaise("TypeError", "bad operand type for unary ~");
             result = y.k == 1 ? intValue(~y.i) : intValue(-(numBig(y) + nypy::BigInt(1)));
+        } else if (bytesOf(old_val) && bytesOf(old_val)->mut && (opc == OP_ADD || opc == OP_MUL)) {
+            // bytearray += b / *= n change it in place (every alias sees it)
+            auto* bo = bytesOf(old_val);
+            if (opc == OP_ADD) {
+                nypy::BArg ra = toBArg(new_val, ctx);
+                if (ra.k != nypy::BArg::BYTES) pyRaise("TypeError", "can't concat " + typeNameOf(new_val) + " to bytearray");
+                bo->s += ra.s;
+            } else {
+                Num cnt;
+                if (!asNum(new_val, cnt) || cnt.k == 3) pyRaise("TypeError", "can't multiply sequence by non-int of type '" + typeNameOf(new_val) + "'");
+                int64_t times = cnt.k == 1 ? cnt.i : (numIsNeg(cnt) ? 0 : 1);
+                bo->s = nypy::repeat_str(bo->s, times);
+            }
+            result = old_val;
         } else if (oc && seqLen(oc) >= 0 && !isTupleCont(oc) && !isSetCont(oc) && (opc == OP_ADD || opc == OP_MUL)) {
             if (opc == OP_ADD) {
                 std::vector<Value> more = iterItems(new_val, ctx);
@@ -1677,6 +1992,10 @@ public:   // NythonExecutor is a struct: members default to public
         }
         Num x, y;
         if (asNum(a, x) && asNum(b, y)) return numCmp(x, y) == 0;
+        {
+            auto* ab = bytesOf(a); auto* bb = bytesOf(b);
+            if (ab || bb) return ab && bb && ab->s == bb->s;   // bytes == bytearray by content
+        }
         bool as = isStringValue(a), bs = isStringValue(b);
         if (as || bs) {
             if (!(as && bs)) return false;
@@ -1755,6 +2074,10 @@ public:   // NythonExecutor is a struct: members default to public
             case ValueType::DOUBLE: return nypy::key_of_float((double)k.value.d);
             default: break;
         }
+        if (auto* bo = bytesOf(k)) {
+            if (bo->mut) pyRaise("TypeError", "unhashable type: 'bytearray'");
+            return nypy::key_of_bytes(bo->s);
+        }
         if (isStringValue(k)) return nypy::key_of_str(*(std::string*)k.value.p);
         if (Container* c = contOf(k)) {
             if (seqLen(c) >= 0 && isTupleCont(c)) {
@@ -1818,6 +2141,7 @@ public:   // NythonExecutor is a struct: members default to public
                 auto it = key_objs_.find(k.substr(2));
                 return it != key_objs_.end() ? it->second : NONE_VALUE;
             }
+            case nypy::K_BYTES: return makeBytesValue(k.substr(2));
         }
         return NONE_VALUE;
     }
@@ -2084,6 +2408,31 @@ public:   // NythonExecutor is a struct: members default to public
     }
     // L[a:b] = it and L[a:b:c] = it (extended slices must match in length).
     void assignSlice(const Value& obj, const std::vector<Value>& sargs, const Value& val, Context* ctx) {
+        if (auto* bo = bytesOf(obj)) {
+            if (!bo->mut) pyRaise("TypeError", "'bytes' object does not support item assignment");
+            // the replacement: a bytes-like, or an iterable of ints
+            nypy::BArg ra = toBArg(val, ctx);
+            if (ra.k == nypy::BArg::INT || ra.k == nypy::BArg::BOOL || ra.k == nypy::BArg::STR)
+                pyRaise("TypeError", "can assign only bytes, buffers, or iterables of ints in range(0, 256)");
+            std::string repl = ra.k == nypy::BArg::BYTES ? ra.s : nyCall([&] {
+                std::vector<nypy::BArg> one = {ra};
+                return nypy::bytes_construct(one, "utf-8", "strict", false, "bytearray"); });
+            std::string& d = bo->s;
+            int64_t len = (int64_t)d.size(), st = 0, en = 0, step = 1;
+            bool hs = sliceArg(sargs, 0, st), he = sliceArg(sargs, 1, en);
+            if (sargs.size() >= 3 && sargs[2].type != ValueType::NONE) sliceArg(sargs, 2, step);
+            int64_t cnt = nyCall([&] { return nypy::slice_adjust(len, hs, st, he, en, step); });
+            if (step == 1) {
+                if (cnt < 0) cnt = 0;
+                if (st > len) st = len;
+                d.replace((size_t)st, (size_t)cnt, repl);
+            } else {
+                if ((int64_t)repl.size() != cnt)
+                    pyRaise("ValueError", "attempt to assign bytes of size " + std::to_string(repl.size()) + " to extended slice of size " + std::to_string(cnt));
+                for (int64_t k = 0, i = st; k < cnt; k++, i += step) d[(size_t)i] = repl[(size_t)k];
+            }
+            return;
+        }
         Container* cont = contOf(obj);
         if (!cont || seqLen(cont) < 0) pyRaise("TypeError", "'" + typeNameOf(obj) + "' object does not support item assignment");
         if (isTupleCont(cont)) pyRaise("TypeError", "'tuple' object does not support item assignment");
@@ -2115,6 +2464,15 @@ public:   // NythonExecutor is a struct: members default to public
     // obj[idx]
     Value getItem(const Value& obj, const Value& idx, Context* ctx) {
         if (nygen::is_gen(obj)) pyRaise("TypeError", "'generator' object is not subscriptable");
+        if (auto* bo = bytesOf(obj)) {
+            Num k;
+            if (!asNum(idx, k) || k.k == 3) pyRaise("TypeError", "byte indices must be integers or slices, not " + typeNameOf(idx));
+            int64_t n = (int64_t)bo->s.size();
+            int64_t i = k.k == 1 ? k.i : (numIsNeg(k) ? INT64_MIN / 2 : INT64_MAX / 2);
+            if (i < 0) i += n;
+            if (i < 0 || i >= n) pyRaise("IndexError", bo->mut ? "bytearray index out of range" : "index out of range");
+            return intValue((int64_t)(unsigned char)bo->s[(size_t)i]);
+        }
         // String indexing, in characters: s[0], s[-1]
         if (obj.type == ValueType::USERDATA && obj.value.p && !func_names.count(obj.value.p)) {
             const std::string& s = *(std::string*)obj.value.p;
@@ -2179,6 +2537,13 @@ public:   // NythonExecutor is a struct: members default to public
                 int64_t j = k.i < 0 ? k.i + n : k.i;
                 if (j < 0 || j >= n) return false;
             }
+        } else if (auto* bo = bytesOf(obj)) {
+            Num k;
+            if (asNum(idx, k) && k.k == 1) {
+                int64_t n = (int64_t)bo->s.size();
+                int64_t j = k.i < 0 ? k.i + n : k.i;
+                if (j < 0 || j >= n) return false;
+            }
         } else if (isStringValue(obj)) {
             Num k;
             if (asNum(idx, k) && k.k == 1) {
@@ -2206,6 +2571,18 @@ public:   // NythonExecutor is a struct: members default to public
             std::vector<Value> call_args = {idx, val};
             Value result = callMethod(obj, "__setitem__", call_args, ctx);
             if (result.type != ValueType::NONE) return;
+        }
+        if (auto* bo = bytesOf(obj)) {
+            if (!bo->mut) pyRaise("TypeError", "'bytes' object does not support item assignment");
+            Num k;
+            if (!asNum(idx, k) || k.k == 3) pyRaise("TypeError", "bytearray indices must be integers or slices, not " + typeNameOf(idx));
+            int64_t n = (int64_t)bo->s.size();
+            int64_t i = k.k == 1 ? k.i : (numIsNeg(k) ? INT64_MIN / 2 : INT64_MAX / 2);
+            if (i < 0) i += n;
+            if (i < 0 || i >= n) pyRaise("IndexError", "bytearray index out of range");
+            nypy::BArg b = toBArg(val, ctx);
+            bo->s[(size_t)i] = (char)nyCall([&] { return nypy::byte_of(b); });
+            return;
         }
         Container* cont = contOf(obj);
         if (!cont) {
@@ -2254,6 +2631,12 @@ public:   // NythonExecutor is a struct: members default to public
             if (seqLen(c) >= 0) return seqItems(c);
             return dictKeys(c);
         }
+        if (auto* bo = bytesOf(v)) {
+            std::vector<Value> out;
+            out.reserve(bo->s.size());
+            for (unsigned char c : bo->s) out.push_back(intValue((int64_t)c));
+            return out;
+        }
         if (isStringValue(v)) {
             std::vector<Value> out;
             for (auto& ch : nypy::u8_chars(*(std::string*)v.value.p)) out.push_back(makeStringValue(ch));
@@ -2273,6 +2656,7 @@ public:   // NythonExecutor is a struct: members default to public
             case ValueType::UNDEFINED: return "undefined";
             default: break;
         }
+        if (auto* bo = bytesOf(v)) return bo->mut ? "bytearray" : "bytes";
         if (isStringValue(v)) return "str";
         if (nygen::is_gen(v)) return "generator";
         if (Container* c = contOf(v)) {
@@ -2309,6 +2693,8 @@ public:   // NythonExecutor is a struct: members default to public
         if (depth > 50) return "...";
         if (v.type == ValueType::USERDATA) {
             if (!v.value.p) return "none";
+            // str(b) is its repr, as in Python
+            if (auto* bo = bytesOf(v)) return nypy::bytes_repr(bo->s, bo->mut);
             if (string_ptrs_.count(v.value.p)) {
                 const std::string& s = *(std::string*)v.value.p;
                 return repr ? nypy::str_repr(s) : s;
@@ -2882,6 +3268,19 @@ public:   // NythonExecutor is a struct: members default to public
             return result;
         }
 
+        // bytes / bytearray: the ints of its bytes (a bytearray changed by
+        // the loop is read as it is at each step, as in Python)
+        if (auto* bo = bytesOf(iter_val)) {
+            Value hold = iter_val;
+            for (size_t k = 0; k < bo->s.size(); k++) {
+                bindv(var_name, intValue((int64_t)(unsigned char)bo->s[k]));
+                try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
+                catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
+                NY_LOOP_FLOW(broke)
+            }
+            if (!broke && fn->else_branch) result = evalNode(fn->else_branch, ctx);
+            return result;
+        }
         // String iteration — iterate characters
         if (iter_val.type == ValueType::USERDATA && iter_val.value.p) {
             // Check if it's a string (not in func_names)
@@ -3213,7 +3612,8 @@ public:   // NythonExecutor is a struct: members default to public
     bool primitiveMember(const Value& obj, const std::string& m, std::vector<Value>& args, Context* ctx, Value& out) {
         if (m.empty()) return false;
         bool plain = obj.type == ValueType::INTEGER || obj.type == ValueType::DOUBLE
-                  || obj.type == ValueType::BOOLEAN || obj.type == ValueType::NONE || isStringValue(obj);
+                  || obj.type == ValueType::BOOLEAN || obj.type == ValueType::NONE || isStringValue(obj)
+                  || isBytesValue(obj);
         if (!plain) { Container* c = contOf(obj); plain = c && seqLen(c) >= 0; }
         if (!plain) return false;
         if (!std::isalnum((unsigned char)m[0]) && m[0] != '_') {
@@ -3239,6 +3639,54 @@ public:   // NythonExecutor is a struct: members default to public
         return false;
     }
 
+    // A method of a bytes / bytearray value (NyBytes.hpp: bytes_method).
+    // Keyword arguments are placed where the method takes them.
+    Value bytesMethodCall(const Value& obj, nyheap::Bytes* bo, const std::string& m, std::vector<Value>& args_in,
+                          const std::unordered_map<std::string, Value>& kw, Context* ctx) {
+        std::vector<Value> args = args_in;
+        if (!kw.empty()) {
+            static const std::unordered_map<std::string, std::vector<const char*>> slots = {
+                {"decode", {"encoding", "errors"}}, {"hex", {"sep", "bytes_per_sep"}},
+                {"split", {"sep", "maxsplit"}}, {"rsplit", {"sep", "maxsplit"}},
+                {"splitlines", {"keepends"}}, {"translate", {"table", "delete"}},
+                {"count", {"sub", "start", "end"}}, {"replace", {"old", "new", "count"}}};
+            auto it = slots.find(m);
+            for (auto& kv : kw) {
+                size_t pos = SIZE_MAX;
+                if (it != slots.end())
+                    for (size_t k = 0; k < it->second.size(); k++) if (kv.first == it->second[k]) pos = k;
+                if (pos == SIZE_MAX) pyRaise("TypeError", m + "() got an unexpected keyword argument '" + kv.first + "'");
+                if (args.size() <= pos) args.resize(pos + 1, NONE_VALUE);
+                args[pos] = kv.second;
+            }
+        }
+        if (m == "slice") {
+            // b[a:b:c]: bytes of the same type, by byte
+            const std::string& s = bo->s;
+            int64_t len = (int64_t)s.size(), st = 0, en = 0, step = 1;
+            bool hs = sliceArg(args, 0, st), he = sliceArg(args, 1, en);
+            if (args.size() >= 3 && args[2].type != ValueType::NONE) sliceArg(args, 2, step);
+            int64_t cnt = nyCall([&] { return nypy::slice_adjust(len, hs, st, he, en, step); });
+            std::string out;
+            if (step == 1) { if (cnt > 0) out = s.substr((size_t)st, (size_t)cnt); }
+            else for (int64_t k = 0, i = st; k < cnt; k++, i += step) out += s[(size_t)i];
+            return makeBytesValue(std::move(out), bo->mut);
+        }
+        if (m == "fromhex") {
+            if (args.size() != 1 || !isStringValue(args[0])) pyRaise("TypeError", "fromhex() argument must be str, not " + (args.empty() ? std::string("nothing") : typeNameOf(args[0])));
+            std::string h = *(std::string*)args[0].value.p;
+            return makeBytesValue(nyCall([&] { return nypy::bytes_fromhex(h); }), bo->mut);
+        }
+        std::vector<nypy::BArg> ba;
+        ba.reserve(args.size());
+        for (auto& a : args) ba.push_back(toBArg(a, ctx));
+        nypy::BRes r;
+        if (nyCall([&] { return nypy::bytes_method(bo->s, bo->mut, m, ba, r); })) return fromBRes(r);
+        Value pm;
+        if (primitiveMember(obj, m, args, ctx, pm)) return pm;
+        pyRaise("AttributeError", "'" + typeNameOf(obj) + "' object has no attribute '" + m + "'");
+    }
+
     Value callMethod(Value obj, const std::string& method_name, std::vector<Value>& args, Context* ctx,
                      const std::unordered_map<std::string, Value>* kw_in = nullptr) {
         static const std::unordered_map<std::string, Value> kEmptyKw;
@@ -3251,10 +3699,15 @@ public:   // NythonExecutor is a struct: members default to public
             if (primitiveMember(obj, method_name, args, ctx, r)) return r;
             pyRaise("AttributeError", "'generator' object has no attribute '" + method_name + "'");
         }
+        if (obj.type == ValueType::INTEGER || obj.type == ValueType::BOOLEAN || obj.type == ValueType::DOUBLE) {
+            Value nm;
+            if (numberMethod(obj, method_name, args, kw_args_in, ctx, nm)) return nm;
+        }
         {
             Value pm;
             if (primitiveMember(obj, method_name, args, ctx, pm)) return pm;
         }
+        if (auto* bo = bytesOf(obj)) return bytesMethodCall(obj, bo, method_name, args, kw_args_in, ctx);
         // Built-in string methods
         if (obj.type == ValueType::USERDATA && obj.value.p) {
             std::string s = getStringValue(obj);
@@ -3263,6 +3716,15 @@ public:   // NythonExecutor is a struct: members default to public
                 // Every str method has one implementation shared with the VM
                 // (NyStr.hpp: nypy::str_method); only format needs values.
                 if (method_name == "format") return makeStringValue(strFormat(s, args, kw_args_in, ctx));
+                if (method_name == "encode") {
+                    // str -> bytes (NyBytes.hpp: str_encode)
+                    std::string enc = "utf-8", err = "strict";
+                    if (args.size() >= 1 && args[0].type != ValueType::NONE) enc = strOf(args[0], ctx);
+                    if (args.size() >= 2 && args[1].type != ValueType::NONE) err = strOf(args[1], ctx);
+                    auto ki = kw_args_in.find("encoding"); if (ki != kw_args_in.end()) enc = strOf(ki->second, ctx);
+                    ki = kw_args_in.find("errors"); if (ki != kw_args_in.end()) err = strOf(ki->second, ctx);
+                    return makeBytesValue(nyCall([&] { return nypy::str_encode(s, enc, err); }));
+                }
                 if (method_name == "format_map" && !args.empty()) {
                     std::unordered_map<std::string, Value> kw;
                     if (Container* mc = contOf(args[0])) for (auto& kv : *mc->container) if (!isInternalKey(kv.first)) kw[nypy::key_payload(kv.first)] = kv.second;
@@ -4906,8 +5368,11 @@ public:
                         if (attr_val.type == ValueType::USERDATA && attr_val.value.p) {
                             auto fn_it = func_names.find(attr_val.value.p);
                             if (fn_it != func_names.end()) {
-                                if (fn_it->second.find("__builtin__:") == 0)
-                                    return callBuiltin(fn_it->second.substr(12), args, ctx);
+                                if (fn_it->second.find("__builtin__:") == 0) {
+                                    std::string bn = fn_it->second.substr(12);
+                                    if (!kw_args.empty() && isKwmapBuiltin(bn)) appendKwMap(args, kw_args);
+                                    return callBuiltin(bn, args, ctx);
+                                }
                                 if (fn_it->second.find("__func__:") == 0 || fn_it->second.find("__lambda__") == 0) {
                                     void* ast_ptr = attr_val.value.p;
                                     auto ai = func_ast_nodes.find(attr_val.value.p);
@@ -4959,8 +5424,11 @@ public:
                                 pit2->second->access_container_shared([&](ContainerType* c) { own = c && c->count(method_name); });
                             stray = !own;
                         }
-                        if (!stray && fn_it->second.find("__builtin__:") == 0)
-                            return callBuiltin(fn_it->second.substr(12), args, ctx);
+                        if (!stray && fn_it->second.find("__builtin__:") == 0) {
+                            std::string bn = fn_it->second.substr(12);
+                            if (!kw_args.empty() && isKwmapBuiltin(bn)) appendKwMap(args, kw_args);
+                            return callBuiltin(bn, args, ctx);
+                        }
                         // Class value accessed via attribute (e.g. Outer.Inner()) -> instantiate
                         if (fn_it->second.find("__class__:") == 0) {
                             // Re-invoke evalCall with this as the callee directly
@@ -5040,7 +5508,8 @@ public:
             // made min(a, b, key=f) look like min(a, b, f).
             static const std::unordered_set<std::string> kw_native = {
                 "sorted", "min", "max", "sum", "enumerate", "round", "int", "dict", "pow",
-                "format", "range", "zip", "map", "filter", "list", "tuple", "set", "str", "repr"
+                "format", "range", "zip", "map", "filter", "list", "tuple", "set", "str", "repr",
+                "bytes", "bytearray"
             };
             if (kw_native.count(builtin)) {
                 cur_kw_order_.clear();
@@ -5073,9 +5542,12 @@ public:
                 "time_format", "time_date", "time_strftime", "time_iso",
                 "file_open", "file_open_or_raise", "os_proc_read", "os_poll"
             };
-            if (!kw_args.empty() && kwmap_builtins.count(builtin)) {
+            if (!kw_args.empty() && (kwmap_builtins.count(builtin) || isKwmapBuiltin(builtin))) {
                 auto* kw = new Object((Runnable*)runner, "map", Type::MAP);
                 for (auto& kv : kw_args) kw->set(kv.first, kv.second);
+                // marks the map as keyword arguments (internal key: dict
+                // reads and nyos::Args skip it)
+                (*kw->container)["__kwargs__"] = Value(1);
                 args.push_back(Value((Collectable*)kw));
             }
             if (gen_s0 != nygen::serial_now()) return callBuiltinTemps(builtin, args, ctx, cn, gen_s0);
@@ -5310,6 +5782,7 @@ public:
             Value r;
             if (iterableBuiltin(name_orig, args, ctx, r)) return r;
             if (gcBuiltin(name_orig, args, r)) return r;
+            if (name_orig.find('.') != std::string::npos && typeMemberCall(name_orig, args, ctx, r)) return r;
         }
         if (name_orig.rfind("__prop_setter__:", 0) == 0) {
             // The getter, held since `prop.setter` was read: the def that
@@ -5365,7 +5838,8 @@ public:
             "ProcessLookupError","InterruptedError","BlockingIOError","ConnectionError",
             "BrokenPipeError","ConnectionRefusedError","ConnectionResetError",
             "LookupError","ArithmeticError","EOFError","ImportError","ModuleNotFoundError",
-            "UnicodeError"
+            "UnicodeError","UnicodeDecodeError","UnicodeEncodeError","UnicodeTranslateError",
+            "ConnectionAbortedError","gaierror","herror"
         };
         if (exc_types_.count(name_orig)) {
             // Create exception Value tagged as "__exc__:TypeName:message"
@@ -5599,7 +6073,15 @@ public:
         if (obj.type == ValueType::USERDATA && obj.value.p) {
             auto bit = func_names.find(obj.value.p);
             if (bit != func_names.end() && bit->second.rfind("__builtin__:", 0) == 0) {
-                std::string target = nyrt::builtin_member(bit->second.substr(12), attr,
+                const std::string base = bit->second.substr(12);
+                // str.upper, bytes.fromhex, int.from_bytes ... (round 77)
+                if (nypy::type_has_member(base, attr)) {
+                    std::string full = base + "." + attr;
+                    if (!builtin_ptrs.count(full)) registerBuiltin(full);
+                    out = builtinValue(full);
+                    return true;
+                }
+                std::string target = nyrt::builtin_member(base, attr,
                     [&](const std::string& n) { return builtin_ptrs.count(n) > 0; });
                 if (!target.empty()) { out = builtinValue(target); return true; }
                 return false;
@@ -5708,6 +6190,7 @@ public:
             case ValueType::UNDEFINED: return nypy::MemberKind::Other;
             default: break;
         }
+        if (auto* bo = bytesOf(v)) return bo->mut ? nypy::MemberKind::ByteArray : nypy::MemberKind::Bytes;
         if (isStringValue(v)) return nypy::MemberKind::Str;
         if (nygen::is_gen(v)) return nypy::MemberKind::Generator;
         if (Container* c = contOf(v)) {
@@ -5924,7 +6407,7 @@ public:
         }
         // Lists, tuples, sets, generators, dicts (their typed keys) and
         // strings (by character): the shared iteration (iterItems).
-        if ((v.isCollectable() && v.value.gc) || isStringValue(v)) return iterItems(v, ctx);
+        if ((v.isCollectable() && v.value.gc) || isStringValue(v) || isBytesValue(v)) return iterItems(v, ctx);
         if (isInstanceValue(v)) {
             std::vector<Value> no_args;
             Value iterator = v;
@@ -6490,6 +6973,8 @@ public:
     // Top-level declarations of a module: functions, classes and vars. Used to
     // build an `import ... as` namespace without depending on scope state.
     void collectTopLevelNames(const node_ptr& root, std::set<std::string>& out) {
+        nython::scope::module_names(root, out);   // NyScope.cpp, shared with the VM
+        return;
         if (!root) return;
         for (auto& st : root->statements()) {
             if (!st) continue;
@@ -6519,7 +7004,7 @@ public:
             "int","Integer","integer","float","Float","double","Double",
             "str","String","string","bool","Boolean","boolean",
             "list","List","array","Array","map","Map","dict","Dict",
-            "tuple","Tuple","set","Set",
+            "tuple","Tuple","set","Set","bytes","bytearray",
             "none","None","function","Function","Object","object","any","Any"
         };
         if (type_names.count(n)) return n;
@@ -6662,12 +7147,34 @@ public:
         return UNDEFINED_VALUE;   // not part of the protocol (Value() is none)
     }
 
+    // Modules imported by name, their namespaces (evalImport).
+    std::unordered_map<std::string, Value> module_ns_;
+    static bool isIdentifierText(const std::string& n) {
+        if (n.empty() || !(std::isalpha((unsigned char)n[0]) || n[0] == '_')) return false;
+        for (char c : n) if (!(std::isalnum((unsigned char)c) || c == '_')) return false;
+        return true;
+    }
     Value evalImport(node_ptr node, Context* ctx) {
         auto in_node = static_pointer_cast<ImportNode>(node);
         std::string module_name = in_node->module_name;
         // Strip quotes if present
+        bool quoted = false;
         if (module_name.size() >= 2 && (module_name[0] == '"' || module_name[0] == '\'')) {
             module_name = module_name.substr(1, module_name.size() - 2);
+            quoted = true;
+        }
+        // `import name` (an identifier, not a quoted path) binds `name` to the
+        // module's namespace, as in Python (round 77); its names are also
+        // defined in the importing scope, as every import here always did.
+        // A module runs once: a later import binds the cached namespace.
+        std::string implicit_alias;
+        if (!quoted && in_node->alias.empty() && isIdentifierText(module_name)) implicit_alias = module_name;
+        {
+            // a module runs once: a later import (named or aliased) binds the
+            // namespace its first import made
+            const std::string& want = !in_node->alias.empty() ? in_node->alias : implicit_alias;
+            auto mc = module_ns_.find(module_name);
+            if (!want.empty() && mc != module_ns_.end()) { ctx->defineByName(want, mc->second); return NONE_VALUE; }
         }
 
         // Circular import guard.
@@ -7351,7 +7858,8 @@ public:
                 // execution, so a module needs no cooperation to be aliasable.
                 // Context inherits Container, whose access_container() gives the
                 // iteration this needs.
-                const bool aliased = !in_node->alias.empty() && ctx;
+                const std::string bind_as = !in_node->alias.empty() ? in_node->alias : implicit_alias;
+                const bool aliased = !bind_as.empty() && ctx;
 
                 // Collect the module's OWN top-level names from its AST rather
                 // than by diffing scope before and after.
@@ -7387,12 +7895,14 @@ public:
                 evalNode(ast, ctx);
 
                 if (aliased) {
-                    auto* ns = new Object((Runnable*)runner, in_node->alias, Type::MAP);
+                    auto* ns = new Object((Runnable*)runner, bind_as, Type::MAP);
                     for (const auto& n : own) {
                         Value v = ctx->getByName(n);
                         if (v.type != ValueType::UNDEFINED) ns->set(n, v);
                     }
-                    ctx->defineByName(in_node->alias, Value((Collectable*)ns));
+                    Value nsv((Collectable*)ns);
+                    module_ns_[module_name] = nsv;
+                    ctx->defineByName(bind_as, nsv);
                 }
             }
         } catch (nython::node::ReturnSignal&) {
@@ -7455,6 +7965,16 @@ public:
                 callMethod(obj, "__delitem__", a, ctx);
                 return NONE_VALUE;
             }
+            if (auto* bo = bytesOf(obj)) {
+                if (!bo->mut) pyRaise("TypeError", "'bytes' object doesn't support item deletion");
+                Num k;
+                if (!asNum(idx, k) || k.k == 3) pyRaise("TypeError", "bytearray indices must be integers or slices, not " + typeNameOf(idx));
+                int64_t n = (int64_t)bo->s.size(), i = k.k == 1 ? k.i : INT64_MAX;
+                if (i < 0) i += n;
+                if (i < 0 || i >= n) pyRaise("IndexError", "bytearray index out of range");
+                bo->s.erase((size_t)i, 1);
+                return NONE_VALUE;
+            }
             if (Container* cont = contOf(obj)) {
                 int64_t n = seqLen(cont);
                 if (n < 0) {
@@ -7481,6 +8001,21 @@ public:
                 Value obj = evalNode(static_pointer_cast<AttributeNode>(cn->callee)->object, ctx);
                 std::vector<Value> sargs;
                 for (auto& a : cn->args) sargs.push_back(evalNode(a, ctx));
+                if (auto* bo = bytesOf(obj)) {
+                    if (!bo->mut) pyRaise("TypeError", "'bytes' object doesn't support item deletion");
+                    int64_t len = (int64_t)bo->s.size(), st = 0, en = 0, step = 1;
+                    bool hs = sliceArg(sargs, 0, st), he = sliceArg(sargs, 1, en);
+                    if (sargs.size() >= 3 && sargs[2].type != ValueType::NONE) sliceArg(sargs, 2, step);
+                    int64_t cnt = nyCall([&] { return nypy::slice_adjust(len, hs, st, he, en, step); });
+                    if (cnt > 0) {
+                        std::vector<bool> gone((size_t)len, false);
+                        for (int64_t k = 0, i = st; k < cnt; k++, i += step) gone[(size_t)i] = true;
+                        std::string kept;
+                        for (int64_t k = 0; k < len; k++) if (!gone[(size_t)k]) kept += bo->s[(size_t)k];
+                        bo->s = std::move(kept);
+                    }
+                    return NONE_VALUE;
+                }
                 Container* cont = contOf(obj);
                 if (!cont || seqLen(cont) < 0) pyRaise("TypeError", "'" + typeNameOf(obj) + "' object does not support item deletion");
                 if (isTupleCont(cont)) pyRaise("TypeError", "'tuple' object doesn't support item deletion");

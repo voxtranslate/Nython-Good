@@ -42,6 +42,19 @@ inline Str::~Str() {
     if (E && executor_alive(E)) E->string_ptrs_.erase((void*)&s);
 }
 
+// ── Bytes ────────────────────────────────────────────────────────────────
+inline Bytes::Bytes(NythonExecutor* e, std::string x, bool m) : Collectable(nython::kernel::Type::STRING), s(std::move(x)), mut(m), E(e) {
+    gc_counted = 0;
+    nython::gc::collectables_created()--;
+    nygc::g_live_strings++;
+    nygc::g_string_bytes += (long long)s.size();
+}
+inline Bytes::~Bytes() {
+    nygc::g_live_strings--;
+    nygc::g_string_bytes -= (long long)s.size();
+    if (E && executor_alive(E)) E->bytes_ptrs_.erase((void*)&s);
+}
+
 // ── Func ─────────────────────────────────────────────────────────────────
 inline Func::Func(NythonExecutor* e, int64_t i) : Collectable(nython::kernel::Type::FUNCTION), id(i), E(e) {}
 inline Func::~Func() {
