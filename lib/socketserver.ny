@@ -190,7 +190,11 @@ class ThreadingMixIn:
         var t = threading.Thread(target=self.process_request_thread, args=(request, client_address), daemon=self.daemon_threads)
         if not hasattr(self, "_threads"):
             self._threads = []
-        self._threads.append(t)
+        # server_close() waits for the non-daemon ones (as Python's: a daemon
+        # thread may be blocked on a kept-alive connection)
+        if not self.daemon_threads and self.block_on_close:
+            self._threads = [x for x in self._threads if x.is_alive()]
+            self._threads.append(t)
         t.start()
 
     def server_close(self):

@@ -306,17 +306,9 @@ Value dispatch_string(NythonExecutor& E,
             return NONE_VALUE;
         }
     // ── from main.cpp lines 6951–7038 ──────────────────────────────────────────
-        if (name == "http_get") {
-            std::string url = getStringValue(args.empty() ? Value() : args[0]);
-            return makeStringValue(ny_http::get(url));
-        }
-        // ── http_post(url, body, content_type) ───────────────────────────────────
-        if (name == "http_post") {
-            std::string url  = args.size() > 0 ? getStringValue(args[0]) : "";
-            std::string body = args.size() > 1 ? getStringValue(args[1]) : "";
-            std::string ct   = args.size() > 2 ? getStringValue(args[2]) : "application/json";
-            return makeStringValue(ny_http::post(url, body, ct));
-        }
+        // http_get / http_post: builtins/network.cpp (round 77; the copies
+        // here read with a blocking recv while holding the GIL, so a server
+        // thread of the same program could never answer).
         // ── file_read(path) ──────────────────────────────────────────────────────
         if (name == "load_text" || name == "read_text") {
             std::string path = args.empty() ? "" : getStringValue(args[0]);
@@ -463,26 +455,22 @@ Value dispatch_string(NythonExecutor& E,
             }
             return Value(false);
         }
-        // ── string_format(template, values_list) ─────────────────────────────────
+        // ── string_format(template, *values) / (template, [values]) ─────────────
+        // str.format's rules (fields, indexes, specs); a single list argument
+        // gives the values (the legacy form). It used to replace bare "{}"
+        // only, so "{:08d}" or "{0}" came back unformatted.
         if (name == "string_format") {
-            if (!args.empty()) {
-                std::string tmpl = getStringValue(args[0]);
-                if (args.size() > 1 && args[1].isCollectable()) {
-                    auto* lst = dynamic_cast<Container*>(args[1].value.gc);
-                    if (lst && lst->container) {
-                        auto li = lst->container->find("__len__");
-                        int len = (li != lst->container->end()) ? (int)bigint_to_i64(li->second.value.i) : 0;
-                        for (int i = 0; i < len; i++) {
-                            auto it = lst->container->find(std::to_string(i));
-                            std::string val = (it != lst->container->end()) ? getStringValue(it->second) : "";
-                            size_t pos = tmpl.find("{}");
-                            if (pos != std::string::npos) tmpl.replace(pos, 2, val);
-                        }
-                    }
-                }
-                return makeStringValue(tmpl);
+            if (args.empty()) return NONE_VALUE;
+            std::string tmpl = getStringValue(args[0]);
+            std::vector<Value> vals(args.begin() + 1, args.end());
+            if (vals.size() == 1 && vals[0].isCollectable()) {
+                auto* lst = dynamic_cast<Container*>(vals[0].value.gc);
+                if (lst && lst->container && lst->container->count("__len__") && !lst->container->count("__tuple__")
+                    && !lst->container->count("__set__"))
+                    vals = E.listItems(vals[0]);
             }
-            return NONE_VALUE;
+            std::unordered_map<std::string, Value> kw;
+            return makeStringValue(E.strFormat(tmpl, vals, kw, ctx));
         }
         // ── string_count(s, sub) ─────────────────────────────────────────────────
         if (name == "string_count") {

@@ -458,14 +458,22 @@ class GitHubLearner:
         return true
 
     def search_patterns(self, language, pattern):
-        var url = self.api_base + "/search/code?q=" + pattern + "+language:" + language + "&per_page=10"
-        var resp = http_get(url)
-        if resp == none:
+        # GitHub's code search (it needs a token): the matching items, [] on
+        # failure. The query is URL-encoded and the API's headers are sent.
+        var q = url_encode(pattern + " language:" + language)
+        var url = self.api_base + "/search/code?q=" + q + "&per_page=10"
+        var hdrs = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "Nython-NyxAI"}
+        if self.token != "":
+            hdrs["Authorization"] = "Bearer " + self.token
+        var r = http_request("GET", url, hdrs, "")
+        if r == none or r["status"] != 200:
             return []
-        var data = json_decode(resp)
-        if data == none:
+        var data = none
+        try:
+            data = json_decode(r["body"])
+        except Exception:
             return []
-        return data
+        return data.get("items", [])
 
 # ─── Document Learner ────────────────────────────────────────────────────────
 
@@ -651,6 +659,9 @@ class IdeIntegration:
         self.nyx = nyx
         self.socket_path = "/tmp/nyx_ide.sock"
         self.server_fd = -1
+        self.port = none
+        self._srv = none
+        self._serving = false
 
     def autocomplete(self, prefix, context):
         var results = self.nyx.kb.query(prefix)
@@ -681,29 +692,70 @@ class IdeIntegration:
         return suggestions
 
     def format_code(self, code):
-        var lines = string_split(code, "\n")
-        var formatted = []
-        var i = 0
-        while i < len(lines):
-            var line = lines[i]
-            var stripped = string_strip(line)
-            if len(stripped) == 0:
-                formatted.append("")
-            else:
-                formatted.append(line)
-            i = i + 1
-        return string_join(formatted, "\n")
+        # the IDE's formatter (native text services): indentation normalised,
+        # trailing spaces and runs of blank lines removed
+        return text_format_nython(code)
 
-    def start_server(self):
-        var fd = tcp_server_create("127.0.0.1", 9999)
-        if fd < 0:
+    def start_server(self, port=9999, host="127.0.0.1"):
+        # Serves handle_request() to editors: one JSON request per line, one
+        # JSON reply per line, a thread per client. self.port is the port.
+        import socket
+        import threading
+        try:
+            self._srv = socket.create_server((host, port))
+        except OSError:
             return false
-        self.server_fd = fd
+        self.port = self._srv.getsockname()[1]
+        self.server_fd = self._srv.fileno()
+        self._serving = true
+        var t = threading.Thread(target=self._accept_loop, daemon=true)
+        t.start()
         return true
 
+    def _accept_loop(self):
+        import threading
+        while self._serving:
+            if not self._srv.wait_readable(0.2):
+                continue
+            try:
+                var pair = self._srv.accept()
+                threading.Thread(target=self._serve_client, args=(pair[0],), daemon=true).start()
+            except OSError:
+                break
+
+    def _serve_client(self, conn):
+        var f = conn.makefile("rb")
+        try:
+            while true:
+                var line = f.readline()
+                if len(line) == 0:
+                    break
+                var text = line.decode("utf-8", "replace").strip()
+                if text == "":
+                    continue
+                var reply = none
+                try:
+                    reply = self.handle_request(text)
+                except Exception as e:
+                    reply = json_encode({"error": type(e).__name__ + ": " + str(e)})
+                conn.sendall((reply + "\n").encode("utf-8"))
+        except OSError:
+            pass
+        conn.close()
+
+    def stop_server(self):
+        self._serving = false
+        if self.server_fd != -1:
+            self._srv.close()
+            self.server_fd = -1
+
     def handle_request(self, raw):
-        var req = json_decode(raw)
-        if req == none:
+        var req = none
+        try:
+            req = json_decode(raw)
+        except Exception:
+            req = none
+        if not isinstance(req, "map") or not ("command" in req):
             return json_encode({"error": "invalid request"})
         var cmd = req["command"]
         var resp = {}

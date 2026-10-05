@@ -5874,8 +5874,12 @@ private:
             break;
         }
         case VMType::STRING:
-            // type(x).__name__: type() gives a name string on this engine.
-            if(attr=="__name__"){ out=obj; return true; }
+            // type(x).__name__: type() gives a name string on this engine
+            // (a module class "m.C" is named "C").
+            if(attr=="__name__"||attr=="__qualname__"){
+                size_t dot=obj.s.rfind('.');
+                out=dot==std::string::npos?obj:VMVal::make_str(obj.s.substr(dot+1)); return true;
+            }
             break;
         case VMType::FUNCTION: {
             if(!func_attrs_.empty()){
@@ -6503,8 +6507,9 @@ private:
                 // then self.cb(a, b). A bound method carries its own instance,
                 // so it must go through vm_call rather than being re-bound to
                 // the object that happens to hold it; natives take no self at
-                // all. Only a bare FUNCTION keeps the historical behaviour of
-                // being treated as a method of this object.
+                // all. A bare FUNCTION is not bound either (as in Python and
+                // the interpreter, round 77): a nested def that uses its
+                // enclosing method's self saw the holder as self instead.
                 if(held.type==VMType::MAP&&held.class_name=="__bound_method__")
                     return vm_call(held,args,std::nullopt,kwargs);
                 if(held.type==VMType::NATIVE)
@@ -6513,7 +6518,7 @@ private:
                     // A function stored in an attribute is called with its
                     // own closure and defaults (a closure stored as obj.cb
                     // and called obj.cb() used to lose its captured values).
-                    return call_function(held,args,obj,kwargs);
+                    return call_function(held,args,std::nullopt,kwargs);
                 if(held.type==VMType::CLASS||held.type==VMType::INSTANCE)
                     return vm_call(held,args,std::nullopt,kwargs);
             }
@@ -7186,7 +7191,7 @@ private:
         if(name=="os"){ define_os_module(alias.empty()?std::string("os"):alias); return; }
         if(name=="shell"||name=="sh"){ return; }
         if(name=="sys"){ define_sys_module(alias.empty()?std::string("sys"):alias); return; }
-        if(name=="math"){ register_math_builtins(); return; }
+        if(name=="math"){ register_math_builtins(); define_math_module(alias.empty()?std::string("math"):alias); return; }
         if(name=="time"){ return; }
         if(name=="json"){ register_json_builtins(); return; }
         if(name=="io"||name=="fs"||name=="file"){ return; }
@@ -7951,6 +7956,24 @@ private:
     // os_*, read_file, write_file, shell, ... that disagreed with the
     // interpreter's. Removed in round 74 - the bridge serves the
     // interpreter's implementations, see include/builtins/os.hpp.)
+
+    // `import math`: a namespace of builtins/pymath.cpp's math_* functions
+    // (through the bridge, so both engines run the same code) and the
+    // constants. `math` used to be undefined on this engine.
+    void define_math_module(const std::string& as_name) {
+        VMVal ns=VMVal::make_map();
+        std::vector<std::string> names;
+        if(bridge_names()) names=bridge_names()();
+        for(auto& n:names)
+            if(n.compare(0,5,"math_")==0){ VMVal fn=load_var(n); if(fn.type!=VMType::NONE) (*ns.map)[n.substr(5)]=fn; }
+        (*ns.map)["pi"]=VMVal::make_float(3.14159265358979323846);
+        (*ns.map)["e"]=VMVal::make_float(2.71828182845904523536);
+        (*ns.map)["tau"]=VMVal::make_float(6.28318530717958647692);
+        (*ns.map)["inf"]=VMVal::make_float(std::numeric_limits<double>::infinity());
+        (*ns.map)["nan"]=VMVal::make_float(std::numeric_limits<double>::quiet_NaN());
+        ns.class_name=as_name;
+        globals_[as_name]=ns;
+    }
 
     void register_math_builtins() {
         // Registered after the guarded copies above, so these shadowed them and
@@ -9496,15 +9519,15 @@ private:
             char buf[8]; snprintf(buf,sizeof(buf),"#%02x%02x%02x",r,g,b);
             return VMVal::make_str(buf);
         });
-        globals_["string_format"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
+        // string_format(template, *values) / (template, [values]): str.format
+        // (the interpreter's builtins/string.cpp is the same).
+        globals_["string_format"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.empty()) return VMVal::make_str("");
-            std::string s=a[0].s,r; size_t arg=1,pos=0,found;
-            while((found=s.find("{}",pos))!=std::string::npos){
-                r+=s.substr(pos,found-pos);
-                r+=(arg<a.size()?a[arg++].to_string():"");
-                pos=found+2;
-            }
-            return VMVal::make_str(r+s.substr(pos));
+            VMVal tmpl=a[0];
+            std::vector<VMVal> rest(a.begin()+1,a.end());
+            if(rest.size()==1&&rest[0].type==VMType::LIST&&rest[0].list&&!rest[0].is_tuple()&&!rest[0].is_set())
+                rest=*rest[0].list;
+            return vm_call_method(tmpl,"format",rest);
         });
         // count_words helper used by StringUtils
         globals_["count_words"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{

@@ -202,9 +202,15 @@ def on_order_placed(payload):
     events_received = events_received + [payload]
 whk.on("user.created", on_user_created)
 whk.on("order.placed", on_order_placed)
-whk.handle("user.created", {"user_id": 1, "name": "Alice"}, "sig")
-whk.handle("order.placed", {"order_id": 100}, "sig")
-whk.handle("unknown.event", {"data": "x"}, "sig")
+var p1 = {"user_id": 1, "name": "Alice"}
+var p2 = {"order_id": 100}
+var p3 = {"data": "x"}
+whk.handle("user.created", p1, whk.sign(p1))
+whk.handle("order.placed", p2, whk.sign(p2))
+whk.handle("unknown.event", p3, whk.sign(p3))
+assert_true("forged signature refused", not whk.handle("user.created", p1, "sig"))
+assert_true("other payload refused", not whk.handle("user.created", p2, whk.sign(p1)))
+whk.failed = 0
 assert_eq("received count", whk.received, 3)
 assert_eq("events count", len(events_received), 2)
 var wstats = whk.stats()

@@ -388,15 +388,52 @@ class HTTPResponse:
         return d2
 
     def readline(self, limit=-1):
-        var parts = []
-        while true:
-            var c = self.read(1)
-            if len(c) == 0:
-                break
-            parts.append(c)
-            if c == b"\n" or (limit >= 0 and len(parts) >= limit):
-                break
-        return b"".join(parts)
+        # One line of the body (through b"\n"), at most limit bytes; read
+        # from the buffer a line at a time, chunked bodies included.
+        if self._closed or self.headers == none or self._done:
+            return b""
+        if self.chunked:
+            var parts = []
+            var got = 0
+            while true:
+                if self.chunk_left == none or self.chunk_left == 0:
+                    if self.chunk_left == 0:
+                        self.fp.readline()          # CRLF after the chunk
+                    var n = self._read_chunk_size()
+                    if n == 0:
+                        parse_headers(self.fp)
+                        self.chunk_left = none
+                        self._finish()
+                        break
+                    self.chunk_left = n
+                var want = self.chunk_left
+                if limit >= 0:
+                    want = min(want, limit - got)
+                var piece = self.fp.readline(want)
+                if len(piece) == 0:
+                    raise IncompleteRead(b"".join(parts))
+                parts.append(piece)
+                got = got + len(piece)
+                self.chunk_left = self.chunk_left - len(piece)
+                if piece.endswith(b"\n") or (limit >= 0 and got >= limit):
+                    break
+            return b"".join(parts)
+        if self.length != none:
+            if self.length == 0:
+                self._finish()
+                return b""
+            var want2 = self.length
+            if limit >= 0:
+                want2 = min(limit, self.length)
+            var line = self.fp.readline(want2)
+            self.length = self.length - len(line)
+            if self.length == 0 or len(line) == 0:
+                self._finish()
+            return line
+        var line2 = self.fp.readline(limit)
+        if len(line2) == 0:
+            self._finish()
+        return line2
 
     def readlines(self):
         var out = []

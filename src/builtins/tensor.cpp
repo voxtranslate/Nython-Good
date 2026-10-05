@@ -452,10 +452,11 @@ Value dispatch_tensor(NythonExecutor& E,
                     return Value(sc && NythonExecutor::isFrozenCont(sc) == (type_name == "frozenset"));
                 }
                 if (type_name == "map" || type_name == "dict") {
-                    if (args[0].isCollectable() && args[0].value.gc) {
-                        return Value(args[0].value.gc->getType() == Type::MAP);
-                    }
-                    return Value(false);
+                    // what type() calls a dict: a container that is no
+                    // sequence (json_decode's maps carry the LIST tag, so
+                    // the tag alone said false for them)
+                    if (E.isInstanceValue(args[0])) return Value(false);
+                    return Value(E.typeNameOf(args[0]) == "dict");
                 }
                 if (type_name == "none") return Value(args[0].type == ValueType::NONE);
                 // Every lazy iterator: a generator, a generator expression,

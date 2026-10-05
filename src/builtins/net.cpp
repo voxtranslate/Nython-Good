@@ -946,6 +946,22 @@ Value dispatch_net(NythonExecutor& E, const std::string& name, std::vector<Value
         add_c("IPV6_V6ONLY", IPV6_V6ONLY);
 #endif
         add_c("IP_TTL", IP_TTL); add_c("IP_MULTICAST_TTL", IP_MULTICAST_TTL);
+        // Multicast (round 77): struct ip_mreq / ipv6_mreq go in as bytes
+        // (socket.inet_aton(group) + socket.inet_aton(interface)).
+        add_c("IP_MULTICAST_IF", IP_MULTICAST_IF); add_c("IP_MULTICAST_LOOP", IP_MULTICAST_LOOP);
+        add_c("IP_ADD_MEMBERSHIP", IP_ADD_MEMBERSHIP); add_c("IP_DROP_MEMBERSHIP", IP_DROP_MEMBERSHIP);
+#ifdef IPV6_JOIN_GROUP
+        add_c("IPV6_JOIN_GROUP", IPV6_JOIN_GROUP); add_c("IPV6_LEAVE_GROUP", IPV6_LEAVE_GROUP);
+#endif
+#ifdef IPV6_MULTICAST_HOPS
+        add_c("IPV6_MULTICAST_HOPS", IPV6_MULTICAST_HOPS); add_c("IPV6_MULTICAST_LOOP", IPV6_MULTICAST_LOOP);
+#endif
+#ifdef TCP_KEEPIDLE
+        add_c("TCP_KEEPIDLE", TCP_KEEPIDLE);
+#endif
+#ifdef TCP_KEEPINTVL
+        add_c("TCP_KEEPINTVL", TCP_KEEPINTVL); add_c("TCP_KEEPCNT", TCP_KEEPCNT);
+#endif
         add_c("SHUT_RD", SHUT_RD); add_c("SHUT_WR", SHUT_WR); add_c("SHUT_RDWR", SHUT_RDWR);
         add_c("MSG_PEEK", MSG_PEEK); add_c("MSG_OOB", MSG_OOB);
 #ifdef MSG_DONTWAIT

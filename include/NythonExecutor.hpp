@@ -230,6 +230,8 @@ Value dispatch_io       (NythonExecutor& E, const std::string& name, std::vector
 Value dispatch_network  (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_hash     (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 std::vector<std::string> hash_builtin_names();
+Value dispatch_pymath   (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
+std::vector<std::string> pymath_builtin_names();
 Value dispatch_math     (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_os       (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_data     (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
@@ -653,6 +655,7 @@ public:   // NythonExecutor is a struct: members default to public
         for (auto& name : net_builtin_names()) registerBuiltin(name);
         for (auto& name : tls_builtin_names()) registerBuiltin(name);
         for (auto& name : hash_builtin_names()) registerBuiltin(name);
+        for (auto& name : pymath_builtin_names()) registerBuiltin(name);
         // Exception types
         std::vector<std::string> exc_types = {
             "Exception","BaseException","Error",
@@ -1712,7 +1715,7 @@ public:   // NythonExecutor is a struct: members default to public
     // "__kwargs__"), beyond the fixed list in evalCall: the round 77 natives
     // (network, signals, codecs) by prefix.
     static bool isKwmapBuiltin(const std::string& n) {
-        static const char* pre[] = {"_net_", "_sig_", "_ws_", "_tls_", "_http_", "_struct_", "_codec_", "_cli_", "_hash_"};
+        static const char* pre[] = {"_net_", "_sig_", "_ws_", "_tls_", "_http_", "_struct_", "_codec_", "_cli_", "_hash_", "math_"};
         for (const char* p : pre) if (n.rfind(p, 0) == 0) return true;
         size_t dot = n.find('.');
         return dot != std::string::npos && nypy::type_kind(n.substr(0, dot)) != nypy::MemberKind::Other;
@@ -6119,6 +6122,9 @@ public:
             result = dispatch_hash(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         }
         if (name == "os_urandom") return dispatch_hash(*this, name, args, ctx);
+        if (name.compare(0, 5, "math_") == 0) {
+            result = dispatch_pymath(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
+        }
         result = dispatch_math(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         result = dispatch_os(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         result = dispatch_data(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
@@ -6609,7 +6615,14 @@ public:
                     out = makeStringValue(dot == std::string::npos ? nm : nm.substr(dot + 1));
                     return true;
                 }
-                if (attr == "__name__" && isStringValue(obj)) { out = obj; return true; }
+                // type(x).__name__ (type() gives the class's name): a module
+                // class "m.C" is named "C"
+                if ((attr == "__name__" || attr == "__qualname__") && isStringValue(obj)) {
+                    std::string t = getStringValue(obj);
+                    size_t dot = t.rfind('.');
+                    out = dot == std::string::npos ? obj : makeStringValue(t.substr(dot + 1));
+                    return true;
+                }
             }
             if (isInstanceValue(obj)) {
                 if (attr == "__class__") {
@@ -8163,17 +8176,17 @@ public:
                 (*cont->container)["tau"] = Value(6.28318530717958647692);
                 (*cont->container)["inf"] = Value(std::numeric_limits<double>::infinity());
                 (*cont->container)["nan"] = Value(std::numeric_limits<double>::quiet_NaN());
-                // Register math function builtins and store them as attributes
-                std::vector<std::string> math_fns = {"sqrt","sin","cos","tan","log","log2","log10",
-                    "floor","ceil","abs","pow","exp","asin","acos","atan","atan2","hypot",
-                    "degrees","radians","trunc","gcd","factorial","comb","perm"};
-                for (auto& fn : math_fns) {
-                    registerBuiltin(fn);
-                    // Get the registered builtin value from global_ctx
-                    Value bv = global_ctx->getByName(fn);
+                // The members are builtins/pymath.cpp's math_* functions,
+                // the same ones the VM's namespace holds (round 77).
+                for (auto& full : pymath_builtin_names()) {
+                    registerBuiltin(full);
+                    Value bv = global_ctx->getByName(full);
                     if (bv.type == ValueType::USERDATA && bv.value.p)
-                        (*cont->container)[fn] = bv;
+                        (*cont->container)[full.substr(5)] = bv;
                 }
+                // The bare names, as before (sqrt(x) without math.)
+                for (auto& fn : {"sqrt","sin","cos","tan","log","floor","ceil","abs","pow","exp","asin","acos","atan","atan2"})
+                    registerBuiltin(fn);
             }
             ctx->defineByName("math", math_obj);
             // Also define pi/e as globals for convenience
