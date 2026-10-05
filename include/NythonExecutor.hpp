@@ -234,6 +234,9 @@ Value dispatch_hash     (NythonExecutor& E, const std::string& name, std::vector
 std::vector<std::string> hash_builtin_names();
 Value dispatch_pymath   (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 std::vector<std::string> pymath_builtin_names();
+// Regular expressions (round 78): the native engine of lib/re.ny (src/builtins/nyre.cpp).
+Value dispatch_re       (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
+std::vector<std::string> re_builtin_names();
 Value dispatch_math     (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_os       (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_data     (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
@@ -665,6 +668,7 @@ public:   // NythonExecutor is a struct: members default to public
         for (auto& name : tls_builtin_names()) registerBuiltin(name);
         for (auto& name : hash_builtin_names()) registerBuiltin(name);
         for (auto& name : pymath_builtin_names()) registerBuiltin(name);
+        for (auto& name : re_builtin_names()) registerBuiltin(name);
         // Exception types
         std::vector<std::string> exc_types = {
             "Exception","BaseException","Error",
@@ -6249,6 +6253,7 @@ public:
             result = dispatch_net(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
             result = dispatch_tls(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
             result = dispatch_hash(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
+            if (name.compare(0, 4, "_re_") == 0) return dispatch_re(*this, name, args, ctx);
         }
         if (name == "os_urandom") return dispatch_hash(*this, name, args, ctx);
         if (name.compare(0, 5, "math_") == 0) {
