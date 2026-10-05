@@ -250,6 +250,104 @@ def _ny_print(*args, **kw):
         file.flush()
     return none
 
+class ellipsis:
+    # the type of `...` (round 77)
+    def __repr__(self):
+        return "Ellipsis"
+    def __reduce__(self):
+        return "Ellipsis"
+Ellipsis = ellipsis()
+
+def _ny_ann(thunk, text):
+    # An annotation's value for __annotations__ (round 77): evaluated when
+    # its statement runs, as Python does; one that cannot be evaluated yet - a
+    # forward reference, a name of a module not imported - is kept as its
+    # source text, as typing's ForwardRef would hold it, instead of failing a
+    # program that never reads it.
+    try:
+        return thunk()
+    except Exception:
+        return text
+
+def _ny_type_repr(t):
+    # How typing shows a type inside list[...] / X | Y: a builtin by its
+    # name, a class qualified by its module, None and ... as such.
+    if t is None:
+        return "None"
+    if isinstance(t, _NyGenericAlias) or isinstance(t, _NyUnionType):
+        return repr(t)
+    if t == Ellipsis:
+        return "..."
+    if callable(t) and hasattr(t, "__name__"):
+        var m = getattr(t, "__module__", "builtins")
+        if m == "builtins" or m == None:
+            return t.__name__
+        return m + "." + t.__name__
+    return repr(t)
+
+class _NyGenericAlias:
+    # list[int], dict[str, int], tuple[int, ...] (types.GenericAlias) and
+    # what a class's __class_getitem__ may return (round 77).
+    def __init__(self, origin, args):
+        self.__origin__ = origin
+        if not isinstance(args, tuple):
+            args = (args,)
+        self.__args__ = args
+        self.__parameters__ = ()
+    def __repr__(self):
+        if len(self.__args__) == 0:
+            return _ny_type_repr(self.__origin__) + "[()]"
+        return _ny_type_repr(self.__origin__) + "[" + ", ".join([_ny_type_repr(a) for a in self.__args__]) + "]"
+    def __call__(self, *args, **kw):
+        return self.__origin__(*args, **kw)
+    def __mro_entries__(self, bases):
+        return (self.__origin__,)
+    def __eq__(self, other):
+        if not isinstance(other, _NyGenericAlias):
+            return False
+        return self.__origin__ == other.__origin__ and self.__args__ == other.__args__
+    def __hash__(self):
+        return hash(repr(self))
+    def __or__(self, other):
+        return _ny_union(self, other)
+    def __ror__(self, other):
+        return _ny_union(other, self)
+    def __getitem__(self, item):
+        return _NyGenericAlias(self.__origin__, item)
+
+class _NyUnionType:
+    # int | str, Foo | None (types.UnionType, round 77)
+    def __init__(self, args):
+        self.__args__ = args
+    def __repr__(self):
+        return " | ".join([_ny_type_repr(a) for a in self.__args__])
+    def __or__(self, other):
+        return _ny_union(self, other)
+    def __ror__(self, other):
+        return _ny_union(other, self)
+    def __eq__(self, other):
+        if not isinstance(other, _NyUnionType) or len(self.__args__) != len(other.__args__):
+            return False
+        for a in self.__args__:
+            if a not in other.__args__:
+                return False
+        return True
+    def __hash__(self):
+        return hash(len(self.__args__))
+
+def _ny_union(a, b):
+    var args = []
+    for x in [a, b]:
+        if isinstance(x, _NyUnionType):
+            for y in x.__args__:
+                if y not in args:
+                    args.append(y)
+        elif x not in args:
+            args.append(x)
+    if len(args) == 1:
+        return args[0]
+    return _NyUnionType(tuple(args))
+
 def _ny_list_cat(*parts):
     # [*a, b, *c] (the parser hands the pieces here)
     var out = []
@@ -326,6 +424,15 @@ class _NyCode:
         return "<code object <module>, file \"" + self.co_filename + "\", line 1>"
 
 class object:
+    def __new__(cls, *args, **kw):
+        # object.__new__(cls) / super().__new__(cls): a bare instance
+        # (round 77; a class's own __new__ runs before __init__)
+        return _ny_object_new(cls)
+    @classmethod
+    def __init_subclass__(cls, **kw):
+        # the end of every super().__init_subclass__(**kw) chain
+        if len(kw) > 0:
+            raise TypeError(cls.__name__ + ".__init_subclass__() takes no keyword arguments")
     # the root of the class tree (round 77; `object` was undefined):
     # object(), class C(object), object.__init__(self) in a super() chain,
     # and the plain attribute store a __setattr__ hands on to

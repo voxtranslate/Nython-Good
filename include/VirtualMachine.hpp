@@ -584,7 +584,7 @@ inline std::string VMVal::to_string() const {
         return r+"}";
     }
     case VMType::FUNCTION: return "<function "+(code?code->name:"?")+">"; 
-    case VMType::CLASS:    return "<class "+nyrt::shown_class_name(class_name)+">";
+    case VMType::CLASS:    return nyrt::class_repr(class_name);
     case VMType::INSTANCE: {
         // An exception reads as its message, as in Python: str(e) is the
         // message, not "Type: message" (that is how an uncaught one is
@@ -593,7 +593,19 @@ inline std::string VMVal::to_string() const {
         return "<"+nyrt::shown_class_name(class_name)+" instance>";
     }
     case VMType::NATIVE:
-        if(class_name.rfind("__builtin__:",0)==0) return "<built-in function "+class_name.substr(12)+">";
+        if(class_name.rfind("__builtin__:",0)==0){
+            std::string bn=class_name.substr(12);
+            if(nyrt::is_builtin_type_name(bn)) return "<class '"+bn+"'>";
+            return "<built-in function "+bn+">";
+        }
+        if(nyrt::is_builtin_type_name(class_name)) return "<class '"+class_name+"'>";
+        if(class_name.rfind("__native__:",0)==0){
+            std::string bn=class_name.substr(11);
+            if(bn=="map") bn="dict";
+            if(nyrt::is_builtin_type_name(bn)) return "<class '"+bn+"'>";
+            return "<built-in function "+bn+">";
+        }
+        if(class_name=="map") return "<class 'dict'>";
         return "<native>";
     case VMType::ITERATOR: {
         char buf[32];
@@ -1882,8 +1894,18 @@ private:
             }
             pn_idx++;
         }
+        // __init_subclass__ / __class_getitem__ in a class body are
+        // classmethods without the decorator, as in Python (round 77)
+        if(C().is_class&&(fn->name=="__init_subclass__"||fn->name=="__class_getitem__")) fcode->is_classmethod=true;
         // MAKE_FUNCTION arg = idx | (n_defaults << 16)
         emit(Op::MAKE_FUNCTION, idx|(n_defaults<<16), l);
+        // f.__annotations__, evaluated when the def runs (round 77)
+        if(fn->annotations){
+            emit(Op::DUP_TOP,0,l);
+            visit(fn->annotations);
+            emit(Op::ROT_TWO,0,l);
+            emit(Op::STORE_ATTR,C().add_name("__annotations__"),l);
+        }
         emit_dn(fn->name,l);
     }
 
@@ -1893,9 +1915,17 @@ private:
         push_code(cn->name,true);
         code_->is_class=true;  // mark this sub_code as a class
         code_->doc=cn->doc; code_->has_doc=cn->has_doc;
-        for(auto& b:cn->bases) code_->bases.push_back(b->token().value);
+        // A base given by an expression (Generic[T], a call) is evaluated
+        // before MAKE_CLASS; its slot is "\x06<i>" until then (round 77).
+        std::vector<np> expr_bases;
+        for(auto& b:cn->bases){
+            if(b->type()==NT::VARIABLE) code_->bases.push_back(b->token().value);
+            else { code_->bases.push_back(std::string("\x06")+std::to_string(expr_bases.size())); expr_bases.push_back(b); }
+        }
         if(!code_->bases.empty()) code_->parent_class=code_->bases[0];
-        if(cn->body) for(auto& s:cn->body->statements()) visit_stmt(s);
+        // a one-line body (`class A: x = 1`) is a statement, not a block
+        if(cn->body&&cn->body->type()!=NT::BLOCK) visit_stmt(cn->body);
+        else if(cn->body) for(auto& s:cn->body->statements()) visit_stmt(s);
         // A method defined twice in one class body: the LAST definition wins,
         // as in Python and on the interpreter. Methods are found by scanning
         // sub_codes for the first name match, so the VM used to keep the
@@ -1917,7 +1947,15 @@ private:
         emit(Op::HALT,0,l);
         pop_code();
         int idx=(int)C().sub_codes.size()-1;
-        emit(Op::MAKE_CLASS,idx,l); emit_dn(cn->bind_name.empty()?cn->name:cn->bind_name,l);
+        // the class keywords (a map) and the expression bases (a list)
+        bool extras=!expr_bases.empty()||!cn->keywords.empty();
+        if(extras){
+            for(auto& [k,e]:cn->keywords){ emit_lc(VMVal::make_str(k),l); visit(e); }
+            emit(Op::BUILD_MAP,(int)cn->keywords.size(),l);
+            for(auto& e:expr_bases) visit(e);
+            emit(Op::BUILD_LIST,(int)expr_bases.size(),l);
+        }
+        emit(Op::MAKE_CLASS,idx|(extras?(1<<24):0),l); emit_dn(cn->bind_name.empty()?cn->name:cn->bind_name,l);
     }
 
     // ─── call ───────────────────────────────────────────────────────────
@@ -4318,7 +4356,116 @@ private:
         }
         return false;
     }
+    // A class's own __new__ (not object's); classes without one are
+    // remembered until the next class is made.
+    std::unordered_set<std::string> no_new_;
+    std::unordered_map<std::string,VMVal> class_meta_;   // metaclass= of a class statement
+    bool class_new(const std::string& cname, VMVal& m) {
+        if(no_new_.count(cname)) return false;
+        std::string owner;
+        if(class_lookup(cname,"__new__",m,&owner)&&nyrt::shown_class_name(owner)!="object"&&m.type==VMType::FUNCTION) return true;
+        no_new_.insert(cname);
+        return false;
+    }
+    // What a class statement has made: the hooks of PEP 487 - __set_name__
+    // of its attributes, then __init_subclass__ of the nearest base defining
+    // it (an implicit classmethod) with the statement's keywords (round 77).
+    void class_created(const VMVal& clsv, const VMVal& kw) {
+        const std::string& cname=clsv.class_name;
+        {
+            std::vector<std::pair<std::string,VMVal>> attrs;
+            auto cv=class_vars_.find(cname);
+            if(cv!=class_vars_.end())
+                for(auto& kv:cv->second) if(kv.second.type==VMType::INSTANCE) attrs.push_back(kv);
+            for(auto& [n,v]:attrs){
+                VMVal m;
+                if(!class_lookup(v.class_name,"__set_name__",m)) continue;
+                std::vector<VMVal> a{clsv, VMVal::make_str(n)};
+                invoke_method(m, v, a, v.class_name);
+            }
+        }
+        VMVal m; std::string owner;
+        bool has_kw=kw.type==VMType::MAP&&kw.map&&!kw.map->empty();
+        if(class_lookup(cname,"__init_subclass__",m,&owner,&cname)&&(m.type==VMType::FUNCTION||m.type==VMType::NATIVE)){
+            std::vector<VMVal> a{clsv};
+            vm_call(m, a, std::nullopt, has_kw?&kw:nullptr);
+        } else if(has_kw)
+            raise_native_exception("TypeError", nyrt::shown_class_name(cname)+".__init_subclass__() takes no keyword arguments");
+    }
+    // The bases given by expressions (placeholders "\x06<i>"): a class, a
+    // builtin type, or an object whose __mro_entries__ (PEP 560) names them.
+    void resolve_expr_bases(VMCode& sub, const VMVal& vals) {
+        std::vector<std::string> nb;
+        for(auto& b:sub.bases){
+            if(b.empty()||b[0]!='\x06'){ nb.push_back(b); continue; }
+            size_t i=(size_t)std::stoul(b.substr(1));
+            VMVal v=(vals.type==VMType::LIST&&vals.list&&i<vals.list->size())?(*vals.list)[i]:VMVal::make_none();
+            std::vector<VMVal> entries{v};
+            VMVal me;
+            if(v.type==VMType::INSTANCE&&class_lookup(v.class_name,"__mro_entries__",me)){
+                std::vector<VMVal> a{VMVal::make_tuple({})};
+                entries=iter_items(invoke_method(me, v, a, v.class_name));
+            }
+            for(auto& e:entries){
+                std::string n;
+                if(e.type==VMType::CLASS) n=e.class_name.empty()?e.s:e.class_name;
+                else if(e.type==VMType::NATIVE){ n=e.class_name.rfind("__builtin__:",0)==0?e.class_name.substr(12):e.class_name; }
+                if(n.empty()) raise_native_exception("TypeError","bases must be types");
+                nb.push_back(n);
+            }
+        }
+        sub.bases=nb;
+    }
+    // C[x]: __class_getitem__ (PEP 560, an implicit classmethod) and the
+    // builtin generics list[int], dict[str, int], ... (_NyGenericAlias).
+    bool class_subscript(const VMVal& obj, const VMVal& idx, VMVal& out) {
+        if(obj.type==VMType::CLASS){
+            std::string cname=obj.class_name.empty()?obj.s:obj.class_name;
+            VMVal m;
+            if(!class_lookup(cname,"__class_getitem__",m)) return false;
+            std::vector<VMVal> a{obj, idx};
+            out=vm_call(m, a, std::nullopt, nullptr);
+            return true;
+        }
+        if(obj.type!=VMType::NATIVE) return false;
+        std::string b=native_name(obj);
+        static const std::unordered_set<std::string> generic={"list","dict","tuple","set","frozenset","type"};
+        if(!generic.count(b)) return false;
+        std::vector<VMVal> a{obj, idx};
+        out=vm_call(load_var("_NyGenericAlias"), a, std::nullopt, nullptr);
+        return true;
+    }
+    // The name a builtin native is tagged with ("__builtin__:x", the
+    // "__native__:x" a global read gives it, or the type it builds).
+    static std::string native_name(const VMVal& v) {
+        const std::string& c=v.class_name;
+        std::string b=c.rfind("__builtin__:",0)==0?c.substr(12):c.rfind("__native__:",0)==0?c.substr(11):c;
+        return b=="map"?std::string("dict"):b;
+    }
+    // A type in an X | Y union: a class, a builtin type, None.
+    bool is_type_operand(const VMVal& v) {
+        if(v.type==VMType::NONE||v.type==VMType::CLASS) return true;
+        if(v.type!=VMType::NATIVE) return false;
+        return nyrt::is_builtin_type_name(native_name(v));
+    }
     VMVal instantiate(const VMVal& cls, std::vector<VMVal>& args, const VMVal* kwargs=nullptr) {
+        // __new__(cls, *args, **kw) makes the object; __init__ runs when it
+        // returned an instance of the class (round 77).
+        {
+            VMVal nw;
+            if(class_new(cls.class_name, nw)){
+                std::vector<VMVal> a; a.reserve(args.size()+1);
+                a.push_back(cls);
+                for(auto& x:args) a.push_back(x);
+                VMVal inst=vm_call(nw, a, std::nullopt, kwargs);
+                if(inst.type==VMType::INSTANCE&&class_derives(inst.class_name, cls.class_name)){
+                    if(vm_exc_classes().count(cls.class_name)&&inst.map) (*inst.map)["args"]=VMVal::make_tuple(args);
+                    VMVal init;
+                    if(find_ctor(cls.class_name, init)) invoke_method(init, inst, args, cls.class_name, kwargs);
+                }
+                return inst;
+            }
+        }
         auto attrs=new_instance_fields(cls.class_name);
         VMVal inst=VMVal::make_instance(cls.class_name,attrs);
         if(!class_reg_.count(cls.class_name)&&cls.code) class_reg_[cls.class_name]=cls.code;
@@ -4496,6 +4643,7 @@ private:
                 }
                 if(obj.type==VMType::INSTANCE){bool f=false;VMVal res=call_dunder_f(obj,"__getitem__",{idx},f);if(f){push(res);break;}
                     throw_exception(make_exception("TypeError",{VMVal::make_str("'"+obj.class_name+"' object is not subscriptable")}));}
+                if(obj.type==VMType::CLASS||obj.type==VMType::NATIVE){ VMVal cg; if(class_subscript(obj,idx,cg)){ push(std::move(cg)); break; } }
                 push(get_sub(obj,idx)); break;
             }
             case Op::STORE_SUBSCR:{
@@ -4632,6 +4780,11 @@ private:
                     VMVal res;
                     if(binary_dunder(l,r,dunder,rdunder,res)){ push(std::move(res)); break; }
                     if(aop==nypy::A_DIV && binary_dunder(l,r,"__div__","__rdiv__",res)){ push(std::move(res)); break; }
+                }
+                // int | None, Foo | Bar: a union type (PEP 604, round 77)
+                if(aop==nypy::A_OR&&is_type_operand(l)&&is_type_operand(r)){
+                    std::vector<VMVal> a{l, r};
+                    push(vm_call(load_var("_ny_union"), a, std::nullopt, nullptr)); break;
                 }
                 push(binop(aop,l,r)); break; }
             // Compares
@@ -4786,7 +4939,10 @@ private:
                 push(std::move(fn_val)); break;
             }
             case Op::MAKE_CLASS: {
-                auto sub=fr.code->sub_codes[ins.arg];
+                bool extras=(ins.arg>>24)&1;
+                VMVal ex_bases, ex_kw;
+                if(extras){ ex_bases=pop(); ex_kw=pop(); }
+                auto sub=fr.code->sub_codes[ins.arg&0xFFFFFF];
                 // Each run of a class statement makes a new class (round 77;
                 // a factory's second call rebound the first one's class): a
                 // re-run is a copy registered as "Name#n", shown as Name.
@@ -4803,7 +4959,13 @@ private:
                         }
                     }
                     sub=copy;
-                } else class_ran_.insert(sub.get());
+                } else {
+                    class_ran_.insert(sub.get());
+                    // expression bases are resolved below: the statement's own
+                    // code keeps its placeholders for the next run
+                    if(extras) sub=std::make_shared<VMCode>(*sub);
+                }
+                if(extras) resolve_expr_bases(*sub, ex_bases);
                 // Bases are looked up in scope (NythonExecutor::evalClassDecl)
                 for(auto& b:sub->bases){
                     // A module's own base is already "module.Class" (the
@@ -4826,10 +4988,21 @@ private:
                 attr_hook_cache_[0].clear();
                 attr_hook_cache_[1].clear();
                 has_del_cache_.clear();
+                no_new_.clear();
                 class_vars_[sub->name]=run_class_body(sub, fr);
                 if(is_exception_class(sub->name)) vm_exc_classes().insert(sub->name);
                 else vm_exc_classes().erase(sub->name);
-                push(VMVal::make_class(sub,sub->name));
+                {
+                    VMVal clsv=VMVal::make_class(sub,sub->name);
+                    VMVal kw=VMVal::make_map();
+                    if(extras&&ex_kw.type==VMType::MAP&&ex_kw.map)
+                        for(auto& kv:*ex_kw.map){
+                            if(kv.first=="metaclass") class_meta_[sub->name]=kv.second;
+                            else (*kw.map)[kv.first]=kv.second;
+                        }
+                    class_created(clsv, kw);
+                    push(clsv);
+                }
                 break;
             }
 
@@ -6162,8 +6335,9 @@ private:
     // getters and __getattr__ run, and what they raise propagates. `bind`
     // false: a builtin's method is not made into a bound value.
     bool lookup_attr(const VMVal& obj, const std::string& attr, VMVal& out, bool bind=true) {
-        // a bound method's __doc__ / __name__ / __func__ / __self__ are its function's
-        if(obj.type==VMType::MAP&&obj.class_name=="__bound_method__"&&obj.map&&(attr=="__doc__"||attr=="__name__"||attr=="__func__"||attr=="__self__"||attr=="__qualname__")){
+        // a bound method: __self__, __func__, and everything else its
+        // function's (__doc__, __name__, __annotations__, attributes set on it)
+        if(obj.type==VMType::MAP&&obj.class_name=="__bound_method__"&&obj.map){
             auto fit=obj.map->find("__fn__");
             if(attr=="__self__"){ auto sit=obj.map->find("__self__"); out=sit!=obj.map->end()?sit->second:VMVal::make_none(); return true; }
             if(fit==obj.map->end()) return false;
@@ -6228,6 +6402,8 @@ private:
             }
             if(attr=="__name__"){ out=VMVal::make_str(obj.code?obj.code->name:""); return true; }
             if(attr=="__doc__"){ out=obj.code&&obj.code->has_doc?VMVal::make_str(obj.code->doc):VMVal::make_none(); return true; }
+            // no annotations: an empty dict, made on first read and kept
+            if(attr=="__annotations__"&&obj.code){ out=VMVal::make_map(); func_attrs_[func_key(obj)][attr]=out; return true; }
             return false;
         }
         case VMType::CLASS: {
@@ -6259,6 +6435,13 @@ private:
                 for(auto& c:*class_mro(cname)){ VMVal cv=class_value(c); if(cv.type!=VMType::NONE) r.push_back(cv); }
                 out=VMVal::make_tuple(std::move(r)); return true;
             }
+            // C.__dict__: the class's own namespace (a copy; a mappingproxy is read-only)
+            if(attr=="__dict__"){
+                VMVal d=VMVal::make_map();
+                auto cv=class_vars_.find(cname);
+                if(cv!=class_vars_.end()) for(auto& kv:cv->second) (*d.map)[nypy::key_of_str(kv.first)]=kv.second;
+                out=d; return true;
+            }
             if(attr=="__bases__"){
                 std::vector<VMVal> r;
                 auto rit=class_reg_.find(cname);
@@ -6276,6 +6459,7 @@ private:
                 if(tagged||(!c.empty()&&colon==std::string::npos)){
                     if(attr=="__module__"){ out=VMVal::make_str("builtins"); return true; }
                     std::string nm=tagged?c.substr(colon+1):c;
+                    if(nm=="map") nm="dict";   // the dict builtin is tagged with Nython's name for it
                     size_t dot=nm.rfind('.');
                     out=VMVal::make_str(dot==std::string::npos?nm:nm.substr(dot+1));
                     return true;
@@ -8157,6 +8341,16 @@ private:
             return VMVal::make_list(std::move(r));});
         // locals() / globals() / vars() / dir() (round 77; they read none):
         // as on the interpreter (NythonExecutor reflect*).
+        // object.__new__(cls): an instance of cls without running __init__ (round 77)
+        globals_["_ny_object_new"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.empty()||a[0].type!=VMType::CLASS) raise_native_exception("TypeError","object.__new__(X): X is not a type object");
+            const VMVal& cls=a[0];
+            auto attrs=new_instance_fields(cls.class_name);
+            VMVal inst=VMVal::make_instance(cls.class_name,attrs);
+            if(!class_reg_.count(cls.class_name)&&cls.code) class_reg_[cls.class_name]=cls.code;
+            if(vm_exc_classes().count(cls.class_name)){ (*attrs)["args"]=VMVal::make_tuple({}); (*attrs)["msg"]=VMVal::make_str(""); }
+            return inst;
+        });
         globals_["_ny_setattr_raw"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()>=3){ RawAttr raw; VMVal o=a[0]; set_attr(o,a[1].to_string(),a[2]); }
             return VMVal::make_none(); });
@@ -9504,6 +9698,16 @@ private:
         tag_type_builtins();
         globals_["isinstance"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()<2) return VMVal::make_bool(false);
+            // isinstance(x, int | str): any of the union's types (round 77)
+            if(a[1].type==VMType::INSTANCE&&a[1].map&&nyrt::shown_class_name(a[1].class_name)=="_NyUnionType"){
+                auto it=a[1].map->find("__args__");
+                if(it!=a[1].map->end()) for(auto& t:iter_items(it->second)){
+                    if(t.type==VMType::NONE){ if(a[0].type==VMType::NONE) return VMVal::make_bool(true); continue; }
+                    std::vector<VMVal> one{a[0], t};
+                    if(globals_["isinstance"].native(one).b) return VMVal::make_bool(true);
+                }
+                return VMVal::make_bool(false);
+            }
             if(a[1].type==VMType::LIST&&a[1].list){
                 // isinstance(x, (A, B)): any of them.
                 for(auto& c:*a[1].list){

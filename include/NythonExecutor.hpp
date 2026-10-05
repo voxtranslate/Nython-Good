@@ -381,7 +381,7 @@ struct NythonExecutor {
     // "Name#n" (evalClassDecl); what is shown is Name.
     static std::string shownClassName(const std::string& n) { return nyrt::shown_class_name(n); }
     static std::string funcDisplayName(const std::string& fn) {
-        if (fn.rfind("__class__:", 0) == 0) return "<class " + shownClassName(fn.substr(10)) + ">";
+        if (fn.rfind("__class__:", 0) == 0) return nyrt::class_repr(fn.substr(10));
         std::string n = fn;
         if (n.rfind("__func__:", 0) == 0) n = n.substr(9);
         if (n == "__lambda__" || n.empty()) n = "<lambda>";
@@ -529,7 +529,7 @@ public:   // NythonExecutor is a struct: members default to public
             "isinstance","issubclass","id","hash","hex","oct","bin",
             "chr","ord","repr","format","open","exit","quit",
             "pow","divmod","input","dict","display","show","is_int","is_float","is_string","is_list","is_none","is_bool","to_int","to_float","to_str","clamp","lerp","map_range","repeat_str","repeat","flatten","flat","shell","system","ls","cat","pwd","mkdir","write","exists","env","all","any","complex","slice","super","property",
-            "staticmethod","classmethod","callable","dir","vars","globals","locals","eval","exec","compile","_ny_setattr_raw","_ny_delattr_raw",
+            "staticmethod","classmethod","callable","dir","vars","globals","locals","eval","exec","compile","_ny_setattr_raw","_ny_delattr_raw","_ny_object_new",
             "iter","next","help","Set","Counter","OrderedDict","deque","defaultdict","assert",
             "islice","take",   // lazy iteration (src/NyGen.cpp), both engines
             "sqrt","sin","cos","tan","log","floor","ceil",
@@ -829,7 +829,11 @@ public:   // NythonExecutor is a struct: members default to public
         } _restore{f, f.fast_ctx, f.brk_ok};
         f.fast_ctx = fc;
         f.brk_ok = false;
-        Value v = evalNode(body, fc);
+        evalNode(body, fc);
+        // A function returns what its `return` gave, else None - not the value
+        // of its last statement (round 77: `def f(): 5` returned 5 here and
+        // None on the VM and in Python).
+        Value v = NONE_VALUE;
         if (f.pending) {
             if (f.pending == 1) { v = f.value; f.value = NONE_VALUE; }
             f.pending = 0;
@@ -1696,6 +1700,11 @@ public:   // NythonExecutor is a struct: members default to public
                     dictUpdate(contOf(d), lc);
                     dictUpdate(contOf(d), rc);
                     return d;
+                }
+                // int | None, Foo | Bar: a union type (PEP 604, round 77)
+                if (isTypeOperand(lv) && isTypeOperand(rv)) {
+                    std::vector<Value> a{lv, rv};
+                    return callFunctionValue(global_ctx->getByName("_ny_union"), a, ctx);
                 }
             }
             unsupportedOperands(opc, lv, rv);
@@ -2779,6 +2788,10 @@ public:   // NythonExecutor is a struct: members default to public
             std::vector<Value> call_args = {idx};
             return callMethod(obj, "__getitem__", call_args, ctx);
         }
+        {
+            Value cg;
+            if (classSubscript(obj, idx, ctx, cg)) return cg;
+        }
         // none[k], 5[0], f[0]: TypeError (they read none).
         std::string msg = "'" + typeNameOf(obj) + "' object is not subscriptable";
         if (nypy::lenient_reads_log()) { logLenientRead(nullptr, "TypeError: " + msg); return NONE_VALUE; }
@@ -2995,7 +3008,11 @@ public:   // NythonExecutor is a struct: members default to public
             }
             auto fit = func_names.find(v.value.p);
             if (fit != func_names.end()) {
-                if (fit->second.rfind("__builtin__:", 0) == 0) return "<built-in function " + fit->second.substr(12) + ">";
+                if (fit->second.rfind("__builtin__:", 0) == 0) {
+                    std::string bn = fit->second.substr(12);
+                    if (nyrt::is_builtin_type_name(bn)) return "<class '" + bn + "'>";
+                    return "<built-in function " + bn + ">";
+                }
                 return funcDisplayName(fit->second);
             }
             const std::string& s = *(std::string*)v.value.p;
@@ -3692,6 +3709,9 @@ public:   // NythonExecutor is a struct: members default to public
         heap_owner_[unique_ptr] = fo;
         nygc::track(fo);
         captureDefaults(fn.get(), unique_ptr, ctx);
+        // __annotations__, evaluated when the def runs (round 77; the parser
+        // makes the dict display, each value through the prelude's _ny_ann).
+        if (fn->annotations) func_attrs_[unique_ptr]["__annotations__"] = evalNode(fn->annotations, ctx);
 
         ctx->defineByName(fn->name, func_val);
         return func_val;
@@ -4826,6 +4846,8 @@ public:   // NythonExecutor is a struct: members default to public
     Value evalClassDecl(node_ptr node, Context* ctx) {
         auto cn = static_pointer_cast<ClassNode>(node);
         std::string plain_name = cn->name;
+        bool expr_bases = false;
+        for (auto& b : cn->bases) if (b && b->type() != NodeType::VARIABLE) expr_bases = true;
         if (class_ran_.count(node.get())) {
             auto copy = std::make_shared<ClassNode>(*cn);
             copy->name = cn->name + "#" + std::to_string(++class_generation_);
@@ -4835,6 +4857,50 @@ public:   // NythonExecutor is a struct: members default to public
             cn = copy;
         } else {
             class_ran_.insert(node.get());
+            if (expr_bases) {
+                // its bases are rewritten below: the statement keeps the
+                // expressions for its next run
+                auto copy = std::make_shared<ClassNode>(*cn);
+                class_copies_.push_back(copy);
+                node = copy;
+                cn = copy;
+            }
+        }
+        // A base given by an expression (Generic[T], namedtuple("P", "x")):
+        // evaluated; an object with __mro_entries__ (PEP 560) names the
+        // classes it stands for (round 77).
+        if (expr_bases) {
+            std::vector<node_ptr> nb;
+            for (auto& b : cn->bases) {
+                if (!b || b->type() == NodeType::VARIABLE) { nb.push_back(b); continue; }
+                Value bv = evalNode(b, ctx);
+                std::vector<Value> entries{bv};
+                if (isInstanceValue(bv) && instanceHasMethod(bv, "__mro_entries__")) {
+                    std::vector<Value> a{makeListValue(std::vector<Value>{}, true)};
+                    entries = listItems(callMethod(bv, "__mro_entries__", a, ctx));
+                }
+                for (auto& e : entries) {
+                    std::string bn;
+                    if (Node* bcn = classNodeOfValue(e)) bn = static_cast<ClassNode*>(bcn)->name;
+                    else {
+                        std::string t = fnTag(func_names, e.value.p);
+                        if (e.type == ValueType::USERDATA && t.rfind("__builtin__:", 0) == 0) bn = t.substr(12);
+                    }
+                    if (bn.empty()) pyRaise("TypeError", "bases must be types");
+                    Token t = b->token();
+                    t.value = bn;
+                    nb.push_back(std::make_shared<VariableNode>(t));
+                }
+            }
+            cn->bases = nb;
+        }
+        // `class C(Base, metaclass=M, **kw)`: the keywords, for
+        // __init_subclass__ (metaclass: the class's metaclass).
+        nyrt::OrderedKw<Value> class_kw;
+        for (auto& [k, e] : cn->keywords) {
+            Value v = evalNode(e, ctx);
+            if (k == "metaclass") class_meta_[(void*)node.get()] = v;
+            else class_kw[k] = v;
         }
         // Bases are looked up in scope (round 77): a module's class (named
         // "module.Class"), one imported with `from m import C`, an alias,
@@ -4875,6 +4941,7 @@ public:   // NythonExecutor is a struct: members default to public
         mro_cache_.clear();
         attr_hook_cache_[0].clear();
         attr_hook_cache_[1].clear();
+        no_new_.clear();
         if (cn->body)
             for (auto& st : cn->body->statements())
                 if (st && st->type() == NodeType::FUNCTION) direct_methods_.insert(st.get());
@@ -4889,10 +4956,85 @@ public:   // NythonExecutor is a struct: members default to public
             CtxReaper _class_creator(this, class_ctx);
             class_ctx->inClass = true;
             evalNode(cn->body, class_ctx);
+            // __init_subclass__ and __class_getitem__ are classmethods
+            // without the decorator, as in Python (round 77)
+            for (const char* nm : {"__init_subclass__", "__class_getitem__"}) {
+                if (!class_ctx->container) break;
+                auto it = class_ctx->container->find(nm);
+                if (it == class_ctx->container->end() || !isPlainFunction(it->second)) continue;
+                if (fnTag(func_names, it->second.value.p).find("__classmethod__") != std::string::npos) continue;
+                std::vector<Value> a{it->second};
+                Value cm = callBuiltin("classmethod", a, class_ctx);
+                class_ctx->defineByName(nm, cm);
+            }
             // Store the evaluated class context so decorators (@property, @staticmethod) are visible
             setClassContext((void*)node.get(), class_ctx);
         }
+        classCreated(class_val, node.get(), class_kw, ctx);
         return class_val;
+    }
+    // What a class statement has made: metaclass of each class (class_meta_),
+    // and the hooks of PEP 487 run once the class exists - __set_name__ of
+    // its attributes, then __init_subclass__ of the nearest base defining it
+    // (an implicit classmethod) with the statement's keywords (round 77).
+    std::unordered_map<void*, Value> class_meta_;
+    void classCreated(const Value& cls, Node* cnode, const nyrt::OrderedKw<Value>& kw, Context* ctx) {
+        auto cit = class_ctx_map_.find((void*)cnode);
+        if (cit != class_ctx_map_.end() && cit->second && cit->second->container) {
+            std::vector<std::pair<std::string, Value>> attrs;
+            for (auto& kv : *cit->second->container)
+                if (isInstanceValue(kv.second)) attrs.push_back({kv.first, kv.second});
+            for (auto& [n, v] : attrs) {
+                if (!instanceHasMethod(v, "__set_name__")) continue;
+                std::vector<Value> a{cls, makeStringValue(n)};
+                Value vv = v;
+                callMethod(vv, "__set_name__", a, ctx);
+            }
+        }
+        Value m; Node* where = nullptr;
+        if (findClassMember(cnode, "__init_subclass__", m, &where, cnode) && m.type == ValueType::USERDATA
+            && m.value.p && func_names.count(m.value.p)) {
+            std::vector<Value> a;
+            if (fnTag(func_names, m.value.p).find("__classmethod__") == std::string::npos) a.push_back(cls);
+            invokeMember(m, where, cls, a, kw, ctx);
+        } else if (!kw.empty()) {
+            pyRaise("TypeError", shownClassName(static_cast<ClassNode*>(cnode)->name) + ".__init_subclass__() takes no keyword arguments");
+        }
+    }
+    // C[x]: __class_getitem__ (PEP 560, an implicit classmethod), and the
+    // builtin generics list[int], dict[str, int], ... (the prelude's
+    // _NyGenericAlias) - round 77.
+    bool classSubscript(const Value& obj, const Value& idx, Context* ctx, Value& out) {
+        if (obj.type != ValueType::USERDATA || !obj.value.p) return false;
+        if (Node* cn = classNodeOfValue(obj)) {
+            Value m; Node* where = nullptr;
+            if (!findClassMember(cn, "__class_getitem__", m, &where) || m.type != ValueType::USERDATA || !func_names.count(m.value.p))
+                return false;
+            std::vector<Value> a;
+            if (fnTag(func_names, m.value.p).find("__classmethod__") == std::string::npos) a.push_back(obj);
+            a.push_back(idx);
+            static const nyrt::OrderedKw<Value> no_kw;
+            out = invokeMember(m, where, obj, a, no_kw, ctx);
+            return true;
+        }
+        std::string t = fnTag(func_names, obj.value.p);
+        if (t.rfind("__builtin__:", 0) != 0) return false;
+        static const std::unordered_set<std::string> generic = {"list", "dict", "tuple", "set", "frozenset", "type"};
+        if (!generic.count(t.substr(12))) return false;
+        std::vector<Value> a{obj, idx};
+        out = callFunctionValue(global_ctx->getByName("_NyGenericAlias"), a, ctx);
+        return true;
+    }
+    // A type in an X | Y union: a class, a builtin type, None.
+    bool isTypeOperand(const Value& v) {
+        if (v.type == ValueType::NONE) return true;
+        if (v.type != ValueType::USERDATA || !v.value.p) return false;
+        if (classNodeOfValue(v)) return true;
+        std::string t = fnTag(func_names, v.value.p);
+        if (t.rfind("__builtin__:", 0) != 0) return false;
+        static const std::unordered_set<std::string> types = {"int", "float", "str", "bool", "list", "dict", "tuple",
+            "set", "frozenset", "bytes", "bytearray", "complex", "object", "type"};
+        return types.count(t.substr(12)) > 0;
     }
 
     // Bind the interface as a real class-like value, registered the same
@@ -6699,12 +6841,44 @@ public:
     std::vector<std::unique_ptr<std::string>> prop_setter_ids_;
     bool specialAttribute(const Value& obj, const std::string& attr, Context* ctx, Value& out, bool bind = true) {
         if (obj.type == ValueType::USERDATA && obj.value.p) {
+            // A bound method: __self__, __func__, and everything else its
+            // function's (__annotations__, __doc__, attributes set on it).
+            if (!bound_self_.empty()) {
+                auto bs = bound_self_.find(obj.value.p);
+                if (bs != bound_self_.end() && bs->second) {
+                    if (attr == "__self__") { out = bs->second->self; return true; }
+                    if (attr == "__func__") { out = bs->second->fn; return true; }
+                    Value fnv = bs->second->fn;
+                    if (fnv.value.p != obj.value.p && specialAttribute(fnv, attr, ctx, out, bind)) return true;
+                }
+            }
             if (!func_attrs_.empty()) {
                 auto fa = func_attrs_.find(obj.value.p);
                 if (fa != func_attrs_.end()) {
                     auto it = fa->second.find(attr);
                     if (it != fa->second.end()) { out = it->second; return true; }
                 }
+            }
+            // C.__dict__: the class's own namespace (a copy, as a mappingproxy
+            // is read-only).
+            if (attr == "__dict__") {
+                if (Node* cn = classNodeOfValue(obj)) {
+                    auto* d = new Object((Runnable*)runner, "map", Type::MAP);
+                    auto cit = class_ctx_map_.find((void*)cn);
+                    if (cit != class_ctx_map_.end() && cit->second && cit->second->container)
+                        for (auto& kv : *cit->second->container)
+                            if (!kv.first.empty() && (unsigned char)kv.first[0] >= 0x20 && kv.first != "__parent_class__")
+                                d->set(kv.first, kv.second);
+                    out = Value((Collectable*)d);
+                    return true;
+                }
+            }
+            // A function without annotations has an empty __annotations__
+            // dict, made on first read and kept (writes to it stay).
+            if (attr == "__annotations__" && isPlainFunction(obj)) {
+                out = Value((Collectable*)new Object((Runnable*)runner, "map", Type::MAP));
+                func_attrs_[obj.value.p]["__annotations__"] = out;
+                return true;
             }
             auto fit = func_names.find(obj.value.p);
             // prop.setter: a callable that records its argument as the
@@ -7302,9 +7476,39 @@ public:
         nygc::track(io);
         return instance;
     }
+    // A class's own __new__ (not object's), found through the MRO; classes
+    // without one are remembered (cleared whenever a class is made).
+    std::unordered_set<const Node*> no_new_;
+    bool classNew(Node* cn, Value& m, Node*& where) {
+        if (!cn || no_new_.count(cn)) return false;
+        Node* objn = classNodeByName("object");
+        if (findClassMember(cn, "__new__", m, &where) && where != objn && m.type == ValueType::USERDATA
+            && m.value.p && func_names.count(m.value.p))
+            return true;
+        no_new_.insert(cn);
+        return false;
+    }
     Value instantiateClass(const Value& cls, std::vector<Value>& args,
                            const nyrt::OrderedKw<Value>& kw, Context* ctx) {
         std::string className = fnTag(func_names, cls.value.p).substr(10);
+        // __new__(cls, *args, **kw) makes the object; __init__ runs when it
+        // returned an instance of the class (round 77).
+        {
+            Value nm; Node* where = nullptr;
+            Node* cn = classNodeOfValue(cls);
+            if (cn && classNew(cn, nm, where)) {
+                std::vector<Value> a;
+                a.reserve(args.size() + 1);
+                a.push_back(cls);
+                for (auto& x : args) a.push_back(x);
+                Value inst = invokeMember(nm, where, cls, a, kw, ctx);
+                if (isInstanceValue(inst) && classDerivesFrom(instanceClassName(inst), static_cast<ClassNode*>(cn)->name)) {
+                    if (isExceptionClass(className)) setExceptionArgs(inst, args);
+                    runConstructor(inst, args, kw, ctx);
+                }
+                return inst;
+            }
+        }
         Value instance = newInstance(className, cls.value.p);
         if (isExceptionClass(className)) setExceptionArgs(instance, args);
         runConstructor(instance, args, kw, ctx);

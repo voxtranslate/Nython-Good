@@ -257,6 +257,22 @@ inline std::string native_exc_type(const std::exception& e) {
     return "RuntimeError";
 }
 
+// repr of a class, as Python shows it: <class 'int'> for a builtin type and
+// the prelude's own classes, <class '__main__.A'> for a class of the program,
+// <class 'mod.A'> for a module's (round 77; it was <class A>).
+inline bool is_builtin_type_name(const std::string& n) {
+    static const char* const names[] = {"int", "float", "str", "bool", "list", "dict", "tuple", "set", "frozenset",
+                                        "bytes", "bytearray", "complex", "object", "type", "slice", "range"};
+    for (const char* x : names) if (n == x) return true;
+    return false;
+}
+inline std::string class_repr(const std::string& full) {
+    std::string n = shown_class_name(full);
+    if (is_builtin_type_name(n)) return "<class '" + n + "'>";
+    if (n.find('.') == std::string::npos) n = "__main__." + n;
+    return "<class '" + n + "'>";
+}
+
 // `from m import a as b`: ImportNode::names holds "a\x05b" (the parser);
 // both engines bind it with this split - {name in the module, name bound}.
 inline std::pair<std::string, std::string> import_name_alias(const std::string& n) {

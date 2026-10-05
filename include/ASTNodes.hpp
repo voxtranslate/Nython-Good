@@ -698,6 +698,10 @@ struct FunctionNode : Node {
     std::string doc; bool has_doc = false;   // its docstring (__doc__, round 77)
     std::vector<node_ptr> defaults; // default values for parameters
     size_t posonly = 0;   // how many parameters precede a bare `/` (PEP 570): never bound by keyword
+    // Its parameter and return annotations, a dict display evaluated when the
+    // def runs (each value through _ny_ann: a name not defined yet gives the
+    // annotation's source text). Null when it has none (round 77).
+    node_ptr annotations;
     FunctionNode(Token t, const std::string& n, node_ptr b, bool m=false) : Node(t, NodeType::FUNCTION), name(n), params{}, body(b), is_method(m), defaults{} {}
     Node* add(node_ptr n) override { params.push_back(n); return this; }
     Value eval(Context* ctx) override {
@@ -728,6 +732,11 @@ struct ClassNode : Node {
     // identity: both engines key classes by name) and bound as "Class"
     // (nython::scope::qualify_module_classes, round 77).
     std::string bind_name;
+    // `class C(Base, metaclass=M, flag=1)`: the keywords, evaluated when the
+    // class statement runs - metaclass picks the metaclass, the rest go to
+    // __init_subclass__ (round 77). A base that is not a (dotted) name -
+    // Generic[T], namedtuple("P", "x y") - is kept as its expression node.
+    std::vector<std::pair<std::string, node_ptr>> keywords;
     ClassNode(Token t, const std::string& n, node_ptr b) : Node(t, NodeType::CLASS), name(n), bases{}, body(b) {}
     Value eval(Context* ctx) override {
         Runnable* r = getRunner(ctx);

@@ -44,6 +44,16 @@ private:
     /// Temporary storage for parameter default values during function parsing
     std::vector<node_ptr> param_defaults_;
     size_t param_posonly_ = 0;   // paramList: parameters before a bare `/`
+    // Annotations (round 77). The kind of scope each statement is parsed in
+    // ('c' a class body, 'f' a function body; empty: the module); whether a
+    // class body / the module stored an annotation (it then starts with
+    // `var __annotations__ = {}`); `from __future__ import annotations`
+    // (annotations stay strings); paramList's parameter annotations.
+    std::vector<char> ann_scope_;
+    std::vector<bool> class_ann_used_;
+    bool module_ann_used_ = false;
+    bool future_annotations_ = false;
+    std::vector<std::pair<std::string, node_ptr>> param_ann_;
     // Per function being parsed: the names it declared `global`/`nonlocal`.
     std::vector<std::vector<std::string>> outer_decls_;
     std::vector<std::vector<std::string>> global_decls_;   // `global` only, per function
@@ -251,6 +261,9 @@ private:
     node_ptr yieldStmt();
     node_ptr withStmt(bool is_async = false);
     node_ptr wrap_call(const std::string& helper, node_ptr arg);
+    std::string tokenText(int from, int to);                  // source text of tokens [from, to)
+    node_ptr annotationValue(node_ptr expr, int from, int to); // what __annotations__ stores
+    node_ptr annotationsDecl(const Token& t);                 // `var __annotations__ = {}`
     bool haveCompFor();
     node_ptr repeatStmt();
     node_ptr loopStmt();

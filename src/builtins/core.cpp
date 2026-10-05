@@ -556,6 +556,16 @@ Value dispatch_core(NythonExecutor& E,
             }
             return NONE_VALUE;
         }
+        // object.__new__(cls): an instance of cls without running __init__
+        // (round 77).
+        if (name == "_ny_object_new") {
+            Node* cn = args.empty() ? nullptr : E.classNodeOfValue(args[0]);
+            if (!cn) E.pyRaise("TypeError", "object.__new__(X): X is not a type object");
+            std::string cname = static_cast<nython::node::ClassNode*>(cn)->name;
+            Value inst = E.newInstance(cname, args[0].value.p);
+            if (E.isExceptionClass(cname)) { std::vector<Value> none; E.setExceptionArgs(inst, none); }
+            return inst;
+        }
         if (name == "_ny_setattr_raw" && args.size() >= 3) {
             NythonExecutor::RawAttr raw;
             E.setAttr(args[0], E.getStringValue(args[1]), args[2]);

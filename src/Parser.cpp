@@ -207,12 +207,18 @@ node_ptr Parser::script(){
         tok.value = "nython";
     }
     node_ptr node = node_ptr(new Script(tok));
+    module_ann_used_ = false;
+    future_annotations_ = false;
+    std::vector<node_ptr> stmts;
     while(!see(TokenType::End)){
         if(have(TokenType::NewLine));
         else if(have(TokenType::SemiColon));
-        else node->add(stmt());
+        else stmts.push_back(stmt());
     }
     mustBe(TokenType::End);
+    // A module that annotates a name has __annotations__ (round 77).
+    if(module_ann_used_) node->add(annotationsDecl(tok));
+    for(auto& s : stmts) node->add(s);
     return node;
 }
 
@@ -628,13 +634,30 @@ node_ptr Parser::statement(){
             bool simple = k == 1 && see(TokenType::Identifier);
             node_ptr target = postfix();
             mustBe(TokenType::Colon);
-            ternary();   // the annotation (not expression(): `T = v` is not an assignment)
+            int a0 = scanner->current;
+            node_ptr ann = ternary();   // the annotation (not expression(): `T = v` is not an assignment)
+            int a1 = scanner->current;
             node_ptr value = nullptr;
             if(have(TokenType::Assign)) value = expression();
             have(TokenType::SemiColon); have(TokenType::NewLine);
-            if(!value) return make_node<PassNode>(tok0);
-            if(simple) return make_node<VarDeclNode>(tok0, target->value(), value);
-            return make_node<AssignmentNode>(tok0, target, value);
+            node_ptr assign = nullptr;
+            if(value) assign = simple ? make_node<VarDeclNode>(tok0, target->value(), value)
+                                      : make_node<AssignmentNode>(tok0, target, value);
+            // A simple name annotated in a class body or the module is
+            // stored in __annotations__ (after the value, as CPython does);
+            // in a function, and for `a.b: T` / `a[i]: T`, it is not kept.
+            char sc = ann_scope_.empty() ? 'm' : ann_scope_.back();
+            if(!simple || sc == 'f') return assign ? assign : make_node<PassNode>(tok0);
+            if(sc == 'c') class_ann_used_.back() = true; else module_ann_used_ = true;
+            Token at = tok0; at.value = "__annotations__";
+            Token kt = tok0; kt.value = target->value();
+            auto slot = make_node<SubscriptNode>(at, make_node<VariableNode>(at), make_node<StringNode>(kt));
+            auto store = make_node<AssignmentNode>(tok0, slot, annotationValue(ann, a0, a1));
+            if(!assign) return store;
+            auto blk = make_node<BlockNode>(tok0);
+            blk->add(assign);
+            blk->add(store);
+            return blk;
         }
     }
 
@@ -1314,6 +1337,14 @@ node_ptr Parser::parseSubscriptTail(Token tok, node_ptr expr){
             for(auto& sa : slice_args) call->add(sa);
             return call;
         } else {
+            // x[a, b]: the index is the tuple (a, b), as in Python (dict
+            // keys, numpy-style indices, dict[str, int]) - round 77
+            if(see(TokenType::Comma)){
+                auto tup = make_node<TupleNode>(tok);
+                tup->add(index);
+                while(have(TokenType::Comma) && !see(TokenType::BracketClose)) tup->add(expression());
+                index = tup;
+            }
             mustBe(TokenType::BracketClose);
             return make_node<SubscriptNode>(tok, expr, index);
         }
@@ -1413,6 +1444,14 @@ bool Parser::postfixOther(node_ptr& expr){
 }
 
 node_ptr Parser::primary(){
+    // `...` where an expression starts is the Ellipsis object (`def f(): ...`,
+    // tuple[int, ...], x[..., 0]); between two operands it is the inclusive
+    // range a...b.
+    if(see(TokenType::Ellipsis)) {
+        Token et = token(); next();
+        et.value = "Ellipsis";
+        return make_node<VariableNode>(et);
+    }
     // await expr -> async_await(expr): suspends the current task until the
     // awaitable (coroutine, task, future, sleep, gather, wait_for) is done; a
     // plain value is returned as is. `await` followed by something that cannot
@@ -2196,18 +2235,27 @@ node_ptr Parser::functionDecl(bool is_method){
     std::vector<node_ptr> params;
     if(see(TokenType::ParenOpen)) {
         next(); // consume (
+        param_ann_.clear();
         params = paramList();
         mustBe(TokenType::ParenClose);
-    }
+    } else param_ann_.clear();
     size_t posonly = param_posonly_;   // the body's own functions reset it
-    // `-> T` (a return annotation, parsed and dropped)
-    if(have(TokenType::RightArrow)) ternary();
+    auto fn_ann = std::move(param_ann_);
+    param_ann_.clear();
+    // `-> T`: the return annotation
+    if(have(TokenType::RightArrow)) {
+        int a0 = scanner->current;
+        node_ptr r = ternary();
+        fn_ann.push_back({"return", annotationValue(r, a0, scanner->current)});
+    }
     have(TokenType::Colon);
     outer_decls_.emplace_back();
     global_decls_.emplace_back();
     auto saved_defaults = std::move(param_defaults_);
     yield_seen_.push_back(false);
+    ann_scope_.push_back('f');
     node_ptr body = blockOrStmt();
+    ann_scope_.pop_back();
     bool is_gen = yield_seen_.back();
     yield_seen_.pop_back();
     param_defaults_ = std::move(saved_defaults);
@@ -2221,6 +2269,15 @@ node_ptr Parser::functionDecl(bool is_method){
     for(auto& p : params) fn->add(p);
     static_cast<FunctionNode*>(fn.get())->defaults = std::move(param_defaults_);
     static_cast<FunctionNode*>(fn.get())->posonly = posonly;
+    if(!fn_ann.empty()){
+        // f.__annotations__: {"param": ann, ..., "return": ann}
+        auto m = make_node<MapNode>(tok);
+        for(auto& [k, v] : fn_ann){
+            Token kt = tok; kt.value = k;
+            m->add(make_node<MapEntryNode>(tok, make_node<StringNode>(kt), v));
+        }
+        static_cast<FunctionNode*>(fn.get())->annotations = m;
+    }
     if(is_async) return async_def_desugar(tok, fn, is_gen);
     return fn;
 }
@@ -2284,8 +2341,12 @@ std::vector<node_ptr> Parser::paramList(){
             else if(kw) static_cast<VariableNode*>(pnode.get())->name = "**" + ptok.value;
             else static_cast<VariableNode*>(pnode.get())->name = ptok.value;
             params.push_back(pnode);
-            // `name: T` (an annotation, parsed and dropped)
-            if(have(TokenType::Colon)) ternary();
+            // `name: T`: kept for the function's __annotations__
+            if(have(TokenType::Colon)) {
+                int a0 = scanner->current;
+                node_ptr ann = ternary();
+                param_ann_.push_back({ptok.value, annotationValue(ann, a0, scanner->current)});
+            }
             if(have(TokenType::Assign)) param_defaults_.push_back(expression());
             else param_defaults_.push_back(nullptr);
         };
@@ -2331,11 +2392,25 @@ node_ptr Parser::classDecl(){
     // A base: a name or a dotted one (class C(threading.Thread)); the engines
     // look it up when the class statement runs. `metaclass=M` and other
     // keywords are read and not used.
+    std::vector<std::pair<std::string, node_ptr>> class_kw;
     auto base = [&]() {
         if(see(TokenType::Identifier) && peek().type() == TokenType::Assign){
-            next(); next(); expression();
+            std::string kn = identifier();
+            next();
+            class_kw.push_back({kn, expression()});
             return;
         }
+        // A (dotted) name, or any other expression (Generic[T], a call).
+        int k = 0;
+        bool plain = true;
+        while(true){
+            TokenType tt = peek(k).type();
+            if(tt == TokenType::Comma || tt == TokenType::ParenClose) break;
+            if(k % 2 == 0 ? (tt != TokenType::Identifier && peek(k).clazz() != TokenClass::Keyword)
+                          : tt != TokenType::Dot) { plain = false; break; }
+            k++;
+        }
+        if(!plain){ bases.push_back(expression()); return; }
         Token bt = token();
         std::string bn = identifier();
         while(see(TokenType::Dot) && peek(1).type() == TokenType::Identifier){ next(); bn += "." + identifier(); }
@@ -2359,18 +2434,42 @@ node_ptr Parser::classDecl(){
         bases.push_back(make_node<VariableNode>(token())); next();
         while(have(TokenType::Comma)){ bases.push_back(make_node<VariableNode>(token())); next(); }
     }
-    // Handle colon-based inheritance: class Foo : Bar (only if no extends/inherits)
-    if(bases.empty() && have(TokenType::Colon)){
-        if(see(TokenType::Identifier)){
+    // Handle colon-based inheritance: class Foo : Bar (only if no extends/inherits).
+    // Only when the names are followed by the block (a newline, a brace, or
+    // a second colon ending the line): `class A: x = 1` and `class A: x: int
+    // = 1` are Python one-line bodies (round 77: they read as base `x`).
+    if(bases.empty() && see(TokenType::Colon) && peek(1).type() == TokenType::Identifier){
+        int k = 1;
+        while(peek(k).type() == TokenType::Identifier && peek(k + 1).type() == TokenType::Comma) k += 2;
+        TokenType after = peek(k + 1).type();
+        auto ends = [](TokenType t){ return t == TokenType::NewLine || t == TokenType::Indent || t == TokenType::BraceOpen
+                                            || t == TokenType::End; };
+        bool inherit = peek(k).type() == TokenType::Identifier
+                       && (ends(after) || (after == TokenType::Colon && ends(peek(k + 2).type())));
+        if(inherit){
+            next();
             bases.push_back(make_node<VariableNode>(token())); next();
             while(have(TokenType::Comma)){ bases.push_back(make_node<VariableNode>(token())); next(); }
             have(TokenType::Colon);
         }
     }
     have(TokenType::Colon); // consume : before block
+    ann_scope_.push_back('c');
+    class_ann_used_.push_back(false);
     node_ptr body = blockOrStmt();
+    ann_scope_.pop_back();
+    if(class_ann_used_.back() && body){
+        // the class body starts with `var __annotations__ = {}`
+        auto nb = make_node<BlockNode>(body->token());
+        nb->add(annotationsDecl(tok));
+        if(body->type() == NodeType::BLOCK) for(auto& s : body->statements()) nb->add(s);
+        else nb->add(body);
+        body = nb;
+    }
+    class_ann_used_.pop_back();
     auto cls = make_node<ClassNode>(tok, name, body);
     std::static_pointer_cast<ClassNode>(cls)->bases = bases;
+    std::static_pointer_cast<ClassNode>(cls)->keywords = std::move(class_kw);
     {
         auto* cp = static_cast<ClassNode*>(cls.get());
         cp->has_doc = docstringOf(body, cp->doc);
@@ -2644,6 +2743,20 @@ node_ptr Parser::importStmt(){
         bool quoted = see(TokenType::String);
         std::string mod = dottedName();
         mustBe(TokenType::Import);
+        // `from __future__ import annotations` (PEP 563): annotations are
+        // kept as their source text. The other features are always on.
+        if(mod == "__future__"){
+            bool paren = have(TokenType::ParenOpen);
+            while(true){
+                std::string feat = identifier();
+                if(feat == "annotations") future_annotations_ = true;
+                if(!have(TokenType::Comma)) break;
+                if(paren && see(TokenType::ParenClose)) break;
+            }
+            if(paren) mustBe(TokenType::ParenClose);
+            have(TokenType::SemiColon); have(TokenType::NewLine);
+            return make_node<PassNode>(tok);
+        }
         auto imp = make_node<ImportNode>(tok, mod);
         std::static_pointer_cast<ImportNode>(imp)->quoted = quoted;
         auto& names = std::static_pointer_cast<ImportNode>(imp)->names;
@@ -3207,6 +3320,65 @@ node_ptr Parser::wrap_call(const std::string& helper, node_ptr arg){
     auto call = make_node<CallNode>(t, make_node<VariableNode>(t));
     call->add(arg);
     return call;
+}
+
+// The source text of tokens [from, to), spaced as Python prints an
+// expression (`dict[str, int]`, `int | None`, `Callable[[int], str]`):
+// the string form of an annotation.
+std::string Parser::tokenText(int from, int to){
+    auto quote = [](const std::string& s) {
+        char q = (s.find('\'') != std::string::npos && s.find('"') == std::string::npos) ? '"' : '\'';
+        std::string r(1, q);
+        for(char c : s){
+            if(c == '\\' || c == q) r += '\\';
+            if(c == '\n') { r += "\\n"; continue; }
+            r += c;
+        }
+        return r + q;
+    };
+    std::string out, prev, prev2;
+    for(int i = from; i < to && i < (int)scanner->tokens.size(); i++){
+        const Token& t = scanner->tokens[i];
+        if(t.type() == TokenType::NewLine || t.type() == TokenType::Indent || t.type() == TokenType::Dedent) continue;
+        std::string s = t.type() == TokenType::String ? quote(t.value) : t.value;
+        bool space = false;
+        if(!out.empty()){
+            bool unary = (prev == "-" || prev == "+" || prev == "~")
+                         && (prev2.empty() || prev2 == "(" || prev2 == "[" || prev2 == "," || prev2 == "|");
+            if(prev == ",") space = true;
+            else if(s == "," || s == ")" || s == "]" || s == "." || s == "(" || s == "[") space = false;
+            else if(prev == "(" || prev == "[" || prev == "." || unary) space = false;
+            else space = true;
+        }
+        if(space) out += ' ';
+        out += s;
+        prev2 = prev;
+        prev = s;
+    }
+    return out;
+}
+
+// What __annotations__ holds for an annotation: its source text under
+// `from __future__ import annotations`, else _ny_ann(lambda: T, "T") - the
+// value, or the text when T cannot be evaluated yet (a forward reference,
+// a name from an unimported module), so an annotation never breaks a
+// program that does not read it.
+node_ptr Parser::annotationValue(node_ptr expr, int from, int to){
+    Token t = expr ? expr->token() : token();
+    t.value = tokenText(from, to);
+    auto text = make_node<StringNode>(t);
+    if(future_annotations_ || !expr) return text;
+    Token ht = t; ht.value = "_ny_ann";
+    auto call = make_node<CallNode>(ht, make_node<VariableNode>(ht));
+    Token lt = t; lt.value = "lambda";
+    call->add(make_node<LambdaNode>(lt, expr));
+    call->add(text);
+    return call;
+}
+
+node_ptr Parser::annotationsDecl(const Token& t){
+    Token at = t; at.value = "__annotations__";
+    return make_node<VarDeclNode>(at, "__annotations__", make_node<MapNode>(at));
 }
 
 // `for` or `async for` in a comprehension; sets comp_async_ for the latter.

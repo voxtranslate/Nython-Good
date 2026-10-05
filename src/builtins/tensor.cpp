@@ -371,6 +371,17 @@ Value dispatch_tensor(NythonExecutor& E,
             return E.makeStringValue(line);
         }
         if (name == "isinstance") {
+            // isinstance(x, int | str): any of the union's types (round 77)
+            if (args.size() >= 2 && E.isInstanceValue(args[1]) && E.shownClassName(E.instanceClassName(args[1])) == "_NyUnionType") {
+                Value ua = args[1];
+                for (auto& t : E.listItems(E.attrOf(ua, "__args__"))) {
+                    if (t.type == ValueType::NONE) { if (args[0].type == ValueType::NONE) return Value(true); continue; }
+                    std::vector<Value> one{args[0], t};
+                    Value r = callBuiltin("isinstance", one, ctx);
+                    if (r.type == ValueType::BOOLEAN && r.value.b) return Value(true);
+                }
+                return Value(false);
+            }
             // isinstance(x, (A, B)): any of them.
             if (args.size() >= 2 && args[1].isCollectable() && args[1].value.gc) {
                 auto* tc = dynamic_cast<Container*>(args[1].value.gc);
