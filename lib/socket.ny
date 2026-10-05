@@ -72,22 +72,41 @@ def _addr(a):
     return a
 
 class SocketIO:
-    # sock.makefile(mode): read/readline/readlines/write/flush/close over the
-    # socket, in text ("r", "w", "rw") or binary ("rb", "wb") mode.
+    # sock.makefile(mode): read/read1/readline/readlines/write/flush/close over
+    # the socket, in text ("r", "w", "rw") or binary ("rb", "wb") mode.
+    # Buffered: `buf` from `pos` is what has been received and not yet read,
+    # so a line or a small read costs what it returns, not the buffer's size.
     def __init__(self, sock, mode="r", encoding="utf-8"):
         self.sock = sock
         self.mode = mode
         self.binary = "b" in mode
         self.encoding = encoding
         self.buf = b""
+        self.pos = 0
+        self.eof = false
         self.closed = false
 
     def _fill(self):
+        if self.eof:
+            return false
         var chunk = self.sock.recv(65536)
         if len(chunk) == 0:
+            self.eof = true
             return false
-        self.buf = self.buf + chunk
+        if self.pos >= len(self.buf):
+            self.buf = chunk
+        else:
+            self.buf = self.buf[self.pos:] + chunk
+        self.pos = 0
         return true
+
+    def _take(self, n):
+        var part = self.buf[self.pos:self.pos + n]
+        self.pos = self.pos + len(part)
+        if self.pos >= len(self.buf):
+            self.buf = b""
+            self.pos = 0
+        return part
 
     def _out(self, data):
         if self.binary:
@@ -96,32 +115,51 @@ class SocketIO:
 
     def read(self, n=-1):
         if n is none or n < 0:
-            while self._fill():
-                pass
-            var all = self.buf
-            self.buf = b""
-            return self._out(all)
-        while len(self.buf) < n and self._fill():
-            pass
-        var part = self.buf[0:n]
-        self.buf = self.buf[n:]
-        return self._out(part)
+            var parts = [self._take(len(self.buf))]
+            while not self.eof:
+                var d = self.sock.recv(1048576)
+                if len(d) == 0:
+                    self.eof = true
+                    break
+                parts.append(d)
+            return self._out(b"".join(parts))
+        var parts2 = [self._take(n)]
+        var have = len(parts2[0])
+        while have < n and not self.eof:
+            var d2 = self.sock.recv(min(n - have, 1048576))
+            if len(d2) == 0:
+                self.eof = true
+                break
+            parts2.append(d2)
+            have = have + len(d2)
+        return self._out(b"".join(parts2))
+
+    def read1(self, n=-1):
+        # What is buffered, else one receive.
+        if self.pos >= len(self.buf) and not self._fill():
+            return self._out(b"")
+        if n is none or n < 0:
+            n = len(self.buf)
+        return self._out(self._take(n))
+
+    def peek(self, n=1):
+        if self.pos >= len(self.buf):
+            self._fill()
+        return self.buf[self.pos:]
 
     def readline(self, limit=-1):
+        var scanned = self.pos
         while true:
-            var i = self.buf.find(b"\n")
-            if i >= 0:
-                var line = self.buf[0:i + 1]
-                self.buf = self.buf[i + 1:]
-                return self._out(line)
-            if limit >= 0 and len(self.buf) >= limit:
-                var cut = self.buf[0:limit]
-                self.buf = self.buf[limit:]
-                return self._out(cut)
+            var i = self.buf.find(b"\n", scanned)
+            if i >= 0 and (limit < 0 or i + 1 - self.pos <= limit):
+                return self._out(self._take(i + 1 - self.pos))
+            if limit >= 0 and len(self.buf) - self.pos >= limit:
+                return self._out(self._take(limit))
+            scanned = len(self.buf)
+            var before = self.pos
             if not self._fill():
-                var rest = self.buf
-                self.buf = b""
-                return self._out(rest)
+                return self._out(self._take(len(self.buf)))
+            scanned = scanned - before
 
     def readlines(self):
         var out = []
@@ -134,14 +172,27 @@ class SocketIO:
     def __iter__(self):
         return iter(self.readlines())
 
+    def readable(self):
+        return "r" in self.mode
+
+    def writable(self):
+        return "w" in self.mode
+
     def write(self, data):
         if isinstance(data, "str"):
             data = data.encode(self.encoding)
         self.sock.sendall(data)
         return len(data)
 
+    def writelines(self, lines):
+        for l in lines:
+            self.write(l)
+
     def flush(self):
         pass
+
+    def fileno(self):
+        return self.sock.fileno()
 
     def close(self):
         self.closed = true
@@ -312,9 +363,7 @@ def create_connection(address, timeout=none, source_address=none):
             if source_address is not none:
                 s.bind(source_address)
             s.connect(ai[4])
-            if timeout is not none:
-                s.settimeout(none)
-            return s
+            return s        # the timeout stays: it applies to every operation, as in Python
         except OSError as e:
             last = e
             if s is not none:

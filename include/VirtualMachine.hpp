@@ -2916,31 +2916,34 @@ public:
                     if(vm->stack_.size()>base) vm->stack_.resize(base);
                 }
             } pop_module{this, base};
+            // An uncaught exception is reported here, before PopModule waits
+            // for the program's threads (as Python prints the traceback first).
             try { run_loop(); } catch(VMReturn&) {}
+            catch(std::exception& e) { return report_uncaught(e.what(), false); }
+            catch(std::string& m) { return report_uncaught(m, true); }
             // Generators the program left paused: closed now, so their
             // finally blocks run (the interpreter does the same).
             gen_close_all();
             return VMResult::SUCCESS;
         } catch(std::exception& e) {
-            if(std::string(e.what()).rfind("KeyboardInterrupt",0)==0){
-                // as Python: the bare name, and the exit status of SIGINT (main.cpp)
-                std::cerr<<"KeyboardInterrupt\n";
-                keyboard_interrupted()=true;
-                return VMResult::RUNTIME_ERROR;
-            }
-            std::cerr<<"\x1b[31m[VMError] "<<e.what()<<"\x1b[0m\n";
-            return VMResult::RUNTIME_ERROR;
+            return report_uncaught(e.what(), false);
         } catch(std::string& m) {
-            std::string type, msg;
-            if(nython::ny_split_exc_message(m,type,msg)&&type=="KeyboardInterrupt"){
-                std::cerr<<"KeyboardInterrupt\n";
-                keyboard_interrupted()=true;
-                return VMResult::RUNTIME_ERROR;
-            }
-            if(nython::ny_split_exc_message(m,type,msg)) std::cerr<<"\x1b[31m[VMError] "<<type<<": "<<msg<<"\x1b[0m\n";
-            else std::cerr<<"\x1b[31m[VMError] "<<m<<"\x1b[0m\n";
+            return report_uncaught(m, true);
+        }
+    }
+
+    VMResult report_uncaught(const std::string& m, bool tagged) {
+        std::string type, msg;
+        bool split=tagged&&nython::ny_split_exc_message(m,type,msg);
+        if((split&&type=="KeyboardInterrupt")||(!tagged&&m.rfind("KeyboardInterrupt",0)==0)){
+            // as Python: the bare name, and the exit status of SIGINT (main.cpp)
+            std::cerr<<"KeyboardInterrupt\n";
+            keyboard_interrupted()=true;
             return VMResult::RUNTIME_ERROR;
         }
+        if(split) std::cerr<<"\x1b[31m[VMError] "<<type<<": "<<msg<<"\x1b[0m\n";
+        else std::cerr<<"\x1b[31m[VMError] "<<m<<"\x1b[0m\n";
+        return VMResult::RUNTIME_ERROR;
     }
 
     // The Nython prelude (include/NyPrelude.hpp) - the same text the
@@ -2978,8 +2981,10 @@ public:
             VMVal kw=VMVal::make_none();
             if(!args.empty()&&args.back().type==VMType::MAP&&args.back().map&&args.size()>=1){
                 bool all_kw=true;
-                for(auto& kv:*args.back().map) if(kv.first!="mode"&&kv.first!="encoding"&&kv.first!="file"&&kv.first!="path") all_kw=false;
-                if(all_kw&&!args.back().map->empty()){ kw=args.back(); args.pop_back(); }
+                for(auto& kv:*args.back().map)
+                    if(kv.first!="mode"&&kv.first!="encoding"&&kv.first!="file"&&kv.first!="path"&&kv.first!="errors"
+                       &&kv.first!="newline"&&kv.first!="buffering") all_kw=false;
+                if((all_kw||args.back().class_name=="__kwargs__")&&!args.back().map->empty()){ kw=args.back(); args.pop_back(); }
             }
             auto kwget=[&](const char* k)->VMVal{
                 if(kw.type==VMType::MAP&&kw.map&&kw.map->count(k)) return (*kw.map)[k];
@@ -2995,7 +3000,11 @@ public:
             auto cit=class_reg_.find("NythonFile");
             if(cit==class_reg_.end()) return h;
             VMVal cls=VMVal::make_class(cit->second,"NythonFile");
-            std::vector<VMVal> ca={path,mode,h};
+            VMVal enc=args.size()>2?args[2]:kwget("encoding");
+            if(enc.type==VMType::NONE) enc=VMVal::make_str("utf-8");
+            if(mode.type==VMType::STRING&&mode.s.find('b')!=std::string::npos&&enc.type==VMType::STRING&&enc.s!="utf-8")
+                raise_native_exception("ValueError","binary mode doesn't take an encoding argument");
+            std::vector<VMVal> ca={path,mode,h,enc};
             return vm_call(cls,ca,std::nullopt);
         });
     }
@@ -3060,7 +3069,7 @@ public:
     [[noreturn]] void raise_native_exception(const std::string& type, const std::string& msg) {
         auto attrs=std::make_shared<VMMap>(); vmgc::track_map(attrs);
         (*attrs)["msg"]=VMVal::make_str(msg);
-        (*attrs)["args"]=VMVal::make_list(std::vector<VMVal>{VMVal::make_str(msg)});
+        (*attrs)["args"]=VMVal::make_tuple(std::vector<VMVal>{VMVal::make_str(msg)});
         last_exception_obj_=VMVal::make_instance(type.empty()?std::string("Exception"):type, attrs);
         throw std::runtime_error((type.empty()?std::string("Exception"):type)+": "+msg);
     }
@@ -4031,7 +4040,7 @@ private:
         // __init__ does (Python's BaseException.__new__); a class that calls
         // super().__init__(...) replaces them there.
         if(vm_exc_classes().count(cls.class_name)){
-            (*attrs)["args"]=VMVal::make_list(args);
+            (*attrs)["args"]=VMVal::make_tuple(args);
             (*attrs)["msg"]=VMVal::make_str(args.size()==1?args[0].to_string():std::string());
             if(class_derives(cls.class_name,"StopIteration")) (*attrs)["value"]=args.empty()?VMVal::make_none():args[0];
         }
@@ -4480,6 +4489,12 @@ private:
             }
             case Op::MAKE_CLASS: {
                 auto sub=fr.code->sub_codes[ins.arg];
+                // Bases are looked up in scope (NythonExecutor::evalClassDecl)
+                for(auto& b:sub->bases){
+                    std::string rn=exc_class_name(b);
+                    if(rn!=b && (class_reg_.count(rn) || nython::ny_is_builtin_exc(rn))) b=rn;
+                }
+                if(!sub->bases.empty()) sub->parent_class=sub->bases[0];
                 class_reg_[sub->name]=sub;
                 mro_cache_.clear();
                 has_del_cache_.clear();
@@ -4988,7 +5003,7 @@ private:
         std::string msg = args.size()==1 ? args[0].to_string() : std::string();
         // StopIteration.value: a generator's return value (both engines).
         if(class_derives(type,"StopIteration")) (*attrs)["value"]=args.empty()?VMVal::make_none():args[0];
-        (*attrs)["args"]=VMVal::make_list(std::move(args));
+        (*attrs)["args"]=VMVal::make_tuple(std::move(args));
         (*attrs)["msg"]=VMVal::make_str(msg);
         return VMVal::make_instance(type, attrs);
     }
@@ -5875,7 +5890,16 @@ private:
                 else out=m;   // a method read from the class is the plain function
                 return true;
             }
-            if(attr=="__name__"){ out=VMVal::make_str(cname); return true; }
+            // A module's class is "module.Class" (round 77): __name__ is the
+            // class's own name, __module__ the module's.
+            if(attr=="__name__"||attr=="__qualname__"){
+                size_t dot=cname.rfind('.');
+                out=VMVal::make_str(dot==std::string::npos?cname:cname.substr(dot+1)); return true;
+            }
+            if(attr=="__module__"){
+                size_t dot=cname.rfind('.');
+                out=VMVal::make_str(dot==std::string::npos?std::string("__main__"):cname.substr(0,dot)); return true;
+            }
             if(attr=="__mro__"){
                 std::vector<VMVal> r;
                 for(auto& c:*class_mro(cname)){ VMVal cv=class_value(c); if(cv.type!=VMType::NONE) r.push_back(cv); }
@@ -6460,7 +6484,7 @@ private:
                 // super().__init__(...) reaching a builtin exception class
                 // sets the exception's args; reaching object, nothing.
                 if(self_v.type==VMType::INSTANCE && self_v.map && is_exception_class(mro_of)){
-                    (*self_v.map)["args"]=VMVal::make_list(args);
+                    (*self_v.map)["args"]=VMVal::make_tuple(args);
                     (*self_v.map)["msg"]=VMVal::make_str(args.size()==1?args[0].to_string():std::string());
                     if(class_derives(self_v.class_name,"StopIteration")) (*self_v.map)["value"]=args.empty()?VMVal::make_none():args[0];
                 }
@@ -6564,7 +6588,7 @@ private:
             if(is_ctor_name(method) && !args.empty() && args[0].type==VMType::INSTANCE && args[0].map
                && is_exception_class(obj.class_name)){
                 std::vector<VMVal> rest(args.begin()+1,args.end());
-                (*args[0].map)["args"]=VMVal::make_list(rest);
+                (*args[0].map)["args"]=VMVal::make_tuple(rest);
                 (*args[0].map)["msg"]=VMVal::make_str(rest.size()==1?rest[0].to_string():std::string());
                 return VMVal::make_none();
             }
@@ -6919,8 +6943,97 @@ private:
     // (VMCode::module_env), and the importer binds only its namespace - the
     // module scope as it was when the module finished - or the names asked
     // for. A quoted import still includes the file (export_to_globals_).
+    // ── packages (round 77; NythonExecutor's findModulePath/importDotted)
+    std::vector<std::string> module_dirs() {
+        std::vector<std::string> dirs;
+        if(!script_dir_.empty()){ dirs.push_back(script_dir_); dirs.push_back(script_dir_+"lib/"); }
+        for(const char* d:{"","./","lib/","./lib/"}) dirs.push_back(d);
+        dirs.push_back(cwd_+"/"); dirs.push_back(cwd_+"/lib/");
+        std::string d=script_dir_;
+#ifndef _WIN32
+        char rb[4096];
+        if(!d.empty() && realpath(d.c_str(),rb)) d=std::string(rb)+"/";
+#endif
+        for(int up=0;up<4;++up){
+            while(d.size()>1&&(d.back()=='/'||d.back()=='\\')) d.pop_back();
+            size_t cut=d.find_last_of("/\\");
+            if(cut==std::string::npos) break;
+            d=d.substr(0,cut+1);
+            dirs.push_back(d); dirs.push_back(d+"lib/");
+        }
+        for(auto& ld:nyrt::library_dirs()) dirs.push_back(ld);
+        return dirs;
+    }
+    std::string find_module_path(const std::string& dotted, bool* is_dir=nullptr) {
+        std::string rel=dotted;
+        std::replace(rel.begin(),rel.end(),'.','/');
+        struct stat st;
+        auto dirs=module_dirs();
+        for(auto& d:dirs){
+            if(::stat((d+rel+".ny").c_str(),&st)==0 && !S_ISDIR(st.st_mode)) return d+rel+".ny";
+            if(::stat((d+rel+"/__init__.ny").c_str(),&st)==0) return d+rel+"/__init__.ny";
+        }
+        if(is_dir) for(auto& d:dirs){
+            std::string p=d.empty()?rel:d+rel;
+            if(::stat(p.c_str(),&st)==0 && S_ISDIR(st.st_mode)){ *is_dir=true; return p; }
+        }
+        return std::string();
+    }
+    bool is_package_name(const std::string& name) {
+        bool dir=false;
+        std::string p=find_module_path(name,&dir);
+        return dir || (p.size()>12 && p.compare(p.size()-12,12,"/__init__.ny")==0);
+    }
+    VMVal load_module(const std::string& dotted) {
+        auto it=module_ns_.find(dotted);
+        if(it!=module_ns_.end()) return it->second;
+        bool dir=false;
+        std::string path=find_module_path(dotted,&dir);
+        if(path.empty()) throw_exception(make_exception("ModuleNotFoundError",{VMVal::make_str("No module named '"+dotted+"'")}));
+        if(dir){
+            auto nsmap=std::make_shared<VMMap>(); vmgc::track_map(nsmap);
+            (*nsmap)["__name__"]=VMVal::make_str(dotted);
+            VMVal nsv=VMVal::make_map(); nsv.map=nsmap; nsv.class_name=dotted;
+            module_ns_[dotted]=nsv;
+            return nsv;
+        }
+        return load_module_file(path, dotted);
+    }
+    void import_dotted(const std::string& name, const std::string& alias, const std::vector<std::string>& from_names, bool explicit_alias) {
+        std::vector<std::string> parts;
+        size_t a=0;
+        while(a<=name.size()){
+            size_t b=name.find('.',a);
+            if(b==std::string::npos) b=name.size();
+            parts.push_back(name.substr(a,b-a));
+            a=b+1;
+        }
+        VMVal first, prev;
+        std::string prefix;
+        for(size_t i=0;i<parts.size();i++){
+            prefix=i?prefix+"."+parts[i]:parts[i];
+            VMVal ns=load_module(prefix);
+            if(i==0) first=ns;
+            else if(prev.type==VMType::MAP&&prev.map) (*prev.map)[parts[i]]=ns;
+            prev=ns;
+        }
+        if(!from_names.empty()){
+            for(auto& n:from_names){
+                if(n=="*"||!prev.map||prev.map->count(n)) continue;
+                bool dir=false;
+                if(!find_module_path(name+"."+n,&dir).empty()) (*prev.map)[n]=load_module(name+"."+n);
+            }
+            bind_from_namespace(prev, from_names, name);
+        } else if(explicit_alias) define_var(alias, prev);
+        else define_var(parts[0], first);
+    }
     void import_module(const std::string& filepath, const std::string& name, const std::string& bind_as,
                        const std::vector<std::string>& from_names) {
+        VMVal nsv=load_module_file(filepath, name);
+        if(!from_names.empty()) bind_from_namespace(nsv, from_names, name);
+        else if(!bind_as.empty()) define_var(bind_as, nsv);
+    }
+    VMVal load_module_file(const std::string& filepath, const std::string& name) {
         auto source=nython::reader::SourceCode(filepath);
         auto reporter=std::make_shared<nython::exception::Reporter>(source);
         auto lx=std::make_shared<nython::lexer::Lexer>(source);
@@ -6949,8 +7062,7 @@ private:
         catch(...){ module_ns_.erase(name); globals_.erase("__imported_"+name); throw; }
         for(auto& kv:*env) (*nsmap)[kv.first]=kv.second;
         for(auto& sub:code->sub_codes) if(sub->is_class) class_reg_[sub->name]=sub;
-        if(!from_names.empty()) bind_from_namespace(nsv, from_names, name);
-        else if(!bind_as.empty()) define_var(bind_as, nsv);
+        return nsv;
     }
     void vm_import(const std::string& raw_name_in) {
         std::string tried_paths;
@@ -6993,6 +7105,23 @@ private:
         {
             // a module runs once: a later import (named or aliased) binds the
             // namespace its first import made
+            // a.b.c, and packages (directories of modules), before the
+            // builtin module names (lib/http/ is a package)
+            if(bare && (name.find('.')!=std::string::npos || is_package_name(name))){
+                bool explicit_alias=raw_name_in.find('\x01')!=std::string::npos;
+                import_dotted(name, alias, from_names, explicit_alias);
+                return;
+            }
+            // `import threading` binds Python's threading module (lib/threading.ny)
+            if(name=="threading" && bare){
+                std::string p=find_module_path("threading");
+                if(!p.empty()){
+                    VMVal nsv=module_ns_.count("threading")?module_ns_["threading"]:load_module_file(p,"threading");
+                    if(!from_names.empty()) bind_from_namespace(nsv, from_names, "threading");
+                    else define_var(alias.empty()?std::string("threading"):alias, nsv);
+                    return;
+                }
+            }
             auto mc=module_ns_.find(name);
             if(bare && mc!=module_ns_.end()){
                 if(!from_names.empty()) bind_from_namespace(mc->second, from_names, name);
@@ -7330,7 +7459,7 @@ private:
                     // (a bare runtime_error only reaches untyped handlers).
                     auto attrs = std::make_shared<VMMap>(); vmgc::track_map(attrs);
                     (*attrs)["msg"] = VMVal::make_str(e.msg);
-                    (*attrs)["args"] = VMVal::make_list({VMVal::make_str(e.msg)});
+                    (*attrs)["args"] = VMVal::make_tuple({VMVal::make_str(e.msg)});
                     last_exception_obj_ = VMVal::make_instance(e.type, attrs);
                     throw std::runtime_error(e.type + ": " + e.msg);
                 }
@@ -8317,13 +8446,14 @@ private:
             const VMVal& v=a[0];
             const VMVal* bv=a.size()>=2?&a[1]:kwarg(kw,"base");
             if(bv){
-                if(v.type!=VMType::STRING) vm->raise_native_exception("TypeError","int() can't convert non-string with explicit base");
+                if(v.type!=VMType::STRING&&v.type!=VMType::BYTES) vm->raise_native_exception("TypeError","int() can't convert non-string with explicit base");
                 nypy::NumV b=as_int(*bv);
                 int base=(int)b.i;
                 if(b.k!=1||(base!=0&&(base<2||base>36))) vm->raise_native_exception("ValueError","int() base must be >= 2 and <= 36, or 0");
                 nypy::BigInt out;
-                if(!nypy::parse_int_str(v.s,base,out))
-                    vm->raise_native_exception("ValueError","invalid literal for int() with base "+std::to_string(base)+": "+nypy::str_repr(v.s));
+                const std::string& txt=v.type==VMType::BYTES?v.bdata():v.s;
+                if(!nypy::parse_int_str(txt,base,out))
+                    vm->raise_native_exception("ValueError","invalid literal for int() with base "+std::to_string(base)+": "+(v.type==VMType::BYTES?v.to_string():nypy::str_repr(v.s)));
                 return VMVal::make_bigint(out);
             }
             switch(v.type){

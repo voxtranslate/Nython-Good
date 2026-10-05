@@ -86,12 +86,8 @@ std::time_t timegm_portable(std::tm* tm) {
 // strftime with a growing buffer (it used a fixed 64-byte buffer and ignored
 // the return value, so a long result came back as garbage bytes) and "%f"
 // for microseconds.
-std::string format_time(const std::string& fmt_in, double ts, bool utc) {
-    std::tm tm{};
-    if (!to_tm(ts, utc, tm)) raise("OverflowError", "timestamp out of range for platform time_t");
+std::string format_tm(const std::string& fmt_in, const std::tm& tm, long us) {
     std::string fmt;
-    long us = (long)std::llround((ts - std::floor(ts)) * 1e6);
-    if (us >= 1000000) us = 999999;
     for (size_t i = 0; i < fmt_in.size(); i++) {
         if (fmt_in[i] == '%' && i + 1 < fmt_in.size()) {
             if (fmt_in[i + 1] == 'f') {
@@ -115,6 +111,14 @@ std::string format_time(const std::string& fmt_in, double ts, bool utc) {
     return "";
 }
 
+std::string format_time(const std::string& fmt_in, double ts, bool utc) {
+    std::tm tm{};
+    if (!to_tm(ts, utc, tm)) raise("OverflowError", "timestamp out of range for platform time_t");
+    long us = (long)std::llround((ts - std::floor(ts)) * 1e6);
+    if (us >= 1000000) us = 999999;
+    return format_tm(fmt_in, tm, us);
+}
+
 Value tm_map(NythonExecutor& E, const std::tm& tm, double ts) {
     return nyos::make_map(E, {
         {"year",    Value(tm.tm_year + 1900)},
@@ -132,6 +136,7 @@ Value tm_map(NythonExecutor& E, const std::tm& tm, double ts) {
 
 std::tm map_tm(NythonExecutor& E, const Value& m) {
     std::tm tm{};
+    bool wd = false, yd = false;
     tm.tm_isdst = -1;
     tm.tm_mday = 1;
     for (auto& kv : nyos::map_items(m)) {
@@ -143,6 +148,17 @@ std::tm map_tm(NythonExecutor& E, const Value& m) {
         else if (kv.first == "minute") tm.tm_min = (int)v;
         else if (kv.first == "second") tm.tm_sec = (int)v;
         else if (kv.first == "isdst") tm.tm_isdst = (int)v;
+        else if (kv.first == "weekday") { tm.tm_wday = (int)((v + 1) % 7); wd = true; }    // Monday == 0
+        else if (kv.first == "yearday") { tm.tm_yday = (int)v - 1; yd = true; }
+    }
+    if (!wd || !yd) {
+        // %a %A %j %U... need the weekday and the day of the year: derive them
+        // from the date (the calendar's, whatever the time zone).
+        std::tm c = tm;
+        c.tm_hour = 12; c.tm_min = 0; c.tm_sec = 0; c.tm_isdst = 0;
+        std::time_t t = timegm_portable(&c);
+        std::tm d{};
+        if (to_tm((double)t, true, d)) { if (!wd) tm.tm_wday = d.tm_wday; if (!yd) tm.tm_yday = d.tm_yday; }
     }
     (void)E;
     return tm;
@@ -389,6 +405,11 @@ Value dispatch_os_time(NythonExecutor& E,
         // timestamp argument used to be ignored.
         Args A(E, args, {"fmt", "ts", "utc"});
         std::string fmt = A.str(0, "fmt", "%Y-%m-%d %H:%M:%S");
+        // time_strftime(fmt, time_gmtime(t)): the broken-down time itself.
+        if (A.has(1, "ts") && is_map(A.get(1, "ts"))) {
+            std::tm tm = map_tm(E, A.get(1, "ts"));
+            return Str(format_tm(fmt, tm, 0));
+        }
         double ts = A.has(1, "ts") ? A.num(1, "ts", now_seconds()) : now_seconds();
         return Str(format_time(fmt, ts, A.flag(2, "utc", false)));
     }

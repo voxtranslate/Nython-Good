@@ -20,11 +20,13 @@ namespace nyrt {
 inline const char* prelude_source() {
     return R"NYPRELUDE(
 class NythonFile:
-    def __init__(self, path, mode, handle):
+    def __init__(self, path, mode, handle, encoding="utf-8"):
         self.name = path
         self.mode = mode
         self.handle = handle
         self.closed = false
+        self.binary = "b" in mode
+        self.encoding = none if self.binary else encoding
 
     def _check(self):
         if self.closed:
@@ -32,32 +34,57 @@ class NythonFile:
 
     def read(self, size=-1):
         self._check()
+        if size is none:
+            size = -1
+        if self.binary:
+            return file_read_bytes(self.handle, size)
         return file_read(self.handle, size)
 
-    def readline(self):
+    def readline(self, size=-1):
         self._check()
+        if self.binary:
+            return file_readline_bytes(self.handle, size)
         return file_readline(self.handle, true)
 
-    def readlines(self):
+    def readlines(self, hint=-1):
         self._check()
         var out = []
-        var line = file_readline(self.handle, true)
-        while line != "":
+        var line = self.readline()
+        while len(line) > 0:
             out.append(line)
-            line = file_readline(self.handle, true)
+            line = self.readline()
         return out
 
     def write(self, data):
         self._check()
-        return file_write(self.handle, str(data))
+        if self.binary:
+            if not (isinstance(data, "bytes") or isinstance(data, "bytearray")):
+                raise TypeError("a bytes-like object is required, not '" + data.type_name() + "'")
+            return file_write(self.handle, data)
+        if isinstance(data, "bytes") or isinstance(data, "bytearray"):
+            raise TypeError("write() argument must be str, not " + data.type_name())
+        var text = str(data)
+        file_write(self.handle, text)
+        return len(text)
 
     def writelines(self, lines):
         self._check()
-        var i = 0
-        while i < len(lines):
-            file_write(self.handle, str(lines[i]))
-            i = i + 1
+        for line in lines:
+            self.write(line)
         return none
+
+    def readable(self):
+        return "r" in self.mode or "+" in self.mode
+
+    def writable(self):
+        return "w" in self.mode or "a" in self.mode or "x" in self.mode or "+" in self.mode
+
+    def seekable(self):
+        return true
+
+    def truncate(self, size=none):
+        self._check()
+        return file_truncate(self.handle, size)
 
     def seek(self, offset, whence=0):
         self._check()
@@ -93,7 +120,7 @@ class NythonFile:
 
     def __next__(self):
         var line = self.readline()
-        if line == "":
+        if len(line) == 0:
             raise StopIteration("end of file")
         return line
 
@@ -112,8 +139,10 @@ class NythonFile:
     def __str__(self):
         return "<file '" + self.name + "' mode '" + self.mode + "'>"
 
-def open(path, mode="r", encoding="utf-8"):
-    return NythonFile(path, mode, file_open_or_raise(path, mode))
+def open(path, mode="r", encoding="utf-8", errors=none, newline=none, buffering=-1):
+    if "b" in mode and encoding != "utf-8" and encoding is not none:
+        raise ValueError("binary mode doesn't take an encoding argument")
+    return NythonFile(path, mode, file_open_or_raise(path, mode), encoding if encoding is not none else "utf-8")
 
 class _NyAsyncCM:
     def __init__(self, m):

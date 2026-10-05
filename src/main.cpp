@@ -114,6 +114,26 @@ static void report_uncaught_where(const std::string& msg) {
     if (!where.empty()) std::cerr << "  at " << where << "\n";
 }
 
+// An uncaught Nython exception (a tagged std::string): reported; the exit status.
+static int report_uncaught_string(const std::string& s) {
+    std::string msg = s;
+    if (msg.rfind("__exc__:", 0) == 0) {
+        msg = msg.substr(8);
+        auto colon = msg.find(':');
+        if (colon != std::string::npos)
+            msg = msg.substr(0, colon) + ": " + msg.substr(colon + 1);
+    }
+    if (msg.rfind("KeyboardInterrupt", 0) == 0) {
+        // As Python: the bare name, and the status of a process ended by SIGINT.
+        NythonExecutor::traceException(msg);
+        std::cerr << "KeyboardInterrupt\n";
+        return 130;
+    }
+    std::cerr << "[Nython] Uncaught exception — " << msg << "\n";
+    report_uncaught_where(msg);
+    return 1;
+}
+
 int run_file(const std::string& filename, bool show_ast = false) {
     struct stat buf;
     if (stat(filename.c_str(), &buf) != 0) {
@@ -176,7 +196,15 @@ int run_file(const std::string& filename, bool show_ast = false) {
                 if (v > 0) T.max_events = v;
             }
         }
-        exec.execute(ast);
+        try {
+            exec.execute(ast);
+        } catch (std::string& s) {
+            // Reported before the program's threads are waited for, as
+            // Python prints the traceback first.
+            int rc = report_uncaught_string(s);
+            nyconc::join_nondaemon_at_exit();
+            return rc;
+        }
         // Generators the program left suspended are closed now, oldest
         // first, so their finally blocks and __exit__ run (as when CPython
         // shuts down).
@@ -196,22 +224,7 @@ int run_file(const std::string& filename, bool show_ast = false) {
         // Nython raises uncaught exceptions as tagged std::string. Without this
         // handler they escaped main() and the process died via std::terminate
         // ("terminate called after throwing an instance of std::string").
-        std::string msg = s;
-        if (msg.rfind("__exc__:", 0) == 0) {
-            msg = msg.substr(8);
-            auto colon = msg.find(':');
-            if (colon != std::string::npos)
-                msg = msg.substr(0, colon) + ": " + msg.substr(colon + 1);
-        }
-        if (msg.rfind("KeyboardInterrupt", 0) == 0) {
-            // As Python: the bare name, and the status of a process ended by SIGINT.
-            NythonExecutor::traceException(msg);
-            std::cerr << "KeyboardInterrupt\n";
-            return 130;
-        }
-        std::cerr << "[Nython] Uncaught exception — " << msg << "\n";
-        report_uncaught_where(msg);
-        return 1;
+        return report_uncaught_string(s);
     } catch (std::runtime_error& e) {
         if (std::string(e.what()).rfind("KeyboardInterrupt", 0) == 0) { std::cerr << "KeyboardInterrupt\n"; return 130; }
         std::cerr << "runtime error: " << e.what() << "\n";

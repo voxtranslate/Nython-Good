@@ -159,6 +159,7 @@
         <Unit filename="src/builtins/nytensor.cpp" />
         <Unit filename="src/builtins/threading.cpp" />
         <Unit filename="src/builtins/tls.cpp" />
+        <Unit filename="src/builtins/hashing.cpp" />
         <Unit filename="src/builtins/text.cpp" />
         <Unit filename="src/builtins/os_time.cpp" />
         <Unit filename="src/builtins/os_proc.cpp" />

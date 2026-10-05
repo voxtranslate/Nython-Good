@@ -221,15 +221,10 @@ Value dispatch_data(NythonExecutor& E,
         // ===================== CRYPTO/HASH MODULE =====================
     // ── from main.cpp lines 8519–8658 ──────────────────────────────────────────
         if (name == "hash_sha256" || name == "hash_md5") {
-            // Simple hash using std::hash (not cryptographic, but functional)
+            // The real digests, as hex (they returned std::hash's 16 hex digits)
             if (args.size() >= 1) {
-                std::string input = getStringValue(args[0]);
-                std::hash<std::string> hasher;
-                size_t h = hasher(input);
-                // Generate pseudo-hash string
-                char buf[32];
-                snprintf(buf, sizeof(buf), "%016lx", (unsigned long)h);
-                return makeStringValue(std::string(buf));
+                std::string input = E.bytesOf(args[0]) ? E.bytesOf(args[0])->s : getStringValue(args[0]);
+                return makeStringValue(name == "hash_sha256" ? ny_crypto::sha256(input) : ny_crypto::md5(input));
             }
             return makeStringValue("");
         }

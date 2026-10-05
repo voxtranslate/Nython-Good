@@ -2166,10 +2166,24 @@ node_ptr Parser::classDecl(){
     // Optional bases: class Foo(Bar, Baz) or class Foo extends Bar
     // Supports: extends, inherits, and parenthesized syntax
     std::vector<node_ptr> bases;
+    // A base: a name or a dotted one (class C(threading.Thread)); the engines
+    // look it up when the class statement runs. `metaclass=M` and other
+    // keywords are read and not used.
+    auto base = [&]() {
+        if(see(TokenType::Identifier) && peek().type() == TokenType::Assign){
+            next(); next(); expression();
+            return;
+        }
+        Token bt = token();
+        std::string bn = identifier();
+        while(see(TokenType::Dot) && peek(1).type() == TokenType::Identifier){ next(); bn += "." + identifier(); }
+        bt.value = bn;
+        bases.push_back(make_node<VariableNode>(bt));
+    };
     if(have(TokenType::ParenOpen)){
         if(!see(TokenType::ParenClose)){
-            bases.push_back(make_node<VariableNode>(token())); next();
-            while(have(TokenType::Comma)){ bases.push_back(make_node<VariableNode>(token())); next(); }
+            base();
+            while(have(TokenType::Comma) && !see(TokenType::ParenClose)) base();
         }
         mustBe(TokenType::ParenClose);
     } else if(have(TokenType::Extends) || have(TokenType::Inherits)) {

@@ -228,6 +228,8 @@ Value dispatch_audio    (NythonExecutor& E, const std::string& name, std::vector
 Value dispatch_string   (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_io       (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_network  (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
+Value dispatch_hash     (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
+std::vector<std::string> hash_builtin_names();
 Value dispatch_math     (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_os       (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_data     (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
@@ -551,6 +553,7 @@ public:   // NythonExecutor is a struct: members default to public
             "cos_sim","cosine_similarity","cross_entropy_loss","ctc_loss","device_info","dns_resolve","dropout","elu",
             "embedding","embedding_lookup","env_get","eprint","exec_cmd","exp","fclose","fft_magnitude",
             "file_append","file_close","file_copy","file_delete","file_open","file_read","file_readline","file_readlines",
+            "file_read_bytes","file_readline_bytes","file_truncate",
             "file_rename","file_size","file_mtime","fuzzy_score","fuzzy_positions","fuzzy_rank","file_write","file_writelines","flush","fprint","fread","freadline",
             "fs_mkdirs","fs_stat","fs_walk","function","fwrite","gelu","getcwd","getenv",
             "gethostbyname","hash_md5","hash_sha256","hex_decode","hex_encode","html_strip","htonl","htons",
@@ -649,6 +652,7 @@ public:   // NythonExecutor is a struct: members default to public
         // The socket and TLS layers (round 77): the VM reaches them through the bridge.
         for (auto& name : net_builtin_names()) registerBuiltin(name);
         for (auto& name : tls_builtin_names()) registerBuiltin(name);
+        for (auto& name : hash_builtin_names()) registerBuiltin(name);
         // Exception types
         std::vector<std::string> exc_types = {
             "Exception","BaseException","Error",
@@ -1708,7 +1712,7 @@ public:   // NythonExecutor is a struct: members default to public
     // "__kwargs__"), beyond the fixed list in evalCall: the round 77 natives
     // (network, signals, codecs) by prefix.
     static bool isKwmapBuiltin(const std::string& n) {
-        static const char* pre[] = {"_net_", "_sig_", "_ws_", "_tls_", "_http_", "_struct_", "_codec_", "_cli_"};
+        static const char* pre[] = {"_net_", "_sig_", "_ws_", "_tls_", "_http_", "_struct_", "_codec_", "_cli_", "_hash_"};
         for (const char* p : pre) if (n.rfind(p, 0) == 0) return true;
         size_t dot = n.find('.');
         return dot != std::string::npos && nypy::type_kind(n.substr(0, dot)) != nypy::MemberKind::Other;
@@ -4684,6 +4688,31 @@ public:   // NythonExecutor is a struct: members default to public
                 return callMethod(target, "__call__", args, ctx, kw_in);
             return callFunctionValue(target, args, ctx);
         }
+        // BaseException's own methods called through a class, as subclasses
+        // do: `ConnectionResetError.__init__(self, msg)`, `Exception.__str__(e)`.
+        if (!args.empty() && isInstanceValue(args[0]) && obj.type == ValueType::USERDATA &&
+            (method_name == "__init__" || method_name == "__str__" || method_name == "__repr__")) {
+            std::string t = fnTag(func_names, obj.value.p);
+            if (t.rfind("__class__:", 0) == 0) {
+                std::string cn = t.substr(10);
+                size_t tag = cn.find("__");
+                if (tag != std::string::npos && tag > 0) cn = cn.substr(0, tag);
+                if (classDerivesFrom(cn, "BaseException")) {
+                    if (method_name == "__init__") {
+                        std::vector<Value> rest(args.begin() + 1, args.end());
+                        setExceptionArgs(args[0], rest);
+                        return NONE_VALUE;
+                    }
+                    if (method_name == "__str__") return makeStringValue(exceptionMessage(args[0]));
+                    std::vector<Value> items;
+                    auto pit = instance_properties.find(args[0].value.p);
+                    if (pit != instance_properties.end()) items = listItems(pit->second->getByName("args"));
+                    std::string r = instanceClassName(args[0]) + "(";
+                    for (size_t i = 0; i < items.size(); i++) r += (i ? ", " : "") + reprOf(items[i], ctx);
+                    return makeStringValue(r + ")");
+                }
+            }
+        }
         // Any other value without such a method raises too: `none.m()` and
         // `"s".nosuch()` returned none (round 75). `x?.m()` is the graceful
         // spelling.
@@ -4699,6 +4728,19 @@ public:   // NythonExecutor is a struct: members default to public
 
     Value evalClassDecl(node_ptr node, Context* ctx) {
         auto cn = static_pointer_cast<ClassNode>(node);
+        // Bases are looked up in scope (round 77): a module's class (named
+        // "module.Class"), one imported with `from m import C`, an alias,
+        // a dotted base (threading.Thread). The base node takes the class's
+        // own name, which everything after this reads.
+        for (auto& b : cn->bases) {
+            if (!b) continue;
+            std::string bn = b->value(), rn = excClassName(bn, ctx);
+            if (rn != bn && (classNodeByName(rn) || nython::ny_is_builtin_exc(rn))) {
+                Token t = b->token();
+                t.value = rn;
+                b = std::make_shared<VariableNode>(t);
+            }
+        }
         Value class_val;
         class_val.type = ValueType::USERDATA;
         class_val.value.p = (void*)node.get();
@@ -5507,7 +5549,11 @@ public:
                                     if (!own) is_bi = false;
                                 }
                                 if (is_fn || is_lam || is_bi) {
-                                    if (is_bi) return callBuiltin(fn_type.substr(12), args, ctx);
+                                    if (is_bi) {
+                                        std::string bn = fn_type.substr(12);
+                                        if (!kw_args.empty() && isKwmapBuiltin(bn)) appendKwMap(args, kw_args);
+                                        return callBuiltin(bn, args, ctx);
+                                    }
                                     // A bound method can be STORED in an attribute
                                     // (e.g. win.on_resize(self.on_resize) keeps it
                                     // in self._on_resize, then calls
@@ -5534,7 +5580,8 @@ public:
                                         if (cit != closure_contexts.end()) cp = cit->second;
                                         Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
                                         CtxReaper _reap_fc3627(this, fc);
-                                        bindParams(fn, args, fc, ctx, attr_val.value.p);
+                                        // keyword arguments too (self.fn(*a, **kw) dropped them)
+                                        bindParamsKw(fn, args, kw_args, fc, ctx, 0, attr_val.value.p);
                                         return runFunctionBody(fn, fc);
                                     }
                                 }
@@ -6065,7 +6112,9 @@ public:
             // the round 77 socket and TLS layers (builtins/net.cpp, tls.cpp)
             result = dispatch_net(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
             result = dispatch_tls(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
+            result = dispatch_hash(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         }
+        if (name == "os_urandom") return dispatch_hash(*this, name, args, ctx);
         result = dispatch_math(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         result = dispatch_os(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         result = dispatch_data(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
@@ -6537,17 +6586,26 @@ public:
                 out = makeListValue(seq_vals, attr == "__mro__");
                 return true;
             }
-            if (attr == "__name__") {
+            if (attr == "__name__" || attr == "__qualname__" || attr == "__module__") {
                 if (fit != func_names.end()) {
                     const std::string& t = fit->second;
                     size_t c = t.find(':');
                     std::string nm = c == std::string::npos ? t : t.substr(c + 1);
                     size_t tag = nm.find("__");
                     if (tag != std::string::npos && tag > 0) nm = nm.substr(0, tag);   // name__static__ etc
-                    out = makeStringValue(nm);
+                    // A module's class is "module.Class" (round 77): __name__
+                    // is the class's own name, __module__ the module's.
+                    bool is_class = t.rfind("__class__:", 0) == 0;
+                    size_t dot = is_class ? nm.rfind('.') : std::string::npos;
+                    if (attr == "__module__") {
+                        if (!is_class) return false;
+                        out = makeStringValue(dot == std::string::npos ? std::string("__main__") : nm.substr(0, dot));
+                        return true;
+                    }
+                    out = makeStringValue(dot == std::string::npos ? nm : nm.substr(dot + 1));
                     return true;
                 }
-                if (isStringValue(obj)) { out = obj; return true; }
+                if (attr == "__name__" && isStringValue(obj)) { out = obj; return true; }
             }
             if (isInstanceValue(obj)) {
                 if (attr == "__class__") {
@@ -6800,7 +6858,7 @@ public:
     void setExceptionArgs(const Value& inst, const std::vector<Value>& args) {
         auto pit = instance_properties.find(inst.value.p);
         if (pit == instance_properties.end()) return;
-        pit->second->defineByName("args", makeListValue(args));
+        pit->second->defineByName("args", makeListValue(args, true));
         pit->second->defineByName("msg", makeStringValue(args.size() == 1 ? valueToDisplay(args[0]) : std::string()));
         // StopIteration.value: a generator's return value (both engines).
         if (classDerivesFrom(instanceClassName(inst), "StopIteration"))
@@ -7414,8 +7472,99 @@ public:
     // module finished running), or the names it asked for. A quoted import
     // (`import "lib/x.ny"`) still includes the file into the importing scope,
     // which the IDE's files and older programs rely on.
-    Value importModule(const std::string& filepath, const std::string& module_name,
-                       ImportNode* in_node, const std::string& bind_as, Context* ctx) {
+    // ── packages (round 77) ─────────────────────────────────────────────
+    // The file of module `dotted` ("a.b.c" -> a/b/c.ny, or the package's
+    // a/b/c/__init__.ny), looked for beside the importing file, in the working
+    // directory and its lib/, the importer's ancestors, NYTHONPATH and the
+    // interpreter's own lib/. A directory with neither is a namespace package
+    // (*is_dir). "" when nothing is found.
+    std::vector<std::string> moduleDirs(const node_ptr& node) {
+        std::vector<std::string> dirs;
+        std::string here = importerDir(node);
+        if (!here.empty()) { dirs.push_back(here); dirs.push_back(here + "lib/"); }
+        for (const char* d : {"", "./", "lib/", "./lib/"}) dirs.push_back(d);
+        std::string anc = parentDirOf(here);
+        for (int up = 0; up < 4 && !anc.empty(); ++up) {
+            dirs.push_back(anc); dirs.push_back(anc + "lib/");
+            std::string next = parentDirOf(anc);
+            if (next == anc) break;
+            anc = next;
+        }
+        for (auto& d : nyrt::library_dirs()) dirs.push_back(d);
+        return dirs;
+    }
+    std::string findModulePath(const node_ptr& node, const std::string& dotted, bool* is_dir = nullptr) {
+        std::string rel = dotted;
+        std::replace(rel.begin(), rel.end(), '.', '/');
+        struct stat st;
+        auto dirs = moduleDirs(node);
+        for (auto& d : dirs) {
+            if (stat((d + rel + ".ny").c_str(), &st) == 0 && !S_ISDIR(st.st_mode)) return d + rel + ".ny";
+            if (stat((d + rel + "/__init__.ny").c_str(), &st) == 0) return d + rel + "/__init__.ny";
+        }
+        if (is_dir) for (auto& d : dirs)
+            if (!d.empty() && stat((d + rel).c_str(), &st) == 0 && S_ISDIR(st.st_mode)) { *is_dir = true; return d + rel; }
+            else if (d.empty() && stat(rel.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) { *is_dir = true; return rel; }
+        return std::string();
+    }
+    // Whether `name` is a package (a directory of modules) rather than a file.
+    bool isPackageName(const node_ptr& node, const std::string& name) {
+        bool dir = false;
+        std::string p = findModulePath(node, name, &dir);
+        return dir || (p.size() > 12 && p.compare(p.size() - 12, 12, "/__init__.ny") == 0);
+    }
+    // Module `dotted`, loaded once (its namespace).
+    Value loadModule(const node_ptr& node, const std::string& dotted) {
+        auto it = module_ns_.find(dotted);
+        if (it != module_ns_.end()) return it->second;
+        bool dir = false;
+        std::string path = findModulePath(node, dotted, &dir);
+        if (path.empty()) throw std::string("__exc__:ModuleNotFoundError:No module named '" + dotted + "'");
+        if (dir) {
+            auto* ns = new Object((Runnable*)runner, dotted, Type::MAP);
+            ns->set("__name__", makeStringValue(dotted));
+            Value nsv((Collectable*)ns);
+            module_ns_[dotted] = nsv;
+            return nsv;
+        }
+        return runModuleFile(path, dotted);
+    }
+    // import a.b.c / import a.b as x / from a.b import c, d (c may itself be
+    // a submodule a/b/c.ny): each package's namespace gets its loaded
+    // submodules as attributes.
+    Value importDotted(const node_ptr& node, ImportNode* in_node, const std::string& module_name, Context* ctx) {
+        std::vector<std::string> parts;
+        size_t a = 0;
+        while (a <= module_name.size()) {
+            size_t b = module_name.find('.', a);
+            if (b == std::string::npos) b = module_name.size();
+            parts.push_back(module_name.substr(a, b - a));
+            a = b + 1;
+        }
+        Value first, prev;
+        std::string prefix;
+        for (size_t i = 0; i < parts.size(); i++) {
+            prefix = i ? prefix + "." + parts[i] : parts[i];
+            Value ns = loadModule(node, prefix);
+            if (i == 0) first = ns;
+            else if (auto* po = dynamic_cast<Object*>(prev.value.gc)) po->set(parts[i], ns);
+            prev = ns;
+        }
+        if (!in_node->names.empty()) {
+            auto* po = dynamic_cast<Object*>(prev.value.gc);
+            for (auto& n : in_node->names) {
+                if (n == "*" || !po || po->container->count(n)) continue;
+                bool dir = false;
+                if (!findModulePath(node, module_name + "." + n, &dir).empty())
+                    po->set(n, loadModule(node, module_name + "." + n));
+            }
+            bindFromNamespace(prev, in_node->names, module_name, ctx);
+        } else if (!in_node->alias.empty()) ctx->defineByName(in_node->alias, prev);
+        else ctx->defineByName(parts[0], first);
+        return NONE_VALUE;
+    }
+    // Runs a module file in a scope of its own; its namespace.
+    Value runModuleFile(const std::string& filepath, const std::string& module_name) {
         auto source = SourceCode(filepath);
         auto reporter = std::make_shared<Reporter>(source);
         auto lex = std::make_shared<Lexer>(source);
@@ -7442,6 +7591,11 @@ public:
         catch (std::string&) { module_ns_.erase(module_name); imported_modules_.erase(module_name); throw; }
         for (auto& kv : func_names) if (!before.count(kv.first)) module_owned_.insert(kv.first);
         for (auto& kv : *mctx->container) ns->set(kv.first, kv.second);
+        return nsv;
+    }
+    Value importModule(const std::string& filepath, const std::string& module_name,
+                       ImportNode* in_node, const std::string& bind_as, Context* ctx) {
+        Value nsv = runModuleFile(filepath, module_name);
         if (!in_node->names.empty()) bindFromNamespace(nsv, in_node->names, module_name, ctx);
         else if (!bind_as.empty()) ctx->defineByName(bind_as, nsv);
         return NONE_VALUE;
@@ -7472,11 +7626,15 @@ public:
             // namespace its first import made
             const std::string& want = !in_node->alias.empty() ? in_node->alias : implicit_alias;
             auto mc = module_ns_.find(module_name);
-            if (mc != module_ns_.end()) {
+            if (mc != module_ns_.end() && module_name.find('.') == std::string::npos) {
                 if (from_import && !quoted) { bindFromNamespace(mc->second, in_node->names, module_name, ctx); return NONE_VALUE; }
                 if (!want.empty()) { ctx->defineByName(want, mc->second); return NONE_VALUE; }
             }
         }
+        // a.b.c, and packages (directories of modules): before the builtin
+        // module names, so a package named like one (lib/http/) is found.
+        if (!quoted && (module_name.find('.') != std::string::npos || isPackageName(node, module_name)))
+            return importDotted(node, in_node.get(), module_name, ctx);
 
         // Circular import guard.
         //
@@ -7920,6 +8078,16 @@ public:
                 registerBuiltin("atomic_inc");
                 registerBuiltin("atomic_dec");
                 registerBuiltin("atomic_get");
+                // `import threading` also binds Python's threading module
+                // (lib/threading.ny, round 77).
+                if (module_name == "threading" && !quoted) {
+                    std::string p = findModulePath(node, "threading");
+                    if (!p.empty()) {
+                        Value nsv = module_ns_.count("threading") ? module_ns_["threading"] : runModuleFile(p, "threading");
+                        if (!in_node->names.empty()) bindFromNamespace(nsv, in_node->names, "threading", ctx);
+                        else ctx->defineByName(!in_node->alias.empty() ? in_node->alias : "threading", nsv);
+                    }
+                }
                 return NONE_VALUE;
         }
         if (module_name == "net" || module_name == "http") {

@@ -133,8 +133,18 @@ class SSLContext:
         _tls_ctx_set_ciphers(self._h, ciphers)
 
     def wrap_socket(self, sock, server_side=false, do_handshake_on_connect=true, suppress_ragged_eofs=true, server_hostname=none, session=none):
-        _tls_wrap(sock.fileno_handle(), self._h, server_side, server_hostname, self._check_hostname, do_handshake_on_connect)
-        return SSLSocket(sock, self, server_side, server_hostname)
+        # A connected socket starts TLS now; an unconnected one when it
+        # connects, and a listening one wraps each connection accept() returns.
+        var s = SSLSocket(sock, self, server_side, server_hostname)
+        s._handshake_now = do_handshake_on_connect
+        var connected = true
+        try:
+            sock.getpeername()
+        except OSError:
+            connected = false
+        if connected:
+            s._start()
+        return s
 
     def __repr__(self):
         return "<ssl.SSLContext protocol=" + str(self.protocol) + ">"
@@ -161,9 +171,42 @@ class SSLSocket:
         self.server_hostname = server_hostname
         self.family = sock.family
         self.type = sock.type
+        self._tls = false
+        self._handshake_now = true
+
+    def _start(self):
+        _tls_wrap(self._sock.fileno_handle(), self.context._h, self.server_side, self.server_hostname, self.context._check_hostname, self._handshake_now)
+        self._tls = true
 
     def do_handshake(self, block=false):
+        if not self._tls:
+            self._start()
         _tls_handshake(self._sock.fileno_handle())
+
+    def connect(self, address):
+        if self.server_side:
+            raise ValueError("can't connect in server-side mode")
+        self._sock.connect(address)
+        self._start()
+
+    def connect_ex(self, address):
+        try:
+            self.connect(address)
+            return 0
+        except OSError as e:
+            return e.errno if hasattr(e, "errno") and e.errno != none else 1
+
+    def bind(self, address):
+        self._sock.bind(address)
+
+    def listen(self, backlog=128):
+        self._sock.listen(backlog)
+
+    def accept(self):
+        # The connection, as an SSLSocket that has done its server handshake.
+        var pair = self._sock.accept()
+        var conn = self.context.wrap_socket(pair[0], true, self._handshake_now)
+        return (conn, pair[1])
 
     def version(self):
         return _tls_info(self._sock.fileno_handle()).get("version")

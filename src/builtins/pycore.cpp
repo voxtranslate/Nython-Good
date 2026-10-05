@@ -182,14 +182,15 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         const Value& v = args[0];
         const Value* bv = arg(1, "base");
         if (bv) {
-            if (!E.isStringValue(v)) E.pyRaise("TypeError", "int() can't convert non-string with explicit base");
+            auto* bo = E.isStringValue(v) ? nullptr : E.bytesOf(v);
+            if (!E.isStringValue(v) && !bo) E.pyRaise("TypeError", "int() can't convert non-string with explicit base");
             NythonExecutor::Num b = asInt(*bv, nullptr);
             int base = (int)b.i;
             if (b.k != 1 || (base != 0 && (base < 2 || base > 36))) E.pyRaise("ValueError", "int() base must be >= 2 and <= 36, or 0");
             nypy::BigInt out;
-            const std::string& s = *(std::string*)v.value.p;
+            const std::string& s = bo ? bo->s : *(std::string*)v.value.p;
             if (!nypy::parse_int_str(s, base, out))
-                E.pyRaise("ValueError", "invalid literal for int() with base " + std::to_string(base) + ": " + nypy::str_repr(s));
+                E.pyRaise("ValueError", "invalid literal for int() with base " + std::to_string(base) + ": " + (bo ? E.reprOf(v, ctx) : nypy::str_repr(s)));
             return intValue(out);
         }
         switch (v.type) {

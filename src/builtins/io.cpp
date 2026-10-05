@@ -388,9 +388,59 @@ Value dispatch_io(NythonExecutor& E,
             text_newlines(f, content);
             return makeStringValue(content);
         }
+        if (name == "file_read_bytes") {
+            // file_read_bytes(h, size=-1) -> bytes: a binary-mode read
+            // (no newline translation).
+            FILE* f = file_of(0);
+            if (!f) nyos::raise("ValueError", "I/O operation on closed file");
+            long long size = args.size() >= 2 ? nyos::to_int(args[1], -1) : -1;
+            std::string content;
+            if (size < 0) {
+                std::vector<char> buf(65536);
+                size_t n;
+                while ((n = fread(buf.data(), 1, buf.size(), f)) > 0) content.append(buf.data(), n);
+            } else if (size > 0) {
+                content.resize((size_t)size);
+                size_t r = fread(&content[0], 1, (size_t)size, f);
+                content.resize(r);
+            }
+            return E.makeBytesValue(content);
+        }
+        if (name == "file_readline_bytes") {
+            // file_readline_bytes(h, limit=-1) -> bytes up to and including
+            // b"\n" (at most limit bytes); b"" at the end of the file.
+            FILE* f = file_of(0);
+            if (!f) nyos::raise("ValueError", "I/O operation on closed file");
+            long long limit = args.size() >= 2 ? nyos::to_int(args[1], -1) : -1;
+            std::string line;
+            int c;
+            while ((limit < 0 || (long long)line.size() < limit) && (c = fgetc(f)) != EOF) {
+                line += (char)c;
+                if (c == '\n') break;
+            }
+            return E.makeBytesValue(line);
+        }
+        if (name == "file_truncate") {
+            // file_truncate(h, size=current position) -> the new size
+            FILE* f = file_of(0);
+            if (!f) nyos::raise("ValueError", "I/O operation on closed file");
+            fflush(f);
+            long long size = args.size() >= 2 && args[1].type != ValueType::NONE ? nyos::to_int(args[1], 0) : (long long)ftell(f);
+#ifdef _WIN32
+            if (_chsize_s(_fileno(f), size) != 0) nyos::raise_errno(errno ? errno : EINVAL, "truncate");
+#else
+            if (ftruncate(fileno(f), (off_t)size) != 0) nyos::raise_errno(errno ? errno : EINVAL, "truncate");
+#endif
+            return nyos::make_int(size);
+        }
         if (name == "file_write" || name == "fwrite") {
+            // A str is written as UTF-8; bytes/bytearray as they are.
             FILE* f = file_of(0);
             if (!f || args.size() < 2) return Value(-1);
+            if (auto* bo = E.bytesOf(args[1])) {
+                size_t written = fwrite(bo->s.data(), 1, bo->s.size(), f);
+                return Value(static_cast<int>(written));
+            }
             std::string data = getStringValue(args[1]);
             size_t written = fwrite(data.data(), 1, data.size(), f);
             return Value(static_cast<int>(written));
