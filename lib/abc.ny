@@ -32,13 +32,14 @@
 # update_abstractmethods(cls)   recomputes __abstractmethods__ after methods
 #                    were added to or implemented in a class
 #
-# isinstance(5, SomeABC) works for builtin values: type(5) is int. The kinds
-# that have no type object here - None, functions, builtins, generators and
-# lazy iterators (type() gives "none", "function", "builtin", "generator")
-# - are represented by the stand-in classes NoneType, function,
-# builtin_function_or_method, generator and iterator below (a generator has
-# send(); a lazy iterator such as iter([1]) or zip() does not), so
-# collections.abc's checks see what CPython's types define. The builtin
+# isinstance(5, SomeABC) works for builtin values: type(5) is int. The
+# runtime's own type objects - None's, functions' and bound methods',
+# builtins', generators' and the lazy iterators' (type(None) is NoneType,
+# type(f) is function ...; they have no __dict__) - are represented by the
+# stand-in classes NoneType, function, builtin_function_or_method, generator
+# and iterator below (a generator has send(); a lazy iterator such as
+# iter([1]) or zip() does not), so collections.abc's checks see what
+# CPython's types define. The builtin
 # types have no __dict__ here (int.__mro__ and int.__bases__ they have):
 # _ny_namespace gives what CPython's int, str, list, ... define (CPython
 # 3.11's tables), so collections.abc's __subclasshook__s inspect them as
@@ -159,18 +160,30 @@ _standin_names = {"none": NoneType, "function": function, "builtin": builtin_fun
                   "generator": generator, "iterator": iterator}
 
 
+def _ny_standin_of_type(t):
+    # The stand-in of a runtime type object - type(None), type(f), a bound
+    # method's, type(len), a generator's, a lazy iterator's (zip,
+    # list_iterator ...) - each equal to the legacy name of its kind
+    # ("none", "function", "builtin", "generator"); None for anything else.
+    if isinstance(t, str):
+        return _standin_names.get(t)
+    for n in ("none", "function", "builtin"):
+        if t == n:
+            return _standin_names[n]
+    if t == "generator":
+        return generator if t.__name__ == "generator" else iterator
+    return None
+
+
 def _ny_class_of(x):
     """The class isinstance(x, SomeABC) asks about: type(x), or the stand-in
-    of a kind whose type() is a name string."""
+    of a kind the runtime's own type object stands for."""
     var t = type(x)
+    var s = _ny_standin_of_type(t)
+    if s is not None:
+        return s
     if not isinstance(t, str):
         return t
-    if t == "generator":
-        # a lazy iterator (iter([1]), zip ...) is a "generator" kind too,
-        # without send(); its repr is "<iterator object at ...>"
-        return generator if repr(x).startswith("<generator") else iterator
-    if t in _standin_names:
-        return _standin_names[t]
     if callable(x):
         return function
     if isinstance(x, dict):
@@ -200,8 +213,9 @@ def _ny_type_arg(x, message):
     # a class argument: a type, or a kind's name (type(None) is "none"
     # here) taken as its stand-in; anything else is the TypeError Python
     # raises
-    if isinstance(x, str) and x in _standin_names:
-        return _standin_names[x]
+    var s = _ny_standin_of_type(x)
+    if s is not None:
+        return s
     if not _is_type(x):
         raise TypeError(message)
     return x

@@ -101,7 +101,8 @@ bool method(NythonExecutor& E, const Value& obj, const std::string& name, std::v
 void close(NythonExecutor& E, Gen* g);
 // `x in g`: consumes up to the first match.
 bool contains(NythonExecutor& E, Gen* g, const Value& x, Context* ctx);
-// "generator".
+// Python's name of its type: "generator", or a lazy builtin's ("zip",
+// "list_iterator", ...) - round 77.
 std::string type_name(const Gen* g);
 // The values an unpacking assignment of `n` targets takes from generator
 // `v` (n = -1: a starred target, all of them): n + 1 are pulled at most, as

@@ -154,8 +154,18 @@ def ismodule(object):
     return isinstance(object, types.ModuleType)
 
 
+def _ny_object_slot(f):
+    # The prelude object's own methods (__init__, __setattr__ ...) stand for
+    # CPython's slot wrappers, which are no Python functions; dir() lists
+    # them as Python's does (round 77)
+    try:
+        return getattr(object, f.__name__, None) is f
+    except Exception:
+        return False
+
+
 def isfunction(object):
-    return isinstance(object, types.FunctionType)
+    return isinstance(object, types.FunctionType) and not _ny_object_slot(object)
 
 
 def ismethod(object):

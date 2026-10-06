@@ -30,6 +30,11 @@ class _Result:
     def __eq__(self, other):
         return list(self._values) == list(other)
 
+    def __hash__(self):
+        # hashable as the tuple it stands for (a class defining __eq__ alone
+        # is unhashable - round 77)
+        return hash(tuple(self._values))
+
     def _hostinfo(self):
         var netloc = self.netloc
         var at = netloc.rfind("@")

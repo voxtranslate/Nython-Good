@@ -106,7 +106,10 @@ if nython:
                            type({}) == "dict", type([]) == "list", type(P()) == "P", type(P) == "class",
                            type(5) != "float", type([]) in ["list", "tuple"]],
           [True, True, True, True, True, True, True, True, True, True])
-    check("legacy names stay for the rest", [type(none), type(len), type(kind)], ["none", "builtin", "function"])
+    # None, builtins and functions have type objects too now (vm_audit86),
+    # equal to the names type() gave for them
+    check("legacy names stay for the rest", [type(none) == "none", type(len) == "builtin", type(kind) == "function"],
+          [True, True, True])
     check("typeof(x) is the Nython name, a string",
           [typeof(5), typeof("s"), typeof({}), typeof([]), typeof(P()), typeof(P), typeof(none), isinstance(typeof(5), "str")],
           ["int", "string", "map", "list", "P", "class", "none", True])
