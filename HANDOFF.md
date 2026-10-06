@@ -502,6 +502,30 @@ Nython over the class machinery above; each header says what is not there.
   made the context, so without OpenSSL (a Windows system without its DLLs)
   every `urlopen`, plain http included, raised SSLError - vm_audit70 then
   waited for its server threads forever.
+- **`urllib.request.pathname2url`/`url2pathname` on Windows** are CPython's
+  `nturl2path` (`C:\x\a.txt` <-> `///C:/x/a.txt`, UNC paths with the slashes
+  doubled); they only quoted, so `"file:" + pathname2url(p)` was no URL there.
+  Checked under Wine against CPython's own `nturl2path` answers. vm_audit70
+  builds its file URL that way (`"file://" + path` is not a URL on Windows).
+- **WebSocket servers close a failed connection with a lingering close**
+  (`_lingering_close` in `lib/websocket.ny`; RFC 7230 6.6, as Apache): the
+  Close frame, a half-close, then up to 1 MB / 2 s of the peer's input read
+  and dropped before the socket is closed. A connection failed for a bad
+  frame always has unread input (the rest of that frame), and closing a
+  socket with unread input sends a TCP reset, which discards what the peer
+  has not read yet - on Windows the client never saw the Close frame and got
+  ConnectionResetError (vm_audit70's protocol-error checks).
+- **Accept loops read their socket once** (`TCPServer.accept` in
+  `lib/sockets.ny`, `UnixServer.accept`, `Server.listen` in
+  `lib/clientserver.ny`): `stop()` on another thread sets the attribute to
+  none, and under Windows' timing the loop then called `none.accept()`
+  ("Exception in thread ... AttributeError").
+- **vm_audit76 is portable throughout**: paths in messages are compared through
+  `tpath` (TMP as `T`, `/` as the separator, raw or repr'd); on Windows the
+  permission bits read 0o666/0o777 (only a read-only flag exists), a text file
+  written with `\n` is 14 bytes (`\r\n`), `which` finds commands by PATHEXT,
+  and `Path("~/x").expanduser()` is compared as a path - CPython's results there.
+  Under Wine it runs 243 checks (the POSIX-only ones skipped), on Linux 280.
 
 ### A running program's input (vm_audit71, tools/ide_e2e.py `run`/`terminal`)
 - The IDE closed a program's stdin (`os_spawn(..., input="")`), so its first

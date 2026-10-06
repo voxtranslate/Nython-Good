@@ -65,6 +65,23 @@ def raises_msg(fn, *args, **kw):
 
 TMP = tempfile.mkdtemp(prefix="vm_audit76_")
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+WIN = os.name == "nt"
+
+# A message naming paths under TMP, with TMP shown as T and "/" for the
+# separator, whether the path appears as it is or as a repr (an OSError's
+# message quotes its filename with repr, doubling Windows' backslashes)
+def tpath(text_t):
+    text_t = text_t.replace(repr(TMP)[1:-1], "T").replace(TMP, "T")
+    if WIN:
+        text_t = text_t.replace("\\\\", "/").replace("\\", "/")
+    return text_t
+
+# Windows keeps only a read-only flag: a writable file reads 0o666 and a
+# directory 0o777 whatever mode was set (as CPython reports there)
+def fmode(m):
+    return 0o666 if WIN else m
+def dmode(m):
+    return 0o777 if WIN else m
 
 def T(*parts):
     return os.path.join(TMP, *parts)
@@ -208,19 +225,19 @@ check("copyfile", [rel(shutil.copyfile(T("sh", "a.txt"), T("sh", "b.txt"))), rea
 check("copyfile does not copy times", os.path.getmtime(T("sh", "b.txt")) != 1500000000.0, True)
 os.makedirs(T("sh", "d"))
 check("copy into dir", rel(shutil.copy(T("sh", "a.txt"), T("sh", "d"))), "/sh/d/a.txt")
-check("copy copies mode", Path(T("sh", "d", "a.txt")).stat().st_mode & 0o777, 0o640)
+check("copy copies mode", Path(T("sh", "d", "a.txt")).stat().st_mode & 0o777, fmode(0o640))
 check("copy2", rel(shutil.copy2(T("sh", "a.txt"), T("sh", "d", "c2.txt"))), "/sh/d/c2.txt")
 check("copy2 copies mtime", os.path.getmtime(T("sh", "d", "c2.txt")), 1500000000.0)
-check("copy2 copies mode", Path(T("sh", "d", "c2.txt")).stat().st_mode & 0o777, 0o640)
+check("copy2 copies mode", Path(T("sh", "d", "c2.txt")).stat().st_mode & 0o777, fmode(0o640))
 os.chmod(T("sh", "b.txt"), 0o600)
 shutil.copymode(T("sh", "a.txt"), T("sh", "b.txt"))
-check("copymode", Path(T("sh", "b.txt")).stat().st_mode & 0o777, 0o640)
+check("copymode", Path(T("sh", "b.txt")).stat().st_mode & 0o777, fmode(0o640))
 shutil.copystat(T("sh", "a.txt"), T("sh", "b.txt"))
 check("copystat", os.path.getmtime(T("sh", "b.txt")), 1500000000.0)
-check("SameFileError", raises_msg(shutil.copyfile, T("sh", "a.txt"), T("sh", "a.txt")).replace(TMP, "T"),
+check("SameFileError", tpath(raises_msg(shutil.copyfile, T("sh", "a.txt"), T("sh", "a.txt"))),
       "SameFileError: 'T/sh/a.txt' and 'T/sh/a.txt' are the same file")
 check("SameFileError hierarchy", [issubclass(shutil.SameFileError, shutil.Error), issubclass(shutil.Error, OSError)], [True, True])
-check("copyfile missing", raises_msg(shutil.copyfile, T("sh", "missing"), T("sh", "x")).replace(TMP, "T"),
+check("copyfile missing", tpath(raises_msg(shutil.copyfile, T("sh", "missing"), T("sh", "x"))),
       "FileNotFoundError: [Errno 2] No such file or directory: 'T/sh/missing'")
 check("copyfile to dir", raises(shutil.copyfile, T("sh", "a.txt"), T("sh", "d")), "IsADirectoryError")
 check("copyfile to missing dir", raises(shutil.copyfile, T("sh", "a.txt"), T("sh", "nodir", "x")), "FileNotFoundError")
@@ -236,19 +253,19 @@ for walk_root, walk_dirs, walk_files in os.walk(T("sh", "dst")):
 check("copytree contents", sorted(tree_files), ["/sh/dst/sub/z.txt", "/sh/dst/x.py", "/sh/dst/y.pyc"])
 shutil.copytree(T("sh", "src"), T("sh", "dst2"), ignore=shutil.ignore_patterns("*.pyc", "sub"))
 check("copytree ignore_patterns", sorted(os.listdir(T("sh", "dst2"))), ["x.py"])
-check("copytree exists", raises_msg(shutil.copytree, T("sh", "src"), T("sh", "dst2")).replace(TMP, "T"),
+check("copytree exists", tpath(raises_msg(shutil.copytree, T("sh", "src"), T("sh", "dst2"))),
       "FileExistsError: [Errno 17] File exists: 'T/sh/dst2'")
 shutil.copytree(T("sh", "src"), T("sh", "dst2"), dirs_exist_ok=True)
 check("copytree dirs_exist_ok", sorted(os.listdir(T("sh", "dst2"))), ["sub", "x.py", "y.pyc"])
 check("ignore_patterns", sorted(shutil.ignore_patterns("*.c", "a*")("/x", ["a.c", "b.c", "ab", "z"])), ["a.c", "ab", "b.c"])
 shutil.rmtree(T("sh", "dst"))
 check("rmtree", os.path.exists(T("sh", "dst")), False)
-check("rmtree missing", raises_msg(shutil.rmtree, T("sh", "dst")).replace(TMP, "T"),
+check("rmtree missing", tpath(raises_msg(shutil.rmtree, T("sh", "dst"))),
       "FileNotFoundError: [Errno 2] No such file or directory: 'T/sh/dst'")
 shutil.rmtree(T("sh", "dst"), ignore_errors=True)
 rm_errors = []
 def rm_onerror(func_e, path_e, exc_info_e):
-    rm_errors.append([path_e.replace(TMP, "T"), exc_info_e[0].__name__])
+    rm_errors.append([tpath(path_e), exc_info_e[0].__name__])
 shutil.rmtree(T("sh", "dst"), onerror=rm_onerror)
 check("rmtree onerror", rm_errors, [["T/sh/dst", "FileNotFoundError"]])
 check("rmtree file", raises(shutil.rmtree, T("sh", "a.txt")), "NotADirectoryError")
@@ -257,19 +274,25 @@ check("move file", [rel(shutil.move(T("sh", "b.txt"), T("sh", "moved.txt"))), os
 check("move into dir", rel(shutil.move(T("sh", "moved.txt"), T("sh", "d"))), "/sh/d/moved.txt")
 write_file(T("sh", "dup.txt"), "1")
 write_file(T("sh", "d", "dup.txt"), "2")
-check("move exists", raises_msg(shutil.move, T("sh", "dup.txt"), T("sh", "d")).replace(TMP, "T"),
+check("move exists", tpath(raises_msg(shutil.move, T("sh", "dup.txt"), T("sh", "d"))),
       "Error: Destination path 'T/sh/d/dup.txt' already exists")
 check("move dir", [rel(shutil.move(T("sh", "dst2"), T("sh", "dst3"))), sorted(os.listdir(T("sh", "dst3")))],
       ["/sh/dst3", ["sub", "x.py", "y.pyc"]])
-check("move into itself", raises_msg(shutil.move, T("sh", "dst3"), T("sh", "dst3", "inner")).replace(TMP, "T"),
+check("move into itself", tpath(raises_msg(shutil.move, T("sh", "dst3"), T("sh", "dst3", "inner"))),
       "Error: Cannot move a directory 'T/sh/dst3' into itself 'T/sh/dst3/inner'.")
 du = shutil.disk_usage(TMP)
 check("disk_usage", [du.total > 0, du.free >= 0, du.used >= 0, len(du), du[0] == du.total, type(du).__name__, repr(du).startswith("usage(total=")],
       [True, True, True, 3, True, "usage", True])
-check("which", [shutil.which("sh") is not None, shutil.which("definitely-not-a-cmd-zz"), shutil.which(T("sh", "a.txt"))],
-      [True, None, None])
+# a path is returned when it is executable: any existing file on Windows,
+# where PATHEXT (not a mode bit) makes a name a command
+check("which", [shutil.which("cmd" if WIN else "sh") is not None, shutil.which("definitely-not-a-cmd-zz"), shutil.which(T("sh", "a.txt"))],
+      [True, None, T("sh", "a.txt") if WIN else None])
 os.chmod(T("sh", "a.txt"), 0o755)
-check("which path=", shutil.which("a.txt", path=T("sh")) == T("sh", "a.txt"), True)
+if WIN:
+    write_file(T("sh", "tool.bat"), "@echo off\n")
+    check("which path=", (shutil.which("tool", path=T("sh")) or "").lower() == T("sh", "tool.bat").lower(), True)
+else:
+    check("which path=", shutil.which("a.txt", path=T("sh")) == T("sh", "a.txt"), True)
 term = shutil.get_terminal_size((99, 33))
 check("get_terminal_size", [len(term), term.columns > 0, term.lines > 0, term[0] == term.columns], [2, True, True, True])
 check("archive formats", "tar" in [fmt[0] for fmt in shutil.get_archive_formats()], True)
@@ -289,11 +312,11 @@ check("gettempprefix", tempfile.gettempprefix(), "tmp")
 td = tempfile.mkdtemp(prefix="pre_", suffix="_suf", dir=TMP)
 check("mkdtemp", [os.path.isdir(td), os.path.basename(td).startswith("pre_"), td.endswith("_suf"),
                   os.path.isabs(td), os.path.dirname(td) == TMP], [True, True, True, True, True])
-check("mkdtemp mode", Path(td).stat().st_mode & 0o777, 0o700)
+check("mkdtemp mode", Path(td).stat().st_mode & 0o777, dmode(0o700))
 mk_fd, mk_path = tempfile.mkstemp(suffix=".dat", prefix="ms_", dir=TMP)
 check("mkstemp", [isinstance(mk_fd, int), os.path.isfile(mk_path), os.path.basename(mk_path).startswith("ms_"),
                   mk_path.endswith(".dat"), os.path.getsize(mk_path)], [True, True, True, True, 0])
-check("mkstemp mode", Path(mk_path).stat().st_mode & 0o777, 0o600)
+check("mkstemp mode", Path(mk_path).stat().st_mode & 0o777, fmode(0o600))
 try:
     os.close(mk_fd)
 except AttributeError:
@@ -376,7 +399,7 @@ check("Path type", [type(pbase).__name__ in ["PosixPath", "WindowsPath"], isinst
       [True, True, True, True, True, False])
 pf = pbase / "a.txt"
 check("write_text/read_text", [pf.write_text("hello\nworld\n"), pf.read_text(), pf.stat().st_size, pf.is_file()],
-      [12, "hello\nworld\n", 12, True])
+      [12, "hello\nworld\n", 14 if WIN else 12, True])
 check("write_bytes/read_bytes", [pf.write_bytes(b"\x00\x01"), pf.read_bytes()], [2, b"\x00\x01"])
 check("write_text type", raises(pf.write_text, b"x"), "TypeError")
 (pbase / "sub" / "deep").mkdir(parents=True)
@@ -388,9 +411,9 @@ check("Path.glob", sorted([rel(x) for x in pbase.glob("sub/*.py")]), ["/pl/sub/.
 check("Path.rglob", sorted([rel(x) for x in pbase.rglob("*.py")]), ["/pl/sub/.h.py", "/pl/sub/deep/y.py", "/pl/sub/x.py"])
 check("Path.glob **", sorted([rel(x) for x in pbase.glob("**/*.py")]), ["/pl/sub/.h.py", "/pl/sub/deep/y.py", "/pl/sub/x.py"])
 check("Path.glob */", sorted([rel(x) for x in pbase.glob("*/")]), ["/pl/sub"])
-check("mkdir exists", raises_msg((pbase / "sub").mkdir).replace(TMP, "T"), "FileExistsError: [Errno 17] File exists: 'T/pl/sub'")
+check("mkdir exists", tpath(raises_msg((pbase / "sub").mkdir)), "FileExistsError: [Errno 17] File exists: 'T/pl/sub'")
 (pbase / "sub").mkdir(exist_ok=True)
-check("mkdir no parent", raises_msg((pbase / "nope" / "x").mkdir).replace(TMP, "T"),
+check("mkdir no parent", tpath(raises_msg((pbase / "nope" / "x").mkdir)),
       "FileNotFoundError: [Errno 2] No such file or directory: 'T/pl/nope/x'")
 check("unlink missing", raises((pbase / "missing").unlink), "FileNotFoundError")
 (pbase / "missing").unlink(missing_ok=True)
@@ -402,12 +425,12 @@ ph = pg.rename(pbase / "h.txt")
 check("rename", [rel(ph), pg.exists(), ph.exists()], ["/pl/h.txt", False, True])
 ph2 = ph.replace(pbase / "a.txt")
 check("replace", [rel(ph2), (pbase / "a.txt").read_text()], ["/pl/a.txt", ""])
-check("rename missing", raises_msg((pbase / "zz").rename, pbase / "yy").replace(TMP, "T"),
+check("rename missing", tpath(raises_msg((pbase / "zz").rename, pbase / "yy")),
       "FileNotFoundError: [Errno 2] No such file or directory: 'T/pl/zz' -> 'T/pl/yy'")
 check("resolve", rel(Path(str(pbase) + "/sub/../a.txt").resolve()), "/pl/a.txt")
 check("absolute", [Path("rel_x").absolute().is_absolute(), Path("rel_x").absolute().name], [True, "rel_x"])
 check("cwd/home/expanduser", [Path.cwd() == Path(os.getcwd()), Path.home() == Path(os.path.expanduser("~")),
-                              str(Path("~/x").expanduser()) == os.path.expanduser("~/x")], [True, True, True])
+                              Path("~/x").expanduser() == Path(os.path.expanduser("~/x"))], [True, True, True])
 check("samefile", (pbase / "a.txt").samefile(str(pbase) + "/sub/../a.txt"), True)
 def can_symlink(d):
     # as CPython's test.support.os_helper.can_symlink: Windows without

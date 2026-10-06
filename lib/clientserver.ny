@@ -132,12 +132,16 @@ class _ThreadedServer:
         if not quiet:
             print type(self).__name__ + " on " + self.host + ":" + str(self.port)
         while self.running:
-            if not self._sock.wait_readable(0.1):
-                continue
+            # read once: stop() on another thread sets self._sock to none
+            var lsock = self._sock
+            if lsock == none:
+                break
             var pair = none
             try:
-                pair = self._sock.accept()
-            except OSError:
+                if not lsock.wait_readable(0.1):
+                    continue
+                pair = lsock.accept()
+            except (OSError, ValueError):
                 if not self.running:
                     break
                 continue

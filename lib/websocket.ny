@@ -526,6 +526,34 @@ class Connection:
                     self._write_locked(encode_frame(true, OP_CLOSE, _close_payload(code, reason[0:100]), self.is_client))
                 except OSError:
                     pass
+        self._lingering_close()
+
+    # Half-close, then read and discard what the peer still sends for a
+    # moment before closing (a "lingering close", RFC 7230 6.6, as Apache
+    # does): a socket closed with unread input makes TCP send a reset rather
+    # than a FIN, and a reset discards what the peer has not read yet - the
+    # Close frame just sent included. A failed connection has unread input
+    # by nature (the rest of the bad frame); Windows lost the Close frame
+    # every time (round 77).
+    def _lingering_close(self):
+        try:
+            self.socket.shutdown(socket.SHUT_WR)
+            var limit = 2.0
+            if self.close_timeout != none and self.close_timeout < limit:
+                limit = self.close_timeout
+            var deadline = monotonic() + limit
+            var drained = 0
+            while drained < 1048576:
+                var left = deadline - monotonic()
+                if left <= 0:
+                    break
+                self.socket.settimeout(left)
+                var chunk = self.socket.recv(65536)
+                if len(chunk) == 0:
+                    break
+                drained = drained + len(chunk)
+        except (OSError, ValueError):
+            pass
         self._shutdown_socket()
 
     def _shutdown_socket(self):

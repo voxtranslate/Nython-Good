@@ -42,6 +42,7 @@ import http.cookiejar
 import urllib.request
 import urllib.error
 import urllib.parse
+import sys
 import websocket
 import hashlib
 import math
@@ -269,7 +270,12 @@ def test_urllib():
     check("http proxy", pop.open("http://example.invalid/thing").read(), b"proxied http://example.invalid/thing")
     check("proxy_bypass", [urllib.request.proxy_bypass("x.invalid:80", {"no": "localhost,.invalid"}), urllib.request.proxy_bypass("y.com", {"no": ".invalid"})], [true, false])
     check("data: URL", [urllib.request.urlopen("data:,Hello%2C%20World!").read(), urllib.request.urlopen("data:text/plain;base64,SGk=").read()], [b"Hello, World!", b"Hi"])
-    check("file: URL", urllib.request.urlopen("file://" + os_path_abspath(os_path_join(TMP, "www/a.txt"))).read(), b"hi there\n")
+    # "file:" + pathname2url(path): "file://" + path is not a URL on Windows
+    # (C: would be its host)
+    var furl = "file:" + urllib.request.pathname2url(os_path_abspath(os_path_join(TMP, "www/a.txt")))
+    check("file: URL", urllib.request.urlopen(furl).read(), b"hi there\n")
+    var p0 = "C:\\a b\\c%d" if sys.platform.startswith("win") else "/a b/c%d"
+    check("pathname2url round trip", urllib.request.url2pathname(urllib.request.pathname2url(p0)), p0)
     var dl = os_path_join(TMP, "dl.txt")
     urllib.request.urlretrieve(base + "/final?dl", dl)
     check("urlretrieve", read_file(dl), "path=/final?dl ua=Nython-urllib/0.2")

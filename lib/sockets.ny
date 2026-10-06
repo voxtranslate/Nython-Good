@@ -261,16 +261,19 @@ class TcpServer:
         return true
 
     def accept(self, timeout=none):
-        # the next client, or none (stopped, or nothing within timeout seconds)
-        if self.fd == none:
-            return none
-        if timeout != none and not self.fd.wait_readable(timeout):
+        # the next client, or none (stopped, or nothing within timeout seconds).
+        # self.fd is read once: stop() on another thread sets it to none
+        # while this waits (round 77: AttributeError under Windows' timing)
+        var fd = self.fd
+        if fd == none:
             return none
         try:
-            var pair = self.fd.accept()
+            if timeout != none and not fd.wait_readable(timeout):
+                return none
+            var pair = fd.accept()
             self.clients_served = self.clients_served + 1
             return _wrap_conn(pair[0], pair[1], self.binary)
-        except OSError:
+        except (OSError, ValueError):
             return none
 
     def stop(self):
@@ -416,7 +419,10 @@ class UnixSocket:
         return true
 
     def accept(self):
-        var pair = self.fd.accept()
+        var fd = self.fd
+        if fd == none:
+            return none
+        var pair = fd.accept()
         var c = UnixSocket(self.path, self.binary)
         c.fd = pair[0]
         c.connected = true

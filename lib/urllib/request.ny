@@ -883,11 +883,44 @@ class DataHandler(BaseHandler):
 
 # ─── helpers ────────────────────────────────────────────────────────────────
 
-def pathname2url(pathname):
-    return urllib.parse.quote(pathname)
+# On Windows, CPython's nturl2path: C:\x\a.txt <-> ///C:/x/a.txt
+# (a drive letter is not a host); elsewhere quoting alone.
+def _is_windows():
+    import sys
+    return sys.platform.startswith("win")
 
-def url2pathname(pathname):
-    return urllib.parse.unquote(pathname)
+def pathname2url(pathname):
+    if not _is_windows():
+        return urllib.parse.quote(pathname)
+    var p = pathname.replace("\\", "/")
+    if p[:4] == "//?/":
+        p = p[4:]
+        if p[:4].upper() == "UNC/":
+            p = "//" + p[4:]
+        elif p[1:2] != ":":
+            raise OSError("Bad path: " + p)
+    if not (":" in p):
+        # \\host\share\f -> ////host/share/f (the slashes doubled)
+        if p[:2] == "//":
+            p = "//" + p
+        return urllib.parse.quote(p)
+    var comp = p.split(":", 2)
+    if len(comp) != 2 or len(comp[0]) > 1:
+        raise OSError("Bad path: " + p)
+    return "///" + urllib.parse.quote(comp[0].upper()) + ":" + urllib.parse.quote(comp[1])
+
+def url2pathname(url):
+    if not _is_windows():
+        return urllib.parse.unquote(url)
+    url = url.replace(":", "|")
+    if not ("|" in url):
+        if url[:4] == "////":
+            url = url[2:]
+        return urllib.parse.unquote(url.replace("/", "\\"))
+    var comp = url.split("|")
+    if len(comp) != 2 or len(comp[0]) == 0 or not comp[0][-1].isalpha():
+        raise OSError("Bad URL: " + url)
+    return comp[0][-1].upper() + ":" + urllib.parse.unquote(comp[1].replace("/", "\\"))
 
 _url_tempfiles = []
 
