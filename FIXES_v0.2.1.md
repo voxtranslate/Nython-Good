@@ -5552,3 +5552,11 @@ Full detail in `HANDOFF.md` §0p. New tests: `vm_audit65` (bytes, 149 checks), `
 | `open(p, "w", -1, "utf-8")` took -1 as the encoding | encoding was the third parameter | Python's order: file, mode, buffering, encoding, errors, newline |
 | Windows: `datetime.fromtimestamp(-1.5, timezone.utc)` raised OverflowError | `gmtime_s` refuses negative times | UTC computed from the calendar (`utc_tm`), every platform |
 | Windows: `os.utime(directory, ...)` raised PermissionError | the CRT's `_utime` cannot open a directory | `SetFileTime` with backup semantics, to 100 ns |
+| No abc, enum, dataclasses, typing, types, inspect, keyword, weakref, warnings, traceback, numbers, collections.abc | — | written over the class machinery, CPython's algorithms and messages (vm_audit74, 81-83) |
+| `e.__traceback__`, `sys.exc_info()`, `raise X from Y`'s `__cause__` did not exist; an uncaught error showed one line | exceptions carried a location string only | real traceback objects on both engines; Python's traceback block before the `[Nython]`/`[VMError]` line |
+| `sys.exc_info()` could return another thread's (or a suspended generator's) exception | `handling_obj_` was not swapped with the rest of the per-thread state | saved and restored with it |
+| VM: an exception's `__excN__` variable stayed set after its handler | never cleared | cleared when the exception leaves the clause |
+| `f(__x__=1)` never reached parameter `__x__`; `C.__dict__` and `vars(obj)` lacked dunder names | dunder keys were stored raw and read as internal markers | keys encoded as dict keys (`key_of_str`) |
+| A program's top-level `list = []` rebound `list` inside every imported module | module scopes chained to the program's globals | they start from a snapshot of the builtins and prelude |
+| `"""x "y" z"""` lost its inner quotes | the lexer dropped a `"` inside a triple-quoted string | kept |
+| `hash(obj)` kept `obj` alive until a full collection | `hash` entered it in the key-object table | not entered |

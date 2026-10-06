@@ -361,6 +361,10 @@ These were aligned to match how the IDE calls them:
 | vm_audit78 | 147 | round 77: re - Python's syntax and messages over a native engine immune to catastrophic backtracking (selective memoization) |
 | vm_audit79 | 43 | round 77: class machinery, passes under python3 - annotations, PEP 487 (__init_subclass__, __set_name__), __new__, PEP 560/604 generics and unions, metaclasses, NotImplemented and reflected operators, __mro__/__bases__/__subclasses__ |
 | vm_audit80 | 15 | round 77: type() gives type objects (type(5) is int, type(obj) is its class, x.__class__), equal to their legacy names on Nython; typeof(x) is the name |
+| vm_audit74 | 124 | round 77: abc (ABCMeta, register, subclass hooks), numbers, collections.abc (all 26 ABCs, mixins, builtin registrations), singledispatch on ABCs and annotations |
+| vm_audit81 | 116 | round 77: enum (EnumType metaclass, auto, Flag boundaries, functional API) and dataclasses (every parameter, field, KW_ONLY, InitVar, frozen) |
+| vm_audit82 | 140 | round 77: typing (Union, generics, TypeVar, Protocol, NamedTuple, TypedDict, get_type_hints, check_type), types, inspect (signature, bind, getsource), keyword |
+| vm_audit83 | 158 | round 77: weakref (callbacks, proxies, weak dicts, finalize), warnings (filters, catch_warnings, -W), traceback (real tracebacks, chains), linecache, atexit |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -973,6 +977,16 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   Python's or the legacy one (`type(x) == "list"`, `"string"`, `"map"`), so
   old code keeps working - but `str(type(x))` is `"<class 'int'>"`. Use
   `typeof(x)` for Nython's name as a string. `int is int` is identity.
+- **Class-machinery modules** (vm_audit74, 81-83): abc, numbers,
+  collections.abc (collections is a package now), enum, dataclasses,
+  typing (+ `check_type`), types, inspect (+ `signature_diff`), keyword,
+  weakref, warnings (+ `deprecated`, `-W`), traceback, linecache, atexit.
+  Engines: `f.__code__`/`__defaults__`/`__qualname__`, real tracebacks
+  (`e.__traceback__`, `__context__`/`__cause__`, `sys.exc_info()`, Python's
+  "Traceback (most recent call last):" before the `[Nython]`/`[VMError]`
+  line), weakref callbacks, data descriptors, `__index__`, `__hash__ =
+  None`, metaclass `__setattr__`, dunder names in `__dict__`, module scopes
+  from a builtins snapshot.
 - **Standard library** (vm_audit73, 75-78): json, random, datetime, time,
   io, string, textwrap, pprint, csv, statistics, fractions, struct,
   calendar, uuid, fnmatch, glob, shutil, tempfile, pathlib, subprocess,

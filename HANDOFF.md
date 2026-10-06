@@ -9,8 +9,10 @@ async protocols; modules with their own scope and packages; sets; the
 command line and argparse; per-execution classes, slices, eval/exec,
 complex numbers, `__setattr__`, docstrings, collections; positional-only
 parameters; annotations, `__new__`, PEP 487/560/604, metaclasses,
-NotImplemented; `type()` giving type objects; ~45 Python standard-library
-modules and a ReDoS-immune regex engine; both engines).
+NotImplemented; `type()` giving type objects; ~60 Python standard-library
+modules (abc, enum, dataclasses, typing, inspect, traceback, warnings,
+weakref among them) and a ReDoS-immune regex engine; real tracebacks; both
+engines).
 Round 76 — **§0o** (the "Not done" lists of rounds 74-75
 closed: static scope checks, lambda closures, error columns, async tasks
 as coroutines, rwlock succession, objects used as dict keys and suspended
@@ -340,6 +342,107 @@ module` files (their own scope). Most tests pass under python3 too.
   = staticmethod(three_way_cmp)`, the functions of `lib/time.ny`'s `time`
   namespace class).
 
+### The class-machinery modules (vm_audit74, 81-83; most checks also pass under python3)
+Each is CPython 3.11/3.12's API and algorithm with its messages, written in
+Nython over the class machinery above; each header says what is not there.
+- **vm_audit74 (124): `abc`, `numbers`, `collections.abc`, singledispatch on
+  ABCs.** `ABCMeta` is a real metaclass (`_py_abc`'s algorithm: abstract
+  methods from the namespace and the bases, 3.12's "Can't instantiate
+  abstract class X without an implementation for abstract method 'm'",
+  `register`, `__subclasshook__`, positive/negative caches invalidated by a
+  global token). `lib/collections` is a package now (`git mv` keeps the
+  history): `collections/abc.ny` has all 26 ABCs with CPython's hooks and
+  mixins and the builtin registrations (`isinstance([], Sequence)`,
+  `isinstance({}, Mapping)`); `numbers` is the numeric tower with int,
+  float, complex registered and `Fraction` a `Rational`. functools'
+  singledispatch dispatches on ABCs (`_compose_mro`/`_c3_mro`) and
+  registers by annotation (unions too).
+- **vm_audit81 (116): `enum`, `dataclasses`.** `EnumType` is a real
+  metaclass: members in definition order, `Color["RED"]`/`Color(1)`/
+  `_missing_`, aliases, `@unique`, `auto()`, `IntEnum`/`StrEnum`/mixed-in
+  types, `Flag`/`IntFlag` with 3.11's boundaries, the functional API,
+  `member`/`nonmember`, `verify`, immutability, members in `match`. Without
+  `__prepare__`, arithmetic on `auto()` in a body (`RW = R | W`) is kept as an
+  expression and computed when the member is made. `@dataclass` with every
+  parameter, `field()`, `KW_ONLY`, `InitVar`, ClassVar exclusion (also by
+  the text of a string annotation), inheritance, frozen instances,
+  `__match_args__`, `fields`/`asdict`/`astuple`/`replace`/
+  `make_dataclass`, CPython's messages; all of a class's methods come from
+  one `exec` of generated source (as 3.13 does).
+- **vm_audit82 (140): `typing`, `types`, `inspect`, `keyword`.** typing:
+  the special forms, Union/Optional (flattened, `==` to `X | Y`), the
+  generic aliases with substitution, TypeVar/ParamSpec/TypeVarTuple,
+  Generic (`C[int]()` sets `__orig_class__`), Protocol and
+  `runtime_checkable`, NamedTuple (class and functional forms), TypedDict,
+  NewType, `get_type_hints`, `get_origin`/`get_args`, overloads - plus
+  **`typing.check_type(value, tp)`**, a recursive runtime check that names
+  the path to the first mismatch (`value[1] is str, not int`; the idea of
+  typeguard). types: SimpleNamespace, MappingProxyType, ModuleType,
+  MethodType and stand-ins (FunctionType, GeneratorType, NoneType ...) whose
+  metaclass answers isinstance for the engines' values. inspect:
+  `signature` (functions, lambdas, bound methods, classes, partials,
+  `__wrapped__`, 32 builtins), `Signature`/`Parameter`/`BoundArguments`
+  with 3.11's `str()` and TypeErrors, the predicates, `getmembers`,
+  `getdoc`, `getsource` and friends, plus **`inspect.signature_diff(a, b)`**:
+  the calls `a` accepts that `b` would reject (a call-substitutability
+  check, as type checkers apply to overriding methods). keyword: CPython's
+  lists, and `nykwlist` read from the lexer's own table.
+- **vm_audit83 (158): `weakref`, `warnings`, `traceback`, `linecache`,
+  `atexit`.** weakref: `ref` with callbacks, `proxy`, `WeakMethod`,
+  `WeakValueDictionary`/`WeakKeyDictionary`/`WeakSet`, `finalize`. warnings:
+  `warn` (stacklevel from the running frames), the filter machinery with all
+  six actions and regexes, once-per-location registries, `catch_warnings`,
+  `PYTHONWARNINGS` and a new `-W` option, and PEP 702's
+  `warnings.deprecated`. traceback: the whole module (`format_exception`
+  with chains, `TracebackException`, `StackSummary`, "[Previous line
+  repeated N more times]").
+- **Engine work they needed (both engines):**
+  - *function introspection*: `f.__code__` (`co_varnames`,
+    `co_argcount`, `co_flags`, `co_firstlineno`...), `__defaults__`,
+    `__kwdefaults__`, `__qualname__` (the parser records it; one a
+    program assigns also names the function in call errors),
+    `__module__`, `__globals__`;
+  - *real tracebacks*: `e.__traceback__` (`tb_next`, `tb_lineno`,
+    `tb_frame`), `__context__`/`__cause__`/`__suppress_context__`,
+    `raise X from Y`, `sys.exc_info()`/`sys.exception()`/
+    `sys._getframe()`; an uncaught exception prints Python's
+    "Traceback (most recent call last):" block, chains included, before
+    the existing `[Nython] Uncaught exception` / `[VMError]` line (which
+    the IDE parses, so it is unchanged);
+  - *weakref callbacks*, run at safe points;
+  - *data descriptors* (`__set__`/`__delete__` on instance assignment);
+  - *`__index__`* for indexing, slicing, `range`, `hex`/`oct`/`bin`/`chr`
+    and `%d`; *`__hash__ = None`* makes instances unhashable;
+  - *metaclass `__setattr__`/`__delattr__`* for `C.x = v`; *`reversed(C)`*
+    through the metaclass; `isinstance(int, type)`, `int.__mro__`,
+    `issubclass(MyList, list)`, `issubclass(C, (A, B))` asking each ABC;
+  - class and instance `__dict__` list dunder names (they were stored as
+    raw keys and read as internal markers); the parser's decorator
+    temporaries are left out;
+  - `mod.C()` goes through the metaclass and `__new__`; `lambda self:`
+    binds self on the VM; a `**kw` collector keeps dunder keys;
+  - module scopes start from a snapshot of the builtins and the prelude,
+    so a program's top-level `list = []` no longer rebinds `list` inside
+    every module;
+  - Warning classes and ReferenceError; `-W` (into `sys.warnoptions`) and
+    `-X` (accepted, ignored) on the command line;
+  - fixes found on the way: `handling_obj_` was not saved across
+    generator switches and thread switches (`sys.exc_info()` could give
+    another thread's exception); a VM handler's `__excN__` stayed set after
+    its clause; `hash(obj)` kept the object alive until a full collection;
+    a `"` inside a triple-quoted string was dropped by the lexer; a class
+    with annotations lost its docstring.
+- **Cost**: a caught runtime error is ~10 µs (~40%) slower on the
+  interpreter and ~5% on the VM (it now builds the exception object and a
+  traceback entry).
+- **Not provided** (each module's header has the full list): frames have
+  no locals (`currentframe()` is None, no `inspect.stack`); weak references
+  to functions, classes and sets; `__prepare__` (enum cannot detect a name
+  assigned twice in a body); classes deriving from int/str hold no value
+  (`int.__new__` does not exist; enum delegates to the member's value); a
+  NamedTuple is tuple-like but not a tuple subclass; the abstract-class
+  check is made in `ABCMeta.__call__`; registries hold classes strongly.
+
 ### Files and time, found under Wine (vm_audit75-77)
 - **`open(newline=...)` is Python's** on both engines (the prelude's `open`
   and the VM's native one): `None` translates as the platform does, `""` and
@@ -404,6 +507,8 @@ module` files (their own scope). Most tests pass under python3 too.
 - `type(None)`, functions, builtins and generators have no type object yet
   (their legacy name strings stand in); `types.FunctionType` and friends are
   those names.
+- Frames have no locals (`inspect.currentframe()` is None); weak references
+  are to instances only; classes deriving from int/str hold no value.
 - A metaclass's `__prepare__` is not called (the class body runs in the
   engines' own namespace before the metaclass sees it), and `type.__new__`
   called by a metaclass for a *different* name than the statement's makes a
