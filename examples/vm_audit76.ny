@@ -458,7 +458,13 @@ with (pbase / "o.txt").open("w") as fh_o:
 check("Path.open", (pbase / "o.txt").open().read(), "abc")
 # a file dropped without close() is closed when its last reference goes
 # (round 77: it stayed open, and Windows cannot delete an open file)
-if os.path.isdir("/proc/self/fd"):
+# (Wine maps / to a drive, so /proc/self/fd exists there too, listing the
+# Wine process's own descriptors: Windows checks the symptom instead)
+if WIN:
+    (pbase / "o2.txt").write_text("x")
+    (pbase / "o2.txt").open().read()
+    check("dropped files are closed", raises(os.remove, str(pbase / "o2.txt")), "no error")
+elif os.path.isdir("/proc/self/fd"):
     n_fds = len(os.listdir("/proc/self/fd"))
     for _ in range(40):
         (pbase / "o.txt").open().read()
