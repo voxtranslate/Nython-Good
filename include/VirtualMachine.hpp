@@ -470,6 +470,7 @@ struct VMCode {
     // qualified name, `async def` (its body is rewritten, so nothing else
     // says), and the line of the def.
     std::string              qualname;
+    bool                     qualname_set = false;   // a __qualname__ assigned by the program (call errors use it)
     bool                     is_async = false, is_async_gen = false;
     int                      first_line = 0;
     std::shared_ptr<VMMap> closure_env;
@@ -3379,6 +3380,9 @@ private:
                           const std::vector<VMVal>& pos, const VMVal* kw,
                           VMMap& locs, bool bound_self=false) {
         const auto& pnames=code.param_names;
+        // a __qualname__ the program set names the function in its call
+        // errors; the compiler's own qualname does not (round 77)
+        const std::string& fname=code.qualname_set&&!code.qualname.empty()?code.qualname:code.name;
         const std::vector<VMVal>& dflts = defaults ? *defaults : code.param_defaults;
         size_t ai=0;
         bool star_seen=false, has_varargs=false, has_varkw=false;
@@ -3410,7 +3414,7 @@ private:
                 // (round 77: f(__x__=1) never reached parameter __x__)
                 auto it=kw->map->find(nypy::key_of_str(pn));
                 if(it!=kw->map->end()){
-                    if(have && err.empty()) err=code.name+"() got multiple values for argument '"+pn+"'";
+                    if(have && err.empty()) err=fname+"() got multiple values for argument '"+pn+"'";
                     locs[pn]=it->second; used_kw.insert(it->first); have=true;
                 }
             }
@@ -3424,7 +3428,7 @@ private:
         }
         if(err.empty() && (!missing.empty() || (!has_varargs && pos.size()>max_pos))){
             size_t s = bound_self ? 1 : 0;
-            err=nython::ny_arity_error(code.name=="<lambda>"?std::string():code.name, missing,
+            err=nython::ny_arity_error(code.name=="<lambda>"?std::string():fname, missing,
                                        min_pos+s, has_varargs ? -1L : (long)(max_pos+s), pos.size()+s);
         }
         if(kw && kw->map){
@@ -3432,9 +3436,9 @@ private:
             for(auto& [k,v]:*kw->map) if(!used_kw.count(k)) (*extra.map)[k]=v;
             if(has_varkw) locs[kw_name]=extra;
             else if(!posonly_kw.empty())
-                err=code.name+"() got some positional-only arguments passed as keyword arguments: '"+posonly_kw+"'";
+                err=fname+"() got some positional-only arguments passed as keyword arguments: '"+posonly_kw+"'";
             else if(!extra.map->empty() && err.empty())
-                err=code.name+"() got an unexpected keyword argument '"+nypy::key_payload(extra.map->begin()->first)+"'";
+                err=fname+"() got an unexpected keyword argument '"+nypy::key_payload(extra.map->begin()->first)+"'";
         } else if(has_varkw) locs[kw_name]=VMVal::make_map();
         return err;
     }
@@ -4657,9 +4661,15 @@ private:
     // A class statement with a metaclass: M.__new__ (whose type.__new__
     // returns the class already made), then M.__init__.
     VMVal run_metaclass(const VMVal& meta, const VMVal& clsv, VMCode& sub, const VMVal& kw) {
-        VMVal name=VMVal::make_str(nyrt::shown_class_name(sub.name));
+        // the class's own name, as Python passes it ("A", not "m.A" - round 77)
+        VMVal name=VMVal::make_str(nyrt::bare_class_name(nyrt::shown_class_name(sub.name)));
         std::vector<VMVal> bv;
-        for(auto& b:sub.bases){ VMVal c=class_value(b); if(c.type==VMType::CLASS) bv.push_back(c); }
+        for(auto& b:sub.bases){
+            VMVal c=class_value(b);
+            if(c.type==VMType::CLASS) bv.push_back(c);
+            // a builtin base is one of the bases the metaclass sees (round 77)
+            else if(nyrt::is_builtin_type_name(b)&&b!="object"){ VMVal t=load_var(b); if(t.type!=VMType::NONE&&t.type!=VMType::UNDEFINED) bv.push_back(t); }
+        }
         VMVal bases=VMVal::make_tuple(bv);
         VMVal ns=class_namespace(sub.name);
         bool has_kw=kw.type==VMType::MAP&&kw.map&&!kw.map->empty();
@@ -4689,10 +4699,11 @@ private:
         std::string name=a[1].type==VMType::STRING?a[1].s:a[1].to_string();
         if(!constructing_.empty()&&!constructing_.back().second){
             VMVal cls=constructing_.back().first;
-            if(nyrt::shown_class_name(class_key(cls))==name){
+            if(nyrt::bare_class_name(nyrt::shown_class_name(class_key(cls)))==nyrt::bare_class_name(name)){
                 constructing_.back().second=true;
                 auto& ns=class_vars_[class_key(cls)];
-                if(a[3].type==VMType::MAP&&a[3].map) for(auto& kv:*a[3].map) ns[kv.first]=kv.second;
+                // the dict's keys as names: "__init__" is stored "\x01s__init__" (round 77)
+                if(a[3].type==VMType::MAP&&a[3].map) for(auto& kv:*a[3].map) if(nypy::key_kind(kv.first)==nypy::K_STR) ns[nypy::key_payload(kv.first)]=kv.second;
                 if(a[0].type==VMType::CLASS) class_meta_[class_key(cls)]=a[0];
                 mro_cache_.clear(); attr_hook_cache_[0].clear(); attr_hook_cache_[1].clear();
                 class_created(cls, kwv);
@@ -4713,7 +4724,7 @@ private:
         class_reg_[code->name]=code;
         mro_cache_.clear(); attr_hook_cache_[0].clear(); attr_hook_cache_[1].clear(); no_new_.clear(); has_del_cache_.clear();
         VMMap vars;
-        if(a[3].type==VMType::MAP&&a[3].map) for(auto& kv:*a[3].map) vars[kv.first]=kv.second;
+        if(a[3].type==VMType::MAP&&a[3].map) for(auto& kv:*a[3].map) if(nypy::key_kind(kv.first)==nypy::K_STR) vars[nypy::key_payload(kv.first)]=kv.second;
         class_vars_[code->name]=vars;
         if(is_exception_class(code->name)) vm_exc_classes().insert(code->name);
         VMVal clsv=VMVal::make_class(code, code->name);
@@ -4763,6 +4774,11 @@ private:
             }
         }
         if(class_derives(cname,"type")) metaclass_types_.insert(cname);
+        if(!any_data_descr_){
+            // a data descriptor class: attribute stores look for it (round 77)
+            VMVal dm;
+            if(class_lookup(cname,"__set__",dm)||class_lookup(cname,"__delete__",dm)) any_data_descr_=true;
+        }
         {
             std::vector<std::pair<std::string,VMVal>> attrs;
             auto cv=class_vars_.find(cname);
@@ -6432,6 +6448,16 @@ private:
         }
         return nycall([&]{ return nypy::format_value(to_fmtval(v,0),spec); });
     }
+    // An object formatted by %d / %x / %f ...: its __index__, else its
+    // __float__ (round 77; an IntEnum member is formatted as its int)
+    VMVal pct_number(const VMVal& v) {
+        if(v.type!=VMType::INSTANCE) return v;
+        VMVal iv;
+        if(index_value(v,iv)) return iv;
+        bool f=false;
+        VMVal fv=call_dunder_f(v,"__float__",{},f);
+        return f?fv:v;
+    }
     // "fmt" % args
     std::string percent_format(const std::string& fmt, const VMVal& r) {
         std::vector<VMVal> args;
@@ -6444,9 +6470,9 @@ private:
                     if(idx<0){
                         auto it=r.map->find(nypy::key_of_str(key));
                         if(it==r.map->end()) raise_native_exception("KeyError",nypy::str_repr(key));
-                        return to_fmtval(it->second,conv);
+                        return to_fmtval(conv==0?pct_number(it->second):it->second,conv);
                     }
-                    return to_fmtval(args[(size_t)idx],conv);
+                    return to_fmtval(conv==0?pct_number(args[(size_t)idx]):args[(size_t)idx],conv);
                 });
         });
     }
@@ -6598,6 +6624,7 @@ private:
                 // An object with __hash__: keyed by its class and hash, as a
                 // set element is (set_key) - two equal dates are one key. The
                 // first object stored stands for the key.
+                check_hashable(k);
                 bool f=false;
                 VMVal h=call_dunder_f(k,"__hash__",{},f);
                 if(f){
@@ -6627,8 +6654,16 @@ private:
     // ── Sets (round 77; NythonExecutor's "SETS" section is the interpreter's)
     // An element's key: the dict key (vkey: 1 == 1.0 == true, tuples and
     // frozensets by content), an object with __hash__ by its hash.
+    // A class whose __hash__ is None (a dataclass with eq=True, Python's
+    // `__hash__ = None`): its instances are unhashable (round 77).
+    void check_hashable(const VMVal& v) {
+        VMVal m;
+        if(v.type==VMType::INSTANCE&&class_lookup(v.class_name,"__hash__",m)&&m.type==VMType::NONE)
+            raise_native_exception("TypeError","unhashable type: '"+vm_type_name(v)+"'");
+    }
     std::string set_key(const VMVal& v) {
         if(v.type==VMType::INSTANCE){
+            check_hashable(v);
             bool f=false;
             VMVal h=call_dunder_f(v,"__hash__",{},f);
             if(f) return "\x01h"+h.to_string();
@@ -6963,6 +6998,7 @@ private:
                 if(fa!=func_attrs_.end()){ auto it=fa->second.find(attr); if(it!=fa->second.end()){ out=it->second; return true; } }
             }
             if(attr=="__name__"){ out=VMVal::make_str(obj.code?obj.code->name:""); return true; }
+            if(attr=="__qualname__"){ out=VMVal::make_str(obj.code?(obj.code->qualname.empty()?obj.code->name:obj.code->qualname):""); return true; }
             if(attr=="__doc__"){ out=obj.code&&obj.code->has_doc?VMVal::make_str(obj.code->doc):VMVal::make_none(); return true; }
             // __defaults__, __kwdefaults__, __code__, __qualname__, __module__,
             // __globals__ (round 77): the prelude's _ny_fn_attr makes them from
@@ -7223,6 +7259,26 @@ private:
         return has;
     }
     struct RawAttr { RawAttr(){ raw_attr_depth_++; } ~RawAttr(){ raw_attr_depth_--; } RawAttr(const RawAttr&)=delete; RawAttr& operator=(const RawAttr&)=delete; };
+    // C.x = v / del C.x for a class whose metaclass defines __setattr__ /
+    // __delattr__ (not object's): the metaclass's runs (round 77, as
+    // NythonExecutor::metaAttrHook); its super().__setattr__ stores directly.
+    bool meta_attr_hook(const VMVal& cls, const char* which, std::vector<VMVal> args) {
+        if(raw_attr_depth_>0||class_meta_.empty()||cls.type!=VMType::CLASS) return false;
+        VMVal m;
+        if(!meta_member(cls,which,m)) return false;
+        call_with_first(m, cls, std::move(args), nullptr);
+        return true;
+    }
+    // A data descriptor (an object whose class defines __set__ / __delete__)
+    // held by the instance's class runs for an assignment / deletion of that
+    // attribute (round 77, as NythonExecutor::dataDescriptor). Any class
+    // defining one turns the check on (class_created).
+    bool any_data_descr_=false;
+    bool data_descriptor(const VMVal& obj, const std::string& attr, const char* which, VMVal& d, VMVal& m) {
+        if(!any_data_descr_||obj.type!=VMType::INSTANCE) return false;
+        return class_lookup(obj.class_name, attr, d) && d.type==VMType::INSTANCE && class_lookup(d.class_name, which, m)
+               && (m.type==VMType::FUNCTION||m.type==VMType::NATIVE);
+    }
     void del_attr(const VMVal& obj, const std::string& attr) {
         {
             VMVal m;
@@ -7232,6 +7288,15 @@ private:
                 return;
             }
         }
+        if(any_data_descr_){
+            VMVal d, m;
+            if(data_descriptor(obj, attr, "__delete__", d, m)){
+                std::vector<VMVal> a{obj};
+                invoke_method(m, d, a, d.class_name);
+                return;
+            }
+        }
+        if(!class_meta_.empty()&&meta_attr_hook(obj,"__delattr__",{VMVal::make_str(attr)})) return;
         if((obj.type==VMType::MAP||obj.type==VMType::INSTANCE)&&obj.map&&obj.map->erase(attr)) return;
         if(obj.type==VMType::CLASS){
             std::string cname = obj.class_name.empty() ? obj.s : obj.class_name;
@@ -7253,6 +7318,15 @@ private:
                 return;
             }
         }
+        if(any_data_descr_){
+            VMVal d, m;
+            if(data_descriptor(obj, attr, "__set__", d, m)){
+                std::vector<VMVal> a{obj, val};
+                invoke_method(m, d, a, d.class_name);
+                return;
+            }
+        }
+        if(!class_meta_.empty()&&meta_attr_hook(obj,"__setattr__",{VMVal::make_str(attr), val})) return;
         if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map){
             auto it=obj.map->find(attr);
             if(it!=obj.map->end()){
@@ -7291,7 +7365,11 @@ private:
             class_vars_[cname][attr] = std::move(val);
             return;
         }
-        if(obj.type==VMType::FUNCTION&&obj.code){ func_attrs_[func_key(obj)][attr]=std::move(val); return; }
+        if(obj.type==VMType::FUNCTION&&obj.code){
+            // f.__qualname__ = "C.f": the name its call errors give (round 77)
+            if(attr=="__qualname__"&&val.type==VMType::STRING){ obj.code->qualname=val.s; obj.code->qualname_set=true; }
+            func_attrs_[func_key(obj)][attr]=std::move(val); return;
+        }
         // none.x = v, 5.x = v, "s".x = v, len.x = v: nothing can hold it
         // (AttributeError, as in Python - it was dropped silently).
         std::string msg=attr_error_text(obj,attr);
@@ -7305,7 +7383,18 @@ private:
     int64_t index_of(const VMVal& idx, const char* what) {
         if(idx.type==VMType::INT) return idx.s.empty()?idx.i:(idx.s[0]=='-'?INT64_MIN/2:INT64_MAX/2);
         if(idx.type==VMType::BOOL) return idx.b?1:0;
+        if(idx.type==VMType::INSTANCE){ VMVal r; if(index_value(idx,r)) return index_of(r,what); }
         raise_native_exception("TypeError",std::string(what)+" indices must be integers or slices, not "+vm_type_name(idx));
+    }
+    // x.__index__() (PEP 357): an object standing for an int as an index,
+    // a range bound, hex()/bin()/chr() or %d (round 77; an IntEnum member)
+    bool index_value(const VMVal& v, VMVal& out) {
+        if(v.type!=VMType::INSTANCE) return false;
+        bool f=false;
+        out=call_dunder_f(v,"__index__",{},f);
+        if(!f) return false;
+        if(out.type!=VMType::INT&&out.type!=VMType::BOOL) raise_native_exception("TypeError","__index__ returned non-int (type "+vm_type_name(out)+")");
+        return true;
     }
     // A slice spec [start, stop(, step)] (none = omitted) against length len:
     // the number of items and the adjusted start/step (PySlice_AdjustIndices).
@@ -7314,6 +7403,8 @@ private:
         bool hs=false,he=false;
         auto bound=[&](const VMVal& v,int64_t& out)->bool{
             if(v.type==VMType::NONE||v.type==VMType::UNDEFINED) return false;
+            VMVal iv;
+            if(v.type==VMType::INSTANCE&&index_value(v,iv)){ out=index_of(iv,"slice"); return true; }
             if(v.type!=VMType::INT&&v.type!=VMType::BOOL) raise_native_exception("TypeError","slice indices must be integers or None or have an __index__ method");
             out=index_of(v,"slice"); return true;
         };
@@ -9760,8 +9851,10 @@ private:
         auto need=[vm](const std::vector<VMVal>& a, size_t n, const char* what){
             if(a.size()<n) vm->raise_native_exception("TypeError",std::string(what)+" expected "+std::to_string(n)+" argument"+(n==1?"":"s")+", got "+std::to_string(a.size()));
         };
-        auto as_int=[vm](const VMVal& v)->nypy::NumV{
+        auto as_int=[vm](const VMVal& v0)->nypy::NumV{
             nypy::NumV n;
+            VMVal v=v0;
+            { VMVal iv; if(vm->index_value(v0,iv)) v=iv; }   // __index__ (round 77)
             if(!v.to_numv(n)||n.k==3) vm->raise_native_exception("TypeError","'"+vm_type_name(v)+"' object cannot be interpreted as an integer");
             return n;
         };
@@ -10022,6 +10115,8 @@ private:
         def("reversed",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
             if(a.empty()) vm->raise_native_exception("TypeError","reversed expected 1 argument, got 0");
             if(a[0].type==VMType::INSTANCE){ VMVal r=vm->call_dunder(a[0],"__reversed__",{}); if(r.type!=VMType::NONE) return r; }
+            // a class whose metaclass defines __reversed__: reversed(Color) (round 77)
+            if(a[0].type==VMType::CLASS){ VMVal r; if(vm->meta_call(a[0],"__reversed__",{},r)) return r; }
             std::vector<VMVal> items=vm->iter_items(a[0]);
             std::reverse(items.begin(),items.end());
             return VMVal::make_list(std::move(items));
@@ -10280,7 +10375,13 @@ private:
             return VMVal::make_bool(!a.empty()&&vm_truthy(a[0]));});
         // len and type: register_pycore (it runs after this and replaced
         // the copies that were here)
-        globals_["range"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
+        globals_["range"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            // a bound given by an object with __index__ (round 77)
+            for(auto& x:a) if(x.type==VMType::INSTANCE){
+                VMVal iv;
+                if(index_value(x,iv)) x=iv;
+                else raise_native_exception("TypeError","'"+vm_type_name(x)+"' object cannot be interpreted as an integer");
+            }
             int64_t st=0,en=0,step=1;
             if(a.size()==1)en=a[0].i;
             else if(a.size()>=2){st=a[0].i;en=a[1].i;}
@@ -10551,7 +10652,10 @@ private:
             auto one=[&](const VMVal& c){
                 if(c.type==VMType::CLASS) return class_derives(a[0].class_name, c.class_name)||nyrt::shown_class_name(c.class_name)=="object";
                 if(c.type==VMType::STRING) return class_derives(a[0].class_name, c.s);
-                if(builtin_name(c)=="object") return true;
+                std::string bn=builtin_name(c);
+                if(bn=="object") return true;
+                // a class deriving from a builtin type: issubclass(IntEnum, int) (round 77)
+                if(!bn.empty()&&nyrt::is_builtin_type_name(bn)&&class_derives(a[0].class_name, bn)) return true;
                 return false;
             };
             if(a[1].type==VMType::LIST&&a[1].list){
@@ -10767,6 +10871,7 @@ private:
         globals_["hash"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.empty()) raise_native_exception("TypeError","hash() takes exactly one argument (0 given)");
             if(a[0].type==VMType::INSTANCE){
+                check_hashable(a[0]);
                 bool f=false; VMVal r=call_dunder_f(a[0],"__hash__",{},f);
                 if(f) return r;
                 uintptr_t raw=a[0].map?(uintptr_t)a[0].map.get():0;

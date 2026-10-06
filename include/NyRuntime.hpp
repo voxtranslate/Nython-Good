@@ -108,6 +108,13 @@ inline std::string shown_class_name(const std::string& n) {
     return n.substr(0, h);
 }
 
+// A module's class is keyed "module.Class" (round 77): its own name, as
+// __name__ and a metaclass's `name` argument give it.
+inline std::string bare_class_name(const std::string& n) {
+    size_t dot = n.rfind('.');
+    return dot == std::string::npos ? n : n.substr(dot + 1);
+}
+
 // issubclass over the builtin types (round 77): a type derives from itself
 // and from object, bool from int.
 inline bool builtin_type_derives(const std::string& sub, const std::string& sup) {
