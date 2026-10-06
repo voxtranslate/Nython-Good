@@ -4343,8 +4343,6 @@ private:
         mro_cache_[cls]=res;
         return res;
     }
-    // `attr` in the namespace of `cls` or a class after it in its MRO
-    // (strictly after `after`, when given - for super()).
     // The namespace of an MRO entry: a builtin type's is its mirror's
     // (round 77, see class_lookup).
     std::unordered_map<std::string,VMMap>::iterator class_vars_at(const std::string& c) {
@@ -4353,6 +4351,8 @@ private:
         const char* mn=nyrt::builtin_mirror(c);
         return mn?class_vars_.find(mn):cv;
     }
+    // `attr` in the namespace of `cls` or a class after it in its MRO
+    // (strictly after `after`, when given - for super()).
     bool class_lookup(const std::string& cls, const std::string& attr, VMVal& out,
                       std::string* owner=nullptr, const std::string* after=nullptr) {
         auto mro=class_mro(cls);
