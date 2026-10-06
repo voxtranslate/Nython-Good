@@ -653,7 +653,9 @@ check("Set operators", [sorted(a & b), sorted(a | b), sorted(a - b), sorted(a ^ 
                         sorted(a & [3, 9]), sorted([2, 7] & a), sorted(a - [1]), sorted([1, 5] | a), sorted({2, 9} - a)],
       [[2, 3], [1, 2, 3, 4], [1], [1, 4], "ListSet", [3], [2], [2, 3], [1, 2, 3, 5], [9]])
 check("isdisjoint, _hash", [a.isdisjoint([7, 8]), a.isdisjoint([3]), a._hash(), ListSet()._hash(), ListSet([5, -7, 100])._hash()],
-      [True, False, -272375401224217160, 133146708735736, -3759759131576854860])
+      # CPython's algorithm masks with sys.maxsize: the values depend on the word size
+      [True, False] + ([-272375401224217160, 133146708735736, -3759759131576854860] if sys.maxsize > 2**31
+                       else [-2021384008, -1572407560, 1920513972]))
 check("set and ListSet", [{1, 2, 3} == a, sorted(a | {1, 5}), isinstance(a, Set), isinstance(a, MutableSet)],
       [True, [1, 2, 3, 5], True, False])
 

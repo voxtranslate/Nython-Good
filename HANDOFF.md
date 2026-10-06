@@ -862,6 +862,14 @@ Nython over the class machinery above; each header says what is not there.
   `[WinError N]` form - on Windows only, as in CPython; elsewhere nothing
   changes. vm_audit46 compares the file name in a message with its repr (the
   OS layer quotes names as CPython does, doubling Windows' backslashes).
+- **32-bit Windows (i686, under Wine), round 77 at 49cca9a**: 401 runs, one
+  failure - vm_audit74 compared `collections.abc.Set._hash()` with 64-bit
+  values; CPython's algorithm masks with `sys.maxsize`, and Nython's 32-bit
+  values are exactly CPython's for a 32-bit word, so the test now picks by
+  `sys.maxsize`. The i686 link warns "duplicate section ...class_dir_names...
+  has different size": GCC aligned that function-local static to 8 (padded to
+  16 bytes) in one unit and to 4 (12 bytes) in another - the same object,
+  only the padding differs, so it is harmless.
 
 ### A running program's input (vm_audit71, tools/ide_e2e.py `run`/`terminal`)
 - The IDE closed a program's stdin (`os_spawn(..., input="")`), so its first
