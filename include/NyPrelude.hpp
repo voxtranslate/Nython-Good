@@ -112,6 +112,15 @@ class NythonFile:
             self.closed = true
         return none
 
+    # As CPython's io objects: a file dropped without close() is closed when
+    # its last reference goes - `open(p).read()` kept the handle until the
+    # program ended, and Windows cannot delete or rename an open file
+    # (round 77).
+    def __del__(self):
+        if not getattr(self, "closed", true):
+            self.closed = true
+            file_close(self.handle)
+
     def fileno(self):
         return self.handle
 

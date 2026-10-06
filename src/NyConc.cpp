@@ -3112,14 +3112,21 @@ static int wait_io_task(ThreadRec* self, std::vector<IoReq>& reqs, const Deadlin
     std::unique_lock<std::mutex> lk(RT().m);
     check_cancel_locked(self);
     for (auto& w : ws) L->io.push_back(&w);
+    // Blocking, so a cancellation wakes it (task_cancel_locked): it was woken
+    // only by its descriptor, and a socket closed under it - Server.close()
+    // cancelling its accept loop - is reported by Linux's poll (POLLNVAL)
+    // but never by Windows', so asyncio.run waited forever there (round 77).
+    // Not blocked_forever: the reactor wakes it, no deadlock to report.
+    self->blocking = true;
     struct Unreg {
-        Loop* L; std::vector<IoWait>& ws;
+        Loop* L; std::vector<IoWait>& ws; ThreadRec* self;
         ~Unreg() {
             auto& v = L->io;
             v.erase(std::remove_if(v.begin(), v.end(), [this](IoWait* p) {
                 return p >= ws.data() && p < ws.data() + ws.size(); }), v.end());
+            self->blocking = false;
         }
-    } unreg{L, ws};
+    } unreg{L, ws, self};
     auto ready = [&] { for (auto& w : ws) if (w.revents) return true; return false; };
     while (!ready()) {
         if (dl.expired()) return 0;
@@ -3205,7 +3212,23 @@ static void loop_poll_io(std::unique_lock<std::mutex>& lk, Loop* L) {
     lk.lock();
     L->polling = false;
     (void)watch;
-    if (r <= 0) return;
+    if (r < 0) {
+        // One invalid socket (closed while a task waited on it) fails the
+        // whole call, where poll() would flag just that one POLLNVAL: find
+        // it and report it as an error to its task, instead of failing
+        // every poll from now on (a busy loop) (round 77).
+        for (size_t i = 0; i < ws.size(); i++) {
+            WSAPOLLFD one = fds[i];
+            one.revents = 0;
+            if (WSAPoll(&one, 1, 0) >= 0 && !(one.revents & POLLNVAL)) continue;
+            IoWait* w = ws[i];
+            if (std::find(L->io.begin(), L->io.end(), w) == L->io.end()) continue;
+            w->revents = IO_ERR;
+            make_ready(w->task);
+        }
+        return;
+    }
+    if (r == 0) return;
     for (size_t i = 0; i < ws.size(); i++) {
         if (!fds[i].revents) continue;
         IoWait* w = ws[i];

@@ -548,6 +548,15 @@ check("struct_time make", repr(time.struct_time((2024, 1, 2, 3, 4, 5, 1, 2, 0)))
 check("strftime", [time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(1709528400)), time.strftime("%a %A %b %B %j %p %y %%", (2024, 3, 4, 15, 0, 0, 0, 64, 0)),
                    time.strftime("%c|%x|%X", (2024, 1, 5, 3, 4, 5, 4, 5, 0))],
       ["2024-03-04 05:00:00", "Mon Monday Mar March 064 PM 24 %", "Fri Jan  5 03:04:05 2024|01/05/24|03:04:05"])
+# glibc's directives and flags, the same on every platform (round 77: the
+# Windows C runtime has none of these and aborted on an unknown directive)
+check("strftime C-locale directives and flags",
+      [time.strftime("%-d|%e|%k|%l|%P|%u|%C|%D|%F|%R|%T|%r|%n|%t|", (2024, 1, 5, 3, 4, 5, 4, 5, 0)),
+       time.strftime("%G-W%V-%u %g|%G-W%V", (2024, 12, 30, 0, 0, 0, 0, 365, 0)) + "|" + time.strftime("%G-W%V", (2021, 1, 3, 0, 0, 0, 6, 3, 0)),
+       time.strftime("%_H|%^a|%#p|%4Y|%_4Y|%10F|%-10b|%5%|%Q|%Ey|%Od", (12, 1, 5, 3, 4, 5, 4, 5, 0))],
+      ["5| 5| 3| 3|am|5|20|01/05/24|2024-01-05|03:04|03:04:05|03:04:05 AM|\n|\t|",
+       "2025-W01-1 25|2025-W01|2020-W53",
+       " 3|FRI|am|0012|  12|  12-01-05|       Jan|    %|%Q|12|05"])
 check("strftime errors", [err(lambda: time.strftime("%Y", (2024, 13, 1, 0, 0, 0, 0, 1, 0))), errtype(lambda: time.strftime("%Y", (1, 2)))],
       ["ValueError: month out of range", "TypeError"])
 check("asctime", [time.asctime(time.gmtime(0)), time.asctime((2024, 1, 5, 3, 4, 5, 4, 5, 0))], ["Thu Jan  1 00:00:00 1970", "Fri Jan  5 03:04:05 2024"])

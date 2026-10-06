@@ -36,6 +36,7 @@
 # fields are read-only properties (assigning raises AttributeError, with
 # Nython's wording).
 import time as _time
+import sys as _sys
 import math
 
 __all__ = ["date", "datetime", "time", "timedelta", "timezone", "tzinfo", "MINYEAR", "MAXYEAR", "UTC"]
@@ -1347,6 +1348,11 @@ class datetime(date):
         var result = cls(tt[0], tt[1], tt[2], tt[3], tt[4], ss, us, tz)
         if tz is none and not utc:
             var max_fold_seconds = 24 * 3600
+            # As CPython: Windows' localtime() fails for negative times, so
+            # the fold probe below is skipped for a time within a day of
+            # the epoch (fromtimestamp(0) raised OverflowError there)
+            if t < max_fold_seconds and _sys.platform.startswith("win"):
+                return result
             var p1 = _time.localtime(t - max_fold_seconds)
             var probe1 = cls(p1[0], p1[1], p1[2], p1[3], p1[4], min(p1[5], 59), us, tz)
             var trans = result - probe1 - timedelta(0, max_fold_seconds)

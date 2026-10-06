@@ -409,96 +409,152 @@ check("absolute", [Path("rel_x").absolute().is_absolute(), Path("rel_x").absolut
 check("cwd/home/expanduser", [Path.cwd() == Path(os.getcwd()), Path.home() == Path(os.path.expanduser("~")),
                               str(Path("~/x").expanduser()) == os.path.expanduser("~/x")], [True, True, True])
 check("samefile", (pbase / "a.txt").samefile(str(pbase) + "/sub/../a.txt"), True)
-os.symlink(str(pbase / "a.txt"), str(pbase / "link"))
-check("symlink", [(pbase / "link").is_symlink(), (pbase / "link").exists(), rel((pbase / "link").readlink()),
-                  rel((pbase / "link").resolve())], [True, True, "/pl/a.txt", "/pl/a.txt"])
+def can_symlink(d):
+    # as CPython's test.support.os_helper.can_symlink: Windows without
+    # developer mode (and Wine, whose CreateSymbolicLinkW makes nothing)
+    # cannot create one
+    probe = os.path.join(d, "symlink_probe")
+    try:
+        os.symlink(os.path.join(d, "a.txt"), probe)
+    except OSError:
+        return False
+    made = os.path.islink(probe)
+    if made:
+        os.remove(probe)
+    return made
+has_link = can_symlink(str(pbase))
+if has_link:
+    os.symlink(str(pbase / "a.txt"), str(pbase / "link"))
+    check("symlink", [(pbase / "link").is_symlink(), (pbase / "link").exists(), rel((pbase / "link").readlink()),
+                      rel((pbase / "link").resolve())], [True, True, "/pl/a.txt", "/pl/a.txt"])
+else:
+    check("symlink (none can be made here)", True, True)
 check("rmdir non-empty", raises((pbase / "sub").rmdir), "OSError")
 with (pbase / "o.txt").open("w") as fh_o:
     fh_o.write("abc")
 check("Path.open", (pbase / "o.txt").open().read(), "abc")
+# a file dropped without close() is closed when its last reference goes
+# (round 77: it stayed open, and Windows cannot delete an open file)
+if os.path.isdir("/proc/self/fd"):
+    n_fds = len(os.listdir("/proc/self/fd"))
+    for _ in range(40):
+        (pbase / "o.txt").open().read()
+    check("dropped files are closed", len(os.listdir("/proc/self/fd")) - n_fds <= 1, True)
+else:
+    check("dropped files are closed (no /proc here)", True, True)
 st_o = (pbase / "o.txt").stat()
 check("stat result", [st_o.st_size, st_o[6], len(st_o)], [3, 3, 10])
 if hasattr(Path, "walk"):
     walked = sorted([(rel(w[0]), sorted(w[1]), sorted(w[2])) for w in pbase.walk()])
 else:
     walked = sorted([(rel(w[0]), sorted(w[1]), sorted(w[2])) for w in os.walk(str(pbase))])
-check("walk", walked, [("/pl", ["sub"], ["a.txt", "link", "o.txt"]), ("/pl/sub", ["deep"], [".h.py", "x.py"]),
+check("walk", walked, [("/pl", ["sub"], ["a.txt", "link", "o.txt"] if has_link else ["a.txt", "o.txt"]), ("/pl/sub", ["deep"], [".h.py", "x.py"]),
                        ("/pl/sub/deep", [], ["y.py"])])
 check("other flavour", raises(pathlib.WindowsPath if os.name != "nt" else pathlib.PosixPath, "x"), "NotImplementedError")
 
 # ── subprocess ───────────────────────────────────────────────────────────────
-cp = subprocess.run(["sh", "-c", "echo out; echo err 1>&2; exit 3"], capture_output=True)
-check("run capture", [cp.returncode, cp.stdout, cp.stderr, cp.args], [3, b"out\n", b"err\n", ["sh", "-c", "echo out; echo err 1>&2; exit 3"]])
-check("CompletedProcess repr", repr(subprocess.run(["sh", "-c", "exit 0"])), "CompletedProcess(args=['sh', '-c', 'exit 0'], returncode=0)")
-check("run text", subprocess.run(["sh", "-c", "printf 'a\\r\\nb\\rc'"], capture_output=True, text=True).stdout, "a\nb\nc")
-check("run bytes", subprocess.run(["printf", "a\\377"], stdout=subprocess.PIPE).stdout, b"a\xff")
-check("run input", subprocess.run(["cat"], input="h\u00e9", capture_output=True, text=True).stdout, "h\u00e9")
-check("run input bytes", subprocess.run(["cat"], input=b"xy", capture_output=True).stdout, b"xy")
-check("run input str without text", raises(subprocess.run, ["cat"], input="x", capture_output=True), "TypeError")
-check("run stderr=STDOUT", subprocess.run(["sh", "-c", "echo out; echo err 1>&2"], stdout=subprocess.PIPE,
-                                          stderr=subprocess.STDOUT, text=True).stdout, "out\nerr\n")
-check("run DEVNULL", subprocess.run(["sh", "-c", "echo x"], stdout=subprocess.DEVNULL).stdout, None)
-check("run shell", subprocess.run("echo $((6*7))", shell=True, capture_output=True, text=True).stdout, "42\n")
-check("run cwd", subprocess.run(["pwd"], cwd=TMP, capture_output=True, text=True).stdout.strip(), os.path.realpath(TMP))
-check("run env replaces", subprocess.run(["sh", "-c", "echo $FOO-$VM76_UNSET"],
-                                         env={"FOO": "bar", "PATH": os.environ.get("PATH", "/bin:/usr/bin")},
-                                         capture_output=True, text=True).stdout, "bar-\n")
-cpe = None
+# Portable children: this interpreter itself (sys.executable -c ...), so
+# these run on Windows too, where there is no sh/cat/printf on PATH.
+def py_child(code):
+    return [sys.executable, "-c", code]
+cp_p = subprocess.run(py_child("import sys\nprint('out')\nprint('err', file=sys.stderr)\nsys.exit(3)"),
+                      capture_output=True, text=True, cwd=REPO)
+check("portable run capture", [cp_p.returncode, cp_p.stdout, cp_p.stderr], [3, "out\n", "err\n"])
+check("portable run input", subprocess.run(py_child("import sys\nprint(sys.stdin.read().upper(), end='')"),
+                                           input="abc", capture_output=True, text=True, cwd=REPO).stdout, "ABC")
+check("portable check_output", subprocess.check_output(py_child("print('hi')"), text=True, cwd=REPO), "hi\n")
+portable_cpe = None
 try:
-    subprocess.run(["sh", "-c", "echo partial; exit 2"], capture_output=True, check=True)
-except subprocess.CalledProcessError as e_cpe:
-    cpe = e_cpe
-check("CalledProcessError", [cpe.returncode, cpe.cmd, cpe.output, cpe.stdout, cpe.stderr, str(cpe)],
-      [2, ["sh", "-c", "echo partial; exit 2"], b"partial\n", b"partial\n", b"",
-       "Command '['sh', '-c', 'echo partial; exit 2']' returned non-zero exit status 2."])
-check("CalledProcessError hierarchy", [issubclass(subprocess.CalledProcessError, subprocess.SubprocessError),
-                                       issubclass(subprocess.TimeoutExpired, subprocess.SubprocessError)], [True, True])
-check("CalledProcessError signal", str(subprocess.CalledProcessError(-9, "cmd")), "Command 'cmd' died with <Signals.SIGKILL: 9>.")
-toe = None
+    subprocess.run(py_child("import sys\nsys.exit(2)"), check=True, capture_output=True, cwd=REPO)
+except subprocess.CalledProcessError as e_pcpe:
+    portable_cpe = e_pcpe.returncode
+check("portable CalledProcessError", portable_cpe, 2)
+po_p = subprocess.Popen(py_child("import sys\nx = input()\nprint('got ' + x)\nsys.exit(7)"),
+                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, cwd=REPO)
+po_out, po_err = po_p.communicate("hello\n")
+check("portable Popen communicate", [po_out, po_p.returncode], ["got hello\n", 7])
+portable_to = "no timeout"
 try:
-    subprocess.run(["sleep", "5"], timeout=0.2)
-except subprocess.TimeoutExpired as e_to:
-    toe = e_to
-check("TimeoutExpired", [toe.cmd, 0.1 <= toe.timeout <= 0.2, str(toe)[:len("Command '['sleep', '5']' timed out after 0.")]],
-      [["sleep", "5"], True, "Command '['sleep', '5']' timed out after 0."])
-check("missing program", raises_msg(subprocess.run, ["no-such-program-vm76"]),
-      "FileNotFoundError: [Errno 2] No such file or directory: 'no-such-program-vm76'")
-check("check_output", subprocess.check_output(["echo", "hi"]), b"hi\n")
-check("check_output text", subprocess.check_output(["sh", "-c", "echo hi"], text=True), "hi\n")
-check("check_output fails", raises(subprocess.check_output, ["sh", "-c", "exit 1"]), "CalledProcessError")
-check("check_call", [subprocess.check_call(["true"]), raises(subprocess.check_call, ["false"])], [0, "CalledProcessError"])
-check("call", subprocess.call(["sh", "-c", "exit 5"]), 5)
-check("getoutput", subprocess.getoutput("echo hi; echo err >&2"), "hi\nerr")
-check("getstatusoutput", [subprocess.getstatusoutput("exit 4"), subprocess.getstatusoutput("echo ok")], [(4, ""), (0, "ok")])
-check("list2cmdline", subprocess.list2cmdline(["a b", "c\"d", "e\\", ""]), "\"a b\" c\\\"d e\\ \"\"")
-fh_sp = open(T("sp_out.txt"), "w")
-subprocess.run(["echo", "to file"], stdout=fh_sp)
-fh_sp.close()
-check("run stdout=file", read_file_text(T("sp_out.txt")), "to file\n")
-check("run Path arg", subprocess.run(["cat", Path(T("sp_out.txt"))], capture_output=True).stdout, b"to file\n")
-inh = subprocess.run([sys.executable, "-c", "import subprocess\nsubprocess.run(['echo', 'inherited'])\nprint('after')"],
-                     capture_output=True, text=True, cwd=REPO)
-check("stdout=None is inherited", [inh.stdout, inh.returncode], ["inherited\nafter\n", 0])
-pop = subprocess.Popen(["sh", "-c", "read x; echo got $x; echo e >&2; exit 7"], stdin=subprocess.PIPE,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-pop_out, pop_err = pop.communicate("hello\n")
-check("Popen communicate", [pop_out, pop_err, pop.returncode, pop.poll()], ["got hello\n", "e\n", 7, 7])
-pop2 = subprocess.Popen(["cat"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-pop2.stdin.write("l1\nl2\n")
-pop2.stdin.close()
-check("Popen pipes", [list(pop2.stdout), pop2.wait()], [["l1\n", "l2\n"], 0])
-pop3 = subprocess.Popen(["sh", "-c", "printf 'abc\\ndef'"], stdout=subprocess.PIPE)
-check("Popen read", [pop3.stdout.readline(), pop3.stdout.read(), pop3.wait()], [b"abc\n", b"def", 0])
-pop4 = subprocess.Popen(["sleep", "10"])
-check("Popen poll running", pop4.poll(), None)
-check("Popen wait timeout", raises(pop4.wait, 0.1), "TimeoutExpired")
-pop4.kill()
-check("Popen kill", pop4.wait(), -9)
-pop4.kill()
-with subprocess.Popen(["sh", "-c", "exit 3"], stdout=subprocess.PIPE) as pop5:
-    pop5_out = pop5.stdout.read()
-check("Popen context manager", [pop5_out, pop5.returncode], [b"", 3])
-check("Popen repr", repr(pop5), "<Popen: returncode: 3 args: ['sh', '-c', 'exit 3']>")
+    subprocess.run(py_child("import time\ntime.sleep(5)"), timeout=0.5, cwd=REPO)
+except subprocess.TimeoutExpired:
+    portable_to = "TimeoutExpired"
+check("portable timeout", portable_to, "TimeoutExpired")
+
+# The POSIX tools (sh, cat, printf, pwd, sleep, true/false) and signal
+# numbers: not on Windows, as CPython's test_subprocess skips them there.
+if os.name != "nt" and shutil.which("sh") is not None:
+    cp = subprocess.run(["sh", "-c", "echo out; echo err 1>&2; exit 3"], capture_output=True)
+    check("run capture", [cp.returncode, cp.stdout, cp.stderr, cp.args], [3, b"out\n", b"err\n", ["sh", "-c", "echo out; echo err 1>&2; exit 3"]])
+    check("CompletedProcess repr", repr(subprocess.run(["sh", "-c", "exit 0"])), "CompletedProcess(args=['sh', '-c', 'exit 0'], returncode=0)")
+    check("run text", subprocess.run(["sh", "-c", "printf 'a\\r\\nb\\rc'"], capture_output=True, text=True).stdout, "a\nb\nc")
+    check("run bytes", subprocess.run(["printf", "a\\377"], stdout=subprocess.PIPE).stdout, b"a\xff")
+    check("run input", subprocess.run(["cat"], input="h\u00e9", capture_output=True, text=True).stdout, "h\u00e9")
+    check("run input bytes", subprocess.run(["cat"], input=b"xy", capture_output=True).stdout, b"xy")
+    check("run input str without text", raises(subprocess.run, ["cat"], input="x", capture_output=True), "TypeError")
+    check("run stderr=STDOUT", subprocess.run(["sh", "-c", "echo out; echo err 1>&2"], stdout=subprocess.PIPE,
+                                              stderr=subprocess.STDOUT, text=True).stdout, "out\nerr\n")
+    check("run DEVNULL", subprocess.run(["sh", "-c", "echo x"], stdout=subprocess.DEVNULL).stdout, None)
+    check("run shell", subprocess.run("echo $((6*7))", shell=True, capture_output=True, text=True).stdout, "42\n")
+    check("run cwd", subprocess.run(["pwd"], cwd=TMP, capture_output=True, text=True).stdout.strip(), os.path.realpath(TMP))
+    check("run env replaces", subprocess.run(["sh", "-c", "echo $FOO-$VM76_UNSET"],
+                                             env={"FOO": "bar", "PATH": os.environ.get("PATH", "/bin:/usr/bin")},
+                                             capture_output=True, text=True).stdout, "bar-\n")
+    cpe = None
+    try:
+        subprocess.run(["sh", "-c", "echo partial; exit 2"], capture_output=True, check=True)
+    except subprocess.CalledProcessError as e_cpe:
+        cpe = e_cpe
+    check("CalledProcessError", [cpe.returncode, cpe.cmd, cpe.output, cpe.stdout, cpe.stderr, str(cpe)],
+          [2, ["sh", "-c", "echo partial; exit 2"], b"partial\n", b"partial\n", b"",
+           "Command '['sh', '-c', 'echo partial; exit 2']' returned non-zero exit status 2."])
+    check("CalledProcessError hierarchy", [issubclass(subprocess.CalledProcessError, subprocess.SubprocessError),
+                                           issubclass(subprocess.TimeoutExpired, subprocess.SubprocessError)], [True, True])
+    check("CalledProcessError signal", str(subprocess.CalledProcessError(-9, "cmd")), "Command 'cmd' died with <Signals.SIGKILL: 9>.")
+    toe = None
+    try:
+        subprocess.run(["sleep", "5"], timeout=0.2)
+    except subprocess.TimeoutExpired as e_to:
+        toe = e_to
+    check("TimeoutExpired", [toe.cmd, 0.1 <= toe.timeout <= 0.2, str(toe)[:len("Command '['sleep', '5']' timed out after 0.")]],
+          [["sleep", "5"], True, "Command '['sleep', '5']' timed out after 0."])
+    check("missing program", raises_msg(subprocess.run, ["no-such-program-vm76"]),
+          "FileNotFoundError: [Errno 2] No such file or directory: 'no-such-program-vm76'")
+    check("check_output", subprocess.check_output(["echo", "hi"]), b"hi\n")
+    check("check_output text", subprocess.check_output(["sh", "-c", "echo hi"], text=True), "hi\n")
+    check("check_output fails", raises(subprocess.check_output, ["sh", "-c", "exit 1"]), "CalledProcessError")
+    check("check_call", [subprocess.check_call(["true"]), raises(subprocess.check_call, ["false"])], [0, "CalledProcessError"])
+    check("call", subprocess.call(["sh", "-c", "exit 5"]), 5)
+    check("getoutput", subprocess.getoutput("echo hi; echo err >&2"), "hi\nerr")
+    check("getstatusoutput", [subprocess.getstatusoutput("exit 4"), subprocess.getstatusoutput("echo ok")], [(4, ""), (0, "ok")])
+    check("list2cmdline", subprocess.list2cmdline(["a b", "c\"d", "e\\", ""]), "\"a b\" c\\\"d e\\ \"\"")
+    fh_sp = open(T("sp_out.txt"), "w")
+    subprocess.run(["echo", "to file"], stdout=fh_sp)
+    fh_sp.close()
+    check("run stdout=file", read_file_text(T("sp_out.txt")), "to file\n")
+    check("run Path arg", subprocess.run(["cat", Path(T("sp_out.txt"))], capture_output=True).stdout, b"to file\n")
+    inh = subprocess.run([sys.executable, "-c", "import subprocess\nsubprocess.run(['echo', 'inherited'])\nprint('after')"],
+                         capture_output=True, text=True, cwd=REPO)
+    check("stdout=None is inherited", [inh.stdout, inh.returncode], ["inherited\nafter\n", 0])
+    pop = subprocess.Popen(["sh", "-c", "read x; echo got $x; echo e >&2; exit 7"], stdin=subprocess.PIPE,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    pop_out, pop_err = pop.communicate("hello\n")
+    check("Popen communicate", [pop_out, pop_err, pop.returncode, pop.poll()], ["got hello\n", "e\n", 7, 7])
+    pop2 = subprocess.Popen(["cat"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    pop2.stdin.write("l1\nl2\n")
+    pop2.stdin.close()
+    check("Popen pipes", [list(pop2.stdout), pop2.wait()], [["l1\n", "l2\n"], 0])
+    pop3 = subprocess.Popen(["sh", "-c", "printf 'abc\\ndef'"], stdout=subprocess.PIPE)
+    check("Popen read", [pop3.stdout.readline(), pop3.stdout.read(), pop3.wait()], [b"abc\n", b"def", 0])
+    pop4 = subprocess.Popen(["sleep", "10"])
+    check("Popen poll running", pop4.poll(), None)
+    check("Popen wait timeout", raises(pop4.wait, 0.1), "TimeoutExpired")
+    pop4.kill()
+    check("Popen kill", pop4.wait(), -9)
+    pop4.kill()
+    with subprocess.Popen(["sh", "-c", "exit 3"], stdout=subprocess.PIPE) as pop5:
+        pop5_out = pop5.stdout.read()
+    check("Popen context manager", [pop5_out, pop5.returncode], [b"", 3])
+    check("Popen repr", repr(pop5), "<Popen: returncode: 3 args: ['sh', '-c', 'exit 3']>")
 check("PIPE/STDOUT/DEVNULL", [subprocess.PIPE, subprocess.STDOUT, subprocess.DEVNULL], [-1, -2, -3])
 
 # ── platform ─────────────────────────────────────────────────────────────────

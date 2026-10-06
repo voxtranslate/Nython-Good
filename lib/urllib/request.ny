@@ -495,16 +495,23 @@ class HTTPHandler(AbstractHTTPHandler):
         return self.do_request_(req)
 
 class HTTPSHandler(AbstractHTTPHandler):
+    # The default context is made by the first https request, not here:
+    # build_opener() installs this handler in every opener, and on a system
+    # without OpenSSL that made every urlopen() fail, plain http included
+    # (CPython leaves the handler out when there is no ssl module).
     def __init__(self, debuglevel=none, context=none, check_hostname=none):
         AbstractHTTPHandler.__init__(self, debuglevel)
-        if context == none:
-            import ssl
-            context = ssl.create_default_context()
-        if check_hostname != none:
+        if context != none and check_hostname != none:
             context.check_hostname = check_hostname
         self._context = context
+        self._check_hostname = check_hostname
 
     def https_open(self, req):
+        if self._context == none:
+            import ssl
+            self._context = ssl.create_default_context()
+            if self._check_hostname != none:
+                self._context.check_hostname = self._check_hostname
         return self.do_open(http.client.HTTPSConnection, req, context=self._context)
 
     def https_request(self, req):

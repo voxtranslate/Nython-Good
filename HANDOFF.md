@@ -462,6 +462,46 @@ Nython over the class machinery above; each header says what is not there.
 - **`os.utime` / touch on Windows** use `SetFileTime` with backup semantics
   (`win_set_times`): the CRT's `_utime` cannot open a directory
   (PermissionError) and kept whole seconds; times are now set to 100 ns.
+- **Local times before 1970 on Windows**: `localtime_s` refuses them too;
+  `to_tm` then applies the zone's standard bias (`GetTimeZoneInformation`)
+  to the UTC arithmetic above (no DST rule for such dates, as the CRT has
+  none either). `datetime.fromtimestamp(t)` for `t` within a day of the epoch
+  skips the fold probe on Windows, as CPython does (it raised OverflowError).
+- **vm_audit76 is portable**: symlink checks run only where a symlink can be
+  made (an unprivileged Windows account cannot), and the subprocess checks
+  run a Python child (`[sys.executable, "-c", ...]`) instead of POSIX tools,
+  which stay checked where `sh` exists.
+- **A cancelled task waiting on a socket was never woken** (an asyncio
+  program that had served one connection never returned from
+  `asyncio.run` on Windows - vm_audit67 hung under Wine):
+  `task_cancel_locked` wakes only a `blocking` task and `wait_io_task` never
+  set the flag. On Linux the socket that `Server.close()` closes under the
+  accept loop hid it - `poll` flags the closed descriptor (POLLNVAL) and
+  wakes the task - but `WSAPoll` fails the whole call for one invalid
+  socket, so the reactor spun. Both fixed in `src/NyConc.cpp`: the waiting
+  task is `blocking` (not `blocked_forever`: no deadlock to report), and a
+  failed `WSAPoll` is retried socket by socket to give the invalid one an
+  error, as POLLNVAL would.
+- **strftime is Nython's own, the same everywhere** (`format_tm` in
+  `src/builtins/os_time.cpp`): every C-locale directive, with glibc's output
+  as the reference (CPython on Linux) - Windows' C runtime formatted
+  `%c`/`%x`/`%X` by its locale (`1/5/2024 3:04:05 AM`), padded `%Y` to four
+  digits, lacked `%e %k %l %s %P %G %V %u %C %n %t` and aborted on a directive
+  it did not know. glibc's flags (`%-d`, `%_H`, `%^a`, `%#p`, `%010Y`) and
+  widths work on every platform; an unknown directive is copied as written;
+  `%z`/`%Z` still ask the C library (only it knows the zone; `time.strftime`
+  fills them from the tuple first, as CPython). Checked against python3's
+  `time.strftime` on 30,000 (directive, date) pairs, years 1 to 9999, ISO weeks
+  at every year boundary.
+- **A file dropped without `close()` is closed** when its last reference
+  goes (`NythonFile.__del__`, both engines), as CPython's io objects:
+  `open(p).read()` kept its handle to the end of the program, and Windows
+  cannot delete or rename an open file (vm_audit76's cleanup failed there).
+- **`urllib`'s default HTTPS context is made by the first https request**:
+  `build_opener()` puts an `HTTPSHandler` in every opener and its constructor
+  made the context, so without OpenSSL (a Windows system without its DLLs)
+  every `urlopen`, plain http included, raised SSLError - vm_audit70 then
+  waited for its server threads forever.
 
 ### A running program's input (vm_audit71, tools/ide_e2e.py `run`/`terminal`)
 - The IDE closed a program's stdin (`os_spawn(..., input="")`), so its first

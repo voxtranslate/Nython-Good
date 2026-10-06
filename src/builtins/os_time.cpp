@@ -36,6 +36,8 @@
 #include <thread>
 #include <ctime>
 #include <cstring>
+#include <cctype>
+#include <algorithm>
 #include <cmath>
 #include <random>
 #include <sstream>
@@ -105,7 +107,16 @@ bool to_tm(double ts, bool utc, std::tm& out) {
     if (utc) return utc_tm(ts, out);
     std::time_t t = (std::time_t)std::floor(ts);
 #ifdef _WIN32
-    return (utc ? gmtime_s(&out, &t) : localtime_s(&out, &t)) == 0;
+    if (localtime_s(&out, &t) == 0) return true;
+    // Windows refuses local times before 1970 (datetime(1970, 1, 1)
+    // .timestamp() probes a day earlier, and failed): the calendar with the
+    // zone's standard offset instead - Windows keeps no DST rules for those
+    // years anyway (round 77).
+    TIME_ZONE_INFORMATION tzi;
+    if (GetTimeZoneInformation(&tzi) == TIME_ZONE_ID_INVALID) return false;
+    if (!utc_tm(ts - (double)tzi.Bias * 60.0, out)) return false;
+    out.tm_isdst = 0;
+    return true;
 #else
     return (utc ? gmtime_r(&t, &out) : localtime_r(&t, &out)) != nullptr;
 #endif
@@ -119,24 +130,11 @@ std::time_t timegm_portable(std::tm* tm) {
 #endif
 }
 
-// strftime with a growing buffer (it used a fixed 64-byte buffer and ignored
-// the return value, so a long result came back as garbage bytes) and "%f"
-// for microseconds.
-std::string format_tm(const std::string& fmt_in, const std::tm& tm, long us) {
-    std::string fmt;
-    for (size_t i = 0; i < fmt_in.size(); i++) {
-        if (fmt_in[i] == '%' && i + 1 < fmt_in.size()) {
-            if (fmt_in[i + 1] == 'f') {
-                char b[32]; std::snprintf(b, sizeof b, "%06ld", us);
-                fmt += b; i++; continue;
-            }
-            fmt += fmt_in[i]; fmt += fmt_in[i + 1]; i++; continue;
-        }
-        fmt += fmt_in[i];
-    }
-    if (fmt.empty()) return "";
-    // strftime returns 0 both for "does not fit" and for an empty result;
-    // a trailing sentinel tells the two apart.
+// The platform's strftime for one directive (%z, %Z: the zone, which only
+// the C library knows), with a growing buffer: strftime returns 0 both for
+// "does not fit" and for an empty result, so a trailing sentinel tells the
+// two apart.
+static std::string platform_strftime(const std::string& fmt, const std::tm& tm) {
     std::string f2 = fmt + "\x01";
     std::vector<char> buf(std::max<size_t>(64, f2.size() * 4));
     for (int tries = 0; tries < 8; tries++) {
@@ -145,6 +143,139 @@ std::string format_tm(const std::string& fmt_in, const std::tm& tm, long us) {
         buf.resize(buf.size() * 4);
     }
     return "";
+}
+
+// The ISO 8601 week-based year's day count, as glibc computes it: the days
+// since the Monday of the year's first week (negative: the previous year's).
+static int iso_week_days(int yday, int wday) {
+    const int big_enough_multiple_of_7 = (366 / 7 + 2) * 7;
+    return yday - (yday - wday + 4 + big_enough_multiple_of_7) % 7 + 4 - 1;
+}
+static bool is_leap(long long y) { return (y % 4 == 0 && y % 100 != 0) || y % 400 == 0; }
+
+// strftime in the C locale, implemented here so it is the same on every
+// platform (round 77): Windows' C runtime formats %c/%x/%X by its own
+// locale ("1/5/2024 3:04:05 AM"), pads %Y to four digits, has no %e %k %l
+// %s %P %G %V %u %C %n %t, and aborts on a directive it does not know;
+// glibc's output is the reference (CPython on Linux). glibc's flags are
+// accepted - "-" (no padding), "_" (spaces), "0" (zeros), "^" (upper case),
+// "#" (swap case) - and a field width (%10Y, %-d, %_H); E and O modifiers
+// are ignored, as in the C locale. "%f" is microseconds (Nython). An
+// unknown directive is copied as it is, as glibc does.
+std::string format_tm(const std::string& fmt, const std::tm& tm, long us) {
+    static const char* const wd_full[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+    static const char* const mo_full[] = {"January", "February", "March", "April", "May", "June", "July",
+                                          "August", "September", "October", "November", "December"};
+    const long long year = (long long)tm.tm_year + 1900;
+    const int wday = ((tm.tm_wday % 7) + 7) % 7, mon = ((tm.tm_mon % 12) + 12) % 12;
+    std::string out;
+    out.reserve(fmt.size() * 2);
+    for (size_t i = 0; i < fmt.size(); i++) {
+        if (fmt[i] != '%' || i + 1 >= fmt.size()) { out += fmt[i]; continue; }
+        const size_t at = i;
+        size_t j = i + 1;
+        char pad = 0;            // 0: the directive's own
+        bool upper = false, swap = false;
+        while (j < fmt.size() && std::strchr("-_0^#", fmt[j])) {
+            char f = fmt[j++];
+            if (f == '^') upper = true;
+            else if (f == '#') swap = true;
+            else pad = f;
+        }
+        int width = -1;
+        while (j < fmt.size() && fmt[j] >= '0' && fmt[j] <= '9') {
+            width = (width < 0 ? 0 : width) * 10 + (fmt[j++] - '0');
+            if (width > 1024) width = 1024;
+        }
+        while (j < fmt.size() && (fmt[j] == 'E' || fmt[j] == 'O')) j++;
+        if (j >= fmt.size()) { out.append(fmt, at, std::string::npos); break; }
+        const char c = fmt[j];
+        i = j;
+        // A number padded to `digits` with `fill` (the directive's default).
+        auto num = [&](long long v, int digits, char fill) {
+            char f = pad == '-' ? 0 : pad == '_' ? ' ' : pad == '0' ? '0' : fill;
+            int w = width >= 0 ? width : digits;
+            std::string d = std::to_string(v < 0 ? -v : v);
+            std::string r;
+            if (f && (int)d.size() + (v < 0 ? 1 : 0) < w) {
+                size_t n = (size_t)(w - (int)d.size() - (v < 0 ? 1 : 0));
+                if (f == '0') r = (v < 0 ? "-" : "") + std::string(n, '0') + d;
+                else r = std::string(n, ' ') + (v < 0 ? "-" : "") + d;
+            } else r = (v < 0 ? "-" : "") + d;
+            out += r;
+        };
+        // Text (names, composites): padded with spaces to the width.
+        enum { KEEP, UP, LOW } cas = upper ? UP : KEEP;
+        auto text = [&](std::string t, bool swap_lowers) {
+            if (swap) cas = swap_lowers ? LOW : UP;
+            if (cas == UP) for (auto& ch : t) ch = (char)std::toupper((unsigned char)ch);
+            else if (cas == LOW) for (auto& ch : t) ch = (char)std::tolower((unsigned char)ch);
+            // as glibc: "-" removes the padding of numbers only
+            if (width > (int)t.size())
+                t = std::string((size_t)(width - (int)t.size()), pad == '0' ? '0' : ' ') + t;
+            out += t;
+        };
+        auto sub = [&](const char* f) { std::string t = format_tm(f, tm, us); text(t, false); };
+        switch (c) {
+        case '%': text("%", false); break;
+        case 'n': out += '\n'; break;
+        case 't': out += '\t'; break;
+        case 'a': text(std::string(wd_full[wday], 3), false); break;
+        case 'A': text(wd_full[wday], false); break;
+        case 'b': case 'h': text(std::string(mo_full[mon], 3), false); break;
+        case 'B': text(mo_full[mon], false); break;
+        case 'p': text(tm.tm_hour >= 12 ? "PM" : "AM", true); break;
+        case 'P': text(tm.tm_hour >= 12 ? "pm" : "am", false); break;
+        case 'c': sub("%a %b %e %H:%M:%S %Y"); break;
+        case 'D': case 'x': sub("%m/%d/%y"); break;
+        case 'F': sub("%Y-%m-%d"); break;
+        case 'r': sub("%I:%M:%S %p"); break;
+        case 'R': sub("%H:%M"); break;
+        case 'T': case 'X': sub("%H:%M:%S"); break;
+        // the "yearish" ones (%C %Y %G) are not padded unless a width asks
+        case 'C': num((year - (((year % 100) + 100) % 100)) / 100, 1, '0'); break;
+        case 'y': num(((year % 100) + 100) % 100, 2, '0'); break;
+        case 'Y': num(year, 1, '0'); break;
+        case 'd': num(tm.tm_mday, 2, '0'); break;
+        case 'e': num(tm.tm_mday, 2, ' '); break;
+        case 'H': num(tm.tm_hour, 2, '0'); break;
+        case 'k': num(tm.tm_hour, 2, ' '); break;
+        case 'I': num((tm.tm_hour + 11) % 12 + 1, 2, '0'); break;
+        case 'l': num((tm.tm_hour + 11) % 12 + 1, 2, ' '); break;
+        case 'j': num(tm.tm_yday + 1, 3, '0'); break;
+        case 'm': num(mon + 1, 2, '0'); break;
+        case 'M': num(tm.tm_min, 2, '0'); break;
+        case 'S': num(tm.tm_sec, 2, '0'); break;
+        case 'u': num(wday == 0 ? 7 : wday, 1, '0'); break;
+        case 'w': num(wday, 1, '0'); break;
+        case 'U': num((tm.tm_yday - wday + 7) / 7, 2, '0'); break;
+        case 'W': num((tm.tm_yday - (wday - 1 + 7) % 7 + 7) / 7, 2, '0'); break;
+        case 'G': case 'g': case 'V': {
+            long long y = year;
+            int days = iso_week_days(tm.tm_yday, wday);
+            if (days < 0) {
+                y--;
+                days = iso_week_days(tm.tm_yday + (365 + (is_leap(y) ? 1 : 0)), wday);
+            } else {
+                int d = iso_week_days(tm.tm_yday - (365 + (is_leap(y) ? 1 : 0)), wday);
+                if (d >= 0) { y++; days = d; }
+            }
+            if (c == 'G') num(y, 1, '0');
+            else if (c == 'g') num(((y % 100) + 100) % 100, 2, '0');
+            else num(days / 7 + 1, 2, '0');
+            break;
+        }
+        case 's': {
+            std::tm c2 = tm;
+            num((long long)std::mktime(&c2), 1, '0');
+            break;
+        }
+        case 'f': num(us, 6, '0'); break;
+        case 'z': case 'Z': text(platform_strftime(std::string("%") + c, tm), c == 'Z'); break;
+        default: out.append(fmt, at, j - at + 1); break;   // as glibc: copied as written
+        }
+    }
+    return out;
 }
 
 std::string format_time(const std::string& fmt_in, double ts, bool utc) {
