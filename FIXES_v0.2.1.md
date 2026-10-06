@@ -5570,6 +5570,14 @@ Full detail in `HANDOFF.md` §0p. New tests: `vm_audit65` (bytes, 149 checks), `
 | VM: `type(xs.append)` read `'map'`, `[].append.__name__` raised | builtin methods had no type | `builtin_function_or_method` / `method` with Python's reprs and attributes |
 | `type(None)`, functions, generators gave strings | no type objects for them | runtime type objects (`NoneType`, `function`, `generator`, `zip`, ...), still `==` the legacy names |
 | `d = {"get": 1}; d.get("x")` called the key | keys were read before a dict's methods | the methods win; other names still read keys |
+| `1 in 5` was false; `1 < "a"`, `None < 1` compared | no type check on membership and ordering | TypeError with Python's messages, both engines |
+| `str(KeyError("k"))` was `k`; a subclass's `self.msg` was overwritten by `super().__init__` | exceptions kept a legacy `msg` and printed their first argument | CPython's str/repr/args per class; `msg` removed |
+| `except FileNotFoundError as e: e.filename` was missing | native OSErrors carried only a message | errno/strerror/filename/filename2 parsed back from the OS layer's messages; `OSError(2, "x")` is a FileNotFoundError |
+| VM: `next(5)` returned none; `iter(f, sentinel)` missing | | TypeError; a lazy `callable_iterator` |
+| `f"{obj}"` ignored `__format__` | the empty spec skipped it | `__format__` called, `object.__format__` rejects a spec |
+| `os.stat(p)` was a dict | no structure sequences | `os.stat_result`, `terminal_size`, `times`, `uname` |
+| `exec(src, ns)`: functions defined there did not see later changes to `ns`; `def __init__` was not exported | the namespace was copied in and out | `ns` is the code's live globals |
+| VM: printing a two-list cycle overflowed the stack | no recursion guard in repr | `[...]` / `{...}` / `(...)` as CPython |
 | No abc, enum, dataclasses, typing, types, inspect, keyword, weakref, warnings, traceback, numbers, collections.abc | — | written over the class machinery, CPython's algorithms and messages (vm_audit74, 81-83) |
 | `e.__traceback__`, `sys.exc_info()`, `raise X from Y`'s `__cause__` did not exist; an uncaught error showed one line | exceptions carried a location string only | real traceback objects on both engines; Python's traceback block before the `[Nython]`/`[VMError]` line |
 | `sys.exc_info()` could return another thread's (or a suspended generator's) exception | `handling_obj_` was not swapped with the rest of the per-thread state | saved and restored with it |

@@ -356,6 +356,64 @@ membership), `frozenset`, the full API and operators; `dict | dict`.
 - `getattr(o, n)` without a default re-raises the AttributeError a getter
   raised; messages show a re-run class's name without `#n`.
 
+### Values and errors as Python has them (vm_audit87, 73 checks; 72 pass under python3)
+- **`in` and ordering raise TypeError** with Python's messages: `1 in 5`,
+  `x in None`, `1 in "abc"`; `1 < "a"`, `None < 1`, `[] < 3`, list vs tuple,
+  dicts. The message names the first pair that cannot be ordered (`[1] <
+  ["a"]` names int and str); NaN still compares false. (`sorted`/`min`/`max`
+  of mixed types still fall back to ordering by type name.)
+- **Exceptions**: `str`/`repr`/`args` as CPython (KeyError's str is its key's
+  repr; `repr(e)` shows the args' reprs; `str(e)` ignores a class's own
+  `__repr__`). `OSError(errno, strerror[, filename[, winerror[,
+  filename2]]])` sets its fields, prints `[Errno 2] x: 'f' -> 'g'`, cuts
+  `args` to `(errno, strerror)`, and `OSError(2, "x")` is a
+  FileNotFoundError (CPython's errno table, `ny_errno_exc_class` in
+  `include/NyExcTypes.hpp`); Unicode errors have `encoding`/`object`/
+  `start`/`end`/`reason`; SyntaxError's tuple form gives its fields and `msg
+  (file.py, line 3)`; `ImportError.msg`. **The legacy `msg` attribute is
+  gone**: `super().__init__` overwrote a subclass's own `self.msg`.
+- **Errors raised by the runtime carry their fields**: native OSErrors
+  (open, stat, listdir, rename...) have `errno`/`strerror`/`filename`/
+  `filename2` (the OS layer quotes names with repr and the engines parse
+  them back - `ny_parse_errno_message`); codec errors carry the input as
+  `e.object` (a thread-local the codec sets, `last_unicode_error()`); a
+  missing key, `set.remove`, `dict.pop`, `del d[k]` raise `KeyError(key)`
+  with the key itself.
+- **Iteration and generators**: `iter(callable, sentinel)` (a lazy
+  `callable_iterator`); the VM's `next()` of a non-iterator is a TypeError
+  (it gave none) and `iter(bytes)` works; `gen.throw(type, value, tb)` /
+  `gen.throw(instance)` normalized as Python; a bare `raise` in a helper
+  called from an except clause re-raises on the VM; generators have
+  `__name__`, `__qualname__`, `gi_running`, `gi_suspended`, `gi_frame` (None
+  once finished; `f_lineno` is the paused line), `gi_code`, `gi_yieldfrom`.
+- **`__format__`**: `f"{obj}"` calls it even for an empty spec and the
+  result must be a str; `object.__format__` rejects a non-empty spec;
+  `(255).__format__("x")` and friends.
+- **`os`**: `os.stat`/`lstat`/`fstat` return an `os.stat_result`
+  (indexing, slicing, fields, `st_*_ns`, `st_blocks`, read-only; prelude
+  `_NyStructSeq`), `os.get_terminal_size()` (OSError off a terminal, as
+  Python), `os.times()`, `os.uname()`; `listdir`/`rename`/`replace`/`mkdir`/
+  `link`/`remove` raise OSError with the file names. The flat `os_*`
+  builtins keep their contracts.
+- **`exec(src, ns)` / `eval(src, ns)`**: `ns` is the live globals of what
+  the code defines (`Context::ns_owner`: a scope runs over the dict's map
+  without owning it) - later changes to `ns` are seen, `global x` writes
+  into it, dunder names are exported. With a separate locals dict the old
+  copy-in/copy-out remains.
+- **Recursive containers** print `[...]`, `{...}`, `(...)` through any cycle
+  (the VM overflowed its stack on a two-list cycle).
+- `lib/aiagent.ny` skips malformed stored cells: the shared store file
+  `/tmp/nyx_final/nyx_memory.json` (test_all_libs) held cells with a None
+  confidence, which is no longer comparable with a number.
+- Not done (vm_audit87): `range()` and `dict.keys()/values()/items()` are
+  lists; `zip`/`map`/`filter`/`enumerate` over lists return lists (Nython's
+  design; old tests index them); the default instance repr stays `<C
+  instance>`; structure sequences are not tuple subclasses; `fileno()` is
+  Nython's handle (only `os.stat`/`fstat` translate it);
+  `ImportError(name=, path=)` and `AttributeError(name=, obj=)` keywords;
+  exception fields show in `vars(e)`; `exec(src, g, l)` with two dicts still
+  copies; a dunder name exec binds is copied into the dict when it returns.
+
 ### The Python standard library (vm_audit73, 75-78)
 Each module is CPython 3.12's API and algorithm, written in Nython, with a
 header comment saying what is there and what is not; all are `# nython:

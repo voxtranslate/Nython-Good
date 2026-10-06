@@ -366,6 +366,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit82 | 140 | round 77: typing (Union, generics, TypeVar, Protocol, NamedTuple, TypedDict, get_type_hints, check_type), types, inspect (signature, bind, getsource), keyword |
 | vm_audit83 | 158 | round 77: weakref (callbacks, proxies, weak dicts, finalize), warnings (filters, catch_warnings, -W), traceback (real tracebacks, chains), linecache, atexit |
 | vm_audit86 | 65 | round 77: every class statement its own class, `isinstance(x, object)`, `__eq__` without `__hash__`, property/staticmethod/classmethod objects, dir/vars, two-argument super, bound/builtin method types and reprs, type objects for None/functions/builtins/generators/iterators, dict methods before keys (63 pass under python3) |
+| vm_audit87 | 73 | round 77: `in`/ordering TypeErrors, exceptions' str/repr/args and fields (OSError errno/filename, Unicode errors, SyntaxError), runtime errors with their fields, `iter(f, sentinel)`, generator attributes, `__format__`, `os.stat_result`, live `exec` namespaces, recursive reprs (72 pass under python3) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -984,6 +985,11 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   builtins, generators and iterators (`type(f) is types.FunctionType`, still
   `== "function"`); a plain dict's methods (`get`, `keys`, `pop`...) win over
   its keys, other names still read keys.
+- **Values and errors** (vm_audit87): `1 in 5` and `1 < "a"` raise
+  TypeError; exceptions print and carry fields as CPython (`e.errno`,
+  `e.filename` on native OSErrors; no legacy `e.msg` any more - use
+  `str(e)` or `e.args`); `os.stat()` is an `os.stat_result`; `exec(src, ns)`
+  runs with `ns` as live globals.
 - **Class-machinery modules** (vm_audit74, 81-83): abc, numbers,
   collections.abc (collections is a package now), enum, dataclasses,
   typing (+ `check_type`), types, inspect (+ `signature_diff`), keyword,
