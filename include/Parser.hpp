@@ -176,6 +176,30 @@ private:
 
     std::string identifier();
     std::string dottedName();
+    // Soft keywords (round 77): the word at the start of a statement is a
+    // name when usedAsName(); var/let/const/ref declare when declFollows().
+    bool usedAsName(int k = 1);
+    bool declFollows();
+    // Binding positions (assignment, del, walrus targets): `self`/`this`
+    // there are the names, not the Nython self-reference (round 77).
+    node_ptr asTarget(node_ptr t);
+    // `this` reads as self only inside a def whose first parameter is
+    // self/this; elsewhere it is the ordinary name (round 77).
+    std::vector<bool> self_scope_;
+    // A statement that starts with `{` is a dict/set display when the
+    // brace is followed by more of an expression (`{}["x"]`, `{1} | s`)
+    // rather than a block (round 77).
+    bool braceIsExpression();
+    // star_expressions: `1, 2`, `*a, b` (a tuple display) or one expression
+    node_ptr exprList(Token tok, std::vector<node_ptr>* items = nullptr, node_ptr first = nullptr);
+    // del target lists: `del a, (b, [c])` (round 77)
+    void delTargets(node_ptr t, std::vector<node_ptr>& out);
+    // lambda parameters before a bare `/`
+    size_t lambda_posonly_ = 0;
+    // Binding a value to a (tuple/list/starred) target, into `block`
+    std::string unpackTemp();
+    void bindTarget(const Token& op, node_ptr t, node_ptr value, node_ptr block);
+    void bindTargets(const Token& op, const std::vector<node_ptr>& ts, int star, const std::string& src, node_ptr block);
 
     bool isCompoundStatement();
     bool isFlowStatement();

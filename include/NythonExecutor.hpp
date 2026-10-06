@@ -552,6 +552,7 @@ public:   // NythonExecutor is a struct: members default to public
             "staticmethod","classmethod","callable","dir","vars","globals","locals","eval","exec","compile","_ny_setattr_raw","_ny_delattr_raw","_ny_object_new","_ny_subclasses","_ny_type_new","_ny_type_call",
             "_ny_main_globals","_ny_exc_current","_ny_stack",
             "_ny_fn_info","_ny_fn_globals","_ny_keywords",   // inspect, f.__code__, keyword (round 77)
+            "_ny_unicode_lookup","_ny_unicode_name",          // unicodedata (round 77)
             "iter","next","help","Set","Counter","OrderedDict","deque","defaultdict","assert",
             "islice","take",   // lazy iteration (src/NyGen.cpp), both engines
             "sqrt","sin","cos","tan","log","floor","ceil",
@@ -957,7 +958,12 @@ public:   // NythonExecutor is a struct: members default to public
                 // Walrus operator: (var name = expr) — evaluates expr, stores it, returns value
                 auto wn = static_pointer_cast<WalrusNode>(node);
                 Value v = evalNode(wn->init, ctx);
-                (wn->global_ref ? moduleCtx(ctx) : ctx)->defineByName(wn->name, v);
+                Context* wc = wn->global_ref ? moduleCtx(ctx) : ctx;
+                // in a comprehension or generator expression it binds in the
+                // scope around it (PEP 572; round 77: the name stayed inside)
+                while (!wn->global_ref && wc->parent && (wc->name == "<comprehension>" || wc->name == "<genexpr>"))
+                    wc = wc->parent;
+                wc->defineByName(wn->name, v);
                 return v;
             }
             default: return NONE_VALUE;
@@ -1074,8 +1080,23 @@ public:   // NythonExecutor is a struct: members default to public
     void assignName(VariableNode* vn, const Value& val, Context* ctx) {
         if (vn->global_ref) moduleCtx(ctx)->defineByName(vn->name, val);
         else if (ctx->inClass) ctx->defineByName(vn->name, val);
-        else ctx->setByName(vn->name, val);
+        else {
+            // A builtin's name (len, sorted, max, id, type, open...) assigned
+            // in a function is a local of it, as in Python and on the VM
+            // (round 77: the nearest binding was the builtin itself in the
+            // global scope, which the assignment replaced for the whole
+            // program). At the top level it shadows the builtin, as before.
+            const std::string& n = vn->name;
+            if (ctx != global_ctx && base_global_names_.count(n) && !program_rebound_.count(n)) {
+                Context* c = ctx;
+                while (c && !(c->container && c->container->count(n))) c = c->inModule ? nullptr : c->parent;
+                if (c == global_ctx) { ctx->defineByName(n, val); return; }
+            }
+            if (ctx == global_ctx && base_global_names_.count(n)) program_rebound_.insert(n);
+            ctx->setByName(n, val);
+        }
     }
+    std::unordered_set<std::string> program_rebound_;   // builtin names the program's top level rebound
 
     Value evalVariable(node_ptr node, Context* ctx) {
         auto vn = static_pointer_cast<VariableNode>(node);
@@ -1125,6 +1146,26 @@ public:   // NythonExecutor is a struct: members default to public
         if (vd->unpack != -2 && !nygen::is_gen(val) && isInstanceValue(val)
             && (instanceHasMethod(val, "__iter__") || instanceHasMethod(val, "__next__")))
             val = nygen::make_iter(*this, val, ctx);
+        // a set or a dict is iterated too (its keys), and a list, tuple or
+        // string must hold exactly as many items as there are targets - at
+        // least as many as the unstarred ones (round 77: extra items were
+        // dropped and missing ones an IndexError). VarDeclNode::unpack: n,
+        // or -3 - k for a starred list of k other targets.
+        if (vd->unpack != -2) {
+            Container* uc = contOf(val);
+            if (uc && (isSetCont(uc) || seqLen(uc) < 0) && !isGenCont(uc)) val = nygen::make_iter(*this, val, ctx);
+            int64_t len = -1;
+            if ((uc = contOf(val)) && !isGenCont(uc)) len = seqLen(uc);
+            else if (string_ptrs_.count(val.value.p) && val.type == ValueType::USERDATA)
+                len = (int64_t)nypy::u8_len(*static_cast<std::string*>(val.value.p));
+            int n = vd->unpack;
+            if (len >= 0 && n >= 0 && len > n)
+                pyRaise("ValueError", "too many values to unpack (expected " + std::to_string(n) + ")");
+            if (len >= 0 && n >= 0 && len < n)
+                pyRaise("ValueError", "not enough values to unpack (expected " + std::to_string(n) + ", got " + std::to_string(len) + ")");
+            if (len >= 0 && n <= -3 && len < -n - 3)
+                pyRaise("ValueError", "not enough values to unpack (expected at least " + std::to_string(-n - 3) + ", got " + std::to_string(len) + ")");
+        }
         if (vd->unpack != -2 && isInstanceValue(val) && instanceHasMethod(val, "__next__")) {
             std::vector<Value> items, no_args;
             int n = vd->unpack;
@@ -1138,6 +1179,8 @@ public:   // NythonExecutor is a struct: members default to public
                 pyRaise("ValueError", "too many values to unpack (expected " + std::to_string(n) + ")");
             if (n >= 0 && (int)items.size() < n)
                 pyRaise("ValueError", "not enough values to unpack (expected " + std::to_string(n) + ", got " + std::to_string(items.size()) + ")");
+            if (n <= -3 && (int)items.size() < -n - 3)   // round 77
+                pyRaise("ValueError", "not enough values to unpack (expected at least " + std::to_string(-n - 3) + ", got " + std::to_string(items.size()) + ")");
             val = makeListValue(items);
         }
         if (vd->unpack != -2 && nygen::is_gen(val)) val = nygen::unpack_list(*this, val, vd->unpack, ctx);
@@ -2164,7 +2207,8 @@ public:   // NythonExecutor is a struct: members default to public
                 static const std::unordered_map<std::string, const char*> idunder = {
                     {"+=", "__iadd__"}, {"-=", "__isub__"}, {"*=", "__imul__"}, {"/=", "__itruediv__"},
                     {"//=", "__ifloordiv__"}, {"%=", "__imod__"}, {"**=", "__ipow__"}, {"&=", "__iand__"},
-                    {"|=", "__ior__"}, {"^=", "__ixor__"}, {"<<=", "__ilshift__"}, {">>=", "__irshift__"}};
+                    {"|=", "__ior__"}, {"^=", "__ixor__"}, {"<<=", "__ilshift__"}, {">>=", "__irshift__"},
+                    {"@=", "__imatmul__"}};   // round 77
                 auto it = idunder.find(op);
                 // No __iadd__: x += y is x = x + y (__add__, then the
                 // right operand's __radd__), as Python - it raised
@@ -2174,6 +2218,12 @@ public:   // NythonExecutor is a struct: members default to public
                     Value r = callMethod(old_val, it->second, a, ctx);
                     if (r.type != ValueType::NONE && !isNotImplemented(r)) { result = r; done = true; }
                 }
+            }
+            if (!done && op == "@=") {
+                // `a @= b` without __imatmul__: a = a @ b (round 77)
+                if (!binaryDunder("@", old_val, new_val, ctx, result))
+                    pyRaise("TypeError", "unsupported operand type(s) for @=: '" + typeNameOf(old_val) + "' and '" + typeNameOf(new_val) + "'");
+                done = true;
             }
             if (!done) {
                 if (opc == OP_UNKNOWN) result = new_val;
@@ -3296,6 +3346,25 @@ public:   // NythonExecutor is a struct: members default to public
                 // repr(), as in Python and on the VM.
                 std::string cn0 = instanceClassName(v);
                 if (!cn0.empty() && isExceptionClass(cn0)) {
+                    // repr() is Type(*args) with each argument's repr, as
+                    // Python and the VM give: ValueError(1), not
+                    // ValueError('1') (round 77)
+                    if (repr) {
+                        auto pit = instance_properties.find(v.value.p);
+                        if (pit != instance_properties.end() && pit->second->container && pit->second->container->count("args")) {
+                            Container* ac = contOf(pit->second->getByName("args"));
+                            int64_t an = ac ? seqLen(ac) : -1;
+                            if (an >= 0) {
+                                std::string r = cn0 + "(";
+                                for (int64_t i = 0; i < an; i++) {
+                                    if (i) r += ", ";
+                                    auto it = ac->container->find(std::to_string(i));
+                                    if (it != ac->container->end()) r += toText(it->second, true, ctx, depth + 1);
+                                }
+                                return r + ")";
+                            }
+                        }
+                    }
                     std::string msg = exceptionMessage(v);
                     return repr ? cn0 + "(" + nypy::str_repr(msg) + ")" : msg;
                 }
@@ -3604,9 +3673,9 @@ public:   // NythonExecutor is a struct: members default to public
                 std::vector<Value> no_args;
                 return callMethod(v, d, no_args, ctx);
             }
-            if (op == "+") return v;
-            if (op == "~") return intValue(0);
-            return Value(0) - v;
+            // anything else has no unary + - ~: TypeError, as Python (round
+            // 77: `-{}` was none, `~[1]` 0 and `+"a"` "a")
+            pyRaise("TypeError", "bad operand type for unary " + op + ": '" + typeNameOf(v) + "'");
         }
         if (op == "++" || op == "--") {
             Num n;
@@ -5384,6 +5453,19 @@ public:   // NythonExecutor is a struct: members default to public
         nyrt::OrderedKw<Value> class_kw;
         for (auto& [k, e] : cn->keywords) {
             Value v = evalNode(e, ctx);
+            if (k == "**") {
+                // `class C(**kw)` (round 77): each item is a keyword
+                Container* kc = contOf(v);
+                if (!kc || seqLen(kc) >= 0) pyRaise("TypeError", "argument after ** must be a mapping, not " + typeNameOf(v));
+                for (auto& [dk, dv] : *kc->container) {
+                    if (isInternalKey(dk)) continue;   // a marker, not an item
+                    if (nypy::key_kind(dk) != nypy::K_STR) pyRaise("TypeError", "keywords must be strings");
+                    std::string kn = nypy::key_payload(dk);
+                    if (kn == "metaclass") class_meta_[(void*)node.get()] = dv;
+                    else class_kw[kn] = dv;
+                }
+                continue;
+            }
             if (k == "metaclass") class_meta_[(void*)node.get()] = v;
             else class_kw[k] = v;
         }
@@ -6025,6 +6107,28 @@ public:   // NythonExecutor is a struct: members default to public
     void bindLambdaParams(LambdaNode* lam, std::vector<Value>& args,
                           const nyrt::OrderedKw<Value>& kw, Context* fc, Context* def_ctx,
                           void* callee_ptr = nullptr) {
+        // Python's whole parameter grammar - `*`, `/`, keyword-only
+        // parameters, **kw, unexpected keywords - binds as a def's does
+        // (round 77: `lambda *, k: k`, `lambda **kw: kw` and `lambda a, /, b`
+        // were read as plain parameters). The signature is a FunctionNode
+        // made once per lambda; its defaults are the ones evalLambda kept
+        // under callee_ptr.
+        bool simple = lam->posonly == 0;
+        for (auto& p : lam->params) {
+            const std::string& pn = p->value();
+            if (!pn.empty() && pn[0] == '*') { simple = false; break; }
+        }
+        if (!simple || !kw.empty()) {
+            if (!lam->sig) {
+                auto sig = std::make_shared<FunctionNode>(lam->token(), "<lambda>", lam->body, false);
+                for (auto& p : lam->params) sig->add(p);
+                sig->defaults = lam->defaults;
+                sig->posonly = lam->posonly;
+                lam->sig = sig;
+            }
+            bindParamsImpl(static_cast<FunctionNode*>(lam->sig.get()), args, kw, fc, def_ctx, 0, callee_ptr);
+            return;
+        }
         const std::vector<Value>* made = nullptr;   // defaults evaluated by evalLambda
         if (callee_ptr) {
             auto it = fn_defaults_val_.find(callee_ptr);
@@ -9216,6 +9320,21 @@ public:
     // a submodule a/b/c.ny): each package's namespace gets its loaded
     // submodules as attributes.
     Value importDotted(const node_ptr& node, ImportNode* in_node, const std::string& module_name, Context* ctx) {
+        // `import os.path` binds os, `import os.path as p` and `from
+        // os.path import join` the path namespace of the builtin os
+        // module (round 77: "No module named 'os.path'")
+        if (module_name == "os.path") {
+            Value osv = makeOsNamespace();
+            Value pv = NONE_VALUE;
+            if (auto* po = dynamic_cast<Object*>(osv.value.gc)) {
+                auto it = po->container->find("path");
+                if (it != po->container->end()) pv = it->second;
+            }
+            if (!in_node->names.empty()) bindFromNamespace(pv, in_node->names, module_name, ctx);
+            else if (!in_node->alias.empty()) ctx->defineByName(in_node->alias, pv);
+            else ctx->defineByName("os", osv);
+            return NONE_VALUE;
+        }
         std::vector<std::string> parts;
         size_t a = 0;
         while (a <= module_name.size()) {
@@ -9790,7 +9909,10 @@ public:
                 registerBuiltin("os_path_ext");
                 registerBuiltin("os_path_abs");
                 if (module_name == "os") {
-                    ctx->defineByName(in_node->alias.empty() ? "os" : in_node->alias, makeOsNamespace());
+                    // `from os import path as p, sep` binds the names asked
+                    // for (round 77: only `import os` bound anything)
+                    if (from_import) bindFromNamespace(makeOsNamespace(), in_node->names, "os", ctx);
+                    else ctx->defineByName(in_node->alias.empty() ? "os" : in_node->alias, makeOsNamespace());
                     imported_modules_.erase(module_name);
                 }
                 return NONE_VALUE;

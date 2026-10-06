@@ -1123,6 +1123,162 @@ def _ny_run_atexit():
             pass
         except BaseException as e:
             _ny_stderr.write("Exception ignored in atexit callback: " + repr(h[0]) + "\n" + _ny_format_exc(e, True, [], {}))
+
+# Exception groups (PEP 654, Python 3.11; round 77): BaseExceptionGroup and
+# ExceptionGroup with message, exceptions, split, subgroup and derive, and
+# the protocol `except*` is desugared onto (Parser::tryStmt): _NyStar holds
+# what is left of the exception, _ny_star_match splits each clause's types
+# off it, _ny_star_finish raises what remains - CPython's
+# _PyExc_PrepReraiseStar: the unhandled and re-raised leaves keep the
+# original's shape (a projection), exceptions the handlers raised are
+# grouped with them, a naked exception is re-raised as itself.
+def _ny_eg_matcher(condition):
+    if isinstance(condition, type) or isinstance(condition, tuple):
+        return lambda e: isinstance(e, condition)
+    if callable(condition):
+        return condition
+    raise TypeError("expected an exception type, a tuple of exception types, or a callable (other than a class)")
+
+class BaseExceptionGroup(BaseException):
+    def __new__(cls, message, exceptions):
+        if not isinstance(message, str):
+            raise TypeError("argument 1 must be str, not " + type(message).__name__)
+        if not isinstance(exceptions, (list, tuple)):
+            raise TypeError("second argument (exceptions) must be a sequence")
+        if len(exceptions) == 0:
+            raise ValueError("second argument (exceptions) must be a non-empty sequence")
+        var all_plain = True
+        var i = 0
+        for e in exceptions:
+            if not isinstance(e, BaseException):
+                raise ValueError("Item " + str(i) + " of second argument (exceptions) is not an exception")
+            if not isinstance(e, Exception):
+                all_plain = False
+            i += 1
+        if cls is BaseExceptionGroup and all_plain:
+            cls = ExceptionGroup
+        elif cls is ExceptionGroup and not all_plain:
+            raise TypeError("Cannot nest BaseExceptions in an ExceptionGroup")
+        return super().__new__(cls)
+    def __init__(self, message, exceptions):
+        self.message = message
+        self.exceptions = tuple(exceptions)
+        self.args = (message, exceptions)
+    def __str__(self):
+        var n = len(self.exceptions)
+        return self.message + " (" + str(n) + " sub-exception" + ("" if n == 1 else "s") + ")"
+    def __repr__(self):
+        return type(self).__name__ + "(" + repr(self.message) + ", " + repr(self.args[1]) + ")"
+    def derive(self, excs):
+        return BaseExceptionGroup(self.message, excs)
+    def _ny_copy_meta(self, g):
+        g.__traceback__ = self.__traceback__
+        g.__cause__ = self.__cause__
+        g.__context__ = self.__context__
+        var notes = getattr(self, "__notes__", None)
+        if notes is not None:
+            g.__notes__ = list(notes)
+        return g
+    def split(self, condition):
+        var m = _ny_eg_matcher(condition)
+        if m(self):
+            return (self, None)
+        var matched = []
+        var rest = []
+        for e in self.exceptions:
+            if isinstance(e, BaseExceptionGroup):
+                var parts = e.split(condition)
+                if parts[0] is not None:
+                    matched.append(parts[0])
+                if parts[1] is not None:
+                    rest.append(parts[1])
+            elif m(e):
+                matched.append(e)
+            else:
+                rest.append(e)
+        var mg = self._ny_copy_meta(self.derive(matched)) if matched else None
+        var rg = self._ny_copy_meta(self.derive(rest)) if rest else None
+        return (mg, rg)
+    def subgroup(self, condition):
+        return self.split(condition)[0]
+
+class ExceptionGroup(BaseExceptionGroup, Exception):
+    pass
+
+class _NyStar:
+    def __init__(self, exc):
+        self.orig = exc
+        self.naked = not isinstance(exc, BaseExceptionGroup)
+        self.rest = exc
+        self.match = None
+        self.raised = []
+        self.reraised = []
+
+def _ny_star_begin(exc):
+    return _NyStar(exc)
+
+def _ny_star_match(st, types):
+    var ts = types if isinstance(types, tuple) else (types,)
+    for t in ts:
+        if isinstance(t, type) and issubclass(t, BaseExceptionGroup):
+            raise TypeError("catching ExceptionGroup with except* is not allowed. Use except instead.")
+    st.match = None
+    if st.rest is None:
+        return None
+    if st.naked:
+        if isinstance(st.rest, types):
+            st.match = BaseExceptionGroup("", (st.rest,))
+            st.rest = None
+    else:
+        var parts = st.rest.split(types)
+        st.match = parts[0]
+        st.rest = parts[1]
+    return st.match
+
+def _ny_star_raised(st, e):
+    if e is st.match:
+        st.reraised.append(e)
+    else:
+        st.raised.append(e)
+
+def _ny_eg_leaves(g, out):
+    for e in g.exceptions:
+        if isinstance(e, BaseExceptionGroup):
+            _ny_eg_leaves(e, out)
+        else:
+            out.append(e)
+
+def _ny_star_finish(st):
+    if st.naked:
+        # one clause at most ran: what it raised, else the exception itself
+        if st.raised:
+            raise st.raised[0]
+        if st.reraised:
+            raise st.reraised[0]
+        if st.rest is not None:
+            raise st.orig
+        return
+    var keep = []
+    if st.rest is not None:
+        _ny_eg_leaves(st.rest, keep)
+    for g in st.reraised:
+        _ny_eg_leaves(g, keep)
+    var kept = None
+    if keep:
+        var all_leaves = []
+        _ny_eg_leaves(st.orig, all_leaves)
+        if len(all_leaves) == len(keep):
+            kept = st.orig
+        else:
+            kept = st.orig.split(lambda e: not isinstance(e, BaseExceptionGroup) and any(e is k for k in keep))[0]
+    if not st.raised:
+        if kept is not None:
+            raise kept
+        return
+    var excs = list(st.raised)
+    if kept is not None:
+        excs.append(kept)
+    raise BaseExceptionGroup("", excs)
 )NYPRELUDE";
 }
 

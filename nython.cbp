@@ -142,6 +142,7 @@
         <Unit filename="src/NyGen.cpp" />
         <Unit filename="src/NyGC.cpp" />
         <Unit filename="src/NyScope.cpp" />
+        <Unit filename="src/NyUniNames.cpp" />
         <Unit filename="src/VMGC.cpp" />
         <!-- ═══════════ Builtin modules ═══════════ -->
         <Unit filename="src/builtins/audio.cpp" />
@@ -177,6 +178,7 @@
         <Unit filename="include/VirtualMachine.hpp" />
         <Unit filename="include/NyCoro.hpp" />
         <Unit filename="include/NyGen.hpp" />
+        <Unit filename="include/NyUniNames.hpp" />
         <Unit filename="include/NyGC.hpp" />
         <Unit filename="include/NyScope.hpp" />
         <Unit filename="include/VMGC.hpp" />

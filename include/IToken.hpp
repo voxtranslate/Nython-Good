@@ -196,6 +196,7 @@ DECLARE_ENUM_WITH_TYPE (
 	NullCoalesceAssign,/// '??='
 	OptDot,/// '?.'
 	OptBracket,/// '?[' (glued to its receiver: a?[k])
+	MatMulAssign,/// '@=' (round 77)
 	TokenTypeCount
 );
 

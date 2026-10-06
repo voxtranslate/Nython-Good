@@ -1260,8 +1260,12 @@ Value unpack_list(NythonExecutor& E, const Value& v, int n, Context* ctx) {
     std::vector<Value> items;
     if (!g) return v;
     Value x;
-    if (n < 0) drain(E, g, items, ctx);
-    else {
+    if (n < 0) {
+        drain(E, g, items, ctx);
+        // a starred target list of k others: at least k values (round 77)
+        if (n <= -3 && (int)items.size() < -n - 3)
+            raise("ValueError", "not enough values to unpack (expected at least " + std::to_string(-n - 3) + ", got " + std::to_string(items.size()) + ")");
+    } else {
         while ((int)items.size() <= n && next(E, g, x, ctx)) items.push_back(x);
         if ((int)items.size() > n) raise("ValueError", "too many values to unpack (expected " + std::to_string(n) + ")");
         if ((int)items.size() < n)
