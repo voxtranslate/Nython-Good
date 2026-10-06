@@ -19,6 +19,7 @@
 #include "platform_compat.hpp"
 #include <algorithm>
 #include <cmath>
+#include <deque>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -70,8 +71,14 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
     auto need = [&](size_t n, const char* what) {
         if (args.size() < n) E.pyRaise("TypeError", std::string(what) + " expected " + std::to_string(n) + " argument" + (n == 1 ? "" : "s") + ", got " + std::to_string(args.size()));
     };
-    auto asInt = [&](const Value& v, const char* what) -> NythonExecutor::Num {
+    // __index__ results asInt hands out: a big int's Num points into its
+    // Value, which must outlive the call (round 77)
+    std::deque<Value> index_held;
+    auto asInt = [&](const Value& v0, const char* what) -> NythonExecutor::Num {
         NythonExecutor::Num n;
+        const Value* vp = &v0;
+        { Value iv; if (E.indexValue(v0, iv, ctx)) { index_held.push_back(iv); vp = &index_held.back(); } }   // __index__ (round 77)
+        const Value& v = *vp;
         if (!NythonExecutor::asNum(v, n) || n.k == 3)
             E.pyRaise("TypeError", "'" + E.typeNameOf(v) + "' object cannot be interpreted as an integer" + (what ? std::string(" (") + what + ")" : std::string()));
         return n;
@@ -420,6 +427,11 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
     }
     case B_REVERSED: {
         need(1, "reversed()");
+        // a class whose metaclass defines __reversed__: reversed(Color) (round 77)
+        if (!E.class_meta_.empty() && E.classNodeOfValue(args[0])) {
+            Value r;
+            if (E.metaCall(args[0], "__reversed__", {}, ctx, r)) return r;
+        }
         if (E.isInstanceVal(args[0]) && E.instanceHasMethod(args[0], "__reversed__")) {
             std::vector<Value> no;
             Value r = E.callMethod(args[0], "__reversed__", no, ctx);

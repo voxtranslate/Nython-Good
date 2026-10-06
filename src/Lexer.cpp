@@ -1969,6 +1969,11 @@ void Lexer::consume_string(char first) {
                 );
                 return;
 			}
+			// A quote that did not end a triple-quoted string is part of it
+			// ("""say "hi" """ kept no quotes, so exec'd source and docstrings
+			// lost them) - round 77.
+			if(quote_count == 3 && cur != first && end_quote_count > 0)
+				for(int q = 0; q < end_quote_count; q++) strbuff << first;
 			if(cur != '\\' && cur != '\x0c' && cur != '\r') {
 				// For triple-quoted strings (quote_count==3), preserve literal newlines
 				if(cur == '\n') {

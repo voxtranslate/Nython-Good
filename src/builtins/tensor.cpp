@@ -434,6 +434,10 @@ Value dispatch_tensor(NythonExecutor& E,
                 } else {
                     type_name = getStringValue(args[1]);
                 }
+                // An instance of a class deriving from a builtin type
+                // (class Color(IntEnum), IntEnum(int, ...)) is one (round 77).
+                if (E.isInstanceValue(args[0]) && type_name != "object" && nyrt::is_builtin_type_name(type_name)
+                    && E.classDerivesFrom(E.instanceClassName(args[0]), type_name)) return Value(true);
                 // bool is a subclass of int, as in Python.
                 if (type_name == "int" || type_name == "integer") return Value(args[0].type == ValueType::INTEGER || args[0].type == ValueType::BOOLEAN);
                 if (type_name == "tuple") {
