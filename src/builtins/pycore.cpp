@@ -178,7 +178,8 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         need(3, "__format_value__()");
         std::string spec = E.getStringValue(args[1]), conv = E.getStringValue(args[2]);
         if (conv.empty()) {
-            if (spec.empty()) return str_(E.strOf(args[0], ctx));
+            // f"{obj}" is format(obj, ""): an object's __format__ runs (round 77)
+            if (spec.empty() && !E.isInstanceValue(args[0])) return str_(E.strOf(args[0], ctx));
             return str_(E.formatValue(args[0], spec, ctx));
         }
         nypy::FmtVal fv = E.toFmtVal(args[0], conv[0], ctx);

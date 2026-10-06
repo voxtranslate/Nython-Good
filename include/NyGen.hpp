@@ -111,6 +111,11 @@ Value unpack_list(NythonExecutor& E, const Value& v, int n, Context* ctx);
 bool contains_iter(NythonExecutor& E, const Value& v, const Value& x, Context* ctx);
 // iter(v) for anything that is not already a generator: a lazy iterator.
 Value make_iter(NythonExecutor& E, const Value& v, Context* ctx);
+// iter(fn, sentinel): calls fn() until it returns the sentinel (round 77).
+Value make_callable_iter(NythonExecutor& E, const Value& fn, const Value& sentinel);
+// A generator's attributes (round 77): __name__, __qualname__, gi_running,
+// gi_suspended, gi_frame, gi_code, gi_yieldfrom. False: not one of them.
+bool attr(NythonExecutor& E, const Value& obj, const std::string& name, Value& out);
 // A `for` loop whose iterable is a generator: pulls one value per iteration.
 // `owned`: the loop's temporary, closed when the loop ends.
 Value for_loop(NythonExecutor& E, void* for_node, const Value& gen, Context* ctx, bool owned);

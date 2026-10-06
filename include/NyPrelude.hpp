@@ -1123,6 +1123,222 @@ def _ny_run_atexit():
             pass
         except BaseException as e:
             _ny_stderr.write("Exception ignored in atexit callback: " + repr(h[0]) + "\n" + _ny_format_exc(e, True, [], {}))
+
+# ── os's structure sequences and raising functions (round 77) ─────────────
+# `import os` binds these in place of the flat builtins of the same name
+# (NyRuntime.hpp os_python_members): os.stat() gives an os.stat_result,
+# os.get_terminal_size() an os.terminal_size, os.times() / os.uname() their
+# results - tuple-like (indexing, slicing, len, iteration, unpacking, == and
+# ordering against tuples, hashing) with named fields and read-only, as
+# CPython's structseq, but not a tuple subclass (isinstance(st, tuple) is
+# false here). os.listdir / rename / replace / mkdir / link / remove raise
+# OSError with errno, strerror and the file names (filename2 for two).
+class _NyStructSeq:
+    _ny_qual = "structseq"
+    _ny_names = ()
+    _ny_repr_names = None
+    _ny_extra = ()
+    _ny_exact = True
+
+    def __init__(self, seq=(), dict=None):
+        var cls = type(self)
+        var t = tuple(seq)
+        var n = len(cls._ny_names)
+        var total = n + len(cls._ny_extra)
+        var q = self._ny_qualname()
+        if cls._ny_exact and len(t) != n:
+            raise TypeError(q + "() takes a " + str(n) + "-sequence (" + str(len(t)) + "-sequence given)")
+        if len(t) < n:
+            raise TypeError(q + "() takes an at least " + str(n) + "-sequence (" + str(len(t)) + "-sequence given)")
+        if len(t) > total:
+            raise TypeError(q + "() takes an at most " + str(total) + "-sequence (" + str(len(t)) + "-sequence given)")
+        object.__setattr__(self, "_ny_t", t[:n])
+        var i = 0
+        for name in cls._ny_names:
+            if name is not None:
+                object.__setattr__(self, name, t[i])
+            i += 1
+        var k = 0
+        for name in cls._ny_extra:
+            var v = None
+            if n + k < len(t):
+                v = t[n + k]
+            elif dict is not None and name in dict:
+                v = dict[name]
+            object.__setattr__(self, name, v)
+            k += 1
+        self._ny_fill()
+
+    def _ny_fill(self):
+        pass
+
+    def _ny_qualname(self):
+        return type(self)._ny_qual
+
+    def __setattr__(self, name, value):
+        raise AttributeError("readonly attribute")
+
+    def __delattr__(self, name):
+        raise AttributeError("readonly attribute")
+
+    def __len__(self):
+        return len(self._ny_t)
+
+    def __getitem__(self, i):
+        return self._ny_t[i]
+
+    def __iter__(self):
+        return iter(self._ny_t)
+
+    def __contains__(self, x):
+        return x in self._ny_t
+
+    def __eq__(self, other):
+        if isinstance(other, _NyStructSeq):
+            return self._ny_t == other._ny_t
+        return self._ny_t == other
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __lt__(self, other):
+        return self._ny_t < (other._ny_t if isinstance(other, _NyStructSeq) else other)
+
+    def __le__(self, other):
+        return self._ny_t <= (other._ny_t if isinstance(other, _NyStructSeq) else other)
+
+    def __gt__(self, other):
+        return self._ny_t > (other._ny_t if isinstance(other, _NyStructSeq) else other)
+
+    def __ge__(self, other):
+        return self._ny_t >= (other._ny_t if isinstance(other, _NyStructSeq) else other)
+
+    def __hash__(self):
+        return hash(self._ny_t)
+
+    def __add__(self, other):
+        return self._ny_t + (other._ny_t if isinstance(other, _NyStructSeq) else other)
+
+    def count(self, x):
+        return self._ny_t.count(x)
+
+    def index(self, x):
+        return self._ny_t.index(x)
+
+    def __reduce__(self):
+        return (type(self), (self._ny_t,))
+
+    def __repr__(self):
+        var names = type(self)._ny_repr_names
+        if names is None:
+            names = type(self)._ny_names
+        var parts = []
+        var i = 0
+        for v in self._ny_t:
+            parts.append(str(names[i]) + "=" + repr(v))
+            i += 1
+        return self._ny_qualname() + "(" + ", ".join(parts) + ")"
+
+class stat_result(_NyStructSeq):
+    __module__ = "os"
+    _ny_qual = "os.stat_result"
+    _ny_names = ("st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size", None, None, None)
+    _ny_repr_names = ("st_mode", "st_ino", "st_dev", "st_nlink", "st_uid", "st_gid", "st_size",
+                      "st_atime", "st_mtime", "st_ctime")
+    _ny_extra = ("st_atime", "st_mtime", "st_ctime", "st_atime_ns", "st_mtime_ns", "st_ctime_ns",
+                 "st_blksize", "st_blocks", "st_rdev")
+    _ny_exact = False
+    n_sequence_fields = 10
+    n_fields = 19
+    n_unnamed_fields = 3
+
+    def _ny_fill(self):
+        # the float times default to the integer ones (CPython's statresult_new)
+        var t = self._ny_t
+        if self.st_atime is None:
+            object.__setattr__(self, "st_atime", t[7])
+        if self.st_mtime is None:
+            object.__setattr__(self, "st_mtime", t[8])
+        if self.st_ctime is None:
+            object.__setattr__(self, "st_ctime", t[9])
+
+class terminal_size(_NyStructSeq):
+    __module__ = "os"
+    _ny_qual = "os.terminal_size"
+    _ny_names = ("columns", "lines")
+    n_sequence_fields = 2
+    n_fields = 2
+    n_unnamed_fields = 0
+
+class times_result(_NyStructSeq):
+    __module__ = "posix"
+    _ny_names = ("user", "system", "children_user", "children_system", "elapsed")
+    n_sequence_fields = 5
+    n_fields = 5
+    n_unnamed_fields = 0
+
+    def _ny_qualname(self):
+        return ("nt" if os_name == "nt" else "posix") + ".times_result"
+
+class uname_result(_NyStructSeq):
+    __module__ = "posix"
+    _ny_qual = "posix.uname_result"
+    _ny_names = ("sysname", "nodename", "release", "version", "machine")
+    n_sequence_fields = 5
+    n_fields = 5
+    n_unnamed_fields = 0
+
+_ny_os_stat_result = stat_result
+_ny_os_terminal_size = terminal_size
+_ny_os_times_result = times_result
+_ny_os_uname_result = uname_result
+del stat_result
+del terminal_size
+del times_result
+del uname_result
+
+def _ny_os_stat_of(m):
+    var ns = 1000000000
+    return _ny_os_stat_result((m["mode"], m["ino"], m["dev"], m["nlink"], m["uid"], m["gid"], m["size"],
+                               m["atime_ns"] // ns, m["mtime_ns"] // ns, m["ctime_ns"] // ns,
+                               m["atime"], m["mtime"], m["ctime"], m["atime_ns"], m["mtime_ns"], m["ctime_ns"],
+                               m.get("blksize"), m.get("blocks"), m.get("rdev")))
+
+def _ny_os_stat(path, *, dir_fd=None, follow_symlinks=True):
+    if isinstance(path, int) and not isinstance(path, bool):
+        return _ny_os_fstat(path)
+    return _ny_os_stat_of(os_stat(path) if follow_symlinks else os_lstat(path))
+
+def _ny_os_lstat(path, *, dir_fd=None):
+    return _ny_os_stat_of(os_lstat(path))
+
+def _ny_os_fstat(fd):
+    return _ny_os_stat_of(_ny_os_call("fstat", fd))
+
+def _ny_os_get_terminal_size(fd=1):
+    return _ny_os_terminal_size(_ny_os_call("terminal_size", fd))
+
+def _ny_os_times():
+    return _ny_os_times_result(_ny_os_call("times"))
+
+def _ny_os_uname():
+    var u = os_uname()
+    return _ny_os_uname_result((u["sysname"], u["nodename"], u["release"], u["version"], u["machine"]))
+
+def _ny_os_listdir(path="."):
+    return _ny_os_call("listdir", path)
+
+def _ny_os_rename(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+    _ny_os_call("rename", src, dst)
+
+def _ny_os_replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):
+    _ny_os_call("replace", src, dst)
+
+def _ny_os_mkdir(path, mode=511, *, dir_fd=None):
+    _ny_os_call("mkdir", path, mode)
+
+def _ny_os_link(src, dst, *, src_dir_fd=None, dst_dir_fd=None, follow_symlinks=True):
+    _ny_os_call("link", src, dst)
 )NYPRELUDE";
 }
 

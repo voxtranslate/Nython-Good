@@ -50,6 +50,9 @@
 #  include <sys/ioctl.h>
 #  include <sys/utsname.h>
 #  include <sys/time.h>
+#  include <sys/times.h>     // os.times() (round 77)
+#  include <dirent.h>
+#  include <unistd.h>
 #  include <pwd.h>
 #  include <utime.h>
 #  include <fcntl.h>
@@ -90,27 +93,20 @@ void raise(const std::string& type, const std::string& msg) {
 }
 
 std::string errno_type(int err) {
-    switch (err) {
-        case ENOENT:  return "FileNotFoundError";
-        case EEXIST:  return "FileExistsError";
-        case EACCES:
-        case EPERM:   return "PermissionError";
-        case EISDIR:  return "IsADirectoryError";
-        case ENOTDIR: return "NotADirectoryError";
-        case EINTR:   return "InterruptedError";
-        case ECHILD:  return "ChildProcessError";
-        case ESRCH:   return "ProcessLookupError";
-#ifdef ETIMEDOUT
-        case ETIMEDOUT: return "TimeoutError";
-#endif
-        default:      return "OSError";
-    }
+    // CPython's errno -> OSError subclass table, shared with the engines'
+    // OSError(errno, ...) (NyExcTypes.hpp; round 77 - BlockingIOError,
+    // BrokenPipeError and the Connection*Errors were plain OSErrors here)
+    const char* c = nython::ny_errno_exc_class(err);
+    return *c ? std::string(c) : std::string("OSError");
 }
 
 void raise_errno(int err, const std::string& path, const std::string& path2) {
+    // the names as repr() writes them, as Python's OSError.__str__ does - so
+    // the engines can read errno, strerror, filename and filename2 back
+    // (NyExcTypes.hpp ny_parse_errno_message; round 77)
     std::string msg = "[Errno " + std::to_string(err) + "] " + std::strerror(err);
-    if (!path.empty())  msg += ": '" + path + "'";
-    if (!path2.empty()) msg += " -> '" + path2 + "'";
+    if (!path.empty())  msg += ": " + nypy::str_repr(path);
+    if (!path2.empty()) msg += " -> " + nypy::str_repr(path2);
     raise(errno_type(err), msg);
 }
 
@@ -520,6 +516,27 @@ Value stat_map(NythonExecutor& E, const struct stat* st, bool link, const std::s
         {"ino",     make_int(ok ? (long long)st->st_ino : 0)},
         {"dev",     make_int(ok ? (long long)st->st_dev : 0)},
     };
+    // os.stat_result's st_*_ns, st_blocks, st_blksize, st_rdev (round 77):
+    // the times exactly, in nanoseconds
+    auto ns_of = [&](char which, double secs) -> long long {
+#if defined(__APPLE__)
+        if (ok) { const struct timespec& t = which == 'm' ? st->st_mtimespec : which == 'a' ? st->st_atimespec : st->st_ctimespec;
+                  return (long long)t.tv_sec * 1000000000LL + t.tv_nsec; }
+#elif !defined(_WIN32)
+        if (ok) { const struct timespec& t = which == 'm' ? st->st_mtim : which == 'a' ? st->st_atim : st->st_ctim;
+                  return (long long)t.tv_sec * 1000000000LL + t.tv_nsec; }
+#endif
+        (void)which;
+        return (long long)std::llround(secs * 1e9);
+    };
+    m.push_back({"atime_ns", make_int(ns_of('a', at))});
+    m.push_back({"mtime_ns", make_int(ns_of('m', mt))});
+    m.push_back({"ctime_ns", make_int(ns_of('c', ct))});
+#ifndef _WIN32
+    m.push_back({"blocks", make_int(ok ? (long long)st->st_blocks : 0)});
+    m.push_back({"blksize", make_int(ok ? (long long)st->st_blksize : 0)});
+    m.push_back({"rdev", make_int(ok ? (long long)st->st_rdev : 0)});
+#endif
     return nyos::make_map(E, m);
 }
 
@@ -1397,6 +1414,107 @@ Value dispatch_os(NythonExecutor& E,
         return Str(u ? u : "");
     }
     if (name == "os_home") return Str(home_dir());
+    // ── Python's os functions that raise (round 77) ──────────────────────────
+    // _ny_os_call(op, ...): what the os namespace's listdir, rename, replace,
+    // mkdir, link, fstat, times and get_terminal_size run (the prelude's
+    // _ny_os_*), raising OSErrors with errno and the file names. The flat
+    // legacy names keep their contracts (os_rename / os_listdir report a
+    // failure by their result; os_get_terminal_size falls back to 80 x 24).
+    if (name == "_ny_os_call") {
+        std::string op = S(0);
+        if (op == "listdir") {
+            std::string p = args.size() > 1 ? S(1, ".") : std::string(".");
+            if (!exists(p)) raise_errno(ENOENT, p);
+            if (!is_dir(p)) raise_errno(ENOTDIR, p);
+#ifndef _WIN32
+            DIR* d = ::opendir(p.c_str());
+            if (!d) raise_errno(errno, p);
+            ::closedir(d);
+#endif
+            return make_str_list(E, ny_fs::listdir(p));
+        }
+        if (op == "rename" || op == "replace") {
+            std::string a = S(1), b = S(2);
+#ifdef _WIN32
+            if (op == "replace") {
+                if (!MoveFileExW(widen_os(a).c_str(), widen_os(b).c_str(), MOVEFILE_REPLACE_EXISTING)) {
+                    DWORD e = GetLastError();
+                    raise_errno(e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND ? ENOENT
+                                : e == ERROR_ACCESS_DENIED || e == ERROR_SHARING_VIOLATION ? EACCES : EINVAL, a, b);
+                }
+                return NONE_VALUE;
+            }
+            if (exists(b) || is_link(b)) raise_errno(EEXIST, a, b);   // Windows' rename does not replace
+#endif
+            if (std::rename(a.c_str(), b.c_str()) != 0) raise_errno(errno, a, b);
+            return NONE_VALUE;
+        }
+        if (op == "mkdir") {
+            std::string p = S(1);
+            long long mode = args.size() > 2 ? to_int(args[2], 0777) : 0777;
+            (void)mode;
+            if (NY_MKDIR(p.c_str(), (unsigned)mode) != 0) raise_errno(errno, p);
+            return NONE_VALUE;
+        }
+        if (op == "link") {
+            std::string a = S(1), b = S(2);
+#ifdef _WIN32
+            if (!CreateHardLinkW(widen_os(b).c_str(), widen_os(a).c_str(), nullptr)) {
+                DWORD e = GetLastError();
+                raise_errno(e == ERROR_ALREADY_EXISTS || e == ERROR_FILE_EXISTS ? EEXIST
+                            : e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND ? ENOENT
+                            : e == ERROR_ACCESS_DENIED ? EACCES : EINVAL, a, b);
+            }
+#else
+            if (::link(a.c_str(), b.c_str()) != 0) raise_errno(errno, a, b);
+#endif
+            return NONE_VALUE;
+        }
+        if (op == "fstat") {
+            int fd = (int)to_int(args.size() > 1 ? args[1] : Value(-1), -1);
+            // a file object's fileno() is its handle (1000 up): its FILE's descriptor
+            auto hit = E.file_handles.find(fd);
+            if (hit != E.file_handles.end() && hit->second) { std::fflush(hit->second); fd = ::fileno(hit->second); }
+            struct stat st;
+            if (::fstat(fd, &st) != 0) raise_errno(errno, "");
+            return stat_map(E, &st, false);
+        }
+        if (op == "times") {
+            // (user, system, children_user, children_system, elapsed) seconds
+#ifdef _WIN32
+            FILETIME c, x, k, u;
+            double user = 0, sys = 0;
+            if (GetProcessTimes(GetCurrentProcess(), &c, &x, &k, &u)) {
+                auto secs = [](const FILETIME& f) { return (double)(((unsigned long long)f.dwHighDateTime << 32) | f.dwLowDateTime) / 1e7; };
+                user = secs(u); sys = secs(k);
+            }
+            return make_list(E, {Value(user), Value(sys), Value(0.0), Value(0.0), Value(0.0)});
+#else
+            struct tms t;
+            clock_t el = ::times(&t);
+            double hz = (double)sysconf(_SC_CLK_TCK);
+            if (el == (clock_t)-1 || hz <= 0) raise_errno(errno, "");
+            return make_list(E, {Value(t.tms_utime / hz), Value(t.tms_stime / hz), Value(t.tms_cutime / hz),
+                                 Value(t.tms_cstime / hz), Value(el / hz)});
+#endif
+        }
+        if (op == "terminal_size") {
+            // os.get_terminal_size(fd): the terminal's, or OSError when fd is
+            // not one (shutil's falls back; it reads COLUMNS/LINES first)
+            int fd = (int)to_int(args.size() > 1 ? args[1] : Value(1), 1);
+#ifdef _WIN32
+            HANDLE h = GetStdHandle(fd == 2 ? STD_ERROR_HANDLE : fd == 0 ? STD_INPUT_HANDLE : STD_OUTPUT_HANDLE);
+            CONSOLE_SCREEN_BUFFER_INFO info;
+            if (h == INVALID_HANDLE_VALUE || !GetConsoleScreenBufferInfo(h, &info)) raise("OSError", "[WinError 6] The handle is invalid");
+            return make_list(E, {Value((int)(info.srWindow.Right - info.srWindow.Left + 1)), Value((int)(info.srWindow.Bottom - info.srWindow.Top + 1))});
+#else
+            struct winsize ws;
+            if (ioctl(fd, TIOCGWINSZ, &ws) != 0) raise_errno(errno, "");
+            return make_list(E, {Value((int)ws.ws_col), Value((int)ws.ws_row)});
+#endif
+        }
+        raise("ValueError", "_ny_os_call: unknown operation '" + op + "'");
+    }
     if (name == "os_uname") {
 #ifndef _WIN32
         struct utsname u;

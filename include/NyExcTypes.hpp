@@ -6,6 +6,9 @@
 // the literal names Exception/BaseException/Error acted as catch-alls. This
 // is the one table both consult, following Python's own hierarchy.
 #pragma once
+#include <cerrno>
+#include <cstdint>
+#include <cstdio>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -167,6 +170,228 @@ inline bool ny_split_exc_message(const std::string& m, std::string& type, std::s
     type = t;
     msg = m.substr(c + 2);
     return true;
+}
+
+// ── What str(e) is made from for the exceptions with fields (round 77) ──────
+// Both engines keep an exception's fields as attributes (errno, strerror,
+// filename, filename2 of an OSError; encoding, object, start, end, reason of
+// the Unicode errors) and make str(e) from them as CPython's
+// Objects/exceptions.c does; these are the pieces they share.
+// SyntaxError(msg, (filename, lineno, offset, text[, end_lineno,
+// end_offset])) and ImportError(msg) keep `msg` as CPython's do.
+enum NyExcKind { NYX_PLAIN = 0, NYX_KEY = 1, NYX_OS = 2, NYX_UDECODE = 3, NYX_UENCODE = 4, NYX_UTRANSLATE = 5,
+                 NYX_SYNTAX = 6, NYX_IMPORT = 7 };
+inline bool ny_exc_kind_unicode(int k) { return k == NYX_UDECODE || k == NYX_UENCODE || k == NYX_UTRANSLATE; }
+// The kind of exception class `derives(base)` describes (the most specific
+// base that has fields).
+template <typename DerivesFn>
+inline int ny_exc_kind(DerivesFn derives) {
+    if (derives("KeyError")) return NYX_KEY;
+    if (derives("OSError")) return NYX_OS;
+    if (derives("UnicodeDecodeError")) return NYX_UDECODE;
+    if (derives("UnicodeEncodeError")) return NYX_UENCODE;
+    if (derives("UnicodeTranslateError")) return NYX_UTRANSLATE;
+    if (derives("SyntaxError")) return NYX_SYNTAX;
+    if (derives("ImportError")) return NYX_IMPORT;
+    return NYX_PLAIN;
+}
+// The fields SyntaxError(msg, details) sets from details, in order.
+inline const char* const* ny_syntax_fields() {
+    static const char* const f[] = {"filename", "lineno", "offset", "text", "end_lineno", "end_offset"};
+    return f;
+}
+// str(SyntaxError): "msg (file.py, line 3)" - the file's base name - or
+// with what of the two it has (CPython's SyntaxError_str).
+inline std::string ny_syntax_message(const std::string& msg, bool has_file, const std::string& file,
+                                     bool has_line, long long line) {
+    if (!has_file && !has_line) return msg;
+    std::string base = file;
+    size_t cut = base.find_last_of("/\\");
+    if (cut != std::string::npos) base = base.substr(cut + 1);
+    if (has_file && has_line) return msg + " (" + base + ", line " + std::to_string(line) + ")";
+    if (has_file) return msg + " (" + base + ")";
+    return msg + " (line " + std::to_string(line) + ")";
+}
+
+// The OSError subclass OSError(errno, ...) makes for an errno (CPython's
+// errnomap), "" when there is none (it stays OSError).
+inline const char* ny_errno_exc_class(long e) {
+#ifdef EAGAIN
+    if (e == EAGAIN) return "BlockingIOError";
+#endif
+#ifdef EWOULDBLOCK
+    if (e == EWOULDBLOCK) return "BlockingIOError";
+#endif
+#ifdef EALREADY
+    if (e == EALREADY) return "BlockingIOError";
+#endif
+#ifdef EINPROGRESS
+    if (e == EINPROGRESS) return "BlockingIOError";
+#endif
+#ifdef ECHILD
+    if (e == ECHILD) return "ChildProcessError";
+#endif
+#ifdef EPIPE
+    if (e == EPIPE) return "BrokenPipeError";
+#endif
+#ifdef ESHUTDOWN
+    if (e == ESHUTDOWN) return "BrokenPipeError";
+#endif
+#ifdef ECONNABORTED
+    if (e == ECONNABORTED) return "ConnectionAbortedError";
+#endif
+#ifdef ECONNREFUSED
+    if (e == ECONNREFUSED) return "ConnectionRefusedError";
+#endif
+#ifdef ECONNRESET
+    if (e == ECONNRESET) return "ConnectionResetError";
+#endif
+#ifdef EEXIST
+    if (e == EEXIST) return "FileExistsError";
+#endif
+#ifdef ENOENT
+    if (e == ENOENT) return "FileNotFoundError";
+#endif
+#ifdef EISDIR
+    if (e == EISDIR) return "IsADirectoryError";
+#endif
+#ifdef ENOTDIR
+    if (e == ENOTDIR) return "NotADirectoryError";
+#endif
+#ifdef EINTR
+    if (e == EINTR) return "InterruptedError";
+#endif
+#ifdef EACCES
+    if (e == EACCES) return "PermissionError";
+#endif
+#ifdef EPERM
+    if (e == EPERM) return "PermissionError";
+#endif
+#ifdef ESRCH
+    if (e == ESRCH) return "ProcessLookupError";
+#endif
+#ifdef ETIMEDOUT
+    if (e == ETIMEDOUT) return "TimeoutError";
+#endif
+    return "";
+}
+
+inline void ny_u8_append(uint32_t cp, std::string& out) {
+    if (cp < 0x80) out += (char)cp;
+    else if (cp < 0x800) { out += (char)(0xC0 | (cp >> 6)); out += (char)(0x80 | (cp & 0x3F)); }
+    else if (cp < 0x10000) { out += (char)(0xE0 | (cp >> 12)); out += (char)(0x80 | ((cp >> 6) & 0x3F)); out += (char)(0x80 | (cp & 0x3F)); }
+    else { out += (char)(0xF0 | (cp >> 18)); out += (char)(0x80 | ((cp >> 12) & 0x3F)); out += (char)(0x80 | ((cp >> 6) & 0x3F)); out += (char)(0x80 | (cp & 0x3F)); }
+}
+// A Python string literal at s[i] ('...' or "...", the escapes repr()
+// writes): its text in `out` and i moved past it; false when there is none.
+inline bool ny_unquote_py(const std::string& s, size_t& i, std::string& out) {
+    if (i >= s.size() || (s[i] != '\'' && s[i] != '"')) return false;
+    char q = s[i];
+    std::string r;
+    size_t j = i + 1;
+    auto hexv = [&](size_t at, int n, uint32_t& v) {
+        v = 0;
+        if (at + (size_t)n > s.size()) return false;
+        for (int k = 0; k < n; k++) {
+            char c = s[at + (size_t)k];
+            int d = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+            if (d < 0) return false;
+            v = v * 16 + (uint32_t)d;
+        }
+        return true;
+    };
+    while (j < s.size()) {
+        char c = s[j];
+        if (c == q) { out = r; i = j + 1; return true; }
+        if (c != '\\') { r += c; j++; continue; }
+        if (j + 1 >= s.size()) return false;
+        char e = s[j + 1];
+        uint32_t v = 0;
+        switch (e) {
+            case '\\': r += '\\'; j += 2; break;
+            case '\'': r += '\''; j += 2; break;
+            case '"': r += '"'; j += 2; break;
+            case 'n': r += '\n'; j += 2; break;
+            case 'r': r += '\r'; j += 2; break;
+            case 't': r += '\t'; j += 2; break;
+            case 'a': r += '\a'; j += 2; break;
+            case 'b': r += '\b'; j += 2; break;
+            case 'f': r += '\f'; j += 2; break;
+            case 'v': r += '\v'; j += 2; break;
+            case '0': r += '\0'; j += 2; break;
+            case 'x': if (!hexv(j + 2, 2, v)) return false; ny_u8_append(v, r); j += 4; break;
+            case 'u': if (!hexv(j + 2, 4, v)) return false; ny_u8_append(v, r); j += 6; break;
+            case 'U': if (!hexv(j + 2, 8, v)) return false; ny_u8_append(v, r); j += 10; break;
+            default: r += '\\'; r += e; j += 2; break;
+        }
+    }
+    return false;
+}
+
+// "[Errno 2] No such file or directory: 'a' -> 'b'" - how the native OS
+// layer words an OSError (the names as repr() writes them) - back into its
+// fields, so the object an except clause binds has errno, strerror and
+// filename (filename2). False when the message is not of that form.
+struct NyErrnoParts {
+    long err = 0;
+    std::string strerror{}, f1{}, f2{};
+    bool has_f1 = false, has_f2 = false;
+};
+inline bool ny_parse_errno_message(const std::string& m, NyErrnoParts& p) {
+    if (m.compare(0, 7, "[Errno ") != 0) return false;
+    size_t i = 7;
+    bool neg = i < m.size() && m[i] == '-';
+    if (neg) i++;
+    size_t d0 = i;
+    while (i < m.size() && m[i] >= '0' && m[i] <= '9') i++;
+    if (i == d0 || i - d0 > 9 || i + 1 >= m.size() || m[i] != ']' || m[i + 1] != ' ') return false;
+    p.err = std::stol(m.substr(d0, i - d0)) * (neg ? -1 : 1);
+    size_t rest = i + 2;
+    for (size_t c = m.find(": ", rest); c != std::string::npos; c = m.find(": ", c + 1)) {
+        size_t j = c + 2;
+        std::string a, b;
+        if (!ny_unquote_py(m, j, a)) continue;
+        if (j == m.size()) {
+            p.strerror = m.substr(rest, c - rest); p.f1 = a; p.has_f1 = true;
+            return true;
+        }
+        if (m.compare(j, 4, " -> ") == 0) {
+            size_t k = j + 4;
+            if (ny_unquote_py(m, k, b) && k == m.size()) {
+                p.strerror = m.substr(rest, c - rest); p.f1 = a; p.has_f1 = true; p.f2 = b; p.has_f2 = true;
+                return true;
+            }
+        }
+    }
+    p.strerror = m.substr(rest);
+    return true;
+}
+
+// '\xe9', '€', '\U0001f600': a character as the Unicode errors show it.
+inline std::string ny_unicode_char_escape(uint32_t cp) {
+    char buf[16];
+    if (cp <= 0xFF) std::snprintf(buf, sizeof buf, "\\x%02x", (unsigned)cp);
+    else if (cp <= 0xFFFF) std::snprintf(buf, sizeof buf, "\\u%04x", (unsigned)cp);
+    else std::snprintf(buf, sizeof buf, "\\U%08x", (unsigned)cp);
+    return buf;
+}
+// str(UnicodeDecodeError / UnicodeEncodeError / UnicodeTranslateError):
+// `one` is the byte (decode) or code point (encode, translate) at start
+// when the range is that one item inside the object, -1 otherwise.
+inline std::string ny_unicode_error_message(int kind, const std::string& encoding, long long one,
+                                            long long start, long long end, const std::string& reason) {
+    std::string pos = std::to_string(start), rng = std::to_string(start) + "-" + std::to_string(end - 1);
+    if (kind == NYX_UDECODE) {
+        if (one >= 0) {
+            char buf[8];
+            std::snprintf(buf, sizeof buf, "0x%02x", (unsigned)(one & 0xFF));
+            return "'" + encoding + "' codec can't decode byte " + buf + " in position " + pos + ": " + reason;
+        }
+        return "'" + encoding + "' codec can't decode bytes in position " + rng + ": " + reason;
+    }
+    std::string head = kind == NYX_UENCODE ? "'" + encoding + "' codec can't encode" : std::string("can't translate");
+    if (one >= 0) return head + " character '" + ny_unicode_char_escape((uint32_t)one) + "' in position " + pos + ": " + reason;
+    return head + " characters in position " + rng + ": " + reason;
 }
 
 // The TypeError message for a call that does not fit a function's

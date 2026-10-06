@@ -74,6 +74,13 @@ class MemoryStore:
         while i < len(all_keys):
             var k = all_keys[i]
             var entry = data[k]
+            # an entry that is not a stored cell (a store written by an older
+            # version holds some whose fields are all null) is skipped: its
+            # confidence of None cannot be compared with a number (round 77:
+            # `None > 0.3` raises TypeError, as in Python)
+            if not isinstance(entry, dict) or entry.get("key") == none or entry.get("confidence") == none:
+                i = i + 1
+                continue
             var cell = MemoryCell(
                 entry["key"],
                 entry["value"],
