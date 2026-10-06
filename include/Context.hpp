@@ -30,6 +30,10 @@ struct Context extends Container {
     // global scope) this accepts: the builtins and the prelude, not the
     // importing program's own variables (NythonExecutor::importModule).
     const std::function<bool(const std::string&)>* parentFilter = nullptr;
+    // exec(src, ns) (round 77): the scope's variables ARE the dict's - its
+    // `container` is the dict's map, which this does not own; it holds a
+    // counted reference to the dict instead (NythonExecutor::evalExecBuiltin).
+    Collectable* ns_owner = nullptr;
 
 	Context(Runnable* runner,const std::string& name, Collectable* self = nullptr, Collectable* klass = nullptr, Context* parent = nullptr);
 	~Context();

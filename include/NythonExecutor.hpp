@@ -662,6 +662,7 @@ public:   // NythonExecutor is a struct: members default to public
             "os_mkdtemp","os_disk_usage","os_chdir","cd","sh",
             "os_unsetenv","os_environ","os_platform","os_cpu_count","os_hostname",
             "os_username","os_home","os_uname","os_get_terminal_size","os_terminal_size",
+            "_ny_os_call",   // the os namespace's raising listdir, rename, mkdir, fstat, ... (round 77)
             "os_system","os_run","subprocess_run","os_spawn","os_proc_read","os_poll","os_proc_write","os_proc_close_stdin",
             "os_wait","os_kill","os_getpid","os_getppid","shell_quote","os_shell_quote","os_shell",
             "which","os_which","sys_argv",
@@ -1205,6 +1206,13 @@ public:   // NythonExecutor is a struct: members default to public
             if (m.first.rfind("path.", 0) == 0) path->set(m.first.substr(5), builtinValue(m.second));
             else ns->set(m.first, builtinValue(m.second));
         }
+        // Python's own members: os.stat_result, os.terminal_size, the raising
+        // listdir / rename / mkdir ... (round 77, NyRuntime.hpp)
+        for (auto& pm : nyrt::os_python_members()) {
+            Value v = global_ctx->getByName(pm.second);
+            if (v.type == ValueType::UNDEFINED || v.type == ValueType::NONE) v = builtinValue(pm.second);
+            if (v.type != ValueType::UNDEFINED && v.type != ValueType::NONE) (*ns->container)[pm.first] = v;   // set() keeps an existing key
+        }
         for (const char* c : {"sep", "pathsep", "linesep", "name"}) {
             Value v = global_ctx->getByName(std::string("os_") + c);
             ns->set(c, v);
@@ -1390,7 +1398,7 @@ public:   // NythonExecutor is a struct: members default to public
         if (m == "discard") { mutating(); need(1); setDiscard(c, args[0]); return true; }
         if (m == "remove") {
             mutating(); need(1);
-            if (!setDiscard(c, args[0])) pyRaise("KeyError", toText(args[0], true, ctx, 0));
+            if (!setDiscard(c, args[0])) raiseKeyError(args[0]);   // the key itself (round 77)
             return true;
         }
         if (m == "pop") {
@@ -1595,6 +1603,13 @@ public:   // NythonExecutor is a struct: members default to public
     // order - UTF-8 byte order is the same), and lists/tuples element by
     // element. Returns false when the two are not comparable (the operators
     // then read false, as they always have here, rather than raising).
+    // The two values that could not be ordered, for the operators' TypeError
+    // (round 77: `[1] < ["a"]` names int and str, as Python does).
+    std::string order_fail_l_, order_fail_r_;
+    bool orderFail(const Value& a, const Value& b) {
+        order_fail_l_ = typeNameOf(a); order_fail_r_ = typeNameOf(b);
+        return false;
+    }
     bool orderValues(const Value& a, const Value& b, int& res, Context* ctx, int depth = 0) {
         Num x, y;
         if (asNum(a, x) && asNum(b, y)) { res = numCmp(x, y); return res != 2; }
@@ -1604,15 +1619,16 @@ public:   // NythonExecutor is a struct: members default to public
             res = c < 0 ? -1 : c > 0 ? 1 : 0;
             return true;
         }
-        if (as || bs) return false;
+        if (as || bs) return orderFail(a, b);
         Container* ca = contOf(a); Container* cb = contOf(b);
         if (ca && cb && depth < 100) {
             int64_t la = seqLen(ca), lb = seqLen(cb);
-            if (la < 0 || lb < 0) return false;
+            // dicts, and a list against a tuple, have no order (round 77)
+            if (la < 0 || lb < 0 || isTupleCont(ca) != isTupleCont(cb)) return orderFail(a, b);
             for (int64_t i = 0; i < la && i < lb; i++) {
                 auto ia = ca->container->find(std::to_string(i));
                 auto ib = cb->container->find(std::to_string(i));
-                if (ia == ca->container->end() || ib == cb->container->end()) return false;
+                if (ia == ca->container->end() || ib == cb->container->end()) return orderFail(a, b);
                 if (valuesEqual(ia->second, ib->second, depth + 1)) continue;
                 return orderValues(ia->second, ib->second, res, ctx, depth + 1);
             }
@@ -1622,13 +1638,13 @@ public:   // NythonExecutor is a struct: members default to public
         // Objects: __lt__ (or the other side's __gt__), then __eq__.
         if ((isInstanceVal(a) || isInstanceVal(b)) && ctx) {
             Value lt;
-            if (!binaryDunder("<", a, b, ctx, lt)) return false;
+            if (!binaryDunder("<", a, b, ctx, lt)) return orderFail(a, b);
             if (isTruthy(lt)) { res = -1; return true; }
             Value eq;
             res = (binaryDunder("==", a, b, ctx, eq) ? isTruthy(eq) : identical(a, b)) ? 0 : 1;
             return true;
         }
-        return false;
+        return orderFail(a, b);
     }
 
     // `x in c`
@@ -1654,11 +1670,12 @@ public:   // NythonExecutor is a struct: members default to public
             pyRaise("TypeError", "argument of type '" + shownClassName(instanceClassName(c)) + "' is not iterable");
         }
         if (isStringValue(c)) {
-            if (!isStringValue(x)) pyRaise("TypeError", "'in <string>' requires string as left operand");
+            if (!isStringValue(x)) pyRaise("TypeError", "'in <string>' requires string as left operand, not " + typeNameOf(x));
             return ((std::string*)c.value.p)->find(*(std::string*)x.value.p) != std::string::npos;
         }
         Container* cont = contOf(c);
-        if (!cont) return false;
+        // `1 in 5`, `x in None`: TypeError, as in Python (round 77; it was false)
+        if (!cont) pyRaise("TypeError", "argument of type '" + typeNameOf(c) + "' is not iterable");
         if (isSetCont(cont)) return setHas(cont, x);   // one lookup (round 77)
         int64_t n = seqLen(cont);
         if (n >= 0) {
@@ -1787,8 +1804,13 @@ public:   // NythonExecutor is a struct: members default to public
         case OP_EQ: return Value(valuesEqual(lv, rv, 0));
         case OP_NE: return Value(!valuesEqual(lv, rv, 0));
         case OP_LT: case OP_LE: case OP_GT: case OP_GE: {
-            int c;
-            if (!orderValues(lv, rv, c, ctx)) return Value(false);
+            int c = 3;
+            if (!orderValues(lv, rv, c, ctx)) {
+                if (c == 2) return Value(false);   // a NaN: unordered, not an error
+                // values Python cannot order: TypeError (round 77; it read false)
+                pyRaise("TypeError", std::string("'") + opSymbol(opc) + "' not supported between instances of '"
+                        + order_fail_l_ + "' and '" + order_fail_r_ + "'");
+            }
             return Value(opc == OP_LT ? c < 0 : opc == OP_LE ? c <= 0 : opc == OP_GT ? c > 0 : c >= 0);
         }
         case OP_SEQ: case OP_SNE: {
@@ -2878,7 +2900,7 @@ public:   // NythonExecutor is a struct: members default to public
             auto it = C.find(k);
             if (it != C.end()) { out = it->second; C.erase(k); return true; }
             if (args.size() >= 2) { out = args[1]; return true; }
-            pyRaise("KeyError", reprOf(args[0], ctx));
+            raiseKeyError(args[0]);   // the key itself (round 77)
         }
         if (name == "popitem") {
             std::string last;
@@ -3365,25 +3387,26 @@ public:   // NythonExecutor is a struct: members default to public
             if (instance_to_class.count(v.value.p)) {
                 std::vector<Value> no_args;
                 Context* c = ctx ? ctx : global_ctx;
+                std::string cn0 = instanceClassName(v);
+                bool exc = !cn0.empty() && isExceptionClass(cn0);
                 if (!repr && instanceHasMethod(v, "__str__")) {
                     Value r;
                     try { r = callMethod(v, "__str__", no_args, c); }
                     catch (nython::node::ReturnSignal& rs) { r = rs.value; }
                     if (r.type != ValueType::NONE && r.type != ValueType::UNDEFINED) return getStringValue(r);
                 }
-                if (instanceHasMethod(v, "__repr__")) {
+                // str() of an exception is BaseException.__str__ even when the
+                // class has its own __repr__ (it comes first in the MRO)
+                if ((repr || !exc) && instanceHasMethod(v, "__repr__")) {
                     Value r;
                     try { r = callMethod(v, "__repr__", no_args, c); }
                     catch (nython::node::ReturnSignal& rs) { r = rs.value; }
                     if (r.type != ValueType::NONE && r.type != ValueType::UNDEFINED) return getStringValue(r);
                 }
-                // An exception: its message for str(), Type('message') for
-                // repr(), as in Python and on the VM.
-                std::string cn0 = instanceClassName(v);
-                if (!cn0.empty() && isExceptionClass(cn0)) {
-                    std::string msg = exceptionMessage(v);
-                    return repr ? cn0 + "(" + nypy::str_repr(msg) + ")" : msg;
-                }
+                // An exception: its message for str(), Type(args...) for
+                // repr(), as in Python and on the VM (round 77: the args'
+                // reprs, not the message quoted).
+                if (exc) return repr ? exceptionRepr(v, c) : exceptionMessage(v);
                 return "<" + typeNameOf(v) + " instance>";
             }
             auto fit = func_names.find(v.value.p);
@@ -3420,6 +3443,14 @@ public:   // NythonExecutor is a struct: members default to public
         Container* c = contOf(v);
         if (!c) return v.value.gc ? v.value.gc->toString() : "none";
         int64_t n = seqLen(c);
+        // A container met again inside itself - directly or through another
+        // one - is [...] / {...} (CPython's Py_ReprEnter; round 77: a cycle
+        // through two containers printed 50 levels deep).
+        static thread_local std::vector<const void*> active;
+        for (const void* p : active)
+            if (p == (const void*)c) return n < 0 ? "{...}" : isTupleCont(c) ? "(...)" : "[...]";
+        active.push_back((const void*)c);
+        struct Leave { ~Leave() { active.pop_back(); } } leave;
         if (n >= 0) {
             bool tup = isTupleCont(c), st = isSetCont(c);
             bool fz = st && isFrozenCont(c);
@@ -3481,9 +3512,11 @@ public:   // NythonExecutor is a struct: members default to public
         if (isInstanceVal(v) && instanceHasMethod(v, "__format__")) {
             std::vector<Value> a = {makeStringValue(spec)};
             Value r = callMethod(v, "__format__", a, ctx ? ctx : global_ctx);
-            if (r.type != ValueType::NONE && r.type != ValueType::UNDEFINED) return getStringValue(r);
-            if (spec.empty()) return strOf(v, ctx);
+            if (isStringValue(r)) return getStringValue(r);
+            // it must give a str (round 77; it was shown whatever it was)
+            pyRaise("TypeError", "__format__ must return a str, not " + typeNameOf(r));
         }
+        if (isInstanceVal(v) && spec.empty()) return strOf(v, ctx);   // object.__format__
         return nyCall([&] { return nypy::format_value(toFmtVal(v, 0, ctx), spec); });
     }
     // str methods: arguments to and results from nypy::str_method.
@@ -4485,6 +4518,13 @@ public:   // NythonExecutor is a struct: members default to public
         }
         if (m == "class_name" || m == "type_name") { out = makeStringValue(typeNameOf(obj)); return true; }
         if (m == "to_string") { out = makeStringValue(strOf(obj, ctx)); return true; }
+        // (255).__format__("x"), "ab".__format__(">4"): format(obj, spec) (round 77)
+        if (m == "__format__") {
+            if (args.size() != 1 || !isStringValue(args[0]))
+                pyRaise("TypeError", typeNameOf(obj) + ".__format__() argument must be str");
+            out = makeStringValue(formatValue(obj, getStringValue(args[0]), ctx));
+            return true;
+        }
         return false;
     }
 
@@ -5371,12 +5411,7 @@ public:   // NythonExecutor is a struct: members default to public
                         return NONE_VALUE;
                     }
                     if (method_name == "__str__") return makeStringValue(exceptionMessage(args[0]));
-                    std::vector<Value> items;
-                    auto pit = instance_properties.find(args[0].value.p);
-                    if (pit != instance_properties.end()) items = listItems(pit->second->getByName("args"));
-                    std::string r = instanceClassName(args[0]) + "(";
-                    for (size_t i = 0; i < items.size(); i++) r += (i ? ", " : "") + reprOf(items[i], ctx);
-                    return makeStringValue(r + ")");
+                    return makeStringValue(exceptionRepr(args[0], ctx));
                 }
             }
         }
@@ -7551,6 +7586,8 @@ public:
     // false: a builtin method (list.append ...) is left to the method call
     // that is about to happen instead of being read as a bound value.
     bool getAttrValue(const Value& obj, const std::string& attr, Context* ctx, Value& out, bool bind = true) {
+        // a generator's __name__, gi_frame, gi_code, ... (round 77, NyGen.cpp)
+        if (nygen::is_gen(obj) && nygen::attr(*this, obj, attr, out)) return true;
         if (attr == "__class__" && !isInstanceValue(obj)) {
             // (5).__class__ is int, [].__class__ is list, C.__class__ is
             // type (round 77)
@@ -7814,14 +7851,18 @@ public:
         void* p = f.value.p;
         auto an = func_ast_nodes.find(p);
         Node* node = an == func_ast_nodes.end() ? nullptr : (Node*)an->second;
+        auto cc = closure_contexts.find(p);
+        return fnInfoOf(node, p, cc == closure_contexts.end() ? nullptr : cc->second);
+    }
+    // fnInfo for a function's node; `p` (the function value, for its
+    // default values) may be null - a generator's gi_code (round 77).
+    Value fnInfoOf(Node* node, void* p, Context* where) {
         auto* fn = dynamic_cast<FunctionNode*>(node);
         auto* lam = fn ? nullptr : dynamic_cast<LambdaNode*>(node);
         if (!fn && !lam) return NONE_VALUE;
         const std::vector<node_ptr>& params = fn ? fn->params : lam->params;
         const std::vector<node_ptr>& defs = fn ? fn->defaults : lam->defaults;
         size_t posonly = fn ? fn->posonly : 0;
-        auto cc = closure_contexts.find(p);
-        Context* where = cc == closure_contexts.end() ? nullptr : cc->second;
         std::vector<Value> ps;
         bool star = false;
         for (size_t i = 0; i < params.size(); i++) {
@@ -7834,7 +7875,7 @@ public:
             else if (i < posonly) kind = 0;
             bool has = i < defs.size() && defs[i] && kind != 2 && kind != 4;
             Value dv = NONE_VALUE;
-            if (has) {
+            if (has && p) {
                 auto dit = fn_defaults_val_.find(p);
                 if (dit != fn_defaults_val_.end() && i < dit->second.size() && dit->second[i].type != ValueType::UNDEFINED) dv = dit->second[i];
                 else if (fn) dv = paramDefault(fn, i, where ? where : global_ctx, p);
@@ -7938,9 +7979,8 @@ public:
     }
     // A missing dict key read: KeyError(key), or the NY_LENIENT_READS=log line.
     Value missingKey(const Value& key, Context* ctx) {
-        std::string k = reprOf(key, ctx);
-        if (nypy::lenient_reads_log()) { logLenientRead(nullptr, "KeyError: " + k); return NONE_VALUE; }
-        throw std::string("__exc__:KeyError:" + k);
+        if (nypy::lenient_reads_log()) { logLenientRead(nullptr, "KeyError: " + reprOf(key, ctx)); return NONE_VALUE; }
+        raiseKeyError(key);   // KeyError(key), the key itself (round 77)
     }
     void logLenientRead(Node* where, const std::string& what) {
         std::string loc;
@@ -8448,19 +8488,113 @@ public:
         }
         return out;
     }
-    // Sets an exception instance's args (and the legacy msg) from the
-    // constructor or super().__init__ arguments.
+    // Sets an exception instance's args from the constructor or
+    // super().__init__ arguments (Python's BaseException.__new__ and
+    // __init__), and the fields some classes make of them (round 77):
+    // OSError(errno, strerror[, filename[, winerror[, filename2]]]) - whose
+    // args are then (errno, strerror) -, UnicodeDecodeError/EncodeError(
+    // encoding, object, start, end, reason), UnicodeTranslateError(object,
+    // start, end, reason), StopIteration.value, SystemExit.code. A field the
+    // arguments do not give keeps what it had (None at first), as in CPython;
+    // the legacy `msg` attribute is gone - super().__init__ overwrote the one
+    // a subclass's __init__ had computed.
+    std::unordered_map<std::string, int> exc_kind_cache_;
+    int excKindOf(const std::string& cn) {
+        auto it = exc_kind_cache_.find(cn);
+        if (it != exc_kind_cache_.end()) return it->second;
+        int k = nython::ny_exc_kind([&](const char* b) { return classDerivesFrom(cn, b); });
+        exc_kind_cache_[cn] = k;
+        return k;
+    }
     void setExceptionArgs(const Value& inst, const std::vector<Value>& args) {
         auto pit = instance_properties.find(inst.value.p);
         if (pit == instance_properties.end()) return;
-        pit->second->defineByName("args", makeListValue(args, true));
-        pit->second->defineByName("msg", makeStringValue(args.size() == 1 ? valueToDisplay(args[0]) : std::string()));
+        Context* props = pit->second;
+        std::string cn = instanceClassName(inst);
+        int kind = excKindOf(cn);
+        auto field = [&](const char* k, const Value& v, bool given) {
+            if (given || !props->container || !props->container->count(k)) props->defineByName(k, given ? v : NONE_VALUE);
+        };
+        std::vector<Value> a = args;
+        if (kind == nython::NYX_OS) {
+            bool p = args.size() >= 2 && args.size() <= 5;
+            field("errno", p ? args[0] : NONE_VALUE, p);
+            field("strerror", p ? args[1] : NONE_VALUE, p);
+            field("filename", p && args.size() >= 3 ? args[2] : NONE_VALUE, p);
+            field("filename2", p && args.size() == 5 ? args[4] : NONE_VALUE, p);
+            if (p && args.size() >= 3 && args[2].type != ValueType::NONE) a.resize(2);
+        } else if (kind == nython::NYX_UDECODE || kind == nython::NYX_UENCODE || kind == nython::NYX_UTRANSLATE) {
+            bool tr = kind == nython::NYX_UTRANSLATE;
+            bool p = args.size() == (tr ? 4u : 5u);
+            size_t o = tr ? 0 : 1;
+            field("encoding", p && !tr ? args[0] : NONE_VALUE, p);
+            field("object", p ? args[o] : NONE_VALUE, p);
+            field("start", p ? args[o + 1] : NONE_VALUE, p);
+            field("end", p ? args[o + 2] : NONE_VALUE, p);
+            field("reason", p ? args[o + 3] : NONE_VALUE, p);
+        } else if (kind == nython::NYX_SYNTAX) {
+            // SyntaxError(msg, (filename, lineno, offset, text[, end_lineno, end_offset]))
+            field("msg", args.empty() ? NONE_VALUE : args[0], !args.empty());
+            std::vector<Value> info;
+            if (args.size() == 2) { Container* ic = contOf(args[1]); int64_t n = ic ? seqLen(ic) : -1; if (n >= 4 && n <= 6) info = listItems(args[1]); }
+            for (int i = 0; i < 6; i++)
+                field(nython::ny_syntax_fields()[i], i < (int)info.size() ? info[(size_t)i] : NONE_VALUE, !info.empty());
+        } else if (kind == nython::NYX_IMPORT) {
+            field("msg", args.size() == 1 ? args[0] : NONE_VALUE, args.size() == 1);
+        }
+        props->defineByName("args", makeListValue(a, true));
         // StopIteration.value: a generator's return value (both engines).
-        if (classDerivesFrom(instanceClassName(inst), "StopIteration"))
-            pit->second->defineByName("value", args.empty() ? NONE_VALUE : args[0]);
+        if (classDerivesFrom(cn, "StopIteration"))
+            props->defineByName("value", args.empty() ? NONE_VALUE : args[0]);
         // SystemExit.code: exit(n) / sys.exit(n) (round 77)
-        if (classDerivesFrom(instanceClassName(inst), "SystemExit"))
-            pit->second->defineByName("code", args.empty() ? NONE_VALUE : args.size() == 1 ? args[0] : makeListValue(args, true));
+        if (classDerivesFrom(cn, "SystemExit"))
+            props->defineByName("code", args.empty() ? NONE_VALUE : args.size() == 1 ? args[0] : makeListValue(args, true));
+    }
+    // The arguments of a builtin exception made from a runtime error's
+    // message (round 77): an OSError's "[Errno N] text: 'name'" back into
+    // (errno, strerror, filename, None, filename2), a codec error's fields
+    // from the codec (nypy::last_unicode_error), a KeyError's key from its
+    // repr (a str or int key; anything else stays the text).
+    std::vector<Value> excArgsFromMessage(const std::string& t, const std::string& msg) {
+        int kind = excKindOf(t);
+        if (kind == nython::NYX_OS) {
+            nython::NyErrnoParts ep;
+            if (nython::ny_parse_errno_message(msg, ep)) {
+                std::vector<Value> a{intValue((int64_t)ep.err), makeStringValue(ep.strerror)};
+                if (ep.has_f1) a.push_back(makeStringValue(ep.f1));
+                if (ep.has_f2) { a.push_back(NONE_VALUE); a.push_back(makeStringValue(ep.f2)); }
+                return a;
+            }
+        } else if (kind == nython::NYX_UDECODE || kind == nython::NYX_UENCODE) {
+            const nypy::UnicodeErrInfo& ui = nypy::last_unicode_error();
+            if (ui.msg == msg && ui.is_str == (kind == nython::NYX_UENCODE))
+                return {makeStringValue(ui.encoding), ui.is_str ? makeStringValue(ui.object) : makeBytesValue(ui.object, false),
+                        intValue(ui.start), intValue(ui.end), makeStringValue(ui.reason)};
+        } else if (kind == nython::NYX_KEY) {
+            std::string k;
+            size_t i = 0;
+            if (nython::ny_unquote_py(msg, i, k) && i == msg.size()) return {makeStringValue(k)};
+            size_t d = msg.size() > 1 && msg[0] == '-' ? 1 : 0;
+            if (msg.size() > d && msg.size() < 19 && msg.find_first_not_of("0123456789", d) == std::string::npos)
+                return {intValue((int64_t)std::stoll(msg))};
+        }
+        return {makeStringValue(msg)};
+    }
+    // KeyError(key) raised by the runtime (a missing key, set.remove, ...):
+    // the key itself is its argument, as in Python (round 77).
+    [[noreturn]] void raiseKeyError(const Value& key) {
+        Node* cn = classNodeByName("KeyError");
+        if (cn) {
+            Value cv; cv.type = ValueType::USERDATA; cv.value.p = (void*)cn;
+            std::vector<Value> a{key};
+            static const nyrt::OrderedKw<Value> no_kw;
+            Value inst = instantiateClass(cv, a, no_kw, global_ctx);
+            if (isInstanceVal(inst)) {
+                if (!handling_obj_.empty()) setExcContext(inst, handling_obj_.back().second);
+                throw rememberRaised("KeyError", inst);
+            }
+        }
+        pyRaise("KeyError", reprOf(key));
     }
     std::string valueToDisplay(const Value& v) {
         if (v.type == ValueType::USERDATA && v.value.p && instance_to_class.count(v.value.p))
@@ -8470,20 +8604,65 @@ public:
         std::vector<Value> sa{v};
         return getStringValue(callBuiltin("str", sa, global_ctx));
     }
-    // Python's BaseException.__str__ over the instance's args.
+    // Python's BaseException.__str__ over the instance's args: "" for none,
+    // str(arg) for one (KeyError: its repr), the args tuple's repr for more -
+    // and OSError's / the Unicode errors' own, made from their fields (round
+    // 77; CPython's Objects/exceptions.c).
     std::string exceptionMessage(const Value& inst) {
         auto pit = instance_properties.find(inst.value.p);
-        if (pit == instance_properties.end()) return std::string();
-        Value a = pit->second->getByName("args");
-        std::vector<Value> items = listItems(a);
-        if (a.type == ValueType::UNDEFINED) {
-            Value m = pit->second->getByName("msg");
-            return m.type == ValueType::UNDEFINED ? std::string() : valueToDisplay(m);
+        if (pit == instance_properties.end() || !pit->second->container) return std::string();
+        auto& pc = *pit->second->container;
+        auto field = [&](const char* k) { auto it = pc.find(k); return it == pc.end() ? NONE_VALUE : it->second; };
+        auto absent = [](const Value& v) { return v.type == ValueType::NONE || v.type == ValueType::UNDEFINED; };
+        int kind = excKindOf(instanceClassName(inst));
+        if (kind == nython::NYX_OS) {
+            Value en = field("errno"), se = field("strerror"), f1 = field("filename"), f2 = field("filename2");
+            if (!absent(f1))
+                return "[Errno " + strOf(en) + "] " + strOf(se) + ": " + reprOf(f1) + (absent(f2) ? std::string() : " -> " + reprOf(f2));
+            if (!absent(en) && !absent(se)) return "[Errno " + strOf(en) + "] " + strOf(se);
+        } else if (kind == nython::NYX_UDECODE || kind == nython::NYX_UENCODE || kind == nython::NYX_UTRANSLATE) {
+            Value ob = field("object"), sv = field("start"), ev = field("end");
+            Num s, e;
+            if (!absent(ob) && asNum(sv, s) && asNum(ev, e) && s.k == 1 && e.k == 1) {
+                long long one = -1;
+                if (kind == nython::NYX_UDECODE) {
+                    if (auto* bo = bytesOf(ob)) if (s.i >= 0 && (size_t)s.i < bo->s.size() && e.i == s.i + 1) one = (unsigned char)bo->s[(size_t)s.i];
+                } else if (isStringValue(ob) && e.i == s.i + 1 && s.i >= 0) {
+                    auto chars = nypy::u8_chars(getStringValue(ob));
+                    if ((size_t)s.i < chars.size()) { size_t j = 0; one = nypy::u8_decode(chars[(size_t)s.i], j); }
+                }
+                Value enc = field("encoding"), why = field("reason");
+                return nython::ny_unicode_error_message(kind, absent(enc) ? std::string() : strOf(enc), one, s.i, e.i, strOf(why));
+            }
+        } else if (kind == nython::NYX_SYNTAX) {
+            Value fn = field("filename"), ln = field("lineno");
+            bool hf = isStringValue(fn), hl = ln.type == ValueType::INTEGER;
+            if (hf || hl) {
+                int64_t line = 0;
+                if (hl) bigint_fits_i64(ln.value.i, line);
+                return nython::ny_syntax_message(strOf(field("msg")), hf, hf ? getStringValue(fn) : std::string(), hl, line);
+            }
         }
+        auto ait = pc.find("args");
+        if (ait == pc.end()) return std::string();
+        std::vector<Value> items = listItems(ait->second);
         if (items.empty()) return std::string();
-        if (items.size() == 1) return valueToDisplay(items[0]);
-        std::string r = "(";
-        for (size_t i = 0; i < items.size(); i++) { if (i) r += ", "; r += valueToDisplay(items[i]); }
+        if (items.size() == 1) return kind == nython::NYX_KEY ? reprOf(items[0]) : valueToDisplay(items[0]);
+        return reprOf(ait->second);
+    }
+    // Python's BaseException.__repr__: Type(args...), the args as reprs.
+    std::string exceptionRepr(const Value& inst, Context* ctx) {
+        std::vector<Value> items;
+        auto pit = instance_properties.find(inst.value.p);
+        if (pit != instance_properties.end() && pit->second->container) {
+            auto it = pit->second->container->find("args");
+            if (it != pit->second->container->end()) items = listItems(it->second);
+        }
+        std::string r = shownClassName(instanceClassName(inst));
+        size_t dot = r.rfind('.');
+        if (dot != std::string::npos) r = r.substr(dot + 1);
+        r += "(";
+        for (size_t i = 0; i < items.size(); i++) r += (i ? ", " : "") + reprOf(items[i], ctx);
         return r + ")";
     }
     // str(instance): its __str__/__repr__, an exception's message, or
@@ -8555,7 +8734,10 @@ public:
         if (cn && flow.rfind("__exc__:", 0) == 0) {
             Value cv; cv.type = ValueType::USERDATA; cv.value.p = (void*)cn;
             if (fnTag(func_names, cv.value.p).rfind("__class__:", 0) == 0) {
-                std::vector<Value> a{makeStringValue(excMessageOf(flow))};
+                // the arguments the message stands for: an OSError's errno
+                // and filename, a codec error's fields, a KeyError's key
+                // (round 77)
+                std::vector<Value> a = excArgsFromMessage(t, excMessageOf(flow));
                 // StopIteration() / GeneratorExit() raised by the runtime
                 // carry no argument (value is none, args empty).
                 if ((t == "StopIteration" || t == "GeneratorExit") && excMessageOf(flow).empty()) a.clear();
@@ -9033,6 +9215,14 @@ public:
     Value instantiateClass(const Value& cls, std::vector<Value>& args,
                            const nyrt::OrderedKw<Value>& kw, Context* ctx) {
         std::string className = fnTag(func_names, cls.value.p).substr(10);
+        // OSError(errno, strerror, ...) makes the subclass for that errno:
+        // OSError(2, "x") is a FileNotFoundError (round 77, CPython's errnomap)
+        if (className == "OSError" && args.size() >= 2 && args.size() <= 5 && args[0].type == ValueType::INTEGER) {
+            int64_t en = 0;
+            const char* sub = bigint_fits_i64(args[0].value.i, en) ? nython::ny_errno_exc_class((long)en) : "";
+            Node* sn = *sub ? classNodeByName(sub) : nullptr;
+            if (sn) { Value sv; sv.type = ValueType::USERDATA; sv.value.p = (void*)sn; return instantiateClass(sv, args, kw, ctx); }
+        }
         bool skip_meta_call = type_call_skip_;
         type_call_skip_ = false;
         if (!class_meta_.empty() || !metaclass_types_.empty()) {
@@ -10512,7 +10702,7 @@ public:
                 int64_t n = seqLen(cont);
                 if (n < 0) {
                     // del d[k]: a missing key is a KeyError, as in Python
-                    if (cont->container->erase(dictKey(idx)) == 0) pyRaise("KeyError", reprOf(idx, ctx));
+                    if (cont->container->erase(dictKey(idx)) == 0) raiseKeyError(idx);   // round 77
                 } else {
                     if (isTupleCont(cont)) pyRaise("TypeError", "'tuple' object doesn't support item deletion");
                     Num k;
@@ -10844,15 +11034,56 @@ public:
         CtxReaper reap(this, sc);
         sc->inModule = true;
         sc->parentFilter = &module_filter_;
-        auto load = [&](Container* d) {
-            for (auto& kv : *d->container) if (!isInternalKey(kv.first)) sc->defineByName(nypy::key_payload(kv.first), kv.second);
+        // what the code bound that goes back into a dict: every name but the
+        // parser's temporaries (round 77: dunder names too - def __init__)
+        auto exported = [](const std::string& k) {
+            return !k.empty() && (unsigned char)k[0] >= 0x20 && !nyrt::is_decorator_temp(k);
         };
-        if (gd) load(gd);
-        if (ld) load(ld);
+        // A dict's string key is the plain name, except a dunder name
+        // ("\x01s__x__"); a scope keys every name plainly.
+        bool live = gd && (!ld || ld == gd);
+        if (live) {
+            // exec(src, ns) / eval(src, ns): the scope's variables ARE the
+            // dict's (round 77, as Python) - functions defined there see
+            // later changes to ns, and what they bind with `global` lands in
+            // it. With a locals dict too, a scope made from both, its
+            // bindings copied into the locals dict afterwards.
+            delete sc->container;
+            sc->container = gd->container;
+            sc->ns_owner = gd;
+            nygc::incref(gd);
+            std::vector<std::pair<std::string, Value>> dn;
+            for (auto& kv : *gd->container)
+                if (kv.first.size() > 2 && kv.first[0] == '\x01' && kv.first[1] == 's') dn.push_back({kv.first.substr(2), kv.second});
+            for (auto& d : dn) (*gd->container)[d.first] = d.second;
+        } else {
+            auto load = [&](Container* d) {
+                for (auto& kv : *d->container) {
+                    if (isInternalKey(kv.first)) continue;
+                    if (kv.first.size() >= 2 && kv.first[0] == '\x01' && kv.first[1] != 's') continue;   // not a str key
+                    sc->defineByName(nypy::key_payload(kv.first), kv.second);
+                }
+            };
+            if (gd) load(gd);
+            if (ld) load(ld);
+        }
+        // the markers a dict's map must not hold as plain keys (a "__len__"
+        // makes it a list): bound by the code, they stay under the dict key
+        static const char* const markers[] = {"__len__", "__tuple__", "__set__", "__kwargs__", "__type__", "__class__"};
+        std::vector<const char*> fresh_markers;
+        if (live) for (const char* m : markers) if (!gd->container->count(m)) fresh_markers.push_back(m);
         Value r = evalNode(ast, sc);
+        if (live) {
+            std::vector<std::pair<std::string, Value>> add;
+            for (auto& kv : *gd->container)
+                if (isInternalKey(kv.first) && exported(kv.first)) add.push_back({nypy::key_of_str(kv.first), kv.second});
+            for (auto& d : add) (*gd->container)[d.first] = d.second;
+            for (const char* m : fresh_markers) gd->container->erase(m);
+            return is_exec ? NONE_VALUE : r;
+        }
         if (!is_exec) return r;
         Container* out = ld ? ld : gd;
-        for (auto& kv : *sc->container) if (!reflectHidden(kv.first)) dictSet(out, makeStringValue(kv.first), kv.second);
+        for (auto& kv : *sc->container) if (exported(kv.first)) dictSet(out, makeStringValue(kv.first), kv.second);
         return NONE_VALUE;
     }
     Value compileBuiltin(std::vector<Value>& args, Context* ctx) {
@@ -11385,6 +11616,15 @@ public:
             }
             out = Value(r); return true;
         }
+        // iter(callable, sentinel): calls it until it returns the sentinel
+        // (round 77, a lazy callable_iterator)
+        if (name == "iter" && args.size() == 2) {
+            std::vector<Value> ca{args[0]};
+            if (!isTruthy(callBuiltin("callable", ca, ctx))) pyRaise("TypeError", "iter(v, w): v must be callable");
+            out = nygen::make_callable_iter(*this, args[0], args[1]);
+            return true;
+        }
+        if (name == "iter" && args.size() > 2) pyRaise("TypeError", "iter expected at most 2 arguments, got " + std::to_string(args.size()));
         if (name == "iter" && !args.empty()) {
             const Value& v = args[0];
             if (nygen::is_gen(v)) { out = v; return true; }

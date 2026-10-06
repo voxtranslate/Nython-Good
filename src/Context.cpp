@@ -30,15 +30,20 @@ Context::~Context(){
     Context* p = parent;
     parent = nullptr;
     if (p) nygc::decref(p);
+    // a scope over a dict's map (exec(src, ns), round 77): the map is the
+    // dict's, not freed here
+    if (Collectable* o = ns_owner) { container = nullptr; ns_owner = nullptr; nygc::decref(o); }
 }
 
 void Context::gc_traverse(nython::gc::GcVisitFn visit, void* arg) {
-    Container::gc_traverse(visit, arg);
+    if (ns_owner) visit(ns_owner, arg);          // its variables are the dict's (round 77)
+    else Container::gc_traverse(visit, arg);
     if (parent) visit(parent, arg);
 }
 
 void Context::gc_clear() {
-    Container::gc_clear();
+    if (Collectable* o = ns_owner) { container = nullptr; ns_owner = nullptr; nygc::decref(o); }
+    else Container::gc_clear();
     Context* p = parent;
     parent = nullptr;
     if (p) nygc::decref(p);

@@ -38,11 +38,11 @@ inline bool is_operator_member(const std::string& m) {
 // int / float methods (round 77; NyBytes.hpp has the shared bodies).
 inline const std::unordered_set<std::string>& int_methods() {
     static const std::unordered_set<std::string> s = {
-        "to_bytes", "bit_length", "bit_count", "conjugate", "as_integer_ratio", "is_integer"};
+        "to_bytes", "bit_length", "bit_count", "conjugate", "as_integer_ratio", "is_integer", "__format__"};
     return s;
 }
 inline const std::unordered_set<std::string>& float_methods() {
-    static const std::unordered_set<std::string> s = {"is_integer", "as_integer_ratio", "hex", "conjugate"};
+    static const std::unordered_set<std::string> s = {"is_integer", "as_integer_ratio", "hex", "conjugate", "__format__"};
     return s;
 }
 // The builtin types read as namespaces (round 77): `str.upper`,
@@ -71,7 +71,7 @@ inline bool type_classmethod(const std::string& t, const std::string& m) {
 // The methods each builtin kind has (dir() lists them).
 inline const std::unordered_set<std::string>* kind_methods(MemberKind k) {
     static const std::unordered_set<std::string> str_m = {
-        "__contains__", "capitalize", "casefold", "center", "charAt", "char_at", "contains", "count",
+        "__contains__", "__format__", "capitalize", "casefold", "center", "charAt", "char_at", "contains", "count",
         "decode", "encode", "ends_with", "endswith", "expandtabs", "find", "format", "format_map",
         "includes", "index", "isalnum", "isalpha", "isascii", "isdecimal", "isdigit", "isidentifier",
         "islower", "isnumeric", "isprintable", "isspace", "istitle", "isupper", "join", "len", "length",
@@ -80,12 +80,12 @@ inline const std::unordered_set<std::string>* kind_methods(MemberKind k) {
         "slice", "split", "splitlines", "starts_with", "startswith", "strip", "substr", "substring",
         "swapcase", "title", "to_float", "to_int", "to_integer", "to_number", "trim", "upper", "zfill"};
     static const std::unordered_set<std::string> list_m = {
-        "__contains__", "add", "append", "clear", "contains", "copy", "count", "difference", "discard",
+        "__contains__", "__format__", "add", "append", "clear", "contains", "copy", "count", "difference", "discard",
         "each", "extend", "filter", "fold", "forEach", "has", "includes", "index", "indexOf", "insert",
         "intersection", "join", "len", "length", "map", "max", "min", "pop", "push", "reduce", "remove",
         "reverse", "reversed", "size", "slice", "sort", "sorted", "sum", "union"};
     static const std::unordered_set<std::string> tuple_m = {
-        "__contains__", "contains", "count", "copy", "each", "filter", "fold", "forEach", "has",
+        "__contains__", "__format__", "contains", "count", "copy", "each", "filter", "fold", "forEach", "has",
         "includes", "index", "indexOf", "join", "len", "length", "map", "max", "min", "reduce",
         "reversed", "size", "slice", "sorted", "sum"};
     static const std::unordered_set<std::string> dict_m = {

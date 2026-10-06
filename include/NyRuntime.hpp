@@ -152,6 +152,24 @@ module_members(const std::string& module, const std::vector<std::string>& builti
     return out;
 }
 
+// Members of `import os` that are Python's own rather than the flat os_*
+// builtin of that name (round 77): structure sequences (os.stat_result,
+// os.terminal_size, os.times_result, os.uname_result) and the functions
+// that raise OSError with errno and the file names where the legacy
+// builtin reports failure by its result. Each maps to the prelude (or
+// builtin) name both engines bind in its place.
+inline const std::vector<std::pair<const char*, const char*>>& os_python_members() {
+    static const std::vector<std::pair<const char*, const char*>> m = {
+        {"stat", "_ny_os_stat"}, {"lstat", "_ny_os_lstat"}, {"fstat", "_ny_os_fstat"},
+        {"stat_result", "_ny_os_stat_result"}, {"terminal_size", "_ny_os_terminal_size"},
+        {"get_terminal_size", "_ny_os_get_terminal_size"}, {"times", "_ny_os_times"},
+        {"times_result", "_ny_os_times_result"}, {"uname", "_ny_os_uname"},
+        {"uname_result", "_ny_os_uname_result"}, {"listdir", "_ny_os_listdir"},
+        {"rename", "_ny_os_rename"}, {"replace", "_ny_os_replace"}, {"remove", "os_unlink"},
+        {"mkdir", "_ny_os_mkdir"}, {"link", "_ny_os_link"}};
+    return m;
+}
+
 // The builtin a member of a builtin used as a namespace names: time.sleep is
 // time_sleep, time.time is time, time.monotonic is time_monotonic. `has`
 // says whether a builtin exists. "" when there is none.
@@ -393,7 +411,7 @@ inline bool takes_paths(const std::string& n) {
     static const char* const names[] = {"open", "read_file", "write_file", "append_file", "read_bytes",
                                         "write_bytes", "read_text", "write_text", "load_text",
                                         "save_text", "append_text", "listdir", "list_dir", "glob",
-                                        "fnmatch", "remove_file", "subprocess_run"};
+                                        "fnmatch", "remove_file", "subprocess_run", "_ny_os_call"};
     for (const char* x : names) if (n == x) return true;
     return false;
 }

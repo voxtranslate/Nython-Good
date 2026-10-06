@@ -167,10 +167,24 @@ inline std::string hex2(unsigned char c) {
     static const char* hx = "0123456789abcdef";
     std::string r = "0x"; r += hx[c >> 4]; r += hx[c & 15]; return r;
 }
+// The fields of the last UnicodeDecodeError / UnicodeEncodeError a codec
+// raised on this thread (round 77): the engines make the exception object
+// from the message, and take encoding, object, start, end and reason from
+// here when the message is this one (e.object is the whole input).
+struct UnicodeErrInfo {
+    std::string msg, encoding, object, reason;
+    bool is_str = false;            // object is a str (encode) rather than bytes
+    int64_t start = 0, end = 0;
+};
+inline UnicodeErrInfo& last_unicode_error() { static thread_local UnicodeErrInfo e; return e; }
+
 [[noreturn]] inline void decode_error(Codec c, const std::string& s, size_t a, size_t b, const char* why) {
     std::string m = std::string("'") + codec_name(c) + "' codec can't decode ";
     if (b - a == 1) m += "byte " + hex2((unsigned char)s[a]) + " in position " + std::to_string(a);
     else m += "bytes in position " + std::to_string(a) + "-" + std::to_string(b - 1);
+    UnicodeErrInfo& info = last_unicode_error();
+    info.msg = m + ": " + why; info.encoding = codec_name(c); info.object = s; info.reason = why;
+    info.is_str = false; info.start = (int64_t)a; info.end = (int64_t)b;
     raise("UnicodeDecodeError", m + ": " + why);
 }
 inline void decode_bad(ErrMode e, Codec c, const std::string& s, size_t a, size_t b, const char* why, std::string& out) {
@@ -283,6 +297,11 @@ inline void encode_bad(ErrMode e, Codec c, const std::string& s, uint32_t cp, in
             if (cp <= 0xFF) std::snprintf(buf, sizeof buf, "\\x%02x", cp);
             else if (cp <= 0xFFFF) std::snprintf(buf, sizeof buf, "\\u%04x", cp);
             else std::snprintf(buf, sizeof buf, "\\U%08x", cp);
+            UnicodeErrInfo& info = last_unicode_error();
+            info.reason = "ordinal not in range(" + std::to_string(limit) + ")";
+            info.msg = m + buf + "' in position " + std::to_string(pos) + ": " + info.reason;
+            info.encoding = codec_name(c); info.object = s; info.is_str = true;
+            info.start = pos; info.end = pos + 1;
             raise("UnicodeEncodeError", m + buf + "' in position " + std::to_string(pos) + ": ordinal not in range(" + std::to_string(limit) + ")");
         }
         case ErrMode::Ignore: return;

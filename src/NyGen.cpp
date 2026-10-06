@@ -29,7 +29,7 @@ struct GenKill {};
 enum class Kind : uint8_t { Function, GenExpr, Native };
 enum class St : uint8_t { Created, Suspended, Running, Done };
 enum class Mode : uint8_t { Next, Send, Throw, Close, Kill };
-enum class Op : uint8_t { Zip, Map, Filter, Enumerate, Islice, Iter };
+enum class Op : uint8_t { Zip, Map, Filter, Enumerate, Islice, Iter, CallIter };
 
 // A position in anything iterable, advanced one value at a time.
 struct Cursor {
@@ -604,6 +604,14 @@ bool native_next(NythonExecutor& E, Gen* g, Value& out, Context* ctx) {
     }
     case Op::Iter:
         return step(E, g->src[0], out, ctx);
+    case Op::CallIter: {
+        // iter(fn, sentinel): fnv() until it equals the sentinel (idx)
+        std::vector<Value> none;
+        Value v = E.callFunctionValue(g->fnv, none, ctx);
+        if (E.pyEquals(v, g->idx, ctx)) return false;
+        out = v;
+        return true;
+    }
     case Op::Islice: {
         // CPython's islice_next: skip to the next wanted index, stop at `stop`
         // without reading past it.
@@ -991,8 +999,28 @@ bool method(NythonExecutor& E, const Value& obj, const std::string& name, std::v
     }
     if (name == "throw") {
         if (args.empty()) raise("TypeError", "throw expected at least 1 argument, got 0");
-        std::vector<Value> cargs(args.begin() + 1, args.end());
-        std::string th = exc_string_for(E, args[0], cargs, ctx ? ctx : E.global_ctx);
+        if (args.size() > 3) raise("TypeError", "throw expected at most 3 arguments, got " + std::to_string(args.size()));
+        // throw(type[, value[, tb]]) as Python normalizes it (round 77): a
+        // value that is an instance of type is raised itself, None makes
+        // type(), a tuple type(*value), anything else type(value); an
+        // instance takes no separate value.
+        Value tv = args[0];
+        std::vector<Value> cargs;
+        bool is_cls = tv.type == ValueType::USERDATA && tv.value.p && E.fnTag(E.func_names, tv.value.p).rfind("__class__:", 0) == 0;
+        if (args.size() > 1 && args[1].type != ValueType::NONE) {
+            const Value& val = args[1];
+            if (is_cls) {
+                std::string cn = E.fnTag(E.func_names, tv.value.p).substr(10);
+                if (E.isInstanceValue(val) && E.classDerivesFrom(E.instanceClassName(val), cn)) tv = val;
+                else if (Container* tc = E.contOf(val); tc && E.isTupleCont(tc)) cargs = E.listItems(val);
+                else cargs.push_back(val);
+            } else if (E.isInstanceValue(tv)) {
+                raise("TypeError", "instance exception may not have a separate value");
+            } else {
+                cargs.push_back(val);
+            }
+        }
+        std::string th = exc_string_for(E, tv, cargs, ctx ? ctx : E.global_ctx);
         if (g->st == St::Running) raise("ValueError", "generator already executing");
         if (g->kind != Kind::Function || g->st != St::Suspended) {
             // Not paused at a yield: the exception is raised straight away
@@ -1295,6 +1323,64 @@ Value make_iter(NythonExecutor& E, const Value& v, Context* ctx) {
     Value res = make_native(E, Op::Iter, "iterator");
     gen_of(res)->name = nyrt::iterator_type_for(tn, ascii);
     gen_of(res)->src.push_back(std::move(cu));
+    return res;
+}
+
+bool attr(NythonExecutor& E, const Value& obj, const std::string& name, Value& out) {
+    Gen* g = gen_of(obj);
+    if (!g || g->kind == Kind::Native) return false;      // a zip/map object has none of these
+    if (name.size() < 7 || (name[0] != '_' && name[0] != 'g')) return false;
+    bool fn = g->kind == Kind::Function && g->fn;
+    if (name == "__name__") { out = E.makeStringValue(g->name); return true; }
+    if (name == "__qualname__") {
+        out = E.makeStringValue(fn && !g->fn->qualname.empty() ? g->fn->qualname : g->name);
+        return true;
+    }
+    if (name == "gi_running") { out = Value(g->st == St::Running); return true; }
+    if (name == "gi_suspended") { out = Value(g->st == St::Suspended); return true; }
+    if (name == "gi_yieldfrom") {
+        out = g->st == St::Suspended && g->kind == Kind::Function && g->delegate.type != ValueType::NONE
+              && g->delegate.type != ValueType::UNDEFINED ? g->delegate : NONE_VALUE;
+        return true;
+    }
+    if (name == "gi_frame") {
+        // None once it has finished; else a frame whose f_lineno is the
+        // statement it is paused at (the def line before it starts)
+        if (g->st == St::Done) { out = NONE_VALUE; return true; }
+        Node* code = fn ? (Node*)g->fn : (Node*)g->comp;
+        Node* where = g->st == St::Suspended && g->saved.cur ? g->saved.cur
+                    : g->st == St::Running ? NythonExecutor::cur_stmt() : nullptr;
+        int64_t line = where ? (int64_t)where->token().line()
+                     : fn && g->fn->first_line ? (int64_t)g->fn->first_line : code ? (int64_t)code->token().line() : 0;
+        std::string file = code ? code->token().fileName() : std::string();
+        Value fr = E.global_ctx->getByName("_NyFrame");
+        std::vector<Value> a{E.makeStringValue(file), intValue(line), E.makeStringValue(g->name),
+                             E.makeStringValue(E.frameModule(g->fc ? g->fc : g->outer))};
+        out = E.callFunctionValue(fr, a, E.global_ctx);
+        return true;
+    }
+    if (name == "gi_code") {
+        // the generator function's __code__ (a generator expression's has
+        // only its name and place)
+        if (fn) {
+            Value info = E.fnInfoOf(g->fn, nullptr, g->fc);
+            std::vector<Value> a{info};
+            out = E.callFunctionValue(E.global_ctx->getByName("_NyFuncCode"), a, E.global_ctx);
+        } else {
+            Node* code = (Node*)g->comp;
+            std::vector<Value> a{E.makeStringValue(code ? code->token().fileName() : std::string()), E.makeStringValue(g->name)};
+            out = E.callFunctionValue(E.global_ctx->getByName("_NyCodeInfo"), a, E.global_ctx);
+        }
+        return true;
+    }
+    return false;
+}
+
+Value make_callable_iter(NythonExecutor& E, const Value& fn, const Value& sentinel) {
+    Value res = make_native(E, Op::CallIter, "callable_iterator");
+    Gen* g = gen_of(res);
+    g->fnv = fn;
+    g->idx = sentinel;
     return res;
 }
 

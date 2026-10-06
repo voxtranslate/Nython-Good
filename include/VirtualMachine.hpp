@@ -543,21 +543,55 @@ struct VMCode {
 inline std::unordered_set<std::string>& vm_exc_classes() {
     static std::unordered_set<std::string> s; return s;
 }
-// Python's BaseException.__str__: no args -> "", one -> str(arg), more ->
-// the args tuple.
+// Which exception classes have fields str() is made from (NyExcTypes.hpp
+// NyExcKind: KeyError, OSError, the Unicode errors), by class name, filled
+// as vm_exc_classes is (round 77).
+inline std::unordered_map<std::string,int>& vm_exc_kinds() {
+    static std::unordered_map<std::string,int> m; return m;
+}
+inline int vm_exc_kind_of(const std::string& cn) {
+    auto it=vm_exc_kinds().find(cn);
+    return it==vm_exc_kinds().end()?0:it->second;
+}
+// Python's BaseException.__str__: no args -> "", one -> str(arg) (a
+// KeyError: its repr), more -> the args tuple; an OSError's and the Unicode
+// errors' own from their fields (round 77, as on the interpreter).
 inline std::string vm_exc_message(const VMVal& e) {
     if(!e.map) return std::string();
+    int kind=vm_exc_kind_of(e.class_name);
+    auto field=[&](const char* k)->VMVal{ auto f=e.map->find(k); return f==e.map->end()?VMVal::make_none():f->second; };
+    if(kind==nython::NYX_OS){
+        VMVal en=field("errno"), se=field("strerror"), f1=field("filename"), f2=field("filename2");
+        if(f1.type!=VMType::NONE)
+            return "[Errno "+en.to_string()+"] "+se.to_string()+": "+f1.repr()+(f2.type==VMType::NONE?std::string():" -> "+f2.repr());
+        if(en.type!=VMType::NONE&&se.type!=VMType::NONE) return "[Errno "+en.to_string()+"] "+se.to_string();
+    } else if(nython::ny_exc_kind_unicode(kind)){
+        VMVal ob=field("object"), sv=field("start"), ev=field("end");
+        if(ob.type!=VMType::NONE&&sv.type==VMType::INT&&ev.type==VMType::INT&&sv.s.empty()&&ev.s.empty()){
+            long long one=-1;
+            if(kind==nython::NYX_UDECODE){
+                if(ob.type==VMType::BYTES){ const std::string& bs=ob.bdata(); if(sv.i>=0&&(size_t)sv.i<bs.size()&&ev.i==sv.i+1) one=(unsigned char)bs[(size_t)sv.i]; }
+            } else if(ob.type==VMType::STRING&&sv.i>=0&&ev.i==sv.i+1){
+                auto ch=nypy::u8_chars(ob.s);
+                if((size_t)sv.i<ch.size()){ size_t j=0; one=nypy::u8_decode(ch[(size_t)sv.i],j); }
+            }
+            VMVal enc=field("encoding");
+            return nython::ny_unicode_error_message(kind, enc.type==VMType::NONE?std::string():enc.to_string(), one, sv.i, ev.i, field("reason").to_string());
+        }
+    } else if(kind==nython::NYX_SYNTAX){
+        VMVal fn=field("filename"), ln=field("lineno");
+        bool hf=fn.type==VMType::STRING, hl=ln.type==VMType::INT&&ln.s.empty();
+        if(hf||hl) return nython::ny_syntax_message(field("msg").to_string(), hf, hf?fn.s:std::string(), hl, hl?ln.i:0);
+    }
     auto it=e.map->find("args");
     if(it!=e.map->end()&&it->second.type==VMType::LIST&&it->second.list){
         auto& a=*it->second.list;
         if(a.empty()) return std::string();
-        if(a.size()==1) return a[0].to_string();
+        if(a.size()==1) return kind==nython::NYX_KEY?a[0].repr():a[0].to_string();
         std::string r="(";
         for(size_t k=0;k<a.size();k++){ if(k) r+=", "; r+=a[k].repr(); }
         return r+")";
     }
-    auto mt=e.map->find("msg");
-    if(mt!=e.map->end()) return mt->second.to_string();
     return std::string();
 }
 
@@ -588,6 +622,23 @@ inline VMVal vm_key_value(const std::string& k) {
     return VMVal::make_none();
 }
 inline bool vm_internal_key(const std::string& k){ return k.size()>=2&&k[0]=='_'&&k[1]=='_'; }
+// The lists and dicts being shown right now on this thread (CPython's
+// Py_ReprEnter): one met again inside itself - `a.append(a)`, or through
+// another container - is shown as [...] / {...} (round 77; only a direct
+// self-reference was caught, and a cycle through two overflowed the stack).
+inline std::vector<const void*>& vm_repr_active() { static thread_local std::vector<const void*> v; return v; }
+struct VMReprEnter {
+    const void* key; bool again=false, pushed=false;
+    explicit VMReprEnter(const void* k) : key(k) {
+        if(!k) return;
+        auto& a=vm_repr_active();
+        for(const void* p:a) if(p==k){ again=true; return; }
+        a.push_back(k); pushed=true;
+    }
+    ~VMReprEnter(){ if(pushed&&!vm_repr_active().empty()) vm_repr_active().pop_back(); }
+    VMReprEnter(const VMReprEnter&)=delete;
+    VMReprEnter& operator=(const VMReprEnter&)=delete;
+};
 struct GenState;
 inline std::string vm_gen_repr(const GenState* g);   // after GenState
 
@@ -609,6 +660,8 @@ inline std::string VMVal::to_string() const {
             for(size_t k=0;k<list->size();k++){ if(k) r+=", "; r+=(*list)[k].repr(); }
             return r+(fz?"})":"}");
         }
+        VMReprEnter guard(list.get());
+        if(guard.again) return b?"(...)":"[...]";
         std::string r=b?"(":"[";
         if(list) for(size_t k=0;k<list->size();k++){
             if(k)r+=", ";
@@ -619,6 +672,8 @@ inline std::string VMVal::to_string() const {
         return r+(b?")":"]");
     }
     case VMType::MAP:{
+        VMReprEnter guard(map.get());
+        if(guard.again) return "{...}";
         std::string r="{"; bool first=true;
         if(map) for(auto&[k,v]:*map){
             if(vm_internal_key(k)) continue;
@@ -682,7 +737,11 @@ inline std::string VMVal::repr() const {
     if(type==VMType::STRING) return nypy::str_repr(s);
     // An exception instance: Type(args...), as Python shows it.
     if(type==VMType::INSTANCE && map && vm_exc_classes().count(class_name)){
-        std::string r=class_name+"(";
+        // the class's own name, as type(e).__name__ (round 77: not "m.E" / "E#2")
+        std::string r=nyrt::shown_class_name(class_name);
+        size_t dot=r.rfind('.');
+        if(dot!=std::string::npos) r=r.substr(dot+1);
+        r+="(";
         auto it=map->find("args");
         if(it!=map->end()&&it->second.type==VMType::LIST&&it->second.list)
             for(size_t k=0;k<it->second.list->size();k++){ if(k) r+=", "; r+=(*it->second.list)[k].repr(); }
@@ -1620,7 +1679,13 @@ private:
                 // clause is handling. It used to raise the string "Exception",
                 // which no typed clause matched.
                 if(!exc_vars_.empty()){ emit_ln(exc_vars_.back(),l); emit(Op::RAISE_ERROR,1,l); }
-                else { emit_lc(VMVal::make_str("RuntimeError: No active exception to reraise"),l); emit(Op::RAISE_ERROR,0,l); }
+                else {
+                    // outside an except clause of its own: the exception a
+                    // caller's except clause is handling - a helper called
+                    // from one re-raises it (round 77) - else RuntimeError
+                    emit_ln("_ny_exc_current",l); emit(Op::CALL_FUNCTION,0,l);
+                    emit(Op::RAISE_ERROR,3,l);
+                }
                 break;
             }
             visit(rn->expr);
@@ -3311,6 +3376,15 @@ public:
             if(m.first.rfind("path.",0)==0) (*path.map)[m.first.substr(5)]=fn;
             else (*ns.map)[m.first]=fn;
         }
+        // Python's own members: os.stat_result, os.terminal_size, the raising
+        // listdir / rename / mkdir ... (round 77, NyRuntime.hpp)
+        for(auto& pm : nyrt::os_python_members()){
+            auto git=globals_.find(pm.second);
+            VMVal v;
+            if(git!=globals_.end()) v=git->second;
+            else { try { v=load_var(pm.second); } catch(...) { continue; } }
+            if(v.type!=VMType::NONE) (*ns.map)[pm.first]=v;
+        }
         for(const char* c : {"sep","pathsep","linesep","name"}){
             VMVal v=globals_.count(std::string("os_")+c)?globals_[std::string("os_")+c]:VMVal::make_none();
             (*ns.map)[c]=v;
@@ -3412,8 +3486,10 @@ public:
 
     [[noreturn]] void raise_native_exception(const std::string& type, const std::string& msg) {
         auto attrs=std::make_shared<VMMap>(); vmgc::track_map(attrs);
-        (*attrs)["msg"]=VMVal::make_str(msg);
-        (*attrs)["args"]=VMVal::make_tuple(std::vector<VMVal>{VMVal::make_str(msg)});
+        // the arguments the message stands for (an OSError's errno and
+        // filename, a codec error's fields, a KeyError's key - round 77)
+        std::string t=type.empty()?std::string("Exception"):type;
+        set_exc_args(*attrs, t, exc_args_from_message(t, msg));
         last_exception_obj_=VMVal::make_instance(type.empty()?std::string("Exception"):type, attrs);
         throw std::runtime_error((type.empty()?std::string("Exception"):type)+": "+msg);
     }
@@ -3788,16 +3864,75 @@ private:
     // arguments), an instance or string as it is.
     VMVal gen_throw_value(std::vector<VMVal>& args) {
         if(args.empty()) throw_exception(make_exception("TypeError",{VMVal::make_str("throw expected at least 1 argument, got 0")}));
+        if(args.size()>3) throw_exception(make_exception("TypeError",{VMVal::make_str("throw expected at most 3 arguments, got "+std::to_string(args.size()))}));
+        // throw(type[, value[, tb]]) as Python normalizes it (round 77): a
+        // value that is an instance of type is raised itself, None makes
+        // type(), a tuple type(*value), anything else type(value); an
+        // instance takes no separate value.
         VMVal ev=args[0];
+        std::vector<VMVal> cargs;
+        bool has_val=args.size()>1&&args[1].type!=VMType::NONE;
+        if(has_val){
+            const VMVal& val=args[1];
+            if(val.type==VMType::LIST&&val.b&&!val.is_set()&&val.list) cargs=*val.list;
+            else cargs.push_back(val);
+        }
         if(ev.type==VMType::CLASS){
-            std::vector<VMVal> cargs(args.begin()+1, args.end());
+            if(has_val&&args[1].type==VMType::INSTANCE&&class_derives(args[1].class_name, ev.class_name)) return args[1];
             ev=instantiate(ev, cargs);
         } else if(ev.type==VMType::NATIVE && ev.class_name.rfind("__builtin__:",0)==0
                   && nython::ny_is_builtin_exc(ev.class_name.substr(12))){
-            std::vector<VMVal> cargs(args.begin()+1, args.end());
             ev=make_exception(ev.class_name.substr(12), cargs);
+        } else if(has_val&&ev.type==VMType::INSTANCE){
+            throw_exception(make_exception("TypeError",{VMVal::make_str("instance exception may not have a separate value")}));
         }
         return normalize_exception(ev);
+    }
+    // A generator's attributes (round 77, as NyGen.cpp's attr): __name__,
+    // __qualname__, gi_running, gi_suspended, gi_yieldfrom (the iterator a
+    // paused `yield from` runs), gi_frame (None once finished; f_lineno is
+    // the line it is paused at, the def line before it starts) and gi_code
+    // (its function's __code__). A lazy zip/map/... has none of them.
+    bool gen_attr(const VMVal& g, const std::string& attr, VMVal& out) {
+        if(!g.gen||g.gen->native) return false;
+        GenState& gs=*g.gen;
+        if(attr=="__name__"){ out=VMVal::make_str(gs.name); return true; }
+        if(attr=="__qualname__"){ out=VMVal::make_str(gs.code&&!gs.code->qualname.empty()?gs.code->qualname:gs.name); return true; }
+        if(attr=="gi_running"){ out=VMVal::make_bool(gs.running); return true; }
+        if(attr=="gi_suspended"){ out=VMVal::make_bool(gs.started&&!gs.done&&!gs.running); return true; }
+        if(attr=="gi_yieldfrom"){
+            out=gs.in_yield_from&&!gs.running&&!gs.saved_stack.empty()?gs.saved_stack.back():VMVal::make_none();
+            return true;
+        }
+        if(attr=="gi_frame"){
+            if(gs.done||!gs.code){ out=VMVal::make_none(); return true; }
+            int line=gs.code->first_line;
+            if(gs.started){
+                // a paused yield: the instruction before ip; a paused yield
+                // from: ip itself; running: the current instruction
+                size_t at=gs.running?(call_stack_.empty()?0:(size_t)call_stack_.back().ip):(size_t)gs.ip;
+                if(!gs.in_yield_from&&at>0) at--;
+                if(at<gs.code->instructions.size()&&gs.code->instructions[at].line>0) line=gs.code->instructions[at].line;
+            }
+            std::string mod="__main__";
+            if(gs.code->module_env){ auto it=gs.code->module_env->find("__name__"); if(it!=gs.code->module_env->end()&&it->second.type==VMType::STRING) mod=it->second.s; }
+            std::vector<VMVal> a{VMVal::make_str(gs.code->file),VMVal::make_int(line),VMVal::make_str(gs.name),VMVal::make_str(mod)};
+            out=vm_call(load_var("_NyFrame"),a,std::nullopt,nullptr);
+            return true;
+        }
+        if(attr=="gi_code"){
+            if(!gs.code){ out=VMVal::make_none(); return true; }
+            VMVal f; f.type=VMType::FUNCTION; f.code=gs.code;
+            if(gs.is_genexpr){
+                std::vector<VMVal> a{VMVal::make_str(gs.code->file),VMVal::make_str(gs.name)};
+                out=vm_call(load_var("_NyCodeInfo"),a,std::nullopt,nullptr);
+            } else {
+                std::vector<VMVal> a{f,VMVal::make_str("__code__")};
+                out=vm_call(load_var("_ny_fn_attr"),a,std::nullopt,nullptr);
+            }
+            return true;
+        }
+        return false;
     }
     // Whether a try/except/finally/with covers the point where a generator
     // is paused - only then can closing it run code of the program.
@@ -4161,6 +4296,28 @@ private:
         raise_native_exception("TypeError",std::string("'")+sym+"' not supported between instances of '"+vm_type_name(a)+"' and '"+vm_type_name(b)+"'");
         throw 0;   // not reached
     }
+    // Python's orderable pairs for < <= > >= (round 77; the rest compared as
+    // false): numbers, two str, two bytes, and two lists or two tuples
+    // element by element; anything else - `1 < "a"`, `None < 1`, `[] < 3`, a
+    // dict - is a TypeError naming the first pair that cannot be ordered
+    // (`[1] < ["a"]`: int and str). Instances are left to their dunders.
+    void order_check(const char* sym, const VMVal& a, const VMVal& b, int depth=0) {
+        auto num=[](const VMVal& v){ return v.type==VMType::INT||v.type==VMType::FLOAT||v.type==VMType::BOOL; };
+        if(num(a)&&num(b)) return;
+        if(a.type==b.type&&(a.type==VMType::STRING||a.type==VMType::BYTES)) return;
+        if(a.type==VMType::INSTANCE||b.type==VMType::INSTANCE) return;
+        if(a.type==VMType::LIST&&b.type==VMType::LIST&&!a.is_set()&&!b.is_set()&&a.b==b.b&&depth<100){
+            size_t n=std::min(a.list?a.list->size():0, b.list?b.list->size():0);
+            for(size_t k=0;k<n;k++){
+                const VMVal& x=(*a.list)[k]; const VMVal& y=(*b.list)[k];
+                if(vm_eq(x,y)) continue;
+                order_check(sym,x,y,depth+1);
+                return;
+            }
+            return;
+        }
+        order_unsupported(sym,a,b);
+    }
     // The prelude's NotImplemented singleton.
     static bool is_ni(const VMVal& v){ return v.type==VMType::INSTANCE&&v.class_name=="_NyNotImplementedType"; }
     static VMVal ni_none(VMVal v){ return is_ni(v)?VMVal::make_none():v; }
@@ -4236,7 +4393,11 @@ private:
             if(meta_call(v,"__str__",{},r)||meta_call(v,"__repr__",{},r)) return r.to_string();
         }
         if(v.type==VMType::INSTANCE){
+            // str() of an exception is BaseException.__str__ even when the
+            // class has its own __repr__ (round 77, as on the interpreter)
+            bool exc=v.map&&vm_exc_classes().count(v.class_name);
             for(auto dname : {"__str__","__repr__"}){
+                if(exc&&dname[2]=='r') break;
                 bool found=false;
                 VMVal r=call_dunder_f(v,dname,{},found);
                 if(found) return r.to_string();
@@ -4252,11 +4413,11 @@ private:
             if(meta_call(v,"__repr__",{},r)) return r.to_string();
         }
         if(v.type==VMType::INSTANCE){
-            for(auto dname : {"__repr__","__str__"}){
-                bool found=false;
-                VMVal r=call_dunder_f(v,dname,{},found);
-                if(found) return r.to_string();
-            }
+            // __repr__ only: repr() does not fall back to __str__ (round 77,
+            // as on the interpreter and in Python)
+            bool found=false;
+            VMVal r=call_dunder_f(v,"__repr__",{},found);
+            if(found) return r.to_string();
             return v.repr();
         }
         if(v.is_set()&&v.list){
@@ -4267,6 +4428,8 @@ private:
             return r+(fz?"})":"}");
         }
         if(v.type==VMType::LIST&&v.list){
+            VMReprEnter guard(v.list.get());   // round 77
+            if(guard.again) return v.b?"(...)":"[...]";
             std::string r=v.b?"(":"[";
             for(size_t k=0;k<v.list->size();k++){
                 if(k) r+=", ";
@@ -4285,6 +4448,8 @@ private:
             return "<bound method "+nm+" of "+(sv!=v.map->end()?vm_repr(sv->second):std::string("?"))+">";
         }
         if(v.type==VMType::MAP&&v.map&&v.class_name.empty()){
+            VMReprEnter guard(v.map.get());   // round 77
+            if(guard.again) return "{...}";
             std::string r="{"; bool first=true;
             for(auto& [k,x]:*v.map){
                 if(vm_internal_key(k)) continue;
@@ -4450,20 +4615,57 @@ private:
         if(has_g&&a[1].type!=VMType::MAP) raise_native_exception("TypeError",std::string(who)+"() globals must be a dict, not "+vm_type_name(a[1]));
         Compiler c; auto code=c.compile(ast);
         if(has_g||has_l){
-            // a module scope of its own made from the dicts (vm_import's
-            // mechanism): what it defines sees those names, not the program's
-            auto env=std::make_shared<VMMap>(); vmgc::track_map(env);
-            if(has_g&&a[1].map) for(auto& kv:*a[1].map) if(!vm_internal_key(kv.first)) (*env)[kv.first]=kv.second;
-            if(has_l&&a[2].type==VMType::MAP&&a[2].map) for(auto& kv:*a[2].map) if(!vm_internal_key(kv.first)) (*env)[kv.first]=kv.second;
+            // A dict's string key is the plain name, except a dunder name
+            // ("\x01s__x__"); a scope keys every name plainly (round 77).
+            auto scope_name=[](const std::string& k, std::string& out)->bool{
+                if(k.size()>=2&&k[0]=='\x01'){ if(k[1]!='s') return false; out=k.substr(2); return true; }
+                if(vm_internal_key(k)) return false;
+                out=k; return true;
+            };
+            // what the code bound that goes back into a dict: every name
+            // but the engine's temporaries
+            auto exported=[](const std::string& k){
+                if(k.empty()||(unsigned char)k[0]<0x20||k=="__ny_eval__"||nyrt::is_decorator_temp(k)) return false;
+                if(k.size()>7&&k.compare(0,5,"__exc")==0&&k.compare(k.size()-2,2,"__")==0
+                   &&k.find_first_not_of("0123456789",5)==k.size()-2) return false;
+                return true;
+            };
+            std::shared_ptr<VMMap> env;
+            // exec(src, ns) / eval(src, ns): the dict itself is the module
+            // scope (round 77, as Python) - functions defined there see
+            // later changes to it, and what they bind with `global` lands
+            // in it. With a locals dict too, a scope made from both, its
+            // bindings copied into the locals dict afterwards.
+            bool live=has_g&&a[1].map&&(!has_l||(a[2].type==VMType::MAP&&a[2].map==a[1].map));
+            if(live){
+                env=a[1].map;
+                std::vector<std::pair<std::string,VMVal>> dunders;
+                for(auto& kv:*env){ std::string n; if(kv.first.size()>=2&&kv.first[0]=='\x01'&&scope_name(kv.first,n)) dunders.push_back({n,kv.second}); }
+                for(auto& d:dunders) (*env)[d.first]=d.second;
+            } else {
+                env=std::make_shared<VMMap>(); vmgc::track_map(env);
+                std::string n;
+                if(has_g&&a[1].map) for(auto& kv:*a[1].map) if(scope_name(kv.first,n)) (*env)[n]=kv.second;
+                if(has_l&&a[2].type==VMType::MAP&&a[2].map) for(auto& kv:*a[2].map) if(scope_name(kv.first,n)) (*env)[n]=kv.second;
+            }
             tag_module_code(code,env);
             code->module_top=true;
             try{ exec_code(code,{},std::nullopt); } catch(VMReturn&){}
             if(!is_exec){
                 auto it=env->find("__ny_eval__");
-                return it!=env->end()?it->second:VMVal::make_none();
+                VMVal r=it!=env->end()?it->second:VMVal::make_none();
+                if(live) env->erase("__ny_eval__");
+                return r;
+            }
+            if(live){
+                // a dunder name it bound (def __init__, __all__ = ...) shows in the dict too
+                std::vector<std::pair<std::string,VMVal>> add;
+                for(auto& kv:*env) if(vm_internal_key(kv.first)&&exported(kv.first)) add.push_back({nypy::key_of_str(kv.first),kv.second});
+                for(auto& d:add) (*env)[d.first]=d.second;
+                return VMVal::make_none();
             }
             VMVal out=has_l&&a[2].type==VMType::MAP?a[2]:a[1];
-            for(auto& kv:*env) if(!reflect_hidden(kv.first)) (*out.map)[kv.first]=kv.second;
+            for(auto& kv:*env) if(exported(kv.first)) (*out.map)[nypy::key_of_str(kv.first)]=kv.second;
             return VMVal::make_none();
         }
         VMMap locals;
@@ -4945,7 +5147,7 @@ private:
         VMMap vars;
         if(a[3].type==VMType::MAP&&a[3].map) for(auto& kv:*a[3].map) if(nypy::key_kind(kv.first)==nypy::K_STR) vars[nypy::key_payload(kv.first)]=kv.second;
         class_vars_[code->name]=vars;
-        if(is_exception_class(code->name)) vm_exc_classes().insert(code->name);
+        if(is_exception_class(code->name)) note_exc_class(code->name);   // with its kind (round 77)
         VMVal clsv=VMVal::make_class(code, code->name);
         if(a[0].type==VMType::CLASS) class_meta_[code->name]=a[0];
         class_created(clsv, kwv);
@@ -5222,6 +5424,12 @@ private:
         // type.__call__ (a metaclass's super().__call__) sets the flag for
         // the one instantiation it makes, which must not run the
         // metaclass's __call__ again; nested ones still do
+        // OSError(errno, strerror, ...) makes the subclass for that errno:
+        // OSError(2, "x") is a FileNotFoundError (round 77, CPython's errnomap)
+        if(cls.class_name=="OSError"&&args.size()>=2&&args.size()<=5&&args[0].type==VMType::INT&&args[0].s.empty()){
+            const char* sub=nython::ny_errno_exc_class((long)args[0].i);
+            if(*sub&&class_reg_.count(sub)) return instantiate(class_value(sub), args, kwargs);
+        }
         bool skip_meta_call=type_call_skip_;
         type_call_skip_=false;
         if(!class_meta_.empty()||!metaclass_types_.empty()){
@@ -5239,7 +5447,7 @@ private:
                 for(auto& x:args) a.push_back(x);
                 VMVal inst=vm_call(nw, a, std::nullopt, kwargs);
                 if(inst.type==VMType::INSTANCE&&class_derives(inst.class_name, cls.class_name)){
-                    if(vm_exc_classes().count(cls.class_name)&&inst.map) (*inst.map)["args"]=VMVal::make_tuple(args);
+                    if(vm_exc_classes().count(cls.class_name)&&inst.map) set_exc_args(*inst.map, inst.class_name, args);
                     VMVal init;
                     if(find_ctor(cls.class_name, init)) invoke_method(init, inst, args, cls.class_name, kwargs);
                 }
@@ -5252,12 +5460,7 @@ private:
         // An exception's args are the constructor's arguments whatever its
         // __init__ does (Python's BaseException.__new__); a class that calls
         // super().__init__(...) replaces them there.
-        if(vm_exc_classes().count(cls.class_name)){
-            (*attrs)["args"]=VMVal::make_tuple(args);
-            (*attrs)["msg"]=VMVal::make_str(args.size()==1?args[0].to_string():std::string());
-            if(class_derives(cls.class_name,"StopIteration")) (*attrs)["value"]=args.empty()?VMVal::make_none():args[0];
-            if(class_derives(cls.class_name,"SystemExit")) (*attrs)["code"]=args.empty()?VMVal::make_none():args.size()==1?args[0]:VMVal::make_tuple(args);
-        }
+        if(vm_exc_classes().count(cls.class_name)) set_exc_args(*attrs, cls.class_name, args);   // and the fields (round 77)
         VMVal init;
         if(find_ctor(cls.class_name, init)) invoke_method(init, inst, args, cls.class_name, kwargs);
         return inst;
@@ -5455,7 +5658,7 @@ private:
                     throw_exception(make_exception("TypeError",{VMVal::make_str("'"+nyrt::shown_class_name(obj.class_name)+"' object doesn't support item deletion")}));
                 }
                 else if(obj.type==VMType::MAP&&obj.map){
-                    if(obj.map->erase(vkey(key))==0) raise_native_exception("KeyError",key.repr());
+                    if(obj.map->erase(vkey(key))==0) throw_exception(make_exception("KeyError",{key}));   // the key itself (round 77)
                 }
                 else if(obj.type==VMType::BYTES){
                     if(!obj.b) raise_native_exception("TypeError","'bytes' object doesn't support item deletion");
@@ -5617,6 +5820,7 @@ private:
                 if((lv.type==VMType::BYTES)!=(r.type==VMType::BYTES)&&lv.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
                     raise_native_exception("TypeError","'<' not supported between instances of '"+vm_type_name(lv)+"' and '"+vm_type_name(r)+"'");
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__lt__","__gt__",res)){ push(std::move(res)); break; } order_unsupported("<",lv,r); }
+                order_check("<",lv,r);   // round 77
                 push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)<0 : lv<r)); break;
             }
             case Op::COMPARE_LE: {
@@ -5625,6 +5829,7 @@ private:
                 if((lv.type==VMType::BYTES)!=(r.type==VMType::BYTES)&&lv.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
                     raise_native_exception("TypeError","'<=' not supported between instances of '"+vm_type_name(lv)+"' and '"+vm_type_name(r)+"'");
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__le__","__ge__",res)){ push(std::move(res)); break; } order_unsupported("<=",lv,r); }
+                order_check("<=",lv,r);   // round 77
                 push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)<=0 : lv<=r)); break;
             }
             case Op::COMPARE_GT: {
@@ -5633,6 +5838,7 @@ private:
                 if((lv.type==VMType::BYTES)!=(r.type==VMType::BYTES)&&lv.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
                     raise_native_exception("TypeError","'>' not supported between instances of '"+vm_type_name(lv)+"' and '"+vm_type_name(r)+"'");
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__gt__","__lt__",res)){ push(std::move(res)); break; } order_unsupported(">",lv,r); }
+                order_check(">",lv,r);   // round 77
                 push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)>0 : lv>r)); break;
             }
             case Op::COMPARE_GE: {
@@ -5641,6 +5847,7 @@ private:
                 if((lv.type==VMType::BYTES)!=(r.type==VMType::BYTES)&&lv.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
                     raise_native_exception("TypeError","'>=' not supported between instances of '"+vm_type_name(lv)+"' and '"+vm_type_name(r)+"'");
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(rich_compare(lv,r,"__ge__","__le__",res)){ push(std::move(res)); break; } order_unsupported(">=",lv,r); }
+                order_check(">=",lv,r);   // round 77
                 push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)>=0 : lv>=r)); break;
             }
             case Op::COMPARE_IN:       { VMVal c=pop(),it=pop(); push(VMVal::make_bool(op_in(it,c))); break; }
@@ -5819,7 +6026,7 @@ private:
                 no_new_.clear();
                 class_vars_[sub->name]=run_class_body(sub, fr);
                 if(orig_bases.type!=VMType::NONE) class_vars_[sub->name]["__orig_bases__"]=orig_bases;   // round 77
-                if(is_exception_class(sub->name)) vm_exc_classes().insert(sub->name);
+                if(is_exception_class(sub->name)) note_exc_class(sub->name);   // with its kind (round 77)
                 else vm_exc_classes().erase(sub->name);
                 {
                     VMVal clsv=VMVal::make_class(sub,sub->name);
@@ -6176,6 +6383,13 @@ private:
 
             case Op::RAISE_ERROR: {
                 // arg 0: raise X   1: bare raise (re-raise)   2: raise X from Y
+                // 3: bare raise of what a caller's except clause handles (round 77)
+                if(ins.arg==3){
+                    VMVal cur=pop();
+                    if(cur.type==VMType::NONE) raise_native_exception("RuntimeError","No active exception to reraise");
+                    tb_reraise_=true;
+                    throw_exception(std::move(cur));
+                }
                 VMVal cause; if(ins.arg==2) cause=pop();
                 VMVal ev=normalize_exception(pop());
                 if(ins.arg==2 && ev.type==VMType::INSTANCE && ev.map){
@@ -6444,16 +6658,91 @@ private:
         }
         return ev.to_string();
     }
+    // Registers class `cn` as an exception class, with the kind of fields
+    // its str() is made from (round 77).
+    void note_exc_class(const std::string& cn) {
+        vm_exc_classes().insert(cn);
+        vm_exc_kinds()[cn]=nython::ny_exc_kind([&](const char* b){ return class_derives(cn,b); });
+    }
+    // An exception's args from its constructor's or super().__init__'s
+    // arguments, and the fields some classes make of them (round 77, as the
+    // interpreter's setExceptionArgs): OSError(errno, strerror[, filename[,
+    // winerror[, filename2]]]) - args then (errno, strerror) -, the Unicode
+    // errors' encoding/object/start/end/reason, StopIteration.value,
+    // SystemExit.code. A field the arguments do not give keeps what it had
+    // (None at first). No legacy `msg`: super().__init__ overwrote the one a
+    // subclass's __init__ had computed.
+    void set_exc_args(VMMap& attrs, const std::string& cls, const std::vector<VMVal>& args) {
+        int kind=vm_exc_kinds().count(cls)?vm_exc_kind_of(cls):nython::ny_exc_kind([&](const char* b){ return class_derives(cls,b); });
+        auto field=[&](const char* k, const VMVal& v, bool given){
+            if(given||!attrs.count(k)) attrs[k]=given?v:VMVal::make_none();
+        };
+        std::vector<VMVal> a=args;
+        if(kind==nython::NYX_OS){
+            bool p=args.size()>=2&&args.size()<=5;
+            VMVal none=VMVal::make_none();
+            field("errno", p?args[0]:none, p);
+            field("strerror", p?args[1]:none, p);
+            field("filename", p&&args.size()>=3?args[2]:none, p);
+            field("filename2", p&&args.size()==5?args[4]:none, p);
+            if(p&&args.size()>=3&&args[2].type!=VMType::NONE) a.resize(2);
+        } else if(nython::ny_exc_kind_unicode(kind)){
+            bool tr=kind==nython::NYX_UTRANSLATE;
+            bool p=args.size()==(tr?4u:5u);
+            size_t o=tr?0:1;
+            VMVal none=VMVal::make_none();
+            field("encoding", p&&!tr?args[0]:none, p);
+            field("object", p?args[o]:none, p);
+            field("start", p?args[o+1]:none, p);
+            field("end", p?args[o+2]:none, p);
+            field("reason", p?args[o+3]:none, p);
+        } else if(kind==nython::NYX_SYNTAX){
+            // SyntaxError(msg, (filename, lineno, offset, text[, end_lineno, end_offset]))
+            VMVal none=VMVal::make_none();
+            field("msg", args.empty()?none:args[0], !args.empty());
+            std::vector<VMVal> info;
+            if(args.size()==2&&args[1].type==VMType::LIST&&!args[1].is_set()&&args[1].list&&args[1].list->size()>=4&&args[1].list->size()<=6) info=*args[1].list;
+            for(int i=0;i<6;i++) field(nython::ny_syntax_fields()[i], i<(int)info.size()?info[(size_t)i]:none, !info.empty());
+        } else if(kind==nython::NYX_IMPORT){
+            field("msg", args.size()==1?args[0]:VMVal::make_none(), args.size()==1);
+        }
+        // StopIteration.value: a generator's return value (both engines).
+        if(class_derives(cls,"StopIteration")) attrs["value"]=args.empty()?VMVal::make_none():args[0];
+        if(class_derives(cls,"SystemExit")) attrs["code"]=args.empty()?VMVal::make_none():args.size()==1?args[0]:VMVal::make_tuple(args);
+        attrs["args"]=VMVal::make_tuple(std::move(a));
+    }
+    // The arguments of a builtin exception made from a runtime error's
+    // message (round 77, NythonExecutor::excArgsFromMessage): an OSError's
+    // errno and filenames, a codec error's fields, a KeyError's key.
+    std::vector<VMVal> exc_args_from_message(const std::string& type, const std::string& msg) {
+        int kind=nython::ny_exc_kind([&](const char* b){ return class_derives(type,b); });
+        if(kind==nython::NYX_OS){
+            nython::NyErrnoParts ep;
+            if(nython::ny_parse_errno_message(msg, ep)){
+                std::vector<VMVal> a{VMVal::make_int((int64_t)ep.err), VMVal::make_str(ep.strerror)};
+                if(ep.has_f1) a.push_back(VMVal::make_str(ep.f1));
+                if(ep.has_f2){ a.push_back(VMVal::make_none()); a.push_back(VMVal::make_str(ep.f2)); }
+                return a;
+            }
+        } else if(kind==nython::NYX_UDECODE||kind==nython::NYX_UENCODE){
+            const nypy::UnicodeErrInfo& ui=nypy::last_unicode_error();
+            if(ui.msg==msg&&ui.is_str==(kind==nython::NYX_UENCODE))
+                return {VMVal::make_str(ui.encoding), ui.is_str?VMVal::make_str(ui.object):VMVal::make_bytes(ui.object,false),
+                        VMVal::make_int(ui.start), VMVal::make_int(ui.end), VMVal::make_str(ui.reason)};
+        } else if(kind==nython::NYX_KEY){
+            std::string k; size_t i=0;
+            if(nython::ny_unquote_py(msg,i,k)&&i==msg.size()) return {VMVal::make_str(k)};
+            size_t d=msg.size()>1&&msg[0]=='-'?1:0;
+            if(msg.size()>d&&msg.size()<19&&msg.find_first_not_of("0123456789",d)==std::string::npos)
+                return {VMVal::make_int((int64_t)std::stoll(msg))};
+        }
+        return {VMVal::make_str(msg)};
+    }
     // A new instance of builtin exception class `type` with the given args.
     VMVal make_exception(const std::string& type, std::vector<VMVal> args) {
         if(!class_reg_.count(type)) vm_exc_classes().insert(type);
         auto attrs=std::make_shared<VMMap>(); vmgc::track_map(attrs);
-        std::string msg = args.size()==1 ? args[0].to_string() : std::string();
-        // StopIteration.value: a generator's return value (both engines).
-        if(class_derives(type,"StopIteration")) (*attrs)["value"]=args.empty()?VMVal::make_none():args[0];
-        if(class_derives(type,"SystemExit")) (*attrs)["code"]=args.empty()?VMVal::make_none():args.size()==1?args[0]:VMVal::make_tuple(args);
-        (*attrs)["args"]=VMVal::make_tuple(std::move(args));
-        (*attrs)["msg"]=VMVal::make_str(msg);
+        set_exc_args(*attrs, type, args);
         return VMVal::make_instance(type, attrs);
     }
     // The exception a native raised as last_exception_obj_ + a "Type: msg"
@@ -6471,8 +6760,7 @@ private:
     VMVal exception_from_message(const std::string& m) {
         std::string type, msg;
         if(!nython::ny_split_exc_message(m, type, msg)){ type="Exception"; msg=m; }
-        std::vector<VMVal> a; a.push_back(VMVal::make_str(msg));
-        return make_exception(type, std::move(a));
+        return make_exception(type, exc_args_from_message(type, msg));   // round 77
     }
     // `raise X`: a class is instantiated with no arguments; an instance is
     // raised as is; anything else (Nython lets a string be raised) as well.
@@ -6863,8 +7151,15 @@ private:
     }
     std::string format_value(const VMVal& v, const std::string& spec) {
         if(v.type==VMType::INSTANCE){
-            VMVal r=call_dunder(v,"__format__",{VMVal::make_str(spec)});
-            if(r.type==VMType::STRING) return r.s;
+            // its __format__, which must give a str; without one,
+            // object.__format__: str(v) for an empty spec, else TypeError
+            // (round 77, as the interpreter)
+            bool found=false;
+            VMVal r=call_dunder_f(v,"__format__",{VMVal::make_str(spec)},found);
+            if(found){
+                if(r.type==VMType::STRING) return r.s;
+                raise_native_exception("TypeError","__format__ must return a str, not "+vm_type_name(r));
+            }
             if(spec.empty()) return vm_str(v);
         }
         return nycall([&]{ return nypy::format_value(to_fmtval(v,0),spec); });
@@ -7158,7 +7453,7 @@ private:
         out=VMVal::make_none();
         if(m=="add"){ mutating(); need(1); set_add(obj,a[0]); return true; }
         if(m=="discard"){ mutating(); need(1); set_discard(obj,a[0]); return true; }
-        if(m=="remove"){ mutating(); need(1); if(!set_discard(obj,a[0])) raise_native_exception("KeyError",vm_repr(a[0])); return true; }
+        if(m=="remove"){ mutating(); need(1); if(!set_discard(obj,a[0])) throw_exception(make_exception("KeyError",{a[0]})); return true; }
         if(m=="pop"){
             mutating(); need(0);
             if(obj.list->empty()) raise_native_exception("KeyError","'pop from an empty set'");
@@ -7220,18 +7515,26 @@ private:
             while(vm_iter_step(it,v)) if(vm_eq(v,item)) return true;
             return false;
         }
-        if(cont.type==VMType::STRING&&item.type==VMType::STRING)
+        if(cont.type==VMType::STRING){
+            if(item.type!=VMType::STRING)   // round 77: it was false
+                raise_native_exception("TypeError","'in <string>' requires string as left operand, not "+vm_type_name(item));
             return cont.s.find(item.s)!=std::string::npos;
+        }
         if(cont.type==VMType::BYTES){
             nypy::BArg x=to_barg(item);
             return nycall([&]{ return nypy::bytes_contains(cont.bdata(),x); });
         }
         if(cont.is_set()) return set_has(cont,item);   // one lookup (round 77)
-        if(cont.type==VMType::LIST&&cont.list)
-            for(auto& v:*cont.list) if(vm_eq(v,item)) return true;
-        if(cont.type==VMType::MAP&&cont.map)
-            return cont.map->count(vkey(item))>0;
-        return false;
+        if(cont.type==VMType::LIST){
+            if(cont.list) for(auto& v:*cont.list) if(vm_eq(v,item)) return true;
+            return false;
+        }
+        if(cont.type==VMType::MAP){
+            if(cont.map) return cont.map->count(vkey(item))>0;
+            return false;
+        }
+        // `1 in 5`, `x in None`: TypeError, as in Python (round 77; it was false)
+        raise_native_exception("TypeError","argument of type '"+vm_type_name(cont)+"' is not iterable");
     }
     // Which except clause (if any) a raised exception should run: the first
     // whose declared type is empty (catch-all), one of the generic
@@ -7411,6 +7714,8 @@ private:
             VMVal t=type_object_of(obj);
             if(t.type!=VMType::NONE){ out=t; return true; }
         }
+        // a generator's __name__, gi_frame, gi_code, ... (round 77)
+        if(obj.type==VMType::GENERATOR&&gen_attr(obj,attr,out)) return true;
         switch(obj.type){
         case VMType::INSTANCE: {
             VMVal m;
@@ -7715,7 +8020,7 @@ private:
     }
     VMVal missing_key(const VMVal& key){
         if(nypy::lenient_reads_log()){ log_lenient_read("KeyError: "+key.repr()); return VMVal::make_none(); }
-        raise_native_exception("KeyError",key.repr());
+        throw_exception(make_exception("KeyError",{key}));   // the key itself (round 77)
         return VMVal::make_none();
     }
     // "file:line" of the running instruction.
@@ -8222,6 +8527,12 @@ private:
         }
         if(m=="class_name"||m=="type_name"){ out=VMVal::make_str(vm_type_name(obj)); return true; }
         if(m=="to_string"){ out=VMVal::make_str(vm_str(obj)); return true; }
+        // (255).__format__("x"), "ab".__format__(">4"): format(obj, spec) (round 77)
+        if(m=="__format__"){
+            if(args.size()!=1||args[0].type!=VMType::STRING)
+                raise_native_exception("TypeError",vm_type_name(obj)+".__format__() argument must be str");
+            out=VMVal::make_str(format_value(obj,args[0].s)); return true;
+        }
         return false;
     }
 
@@ -8310,10 +8621,7 @@ private:
                 // super().__init__(...) reaching a builtin exception class
                 // sets the exception's args; reaching object, nothing.
                 if(self_v.type==VMType::INSTANCE && self_v.map && is_exception_class(mro_of)){
-                    (*self_v.map)["args"]=VMVal::make_tuple(args);
-                    (*self_v.map)["msg"]=VMVal::make_str(args.size()==1?args[0].to_string():std::string());
-                    if(class_derives(self_v.class_name,"StopIteration")) (*self_v.map)["value"]=args.empty()?VMVal::make_none():args[0];
-                    if(class_derives(self_v.class_name,"SystemExit")) (*self_v.map)["code"]=args.empty()?VMVal::make_none():args.size()==1?args[0]:VMVal::make_tuple(args);
+                    set_exc_args(*self_v.map, self_v.class_name, args);   // and the fields (round 77)
                 }
                 return VMVal::make_none();
             }
@@ -8435,9 +8743,7 @@ private:
             if(is_ctor_name(method) && !args.empty() && args[0].type==VMType::INSTANCE && args[0].map
                && is_exception_class(obj.class_name)){
                 std::vector<VMVal> rest(args.begin()+1,args.end());
-                (*args[0].map)["args"]=VMVal::make_tuple(rest);
-                if(class_derives(args[0].class_name,"SystemExit")) (*args[0].map)["code"]=rest.empty()?VMVal::make_none():rest.size()==1?rest[0]:VMVal::make_tuple(rest);
-                (*args[0].map)["msg"]=VMVal::make_str(rest.size()==1?rest[0].to_string():std::string());
+                set_exc_args(*args[0].map, args[0].class_name, rest);   // and the fields (round 77)
                 return VMVal::make_none();
             }
             // a method of the class's metaclass, or anything else the
@@ -8714,7 +9020,7 @@ private:
             auto it=mp.find(key);
             if(it==mp.end()){
                 if(a.size()>=2) return a[1];
-                raise_native_exception("KeyError",a[0].repr());
+                throw_exception(make_exception("KeyError",{a[0]}));   // the key itself (round 77)
             }
             VMVal v=it->second; mp.erase(key); return v;
         }
@@ -9351,7 +9657,6 @@ private:
                     // A typed instance, so `except ValueError as e:` matches
                     // (a bare runtime_error only reaches untyped handlers).
                     auto attrs = std::make_shared<VMMap>(); vmgc::track_map(attrs);
-                    (*attrs)["msg"] = VMVal::make_str(e.msg);
                     (*attrs)["args"] = VMVal::make_tuple({VMVal::make_str(e.msg)});
                     last_exception_obj_ = VMVal::make_instance(e.type, attrs);
                     throw std::runtime_error(e.type + ": " + e.msg);
@@ -9638,7 +9943,7 @@ private:
             auto attrs=new_instance_fields(cls.class_name);
             VMVal inst=VMVal::make_instance(cls.class_name,attrs);
             if(!class_reg_.count(cls.class_name)&&cls.code) class_reg_[cls.class_name]=cls.code;
-            if(vm_exc_classes().count(cls.class_name)){ (*attrs)["args"]=VMVal::make_tuple({}); (*attrs)["msg"]=VMVal::make_str(""); }
+            if(vm_exc_classes().count(cls.class_name)) set_exc_args(*attrs, cls.class_name, {});   // round 77
             return inst;
         });
         // _ny_method_new(f, obj): f bound to obj (classmethod.__get__,
@@ -9728,6 +10033,21 @@ private:
         // so `def __iter__(self): return iter(self.items)` iterated nothing.
         globals_["iter"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.empty()) throw_exception(make_exception("TypeError",{VMVal::make_str("iter expected 1 argument, got 0")}));
+            if(a.size()>2) throw_exception(make_exception("TypeError",{VMVal::make_str("iter expected at most 2 arguments, got "+std::to_string(a.size()))}));
+            if(a.size()==2){
+                // iter(callable, sentinel): calls it until it returns the
+                // sentinel (round 77, a lazy callable_iterator)
+                std::vector<VMVal> ca{a[0]};
+                if(!load_var("callable").native(ca).is_truthy())
+                    throw_exception(make_exception("TypeError",{VMVal::make_str("iter(v, w): v must be callable")}));
+                VMVal fn=a[0], sentinel=a[1];
+                return gen_native("callable_iterator",[this,fn,sentinel](VMVal& out)->bool{
+                    std::vector<VMVal> none;
+                    VMVal v=vm_call(fn,none,std::nullopt);
+                    if(vm_eq(v,sentinel)) return false;
+                    out=v; return true;
+                });
+            }
             const VMVal& v=a[0];
             if(v.type==VMType::GENERATOR||v.type==VMType::ITERATOR) return v;
             if(v.type==VMType::INSTANCE){
@@ -9746,7 +10066,7 @@ private:
                 it.s=nyrt::iterator_type_for(vm_type_name(v), ascii);
                 return it;
             }
-            throw_exception(make_exception("TypeError",{VMVal::make_str("'"+std::string(v.type==VMType::INT?"int":v.type==VMType::FLOAT?"float":v.type==VMType::BOOL?"bool":v.type==VMType::NONE?"NoneType":"object")+"' object is not iterable")}));
+            throw_exception(make_exception("TypeError",{VMVal::make_str("'"+vm_type_name(v)+"' object is not iterable")}));
         });
         // callable(x): functions, builtins, classes, and objects with __call__.
         globals_["callable"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
@@ -9774,10 +10094,16 @@ private:
                 gen_raise_stop(*gsp);   // StopIteration(return value)
             }
             if(a[0].type==VMType::INSTANCE){
+                VMVal nx;
+                if(!class_lookup(a[0].class_name,"__next__",nx))
+                    throw_exception(make_exception("TypeError",{VMVal::make_str("'"+vm_type_name(a[0])+"' object is not an iterator")}));
                 try { return call_dunder(a[0],"__next__",{}); }
                 catch(VMException& e){ if(is_stop_iteration(e.value)) return exhausted(); throw; }
             }
-            if(a[0].type!=VMType::ITERATOR||!a[0].iter) return VMVal::make_none();
+            // a list, str, int...: not an iterator (round 77; it returned none)
+            if(a[0].type!=VMType::ITERATOR)
+                throw_exception(make_exception("TypeError",{VMVal::make_str("'"+vm_type_name(a[0])+"' object is not an iterator")}));
+            if(!a[0].iter) return exhausted();
             auto&[cur,items]=*a[0].iter;
             if(cur>=(int)items.size()) return exhausted();
             return items[cur++];});
@@ -10442,7 +10768,8 @@ private:
             if(a.size()<3) return VMVal::make_str(a.empty()?std::string():vm->vm_str(a[0]));
             const std::string& spec=a[1].s; const std::string& conv=a[2].s;
             if(conv.empty()){
-                if(spec.empty()) return VMVal::make_str(a[0].type==VMType::STRING?a[0].s:vm->vm_str(a[0]));
+                // f"{obj}" is format(obj, ""): an object's __format__ runs (round 77)
+                if(spec.empty()&&a[0].type!=VMType::INSTANCE) return VMVal::make_str(a[0].type==VMType::STRING?a[0].s:vm->vm_str(a[0]));
                 return VMVal::make_str(vm->format_value(a[0],spec));
             }
             nypy::FmtVal fv=vm->to_fmtval(a[0],conv[0]);
@@ -11252,7 +11579,7 @@ private:
             class_reg_[en]=code;
             builtin_exc_codes_.insert(code.get());
             globals_[en]=VMVal::make_class(code,en);
-            vm_exc_classes().insert(en);
+            note_exc_class(en);   // with its kind (round 77)
         }
         globals_["false"]=VMVal::make_bool(false);
         globals_["null"]=VMVal::make_none();
