@@ -336,16 +336,49 @@ struct NyErrnoParts {
     long err = 0;
     std::string strerror{}, f1{}, f2{};
     bool has_f1 = false, has_f2 = false;
+    long winerror = 0;       // "[WinError N] ...": a Windows error (round 77)
+    bool has_win = false;
 };
+// The errno a Windows error stands for: CPython's winerror_to_errno
+// (PC/errmap.h), with the platform's own errno constants; Winsock's codes
+// (10000-11999) are errno values themselves there (round 77).
+inline long ny_winerror_to_errno(long w) {
+    if (w >= 10000 && w < 12000) return w;
+    switch (w) {
+    case 2: case 3: case 15: case 18: case 53: case 67: case 161: case 206: return ENOENT;
+    case 10: return E2BIG;
+    case 11: case 193: return ENOEXEC;
+    case 6: case 114: case 130: return EBADF;
+    case 128: case 129: return ECHILD;
+    case 89: case 164: case 215: return EAGAIN;
+    case 7: case 8: case 9: case 1816: return ENOMEM;
+    case 5: case 16: case 19: case 20: case 21: case 22: case 23: case 24: case 25: case 26: case 27:
+    case 28: case 29: case 30: case 31: case 32: case 33: case 34: case 35: case 36: case 65: case 82:
+    case 83: case 108: case 132: case 158: case 167: return EACCES;
+    case 80: case 183: return EEXIST;
+    case 17: return EXDEV;
+    case 267: return ENOTDIR;
+    case 4: return EMFILE;
+    case 112: return ENOSPC;
+    case 109: case 232: return EPIPE;
+    case 145: return ENOTEMPTY;
+    default: return EINVAL;
+    }
+}
 inline bool ny_parse_errno_message(const std::string& m, NyErrnoParts& p) {
-    if (m.compare(0, 7, "[Errno ") != 0) return false;
-    size_t i = 7;
+    size_t i;
+    bool win = false;
+    if (m.compare(0, 7, "[Errno ") == 0) i = 7;
+    else if (m.compare(0, 10, "[WinError ") == 0) { i = 10; win = true; }
+    else return false;
     bool neg = i < m.size() && m[i] == '-';
     if (neg) i++;
     size_t d0 = i;
     while (i < m.size() && m[i] >= '0' && m[i] <= '9') i++;
     if (i == d0 || i - d0 > 9 || i + 1 >= m.size() || m[i] != ']' || m[i + 1] != ' ') return false;
-    p.err = std::stol(m.substr(d0, i - d0)) * (neg ? -1 : 1);
+    long n = std::stol(m.substr(d0, i - d0)) * (neg ? -1 : 1);
+    if (win) { p.has_win = true; p.winerror = n; p.err = ny_winerror_to_errno(n); }
+    else p.err = n;
     size_t rest = i + 2;
     for (size_t c = m.find(": ", rest); c != std::string::npos; c = m.find(": ", c + 1)) {
         size_t j = c + 2;

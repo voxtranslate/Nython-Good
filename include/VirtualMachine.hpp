@@ -574,6 +574,14 @@ inline std::string vm_exc_message(const VMVal& e) {
     auto field=[&](const char* k)->VMVal{ auto f=e.map->find(k); return f==e.map->end()?VMVal::make_none():f->second; };
     if(kind==nython::NYX_OS){
         VMVal en=field("errno"), se=field("strerror"), f1=field("filename"), f2=field("filename2");
+#ifdef _WIN32
+        // a Windows error is shown by its own number (CPython's OSError_str)
+        VMVal we=field("winerror");
+        if(we.type!=VMType::NONE&&se.type!=VMType::NONE){
+            if(f1.type!=VMType::NONE) return "[WinError "+we.to_string()+"] "+se.to_string()+": "+f1.repr()+(f2.type==VMType::NONE?std::string():" -> "+f2.repr());
+            return "[WinError "+we.to_string()+"] "+se.to_string();
+        }
+#endif
         if(f1.type!=VMType::NONE)
             return "[Errno "+en.to_string()+"] "+se.to_string()+": "+f1.repr()+(f2.type==VMType::NONE?std::string():" -> "+f2.repr());
         if(en.type!=VMType::NONE&&se.type!=VMType::NONE) return "[Errno "+en.to_string()+"] "+se.to_string();
@@ -7074,6 +7082,15 @@ private:
             field("strerror", p?args[1]:none, p);
             field("filename", p&&args.size()>=3?args[2]:none, p);
             field("filename2", p&&args.size()==5?args[4]:none, p);
+#ifdef _WIN32
+            // winerror, on Windows as in CPython: the errno is the one the
+            // Windows error maps to (round 77)
+            {
+                bool w=p&&args.size()>=4&&args[3].type!=VMType::NONE;
+                field("winerror", w?args[3]:none, p);
+                if(w&&args[3].type==VMType::INT&&args[3].s.empty()) field("errno", VMVal::make_int((int64_t)nython::ny_winerror_to_errno((long)args[3].i)), true);
+            }
+#endif
             if(p&&args.size()>=3&&args[2].type!=VMType::NONE) a.resize(2);
         } else if(nython::ny_exc_kind_unicode(kind)){
             bool tr=kind==nython::NYX_UTRANSLATE;
@@ -7109,6 +7126,13 @@ private:
             nython::NyErrnoParts ep;
             if(nython::ny_parse_errno_message(msg, ep)){
                 std::vector<VMVal> a{VMVal::make_int((int64_t)ep.err), VMVal::make_str(ep.strerror)};
+                if(ep.has_win){
+                    // (errno, strerror, filename, winerror[, filename2])
+                    a.push_back(ep.has_f1?VMVal::make_str(ep.f1):VMVal::make_none());
+                    a.push_back(VMVal::make_int((int64_t)ep.winerror));
+                    if(ep.has_f2) a.push_back(VMVal::make_str(ep.f2));
+                    return a;
+                }
                 if(ep.has_f1) a.push_back(VMVal::make_str(ep.f1));
                 if(ep.has_f2){ a.push_back(VMVal::make_none()); a.push_back(VMVal::make_str(ep.f2)); }
                 return a;

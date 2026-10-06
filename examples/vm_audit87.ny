@@ -280,6 +280,10 @@ def term():
         t = os.get_terminal_size()
         return [type(t).__name__, isinstance(t.columns, int), isinstance(t.lines, int)]
     except OSError as e:
+        # off a console: on Windows a Windows error (winerror 6, errno EBADF
+        # mapped from it, "[WinError 6] ..."), as CPython gives
+        if os.name == "nt":
+            return ["terminal_size", e.errno is not None, e.winerror == 6 and str(e).startswith("[WinError 6] ")]
         return ["terminal_size", e.errno is not None, True]
 check("os.get_terminal_size()", term(), ["terminal_size", True, True])
 tm = os.times()

@@ -853,6 +853,15 @@ Nython over the class machinery above; each header says what is not there.
   written with `\n` is 14 bytes (`\r\n`), `which` finds commands by PATHEXT,
   and `Path("~/x").expanduser()` is compared as a path - CPython's results there.
   Under Wine it runs 243 checks (the POSIX-only ones skipped), on Linux 280.
+- **Windows errors carry `winerror`** (after vm_audit87's OSError fields):
+  a runtime error reported as `[WinError N] text` (`os.get_terminal_size()`
+  off a console, symlinks, sockets in `net.cpp`) becomes `OSError(errno,
+  strerror, filename, N)`: `winerror` is N, `errno` the one CPython maps it to
+  (`ny_winerror_to_errno`, PC/errmap.h's table with the platform's errno
+  constants; Winsock codes are their own errno) and `str(e)` keeps the
+  `[WinError N]` form - on Windows only, as in CPython; elsewhere nothing
+  changes. vm_audit46 compares the file name in a message with its repr (the
+  OS layer quotes names as CPython does, doubling Windows' backslashes).
 
 ### A running program's input (vm_audit71, tools/ide_e2e.py `run`/`terminal`)
 - The IDE closed a program's stdin (`os_spawn(..., input="")`), so its first

@@ -206,7 +206,8 @@ try:
     os_stat(S + "/nope")
 except FileNotFoundError as e:
     got = "FileNotFoundError"
-    check("error message names the path", string_contains(str(e), "No such file or directory: '" + S + "/nope'"), true)
+    # the name is quoted with repr, as CPython does (Windows' backslashes doubled)
+    check("error message names the path", string_contains(str(e), "No such file or directory: " + repr(S + "/nope")), true)
 check("os_stat missing", got, "FileNotFoundError")
 got = "none"
 try:

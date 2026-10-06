@@ -8896,6 +8896,16 @@ public:
             field("strerror", p ? args[1] : NONE_VALUE, p);
             field("filename", p && args.size() >= 3 ? args[2] : NONE_VALUE, p);
             field("filename2", p && args.size() == 5 ? args[4] : NONE_VALUE, p);
+#ifdef _WIN32
+            // winerror, on Windows as in CPython: the errno is the one the
+            // Windows error maps to (round 77)
+            {
+                bool w = p && args.size() >= 4 && args[3].type != ValueType::NONE;
+                field("winerror", w ? args[3] : NONE_VALUE, p);
+                Num wn;
+                if (w && asNum(args[3], wn) && wn.k == 1) field("errno", intValue((int64_t)nython::ny_winerror_to_errno((long)wn.i)), true);
+            }
+#endif
             if (p && args.size() >= 3 && args[2].type != ValueType::NONE) a.resize(2);
         } else if (kind == nython::NYX_UDECODE || kind == nython::NYX_UENCODE || kind == nython::NYX_UTRANSLATE) {
             bool tr = kind == nython::NYX_UTRANSLATE;
@@ -8935,6 +8945,13 @@ public:
             nython::NyErrnoParts ep;
             if (nython::ny_parse_errno_message(msg, ep)) {
                 std::vector<Value> a{intValue((int64_t)ep.err), makeStringValue(ep.strerror)};
+                if (ep.has_win) {
+                    // (errno, strerror, filename, winerror[, filename2])
+                    a.push_back(ep.has_f1 ? makeStringValue(ep.f1) : NONE_VALUE);
+                    a.push_back(intValue((int64_t)ep.winerror));
+                    if (ep.has_f2) a.push_back(makeStringValue(ep.f2));
+                    return a;
+                }
                 if (ep.has_f1) a.push_back(makeStringValue(ep.f1));
                 if (ep.has_f2) { a.push_back(NONE_VALUE); a.push_back(makeStringValue(ep.f2)); }
                 return a;
@@ -8991,6 +9008,14 @@ public:
         int kind = excKindOf(instanceClassName(inst));
         if (kind == nython::NYX_OS) {
             Value en = field("errno"), se = field("strerror"), f1 = field("filename"), f2 = field("filename2");
+#ifdef _WIN32
+            // a Windows error is shown by its own number (CPython's OSError_str)
+            Value we = field("winerror");
+            if (!absent(we) && !absent(se)) {
+                if (!absent(f1)) return "[WinError " + strOf(we) + "] " + strOf(se) + ": " + reprOf(f1) + (absent(f2) ? std::string() : " -> " + reprOf(f2));
+                return "[WinError " + strOf(we) + "] " + strOf(se);
+            }
+#endif
             if (!absent(f1))
                 return "[Errno " + strOf(en) + "] " + strOf(se) + ": " + reprOf(f1) + (absent(f2) ? std::string() : " -> " + reprOf(f2));
             if (!absent(en) && !absent(se)) return "[Errno " + strOf(en) + "] " + strOf(se);
