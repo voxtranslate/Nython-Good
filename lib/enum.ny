@@ -733,6 +733,20 @@ class _EnumDict(dict):
         super().__setitem__(key, value)
 
 
+# Whether `name` reaches enum_class from its data type (or object) before any
+# class written in Nython defines it: CPython's `found_method in
+# (data_type_method, object_method)`, decided by where the method comes from.
+# A builtin type's dunder is its mirror class's function when found through
+# the MRO but a native when read off the type (str.__format__), so the two
+# are not equal objects here (round 77).
+def _ny_found_on_data_type(enum_class, name, member_type):
+    for k in enum_class.__mro__:
+        if k is member_type or k is object:
+            return true
+        if name in k.__dict__:
+            return false
+    return false
+
 class EnumType(type):
     # Metaclass for Enum
 
@@ -931,7 +945,7 @@ class EnumType(type):
                 if name not in classdict:
                     data_type_method = getattr(member_type, name, none)
                     found_method = getattr(enum_class, name, none)
-                    if data_type_method is not none and found_method == data_type_method:
+                    if data_type_method is not none and (found_method == data_type_method or _ny_found_on_data_type(enum_class, name, member_type)):
                         _ny_setattr_raw(enum_class, name, getattr(first_enum, name))
         #
         # for Flag, add __or__, __and__, __xor__, and __invert__
