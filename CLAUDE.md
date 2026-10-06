@@ -365,6 +365,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit81 | 116 | round 77: enum (EnumType metaclass, auto, Flag boundaries, functional API) and dataclasses (every parameter, field, KW_ONLY, InitVar, frozen) |
 | vm_audit82 | 140 | round 77: typing (Union, generics, TypeVar, Protocol, NamedTuple, TypedDict, get_type_hints, check_type), types, inspect (signature, bind, getsource), keyword |
 | vm_audit83 | 158 | round 77: weakref (callbacks, proxies, weak dicts, finalize), warnings (filters, catch_warnings, -W), traceback (real tracebacks, chains), linecache, atexit |
+| vm_audit86 | 65 | round 77: every class statement its own class, `isinstance(x, object)`, `__eq__` without `__hash__`, property/staticmethod/classmethod objects, dir/vars, two-argument super, bound/builtin method types and reprs, type objects for None/functions/builtins/generators/iterators, dict methods before keys (63 pass under python3) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -977,6 +978,12 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   Python's or the legacy one (`type(x) == "list"`, `"string"`, `"map"`), so
   old code keeps working - but `str(type(x))` is `"<class 'int'>"`. Use
   `typeof(x)` for Nython's name as a string. `int is int` is identity.
+- **Classes and objects** (vm_audit86): each class statement its own class
+  (`Name#n` for a second one); property/staticmethod/classmethod are objects
+  (`C.__dict__["p"].fget`); type objects for None, functions, methods,
+  builtins, generators and iterators (`type(f) is types.FunctionType`, still
+  `== "function"`); a plain dict's methods (`get`, `keys`, `pop`...) win over
+  its keys, other names still read keys.
 - **Class-machinery modules** (vm_audit74, 81-83): abc, numbers,
   collections.abc (collections is a package now), enum, dataclasses,
   typing (+ `check_type`), types, inspect (+ `signature_diff`), keyword,

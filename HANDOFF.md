@@ -292,10 +292,9 @@ membership), `frozenset`, the full API and operators; `dict | dict`.
   (`legacyTypeName`).
 - `is` between types is identity: `int is int`, `C is C` were false (a
   type on the left was asked whether it is an instance of the right).
-- The kinds without a type object here keep their legacy name strings:
-  `type(None)` is `"none"`, functions `"function"`, builtins `"builtin"`,
-  generators `"generator"`, typed maps (a `__type__` key) their tag;
-  `isinstance(f, "function")` accepts such a name.
+- The other kinds got type objects in vm_audit86 (below); typed maps (a
+  `__type__` key) still give their tag, and `isinstance(f, "function")`
+  still accepts a legacy name.
 - VM: builtin natives were all one dict key (`vkey` had no pointer for
   them: `{int: 1, str: 2}` had one entry) - keyed by what they are now;
   `isinstance(x, T)` compares the native's name (`native_name`), not its
@@ -305,6 +304,57 @@ membership), `frozenset`, the full API and operators; `dict | dict`.
   abstract getter's `__isabstractmethod__` (abc reads it); the
   interpreter's property (its tagged getter) answers `fget`/`fset`, and
   `obj.m(...)` on a function value is `getattr(obj, "m")(...)`.
+
+### Classes and objects, the smaller gaps (vm_audit86, 65 checks; 63 pass under python3)
+- **Every class statement makes its own class**: a second statement with a
+  name already registered (another function's `class P`, a redefinition) is
+  registered as `Name#n`, as a re-run was. The VM gave both functions one
+  class (`f1()().m()` ran f2's method); the interpreter resolved a base named
+  that way to the newest. A program's own class named like a builtin
+  exception still replaces the builtin on the VM.
+- **`object`**: `isinstance(x, object)` for every value, `issubclass(T,
+  object)` for every type object.
+- **`__eq__` without `__hash__`** puts `__hash__ = None` in the namespace
+  (unhashable instances); a subclass defining only `__eq__` loses the
+  inherited hash, as CPython.
+- **property, staticmethod and classmethod are objects** (prelude classes):
+  `C.__dict__["p"]` and `C.p` are the property (`fget`/`fset`/`fdel`/
+  `__doc__`, `getter`/`setter`/`deleter` copying as CPython,
+  `property(fget, fset, fdel, doc)`, 3.11's messages such as "property 'x' of
+  'C' object has no setter"); staticmethod/classmethod objects have
+  `__func__`/`__wrapped__`, a staticmethod is callable (3.10+). The engines
+  unwrap them when a class is made (`unwrapMethodObject` /
+  `unwrap_method_object`) and call the prelude property's getter and setter
+  directly. Properties on metaclasses work; `super().p` and
+  `super(C, obj).attr` read attributes (the interpreter ran the parent
+  constructor). The data-descriptor check on stores turns on when a class
+  *holds* a data descriptor (the prelude property defines `__set__`, so "a
+  class defines `__set__`" would be every program).
+- **`dir()`/`vars()`**: `dir(obj)`/`dir(C)` list what CPython 3.11 lists
+  (identical for a plain class); `vars(obj)` includes dunder attributes,
+  `vars(C)` is `C.__dict__`.
+- **Two-argument `super`** outside a method: `super(C, obj).m()`,
+  `super(C, C2).m()`, checked as Python (TypeError).
+- **Bound and builtin methods**: `type()` is `method` /
+  `builtin_function_or_method`, reprs are Python's (`<bound method C.m of
+  ...>`, `<built-in method append of list object at 0x...>`), with
+  `__name__`, `__qualname__`, `__self__`, `__func__`.
+- **Type objects for the remaining kinds**: `NoneType`, `function`,
+  `method`, `builtin_function_or_method`, `generator`, and the lazy
+  iterators (`zip`, `map`, `filter`, `enumerate`, `islice`, `list_iterator`,
+  `str_ascii_iterator`, `dict_keyiterator`, `set_iterator`, ...). Tagged
+  `__rtype__:<name>` (`nyrt::RuntimeType`), never global names, each `==` its
+  legacy name (`type(f) == "function"`); `type(None)()` is None;
+  `types.MethodType(f, obj)` binds; `lib/types.ny` uses them, so `type(f) is
+  types.FunctionType`.
+- **A dict's methods win over its keys** for `keys values items get pop
+  popitem setdefault update clear copy fromkeys` on a plain dict (`d =
+  {"get": 1}; d.get("x")` is the method); any other name still reads the key
+  (`d.name`, Nython's feature). With `NY_LENIENT_READS=log` a method hiding a
+  key is reported once per line - a porting aid for code that relied on the
+  old key-first rule.
+- `getattr(o, n)` without a default re-raises the AttributeError a getter
+  raised; messages show a re-run class's name without `#n`.
 
 ### The Python standard library (vm_audit73, 75-78)
 Each module is CPython 3.12's API and algorithm, written in Nython, with a
@@ -568,9 +618,18 @@ Nython over the class machinery above; each header says what is not there.
 - Coroutine objects are task handles (ints): `type(co())` is int, not
   coroutine; awaiting and asyncio work.
 - `__getattribute__` is not dispatched.
-- `type(None)`, functions, builtins and generators have no type object yet
-  (their legacy name strings stand in); `types.FunctionType` and friends are
-  those names.
+- Found with vm_audit86, not fixed: no name mangling (`self.__y` is not
+  `_C__y`); on the VM a method whose first parameter is not named `self` is
+  not bound (the interpreter binds `self`/`this`); on the interpreter,
+  calling a non-callable (`1("x")`) gives none or "NameError: 'End'" instead
+  of TypeError; functions have no `__call__`; `type(module)` is `dict`;
+  `super(C, obj)` used as a value is still the interpreter's
+  parent-constructor shorthand (only `.x`/`.m()` follow Python); an instance
+  field is read before a class data descriptor of the same name;
+  `C.__dict__["__new__"]` is not a staticmethod; `iter(range(n))` is a
+  `list_iterator` (range is a list); on the interpreter, set/dict keys of
+  objects with `__hash__` are keyed by class name plus hash, so equal objects
+  of two classes stay distinct.
 - Frames have no locals (`inspect.currentframe()` is None); weak references
   are to instances only; classes deriving from int/str hold no value.
 - A metaclass's `__prepare__` is not called (the class body runs in the

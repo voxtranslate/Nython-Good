@@ -5562,6 +5562,14 @@ Full detail in `HANDOFF.md` §0p. New tests: `vm_audit65` (bytes, 149 checks), `
 | Windows: a WebSocket client never saw the server's Close frame after a protocol error (ConnectionResetError) | the server closed the socket with the bad frame's bytes unread, so TCP sent a reset, which discards the peer's unread data | a lingering close: half-close, drain the peer's input briefly, then close |
 | Windows: "Exception in thread: AttributeError: 'NoneType' object has no attribute 'accept'" when a server stopped | accept loops re-read the socket attribute that `stop()` sets to none on another thread | each loop reads its socket once |
 | Windows: vm_audit76 failed 19 checks | the test expected `/` in paths, POSIX permission bits and LF-only file sizes | portable expectations (CPython's results on Windows) |
+| VM: two functions each defining `class P` shared one class (`f1()().m()` ran f2's method) | classes were keyed by name | a second class statement of a name is registered as `Name#n`, both engines |
+| `isinstance(5, object)` was false | `object` was not a base of builtin values | true for every value and type |
+| A class defining `__eq__` only stayed hashable | `__hash__` was inherited | `__hash__ = None` as CPython |
+| `C.__dict__["p"]` gave a function (interpreter) or a map (VM); `C.p` called the getter | properties were native tags | property/staticmethod/classmethod are prelude objects, unwrapped when the class is made |
+| `dir(obj)` lacked class attributes; `super(C, obj).m()` outside a method returned none | `dir` listed instance fields only; super needed a method frame | CPython 3.11's `dir`; two-argument super on both engines |
+| VM: `type(xs.append)` read `'map'`, `[].append.__name__` raised | builtin methods had no type | `builtin_function_or_method` / `method` with Python's reprs and attributes |
+| `type(None)`, functions, generators gave strings | no type objects for them | runtime type objects (`NoneType`, `function`, `generator`, `zip`, ...), still `==` the legacy names |
+| `d = {"get": 1}; d.get("x")` called the key | keys were read before a dict's methods | the methods win; other names still read keys |
 | No abc, enum, dataclasses, typing, types, inspect, keyword, weakref, warnings, traceback, numbers, collections.abc | — | written over the class machinery, CPython's algorithms and messages (vm_audit74, 81-83) |
 | `e.__traceback__`, `sys.exc_info()`, `raise X from Y`'s `__cause__` did not exist; an uncaught error showed one line | exceptions carried a location string only | real traceback objects on both engines; Python's traceback block before the `[Nython]`/`[VMError]` line |
 | `sys.exc_info()` could return another thread's (or a suspended generator's) exception | `handling_obj_` was not swapped with the rest of the per-thread state | saved and restored with it |
