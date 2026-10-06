@@ -9,8 +9,8 @@
 # Counter       counts: most_common, elements, update/subtract, total, + - & |
 # defaultdict   a dict whose missing keys are made by default_factory
 # OrderedDict   a dict with move_to_end and popitem(last=)
-# namedtuple    a tuple class with named fields (_make, _asdict, _replace,
-#               _fields, defaults=)
+# namedtuple    a tuple subclass with named fields (_make, _asdict,
+#               _replace, _fields, _field_defaults, __match_args__, defaults=)
 # ChainMap      several mappings searched in order; writes go to the first
 # UserDict / UserList   wrappers to subclass
 #
@@ -631,67 +631,41 @@ class UserList:
 
 
 # ── namedtuple ───────────────────────────────────────────────────────────────
-class _NamedTupleBase:
-    # An instance: the values in field order, readable by name and index.
-    def __init__(self, *args, **kw):
-        var fields = self._fields
+class _NamedTupleBase(tuple):
+    # An instance is a tuple of the values in field order (round 77: a real
+    # tuple subclass - isinstance(p, tuple), hashing, ordering, slicing,
+    # JSON as an array), its fields read by name through properties.
+    def __new__(cls, *args, **kw):
+        var fields = cls._fields
         if len(args) > len(fields):
-            raise TypeError(self._typename + "() takes " + str(len(fields)) + " positional arguments but " + str(len(args)) + " were given")
+            raise TypeError(cls._typename + "() takes " + str(len(fields)) + " positional arguments but " + str(len(args)) + " were given")
         var vals = list(args)
         for i in range(len(args), len(fields)):
             var f = fields[i]
             if f in kw:
                 vals.append(kw[f])
-            elif f in self._field_defaults:
-                vals.append(self._field_defaults[f])
+            elif f in cls._field_defaults:
+                vals.append(cls._field_defaults[f])
             else:
-                raise TypeError(self._typename + "() missing required argument: '" + f + "'")
+                raise TypeError(cls._typename + "() missing required argument: '" + f + "'")
         for k in kw:
             if not (k in fields):
-                raise TypeError(self._typename + "() got an unexpected keyword argument '" + k + "'")
+                raise TypeError(cls._typename + "() got an unexpected keyword argument '" + k + "'")
             var at = fields.index(k)
             if at < len(args):
-                raise TypeError(self._typename + "() got multiple values for argument '" + k + "'")
-        self._values = tuple(vals)
-        for i in range(len(fields)):
-            setattr(self, fields[i], vals[i])
-
-    def __getitem__(self, i):
-        return self._values[i]
-
-    def __len__(self):
-        return len(self._values)
-
-    def __iter__(self):
-        return iter(list(self._values))
-
-    def __contains__(self, x):
-        return x in self._values
-
-    def __eq__(self, other):
-        if isinstance(other, _NamedTupleBase):
-            return self._values == other._values
-        return self._values == other
-
-    def __ne__(self, other):
-        return not self.__eq__(other)
-
-    def __lt__(self, other):
-        return self._values < (other._values if isinstance(other, _NamedTupleBase) else other)
-
-    def __hash__(self):
-        return hash(repr(self._values))
+                raise TypeError(cls._typename + "() got multiple values for argument '" + k + "'")
+        return tuple.__new__(cls, vals)
 
     def __repr__(self):
         var parts = []
         for i in range(len(self._fields)):
-            parts.append(self._fields[i] + "=" + repr(self._values[i]))
+            parts.append(self._fields[i] + "=" + repr(self[i]))
         return self._typename + "(" + ", ".join(parts) + ")"
 
     def _asdict(self):
         var d = {}
         for i in range(len(self._fields)):
-            d[self._fields[i]] = self._values[i]
+            d[self._fields[i]] = self[i]
         return d
 
     def _replace(self, **kw):
@@ -700,13 +674,17 @@ class _NamedTupleBase:
             if not (k in d):
                 raise ValueError("Got unexpected field names: " + repr([k]))
             d[k] = kw[k]
-        return self.__class__(*[d[f] for f in self._fields])
+        return self._make([d[f] for f in self._fields])
 
-    def count(self, x):
-        return list(self._values).count(x)
+    def __getnewargs__(self):
+        return tuple(self)
 
-    def index(self, x):
-        return list(self._values).index(x)
+
+def _nt_field(i):
+    # the property reading field i
+    def get(self):
+        return self[i]
+    return property(get)
 
 
 def namedtuple(typename, field_names, defaults=none, rename=false, module=none):
@@ -737,9 +715,12 @@ def namedtuple(typename, field_names, defaults=none, rename=false, module=none):
     _NT._typename = typename
     _NT._fields = tuple(names)
     _NT._field_defaults = field_defaults
+    _NT.__match_args__ = tuple(names)
+    for i in range(len(names)):
+        setattr(_NT, names[i], _nt_field(i))
 
     def _make(iterable):
-        return _NT(*list(iterable))
+        return tuple.__new__(_NT, iterable)
     _NT._make = staticmethod(_make)
     return _NT
 

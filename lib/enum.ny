@@ -40,33 +40,27 @@
 # NAMED_FLAGS), FlagBoundary, property (enum.property), global_enum_repr,
 # global_flag_repr, global_str, global_enum, show_flag_values, bin
 #
-# How it is built: Nython has no __prepare__ (the class body runs in the
-# engine's own namespace), so what CPython's _EnumDict checks while the body
-# runs is checked by EnumType.__new__ over the namespace it receives, which
-# keeps definition order. Members are made by _proto_member.__set_name__,
-# which type.__new__ runs in definition order before __init_subclass__, as in
-# CPython. Inside the body an auto() is still an auto object, so arithmetic
-# on it (RW = R | W) is kept as an expression and computed when the member is
-# made - in CPython R and W are already ints on that line.
+# How it is built: as CPython's. EnumType.__prepare__ gives the class body
+# an _EnumDict, which sees each binding as the body makes it (round 77): a
+# member name bound twice is "'A' already defined as 1", auto() gets its
+# value on its own line (RW = R | W sees R and W as ints), and
+# _generate_next_value_ must come before the members. Members are made by
+# _proto_member.__set_name__, which type.__new__ runs in definition order
+# before __init_subclass__, as in CPython.
 #
-# A member whose enum mixes in a builtin type (int, str, float, ...) is not a
-# value of that type (a builtin type cannot be subclassed by value here): the
-# enum class gets the type's operators, comparisons, hash and methods,
-# delegated to the member's _value_ - so IntEnum.A + 1, IntEnum.A == 1,
-# lst[IntEnum.A], range(IntEnum.A), "%d" % IntEnum.A (the engines honour
-# __index__), "s" + StrEnum.B, StrEnum.B.upper() work, and
-# isinstance(IntEnum.A, int) is true.
+# A member whose enum mixes in int, str, float or bytes is a value of that
+# type, made by int.__new__(enum_class, value) (str.__new__ for StrEnum ...;
+# the engines' classes deriving from builtin types, round 77): it does
+# arithmetic, compares, hashes and is the same dict key as its value
+# ({1: x}[IntEnum.A]), and isinstance(IntEnum.A, int) holds; a user __new__
+# can call int.__new__(cls, value). A complex enum's members hold their
+# value, with complex's operators delegated to it.
 #
-# Not here: an IntEnum member and the equal int are different dict keys and
-# set elements ({1: x}[IntEnum.A] is a KeyError: the engines key objects by
-# class and __hash__); pickling (__reduce_ex__ is kept, no pickle module); a
-# name assigned twice in a body (CPython's "Attempted to reuse key") cannot
-# be seen without __prepare__, the second value wins; global_enum cannot
-# export the members into the module's namespace (no sys.modules);
-# _simple_enum / _convert_; a user __new__ calling int.__new__ / str.__new__
-# (use object.__new__ and set _value_); 3.11's DeprecationWarnings are not
-# issued; where 3.12 differs (`1 in Color` is True there, a TypeError in
-# 3.11), 3.11 is followed.
+# Not here: pickling (__reduce_ex__ is kept, no pickle module); global_enum
+# cannot export the members into the module's namespace (no sys.modules);
+# _simple_enum / _convert_; 3.11's DeprecationWarnings are not issued; where
+# 3.12 differs (`1 in Color` is True there, a TypeError in 3.11), 3.11 is
+# followed.
 
 __all__ = ["EnumType", "EnumMeta", "Enum", "IntEnum", "StrEnum", "Flag", "IntFlag", "ReprEnum",
            "auto", "unique", "property", "verify", "member", "nonmember",
@@ -178,64 +172,10 @@ class _auto_null_type:
         return "_auto_null"
 _auto_null = _auto_null_type()
 
-# Operators on auto() values inside a class body (RW = R | W). CPython's
-# _EnumDict has replaced R and W by their values when that line runs; without
-# __prepare__ they are still auto objects here, so the expression is kept and
-# computed when the member is made (its operands, defined earlier, have their
-# values by then).
-class _AutoOps:
-    def __or__(self, o):
-        return _AutoExpr(lambda a, b: a | b, self, o)
-    def __ror__(self, o):
-        return _AutoExpr(lambda a, b: a | b, o, self)
-    def __and__(self, o):
-        return _AutoExpr(lambda a, b: a & b, self, o)
-    def __rand__(self, o):
-        return _AutoExpr(lambda a, b: a & b, o, self)
-    def __xor__(self, o):
-        return _AutoExpr(lambda a, b: a ^ b, self, o)
-    def __rxor__(self, o):
-        return _AutoExpr(lambda a, b: a ^ b, o, self)
-    def __add__(self, o):
-        return _AutoExpr(lambda a, b: a + b, self, o)
-    def __radd__(self, o):
-        return _AutoExpr(lambda a, b: a + b, o, self)
-    def __sub__(self, o):
-        return _AutoExpr(lambda a, b: a - b, self, o)
-    def __rsub__(self, o):
-        return _AutoExpr(lambda a, b: a - b, o, self)
-    def __mul__(self, o):
-        return _AutoExpr(lambda a, b: a * b, self, o)
-    def __rmul__(self, o):
-        return _AutoExpr(lambda a, b: a * b, o, self)
-    def __lshift__(self, o):
-        return _AutoExpr(lambda a, b: a << b, self, o)
-    def __rshift__(self, o):
-        return _AutoExpr(lambda a, b: a >> b, self, o)
-    def __invert__(self):
-        return _AutoExpr(lambda a, b: ~a, self, none)
-    def __neg__(self):
-        return _AutoExpr(lambda a, b: -a, self, none)
-
-def _auto_resolve(x):
-    if isinstance(x, _AutoExpr):
-        return x.fn(_auto_resolve(x.a), _auto_resolve(x.b))
-    if isinstance(x, auto):
-        if x.value is _auto_null:
-            raise TypeError("auto() value used before it was assigned")
-        return x.value
-    return x
-
-class _AutoExpr(_AutoOps):
-    def __init__(self, fn, a, b):
-        self.fn = fn
-        self.a = a
-        self.b = b
-    def __repr__(self):
-        return "<auto() expression>"
-
-class auto(_AutoOps):
-    # Instances are replaced with an appropriate value in Enum class suites.
+class auto:
+    # Instances are replaced with an appropriate value in Enum class suites
+    # (by _EnumDict, on the line that assigns them - so RW = R | W sees R and
+    # W as their values, as in CPython).
     def __init__(self, value=_auto_null):
         self.value = value
     def __repr__(self):
@@ -295,12 +235,23 @@ class property:
 
 
 # ── data types mixed into an enum (int, str, float, ...) ─────────────────────
-# A member of such an enum is an object holding its value; the enum class
-# gets the type's operators, delegated to the value (see the header).
+# A member of an enum mixing in int, str, float or bytes is a value of that
+# type (made by int.__new__(enum_class, v) ...: the engines' classes deriving
+# from builtin types, round 77). complex has no such class on the engines: a
+# member of a complex enum is an object holding its value, and the enum class
+# gets complex's operators, delegated to the value (_install_data_type).
 _DATA_TYPES = [int, str, float, bool, bytes, complex]
+_VALUE_TYPES = [int, str, float, bytes]
 
 def _is_data_type(t):
     for d in _DATA_TYPES:
+        if t is d:
+            return true
+    return false
+
+def _is_value_type(t):
+    # a data type whose members are values of it
+    for d in _VALUE_TYPES:
         if t is d:
             return true
     return false
@@ -664,7 +615,7 @@ def _find_new_(classdict, member_type, first_enum):
     if nw is none:
         for method in ["__new_member__", "__new__"]:
             for possible in [member_type, first_enum]:
-                if possible is none or possible is object or _is_data_type(possible):
+                if possible is none or possible is object or (_is_data_type(possible) and not _is_value_type(possible)):
                     continue
                 if possible is Enum or (Enum is not none and isinstance(possible, EnumType) and method == "__new__"):
                     # Enum.__new__ is the value lookup, never a member maker
@@ -703,10 +654,104 @@ def _collect_descriptors(bases):
     return found
 
 
+class _EnumDict(dict):
+    # The namespace an enum's class body runs in (EnumType.__prepare__ -
+    # round 77): as CPython's, it sees each binding as it is made, so a
+    # member name bound twice is refused, auto() gets its value on its own
+    # line (with _generate_next_value_, which must come before the members),
+    # and _ignore_ cannot name a member already set.
+    def __init__(self):
+        super().__init__()
+        self._member_names = {}
+        self._last_values = []
+        self._ignore = []
+        self._auto_called = false
+        self._cls_name = none
+        self._generate_next_value = none
+
+    def __setitem__(self, key, value):
+        if _is_private(self._cls_name, key):
+            pass
+        elif _is_sunder(key):
+            if key not in _SUNDER_ALLOWED:
+                raise ValueError("_sunder_ names, such as %r, are reserved for future Enum use" % (key,))
+            if key == "_generate_next_value_":
+                if self._auto_called:
+                    raise TypeError("_generate_next_value_ must be defined before members")
+                self._generate_next_value = value
+            elif key == "_ignore_":
+                if isinstance(value, str):
+                    value = value.replace(",", " ").split()
+                else:
+                    value = list(value)
+                self._ignore = value
+                already = [n for n in value if n in self._member_names]
+                if already:
+                    raise ValueError("_ignore_ cannot specify already set names: %r" % (set(already),))
+        elif _is_dunder(key):
+            if key == "__order__":
+                key = "_order_"
+        elif key in self._member_names:
+            # descriptor overwriting an enum?
+            raise TypeError("%r already defined as %r" % (key, self[key]))
+        elif key in self._ignore:
+            pass
+        elif isinstance(value, nonmember):
+            pass
+        elif _is_descriptor(value):
+            pass
+        else:
+            if key in self:
+                # enum overwriting a descriptor?
+                raise TypeError("%r already defined as %r" % (key, self[key]))
+            # (a member() / nonmember() wrapper stays for EnumType.__new__)
+            v = value.value if isinstance(value, member) else value
+            non_auto_store = true
+            single = false
+            if isinstance(v, auto):
+                single = true
+                v = (v,)
+            if type(v) is tuple and any([isinstance(a, auto) for a in v]):
+                # insist on an actual tuple, no subclasses, in keeping with only
+                # supporting top-level auto() usage
+                auto_valued = []
+                for a in v:
+                    if isinstance(a, auto):
+                        non_auto_store = false
+                        if a.value is _auto_null:
+                            if self._generate_next_value is none:
+                                raise TypeError("auto() used without a _generate_next_value_")
+                            a.value = self._generate_next_value(key, 1, len(self._member_names), self._last_values[:])
+                            self._auto_called = true
+                        a = a.value
+                        self._last_values.append(a)
+                    auto_valued.append(a)
+                value = auto_valued[0] if single else tuple(auto_valued)
+            self._member_names[key] = none
+            if non_auto_store:
+                self._last_values.append(v)
+        super().__setitem__(key, value)
+
+
 class EnumType(type):
     # Metaclass for Enum
 
+    @classmethod
+    def __prepare__(metacls, cls, bases, **kwds):
+        # the class body's namespace (round 77): an _EnumDict
+        _check_for_existing_members_(cls, bases)
+        enum_dict = _EnumDict()
+        enum_dict._cls_name = cls
+        if bases:
+            first_enum = _get_mixins_(cls, bases)[1]
+            if first_enum is not none:
+                enum_dict["_generate_next_value_"] = getattr(first_enum, "_generate_next_value_", none)
+        return enum_dict
+
     def __new__(metacls, cls, bases, classdict, boundary=none, _simple=false, **kwds):
+        if isinstance(classdict, _EnumDict):
+            # what the body bound, as a plain dict (CPython converts it too)
+            classdict = dict(classdict.items())
         if _simple:
             return super().__new__(metacls, cls, bases, classdict, **kwds)
         mixins = _get_mixins_(cls, bases)
@@ -761,8 +806,6 @@ class EnumType(type):
                 if isinstance(value, member):
                     # unwrap value here -- it will become a member
                     value = value.value
-                if isinstance(value, _AutoExpr):
-                    value = _auto_resolve(value)
                 non_auto_store = true
                 single = false
                 if isinstance(value, auto):
@@ -857,8 +900,8 @@ class EnumType(type):
         for k in own:
             classdict[k] = own[k]
         #
-        # a builtin data type mixed in: its operators, delegated to the value
-        if _is_data_type(member_type) and member_type in bases:
+        # complex mixed in: its operators, delegated to the value
+        if _is_data_type(member_type) and not _is_value_type(member_type) and member_type in bases:
             _install_data_type(enum_class, member_type, classdict)
         #
         # Also, special handling for ReprEnum
@@ -881,8 +924,9 @@ class EnumType(type):
                     if method is not none:
                         _ny_setattr_raw(enum_class, "__str__", method)
                 classdict["__str__"] = enum_class.__str__
-        # double check that repr and friends are not the (user) mixin's
-        if first_enum is not none and member_type is not object and not _is_data_type(member_type):
+        # double check that repr and friends are not the mixin's (a builtin
+        # type's too: its mirror class stands before Enum in the MRO - round 77)
+        if first_enum is not none and member_type is not object:
             for name in ["__repr__", "__str__", "__format__"]:
                 if name not in classdict:
                     data_type_method = getattr(member_type, name, none)
@@ -1197,7 +1241,7 @@ class StrEnum(str, ReprEnum):
             value = values[0]
         else:
             value = str(*values)
-        obj = object.__new__(cls)
+        obj = str.__new__(cls, value)
         obj._value_ = value
         return obj
 
@@ -1296,8 +1340,11 @@ class Flag(Enum, boundary=STRICT):
         member_value = value & singles_mask
         if unknown and cls._boundary_ is not KEEP:
             raise ValueError("%s(%r) -->  unknown values %r [%s]" % (cls.__name__, value, unknown, bin(unknown)))
-        # construct a singleton enum pseudo-member
-        pseudo_member = object.__new__(cls)
+        # construct a singleton enum pseudo-member (an int for IntFlag)
+        if cls._member_type_ is object:
+            pseudo_member = object.__new__(cls)
+        else:
+            pseudo_member = cls._member_type_.__new__(cls, value)
         pseudo_member._value_ = value
         if member_value or aliases:
             members = []

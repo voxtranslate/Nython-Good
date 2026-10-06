@@ -366,6 +366,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit82 | 140 | round 77: typing (Union, generics, TypeVar, Protocol, NamedTuple, TypedDict, get_type_hints, check_type), types, inspect (signature, bind, getsource), keyword |
 | vm_audit83 | 158 | round 77: weakref (callbacks, proxies, weak dicts, finalize), warnings (filters, catch_warnings, -W), traceback (real tracebacks, chains), linecache, atexit |
 | vm_audit84 | 212 | round 77: Python's syntax (passes under python3) - soft Nython keywords (`new = 1`, `def f(ref):`, `obj.self`), imports/del/class bases/lambda parameters in every form, expression statements evaluated (`{}["x"]`), assignment and for/with targets, unpack counts, augmented in-place dunders and `@=`, chained comparisons, literals (`\N{...}`), decorators (PEP 614), match, exception groups and `except*` (PEP 654) |
+| vm_audit85 | 73 | round 77: classes deriving from builtin types hold a value (int/float/str/bytes/bytearray/list/dict/set/frozenset/tuple, `int.__new__(cls, v)`), `__getattribute__`, a live `obj.__dict__`, a metaclass's `__prepare__` (passes under python3) |
 | vm_audit86 | 65 | round 77: every class statement its own class, `isinstance(x, object)`, `__eq__` without `__hash__`, property/staticmethod/classmethod objects, dir/vars, two-argument super, bound/builtin method types and reprs, type objects for None/functions/builtins/generators/iterators, dict methods before keys (63 pass under python3) |
 | vm_audit87 | 73 | round 77: `in`/ordering TypeErrors, exceptions' str/repr/args and fields (OSError errno/filename, Unicode errors, SyntaxError), runtime errors with their fields, `iter(f, sentinel)`, generator attributes, `__format__`, `os.stat_result`, live `exec` namespaces, recursive reprs (72 pass under python3) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
@@ -963,7 +964,8 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   stdout). Run shows the pending prompt with an input line in the Output
   panel (focus `"stdin"`), the Terminal forwards lines to a running
   command, Ctrl+D ends input.
-- **Gotchas**: `__dict__` is a copy (use `object.__setattr__`); coroutine
+- **Gotchas**: `C.__dict__` is a copy (an instance's is live since
+  vm_audit85); coroutine
   objects are task handles (ints); a prelude name (`slice`, `object`,
   `complex`, `help`) shadows the old placeholder builtin of that name.
 - **Classes** (vm_audit79): annotations are kept (`__annotations__`);
@@ -1001,6 +1003,16 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   line), weakref callbacks, data descriptors, `__index__`, `__hash__ =
   None`, metaclass `__setattr__`, dunder names in `__dict__`, module scopes
   from a builtins snapshot.
+- **Builtin subclasses, `__getattribute__`, `__dict__`, `__prepare__`**
+  (vm_audit85): `class MyInt(int)` ... instances hold their value in the
+  hidden field `__ny_payload__`; the prelude's mirror class of the type
+  (`_NyB_int` ..., loaded on first need, `nyrt::builtin_mirror`) stands where
+  the type is in the MRO; builtins are given the value except
+  `nyrt::payload_transparent`'s. `__getattribute__` is dispatched once a
+  class defines one; `obj.__dict__`/`vars(obj)` is a live
+  `_NyInstanceDict`; `__prepare__`'s mapping gets each binding of the body
+  through `__setitem__` (`Context::storeHook` / `CallFrame::prep_ns`).
+  enum's `_EnumDict`, NamedTuple and namedtuple as real tuples use them.
 - **Standard library** (vm_audit73, 75-78): json, random, datetime, time,
   io, string, textwrap, pprint, csv, statistics, fractions, struct,
   calendar, uuid, fnmatch, glob, shutil, tempfile, pathlib, subprocess,

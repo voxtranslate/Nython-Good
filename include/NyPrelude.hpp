@@ -14,6 +14,10 @@
 // Round 77: the asynchronous protocols the parser desugars to (Parser.cpp,
 // async_def_desugar / `async for` / `async with`): _ny_async_cm,
 // _ny_async_gen, _ny_aiter, and the aiter()/anext() builtins.
+//
+// Round 77 also: builtin_mirrors_source() at the end, run on demand.
+
+#include <string>
 
 namespace nyrt {
 
@@ -486,6 +490,8 @@ def _ny_dict_merge(*parts):
     # {**a, k: v, **b}
     var out = {}
     for p in parts:
+        if isinstance(p, dict):
+            p = _ny_payload(p)    # a dict subclass's own items (round 77)
         if not hasattr(p, "keys"):
             raise TypeError("'" + type(p) + "' object is not a mapping")
         for k in p.keys():
@@ -661,6 +667,12 @@ class object:
 
     def __delattr__(self, name):
         _ny_delattr_raw(self, name)
+
+    # the normal attribute lookup, which a class's own __getattribute__
+    # hands on to (round 77); it raises AttributeError, and __getattr__ is
+    # the engines' to call after it
+    def __getattribute__(self, name):
+        return _ny_getattr_raw(self, name)
 
 def _ny_complex_part(x):
     # a component as Python shows it: 2.0 -> 2, 1.5 -> 1.5
@@ -1599,6 +1611,780 @@ def _ny_star_finish(st):
         excs.append(kept)
     raise BaseExceptionGroup("", excs)
 )NYPRELUDE";
+}
+
+// The mirror classes of the builtin types (round 77): what a class deriving
+// from int, float, str, bytes, bytearray, list, dict, set, frozenset or tuple
+// finds where the type stands in its MRO (nyrt::builtin_mirror), and the
+// live view obj.__dict__ / vars(obj) gives. The text is in chunks ("#@ name"
+// lines): "base" (helpers), one per type, "dictview". Both engines run a
+// type's chunk (after "base") the first time a class derives from the type
+// or one of its dunders is read (int.__new__), and "dictview" (after "dict")
+// at the first instance __dict__ read - not at startup: a program that never
+// does pays nothing for them.
+inline const char* builtin_mirrors_source() {
+    return R"NYMIRRORS(
+# ── classes deriving from builtin types (round 77) ───────────────────────
+# `class MyInt(int)`, `class Stack(list)`, `class Config(dict)`... : an
+# instance holds a value of the type, its payload (the hidden field
+# __ny_payload__, which _ny_payload(x) reads - x itself for anything else).
+# Where the builtin type stands in such a class's MRO the engines put its
+# mirror class below (_NyB_int for int ...), so the type's operators,
+# protocol methods and methods answer for the instance through the payload,
+# a subclass's own definitions coming first, and int.__new__(cls, v),
+# list.__init__(self, it), dict.__setitem__(self, k, v), int.__repr__(x)
+# ... are the mirror's functions. Results are plain values of the type
+# (MyStr("a").upper() is a str), as in Python. The type's __new__ makes the
+# payload from the arguments (int, float, str, bytes, tuple, frozenset); a
+# mutable type's starts empty and __init__ fills it (list, dict, set,
+# bytearray). As in CPython, the payload's own methods (dict.update ...)
+# do not call a subclass's __setitem__.
+
+#@ base
+def _ny_bdelegate(name):
+    # a method of the type, called on the payload
+    def method(self, *args, **kw):
+        return getattr(_ny_payload(self), name)(*args, **kw)
+    method.__name__ = name
+    method.__qualname__ = name
+    return method
+
+def _ny_bmethods(cls, names):
+    for n in names.split():
+        setattr(cls, n, _ny_bdelegate(n))
+
+def _ny_bgeneric(cls, item):
+    return _NyGenericAlias(cls, item)
+
+def _ny_bformat(self, spec):
+    if spec == "":
+        return str(self)
+    return format(_ny_payload(self), spec)
+
+#@ int
+class _NyB_int:
+    def __new__(cls, *args, **kw):
+        return _ny_payload_new(cls, int, int(*args, **kw))
+    def __repr__(self):
+        return repr(_ny_payload(self))
+    def __format__(self, spec):
+        return _ny_bformat(self, spec)
+    def __hash__(self):
+        return hash(_ny_payload(self))
+    def __bool__(self):
+        return _ny_payload(self) != 0
+    def __index__(self):
+        return _ny_payload(self)
+    def __int__(self):
+        return _ny_payload(self)
+    def __float__(self):
+        return float(_ny_payload(self))
+    def __complex__(self):
+        return complex(_ny_payload(self))
+    def __getnewargs__(self):
+        return (_ny_payload(self),)
+    def __eq__(self, o):
+        return _ny_payload(self) == o
+    def __ne__(self, o):
+        return _ny_payload(self) != o
+    def __lt__(self, o):
+        return _ny_payload(self) < o
+    def __le__(self, o):
+        return _ny_payload(self) <= o
+    def __gt__(self, o):
+        return _ny_payload(self) > o
+    def __ge__(self, o):
+        return _ny_payload(self) >= o
+    def __add__(self, o):
+        return _ny_payload(self) + o
+    def __radd__(self, o):
+        return o + _ny_payload(self)
+    def __sub__(self, o):
+        return _ny_payload(self) - o
+    def __rsub__(self, o):
+        return o - _ny_payload(self)
+    def __mul__(self, o):
+        return _ny_payload(self) * o
+    def __rmul__(self, o):
+        return o * _ny_payload(self)
+    def __truediv__(self, o):
+        return _ny_payload(self) / o
+    def __rtruediv__(self, o):
+        return o / _ny_payload(self)
+    def __floordiv__(self, o):
+        return _ny_payload(self) // o
+    def __rfloordiv__(self, o):
+        return o // _ny_payload(self)
+    def __mod__(self, o):
+        return _ny_payload(self) % o
+    def __rmod__(self, o):
+        if isinstance(o, str) or isinstance(o, bytes) or isinstance(o, bytearray):
+            return o % (self,)      # "%s" % x: str.__mod__'s, x itself the argument
+        return o % _ny_payload(self)
+    def __divmod__(self, o):
+        return divmod(_ny_payload(self), o)
+    def __rdivmod__(self, o):
+        return divmod(o, _ny_payload(self))
+    def __pow__(self, o, m=None):
+        if m is None:
+            return _ny_payload(self) ** o
+        return pow(_ny_payload(self), o, m)
+    def __rpow__(self, o):
+        return o ** _ny_payload(self)
+    def __lshift__(self, o):
+        return _ny_payload(self) << o
+    def __rlshift__(self, o):
+        return o << _ny_payload(self)
+    def __rshift__(self, o):
+        return _ny_payload(self) >> o
+    def __rrshift__(self, o):
+        return o >> _ny_payload(self)
+    def __and__(self, o):
+        return _ny_payload(self) & o
+    def __rand__(self, o):
+        return o & _ny_payload(self)
+    def __or__(self, o):
+        return _ny_payload(self) | o
+    def __ror__(self, o):
+        return o | _ny_payload(self)
+    def __xor__(self, o):
+        return _ny_payload(self) ^ o
+    def __rxor__(self, o):
+        return o ^ _ny_payload(self)
+    def __neg__(self):
+        return -_ny_payload(self)
+    def __pos__(self):
+        return _ny_payload(self)
+    def __abs__(self):
+        return abs(_ny_payload(self))
+    def __invert__(self):
+        return ~_ny_payload(self)
+    def __round__(self, n=None):
+        if n is None:
+            return round(_ny_payload(self))
+        return round(_ny_payload(self), n)
+    def __trunc__(self):
+        return _ny_payload(self)
+    def __floor__(self):
+        return _ny_payload(self)
+    def __ceil__(self):
+        return _ny_payload(self)
+    @property
+    def real(self):
+        return _ny_payload(self)
+    @property
+    def imag(self):
+        return 0
+    @property
+    def numerator(self):
+        return _ny_payload(self)
+    @property
+    def denominator(self):
+        return 1
+    @classmethod
+    def from_bytes(cls, *args, **kw):
+        return cls(int.from_bytes(*args, **kw))
+_ny_bmethods(_NyB_int, "as_integer_ratio bit_count bit_length conjugate to_bytes is_integer")
+
+#@ float
+class _NyB_float:
+    def __new__(cls, *args, **kw):
+        return _ny_payload_new(cls, float, float(*args, **kw))
+    def __repr__(self):
+        return repr(_ny_payload(self))
+    def __format__(self, spec):
+        return _ny_bformat(self, spec)
+    def __hash__(self):
+        return hash(_ny_payload(self))
+    def __bool__(self):
+        return _ny_payload(self) != 0
+    def __int__(self):
+        return int(_ny_payload(self))
+    def __float__(self):
+        return _ny_payload(self)
+    def __complex__(self):
+        return complex(_ny_payload(self))
+    def __getnewargs__(self):
+        return (_ny_payload(self),)
+    def __eq__(self, o):
+        return _ny_payload(self) == o
+    def __ne__(self, o):
+        return _ny_payload(self) != o
+    def __lt__(self, o):
+        return _ny_payload(self) < o
+    def __le__(self, o):
+        return _ny_payload(self) <= o
+    def __gt__(self, o):
+        return _ny_payload(self) > o
+    def __ge__(self, o):
+        return _ny_payload(self) >= o
+    def __add__(self, o):
+        return _ny_payload(self) + o
+    def __radd__(self, o):
+        return o + _ny_payload(self)
+    def __sub__(self, o):
+        return _ny_payload(self) - o
+    def __rsub__(self, o):
+        return o - _ny_payload(self)
+    def __mul__(self, o):
+        return _ny_payload(self) * o
+    def __rmul__(self, o):
+        return o * _ny_payload(self)
+    def __truediv__(self, o):
+        return _ny_payload(self) / o
+    def __rtruediv__(self, o):
+        return o / _ny_payload(self)
+    def __floordiv__(self, o):
+        return _ny_payload(self) // o
+    def __rfloordiv__(self, o):
+        return o // _ny_payload(self)
+    def __mod__(self, o):
+        return _ny_payload(self) % o
+    def __rmod__(self, o):
+        if isinstance(o, str) or isinstance(o, bytes) or isinstance(o, bytearray):
+            return o % (self,)      # "%s" % x: str.__mod__'s, x itself the argument
+        return o % _ny_payload(self)
+    def __divmod__(self, o):
+        return divmod(_ny_payload(self), o)
+    def __rdivmod__(self, o):
+        return divmod(o, _ny_payload(self))
+    def __pow__(self, o, m=None):
+        if m is None:
+            return _ny_payload(self) ** o
+        return pow(_ny_payload(self), o, m)
+    def __rpow__(self, o):
+        return o ** _ny_payload(self)
+    def __neg__(self):
+        return -_ny_payload(self)
+    def __pos__(self):
+        return _ny_payload(self)
+    def __abs__(self):
+        return abs(_ny_payload(self))
+    def __round__(self, n=None):
+        if n is None:
+            return round(_ny_payload(self))
+        return round(_ny_payload(self), n)
+    def __trunc__(self):
+        return int(_ny_payload(self))
+    def __floor__(self):
+        var p = _ny_payload(self)
+        var i = int(p)
+        return i if i <= p else i - 1
+    def __ceil__(self):
+        var p = _ny_payload(self)
+        var i = int(p)
+        return i if i >= p else i + 1
+    @property
+    def real(self):
+        return _ny_payload(self)
+    @property
+    def imag(self):
+        return 0.0
+    @classmethod
+    def fromhex(cls, s):
+        return cls(float.fromhex(s))
+_ny_bmethods(_NyB_float, "as_integer_ratio conjugate hex is_integer")
+
+# str, bytes, bytearray, tuple, list: the sequence protocol
+#@ str
+class _NyB_str:
+    def __new__(cls, *args, **kw):
+        return _ny_payload_new(cls, str, str(*args, **kw))
+    def __str__(self):
+        return _ny_payload(self)
+    def __repr__(self):
+        return repr(_ny_payload(self))
+    def __format__(self, spec):
+        return format(_ny_payload(self), spec)
+    def __hash__(self):
+        return hash(_ny_payload(self))
+    def __len__(self):
+        return len(_ny_payload(self))
+    def __iter__(self):
+        return iter(_ny_payload(self))
+    def __contains__(self, x):
+        return _ny_payload(x) in _ny_payload(self)
+    def __getitem__(self, i):
+        return _ny_payload(self)[i]
+    def __getnewargs__(self):
+        return (_ny_payload(self),)
+    def __eq__(self, o):
+        return _ny_payload(self) == o
+    def __ne__(self, o):
+        return _ny_payload(self) != o
+    def __lt__(self, o):
+        return _ny_payload(self) < o
+    def __le__(self, o):
+        return _ny_payload(self) <= o
+    def __gt__(self, o):
+        return _ny_payload(self) > o
+    def __ge__(self, o):
+        return _ny_payload(self) >= o
+    def __add__(self, o):
+        return _ny_payload(self) + _ny_payload(o)
+    def __radd__(self, o):
+        return _ny_payload(o) + _ny_payload(self)
+    def __mul__(self, n):
+        return _ny_payload(self) * n
+    def __rmul__(self, n):
+        return _ny_payload(self) * n
+    def __mod__(self, args):
+        return _ny_payload(self) % args
+    def __rmod__(self, o):
+        if isinstance(o, str) or isinstance(o, bytes) or isinstance(o, bytearray):
+            return o % (self,)      # "%s" % x: str.__mod__'s, x itself the argument
+        return o % _ny_payload(self)
+    @staticmethod
+    def maketrans(*args):
+        return str.maketrans(*args)
+_ny_bmethods(_NyB_str, "capitalize casefold center count encode endswith expandtabs find format format_map index isalnum isalpha isascii isdecimal isdigit isidentifier islower isnumeric isprintable isspace istitle isupper join ljust lower lstrip partition removeprefix removesuffix replace rfind rindex rjust rpartition rsplit rstrip split splitlines startswith strip swapcase title translate upper zfill")
+
+#@ bytes
+class _NyB_bytes:
+    def __new__(cls, *args, **kw):
+        return _ny_payload_new(cls, bytes, bytes(*args, **kw))
+    def __bytes__(self):
+        return _ny_payload(self)
+    def __repr__(self):
+        return repr(_ny_payload(self))
+    def __hash__(self):
+        return hash(_ny_payload(self))
+    def __len__(self):
+        return len(_ny_payload(self))
+    def __iter__(self):
+        return iter(_ny_payload(self))
+    def __contains__(self, x):
+        return _ny_payload(x) in _ny_payload(self)
+    def __getitem__(self, i):
+        return _ny_payload(self)[i]
+    def __getnewargs__(self):
+        return (_ny_payload(self),)
+    def __eq__(self, o):
+        return _ny_payload(self) == o
+    def __ne__(self, o):
+        return _ny_payload(self) != o
+    def __lt__(self, o):
+        return _ny_payload(self) < o
+    def __le__(self, o):
+        return _ny_payload(self) <= o
+    def __gt__(self, o):
+        return _ny_payload(self) > o
+    def __ge__(self, o):
+        return _ny_payload(self) >= o
+    def __add__(self, o):
+        return _ny_payload(self) + _ny_payload(o)
+    def __radd__(self, o):
+        return _ny_payload(o) + _ny_payload(self)
+    def __mul__(self, n):
+        return _ny_payload(self) * n
+    def __rmul__(self, n):
+        return _ny_payload(self) * n
+    def __mod__(self, args):
+        return _ny_payload(self) % args
+    @classmethod
+    def fromhex(cls, s):
+        return cls(bytes.fromhex(s))
+    @staticmethod
+    def maketrans(*args):
+        return bytes.maketrans(*args)
+_ny_bmethods(_NyB_bytes, "capitalize center count decode endswith expandtabs find hex index isalnum isalpha isascii isdigit islower isspace istitle isupper join ljust lower lstrip partition removeprefix removesuffix replace rfind rindex rjust rpartition rsplit rstrip split splitlines startswith strip swapcase title translate upper zfill")
+
+#@ bytearray
+class _NyB_bytearray:
+    __hash__ = None
+    def __new__(cls, *args, **kw):
+        return _ny_payload_new(cls, bytearray, bytearray())
+    def __init__(self, *args, **kw):
+        var p = _ny_payload(self)
+        p[:] = bytearray(*args, **kw)
+    def __repr__(self):
+        return type(self).__name__ + "(" + repr(bytes(_ny_payload(self))) + ")"
+    def __len__(self):
+        return len(_ny_payload(self))
+    def __iter__(self):
+        return iter(_ny_payload(self))
+    def __contains__(self, x):
+        return _ny_payload(x) in _ny_payload(self)
+    def __getitem__(self, i):
+        return _ny_payload(self)[i]
+    def __setitem__(self, i, v):
+        var p = _ny_payload(self)
+        p[i] = v
+    def __delitem__(self, i):
+        var p = _ny_payload(self)
+        del p[i]
+    def __eq__(self, o):
+        return _ny_payload(self) == o
+    def __ne__(self, o):
+        return _ny_payload(self) != o
+    def __lt__(self, o):
+        return _ny_payload(self) < o
+    def __le__(self, o):
+        return _ny_payload(self) <= o
+    def __gt__(self, o):
+        return _ny_payload(self) > o
+    def __ge__(self, o):
+        return _ny_payload(self) >= o
+    def __add__(self, o):
+        return _ny_payload(self) + _ny_payload(o)
+    def __iadd__(self, o):
+        _ny_payload(self).extend(_ny_payload(o))
+        return self
+    def __mul__(self, n):
+        return _ny_payload(self) * n
+    def __rmul__(self, n):
+        return _ny_payload(self) * n
+    @classmethod
+    def fromhex(cls, s):
+        return cls(bytearray.fromhex(s))
+_ny_bmethods(_NyB_bytearray, "append capitalize center clear copy count decode endswith expandtabs extend find hex index insert isalnum isalpha isascii isdigit islower isspace istitle isupper join ljust lower lstrip partition pop remove removeprefix removesuffix replace reverse rfind rindex rjust rpartition rsplit rstrip split splitlines startswith strip swapcase title translate upper zfill")
+
+#@ tuple
+class _NyB_tuple:
+    def __new__(cls, *args, **kw):
+        return _ny_payload_new(cls, tuple, tuple(*args, **kw))
+    def __repr__(self):
+        return repr(_ny_payload(self))
+    def __hash__(self):
+        return hash(_ny_payload(self))
+    def __len__(self):
+        return len(_ny_payload(self))
+    def __iter__(self):
+        return iter(_ny_payload(self))
+    def __contains__(self, x):
+        return x in _ny_payload(self)
+    def __getitem__(self, i):
+        return _ny_payload(self)[i]
+    def __getnewargs__(self):
+        return (_ny_payload(self),)
+    def __eq__(self, o):
+        return _ny_payload(self) == _ny_payload(o)
+    def __ne__(self, o):
+        return _ny_payload(self) != _ny_payload(o)
+    def __lt__(self, o):
+        return _ny_payload(self) < _ny_payload(o)
+    def __le__(self, o):
+        return _ny_payload(self) <= _ny_payload(o)
+    def __gt__(self, o):
+        return _ny_payload(self) > _ny_payload(o)
+    def __ge__(self, o):
+        return _ny_payload(self) >= _ny_payload(o)
+    def __add__(self, o):
+        return _ny_payload(self) + _ny_payload(o)
+    def __radd__(self, o):
+        return _ny_payload(o) + _ny_payload(self)
+    def __mul__(self, n):
+        return _ny_payload(self) * n
+    def __rmul__(self, n):
+        return _ny_payload(self) * n
+    @classmethod
+    def __class_getitem__(cls, item):
+        return _ny_bgeneric(cls, item)
+_ny_bmethods(_NyB_tuple, "count index")
+
+#@ list
+class _NyB_list:
+    __hash__ = None
+    def __new__(cls, *args, **kw):
+        return _ny_payload_new(cls, list, [])
+    def __init__(self, iterable=()):
+        var p = _ny_payload(self)
+        p.clear()
+        p.extend(iterable)
+    def __repr__(self):
+        return repr(_ny_payload(self))
+    def __len__(self):
+        return len(_ny_payload(self))
+    def __iter__(self):
+        return iter(_ny_payload(self))
+    def __reversed__(self):
+        return reversed(_ny_payload(self))
+    def __contains__(self, x):
+        return x in _ny_payload(self)
+    def __getitem__(self, i):
+        return _ny_payload(self)[i]
+    def __setitem__(self, i, v):
+        var p = _ny_payload(self)
+        p[i] = v
+    def __delitem__(self, i):
+        var p = _ny_payload(self)
+        del p[i]
+    def __eq__(self, o):
+        return _ny_payload(self) == _ny_payload(o)
+    def __ne__(self, o):
+        return _ny_payload(self) != _ny_payload(o)
+    def __lt__(self, o):
+        return _ny_payload(self) < _ny_payload(o)
+    def __le__(self, o):
+        return _ny_payload(self) <= _ny_payload(o)
+    def __gt__(self, o):
+        return _ny_payload(self) > _ny_payload(o)
+    def __ge__(self, o):
+        return _ny_payload(self) >= _ny_payload(o)
+    def __add__(self, o):
+        return _ny_payload(self) + _ny_payload(o)
+    def __radd__(self, o):
+        return _ny_payload(o) + _ny_payload(self)
+    def __iadd__(self, o):
+        _ny_payload(self).extend(o)
+        return self
+    def __mul__(self, n):
+        return _ny_payload(self) * n
+    def __rmul__(self, n):
+        return _ny_payload(self) * n
+    def __imul__(self, n):
+        var p = _ny_payload(self)
+        var items = list(p)
+        p.clear()
+        for _ in range(n):
+            p.extend(items)
+        return self
+    @classmethod
+    def __class_getitem__(cls, item):
+        return _ny_bgeneric(cls, item)
+_ny_bmethods(_NyB_list, "append clear copy count extend index insert pop remove reverse sort")
+
+#@ dict
+class _NyB_dict:
+    __hash__ = None
+    def __new__(cls, *args, **kw):
+        return _ny_payload_new(cls, dict, {})
+    def __init__(self, *args, **kw):
+        var p = _ny_payload(self)
+        p.clear()
+        if len(args) > 1:
+            raise TypeError("dict expected at most 1 argument, got " + str(len(args)))
+        if len(args) == 1:
+            p.update(args[0])
+        if len(kw) > 0:
+            p.update(kw)
+    def __repr__(self):
+        return repr(_ny_payload(self))
+    def __len__(self):
+        return len(_ny_payload(self))
+    def __iter__(self):
+        return iter(_ny_payload(self))
+    def __reversed__(self):
+        return reversed(_ny_payload(self))
+    def __contains__(self, k):
+        return k in _ny_payload(self)
+    def __getitem__(self, k):
+        var p = _ny_payload(self)
+        if k in p:
+            return p[k]
+        var missing = getattr(type(self), "__missing__", None)
+        if missing is not None:
+            return missing(self, k)
+        raise KeyError(k)
+    def __setitem__(self, k, v):
+        var p = _ny_payload(self)
+        p[k] = v
+    def __delitem__(self, k):
+        var p = _ny_payload(self)
+        del p[k]
+    def __eq__(self, o):
+        return _ny_payload(self) == _ny_payload(o)
+    def __ne__(self, o):
+        return _ny_payload(self) != _ny_payload(o)
+    def __or__(self, o):
+        return _ny_payload(self) | _ny_payload(o)
+    def __ror__(self, o):
+        return _ny_payload(o) | _ny_payload(self)
+    def __ior__(self, o):
+        _ny_payload(self).update(o)
+        return self
+    @classmethod
+    def fromkeys(cls, iterable, value=None):
+        var d = cls()
+        for k in iterable:
+            d[k] = value
+        return d
+    @classmethod
+    def __class_getitem__(cls, item):
+        return _ny_bgeneric(cls, item)
+_ny_bmethods(_NyB_dict, "clear copy get items keys pop popitem setdefault update values")
+
+#@ set
+class _NyB_set:
+    __hash__ = None
+    def __new__(cls, *args, **kw):
+        return _ny_payload_new(cls, set, set())
+    def __init__(self, iterable=()):
+        var p = _ny_payload(self)
+        p.clear()
+        p.update(iterable)
+    def __repr__(self):
+        var p = _ny_payload(self)
+        if len(p) == 0:
+            return type(self).__name__ + "()"
+        return type(self).__name__ + "(" + repr(p) + ")"
+    def __len__(self):
+        return len(_ny_payload(self))
+    def __iter__(self):
+        return iter(_ny_payload(self))
+    def __contains__(self, x):
+        return x in _ny_payload(self)
+    def __eq__(self, o):
+        return _ny_payload(self) == _ny_payload(o)
+    def __ne__(self, o):
+        return _ny_payload(self) != _ny_payload(o)
+    def __lt__(self, o):
+        return _ny_payload(self) < _ny_payload(o)
+    def __le__(self, o):
+        return _ny_payload(self) <= _ny_payload(o)
+    def __gt__(self, o):
+        return _ny_payload(self) > _ny_payload(o)
+    def __ge__(self, o):
+        return _ny_payload(self) >= _ny_payload(o)
+    def __and__(self, o):
+        return _ny_payload(self) & _ny_payload(o)
+    def __rand__(self, o):
+        return _ny_payload(o) & _ny_payload(self)
+    def __or__(self, o):
+        return _ny_payload(self) | _ny_payload(o)
+    def __ror__(self, o):
+        return _ny_payload(o) | _ny_payload(self)
+    def __sub__(self, o):
+        return _ny_payload(self) - _ny_payload(o)
+    def __rsub__(self, o):
+        return _ny_payload(o) - _ny_payload(self)
+    def __xor__(self, o):
+        return _ny_payload(self) ^ _ny_payload(o)
+    def __rxor__(self, o):
+        return _ny_payload(o) ^ _ny_payload(self)
+    def __iand__(self, o):
+        _ny_payload(self).intersection_update(o)
+        return self
+    def __ior__(self, o):
+        _ny_payload(self).update(o)
+        return self
+    def __isub__(self, o):
+        _ny_payload(self).difference_update(o)
+        return self
+    def __ixor__(self, o):
+        _ny_payload(self).symmetric_difference_update(o)
+        return self
+    @classmethod
+    def __class_getitem__(cls, item):
+        return _ny_bgeneric(cls, item)
+_ny_bmethods(_NyB_set, "add clear copy difference difference_update discard intersection intersection_update isdisjoint issubset issuperset pop remove symmetric_difference symmetric_difference_update union update")
+
+#@ frozenset
+class _NyB_frozenset:
+    def __new__(cls, *args, **kw):
+        return _ny_payload_new(cls, frozenset, frozenset(*args, **kw))
+    def __repr__(self):
+        var p = _ny_payload(self)
+        if len(p) == 0:
+            return type(self).__name__ + "()"
+        return type(self).__name__ + "(" + repr(set(p)) + ")"
+    def __hash__(self):
+        return hash(_ny_payload(self))
+    def __len__(self):
+        return len(_ny_payload(self))
+    def __iter__(self):
+        return iter(_ny_payload(self))
+    def __contains__(self, x):
+        return x in _ny_payload(self)
+    def __eq__(self, o):
+        return _ny_payload(self) == _ny_payload(o)
+    def __ne__(self, o):
+        return _ny_payload(self) != _ny_payload(o)
+    def __lt__(self, o):
+        return _ny_payload(self) < _ny_payload(o)
+    def __le__(self, o):
+        return _ny_payload(self) <= _ny_payload(o)
+    def __gt__(self, o):
+        return _ny_payload(self) > _ny_payload(o)
+    def __ge__(self, o):
+        return _ny_payload(self) >= _ny_payload(o)
+    def __and__(self, o):
+        return _ny_payload(self) & _ny_payload(o)
+    def __rand__(self, o):
+        return _ny_payload(o) & _ny_payload(self)
+    def __or__(self, o):
+        return _ny_payload(self) | _ny_payload(o)
+    def __ror__(self, o):
+        return _ny_payload(o) | _ny_payload(self)
+    def __sub__(self, o):
+        return _ny_payload(self) - _ny_payload(o)
+    def __rsub__(self, o):
+        return _ny_payload(o) - _ny_payload(self)
+    def __xor__(self, o):
+        return _ny_payload(self) ^ _ny_payload(o)
+    def __rxor__(self, o):
+        return _ny_payload(o) ^ _ny_payload(self)
+    @classmethod
+    def __class_getitem__(cls, item):
+        return _ny_bgeneric(cls, item)
+_ny_bmethods(_NyB_frozenset, "copy difference intersection isdisjoint issubset issuperset symmetric_difference union")
+
+#@ dictview
+# obj.__dict__ / vars(obj): a live view of an instance's attributes (round
+# 77). Reads see the fields as they are now (its payload, _ny_payload(view),
+# is a fresh dict of them, so the dict mirror's methods and every builtin
+# read them); writes store or remove fields directly, past __setattr__ and
+# descriptors, as CPython's instance dict does.
+class _NyInstanceDict(dict):
+    def __init__(self, *args, **kw):
+        pass
+    def __setitem__(self, k, v):
+        _ny_setfield(self.__ny_view_of__, k, v)
+    def __delitem__(self, k):
+        _ny_delfield(self.__ny_view_of__, k)
+    def update(self, *args, **kw):
+        if len(args) > 1:
+            raise TypeError("update expected at most 1 argument, got " + str(len(args)))
+        if len(args) == 1:
+            var other = args[0]
+            if hasattr(other, "keys"):
+                for k in list(other.keys()):
+                    self[k] = other[k]
+            else:
+                for kv in other:
+                    self[kv[0]] = kv[1]
+        for k in kw:
+            self[k] = kw[k]
+    def __ior__(self, other):
+        self.update(other)
+        return self
+    def setdefault(self, k, default=None):
+        var d = _ny_payload(self)
+        if k in d:
+            return d[k]
+        self[k] = default
+        return default
+    def pop(self, k, *default):
+        var d = _ny_payload(self)
+        if k in d:
+            var v = d[k]
+            del self[k]
+            return v
+        if len(default) > 0:
+            return default[0]
+        raise KeyError(k)
+    def popitem(self):
+        var d = _ny_payload(self)
+        if len(d) == 0:
+            raise KeyError("popitem(): dictionary is empty")
+        var k = list(d.keys())[-1]
+        var v = d[k]
+        del self[k]
+        return (k, v)
+    def clear(self):
+        for k in list(_ny_payload(self).keys()):
+            del self[k]
+)NYMIRRORS";
+}
+// The text of one chunk of builtin_mirrors_source() ("" if there is none).
+inline std::string builtin_mirror_chunk(const std::string& name) {
+    static const std::string src = builtin_mirrors_source();
+    const std::string mark = "#@ " + name + "\n";
+    size_t b = src.find(mark);
+    if (b == std::string::npos) return std::string();
+    b += mark.size();
+    size_t e = src.find("\n#@ ", b);
+    return src.substr(b, e == std::string::npos ? std::string::npos : e + 1 - b);
 }
 
 } // namespace nyrt
