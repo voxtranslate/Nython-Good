@@ -71,9 +71,7 @@
 # not int"). Containers are checked fully (beartype samples one element;
 # this is the exhaustive variant typeguard uses).
 #
-# Not here (honestly): a NamedTuple class is tuple-like, not a subclass of
-# tuple - isinstance(p, tuple) is false (a class cannot subclass a builtin
-# type on this runtime); a TypedDict class's MRO keeps TypedDict (CPython
+# Not here (honestly): a TypedDict class's MRO keeps TypedDict (CPython
 # puts dict there); TypeVar / NewType __module__ is "typing" / "__main__"
 # (the caller's module is not known without frames); the abstract origins
 # (Iterable, Mapping...) are collections.abc's when lib/collections/abc.ny
@@ -1614,6 +1612,8 @@ def _setup_namedtuple(cls, typename, bases, ns):
             delattr(cls, n)
         except Exception:
             pass
+    for i in range(len(fields)):
+        setattr(cls, fields[i], _nt_field(i))
 
 
 def _namedtuple_functional(typename, fields=None, /, **kwargs):
@@ -1628,14 +1628,22 @@ def _namedtuple_functional(typename, fields=None, /, **kwargs):
     return NamedTupleMeta(typename, (NamedTuple,), {"__annotations__": ann, "__module__": "__main__"})
 
 
-class NamedTuple(metaclass=NamedTupleMeta):
+def _nt_field(i):
+    # the property reading field i of a NamedTuple
+    def get(self):
+        return self[i]
+    return property(get)
+
+
+class NamedTuple(tuple, metaclass=NamedTupleMeta):
     """Typed version of namedtuple."""
+    # a tuple subclass (round 77): isinstance(p, tuple), and the tuple's
+    # operators, hashing, slicing and methods come from tuple
     _ny_namedtuple_root = True
     _fields = ()
     _field_defaults = {}
 
-    def __init__(self, *args, **kwargs):
-        var cls = type(self)
+    def __new__(cls, *args, **kwargs):
         var fields = cls._fields
         var defaults = cls._field_defaults
         var qn = cls.__name__ + ".__new__()"
@@ -1664,9 +1672,7 @@ class NamedTuple(metaclass=NamedTupleMeta):
         if missing:
             raise TypeError(qn + " missing " + str(len(missing)) + " required positional argument"
                             + ("s" if len(missing) > 1 else "") + ": " + _join_names(missing))
-        object.__setattr__(self, "_ny_values", tuple(vals))
-        for i in range(npos):
-            object.__setattr__(self, fields[i], vals[i])
+        return tuple.__new__(cls, vals)
 
     def __setattr__(self, name, value):
         if name in type(self)._fields:
@@ -1676,86 +1682,16 @@ class NamedTuple(metaclass=NamedTupleMeta):
     def __delattr__(self, name):
         raise AttributeError("can't delete attribute")
 
-    def __getitem__(self, i):
-        return self._ny_values[i]
-
-    def __len__(self):
-        return len(self._ny_values)
-
-    def __iter__(self):
-        return iter(list(self._ny_values))
-
-    def __reversed__(self):
-        return iter(list(reversed(list(self._ny_values))))
-
-    def __contains__(self, x):
-        return x in self._ny_values
-
-    def _ny_other(self, other):
-        if isinstance(other, NamedTuple):
-            return other._ny_values
-        if isinstance(other, tuple):
-            return other
-        return None
-
-    def __eq__(self, other):
-        var o = self._ny_other(other)
-        if o is None:
-            return NotImplemented
-        return self._ny_values == o
-
-    def __ne__(self, other):
-        var o = self._ny_other(other)
-        if o is None:
-            return NotImplemented
-        return self._ny_values != o
-
-    def __lt__(self, other):
-        var o = self._ny_other(other)
-        if o is None:
-            return NotImplemented
-        return self._ny_values < o
-
-    def __le__(self, other):
-        var o = self._ny_other(other)
-        if o is None:
-            return NotImplemented
-        return self._ny_values <= o
-
-    def __gt__(self, other):
-        var o = self._ny_other(other)
-        if o is None:
-            return NotImplemented
-        return self._ny_values > o
-
-    def __ge__(self, other):
-        var o = self._ny_other(other)
-        if o is None:
-            return NotImplemented
-        return self._ny_values >= o
-
-    def __hash__(self):
-        return hash(self._ny_values)
-
-    def __add__(self, other):
-        var o = self._ny_other(other)
-        if o is None:
-            return NotImplemented
-        return self._ny_values + o
-
-    def __mul__(self, n):
-        return self._ny_values * n
-
     def __repr__(self):
         var parts = []
         for i in range(len(self._fields)):
-            parts.append(self._fields[i] + "=" + repr(self._ny_values[i]))
+            parts.append(self._fields[i] + "=" + repr(self[i]))
         return type(self).__name__ + "(" + ", ".join(parts) + ")"
 
     def _asdict(self):
         var d = {}
         for i in range(len(self._fields)):
-            d[self._fields[i]] = self._ny_values[i]
+            d[self._fields[i]] = self[i]
         return d
 
     def _replace(self, **kwds):
@@ -1775,16 +1711,10 @@ class NamedTuple(metaclass=NamedTupleMeta):
         var vals = list(iterable)
         if len(vals) != len(cls._fields):
             raise TypeError("Expected " + str(len(cls._fields)) + " arguments, got " + str(len(vals)))
-        return cls(*vals)
-
-    def count(self, x):
-        return list(self._ny_values).count(x)
-
-    def index(self, x):
-        return list(self._ny_values).index(x)
+        return tuple.__new__(cls, vals)
 
     def __getnewargs__(self):
-        return tuple(self._ny_values)
+        return tuple(self)
 
 
 # ── TypedDict ────────────────────────────────────────────────────────────────

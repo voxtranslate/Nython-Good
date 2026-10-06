@@ -12,7 +12,10 @@
 #                       __reduce_ex__(4) / __reduce__() if the class defines
 #                       them, else a new instance of the same class (its
 #                       __init__ is not run) with the same attributes, through
-#                       __getstate__ / __setstate__ when defined.
+#                       __getstate__ / __setstate__ when defined; an instance
+#                       of a class deriving from a builtin type (MyInt,
+#                       Stack(list)) is made again with its value, as CPython's
+#                       __reduce_ex__ does (round 77).
 # deepcopy(x, memo=None)  the same with every component copied; `memo` maps
 #                       id(original) -> copy, so shared references stay shared
 #                       and cycles are reproduced (a list holding itself, an
@@ -104,7 +107,7 @@ def _state_of(x):
     # attributes (None when there are none, as object.__getstate__)
     if hasattr(x, "__getstate__"):
         return x.__getstate__()
-    var d = vars(x)
+    var d = dict(vars(x))   # a plain dict, not the live view (round 77)
     if len(d) == 0:
         return none
     return d
@@ -151,12 +154,56 @@ def _exception_new(x):
     return x.__class__(*x.args)
 
 
+# An instance of a class deriving from a builtin type (round 77: it holds a
+# value of the type, _ny_payload(x)): copied as CPython's __reduce_ex__(4)
+# makes it - cls.__new__(cls, *x.__getnewargs__()) for an immutable value,
+# cls.__new__(cls) filled item by item (y[k] = v for a dict, as CPython's
+# dictitems) for a mutable one - then its attributes.
+def _builtin_value(x):
+    var v = _ny_payload(x)
+    return none if v is x else v
+
+def _copy_valued(x, v, memo):
+    var cls = x.__class__
+    var deep = memo is not none
+    var y = none
+    if isinstance(v, (list, dict, set, bytearray)):
+        y = cls.__new__(cls)
+        if deep:
+            memo[id(x)] = y
+        if isinstance(v, list):
+            list.extend(y, [deepcopy(a, memo) for a in v] if deep else v)
+        elif isinstance(v, dict):
+            for k in list(v.keys()):
+                y[deepcopy(k, memo) if deep else k] = deepcopy(v[k], memo) if deep else v[k]
+        elif isinstance(v, set):
+            set.update(y, [deepcopy(a, memo) for a in v] if deep else v)
+        else:
+            _ny_payload(y)[:] = v
+    else:
+        var args = x.__getnewargs__() if hasattr(x, "__getnewargs__") else (v,)
+        if deep:
+            args = deepcopy(args, memo)
+        y = cls.__new__(cls, *args)
+        if deep:
+            memo[id(x)] = y
+    var state = _state_of(x)
+    if deep and state is not none:
+        state = deepcopy(state, memo)
+    _set_state(y, state)
+    return y
+
+
 # ── copy ─────────────────────────────────────────────────────────────────────
 def copy(x):
     """Shallow copy operation on arbitrary Python objects.
 
     See the module's __doc__ string for more info.
     """
+    if _is_instance(x) and not _has_class_attr(x.__class__, "__copy__"):
+        var bv = _builtin_value(x)
+        if bv is not none:
+            return _copy_valued(x, bv, none)
     if _is_atomic(x):
         return x
     if isinstance(x, list):
@@ -198,7 +245,7 @@ def copy(x):
 
 def _plain_state(x):
     # an exception's attributes beyond its args
-    var d = vars(x)
+    var d = dict(vars(x))
     var out = {}
     for k in d:
         if k != "args" and k != "msg":
@@ -225,13 +272,15 @@ def deepcopy(x, memo=none, _nil=[]):
     """
     if memo is none:
         memo = {}
-    if _is_atomic(x):
+    if _is_atomic(x) and _builtin_value(x) is none:
         return x
     var d = id(x)
     var y = memo.get(d, _nil)
     if id(y) != id(_nil):
         return y
-    if isinstance(x, list):
+    if _is_instance(x) and not _has_class_attr(x.__class__, "__deepcopy__") and _builtin_value(x) is not none:
+        y = _copy_valued(x, _builtin_value(x), memo)
+    elif isinstance(x, list):
         y = []
         memo[d] = y
         for a in x:

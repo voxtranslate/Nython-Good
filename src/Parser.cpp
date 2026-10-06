@@ -3171,7 +3171,12 @@ node_ptr Parser::matchStmt(Token tok, node_ptr subject){
         }
         case MatchPat::SEQ: {
             long n = (long)p->subs.size();
-            node_ptr r = call("isinstance", {path(), var_ref("list")});
+            // a list or a tuple, as CPython's sequence patterns (round 77: a
+            // tuple never matched; a subclass's instance is one of them)
+            auto seq_types = make_node<TupleNode>(T("("));
+            seq_types->add(var_ref("list"));
+            seq_types->add(var_ref("tuple"));
+            node_ptr r = call("isinstance", {path(), seq_types});
             if(p->star < 0) r = conj(r, bin("==", call("len", {path()}), int_node(n)));
             else r = conj(r, bin(">=", call("len", {path()}), int_node(n - 1)));
             for(long i = 0; i < n; i++){

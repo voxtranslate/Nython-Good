@@ -496,6 +496,37 @@ struct NythonExecutor {
             for (auto& kv : *global_ctx->container) module_base_ctx_->defineByName(kv.first, kv.second);
         }
     }
+    // The mirror classes of the builtin types (NyPrelude.hpp,
+    // builtin_mirrors_source; round 77): a type's chunk runs in the global
+    // scope the first time a class derives from the type or one of its
+    // dunders is read (int.__new__), "dictview" at the first instance
+    // __dict__ read: a program that never does pays nothing for them.
+    std::unordered_set<std::string> mirrors_loaded_;
+    void ensureMirror(const std::string& chunk) {
+        if (mirrors_loaded_.count(chunk)) return;
+        mirrors_loaded_.insert(chunk);
+        if (chunk != "base") ensureMirror("base");
+        if (chunk == "dictview") ensureMirror("dict");
+        try {
+            auto source = SourceCode(nyrt::builtin_mirror_chunk(chunk));
+            auto reporter = std::make_shared<Reporter>(source);
+            auto lex = std::make_shared<Lexer>(source);
+            lex->tokenize();
+            auto parser = std::make_shared<Parser>(reporter.get(), (Runnable*)runner, lex.get());
+            auto ast = parser->parse();
+            if (ast) {
+                imported_asts.push_back(ast);
+                evalNode(ast, global_ctx);
+            }
+        } catch (std::exception& e) {
+            std::cerr << "[Nython] builtin mirror '" << chunk << "' failed to load: " << e.what() << "\n";
+        }
+        mro_cache_.clear();
+    }
+    // A class naming `name` as a base needs its mirror.
+    void mirrorsFor(const std::string& name) {
+        if (nyrt::builtin_mirror(name) && !mirrors_loaded_.count(name) && !classNodeByName(name)) ensureMirror(name);
+    }
     std::unordered_set<std::string> base_global_names_;
     Context* module_base_ctx_ = nullptr;
     std::function<bool(const std::string&)> module_filter_;
@@ -552,6 +583,7 @@ public:   // NythonExecutor is a struct: members default to public
             "staticmethod","classmethod","callable","dir","vars","globals","locals","eval","exec","compile","_ny_setattr_raw","_ny_delattr_raw","_ny_object_new","_ny_subclasses","_ny_type_new","_ny_type_call",
             "_ny_main_globals","_ny_exc_current","_ny_stack",
             "_ny_fn_info","_ny_fn_globals","_ny_keywords",   // inspect, f.__code__, keyword (round 77)
+            "_ny_payload","_ny_payload_new","_ny_getattr_raw","_ny_setfield","_ny_delfield",   // builtin subclasses, __getattribute__, __dict__ (round 77)
             "iter","next","help","Set","Counter","OrderedDict","deque","defaultdict","assert",
             "islice","take",   // lazy iteration (src/NyGen.cpp), both engines
             "sqrt","sin","cos","tan","log","floor","ceil",
@@ -1155,6 +1187,10 @@ public:   // NythonExecutor is a struct: members default to public
             // rebound IT (`items = []` in a class body overwrote the global
             // builtin `items`, and the class never got the attribute).
             assignName(vn.get(), val, ctx);
+        } else if (an->target->type() == NodeType::SELF) {
+            // self = expr (round 77: `self = super().__new__(cls, v)` in a
+            // __new__ was dropped)
+            ctx->setByName("self", val);
         } else if (an->target->type() == NodeType::ATTRIBUTE) {
             auto attr = static_pointer_cast<AttributeNode>(an->target);
             Value obj = evalNode(attr->object, ctx);
@@ -1250,6 +1286,10 @@ public:   // NythonExecutor is a struct: members default to public
             pyRaise("TypeError", "unhashable type: '" + typeNameOf(v) + "'");
     }
     std::string setKey(const Value& v) {
+        {
+            Value p;   // MyInt(1) is the element 1 (round 77)
+            if (any_payload_ && payloadKey(v, p)) return setKey(p);
+        }
         if (isInstanceValue(v) && instanceHasMethod(v, "__hash__")) {
             checkHashable(v);
             std::vector<Value> none;
@@ -1654,6 +1694,8 @@ public:   // NythonExecutor is a struct: members default to public
             pyRaise("TypeError", "argument of type '" + instanceClassName(c) + "' is not iterable");
         }
         if (isStringValue(c)) {
+            Value px;
+            if (any_payload_ && payloadOf(x, px) && isStringValue(px)) return containsValue(c, px, ctx);   // MyStr("a") in "cat" (round 77)
             if (!isStringValue(x)) pyRaise("TypeError", "'in <string>' requires string as left operand");
             return ((std::string*)c.value.p)->find(*(std::string*)x.value.p) != std::string::npos;
         }
@@ -1907,9 +1949,12 @@ public:   // NythonExecutor is a struct: members default to public
         // An instance method through its type: the receiver must be of it.
         if (args.empty()) pyRaise("TypeError", "unbound method " + t + "." + m + "() needs an argument");
         std::string have = typeNameOf(args[0]);
+        Value self = args[0];
+        // an instance of a class deriving from t: the method on the value it
+        // holds, as CPython's str.upper(MyStr("q")) (round 77)
+        { Value p; if (any_payload_ && payloadOf(args[0], p) && typeNameOf(p) == t) { self = p; have = t; } }
         bool ok = have == t || (t == "int" && have == "bool");
         if (!ok) pyRaise("TypeError", "descriptor '" + m + "' for '" + t + "' objects doesn't apply to a '" + have + "' object");
-        Value self = args[0];
         std::vector<Value> rest(args.begin() + 1, args.end());
         out = callMethod(self, m, rest, ctx, kw.empty() ? nullptr : &kw);
         return true;
@@ -2013,7 +2058,9 @@ public:   // NythonExecutor is a struct: members default to public
         }
     }
     // A value as an argument of a bytes method (NyBytes.hpp: BArg).
-    nypy::BArg toBArg(const Value& v, Context* ctx, int depth = 0) {
+    nypy::BArg toBArg(const Value& v_in, Context* ctx, int depth = 0) {
+        // a bytes / int subclass's instance is its value (round 77)
+        Value v = unwrapPayload(v_in);
         nypy::BArg a;
         a.tname = typeNameOf(v);
         switch (v.type) {
@@ -2226,7 +2273,7 @@ public:   // NythonExecutor is a struct: members default to public
     // _ny_delattr_raw, which also back super().__setattr__(name, value).
     // Whether a class has such a hook is cached until the next class
     // statement.
-    std::unordered_map<const Node*, uint8_t> attr_hook_cache_[2];
+    std::unordered_map<const Node*, uint8_t> attr_hook_cache_[3];   // __setattr__, __delattr__, __getattribute__ (round 77)
     static inline thread_local int raw_attr_depth_ = 0;
     bool instanceAttrHook(const Value& obj, int which) {
         if (raw_attr_depth_ > 0) return false;
@@ -2242,6 +2289,52 @@ public:   // NythonExecutor is a struct: members default to public
         return has;
     }
     struct RawAttr { RawAttr() { raw_attr_depth_++; } ~RawAttr() { raw_attr_depth_--; } RawAttr(const RawAttr&) = delete; RawAttr& operator=(const RawAttr&) = delete; };
+    // ── __getattribute__ (round 77) ─────────────────────────────────────
+    // A class defining one (not object's) has it called for every attribute
+    // read on its instances - obj.x, obj.m(...), getattr, hasattr - and its
+    // __getattr__ when it raises AttributeError, as in Python. The engine's
+    // own lookups of special methods (operators, len, iter, str ...) do not
+    // go through it, as in CPython. object.__getattribute__ (_ny_getattr_raw)
+    // is the normal lookup, without __getattr__. Until a class defines one
+    // (any_getattribute_), nothing is looked for.
+    bool any_getattribute_ = false;
+    bool raw_getattr_once_ = false;            // the next lookup is object.__getattribute__'s
+    const void* raw_getattr_obj_ = nullptr;    // ... and its object's __getattr__ is not called
+    bool getattributeHook(const Value& obj) {
+        if (!any_getattribute_ || !isInstanceValue(obj)) return false;
+        Node* cls = classNodeOfInstance(obj);
+        if (!cls) return false;
+        auto& c = attr_hook_cache_[2];
+        auto it = c.find(cls);
+        if (it != c.end()) return it->second == 1;
+        Value m; Node* owner = nullptr;
+        bool has = findClassMember(cls, "__getattribute__", m, &owner) && owner
+                   && owner->type() == NodeType::CLASS && shownClassName(static_cast<ClassNode*>(owner)->name) != "object";
+        c[cls] = has ? 1 : 2;
+        return has;
+    }
+    Value hookedGetattr(const Value& obj, const std::string& name, Context* ctx) {
+        std::vector<Value> a{makeStringValue(name)};
+        try { return callMethod(obj, "__getattribute__", a, ctx ? ctx : global_ctx); }
+        catch (std::string& flow) {
+            if (!excTypeMatches(flow, "AttributeError") || !instanceHasMethod(obj, "__getattr__")) throw;
+        }
+        std::vector<Value> b{makeStringValue(name)};
+        return callMethod(obj, "__getattr__", b, ctx ? ctx : global_ctx);
+    }
+    Value rawGetattr(const Value& obj, const std::string& name, Context* ctx) {
+        const void* saved = raw_getattr_obj_;
+        raw_getattr_obj_ = obj.value.p;
+        raw_getattr_once_ = true;
+        Value out;
+        bool ok = false;
+        try { ok = getAttrValue(obj, name, ctx ? ctx : global_ctx, out); }
+        catch (...) { raw_getattr_once_ = false; raw_getattr_obj_ = saved; throw; }
+        raw_getattr_once_ = false;
+        raw_getattr_obj_ = saved;
+        if (!ok) throw std::string("__exc__:AttributeError:" + attributeErrorText(obj, name));
+        return out;
+    }
     // C.x = v / del C.x for a class whose metaclass defines __setattr__ /
     // __delattr__ (not object's): the metaclass's runs (round 77; enum
     // refuses to reassign a member). Its super().__setattr__ stores directly.
@@ -2298,6 +2391,23 @@ public:   // NythonExecutor is a struct: members default to public
                 return;
             }
         }
+        // obj.__dict__ = d: the fields become d's items (round 77; it stored
+        // a field named __dict__)
+        if (name == "__dict__" && isInstanceValue(obj)) {
+            Value src = unwrapPayload(val);
+            Container* sc = contOf(src);
+            if (!sc || seqLen(sc) >= 0 || isInstanceVal(src))
+                pyRaise("TypeError", "__dict__ must be set to a dictionary, not a '" + typeNameOf(val) + "'");
+            std::vector<Value> keys = dictKeys(sc);
+            std::vector<Value> vals;
+            for (auto& k : keys) { auto it = dictFind(sc, k); vals.push_back(it != sc->container->end() ? it->second : NONE_VALUE); }
+            Context* f = fieldsOf(obj, "__dict__");
+            std::vector<std::string> drop;
+            if (f->container) for (auto& kv : *f->container) if (!nyrt::hidden_field(kv.first)) drop.push_back(kv.first);
+            for (auto& d : drop) f->container->erase(d);
+            for (size_t i = 0; i < keys.size(); i++) if (isStringValue(keys[i])) f->defineByName(getStringValue(keys[i]), vals[i]);
+            return;
+        }
         // Store on instance properties (USERDATA instances)
         if (obj.type == ValueType::USERDATA && obj.value.p) {
             auto pit = instance_properties.find(obj.value.p);
@@ -2316,6 +2426,8 @@ public:   // NythonExecutor is a struct: members default to public
                     auto* cn = static_cast<ClassNode*>(class_node);
                     class_vars_[cn->name + "." + name] = val;
                     if (!class_vars_deleted_.empty()) class_vars_deleted_.erase(cn->name + "." + name);
+                    if (name == "__getattribute__") { any_getattribute_ = true; attr_hook_cache_[2].clear(); }
+                    if (name == "__iter__") iter_own_cache_.clear();   // round 77
                     // Also update class_ctx_map_ so subsequent reads via evalAttribute see the new value.
                     // In the class's own namespace: setByName walked on into
                     // the scope the class was defined in, so C.x = v rebound a
@@ -2536,6 +2648,10 @@ public:   // NythonExecutor is a struct: members default to public
             }
             if (isSetCont(c)) return setKey(k);       // a frozenset; a set raises
             if (!isInstanceVal(k)) pyRaise("TypeError", "unhashable type: '" + typeNameOf(k) + "'");
+        }
+        {
+            Value p;   // MyStr("k") is the key "k" (round 77)
+            if (any_payload_ && payloadKey(k, p)) return dictKey(p);
         }
         if (isInstanceVal(k) && instanceHasMethod(k, "__hash__")) {
             checkHashable(k);
@@ -3384,7 +3500,9 @@ public:   // NythonExecutor is a struct: members default to public
         return nyCall([&] { return nypy::format_value(toFmtVal(v, 0, ctx), spec); });
     }
     // str methods: arguments to and results from nypy::str_method.
-    nypy::SArg toSArg(const Value& v, Context* ctx) {
+    nypy::SArg toSArg(const Value& v_in, Context* ctx) {
+        // a str subclass's instance is its str (round 77)
+        Value v = unwrapPayload(v_in);
         nypy::SArg a;
         a.tname = typeNameOf(v);
         switch (v.type) {
@@ -3399,6 +3517,7 @@ public:   // NythonExecutor is a struct: members default to public
             std::vector<Value> items = iterItems(v, ctx);
             a.k = nypy::SArg::STRS;
             for (size_t i = 0; i < items.size(); i++) {
+                if (any_payload_) items[i] = unwrapPayload(items[i]);   // ",".join([MyStr("a")]) (round 77)
                 if (!isStringValue(items[i]))
                     pyRaise("TypeError", "sequence item " + std::to_string(i) + ": expected str instance, " + typeNameOf(items[i]) + " found");
                 a.v.push_back(*(std::string*)items[i].value.p);
@@ -3487,6 +3606,16 @@ public:   // NythonExecutor is a struct: members default to public
     }
     // "fmt" % args
     Value percentFormat(const std::string& fmt, const Value& rv, Context* ctx) {
+        {
+            // a tuple or dict subclass's instance: its value's items or keys,
+            // as CPython's PyTuple_Check / PyMapping_Check (round 77)
+            Value pv;
+            if (any_payload_ && payloadOf(rv, pv)) {
+                Container* pc = contOf(pv);
+                if (pc && ((seqLen(pc) >= 0 && isTupleCont(pc)) || (seqLen(pc) < 0 && !nygen::is_gen(pv))))
+                    return percentFormat(fmt, pv, ctx);
+            }
+        }
         std::vector<Value> args;
         bool mapping = false;
         Container* rc = contOf(rv);
@@ -3830,6 +3959,15 @@ public:   // NythonExecutor is a struct: members default to public
         return result;
     }
 
+    // `for a, b in ...` over an object item: its values, as the generator
+    // loop's bind_item (src/NyGen.cpp) does (round 77).
+    template <class Bind>
+    void bindUnpacked(ForNode* fn, const std::string& var_name, const Value& item, Context* ctx, Bind& bindv) {
+        std::vector<Value> parts = iterValues(item, ctx);
+        bindv(var_name, parts.empty() ? NONE_VALUE : parts[0]);
+        for (size_t ui = 0; ui < fn->unpack_vars.size(); ui++)
+            bindv(fn->unpack_vars[ui]->value(), ui + 1 < parts.size() ? parts[ui + 1] : NONE_VALUE);
+    }
     Value evalFor(node_ptr node, Context* ctx) {
         auto fn = static_pointer_cast<ForNode>(node);
         bool broke = false;
@@ -3923,7 +4061,11 @@ public:   // NythonExecutor is a struct: members default to public
                     auto it = cont->container->find(key);
                     if (it != cont->container->end()) {
                         Value elem = it->second;
-                        if (!fn->unpack_vars.empty() && elem.isCollectable() && elem.value.gc) {
+                        if (!fn->unpack_vars.empty() && isInstanceValue(elem)) {
+                            // an object (a tuple subclass's instance ...):
+                            // unpacked by iterating it (round 77)
+                            bindUnpacked(fn.get(), var_name, elem, ctx, bindv);
+                        } else if (!fn->unpack_vars.empty() && elem.isCollectable() && elem.value.gc) {
                             // Tuple unpacking: destructure element
                             auto* elem_cont = dynamic_cast<Container*>(elem.value.gc);
                             if (elem_cont && elem_cont->container) {
@@ -4002,7 +4144,9 @@ public:   // NythonExecutor is a struct: members default to public
                 }
                 if (stop) break;
                 // Unpack tuples for k,v iteration
-                if (!fn->unpack_vars.empty() && item.isCollectable()) {
+                if (!fn->unpack_vars.empty() && isInstanceValue(item)) {
+                    bindUnpacked(fn.get(), var_name, item, ctx, bindv);   // round 77
+                } else if (!fn->unpack_vars.empty() && item.isCollectable()) {
                     auto* cont = dynamic_cast<Container*>(item.value.gc);
                     if (cont && cont->container) {
                         bindv(var_name, cont->container->count("0") ? (*cont->container)["0"] : NONE_VALUE);
@@ -5418,6 +5562,8 @@ public:   // NythonExecutor is a struct: members default to public
                 b = std::make_shared<VariableNode>(t);
             }
         }
+        // a builtin base (int, list ...): its mirror class (round 77)
+        for (auto& b : cn->bases) if (b) mirrorsFor(b->value());
         Value class_val;
         class_val.type = ValueType::USERDATA;
         class_val.value.p = (void*)node.get();
@@ -5426,6 +5572,7 @@ public:   // NythonExecutor is a struct: members default to public
         mro_cache_.clear();
         attr_hook_cache_[0].clear();
         attr_hook_cache_[1].clear();
+        attr_hook_cache_[2].clear();
         no_new_.clear();
         if (cn->body)
             for (auto& st : cn->body->statements())
@@ -5441,11 +5588,20 @@ public:   // NythonExecutor is a struct: members default to public
         Value meta_pre = metaclassOf(node.get());
         if (meta_pre.type == ValueType::NONE)
             ctx->defineByName(cn->bind_name.empty() ? cn->name : cn->bind_name, class_val);
+        // A metaclass's __prepare__(name, bases, **kw) (round 77): the
+        // mapping the body's bindings go to as they are made, in order
+        // (prepareStore), and the namespace the metaclass's __new__ gets.
+        PrepareHook prep{this, NONE_VALUE};
+        if (meta_pre.type != ValueType::NONE) prep.ns = callPrepare(meta_pre, cn.get(), class_kw, ctx);
         if (cn->body) {
             Context* class_ctx = new Context(runner, cn->name, nullptr, nullptr, ctx);
             CtxReaper _class_creator(this, class_ctx);
             class_ctx->inClass = true;
-            evalNode(cn->body, class_ctx);
+            {
+                struct Unhook { Context* c; ~Unhook() { c->storeHook = nullptr; c->storeHookArg = nullptr; } } unhook{class_ctx};
+                if (prep.ns.type != ValueType::NONE) { class_ctx->storeHook = &NythonExecutor::prepareStoreThunk; class_ctx->storeHookArg = &prep; }
+                evalNode(cn->body, class_ctx);
+            }
             if (orig_bases.type != ValueType::NONE) class_ctx->defineByName("__orig_bases__", orig_bases);   // round 77
             // __init_subclass__ and __class_getitem__ are classmethods
             // without the decorator, as in Python (round 77)
@@ -5467,7 +5623,8 @@ public:   // NythonExecutor is a struct: members default to public
         // what the statement binds (round 77).
         Value meta = meta_pre;
         if (meta.type != ValueType::NONE) {
-            Value made = runMetaclass(meta, class_val, node.get(), cn.get(), class_kw, ctx);
+            Value made = runMetaclass(meta, class_val, node.get(), cn.get(), class_kw, ctx,
+                                      prep.ns.type != ValueType::NONE ? &prep.ns : nullptr);
             ctx->defineByName(cn->bind_name.empty() ? cn->name : cn->bind_name, made);
             return made;
         }
@@ -5530,25 +5687,78 @@ public:   // NythonExecutor is a struct: members default to public
     // a metaclass's __new__ (it returns the class already made); `second`:
     // type.__new__ has run for it.
     std::vector<std::pair<Value, bool>> constructing_;
+    // The bases a metaclass sees: the classes, a builtin base (class
+    // IntEnum(int, ReprEnum)) as its builtin type, as in Python (round 77).
+    Value classBasesTuple(ClassNode* cn) {
+        std::vector<Value> bvals;
+        for (auto& b : cn->bases) {
+            if (Node* bn = classNodeByName(b->value())) bvals.push_back(classValueOfNode(bn));
+            else if (nyrt::is_builtin_type_name(b->value()) && b->value() != "object") {
+                Value bv = global_ctx->getByName(b->value());
+                if (bv.type != ValueType::UNDEFINED && bv.type != ValueType::NONE) bvals.push_back(bv);
+            }
+        }
+        return makeListValue(bvals, true);
+    }
+    // ── __prepare__ (round 77) ──────────────────────────────────────────
+    // A metaclass defining __prepare__ (not type's): it is called with the
+    // class's name, bases and keywords before the body runs, and each name
+    // the body binds goes to the mapping it returned, in order, through the
+    // mapping's __setitem__ (so a name bound twice is seen twice); the body
+    // reads back what the mapping then holds for the name (enum's auto()
+    // values), and the mapping is the namespace the metaclass's __new__
+    // gets. What differs from CPython: the body runs in the engine's own
+    // namespace, so its reads do not go through the mapping's __getitem__,
+    // `del name` in the body does not call __delitem__, a name the mapping
+    // refuses to hold stays in the class, and the mapping does not receive
+    // __module__ / __qualname__.
+    struct PrepareHook { NythonExecutor* E; Value ns; int skip = 0; };
+    static Value prepareStoreThunk(void* a, const std::string& name, const Value& v) {
+        auto* h = static_cast<PrepareHook*>(a);
+        return h->E->prepareStore(h->ns, name, v, h->skip);
+    }
+    Value prepareStore(const Value& ns, const std::string& name, const Value& v, int& skip) {
+        if (name.empty() || (unsigned char)name[0] < 0x20) return v;
+        // @D def f: the parser's `__decN__ = D; def f; f = __decN__(f)` -
+        // the mapping sees f once, decorated, as in Python (nyrt::
+        // decorator_binding; stacked decorators nest the pattern)
+        if (nyrt::decorator_binding(name, skip)) return v;
+        Value key = makeStringValue(name);
+        if (isInstanceValue(ns)) {
+            std::vector<Value> a{key, v};
+            callMethod(ns, "__setitem__", a, global_ctx);
+            Value back;
+            if (tryGetItem(ns, key, global_ctx, back)) return back;
+            return v;
+        }
+        if (Container* c = contOf(ns); c && seqLen(c) < 0) dictSet(c, key, v);
+        return v;
+    }
+    Value callPrepare(const Value& meta, ClassNode* cn, const nyrt::OrderedKw<Value>& kw, Context* ctx) {
+        Node* mn = classNodeOfValue(meta);
+        if (!mn) return NONE_VALUE;
+        Value m; Node* where = nullptr;
+        if (!findClassMember(mn, "__prepare__", m, &where) || !where || where->type() != NodeType::CLASS) return NONE_VALUE;
+        std::string owner = shownClassName(static_cast<ClassNode*>(where)->name);
+        if (owner == "object" || owner == "type") return NONE_VALUE;
+        Value f;
+        if (!getAttrValue(meta, "__prepare__", ctx, f)) return NONE_VALUE;
+        std::vector<Value> a{makeStringValue(nyrt::bare_class_name(shownClassName(cn->name))), classBasesTuple(cn)};
+        Value ns = callFunctionValue(f, a, ctx, &kw);
+        if (!isInstanceValue(ns) && !(contOf(ns) && seqLen(contOf(ns)) < 0))
+            pyRaise("TypeError", shownClassName(static_cast<ClassNode*>(mn)->name) + ".__prepare__() must return a mapping, not " + typeNameOf(ns));
+        return ns;
+    }
     Value runMetaclass(const Value& meta, const Value& cls, Node* cnode, ClassNode* cn,
-                       const nyrt::OrderedKw<Value>& kw, Context* ctx) {
+                       const nyrt::OrderedKw<Value>& kw, Context* ctx, const Value* prepared = nullptr) {
         Node* mn = classNodeOfValue(meta);
         Node* objn = classNodeByName("object");
         // the class's own name, as Python passes it ("A", not the module's
         // "m.A" this engine keys it by - round 77)
         Value name = makeStringValue(nyrt::bare_class_name(shownClassName(cn->name)));
-        std::vector<Value> bvals;
-        for (auto& b : cn->bases) {
-            if (Node* bn = classNodeByName(b->value())) bvals.push_back(classValueOfNode(bn));
-            else if (nyrt::is_builtin_type_name(b->value()) && b->value() != "object") {
-                // a builtin base (class IntEnum(int, ReprEnum)) is one of the
-                // bases the metaclass sees, as in Python (round 77)
-                Value bv = global_ctx->getByName(b->value());
-                if (bv.type != ValueType::UNDEFINED && bv.type != ValueType::NONE) bvals.push_back(bv);
-            }
-        }
-        Value bases = makeListValue(bvals, true);
-        Value ns = classNamespace(cnode);
+        Value bases = classBasesTuple(cn);
+        // the namespace: what __prepare__ returned, else the body's (round 77)
+        Value ns = prepared ? *prepared : classNamespace(cnode);
         Value made = cls;
         Value m; Node* where = nullptr;
         if (findClassMember(mn, "__new__", m, &where) && where != objn && func_names.count(m.value.p)) {
@@ -5561,6 +5771,17 @@ public:   // NythonExecutor is a struct: members default to public
             if (!ran) classCreated(cls, cnode, kw, ctx);
         } else {
             class_meta_[cnode] = meta;
+            // type.__new__ itself: the class's namespace is the mapping
+            // __prepare__ returned (round 77)
+            if (prepared) {
+                auto cit = class_ctx_map_.find((void*)cnode);
+                if (Container* nc = contOf(unwrapPayload(*prepared)); nc && cit != class_ctx_map_.end() && cit->second)
+                    for (auto& k : dictKeys(nc)) {
+                        if (!isStringValue(k)) continue;
+                        auto it = dictFind(nc, k);
+                        if (it != nc->container->end()) cit->second->defineByName(getStringValue(k), it->second);
+                    }
+            }
             classCreated(cls, cnode, kw, ctx);
         }
         if (classNodeOfValue(made) && findClassMember(mn, "__init__", m, &where) && where != objn && func_names.count(m.value.p)) {
@@ -5575,6 +5796,9 @@ public:   // NythonExecutor is a struct: members default to public
     // arguments - type(name, bases, ns) and a metaclass called directly.
     Value typeNew(std::vector<Value>& args, const nyrt::OrderedKw<Value>& kw, Context* ctx) {
         if (args.size() < 4) pyRaise("TypeError", "type.__new__() takes exactly 3 arguments (" + std::to_string(args.size() ? args.size() - 1 : 0) + " given)");
+        // the namespace may be a dict subclass's instance (what a
+        // __prepare__ returned): its dict, as CPython copies it (round 77)
+        args[3] = unwrapPayload(args[3]);
         Value mcs = args[0];
         std::string name = getStringValue(args[1]);
         if (!constructing_.empty() && !constructing_.back().second) {
@@ -5594,6 +5818,7 @@ public:   // NythonExecutor is a struct: members default to public
                 mro_cache_.clear();
                 attr_hook_cache_[0].clear();
                 attr_hook_cache_[1].clear();
+        attr_hook_cache_[2].clear();
                 classCreated(cls, cnode, kw, ctx);
                 return cls;
             }
@@ -5619,6 +5844,8 @@ public:   // NythonExecutor is a struct: members default to public
                 if (b.type == ValueType::USERDATA && tag.rfind("__builtin__:", 0) == 0) bn = tag.substr(12);
             }
             if (bn.empty()) pyRaise("TypeError", "bases must be types");
+            if (bn == "map") bn = "dict";
+            mirrorsFor(bn);   // a builtin base's mirror class (round 77)
             Token bt = t; bt.value = bn;
             node->bases.push_back(std::make_shared<VariableNode>(bt));
         }
@@ -5630,6 +5857,7 @@ public:   // NythonExecutor is a struct: members default to public
         mro_cache_.clear();
         attr_hook_cache_[0].clear();
         attr_hook_cache_[1].clear();
+        attr_hook_cache_[2].clear();
         no_new_.clear();
         Context* class_ctx = new Context(runner, full, nullptr, nullptr, global_ctx);
         CtxReaper _class_creator(this, class_ctx);
@@ -5709,6 +5937,11 @@ public:   // NythonExecutor is a struct: members default to public
             if (findClassMember(cnode, "__set__", dm) || findClassMember(cnode, "__delete__", dm)) any_data_descr_ = true;
         }
         auto cit = class_ctx_map_.find((void*)cnode);
+        // a class with its own __getattribute__: attribute reads look for it
+        // (round 77; object's is the plain lookup)
+        if (!any_getattribute_ && cit != class_ctx_map_.end() && cit->second && cit->second->container
+            && cit->second->container->count("__getattribute__") && shownClassName(static_cast<ClassNode*>(cnode)->name) != "object")
+            any_getattribute_ = true;
         if (cit != class_ctx_map_.end() && cit->second && cit->second->container) {
             std::vector<std::pair<std::string, Value>> attrs;
             for (auto& kv : *cit->second->container)
@@ -5852,6 +6085,17 @@ public:   // NythonExecutor is a struct: members default to public
                 } else if (un->op == "**") {
                     // **dict spread into kw_args
                     Value spread_val = evalNode(un->operand, ctx);
+                    if (isInstanceValue(spread_val)) {
+                        // a dict subclass's instance: its value; another
+                        // mapping through keys() and [] (round 77: it was
+                        // dropped without a word)
+                        Value p;
+                        if (any_payload_ && payloadOf(spread_val, p)) spread_val = p;
+                        else {
+                            std::vector<Value> a{spread_val};
+                            spread_val = callFunctionValue(global_ctx->getByName("_ny_dict_merge"), a, ctx);
+                        }
+                    }
                     if (spread_val.isCollectable() && spread_val.value.gc) {
                         auto* cont = dynamic_cast<Container*>(spread_val.value.gc);
                         if (cont && cont->container)
@@ -6540,6 +6784,13 @@ public:
             std::vector<Value> args; nyrt::OrderedKw<Value> kw_args;
             evalCallArgs(cn->args, ctx, args, kw_args);
 
+            // obj.m(...) on an object whose class defines __getattribute__:
+            // m is what it gives (round 77)
+            if (any_getattribute_ && getattributeHook(obj)) {
+                Value target = hookedGetattr(obj, method_name, ctx);
+                return callFunctionValue(target, args, ctx, &kw_args);
+            }
+
             // Check class_ctx_map_ FIRST for decorated methods (e.g. @decorator on class method)
             // This ensures we call the decorated wrapper with self injected into *args.
             // (Decorated methods - functions a decorator returned into the
@@ -6704,6 +6955,11 @@ public:
                             if (!kw_args.empty() && isKwmapBuiltin(bn)) appendKwMap(args, kw_args);
                             return callBuiltin(bn, args, ctx);
                         }
+                        // int.__new__(cls, v), dict.__setitem__(d, k, v): the
+                        // builtin type's mirror function, called (round 77)
+                        if (isTypeObject(obj) && !classNodeOfValue(obj)
+                            && (fn_it->second.rfind("__func__:", 0) == 0 || fn_it->second.rfind("__lambda__", 0) == 0))
+                            return callFunctionValue(callee_val, args, ctx, &kw_args);
                         // Class value accessed via attribute (e.g. Outer.Inner()) -> instantiate
                         if (fn_it->second.find("__class__:") == 0) {
                             // as a call by name does: the metaclass's __call__,
@@ -7055,6 +7311,10 @@ public:
     }
 
     Value callBuiltin(const std::string& name_orig, std::vector<Value>& args, Context* ctx) {
+        // an instance of a class deriving from a builtin type is its value
+        // to a builtin (round 77) - but not to the ones asking for its class,
+        // dunders or identity, or storing it (nyrt::payload_transparent)
+        if (any_payload_ && !args.empty()) unwrapBuiltinArgs(name_orig, args);
         if (!args.empty() && nyrt::takes_paths(name_orig)) fspathArgs(args, ctx);
         // islice/take, and iter/next/any/all/zip/map/filter/enumerate given a
         // generator: lazy (src/NyGen.cpp).
@@ -7244,8 +7504,9 @@ public:
         auto* an = static_cast<AttributeNode*>(node.get());
         Value obj = evalNode(an->object, ctx);
         // The common read, an instance's own field, straight from its
-        // namespace (a Value is not cheap to copy: it carries a Token).
-        if (obj.type == ValueType::USERDATA && obj.value.p) {
+        // namespace (a Value is not cheap to copy: it carries a Token) -
+        // unless its class defines __getattribute__ (round 77).
+        if (obj.type == ValueType::USERDATA && obj.value.p && !(any_getattribute_ && getattributeHook(obj))) {
             auto pit = instance_properties.find(obj.value.p);
             if (pit != instance_properties.end() && pit->second && pit->second->container) {
                 auto fit = pit->second->container->find(an->attr);
@@ -7323,6 +7584,12 @@ public:
     // false: a builtin method (list.append ...) is left to the method call
     // that is about to happen instead of being read as a bound value.
     bool getAttrValue(const Value& obj, const std::string& attr, Context* ctx, Value& out, bool bind = true) {
+        if (any_getattribute_) {
+            // a class's __getattribute__ (round 77); object.__getattribute__
+            // asks for the lookup below
+            if (raw_getattr_once_) raw_getattr_once_ = false;
+            else if (getattributeHook(obj)) { out = hookedGetattr(obj, attr, ctx); return true; }
+        }
         if (attr == "__class__" && !isInstanceValue(obj)) {
             // (5).__class__ is int, [].__class__ is list, C.__class__ is
             // type (round 77)
@@ -7412,6 +7679,16 @@ public:
                         if (Node* on = classNodeByName("object")) chain.push_back(classValueOfNode(on));
                     out = makeListValue(chain, true);
                     return true;
+                }
+                // int.__new__, list.__init__, dict.__setitem__, int.__repr__
+                // ...: the type's mirror class has them (round 77)
+                if (nyrt::mirror_dunder(attr)) {
+                    std::string bt = base == "map" ? std::string("dict") : base;
+                    if (nyrt::builtin_mirror(bt)) ensureMirror(bt);
+                    if (Node* mn = builtinMirrorNode(bt)) {
+                        Value mv;
+                        if (findClassMember(mn, attr, mv)) { out = mv; return true; }
+                    }
                 }
                 return false;
             }
@@ -7844,9 +8121,23 @@ public:
                         std::vector<Node*> seq = classMro(cn);
                         std::vector<std::string> extra;
                         for (Node* c : seq) {
+                            // a builtin type's mirror is that type, where it
+                            // stands (round 77)
+                            std::string bt = nyrt::mirror_builtin(static_cast<ClassNode*>(c)->name);
+                            if (!bt.empty() && c != cn) {
+                                Value v;
+                                if (builtin(bt, v)) seq_vals.push_back(v);
+                                extra.push_back(bt);
+                                continue;
+                            }
                             if (c != objn) push(c);
+                        }
+                        for (Node* c : seq)
                             for (auto& b : static_cast<ClassNode*>(c)->bases)
                                 if (std::find(extra.begin(), extra.end(), b->value()) == extra.end()) extra.push_back(b->value());
+                        for (Node* c : seq) {
+                            std::string bt = nyrt::mirror_builtin(static_cast<ClassNode*>(c)->name);
+                            if (!bt.empty()) extra.erase(std::remove(extra.begin(), extra.end(), bt), extra.end());
                         }
                         for (auto& n : extra) { Value v; if (builtin(n, v)) seq_vals.push_back(v); }
                         if (objn && cn != objn) push(objn);
@@ -7914,15 +8205,13 @@ public:
                     return true;
                 }
                 if (attr == "__dict__") {
-                    // names as dict keys: self.__x__ is listed too (round 77)
-                    auto* d = new Object((Runnable*)runner, "map", Type::MAP);
-                    auto pit = instance_properties.find(obj.value.p);
-                    if (pit != instance_properties.end() && pit->second && pit->second->container)
-                        for (auto& kv : *pit->second->container) (*d->container)[nypy::key_of_str(kv.first)] = kv.second;
-                    out = Value((Collectable*)d);
+                    // a live view of the fields (round 77; it was a copy):
+                    // names as dict keys, self.__x__ listed too
+                    out = instanceDictView(obj);
                     return true;
                 }
-                if (instanceHasMethod(obj, "__getattr__")) {
+                // (not for object.__getattribute__'s lookup - round 77)
+                if (raw_getattr_obj_ != obj.value.p && instanceHasMethod(obj, "__getattr__")) {
                     std::vector<Value> a{makeStringValue(attr)};
                     out = callMethod(obj, "__getattr__", a, ctx);
                     return true;
@@ -10428,6 +10717,9 @@ public:
         std::vector<Node*> direct;
         for (auto& b : static_cast<ClassNode*>(cls)->bases) {
             Node* bn = classNodeByName(b->value());
+            // a builtin base (int, list, dict ...): its mirror class stands
+            // where it does (round 77; it was left out)
+            if (!bn) bn = builtinMirrorNode(b->value());
             if (!bn || bn == cls) continue;
             seqs.push_back(std::vector<Node*>(classMro(bn)));
             direct.push_back(bn);
@@ -10462,6 +10754,7 @@ public:
                 size_t at = 0;
                 for (auto& b : static_cast<ClassNode*>(k)->bases) {
                     Node* bn = classNodeByName(b->value());
+                    if (!bn) bn = builtinMirrorNode(b->value());   // round 77
                     if (bn) todo.insert(todo.begin() + (long)(at++), bn);
                 }
             }
@@ -10507,6 +10800,181 @@ public:
     bool isInstanceValue(const Value& v) {
         return v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p)
                && instance_to_class.count(v.value.p);
+    }
+    // ── Classes deriving from builtin types (round 77) ──────────────────
+    // An instance of `class MyInt(int)` holds its value - the payload - in
+    // the hidden field nyrt::payload_field(); the prelude's mirror class of
+    // the type (_NyB_int ...) answers for it, standing in the MRO where the
+    // type does (classMro). Builtins are given the payload (callBuiltin).
+    bool any_payload_ = false;   // a payload instance was made: builtins unwrap their arguments
+    bool payloadOf(const Value& v, Value& out) {
+        if (v.type != ValueType::USERDATA || !v.value.p) return false;
+        auto pit = instance_properties.find(v.value.p);
+        if (pit == instance_properties.end() || !pit->second || !pit->second->container) return false;
+        auto it = pit->second->container->find(nyrt::payload_field());
+        if (it == pit->second->container->end()) {
+            // an instance-dict view's value: its owner's fields as they are now
+            it = pit->second->container->find("__ny_view_of__");
+            if (it == pit->second->container->end()) return false;
+            out = instanceFields(it->second);
+            return true;
+        }
+        out = it->second;
+        return true;
+    }
+    // ── obj.__dict__ / vars(obj): a live view (round 77) ────────────────
+    // An instance of the prelude's _NyInstanceDict (a dict subclass, the
+    // mirrors' "dictview" chunk) whose field __ny_view_of__ is the object:
+    // its value is a fresh dict of the object's fields (payloadOf), so
+    // every read sees them as they are; its __setitem__ / __delitem__ /
+    // update ... store and remove fields (_ny_setfield / _ny_delfield). The
+    // view holds the object; while it is alive the object's __dict__ is it
+    // (vars(o) is o.__dict__), through a table that does not hold it - so
+    // reading __dict__ makes no cycle and the object is still freed at once.
+    std::unordered_map<const void*, std::pair<nyheap::Inst*, void*>> dict_views_;   // object -> its view
+    std::unordered_map<const void*, const void*> dict_view_owner_;                  // view -> its object
+    void forgetDictView(void* p) {
+        auto o = dict_view_owner_.find(p);
+        if (o != dict_view_owner_.end()) { dict_views_.erase(o->second); dict_view_owner_.erase(o); }
+        auto v = dict_views_.find(p);
+        if (v != dict_views_.end()) { dict_view_owner_.erase(v->second.second); dict_views_.erase(v); }
+    }
+    Value instanceFields(const Value& obj) {
+        auto* d = new Object((Runnable*)runner, "map", Type::MAP);
+        Value dv((Collectable*)d);
+        auto pit = instance_properties.find(obj.value.p);
+        if (obj.type == ValueType::USERDATA && obj.value.p && pit != instance_properties.end() && pit->second && pit->second->container)
+            for (auto& kv : *pit->second->container)
+                if (!nyrt::hidden_field(kv.first)) (*d->container)[nypy::key_of_str(kv.first)] = kv.second;
+        return dv;
+    }
+    Value instanceDictView(const Value& obj) {
+        auto pit = instance_properties.find(obj.value.p);
+        if (pit == instance_properties.end() || !pit->second || !pit->second->container) return instanceFields(obj);
+        auto it = dict_views_.find(obj.value.p);
+        if (it != dict_views_.end()) return nyheap::userValue(it->second.first, it->second.second);
+        ensureMirror("dictview");
+        Node* vn = classNodeByName("_NyInstanceDict");
+        if (!vn) return instanceFields(obj);
+        Value view = newInstance(static_cast<ClassNode*>(vn)->name, (void*)vn);
+        auto vit = instance_properties.find(view.value.p);
+        if (vit != instance_properties.end() && vit->second) vit->second->defineByName("__ny_view_of__", obj);
+        dict_views_[obj.value.p] = {static_cast<nyheap::Inst*>(view.value.o), view.value.p};
+        dict_view_owner_[view.value.p] = obj.value.p;
+        any_payload_ = true;
+        return view;
+    }
+    // _ny_setfield(obj, name, value) / _ny_delfield(obj, name): a field
+    // stored or removed directly (no __setattr__, no descriptor), as
+    // obj.__dict__[name] = value does.
+    Context* fieldsOf(const Value& obj, const char* who) {
+        auto pit = obj.type == ValueType::USERDATA && obj.value.p ? instance_properties.find(obj.value.p) : instance_properties.end();
+        if (pit == instance_properties.end() || !pit->second) pyRaise("TypeError", std::string(who) + ": not an instance");
+        return pit->second;
+    }
+    void setField(const Value& obj, const Value& name, const Value& v) {
+        if (!isStringValue(name)) pyRaise("TypeError", "attribute name must be string, not '" + typeNameOf(name) + "'");
+        fieldsOf(obj, "__dict__")->defineByName(getStringValue(name), v);
+    }
+    void delField(const Value& obj, const Value& name) {
+        Context* f = fieldsOf(obj, "__dict__");
+        std::string n = isStringValue(name) ? getStringValue(name) : std::string();
+        if (n.empty() || nyrt::hidden_field(n) || !f->container || !f->container->erase(n)) missingKey(name, global_ctx);
+    }
+    Value unwrapPayload(const Value& v) { Value p; return any_payload_ && payloadOf(v, p) ? p : v; }
+    void unwrapPayloadArgs(std::vector<Value>& args) {
+        for (auto& a : args) { Value p; if (payloadOf(a, p)) a = p; }
+    }
+    // A builtin's arguments (callBuiltin): payload instances as their values,
+    // unless the builtin is one of nyrt::payload_transparent's.
+    void unwrapBuiltinArgs(const std::string& name, std::vector<Value>& args) {
+        int decided = 0;
+        for (auto& a : args) {
+            if (a.type != ValueType::USERDATA || !a.value.p || string_ptrs_.count(a.value.p)) continue;
+            Value p;
+            if (!payloadOf(a, p) || iterOverridden(a)) continue;
+            if (!decided) decided = nyrt::payload_transparent(name) ? -1 : 1;
+            if (decided < 0) return;
+            a = p;
+        }
+    }
+    // An instance of a class deriving from a builtin type that holds no
+    // value (made by object.__new__): an error from _ny_payload, not the
+    // mirror's methods calling themselves for ever.
+    void checkHasPayload(const Value& v) {
+        Node* cn = classNodeOfInstance(v);
+        if (!cn) return;
+        for (Node* c : classMro(cn)) {
+            std::string bt = nyrt::mirror_builtin(static_cast<ClassNode*>(c)->name);
+            if (!bt.empty() && c != cn)
+                pyRaise("TypeError", "'" + nyrt::bare_class_name(shownClassName(static_cast<ClassNode*>(cn)->name)) + "' object holds no "
+                        + bt + " value (it was made by object.__new__(), not " + bt + ".__new__())");
+        }
+    }
+    Node* builtinMirrorNode(const std::string& t) {
+        const char* m = nyrt::builtin_mirror(t);
+        return m ? classNodeByName(m) : nullptr;
+    }
+    // _ny_payload_new(cls, T, value), what T.__new__(cls, ...) does: value
+    // itself when cls is T, else a new instance of cls (a subclass of T)
+    // holding it.
+    Value newPayloadInstance(const Value& cls, const Value& t, const Value& value) {
+        std::string tn = t.type == ValueType::USERDATA && t.value.p ? fnTag(func_names, t.value.p) : std::string();
+        if (tn.rfind("__builtin__:", 0) == 0) tn = tn.substr(12);
+        if (tn == "map") tn = "dict";
+        if (cls.type == ValueType::USERDATA && cls.value.p && cls.value.p == t.value.p) return value;
+        Node* cn = classNodeOfValue(cls);
+        if (!cn && isTypeObject(cls)) {
+            std::string sn = fnTag(func_names, cls.value.p);
+            if (sn.rfind("__builtin__:", 0) == 0) sn = sn.substr(12);
+            pyRaise("TypeError", tn + ".__new__(" + sn + "): " + sn + " is not a subtype of " + tn);
+        }
+        if (!cn) pyRaise("TypeError", tn + ".__new__(X): X is not a type object (" + typeNameOf(cls) + ")");
+        std::string cname = static_cast<ClassNode*>(cn)->name;
+        std::string shown = nyrt::bare_class_name(shownClassName(cname));
+        if (!classDerivesFrom(cname, tn))
+            pyRaise("TypeError", tn + ".__new__(" + shown + "): " + shown + " is not a subtype of " + tn);
+        Value inst = newInstance(cname, cls.value.p);
+        auto pit = instance_properties.find(inst.value.p);
+        if (pit != instance_properties.end() && pit->second) pit->second->defineByName(nyrt::payload_field(), value);
+        any_payload_ = true;
+        return inst;
+    }
+    // A payload instance whose class keeps the type's __hash__ and __eq__
+    // is the same dict key / set element as its value (MyStr("k") finds
+    // d["k"], 1 in {MyInt(1)}); cached per class (class nodes are never
+    // freed, and a class's MRO does not change).
+    std::unordered_map<const Node*, bool> payload_key_cache_;
+    // A class with an __iter__ of its own (Flag's, a list subclass's): a
+    // builtin is given the instance and iterates it through that, as
+    // CPython's slots would (round 77); cached per class, cleared with the
+    // attribute-hook caches.
+    std::unordered_map<const Node*, bool> iter_own_cache_;
+    bool iterOverridden(const Value& v) {
+        Node* cn = classNodeOfInstance(v);
+        if (!cn) return false;
+        auto it = iter_own_cache_.find(cn);
+        if (it != iter_own_cache_.end()) return it->second;
+        Value m; Node* owner = nullptr;
+        bool own = findClassMember(cn, "__iter__", m, &owner) && owner && owner->type() == NodeType::CLASS
+                   && nyrt::mirror_builtin(static_cast<ClassNode*>(owner)->name).empty();
+        iter_own_cache_[cn] = own;
+        return own;
+    }
+    bool payloadKey(const Value& v, Value& out) {
+        if (!any_payload_ || !payloadOf(v, out)) return false;
+        Node* cn = classNodeOfInstance(v);
+        if (!cn) return false;
+        auto it = payload_key_cache_.find(cn);
+        if (it != payload_key_cache_.end()) return it->second;
+        bool plain = true;
+        for (const char* d : {"__hash__", "__eq__"}) {
+            Value m; Node* owner = nullptr;
+            if (!findClassMember(cn, d, m, &owner) || !owner || owner->type() != NodeType::CLASS
+                || nyrt::mirror_builtin(static_cast<ClassNode*>(owner)->name).empty()) plain = false;
+        }
+        payload_key_cache_[cn] = plain;
+        return plain;
     }
     // ── eval / exec / compile (round 77; there were none) ──────────────
     // Source text - a str, bytes, or what compile() made - parsed and run:
@@ -10656,14 +11124,10 @@ public:
     Value reflectVars(std::vector<Value>& args, Context* ctx) {
         if (args.empty()) return reflectLocals(ctx);
         const Value& o = args[0];
+        // an instance's: its __dict__, the live view (round 77)
+        if (isInstanceValue(o)) return instanceDictView(o);
         auto* d = new Object((Runnable*)runner, "map", Type::MAP);
         Value dv((Collectable*)d);
-        if (isInstanceValue(o)) {
-            auto pit = instance_properties.find(o.value.p);
-            if (pit != instance_properties.end() && pit->second && pit->second->container)
-                for (auto& kv : *pit->second->container) if (!reflectHidden(kv.first)) d->set(kv.first, kv.second);
-            return dv;
-        }
         if (Node* cn = classNodeOfValue(o)) {
             auto cit = class_ctx_map_.find((void*)cn);
             if (cit != class_ctx_map_.end() && cit->second && cit->second->container)
@@ -11315,6 +11779,7 @@ public:
         instance_to_class.erase(p);
         func_names.erase(p);
         instance_properties.erase(p);
+        if (!dict_views_.empty()) forgetDictView(p);   // round 77
     }
     // weakref(): its objects by id, for the builtin tag that calls them.
     std::unordered_map<int64_t, nyheap::Weak*> weak_by_id_;
@@ -11532,6 +11997,9 @@ public:
                 if (st->type() == NodeType::FUNCTION && static_cast<FunctionNode*>(st.get())->name == name) return true;
         for (auto& b : cn->bases) {
             auto bit = class_by_name.find(b->value());
+            // a builtin base: its mirror class (round 77)
+            if (bit == class_by_name.end())
+                if (const char* mn = nyrt::builtin_mirror(b->value())) bit = class_by_name.find(mn);
             if (bit != class_by_name.end() && classDefines(bit->second, name, depth + 1)) return true;
         }
         return false;

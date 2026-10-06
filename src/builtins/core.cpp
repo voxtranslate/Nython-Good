@@ -566,6 +566,23 @@ Value dispatch_core(NythonExecutor& E,
             if (E.isExceptionClass(cname)) { std::vector<Value> none; E.setExceptionArgs(inst, none); }
             return inst;
         }
+        // classes deriving from builtin types (round 77): an instance's
+        // value (anything else is its own), and T.__new__(cls, ...)
+        if (name == "_ny_payload") {
+            if (args.empty()) return NONE_VALUE;
+            Value p;
+            if (E.payloadOf(args[0], p)) return p;
+            if (E.isInstanceValue(args[0])) E.checkHasPayload(args[0]);
+            return args[0];
+        }
+        if (name == "_ny_payload_new" && args.size() >= 3) return E.newPayloadInstance(args[0], args[1], args[2]);
+        // obj.__dict__[k] = v / del obj.__dict__[k] (the view's): a field
+        // stored or removed directly (round 77)
+        if (name == "_ny_setfield" && args.size() >= 3) { E.setField(args[0], args[1], args[2]); return NONE_VALUE; }
+        if (name == "_ny_delfield" && args.size() >= 2) { E.delField(args[0], args[1]); return NONE_VALUE; }
+        // object.__getattribute__(obj, name): the attribute lookup without
+        // the class's __getattribute__ and __getattr__ (round 77)
+        if (name == "_ny_getattr_raw" && args.size() >= 2) return E.rawGetattr(args[0], E.getStringValue(args[1]), ctx);
         if (name == "_ny_subclasses") return E.subclassesOf(args.empty() ? NONE_VALUE : args[0]);
         // a function's parameters, flags and place (inspect; round 77)
         if (name == "_ny_fn_info") return E.fnInfo(args.empty() ? NONE_VALUE : args[0]);

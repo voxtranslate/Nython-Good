@@ -30,6 +30,11 @@ struct Context extends Container {
     // global scope) this accepts: the builtins and the prelude, not the
     // importing program's own variables (NythonExecutor::importModule).
     const std::function<bool(const std::string&)>* parentFilter = nullptr;
+    // A class body run for a metaclass's __prepare__ (round 77): each name
+    // it binds goes to the mapping first, and the value stored is what the
+    // hook gives back (NythonExecutor::evalClassDecl).
+    Value (*storeHook)(void*, const std::string&, const Value&) = nullptr;
+    void* storeHookArg = nullptr;
 
 	Context(Runnable* runner,const std::string& name, Collectable* self = nullptr, Collectable* klass = nullptr, Context* parent = nullptr);
 	~Context();
@@ -59,6 +64,7 @@ struct Context extends Container {
     }
     void setByName(const std::string& varName, Value val) {
         if (!container) return;
+        if (storeHook) { defineByName(varName, val); return; }   // a class body under __prepare__ (round 77)
         // Check if variable exists in current scope
         auto it = container->find(varName);
         if (it != container->end()) { it->second = val; return; }
@@ -77,6 +83,7 @@ struct Context extends Container {
     }
     void defineByName(const std::string& varName, Value val) {
         if (!container) return;
+        if (storeHook) val = storeHook(storeHookArg, varName, val);   // round 77
         (*container)[varName] = val;
     }
     bool hasByName(const std::string& varName) {

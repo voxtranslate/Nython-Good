@@ -12,6 +12,7 @@
 
 #include <string>
 #include <vector>
+#include <unordered_set>
 #include <exception>
 #include <stdexcept>
 #include <new>
@@ -128,12 +129,83 @@ inline bool is_decorator_temp(const std::string& n) {
     for (size_t i = 5; i + 2 < n.size(); i++) if (n[i] < '0' || n[i] > '9') return false;
     return true;
 }
+// A class body's binding a metaclass's __prepare__ mapping must not see
+// (round 77): a decorator temporary, and the bindings the desugaring of
+// `@D def f` makes before its last (`__decN__ = D; def f; f = __decN__(f)`:
+// Python binds f once, decorated). `skip` counts the pending ones per body.
+inline bool decorator_binding(const std::string& n, int& skip) {
+    if (is_decorator_temp(n)) { ++skip; return true; }
+    if (skip > 0) { --skip; return true; }
+    return false;
+}
 
 // issubclass over the builtin types (round 77): a type derives from itself
 // and from object, bool from int.
 inline bool builtin_type_derives(const std::string& sub, const std::string& sup) {
     if (sub.empty() || sup.empty()) return false;
     return sub == sup || sup == "object" || (sub == "bool" && sup == "int");
+}
+
+// ── Classes deriving from builtin types (round 77) ───────────────────────────
+// `class MyInt(int)`: an instance holds a value of the type, its payload, in
+// the hidden field below (a "__" name, so a dict view of the fields - vars(),
+// obj.__dict__ - leaves it out on both engines). Where the type stands in
+// the class's MRO, both engines put the prelude's mirror class of the type
+// (_NyB_int ...: its operators, protocol and methods over the payload).
+inline const char* payload_field() { return "__ny_payload__"; }
+// Fields the engines keep on an instance for themselves ("__ny_*": the
+// payload, the owner of an instance-dict view, the view itself): never part
+// of vars(obj) / obj.__dict__ / dir(obj).
+inline bool hidden_field(const std::string& n) { return n.size() > 7 && n.compare(0, 5, "__ny_") == 0; }
+// The mirror class of a builtin type that can be subclassed, nullptr otherwise.
+inline const char* builtin_mirror(const std::string& t) {
+    static const char* const names[][2] = {
+        {"int", "_NyB_int"}, {"float", "_NyB_float"}, {"str", "_NyB_str"}, {"bytes", "_NyB_bytes"},
+        {"bytearray", "_NyB_bytearray"}, {"list", "_NyB_list"}, {"dict", "_NyB_dict"},
+        {"set", "_NyB_set"}, {"frozenset", "_NyB_frozenset"}, {"tuple", "_NyB_tuple"},
+    };
+    if (t.empty() || t.size() > 9) return nullptr;
+    for (auto& n : names) if (t == n[0]) return n[1];
+    return nullptr;
+}
+// The dunders the mirror classes define: reading one from a builtin type
+// (int.__new__, dict.__setitem__, int.__repr__) loads the mirrors.
+inline bool mirror_dunder(const std::string& a) {
+    static const char* const names[] = {
+        "__abs__", "__add__", "__and__", "__bool__", "__bytes__", "__ceil__", "__class_getitem__", "__complex__",
+        "__contains__", "__delitem__", "__divmod__", "__eq__", "__float__", "__floor__", "__floordiv__", "__format__",
+        "__ge__", "__getitem__", "__getnewargs__", "__gt__", "__hash__", "__iadd__", "__iand__", "__imul__", "__index__",
+        "__init__", "__int__", "__invert__", "__ior__", "__isub__", "__iter__", "__ixor__", "__le__", "__len__",
+        "__lshift__", "__lt__", "__mod__", "__mul__", "__ne__", "__neg__", "__new__", "__or__", "__pos__", "__pow__",
+        "__radd__", "__rand__", "__rdivmod__", "__repr__", "__reversed__", "__rfloordiv__", "__rlshift__", "__rmod__",
+        "__rmul__", "__ror__", "__round__", "__rpow__", "__rrshift__", "__rshift__", "__rsub__", "__rtruediv__",
+        "__rxor__", "__setitem__", "__str__", "__sub__", "__truediv__", "__trunc__", "__xor__",
+    };
+    if (a.size() < 5 || a[0] != '_' || a[1] != '_') return false;
+    for (const char* n : names) if (a == n) return true;
+    return false;
+}
+// The builtin type a mirror class stands for ("" for any other class name).
+inline std::string mirror_builtin(const std::string& cls) {
+    if (cls.size() < 6 || cls.compare(0, 5, "_NyB_") != 0) return std::string();
+    std::string t = cls.substr(5);
+    return builtin_mirror(t) ? t : std::string();
+}
+// The builtins a payload instance reaches as itself: the ones that ask for
+// its class, dunders or identity, or store it (every other builtin is given
+// the payload - math_sqrt(Celsius(4.0)), os_path_join(Name("a")), int(...)).
+inline bool payload_transparent(const std::string& n) {
+    if (n.size() > 4 && n[0] == '_' && n[1] == 'n' && n[2] == 'y' && n[3] == '_') return true;   // _ny_* (the prelude's)
+    static const char* const pre[] = {"thread_", "mutex_", "channel_", "queue_", "future_", "task_", "atomic_",
+                                       "rwlock_", "cond_", "sem_", "barrier_", "latch_", "async_", "gc_", "pool_"};
+    for (const char* p : pre) if (n.rfind(p, 0) == 0) return true;
+    static const std::unordered_set<std::string> names = {
+        "type", "typeof", "isinstance", "issubclass", "id", "hash", "repr", "str", "ascii", "format", "print",
+        "println", "len", "iter", "next", "bool", "callable", "getattr", "setattr", "hasattr", "delattr", "vars",
+        "dir", "super", "weakref", "min", "max", "help", "object", "property", "staticmethod", "classmethod",
+        "display", "show", "__format_value__", "anext", "aiter", "reversed",
+    };
+    return names.count(n) > 0;
 }
 
 // ── Module namespaces over the flat builtins ─────────────────────────────────

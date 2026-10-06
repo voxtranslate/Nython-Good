@@ -361,9 +361,10 @@ Nython over the class machinery above; each header says what is not there.
   metaclass: members in definition order, `Color["RED"]`/`Color(1)`/
   `_missing_`, aliases, `@unique`, `auto()`, `IntEnum`/`StrEnum`/mixed-in
   types, `Flag`/`IntFlag` with 3.11's boundaries, the functional API,
-  `member`/`nonmember`, `verify`, immutability, members in `match`. Without
-  `__prepare__`, arithmetic on `auto()` in a body (`RW = R | W`) is kept as an
-  expression and computed when the member is made. `@dataclass` with every
+  `member`/`nonmember`, `verify`, immutability, members in `match`.
+  `EnumType.__prepare__` returns CPython's `_EnumDict` (see the next
+  section): `auto()` is resolved on its own line and a name bound twice is
+  refused. `@dataclass` with every
   parameter, `field()`, `KW_ONLY`, `InitVar`, ClassVar exclusion (also by
   the text of a string annotation), inheritance, frozen instances,
   `__match_args__`, `fields`/`asdict`/`astuple`/`replace`/
@@ -437,11 +438,141 @@ Nython over the class machinery above; each header says what is not there.
   traceback entry).
 - **Not provided** (each module's header has the full list): frames have
   no locals (`currentframe()` is None, no `inspect.stack`); weak references
-  to functions, classes and sets; `__prepare__` (enum cannot detect a name
-  assigned twice in a body); classes deriving from int/str hold no value
-  (`int.__new__` does not exist; enum delegates to the member's value); a
-  NamedTuple is tuple-like but not a tuple subclass; the abstract-class
-  check is made in `ABCMeta.__call__`; registries hold classes strongly.
+  to functions, classes and sets; the abstract-class check is made in
+  `ABCMeta.__call__`; registries hold classes strongly. (`__prepare__`,
+  classes deriving from builtin types holding a value, `int.__new__` and
+  NamedTuple as a real tuple subclass came later in round 77 - next section.)
+
+### The class model: builtin subclasses, __getattribute__, a live __dict__, __prepare__ (vm_audit85, passes under python3)
+- **Classes deriving from builtin types hold a value** (`class MyInt(int)`,
+  `Celsius(float)`, `Name(str)`, `Blob(bytes)`, `Buffer(bytearray)`,
+  `Stack(list)`, `Config(dict)`, `Tags(set)` / `frozenset`, `Point(tuple)`),
+  the same way on both engines: an instance is an ordinary instance whose
+  hidden field `__ny_payload__` (`nyrt::payload_field()`; a `__ny_*` name, so
+  `vars()`, `__dict__` and `dir()` leave it out) holds the value, and where
+  the builtin type stands in the class's MRO the engines put the type's
+  *mirror class* (`_NyB_int`, `_NyB_list` ... - `nyrt::builtin_mirror`): the
+  interpreter's `classMro` uses the mirror's node for a builtin base, the
+  VM's `class_lookup` looks in the mirror's namespace at the MRO entry
+  "int". The mirrors are Nython (`nyrt::builtin_mirrors_source()` in
+  NyPrelude.hpp): each type's operators, reflected operators, comparisons,
+  `__hash__` (None for the mutable ones), `__len__/__iter__/__contains__/
+  __getitem__/__setitem__/__delitem__`, `__index__/__int__/__float__/
+  __round__ ...`, `__repr__`/`__format__` (and `__str__` for str), in-place
+  operators that mutate the value (`stack += [4]` keeps the Stack), its
+  properties (`real`, `numerator` ...), its class methods (`fromkeys`,
+  `from_bytes`, `fromhex` making the subclass) and a delegate for every
+  regular method (`MyStr("a").upper()` is a plain str, as in Python), all
+  over `_ny_payload(self)`. A subclass's own definitions come first; the
+  type's own methods do not call its dunders (`dict.update` does not call
+  `__setitem__`), as in CPython; dicts keep `__missing__`.
+- **Making one**: the mirror's `__new__` is the type's: `T(*args)` made into
+  the value for the immutable types (`MyInt("12")`, `Celsius("2.5")`), an
+  empty value that `__init__` fills for the mutable ones (`list.__init__`,
+  `dict.__init__` ...), so `super().__new__(cls, v)`, `int.__new__(cls, v)`,
+  `str.__new__`, `tuple.__new__(cls, it)`, `float.__new__` work in a user
+  `__new__`, and `super().__init__(items)` in a user `__init__`
+  (`_ny_payload_new(cls, T, value)`: the value itself when cls is T,
+  "int.__new__(S): S is not a subtype of int" otherwise).
+- **Builtins get the value**: a builtin called with a payload instance gets
+  its value (`math.sqrt(MyInt(16))`, `int(Name("12"))`, `os.path.join`,
+  `json.dumps`, `",".join([Name("a")])`, `"abc".find(Name("c"))`, `MyStr in
+  "text"`), except the ones that ask for the object itself - its class,
+  dunders or identity, or store it (`nyrt::payload_transparent`: type,
+  isinstance, repr, str, len, iter, hash, getattr..., min/max - which return
+  the instance -, the `_ny_*` prelude natives, the thread/channel/queue
+  natives). Interpreter: `callBuiltin`, `toSArg`/`toBArg`; VM: `vm_call`'s
+  native path (named builtins only: a bound member stores what it is given),
+  `to_sarg`/`to_barg`.
+- **Keys**: a payload instance whose class keeps the type's `__hash__` and
+  `__eq__` is the same dict key and set element as its value (`{5: "a"}[MyInt(5)]`,
+  `{"bob": 1}[Name("bob")]`, `1 in {MyInt(1)}`) - `payloadKey` / `payload_key`.
+  Iterating such a dict gives the key back as the plain value (CPython gives
+  the first object stored).
+- **On demand**: a type's mirror (and the shared helpers) is run the first
+  time a class derives from the type, or one of its dunders is read from it
+  (`int.__new__`, `dict.__setitem__`, `int.__repr__`), the "dictview" chunk
+  at the first instance `__dict__` read; the text is in "#@ name" chunks
+  (`nyrt::builtin_mirror_chunk`). A program that never does pays nothing
+  (the mirrors cost ~5-10 ms to run).
+- **Cost**: plain values take none of these paths (a builtin's arguments are
+  looked at only once a payload instance exists, `any_payload_`); an
+  operator on a payload instance is a call of the mirror's Nython method
+  (`s + MyInt(1)` in a loop: ~3.5x a plain int `+` on the VM, ~5x on the
+  interpreter).
+- **`__getattribute__`** is dispatched on both engines: a class defining one
+  (not object's) has it called for every attribute read on its instances -
+  `obj.x`, `obj.m(...)`, `getattr`, `hasattr`, `?.` - then `__getattr__` when
+  it raises AttributeError; `object.__getattribute__(self, name)` (prelude,
+  `_ny_getattr_raw`) and `super().__getattribute__` are the normal lookup
+  without `__getattr__`. The engines' own lookups of special methods
+  (operators, `len`, `str`, `iter`) do not go through it, as in CPython.
+  Nothing is looked for until some class defines one (`any_getattribute_`;
+  per-class answers cached with the `__setattr__` hooks').
+- **`obj.__dict__` is live** (it was a copy): `obj.__dict__` and `vars(obj)`
+  are one object while it is alive - an instance of the prelude's
+  `_NyInstanceDict` (a dict subclass) whose value is a fresh dict of the
+  object's fields at every read (`payloadOf` of a view), so every dict
+  operation and builtin sees them as they are; `d[k] = v`, `del d[k]`,
+  `update`, `pop`, `setdefault`, `popitem`, `clear`, `|=` store and remove
+  fields directly (`_ny_setfield` / `_ny_delfield`, past `__setattr__` and
+  descriptors, as CPython's instance dict). The view holds the object; the
+  object finds its view through a table that does not hold it, so reading
+  `__dict__` makes no cycle. `obj.__dict__ = d` replaces the fields.
+  Dunder attributes are listed (`self.__marked__`). `C.__dict__` is still a
+  copy of the class namespace. Differences: `type(vars(o))` is
+  `_NyInstanceDict`, not dict (isinstance(..., dict) holds).
+- **`__prepare__`**: a metaclass's `__prepare__(name, bases, **kw)` is
+  called before the class body; each name the body binds goes to the
+  mapping it returned, in order, through its `__setitem__` (a name bound
+  twice is seen twice; a decorated def once, decorated - the parser's
+  `__decN__ = D; def f; f = __decN__(f)` is recognised by
+  `nyrt::decorator_binding`), and the body then reads back what the mapping holds
+  for it (so a mapping that turns `None` or `auto()` into numbers is seen
+  by the next lines); the mapping is the `ns` the metaclass's `__new__`
+  gets, and `type.__new__` makes it the class's namespace. Interpreter:
+  `Context::storeHook` on the class body's scope (evalClassDecl,
+  `prepareStore`); VM: `CallFrame::prep_ns`, STORE_NAME / DEFINE_NAME in a
+  class body (`prepare_store`). What differs from CPython: the body runs in
+  the engine's own namespace, so its reads do not go through the mapping's
+  `__getitem__`; `del name` in the body does not call `__delitem__`; a name
+  the mapping refuses to hold stays in the class; the mapping does not
+  receive `__module__` / `__qualname__`.
+- **Libraries**: enum's `EnumType.__prepare__` returns an `_EnumDict` (as
+  CPython's): a member name bound twice is "'A' already defined as 1",
+  `auto()` gets its value on its own line (`RW = R | W` is exact; the
+  deferred `_AutoExpr` workaround is gone), `_generate_next_value_` after a
+  member is refused at once; members of a mixed-in builtin type are values
+  of it (`int.__new__(enum_class, v)`, StrEnum's `str.__new__`, Flag's
+  pseudo-members), so a user `__new__` calling `int.__new__` works, and an
+  IntEnum member is the same dict key as its int (`{1: x}[Level.LOW]`);
+  only a complex enum still delegates to `_value_`.
+  collections.namedtuple and typing.NamedTuple are tuple subclasses
+  (`isinstance(p, tuple)`, slicing, hashing and JSON as an array). copy /
+  deepcopy make a payload instance again with its value.
+- **Engine fixes this needed (both engines unless said):** `self = expr`
+  was dropped (the interpreter's `evalAssignment` had no SELF target; the
+  VM's `store()` emitted nothing for it and left the value on the stack -
+  new op `STORE_SELF`); the VM's `x |= y` (and `/= %= //= **= &= ^= <<=
+  >>=`) went straight to `__or__`, so `__ior__` ... were never called (the
+  aug-assign now emits the binary op with arg 1, which tries `__i<op>__`
+  first); the VM's constructor lookup (`find_ctor`) and `dir()` did not look
+  in a builtin base's mirror; `str.upper(MyStr("q"))` (a type's method on a
+  subclass instance) was "descriptor 'upper' ... doesn't apply";
+  `"%s %s" % TupleSub(...)` / `"%(k)s" % DictSub(...)` use the value's items
+  / keys; `T.__new__(S)` for another builtin S is "int.__new__(str): str is
+  not a subtype of int"; a builtin subclass instance made by
+  `object.__new__` is a TypeError at its first use ("holds no int value"),
+  not an endless recursion; a class with an `__iter__` of its own (Flag's,
+  a list subclass's) is given to builtins as itself, so `list(flag)`,
+  `sorted(x)`, `map(f, x)` iterate through it (`iterOverridden` /
+  `iter_overridden`); `f(**DictSub(...))` (the interpreter dropped it
+  silently, the VM raised) and any mapping object (keys() and []) for `**`;
+  `{**d}` takes a dict subclass's own items, not its `__getitem__`'s, as
+  CPython's dict_merge; `for a, b in` over object items unpacks them by
+  iterating (interpreter; it bound only `a`); a sequence pattern matches a
+  tuple (`case (a, b):` never matched a tuple, on either engine - the test
+  was `isinstance(x, list)`).
 
 ### Files and time, found under Wine (vm_audit75-77)
 - **`open(newline=...)` is Python's** on both engines (the prelude's `open`
@@ -499,20 +630,22 @@ Nython over the class machinery above; each header says what is not there.
   is passed through byte for byte, as before.
 
 ### Not done / known differences
-- `__dict__` is a copy on both engines: `self.__dict__[k] = v` does not
-  set an attribute (use `object.__setattr__`).
+- `obj.__dict__` is live (above), but `type(vars(obj))` is the prelude's
+  `_NyInstanceDict` (a dict subclass), and `C.__dict__` is still a copy.
 - Coroutine objects are task handles (ints): `type(co())` is int, not
   coroutine; awaiting and asyncio work.
-- `__getattribute__` is not dispatched.
 - `type(None)`, functions, builtins and generators have no type object yet
   (their legacy name strings stand in); `types.FunctionType` and friends are
   those names.
 - Frames have no locals (`inspect.currentframe()` is None); weak references
-  are to instances only; classes deriving from int/str hold no value.
-- A metaclass's `__prepare__` is not called (the class body runs in the
-  engines' own namespace before the metaclass sees it), and `type.__new__`
-  called by a metaclass for a *different* name than the statement's makes a
-  new class rather than adopting it.
+  are to instances only. Classes deriving from `complex`, `range`,
+  `memoryview` ... (types with no mirror class) still hold no value; a dict
+  keyed by a payload instance gives the key back as the plain value.
+- A metaclass's `__prepare__` mapping sees the body's bindings, but the body
+  still runs in the engines' own namespace (reads do not go through the
+  mapping, `del` in the body does not reach it - see above), and
+  `type.__new__` called by a metaclass for a *different* name than the
+  statement's makes a new class rather than adopting it.
 - Video/audio builtins remain stubs (no codec library).
 
 ## 0o. Round 76 — the "Not done" lists closed
