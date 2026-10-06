@@ -350,6 +350,14 @@ node_ptr Parser::statement(){
         have(TokenType::NewLine);
         // Parse the decorated function or class
         node_ptr target = statement();
+        {
+            // a decorated function's co_firstlineno is its first decorator's
+            // line, as in CPython (round 77; stacked decorators wrap it in
+            // blocks [__decN__ = d, target, f = __decN__(f)])
+            node_ptr t = target;
+            while(t && t->type() == NodeType::BLOCK && t->statements().size() == 3) t = t->statements()[1];
+            if(t && t->type() == NodeType::FUNCTION) static_cast<FunctionNode*>(t.get())->first_line = dec_tok.line();
+        }
         std::string target_name;
         if(target->type() == NodeType::FUNCTION)
             target_name = static_cast<FunctionNode*>(target.get())->name;
@@ -2274,7 +2282,10 @@ node_ptr Parser::functionDecl(bool is_method){
     auto saved_defaults = std::move(param_defaults_);
     yield_seen_.push_back(false);
     ann_scope_.push_back('f');
+    std::string qualname = qualOf(name);
+    qual_stack_.push_back(qualname + ".<locals>");
     node_ptr body = blockOrStmt();
+    qual_stack_.pop_back();
     ann_scope_.pop_back();
     bool is_gen = yield_seen_.back();
     yield_seen_.pop_back();
@@ -2289,6 +2300,13 @@ node_ptr Parser::functionDecl(bool is_method){
     for(auto& p : params) fn->add(p);
     static_cast<FunctionNode*>(fn.get())->defaults = std::move(param_defaults_);
     static_cast<FunctionNode*>(fn.get())->posonly = posonly;
+    {
+        // __qualname__ and the async flags, for inspect (round 77)
+        auto* fnp = static_cast<FunctionNode*>(fn.get());
+        fnp->qualname = qualname;
+        fnp->is_async = is_async;
+        fnp->is_async_gen = is_async && is_gen;
+    }
     if(!fn_ann.empty()){
         // f.__annotations__: {"param": ann, ..., "return": ann}
         auto m = make_node<MapNode>(tok);
@@ -2476,8 +2494,14 @@ node_ptr Parser::classDecl(){
     have(TokenType::Colon); // consume : before block
     ann_scope_.push_back('c');
     class_ann_used_.push_back(false);
+    qual_stack_.push_back(qualOf(name));   // its methods are "C.m" (round 77)
     node_ptr body = blockOrStmt();
+    qual_stack_.pop_back();
     ann_scope_.pop_back();
+    // the docstring, before `var __annotations__ = {}` is put ahead of it
+    // (round 77: a class with annotations lost its __doc__)
+    std::string class_doc;
+    bool class_has_doc = docstringOf(body, class_doc);
     if(class_ann_used_.back() && body){
         // the class body starts with `var __annotations__ = {}`
         auto nb = make_node<BlockNode>(body->token());
@@ -2492,7 +2516,8 @@ node_ptr Parser::classDecl(){
     std::static_pointer_cast<ClassNode>(cls)->keywords = std::move(class_kw);
     {
         auto* cp = static_cast<ClassNode*>(cls.get());
-        cp->has_doc = docstringOf(body, cp->doc);
+        cp->has_doc = class_has_doc;
+        cp->doc = class_doc;
     }
     return cls;
 }
@@ -3429,6 +3454,7 @@ node_ptr Parser::lambdaExpr(){
     node_ptr body = expression();
     yield_seen_.pop_back();
     auto lam = make_node<LambdaNode>(tok, body);
+    static_cast<LambdaNode*>(lam.get())->qualname = qualOf("<lambda>");   // round 77
     for(auto& p : params) lam->add(p);
     static_cast<LambdaNode*>(lam.get())->defaults = std::move(param_defaults_);
     return lam;

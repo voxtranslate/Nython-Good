@@ -60,6 +60,12 @@ private:
     // Per function being parsed: whether its body yields (an `async def`
     // that yields is an async generator).
     std::vector<bool> yield_seen_;
+    // The scopes around the definition being parsed, for __qualname__
+    // (round 77): a class's name, or a function's qualname + ".<locals>".
+    std::vector<std::string> qual_stack_;
+    std::string qualOf(const std::string& name) const {
+        return qual_stack_.empty() ? name : qual_stack_.back() + "." + name;
+    }
     // The comprehension clause haveCompFor() just consumed was `async for`.
     bool comp_async_ = false;
     // Set when a statement was terminated by ';' rather than a newline.

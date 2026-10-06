@@ -466,6 +466,12 @@ struct VMCode {
     bool                     is_static     = false;
     bool                     is_classmethod= false;
     bool                     is_generator  = false;
+    // For inspect / __code__ / __qualname__ (round 77): the parser's
+    // qualified name, `async def` (its body is rewritten, so nothing else
+    // says), and the line of the def.
+    std::string              qualname;
+    bool                     is_async = false, is_async_gen = false;
+    int                      first_line = 0;
     std::shared_ptr<VMMap> closure_env;
     // Code of a module imported by name (round 77): the module's own scope,
     // where its top level (module_top) defines its names and its functions
@@ -1104,6 +1110,10 @@ private:
         case NT::LAMBDA: {
             auto lm=std::static_pointer_cast<nython::node::LambdaNode>(nd);
             push_code("<lambda>");
+            C().qualname=lm->qualname; C().first_line=l; C().file=lm->token().fileName();   // round 77
+            // a first parameter named self is bound as a def's is (round 77:
+            // it was dropped, so `(lambda self: self)(5)` was an arity error)
+            C().is_method=!lm->params.empty()&&lm->params[0]->value()=="self";
             renames_.emplace_back();
             for(auto& p:lm->params){
                 std::string pn=p->value(); if(pn=="self") continue;
@@ -1831,6 +1841,8 @@ private:
         int l=ln(fn);
         push_code(fn->name);
         C().doc=fn->doc; C().has_doc=fn->has_doc;
+        C().qualname=fn->qualname; C().is_async=fn->is_async; C().is_async_gen=fn->is_async_gen;   // round 77
+        C().first_line=fn->first_line?fn->first_line:l; C().file=fn->token().fileName();
         C().is_method=!fn->params.empty()&&fn->params[0]->value()=="self";
         int param_idx=0;
         for(int i=0;i<(int)fn->params.size();i++){
@@ -3068,7 +3080,7 @@ public:
             int old_depth=export_depth_; export_depth_=(int)call_stack_.size()+1;
             try{ exec_code(code,{},std::nullopt); } catch(VMReturn&){}
             export_to_globals_=old_exp; export_depth_=old_depth;
-            for(auto& sub:code->sub_codes) if(sub->is_class) class_reg_[sub->name]=sub;
+            for(auto& sub:code->sub_codes) if(sub->is_class&&!class_reg_.count(sub->name)) class_reg_[sub->name]=sub;   // keep the class MAKE_CLASS made (a copy for metaclass= / expression bases), round 77
         } catch(std::exception& e){ std::cerr<<"[VM] prelude failed to load: "<<e.what()<<"\n"; }
         for(auto& kv:globals_) base_global_names_.insert(kv.first);   // globals() leaves these out
         // open() as a native: the prelude's `def open` raises from its own
@@ -3392,12 +3404,14 @@ private:
             if(!star_seen && ai<pos.size()){ locs[pn]=pos[ai++]; have=true; }
             if(kw && kw->map && pi<code.posonly){
                 // never bound by keyword: the keyword goes to **kwargs, or is an error
-                if(kw->map->count(pn)) posonly_kw += (posonly_kw.empty() ? "" : ", ") + pn;
+                if(kw->map->count(nypy::key_of_str(pn))) posonly_kw += (posonly_kw.empty() ? "" : ", ") + pn;
             } else if(kw && kw->map){
-                auto it=kw->map->find(pn);
+                // the keywords are dict keys: a dunder name is a typed key
+                // (round 77: f(__x__=1) never reached parameter __x__)
+                auto it=kw->map->find(nypy::key_of_str(pn));
                 if(it!=kw->map->end()){
                     if(have && err.empty()) err=code.name+"() got multiple values for argument '"+pn+"'";
-                    locs[pn]=it->second; used_kw.insert(pn); have=true;
+                    locs[pn]=it->second; used_kw.insert(it->first); have=true;
                 }
             }
             if(!have){
@@ -3420,7 +3434,7 @@ private:
             else if(!posonly_kw.empty())
                 err=code.name+"() got some positional-only arguments passed as keyword arguments: '"+posonly_kw+"'";
             else if(!extra.map->empty() && err.empty())
-                err=code.name+"() got an unexpected keyword argument '"+extra.map->begin()->first+"'";
+                err=code.name+"() got an unexpected keyword argument '"+nypy::key_payload(extra.map->begin()->first)+"'";
         } else if(has_varkw) locs[kw_name]=VMVal::make_map();
         return err;
     }
@@ -4359,6 +4373,65 @@ private:
     static bool is_module_ns(const VMVal& v) {
         return v.type==VMType::MAP&&v.map&&!v.class_name.empty()&&v.class_name!="__kwargs__";
     }
+    // _ny_fn_info(f) (round 77): [name, qualname, module, params, flags,
+    // file, line] - params [name, kind, has_default, default] with inspect's
+    // kinds (0 positional-only .. 4 **kwargs), flags 1 generator, 2
+    // coroutine, 4 async generator, 8 lambda - as the interpreter's
+    // NythonExecutor::fnInfo. A bound method answers for its function; the
+    // `self` this engine keeps out of param_names is put back.
+    VMVal fn_info(VMVal f) {
+        if(f.type==VMType::MAP&&f.class_name=="__bound_method__"&&f.map){
+            auto it=f.map->find("__fn__");
+            if(it==f.map->end()) return VMVal::make_none();
+            VMVal fn=it->second; f=fn;
+        }
+        if(f.type!=VMType::FUNCTION||!f.code) return VMVal::make_none();
+        const VMCode& c=*f.code;
+        const std::vector<VMVal>& dflts=f.list?*f.list:c.param_defaults;
+        auto S=[](const std::string& s){ return VMVal::make_str(s); };
+        std::vector<VMVal> ps;
+        if(c.is_method) ps.push_back(VMVal::make_list({S("self"),VMVal::make_int(c.posonly>0?0:1),VMVal::make_bool(false),VMVal::make_none()}));
+        bool star=false;
+        for(size_t i=0;i<c.param_names.size();i++){
+            std::string pn=c.param_names[i];
+            int kind=1;
+            if(pn=="*"){ star=true; continue; }
+            if(pn.size()>1&&pn[0]=='*'&&pn[1]=='*'){ kind=4; pn=pn.substr(2); }
+            else if(pn.size()>1&&pn[0]=='*'){ kind=2; pn=pn.substr(1); star=true; }
+            else if(star) kind=3;
+            else if(i<c.posonly) kind=0;
+            bool has=kind!=2&&kind!=4&&i<dflts.size()&&!dflts[i].is_missing();
+            ps.push_back(VMVal::make_list({S(pn),VMVal::make_int(kind),VMVal::make_bool(has),has?dflts[i]:VMVal::make_none()}));
+        }
+        std::string mod="__main__";
+        if(c.module_env){ auto it=c.module_env->find("__name__"); if(it!=c.module_env->end()&&it->second.type==VMType::STRING) mod=it->second.s; }
+        int flags=c.name=="<lambda>"?8:0;
+        if(c.is_async) flags|=c.is_async_gen?4:2;
+        else if(c.has_yield()) flags|=1;
+        return VMVal::make_list({S(c.name),S(c.qualname.empty()?c.name:c.qualname),S(mod),VMVal::make_list(std::move(ps)),
+                                 VMVal::make_int(flags),S(c.file),VMVal::make_int(c.first_line)});
+    }
+    // _ny_fn_globals(f) (round 77): f.__globals__, the names of the module f
+    // was defined in (a copy, as globals() is here).
+    VMVal fn_globals(VMVal f) {
+        if(f.type==VMType::MAP&&f.class_name=="__bound_method__"&&f.map){
+            auto it=f.map->find("__fn__");
+            if(it!=f.map->end()){ VMVal fn=it->second; f=fn; }
+        }
+        if(f.type!=VMType::FUNCTION||!f.code) return VMVal::make_none();
+        VMVal d=VMVal::make_map();
+        if(f.code->module_env){
+            for(auto& kv:*f.code->module_env) if(!reflect_hidden(kv.first)) (*d.map)[kv.first]=kv.second;
+            return d;
+        }
+        for(auto& kv:globals_){
+            if(reflect_hidden(kv.first)||base_global_names_.count(kv.first)) continue;
+            (*d.map)[kv.first]=kv.second;
+        }
+        CallFrame* mf=in_other_thread()?module_frame_:(call_stack_.empty()?nullptr:&call_stack_.front());
+        if(mf) for(auto& kv:mf->locals) if(!reflect_hidden(kv.first)) (*d.map)[kv.first]=kv.second;
+        return d;
+    }
     VMVal vm_vars(std::vector<VMVal>& a) {
         if(a.empty()) return vm_locals_map();
         const VMVal& o=a[0];
@@ -4712,16 +4785,34 @@ private:
     }
     // The bases given by expressions (placeholders "\x06<i>"): a class, a
     // builtin type, or an object whose __mro_entries__ (PEP 560) names them.
-    void resolve_expr_bases(VMCode& sub, const VMVal& vals) {
+    // Returns the bases as written (the class's __orig_bases__, also what
+    // __mro_entries__ is given - round 77), none when no base was an
+    // expression.
+    VMVal resolve_expr_bases(VMCode& sub, const VMVal& vals) {
         std::vector<std::string> nb;
+        std::vector<VMVal> orig;
+        bool any=false;
         for(auto& b:sub.bases){
+            if(!b.empty()&&b[0]=='\x06'){
+                size_t i=(size_t)std::stoul(b.substr(1));
+                orig.push_back((vals.type==VMType::LIST&&vals.list&&i<vals.list->size())?(*vals.list)[i]:VMVal::make_none());
+                any=true;
+                continue;
+            }
+            VMVal bv=b.find('.')==std::string::npos?load_var(b):VMVal::make_none();
+            if(bv.type!=VMType::CLASS&&bv.type!=VMType::NATIVE) bv=class_value(b);
+            orig.push_back(bv);
+        }
+        if(!any) return VMVal::make_none();
+        VMVal orig_t=VMVal::make_tuple(orig);
+        size_t oi=0;
+        for(auto& b:sub.bases){
+            VMVal v=orig[oi++];
             if(b.empty()||b[0]!='\x06'){ nb.push_back(b); continue; }
-            size_t i=(size_t)std::stoul(b.substr(1));
-            VMVal v=(vals.type==VMType::LIST&&vals.list&&i<vals.list->size())?(*vals.list)[i]:VMVal::make_none();
             std::vector<VMVal> entries{v};
             VMVal me;
             if(v.type==VMType::INSTANCE&&class_lookup(v.class_name,"__mro_entries__",me)){
-                std::vector<VMVal> a{VMVal::make_tuple({})};
+                std::vector<VMVal> a{orig_t};
                 entries=iter_items(invoke_method(me, v, a, v.class_name));
             }
             for(auto& e:entries){
@@ -4733,6 +4824,7 @@ private:
             }
         }
         sub.bases=nb;
+        return orig_t;
     }
     // C[x]: __class_getitem__ (PEP 560, an implicit classmethod) and the
     // builtin generics list[int], dict[str, int], ... (_NyGenericAlias).
@@ -5360,7 +5452,7 @@ private:
                     // code keeps its placeholders for the next run
                     if(extras) sub=std::make_shared<VMCode>(*sub);
                 }
-                if(extras) resolve_expr_bases(*sub, ex_bases);
+                VMVal orig_bases=extras?resolve_expr_bases(*sub, ex_bases):VMVal::make_none();
                 // Bases are looked up in scope (NythonExecutor::evalClassDecl)
                 for(auto& b:sub->bases){
                     // A module's own base is already "module.Class" (the
@@ -5385,6 +5477,7 @@ private:
                 has_del_cache_.clear();
                 no_new_.clear();
                 class_vars_[sub->name]=run_class_body(sub, fr);
+                if(orig_bases.type!=VMType::NONE) class_vars_[sub->name]["__orig_bases__"]=orig_bases;   // round 77
                 if(is_exception_class(sub->name)) vm_exc_classes().insert(sub->name);
                 else vm_exc_classes().erase(sub->name);
                 {
@@ -6768,7 +6861,10 @@ private:
         if(l.type==VMType::MAP)  return l.map.get()==r.map.get();
         // Functions compare by identity, not by structural equality: two
         // distinct functions are not "the same function".
-        if(l.type==VMType::FUNCTION) return l.code.get()==r.code.get();
+        // A function value is its code with its closure and defaults (round
+        // 77: two closures of one def were `is`-identical - inspect.unwrap
+        // saw a wrapper loop in two functools.wraps wrappers)
+        if(l.type==VMType::FUNCTION) return l.code.get()==r.code.get()&&l.closure_env.get()==r.closure_env.get()&&l.list.get()==r.list.get();
         // builtins: the same one (int is int, len is len)
         if(l.type==VMType::NATIVE)   return l==r;
         return l==r;
@@ -6803,7 +6899,7 @@ private:
             if(attr=="__self__"){ auto sit=obj.map->find("__self__"); out=sit!=obj.map->end()?sit->second:VMVal::make_none(); return true; }
             if(fit==obj.map->end()) return false;
             if(attr=="__func__"){ out=fit->second; return true; }
-            return lookup_attr(fit->second, attr=="__qualname__"?std::string("__name__"):attr, out, bind);
+            return lookup_attr(fit->second, attr, out, bind);
         }
         // Instance / map fields — check for property descriptors
         if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map){
@@ -6841,7 +6937,7 @@ private:
             }
             if(attr=="__dict__"){
                 VMVal d=VMVal::make_map();
-                if(obj.map) for(auto& kv:*obj.map) (*d.map)[kv.first]=kv.second;
+                if(obj.map) for(auto& kv:*obj.map) (*d.map)[nypy::key_of_str(kv.first)]=kv.second;   // a dunder name is a typed key (round 77)
                 out=d; return true;
             }
             VMVal ga;
@@ -6868,6 +6964,15 @@ private:
             }
             if(attr=="__name__"){ out=VMVal::make_str(obj.code?obj.code->name:""); return true; }
             if(attr=="__doc__"){ out=obj.code&&obj.code->has_doc?VMVal::make_str(obj.code->doc):VMVal::make_none(); return true; }
+            // __defaults__, __kwdefaults__, __code__, __qualname__, __module__,
+            // __globals__ (round 77): the prelude's _ny_fn_attr makes them from
+            // _ny_fn_info (fn_info), as on the interpreter.
+            if(obj.code&&(attr=="__defaults__"||attr=="__kwdefaults__"||attr=="__code__"||attr=="__qualname__"
+                          ||attr=="__module__"||attr=="__globals__")){
+                std::vector<VMVal> a{obj, VMVal::make_str(attr)};
+                out=vm_call(load_var("_ny_fn_attr"), a, std::nullopt, nullptr);
+                return true;
+            }
             // no annotations: an empty dict, made on first read and kept
             if(attr=="__annotations__"&&obj.code){ out=VMVal::make_map(); func_attrs_[func_key(obj)][attr]=out; return true; }
             return false;
@@ -8203,7 +8308,7 @@ private:
         catch(VMReturn&){}
         catch(...){ module_ns_.erase(name); globals_.erase("__imported_"+name); throw; }
         for(auto& kv:*env) (*nsmap)[kv.first]=kv.second;
-        for(auto& sub:code->sub_codes) if(sub->is_class) class_reg_[sub->name]=sub;
+        for(auto& sub:code->sub_codes) if(sub->is_class&&!class_reg_.count(sub->name)) class_reg_[sub->name]=sub;   // keep the class MAKE_CLASS made (a copy for metaclass= / expression bases), round 77
         return nsv;
     }
     void vm_import(const std::string& raw_name_in) {
@@ -8490,7 +8595,7 @@ private:
                     set_attr(same, alias, same);
                     module_ns_[name]=same;
                     globals_[alias]=same;
-                    for(auto& sub:code->sub_codes) if(sub->is_class) class_reg_[sub->name]=sub;
+                    for(auto& sub:code->sub_codes) if(sub->is_class&&!class_reg_.count(sub->name)) class_reg_[sub->name]=sub;   // keep the class MAKE_CLASS made (a copy for metaclass= / expression bases), round 77
                     return;
                 }
             }
@@ -8913,6 +9018,9 @@ private:
                 if(it!=subclasses_.end()) for(auto& n:it->second){ VMVal cv=class_value(n); if(cv.type==VMType::CLASS) r.push_back(cv); }
             }
             return VMVal::make_list(std::move(r)); });
+        // a function's parameters, flags and place (inspect; round 77)
+        globals_["_ny_fn_info"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return fn_info(a.empty()?VMVal::make_none():a[0]); });
+        globals_["_ny_fn_globals"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return fn_globals(a.empty()?VMVal::make_none():a[0]); });
         globals_["_ny_setattr_raw"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()>=3){ RawAttr raw; VMVal o=a[0]; set_attr(o,a[1].to_string(),a[2]); }
             return VMVal::make_none(); });
@@ -10347,6 +10455,15 @@ private:
                 }
                 return VMVal::make_bool(false);
             }
+            // an object whose class defines __instancecheck__ (typing's
+            // List, Union[int, str] ...), as CPython asks type(cls) - round 77
+            if(a[1].type==VMType::INSTANCE){
+                VMVal ic;
+                if(class_lookup(a[1].class_name,"__instancecheck__",ic)){
+                    std::vector<VMVal> one{a[0]};
+                    return VMVal::make_bool(vm_truthy(invoke_method(ic, a[1], one, a[1].class_name)));
+                }
+            }
             if(a[1].type==VMType::LIST&&a[1].list){
                 // isinstance(x, (A, B)): any of them.
                 for(auto& c:*a[1].list){
@@ -10403,6 +10520,14 @@ private:
             if(a.size()>=2&&a[1].type==VMType::CLASS&&!class_meta_.empty()){
                 VMVal r;
                 if(meta_call(a[1],"__subclasscheck__",{a[0]},r)) return VMVal::make_bool(vm_truthy(r));
+            }
+            // an object whose class defines __subclasscheck__ (round 77)
+            if(a.size()>=2&&a[1].type==VMType::INSTANCE){
+                VMVal sc;
+                if(class_lookup(a[1].class_name,"__subclasscheck__",sc)){
+                    std::vector<VMVal> one{a[0]};
+                    return VMVal::make_bool(vm_truthy(invoke_method(sc, a[1], one, a[1].class_name)));
+                }
             }
             // a builtin type (int, bool ...) is a tagged native
             auto builtin_name=[](const VMVal& v)->std::string{
@@ -10627,7 +10752,8 @@ private:
                 case VMType::LIST:      raw=(uintptr_t)v.list.get(); break;
                 case VMType::MAP:
                 case VMType::INSTANCE:  raw=(uintptr_t)v.map.get();  break;
-                case VMType::FUNCTION:
+                case VMType::FUNCTION:  // its closure and defaults too, as `is` (round 77)
+                    raw=(uintptr_t)v.code.get()^((uintptr_t)v.closure_env.get()*31)^((uintptr_t)v.list.get()*17); break;
                 case VMType::CLASS:     raw=(uintptr_t)v.code.get(); break;
                 case VMType::ITERATOR:  raw=(uintptr_t)v.iter.get(); break;
                 case VMType::GENERATOR: raw=(uintptr_t)v.gen.get();  break;
