@@ -108,6 +108,16 @@ inline std::string shown_class_name(const std::string& n) {
     return n.substr(0, h);
 }
 
+// The parser's decorator temporaries (`__decN__ = D` before a decorated def,
+// src/Parser.cpp): a class body binds them, but they are no part of the
+// class's namespace - C.__dict__ and the namespace a metaclass gets leave
+// them out, on both engines (round 77).
+inline bool is_decorator_temp(const std::string& n) {
+    if (n.size() < 8 || n.compare(0, 5, "__dec") != 0 || n.compare(n.size() - 2, 2, "__") != 0) return false;
+    for (size_t i = 5; i + 2 < n.size(); i++) if (n[i] < '0' || n[i] > '9') return false;
+    return true;
+}
+
 // issubclass over the builtin types (round 77): a type derives from itself
 // and from object, bool from int.
 inline bool builtin_type_derives(const std::string& sub, const std::string& sup) {

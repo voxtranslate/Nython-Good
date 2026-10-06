@@ -27,6 +27,10 @@
 #     d[Fraction(1, 2)] does not find a key stored as 0.5.
 #   - Decimal does not exist yet: from_decimal takes any object with
 #     as_integer_ratio().
+#   - Fraction is a numbers.Rational by registration (round 77), not by
+#     deriving from it as in CPython: isinstance(Fraction(1, 3),
+#     numbers.Rational) holds, but Rational is not in Fraction.__mro__
+#     and making a Fraction does not go through ABCMeta.
 import math
 
 __all__ = ["Fraction"]
@@ -800,3 +804,9 @@ class Fraction:
 
     def __deepcopy__(self, memo):
         return self
+
+
+# A numbers.Rational, as CPython's Fraction (which derives from it): a
+# virtual subclass here (round 77).
+import numbers as _numbers
+_numbers.Rational.register(Fraction)

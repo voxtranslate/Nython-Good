@@ -466,6 +466,11 @@ class object:
         # the end of every super().__init_subclass__(**kw) chain
         if len(kw) > 0:
             raise TypeError(cls.__name__ + ".__init_subclass__() takes no keyword arguments")
+    @classmethod
+    def __subclasshook__(cls, subclass):
+        # Abstract classes can override this to customize issubclass()
+        # (lib/abc.ny asks it first); object's declines (round 77)
+        return NotImplemented
     # the root of the class tree (round 77; `object` was undefined):
     # object(), class C(object), object.__init__(self) in a super() chain,
     # and the plain attribute store a __setattr__ hands on to
