@@ -192,9 +192,12 @@ struct InterpEngine : nyconc::Engine {
         int depth = 0;
         NythonExecutor::FlowState flow;
         nython::node::node_ptr last;
+        nython::node::Node* cur = nullptr;                       // round 77: cur_stmt()
         decltype(NythonExecutor::handling_exc_) handling;
+        decltype(NythonExecutor::handling_obj_) handling_obj;   // round 77: with handling
         decltype(NythonExecutor::owner_stack_) owners;
         decltype(NythonExecutor::TraceState::fn_stack) trace;
+        NythonExecutor::PyFrames frames;                         // round 77: its frames
         nygen::Gen* gen = nullptr;
     };
     void* state_new() override { return new State(); }
@@ -206,9 +209,12 @@ struct InterpEngine : nyconc::Engine {
         std::swap(NythonExecutor::call_depth_, st->depth);
         std::swap(NythonExecutor::flow(), st->flow);
         std::swap(NythonExecutor::last_stmt(), st->last);
+        std::swap(NythonExecutor::cur_stmt(), st->cur);
         std::swap(E.handling_exc_, st->handling);
+        std::swap(E.handling_obj_, st->handling_obj);
         std::swap(E.owner_stack_, st->owners);
         std::swap(NythonExecutor::tracer().fn_stack, st->trace);
+        std::swap(NythonExecutor::py_frames(), st->frames);
         std::swap(nygen::running(), st->gen);
     }
 };

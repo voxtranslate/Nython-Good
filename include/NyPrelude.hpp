@@ -830,6 +830,208 @@ def anext(it, *default):
         if len(default) > 0:
             return default[0]
         raise
+
+# ── frames and tracebacks (round 77) ─────────────────────────────────────
+# e.__traceback__ is a chain of _NyTraceback the engines make as the
+# exception passes each frame (tb_next, tb_lineno, and the frame's file,
+# function and module in _ny_loc, "\x1f"-separated); tb_frame is made from
+# those when it is first read. A frame - sys._getframe(), a
+# traceback's tb_frame - has f_code (co_filename, co_name), f_lineno,
+# f_back and f_globals (its module's __name__ and __file__, in a dict of
+# its own rather than the module's namespace); f_locals is empty, and a
+# traceback's frames have no f_back.
+def _ny_hexid(o):
+    return "0x" + format(id(o), "x")
+
+class _NyCodeInfo:
+    # a frame's f_code
+    def __init__(self, filename, name):
+        self.co_filename = filename
+        self.co_name = name
+        self.co_qualname = name
+        self.co_firstlineno = 0
+
+    def __repr__(self):
+        return "<code object " + self.co_name + " at " + _ny_hexid(self) + ", file \"" + self.co_filename + "\", line " + str(self.co_firstlineno) + ">"
+
+class _NyFrame:
+    def __init__(self, filename, lineno, name, module="__main__", back=None):
+        self.f_code = _NyCodeInfo(filename, name)
+        self.f_lineno = lineno
+        self.f_lasti = -1
+        self.f_back = back
+        self.f_globals = {"__name__": module, "__file__": filename}
+        self.f_locals = {}
+        self.f_builtins = {}
+        self.f_trace = None
+        self.f_trace_lines = True
+        self.f_trace_opcodes = False
+
+    def clear(self):
+        return None
+
+    def __repr__(self):
+        return "<frame at " + _ny_hexid(self) + ", file '" + self.f_code.co_filename + "', line " + str(self.f_lineno) + ", code " + self.f_code.co_name + ">"
+
+class _NyTraceback:
+    # Made by the engines without calling this (fields set directly);
+    # types.TracebackType(tb_next, tb_frame, tb_lasti, tb_lineno) calls it.
+    tb_lasti = -1
+    _ny_frame = None
+
+    def __init__(self, tb_next=None, tb_frame=None, tb_lasti=-1, tb_lineno=0):
+        self.tb_next = tb_next
+        self.tb_lasti = tb_lasti
+        self.tb_lineno = tb_lineno
+        self._ny_frame = tb_frame
+        self._ny_loc = "<unknown>\x1f<module>\x1f__main__"
+
+    @property
+    def tb_frame(self):
+        if self._ny_frame is None:
+            var loc = self._ny_loc.split("\x1f")
+            self._ny_frame = _NyFrame(loc[0], self.tb_lineno, loc[1], loc[2])
+        return self._ny_frame
+
+    def __repr__(self):
+        return "<traceback object at " + _ny_hexid(self) + ">"
+
+# Every exception has these, as in Python (the engines set them on the
+# object when it is raised and caught).
+BaseException.__traceback__ = None
+BaseException.__cause__ = None
+BaseException.__context__ = None
+BaseException.__suppress_context__ = False
+
+def _ny_exc_with_traceback(self, tb):
+    self.__traceback__ = tb
+    return self
+BaseException.with_traceback = _ny_exc_with_traceback
+
+def _ny_exc_add_note(self, note):
+    if not isinstance(note, str):
+        raise TypeError("note must be a str, not '" + type(note).__name__ + "'")
+    var notes = getattr(self, "__notes__", None)
+    if notes is None:
+        notes = []
+        self.__notes__ = notes
+    notes.append(note)
+BaseException.add_note = _ny_exc_add_note
+
+def _ny_exc_info():
+    # sys.exc_info()
+    var e = _ny_exc_current()
+    if e is None:
+        return (None, None, None)
+    return (type(e), e, getattr(e, "__traceback__", None))
+
+def _ny_getframe(depth=0):
+    # sys._getframe(depth): the caller's frame (depth 0), linked by f_back
+    var st = _ny_stack()
+    if depth < 0:
+        depth = 0
+    if depth >= len(st):
+        raise ValueError("call stack is not deep enough")
+    var fr = None
+    var i = len(st) - 1
+    while i >= depth:
+        var s = st[i]
+        fr = _NyFrame(s[0], s[1], s[2], s[3], fr)
+        i -= 1
+    return fr
+
+# What the engines print for an uncaught exception before their own line
+# ("[Nython] Uncaught exception - Type: message"): Python's traceback - the
+# chained exceptions first - without that last line.
+def _ny_tb_lines(tb, cache):
+    # as traceback.StackSummary.format: a run of more than three identical
+    # entries (deep recursion) ends with "[Previous line repeated N more times]"
+    var out = ""
+    var last = None
+    var count = 0
+    while tb is not None:
+        var fr = tb.tb_frame
+        var fn = fr.f_code.co_filename
+        var key = (fn, tb.tb_lineno, fr.f_code.co_name)
+        if key != last:
+            if count > 3:
+                out += "  [Previous line repeated " + str(count - 3) + " more time" + ("s" if count - 3 > 1 else "") + "]\n"
+            last = key
+            count = 0
+        count += 1
+        if count <= 3:
+            out += "  File \"" + fn + "\", line " + str(tb.tb_lineno) + ", in " + fr.f_code.co_name + "\n"
+            if fn not in cache:
+                var lines = []
+                try:
+                    var f = open(fn)
+                    lines = f.readlines()
+                    f.close()
+                except BaseException:
+                    lines = []
+                cache[fn] = lines
+            var src = cache[fn]
+            if tb.tb_lineno >= 1 and tb.tb_lineno <= len(src):
+                var line = src[tb.tb_lineno - 1].strip()
+                if line != "":
+                    out += "    " + line + "\n"
+        tb = tb.tb_next
+    if count > 3:
+        out += "  [Previous line repeated " + str(count - 3) + " more time" + ("s" if count - 3 > 1 else "") + "]\n"
+    return out
+
+def _ny_exc_line(e):
+    var t = type(e)
+    var name = getattr(t, "__name__", "Exception")
+    var mod = getattr(t, "__module__", "builtins")
+    if mod is not None and mod != "builtins" and mod != "__main__":
+        name = mod + "." + name
+    var msg = ""
+    try:
+        msg = str(e)
+    except BaseException:
+        msg = "<exception str() failed>"
+    if msg == "":
+        return name + "\n"
+    return name + ": " + msg + "\n"
+
+def _ny_format_exc(e, last_line, seen, cache):
+    seen.append(id(e))
+    var out = ""
+    var cause = getattr(e, "__cause__", None)
+    var ctx = getattr(e, "__context__", None)
+    if cause is not None and id(cause) not in seen:
+        out += _ny_format_exc(cause, True, seen, cache) + "\nThe above exception was the direct cause of the following exception:\n\n"
+    elif ctx is not None and not getattr(e, "__suppress_context__", False) and id(ctx) not in seen:
+        out += _ny_format_exc(ctx, True, seen, cache) + "\nDuring handling of the above exception, another exception occurred:\n\n"
+    var tb = getattr(e, "__traceback__", None)
+    if tb is not None:
+        out += "Traceback (most recent call last):\n" + _ny_tb_lines(tb, cache)
+    if last_line:
+        out += _ny_exc_line(e)
+    return out
+
+def _ny_format_uncaught(e):
+    try:
+        return _ny_format_exc(e, False, [], {})
+    except BaseException:
+        return ""
+
+# atexit (round 77, lib/atexit.ny): the engines call _ny_run_atexit when
+# the program ends - normally, by sys.exit() or by an uncaught exception.
+_ny_atexit_handlers = []
+
+def _ny_run_atexit():
+    # last registered first; one that raises is reported (SystemExit is
+    # not) and the rest still run
+    while len(_ny_atexit_handlers) > 0:
+        var h = _ny_atexit_handlers.pop()
+        try:
+            h[0](*h[1], **h[2])
+        except SystemExit:
+            pass
+        except BaseException as e:
+            _ny_stderr.write("Exception ignored in atexit callback: " + repr(h[0]) + "\n" + _ny_format_exc(e, True, [], {}))
 )NYPRELUDE";
 }
 

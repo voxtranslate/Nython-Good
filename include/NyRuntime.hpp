@@ -90,6 +90,10 @@ inline int system_exit_status(const std::string& msg) {
     return 1;
 }
 
+// -W options, in order (round 77): sys.warnoptions, which lib/warnings.ny
+// processes when it is imported, as Python does.
+inline std::vector<std::string>& warn_options() { static std::vector<std::string> v; return v; }
+
 inline void set_command_line(const std::string& script, int argc, char** args, int first_arg) {
     script_path() = script;
     argv().clear();

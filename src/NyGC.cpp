@@ -27,6 +27,7 @@ namespace nygc {
 
 std::atomic<bool> g_pending{false};
 void (*g_weak_hook)(Collectable*) = nullptr;
+void (*g_weak_cb_hook)() = nullptr;
 KeyTable g_keys;
 bool g_key_edges = false;
 
@@ -355,6 +356,7 @@ void safe_point_slow() {
         }
         decref(c);
     }
+    if (g_weak_cb_hook) g_weak_cb_hook();   // weakref callbacks (round 77)
     if (enabled) collect_due();
     in_safe_point = false;
     if (!final_queue.empty()) g_pending.store(true, std::memory_order_relaxed);

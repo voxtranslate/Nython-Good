@@ -588,11 +588,14 @@ Value dispatch_core(NythonExecutor& E,
         // The exception an except clause is handling now, here or in a
         // caller (sys.exc_info()[1]); none outside every except clause.
         if (name == "_ny_exc_current") {
-            if (E.handling_exc_.empty()) return NONE_VALUE;
+            if (E.handling_exc_.empty() || E.handling_obj_.empty()) return NONE_VALUE;
             const Value& held = E.handling_obj_.back().second;
             if (held.type != ValueType::NONE) return held;
             return E.exceptionObject(E.handling_exc_.back());
         }
+        // The running frames, innermost first: (filename, lineno, function,
+        // module) - sys._getframe, traceback.extract_stack, warnings (round 77).
+        if (name == "_ny_stack") return E.pyStackValue();
         if (name == "vars") return E.reflectVars(args, ctx);
         if (name == "dir") return E.reflectDir(args, ctx);
         if (name == "issubclass" || name == "property" || name == "staticmethod" || name == "classmethod" || name == "iter" || name == "help" || name == "slice" || name == "complex") {

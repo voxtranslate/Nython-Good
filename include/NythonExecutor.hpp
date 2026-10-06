@@ -538,7 +538,7 @@ public:   // NythonExecutor is a struct: members default to public
             "chr","ord","repr","format","open","exit","quit",
             "pow","divmod","input","dict","display","show","is_int","is_float","is_string","is_list","is_none","is_bool","to_int","to_float","to_str","clamp","lerp","map_range","repeat_str","repeat","flatten","flat","shell","system","ls","cat","pwd","mkdir","write","exists","env","all","any","complex","slice","super","property",
             "staticmethod","classmethod","callable","dir","vars","globals","locals","eval","exec","compile","_ny_setattr_raw","_ny_delattr_raw","_ny_object_new","_ny_subclasses","_ny_type_new","_ny_type_call",
-            "_ny_main_globals","_ny_exc_current",
+            "_ny_main_globals","_ny_exc_current","_ny_stack",
             "iter","next","help","Set","Counter","OrderedDict","deque","defaultdict","assert",
             "islice","take",   // lazy iteration (src/NyGen.cpp), both engines
             "sqrt","sin","cos","tan","log","floor","ceil",
@@ -767,6 +767,11 @@ public:   // NythonExecutor is a struct: members default to public
         try {
             return evalNode(ast, global_ctx);
         } catch (std::string& flow) {
+            // round 77: the uncaught exception's object, with its traceback,
+            // for the report (main.cpp: uncaughtTracebackText)
+            if (flow != "break" && flow != "continue") {
+                try { uncaught_obj_ = uncaughtException(flow); } catch (...) {}
+            }
             // An uncaught raised instance travels as "__exc__:C:__obj__:<ptr>";
             // resolve it to "__exc__:C:message" while the instance still
             // exists, so the top level reports the message, not a pointer.
@@ -4217,7 +4222,7 @@ public:   // NythonExecutor is a struct: members default to public
             Context* fn_ctx = new Context(runner, "<lambda>", nullptr, nullptr, closure_parent);
             CtxReaper _reap_fn_ctx2033(this, fn_ctx);
             bindLambdaParams(lam, call_args, kw ? *kw : no_kw, fn_ctx, closure_parent, fn_val.value.p);
-            return evalNode(lam->body, fn_ctx);
+            return runLambdaBody(lam, fn_ctx);
         }
         return NONE_VALUE;
     }
@@ -6140,6 +6145,7 @@ public:
         // statements, not inside the destructor that dropped them.
         if (__builtin_expect(nygen::t_pending, 0)) nygen::run_pending(*this);
         last_stmt() = st;
+        cur_stmt() = st.get();   // round 77: frames
         if (trace_on()) traceStatement(st, ctx);
     }
 
@@ -6424,7 +6430,7 @@ public:
                                         Context* fc = new Context(runner, "<lambda>", nullptr, nullptr, cp);
                                         CtxReaper _reap_fc3618(this, fc);
                                         bindLambdaParams(lam, args, kw_args, fc, cp, attr_val.value.p);
-                                        return evalNode(lam->body, fc);
+                                        return runLambdaBody(lam, fc);
                                     } else if (raw->type() == NodeType::FUNCTION) {
                                         auto fn = static_cast<FunctionNode*>(raw);
                                         Context* cp = ctx;
@@ -6534,14 +6540,11 @@ public:
                         }
                         // Class value accessed via attribute (e.g. Outer.Inner()) -> instantiate
                         if (fn_it->second.find("__class__:") == 0) {
-                            // Re-invoke evalCall with this as the callee directly
-                            // Build a synthetic call: reuse current evalCall non-ATTRIBUTE path
-                            std::string class_fname = fn_it->second;
-                            std::string className = class_fname.substr(10);
-                            Value instance = newInstance(className, callee_val.value.p);
-                            if (isExceptionClass(className)) setExceptionArgs(instance, args);
-                            runConstructor(instance, args, kw_args, ctx);
-                            return instance;
+                            // as any class call: a metaclass's __call__, the
+                            // class's __new__, then __init__ (round 77 - a
+                            // module's class called as mod.C(...) skipped
+                            // __new__ and the metaclass)
+                            return instantiateClass(callee_val, args, kw_args, ctx);
                         }
                     }
                 }            }
@@ -6688,7 +6691,7 @@ public:
                     Context* fn_ctx = new Context(runner, "<lambda>", nullptr, nullptr, closure_parent);
                     CtxReaper _reap_fn_ctx3854(this, fn_ctx);
                     bindLambdaParams(lam, args, kw_args, fn_ctx, closure_parent, callee.value.p);
-                    Value result = evalNode(lam->body, fn_ctx);
+                    Value result = runLambdaBody(lam, fn_ctx);
                     return result;
                 }
             }
@@ -8118,6 +8121,272 @@ public:
         return "__exc__:Exception:" + what;
     }
 
+    // ── Frames and tracebacks (round 77) ────────────────────────────────
+    // The frames running on this thread (or async task, or generator body -
+    // InterpEngine::State and NyGen keep them apart), innermost last: what
+    // _ny_stack() reports (sys._getframe, traceback.extract_stack,
+    // warnings' stacklevel) and what e.__traceback__ is made of. `code` is
+    // the FunctionNode / LambdaNode (nullptr: a module's top level),
+    // `call_site` the caller's statement when the frame began - so the
+    // caller's current line while it runs - and `ctx` its scope (whose
+    // __name__ is the frame's module). The main program's top level is the
+    // frame below them all; its line is the first frame's call_site.
+    struct PyFrame { Node* code; Node* call_site; Context* ctx; };
+    using PyFrames = std::vector<PyFrame>;
+    static PyFrames& py_frames() { static thread_local PyFrames v; return v; }
+    // The running frame's current statement: last_stmt() as a plain pointer,
+    // put back to the caller's when a frame ends (last_stmt() is not: an
+    // uncaught error reports the innermost statement).
+    static Node*& cur_stmt() { static thread_local Node* p = nullptr; return p; }
+    struct FrameGuard {
+        FrameGuard(Node* code, Context* ctx) { py_frames().push_back({code, cur_stmt(), ctx}); }
+        ~FrameGuard() { cur_stmt() = py_frames().back().call_site; py_frames().pop_back(); }
+    };
+    // An exception on its way out: the frames it has left so far, innermost
+    // first, recorded as it unwinds through each frame (tbUnwind) and made
+    // into e.__traceback__ where an except clause catches it (tbCaught) -
+    // CPython's PyTraceBack_Here, one entry per frame the exception passes.
+    // A record is the exception string's while that string keeps unwinding:
+    // `last` (the statement then) and `depth` (the frames then) tell it from
+    // a record of an exception native code caught and dropped (hasattr, a
+    // loop's StopIteration), which a new exception must not continue.
+    struct TbRec { std::string file; int64_t line; std::string name; std::string mod; };
+    struct TbPending {
+        std::string flow;
+        std::vector<TbRec> recs;
+        Node* line = nullptr;         // the current frame's line for it (where it entered the frame)
+        Node* last = nullptr;         // cur_stmt() as this left it
+        size_t depth = 0;             // py_frames().size() then
+        bool active = false;
+        bool reraise = false;         // a bare raise: that frame already heads its traceback
+    };
+    static TbPending& tb_pending() { static thread_local TbPending p; return p; }
+    // The prelude's frames are not shown (its source is named "stdin"), as
+    // CPython shows no frame for a builtin written in C.
+    static bool tbHiddenFile(const std::string& f) { return f == "stdin"; }
+    static std::string frameName(Node* code) {
+        if (!code) return "<module>";
+        if (code->type() == NodeType::FUNCTION) {
+            const std::string& n = static_cast<FunctionNode*>(code)->name;
+            return n.empty() ? std::string("<lambda>") : n;
+        }
+        return "<lambda>";
+    }
+    std::string frameModule(Context* c) {
+        Value v = c ? c->getByName("__name__") : UNDEFINED_VALUE;
+        return isStringValue(v) ? getStringValue(v) : std::string("__main__");
+    }
+    // A lambda runs no statement of its own: its line is the lambda's.
+    static Node* frameLine(const PyFrame& f, Node* cur) {
+        return f.code && f.code->type() == NodeType::LAMBDA ? f.code : cur;
+    }
+    void tbRecord(TbPending& P, Node* where, const PyFrame& fr) {
+        if (!where) return;
+        auto tk = where->token();
+        std::string file = tk.fileName();
+        if (tbHiddenFile(file)) return;
+        P.recs.push_back({std::move(file), (int64_t)tk.line(), frameName(fr.code), frameModule(fr.ctx)});
+    }
+    bool tbContinues(const TbPending& P, const std::string& flow) {
+        return P.active && P.depth == py_frames().size() && P.last == cur_stmt() && P.flow == flow;
+    }
+    // `flow` is leaving the innermost frame.
+    void tbUnwind(const std::string& flow) {
+        if (flow == "break" || flow == "continue") return;
+        auto& F = py_frames();
+        if (F.empty()) return;
+        auto& P = tb_pending();
+        bool skip = false;
+        Node* where = cur_stmt();
+        if (tbContinues(P, flow)) {
+            if (P.line) where = P.line;
+            if (P.reraise) { skip = true; P.reraise = false; }
+        } else {
+            P.flow = flow; P.recs.clear(); P.active = true; P.reraise = false;
+        }
+        const PyFrame& top = F.back();
+        if (!skip) tbRecord(P, frameLine(top, where), top);
+        P.depth = F.size() - 1;
+        P.line = P.last = top.call_site;   // the caller's line; cur_stmt() once this frame is gone
+    }
+    // `flow` has reached the running frame and code (a finally body, a
+    // handler) is about to run there: its line in this frame is the one
+    // running now, whatever that code runs.
+    void tbSee(const std::string& flow) {
+        if (flow == "break" || flow == "continue") return;
+        auto& P = tb_pending();
+        if (tbContinues(P, flow)) { if (!P.line) P.line = cur_stmt(); return; }
+        P.flow = flow; P.recs.clear(); P.active = true; P.reraise = false;
+        P.line = P.last = cur_stmt();
+        P.depth = py_frames().size();
+    }
+    // `flow` is raised again from the running frame as it is (a bare raise,
+    // a with statement whose __exit__ did not suppress it): that frame is
+    // already the head of its traceback.
+    void tbReraise(const std::string& flow) {
+        auto& P = tb_pending();
+        P.flow = flow; P.recs.clear(); P.active = true; P.reraise = true;
+        P.line = P.last = cur_stmt();
+        P.depth = py_frames().size();
+    }
+    Context* instanceProps(const Value& v) {
+        if (v.type != ValueType::USERDATA || !v.value.p) return nullptr;
+        auto it = instance_properties.find(v.value.p);
+        return it == instance_properties.end() ? nullptr : it->second;
+    }
+    // A traceback entry: a prelude _NyTraceback whose fields the engine sets
+    // - tb_next, tb_lineno and _ny_loc ("file\x1ffunction\x1fmodule"); its
+    // tb_frame is made from them when first read (the VM's tb_here is the same).
+    Node* tb_class_ = nullptr;
+    Value makeTbValue(const TbRec& r, const Value& next) {
+        if (!tb_class_) tb_class_ = classNodeByName("_NyTraceback");
+        if (!tb_class_) return next;
+        Value tb = newInstance("_NyTraceback", (void*)tb_class_);
+        Context* p = instanceProps(tb);
+        if (!p) return next;
+        p->defineByName("tb_next", next);
+        p->defineByName("tb_lineno", intValue(r.line));
+        p->defineByName("_ny_loc", makeStringValue(r.file + '\x1f' + r.name + '\x1f' + r.mod));
+        return tb;
+    }
+    // e.__context__ = c, as Python sets it when e is raised while c is
+    // being handled - without making a cycle (a link back to e is cut).
+    void setExcContext(const Value& inst, const Value& c) {
+        Context* ip = instanceProps(inst);
+        if (!ip || !isInstanceVal(c) || c.value.p == inst.value.p) return;
+        Value o = c;
+        for (int guard = 0; guard < 1000; guard++) {
+            Context* op = instanceProps(o);
+            if (!op) break;
+            Value nx = op->getByName("__context__");
+            if (!isInstanceVal(nx)) break;
+            if (nx.value.p == inst.value.p) { op->defineByName("__context__", NONE_VALUE); break; }
+            o = nx;
+        }
+        ip->defineByName("__context__", c);
+    }
+    // A runtime error (no object yet) leaving an except clause: the exception
+    // that clause handles becomes its __context__ when it is made.
+    std::string pending_ctx_flow_;
+    Value pending_ctx_;
+    void tbHandlerExit(const std::string& flow) {
+        if (flow == "break" || flow == "continue" || handling_obj_.empty() || handling_exc_.empty()) return;
+        if (flow == handling_exc_.back() || isInstanceVal(excInstanceOf(flow))) return;
+        pending_ctx_flow_ = flow;
+        pending_ctx_ = handling_obj_.back().second;
+    }
+    // An except clause (or a with statement's __exit__) receives `exc`: its
+    // object is made if it is a runtime error, the frames it unwound become
+    // its __traceback__ (ahead of what it had: a re-raised exception keeps
+    // its old frames, as in Python) and the string that now carries it is
+    // returned.
+    std::string tbCaught(const std::string& exc) {
+        auto& F = py_frames();
+        auto& P = tb_pending();
+        Node* where = cur_stmt();
+        bool skip = false;
+        if (tbContinues(P, exc)) { skip = P.reraise; if (P.line) where = P.line; }
+        else P.recs.clear();
+        if (!skip) {
+            PyFrame here{nullptr, nullptr, global_ctx};
+            if (!F.empty()) here = F.back();
+            tbRecord(P, frameLine(here, where), here);
+        }
+        P.active = false; P.reraise = false; P.line = nullptr;
+        std::vector<TbRec> recs;
+        recs.swap(P.recs);
+        Value inst = excInstanceOf(exc);
+        std::string out = exc;
+        bool fresh = false;
+        if (!isInstanceVal(inst)) {
+            Value obj = exceptionObject(exc);
+            if (!isInstanceVal(obj)) return exc;
+            inst = obj;
+            fresh = true;
+            out = rememberRaised(instanceClassName(obj), obj);
+        }
+        Context* props = instanceProps(inst);
+        if (!props) return out;
+        Value tb = props->getByName("__traceback__");
+        if (!isInstanceVal(tb)) tb = NONE_VALUE;
+        for (auto& r : recs) tb = makeTbValue(r, tb);
+        props->defineByName("__traceback__", tb);
+        if (fresh) {
+            if (!pending_ctx_flow_.empty() && pending_ctx_flow_ == exc) setExcContext(inst, pending_ctx_);
+            else if (!handling_obj_.empty()) setExcContext(inst, handling_obj_.back().second);
+        }
+        pending_ctx_flow_.clear();
+        pending_ctx_ = NONE_VALUE;
+        return out;
+    }
+    // A finally body run while an exception propagates: when it completes,
+    // the exception's record is as it was (whatever the body raised and
+    // caught inside).
+    template <class Fn> void tbFinally(Fn&& f) {
+        TbPending saved = tb_pending();
+        f();
+        tb_pending() = std::move(saved);
+        tb_pending().last = cur_stmt();
+    }
+    // The uncaught exception `flow` at the top of the program: its object
+    // with the whole traceback (main.cpp reports it), or none.
+    Value uncaughtException(const std::string& flow) {
+        std::string f = tbCaught(flow);
+        return excInstanceOf(f);
+    }
+    // Python's traceback of it, the chained exceptions first, without the
+    // last line (main.cpp's own line follows): the prelude's
+    // _ny_format_uncaught. The statement an uncaught error reports stays.
+    Value uncaught_obj_;
+    std::string uncaughtTracebackText(const std::string& flow) {
+        node_ptr saved = last_stmt();
+        std::string out;
+        try {
+            Value inst = isInstanceVal(uncaught_obj_) ? uncaught_obj_ : uncaughtException(flow);
+            uncaught_obj_ = Value();
+            Value f = global_ctx ? global_ctx->getByName("_ny_format_uncaught") : UNDEFINED_VALUE;
+            if (isInstanceVal(inst) && f.type == ValueType::USERDATA) {
+                std::vector<Value> a{inst};
+                Value r = callFunctionValue(f, a, global_ctx);
+                if (isStringValue(r)) out = getStringValue(r);
+            }
+        } catch (...) {}
+        last_stmt() = saved;
+        return out;
+    }
+    // The exit handlers lib/atexit.ny registered, when the program ends
+    // (the prelude's _ny_run_atexit).
+    void runAtexit() {
+        Value f = global_ctx ? global_ctx->getByName("_ny_run_atexit") : UNDEFINED_VALUE;
+        if (f.type != ValueType::USERDATA) return;
+        node_ptr saved = last_stmt();
+        std::vector<Value> a;
+        try { callFunctionValue(f, a, global_ctx); } catch (...) {}
+        last_stmt() = saved;
+    }
+    // _ny_stack(): the running frames, innermost first, as
+    // (filename, lineno, function name, module name) - the prelude's left out.
+    Value pyStackValue() {
+        auto& F = py_frames();
+        std::vector<Value> out;
+        auto add = [&](Node* where, const PyFrame& fr) {
+            if (!where) return;
+            auto tk = where->token();
+            std::string file = tk.fileName();
+            if (tbHiddenFile(file)) return;
+            std::vector<Value> t{makeStringValue(file), intValue((int64_t)tk.line()),
+                                 makeStringValue(frameName(fr.code)), makeStringValue(frameModule(fr.ctx))};
+            out.push_back(makeListValue(t, true));
+        };
+        Node* cur = cur_stmt();
+        for (size_t i = F.size(); i-- > 0;) {
+            add(frameLine(F[i], cur), F[i]);
+            cur = F[i].call_site;
+        }
+        add(cur, PyFrame{nullptr, nullptr, global_ctx});
+        return makeListValue(out);
+    }
+
     Value evalTry(node_ptr node, Context* ctx) {
         auto tn = static_pointer_cast<TryNode>(node);
         Value result = NONE_VALUE;
@@ -8126,6 +8395,8 @@ public:
         // propagates - it used to be silently dropped), and an exception
         // raised by a handler or the else clause (it used to skip finally).
         auto run_finally = [&]() { if (tn->finally_clause) evalNode(tn->finally_clause, ctx); };
+        // ... with an exception on its way out (its traceback record kept, round 77)
+        auto run_finally_exc = [&]() { if (tn->finally_clause) tbFinally([&]() { evalNode(tn->finally_clause, ctx); }); };
         std::string exc;
         bool raised = false;
         try {
@@ -8138,11 +8409,17 @@ public:
             exc = flow; raised = true;
         }
         catch (std::exception& e) { exc = excFromCpp(e.what()); raised = true; }
+        if (raised) tbSee(exc);   // round 77: its line here, before a finally runs
 
         if (!raised) {
             if (tn->else_clause) {
                 try { result = evalNode(tn->else_clause, ctx); }
                 catch (nython::node::YieldSignal&) { throw; }
+                catch (std::string& f2) {
+                    if (f2 == "break" || f2 == "continue") run_finally(); else { tbSee(f2); run_finally_exc(); }
+                    throw;
+                }
+                catch (std::exception& e3) { tbSee(excFromCpp(e3.what())); run_finally_exc(); throw; }
                 catch (...) { run_finally(); throw; }
             }
             run_finally();
@@ -8154,7 +8431,9 @@ public:
             auto* en = static_cast<ExceptNode*>(ec.get());
             if (excClauseMatches(en, exc, ctx)) { match = en; break; }
         }
-        if (!match) { run_finally(); throw exc; }
+        if (!match) { run_finally_exc(); throw exc; }
+        // the exception object, with its traceback (round 77)
+        exc = tbCaught(exc);
 
         if (!match->var.empty()) {
             (match->var_global ? moduleCtx(ctx) : ctx)->defineByName(match->var, exceptionObject(exc));
@@ -8167,6 +8446,14 @@ public:
         } _ph{handling_exc_, handling_obj_};
         try { result = evalNode(match->body, ctx); }
         catch (nython::node::YieldSignal&) { throw; }
+        catch (std::string& f2) {
+            if (f2 == "break" || f2 == "continue") { run_finally(); throw; }
+            tbHandlerExit(f2);
+            tbSee(f2);
+            run_finally_exc();
+            throw;
+        }
+        catch (std::exception& e2) { std::string f3 = excFromCpp(e2.what()); tbHandlerExit(f3); tbSee(f3); run_finally_exc(); throw; }
         catch (...) { run_finally(); throw; }
         run_finally();
         return result;
@@ -8254,8 +8541,9 @@ public:
         auto rn = static_pointer_cast<RaiseNode>(node);
         if (!rn->expr) {
             // Bare `raise`: the exception the enclosing except clause is
-            // handling (it used to raise the string "Exception").
-            if (!handling_exc_.empty()) throw std::string(handling_exc_.back());
+            // handling (it used to raise the string "Exception"), with the
+            // traceback it has (round 77).
+            if (!handling_exc_.empty()) { tbReraise(handling_exc_.back()); throw std::string(handling_exc_.back()); }
             throw std::string("__exc__:RuntimeError:No active exception to reraise");
         }
         Value v = evalNode(rn->expr, ctx);
@@ -8278,10 +8566,25 @@ public:
             if (cit != instance_to_class.end()) {
                 std::string class_name = instanceClassName(v);
                 if (rn->cause) {
+                    // `raise X from Y`: Y (an instance of it when Y is a
+                    // class, none for `from None`) is the cause, and the
+                    // context is not shown (round 77: __suppress_context__)
                     Value cause = evalNode(rn->cause, ctx);
+                    if (cause.type == ValueType::USERDATA && cause.value.p
+                        && fnTag(func_names, cause.value.p).rfind("__class__:", 0) == 0) {
+                        std::vector<Value> none_args;
+                        static const nyrt::OrderedKw<Value> no_kw2;
+                        cause = instantiateClass(cause, none_args, no_kw2, ctx);
+                    }
                     auto pit = instance_properties.find(v.value.p);
-                    if (pit != instance_properties.end()) pit->second->defineByName("__cause__", cause);
+                    if (pit != instance_properties.end()) {
+                        pit->second->defineByName("__cause__", cause);
+                        pit->second->defineByName("__suppress_context__", Value(true));
+                    }
                 }
+                // raised while an except clause handles another: that one
+                // is its __context__ (round 77)
+                if (!handling_obj_.empty()) setExcContext(v, handling_obj_.back().second);
                 throw rememberRaised(class_name, v);
             }
             throw getStringValue(v);
@@ -8703,9 +9006,13 @@ public:
         mctx->defineByName("__file__", makeStringValue(filepath));
         std::unordered_set<void*> before;
         for (auto& kv : func_names) before.insert(kv.first);
-        try { evalNode(ast, mctx); }
-        catch (nython::node::ReturnSignal&) {}
-        catch (std::string&) { module_ns_.erase(module_name); imported_modules_.erase(module_name); throw; }
+        {
+            FrameGuard _frame(nullptr, mctx);   // round 77: <module> of the file
+            try { evalNode(ast, mctx); }
+            catch (nython::node::ReturnSignal&) {}
+            catch (std::string& flow) { tbUnwind(flow); module_ns_.erase(module_name); imported_modules_.erase(module_name); throw; }
+            catch (std::exception& e) { tbUnwind(excFromCpp(e.what())); module_ns_.erase(module_name); imported_modules_.erase(module_name); throw; }
+        }
         for (auto& kv : func_names) if (!before.count(kv.first)) module_owned_.insert(kv.first);
         for (auto& kv : *mctx->container) ns->set(kv.first, kv.second);
         return nsv;
@@ -9127,6 +9434,11 @@ public:
                     ns->set("byteorder", makeStringValue(*(const uint8_t*)&probe ? "little" : "big"));
                 }
                 ns->set("exit", global_ctx->getByName("exit"));
+                // sys.exc_info() / sys.exception() / sys._getframe() (round 77, the prelude's)
+                ns->set("exc_info", global_ctx->getByName("_ny_exc_info"));
+                ns->set("exception", global_ctx->getByName("_ny_exc_current"));
+                ns->set("_getframe", global_ctx->getByName("_ny_getframe"));
+                ns->set("warnoptions", nyos_list_of(nyrt::warn_options()));
                 // the standard streams (NyPrelude _NyStdStream, round 77)
                 for (const char* st : {"stdin", "stdout", "stderr"}) {
                     Value sv = global_ctx->getByName(std::string("_ny_") + st);
@@ -10295,8 +10607,18 @@ public:
         // Calls that do not pass through evalCall (operators, callbacks of
         // builtins) meet the same stack check (see evalCall).
         if (nycoro::stack_exhausted()) return nygen::body_on_new_stack(*this, fn, fc);
+        FrameGuard _frame(fn, fc);   // round 77: frames and tracebacks
         try { return evalBody(fn->body, fc); }
         catch (nython::node::ReturnSignal& r) { return r.value; }
+        catch (std::string& flow) { tbUnwind(flow); throw; }
+        catch (std::exception& e) { tbUnwind(excFromCpp(e.what())); throw; }
+    }
+    // A lambda's body (round 77: a frame of its own, "<lambda>").
+    Value runLambdaBody(LambdaNode* lam, Context* fc) {
+        FrameGuard _frame(lam, fc);
+        try { return evalNode(lam->body, fc); }
+        catch (std::string& flow) { tbUnwind(flow); throw; }
+        catch (std::exception& e) { tbUnwind(excFromCpp(e.what())); throw; }
     }
     bool iterableBuiltin(const std::string& name, std::vector<Value>& args, Context* ctx, Value& out) {
         static const std::unordered_set<std::string> takes = {
@@ -10519,11 +10841,19 @@ public:
             std::vector<Value> a{NONE_VALUE, NONE_VALUE, NONE_VALUE};
             callMethod(v, "__exit__", a, ctx);
         };
-        auto exit_exc = [&](const std::string& flow) -> bool {
+        // __exit__(type, value, traceback): the exception object with the
+        // traceback it has here; not suppressed, it goes on from this frame
+        // as a re-raise (round 77).
+        auto exit_exc = [&](std::string& flow) -> bool {
             if (!managed || !instanceHasMethod(v, "__exit__")) return false;
+            flow = tbCaught(flow);
             Value ev = exceptionObject(flow);
-            std::vector<Value> a{exceptionClassValue(flow), ev, NONE_VALUE};
-            return isTruthy(callMethod(v, "__exit__", a, ctx));
+            Value tb = NONE_VALUE;
+            if (Context* ep = instanceProps(ev)) { tb = ep->getByName("__traceback__"); if (!isInstanceVal(tb)) tb = NONE_VALUE; }
+            std::vector<Value> a{exceptionClassValue(flow), ev, tb};
+            bool sup = isTruthy(callMethod(v, "__exit__", a, ctx));
+            if (!sup) tbReraise(flow);
+            return sup;
         };
         Value result = NONE_VALUE;
         try {
@@ -10533,8 +10863,9 @@ public:
         catch (nython::node::YieldSignal&) { throw; }
         catch (std::string& flow) {
             if (flow == "break" || flow == "continue") { exit_plain(); throw; }
-            if (exit_exc(flow)) return NONE_VALUE;
-            throw;
+            std::string f = flow;
+            if (exit_exc(f)) return NONE_VALUE;
+            throw f;
         }
         catch (std::exception& e) {
             std::string flow = excFromCpp(e.what());
@@ -10662,17 +10993,39 @@ public:
         func_names.erase((void*)&w->tag);
         weak_by_id_.erase(w->id);
     }
-    Value makeWeakRef(const Value& obj) {
+    Value makeWeakRef(const Value& obj, const Value& callback = Value()) {
         if (!isInstanceVal(obj) || !obj.value.o)
             pyRaise("TypeError", "cannot create weak reference to '" + typeNameOf(obj) + "' object");
         nygc::g_weak_hook = &nyheap::weak_target_died;
+        nygc::g_weak_cb_hook = &nyheap::run_weak_callbacks;
         auto* w = new nyheap::Weak(this, ++weak_serial_);
         w->target = obj.value.o;
         w->payload = obj.value.p;
         nyheap::weak_register(w);
         weak_by_id_[w->id] = w;
         func_names[(void*)&w->tag] = "__builtin__:" + w->tag;
-        return nyheap::userValue(w, (void*)&w->tag);
+        Value wv = nyheap::userValue(w, (void*)&w->tag);
+        if (callback.type != ValueType::NONE && callback.type != ValueType::UNDEFINED) {
+            w->callback = callback;   // round 77
+            nygc::track(w);
+        }
+        return wv;
+    }
+    // A weak reference's callback, its target dead (round 77): called once
+    // with the reference; what it raises is reported and ignored, as in Python.
+    void runWeakCallback(nyheap::Weak* w) {
+        Value cb = w->callback;
+        w->callback = Value();
+        if (cb.type == ValueType::NONE || cb.type == ValueType::UNDEFINED) return;
+        Value self = nyheap::userValue(w, (void*)&w->tag);
+        node_ptr saved_stmt = last_stmt();
+        std::vector<Value> a{self};
+        try { callFunctionValue(cb, a, global_ctx); }
+        catch (std::string& flow) { std::cerr << "Exception ignored in: " << valueToDisplay(cb) << "\n" << describeException(flow) << "\n"; }
+        catch (nython::node::ReturnSignal&) {}
+        catch (std::exception& e) { std::cerr << "Exception ignored in: " << valueToDisplay(cb) << "\n" << e.what() << "\n"; }
+        catch (...) {}
+        last_stmt() = saved_stmt;
     }
     // Whether instances of this class run __del__ when they are freed.
     std::unordered_map<void*, bool> has_del_;
@@ -10723,6 +11076,11 @@ public:
             exc_instance_map_.clear();
             exc_ring_.clear();
             handling_obj_.clear();
+            dead.push_back(pending_ctx_);   // round 77
+            pending_ctx_ = Value();
+            dead.push_back(uncaught_obj_);
+            uncaught_obj_ = Value();
+            pending_ctx_flow_.clear();
             for (auto& kv : key_objs_) dead.push_back(kv.second);
             key_objs_.clear();
             if (keys_owner_ == this) { keys_owner_ = nullptr; nygc::g_keys = nygc::KeyTable(); }
@@ -10764,7 +11122,7 @@ public:
         }
         if (name == "weakref") {
             if (args.empty()) pyRaise("TypeError", "weakref() takes exactly one argument (0 given)");
-            out = makeWeakRef(args[0]);
+            out = makeWeakRef(args[0], args.size() > 1 ? args[1] : Value());
             return true;
         }
         auto argInt = [&](size_t i, int64_t dflt) -> int64_t {

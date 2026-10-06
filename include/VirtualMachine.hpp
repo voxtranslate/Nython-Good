@@ -440,6 +440,10 @@ struct ExceptionEntry {
     // iterator, and the loop stopped).
     int depth = 0;
     int end = 0;
+    // The hidden variable its except clauses keep the exception in (a bare
+    // `raise`, _ny_exc_current): an exception leaving a clause clears it
+    // (round 77 - it stayed, and sys.exc_info() / __context__ saw it later).
+    std::string held;
 };
 
 struct VMCode {
@@ -1617,6 +1621,7 @@ private:
             // raised exception's class and each clause's types. The
             // exception is kept in a hidden variable for a bare `raise`.
             std::string held="__exc"+std::to_string(try_counter_++)+"__";
+            if(!tn->except_clauses.empty()) C().exc_table[idx].held=rn(held);
             std::vector<int> to_exit;
             for(auto& ec:tn->except_clauses){
                 auto en=std::static_pointer_cast<nython::node::ExceptNode>(ec);
@@ -2840,6 +2845,81 @@ public:
     }
     // __del__ on an instance, at a safe point; an exception it raises is
     // reported and ignored, as in Python.
+    // ── weakref callbacks (round 77) ─────────────────────────────────────
+    // A weak reference: its target and the callback to call with it when
+    // the target dies. The target's fields hold a WeakNotifier under a
+    // hidden key ("\x01weakref": not an attribute, left out of __dict__,
+    // vars() and dir()); freed with them, it queues the callbacks of the
+    // references still alive, and they run at the next safe point (as
+    // __del__ does), so whatever freed the target never runs Nython code.
+    struct WeakCell {
+        std::weak_ptr<VMMap> target;
+        std::string cls;
+        VMVal callback;
+    };
+    struct WeakNotifier {
+        std::vector<std::weak_ptr<WeakCell>> cells;
+        ~WeakNotifier() {
+            std::vector<std::shared_ptr<WeakCell>> due;
+            for (auto& c : cells) if (auto sp = c.lock()) if (sp->callback.type != VMType::NONE) due.push_back(sp);
+            if (due.empty()) return;
+            {
+                std::lock_guard<std::mutex> lk(weak_queue_mutex());
+                for (auto& d : due) weak_queue().push_back(d);
+            }
+            vmgc::g_pending.store(true, std::memory_order_relaxed);
+        }
+    };
+    struct WeakHolder {   // the hidden field's native: owns the notifier
+        std::shared_ptr<WeakNotifier> n;
+        VMVal operator()(std::vector<VMVal>&) const { return VMVal::make_none(); }
+    };
+    static std::mutex& weak_queue_mutex() { static auto* m = new std::mutex(); return *m; }
+    static std::vector<std::shared_ptr<WeakCell>>& weak_queue() {
+        static auto* q = new std::vector<std::shared_ptr<WeakCell>>();
+        return *q;
+    }
+    static WeakNotifier* weak_notifier_of(const std::shared_ptr<VMMap>& m) {
+        auto it = m->find("\x01weakref");
+        if (it != m->end() && it->second.type == VMType::NATIVE)
+            if (auto* h = it->second.native.target<WeakHolder>()) return h->n.get();
+        WeakHolder h{std::make_shared<WeakNotifier>()};
+        WeakNotifier* n = h.n.get();
+        (*m)["\x01weakref"] = VMVal::make_native(NativeFunc(h));
+        return n;
+    }
+    static VMVal weak_value(const std::shared_ptr<WeakCell>& cell) {
+        return VMVal::make_native([cell](std::vector<VMVal>&) -> VMVal {
+            auto sp = cell->target.lock();
+            if (!sp) return VMVal::make_none();
+            return VMVal::make_instance(cell->cls, sp);
+        });
+    }
+    // At a safe point (vmgc::safe_point_slow): the callbacks of dead targets.
+    void gc_run_weak_callbacks() {
+        for (;;) {
+            std::vector<std::shared_ptr<WeakCell>> q;
+            {
+                std::lock_guard<std::mutex> lk(weak_queue_mutex());
+                if (weak_queue().empty()) return;
+                q.swap(weak_queue());
+            }
+            if (vm_finalizers_off_) continue;
+            for (auto& c : q) {
+                VMVal cb = c->callback;
+                c->callback = VMVal::make_none();
+                if (cb.type == VMType::NONE) continue;
+                VMVal saved_exc = last_exception_obj_;
+                std::vector<VMVal> args{weak_value(c)};
+                try { vm_call(cb, args, std::nullopt); }
+                catch (std::exception& e) {
+                    std::cerr << "Exception ignored in: " << vm_repr(cb) << "\n" << e.what() << "\n";
+                }
+                catch (...) {}
+                last_exception_obj_ = saved_exc;
+            }
+        }
+    }
     void gc_run_finalizer(const std::string& cls, const std::shared_ptr<VMMap>& attrs) {
         if (vm_finalizers_off_) return;
         VMVal m;
@@ -2900,19 +2980,27 @@ public:
             if (nygc::tracked_objects() > 0) nygc::collect(g);
             return I(n);
         });
-        // weakref(obj): a callable giving the instance back while it is
-        // alive, none afterwards (instances only, as on the interpreter).
+        // weakref(obj, callback=None): a callable giving the instance back
+        // while it is alive, none afterwards (instances only, as on the
+        // interpreter). With a callback, callback(ref) runs at the next safe
+        // point after the instance dies, unless the ref died first (round 77).
         globals_["weakref"] = VMVal::make_native([this](std::vector<VMVal>& a) -> VMVal {
+            if (!a.empty() && a.back().type == VMType::MAP && a.back().class_name == "__kwargs__") {
+                VMVal kw = a.back(); a.pop_back();
+                auto it = kw.map->find("callback");
+                if (it != kw.map->end()) { if (a.size() < 2) a.push_back(it->second); }
+            }
             if (a.empty() || a[0].type != VMType::INSTANCE || !a[0].map)
                 throw_exception(make_exception("TypeError", {VMVal::make_str("cannot create weak reference to '"
                     + (a.empty() ? std::string("NoneType") : vm_type_name(a[0])) + "' object")}));
-            std::weak_ptr<VMMap> w = a[0].map;
-            std::string cn = a[0].class_name;
-            return VMVal::make_native([w, cn](std::vector<VMVal>&) -> VMVal {
-                auto sp = w.lock();
-                if (!sp) return VMVal::make_none();
-                return VMVal::make_instance(cn, sp);
-            });
+            auto cell = std::make_shared<WeakCell>();
+            cell->target = a[0].map;
+            cell->cls = a[0].class_name;
+            if (a.size() >= 2 && a[1].type != VMType::NONE) {
+                cell->callback = a[1];
+                weak_notifier_of(a[0].map)->cells.push_back(cell);
+            }
+            return weak_value(cell);
         });
         globals_["gc_enable"] = VMVal::make_native([](std::vector<VMVal>&) -> VMVal { vmgc::set_enabled(true); return VMVal::make_none(); });
         globals_["gc_disable"] = VMVal::make_native([](std::vector<VMVal>&) -> VMVal { vmgc::set_enabled(false); return VMVal::make_none(); });
@@ -2994,10 +3082,27 @@ public:
                 }
             } pop_module{this, base, session};
             // An uncaught exception is reported here, before PopModule waits
-            // for the program's threads (as Python prints the traceback first).
+            // for the program's threads (as Python prints the traceback first):
+            // Python's frames (round 77), then the [VMError] line. The atexit
+            // handlers run after the threads are done (round 77).
             try { run_loop(); } catch(VMReturn&) {}
-            catch(std::exception& e) { return report_uncaught(e.what(), false); }
-            catch(std::string& m) { return report_uncaught(m, true); }
+            catch(VMException& ve) {
+                if(!session) print_uncaught_traceback(ve.value);
+                VMResult r=report_uncaught(ve.what(), false);
+                if(!session){ nyconc::join_nondaemon_at_exit(); run_atexit(); }
+                return r;
+            }
+            catch(std::exception& e) {
+                VMResult r=report_uncaught(e.what(), false);
+                if(!session){ nyconc::join_nondaemon_at_exit(); run_atexit(); }
+                return r;
+            }
+            catch(std::string& m) {
+                VMResult r=report_uncaught(m, true);
+                if(!session){ nyconc::join_nondaemon_at_exit(); run_atexit(); }
+                return r;
+            }
+            if(!session){ nyconc::join_nondaemon_at_exit(); run_atexit(); }
             // Generators the program left paused: closed now, so their
             // finally blocks run (the interpreter does the same).
             if(!session) gen_close_all();
@@ -3011,6 +3116,30 @@ public:
 
     // repr() of a value as a program would see it (the prompt's echo).
     std::string repr_of(const VMVal& v) { return vm_repr(v); }
+
+    // An uncaught exception's traceback, Python's way, chained exceptions
+    // first, without the last line (the prelude's _ny_format_uncaught;
+    // report_uncaught prints that line) - round 77.
+    void print_uncaught_traceback(const VMVal& ev) {
+        if(ev.type!=VMType::INSTANCE||prompt_session_) return;
+        if(class_derives(ev.class_name,"SystemExit")||class_derives(ev.class_name,"KeyboardInterrupt")) return;
+        try {
+            VMVal f=load_var("_ny_format_uncaught");
+            if(f.type!=VMType::FUNCTION) return;
+            std::vector<VMVal> a{ev};
+            VMVal r=vm_call(f,a,std::nullopt);
+            if(r.type==VMType::STRING) std::cerr<<r.s;
+        } catch(...) {}
+    }
+    // The exit handlers lib/atexit.ny registered (the prelude's _ny_run_atexit).
+    void run_atexit() {
+        try {
+            VMVal f=load_var("_ny_run_atexit");
+            if(f.type!=VMType::FUNCTION) return;
+            std::vector<VMVal> a;
+            vm_call(f,a,std::nullopt);
+        } catch(...) {}
+    }
 
     // The status of a program ended by an uncaught SystemExit (round 77).
     static int& exit_status() { static int s=-1; return s; }
@@ -3176,6 +3305,15 @@ public:
         VMVal ns=VMVal::make_map();
         (*ns.map)["argv"]=argv_list;
         (*ns.map)["exit"]=load_var("exit");
+        // sys.exc_info() / sys.exception() / sys._getframe() (round 77, the prelude's)
+        (*ns.map)["exc_info"]=load_var("_ny_exc_info");
+        (*ns.map)["exception"]=load_var("_ny_exc_current");
+        (*ns.map)["_getframe"]=load_var("_ny_getframe");
+        {
+            std::vector<VMVal> wo;
+            for(auto& o:nyrt::warn_options()) wo.push_back(VMVal::make_str(o));
+            (*ns.map)["warnoptions"]=VMVal::make_list(std::move(wo));
+        }
         // the standard streams (NyPrelude _NyStdStream, round 77)
         for(const char* st : {"stdin","stdout","stderr"}){
             auto it=globals_.find(std::string("_ny_")+st);
@@ -4313,6 +4451,33 @@ private:
     }
 
     // ── Reflection (round 77) ──
+    // The exception an except clause is handling now, here or in a caller
+    // (_ny_exc_current, sys.exc_info()[1]); none outside every except
+    // clause. A clause keeps its exception in a hidden "__excN__" variable
+    // for a bare `raise` and deletes it when it completes; the innermost
+    // clause has the highest N in its frame.
+    VMVal vm_exc_current() {
+        auto best_in=[](const VMMap& m, VMVal& out)->bool{
+            long best=-1;
+            for(auto& kv:m){
+                const std::string& k=kv.first;
+                if(k.size()<8||k.compare(0,5,"__exc")!=0||k.compare(k.size()-2,2,"__")!=0) continue;
+                std::string mid=k.substr(5,k.size()-7);
+                if(mid.empty()||mid.find_first_not_of("0123456789")!=std::string::npos) continue;
+                long nn=std::stol(mid);
+                if(nn>best && kv.second.type!=VMType::NONE){ best=nn; out=kv.second; }
+            }
+            return best>=0;
+        };
+        VMVal out=VMVal::make_none();
+        for(int i=(int)call_stack_.size()-1;i>=0;i--){
+            auto& f=call_stack_[i];
+            if(best_in(f.locals,out)) return out;
+            if(f.own_env&&f.closure_env&&best_in(*f.closure_env,out)) return out;
+        }
+        if(VMMap* me=menv()) if(best_in(*me,out)) return out;
+        return VMVal::make_none();
+    }
     static bool reflect_hidden(const std::string& k) {
         if(k.empty()||(unsigned char)k[0]<0x20) return true;
         if(k=="__name__"||k=="__file__"||k=="__doc__") return false;
@@ -5730,8 +5895,15 @@ private:
                 // arg 0: raise X   1: bare raise (re-raise)   2: raise X from Y
                 VMVal cause; if(ins.arg==2) cause=pop();
                 VMVal ev=normalize_exception(pop());
-                if(ins.arg==2 && ev.type==VMType::INSTANCE && ev.map)
+                if(ins.arg==2 && ev.type==VMType::INSTANCE && ev.map){
                     (*ev.map)["__cause__"]=cause.type==VMType::NONE?cause:normalize_exception(cause);
+                    (*ev.map)["__suppress_context__"]=VMVal::make_bool(true);   // round 77
+                }
+                // round 77: raised while an except clause handles another,
+                // that one is its __context__; a bare raise goes on with the
+                // traceback it has (this frame already heads it)
+                if(ins.arg==1) tb_reraise_=true;
+                else set_exc_context(ev, vm_exc_current());
                 throw_exception(std::move(ev));
             }
 
@@ -5745,6 +5917,7 @@ private:
                 int outer=ins.arg;
                 switch((int)st.i){
                 case FIN_K_EXC:
+                    tb_reraise_=true;   // on its way out still: no second entry for this frame (round 77)
                     throw_exception((*st.list)[0]);
                 case FIN_K_RETURN:
                     if(outer>=0){ push(st); fr.ip=fr.code->exc_table[outer].finally_start; break; }
@@ -5778,7 +5951,9 @@ private:
                 if(is_fin_state(st) && st.i==FIN_K_EXC){
                     VMVal exc=(*st.list)[0];
                     bool found=false;
-                    VMVal r=call_dunder_f(cm,"__exit__",{class_of_exception(exc),exc,VMVal::make_none()},found);
+                    VMVal tbv=VMVal::make_none();   // the traceback it has here (round 77)
+                    if(exc.type==VMType::INSTANCE&&exc.map){ auto ti=exc.map->find("__traceback__"); if(ti!=exc.map->end()) tbv=ti->second; }
+                    VMVal r=call_dunder_f(cm,"__exit__",{class_of_exception(exc),exc,tbv},found);
                     bool truthy = r.type==VMType::INSTANCE ? instance_truthy(r) : r.is_truthy();
                     if(found && truthy) stack_[st_idx]=make_fin_state(FIN_K_NORMAL);
                 } else {
@@ -5820,12 +5995,21 @@ private:
             } catch(VMReturn& r) { throw; }  // propagate returns
               catch(VMYield&) { throw; }
               catch(VMException& ex) {
+                // round 77: just raised (no traceback yet) while an except
+                // clause handles another - its __context__; then the
+                // traceback, a frame at a time
+                if(ex.value.type==VMType::INSTANCE&&ex.value.map&&!tb_reraise_&&!ex.value.map->count("__traceback__")
+                   &&!ex.value.map->count("__context__"))
+                    set_exc_context(ex.value, vm_exc_current());
+                tb_here(ex.value);
                 if(!dispatch_exception(call_stack_.back(), ex.value)) throw;
               }
               catch(std::string& m) {
                 // Interpreter builtins reached through the bridge, and a few
                 // VM paths, report errors as "__exc__:Type:message" strings.
                 VMVal ev=exception_from_message(m);
+                set_exc_context(ev, vm_exc_current());
+                tb_here(ev);
                 if(!dispatch_exception(call_stack_.back(), ev)) throw VMException(ev, describe_exception(ev));
               }
               catch(std::exception& exc) {
@@ -5836,9 +6020,74 @@ private:
                 // instance itself (the tensor and concurrency runtimes, the
                 // builtin bridge) leaves it in last_exception_obj_.
                 VMVal ev=take_native_exception(exc.what());
+                set_exc_context(ev, vm_exc_current());
+                tb_here(ev);
                 if(!dispatch_exception(call_stack_.back(), ev)) throw VMException(ev, describe_exception(ev));
               }
         }
+    }
+
+    // ── Tracebacks (round 77) ────────────────────────────────────────────
+    // An exception passing through a frame gets an entry for it at the head
+    // of its __traceback__ (CPython's PyTraceBack_Here): a prelude
+    // _NyTraceback with tb_next, tb_lineno and the frame's file, function
+    // and module in _ny_loc, "\x1f"-separated (its tb_frame is made from
+    // them when first read). A bare
+    // raise, or an exception leaving a finally on its way out, is already
+    // headed by this frame (tb_reraise_). The prelude's frames are not
+    // shown (its source is named "stdin"), as CPython shows no frame for a
+    // builtin written in C.
+    bool tb_reraise_=false;
+    std::string frame_module(const CallFrame& f) {
+        if(f.code&&f.code->module_env){
+            auto it=f.code->module_env->find("__name__");
+            if(it!=f.code->module_env->end()&&it->second.type==VMType::STRING) return it->second.s;
+        }
+        return "__main__";
+    }
+    static int frame_line(const CallFrame& f) {
+        int ip=f.ip-1;
+        return (f.code&&ip>=0&&ip<(int)f.code->instructions.size())?f.code->instructions[(size_t)ip].line:0;
+    }
+    void tb_here(const VMVal& ev) {
+        if(tb_reraise_){ tb_reraise_=false; return; }
+        if(ev.type!=VMType::INSTANCE||!ev.map||call_stack_.empty()) return;
+        const CallFrame& f=call_stack_.back();
+        if(!f.code||f.code->file=="stdin") return;
+        VMVal next=VMVal::make_none();
+        auto it=ev.map->find("__traceback__");
+        if(it!=ev.map->end()&&it->second.type==VMType::INSTANCE) next=it->second;
+        auto attrs=std::make_shared<VMMap>(); vmgc::track_map(attrs);
+        (*attrs)["tb_next"]=next;
+        (*attrs)["tb_lineno"]=VMVal::make_int(frame_line(f));
+        (*attrs)["_ny_loc"]=VMVal::make_str(f.code->file+'\x1f'+f.code->name+'\x1f'+frame_module(f));
+        (*ev.map)["__traceback__"]=VMVal::make_instance("_NyTraceback", attrs);
+    }
+    // e.__context__ = c, as Python sets it when e is raised while c is being
+    // handled - without making a cycle (a link back to e is cut).
+    static void set_exc_context(const VMVal& ev, const VMVal& c) {
+        if(ev.type!=VMType::INSTANCE||!ev.map||c.type!=VMType::INSTANCE||!c.map||c.map==ev.map) return;
+        VMVal o=c;
+        for(int guard=0; guard<1000 && o.type==VMType::INSTANCE && o.map; guard++){
+            auto it=o.map->find("__context__");
+            if(it==o.map->end()||it->second.type!=VMType::INSTANCE) break;
+            if(it->second.map==ev.map){ it->second=VMVal::make_none(); break; }
+            VMVal nx=it->second;
+            o=nx;
+        }
+        (*ev.map)["__context__"]=c;
+    }
+    // _ny_stack(): the running frames, innermost first, as (filename,
+    // lineno, function name, module name) - the prelude's left out.
+    VMVal vm_stack_value() {
+        std::vector<VMVal> out;
+        for(int i=(int)call_stack_.size()-1;i>=0;i--){
+            const CallFrame& f=call_stack_[(size_t)i];
+            if(!f.code||f.code->file=="stdin"||f.code->file.empty()) continue;
+            out.push_back(VMVal::make_tuple({VMVal::make_str(f.code->file), VMVal::make_int(frame_line(f)),
+                                             VMVal::make_str(f.code->name), VMVal::make_str(frame_module(f))}));
+        }
+        return VMVal::make_list(std::move(out));
     }
 
     // ── Exceptions ───────────────────────────────────────────────────────
@@ -5852,6 +6101,15 @@ private:
         int ip=f.ip-1;
         auto& tbl=f.code->exc_table;
         if(tbl.empty()) return false;
+        // Leaving an except clause by an exception: it no longer handles its
+        // own (round 77).
+        for(auto& e:tbl)
+            if(!e.held.empty() && ip>=e.try_end && ip<e.end){
+                auto hv=f.locals.find(e.held);
+                if(hv!=f.locals.end()) hv->second=VMVal::make_none();
+                if(f.own_env&&f.closure_env){ auto he=f.closure_env->find(e.held); if(he!=f.closure_env->end()) he->second=VMVal::make_none(); }
+                if(f.code->module_top&&f.code->module_env){ auto hm=f.code->module_env->find(e.held); if(hm!=f.code->module_env->end()) hm->second=VMVal::make_none(); }
+            }
         std::vector<int> cands;
         for(int i=0;i<(int)tbl.size();i++){
             auto& e=tbl[i];
@@ -6827,7 +7085,8 @@ private:
             }
             if(attr=="__dict__"){
                 VMVal d=VMVal::make_map();
-                if(obj.map) for(auto& kv:*obj.map) (*d.map)[kv.first]=kv.second;
+                // not the engine's hidden fields ("\x01weakref", round 77)
+                if(obj.map) for(auto& kv:*obj.map) if(kv.first.empty()||kv.first[0]!='\x01') (*d.map)[kv.first]=kv.second;
                 out=d; return true;
             }
             VMVal ga;
@@ -8917,28 +9176,9 @@ private:
         // any except clause. A clause keeps its exception in a hidden
         // "__excN__" variable for a bare `raise` and deletes it when it
         // completes; the innermost clause has the highest N in its frame.
-        globals_["_ny_exc_current"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{
-            auto best_in=[](const VMMap& m, VMVal& out)->bool{
-                long best=-1;
-                for(auto& kv:m){
-                    const std::string& k=kv.first;
-                    if(k.size()<8||k.compare(0,5,"__exc")!=0||k.compare(k.size()-2,2,"__")!=0) continue;
-                    std::string mid=k.substr(5,k.size()-7);
-                    if(mid.empty()||mid.find_first_not_of("0123456789")!=std::string::npos) continue;
-                    long nn=std::stol(mid);
-                    if(nn>best && kv.second.type!=VMType::NONE){ best=nn; out=kv.second; }
-                }
-                return best>=0;
-            };
-            VMVal out=VMVal::make_none();
-            for(int i=(int)call_stack_.size()-1;i>=0;i--){
-                auto& f=call_stack_[i];
-                if(best_in(f.locals,out)) return out;
-                if(f.own_env&&f.closure_env&&best_in(*f.closure_env,out)) return out;
-            }
-            if(VMMap* me=menv()) if(best_in(*me,out)) return out;
-            return VMVal::make_none();
-        });
+        globals_["_ny_exc_current"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return vm_exc_current(); });
+        // The running frames (round 77): sys._getframe, traceback.extract_stack, warnings.
+        globals_["_ny_stack"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return vm_stack_value(); });
         globals_["_ny_main_globals"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{
             VMVal d=VMVal::make_map();
             for(auto& kv:globals_){
