@@ -6,6 +6,7 @@
 // fmt provided by Definitions.hpp
 #include "PrettyPrinter.hpp"
 #include "DynamicLang.hpp"
+#include "NyUniNames.hpp"
 #include <sstream>
 // ^ explicit: libstdc++ supplies these transitively, MinGW does not.
 
@@ -55,7 +56,8 @@ std::map<TokenType,std::string> TokenTypeNames = {
 	{TokenType::BracketOpen,"BracketOpen"},{TokenType::BracketClose,"BracketClose"},{TokenType::ParenOpen,"ParenOpen"},{TokenType::Regex,"Regex"},{TokenType::New,"New"},{TokenType::Struct,"Struct"},
 	{TokenType::ParenClose,"ParenClose"},{TokenType::At,"At"},{TokenType::RightArrow,"RightArrow"},{TokenType::LeftArrow,"LeftArrow"},{TokenType::Var,"Var"},{TokenType::Block,"Block"},
 	{TokenType::Const,"Const"},{TokenType::Let,"Let"},{TokenType::Undefined,"Undefined"},{TokenType::Ref,"Ref"},{TokenType::QuestionMark,"QuestionMark"},{TokenType::Comment,"Comment"},
-	{TokenType::NullCoalesce,"NullCoalesce"},{TokenType::NullCoalesceAssign,"NullCoalesceAssign"},{TokenType::OptDot,"OptDot"},{TokenType::OptBracket,"OptBracket"}
+	{TokenType::NullCoalesce,"NullCoalesce"},{TokenType::NullCoalesceAssign,"NullCoalesceAssign"},{TokenType::OptDot,"OptDot"},{TokenType::OptBracket,"OptBracket"},
+	{TokenType::MatMulAssign,"MatMulAssign"}
 };
 
 static const TokenDef KeywordTokens[] = {
@@ -555,8 +557,12 @@ inline std::vector<Token> optimize(std::vector<Token> tk) {
             paren_indent_delta--;
             i++; continue;
         }
-        // Guard tk[i+1] access before using it
-        if(i < nb-1 && tk[i].type()==TokenType::Comma && tk[i+1].type()==TokenType::NewLine) {
+        // Guard tk[i+1] access before using it. A trailing comma at the end
+        // of a line joins the next one only when that is indented under it:
+        // `y = 3,` / `return 1,` / `i, = x` end their statement, as in
+        // Python (round 77: the next line became part of the tuple).
+        if(i < nb-2 && tk[i].type()==TokenType::Comma && tk[i+1].type()==TokenType::NewLine
+           && tk[i+2].type()==TokenType::Indent) {
             ret.push_back(tk[i]);
             i += 2;
         } else {
@@ -746,6 +752,11 @@ void Lexer::read_token() {
                 source.read_char();
                 this->consume_string(source.current_char);
                 this->token.type(TokenType::Identifier);
+              } else if (this->source.peek_char() == '=') {
+                // `a @= b` (round 77: it read as a decorator `@` and `=`)
+                this->source.read_char();
+                this->token.value = "@=";
+                make_token(TokenType::MatMulAssign,TokenKind::At,TokenClass::Assignment);
               } else {
                 this->token.value = "@";
                 make_token(TokenType::At,TokenKind::At,TokenClass::Delimiter);
@@ -1535,8 +1546,12 @@ void Lexer::consume_decimal() {
     }
     source.put_char();
     if (cp == '.' && !point_passed) {
-        cp = source.peek_char();
-        if(std::isspace(cp)) {
+        // the '.' was put back: peek_char() is it, peek_char(1) what follows
+        cp = source.peek_char(1);
+        // `5.` is a float before a space and before what ends an operand
+        // (`[5., 0.]`, `f(1.)`; round 77) - `1.+(2, 3)` stays a member call
+        if(std::isspace(cp) || cp == ',' || cp == ')' || cp == ']' || cp == '}' || cp == ':' || cp == ';'
+           || cp == '#' || cp == '\0') {
         	source.read_char();
         	decoder << '.';
         	point_passed = true;
@@ -1575,6 +1590,8 @@ void Lexer::consume_hex() {
     bool point_passed = false;
     this->token.value.clear();
     this->token.value.append("0x");
+    // `0x_ff`, `0xff_ff`: an underscore between digits (round 77)
+    if (source.current_char == '_' && Lexer::is_hex(source.peek_char())) source.read_char();
     // There has to be at least one hex character
     if (!Lexer::is_hex(source.current_char)) {
         this->unexpectedChar();
@@ -1583,6 +1600,8 @@ void Lexer::consume_hex() {
     while (true) {
         if (Lexer::is_hex(cp)) {
             this->token.value += static_cast<char>(cp);
+            cp = source.read_char();
+        } else if (cp == '_' && Lexer::is_hex(source.peek_char())) {
             cp = source.read_char();
         } else if (cp == '.') {
             if (point_passed) {
@@ -1608,6 +1627,7 @@ void Lexer::consume_octal() {
     bool point_passed = false;
     this->token.value.clear();
     this->token.value.append("0o");
+    if (source.current_char == '_' && Lexer::is_octal(source.peek_char())) source.read_char();   // 0o_17 (round 77)
     // There has to be at least one hex character
     if (!Lexer::is_octal(source.current_char)) {
         this->unexpectedChar();
@@ -1616,6 +1636,8 @@ void Lexer::consume_octal() {
     while (true) {
         if (Lexer::is_octal(cp)) {
             this->token.value += static_cast<char>(cp);
+            cp = source.read_char();
+        } else if (cp == '_' && Lexer::is_octal(source.peek_char())) {
             cp = source.read_char();
         }else if (cp == '.') {
             if (point_passed) {
@@ -1641,6 +1663,7 @@ void Lexer::consume_binary() {
     bool point_passed = false;
     this->token.value.clear();
     this->token.value.append("0b");
+    if (source.current_char == '_' && Lexer::is_binary(source.peek_char())) source.read_char();   // 0b_1010 (round 77)
     // There has to be at least one hex character
     if (!Lexer::is_binary(source.current_char)) {
         this->unexpectedChar();
@@ -1649,6 +1672,8 @@ void Lexer::consume_binary() {
     while (true) {
         if (Lexer::is_binary(cp)) {
             this->token.value += static_cast<char>(cp);
+            cp = source.read_char();
+        } else if (cp == '_' && Lexer::is_binary(source.peek_char())) {
             cp = source.read_char();
         }else if (cp == '.') {
             if (point_passed) {
@@ -1796,6 +1821,23 @@ void Lexer::consume_ident() {
         if (lo == "b" || lo == "rb" || lo == "br") {
             char q = source.read_char();
             consume_bytes(q, lo != "b");
+            return;
+        }
+        // u"..." is a plain string; F"..." an f-string (the parser reads
+        // `f` + a string); rf"..." / fR"..." an f-string over a raw string:
+        // the `f` token, then the raw text (round 77)
+        if (lo == "u") {
+            char q = source.read_char();
+            consume_string(q);
+            return;
+        }
+        if (lo == "f") ident = "f";
+        if (lo == "rf" || lo == "fr") {
+            this->token.value = "f";
+            make_token(TokenType::Identifier,TokenKind::Identifier,TokenClass::Identifier);
+            tokens.push_back(this->token);
+            char q = source.read_char();
+            consume_raw_string(q);
             return;
         }
     }
@@ -2083,6 +2125,44 @@ void Lexer::consume_string(char first) {
                                 }
                             } else {
                                 strbuff << '\\' << c; // leave as-is on invalid escape
+                            }
+                            break;
+                        }
+						case 'N': {
+                            // \N{EM DASH}: the character of that name, as in
+                            // Python (round 77; NyUniNames.hpp). An unknown
+                            // name is a SyntaxError, as there.
+                            if(source.peek_char() != '{') { strbuff << '\\' << c; break; }
+                            source.read_char();
+                            std::string nm;
+                            char nc;
+                            while((nc = source.peek_char()) != '}' && nc != '\0' && nc != '\n' && nc != first && nm.size() < 128) {
+                                source.read_char();
+                                nm += nc;
+                            }
+                            uint32_t codepoint = 0;
+                            if(nc == '}' && ::nyuni::lookup(nm, codepoint)) {
+                                source.read_char();
+                                if(codepoint < 0x80) {
+                                    strbuff << (char)codepoint;
+                                } else if(codepoint < 0x800) {
+                                    strbuff << (char)(0xC0|(codepoint>>6));
+                                    strbuff << (char)(0x80|(codepoint&0x3F));
+                                } else if(codepoint < 0x10000) {
+                                    strbuff << (char)(0xE0|(codepoint>>12));
+                                    strbuff << (char)(0x80|((codepoint>>6)&0x3F));
+                                    strbuff << (char)(0x80|(codepoint&0x3F));
+                                } else {
+                                    strbuff << (char)(0xF0|(codepoint>>18));
+                                    strbuff << (char)(0x80|((codepoint>>12)&0x3F));
+                                    strbuff << (char)(0x80|((codepoint>>6)&0x3F));
+                                    strbuff << (char)(0x80|(codepoint&0x3F));
+                                }
+                            } else {
+                                throw nython::exception::SyntaxError(
+                                    Location(source.location.row, source.location.column, source.fileName()),
+                                    nc == '}' ? "(unicode error) 'unicodeescape' codec can't decode bytes: unknown Unicode character name"
+                                              : "(unicode error) 'unicodeescape' codec can't decode bytes: malformed \\N character escape");
                             }
                             break;
                         }

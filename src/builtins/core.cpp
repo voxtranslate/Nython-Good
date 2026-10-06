@@ -14,6 +14,7 @@
 
 // Platform compatibility (must come first)
 #include "platform_compat.hpp"
+#include "NyUniNames.hpp"
 
 #include <algorithm>
 #include <fstream>
@@ -582,6 +583,24 @@ Value dispatch_core(NythonExecutor& E,
             std::vector<Value> ks;
             for (auto& k : nython::lexer::keyword_spellings()) ks.push_back(E.makeStringValue(k));
             return E.makeListValue(ks);
+        }
+        // Unicode character names (lib/unicodedata.ny, src/NyUniNames.cpp;
+        // round 77): the character of a name or none, the name of a
+        // character or "" - through the bridge on the VM
+        if (name == "_ny_unicode_lookup") {
+            uint32_t cp = 0;
+            if (args.empty() || !E.isStringValue(args[0]) || !::nyuni::lookup(E.getStringValue(args[0]), cp)) return NONE_VALUE;
+            std::string out;
+            nypy::u8_encode(cp, out);
+            return E.makeStringValue(out);
+        }
+        if (name == "_ny_unicode_name") {
+            if (args.empty() || !E.isStringValue(args[0])) return E.makeStringValue("");
+            std::string s = E.getStringValue(args[0]);
+            size_t i = 0;
+            if (s.empty()) return E.makeStringValue("");
+            uint32_t cp = nypy::u8_decode(s, i);
+            return E.makeStringValue(::nyuni::name(cp));
         }
         if (name == "_ny_setattr_raw" && args.size() >= 3) {
             NythonExecutor::RawAttr raw;

@@ -137,6 +137,18 @@ enum class Op : uint8_t {
     LOAD_GLOBAL_NAME, STORE_GLOBAL_NAME,
     // del x: unbinds the nearest x (a later read is a NameError).
     DELETE_NAME,
+    // `self = v` in a method: rebinds the frame's self_val, which every
+    // later read of self (LOAD_SELF) sees (round 77).
+    STORE_SELF,
+    // `x op= y` (op without an in-place opcode of its own): when x (TOS1)
+    // is an instance whose class has names[arg] (__ior__, __imatmul__...),
+    // that is called and the binary operator that follows is skipped
+    // (round 77).
+    INPLACE_TRY,
+    // `(x := v)` in a generator expression: binds names[arg] in the nearest
+    // visible frame that is not a generator expression's (the module's when
+    // there is none) - PEP 572 (round 77).
+    DEFINE_OUTER,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -801,6 +813,13 @@ class Compiler {
         code_->sub_codes.push_back(c); return c;
     }
     VMCode& C() { return *code_; }
+    // Compiling a method (first parameter self, carried as the frame's
+    // self_val) or a function nested in one (round 77).
+    bool in_method() const {
+        if(code_ && code_->is_method) return true;
+        for(auto& c:code_stack_) if(c && c->is_method) return true;
+        return false;
+    }
 
     void emit(Op op,int arg=0,int ln=0)    { C().emit(op,arg,ln); }
     void emit_lc(VMVal v,int ln=0)         { emit(Op::LOAD_CONST,  C().add_const(std::move(v)),ln); }
@@ -833,6 +852,8 @@ class Compiler {
             for(auto& e:el) store_target(e,l);
             return;
         }
+        // `for self in ...` in a method (not a comprehension's own, renamed, target)
+        if(t->token().value=="self" && rn("self")=="self" && C().is_method){ emit(Op::STORE_SELF,0,l); return; }   // round 77
         emit_dn(t->token().value,l);
     }
     int comp_id_ = 0;
@@ -977,7 +998,12 @@ private:
                 emit(Op::LOAD_GLOBAL_NAME,C().add_name(nd->token().value),l);
             else emit_ln(nd->token().value,l);
             break;
-        case NT::SELF:     emit(Op::LOAD_SELF,0,l); break;
+        // self: the method's receiver; outside every method (no def around
+        // it has a first parameter self) the ordinary name `self` (round 77:
+        // it read none).
+        case NT::SELF:
+            if(in_method()) emit(Op::LOAD_SELF,0,l); else emit_ln("self",l);
+            break;
         case NT::SUPER:    emit(Op::LOAD_SUPER,0,l); break;
 
         // Var decl
@@ -993,6 +1019,7 @@ private:
                 emit_dn(vd->name,l); break;
             }
             if(vd->init) visit(vd->init); else emit_lc(VMVal::make_none(),l);
+            if(vd->name=="self" && C().is_method){ emit(Op::STORE_SELF,0,l); break; }   // round 77
             emit_dn(vd->name,l); break;
         }
 
@@ -1060,6 +1087,16 @@ private:
             load_target(an->target,l);
             // Load new value and apply op
             visit(an->value_node);
+            {
+                // an instance's in-place dunder first (round 77; += -= *=
+                // have opcodes of their own that do it)
+                static const std::unordered_map<std::string,const char*> idunder={
+                    {"/=","__itruediv__"},{"//=","__ifloordiv__"},{"\\=","__ifloordiv__"},{"%=","__imod__"},
+                    {"**=","__ipow__"},{"&=","__iand__"},{"|=","__ior__"},{"^=","__ixor__"},
+                    {"<<=","__ilshift__"},{">>=","__irshift__"},{"@=","__imatmul__"}};
+                auto it=idunder.find(an->op);
+                if(it!=idunder.end()) emit(Op::INPLACE_TRY,C().add_name(it->second),l);
+            }
             emit(aug_op(an->op),0,l);
             // Store back
             store(an->target,l); break;
@@ -1205,8 +1242,9 @@ private:
             // it was dropped, so `(lambda self: self)(5)` was an arity error)
             C().is_method=!lm->params.empty()&&lm->params[0]->value()=="self";
             renames_.emplace_back();
-            for(auto& p:lm->params){
-                std::string pn=p->value(); if(pn=="self") continue;
+            for(size_t i=0;i<lm->params.size();i++){
+                std::string pn=lm->params[i]->value(); if(pn=="self") continue;
+                if(i<lm->posonly) C().posonly=C().param_names.size()+1;   // `lambda a, /, b` (round 77)
                 C().param_names.push_back(pn); C().add_name(pn);
                 renames_.back()[pn]=pn;
             }
@@ -1256,6 +1294,10 @@ private:
             visit(wn->init);
             emit(Op::DUP_TOP,0,l);
             if(wn->global_ref) emit(Op::STORE_GLOBAL_NAME,C().add_name(wn->name),l);
+            // in a generator expression: the scope around it (PEP 572;
+            // round 77 - list/set/dict comprehensions are compiled inline,
+            // so their walrus already lands there)
+            else if(C().name=="<genexpr>") emit(Op::DEFINE_OUTER,C().add_name(wn->name),l);
             else emit_dn(wn->name,l);
             break;
         }
@@ -2084,8 +2126,11 @@ private:
         // the class keywords (a map) and the expression bases (a list)
         bool extras=!expr_bases.empty()||!cn->keywords.empty();
         if(extras){
-            for(auto& [k,e]:cn->keywords){ emit_lc(VMVal::make_str(k),l); visit(e); }
-            emit(Op::BUILD_MAP,(int)cn->keywords.size(),l);
+            int n_plain=0;
+            for(auto& [k,e]:cn->keywords){ if(k=="**") continue; emit_lc(VMVal::make_str(k),l); visit(e); n_plain++; }
+            emit(Op::BUILD_MAP,n_plain,l);
+            // `class C(**kw)`: merged in (round 77)
+            for(auto& [k,e]:cn->keywords){ if(k!="**") continue; visit(e); emit(Op::MAP_MERGE,0,l); }
             for(auto& e:expr_bases) visit(e);
             emit(Op::BUILD_LIST,(int)expr_bases.size(),l);
         }
@@ -2283,6 +2328,7 @@ private:
     // ─── store target ───────────────────────────────────────────────────
     void store(np tgt, int l) {
         if(tgt->type()==NT::VARIABLE) {
+            if(tgt->token().value=="self" && C().is_method) { emit(Op::STORE_SELF,0,l); return; }   // round 77
             if(std::static_pointer_cast<nython::node::VariableNode>(tgt)->global_ref)
                 emit(Op::STORE_GLOBAL_NAME,C().add_name(tgt->token().value),l);
             else emit_sn(tgt->token().value,l);
@@ -2349,6 +2395,7 @@ private:
         if(op=="^=") return Op::BINARY_XOR;
         if(op=="<<=") return Op::BINARY_LSHIFT;
         if(op==">>="||op==">>>=") return Op::BINARY_RSHIFT;
+        if(op=="@=") return Op::BINARY_MATMUL;   // round 77
         return Op::NOP;
     }
 };
@@ -3366,7 +3413,7 @@ public:
     // `import os`: os.getcwd(), os.path.join(), ... over the interpreter's
     // os_* builtins (include/NyRuntime.hpp module_members), plus the
     // constants and a snapshot of os.environ - as on the interpreter.
-    void define_os_module(const std::string& as_name) {
+    VMVal define_os_module(const std::string& as_name, bool bind=true) {   // bind=false: just made (round 77)
         std::vector<std::string> names;
         if(bridge_names()) names=bridge_names()();
         VMVal ns=VMVal::make_map(), path=VMVal::make_map();
@@ -3396,7 +3443,8 @@ public:
         path.class_name="path";
         (*ns.map)["path"]=path;
         ns.class_name=as_name;
-        globals_[as_name]=ns;
+        if(bind) globals_[as_name]=ns;
+        return ns;
     }
 
     // `import sys`: a namespace with argv (the script path, then the
@@ -4188,11 +4236,31 @@ private:
                 VMVal m;
                 inst_iter=class_lookup(a[0].class_name,"__iter__",m)||class_lookup(a[0].class_name,"__next__",m);
             }
-            if(!vm_lazy_arg(a[0])&&!inst_iter) return a[0];
             int64_t n = a.size()>=2 && a[1].type==VMType::INT ? a[1].i : -1;
-            VMVal it=inst_iter?vm_iter_open(a[0]):a[0], v;
+            // a set or a dict is iterated too (its keys); a list, tuple or
+            // string must hold exactly n items - at least -n-3 around a
+            // starred target (VarDeclNode::unpack; round 77: extra items
+            // were dropped and missing ones an IndexError)
+            bool iterate=inst_iter||a[0].is_set()||a[0].type==VMType::MAP;
+            if(!vm_lazy_arg(a[0])&&!iterate){
+                int64_t len=-1;
+                if(a[0].type==VMType::LIST&&a[0].list) len=(int64_t)a[0].list->size();
+                else if(a[0].type==VMType::STRING) len=(int64_t)nypy::u8_len(a[0].s);
+                if(len>=0&&n>=0&&len>n)
+                    throw_exception(make_exception("ValueError",{VMVal::make_str("too many values to unpack (expected "+std::to_string(n)+")")}));
+                if(len>=0&&n>=0&&len<n)
+                    throw_exception(make_exception("ValueError",{VMVal::make_str("not enough values to unpack (expected "+std::to_string(n)+", got "+std::to_string(len)+")")}));
+                if(len>=0&&n<=-3&&len<-n-3)
+                    throw_exception(make_exception("ValueError",{VMVal::make_str("not enough values to unpack (expected at least "+std::to_string(-n-3)+", got "+std::to_string(len)+")")}));
+                return a[0];
+            }
+            VMVal it=iterate?vm_iter_open(a[0]):a[0], v;
             std::vector<VMVal> items;
-            if(n<0){ while(vm_iter_step(it,v)) items.push_back(std::move(v)); }
+            if(n<0){
+                while(vm_iter_step(it,v)) items.push_back(std::move(v));
+                if(n<=-3&&(int64_t)items.size()<-n-3)
+                    throw_exception(make_exception("ValueError",{VMVal::make_str("not enough values to unpack (expected at least "+std::to_string(-n-3)+", got "+std::to_string(items.size())+")")}));
+            }
             else {
                 while((int64_t)items.size()<=n && vm_iter_step(it,v)) items.push_back(std::move(v));
                 if((int64_t)items.size()>n)
@@ -5535,6 +5603,38 @@ private:
                 }
                 break;
             }
+            case Op::STORE_SELF: { fr.self_val = pop(); break; }   // round 77
+            case Op::DEFINE_OUTER: {   // round 77
+                const std::string n=fr.code->names[ins.arg];
+                VMVal v=pop();
+                int top=(int)call_stack_.size()-1, target=-1;
+                for(int i=top-1;i>=1;i--){
+                    if(!frame_visible(i)) continue;
+                    if(call_stack_[i].code && call_stack_[i].code->name=="<genexpr>") continue;
+                    target=i; break;
+                }
+                if(target>0){
+                    CallFrame& tf=call_stack_[target];
+                    tf.locals[n]=v;
+                    if(tf.own_env && tf.closure_env) (*tf.closure_env)[n]=v;
+                    break;
+                }
+                if(VMMap* me=menv()){ (*me)[n]=std::move(v); break; }
+                CallFrame* mf=in_other_thread()?module_frame_:(call_stack_.empty()?nullptr:&call_stack_.front());
+                if(mf) mf->set(n,std::move(v)); else globals_[n]=std::move(v);
+                break;
+            }
+            case Op::INPLACE_TRY: {   // round 77
+                if(stack_.size()<2||stack_[stack_.size()-2].type!=VMType::INSTANCE) break;
+                const std::string& dn=fr.code->names[ins.arg];
+                VMVal m;
+                if(!class_lookup(stack_[stack_.size()-2].class_name,dn,m)) break;
+                VMVal r=pop(), lv=pop();
+                VMVal res=ni_none(call_dunder(lv,dn,{r}));
+                if(res.type!=VMType::NONE){ push(std::move(res)); call_stack_.back().ip++; break; }
+                push(std::move(lv)); push(std::move(r));
+                break;
+            }
             case Op::DELETE_NAME: {
                 const std::string& n=fr.code->names[ins.arg];
                 if(!delete_var(n)){
@@ -5883,7 +5983,7 @@ private:
                 nypy::NumV nv;
                 if(v.to_numv(nv)) push(VMVal::from_numv(nypy::num_neg(nv)));
                 else if(v.type==VMType::INSTANCE) push(unary_dunder(v,"__neg__","-"));
-                else throw_exception(make_exception("TypeError",{VMVal::make_str("bad operand type for unary -")}));
+                else throw_exception(make_exception("TypeError",{VMVal::make_str("bad operand type for unary -: '"+vm_type_name(v)+"'")}));   // round 77: the type
                 break;
             }
             // not: Python truthiness, including __bool__ / __len__.
@@ -5891,11 +5991,13 @@ private:
             case Op::UNARY_BITNOT: { VMVal v=pop(); nypy::NumV nv;
                 if(v.to_numv(nv)){ push(nycall([&]{ return VMVal::from_numv(nypy::num_invert(nv)); })); break; }
                 if(v.type==VMType::INSTANCE){ push(unary_dunder(v,"__invert__","~")); break; }
-                throw_exception(make_exception("TypeError",{VMVal::make_str("bad operand type for unary ~")}));
+                throw_exception(make_exception("TypeError",{VMVal::make_str("bad operand type for unary ~: '"+vm_type_name(v)+"'")}));
                 break; }
             case Op::UNARY_POS:
                 if(!stack_.empty()&&stack_.back().type==VMType::BOOL) stack_.back()=VMVal::make_int(stack_.back().b?1:0);
                 else if(!stack_.empty()&&stack_.back().type==VMType::INSTANCE){ VMVal v=pop(); push(unary_dunder(v,"__pos__","+")); }
+                else if(!stack_.empty()&&stack_.back().type!=VMType::INT&&stack_.back().type!=VMType::FLOAT)   // round 77: `+"a"` / `+[1]`
+                    throw_exception(make_exception("TypeError",{VMVal::make_str("bad operand type for unary +: '"+vm_type_name(stack_.back())+"'")}));
                 break;
 
             // Jumps
@@ -9177,6 +9279,17 @@ private:
         return load_module_file(path, dotted);
     }
     void import_dotted(const std::string& name, const std::string& alias, const std::vector<std::string>& from_names, bool explicit_alias) {
+        // `import os.path` binds os, `import os.path as p` / `from os.path
+        // import join` the builtin os module's path namespace (round 77)
+        if(name=="os.path"){
+            VMVal osv=define_os_module("os",false);
+            VMVal pv=VMVal::make_none();
+            if(osv.type==VMType::MAP&&osv.map){ auto it=osv.map->find("path"); if(it!=osv.map->end()) pv=it->second; }
+            if(!from_names.empty()) bind_from_namespace(pv, from_names, name);
+            else if(explicit_alias) define_var(alias, pv);
+            else define_var("os", osv);
+            return;
+        }
         std::vector<std::string> parts;
         size_t a=0;
         while(a<=name.size()){
@@ -9318,7 +9431,7 @@ private:
         // An aliased import must still run so its namespace can be built, even
         // if the module was already loaded — otherwise the name diff sees
         // nothing and the alias is empty. Matches the interpreter.
-        if(globals_.count(guard_key) && alias.empty()) return;
+        if(globals_.count(guard_key) && alias.empty() && !(name=="os" && !from_names.empty())) return;
         globals_[guard_key] = VMVal::make_bool(true);
         // The tensor natives (register_nytorch_builtins) are registered when
         // the VM starts (register_all_builtins). Registering them again here
@@ -9346,7 +9459,13 @@ private:
         // These imports used to install VM copies that differed (time_ms()
         // in seconds, sleep(0.5) not sleeping, shell() returning a wait
         // status); now they are acknowledgements only.
-        if(name=="os"){ define_os_module(alias.empty()?std::string("os"):alias); return; }
+        if(name=="os"){
+            // `from os import path as p, sep` binds the names asked for
+            // (round 77: it bound nothing)
+            if(!from_names.empty()){ bind_from_namespace(define_os_module("os",false), from_names, "os"); globals_.erase(guard_key); }
+            else define_os_module(alias.empty()?std::string("os"):alias);
+            return;
+        }
         if(name=="shell"||name=="sh"){ return; }
         if(name=="sys"){
             define_sys_module(alias.empty()?std::string("sys"):alias);
@@ -11970,6 +12089,9 @@ private:
         case Op::DUP_TOP_TWO:  return "DUP_TOP_TWO";
         case Op::LOAD_GLOBAL_NAME: return "LOAD_GLOBAL_NAME";
         case Op::DELETE_NAME:  return "DELETE_NAME";
+        case Op::STORE_SELF:   return "STORE_SELF";
+        case Op::INPLACE_TRY:  return "INPLACE_TRY";
+        case Op::DEFINE_OUTER: return "DEFINE_OUTER";
         case Op::STORE_GLOBAL_NAME: return "STORE_GLOBAL_NAME";
         case Op::JUMP_IF_NONE_KEEP: return "JUMP_IF_NONE_KEEP";
         case Op::JUMP_IF_MISSING_KEEP: return "JUMP_IF_MISSING_KEEP";

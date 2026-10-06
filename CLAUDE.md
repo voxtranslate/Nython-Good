@@ -365,6 +365,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit81 | 116 | round 77: enum (EnumType metaclass, auto, Flag boundaries, functional API) and dataclasses (every parameter, field, KW_ONLY, InitVar, frozen) |
 | vm_audit82 | 140 | round 77: typing (Union, generics, TypeVar, Protocol, NamedTuple, TypedDict, get_type_hints, check_type), types, inspect (signature, bind, getsource), keyword |
 | vm_audit83 | 158 | round 77: weakref (callbacks, proxies, weak dicts, finalize), warnings (filters, catch_warnings, -W), traceback (real tracebacks, chains), linecache, atexit |
+| vm_audit84 | 212 | round 77: Python's syntax (passes under python3) - soft Nython keywords (`new = 1`, `def f(ref):`, `obj.self`), imports/del/class bases/lambda parameters in every form, expression statements evaluated (`{}["x"]`), assignment and for/with targets, unpack counts, augmented in-place dunders and `@=`, chained comparisons, literals (`\N{...}`), decorators (PEP 614), match, exception groups and `except*` (PEP 654) |
 | vm_audit86 | 65 | round 77: every class statement its own class, `isinstance(x, object)`, `__eq__` without `__hash__`, property/staticmethod/classmethod objects, dir/vars, two-argument super, bound/builtin method types and reprs, type objects for None/functions/builtins/generators/iterators, dict methods before keys (63 pass under python3) |
 | vm_audit87 | 73 | round 77: `in`/ordering TypeErrors, exceptions' str/repr/args and fields (OSError errno/filename, Unicode errors, SyntaxError), runtime errors with their fields, `iter(f, sentinel)`, generator attributes, `__format__`, `os.stat_result`, live `exec` namespaces, recursive reprs (72 pass under python3) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
@@ -1006,6 +1007,15 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   platform, getpass, logging, unittest, queue, itertools, functools,
   operator, heapq, bisect, copy, contextlib, re (a native engine with
   selective memoization - no catastrophic backtracking).
+- **Python's syntax** (vm_audit84): Nython's extra keywords are soft - a
+  keyword only where its construct starts (`new A()`, `var x`, `unless c:`),
+  a name elsewhere (`new = old + 1`, `def f(ref):`, `print = log`); only
+  elseif/super and the literals stay reserved (`keyword.nyhardkwlist`).
+  A statement starting with `{` is a block only when it is not an
+  expression; `x = 1, 2` and `return a, b` are tuples; unpacking checks
+  counts; every augmented operator tries its in-place dunder; comparisons
+  chain at one level; `except*` and ExceptionGroup (prelude); `\N{name}`
+  escapes and `lib/unicodedata.ny` (`src/NyUniNames.cpp`).
 
 ## Transcripts
 

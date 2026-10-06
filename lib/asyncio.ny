@@ -28,8 +28,8 @@
 #
 # Differences from Python, on purpose or for now:
 #   - a TaskGroup whose children fail raises the error itself when one child
-#     failed, an ExceptionGroup (this module's) when several did: Nython has
-#     no `except*`, so the common case stays catchable by type;
+#     failed, an ExceptionGroup (the builtin; `except*` splits it) when
+#     several did, so the common case stays catchable by type;
 #   - wait() returns (done, pending) as sets of Task objects;
 #   - the low-level transports/protocols API (loop.create_connection with a
 #     protocol factory) is not provided: streams cover the same ground;
@@ -69,11 +69,8 @@ class LimitOverrunError(Exception):
         self.consumed = consumed
         super().__init__(message)
 
-class ExceptionGroup(Exception):
-    def __init__(self, message, exceptions):
-        self.message = message
-        self.exceptions = exceptions
-        super().__init__(message + " (" + str(len(exceptions)) + " sub-exceptions)")
+# the builtin (the prelude's, round 77: `except*` takes it apart)
+ExceptionGroup = ExceptionGroup
 
 FIRST_COMPLETED = "FIRST_COMPLETED"
 FIRST_EXCEPTION = "FIRST_EXCEPTION"

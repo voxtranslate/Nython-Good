@@ -724,6 +724,10 @@ struct LambdaNode : Node {
     std::vector<node_ptr> params; node_ptr body;
     std::vector<node_ptr> defaults; // default values for parameters
     std::string qualname;   // "<lambda>", "f.<locals>.<lambda>" (round 77)
+    size_t posonly = 0;     // parameters before a bare `/` (round 77)
+    // The interpreter binds a lambda's arguments as a def's
+    // (bindParamsImpl): this FunctionNode carries its signature (round 77).
+    node_ptr sig;
     LambdaNode(Token t, node_ptr b) : Node(t, NodeType::LAMBDA), params{}, body(b), defaults{} {}
     Node* add(node_ptr n) override { params.push_back(n); return this; }
     Value eval(Context* ctx) override {

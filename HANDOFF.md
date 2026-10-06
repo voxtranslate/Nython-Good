@@ -197,6 +197,94 @@ membership), `frozenset`, the full API and operators; `dict | dict`.
 - `from __future__ import annotations` (PEP 563) and the other `__future__`
   names are accepted; `annotations` keeps annotations as text (below).
 
+### Python's syntax (vm_audit84, 212 checks, passes under python3)
+A conformance battery over Python 3.11's grammar (`Grammar/python.gram`,
+`type X =` aside): the forms the parser rejected or compiled wrongly, and
+the rest of the statement and expression grammar beside them. Mostly
+`src/Parser.cpp`; where the engines had to change, both did.
+- **Nython's extra keywords are soft** (`nameKeyword` in Parser.cpp: repeat,
+  execute, delete, default, final, loop, block, use, static, public,
+  private, protected, abstract, print, typeof, sizeof, ref, let, var, const,
+  namespace, package, interface, struct, enum, end, fn, fun, function, new,
+  do, switch, case, then, extends, inherits, implements, unless, until,
+  equals, instanceof, subclassof, parentof, self, this): each is a keyword
+  only where its construct starts and a name everywhere else - `new = old +
+  1`, `def f(ref, new=1):`, `obj.self`, `match = re.match(...)`, `print =
+  log`, `class K: var = 1`, `self` outside a method, keyword arguments
+  `f(default=1)`, `nonlocal end`. At the start of a statement the word is a
+  name when the next token cannot begin its construct (`usedAsName`: `=`,
+  an augmented `=`, `.`, `,`, `[`-less operators, `)` ...), so `print -1`,
+  `unless (x):`, `repeat 3:` stay statements; `var`/`let`/`const`/`ref`
+  declare only when a name follows (`declFollows`). `match` is a statement
+  only on a `match subject:` header line. `this` means the receiver only
+  inside a method whose first parameter is self/this. `lib/keyword.ny`:
+  `nyhardkwlist` (elseif false none null super true undefined - still
+  reserved), `nysoftkwlist`, `isnysoftkeyword`.
+- **Imports, del, classes, lambdas**: `import os, sys`, `import a.b as c,
+  d`, `from os import path as p`, `import os.path` (both engines bind `os`
+  and give `os.path` its namespace); `del a, b`, `del x[0], y.z`, `del (a,
+  [b])`; dotted bases `class K(weakref.ref)`, `class E(m.Base,
+  metaclass=m.M)`, `class C(**kw)` (stored as keyword `"**"`, merged by
+  both engines); lambdas take Python's whole parameter list (`lambda *,
+  k:`, `*a, **kw`, `a, /, b`, defaults, keyword-only defaults) and bind
+  through the same code as def on the interpreter (`LambdaNode::sig`).
+- **Expression statements are evaluated in every form**: a statement that
+  starts with `{` is a block only when it is not an expression
+  (`braceIsExpression`: a `key: value`/comma display, or an operator/`[`/
+  `.`/`(` after the closing brace), so `{}["x"]` raises KeyError and
+  `{"a": 1}.items()` runs; `x = 1, 2` and `f(), g()` are tuples.
+- **Assignment**: `a = b = c, d = 1, 2` (each target group gets the value),
+  `i, = x`, `*rest` anywhere, nested targets; unpacking checks counts on both
+  engines with Python's messages ("too many values to unpack (expected 2)",
+  "not enough values to unpack (expected at least 3, got 2)"), sets and dicts
+  unpack by iteration; assigning to a literal, call or operator is a
+  SyntaxError ("cannot assign to literal", ...). A builtin or prelude name
+  assigned inside a function becomes a local there (interpreter
+  `assignName`: `typeof = 3` in a function clobbered the builtin).
+- **Augmented assignment**: `@=` is a token (`TokenType::MatMulAssign`);
+  every augmented operator tries the in-place dunder first (`__imatmul__`,
+  `__ior__`, `__ipow__`, `__ifloordiv__` ...) then the binary one, on both
+  engines (VM opcode `INPLACE_TRY`).
+- **for / with targets**: `for a, *b in`, `for (p, q), r in`, `for [m, n]
+  in`, `for o.attr in`, `for d[k] in`, `for x, in`; `with (A() as a, B() as
+  b):`, `with f() as (x, y):`, `with f() as o.attr:`.
+- **Comparisons**: one precedence level for every comparison operator, any
+  chain (`a < b == c != d in e`), each middle operand evaluated once (a
+  walrus temporary `__cmpN__`).
+- **Literals**: `0x_ff`, `0b1_0`, `5.` before `)`/`,`/space, `u"..."`,
+  `F"..."`, `rf"..."`/`fr"..."`, `\N{EM DASH}` in strings and bytes
+  (`src/NyUniNames.cpp`: all 138,552 Unicode 14 names CPython 3.11 knows,
+  derived CJK/Hangul names included, 250 KB compressed in
+  `include/NyUniNamesData.hpp`, made by `tools/gen_unicode_names.py`, decoded
+  on first use); `lib/unicodedata.ny` has `lookup`, `name`,
+  `unidata_version`; f-string fields may be padded (`{ x }`).
+- **Subscripts**: `a[1:2, ::3]` hands `__getitem__` a tuple of slice
+  objects.
+- **Decorators** are any expression (PEP 614: `@buttons[0].clicked`,
+  `@(lambda f: f)`).
+- **match**: bytes and complex literal patterns (`2 + 3j`), sequence
+  patterns match tuples, star captures.
+- **return / yield** of `a, b` and `*xs, y` are tuples.
+- **print**: `print(x, file=f)` with keywords or `*args` is the call form
+  even at statement start (`_ny_print`), and `print` is a value in
+  expressions.
+- **Exception groups (PEP 654)**: `BaseExceptionGroup` / `ExceptionGroup`
+  in the prelude (`__new__` picking ExceptionGroup when every member is an
+  Exception, validation messages, `split`, `subgroup`, `derive`, str and
+  repr) - asyncio's own ExceptionGroup is now the builtin; `except*` is
+  desugared by the parser onto `_ny_star_begin/_match/_raised/_finish`,
+  which follow CPython's `PrepReraiseStar`: a naked exception is wrapped,
+  each clause gets the matching subgroup, the unhandled rest is re-raised
+  with the original group's structure, new raises join it as
+  `ExceptionGroup("", [...])`; mixing `except` and `except*` is a
+  SyntaxError.
+- **Unary operators** on a non-number raise TypeError ("bad operand type for
+  unary -: 'str'") on both engines (the interpreter returned none).
+- **Exception repr** on the interpreter is `Type(*args)` with each
+  argument's repr (`ValueError(1)`; it gave `ValueError('1')`).
+- **Walrus in a comprehension** binds in the enclosing function (PEP 572),
+  generator expressions included (VM opcode `DEFINE_OUTER`).
+
 ### Classes: the machinery typing, dataclasses, enum and abc stand on (vm_audit79, 43 checks, passes under python3)
 - **Annotations are kept** (they were parsed and dropped): a function's
   parameter and return annotations are its `__annotations__` (a dict display
@@ -694,6 +782,14 @@ Nython over the class machinery above; each header says what is not there.
   engines' own namespace before the metaclass sees it), and `type.__new__`
   called by a metaclass for a *different* name than the statement's makes a
   new class rather than adopting it.
+- Syntax (vm_audit84): `class C(*bases)`; a statement that is only a set
+  display (`{x}` alone on a line) is still a block; `return`/`break`/
+  `continue` inside an `except*` clause are not rejected; `\N{}` knows no
+  name aliases or named sequences, and unicodedata has only `lookup`/`name`;
+  `elseif` and `super` stay reserved words; a walrus in a generator
+  expression consumed after its function returned binds nowhere visible;
+  rebinding `self` in a scope nested inside a method; int's dunder methods
+  as values (`(5).__add__`).
 - Video/audio builtins remain stubs (no codec library).
 
 ## 0o. Round 76 — the "Not done" lists closed
