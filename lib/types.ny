@@ -17,14 +17,19 @@
 #                         a module object (__name__ __doc__ __package__
 #                         __loader__ __spec__, attributes); isinstance() is
 #                         also true for the namespaces `import m` binds
-# MethodType(func, obj)   func bound to obj: __func__ __self__, calling it
-#                         passes obj first; isinstance() is true for the
-#                         engines' bound methods too
-# FunctionType, LambdaType, BuiltinFunctionType, BuiltinMethodType,
-# GeneratorType, AsyncGeneratorType, CoroutineType, CodeType, CellType,
-# FrameType, TracebackType, WrapperDescriptorType, MethodWrapperType,
+# FunctionType, LambdaType, MethodType, BuiltinFunctionType,
+# BuiltinMethodType, GeneratorType, NoneType
+#                         the runtime's own type objects: type(f) is
+#                         FunctionType, type(obj.m) is MethodType,
+#                         type(len) and type([].append) BuiltinFunctionType,
+#                         type(None) is NoneType (NoneType() is None);
+#                         MethodType(func, obj) binds func to obj (__func__
+#                         __self__; a callable that is not a function gives
+#                         a binding of another type)
+# AsyncGeneratorType, CoroutineType, CodeType, CellType, FrameType,
+# TracebackType, WrapperDescriptorType, MethodWrapperType,
 # MethodDescriptorType, ClassMethodDescriptorType, GetSetDescriptorType,
-# MemberDescriptorType, NoneType, NotImplementedType
+# MemberDescriptorType, NotImplementedType
 #                         stand-ins (see below) whose isinstance() is true
 #                         for the corresponding values of both engines
 # EllipsisType            type(...)          GenericAlias  list[int]'s type
@@ -37,15 +42,12 @@
 #                         metaclass's __getattr__ (enum uses it)
 # coroutine(func)         marks a generator function as a coroutine
 #
-# How the stand-ins work: the runtime has no type object for functions,
-# builtins, None or generators (type(f) is the string "function", type(None)
-# is "none" - HANDOFF §0p), so FunctionType and friends are classes whose
-# metaclass answers isinstance() by asking what the value is (the engines'
-# _ny_fn_info for functions, the legacy type names for builtins and
-# generators). isinstance(f, types.FunctionType) holds; `type(f) is
-# types.FunctionType` does not. NoneType() returns None, NotImplementedType()
-# NotImplemented. FunctionType(code, globals) cannot build a function (there
-# is no code object to run): it raises TypeError.
+# How the stand-ins work: the runtime has no type object for coroutines,
+# code, frames, tracebacks, cells or the C-level descriptors, so those are
+# classes whose metaclass answers isinstance() by asking what the value is.
+# NotImplementedType() returns NotImplemented. FunctionType(code, globals)
+# cannot build a function (there is no code object to run): it raises
+# TypeError.
 #
 # Not here: CapsuleType (3.13), the frame/traceback/code objects themselves
 # (the stand-ins recognise duck-typed ones), types.coroutine making a
@@ -104,23 +106,6 @@ def _stand_in(name, check, call=None):
     return cls
 
 
-def _check_function(x):
-    try:
-        return _ny_fn_info(x) is not None and not hasattr(x, "__self__")
-    except Exception:
-        return False
-
-
-def _check_builtin(x):
-    return type(x) == "builtin" and not _is_class(x)
-
-
-def _check_generator(x):
-    # real generators have send/throw; the lazy iterators (zip, map, iter(...))
-    # say "generator" too but do not
-    return isinstance(x, "generator") and hasattr(x, "send") and hasattr(x, "throw")
-
-
 def _check_asyncgen(x):
     return isinstance(x, _NyAsyncGen)
 
@@ -137,10 +122,6 @@ def _check_traceback(x):
     return hasattr(x, "tb_frame") and hasattr(x, "tb_lineno") and hasattr(x, "tb_next")
 
 
-def _check_none(x):
-    return x is None
-
-
 def _check_notimpl(x):
     return x is NotImplemented
 
@@ -155,27 +136,35 @@ def _cannot_make(name):
     return make
 
 
-def _no_function(*args, **kw):
-    raise TypeError("cannot create 'function' instances on this runtime (functions come from def and lambda)")
-
-
-def _none_new(*args, **kw):
-    if len(args) > 0 or len(kw) > 0:
-        raise TypeError("NoneType takes no arguments")
-    return None
-
-
 def _notimpl_new(*args, **kw):
     if len(args) > 0 or len(kw) > 0:
         raise TypeError("NotImplementedType takes no arguments")
     return NotImplemented
 
 
-FunctionType = _stand_in("function", _check_function, _no_function)
+# The runtime's own type objects (round 77): type(f) is types.FunctionType
+def _ny_sample_function():
+    pass
+
+
+def _ny_sample_generator():
+    yield 1
+
+
+class _NySampleClass:
+    def method(self):
+        pass
+
+
+FunctionType = type(_ny_sample_function)
 LambdaType = FunctionType
-BuiltinFunctionType = _stand_in("builtin_function_or_method", _check_builtin)
+BuiltinFunctionType = type(len)
 BuiltinMethodType = BuiltinFunctionType
-GeneratorType = _stand_in("generator", _check_generator)
+var _ny_sample_gen = _ny_sample_generator()
+GeneratorType = type(_ny_sample_gen)
+_ny_sample_gen.close()
+MethodType = type(_NySampleClass().method)
+NoneType = type(None)
 AsyncGeneratorType = _stand_in("async_generator", _check_asyncgen)
 CoroutineType = _stand_in("coroutine", _check_nothing)
 CodeType = _stand_in("code", _check_code)
@@ -188,60 +177,12 @@ MethodDescriptorType = _stand_in("method_descriptor", _check_nothing)
 ClassMethodDescriptorType = _stand_in("classmethod_descriptor", _check_nothing)
 GetSetDescriptorType = _stand_in("getset_descriptor", _check_nothing)
 MemberDescriptorType = _stand_in("member_descriptor", _check_nothing)
-NoneType = _stand_in("NoneType", _check_none, _none_new)
 NotImplementedType = _stand_in("NotImplementedType", _check_notimpl, _notimpl_new)
 
 # Real classes the prelude already has
 EllipsisType = type(Ellipsis)
 GenericAlias = _NyGenericAlias
 UnionType = _NyUnionType
-
-
-# ── MethodType ───────────────────────────────────────────────────────────────
-class _MethodTypeMeta(type):
-    def __instancecheck__(cls, obj):
-        if type(obj) is cls:
-            return True
-        if isinstance(obj, _NyMetaBound):
-            return True
-        try:
-            return _ny_fn_info(obj) is not None and hasattr(obj, "__self__") and hasattr(obj, "__func__")
-        except Exception:
-            return False
-    def __repr__(cls):
-        return "<class 'method'>"
-
-
-class MethodType(metaclass=_MethodTypeMeta):
-    # MethodType(func, obj): func with obj as its first argument
-    def __init__(self, func, obj):
-        if not callable(func):
-            raise TypeError("first argument must be callable")
-        if obj is None:
-            raise TypeError("instance must not be None")
-        self.__func__ = func
-        self.__self__ = obj
-
-    def __call__(self, *args, **kw):
-        return self.__func__(self.__self__, *args, **kw)
-
-    def __getattr__(self, name):
-        # everything else is the function's (__name__, __doc__, attributes)
-        return getattr(self.__func__, name)
-
-    def __eq__(self, other):
-        if not isinstance(other, MethodType):
-            return NotImplemented
-        return self.__func__ == other.__func__ and self.__self__ is other.__self__
-
-    def __hash__(self):
-        return hash(id(self.__self__)) ^ hash(id(self.__func__))
-
-    def __repr__(self):
-        return "<bound method " + getattr(self.__func__, "__qualname__", "?") + " of " + repr(self.__self__) + ">"
-
-MethodType.__name__ = "method"
-MethodType.__qualname__ = "method"
 
 
 # ── SimpleNamespace ──────────────────────────────────────────────────────────

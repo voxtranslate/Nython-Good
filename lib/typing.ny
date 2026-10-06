@@ -57,10 +57,9 @@
 # dataclass_transform override (3.12) TYPE_CHECKING Text AnyStr IO TextIO
 # BinaryIO
 #
-# Nython only: the runtime's type(None) is the string "none"; given to a
-# form (Union[int, type(None)]) it is NoneType, as type(None) is in CPython.
-# The NoneType that appears in __args__ is types.NoneType (a stand-in class:
-# isinstance(None, NoneType), repr "NoneType").
+# The NoneType that appears in __args__ is types.NoneType, which is
+# type(None), as in CPython; the legacy name string "none" given to a form
+# is taken as NoneType too (Nython only).
 #
 # Innovation: check_type(value, tp) - a runtime check of a value against an
 # annotation, recursively (List[int], Dict[str, Optional[int]],

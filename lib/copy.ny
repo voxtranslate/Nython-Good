@@ -53,15 +53,22 @@ def _is_atomic(x):
         return true
     return false
 
+def _runtime_kind(x):
+    # a function, bound method, builtin or generator / lazy iterator: kinds
+    # whose type object (round 77) equals its legacy name
+    var t = type(x)
+    return t == "function" or t == "builtin" or t == "generator"
+
 def _is_instance(x):
-    # an instance of a class (builtin values have no __class__ here)
-    return hasattr(x, "__class__") and not hasattr(x, "__mro__")
+    # an instance of a class (builtin values answer __class__ too)
+    return hasattr(x, "__class__") and not hasattr(x, "__mro__") and not _runtime_kind(x)
 
 def _is_class(x):
     return hasattr(x, "__mro__") and not hasattr(x, "__class__")
 
 def _is_generator(x):
-    return _tname(x) == "generator"
+    # a generator or a lazy iterator (zip, map, iter(...))
+    return type(x) == "generator"
 
 
 # ── making an instance without __init__ ──────────────────────────────────────
@@ -190,7 +197,7 @@ def copy(x):
         _set_state(y, _state_of(x))
         return y
     if _is_generator(x):
-        raise TypeError("cannot pickle 'generator' object")
+        raise TypeError("cannot pickle '" + _tname(x) + "' object")
     if callable(x):
         return x
     raise Error("un(shallow)copyable object of type " + _tname(x))
@@ -257,7 +264,7 @@ def deepcopy(x, memo=none, _nil=[]):
     elif _is_instance(x):
         y = _deepcopy_instance(x, memo)
     elif _is_generator(x):
-        raise TypeError("cannot pickle 'generator' object")
+        raise TypeError("cannot pickle '" + _tname(x) + "' object")
     elif callable(x):
         y = x
     else:

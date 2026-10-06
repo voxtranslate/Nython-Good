@@ -529,6 +529,11 @@ class LinearRegression:
             return (self.slope, self.intercept) == other
         return false
 
+    def __hash__(self):
+        # hashable as the namedtuple it stands for (round 77: a class
+        # defining __eq__ alone is unhashable)
+        return hash((self.slope, self.intercept))
+
     def __repr__(self):
         return "LinearRegression(slope=" + repr(self.slope) + ", intercept=" + repr(self.intercept) + ")"
 

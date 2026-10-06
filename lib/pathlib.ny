@@ -710,6 +710,11 @@ class _PathStatResult:
             return self._tuple() == other._tuple()
         return self._tuple() == other
 
+    def __hash__(self):
+        # hashable, as os.stat_result is (round 77: a class defining __eq__
+        # alone is unhashable)
+        return hash(self._tuple())
+
     def __repr__(self):
         var t = self._tuple()
         return ("os.stat_result(st_mode=" + str(t[0]) + ", st_ino=" + str(t[1]) + ", st_dev=" + str(t[2]) +

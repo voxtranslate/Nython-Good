@@ -45,6 +45,12 @@ class Inspector:
         var t = type(v)
         if isinstance(t, "str"):
             return t
+        # None, functions, bound methods, builtins and generators have type
+        # objects of their own too (round 77): their legacy names, which
+        # those type objects equal
+        for k in ["none", "function", "builtin", "generator"]:
+            if t == k:
+                return k
         var n = t.__name__
         if n == "str":
             return "string"

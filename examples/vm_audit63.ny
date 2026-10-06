@@ -265,7 +265,11 @@ check("zip still iterates", list(lz), [(1, 4), (2, 5), (3, 6)])
 check("isinstance of a generator", isinstance(three(), "generator"), true)
 check("isinstance of a lazy zip", isinstance(zip(three()), "generator"), true)
 check("a list is not one", isinstance([1], "generator"), false)
-check("type of each", [type(three()), type(zip(three())), type(enumerate(three()))], ["generator", "generator", "generator"])
+# their types are type objects with Python's names, each still equal to the
+# legacy name "generator" (vm_audit86)
+check("type of each", [type(three()).__name__, type(zip(three())).__name__, type(enumerate(three())).__name__,
+                       type(three()) == "generator", type(zip(three())) == "generator"],
+      ["generator", "zip", "enumerate", true, true])
 
 # ── sys.maxsize ──────────────────────────────────────────────────────────
 import sys

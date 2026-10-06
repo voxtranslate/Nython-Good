@@ -262,6 +262,100 @@ def _ny_print(*args, **kw):
         file.flush()
     return none
 
+class property:
+    # Python's property, a data descriptor (round 77): C.__dict__["p"] and C.p
+    # are this object, obj.p runs fget, obj.p = v fset, del obj.p fdel. The
+    # engines call fget/fset/fdel of this exact class directly (no __get__
+    # frame); a subclass goes through its own __get__/__set__/__delete__.
+    def __init__(self, fget=None, fset=None, fdel=None, doc=None):
+        self.fget = fget
+        self.fset = fset
+        self.fdel = fdel
+        # the getter's docstring when none is given (CPython's getter_doc)
+        self._ny_doc_from_fget = false
+        if doc is None and fget is not None:
+            doc = getattr(fget, "__doc__", None)
+            self._ny_doc_from_fget = doc is not None
+        self.__doc__ = doc
+        self._ny_name = None
+        var ab = false
+        for f in (fget, fset, fdel):
+            if f is not None and getattr(f, "__isabstractmethod__", false):
+                ab = true
+        self.__isabstractmethod__ = ab
+    def __set_name__(self, owner, name):
+        self._ny_name = name
+    def _ny_copy(self, fget, fset, fdel):
+        # CPython's property_copy: None keeps the old function
+        if fget is None:
+            fget = self.fget
+        if fset is None:
+            fset = self.fset
+        if fdel is None:
+            fdel = self.fdel
+        var p = type(self)(fget, fset, fdel, None if self._ny_doc_from_fget and fget is not None else self.__doc__)
+        p._ny_name = self._ny_name
+        return p
+    def getter(self, fget):
+        return self._ny_copy(fget, self.fset, self.fdel)
+    def setter(self, fset):
+        return self._ny_copy(self.fget, fset, self.fdel)
+    def deleter(self, fdel):
+        return self._ny_copy(self.fget, self.fset, fdel)
+    def _ny_err(self, obj, what):
+        var n = "" if self._ny_name is None else " " + repr(self._ny_name)
+        return AttributeError("property" + n + " of " + repr(type(obj).__name__) + " object has no " + what)
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        if self.fget is None:
+            raise self._ny_err(obj, "getter")
+        return self.fget(obj)
+    def __set__(self, obj, value):
+        if self.fset is None:
+            raise self._ny_err(obj, "setter")
+        self.fset(obj, value)
+    def __delete__(self, obj):
+        if self.fdel is None:
+            raise self._ny_err(obj, "deleter")
+        self.fdel(obj)
+
+def _ny_copy_wrapped(w, f):
+    # what staticmethod/classmethod copy from the function (3.10+)
+    for a in ("__module__", "__name__", "__qualname__", "__doc__"):
+        try:
+            _ny_setattr_raw(w, a, getattr(f, a))
+        except Exception:
+            pass
+    w.__wrapped__ = f
+    w.__isabstractmethod__ = bool(getattr(f, "__isabstractmethod__", false))
+
+class staticmethod:
+    # staticmethod(f) (round 77): a class body's staticmethod objects are
+    # taken apart by the engines when the class is made (the function marked
+    # static), and C.__dict__ gives this object back.
+    def __init__(self, f):
+        self.__func__ = f
+        _ny_copy_wrapped(self, f)
+    def __get__(self, obj, objtype=None):
+        return self.__func__
+    def __call__(self, *args, **kw):
+        return self.__func__(*args, **kw)
+    def __repr__(self):
+        return "<staticmethod(" + repr(self.__func__) + ")>"
+
+class classmethod:
+    # classmethod(f) (round 77), taken apart like staticmethod
+    def __init__(self, f):
+        self.__func__ = f
+        _ny_copy_wrapped(self, f)
+    def __get__(self, obj, objtype=None):
+        if objtype is None:
+            objtype = type(obj)
+        return _ny_method_new(self.__func__, objtype)
+    def __repr__(self):
+        return "<classmethod(" + repr(self.__func__) + ")>"
+
 class ellipsis:
     # the type of `...` (round 77)
     def __repr__(self):

@@ -287,11 +287,79 @@ inline bool is_builtin_type_name(const std::string& n) {
     for (const char* x : names) if (n == x) return true;
     return false;
 }
+// The prelude's classes that are builtins in Python (round 77): shown as such.
+inline bool is_prelude_builtin_class(const std::string& n) {
+    return n == "property" || n == "staticmethod" || n == "classmethod" || n == "ellipsis";
+}
 inline std::string class_repr(const std::string& full) {
     std::string n = shown_class_name(full);
-    if (is_builtin_type_name(n)) return "<class '" + n + "'>";
+    if (is_builtin_type_name(n) || (n == full && is_prelude_builtin_class(n))) return "<class '" + n + "'>";
     if (n.find('.') == std::string::npos) n = "__main__." + n;
     return "<class '" + n + "'>";
+}
+
+// ── Type objects of the runtime's own kinds (round 77) ──────────────────────
+// None, functions, bound methods, builtins, generators and the lazy iterators
+// have type objects too (type(None) is NoneType, type(f) the function type):
+// tagged "__rtype__:<name>" on both engines, never global names. Each still
+// equals the legacy name type() gave for it (type(f) == "function").
+struct RuntimeType { const char* name; const char* legacy; const char* module; };
+inline const RuntimeType* runtime_type(const std::string& n) {
+    static const RuntimeType t[] = {
+        {"NoneType", "none", "builtins"},
+        {"function", "function", "builtins"},
+        {"method", "function", "builtins"},
+        {"builtin_function_or_method", "builtin", "builtins"},
+        {"generator", "generator", "builtins"},
+        {"zip", "generator", "builtins"}, {"map", "generator", "builtins"},
+        {"filter", "generator", "builtins"}, {"enumerate", "generator", "builtins"},
+        {"islice", "generator", "itertools"},
+        {"list_iterator", "generator", "builtins"}, {"tuple_iterator", "generator", "builtins"},
+        {"str_iterator", "generator", "builtins"}, {"str_ascii_iterator", "generator", "builtins"},
+        {"dict_keyiterator", "generator", "builtins"},
+        {"set_iterator", "generator", "builtins"}, {"bytes_iterator", "generator", "builtins"},
+        {"bytearray_iterator", "generator", "builtins"},
+        {"range_iterator", "generator", "builtins"}, {"iterator", "generator", "builtins"},
+    };
+    for (auto& x : t) if (n == x.name) return &x;
+    return nullptr;
+}
+inline std::string runtime_type_repr(const RuntimeType& t) {
+    return std::string("<class '") + (std::string(t.module) == "builtins" ? "" : std::string(t.module) + ".") + t.name + "'>";
+}
+// What every object answers to (CPython 3.11's dir(object())), and what an
+// instance of a class made by a class statement adds - dir() lists them as
+// Python does (round 77).
+inline const std::vector<std::string>& object_dir_names() {
+    static const std::vector<std::string> n = {
+        "__class__", "__delattr__", "__dir__", "__doc__", "__eq__", "__format__", "__ge__",
+        "__getattribute__", "__getstate__", "__gt__", "__hash__", "__init__", "__init_subclass__",
+        "__le__", "__lt__", "__ne__", "__new__", "__reduce__", "__reduce_ex__", "__repr__",
+        "__setattr__", "__sizeof__", "__str__", "__subclasshook__"};
+    return n;
+}
+inline const std::vector<std::string>& class_dir_names() {
+    static const std::vector<std::string> n = {"__dict__", "__module__", "__weakref__"};
+    return n;
+}
+// A dict's own methods (round 77): read with `.` they win over a key of the
+// same name (d = {"get": 1}; d.get("x") is the method), so code calling them
+// on any dict is safe; any other name still reads the key (Nython's d.key).
+inline bool is_dict_method_name(const std::string& n) {
+    static const char* const names[] = {"keys", "values", "items", "get", "pop", "popitem", "setdefault",
+                                        "update", "clear", "copy", "fromkeys"};
+    for (const char* x : names) if (n == x) return true;
+    return false;
+}
+// The iterator iter(x) gives for a value whose type is named `tn` (a str:
+// `ascii`, all its characters ASCII, as CPython 3.11 names it).
+inline std::string iterator_type_for(const std::string& tn, bool ascii = true) {
+    if (tn == "list" || tn == "tuple" || tn == "set" || tn == "bytes") return tn + "_iterator";
+    if (tn == "frozenset") return "set_iterator";
+    if (tn == "bytearray") return "bytearray_iterator";
+    if (tn == "str") return ascii ? "str_ascii_iterator" : "str_iterator";
+    if (tn == "dict") return "dict_keyiterator";
+    return "iterator";
 }
 
 // `from m import a as b`: ImportNode::names holds "a\x05b" (the parser);

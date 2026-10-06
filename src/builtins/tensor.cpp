@@ -371,6 +371,12 @@ Value dispatch_tensor(NythonExecutor& E,
             return E.makeStringValue(line);
         }
         if (name == "isinstance") {
+            // a runtime type object (NoneType, function, method, generator,
+            // list_iterator ...): exactly that kind - round 77
+            if (args.size() >= 2 && E.runtimeTypeOf(args[1])) {
+                Value t = E.typeObjectOf(args[0]);
+                return Value(t.type == ValueType::USERDATA && t.value.p == args[1].value.p);
+            }
             // isinstance(x, int | str): any of the union's types (round 77)
             if (args.size() >= 2 && E.isInstanceValue(args[1]) && E.shownClassName(E.instanceClassName(args[1])) == "_NyUnionType") {
                 Value ua = args[1];
@@ -388,6 +394,10 @@ Value dispatch_tensor(NythonExecutor& E,
                 std::vector<Value> one{args[0]};
                 return Value(E.isTruthy(E.callMethod(args[1], "__instancecheck__", one, ctx)));
             }
+            // everything is an object: isinstance(5, object), (C, object),
+            // (None, object) - round 77
+            if (args.size() >= 2 && E.classNodeOfValue(args[1]) && E.classNodeOfValue(args[1]) == E.classNodeByName("object"))
+                return Value(true);
             // a metaclass's __instancecheck__; isinstance(C, type) / (C, M)
             if (args.size() >= 2 && E.classNodeOfValue(args[1])) {
                 if (!E.class_meta_.empty()) {

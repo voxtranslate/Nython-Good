@@ -956,7 +956,10 @@ void close(NythonExecutor& E, Gen* g) {
     if (yielded) raise("RuntimeError", "generator ignored GeneratorExit");
 }
 
-std::string type_name(const Gen*) { return "generator"; }
+// Python's name of the generator's type (round 77): "generator" for a
+// generator function's or a generator expression's, the lazy builtin's own
+// for the others (zip, map, filter, enumerate, islice, list_iterator ...).
+std::string type_name(const Gen* g) { return g && g->kind == Kind::Native ? g->name : std::string("generator"); }
 
 bool method(NythonExecutor& E, const Value& obj, const std::string& name, std::vector<Value>& args,
             Context* ctx, Value& out) {
@@ -1284,7 +1287,13 @@ Value make_iter(NythonExecutor& E, const Value& v, Context* ctx) {
     open(E, v, ctx, cu);
     if (cu.k == Cursor::GEN) return cu.hold;   // __iter__ returned a generator
     if (cu.k == Cursor::INST && E.isInstanceValue(cu.it)) return cu.it;
+    // named as Python names it: list_iterator, str_iterator, ... (round 77)
+    std::string py, legacy;
+    std::string tn = E.typeObjectNames(E.typeObjectOf(v), py, legacy) ? py : std::string();
+    bool ascii = true;
+    if (tn == "str") for (unsigned char ch : E.getStringValue(v)) if (ch >= 0x80) { ascii = false; break; }
     Value res = make_native(E, Op::Iter, "iterator");
+    gen_of(res)->name = nyrt::iterator_type_for(tn, ascii);
     gen_of(res)->src.push_back(std::move(cu));
     return res;
 }

@@ -566,6 +566,12 @@ Value dispatch_core(NythonExecutor& E,
             if (E.isExceptionClass(cname)) { std::vector<Value> none; E.setExceptionArgs(inst, none); }
             return inst;
         }
+        // _ny_method_new(f, obj): f bound to obj (classmethod.__get__,
+        // types.MethodType) - round 77
+        if (name == "_ny_method_new") {
+            if (args.size() != 2) E.pyRaise("TypeError", "method expected 2 arguments, got " + std::to_string(args.size()));
+            return E.methodNew(args[0], args[1], ctx);
+        }
         if (name == "_ny_subclasses") return E.subclassesOf(args.empty() ? NONE_VALUE : args[0]);
         // a function's parameters, flags and place (inspect; round 77)
         if (name == "_ny_fn_info") return E.fnInfo(args.empty() ? NONE_VALUE : args[0]);
