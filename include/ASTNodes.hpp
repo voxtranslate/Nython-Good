@@ -702,6 +702,12 @@ struct FunctionNode : Node {
     // def runs (each value through _ny_ann: a name not defined yet gives the
     // annotation's source text). Null when it has none (round 77).
     node_ptr annotations;
+    // For inspect / __code__ / __qualname__ (round 77): Python's qualified
+    // name ("C.m", "f.<locals>.g"), and whether it was an `async def` (the
+    // parser rewrites its body - async_def_desugar - so nothing else says).
+    std::string qualname;
+    bool is_async = false, is_async_gen = false;
+    int first_line = 0;   // a decorated def: its first decorator's line (co_firstlineno)
     FunctionNode(Token t, const std::string& n, node_ptr b, bool m=false) : Node(t, NodeType::FUNCTION), name(n), params{}, body(b), is_method(m), defaults{} {}
     Node* add(node_ptr n) override { params.push_back(n); return this; }
     Value eval(Context* ctx) override {
@@ -717,6 +723,7 @@ struct FunctionNode : Node {
 struct LambdaNode : Node {
     std::vector<node_ptr> params; node_ptr body;
     std::vector<node_ptr> defaults; // default values for parameters
+    std::string qualname;   // "<lambda>", "f.<locals>.<lambda>" (round 77)
     LambdaNode(Token t, node_ptr b) : Node(t, NodeType::LAMBDA), params{}, body(b), defaults{} {}
     Node* add(node_ptr n) override { params.push_back(n); return this; }
     Value eval(Context* ctx) override {

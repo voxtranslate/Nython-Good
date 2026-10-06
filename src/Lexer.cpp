@@ -253,6 +253,12 @@ inline ConstArray<TokenDef const> Keywords() {
 	return { KeywordTokens };
 }
 
+std::vector<std::string> keyword_spellings() {
+	std::vector<std::string> out;
+	for (auto& k : KeywordTokens) out.push_back(k.value);
+	return out;
+}
+
 inline bool is_ident_char(char c, bool first = false) {
 	unsigned char uc = static_cast<unsigned char>(c);
 	// Accept ASCII letters, underscore

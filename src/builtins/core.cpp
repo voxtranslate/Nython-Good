@@ -567,6 +567,16 @@ Value dispatch_core(NythonExecutor& E,
             return inst;
         }
         if (name == "_ny_subclasses") return E.subclassesOf(args.empty() ? NONE_VALUE : args[0]);
+        // a function's parameters, flags and place (inspect; round 77)
+        if (name == "_ny_fn_info") return E.fnInfo(args.empty() ? NONE_VALUE : args[0]);
+        if (name == "_ny_fn_globals") return E.fnGlobals(args.empty() ? NONE_VALUE : args[0]);
+        // the lexer's keyword spellings (lib/keyword.ny's nykwlist; the VM
+        // reaches this through the builtin bridge)
+        if (name == "_ny_keywords") {
+            std::vector<Value> ks;
+            for (auto& k : nython::lexer::keyword_spellings()) ks.push_back(E.makeStringValue(k));
+            return E.makeListValue(ks);
+        }
         if (name == "_ny_setattr_raw" && args.size() >= 3) {
             NythonExecutor::RawAttr raw;
             E.setAttr(args[0], E.getStringValue(args[1]), args[2]);

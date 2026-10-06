@@ -439,6 +439,74 @@ class _NyCode:
     def __repr__(self):
         return "<code object <module>, file \"" + self.co_filename + "\", line 1>"
 
+class _NyFuncCode:
+    # f.__code__ (round 77): CPython's code-object attributes, made from
+    # _ny_fn_info(f). co_varnames holds the parameters (args, keyword-only,
+    # *args, **kwargs, as CPython orders them), not the other locals.
+    def __init__(self, info):
+        self.co_name = info[0]
+        self.co_qualname = info[1]
+        self.co_filename = info[5]
+        self.co_firstlineno = info[6]
+        var pos = []
+        var kwonly = []
+        var star = []
+        var npos = 0
+        var flags = 3
+        for p in info[3]:
+            if p[1] == 0:
+                npos = npos + 1
+            if p[1] <= 1:
+                pos.append(p[0])
+            elif p[1] == 3:
+                kwonly.append(p[0])
+            elif p[1] == 2:
+                star.insert(0, p[0])
+                flags = flags | 4
+            else:
+                star.append(p[0])
+                flags = flags | 8
+        self.co_argcount = len(pos)
+        self.co_posonlyargcount = npos
+        self.co_kwonlyargcount = len(kwonly)
+        self.co_varnames = tuple(pos + kwonly + star)
+        self.co_nlocals = len(self.co_varnames)
+        if "<locals>" in info[1]:
+            flags = flags | 16
+        var kind = info[4]
+        if kind & 1:
+            flags = flags | 32
+        if kind & 2:
+            flags = flags | 128
+        if kind & 4:
+            flags = flags | 512
+        self.co_flags = flags
+        self.co_freevars = ()
+        self.co_cellvars = ()
+    def __repr__(self):
+        return "<code object " + self.co_name + ", file \"" + self.co_filename + "\", line " + str(self.co_firstlineno) + ">"
+
+def _ny_fn_attr(f, attr):
+    # A function's __defaults__, __kwdefaults__, __code__, __qualname__,
+    # __module__, __globals__ (round 77; both engines read them here).
+    if attr == "__globals__":
+        return _ny_fn_globals(f)
+    var info = _ny_fn_info(f)
+    if attr == "__qualname__":
+        return info[1]
+    if attr == "__module__":
+        return info[2]
+    if attr == "__code__":
+        return _NyFuncCode(info)
+    if attr == "__defaults__":
+        var d = [p[3] for p in info[3] if p[1] <= 1 and p[2]]
+        return tuple(d) if len(d) > 0 else None
+    var kd = {}
+    for p in info[3]:
+        if p[1] == 3 and p[2]:
+            kd[p[0]] = p[3]
+    return kd if len(kd) > 0 else None
+
 class _NyNotImplementedType:
     # What a binary or comparison dunder returns for an operand it does not
     # handle: the other operand's reflected method is tried next, then

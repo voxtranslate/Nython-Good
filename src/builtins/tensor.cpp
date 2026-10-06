@@ -382,6 +382,12 @@ Value dispatch_tensor(NythonExecutor& E,
                 }
                 return Value(false);
             }
+            // an object whose class defines __instancecheck__ (typing's
+            // List, Union[int, str] ...), as CPython asks type(cls) - round 77
+            if (args.size() >= 2 && E.isInstanceValue(args[1]) && E.instanceHasMethod(args[1], "__instancecheck__")) {
+                std::vector<Value> one{args[0]};
+                return Value(E.isTruthy(E.callMethod(args[1], "__instancecheck__", one, ctx)));
+            }
             // a metaclass's __instancecheck__; isinstance(C, type) / (C, M)
             if (args.size() >= 2 && E.classNodeOfValue(args[1])) {
                 if (!E.class_meta_.empty()) {

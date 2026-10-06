@@ -146,6 +146,10 @@ private:
 
 };
 
+// The spellings of the keyword table (KeywordTokens), in table order - what
+// lib/keyword.ny's nykwlist is derived from (_ny_keywords, round 77).
+std::vector<std::string> keyword_spellings();
+
 }
 
 
