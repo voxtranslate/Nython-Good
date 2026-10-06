@@ -51,6 +51,9 @@ enum : uint16_t {
 // Called when an object with F_WEAKREFD is destroyed (its weak references
 // then give none).
 extern void (*g_weak_hook)(Collectable*);
+// Run at every safe point once set: the callbacks of weak references whose
+// targets died (round 77, nyheap::run_weak_callbacks).
+extern void (*g_weak_cb_hook)();
 
 // Objects used as dict keys (round 76). A dict keyed by an instance or a
 // function stores the object's identity as the key's text, and the engine

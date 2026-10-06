@@ -122,15 +122,23 @@ struct Inst final : Collectable {
 // and none afterwards. value.p == &tag, which func_names lists as the
 // builtin "__weakref__:<n>". Only instances can be weakly referenced (as in
 // Python, not a list, dict, number or string).
+// weakref(obj, callback) (round 77): when the target dies, callback(ref)
+// runs at the next safe point (as __del__ does) unless the ref died first.
 struct Weak final : Collectable {
     std::string tag;
     NythonExecutor* E;
     int64_t id;
     Collectable* target = nullptr;      // not counted; cleared when it dies
     void* payload = nullptr;
+    Value callback;                     // counted; none once called
     Weak(NythonExecutor* e, int64_t i);
     ~Weak() override;
+    void gc_traverse(GcVisitFn visit, void* arg) override;
+    void gc_clear() override;
 };
+// The callbacks of references whose targets died, run at a safe point
+// (nygc::g_weak_cb_hook).
+inline void run_weak_callbacks();
 // A target died: its weak references now give none.
 inline void weak_target_died(Collectable* target);
 inline void weak_register(Weak* w);          // w->target is set

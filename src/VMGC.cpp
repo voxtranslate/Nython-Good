@@ -358,6 +358,7 @@ void safe_point_slow(VirtualMachine& vm) {
         st.finalized++;
         vm.gc_run_finalizer(item.first, item.second);
     }
+    vm.gc_run_weak_callbacks();   // weakref callbacks of dead targets (round 77)
     if (enabled) collect_due(vm);
     in_safe_point = false;
     std::lock_guard<std::mutex> l(queue_mutex());

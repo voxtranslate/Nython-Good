@@ -86,6 +86,21 @@ inline const char* ny_builtin_exc_parent(const std::string& name) {
         // swallow a cancellation.
         {"CancelledError", "BaseException"},
         {"ChannelClosedError", "Exception"},
+        // weakref.proxy's error and the warning categories (round 77,
+        // lib/weakref.ny, lib/warnings.ny): Python's builtins.
+        {"ReferenceError", "Exception"},
+        {"Warning", "Exception"},
+        {"UserWarning", "Warning"},
+        {"DeprecationWarning", "Warning"},
+        {"PendingDeprecationWarning", "Warning"},
+        {"SyntaxWarning", "Warning"},
+        {"RuntimeWarning", "Warning"},
+        {"FutureWarning", "Warning"},
+        {"ImportWarning", "Warning"},
+        {"UnicodeWarning", "Warning"},
+        {"BytesWarning", "Warning"},
+        {"ResourceWarning", "Warning"},
+        {"EncodingWarning", "Warning"},
     };
     auto it = parents.find(name);
     return it == parents.end() ? nullptr : it->second;
@@ -128,6 +143,9 @@ inline const std::vector<std::string>& ny_builtin_exc_names() {
         "BrokenPipeError", "ConnectionRefusedError", "ConnectionResetError",
         "ConnectionAbortedError", "gaierror", "herror",
         "DeadlockError", "LockOrderError", "CancelledError", "ChannelClosedError",
+        "ReferenceError", "Warning", "UserWarning", "DeprecationWarning",
+        "PendingDeprecationWarning", "SyntaxWarning", "RuntimeWarning", "FutureWarning",
+        "ImportWarning", "UnicodeWarning", "BytesWarning", "ResourceWarning", "EncodingWarning",
     };
     return names;
 }

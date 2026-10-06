@@ -235,13 +235,19 @@ int run_program(const Program& prog, bool show_ast = false) {
             exec.execute(ast);
         } catch (std::string& s) {
             // Reported before the program's threads are waited for, as
-            // Python prints the traceback first.
+            // Python prints the traceback first: Python's frames (round 77),
+            // then the located line the IDE and the tools read.
+            if (s.rfind("__exc__:SystemExit", 0) != 0 && s.rfind("__exc__:KeyboardInterrupt", 0) != 0)
+                std::cerr << exec.uncaughtTracebackText(s);
             int rc = report_uncaught_string(s);
-            if (g_inspect) { interactive_interp(exec, (Runnable*)vm_ptr.get(), false); return g_repl_exit >= 0 ? g_repl_exit : rc; }
+            if (g_inspect) { interactive_interp(exec, (Runnable*)vm_ptr.get(), false); exec.runAtexit(); return g_repl_exit >= 0 ? g_repl_exit : rc; }
             nyconc::join_nondaemon_at_exit();
+            exec.runAtexit();   // round 77: atexit handlers, after the threads
             return rc;
         }
         if (g_inspect) interactive_interp(exec, (Runnable*)vm_ptr.get(), false);
+        nyconc::join_nondaemon_at_exit();
+        exec.runAtexit();   // round 77: atexit handlers, after the threads
         // Generators the program left suspended are closed now, oldest
         // first, so their finally blocks and __exit__ run (as when CPython
         // shuts down).
@@ -745,7 +751,11 @@ struct BridgeConv {
                     // An instance crosses as a map of its attributes plus
                     // "__class__" - enough for builtins that read fields (the
                     // file functions take a file object's "handle").
-                    for (auto& kv : *v.map) (*obj->container)[kv.first] = to_value(kv.second);
+                    for (auto& kv : *v.map) {
+                        // not the engine's hidden field (round 77: weakref callbacks)
+                        if (v.type == VMType::INSTANCE && kv.first == "\x01weakref") continue;
+                        (*obj->container)[kv.first] = to_value(kv.second);
+                    }
                     if (v.type == VMType::INSTANCE)
                         (*obj->container)["__class__"] = exec.makeStringValue(v.class_name);
                 }
@@ -858,20 +868,23 @@ struct BridgeConv {
                 *vm.list = std::move(out);
             } else {
                 bool inst = vm.type == VMType::INSTANCE;
-                size_t n = 0;
+                size_t n = 0, hidden = 0;
                 bool changed = false;
+                if (inst && vm.map->count("\x01weakref")) hidden++;
                 for (auto& kv : m) {
                     if (inst && kv.first == "__class__") continue;
                     n++;
                     auto it = vm.map->find(kv.first);
                     if (it == vm.map->end() || !same(kv.second, it->second)) { changed = true; break; }
                 }
-                if (!changed && n == vm.map->size()) continue;
+                if (!changed && n + hidden == vm.map->size()) continue;
                 VMMap fresh;
                 for (auto& kv : m) {
                     if (inst && kv.first == "__class__") continue;
                     fresh[kv.first] = to_vm(kv.second);
                 }
+                // the engine's hidden field stays as it is (round 77)
+                if (inst) { auto hf = vm.map->find("\x01weakref"); if (hf != vm.map->end()) fresh[hf->first] = hf->second; }
                 *vm.map = std::move(fresh);
             }
         }
@@ -1207,6 +1220,17 @@ int main(int argc, char** argv, char** env) {
                         target = val;
                         stop = true;
                     }
+                    else if (c == 'W' || c == 'X') {
+                        // -W action:message:category:module:lineno (round 77:
+                        // sys.warnoptions); -X options are accepted and ignored
+                        std::string val = a.substr(k + 1);
+                        if (val.empty()) {
+                            if (i + 1 >= argc) return bad(std::string("option -") + c + " needs an argument");
+                            val = argv[++i];
+                        }
+                        if (c == 'W') nyrt::warn_options().push_back(val);
+                        stop = true;
+                    }
                     else if (c == 'i') inspect = true;
                     else if (c == 'q') quiet = true;
                     else if (c == 'u') setenv_default_unbuffered();
@@ -1220,7 +1244,7 @@ int main(int argc, char** argv, char** env) {
                     else if (c == 'B' || c == 'O' || c == 's' || c == 'S' || c == 'b') {}   // Python's: nothing to do here
                     else return bad(std::string("unknown option -") + c);
                 }
-                if (stop) { i++; break; }
+                if (stop && (mode == "cmd" || mode == "module")) { i++; break; }
                 continue;
             }
             mode = "file";

@@ -52,10 +52,13 @@ struct Saved {
     int pending = 0;
     Value value;
     node_ptr last;
+    Node* cur = nullptr;                  // NythonExecutor::cur_stmt() (round 77)
     int rel_depth = 0;                    // call depth inside the generator
     std::vector<std::string> handling;    // except clauses it is inside
+    std::vector<std::pair<std::string, Value>> handling_obj;   // ... and their objects (round 77)
     std::vector<Node*> owners;            // method owners (super())
     std::vector<std::string> trace;       // --trace frames
+    std::vector<NythonExecutor::PyFrame> frames;   // frames above its own (round 77)
 };
 
 }  // namespace
@@ -343,6 +346,7 @@ void entry(void* p) {
         g->retval = r.value;
     } catch (GenKill&) {
     } catch (std::string& s) {
+        E.tbUnwind(s);   // the generator's frame, for the traceback (round 77)
         // PEP 479: a StopIteration escaping a generator body would silently
         // end whatever loop drives it; it becomes a RuntimeError.
         if (is_exc(E, s, "StopIteration"))
@@ -385,16 +389,19 @@ bool resume_function(NythonExecutor& E, Gen* g, Mode m) {
     }
     auto& f = NythonExecutor::flow();
     auto& H = E.handling_exc_;
+    auto& HO = E.handling_obj_;
     auto& O = E.owner_stack_;
     auto& T = NythonExecutor::tracer().fn_stack;
+    auto& PF = NythonExecutor::py_frames();
     // The resumer's state.
     Context* r_fast = f.fast_ctx;
     bool r_brk = f.brk_ok;
     int r_pend = f.pending;
     Value r_val = f.value;
     node_ptr r_last = NythonExecutor::last_stmt();
+    Node* r_cur = NythonExecutor::cur_stmt();
     Gen* r_gen = t_cur;
-    size_t h0 = H.size(), o0 = O.size(), t0 = T.size();
+    size_t h0 = H.size(), ho0 = HO.size(), o0 = O.size(), t0 = T.size(), pf0 = PF.size();
     bool tracing = NythonExecutor::trace_on() && !NythonExecutor::tracer().in_repr;
     bool first = true;
     for (;;) {
@@ -406,7 +413,14 @@ bool resume_function(NythonExecutor& E, Gen* g, Mode m) {
         if (g->saved.last) NythonExecutor::last_stmt() = g->saved.last;
         NythonExecutor::call_depth_ = rd + 1 + g->saved.rel_depth;
         H.insert(H.end(), g->saved.handling.begin(), g->saved.handling.end());
+        HO.insert(HO.end(), g->saved.handling_obj.begin(), g->saved.handling_obj.end());
+        g->saved.handling_obj.clear();
         O.insert(O.end(), g->saved.owners.begin(), g->saved.owners.end());
+        // the generator's own frame, and those its body had running (round 77)
+        PF.push_back({g->fn, r_cur, g->fc});
+        if (g->saved.cur) NythonExecutor::cur_stmt() = g->saved.cur;
+        size_t pf1 = PF.size();
+        PF.insert(PF.end(), g->saved.frames.begin(), g->saved.frames.end());
         if (tracing) T.push_back(g->name);
         size_t t1 = T.size();
         T.insert(T.end(), g->saved.trace.begin(), g->saved.trace.end());
@@ -423,9 +437,15 @@ bool resume_function(NythonExecutor& E, Gen* g, Mode m) {
         g->saved.pending = f.pending;
         g->saved.value = f.value;
         g->saved.last = NythonExecutor::last_stmt();
+        g->saved.cur = NythonExecutor::cur_stmt();
+        NythonExecutor::cur_stmt() = r_cur;
         g->saved.rel_depth = NythonExecutor::call_depth_ - (rd + 1);
         g->saved.handling.assign(H.size() > h0 ? H.begin() + (long)h0 : H.end(), H.end());
         H.resize(std::min(H.size(), h0));
+        g->saved.handling_obj.assign(HO.size() > ho0 ? HO.begin() + (long)ho0 : HO.end(), HO.end());
+        HO.resize(std::min(HO.size(), ho0));
+        g->saved.frames.assign(PF.size() > pf1 ? PF.begin() + (long)pf1 : PF.end(), PF.end());
+        PF.resize(std::min(PF.size(), pf0));
         g->saved.owners.assign(O.size() > o0 ? O.begin() + (long)o0 : O.end(), O.end());
         O.resize(std::min(O.size(), o0));
         g->saved.trace.assign(T.size() > t1 ? T.begin() + (long)t1 : T.end(), T.end());

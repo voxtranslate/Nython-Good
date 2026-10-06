@@ -363,6 +363,12 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
                 std::vector<Value> none;
                 return E.callMethod(v, "__hash__", none, ctx);
             }
+            // by identity, the key dictKey gives it ("u" + its address) -
+            // without entering it in the key table, which kept the object
+            // alive until a full collection (round 77: weakref.WeakKeyDictionary)
+            char buf[32];
+            snprintf(buf, sizeof buf, "%p", v.value.p);
+            return intValue(nypy::hash_of_key(nypy::key_of_obj(std::string("u") + buf)));
         }
         return intValue(nypy::hash_of_key(E.dictKey(v)));
     }

@@ -150,12 +150,38 @@ inline std::unordered_map<Collectable*, std::vector<Weak*>>& weak_targets() {
     return *m;
 }
 }
+namespace detail {
+inline std::vector<Weak*>& weak_cb_queue() {   // each holds a reference
+    static auto* q = new std::vector<Weak*>();
+    return *q;
+}
+}
 inline void weak_target_died(Collectable* target) {
     auto& m = detail::weak_targets();
     auto it = m.find(target);
     if (it == m.end()) return;
-    for (Weak* w : it->second) { w->target = nullptr; w->payload = nullptr; }
+    for (Weak* w : it->second) {
+        w->target = nullptr; w->payload = nullptr;
+        // its callback, at the next safe point (round 77)
+        if (w->callback.type != nython::kernel::ValueType::NONE && w->callback.type != nython::kernel::ValueType::UNDEFINED
+            && !(w->gc_flags & nygc::F_DEALLOC)) {
+            nygc::incref(w);
+            detail::weak_cb_queue().push_back(w);
+            nygc::g_pending.store(true, std::memory_order_relaxed);
+        }
+    }
     m.erase(it);
+}
+inline void run_weak_callbacks() {
+    auto& q = detail::weak_cb_queue();
+    while (!q.empty()) {
+        std::vector<Weak*> due;
+        due.swap(q);
+        for (Weak* w : due) {
+            if (w->E && executor_alive(w->E)) w->E->runWeakCallback(w);
+            nygc::decref(w);
+        }
+    }
 }
 inline void weak_register(Weak* w) {
     w->target->gc_flags |= nygc::F_WEAKREFD;
@@ -163,6 +189,13 @@ inline void weak_register(Weak* w) {
 }
 inline Weak::Weak(NythonExecutor* e, int64_t i)
     : Collectable(nython::kernel::Type::FUNCTION), tag("__weakref__:" + std::to_string(i)), E(e), id(i) {}
+inline void Weak::gc_traverse(GcVisitFn visit, void* arg) {
+    if (callback.value.o) visit(callback.value.o, arg);
+}
+inline void Weak::gc_clear() {
+    Value c = callback;
+    callback = Value();
+}
 inline Weak::~Weak() {
     if (target) {
         auto& m = detail::weak_targets();
