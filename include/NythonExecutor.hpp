@@ -8359,6 +8359,8 @@ public:
     void runAtexit() {
         Value f = global_ctx ? global_ctx->getByName("_ny_run_atexit") : UNDEFINED_VALUE;
         if (f.type != ValueType::USERDATA) return;
+        // none registered: no call (nothing for --profile to count)
+        if (listItems(global_ctx->getByName("_ny_atexit_handlers")).empty()) return;
         node_ptr saved = last_stmt();
         std::vector<Value> a;
         try { callFunctionValue(f, a, global_ctx); } catch (...) {}

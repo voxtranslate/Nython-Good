@@ -3136,6 +3136,8 @@ public:
         try {
             VMVal f=load_var("_ny_run_atexit");
             if(f.type!=VMType::FUNCTION) return;
+            VMVal hs=load_var("_ny_atexit_handlers");   // none registered: no call
+            if(hs.type!=VMType::LIST||!hs.list||hs.list->empty()) return;
             std::vector<VMVal> a;
             vm_call(f,a,std::nullopt);
         } catch(...) {}
@@ -7085,8 +7087,8 @@ private:
             }
             if(attr=="__dict__"){
                 VMVal d=VMVal::make_map();
-                // not the engine's hidden fields ("\x01weakref", round 77)
-                if(obj.map) for(auto& kv:*obj.map) if(kv.first.empty()||kv.first[0]!='\x01') (*d.map)[kv.first]=kv.second;
+                // not the engine's hidden field ("\x01weakref", round 77)
+                if(obj.map) for(auto& kv:*obj.map) if(kv.first!="\x01weakref") (*d.map)[kv.first]=kv.second;
                 out=d; return true;
             }
             VMVal ga;

@@ -752,8 +752,8 @@ struct BridgeConv {
                     // "__class__" - enough for builtins that read fields (the
                     // file functions take a file object's "handle").
                     for (auto& kv : *v.map) {
-                        // not the engine's hidden fields ("\x01weakref", round 77)
-                        if (!kv.first.empty() && kv.first[0] == '\x01') continue;
+                        // not the engine's hidden field (round 77: weakref callbacks)
+                        if (v.type == VMType::INSTANCE && kv.first == "\x01weakref") continue;
                         (*obj->container)[kv.first] = to_value(kv.second);
                     }
                     if (v.type == VMType::INSTANCE)
@@ -870,7 +870,7 @@ struct BridgeConv {
                 bool inst = vm.type == VMType::INSTANCE;
                 size_t n = 0, hidden = 0;
                 bool changed = false;
-                for (auto& kv : *vm.map) if (!kv.first.empty() && kv.first[0] == '\x01') hidden++;
+                if (inst && vm.map->count("\x01weakref")) hidden++;
                 for (auto& kv : m) {
                     if (inst && kv.first == "__class__") continue;
                     n++;
@@ -883,8 +883,8 @@ struct BridgeConv {
                     if (inst && kv.first == "__class__") continue;
                     fresh[kv.first] = to_vm(kv.second);
                 }
-                // the engine's hidden fields stay as they are (round 77)
-                for (auto& kv : *vm.map) if (!kv.first.empty() && kv.first[0] == '\x01') fresh[kv.first] = kv.second;
+                // the engine's hidden field stays as it is (round 77)
+                if (inst) { auto hf = vm.map->find("\x01weakref"); if (hf != vm.map->end()) fresh[hf->first] = hf->second; }
                 *vm.map = std::move(fresh);
             }
         }
