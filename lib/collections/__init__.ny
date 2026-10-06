@@ -1,7 +1,8 @@
-# nython: module    (import it by name: it runs in a module scope of its own)
-# lib/collections.ny - Python's collections (round 77).
+# nython: module    (a package: collections.abc is lib/collections/abc.ny)
+# lib/collections/__init__.ny - Python's collections (round 77).
 #
 #     from collections import deque, Counter, defaultdict, OrderedDict, namedtuple
+#     from collections.abc import Mapping, Sequence     (the ABCs: abc.ny)
 #
 # deque         a ring buffer: O(1) append/appendleft/pop/popleft and
 #               indexing, maxlen (the far end drops off), rotate, extendleft
@@ -15,6 +16,12 @@
 #
 # They were native stubs that returned an empty list whatever they were
 # given (deque([1, 2]) was []).
+#
+# As in CPython, they are collections.abc's virtual subclasses: deque and
+# UserList are MutableSequences, OrderedDict, defaultdict, Counter, UserDict
+# and ChainMap MutableMappings, a namedtuple class a Sequence (they are
+# registered rather than derived from the ABCs, so making one does not go
+# through ABCMeta).
 
 
 def _reprs(items):
@@ -735,3 +742,14 @@ def namedtuple(typename, field_names, defaults=none, rename=false, module=none):
         return _NT(*list(iterable))
     _NT._make = staticmethod(_make)
     return _NT
+
+
+# ── collections.abc ──────────────────────────────────────────────────────────
+# Python's types are dict / tuple subclasses or derive from the ABCs; these
+# are registered (round 77).
+import collections.abc as _collections_abc
+_collections_abc.MutableSequence.register(deque)
+_collections_abc.MutableSequence.register(UserList)
+_collections_abc.MutableMapping.register(_DictWrapper)
+_collections_abc.MutableMapping.register(ChainMap)
+_collections_abc.Sequence.register(_NamedTupleBase)

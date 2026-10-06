@@ -484,8 +484,20 @@ struct NythonExecutor {
         module_filter_ = [this](const std::string& n) {
             return base_global_names_.count(n) > 0 || builtin_ptrs.count(n) > 0 || builtin_set.count(n) > 0;
         };
+        // ... and sees them as they were before the program ran (round 77):
+        // a program's top-level `list = []` rebound list for every module
+        // it imported (collections.abc's `MutableSequence.register(list)`
+        // then failed), as the VM never did. A module scope's parent is this
+        // copy of the builtins and the prelude; builtins registered later
+        // are still found past it in the global scope.
+        if (global_ctx && global_ctx->container) {
+            module_base_ctx_ = new Context(runner, "<builtins>", nullptr, nullptr, global_ctx);
+            module_base_ctx_->parentFilter = &module_filter_;
+            for (auto& kv : *global_ctx->container) module_base_ctx_->defineByName(kv.first, kv.second);
+        }
     }
     std::unordered_set<std::string> base_global_names_;
+    Context* module_base_ctx_ = nullptr;
     std::function<bool(const std::string&)> module_filter_;
     // Functions and classes an imported module defined (importModule):
     // knownName() does not count them for the program.
@@ -5494,14 +5506,19 @@ public:   // NythonExecutor is a struct: members default to public
         return true;
     }
     Value classValueOfNode(Node* n) { Value v; v.type = ValueType::USERDATA; v.value.p = (void*)n; return v; }
-    // The class namespace as the dict a metaclass gets.
+    // The class namespace as the dict a metaclass gets, and C.__dict__.
+    // Its names are stored as dict keys (key_of_str), so a dunder method is
+    // a key like any other - it read as an internal marker, so __iter__,
+    // __init__, __hash__ = None ... were missing - and the parser's
+    // decorator temporaries are left out (round 77).
     Value classNamespace(Node* cnode) {
         auto* d = new Object((Runnable*)runner, "map", Type::MAP);
         auto cit = class_ctx_map_.find((void*)cnode);
         if (cit != class_ctx_map_.end() && cit->second && cit->second->container)
             for (auto& kv : *cit->second->container)
-                if (!kv.first.empty() && (unsigned char)kv.first[0] >= 0x20 && kv.first != "__parent_class__")
-                    (*d->container)[nypy::key_of_str(kv.first)] = kv.second;   // a dict key: dunder names too (round 77)
+                if (!kv.first.empty() && (unsigned char)kv.first[0] >= 0x20 && kv.first != "__parent_class__"
+                    && !nyrt::is_decorator_temp(kv.first))
+                    (*d->container)[nypy::key_of_str(kv.first)] = kv.second;
         return Value((Collectable*)d);
     }
     // The classes a class statement is building, for type.__new__ called by
@@ -7377,6 +7394,19 @@ public:
                     return true;
                 }
                 if (attr == "__module__") { out = makeStringValue("builtins"); return true; }
+                // int.__mro__ / int.__bases__ of a builtin type (round 77):
+                // (int, object), and bool's MRO is (bool, int, object)
+                if (attr == "__mro__" || attr == "__bases__") {
+                    std::string py, legacy;
+                    if (!typeObjectNames(obj, py, legacy)) return false;
+                    std::vector<Value> chain;
+                    if (attr == "__mro__") chain.push_back(obj);
+                    if (py == "bool") chain.push_back(builtinValue("int"));
+                    if (attr == "__mro__" || py != "bool")
+                        if (Node* on = classNodeByName("object")) chain.push_back(classValueOfNode(on));
+                    out = makeListValue(chain, true);
+                    return true;
+                }
                 return false;
             }
         }
@@ -7738,16 +7768,7 @@ public:
             // C.__dict__: the class's own namespace (a copy, as a mappingproxy
             // is read-only).
             if (attr == "__dict__") {
-                if (Node* cn = classNodeOfValue(obj)) {
-                    auto* d = new Object((Runnable*)runner, "map", Type::MAP);
-                    auto cit = class_ctx_map_.find((void*)cn);
-                    if (cit != class_ctx_map_.end() && cit->second && cit->second->container)
-                        for (auto& kv : *cit->second->container)
-                            if (!kv.first.empty() && (unsigned char)kv.first[0] >= 0x20 && kv.first != "__parent_class__")
-                                (*d->container)[nypy::key_of_str(kv.first)] = kv.second;   // dunder names too (round 77)
-                    out = Value((Collectable*)d);
-                    return true;
-                }
+                if (Node* cn = classNodeOfValue(obj)) { out = classNamespace(cn); return true; }
             }
             // A class's metaclass members (methods bound to the class, its
             // properties read with the class), then its __getattr__ (round 77).
@@ -7887,10 +7908,11 @@ public:
                     return true;
                 }
                 if (attr == "__dict__") {
+                    // names as dict keys: self.__x__ is listed too (round 77)
                     auto* d = new Object((Runnable*)runner, "map", Type::MAP);
                     auto pit = instance_properties.find(obj.value.p);
                     if (pit != instance_properties.end() && pit->second && pit->second->container)
-                        for (auto& kv : *pit->second->container) d->set(nypy::key_of_str(kv.first), kv.second);   // round 77
+                        for (auto& kv : *pit->second->container) (*d->container)[nypy::key_of_str(kv.first)] = kv.second;
                     out = Value((Collectable*)d);
                     return true;
                 }
@@ -8826,7 +8848,13 @@ public:
     std::vector<std::string> moduleDirs(const node_ptr& node) {
         std::vector<std::string> dirs;
         std::string here = importerDir(node);
-        if (!here.empty()) { dirs.push_back(here); dirs.push_back(here + "lib/"); }
+        // A module of a package does not search beside itself (Python has no
+        // implicit relative imports; the VM never searched there): `from abc
+        // import ABCMeta` in lib/collections/abc.ny is lib/abc.ny, not the
+        // module importing it (round 77).
+        struct stat pst;
+        bool in_package = !here.empty() && stat((here + "__init__.ny").c_str(), &pst) == 0;
+        if (!here.empty() && !in_package) { dirs.push_back(here); dirs.push_back(here + "lib/"); }
         for (const char* d : {"", "./", "lib/", "./lib/"}) dirs.push_back(d);
         std::string anc = parentDirOf(here);
         for (int up = 0; up < 4 && !anc.empty(); ++up) {
@@ -8927,7 +8955,7 @@ public:
         Value nsv((Collectable*)ns);
         // Registered before the module runs, so a circular import binds it.
         module_ns_[module_name] = nsv;
-        Context* mctx = new Context(runner, module_name, nullptr, nullptr, global_ctx);
+        Context* mctx = new Context(runner, module_name, nullptr, nullptr, module_base_ctx_ ? module_base_ctx_ : global_ctx);
         mctx->inModule = true;
         mctx->parentFilter = &module_filter_;
         module_ctxs_.push_back(mctx);
@@ -8976,7 +9004,17 @@ public:
             const std::string& want = !in_node->alias.empty() ? in_node->alias : implicit_alias;
             auto mc = module_ns_.find(module_name);
             if (mc != module_ns_.end() && module_name.find('.') == std::string::npos) {
-                if (from_import && !quoted) { bindFromNamespace(mc->second, in_node->names, module_name, ctx); return NONE_VALUE; }
+                // a name the namespace lacks may be a package's submodule
+                // not loaded yet (import urllib; from urllib import parse):
+                // the package path below loads it, as the VM does (round 77)
+                bool all_bound = true;
+                if (from_import && !quoted && mc->second.isCollectable() && mc->second.value.gc)
+                    if (auto* po = dynamic_cast<Object*>(mc->second.value.gc))
+                        for (auto& entry : in_node->names) {
+                            std::string n = nyrt::import_name_alias(entry).first;
+                            if (n != "*" && !po->container->count(n)) { all_bound = false; break; }
+                        }
+                if (from_import && !quoted && (all_bound || !isPackageName(node, module_name))) { bindFromNamespace(mc->second, in_node->names, module_name, ctx); return NONE_VALUE; }
                 if (!want.empty()) { ctx->defineByName(want, mc->second); return NONE_VALUE; }
             }
         }
@@ -9670,6 +9708,10 @@ public:
         std::vector<std::string> search_paths;
         {
             std::string here = importerDir(node);
+            // not beside a module of a package, for a name without quotes
+            // (see moduleDirs, round 77)
+            struct stat pst;
+            if (!here.empty() && !quoted && stat((here + "__init__.ny").c_str(), &pst) == 0) here.clear();
             if (!here.empty()) {
                 search_paths.push_back(here + module_name + ".ny");
                 search_paths.push_back(here + module_name);
@@ -10445,6 +10487,9 @@ public:
             std::vector<Value> a2; a2.push_back(cls_val);
             for (auto& a : args) a2.push_back(a);
             bindParamsKw(fn, a2, kw, fc, ctx, 0, m.value.p);
+            // super().m() in a classmethod passes the class on (round 77; it
+            // passed nothing, so a base's classmethod got no cls)
+            fc->defineByName("\x01first_arg", cls_val);
         } else if (is_static || !has_self) {
             bindParamsKw(fn, args, kw, fc, ctx, 0, m.value.p);
             // what super() takes as the receiver in a method whose first
@@ -10571,6 +10616,19 @@ public:
                 }
                 return std::string();
             };
+            // issubclass(C, (A, B)): any of them, each asked as itself - an
+            // ABC's __subclasscheck__ too (round 77)
+            if (!classNodeOfValue(args[1]) && !isInstanceVal(args[1])) {
+                Container* tc = contOf(args[1]);
+                if (tc && seqLen(tc) >= 0) {
+                    for (auto& t : listItems(args[1])) {
+                        std::vector<Value> one{args[0], t};
+                        Value r;
+                        if (iterableBuiltin(name, one, ctx, r) && isTruthy(r)) { out = Value(true); return true; }
+                    }
+                    out = Value(false); return true;
+                }
+            }
             // a metaclass's __subclasscheck__ (round 77)
             if (!class_meta_.empty() && classNodeOfValue(args[1])) {
                 Value r;

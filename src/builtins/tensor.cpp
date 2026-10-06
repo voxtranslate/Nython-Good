@@ -402,7 +402,9 @@ Value dispatch_tensor(NythonExecutor& E,
                     return Value(false);
                 }
             }
-            if (args.size() >= 2 && E.classNodeOfValue(args[0]) && args[1].type == ValueType::USERDATA
+            // isinstance(C, type), and of a builtin type: isinstance(int, type)
+            // read false (round 77)
+            if (args.size() >= 2 && (E.classNodeOfValue(args[0]) || E.isTypeObject(args[0])) && args[1].type == ValueType::USERDATA
                 && E.fnTag(E.func_names, args[1].value.p) == "__builtin__:type")
                 return Value(true);
             // isinstance(x, (A, B)): any of them.

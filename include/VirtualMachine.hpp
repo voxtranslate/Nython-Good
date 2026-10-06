@@ -4511,7 +4511,10 @@ private:
         }
         return out;
     }
-    std::unordered_set<const VMCode*> class_ran_;
+    // The class statements that have run, by code; each held, so that a
+    // statement's code freed with its module cannot have its address taken
+    // by a new class statement that would then read as a re-run (round 77).
+    std::unordered_map<const VMCode*, std::shared_ptr<VMCode>> class_ran_;
     int class_generation_=0;
     VMVal class_value(const std::string& name) {
         auto it=class_reg_.find(name);
@@ -4652,10 +4655,13 @@ private:
         out=call_with_first(m, cls, std::move(args), nullptr);
         return true;
     }
+    // The class namespace as the dict a metaclass gets, and C.__dict__:
+    // without the parser's decorator temporaries (round 77).
     VMVal class_namespace(const std::string& cname) {
         VMVal d=VMVal::make_map();
         auto cv=class_vars_.find(cname);
-        if(cv!=class_vars_.end()) for(auto& kv:cv->second) (*d.map)[nypy::key_of_str(kv.first)]=kv.second;
+        if(cv!=class_vars_.end()) for(auto& kv:cv->second)
+            if(!nyrt::is_decorator_temp(kv.first)) (*d.map)[nypy::key_of_str(kv.first)]=kv.second;
         return d;
     }
     // A class statement with a metaclass: M.__new__ (whose type.__new__
@@ -4723,6 +4729,8 @@ private:
         if(!code->bases.empty()) code->parent_class=code->bases[0];
         class_reg_[code->name]=code;
         mro_cache_.clear(); attr_hook_cache_[0].clear(); attr_hook_cache_[1].clear(); no_new_.clear(); has_del_cache_.clear();
+        // the namespace's keys are dict keys (a dunder name is encoded,
+        // key_of_str); class variables are plain names (round 77)
         VMMap vars;
         if(a[3].type==VMType::MAP&&a[3].map) for(auto& kv:*a[3].map) if(nypy::key_kind(kv.first)==nypy::K_STR) vars[nypy::key_payload(kv.first)]=kv.second;
         class_vars_[code->name]=vars;
@@ -5463,7 +5471,7 @@ private:
                     }
                     sub=copy;
                 } else {
-                    class_ran_.insert(sub.get());
+                    class_ran_[sub.get()]=sub;
                     // expression bases are resolved below: the statement's own
                     // code keeps its placeholders for the next run
                     if(extras) sub=std::make_shared<VMCode>(*sub);
@@ -6971,6 +6979,7 @@ private:
                 return true;
             }
             if(attr=="__dict__"){
+                // names as dict keys: self.__x__ is listed too (round 77)
                 VMVal d=VMVal::make_map();
                 if(obj.map) for(auto& kv:*obj.map) (*d.map)[nypy::key_of_str(kv.first)]=kv.second;   // a dunder name is a typed key (round 77)
                 out=d; return true;
@@ -7051,12 +7060,7 @@ private:
                 out=VMVal::make_tuple(std::move(r)); return true;
             }
             // C.__dict__: the class's own namespace (a copy; a mappingproxy is read-only)
-            if(attr=="__dict__"){
-                VMVal d=VMVal::make_map();
-                auto cv=class_vars_.find(cname);
-                if(cv!=class_vars_.end()) for(auto& kv:cv->second) (*d.map)[nypy::key_of_str(kv.first)]=kv.second;
-                out=d; return true;
-            }
+            if(attr=="__dict__"){ out=class_namespace(cname); return true; }
             if(attr=="__bases__"){
                 std::vector<VMVal> r;
                 auto rit=class_reg_.find(cname);
@@ -7092,6 +7096,16 @@ private:
             return false;
         }
         case VMType::NATIVE:
+            // int.__mro__ / int.__bases__ of a builtin type (round 77):
+            // (int, object), and bool's MRO is (bool, int, object)
+            if((attr=="__mro__"||attr=="__bases__")&&!obj.builtin_type_name().empty()){
+                std::string b=obj.builtin_type_name();
+                std::vector<VMVal> r;
+                if(attr=="__mro__") r.push_back(obj);
+                if(b=="bool"){ auto it=builtin_types_.find("int"); if(it!=builtin_types_.end()) r.push_back(it->second); }
+                if(attr=="__mro__"||b!="bool"){ VMVal o=class_value("object"); if(o.type!=VMType::NONE) r.push_back(o); }
+                out=VMVal::make_tuple(std::move(r)); return true;
+            }
             // len.__name__, int.__name__: the name the builtin is tagged with
             if(attr=="__name__"||attr=="__qualname__"||attr=="__module__"){
                 const std::string& c=obj.class_name;
@@ -10583,7 +10597,10 @@ private:
                     return VMVal::make_bool(meta.type==VMType::CLASS&&class_derives(class_key(meta),class_key(cls)));
                 }
             }
-            if(obj.type==VMType::CLASS&&cls.type==VMType::NATIVE&&native_name(cls)=="type")
+            // isinstance(C, type), and of a builtin type: isinstance(int, type)
+            // read false (round 77)
+            if((obj.type==VMType::CLASS||(obj.type==VMType::NATIVE&&!obj.builtin_type_name().empty()))
+               &&cls.type==VMType::NATIVE&&native_name(cls)=="type")
                 return VMVal::make_bool(true);
             std::string cls_name;
             if(cls.type==VMType::CLASS) cls_name=cls.class_name;
@@ -10618,6 +10635,16 @@ private:
         });
         // issubclass(B, A): B's MRO contains A (a tuple of classes: any).
         globals_["issubclass"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            // issubclass(C, (A, B)): any of them, each asked as itself - an
+            // ABC's __subclasscheck__ too (round 77)
+            if(a.size()>=2&&a[1].type==VMType::LIST&&a[1].list&&!a[1].is_set()){
+                std::vector<VMVal> items=*a[1].list;
+                for(auto& c:items){
+                    std::vector<VMVal> one{a[0], c};
+                    if(globals_["issubclass"].native(one).b) return VMVal::make_bool(true);
+                }
+                return VMVal::make_bool(false);
+            }
             if(a.size()>=2&&a[1].type==VMType::CLASS&&!class_meta_.empty()){
                 VMVal r;
                 if(meta_call(a[1],"__subclasscheck__",{a[0]},r)) return VMVal::make_bool(vm_truthy(r));
