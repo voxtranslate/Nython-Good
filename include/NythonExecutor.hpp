@@ -11973,7 +11973,10 @@ public:
         auto* o = c ? dynamic_cast<Object*>(c) : nullptr;
         if (!o) return false;
         auto it = namespace_objs_.find((const void*)o);
-        return it != namespace_objs_.end() && it->second == o->getName() && o->getName() != "map";
+        // (round 78: a list or tuple made at a freed namespace's address is
+        // none - modules are mostly nameless here; it printed as a module)
+        return it != namespace_objs_.end() && it->second == o->getName() && o->getName() != "map"
+               && seqLen(c) < 0;
     }
     Value reflectVars(std::vector<Value>& args, Context* ctx) {
         if (args.empty()) return reflectLocals(ctx);
