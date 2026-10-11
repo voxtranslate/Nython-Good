@@ -26,8 +26,11 @@
 #                         MethodType(func, obj) binds func to obj (__func__
 #                         __self__; a callable that is not a function gives
 #                         a binding of another type)
-# AsyncGeneratorType, CoroutineType, CodeType, CellType, FrameType,
-# TracebackType, WrapperDescriptorType, MethodWrapperType,
+# AsyncGeneratorType, CoroutineType, FrameType, TracebackType
+#                         the runtime's classes for those values (round 78);
+#                         TracebackType(tb_next, tb_frame, tb_lasti,
+#                         tb_lineno) makes a traceback entry
+# CodeType, CellType, WrapperDescriptorType, MethodWrapperType,
 # MethodDescriptorType, ClassMethodDescriptorType, GetSetDescriptorType,
 # MemberDescriptorType, NotImplementedType
 #                         stand-ins (see below) whose isinstance() is true
@@ -42,18 +45,18 @@
 #                         metaclass's __getattr__ (enum uses it)
 # coroutine(func)         marks a generator function as a coroutine
 #
-# How the stand-ins work: the runtime has no type object for coroutines,
-# code, frames, tracebacks, cells or the C-level descriptors, so those are
-# classes whose metaclass answers isinstance() by asking what the value is.
+# How the stand-ins work: the runtime has no type object for code, cells or
+# the C-level descriptors, so those are classes whose metaclass answers
+# isinstance() by asking what the value is.
 # NotImplementedType() returns NotImplemented. FunctionType(code, globals)
 # cannot build a function (there is no code object to run): it raises
 # TypeError.
 #
-# Not here: CapsuleType (3.13), the frame/traceback/code objects themselves
-# (the stand-ins recognise duck-typed ones), types.coroutine making a
-# generator awaitable (it marks the function; the engines' await takes
-# generator-based awaitables as they are), coroutine objects (they are task
-# handles - ints - on both engines, so CoroutineType matches nothing).
+# Not here: CapsuleType (3.13), code objects themselves (the stand-in
+# recognises the engines' __code__ objects), types.coroutine making a
+# generator awaitable (it marks the function; an object whose __await__
+# returns a generator is awaited by running that generator - round 78 - but
+# a bare generator is not awaitable).
 
 __all__ = ["FunctionType", "LambdaType", "CodeType", "MappingProxyType", "SimpleNamespace",
            "CellType", "GeneratorType", "CoroutineType", "AsyncGeneratorType", "MethodType",
@@ -106,20 +109,8 @@ def _stand_in(name, check, call=None):
     return cls
 
 
-def _check_asyncgen(x):
-    return isinstance(x, _NyAsyncGen)
-
-
 def _check_code(x):
     return isinstance(x, _NyFuncCode) or isinstance(x, _NyCode)
-
-
-def _check_frame(x):
-    return hasattr(x, "f_code") and hasattr(x, "f_lineno") and hasattr(x, "f_globals")
-
-
-def _check_traceback(x):
-    return hasattr(x, "tb_frame") and hasattr(x, "tb_lineno") and hasattr(x, "tb_next")
 
 
 def _check_notimpl(x):
@@ -165,12 +156,14 @@ GeneratorType = type(_ny_sample_gen)
 _ny_sample_gen.close()
 MethodType = type(_NySampleClass().method)
 NoneType = type(None)
-AsyncGeneratorType = _stand_in("async_generator", _check_asyncgen)
-CoroutineType = _stand_in("coroutine", _check_nothing)
+# the runtime's own (round 78): coroutines, async generators, frames and
+# tracebacks are objects of these classes on both engines
+AsyncGeneratorType = _NyAsyncGen
+CoroutineType = _NyCoroutine
 CodeType = _stand_in("code", _check_code)
 CellType = _stand_in("cell", _check_nothing)
-FrameType = _stand_in("frame", _check_frame)
-TracebackType = _stand_in("traceback", _check_traceback)
+FrameType = _NyFrame
+TracebackType = _NyTraceback
 WrapperDescriptorType = _stand_in("wrapper_descriptor", _check_nothing)
 MethodWrapperType = _stand_in("method-wrapper", _check_nothing)
 MethodDescriptorType = _stand_in("method_descriptor", _check_nothing)

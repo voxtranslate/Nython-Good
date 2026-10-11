@@ -124,6 +124,9 @@ struct Inst final : Collectable {
 // Python, not a list, dict, number or string).
 // weakref(obj, callback) (round 77): when the target dies, callback(ref)
 // runs at the next safe point (as __del__ does) unless the ref died first.
+// Round 78: functions, bound methods, sets and frozensets too (`coll`: the
+// target is the set's container itself), and classes - which live as long
+// as the program, so the reference holds the class (`held`).
 struct Weak final : Collectable {
     std::string tag;
     NythonExecutor* E;
@@ -131,6 +134,9 @@ struct Weak final : Collectable {
     Collectable* target = nullptr;      // not counted; cleared when it dies
     void* payload = nullptr;
     Value callback;                     // counted; none once called
+    bool coll = false;                  // round 78
+    bool has_held = false;
+    Value held;
     Weak(NythonExecutor* e, int64_t i);
     ~Weak() override;
     void gc_traverse(GcVisitFn visit, void* arg) override;

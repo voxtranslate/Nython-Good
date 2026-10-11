@@ -2682,6 +2682,13 @@ static node_ptr async_def_desugar(const Token& tok, node_ptr fn, bool is_generat
     auto* f = static_cast<FunctionNode*>(fn.get());
     Token t = tok;
     auto name_tok = [&](const std::string& v) { Token x = t; x.value = v; return x; };
+    bool method = !f->params.empty() &&
+        (f->params[0]->value() == "self" || f->params[0]->value() == "this");
+    // The function itself (a method: self.name), as the call below names it.
+    auto self_ref = [&]() -> node_ptr {
+        if (method) return make_node<AttributeNode>(name_tok(f->name), make_node<SelfNode>(name_tok("self")), f->name);
+        return make_node<VariableNode>(name_tok(f->name));
+    };
     if (is_generator) {
         Token bt = name_tok("_ny_agen_body");
         auto inner = make_node<FunctionNode>(bt, "_ny_agen_body", f->body, false);
@@ -2693,17 +2700,17 @@ static node_ptr async_def_desugar(const Token& tok, node_ptr fn, bool is_generat
         Token wt = name_tok("_ny_async_gen");
         auto wrap = make_node<CallNode>(wt, make_node<VariableNode>(wt));
         wrap->add(call);
+        // its name and qualname (round 78; as strings: a static method's
+        // own name is not in scope in its body)
+        wrap->add(make_node<StringNode>(name_tok(f->name)));
+        wrap->add(make_node<StringNode>(name_tok(f->qualname.empty() ? f->name : f->qualname)));
         auto body = make_node<BlockNode>(t);
         body->add(inner);
         body->add(make_node<ReturnNode>(t, wrap));
         f->body = body;
         return fn;
     }
-    bool method = !f->params.empty() &&
-        (f->params[0]->value() == "self" || f->params[0]->value() == "this");
-    node_ptr ref;
-    if (method) ref = make_node<AttributeNode>(name_tok(f->name), make_node<SelfNode>(name_tok("self")), f->name);
-    else ref = make_node<VariableNode>(name_tok(f->name));
+    node_ptr ref = self_ref();
     auto again = make_node<CallNode>(t, ref);
     forward_params(t, static_cast<CallNode*>(again.get()), f->params, method ? 1 : 0);
     auto closure = make_node<LambdaNode>(name_tok("lambda"), again);
@@ -2711,10 +2718,19 @@ static node_ptr async_def_desugar(const Token& tok, node_ptr fn, bool is_generat
     auto make = make_node<CallNode>(mk, make_node<VariableNode>(mk));
     make->add(closure);
     make->add(make_node<StringNode>(name_tok(f->name)));
+    // The coroutine object (round 78): _NyCoroutine(handle, the function)
+    // - the handle is what the runtime runs, the function gives its name,
+    // qualname and code.
+    Token ct = name_tok("_NyCoroutine");
+    auto coro = make_node<CallNode>(ct, make_node<VariableNode>(ct));
+    coro->add(make);
+    coro->add(self_ref());
+    coro->add(make_node<StringNode>(name_tok(f->name)));
+    coro->add(make_node<StringNode>(name_tok(f->qualname.empty() ? f->name : f->qualname)));
     Token bt = name_tok("async_body_begin");
     auto begin = make_node<CallNode>(bt, make_node<VariableNode>(bt));
     auto then_blk = make_node<BlockNode>(t);
-    then_blk->add(make_node<ReturnNode>(t, make));
+    then_blk->add(make_node<ReturnNode>(t, coro));
     auto guard = make_node<IfNode>(t, begin, then_blk);
     auto body = make_node<BlockNode>(t);
     body->add(guard);
@@ -4120,6 +4136,15 @@ bool Parser::haveCompFor(){
 
 node_ptr Parser::lambdaExpr(){
     Token tok = token(); mustBe(TokenType::Lambda);
+    // A lambda inside a parameter list (`def f(g=lambda n: n, h=2)`) has
+    // defaults of its own: the list's are put back after it (round 78 - the
+    // lambda took them, and h lost its default).
+    auto outer_defaults = std::move(param_defaults_);
+    param_defaults_.clear();
+    struct Restore {
+        std::vector<node_ptr>& d; std::vector<node_ptr> saved;
+        ~Restore() { d = std::move(saved); }
+    } restore_defaults{param_defaults_, std::move(outer_defaults)};
     std::vector<node_ptr> params;
     // Only parse params if not immediately followed by ':'
     if(!see(TokenType::Colon)){

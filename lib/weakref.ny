@@ -48,13 +48,19 @@
 #                           default; newest first) - .alive, .detach(),
 #                           .peek(), .atexit
 #
-# Only instances of classes can be weakly referenced (as in Python: not an
-# int, str, list, tuple or dict); functions, methods and classes cannot be
-# here either - a WeakMethod holds its function strongly and is dead when
-# its object is, and WeakKeyDictionary / WeakSet keys must be instances.
+# What can be weakly referenced is Python's (round 78, both engines):
+# instances (of builtin subclasses too), functions and lambdas, bound
+# methods, sets and frozensets, classes - but not an int, str, list, tuple,
+# dict or bytes ("cannot create weak reference to 'int' object"). A class
+# lives as long as the program here, so a reference to one never dies; on
+# the VM the callback of a reference to a set runs at the next collection
+# (gc_collect() or an automatic one) rather than at the next statement. A
+# WeakMethod holds its function strongly and is dead when its object is.
 # Not here: a callback is not run when the referent and the reference die
 # together in one garbage cycle (Python skips it; here it may run), and
-# references are not made to the frames, generators or sets Python allows.
+# references are not made to generators, which Python allows (coroutine
+# and frame objects are instances here, so they can be referenced - a frame
+# cannot be in Python).
 
 __all__ = ["ref", "proxy", "getweakrefcount", "getweakrefs",
            "WeakKeyDictionary", "ReferenceType", "ProxyType",

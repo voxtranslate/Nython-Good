@@ -851,7 +851,8 @@ if nython:
           [True, "<class 'NoneType'>"])
     check("SimpleNamespace(mapping) (3.13)", [repr(types.SimpleNamespace({"a": 1}, b=2)), repr(types.SimpleNamespace([("q", 1)]))],
           ["namespace(a=1, b=2)", "namespace(q=1)"])
-    check("currentframe (no frames here)", inspect.currentframe(), None)
+    check("currentframe (round 78: the engines' frame objects)", [inspect.currentframe().f_code.co_name, inspect.isframe(inspect.currentframe())],
+          ["<module>", True])
     check("check_type accepts", [typing.check_type([1, 2], List[int]), typing.check_type({"a": None}, Dict[str, Optional[int]]),
                                  typing.check_type((1, "a"), Tuple[int, str]), typing.check_type(3, Union[int, str]),
                                  typing.check_type(mv, Movie), typing.check_type(2, Literal[1, 2]), typing.check_type(1, float),

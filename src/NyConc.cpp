@@ -115,6 +115,7 @@ struct Obj {
 
 struct Task;
 struct Loop;
+struct Coro;
 
 struct ThreadRec : Waitable {
     int64_t id = 0;
@@ -653,6 +654,7 @@ struct Task : Obj {
     std::function<BoxPtr(Engine&)> entry;    // runs on the task's coroutine, GIL held
     bool timer_set = false;
     std::multimap<std::pair<TP, uint64_t>, Task*>::iterator timer_it;
+    Coro* manual = nullptr;                  // a coroutine driven by hand (round 78: coro_drive)
 };
 
 // A task waiting for a socket or pipe to be ready (wait_io, section 9).
@@ -1379,7 +1381,22 @@ struct Coro : Obj {
     bool is_def = false;            // created by an `async def` (body gated by the token)
     bool consumed = false;
     int64_t task = 0;
+    // Round 78: the coroutine object's state (inspect.getcoroutinestate) and
+    // driving it by hand (co.send / throw / close: coro_drive) - a task of
+    // a loop of its own, parked where an __await__ generator yields
+    // (_ny_await_yield) with what it yielded in out_val, resumed with what
+    // the next send brings (in_mode 0 send, 1 throw, 2 close; in_val).
+    bool inline_running = false;    // awaited in the awaiting task's body
+    bool running = false, finished = false;
+    std::shared_ptr<Loop> mloop;
+    Task* mtask = nullptr;
+    int in_mode = 0; BoxPtr in_val;
+    bool has_out = false; BoxPtr out_val;
+    BoxPtr awaiting, frame;         // cr_await / cr_frame while parked
 };
+// The coroutine's state: 0 created, 1 running, 2 suspended, 3 closed
+// (inspect's CORO_*). Runtime mutex held.
+static int coro_state_locked(Coro* c);
 struct Awaitable : Obj {
     enum Kind { SLEEP, GATHER, WAIT_FOR, CALL_LATER } kind = SLEEP;
     double secs = 0;
@@ -1419,7 +1436,7 @@ static Task* ensure_task_locked(Loop* L, Engine& e, const Awaitable::Item& it) {
         Obj* o = oi == RT().objs.end() ? nullptr : oi->second.get();
         if (auto* c = dynamic_cast<Coro*>(o)) {
             if (c->task) return get_obj<Task>(c->task, "task");
-            if (c->consumed) raise("RuntimeError", "coroutine '" + c->name + "' was already awaited");
+            if (c->consumed) raise("RuntimeError", "cannot reuse already awaited coroutine");   // round 78
             c->consumed = true;
             Task* t = new_task_locked(L, e, [c](Engine& en) { return run_coro_body(en, c); }, c->name);
             c->task = t->id;
@@ -1631,11 +1648,19 @@ static BoxPtr await_value(Engine& e, int64_t h, bool is_handle, const BoxPtr& v)
             std::lock_guard<std::mutex> l(RT().m);
             tid = c->task;
             if (!tid) {
-                if (c->consumed) raise("RuntimeError", "coroutine '" + c->name + "' was already awaited");
+                // CPython's message (round 78)
+                if (c->consumed) raise("RuntimeError", "cannot reuse already awaited coroutine");
                 c->consumed = true;
             }
         }
-        if (!tid) return run_coro_body(e, c);         // run inline, in this task
+        if (!tid) {                                    // run inline, in this task
+            struct Running {
+                Coro* c;
+                explicit Running(Coro* x) : c(x) { c->inline_running = true; }
+                ~Running() { c->inline_running = false; c->finished = true; }
+            } running(c);
+            return run_coro_body(e, c);
+        }
         return await_value(e, tid, true, nullptr);
     }
     if (auto* t = dynamic_cast<Task*>(o)) {
@@ -1719,6 +1744,103 @@ static BoxPtr await_value(Engine& e, int64_t h, bool is_handle, const BoxPtr& v)
     return task_outcome_locked(e, t);
 }
 
+// ── Coroutine objects driven by hand (round 78) ────────────────────────────
+// co.send(v) / co.throw(e) / co.close(), as a coroutine runner calls them:
+// the coroutine runs as a task of a loop of its own on this thread until it
+// finishes or one of its awaits reaches a yield of an __await__ iterator
+// (_ny_await_yield), whose value send() returns; the next call resumes it
+// there. What the runtime's own awaitables wait for (sleep, a task, a lock)
+// is waited for inside the call.
+static int coro_state_locked(Coro* c) {
+    if (c->running || c->inline_running) return 1;
+    if (c->mtask) return c->finished || c->mtask->done ? 3 : 2;
+    if (c->task) {
+        auto ti = RT().objs.find(c->task);
+        Task* t = ti == RT().objs.end() ? nullptr : dynamic_cast<Task*>(ti->second.get());
+        if (!t || t->done) return 3;
+        return t->loop && t->loop->current == t ? 1 : 2;
+    }
+    return c->consumed || c->finished ? 3 : 0;
+}
+static bool err_is(const NyError& x, const std::string& t) {
+    if (x.type == t) return true;
+    if (x.raw.rfind(t + ":", 0) == 0 || x.raw == t) return true;           // the VM's "Type: message"
+    return x.raw.rfind("__exc__:" + t + ":", 0) == 0;                      // the interpreter's
+}
+static Ret coro_drive(Engine& e, int64_t h, int mode, const BoxPtr& val, bool val_none) {
+    ThreadRec* self = current(e);
+    std::shared_ptr<Obj> keep;
+    Coro* c;
+    bool start = false;
+    {
+        std::lock_guard<std::mutex> l(RT().m);
+        auto it = RT().objs.find(h);
+        c = it == RT().objs.end() ? nullptr : dynamic_cast<Coro*>(it->second.get());
+        if (!c) raise("TypeError", "not a coroutine");
+        keep = it->second;
+        if (c->running || c->inline_running) raise("ValueError", "coroutine already executing");
+        bool over = c->finished || (c->mtask && c->mtask->done) || (!c->mtask && (c->consumed || c->task));
+        if (over) {
+            if (mode == 2) return Ret::lst({Ret::integer(1), Ret::none()});
+            if (mode == 1) return Ret::lst({Ret::integer(2), Ret::boxed(val)});
+            raise("RuntimeError", "cannot reuse already awaited coroutine");
+        }
+        if (!c->mtask) {
+            // not started: close() just ends it; throw() raises at once
+            if (mode == 2) { c->consumed = c->finished = true; return Ret::lst({Ret::integer(1), Ret::none()}); }
+            if (mode == 1) { c->consumed = c->finished = true; return Ret::lst({Ret::integer(2), Ret::boxed(val)}); }
+            if (!val_none) raise("TypeError", "can't send non-None value to a just-started coroutine");
+            c->consumed = true;
+            start = true;
+        }
+    }
+    if (start) ensure_active(e);
+    Loop* L;
+    Task* t;
+    {
+        std::lock_guard<std::mutex> l(RT().m);
+        if (start) {
+            c->mloop = std::make_shared<Loop>();
+            c->mloop->thread = self;
+            Coro* cp = c;
+            c->mtask = new_task_locked(c->mloop.get(), e, [cp](Engine& en) { return run_coro_body(en, cp); }, c->name);
+            c->mtask->manual = c;
+        } else {
+            c->in_mode = mode; c->in_val = val;
+            make_ready(c->mtask);
+        }
+        c->has_out = false;
+        c->running = true;
+        L = c->mloop.get();
+        t = c->mtask;
+    }
+    NyError loop_err; bool loop_failed = false;
+    {
+        GilRelease rel;
+        std::unique_lock<std::mutex> lk(RT().m);
+        try { run_loop_until(lk, L, [t, c] { return t->done || c->has_out; }); }
+        catch (NyError& x) { loop_err = x; loop_failed = true; }
+    }
+    std::lock_guard<std::mutex> l(RT().m);
+    c->running = false;
+    if (loop_failed) { c->finished = true; throw loop_err; }
+    if (c->has_out && !t->done) {
+        c->has_out = false;
+        if (mode == 2) raise("RuntimeError", "coroutine ignored GeneratorExit");
+        BoxPtr y = c->out_val;
+        c->out_val = nullptr;
+        return Ret::lst({Ret::integer(0), y ? Ret::boxed(y) : Ret::none()});
+    }
+    c->finished = true;
+    c->awaiting = nullptr; c->frame = nullptr; c->out_val = nullptr;
+    if (t->failed) {
+        if (mode == 2 && err_is(t->err, "GeneratorExit")) return Ret::lst({Ret::integer(1), Ret::none()});
+        if (err_is(t->err, "StopIteration")) raise("RuntimeError", "coroutine raised StopIteration");
+        throw t->err;
+    }
+    return Ret::lst({Ret::integer(1), t->result ? Ret::boxed(t->result) : Ret::none()});
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // 8. Builtin dispatch
 // ════════════════════════════════════════════════════════════════════════════
@@ -1754,11 +1876,15 @@ static Awaitable::Item item_of(Engine& e, const Args& a, size_t i) {
     Awaitable::Item it{false, 0, nullptr};
     if (a.is_number(i) && a.as_num(i) == (double)a.as_int(i)) { it.is_handle = true; it.h = a.as_int(i); return it; }
     BoxPtr v = a.box(i);
+    BoxPtr obj = v;
     for (int depth = 0; depth < 16; depth++) {
+        int64_t h;
+        // A coroutine object (round 78): its handle, and the object kept
+        // with it (a gather or wait_for holding it keeps it alive).
+        if (e.coro_handle(v, h)) { it.is_handle = true; it.h = h; it.v = obj; return it; }
         BoxPtr r = e.await_target(v);
         if (!r) break;
-        int64_t h;
-        if (e.unbox_int(r, h)) { it.is_handle = true; it.h = h; return it; }
+        if (e.unbox_int(r, h)) { it.is_handle = true; it.h = h; it.v = obj; return it; }
         v = r;
     }
     it.v = v;
@@ -2749,11 +2875,138 @@ static std::unordered_map<std::string, Handler>& table() {
             std::lock_guard<std::mutex> l(RT().m);
             return Ret::integer(add_obj(c, true));
         };
-        T["async_is_coroutine"] = [](Engine&, const Args& a) {
+        T["async_is_coroutine"] = [](Engine& e, const Args& a) {
+            int64_t ch;
+            if (a.size() >= 1 && e.coro_handle(a.box(0), ch)) return Ret::boolean(true);   // a coroutine object (round 78)
             if (a.size() < 1 || !a.is_number(0)) return Ret::boolean(false);
             std::lock_guard<std::mutex> l(RT().m);
             auto it = RT().objs.find(a.as_int(0));
             return Ret::boolean(it != RT().objs.end() && dynamic_cast<Coro*>(it->second.get()));
+        };
+        // ── coroutine objects (round 78; the prelude's _NyCoroutine) ──────
+        // async_coro_drive(h, mode, value): co.send(value) (mode 0),
+        // co.throw(value) (1), co.close() (2) - [0, yielded] while it is
+        // suspended, [1, result] once it has finished, [2, exc] for an
+        // exception the caller is to raise as it is.
+        T["async_coro_drive"] = [](Engine& e, const Args& a) -> Ret {
+            if (a.size() < 2 || !a.is_number(0) || !a.is_number(1)) raise("TypeError", "async_coro_drive(handle, mode, value)");
+            BoxPtr v = a.size() > 2 ? a.box(2) : nullptr;
+            bool v_none = a.size() <= 2 || a.is_none(2);
+            return coro_drive(e, a.as_int(0), (int)a.as_int(1), v, v_none);
+        };
+        // async_coro_info(h): [state, cr_await, cr_frame, driven by hand]
+        T["async_coro_info"] = [](Engine&, const Args& a) -> Ret {
+            if (a.size() < 1 || !a.is_number(0)) return Ret::lst({Ret::integer(3), Ret::none(), Ret::none(), Ret::boolean(false)});
+            std::lock_guard<std::mutex> l(RT().m);
+            auto it = RT().objs.find(a.as_int(0));
+            Coro* c = it == RT().objs.end() ? nullptr : dynamic_cast<Coro*>(it->second.get());
+            if (!c) return Ret::lst({Ret::integer(3), Ret::none(), Ret::none(), Ret::boolean(false)});
+            int st = coro_state_locked(c);
+            bool parked = st == 2 && c->mtask;
+            return Ret::lst({Ret::integer(st), parked && c->awaiting ? Ret::boxed(c->awaiting) : Ret::none(),
+                             parked && c->frame ? Ret::boxed(c->frame) : Ret::none(), Ret::boolean(c->mtask != nullptr)});
+        };
+        // async_coro_release(h): the coroutine object is gone - its handle
+        // goes too, unless something still runs it.
+        T["async_coro_release"] = [](Engine&, const Args& a) -> Ret {
+            if (a.size() < 1 || !a.is_number(0)) return Ret::none();
+            std::shared_ptr<Obj> dead;
+            {
+                std::lock_guard<std::mutex> l(RT().m);
+                auto it = RT().objs.find(a.as_int(0));
+                Coro* c = it == RT().objs.end() ? nullptr : dynamic_cast<Coro*>(it->second.get());
+                if (!c || c->running || c->inline_running) return Ret::none();
+                if (c->mtask && !c->mtask->done) return Ret::none();
+                if (c->task) {
+                    auto ti = RT().objs.find(c->task);
+                    Task* t = ti == RT().objs.end() ? nullptr : dynamic_cast<Task*>(ti->second.get());
+                    if (t && !t->done) return Ret::none();
+                }
+                dead = it->second;
+                RT().objs.erase(it);
+            }
+            dead.reset();      // its function and arguments go with the GIL held
+            return Ret::none();
+        };
+        // async_coro_drop(h): a coroutine object is gone - its state as
+        // async_coro_info gives it, its handle released unless something
+        // still runs it; -1 (kept) when it is suspended by its runner, to be
+        // closed first. One call for the common case.
+        T["async_coro_drop"] = [](Engine&, const Args& a) -> Ret {
+            if (a.size() < 1 || !a.is_number(0)) return Ret::integer(3);
+            std::shared_ptr<Obj> dead;
+            int st;
+            {
+                std::lock_guard<std::mutex> l(RT().m);
+                auto it = RT().objs.find(a.as_int(0));
+                Coro* c = it == RT().objs.end() ? nullptr : dynamic_cast<Coro*>(it->second.get());
+                if (!c) return Ret::integer(3);
+                st = coro_state_locked(c);
+                if (st == 2 && c->mtask) return Ret::integer(-1);
+                bool busy = c->running || c->inline_running || (c->mtask && !c->mtask->done);
+                if (!busy && c->task) {
+                    auto ti = RT().objs.find(c->task);
+                    Task* t = ti == RT().objs.end() ? nullptr : dynamic_cast<Task*>(ti->second.get());
+                    busy = t && !t->done;
+                }
+                if (!busy) { dead = it->second; RT().objs.erase(it); }
+            }
+            dead.reset();
+            return Ret::integer(st);
+        };
+        // _ny_await_manual(): the name of the coroutine this task drives by
+        // hand (its runner calls send), or none.
+        T["_ny_await_manual"] = [](Engine& e, const Args&) -> Ret {
+            ThreadRec* self = current(e);
+            Coro* mc = self->task ? self->task->manual : nullptr;
+            return mc ? Ret::str(mc->name) : Ret::none();
+        };
+        // _ny_await_yield(y, it, frame): an __await__ iterator yielded y
+        // (the prelude's _ny_drive_await). Driven by hand, y goes to the
+        // runner (send() returns it) and the task parks until the runner
+        // sends again: [mode, value] is what it brings. Otherwise a bare
+        // yield gives the loop's other tasks a turn and anything else is
+        // awaited, then None is sent back - as asyncio's Task does with a
+        // yielded future.
+        T["_ny_await_yield"] = [](Engine& e, const Args& a) -> Ret {
+            ThreadRec* self = current(e);
+            Task* t = self->task;
+            Coro* mc = t ? t->manual : nullptr;
+            if (mc) {
+                {
+                    std::lock_guard<std::mutex> l(RT().m);
+                    mc->out_val = a.size() > 0 ? a.box(0) : e.box_none();
+                    mc->awaiting = a.size() > 1 && !a.is_none(1) ? a.box(1) : nullptr;
+                    mc->frame = a.size() > 2 && !a.is_none(2) ? a.box(2) : nullptr;
+                    mc->has_out = true;
+                    mc->in_mode = 0; mc->in_val = nullptr;
+                }
+                {
+                    GilRelease rel;
+                    std::unique_lock<std::mutex> lk(RT().m);
+                    task_park(lk, self, Deadline::never());
+                }
+                std::lock_guard<std::mutex> l(RT().m);
+                int m = mc->in_mode;
+                BoxPtr v = mc->in_val;
+                mc->in_val = nullptr; mc->awaiting = nullptr; mc->frame = nullptr;
+                return Ret::lst({Ret::integer(m), v ? Ret::boxed(v) : Ret::none()});
+            }
+            if (a.size() == 0 || a.is_none(0)) {
+                if (t) {
+                    GilRelease rel;
+                    std::unique_lock<std::mutex> lk(RT().m);
+                    check_cancel_locked(self);
+                    t->loop->ready.push_back(t); t->in_ready = true;
+                    task_park(lk, self, Deadline::never());
+                    check_cancel_locked(self);
+                }
+                return Ret::lst({Ret::integer(0), Ret::none()});
+            }
+            Awaitable::Item it = item_of(e, a, 0);
+            if (!it.is_handle) raise("RuntimeError", "Task got bad yield: " + e.describe(a.box(0)));
+            await_value(e, it.h, true, nullptr);
+            return Ret::lst({Ret::integer(0), Ret::none()});
         };
         T["async_await"] = [](Engine& e, const Args& a) -> Ret {
             if (a.size() < 1) return Ret::none();
@@ -2763,12 +3016,17 @@ static std::unordered_map<std::string, Handler>& table() {
         T["async_run"] = [](Engine& e, const Args& a) -> Ret {
             if (a.size() < 1) raise("TypeError", "async_run(coroutine)");
             Awaitable::Item it{false, 0, nullptr};
+            int64_t ch = 0;
             if (a.is_number(0)) { it.is_handle = true; it.h = a.as_int(0); }
+            // a coroutine object (round 78)
+            else if (e.coro_handle(a.box(0), ch)) { it.is_handle = true; it.h = ch; it.v = a.box(0); }
             else if (e.is_callable(a.box(0))) {
                 // async_run(main): call the async function to get its coroutine.
                 BoxPtr r = e.call(a.box(0), std::vector<BoxPtr>(rest(a, 1)));
-                if (!e.unbox_int(r, it.h)) raise("TypeError", "async_run(): the function did not return a coroutine");
+                if (!e.unbox_int(r, it.h) && !e.coro_handle(r, it.h))
+                    raise("TypeError", "async_run(): the function did not return a coroutine");
                 it.is_handle = true;
+                it.v = r;
             } else raise("TypeError", "async_run() expects a coroutine");
             return boxret(async_run(e, it));
         };

@@ -368,6 +368,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit84 | 212 | round 77: Python's syntax (passes under python3) - soft Nython keywords (`new = 1`, `def f(ref):`, `obj.self`), imports/del/class bases/lambda parameters in every form, expression statements evaluated (`{}["x"]`), assignment and for/with targets, unpack counts, augmented in-place dunders and `@=`, chained comparisons, literals (`\N{...}`), decorators (PEP 614), match, exception groups and `except*` (PEP 654) |
 | vm_audit85 | 73 | round 77: classes deriving from builtin types hold a value (int/float/str/bytes/bytearray/list/dict/set/frozenset/tuple, `int.__new__(cls, v)`), `__getattribute__`, a live `obj.__dict__`, a metaclass's `__prepare__` (passes under python3) |
 | vm_audit86 | 65 | round 77: every class statement its own class, `isinstance(x, object)`, `__eq__` without `__hash__`, property/staticmethod/classmethod objects, dir/vars, two-argument super, bound/builtin method types and reprs, type objects for None/functions/builtins/generators/iterators, dict methods before keys (63 pass under python3) |
+| vm_audit89 | 70 | round 78: frame objects (sys._getframe, inspect.stack/currentframe/getframeinfo/getargvalues, traceback frames with locals, gi_frame, logging's caller info), weak references to functions/classes/sets/builtin subclasses, coroutine objects driven by hand (send/throw/close, cr_*, never-awaited warning), async generator objects (passes under python3) |
 | vm_audit87 | 73 | round 77: `in`/ordering TypeErrors, exceptions' str/repr/args and fields (OSError errno/filename, Unicode errors, SyntaxError), runtime errors with their fields, `iter(f, sentinel)`, generator attributes, `__format__`, `os.stat_result`, live `exec` namespaces, recursive reprs (72 pass under python3) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
@@ -965,8 +966,7 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   panel (focus `"stdin"`), the Terminal forwards lines to a running
   command, Ctrl+D ends input.
 - **Gotchas**: `C.__dict__` is a copy (an instance's is live since
-  vm_audit85); coroutine
-  objects are task handles (ints); a prelude name (`slice`, `object`,
+  vm_audit85); a prelude name (`slice`, `object`,
   `complex`, `help`) shadows the old placeholder builtin of that name.
 - **Classes** (vm_audit79): annotations are kept (`__annotations__`);
   `__new__`, `__init_subclass__` with class keywords, `__set_name__`,
@@ -1028,6 +1028,22 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   counts; every augmented operator tries its in-place dunder; comparisons
   chain at one level; `except*` and ExceptionGroup (prelude); `\N{name}`
   escapes and `lib/unicodedata.ny` (`src/NyUniNames.cpp`).
+
+## Round 78: frames, weak references, coroutine objects (see `HANDOFF.md` §0q)
+
+- **Frame objects, made only when asked for** (`sys._getframe`, inspect,
+  traceback, `tb_frame`, `gi_frame`): the prelude's `_NyFrame`, kept in the
+  frame's record (`PyFrame::fobj` / `CallFrame::fobj`); live `f_locals` /
+  `f_lineno` / `f_back` while the call runs, the last ones after. logging's
+  `%(funcName)s`/`%(lineno)d`/stack_info come from them.
+- **Weak references** to functions, bound methods, classes, sets,
+  frozensets and builtin-subclass instances (VM functions carry an identity
+  cell in `VMVal::iter`).
+- **Coroutine objects**: an async def call gives `_NyCoroutine`
+  (`coroutine`) over the runtime's handle; `send`/`throw`/`close` drive it
+  by hand (`async_coro_drive` in NyConc.cpp), `__await__` generators are
+  run (`_ny_drive_await`), unawaited ones warn. Async generators give
+  `async_generator` objects with awaitable asend/athrow/aclose.
 
 ## Transcripts
 

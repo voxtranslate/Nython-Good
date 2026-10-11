@@ -264,9 +264,9 @@ def _agen_throw(agen, value):
 
 
 def _await(x):
-    # await the result of an async call (a coroutine); a plain value as it is
-    if x is none or isinstance(x, bool) or not isinstance(x, int):
-        return x
+    # await the result of an async call (a coroutine object - round 78: no
+    # longer an int handle to tell from a plain value); a plain value is
+    # returned as it is
     return async_await(x)
 
 

@@ -39,8 +39,8 @@
 #     filter() return lists, so they are MutableSequences (not KeysView,
 #     ItemsView, ...); there are no distinct dict view or mappingproxy types
 #     to register.
-#   - Coroutine objects are task handles (ints), so a coroutine is not an
-#     Awaitable/Coroutine instance; a class defining __await__ is.
+#   - (Coroutine objects are real objects since round 78: a coroutine is a
+#     Coroutine and an Awaitable, as in Python.)
 #   - memoryview does not exist (not registered).
 #   - A class that defines __eq__ without __hash__ is unhashable in Python
 #     (its __hash__ is set to None); the engines do not do that, but
@@ -1114,3 +1114,11 @@ MutableSequence.register(bytearray)  # Multiply inheriting, see ByteString
 async def _ag():
     yield
 AsyncGenerator.register(type(_ag()))
+
+# coroutines: the prelude's class too (round 78), registered as CPython does
+async def _coro():
+    pass
+_coro_obj = _coro()
+Coroutine.register(type(_coro_obj))
+_coro_obj.close()   # (closed, so it does not warn that it was never awaited)
+del _coro_obj

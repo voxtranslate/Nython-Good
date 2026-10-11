@@ -3,7 +3,9 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 77 — **§0p** (bytes; signals; sockets, TLS, HTTP,
+Last updated: round 78 — **§0q** (frame objects, weak references to
+functions/classes/sets, coroutine and async generator objects; both
+engines). Round 77 — **§0p** (bytes; signals; sockets, TLS, HTTP,
 urllib, WebSockets and the network libraries made real; asyncio and the
 async protocols; modules with their own scope and packages; sets; the
 command line and argparse; per-execution classes, slices, eval/exec,
@@ -35,6 +37,137 @@ multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
 
 ---
+
+## 0q. Round 78 — frames, weak references, coroutine objects (vm_audit89)
+
+All on both engines; `examples/vm_audit89.ny` passes on both and under
+python3 (every expected value is CPython 3.11's; two 3.12-only checks are
+Nython-only).
+
+### Frame objects
+- `sys._getframe(depth)`, `inspect.currentframe()/stack()/trace()/
+  getframeinfo()/getouterframes()/getinnerframes()/getargvalues()`,
+  `traceback.extract_stack()/walk_stack()/print_stack()` and a traceback's
+  `tb_frame` are real frame objects: the prelude's `_NyFrame` (shown as
+  `frame`; `types.FrameType`), made by the engines **only when asked for**
+  and kept in the frame's record (`PyFrame::fobj` on the interpreter,
+  `CallFrame::fobj` on the VM), so the same object comes back while the
+  call runs. Fields: `f_code` (`_NyFuncCode`: co_name, co_qualname,
+  co_filename, co_firstlineno, co_varnames = the parameters,
+  co_argcount...), `f_lineno`, `f_lasti` (approximate: the VM's
+  instruction offset, the interpreter's line x 2), `f_locals` (what
+  `locals()` gives there - a method's `self` included on both engines now;
+  for a module frame its globals), `f_globals`, `f_builtins`, `f_back`,
+  `f_trace`, `clear()` (RuntimeError on a running frame).
+- Live vs dead: while the call runs, `f_locals`/`f_lineno` are read from
+  the running frame (`_ny_frame_sync`, a new dict each read - 3.13's
+  snapshot semantics rather than 3.11's one cached dict) and `f_back` is
+  the caller's frame (`_ny_frame_back`). When the call ends, a frame
+  object referenced elsewhere keeps its last locals and line and links its
+  caller's frame object (as CPython's `take_ownership`); one nobody else
+  holds just goes. A call nobody asks about pays one pointer test when it
+  ends. Frames on another thread or in a suspended generator show what
+  they had when last synced (a generator's is synced when it pauses).
+- Generators: `gi_frame` is the generator's real frame (its arguments
+  before it starts, the locals it paused at, None once finished); the
+  generator keeps it while suspended. `inspect.getgeneratorstate/
+  getgeneratorlocals`, `getcoroutinestate/getcoroutinelocals`,
+  `getasyncgenstate/getasyncgenlocals` (3.12).
+- Tracebacks: each entry holds the frame it passed (`_ny_frame`), with
+  its last locals (`traceback.TracebackException(capture_locals=True)`
+  shows them). On the interpreter the pending traceback record holds the
+  frame objects while an exception unwinds; an exception native code
+  catches and drops (a generator's close, `hasattr`, a loop's
+  StopIteration) would keep them, so they are dropped at the next
+  statement and when `close()` swallows GeneratorExit
+  (`tbDropFrames`) - a suspended generator's cycle is still collected.
+- `logging`: findCaller walks the real frames (CPython's
+  `_is_internal_frame`, stacklevel), `stack_info=True` prints the stack,
+  `exception()` the whole traceback, `captureWarnings()` routes warnings to
+  the `py.warnings` logger.
+- Fixed on the way: `globals()` lacked `__name__`/`__file__`, and the
+  dicts `locals()`/`globals()` build stored names raw - a dunder name is not
+  a plain dict key (`nypy::key_of_str`), so `globals()["__name__"]` was a
+  KeyError (both engines); a lambda in a parameter list took the list's defaults
+  (`def f(g=lambda n: n, h=2)` lost h's default - the parser, both
+  engines); on the VM `next(it)` dropped the value of the StopIteration
+  `__next__` raised.
+
+- Cost (this container, loaded): a caught exception passing two frames
+  ~+20% on the interpreter (a frame object per frame it passes, its locals
+  copied when the frame ends; the code info is made once per function),
+  unchanged on the VM within noise; plain calls unchanged.
+
+### Weak references
+`weakref(obj)` (and lib/weakref.ny over it) reaches functions and lambdas,
+bound methods, sets and frozensets, classes and instances of builtin
+subclasses, with callbacks; int/str/list/tuple/dict/bytes/None keep
+CPython's TypeError. Classes live as long as the program here, so a
+reference to one is never dead. On the VM a function value got an
+identity cell (`VMVal::iter`, made by MAKE_FUNCTION; registered with the
+cycle collector the first time the function is weakly referenced or used
+as a key, so a function kept only by the key table is freed), and a
+reference to a set has its callback run at the next collection
+(`weak_polled`; a set has no field to hold a notifier).
+
+### Coroutine objects
+- Calling an `async def` gives a `_NyCoroutine` (shown as `coroutine`,
+  `types.CoroutineType`; the parser's rewriting builds it:
+  `_NyCoroutine(handle, function, name, qualname)`). The runtime still runs
+  the int handle (`_ny_coro_h`); the engines read it from the object
+  without calling anything (`Engine::coro_handle`), so `await`,
+  `asyncio.run`, `create_task`, `gather`, `wait_for` take the objects.
+- Driven by hand (`async_coro_drive`, `src/NyConc.cpp`): `send(None)` runs
+  the coroutine as a task of a private loop on the calling thread until it
+  finishes (`StopIteration(value)`) or reaches a yield of an `__await__`
+  generator, whose value `send` returns; `throw`/`close` resume it there
+  (GeneratorExit / finally blocks run). What the runtime's own awaitables
+  wait for (sleep, tasks, locks) is waited for inside the call - CPython
+  would hand the future to the runner instead.
+- `await x` where `x.__await__()` is a generator (or an iterator) runs it
+  (`_ny_drive_await`): driven by hand its yields reach the runner; in a
+  task a bare yield gives the other tasks a turn and a yielded awaitable is
+  awaited. `cr_running`, `cr_suspended`, `cr_await`, `cr_frame` (the
+  body's frame while paused by hand; a frame at the def line before it
+  starts; None once finished), `cr_code`, `__name__`/`__qualname__`,
+  `__await__()` (a `coroutine_wrapper`), "cannot reuse already awaited
+  coroutine", and `RuntimeWarning: coroutine 'f' was never awaited`
+  through `warnings` when one is dropped unawaited (`__del__`; the handle
+  is released then). An async call costs ~15 µs more on the interpreter
+  and ~8 µs on the VM (the object, and its `__del__`).
+- `lib/contextlib.ny`'s async parts awaited only int handles (`_await`);
+  `collections.abc` registers the coroutine type as CPython does.
+- Async generators are `_NyAsyncGen` (`async_generator`): `__anext__`,
+  `asend`, `athrow`, `aclose` return awaitables (`async_generator_asend` /
+  `_athrow`) that can also be driven by hand; `ag_running`, `ag_frame`,
+  `ag_code`, `ag_suspended`. `async for` still reads the generator
+  directly. `asyncio.sleep()` is a coroutine now.
+
+### New natives (both engines)
+`_ny_frame_get(depth)`, `_ny_frame_sync(f)`, `_ny_frame_back(f)`,
+`_ny_frame_globals(f)`, `_ny_builtins_dict()` (NythonExecutor::frameGet ...
+/ VirtualMachine::frame_get ...); in the shared runtime (NyConc.cpp, so
+registered on both): `async_coro_drive(h, mode, value)`,
+`async_coro_info(h)`, `async_coro_drop(h)`, `async_coro_release(h)`,
+`_ny_await_manual()`, `_ny_await_yield(y, it, frame)`; the engine adapters
+gained `Engine::coro_handle` and an `__await__`-generator path in
+`await_target`.
+
+### Not done
+- `sys.settrace` / `sys.setprofile`: feasible at almost no cost when
+  unused - one more predictable branch per statement on the interpreter
+  (beside the `--trace` check in `noteStatement`) and per instruction on
+  the VM (folded into the existing `vm_trace_` test), one per call/return
+  (FrameGuard / `pop_frame`) - but not written: call/line/return/exception
+  events with per-frame `f_trace`, re-entrancy guards and the profile
+  events are ~250 lines per engine.
+- Writing to `f_locals` does not change the frame's variables (3.11's
+  behaviour without `PyFrame_LocalsToFast`; 3.13 writes through).
+- `co_varnames` lists the parameters only; positions carry no columns.
+- A coroutine wrapped in a running asyncio task shows a frame at its def
+  line as `cr_frame` (its real frame is on the task's own stack).
+- A bare generator (`types.coroutine` without an `__await__` object) is
+  not awaitable; weak references to generators are not supported.
 
 ## 0p. Round 77 — bytes, the network stack, signals, modules, the CLI, Python compatibility
 
@@ -901,8 +1034,8 @@ Nython over the class machinery above; each header says what is not there.
 ### Not done / known differences
 - `obj.__dict__` is live (above), but `type(vars(obj))` is the prelude's
   `_NyInstanceDict` (a dict subclass), and `C.__dict__` is still a copy.
-- Coroutine objects are task handles (ints): `type(co())` is int, not
-  coroutine; awaiting and asyncio work.
+- ~~Coroutine objects are task handles (ints)~~ - real coroutine objects
+  since round 78 (§0q).
 - Found with vm_audit86, not fixed: no name mangling (`self.__y` is not
   `_C__y`); on the VM a method whose first parameter is not named `self` is
   not bound (the interpreter binds `self`/`this`); on the interpreter,
@@ -915,8 +1048,9 @@ Nython over the class machinery above; each header says what is not there.
   `list_iterator` (range is a list); on the interpreter, set/dict keys of
   objects with `__hash__` are keyed by class name plus hash, so equal objects
   of two classes stay distinct.
-- Frames have no locals (`inspect.currentframe()` is None); weak references
-  are to instances only. Classes deriving from `complex`, `range`,
+- ~~Frames have no locals; weak references are to instances only~~ - real
+  frame objects and weak references to functions, classes and sets since
+  round 78 (§0q). Classes deriving from `complex`, `range`,
   `memoryview` ... (types with no mirror class) still hold no value; a dict
   keyed by a payload instance gives the key back as the plain value.
 - A metaclass's `__prepare__` mapping sees the body's bindings, but the body

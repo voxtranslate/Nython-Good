@@ -72,6 +72,9 @@ struct Engine {
     // `await obj` for an object with __await__: what obj.__await__() returns
     // (nullptr when obj has none). Throws NyError if __await__ raises.
     virtual BoxPtr await_target(const BoxPtr&) { return nullptr; }
+    // A coroutine object (round 78; the prelude's _NyCoroutine and the
+    // awaitables built like it): the handle of the coroutine it stands for.
+    virtual bool coro_handle(const BoxPtr&, int64_t&) { return false; }
     // The exception object an error stands for (gather(return_exceptions=
     // True) returns them); nullptr when the engine cannot make one.
     virtual BoxPtr exception_object(const NyError&) { return nullptr; }

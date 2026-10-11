@@ -89,6 +89,10 @@ struct Gen {
     Value retval;                 // `return v`: StopIteration.value
     Saved saved;
     Value delegate;               // the iterator a `yield from` is running
+    // Its frame object (round 78), once one was asked for (gi_frame, or
+    // sys._getframe() in its body): counted; it keeps the line and locals
+    // the body paused at while the generator is suspended.
+    nyheap::Inst* fobj = nullptr;
     // GenExpr
     ComprehensionNode* comp = nullptr;
     node_ptr comp_keep;
@@ -417,7 +421,7 @@ bool resume_function(NythonExecutor& E, Gen* g, Mode m) {
         g->saved.handling_obj.clear();
         O.insert(O.end(), g->saved.owners.begin(), g->saved.owners.end());
         // the generator's own frame, and those its body had running (round 77)
-        PF.push_back({g->fn, r_cur, g->fc});
+        PF.push_back({g->fn, r_cur, g->fc, g->fobj});
         if (g->saved.cur) NythonExecutor::cur_stmt() = g->saved.cur;
         size_t pf1 = PF.size();
         PF.insert(PF.end(), g->saved.frames.begin(), g->saved.frames.end());
@@ -445,6 +449,14 @@ bool resume_function(NythonExecutor& E, Gen* g, Mode m) {
         g->saved.handling_obj.assign(HO.size() > ho0 ? HO.begin() + (long)ho0 : HO.end(), HO.end());
         HO.resize(std::min(HO.size(), ho0));
         g->saved.frames.assign(PF.size() > pf1 ? PF.begin() + (long)pf1 : PF.end(), PF.end());
+        // Its frame object (round 78): the record's (one made while it ran
+        // is the generator's now), with the line and locals it paused at -
+        // or its last ones, once the body has ended.
+        if (PF.size() > pf0) g->fobj = PF[pf0].fobj;
+        if (g->fobj) {
+            if (g->fobj->gc_rc > 1) E.frameStore(g->fobj, g->saved.cur, g->fc);
+            if (nycoro::done(g->co)) { nygc::decref(g->fobj); g->fobj = nullptr; }
+        }
         PF.resize(std::min(PF.size(), pf0));
         g->saved.owners.assign(O.size() > o0 ? O.begin() + (long)o0 : O.end(), O.end());
         O.resize(std::min(O.size(), o0));
@@ -485,6 +497,7 @@ void finish(NythonExecutor& E, Gen* g) {
     switch (g->kind) {
     case Kind::Function:
         list_remove(g);
+        if (g->fobj) { nyheap::Inst* fo = g->fobj; g->fobj = nullptr; nygc::decref(fo); }   // round 78
         if (g->co) {
             if (!nycoro::started(g->co) || nycoro::done(g->co)) { nycoro::destroy(g->co); g->co = nullptr; }
         }
@@ -755,6 +768,7 @@ void GenObject::gc_traverse(nython::gc::GcVisitFn visit, void* arg) {
     // so it must not be found unreachable here.
     if (gg->kind == Kind::Function && gg->st == St::Suspended && !closable_here(gg)) return;
     if (gg->fc_pinned && gg->fc) visit(gg->fc, arg);
+    if (gg->fobj) visit(gg->fobj, arg);   // round 78
     if (gg->outer_pinned && gg->outer) visit(gg->outer, arg);
     if (gg->cc) visit(gg->cc, arg);
     visit_value(gg->xfer, visit, arg);
@@ -958,7 +972,8 @@ void close(NythonExecutor& E, Gen* g) {
     try {
         yielded = resume_function(E, g, Mode::Close);
     } catch (std::string& s) {
-        if (is_exc(E, s, "GeneratorExit") || is_exc(E, s, "StopIteration")) return;
+        // its traceback's frames go with it (round 78)
+        if (is_exc(E, s, "GeneratorExit") || is_exc(E, s, "StopIteration")) { NythonExecutor::tbDropFrames(); return; }
         throw;
     }
     if (yielded) raise("RuntimeError", "generator ignored GeneratorExit");
@@ -1351,6 +1366,26 @@ bool attr(NythonExecutor& E, const Value& obj, const std::string& name, Value& o
         // None once it has finished; else a frame whose f_lineno is the
         // statement it is paused at (the def line before it starts)
         if (g->st == St::Done) { out = NONE_VALUE; return true; }
+        // A generator function's: its real frame object (round 78) - the
+        // running record's, or the one it keeps while suspended, with the
+        // locals it paused at (its arguments before it starts).
+        if (fn) {
+            if (g->st == St::Running) {
+                auto& PF = NythonExecutor::py_frames();
+                for (size_t i = PF.size(); i-- > 0;)
+                    if (PF[i].code == (Node*)g->fn && PF[i].ctx == g->fc) { out = E.frameObject(i, E.frameWhere(i)); return true; }
+            }
+            int64_t def_line = g->fn->first_line ? (int64_t)g->fn->first_line : (int64_t)g->fn->token().line();
+            Node* at = g->st == St::Suspended ? g->saved.cur : nullptr;
+            if (!g->fobj) {
+                Value fo = E.newFrameObject(g->fn, g->fc, at, def_line);
+                if (!E.isInstanceVal(fo)) { out = NONE_VALUE; return true; }
+                g->fobj = static_cast<nyheap::Inst*>(fo.value.o);
+                nygc::incref(g->fobj);
+            } else E.frameStore(g->fobj, at, g->fc, def_line);   // where it is paused now
+            out = NythonExecutor::instValue(g->fobj);
+            return true;
+        }
         Node* code = fn ? (Node*)g->fn : (Node*)g->comp;
         Node* where = g->st == St::Suspended && g->saved.cur ? g->saved.cur
                     : g->st == St::Running ? NythonExecutor::cur_stmt() : nullptr;

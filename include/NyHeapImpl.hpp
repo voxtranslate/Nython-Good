@@ -191,10 +191,13 @@ inline Weak::Weak(NythonExecutor* e, int64_t i)
     : Collectable(nython::kernel::Type::FUNCTION), tag("__weakref__:" + std::to_string(i)), E(e), id(i) {}
 inline void Weak::gc_traverse(GcVisitFn visit, void* arg) {
     if (callback.value.o) visit(callback.value.o, arg);
+    if (held.value.o) visit(held.value.o, arg);
 }
 inline void Weak::gc_clear() {
     Value c = callback;
     callback = Value();
+    Value h = held;
+    held = Value();
 }
 inline Weak::~Weak() {
     if (target) {
