@@ -5646,3 +5646,34 @@ Full detail in `HANDOFF.md` §0r, §0r2, §0r3. New tests: `vm_audit91` (settrac
 | `frame.f_locals["x"] = 5` changed nothing | f_locals was a snapshot | PEP 667 write-through proxy |
 | Windows: the debugger's per-file questions (`why_not`, file breakpoints) never matched | a recording's file names were kept JSON-escaped (`C:\\\\users`) | each name decoded once when first seen |
 
+
+## Round 80, part A — the correctness gaps rounds 78-79 found
+
+Full detail in `HANDOFF.md` §0s. New test: `vm_audit96` (116 checks), passes under python3 too (one Nython-only check).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Interpreter segfault: `__class_getitem__ = classmethod(types.GenericAlias)` then `A[int]` | a classmethod object whose `__func__` is a class was not unwrapped, and `classSubscript` read it as a function's AST node | descriptors are bound with `__get__(None, C)` and called |
+| Interpreter segfault: a generator's `__next__` held by a class and iterated | `callClassMethod` declined a member that was not a function; the older path read the bound member's heap object as a FunctionNode (a type confusion) | any callable a class holds is called as it is; only a function's pointer is read as an AST node |
+| Interpreter: `m.f = lambda: 1; m.f()` raised AttributeError (and `sys.getdefaultencoding()`) | `callMethod`'s module/namespace path ran only `def` functions | lambdas too |
+| `StrAttr.label()` (a str class attribute) gave none | no callable check on class attributes | TypeError "'str' object is not callable", both engines |
+| `P.__eq__`, `P.__init_subclass__`, `Base.__init__(self)` with no `__init__` in Base: AttributeError | a class naming no base had no `object` in the MRO the engines search | object's members are looked for after a lookup through the class missed (no cost to hits); `_NyObjectExtra` |
+| `KeyError.__module__ == "__main__"`, `repr(KeyError)` `<class '__main__.KeyError'>` | builtin exception classes were prelude classes | `"builtins"`, `<class 'KeyError'>` |
+| `ImportError("m", name="x")` raised TypeError; the runtime's NameError had no `.name` | no keyword fields | `name`/`path`/`obj` fields (3.10+), also read back from the runtime's messages |
+| VM: `iter([1]).__next__` AttributeError; `f_builtins["len"] is len` false | iterators had no `__next__` member; each bridge load made a new native | `__next__` bound; one object per bridged builtin |
+| `except self._error:` / `except errs[0]:` / `except (A,) + (B,):` were syntax errors; `except ERRS:` with a tuple name matched nothing | only names parsed; a name was matched as a class name | any expression (the parser lowers it onto `_ny_exc_match`); tuple-valued names matched element by element |
+| `{Decimal("0.5"), 0.5}` had two elements | an object's `__hash__` key was never the number's key | an object hashing like an int/float of equal value is that number's key |
+| `dataclass(slots=True)` only set `__slots__` | no rebuild | CPython's `_add_slots` |
+| No `__import__`, `sys.modules` was a snapshot dict, no importlib | — | the registry as a real dict that import asks first; `__import__`; `lib/importlib/` |
+| No pkgutil, runpy | — | `lib/pkgutil.ny`, `lib/runpy.ny` over importlib (CPython 3.11's API and messages) |
+| `from . import a` / `from .m import x` were syntax errors | no relative imports | the parser keeps the dots; both engines resolve them against `__package__` (CPython's `_resolve_name`) |
+| A program's `sys.excepthook` was never called | the engines printed the traceback themselves | the hook reports an uncaught exception; nothing more is printed |
+| VM: a module's `del sys` removed the program's `sys`; `exec("import math as m", ns)` bound `m` among the globals | `define_*_module` bound into the globals | bound in the importing scope |
+| Interpreter: `eval("name", {})` saw the program's globals; `exec("import math", ns)` put `PI`/`E` into `ns` | the given dict's scope had the program's as parent; math members copied into any scope | only that dict and the builtins; math's constants only into the program's scope |
+| No `sys.version_info`, `hash_info`, `float_info`, `flags`, `getsizeof`, `setrecursionlimit`, `excepthook`, `setswitchinterval`, `__debug__`, `-O` | — | `_ny_sys_extend`; one recursion limit both engines check; a settable GIL interval; `-O` drops asserts |
+| `locals()` dropped `__x__` variables | every dunder name was treated as the engine's | only the engines' own names and the parser's temporaries are left out (`nyrt::user_dunder_name`) |
+| `os.environ[k] = v` did not reach `os.getenv` or children; each `import os` had its own | a snapshot dict per import | `os._Environ` (putenv/unsetenv), one `os` module |
+| A program's `list = 5` broke lazily loaded prelude chunks (`A.mro()`...) | prelude code resolved names in the program's globals | prelude code has its own scope (interpreter) / does not see the main frame (VM); `_ny_b_*` removed |
+| `ThreadPoolExecutor` workers were daemons drained by atexit | no `threading._register_atexit` | callbacks run before non-daemon threads are joined (both engines) |
+| `str.maketrans` / `str.translate` missing | — | all three forms, CPython's messages |
+| `string.Template("${name}")` in Python code interpolated `name` | `${...}` made any quoted literal an f-string, and the interpreter re-interpolated at run time | `${...}` only in Nython source: not in raw strings, bytes, f-strings, nor any quoted string of a `.py` file, a `# nython: module` module or a `# nython: python` file; no run-time re-interpolation |

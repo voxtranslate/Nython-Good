@@ -4,12 +4,11 @@
 # worker threads started on demand up to max_workers - min(32, cpus + 4) by
 # default - and reused when idle; initializer/initargs, thread_name_prefix,
 # BrokenThreadPool when an initializer fails, shutdown(wait, cancel_futures),
-# and the pool drained and joined at interpreter exit).
-#
-# Difference from CPython 3.9+: the workers are daemon threads that an
-# atexit handler drains and joins (CPython 3.8's arrangement) - Nython has
-# no threading._register_atexit, the hook that runs before the interpreter
-# waits for its non-daemon threads.
+# and the pool drained and joined at interpreter exit: CPython 3.9+'s
+# arrangement - non-daemon workers, woken and joined by a
+# threading._register_atexit hook, which runs before the program's
+# non-daemon threads are waited for (round 80; round 79 used daemon workers
+# drained by an atexit handler, as CPython 3.8).
 # Copyright 2009 Brian Quinlan. All Rights Reserved.
 # Licensed to PSF under a Contributor Agreement.
 
@@ -17,7 +16,6 @@
 __author__ = 'Brian Quinlan (brian@sweetapp.com)'
 
 from concurrent.futures import _base
-import atexit
 import itertools
 import queue
 import threading
@@ -46,11 +44,7 @@ def _python_exit():
 # non-daemon threads. This is used instead of `atexit.register()` for
 # compatibility with subinterpreters, which no longer support daemon threads.
 # See bpo-39812 for context.
-# (Nython has no threading._register_atexit - hooks run before the
-# interpreter waits for the threads still running. The workers are daemon
-# threads instead, and an atexit handler drains and joins them, so the work
-# submitted still runs at exit: CPython 3.8's arrangement)
-atexit.register(_python_exit)
+threading._register_atexit(_python_exit)
 
 # At fork, reinitialize the `_global_shutdown_lock` lock in the child process
 if hasattr(os, 'register_at_fork'):
@@ -206,8 +200,7 @@ class ThreadPoolExecutor(_base.Executor):
                                  args=(weakref.ref(self, weakref_cb),
                                        self._work_queue,
                                        self._initializer,
-                                       self._initargs),
-                                 daemon=True)
+                                       self._initargs))
             t.start()
             self._threads.add(t)
             _threads_queues[t] = self._work_queue

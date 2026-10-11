@@ -954,6 +954,7 @@ class MutableMapping(Mapping):
 
 
 MutableMapping.register(dict)
+MutableMapping.register(_NyEnviron)   # os.environ (round 80: the prelude's os._Environ)
 
 
 ### SEQUENCES ###

@@ -1062,7 +1062,7 @@ class object:
         if len(kw) > 0:
             raise TypeError(cls.__name__ + ".__init_subclass__() takes no keyword arguments")
     @classmethod
-    def __subclasshook__(cls, subclass):
+    def __subclasshook__(cls, *args):
         # Abstract classes can override this to customize issubclass()
         # (lib/abc.ny asks it first); object's declines (round 77)
         return NotImplemented
@@ -1100,6 +1100,57 @@ class object:
     def __getstate__(self):
         import copyreg
         return copyreg._ny_getstate(self)
+
+class _NyObjectExtra:
+    # The rest of object's methods (round 80). They cannot be in object's
+    # class body: the engines' protocol dispatch would then find __eq__,
+    # __hash__, __repr__ ... in every class (each MRO ends in object) and run
+    # them for every ==, hash() and repr(). They are read only where nothing
+    # in a class's MRO has the name (the engines' objectMember /
+    # object_member): P.__eq__, object.__repr__(x), super().__hash__(),
+    # hasattr(p, "__ne__").
+    def __eq__(self, other):
+        if self is other:
+            return True
+        return NotImplemented
+    def __ne__(self, other):
+        var r = type(self).__eq__(self, other)
+        if r is NotImplemented:
+            return r
+        return not r
+    def __lt__(self, other):
+        return NotImplemented
+    def __le__(self, other):
+        return NotImplemented
+    def __gt__(self, other):
+        return NotImplemented
+    def __ge__(self, other):
+        return NotImplemented
+    def __hash__(self):
+        # the identity hash hash() gives an object whose class defines none
+        if getattr(type(self), "__hash__", None) is _ny_object_extra_hash:
+            return hash(self)
+        return id(self) >> 4
+    def __repr__(self):
+        var t = type(self)
+        var m = getattr(t, "__module__", None)
+        var q = getattr(t, "__qualname__", t.__name__)
+        if m is not None and m != "builtins":
+            q = m + "." + q
+        return "<" + q + " object at " + hex(id(self)) + ">"
+    def __str__(self):
+        return type(self).__repr__(self)
+    def __format__(self, format_spec):
+        if not isinstance(format_spec, str):
+            raise TypeError("__format__() argument must be str, not " + type(format_spec).__name__)
+        if format_spec != "":
+            raise TypeError("unsupported format string passed to " + type(self).__name__ + ".__format__")
+        return str(self)
+    def __sizeof__(self):
+        return 16 if type(self) is object else 24
+    def __dir__(self):
+        return dir(self)
+_ny_object_extra_hash = _NyObjectExtra.__hash__
 
 def _ny_complex_part(x):
     # a component as Python shows it: 2.0 -> 2, 1.5 -> 1.5
@@ -2117,7 +2168,41 @@ def _ny_format_exc(e, last_line, seen, cache):
         out += _ny_exc_line(e)
     return out
 
+# sys.excepthook / sys.__excepthook__ (round 80): the traceback the engines
+# print for an uncaught exception, on the current sys.stderr. A program's
+# own hook is called instead (_ny_format_uncaught then gives None and the
+# engines print nothing more).
+_ny_sys_ref = [None]
+
+def _ny_excepthook(exc_type, value, tb):
+    var err = None
+    if _ny_sys_ref[0] is not None:
+        err = getattr(_ny_sys_ref[0], "stderr", None)
+    if err is None:
+        err = _ny_stderr
+    if not isinstance(value, BaseException):
+        # reported, not raised (CPython's sys.excepthook)
+        err.write("TypeError: print_exception(): Exception expected for value, " + type(value).__name__ + " found\n")
+        return
+    # the exception's own traceback; the one given only when it has none
+    # (CPython's _PyErr_Display puts it on the exception)
+    if tb is not None and getattr(value, "__traceback__", None) is None:
+        value.__traceback__ = tb
+    err.write(_ny_format_exc(value, True, [], {}))
+
 def _ny_format_uncaught(e):
+    var s = _ny_sys_ref[0]
+    if s is not None:
+        var hook = getattr(s, "excepthook", None)
+        if hook is None:
+            _ny_stderr.write("sys.excepthook is missing\n")
+        elif hook is not _ny_excepthook:
+            try:
+                hook(type(e), e, getattr(e, "__traceback__", None))
+            except BaseException as he:
+                _ny_stderr.write("Error in sys.excepthook:\n" + _ny_format_exc(he, True, [], {}) +
+                                 "\nOriginal exception was:\n" + _ny_format_exc(e, True, [], {}))
+            return None
     try:
         return _ny_format_exc(e, False, [], {})
     except BaseException:
@@ -2511,21 +2596,582 @@ def _ny_star_finish(st):
         excs.append(kept)
     raise BaseExceptionGroup("", excs)
 
-# The builtins the "slots" mirror chunk calls, under names a program does not
-# rebind (round 79): the chunk runs in the global scope, lazily - after a
-# program's own `list = []` may have replaced the builtin there - and it runs
-# for library classes too (abc.ABC's `__slots__ = ()`).
-_ny_b_list = list
-_ny_b_tuple = tuple
-_ny_b_str = str
-_ny_b_int = int
-_ny_b_bytes = bytes
-_ny_b_type = type
-_ny_b_object = object
-_ny_b_isinstance = isinstance
-_ny_b_issubclass = issubclass
-_ny_b_getattr = getattr
-_ny_b_repr = repr
+def _ny_exc_match(e, t):
+    # `except <expression>:` (round 80; the parser lowers such clauses onto
+    # this): whether the exception handled is an instance of t - a class or
+    # a tuple of classes - with CPython's TypeError for anything else (a
+    # nested tuple included, as _PyEval_CheckExceptTypeValid)
+    var ts = t if isinstance(t, tuple) else (t,)
+    for x in ts:
+        if not (isinstance(x, type) and issubclass(x, BaseException)):
+            raise TypeError("catching classes that do not inherit from BaseException is not allowed")
+    for x in ts:
+        if isinstance(e, x):
+            return True
+    return False
+
+def _ny_str_maketrans(*args):
+    # str.maketrans (round 80): CPython's three forms and messages
+    if len(args) == 0:
+        raise TypeError("maketrans expected at least 1 argument, got 0")
+    if len(args) > 3:
+        raise TypeError("maketrans expected at most 3 arguments, got " + str(len(args)))
+    var x = args[0]
+    var d = {}
+    if len(args) == 1:
+        if not isinstance(x, dict):
+            raise TypeError("if you give only one argument to maketrans it must be a dict")
+        for k in x:
+            if isinstance(k, str):
+                if len(k) != 1:
+                    raise ValueError("string keys in translate table must be of length 1")
+                d[ord(k)] = x[k]
+            elif isinstance(k, int):
+                d[k] = x[k]
+            else:
+                raise TypeError("keys in translate table must be strings or integers")
+        return d
+    var y = args[1]
+    if not isinstance(y, str):
+        raise TypeError("maketrans() argument 2 must be str, not " + type(y).__name__)
+    if len(args) == 3 and not isinstance(args[2], str):
+        raise TypeError("maketrans() argument 3 must be str, not " + type(args[2]).__name__)
+    if not isinstance(x, str):
+        raise TypeError("first maketrans argument must be a string if there is a second argument")
+    if len(x) != len(y):
+        raise ValueError("the first two maketrans arguments must have equal length")
+    var i = 0
+    for c in x:
+        d[ord(c)] = ord(y[i])
+        i += 1
+    if len(args) == 3:
+        for c in args[2]:
+            d[ord(c)] = None
+    return d
+
+class _NyTransMiss:
+    pass
+_ny_trans_miss = _NyTransMiss()
+
+def _ny_str_translate(s, table):
+    # str.translate (round 80): each character's code point looked up in the
+    # table (any object with __getitem__); LookupError keeps the character,
+    # None deletes it, an int or a str replaces it
+    var out = []
+    var plain = type(table) is dict
+    for c in s:
+        var r = None
+        if plain:
+            r = table.get(ord(c), _ny_trans_miss)
+            if r is _ny_trans_miss:
+                out.append(c)
+                continue
+        else:
+            try:
+                r = table[ord(c)]
+            except LookupError:
+                out.append(c)
+                continue
+        if r is None:
+            continue
+        if isinstance(r, str):
+            out.append(r)
+        elif isinstance(r, int):
+            if r < 0 or r > 0x10FFFF:
+                raise ValueError("character mapping must be in range(0x110000)")
+            out.append(chr(r))
+        else:
+            raise TypeError("character mapping must return integer, None or str")
+    return "".join(out)
+
+# ── import machinery as values (round 80) ────────────────────────────────
+# sys.modules is the engines' own registry (_ny_modules(): a real dict that
+# importing consults and fills); __import__ is the import statement as a
+# function; "__main__" is the running program, its globals read through
+# the module object.
+class _NyMainModule(_NyModuleType):
+    def __init__(self):
+        _NyModuleType.__init__(self, "__main__")
+    def __getattr__(self, name):
+        var g = _ny_main_globals()
+        if name in g:
+            return g[name]
+        raise AttributeError("module '__main__' has no attribute '" + name + "'")
+    def __dir__(self):
+        return sorted(list(_ny_main_globals()))
+
+def _ny_import_module(name):
+    # `import name`, the module itself (not its top-level package)
+    var ns = {}
+    exec("import " + name + " as _ny_m", ns)
+    return ns["_ny_m"]
+
+def _ny_resolve_name(name, package, level):
+    # importlib._bootstrap._resolve_name
+    var bits = package.rsplit(".", level - 1)
+    if len(bits) < level:
+        raise ImportError("attempted relative import beyond top-level package")
+    var base = bits[0]
+    return base + "." + name if name else base
+
+def _ny_calc_package(globals):
+    # importlib._bootstrap._calc___package__
+    var package = globals.get("__package__")
+    var spec = globals.get("__spec__")
+    if package is not None:
+        return package
+    if spec is not None:
+        return spec.parent
+    if "__name__" not in globals:
+        raise KeyError("'__name__' not in globals")
+    package = globals["__name__"]
+    if "__path__" not in globals:
+        package = package.rpartition(".")[0]
+    return package
+
+def _ny_handle_fromlist(module, fromlist):
+    # importlib._bootstrap._handle_fromlist: each name of fromlist that is
+    # not an attribute is imported as a submodule
+    for x in fromlist:
+        if not isinstance(x, str):
+            raise TypeError("Item in " + module.__name__ + ".__all__ must be str, not " + type(x).__name__)
+        if x == "*":
+            if hasattr(module, "__all__"):
+                _ny_handle_fromlist(module, module.__all__)
+        elif not hasattr(module, x):
+            var from_name = module.__name__ + "." + x
+            try:
+                _ny_import_module(from_name)
+            except ModuleNotFoundError as exc:
+                if getattr(exc, "name", None) == from_name or ("'" + from_name + "'") in str(exc):
+                    continue
+                raise
+    return module
+
+def __import__(name, globals=None, locals=None, fromlist=(), level=0):
+    # (round 80) CPython's builtin: the top-level package for `import a.b`,
+    # the module itself when fromlist names anything (its submodules
+    # imported); level > 0 is relative to globals' __package__
+    if not isinstance(name, str):
+        raise TypeError("module name must be str, not " + type(name).__name__)
+    if level < 0:
+        raise ValueError("level must be >= 0")
+    var full = name
+    if level > 0:
+        var package = _ny_calc_package(globals) if globals is not None else None
+        if not package:
+            raise ImportError("attempted relative import with no known parent package")
+        full = _ny_resolve_name(name, package, level)
+    elif name == "":
+        raise ValueError("Empty module name")
+    var module = _ny_import_module(full)
+    if not fromlist:
+        if level == 0:
+            return _ny_import_module(name.partition(".")[0])
+        if not name:
+            return module
+        var cut_off = len(name) - len(name.partition(".")[0])
+        return _ny_modules()[module.__name__[:len(module.__name__) - cut_off]]
+    if hasattr(module, "__path__"):
+        return _ny_handle_fromlist(module, fromlist)
+    return module
+
+# ── sys's Python members (round 80): the engines make the sys module and
+# call _ny_sys_extend(sys) once ─────────────────────────────────────────
+class _NySysVersionInfo(_NyStructSeq):
+    __module__ = "sys"
+    _ny_qual = "sys.version_info"
+    _ny_names = ("major", "minor", "micro", "releaselevel", "serial")
+    n_sequence_fields = 5
+    n_fields = 5
+    n_unnamed_fields = 0
+_NySysVersionInfo.__name__ = "version_info"
+_NySysVersionInfo.__qualname__ = "version_info"
+
+class _NySysHashInfo(_NyStructSeq):
+    __module__ = "sys"
+    _ny_qual = "sys.hash_info"
+    _ny_names = ("width", "modulus", "inf", "nan", "imag", "algorithm", "hash_bits", "seed_bits", "cutoff")
+    n_sequence_fields = 9
+    n_fields = 9
+    n_unnamed_fields = 0
+_NySysHashInfo.__name__ = "hash_info"
+_NySysHashInfo.__qualname__ = "hash_info"
+
+class _NySysFloatInfo(_NyStructSeq):
+    __module__ = "sys"
+    _ny_qual = "sys.float_info"
+    _ny_names = ("max", "max_exp", "max_10_exp", "min", "min_exp", "min_10_exp", "dig", "mant_dig",
+                 "epsilon", "radix", "rounds")
+    n_sequence_fields = 11
+    n_fields = 11
+    n_unnamed_fields = 0
+_NySysFloatInfo.__name__ = "float_info"
+_NySysFloatInfo.__qualname__ = "float_info"
+
+class _NySysIntInfo(_NyStructSeq):
+    __module__ = "sys"
+    _ny_qual = "sys.int_info"
+    _ny_names = ("bits_per_digit", "sizeof_digit", "default_max_str_digits", "str_digits_check_threshold")
+    n_sequence_fields = 4
+    n_fields = 4
+    n_unnamed_fields = 0
+_NySysIntInfo.__name__ = "int_info"
+_NySysIntInfo.__qualname__ = "int_info"
+
+class _NySysFlags(_NyStructSeq):
+    __module__ = "sys"
+    _ny_qual = "sys.flags"
+    _ny_names = ("debug", "inspect", "interactive", "optimize", "dont_write_bytecode", "no_user_site",
+                 "no_site", "ignore_environment", "verbose", "bytes_warning", "quiet", "hash_randomization",
+                 "isolated", "dev_mode", "utf8_mode", "warn_default_encoding", "safe_path", "int_max_str_digits")
+    n_sequence_fields = 18
+    n_fields = 18
+    n_unnamed_fields = 0
+_NySysFlags.__name__ = "flags"
+_NySysFlags.__qualname__ = "flags"
+
+class _NySysNamespace:
+    # sys.implementation (types.SimpleNamespace in CPython)
+    def __init__(self, **kw):
+        for k in kw:
+            setattr(self, k, kw[k])
+    def __repr__(self):
+        var parts = []
+        for k in self.__dict__:
+            parts.append(k + "=" + repr(self.__dict__[k]))
+        return "namespace(" + ", ".join(parts) + ")"
+    def __eq__(self, other):
+        return isinstance(other, _NySysNamespace) and self.__dict__ == other.__dict__
+
+def _ny_getsizeof(obj, default=None):
+    # sys.getsizeof (round 80): what CPython 3.11 on a 64-bit build reports
+    # for the builtin types - a reasonable estimate of Nython's own use -
+    # and __sizeof__() plus the 16-byte GC header for everything else
+    if obj is None:
+        return 16
+    if isinstance(obj, bool):
+        return 28
+    if isinstance(obj, int):
+        var n = abs(obj)
+        var digits = 0
+        while n > 0:
+            n = n >> 30
+            digits += 1
+        return 24 + 4 * (digits if digits > 0 else 1) if obj != 0 else 28
+    if isinstance(obj, float):
+        return 24
+    if isinstance(obj, str):
+        var big = 0
+        for c in obj:
+            var o = ord(c)
+            if o > big:
+                big = o
+        if big < 128:
+            return 48 + len(obj) + 1
+        if big < 256:
+            return 72 + len(obj) + 1
+        if big < 65536:
+            return 72 + 2 * (len(obj) + 1)
+        return 72 + 4 * (len(obj) + 1)
+    if isinstance(obj, bytes):
+        return 33 + len(obj)
+    if isinstance(obj, bytearray):
+        return 56 + len(obj) + (1 if len(obj) else 0)
+    if isinstance(obj, tuple):
+        return 40 + 8 * len(obj)
+    if isinstance(obj, list):
+        return 56 + 8 * len(obj)
+    if isinstance(obj, (set, frozenset)):
+        var size = 8
+        while size * 3 <= len(obj) * 5:
+            size = size * 4
+        return 88 + 16 * size
+    if isinstance(obj, dict):
+        if len(obj) == 0:
+            return 64
+        var cap = 8
+        while cap * 2 // 3 < len(obj):
+            cap = cap * 2
+        var ix = 1 if cap <= 128 else (2 if cap <= 32768 else 4)
+        return 96 + ix * cap + 24 * (cap * 2 // 3)
+    var f = getattr(obj, "__sizeof__", None)
+    if f is not None:
+        try:
+            var r = f()
+            if not isinstance(r, int):
+                raise TypeError("an integer is required")
+            if r < 0:
+                raise ValueError("__sizeof__() should return >= 0")
+            return r + (32 if hasattr(obj, "__dict__") else 16)
+        except (TypeError, ValueError):
+            if default is not None:
+                return default
+            raise
+    if default is not None:
+        return default
+    return 48
+
+def _ny_getrecursionlimit():
+    return _ny_recursion_limit()
+
+def _ny_setrecursionlimit(limit):
+    if not isinstance(limit, int) or isinstance(limit, bool):
+        raise TypeError("'" + type(limit).__name__ + "' object cannot be interpreted as an integer")
+    if limit < 1:
+        raise ValueError("recursion limit must be greater or equal than 1")
+    var depth = len(_ny_stack())
+    if limit <= depth:
+        raise RecursionError("cannot set the recursion limit to " + str(limit) + " at the recursion depth " +
+                             str(depth) + ": the limit is too low")
+    _ny_recursion_limit(limit)
+
+def _ny_intern(s):
+    if type(s) is not str:
+        raise TypeError("intern() argument must be str, not " + type(s).__name__)
+    return s
+
+def _ny_sys_call_tracing(func, args):
+    return func(*args)
+
+def _ny_getswitchinterval():
+    return _ny_sys_info("switch_interval")
+
+def _ny_setswitchinterval(interval):
+    # the GIL's hand-over interval (round 80; NyConc.cpp)
+    if isinstance(interval, str) or not (isinstance(interval, (int, float)) or hasattr(interval, "__float__")):
+        raise TypeError("must be real number, not " + type(interval).__name__)
+    var v = float(interval)
+    if not (v > 0):
+        raise ValueError("switch interval must be strictly positive")
+    _ny_sys_info("switch_interval", v)
+
+def _ny_sys_extend(sysmod):
+    # the Python-level members of sys: the language level Nython implements
+    # (the standard library's ports follow CPython 3.12) in version_info,
+    # Nython's own version in sys.implementation, as PyPy does
+    var vi = _NySysVersionInfo((3, 12, 0, "final", 0))
+    sysmod.version_info = vi
+    sysmod.hexversion = 0x030C00F0
+    sysmod.api_version = 1013
+    sysmod.implementation = _NySysNamespace(name="nython", cache_tag=None,
+                                            version=_NySysVersionInfo((0, 2, 1, "final", 0)),
+                                            hexversion=0x000201F0)
+    sysmod.hash_info = _NySysHashInfo((64, 2305843009213693951, 314159, 0, 1000003, "fnv", 64, 0, 0))
+    sysmod.float_info = _NySysFloatInfo((1.7976931348623157e+308, 1024, 308, 2.2250738585072014e-308,
+                                          -1021, -307, 15, 53, 2.220446049250313e-16, 2, 1))
+    sysmod.int_info = _NySysIntInfo((32, 4, 0, 640))
+    sysmod.flags = _NySysFlags(tuple(_ny_sys_info("flags")))
+    sysmod.float_repr_style = "short"
+    sysmod.maxunicode = 1114111
+    sysmod.dont_write_bytecode = True
+    sysmod.path = _ny_sys_info("path")
+    sysmod.meta_path = []
+    sysmod.path_hooks = []
+    sysmod.path_importer_cache = {}
+    sysmod.builtin_module_names = ("builtins", "math", "os", "sys")
+    sysmod.orig_argv = _ny_sys_info("orig_argv")
+    sysmod.modules = _ny_modules()
+    sysmod.getrecursionlimit = _ny_getrecursionlimit
+    sysmod.setrecursionlimit = _ny_setrecursionlimit
+    sysmod.getsizeof = _ny_getsizeof
+    sysmod.intern = _ny_intern
+    sysmod.call_tracing = _ny_sys_call_tracing
+    sysmod.getdefaultencoding = lambda: "utf-8"
+    sysmod.getfilesystemencoding = lambda: "utf-8"
+    sysmod.getfilesystemencodeerrors = lambda: "surrogateescape"
+    sysmod.is_finalizing = lambda: False
+    sysmod.copyright = "Copyright (c) the Nython authors."
+    sysmod.excepthook = _ny_excepthook
+    sysmod.__excepthook__ = _ny_excepthook
+    sysmod.getswitchinterval = _ny_getswitchinterval
+    sysmod.setswitchinterval = _ny_setswitchinterval
+    # where the standard library is: <prefix>/lib (no virtual environments)
+    var root = _ny_sys_info("prefix")
+    sysmod.prefix = root
+    sysmod.exec_prefix = root
+    sysmod.base_prefix = root
+    sysmod.base_exec_prefix = root
+    sysmod.platlibdir = "lib"
+    sysmod.__name__ = "sys"
+    _ny_sys_ref[0] = sysmod
+    var m = _ny_modules()
+    if "sys" not in m:
+        m["sys"] = sysmod
+
+__debug__ = _ny_sys_info("flags")[3] == 0
+
+# threading._register_atexit (round 80): run when the program ends, before
+# the engines wait for the non-daemon threads (CPython's
+# threading._shutdown), last registered first
+_ny_threading_atexits = []
+_ny_threading_atexit_done = [False]
+
+def _ny_run_threading_atexit():
+    _ny_threading_atexit_done[0] = True
+    while len(_ny_threading_atexits) > 0:
+        var h = _ny_threading_atexits.pop()
+        try:
+            h()
+        except BaseException as e:
+            _ny_stderr.write("Exception ignored in threading atexit callback: " + repr(h) + "\n" + _ny_format_exc(e, True, [], {}))
+
+# os.environ (round 80): CPython's os._Environ - a mapping over a copy of the
+# environment that writes through: setting or deleting a key calls putenv /
+# unsetenv, so os.getenv and child processes see it. One object for every
+# `import os`.
+def _ny_fs_encode(s):
+    # os.fsencode's codec (surrogateescape when the codecs have it)
+    try:
+        return s.encode("utf-8", "surrogateescape")
+    except LookupError:
+        return s.encode("utf-8")
+
+def _ny_fs_decode(b):
+    try:
+        return b.decode("utf-8", "surrogateescape")
+    except LookupError:
+        return b.decode("utf-8", "replace")
+
+class _NyEnviron:
+    def __init__(self, data, encoded=False):
+        self._data = data
+        self._encoded = encoded
+    def _key(self, key):
+        if self._encoded:
+            if not isinstance(key, bytes):
+                raise TypeError("bytes expected, not " + type(key).__name__)
+            return _ny_fs_decode(key)
+        if not isinstance(key, str):
+            raise TypeError("str expected, not " + type(key).__name__)
+        return key
+    def _val(self, value):
+        if self._encoded:
+            if not isinstance(value, bytes):
+                raise TypeError("bytes expected, not " + type(value).__name__)
+            return _ny_fs_decode(value)
+        if not isinstance(value, str):
+            raise TypeError("str expected, not " + type(value).__name__)
+        return value
+    def _out(self, s):
+        return _ny_fs_encode(s) if self._encoded else s
+    def __getitem__(self, key):
+        var k = self._key(key)
+        if k not in self._data:
+            raise KeyError(key)
+        return self._out(self._data[k])
+    def __setitem__(self, key, value):
+        var k = self._key(key)
+        var v = self._val(value)
+        if k == "" or "=" in k:
+            raise ValueError("illegal environment variable name")
+        os_setenv(k, v)
+        self._data[k] = v
+    def __delitem__(self, key):
+        var k = self._key(key)
+        if k not in self._data:
+            raise KeyError(key)
+        os_unsetenv(k)
+        del self._data[k]
+    def __iter__(self):
+        for k in list(self._data):
+            yield self._out(k)
+    def __len__(self):
+        return len(self._data)
+    def __contains__(self, key):
+        try:
+            return self._key(key) in self._data
+        except TypeError:
+            return False
+    def keys(self):
+        return [self._out(k) for k in self._data]
+    def values(self):
+        return [self._out(self._data[k]) for k in self._data]
+    def items(self):
+        return [(self._out(k), self._out(self._data[k])) for k in self._data]
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+    def setdefault(self, key, value=None):
+        if key not in self:
+            self[key] = value
+        return self[key]
+    def pop(self, key, *default):
+        if key in self:
+            var v = self[key]
+            del self[key]
+            return v
+        if default:
+            return default[0]
+        raise KeyError(key)
+    def popitem(self):
+        for k in self._data:
+            var v = self._out(self._data[k])
+            del self[self._out(k)]
+            return (self._out(k), v)
+        raise KeyError("popitem(): dictionary is empty")
+    def clear(self):
+        for k in list(self._data):
+            del self[self._out(k)]
+    def update(self, other=(), **kw):
+        if hasattr(other, "keys"):
+            for k in other.keys():
+                self[k] = other[k]
+        else:
+            for kv in other:
+                self[kv[0]] = kv[1]
+        for k in kw:
+            self[k] = kw[k]
+    def copy(self):
+        return dict(self.items())
+    def __eq__(self, other):
+        if isinstance(other, _NyEnviron):
+            return self._data == other._data and self._encoded == other._encoded
+        if isinstance(other, dict):
+            return dict(self.items()) == other
+        return NotImplemented
+    def __ne__(self, other):
+        var r = self.__eq__(other)
+        return r if r is NotImplemented else not r
+    __hash__ = None
+    def __or__(self, other):
+        if not hasattr(other, "keys"):
+            return NotImplemented
+        var d = dict(self.items())
+        d.update(other)
+        return d
+    def __ror__(self, other):
+        if not hasattr(other, "keys"):
+            return NotImplemented
+        var d = dict(other)
+        d.update(self.items())
+        return d
+    def __ior__(self, other):
+        self.update(other)
+        return self
+    def __repr__(self):
+        var parts = []
+        for k in self._data:
+            parts.append(repr(self._out(k)) + ": " + repr(self._out(self._data[k])))
+        return ("environb({" if self._encoded else "environ({") + ", ".join(parts) + "})"
+_NyEnviron.__name__ = "_Environ"
+_NyEnviron.__qualname__ = "_Environ"
+_NyEnviron.__module__ = "os"
+
+_ny_environ_obj = []
+def _ny_os_environ():
+    if not _ny_environ_obj:
+        var data = os_environ()
+        var env = _NyEnviron(data)
+        _ny_environ_obj.append(env)
+        _ny_environ_obj.append(_NyEnviron(data, True))
+    return _ny_environ_obj[0]
+def _ny_os_environb():
+    _ny_os_environ()
+    return _ny_environ_obj[1]
+
 )NYPRELUDE";
 }
 
@@ -3270,13 +3916,14 @@ _ny_bmethods(_NyB_frozenset, "copy difference intersection isdisjoint issubset i
 # calls). A class whose MRO declares __slots__ everywhere (object and the
 # builtin types aside) without "__dict__" makes instances that take no other
 # attribute (_ny_mark_slots flag 1); without "__weakref__" anywhere, no weak
-# reference (flag 2, lib/weakref.ny). The builtins are called by their
-# _ny_b_ names (the prelude's end), which a program does not rebind.
+# reference (flag 2, lib/weakref.ny). (round 80: prelude code - this chunk
+# too - resolves the builtins themselves whatever a program rebinds, so the
+# _ny_b_ aliases round 79 called them by are gone.)
 class _NyMemberDescriptor:
     def __init__(self, name, owner):
         self.__name__ = name
         self.__objclass__ = owner
-        self.__qualname__ = _ny_b_getattr(owner, "__qualname__", owner.__name__) + "." + name
+        self.__qualname__ = getattr(owner, "__qualname__", owner.__name__) + "." + name
     def __get__(self, obj, objtype=None):
         if obj is None:
             return self
@@ -3294,22 +3941,22 @@ _NyMemberDescriptor.__name__ = "member_descriptor"
 _NyMemberDescriptor.__qualname__ = "member_descriptor"
 
 def _ny_slots_of(c):
-    var d = _ny_b_getattr(c, "__dict__", None)
+    var d = getattr(c, "__dict__", None)
     if d is None or "__slots__" not in d:
         return None
     var s = d["__slots__"]
-    if _ny_b_isinstance(s, _ny_b_str):
+    if isinstance(s, str):
         return [s]
-    return _ny_b_list(s)
+    return list(s)
 
 def _ny_builtin_base(c):
-    return c is _ny_b_object or _ny_b_getattr(c, "__module__", None) == "builtins"
+    return c is object or getattr(c, "__module__", None) == "builtins"
 
 def _ny_init_slots(cls):
     # type.__new__'s handling of __slots__
     var names = _ny_slots_of(cls)
     var ns = cls.__dict__
-    if names and _ny_b_issubclass(cls, (_ny_b_int, _ny_b_bytes, _ny_b_tuple)):
+    if names and issubclass(cls, (int, bytes, tuple)):
         # variable-size builtins hold no slots (tp_itemsize != 0)
         raise TypeError("nonempty __slots__ not supported for subtype of '" + cls.__bases__[0].__name__ + "'")
     var base_dict = False
@@ -3330,8 +3977,8 @@ def _ny_init_slots(cls):
     var has_weak = base_weak
     var made = []
     for n in names:
-        if not _ny_b_isinstance(n, _ny_b_str):
-            raise TypeError("__slots__ items must be strings, not '" + _ny_b_type(n).__name__ + "'")
+        if not isinstance(n, str):
+            raise TypeError("__slots__ items must be strings, not '" + type(n).__name__ + "'")
         if not n.isidentifier():
             raise TypeError("__slots__ must be identifiers")
         if n == "__dict__":
@@ -3350,7 +3997,7 @@ def _ny_init_slots(cls):
             if stripped:
                 m = "_" + stripped + n
         if m in ns:
-            raise ValueError(_ny_b_repr(m) + " in __slots__ conflicts with class variable")
+            raise ValueError(repr(m) + " in __slots__ conflicts with class variable")
         made.append(m)
     for m in made:
         _ny_setattr_raw(cls, m, _NyMemberDescriptor(m, cls))
@@ -3364,7 +4011,7 @@ def _ny_class_layout(cls):
     var dictful = False
     var builtin = None
     for c in cls.__mro__:
-        if c is _ny_b_object:
+        if c is object:
             continue
         if _ny_builtin_base(c):
             if builtin is None:
@@ -3381,14 +4028,14 @@ def _ny_class_layout(cls):
                 if n.startswith("__") and not n.endswith("__") and c.__name__.lstrip("_"):
                     n = "_" + c.__name__.lstrip("_") + n
                 slots.append(n)
-    return (dictful, _ny_b_tuple(slots), builtin)
+    return (dictful, tuple(slots), builtin)
 
 def _ny_set_class(obj, cls):
     # obj.__class__ = cls (object.__class__'s setter)
-    if not _ny_b_isinstance(cls, _ny_b_type):
-        raise TypeError("__class__ must be set to a class, not '" + _ny_b_type(cls).__name__ + "' object")
-    var old = _ny_b_type(obj)
-    if _ny_b_isinstance(obj, _ny_b_type) or _ny_builtin_base(old) or _ny_builtin_base(cls):
+    if not isinstance(cls, type):
+        raise TypeError("__class__ must be set to a class, not '" + type(cls).__name__ + "' object")
+    var old = type(obj)
+    if isinstance(obj, type) or _ny_builtin_base(old) or _ny_builtin_base(cls):
         raise TypeError("__class__ assignment only supported for mutable types or ModuleType subclasses")
     if _ny_class_layout(old) != _ny_class_layout(cls):
         raise TypeError("__class__ assignment: '" + cls.__name__ + "' object layout differs from '" + old.__name__ + "'")

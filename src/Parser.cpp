@@ -10,6 +10,7 @@
 #include "ASTNodes.hpp"
 #include "DynamicLang.hpp"
 #include "NyScope.hpp"
+#include "NyRuntime.hpp"   // nyrt::cli_flags (-O drops asserts, round 80)
 
 // Set by stmt() when `async` precedes a def; consumed by functionDecl().
 static bool s_async_def_next = false;
@@ -2025,7 +2026,9 @@ node_ptr Parser::atom(){
         // Check if string contains ${...} markers (set by lexer converting ${ → \x02 or left raw)
         // We detect raw ${  in the stored string value and process as interpolation
         std::string& sv = str_tok.value;
-        bool has_interp = sv.find("${") != std::string::npos;
+        // round 80: not in a raw string nor in a Python-mode file's quoted
+        // strings (the lexer makes those TokenClass::Default)
+        bool has_interp = sv.find("${") != std::string::npos && str_tok.clazz() != TokenClass::Default;
         if(has_interp) {
             // Convert ${expr} → same pipeline as f-string {expr}
             // Replace ${ with { for re-use of f-string parser below
@@ -3428,8 +3431,18 @@ node_ptr Parser::printStmt(){
 node_ptr Parser::importStmt(){
     Token tok = token();
     if(have(TokenType::From)){
-        bool quoted = see(TokenType::String);
-        std::string mod = dottedName();
+        // a relative import (round 80: `from . import a`, `from ..m import
+        // b`): its leading dots stay in the module's name - the engines
+        // resolve them against the importing module's __package__
+        std::string dots;
+        while(true){
+            if(have(TokenType::Dot)) dots += ".";
+            else if(have(TokenType::Interval)) dots += "..";
+            else if(have(TokenType::Ellipsis)) dots += "...";
+            else break;
+        }
+        bool quoted = dots.empty() && see(TokenType::String);
+        std::string mod = dots + ((!dots.empty() && see(TokenType::Import)) ? std::string() : dottedName());
         mustBe(TokenType::Import);
         // `from __future__ import annotations` (PEP 563): annotations are
         // kept as their source text. The other features are always on.
@@ -3638,13 +3651,63 @@ node_ptr Parser::tryStmt(){
         }
         return n;
     };
+    // round 80: `except <expression>:` - any expression, as Python's grammar
+    // has it (`except self._error:`, `except errs[0]:`, `except get():`,
+    // `except (A, B) + extra as e:`). The forms the engines match by name
+    // (a dotted name, a parenthesised list of them) keep their path; from
+    // the first clause with an expression on, the clauses are lowered to
+    // one catch-all whose body tests them in order:
+    //     except BaseException as __exmN__:
+    //         if _ny_exc_match(__exmN__, EXPR):  e = __exmN__; BODY
+    //         elif _ny_exc_match(__exmN__, (A, B)): BODY2
+    //         else: raise
+    // (the prelude's _ny_exc_match is CPython's PyErr_GivenExceptionMatches,
+    // with its TypeError for a non-exception class).
+    struct EClause { Token etok; std::string ename, ealias, var; std::vector<std::string> types; node_ptr texpr; node_ptr body; };
+    std::vector<EClause> eclauses;
+    auto tk = [&](int k) { return k == 0 ? token() : peek(k); };
+    auto ends_clause = [&](int k) {
+        TokenType tt = tk(k).type();
+        return tt == TokenType::Colon || tt == TokenType::As || tt == TokenType::NewLine || tt == TokenType::BraceOpen
+               || tt == TokenType::Indent || tt == TokenType::SemiColon || tt == TokenType::End;
+    };
+    auto dotted_end = [&](int k) -> int {
+        TokenType tt = tk(k).type();
+        bool name = tt == TokenType::Identifier
+                    || ((tt == TokenType::Struct || tt == TokenType::Enum || tt == TokenType::Interface
+                         || tt == TokenType::NameSpace || tt == TokenType::Package) && tk(k + 1).type() == TokenType::Dot);
+        if(!name) return -1;
+        k++;
+        while(tk(k).type() == TokenType::Dot && tk(k + 1).type() == TokenType::Identifier) k += 2;
+        return k;
+    };
+    auto names_clause = [&]() {
+        if(see(TokenType::As) || ends_clause(0)) return true;
+        if(see(TokenType::ParenOpen)){
+            int k = 1;
+            while(tk(k).type() != TokenType::ParenClose){
+                int e = dotted_end(k);
+                if(e < 0) return false;
+                k = e;
+                if(tk(k).type() == TokenType::Comma) k++;
+                else if(tk(k).type() != TokenType::ParenClose) return false;
+            }
+            return ends_clause(k + 1);
+        }
+        int e = dotted_end(0);
+        return e >= 0 && ends_clause(e);
+    };
     while(see(TokenType::Except) && !(value() == "catch" && usedAsName())){   // `catch = 1` is a name (round 77)
         Token etok = token();   // the clause's own line (round 79: sys.settrace's line event, tracebacks)
         next(); // consume 'except'
         std::string ename, ealias;
         std::vector<std::string> types;
         std::string var;
-        if(see(TokenType::As)){
+        node_ptr texpr;
+        if(!names_clause()){
+            texpr = ternary();
+            if(have(TokenType::As)) { ealias = identifier(); var = ealias; }
+        } else if(see(TokenType::As)){
             // "except as e:" — catch-all with alias
             next(); // consume 'as'
             if(see(TokenType::Identifier)) ealias = identifier();
@@ -3671,12 +3734,75 @@ node_ptr Parser::tryStmt(){
         }
         have(TokenType::Colon);
         node_ptr ebody = blockOrStmt();
-        auto en = make_node<ExceptNode>(etok, ename, ealias, ebody);
-        auto enp = std::static_pointer_cast<ExceptNode>(en);
-        enp->types = std::move(types);
-        enp->var = std::move(var);
-        tn->except_clauses.push_back(en);
+        eclauses.push_back(EClause{etok, ename, ealias, var, std::move(types), texpr, ebody});
         while(have(TokenType::NewLine)) {}
+    }
+    size_t first_expr = eclauses.size();
+    for(size_t i = 0; i < eclauses.size(); i++) if(eclauses[i].texpr) { first_expr = i; break; }
+    for(size_t i = 0; i < first_expr; i++){
+        EClause& c = eclauses[i];
+        auto en = make_node<ExceptNode>(c.etok, c.ename, c.ealias, c.body);
+        auto enp = std::static_pointer_cast<ExceptNode>(en);
+        enp->types = std::move(c.types);
+        enp->var = std::move(c.var);
+        tn->except_clauses.push_back(en);
+    }
+    if(first_expr < eclauses.size()){
+        static int exm_counter = 0;
+        Token t0 = eclauses[first_expr].etok;
+        std::string ev = "__exm" + std::to_string(exm_counter++) + "__";
+        auto T = [&](const Token& base, const std::string& v){ Token t = base; t.value = v; return t; };
+        auto var_of = [&](const Token& base, const std::string& n) -> node_ptr { return make_node<VariableNode>(T(base, n)); };
+        // a dotted name the engines would have looked up: the same lookup
+        auto name_expr = [&](const Token& base, const std::string& dn) -> node_ptr {
+            size_t a = dn.find('.');
+            node_ptr e = var_of(base, dn.substr(0, a));
+            while(a != std::string::npos){
+                size_t b = dn.find('.', a + 1);
+                std::string part = dn.substr(a + 1, b == std::string::npos ? std::string::npos : b - a - 1);
+                e = make_node<AttributeNode>(T(base, part), e, part);
+                a = b;
+            }
+            return e;
+        };
+        // the clause's binding: a local, or the module's for a `global` name
+        auto bind = [&](const Token& base, const std::string& n) -> node_ptr {
+            bool is_global = !global_decls_.empty()
+                             && std::find(global_decls_.back().begin(), global_decls_.back().end(), n) != global_decls_.back().end();
+            if(!is_global) return make_node<VarDeclNode>(T(base, n), n, var_of(base, ev));
+            auto vn = std::make_shared<VariableNode>(T(base, n));
+            vn->global_ref = true;
+            return make_node<AssignmentNode>(T(base, "="), vn, var_of(base, ev));
+        };
+        node_ptr chain = make_node<RaiseNode>(eclauses.back().etok);   // nothing matched: re-raised
+        for(size_t j = eclauses.size(); j-- > first_expr;){
+            EClause& c = eclauses[j];
+            auto run = make_node<BlockNode>(c.etok);
+            if(!c.var.empty()) run->add(bind(c.etok, c.var));
+            run->add(c.body);
+            node_ptr test;
+            if(c.texpr) test = c.texpr;
+            else if(!c.types.empty()){
+                if(c.types.size() == 1) test = name_expr(c.etok, c.types[0]);
+                else {
+                    auto tup = make_node<TupleNode>(c.etok);
+                    for(auto& n : c.types) tup->add(name_expr(c.etok, n));
+                    test = tup;
+                }
+            }
+            if(!test){ chain = run; continue; }   // a catch-all clause
+            auto call = make_node<CallNode>(T(c.etok, "_ny_exc_match"), var_of(c.etok, "_ny_exc_match"));
+            call->add(var_of(c.etok, ev));
+            call->add(test);
+            auto ifn = make_node<IfNode>(c.etok, call, run);
+            std::static_pointer_cast<IfNode>(ifn)->else_branch = chain;
+            chain = ifn;
+        }
+        auto en = make_node<ExceptNode>(t0, "BaseException", ev, chain);
+        auto enp = std::static_pointer_cast<ExceptNode>(en);
+        enp->types = {"BaseException"};
+        enp->var = ev;
+        tn->except_clauses.push_back(en);
     }
     return try_node;
 }
@@ -3703,6 +3829,8 @@ node_ptr Parser::assertStmt(){
     node_ptr msg = nullptr;
     if(have(TokenType::Comma)) msg = expression();
     have(TokenType::SemiColon); have(TokenType::NewLine);
+    // -O (round 80): assert statements are dropped, as CPython compiles them
+    if(nyrt::cli_flags().optimize > 0) return make_node<PassNode>(tok);
     return make_node<AssertNode>(tok, cond, msg);
 }
 

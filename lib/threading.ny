@@ -9,7 +9,9 @@
 #   RLock, Condition, Semaphore, BoundedSemaphore, Event, Timer, Barrier
 #   (BrokenBarrierError), local, excepthook, TIMEOUT_MAX,
 #   settrace/setprofile/gettrace/getprofile (round 79: the sys.settrace /
-#   sys.setprofile functions each thread started afterwards gets)
+#   sys.setprofile functions each thread started afterwards gets),
+#   _register_atexit (round 80: callbacks run at exit before the
+#   non-daemon threads are joined, as CPython's threading._shutdown)
 #
 # lib/thread.ny is Nython's own threading library (channels, futures, pools,
 # RWLock, atomics...); both run on the same runtime.
@@ -239,6 +241,16 @@ def getprofile():
 
 def stack_size(size=0):
     return 0
+
+def _register_atexit(func, *arg, **kwargs):
+    # round 80: CPython's private hook (concurrent.futures uses it) - func
+    # runs when the program ends, before the engines wait for the non-daemon
+    # threads (atexit's handlers run after them); last registered first
+    if _ny_threading_atexit_done[0]:
+        raise RuntimeError("can't register atexit after shutdown")
+    def call():
+        func(*arg, **kwargs)
+    _ny_threading_atexits.append(call)
 
 class Lock:
     def __init__(self):

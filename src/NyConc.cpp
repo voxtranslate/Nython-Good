@@ -193,7 +193,17 @@ std::atomic<int> g_gil_waiters{0};
 // condition, queue, join, ... (thread_wait_count()).
 static std::atomic<int64_t> g_waits{0};
 static std::atomic<bool> g_active{false};
-static const auto kSwitchInterval = std::chrono::milliseconds(5);
+// sys.setswitchinterval sets it (round 80), in microseconds as CPython keeps it
+static std::atomic<int64_t> g_switch_us{5000};
+double switch_interval() { return 1e-6 * (double)g_switch_us.load(std::memory_order_relaxed); }
+void set_switch_interval(double seconds) {
+    // truncated to whole microseconds, as CPython (1e-9 reads back 0.0; the
+    // hand-over then waits at least 1 us)
+    double us = seconds * 1e6;
+    if (!(us >= 0)) us = 0;
+    if (us > 1e12) us = 1e12;
+    g_switch_us.store((int64_t)us, std::memory_order_relaxed);
+}
 
 struct Gil {
     std::mutex m;
@@ -246,6 +256,7 @@ void tick_slow() {
     if (!t_holds) return;
     if ((++t_tick & 15u) != 0) return;
     auto held_for = Clock::now() - G().since;
+    const auto kSwitchInterval = std::chrono::microseconds(std::max<int64_t>(1, g_switch_us.load(std::memory_order_relaxed)));
     if (held_for < kSwitchInterval) return;
     // Lock-holder preemption (the problem paravirtualised spinlocks and
     // Linux's time-slice extension address for vCPUs and threads): handing

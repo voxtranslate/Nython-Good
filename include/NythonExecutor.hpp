@@ -469,7 +469,20 @@ struct NythonExecutor {
             auto ast = parser->parse();
             if (ast) {
                 imported_asts.push_back(ast);
-                evalNode(ast, global_ctx);
+                // round 80: the prelude's code runs in prelude_ctx_, a scope
+                // of its own. While the prelude loads it shares the global
+                // scope's map (the engine reads the prelude's names there);
+                // then it gets a copy, so prelude code keeps resolving list,
+                // str, len, isinstance ... to the builtins whatever a program
+                // rebinds at its top level (CPython's builtins module).
+                prelude_ctx_ = new Context(runner, "<prelude>", nullptr, nullptr, global_ctx);
+                delete prelude_ctx_->container;
+                prelude_ctx_->container = global_ctx->container;
+                prelude_ctx_->ns_owner = global_ctx;
+                nygc::incref(global_ctx);
+                try { evalNode(ast, prelude_ctx_); }
+                catch (...) { splitPreludeScope(); throw; }
+                splitPreludeScope();
             }
         } catch (std::exception& e) {
             std::cerr << "[Nython] prelude failed to load: " << e.what() << "\n";
@@ -519,12 +532,33 @@ struct NythonExecutor {
             auto ast = parser->parse();
             if (ast) {
                 imported_asts.push_back(ast);
-                evalNode(ast, global_ctx);
+                // round 80: in the prelude's scope (its builtins are the real
+                // ones whatever the program rebinds), the names it adds then
+                // copied to the global scope and the modules' snapshot
+                Context* pc = prelude_ctx_ ? prelude_ctx_ : global_ctx;
+                std::unordered_set<std::string> had;
+                if (pc != global_ctx) for (auto& kv : *pc->container) had.insert(kv.first);
+                evalNode(ast, pc);
+                if (pc != global_ctx)
+                    for (auto& kv : *pc->container) {
+                        if (had.count(kv.first)) continue;
+                        global_ctx->defineByName(kv.first, kv.second);
+                        if (module_base_ctx_) module_base_ctx_->defineByName(kv.first, kv.second);
+                        base_global_names_.insert(kv.first);
+                    }
             }
         } catch (std::exception& e) {
             std::cerr << "[Nython] builtin mirror '" << chunk << "' failed to load: " << e.what() << "\n";
         }
         mro_cache_.clear();
+    }
+    // The prelude's scope gets its own copy of the global map (loadPrelude).
+    void splitPreludeScope() {
+        if (!prelude_ctx_ || prelude_ctx_->ns_owner != global_ctx) return;
+        auto* own = new ContainerType(*global_ctx->container);
+        prelude_ctx_->container = own;
+        prelude_ctx_->ns_owner = nullptr;
+        nygc::decref(global_ctx);
     }
     // A class naming `name` as a base needs its mirror.
     void mirrorsFor(const std::string& name) {
@@ -532,6 +566,7 @@ struct NythonExecutor {
     }
     std::unordered_set<std::string> base_global_names_;
     Context* module_base_ctx_ = nullptr;
+    Context* prelude_ctx_ = nullptr;   // the prelude's own scope (round 80, loadPrelude)
     std::function<bool(const std::string&)> module_filter_;
     // Functions and classes an imported module defined (importModule):
     // knownName() does not count them for the program.
@@ -585,6 +620,8 @@ public:   // NythonExecutor is a struct: members default to public
             "pow","divmod","input","dict","display","show","is_int","is_float","is_string","is_list","is_none","is_bool","to_int","to_float","to_str","clamp","lerp","map_range","repeat_str","repeat","flatten","flat","shell","system","ls","cat","pwd","mkdir","write","exists","env","all","any","complex","slice","super","property",
             "staticmethod","classmethod","callable","dir","vars","globals","locals","eval","exec","compile","_ny_setattr_raw","_ny_delattr_raw","_ny_object_new","_ny_method_new","_ny_subclasses","_ny_type_new","_ny_type_call",
             "_ny_main_globals","_ny_exc_current","_ny_stack",
+            "_ny_modules","_ny_module_new","_ny_module_exec","_ny_find_module",   // sys.modules, importlib (round 80)
+            "_ny_sys_info","_ny_recursion_limit",                                 // sys's facts (round 80)
             "_ny_frame_get","_ny_frame_sync","_ny_frame_back","_ny_frame_globals","_ny_builtins_dict",   // frame objects (round 78)
             "_ny_settrace","_ny_setprofile","_ny_gettrace","_ny_getprofile","_ny_frame_local_set",   // sys.settrace ... (round 79)
             "sys.settrace","sys.setprofile","sys.gettrace","sys.getprofile",   // the same, named as sys's (__name__ "settrace")
@@ -1078,32 +1115,10 @@ public:   // NythonExecutor is a struct: members default to public
 
     Value evalString(node_ptr node, Context* ctx = nullptr) {
         const std::string& raw = node->token().value;
-        // Check for ${...} interpolation
-        if (ctx && raw.find("${") != std::string::npos) {
-            std::string result;
-            size_t i = 0;
-            while (i < raw.size()) {
-                if (i + 1 < raw.size() && raw[i] == '$' && raw[i+1] == '{') {
-                    i += 2; // skip ${
-                    std::string expr_name;
-                    while (i < raw.size() && raw[i] != '}') expr_name += raw[i++];
-                    if (i < raw.size()) i++; // skip }
-                    // Evaluate the variable name
-                    try {
-                        Value v = ctx->getByName(expr_name);
-                        if (v.type == ValueType::INTEGER) result += std::to_string(bigint_to_i64(v.value.i));
-                        else if (v.type == ValueType::DOUBLE) { char buf[64]; snprintf(buf, sizeof(buf), "%g", static_cast<double>(v.value.d)); result += buf; }
-                        else if (v.type == ValueType::NONE) result += "none";
-                        else if (v.type == ValueType::BOOLEAN) result += v.value.b ? "true" : "false";
-                        else if (isStringValue(v)) result += *static_cast<std::string*>(v.value.p);
-                        else result += getStringValue(v);
-                    } catch (...) { result += "${" + expr_name + "}"; }
-                } else {
-                    result += raw[i++];
-                }
-            }
-            return makeStringValue(result);
-        }
+        // round 80: ${...} is interpolated by the parser (a literal holding
+        // it becomes an f-string there); a string node still holding it is
+        // text - f"${{x}}", a raw string, a Python-mode file - as on the VM
+        (void)ctx;
         // A literal is made into a string once, not on every evaluation. The
         // interpreter never frees a string (string_store), so `"a"` inside a
         // loop or a per-frame function used to add a new permanent string on
@@ -1296,6 +1311,12 @@ public:   // NythonExecutor is a struct: members default to public
     // os.path.join, ...) plus os.sep/pathsep/linesep/name and a snapshot of
     // os.environ. The flat os_* names stay registered as well.
     Value makeOsNamespace() {
+        // round 80: one os module (sys.modules["os"]; it was made anew by
+        // each import, each with its own snapshot of os.environ)
+        {
+            auto oc = module_ns_.find("os");
+            if (oc != module_ns_.end() && contOf(oc->second)) return oc->second;
+        }
         std::vector<std::string> names;
         for (auto& kv : builtin_ptrs) names.push_back(kv.first);
         auto* ns = new Object((Runnable*)runner, "os", Type::MAP);
@@ -1320,9 +1341,21 @@ public:   // NythonExecutor is a struct: members default to public
             if (std::string(c) == "sep" || std::string(c) == "pathsep") path->set(c, v);
         }
         std::vector<Value> no_args;
-        ns->set("environ", callBuiltin("os_environ", no_args, global_ctx));
+        // os.environ / os.environb (round 80): the prelude's _Environ, which
+        // writes through to the process environment
+        Value envf = global_ctx->getByName("_ny_os_environ");
+        if (envf.type == ValueType::USERDATA && envf.value.p) ns->set("environ", callFunctionValue(envf, no_args, global_ctx));
+        else ns->set("environ", callBuiltin("os_environ", no_args, global_ctx));
+#ifndef _WIN32
+        Value envbf = global_ctx->getByName("_ny_os_environb");
+        if (envbf.type == ValueType::USERDATA && envbf.value.p) ns->set("environb", callFunctionValue(envbf, no_args, global_ctx));
+#endif
         ns->set("path", Value((Collectable*)path));
-        return Value((Collectable*)ns);
+        ns->set("__name__", makeStringValue("os"));
+        Value nsv((Collectable*)ns);
+        noteModule("os", nsv);
+        noteModule("os.path", Value((Collectable*)path));   // sys.modules["os.path"] (round 80)
+        return nsv;
     }
 
     Value nyos_list_of(const std::vector<std::string>& items) {
@@ -2116,6 +2149,11 @@ public:   // NythonExecutor is a struct: members default to public
             return pos < args.size() ? &args[pos] : nullptr;
         };
         if (nypy::type_classmethod(t, m)) {
+            if (t == "str" && m == "maketrans") {   // round 80: CPython's three forms (the prelude's)
+                if (!kw.empty()) pyRaise("TypeError", "maketrans() takes no keyword arguments");
+                out = callFunctionValue(global_ctx->getByName("_ny_str_maketrans"), args, ctx);
+                return true;
+            }
             if (m == "from_bytes") {
                 const Value* b = kwv("bytes", 0);
                 if (!b) pyRaise("TypeError", "from_bytes() missing required argument 'bytes' (pos 1)");
@@ -3037,6 +3075,21 @@ public:   // NythonExecutor is a struct: members default to public
         // equal to its hash as an int (a Fraction(2, 2), an IntEnum member):
         // that int's key, as Python finds it
         if (h.type == ValueType::INTEGER && keyEquals(k, h)) return dictKey(h);
+        // round 80: equal to a float or an int of the same hash (Decimal("0.5")
+        // and 0.5, Fraction(1, 2) and 0.5, Decimal(10**30) and 10**30): that
+        // number's key - Python's numeric hash and == make them one key
+        int64_t hv;
+        if (h.type == ValueType::INTEGER && bigint_fits_i64(h.value.i, hv) && isInstanceVal(k)) {
+            for (const char* conv : {"__float__", "__int__"}) {
+                if (!instanceHasMethod(k, conv)) continue;
+                Value num;
+                try { std::vector<Value> none; num = callMethod(k, conv, none, global_ctx); }
+                catch (...) { continue; }
+                if (num.type != ValueType::DOUBLE && num.type != ValueType::INTEGER) continue;
+                std::string nk = dictKey(num);
+                if (nypy::hash_of_key(nk) == hv && keyEquals(k, num)) return nk;
+            }
+        }
         std::string hid = "h" + hs + "#" + std::to_string(hash_key_seq_++);
         key_objs_.emplace(hid, k);
         hash_keys_[hs].push_back(hid);   // (keyEquals may have run code that touched the table)
@@ -5228,6 +5281,18 @@ public:   // NythonExecutor is a struct: members default to public
                     ki = kw_args_in.find("errors"); if (ki != kw_args_in.end()) err = strOf(ki->second, ctx);
                     return makeBytesValue(nyCall([&] { return nypy::str_encode(s, enc, err); }));
                 }
+                // round 80: str.translate / str.maketrans (the prelude's:
+                // the table is any mapping, read with __getitem__)
+                if (method_name == "translate" || method_name == "maketrans") {
+                    if (!kw_args_in.empty()) pyRaise("TypeError", "str." + method_name + "() takes no keyword arguments");
+                    std::vector<Value> a;
+                    if (method_name == "translate") {
+                        if (args.size() != 1) pyRaise("TypeError", "str.translate() takes exactly one argument (" + std::to_string(args.size()) + " given)");
+                        a.push_back(obj);
+                    }
+                    for (auto& x : args) a.push_back(x);
+                    return callFunctionValue(global_ctx->getByName(method_name == "translate" ? "_ny_str_translate" : "_ny_str_maketrans"), a, ctx);
+                }
                 if (method_name == "format_map" && !args.empty()) {
                     nyrt::OrderedKw<Value> kw;
                     if (Container* mc = contOf(args[0])) for (auto& kv : *mc->container) if (!isInternalKey(kv.first)) kw[nypy::key_payload(kv.first)] = kv.second;
@@ -5759,7 +5824,10 @@ public:   // NythonExecutor is a struct: members default to public
                     void* ast_ptr = method_val.value.p;
                     auto ast_it2 = func_ast_nodes.find(method_val.value.p);
                     if (ast_it2 != func_ast_nodes.end()) ast_ptr = ast_it2->second;
-                    Node* raw = (Node*)ast_ptr;
+                    // only a function's pointer is an AST node (round 80: a
+                    // string or a builtin's bound member was read as one)
+                    Node* raw = func_names.count(method_val.value.p) && !string_ptrs_.count(method_val.value.p)
+                                && !bound_members_.count(method_val.value.p) ? (Node*)ast_ptr : nullptr;
                     std::string fn_tag = func_names.count(method_val.value.p) ? func_names[method_val.value.p] : "";
                     bool is_static = fn_tag.find("__static__") != std::string::npos;
                     bool is_classmethod = fn_tag.find("__classmethod__") != std::string::npos;
@@ -5994,6 +6062,25 @@ public:   // NythonExecutor is a struct: members default to public
             }
         }
 
+        // round 80: object's members (objectMember) through an instance or a
+        // class: p.__setattr__(k, v), Base.__init__(self), P.__eq__(a, b)
+        if (objectFallbackName(method_name) && obj.type == ValueType::USERDATA && obj.value.p
+            && (isInstanceValue(obj) || fnTag(func_names, obj.value.p).rfind("__class__:", 0) == 0)) {
+            Value m; Node* where = nullptr;
+            Node* rcls = isInstanceValue(obj) ? classNodeOfInstance(obj) : classNodeOfValue(obj);
+            if (objectMember(method_name, m, &where, rcls)) {
+                std::string tag = fnTag(func_names, m.value.p);
+                if (tag.find("__classmethod__") != std::string::npos) {
+                    Value clsv = obj;
+                    if (isInstanceValue(obj)) { clsv = Value(); clsv.type = ValueType::USERDATA; clsv.value.p = instance_to_class[obj.value.p]; }
+                    Value bm = makeBoundClassMethod(m, clsv);
+                    return callFunctionValue(bm, args, ctx, kw_in);
+                }
+                if (isInstanceValue(obj) && tag.find("__static__") == std::string::npos)
+                    return invokeMember(m, where, obj, args, kw_args_in, ctx);
+                return callFunctionValue(m, args, ctx, kw_in);
+            }
+        }
         // ── Universal Object protocol ────────────────────────────────────────
         // Everything is an object in this language, so every instance should
         // answer a common set of queries without the author writing them.
@@ -6714,8 +6801,19 @@ public:   // NythonExecutor is a struct: members default to public
         if (obj.type != ValueType::USERDATA || !obj.value.p) return false;
         if (Node* cn = classNodeOfValue(obj)) {
             Value m; Node* where = nullptr;
-            if (!findClassMember(cn, "__class_getitem__", m, &where) || m.type != ValueType::USERDATA || !func_names.count(m.value.p))
-                return false;
+            if (!findClassMember(cn, "__class_getitem__", m, &where) || m.type != ValueType::USERDATA) return false;
+            // round 80: a descriptor (`__class_getitem__ =
+            // classmethod(types.GenericAlias)` - it was called as a function:
+            // a segmentation fault): what its __get__(None, C) gives is
+            // called with the item
+            if (isInstanceValue(m)) {
+                Value b;
+                if (!descriptorGet(m, NONE_VALUE, obj.value.p, ctx, b, false, where)) b = m;
+                std::vector<Value> a1{idx};
+                out = callFunctionValue(b, a1, ctx);
+                return true;
+            }
+            if (!func_names.count(m.value.p)) return false;
             std::vector<Value> a;
             if (fnTag(func_names, m.value.p).find("__classmethod__") == std::string::npos) a.push_back(obj);
             a.push_back(idx);
@@ -7085,7 +7183,9 @@ public:   // NythonExecutor is a struct: members default to public
     // it calls itself forever.) Convert that into a catchable Nython error.
     // Per OS thread: each thread has its own C++ stack (round 74).
     static inline thread_local int call_depth_ = 0;
-    static const int kMaxCallDepth = 900;
+    // round 80: sys.setrecursionlimit() sets it (nyrt::recursion_limit, the
+    // VM's limit too); this engine keeps its old margin of 100 below it
+    static int maxCallDepth() { int l = nyrt::recursion_limit(); return l > 200 ? l - 100 : l; }
     struct DepthGuard {
         int& d;
         explicit DepthGuard(int& x) : d(x) { ++d; }
@@ -7448,9 +7548,12 @@ public:
     }
 
     Value evalCall(node_ptr node, Context* ctx) {
-        if (call_depth_ >= kMaxCallDepth)
+        if (call_depth_ >= maxCallDepth()
+            // past the default depth, the native stack is the limit too (a
+            // raised recursion limit must not overflow it - round 80)
+            || (call_depth_ > 800 && !nycoro::current() && nycoro::native_stack_exhausted()))
             throw std::string("__exc__:RecursionError:maximum call depth exceeded ("
-                              + std::to_string(kMaxCallDepth) + ") — check for unintended "
+                              + std::to_string(maxCallDepth()) + ") — check for unintended "
                               "self-recursion, e.g. a method with the same name as a builtin");
         // Inside a generator the body runs on the generator's own stack;
         // near its end, the call continues on an extension stack (nygen).
@@ -7717,6 +7820,9 @@ public:
                                         bindParamsKw(fn, args, kw_args, fc, ctx, 0, attr_val.value.p);
                                         return runFunctionBody(fn, fc);
                                     }
+                                    // a lambda a module or namespace holds (round 80:
+                                    // `m.f = lambda: 1; m.f()` raised AttributeError)
+                                    if (raw && raw->type() == NodeType::LAMBDA) return callFunctionValue(attr_val, args, ctx, &kw_args);
                                 }
                             }
                         }
@@ -8601,6 +8707,10 @@ public:
               // C3 MRO, as the VM and method calls use.
               std::vector<Node*> mro = classMro(class_node);
               for (Node* mro_node : mro) {
+                // a class's __name__ / __qualname__ is its own, never a base's
+                // namespace entry (round 80: a dataclass(slots=True) base's
+                // __qualname__ named its subclasses)
+                if (mro_node != mro.front() && inst_it == instance_to_class.end() && (attr == "__qualname__" || attr == "__name__")) continue;
                 class_node = mro_node;
                 auto* cn = static_cast<ClassNode*>(class_node);
                 // Check class body context (handles @staticmethod, @property, class vars).
@@ -8686,6 +8796,24 @@ public:
                         }
                     }
                 }
+              }
+              // round 80: object's members, after the MRO (objectMember)
+              {
+                  Value cv; Node* owner = nullptr;
+                  if (objectMember(attr, cv, &owner, mro.empty() ? nullptr : mro.front())) {
+                      std::string tag = cv.type == ValueType::USERDATA && cv.value.p ? fnTag(func_names, cv.value.p) : std::string();
+                      if (bind && tag.find("__classmethod__") != std::string::npos) {
+                          Value clsv; clsv.type = ValueType::USERDATA; clsv.value.p = class_ptr;
+                          out = makeBoundClassMethod(cv, clsv);
+                          return true;
+                      }
+                      if (bind && tag.find("__static__") == std::string::npos && instance_to_class.count(obj.value.p)) {
+                          out = makeBoundMethod(cv, obj);
+                          return true;
+                      }
+                      out = cv;
+                      return true;
+                  }
               }
             }
         }
@@ -9132,6 +9260,11 @@ public:
                     size_t dot = is_class ? nm.rfind('.') : std::string::npos;
                     if (attr == "__module__") {
                         if (!is_class) return false;
+                        // the builtin exceptions and object are builtins' (round 80)
+                        if (dot == std::string::npos && (nm == "object" || nython::ny_is_builtin_exc(nm)) && t.find('#') == std::string::npos) {
+                            out = makeStringValue("builtins");
+                            return true;
+                        }
                         out = makeStringValue(dot == std::string::npos ? std::string("__main__") : nm.substr(0, dot));
                         return true;
                     }
@@ -9505,6 +9638,14 @@ public:
         } else if (kind == nython::NYX_IMPORT) {
             field("msg", args.size() == 1 ? args[0] : NONE_VALUE, args.size() == 1);
         }
+        // round 80: ImportError's name/path, AttributeError's name/obj,
+        // NameError's name (CPython 3.10+): None until given
+        switch (excKwFamily(cn, kind)) {
+            case 1: field("name", NONE_VALUE, false); field("path", NONE_VALUE, false); break;
+            case 2: field("name", NONE_VALUE, false); field("obj", NONE_VALUE, false); break;
+            case 3: field("name", NONE_VALUE, false); break;
+            default: break;
+        }
         props->defineByName("args", makeListValue(a, true));
         // StopIteration.value: a generator's return value (both engines).
         if (classDerivesFrom(cn, "StopIteration"))
@@ -9512,6 +9653,21 @@ public:
         // SystemExit.code: exit(n) / sys.exit(n) (round 77)
         if (classDerivesFrom(cn, "SystemExit"))
             props->defineByName("code", args.empty() ? NONE_VALUE : args.size() == 1 ? args[0] : makeListValue(args, true));
+    }
+    int excKwFamily(const std::string& cn, int kind) {
+        return nython::ny_exc_kw_family(kind == nython::NYX_IMPORT, classDerivesFrom(cn, "AttributeError"),
+                                        classDerivesFrom(cn, "NameError"));
+    }
+    // ImportError(msg, name=, path=), AttributeError(msg, name=, obj=),
+    // NameError(msg, name=) (round 80; other keywords are left to the
+    // class's own __init__)
+    void setExceptionKw(const Value& inst, const nyrt::OrderedKw<Value>& kw) {
+        if (kw.empty() || !isInstanceValue(inst)) return;
+        auto pit = instance_properties.find(inst.value.p);
+        if (pit == instance_properties.end() || !pit->second) return;
+        std::string cn = instanceClassName(inst);
+        int fam = excKwFamily(cn, excKindOf(cn));
+        for (auto& kv : kw) if (nython::ny_exc_kw_field(fam, kv.first)) pit->second->defineByName(kv.first, kv.second);
     }
     // The arguments of a builtin exception made from a runtime error's
     // message (round 77): an OSError's "[Errno N] text: 'name'" back into
@@ -9721,6 +9877,13 @@ public:
                 if ((t == "StopIteration" || t == "GeneratorExit") && excMessageOf(flow).empty()) a.clear();
                 static const nyrt::OrderedKw<Value> no_kw;
                 Value obj = instantiateClass(cv, a, no_kw, global_ctx);
+                // its name field, from the message (round 80: e.name of a
+                // ModuleNotFoundError, AttributeError, NameError)
+                std::string nm;
+                if (nython::ny_exc_name_from_message(excKwFamily(t, excKindOf(t)), excMessageOf(flow), nm)) {
+                    auto pit = instance_properties.find(obj.value.p);
+                    if (pit != instance_properties.end() && pit->second) pit->second->defineByName("name", makeStringValue(nm));
+                }
                 return obj;
             }
         }
@@ -9776,7 +9939,28 @@ public:
     }
     bool excClauseMatches(ExceptNode* en, const std::string& flow, Context* ctx = nullptr) {
         if (en->types.empty()) return true;
-        for (auto& t : en->types) if (excTypeMatches(flow, ctx ? excClassName(t, ctx) : t)) return true;
+        for (auto& t : en->types) {
+            // round 80: a name bound to a tuple of classes (`except ERRORS:`)
+            // catches what any of them catches, as in Python
+            std::vector<Value> tup;
+            std::string cn = ctx ? excClassName(t, ctx, &tup) : t;
+            if (!tup.empty()) { if (excTupleMatches(flow, tup, 0)) return true; continue; }
+            if (excTypeMatches(flow, cn)) return true;
+        }
+        return false;
+    }
+    bool excTupleMatches(const std::string& flow, const std::vector<Value>& items, int depth) {
+        for (auto& v : items) {
+            if (Container* c = contOf(v)) {
+                if (depth < 16 && seqLen(c) >= 0 && isTupleCont(c) && excTupleMatches(flow, seqItems(c), depth + 1)) return true;
+                continue;
+            }
+            if (v.type == ValueType::USERDATA && v.value.p) {
+                auto it = func_names.find(v.value.p);
+                if (it != func_names.end() && it->second.rfind("__class__:", 0) == 0 && excTypeMatches(flow, it->second.substr(10)))
+                    return true;
+            }
+        }
         return false;
     }
     // The class an except clause names, as the name the class is known by:
@@ -9785,7 +9969,7 @@ public:
     // (`except socket.error`, `except asyncio.QueueEmpty`) all match what
     // they name. A builtin exception name, or a name that is not bound to a
     // class, matches by name as before (the last part of a dotted one).
-    std::string excClassName(const std::string& t, Context* ctx) {
+    std::string excClassName(const std::string& t, Context* ctx, std::vector<Value>* tuple_items = nullptr) {
         if (t.empty() || nython::ny_is_builtin_exc(t)) return t;
         size_t dot = t.find('.');
         Value v = ctx->getByName(dot == std::string::npos ? t : t.substr(0, dot));
@@ -9795,6 +9979,8 @@ public:
             try { v = attrOf(v, part); } catch (...) { v = UNDEFINED_VALUE; }
             dot = next;
         }
+        if (tuple_items)   // round 80: a tuple of classes (excClauseMatches)
+            if (Container* c = contOf(v)) if (seqLen(c) >= 0 && isTupleCont(c)) { *tuple_items = seqItems(c); return std::string(); }
         if (v.type == ValueType::USERDATA && v.value.p) {
             auto it = func_names.find(v.value.p);
             if (it != func_names.end() && it->second.rfind("__class__:", 0) == 0) return it->second.substr(10);
@@ -10059,13 +10245,27 @@ public:
                 std::vector<Value> a{inst};
                 Value r = callFunctionValue(f, a, global_ctx);
                 if (isStringValue(r)) out = getStringValue(r);
+                else if (r.type == ValueType::NONE) uncaught_hooked_ = true;   // sys.excepthook ran (round 80)
             }
         } catch (...) {}
         last_stmt() = saved;
         return out;
     }
+    bool uncaught_hooked_ = false;
     // The exit handlers lib/atexit.ny registered, when the program ends
     // (the prelude's _ny_run_atexit).
+    // threading._register_atexit's callbacks (round 80): before the program's
+    // non-daemon threads are waited for (main.cpp), as CPython's
+    // threading._shutdown runs them.
+    void runThreadingAtexit() {
+        Value f = global_ctx ? global_ctx->getByName("_ny_run_threading_atexit") : UNDEFINED_VALUE;
+        if (f.type != ValueType::USERDATA) return;
+        if (listItems(global_ctx->getByName("_ny_threading_atexits")).empty()) return;
+        node_ptr saved = last_stmt();
+        std::vector<Value> a;
+        try { callFunctionValue(f, a, global_ctx); } catch (...) {}
+        last_stmt() = saved;
+    }
     void runAtexit() {
         Value f = global_ctx ? global_ctx->getByName("_ny_run_atexit") : UNDEFINED_VALUE;
         if (f.type != ValueType::USERDATA) return;
@@ -10659,14 +10859,14 @@ public:
                 for (auto& x : args) a.push_back(x);
                 Value inst = invokeMember(nm, where, cls, a, kw, ctx);
                 if (isInstanceValue(inst) && classDerivesFrom(instanceClassName(inst), static_cast<ClassNode*>(cn)->name)) {
-                    if (isExceptionClass(className)) setExceptionArgs(inst, args);
+                    if (isExceptionClass(className)) { setExceptionArgs(inst, args); setExceptionKw(inst, kw); }
                     runConstructor(inst, args, kw, ctx);
                 }
                 return inst;
             }
         }
         Value instance = newInstance(className, cls.value.p);
-        if (isExceptionClass(className)) setExceptionArgs(instance, args);
+        if (isExceptionClass(className)) { setExceptionArgs(instance, args); setExceptionKw(instance, kw); }
         runConstructor(instance, args, kw, ctx);
         return instance;
     }
@@ -10976,6 +11176,86 @@ public:
 
     // Modules imported by name, their namespaces (evalImport).
     std::unordered_map<std::string, Value> module_ns_;
+    // ── sys.modules (round 80) ──────────────────────────────────────────
+    // A real dict of the loaded modules, made the first time a program asks
+    // for it (sys.modules, __import__, importlib - the prelude's
+    // _ny_modules()). Once it exists every module registered is put in it
+    // (noteModule), and an import first asks it (syncModule): a name deleted
+    // from it is loaded again, a value assigned to it is what the import
+    // binds. "__main__" is the prelude's _NyMainModule (the program's
+    // globals, read through it).
+    Value sys_modules_ = UNDEFINED_VALUE;
+    Container* sysModulesCont() {
+        if (sys_modules_.type == ValueType::UNDEFINED) return nullptr;
+        return contOf(sys_modules_);
+    }
+    Value sysModulesValue() {
+        if (sys_modules_.type != ValueType::UNDEFINED) return sys_modules_;
+        auto* d = new Object((Runnable*)runner, "map", Type::MAP);
+        sys_modules_ = Value((Collectable*)d);
+        auto put = [&](const std::string& n, const Value& v) { (*d->container)[nypy::key_of_str(n)] = v; };
+        if (sys_ns_.type != ValueType::UNDEFINED) put("sys", sys_ns_);
+        Value bm = global_ctx->getByName("_ny_builtins_module");
+        if (bm.type != ValueType::UNDEFINED && bm.type != ValueType::NONE) {
+            std::vector<Value> none;
+            put("builtins", callFunctionValue(bm, none, global_ctx));
+        }
+        Value mm = global_ctx->getByName("_NyMainModule");
+        if (mm.type != ValueType::UNDEFINED && mm.type != ValueType::NONE) {
+            std::vector<Value> none;
+            put("__main__", callFunctionValue(mm, none, global_ctx));
+        }
+        std::vector<std::string> names;
+        for (auto& kv : module_ns_) names.push_back(kv.first);
+        std::sort(names.begin(), names.end());
+        for (auto& n : names) put(n, module_ns_[n]);
+        return sys_modules_;
+    }
+    void noteModule(const std::string& name, const Value& v) {
+        module_ns_[name] = v;
+        if (Container* c = sysModulesCont()) (*c->container)[nypy::key_of_str(name)] = v;
+    }
+    void forgetModule(const std::string& name) {
+        module_ns_.erase(name);
+        imported_modules_.erase(name);
+        if (Container* c = sysModulesCont()) c->container->erase(nypy::key_of_str(name));
+    }
+    // importlib's natives (round 80): a new empty module, a file run as a
+    // module in a given one (exec_module, reload), and where `import name`
+    // would find name - [path, "file" | "package" | "namespace" | ""].
+    Value moduleNew(const std::string& name) {
+        auto* ns = new Object((Runnable*)runner, name.empty() ? std::string("module") : name, Type::MAP);
+        noteNamespace(ns);
+        ns->set("__name__", makeStringValue(name));
+        return Value((Collectable*)ns);
+    }
+    Value moduleExec(const Value& m, const std::string& path, const std::string& name) {
+        if (!m.isCollectable() || !dynamic_cast<Object*>(m.value.gc)) pyRaise("TypeError", "_ny_module_exec(module, path, name)");
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0) pyRaise("FileNotFoundError", "[Errno 2] No such file or directory: '" + path + "'");
+        runModuleFile(path, name, m);
+        return m;
+    }
+    Value findModule(const std::string& name) {
+        bool dir = false;
+        std::string p = name.empty() ? std::string() : findModulePath(nullptr, name, &dir);
+        std::string kind = p.empty() ? "" : dir ? "namespace"
+                         : (p.size() > 12 && p.compare(p.size() - 12, 12, "/__init__.ny") == 0) ? "package" : "file";
+        return nyos_list_of({p, kind});
+    }
+    // What sys.modules says about `name` wins over the engine's own cache.
+    void syncModule(const std::string& name) {
+        Container* c = sysModulesCont();
+        if (!c) return;
+        auto it = c->container->find(nypy::key_of_str(name));
+        auto mc = module_ns_.find(name);
+        if (it == c->container->end()) {
+            if (mc != module_ns_.end()) { module_ns_.erase(mc); imported_modules_.erase(name); }
+            return;
+        }
+        if (mc == module_ns_.end() || mc->second.value.o != it->second.value.o || mc->second.type != it->second.type)
+            module_ns_[name] = it->second;
+    }
     // Scopes of the modules imported by name (importModule); a module lives
     // as long as the program, so its scope is never released.
     std::vector<Context*> module_ctxs_;
@@ -10986,6 +11266,18 @@ public:
     void bindFromNamespace(const Value& nsv, const std::vector<std::string>& names,
                            const std::string& module_name, Context* ctx) {
         auto* ns = nsv.isCollectable() ? dynamic_cast<Object*>(nsv.value.gc) : nullptr;
+        if ((!ns || !ns->container) && nsv.type != ValueType::NONE && nsv.type != ValueType::UNDEFINED
+            && !(names.size() == 1 && names[0] == "*")) {
+            // round 80: any object put in sys.modules - its attributes
+            for (const auto& entry : names) {
+                auto [n, bound] = nyrt::import_name_alias(entry);
+                Value v;
+                if (!getAttrValue(nsv, n, ctx, v))
+                    throw std::string("__exc__:ImportError:cannot import name '" + n + "' from '" + module_name + "'");
+                ctx->defineByName(bound, v);
+            }
+            return;
+        }
         if (!ns || !ns->container) throw std::string("__exc__:ImportError:cannot import from \"" + module_name + "\"");
         if (names.size() == 1 && names[0] == "*") {
             auto all = ns->container->find("__all__");
@@ -11037,6 +11329,7 @@ public:
         struct stat pst;
         bool in_package = !here.empty() && stat((here + "__init__.ny").c_str(), &pst) == 0;
         if (!here.empty() && !in_package) { dirs.push_back(here); dirs.push_back(here + "lib/"); }
+        for (auto& d : sysPathDirs()) dirs.push_back(d);   // round 80
         for (const char* d : {"", "./", "lib/", "./lib/"}) dirs.push_back(d);
         std::string anc = parentDirOf(here);
         for (int up = 0; up < 4 && !anc.empty(); ++up) {
@@ -11046,6 +11339,29 @@ public:
             anc = next;
         }
         for (auto& d : nyrt::library_dirs()) dirs.push_back(d);
+        return dirs;
+    }
+    // round 80: sys.path's entries (a program's sys.path.insert(0, d) is
+    // searched), then the main script's directory - CPython's sys.path[0],
+    // which __import__ / importlib reach from exec'd code. Each ends with a
+    // separator.
+    std::vector<std::string> sysPathDirs() {
+        std::vector<std::string> dirs;
+        if (sys_ns_.type != ValueType::UNDEFINED)
+            if (Container* sc = contOf(sys_ns_)) {
+                auto pit = sc->container->find("path");
+                if (pit != sc->container->end() && contOf(pit->second))
+                    for (auto& e : listItems(pit->second)) {
+                        if (!isStringValue(e)) continue;
+                        std::string d = getStringValue(e);
+                        if (d.empty()) continue;
+                        if (d.back() != '/' && d.back() != '\\') d += '/';
+                        dirs.push_back(d);
+                    }
+            }
+        const std::string& sp = nyrt::script_path();
+        size_t cut = sp.find_last_of("/\\");
+        if (cut != std::string::npos) dirs.push_back(sp.substr(0, cut + 1));
         return dirs;
     }
     std::string findModulePath(const node_ptr& node, const std::string& dotted, bool* is_dir = nullptr) {
@@ -11071,6 +11387,7 @@ public:
     }
     // Module `dotted`, loaded once (its namespace).
     Value loadModule(const node_ptr& node, const std::string& dotted) {
+        syncModule(dotted);   // round 80
         auto it = module_ns_.find(dotted);
         if (it != module_ns_.end()) return it->second;
         bool dir = false;
@@ -11081,7 +11398,7 @@ public:
             noteNamespace(ns);
             ns->set("__name__", makeStringValue(dotted));
             Value nsv((Collectable*)ns);
-            module_ns_[dotted] = nsv;
+            noteModule(dotted, nsv);   // round 80: sys.modules too
             return nsv;
         }
         return runModuleFile(path, dotted);
@@ -11137,7 +11454,9 @@ public:
         return NONE_VALUE;
     }
     // Runs a module file in a scope of its own; its namespace.
-    Value runModuleFile(const std::string& filepath, const std::string& module_name) {
+    // `into` (round 80): an existing module namespace to run the file in -
+    // importlib.reload(m), a loader's exec_module(m) - instead of a new one.
+    Value runModuleFile(const std::string& filepath, const std::string& module_name, Value into = UNDEFINED_VALUE) {
         auto source = SourceCode(filepath);
         auto reporter = std::make_shared<Reporter>(source);
         auto lex = std::make_shared<Lexer>(source);
@@ -11147,11 +11466,15 @@ public:
         if (!ast) throw std::string("__exc__:ImportError:cannot import \"" + filepath + "\"");
         nython::scope::qualify_module_classes(ast, module_name);
         imported_asts.push_back(ast);
-        auto* ns = new Object((Runnable*)runner, module_name, Type::MAP);
-        noteNamespace(ns);
+        Object* ns = into.isCollectable() ? dynamic_cast<Object*>(into.value.gc) : nullptr;
+        if (!ns) {
+            ns = new Object((Runnable*)runner, module_name, Type::MAP);
+            noteNamespace(ns);
+        }
         Value nsv((Collectable*)ns);
-        // Registered before the module runs, so a circular import binds it.
-        module_ns_[module_name] = nsv;
+        // Registered before the module runs, so a circular import binds it
+        // (round 80: in sys.modules too; exec_module / reload register nothing)
+        if (into.type == ValueType::UNDEFINED) noteModule(module_name, nsv);
         Context* mctx = new Context(runner, module_name, nullptr, nullptr, module_base_ctx_ ? module_base_ctx_ : global_ctx);
         mctx->inModule = true;
         mctx->parentFilter = &module_filter_;
@@ -11166,14 +11489,21 @@ public:
         module_ctxs_.push_back(mctx);
         mctx->defineByName("__name__", makeStringValue(module_name));
         mctx->defineByName("__file__", makeStringValue(filepath));
+        {   // round 80: __package__ (relative imports, importlib) and a package's __path__
+            bool pkg = filepath.size() >= 12 && filepath.compare(filepath.size() - 11, 11, "__init__.ny") == 0
+                       && (filepath[filepath.size() - 12] == '/' || filepath[filepath.size() - 12] == '\\');
+            size_t dot = module_name.rfind('.');
+            mctx->defineByName("__package__", makeStringValue(pkg ? module_name : dot == std::string::npos ? std::string() : module_name.substr(0, dot)));
+            if (pkg) mctx->defineByName("__path__", nyos_list_of({filepath.substr(0, filepath.size() - 12)}));
+        }
         std::unordered_set<void*> before;
         for (auto& kv : func_names) before.insert(kv.first);
         {
             FrameGuard _frame(nullptr, mctx);   // round 77: <module> of the file
             try { evalNode(ast, mctx); }
             catch (nython::node::ReturnSignal&) {}
-            catch (std::string& flow) { tbUnwind(flow); module_ns_.erase(module_name); imported_modules_.erase(module_name); throw; }
-            catch (std::exception& e) { tbUnwind(excFromCpp(e.what())); module_ns_.erase(module_name); imported_modules_.erase(module_name); throw; }
+            catch (std::string& flow) { tbUnwind(flow); if (into.type == ValueType::UNDEFINED) forgetModule(module_name); throw; }
+            catch (std::exception& e) { tbUnwind(excFromCpp(e.what())); if (into.type == ValueType::UNDEFINED) forgetModule(module_name); throw; }
         }
         for (auto& kv : func_names) if (!before.count(kv.first)) module_owned_.insert(kv.first);
         return nsv;
@@ -11190,6 +11520,35 @@ public:
         for (char c : n) if (!(std::isalnum((unsigned char)c) || c == '_')) return false;
         return true;
     }
+    // A relative import's module (round 80: `from .m import x`, `from ..
+    // import y` - the parser keeps the dots in the name): CPython's
+    // _calc___package__ and _resolve_name over the importing module's
+    // __package__, else its __name__ (a package's own when it has __path__).
+    std::string resolveRelativeImport(const std::string& rel, Context* ctx) {
+        size_t level = 0;
+        while (level < rel.size() && rel[level] == '.') level++;
+        std::string rest = rel.substr(level), package;
+        Value pk = ctx->getByName("__package__");
+        if (isStringValue(pk)) package = getStringValue(pk);
+        else {
+            Value nm = ctx->getByName("__name__");
+            if (isStringValue(nm)) {
+                package = getStringValue(nm);
+                Value pth = ctx->getByName("__path__");
+                if (pth.type == ValueType::UNDEFINED || pth.type == ValueType::NONE) {
+                    size_t c = package.rfind('.');
+                    package = c == std::string::npos ? std::string() : package.substr(0, c);
+                }
+            }
+        }
+        if (package.empty()) pyRaise("ImportError", "attempted relative import with no known parent package");
+        for (size_t i = 1; i < level; i++) {
+            size_t c = package.rfind('.');
+            if (c == std::string::npos) pyRaise("ImportError", "attempted relative import beyond top-level package");
+            package = package.substr(0, c);
+        }
+        return rest.empty() ? package : package + "." + rest;
+    }
     Value evalImport(node_ptr node, Context* ctx) {
         auto in_node = static_pointer_cast<ImportNode>(node);
         std::string module_name = in_node->module_name;
@@ -11199,6 +11558,7 @@ public:
             module_name = module_name.substr(1, module_name.size() - 2);
             quoted = true;
         }
+        if (!quoted && !module_name.empty() && module_name[0] == '.') module_name = resolveRelativeImport(module_name, ctx);   // round 80
         // `import name` (an identifier, not a quoted path) binds `name` to the
         // module's namespace, as in Python (round 77); its names are also
         // defined in the importing scope, as every import here always did.
@@ -11206,6 +11566,7 @@ public:
         std::string implicit_alias;
         const bool from_import = !in_node->names.empty();
         if (!quoted && in_node->alias.empty() && !from_import && isIdentifierText(module_name)) implicit_alias = module_name;
+        if (!quoted) syncModule(module_name);   // round 80: sys.modules first
         {
             // a module runs once: a later import (named or aliased) binds the
             // namespace its first import made
@@ -11592,8 +11953,9 @@ public:
 #else
                 plat = "linux";
 #endif
-                auto* ns = new Object((Runnable*)runner, in_node->alias.empty() ? "sys" : in_node->alias, Type::MAP);
+                auto* ns = new Object((Runnable*)runner, "sys", Type::MAP);   // round 80: "sys", not the alias
                 noteNamespace(ns);
+                ns->set("__name__", makeStringValue("sys"));
                 ns->set("argv", argv_list);
                 ns->set("platform", makeStringValue(plat));
                 ns->set("executable", makeStringValue(nyrt::executable_path()));
@@ -11626,6 +11988,13 @@ public:
                     ns->set(std::string("__") + st + "__", sv);
                 }
                 sys_ns_ = Value((Collectable*)ns);
+                {   // round 80: sys's Python-level members (the prelude's)
+                    Value ext = global_ctx->getByName("_ny_sys_extend");
+                    if (ext.type == ValueType::USERDATA && ext.value.p) {
+                        std::vector<Value> a{sys_ns_};
+                        callFunctionValue(ext, a, global_ctx);
+                    }
+                }
                 if (from_import) bindFromNamespace(sys_ns_, in_node->names, "sys", ctx);
                 else ctx->defineByName(in_node->alias.empty() ? "sys" : in_node->alias, sys_ns_);
                 ctx->defineByName("argv", argv_list);
@@ -11825,14 +12194,18 @@ public:
             // imported math binds it there too: the circular-import guard
             // above returned without binding anything (NameError: math in
             // lib/fractions.ny when the program had imported math first).
-            module_ns_["math"] = math_obj;
+            noteModule("math", math_obj);   // round 80: sys.modules too
             if (!in_node->names.empty()) bindFromNamespace(math_obj, in_node->names, "math", ctx);
             else ctx->defineByName(in_node->alias.empty() ? "math" : in_node->alias, math_obj);
             // a second `import math` in another module's scope binds it there too
             imported_modules_.erase(module_name);
-            // Also define pi/e as globals for convenience
-            ctx->defineByName("PI", Value(3.14159265358979323846));
-            ctx->defineByName("E", Value(2.71828182845904523536));
+            // Also define pi/e as globals for convenience (round 80: in the
+            // program's own scope only - exec("import math as m", ns) put
+            // them in ns)
+            if (ctx == global_ctx) {
+                ctx->defineByName("PI", Value(3.14159265358979323846));
+                ctx->defineByName("E", Value(2.71828182845904523536));
+            }
             return math_obj;
         }
 
@@ -11943,6 +12316,8 @@ public:
                 search_paths.push_back(here + "lib/" + module_name + ".ny");
             }
         }
+        // round 80: sys.path's entries (sys.path.insert(0, d)) for `import name`
+        if (!quoted) for (auto& d : sysPathDirs()) search_paths.push_back(d + module_name + ".ny");
         search_paths.push_back(module_name + ".ny");
         search_paths.push_back(module_name);
         search_paths.push_back("./" + module_name + ".ny");
@@ -11967,6 +12342,9 @@ public:
                 if (i) tried += ", ";
                 tried += search_paths[i];
             }
+            // `import name`: Python's ModuleNotFoundError (round 80); a quoted
+            // import keeps the paths it tried
+            if (!quoted) throw std::string("__exc__:ModuleNotFoundError:No module named '" + module_name + "'");
             throw std::string("__exc__:ImportError:cannot find module \"" + module_name
                               + "\" (looked in: " + tried + ")");
         }
@@ -12413,6 +12791,34 @@ public:
         }
         return false;
     }
+    // ── object's members, read through any class (round 80) ──────────────
+    // Every class's MRO ends in object (C.__mro__ says so), but a class
+    // naming no base does not have object in the MRO the engines search, and
+    // object's class body holds only the members the engines dispatch to
+    // themselves (__init__, __new__, __setattr__ ...); the others - __eq__,
+    // __hash__, __repr__ ... - are the prelude's _NyObjectExtra. They are
+    // looked for only where a read through the class has found nothing (a
+    // failed lookup: instance attribute reads that succeed pay nothing), and
+    // only for the names object has in CPython.
+    static bool objectFallbackName(const std::string& a) {
+        if (a.size() < 6 || a[0] != '_' || a[1] != '_') return false;
+        static const std::unordered_set<std::string> names = {
+            "__init__", "__new__", "__setattr__", "__delattr__", "__getattribute__", "__init_subclass__",
+            "__subclasshook__", "__reduce__", "__reduce_ex__", "__getstate__", "__eq__", "__ne__", "__lt__",
+            "__le__", "__gt__", "__ge__", "__hash__", "__repr__", "__str__", "__format__", "__sizeof__", "__dir__"};
+        return names.count(a) > 0;
+    }
+    // `cls` (the receiver's class): an exception's __init__ / __str__ /
+    // __repr__ are BaseException's, which the engine supplies itself.
+    bool objectMember(const std::string& name, Value& out, Node** owner = nullptr, Node* cls = nullptr) {
+        if (!objectFallbackName(name)) return false;
+        if (cls && cls->type() == NodeType::CLASS && (name == "__init__" || name == "__str__" || name == "__repr__")
+            && isExceptionClass(static_cast<ClassNode*>(cls)->name)) return false;
+        Node* objn = classNodeByName("object");
+        if (objn && findClassMember(objn, name, out, owner)) return true;
+        Node* ex = classNodeByName("_NyObjectExtra");
+        return ex && findClassMember(ex, name, out, owner);
+    }
     Node* classNodeOfInstance(const Value& v) {
         if (v.type != ValueType::USERDATA || !v.value.p) return nullptr;
         auto it = instance_to_class.find(v.value.p);
@@ -12844,6 +13250,7 @@ public:
     static bool reflectHidden(const std::string& k) {
         if (k.empty() || (unsigned char)k[0] < 0x20) return true;
         if (k == "__name__" || k == "__file__" || k == "__doc__") return false;
+        if (nyrt::user_dunder_name(k)) return false;   // a program's __x__ (round 80)
         return isInternalKey(k);
     }
     Value reflectGlobals(Context* ctx) {
@@ -13202,6 +13609,7 @@ public:
             Node* objn = classNodeByName("object");
             found = objn && objn != owner && findClassMember(objn, attr, m, &where);
         }
+        if (!found) found = objectMember(attr, m, &where, start);   // super().__eq__ ... (round 80)
         if (!found) pyRaise("AttributeError", "'super' object has no attribute '" + attr + "'");
         std::string tag = m.type == ValueType::USERDATA && m.value.p ? fnTag(func_names, m.value.p) : std::string();
         Value cls = isInstanceValue(self) ? classValueOfNode(start) : self;
@@ -13264,14 +13672,16 @@ public:
             }
             // Reaching a builtin exception base sets the exception's args;
             // reaching object, nothing.
-            if (isInstanceValue(self) && isExceptionClass(instanceClassName(self))) setExceptionArgs(self, args);
+            if (isInstanceValue(self) && isExceptionClass(instanceClassName(self))) { setExceptionArgs(self, args); setExceptionKw(self, kw); }
             out = NONE_VALUE;
             return true;
         }
         // Past the last base is object (every class's implicit root):
-        // super().__setattr__(k, v) and the like (round 77)
+        // super().__setattr__(k, v) and the like (round 77); its other
+        // members too - super().__eq__(o), super().__repr__() (round 80)
         if (Node* objn = classNodeByName("object")) {
-            if (findClassMember(objn, name, m, &where) && m.type == ValueType::USERDATA && m.value.p && func_names.count(m.value.p)) {
+            if ((findClassMember(objn, name, m, &where) || objectMember(name, m, &where, start))
+                && m.type == ValueType::USERDATA && m.value.p && func_names.count(m.value.p)) {
                 out = invoke(m, where);
                 return true;
             }
@@ -13565,6 +13975,12 @@ public:
         if (!cls) return false;
         Value m; Node* owner = nullptr;
         if (!findClassMember(cls, name, m, &owner)) return false;
+        // a class attribute that is a number, a string, bytes, None or a
+        // plain container is not callable (round 80: C.label() gave none)
+        if (m.type == ValueType::INTEGER || m.type == ValueType::DOUBLE || m.type == ValueType::BOOLEAN
+            || m.type == ValueType::NONE || bytesOf(m) || (isStringValue(m) && !func_names.count(m.value.p))
+            || (contOf(m) && !isInstanceValue(m)))
+            pyRaise("TypeError", "'" + typeNameOf(m) + "' object is not callable");
         if (m.type != ValueType::USERDATA || !m.value.p) return false;
         {
             // a descriptor (partialmethod, singledispatchmethod...): what its
@@ -13578,6 +13994,16 @@ public:
             // A class stored in the class (Outer.Inner(...)) or a builtin.
             if (tag.rfind("__class__:", 0) == 0 || tag.rfind("__builtin__:", 0) == 0) {
                 out = callFunctionValue(m, args, ctx);
+                return true;
+            }
+            // round 80: any other callable a class holds - a builtin's bound
+            // member (`__next__ = gen.__next__`), a bound method, an object
+            // with __call__ - is called as it is, no self added (as Python;
+            // the older path below read it as a function's AST node and
+            // crashed)
+            if (tag.find("__property__") == std::string::npos
+                && (bound_members_.count(m.value.p) || bound_self_.count(m.value.p) || isInstanceValue(m) || !tag.empty())) {
+                out = callFunctionValue(m, args, ctx, &kw);
                 return true;
             }
             return false;

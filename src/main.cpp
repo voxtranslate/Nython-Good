@@ -114,8 +114,9 @@ static void report_uncaught_where(const std::string& msg) {
     if (!where.empty()) std::cerr << "  at " << where << "\n";
 }
 
-// An uncaught Nython exception (a tagged std::string): reported; the exit status.
-static int report_uncaught_string(const std::string& s) {
+// An uncaught Nython exception (a tagged std::string): reported; the exit
+// status. `hooked`: a program's sys.excepthook reported it (round 80).
+static int report_uncaught_string(const std::string& s, bool hooked = false) {
     std::string msg = s;
     if (msg.rfind("__exc__:", 0) == 0) {
         msg = msg.substr(8);
@@ -134,6 +135,7 @@ static int report_uncaught_string(const std::string& s) {
         std::string rest = msg.size() > 12 ? msg.substr(12) : std::string();
         return nyrt::system_exit_status(rest);
     }
+    if (hooked) { NythonExecutor::traceException(msg); return 1; }
     std::cerr << "[Nython] Uncaught exception — " << msg << "\n";
     report_uncaught_where(msg);
     return 1;
@@ -239,13 +241,15 @@ int run_program(const Program& prog, bool show_ast = false) {
             // then the located line the IDE and the tools read.
             if (s.rfind("__exc__:SystemExit", 0) != 0 && s.rfind("__exc__:KeyboardInterrupt", 0) != 0)
                 std::cerr << exec.uncaughtTracebackText(s);
-            int rc = report_uncaught_string(s);
+            int rc = report_uncaught_string(s, exec.uncaught_hooked_);
             if (g_inspect) { interactive_interp(exec, (Runnable*)vm_ptr.get(), false); exec.runAtexit(); return g_repl_exit >= 0 ? g_repl_exit : rc; }
+            exec.runThreadingAtexit();   // round 80: threading._register_atexit's, before the threads
             nyconc::join_nondaemon_at_exit();
             exec.runAtexit();   // round 77: atexit handlers, after the threads
             return rc;
         }
         if (g_inspect) interactive_interp(exec, (Runnable*)vm_ptr.get(), false);
+        exec.runThreadingAtexit();   // round 80: threading._register_atexit's, before the threads
         nyconc::join_nondaemon_at_exit();
         exec.runAtexit();   // round 77: atexit handlers, after the threads
         // Generators the program left suspended are closed now, oldest
@@ -1191,6 +1195,7 @@ int main(int argc, char** argv, char** env) {
         // way of giving a program. The old forms still work: --vm file,
         // --trace OUT file, -p file, -t/-a/-d file.
         bool use_vm = false, inspect = false, quiet = false, force_repl = false, profile = false, ide = false;
+        for (int k = 0; k < argc; k++) nyrt::orig_argv().push_back(argv[k]);   // sys.orig_argv (round 80)
         std::string tool, mode, target, trace_out;
         int i = 1;
         auto bad = [&](const std::string& m) { std::cerr << "nython: " << m << "\nTry 'nython -h' for more information.\n"; return 2; };
@@ -1242,17 +1247,22 @@ int main(int argc, char** argv, char** env) {
                         if (c == 'W') nyrt::warn_options().push_back(val);
                         stop = true;
                     }
-                    else if (c == 'i') inspect = true;
-                    else if (c == 'q') quiet = true;
+                    else if (c == 'i') { inspect = true; nyrt::cli_flags().inspect = nyrt::cli_flags().interactive = 1; }
+                    else if (c == 'q') { quiet = true; nyrt::cli_flags().quiet = 1; }
                     else if (c == 'u') setenv_default_unbuffered();
-                    else if (c == 'E') { unset_env("NYTHONPATH"); unset_env("NYTHONSTARTUP"); unset_env("NYTHONUNBUFFERED"); }
+                    else if (c == 'E') { nyrt::cli_flags().ignore_environment = 1; unset_env("NYTHONPATH"); unset_env("NYTHONSTARTUP"); unset_env("NYTHONUNBUFFERED"); }
                     else if (c == 'V' || c == 'v') { print_version(); return 0; }
                     else if (c == 'h' || c == '?') { print_usage(); return 0; }
                     else if (c == 't') tool = "tokenize";
                     else if (c == 'a') tool = "ast";
                     else if (c == 'd') tool = "disasm";
                     else if (c == 'p') profile = true;
-                    else if (c == 'B' || c == 'O' || c == 's' || c == 'S' || c == 'b') {}   // Python's: nothing to do here
+                    // round 80: sys.flags; -O / -OO make __debug__ False and drop asserts
+                    else if (c == 'O') nyrt::cli_flags().optimize++;
+                    else if (c == 's') nyrt::cli_flags().no_user_site = 1;
+                    else if (c == 'S') nyrt::cli_flags().no_site = 1;
+                    else if (c == 'b') nyrt::cli_flags().bytes_warning++;
+                    else if (c == 'B') {}   // Python's: nothing to do here
                     else return bad(std::string("unknown option -") + c);
                 }
                 if (stop && (mode == "cmd" || mode == "module")) { i++; break; }

@@ -523,6 +523,10 @@ struct VMCode {
     // where its top level (module_top) defines its names and its functions
     // find them - in place of the main program's frame.
     std::shared_ptr<VMMap> module_env;
+    // round 80: the prelude's (and the builtin mirrors') code: it does not see
+    // the main program's frame, so a program's top-level `list = ...` does
+    // not change the builtins it calls (VirtualMachine::frame_visible)
+    bool prelude_code = false;
     bool                   module_top = false;
     std::vector<std::shared_ptr<VMCode>> sub_codes;
     std::vector<ExceptionEntry>          exc_table;
@@ -2815,10 +2819,22 @@ private:
     VMMap* menv() const {
         return call_stack_.empty() || !call_stack_.back().code ? nullptr : call_stack_.back().code->module_env.get();
     }
+    // the running code is the prelude's (round 80)
+    bool prelude_running() const {
+        return !call_stack_.empty() && call_stack_.back().code && call_stack_.back().code->prelude_code;
+    }
+    static void tag_prelude_code(const std::shared_ptr<VMCode>& c) {
+        if(!c || c->prelude_code) return;
+        c->prelude_code=true;
+        for(auto& s:c->sub_codes) tag_prelude_code(s);
+        for(auto& k:c->constants) if(k.code) tag_prelude_code(k.code);
+    }
     bool frame_visible(int i) const {
         int top=(int)call_stack_.size()-1;
         if(i==top) return true;
-        if(i==0) return !menv();       // a module's code does not see the program's frame
+        // a module's code does not see the program's frame, nor does the
+        // prelude's (round 80)
+        if(i==0) return !menv() && !prelude_running();
         const auto& env=call_stack_[top].closure_env;
         const auto& fe=call_stack_[i].closure_env;
         return env && fe && call_stack_[i].own_env && env_reaches(env.get(), fe.get());
@@ -2851,7 +2867,7 @@ private:
             if(f.has_local(n)) return true;
         }
         if(VMMap* me=menv()){ if(me->count(n)) return true; }
-        else if(in_other_thread() && module_frame_ && !module_frame_->get_local(n).is_missing()) return true;
+        else if(in_other_thread() && module_frame_ && !prelude_running() && !module_frame_->get_local(n).is_missing()) return true;
         if(globals_.count(n)) return true;
         return bridge_exists() && bridge_exists()(n);
     }
@@ -2864,7 +2880,7 @@ private:
         if(VMMap* me=menv()){
             auto mi=me->find(n);
             if(mi!=me->end()) return mi->second;
-        } else if(in_other_thread()){                            // round 74
+        } else if(in_other_thread() && !prelude_running()){      // round 74 (not the prelude's code: round 80)
             auto mv=module_frame_->get_local(n);
             if(!mv.is_missing()) return mv;
         }
@@ -2880,16 +2896,22 @@ private:
         // Only names the interpreter actually registers are wrapped, so an
         // undefined variable still reads as none rather than becoming callable.
         if(bridge_exists() && bridge_exists()(n)){
+            // one object per builtin (round 80): f_builtins["len"] is len,
+            // `is` between two reads (a new native was made each read)
+            auto bc=bridge_natives_.find(n);
+            if(bc!=bridge_natives_.end()) return bc->second;
             std::string nm=n;
             VMVal nv=VMVal::make_native([nm](std::vector<VMVal>& a)->VMVal{
                 if(bridge_call()) return bridge_call()(nm,a);
                 return VMVal::make_none();
             });
             nv.class_name="__builtin__:"+nm;   // lets time.time() find time's members
+            bridge_natives_.emplace(n, nv);
             return nv;
         }
         return VMVal::make_none();
     }
+    std::unordered_map<std::string, VMVal> bridge_natives_;   // load_var's wrappers, one per name (round 80)
     // del x: the nearest binding of x goes (the scopes store_var looks in).
     bool delete_var(const std::string& n) {
         for(int i=(int)call_stack_.size()-1;i>=0;i--){
@@ -2947,7 +2969,7 @@ private:
             // A module's top level, or a module variable rebound by one of
             // its functions.
             if(call_stack_.back().code->module_top || me->count(n)){ (*me)[n]=std::move(v); return; }
-        } else if(in_other_thread() && module_frame_->has_local(n)){    // round 74
+        } else if(in_other_thread() && !prelude_running() && module_frame_->has_local(n)){    // round 74
             module_frame_->set(n,std::move(v)); return;
         }
         if(!call_stack_.empty()) call_stack_.back().locals[n]=std::move(v);
@@ -3474,22 +3496,23 @@ public:
             // handlers run after the threads are done (round 77).
             try { run_loop(); } catch(VMReturn&) {}
             catch(VMException& ve) {
-                if(!session) print_uncaught_traceback(ve.value);
-                VMResult r=report_uncaught(ve.what(), false);
-                if(!session){ nyconc::join_nondaemon_at_exit(); run_atexit(); }
+                // a program's sys.excepthook reported it: nothing more (round 80)
+                bool hooked=!session&&print_uncaught_traceback(ve.value);
+                VMResult r=hooked ? VMResult::RUNTIME_ERROR : report_uncaught(ve.what(), false);
+                if(!session){ run_threading_atexit(); nyconc::join_nondaemon_at_exit(); run_atexit(); }
                 return r;
             }
             catch(std::exception& e) {
                 VMResult r=report_uncaught(e.what(), false);
-                if(!session){ nyconc::join_nondaemon_at_exit(); run_atexit(); }
+                if(!session){ run_threading_atexit(); nyconc::join_nondaemon_at_exit(); run_atexit(); }
                 return r;
             }
             catch(std::string& m) {
                 VMResult r=report_uncaught(m, true);
-                if(!session){ nyconc::join_nondaemon_at_exit(); run_atexit(); }
+                if(!session){ run_threading_atexit(); nyconc::join_nondaemon_at_exit(); run_atexit(); }
                 return r;
             }
-            if(!session){ nyconc::join_nondaemon_at_exit(); run_atexit(); }
+            if(!session){ run_threading_atexit(); nyconc::join_nondaemon_at_exit(); run_atexit(); }
             // Generators the program left paused: closed now, so their
             // finally blocks run (the interpreter does the same).
             if(!session) gen_close_all();
@@ -3507,15 +3530,31 @@ public:
     // An uncaught exception's traceback, Python's way, chained exceptions
     // first, without the last line (the prelude's _ny_format_uncaught;
     // report_uncaught prints that line) - round 77.
-    void print_uncaught_traceback(const VMVal& ev) {
-        if(ev.type!=VMType::INSTANCE||prompt_session_) return;
-        if(class_derives(ev.class_name,"SystemExit")||class_derives(ev.class_name,"KeyboardInterrupt")) return;
+    // True when a program's sys.excepthook reported it (round 80).
+    bool print_uncaught_traceback(const VMVal& ev) {
+        if(ev.type!=VMType::INSTANCE||prompt_session_) return false;
+        if(class_derives(ev.class_name,"SystemExit")||class_derives(ev.class_name,"KeyboardInterrupt")) return false;
         try {
             VMVal f=load_var("_ny_format_uncaught");
-            if(f.type!=VMType::FUNCTION) return;
+            if(f.type!=VMType::FUNCTION) return false;
             std::vector<VMVal> a{ev};
             VMVal r=vm_call(f,a,std::nullopt);
             if(r.type==VMType::STRING) std::cerr<<r.s;
+            else if(r.type==VMType::NONE) return true;
+        } catch(...) {}
+        return false;
+    }
+    // threading._register_atexit's callbacks (round 80): run before the
+    // program's non-daemon threads are waited for, as CPython's
+    // threading._shutdown (the prelude's _ny_run_threading_atexit).
+    void run_threading_atexit() {
+        try {
+            VMVal hs=load_var("_ny_threading_atexits");
+            if(hs.type!=VMType::LIST||!hs.list||hs.list->empty()) return;
+            VMVal f=load_var("_ny_run_threading_atexit");
+            if(f.type!=VMType::FUNCTION) return;
+            std::vector<VMVal> a;
+            vm_call(f,a,std::nullopt);
         } catch(...) {}
     }
     // The exit handlers lib/atexit.ny registered (the prelude's _ny_run_atexit).
@@ -3578,6 +3617,7 @@ public:
             if(!ast) return;
             prelude_asts_.push_back(ast);
             Compiler c; auto code=c.compile(ast);
+            tag_prelude_code(code);   // round 80
             // The prelude's names become globals (round 77: export_depth_ was
             // left unset, so only the native open() below and the classes
             // registered here were ever visible - NythonFile, but none of the
@@ -3653,6 +3693,15 @@ public:
     // os_* builtins (include/NyRuntime.hpp module_members), plus the
     // constants and a snapshot of os.environ - as on the interpreter.
     VMVal define_os_module(const std::string& as_name, bool bind=true) {   // bind=false: just made (round 77)
+        // round 80: one os module (sys.modules["os"]), bound in the
+        // importing scope
+        {
+            auto oc=module_ns_.find("os");
+            if(oc!=module_ns_.end()&&oc->second.type==VMType::MAP&&oc->second.map){
+                if(bind) define_var(as_name,oc->second);
+                return oc->second;
+            }
+        }
         std::vector<std::string> names;
         if(bridge_names()) names=bridge_names()();
         VMVal ns=VMVal::make_map(), path=VMVal::make_map();
@@ -3676,13 +3725,28 @@ public:
             (*ns.map)[c]=v;
             if(std::string(c)=="sep"||std::string(c)=="pathsep") (*path.map)[c]=v;
         }
-        VMVal envf=load_var("os_environ");
-        std::vector<VMVal> none_args;
-        (*ns.map)["environ"]=envf.type==VMType::NATIVE?envf.native(none_args):VMVal::make_map();
+        // os.environ / os.environb (round 80): the prelude's _Environ, which
+        // writes through to the process environment
+        {
+            std::vector<VMVal> none_args;
+            VMVal ef=load_var("_ny_os_environ");
+            VMVal ebf=load_var("_ny_os_environb");
+            if(ef.type==VMType::FUNCTION) (*ns.map)["environ"]=vm_call(ef,none_args,std::nullopt);
+            else {
+                VMVal envf=load_var("os_environ");
+                (*ns.map)["environ"]=envf.type==VMType::NATIVE?envf.native(none_args):VMVal::make_map();
+            }
+#ifndef _WIN32
+            if(ebf.type==VMType::FUNCTION) (*ns.map)["environb"]=vm_call(ebf,none_args,std::nullopt);
+#endif
+        }
         path.class_name="path";
         (*ns.map)["path"]=path;
-        ns.class_name=as_name;
-        if(bind) globals_[as_name]=ns;
+        (*ns.map)["__name__"]=VMVal::make_str("os");
+        ns.class_name="os";   // round 80: its name, not the alias it is bound as
+        note_module("os",ns);
+        note_module("os.path",path);   // sys.modules["os.path"] (round 80)
+        if(bind) define_var(as_name,ns);
         return ns;
     }
 
@@ -3706,8 +3770,12 @@ public:
         target=so;
         return true;
     }
-    void define_sys_module(const std::string& as_name) {
-        if(sys_ns_.type==VMType::MAP&&sys_ns_.map){ globals_[as_name]=sys_ns_; return; }
+    // round 80: the module is bound in the importing scope (define_var: a
+    // module's own scope, an exec namespace - it went to the globals, so a
+    // module's `del sys` removed the program's), registered as a module,
+    // and given the prelude's Python-level members (_ny_sys_extend).
+    void define_sys_module(const std::string& as_name, bool bind=true) {
+        if(sys_ns_.type==VMType::MAP&&sys_ns_.map){ if(bind) define_var(as_name,sys_ns_); return; }
         std::vector<VMVal> av;
         for(auto& a : nyrt::argv()) av.push_back(VMVal::make_str(a));
         VMVal argv_list=VMVal::make_list(std::move(av));
@@ -3754,7 +3822,12 @@ public:
         { const uint16_t probe=1; (*ns.map)["byteorder"]=VMVal::make_str(*(const uint8_t*)&probe?"little":"big"); }
         ns.class_name="sys";
         sys_ns_=ns;
-        globals_[as_name]=ns;
+        note_module("sys",ns);
+        {
+            VMVal ext=load_var("_ny_sys_extend");
+            if(ext.type==VMType::FUNCTION){ std::vector<VMVal> a{ns}; vm_call(ext,a,std::nullopt); }
+        }
+        if(bind) define_var(as_name,ns);
         globals_["argv"]=argv_list;
         globals_["platform"]=VMVal::make_str(plat);
     }
@@ -3787,6 +3860,7 @@ public:
         // filename, a codec error's fields, a KeyError's key - round 77)
         std::string t=type.empty()?std::string("Exception"):type;
         set_exc_args(*attrs, t, exc_args_from_message(t, msg));
+        exc_name_field(*attrs, t, msg);   // round 80
         last_exception_obj_=VMVal::make_instance(type.empty()?std::string("Exception"):type, attrs);
         throw std::runtime_error((type.empty()?std::string("Exception"):type)+": "+msg);
     }
@@ -3850,9 +3924,9 @@ private:
     // Deep recursion raises RecursionError (it crashed the process with
     // SIGSEGV at ~1400 frames): at most kMaxFrames frames, and never past the
     // stack's own floor (smaller thread stacks, instrumented builds).
-    static const size_t kMaxFrames = 1000;
+    // round 80: sys.setrecursionlimit() sets it (nyrt::recursion_limit)
     void check_depth() {
-        if(call_stack_.size() >= kMaxFrames)
+        if(call_stack_.size() >= (size_t)nyrt::recursion_limit())
             throw_exception(make_exception("RecursionError",{VMVal::make_str("maximum recursion depth exceeded")}));
         // On a coroutine's stack (an async task) a deep call goes on to an
         // extension stack instead (run_frame); a thread's own stack ends here.
@@ -5257,6 +5331,28 @@ private:
             return class_lookup("object",attr,out,owner);
         return false;
     }
+    // ── object's members, read through any class (round 80) ──────────────
+    // NythonExecutor::objectMember: object's class body (a class naming no
+    // base lacks object in the MRO this engine searches) and the prelude's
+    // _NyObjectExtra (__eq__, __hash__, __repr__ ...: in object's body every
+    // class would seem to define them to the protocol dispatch). Asked only
+    // where a lookup through the class found nothing.
+    static bool object_fallback_name(const std::string& a) {
+        if(a.size()<6||a[0]!='_'||a[1]!='_') return false;
+        static const std::unordered_set<std::string> names = {
+            "__init__","__new__","__setattr__","__delattr__","__getattribute__","__init_subclass__",
+            "__subclasshook__","__reduce__","__reduce_ex__","__getstate__","__eq__","__ne__","__lt__",
+            "__le__","__gt__","__ge__","__hash__","__repr__","__str__","__format__","__sizeof__","__dir__"};
+        return names.count(a)>0;
+    }
+    // `cls` (the receiver's class): an exception's __init__ / __str__ /
+    // __repr__ are BaseException's, which the engine supplies itself.
+    bool object_member(const std::string& attr, VMVal& out, std::string* owner=nullptr, const std::string& cls=std::string()) {
+        if(!object_fallback_name(attr)) return false;
+        if(!cls.empty()&&(attr=="__init__"||attr=="__str__"||attr=="__repr__")&&is_exception_class(cls)) return false;
+        if(class_lookup("object",attr,out,owner)) return true;
+        return class_lookup("_NyObjectExtra",attr,out,owner);
+    }
     // ── Classes deriving from builtin types (round 77) ───────────────────
     // As on the interpreter (NythonExecutor's section of the same name): an
     // instance of `class MyInt(int)` holds its value - the payload - in the
@@ -5280,6 +5376,7 @@ private:
             if(!ast) return;
             prelude_asts_.push_back(ast);
             Compiler c; auto code=c.compile(ast);
+            tag_prelude_code(code);   // round 80
             // its names become globals, as the prelude's (load_prelude)
             bool old_exp=export_to_globals_; export_to_globals_=true;
             int old_depth=export_depth_; export_depth_=(int)call_stack_.size()+1;
@@ -5656,6 +5753,7 @@ private:
     static bool reflect_hidden(const std::string& k) {
         if(k.empty()||(unsigned char)k[0]<0x20) return true;
         if(k=="__name__"||k=="__file__"||k=="__doc__") return false;
+        if(nyrt::user_dunder_name(k)) return false;   // a program's __x__ (round 80)
         return k.size()>=2&&k[0]=='_'&&k[1]=='_';
     }
     std::unordered_set<std::string> base_global_names_;
@@ -6336,6 +6434,17 @@ private:
             std::string cname=obj.class_name.empty()?obj.s:obj.class_name;
             VMVal m;
             if(!class_lookup(cname,"__class_getitem__",m)) return false;
+            // round 80: a descriptor (`__class_getitem__ =
+            // classmethod(types.GenericAlias)`): what its __get__(None, C)
+            // gives is called with the item
+            if(m.type==VMType::INSTANCE){
+                VMVal b;
+                if(descriptor_get(m, VMVal::make_none(), cname, b)){
+                    std::vector<VMVal> a1{idx};
+                    out=vm_call(b, a1, std::nullopt, nullptr);
+                    return true;
+                }
+            }
             std::vector<VMVal> a{obj, idx};
             out=vm_call(m, a, std::nullopt, nullptr);
             return true;
@@ -6476,7 +6585,7 @@ private:
                 for(auto& x:args) a.push_back(x);
                 VMVal inst=vm_call(nw, a, std::nullopt, kwargs);
                 if(inst.type==VMType::INSTANCE&&class_derives(inst.class_name, cls.class_name)){
-                    if(vm_exc_classes().count(cls.class_name)&&inst.map) set_exc_args(*inst.map, inst.class_name, args);
+                    if(vm_exc_classes().count(cls.class_name)&&inst.map){ set_exc_args(*inst.map, inst.class_name, args); set_exc_kw(*inst.map, inst.class_name, kwargs); }
                     VMVal init;
                     if(find_ctor(cls.class_name, init)) invoke_method(init, inst, args, cls.class_name, kwargs);
                 }
@@ -6489,7 +6598,7 @@ private:
         // An exception's args are the constructor's arguments whatever its
         // __init__ does (Python's BaseException.__new__); a class that calls
         // super().__init__(...) replaces them there.
-        if(vm_exc_classes().count(cls.class_name)) set_exc_args(*attrs, cls.class_name, args);   // and the fields (round 77)
+        if(vm_exc_classes().count(cls.class_name)){ set_exc_args(*attrs, cls.class_name, args); set_exc_kw(*attrs, cls.class_name, kwargs); }   // and the fields (round 77, 80)
         VMVal init;
         if(find_ctor(cls.class_name, init)) invoke_method(init, inst, args, cls.class_name, kwargs);
         return inst;
@@ -7947,7 +8056,10 @@ private:
         for(auto& n:names){
             if(n.rfind("_ny",0)==0||n.rfind("_Ny",0)==0||reflect_hidden(n)) continue;
             auto it=globals_.find(n);
-            if(it!=globals_.end()) (*d.map)[nypy::key_of_str(n)]=it->second;
+            if(it==globals_.end()) continue;
+            // named as load_var names it, so f_builtins["len"] is len (round 80)
+            if(it->second.type==VMType::NATIVE&&it->second.class_name.empty()) it->second.class_name="__native__:"+n;
+            (*d.map)[nypy::key_of_str(n)]=it->second;
         }
         return d;
     }
@@ -8292,10 +8404,32 @@ private:
         } else if(kind==nython::NYX_IMPORT){
             field("msg", args.size()==1?args[0]:VMVal::make_none(), args.size()==1);
         }
+        // round 80: ImportError's name/path, AttributeError's name/obj,
+        // NameError's name (CPython 3.10+): None until given
+        switch(exc_kw_family(cls,kind)){
+            case 1: field("name",VMVal::make_none(),false); field("path",VMVal::make_none(),false); break;
+            case 2: field("name",VMVal::make_none(),false); field("obj",VMVal::make_none(),false); break;
+            case 3: field("name",VMVal::make_none(),false); break;
+            default: break;
+        }
         // StopIteration.value: a generator's return value (both engines).
         if(class_derives(cls,"StopIteration")) attrs["value"]=args.empty()?VMVal::make_none():args[0];
         if(class_derives(cls,"SystemExit")) attrs["code"]=args.empty()?VMVal::make_none():args.size()==1?args[0]:VMVal::make_tuple(args);
         attrs["args"]=VMVal::make_tuple(std::move(a));
+    }
+    int exc_kw_family(const std::string& cls, int kind) {
+        return nython::ny_exc_kw_family(kind==nython::NYX_IMPORT, class_derives(cls,"AttributeError"), class_derives(cls,"NameError"));
+    }
+    // ImportError(msg, name=, path=), AttributeError(msg, name=, obj=),
+    // NameError(msg, name=) (round 80; NythonExecutor::setExceptionKw)
+    void set_exc_kw(VMMap& attrs, const std::string& cls, const VMVal* kwargs) {
+        if(!kwargs||kwargs->type!=VMType::MAP||!kwargs->map||kwargs->map->empty()) return;
+        int kind=nython::ny_exc_kind([&](const char* b){ return class_derives(cls,b); });
+        int fam=exc_kw_family(cls,kind);
+        for(auto& kv:*kwargs->map){
+            std::string k=nypy::key_payload(kv.first);
+            if(nython::ny_exc_kw_field(fam,k)) attrs[k]=kv.second;
+        }
     }
     // The arguments of a builtin exception made from a runtime error's
     // message (round 77, NythonExecutor::excArgsFromMessage): an OSError's
@@ -8336,7 +8470,17 @@ private:
         if(!class_reg_.count(type)) vm_exc_classes().insert(type);
         auto attrs=std::make_shared<VMMap>(); vmgc::track_map(attrs);
         set_exc_args(*attrs, type, args);
+        if(args.size()==1&&args[0].type==VMType::STRING) exc_name_field(*attrs, type, args[0].s);   // round 80
         return VMVal::make_instance(type, attrs);
+    }
+    // The name field of an error the runtime raised, read back from its
+    // message (round 80: e.name of a ModuleNotFoundError, AttributeError,
+    // NameError)
+    void exc_name_field(VMMap& attrs, const std::string& t, const std::string& msg) {
+        if(msg.find('\'')==std::string::npos) return;
+        std::string nm;
+        int kind=nython::ny_exc_kind([&](const char* b){ return class_derives(t,b); });
+        if(nython::ny_exc_name_from_message(exc_kw_family(t,kind), msg, nm)) attrs["name"]=VMVal::make_str(nm);
     }
     // The exception a native raised as last_exception_obj_ + a "Type: msg"
     // runtime_error, when the two agree; else one made from the message.
@@ -8943,6 +9087,18 @@ private:
         // equal to its hash as an int (Fraction(2, 2), an IntEnum member):
         // that int's key, as Python finds it
         if(h.type==VMType::INT&&key_equals(k,h)) return vkey(h);
+        // round 80: equal to a float or an int of the same hash (Decimal("0.5")
+        // and 0.5, Fraction(1, 2) and 0.5, Decimal(10**30) and 10**30): that
+        // number's key - Python's numeric hash and == make them one key
+        if(h.type==VMType::INT&&h.s.empty()&&k.type==VMType::INSTANCE){
+            for(const char* conv:{"__float__","__int__"}){
+                bool found=false;
+                VMVal num;
+                try { num=call_dunder_f(k,conv,{},found); } catch(...) { found=false; }
+                if(!found||(num.type!=VMType::FLOAT&&num.type!=VMType::INT)) continue;
+                if(nypy::hash_of_key(vkey(num))==h.i&&key_equals(k,num)) return vkey(num);
+            }
+        }
         std::string hid="vh"+hs+"#"+std::to_string(hash_key_seq_++);
         vm_key_objs().emplace(hid,k);
         hash_keys_[hs].push_back(hid);
@@ -9204,15 +9360,29 @@ private:
     int match_except_handler(const ExceptionEntry& ee, const VMVal& exc_val) {
         for(auto& cl : ee.clauses){
             if(cl.types.empty()) return cl.handler;
-            for(auto& t : cl.types)
-                if(exception_matches(exc_val, exc_class_name(t))) return cl.handler;
+            for(auto& t : cl.types){
+                // round 80: a name bound to a tuple of classes (`except
+                // ERRORS:`) catches what any of them catches
+                VMVal tup;
+                std::string cn=exc_class_name(t,&tup);
+                if(tup.type==VMType::LIST){ if(exc_tuple_matches(exc_val,tup,0)) return cl.handler; continue; }
+                if(exception_matches(exc_val, cn)) return cl.handler;
+            }
         }
         return -1;
+    }
+    bool exc_tuple_matches(const VMVal& exc_val, const VMVal& tup, int depth) {
+        if(!tup.list) return false;
+        for(auto& v:*tup.list){
+            if(v.type==VMType::LIST&&v.b){ if(depth<16&&exc_tuple_matches(exc_val,v,depth+1)) return true; continue; }
+            if(v.type==VMType::CLASS&&exception_matches(exc_val,v.class_name)) return true;
+        }
+        return false;
     }
     // The class an except clause names (NythonExecutor::excClassName): the
     // name is looked up in scope, so a module's own class ("module.E"), an
     // alias and a dotted name match what they name (round 77).
-    std::string exc_class_name(const std::string& t) {
+    std::string exc_class_name(const std::string& t, VMVal* tuple_out=nullptr) {
         if(t.empty() || nython::ny_is_builtin_exc(t)) return t;
         size_t dot=t.find('.');
         std::string head=dot==std::string::npos?t:t.substr(0,dot);
@@ -9227,6 +9397,7 @@ private:
             v=a; dot=next;
         }
         if(ok && v.type==VMType::CLASS) return v.class_name;
+        if(ok && tuple_out && v.type==VMType::LIST && v.b){ *tuple_out=v; return std::string(); }   // round 80
         size_t last=t.rfind('.');
         return last==std::string::npos?t:t.substr(last+1);
     }
@@ -9384,7 +9555,8 @@ private:
             if(attr=="__self__"){ out=self_v; return true; }
             if(attr=="__self_class__"){ out=self_v.type==VMType::INSTANCE?class_value(self_v.class_name):self_v; return true; }
             VMVal m; std::string where;
-            if(!class_lookup(mro_of, attr, m, &where, &owner)&&!(owner!="object"&&class_lookup("object", attr, m))) return false;
+            if(!class_lookup(mro_of, attr, m, &where, &owner)&&!(owner!="object"&&class_lookup("object", attr, m))
+               &&!object_member(attr, m, nullptr, mro_of)) return false;   // super().__eq__ ... (round 80)
             if(self_v.type==VMType::INSTANCE){ out=bind_member(m, self_v, mro_of); return true; }
             if(m.type==VMType::FUNCTION&&m.code&&m.code->is_classmethod){ out=make_bound(m, self_v, true); return true; }
             if(m.type==VMType::INSTANCE&&descriptor_get(m, VMVal::make_none(), mro_of, out)) return true;
@@ -9402,6 +9574,7 @@ private:
         case VMType::INSTANCE: {
             VMVal m;
             if(class_lookup(obj.class_name, attr, m)){ out=bind_member(m, obj, obj.class_name); return true; }
+            if(object_member(attr, m, nullptr, obj.class_name)){ out=bind_member(m, obj, obj.class_name); return true; }   // round 80
             if(attr=="__class__"){ out=class_value(obj.class_name); return true; }
             if(attr=="__doc__"){
                 auto cr=class_reg_.find(obj.class_name);
@@ -9459,7 +9632,14 @@ private:
         case VMType::CLASS: {
             std::string cname = obj.class_name.empty() ? obj.s : obj.class_name;
             VMVal m;
-            if(class_lookup(cname, attr, m)){
+            // a class's __name__ / __qualname__ is its own, never a base's
+            // namespace entry (round 80: a dataclass(slots=True) base's
+            // __qualname__ named its subclasses)
+            if(attr=="__qualname__"||attr=="__name__"){
+                auto own=class_vars_.find(cname);
+                if(own!=class_vars_.end()){ auto f=own->second.find(attr); if(f!=own->second.end()){ out=f->second; return true; } }
+            }
+            else if(class_lookup(cname, attr, m)||object_member(attr, m, nullptr, cname)){   // object's too (round 80)
                 if(m.type==VMType::FUNCTION&&m.code&&m.code->is_classmethod) out=make_bound(m, obj, true);
                 else if(m.type==VMType::INSTANCE&&descriptor_get(m, VMVal::make_none(), cname, out)) {}
                 else out=m;   // a method read from the class is the plain function
@@ -9480,6 +9660,8 @@ private:
             }
             if(attr=="__module__"){
                 size_t dot=cname.rfind('.');
+                // the builtin exceptions and object are builtins' (round 80)
+                if(dot==std::string::npos&&(cname=="object"||nython::ny_is_builtin_exc(cname))){ out=VMVal::make_str("builtins"); return true; }
                 out=VMVal::make_str(dot==std::string::npos?std::string("__main__"):cname.substr(0,dot)); return true;
             }
             if(attr=="__doc__"){
@@ -10384,6 +10566,14 @@ private:
             if(primitive_member(obj,method,args,pm)) return pm;
             throw_exception(make_exception("AttributeError",{VMVal::make_str("'generator' object has no attribute '"+method+"'")}));
         }
+        // An iterator over a list, a tuple, a str ... (round 80: it.__next__()
+        // and a bound it.__next__ raised AttributeError)
+        if(obj.type==VMType::ITERATOR&&(method=="__next__"||method=="__iter__")){
+            if(method=="__iter__") return obj;
+            VMVal it=obj, v;
+            if(vm_iter_step(it,v)) return v;
+            throw_exception(make_exception("StopIteration",{}));
+        }
         // f.__call__(...): the call itself, for a function, a bound or
         // builtin method (round 78)
         if(method=="__call__"&&(obj.type==VMType::FUNCTION||(obj.type==VMType::MAP&&obj.class_name=="__bound_method__")
@@ -10447,13 +10637,14 @@ private:
                 // sets the exception's args; reaching object, nothing.
                 if(self_v.type==VMType::INSTANCE && self_v.map && is_exception_class(mro_of)){
                     set_exc_args(*self_v.map, self_v.class_name, args);   // and the fields (round 77)
+                    set_exc_kw(*self_v.map, self_v.class_name, kwargs);   // round 80
                 }
                 return VMVal::make_none();
             }
             // past the last base is object, every class's implicit root
             // (super().__setattr__(k, v) ...); otherwise AttributeError, as
             // Python (it returned none)
-            if(class_lookup("object", method, m)) return invoke_method(m, self_v, args, "object", kwargs);
+            if(class_lookup("object", method, m)||object_member(method, m, nullptr, mro_of)) return invoke_method(m, self_v, args, "object", kwargs);   // object's other members too (round 80)
             throw_exception(make_exception("AttributeError",{VMVal::make_str("'super' object has no attribute '"+method+"'")}));
         }
         // obj.m(...) on an object whose class defines __getattribute__: m is
@@ -10492,7 +10683,11 @@ private:
         }
         if(obj.type==VMType::INSTANCE){
             VMVal m;
-            if(class_lookup(obj.class_name, method, m)) return invoke_method(m, obj, args, obj.class_name, kwargs);
+            if(class_lookup(obj.class_name, method, m)){
+                check_callable(m);   // a class's str / int / None attribute (round 80: it gave none)
+                return invoke_method(m, obj, args, obj.class_name, kwargs);
+            }
+            if(object_member(method, m, nullptr, obj.class_name)) return invoke_method(m, obj, args, obj.class_name, kwargs);   // round 80
             // obj[i:j:k] (spelt obj.slice(i, j, k)): __getitem__ gets a slice
             if(method=="slice"&&class_lookup(obj.class_name,"__getitem__",m)){
                 VMVal spec=VMVal::make_list(std::vector<VMVal>(args.begin(),args.end()));
@@ -10555,7 +10750,8 @@ private:
         // (Animal.__init__(self, name)).
         if(obj.type==VMType::CLASS&&obj.code){
             VMVal m;
-            if(class_lookup(obj.class_name, method, m)){
+            if(class_lookup(obj.class_name, method, m)||object_member(method, m, nullptr, obj.class_name)){   // object's too (round 80)
+                check_callable(m);   // round 80
                 if(m.type==VMType::FUNCTION&&m.code){
                     if(m.code->is_classmethod) return invoke_method(m, obj, args, obj.class_name, kwargs);
                     if(m.code->is_static||!m.code->is_method||m.code->bind_first) return call_function(m, args, std::nullopt, kwargs);
@@ -10576,6 +10772,7 @@ private:
                && is_exception_class(obj.class_name)){
                 std::vector<VMVal> rest(args.begin()+1,args.end());
                 set_exc_args(*args[0].map, args[0].class_name, rest);   // and the fields (round 77)
+                set_exc_kw(*args[0].map, args[0].class_name, kwargs);   // round 80
                 return VMVal::make_none();
             }
             // a method of the class's metaclass, or anything else the
@@ -10793,6 +10990,10 @@ private:
                 if(t=="float") return VMVal::make_float(std::strtod(a[0].s.c_str(),nullptr));
                 return VMVal::make_bytes(nycall([&]{ return nypy::bytes_fromhex(a[0].s); }),t=="bytearray");
             }
+            if(m=="maketrans"&&t=="str"){   // round 80: CPython's three forms (the prelude's)
+                if(kw&&kw->type==VMType::MAP&&kw->map&&!kw->map->empty()) raise_native_exception("TypeError","maketrans() takes no keyword arguments");
+                return vm_call(load_var("_ny_str_maketrans"),a,std::nullopt);
+            }
             if(m=="maketrans"){
                 if(a.size()!=2||a[0].type!=VMType::BYTES||a[1].type!=VMType::BYTES) raise_native_exception("TypeError","maketrans expected 2 bytes-like arguments");
                 const std::string& x=a[0].bdata(); const std::string& y=a[1].bdata();
@@ -10922,6 +11123,54 @@ private:
     // ── Import system ───────────────────────────────────────────────────────
     // Modules imported by name, their namespaces (vm_import).
     std::unordered_map<std::string, VMVal> module_ns_;
+    // ── sys.modules (round 80; NythonExecutor's section of the same name) ─
+    // A real dict of the loaded modules, made on first need (the prelude's
+    // _ny_modules()); every module registered afterwards goes in it
+    // (note_module), and an import asks it first (sync_module): a deleted
+    // name is loaded again, an assigned value is what the import binds.
+    VMVal sys_modules_;
+    VMVal sys_modules_value() {
+        if(sys_modules_.type==VMType::MAP&&sys_modules_.map) return sys_modules_;
+        sys_modules_=VMVal::make_map();
+        auto& d=*sys_modules_.map;
+        if(sys_ns_.type==VMType::MAP&&sys_ns_.map) d[nypy::key_of_str("sys")]=sys_ns_;
+        std::vector<VMVal> none;
+        VMVal bm=load_var("_ny_builtins_module");
+        if(bm.type==VMType::FUNCTION) d[nypy::key_of_str("builtins")]=vm_call(bm,none,std::nullopt);
+        VMVal mm=load_var("_NyMainModule");
+        if(mm.type==VMType::CLASS) d[nypy::key_of_str("__main__")]=vm_call(mm,none,std::nullopt);
+        std::vector<std::string> names;
+        for(auto& kv:module_ns_) names.push_back(kv.first);
+        std::sort(names.begin(),names.end());
+        for(auto& n:names) d[nypy::key_of_str(n)]=module_ns_[n];
+        return sys_modules_;
+    }
+    void note_module(const std::string& name, const VMVal& v) {
+        module_ns_[name]=v;
+        if(sys_modules_.type==VMType::MAP&&sys_modules_.map) (*sys_modules_.map)[nypy::key_of_str(name)]=v;
+    }
+    void forget_module(const std::string& name) {
+        module_ns_.erase(name);
+        globals_.erase("__imported_"+name);
+        if(sys_modules_.type==VMType::MAP&&sys_modules_.map) sys_modules_.map->erase(nypy::key_of_str(name));
+    }
+    static bool same_value(const VMVal& a, const VMVal& b) {
+        if(a.type!=b.type) return false;
+        if(a.type==VMType::MAP) return a.map==b.map;
+        if(a.type==VMType::INSTANCE) return a.map==b.map;
+        if(a.type==VMType::CLASS) return a.class_name==b.class_name;
+        return false;
+    }
+    void sync_module(const std::string& name) {
+        if(sys_modules_.type!=VMType::MAP||!sys_modules_.map) return;
+        auto it=sys_modules_.map->find(nypy::key_of_str(name));
+        auto mc=module_ns_.find(name);
+        if(it==sys_modules_.map->end()){
+            if(mc!=module_ns_.end()){ module_ns_.erase(mc); globals_.erase("__imported_"+name); }
+            return;
+        }
+        if(mc==module_ns_.end()||!same_value(mc->second,it->second)) module_ns_[name]=it->second;
+    }
 
     static void tag_module_code(const std::shared_ptr<VMCode>& c, const std::shared_ptr<VMMap>& env) {
         if(!c || c->module_env==env) return;
@@ -10931,6 +11180,17 @@ private:
     }
     // `from m import a, b` / `*` (see the interpreter's bindFromNamespace).
     void bind_from_namespace(const VMVal& nsv, const std::vector<std::string>& names, const std::string& module_name) {
+        if((nsv.type!=VMType::MAP || !nsv.map) && nsv.type!=VMType::NONE && !(names.size()==1&&names[0]=="*")){
+            // round 80: any object put in sys.modules - its attributes
+            for(auto& entry:names){
+                auto [n, bound]=nyrt::import_name_alias(entry);
+                VMVal v;
+                if(!try_get_attr(nsv,n,v))
+                    throw_exception(make_exception("ImportError",{VMVal::make_str("cannot import name '"+n+"' from '"+module_name+"'")}));
+                define_var(bound,v);
+            }
+            return;
+        }
         if(nsv.type!=VMType::MAP || !nsv.map)
             throw_exception(make_exception("ImportError",{VMVal::make_str("cannot import from \""+module_name+"\"")}));
         auto& ns=*nsv.map;
@@ -10965,9 +11225,26 @@ private:
     // module scope as it was when the module finished - or the names asked
     // for. A quoted import still includes the file (export_to_globals_).
     // ── packages (round 77; NythonExecutor's findModulePath/importDotted)
+    // round 80: sys.path's entries (sys.path.insert(0, d) is searched), each
+    // ending with a separator
+    std::vector<std::string> sys_path_dirs() {
+        std::vector<std::string> dirs;
+        if(sys_ns_.type==VMType::MAP&&sys_ns_.map){
+            auto pit=sys_ns_.map->find("path");
+            if(pit!=sys_ns_.map->end()&&pit->second.type==VMType::LIST&&pit->second.list)
+                for(auto& e:*pit->second.list){
+                    if(e.type!=VMType::STRING||e.s.empty()) continue;
+                    std::string d=e.s;
+                    if(d.back()!='/'&&d.back()!='\\') d+='/';
+                    dirs.push_back(d);
+                }
+        }
+        return dirs;
+    }
     std::vector<std::string> module_dirs() {
         std::vector<std::string> dirs;
         if(!script_dir_.empty()){ dirs.push_back(script_dir_); dirs.push_back(script_dir_+"lib/"); }
+        for(auto& d:sys_path_dirs()) dirs.push_back(d);   // round 80
         for(const char* d:{"","./","lib/","./lib/"}) dirs.push_back(d);
         dirs.push_back(cwd_+"/"); dirs.push_back(cwd_+"/lib/");
         std::string d=script_dir_;
@@ -11009,6 +11286,7 @@ private:
         return dir || (p.size()>12 && p.compare(p.size()-12,12,"/__init__.ny")==0);
     }
     VMVal load_module(const std::string& dotted) {
+        sync_module(dotted);   // round 80
         auto it=module_ns_.find(dotted);
         if(it!=module_ns_.end()) return it->second;
         bool dir=false;
@@ -11018,7 +11296,7 @@ private:
             auto nsmap=std::make_shared<VMMap>(); vmgc::track_map(nsmap);
             (*nsmap)["__name__"]=VMVal::make_str(dotted);
             VMVal nsv=VMVal::make_map(); nsv.map=nsmap; nsv.class_name=dotted;
-            module_ns_[dotted]=nsv;
+            note_module(dotted,nsv);   // round 80: sys.modules too
             return nsv;
         }
         return load_module_file(path, dotted);
@@ -11069,7 +11347,9 @@ private:
         if(!from_names.empty()) bind_from_namespace(nsv, from_names, name);
         else if(!bind_as.empty()) define_var(bind_as, nsv);
     }
-    VMVal load_module_file(const std::string& filepath, const std::string& name) {
+    // `into` (round 80): an existing module namespace to run the file in -
+    // importlib.reload(m), a loader's exec_module(m).
+    VMVal load_module_file(const std::string& filepath, const std::string& name, const VMVal* into=nullptr) {
         auto source=nython::reader::SourceCode(filepath);
         auto reporter=std::make_shared<nython::exception::Reporter>(source);
         auto lx=std::make_shared<nython::lexer::Lexer>(source);
@@ -11080,9 +11360,18 @@ private:
         nython::scope::qualify_module_classes(ast, name);
         prelude_asts_.push_back(ast);    // kept alive with the code
         Compiler c; auto code=c.compile(ast);
-        auto env=std::make_shared<VMMap>(); vmgc::track_map(env);
+        std::shared_ptr<VMMap> env;
+        if(into&&into->type==VMType::MAP&&into->map) env=into->map;
+        else { env=std::make_shared<VMMap>(); vmgc::track_map(env); }
         (*env)["__name__"]=VMVal::make_str(name);
         (*env)["__file__"]=VMVal::make_str(filepath);
+        {   // round 80: __package__ (relative imports, importlib) and a package's __path__
+            bool pkg=filepath.size()>=12&&filepath.compare(filepath.size()-11,11,"__init__.ny")==0
+                     &&(filepath[filepath.size()-12]=='/'||filepath[filepath.size()-12]=='\\');
+            size_t dot=name.rfind('.');
+            (*env)["__package__"]=VMVal::make_str(pkg?name:dot==std::string::npos?std::string():name.substr(0,dot));
+            if(pkg) (*env)["__path__"]=VMVal::make_list({VMVal::make_str(filepath.substr(0,filepath.size()-12))});
+        }
         tag_module_code(code, env);
         code->module_top=true;
         // Registered before the module runs, so a circular import binds it.
@@ -11090,16 +11379,47 @@ private:
         // object stays live (a `global` rebinding inside it is what importers
         // read, `mod.x = v` from outside is what its code sees), as Python's.
         VMVal nsv=VMVal::make_map(); nsv.map=env; nsv.class_name=name;
-        module_ns_[name]=nsv;
+        if(into) nsv=*into;
+        else note_module(name,nsv);   // round 80: sys.modules too (not for exec_module / reload)
         bool old_exp=export_to_globals_; int old_depth=export_depth_;
         export_to_globals_=false; export_depth_=-1;
         struct Restore { VirtualMachine* vm; bool e; int d;
             ~Restore(){ vm->export_to_globals_=e; vm->export_depth_=d; } } restore{this, old_exp, old_depth};
         try{ exec_code(code,{},std::nullopt); }
         catch(VMReturn&){}
-        catch(...){ module_ns_.erase(name); globals_.erase("__imported_"+name); throw; }
+        catch(...){ if(!into) forget_module(name); throw; }
         for(auto& sub:code->sub_codes) if(sub->is_class&&!class_reg_.count(sub->name)) class_reg_[sub->name]=sub;   // keep the class MAKE_CLASS made (a copy for metaclass= / expression bases), round 77
         return nsv;
+    }
+    // A relative import's module (round 80: `from .m import x`, `from ..
+    // import y` - the parser keeps the dots in the name): CPython's
+    // _calc___package__ and _resolve_name over the importing module's
+    // __package__, else its __name__ (a package's own when it has __path__).
+    std::string resolve_relative_import(const std::string& rel) {
+        size_t level=0;
+        while(level<rel.size()&&rel[level]=='.') level++;
+        std::string rest=rel.substr(level), package;
+        auto read=[&](const char* n){ return name_bound(n) ? load_var(n) : VMVal::make_none(); };
+        VMVal pk=read("__package__");
+        if(pk.type==VMType::STRING) package=pk.s;
+        else {
+            VMVal nm=read("__name__");
+            if(nm.type==VMType::STRING){
+                package=nm.s;
+                VMVal pth=read("__path__");
+                if(pth.type==VMType::NONE||pth.type==VMType::UNDEFINED){
+                    size_t c=package.rfind('.');
+                    package=c==std::string::npos?std::string():package.substr(0,c);
+                }
+            }
+        }
+        if(package.empty()) throw_exception(make_exception("ImportError",{VMVal::make_str("attempted relative import with no known parent package")}));
+        for(size_t i=1;i<level;i++){
+            size_t c=package.rfind('.');
+            if(c==std::string::npos) throw_exception(make_exception("ImportError",{VMVal::make_str("attempted relative import beyond top-level package")}));
+            package=package.substr(0,c);
+        }
+        return rest.empty()?package:package+"."+rest;
     }
     void vm_import(const std::string& raw_name_in) {
         std::string tried_paths;
@@ -11138,7 +11458,9 @@ private:
         if(name.size()>=2&&(name[0]=='"'||name[0]=='\'')){
             name=name.substr(1,name.size()-2);
         }
+        if(bare&&!name.empty()&&name[0]=='.') name=resolve_relative_import(name);   // round 80
         std::string guard_key = "__imported_"+name;
+        if(bare) sync_module(name);   // round 80: sys.modules first
         {
             // a module runs once: a later import (named or aliased) binds the
             // namespace its first import made
@@ -11214,7 +11536,7 @@ private:
         }
         if(name=="shell"||name=="sh"){ return; }
         if(name=="sys"){
-            define_sys_module(alias.empty()?std::string("sys"):alias);
+            define_sys_module(alias.empty()?std::string("sys"):alias, from_names.empty());
             // from sys import stdout, maxsize: the one sys namespace's
             if(!from_names.empty()) bind_from_namespace(sys_ns_, from_names, "sys");
             return;
@@ -11224,8 +11546,9 @@ private:
             // is cached so later imports, from any module, bind it
             register_math_builtins();
             VMVal mns=define_math_module(alias.empty()?std::string("math"):alias);
-            module_ns_["math"]=mns;
+            note_module("math",mns);   // round 80: sys.modules too
             if(!from_names.empty()) bind_from_namespace(mns, from_names, "math");
+            else define_var(alias.empty()?std::string("math"):alias, mns);   // the importing scope (round 80)
             return;
         }
         if(name=="time"){ return; }
@@ -11302,10 +11625,11 @@ private:
                 // engine and not the other — the same file, the same import,
                 // two different answers.
                 script_dir_+name+".ny", script_dir_+name, script_dir_+"lib/"+name+".ny",
-                name+".ny",name,"./"+name+".ny",
-                cwd_+"/"+name+".ny","lib/"+name+".ny","./lib/"+name+".ny",
-                cwd_+"/lib/"+name+".ny",
             };
+            for(auto& d:sys_path_dirs()) paths.push_back(d+name+".ny");   // round 80: sys.path
+            for(const std::string& extra:{name+".ny",name,"./"+name+".ny",
+                                          cwd_+"/"+name+".ny","lib/"+name+".ny","./lib/"+name+".ny",
+                                          cwd_+"/lib/"+name+".ny"}) paths.push_back(extra);
             for(auto& c:ancestors(name+".ny")) paths.push_back(c);
             for(auto& c:ancestors(name)) paths.push_back(c);
             for(auto& d:nyrt::library_dirs()) paths.push_back(d+name+".ny");
@@ -11324,6 +11648,9 @@ private:
             // catches what Op::RAISE throws, which is runtime_error. Throwing a
             // std::string unwound straight out of run_loop, so an import error
             // was uncatchable on this engine while the interpreter caught it.
+            // `import name`: Python's ModuleNotFoundError (round 80); a quoted
+            // import keeps the paths it tried
+            if(bare) throw std::runtime_error("__exc__:ModuleNotFoundError:No module named '" + name + "'");
             throw std::runtime_error("__exc__:ImportError:cannot find module \"" + raw_name
                                      + "\" (looked in: " + tried_paths + ")");
         }
@@ -11908,6 +12235,35 @@ private:
         globals_["_ny_getprofile"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return vm_get_hook(false); });
         globals_["_ny_frame_local_set"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return frame_local_set(a); });
         globals_["_ny_main_globals"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return main_globals_map(); });
+        // round 80: sys.modules and importlib's natives (the interpreter's
+        // NythonExecutor::sysModulesValue / moduleNew / moduleExec / findModule)
+        globals_["_ny_modules"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return sys_modules_value(); });
+        globals_["_ny_module_new"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            std::string name=a.empty()?std::string():vm_str(a[0]);
+            auto env=std::make_shared<VMMap>(); vmgc::track_map(env);
+            (*env)["__name__"]=VMVal::make_str(name);
+            VMVal nsv=VMVal::make_map(); nsv.map=env; nsv.class_name=name.empty()?std::string("module"):name;
+            return nsv;
+        });
+        globals_["_ny_module_exec"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            // (module, path, name): the file run as that module, in its namespace
+            if(a.size()<3||a[0].type!=VMType::MAP||!a[0].map) raise_native_exception("TypeError","_ny_module_exec(module, path, name)");
+            VMVal m=a[0];
+            std::string path=vm_str(a[1]), name=vm_str(a[2]);
+            struct stat st;
+            if(::stat(path.c_str(),&st)!=0) raise_native_exception("FileNotFoundError","[Errno 2] No such file or directory: '"+path+"'");
+            if(m.class_name.empty()||m.class_name=="module") m.class_name=name;
+            load_module_file(path,name,&m);
+            return m;
+        });
+        globals_["_ny_find_module"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            // [path, kind]: kind "file", "package", "namespace" or "" (none)
+            std::string name=a.empty()?std::string():vm_str(a[0]);
+            bool dir=false;
+            std::string p=name.empty()?std::string():find_module_path(name,&dir);
+            std::string kind=p.empty()?"":dir?"namespace":(p.size()>12&&p.compare(p.size()-12,12,"/__init__.ny")==0)?"package":"file";
+            return VMVal::make_list({VMVal::make_str(p),VMVal::make_str(kind)});
+        });
         globals_["locals"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return vm_locals_map(); });
         globals_["vars"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_vars(a); });
         globals_["dir"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_dir(a); });
@@ -12180,8 +12536,9 @@ private:
         (*ns.map)["tau"]=VMVal::make_float(6.28318530717958647692);
         (*ns.map)["inf"]=VMVal::make_float(std::numeric_limits<double>::infinity());
         (*ns.map)["nan"]=VMVal::make_float(std::numeric_limits<double>::quiet_NaN());
-        ns.class_name=as_name;
-        globals_[as_name]=ns;
+        (*ns.map)["__name__"]=VMVal::make_str("math");
+        ns.class_name="math";   // round 80: its name, not the alias it is bound as
+        (void)as_name;          // vm_import binds it (define_var), round 80
         return ns;
     }
 
@@ -12371,6 +12728,19 @@ private:
         return VMVal::make_native([obj,m,vm](std::vector<VMVal>& a)->VMVal{
             VMVal kw=take_kwargs(a);
             if(m=="format") return VMVal::make_str(vm->str_format(obj.s,a,kw.type==VMType::MAP?&kw:nullptr));
+            // round 80: str.translate / str.maketrans (the prelude's: the
+            // table is any mapping, read with __getitem__)
+            if(m=="translate"||m=="maketrans"){
+                if(kw.type==VMType::MAP&&kw.map&&!kw.map->empty())
+                    vm->raise_native_exception("TypeError","str."+m+"() takes no keyword arguments");
+                std::vector<VMVal> args2;
+                if(m=="translate"){
+                    if(a.size()!=1) vm->raise_native_exception("TypeError","str.translate() takes exactly one argument ("+std::to_string(a.size())+" given)");
+                    args2.push_back(obj);
+                }
+                for(auto& x:a) args2.push_back(x);
+                return vm->vm_call(vm->load_var(m=="translate"?"_ny_str_translate":"_ny_str_maketrans"),args2,std::nullopt);
+            }
             if(m=="format_map"){
                 VMVal mp=a.empty()?VMVal::make_none():a[0];
                 std::vector<VMVal> none;
