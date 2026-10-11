@@ -399,7 +399,7 @@ Value os_call_ext(NythonExecutor& E, const std::string& op, std::vector<Value>& 
         int fd = fd_arg(E, A(0));
         long long n = I(1, 0);
 #ifdef _WIN32
-        if (::_chsize_s(fd, n) != 0) raise_errno(errno, "");
+        if (::_chsize(fd, (long)n) != 0) raise_errno(errno, "");
 #else
         if (::ftruncate(fd, (off_t)n) != 0) raise_errno(errno, "");
 #endif
@@ -411,7 +411,7 @@ Value os_call_ext(NythonExecutor& E, const std::string& op, std::vector<Value>& 
 #ifdef _WIN32
         int fd = ::_wopen(widen(p).c_str(), _O_WRONLY | _O_BINARY);
         if (fd < 0) raise_errno(errno, p);
-        int rc = ::_chsize_s(fd, n);
+        int rc = ::_chsize(fd, (long)n);
         int e = errno;
         ::_close(fd);
         if (rc != 0) raise_errno(e, p);
@@ -457,9 +457,13 @@ Value os_call_ext(NythonExecutor& E, const std::string& op, std::vector<Value>& 
     }
     if (op == "getlogin") {
 #ifdef _WIN32
+        // GetUserNameW, looked up at run time (advapi32 is not linked)
+        typedef BOOL (WINAPI *GetUserNameW_t)(LPWSTR, LPDWORD);
+        HMODULE adv = LoadLibraryA("advapi32.dll");
+        GetUserNameW_t gun = adv ? (GetUserNameW_t)(void*)GetProcAddress(adv, "GetUserNameW") : nullptr;
         wchar_t buf[257];
         DWORD n = 257;
-        if (!GetUserNameW(buf, &n)) raise_errno(win_errno(GetLastError()), "");
+        if (!gun || !gun(buf, &n)) raise_errno(gun ? win_errno(GetLastError()) : ENOSYS, "");
         int k = WideCharToMultiByte(CP_UTF8, 0, buf, -1, nullptr, 0, nullptr, nullptr);
         std::string s((size_t)(k > 0 ? k - 1 : 0), '\0');
         if (k > 1) WideCharToMultiByte(CP_UTF8, 0, buf, -1, &s[0], k, nullptr, nullptr);
@@ -503,8 +507,11 @@ Value os_call_ext(NythonExecutor& E, const std::string& op, std::vector<Value>& 
         HANDLE h = FindFirstFileW(pat.c_str(), &fd);
         if (h == INVALID_HANDLE_VALUE) {
             DWORD e = GetLastError();
+            DWORD attr = GetFileAttributesW(widen(p).c_str());
+            if (attr == INVALID_FILE_ATTRIBUTES) raise_errno(ENOENT, p);
+            if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) raise_errno(ENOTDIR, p);
             if (e == ERROR_FILE_NOT_FOUND) return make_list(E, out);
-            raise_errno(e == ERROR_DIRECTORY ? ENOTDIR : win_errno(e), p);
+            raise_errno(win_errno(e), p);
         }
         do {
             std::wstring wn = fd.cFileName;

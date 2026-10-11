@@ -265,8 +265,6 @@ _varsub = [None, None]
 
 
 def expandvars(path):
-    """Expand shell variables of form $var and ${var}.  Unknown variables
-    are left unchanged."""
     path = os.fspath(path)
     var subf = None
     var start = None
@@ -307,6 +305,10 @@ def expandvars(path):
             return m[0]
 
     return subf(repl, path)
+
+
+# (a string literal holding "$" "{" would be Nython interpolation)
+expandvars.__doc__ = "Expand shell variables of form $var and $" + "{var}.  Unknown variables\n    are left unchanged."
 
 
 def normpath(path):

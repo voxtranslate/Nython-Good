@@ -31,22 +31,20 @@ class struct_passwd(_NyStructSeq):
     n_unnamed_fields = 0
 
 
-def _uid(uid, fn):
-    if isinstance(uid, bool) or not isinstance(uid, int):
-        if hasattr(uid, "__index__"):
-            return uid.__index__()
-        raise TypeError("'" + type(uid).__name__ + "' object cannot be interpreted as an integer")
-    return uid
-
-
 def getpwuid(uid):
     """Return the password database entry for the given numeric user ID."""
-    uid = _uid(uid, "getpwuid")
+    if not isinstance(uid, int):
+        if hasattr(uid, "__index__") and not isinstance(uid, float):
+            uid = uid.__index__()
+        else:
+            raise TypeError("uid should be integer, not " + type(uid).__name__)
     var t = None
-    if -2147483648 <= uid <= 4294967295:
-        t = _ny_os_call("getpwuid", uid)
+    if -1 <= uid <= 4294967295:
+        t = _ny_os_call("getpwuid", int(uid))
+    else:
+        raise KeyError("getpwuid(): uid not found")
     if t is None:
-        raise KeyError("getpwuid(): uid not found: " + str(uid))
+        raise KeyError("getpwuid(): uid not found: " + str(int(uid)))
     return struct_passwd(t)
 
 

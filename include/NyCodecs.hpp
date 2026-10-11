@@ -703,10 +703,13 @@ struct CxEncoder {
             if (c == Cx::UTF32) out += std::string("\xFF\xFE\0\0", 4);
         }
         size_t n = cps.size(), i = pos;
+        // UTF-16/32 report each unencodable character on its own (CPython's
+        // encoders); the others a run of them
+        bool single = cx_is_utf16(c) || cx_is_utf32(c);
         while (i < n) {
             if (can(cps[i])) { put(cps[i]); i++; continue; }
             size_t b = i + 1;
-            while (b < n && !can(cps[b])) b++;
+            while (!single && b < n && !can(cps[b])) b++;
             if (!bad(i, b)) return i;
             i = b;
         }

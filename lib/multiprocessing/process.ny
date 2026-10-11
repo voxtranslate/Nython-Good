@@ -308,13 +308,12 @@ class _ParentProcess(BaseProcess):
     def is_alive(self):
         if self._pid is None:
             return False
+        # the runtime's os_kill: signal 0 (on Windows a query, where
+        # os.kill(pid, 0) would end the process, as CPython's)
         try:
-            os.kill(self._pid, 0)
-            return True
-        except OSError:
-            return False
+            return bool(os_kill(self._pid, 0))
         except Exception:
-            return True
+            return False
 
     @property
     def ident(self):
@@ -421,7 +420,8 @@ class _Popen(object):
         self._send_signal(15)
 
     def kill(self):
-        self._send_signal(9)
+        # Windows: the same as terminate (exit code -15), as CPython's
+        self._send_signal(15 if os.name == "nt" else 9)
 
     def close(self):
         pass

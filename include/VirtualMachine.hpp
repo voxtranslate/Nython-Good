@@ -3620,6 +3620,18 @@ public:
             }
             VMVal mode=args.size()>1?args[1]:kwget("mode");
             if(mode.type==VMType::NONE) mode=VMVal::make_str("r");
+            {
+                // open(fd) and opener= (round 80): the prelude's _ny_open_fd
+                VMVal opener_fn=args.size()>7?args[7]:kwget("opener");
+                if(path.type==VMType::INT||opener_fn.type!=VMType::NONE){
+                    VMVal cfd=args.size()>6?args[6]:kwget("closefd");
+                    if(cfd.type==VMType::NONE) cfd=VMVal::make_bool(true);
+                    VMVal enc0=args.size()>3?args[3]:kwget("encoding");
+                    VMVal nl0=args.size()>5?args[5]:kwget("newline");
+                    std::vector<VMVal> fa={path,mode,enc0,nl0,cfd,opener_fn};
+                    return vm_call(load_var("_ny_open_fd"),fa,std::nullopt);
+                }
+            }
             // open(file, mode, buffering, encoding, errors, newline), Python's
             // order; newline= as the prelude's open (NythonFile.newline):
             // an explicit one opens the handle raw (round 77)

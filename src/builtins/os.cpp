@@ -498,6 +498,25 @@ Value stat_map(NythonExecutor& E, const struct stat* st, bool link, const std::s
 #else
     (void)path;
 #endif
+    long long ino = ok ? (long long)st->st_ino : 0, dev = ok ? (long long)st->st_dev : 0, nlink = ok ? (long long)st->st_nlink : 0;
+#ifdef _WIN32
+    // (round 80) the file index, volume serial and link count, as CPython's
+    // os.stat on Windows: the C runtime's _stat gives 0, 0 and 1, so
+    // os.path.samefile / samestat and DirEntry.inode could not tell files apart
+    if (ok && path) {
+        HANDLE h = CreateFileW(widen_os(*path).c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            BY_HANDLE_FILE_INFORMATION fi;
+            if (GetFileInformationByHandle(h, &fi)) {
+                ino = (long long)(((unsigned long long)fi.nFileIndexHigh << 32) | fi.nFileIndexLow);
+                dev = (long long)fi.dwVolumeSerialNumber;
+                nlink = (long long)fi.nNumberOfLinks;
+            }
+            CloseHandle(h);
+        }
+    }
+#endif
     std::vector<std::pair<std::string, Value>> m = {
         {"exists",  Value(ok)},
         {"size",    make_int(ok ? (long long)st->st_size : 0)},
@@ -512,9 +531,9 @@ Value stat_map(NythonExecutor& E, const struct stat* st, bool link, const std::s
         {"permissions", make_int(ok ? (long long)(st->st_mode & 07777) : 0)},
         {"uid",     make_int(ok ? (long long)st->st_uid : 0)},
         {"gid",     make_int(ok ? (long long)st->st_gid : 0)},
-        {"nlink",   make_int(ok ? (long long)st->st_nlink : 0)},
-        {"ino",     make_int(ok ? (long long)st->st_ino : 0)},
-        {"dev",     make_int(ok ? (long long)st->st_dev : 0)},
+        {"nlink",   make_int(nlink)},
+        {"ino",     make_int(ino)},
+        {"dev",     make_int(dev)},
     };
     // os.stat_result's st_*_ns, st_blocks, st_blksize, st_rdev (round 77):
     // the times exactly, in nanoseconds

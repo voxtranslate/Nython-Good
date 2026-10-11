@@ -656,6 +656,27 @@ class _SValue:
         self.value = value
 
 
+# a container's protocol methods, as operations (getattr(list, "__len__")
+# is not a bound method on every engine)
+def _op_setitem(o, k, v):
+    o[k] = v
+
+
+def _op_delitem(o, k):
+    del o[k]
+
+
+def _op_imul(o, n):
+    o *= n
+    return None
+
+
+_OPERATORS = {"__len__": len, "__getitem__": lambda o, k: o[k], "__setitem__": _op_setitem,
+              "__delitem__": _op_delitem, "__contains__": lambda o, k: k in o, "__repr__": repr, "__str__": str,
+              "__add__": lambda o, x: o + x, "__mul__": lambda o, n: o * n, "__rmul__": lambda o, n: n * o,
+              "__imul__": _op_imul, "__reversed__": lambda o: list(reversed(o))}
+
+
 # the server-side types: owner-aware (a sync primitive's methods take the
 # caller first) or plain (a Manager's dict, list ...)
 _OWNER_TYPES = {"Lock": lambda srv, *a: _SLock(False), "RLock": lambda srv, *a: _SLock(True),
@@ -798,6 +819,8 @@ class Server:
             var kw = req[4] if len(req) > 4 else {}
             if self.kinds.get(req[1]) == "Namespace" and name in ("__getattr__", "__setattr__", "__delattr__"):
                 name = {"__getattr__": "getattr_", "__setattr__": "setattr_", "__delattr__": "delattr_"}[name]
+            if name in _OPERATORS:
+                return _OPERATORS[name](obj, *args)
             return getattr(obj, name)(*args, **kw)
         if op == "create":
             var kind = req[1]

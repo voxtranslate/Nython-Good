@@ -1368,41 +1368,46 @@ def _ny_codec_decode(b, encoding, errors):
     import codecs
     return codecs._ny_text_decode(b, encoding, errors)
 
-def open(path, mode="r", buffering=-1, encoding="utf-8", errors=none, newline=none, closefd=true, opener=none):
-    # Python's parameters in Python's order (round 77: encoding was third)
-    if hasattr(path, "__fspath__"):
-        path = path.__fspath__()
+def _ny_open_fd(path, mode, encoding, newline, closefd, opener):
+    # open(fd) and open(path, opener=f) (round 80; the VM's open calls this
+    # for them too)
     if isinstance(path, int) and not isinstance(path, bool):
-        # a file descriptor (round 80): its own file object, which closes
-        # the descriptor unless closefd is false
+        # a file descriptor: its own file object, which closes the
+        # descriptor unless closefd is false
         var fd = path if closefd else _ny_os_call("dup", path)
         var ff = NythonFile(path, mode, _ny_os_call("fdopen", fd, mode), encoding if encoding is not none else "utf-8")
         ff.newline = newline
         return ff
-    if opener is not none:
-        # open(path, mode, opener=f): f(path, flags) gives the descriptor (round 80)
-        var flags = 0
-        var plus = "+" in mode
-        var oc = {}
-        for kv in _ny_os_call("constants"):
-            oc[kv[0]] = kv[1]
-        if "r" in mode:
-            flags = oc["O_RDWR"] if plus else oc["O_RDONLY"]
-        else:
-            flags = oc["O_RDWR"] if plus else oc["O_WRONLY"]
-            flags = flags | oc["O_CREAT"]
-            if "w" in mode:
-                flags = flags | oc["O_TRUNC"]
-            if "a" in mode:
-                flags = flags | oc["O_APPEND"]
-            if "x" in mode:
-                flags = flags | oc["O_EXCL"]
-        if "b" in mode and "O_BINARY" in oc:
-            flags = flags | oc["O_BINARY"]
-        var ofd = opener(path, flags)
-        var fo = NythonFile(path, mode, _ny_os_call("fdopen", ofd, mode), encoding if encoding is not none else "utf-8")
-        fo.newline = newline
-        return fo
+    # open(path, mode, opener=f): f(path, flags) gives the descriptor
+    var flags = 0
+    var plus = "+" in mode
+    var oc = {}
+    for kv in _ny_os_call("constants"):
+        oc[kv[0]] = kv[1]
+    if "r" in mode:
+        flags = oc["O_RDWR"] if plus else oc["O_RDONLY"]
+    else:
+        flags = oc["O_RDWR"] if plus else oc["O_WRONLY"]
+        flags = flags | oc["O_CREAT"]
+        if "w" in mode:
+            flags = flags | oc["O_TRUNC"]
+        if "a" in mode:
+            flags = flags | oc["O_APPEND"]
+        if "x" in mode:
+            flags = flags | oc["O_EXCL"]
+    if "b" in mode and "O_BINARY" in oc:
+        flags = flags | oc["O_BINARY"]
+    var ofd = opener(path, flags)
+    var fo = NythonFile(path, mode, _ny_os_call("fdopen", ofd, mode), encoding if encoding is not none else "utf-8")
+    fo.newline = newline
+    return fo
+
+def open(path, mode="r", buffering=-1, encoding="utf-8", errors=none, newline=none, closefd=true, opener=none):
+    # Python's parameters in Python's order (round 77: encoding was third)
+    if hasattr(path, "__fspath__"):
+        path = path.__fspath__()
+    if (isinstance(path, int) and not isinstance(path, bool)) or opener is not none:
+        return _ny_open_fd(path, mode, encoding, newline, closefd, opener)
     if "b" in mode and encoding != "utf-8" and encoding is not none:
         raise ValueError("binary mode doesn't take an encoding argument")
     if newline is not none and not (newline == "" or newline == "\n" or newline == "\r" or newline == "\r\n"):

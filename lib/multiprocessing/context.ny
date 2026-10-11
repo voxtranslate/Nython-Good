@@ -167,12 +167,15 @@ class BaseContext(object):
 
 
 Process = _process.Process
-SpawnProcess = _process.Process
+
+
+class SpawnProcess(_process.Process):
+    _start_method = 'spawn'
 
 
 class SpawnContext(BaseContext):
     _name = 'spawn'
-    Process = _process.Process
+    Process = SpawnProcess
 
 
 class DefaultContext(BaseContext):

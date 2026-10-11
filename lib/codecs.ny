@@ -552,7 +552,7 @@ def namereplace_errors(exc):
         raise TypeError("don't know how to handle " + type(exc).__name__ + " in error callback")
     var out = []
     for c in exc.object[exc.start:exc.end]:
-        var nm = _ny_unicode_name(ord(c))
+        var nm = _ny_unicode_name(c)
         out.append("\\N{" + nm + "}" if nm else _bs(ord(c)))
     return ("".join(out), exc.end)
 

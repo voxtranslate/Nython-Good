@@ -31,16 +31,18 @@ class struct_group(_NyStructSeq):
 
 def getgrgid(id):
     """Return the group database entry for the given numeric group ID."""
-    if isinstance(id, bool) or not isinstance(id, int):
-        if hasattr(id, "__index__"):
+    if not isinstance(id, int):
+        if hasattr(id, "__index__") and not isinstance(id, float):
             id = id.__index__()
         else:
-            raise TypeError("'" + type(id).__name__ + "' object cannot be interpreted as an integer")
-    var t = None
-    if -2147483648 <= id <= 4294967295:
-        t = _ny_os_call("getgrgid", id)
+            raise TypeError("gid should be integer, not " + type(id).__name__)
+    if id < -1:
+        raise OverflowError("gid is less than minimum")
+    if id > 4294967295:
+        raise OverflowError("gid is greater than maximum")
+    var t = _ny_os_call("getgrgid", int(id))
     if t is None:
-        raise KeyError("getgrgid(): gid not found: " + str(id))
+        raise KeyError("getgrgid(): gid not found: " + str(int(id)))
     return struct_group(t)
 
 
