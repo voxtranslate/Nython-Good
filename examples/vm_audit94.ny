@@ -1,6 +1,6 @@
 # vm_audit94.ny - text formats and utility modules (round 79), both engines:
 # difflib, shlex, configparser, tomllib, html (escape/unescape,
-# html.parser, html.entities), xml.etree.ElementTree / ElementPath and
+# html.parser, html.entities), xml.etree.ElementTree / ElementPath, xml.dom.minidom and
 # xml.parsers.expat, ipaddress, graphlib, contextvars (per thread and per
 # asyncio task), concurrent.futures (ThreadPoolExecutor and
 # ProcessPoolExecutor), zoneinfo, mimetypes.
@@ -468,6 +468,40 @@ check('expat namespaces', (lambda log, p: (setattr(p, 'StartElementHandler', lam
       [('ns', None, 'u'), ('ns', 'p', 'v'), ('s', 'u a', {'v x': '1'}), ('s', 'v b', {})])
 check('expat errors', [expat.ErrorString(7), expat.errors.XML_ERROR_SYNTAX, expat.errors.codes['mismatched tag'], err(lambda: expat.ParserCreate().Parse('<a></b>', True))],
       ['mismatched tag', 'syntax error', 7, 'ExpatError: mismatched tag: line 1, column 5'])
+
+# ── xml.dom.minidom ──────────────────────────────────────────────────────────
+import xml.dom
+from xml.dom import minidom
+mdoc = minidom.parseString("<a x='1'><b>hi</b><b/><!--c--><?pi d?><c xmlns='urn:c'><d/></c></a>")
+mimpl = minidom.getDOMImplementation()
+ndoc = mimpl.createDocument(None, "root", None)
+ntop = ndoc.documentElement
+nitem = ndoc.createElement("item")
+nitem.setAttribute("k", "v<&>\"")
+nitem.appendChild(ndoc.createTextNode("text & <stuff>"))
+ntop.appendChild(nitem)
+ntop.appendChild(ndoc.createComment("note"))
+ntop.appendChild(ndoc.createCDATASection("raw <x>"))
+ndoc_xml = ndoc.toxml()
+ndoc_pretty = ndoc.toprettyxml(indent="\t", newl="\n", encoding="utf-8")
+ntypes = [n.nodeType for n in ntop.childNodes]
+ntop.removeChild(ntop.lastChild)
+nclone = ntop.cloneNode(True)
+norm = minidom.parseString("<p>a<b>b</b>c</p>")
+norm.documentElement.normalize()
+mdt = minidom.parseString('<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html/>')
+check('parseString, toxml', [[b.toxml() for b in mdoc.getElementsByTagName('b')], mdoc.toxml()],
+      [['<b>hi</b>', '<b/>'], '<?xml version="1.0" ?><a x="1"><b>hi</b><b/><!--c--><?pi d?><c xmlns="urn:c"><d/></c></a>'])
+check('toprettyxml', mdoc.toprettyxml(indent='  '),
+      '<?xml version="1.0" ?>\n<a x="1">\n  <b>hi</b>\n  <b/>\n  <!--c-->\n  <?pi d?>\n  <c xmlns="urn:c">\n    <d/>\n  </c>\n</a>\n')
+check('elements, attributes, namespaces', [mdoc.documentElement.tagName, mdoc.documentElement.getAttribute('x'), mdoc.documentElement.hasAttribute('y'), mdoc.getElementsByTagName('c')[0].namespaceURI, mdoc.getElementsByTagName('d')[0].localName, len(mdoc.documentElement.childNodes), minidom.parseString("<r a='1' b='2'/>").documentElement.attributes.items()],
+      ['a', '1', False, 'urn:c', 'd', 5, [('a', '1'), ('b', '2')]])
+check('building a document', [ndoc_xml, ndoc_pretty, ntypes, xml.dom.Node.ELEMENT_NODE, nclone.toxml(), ntop.isSameNode(nclone)],
+      ['<?xml version="1.0" ?><root><item k="v&lt;&amp;&gt;&quot;">text &amp; &lt;stuff&gt;</item><!--note--><![CDATA[raw <x>]]></root>', b'<?xml version="1.0" encoding="utf-8"?>\n<root>\n\t<item k="v&lt;&amp;&gt;&quot;">text &amp; &lt;stuff&gt;</item>\n\t<!--note-->\n<![CDATA[raw <x>]]></root>\n', [1, 8, 4], 1, '<root><item k="v&lt;&amp;&gt;&quot;">text &amp; &lt;stuff&gt;</item><!--note--></root>', False])
+check('normalize, doctype', [[n.nodeValue for n in norm.documentElement.childNodes], mdt.doctype.name, mdt.doctype.publicId, mdt.doctype.systemId, mdt.toxml()],
+      [['a', None, 'c'], 'html', '-//W3C//DTD XHTML 1.0 Strict//EN', 'http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd', '<?xml version="1.0" ?><!DOCTYPE html  PUBLIC \'-//W3C//DTD XHTML 1.0 Strict//EN\'  \'http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\'><html/>'])
+check('errors', [err(lambda: minidom.parseString('<a><b></a>')), err(lambda: mimpl.createDocument(None, 'r', None).documentElement.appendChild(mimpl.createDocument(None, 'q', None))).split(':')[0]],
+      ['ExpatError: mismatched tag: line 1, column 8', 'HierarchyRequestErr'])
 
 # ── ipaddress ────────────────────────────────────────────────────────────────
 import ipaddress as ip

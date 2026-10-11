@@ -3,7 +3,7 @@
 
 HEADER = '''# vm_audit94.ny - text formats and utility modules (round 79), both engines:
 # difflib, shlex, configparser, tomllib, html (escape/unescape,
-# html.parser, html.entities), xml.etree.ElementTree / ElementPath and
+# html.parser, html.entities), xml.etree.ElementTree / ElementPath, xml.dom.minidom and
 # xml.parsers.expat, ipaddress, graphlib, contextvars (per thread and per
 # asyncio task), concurrent.futures (ThreadPoolExecutor and
 # ProcessPoolExecutor), zoneinfo, mimetypes.
@@ -406,6 +406,37 @@ chk("Element copy, clear, attrib", "(lambda e: (e.set('a', '1'), ET.SubElement(e
 chk("expat directly", "(lambda log, p: (setattr(p, 'StartElementHandler', lambda n, a: log.append(('s', n, a))), setattr(p, 'EndElementHandler', lambda n: log.append(('e', n))), setattr(p, 'CharacterDataHandler', lambda d: log.append(('d', d))), p.Parse('<a x=\"1\">hi &amp; bye<b/></a>', True), log)[4])([], expat.ParserCreate())")
 chk("expat namespaces", "(lambda log, p: (setattr(p, 'StartElementHandler', lambda n, a: log.append(('s', n, a))), setattr(p, 'StartNamespaceDeclHandler', lambda pf, u: log.append(('ns', pf, u))), p.Parse('<a xmlns=\"u\" xmlns:p=\"v\" p:x=\"1\"><p:b/></a>', True), log)[3])([], expat.ParserCreate(None, ' '))")
 chk("expat errors", "[expat.ErrorString(7), expat.errors.XML_ERROR_SYNTAX, expat.errors.codes['mismatched tag'], err(lambda: expat.ParserCreate().Parse('<a></b>', True))]")
+
+# ── xml.dom.minidom ──────────────────────────────────────────────────────────
+code('''
+# ── xml.dom.minidom ──────────────────────────────────────────────────────────
+import xml.dom
+from xml.dom import minidom
+mdoc = minidom.parseString("<a x='1'><b>hi</b><b/><!--c--><?pi d?><c xmlns='urn:c'><d/></c></a>")
+mimpl = minidom.getDOMImplementation()
+ndoc = mimpl.createDocument(None, "root", None)
+ntop = ndoc.documentElement
+nitem = ndoc.createElement("item")
+nitem.setAttribute("k", "v<&>\\"")
+nitem.appendChild(ndoc.createTextNode("text & <stuff>"))
+ntop.appendChild(nitem)
+ntop.appendChild(ndoc.createComment("note"))
+ntop.appendChild(ndoc.createCDATASection("raw <x>"))
+ndoc_xml = ndoc.toxml()
+ndoc_pretty = ndoc.toprettyxml(indent="\\t", newl="\\n", encoding="utf-8")
+ntypes = [n.nodeType for n in ntop.childNodes]
+ntop.removeChild(ntop.lastChild)
+nclone = ntop.cloneNode(True)
+norm = minidom.parseString("<p>a<b>b</b>c</p>")
+norm.documentElement.normalize()
+mdt = minidom.parseString('<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd"><html/>')
+''')
+chk("parseString, toxml", "[[b.toxml() for b in mdoc.getElementsByTagName('b')], mdoc.toxml()]")
+chk("toprettyxml", "mdoc.toprettyxml(indent='  ')")
+chk("elements, attributes, namespaces", "[mdoc.documentElement.tagName, mdoc.documentElement.getAttribute('x'), mdoc.documentElement.hasAttribute('y'), mdoc.getElementsByTagName('c')[0].namespaceURI, mdoc.getElementsByTagName('d')[0].localName, len(mdoc.documentElement.childNodes), minidom.parseString(\"<r a='1' b='2'/>\").documentElement.attributes.items()]")
+chk("building a document", "[ndoc_xml, ndoc_pretty, ntypes, xml.dom.Node.ELEMENT_NODE, nclone.toxml(), ntop.isSameNode(nclone)]")
+chk("normalize, doctype", "[[n.nodeValue for n in norm.documentElement.childNodes], mdt.doctype.name, mdt.doctype.publicId, mdt.doctype.systemId, mdt.toxml()]")
+chk("errors", "[err(lambda: minidom.parseString('<a><b></a>')), err(lambda: mimpl.createDocument(None, 'r', None).documentElement.appendChild(mimpl.createDocument(None, 'q', None))).split(':')[0]]")
 
 # ── ipaddress ────────────────────────────────────────────────────────────────
 code('''
