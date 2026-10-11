@@ -29,9 +29,11 @@ Data
     characteristics as MLT (natural images, multi-oriented quadrilateral / polygon text annotations with
     transcriptions and "###"/illegible don't-care regions): RCTW-17, ReCTS-19, LSVT-19 (fully annotated part),
     ArT-19, KAIST Scene Text (Korean) and the official ICDAR-2019-MLT synthetic set (SynthMLT: Chinese /
-    Japanese / Korean). Format adapters, automatic discovery under /kaggle/input, optional download, cached
-    index, perceptual-hash leakage guard against the validation / test images, vertex-order repair, polygon-aware
-    reading direction, reduced-resolution decoding of large images.
+    Japanese / Korean). Every set is DOWNLOADED AUTOMATICALLY from its original host (resumable, size / MD5 /
+    archive-verified, safely extracted, never twice); attached copies are found by file signature. IC15 comes from
+    the RRC (MD5-verified); MLT-19 (RRC account needed) from the Kaggle copy. Format adapters, fingerprinted index
+    cache, perceptual-hash leakage guard against the validation / test images, vertex-order repair, polygon-aware
+    reading direction, reduced-resolution decoding of large images, numpy-backed (fork-shared) index.
   * Script-adaptive mixture sampling: per-group budgets + temperature sampling inside groups, modulated by
     per-script multipliers that follow the held-out per-script recognition error (error-feedback mixing).
   * Scene-word strip stream: rectified, scale-normalised word strips cut from the same training images and read by
@@ -43,7 +45,9 @@ Recognition
     (L/V/T) and NFD base-letter / combining-mark components (e/é, か/が/ぱ). E starts at 0, so the V4 classifier is
     reproduced exactly at the start of fine-tuning; rare Hangul syllables share strength with frequent ones.
   * Two-length time axis: long lines (aspect > 12) are read with 128 CTC steps, words with 64.
-  * Labels longer than max_seq_len, CTC-infeasible labels and strongly curved polygons are excluded from CTC.
+  * Labels longer than max_seq_len, CTC-infeasible labels, words < 98% inside the crop and strongly curved
+    polygons are excluded from CTC; box jitter is in units of text height (never cuts characters off long lines);
+    right-to-left words use visual-order targets (simplified bidi) and are decoded back to logical order.
   * Light CTC confidence penalty (frame-entropy bonus); recogniser tower+LSTM only run on RoIs with a CTC target
     during training (the verification / script heads still see every RoI).
 Inference
@@ -270,7 +274,52 @@ TRACKED_SCRIPTS = ['Latin', 'Chinese', 'Japanese', 'Korean']
 
 
 def _fold_char(ch):
-    return ch.lower() if ord(ch) < 128 else ch
+    """Case-insensitive vocabulary (the E2E protocol is case-insensitive): É and é share a class. Characters whose
+    lower case is not one code point (e.g. 'İ') are kept as they are."""
+    lo = ch.lower()
+    return lo if len(lo) == 1 else ch
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Right-to-left scripts. Transcriptions are stored in LOGICAL order, but the RoI time axis runs left-to-right in
+# the image (reading_direction points rightwards for horizontal words), so CTC targets of RTL words must be in
+# VISUAL order and decoded RTL strings converted back. Simplified bidi for one line: maximal runs of LTR
+# characters (digits, Latin) keep their order, everything else is reversed, and the runs are reversed. The
+# mapping is its own inverse, so it converts logical <-> visual.
+# ---------------------------------------------------------------------------------------------------------
+_RTL_RANGES = ((0x0590, 0x08FF), (0xFB1D, 0xFDFF), (0xFE70, 0xFEFF))
+
+
+def _is_rtl_char(c):
+    o = ord(c)
+    return any(a <= o <= b for a, b in _RTL_RANGES) and unicodedata.category(c) != 'Nd'
+
+
+def has_rtl(t):
+    return any(_is_rtl_char(c) for c in (t or ''))
+
+
+def visual_order(t):
+    if not has_rtl(t):
+        return t
+    runs, cur, cur_ltr = [], '', None
+    for c in t:
+        ltr = unicodedata.category(c) == 'Nd' or (c.isalnum() and not _is_rtl_char(c))
+        if cur and ltr != cur_ltr:
+            runs.append((cur, cur_ltr))
+            cur = ''
+        cur, cur_ltr = cur + c, ltr
+    if cur:
+        runs.append((cur, cur_ltr))
+    merged = []                                       # 'ABC 2024': neutrals between two LTR runs stay LTR
+    for r, ltr in runs:
+        if ltr and len(merged) >= 2 and merged[-2][1] and not has_rtl(merged[-1][0]):
+            mid, _ = merged.pop()
+            prev, _ = merged.pop()
+            merged.append((prev + mid + r, True))
+        else:
+            merged.append((r, ltr))
+    return ''.join(r if ltr else r[::-1] for r, ltr in reversed(merged))
 
 
 def normalize_transcript(t):
@@ -292,7 +341,7 @@ def infer_script_from_text(text):
             counts['Latin'] += 1
         elif 0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF or 0xF900 <= o <= 0xFAFF:
             counts['Chinese'] += 1
-        elif 0x3040 <= o <= 0x30FF or 0x31F0 <= o <= 0x31FF:
+        elif 0x3041 <= o <= 0x3096 or 0x30A1 <= o <= 0x30FA or o == 0x30FC or 0x31F0 <= o <= 0x31FF:
             counts['Japanese'] += 1
         elif 0xAC00 <= o <= 0xD7AF or 0x1100 <= o <= 0x11FF or 0x3130 <= o <= 0x318F:
             counts['Korean'] += 1
@@ -432,7 +481,8 @@ class Config:
         self.ic15_train_gt_dir = _first_existing([os.path.join(ic15_root, d) for d in
                                                   ('ch4_training_localization_transcription_gt',
                                                    'train_gts', 'ch4_train_gt')])
-        self.ic15_repeat = 2                     # oversampling weight of the (small) IC15 train split
+        self.ic15_repeat = 2                     # weight INSIDE the 'ic15' group (the group's share of every epoch
+                                                 # is mixture_budget['ic15']; a lone source gets the whole budget)
         self.ic15_val_fraction = 0.1             # NEW: held-out IC15 train images = test-domain validation
         # Optional extra FULL-IMAGE training sets in ICDAR quad format (e.g. SynthMLT, ArT, RCTW converted):
         #   [{'img_dir': ..., 'gt_dir': ..., 'repeat': 1}, ...]
@@ -465,7 +515,8 @@ class Config:
         # data goes to the large ephemeral disk; save that folder as a Kaggle dataset to skip it next session.
         self.auto_download_sources = True
         self.download_root = '/tmp/a3espotter_data' if os.path.isdir('/kaggle') else './data/public_sources'
-        self.download_names = ['lsvt', 'art', 'rects', 'kaist', 'synthmlt_zh', 'synthmlt_ja', 'synthmlt_ko', 'rctw17']
+        # priority order: if the disk reserve is reached, the sets at the end are the ones skipped
+        self.download_names = ['lsvt', 'rects', 'kaist', 'art', 'synthmlt_ja', 'synthmlt_ko', 'synthmlt_zh', 'rctw17']
         self.custom_download_urls = {}           # e.g. {'rctw17': ['https://.../train_images.zip.001', ...]}
         self.download_retries = 4
         self.download_timeout = 60
@@ -481,7 +532,9 @@ class Config:
         self.dedup_hamming = 5
         # sampling budget per group (renormalised over the groups that are present)
         self.mixture_budget = {'mlt': 0.40, 'ic15': 0.18, 'extra': 0.07, 'zh': 0.15, 'ja': 0.10, 'ko': 0.10}
-        self.mixture_temperature = 2.0           # inside a group: p_source ~ (w * n)^(1/T)
+        self.mixture_temperature = 2.0           # inside a group: p_source ~ (w * n)^(1/T); group shares are the
+                                                 # budgets above, so `weight` / `synthetic_weight` only matter
+                                                 # between sources of the same group
         self.synthetic_weight = 0.5              # synthetic sources start with half the weight of real ones
         self.samples_per_epoch = 11000           # fixed epoch length (V4: 11,000 images per epoch)
         self.adaptive_mixing = True              # error-feedback per-script multipliers
@@ -707,8 +760,9 @@ class Config:
         def eligible(c):
             if ord(c) < 128:
                 return True
-            thr = 1 if (is_hangul_syllable(c) and self.use_compositional_classifier) else self.min_char_count
-            return counter[c] >= thr
+            if is_hangul_syllable(c) and self.use_compositional_classifier:
+                return counter[c] > 0                     # shares jamo: one (even synthetic) occurrence is enough
+            return counter[c] >= self.min_char_count
         cands = sorted((c for c in counter if eligible(c)), key=lambda c: (-counter[c], c))
         if base_chars:
             chars = list(base_chars)
@@ -780,9 +834,10 @@ class Config:
 
     def encode_text(self, text):
         """Returns (padded ids, length, number of out-of-vocabulary characters). Text longer than max_seq_len is
-        truncated here - callers must check `text_fits` before using it as a CTC target."""
+        truncated here - callers must check `text_fits` before using it as a CTC target. Right-to-left words are
+        encoded in visual (left-to-right image) order, the order of the RoI time axis."""
         seq, n_oov = [], 0
-        for ch in text:
+        for ch in visual_order(text):
             if ch.isspace():
                 continue
             idx = self.stoi.get(_fold_char(ch))
@@ -805,7 +860,7 @@ class Config:
             if p != prev and p > 1 and p in self.itos:
                 res.append(self.itos[p])
             prev = p
-        return "".join(res)
+        return visual_order("".join(res))
 
     def decode_with_confidence(self, probs_tv):
         """Greedy CTC decoding of a (T, V) probability matrix. Confidence = geometric mean of the
@@ -821,10 +876,11 @@ class Config:
             prev = p
         if not confs:
             return '', 0.0
-        return ''.join(res), float(np.exp(np.mean(np.log(np.clip(confs, 1e-8, 1.0)))))
+        return visual_order(''.join(res)), float(np.exp(np.mean(np.log(np.clip(confs, 1e-8, 1.0)))))
 
     def decode_indices_raw(self, indices):
-        return "".join(self.itos.get(int(i), '') for i in indices if int(i) not in (0, 1))
+        """Target ids -> text in logical order."""
+        return visual_order("".join(self.itos.get(int(i), '') for i in indices if int(i) not in (0, 1)))
 
     ARCH_KEYS = ('backbone', 'embed_dim', 'sgdla_depth', 'sgdla_heads', 'fpn_dim', 'neck_dim', 'num_kernels',
                  'min_scale', 'rec_hidden', 'num_experts', 'img_size')
@@ -1016,30 +1072,26 @@ def strip_affine(rb_padded, strip_h, strip_w_max):
     return A, nw
 
 
-def rectify_strip(image, rb_padded, strip_h, strip_w_max):
+def rectify_strip(image, rb_padded, strip_h, strip_w_max, max_oversample=8):
     """Cuts the oriented, padded word box out of `image` into a (strip_h, strip_w_max, 3) canvas: text height =
-    strip_h, aspect kept (capped at strip_w_max), right-padded with zeros. Strong downscaling is pre-filtered
-    with INTER_AREA on a local crop (warpAffine alone aliases). Returns (canvas, nw, A_image_to_strip)."""
+    strip_h, aspect kept (capped at strip_w_max), right-padded with zeros. Downscaling is anti-aliased PER AXIS:
+    the warp goes to a canvas oversampled by ceil(0.8 / scale) along each axis, then INTER_AREA brings it to the
+    strip size (warpAffine alone aliases; one isotropic factor blurred long lines / missed rotated words).
+    Returns (canvas, nw, A_image_to_strip)."""
     A, nw = strip_affine(rb_padded, strip_h, strip_w_max)
-    scale = min(abs(A[0, 0]) + abs(A[0, 1]), abs(A[1, 0]) + abs(A[1, 1]))
-    src, A_src = image, A
-    if scale < 0.6:
-        q = rbox_to_quad(rb_padded)
-        H, W = image.shape[:2]
-        x0, y0 = max(int(np.floor(q[:, 0].min())) - 2, 0), max(int(np.floor(q[:, 1].min())) - 2, 0)
-        x1, y1 = min(int(np.ceil(q[:, 0].max())) + 2, W), min(int(np.ceil(q[:, 1].max())) + 2, H)
-        if x1 - x0 >= 2 and y1 - y0 >= 2:
-            f = min(1.0, scale / 0.8)
-            crop = image[y0:y1, x0:x1]
-            cw, ch = max(1, int(round((x1 - x0) * f))), max(1, int(round((y1 - y0) * f)))
-            src = cv2.resize(crop, (cw, ch), interpolation=cv2.INTER_AREA)
-            fx, fy = cw / float(x1 - x0), ch / float(y1 - y0)
-            A_src = A.copy()
-            A_src[:, 0] = A[:, 0] / fx
-            A_src[:, 1] = A[:, 1] / fy
-            A_src[:, 2] = A[:, 2] + A[:, 0] * x0 + A[:, 1] * y0
-    canvas = cv2.warpAffine(src, A_src, (strip_w_max, strip_h), flags=cv2.INTER_LINEAR,
-                            borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+    sx, sy = float(np.hypot(A[0, 0], A[0, 1])), float(np.hypot(A[1, 0], A[1, 1]))
+    fx = int(min(max_oversample, max(1, math.ceil(0.8 / max(sx, 1e-6)))))
+    fy = int(min(max_oversample, max(1, math.ceil(0.8 / max(sy, 1e-6)))))
+    if fx > 1 or fy > 1:
+        A_big = A.copy()
+        A_big[0] *= fx
+        A_big[1] *= fy
+        big = cv2.warpAffine(image, A_big, (strip_w_max * fx, strip_h * fy), flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+        canvas = cv2.resize(big, (strip_w_max, strip_h), interpolation=cv2.INTER_AREA)
+    else:
+        canvas = cv2.warpAffine(image, A, (strip_w_max, strip_h), flags=cv2.INTER_LINEAR,
+                                borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
     canvas[:, nw:] = 0
     return canvas, nw, A
 
@@ -1104,6 +1156,8 @@ def prepare_instances(raw, W, H, config, vertex_order='icdar'):
             u, curved = reading_direction_from_quad(poly, lang, text), False
         else:
             u, curved = polygon_reading_direction(poly, lang, text)
+        if u[0] < -0.35 and has_rtl(text):
+            u = -u                                         # RTL targets are visual-order: time axis runs rightwards
         out.append({'poly': poly, 'u': u, 'curved': curved, 'language': lang, 'transcript': text,
                     'ignore': bool(inst.get('ignore', False)), 'script_id': config.script_id_for(lang)})
     return out
@@ -1185,6 +1239,9 @@ class ICDAR2019Dataset(Dataset):
             return image, []
         H, W = image.shape[:2]
         return image, prepare_instances(read_gt_file(gt_path), W, H, self.config, 'icdar')
+
+    def _item_name(self, idx):
+        return os.path.basename(self.items[idx][0])
 
     def _is_complete(self, idx):
         """False for sources whose annotation does not cover every text instance (no background sampling /
@@ -1351,16 +1408,19 @@ class ICDAR2019Dataset(Dataset):
 
     # ------------------------------------------------------------------ targets
     def _jitter_rbox(self, rb):
+        """Imperfect-box jitter in units of the text HEIGHT. V4 scaled the shift, width change and rotation with the
+        line LENGTH, which cut whole characters off long CJK lines while their full CTC label was kept."""
         rb = rb.copy()
         w, h = float(rb[2]), float(rb[3])
         u = rb[4:6].copy()
         v = perp(u)
-        shift = u * random.gauss(0, 0.04) * w + v * random.gauss(0, 0.06) * h
+        shift = u * random.gauss(0, 0.06) * h + v * random.gauss(0, 0.06) * h
         rb[0] += shift[0]
         rb[1] += shift[1]
-        rb[2] = w * random.uniform(0.92, 1.08)
-        rb[3] = h * random.uniform(0.9, 1.15)
-        a = math.radians(random.gauss(0, 2.0))
+        rb[2] = w + h * random.uniform(-0.05, 0.3)
+        rb[3] = h * random.uniform(0.95, 1.15)
+        max_deg = min(2.0, math.degrees(math.atan2(0.1 * h, max(w / 2.0, 1e-3))))   # end corners move <~0.1 h
+        a = math.radians(random.gauss(0, max_deg))
         ca, sa = math.cos(a), math.sin(a)
         rb[4], rb[5] = ca * u[0] - sa * u[1], sa * u[0] + ca * u[1]
         return rb
@@ -1436,9 +1496,10 @@ class ICDAR2019Dataset(Dataset):
             if vis < 0.5:                      # mostly outside the crop: supervise the masks only
                 continue
             seq, tlen, n_oov = cfg.encode_text(inst['transcript'])
-            # FIX (V5): labels longer than max_seq_len were truncated and still trained CTC; strongly curved
-            # polygons cannot be read from one straight oriented RoI.
-            rec_valid = (vis >= 0.85) and (n_oov == 0) and (tlen > 0) and cfg.text_fits(inst['transcript']) \
+            # FIX (V5): labels longer than max_seq_len were truncated and still trained CTC; words partly outside
+            # the crop (V4: up to 15% cut away) kept their full label; strongly curved polygons cannot be read from
+            # one straight oriented RoI.
+            rec_valid = (vis >= 0.98) and (n_oov == 0) and (tlen > 0) and cfg.text_fits(inst['transcript']) \
                 and not inst.get('curved', False)
             text_rois.append(dict(rb=rb, poly=clipped, seq=seq, tlen=tlen, script=inst['script_id'],
                                   rec_valid=rec_valid, verify=0,
@@ -1491,7 +1552,7 @@ class ICDAR2019Dataset(Dataset):
             'gt_any': torch.from_numpy(gt_any),
             'complete': bool(complete),
             'instances': rois,
-            'filename': os.path.basename(self.items[idx][0]),
+            'filename': self._item_name(idx),
         }
 
 
@@ -1624,30 +1685,42 @@ class CropRecognitionDataset(Dataset):
     def __init__(self, sources, config, max_samples=None):
         self.cfg = config
         self.H, self.W = config.roi_h * config.feature_stride, config.roi_w_long * config.feature_stride
-        self.index = []                  # (source_id, key)
+        # LMDB entries live in two numpy arrays (no per-sample Python objects: forked workers would otherwise
+        # copy a multi-million-entry list page by page); txt entries (small) stay in a list.
         self.sources = sources
         self._envs = {}
+        lm_src, lm_key, self.txt = [], [], []
         for si, src in enumerate(sources):
             if src.get('type') == 'lmdb' and HAS_LMDB and os.path.isdir(src['path']):
                 env = lmdb.open(src['path'], readonly=True, lock=False, readahead=False, meminit=False)
                 with env.begin() as txn:
                     total = int(txn.get(b'num-samples') or 0)
                 env.close()
-                self.index += [(si, i) for i in range(1, total + 1)]
+                lm_src.append(np.full(total, si, dtype=np.int32))
+                lm_key.append(np.arange(1, total + 1, dtype=np.int64))
             elif src.get('type') == 'txt' and os.path.exists(src['path']):
                 with open(src['path'], encoding='utf-8', errors='ignore') as f:
                     for line in f:
                         parts = line.rstrip('\n').split('\t', 1)
                         if len(parts) == 2:
-                            self.index.append((si, (os.path.join(src.get('root', ''), parts[0]), parts[1])))
+                            self.txt.append((si, (os.path.join(src.get('root', ''), parts[0]), parts[1])))
             else:
                 print(f"[crop-rec] source skipped (missing path or lmdb not installed): {src}")
-        if max_samples and len(self.index) > max_samples:
-            random.Random(0).shuffle(self.index)
-            self.index = self.index[:max_samples]
+        self.lm_src = np.concatenate(lm_src) if lm_src else np.zeros(0, np.int32)
+        self.lm_key = np.concatenate(lm_key) if lm_key else np.zeros(0, np.int64)
+        n = len(self.lm_key) + len(self.txt)
+        self.order = None
+        if max_samples and n > max_samples:
+            self.order = np.random.RandomState(0).permutation(n)[:max_samples]
 
     def __len__(self):
-        return len(self.index)
+        return len(self.order) if self.order is not None else len(self.lm_key) + len(self.txt)
+
+    def _entry(self, idx):
+        idx = int(self.order[idx]) if self.order is not None else idx
+        if idx < len(self.lm_key):
+            return int(self.lm_src[idx]), int(self.lm_key[idx])
+        return self.txt[idx - len(self.lm_key)]
 
     def _read(self, si, key):
         src = self.sources[si]
@@ -1668,12 +1741,12 @@ class CropRecognitionDataset(Dataset):
         return load_image_rgb(path), lab
 
     def __getitem__(self, idx):
-        si, key = self.index[idx]
+        si, key = self._entry(idx)
         img, label = self._read(si, key)
         label = normalize_transcript(label)
         if img is None or img.size == 0:
             img, label = np.zeros((self.H, self.W, 3), np.uint8), ''
-        lang = infer_script_from_text(label)
+        lang = resolve_script(label, None, self.sources[si].get('script_hint'))   # kanji-only Japanese crops
         h, w = img.shape[:2]
         if h > 1.5 * w and len(label) >= 2:          # tall multi-char crop: vertical line -> read left-to-right
             img = cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
@@ -1856,17 +1929,31 @@ def _read_xml_text(path):
     return re.sub(r'^\s*<\?xml[^>]*\?>', '', txt or '')
 
 
+def _kaist_words_regex(txt):
+    """Tolerant fallback for KAIST files that are not well-formed XML (e.g. an unescaped '&' in a char attribute)."""
+    out = []
+    for m in re.finditer(r'<word\b([^>]*)>(.*?)</word>', txt, re.S):
+        attrs = dict(re.findall(r'(\w+)\s*=\s*"([^"]*)"', m.group(1)))
+        chars = re.findall(r'<character\b[^>]*?\bchar\s*=\s*"([^"]*)"', m.group(2))
+        out.append((attrs, ''.join(chars)))
+    return out
+
+
 def _parse_kaist_file(path):
     """KAIST XML: <word x y width height><character ... char="X"/>...</word>; axis-aligned word boxes."""
-    root = ET.fromstring(_read_xml_text(path))
+    txt = _read_xml_text(path)
+    try:
+        words = [(w.attrib, ''.join(c.attrib.get('char', '') for c in w.iter('character')))
+                 for w in ET.fromstring(txt).iter('word')]
+    except ET.ParseError:
+        words = _kaist_words_regex(txt)
     out = []
-    for word in root.iter('word'):
+    for attrs, text in words:
         try:
-            x, y = float(word.attrib['x']), float(word.attrib['y'])
-            w, h = float(word.attrib['width']), float(word.attrib['height'])
+            x, y = float(attrs['x']), float(attrs['y'])
+            w, h = float(attrs['width']), float(attrs['height'])
         except (KeyError, ValueError):
             continue
-        text = ''.join(c.attrib.get('char', '') for c in word.iter('character'))
         out.append(([x, y, x + w, y, x + w, y + h, x, y + h], text, text.strip() == '', None))
     return out
 
@@ -2001,15 +2088,20 @@ def _pair_images_with_gt(img_dir, gt_dir, ext):
     (synthetic sets numbered per sub-folder), the GT whose folder path matches the image's best wins; ties are
     dropped rather than guessed."""
     imgs = list_images_recursive(img_dir)
-    gts = defaultdict(list)
+    raw, stripped = defaultdict(list), defaultdict(list)
     for dp, dn, fn in os.walk(gt_dir):
         dn.sort()
         for f in sorted(fn):
             if f.lower().endswith(ext):
-                gts[_strip_gt_prefix(os.path.splitext(f)[0])].append(os.path.join(dp, f))
+                stem = os.path.splitext(f)[0]
+                raw[stem].append(os.path.join(dp, f))
+                if _strip_gt_prefix(stem) != stem:
+                    stripped[_strip_gt_prefix(stem)].append(os.path.join(dp, f))
     pairs, ambiguous = [], 0
     for p in imgs:
-        cands = gts.get(os.path.splitext(os.path.basename(p))[0])
+        stem = os.path.splitext(os.path.basename(p))[0]
+        cands = raw.get(stem) or stripped.get(stem)     # 'gt_N.jpg' + 'gt_N.txt' as well as 'img_N' + 'gt_img_N'
+
         if not cands:
             continue
         if len(cands) == 1:
@@ -2025,9 +2117,51 @@ def _pair_images_with_gt(img_dir, gt_dir, ext):
     return pairs
 
 
+class FrozenRecords:
+    """Read-only ImageRecord sequence stored in a few numpy buffers (paths and annotation JSON as one UTF-8 blob
+    each, plus offsets). Unlike a list of Python objects, whose reference counts are written whenever a forked
+    DataLoader worker touches them (copying every page it reads), these buffers stay shared copy-on-write."""
+
+    def __init__(self, records, num_scripts):
+        n = len(records)
+        self.src = np.fromiter((r.src for r in records), np.int32, n)
+        self.w = np.fromiter((r.w or 0 for r in records), np.int32, n)
+        self.h = np.fromiter((r.h or 0 for r in records), np.int32, n)
+        self.scripts = np.zeros((n, num_scripts), np.uint16)
+        for i, r in enumerate(records):
+            for sid, c in r.scripts:
+                self.scripts[i, sid] = min(int(c), 65535)
+        self._paths, self._p_off = self._pack([r.img for r in records])
+        self._anns, self._a_off = self._pack([r.ann for r in records])
+
+    @staticmethod
+    def _pack(strings):
+        enc = [x.encode('utf-8') for x in strings]
+        off = np.zeros(len(enc) + 1, np.int64)
+        off[1:] = np.cumsum([len(e) for e in enc]) if enc else 0
+        return np.frombuffer(b''.join(enc), np.uint8), off
+
+    def __len__(self):
+        return len(self.src)
+
+    def __getitem__(self, i):
+        if isinstance(i, slice):
+            return [self[j] for j in range(*i.indices(len(self)))]
+        i = int(i)
+        img = self._paths[self._p_off[i]:self._p_off[i + 1]].tobytes().decode('utf-8')
+        ann = self._anns[self._a_off[i]:self._a_off[i + 1]].tobytes().decode('utf-8')
+        nz = np.nonzero(self.scripts[i])[0]
+        return ImageRecord(img, int(self.src[i]), int(self.w[i]), int(self.h[i]), ann,
+                           tuple((int(k), int(self.scripts[i, k])) for k in nz))
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+
+
 class SourceIndex:
-    """All training images of all sources: compact per-image records (annotation as one JSON string per image,
-    so DataLoader workers forked from the main process share it copy-on-write)."""
+    """All training images of all sources: compact per-image records (annotation as one JSON string per image).
+    `freeze()` moves them into FrozenRecords before DataLoader workers are forked."""
 
     def __init__(self, sources=None, records=None):
         self.sources = list(sources or [])
@@ -2044,14 +2178,24 @@ class SourceIndex:
     def filter(self, keep):
         return SourceIndex(self.sources, [r for r, k in zip(self.records, keep) if k])
 
+    def freeze(self, num_scripts):
+        if not isinstance(self.records, FrozenRecords):
+            self.records = FrozenRecords(self.records, num_scripts)
+        return self
+
+    def src_array(self):
+        return self.records.src if isinstance(self.records, FrozenRecords) else \
+            np.array([r.src for r in self.records], np.int32)
+
     def script_mass(self, num_scripts):
-        m = np.zeros((len(self.records), num_scripts), dtype=np.float32)
-        for i, r in enumerate(self.records):
-            if r.scripts:
+        if isinstance(self.records, FrozenRecords):
+            m = self.records.scripts.astype(np.float32)
+        else:
+            m = np.zeros((len(self.records), num_scripts), dtype=np.float32)
+            for i, r in enumerate(self.records):
                 for sid, n in r.scripts:
                     m[i, sid] += n
-            else:
-                m[i, 0] = 1.0                       # no legible text: neutral ('None' multiplier is fixed at 1)
+        m[m.sum(1) == 0, 0] = 1.0                   # no legible text: neutral ('None' multiplier is fixed at 1)
         return m / m.sum(1, keepdims=True).clip(min=1e-6)
 
     def summary(self, cfg, mixture=None):
@@ -2091,13 +2235,47 @@ def _spec_with_defaults(spec, cfg):
     return out
 
 
+def _tree_fingerprint(paths):
+    """(file count, newest mtime, total label size) of the source's folders / files: a changed or completed
+    extraction invalidates the cached index."""
+    n, newest = 0, 0.0
+    for p in paths:
+        if not p:
+            continue
+        if os.path.isfile(p):
+            st = os.stat(p)
+            n, newest = n + st.st_size, max(newest, st.st_mtime)
+            continue
+        for dp, dn, fn in os.walk(p):
+            n += len(fn)
+            try:
+                newest = max(newest, os.stat(dp).st_mtime)
+            except OSError:
+                pass
+    return [n, round(newest, 1)]
+
+
+def _spec_dirs(spec):
+    """[(img_dirs, gt_dir)] of a per-image-annotated spec."""
+    if spec.get('pairs_dirs'):
+        return [(list(a), b) for a, b in spec['pairs_dirs']]
+    img_dirs = spec.get('img_dirs') or [spec['img_dir']]
+    return [(img_dirs, spec.get('gt_dir') or img_dirs[0])]
+
+
 def build_source_records(spec, cfg):
-    """Parses one source into ImageRecords (cached under cfg.cache_dir)."""
+    """Parses one source into ImageRecords (cached under cfg.cache_dir; the key includes a fingerprint of the files,
+    so an updated / completed extraction is re-indexed; empty results are never cached)."""
     fmt = spec['format']
-    digest_src = {k: spec.get(k) for k in ('name', 'format', 'img_dir', 'img_dirs', 'gt_dir', 'label_file',
-                                           'script_hint', 'max_images')}
+    digest_src = {k: spec.get(k) for k in ('name', 'format', 'img_dir', 'img_dirs', 'gt_dir', 'pairs_dirs',
+                                           'label_file', 'script_hint', 'max_images')}
     if spec.get('items') is not None:
         digest_src['items'] = hashlib.sha1('\n'.join(f'{a}|{b}' for a, b in spec['items']).encode()).hexdigest()
+    else:
+        roots = [spec.get('label_file')] + [d for a, b in (_spec_dirs(spec) if fmt in PER_IMAGE_FORMATS else
+                                                          [(spec.get('img_dirs') or [spec.get('img_dir')], None)])
+                                            for d in list(a) + [b]]
+        digest_src['fingerprint'] = _tree_fingerprint(sorted({r for r in roots if r}))
     key = hashlib.sha1((json.dumps(digest_src, sort_keys=True, default=str) + INDEX_VERSION).encode()).hexdigest()[:12]
     cache = os.path.join(cfg.cache_dir, f"index_{re.sub(r'[^A-Za-z0-9_]+', '_', spec.get('name', fmt))}_{key}.pkl")
     if os.path.exists(cache):
@@ -2112,7 +2290,13 @@ def build_source_records(spec, cfg):
         if spec.get('items') is not None:
             pairs = list(spec['items'])
         else:
-            pairs = _pair_images_with_gt(spec['img_dir'], spec.get('gt_dir') or spec['img_dir'], PER_IMAGE_FORMATS[fmt])
+            pairs, seen = [], set()
+            for img_dirs, gt_dir in _spec_dirs(spec):
+                for d in img_dirs:
+                    for img, gt in _pair_images_with_gt(d, gt_dir, PER_IMAGE_FORMATS[fmt]):
+                        if img not in seen:
+                            seen.add(img)
+                            pairs.append((img, gt))
         tasks = [(fmt, img, gt, hint, None) for img, gt in pairs]
     elif fmt in ('lsvt', 'art'):
         labels = _load_json_labels(spec['label_file'])
@@ -2137,6 +2321,8 @@ def build_source_records(spec, cfg):
             continue
         img, w, h, ann = r
         recs.append(ImageRecord(img, 0, w, h, ann, _script_counts(json.loads(ann), cfg.script2id)))
+    if not recs:
+        return recs
     try:
         with open(cache, 'wb') as f:                       # plain tuples: loadable from any module context
             pickle.dump([tuple(r) for r in recs], f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -2149,7 +2335,7 @@ def build_source_records(spec, cfg):
 def _sniff(path, n=4096):
     try:
         with open(path, 'rb') as f:
-            return f.read(n).decode('utf-8', 'ignore')
+            return f.read(n).decode('utf-8-sig', 'ignore')
     except Exception:
         return ''
 
@@ -2174,6 +2360,56 @@ def _find_image_dir_near(dp, prefix, levels=2):
             break
         base = parent
     return None
+
+
+_SPLIT_TOKENS = ('test', 'val', 'eval')
+
+
+def _image_dirs_for_keys(dp, keys, prefix, name_hint=None, up=1, down=4, floor=None):
+    """Image folders that really hold the annotated images: every folder within `up` levels above / `down` levels
+    below the annotation folder whose `prefix*` image stems overlap the annotation keys. Test / validation folders
+    are dropped when a training folder exists (RCTW / ArT test images share the train file names), a folder-name
+    hint separates sets with identical naming (LSVT vs ArT 'gt_N'), and every folder with a substantial share of
+    the keys is kept (LSVT is split over train_full_images_0 / _1; extraction may nest folders)."""
+    keys = set(keys)
+    if not keys:
+        return []
+    scope = dp
+    floor_real = os.path.realpath(floor) if floor else None
+    for _ in range(up):                            # never above the search root (other datasets live there)
+        parent = os.path.dirname(scope)
+        if parent == scope or (floor_real and not os.path.realpath(parent).startswith(floor_real + os.sep)):
+            break
+        scope = parent
+    base_depth = scope.rstrip(os.sep).count(os.sep)
+    cands = []
+    for cur, dn, fn in os.walk(scope):
+        if cur.rstrip(os.sep).count(os.sep) - base_depth >= down:
+            dn[:] = []
+        dn[:] = sorted(d for d in dn if not d.startswith('.'))
+        stems = {os.path.splitext(f)[0] for f in fn if f.startswith(prefix) and f.endswith(IMG_EXTS)}
+        hit = len(stems & keys)
+        if hit:
+            cands.append((hit, cur))
+    if not cands:
+        return []
+    is_split = lambda c: any(t in os.path.relpath(c, scope).lower() for t in _SPLIT_TOKENS)
+    if any(not is_split(c) for _, c in cands):
+        cands = [(h, c) for h, c in cands if not is_split(c)]
+    if name_hint and any(name_hint in os.path.basename(c).lower() for _, c in cands):
+        cands = [(h, c) for h, c in cands if name_hint in os.path.basename(c).lower()]
+    top = max(h for h, _ in cands)
+    return sorted(c for h, c in cands if h >= 0.25 * top)
+
+
+def _json_label_keys(path):
+    """All image keys of an LSVT / ArT label file (regex over the whole file: the keys are ordered, so a sample
+    from the head would only ever match the first image folder)."""
+    try:
+        with open(path, 'rb') as f:
+            return set(m.decode() for m in re.findall(rb'"(gt_\d+)"\s*:', f.read()))
+    except Exception:
+        return set()
 
 
 def _sibling_image_dirs(img_dir, prefix):
@@ -2207,15 +2443,19 @@ def _ancestor_with(dp, token, levels=4):
 
 
 def discover_public_sources(roots, exclude=(), max_depth=7, verbose=True):
-    """Finds the catalogued datasets by their file signatures (dataset slugs on Kaggle differ, signatures don't)."""
-    found = {}
+    """Finds the catalogued datasets by their file signatures (dataset slugs on Kaggle differ, signatures don't).
+    Image folders are chosen by overlap with the annotation keys (see _image_dirs_for_keys); several folders of the
+    same per-image-annotated set are merged into one spec (one source = one sampling weight)."""
+    per_image = defaultdict(list)                  # name -> [(img_dirs, gt_dir)]
+    single = {}                                    # (name, label_file) -> spec   (LSVT / ArT)
     excl = {os.path.realpath(e) for e in exclude if e}
     synth_lang = {'chinese': 'synthmlt_zh', 'japanese': 'synthmlt_ja', 'korean': 'synthmlt_ko'}
+    fmt_of = {'rects': 'rects', 'rctw17': 'rctw', 'kaist': 'kaist', 'synthmlt_zh': 'mlt', 'synthmlt_ja': 'mlt',
+              'synthmlt_ko': 'mlt'}
 
-    def add(name, **kw):
-        key = (name, kw.get('gt_dir') or kw.get('label_file'))
-        if key not in found:
-            found[key] = dict(name=name, catalog=name, **kw)
+    def add_dirs(name, img_dirs, gt_dir):
+        if img_dirs and all((tuple(img_dirs), gt_dir) != (tuple(a), b) for a, b in per_image[name]):
+            per_image[name].append((list(img_dirs), gt_dir))
 
     for root in roots:
         if not root or not os.path.isdir(root):
@@ -2228,32 +2468,31 @@ def discover_public_sources(roots, exclude=(), max_depth=7, verbose=True):
                 continue
             if rdp.count(os.sep) - rdepth >= max_depth:
                 dn[:] = []
-            dn[:] = [d for d in dn if not d.startswith('.')]
+            dn[:] = sorted(d for d in dn if not d.startswith('.'))
             try:
                 fs = set(fn)
                 for jf in ('train_full_labels.json', 'train_labels.json'):
                     if jf in fs:
-                        head = _sniff(os.path.join(dp, jf), 1 << 16)
+                        lf = os.path.join(dp, jf)
+                        head = _sniff(lf, 1 << 16)
                         if '"points"' not in head or '"gt_' not in head:
                             continue
                         name = 'art' if '"language"' in head else 'lsvt'
-                        img_dir = _find_image_dir_near(dp, 'gt_')
-                        if img_dir:
-                            add(name, format=name, img_dir=img_dir, img_dirs=_sibling_image_dirs(img_dir, 'gt_'),
-                                label_file=os.path.join(dp, jf))
-                if any(f.startswith('train_ReCTS_') and f.endswith('.json') for f in fn):
-                    img_dir = _find_image_dir_near(dp, 'train_ReCTS_')
-                    if img_dir and os.path.basename(dp) != 'gt_unicode':
-                        add('rects', format='rects', img_dir=img_dir, gt_dir=dp)
+                        img_dirs = _image_dirs_for_keys(dp, _json_label_keys(lf), 'gt_', floor=root,
+                                                        name_hint='full' if name == 'lsvt' else 'train_images')
+                        if img_dirs:
+                            single[(name, lf)] = {'name': name, 'catalog': name, 'format': name, 'img_dir': img_dirs[0],
+                                                  'img_dirs': img_dirs, 'label_file': lf}
+                rects = [f for f in fn if f.startswith('train_ReCTS_') and f.endswith('.json')]
+                if rects and os.path.basename(dp) != 'gt_unicode':
+                    add_dirs('rects', _image_dirs_for_keys(dp, [f[:-5] for f in rects], 'train_ReCTS_', floor=root), dp)
                 txts = sorted(f for f in fn if re.match(r'image_\d+\.txt$', f))
                 if txts and re.match(r'^\s*[\d.\-]+(,[\d.\-]+){7},[01],', _sniff(os.path.join(dp, txts[0]), 512)):
-                    img_dir = _find_image_dir_near(dp, 'image_')
-                    if img_dir:
-                        add('rctw17', format='rctw', img_dir=img_dir, gt_dir=dp)
+                    add_dirs('rctw17', _image_dirs_for_keys(dp, [f[:-4] for f in txts], 'image_', floor=root), dp)
                 xmls = [f for f in fn if f.lower().endswith('.xml')]
                 if xmls and '<words' in _sniff(os.path.join(dp, xmls[0])):
                     kroot = _ancestor_with(dp, 'kaist') or dp
-                    add('kaist', format='kaist', img_dir=kroot, gt_dir=kroot)
+                    add_dirs('kaist', [kroot], kroot)
                     if kroot != dp:
                         dn[:] = []
                 if 'synth' in rdp.lower():
@@ -2268,22 +2507,30 @@ def discover_public_sources(roots, exclude=(), max_depth=7, verbose=True):
                         lang = langs.most_common(1)[0][0]
                         gt_root = _ancestor_with(dp, lang) or dp
                         sib = gt_root[:-3] if gt_root.lower().endswith('_gt') else gt_root
-                        img_root = sib if os.path.isdir(sib) else gt_root
-                        add(synth_lang[lang], format='mlt', img_dir=img_root, gt_dir=gt_root)
+                        add_dirs(synth_lang[lang], [sib if os.path.isdir(sib) else gt_root], gt_root)
                         if gt_root != dp:
                             dn[:] = []
             except Exception as e:
                 if verbose:
                     print(f"[discover] skipped {dp}: {type(e).__name__}: {e}")
-    specs = list(found.values())
+    specs = []
+    for name, entries in per_image.items():
+        specs.append({'name': name, 'catalog': name, 'format': fmt_of[name], 'img_dir': entries[0][0][0],
+                      'pairs_dirs': entries})
+    seen = Counter()
+    for (name, lf), spec in single.items():
+        seen[name] += 1
+        if seen[name] > 1:                         # a second, different copy of the labels
+            spec['name'] = f'{name}#{seen[name]}'
+        specs.append(spec)
     if verbose:
         if specs:
             for s in specs:
-                print(f"[discover] {s['name']:<12} images={s.get('img_dirs') or s.get('img_dir')} "
-                  f"labels={s.get('gt_dir') or s.get('label_file')}")
+                where = s.get('img_dirs') or [d for e in s.get('pairs_dirs', []) for d in e[0]]
+                print(f"[discover] {s['name']:<12} images={where} labels={s.get('label_file') or [e[1] for e in s.get('pairs_dirs', [])]}")
         else:
             print("[discover] no public CJK scene-text set found under " + ', '.join(str(r) for r in roots) +
-                  " - attach one (see PUBLIC_SOURCE_CATALOG) or set auto_download_sources=True.")
+                  " - attach one (see PUBLIC_SOURCE_CATALOG) or keep auto_download_sources=True.")
     return specs
 
 
@@ -2492,10 +2739,17 @@ def _acquire_file(spec, dest, cfg, extra_urls=()):
     if os.path.exists(marker):
         return
     path = fetch_file(spec, dest, cfg, extra_urls)
-    if spec.get('extract'):
-        _extract_archive(path, dest, spec['extract'])
-        if not cfg.download_keep_archives:
-            os.remove(path)
+    try:
+        if spec.get('extract'):
+            _extract_archive(path, dest, spec['extract'])
+        elif path.endswith('.json'):
+            with open(path, encoding='utf-8-sig') as f:
+                json.load(f)                                 # a truncated / HTML label file must not pass
+    except Exception as e:
+        os.remove(path)                                      # re-downloaded next time instead of trusted
+        raise DownloadError(f'{name}: unusable after download ({type(e).__name__}: {e})')
+    if spec.get('extract') and not cfg.download_keep_archives:
+        os.remove(path)
     open(marker, 'w').close()
 
 
@@ -2559,7 +2813,8 @@ def acquire_public_sources(cfg, names=None):
                 for u in fb['urls']:
                     _acquire_file(_f(u, extract=None), fdir, cfg)
                 print(f"[download] {name}: using the {fb['note']}")
-                crop_sources.append({'type': 'lmdb', 'path': fdir, 'name': name + '_crops'})
+                crop_sources.append({'type': 'lmdb', 'path': fdir, 'name': name + '_crops',
+                                     'script_hint': meta.get('script_hint')})
             except DownloadError as e:
                 print(f"[download] {name}: fallback not available either ({e})")
     return specs, crop_sources
@@ -2710,10 +2965,17 @@ class MergedSceneTextDataset(ICDAR2019Dataset):
       * large photos are decoded at 1/2, 1/4 or 1/8 resolution when the sampled scale allows it."""
 
     def __init__(self, index, config, is_train=True):
-        super().__init__([(r.img, None) for r in index.records], config, is_train)
+        super().__init__([], config, is_train)
+        self.items = self.img_paths = None                # paths come from the frozen index (copy-on-write safe)
         self.index = index
         self.records = index.records
         self.sources = index.sources
+
+    def __len__(self):
+        return len(self.records)
+
+    def _item_name(self, idx):
+        return os.path.basename(self.records[idx].img)
 
     def raw_instances(self, idx):
         return [{'poly': np.asarray(p, dtype=np.float32).reshape(-1, 2), 'transcript': t, 'ignore': bool(ig),
@@ -2761,7 +3023,8 @@ class MergedSceneTextDataset(ICDAR2019Dataset):
 
 def compute_mixture_weights(index, cfg):
     """Per-record base sampling weight: group budget x temperature-sampled source share inside the group / size."""
-    src_count = Counter(r.src for r in index.records)
+    src_arr = index.src_array()
+    src_count = Counter(src_arr.tolist())
     groups = defaultdict(list)
     for sid in src_count:
         groups[index.sources[sid].get('group', 'extra')].append(sid)
@@ -2774,7 +3037,10 @@ def compute_mixture_weights(index, cfg):
         zs = sum(z.values())
         for s in sids:
             share[s] = budget[g] / tot * z[s] / zs
-    base = np.array([share[r.src] / src_count[r.src] for r in index.records], dtype=np.float64)
+    per_src = np.zeros(max(src_count) + 1 if src_count else 1, dtype=np.float64)
+    for sid, c in src_count.items():
+        per_src[sid] = share[sid] / c
+    base = per_src[src_arr]
     return base, share
 
 
@@ -2912,16 +3178,23 @@ def build_training_index(cfg, mlt_items, ic15_items, eval_image_paths):
     cfg.crop_rec_sources = list(cfg.crop_rec_sources) + [c for c in crop_sources if c['path'] not in known]
     specs = [_spec_with_defaults(s, cfg) for s in base_specs] + cjk_specs
     for spec in specs:
-        if spec.get('items') is None and not (spec.get('img_dir') and os.path.isdir(spec['img_dir'])):
-            print(f"[sources] {spec.get('name')}: image dir not found - skipped")
+        dirs = [spec.get('img_dir')] + list(spec.get('img_dirs') or []) + \
+            [d for e in spec.get('pairs_dirs') or [] for d in e[0]]
+        if spec.get('items') is None and not any(d and os.path.isdir(d) for d in dirs) and \
+                not (spec.get('label_file') and os.path.isfile(spec['label_file'])):
+            print(f"[sources] {spec.get('name')}: no image folder / label file found - skipped")
             continue
-        recs = build_source_records(spec, cfg)
+        try:
+            recs = build_source_records(spec, cfg)
+        except Exception as e:                             # one broken source must not stop the run
+            print(f"[sources] {spec.get('name')}: could not be indexed ({type(e).__name__}: {e}) - skipped")
+            continue
         if recs:
             index.add({k: v for k, v in spec.items() if k != 'items'}, recs)
             print(f"[sources] {spec.get('name')}: {len(recs)} images")
     if cfg.dedup_against_eval:
         index = apply_leakage_guard(index, eval_image_paths, cfg)
-    return index
+    return index.freeze(cfg.num_scripts)
 
 
 # =====================================================================
@@ -3173,7 +3446,7 @@ def oriented_roi_crop(features, batch_idx, rboxes, out_h, out_w, spatial_scale):
         sel = (bidx == b).nonzero(as_tuple=True)[0]
         g = grid[sel].reshape(1, -1, out_w, 2).to(features.dtype)
         samp = F.grid_sample(features[b:b + 1], g, mode='bilinear', padding_mode='zeros', align_corners=False)
-        out[sel] = samp.reshape(C, sel.numel(), out_h, out_w).permute(1, 0, 2, 3)
+        out[sel] = samp.reshape(C, sel.numel(), out_h, out_w).permute(1, 0, 2, 3).to(out.dtype)
     return out
 
 
@@ -3235,7 +3508,8 @@ class ScriptAwareInstanceRecognizer(nn.Module):
         lines), the rest with `roi_w`; text logits are returned padded to the longest length with blank-only
         frames (equivalent to extra blank frames for CTC / greedy decoding) plus the true `time_lengths`;
       * `rec_mask`: tower+heads run for every RoI, the sequence model + classifier only for the masked RoIs
-        (training: RoIs with a CTC target); `rec_index` gives their positions;
+        (training: RoIs with a CTC target). Rows of `text_logits` / `time_lengths` are grouped by time-length
+        bucket; `rec_index[j]` is the RoI of row j (script / verify / embed outputs stay in RoI order);
       * compositional classifier (see CompositionalCharClassifier).
 
     Expert routing (`moe_routing`):
@@ -3384,40 +3658,32 @@ class ScriptAwareInstanceRecognizer(nn.Module):
         verify_logits = self.verify_head(torch.cat([pooled, mstats], -1))
         expert_weights, router_probs = self.route(pooled, script_logits)
 
-        rec_index = torch.arange(K, device=rboxes.device) if rec_mask is None else \
-            rec_mask.to(rboxes.device).nonzero(as_tuple=True)[0]
-        Kr = rec_index.numel()
+        rec_set = torch.ones(K, dtype=torch.bool, device=rboxes.device) if rec_mask is None else \
+            rec_mask.to(rboxes.device).bool()
         V = self.classifier.out_features
         out = {'script_logits': script_logits, 'verify_logits': verify_logits, 'family_logits': family_logits,
-               'embed': pooled, 'expert_weights': expert_weights, 'router_probs': router_probs, 'rec_index': rec_index}
-        if Kr == 0:
-            out['text_logits'] = pooled.new_zeros((0, self.roi_w, V))
-            out['time_lengths'] = torch.zeros(0, dtype=torch.long, device=rboxes.device)
-            return out
-        pos_in_rec = torch.full((K,), -1, dtype=torch.long, device=rboxes.device)
-        pos_in_rec[rec_index] = torch.arange(Kr, device=rboxes.device)
+               'embed': pooled, 'expert_weights': expert_weights, 'router_probs': router_probs}
         ctx_all = F.adaptive_avg_pool2d(enhanced_feats, (8, 8))
-        parts, T_max = [], 0
+        parts, idx_parts, T_max = [], [], 0
         for idx, Wb, seq in buckets:
-            p = pos_in_rec[idx]
-            sel = (p >= 0).nonzero(as_tuple=True)[0]
+            sel = rec_set[idx].nonzero(as_tuple=True)[0]
             if sel.numel() == 0:
                 continue
             ridx = idx[sel]
             ctx = ctx_all.index_select(0, batch_idx[ridx].clamp(0, enhanced_feats.shape[0] - 1))
-            logits = self._sequence(seq[sel], ctx, expert_weights[ridx], sel.numel())
-            parts.append((p[sel], Wb, logits))
+            parts.append((Wb, self._sequence(seq[sel], ctx, expert_weights[ridx], sel.numel())))
+            idx_parts.append(ridx)
             T_max = max(T_max, Wb)
-        text_logits = None
-        time_lengths = torch.zeros(Kr, dtype=torch.long, device=rboxes.device)
-        for p, Wb, logits in parts:
-            if text_logits is None:
-                text_logits = logits.new_full((Kr, T_max, V), self.PAD_LOGIT)
-                text_logits[:, :, 0] = 0.0
-            text_logits = text_logits.index_copy(0, p, logits if Wb == T_max else self._pad_blank(logits, T_max))
-            time_lengths[p] = Wb
-        out['text_logits'] = text_logits
-        out['time_lengths'] = time_lengths
+        if not parts:
+            out['text_logits'] = pooled.new_zeros((0, self.roi_w, V))
+            out['time_lengths'] = torch.zeros(0, dtype=torch.long, device=rboxes.device)
+            out['rec_index'] = torch.zeros(0, dtype=torch.long, device=rboxes.device)
+            return out
+        # rows are in bucket order (one concatenation, no scatter copies); rec_index maps row -> RoI
+        out['rec_index'] = torch.cat(idx_parts)
+        out['text_logits'] = torch.cat([lg if Wb == T_max else self._pad_blank(lg, T_max) for Wb, lg in parts], 0)
+        out['time_lengths'] = torch.cat([torch.full((lg.shape[0],), Wb, dtype=torch.long, device=rboxes.device)
+                                         for Wb, lg in parts])
         return out
 
     def _pad_blank(self, logits, T):
@@ -3585,8 +3851,10 @@ class EntropyGuidedInformationPreservingMPM(nn.Module):
         self.reduce_conv = _conv_bn_relu(in_channels, out_channels, k=1)
         self.pool_square_1 = nn.Sequential(nn.AdaptiveAvgPool2d((16, 16)), nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False))
         self.pool_square_2 = nn.Sequential(nn.AdaptiveAvgPool2d((8, 8)), nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False))
-        self.pool_h = nn.Sequential(nn.AdaptiveAvgPool2d((None, 1)), nn.Conv2d(out_channels, out_channels, (1, 3), padding=(0, 1), bias=False))
-        self.pool_w = nn.Sequential(nn.AdaptiveAvgPool2d((1, None)), nn.Conv2d(out_channels, out_channels, (3, 1), padding=(1, 0), bias=False))
+        # strip pooling: an H x 1 map is mixed along H with a (3, 1) kernel, a 1 x W map along W with (1, 3).
+        # (V4 had the kernels swapped, so only their centre taps ever saw data; upgrade_legacy_state converts.)
+        self.pool_h = nn.Sequential(nn.AdaptiveAvgPool2d((None, 1)), nn.Conv2d(out_channels, out_channels, (3, 1), padding=(1, 0), bias=False))
+        self.pool_w = nn.Sequential(nn.AdaptiveAvgPool2d((1, None)), nn.Conv2d(out_channels, out_channels, (1, 3), padding=(0, 1), bias=False))
         self.entropy_gate = nn.Conv2d(out_channels * 4 + 4, 4, 1)
         self.fusion = _conv_bn_relu(out_channels * 4, out_channels)
         self.neck_blender = BlendedScorer(out_channels, out_dim=out_channels, spatial_size=spatial_size, as_vector=False)
@@ -3689,6 +3957,19 @@ class A3ESpotter_V5(nn.Module):
 
 A3ESpotter_V4 = A3ESpotter_V5      # backwards-compatible names (state dicts are compatible)
 A3ESpotter_V3 = A3ESpotter_V5
+
+
+def upgrade_legacy_state(state):
+    """Converts V4 checkpoints to the V5 layout, exactly preserving their function: the EGIP-MPM strip-pool convs
+    had swapped kernel shapes ((1,3) on an H x 1 map, (3,1) on a 1 x W map), so only their centre taps mattered;
+    they become (3,1) / (1,3) kernels holding that centre tap and zeros elsewhere."""
+    for k, want in (('egip_mpm.pool_h.1.weight', (3, 1)), ('egip_mpm.pool_w.1.weight', (1, 3))):
+        w = state.get(k)
+        if w is not None and w.dim() == 4 and tuple(w.shape[-2:]) == want[::-1]:
+            new = torch.zeros(*w.shape[:2], *want, dtype=w.dtype)
+            new[:, :, want[0] // 2, want[1] // 2] = w[:, :, w.shape[2] // 2, w.shape[3] // 2]
+            state[k] = new
+    return state
 
 
 def remap_vocab_state(state, old_chars, new_chars, char2script_new, old_components=None, prefix='recognizer.'):
@@ -3989,8 +4270,9 @@ def ctc_loss_fp32(text_logits, text_seq, text_len, time_lengths=None, entropy_be
                        torch.full((sel.numel(),), int(Tb), dtype=torch.long, device=lp.device),
                        text_len[sel], blank=0, reduction='none', zero_infinity=True)
         losses.append(L / text_len[sel].clamp(min=1).float())
-        if entropy_beta > 0:
-            ents.append(-(lp.exp() * lp).sum(-1).mean(-1))
+        if entropy_beta > 0:                                # bounded subset: (K, T, V) temporaries are large
+            le = lp[:64]
+            ents.append(-(le.exp() * le).sum(-1).mean(-1))
     if not losses:
         z = text_logits.float().sum() * 0.0
         return (z, z.detach()) if return_parts else z
@@ -4035,15 +4317,22 @@ def _rec_subset(rois, targets):
     return tl[rv], rois['time_lengths'][rv], rows
 
 
-def _script_consistency(recognizer, tl, sid, cfg, exclude):
+def _script_consistency(recognizer, tl, sid, cfg, exclude, time_lengths=None):
     ok = sid >= 0
     for ex in exclude:
         ok = ok & (sid != ex)
     if not bool(ok.any()):
         return None
     sel = ok.nonzero(as_tuple=True)[0][:cfg.max_script_consistency_rois]
-    q, _ = recognizer.implied_script_distribution(tl[sel])
-    return F.nll_loss(torch.log(q.clamp(min=1e-6)), sid[sel])
+    if time_lengths is None:
+        q, _ = recognizer.implied_script_distribution(tl[sel])
+        return F.nll_loss(torch.log(q.clamp(min=1e-6)), sid[sel])
+    losses = []
+    for Tb in torch.unique(time_lengths[sel]).tolist():          # valid frames only (no padding softmax)
+        sb = sel[time_lengths[sel] == Tb]
+        q, _ = recognizer.implied_script_distribution(tl[sb, :int(Tb)])
+        losses.append(F.nll_loss(torch.log(q.clamp(min=1e-6)), sid[sb], reduction='sum'))
+    return torch.stack(losses).sum() / sel.numel()
 
 
 def crop_recognition_loss(rois, targets, recognizer, cfg):
@@ -4059,7 +4348,7 @@ def crop_recognition_loss(rois, targets, recognizer, cfg):
         total = total + cfg.w_rec * l
         if cfg.w_script_consistency > 0:
             exclude = [cfg.script2id[n] for n in ('none', 'mixed', 'unknown')]
-            l_sc = _script_consistency(recognizer, tl, targets['script_id'][rows], cfg, exclude)
+            l_sc = _script_consistency(recognizer, tl, targets['script_id'][rows], cfg, exclude, tls)
             if l_sc is not None:
                 total = total + cfg.w_rec * cfg.w_script_consistency * l_sc
     sv = targets['script_id'] >= 0
@@ -4107,7 +4396,7 @@ class UnifiedSpotterLoss(nn.Module):
                 logs['ctc'] = float(l_ctc)
                 if recognizer is not None and self.cfg.w_script_consistency > 0:
                     l_sc = _script_consistency(recognizer, tl, targets['script_id'][rows], self.cfg,
-                                               self.script_consistency_exclude)
+                                               self.script_consistency_exclude, tls)
                     if l_sc is not None:
                         logs['script_consistency'] = float(l_sc.detach())
                         l_rec = l_rec + self.cfg.w_script_consistency * l_sc
@@ -4172,7 +4461,7 @@ def greedy_decode_batch(scores, time_lengths, config, normalized=True, chunk=32)
         return []
     pm, am = [], []
     for i in range(0, scores.shape[0], chunk):
-        x = scores[i:i + chunk].float()
+        x = scores[i:i + chunk].detach().float()
         if not normalized:
             x = x.log_softmax(-1)
         p, a = x.max(-1)
@@ -4190,7 +4479,7 @@ def greedy_decode_batch(scores, time_lengths, config, normalized=True, chunk=32)
                 confs.append(float(pmax[k, t]))
             prev = p
         conf = float(np.exp(np.mean(np.log(np.clip(confs, 1e-8, 1.0))))) if confs else 0.0
-        out.append((''.join(res), conf))
+        out.append((visual_order(''.join(res)), conf))            # RTL readings back to logical order
     return out
 
 
@@ -4232,12 +4521,19 @@ def compute_recognition_metrics(rois, targets, config):
 # E2E: case-insensitive exact match after stripping leading/trailing symbols; Latin words of 1-2 characters
 # are don't care, as in IC15 - for CJK / Korean / Arabic ... words that rule would drop real words)
 # ---------------------------------------------------------------------------------------------
+def _edge_strippable(c):
+    """Leading / trailing punctuation, symbols, separators and controls are ignored by the E2E match; letters,
+    digits and combining marks (Indic vowel signs / virama, Arabic harakat) are kept - stripping a trailing vowel
+    sign would make wrong Hindi / Bangla words match."""
+    return unicodedata.category(c)[0] in 'PSZC'
+
+
 def text_for_eval(t):
     t = unicodedata.normalize('NFKC', t or '').strip()
     i, j = 0, len(t)
-    while i < j and not t[i].isalnum():
+    while i < j and _edge_strippable(t[i]):
         i += 1
-    while j > i and not t[j - 1].isalnum():
+    while j > i and _edge_strippable(t[j - 1]):
         j -= 1
     return t[i:j].casefold()
 
@@ -4301,9 +4597,15 @@ def evaluate_image(gts, dets, e2e_min_len=3, iou_thr=0.5):
         if a == b:
             tp += 1
             hit.add(i)
-        r['ned_sum'] += edit_distance(a, b) / max(len(a), len(b), 1)
+        ned = edit_distance(a, b) / max(len(a), len(b), 1)
+        r['ned_sum'] += ned
         r['ned_n'] += 1
+        r['ned_all_sum'] += ned
+        r['ned_all_n'] += 1
     r['e2e_tp'] += tp; r['e2e_ngt'] += len(e_care); r['e2e_ndet'] += len(e_dets)
+    n_unmatched = (len(e_care) - len(pairs)) + (len(e_dets) - len(pairs))   # each counts NED = 1
+    r['ned_all_sum'] += n_unmatched
+    r['ned_all_n'] += n_unmatched
     for i, g in enumerate(e_care):
         s = g.get('script', 'Unknown')
         r['e2e_ngt@' + s] += 1
@@ -4319,8 +4621,10 @@ def summarize_eval(acc):
     dp, dr, dh = prh(acc['det_tp'], acc['det_ndet'], acc['det_ngt'])
     ep, er, eh = prh(acc['e2e_tp'], acc['e2e_ndet'], acc['e2e_ngt'])
     ned = 1.0 - acc['ned_sum'] / acc['ned_n'] if acc['ned_n'] > 0 else 0.0
+    ned_all = 1.0 - acc['ned_all_sum'] / acc['ned_all_n'] if acc['ned_all_n'] > 0 else 0.0
+    # one_minus_ned: matched pairs only (V4 definition); one_minus_ned_all: misses / false alarms count NED = 1
     out = {'det_precision': dp, 'det_recall': dr, 'det_hmean': dh, 'e2e_precision': ep, 'e2e_recall': er,
-           'e2e_hmean': eh, 'one_minus_ned': ned, 'spot_score': 0.5 * (dh + eh)}
+           'e2e_hmean': eh, 'one_minus_ned': ned, 'one_minus_ned_all': ned_all, 'spot_score': 0.5 * (dh + eh)}
     for k in list(acc.keys()):
         if k.startswith('e2e_ngt@') or k.startswith('det_ngt@'):
             task, s = k.split('_ngt@')
@@ -4451,12 +4755,14 @@ class SpottingEngine:
 
     @torch.no_grad()
     def _decode(self, out):
+        """Decoded readings in RoI order (text_logits rows are bucket-ordered; out['rec_index'] maps them back)."""
         cfg = self.cfg
         rec = self.model.recognizer
         tl = out['text_logits']
         if tl.shape[0] == 0:
             return []
-        sp = torch.softmax(out['script_logits'].float(), -1)
+        ridx = out['rec_index']
+        sp = torch.softmax(out['script_logits'].float(), -1)[ridx]
         q, mass = rec.implied_script_distribution(tl)
         pi = self._consensus(sp, q, mass)
         lp = tl.float().log_softmax(-1)
@@ -4469,12 +4775,12 @@ class SpottingEngine:
         vp = torch.softmax(out['verify_logits'].float(), -1).cpu().numpy()
         pin, spn = pi.cpu().numpy(), sp.cpu().numpy()
         emb = out['embed'].float().cpu().numpy()
-        res = []
-        for k, (text, conf) in enumerate(decoded):
-            sid = int(pin[k].argmax())
-            res.append({'text': text, 'rec_conf': conf, 'script': cfg.CANONICAL_SCRIPTS[sid],
-                        'script_conf': float(pin[k, sid]), 'script_head': cfg.CANONICAL_SCRIPTS[int(spn[k].argmax())],
-                        'verify': vp[k], 'embed': emb[k]})
+        res = [None] * out['script_logits'].shape[0]
+        for j, ((text, conf), k) in enumerate(zip(decoded, ridx.tolist())):
+            sid = int(pin[j].argmax())
+            res[k] = {'text': text, 'rec_conf': conf, 'script': cfg.CANONICAL_SCRIPTS[sid],
+                      'script_conf': float(pin[j, sid]), 'script_head': cfg.CANONICAL_SCRIPTS[int(spn[j].argmax())],
+                      'verify': vp[k], 'embed': emb[k]}
         return res
 
     # ---------------- recognition on stitched features ----------------
@@ -5389,9 +5695,11 @@ class Trainer:
     def _to_device(self, batch):
         return {k: (v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
 
-    def _rec_mask(self, tgt):
+    def _rec_mask(self, tgt, train=True):
+        """RoIs that go through the sequence model. Training caps them (memory with an 8,000-class output);
+        validation keeps all of them so the per-script metrics that drive the mixers are not a random subsample."""
         rv = tgt['rec_valid']
-        cap = self.config.max_rec_rois_per_batch
+        cap = self.config.max_rec_rois_per_batch if train else 0
         if cap and int(rv.sum()) > cap:
             idx = rv.nonzero(as_tuple=True)[0]
             keep = idx[torch.randperm(idx.numel(), device=idx.device)[:cap]]
@@ -5477,7 +5785,7 @@ class Trainer:
             rois = None
             if tgt['rboxes'].shape[0] > 0:
                 rois = model.forward_rois(dense['enhanced_feats'], tgt['batch_idx'], tgt['rboxes'], tgt['roi_masks'],
-                                          rec_mask=self._rec_mask(tgt))
+                                          rec_mask=self._rec_mask(tgt, train=mine))
             loss, logs = self.criterion(dense, rois, tgt, model.recognizer)
         return dense, rois, tgt, loss, logs, n_mined
 
@@ -5719,6 +6027,7 @@ class Trainer:
 
     @staticmethod
     def _filtered_load(module, state):
+        state = upgrade_legacy_state(dict(state))
         own = module.state_dict()
         ok = {k: v for k, v in state.items() if k in own and own[k].shape == v.shape}
         module.load_state_dict(ok, strict=False)
@@ -5962,7 +6271,7 @@ def load_model_for_inference(path, config=None, device='cpu'):
     config.pretrained_backbone = False
     model = A3ESpotter_V5(config)
     state = ckpt.get('ema_state', ckpt.get('model_state', ckpt))
-    missing, unexpected = model.load_state_dict(state, strict=False)
+    missing, unexpected = model.load_state_dict(upgrade_legacy_state(dict(state)), strict=False)
     missing = [k for k in missing if not k.endswith('comp_embed')]
     if missing or unexpected:
         print(f"[inference] non-strict load: {len(missing)} missing, {len(unexpected)} unexpected tensors")
