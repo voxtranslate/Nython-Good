@@ -27,10 +27,10 @@
 # LargeZipFile; the command line: nython -m zipfile -l|-t|-e|-c.
 #
 # Not here: ZIP_BZIP2 and ZIP_LZMA (the constants exist; using them raises
-# RuntimeError as CPython does without its bz2/lzma modules), encrypted
-# members (reading one raises "File ... is encrypted, password required for
-# extraction"; there is no ZipCrypto decryption), multi-disk archives,
-# PyZipFile.
+# RuntimeError as CPython does without its bz2/lzma modules); encrypted
+# members are read (traditional PKWARE ZipCrypto, pwd= / setpassword, "Bad
+# password for file") but not written (CPython does not write them
+# either); AES-encrypted members, multi-disk archives, PyZipFile.
 import io
 import os
 import time
@@ -127,6 +127,19 @@ def _splitdrive(p):
     return "", p
 
 
+# IBM PC code page 437, the names' encoding when the UTF-8 flag is not set
+_CP437_HIGH = "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ "
+
+
+def _decode_name(b, encoding):
+    if encoding is not none:
+        return bytes(b).decode(encoding)
+    var out = []
+    for c in b:
+        out.append(chr(c) if c < 128 else _CP437_HIGH[c - 128])
+    return "".join(out)
+
+
 def _fspath(p):
     if isinstance(p, str):
         return p
@@ -173,8 +186,7 @@ class ZipInfo:
     def __repr__(self):
         var result = ["<" + type(self).__name__ + " filename=" + repr(self.filename)]
         if self.compress_type != ZIP_STORED:
-            var names = {0: "stored", 8: "deflated", 12: "bzip2", 14: "lzma"}
-            result.append(" compress_type=" + names.get(self.compress_type, str(self.compress_type)))
+            result.append(" compress_type=" + str(compressor_names.get(self.compress_type, self.compress_type)))
         var hi = self.external_attr >> 16
         var lo = self.external_attr & 0xFFFF
         if hi:
@@ -231,7 +243,7 @@ class ZipInfo:
         var nf = self._encoded_name()
         var filename = nf[0]
         var flag_bits = nf[1]
-        return (_LOCAL_SIG + _u16(self.extract_version) + _u16(self.reserved) + _u16(flag_bits)
+        return (_LOCAL_SIG + bytes([self.extract_version, self.reserved]) + _u16(flag_bits)
                 + _u16(self.compress_type) + _u16(dd[1]) + _u16(dd[0]) + _u32(CRC) + _u32(compress_size)
                 + _u32(file_size) + _u16(len(filename)) + _u16(len(extra)) + filename + extra)
 
@@ -291,6 +303,11 @@ class ZipInfo:
     def is_dir(self):
         """Return True if this archive member is a directory."""
         return self.filename[-1:] == "/"
+
+
+compressor_names = {0: "store", 1: "shrink", 2: "reduce", 3: "reduce", 4: "reduce", 5: "reduce", 6: "implode",
+                    7: "tokenize", 8: "deflate", 9: "deflate64", 10: "implode", 12: "bzip2", 14: "lzma", 18: "terse",
+                    19: "lz77", 97: "wavpack", 98: "ppmd"}
 
 
 def _filemode(mode):
@@ -417,6 +434,51 @@ class _SharedFile:
             self._close(fileobj)
 
 
+# ── traditional PKWARE encryption (reading) ─────────────────────────────────
+_CRCTABLE = []
+
+
+def _crctable():
+    if not _CRCTABLE:
+        for n in range(256):
+            var crc = n
+            for j in range(8):
+                if crc & 1:
+                    crc = (crc >> 1) ^ 0xEDB88320
+                else:
+                    crc = crc >> 1
+            _CRCTABLE.append(crc)
+    return _CRCTABLE
+
+
+class _ZipDecrypter:
+    """ZipCrypto: the keys follow the plaintext (APPNOTE 6.1)."""
+
+    def __init__(self, pwd):
+        self.table = _crctable()
+        self.key0 = 305419896
+        self.key1 = 591751049
+        self.key2 = 878082192
+        for p in pwd:
+            self._update(p)
+
+    def _update(self, c):
+        var t = self.table
+        self.key0 = (self.key0 >> 8) ^ t[(self.key0 ^ c) & 0xFF]
+        self.key1 = (self.key1 + (self.key0 & 0xFF)) & 0xFFFFFFFF
+        self.key1 = (self.key1 * 134775813 + 1) & 0xFFFFFFFF
+        self.key2 = (self.key2 >> 8) ^ t[(self.key2 ^ ((self.key1 >> 24) & 0xFF)) & 0xFF]
+
+    def __call__(self, data):
+        var out = bytearray()
+        for c in data:
+            var k = self.key2 | 2
+            c = c ^ (((k * (k ^ 1)) >> 8) & 0xFF)
+            self._update(c)
+            out.append(c)
+        return bytes(out)
+
+
 # ── reading a member ────────────────────────────────────────────────────────
 class ZipExtFile(io.BufferedIOBase):
     """File-like object for reading an archive member (ZipFile.open)."""
@@ -442,6 +504,18 @@ class ZipExtFile(io.BufferedIOBase):
         self._running_crc = 0
         self._seekable = false
         self._closed = false
+        self._decrypter = none
+        if pwd:
+            var check_byte = 0
+            if zipinfo.flag_bits & 0x08:
+                check_byte = (getattr(zipinfo, "_raw_time", 0) >> 8) & 0xff
+            else:
+                check_byte = (zipinfo.CRC >> 24) & 0xff
+            self._decrypter = _ZipDecrypter(pwd)
+            var header = self._decrypter(fileobj.read(12))
+            self._compress_left = self._compress_left - 12
+            if header[11] != check_byte:
+                raise RuntimeError("Bad password for file " + repr(zipinfo.orig_filename))
         try:
             if fileobj.seekable():
                 self._orig_compress_start = fileobj.tell()
@@ -457,7 +531,7 @@ class ZipExtFile(io.BufferedIOBase):
         if not self._closed:
             result.append(" name=" + repr(self.name) + " mode=" + repr(self.mode))
             if self._compress_type != ZIP_STORED:
-                result.append(" compress_type=" + {8: "deflated"}.get(self._compress_type, str(self._compress_type)))
+                result.append(" compress_type=" + str(compressor_names.get(self._compress_type, self._compress_type)))
         else:
             result.append(" [closed]")
         result.append(">")
@@ -496,6 +570,8 @@ class ZipExtFile(io.BufferedIOBase):
         self._compress_left = self._compress_left - len(data)
         if not data:
             raise EOFError
+        if self._decrypter is not none:
+            data = self._decrypter(data)
         return data
 
     def _read1(self, n):
@@ -944,7 +1020,7 @@ class ZipFile:
             if flags & 0x800:
                 filename = filename.decode("utf-8")
             else:
-                filename = filename.decode(self.metadata_encoding or "cp437")
+                filename = _decode_name(filename, self.metadata_encoding)
             var x = ZipInfo(filename)
             x.extra = data[pos:pos + elen]
             pos = pos + elen
@@ -1084,13 +1160,20 @@ class ZipFile:
             if _le(fheader, 6, 2) & 0x800:
                 fname_str = fname.decode("utf-8")
             else:
-                fname_str = fname.decode(self.metadata_encoding or "cp437")
+                fname_str = _decode_name(fname, self.metadata_encoding)
             if fname_str != zinfo.orig_filename:
                 raise BadZipFile("File name in directory " + repr(zinfo.orig_filename) + " and header "
                                  + repr(fname) + " differ.")
             if zinfo.flag_bits & 0x1:
-                raise RuntimeError("File " + repr(name if isinstance(name, str) else zinfo.filename)
-                                   + " is encrypted, password required for extraction")
+                if not pwd:
+                    pwd = self.pwd
+                if pwd and not isinstance(pwd, bytes):
+                    raise TypeError("pwd: expected bytes, got " + type(pwd).__name__)
+                if not pwd:
+                    raise RuntimeError("File " + repr(name if isinstance(name, str) else zinfo.filename)
+                                       + " is encrypted, password required for extraction")
+            else:
+                pwd = none
             _check_compression(zinfo.compress_type)
             return ZipExtFile(zef_file, mode, zinfo, pwd, true)
         except Exception:

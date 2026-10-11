@@ -377,11 +377,8 @@ class PickleBuffer:
 
 # ── where globals come from ─────────────────────────────────────────────────
 def _main_globals():
-    import sys
-    var f = sys._getframe(0)
-    while f.f_back is not none:
-        f = f.f_back
-    return f.f_globals
+    # the running program's globals (sys.modules["__main__"] in CPython)
+    return _ny_main_globals()
 
 
 # the builtins every program starts with (the prelude's private names left out)

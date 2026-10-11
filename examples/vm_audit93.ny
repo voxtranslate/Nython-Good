@@ -419,22 +419,26 @@ with zipfile.ZipFile(m64, "w") as zw:
 z64b = m64.getvalue()
 check("force_zip64 writes the ZIP64 extra field", [z64b[4], b"\x01\x00\x10\x00" in z64b[:60], zipfile.ZipFile(io.BytesIO(z64b)).read("forced")],
       [45, True, b"0123456789"])
-old_limit = zipfile.ZIP_FILECOUNT_LIMIT
-zipfile.ZIP_FILECOUNT_LIMIT = 3
-mc = io.BytesIO()
-with zipfile.ZipFile(mc, "w") as zw:
-    for i in range(5):
-        zw.writestr("f" + str(i), str(i))
-zipfile.ZIP_FILECOUNT_LIMIT = old_limit
-mcb = mc.getvalue()
-check("more members than the limit: ZIP64 end records", [b"PK\x06\x06" in mcb, b"PK\x06\x07" in mcb, zipfile.ZipFile(io.BytesIO(mcb)).namelist(),
-                                                        zipfile.ZipFile(io.BytesIO(mcb)).read("f4")],
-      [True, True, ["f0", "f1", "f2", "f3", "f4"], b"4"])
-zipfile.ZIP_FILECOUNT_LIMIT = 3
-zl = zipfile.ZipFile(io.BytesIO(), "w", allowZip64=False)
-check("LargeZipFile without allowZip64", raises(lambda: [zl.writestr("f" + str(i), "") for i in range(5)]),
-      "LargeZipFile: Files count would require ZIP64 extensions")
-zipfile.ZIP_FILECOUNT_LIMIT = old_limit
+# CPython wrote this one with ZIP_FILECOUNT_LIMIT patched to 3: ZIP64 end records
+ZIP64_COUNT = b'PK\x03\x04\x14\x00\x00\x00\x00\x00\x00\x00!P!\xdf\xdb\xf4\x01\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00f00PK\x03\x04\x14\x00\x00\x00\x00\x00\x00\x00!P\xb7\xef\xdc\x83\x01\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00f11PK\x03\x04\x14\x00\x00\x00\x00\x00\x00\x00!P\r\xbe\xd5\x1a\x01\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00f22PK\x03\x04\x14\x00\x00\x00\x00\x00\x00\x00!P\x9b\x8e\xd2m\x01\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00f33PK\x03\x04\x14\x00\x00\x00\x00\x00\x00\x00!P8\x1b\xb6\xf3\x01\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00f44PK\x01\x02\x14\x03\x14\x00\x00\x00\x00\x00\x00\x00!P!\xdf\xdb\xf4\x01\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00f0PK\x01\x02\x14\x03\x14\x00\x00\x00\x00\x00\x00\x00!P\xb7\xef\xdc\x83\x01\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01!\x00\x00\x00f1PK\x01\x02\x14\x03\x14\x00\x00\x00\x00\x00\x00\x00!P\r\xbe\xd5\x1a\x01\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01B\x00\x00\x00f2PK\x01\x02\x14\x03\x14\x00\x00\x00\x00\x00\x00\x00!P\x9b\x8e\xd2m\x01\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01c\x00\x00\x00f3PK\x01\x02\x14\x03\x14\x00\x00\x00\x00\x00\x00\x00!P8\x1b\xb6\xf3\x01\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01\x84\x00\x00\x00f4PK\x06\x06,\x00\x00\x00\x00\x00\x00\x00-\x00-\x00\x00\x00\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\xf0\x00\x00\x00\x00\x00\x00\x00\xa5\x00\x00\x00\x00\x00\x00\x00PK\x06\x07\x00\x00\x00\x00\x95\x01\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00PK\x05\x06\x00\x00\x00\x00\x05\x00\x05\x00\xf0\x00\x00\x00\xa5\x00\x00\x00\x00\x00'
+z64c = zipfile.ZipFile(io.BytesIO(ZIP64_COUNT))
+check("CPython's ZIP64 end records", [b"PK\x06\x06" in ZIP64_COUNT, z64c.namelist(), z64c.read("f4"), z64c.testzip()],
+      [True, ["f0", "f1", "f2", "f3", "f4"], b"4", None])
+# (a module's globals can be patched from outside under python3 only: in
+# Nython, `zipfile.ZIP_FILECOUNT_LIMIT = 3` does not reach the module's code)
+if not nython:
+    old_limit = zipfile.ZIP_FILECOUNT_LIMIT
+    zipfile.ZIP_FILECOUNT_LIMIT = 3
+    mc = io.BytesIO()
+    with zipfile.ZipFile(mc, "w") as zw:
+        for i in range(5):
+            zw.writestr("f" + str(i), str(i))
+    mcb = mc.getvalue()
+    zl = zipfile.ZipFile(io.BytesIO(), "w", allowZip64=False)
+    large = raises(lambda: [zl.writestr("f" + str(i), "") for i in range(5)])
+    zipfile.ZIP_FILECOUNT_LIMIT = old_limit
+    check("writing more members than the limit", [b"PK\x06\x06" in mcb, b"PK\x06\x07" in mcb, zipfile.ZipFile(io.BytesIO(mcb)).read("f4"), large],
+          [True, True, b"4", "LargeZipFile: Files count would require ZIP64 extensions"])
 zp = os.path.join(TMP, "a.zip")
 srcf = os.path.join(TMP, "src.txt")
 f = open(srcf, "wb")
@@ -460,6 +464,44 @@ check("zipfile.Path", [sorted([p.name for p in zpath.iterdir()]), (zpath / "docs
                        (zpath / "docs").is_dir(), (zpath / "docs/readme.txt").is_file(), (zpath / "nope").exists(),
                        (zpath / "docs/readme.txt").suffix, (zpath / "docs/readme.txt").stem],
       [["caf\u00e9.bin", "docs"], "read me", True, True, False, ".txt", "readme"])
+# made by Info-ZIP's zip -P pass123 (traditional PKWARE encryption, a data descriptor)
+ENC_ZIP = b'PK\x03\x04\x14\x00\t\x00\x08\x00\x96~K]\xee\xaf\t\xbe!\x00\x00\x00 \x00\x00\x00\n\x00\x00\x00secret.txt \xaaI5|\x9e\xb6\nT\xba\xec\xe9\xf9bk\xb1\xb3\xf7t\xfb6\x0c \xd1\x8e<H\xd2\x94\xfab\xa4\xa6PK\x07\x08\xee\xaf\t\xbe!\x00\x00\x00 \x00\x00\x00PK\x01\x02\x1e\x03\x14\x00\t\x00\x08\x00\x96~K]\xee\xaf\t\xbe!\x00\x00\x00 \x00\x00\x00\n\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\xa4\x81\x00\x00\x00\x00secret.txtPK\x05\x06\x00\x00\x00\x00\x01\x00\x01\x008\x00\x00\x00Y\x00\x00\x00\x00\x00'
+ze = zipfile.ZipFile(io.BytesIO(ENC_ZIP))
+check("an encrypted member", [ze.read("secret.txt", pwd=b"pass123"), raises(ze.read, "secret.txt"), raises(ze.read, "secret.txt", b"wrong"),
+                              ze.getinfo("secret.txt").flag_bits & 1],
+      [b"top secret text\ntop secret text\n", "RuntimeError: File 'secret.txt' is encrypted, password required for extraction",
+       "RuntimeError: Bad password for file 'secret.txt'", 1])
+ze.setpassword(b"pass123")
+check("setpassword", ze.read("secret.txt")[:10], b"top secret")
+pd = io.StringIO()
+zc.printdir(pd)
+check("printdir", pd.getvalue().split("\n")[:2],
+      ["File Name                                             Modified             Size", "docs/readme.txt                                2020-05-17 10:30:42          160"])
+rz = zipfile.ZipInfo("x.txt")
+rz.compress_type = zipfile.ZIP_DEFLATED
+rz.external_attr = 0o100644 << 16
+rz.file_size = 5
+rz.compress_size = 7
+check("ZipInfo repr and defaults", [repr(rz), repr(zipfile.ZipInfo("n")), zipfile.ZipInfo("a\\b").filename == ("a/b" if os.sep == "\\" else "a\\b"),
+                                    raises(zipfile.ZipInfo, "x", (1979, 1, 1, 0, 0, 0))],
+      ["<ZipInfo filename='x.txt' compress_type=deflate filemode='-rw-r--r--' file_size=5 compress_size=7>",
+       "<ZipInfo filename='n' file_size=0>", True, "ValueError: ZIP does not support timestamps before 1980"])
+zx = zipfile.ZipFile(io.BytesIO(), "w")
+hw = zx.open("one", "w")
+check("one writing handle at a time", [raises(zx.open, "two", "w"), raises(zx.writestr, "x", "y")[:44]],
+      ["ValueError: Can't write to the ZIP file while there is another write handle open on it. Close the first handle before opening another.",
+       "ValueError: Can't write to ZIP archive while"])
+hw.close()
+zx.close()
+check("a closed archive", [raises(zx.read, "one"), raises(zx.writestr, "x", "y")],
+      ["ValueError: Attempt to use ZIP archive that was already closed", "ValueError: Attempt to write to ZIP archive that was already closed"])
+fi = zipfile.ZipInfo.from_file(srcf, "renamed.txt")
+check("ZipInfo.from_file", [fi.filename, fi.file_size, fi.is_dir(), (fi.external_attr >> 16) & 0o170000 == 0o100000,
+                            zipfile.ZipInfo.from_file(TMP, "d").filename],
+      ["renamed.txt", 100, False, True, "d/"])
+with zipfile.ZipFile(zp) as zr3:
+    one = zr3.extract("in/src.txt", os.path.join(TMP, "single"))
+check("extract one member", [one == os.path.join(TMP, "single", "in", "src.txt"), open(one, "rb").read()[:4]], [True, b"from"])
 
 # ═══ tarfile ═════════════════════════════════════════════════════════════════
 ti = tarfile.TarInfo("dir/file.txt")
@@ -480,6 +522,29 @@ check("headers are CPython's, byte for byte (crc32)",
       [[1805726201, 4243588342, 1805726201], [3408092413, 351378032], 1536, "ValueError: name is too long"])
 check("TarInfo predicates", [ti.isfile(), ti.isreg(), ti.isdir(), ti.issym(), ti.islnk(), ti.isdev(), ti.path, ti.linkpath],
       [True, True, False, False, False, False, "dir/file.txt", ""])
+fb = tarfile.TarInfo.frombuf(ti.tobuf(tarfile.USTAR_FORMAT), "utf-8", "surrogateescape")
+check("frombuf(tobuf()) keeps every field", [fb.name, fb.size, fb.mtime, fb.uid, fb.gid, fb.uname, fb.gname, oct(fb.mode), fb.type, fb.chksum > 0],
+      ["dir/file.txt", 1234, 1700000000, 1000, 100, "user", "staff", "0o640", b"0", True])
+huge = tarfile.TarInfo("huge")
+huge.size = 2 ** 40
+huge.mtime = 1700000000.5
+check("big numbers: GNU base-256, pax records", [huge.tobuf(tarfile.GNU_FORMAT)[124:136], b"size=1099511627776" in huge.tobuf(tarfile.PAX_FORMAT),
+                                                 b"mtime=1700000000.5" in huge.tobuf(tarfile.PAX_FORMAT), raises(huge.tobuf, tarfile.USTAR_FORMAT),
+                                                 tarfile.TarInfo.frombuf(huge.tobuf(tarfile.GNU_FORMAT), "utf-8", "strict").size],
+      [b"\x80\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00", True, True, "ValueError: overflow in number field", 2 ** 40])
+check("bad headers", [raises(tarfile.TarInfo.frombuf, b"\x00" * 512, "utf-8", "strict"), raises(tarfile.TarInfo.frombuf, b"x" * 100, "utf-8", "strict"),
+                      raises(tarfile.TarInfo.frombuf, b"a" * 512, "utf-8", "strict")],
+      ["EOFHeaderError: end of file header", "TruncatedHeaderError: truncated header", "InvalidHeaderError: invalid header"])
+gb = io.BytesIO()
+with tarfile.open(fileobj=gb, mode="w", pax_headers={"comment": "global note"}) as tw:
+    one = tarfile.TarInfo("x")
+    one.pax_headers = {"custom": "value"}
+    tw.addfile(one)
+with tarfile.open(fileobj=io.BytesIO(gb.getvalue())) as tr:
+    gx = tr.getmember("x")
+    check("pax headers, global and per member", [tr.pax_headers, gx.pax_headers], [{"comment": "global note"}, {"comment": "global note", "custom": "value"}])
+rp = ti.replace(name="other", mtime=5)
+check("TarInfo.replace", [rp.name, rp.mtime, rp.size, ti.name], ["other", 5, 1234, "dir/file.txt"])
 tz = tarfile.open(fileobj=io.BytesIO(TGZ_CPY))
 check("CPython's tar.gz (pax): names, types, sizes",
       [tz.getnames(), [m.type for m in tz.getmembers()], [m.size for m in tz.getmembers()], tz.getmember("pkg/link").linkname,
@@ -521,6 +586,9 @@ check("written and read: GNU and pax, long and UTF-8 names", [read_tar(gnu) == w
                                                               len(gnu) % 10240, b"././@LongLink" in gnu, b"././@PaxHeader" in pax],
       [True, True, 0, True, True])
 check("ustar refuses a long name", raises(make_tar, tarfile.USTAR_FORMAT), "ValueError: name is too long")
+two_tars = gnu + make_tar(tarfile.GNU_FORMAT)
+check("ignore_zeros reads past the end blocks", [len(tarfile.open(fileobj=io.BytesIO(two_tars)).getnames()),
+                                                 len(tarfile.open(fileobj=io.BytesIO(two_tars), ignore_zeros=True).getnames())], [4, 8])
 check("gzip and the stream modes", [read_tar(make_tar(tarfile.PAX_FORMAT, "w:gz"), "r:gz") == want_members,
                                     read_tar(make_tar(tarfile.PAX_FORMAT, "w:gz")) == want_members,
                                     read_tar(make_tar(tarfile.PAX_FORMAT, "w|gz"), "r|gz") == want_members,
@@ -765,7 +833,7 @@ for p in range(6):
            type(md).__name__, dict(md), type(ve).__name__, ve.args, fn(21), pickle.loads(pickle.dumps(Point, p)) is Point],
           ["Point", True, 1, "restored", 5, 7, 8, 6, "MyList", [1, 2], "MyDict", {"a": 1}, "ValueError", ("bad",), 42, True])
 sl = Slotted(1, [2])
-check("slotted objects: state as (None, slots)", [Slotted(1, 2).__getstate__() if sys.version_info >= (3, 11) else (None, {"x": 1, "y": 2}),
+check("slotted objects: state as (None, slots)", [Slotted(1, 2).__getstate__(),
                                                   copyreg._slotnames(Slotted)],
       [(None, {"x": 1, "y": 2}), ["x", "y"]])
 for p in (2, 4, 5):

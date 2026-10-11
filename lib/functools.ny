@@ -395,6 +395,24 @@ class partial:
     def __reduce__(self):
         return (self.__class__, (self.func,), (self.func, self.args, self.keywords or none, none))
 
+    def __setstate__(self, state):
+        # what pickle's BUILD gives back (round 79), as CPython's partial
+        if not isinstance(state, tuple):
+            raise TypeError("argument to __setstate__ must be a tuple")
+        if len(state) != 4:
+            raise TypeError("expected 4 items in state, got " + str(len(state)))
+        var func = state[0]
+        var fargs = state[1]
+        var kwds = state[2]
+        if not callable(func) or not isinstance(fargs, tuple) or (kwds is not none and not isinstance(kwds, dict)):
+            raise TypeError("invalid partial state")
+        self.func = func
+        self.args = tuple(fargs)
+        self.keywords = dict(kwds) if kwds is not none else {}
+        if state[3]:
+            for k in state[3]:
+                setattr(self, k, state[3][k])
+
 
 class partialmethod:
     """Method descriptor with partial application of the given arguments
