@@ -904,20 +904,59 @@ Value dispatch_os(NythonExecutor& E,
     if (name == "os_path_expanduser") return Str(expanduser(S(0)));
     if (name == "os_path_expandvars") return Str(expandvars(S(0)));
     if (name == "os_path_commonpath") {
+        // CPython's posixpath/ntpath.commonpath (round 79): the drive and
+        // root are split off first (on Windows "C:\\a" gave "\\C:\\a" - the
+        // root separator was put before the drive), components are not
+        // normalized ("." dropped, ".." kept), a mix of absolute and
+        // relative paths or of drives is a ValueError, and Windows compares
+        // case-insensitively but returns the first path's spelling.
         auto items = list_items(args.empty() ? NONE_VALUE : args[0]);
-        if (items.empty()) raise("ValueError", "os_path_commonpath() arg is an empty sequence");
-        std::vector<std::vector<std::string>> all;
-        bool abs = nyos::isabs(E.getStringValue(items[0]));
-        for (auto& it : items) all.push_back(components(nyos::normpath(E.getStringValue(it))));
-        std::string out = abs ? sep_str() : "";
-        for (size_t i = 0;; i++) {
-            bool ok = i < all[0].size();
-            for (auto& v : all) if (!ok || i >= v.size() || v[i] != all[0][i]) ok = false;
-            if (!ok) break;
-            if (!out.empty() && !is_any_sep(out.back())) out += SEP;
-            out += all[0][i];
+        if (items.empty()) raise("ValueError", "commonpath() arg is an empty sequence");
+        struct CP { std::string drive, root; std::vector<std::string> parts; };
+        std::vector<CP> ps;
+        for (auto& it : items) {
+            std::string s = E.getStringValue(it);
+            CP c;
+            size_t i = 0;
+#ifdef _WIN32
+            for (char& ch : s) if (ch == '/') ch = '\\';
+            if (s.size() >= 2 && std::isalpha((unsigned char)s[0]) && s[1] == ':') { c.drive = s.substr(0, 2); i = 2; }
+            else if (s.size() >= 3 && s[0] == '\\' && s[1] == '\\' && s[2] != '\\') {
+                // a UNC drive: \\server\share
+                size_t a = s.find('\\', 2);
+                size_t b = a == std::string::npos ? std::string::npos : s.find('\\', a + 1);
+                i = b == std::string::npos ? s.size() : b;
+                c.drive = s.substr(0, i);
+            }
+#endif
+            if (i < s.size() && s[i] == SEP) { c.root = SEP; i++; }
+            // split on the separator only (a backslash is a character on POSIX)
+            std::string cur;
+            for (size_t j = i; j <= s.size(); j++) {
+                if (j == s.size() || s[j] == SEP) {
+                    if (!cur.empty() && cur != ".") c.parts.push_back(cur);
+                    cur.clear();
+                } else cur += s[j];
+            }
+            ps.push_back(c);
         }
-        return Str(out.empty() && !abs ? "" : out);
+        auto fold = [](std::string v) {
+#ifdef _WIN32
+            for (char& ch : v) ch = (char)std::tolower((unsigned char)ch);
+#endif
+            return v;
+        };
+        for (auto& c : ps) if (c.root != ps[0].root) raise("ValueError", "Can't mix absolute and relative paths");
+        for (auto& c : ps) if (fold(c.drive) != fold(ps[0].drive)) raise("ValueError", "Paths don't have the same drive");
+        std::string out = ps[0].drive + ps[0].root;
+        for (size_t k = 0; k < ps[0].parts.size(); k++) {
+            bool same = true;
+            for (auto& c : ps) if (k >= c.parts.size() || fold(c.parts[k]) != fold(ps[0].parts[k])) { same = false; break; }
+            if (!same) break;
+            if (k > 0) out += SEP;
+            out += ps[0].parts[k];
+        }
+        return Str(out);
     }
     if (name == "os_fnmatch" || name == "fnmatch") return Value(nyos::fnmatch(S(0), S(1)));
     if (name == "os_glob" || name == "glob") return make_str_list(E, glob(S(0)));

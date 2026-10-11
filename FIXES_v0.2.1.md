@@ -5638,4 +5638,5 @@ Full detail in `HANDOFF.md` §0r, §0r2. New tests: `vm_audit93` (zlib, archives
 | for-loops over a class with only `__getitem__` raised "not iterable" (interpreter) | no sequence protocol in `evalFor` | `__getitem__` until IndexError |
 | VM: `{"d": date(1,2,3)} == {"d": date(1,2,3)}` was false | dict values compared by identity | compared with `==` |
 | An asyncio task saw the context of whoever ran last | no per-task context | each task starts in a copy of its creator's (PEP 567) |
+| Windows: `os.path.commonpath(["C:\\a\\b", "C:\\a"])` gave `\\C:\\a`, so tarfile's filters refused every member | the root separator was written before the drive | CPython's `posixpath`/`ntpath.commonpath` (drive and root first, case-insensitive on Windows, `..` kept, its ValueErrors) |
 

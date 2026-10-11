@@ -100,6 +100,21 @@ os_setenv("NY46_V", "val")
 # ("$" + "{" keeps the string literal itself from interpolating ${...})
 check("expandvars", os_path_expandvars("a/$NY46_V/$" + "{NY46_V}/$NY46_NOPE"), "a/val/val/$NY46_NOPE")
 check("commonpath", os_path_commonpath(["/a/b/c", "/a/b/d"]), NATIVE("/a/b"))
+# CPython's commonpath (round 79): "." dropped and ".." kept, mixed absolute
+# and relative paths refused; on Windows the drive leads ("\\C:\\a" before)
+def cp_err(xs):
+    try:
+        return os_path_commonpath(xs)
+    except ValueError as e:
+        return "ValueError: " + str(e)
+check("commonpath . and ..", [os_path_commonpath(["/a/./b", "/a/b/c"]), os_path_commonpath(["/a/../b", "/a/../c"]), os_path_commonpath(["a", "b"])],
+      [NATIVE("/a/b"), NATIVE("/a/.."), ""])
+check("commonpath errors", [cp_err(["/a", "b"]), cp_err([])],
+      ["ValueError: Can't mix absolute and relative paths", "ValueError: commonpath() arg is an empty sequence"])
+if os_name == "nt":
+    check("commonpath drives", [os_path_commonpath(["C:\\a\\b", "c:/A/c"]), cp_err(["C:\\a", "D:\\a"]),
+                                os_path_commonpath(["\\\\srv\\share\\x\\y", "\\\\srv\\share\\x\\z"])],
+          ["C:\\a", "ValueError: Paths don't have the same drive", "\\\\srv\\share\\x"])
 check("fnmatch", [fnmatch("f.ny", "*.ny"), fnmatch("f.py", "*.ny"), fnmatch("a1", "a[0-9]"), fnmatch("ab", "a[!b]"), fnmatch("abc", "a?c")], [true, false, true, false, true])
 check("os_sep", os_path_join("a", "b"), "a" + os_sep + "b")
 

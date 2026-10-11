@@ -642,13 +642,17 @@ dest = os.path.join(TMP, "tarout")
 os.mkdir(dest)
 rdest = os.path.realpath(dest)
 
+# the filters' messages quote paths with !r (doubled backslashes on Windows)
+def _r(p):
+    return repr(p)[1:-1]
+
 def filter_msg(entries, flt="data"):
     t = evil_tar(entries)
     return raises(t.extractall, dest, None, filter=flt) if False else raises(lambda: t.extractall(dest, filter=flt))
 
 check("extraction filters refuse what is unsafe",
-      [filter_msg([("/etc/passwd", "file", b"x")]).replace(rdest, "D"), filter_msg([("../up.txt", "file", b"x")]).replace(rdest, "D").replace(os.path.dirname(rdest), "P"),
-       filter_msg([("ln", "sym", "/etc/passwd")]), filter_msg([("ln2", "sym", "../../x")]).replace(os.path.dirname(os.path.dirname(rdest)), "Q"),
+      [filter_msg([("/etc/passwd", "file", b"x")]).replace(_r(rdest), "D"), filter_msg([("../up.txt", "file", b"x")]).replace(_r(rdest), "D").replace(_r(os.path.dirname(rdest)), "P").replace(_r(os.sep), "/"),
+       filter_msg([("ln", "sym", "/etc/passwd")]), filter_msg([("ln2", "sym", "../../x")]).replace(_r(os.path.dirname(os.path.dirname(rdest))), "Q").replace(_r(os.sep), "/"),
        filter_msg([("f", "fifo", b"")]), raises(lambda: evil_tar([("ok", "file", b"1")]).extractall(dest, filter="nope"))],
       ["no error", "OutsideDestinationError: '../up.txt' would be extracted to 'P/up.txt', which is outside the destination",
        "AbsoluteLinkError: 'ln' is a link to an absolute path",
@@ -656,7 +660,7 @@ check("extraction filters refuse what is unsafe",
        "SpecialFileError: 'f' is a special file", "ValueError: filter 'nope' not found"])
 check("the data filter strips a leading / and limits the mode",
       [open(os.path.join(dest, "etc", "passwd")).read(), oct(os.stat(os.path.join(dest, "etc", "passwd")).st_mode & 0o7777)],
-      ["x", "0o755"])
+      ["x", "0o666" if os.name == "nt" else "0o755"])   # Windows has no execute bits
 t = evil_tar([("plain.txt", "file", b"plain data")])
 t.extractall(dest, filter="tar")
 t2 = evil_tar([("deep/er/f.txt", "file", b"deeper")])
@@ -1026,13 +1030,15 @@ check("byteswap, frombytes, fromlist, unicode", [bs, raises(array("i").frombytes
 check("operators", [array("i", [1, 2]) + array("i", [3]), array("b", [1]) * 3, 2 * array("b", [7]), array("i", [1, 2]) < array("i", [1, 3]),
                     array("i", [1, 2]) == array("d", [1.0, 2.0]), repr(array("d", [1.5, 2])), repr(array("b"))],
       [array("i", [1, 2, 3]), array("b", [1, 1, 1]), array("b", [7, 7]), True, True, "array('d', [1.5, 2.0])", "array('b')"])
+# 2 ** 40 overflows a C long first where it is 32 bits (Windows), as in CPython
+I_BIG = "OverflowError: Python int too large to convert to C long" if os.name == "nt" else "OverflowError: signed integer is greater than maximum"
 check("range errors, CPython's messages",
       [raises(array, "b", [200]), raises(array, "B", [-1]), raises(array, "h", [40000]), raises(array, "H", [70000]), raises(array, "i", [2 ** 40]),
        raises(array, "I", [-1]), raises(array, "Q", [-1]), raises(array, "q", [2 ** 63]), raises(array, "i", [1.5]), raises(array, "d", ["a"]),
        raises(array, "z"), raises(lambda: array("i", [1]) + [2]), raises(lambda: array("i", [1]) + array("d", [2])), raises(hash, array("i"))],
       ["OverflowError: signed char is greater than maximum", "OverflowError: unsigned byte integer is less than minimum",
        "OverflowError: signed short integer is greater than maximum", "OverflowError: unsigned short is greater than maximum",
-       "OverflowError: signed integer is greater than maximum", "OverflowError: can't convert negative value to unsigned int",
+       I_BIG, "OverflowError: can't convert negative value to unsigned int",
        "OverflowError: can't convert negative int to unsigned", "OverflowError: int too big to convert",
        "TypeError: 'float' object cannot be interpreted as an integer", "TypeError: must be real number, not str",
        "ValueError: bad typecode (must be b, B, u, h, H, i, I, l, L, q, Q, f or d)",
@@ -1060,7 +1066,7 @@ check("extended slices, item errors", [ax, raises(bad_extended), raises(bad_slic
                                        raises(array("i").pop), raises(ax.pop, 10), raises(ax.index, 7), raises(ax.remove, 7),
                                        raises(ax.extend, array("d", [1.0])), ax.index(9, 1)],
       [array("i", [9, 2, 9, 4]), "ValueError: attempt to assign array of size 1 to extended slice of size 2",
-       "TypeError: can only assign array (not \"list\") to array slice", "OverflowError: signed integer is greater than maximum",
+       "TypeError: can only assign array (not \"list\") to array slice", I_BIG,
        "IndexError: array index out of range", "IndexError: pop from empty array", "IndexError: pop index out of range",
        "ValueError: array.index(x): x not in array", "ValueError: array.remove(x): x not in array",
        "TypeError: can only extend with array of same kind", 2])

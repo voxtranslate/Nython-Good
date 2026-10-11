@@ -149,6 +149,18 @@ under python3 (the other 10 test Nython-only additions).
   the VM and python3; `ide_e2e` 373/373; `ide_lint`, `ny_classcheck`,
   `cbp.py check` clean; `ide_memprobe --check` within its thresholds.
 - The merge had no conflicts.
+- Windows 64-bit (MinGW from `nython.cbp`, under Wine): built (with the new
+  `nyzlib.cpp`), `pe_unwind_check` clean, the sweep 413 runs, 0 not ok -
+  after one fix: `os.path.commonpath` on Windows put the root separator
+  before the drive (`["C:\\a\\b", "C:\\a"]` gave `\\C:\\a`), so tarfile's
+  extraction filters judged every member "outside the destination". It is
+  now CPython's `posixpath`/`ntpath.commonpath` (drive and root split off
+  first, Windows comparing case-insensitively, `..` kept, CPython's
+  ValueErrors), compared with python3's `posixpath` and `ntpath` on both
+  engines; vm_audit46 checks it. vm_audit93's three Linux-only expectations
+  now follow CPython on Windows (no execute bits in `st_mode`; a 32-bit C
+  `long` overflowing first in `array("i", [2 ** 40])`; the filters'
+  `!r`-quoted paths).
 
 ## 0r. Round 79, part B — zlib, archives, pickle, `__slots__`, `__class__` assignment (vm_audit93)
 
