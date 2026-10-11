@@ -4945,6 +4945,17 @@ private:
             for(size_t k=0;k<a.list->size();k++) if(!vm_eq((*a.list)[k],(*b.list)[k])) return false;
             return true;
         }
+        // round 79: a dict's values are compared with == too, so an object's
+        // __eq__ counts ({"d": date(2024, 1, 2)} == {"d": date(2024, 1, 2)}
+        // was False: VMVal's == compares instances by identity)
+        if(a.type==VMType::MAP&&b.type==VMType::MAP&&a.map&&b.map&&a.map!=b.map){
+            if(a.map->size()!=b.map->size()) return false;
+            for(auto& kv:*a.map){
+                auto it=b.map->find(kv.first);
+                if(it==b.map->end()||!vm_eq(kv.second,it->second)) return false;
+            }
+            return true;
+        }
         return a==b;
     }
     bool vm_ne(const VMVal& a, const VMVal& b) {
