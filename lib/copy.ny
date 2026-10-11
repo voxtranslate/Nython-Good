@@ -11,8 +11,9 @@
 #                       an instance gets __copy__() if its class has one, else
 #                       __reduce_ex__(4) / __reduce__() if the class defines
 #                       them, else a new instance of the same class (its
-#                       __init__ is not run) with the same attributes, through
-#                       __getstate__ / __setstate__ when defined; an instance
+#                       __init__ is not run) with the same attributes and slot
+#                       values (copyreg's object.__getstate__, round 79),
+#                       through __getstate__ / __setstate__ when defined; an instance
 #                       of a class deriving from a builtin type (MyInt,
 #                       Stack(list)) is made again with its value, as CPython's
 #                       __reduce_ex__ does (round 77).
@@ -31,6 +32,8 @@
 # Instance attributes are stored with object.__setattr__, so a class's own
 # __setattr__ is bypassed, as Python's __dict__.update() does. Generators
 # and other runtime iterators cannot be copied (TypeError, as in Python).
+
+import copyreg
 
 __all__ = ["Error", "copy", "deepcopy", "replace"]
 
@@ -109,15 +112,23 @@ def _new_instance(cls):
         mutex_unlock(_new_lock)
 
 
+def _own_hook(cls, name):
+    # a hook the class or a base defines (object's, the default, aside)
+    for c in cls.__mro__:
+        if c is object:
+            return false
+        if name in copyreg._cdict(c):
+            return true
+    return false
+
+
 def _state_of(x):
-    # what __reduce_ex__ would give as the state: __getstate__(), else the
-    # attributes (None when there are none, as object.__getstate__)
-    if hasattr(x, "__getstate__"):
+    # what __reduce_ex__ would give as the state: the class's __getstate__(),
+    # else object.__getstate__'s - the attributes (None when there are
+    # none), with the slots' values as a (dict, slots) pair (round 79)
+    if _own_hook(x.__class__, "__getstate__"):
         return x.__getstate__()
-    var d = dict(vars(x))   # a plain dict, not the live view (round 77)
-    if len(d) == 0:
-        return none
-    return d
+    return copyreg._ny_getstate(x)
 
 
 def _set_state(y, state):
@@ -263,11 +274,15 @@ def _plain_state(x):
 
 
 def _reduce(x, cls):
-    # __reduce_ex__(4) / __reduce__() when the class defines one
-    if _has_class_attr(cls, "__reduce_ex__"):
+    # __reduce_ex__(4) / __reduce__() when the class defines one (object's
+    # own, copyreg's default, is not used: an instance is copied below)
+    if _own_hook(cls, "__reduce_ex__"):
         return x.__reduce_ex__(4)
-    if _has_class_attr(cls, "__reduce__"):
+    if _own_hook(cls, "__reduce__"):
         return x.__reduce__()
+    # __new__'s arguments: object.__reduce_ex__(4) as CPython makes it
+    if _own_hook(cls, "__getnewargs_ex__") or _own_hook(cls, "__getnewargs__"):
+        return copyreg._ny_reduce_newobj(x)
     return none
 
 

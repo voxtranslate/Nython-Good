@@ -588,6 +588,7 @@ public:   // NythonExecutor is a struct: members default to public
             "_ny_fn_info","_ny_fn_globals","_ny_keywords",   // inspect, f.__code__, keyword (round 77)
             "_ny_unicode_lookup","_ny_unicode_name",          // unicodedata (round 77)
             "_ny_payload","_ny_payload_new","_ny_getattr_raw","_ny_setfield","_ny_delfield",   // builtin subclasses, __getattribute__, __dict__ (round 77)
+            "_ny_getfield","_ny_mark_slots","_ny_slot_flags","_ny_switch_class",   // __slots__, __class__ assignment (round 79)
             "iter","next","help","Set","Counter","OrderedDict","deque","defaultdict","assert",
             "islice","take",   // lazy iteration (src/NyGen.cpp), both engines
             "_ny_range_iter","_ny_dict_iter",   // range and dict-view iterators (round 78)
@@ -2589,10 +2590,18 @@ public:   // NythonExecutor is a struct: members default to public
             if (object_class_node_ && classNodeOfInstance(obj) == object_class_node_)
                 pyRaise("AttributeError", "'object' object has no attribute '" + name + "'");
         }
+        // obj.__class__ = C (round 79): the prelude's _ny_set_class checks
+        // and switches it (any kind of value - it raises for builtin ones)
+        if (name == "__class__" && !classNodeOfValue(obj)) { setClassOf(obj, val); return; }
         if (any_data_descr_) {
             Value d;
             Node* where = nullptr;
             if (dataDescriptor(obj, name, "__set__", d, &where)) {
+                // a slot (round 79): its value is the instance's field
+                if (member_desc_node_ && classNodeOfInstance(d) == member_desc_node_) {
+                    fieldsOf(obj, "__slots__")->defineByName(name, val);
+                    return;
+                }
                 // the prelude's property: its setter called directly (round 77)
                 if (classNodeOfInstance(d) == prelude_property_node()) {
                     Value fs = attrOf(d, "fset");
@@ -2626,6 +2635,10 @@ public:   // NythonExecutor is a struct: members default to public
                 return;
             }
         }
+        // an instance of a class with __slots__ and no __dict__ takes no
+        // other attribute (round 79; its slots were stored above)
+        if (!slot_flags_.empty() && isDictless(obj))
+            pyRaise("AttributeError", "'" + typeNameOf(obj) + "' object has no attribute '" + name + "'");
         // obj.__dict__ = d: the fields become d's items (round 77; it stored
         // a field named __dict__)
         if (name == "__dict__" && isInstanceValue(obj)) {
@@ -2638,7 +2651,8 @@ public:   // NythonExecutor is a struct: members default to public
             for (auto& k : keys) { auto it = dictFind(sc, k); vals.push_back(it != sc->container->end() ? it->second : NONE_VALUE); }
             Context* f = fieldsOf(obj, "__dict__");
             std::vector<std::string> drop;
-            if (f->container) for (auto& kv : *f->container) if (!nyrt::hidden_field(kv.first)) drop.push_back(kv.first);
+            if (f->container) for (auto& kv : *f->container)
+                if (!nyrt::hidden_field(kv.first) && (!member_desc_node_ || !isSlotOf(obj, kv.first))) drop.push_back(kv.first);   // (slots stay - round 79)
             for (auto& d : drop) f->container->erase(d);
             for (size_t i = 0; i < keys.size(); i++) if (isStringValue(keys[i])) f->defineByName(getStringValue(keys[i]), vals[i]);
             return;
@@ -6570,6 +6584,18 @@ public:   // NythonExecutor is a struct: members default to public
         return cls && findClassMember(cls, attr, d) && isDataDescriptorValue(d);
     }
     void classCreated(const Value& cls, Node* cnode, const nyrt::OrderedKw<Value>& kw, Context* ctx) {
+        // __slots__ (round 79): the prelude's _ny_init_slots (mirrors chunk
+        // "slots") checks them and puts a member descriptor on the class for
+        // each, as type.__new__ does, before anything else sees the class
+        {
+            auto cit = class_ctx_map_.find((void*)cnode);
+            if (cit != class_ctx_map_.end() && cit->second && cit->second->container
+                && cit->second->container->count("__slots__")) {
+                ensureSlotsChunk();
+                std::vector<Value> a{cls};
+                callFunctionValue(global_ctx->getByName("_ny_init_slots"), a, ctx);
+            }
+        }
         {
             auto cit = class_ctx_map_.find((void*)cnode);
             if (cit != class_ctx_map_.end() && cit->second && cit->second->container) {
@@ -8378,7 +8404,9 @@ public:
                 // __set__ / __delete__) wins over the instance's own field of
                 // that name, as in Python (round 78: the field was read
                 // first): the class lookup below reads it.
-                if (fit0 != pit->second->container->end() && !data_descr_names_.empty() && classDataDescriptor(obj, attr))
+                // A slot's member descriptor (round 79) reads that field.
+                if (fit0 != pit->second->container->end() && !data_descr_names_.empty() && classDataDescriptor(obj, attr)
+                    && !isSlotOf(obj, attr))
                     fit0 = pit->second->container->end();
                 if (fit0 != pit->second->container->end()) {
                     const Value& v = fit0->second;
@@ -9052,6 +9080,9 @@ public:
                     return true;
                 }
                 if (attr == "__dict__") {
+                    // (none for a class with __slots__ and no __dict__ - round 79)
+                    if (!slot_flags_.empty() && isDictless(obj))
+                        pyRaise("AttributeError", "'" + typeNameOf(obj) + "' object has no attribute '__dict__'");
                     // a live view of the fields (round 77; it was a copy):
                     // names as dict keys, self.__x__ listed too
                     out = instanceDictView(obj);
@@ -11872,6 +11903,7 @@ public:
     // attribute or a namespace/dict entry is removed; anything else is an
     // AttributeError. (A deleted field used to stay, holding undefined.)
     void delAttrValue(const Value& obj, const std::string& name) {
+        if (name == "__class__" && isInstanceValue(obj)) pyRaise("TypeError", "can't delete __class__ attribute");   // round 79
         if (isInstanceValue(obj) && instanceAttrHook(obj, 1)) {
             std::vector<Value> a{makeStringValue(name)};
             Value o = obj;
@@ -12048,8 +12080,11 @@ public:
             return true;
         }
         // every class reaches object's __subclasses__ and mro (round 77;
-        // a class naming no base has no object in its MRO here)
-        if (!after && (name == "__subclasses__" || name == "mro")) {
+        // a class naming no base has no object in its MRO here), and its
+        // pickle/copy protocol: __reduce_ex__, __reduce__, __getstate__
+        // (round 79)
+        if (!after && (name == "__subclasses__" || name == "mro" || name == "__reduce_ex__" || name == "__reduce__"
+                       || name == "__getstate__")) {
             Node* objn = classNodeByName("object");
             if (objn && objn != cls && std::find(mro.begin(), mro.end(), objn) == mro.end())
                 return findClassMember(objn, name, out, owner);
@@ -12111,7 +12146,8 @@ public:
         auto pit = instance_properties.find(obj.value.p);
         if (obj.type == ValueType::USERDATA && obj.value.p && pit != instance_properties.end() && pit->second && pit->second->container)
             for (auto& kv : *pit->second->container)
-                if (!nyrt::hidden_field(kv.first)) (*d->container)[nypy::key_of_str(kv.first)] = kv.second;
+                if (!nyrt::hidden_field(kv.first) && (!member_desc_node_ || !isSlotOf(obj, kv.first)))   // a slot's value is not in __dict__ (round 79)
+                    (*d->container)[nypy::key_of_str(kv.first)] = kv.second;
         return dv;
     }
     Value instanceDictView(const Value& obj) {
@@ -12146,6 +12182,69 @@ public:
         Context* f = fieldsOf(obj, "__dict__");
         std::string n = isStringValue(name) ? getStringValue(name) : std::string();
         if (n.empty() || nyrt::hidden_field(n) || !f->container || !f->container->erase(n)) missingKey(name, global_ctx);
+    }
+    // ── __slots__ and __class__ assignment (round 79) ───────────────────
+    // The prelude's "slots" chunk does the Python-level work; these keep
+    // what the engine needs: per class the flags _ny_mark_slots gave (1: its
+    // instances have no __dict__, 2: no weak references), the member
+    // descriptor class (a slot's value is the instance's field of its name:
+    // reads and stores go straight to it), and the switch of an instance's
+    // class.
+    std::unordered_map<const Node*, int> slot_flags_;
+    Node* member_desc_node_ = nullptr;
+    void ensureSlotsChunk() {
+        if (member_desc_node_) return;
+        ensureMirror("slots");
+        member_desc_node_ = classNodeByName("_NyMemberDescriptor");
+    }
+    bool isDictless(const Value& obj) {
+        if (!isInstanceValue(obj)) return false;
+        auto it = slot_flags_.find(classNodeOfInstance(obj));
+        return it != slot_flags_.end() && (it->second & 1);
+    }
+    // obj's class holds a slot (a member descriptor) named attr
+    bool isSlotOf(const Value& obj, const std::string& attr) {
+        if (!member_desc_node_) return false;
+        Node* cls = classNodeOfInstance(obj);
+        Value d;
+        return cls && findClassMember(cls, attr, d) && isInstanceValue(d) && classNodeOfInstance(d) == member_desc_node_;
+    }
+    // _ny_getfield(obj, name): a slot's value (AttributeError when unset)
+    Value getField(const Value& obj, const Value& name) {
+        Context* f = fieldsOf(obj, "__slots__");
+        std::string n = isStringValue(name) ? getStringValue(name) : std::string();
+        if (f->container && !n.empty()) {
+            auto it = f->container->find(n);
+            if (it != f->container->end()) return it->second;
+        }
+        pyRaise("AttributeError", "'" + typeNameOf(obj) + "' object has no attribute '" + n + "'");
+        return NONE_VALUE;
+    }
+    void markSlots(const Value& cls, int flags) {
+        if (Node* cn = classNodeOfValue(cls)) slot_flags_[cn] = flags;
+    }
+    int slotFlags(const Value& cls) {
+        Node* cn = classNodeOfValue(cls);
+        auto it = cn ? slot_flags_.find(cn) : slot_flags_.end();
+        return it == slot_flags_.end() ? 0 : it->second;
+    }
+    void setClassOf(const Value& obj, const Value& cls) {
+        ensureSlotsChunk();
+        std::vector<Value> a{obj, cls};
+        callFunctionValue(global_ctx->getByName("_ny_set_class"), a, global_ctx);
+    }
+    // _ny_switch_class(obj, cls): every reference to obj sees cls at once
+    // (the class is kept by the instance's identity, not in each value)
+    void switchClass(const Value& obj, const Value& cls) {
+        Node* cn = classNodeOfValue(cls);
+        if (!isInstanceValue(obj) || !cn || isInstanceValue(cls))
+            pyRaise("TypeError", "__class__ assignment only supported for mutable types or ModuleType subclasses");
+        const std::string tag = "__instance__:" + static_cast<ClassNode*>(cn)->name;
+        void* p = obj.value.p;
+        instance_to_class[p] = cls.value.p;
+        func_names[p] = tag;
+        if (auto* io = dynamic_cast<nyheap::Inst*>(obj.value.o)) { io->tag = tag; io->cls = cls.value.p; }
+        mro_cache_.clear();
     }
     Value unwrapPayload(const Value& v) { Value p; return any_payload_ && payloadOf(v, p) ? p : v; }
     void unwrapPayloadArgs(std::vector<Value>& args) {
@@ -12469,7 +12568,10 @@ public:
     Value reflectVars(std::vector<Value>& args, Context* ctx) {
         if (args.empty()) return reflectLocals(ctx);
         const Value& o = args[0];
-        // an instance's: its __dict__, the live view (round 77)
+        // an instance's: its __dict__, the live view (round 77); none with
+        // __slots__ and no __dict__ (round 79)
+        if (isInstanceValue(o) && !slot_flags_.empty() && isDictless(o))
+            pyRaise("TypeError", "vars() argument must have __dict__ attribute");
         if (isInstanceValue(o)) return instanceDictView(o);
         auto* d = new Object((Runnable*)runner, "map", Type::MAP);
         Value dv((Collectable*)d);

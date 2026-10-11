@@ -182,6 +182,9 @@ class ref:
                 var b = e0.basic()
                 if b is not None and b._ny_alive():
                     return b
+        # a class with __slots__ and no __weakref__ slot (round 79)
+        if _ny_slot_flags(type(ob)) & 2:
+            raise TypeError("cannot create weak reference to '" + type(ob).__name__ + "' object")
         var w = _wr(ob)          # TypeError for what cannot be referenced
         var me = object.__new__(cls)
         object.__setattr__(me, "_ny_w", w)

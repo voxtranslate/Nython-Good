@@ -602,6 +602,15 @@ Value dispatch_core(NythonExecutor& E,
         // stored or removed directly (round 77)
         if (name == "_ny_setfield" && args.size() >= 3) { E.setField(args[0], args[1], args[2]); return NONE_VALUE; }
         if (name == "_ny_delfield" && args.size() >= 2) { E.delField(args[0], args[1]); return NONE_VALUE; }
+        // __slots__ and __class__ assignment (round 79; the prelude's "slots"
+        // chunk): a slot's value, a class's slot flags, an instance's class
+        if (name == "_ny_getfield" && args.size() >= 2) return E.getField(args[0], args[1]);
+        if (name == "_ny_mark_slots" && args.size() >= 2) {
+            E.markSlots(args[0], args[1].type == ValueType::INTEGER ? (int)bigint_to_i64(args[1].value.i) : 0);
+            return NONE_VALUE;
+        }
+        if (name == "_ny_slot_flags") return Value((int)(args.empty() ? 0 : E.slotFlags(args[0])));
+        if (name == "_ny_switch_class" && args.size() >= 2) { E.switchClass(args[0], args[1]); return NONE_VALUE; }
         // object.__getattribute__(obj, name): the attribute lookup without
         // the class's __getattribute__ and __getattr__ (round 77)
         if (name == "_ny_getattr_raw" && args.size() >= 2) return E.rawGetattr(args[0], E.getStringValue(args[1]), ctx);
