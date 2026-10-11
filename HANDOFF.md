@@ -10,7 +10,10 @@ assignment) and **§0r2** (decimal checked against 1,981 vectors, difflib
 with patience/histogram diffs, tomllib, configparser, shlex, html, an XML
 parser written in Nython under ElementTree and minidom, ipaddress,
 graphlib, contextvars per task, concurrent.futures with real processes,
-zoneinfo, mimetypes; live module namespaces); both engines. Round 78 — **§0q** (lazy `range`, live dict views, lazy
+zoneinfo, mimetypes; live module namespaces) and **§0r3** (`sys.settrace`/
+`setprofile` on both engines at one byte test when unused, PEP 667 frame
+locals, bdb/pdb/cProfile/profile/pstats/timeit/trace/cmd/code, and Whyline-
+style "Why?" questions in the debugger by dynamic slicing); both engines. Round 78 — **§0q** (lazy `range`, live dict views, lazy
 zip/map/filter/enumerate/reversed), **§0q2** (frame objects, weak references to
 functions/classes/sets, coroutine and async generator objects) and **§0q3**
 (the data-model gaps: name mangling, methods bound whatever their first
@@ -47,6 +50,114 @@ multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
 
 ---
+
+## 0r3. Round 79, part A — `sys.settrace`/`setprofile`, pdb and the profilers, "Why?" in the debugger (vm_audit91, vm_audit92)
+
+`examples/vm_audit91.ny` (104 checks) passes on the interpreter, the VM and
+python3.11 (101 under 3.13: the pure-Python `profile` checks are skipped on
+3.12+, where CPython's own `profile.py` sees a stray "return" event after
+`sys.settrace` was used); where 3.11 and 3.13 differ (f_locals write-through,
+pdb's help layout and function-breakpoint line, trace's layout) Nython
+follows 3.13 and the test accepts the running python3's answer.
+`examples/vm_audit92.ny` (49, Nython-only) checks `text_defuse` and the
+slicer over a real `nython --trace` recording.
+
+### Tracing and profiling hooks, both engines
+- `sys.settrace/gettrace/setprofile/getprofile`, `threading.settrace/
+  setprofile/gettrace/getprofile` (threads started afterwards); events
+  call/line/return/exception (trace) and call/return/c_call/c_return/
+  c_exception (profile) with CPython 3.11's rules: the global function's
+  result is the frame's `f_trace`, `f_trace_lines`, generators get call on
+  each resume and return on each yield, a hook runs with hooks off and one
+  that raises is unset with the exception continuing in the traced code,
+  calling a type (`str`, `zip`...) makes no c_call.
+- **Cost when unused**: one thread-local byte (`nytrace::t_hooks`,
+  `include/NyPyTrace.hpp`) tested per statement (interpreter
+  `noteStatement`) / per instruction (VM: the same test now also covers
+  the old `NY_VM_TRACE` dump) and per call. Measured against 9bc58e4
+  (minimum of 9-15 alternating runs): interpreter -1.4%..+1.5%, VM
+  -0.1%..+2.7% (the mixed benchmark's +2.6% is a little above the 2% aim;
+  medians -2.9%..+3.6% on a shared machine).
+- Interpreter: `pyHookCall`/`pyEv*` (call, line, return, exception once per
+  frame, handled, leave), line events for `for`/`while` headers on each
+  repetition, each `elif` test reached, an except clause's own line, the
+  `with` line on exit; `runBodyHooked` only when a hook is set;
+  `src/NyGen.cpp` generator events. **exec/eval code now runs in a frame
+  of its own** (`runSnippetFrame`, as on the VM), hooks or not.
+- VM: a line-start map per code object (a statement's first instruction,
+  not a docstring; `elif`, except handlers, the with exit; `try:` gets a
+  NOP line start and `pass` compiles to a NOP), CPython 3.11's line rule (a
+  line start on a new line or any backward jump), `run_frame_hooked`,
+  `vm_end_line` (an implicit return or a finally's re-raise reports the last
+  line that ran), c_call at `CALL_KW`/`CALL_FUNCTION`/`CALL_METHOD`/`PRINT`.
+- **PEP 667**: `frame.f_locals` of a running function is a write-through
+  `_NyFrameLocals` proxy (pdb's `!x = 5` changes `x`); module frames give
+  their globals. Assigning `f_lineno` raises ValueError (no jumps).
+- Parser (both engines): elif and except clauses carry their own line (it
+  was the if's/try's, wrong in tracebacks too); `async @staticmethod`
+  works; classes have `__qualname__` (`Outer.Inner`, `f.<locals>.C`);
+  `eval("a if c else b")` (was a SyntaxError); `inspect.signature` keeps a
+  receiver named `this` on the VM.
+
+### Modules (`lib/`)
+`bdb` (CPython's Bdb/Breakpoint), `pdb` (every command, aliases, display,
+`commands`, `!` statements, post-mortem, `.pdbrc`/`-c`, `nython -m pdb`;
+`breakpoint()` -> `sys.breakpointhook` honouring `PYTHONBREAKPOINT`),
+`cProfile` (`_lsprof`'s algorithm: recursion counts `29/3`, callers, its
+builtin labels, overhead subtracted), `profile`, `pstats` (every report and
+sort; `SortKey`), `timeit` (+ CLI), `trace` (count/trace/listfuncs/
+trackcalls, `.cover` files; executable lines from `text_defuse`), `cmd`,
+`code`, `codeop`, `reprlib`; `threading` gained the hook setters. `-m
+cProfile`, `-m profile`, `-m trace`, `-m timeit` and `-m pdb` were compared
+with python3.13's output.
+
+### "Why?" questions in the IDE's debugger (the innovation)
+- `lib/ide_debugger.ny`: **dynamic backward slicing over the `--trace`
+  recording** joined with static def/use from the real parser.
+  `why_value(name, at)` follows each read back to the statement that last
+  wrote it, the test it ran under and the call that passed a parameter;
+  `why_not(file, line)` names the controlling test that never went that
+  line's way (with its last values), or the function nobody called, or the
+  step after which execution left the block. After Ko & Myers (the
+  Whyline, ICSE 2008), Agrawal & Horgan (PLDI 1990), Korel & Laski (1988),
+  Ferrante/Ottenstein/Warren's PDG (1987).
+- `text_defuse(source)` (`src/builtins/text.cpp`, both engines): per line
+  the statement kind, reads, writes, controlling tests (innermost first,
+  with the branch taken), the enclosing function, a docstring flag.
+- IDE: `nython.debug.whyValue` / `nython.debug.whyNot` (Run menu, palette),
+  a "?" button and context entry on Variables rows, "Why Didn't This Line
+  Run?" in the editor's context menu while debugging; a WHY section in Run
+  and Debug whose rows move the replay to their step (built once per
+  question; the painter only draws). `tools/ide_e2e.py` scenario
+  `debug-why` (17 checks).
+
+### Not done
+- pdb `jump` (frames cannot change line on either engine).
+- Class bodies and comprehensions have no frames (no call/return for them;
+  3.12+ counts comprehension lines per item); only the matching except
+  clause gets a line event (CPython reports each clause tested); await
+  points of a coroutine get no call/return events.
+- `--trace` records no step when a `while` test is re-evaluated, so
+  `why_not` sees only its first evaluation; a `for` header's next item is
+  credited to the header.
+- `dump_stats` writes JSON lines (not marshal) and trace's `-f` counts file
+  is JSON (not pickle): no file exchange with CPython.
+- codeop differs from CPython on `'a b'` and `'try:\n x\n'`.
+- Found, worked around: `os.environ` is a snapshot that does not reach the
+  process environment; `exec("import math as m", ns)` binds `m` in the
+  globals on the VM (`define_math_module`) and copies math's members into
+  `ns` on the interpreter; `locals()` leaves out user variables with dunder
+  names; cProfile labels natives `builtins.X`; library paths print as
+  `build/../lib/...`.
+
+### Verified (merged onto parts B and C)
+- Linux, both engines: the sweep 417 runs, 0 not ok; vm_audit91 104 on the
+  interpreter, the VM and python3, vm_audit92 49 on both engines, and
+  vm_audit93/94/95, 44, 88, 89 still pass; `ide_e2e` 390/390 (the new
+  `debug-why` scenario included); `ide_lint`, `ny_classcheck`, `cbp.py
+  check` clean; `ide_memprobe --check` passes.
+- The merge conflicted only in the lexer, where parts A and C made the same
+  comment-line fix.
 
 ## 0r2. Round 79, part C — text formats and utility modules (vm_audit94, vm_audit95)
 

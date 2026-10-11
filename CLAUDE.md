@@ -372,6 +372,8 @@ These were aligned to match how the IDE calls them:
 | vm_audit89 | 62 | round 78: frame objects (sys._getframe, inspect.stack/currentframe/getframeinfo/getargvalues, traceback frames with locals, gi_frame, logging's caller info), weak references to functions/classes/sets/builtin subclasses, coroutine objects driven by hand (send/throw/close, cr_*, never-awaited warning), async generator objects (passes under python3) |
 | vm_audit87 | 73 | round 77: `in`/ordering TypeErrors, exceptions' str/repr/args and fields (OSError errno/filename, Unicode errors, SyntaxError), runtime errors with their fields, `iter(f, sentinel)`, generator attributes, `__format__`, `os.stat_result`, live `exec` namespaces, recursive reprs (72 pass under python3) |
 | vm_audit90 | 65 | round 78: lazy `range` (CPython's rangeobject.c: big ints, len/OverflowError, indexing, slicing to a range, O(1) `in`, index/count, ==/hash, repr, read-only start/stop/step, `sum` in O(1)), live dict views (set operations, comparisons, isdisjoint, `.mapping`, reversed, "dictionary changed size during iteration"), lazy zip/map/filter/enumerate/reversed (`zip(strict=True)`) - 63 pass under python3 |
+| vm_audit91 | 104 | round 79: `sys.settrace`/`setprofile` events in CPython's order (calls, lines, returns, exceptions, generators, c_calls), `f_trace`, PEP 667 `f_locals` write-through, bdb/pdb scripted sessions, cProfile/pstats counts, timeit, trace, cmd, code/codeop, reprlib, class `__qualname__`, async staticmethods (passes under python3.11; 101 under 3.13) |
+| vm_audit92 | 49 | round 79: `text_defuse` and the debugger's "Why?" slicer (`why_value`/`why_not`) over a real `--trace` recording (Nython-only) |
 | vm_audit93 | 176 | round 79: zlib (native DEFLATE, CPython-made streams read and Nython-made ones read by CPython, the opt-in optimal parse), binascii, gzip, zipfile, tarfile, pickle byte-identical to CPython at protocols 0-5, copyreg, array, `__slots__`, `__class__` assignment (passes under python3) |
 | vm_audit94 | 162 | round 79: difflib (byte-identical to CPython, plus patience/histogram diffs), shlex, configparser, tomllib (+ dumps), html, xml (an expat-compatible parser in Nython, ElementTree, minidom), ipaddress, graphlib, contextvars per task, concurrent.futures (threads and real processes), zoneinfo, mimetypes - generated from `tools/vm_audit94_spec.py` (152 pass under python3; 10 test Nython-only additions) |
 | vm_audit95 | 2050 | round 79: decimal - the API and 1,981 vectors with CPython's results and flags at precisions 9/16/34 (passes under python3) |
@@ -1086,6 +1088,20 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   `__eq__` among same-hash keys; `__str__`/`__len__`/`__bool__`/
   `__hash__`/`__iter__` results are checked; `object()` takes no
   attributes.
+
+## Round 79: tracing, debugging, profiling (see `HANDOFF.md` §0r3)
+
+- `sys.settrace`/`setprofile` (and `threading.`'s) on both engines with
+  CPython's events; unused they cost one thread-local byte test
+  (`nytrace::t_hooks`, `include/NyPyTrace.hpp`) per statement/instruction
+  and call. **Any new hot path must keep it at one test.**
+- exec/eval code runs in a frame of its own on the interpreter too; elif and
+  except clauses carry their own line; classes have `__qualname__`;
+  `frame.f_locals` writes through (PEP 667).
+- `lib/`: bdb, pdb (`breakpoint()`, `PYTHONBREAKPOINT`), cProfile, profile,
+  pstats, timeit, trace, cmd, code, codeop, reprlib.
+- The IDE debugger answers "Why does x have this value?" / "Why didn't this
+  line run?" (dynamic slicing over `--trace` + `text_defuse`).
 
 ## Round 79: binary data and serialization (see `HANDOFF.md` §0r)
 

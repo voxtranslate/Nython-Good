@@ -5620,7 +5620,7 @@ Full detail in `HANDOFF.md` §0q, §0q2, §0q3. New tests: `vm_audit88` (the dat
 
 ## Round 79 — binary data and serialization, tracing and profiling, text formats
 
-Full detail in `HANDOFF.md` §0r, §0r2. New tests: `vm_audit93` (zlib, archives, pickle, `__slots__`, `__class__` assignment, 176 checks), `vm_audit94` (text formats and utilities, 162), `vm_audit95` (decimal, 2050); all pass under python3 too (94: the 152 that are not Nython-only).
+Full detail in `HANDOFF.md` §0r, §0r2, §0r3. New tests: `vm_audit91` (settrace/setprofile, pdb, profilers, 104), `vm_audit92` (the debugger's Why? slicer, 49, Nython-only), `vm_audit93` (zlib, archives, pickle, `__slots__`, `__class__` assignment, 176 checks), `vm_audit94` (text formats and utilities, 162), `vm_audit95` (decimal, 2050); all but 92 pass under python3 too (94: the 152 that are not Nython-only).
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -5639,4 +5639,9 @@ Full detail in `HANDOFF.md` §0r, §0r2. New tests: `vm_audit93` (zlib, archives
 | VM: `{"d": date(1,2,3)} == {"d": date(1,2,3)}` was false | dict values compared by identity | compared with `==` |
 | An asyncio task saw the context of whoever ran last | no per-task context | each task starts in a copy of its creator's (PEP 567) |
 | Windows: `os.path.commonpath(["C:\\a\\b", "C:\\a"])` gave `\\C:\\a`, so tarfile's filters refused every member | the root separator was written before the drive | CPython's `posixpath`/`ntpath.commonpath` (drive and root first, case-insensitive on Windows, `..` kept, its ValueErrors) |
+| No `sys.settrace`/`setprofile`, pdb, bdb, cProfile, profile, pstats, timeit, trace, cmd, code | — | hooks on both engines at one byte test when unused; the modules over them |
+| Tracebacks and line events gave an `elif` test or an except clause the `if`'s/`try`'s line | those nodes carried the parent's token | their own token |
+| `async @staticmethod` failed; nested classes' `__qualname__` was the bare name | the desugared body called itself by a name not in scope; no class qualname | rewritten to an inner function; `Outer.Inner`, `f.<locals>.C` |
+| `eval("a if c else b")` was a SyntaxError (both engines) | the expression-program check did not accept a conditional | accepted |
+| `frame.f_locals["x"] = 5` changed nothing | f_locals was a snapshot | PEP 667 write-through proxy |
 
