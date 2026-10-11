@@ -358,6 +358,20 @@ check("gzip errors", [raises(gzip.decompress, b"not gzip data"), raises(gzip.dec
        "ValueError: Argument 'encoding' not supported in binary mode", "ValueError: Invalid mode: 'rtb'", True])
 wr = gzip.GzipFile(fileobj=io.BytesIO(), mode="wb")
 check("read on a write-only GzipFile", raises(wr.read), "OSError: [Errno 9] read() on write-only GzipFile object")
+rg = gzip.GzipFile(fileobj=io.BytesIO(gzip.compress(T, 6, mtime=1)))
+ba = bytearray(10)
+check("read1, readinto, iteration, seek from the end", [rg.read1(5), rg.readinto(ba), bytes(ba), rg.seek(-3, 2), rg.read(), rg.closed,
+                                                        rg.readable(), rg.writable(), rg.mode == gzip.READ],
+      [T[:5], 10, T[5:15], 2997, T[-3:], False, True, False, True])
+rg.close()
+check("closed", [rg.closed, raises(rg.read)], [True, "ValueError: I/O operation on closed file"])
+with gzip.GzipFile(fileobj=io.BytesIO(), mode="wb") as wg:
+    wg.write(b"abc")
+    wg.seek(10)
+    check("seek forward while writing pads with zeros", [wg.tell(), raises(wg.seek, 2), raises(wg.seek, 0, 2)],
+          [10, "OSError: Negative seek in write mode", "ValueError: Seek from end not supported"])
+lines = list(gzip.GzipFile(fileobj=io.BytesIO(gzip.compress(b"a\nbb\n\nccc", mtime=0))))
+check("lines", lines, [b"a\n", b"bb\n", b"\n", b"ccc"])
 
 # ═══ zipfile ═════════════════════════════════════════════════════════════════
 ZIP_CPY = b'PK\x03\x04\x14\x00\x00\x00\x08\x00\xd5S\xb1P\xe4\x98\x9a\xe4\r\x00\x00\x00\xa0\x00\x00\x00\x0f\x00\x00\x00docs/readme.txt+JMLQ\xc8M\xe5*\x1a\xa44\x00PK\x03\x04\x14\x00\x00\x00\x00\x00\xc0S\xb1P\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00docs/PK\x03\x04\x14\x00\x00\x08\x00\x00\x83\x18"R<.\xa6\r(\x00\x00\x00(\x00\x00\x00\t\x00\x00\x00caf\xc3\xa9.bin\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\x0c\r\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f !"#$%&\'PK\x01\x02\x14\x03\x14\x00\x00\x00\x08\x00\xd5S\xb1P\xe4\x98\x9a\xe4\r\x00\x00\x00\xa0\x00\x00\x00\x0f\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xa4\x01\x00\x00\x00\x00docs/readme.txtPK\x01\x02\x14\x03\x14\x00\x00\x00\x00\x00\xc0S\xb1P\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x05\x00\x00\x00\x00\x00\x00\x00\x00\x00\x10\x00\xedA:\x00\x00\x00docs/PK\x01\x02\x14\x03\x14\x00\x00\x08\x00\x00\x83\x18"R<.\xa6\r(\x00\x00\x00(\x00\x00\x00\t\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01]\x00\x00\x00caf\xc3\xa9.binPK\x05\x06\x00\x00\x00\x00\x03\x00\x03\x00\xa7\x00\x00\x00\xac\x00\x00\x00\x0f\x00made by CPython'

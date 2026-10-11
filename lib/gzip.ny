@@ -344,7 +344,7 @@ class GzipFile(io.BufferedIOBase):
 
     def _check_not_closed(self):
         if self.fileobj is none:
-            raise ValueError("I/O operation on closed file.")
+            raise ValueError("I/O operation on closed file")
 
     def write(self, data):
         self._check_not_closed()
