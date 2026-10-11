@@ -329,6 +329,24 @@ for i in range(N):
     seen.append(read_v(fo))
 check("a property set on the class later", [seen[0], seen[H - 1], seen[H], seen[N - 1]], [1, 1, 7, 7])
 
+class Stor:
+    def __init__(self):
+        self.v = 0
+so = Stor()
+setlog = []
+def store_v(o, x):
+    o.v = x
+def stor_get(self):
+    return -1
+def stor_set(self, x):
+    setlog.append(x)
+for i in range(N):
+    if i == H:
+        Stor.v = property(stor_get, stor_set)   # stores now go to the setter
+    store_v(so, i)
+check("a property with a setter set on the class after stores specialized",
+      [len(setlog), setlog[0], setlog[-1], so.v], [N - H, H, N - 1, -1])
+
 class Lazy:
     def __init__(self):
         self.here = 1
@@ -560,6 +578,211 @@ def raises_in_loop(n):
             out.append(-i)
     return out
 check("exceptions inside specialized loops", raises_in_loop(7), [0, 2, 4, -3, 8, 10, -6])
+
+# ── exceptions crossing specialized calls ────────────────────────────────────
+def level3(k):
+    if k % 2:
+        raise KeyError(k)
+    return k
+def level2(k):
+    return level3(k) + 1
+def level1(k):
+    return level2(k) * 2
+caught = []
+for i in range(N):
+    try:
+        level1(i)
+    except KeyError as e:
+        caught.append(e.args[0])
+check("an exception through three specialized calls", [len(caught), caught[:3], caught[-1]], [N // 2, [1, 3, 5], N - 1])
+
+def tb_names(e):
+    out = []
+    tb = e.__traceback__
+    while tb is not None:
+        out.append(tb.tb_frame.f_code.co_name)
+        tb = tb.tb_next
+    return out
+def tb_lines(e, base):
+    out = []
+    tb = e.__traceback__
+    while tb is not None:
+        out.append(tb.tb_lineno - base)
+        tb = tb.tb_next
+    return out
+def deep_raise(n):
+    if n == 0:
+        raise ValueError("bottom")
+    return deep_raise(n - 1)
+def tb_probe():
+    try:
+        deep_raise(3)
+    except ValueError as e:
+        return e
+base_line = deep_raise.__code__.co_firstlineno
+for i in range(N):
+    last = tb_probe()
+check("the traceback of an exception through specialized calls",
+      [tb_names(last), tb_lines(last, base_line)[1:]],
+      [["tb_probe", "deep_raise", "deep_raise", "deep_raise", "deep_raise"], [3, 3, 3, 2]])
+
+order = []
+def fin_inner(i):
+    try:
+        if i % 3 == 0:
+            raise RuntimeError(i)
+        return i
+    finally:
+        order.append(("inner", i))
+def fin_outer(i):
+    try:
+        return fin_inner(i) * 10
+    finally:
+        order.append(("outer", i))
+got = []
+for i in range(9):
+    try:
+        got.append(fin_outer(i))
+    except RuntimeError as e:
+        got.append(("err", e.args[0]))
+check("finally blocks of specialized frames an exception leaves",
+      [got, order[:6]],
+      [[("err", 0), 10, 20, ("err", 3), 40, 50, ("err", 6), 70, 80],
+       [("inner", 0), ("outer", 0), ("inner", 1), ("outer", 1), ("inner", 2), ("outer", 2)]])
+
+def reraiser(i):
+    try:
+        raise TypeError("t%d" % i)
+    except TypeError:
+        if i % 2:
+            raise
+        raise ValueError("v%d" % i)
+def from_raiser(i):
+    try:
+        reraiser(i)
+    except TypeError as e:
+        raise LookupError("from") from e
+seen = []
+for i in range(6):
+    try:
+        from_raiser(i)
+    except LookupError as e:
+        seen.append(("lookup", type(e.__cause__).__name__, e.__suppress_context__))
+    except ValueError as e:
+        seen.append(("value", type(e.__context__).__name__, str(e)))
+check("re-raise, raise from, __context__ across specialized calls", seen,
+      [("value", "TypeError", "v0"), ("lookup", "TypeError", True), ("value", "TypeError", "v2"),
+       ("lookup", "TypeError", True), ("value", "TypeError", "v4"), ("lookup", "TypeError", True)])
+
+def keyerr(d, k):
+    return d[k]
+dd = {"a": 1, 2: "two", (1, 2): "tuple", 2.5: "float"}
+for i in range(N):
+    keyerr(dd, "a")
+seen = [keyerr(dd, 2), keyerr(dd, (1, 2)), keyerr(dd, 2.5)]
+try:
+    keyerr(dd, "zz")
+    seen.append("no error")
+except KeyError as e:
+    seen.append(("KeyError", e.args[0]))
+seen.append(keyerr([10, 20, 30], -1))
+check("dict reads at a specialized site: other keys, a missing key, a list", seen,
+      [ "two", "tuple", "float", ("KeyError", "zz"), 30])
+
+def setkey(d, k, v):
+    d[k] = v
+    return d
+for i in range(N):
+    setkey({}, "k", i)
+check("dict and list stores at a specialized site",
+      [setkey({}, "x", 1), setkey({1: 0}, 1, 2), setkey([0, 0], 1, 5), setkey([0, 0], -2, 7)],
+      [{"x": 1}, {1: 2}, [0, 5], [7, 0]])
+
+def getitem(seq, i):
+    return seq[i]
+for i in range(N):
+    getitem([1, 2, 3], i % 3)
+errs = []
+for s in [[1, 2, 3], (4, 5, 6), "abc", range(10, 13)]:
+    errs.append(getitem(s, -1))
+    try:
+        getitem(s, 3)
+        errs.append("no error")
+    except IndexError:
+        errs.append("IndexError")
+check("sequence reads at a specialized site", errs, [3, "IndexError", 6, "IndexError", "c", "IndexError", 12, "IndexError"])
+
+def unpack(p):
+    a, b = p
+    return a - b
+for i in range(N):
+    unpack((i, 1))
+errs = [unpack([5, 2]), unpack("ab" if False else (9, 4))]
+for bad in [(1, 2, 3), (1,)]:
+    try:
+        unpack(bad)
+        errs.append("no error")
+    except ValueError:
+        errs.append("ValueError")
+check("unpacking at a specialized site", errs, [3, 5, "ValueError", "ValueError"])
+
+def make_counter2():
+    count = 0
+    def inc():
+        nonlocal count
+        count += 1
+        return count
+    def peek():
+        return count
+    return inc, peek
+inc2, peek2 = make_counter2()
+seen = []
+for i in range(N):
+    inc2()
+    seen.append(peek2())
+check("a closure variable rebound while another closure reads it", [seen[0], seen[59], seen[N - 1]], [1, 60, N])
+
+def make_readers(k):
+    def r():
+        return k
+    return r
+readers = [make_readers(j) for j in range(5)]
+check("one closure code, many environments", [f() for f in readers] * 2, [0, 1, 2, 3, 4] * 2)
+
+def gen_method_args(items):
+    out = []
+    for x in items:
+        out.append((yield x))
+    return out
+g = gen_method_args([1, 2, 3])
+vals = [next(g), g.send("a"), g.send("b")]
+try:
+    g.send("c")
+except StopIteration as e:
+    vals.append(e.value)
+check("a method call suspended between its name and its arguments", vals, [1, 2, 3, ["a", "b", "c"]])
+
+def strs(words):
+    out = []
+    for w in words:
+        out.append(w.strip(".").upper())
+    return out
+check("str methods at a specialized site", [strs(["a.", ".b", "c"] * 3)[:3], strs([])], [["A", "B", "C"], []])
+def lst_ops(n):
+    xs = []
+    for i in range(n):
+        xs.append(i)
+        if i % 3 == 0:
+            xs.pop()
+    xs.insert(0, -1)
+    return [xs[:4], xs.count(1), xs.index(2), len(xs)]
+check("list methods at a specialized site", lst_ops(30), [[-1, 1, 2, 4], 1, 2, 21])
+try:
+    "abc".nosuchmethod()
+    errs = "no error"
+except AttributeError:
+    errs = "AttributeError"
+check("a missing str method", errs, "AttributeError")
 
 # ── modules ──────────────────────────────────────────────────────────────────
 import math
