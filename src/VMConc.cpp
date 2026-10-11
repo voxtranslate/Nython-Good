@@ -197,7 +197,12 @@ struct VMConcEngine : nyconc::Engine {
     }
     void* state_new() override { return new VMThreadState(); }
     void state_free(void* p) override { delete static_cast<VMThreadState*>(p); }
-    void swap_in(void* p) override { swap(static_cast<VMThreadState*>(p)); }
+    void swap_in(void* p) override {
+        // NY_VM_TRACE's dump is a bit of the thread-local nytrace::t_hooks
+        // (round 79): a thread of the program prints its instructions too
+        if (vm.vm_trace_) nytrace::t_hooks |= nytrace::VMDEBUG;
+        swap(static_cast<VMThreadState*>(p));
+    }
     void swap_out(void* p) override { swap(static_cast<VMThreadState*>(p)); }
     void swap(VMThreadState* st) {
         if (!st) return;

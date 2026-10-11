@@ -45,6 +45,14 @@ class DebugSession:
         self.logs = []             # log-message breakpoints passed by continue_fwd
         self.logging = false
         self._hit_nos = none       # per step: how many times its line was reached so far
+        # Why? questions (round 79): per-file text_defuse, decoded variables,
+        # the call each step belongs to and each call's caller step
+        self._defuse_cache = none
+        self._vars_cache = none
+        self._acts = none
+        self._act_parent = []
+        self._prod_line = 0        # _producer's answer was a loop header's write (its line)
+        self._src_cache = none     # file -> its lines
 
     def reset(self):
         self.__init__()
@@ -61,6 +69,12 @@ class DebugSession:
         self.exception = ""
         self.exception_at = ""
         self.capped = false
+        self._defuse_cache = none
+        self._src_cache = none
+        self._vars_cache = none
+        self._acts = none
+        self._act_parent = []
+        self._hit_nos = none
         var text = read_file(path)
         if text == none:
             return false
@@ -461,6 +475,426 @@ class DebugSession:
         self.active = false
         self.state = "idle"
         self.pos = -1
+
+    # ── Why? questions (round 79) ────────────────────────────────────────────
+    # The Whyline (Ko & Myers, "Debugging Reinvented: Asking and Answering
+    # Why and Why Not Questions about Program Output", ICSE 2008) answered
+    # by dynamic backward slicing over the recording (Agrawal & Horgan,
+    # "Dynamic Program Slicing", PLDI 1990; Korel & Laski 1988): a step
+    # depends on the last earlier step of its own call that wrote a
+    # variable it reads (data dependence), and on the last evaluation of
+    # the predicate that decided whether it ran (control dependence, from
+    # the program dependence graph of Ferrante, Ottenstein & Warren, 1987).
+    # The static half - each line's read and write sets and its controlling
+    # predicates - comes from the real parser (text_defuse); the dynamic
+    # half from the recording.
+    #
+    # Approximations: a step "writes" x when its line's static write set
+    # holds x or the recorded value of x differs at the next step of the
+    # same call (heap and attribute writes are seen only through the
+    # recorded variables' printed values: obj.f = v writes obj, xs.append(v)
+    # writes xs); calls are told apart by depth and function name, so two
+    # calls of one function from one statement merge; a parameter's value
+    # is traced to the call's line in the caller (its argument expressions
+    # are that line's reads); a global read inside a function is followed
+    # in the module's steps.
+    #
+    #   why_value(name, at=None, limit=40)   why does `name` have the value
+    #       it has at step `at` (the current step): the slice, depth first,
+    #       as entries {step, file, line, fn, level, kind, var, value, text};
+    #       kind "value" (the question), "data" (wrote the variable),
+    #       "control" (the predicate it ran under), "call" (a parameter's
+    #       call), "param", "note"
+    #   why_not(file, line, at=None)   why did `line` not run (up to step
+    #       `at`, the whole recording by default): the controlling
+    #       predicates' last evaluations with the values they read and
+    #       their outcome, or "never called" for a function nobody called;
+    #       kind "never", "predicate", "exit", "note"
+    #   defuse(file)   text_defuse of the file's source (cached)
+
+    def defuse(self, file):
+        if self._defuse_cache == none:
+            self._defuse_cache = {}
+        var d = self._defuse_cache.get(file)
+        if d == none:
+            var text = read_file(file)
+            d = text_defuse(text) if text != none else []
+            self._defuse_cache[file] = d
+        return d
+
+    def _du(self, file, line):
+        var d = self.defuse(file)
+        if line < 1 or line > len(d):
+            return none
+        return d[line - 1]
+
+    def _vars_at(self, i):
+        if self._vars_cache == none:
+            self._vars_cache = {}
+        var v = self._vars_cache.get(i)
+        if v == none:
+            var ev = json_decode(self.raw[i])
+            v = ev.get("v") if ev != none else none
+            if v == none:
+                v = {}
+            if len(self._vars_cache) > 4096:
+                self._vars_cache = {}
+            self._vars_cache[i] = v
+        return v
+
+    # The call each step belongs to: steps at one depth between a call and
+    # its return; a change of function name at the same depth starts another.
+    def _activations(self):
+        if self._acts != none and len(self._acts) == self.n:
+            return self._acts
+        var acts = []
+        var stack = []          # [depth, act id, fn] innermost last
+        var next_id = 0
+        var parent = []         # act id -> the caller's step before it began (-1)
+        var i = 0
+        while i < self.n:
+            var d = self.depths[i]
+            var fn = self._fn_of(i)
+            while len(stack) > 0 and stack[-1][0] > d:
+                stack.pop()
+            if len(stack) > 0 and stack[-1][0] == d and stack[-1][2] == fn and not (i > 0 and self.depths[i - 1] > d and fn != "<module>" and self._starts_call(i)):
+                acts.append(stack[-1][1])
+            else:
+                if len(stack) > 0 and stack[-1][0] == d:
+                    stack.pop()
+                var caller = -1
+                var k = i - 1
+                while k >= 0:
+                    if self.depths[k] < d:
+                        caller = k
+                        break
+                    k = k - 1
+                stack.append([d, next_id, fn])
+                parent.append(caller)
+                acts.append(next_id)
+                next_id = next_id + 1
+            i = i + 1
+        self._acts = acts
+        self._act_parent = parent
+        return acts
+
+    # step i is the first statement of a new call of its function (its line
+    # is the first statement of the function's body)
+    def _starts_call(self, i):
+        var du = self._du(self.file_at(i), self.lines[i])
+        if du == none or du.get("func_line", 0) == 0:
+            return false
+        var first = self._first_body_line(self.file_at(i), du["func_line"])
+        return first == self.lines[i]
+
+    def _first_body_line(self, file, def_line):
+        var d = self.defuse(file)
+        var ln = def_line + 1
+        while ln <= len(d):
+            var e = d[ln - 1]
+            if e != none and e.get("stmt") and e.get("func_line", 0) == def_line:
+                return ln
+            ln = ln + 1
+        return -1
+
+    # the step after i in the same call, or -1
+    def _next_in_act(self, i):
+        var acts = self._activations()
+        var a = acts[i]
+        var k = i + 1
+        while k < self.n:
+            if acts[k] == a:
+                return k
+            if self.depths[k] < self.depths[i]:
+                return -1
+            k = k + 1
+        return -1
+
+    def _writes(self, i, name):
+        var du = self._du(self.file_at(i), self.lines[i])
+        if du != none and name in du.get("writes", []):
+            return true
+        var nx = self._next_in_act(i)
+        if nx < 0:
+            return false
+        var before = self._vars_at(i).get(name)
+        var after = self._vars_at(nx).get(name)
+        return after != none and after != before and self._header_write(i, nx, name) == 0
+
+    # The recording has one step per statement run, none for a loop header
+    # taking its next item: when `name` changes between step i and the next
+    # step of its call, nx, and nx starts a new iteration of a for loop whose
+    # target holds `name`, the header wrote it - its line; else 0.
+    def _header_write(self, i, nx, name):
+        if self.lines[nx] > self.lines[i] or self.file_at(nx) != self.file_at(i):
+            return 0
+        var du = self._du(self.file_at(nx), self.lines[nx])
+        if du == none:
+            return 0
+        for p in du.get("ctrl", []):
+            var h = self._du(self.file_at(nx), p)
+            if h != none and h.get("kind") == "for" and name in h.get("writes", []) and p <= self.lines[nx]:
+                return p
+        return 0
+
+    # the last step before i, in i's call, that wrote `name`; -1 if none.
+    # A loop header's write is answered as the step after it (nx), with
+    # self._prod_line set to the header's line (0 otherwise).
+    def _producer(self, i, name):
+        var acts = self._activations()
+        var a = acts[i]
+        self._prod_line = 0
+        var k = i - 1
+        while k >= 0:
+            if acts[k] == a:
+                if self._writes(k, name):
+                    return k
+                var nx = self._next_in_act(k)
+                if nx >= 0 and nx <= i:
+                    var hl = self._header_write(k, nx, name)
+                    if hl > 0 and self._vars_at(nx).get(name) != self._vars_at(k).get(name):
+                        self._prod_line = hl
+                        return nx
+            k = k - 1
+        return -1
+
+    # the last step before i, in i's call, on line `line`
+    def _last_eval(self, i, line):
+        var acts = self._activations()
+        var a = acts[i]
+        var f = self.files[i]
+        var k = i - 1
+        while k >= 0:
+            if acts[k] == a and self.lines[k] == line and self.files[k] == f:
+                return k
+            k = k - 1
+        return -1
+
+    # the source of step i's line (or of `line` in step i's file)
+    def _src(self, i, line=0):
+        var file = self.file_at(i)
+        if self._src_cache == none:
+            self._src_cache = {}
+        var rows = self._src_cache.get(file)
+        if rows == none:
+            var text = read_file(file)
+            rows = string_split(text, "\n") if text != none else []
+            self._src_cache[file] = rows
+        var ln = line if line > 0 else self.lines[i]
+        if ln < 1 or ln > len(rows):
+            return ""
+        return string_strip(rows[ln - 1])
+
+    def _entry(self, i, level, kind, var_name, text):
+        var e = {"step": i, "file": self.file_at(i), "line": self.lines[i], "fn": self._fn_of(i),
+                 "level": level, "kind": kind, "var": var_name, "value": none, "text": text}
+        if var_name != "" and i >= 0:
+            var nx = self._next_in_act(i) if kind == "data" else i
+            if nx >= 0:
+                e["value"] = self._vars_at(nx).get(var_name)
+        return e
+
+    def why_value(self, name, at=none, limit=40):
+        var out = []
+        if self.n == 0:
+            return out
+        var i = self.pos if at == none else at
+        if i < 0 or i >= self.n:
+            i = self.n - 1
+        var cur = self._vars_at(i).get(name)
+        var q = self._entry(i, 0, "value", name, name + " = " + str(cur) + " at line " + str(self.lines[i]))
+        q["value"] = cur
+        out.append(q)
+        var seen = {}
+        self._why_data(i, name, 1, out, seen, limit)
+        return out
+
+    # why `name` read at step i has its value: its producer, recursively
+    def _why_data(self, i, name, level, out, seen, limit):
+        if len(out) >= limit:
+            return
+        var j = self._producer(i, name)
+        var hl = self._prod_line
+        if j < 0:
+            self._why_param(i, name, level, out, seen, limit)
+            return
+        var key = str(j) + ":" + name + ":" + str(hl)
+        if seen.get(key) != none:
+            return
+        seen[key] = true
+        if hl > 0:
+            # a loop header took its next item (before step j)
+            var e = self._entry(j, level, "data", name, self._src(j, hl) + "   (next item)")
+            e["line"] = hl
+            e["value"] = self._vars_at(j).get(name)
+            out.append(e)
+            self._why_line(j, hl, level + 1, out, seen, limit)
+            return
+        out.append(self._entry(j, level, "data", name, self._src(j)))
+        self._why_step(j, level + 1, out, seen, limit)
+
+    # why step j ran with what it read: its reads' producers and the
+    # predicate it ran under
+    def _why_step(self, j, level, out, seen, limit):
+        self._why_line(j, self.lines[j], level, out, seen, limit)
+
+    # ... for the statement on `line` run at step j (a loop header's next
+    # item is answered at the step after it)
+    def _why_line(self, j, line, level, out, seen, limit):
+        if len(out) >= limit:
+            return
+        var du = self._du(self.file_at(j), line)
+        if du == none:
+            return
+        for r in du.get("reads", []):
+            if self._vars_at(j).get(r) != none:
+                self._why_data(j, r, level, out, seen, limit)
+        var ctrl = du.get("ctrl", [])
+        var branch = du.get("branch", [])
+        if len(ctrl) > 0:
+            var p = self._last_eval(j, ctrl[0])
+            if p >= 0:
+                var key = "c" + str(p)
+                if seen.get(key) == none:
+                    seen[key] = true
+                    var how = branch[0] if len(branch) > 0 else ""
+                    out.append(self._entry(p, level, "control", "", self._src(p) + "   (" + how + ")"))
+                    self._why_step(p, level + 1, out, seen, limit)
+
+    # `name` has no producer in its call: a parameter (from the call's line
+    # in the caller) or a variable bound before the recording saw it
+    def _why_param(self, i, name, level, out, seen, limit):
+        var acts = self._activations()
+        var a = acts[i]
+        var caller = self._act_parent[a] if a < len(self._act_parent) else -1
+        var du = self._du(self.file_at(i), self.lines[i])
+        var fn = self._fn_of(i)
+        if caller >= 0 and fn != "<module>":
+            var key = "p" + str(caller) + ":" + name
+            if seen.get(key) != none:
+                return
+            seen[key] = true
+            out.append(self._entry(caller, level, "call", "", self._src(caller) + "   (" + name + " passed to " + fn + ")"))
+            self._why_step(caller, level + 1, out, seen, limit)
+            return
+        out.append(self._entry(i, level, "note", name, name + " was not set by a recorded statement"))
+
+    def why_not(self, file, line, at=none):
+        var out = []
+        var upto = self.n if at == none else min(self.n, at + 1)
+        var du = self._du(file, line)
+        if du == none or not du.get("stmt"):
+            out.append({"step": -1, "file": file, "line": line, "fn": "", "level": 0, "kind": "note", "var": "",
+                        "value": none, "text": "line " + str(line) + " is not the start of a statement"})
+            return out
+        # did it run?
+        var k = 0
+        while k < upto:
+            if self.lines[k] == line and self.file_at(k) == file:
+                out.append({"step": k, "file": file, "line": line, "fn": self._fn_of(k), "level": 0, "kind": "note", "var": "",
+                            "value": none, "text": "line " + str(line) + " did run (step " + str(k) + ")"})
+                return out
+            k = k + 1
+        out.append({"step": -1, "file": file, "line": line, "fn": du.get("func", ""), "level": 0, "kind": "question", "var": "",
+                    "value": none, "text": "why didn't line " + str(line) + " run?"})
+        var func = du.get("func", "")
+        var fline = du.get("func_line", 0)
+        if fline > 0:
+            var called = -1
+            k = 0
+            while k < upto:
+                if self.file_at(k) == file and self._fn_of(k) == func:
+                    var e2 = self._du(file, self.lines[k])
+                    if e2 != none and e2.get("func_line", 0) == fline:
+                        called = k
+                        break
+                k = k + 1
+            if called < 0:
+                out.append({"step": -1, "file": file, "line": fline, "fn": func, "level": 1, "kind": "never", "var": "",
+                            "value": none, "text": func + "() was never called"})
+                return out
+        var ctrl = du.get("ctrl", [])
+        var branch = du.get("branch", [])
+        # outermost first: the first predicate that never chose L's branch
+        var c = len(ctrl) - 1
+        while c >= 0:
+            var p = ctrl[c]
+            var how = branch[c] if c < len(branch) else ""
+            var evals = []
+            k = 0
+            while k < upto:
+                if self.lines[k] == p and self.file_at(k) == file:
+                    evals.append(k)
+                k = k + 1
+            if len(evals) == 0:
+                out.append({"step": -1, "file": file, "line": p, "fn": func, "level": 1, "kind": "never", "var": "",
+                            "value": none, "text": "line " + str(p) + " never ran either"})
+                return out
+            var taken = false
+            for s in evals:
+                var nx = self._next_in_act(s)
+                if nx >= 0 and nx < upto:
+                    var e3 = self._du(file, self.lines[nx])
+                    if e3 != none and self._ctrl_has(e3, p, how):
+                        taken = true
+            if not taken:
+                var last = evals[-1]
+                var reads = self._du(file, p).get("reads", [])
+                var vals = []
+                var vv = self._vars_at(last)
+                for r in reads:
+                    if vv.get(r) != none:
+                        vals.append(r + " = " + str(vv[r]))
+                var outcome = "false" if how == "then" or how == "body" or how == "case" else "true"
+                if how == "except":
+                    outcome = "no matching exception"
+                if how == "loop-else":
+                    outcome = "the loop was left by break"
+                var txt = self._src(last) + "   was " + outcome + " each of " + str(len(evals)) + " time" + ("s" if len(evals) != 1 else "")
+                if len(vals) > 0:
+                    txt = txt + " (last: " + string_join(vals, ", ") + ")"
+                out.append({"step": last, "file": file, "line": p, "fn": self._fn_of(last), "level": 1, "kind": "predicate",
+                            "var": "", "value": outcome, "text": txt})
+                for s in evals[:-1][-4:]:
+                    out.append({"step": s, "file": file, "line": p, "fn": self._fn_of(s), "level": 2, "kind": "predicate",
+                                "var": "", "value": outcome, "text": "earlier evaluation"})
+                return out
+            c = c - 1
+        # every predicate chose L's way at least once: execution left the
+        # block before reaching L (break / return / an exception)
+        var last_in = -1
+        k = 0
+        while k < upto:
+            if self.file_at(k) == file:
+                var e4 = self._du(file, self.lines[k])
+                if e4 != none and e4.get("func", "") == func and self._same_block(e4, du) and self.lines[k] < line:
+                    last_in = k
+            k = k + 1
+        if last_in >= 0:
+            out.append({"step": last_in, "file": file, "line": self.lines[last_in], "fn": self._fn_of(last_in), "level": 1,
+                        "kind": "exit", "var": "", "value": none,
+                        "text": self._src(last_in) + "   ran last before line " + str(line) + " (execution left the block)"})
+        else:
+            out.append({"step": -1, "file": file, "line": line, "fn": func, "level": 1, "kind": "note", "var": "", "value": none,
+                        "text": "execution never reached line " + str(line)})
+        if self.exception != "":
+            out.append({"step": self.n - 1, "file": self.file_at(self.n - 1), "line": self.lines[self.n - 1],
+                        "fn": self._fn_of(self.n - 1), "level": 1, "kind": "exit", "var": "", "value": none,
+                        "text": "the program ended with " + self.exception})
+        return out
+
+    def _ctrl_has(self, du, p, how):
+        var ctrl = du.get("ctrl", [])
+        var br = du.get("branch", [])
+        var i = 0
+        while i < len(ctrl):
+            if ctrl[i] == p and (i >= len(br) or br[i] == how):
+                return true
+            i = i + 1
+        return false
+
+    def _same_block(self, a, b):
+        return a.get("ctrl", []) == b.get("ctrl", [])
 
 
 def int_or_zero_dbg(s):

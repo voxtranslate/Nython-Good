@@ -546,6 +546,9 @@ class IDECore:
         c._cmd("workbench.action.debug.stepOut", "Debug", "Step Out", "Shift+F11", "inDebugMode")
         c._cmd("workbench.action.debug.stepBack", "Debug", "Step Back", "Ctrl+Shift+F11", "inDebugMode")
         c._cmd("workbench.action.debug.reverseContinue", "Debug", "Reverse Continue", "", "inDebugMode")
+        # Whyline questions over the recording (round 79, ide_views.ny)
+        c._cmd("nython.debug.whyValue", "Debug", "Why Does This Variable Have This Value?", "", "inDebugMode")
+        c._cmd("nython.debug.whyNot", "Debug", "Why Didn't This Line Run?", "", "inDebugMode")
         c._cmd("editor.debug.action.toggleBreakpoint", "Run", "Toggle Breakpoint", "F9", "")
         c._cmd("workbench.debug.viewlet.action.removeAllBreakpoints", "Run", "Remove All Breakpoints", "", "")
         c._cmd("nython.runOnVM", "Run", "Run on Bytecode VM", "", "")
@@ -639,6 +642,7 @@ class IDECore:
                     "workbench.action.debug.restart", "-",
                     "workbench.action.debug.stepOver", "workbench.action.debug.stepInto", "workbench.action.debug.stepOut",
                     "workbench.action.debug.stepBack", "workbench.action.debug.continue", "-",
+                    "nython.debug.whyValue", "nython.debug.whyNot", "-",
                     "editor.debug.action.toggleBreakpoint", "workbench.debug.viewlet.action.removeAllBreakpoints", "-",
                     "nython.runOnVM", "nython.profile", "nython.checkSyntax", "-",
                     "nython.tokenize", "nython.showAST", "nython.disassemble"],
@@ -670,6 +674,8 @@ class IDECore:
         if id == "workbench.action.reopenClosedEditor":
             return len(self.closed_stack) > 0
         if string_startswith(id, "workbench.action.debug.step") or id == "workbench.action.debug.continue" or id == "workbench.action.debug.stop" or id == "workbench.action.debug.restart" or id == "workbench.action.debug.reverseContinue":
+            return self.dbg.active
+        if id == "nython.debug.whyValue" or id == "nython.debug.whyNot":
             return self.dbg.active
         if id == "workbench.action.files.revert":
             return self.doc().kind == "file"
@@ -948,6 +954,10 @@ class IDECore:
             self._debug_step("out")
         elif id == "workbench.action.debug.stepBack":
             self._debug_step("back")
+        elif id == "nython.debug.whyValue":
+            self._dbg_why_value(arg)
+        elif id == "nython.debug.whyNot":
+            self._dbg_why_not(arg)
         elif id == "editor.debug.action.toggleBreakpoint":
             if self._is_text():
                 var row = self.buf().cursor_row

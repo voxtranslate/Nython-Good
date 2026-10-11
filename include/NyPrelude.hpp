@@ -1779,6 +1779,17 @@ class _NyFrame:
         _ny_frame_sync(self)
         return self._ny_line
 
+    @f_lineno.setter
+    def f_lineno(self, lineno):
+        # (round 79) CPython's trace functions can move a frame to another
+        # line; Nython's frames cannot: a ValueError, as CPython gives for a
+        # jump it refuses (pdb reports "Jump failed: ...")
+        if type(lineno) is not int:
+            raise ValueError("lineno must be an integer")
+        if lineno < self.f_code.co_firstlineno:
+            raise ValueError("line " + str(lineno) + " comes before the current code block")
+        raise ValueError("line " + str(lineno) + ": a frame's line cannot be changed (Nython has no jump)")
+
     @property
     def f_lasti(self):
         _ny_frame_sync(self)
@@ -1786,7 +1797,11 @@ class _NyFrame:
 
     @property
     def f_locals(self):
-        _ny_frame_sync(self)
+        # a running function's frame: a FrameLocalsProxy (PEP 667, CPython
+        # 3.13 - writes reach its variables; round 79); a module's, or a
+        # frame that has ended, its variables as a dict
+        if _ny_frame_sync(self) and self._ny_info is not None and self._ny_info[0] != "<module>":
+            return _NyFrameLocals(self)
         var l = self._ny_locals
         if l is None:
             l = {}
@@ -1821,6 +1836,154 @@ class _NyFrame:
 _NyFrame.__name__ = "frame"
 _NyFrame.__qualname__ = "frame"
 _NyFrame.__module__ = "builtins"
+
+class _NyFrameLocals:
+    # frame.f_locals of a running function (round 79): PEP 667's
+    # FrameLocalsProxy (CPython 3.13). Reads see the frame's variables as
+    # they are now; proxy[name] = value changes the variable the running
+    # code reads next (_ny_frame_local_set) - from a trace function too;
+    # deleting is refused, as there. Once the frame has ended it reads and
+    # writes the variables the frame ended with. A dunder name (pdb's
+    # __return__ / __exception__) is kept beside the variables, as 3.13's
+    # extra locals are - locals() leaves the frame's dunders out.
+    def __init__(self, frame):
+        self._ny_f = frame
+
+    def _ny_snap(self):
+        var f = self._ny_f
+        _ny_frame_sync(f)
+        var l = f._ny_locals
+        if l is None:
+            l = {}
+            f._ny_locals = l
+        var x = getattr(f, "_ny_xlocals", None)
+        if x:
+            l.update(x)
+        return l
+
+    def __getitem__(self, key):
+        return self._ny_snap()[key]
+
+    def __setitem__(self, key, value):
+        if not isinstance(key, str):
+            raise TypeError("local variables must be strings")
+        if key.startswith("__") and key.endswith("__") and len(key) > 4:
+            var x = getattr(self._ny_f, "_ny_xlocals", None)
+            if x is None:
+                x = {}
+                self._ny_f._ny_xlocals = x
+            x[key] = value
+        elif not _ny_frame_local_set(self._ny_f, key, value):
+            self._ny_snap()[key] = value
+
+    def __delitem__(self, key):
+        raise ValueError("cannot remove local variables from FrameLocalsProxy")
+
+    def __contains__(self, key):
+        return key in self._ny_snap()
+
+    def __iter__(self):
+        return iter(list(self._ny_snap().keys()))
+
+    def __len__(self):
+        return len(self._ny_snap())
+
+    def keys(self):
+        return self._ny_snap().keys()
+
+    def values(self):
+        return self._ny_snap().values()
+
+    def items(self):
+        return self._ny_snap().items()
+
+    def get(self, key, default=None):
+        return self._ny_snap().get(key, default)
+
+    def copy(self):
+        return dict(self._ny_snap())
+
+    def update(self, *args, **kwargs):
+        var d = dict(*args, **kwargs)
+        for k in list(d.keys()):
+            self[k] = d[k]
+
+    def setdefault(self, key, default=None):
+        var l = self._ny_snap()
+        if key in l:
+            return l[key]
+        self[key] = default
+        return default
+
+    def pop(self, key, *default):
+        raise ValueError("cannot remove local variables from FrameLocalsProxy")
+
+    def __eq__(self, other):
+        if isinstance(other, _NyFrameLocals):
+            return self._ny_snap() == other._ny_snap()
+        if isinstance(other, dict):
+            return self._ny_snap() == other
+        return NotImplemented
+
+    def __ne__(self, other):
+        var r = self.__eq__(other)
+        if r is NotImplemented:
+            return r
+        return not r
+
+    def __or__(self, other):
+        var d = dict(self._ny_snap())
+        d.update(other)
+        return d
+
+    def __ror__(self, other):
+        var d = dict(other)
+        d.update(self._ny_snap())
+        return d
+
+    def __repr__(self):
+        return repr(self._ny_snap())
+
+    __hash__ = None
+
+_NyFrameLocals.__name__ = "FrameLocalsProxy"
+_NyFrameLocals.__qualname__ = "FrameLocalsProxy"
+_NyFrameLocals.__module__ = "builtins"
+
+# breakpoint() and sys.breakpointhook (round 79): PYTHONBREAKPOINT names the
+# hook - unset or empty is pdb.set_trace, "0" turns breakpoint() off,
+# "mod.func" imports mod and calls func, a bare name is a builtin's.
+def _ny_breakpointhook(*args, **kws):
+    var hookname = os_getenv("PYTHONBREAKPOINT")
+    if hookname is None or len(hookname) == 0:
+        hookname = "pdb.set_trace"
+    elif hookname == "0":
+        return None
+    var cut = hookname.rfind(".")
+    var modname = "builtins" if cut < 0 else hookname[:cut]
+    var funcname = hookname[cut + 1:]
+    var hook = None
+    try:
+        if modname == "builtins":
+            hook = _ny_main_globals()[funcname]
+        else:
+            var ns = {}
+            exec("import " + modname + " as _ny_bp_mod", ns)
+            # (eval: the VM binds a native module's alias - math - among the
+            # globals, not in ns)
+            hook = getattr(eval("_ny_bp_mod", ns), funcname)
+    except Exception:
+        import warnings
+        warnings.warn("Ignoring unimportable $PYTHONBREAKPOINT: \"" + hookname + "\"", RuntimeWarning)
+        return None
+    return hook(*args, **kws)
+
+def breakpoint(*args, **kws):
+    import sys
+    var hook = getattr(sys, "breakpointhook", None)
+    if hook is None:
+        raise RuntimeError("lost sys.breakpointhook")
+    return hook(*args, **kws)
 
 class _NyTraceback:
     # Made by the engines without calling this (fields set directly);

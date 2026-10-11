@@ -678,6 +678,12 @@ Value dispatch_core(NythonExecutor& E,
         if (name == "_ny_frame_back") return args.empty() ? NONE_VALUE : E.frameBack(args[0]);
         if (name == "_ny_frame_globals") return E.frameGlobals(args);
         if (name == "_ny_builtins_dict") return E.builtinsDict();
+        // sys.settrace / sys.setprofile and f_locals write-through (round 79)
+        if (name == "_ny_settrace" || name == "sys.settrace") return E.pySetHook(args, true);
+        if (name == "_ny_setprofile" || name == "sys.setprofile") return E.pySetHook(args, false);
+        if (name == "_ny_gettrace" || name == "sys.gettrace") return E.pyGetHook(true);
+        if (name == "_ny_getprofile" || name == "sys.getprofile") return E.pyGetHook(false);
+        if (name == "_ny_frame_local_set") return E.frameLocalSet(args);
         if (name == "vars") return E.reflectVars(args, ctx);
         if (name == "dir") return E.reflectDir(args, ctx);
         if (name == "issubclass" || name == "property" || name == "staticmethod" || name == "classmethod" || name == "iter" || name == "help" || name == "slice" || name == "complex") {

@@ -796,6 +796,74 @@ def sc_debugger(s):
     c(st["dbg_state"] in ("idle", "ended"), "debug: Shift+F5 stops", st["dbg_state"])
 
 
+WHY = ('def pick(xs, lim):\n    best = 0\n    for x in xs:\n        if x > lim:\n            best = best + x\n'
+       '    if best > 100:\n        print("huge")\n    return best\n\nvar r = pick([3, 8, 1, 12], 5)\nprint("r", r)\n')
+
+
+def sc_debug_why(s):
+    """Whyline questions over the recording (round 79): why does a variable
+    have its value, why didn't a line run - asked from the Variables pane,
+    the palette and the editor's context menu; the answer's rows travel."""
+    ide = s.start()
+    c = s.res.check
+    s.write("why.ny", WHY)
+    s.open_file("why.ny")
+    ide.key("ctrl+g")
+    ide.type("8\n")
+    ide.key("f9")
+    ide.key("f5")
+    st = s.wait_until(lambda st: st["dbg_state"] == "paused")
+    c(st["dbg_state"] == "paused" and st["dbg_line"] == 8, "why: stopped at return best", (st["dbg_state"], st["dbg_line"]))
+    side = R(48, 30, 300, 900)
+    t = ide.find("best", region=side)
+    ide.click(int(t.cx), int(t.cy))          # select the variable
+    palette(s, "Debug: Why Does This Variable Have This Value?")
+    st = ide.state()
+    c(st["dbg_why_title"] == "Why is best = 20 at line 8?", "why: the question names the value", st["dbg_why_title"])
+    if s.shots:
+        ide.screenshot(os.path.join(s.shots, "debug-why-value.png"))
+    rows = st["dbg_why"]
+    c(len(rows) > 0 and rows[0][1] == 5 and rows[0][2] == "data" and rows[0][0].endswith("-> best = 20"),
+      "why: first answer is the last write, with its value", rows[:2])
+    c(any(r[2] == "control" and r[1] == 4 for r in rows), "why: the test the write ran under", rows)
+    c(any(r[2] == "call" and r[1] == 10 for r in rows), "why: the parameters' call", rows)
+    c(not any(r[1] == 7 for r in rows), "why: lines that did not matter are left out", rows)
+    f = ide.snap()
+    c(f.has("WHY", exact=True) and f.has("best = best + x", exact=False), "why: the WHY section shows the answer")
+    # an earlier write: travel there
+    t = ide.find("best = best + x   -> best = 8", exact=False, region=side)
+    ide.click(int(t.cx), int(t.cy))
+    st = ide.state()
+    c(st["dbg_line"] == 5 and st["dbg_state"] == "paused", "why: a row seeks the replay to its step", (st["dbg_line"], st["dbg_state"]))
+    t = ide.find("best", region=side)
+    c(t is not None, "why: the variables follow the step")
+    # why didn't print("huge") run? - from the editor's context menu
+    ide.key("ctrl+g")
+    ide.type("7\n")
+    st = ide.state()
+    ln = ide.find('"huge"', exact=True, region=R(330, 60, 900, 600))   # line 7's tokens
+    ide.right_click(int(ln.cx), int(ln.cy))
+    f = ide.snap()
+    c(f.has("Why Didn't This Line Run?", exact=True), "why: the editor's context menu asks it while debugging")
+    ide.click_text("Why Didn't This Line Run?")
+    st = ide.state()
+    c(st["dbg_why_title"] == "Why didn't line 7 run?", "why-not: the question", st["dbg_why_title"])
+    rows = st["dbg_why"]
+    c(len(rows) > 0 and rows[0][2] == "predicate" and rows[0][1] == 6 and "(last: best = 20)" in rows[0][0],
+      "why-not: the test that was false, with its values", rows)
+    if s.shots:
+        ide.screenshot(os.path.join(s.shots, "debug-why-not.png"))
+    t = ide.find("was false each of 1 time", exact=False, region=side)
+    ide.click(int(t.cx), int(t.cy))
+    st = ide.state()
+    c(st["dbg_line"] == 6, "why-not: the row travels to the test's evaluation", st["dbg_line"])
+    palette(s, "Debug: Why Didn't This Line Run?")
+    st = ide.state()
+    c(st["dbg_why_title"] == "Why didn't line 6 run?" and st["dbg_why"] and "did run" in st["dbg_why"][0][0],
+      "why-not from the palette, on the caret's line: it ran", (st["dbg_why_title"], st["dbg_why"][:1]))
+    ide.key("shift+f5")
+
+
 def sc_scm(s):
     s.git("init", "-q")
     s.git("add", "-A")
@@ -1685,7 +1753,7 @@ SCENARIOS = [
     ("multicursor", sc_multicursor), ("palette", sc_palette), ("quickopen", sc_quick_open),
     ("menus", sc_menus), ("find", sc_find_replace), ("statusbar", sc_statusbar),
     ("explorer", sc_explorer_ops), ("close", sc_close_dirty), ("terminal", sc_terminal),
-    ("run", sc_run), ("problems", sc_syntax_problems), ("debug", sc_debugger), ("scm", sc_scm),
+    ("run", sc_run), ("problems", sc_syntax_problems), ("debug", sc_debugger), ("debug-why", sc_debug_why), ("scm", sc_scm),
     ("search", sc_search), ("views", sc_views_layout), ("deadclicks", sc_dead_clicks),
     ("deadviews", sc_dead_clicks_views), ("build", sc_build), ("cbedit", sc_cb_editing),
     ("cbtools", sc_cb_tools), ("cbdebug", sc_cb_debug), ("responsive", sc_responsive),

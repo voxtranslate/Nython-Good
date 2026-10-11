@@ -2438,11 +2438,12 @@ node_ptr Parser::ifStmt(){
     while(have(TokenType::NewLine)) {}
     while(have(TokenType::ElseIf)||have(TokenType::ElseIf)||(see(TokenType::Else)&&peek().type()==TokenType::If)){
         if(prev().type()==TokenType::Else) next(); // consume 'if'
+        Token eitok = prev();   // the elif's own line (round 79: sys.settrace's line event)
         // Same rule as the if-condition above: let expression() own the parens.
         node_ptr eicond = expression();
         have(TokenType::Colon);
         node_ptr eibody = blockOrStmt();
-        if_node->elseif_branches.push_back(make_node<IfNode>(tok, eicond, eibody));
+        if_node->elseif_branches.push_back(make_node<IfNode>(eitok, eicond, eibody));
         while(have(TokenType::NewLine)) {}
     }
 
@@ -2695,10 +2696,58 @@ static void forward_params(const Token& t, CallNode* call, const std::vector<nod
     }
 }
 
-static node_ptr async_def_desugar(const Token& tok, node_ptr fn, bool is_generator, bool class_method = false) {
+static node_ptr async_def_desugar(const Token& tok, node_ptr fn, bool is_generator, bool class_method = false,
+                                  bool class_static = false) {
     auto* f = static_cast<FunctionNode*>(fn.get());
     Token t = tok;
     auto name_tok = [&](const std::string& v) { Token x = t; x.value = v; return x; };
+    // An async @staticmethod (round 79): its own name is not in scope in its
+    // body (the class's attribute is), so the coroutine cannot call it
+    // again by name. Its body runs as an inner function of the same name
+    // instead, which consumes the token first:
+    //
+    //     @staticmethod                     @staticmethod
+    //     async def m(a):          ==>      def m(a):
+    //         body                              def m(a):
+    //                                               async_body_begin()
+    //                                               body
+    //                                           return _NyCoroutine(async_coroutine_def(
+    //                                               lambda: m(a), "m"), m, "m", "C.m")
+    if (class_static && !is_generator) {
+        Token it = name_tok(f->name);
+        auto ib = make_node<BlockNode>(t);
+        Token bb = name_tok("async_body_begin");
+        ib->add(make_node<CallNode>(bb, make_node<VariableNode>(bb)));
+        if (f->body) {
+            if (f->body->type() == NodeType::BLOCK) for (auto& st : f->body->statements()) ib->add(st);
+            else ib->add(f->body);
+        }
+        auto inner = make_node<FunctionNode>(it, f->name, ib, false);
+        auto* in = static_cast<FunctionNode*>(inner.get());
+        for (auto& p : f->params) in->add(p);
+        in->defaults.assign(f->params.size(), nullptr);
+        in->posonly = f->posonly;
+        in->qualname = f->qualname;
+        in->is_async = true;
+        auto again = make_node<CallNode>(t, make_node<VariableNode>(it));
+        forward_params(t, static_cast<CallNode*>(again.get()), f->params, 0);
+        auto closure = make_node<LambdaNode>(name_tok("lambda"), again);
+        Token mk = name_tok("async_coroutine_def");
+        auto make = make_node<CallNode>(mk, make_node<VariableNode>(mk));
+        make->add(closure);
+        make->add(make_node<StringNode>(name_tok(f->name)));
+        Token ct = name_tok("_NyCoroutine");
+        auto coro = make_node<CallNode>(ct, make_node<VariableNode>(ct));
+        coro->add(make);
+        coro->add(make_node<VariableNode>(it));
+        coro->add(make_node<StringNode>(name_tok(f->name)));
+        coro->add(make_node<StringNode>(name_tok(f->qualname.empty() ? f->name : f->qualname)));
+        auto body = make_node<BlockNode>(t);
+        body->add(inner);
+        body->add(make_node<ReturnNode>(t, coro));
+        f->body = body;
+        return fn;
+    }
     bool method = !f->params.empty() &&
         (f->params[0]->value() == "self" || f->params[0]->value() == "this");
     // A method whose first parameter is not self (`async def m(s)`, an
@@ -2774,6 +2823,7 @@ node_ptr Parser::functionDecl(bool is_method){
     // a def directly in a class body is a method whatever its first
     // parameter is called, unless it is a static method (round 78)
     bool class_method = !ann_scope_.empty() && ann_scope_.back() == 'c' && !next_def_static_;
+    bool class_static = !ann_scope_.empty() && ann_scope_.back() == 'c' && next_def_static_;   // round 79
     next_def_static_ = false;
     Token tok = token();
     next(); // consume def/function/fn
@@ -2840,7 +2890,7 @@ node_ptr Parser::functionDecl(bool is_method){
         }
         static_cast<FunctionNode*>(fn.get())->annotations = m;
     }
-    if(is_async) return async_def_desugar(tok, fn, is_gen, class_method && name != "__new__");
+    if(is_async) return async_def_desugar(tok, fn, is_gen, class_method && name != "__new__", class_static);
     return fn;
 }
 
@@ -3071,7 +3121,8 @@ node_ptr Parser::classDecl(){
     have(TokenType::Colon); // consume : before block
     ann_scope_.push_back('c');
     class_ann_used_.push_back(false);
-    qual_stack_.push_back(qualOf(name));   // its methods are "C.m" (round 77)
+    std::string class_qualname = qualOf(name);   // Outer.Inner, f.<locals>.C (round 79)
+    qual_stack_.push_back(class_qualname);   // its methods are "C.m" (round 77)
     // the body's private names are mangled with this class's name (round 78)
     {
         size_t u = name.find_first_not_of('_');
@@ -3105,6 +3156,7 @@ node_ptr Parser::classDecl(){
         cp->has_doc = class_has_doc;
         cp->doc = class_doc;
         if(!bind_as.empty()) cp->bind_name = bind_as;   // round 78
+        cp->qualname = class_qualname;                  // round 79
     }
     return cls;
 }
@@ -3587,6 +3639,7 @@ node_ptr Parser::tryStmt(){
         return n;
     };
     while(see(TokenType::Except) && !(value() == "catch" && usedAsName())){   // `catch = 1` is a name (round 77)
+        Token etok = token();   // the clause's own line (round 79: sys.settrace's line event, tracebacks)
         next(); // consume 'except'
         std::string ename, ealias;
         std::vector<std::string> types;
@@ -3618,7 +3671,7 @@ node_ptr Parser::tryStmt(){
         }
         have(TokenType::Colon);
         node_ptr ebody = blockOrStmt();
-        auto en = make_node<ExceptNode>(tok, ename, ealias, ebody);
+        auto en = make_node<ExceptNode>(etok, ename, ealias, ebody);
         auto enp = std::static_pointer_cast<ExceptNode>(en);
         enp->types = std::move(types);
         enp->var = std::move(var);
