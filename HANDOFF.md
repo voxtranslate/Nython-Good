@@ -131,6 +131,10 @@ were real regressions and were fixed in the engines (above).
 | 50k × (`for k, v in d.items()` + `for k in d.keys()`), 20 keys | 4.08 | 2.22 | 2.56 | 2.17 |
 | empty program | 0.04 | 0.05 | 0.10 | 0.08 |
 
+At the end of the round: `tools/sweep.py` 403 runs, 0 not ok;
+`tools/ide_e2e.py` 373 passed, 0 failed; `tools/ide_memprobe.py --check`
+0.00 KB per frame/key/scroll/hover/split; `tools/ide_lint.py` clean.
+
 ### Not done
 - A range's `vars()` lists start/stop/step (CPython: no `__dict__`);
   `type(r).__mro__` of a keys/items view includes `_NyDictSetView`.
