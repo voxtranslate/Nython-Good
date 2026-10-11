@@ -113,13 +113,11 @@ def _is_sunder(name):
     return len(name) > 2 and name[0] == "_" and name[-1] == "_" and name[1:2] != "_" and name[-2:-1] != "_"
 
 def _is_private(cls_name, name):
-    # _Color__x (Python's mangled form) - and __x as written, since a Nython
-    # class body does not mangle private names
+    # _Color__x: what a class body makes of __x (both engines mangle private
+    # names since round 78)
     pattern = "_" + cls_name + "__"
     n = len(pattern)
-    if len(name) > n and name.startswith(pattern) and name[n:n + 1] != "_" and (name[-1] != "_" or name[-2] != "_"):
-        return true
-    return len(name) > 2 and name[:2] == "__" and name[2] != "_" and not name.endswith("__")
+    return len(name) > n and name.startswith(pattern) and name[n:n + 1] != "_" and (name[-1] != "_" or name[-2] != "_")
 
 def _is_single_bit(num):
     if num == 0:

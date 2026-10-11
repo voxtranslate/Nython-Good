@@ -3600,11 +3600,20 @@ public:   // NythonExecutor is a struct: members default to public
                 Context* c = ctx ? ctx : global_ctx;
                 std::string cn0 = instanceClassName(v);
                 bool exc = !cn0.empty() && isExceptionClass(cn0);
+                // what __str__ / __repr__ gave: a str (a str subclass's
+                // value too), else Python's TypeError (round 78: any value
+                // was shown as text, and None fell back to the default)
+                auto textOf = [&](const Value& r, const char* which) -> std::string {
+                    if (isStringValue(r)) return getStringValue(r);
+                    Value p;
+                    if (any_payload_ && payloadOf(r, p) && isStringValue(p)) return getStringValue(p);
+                    pyRaise("TypeError", std::string(which) + " returned non-string (type " + typeNameOf(r) + ")");
+                };
                 if (!repr && instanceHasMethod(v, "__str__")) {
                     Value r;
                     try { r = callMethod(v, "__str__", no_args, c); }
                     catch (nython::node::ReturnSignal& rs) { r = rs.value; }
-                    if (r.type != ValueType::NONE && r.type != ValueType::UNDEFINED) return getStringValue(r);
+                    return textOf(r, "__str__");
                 }
                 // str() of an exception is BaseException.__str__ even when the
                 // class has its own __repr__ (it comes first in the MRO)
@@ -3612,7 +3621,7 @@ public:   // NythonExecutor is a struct: members default to public
                     Value r;
                     try { r = callMethod(v, "__repr__", no_args, c); }
                     catch (nython::node::ReturnSignal& rs) { r = rs.value; }
-                    if (r.type != ValueType::NONE && r.type != ValueType::UNDEFINED) return getStringValue(r);
+                    return textOf(r, "__repr__");
                 }
                 // An exception: its message for str(), Type(args...) for
                 // repr(), as in Python and on the VM (round 77: the args'
@@ -5960,14 +5969,14 @@ public:   // NythonExecutor is a struct: members default to public
     // a key like any other - it read as an internal marker, so __iter__,
     // __init__, __hash__ = None ... were missing - and the parser's
     // decorator temporaries are left out (round 77).
-    Value classNamespace(Node* cnode) {
+    Value classNamespace(Node* cnode, bool implicit = true) {   // implicit: __new__ as a staticmethod ... (round 78; not in the namespace a metaclass gets)
         auto* d = new Object((Runnable*)runner, "map", Type::MAP);
         auto cit = class_ctx_map_.find((void*)cnode);
         if (cit != class_ctx_map_.end() && cit->second && cit->second->container)
             for (auto& kv : *cit->second->container)
                 if (!kv.first.empty() && (unsigned char)kv.first[0] >= 0x20 && kv.first != "__parent_class__"
                     && !nyrt::is_decorator_temp(kv.first))
-                    (*d->container)[nypy::key_of_str(kv.first)] = methodObjectOf(kv.second, global_ctx, &kv.first);
+                    (*d->container)[nypy::key_of_str(kv.first)] = methodObjectOf(kv.second, global_ctx, implicit ? &kv.first : nullptr);
         return Value((Collectable*)d);
     }
     // The classes a class statement is building, for type.__new__ called by
@@ -6045,7 +6054,7 @@ public:   // NythonExecutor is a struct: members default to public
         Value name = makeStringValue(nyrt::bare_class_name(shownClassName(cn->name)));
         Value bases = classBasesTuple(cn);
         // the namespace: what __prepare__ returned, else the body's (round 77)
-        Value ns = prepared ? *prepared : classNamespace(cnode);
+        Value ns = prepared ? *prepared : classNamespace(cnode, false);
         Value made = cls;
         Value m; Node* where = nullptr;
         if (findClassMember(mn, "__new__", m, &where) && where != objn && func_names.count(m.value.p)) {
@@ -8761,6 +8770,15 @@ public:
         }
         // A builtin value's method, or the object protocol (c.to_string),
         // read as a value.
+        // a number's real / imag, an int's numerator / denominator (round 78)
+        if (obj.type == ValueType::INTEGER || obj.type == ValueType::BOOLEAN || obj.type == ValueType::DOUBLE) {
+            bool is_int = obj.type != ValueType::DOUBLE;
+            Value iv = obj.type == ValueType::BOOLEAN ? intValue(obj.value.b ? 1 : 0) : obj;
+            if (attr == "real") { out = iv; return true; }
+            if (attr == "imag") { out = is_int ? intValue(0) : Value(0.0); return true; }
+            if (is_int && attr == "numerator") { out = iv; return true; }
+            if (is_int && attr == "denominator") { out = intValue(1); return true; }
+        }
         if (bind) {
             nypy::MemberKind k = memberKindOf(obj);
             // (5).__add__, "ab".__len__ (round 78)
@@ -12380,6 +12398,9 @@ public:
             checkHashable(args[0]);
             std::vector<Value> none;
             out = callMethod(args[0], "__hash__", none, ctx);
+            // an int, as Python checks it (round 78)
+            if (out.type == ValueType::BOOLEAN) out = intValue(out.value.b ? 1 : 0);
+            else if (out.type != ValueType::INTEGER) pyRaise("TypeError", "__hash__ method should return an integer");
             return true;
         }
         if (name == "bool" && args.size() == 1 && isInstanceValue(args[0])) { out = Value(isTruthy(args[0])); return true; }
@@ -12447,7 +12468,13 @@ public:
             if (nygen::is_gen(v)) { out = v; return true; }
             if (isInstanceValue(v)) {
                 std::vector<Value> none;
-                if (instanceHasMethod(v, "__iter__")) { out = callMethod(v, "__iter__", none, ctx); return true; }
+                if (instanceHasMethod(v, "__iter__")) {
+                    out = callMethod(v, "__iter__", none, ctx);
+                    // an iterator, as Python checks it (round 78)
+                    if (!nygen::is_gen(out) && !(isInstanceValue(out) && instanceHasMethod(out, "__next__")))
+                        pyRaise("TypeError", "iter() returned non-iterator of type '" + typeNameOf(out) + "'");
+                    return true;
+                }
                 if (instanceHasMethod(v, "__next__")) { out = v; return true; }
                 if (!instanceHasMethod(v, "__getitem__"))
                     throw std::string("__exc__:TypeError:'" + shownClassName(instanceClassName(v)) + "' object is not iterable");
@@ -12968,6 +12995,16 @@ public:
         if (kind == 0) return true;
         std::vector<Value> no_args;
         Value r = callMethod(v, kind == 1 ? "__bool__" : "__len__", no_args, global_ctx);
+        // __bool__ must give a bool, __len__ an int >= 0, as Python checks
+        // (round 78)
+        if (kind == 1) {
+            if (r.type != ValueType::BOOLEAN)
+                pyRaise("TypeError", "__bool__ should return bool, returned " + typeNameOf(r));
+            return r.value.b;
+        }
+        if (r.type == ValueType::BOOLEAN) return r.value.b;
+        if (r.type != ValueType::INTEGER) pyRaise("TypeError", "'" + typeNameOf(r) + "' object cannot be interpreted as an integer");
+        if (r.value.i.isNegative()) pyRaise("ValueError", "__len__() should return >= 0");
         return isTruthy(r);
     }
 };

@@ -4364,9 +4364,19 @@ private:
     bool instance_truthy(VMVal& v) {
         bool found=false;
         VMVal r = call_dunder_f(v, "__bool__", {}, found);
-        if(found) return r.type==VMType::INSTANCE ? true : r.is_truthy();
+        // __bool__ must give a bool, __len__ an int >= 0, as Python checks
+        // (round 78)
+        if(found){
+            if(r.type!=VMType::BOOL) raise_native_exception("TypeError","__bool__ should return bool, returned "+vm_type_name(r));
+            return r.b;
+        }
         VMVal lr = call_dunder_f(v, "__len__", {}, found);
-        if(found) return lr.type==VMType::INT ? lr.i != 0 : lr.is_truthy();
+        if(found){
+            if(lr.type==VMType::BOOL) return lr.b;
+            if(lr.type!=VMType::INT) raise_native_exception("TypeError","'"+vm_type_name(lr)+"' object cannot be interpreted as an integer");
+            if(lr.s.empty()?lr.i<0:lr.s[0]=='-') raise_native_exception("ValueError","__len__() should return >= 0");
+            return lr.is_truthy();
+        }
         return true; // default: instances are truthy
     }
 
@@ -4488,6 +4498,15 @@ private:
         return v.type==VMType::INSTANCE||v.type==VMType::GENERATOR||v.type==VMType::ITERATOR;
     }
 
+    // What __str__ / __repr__ gave: a str (a str subclass's value too), else
+    // Python's TypeError (round 78: any value was shown as text).
+    std::string dunder_text(const VMVal& r, const std::string& which) {
+        if(r.type==VMType::STRING) return r.s;
+        VMVal p;
+        if(any_payload_&&payload_of(r,p)&&p.type==VMType::STRING) return p.s;
+        raise_native_exception("TypeError",which+" returned non-string (type "+vm_type_name(r)+")");
+        return std::string();
+    }
     // str(v) and repr(v) with the user's __str__/__repr__, also for the
     // items of a list or map (which rendered as "<C instance>" through
     // VMVal::repr, which cannot call into the program).
@@ -4504,7 +4523,7 @@ private:
                 if(exc&&dname[2]=='r') break;
                 bool found=false;
                 VMVal r=call_dunder_f(v,dname,{},found);
-                if(found) return r.to_string();
+                if(found) return dunder_text(r, dname);   // a str, else TypeError (round 78)
             }
             return v.to_string();
         }
@@ -4521,7 +4540,7 @@ private:
             // as on the interpreter and in Python)
             bool found=false;
             VMVal r=call_dunder_f(v,"__repr__",{},found);
-            if(found) return r.to_string();
+            if(found) return dunder_text(r, "__repr__");   // a str, else TypeError (round 78)
             return v.repr();
         }
         if(v.is_set()&&v.list){
@@ -5382,11 +5401,11 @@ private:
     }
     // The class namespace as the dict a metaclass gets, and C.__dict__:
     // without the parser's decorator temporaries (round 77).
-    VMVal class_namespace(const std::string& cname) {
+    VMVal class_namespace(const std::string& cname, bool implicit=true) {   // implicit: __new__ as a staticmethod (round 78; not in the namespace a metaclass gets)
         VMVal d=VMVal::make_map();
         auto cv=class_vars_.find(cname);
         if(cv!=class_vars_.end()) for(auto& kv:cv->second)
-            if(!nyrt::is_decorator_temp(kv.first)) (*d.map)[nypy::key_of_str(kv.first)]=method_object_of(kv.second, &kv.first);
+            if(!nyrt::is_decorator_temp(kv.first)) (*d.map)[nypy::key_of_str(kv.first)]=method_object_of(kv.second, implicit?&kv.first:nullptr);
         return d;
     }
     // A class statement with a metaclass: M.__new__ (whose type.__new__
@@ -5439,7 +5458,7 @@ private:
         VMVal name=VMVal::make_str(nyrt::bare_class_name(nyrt::shown_class_name(sub.name)));
         VMVal bases=class_bases_tuple(sub);
         // the namespace: what __prepare__ returned, else the body's (round 77)
-        VMVal ns=prepared?*prepared:class_namespace(sub.name);
+        VMVal ns=prepared?*prepared:class_namespace(sub.name, false);
         bool has_kw=kw.type==VMType::MAP&&kw.map&&!kw.map->empty();
         VMVal made=clsv, m;
         std::string owner;
@@ -8495,6 +8514,15 @@ private:
             return false;
         default: break;
         }
+        // a number's real / imag, an int's numerator / denominator (round 78)
+        if(obj.type==VMType::INT||obj.type==VMType::BOOL||obj.type==VMType::FLOAT){
+            bool is_int=obj.type!=VMType::FLOAT;
+            VMVal iv=obj.type==VMType::BOOL?VMVal::make_int(obj.b?1:0):obj;
+            if(attr=="real"){ out=iv; return true; }
+            if(attr=="imag"){ out=is_int?VMVal::make_int(0):VMVal::make_float(0.0); return true; }
+            if(is_int&&attr=="numerator"){ out=iv; return true; }
+            if(is_int&&attr=="denominator"){ out=VMVal::make_int(1); return true; }
+        }
         // A builtin value's method, or the object protocol, read as a value.
         if(bind){
             nypy::MemberKind k=vm_member_kind(obj);
@@ -10783,8 +10811,13 @@ private:
             if(v.type==VMType::INSTANCE){
                 bool f=false;
                 VMVal r=call_dunder_f(v,"__iter__",{},f);
-                if(f) return r;
                 VMVal nx;
+                if(f){
+                    // an iterator, as Python checks it (round 78)
+                    if(r.type!=VMType::GENERATOR&&r.type!=VMType::ITERATOR&&!(r.type==VMType::INSTANCE&&class_lookup(r.class_name,"__next__",nx)))
+                        raise_native_exception("TypeError","iter() returned non-iterator of type '"+vm_type_name(r)+"'");
+                    return r;
+                }
                 if(class_lookup(v.class_name,"__next__",nx)) return v;
                 return VMVal::make_iter(iter_items(v));
             }
@@ -11459,7 +11492,16 @@ private:
                 case VMType::BYTES: return VMVal::make_int((int64_t)v.bdata().size());
                 case VMType::LIST: return VMVal::make_int(v.list?(int64_t)v.list->size():0);
                 case VMType::MAP: { int64_t n=0; if(v.map) for(auto& kv:*v.map) if(!vm_internal_key(kv.first)) n++; return VMVal::make_int(n); }
-                case VMType::INSTANCE: { VMVal r=vm->call_dunder(v,"__len__",{}); if(r.type!=VMType::NONE) return r; break; }
+                case VMType::INSTANCE: {
+                    bool found=false;
+                    VMVal r=vm->call_dunder_f(v,"__len__",{},found);
+                    if(!found) break;
+                    // an int >= 0, as Python checks it (round 78)
+                    if(r.type==VMType::BOOL) return VMVal::make_int(r.b?1:0);
+                    if(r.type!=VMType::INT) vm->raise_native_exception("TypeError","'"+vm_type_name(r)+"' object cannot be interpreted as an integer");
+                    if(r.s.empty()?r.i<0:(!r.s.empty()&&r.s[0]=='-')) vm->raise_native_exception("ValueError","__len__() should return >= 0");
+                    return r;
+                }
                 // a class whose metaclass defines __len__ (round 77)
                 case VMType::CLASS: { VMVal r; if(!vm->class_meta_.empty()&&vm->meta_call(v,"__len__",{},r)) return r; break; }
                 case VMType::ITERATOR: return VMVal::make_int(v.iter?(int64_t)v.iter->second.size()-v.iter->first:0);
@@ -11600,6 +11642,14 @@ private:
         def("pow",[vm](std::vector<VMVal>& a,const VMVal& kw)->VMVal{
             if(a.size()<2) vm->raise_native_exception("TypeError","pow() expected 2 arguments");
             const VMVal* mv=a.size()>=3?&a[2]:kwarg(kw,"mod");
+            // an object's __pow__ (three arguments with a modulus) or the
+            // right operand's __rpow__ (round 78: pow() skipped them)
+            if(a[0].type==VMType::INSTANCE||a[1].type==VMType::INSTANCE){
+                VMVal res;
+                if(mv&&mv->type!=VMType::NONE){
+                    if(a[0].type==VMType::INSTANCE){ bool f=false; res=vm->call_dunder_f(a[0],"__pow__",{a[1],*mv},f); if(f) return res; }
+                } else if(vm->binary_dunder(a[0],a[1],"__pow__","__rpow__",res)) return res;
+            }
             if(mv&&mv->type!=VMType::NONE){
                 nypy::NumV b,e,m;
                 if(!a[0].to_numv(b)||!a[1].to_numv(e)||!mv->to_numv(m)) vm->raise_native_exception("TypeError","unsupported operand type(s) for pow()");
@@ -11865,13 +11915,7 @@ private:
     }
     // Truthiness with __bool__ / __len__ on instances.
     bool truthy(const VMVal& v) {
-        if(v.type==VMType::INSTANCE){
-            VMVal r=call_dunder(v,"__bool__",{});
-            if(r.type!=VMType::NONE) return r.is_truthy();
-            r=call_dunder(v,"__len__",{});
-            if(r.type!=VMType::NONE) return r.is_truthy();
-            return true;
-        }
+        if(v.type==VMType::INSTANCE){ VMVal c=v; return instance_truthy(c); }   // (round 78: one rule)
         return v.is_truthy();
     }
 
@@ -12493,7 +12537,12 @@ private:
             if(a[0].type==VMType::INSTANCE){
                 check_hashable(a[0]);
                 bool f=false; VMVal r=call_dunder_f(a[0],"__hash__",{},f);
-                if(f) return r;
+                if(f){
+                    // an int, as Python checks it (round 78)
+                    if(r.type==VMType::BOOL) return VMVal::make_int(r.b?1:0);
+                    if(r.type!=VMType::INT) raise_native_exception("TypeError","__hash__ method should return an integer");
+                    return r;
+                }
                 uintptr_t raw=a[0].map?(uintptr_t)a[0].map.get():0;
                 return VMVal::make_int((int64_t)(raw>>4));
             }

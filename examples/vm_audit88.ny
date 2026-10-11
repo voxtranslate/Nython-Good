@@ -21,7 +21,10 @@
 #   __class_getitem__ classmethods;
 # - dict keys and set elements with __hash__ compare with __eq__ among
 #   those of the same hash (equal objects of two classes are one key);
-# - super() / super(C, obj) as a value is a proxy.
+# - super() / super(C, obj) as a value is a proxy;
+# - what __str__/__repr__/__len__/__bool__/__hash__/__iter__ return is
+#   checked as Python checks it; a number's real/imag/numerator/denominator;
+#   pow() reaches __pow__ (with a modulus) and __rpow__.
 #
 # Every expected value is CPython's: `python3 examples/vm_audit88.ny` passes
 # too.
@@ -489,6 +492,50 @@ class InitChain(SBase):
     def __init__(self):
         super().__init__(7)
 check("super().__init__ in a constructor", InitChain().x, 7)
+
+# ── 11. what the protocol methods return is checked ─────────────────────────
+class BadStr:
+    def __str__(self):
+        return 5
+    def __repr__(self):
+        return 6
+check("__str__ / __repr__ must return a str", [raises(str, BadStr()), raises(repr, BadStr())],
+      ["TypeError: __str__ returned non-string (type int)", "TypeError: __repr__ returned non-string (type int)"])
+class NegLen:
+    def __len__(self):
+        return -1
+class StrLen:
+    def __len__(self):
+        return "x"
+class BoolLen:
+    def __len__(self):
+        return True
+check("__len__ must return an int >= 0", [raises(len, NegLen()), raises(len, StrLen()), len(BoolLen()), raises(bool, NegLen())],
+      ["ValueError: __len__() should return >= 0", "TypeError: 'str' object cannot be interpreted as an integer", 1,
+       "ValueError: __len__() should return >= 0"])
+class IntBool:
+    def __bool__(self):
+        return 1
+check("__bool__ must return a bool", [raises(bool, IntBool()), raises(lambda: not IntBool())],
+      ["TypeError: __bool__ should return bool, returned int", "TypeError: __bool__ should return bool, returned int"])
+class StrHash:
+    def __hash__(self):
+        return "x"
+check("__hash__ must return an int", [raises(hash, StrHash()), raises(lambda: {StrHash(): 1})],
+      ["TypeError: __hash__ method should return an integer", "TypeError: __hash__ method should return an integer"])
+class BadIter:
+    def __iter__(self):
+        return 5
+check("__iter__ must return an iterator", raises(iter, BadIter()), "TypeError: iter() returned non-iterator of type 'int'")
+check("a number's real, imag, numerator, denominator",
+      [(5).real, (5).imag, (5).numerator, (5).denominator, (2.5).real, (2.5).imag, True.real, True.numerator],
+      [5, 0, 5, 1, 2.5, 0.0, 1, 1])
+class P3:
+    def __pow__(self, e, m=None):
+        return ("pow", e, m)
+    def __rpow__(self, b):
+        return ("rpow", b)
+check("pow() with objects", [pow(P3(), 2), pow(P3(), 2, 5), pow(2, P3())], [("pow", 2, None), ("pow", 2, 5), ("rpow", 2)])
 
 for r in results:
     if r[1]:

@@ -1312,8 +1312,12 @@ def _signature_from_callable(obj, follow_wrapped=True, skip_bound_arg=True, glob
                 return _signature_bound_method(_signature_from_callable(call, follow_wrapped, skip_bound_arg, globals, locals, eval_str, sigcls))
         for base in obj.__mro__:
             var d = _class_dict(base)
-            if "__new__" in d and _ny_fn_info(d["__new__"]) is not None and _tname(base) != "builtin" and base.__name__ != "object":
-                var nsig = _signature_from_callable(d["__new__"], follow_wrapped, skip_bound_arg, globals, locals, eval_str, sigcls)
+            # a class's __new__ is a staticmethod in its __dict__, as in CPython
+            var new_fn = d["__new__"] if "__new__" in d else None
+            if isinstance(new_fn, staticmethod):
+                new_fn = new_fn.__func__
+            if new_fn is not None and _ny_fn_info(new_fn) is not None and _tname(base) != "builtin" and base.__name__ != "object":
+                var nsig = _signature_from_callable(new_fn, follow_wrapped, skip_bound_arg, globals, locals, eval_str, sigcls)
                 if skip_bound_arg:
                     nsig = _signature_bound_method(nsig)
                 return nsig
