@@ -14,6 +14,26 @@
 | Early stopping fired one epoch after the resume | Patience was already exhausted in the checkpoint | Checked before training; a new stage warm-starts from the best checkpoint |
 | Prediction figures half empty, labels unreadable | Fixed 22×5.5 in canvas, tiny labels, no ground-truth (GT) overlay | Figure sized to the image aspect, readable labels, GT colours |
 
+## What the first V5 Kaggle run showed, and what V5.1 changes
+
+| Evidence (V5 Kaggle log) | Diagnosis | V5.1 change |
+|---|---|---|
+| `62.02s/it`, `11:46:58` left for epoch 1 of 687 steps | The model ran on the **CPU**. The same step measured on a 4-core CPU here takes 40–60 s, and data loading costs only ~0.1 s per image, so it is not an input bottleneck. | The run prints its GPUs and **stops at once when no GPU is visible** (`require_gpu`, on by default on Kaggle). `cudnn.benchmark` is off, because input shapes change every step. A speed projection (s/step, data-wait share, minutes per epoch, sessions needed) is printed after 30 steps. |
+| A single training process | Only one GPU can be used. | **GPU T4 x2**: one training process per GPU (details below). |
+| One epoch takes 11 h; a checkpoint only at epoch end | A session can end before the first checkpoint. | **`latest_model.pth` every 20 steps** (`save_every_steps`), with the exact position in the epoch. Training stops cleanly before Kaggle's 12-h limit (`max_session_hours = 11`); the next session continues at the same step. |
+| `20002 images in .../rects have several equally plausible GT files - skipped` | `ReCTS.zip` holds the same labels twice (`gt/` and `gt_unicode/`). | Duplicate annotation copies are recognised (identical boxes), and the copy whose text decodes best is used. GT files for *different* images with the same name are still skipped. |
+| `Epoch 1/250`, `lr=1.09e-06` | Silent start from scratch: no V4 checkpoint was found. | A **stage banner** states resume / warm / scratch, lists the checkpoints it saw, and says how to attach the V4 output. Attached inputs are searched 7 levels deep, and the most advanced same-stage checkpoint is the one resumed. |
+| ~1 h of downloads in every session | Nothing reused the finished downloads. | An attached copy of the download folder is used as is, and nothing in it is downloaded again. Attached index / hash caches are reused. |
+| `[discover] no public CJK scene-text set found ...` after 8 successful downloads | Misleading message. | One line per set says where it came from (attached / found by signature / downloaded), plus the list of sets that are not available. |
+
+**How the two GPUs are used**
+- **Launch:** one process per GPU is forked from the notebook process, so it works when the script is pasted into a cell; no `torchrun` or script file is needed.
+- **Data:** every process draws the same mixture sample sequence and trains on its own shard of it (positions `rank::world`), with `batch_size / world` images per GPU. Global batch, learning-rate schedule and steps per epoch are therefore the same as on one GPU.
+- **Gradients:** averaged by an explicit, bucketed all-reduce after `backward`. One training step runs several forward passes (scene batch, word-strip batch), which `DistributedDataParallel` does not support.
+- **Rank 0:** keeps the EMA, validates, evaluates and writes the checkpoints. The other process waits on a separate control channel, so a long evaluation cannot time out the GPU channel.
+- **Crashes:** if a process dies (for example a DataLoader worker killed for memory), both are restarted from the last 20-step checkpoint.
+- **Fallback:** if CUDA was already initialised by an earlier notebook cell, the GPUs cannot be used from forked processes, and the run falls back to one GPU with a message saying so.
+
 ## Datasets: downloaded automatically from the original sources
 
 With `auto_download_sources = True` (the default), every set below is fetched from its original host on the first run.
@@ -25,7 +45,7 @@ With `auto_download_sources = True` (the default), every set below is fetched fr
   - Archives are extracted safely (no path traversal, no links), and nested zips are unpacked.
   - A `.complete` marker means a finished set is never downloaded twice.
   - The disk always keeps a reserve (`download_min_free_gb`); if space runs out, the sets at the end of `download_names` are the ones skipped.
-- **Where it goes on Kaggle:** the data lands in `/tmp/a3espotter_data`. That disk is wiped between sessions, so save the folder as a Kaggle dataset and attach it to skip the download next time. Attached copies are found by file signature.
+- **Where it goes on Kaggle:** the data lands in `/tmp/a3espotter_data`. That disk is wiped between sessions. An attached copy of this folder is used as is, and sets attached in their original layout are found by file signature. Either way, nothing attached is downloaded again.
 
 | Key | Script | Set | Original source (auto) | Notes |
 |---|---|---|---|---|
@@ -84,13 +104,13 @@ Four independent reviews covered the whole file (data/config, multi-source merge
 
 ## Running on Kaggle
 
-1. Attach the V4 notebook output so that `best_model.pth` is found under `/kaggle/input`, or set `init_checkpoint`.
-2. Enable Internet, then run. The log prints:
-   - the download progress;
-   - the discovered sources;
-   - each source's share of the training mix;
-   - the vocabulary extension.
-3. Stage `v5_cjk_merge` then fine-tunes for `finetune_epochs` (60). After that, the operating point is calibrated on the IC15 held-out split, and IC15 test inference runs with it.
+1. **Settings → Accelerator → GPU T4 x2**, and turn Internet on. Use a fresh kernel: this cell must be the first one that uses the GPU.
+2. **Warm start (strongly recommended):** attach the V4 notebook's output (*Add Input → Your Work → the V4 notebook*), or set `Config.init_checkpoint`. The stage then needs `finetune_epochs` (60) instead of 250 epochs from scratch. The banner at the start says which mode was chosen and why.
+3. **Run it as a commit** (*Save Version → Save & Run All*). The run stops by itself after `max_session_hours` (11 h), after writing `outputs/models/latest_model.pth`, so the version finishes normally and its output is kept.
+4. **Next session:** attach that version's output (*Add Input → this notebook → Output*) and run again. The log says `Resumed stage 'v5_cjk_merge' at epoch E, step S/687`, and training continues on the next sample of the same draw. Repeat until the stage completes; calibration on the IC15 held-out split and test inference then run automatically.
+5. **Optional, to skip the ~1 h download:** upload `/tmp/a3espotter_data` as a private Kaggle dataset and attach it. It is larger than the 20 GB notebook-output limit, so this needs the Kaggle API with your token. The run detects the attached copy and downloads nothing.
+
+The 30-step speed projection in the log shows how many sessions the stage needs. If it reports that most of the step is spent waiting for data (the GPUs share 4 CPU cores), lower `strip_batch_images`.
 
 ## What was verified here
 
@@ -98,7 +118,24 @@ Four independent reviews covered the whole file (data/config, multi-source merge
 - training from scratch;
 - resume;
 - warm start from a V4-shaped checkpoint;
-- strip re-reading, calibration and figures with oracle detection maps.
+- strip re-reading, calibration and figures with oracle detection maps;
+- the attached-checkpoint, truncated-checkpoint and worker-crash paths.
+
+**V5.1 training-lifecycle tests.** The multi-process path ran on CPU with 2 processes over `gloo`; on Kaggle it uses `nccl` on the GPUs.
+- **Exact resume, one process:** a run interrupted at step 8 of 12 and then resumed trains on exactly the same sample sequence as an uninterrupted run, in both epochs.
+- **2-process training:**
+  - after 24 steps both processes hold bit-identical weights;
+  - each process receives exactly its half of the single-process sample sequence.
+- **Stop and resume across process counts:**
+  - a stop requested by one process only stops both at the same step;
+  - resuming on 2 processes, or on 1, continues at sample 16 of the same draw.
+- **Crash recovery:**
+  - one process: a DataLoader-worker crash continues the epoch at the crashed step, with the same draw;
+  - two processes: the crash restarts both processes from the step-5 checkpoint, and they end with identical weights.
+- **ReCTS pairing:** the `gt/` + `gt_unicode/` layout is resolved, a mojibake copy loses to the clean one, and GT files of different images are still skipped.
+- **Attached download folder:** detected, including the word-crop fallback.
+
+**Found and fixed while testing:** the forked training processes deadlocked in their first CPU tensor copy, because GNU OpenMP's thread pool was inherited from the parent. Each training process now uses one intra-op thread, as PyTorch's DataLoader workers do.
 
 **Downloader tests** ran against a local server:
 - resume after a dropped connection;
@@ -115,8 +152,9 @@ Four independent reviews covered the whole file (data/config, multi-source merge
 - exact conversion of the V4 strip-pool weights;
 - the real Hugging Face SynthMLT Japanese LMDB, read through the crop dataset.
 
-**Not verified here:**
-- a GPU/AMP run and any accuracy number;
-- the multi-GB downloads end to end: this sandbox can reach Baidu's CDN and Hugging Face, but its proxy blocks plain HTTP, so the HTTP-only hosts could not be tested.
+**Not verified here (no GPU in this sandbox):**
+- the `nccl` run on two real T4s, and AMP;
+- the actual seconds per step on a T4, and any accuracy number;
+- the multi-GB downloads end to end: this sandbox's proxy blocks plain HTTP, so the HTTP-only hosts could not be tested.
 
-The first Kaggle run is the real test.
+The next Kaggle run's log will show the step time (the `data=` / `gpu=` fields in the progress bar and the `[speed]` line).

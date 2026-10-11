@@ -63,6 +63,28 @@ Training / evaluation
     (a 2-syllable Korean word or a 2-character Chinese word is a real word).
   * GT-aware figures (correct / wrong text / false positive / missed), aspect-correct layout, outcome t-SNE.
 
+What the first V5 Kaggle run showed, and what V5.1 changes
+------------------------------------------------------------
+  * 62 s per training step (11.8 h per epoch): the model was running on the CPU (the same step measured on a 4-core
+    CPU here takes 40-60 s; data loading costs ~0.1 s per image). The run now prints the GPUs it uses and stops at
+    once when none is visible (Config.require_gpu, on by default on Kaggle).
+  * GPU T4 x2: one training process per GPU, forked from the notebook process (no torchrun / script file needed).
+    Each process trains on its shard of every mixture draw; gradients are averaged by an explicit bucketed all-reduce
+    (the step runs several forward passes, which DistributedDataParallel's hooks do not support); rank 0 keeps the
+    EMA, validates, evaluates and saves. Global batch, schedule and steps per epoch are those of the 1-GPU setup.
+  * latest_model.pth every 20 steps (Config.save_every_steps; written in the background) with the exact position in
+    the epoch: the next run replays the same draw from the next sample, with the same LR / EMA / GradScaler state,
+    on any number of GPUs. Training stops cleanly before Kaggle's 12-h limit (Config.max_session_hours) and the next
+    session (with this run's output attached) continues; crashed training processes are restarted from the last
+    step checkpoint.
+  * ReCTS: all 20,002 images were skipped because the archive holds the same labels twice (gt/ and gt_unicode/).
+    Duplicate annotation copies are now recognised (same boxes) and the copy that decodes best is used.
+  * cudnn.benchmark was on although the input shapes change at every step (re-tuning instead of training).
+  * The run silently started from scratch (250 epochs): the stage plan is now printed with the checkpoints seen and
+    how to attach the V4 output; attached checkpoints are searched deeper and the most advanced one is resumed.
+  * Downloaded sets were fetched again in every session (~1 h): an attached copy of the download folder, and
+    attached index caches, are now reused. Images travel from loader workers as uint8 (4x less shared memory).
+
 Components of this model and the closest prior work they build on (for honest positioning - nothing below is
 claimed to be "first"):
   * SGDLA block: focused linear attention (FLatten Transformer, Han et al., ICCV'23) with dyadic keys/values,
@@ -91,6 +113,9 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+# Count GPUs through NVML instead of initialising CUDA: the multi-GPU launcher forks one training process per GPU,
+# and a process that has initialised CUDA cannot be forked into CUDA-using children.
+os.environ.setdefault("PYTORCH_NVML_BASED_CUDA_CHECK", "1")
 
 import math
 import random
@@ -110,6 +135,10 @@ import urllib.parse
 import urllib.error
 import unicodedata
 import multiprocessing as mp
+import socket
+import subprocess
+import threading
+import datetime
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict, namedtuple
 
@@ -126,6 +155,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+tqdm.monitor_interval = 0              # no tqdm monitor thread: training processes are forked from this one
 import pyclipper
 from shapely.geometry import Polygon
 import warnings
@@ -178,14 +208,19 @@ except Exception:
 # ==========================================
 # 0. Reproducibility & Dataloader Safety
 # ==========================================
+_SESSION_T0 = time.time()                       # session clock for the Kaggle time guard (Config.max_session_hours)
+
+
 def seed_everything(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+        torch.cuda.manual_seed_all(seed)                # lazy: queued until CUDA is initialised (fork-safe)
     torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.benchmark = True
+    # FIX (V5.1): benchmark mode re-tunes every convolution / LSTM for each NEW input shape. The RoI count, the strip
+    # canvas width and the long-line bucket change at every step here, so it kept re-tuning instead of training.
+    torch.backends.cudnn.benchmark = False
 
 
 def seed_cuda(seed):
@@ -607,6 +642,19 @@ class Config:
         self.ohem_ratio = 3.0
         self.min_text_px = 4                     # text thinner than this (crop px) -> ignore
         self.target_text_h = (8.0, 80.0)         # text-height range for scale-normalised crops
+
+        # ---------------- NEW (V5.1): compute, multi-GPU, step checkpoints, session budget ----------------
+        on_kaggle = os.path.isdir('/kaggle')
+        self.require_gpu = on_kaggle             # stop at once instead of training on the CPU (the V5.0 Kaggle run:
+                                                 # 62 s/step = 11.8 h per epoch, i.e. no GPU was used)
+        self.multi_gpu = 'auto'                  # 'auto' = one training process per visible GPU (T4 x2 -> 2);
+                                                 # an int caps the count; False / 1 = single process
+        self.ddp_backend = 'nccl'                # 'gloo' runs the multi-process path on CPU (tests)
+        self.ddp_timeout_minutes = 180           # rank 0 validates / evaluates while the others wait
+        self.save_every_steps = 20               # mid-epoch checkpoint (exact resume: sampler position, LR, EMA...)
+        self.max_session_hours = 11.0 if on_kaggle else None   # Kaggle stops sessions at 12 h: training stops
+                                                 # here, after a final checkpoint, and the next session resumes
+        self.timing_in_progress_bar = True       # data-wait vs compute seconds per step in the progress bar
 
         # ---------------- NEW: stages ----------------
         self.stage_name = 'v5_cjk_merge'         # a different stage name in the checkpoint -> warm start
@@ -1542,7 +1590,9 @@ class ICDAR2019Dataset(Dataset):
         image, insts = self._augmented(idx)
         complete = self._is_complete(idx)
         kernels, tm, dir_ds, dirw_ds, gt_any, rois = self._build_targets(image, insts, rng, complete)
-        image_t = torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1).float() / 255.0
+        # uint8 through the worker -> main-process queue (4x less shared memory and copying than float32);
+        # scaled to [0, 1] on the GPU (Trainer._to_device).
+        image_t = torch.from_numpy(np.ascontiguousarray(image)).permute(2, 0, 1)
         return {
             'image': image_t,
             'masks': torch.from_numpy(kernels),
@@ -1670,7 +1720,7 @@ def _strip_item(cfg, canvas, nw, poly_in_strip, label, lang):
         mask = np.ones((cfg.roi_h, cfg.roi_w_long), np.float32)
     else:
         mask = roi_mask_from_polygon(poly_in_strip, rb, cfg.roi_h, cfg.roi_w_long)
-    return {'image': torch.from_numpy(np.ascontiguousarray(canvas)).permute(2, 0, 1).float() / 255.0,
+    return {'image': torch.from_numpy(np.ascontiguousarray(canvas)).permute(2, 0, 1),     # uint8 (see _to_device)
             'nw': int(nw), 'rbox': rb, 'roi_mask': mask, 'text_seq': seq, 'text_len': tlen if rec_valid else 0,
             'script_id': sid, 'rec_valid': rec_valid,
             'family_target': cfg.family_target(label, sid) if label else np.zeros(4, np.float32)}
@@ -1874,7 +1924,7 @@ IC15_RRC_FILES = [
 # Hosts whose HTTPS certificate chain fails standard verification (incomplete chain / self-signed). Their files are
 # tried over verified HTTPS, then plain HTTP, then (only if download_allow_legacy_tls) unverified HTTPS.
 LEGACY_TLS_HOSTS = {'datasets.cvc.uab.es', 'rrc.cvc.uab.es', 'ptak.felk.cvut.cz'}
-INDEX_VERSION = 'v5.2'
+INDEX_VERSION = 'v5.3'
 PER_IMAGE_FORMATS = {'mlt': '.txt', 'icdar': '.txt', 'rctw': '.txt', 'rects': '.json', 'kaist': '.xml'}
 
 ImageRecord = namedtuple('ImageRecord', ['img', 'src', 'w', 'h', 'ann', 'scripts'])
@@ -2083,10 +2133,48 @@ def _dir_affinity(img_path, gt_path):
     return n
 
 
-def _pair_images_with_gt(img_dir, gt_dir, ext):
-    """Pairs images with GT files by stem ('gt_' / 'res_' prefixes ignored). When a stem occurs in several folders
-    (synthetic sets numbered per sub-folder), the GT whose folder path matches the image's best wins; ties are
-    dropped rather than guessed."""
+def _text_quality(raw):
+    """Fraction of transcription characters that are not decoding damage (U+FFFD, C0/C1 controls, Latin-1 mojibake
+    bytes, private-use code points)."""
+    chars = ''.join(t for _, t, ig, *_ in raw if not ig and t and t != '###')
+    if not chars:
+        return 1.0
+    bad = sum(1 for ch in chars if ch == '�' or 0x80 <= ord(ch) <= 0xff or 0xe000 <= ord(ch) <= 0xf8ff
+              or unicodedata.category(ch) == 'Cc')
+    return 1.0 - bad / len(chars)
+
+
+def _resolve_gt_variants(group, parser, sample=12):
+    """`group`: [(image, [tied GT paths])] whose tied GT files live in the same set of folders. If the tied files
+    describe the SAME boxes (one annotation shipped twice, e.g. ReCTS gt/ and gt_unicode/), returns the folder whose
+    transcriptions decode best (ties -> the explicitly encoded 'unicode' copy, as MMOCR uses); if the boxes differ
+    they are labels of different images (numbered per sub-folder) and None is returned (genuinely ambiguous)."""
+    if parser is None:
+        return None
+    smp = random.Random(0).sample(group, min(sample, len(group)))
+    quality = defaultdict(list)
+    for _, cands in smp:
+        geoms = set()
+        for g in cands:
+            try:
+                raw = parser(g)
+            except Exception:
+                quality[os.path.dirname(g)].append(0.0)
+                continue
+            geoms.add(tuple(tuple(int(round(float(v))) for v in pts) for pts, *_ in raw))
+            quality[os.path.dirname(g)].append(_text_quality(raw))
+        if len(geoms) > 1:
+            return None
+    dirs = sorted({os.path.dirname(g) for _, c in group for g in c})
+    return max(dirs, key=lambda d: (float(np.mean(quality[d])) if quality[d] else 0.0,
+                                    'unicode' in d.lower() or 'utf' in d.lower(), -len(d)))
+
+
+def _pair_images_with_gt(img_dir, gt_dir, ext, parser=None):
+    """Pairs images with GT files by stem ('gt_' / 'res_' prefixes ignored). When a stem occurs in several folders,
+    the GT whose folder path matches the image's best wins. Remaining ties are resolved per folder set: two copies
+    of the same annotation (ReCTS ships gt/ and gt_unicode/; V5.0 skipped all 20,002 ReCTS images here) -> the copy
+    that decodes best; labels of different images (synthetic sets numbered per sub-folder) -> skipped, not guessed."""
     imgs = list_images_recursive(img_dir)
     raw, stripped = defaultdict(list), defaultdict(list)
     for dp, dn, fn in os.walk(gt_dir):
@@ -2097,7 +2185,7 @@ def _pair_images_with_gt(img_dir, gt_dir, ext):
                 raw[stem].append(os.path.join(dp, f))
                 if _strip_gt_prefix(stem) != stem:
                     stripped[_strip_gt_prefix(stem)].append(os.path.join(dp, f))
-    pairs, ambiguous = [], 0
+    pairs, ambiguous, ties = [], 0, defaultdict(list)
     for p in imgs:
         stem = os.path.splitext(os.path.basename(p))[0]
         cands = raw.get(stem) or stripped.get(stem)     # 'gt_N.jpg' + 'gt_N.txt' as well as 'img_N' + 'gt_img_N'
@@ -2111,7 +2199,18 @@ def _pair_images_with_gt(img_dir, gt_dir, ext):
         if scored[0][0] > scored[1][0]:
             pairs.append((p, scored[0][1]))
         else:
-            ambiguous += 1
+            top = [g for s, g in scored if s == scored[0][0]]
+            ties[tuple(sorted({os.path.dirname(g) for g in top}))].append((p, top))
+    for dirs, group in ties.items():
+        best = _resolve_gt_variants(group, parser) if len(dirs) > 1 else None
+        chosen = [(p, next((g for g in c if os.path.dirname(g) == best), None)) for p, c in group] if best else []
+        chosen = [(p, g) for p, g in chosen if g is not None]
+        if chosen:
+            pairs += chosen
+            print(f"[sources] {len(chosen)} images in {img_dir}: the same annotation exists in "
+                  f"{len(dirs)} folders ({', '.join(os.path.basename(d) for d in dirs)}) -> using "
+                  f"{os.path.relpath(best, gt_dir)}")
+        ambiguous += len(group) - len(chosen)
     if ambiguous:
         print(f"[sources] {ambiguous} images in {img_dir} have several equally plausible GT files - skipped")
     return pairs
@@ -2293,7 +2392,7 @@ def build_source_records(spec, cfg):
             pairs, seen = [], set()
             for img_dirs, gt_dir in _spec_dirs(spec):
                 for d in img_dirs:
-                    for img, gt in _pair_images_with_gt(d, gt_dir, PER_IMAGE_FORMATS[fmt]):
+                    for img, gt in _pair_images_with_gt(d, gt_dir, PER_IMAGE_FORMATS[fmt], _PARSERS.get(fmt)):
                         if img not in seen:
                             seen.add(img)
                             pairs.append((img, gt))
@@ -2772,6 +2871,50 @@ def _downloaded_spec(name, meta, dest):
     return spec
 
 
+def find_attached_download_mirrors(roots, names, max_depth=5):
+    """Attached copies of a download folder (<dir>/<catalog name>/... exactly as acquire_public_sources writes it,
+    e.g. /tmp/a3espotter_data uploaded as a Kaggle dataset). The '.complete' marker is not required (dataset uploads
+    may drop dot-files); a set counts when its label file / annotation files and images are present.
+    Returns [(spec, None)] for full sets and [(None, crop_source)] for word-crop fallbacks."""
+    out, seen = [], set()
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        rdepth = os.path.realpath(root).rstrip(os.sep).count(os.sep)
+        for dp, dn, fn in os.walk(root):
+            dn[:] = sorted(d for d in dn if not d.startswith('.'))
+            hits = [d for d in dn if d in names and d in PUBLIC_SOURCE_CATALOG]
+            dn[:] = [] if os.path.realpath(dp).count(os.sep) - rdepth >= max_depth else \
+                [d for d in dn if d not in hits]          # never descend into a set
+            for name in hits:
+                path = os.path.join(dp, name)
+                if name in seen:
+                    continue
+                meta = PUBLIC_SOURCE_CATALOG[name]
+                lmdb = os.path.join(path, 'fallback_lmdb', 'data.mdb')
+                spec = None
+                if meta['format'] in ('lsvt', 'art'):
+                    spec = _downloaded_spec(name, meta, path)
+                else:
+                    ext = PER_IMAGE_FORMATS.get(meta['format'], '.txt')
+                    has_gt = has_img = False
+                    for d2, _, f2 in os.walk(path):
+                        has_gt = has_gt or any(f.lower().endswith(ext) for f in f2)
+                        has_img = has_img or any(f.endswith(IMG_EXTS) for f in f2)
+                        if has_gt and has_img:
+                            break
+                    if has_gt and has_img:
+                        spec = _downloaded_spec(name, meta, path)
+                if spec is not None:
+                    seen.add(name)
+                    out.append((spec, None))
+                elif os.path.isfile(lmdb):
+                    seen.add(name)
+                    out.append((None, {'type': 'lmdb', 'path': os.path.dirname(lmdb), 'name': name + '_crops',
+                                       'script_hint': meta.get('script_hint')}))
+    return out
+
+
 def acquire_public_sources(cfg, names=None):
     """Downloads (once; resumable; verified) and extracts every requested catalogued set from its original
     distribution point. Returns (specs of the sets that are ready, extra word-crop LMDB sources from the declared
@@ -3050,18 +3193,24 @@ class ScriptAdaptiveMixtureSampler(Sampler):
     (error-feedback mixing). The sampler runs in the main process, so updates apply from the next epoch even
     with persistent DataLoader workers."""
 
-    def __init__(self, base_weights, script_mass, num_samples, seed=0):
+    def __init__(self, base_weights, script_mass, num_samples, seed=0, rank=0, world=1):
         self.base = np.asarray(base_weights, dtype=np.float64)
         self.mass = np.asarray(script_mass, dtype=np.float32)
         self.beta = np.ones(self.mass.shape[1], dtype=np.float64)
         self.num_samples = int(num_samples)
         self.seed = int(seed)
-        self.epoch = 0
+        self.epoch = 0                      # draw counter: the next __iter__ uses seed + 7919 * epoch
+        self.last_epoch = 0                 # counter value of the draw in progress (mid-epoch checkpoints)
+        self.skip = 0                       # GLOBAL samples of the next draw already consumed (mid-epoch resume)
+        self.rank, self.world = int(rank), max(int(world), 1)
 
     def set_script_multipliers(self, beta):
         b = np.asarray(beta, dtype=np.float64).copy()
         b[0] = 1.0
         self.beta = b
+
+    def set_shard(self, rank, world):
+        self.rank, self.world = int(rank), max(int(world), 1)
 
     def probabilities(self):
         p = self.base * (self.mass.astype(np.float64) @ self.beta)
@@ -3069,12 +3218,33 @@ class ScriptAdaptiveMixtureSampler(Sampler):
         return p / max(p.sum(), 1e-12)
 
     def __iter__(self):
+        """Every rank draws the SAME global sequence (same seed, counter and multipliers), drops the `skip` samples
+        already trained on, and keeps every world-th one from position `rank` (equal lengths on all ranks, so all
+        processes run the same number of steps). `skip` applies to one draw only."""
         rng = np.random.default_rng(self.seed + 7919 * self.epoch)
+        self.last_epoch = self.epoch
         self.epoch += 1
-        return iter(rng.choice(len(self.base), size=self.num_samples, replace=True, p=self.probabilities()).tolist())
+        seq = rng.choice(len(self.base), size=self.num_samples, replace=True, p=self.probabilities())
+        seq = seq[min(self.skip, len(seq)):]
+        self.skip = 0
+        seq = seq[:len(seq) // self.world * self.world]
+        return iter(seq[self.rank::self.world].tolist())
 
     def __len__(self):
-        return self.num_samples
+        return max(self.num_samples - self.skip, 0) // self.world
+
+    def state_dict(self):
+        return {'epoch': int(self.epoch), 'last_epoch': int(self.last_epoch), 'beta': self.beta.tolist()}
+
+    def load_state_dict(self, st, mid_epoch_skip=None):
+        """mid_epoch_skip=None: continue with a fresh draw; an int: replay the interrupted draw from that sample."""
+        if st.get('beta') is not None and len(st['beta']) == len(self.beta):
+            self.set_script_multipliers(st['beta'])
+        if mid_epoch_skip is None:
+            self.epoch = int(st.get('epoch', self.epoch))
+        else:
+            self.epoch = int(st.get('last_epoch', self.epoch))
+            self.skip = int(mid_epoch_skip)
 
 
 class SceneWordStripDataset(Dataset):
@@ -3133,20 +3303,45 @@ class SceneWordStripDataset(Dataset):
 
 
 def resolve_cjk_specs(cfg, exclude_dirs=()):
-    """Public CJK sources: downloaded from their original hosts (auto_download_sources), then attached copies found by
-    signature (cjk_sources='auto') or explicit specs. One spec per catalogued name (downloaded copy first).
+    """Public CJK sources, cheapest first: (1) an attached copy of a previous session's download folder (same layout,
+    e.g. /tmp/a3espotter_data saved as a Kaggle dataset), (2) attached copies found by file signature, (3) automatic
+    download from the original hosts for whatever is still missing (V5.0 downloaded everything again, ~1 h per Kaggle
+    session, even when a copy was attached). Explicit specs (cjk_sources = [...]) are used as given.
     Returns (specs, extra word-crop sources from declared fallbacks)."""
-    specs, crop_sources = [], []
-    if cfg.auto_download_sources:
-        specs, crop_sources = acquire_public_sources(cfg)
+    specs, crop_sources, origin = [], [], {}
     if cfg.cjk_sources == 'auto':
         roots = list(cfg.source_search_roots)
         if not cfg.auto_download_sources:
             roots.append(cfg.download_root)
-        have = {s['name'] for s in specs}
-        specs += [s for s in discover_public_sources(roots, exclude=exclude_dirs) if s['name'] not in have]
+        for s, crops in find_attached_download_mirrors(roots, cfg.download_names):
+            if s is not None and s['name'] not in origin:
+                specs.append(s)
+                origin[s['name']] = 'attached copy of a download folder: ' + s['img_dir']
+            elif s is None and crops['name'][:-len('_crops')] not in origin:
+                crop_sources.append(crops)
+                origin[crops['name'][:-len('_crops')]] = 'attached word-crop fallback: ' + crops['path']
+        for s in discover_public_sources(roots, exclude=exclude_dirs, verbose=False):
+            if s['name'] not in origin:
+                specs.append(s)
+                origin[s['name']] = 'attached (found by file signature): ' + \
+                    str(s.get('img_dirs') or [d for e in s.get('pairs_dirs', []) for d in e[0]])
     else:
         specs += list(cfg.cjk_sources or [])
+        origin.update({s.get('name'): 'explicit spec' for s in specs})
+    if cfg.auto_download_sources:
+        todo = [n for n in cfg.download_names if n not in origin]
+        dl_specs, dl_crops = acquire_public_sources(cfg, todo) if todo else ([], [])
+        specs += dl_specs
+        crop_sources += dl_crops
+        origin.update({s['name']: 'downloaded: ' + s['img_dir'] for s in dl_specs})
+        origin.update({c['name'][:-len('_crops')]: 'word-crop fallback: ' + c['path'] for c in dl_crops})
+    for name in sorted(origin):
+        print(f"[sources] {name:<12} {origin[name]}")
+    missing = [n for n in (cfg.download_names if cfg.cjk_sources == 'auto' else []) if n not in origin]
+    if missing:
+        print(f"[sources] not available: {', '.join(missing)} (see PUBLIC_SOURCE_CATALOG for where to get them).")
+    if not origin:
+        print("[sources] no public CJK scene-text set attached or downloaded: training uses MLT-19 + IC15 only.")
     out = []
     for s in specs:
         s = _spec_with_defaults(s, cfg)
@@ -5470,6 +5665,201 @@ def evaluate_spotting(engine, items, config, max_images=None, desc='Eval'):
 
 
 # ==========================================
+# 9a. NEW (V5.1) - Compute: GPU inventory without CUDA initialisation, one training process per GPU
+# ==========================================
+def available_cpus():
+    try:
+        return len(os.sched_getaffinity(0))
+    except Exception:
+        return os.cpu_count() or 1
+
+
+def gpu_inventory():
+    """[(name, memory MiB, compute capability)] of the visible GPUs, read with nvidia-smi so that this process does NOT
+    initialise CUDA (it may fork one CUDA training process per GPU afterwards)."""
+    rows = []
+    for fields in ('index,name,memory.total,compute_cap', 'index,name,memory.total'):
+        try:
+            out = subprocess.run(['nvidia-smi', f'--query-gpu={fields}', '--format=csv,noheader,nounits'],
+                                 capture_output=True, text=True, timeout=30)
+        except Exception:
+            break
+        if out.returncode == 0 and out.stdout.strip():
+            rows = [[c.strip() for c in ln.split(',')] for ln in out.stdout.strip().splitlines() if ln.strip()]
+            break
+    vis = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if vis is not None and rows:
+        ids = [v.strip() for v in vis.split(',') if v.strip()]
+        rows = [r for r in rows if r[0] in ids] if all(v.isdigit() for v in ids) else rows[:len(ids)]
+    gpus = [(r[1], r[2], r[3] if len(r) > 3 else '?') for r in rows]
+    if not gpus:
+        try:
+            n = torch.cuda.device_count()                  # NVML-based (PYTORCH_NVML_BASED_CUDA_CHECK=1)
+        except Exception:
+            n = 0
+        gpus = [('GPU', '?', '?')] * n
+    return gpus
+
+
+def describe_compute(cfg):
+    """Prints what this session will train on and refuses a CPU-only run when cfg.require_gpu (Kaggle default)."""
+    gpus, cpus = gpu_inventory(), available_cpus()
+    if gpus:
+        print(f"[compute] {len(gpus)} GPU(s): " + '; '.join(f"{n} ({m} MiB, compute {c})" for n, m, c in gpus) +
+              f" | {cpus} CPU cores | torch {torch.__version__}, CUDA {torch.version.cuda}")
+        archs = torch.cuda.get_arch_list() if torch.cuda.is_available() else []
+        for n, _, c in gpus:
+            if archs and c not in ('?', '') and f"sm_{c.replace('.', '')}" not in archs:
+                print(f"[compute] WARNING: this PyTorch build has no kernels for {n} (sm_{c.replace('.', '')}; it has "
+                      f"{', '.join(archs)}). On Kaggle choose the 'GPU T4 x2' accelerator.")
+        if not torch.cuda.is_available():
+            msg = "[compute] GPUs are visible but this PyTorch build cannot use them (CPU-only build or driver mismatch)."
+            if cfg.require_gpu:
+                raise RuntimeError(msg)
+            print(msg)
+            return [], cpus
+    else:
+        msg = ("[compute] NO GPU is visible, so training would run on the CPU. The V5.0 Kaggle log matches this: "
+               "62 s per step, i.e. 11.8 h per epoch (the same step measured on a 4-core CPU takes ~40-60 s).")
+        if cfg.require_gpu:
+            raise RuntimeError(msg + " On Kaggle: Settings -> Accelerator -> 'GPU T4 x2' (or another GPU), then run "
+                                     "again. Set Config.require_gpu = False to train on the CPU anyway.")
+        print(msg)
+    return gpus, cpus
+
+
+def plan_world_size(cfg, gpus):
+    """Number of data-parallel training processes."""
+    mg = cfg.multi_gpu
+    if mg is True or mg == 'auto':
+        want = len(gpus)
+    elif mg is False or mg is None:
+        return 1
+    else:
+        want = int(mg)
+    if cfg.ddp_backend == 'nccl':
+        want = min(want, len(gpus))
+    if want <= 1:
+        return 1
+    if 'fork' not in mp.get_all_start_methods():
+        print("[compute] this platform cannot fork worker processes: training on one GPU.")
+        return 1
+    if torch.cuda.is_initialized():
+        print("[compute] CUDA is already initialised in this Python process (an earlier notebook cell used the GPU), "
+              "so the per-GPU training processes cannot be forked: training on ONE GPU. Restart the kernel and run "
+              "this cell first to use all GPUs.")
+        return 1
+    return want
+
+
+class DistContext:
+    """Rank information of one data-parallel training process. `ctrl` is a gloo group for control messages
+    (barriers, broadcasts of mixer weights / stop decisions) that may wait for minutes while rank 0 evaluates."""
+
+    def __init__(self, rank, world, backend, ctrl, device):
+        self.rank, self.world, self.backend, self.ctrl, self.device = rank, world, backend, ctrl, device
+        self.is_main = rank == 0
+
+    def broadcast(self, obj):
+        box = [obj]
+        torch.distributed.broadcast_object_list(box, src=0, group=self.ctrl)
+        return box[0]
+
+    def barrier(self):
+        torch.distributed.barrier(group=self.ctrl)
+
+
+def _free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+def _ddp_entry(rank, fn, world, backend, timeout_min, port):
+    # A forked child must not enter an OpenMP parallel region whose thread team belonged to the parent (GNU libgomp
+    # deadlocks: observed here in the first CPU tensor copy). One intra-op thread per rank, as in DataLoader workers;
+    # the GPU does the compute and the loader workers use the CPU cores.
+    torch.set_num_threads(1)
+    os.environ['MASTER_ADDR'], os.environ['MASTER_PORT'] = '127.0.0.1', str(port)
+    os.environ['RANK'], os.environ['WORLD_SIZE'], os.environ['LOCAL_RANK'] = str(rank), str(world), str(rank)
+    timeout = datetime.timedelta(minutes=timeout_min)
+    if backend == 'nccl':
+        try:
+            torch.cuda.set_device(rank)
+            torch.zeros(1, device=torch.device('cuda', rank))
+        except Exception as e:
+            raise RuntimeError(f"CUDA_FORK_FAILURE: rank {rank} cannot use its GPU in a forked process ({e}); the "
+                               f"parent process had already initialised CUDA.") from e
+        device = torch.device('cuda', rank)
+    else:
+        device = torch.device('cpu')
+    torch.distributed.init_process_group(backend, rank=rank, world_size=world, timeout=timeout)
+    try:
+        ctrl = torch.distributed.new_group(backend='gloo', timeout=timeout) if backend != 'gloo' else \
+            torch.distributed.group.WORLD
+        fn(DistContext(rank, world, backend, ctrl, device))
+    finally:
+        try:
+            torch.distributed.destroy_process_group()
+        except Exception:
+            pass
+
+
+def launch_data_parallel(fn, world, backend='nccl', timeout_min=180):
+    """Runs fn(DistContext) in `world` forked processes, one per GPU. Forking (not spawning) needs no pickling, so it
+    works from a Kaggle / Jupyter notebook cell (the approach of accelerate's notebook_launcher); this process must
+    not have initialised CUDA. Raises if any rank fails (the others are terminated)."""
+    if backend == 'nccl':
+        os.environ.setdefault('NCCL_P2P_DISABLE', '1')    # cloud VMs (Kaggle T4 x2): PCIe P2P can hang; via host
+        os.environ.setdefault('NCCL_IB_DISABLE', '1')     # memory costs a few ms per step at this model size
+    torch.multiprocessing.start_processes(_ddp_entry, args=(fn, world, backend, timeout_min, _free_port()),
+                                          nprocs=world, join=True, start_method='fork')
+
+
+class SessionTimeUp(Exception):
+    """Raised inside the training loop when Config.max_session_hours is reached (after a checkpoint was written)."""
+
+
+class _AsyncWriter:
+    """Writes checkpoints in a background thread: the training step only pays for the GPU -> CPU copy of the state
+    (a full 34.8M-parameter state with EMA and Adam moments is ~0.6 GB; pickling it to disk takes seconds)."""
+
+    def __init__(self):
+        self._t = None
+        self.error = None
+
+    def submit(self, job):
+        self.wait()
+
+        def run():
+            try:
+                job()
+            except Exception as e:                           # reported, never kills training
+                self.error = e
+                print(f"[checkpoint] background write failed: {type(e).__name__}: {e}")
+        self._t = threading.Thread(target=run, name='ckpt-writer', daemon=False)
+        self._t.start()
+
+    def wait(self):
+        if self._t is not None:
+            self._t.join()
+            self._t = None
+
+
+def _cpu_snapshot(obj):
+    """Deep copy with every tensor moved to the CPU (a consistent snapshot the background writer can pickle while
+    training continues on the GPU)."""
+    if torch.is_tensor(obj):
+        return obj.detach().to('cpu', copy=True)
+    if isinstance(obj, dict):
+        return type(obj)((k, _cpu_snapshot(v)) for k, v in obj.items()) if not isinstance(obj, defaultdict) else \
+            {k: _cpu_snapshot(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_cpu_snapshot(v) for v in obj)
+    return copy.deepcopy(obj)
+
+
+# ==========================================
 # 9. Training Engine
 # ==========================================
 def _native_bf16():
@@ -5550,34 +5940,51 @@ def _ckpt_stage(ck):
     return snap.get('stage_name', 'v4')
 
 
+CkptMeta = namedtuple('CkptMeta', ['stage', 'snapshot', 'progress'])
+
+
 def _safe_ckpt_meta(path):
-    """(stage, config_snapshot) of a checkpoint, or None if it cannot be read (e.g. a file cut off mid-write)."""
+    """(stage, config_snapshot, progress = optimizer steps) of a checkpoint, or None if it cannot be read (e.g. a
+    file cut off mid-write)."""
     try:
         ck = torch.load(path, map_location='cpu', weights_only=False)
     except Exception as e:
         print(f"[stage] cannot read {path} ({type(e).__name__}); ignoring it.")
         return None
-    meta = (_ckpt_stage(ck), ck.get('config_snapshot'))
+    meta = CkptMeta(_ckpt_stage(ck), ck.get('config_snapshot'), int(ck.get('global_step') or -1))
     del ck
     return meta
 
 
-def _checkpoint_candidates(cfg):
-    """init_checkpoint, then chkp_dir, then checkpoints inside attached Kaggle datasets (e.g. a previous session's or
-    the V4 notebook's output), best before latest."""
+_CKPT_NAME = re.compile(r'^(best|latest|final_ema)_model(_[A-Za-z0-9_]+)?\.pth$')
+
+
+def _checkpoint_candidates(cfg, max_depth=7):
+    """init_checkpoint, then chkp_dir, then checkpoints inside attached Kaggle inputs (a previous session's or the
+    V4 notebook's output, at any depth up to max_depth) and /kaggle/working: best before final-EMA before latest,
+    newest first. '_prev' / '_unreadable' backups are skipped."""
     cands = [cfg.init_checkpoint] if cfg.init_checkpoint else []
     cands += [os.path.join(cfg.chkp_dir, 'best_model.pth'), os.path.join(cfg.chkp_dir, 'latest_model.pth')]
-    for root in cfg.source_search_roots:
-        if root and root.startswith('/kaggle/input') and os.path.isdir(root):
-            rdepth = root.rstrip(os.sep).count(os.sep)
-            found = []
-            for dp, dn, fn in os.walk(root):
-                if dp.count(os.sep) - rdepth >= 5:
-                    dn[:] = []
-                for f in ('best_model.pth', 'latest_model.pth'):
-                    if f in fn:
-                        found.append(os.path.join(dp, f))
-            cands += sorted(found, key=lambda p: (not p.endswith('best_model.pth'), p))
+    roots = [r for r in cfg.source_search_roots if r and str(r).startswith('/kaggle/input')] + ['/kaggle/working']
+    found = []
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        rdepth = root.rstrip(os.sep).count(os.sep)
+        for dp, dn, fn in os.walk(root):
+            if dp.count(os.sep) - rdepth >= max_depth:
+                dn[:] = []
+            dn[:] = [d for d in dn if not d.startswith('.') and d not in ('cache', 'vizs', 'interpret')]
+            for f in fn:
+                m = _CKPT_NAME.match(f)
+                if m and '_prev' not in f and '_unreadable' not in f:
+                    p = os.path.join(dp, f)
+                    try:
+                        mt = os.path.getmtime(p)
+                    except OSError:
+                        continue
+                    found.append(({'best': 0, 'final_ema': 1, 'latest': 2}[m.group(1)], -mt, p))
+    cands += [p for _, _, p in sorted(found)]
     out, seen = [], set()
     for p in cands:
         if p and os.path.exists(p) and os.path.realpath(p) not in seen:
@@ -5593,7 +6000,7 @@ def find_warm_start_checkpoint(cfg):
         meta = _safe_ckpt_meta(p)
         if meta is None:
             continue
-        stage, snap = meta
+        stage, snap = meta.stage, meta.snapshot
         if snap is None:
             print(f"[stage] {p}: pre-V4 checkpoint (no config snapshot) - not usable for a warm start.")
         elif stage == cfg.stage_name:
@@ -5625,19 +6032,24 @@ def plan_stage(cfg):
             shutil.copy2(prev, latest)
             print(f"[stage] resuming stage '{cfg.stage_name}' from the previous checkpoint (latest_model_prev.pth).")
             return {'mode': 'resume', 'path': latest, 'snapshot': meta[1]}
+    same = []                                         # attached same-stage checkpoints: the most advanced one wins
     for p in _checkpoint_candidates(cfg):
         if not p.endswith('latest_model.pth') or os.path.realpath(p) == os.path.realpath(latest):
             continue
         meta = _safe_ckpt_meta(p)
         if meta and meta[0] == cfg.stage_name and meta[1] is not None:
-            shutil.copy2(p, latest)
-            best_src = os.path.join(os.path.dirname(p), 'best_model.pth')
-            best_dst = os.path.join(cfg.chkp_dir, 'best_model.pth')
-            bm = _safe_ckpt_meta(best_src) if os.path.exists(best_src) else None
-            if bm and bm[0] == cfg.stage_name and os.path.realpath(best_src) != os.path.realpath(best_dst):
-                shutil.copy2(best_src, best_dst)
-            print(f"[stage] resuming stage '{cfg.stage_name}' from {p} (copied into {cfg.chkp_dir}).")
-            return {'mode': 'resume', 'path': latest, 'snapshot': meta[1]}
+            same.append((meta.progress, p, meta))
+    if same:
+        _, p, meta = max(same, key=lambda t: t[0])
+        shutil.copy2(p, latest)
+        best_src = os.path.join(os.path.dirname(p), 'best_model.pth')
+        best_dst = os.path.join(cfg.chkp_dir, 'best_model.pth')
+        bm = _safe_ckpt_meta(best_src) if os.path.exists(best_src) else None
+        if bm and bm[0] == cfg.stage_name and os.path.realpath(best_src) != os.path.realpath(best_dst):
+            shutil.copy2(best_src, best_dst)
+        print(f"[stage] resuming stage '{cfg.stage_name}' from {p} (optimizer step {meta.progress}; copied into "
+              f"{cfg.chkp_dir}).")
+        return {'mode': 'resume', 'path': latest, 'snapshot': meta[1]}
     path, snap, stage = find_warm_start_checkpoint(cfg)
     if path:
         print(f"[stage] new stage '{cfg.stage_name}': warm start from {path} (stage '{stage}', "
@@ -5664,7 +6076,7 @@ class Trainer:
 
     def __init__(self, model, train_loader, val_loader, config, train_loader_factory=None, val_items=None,
                  crop_loader=None, domain_val_items=None, crop_loaders=None, mixers=None, plan=None,
-                 val_loader_factory=None):
+                 val_loader_factory=None, dist=None):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -5688,7 +6100,19 @@ class Trainer:
         self._crop_turn = 0
         self.mixers = [m for m in (mixers or []) if m is not None]
         self.mixer_beta = np.ones(config.num_scripts, dtype=np.float64)
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # NEW (V5.1): data parallelism. Each rank trains on its shard of every mixture draw; gradients are averaged
+        # by an explicit bucketed all-reduce after backward (the step makes several forward passes - scene batch,
+        # strip / crop batch - which DistributedDataParallel's per-forward hooks do not support); rank 0 alone
+        # keeps the EMA, validates, evaluates and writes checkpoints.
+        self.dist = dist
+        self.rank, self.world = (dist.rank, dist.world) if dist is not None else (0, 1)
+        self.is_main = self.rank == 0
+        self.device = dist.device if dist is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.samples_per_step = int(getattr(train_loader, 'batch_size', None) or config.batch_size) * self.world
+        self._writer = _AsyncWriter()
+        self._resume_step, self._resume_accum, self._cur = 0, None, None
+        self.stop_reason = None
+        self._projection_done = False
         self.model.to(self.device)
         self.criterion = UnifiedSpotterLoss(config).to(self.device)
         self.plan = plan or plan_stage(config)
@@ -5729,6 +6153,12 @@ class Trainer:
         self.evals_without_improvement = 0
         self._epoch_log_path = os.path.join(config.logs_dir, 'train_epoch_log.csv')
         self.load_checkpoint()
+        self._sync_params = [p for p in list(self.model.parameters()) + list(self.criterion.parameters())
+                             if p.requires_grad]
+        if self.world > 1:                            # identical start on every rank (weights AND buffers)
+            with torch.no_grad():
+                for t in list(self.model.state_dict().values()) + list(self.criterion.state_dict().values()):
+                    torch.distributed.broadcast(t, 0)
 
     # ------------------------------ schedule ------------------------------
     def _set_schedule(self, saved=None):
@@ -5766,6 +6196,7 @@ class Trainer:
     def _rebuild_loaders(self):
         """After a worker crash every loader with persistent workers is poisoned (torch raises again on each next()
         / iter()), so all of them are rebuilt, not only the training loader."""
+        self._writer.wait()                           # no checkpoint thread alive while new workers are forked
         if self.train_loader_factory is not None:
             self.train_loader = self.train_loader_factory()
         if self.val_loader_factory is not None:
@@ -5788,7 +6219,14 @@ class Trainer:
                 self._rebuild_loaders()
 
     def _to_device(self, batch):
-        return {k: (v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
+        out = {}
+        for k, v in batch.items():
+            if torch.is_tensor(v):
+                v = v.to(self.device, non_blocking=True)
+                if k == 'image' and v.dtype == torch.uint8:          # loaders ship uint8 images
+                    v = v.float().div_(255.0)
+            out[k] = v
+        return out
 
     def _rec_mask(self, tgt, train=True):
         """RoIs that go through the sequence model. Training caps them (memory with an 8,000-class output);
@@ -5884,44 +6322,153 @@ class Trainer:
             loss, logs = self.criterion(dense, rois, tgt, model.recognizer)
         return dense, rois, tgt, loss, logs, n_mined
 
+    # ------------------------------ data parallelism / session budget ------------------------------
+    def _sync_grads(self, flags):
+        """Averages the gradients over the ranks (all-reduce in ~32 MB buckets, before unscale / clip, so every rank
+        takes the identical optimizer and GradScaler step) and sums the control flags [finite-loss count, stop
+        requests]. A rank whose loss was not finite contributes zeros. Single process: flags are returned as is."""
+        if self.world == 1:
+            return flags
+        grads = []
+        for p in self._sync_params:
+            if p.grad is None:
+                p.grad = torch.zeros_like(p)
+            grads.append(p.grad)
+
+        def reduce(bucket):
+            buf = torch.cat([g.reshape(-1) for g in bucket])
+            torch.distributed.all_reduce(buf)
+            buf.div_(self.world)
+            off = 0
+            for g in bucket:
+                g.copy_(buf[off:off + g.numel()].view_as(g))
+                off += g.numel()
+        bucket, size = [], 0
+        for g in grads:
+            bucket.append(g)
+            size += g.numel()
+            if size >= (1 << 23):
+                reduce(bucket)
+                bucket, size = [], 0
+        if bucket:
+            reduce(bucket)
+        f = torch.tensor(flags, dtype=torch.float32, device=self.device)
+        torch.distributed.all_reduce(f)
+        return f.tolist()
+
+    def _time_up(self):
+        h = self.config.max_session_hours
+        return bool(h) and (time.time() - _SESSION_T0) / 3600.0 >= float(h)
+
+    @staticmethod
+    def _accum_new():
+        return {'sums': {}, 'cnts': {}, 'n': 0, 'gn': 0.0, 'mined': 0, 'clipped': 0, 't_data': 0.0, 't_step': 0.0,
+                'steps_timed': 0}
+
+    def _print_projection(self, acc):
+        per = (acc['t_data'] + acc['t_step']) / max(acc['steps_timed'], 1)
+        data_share = acc['t_data'] / max(acc['t_data'] + acc['t_step'], 1e-9)
+        rest_h = max(self.total_epochs * self.steps_per_epoch - self.global_step, 0) * per / 3600.0
+        msg = (f"[speed] {per:.2f} s/step on {self.world} process(es) ({100 * data_share:.0f}% of it waiting for "
+               f"data) -> {per * self.steps_per_epoch / 60:.0f} min per epoch, {rest_h:.1f} h for the rest of stage "
+               f"'{self.config.stage_name}' ({self.total_epochs} epochs x {self.steps_per_epoch} steps)")
+        if self.config.max_session_hours:
+            n = max(1, math.ceil(rest_h / max(float(self.config.max_session_hours) - 1.0, 1.0)))
+            msg += f", i.e. ~{n} Kaggle session{'s' if n > 1 else ''} (each resumes from the last checkpoint)"
+        if data_share > 0.5:
+            msg += (". The CPU input pipeline is the bottleneck: lower strip_batch_images / samples_per_epoch or use "
+                    "a machine with more CPU cores")
+        tqdm.write(msg + '.')
+
     # ------------------------------ training loop ------------------------------
-    def train_one_epoch(self, epoch):
+    def train_one_epoch(self, epoch, start_step=0, accum=None):
+        """One epoch, or the rest of one (start_step > 0: resumed mid-epoch; the sampler already skips the samples
+        trained on). Writes latest_model.pth every save_every_steps steps; raises SessionTimeUp after writing it when
+        the session budget is used up."""
         self.model.train()
-        sums, cnts, n_batches, gn_sum, mined_sum, clipped = defaultdict(float), defaultdict(int), 0, 0.0, 0, 0
-        loop = tqdm(self.train_loader, desc=f"Epoch {epoch + 1}/{self.total_epochs} [Train]", mininterval=2.0)
-        for raw in loop:
-            batch = self._to_device(raw)
-            lr = self._set_lr()
-            self.optimizer.zero_grad(set_to_none=True)
-            _, _, _, loss, logs, n_mined = self._step_forward(self.model, batch, mine=True)
-            c_loss, c_logs = self._crop_step(self.model)
-            if c_loss is not None and torch.isfinite(c_loss):
-                loss = loss + c_loss
-                logs.update(c_logs)
-            if not torch.isfinite(loss):
+        cfg = self.config
+        acc = accum if accum is not None else self._accum_new()
+        sums, cnts = acc['sums'], acc['cnts']
+        total = self.steps_per_epoch
+        self._cur = {'epoch': epoch, 'step': start_step, 'acc': acc}
+        loop = tqdm(total=total, initial=start_step, desc=f"Epoch {epoch + 1}/{self.total_epochs} [Train]",
+                    mininterval=2.0, disable=not self.is_main)
+        step = start_step
+        params = list(self.model.parameters()) + list(self.criterion.parameters())
+        it = iter(self.train_loader)
+        t0 = time.time()
+        try:
+            while True:
+                try:
+                    raw = next(it)
+                except StopIteration:
+                    break
+                t1 = time.time()
+                batch = self._to_device(raw)
+                lr = self._set_lr()
                 self.optimizer.zero_grad(set_to_none=True)
-                continue
-            self.scaler.scale(loss).backward()
-            self.scaler.unscale_(self.optimizer)
-            gn = torch.nn.utils.clip_grad_norm_(list(self.model.parameters()) + list(self.criterion.parameters()),
-                                                max_norm=self.config.grad_clip)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.ema.update(self.model)
-            self.global_step += 1
-            for k, v in logs.items():
-                if v == v:                                     # skip NaN placeholders
-                    sums[k] += v
-                    cnts[k] += 1
-            gnf = float(gn) if torch.isfinite(gn) else 0.0
-            gn_sum += gnf
-            clipped += int(gnf > self.config.grad_clip)
-            mined_sum += n_mined
-            n_batches += 1
-            loop.set_postfix(L=f"{logs['total']:.3f}", det=f"{logs.get('det', 0):.3f}", ctc=f"{logs.get('ctc', 0):.3f}",
-                             strip=f"{logs.get('strip_ctc', 0):.3f}", ver=f"{logs.get('verify', 0):.3f}", lr=f"{lr:.2e}")
-        n = max(n_batches, 1)
-        return {k: v / max(cnts[k], 1) for k, v in sums.items()}, gn_sum / n, mined_sum / n, clipped / n
+                _, _, _, loss, logs, n_mined = self._step_forward(self.model, batch, mine=True)
+                c_loss, c_logs = self._crop_step(self.model)
+                if c_loss is not None and torch.isfinite(c_loss):
+                    loss = loss + c_loss
+                    logs.update(c_logs)
+                ok = bool(torch.isfinite(loss))
+                if ok:
+                    self.scaler.scale(loss).backward()
+                else:
+                    self.scaler.scale(torch.zeros((), device=self.device))    # initialises the scale (first step)
+                n_ok, n_stop = self._sync_grads([float(ok), float(self._time_up())])
+                gnf = 0.0
+                if n_ok > 0:
+                    self.scaler.unscale_(self.optimizer)
+                    gn = torch.nn.utils.clip_grad_norm_(params, max_norm=cfg.grad_clip)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    if self.is_main:
+                        self.ema.update(self.model)
+                    self.global_step += 1
+                    gnf = float(gn) if torch.isfinite(gn) else 0.0
+                else:
+                    self.optimizer.zero_grad(set_to_none=True)
+                if ok:
+                    for k, v in logs.items():
+                        if v == v:                                     # skip NaN placeholders
+                            sums[k] = sums.get(k, 0.0) + v
+                            cnts[k] = cnts.get(k, 0) + 1
+                    acc['gn'] += gnf
+                    acc['clipped'] += int(gnf > cfg.grad_clip)
+                    acc['mined'] += n_mined
+                    acc['n'] += 1
+                step += 1
+                t2 = time.time()
+                acc['t_data'] += t1 - t0
+                acc['t_step'] += t2 - t1
+                acc['steps_timed'] += 1
+                self._cur['step'] = step
+                if self.is_main:
+                    post = dict(L=f"{logs.get('total', float('nan')):.3f}", det=f"{logs.get('det', 0):.3f}",
+                                ctc=f"{logs.get('ctc', 0):.3f}", strip=f"{logs.get('strip_ctc', 0):.3f}",
+                                ver=f"{logs.get('verify', 0):.3f}", lr=f"{lr:.2e}")
+                    if cfg.timing_in_progress_bar:
+                        post.update(data=f"{t1 - t0:.2f}s", gpu=f"{t2 - t1:.2f}s")
+                    loop.set_postfix(**post)
+                    loop.update(1)
+                    if acc['steps_timed'] == 30 and not self._projection_done:
+                        self._projection_done = True
+                        self._print_projection(acc)
+                if n_stop > 0:
+                    self._save_latest(epoch, step, acc, wait=True)
+                    raise SessionTimeUp(f"epoch {epoch + 1}, step {step}/{total}")
+                if cfg.save_every_steps and step % int(cfg.save_every_steps) == 0 and step < total:
+                    self._save_latest(epoch, step, acc)
+                t0 = time.time()
+        finally:
+            loop.close()
+        n = max(acc['n'], 1)
+        tr = {k: v / max(cnts.get(k, 1), 1) for k, v in sums.items()}
+        tr['_sec_per_step'] = (acc['t_data'] + acc['t_step']) / max(acc['steps_timed'], 1)
+        tr['_data_share'] = acc['t_data'] / max(acc['t_data'] + acc['t_step'], 1e-9)
+        return tr, acc['gn'] / n, acc['mined'] / n, acc['clipped'] / n
 
     @torch.no_grad()
     def validate(self, epoch):
@@ -5996,108 +6543,168 @@ class Trainer:
         out['sel_score'] = sum(w.get(k, 0) * m['spot_score'] for k, m in out.items()) / tot
         return out
 
+    def _end_of_epoch(self, epoch, tr, gn, mined, clip_frac):
+        """Rank 0: validation, mixer update, instance evaluation, model selection, checkpoint, logs.
+        Returns True when early stopping fires."""
+        cfg = self.config
+        self._writer.wait()                           # no checkpoint thread alive while validation workers are forked
+        va = self._with_loader_retry(lambda: self.validate(epoch), 'validation')
+        self._update_mixers(va.get('per_script', {}))
+        h = self.history
+        for k in ('total', 'det', 'text', 'kernel', 'dir', 'rec', 'ctc', 'script_consistency', 'script', 'verify',
+                  'family', 'crop_ctc'):
+            h['train_' + k].append(tr.get(k, float('nan')))
+            h['val_' + k].append(va.get(k, float('nan')))
+        for k in ('pix_precision', 'pix_recall', 'pix_f', 'rec_acc', 'rec_1ned', 'script_acc', 'verify_acc'):
+            h[k].append(va[k])
+        h['lr'].append(self.peak_lr * self.lr_factor(self.global_step))
+        h['grad_norm'].append(gn)
+        h['clip_frac'].append(clip_frac)
+        h['mined_per_batch'].append(mined)
+        s = self.criterion.log_vars().detach().cpu().numpy()
+        for i, k in enumerate(UnifiedSpotterLoss.TASKS):
+            h['w_' + k].append(float(np.exp(-s[i])))
+        ps = va.get('per_script', {})
+        for name in TRACKED_SCRIPTS:
+            h['rec_1ned_' + name.lower()].append(ps[name][0] if name in ps else float('nan'))
+            h['mix_beta_' + name.lower()].append(float(self.mixer_beta[cfg.script2id[name.lower()]]))
+
+        do_eval = (self.val_items or self.domain_val_items) and \
+            ((epoch + 1) % cfg.eval_every == 0 or epoch + 1 == self.total_epochs)
+        ev = self._with_loader_retry(self.evaluate_instances, 'evaluation') if do_eval else None
+        ev_m = ev.get('mlt') if ev else None
+        ev_i = ev.get('ic15') if ev else None
+        for k in self.EVAL_KEYS:
+            h[k].append(ev_m[k] if ev_m else float('nan'))
+        for k in ('det_hmean', 'e2e_hmean', 'spot_score'):
+            h['ic15_' + k].append(ev_i[k] if ev_i else float('nan'))
+        h['sel_score'].append(ev['sel_score'] if ev else float('nan'))
+        for name in TRACKED_SCRIPTS:
+            h['e2e_recall_' + name.lower()].append(ev_m.get('e2e_recall@' + name, float('nan')) if ev_m else float('nan'))
+
+        improved = False
+        if ev is not None:
+            score = ev['sel_score']
+            improved = score > self.best_score + cfg.early_stopping_min_delta
+        elif not (self.val_items or self.domain_val_items):
+            score = -va.get('total', 0.0)
+            improved = score > self.best_score + cfg.early_stopping_min_delta
+        if improved:
+            self.best_score, self.best_epoch = score, epoch + 1
+            self.evals_without_improvement = 0
+        elif ev is not None or not (self.val_items or self.domain_val_items):
+            self.evals_without_improvement += 1
+
+        self.save_checkpoint(epoch, is_best=improved, metrics=ev)
+        self.save_epoch_log(epoch)
+        self.plot_curves()
+        msg = (f"Epoch {epoch + 1}: train={tr.get('total', 0):.4f} val={va.get('total', 0):.4f} "
+               f"[det {va.get('det', 0):.3f} ctc {va.get('ctc', float('nan')):.3f} ver {va.get('verify', 0):.3f}] "
+               f"pixF={va['pix_f']:.3f} recAcc={va['rec_acc']:.3f} 1-NED={va['rec_1ned']:.3f} "
+               f"script={va['script_acc']:.3f} verify={va['verify_acc']:.3f} gn={gn:.2f} clip={clip_frac:.2f} "
+               f"mined/b={mined:.1f} strip_ctc={tr.get('strip_ctc', float('nan')):.3f} "
+               f"| {tr.get('_sec_per_step', float('nan')):.2f} s/step, {100 * tr.get('_data_share', 0):.0f}% data wait")
+        if ps:
+            msg += "\n          per-script 1-NED: " + ', '.join(
+                f"{k} {v[0]:.3f} (n={v[1]})" for k, v in sorted(ps.items(), key=lambda t: -t[1][1]))
+        if ev_m:
+            msg += (f"\n          VAL MLT : det P/R/H={ev_m['det_precision']:.3f}/{ev_m['det_recall']:.3f}/{ev_m['det_hmean']:.3f} "
+                    f"E2E P/R/H={ev_m['e2e_precision']:.3f}/{ev_m['e2e_recall']:.3f}/{ev_m['e2e_hmean']:.3f} "
+                    f"dets/img={ev_m['dets_per_image']:.1f}  E2E recall " +
+                    ' '.join(f"{n[:3]}={ev_m.get('e2e_recall@' + n, float('nan')):.2f}" for n in TRACKED_SCRIPTS))
+        if ev_i:
+            msg += (f"\n          VAL IC15: det H={ev_i['det_hmean']:.3f} E2E H={ev_i['e2e_hmean']:.3f} "
+                    f"spot={ev_i['spot_score']:.3f}")
+        if ev:
+            msg += f"\n          selection score {ev['sel_score']:.4f} (best {self.best_score:.4f} @ epoch {self.best_epoch})"
+        print(msg)
+        if self.evals_without_improvement >= cfg.early_stopping_patience:
+            print(f"[Trainer] Early stopping at epoch {epoch + 1} (best {self.best_score:.4f} @ epoch {self.best_epoch}).")
+            return True
+        return False
+
+    def _resume_interrupted_epoch(self):
+        """After a DataLoader worker crash (single process): continue the interrupted epoch where it stopped, with the
+        same draw of samples, instead of re-running it from the start."""
+        cur = self._cur
+        smp = getattr(self.train_loader, 'sampler', None)
+        if cur and isinstance(smp, ScriptAdaptiveMixtureSampler):
+            smp.epoch = smp.last_epoch
+            smp.skip = cur['step'] * self.samples_per_step
+            self._resume_step, self._resume_accum = cur['step'], cur['acc']
+
     def run(self):
+        """Trains the stage. Returns a status dict: finished (False = stopped by the session budget, resumable),
+        stop_reason, epoch / step reached."""
         cfg = self.config
         stopped_early, stopped_at = False, None
         epoch = self.start_epoch
         retries = 0
         if self.plan['mode'] == 'resume' and self.evals_without_improvement >= cfg.early_stopping_patience:
             # V4 resumed with exhausted patience and spent a full epoch before stopping.
-            print(f"[Trainer] patience already exhausted in stage '{cfg.stage_name}' (best {self.best_score:.4f} "
-                  f"@ epoch {self.best_epoch}); skipping training. Change `stage_name` to start a new stage.")
+            if self.is_main:
+                print(f"[Trainer] patience already exhausted in stage '{cfg.stage_name}' (best {self.best_score:.4f} "
+                      f"@ epoch {self.best_epoch}); skipping training. Change `stage_name` to start a new stage.")
             epoch = self.total_epochs
             stopped_early, stopped_at = True, self.start_epoch
-        while epoch < self.total_epochs:
-            if len(self.train_loader) == 0:
-                print("Skipping training loop; no data found.")
-                break
-            try:
-                tr, gn, mined, clip_frac = self.train_one_epoch(epoch)
-            except RuntimeError as e:
-                if not self._is_worker_crash(e) or retries >= 3:
-                    raise
-                retries += 1
-                print(f"[Trainer] DataLoader worker crashed (retry {retries}/3); rebuilding all loaders.")
-                self._rebuild_loaders()
-                continue
-            retries = 0
-            va = self._with_loader_retry(lambda: self.validate(epoch), 'validation')
-            self._update_mixers(va.get('per_script', {}))
-            h = self.history
-            for k in ('total', 'det', 'text', 'kernel', 'dir', 'rec', 'ctc', 'script_consistency', 'script', 'verify',
-                      'family', 'crop_ctc'):
-                h['train_' + k].append(tr.get(k, float('nan')))
-                h['val_' + k].append(va.get(k, float('nan')))
-            for k in ('pix_precision', 'pix_recall', 'pix_f', 'rec_acc', 'rec_1ned', 'script_acc', 'verify_acc'):
-                h[k].append(va[k])
-            h['lr'].append(self.peak_lr * self.lr_factor(self.global_step))
-            h['grad_norm'].append(gn)
-            h['clip_frac'].append(clip_frac)
-            h['mined_per_batch'].append(mined)
-            s = self.criterion.log_vars().detach().cpu().numpy()
-            for i, k in enumerate(UnifiedSpotterLoss.TASKS):
-                h['w_' + k].append(float(np.exp(-s[i])))
-            ps = va.get('per_script', {})
-            for name in TRACKED_SCRIPTS:
-                h['rec_1ned_' + name.lower()].append(ps[name][0] if name in ps else float('nan'))
-                h['mix_beta_' + name.lower()].append(float(self.mixer_beta[cfg.script2id[name.lower()]]))
-
-            do_eval = (self.val_items or self.domain_val_items) and \
-                ((epoch + 1) % cfg.eval_every == 0 or epoch + 1 == self.total_epochs)
-            ev = self._with_loader_retry(self.evaluate_instances, 'evaluation') if do_eval else None
-            ev_m = ev.get('mlt') if ev else None
-            ev_i = ev.get('ic15') if ev else None
-            for k in self.EVAL_KEYS:
-                h[k].append(ev_m[k] if ev_m else float('nan'))
-            for k in ('det_hmean', 'e2e_hmean', 'spot_score'):
-                h['ic15_' + k].append(ev_i[k] if ev_i else float('nan'))
-            h['sel_score'].append(ev['sel_score'] if ev else float('nan'))
-            for name in TRACKED_SCRIPTS:
-                h['e2e_recall_' + name.lower()].append(ev_m.get('e2e_recall@' + name, float('nan')) if ev_m else float('nan'))
-
-            improved = False
-            if ev is not None:
-                score = ev['sel_score']
-                improved = score > self.best_score + cfg.early_stopping_min_delta
-            elif not (self.val_items or self.domain_val_items):
-                score = -va.get('total', 0.0)
-                improved = score > self.best_score + cfg.early_stopping_min_delta
-            if improved:
-                self.best_score, self.best_epoch = score, epoch + 1
-                self.evals_without_improvement = 0
-            elif ev is not None or not (self.val_items or self.domain_val_items):
-                self.evals_without_improvement += 1
-
-            self.save_checkpoint(epoch, is_best=improved, metrics=ev)
-            self.save_epoch_log(epoch)
+            self.stop_reason = 'patience_exhausted'
+        try:
+            while epoch < self.total_epochs:
+                if len(self.train_loader) == 0 and self._resume_step == 0:
+                    print("Skipping training loop; no data found.")
+                    break
+                start_step, acc = self._resume_step, self._resume_accum
+                self._resume_step, self._resume_accum = 0, None
+                try:
+                    tr, gn, mined, clip_frac = self.train_one_epoch(epoch, start_step, acc)
+                except SessionTimeUp as e:
+                    self.stop_reason = 'time'
+                    if self.is_main:
+                        print(f"[Trainer] session budget ({cfg.max_session_hours} h) reached at {e}: checkpoint "
+                              f"written. Run again (attach this run's output) to continue from this exact step.")
+                    break
+                except RuntimeError as e:
+                    if self.world > 1 or not self._is_worker_crash(e) or retries >= 3:
+                        raise
+                    retries += 1
+                    print(f"[Trainer] DataLoader worker crashed (retry {retries}/3); rebuilding all loaders and "
+                          f"continuing epoch {epoch + 1} at step {self._cur['step'] if self._cur else 0}.")
+                    self._rebuild_loaders()
+                    self._resume_interrupted_epoch()
+                    continue
+                retries = 0
+                stop = time_up = False
+                if self.is_main:
+                    stop = self._end_of_epoch(epoch, tr, gn, mined, clip_frac)
+                    time_up = self._time_up()
+                if self.world > 1:                        # the other ranks wait here while rank 0 evaluates
+                    msg = self.dist.broadcast({'beta': self.mixer_beta.tolist(), 'stop': stop, 'time_up': time_up}
+                                              if self.is_main else None)
+                    if not self.is_main:
+                        self.mixer_beta = np.asarray(msg['beta'], dtype=np.float64)
+                        for m in self.mixers:
+                            m.set_script_multipliers(self.mixer_beta)
+                    stop, time_up = msg['stop'], msg['time_up']
+                if stop:
+                    stopped_early, stopped_at = True, epoch + 1
+                    self.stop_reason = 'early_stopping'
+                    break
+                epoch += 1
+                if time_up and epoch < self.total_epochs:
+                    self.stop_reason = 'time'
+                    if self.is_main:
+                        print(f"[Trainer] session budget of {cfg.max_session_hours} h reached after epoch {epoch}: "
+                              f"run again (attach this run's output) to continue with epoch {epoch + 1}.")
+                    break
+        finally:
+            self._writer.wait()                           # never leave with a checkpoint half-written
+        if self.is_main:
             self.plot_curves()
-            msg = (f"Epoch {epoch + 1}: train={tr.get('total', 0):.4f} val={va.get('total', 0):.4f} "
-                   f"[det {va.get('det', 0):.3f} ctc {va.get('ctc', float('nan')):.3f} ver {va.get('verify', 0):.3f}] "
-                   f"pixF={va['pix_f']:.3f} recAcc={va['rec_acc']:.3f} 1-NED={va['rec_1ned']:.3f} "
-                   f"script={va['script_acc']:.3f} verify={va['verify_acc']:.3f} gn={gn:.2f} clip={clip_frac:.2f} "
-                   f"mined/b={mined:.1f} strip_ctc={tr.get('strip_ctc', float('nan')):.3f}")
-            if ps:
-                msg += "\n          per-script 1-NED: " + ', '.join(
-                    f"{k} {v[0]:.3f} (n={v[1]})" for k, v in sorted(ps.items(), key=lambda t: -t[1][1]))
-            if ev_m:
-                msg += (f"\n          VAL MLT : det P/R/H={ev_m['det_precision']:.3f}/{ev_m['det_recall']:.3f}/{ev_m['det_hmean']:.3f} "
-                        f"E2E P/R/H={ev_m['e2e_precision']:.3f}/{ev_m['e2e_recall']:.3f}/{ev_m['e2e_hmean']:.3f} "
-                        f"dets/img={ev_m['dets_per_image']:.1f}  E2E recall " +
-                        ' '.join(f"{n[:3]}={ev_m.get('e2e_recall@' + n, float('nan')):.2f}" for n in TRACKED_SCRIPTS))
-            if ev_i:
-                msg += (f"\n          VAL IC15: det H={ev_i['det_hmean']:.3f} E2E H={ev_i['e2e_hmean']:.3f} "
-                        f"spot={ev_i['spot_score']:.3f}")
-            if ev:
-                msg += f"\n          selection score {ev['sel_score']:.4f} (best {self.best_score:.4f} @ epoch {self.best_epoch})"
-            print(msg)
-            if self.evals_without_improvement >= cfg.early_stopping_patience:
-                stopped_early, stopped_at = True, epoch + 1
-                print(f"[Trainer] Early stopping at epoch {epoch + 1} (best {self.best_score:.4f} @ epoch {self.best_epoch}).")
-                break
-            epoch += 1
-        self.plot_curves()
-        self.save_history_json()
-        self.save_training_report(stopped_early, stopped_at)
+            self.save_history_json()
+            if self.stop_reason != 'time':
+                self.save_training_report(stopped_early, stopped_at)
+        return {'finished': self.stop_reason != 'time', 'stop_reason': self.stop_reason or 'completed',
+                'epoch': epoch, 'global_step': self.global_step, 'stage': cfg.stage_name}
 
     # ------------------------------ checkpointing ------------------------------
     def _schedule(self):
@@ -6114,21 +6721,53 @@ class Trainer:
             os.replace(path, path.replace('.pth', '_prev.pth'))
         os.replace(tmp, path)
 
-    def save_checkpoint(self, epoch, is_best=False, metrics=None):
-        snap = self.config.snapshot()
-        stage = self.config.stage_name
+    def _latest_payload(self, epoch, step_in_epoch=0, acc=None):
+        """latest_model.pth content. step_in_epoch > 0: written inside epoch `epoch` after that many steps ('epoch'
+        then names the last COMPLETED epoch, as before); resuming replays the same mixture draw from the next
+        sample, with the learning-rate schedule, EMA, GradScaler and epoch statistics where they were."""
+        mid = step_in_epoch > 0
+        return {'epoch': epoch - 1 if mid else epoch, 'global_step': self.global_step,
+                'model_state': self.model.state_dict(), 'ema_state': self.ema.ema.state_dict(),
+                'ema_updates': self.ema.updates, 'criterion_state': self.criterion.state_dict(),
+                'optimizer_state': self.optimizer.state_dict(), 'scaler_state': self.scaler.state_dict(),
+                'history': self.history, 'config_snapshot': self.config.snapshot(), 'vocab_chars': self.config.chars,
+                'best_score': self.best_score, 'best_epoch': self.best_epoch,
+                'evals_without_improvement': self.evals_without_improvement, 'stage': self.config.stage_name,
+                'schedule': self._schedule(), 'mixer_beta': self.mixer_beta.tolist(),
+                'epoch_in_progress': epoch if mid else None, 'step_in_epoch': int(step_in_epoch),
+                'samples_per_step': self.samples_per_step, 'epoch_accum': acc if mid else None,
+                'sampler_states': [m.state_dict() for m in self.mixers], 'world_size': self.world,
+                'saved_at': time.strftime('%Y-%m-%d %H:%M:%S')}
+
+    def _save_latest(self, epoch, step_in_epoch, acc, wait=False):
+        """Mid-epoch checkpoint (rank 0): GPU -> CPU snapshot now, file written in the background (atomic rename;
+        the previous file is kept as latest_model_prev.pth)."""
+        if not self.is_main:
+            return
+        payload = _cpu_snapshot(self._latest_payload(epoch, step_in_epoch, acc))
+        path = os.path.join(self.config.chkp_dir, 'latest_model.pth')
+        self._writer.submit(lambda: self._atomic_save(payload, path, keep_prev=True))
+        if wait:
+            self._writer.wait()
+
+    def save_checkpoint(self, epoch, is_best=False, metrics=None, wait=False):
+        if not self.is_main:
+            return
+        jobs = []
         if is_best:                                   # best first: latest's best_score must describe a saved file
-            self._atomic_save({'model_state': self.ema.ema.state_dict(), 'config_snapshot': snap, 'stage': stage,
-                               'vocab_chars': self.config.chars, 'epoch': epoch, 'metrics': metrics},
-                              os.path.join(self.config.chkp_dir, 'best_model.pth'))
-        self._atomic_save({'epoch': epoch, 'global_step': self.global_step, 'model_state': self.model.state_dict(),
-                    'ema_state': self.ema.ema.state_dict(), 'ema_updates': self.ema.updates,
-                    'criterion_state': self.criterion.state_dict(), 'optimizer_state': self.optimizer.state_dict(),
-                    'scaler_state': self.scaler.state_dict(), 'history': self.history, 'config_snapshot': snap,
-                    'vocab_chars': self.config.chars, 'best_score': self.best_score, 'best_epoch': self.best_epoch,
-                    'evals_without_improvement': self.evals_without_improvement, 'stage': stage,
-                    'schedule': self._schedule(), 'mixer_beta': self.mixer_beta.tolist()},
-                          os.path.join(self.config.chkp_dir, 'latest_model.pth'), keep_prev=True)
+            jobs.append((_cpu_snapshot({'model_state': self.ema.ema.state_dict(), 'config_snapshot': self.config.snapshot(),
+                                        'stage': self.config.stage_name, 'vocab_chars': self.config.chars,
+                                        'epoch': epoch, 'metrics': metrics}),
+                         os.path.join(self.config.chkp_dir, 'best_model.pth'), False))
+        jobs.append((_cpu_snapshot(self._latest_payload(epoch)), os.path.join(self.config.chkp_dir, 'latest_model.pth'),
+                     True))
+
+        def job():
+            for obj, path, keep in jobs:
+                self._atomic_save(obj, path, keep_prev=keep)
+        self._writer.submit(job)
+        if wait:
+            self._writer.wait()
 
     @staticmethod
     def _filtered_load(module, state):
@@ -6166,18 +6805,24 @@ class Trainer:
         cfg = self.config
         mode = self.plan['mode']
         if mode == 'scratch':
-            self._backup_old_log()
+            if self.is_main:
+                self._backup_old_log()
             return
         if mode == 'warm':
             src = self.plan['path']
             ck = torch.load(src, map_location='cpu', weights_only=False)
-            self._archive_previous_stage(self.plan.get('old_stage', 'v4'))
+            if self.world > 1:
+                self.dist.barrier()                   # every rank has read the source before rank 0 moves files
+            if self.is_main:
+                self._archive_previous_stage(self.plan.get('old_stage', 'v4'))
             state = dict(ck.get('ema_state') or ck.get('model_state') or {})
             state = remap_vocab_state(state, self.plan.get('old_chars'), cfg.chars, cfg.char2script,
                                       self.plan.get('old_components'))
             dropped, fresh = self._filtered_load(self.model, state)
-            print(f"[stage] warm start: {dropped} incompatible tensors dropped, {fresh} not taken from the checkpoint "
-                  f"(compositional embeddings start at zero; P(script|char) re-estimated on the merged data).")
+            if self.is_main:
+                print(f"[stage] warm start: {dropped} incompatible tensors dropped, {fresh} not taken from the "
+                      f"checkpoint (compositional embeddings start at zero; P(script|char) re-estimated on the merged "
+                      f"data).")
             if 'criterion_state' in ck:
                 try:
                     self.criterion.load_state_dict(ck['criterion_state'], strict=False)
@@ -6185,7 +6830,8 @@ class Trainer:
                     pass
             del ck
             self.ema = ModelEMA(self.model, cfg.ema_decay)
-            self._backup_old_log()
+            if self.is_main:
+                self._backup_old_log()
             return
         ckpt = torch.load(self.plan['path'], map_location=self.device, weights_only=False)
         dropped, fresh = self._filtered_load(self.model, ckpt.get('model_state', {}))
@@ -6194,7 +6840,8 @@ class Trainer:
             self.ema.updates = ckpt.get('ema_updates', 0)
         else:
             self.ema = ModelEMA(self.model, cfg.ema_decay)
-        print(f"[checkpoint] resumed weights ({dropped} incompatible tensors dropped, {fresh} freshly initialised).")
+        if self.is_main:
+            print(f"[checkpoint] resumed weights ({dropped} incompatible tensors dropped, {fresh} freshly initialised).")
         try:
             self.criterion.load_state_dict(ckpt.get('criterion_state', {}), strict=False)
         except Exception:
@@ -6207,7 +6854,8 @@ class Trainer:
                 for g in self.optimizer.param_groups:
                     g.setdefault('base_lr', self.peak_lr)
             except Exception as e:
-                print(f"[checkpoint] optimizer state not restored ({e}).")
+                if self.is_main:
+                    print(f"[checkpoint] optimizer state not restored ({e}).")
         try:
             self.scaler.load_state_dict(ckpt.get('scaler_state', {}))
         except Exception:
@@ -6220,15 +6868,38 @@ class Trainer:
         self.best_score = ckpt.get('best_score', -1e9)
         self.best_epoch = ckpt.get('best_epoch', 0)
         self.evals_without_improvement = ckpt.get('evals_without_improvement', 0)
-        for k, m in enumerate(self.mixers):           # a resumed session must not replay session 1's draws
-            m.epoch = (self.start_epoch + 1) * 1000 + k
         if ckpt.get('mixer_beta') is not None and len(ckpt['mixer_beta']) == cfg.num_scripts:
             self.mixer_beta = np.asarray(ckpt['mixer_beta'], dtype=np.float64)
             for m in self.mixers:
                 m.set_script_multipliers(self.mixer_beta)
+        # NEW (V5.1): mid-epoch position. The samples already trained on are counted in samples, so a different
+        # number of GPUs / per-GPU batch in the next session still continues at the right place of the draw.
+        step_in = int(ckpt.get('step_in_epoch') or 0)
+        consumed = 0
+        if step_in > 0 and ckpt.get('epoch_in_progress') is not None:
+            self.start_epoch = int(ckpt['epoch_in_progress'])
+            sps = int(ckpt.get('samples_per_step') or self.samples_per_step)
+            consumed = step_in * sps
+            self._resume_step = min(consumed // max(self.samples_per_step, 1), self.steps_per_epoch)
+            acc = ckpt.get('epoch_accum')
+            self._resume_accum = copy.deepcopy(acc) if acc and sps == self.samples_per_step else None
+            if self._resume_accum:                    # timings describe this session only (speed projection)
+                self._resume_accum.update(t_data=0.0, t_step=0.0, steps_timed=0)
+        states = ckpt.get('sampler_states')
+        train_sampler = getattr(self.train_loader, 'sampler', None)
+        if states and len(states) == len(self.mixers):
+            for m, st in zip(self.mixers, states):
+                m.load_state_dict(st, mid_epoch_skip=consumed if (consumed and m is train_sampler) else None)
+        else:
+            for k, m in enumerate(self.mixers):       # older checkpoint: never replay session 1's draws
+                m.epoch = (self.start_epoch + 1) * 1000 + k
         del ckpt
-        print(f"Resumed stage '{cfg.stage_name}' at epoch {self.start_epoch}/{self.total_epochs} "
-              f"(step {self.global_step}, best {self.best_score:.4f} @ {self.best_epoch}).")
+        where = f"epoch {self.start_epoch + 1}, step {self._resume_step}/{self.steps_per_epoch}" if consumed else \
+            f"the start of epoch {self.start_epoch + 1}"
+        if self.is_main:
+            best = f"best {self.best_score:.4f} @ epoch {self.best_epoch}" if self.best_epoch else "no evaluation yet"
+            print(f"Resumed stage '{cfg.stage_name}' at {where} of {self.total_epochs} (optimizer step "
+                  f"{self.global_step}, {best}).")
 
     # ------------------------------ logging / plots / reports ------------------------------
     def save_epoch_log(self, epoch):
@@ -6390,17 +7061,69 @@ def load_model_for_inference(path, config=None, device='cpu'):
     return model.to(device).eval(), config
 
 
-def _make_loader(ds, batch_size, collate, sampler=None, shuffle=False, drop_last=False, workers=2):
+def _make_loader(ds, batch_size, collate, sampler=None, shuffle=False, drop_last=False, workers=2, persistent=True):
     kw = dict(num_workers=workers, pin_memory=torch.cuda.is_available(), worker_init_fn=worker_init_fn,
-              persistent_workers=workers > 0)
+              persistent_workers=persistent and workers > 0)
     return DataLoader(ds, batch_size=batch_size, sampler=sampler, shuffle=shuffle if sampler is None else False,
                       drop_last=drop_last, collate_fn=collate, **kw)
 
 
-def main(config=None):
-    config = config or Config()
-    seed_everything(config.seed)
+def _seed_caches_from_attached(cfg, max_depth=7):
+    """Copies index / perceptual-hash caches of an attached previous run (<output>/cache) into cfg.cache_dir, so a new
+    Kaggle session does not re-index (each cached index is still checked against its key and file fingerprint)."""
+    n = 0
+    for root in cfg.source_search_roots:
+        if not root or not str(root).startswith('/kaggle/input') or not os.path.isdir(root):
+            continue
+        rdepth = root.rstrip(os.sep).count(os.sep)
+        for dp, dn, fn in os.walk(root):
+            if dp.count(os.sep) - rdepth >= max_depth:
+                dn[:] = []
+            if os.path.basename(dp) != 'cache':
+                continue
+            dn[:] = []
+            for f in fn:
+                if (f.startswith('index_') and f.endswith('.pkl')) or (f.startswith('dhash_') and f.endswith('.npy')):
+                    dst = os.path.join(cfg.cache_dir, f)
+                    if not os.path.exists(dst):
+                        try:
+                            shutil.copy2(os.path.join(dp, f), dst)
+                            n += 1
+                        except OSError:
+                            pass
+    if n:
+        print(f"[cache] reused {n} index / hash cache files from an attached previous run.")
+
+
+def print_stage_banner(cfg, plan):
+    """Loud statement of what this run will do (V5.0's log only showed 'Epoch 1/250': a silent start from scratch)."""
+    cands = _checkpoint_candidates(cfg)
+    L = ['=' * 96]
+    if plan['mode'] == 'resume':
+        L.append(f"STAGE '{cfg.stage_name}': RESUMING from {plan['path']}")
+    elif plan['mode'] == 'warm':
+        L.append(f"STAGE '{cfg.stage_name}': WARM START from {plan['path']} (stage '{plan.get('old_stage')}') -> "
+                 f"{cfg.finetune_epochs} epochs, peak lr {cfg.finetune_lr:g}")
+    else:
+        L += [f"STAGE '{cfg.stage_name}': FROM SCRATCH -> {cfg.epochs} epochs, peak lr {cfg.lr:g}.",
+              f"  No usable checkpoint in init_checkpoint={cfg.init_checkpoint!r}, {cfg.chkp_dir}, /kaggle/working or "
+              f"under /kaggle/input.",
+              "  If you have the V4 run (or an earlier V5 session), attach its notebook output (Add Input -> Your Work ->",
+              "  the V4 notebook) or set Config.init_checkpoint = '/kaggle/input/.../best_model.pth', then run again:",
+              f"  a warm start needs {cfg.finetune_epochs} epochs instead of {cfg.epochs}."]
+    if cands:
+        L.append('  checkpoints seen: ' + ', '.join(cands[:8]) + (' ...' if len(cands) > 8 else ''))
+    L.append(f"  checkpoints of this run: {cfg.chkp_dir} (latest_model.pth every {cfg.save_every_steps} steps and "
+             f"at each epoch end; best_model.pth at each improvement)")
+    L.append('=' * 96)
+    print('\n'.join(L))
+
+
+def prepare_training(config):
+    """Everything before training, CPU only (no CUDA, so one training process per GPU can be forked afterwards):
+    base data, evaluation splits, merged training index, stage plan, vocabulary, datasets, model."""
     ensure_base_datasets(config)              # MLT-19 / IC15: configured -> attached -> downloaded
+    _seed_caches_from_attached(config)
 
     # ---------------- evaluation splits (MLT-val, IC15-val = test domain) ----------------
     mlt_items = build_items(config.train_img_dir, config.train_gt_dir)
@@ -6421,6 +7144,7 @@ def main(config=None):
 
     # ---------------- stage plan + vocabulary ----------------
     plan = plan_stage(config)
+    print_stage_banner(config, plan)
     if plan['mode'] == 'resume':
         apply_config_snapshot(config, plan['snapshot'])
         print(f"Resuming stage '{config.stage_name}': {len(config.chars)}-symbol vocabulary from checkpoint.")
@@ -6441,44 +7165,22 @@ def main(config=None):
     print(f"Vocabulary size: {config.vocab_size} ({len(config.chars)} symbols + blank + unk); by script: " +
           ', '.join(f"{config.CANONICAL_SCRIPTS[k]}={v}" for k, v in by_script.most_common()))
 
-    # ---------------- datasets / loaders ----------------
-    collate_fn = make_collate_fn(config)
+    # ---------------- datasets ----------------
     train_dataset = MergedSceneTextDataset(index, config, is_train=True)
     base_w, share = compute_mixture_weights(index, config)
     index.summary(config, share)
-    mass = index.script_mass(config.num_scripts)
-    sampler = ScriptAdaptiveMixtureSampler(base_w, mass, config.samples_per_epoch, seed=config.seed)
-    val_dataset = ICDAR2019Dataset(val_items if val_items else train_items[:max(1, len(train_items) // 10)],
-                                   config, is_train=False)
-    nw = config.num_workers
-
-    def build_train_loader():
-        return _make_loader(train_dataset, config.batch_size, collate_fn, sampler=sampler, drop_last=True, workers=nw)
-
-    def build_val_loader():
-        return _make_loader(val_dataset, config.batch_size, collate_fn, workers=nw)
-
-    train_loader = build_train_loader()
-    val_loader = build_val_loader()
-
-    streams, mixers = [], [sampler]
+    ctx = {'config': config, 'index': index, 'plan': plan, 'val_items': val_items, 'ic15_val': ic15_val,
+           'train_dataset': train_dataset, 'base_w': base_w, 'mass': index.script_mass(config.num_scripts),
+           'val_dataset': ICDAR2019Dataset(val_items if val_items else train_items[:max(1, len(train_items) // 10)],
+                                           config, is_train=False),
+           'strip_dataset': None, 'crop_dataset': None}
     if config.use_scene_strips and config.w_strip_rec > 0:
-        strip_ds = SceneWordStripDataset(train_dataset, config, config.strips_per_image)
-        strip_sampler = ScriptAdaptiveMixtureSampler(base_w, mass, config.samples_per_epoch, seed=config.seed + 11)
-        def build_strip_loader():
-            return _make_loader(strip_ds, config.strip_batch_images, _CropCollate(config.crop_batch_size),
-                                sampler=strip_sampler, drop_last=True, workers=config.strip_num_workers)
-        streams.append((build_strip_loader(), config.w_strip_rec, 'strip', build_strip_loader))
-        mixers.append(strip_sampler)
-        print(f"Scene-word strip stream: {config.strip_batch_images} images x <= {config.strips_per_image} strips per step.")
+        ctx['strip_dataset'] = SceneWordStripDataset(train_dataset, config, config.strips_per_image)
     if config.crop_rec_sources:
         crop_ds = CropRecognitionDataset(config.crop_rec_sources, config, config.crop_max_samples)
         if len(crop_ds) > 0:
-            print(f"Word-crop recognition stream: {len(crop_ds)} samples, batch {config.crop_batch_size}.")
-            def build_crop_loader():
-                return _make_loader(crop_ds, config.crop_batch_size, _CropCollate(), shuffle=True, drop_last=True,
-                                    workers=config.strip_num_workers)
-            streams.append((build_crop_loader(), config.w_crop_rec, 'crop', build_crop_loader))
+            ctx['crop_dataset'] = crop_ds
+            print(f"Word-crop recognition stream: {len(crop_ds)} samples.")
 
     seed_cuda(config.seed)
     model = A3ESpotter_V5(config)
@@ -6486,14 +7188,129 @@ def main(config=None):
     print(f"A3ESpotter V5: {n_params:.1f}M parameters | backbone={config.backbone} "
           f"(ImageNet init: {model.backbone.pretrained_loaded}) | compositional components: "
           f"{len(model.recognizer.classifier.component_names)}")
+    ctx['model'] = model
+    return ctx
 
-    trainer = Trainer(model, train_loader, val_loader, config, train_loader_factory=build_train_loader,
-                      val_items=val_items, domain_val_items=ic15_val, crop_loaders=streams, mixers=mixers, plan=plan,
-                      val_loader_factory=build_val_loader)
-    trainer.run()
 
-    model = trainer.ema.ema
+def train_worker(ctx, dist=None):
+    """Builds this process's loaders and trains. dist=None: single process; else one rank of the data-parallel
+    group (each rank gets batch_size / world scene images, strips and RoIs per step, so the GLOBAL batch, learning
+    rate schedule and steps per epoch are those of the single-GPU configuration)."""
+    config = ctx['config']
+    rank, world = (dist.rank, dist.world) if dist is not None else (0, 1)
+    is_main = rank == 0
+    if dist is not None:
+        seed_everything(config.seed + 1000 * rank)     # different augmentation streams per rank (model already built)
+        config.max_rec_rois_per_batch = max(16, int(config.max_rec_rois_per_batch) // world)
+    bsz = max(1, int(config.batch_size) // world)
+    cpus = available_cpus()
+    if world > 1:
+        nw, sw = max(2, cpus // world), 1
+    else:
+        nw, sw = config.num_workers, config.strip_num_workers
+    if is_main and world > 1:
+        print(f"[compute] rank layout: {world} processes x {bsz} images (global batch {bsz * world}), "
+              f"{nw} loader workers + {sw} strip worker per process on {cpus} CPU cores.")
+    collate_fn = make_collate_fn(config)
+    sampler = ScriptAdaptiveMixtureSampler(ctx['base_w'], ctx['mass'], config.samples_per_epoch, seed=config.seed,
+                                           rank=rank, world=world)
+
+    def build_train_loader():
+        return _make_loader(ctx['train_dataset'], bsz, collate_fn, sampler=sampler, drop_last=True, workers=nw)
+
+    def build_val_loader():                           # rank 0 only; workers live only while validating
+        return _make_loader(ctx['val_dataset'], config.batch_size, collate_fn, workers=nw, persistent=False)
+
+    streams, mixers = [], [sampler]
+    if ctx.get('strip_dataset') is not None:
+        strip_sampler = ScriptAdaptiveMixtureSampler(ctx['base_w'], ctx['mass'], config.samples_per_epoch,
+                                                     seed=config.seed + 11, rank=rank, world=world)
+        strip_imgs = max(1, int(math.ceil(config.strip_batch_images / world)))
+        strip_cap = max(8, config.crop_batch_size // world)
+
+        def build_strip_loader():
+            return _make_loader(ctx['strip_dataset'], strip_imgs, _CropCollate(strip_cap), sampler=strip_sampler,
+                                drop_last=True, workers=sw)
+        streams.append((build_strip_loader(), config.w_strip_rec, 'strip', build_strip_loader))
+        mixers.append(strip_sampler)
+        if is_main:
+            print(f"Scene-word strip stream: {strip_imgs} images x <= {config.strips_per_image} strips per step"
+                  f"{' per process' if world > 1 else ''}.")
+    if ctx.get('crop_dataset') is not None:
+        crop_bs = max(8, config.crop_batch_size // world)
+
+        def build_crop_loader():
+            return _make_loader(ctx['crop_dataset'], crop_bs, _CropCollate(), shuffle=True, drop_last=True, workers=sw)
+        streams.append((build_crop_loader(), config.w_crop_rec, 'crop', build_crop_loader))
+
+    trainer = Trainer(ctx['model'], build_train_loader(), build_val_loader() if is_main else None, config,
+                      train_loader_factory=build_train_loader, val_items=ctx['val_items'] if is_main else None,
+                      domain_val_items=ctx['ic15_val'] if is_main else None, crop_loaders=streams, mixers=mixers,
+                      plan=ctx['plan'], val_loader_factory=build_val_loader if is_main else None, dist=dist)
+    status = trainer.run()
+    if is_main:
+        try:
+            with open(os.path.join(config.logs_dir, 'train_status.json'), 'w') as f:
+                json.dump(status, f)
+        except Exception as e:
+            print(f"[Trainer] could not write the status file: {e}")
+    return status
+
+
+def _recoverable_failure(e):
+    m = f"{type(e).__name__}: {e}"
+    return any(t in m for t in ('DataLoader worker', 'ProcessExitedException', 'NCCL', 'Watchdog', 'timed out',
+                                'Connection reset', 'Broken pipe'))
+
+
+def train_data_parallel(ctx, world, max_restarts=2):
+    """One forked training process per GPU. A crashed process (DataLoader worker killed, NCCL error...) takes the
+    group down; the group is restarted from the last step checkpoint (<= save_every_steps steps are lost)."""
+    cfg = ctx['config']
+    status_path = os.path.join(cfg.logs_dir, 'train_status.json')
+    for attempt in range(max_restarts + 1):
+        if os.path.exists(status_path):
+            os.remove(status_path)
+        print(f"[compute] starting {world} training processes ({cfg.ddp_backend}); progress is shown by rank 0.")
+        try:
+            launch_data_parallel(lambda d: train_worker(ctx, d), world, cfg.ddp_backend, cfg.ddp_timeout_minutes)
+            break
+        except Exception as e:
+            if 'CUDA_FORK_FAILURE' in str(e):
+                print("[compute] the GPUs cannot be used from forked processes because CUDA was already initialised in "
+                      "this Python process (e.g. by an earlier notebook cell). Falling back to ONE GPU; restart the "
+                      "kernel and run this cell first to train on all GPUs.")
+                ctx['plan'] = plan_stage(cfg)
+                return train_worker(ctx)
+            if attempt == max_restarts or not _recoverable_failure(e):
+                raise
+            latest = os.path.join(cfg.chkp_dir, 'latest_model.pth')
+            src = latest if os.path.exists(latest) else 'the start of the stage (no checkpoint yet)'
+            print(f"[compute] a training process failed ({type(e).__name__}: {str(e).strip().splitlines()[-1][:300]}); "
+                  f"restarting all of them from {src} (restart {attempt + 1}/{max_restarts}).")
+            ctx['plan'] = plan_stage(cfg)
+    try:
+        with open(status_path) as f:
+            return json.load(f)
+    except Exception:
+        return {'finished': True, 'stop_reason': 'unknown'}
+
+
+def finalize(ctx, status):
+    """Calibration of the operating point on the held-out IC15 split + test-set inference with the best weights."""
+    config = ctx['config']
+    if not status.get('finished', True):
+        print("=" * 96)
+        print(f"Training of stage '{config.stage_name}' is NOT finished (session budget): {config.chkp_dir}/"
+              f"latest_model.pth holds the exact position (epoch {status.get('epoch', 0) + 1}, optimizer step "
+              f"{status.get('global_step')}).\nNext session: attach this run's output (Kaggle: Save Version, then Add "
+              f"Input -> this notebook's output) and run the same cell; calibration and test inference run when the "
+              f"stage completes.")
+        print("=" * 96)
+        return None
+    model = ctx['model']
     best_path = os.path.join(config.chkp_dir, 'best_model.pth')
+    latest_path = os.path.join(config.chkp_dir, 'latest_model.pth')
     used_best = False
     if config.use_best_checkpoint_for_inference and os.path.exists(best_path):
         best = torch.load(best_path, map_location='cpu', weights_only=False)
@@ -6504,8 +7321,15 @@ def main(config=None):
         else:
             print("[inference] best_model.pth belongs to another stage; using the final EMA weights.")
         del best
+    if not used_best and os.path.exists(latest_path):
+        ck = torch.load(latest_path, map_location='cpu', weights_only=False)
+        if _ckpt_stage(ck) == config.stage_name and ck.get('ema_state'):
+            Trainer._filtered_load(model, ck['ema_state'])
+            print("[inference] using the final EMA weights of latest_model.pth.")
+        del ck
+    model.eval()
     if config.calibrate_operating_point:
-        calib_items = ic15_val if ic15_val else val_items
+        calib_items = ctx['ic15_val'] if ctx['ic15_val'] else ctx['val_items']
         calibrate_operating_point(model, config, calib_items)
         # store the calibrated operating point WITH the weights it was calibrated for
         try:
@@ -6521,6 +7345,19 @@ def main(config=None):
             print(f"[calibration] could not store the operating point in the checkpoint: {e}")
     inferencer = TiledInferencer(model, config) if config.use_tiling else Inferencer(model, config)
     return inferencer.run()
+
+
+def main(config=None):
+    """Kaggle / notebook: run this cell (fresh kernel). With several GPUs (e.g. 'GPU T4 x2') one training process per
+    GPU is forked automatically; the run saves latest_model.pth every Config.save_every_steps steps and stops cleanly
+    before the Kaggle session limit, and the next run (with this run's output attached) continues at the same step."""
+    config = config or Config()
+    gpus, _ = describe_compute(config)
+    world = plan_world_size(config, gpus)
+    seed_everything(config.seed)
+    ctx = prepare_training(config)
+    status = train_data_parallel(ctx, world) if world > 1 else train_worker(ctx)
+    return finalize(ctx, status)
 
 
 if __name__ == "__main__":
