@@ -382,6 +382,10 @@ passes on the interpreter, the VM and under python3.
   the interpreter, the VM and python3 (89: 62/62/61, 90: 65/65/63);
   `ide_e2e` 373/373; `ide_lint`, `ny_classcheck`, `cbp.py check` clean;
   `ide_memprobe --check` 0 KB kept per frame/event/key.
+- Windows 64-bit (MinGW from `nython.cbp`, under Wine): built,
+  `pe_unwind_check` clean, the sweep 407 runs, 0 not ok.
+- AArch64 (qemu-user): vm_audit53, 56, 64, 67, 86, 88, 89 and 90 pass on
+  both engines.
 - The merge conflicted in the VM's `len` (part 1's native range/view
   lengths beside part 3's checked `__len__`: both kept) and in the parser's
   async desugar (part 2's coroutine-object reference beside part 3's
