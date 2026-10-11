@@ -815,7 +815,7 @@ if nython:
     import atexit
     check("atexit API", [atexit.register(fin, "x") is fin, atexit._ncallbacks() >= 1], [True, True])
     atexit.unregister(fin)
-    check("frames: f_locals is empty, f_globals has the module", [sys._getframe().f_locals, sys._getframe().f_globals["__name__"]], [{}, "__main__"])
+    check("frames: the module's f_locals are its globals (round 78)", ["pass_n" in sys._getframe().f_locals, sys._getframe().f_globals["__name__"]], [True, "__main__"])
 
 for res in results:
     if res[1]:

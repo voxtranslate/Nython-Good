@@ -584,6 +584,7 @@ public:   // NythonExecutor is a struct: members default to public
             "pow","divmod","input","dict","display","show","is_int","is_float","is_string","is_list","is_none","is_bool","to_int","to_float","to_str","clamp","lerp","map_range","repeat_str","repeat","flatten","flat","shell","system","ls","cat","pwd","mkdir","write","exists","env","all","any","complex","slice","super","property",
             "staticmethod","classmethod","callable","dir","vars","globals","locals","eval","exec","compile","_ny_setattr_raw","_ny_delattr_raw","_ny_object_new","_ny_method_new","_ny_subclasses","_ny_type_new","_ny_type_call",
             "_ny_main_globals","_ny_exc_current","_ny_stack",
+            "_ny_frame_get","_ny_frame_sync","_ny_frame_back","_ny_frame_globals","_ny_builtins_dict",   // frame objects (round 78)
             "_ny_fn_info","_ny_fn_globals","_ny_keywords",   // inspect, f.__code__, keyword (round 77)
             "_ny_unicode_lookup","_ny_unicode_name",          // unicodedata (round 77)
             "_ny_payload","_ny_payload_new","_ny_getattr_raw","_ny_setfield","_ny_delfield",   // builtin subclasses, __getattribute__, __dict__ (round 77)
@@ -7110,6 +7111,7 @@ public:
         // Generators dropped while suspended are closed here, between
         // statements, not inside the destructor that dropped them.
         if (__builtin_expect(nygen::t_pending, 0)) nygen::run_pending(*this);
+        if (__builtin_expect(tb_frames_held(), 0)) tbDropFrames();   // round 78
         last_stmt() = st;
         cur_stmt() = st.get();   // round 77: frames
         if (trace_on()) traceStatement(st, ctx);
@@ -9513,7 +9515,10 @@ public:
     // caller's current line while it runs - and `ctx` its scope (whose
     // __name__ is the frame's module). The main program's top level is the
     // frame below them all; its line is the first frame's call_site.
-    struct PyFrame { Node* code; Node* call_site; Context* ctx; };
+    // `fobj` (round 78): the frame's Python frame object, once a program has
+    // asked for one (frameObject below) - a counted reference; null for
+    // every call nobody asks about.
+    struct PyFrame { Node* code; Node* call_site; Context* ctx; nyheap::Inst* fobj = nullptr; };
     using PyFrames = std::vector<PyFrame>;
     static PyFrames& py_frames() { static thread_local PyFrames v; return v; }
     // The running frame's current statement: last_stmt() as a plain pointer,
@@ -9522,7 +9527,10 @@ public:
     static Node*& cur_stmt() { static thread_local Node* p = nullptr; return p; }
     struct FrameGuard {
         FrameGuard(Node* code, Context* ctx) { py_frames().push_back({code, cur_stmt(), ctx}); }
-        ~FrameGuard() { cur_stmt() = py_frames().back().call_site; py_frames().pop_back(); }
+        ~FrameGuard() {
+            if (py_frames().back().fobj) frameEnded();   // round 78
+            cur_stmt() = py_frames().back().call_site; py_frames().pop_back();
+        }
     };
     // An exception on its way out: the frames it has left so far, innermost
     // first, recorded as it unwinds through each frame (tbUnwind) and made
@@ -9532,7 +9540,7 @@ public:
     // `last` (the statement then) and `depth` (the frames then) tell it from
     // a record of an exception native code caught and dropped (hasattr, a
     // loop's StopIteration), which a new exception must not continue.
-    struct TbRec { std::string file; int64_t line; std::string name; std::string mod; };
+    struct TbRec { std::string file; int64_t line; std::string name; std::string mod; Value frame; };   // frame: round 78
     struct TbPending {
         std::string flow;
         std::vector<TbRec> recs;
@@ -9562,12 +9570,26 @@ public:
     static Node* frameLine(const PyFrame& f, Node* cur) {
         return f.code && f.code->type() == NodeType::LAMBDA ? f.code : cur;
     }
-    void tbRecord(TbPending& P, Node* where, const PyFrame& fr) {
+    // `idx`: the frame's place in py_frames() (kNoFrame: the main
+    // program's top level), whose frame object the entry gets (round 78).
+    void tbRecord(TbPending& P, Node* where, const PyFrame& fr, size_t idx) {
         if (!where) return;
         auto tk = where->token();
         std::string file = tk.fileName();
         if (tbHiddenFile(file)) return;
-        P.recs.push_back({std::move(file), (int64_t)tk.line(), frameName(fr.code), frameModule(fr.ctx)});
+        P.recs.push_back({std::move(file), (int64_t)tk.line(), frameName(fr.code), frameModule(fr.ctx), frameObject(idx, where, false)});
+        tb_frames_held() = true;
+    }
+    // The frame objects a record holds keep their frames' locals alive; an
+    // exception native code caught and dropped (a generator's close,
+    // hasattr, a loop's StopIteration) leaves its record behind, so they go
+    // at the next statement (noteStatement - no exception propagates across
+    // a statement boundary: finally bodies and handlers save or take the
+    // record first) and when close() swallows GeneratorExit (round 78).
+    static bool& tb_frames_held() { static thread_local bool b = false; return b; }
+    static void tbDropFrames() {
+        tb_frames_held() = false;
+        for (auto& r : tb_pending().recs) r.frame = Value();
     }
     bool tbContinues(const TbPending& P, const std::string& flow) {
         return P.active && P.depth == py_frames().size() && P.last == cur_stmt() && P.flow == flow;
@@ -9587,7 +9609,7 @@ public:
             P.flow = flow; P.recs.clear(); P.active = true; P.reraise = false;
         }
         const PyFrame& top = F.back();
-        if (!skip) tbRecord(P, frameLine(top, where), top);
+        if (!skip) tbRecord(P, frameLine(top, where), top, F.size() - 1);
         P.depth = F.size() - 1;
         P.line = P.last = top.call_site;   // the caller's line; cur_stmt() once this frame is gone
     }
@@ -9629,6 +9651,7 @@ public:
         p->defineByName("tb_next", next);
         p->defineByName("tb_lineno", intValue(r.line));
         p->defineByName("_ny_loc", makeStringValue(r.file + '\x1f' + r.name + '\x1f' + r.mod));
+        if (isInstanceVal(r.frame)) p->defineByName("_ny_frame", r.frame);   // round 78: the frame itself
         return tb;
     }
     // e.__context__ = c, as Python sets it when e is raised while c is
@@ -9672,7 +9695,7 @@ public:
         if (!skip) {
             PyFrame here{nullptr, nullptr, global_ctx};
             if (!F.empty()) here = F.back();
-            tbRecord(P, frameLine(here, where), here);
+            tbRecord(P, frameLine(here, where), here, F.empty() ? kNoFrame : F.size() - 1);
         }
         P.active = false; P.reraise = false; P.line = nullptr;
         std::vector<TbRec> recs;
@@ -9709,6 +9732,7 @@ public:
         f();
         tb_pending() = std::move(saved);
         tb_pending().last = cur_stmt();
+        for (auto& r : tb_pending().recs) if (r.frame.value.o) { tb_frames_held() = true; break; }   // round 78
     }
     // The uncaught exception `flow` at the top of the program: its object
     // with the whole traceback (main.cpp reports it), or none.
@@ -9769,6 +9793,194 @@ public:
         }
         add(cur, PyFrame{nullptr, nullptr, global_ctx});
         return makeListValue(out);
+    }
+
+    // ── Frame objects (round 78) ────────────────────────────────────────
+    // A Python frame object - a prelude _NyFrame whose fields are set here,
+    // no __init__ run - is made for a running frame only when a program
+    // asks for one: sys._getframe() / inspect.currentframe()
+    // (_ny_frame_get), a traceback entry (tbRecord), a generator's gi_frame
+    // (NyGen.cpp). The frame's record keeps it (PyFrame::fobj), so the same
+    // object comes back each time. While the call runs, f_lineno and
+    // f_locals are read from the record (_ny_frame_sync: the locals as
+    // locals() gives them, a new dict each read) and f_back is the caller's
+    // frame (_ny_frame_back). When the call ends (frameEnded), a frame
+    // object referenced elsewhere keeps its last line and locals and its
+    // caller's frame object; one nobody else holds just goes. A call nobody
+    // asks about pays one pointer test when it ends. The VM's are the same
+    // (VirtualMachine::frame_object).
+    static constexpr size_t kNoFrame = (size_t)-1;   // the main program's top level
+    Node* frame_class_ = nullptr;
+    nyheap::Inst* main_fobj_ = nullptr;              // its frame object (counted)
+    // The statement frame `idx` is at: the running one for the innermost,
+    // else the call it is making (the next frame's call site).
+    Node* frameWhere(size_t idx) {
+        auto& F = py_frames();
+        if (idx == kNoFrame) return F.empty() ? cur_stmt() : F[0].call_site;
+        return frameLine(F[idx], idx + 1 < F.size() ? F[idx + 1].call_site : cur_stmt());
+    }
+    // The prelude's frames are not shown (as in _ny_stack)
+    bool frameVisible(size_t idx) {
+        Node* w = frameWhere(idx);
+        return w && !tbHiddenFile(w->token().fileName());
+    }
+    nyheap::Inst*& frameSlot(size_t idx) { return idx == kNoFrame ? main_fobj_ : py_frames()[idx].fobj; }
+    Context* frameCtx(size_t idx) { return idx == kNoFrame ? global_ctx : py_frames()[idx].ctx; }
+    static Value instValue(nyheap::Inst* o) { return nyheap::userValue(o, (void*)&o->tag); }
+    // The frame's code as _ny_fn_info gives a function's (the prelude's
+    // _NyFuncCode reads it); a module's top level is "<module>".
+    struct FrameInfoMemo { std::string name; int64_t line; Value info; };
+    std::unordered_map<Node*, FrameInfoMemo> frame_info_memo_;   // per function node (a node freed and reused is told apart by name and line)
+    Value frameInfo(Node* code, Context* ctx, Node* where) {
+        if (code) {
+            auto* fnode = dynamic_cast<FunctionNode*>(code);
+            std::string nm = fnode ? fnode->name : std::string("<lambda>");
+            int64_t ln = (int64_t)code->token().line();
+            auto it = frame_info_memo_.find(code);
+            if (it != frame_info_memo_.end() && it->second.name == nm && it->second.line == ln
+                && (!fnode || fn_qualname_.empty())) return it->second.info;
+            Value info = fnInfoOf(code, nullptr, ctx);
+            if (info.type != ValueType::NONE) {
+                frame_info_memo_[code] = FrameInfoMemo{nm, ln, info};
+                return info;
+            }
+        }
+        std::string file = where ? where->token().fileName() : std::string("<unknown>");
+        return makeListValue({makeStringValue("<module>"), makeStringValue("<module>"), makeStringValue(frameModule(ctx)),
+                              makeListValue({}), intValue((int64_t)0), makeStringValue(file), intValue((int64_t)1)});
+    }
+    // A frame object's line and locals, as of now (`line` when there is no
+    // statement: a generator that has not started is at its def line).
+    void frameStore(nyheap::Inst* o, Node* where, Context* ctx, int64_t line = 0, bool with_locals = true) {
+        Context* p = o ? o->props : nullptr;
+        if (!p) return;
+        if (where) line = (int64_t)where->token().line();
+        p->defineByName("_ny_line", intValue(line));
+        p->defineByName("_ny_lasti", intValue(line * 2));   // no instruction offsets here: approximate
+        if (with_locals) p->defineByName("_ny_locals", ctx ? reflectLocals(ctx) : reflectGlobals(nullptr));
+    }
+    // A new frame object for code running in ctx (nobody keeps it yet).
+    Value newFrameObject(Node* code, Context* ctx, Node* where, int64_t line = 0, bool with_locals = true) {
+        if (!frame_class_) frame_class_ = classNodeByName("_NyFrame");
+        if (!frame_class_) return NONE_VALUE;
+        Value fo = newInstance("_NyFrame", (void*)frame_class_);
+        auto* o = static_cast<nyheap::Inst*>(fo.value.o);
+        if (!o || !o->props) return NONE_VALUE;
+        o->props->defineByName("_ny_info", frameInfo(code, ctx, where));
+        frameStore(o, where, ctx, line, with_locals);
+        return fo;
+    }
+    // The frame object of frame `idx` (made now if it has none). Its locals
+    // are copied when they are read (the frame runs) or when the frame ends,
+    // not now - a traceback's frames cost no copy until then.
+    Value frameObject(size_t idx, Node* where, bool with_locals = false) {
+        if (nyheap::Inst* o = frameSlot(idx)) return instValue(o);
+        Value fo = newFrameObject(idx == kNoFrame ? nullptr : py_frames()[idx].code, frameCtx(idx), where, 0, with_locals);
+        if (!isInstanceVal(fo)) return NONE_VALUE;
+        auto* o = static_cast<nyheap::Inst*>(fo.value.o);
+        nygc::incref(o);
+        frameSlot(idx) = o;
+        return fo;
+    }
+    // Where frame object `fo` runs on this thread (its record), if it does.
+    bool frameFind(const Value& fo, size_t& idx) {
+        if (!isInstanceVal(fo) || !fo.value.o) return false;
+        const Collectable* o = fo.value.o;
+        if (main_fobj_ && (const Collectable*)main_fobj_ == o) { idx = kNoFrame; return true; }
+        auto& F = py_frames();
+        for (size_t i = F.size(); i-- > 0;)
+            if (F[i].fobj && (const Collectable*)F[i].fobj == o) { idx = i; return true; }
+        return false;
+    }
+    // The visible frame that called frame `idx`.
+    bool frameCaller(size_t idx, size_t& out) {
+        if (idx == kNoFrame) return false;
+        for (size_t j = idx; j-- > 0;) if (frameVisible(j)) { out = j; return true; }
+        if (frameVisible(kNoFrame)) { out = kNoFrame; return true; }
+        return false;
+    }
+    // _ny_frame_get(depth): sys._getframe(depth) - 0 is the innermost
+    // visible frame (the caller of the prelude's sys._getframe).
+    Value frameGet(std::vector<Value>& args) {
+        int64_t depth = 0;
+        if (!args.empty() && args[0].type == ValueType::INTEGER) depth = bigint_to_i64(args[0].value.i);
+        else if (!args.empty() && args[0].type == ValueType::BOOLEAN) depth = args[0].value.b ? 1 : 0;
+        if (depth < 0) depth = 0;
+        auto& F = py_frames();
+        int64_t seen = 0;
+        for (size_t i = F.size(); i-- > 0;) {
+            if (!frameVisible(i)) continue;
+            if (seen++ == depth) return frameObject(i, frameWhere(i));
+        }
+        if (seen == depth && frameVisible(kNoFrame)) return frameObject(kNoFrame, frameWhere(kNoFrame));
+        pyRaise("ValueError", "call stack is not deep enough");
+        return NONE_VALUE;
+    }
+    // _ny_frame_sync(f): whether f's call is running on this thread; if so
+    // its f_lineno / f_locals are refreshed from it.
+    Value frameSync(const Value& fo) {
+        size_t idx;
+        if (!frameFind(fo, idx)) return Value(false);
+        frameStore(frameSlot(idx), frameWhere(idx), frameCtx(idx));
+        return Value(true);
+    }
+    // _ny_frame_back(f): f.f_back - the caller's frame while f runs, the
+    // one it had when it ended afterwards.
+    Value frameBack(const Value& fo) {
+        size_t idx, c;
+        if (frameFind(fo, idx)) return frameCaller(idx, c) ? frameObject(c, frameWhere(c)) : NONE_VALUE;
+        Context* p = instanceProps(fo);
+        Value b = p ? p->getByName("_ny_back") : NONE_VALUE;
+        return isInstanceVal(b) ? b : NONE_VALUE;
+    }
+    // _ny_frame_globals(f): f.f_globals, its module's names (a copy, as
+    // globals() is here).
+    Value frameGlobals(std::vector<Value>& args) {
+        size_t idx;
+        if (!args.empty() && frameFind(args[0], idx)) return reflectGlobals(frameCtx(idx));
+        std::string mod = "__main__";
+        if (Context* p = args.empty() ? nullptr : instanceProps(args[0])) {
+            std::vector<Value> info = listItems(p->getByName("_ny_info"));
+            if (info.size() > 2 && isStringValue(info[2])) mod = getStringValue(info[2]);
+        }
+        if (mod != "__main__")
+            for (Context* m : module_ctxs_) {
+                Value n = m ? m->getByName("__name__") : NONE_VALUE;
+                if (isStringValue(n) && getStringValue(n) == mod) return reflectGlobals(m);
+            }
+        return reflectGlobals(nullptr);
+    }
+    // _ny_builtins_dict(): f.f_builtins - the builtins every program starts
+    // with (the prelude's private names left out).
+    Value builtinsDict() {
+        auto* d = new Object((Runnable*)runner, "map", Type::MAP);
+        Value dv((Collectable*)d);
+        std::vector<std::string> names(base_global_names_.begin(), base_global_names_.end());
+        std::sort(names.begin(), names.end());
+        for (auto& n : names) {
+            if (n.rfind("_ny", 0) == 0 || n.rfind("_Ny", 0) == 0 || reflectHidden(n)) continue;
+            Value v = global_ctx->getByName(n);
+            if (v.type != ValueType::UNDEFINED) (*d->container)[nypy::key_of_str(n)] = v;
+        }
+        return dv;
+    }
+    // The innermost record is ending and has a frame object (FrameGuard).
+    static void frameEnded() {
+        auto& F = py_frames();
+        nyheap::Inst* o = F.back().fobj;
+        NythonExecutor* E = o->E;
+        if (o->gc_rc > 1 && E && nyheap::executor_alive(E)) {
+            try {
+                size_t idx = F.size() - 1, c;
+                E->frameStore(o, E->frameWhere(idx), F[idx].ctx);
+                if (E->frameCaller(idx, c)) {
+                    Value b = E->frameObject(c, E->frameWhere(c));
+                    o->props->defineByName("_ny_back", b);
+                }
+            } catch (...) {}
+        }
+        F.back().fobj = nullptr;
+        nygc::decref(o);
     }
 
     Value evalTry(node_ptr node, Context* ctx) {
@@ -11986,8 +12198,10 @@ public:
         if (m && m->container)
             for (auto& kv : *m->container) {
                 if (reflectHidden(kv.first)) continue;
-                if (m == global_ctx && base_global_names_.count(kv.first)) continue;
-                d->set(kv.first, kv.second);
+                // the module's __name__ and __file__ are its own (round 78:
+                // globals() had neither)
+                if (m == global_ctx && base_global_names_.count(kv.first) && kv.first != "__name__" && kv.first != "__file__") continue;
+                (*d->container)[nypy::key_of_str(kv.first)] = kv.second;   // a dict key (round 78: __name__ was not one)
             }
         return Value((Collectable*)d);
     }
@@ -11995,7 +12209,7 @@ public:
         if (!ctx || ctx == global_ctx || ctx->inModule || !ctx->parent) return reflectGlobals(ctx);
         auto* d = new Object((Runnable*)runner, "map", Type::MAP);
         if (ctx->container)
-            for (auto& kv : *ctx->container) if (!reflectHidden(kv.first)) d->set(kv.first, kv.second);
+            for (auto& kv : *ctx->container) if (!reflectHidden(kv.first)) (*d->container)[nypy::key_of_str(kv.first)] = kv.second;   // round 78
         return Value((Collectable*)d);
     }
     Node* classNodeOfValue(const Value& v) {
@@ -12814,14 +13028,27 @@ public:
         weak_by_id_.erase(w->id);
     }
     Value makeWeakRef(const Value& obj, const Value& callback = Value()) {
-        if (!isInstanceVal(obj) || !obj.value.o)
+        // What can be weakly referenced (round 78, as in Python): an
+        // instance, a function or lambda, a bound method (heap objects with
+        // an identity), a set or frozenset (its container), a class - which
+        // lives as long as the program, so the reference holds it. Not an
+        // int, str, list, tuple, dict or bytes.
+        bool heap = obj.type == ValueType::USERDATA && obj.value.p && obj.value.o
+                    && (isInstanceVal(obj) || isPlainFunction(obj) || bound_self_.count(obj.value.p));
+        bool coll = !heap && obj.isCollectable() && obj.value.gc && setOf(obj) != nullptr;
+        bool cls = !heap && !coll && classNodeOfValue(obj) != nullptr;
+        if (!heap && !coll && !cls)
             pyRaise("TypeError", "cannot create weak reference to '" + typeNameOf(obj) + "' object");
         nygc::g_weak_hook = &nyheap::weak_target_died;
         nygc::g_weak_cb_hook = &nyheap::run_weak_callbacks;
         auto* w = new nyheap::Weak(this, ++weak_serial_);
-        w->target = obj.value.o;
-        w->payload = obj.value.p;
-        nyheap::weak_register(w);
+        if (cls) { w->held = obj; w->has_held = true; }
+        else {
+            w->target = coll ? obj.value.gc : obj.value.o;
+            w->payload = coll ? nullptr : obj.value.p;
+            w->coll = coll;
+            nyheap::weak_register(w);
+        }
         weak_by_id_[w->id] = w;
         func_names[(void*)&w->tag] = "__builtin__:" + w->tag;
         Value wv = nyheap::userValue(w, (void*)&w->tag);
@@ -12900,7 +13127,16 @@ public:
             pending_ctx_ = Value();
             dead.push_back(uncaught_obj_);
             uncaught_obj_ = Value();
+            if (main_fobj_) {   // round 78
+                dead.push_back(instValue(main_fobj_));
+                nygc::decref(main_fobj_);
+                main_fobj_ = nullptr;
+            }
+            for (auto& r : tb_pending().recs) dead.push_back(r.frame);   // their frame objects (round 78)
+            tb_pending().recs.clear();
             pending_ctx_flow_.clear();
+            for (auto& kv : frame_info_memo_) dead.push_back(kv.second.info);   // round 78
+            frame_info_memo_.clear();
             for (auto& kv : key_objs_) dead.push_back(kv.second);
             key_objs_.clear();
             if (keys_owner_ == this) { keys_owner_ = nullptr; nygc::g_keys = nygc::KeyTable(); }
@@ -12936,8 +13172,9 @@ public:
         if (name.size() < 3 || !(name[0] == 'g' || name[0] == 'm' || name[0] == 'w' || name[0] == '_')) return false;
         if (name.rfind("__weakref__:", 0) == 0) {
             auto it = weak_by_id_.find(std::strtoll(name.c_str() + 12, nullptr, 10));
+            if (it != weak_by_id_.end() && it->second->has_held) { out = it->second->held; return true; }   // a class (round 78)
             if (it == weak_by_id_.end() || !it->second->target) { out = NONE_VALUE; return true; }
-            out = nyheap::userValue(it->second->target, it->second->payload);
+            out = it->second->coll ? Value(it->second->target) : nyheap::userValue(it->second->target, it->second->payload);
             return true;
         }
         if (name == "weakref") {

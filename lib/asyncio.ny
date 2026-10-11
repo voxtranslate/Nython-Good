@@ -26,6 +26,12 @@
 #                cancelled; map_bounded(fn, items, limit) - fn over items with
 #                at most `limit` running at once, results in input order.
 #
+# Coroutines are objects (round 78): calling an async def gives a coroutine
+# (type `coroutine`, send/throw/close, cr_frame ...) that run(), create_task,
+# gather and await take as they are; sleep() returns one too. An __await__
+# that is a generator is run as a coroutine runner runs it: a bare yield
+# lets the loop's other tasks run, a yielded awaitable is awaited.
+#
 # Differences from Python, on purpose or for now:
 #   - a TaskGroup whose children fail raises the error itself when one child
 #     failed, an ExceptionGroup (the builtin; `except*` splits it) when
@@ -220,6 +226,7 @@ def all_tasks(loop=none):
     return out
 
 def iscoroutine(obj):
+    # a coroutine object (round 78), or one of the runtime's coroutine handles
     return async_is_coroutine(obj)
 
 def isfuture(obj):
@@ -228,12 +235,9 @@ def isfuture(obj):
 def run(main, debug=none, loop_factory=none):
     return async_run(main)
 
-def sleep(delay, result=none):
-    if result == none:
-        return async_sleep(delay)
-    return _sleep_result(delay, result)
-
-async def _sleep_result(delay, result):
+async def sleep(delay, result=none):
+    # a coroutine, as Python's (round 78: coroutine objects are objects now,
+    # not the runtime's int handles)
     await async_sleep(delay)
     return result
 

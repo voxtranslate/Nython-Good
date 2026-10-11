@@ -56,16 +56,22 @@
 # a list of human-readable problems; empty means `b` accepts every call `a`
 # accepts.
 #
-# Not here: frames - the runtime has no frame objects, so currentframe()
-# returns None (CPython documents that for implementations without frame
-# support), and stack(), trace(), getframeinfo(), getouterframes(),
-# getinnerframes(), getargvalues(), getgeneratorstate(),
-# getgeneratorlocals(), getcoroutinestate() are not provided; signatures
-# of builtins (they carry no __text_signature__: ValueError "no signature
-# found for builtin", as CPython for builtins without one); getclosurevars
-# (no __closure__ cells); classify_class_attrs; walktree / getclasstree;
-# BufferFlags. A function's __code__.co_varnames lists its parameters, not
-# its other locals.
+# Frames (round 78: the engines' frame objects, made only when asked for):
+# currentframe(), stack(context=1), trace(context=1), getframeinfo(frame,
+# context=1) -> Traceback, getouterframes(frame, context=1) /
+# getinnerframes(tb, context=1) -> [FrameInfo], getargvalues(frame) ->
+# ArgInfo, formatargvalues, getlineno; getgeneratorstate /
+# getgeneratorlocals, getcoroutinestate / getcoroutinelocals,
+# getasyncgenstate / getasyncgenlocals (3.12) with the GEN_* / CORO_* /
+# AGEN_* constants. A frame's f_locals is its locals now while it runs (a
+# new dict each read) and its last ones after; positions carry lines only.
+#
+# Not here: signatures of builtins (they carry no __text_signature__:
+# ValueError "no signature found for builtin", as CPython for builtins
+# without one); getclosurevars (no __closure__ cells); classify_class_attrs;
+# walktree / getclasstree; BufferFlags; column positions. A function's
+# __code__.co_varnames (and a frame's f_code.co_varnames) lists its
+# parameters, not its other locals.
 
 import types
 
@@ -80,6 +86,13 @@ __all__ = ["signature", "Signature", "Parameter", "BoundArguments", "get_annotat
            "getdoc", "cleandoc", "getattr_static", "unwrap", "getfile",
            "getsourcefile", "getsourcelines", "getsource", "getblock", "findsource",
            "indentsize", "getmodulename", "getmodule", "getcomments", "currentframe",
+           "getframeinfo", "getouterframes", "getinnerframes", "stack", "trace",
+           "getargvalues", "formatargvalues", "getlineno", "FrameInfo", "Traceback",
+           "ArgInfo", "getgeneratorstate", "getgeneratorlocals", "getcoroutinestate",
+           "getcoroutinelocals", "getasyncgenstate", "getasyncgenlocals",
+           "GEN_CREATED", "GEN_RUNNING", "GEN_SUSPENDED", "GEN_CLOSED",
+           "CORO_CREATED", "CORO_RUNNING", "CORO_SUSPENDED", "CORO_CLOSED",
+           "AGEN_CREATED", "AGEN_RUNNING", "AGEN_SUSPENDED", "AGEN_CLOSED",
            "signature_diff", "CO_OPTIMIZED", "CO_NEWLOCALS", "CO_VARARGS",
            "CO_VARKEYWORDS", "CO_NESTED", "CO_GENERATOR", "CO_NOFREE", "CO_COROUTINE",
            "CO_ITERABLE_COROUTINE", "CO_ASYNC_GENERATOR"]
@@ -1747,6 +1760,10 @@ def findsource(object):
         object = object.__func__
     if isfunction(object):
         object = object.__code__
+    if istraceback(object):
+        object = object.tb_frame
+    if isframe(object):
+        object = object.f_code
     if iscode(object):
         var lnum = object.co_firstlineno - 1
         if lnum < 0 or lnum >= len(lines):
@@ -1809,10 +1826,357 @@ def getcomments(object):
     return None
 
 
+# ── frames and the interpreter stack (round 78) ─────────────────────────────
+# The engines' frame objects (sys._getframe): f_code, f_lineno, f_locals,
+# f_globals, f_back ... - CPython 3.11's functions over them. Positions have
+# lines only (the runtime records no columns).
+class _InfoTuple:
+    # a named tuple of CPython's (compares equal to a tuple of its fields)
+    _fields = ()
+
+    def __getitem__(self, i):
+        return self._values[i]
+
+    def __len__(self):
+        return len(self._values)
+
+    def __iter__(self):
+        return iter(list(self._values))
+
+    def __eq__(self, other):
+        if isinstance(other, _InfoTuple):
+            return self._values == other._values
+        return self._values == other
+
+    def __ne__(self, other):
+        return not self.__eq__(other)
+
+    def __hash__(self):
+        return hash(self._values)
+
+    def _repr_fields(self):
+        var parts = []
+        var i = 0
+        while i < len(self._fields):
+            parts.append(self._fields[i] + "=" + _pyrepr_any(self._values[i]))
+            i = i + 1
+        return parts
+
+    def __repr__(self):
+        return type(self).__name__ + "(" + ", ".join(self._repr_fields()) + ")"
+
+
+def _pyrepr_any(v):
+    if v is None or v is True or v is False or isinstance(v, tuple):
+        return _pyrepr(v)
+    if isinstance(v, list):
+        return "[" + ", ".join([_pyrepr_any(x) for x in v]) + "]"
+    return repr(v)
+
+
+class Positions(_InfoTuple):
+    # dis.Positions(lineno, end_lineno, col_offset, end_col_offset)
+    _fields = ("lineno", "end_lineno", "col_offset", "end_col_offset")
+
+    def __init__(self, lineno=None, end_lineno=None, col_offset=None, end_col_offset=None):
+        self.lineno = lineno
+        self.end_lineno = end_lineno
+        self.col_offset = col_offset
+        self.end_col_offset = end_col_offset
+        self._values = (lineno, end_lineno, col_offset, end_col_offset)
+
+
+class Traceback(_InfoTuple):
+    # getframeinfo(): Traceback(filename, lineno, function, code_context,
+    # index), with .positions
+    _fields = ("filename", "lineno", "function", "code_context", "index")
+
+    def __init__(self, filename, lineno, function, code_context, index, *, positions=None):
+        self.filename = filename
+        self.lineno = lineno
+        self.function = function
+        self.code_context = code_context
+        self.index = index
+        self.positions = positions
+        self._values = (filename, lineno, function, code_context, index)
+
+    def __repr__(self):
+        return "Traceback(" + ", ".join(self._repr_fields() + ["positions=" + repr(self.positions)]) + ")"
+
+
+class FrameInfo(_InfoTuple):
+    # stack() / getouterframes() / getinnerframes(): FrameInfo(frame,
+    # filename, lineno, function, code_context, index), with .positions
+    _fields = ("frame", "filename", "lineno", "function", "code_context", "index")
+
+    def __init__(self, frame, filename, lineno, function, code_context, index, *, positions=None):
+        self.frame = frame
+        self.filename = filename
+        self.lineno = lineno
+        self.function = function
+        self.code_context = code_context
+        self.index = index
+        self.positions = positions
+        self._values = (frame, filename, lineno, function, code_context, index)
+
+    def __repr__(self):
+        return "FrameInfo(" + ", ".join(self._repr_fields() + ["positions=" + repr(self.positions)]) + ")"
+
+
+class ArgInfo(_InfoTuple):
+    # getargvalues(frame): ArgInfo(args, varargs, keywords, locals)
+    _fields = ("args", "varargs", "keywords", "locals")
+
+    def __init__(self, args, varargs, keywords, locals):
+        self.args = args
+        self.varargs = varargs
+        self.keywords = keywords
+        self.locals = locals
+        self._values = (args, varargs, keywords, locals)
+
+
 def currentframe():
-    # The runtime has no frame objects: None, as CPython documents for
-    # implementations without stack frame support
-    return None
+    """Return the frame of the caller or None if this is not possible."""
+    import sys
+    return sys._getframe(1)
+
+
+def getframeinfo(frame, context=1):
+    """Get information about a frame or traceback object.
+
+    A tuple of five things is returned: the filename, the line number of
+    the current line, the function name, a list of lines of context from
+    the source code, and the index of the current line within that list.
+    The optional second argument specifies the number of lines of context
+    to return, which are centered around the current line."""
+    var lineno = 0
+    if istraceback(frame):
+        lineno = frame.tb_lineno
+        frame = frame.tb_frame
+    elif isframe(frame):
+        lineno = frame.f_lineno
+    if not isframe(frame):
+        raise TypeError(repr(frame) + " is not a frame or traceback object")
+    var filename = getsourcefile(frame) or getfile(frame)
+    var lines = None
+    var index = None
+    if context > 0:
+        var start = lineno - 1 - context // 2
+        var src = None
+        try:
+            src = findsource(frame)
+        except OSError:
+            src = None
+        if src is not None:
+            var all_lines = src[0]
+            start = max(0, min(start, len(all_lines) - context))
+            lines = all_lines[start:start + context]
+            index = lineno - 1 - start
+    return Traceback(filename, lineno, frame.f_code.co_name, lines, index,
+                     positions=Positions(lineno, lineno, None, None))
+
+
+def getlineno(frame):
+    """Get the line number from a frame object, allowing for optimization."""
+    return frame.f_lineno
+
+
+def _frameinfo(frame, info):
+    return FrameInfo(frame, info.filename, info.lineno, info.function, info.code_context,
+                     info.index, positions=info.positions)
+
+
+def getouterframes(frame, context=1):
+    """Get a list of records for a frame and all higher (calling) frames.
+
+    Each record contains a frame object, filename, line number, function
+    name, a list of lines of context, and index within the context."""
+    var framelist = []
+    while frame:
+        framelist.append(_frameinfo(frame, getframeinfo(frame, context)))
+        frame = frame.f_back
+    return framelist
+
+
+def getinnerframes(tb, context=1):
+    """Get a list of records for a traceback's frame and all lower frames.
+
+    Each record contains a frame object, filename, line number, function
+    name, a list of lines of context, and index within the context."""
+    var framelist = []
+    while tb:
+        framelist.append(_frameinfo(tb.tb_frame, getframeinfo(tb, context)))
+        tb = tb.tb_next
+    return framelist
+
+
+def stack(context=1):
+    """Return a list of records for the stack above the caller's frame."""
+    import sys
+    return getouterframes(sys._getframe(1), context)
+
+
+def trace(context=1):
+    """Return a list of records for the stack below the current exception."""
+    import sys
+    var exc = sys.exc_info()[1]
+    if exc is None:
+        return []
+    return getinnerframes(exc.__traceback__, context)
+
+
+def getargvalues(frame):
+    """Get information about arguments passed into a particular frame.
+
+    A tuple of four things is returned: (args, varargs, varkw, locals).
+    'args' is a list of the argument names.
+    'varargs' and 'varkw' are the names of the * and ** arguments or None.
+    'locals' is the locals dictionary of the given frame."""
+    var code = frame.f_code
+    var nargs = code.co_argcount + code.co_kwonlyargcount
+    var names = list(code.co_varnames)
+    var args = names[:nargs]
+    var varargs = None
+    if code.co_flags & CO_VARARGS:
+        varargs = names[nargs]
+        nargs = nargs + 1
+    var varkw = None
+    if code.co_flags & CO_VARKEYWORDS:
+        varkw = names[nargs]
+    return ArgInfo(args, varargs, varkw, frame.f_locals)
+
+
+def _fmt_star(name):
+    return "*" + name
+
+
+def _fmt_star2(name):
+    return "**" + name
+
+
+def _fmt_value(value):
+    return "=" + repr(value)
+
+
+def formatargvalues(args, varargs, varkw, locals, formatarg=str,
+                    formatvarargs=_fmt_star, formatvarkw=_fmt_star2,
+                    formatvalue=_fmt_value):
+    """Format an argument spec from the 4 values returned by getargvalues."""
+    var specs = []
+    for i in range(len(args)):
+        specs.append(formatarg(args[i]) + formatvalue(locals[args[i]]))
+    if varargs:
+        specs.append(formatvarargs(varargs) + formatvalue(locals[varargs]))
+    if varkw:
+        specs.append(formatvarkw(varkw) + formatvalue(locals[varkw]))
+    return "(" + ", ".join(specs) + ")"
+
+
+# Generator, coroutine and async generator states (CPython's constants)
+GEN_CREATED = "GEN_CREATED"
+GEN_RUNNING = "GEN_RUNNING"
+GEN_SUSPENDED = "GEN_SUSPENDED"
+GEN_CLOSED = "GEN_CLOSED"
+CORO_CREATED = "CORO_CREATED"
+CORO_RUNNING = "CORO_RUNNING"
+CORO_SUSPENDED = "CORO_SUSPENDED"
+CORO_CLOSED = "CORO_CLOSED"
+AGEN_CREATED = "AGEN_CREATED"
+AGEN_RUNNING = "AGEN_RUNNING"
+AGEN_SUSPENDED = "AGEN_SUSPENDED"
+AGEN_CLOSED = "AGEN_CLOSED"
+
+
+def getgeneratorstate(generator):
+    """Get current state of a generator-iterator.
+
+    Possible states are:
+      GEN_CREATED: Waiting to start execution.
+      GEN_RUNNING: Currently being executed by the interpreter.
+      GEN_SUSPENDED: Currently suspended at a yield expression.
+      GEN_CLOSED: Execution has completed.
+    """
+    if generator.gi_running:
+        return GEN_RUNNING
+    if generator.gi_suspended:
+        return GEN_SUSPENDED
+    if generator.gi_frame is None:
+        return GEN_CLOSED
+    return GEN_CREATED
+
+
+def getgeneratorlocals(generator):
+    """
+    Get the mapping of generator local variables to their current values.
+
+    A dict is returned, with the keys the local variable names and values the
+    bound values."""
+    if not isgenerator(generator):
+        raise TypeError(repr(generator) + " is not a Python generator")
+    var frame = getattr(generator, "gi_frame", None)
+    if frame is not None:
+        return generator.gi_frame.f_locals
+    return {}
+
+
+def getcoroutinestate(coroutine):
+    """Get current state of a coroutine object.
+
+    Possible states are:
+      CORO_CREATED: Waiting to start execution.
+      CORO_RUNNING: Currently being executed by the interpreter.
+      CORO_SUSPENDED: Currently suspended at an await expression.
+      CORO_CLOSED: Execution has completed.
+    """
+    if coroutine.cr_running:
+        return CORO_RUNNING
+    if coroutine.cr_suspended:
+        return CORO_SUSPENDED
+    if coroutine.cr_frame is None:
+        return CORO_CLOSED
+    return CORO_CREATED
+
+
+def getcoroutinelocals(coroutine):
+    """
+    Get the mapping of coroutine local variables to their current values.
+
+    A dict is returned, with the keys the local variable names and values the
+    bound values."""
+    var frame = getattr(coroutine, "cr_frame", None)
+    if frame is not None:
+        return frame.f_locals
+    return {}
+
+
+def getasyncgenstate(agen):
+    """Get current state of an asynchronous generator object (3.12).
+
+    Possible states are:
+      AGEN_CREATED: Waiting to start execution.
+      AGEN_RUNNING: Currently being executed by the interpreter.
+      AGEN_SUSPENDED: Currently suspended at a yield expression.
+      AGEN_CLOSED: Execution has completed.
+    """
+    if agen.ag_running:
+        return AGEN_RUNNING
+    if agen.ag_suspended:
+        return AGEN_SUSPENDED
+    if agen.ag_frame is None:
+        return AGEN_CLOSED
+    return AGEN_CREATED
+
+
+def getasyncgenlocals(agen):
+    """
+    Get the mapping of asynchronous generator local variables to their current
+    values (3.12)."""
+    if not isasyncgen(agen):
+        raise TypeError(repr(agen) + " is not a Python async generator")
+    var frame = getattr(agen, "ag_frame", None)
+    if frame is not None:
+        return agen.ag_frame.f_locals
+    return {}
 
 
 # ── signature_diff (Nython) ──────────────────────────────────────────────────

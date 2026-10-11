@@ -16,7 +16,9 @@
 # new ones). e.__context__ (the exception being handled when it was raised),
 # e.__cause__ (raise X from Y) and e.__suppress_context__ are kept;
 # sys.exc_info() is (type, value, traceback); sys._getframe(depth) gives the
-# running frames (f_code.co_filename / co_name, f_lineno, f_back).
+# running frames - the engines' frame objects (round 78): f_code, f_lineno,
+# f_locals, f_globals, f_back; a traceback entry's tb_frame is the frame it
+# passed, keeping its last locals.
 #
 # print_tb(tb, limit=None, file=None)          format_tb(tb, limit=None)
 # print_exception(exc, /, value, tb, limit=None, file=None, chain=True)
@@ -50,9 +52,8 @@
 # direct cause of the following exception:" / "During handling of the above
 # exception, another exception occurred:" - except for what the runtime does
 # not record: there are no column positions, so no "^^^^" lines under a
-# source line; frames carry no local variables, so capture_locals adds
-# nothing; exception groups are not formatted as groups; a frame's f_back is
-# None for the frames of a traceback; frames of the runtime's own prelude
+# source line; exception groups are not formatted as groups; frames of the
+# runtime's own prelude
 # (the code behind builtins such as open() and print(file=)) are not shown,
 # as Python shows no frame for a function written in C.
 
@@ -281,7 +282,11 @@ def extract_stack(f=None, limit=None):
 def clear_frames(tb):
     "Clear all references to local variables in the frames of a traceback."
     while tb is not None:
-        tb.tb_frame.clear()
+        try:
+            tb.tb_frame.clear()
+        except RuntimeError:
+            # Ignore the exception raised if the frame is still executing.
+            pass
         tb = tb.tb_next
 
 
@@ -375,11 +380,16 @@ def walk_stack(f):
     This will follow f.f_back from the given frame. If no frame is given, the
     current stack is used. Usually used with StackSummary.extract.
     """
+    # (3.12's: the caller's frame is taken now, not when iteration starts)
     if f is None:
-        f = sys._getframe(1)
-    while f is not None:
-        yield (f, f.f_lineno)
-        f = f.f_back
+        f = sys._getframe().f_back
+
+    def walk_stack_generator(frame):
+        while frame is not None:
+            yield (frame, frame.f_lineno)
+            frame = frame.f_back
+
+    return walk_stack_generator(f)
 
 
 def walk_tb(tb):

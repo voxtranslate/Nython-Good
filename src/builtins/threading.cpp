@@ -132,14 +132,35 @@ struct InterpEngine : nyconc::Engine {
         Value v = unbox_value(b);
         if (!E.isInstanceValue(v) || !E.instanceHasMethod(v, "__await__")) return nullptr;
         std::vector<Value> av;
-        try { return box(E.callMethod(v, "__await__", av, E.globalContext())); }
+        Value r;
+        try { r = E.callMethod(v, "__await__", av, E.globalContext()); }
         catch (std::string& s) {
             nyconc::NyError e; e.raw = s;
             Value inst = E.excInstanceOf(s);
             if (inst.type != ValueType::NONE) { e.type = E.instanceClassName(inst); e.msg = E.exceptionMessage(inst); }
             throw e;
         }
-        catch (nython::node::ReturnSignal& r) { return box(r.value); }
+        catch (nython::node::ReturnSignal& rs) { r = rs.value; }
+        // An __await__ that is a generator or an iterator (round 78):
+        // driven as a coroutine of its own by the prelude's
+        // _ny_drive_await (_ny_await_iter gives its handle) - its yields go
+        // to the coroutine runner.
+        if (nygen::is_gen(r) || (E.isInstanceValue(r) && E.instanceHasMethod(r, "__next__") && !E.instanceHasMethod(r, "__await__"))) {
+            Value f = E.globalContext()->getByName("_ny_await_iter");
+            if (f.type == ValueType::USERDATA) return call(box(f), {box(r)});
+        }
+        return box(r);
+    }
+    // A coroutine object (round 78): its handle field.
+    bool coro_handle(const nyconc::BoxPtr& b, int64_t& out) override {
+        Value v = unbox_value(b);
+        if (!E.isInstanceValue(v)) return false;
+        Context* p = E.instanceProps(v);
+        if (!p) return false;
+        Value h = p->getByName("_ny_coro_h");
+        if (h.type != ValueType::INTEGER) return false;
+        out = bigint_to_i64(h.value.i);
+        return true;
     }
     nyconc::BoxPtr box_int(int64_t v) override { return box(Value((int64_t)v)); }
     nyconc::BoxPtr box_none() override { return box(NONE_VALUE); }

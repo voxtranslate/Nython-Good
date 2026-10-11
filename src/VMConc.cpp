@@ -145,7 +145,28 @@ struct VMConcEngine : nyconc::Engine {
         if (v.type != VMType::INSTANCE) return nullptr;
         VMVal m;
         if (!vm.try_get_attr(v, "__await__", m)) return nullptr;
-        return call(box(m), {});
+        nyconc::BoxPtr r = call(box(m), {});
+        // An __await__ that is a generator or an iterator (round 78):
+        // driven as a coroutine of its own by the prelude's
+        // _ny_drive_await (_ny_await_iter gives its handle) - its yields go
+        // to the coroutine runner.
+        VMVal rv = unbox(r);
+        VMVal nx;
+        if (rv.type == VMType::GENERATOR
+            || (rv.type == VMType::INSTANCE && vm.try_get_attr(rv, "__next__", nx) && !vm.try_get_attr(rv, "__await__", nx))) {
+            VMVal f = vm.load_var("_ny_await_iter");
+            if (f.type == VMType::FUNCTION) return call(box(f), {r});
+        }
+        return r;
+    }
+    // A coroutine object (round 78): its handle field.
+    bool coro_handle(const nyconc::BoxPtr& b, int64_t& out) override {
+        VMVal v = unbox(b);
+        if (v.type != VMType::INSTANCE || !v.map) return false;
+        auto it = v.map->find("_ny_coro_h");
+        if (it == v.map->end() || it->second.type != VMType::INT) return false;
+        out = it->second.i;
+        return true;
     }
     nyconc::BoxPtr box_int(int64_t v) override { return box(VMVal::make_int(v)); }
     nyconc::BoxPtr box_none() override { return box(VMVal::make_none()); }

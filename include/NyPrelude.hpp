@@ -1335,42 +1335,294 @@ class _NyAsyncCM:
 def _ny_async_cm(m):
     return _NyAsyncCM(m)
 
+# ── coroutine objects (round 78) ─────────────────────────────────────────
+# Calling an `async def` gives a _NyCoroutine (Python's `coroutine`): the
+# coroutine the runtime runs is behind _ny_coro_h - its handle, which await,
+# create_task, gather and asyncio take from the object without calling
+# anything - and it can be driven by hand, as a coroutine runner drives one:
+# send / throw / close (async_coro_drive). An await of an object whose
+# __await__ is a generator runs that generator (_ny_drive_await): its yields
+# go to whoever drives the coroutine by hand, or, in a task, a bare yield
+# gives the other tasks a turn and anything else is awaited. A coroutine
+# that is never awaited warns through warnings when it goes, as CPython's
+# does: "RuntimeWarning: coroutine 'f' was never awaited".
+def _ny_raise_from(r):
+    # what async_coro_drive answered: [0, yielded] / [1, result] / [2, exc]
+    if r[0] == 0:
+        return r[1]
+    if r[0] == 2:
+        raise r[1]
+    if r[1] is None:
+        raise StopIteration()
+    raise StopIteration(r[1])
+
+def _ny_exc_of(typ, val=None, tb=None):
+    # throw()'s arguments as one exception: throw(E), throw(E, v), throw(e)
+    var exc = typ
+    if not isinstance(typ, BaseException):
+        if val is None:
+            exc = typ()
+        elif isinstance(val, BaseException):
+            exc = val
+        else:
+            exc = typ(val)
+    if tb is not None:
+        exc = exc.with_traceback(tb)
+    return exc
+
+class _NyCoroDriver:
+    # send / throw / close / __next__ over a coroutine handle: the
+    # coroutine objects, their __await__ wrappers and the async generators'
+    # asend / athrow / aclose awaitables
+    _ny_coro_h = 0
+
+    def send(self, value):
+        return _ny_raise_from(async_coro_drive(self._ny_coro_h, 0, value))
+
+    def throw(self, typ, val=None, tb=None):
+        return _ny_raise_from(async_coro_drive(self._ny_coro_h, 1, _ny_exc_of(typ, val, tb)))
+
+    def close(self):
+        async_coro_drive(self._ny_coro_h, 2, None)
+
+    def __next__(self):
+        return self.send(None)
+
+    def __iter__(self):
+        return self
+
+class _NyCoroutine(_NyCoroDriver):
+    # _NyCoroutine(handle, function, name, qualname): the parser's
+    # rewriting of an async def makes one per call (Parser.cpp)
+    def __init__(self, h, fn, name, qualname):
+        self._ny_coro_h = h
+        self._ny_fn = fn
+        self._ny_frame0 = None
+        self.__name__ = name
+        self.__qualname__ = qualname
+
+    def __await__(self):
+        return _NyCoroWrapper(self)
+
+    @property
+    def cr_code(self):
+        return _NyFuncCode(_ny_fn_info(self._ny_fn))
+
+    @property
+    def cr_running(self):
+        return async_coro_info(self._ny_coro_h)[0] == 1
+
+    @property
+    def cr_suspended(self):
+        return async_coro_info(self._ny_coro_h)[0] == 2
+
+    @property
+    def cr_await(self):
+        return async_coro_info(self._ny_coro_h)[1]
+
+    @property
+    def cr_frame(self):
+        # None once it has finished; the frame its body is paused in while
+        # it is driven by hand; else a frame at its def line
+        var info = async_coro_info(self._ny_coro_h)
+        if info[0] == 3:
+            return None
+        if info[2] is not None:
+            return info[2]
+        if self._ny_frame0 is None:
+            var fi = _ny_fn_info(self._ny_fn)
+            self._ny_frame0 = _NyFrame(fi[5], fi[6], fi[0], fi[2])
+            self._ny_frame0._ny_info = fi
+        return self._ny_frame0
+
+    cr_origin = None
+
+    def __repr__(self):
+        return "<coroutine object " + self.__qualname__ + " at " + _ny_hexid(self) + ">"
+
+    def __del__(self):
+        # its handle goes with it (async_coro_drop: its state, -1 when it is
+        # suspended by its runner and was kept to be closed first)
+        var st = async_coro_drop(self._ny_coro_h)
+        if st == 0:
+            _ny_coro_unawaited(self)
+        elif st == -1:
+            # suspended by its runner: closed, as Python's finalizer does
+            try:
+                self.close()
+            except BaseException:
+                pass
+            async_coro_release(self._ny_coro_h)
+
+_NyCoroutine.__name__ = "coroutine"
+_NyCoroutine.__qualname__ = "coroutine"
+_NyCoroutine.__module__ = "builtins"
+
+class _NyCoroWrapper(_NyCoroDriver):
+    # what a coroutine's __await__ returns (Python's coroutine_wrapper)
+    def __init__(self, co):
+        self._ny_coro_h = co._ny_coro_h
+        self._ny_co = co
+
+    def __repr__(self):
+        return "<coroutine_wrapper object at " + _ny_hexid(self) + ">"
+
+_NyCoroWrapper.__name__ = "coroutine_wrapper"
+_NyCoroWrapper.__qualname__ = "coroutine_wrapper"
+_NyCoroWrapper.__module__ = "builtins"
+
+def _ny_coro_unawaited(co):
+    # CPython's warning for a coroutine that was never awaited, through
+    # warnings (lib/warnings.ny)
+    try:
+        import warnings
+        warnings._warn_unawaited_coroutine(co)
+    except BaseException:
+        pass
+
+def _ny_coro_frame(name):
+    # the outermost running frame of the coroutine named `name` (its body)
+    var f = _ny_frame_get(0)
+    var found = None
+    while f is not None:
+        if f.f_code.co_name == name:
+            found = f
+        f = f.f_back
+    if found is not None:
+        _ny_frame_sync(found)   # its line and locals as it pauses
+    return found
+
+def _ny_drive_await(g):
+    # `await x` where x.__await__() is a generator (or an iterator): run it
+    # as a coroutine runner does, its yields going out (_ny_await_yield)
+    var r = [0, None]
+    var sends = hasattr(g, "send")
+    while true:
+        var y = None
+        try:
+            if r[0] == 0:
+                y = g.send(r[1]) if sends else next(g)
+            elif r[0] == 1:
+                if not hasattr(g, "throw"):
+                    raise r[1]
+                y = g.throw(r[1])
+            else:
+                if hasattr(g, "close"):
+                    g.close()
+                raise GeneratorExit()
+        except StopIteration as e:
+            return e.value
+        var name = _ny_await_manual()
+        r = _ny_await_yield(y, g, _ny_coro_frame(name) if name is not None else None)
+
+def _ny_await_iter(g):
+    # the handle of a coroutine running _ny_drive_await(g) (the engines'
+    # await of an __await__ generator)
+    return async_coroutine(_ny_drive_await, g)
+
+# ── async generators (round 78: their own objects) ───────────────────────
+# An `async def` with a yield gives an _NyAsyncGen (Python's
+# async_generator) over a plain generator that runs its body; __anext__,
+# asend, athrow and aclose return awaitables of one step of it (Python's
+# async_generator_asend / async_generator_athrow), which can also be driven
+# by hand. `async for` reads the generator directly.
 class _NyAsyncGen:
-    def __init__(self, g):
+    def __init__(self, g, name="", qualname=""):
         self._g = g
+        self._ny_running = False
+        self.__name__ = name
+        self.__qualname__ = qualname
 
     def __aiter__(self):
         return self
 
     def __anext__(self):
-        try:
-            return next(self._g)
-        except StopIteration:
-            raise StopAsyncIteration()
+        return _NyAGenASend(self, 0, None)
 
     def asend(self, value):
-        try:
-            return self._g.send(value)
-        except StopIteration:
-            raise StopAsyncIteration()
+        return _NyAGenASend(self, 0, value)
 
-    def athrow(self, *exc):
-        try:
-            return self._g.throw(*exc)
-        except StopIteration:
-            raise StopAsyncIteration()
+    def athrow(self, typ, val=None, tb=None):
+        return _NyAGenAThrow(self, 1, _ny_exc_of(typ, val, tb))
 
     def aclose(self):
-        self._g.close()
+        return _NyAGenAThrow(self, 2, None)
 
     def __iter__(self):
         return self._g
 
-    def __repr__(self):
-        return "<async_generator object>"
+    @property
+    def ag_running(self):
+        return self._ny_running
 
-def _ny_async_gen(g):
-    return _NyAsyncGen(g)
+    @property
+    def ag_frame(self):
+        return self._g.gi_frame
+
+    @property
+    def ag_code(self):
+        return self._g.gi_code
+
+    @property
+    def ag_await(self):
+        return None
+
+    @property
+    def ag_suspended(self):
+        return self._g.gi_suspended
+
+    def __repr__(self):
+        return "<async_generator object " + self.__qualname__ + " at " + _ny_hexid(self) + ">"
+
+_NyAsyncGen.__name__ = "async_generator"
+_NyAsyncGen.__qualname__ = "async_generator"
+_NyAsyncGen.__module__ = "builtins"
+
+def _ny_async_gen(g, name="", qualname=""):
+    return _NyAsyncGen(g, name, qualname)
+
+def _ny_agen_step(ag, mode, value):
+    # one step of an async generator: next / send (0), throw (1), close (2)
+    if ag._ny_running:
+        raise RuntimeError("anext(): asynchronous generator is already running")
+    ag._ny_running = true
+    try:
+        if mode == 0:
+            return ag._g.send(value)
+        if mode == 1:
+            return ag._g.throw(value)
+        try:
+            ag._g.close()
+        except RuntimeError:
+            raise RuntimeError("async generator ignored GeneratorExit")
+        return None
+    except StopIteration:
+        raise StopAsyncIteration()
+    finally:
+        ag._ny_running = false
+
+class _NyAGenASend(_NyCoroDriver):
+    def __init__(self, ag, mode, value):
+        self._ny_coro_h = async_coroutine(_ny_agen_step, ag, mode, value)
+
+    def __await__(self):
+        return self
+
+    def __del__(self):
+        async_coro_release(self._ny_coro_h)
+
+    def __repr__(self):
+        return "<" + type(self).__name__ + " object at " + _ny_hexid(self) + ">"
+
+class _NyAGenAThrow(_NyAGenASend):
+    pass
+
+_NyAGenASend.__name__ = "async_generator_asend"
+_NyAGenASend.__qualname__ = "async_generator_asend"
+_NyAGenASend.__module__ = "builtins"
+_NyAGenAThrow.__name__ = "async_generator_athrow"
+_NyAGenAThrow.__qualname__ = "async_generator_athrow"
+_NyAGenAThrow.__module__ = "builtins"
 
 def _ny_adrive(it):
     while true:
@@ -1406,12 +1658,9 @@ def anext(it, *default):
 # ── frames and tracebacks (round 77) ─────────────────────────────────────
 # e.__traceback__ is a chain of _NyTraceback the engines make as the
 # exception passes each frame (tb_next, tb_lineno, and the frame's file,
-# function and module in _ny_loc, "\x1f"-separated); tb_frame is made from
-# those when it is first read. A frame - sys._getframe(), a
-# traceback's tb_frame - has f_code (co_filename, co_name), f_lineno,
-# f_back and f_globals (its module's __name__ and __file__, in a dict of
-# its own rather than the module's namespace); f_locals is empty, and a
-# traceback's frames have no f_back.
+# function and module in _ny_loc, "\x1f"-separated); since round 78 each
+# entry holds the frame object itself (_ny_frame: f_locals, f_back ...).
+# Frames are the engines' (_NyFrame below), made only when asked for.
 def _ny_hexid(o):
     return "0x" + format(id(o), "x")
 
@@ -1427,23 +1676,90 @@ class _NyCodeInfo:
         return "<code object " + self.co_name + " at " + _ny_hexid(self) + ", file \"" + self.co_filename + "\", line " + str(self.co_firstlineno) + ">"
 
 class _NyFrame:
+    # A frame object (round 78). The engines make one only when a program
+    # asks - sys._getframe(), inspect.currentframe(), a traceback's
+    # tb_frame, a generator's gi_frame - and set these fields themselves (no
+    # __init__ runs): _ny_info (the code, as _ny_fn_info gives a
+    # function's), _ny_line, _ny_lasti and _ny_locals. While its call runs,
+    # f_lineno / f_lasti / f_locals are read from the running frame
+    # (_ny_frame_sync refreshes them: f_locals is what locals() gives
+    # there) and f_back is the caller's frame (_ny_frame_back); a frame that
+    # outlives its call keeps its last line, locals and caller.
+    # _NyFrame(filename, lineno, name, module, back) makes a detached one
+    # (a traceback built by types.TracebackType).
+    f_trace = None
+    f_trace_lines = True
+    f_trace_opcodes = False
+    _ny_info = None
+    _ny_code = None
+    _ny_back = None
+    _ny_line = 0
+    _ny_lasti = -1
+    _ny_locals = None
+    _ny_detached_globals = None
+
     def __init__(self, filename, lineno, name, module="__main__", back=None):
-        self.f_code = _NyCodeInfo(filename, name)
-        self.f_lineno = lineno
-        self.f_lasti = -1
-        self.f_back = back
-        self.f_globals = {"__name__": module, "__file__": filename}
-        self.f_locals = {}
-        self.f_builtins = {}
-        self.f_trace = None
-        self.f_trace_lines = True
-        self.f_trace_opcodes = False
+        self._ny_info = [name, name, module, [], 0, filename, 0]
+        self._ny_line = lineno
+        self._ny_back = back
+        self._ny_locals = {}
+        self._ny_detached_globals = {"__name__": module, "__file__": filename}
+
+    @property
+    def f_code(self):
+        var c = self._ny_code
+        if c is None:
+            c = _NyFuncCode(self._ny_info)
+            self._ny_code = c
+        return c
+
+    @property
+    def f_lineno(self):
+        _ny_frame_sync(self)
+        return self._ny_line
+
+    @property
+    def f_lasti(self):
+        _ny_frame_sync(self)
+        return self._ny_lasti
+
+    @property
+    def f_locals(self):
+        _ny_frame_sync(self)
+        var l = self._ny_locals
+        if l is None:
+            l = {}
+            self._ny_locals = l
+        return l
+
+    @property
+    def f_globals(self):
+        if self._ny_detached_globals is not None:
+            return self._ny_detached_globals
+        return _ny_frame_globals(self)
+
+    @property
+    def f_builtins(self):
+        return _ny_builtins_dict()
+
+    @property
+    def f_back(self):
+        return _ny_frame_back(self)
 
     def clear(self):
-        return None
+        # Python's: a running frame cannot be cleared; a finished one lets
+        # go of its locals
+        if _ny_frame_sync(self):
+            raise RuntimeError("cannot clear an executing frame")
+        self._ny_locals = {}
 
     def __repr__(self):
         return "<frame at " + _ny_hexid(self) + ", file '" + self.f_code.co_filename + "', line " + str(self.f_lineno) + ", code " + self.f_code.co_name + ">"
+
+# shown as Python's types are (round 78)
+_NyFrame.__name__ = "frame"
+_NyFrame.__qualname__ = "frame"
+_NyFrame.__module__ = "builtins"
 
 class _NyTraceback:
     # Made by the engines without calling this (fields set directly);
@@ -1467,6 +1783,10 @@ class _NyTraceback:
 
     def __repr__(self):
         return "<traceback object at " + _ny_hexid(self) + ">"
+
+_NyTraceback.__name__ = "traceback"   # round 78
+_NyTraceback.__qualname__ = "traceback"
+_NyTraceback.__module__ = "builtins"
 
 # Every exception has these, as in Python (the engines set them on the
 # object when it is raised and caught).
@@ -1498,19 +1818,9 @@ def _ny_exc_info():
     return (type(e), e, getattr(e, "__traceback__", None))
 
 def _ny_getframe(depth=0):
-    # sys._getframe(depth): the caller's frame (depth 0), linked by f_back
-    var st = _ny_stack()
-    if depth < 0:
-        depth = 0
-    if depth >= len(st):
-        raise ValueError("call stack is not deep enough")
-    var fr = None
-    var i = len(st) - 1
-    while i >= depth:
-        var s = st[i]
-        fr = _NyFrame(s[0], s[1], s[2], s[3], fr)
-        i -= 1
-    return fr
+    # sys._getframe(depth): the caller's frame (depth 0) - the engines' own
+    # frame object (round 78), the same one each time while it runs
+    return _ny_frame_get(depth)
 
 # What the engines print for an uncaught exception before their own line
 # ("[Nython] Uncaught exception - Type: message"): Python's traceback - the

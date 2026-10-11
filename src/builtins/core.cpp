@@ -663,6 +663,12 @@ Value dispatch_core(NythonExecutor& E,
         // The running frames, innermost first: (filename, lineno, function,
         // module) - sys._getframe, traceback.extract_stack, warnings (round 77).
         if (name == "_ny_stack") return E.pyStackValue();
+        // Frame objects (round 78; NythonExecutor::frameObject)
+        if (name == "_ny_frame_get") return E.frameGet(args);
+        if (name == "_ny_frame_sync") return args.empty() ? Value(false) : E.frameSync(args[0]);
+        if (name == "_ny_frame_back") return args.empty() ? NONE_VALUE : E.frameBack(args[0]);
+        if (name == "_ny_frame_globals") return E.frameGlobals(args);
+        if (name == "_ny_builtins_dict") return E.builtinsDict();
         if (name == "vars") return E.reflectVars(args, ctx);
         if (name == "dir") return E.reflectDir(args, ctx);
         if (name == "issubclass" || name == "property" || name == "staticmethod" || name == "classmethod" || name == "iter" || name == "help" || name == "slice" || name == "complex") {

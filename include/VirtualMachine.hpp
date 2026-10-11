@@ -2489,6 +2489,9 @@ struct GenState : std::enable_shared_from_this<GenState> {
     std::function<bool(VMVal&)> native;
     bool sticky=false;           // a native whose error is not the end: a dict iterator keeps raising (round 78)
     VirtualMachine* vm=nullptr;  // the VM that runs it (its registry of live generators)
+    // Its frame object's fields (round 78), once one was asked for: kept
+    // while it is suspended, with the line and locals it paused at.
+    std::shared_ptr<VMMap> fobj;
     GenState() = default;
     GenState(const GenState&) = delete;
     GenState& operator=(const GenState&) = delete;
@@ -2609,6 +2612,9 @@ struct CallFrame {
     // Operand-stack height when the frame was entered; an exception handler
     // truncates to stack_base + ExceptionEntry::depth.
     size_t stack_base = 0;
+    // Its Python frame object's fields (round 78), once a program asked for
+    // one (VirtualMachine::frame_object); null for every other call.
+    std::shared_ptr<VMMap> fobj;
 };
 
 struct VMReturn   { VMVal value; };
@@ -3071,6 +3077,24 @@ public:
         std::weak_ptr<VMMap> target;
         std::string cls;
         VMVal callback;
+        // Round 78: what else can be weakly referenced. kind 0 an instance
+        // (target), 1 a function (its identity cell, fn_id; tmpl is the
+        // value without its counted parts), 2 a set or frozenset (its items
+        // and index), 3 a class (held in tmpl: classes live as long as the
+        // program), 4 a bound method (target: its map).
+        int kind = 0;
+        VMVal tmpl;
+        std::weak_ptr<std::pair<int,std::vector<VMVal>>> fn_id;
+        std::weak_ptr<VMMap> fn_env;
+        std::weak_ptr<std::vector<VMVal>> fn_defaults, set_items;
+        bool alive() const {
+            switch (kind) {
+                case 1: return !fn_id.expired();
+                case 2: return !set_items.expired();
+                case 3: return true;
+                default: return !target.expired();
+            }
+        }
     };
     struct WeakNotifier {
         std::vector<std::weak_ptr<WeakCell>> cells;
@@ -3103,15 +3127,82 @@ public:
         (*m)["\x01weakref"] = VMVal::make_native(NativeFunc(h));
         return n;
     }
+    // A function's (round 78): the holder sits in its identity cell.
+    static WeakNotifier* fn_notifier_of(const std::shared_ptr<std::pair<int,std::vector<VMVal>>>& c) {
+        for (auto& v : c->second)
+            if (v.type == VMType::NATIVE)
+                if (auto* h = v.native.target<WeakHolder>()) return h->n.get();
+        WeakHolder h{std::make_shared<WeakNotifier>()};
+        WeakNotifier* n = h.n.get();
+        c->second.push_back(VMVal::make_native(NativeFunc(h)));
+        return n;
+    }
+    // A function's identity cell (round 78) is registered with the cycle
+    // collector the first time the function is weakly referenced or used as
+    // a key (vm_key_objs keeps it then): the collection that finds the
+    // function unreachable frees it. `first` marks it registered.
+    static void track_fn_cell(const VMVal& f) {
+        if (f.type != VMType::FUNCTION || !f.iter || f.iter->first) return;
+        f.iter->first = 1;
+        vmgc::track_iter(f.iter);
+    }
+    // References to sets with a callback (round 78): a set has no field to
+    // hold a notifier, so these are checked at the safe points where
+    // callbacks run (gc_run_weak_callbacks: the next collection).
+    static std::vector<std::shared_ptr<WeakCell>>& weak_polled() {
+        static auto* v = new std::vector<std::shared_ptr<WeakCell>>();
+        return *v;
+    }
+    static VMVal weak_target_value(const WeakCell& c) {
+        switch (c.kind) {
+            case 1: {
+                auto id = c.fn_id.lock();
+                if (!id) return VMVal::make_none();
+                VMVal v = c.tmpl;
+                v.iter = id; v.closure_env = c.fn_env.lock(); v.list = c.fn_defaults.lock();
+                return v;
+            }
+            case 2: {
+                auto items = c.set_items.lock();
+                auto idx = c.target.lock();
+                if (!items || !idx) return VMVal::make_none();
+                VMVal v = c.tmpl;
+                v.list = items; v.map = idx;
+                return v;
+            }
+            case 3: return c.tmpl;
+            case 4: {
+                auto sp = c.target.lock();
+                if (!sp) return VMVal::make_none();
+                VMVal v; v.type = VMType::MAP; v.map = sp; v.class_name = c.cls;
+                return v;
+            }
+            default: {
+                auto sp = c.target.lock();
+                if (!sp) return VMVal::make_none();
+                return VMVal::make_instance(c.cls, sp);
+            }
+        }
+    }
     static VMVal weak_value(const std::shared_ptr<WeakCell>& cell) {
-        return VMVal::make_native([cell](std::vector<VMVal>&) -> VMVal {
-            auto sp = cell->target.lock();
-            if (!sp) return VMVal::make_none();
-            return VMVal::make_instance(cell->cls, sp);
-        });
+        return VMVal::make_native([cell](std::vector<VMVal>&) -> VMVal { return weak_target_value(*cell); });
     }
     // At a safe point (vmgc::safe_point_slow): the callbacks of dead targets.
     void gc_run_weak_callbacks() {
+        // references to sets whose set died (round 78)
+        if (!weak_polled().empty()) {
+            auto& pl = weak_polled();
+            std::vector<std::shared_ptr<WeakCell>> keep, due;
+            for (auto& c : pl) {
+                if (c.use_count() == 1 || c->callback.type == VMType::NONE) continue;   // the reference died first
+                if (c->alive()) keep.push_back(c); else due.push_back(c);
+            }
+            pl.swap(keep);
+            if (!due.empty()) {
+                std::lock_guard<std::mutex> lk(weak_queue_mutex());
+                for (auto& d : due) weak_queue().push_back(d);
+            }
+        }
         for (;;) {
             std::vector<std::shared_ptr<WeakCell>> q;
             {
@@ -3191,6 +3282,7 @@ public:
             vmgc::safe_point(*this);
             long n = vmgc::collect(*this, g);
             vmgc::safe_point(*this);
+            if (!weak_polled().empty()) gc_run_weak_callbacks();   // references to sets (round 78)
             // Values the builtin bridge made on the interpreter's heap.
             if (nygc::tracked_objects() > 0) nygc::collect(g);
             return I(n);
@@ -3205,16 +3297,40 @@ public:
                 auto it = kw.map->find("callback");
                 if (it != kw.map->end()) { if (a.size() < 2) a.push_back(it->second); }
             }
-            if (a.empty() || a[0].type != VMType::INSTANCE || !a[0].map)
+            // Round 78: functions, bound methods, sets, frozensets and
+            // classes too, as in Python (classes live as long as the
+            // program: the reference holds one); not an int, str, list,
+            // tuple, dict or bytes.
+            const VMVal* o = a.empty() ? nullptr : &a[0];
+            bool cb = a.size() >= 2 && a[1].type != VMType::NONE;
+            auto cell = std::make_shared<WeakCell>();
+            if (cb) cell->callback = a[1];
+            if (o && o->type == VMType::INSTANCE && o->map) {
+                cell->target = o->map;
+                cell->cls = o->class_name;
+                if (cb) weak_notifier_of(o->map)->cells.push_back(cell);
+            } else if (o && o->type == VMType::FUNCTION && o->iter) {
+                track_fn_cell(*o);
+                cell->kind = 1;
+                cell->tmpl = *o; cell->tmpl.iter.reset(); cell->tmpl.closure_env.reset(); cell->tmpl.list.reset();
+                cell->fn_id = o->iter; cell->fn_env = o->closure_env; cell->fn_defaults = o->list;
+                if (cb) fn_notifier_of(o->iter)->cells.push_back(cell);
+            } else if (o && o->type == VMType::MAP && o->class_name == "__bound_method__" && o->map) {
+                cell->kind = 4;
+                cell->target = o->map;
+                cell->cls = o->class_name;
+                if (cb) weak_notifier_of(o->map)->cells.push_back(cell);
+            } else if (o && o->is_set() && o->list) {
+                cell->kind = 2;
+                cell->tmpl = *o; cell->tmpl.list.reset(); cell->tmpl.map.reset();
+                cell->set_items = o->list; cell->target = o->map;
+                if (cb) weak_polled().push_back(cell);
+            } else if (o && (o->type == VMType::CLASS || o->type == VMType::FUNCTION)) {
+                cell->kind = 3;            // a class (or a function made without an identity)
+                cell->tmpl = *o;
+            } else
                 throw_exception(make_exception("TypeError", {VMVal::make_str("cannot create weak reference to '"
                     + (a.empty() ? std::string("NoneType") : vm_type_name(a[0])) + "' object")}));
-            auto cell = std::make_shared<WeakCell>();
-            cell->target = a[0].map;
-            cell->cls = a[0].class_name;
-            if (a.size() >= 2 && a[1].type != VMType::NONE) {
-                cell->callback = a[1];
-                weak_notifier_of(a[0].map)->cells.push_back(cell);
-            }
             return weak_value(cell);
         });
         globals_["gc_enable"] = VMVal::make_native([](std::vector<VMVal>&) -> VMVal { vmgc::set_enabled(true); return VMVal::make_none(); });
@@ -3719,8 +3835,8 @@ private:
         VMVal result=VMVal::make_none();
         try { result=run_frame(); }
         catch(VMReturn& r){ result=r.value; }
-        catch(...){ call_stack_.pop_back(); throw; }
-        call_stack_.pop_back();
+        catch(...){ pop_frame(); throw; }
+        pop_frame();
         return result;
     }
     // Binds positional arguments `pos` and keyword arguments `kw` (a MAP, or
@@ -3818,8 +3934,8 @@ private:
         VMVal result=VMVal::make_none();
         try { result=run_frame(); }
         catch(VMReturn& r){ result=r.value; }
-        catch(...){ call_stack_.pop_back(); if(stack_.size()>_stack_base) stack_.resize(_stack_base); throw; }
-        call_stack_.pop_back();
+        catch(...){ pop_frame(); if(stack_.size()>_stack_base) stack_.resize(_stack_base); throw; }
+        pop_frame();
         if(stack_.size()>_stack_base) stack_.resize(_stack_base);
         return result;
     }
@@ -3888,6 +4004,7 @@ private:
         fr.closure_env=gs.closure;
         fr.own_env=gs.own_env;
         fr.gen_state=gs.shared_from_this();
+        fr.fobj=gs.fobj;   // round 78
         call_stack_.push_back(std::move(fr));
         gs.mode=mode; gs.running=true; gs.yielded=false;
         bool at_yield=gs.at_yield;
@@ -3922,19 +4039,20 @@ private:
         gs.running=false;
         if(gs.yielded){
             gs.yielded=false;
+            gen_frame_pause(gs);             // its frame object (round 78)
             call_stack_.pop_back();          // the yield saved its stack and locals
             out=std::move(r);
             return true;
         }
         if(stack_.size()>gs.stack_base) stack_.resize(gs.stack_base);
-        call_stack_.pop_back();
+        pop_frame();
         gs.retval=std::move(r);
         gen_finish(gs);
         return false;
     }
     // An exception is leaving the generator's frame.
     void gen_unwind(GenState& gs) {
-        if(!call_stack_.empty()) call_stack_.pop_back();
+        if(!call_stack_.empty()) pop_frame();
         if(stack_.size()>gs.stack_base) stack_.resize(gs.stack_base);
         gen_finish(gs);
     }
@@ -3942,6 +4060,7 @@ private:
         gs.done=true; gs.running=false; gs.at_yield=false; gs.in_yield_from=false;
         gs.locals.clear(); gs.saved_stack.clear(); gs.native=nullptr;
         gs.sent=VMVal::make_none(); gs.pending=VMVal::make_none();
+        gs.fobj.reset();   // round 78
         if(gs.serial){ gen_live_.erase(gs.serial); gs.serial=0; }
     }
     // The value of the next yield, or none once it is exhausted (gv.gen->done).
@@ -4021,6 +4140,37 @@ private:
         }
         if(attr=="gi_frame"){
             if(gs.done||!gs.code){ out=VMVal::make_none(); return true; }
+            // A generator function's: its real frame object (round 78) -
+            // the running frame's, or the one it keeps while suspended,
+            // with the locals it paused at (its arguments before it starts).
+            if(!gs.is_genexpr){
+                if(gs.running)
+                    for(size_t i=call_stack_.size(); i-->0;)
+                        if(call_stack_[i].gen_state.get()==&gs){ out=frame_object(i); return true; }
+                if(!gs.fobj){
+                    int ln=gs.code->first_line;
+                    if(gs.started){
+                        size_t at=gs.in_yield_from?(size_t)gs.ip:(gs.ip>0?(size_t)gs.ip-1:0);
+                        if(at<gs.code->instructions.size()&&gs.code->instructions[at].line>0) ln=gs.code->instructions[at].line;
+                    }
+                    std::string md="__main__";
+                    if(gs.code->module_env){ auto it=gs.code->module_env->find("__name__"); if(it!=gs.code->module_env->end()&&it->second.type==VMType::STRING) md=it->second.s; }
+                    auto attrs=std::make_shared<VMMap>(); vmgc::track_map(attrs);
+                    (*attrs)["_ny_info"]=frame_info_of(gs.code, md);
+                    (*attrs)["_ny_line"]=VMVal::make_int(ln);
+                    (*attrs)["_ny_lasti"]=VMVal::make_int(gs.ip>0?(int64_t)(gs.ip-1)*2:0);
+                    (*attrs)["_ny_locals"]=locals_dict(gs.locals, gs.self_val, gs.closure, gs.own_env);
+                    gs.fobj=attrs;
+                } else if(gs.started){
+                    // where it is paused now
+                    size_t at=gs.in_yield_from?(size_t)gs.ip:(gs.ip>0?(size_t)gs.ip-1:0);
+                    if(at<gs.code->instructions.size()&&gs.code->instructions[at].line>0)
+                        (*gs.fobj)["_ny_line"]=VMVal::make_int(gs.code->instructions[at].line);
+                    (*gs.fobj)["_ny_locals"]=locals_dict(gs.locals, gs.self_val, gs.closure, gs.own_env);
+                }
+                out=VMVal::make_instance("_NyFrame", gs.fobj);
+                return true;
+            }
             int line=gs.code->first_line;
             if(gs.started){
                 // a paused yield: the instruction before ip; a paused yield
@@ -5186,9 +5336,9 @@ private:
         fr.locals=locals;
         call_stack_.push_back(std::move(fr));
         try { run_frame(); } catch(VMReturn&){}
-        catch(...){ call_stack_.pop_back(); if(stack_.size()>base) stack_.resize(base); throw; }
+        catch(...){ pop_frame(); if(stack_.size()>base) stack_.resize(base); throw; }
         locals=call_stack_.back().locals;
-        call_stack_.pop_back();
+        pop_frame();
         if(stack_.size()>base) stack_.resize(base);
     }
     VMVal vm_eval_exec(bool is_exec, std::vector<VMVal>& a) {
@@ -5346,27 +5496,19 @@ private:
     }
     std::unordered_set<std::string> base_global_names_;
     VMVal vm_globals_map() {
-        VMVal d=VMVal::make_map();
         if(VMMap* me=menv()){
-            for(auto& kv:*me) if(!reflect_hidden(kv.first)) (*d.map)[kv.first]=kv.second;
+            VMVal d=VMVal::make_map();
+            for(auto& kv:*me) if(!reflect_hidden(kv.first)) (*d.map)[nypy::key_of_str(kv.first)]=kv.second;
             return d;
         }
-        for(auto& kv:globals_){
-            if(reflect_hidden(kv.first)||base_global_names_.count(kv.first)) continue;
-            (*d.map)[kv.first]=kv.second;
-        }
-        if(!call_stack_.empty())
-            for(auto& kv:call_stack_.front().locals) if(!reflect_hidden(kv.first)) (*d.map)[kv.first]=kv.second;
-        return d;
+        return main_globals_map();   // round 78 (with __name__ and __file__)
     }
     VMVal vm_locals_map() {
         if(call_stack_.size()<=1||!call_stack_.back().code||call_stack_.back().code->module_top) return vm_globals_map();
         auto& fr=call_stack_.back();
-        VMVal d=VMVal::make_map();
-        for(auto& kv:fr.locals) if(!reflect_hidden(kv.first)) (*d.map)[kv.first]=kv.second;
-        if(fr.own_env&&fr.closure_env)
-            for(auto& kv:*fr.closure_env) if(!reflect_hidden(kv.first)&&fr.locals.count(kv.first)) (*d.map)[kv.first]=kv.second;
-        return d;
+        // a method's `self` too (round 78), as the interpreter and Python
+        // list it - and as the frame's f_locals give it
+        return locals_dict(fr.locals, fr.self_val, fr.closure_env, fr.own_env);
     }
     static bool is_module_ns(const VMVal& v) {
         return v.type==VMType::MAP&&v.map&&!v.class_name.empty()&&v.class_name!="__kwargs__";
@@ -6659,6 +6801,11 @@ private:
                 std::vector<VMVal> defs(n_defs);
                 for(int i=n_defs-1;i>=0;i--) defs[i]=pop();
                 auto fn_val = VMVal::make_func(fr.code->sub_codes[fn_idx]);
+                // Its identity (round 78): a function value is otherwise its
+                // code, closure and defaults, which other functions share; a
+                // weak reference to it watches this cell, which every copy of
+                // the value holds and which goes with the last of them.
+                fn_val.iter = std::make_shared<std::pair<int,std::vector<VMVal>>>();
                 if(n_defs>0 && fn_val.code){
                     auto& fc=*fn_val.code;
                     auto d=std::make_shared<std::vector<VMVal>>(fc.param_defaults);
@@ -7324,6 +7471,7 @@ private:
         (*attrs)["tb_next"]=next;
         (*attrs)["tb_lineno"]=VMVal::make_int(frame_line(f));
         (*attrs)["_ny_loc"]=VMVal::make_str(f.code->file+'\x1f'+f.code->name+'\x1f'+frame_module(f));
+        (*attrs)["_ny_frame"]=frame_object(call_stack_.size()-1, false);   // the frame itself (round 78)
         (*ev.map)["__traceback__"]=VMVal::make_instance("_NyTraceback", attrs);
     }
     // e.__context__ = c, as Python sets it when e is raised while c is being
@@ -7351,6 +7499,201 @@ private:
                                              VMVal::make_str(f.code->name), VMVal::make_str(frame_module(f))}));
         }
         return VMVal::make_list(std::move(out));
+    }
+
+    // ── Frame objects (round 78; the interpreter's NythonExecutor::frameObject)
+    // A Python frame object - a prelude _NyFrame whose fields are set here,
+    // no __init__ run - is made for a running frame only when a program
+    // asks for one: sys._getframe() / inspect.currentframe()
+    // (_ny_frame_get), a traceback entry (tb_here), a generator's gi_frame.
+    // The frame keeps its fields (CallFrame::fobj), so the same object comes
+    // back each time. While the call runs, f_lineno and f_locals are read
+    // from the frame (_ny_frame_sync: the locals as locals() gives them, a
+    // new dict each read) and f_back is the caller's frame (_ny_frame_back).
+    // When the call ends (pop_frame), a frame object referenced elsewhere
+    // keeps its last line and locals and its caller's frame object; one
+    // nobody else holds just goes. A call nobody asks about pays one pointer
+    // test when it ends.
+    bool frame_visible(size_t i) const {
+        const CallFrame& f=call_stack_[i];
+        return f.code && f.code->file!="stdin" && !f.code->file.empty();
+    }
+    static bool frame_is_module(const CallFrame& f) {
+        return !f.code || f.code->module_top || f.code->name=="<module>";
+    }
+    // A function frame's locals as locals() gives them (`self` first, as
+    // Python lists it).
+    VMVal locals_dict(const VMMap& locals, const std::optional<VMVal>& self_val, const std::shared_ptr<VMMap>& env, bool own_env) {
+        VMVal d=VMVal::make_map();
+        if(self_val && !locals.count("self")) (*d.map)["self"]=*self_val;
+        // keyed as dict keys are (a dunder name is not a plain key: round 78)
+        for(auto& kv:locals) if(!reflect_hidden(kv.first)) (*d.map)[nypy::key_of_str(kv.first)]=kv.second;
+        if(own_env&&env)
+            for(auto& kv:*env) if(!reflect_hidden(kv.first)&&locals.count(kv.first)) (*d.map)[nypy::key_of_str(kv.first)]=kv.second;
+        return d;
+    }
+    // A frame's module's names (a copy, as globals() is here).
+    VMVal frame_globals_of(const CallFrame& f) {
+        if(f.code&&f.code->module_env){
+            VMVal d=VMVal::make_map();
+            for(auto& kv:*f.code->module_env) if(!reflect_hidden(kv.first)) (*d.map)[nypy::key_of_str(kv.first)]=kv.second;
+            return d;
+        }
+        return main_globals_map();
+    }
+    VMVal main_globals_map() {
+        VMVal d=VMVal::make_map();
+        for(auto& kv:globals_){
+            // the module's __name__ and __file__ are its own (round 78:
+            // globals() had neither)
+            if(reflect_hidden(kv.first)||(base_global_names_.count(kv.first)&&kv.first!="__name__"&&kv.first!="__file__")) continue;
+            (*d.map)[nypy::key_of_str(kv.first)]=kv.second;
+        }
+        CallFrame* mf=in_other_thread()?module_frame_:(call_stack_.empty()?nullptr:&call_stack_.front());
+        if(mf) for(auto& kv:mf->locals) if(!reflect_hidden(kv.first)) (*d.map)[nypy::key_of_str(kv.first)]=kv.second;
+        return d;
+    }
+    VMVal frame_locals_of(const CallFrame& f) {
+        if(frame_is_module(f)) return frame_globals_of(f);
+        return locals_dict(f.locals, f.self_val, f.closure_env, f.own_env);
+    }
+    // The frame's code as _ny_fn_info gives a function's; a module's top
+    // level is "<module>".
+    // made once per code object (round 78)
+    std::unordered_map<const VMCode*, std::pair<std::weak_ptr<VMCode>, VMVal>> frame_info_memo_;
+    VMVal frame_info_of(const std::shared_ptr<VMCode>& code, const std::string& module) {
+        if(code && code->name!="<module>" && !code->module_top){
+            auto it=frame_info_memo_.find(code.get());
+            if(it!=frame_info_memo_.end() && it->second.first.lock()==code && !code->qualname_set) return it->second.second;
+            VMVal fv; fv.type=VMType::FUNCTION; fv.code=code;
+            VMVal info=fn_info(fv);
+            if(info.type!=VMType::NONE){ frame_info_memo_[code.get()]={code, info}; return info; }
+        }
+        auto S=[](const std::string& x){ return VMVal::make_str(x); };
+        return VMVal::make_list({S("<module>"),S("<module>"),S(module),VMVal::make_list({}),VMVal::make_int(0),
+                                 S(code?code->file:std::string("<unknown>")),VMVal::make_int(1)});
+    }
+    void frame_store(VMMap& a, const CallFrame& f, bool with_locals=true) {
+        int line=frame_line(f);
+        a["_ny_line"]=VMVal::make_int(line);
+        a["_ny_lasti"]=VMVal::make_int(f.ip>0?(int64_t)(f.ip-1)*2:0);
+        if(with_locals) a["_ny_locals"]=frame_locals_of(f);
+    }
+    // The frame object of call_stack_[idx] (made now if it has none). Its
+    // locals are copied when they are read (the frame runs) or when the frame
+    // ends, not now - a traceback's frames cost no copy until then.
+    VMVal frame_object(size_t idx, bool with_locals=false) {
+        if(call_stack_[idx].fobj) return VMVal::make_instance("_NyFrame", call_stack_[idx].fobj);
+        auto attrs=std::make_shared<VMMap>(); vmgc::track_map(attrs);
+        (*attrs)["_ny_info"]=frame_info_of(call_stack_[idx].code, frame_module(call_stack_[idx]));
+        frame_store(*attrs, call_stack_[idx], with_locals);
+        call_stack_[idx].fobj=attrs;
+        return VMVal::make_instance("_NyFrame", attrs);
+    }
+    bool frame_find(const VMVal& fo, size_t& idx) {
+        if(fo.type!=VMType::INSTANCE||!fo.map) return false;
+        for(size_t i=call_stack_.size(); i-->0;)
+            if(call_stack_[i].fobj.get()==fo.map.get()){ idx=i; return true; }
+        return false;
+    }
+    bool frame_caller(size_t idx, size_t& out) {
+        for(size_t j=idx; j-->0;) if(frame_visible(j)){ out=j; return true; }
+        return false;
+    }
+    // _ny_frame_get(depth): sys._getframe(depth) - 0 is the innermost
+    // visible frame (the caller of the prelude's sys._getframe).
+    VMVal frame_get(std::vector<VMVal>& a) {
+        int64_t depth=0;
+        if(!a.empty()&&a[0].type==VMType::INT) depth=a[0].i;
+        else if(!a.empty()&&a[0].type==VMType::BOOL) depth=a[0].b?1:0;
+        if(depth<0) depth=0;
+        int64_t seen=0;
+        for(size_t i=call_stack_.size(); i-->0;){
+            if(!frame_visible(i)) continue;
+            if(seen++==depth) return frame_object(i);
+        }
+        throw_exception(make_exception("ValueError",{VMVal::make_str("call stack is not deep enough")}));
+        return VMVal::make_none();
+    }
+    // _ny_frame_sync(f): whether f's call is running on this thread; if so
+    // its f_lineno / f_locals are refreshed from it.
+    VMVal frame_sync(const VMVal& fo) {
+        size_t idx;
+        if(!frame_find(fo, idx)) return VMVal::make_bool(false);
+        frame_store(*fo.map, call_stack_[idx]);
+        return VMVal::make_bool(true);
+    }
+    // _ny_frame_back(f): the caller's frame while f runs, the one it had
+    // when it ended afterwards.
+    VMVal frame_back(const VMVal& fo) {
+        size_t idx, c;
+        if(frame_find(fo, idx)) return frame_caller(idx, c) ? frame_object(c) : VMVal::make_none();
+        if(fo.type==VMType::INSTANCE&&fo.map){
+            auto it=fo.map->find("_ny_back");
+            if(it!=fo.map->end()&&it->second.type==VMType::INSTANCE) return it->second;
+        }
+        return VMVal::make_none();
+    }
+    // _ny_frame_globals(f): f.f_globals.
+    VMVal frame_globals(const VMVal& fo) {
+        size_t idx;
+        if(frame_find(fo, idx)) return frame_globals_of(call_stack_[idx]);
+        std::string mod="__main__";
+        if(fo.type==VMType::INSTANCE&&fo.map){
+            auto it=fo.map->find("_ny_info");
+            if(it!=fo.map->end()&&it->second.type==VMType::LIST&&it->second.list&&it->second.list->size()>2
+               &&(*it->second.list)[2].type==VMType::STRING) mod=(*it->second.list)[2].s;
+        }
+        if(mod!="__main__"){
+            auto mi=module_ns_.find(mod);
+            if(mi!=module_ns_.end()&&mi->second.type==VMType::MAP&&mi->second.map){
+                VMVal d=VMVal::make_map();
+                for(auto& kv:*mi->second.map) if(!reflect_hidden(kv.first)) (*d.map)[nypy::key_of_str(kv.first)]=kv.second;
+                return d;
+            }
+        }
+        return main_globals_map();
+    }
+    // _ny_builtins_dict(): f.f_builtins - the builtins every program
+    // starts with (the prelude's private names left out).
+    VMVal builtins_dict() {
+        std::vector<std::string> names(base_global_names_.begin(), base_global_names_.end());
+        std::sort(names.begin(), names.end());
+        VMVal d=VMVal::make_map();
+        for(auto& n:names){
+            if(n.rfind("_ny",0)==0||n.rfind("_Ny",0)==0||reflect_hidden(n)) continue;
+            auto it=globals_.find(n);
+            if(it!=globals_.end()) (*d.map)[nypy::key_of_str(n)]=it->second;
+        }
+        return d;
+    }
+    // A frame ends: one with a frame object referenced elsewhere leaves it
+    // its last line and locals and its caller's frame object.
+    void pop_frame() {
+        CallFrame& f=call_stack_.back();
+        if(f.fobj){
+            std::shared_ptr<VMMap> o=std::move(f.fobj);
+            f.fobj.reset();
+            if(o.use_count()>1){
+                frame_store(*o, f);
+                size_t c;
+                if(frame_caller(call_stack_.size()-1, c)) (*o)["_ny_back"]=frame_object(c);
+            }
+        }
+        call_stack_.pop_back();
+    }
+    // A generator's frame pauses at a yield (its locals are in gs now): it
+    // keeps the frame object, with the line and locals it paused at.
+    void gen_frame_pause(GenState& gs) {
+        CallFrame& f=call_stack_.back();
+        if(!f.fobj) return;
+        gs.fobj=std::move(f.fobj);
+        f.fobj.reset();
+        if(gs.fobj.use_count()>1){
+            (*gs.fobj)["_ny_line"]=VMVal::make_int(frame_line(f));
+            (*gs.fobj)["_ny_lasti"]=VMVal::make_int(f.ip>0?(int64_t)(f.ip-1)*2:0);
+            (*gs.fobj)["_ny_locals"]=locals_dict(gs.locals, gs.self_val, gs.closure, gs.own_env);
+        }
     }
 
     // ── Exceptions ───────────────────────────────────────────────────────
@@ -8157,6 +8500,7 @@ private:
             }
             default: break;
         }
+        if(k.type==VMType::FUNCTION) track_fn_cell(k);   // round 78: freed with the function
         const void* id=k.map?(const void*)k.map.get():k.code?(const void*)k.code.get():k.gen?(const void*)k.gen.get():(const void*)k.iter.get();
         char buf[40]; snprintf(buf,sizeof buf,"v%p",id);
         vm_key_objs()[buf]=k;
@@ -10934,16 +11278,13 @@ private:
         globals_["_ny_exc_current"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return vm_exc_current(); });
         // The running frames (round 77): sys._getframe, traceback.extract_stack, warnings.
         globals_["_ny_stack"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return vm_stack_value(); });
-        globals_["_ny_main_globals"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{
-            VMVal d=VMVal::make_map();
-            for(auto& kv:globals_){
-                if(reflect_hidden(kv.first)||base_global_names_.count(kv.first)) continue;
-                (*d.map)[kv.first]=kv.second;
-            }
-            CallFrame* mf=in_other_thread()?module_frame_:(call_stack_.empty()?nullptr:&call_stack_.front());
-            if(mf) for(auto& kv:mf->locals) if(!reflect_hidden(kv.first)) (*d.map)[kv.first]=kv.second;
-            return d;
-        });
+        // Frame objects (round 78; frame_object)
+        globals_["_ny_frame_get"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return frame_get(a); });
+        globals_["_ny_frame_sync"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return a.empty()?VMVal::make_bool(false):frame_sync(a[0]); });
+        globals_["_ny_frame_back"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return a.empty()?VMVal::make_none():frame_back(a[0]); });
+        globals_["_ny_frame_globals"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return a.empty()?main_globals_map():frame_globals(a[0]); });
+        globals_["_ny_builtins_dict"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return builtins_dict(); });
+        globals_["_ny_main_globals"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return main_globals_map(); });
         globals_["locals"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return vm_locals_map(); });
         globals_["vars"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_vars(a); });
         globals_["dir"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_dir(a); });
@@ -11049,7 +11390,9 @@ private:
                 if(!class_lookup(a[0].class_name,"__next__",nx))
                     throw_exception(make_exception("TypeError",{VMVal::make_str("'"+vm_type_name(a[0])+"' object is not an iterator")}));
                 try { return call_dunder(a[0],"__next__",{}); }
-                catch(VMException& e){ if(is_stop_iteration(e.value)) return exhausted(); throw; }
+                // the StopIteration __next__ raised goes on as it is, its
+                // value with it (round 78: a new one without the value)
+                catch(VMException& e){ if(is_stop_iteration(e.value)&&has_default) return a[1]; throw; }
             }
             // a list, str, int...: not an iterator (round 77; it returned none)
             if(a[0].type!=VMType::ITERATOR)

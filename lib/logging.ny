@@ -31,16 +31,14 @@
 # lineno, funcName, created, msecs, relativeCreated, thread, threadName,
 # processName, process, taskName, message, asctime.
 #
-# Differences from CPython (Nython has no frame objects):
-#   - pathname/filename/module/lineno/funcName are CPython's values for an
-#     unknown caller: "(unknown file)", "(unknown file)", "(unknown file)",
-#     0 and "(unknown function)"; stack_info=True records "Stack (most
-#     recent call last):" with no frames.
-#   - exc_info=True / exception() take the exception being handled from
-#     the runtime (_ny_exc_current, the equivalent of sys.exc_info()), and
-#     its text is "Traceback (most recent call last):" followed by the
-#     exception line ("ValueError: boom") - there are no frame lines.
-#   - captureWarnings() is accepted and does nothing (no warnings module).
+# The caller's pathname/filename/module/lineno/funcName come from the
+# engines' frames (findCaller walks sys._getframe() past this module's own
+# frames, stacklevel as CPython counts it); stack_info=True records
+# "Stack (most recent call last):" and the stack as traceback.print_stack
+# prints it; exc_info=True / exception() format the whole traceback as
+# traceback.print_exception does; captureWarnings() sends warnings to the
+# "py.warnings" logger (round 78 - before, Nython had no frames and no
+# warnings module).
 
 import os
 import sys
@@ -67,6 +65,20 @@ _startTime = time_ns()
 # raiseExceptions is used to see if exceptions during handling should be
 # propagated
 raiseExceptions = true
+
+# The caller's frame, and whether a frame is this module's own (CPython's
+# currentframe / _srcfile / _is_internal_frame; round 78: real frames)
+currentframe = lambda: sys._getframe(1)
+
+
+def _normcase(p):
+    return os.path.normcase(p) if hasattr(os.path, "normcase") else p
+
+
+def _is_internal_frame(frame):
+    """Signal whether the frame is a CPython or logging module internal."""
+    var filename = _normcase(frame.f_code.co_filename)
+    return filename == _srcfile or ("importlib" in filename and "_bootstrap" in filename)
 
 # If you don't want threading information in the log, set this to False
 logThreads = true
@@ -150,6 +162,10 @@ def addLevelName(level, levelName):
         _nameToLevel[levelName] = level
     finally:
         _releaseLock()
+
+
+# this file, whose frames findCaller skips
+_srcfile = _normcase(addLevelName.__code__.co_filename)
 
 
 def _checkLevel(level):
@@ -613,7 +629,14 @@ class Formatter:
         """
         Format and return the specified exception information as a string.
         """
-        var s = _exception_text(ei)
+        # the whole traceback, as traceback.print_exception lays it out
+        # (round 78: the engines' tracebacks have their frames)
+        var s = ""
+        if ei and len(ei) > 1 and ei[1] is not none:
+            import traceback
+            s = "".join(traceback.format_exception(ei[0], ei[1], ei[2] if len(ei) > 2 else none))
+        else:
+            s = _exception_text(ei)
         if s[-1:] == "\n":
             s = s[:-1]
         return s
@@ -1510,13 +1533,27 @@ class Logger(Filterer):
     def findCaller(self, stack_info=false, stacklevel=1):
         """
         Find the stack frame of the caller so that we can note the source
-        file name, line number and function name. Nython keeps no frames:
-        CPython's values for an unknown caller.
+        file name, line number and function name.
         """
+        # CPython 3.12's, over the engines' frames (round 78)
+        var f = currentframe()
+        if f is none:
+            return ("(unknown file)", 0, "(unknown function)", none)
+        while stacklevel > 0:
+            var next_f = f.f_back
+            if next_f is none:
+                break
+            f = next_f
+            if not _is_internal_frame(f):
+                stacklevel = stacklevel - 1
+        var co = f.f_code
         var sinfo = none
         if stack_info:
-            sinfo = "Stack (most recent call last):"
-        return ("(unknown file)", 0, "(unknown function)", sinfo)
+            import traceback
+            sinfo = "Stack (most recent call last):\n" + "".join(traceback.format_stack(f))
+            if sinfo[-1] == "\n":
+                sinfo = sinfo[:-1]
+        return (co.co_filename, f.f_lineno, co.co_name, sinfo)
 
     def makeRecord(self, name, level, fn, lno, msg, args, exc_info,
                    func=none, extra=none, sinfo=none):
@@ -1542,13 +1579,9 @@ class Logger(Filterer):
         var fc = self.findCaller(stack_info, stacklevel)
         if exc_info:
             if isinstance(exc_info, BaseException):
-                exc_info = (type(exc_info), exc_info, none)
+                exc_info = (type(exc_info), exc_info, exc_info.__traceback__)
             elif not isinstance(exc_info, tuple):
-                var e = _ny_exc_current()
-                if e is none:
-                    exc_info = (none, none, none)
-                else:
-                    exc_info = (type(e), e, none)
+                exc_info = sys.exc_info()
         var record = self.makeRecord(self.name, level, fc[0], fc[1], msg, args,
                                      exc_info, fc[2], extra, fc[3])
         self.handle(record)
@@ -2072,11 +2105,44 @@ class NullHandler(Handler):
         pass
 
 
+_warnings_showwarning = none
+
+
+def _showwarning(message, category, filename, lineno, file=none, line=none):
+    """
+    Implementation of showwarnings which redirects to logging, which will first
+    check to see if the file parameter is None. If a file is specified, it will
+    delegate to the original warnings implementation of showwarning. Otherwise,
+    it will call warnings.formatwarning and will log the resulting string to a
+    warnings logger named "py.warnings" with level logging.WARNING.
+    """
+    import warnings
+    if file is not none:
+        if _warnings_showwarning is not none:
+            _warnings_showwarning(message, category, filename, lineno, file, line)
+    else:
+        var s = warnings.formatwarning(message, category, filename, lineno, line)
+        var logger = getLogger("py.warnings")
+        if not logger.handlers:
+            logger.addHandler(NullHandler())
+        # bpo-46557: Log str(s) as msg instead of logger.warning("%s", s)
+        # since some log aggregation tools group logs by the msg arg
+        logger.warning(str(s))
+
+
 def captureWarnings(capture):
     """
     If capture is true, redirect all warnings to the logging package.
     If capture is False, ensure that warnings are not redirected to logging
-    but to their original destinations. (Nython has no warnings module:
-    nothing to redirect.)
+    but to their original destinations.
     """
-    pass
+    global _warnings_showwarning
+    import warnings
+    if capture:
+        if _warnings_showwarning is none:
+            _warnings_showwarning = warnings.showwarning
+            warnings.showwarning = _showwarning
+    else:
+        if _warnings_showwarning is not none:
+            warnings.showwarning = _warnings_showwarning
+            _warnings_showwarning = none
