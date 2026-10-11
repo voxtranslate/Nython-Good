@@ -79,6 +79,14 @@ def err(f):
         return type(e).__name__ + ": " + str(e)
 
 
+def _import_pwd():
+    import pwd
+
+
+def _import_grp():
+    import grp
+
+
 # ── what the child processes run (module level: found by name) ──────────────
 def w_put(wq, wn):
     wq.put((wn, wn * wn, multiprocessing.current_process().name))
@@ -638,7 +646,8 @@ if __name__ == "__main__":
 
     # ── ids, ownership, devices, the rest ────────────────────────────────────
     check("misc", [os.cpu_count() >= 1, len(os.urandom(16)), type(os.urandom(4)).__name__, os.strerror(2),
-                   os.getpid() > 0, os.getppid() > 0, os.path.exists(os.devnull)],
+                   # (under Wine a program started from Linux has no Windows parent: 0)
+                   os.getpid() > 0, os.getppid() > 0 if POSIX else os.getppid() >= 0, os.path.exists(os.devnull)],
           [True, 16, "bytes", "No such file or directory", True, True, True])
     os.environ["R80_LIVE"] = "1"
     live = [os.getenv("R80_LIVE"), "R80_LIVE" in os.environ, os.environ.get("R80_LIVE")]
@@ -722,7 +731,7 @@ if __name__ == "__main__":
         check("tarfile extracts a FIFO", [open(os.path.join(OUT, "f1.txt")).read(), stat.S_ISFIFO(os.lstat(os.path.join(OUT, "pipe")).st_mode)],
               ["hello", True])
     else:
-        check("pwd / grp are POSIX only", [err(lambda: __import__("pwd")).split(":")[0], err(lambda: __import__("grp")).split(":")[0]],
+        check("pwd / grp are POSIX only", [err(_import_pwd).split(":")[0], err(_import_grp).split(":")[0]],
               ["ModuleNotFoundError", "ModuleNotFoundError"])
 
     # ── codecs: every codec with every error handler ─────────────────────────

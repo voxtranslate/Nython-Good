@@ -3664,7 +3664,12 @@ public:
     // `import os`: os.getcwd(), os.path.join(), ... over the interpreter's
     // os_* builtins (include/NyRuntime.hpp module_members), plus the
     // constants and a snapshot of os.environ - as on the interpreter.
+    // One os module per program (round 80), as the interpreter's
+    // os_ns_cache_: every `import os` binds the same namespace (CPython's
+    // sys.modules["os"]), named "os" whatever it is imported as.
+    VMVal os_ns_;
     VMVal define_os_module(const std::string& as_name, bool bind=true) {   // bind=false: just made (round 77)
+        if(os_ns_.type==VMType::MAP&&os_ns_.map){ if(bind) globals_[as_name]=os_ns_; return os_ns_; }
         load_mirror("os");   // the rest of Python's os, in Nython (round 80, NyPrelude.hpp "#@ os")
         std::vector<std::string> names;
         if(bridge_names()) names=bridge_names()();
@@ -3708,7 +3713,8 @@ public:
         }
         path.class_name="path";
         (*ns.map)["path"]=path;
-        ns.class_name=as_name;
+        ns.class_name="os";   // (round 80: it was as_name)
+        os_ns_=ns;
         if(bind) globals_[as_name]=ns;
         return ns;
     }

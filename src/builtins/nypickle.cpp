@@ -162,13 +162,16 @@ struct FastPickler {
             if (items.size() == 1) {
                 save(items[0].first); save(items[0].second); out += 's';
             } else if (!items.empty()) {
-                size_t i = 0;
-                while (i < items.size()) {
+                // _pickle.c's batch_dict_exact: a full batch is followed by
+                // another MARK ... SETITEMS, an empty one when the size is a
+                // multiple of 1000 (lists stop at the last item)
+                size_t i = 0, b;
+                do {
                     out += '(';
-                    size_t b = 0;
+                    b = 0;
                     for (; i < items.size() && b < 1000; i++, b++) { save(items[i].first); save(items[i].second); }
                     out += 'u';
-                }
+                } while (b == 1000);
             }
             depth--;
             return;

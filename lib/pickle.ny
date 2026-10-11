@@ -434,6 +434,11 @@ def _import(module):
         return copyreg
     if module == "_codecs" or module == "codecs":
         return "_codecs"
+    if module == "posix" or module == "nt" or module == "os":
+        # CPython's os functions are posix's / nt's (round 80); imported
+        # here, as the VM's exec("import os", ns) binds no name in ns
+        import os
+        return os
     var m = _module_cache.get(module)
     if m is not none:
         return m
@@ -489,6 +494,18 @@ def _whichmodule(obj, name):
     return "__main__"
 
 
+def _os_function_name(obj):
+    # The name os gives a builtin function (os.getpid is the builtin
+    # os_getpid): CPython pickles it as posix.getpid / nt.getpid (round 80)
+    import os
+    for k in dir(os):
+        if k.startswith("_") or k == "path":
+            continue
+        if getattr(os, k, none) is obj:
+            return k
+    return none
+
+
 def _global_name(obj):
     # (module, qualified name) of a class or function, builtins included
     if obj is _codecs_encode:
@@ -504,6 +521,11 @@ def _global_name(obj):
     var module = _whichmodule(obj, name)
     if module == "builtins" or module == "__builtin__":
         module = "builtins"
+        if type(obj).__name__ == "builtin_function_or_method" and (name.startswith("os_") or name not in _BUILTINS):
+            var osname = _os_function_name(obj)
+            if osname is not none:
+                import os
+                return ("nt" if os.name == "nt" else "posix"), osname
     elif module == "__mp_main__":
         # what a spawned child's main program defines is __main__'s too
         module = "__main__"

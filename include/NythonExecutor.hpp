@@ -1295,7 +1295,14 @@ public:   // NythonExecutor is a struct: members default to public
     // `import os`: a namespace over the os_* builtins (os.getcwd,
     // os.path.join, ...) plus os.sep/pathsep/linesep/name and a snapshot of
     // os.environ. The flat os_* names stay registered as well.
+    // One os module per program (round 80): every `import os` binds this
+    // namespace, as CPython's sys.modules["os"]. One made per import was
+    // freed when a function's local `import os` went, and its address,
+    // still in namespace_objs_, made the next dict made there a "module"
+    // (pickle's **kwargs); it also rebuilt ~300 members per import.
+    Value os_ns_cache_ = NONE_VALUE;
     Value makeOsNamespace() {
+        if (os_ns_cache_.type != ValueType::NONE) return os_ns_cache_;
         ensureMirror("os");   // the rest of Python's os, in Nython (round 80, NyPrelude.hpp "#@ os")
         std::vector<std::string> names;
         for (auto& kv : builtin_ptrs) names.push_back(kv.first);
@@ -1333,7 +1340,8 @@ public:   // NythonExecutor is a struct: members default to public
             }
         }
         ns->set("path", Value((Collectable*)path));
-        return Value((Collectable*)ns);
+        os_ns_cache_ = Value((Collectable*)ns);
+        return os_ns_cache_;
     }
 
     // The (str, value) pairs of a list of 2-tuples (round 80: _ny_os_members).

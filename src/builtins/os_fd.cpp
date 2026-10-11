@@ -50,8 +50,7 @@
 #  include <io.h>
 #  include <fcntl.h>
 #  include <sys/stat.h>
-#  include <dirent.h>
-#  include <windows.h>
+#  include <windows.h>      // (no <dirent.h>: platform_compat.hpp has its own)
 #endif
 
 using namespace nython;

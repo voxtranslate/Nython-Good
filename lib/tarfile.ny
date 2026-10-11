@@ -1625,12 +1625,18 @@ class TarFile:
                         u = pwd.getpwnam(tarinfo.uname)[2]
                 except KeyError:
                     pass
+            # a filter (data_filter) may have dropped the ids: -1 leaves them
+            if g is None:
+                g = -1
+            if u is None:
+                u = -1
             try:
                 if tarinfo.issym() and hasattr(os, "lchown"):
                     os.lchown(targetpath, u, g)
                 else:
                     os.chown(targetpath, u, g)
-            except OSError as e:
+            except (OSError, OverflowError) as e:
+                # OverflowError: an id that does not fit in id_t
                 raise ExtractError("could not change owner") from e
 
     def chmod(self, tarinfo, targetpath):

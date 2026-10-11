@@ -358,10 +358,34 @@ namespace {
 using nyos::raise;
 using nyos::raise_errno;
 
-bool path_stat(const std::string& p, struct stat& st) { return ::stat(p.c_str(), &st) == 0; }
+#ifdef _WIN32
+std::wstring widen_os(const std::string& s);
+// A character device the C runtime's stat does not see (os.devnull "nul",
+// "con", ...): CPython's os.stat gives it st_mode S_IFCHR, so
+// os.path.exists(os.devnull) is True there too (round 80).
+static bool win_char_device(const std::string& p, struct stat& st) {
+    if (p.empty()) return false;
+    HANDLE h = CreateFileW(widen_os(p).c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool chr = GetFileType(h) == FILE_TYPE_CHAR;
+    CloseHandle(h);
+    if (!chr) return false;
+    std::memset(&st, 0, sizeof st);
+    st.st_mode = _S_IFCHR;
+    return true;
+}
+#endif
+bool path_stat(const std::string& p, struct stat& st) {
+#ifdef _WIN32
+    return ::stat(p.c_str(), &st) == 0 || win_char_device(p, st);
+#else
+    return ::stat(p.c_str(), &st) == 0;
+#endif
+}
 bool path_lstat(const std::string& p, struct stat& st) {
 #ifdef _WIN32
-    return ::stat(p.c_str(), &st) == 0;
+    return ::stat(p.c_str(), &st) == 0 || win_char_device(p, st);
 #else
     return ::lstat(p.c_str(), &st) == 0;
 #endif
