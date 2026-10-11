@@ -153,15 +153,25 @@ def urlsplit(url, scheme="", allow_fragments=true):
         rest = rest[0:q]
     return _Result(["scheme", "netloc", "path", "query", "fragment"], (sch, netloc, rest, query, fragment))
 
+uses_params = ["", "ftp", "hdl", "prospero", "http", "imap", "https", "shttp", "rtsp", "rtspu",
+               "sip", "sips", "mms", "sftp", "tel"]
+
 def urlparse(url, scheme="", allow_fragments=true):
+    # round 79: ;params are split off only for the schemes in uses_params,
+    # at the first ';' after the last '/' (CPython's _splitparams) - a data:
+    # URL ("data:text/html;base64,...") keeps its whole path
     var s = urlsplit(url, scheme, allow_fragments)
     var path = s.path
     var params = ""
-    var semi = path.rfind(";")
-    var slash = path.rfind("/")
-    if semi >= 0 and semi > slash:
-        params = path[semi + 1:]
-        path = path[0:semi]
+    if s.scheme in uses_params and ";" in path:
+        var semi = -1
+        if "/" in path:
+            semi = path.find(";", path.rfind("/"))
+        else:
+            semi = path.find(";")
+        if semi >= 0:
+            params = path[semi + 1:]
+            path = path[0:semi]
     return _Result(["scheme", "netloc", "path", "params", "query", "fragment"], (s.scheme, s.netloc, path, params, s.query, s.fragment))
 
 def urlunsplit(parts):

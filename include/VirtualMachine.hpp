@@ -10702,8 +10702,10 @@ private:
         tag_module_code(code, env);
         code->module_top=true;
         // Registered before the module runs, so a circular import binds it.
-        auto nsmap=std::make_shared<VMMap>(); vmgc::track_map(nsmap);
-        VMVal nsv=VMVal::make_map(); nsv.map=nsmap; nsv.class_name=name;
+        // round 79: the namespace IS the module's globals map, so the module
+        // object stays live (a `global` rebinding inside it is what importers
+        // read, `mod.x = v` from outside is what its code sees), as Python's.
+        VMVal nsv=VMVal::make_map(); nsv.map=env; nsv.class_name=name;
         module_ns_[name]=nsv;
         bool old_exp=export_to_globals_; int old_depth=export_depth_;
         export_to_globals_=false; export_depth_=-1;
@@ -10712,7 +10714,6 @@ private:
         try{ exec_code(code,{},std::nullopt); }
         catch(VMReturn&){}
         catch(...){ module_ns_.erase(name); globals_.erase("__imported_"+name); throw; }
-        for(auto& kv:*env) (*nsmap)[kv.first]=kv.second;
         for(auto& sub:code->sub_codes) if(sub->is_class&&!class_reg_.count(sub->name)) class_reg_[sub->name]=sub;   // keep the class MAKE_CLASS made (a copy for metaclass= / expression bases), round 77
         return nsv;
     }

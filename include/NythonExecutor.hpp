@@ -10818,6 +10818,14 @@ public:
         Context* mctx = new Context(runner, module_name, nullptr, nullptr, module_base_ctx_ ? module_base_ctx_ : global_ctx);
         mctx->inModule = true;
         mctx->parentFilter = &module_filter_;
+        // round 79: the module's scope IS its namespace's map (as exec(src,
+        // ns) does), so the module object stays live: what its functions
+        // rebind with `global` is what importers read (mimetypes.inited,
+        // zoneinfo.TZPATH), and `mod.x = v` from outside is what they see.
+        delete mctx->container;
+        mctx->container = ns->container;
+        mctx->ns_owner = ns;
+        nygc::incref(ns);
         module_ctxs_.push_back(mctx);
         mctx->defineByName("__name__", makeStringValue(module_name));
         mctx->defineByName("__file__", makeStringValue(filepath));
@@ -10831,7 +10839,6 @@ public:
             catch (std::exception& e) { tbUnwind(excFromCpp(e.what())); module_ns_.erase(module_name); imported_modules_.erase(module_name); throw; }
         }
         for (auto& kv : func_names) if (!before.count(kv.first)) module_owned_.insert(kv.first);
-        for (auto& kv : *mctx->container) ns->set(kv.first, kv.second);
         return nsv;
     }
     Value importModule(const std::string& filepath, const std::string& module_name,
