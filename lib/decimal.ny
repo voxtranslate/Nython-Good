@@ -29,7 +29,7 @@
 # logical_and / or / xor / invert, conjugate, real/imag; str (scientific
 # notation per the spec), to_eng_string, repr, format() with every PEP 3101
 # spec Decimal takes (e E f F g G n %, fill, align, sign, z, #, 0, width,
-# "," and "_" grouping, precision); hash() equal to the hash of an equal int,
+# "," grouping, precision); hash() equal to the hash of an equal int,
 # float or Fraction (CPython's numeric hash); round(d) and round(d, n), int,
 # float, complex, bool, math.floor / ceil / trunc.
 #
@@ -54,7 +54,16 @@
 # Differences from CPython: it is Python code, so it is slower than the C
 # module (as _pydecimal is); the 'n' format uses the C locale's separators
 # (Nython has no locale module); an exception carries one condition in its
-# list (the C module lists every trapped condition one operation raised).
+# list (the C module lists every trapped condition one operation raised);
+# a context= argument that is not a Context is not refused (the C module
+# raises TypeError "optional argument must be a context"); a Decimal and
+# an equal float are two members of a set or two keys of a dict (Nython's
+# sets and dicts compare an object key with the object keys of its hash,
+# not with numbers - D("2.0") in {2} holds, {D("0.5"), 0.5} has two).
+#
+# Beyond the API: the per-task context comes from lib/contextvars.ny, so
+# asyncio tasks get CPython's isolation (PEP 567) on both engines.
+#
 # Copyright (c) 2004 Python Software Foundation.
 # All rights reserved.
 
