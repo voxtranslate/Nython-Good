@@ -1629,6 +1629,7 @@ public:   // NythonExecutor is a struct: members default to public
             if (args.size() == 3) step = idx(args[2]);
         }
         if (!isTruthy(step)) pyRaise("ValueError", "range() arg 3 must not be zero");
+        rv_made_ = true;
         Value inst = newInstance("range", range_node_);
         Context* p = instance_properties[inst.value.p];
         p->defineByName("start", start);
@@ -1653,9 +1654,21 @@ public:   // NythonExecutor is a struct: members default to public
     // d.keys() / d.values() / d.items(): a live view of d.
     Value makeView(const Value& dict, int kind) {
         Node* cn = view_nodes_[kind];
+        rv_made_ = true;
         Value inst = newInstance(static_cast<ClassNode*>(cn)->name, cn);
         instance_properties[inst.value.p]->defineByName(nyrt::view_field(), dict);
         return inst;
+    }
+    // Set once a range or a dict view object has been made: until then no
+    // builtin argument can be one (callBuiltin's rangeArgsToLists).
+    bool rv_made_ = false;
+    void rangeArgsToLists(std::vector<Value>& args) {
+        for (auto& a : args) {
+            if (a.type != ValueType::USERDATA || !a.value.p || string_ptrs_.count(a.value.p)) continue;
+            if (!isRangeValue(a) && viewOf(a, nullptr) < 0) continue;
+            std::vector<Value> items;
+            if (rangeOrViewItems(a, items)) a = makeListValue(items);
+        }
     }
     // The values a range of 64-bit ints or a dict view holds, natively;
     // false for anything else (round 78).
@@ -7893,6 +7906,9 @@ public:
         // to a builtin (round 77) - but not to the ones asking for its class,
         // dunders or identity, or storing it (nyrt::payload_transparent)
         if (any_payload_ && !args.empty()) unwrapBuiltinArgs(name_orig, args);
+        // a range or a dict view given to one of Nython's own flat natives is
+        // the list of its values, as before round 78 (nyrt::takes_range_objects)
+        if (rv_made_ && !args.empty() && !nyrt::takes_range_objects(name_orig)) rangeArgsToLists(args);
         if (!args.empty() && nyrt::takes_paths(name_orig)) fspathArgs(args, ctx);
         // islice/take, and iter/next/any/all/zip/map/filter/enumerate given a
         // generator: lazy (src/NyGen.cpp).

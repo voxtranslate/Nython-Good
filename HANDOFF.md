@@ -3,7 +3,8 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 77 — **§0p** (bytes; signals; sockets, TLS, HTTP,
+Last updated: round 78 — **§0q** (lazy `range`, live dict views, lazy
+zip/map/filter/enumerate/reversed; both engines). Round 77 — **§0p** (bytes; signals; sockets, TLS, HTTP,
 urllib, WebSockets and the network libraries made real; asyncio and the
 async protocols; modules with their own scope and packages; sets; the
 command line and argparse; per-execution classes, slices, eval/exec,
@@ -35,6 +36,111 @@ multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
 
 ---
+
+## 0q. Round 78 — lazy `range`, live dict views, lazy builtins (both engines)
+
+`range()` and `d.keys()/values()/items()` returned lists, and `zip`/`map`/
+`filter`/`enumerate`/`reversed` over lists returned lists (lazy only over
+generators): `range(10**12)` exhausted memory, `d.keys() & other` was
+impossible, `next(zip(a, b))` failed. They are Python's types now.
+`examples/vm_audit90.ny` (65 checks on both engines, 63 under python3 - two
+are Nython-only) pins them.
+
+### Where it lives
+- **The types are prelude classes** (`include/NyPrelude.hpp`): `range`
+  (CPython's `rangeobject.c`: lazy, ints of any size, `len` with
+  OverflowError past sys.maxsize, negative indices, slicing to a range, O(1)
+  `in` for ints and `==` iteration otherwise, `index`/`count` with CPython's
+  messages, `==`/`hash` by the sequence described, repr, read-only
+  `start`/`stop`/`step`, `bool`, `reversed`), `dict_keys`/`dict_items`
+  (sharing `_NyDictSetView`: `& | - ^` and reflected forms returning sets,
+  comparisons with sets and views, `isdisjoint`, `(k, v) in d.items()`,
+  unhashable), `dict_values` (identity `==`, hashable), `mappingproxy` (a
+  view's `.mapping`; `lib/types.ny`'s `MappingProxyType` is it now). The
+  methods are the general case - big ints, slices, set algebra.
+- **The engines make them natively and take native paths**
+  (`include/NyRange.hpp`, shared arithmetic in uint64 so `stop - start` of
+  two int64s cannot overflow): `range(...)` is intercepted in
+  `instantiateClass` / `instantiate` (`makeRange` / `make_range_val`: the
+  argument checks of CPython's `range_new`; the class has no `__init__`);
+  `d.keys()` makes the view holding the dict in the field `_ny_mapping`
+  (`makeView` / `make_view`). For a range of 64-bit ints and for views:
+  iteration, `len`, `in`, `r[i]`, `list()`/`tuple()`/`set()`/`sorted()`/
+  `min`/`max` (materialised natively), `sum(range)` in O(1) (the arithmetic
+  series, exact - `sum(range(10**9))` is instant: the allowed innovation).
+  A range past 64 bits takes the prelude's methods and iterates through
+  `_ny_longrange` (a generator: CPython's `longrange_iterator`).
+- **Iterators**: `range_iterator`, `dict_keyiterator`/`valueiterator`/
+  `itemiterator` and the `dict_reverse*` ones, `list_reverseiterator`,
+  `reversed` (interpreter: `nygen` cursors `RANGE`/`DICT`/`REVSEQ`; VM:
+  native generators). A dict iterator re-checks the dict's size each step:
+  "dictionary changed size during iteration", sticky as CPython's
+  (`GenState::sticky` on the VM). `NyOrderedMap` has `slot_end()`/
+  `slot_at(n)` for these walks (a slot number survives growth; a compaction
+  only follows an erase, which changes the size). `for k in d` is live too
+  now (it walked a snapshot).
+- **Loops make no object**: `for x in range(...)` and `for k, v in
+  d.items()` (keys/values; the receiver a name or `name.field`) are
+  recognised syntactically - the interpreter's `evalFor` counts or walks the
+  dict's slots in place (and binds `k, v` without making the pair), the VM
+  compiles them to the new `FOR_PREP` opcode, and `GET_ITER` directly
+  before `FOR_ITER` gives a range or dict an in-place iterator (an
+  `ITERATOR` with `b` set and no item vector: `stack_range_iter`/
+  `stack_dict_iter`, advanced by `FOR_ITER`, never visible to the program).
+  Anything else - `range` rebound, a receiver that is not a plain dict - is
+  called as written.
+- **Lazy builtins**: `zip`/`map`/`filter`/`enumerate` are lazy over every
+  iterable (`nygen::builtin`, the VM's `gen_lazy_builtin`), `zip(...,
+  strict=True)` with CPython's messages; `reversed()` follows Python's
+  protocol (`__reversed__`, else `__len__`+`__getitem__`, else "'set' object
+  is not reversible"); `len(zip(...))`/`zip(...)[0]` name the type.
+- **Kept for Nython programs**: `a..b` is still a list (the VM compiles it
+  to `_ny_range_list`, the interpreter's `evalRange` semantics, step -1
+  when b < a); `d.entries()` and the flat `keys(d)`/`values(d)`/`items(d)`
+  are lists; a range or a view given to one of Nython's own flat natives
+  (`random_sample`, `json_encode`, string and tensor functions...) arrives
+  as the list of its values (`nyrt::takes_range_objects` lists the builtins
+  that see the object: Python's and the protocol helpers; interpreter
+  `callBuiltin`, VM builtin bridge in `main.cpp`). The legacy `reduce`
+  accepts any iterable (`reduce(f, map(...))` gave none).
+- `collections.abc` registers `dict_keys`/`dict_items`/`dict_values`/
+  `mappingproxy`; the runtime type table (`nyrt::runtime_type`) knows the new
+  iterator names.
+
+### Measured breakage and the decision
+Making all of it Python's (no compatibility extension) broke 29 of the
+swept files, identically on both engines (58 of 403 runs): 23 legacy test
+suites that asserted the old results (`str(range(5)) == "[0, 1, 2, 3, 4]"`,
+`map(...) == [...]`, `len(enumerate(...))`, `enumerate(xs)[0]`,
+`range(1, 11).filter(...)`), and library code indexing a view (`ks =
+d.keys(); ks[i]` in nytorch's module/convnets/tensor, the IDE's inspector,
+workbench and debugger commands; `keys(d)` in stdlib/aiagent through the
+flat builtin). Every one was in this repository and a mechanical fix
+(`list(...)`), so the callers were migrated rather than adding an extension
+(`d.keys()[i]` on a view would make indexing loops quadratic and views look
+like sequences to duck-typing code; an index materialising a lazy zip would
+consume it). `reduce` over a lazy `map` and the flat natives given a range
+were real regressions and were fixed in the engines (above).
+
+### Speed (CPU seconds, interleaved runs of the round-77 and round-78 binaries)
+| bench | interp before | interp after | VM before | VM after |
+|---|---|---|---|---|
+| `for i in range(10**7): s += i` | 29.8 | 10.0 | 21.7 | 5.55 |
+| ... its peak RSS | 3,351 MB | 18.7 MB | 4,238 MB | 23.1 MB |
+| 300k × `for j in range(3)` | 2.05 | 1.15 | 1.60 | 0.74 |
+| 50k × (`for k, v in d.items()` + `for k in d.keys()`), 20 keys | 4.08 | 2.22 | 2.56 | 2.17 |
+| empty program | 0.04 | 0.05 | 0.10 | 0.08 |
+
+### Not done
+- A range's `vars()` lists start/stop/step (CPython: no `__dict__`);
+  `type(r).__mro__` of a keys/items view includes `_NyDictSetView`.
+- `object.__new__(range)` makes an empty range object (CPython refuses).
+- Iterating a bigint range gives a `generator` (`_ny_longrange`), not a
+  `longrange_iterator`.
+- On the interpreter a comprehension over a dict view (`[k for k in
+  d.items()]`) goes through a lazy iterator object (the VM's comprehensions
+  use GET_ITER/FOR_ITER and walk in place; a comprehension over `range(...)`
+  counts on both).
 
 ## 0p. Round 77 — bytes, the network stack, signals, modules, the CLI, Python compatibility
 
@@ -493,9 +599,9 @@ the rest of the statement and expression grammar beside them. Mostly
 - `lib/aiagent.ny` skips malformed stored cells: the shared store file
   `/tmp/nyx_final/nyx_memory.json` (test_all_libs) held cells with a None
   confidence, which is no longer comparable with a number.
-- Not done (vm_audit87): `range()` and `dict.keys()/values()/items()` are
-  lists; `zip`/`map`/`filter`/`enumerate` over lists return lists (Nython's
-  design; old tests index them); the default instance repr stays `<C
+- Not done (vm_audit87): ~~`range()` and `dict.keys()/values()/items()` are
+  lists; `zip`/`map`/`filter`/`enumerate` over lists return lists~~ (done in
+  round 78, §0q); the default instance repr stays `<C
   instance>`; structure sequences are not tuple subclasses; `fileno()` is
   Nython's handle (only `os.stat`/`fstat` translate it);
   `ImportError(name=, path=)` and `AttributeError(name=, obj=)` keywords;
@@ -911,8 +1017,8 @@ Nython over the class machinery above; each header says what is not there.
   `super(C, obj)` used as a value is still the interpreter's
   parent-constructor shorthand (only `.x`/`.m()` follow Python); an instance
   field is read before a class data descriptor of the same name;
-  `C.__dict__["__new__"]` is not a staticmethod; `iter(range(n))` is a
-  `list_iterator` (range is a list); on the interpreter, set/dict keys of
+  `C.__dict__["__new__"]` is not a staticmethod; ~~`iter(range(n))` is a
+  `list_iterator` (range is a list)~~ (a `range_iterator`, round 78); on the interpreter, set/dict keys of
   objects with `__hash__` are keyed by class name plus hash, so equal objects
   of two classes stay distinct.
 - Frames have no locals (`inspect.currentframe()` is None); weak references
@@ -3722,6 +3828,7 @@ reproducible finding rather than a guess.
 | `examples/vm_audit46.ny` | the OS layer, 252 value checks: paths, files/dirs, file objects, typed errors, os_run/os_spawn, environment, time, full-width integers, sys.argv/`__name__`, lib/os.ny (round 74) |
 | `examples/vm_audit56.ny` | lazy generators, both engines and python3: infinite generators, side-effect order, send/throw/close/finally, StopIteration.value, `yield from`, genexps, lazy builtins, unpacking, deep recursion, threads, finalization (round 75, §0l) |
 | `examples/vm_audit57.ny` | strict reads (AttributeError/KeyError/TypeError), getattr/hasattr/setattr/delattr, get/setdefault/in, `?.`/`?[`/`?.()`/`??`/`??=` including laziness, `undefined`, the scope rules (plain assignment, var/let/const, global/nonlocal, loops, comprehensions, class bodies, methods, closures), suffix literals (round 75, 212 checks) |
+| `examples/vm_audit90.ny` | lazy `range`, live dict views, lazy zip/map/filter/enumerate/reversed, both engines and python3 (round 78, §0q) |
 | `tools/ide_e2e.py` | the shipped IDE driven through real input, 20 scenarios + dead-click audits (round 73) |
 | `gui_tests/test_13` | Codicons, Dark+ palette, HiDPI scaling |
 | `gui_tests/test_14` | toolchain — real compile/run/AST/disasm |

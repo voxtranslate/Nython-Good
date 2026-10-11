@@ -452,7 +452,13 @@ Value dispatch_core(NythonExecutor& E,
                 std::vector<Value> none;
                 static const nyrt::OrderedKw<Value> nokw;
                 Value r;
-                if (E.dictMethod(dc, args[0], name, none, nokw, ctx, r)) return r;
+                if (E.dictMethod(dc, args[0], name, none, nokw, ctx, r)) {
+                    // Nython's keys(d) / values(d) / items(d) stay lists:
+                    // d.keys() is a live view since round 78
+                    std::vector<Value> items;
+                    if (E.rangeOrViewItems(r, items)) return E.makeListValue(items);
+                    return r;
+                }
             }
         }
         if (name == "keys") {

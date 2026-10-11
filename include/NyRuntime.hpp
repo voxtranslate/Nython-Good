@@ -207,6 +207,22 @@ inline bool payload_transparent(const std::string& n) {
     };
     return names.count(n) > 0;
 }
+// Builtins that take a range or a dict view as the object itself (round 78):
+// Python's builtins and the protocol helpers. Every other builtin - Nython's
+// own flat natives (random_sample, json_encode, string and tensor
+// functions...) - is given the list of its values, which is what range()
+// and d.keys() returned before (both engines: NythonExecutor::callBuiltin,
+// the VM's builtin bridge).
+inline bool takes_range_objects(const std::string& n) {
+    if (payload_transparent(n)) return true;
+    if (n.rfind("_json_", 0) == 0) return true;   // lib/json's natives: a view is not JSON data
+    static const std::unordered_set<std::string> names = {
+        "list", "tuple", "set", "frozenset", "dict", "sorted", "sum", "any", "all", "enumerate", "zip", "map",
+        "filter", "islice", "take", "bytes", "bytearray", "int", "float", "abs", "round", "pow", "divmod",
+        "hex", "oct", "bin", "chr", "ord", "sizeof", "range", "reduce",
+    };
+    return names.count(n) > 0;
+}
 
 // ── Module namespaces over the flat builtins ─────────────────────────────────
 // `import os` binds a namespace so Python-style code works: os.getcwd() is

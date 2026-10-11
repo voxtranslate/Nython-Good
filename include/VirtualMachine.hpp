@@ -12572,7 +12572,12 @@ private:
             if(a.empty()) return VMVal::make_list();
             // A dict answers as d.keys() does (typed keys, none values kept,
             // pairs as tuples), like the interpreter's builtin.
-            if(a[0].type==VMType::MAP&&a[0].map){ std::vector<VMVal> none; return call_map_method(a[0],"keys",none); }
+            if(a[0].type==VMType::MAP&&a[0].map){
+                // Nython's keys(d) stays a list (d.keys() is a live view, round 78)
+                std::vector<VMVal> none, items; VMVal r=call_map_method(a[0],"keys",none);
+                if(range_or_view_items(r,items)) return VMVal::make_list(std::move(items));
+                return r;
+            }
             if((a[0].type==VMType::MAP||a[0].type==VMType::INSTANCE)&&a[0].map){
                 std::vector<VMVal> ks;
                 for(auto& [k,v]:*a[0].map) if(v.type!=VMType::NONE) ks.push_back(VMVal::make_str(k));
@@ -12583,7 +12588,12 @@ private:
             if(a.empty()) return VMVal::make_list();
             // A dict answers as d.values() does (typed keys, none values kept,
             // pairs as tuples), like the interpreter's builtin.
-            if(a[0].type==VMType::MAP&&a[0].map){ std::vector<VMVal> none; return call_map_method(a[0],"values",none); }
+            if(a[0].type==VMType::MAP&&a[0].map){
+                // Nython's values(d) stays a list (d.values() is a live view, round 78)
+                std::vector<VMVal> none, items; VMVal r=call_map_method(a[0],"values",none);
+                if(range_or_view_items(r,items)) return VMVal::make_list(std::move(items));
+                return r;
+            }
             if((a[0].type==VMType::MAP||a[0].type==VMType::INSTANCE)&&a[0].map){
                 std::vector<VMVal> vs;
                 for(auto& [k,v]:*a[0].map) if(v.type!=VMType::NONE) vs.push_back(v);
@@ -12594,7 +12604,12 @@ private:
             if(a.empty()) return VMVal::make_list();
             // A dict answers as d.items() does (typed keys, none values kept,
             // pairs as tuples), like the interpreter's builtin.
-            if(a[0].type==VMType::MAP&&a[0].map){ std::vector<VMVal> none; return call_map_method(a[0],"items",none); }
+            if(a[0].type==VMType::MAP&&a[0].map){
+                // Nython's items(d) stays a list (d.items() is a live view, round 78)
+                std::vector<VMVal> none, items; VMVal r=call_map_method(a[0],"items",none);
+                if(range_or_view_items(r,items)) return VMVal::make_list(std::move(items));
+                return r;
+            }
             if((a[0].type==VMType::MAP||a[0].type==VMType::INSTANCE)&&a[0].map){
                 std::vector<VMVal> its;
                 for(auto& [k,v]:*a[0].map){

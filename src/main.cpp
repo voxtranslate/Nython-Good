@@ -921,6 +921,17 @@ void install_vm_builtin_bridge(Runnable* runner) {
                 vm->fspath_args(path_args);
                 src = &path_args;
             }
+            // A range or a dict view given to one of the interpreter's flat
+            // natives is the list of its values, as range() and d.keys()
+            // were before round 78 (nyrt::takes_range_objects).
+            if (!src->empty() && !nyrt::takes_range_objects(n)) {
+                for (size_t i = 0; i < src->size(); i++) {
+                    std::vector<VMVal> items;
+                    if ((*src)[i].type != VMType::INSTANCE || !vm->range_or_view_items((*src)[i], items)) continue;
+                    if (src != &path_args) { path_args = *src; src = &path_args; }
+                    path_args[i] = VMVal::make_list(std::move(items));
+                }
+            }
             std::vector<Value> args;
             args.reserve(src->size());
             for (auto& v : *src) args.push_back(conv.to_value(v));
