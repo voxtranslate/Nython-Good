@@ -2888,6 +2888,10 @@ struct CallFrame {
     // end_line: the line an ending frame reports when its last instruction
     // has no line of its own (frame_line)
     int trace_line = -1, trace_ip = -1, end_line = 0;
+    // Run by CALL_FUNCTION_PY / CALL_METHOD_PY / CALL_FUNCTION_CLASS without
+    // the tracing hooks: an exception leaving it is returned to the caller
+    // (VirtualMachine::exc_sentinel), not thrown (round 80).
+    bool fast_exc = false;
 };
 
 // The call stack (round 80). Frames never move once pushed - run_loop and
@@ -7237,7 +7241,9 @@ private:
     // the name above it).
     // `inst` (CALL_FUNCTION_CLASS): a new instance whose __init__ `fn` is -
     // it is the frame's self, and what the call leaves on the stack.
-    void call_py_fast(size_t head, int argc, const VMVal* fn, bool method, VMVal* inst=nullptr) {
+    // Returns false when the callee left by an exception, which is then in
+    // pending_exc_ for the caller's run_loop (fast_exc_pending).
+    bool call_py_fast(size_t head, int argc, const VMVal* fn, bool method, VMVal* inst=nullptr) {
         // The frame is built where it will run (a deque element does not
         // move), so check_depth's test is made with it already pushed.
         call_stack_.emplace_back();
@@ -7261,15 +7267,53 @@ private:
         size_t base=stack_.size();
         nf.ip=0;
         nf.stack_base=base;
+        // without hooks the frame runs plain (as run_frame would choose) and
+        // returns an exception that leaves it
+        const bool fast=!(nytrace::t_hooks & nytrace::ANY);
+        nf.fast_exc=fast;
         VMVal result=VMVal::make_none();
-        try { result=run_frame(); }
+        try { result=fast?run_frame_plain():run_frame(); }
         catch(VMReturn& r){ result=r.value; }
         catch(...){ pop_frame(); if(stack_.size()>base) stack_.resize(base); throw; }
         pop_frame();
         if(stack_.size()>base) stack_.resize(base);
+        if(fast&&is_exc_sentinel(result)) return false;
         if(inst) stack_.push_back(std::move(*inst));   // __init__'s result is dropped
         else stack_.push_back(std::move(result));
+        return true;
     }
+
+    // What run_loop does with an exception that reaches the running frame
+    // (shared by its catch clauses and the CALL_*_PY path, round 80): its
+    // __context__ when it was just raised while another is handled
+    // (`fresh`: a native's error, always), the frame's traceback entry,
+    // sys.settrace's exception event, then this frame's handler - false
+    // when it has none and the exception goes on to the caller.
+    bool exc_in_frame(VMVal& ev, bool fresh) {
+        // round 77: just raised (no traceback yet) while an except
+        // clause handles another - its __context__; then the
+        // traceback, a frame at a time
+        if(fresh) set_exc_context(ev, vm_exc_current());
+        else if(ev.type==VMType::INSTANCE&&ev.map&&!tb_reraise_&&!ev.map->count("__traceback__")
+                &&!ev.map->count("__context__"))
+            set_exc_context(ev, vm_exc_current());
+        bool rr=tb_reraise_;
+        tb_here(ev);
+        // sys.settrace's exception event, once per frame (round 79)
+        if(__builtin_expect(nytrace::t_hooks&nytrace::TRACE,0)&&!rr) vm_ev_exception(ev);
+        return dispatch_exception(call_stack_.back(), ev);
+    }
+    // An exception leaving a CALL_*_PY frame (CallFrame::fast_exc) is
+    // returned, not thrown: run_loop returns this marker with the exception
+    // (and the text a VMException would carry) in pending_exc_ /
+    // pending_what_, and the caller's run_loop takes it from there. A C++
+    // throw costs a search of run_loop's whole unwind table for each frame
+    // it crosses, twice (round 80).
+    VMVal pending_exc_;
+    std::string pending_what_;
+    static const std::string& exc_sentinel_tag() { static const std::string t("\x01exc"); return t; }
+    static VMVal exc_sentinel() { VMVal x; x.type=VMType::UNDEFINED; x.s=exc_sentinel_tag(); return x; }
+    static bool is_exc_sentinel(const VMVal& v) { return v.type==VMType::UNDEFINED&&v.s==exc_sentinel_tag(); }
 
     // A specializable generic instruction counts its runs and, at zero, tries
     // to specialize; on success the specialized form runs at once (round 80).
@@ -7454,7 +7498,7 @@ private:
                     const VMVal& f=stack_[n-1-(size_t)argc];
                     if(f.type==VMType::FUNCTION&&f.code&&!f.code->is_method&&f.code->param_names.size()==(size_t)argc
                        &&f.code->all_plain_params()&&!f.code->has_yield()){
-                        call_py_fast(n-1-(size_t)argc, argc, nullptr, false);
+                        if(!call_py_fast(n-1-(size_t)argc, argc, nullptr, false)) goto fast_exc_pending;
                         break;
                     }
                 }
@@ -7471,7 +7515,7 @@ private:
                         const VMVal* m=method_way(fr.code->quick.ic[ins.ic-1], obj, mn, argc);
                         // (re-checked: a code object's flags can change)
                         if(plain_method(m, argc)&&!(any_getattribute_&&getattribute_hook(obj))&&!obj.map->count(mn)){
-                            call_py_fast(n-2-(size_t)argc, argc, m, true);
+                            if(!call_py_fast(n-2-(size_t)argc, argc, m, true)) goto fast_exc_pending;
                             break;
                         }
                     }
@@ -7671,7 +7715,7 @@ private:
                         // instantiate(): a new instance, then its __init__
                         const VMVal* init=c.ptr;
                         VMVal inst=VMVal::make_instance(f.class_name, new_instance_fields(f.class_name));
-                        call_py_fast(n-1-(size_t)argc, argc, init, false, &inst);
+                        if(!call_py_fast(n-1-(size_t)argc, argc, init, false, &inst)) goto fast_exc_pending;
                         break;
                     }
                 }
@@ -8917,27 +8961,21 @@ private:
             } catch(VMReturn& r) { throw; }  // propagate returns
               catch(VMYield&) { throw; }
               catch(VMException& ex) {
-                // round 77: just raised (no traceback yet) while an except
-                // clause handles another - its __context__; then the
-                // traceback, a frame at a time
-                if(ex.value.type==VMType::INSTANCE&&ex.value.map&&!tb_reraise_&&!ex.value.map->count("__traceback__")
-                   &&!ex.value.map->count("__context__"))
-                    set_exc_context(ex.value, vm_exc_current());
-                bool rr=tb_reraise_;
-                tb_here(ex.value);
-                // sys.settrace's exception event, once per frame (round 79)
-                if(__builtin_expect(nytrace::t_hooks&nytrace::TRACE,0)&&!rr) vm_ev_exception(ex.value);
-                if(!dispatch_exception(call_stack_.back(), ex.value)) throw;
+                if(!exc_in_frame(ex.value, false)){
+                    // (round 80) a frame CALL_*_PY runs leaves by returning
+                    // the exception to its caller rather than unwinding
+                    if(fr.fast_exc){ pending_exc_=ex.value; pending_what_=ex.what(); return exc_sentinel(); }
+                    throw;
+                }
               }
               catch(std::string& m) {
                 // Interpreter builtins reached through the bridge, and a few
                 // VM paths, report errors as "__exc__:Type:message" strings.
                 VMVal ev=exception_from_message(m);
-                set_exc_context(ev, vm_exc_current());
-                bool rr=tb_reraise_;
-                tb_here(ev);
-                if(__builtin_expect(nytrace::t_hooks&nytrace::TRACE,0)&&!rr) vm_ev_exception(ev);   // round 79
-                if(!dispatch_exception(call_stack_.back(), ev)) throw VMException(ev, describe_exception(ev));
+                if(!exc_in_frame(ev, true)){
+                    if(fr.fast_exc){ pending_what_=describe_exception(ev); pending_exc_=std::move(ev); return exc_sentinel(); }   // round 80
+                    throw VMException(ev, describe_exception(ev));
+                }
               }
               catch(std::exception& exc) {
                 // Runtime errors raised as "Type: message" (ZeroDivisionError
@@ -8947,12 +8985,24 @@ private:
                 // instance itself (the tensor and concurrency runtimes, the
                 // builtin bridge) leaves it in last_exception_obj_.
                 VMVal ev=take_native_exception(exc.what());
-                set_exc_context(ev, vm_exc_current());
-                bool rr=tb_reraise_;
-                tb_here(ev);
-                if(__builtin_expect(nytrace::t_hooks&nytrace::TRACE,0)&&!rr) vm_ev_exception(ev);   // round 79
-                if(!dispatch_exception(call_stack_.back(), ev)) throw VMException(ev, describe_exception(ev));
+                if(!exc_in_frame(ev, true)){
+                    if(fr.fast_exc){ pending_what_=describe_exception(ev); pending_exc_=std::move(ev); return exc_sentinel(); }   // round 80
+                    throw VMException(ev, describe_exception(ev));
+                }
               }
+            continue;
+            // (round 80) an exception a CALL_*_PY callee returned: handled
+            // here as the catch above handles one thrown by a callee -
+            // outside the try, as a handler's own errors leave run_loop
+          fast_exc_pending: {
+                VMVal ev=std::move(pending_exc_);
+                std::string what=std::move(pending_what_);
+                pending_exc_=VMVal::make_none(); pending_what_.clear();
+                if(!exc_in_frame(ev, false)){
+                    if(fr.fast_exc){ pending_exc_=std::move(ev); pending_what_=std::move(what); return exc_sentinel(); }
+                    throw VMException(std::move(ev), what);
+                }
+            }
         }
     }
 
