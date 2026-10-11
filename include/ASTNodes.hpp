@@ -957,6 +957,8 @@ inline bool is_expression_program(const node_ptr& ast) {
             case NodeType::BINARY_OP: case NodeType::BINARY_RE: case NodeType::DYN_BINOP:
             case NodeType::COMPREHENSION: case NodeType::OPT_CHAIN: case NodeType::BYTES: case NodeType::SELF:
                 return true;
+            case NodeType::IF:   // `a if c else b` (round 79: eval() said "invalid syntax")
+                return static_cast<IfNode*>(n.get())->is_expr;
             default:
                 return false;
         }

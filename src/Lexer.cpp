@@ -1759,6 +1759,13 @@ bool Lexer::handle_indentation() {
 		else break;
 	}
 	source.put_char();
+	// A comment-only line does not take part in indentation, as in Python
+	// (round 79): a comment indented deeper than the code around it, e.g.
+	//     self.a = {}     # what a is
+	//                     # and more about it
+	// pushed an Indent that nothing closed, and the next statement failed
+	// to parse ("Unexpected token"). The indent stack is left as it is.
+	if(c == '#') return false;
 	if(col > indent) {
 		///Adjust the current indentation level.
 		indent = col;

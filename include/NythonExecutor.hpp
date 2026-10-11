@@ -587,6 +587,7 @@ public:   // NythonExecutor is a struct: members default to public
             "_ny_main_globals","_ny_exc_current","_ny_stack",
             "_ny_frame_get","_ny_frame_sync","_ny_frame_back","_ny_frame_globals","_ny_builtins_dict",   // frame objects (round 78)
             "_ny_settrace","_ny_setprofile","_ny_gettrace","_ny_getprofile","_ny_frame_local_set",   // sys.settrace ... (round 79)
+            "sys.settrace","sys.setprofile","sys.gettrace","sys.getprofile",   // the same, named as sys's (__name__ "settrace")
             "_ny_fn_info","_ny_fn_globals","_ny_keywords",   // inspect, f.__code__, keyword (round 77)
             "_ny_unicode_lookup","_ny_unicode_name",          // unicodedata (round 77)
             "_ny_payload","_ny_payload_new","_ny_getattr_raw","_ny_setfield","_ny_delfield",   // builtin subclasses, __getattribute__, __dict__ (round 77)
@@ -11536,10 +11537,12 @@ public:
                 ns->set("exception", global_ctx->getByName("_ny_exc_current"));
                 ns->set("_getframe", global_ctx->getByName("_ny_getframe"));
                 // sys.settrace / setprofile and breakpoint()'s hook (round 79)
-                ns->set("settrace", global_ctx->getByName("_ny_settrace"));
-                ns->set("gettrace", global_ctx->getByName("_ny_gettrace"));
-                ns->set("setprofile", global_ctx->getByName("_ny_setprofile"));
-                ns->set("getprofile", global_ctx->getByName("_ny_getprofile"));
+                // (builtins named "sys.settrace" ...: their __name__ is
+                // "settrace", as a profile function's c_call sees it)
+                ns->set("settrace", builtinValue("sys.settrace"));
+                ns->set("gettrace", builtinValue("sys.gettrace"));
+                ns->set("setprofile", builtinValue("sys.setprofile"));
+                ns->set("getprofile", builtinValue("sys.getprofile"));
                 ns->set("breakpointhook", global_ctx->getByName("_ny_breakpointhook"));
                 ns->set("__breakpointhook__", global_ctx->getByName("_ny_breakpointhook"));
                 ns->set("warnoptions", nyos_list_of(nyrt::warn_options()));

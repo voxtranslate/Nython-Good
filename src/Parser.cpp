@@ -2438,11 +2438,12 @@ node_ptr Parser::ifStmt(){
     while(have(TokenType::NewLine)) {}
     while(have(TokenType::ElseIf)||have(TokenType::ElseIf)||(see(TokenType::Else)&&peek().type()==TokenType::If)){
         if(prev().type()==TokenType::Else) next(); // consume 'if'
+        Token eitok = prev();   // the elif's own line (round 79: sys.settrace's line event)
         // Same rule as the if-condition above: let expression() own the parens.
         node_ptr eicond = expression();
         have(TokenType::Colon);
         node_ptr eibody = blockOrStmt();
-        if_node->elseif_branches.push_back(make_node<IfNode>(tok, eicond, eibody));
+        if_node->elseif_branches.push_back(make_node<IfNode>(eitok, eicond, eibody));
         while(have(TokenType::NewLine)) {}
     }
 
@@ -3633,6 +3634,7 @@ node_ptr Parser::tryStmt(){
         return n;
     };
     while(see(TokenType::Except) && !(value() == "catch" && usedAsName())){   // `catch = 1` is a name (round 77)
+        Token etok = token();   // the clause's own line (round 79: sys.settrace's line event, tracebacks)
         next(); // consume 'except'
         std::string ename, ealias;
         std::vector<std::string> types;
@@ -3664,7 +3666,7 @@ node_ptr Parser::tryStmt(){
         }
         have(TokenType::Colon);
         node_ptr ebody = blockOrStmt();
-        auto en = make_node<ExceptNode>(tok, ename, ealias, ebody);
+        auto en = make_node<ExceptNode>(etok, ename, ealias, ebody);
         auto enp = std::static_pointer_cast<ExceptNode>(en);
         enp->types = std::move(types);
         enp->var = std::move(var);

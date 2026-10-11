@@ -2398,6 +2398,8 @@ class IDEOps(IDECore):
         st["dbg_state"] = self.dbg.state
         st["dbg_line"] = self.dbg.line_at(self.dbg.pos)
         st["dbg_n"] = self.dbg.n
+        st["dbg_why_title"] = self.dbg_why_title    # the Why? answer (round 79)
+        st["dbg_why"] = [[row[0], row[3], row[5], row[4]] for row in self.dbg_why]
         st["breaks"] = self.break_list
         st["watches"] = self.watches
         st["font_size"] = self.font_size

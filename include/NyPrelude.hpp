@@ -1816,7 +1816,9 @@ class _NyFrameLocals:
     # they are now; proxy[name] = value changes the variable the running
     # code reads next (_ny_frame_local_set) - from a trace function too;
     # deleting is refused, as there. Once the frame has ended it reads and
-    # writes the variables the frame ended with.
+    # writes the variables the frame ended with. A dunder name (pdb's
+    # __return__ / __exception__) is kept beside the variables, as 3.13's
+    # extra locals are - locals() leaves the frame's dunders out.
     def __init__(self, frame):
         self._ny_f = frame
 
@@ -1827,6 +1829,9 @@ class _NyFrameLocals:
         if l is None:
             l = {}
             f._ny_locals = l
+        var x = getattr(f, "_ny_xlocals", None)
+        if x:
+            l.update(x)
         return l
 
     def __getitem__(self, key):
@@ -1835,7 +1840,13 @@ class _NyFrameLocals:
     def __setitem__(self, key, value):
         if not isinstance(key, str):
             raise TypeError("local variables must be strings")
-        if not _ny_frame_local_set(self._ny_f, key, value):
+        if key.startswith("__") and key.endswith("__") and len(key) > 4:
+            var x = getattr(self._ny_f, "_ny_xlocals", None)
+            if x is None:
+                x = {}
+                self._ny_f._ny_xlocals = x
+            x[key] = value
+        elif not _ny_frame_local_set(self._ny_f, key, value):
             self._ny_snap()[key] = value
 
     def __delitem__(self, key):
@@ -1931,7 +1942,9 @@ def _ny_breakpointhook(*args, **kws):
         else:
             var ns = {}
             exec("import " + modname + " as _ny_bp_mod", ns)
-            hook = getattr(ns["_ny_bp_mod"], funcname)
+            # (eval: the VM binds a native module's alias - math - among the
+            # globals, not in ns)
+            hook = getattr(eval("_ny_bp_mod", ns), funcname)
     except Exception:
         import warnings
         warnings.warn("Ignoring unimportable $PYTHONBREAKPOINT: \"" + hookname + "\"", RuntimeWarning)

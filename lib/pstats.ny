@@ -30,7 +30,7 @@
 #   to restriction <r>")
 # print_callers(*restrictions), print_callees(*restrictions)  with the
 #   "ncalls  tottime  cumtime" sub-header for cProfile's caller tuples
-# SortKey, FunctionProfile, StatsProfile, func_std_string, func_strip_path,
+# SortKey (a str Enum, as CPython's), FunctionProfile, StatsProfile, func_std_string, func_strip_path,
 # func_get_function_name, add_func_stats, add_callers, count_calls, f8
 #
 # Not here: the files dump_stats writes are Nython's own (JSON lines,
@@ -43,22 +43,30 @@ import sys
 import time
 import re
 from functools import cmp_to_key
+from enum import Enum
 
 __all__ = ["Stats", "SortKey", "FunctionProfile", "StatsProfile"]
 
 
-class SortKey:
-    # CPython's is an enum of str values; these are the strings themselves
-    # (sort_stats takes them the same way)
-    CALLS = "calls"
-    CUMULATIVE = "cumulative"
-    FILENAME = "filename"
+class SortKey(str, Enum):
+    CALLS = "calls", "ncalls"
+    CUMULATIVE = "cumulative", "cumtime"
+    FILENAME = "filename", "module"
     LINE = "line"
     NAME = "name"
     NFL = "nfl"
     PCALLS = "pcalls"
     STDNAME = "stdname"
-    TIME = "time"
+    TIME = "time", "tottime"
+
+    def __new__(cls, *values):
+        value = values[0]
+        obj = str.__new__(cls, value)
+        obj._value_ = value
+        for other_value in values[1:]:
+            cls._value2member_map_[other_value] = obj
+        obj._all_values = values
+        return obj
 
 
 class FunctionProfile:
@@ -292,6 +300,8 @@ class Stats:
         self.sort_type = ""
         connector = ""
         for word in field:
+            if isinstance(word, SortKey):
+                word = word.value
             sort_tuple = sort_tuple + sort_arg_defs[word][0]
             self.sort_type += connector + sort_arg_defs[word][1]
             connector = ", "

@@ -49,7 +49,8 @@ fail_n = 0
 results = []
 
 def check(name, got, want):
-    results.append([name, repr(got) == repr(want), got, want])
+    # the reprs now: a list checked may change afterwards
+    results.append([name, repr(got) == repr(want), repr(got), repr(want)])
 
 # The line a marker comment ends ("# @name"), from this file's source.
 _src_lines = open(sys._getframe().f_code.co_filename).read().split("\n")
@@ -176,8 +177,26 @@ def t_lam():   # @t_lam
     f = lambda q: q + 1   # @t_lamdef
     return f(2)
 
+def t_retfin():   # @t_retfin
+    try:
+        return 1
+    finally:
+        x = 2
+
+def t_fall(n):   # @t_fall
+    for i in range(n):
+        pass
+
+def t_brkfin():   # @t_brkfin
+    while True:
+        try:
+            break
+        finally:
+            y = 1
+    z = 2
+
 for _nm in ["t_for", "t_while", "t_if", "t_try", "t_inner", "t_outer", "t_gen", "t_usegen", "t_fin", "t_callfin",
-            "t_with", "t_loopret", "t_cont", "t_lam"]:
+            "t_with", "t_loopret", "t_cont", "t_lam", "t_retfin", "t_fall", "t_brkfin"]:
     _base[_nm] = line_of(_nm)
 _base["<lambda>"] = line_of("t_lamdef")
 
@@ -221,6 +240,14 @@ check("continue: its line, then the header's", [traced(t_cont, 3), _events],
 check("a lambda: call, its one line, return", [traced(t_lam), _events],
       [3, [('call', 't_lam', 0), ('line', 't_lam', 1), ('line', 't_lam', 2), ('call', '<lambda>', 0), ('line', '<lambda>', 0),
            ('return', '<lambda>', 0, 3), ('return', 't_lam', 2, 3)]])
+check("return through a finally: the return event on the finally's last line", [traced(t_retfin), _events],
+      [1, [('call', 't_retfin', 0), ('line', 't_retfin', 1), ('line', 't_retfin', 2), ('line', 't_retfin', 4), ('return', 't_retfin', 4, 1)]])
+check("falling off the end after a loop: return on the header's line; pass has its line", [traced(t_fall, 2), _events],
+      [None, [('call', 't_fall', 0), ('line', 't_fall', 1), ('line', 't_fall', 2), ('line', 't_fall', 1), ('line', 't_fall', 2),
+              ('line', 't_fall', 1), ('return', 't_fall', 1, None)]])
+check("break through a finally", [traced(t_brkfin), _events],
+      [None, [('call', 't_brkfin', 0), ('line', 't_brkfin', 1), ('line', 't_brkfin', 2), ('line', 't_brkfin', 3), ('line', 't_brkfin', 5),
+              ('line', 't_brkfin', 6), ('return', 't_brkfin', 6, None)]])
 
 # ── 2. trace functions: f_trace, f_trace_lines, errors, gettrace ────────────
 def g_target(a):   # @g_target
@@ -514,11 +541,21 @@ sys.breakpointhook = _my_hook
 bp_r = breakpoint(1, k=2)
 sys.breakpointhook = old_hook
 check("breakpoint() calls sys.breakpointhook", [bp_r, _bp_calls], ["hooked", [((1,), {'k': 2})]])
-os.environ["PYTHONBREAKPOINT"] = "0"
+# the hook reads the process environment when it is called (Nython's
+# os.environ is a snapshot that does not write through: os_setenv)
+def _putenv(k, v):
+    if nython:
+        os_setenv(k, v)
+    else:
+        os.environ[k] = v
+_putenv("PYTHONBREAKPOINT", "0")
 check("PYTHONBREAKPOINT=0 turns breakpoint() off", breakpoint(), None)
-os.environ["PYTHONBREAKPOINT"] = "math.sqrt"
+_putenv("PYTHONBREAKPOINT", "math.sqrt")
 check("PYTHONBREAKPOINT=mod.func calls that", sys.breakpointhook(16.0), 4.0)
-del os.environ["PYTHONBREAKPOINT"]
+if nython:
+    os.unsetenv("PYTHONBREAKPOINT")
+else:
+    del os.environ["PYTHONBREAKPOINT"]
 check("sys.__breakpointhook__ is the original", sys.__breakpointhook__ is old_hook, True)
 
 # ── 8. bdb ───────────────────────────────────────────────────────────────────
@@ -970,7 +1007,7 @@ class Shell(cmd.Cmd):
         self.log.append("pre:" + line)
         return line
     def postcmd(self, stop, line):
-        self.log.append("post:" + str(stop))
+        self.log.append("post:" + ("None" if stop is None else "True" if stop is True else "other"))
         return stop
     def help_topic(self):
         self.stdout.write("about the topic\n")
@@ -1044,7 +1081,7 @@ for r in results:
         pass_n = pass_n + 1
     else:
         fail_n = fail_n + 1
-        print("FAIL " + r[0] + ": got " + repr(r[2]) + " want " + repr(r[3]))
+        print("FAIL " + r[0] + ": got " + r[2] + " want " + r[3])
 print("Results: " + str(pass_n) + " passed, " + str(fail_n) + " failed")
 if fail_n == 0:
     print("=== VM_AUDIT91 PASSED ===")

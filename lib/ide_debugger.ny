@@ -51,6 +51,8 @@ class DebugSession:
         self._vars_cache = none
         self._acts = none
         self._act_parent = []
+        self._prod_line = 0        # _producer's answer was a loop header's write (its line)
+        self._src_cache = none     # file -> its lines
 
     def reset(self):
         self.__init__()
@@ -68,6 +70,7 @@ class DebugSession:
         self.exception_at = ""
         self.capped = false
         self._defuse_cache = none
+        self._src_cache = none
         self._vars_cache = none
         self._acts = none
         self._act_parent = []
@@ -616,16 +619,42 @@ class DebugSession:
             return false
         var before = self._vars_at(i).get(name)
         var after = self._vars_at(nx).get(name)
-        return after != none and after != before
+        return after != none and after != before and self._header_write(i, nx, name) == 0
 
-    # the last step before i, in i's call, that wrote `name`; -1 if none
+    # The recording has one step per statement run, none for a loop header
+    # taking its next item: when `name` changes between step i and the next
+    # step of its call, nx, and nx starts a new iteration of a for loop whose
+    # target holds `name`, the header wrote it - its line; else 0.
+    def _header_write(self, i, nx, name):
+        if self.lines[nx] > self.lines[i] or self.file_at(nx) != self.file_at(i):
+            return 0
+        var du = self._du(self.file_at(nx), self.lines[nx])
+        if du == none:
+            return 0
+        for p in du.get("ctrl", []):
+            var h = self._du(self.file_at(nx), p)
+            if h != none and h.get("kind") == "for" and name in h.get("writes", []) and p <= self.lines[nx]:
+                return p
+        return 0
+
+    # the last step before i, in i's call, that wrote `name`; -1 if none.
+    # A loop header's write is answered as the step after it (nx), with
+    # self._prod_line set to the header's line (0 otherwise).
     def _producer(self, i, name):
         var acts = self._activations()
         var a = acts[i]
+        self._prod_line = 0
         var k = i - 1
         while k >= 0:
-            if acts[k] == a and self._writes(k, name):
-                return k
+            if acts[k] == a:
+                if self._writes(k, name):
+                    return k
+                var nx = self._next_in_act(k)
+                if nx >= 0 and nx <= i:
+                    var hl = self._header_write(k, nx, name)
+                    if hl > 0 and self._vars_at(nx).get(name) != self._vars_at(k).get(name):
+                        self._prod_line = hl
+                        return nx
             k = k - 1
         return -1
 
@@ -641,13 +670,17 @@ class DebugSession:
             k = k - 1
         return -1
 
-    def _src(self, i):
+    # the source of step i's line (or of `line` in step i's file)
+    def _src(self, i, line=0):
         var file = self.file_at(i)
-        var text = read_file(file)
-        if text == none:
-            return ""
-        var rows = string_split(text, "\n")
-        var ln = self.lines[i]
+        if self._src_cache == none:
+            self._src_cache = {}
+        var rows = self._src_cache.get(file)
+        if rows == none:
+            var text = read_file(file)
+            rows = string_split(text, "\n") if text != none else []
+            self._src_cache[file] = rows
+        var ln = line if line > 0 else self.lines[i]
         if ln < 1 or ln > len(rows):
             return ""
         return string_strip(rows[ln - 1])
@@ -681,22 +714,36 @@ class DebugSession:
         if len(out) >= limit:
             return
         var j = self._producer(i, name)
+        var hl = self._prod_line
         if j < 0:
             self._why_param(i, name, level, out, seen, limit)
             return
-        var key = str(j) + ":" + name
+        var key = str(j) + ":" + name + ":" + str(hl)
         if seen.get(key) != none:
             return
         seen[key] = true
+        if hl > 0:
+            # a loop header took its next item (before step j)
+            var e = self._entry(j, level, "data", name, self._src(j, hl) + "   (next item)")
+            e["line"] = hl
+            e["value"] = self._vars_at(j).get(name)
+            out.append(e)
+            self._why_line(j, hl, level + 1, out, seen, limit)
+            return
         out.append(self._entry(j, level, "data", name, self._src(j)))
         self._why_step(j, level + 1, out, seen, limit)
 
     # why step j ran with what it read: its reads' producers and the
     # predicate it ran under
     def _why_step(self, j, level, out, seen, limit):
+        self._why_line(j, self.lines[j], level, out, seen, limit)
+
+    # ... for the statement on `line` run at step j (a loop header's next
+    # item is answered at the step after it)
+    def _why_line(self, j, line, level, out, seen, limit):
         if len(out) >= limit:
             return
-        var du = self._du(self.file_at(j), self.lines[j])
+        var du = self._du(self.file_at(j), line)
         if du == none:
             return
         for r in du.get("reads", []):

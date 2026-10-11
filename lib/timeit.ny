@@ -72,6 +72,14 @@ def reindent(src, indent):
     return src.replace("\n", "\n" + " " * indent)
 
 
+def _check_outside_function(src):
+    # Nython's compile() takes a return at the top level, CPython's refuses
+    # it - and the statement must compile outside the template's function
+    for e in text_defuse(src):
+        if e is not None and e.get("stmt") and e.get("func") == "" and e.get("kind") == "return":
+            raise SyntaxError("'return' outside function")
+
+
 class Timer:
     """Class for timing execution speed of small code snippets.
 
@@ -92,6 +100,7 @@ class Timer:
         if isinstance(setup, str):
             # Check that the code can be compiled outside a function
             compile(setup, dummy_src_name, "exec")
+            _check_outside_function(setup)
             stmtprefix = setup + "\n"
             setup = reindent(setup, 4)
         elif callable(setup):
@@ -104,6 +113,7 @@ class Timer:
         if isinstance(stmt, str):
             # Check that the code can be compiled outside a function
             compile(stmtprefix + stmt, dummy_src_name, "exec")
+            _check_outside_function(stmt)
             stmt = reindent(stmt, 8)
         elif callable(stmt):
             local_ns["_stmt"] = stmt

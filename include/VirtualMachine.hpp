@@ -1333,7 +1333,10 @@ private:
             break;
         }
         // Pass / global / nonlocal
-        case NT::PASS: case NT::GLOBAL:
+        case NT::PASS:
+            emit(Op::NOP,0,l);   // its line event, as CPython's NOP (round 79)
+            break;
+        case NT::GLOBAL:
             break;
         // del target  (variable, subscript, attribute)
         case NT::DELETE: {
@@ -2653,8 +2656,10 @@ struct CallFrame {
     // one (VirtualMachine::frame_object); null for every other call.
     std::shared_ptr<VMMap> fobj;
     // sys.settrace (round 79): the line of the last line event and the last
-    // instruction run while tracing (a backward jump is a new line event)
-    int trace_line = -1, trace_ip = -1;
+    // instruction run while tracing (a backward jump is a new line event);
+    // end_line: the line an ending frame reports when its last instruction
+    // has no line of its own (frame_line)
+    int trace_line = -1, trace_ip = -1, end_line = 0;
 };
 
 struct VMReturn   { VMVal value; };
@@ -3719,10 +3724,13 @@ public:
         (*ns.map)["exception"]=load_var("_ny_exc_current");
         (*ns.map)["_getframe"]=load_var("_ny_getframe");
         // sys.settrace / setprofile and breakpoint()'s hook (round 79)
-        (*ns.map)["settrace"]=load_var("_ny_settrace");
-        (*ns.map)["gettrace"]=load_var("_ny_gettrace");
-        (*ns.map)["setprofile"]=load_var("_ny_setprofile");
-        (*ns.map)["getprofile"]=load_var("_ny_getprofile");
+        // (tagged "sys.settrace" ...: their __name__ is "settrace", as a
+        // profile function's c_call sees it)
+        auto sys_named=[&](const char* var, const char* shown){ VMVal v=load_var(var); v.class_name=std::string("__builtin__:")+shown; return v; };
+        (*ns.map)["settrace"]=sys_named("_ny_settrace","sys.settrace");
+        (*ns.map)["gettrace"]=sys_named("_ny_gettrace","sys.gettrace");
+        (*ns.map)["setprofile"]=sys_named("_ny_setprofile","sys.setprofile");
+        (*ns.map)["getprofile"]=sys_named("_ny_getprofile","sys.getprofile");
         (*ns.map)["breakpointhook"]=load_var("_ny_breakpointhook");
         (*ns.map)["__breakpointhook__"]=load_var("_ny_breakpointhook");
         {
@@ -7644,6 +7652,7 @@ private:
         return "__main__";
     }
     static int frame_line(const CallFrame& f) {
+        if(f.end_line>0) return f.end_line;
         int ip=f.ip-1;
         // not started yet: its def line (round 79: a call event's f_lineno)
         if(ip<0&&f.code) return f.code->first_line;
@@ -8029,11 +8038,21 @@ private:
         vm_ev_call(idx);
         VMVal r;
         try { r=run_frame_plain(); }
-        catch(VMReturn& rv){ if(nytrace::t_hooks&nytrace::ANY) vm_ev_return(idx, rv.value); throw; }
+        catch(VMReturn& rv){ if(nytrace::t_hooks&nytrace::ANY){ vm_end_line(f); vm_ev_return(idx, rv.value); } throw; }
         catch(VMYield&){ throw; }
-        catch(VMException&){ if(nytrace::t_hooks&nytrace::ANY) vm_ev_return(idx, VMVal::make_none()); throw; }
-        if(nytrace::t_hooks&nytrace::ANY) vm_ev_return(idx, r);
+        catch(VMException&){ if(nytrace::t_hooks&nytrace::ANY){ vm_end_line(f); vm_ev_return(idx, VMVal::make_none()); } throw; }
+        if(nytrace::t_hooks&nytrace::ANY){ vm_end_line(f); vm_ev_return(idx, r); }
         return r;
+    }
+    // A frame ends on an instruction with no line of its own - the implicit
+    // return at the end of a body, the re-raise after a finally: it is on
+    // the last line it ran, as CPython 3.11 gives those instructions their
+    // predecessor's line (the return event's f_lineno).
+    static void vm_end_line(CallFrame& f) {
+        int ip=f.ip-1;
+        if(f.trace_line<=0||!f.code||ip<0||ip>=(int)f.code->instructions.size()||f.code->is_line_start(ip)) return;
+        const Instruction& in=f.code->instructions[(size_t)ip];
+        if((in.op==Op::RETURN_VALUE||in.op==Op::END_FINALLY)&&in.line!=f.trace_line) f.end_line=f.trace_line;
     }
     // c_call / c_return / c_exception around a native the running frame calls.
     template<class F> VMVal vm_profile_builtin(const VMVal& fn, F&& run) {
