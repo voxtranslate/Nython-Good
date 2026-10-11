@@ -1,0 +1,274 @@
+# nython: module    (import it by name: it runs in a module scope of its own)
+# lib/copyreg.ny - Python's copyreg (round 79): the registry and helpers
+# pickle and copy use to take objects apart and build them again.
+#
+#     import copyreg
+#     copyreg.pickle(Point, lambda p: (Point, (p.x, p.y)))
+#
+# pickle(type, function), constructor, dispatch_table (complex is in it, as
+# in CPython), __newobj__ / __newobj_ex__ (what NEWOBJ / NEWOBJ_EX call),
+# _reconstructor and _reduce_ex (protocols 0 and 1), _slotnames (the slot
+# names along the MRO, mangled, cached as cls.__slotnames__), the extension
+# registry (add_extension, remove_extension, clear_extension_cache).
+#
+# Nython: object.__reduce_ex__ / __reduce__ / __getstate__ (the prelude's
+# object) call _ny_reduce_ex and _ny_getstate here - CPython's typeobject.c
+# reduce_newobj and object_getstate in Python.
+
+__all__ = ["pickle", "constructor", "add_extension", "remove_extension", "clear_extension_cache"]
+
+dispatch_table = {}
+
+
+def pickle(ob_type, pickle_function, constructor_ob=none):
+    if not callable(pickle_function):
+        raise TypeError("reduction functions must be callable")
+    dispatch_table[ob_type] = pickle_function
+    if constructor_ob is not none:
+        constructor(constructor_ob)
+
+
+def constructor(object):
+    if not callable(object):
+        raise TypeError("constructors must be callable")
+
+
+def pickle_complex(c):
+    return complex, (c.real, c.imag)
+
+
+dispatch_table[complex] = pickle_complex
+
+
+def _reconstructor(cls, base, state):
+    var obj = none
+    if base is object:
+        obj = object.__new__(cls)
+    else:
+        obj = base.__new__(cls, state)
+        if base.__init__ != object.__init__:
+            base.__init__(obj, state)
+    return obj
+
+
+_HEAPTYPE = 1 << 9
+
+_BUILTIN_TYPES = (int, float, str, bytes, bytearray, list, dict, tuple, set, frozenset, complex, bool)
+
+
+def _is_builtin_type(t):
+    for b in _BUILTIN_TYPES:
+        if t is b:
+            return true
+    return false
+
+
+def _has_own_getstate(cls):
+    for c in cls.__mro__:
+        if c is object:
+            return false
+        if "__getstate__" in c.__dict__:
+            return true
+    return false
+
+
+# Python's implementation of object.__reduce_ex__ for protocols 0 and 1
+def _reduce_ex(self, proto):
+    var cls = self.__class__
+    var base = object
+    for b in cls.__mro__:
+        if _is_builtin_type(b) or b is object:
+            base = b
+            break
+    var state = none
+    if base is not object:
+        if base is cls:
+            raise TypeError("cannot pickle " + repr(cls.__name__) + " object")
+        state = base(self)
+    var args = (cls, base, state)
+    var dict = none
+    if _has_own_getstate(cls):
+        dict = self.__getstate__()
+    else:
+        if getattr(self, "__slots__", none):
+            raise TypeError("cannot pickle " + repr(cls.__name__) + " object: a class that defines __slots__ "
+                            + "without defining __getstate__ cannot be pickled with protocol " + str(proto))
+        dict = _ny_getstate(self)
+    if dict:
+        return _reconstructor, args, dict
+    return _reconstructor, args
+
+
+def __newobj__(cls, *args):
+    return cls.__new__(cls, *args)
+
+
+def __newobj_ex__(cls, args, kwargs):
+    return cls.__new__(cls, *args, **kwargs)
+
+
+def _slotnames(cls):
+    var names = cls.__dict__.get("__slotnames__")
+    if names is not none:
+        return names
+    names = []
+    if not hasattr(cls, "__slots__"):
+        pass
+    else:
+        for c in cls.__mro__:
+            if "__slots__" in c.__dict__:
+                var slots = c.__dict__["__slots__"]
+                if isinstance(slots, str):
+                    slots = (slots,)
+                for name in slots:
+                    if name == "__dict__" or name == "__weakref__":
+                        continue
+                    elif name.startswith("__") and not name.endswith("__"):
+                        var stripped = c.__name__.lstrip("_")
+                        if stripped:
+                            names.append("_" + stripped + name)
+                        else:
+                            names.append(name)
+                    else:
+                        names.append(name)
+    try:
+        cls.__slotnames__ = names
+    except Exception:
+        pass
+    return names
+
+
+# ── object.__getstate__ / __reduce_ex__ (CPython's typeobject.c) ───────────
+def _ny_has_dict(obj):
+    try:
+        obj.__dict__
+        return true
+    except AttributeError:
+        return false
+    except TypeError:
+        return false
+
+
+def _ny_getstate(obj, required=false):
+    var state = none
+    if _ny_has_dict(obj):
+        var d = obj.__dict__
+        if len(d):
+            state = dict(d)
+    var slotnames = _slotnames(type(obj))
+    if len(slotnames) > 0:
+        var slots = {}
+        for name in slotnames:
+            var sentinel = slots
+            var v = getattr(obj, name, sentinel)
+            if v is not sentinel:
+                slots[name] = v
+        if len(slots) > 0:
+            state = (state, slots)
+    return state
+
+
+def _ny_getnewargs(obj):
+    var cls = type(obj)
+    var gx = getattr(cls, "__getnewargs_ex__", none)
+    if gx is not none:
+        var na = obj.__getnewargs_ex__()
+        if not isinstance(na, tuple):
+            raise TypeError("__getnewargs_ex__ should return a tuple, not '" + type(na).__name__ + "'")
+        if len(na) != 2:
+            raise ValueError("__getnewargs_ex__ should return a tuple of length 2, not " + str(len(na)))
+        if not isinstance(na[0], tuple):
+            raise TypeError("first item of the tuple returned by __getnewargs_ex__ must be a tuple, not '"
+                            + type(na[0]).__name__ + "'")
+        if not isinstance(na[1], dict):
+            raise TypeError("second item of the tuple returned by __getnewargs_ex__ must be a dict, not '"
+                            + type(na[1]).__name__ + "'")
+        return na[0], na[1]
+    var g = getattr(cls, "__getnewargs__", none)
+    if g is not none:
+        var a = obj.__getnewargs__()
+        if not isinstance(a, tuple):
+            raise TypeError("__getnewargs__ should return a tuple, not '" + type(a).__name__ + "'")
+        return a, none
+    return none, none
+
+
+def _ny_reduce_newobj(obj):
+    var cls = type(obj)
+    var na = _ny_getnewargs(obj)
+    var args = na[0]
+    var kwargs = na[1]
+    var hasargs = args is not none
+    var newobj = none
+    var newargs = none
+    if kwargs is none or len(kwargs) == 0:
+        newobj = __newobj__
+        newargs = (cls,) + (args if args is not none else ())
+    else:
+        newobj = __newobj_ex__
+        newargs = (cls, args, kwargs)
+    var state = none
+    if _has_own_getstate(cls):
+        state = obj.__getstate__()
+    else:
+        state = _ny_getstate(obj, not (hasargs or isinstance(obj, list) or isinstance(obj, dict)))
+    var listitems = iter(obj) if isinstance(obj, list) else none
+    var dictitems = iter(obj.items()) if isinstance(obj, dict) else none
+    return newobj, newargs, state, listitems, dictitems
+
+
+def _ny_reduce_ex(obj, proto):
+    # object.__reduce_ex__: a class's own __reduce__ wins
+    var cls = type(obj)
+    for c in cls.__mro__:
+        if c is object:
+            break
+        if "__reduce__" in c.__dict__:
+            return obj.__reduce__()
+    if isinstance(obj, BaseException):
+        var d = obj.__dict__ if _ny_has_dict(obj) else {}
+        var st = {}
+        for k in d:
+            if not k.startswith("__"):
+                st[k] = d[k]
+        if len(st):
+            return cls, tuple(obj.args), st
+        return cls, tuple(obj.args)
+    if proto >= 2:
+        return _ny_reduce_newobj(obj)
+    return _reduce_ex(obj, proto)
+
+
+# ── the extension registry ──────────────────────────────────────────────────
+_extension_registry = {}
+_inverted_registry = {}
+_extension_cache = {}
+
+
+def add_extension(module, name, code):
+    code = int(code)
+    if not 1 <= code <= 0x7fffffff:
+        raise ValueError("code out of range")
+    var key = (module, name)
+    if _extension_registry.get(key) == code and _inverted_registry.get(code) == key:
+        return
+    if key in _extension_registry:
+        raise ValueError("key " + str(key) + " is already registered with code " + str(_extension_registry[key]))
+    if code in _inverted_registry:
+        raise ValueError("code " + str(code) + " is already in use for key " + str(_inverted_registry[code]))
+    _extension_registry[key] = code
+    _inverted_registry[code] = key
+
+
+def remove_extension(module, name, code):
+    var key = (module, name)
+    if _extension_registry.get(key) != code or _inverted_registry.get(code) != key:
+        raise ValueError("key " + str(key) + " is not registered with code " + str(code))
+    del _extension_registry[key]
+    del _inverted_registry[code]
+    if code in _extension_cache:
+        del _extension_cache[code]
+
+
+def clear_extension_cache():
+    _extension_cache.clear()

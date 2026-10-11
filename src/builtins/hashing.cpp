@@ -33,6 +33,10 @@
 
 Value dispatch_hash(NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 std::vector<std::string> hash_builtin_names();
+// DEFLATE / zlib / gzip (round 79, builtins/nyzlib.cpp): registered and
+// dispatched through this module's entry points
+Value dispatch_zlib(NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
+std::vector<std::string> zlib_builtin_names();
 
 namespace {
 
@@ -92,10 +96,12 @@ bool os_random(std::string& out, size_t n) {
 } // namespace
 
 std::vector<std::string> hash_builtin_names() {
-    return {"_hash_new", "_hash_update", "_hash_digest", "_hash_copy", "_hash_free", "_hash_info",
+    std::vector<std::string> v{"_hash_new", "_hash_update", "_hash_digest", "_hash_copy", "_hash_free", "_hash_info",
             "_hash_algorithms", "_hash_hmac", "_hash_pbkdf2", "_hash_crc32", "_hash_adler32",
             "_hash_b64encode", "_hash_b64decode", "_hash_b32encode", "_hash_b32decode", "_hash_compare",
             "os_urandom", "_ws_mask"};
+    for (auto& n : zlib_builtin_names()) v.push_back(n);   // round 79
+    return v;
 }
 
 Value dispatch_hash(NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx) {
@@ -122,6 +128,7 @@ Value dispatch_hash(NythonExecutor& E, const std::string& name, std::vector<Valu
         for (; i < n; i++) p[i] = (char)(p[i] ^ key[i & 3]);
         return E.makeBytesValue(data);
     }
+    if (name.compare(0, 6, "_zlib_") == 0) return dispatch_zlib(E, name, args, ctx);   // round 79
     if (name.compare(0, 6, "_hash_") != 0) return UNDEFINED_VALUE;
     nyos::Args A(E, args, {"h", "name", "data", "digest_size", "key", "length", "msg", "password", "salt",
                            "iterations", "dklen", "value", "altchars", "pad", "validate", "a", "b"});
