@@ -249,6 +249,23 @@ check("static and class methods", [n.static(1, 2), Named.static(3, 4), n.klass(5
       [3, 7, ["Named", 5], ["Named", 6]])
 check("a property whose parameter is not self", n.prop, 107)
 
+import asyncio
+class AsyncNamed:
+    def __init__(this):
+        this.v = 3
+    async def get(this, x):
+        await asyncio.sleep(0)
+        return this.v + x
+    async def twice(s):
+        return s.v * 2
+    @classmethod
+    async def make(cls):
+        return cls.__name__
+async def async_main():
+    a = AsyncNamed()
+    return [await a.get(1), await a.twice(), await AsyncNamed.make()]
+check("async methods whatever their first parameter is called", asyncio.run(async_main()), [4, 6, "AsyncNamed"])
+
 class Meta(type):
     def describe(cls):
         return "class " + cls.__name__
@@ -303,6 +320,8 @@ check("type(module) is the module type",
       [type(types) is types.ModuleType, isinstance(types, types.ModuleType), type(types).__name__,
        repr(type(types)), isinstance({}, types.ModuleType), type(types) is dict],
       [True, True, "module", "<class 'module'>", False, False])
+check("a module's repr", [repr(types).startswith("<module 'types' from '"), repr(types).endswith("types.ny'>" if nython else "types.py'>"),
+                         str(types) == repr(types)], [True, True, True])
 mod = types.ModuleType("made", "doc")
 check("ModuleType makes a module", [type(mod) is types.ModuleType, mod.__name__, mod.__doc__], [True, "made", "doc"])
 
@@ -536,6 +555,12 @@ class P3:
     def __rpow__(self, b):
         return ("rpow", b)
 check("pow() with objects", [pow(P3(), 2), pow(P3(), 2, 5), pow(2, P3())], [("pow", 2, None), ("pow", 2, 5), ("rpow", 2)])
+class GetattrStr:
+    def __getattr__(self, name):
+        return name.upper()
+check("what __getattr__ gives is called only if callable", [GetattrStr().foo, raises(lambda: GetattrStr().foo())],
+      ["FOO", "TypeError: 'str' object is not callable"])
+check("object() takes no attributes", raises(setattr, object(), "x", 1), "AttributeError: 'object' object has no attribute 'x'")
 
 for r in results:
     if r[1]:

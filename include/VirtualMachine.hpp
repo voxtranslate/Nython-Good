@@ -4510,7 +4510,20 @@ private:
     // str(v) and repr(v) with the user's __str__/__repr__, also for the
     // items of a list or map (which rendered as "<C instance>" through
     // VMVal::repr, which cannot call into the program).
+    // a module: <module 'name' from 'file'>, as Python shows it (round 78;
+    // its namespace printed as a dict)
+    std::string module_text(const VMVal& v) {
+        auto field=[&](const char* k)->std::string{
+            auto it=v.map->find(k);
+            if(it==v.map->end()) it=v.map->find(nypy::key_of_str(k));
+            return it!=v.map->end()&&it->second.type==VMType::STRING?it->second.s:std::string();
+        };
+        std::string nm=field("__name__"), file=field("__file__");
+        if(nm.empty()) nm=v.class_name;
+        return "<module "+nypy::str_repr(nm)+(file.empty()?std::string(" (built-in)"):" from "+nypy::str_repr(file))+">";
+    }
     std::string vm_str(const VMVal& v) {
+        if(v.type==VMType::MAP&&is_module_ns(v)&&!is_property_desc(v)&&v.class_name.rfind("__",0)!=0) return module_text(v);   // round 78
         if(v.type==VMType::CLASS&&!class_meta_.empty()){
             VMVal r;
             if(meta_call(v,"__str__",{},r)||meta_call(v,"__repr__",{},r)) return r.to_string();
@@ -4531,6 +4544,7 @@ private:
         return v.to_string();
     }
     std::string vm_repr(const VMVal& v) {
+        if(v.type==VMType::MAP&&is_module_ns(v)&&!is_property_desc(v)&&v.class_name.rfind("__",0)!=0) return module_text(v);   // round 78
         if(v.type==VMType::CLASS&&!class_meta_.empty()){
             VMVal r;
             if(meta_call(v,"__repr__",{},r)) return r.to_string();
@@ -8769,6 +8783,9 @@ private:
                 return;
             }
         }
+        // object() itself has no __dict__ (round 78: it took attributes)
+        if(obj.type==VMType::INSTANCE&&obj.class_name=="object")
+            raise_native_exception("AttributeError","'object' object has no attribute '"+attr+"'");
         if(any_data_descr_){
             VMVal d, m;
             if(data_descriptor(obj, attr, "__set__", d, m)){
@@ -9380,6 +9397,7 @@ private:
                 if(class_lookup(obj.class_name, "__getattr__", ga)){
                     std::vector<VMVal> ga_args{VMVal::make_str(method)};
                     VMVal target=invoke_method(ga, obj, ga_args, obj.class_name);
+                    check_callable(target);   // round 78: a str gave none
                     return vm_call(target, args, std::nullopt, kwargs);
                 }
             }

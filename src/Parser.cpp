@@ -414,6 +414,8 @@ node_ptr Parser::statement(){
         // names (`@repeat`, `@final`) read as names, as everywhere.
         node_ptr dec_expr = ternary();
         have(TokenType::NewLine);
+        // `@staticmethod async def f(x)`: no method (round 78, functionDecl)
+        if(dec_expr && dec_expr->type() == NodeType::VARIABLE && dec_expr->value() == "staticmethod") next_def_static_ = true;
         // Parse the decorated function or class
         node_ptr target = statement();
         {
@@ -2693,7 +2695,7 @@ static void forward_params(const Token& t, CallNode* call, const std::vector<nod
     }
 }
 
-static node_ptr async_def_desugar(const Token& tok, node_ptr fn, bool is_generator) {
+static node_ptr async_def_desugar(const Token& tok, node_ptr fn, bool is_generator, bool class_method = false) {
     auto* f = static_cast<FunctionNode*>(fn.get());
     Token t = tok;
     auto name_tok = [&](const std::string& v) { Token x = t; x.value = v; return x; };
@@ -2718,6 +2720,12 @@ static node_ptr async_def_desugar(const Token& tok, node_ptr fn, bool is_generat
         (f->params[0]->value() == "self" || f->params[0]->value() == "this");
     node_ptr ref;
     if (method) ref = make_node<AttributeNode>(name_tok(f->name), make_node<SelfNode>(name_tok("self")), f->name);
+    else if (class_method && !f->params.empty() && f->params[0]->value()[0] != '*' && f->params[0]->value() != "/") {
+        // a method whose first parameter is not self (`async def m(s)`, an
+        // async classmethod's cls): reached through that parameter (round 78)
+        method = true;
+        ref = make_node<AttributeNode>(name_tok(f->name), make_node<VariableNode>(name_tok(f->params[0]->value())), f->name);
+    }
     else ref = make_node<VariableNode>(name_tok(f->name));
     auto again = make_node<CallNode>(t, ref);
     forward_params(t, static_cast<CallNode*>(again.get()), f->params, method ? 1 : 0);
@@ -2744,6 +2752,10 @@ static node_ptr async_def_desugar(const Token& tok, node_ptr fn, bool is_generat
 node_ptr Parser::functionDecl(bool is_method){
     bool is_async = s_async_def_next;
     s_async_def_next = false;
+    // a def directly in a class body is a method whatever its first
+    // parameter is called, unless it is a static method (round 78)
+    bool class_method = !ann_scope_.empty() && ann_scope_.back() == 'c' && !next_def_static_;
+    next_def_static_ = false;
     Token tok = token();
     next(); // consume def/function/fn
     // `def __m` in a class binds _C__m; __qualname__ is C.__m (round 78)
@@ -2809,7 +2821,7 @@ node_ptr Parser::functionDecl(bool is_method){
         }
         static_cast<FunctionNode*>(fn.get())->annotations = m;
     }
-    if(is_async) return async_def_desugar(tok, fn, is_gen);
+    if(is_async) return async_def_desugar(tok, fn, is_gen, class_method && name != "__new__");
     return fn;
 }
 

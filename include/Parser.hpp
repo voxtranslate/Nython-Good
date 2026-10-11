@@ -83,6 +83,9 @@ private:
     // (`f(__x=1)`) and the names __name__/__qualname__ report stay as
     // written, as in CPython (rawToken / the raw name).
     std::vector<std::string> mangle_stack_;
+    // `@staticmethod` precedes the def being parsed (round 78: an async def
+    // in a class body is a method otherwise, async_def_desugar)
+    bool next_def_static_ = false;
     static bool manglable(const std::string& v){
         return v.size() > 2 && v[0] == '_' && v[1] == '_'
                && !(v[v.size()-1] == '_' && v[v.size()-2] == '_') && v.find('.') == std::string::npos;

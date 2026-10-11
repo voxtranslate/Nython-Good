@@ -2438,12 +2438,19 @@ public:   // NythonExecutor is a struct: members default to public
         if (r && where) *where = owner;
         return r;
     }
+    Node* object_class_node_ = nullptr;
     void setAttr(const Value& obj, const std::string& name, const Value& val) {
         if (isInstanceValue(obj) && instanceAttrHook(obj, 0)) {
             std::vector<Value> a{makeStringValue(name), val};
             Value o = obj;
             callMethod(o, "__setattr__", a, global_ctx);
             return;
+        }
+        // object() itself has no __dict__ (round 78: it took attributes)
+        if (isInstanceValue(obj)) {
+            if (!object_class_node_) object_class_node_ = classNodeByName("object");
+            if (object_class_node_ && classNodeOfInstance(obj) == object_class_node_)
+                pyRaise("AttributeError", "'object' object has no attribute '" + name + "'");
         }
         if (any_data_descr_) {
             Value d;
@@ -3582,6 +3589,20 @@ public:   // NythonExecutor is a struct: members default to public
             default: break;
         }
         if (depth > 50) return "...";
+        // a module: <module 'name' from 'file'>, as Python shows it (round
+        // 78; its namespace printed as a dict)
+        if (v.isCollectable() && v.value.gc && isModuleNamespace(v)) {
+            auto* o = dynamic_cast<Object*>(contOf(v));
+            std::string nm = o->getName(), file;
+            auto field = [&](const char* k) -> std::string {
+                auto it = o->container->find(k);
+                if (it == o->container->end()) it = o->container->find(nypy::key_of_str(k));
+                return it != o->container->end() && isStringValue(it->second) ? getStringValue(it->second) : std::string();
+            };
+            if (!field("__name__").empty()) nm = field("__name__");
+            file = field("__file__");
+            return "<module " + nypy::str_repr(nm) + (file.empty() ? std::string(" (built-in)") : " from " + nypy::str_repr(file)) + ">";
+        }
         if (v.type == ValueType::USERDATA) {
             if (!v.value.p) return "none";
             // str(b) is its repr, as in Python
@@ -5658,6 +5679,11 @@ public:   // NythonExecutor is a struct: members default to public
             Value target = callMethod(obj, "__getattr__", a, ctx);
             if (isInstanceValue(target) && instanceHasMethod(target, "__call__"))
                 return callMethod(target, "__call__", args, ctx, kw_in);
+            // what it gave must be callable (round 78: a str gave none)
+            if (target.type == ValueType::INTEGER || target.type == ValueType::DOUBLE || target.type == ValueType::BOOLEAN
+                || target.type == ValueType::NONE || bytesOf(target) || (isStringValue(target) && !func_names.count(target.value.p))
+                || (contOf(target) && !isInstanceValue(target)))
+                pyRaise("TypeError", "'" + typeNameOf(target) + "' object is not callable");
             return callFunctionValue(target, args, ctx);
         }
         // BaseException's own methods called through a class, as subclasses
