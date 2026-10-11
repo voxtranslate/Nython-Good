@@ -1645,7 +1645,10 @@ class Unpickler:
             var pid = st.pop()
             st.append(self.persistent_load(pid))
         else:
-            raise UnpicklingError("invalid load key, " + repr(chr(key)) + ".")
+            # (as _pickle.c: printable ASCII as itself, anything else as \xNN)
+            if 0x20 <= key and key <= 0x7e and key != 0x27 and key != 0x5c:
+                raise UnpicklingError("invalid load key, '" + chr(key) + "'.")
+            raise UnpicklingError("invalid load key, '\\x%02x'." % key)
 
     def _build(self, inst, state):
         var setstate = getattr(inst, "__setstate__", none)
@@ -1705,7 +1708,7 @@ def load(file, fix_imports=true, encoding="ASCII", errors="strict", buffers=none
 
 def loads(data, fix_imports=true, encoding="ASCII", errors="strict", buffers=none):
     if isinstance(data, str):
-        raise TypeError("Can't load pickle from unicode string")
+        raise TypeError("a bytes-like object is required, not 'str'")
     var u = Unpickler(none, fix_imports, encoding, errors, buffers)
     u._set_bytes(bytes(data))
     return u.load()

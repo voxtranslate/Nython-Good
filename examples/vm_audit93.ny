@@ -1148,6 +1148,19 @@ check("__slots__ errors", [raises(make_class, "    __slots__ = ('x',)\n    x = 1
                            raises(make_class, "    __slots__ = (1,)\n"), raises(make_class, "    __slots__ = ('__dict__', '__dict__')\n")],
       ["ValueError: 'x' in __slots__ conflicts with class variable", "TypeError: __slots__ must be identifiers",
        "TypeError: __slots__ items must be strings, not 'int'", "TypeError: __dict__ slot disallowed: we already got one"])
+
+def make_sub(base, body):
+    ns = {}
+    exec("class C(" + base + "):\n" + body, ns)
+    return ns["C"]
+
+SStr = make_sub("str", "    __slots__ = ('a',)\n")
+sst = SStr("q")
+sst.a = 1
+check("__slots__ on builtin subclasses", [raises(make_sub, "int", "    __slots__ = ('a',)\n"), raises(make_sub, "tuple", "    __slots__ = ('a',)\n"),
+                                          make_sub("int", "    __slots__ = ()\n")(5) + 1, sst.upper(), sst.a, raises(setattr, sst, "b", 2)],
+      ["TypeError: nonempty __slots__ not supported for subtype of 'int'", "TypeError: nonempty __slots__ not supported for subtype of 'tuple'",
+       6, "Q", 1, "AttributeError: 'C' object has no attribute 'b'"])
 sd = SlottedWithDict()
 sd.x = 1
 sd.free = 2

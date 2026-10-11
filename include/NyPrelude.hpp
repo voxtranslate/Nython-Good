@@ -3129,6 +3129,9 @@ def _ny_init_slots(cls):
     # type.__new__'s handling of __slots__
     var names = _ny_slots_of(cls)
     var ns = cls.__dict__
+    if names and issubclass(cls, (int, bytes, tuple)):
+        # variable-size builtins hold no slots (tp_itemsize != 0)
+        raise TypeError("nonempty __slots__ not supported for subtype of '" + cls.__bases__[0].__name__ + "'")
     var base_dict = False
     var base_weak = False
     for b in cls.__mro__[1:]:

@@ -12080,8 +12080,11 @@ public:
             return true;
         }
         // every class reaches object's __subclasses__ and mro (round 77;
-        // a class naming no base has no object in its MRO here)
-        if (!after && (name == "__subclasses__" || name == "mro")) {
+        // a class naming no base has no object in its MRO here), and its
+        // pickle/copy protocol: __reduce_ex__, __reduce__, __getstate__
+        // (round 79)
+        if (!after && (name == "__subclasses__" || name == "mro" || name == "__reduce_ex__" || name == "__reduce__"
+                       || name == "__getstate__")) {
             Node* objn = classNodeByName("object");
             if (objn && objn != cls && std::find(mro.begin(), mro.end(), objn) == mro.end())
                 return findClassMember(objn, name, out, owner);

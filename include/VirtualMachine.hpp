@@ -5177,8 +5177,10 @@ private:
             if(owner) *owner=(*mro)[i];
             return true;
         }
-        // every class reaches object's __subclasses__ and mro (round 77)
-        if(!after&&(attr=="__subclasses__"||attr=="mro")&&cls!="object"
+        // every class reaches object's __subclasses__ and mro (round 77),
+        // and its pickle/copy protocol: __reduce_ex__, __reduce__,
+        // __getstate__ (round 79)
+        if(!after&&(attr=="__subclasses__"||attr=="mro"||attr=="__reduce_ex__"||attr=="__reduce__"||attr=="__getstate__")&&cls!="object"
            &&std::find(mro->begin(),mro->end(),std::string("object"))==mro->end())
             return class_lookup("object",attr,out,owner);
         return false;
