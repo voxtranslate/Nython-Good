@@ -621,6 +621,17 @@ void Lexer::read_token() {
     reset_token();
     source.reset_frame();
     bool potential_keyword = true;
+    // round 79: the ++ / -- at the current character sits between an operand
+    // and another operand glued to it (x--y): Python's binary and unary sign
+    auto glued_unary = [this]() {
+        char n = this->source.peek_char(1);
+        bool operand_next = std::isalnum((unsigned char)n) || n == '_' || n == '(' || n == '['
+                            || n == '"' || n == '\'' || (unsigned char)n >= 0x80;
+        if (!operand_next || tokens.empty()) return false;
+        TokenType pt = tokens.back().type();
+        return pt == TokenType::Identifier || pt == TokenType::Integer || pt == TokenType::Float
+            || pt == TokenType::ParenClose || pt == TokenType::BracketClose || pt == TokenType::String;
+    };
     switch(source.read_char()) {
         case '0':
         case '1':
@@ -1042,6 +1053,15 @@ void Lexer::read_token() {
         }
         /// + -  *
         case '+': {
+            // round 79: x++y / x--y are Python's x + (+y) / x - (-y): after
+            // an operand, a ++ or -- glued to another operand is two
+            // operators, not Nython's postfix increment / decrement
+            // (_pydecimal's `a--n//a>>1` read as a decrement)
+            if (this->source.peek_char() == '+' && glued_unary()) {
+                this->token.value = "+";
+                make_token(TokenType::Add,TokenKind::Plus,TokenClass::Operator);
+                break;
+            }
             switch (this->source.peek_char()) {
                 case '+': {
                   this->token.value = "++";
@@ -1064,6 +1084,11 @@ void Lexer::read_token() {
             break;
         }
         case '-': {
+            if (this->source.peek_char() == '-' && glued_unary()) {   // round 79: see '+'
+                this->token.value = "-";
+                make_token(TokenType::Sub,TokenKind::Minus,TokenClass::Operator);
+                break;
+            }
             switch (this->source.peek_char()) {
                 case '-': {
                   this->token.value = "--";
