@@ -742,10 +742,13 @@ class Fraction:
                 return false
             var r = other.as_integer_ratio()
             return self._numerator == r[0] and self._denominator == r[1]
-        return false
+        # round 80: NotImplemented, as CPython - the other operand's __eq__
+        # decides (Decimal("0.5") == Fraction(1, 2))
+        return NotImplemented
 
     def __ne__(self, other):
-        return not self.__eq__(other)
+        var r = self.__eq__(other)
+        return r if r is NotImplemented else not r
 
     def _cmp(self, other, opname):
         # -1 / 0 / 1 against a rational or a finite float; None for a nan

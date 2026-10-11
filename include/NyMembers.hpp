@@ -63,6 +63,7 @@ inline MemberKind type_kind(const std::string& t) {
 inline bool type_classmethod(const std::string& t, const std::string& m) {
     if (t == "int" || t == "bool") return m == "from_bytes";
     if (t == "bytes" || t == "bytearray") return m == "fromhex" || m == "maketrans";
+    if (t == "str") return m == "maketrans";   // round 80 (the prelude's _ny_str_maketrans)
     if (t == "dict") return m == "fromkeys";
     if (t == "float") return m == "fromhex";
     return false;
@@ -78,7 +79,8 @@ inline const std::unordered_set<std::string>* kind_methods(MemberKind k) {
         "ljust", "lower", "lstrip", "partition", "removeprefix", "removesuffix", "repeat", "replace",
         "reverse", "reversed", "rfind", "rindex", "rjust", "rpartition", "rsplit", "rstrip", "size",
         "slice", "split", "splitlines", "starts_with", "startswith", "strip", "substr", "substring",
-        "swapcase", "title", "to_float", "to_int", "to_integer", "to_number", "trim", "upper", "zfill"};
+        "swapcase", "title", "to_float", "to_int", "to_integer", "to_number", "trim", "upper", "zfill",
+        "maketrans", "translate"};   // round 80
     static const std::unordered_set<std::string> list_m = {
         "__contains__", "__format__", "add", "append", "clear", "contains", "copy", "count", "difference", "discard",
         "each", "extend", "filter", "fold", "forEach", "has", "includes", "index", "indexOf", "insert",

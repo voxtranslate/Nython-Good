@@ -142,6 +142,10 @@ inline void tick() {
     if (__builtin_expect(g_gil_waiters.load(std::memory_order_relaxed) != 0, 0)) tick_slow();
 }
 bool active();                              // true once a second thread exists
+// sys.getswitchinterval / setswitchinterval (round 80): the hand-over
+// interval in seconds (5 ms; at least 1 us)
+double switch_interval();
+void set_switch_interval(double seconds);
 // True when this thread may touch engine values: it holds the GIL, or there
 // is no GIL yet (one thread).
 bool holds_gil();

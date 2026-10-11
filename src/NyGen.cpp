@@ -473,7 +473,7 @@ bool resume_function(NythonExecutor& E, Gen* g, Mode m) {
         raise("RuntimeError", "generator '" + g->name + "' was started on another thread; a started "
               "generator can only be resumed by the thread that started it");
     int rd = NythonExecutor::call_depth_;
-    if (rd + 1 >= NythonExecutor::kMaxCallDepth || nycoro::stack_exhausted())
+    if (rd + 1 >= NythonExecutor::maxCallDepth() || nycoro::stack_exhausted())
         raise("RecursionError", "maximum recursion depth exceeded while resuming generator '" + g->name + "'");
     if (!g->co) {
         try { g->co = nycoro::create(&entry, g); }

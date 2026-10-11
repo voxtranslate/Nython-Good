@@ -661,6 +661,73 @@ Value dispatch_core(NythonExecutor& E,
         // globals() is its own): unittest.main() finds the program's
         // TestCase classes here, as Python's reads sys.modules["__main__"].
         if (name == "_ny_main_globals") return E.reflectGlobals(nullptr);
+        // sys.modules and importlib (round 80; the VM has its own)
+        if (name == "_ny_modules") return E.sysModulesValue();
+        if (name == "_ny_module_new") return E.moduleNew(args.empty() ? std::string() : E.getStringValue(args[0]));
+        if (name == "_ny_module_exec") {
+            if (args.size() < 3) E.pyRaise("TypeError", "_ny_module_exec(module, path, name)");
+            return E.moduleExec(args[0], E.getStringValue(args[1]), E.getStringValue(args[2]));
+        }
+        if (name == "_ny_find_module") return E.findModule(args.empty() ? std::string() : E.getStringValue(args[0]));
+        // sys's facts (round 80): plain values both engines read (the VM
+        // through the builtin bridge)
+        if (name == "_ny_sys_info") {
+            std::string k = args.empty() ? std::string() : E.getStringValue(args[0]);
+            if (k == "flags") {
+                auto& f = nyrt::cli_flags();
+                std::vector<Value> v;
+                for (int x : {f.debug, f.inspect, f.interactive, f.optimize, f.dont_write_bytecode, f.no_user_site,
+                              f.no_site, f.ignore_environment, f.verbose, f.bytes_warning, f.quiet,
+                              f.hash_randomization, f.isolated, f.dev_mode, f.utf8_mode, f.warn_default_encoding,
+                              f.safe_path, f.int_max_str_digits})
+                    v.push_back(Value(x));
+                return E.makeListValue(v);
+            }
+            if (k == "path") {
+                // CPython's sys.path: the script's directory ("" for -c and
+                // the prompt), NYTHONPATH, the standard library
+                std::vector<std::string> p;
+                const std::string& sp = nyrt::script_path();
+                size_t cut = sp.find_last_of("/\\");
+                p.push_back(cut == std::string::npos ? std::string() : sp.substr(0, cut));
+                for (auto d : nyrt::library_dirs()) {
+                    while (d.size() > 1 && (d.back() == '/' || d.back() == '\\')) d.pop_back();
+                    p.push_back(d);
+                }
+                return E.nyos_list_of(p);
+            }
+            if (k == "orig_argv") return E.nyos_list_of(nyrt::orig_argv());
+            if (k == "switch_interval") {
+                // sys.getswitchinterval / setswitchinterval: the GIL's
+                // hand-over interval (NyConc.cpp)
+                if (args.size() > 1) {
+                    double s = args[1].type == ValueType::DOUBLE ? args[1].value.d
+                             : args[1].type == ValueType::INTEGER ? (double)bigint_to_i64(args[1].value.i) : 0.0;
+                    nyconc::set_switch_interval(s);
+                    return NONE_VALUE;
+                }
+                return Value(nyconc::switch_interval());
+            }
+            if (k == "prefix") {
+                // the directory holding the standard library's lib/
+                auto dirs = nyrt::library_dirs();
+                std::string d = dirs.empty() ? std::string() : dirs.back();
+                while (d.size() > 1 && (d.back() == '/' || d.back() == '\\')) d.pop_back();
+                size_t cut = d.find_last_of("/\\");
+                return E.makeStringValue(cut == std::string::npos ? std::string() : d.substr(0, cut));
+            }
+            return NONE_VALUE;
+        }
+        if (name == "_ny_recursion_limit") {
+            // sys.getrecursionlimit() / setrecursionlimit(n): one limit both
+            // engines check (NyRuntime.hpp)
+            if (args.empty() || args[0].type == ValueType::NONE) return Value((int)nyrt::recursion_limit());
+            if (args[0].type != ValueType::INTEGER) E.pyRaise("TypeError", "'" + E.typeNameOf(args[0]) + "' object cannot be interpreted as an integer");
+            int64_t n = bigint_to_i64(args[0].value.i);
+            if (n < 1) E.pyRaise("ValueError", "recursion limit must be greater or equal than 1");
+            nyrt::recursion_limit() = n > 1000000 ? 1000000 : (int)n;
+            return NONE_VALUE;
+        }
         // The exception an except clause is handling now, here or in a
         // caller (sys.exc_info()[1]); none outside every except clause.
         if (name == "_ny_exc_current") {

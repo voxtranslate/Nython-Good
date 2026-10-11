@@ -44,6 +44,11 @@ struct Lexer extends ILexer{
     int level_                    = 0;
     int tab                       = TabSize;/// default tabulation.
     int errors                    = 0;/// number of errors
+    /// round 80: `${...}` in a quoted string is Python's text, not Nython's
+    /// interpolation (python_string_mode: a .py file, `# nython: module`,
+    /// `# nython: python`); such string tokens - and raw strings anywhere -
+    /// are made with TokenClass::Default instead of Literal.
+    bool python_strings           = false;
     int warnings                  = 0;/// number of errors
     int indent                    = 0;///  current indent level is the number of spaces in the last indent.
     /// Open ( [ { count. Indentation is meaningless inside a bracketed

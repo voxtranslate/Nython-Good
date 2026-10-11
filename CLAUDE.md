@@ -377,6 +377,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit93 | 176 | round 79: zlib (native DEFLATE, CPython-made streams read and Nython-made ones read by CPython, the opt-in optimal parse), binascii, gzip, zipfile, tarfile, pickle byte-identical to CPython at protocols 0-5, copyreg, array, `__slots__`, `__class__` assignment (passes under python3) |
 | vm_audit94 | 162 | round 79: difflib (byte-identical to CPython, plus patience/histogram diffs), shlex, configparser, tomllib (+ dumps), html, xml (an expat-compatible parser in Nython, ElementTree, minidom), ipaddress, graphlib, contextvars per task, concurrent.futures (threads and real processes), zoneinfo, mimetypes - generated from `tools/vm_audit94_spec.py` (152 pass under python3; 10 test Nython-only additions) |
 | vm_audit95 | 2050 | round 79: decimal - the API and 1,981 vectors with CPython's results and flags at precisions 9/16/34 (passes under python3) |
+| vm_audit96 | 116 | round 80: the gaps rounds 78-79 found - two interpreter crashes, object's members on every class, except <expression>, numeric keys across int/float/Fraction/Decimal, dataclass(slots=True), sys.modules/__import__/importlib, relative imports, sys's facts, sys.excepthook and -O, exec/eval namespaces, a live os.environ, threading._register_atexit, str.maketrans/translate, `${` in a Python-mode file (passes under python3) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -1129,6 +1130,45 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   (`Task::ctx_data` in `src/NyConc.cpp`).
 - Lexer: `"a" f"{x}"` concatenates; comment-only lines never open/close a
   block; `x--y` is `x - (-y)`. str methods take keyword arguments.
+
+## Round 80: the correctness gaps (see `HANDOFF.md` §0s)
+
+- **`sys.modules`** is the engines' registry as a real dict (import asks it
+  first; `del sys.modules[m]` reloads; an object put there is what `import`
+  binds); `__import__`; **`lib/importlib/`** (import_module, reload, util,
+  machinery, abc, resources), `lib/pkgutil.ny`, `lib/runpy.ny`; `sys.path`
+  is searched; modules get
+  `__package__`/`__path__`; **relative imports** (`from . import a`, `from
+  ..m import x`: the parser keeps the dots, the engines resolve them against
+  `__package__`).
+- **sys**: `version_info` (3.12, the language level; Nython's own version is
+  `sys.implementation.version`), `hash_info`, `float_info`, `int_info`,
+  `flags`, `get/setrecursionlimit` (one limit, `nyrt::recursion_limit`),
+  `getsizeof`, `intern`, `get/setswitchinterval` (the GIL's, settable),
+  `prefix`...; `__debug__`; **`-O`** drops asserts. **`sys.excepthook`**: a
+  program's own hook reports an uncaught exception instead of the engines
+  (the prelude's `_ny_format_uncaught` gives None, then nothing more is
+  printed).
+- **object's members reach every class** (`P.__eq__`, `Base.__init__(self)`
+  with no `__init__` in Base): looked for only where a class lookup failed
+  (`objectMember` / `object_member`; the prelude's `_NyObjectExtra` holds
+  the ones object's body must not, or every class would seem to define
+  `__eq__`/`__hash__`/`__repr__`).
+- **`except <expression>:`** (the parser lowers such clauses onto the
+  prelude's `_ny_exc_match`); a name bound to a tuple of classes works too.
+- **Prelude code resolves the real builtins** whatever a program rebinds
+  (`list = 5` at top level): the interpreter's prelude runs in
+  `prelude_ctx_`, the VM's code is tagged `VMCode::prelude_code` and does not
+  see the main frame.
+- **`${...}`** interpolates in Nython source only: never in raw strings,
+  bytes, f-strings, nor in quoted strings of a `.py` file, a `# nython:
+  module` library module or a file marked `# nython: python`.
+- `os.environ` writes through (putenv/unsetenv); `threading._register_atexit`
+  (ThreadPoolExecutor uses it); `str.maketrans`/`translate`; numeric keys
+  agree across int/float/Fraction/Decimal; `dataclass(slots=True)` rebuilds
+  the class; ImportError/AttributeError/NameError `name=` fields; two
+  interpreter segfaults fixed (classmethod(GenericAlias) as
+  `__class_getitem__`, a builtin's bound method as a class attribute).
 
 ## Transcripts
 

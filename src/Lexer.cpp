@@ -595,9 +595,40 @@ inline std::vector<Token> optimize(std::vector<Token> tk) {
 	return ret;
 }
 
+// round 80: whether `${...}` in an ordinary quoted string literal means
+// what Python means (the text) rather than Nython's interpolation: a .py
+// file, or a file whose leading comment block says `# nython: module` (the
+// standard library's Python modules) or `# nython: python`. Backtick
+// template strings interpolate everywhere; raw strings, bytes and f-strings
+// never do.
+static bool python_string_mode(const std::string& file, const std::string& code) {
+    if (file.size() > 3 && file.compare(file.size() - 3, 3, ".py") == 0) return true;
+    size_t i = 0;
+    while (i < code.size()) {
+        size_t e = code.find('\n', i);
+        if (e == std::string::npos) e = code.size();
+        size_t b = code.find_first_not_of(" \t\r", i);
+        if (b == std::string::npos || b >= e) { i = e + 1; continue; }   // a blank line
+        if (code[b] != '#') break;                                       // the code starts
+        size_t p = code.find("nython:", b);
+        if (p != std::string::npos && p < e) {
+            size_t w = code.find_first_not_of(" \t", p + 7);
+            if (w != std::string::npos && w < e) {
+                size_t we = w;
+                while (we < e && (std::isalnum((unsigned char)code[we]) || code[we] == '_' || code[we] == '-')) we++;
+                std::string word = code.substr(w, we - w);
+                if (word == "module" || word == "python") return true;
+            }
+        }
+        i = e + 1;
+    }
+    return false;
+}
+
 std::vector<Token> Lexer::tokenize() {
     reset();
     if(source.line_number()<0) source.read();
+    python_strings = python_string_mode(source.fileName(), source.sourceCode());
     while (!source.isAtEnd()) { /// this->token.type() != TokenType::End
         this->read_token();
     }
@@ -1907,7 +1938,7 @@ void Lexer::consume_raw_string(char q) {
     if (source.peek_char() == q) {
         source.read_char();
         if (source.peek_char() == q) { source.read_char(); n = 3; }
-        else { this->token.value = ""; make_token(TokenType::String,TokenKind::String,TokenClass::Literal); return; }
+        else { this->token.value = ""; make_token(TokenType::String,TokenKind::String,TokenClass::Default); return; }   // round 80: raw, no ${
     }
     while (true) {
         char c = source.read_char();
@@ -1943,7 +1974,7 @@ void Lexer::consume_raw_string(char q) {
         out += c;
     }
     this->token.value = out;
-    make_token(TokenType::String,TokenKind::String,TokenClass::Literal);
+    make_token(TokenType::String,TokenKind::String,TokenClass::Default);   // round 80: a raw string never interpolates ${...}
 }
 
 // The body of a bytes literal, its opening quote just read. Python's rules:
@@ -2266,7 +2297,9 @@ void Lexer::consume_string(char first) {
 		}
 	}
     this->token.value = strbuff.str();
-    make_token(TokenType::String,TokenKind::String,TokenClass::Literal);
+    // round 80: in a Python-mode file a quoted string's ${...} is its text
+    // (backtick template strings still interpolate)
+    make_token(TokenType::String,TokenKind::String,(python_strings && first != '`') ? TokenClass::Default : TokenClass::Literal);
 }
 
 void Lexer::consume_right_shift() {

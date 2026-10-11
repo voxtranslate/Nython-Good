@@ -3,7 +3,13 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 79 — **§0r** (zlib/DEFLATE written natively with an
+Last updated: round 80 — **§0s** (part A: the correctness gaps rounds
+78-79 found - two interpreter crashes, object's members on every class,
+`except <expression>`, numeric keys across int/float/Fraction/Decimal,
+`sys.modules`/`__import__`/importlib/pkgutil/runpy, relative imports,
+sys's facts and `sys.excepthook`, `-O`, a live `os.environ`, prelude code
+immune to rebound builtins, `${...}` only in Nython source; both engines).
+Round 79 — **§0r** (zlib/DEFLATE written natively with an
 opt-in Zopfli-style optimal parse; binascii, gzip, zipfile, tarfile, pickle
 byte-identical to CPython's, copyreg, array; `__slots__` and `__class__`
 assignment) and **§0r2** (decimal checked against 1,981 vectors, difflib
@@ -48,6 +54,227 @@ round 73 (the IDE to VS Code's model, verified by driving it). Earlier
 rounds: §0/§0b language-level work, §5.3 terminal command line / undo /
 multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
+
+---
+
+## 0s. Round 80, part A — the correctness gaps rounds 78-79 found (vm_audit96)
+
+`examples/vm_audit96.ny` (116 checks) passes on the interpreter, the VM and
+python3.11; every expected value is CPython's except one Nython-only check
+(code that is not marked Python still interpolates `${...}`). Both engines
+the same way unless said. Sweep: 419 runs, 0 not ok; ide_e2e 390/390;
+ide_lint and ide_memprobe clean.
+
+### Crashes (interpreter)
+- `__class_getitem__ = classmethod(types.GenericAlias)` then `A[int]`: the
+  class attribute is a classmethod *object* (its `__func__` a class, so the
+  engines do not unwrap it) and `classSubscript` called it as a function's
+  AST node. Now a descriptor's `__get__(None, C)` is called with the item
+  (the VM raised "'classmethod' object is not callable").
+- A generator's bound `__next__` stored as a class attribute and iterated:
+  `callClassMethod` declined any member that was not a function, class or
+  builtin, and the older path below read the bound member's heap object as a
+  FunctionNode (a type confusion, not a lifetime bug: the member is a counted
+  `nyheap::BMember`). Now any other callable a class holds - a builtin's bound
+  member, a bound method, an object with `__call__` - is called as it is (no
+  self added, as Python), and the old path only reads a function's pointer
+  as an AST node.
+
+### Object model
+- **object's members through every class** (`objectMember` /
+  `object_member`): a class naming no base has no `object` in the MRO the
+  engines search. Its members are now looked for where a lookup through the
+  class found nothing (instance and class reads, method calls, `super()`), so
+  attribute reads that succeed pay nothing. `object`'s class body keeps only
+  what the engines dispatch to themselves (`__init__`, `__new__`,
+  `__setattr__` ...); the rest - `__eq__ __ne__ __lt__ __le__ __gt__ __ge__
+  __hash__ __repr__ __str__ __format__ __sizeof__ __dir__` - is the prelude's
+  `_NyObjectExtra` (in `object`'s body every class would seem to define
+  `__eq__`/`__hash__`/`__repr__` to the protocol dispatch, and `==`/`hash`/
+  `repr` would run Nython code for every object). `P.__eq__ is
+  object.__eq__`, `Base.__init__(self)`, `super().__hash__()`,
+  `object.__repr__(x)` is CPython's `<__main__.P object at 0x...>` (the
+  engines' default `repr()` stays `<P instance>`). Measured: no change to
+  instance attribute access or method calls (the fallback runs only on a
+  miss).
+- Builtin exception classes and `object`: `__module__` is `"builtins"`,
+  `repr(KeyError)` `<class 'KeyError'>` (`nyrt::class_repr`).
+- `ImportError(msg, name=, path=)`, `AttributeError(msg, name=, obj=)`,
+  `NameError(msg, name=)` (3.10+), also through `super().__init__(...)`; the
+  runtime's own ModuleNotFoundError / AttributeError / NameError carry
+  `name` (read back from the message: `nython::ny_exc_name_from_message`).
+- VM: `iter([1]).__next__` (a list/tuple/str iterator's `__next__` called or
+  read as a value raised AttributeError); each builtin reached through the
+  bridge is one object (`bridge_natives_`), and `f_builtins` names natives
+  as `load_var` does, so `f_builtins["len"] is len`.
+- **`except <expression>:`** (Parser::tryStmt): any expression (`except
+  self._error:`, `except errs[0]:`, `except get():`, `except (A,) + (B,)
+  as e:`). The forms the engines match by name keep their path; from the
+  first clause with an expression on, the clauses become one catch-all whose
+  body tests them in order with the prelude's `_ny_exc_match` (CPython's
+  check: classes or a tuple of classes, else "catching classes that do not
+  inherit from BaseException is not allowed") and re-raises when none
+  matches. A *name* bound to a tuple (`ERRS = (A, B); except ERRS:`) is now
+  matched element by element (`excClauseMatches` / `match_except_handler`).
+- **Numeric keys**: an object with `__hash__` equal to a float or an int of
+  the same hash is that number's key (`hashedKey` / `hashed_key` try
+  `__float__` then `__int__`): `{Decimal("0.5"), 0.5}` has one element,
+  `{0.5: x}[Fraction(1, 2)]`, `{10**30: x}[Decimal(10)**30]`.
+  `Fraction.__eq__` returns NotImplemented for an unknown operand (so
+  `Fraction(1, 2) == Decimal("0.5")`, through Decimal's reflected `__eq__`).
+- `dataclass(slots=True)` rebuilds the class with `__slots__` (CPython's
+  `_add_slots`, `_get_slots`; frozen ones get `__getstate__`/`__setstate__`).
+
+### Modules, imports, sys
+- **`sys.modules`** is the engines' registry as a real dict
+  (`sysModulesValue` / `sys_modules_value`, made at `import sys` or first
+  `__import__`): every module registered afterwards is put in it
+  (`noteModule` / `note_module`), and an import first asks it (`syncModule` /
+  `sync_module`): a name deleted there is loaded again, a value assigned
+  there is what `import` binds (any object: `from m import x` reads its
+  attributes). `sys`, `os`, `math`, `builtins` (lib/builtins.ny) and
+  `__main__` (the prelude's `_NyMainModule`, the program's globals read
+  through it) are in it. `os` is one module now (it was made anew by each
+  import, each with its own environ snapshot).
+- **Relative imports** (`from . import a`, `from .m import x`, `from ..pkg
+  import y`, `from ... import z`) were a syntax error - the standard
+  library's packages import absolutely for that reason. The parser keeps the
+  leading dots (`.` `..` `...` tokens) in the module's name
+  (`Parser::importStmt`); both engines resolve it when the statement runs
+  with CPython's `_calc___package__` / `_resolve_name` over the importing
+  module's `__package__` (else `__name__`, `__path__`) -
+  `resolveRelativeImport` / `resolve_relative_import` - and CPython's two
+  ImportErrors ("attempted relative import with no known parent package",
+  "... beyond top-level package"); the rest is the absolute import.
+- Module files get `__package__` and packages `__path__`; `sys.path` is a
+  list the engines search (after the importing file's directory; the main
+  script's directory is searched from exec'd code too, CPython's
+  `sys.path[0]`).
+- **`__import__`** (prelude: CPython's level/fromlist/package rules and
+  messages) over `_ny_import_module` (an `import name as _ny_m` exec'd into a
+  dict); **`lib/importlib/`**: `import_module`, `reload` (the file run again
+  in the same module object - `_ny_module_exec`), `invalidate_caches`;
+  `util` (`find_spec` - meta-path finders a program installs, the builtin
+  modules, the files `import` would find - `module_from_spec`,
+  `spec_from_file_location`, `spec_from_loader`, `resolve_name`,
+  `LazyLoader`, `decode_source`; `cache_from_source` raises as CPython does
+  without a cache tag); `machinery` (`ModuleSpec`, `SourceFileLoader`,
+  `PathFinder`, `BuiltinImporter`, `NamespaceLoader`, `FileFinder`,
+  `SourceFileLoader.get_code`, suffixes); `abc`; `resources` (`files`,
+  `as_file` and the 3.11 functional API). **`lib/pkgutil.ny`**
+  (`iter_modules`, `walk_packages`, `get_data`, `resolve_name`,
+  `get_importer` - a FileFinder for a directory when no `sys.path_hooks`
+  entry claims it - `iter_importers`, `get_loader`/`find_loader`,
+  `extend_path`) and **`lib/runpy.ny`** (`run_module` with `alter_sys`,
+  `run_path` for a file or a directory with `__main__`; CPython's messages)
+  over them. New
+  natives (both engines): `_ny_modules`, `_ny_module_new`, `_ny_module_exec`,
+  `_ny_find_module`.
+- VM: `import sys` / `math` / `os` bound the module among the globals,
+  whatever the scope (`define_*_module`): a module's `del sys` removed the
+  program's, and `exec("import math as m", ns)` put `m` in the globals; they
+  are bound in the importing scope now (`define_var`). The interpreter's
+  `import math` put `PI`/`E` into an exec namespace (now only into the
+  program's own scope).
+- **sys**: the prelude's `_ny_sys_extend(sys)`, called by both engines when
+  they make the module: `version_info` (the language level the standard
+  library follows, 3.12, as a struct sequence - Nython's own 0.2.1 is
+  `sys.implementation.version`, `implementation.name == "nython"`, as PyPy
+  does), `hexversion`, `hash_info` (CPython's numeric hash: modulus 2**61-1,
+  inf 314159; str hashes are FNV), `float_info`, `int_info`, `flags` (from
+  the command line: `-O`, `-i`, `-q`, `-E`, `-s`, `-S`, `-b`),
+  `get/setrecursionlimit` (one limit both engines check -
+  `nyrt::recursion_limit`; the interpreter keeps its margin of 100 below it
+  and stops at the native stack past the default depth), `getsizeof`
+  (CPython 3.11's sizes for the builtin types, `__sizeof__` + GC header
+  otherwise), `intern`, `path`, `meta_path`/`path_hooks` (not consulted by
+  the import statement), `builtin_module_names`, `orig_argv`,
+  `getdefaultencoding`/`getfilesystemencoding`, `maxunicode`, `prefix`/
+  `exec_prefix`/`base_prefix`/`base_exec_prefix` (the directory holding
+  `lib/`), `platlibdir`, `get/setswitchinterval` (the GIL's hand-over
+  interval, settable now: `nyconc::set_switch_interval`, kept in whole
+  microseconds as CPython). `sys.modules["os.path"]` is `os.path`.
+- **`sys.excepthook`** / `sys.__excepthook__`: the default prints the
+  traceback on the current `sys.stderr`; a program's own hook is called for
+  an uncaught exception instead of the engines' report (the prelude's
+  `_ny_format_uncaught` calls it and gives None; then main.cpp's
+  `report_uncaught_string(s, hooked)` and the VM's `print_uncaught_traceback`
+  print nothing more - the status stays 1, `--trace` still records it). A
+  hook that raises: CPython's "Error in sys.excepthook:" ... "Original
+  exception was:".
+- **`__debug__`** is True; **`-O`** makes it False and the parser drops
+  `assert` statements (`-OO` keeps docstrings).
+- `locals()`/`globals()` list a program's dunder-named variables (`__x__`,
+  `__all__`); the engines' own names and the parser's temporaries stay out
+  (`nyrt::user_dunder_name`).
+- **`os.environ`** is the prelude's `_NyEnviron` (`os._Environ`): one object
+  for every import, setting/deleting/pop/update/clear call putenv/unsetenv so
+  `os.getenv` and child processes see them; `os.environb` on POSIX;
+  registered as a MutableMapping.
+- **Prelude code resolves the real builtins** whatever a program rebinds
+  (`list = 5` at top level broke `A.mro()`, every lazily loaded mirror chunk,
+  str.translate...). Interpreter: the prelude runs in `prelude_ctx_` - it
+  shares the global map while it loads (the engine reads its names there),
+  then gets a copy (`splitPreludeScope`); mirror chunks run there and copy
+  the names they add to the globals. VM: prelude and mirror code is tagged
+  (`VMCode::prelude_code`) and does not see the main program's frame. The
+  slots chunk's `_ny_b_*` aliases are gone.
+- **`threading._register_atexit`**: callbacks run when the program ends,
+  before the non-daemon threads are joined (`runThreadingAtexit` /
+  `run_threading_atexit` before `nyconc::join_nondaemon_at_exit`), then
+  atexit's. `ThreadPoolExecutor` uses it with non-daemon workers, as CPython
+  3.9+.
+
+### Strings
+- `str.maketrans` (all three forms) and `str.translate` (any mapping; None
+  deletes, an int or a str replaces; CPython's messages): the prelude's
+  `_ny_str_maketrans` / `_ny_str_translate`, reached from both engines'
+  str method dispatch. (`bytes.maketrans`/`translate` were there.)
+- **`${...}` in string literals**: the parser turns a literal holding `${`
+  into an f-string (and the interpreter re-interpolated `${name}` at run time
+  in any string node - the VM did not: `f"${{x}}"` differed). The rule now:
+  `${...}` interpolates in Nython's own string forms - backtick template
+  strings everywhere, and ordinary quoted strings in Nython source; it is
+  Python's text in raw strings, bytes and f-strings, and in every quoted
+  string of a file that declares itself Python: a `.py` file, a `# nython:
+  module` library module, or a file with `# nython: python` in its leading
+  comment block (`Lexer::python_strings`, the tokens made with
+  `TokenClass::Default`). exec/eval code is Nython source. Backward
+  compatible: the only `${` interpolation in the repository is vm_audit24's
+  (a plain .ny file); the library modules carrying `${` were working around
+  it. The run-time re-interpolation is gone (the engines agree).
+
+### Also
+- Library paths no longer print as `build/../lib/...` (`nyrt::library_dirs`
+  names the parent's `lib/` directly).
+- Interpreter: a lambda a module or namespace holds, called as a method
+  (`m.f = lambda: 1; m.f()`; `sys.getdefaultencoding()`), raised
+  AttributeError - `callMethod`'s namespace path ran only `def` functions.
+- A class attribute that is not callable (`label = "text"; C.label()`)
+  raises TypeError "'str' object is not callable" (it gave none).
+- A bare `import missing` raises ModuleNotFoundError "No module named
+  'missing'" with `e.name` (a quoted `import "path"` keeps its message).
+- The two crash reproducers run clean under valgrind.
+
+### Not done
+- `P(1, 2)` for a class with no `__init__`/`__new__` is not a TypeError
+  (CPython: "P() takes no arguments"); the default instance `repr()` stays
+  `<P instance>`.
+- The import statement does not consult `sys.meta_path` / `sys.path_hooks`
+  (importlib.util.find_spec does); no `importlib.metadata`, zipimport, frozen
+  or extension modules; `sys.modules["__main__"]` reads the program's
+  globals but setting an attribute on it does not create a global.
+- `globals()` is a copy: `globals()[name] = v` does not create a global
+  (and `vars(sys.modules["__main__"])` does not list the program's).
+- Imported modules have no `__spec__` / `__loader__` (importlib.util.find_spec
+  derives a spec from `__file__`); no `sys.getrefcount`,
+  `sys.stdlib_module_names`; the prompt does not call a replaced
+  `sys.displayhook`.
+- `os.fspath`, `os.fsencode`, `os.fsdecode` are missing (pkgutil carries
+  its own); `surrogateescape` is not a codec error handler yet.
+- `except ... as e` leaves `e` bound after the clause (CPython deletes it).
+- A Decimal/Fraction key equal to a float is stored as that float: iterating
+  the dict gives the float back (CPython keeps the first key object).
 
 ---
 

@@ -40,10 +40,13 @@
 # the same way; 3.11 compiles each separately), so a dataclass costs one
 # parse, and instances are made by the engines' own argument binding.
 #
-# Not here: slots=True is accepted and sets __slots__ on the class, but the
-# class is not rebuilt and attributes outside the fields are not refused
-# (Nython does not enforce __slots__); weakref_slot is checked and ignored;
-# abc.update_abstractmethods is not called; __doc__ is made from the fields
+# slots=True rebuilds the class with __slots__ (CPython's _add_slots, round
+# 80): instances have no __dict__ and refuse other attributes, the fields
+# are member descriptors, a frozen one gets __getstate__/__setstate__;
+# weakref_slot adds '__weakref__' to the slots. A method using a bare
+# super() in a slots dataclass still names the class the statement made (as
+# CPython before 3.14).
+# Not here: abc.update_abstractmethods is not called; __doc__ is made from the fields
 # even when the class defines its own __init__; a string annotation is
 # recognised as ClassVar / InitVar / KW_ONLY by its text, without looking the
 # name up in the class's module (CPython checks the module's binding).
@@ -660,9 +663,65 @@ def _process_class(cls, init, repr, eq, order, unsafe_hash, frozen, match_args, 
     if weakref_slot and not slots:
         raise TypeError("weakref_slot is True but slots is False")
     if slots:
-        if "__slots__" in own:
-            raise TypeError(cls.__name__ + " already specifies __slots__")
-        _ny_setattr_raw(cls, "__slots__", tuple([f.name for f in field_list]))
+        cls = _add_slots(cls, frozen, weakref_slot)
+    return cls
+
+
+def _get_slots(cls):
+    # the slots a class has (CPython 3.12's _get_slots)
+    var slots = cls.__dict__.get("__slots__")
+    if slots is none:
+        var out = []
+        if getattr(cls, "__weakrefoffset__", -1) != 0:
+            out.append("__weakref__")
+        if getattr(cls, "__dictoffset__", -1) != 0:
+            out.append("__dict__")
+        return out
+    if isinstance(slots, str):
+        return [slots]
+    if not hasattr(slots, "__next__"):
+        return list(slots)
+    raise TypeError("Slots of '" + cls.__name__ + "' cannot be determined")
+
+
+def _dataclass_getstate(self):
+    return [getattr(self, f.name) for f in fields(self)]
+
+
+def _dataclass_setstate(self, state):
+    for field, value in zip(fields(self), state):
+        # use setattr because dataclass may be frozen
+        object.__setattr__(self, field.name, value)
+
+
+def _add_slots(cls, is_frozen, weakref_slot):
+    # A new class, since __slots__ cannot be set after a class has been made
+    # (CPython 3.12's _add_slots).
+    if "__slots__" in cls.__dict__:
+        raise TypeError(cls.__name__ + " already specifies __slots__")
+    cls_dict = dict(cls.__dict__)
+    field_names = tuple([f.name for f in fields(cls)])
+    inherited_slots = set()
+    for b in list(cls.__mro__)[1:-1]:
+        for s in _get_slots(b):
+            inherited_slots.add(s)
+    wanted = list(field_names) + (["__weakref__"] if weakref_slot else [])
+    cls_dict["__slots__"] = tuple([n for n in wanted if n not in inherited_slots])
+    for field_name in field_names:
+        # the defaults stay available through the fields (_MARKER)
+        cls_dict.pop(field_name, none)
+    cls_dict.pop("__dict__", none)
+    cls_dict.pop("__weakref__", none)
+    qualname = getattr(cls, "__qualname__", none)
+    cls = type(cls)(cls.__name__, cls.__bases__, cls_dict)
+    if qualname is not none:
+        cls.__qualname__ = qualname
+    if is_frozen:
+        # for pickling frozen classes with slots
+        if "__getstate__" not in cls_dict:
+            _ny_setattr_raw(cls, "__getstate__", _dataclass_getstate)
+        if "__setstate__" not in cls_dict:
+            _ny_setattr_raw(cls, "__setstate__", _dataclass_setstate)
     return cls
 
 def repr_of(x):

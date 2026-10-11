@@ -182,6 +182,45 @@ inline bool ny_split_exc_message(const std::string& m, std::string& type, std::s
 enum NyExcKind { NYX_PLAIN = 0, NYX_KEY = 1, NYX_OS = 2, NYX_UDECODE = 3, NYX_UENCODE = 4, NYX_UTRANSLATE = 5,
                  NYX_SYNTAX = 6, NYX_IMPORT = 7 };
 inline bool ny_exc_kind_unicode(int k) { return k == NYX_UDECODE || k == NYX_UENCODE || k == NYX_UTRANSLATE; }
+// round 80: the keyword fields CPython 3.10+ gives three errors - which
+// (0 none, 1 ImportError's name/path, 2 AttributeError's name/obj, 3
+// NameError's name) and whether `k` is one of them
+inline int ny_exc_kw_family(bool is_import, bool is_attr, bool is_name) {
+    return is_import ? 1 : is_attr ? 2 : is_name ? 3 : 0;
+}
+inline bool ny_exc_kw_field(int family, const std::string& k) {
+    if (family == 1) return k == "name" || k == "path";
+    if (family == 2) return k == "name" || k == "obj";
+    if (family == 3) return k == "name";
+    return false;
+}
+// The `name` CPython sets on the errors it raises, read back from the
+// message the runtime raised: ModuleNotFoundError "No module named 'x'" and
+// ImportError "cannot import name 'n' from 'm'" -> the module, AttributeError
+// "... has no attribute 'x'" and NameError "name 'x' is not defined" -> x.
+inline bool ny_exc_name_from_message(int family, const std::string& msg, std::string& out) {
+    auto quoted_after = [&](const std::string& lead, size_t from) -> bool {
+        size_t p = msg.find(lead, from);
+        if (p == std::string::npos) return false;
+        p += lead.size();
+        size_t e = msg.find('\'', p);
+        if (e == std::string::npos) return false;
+        out = msg.substr(p, e - p);
+        return true;
+    };
+    if (family == 1) {
+        if (msg.rfind("No module named '", 0) == 0) return quoted_after("No module named '", 0);
+        size_t f = msg.find("' from '");
+        if (msg.rfind("cannot import name '", 0) == 0 && f != std::string::npos) return quoted_after("' from '", f);
+        return false;
+    }
+    if (family == 2) {
+        size_t p = msg.rfind("has no attribute '");
+        return p != std::string::npos && quoted_after("has no attribute '", p);
+    }
+    if (family == 3) return msg.rfind("name '", 0) == 0 && quoted_after("name '", 0);
+    return false;
+}
 // The kind of exception class `derives(base)` describes (the most specific
 // base that has fields).
 template <typename DerivesFn>

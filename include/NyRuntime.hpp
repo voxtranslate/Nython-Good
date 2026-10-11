@@ -73,7 +73,13 @@ inline std::vector<std::string> library_dirs() {
     if (cut != std::string::npos) {
         std::string dir = exe.substr(0, cut + 1);
         add(dir + "lib");
-        add(dir + "../lib");
+        // its parent's lib, named without "../" (round 80: a module's
+        // __file__ read build/../lib/json/__init__.ny)
+        std::string p = dir.substr(0, dir.size() - 1);
+        size_t c2 = p.find_last_of("/\\");
+        std::string comp = c2 == std::string::npos ? p : p.substr(c2 + 1);
+        if (comp.empty() || comp == "." || comp == ".." || c2 == std::string::npos) add(dir + "../lib");
+        else add(p.substr(0, c2 + 1) + "lib");
     }
     return out;
 }
@@ -94,6 +100,39 @@ inline int system_exit_status(const std::string& msg) {
 // -W options, in order (round 77): sys.warnoptions, which lib/warnings.ny
 // processes when it is imported, as Python does.
 inline std::vector<std::string>& warn_options() { static std::vector<std::string> v; return v; }
+
+// ── sys's facts (round 80) ──────────────────────────────────────────────────
+// The command line's flags, in sys.flags' order (CPython 3.12's fields).
+// -O / -OO set optimize: __debug__ is False and the parser drops assert
+// statements (Parser::assertStmt); -i, -q, -E set theirs (main.cpp).
+struct CliFlags {
+    int debug = 0, inspect = 0, interactive = 0, optimize = 0, dont_write_bytecode = 1, no_user_site = 0,
+        no_site = 0, ignore_environment = 0, verbose = 0, bytes_warning = 0, quiet = 0,
+        hash_randomization = 0, isolated = 0, dev_mode = 0, utf8_mode = 1, warn_default_encoding = 0,
+        safe_path = 0, int_max_str_digits = 0;
+};
+inline CliFlags& cli_flags() { static CliFlags f; return f; }
+// sys.getrecursionlimit() / setrecursionlimit(): the one limit both engines
+// check - the VM's frames (VirtualMachine::check_depth), the interpreter's
+// call depth (evalCall, which keeps its old margin of 100 below it).
+inline int& recursion_limit() { static int n = 1000; return n; }
+// locals() / globals() (round 80): a program's variable named like a dunder
+// (__x__, __all__, __version__) is listed; the engines' own names
+// (__parent_class__ ...) and the parser's temporaries (__exc3__, __cmp0__:
+// a digit before the closing underscores) are not.
+inline bool user_dunder_name(const std::string& k) {
+    size_t n = k.size();
+    if (n < 5 || k[0] != '_' || k[1] != '_' || k[n - 1] != '_' || k[n - 2] != '_') return false;
+    if (!std::isalpha((unsigned char)k[2]) || std::isdigit((unsigned char)k[n - 3])) return false;
+    if (k.compare(0, 4, "__ny") == 0) return false;
+    for (size_t i = 2; i + 2 < n; i++) if (!(std::isalnum((unsigned char)k[i]) || k[i] == '_')) return false;
+    static const std::unordered_set<std::string> internal = {
+        "__parent_class__", "__instance__", "__unpack_seq__", "__len__", "__tuple__", "__set__", "__kwargs__",
+        "__type__", "__class__", "__self__", "__fn__", "__cls__", "__is_property__", "__get__", "__builtins__"};
+    return internal.count(k) == 0;
+}
+// sys.orig_argv: the interpreter's command line as it was given.
+inline std::vector<std::string>& orig_argv() { static std::vector<std::string> v; return v; }
 
 inline void set_command_line(const std::string& script, int argc, char** args, int first_arg) {
     script_path() = script;
@@ -432,6 +471,9 @@ inline bool is_prelude_builtin_class(const std::string& n) {
 inline std::string class_repr(const std::string& full) {
     std::string n = shown_class_name(full);
     if (is_builtin_type_name(n) || (n == full && is_prelude_builtin_class(n))) return "<class '" + n + "'>";
+    // the builtin exceptions and object are builtins' (round 80: <class
+    // '__main__.KeyError'>)
+    if (n == full && (n == "object" || is_builtin_exc(n))) return "<class '" + n + "'>";
     if (n.find('.') == std::string::npos) n = "__main__." + n;
     return "<class '" + n + "'>";
 }
