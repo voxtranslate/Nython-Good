@@ -34,13 +34,13 @@ class Base:
 
 class Child1(Base):
     def init(self, v):
-        super(v)
+        super().init(v)
 class Child2 extends Base:
     def init(self, v):
-        super(v)
+        super().init(v)
 class Child3 inherits Base:
     def init(self, v):
-        super(v)
+        super().init(v)
 
 t("parens", Child1(10).get(), 10)
 t("extends", Child2(20).get(), 20)
@@ -52,15 +52,15 @@ class L1:
         self.a = "L1"
 class L2(L1):
     def init(self):
-        super()
+        super().init()
         self.b = "L2"
 class L3(L2):
     def init(self):
-        super()
+        super().init()
         self.c = "L3"
 class L4(L3):
     def init(self):
-        super()
+        super().init()
         self.d = "L4"
 var deep = L4()
 t("chain_a", deep.a, "L1")

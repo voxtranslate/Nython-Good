@@ -93,11 +93,11 @@ class A:
         self.a = v
 class B(A):
     def init(self, v, w):
-        super(v)
+        super().init(v)
         self.b = w
 class C(B):
     def init(self, v, w, x):
-        super(v, w)
+        super().init(v, w)
         self.c = x
 var obj = C(1, 2, 3)
 t("inherit_a", obj.a, 1)

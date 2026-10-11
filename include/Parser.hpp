@@ -73,20 +73,49 @@ private:
     // cannot otherwise tell that an inline suite continues.
     bool consumed_semi_ = false;
 
+    // Private name mangling (round 78; CPython's _Py_Mangle): inside a class
+    // body - its methods, nested functions, lambdas and comprehensions
+    // included - an identifier `__name` (two leading underscores, not
+    // ending in two, no dot) reads as `_Class__name`, the class's name
+    // stripped of its leading underscores (no mangling when it is all
+    // underscores: an empty entry). Done on the tokens the parser reads, so
+    // both engines get it; the innermost class wins. Call keywords
+    // (`f(__x=1)`) and the names __name__/__qualname__ report stay as
+    // written, as in CPython (rawToken / the raw name).
+    std::vector<std::string> mangle_stack_;
+    // `@staticmethod` precedes the def being parsed (round 78: an async def
+    // in a class body is a method otherwise, async_def_desugar)
+    bool next_def_static_ = false;
+    static bool manglable(const std::string& v){
+        return v.size() > 2 && v[0] == '_' && v[1] == '_'
+               && !(v[v.size()-1] == '_' && v[v.size()-2] == '_') && v.find('.') == std::string::npos;
+    }
+    inline Token mg(Token t) const {
+        if(!mangle_stack_.empty() && !mangle_stack_.back().empty() && t.type() == TokenType::Identifier
+           && manglable(t.value))
+            t.value = "_" + mangle_stack_.back() + t.value;
+        return t;
+    }
+    std::string mangled(const std::string& n) const {
+        if(!mangle_stack_.empty() && !mangle_stack_.back().empty() && manglable(n)) return "_" + mangle_stack_.back() + n;
+        return n;
+    }
+    inline Token rawToken(){ return scanner->curr(); }
+
 	inline Token next(){
-        return scanner->next();
+        return mg(scanner->next());
     }
 
     inline Token prev(){
-        return scanner->prev();
+        return mg(scanner->prev());
     }
 
     inline Token peek(int pos = 1){
-        return scanner->peek(pos);
+        return mg(scanner->peek(pos));
     }
 
     inline Token token(){
-        return scanner->curr();
+        return mg(scanner->curr());
     }
 
     inline int line(){

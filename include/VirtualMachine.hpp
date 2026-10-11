@@ -499,6 +499,12 @@ struct VMCode {
     size_t                   posonly = 0;   // param_names before a bare `/` (PEP 570)
     bool                     is_class      = false;
     bool                     is_method     = false;
+    // A function defined in a class body whose first parameter is not
+    // self/this (`def m(s, x)`, `def m(cls)`, `def m(*a)`, `def m()`):
+    // a method all the same, as in Python - the receiver is passed as its
+    // first positional argument rather than carried as the frame's self
+    // (is_method is set too; round 78).
+    bool                     bind_first    = false;
     bool                     is_static     = false;
     bool                     is_classmethod= false;
     bool                     is_generator  = false;
@@ -832,8 +838,8 @@ class Compiler {
     // Compiling a method (first parameter self, carried as the frame's
     // self_val) or a function nested in one (round 77).
     bool in_method() const {
-        if(code_ && code_->is_method) return true;
-        for(auto& c:code_stack_) if(c && c->is_method) return true;
+        if(code_ && code_->is_method && !code_->bind_first) return true;
+        for(auto& c:code_stack_) if(c && c->is_method && !c->bind_first) return true;
         return false;
     }
 
@@ -869,7 +875,7 @@ class Compiler {
             return;
         }
         // `for self in ...` in a method (not a comprehension's own, renamed, target)
-        if(t->token().value=="self" && rn("self")=="self" && C().is_method){ emit(Op::STORE_SELF,0,l); return; }   // round 77
+        if(t->token().value=="self" && rn("self")=="self" && C().is_method && !C().bind_first){ emit(Op::STORE_SELF,0,l); return; }   // round 77
         emit_dn(t->token().value,l);
     }
     int comp_id_ = 0;
@@ -972,20 +978,9 @@ private:
     }
     void visit_stmt(np nd) {
         if(!nd) return;
-        // `super()` on its own as a statement is Nython's shorthand for
-        // calling the parent constructor (super(args) with arguments is
-        // handled at run time: see vm_call's SUPER_PROXY case).
-        if(nd->type()==NT::CALL){
-            auto cn=std::static_pointer_cast<nython::node::CallNode>(nd);
-            if(cn->callee && cn->callee->type()==NT::SUPER && cn->args.empty()){
-                int l=ln(nd);
-                emit(Op::LOAD_SUPER,0,l);
-                emit_lc(VMVal::make_str("__init__"),l);
-                emit(Op::CALL_METHOD,0,l);
-                emit(Op::POP_TOP,0,l);
-                return;
-            }
-        }
+        // (round 78: `super()` alone as a statement no longer calls the
+        // parent constructor - Nython's shorthand from before super() was
+        // Python's; write super().__init__())
         visit(nd);
         if(pushes_value(nd)) emit(Op::POP_TOP,0,ln(nd));
     }
@@ -1035,7 +1030,7 @@ private:
                 emit_dn(vd->name,l); break;
             }
             if(vd->init) visit(vd->init); else emit_lc(VMVal::make_none(),l);
-            if(vd->name=="self" && C().is_method){ emit(Op::STORE_SELF,0,l); break; }   // round 77
+            if(vd->name=="self" && C().is_method && !C().bind_first){ emit(Op::STORE_SELF,0,l); break; }   // round 77
             emit_dn(vd->name,l); break;
         }
 
@@ -2020,14 +2015,24 @@ private:
     // ─── function ───────────────────────────────────────────────────────
     void visit_func(std::shared_ptr<nython::node::FunctionNode> fn) {
         int l=ln(fn);
+        bool in_class_body=C().is_class;   // round 78
         push_code(fn->name);
         C().doc=fn->doc; C().has_doc=fn->has_doc;
         C().qualname=fn->qualname; C().is_async=fn->is_async; C().is_async_gen=fn->is_async_gen;   // round 77
         C().first_line=fn->first_line?fn->first_line:l; C().file=fn->token().fileName();
-        C().is_method=!fn->params.empty()&&fn->params[0]->value()=="self";
+        // A first parameter self (or this, Nython's spelling) is carried as
+        // the frame's self; any other function in a class body is a method
+        // too, the receiver its first argument (bind_first) - Python binds
+        // every function it finds on the class (round 78: `def m(this, x)`,
+        // `def m(s)` were plain functions). __new__ is a static method.
+        std::string p0=fn->params.empty()?std::string():fn->params[0]->value();
+        bool self_first=p0=="self"||p0=="this";
+        C().is_method=self_first;
+        if(!self_first&&in_class_body&&fn->name!="__new__"){ C().is_method=true; C().bind_first=true; }
+        auto self_param=[&](int i){ return i==0&&self_first; };
         int param_idx=0;
         for(int i=0;i<(int)fn->params.size();i++){
-            std::string pn=fn->params[i]->value(); if(pn=="self") continue;
+            std::string pn=fn->params[i]->value(); if(self_param(i)) continue;
             if((size_t)i<fn->posonly) C().posonly=C().param_names.size()+1;
             C().param_names.push_back(pn); C().add_name(pn);
             // Defaults used to be left UNDEFINED here and filled in at runtime by
@@ -2059,7 +2064,7 @@ private:
         // Emit default-filling prologue: for each param with default, if not supplied
         // We use a different approach: emit assignments at top of function body
         for(int i=0;i<(int)fn->params.size();i++){
-            std::string pn=fn->params[i]->value(); if(pn=="self") continue;
+            std::string pn=fn->params[i]->value(); if(self_param(i)) continue;
             if(i<(int)fn->defaults.size()&&fn->defaults[i]){
                 // Emit: if param is UNDEFINED/not set, assign default
                 // We encode this as: LOAD_NAME pn, JUMP_IF_DEFINED skip, <default>, STORE_NAME pn, skip:
@@ -2105,7 +2110,7 @@ private:
         // function value (VMVal::list), not in the shared code object.
         int n_defaults=0, pn_idx=0;
         for(int i=0;i<(int)fn->params.size();i++){
-            if(fn->params[i]->value()=="self") continue;
+            if(self_param(i)) continue;
             if(i<(int)fn->defaults.size()&&fn->defaults[i]){
                 visit(fn->defaults[i]); n_defaults++;
                 fcode->default_idx.push_back(pn_idx);
@@ -2138,6 +2143,11 @@ private:
         std::vector<np> expr_bases;
         for(auto& b:cn->bases){
             if(b->type()==NT::VARIABLE) code_->bases.push_back(b->token().value);
+            else if(b->type()==NT::UNARY&&std::static_pointer_cast<nython::node::UnaryNode>(b)->op=="*"){
+                // `class C(*bases)`: "\x07<i>", each item a base (round 78)
+                code_->bases.push_back(std::string("\x07")+std::to_string(expr_bases.size()));
+                expr_bases.push_back(std::static_pointer_cast<nython::node::UnaryNode>(b)->operand);
+            }
             else { code_->bases.push_back(std::string("\x06")+std::to_string(expr_bases.size())); expr_bases.push_back(b); }
         }
         if(!code_->bases.empty()) code_->parent_class=code_->bases[0];
@@ -2370,7 +2380,7 @@ private:
     // ─── store target ───────────────────────────────────────────────────
     void store(np tgt, int l) {
         if(tgt->type()==NT::VARIABLE) {
-            if(tgt->token().value=="self" && C().is_method) { emit(Op::STORE_SELF,0,l); return; }   // round 77
+            if(tgt->token().value=="self" && C().is_method && !C().bind_first) { emit(Op::STORE_SELF,0,l); return; }   // round 77
             if(std::static_pointer_cast<nython::node::VariableNode>(tgt)->global_ref)
                 emit(Op::STORE_GLOBAL_NAME,C().add_name(tgt->token().value),l);
             else emit_sn(tgt->token().value,l);
@@ -2386,7 +2396,7 @@ private:
         } else if(tgt->type()==NT::SELF) {
             // inside a method: the frame's self (round 77); elsewhere self is
             // an ordinary name, as LOAD of NT::SELF reads it
-            if(C().is_method) emit(Op::STORE_SELF,0,l);
+            if(C().is_method && !C().bind_first) emit(Op::STORE_SELF,0,l);
             else emit_sn("self",l);
         }
     }
@@ -3855,7 +3865,7 @@ private:
         const auto& pnames=code.param_names;
         // a __qualname__ the program set names the function in its call
         // errors; the compiler's own qualname does not (round 77)
-        const std::string& fname=code.qualname_set&&!code.qualname.empty()?code.qualname:code.name;
+        const std::string& fname=!code.qualname.empty()?code.qualname:code.name;   // its __qualname__, as CPython 3.10+ (round 78: the name unless the program set one)
         const std::vector<VMVal>& dflts = defaults ? *defaults : code.param_defaults;
         size_t ai=0;
         bool star_seen=false, has_varargs=false, has_varkw=false;
@@ -3922,6 +3932,9 @@ private:
                     const std::vector<VMVal>* defaults=nullptr,
                     const VMVal* kwargs=nullptr) {
         check_depth();
+        // a method whose first parameter is not self: the receiver is its
+        // first argument (round 78)
+        if(self && code->bind_first){ args.insert(args.begin(), *self); self.reset(); }
         size_t _stack_base=stack_.size();
         CallFrame fr; fr.code=code; fr.ip=0;
         fr.stack_base=_stack_base;
@@ -3944,6 +3957,12 @@ private:
     VMVal call_function(const VMVal& fn, std::vector<VMVal>& args, std::optional<VMVal> self,
                         const VMVal* kwargs=nullptr) {
         if(fn.type!=VMType::FUNCTION||!fn.code) return VMVal::make_none();
+        if(self && fn.code->bind_first){
+            // the receiver is the first argument (round 78)
+            std::vector<VMVal> a2; a2.reserve(args.size()+1);
+            a2.push_back(*self); a2.insert(a2.end(), args.begin(), args.end());
+            return call_function(fn, a2, std::nullopt, kwargs);
+        }
         const std::vector<VMVal>* d = fn.list ? fn.list.get() : nullptr;
         if(fn.code->has_yield()){
             VMVal g=make_generator_val(fn.code, args, self, fn.closure_env);
@@ -4826,9 +4845,19 @@ private:
     bool instance_truthy(VMVal& v) {
         bool found=false;
         VMVal r = call_dunder_f(v, "__bool__", {}, found);
-        if(found) return r.type==VMType::INSTANCE ? true : r.is_truthy();
+        // __bool__ must give a bool, __len__ an int >= 0, as Python checks
+        // (round 78)
+        if(found){
+            if(r.type!=VMType::BOOL) raise_native_exception("TypeError","__bool__ should return bool, returned "+vm_type_name(r));
+            return r.b;
+        }
         VMVal lr = call_dunder_f(v, "__len__", {}, found);
-        if(found) return lr.type==VMType::INT ? lr.i != 0 : lr.is_truthy();
+        if(found){
+            if(lr.type==VMType::BOOL) return lr.b;
+            if(lr.type!=VMType::INT) raise_native_exception("TypeError","'"+vm_type_name(lr)+"' object cannot be interpreted as an integer");
+            if(lr.s.empty()?lr.i<0:lr.s[0]=='-') raise_native_exception("ValueError","__len__() should return >= 0");
+            return lr.is_truthy();
+        }
         return true; // default: instances are truthy
     }
 
@@ -4950,10 +4979,32 @@ private:
         return v.type==VMType::INSTANCE||v.type==VMType::GENERATOR||v.type==VMType::ITERATOR;
     }
 
+    // What __str__ / __repr__ gave: a str (a str subclass's value too), else
+    // Python's TypeError (round 78: any value was shown as text).
+    std::string dunder_text(const VMVal& r, const std::string& which) {
+        if(r.type==VMType::STRING) return r.s;
+        VMVal p;
+        if(any_payload_&&payload_of(r,p)&&p.type==VMType::STRING) return p.s;
+        raise_native_exception("TypeError",which+" returned non-string (type "+vm_type_name(r)+")");
+        return std::string();
+    }
     // str(v) and repr(v) with the user's __str__/__repr__, also for the
     // items of a list or map (which rendered as "<C instance>" through
     // VMVal::repr, which cannot call into the program).
+    // a module: <module 'name' from 'file'>, as Python shows it (round 78;
+    // its namespace printed as a dict)
+    std::string module_text(const VMVal& v) {
+        auto field=[&](const char* k)->std::string{
+            auto it=v.map->find(k);
+            if(it==v.map->end()) it=v.map->find(nypy::key_of_str(k));
+            return it!=v.map->end()&&it->second.type==VMType::STRING?it->second.s:std::string();
+        };
+        std::string nm=field("__name__"), file=field("__file__");
+        if(nm.empty()) nm=v.class_name;
+        return "<module "+nypy::str_repr(nm)+(file.empty()?std::string(" (built-in)"):" from "+nypy::str_repr(file))+">";
+    }
     std::string vm_str(const VMVal& v) {
+        if(v.type==VMType::MAP&&is_module_ns(v)&&!is_property_desc(v)&&v.class_name.rfind("__",0)!=0) return module_text(v);   // round 78
         if(v.type==VMType::CLASS&&!class_meta_.empty()){
             VMVal r;
             if(meta_call(v,"__str__",{},r)||meta_call(v,"__repr__",{},r)) return r.to_string();
@@ -4966,7 +5017,7 @@ private:
                 if(exc&&dname[2]=='r') break;
                 bool found=false;
                 VMVal r=call_dunder_f(v,dname,{},found);
-                if(found) return r.to_string();
+                if(found) return dunder_text(r, dname);   // a str, else TypeError (round 78)
             }
             return v.to_string();
         }
@@ -4974,6 +5025,7 @@ private:
         return v.to_string();
     }
     std::string vm_repr(const VMVal& v) {
+        if(v.type==VMType::MAP&&is_module_ns(v)&&!is_property_desc(v)&&v.class_name.rfind("__",0)!=0) return module_text(v);   // round 78
         if(v.type==VMType::CLASS&&!class_meta_.empty()){
             VMVal r;
             if(meta_call(v,"__repr__",{},r)) return r.to_string();
@@ -4983,7 +5035,7 @@ private:
             // as on the interpreter and in Python)
             bool found=false;
             VMVal r=call_dunder_f(v,"__repr__",{},found);
-            if(found) return r.to_string();
+            if(found) return dunder_text(r, "__repr__");   // a str, else TypeError (round 78)
             return v.repr();
         }
         if(v.is_set()&&v.list){
@@ -5180,6 +5232,37 @@ private:
         auto f=cv->second.find(attr);
         if(f==cv->second.end()) return false;
         out=f->second;
+        return true;
+    }
+    // (5).__add__, "ab".__len__, [1].__getitem__, {}.__contains__ ... (round
+    // 78, as NythonExecutor::builtinValueDunder): a plain builtin value's
+    // dunder methods are its type's (_NyV_int / _NyV_float first: Python's
+    // NotImplemented), bound to the value.
+    bool builtin_value_dunder(const VMVal& obj, const std::string& attr, VMVal& out) {
+        if(attr.size()<5||attr[0]!='_'||attr[1]!='_'||attr=="__new__"||attr=="__init__"||attr=="__format__"||!nyrt::mirror_dunder(attr)) return false;
+        if(obj.type==VMType::INSTANCE||obj.type==VMType::CLASS||is_module_ns(obj)) return false;
+        if(obj.type==VMType::MAP&&obj.class_name=="__bound_method__") return false;
+        std::string t=vm_type_name(obj);
+        if(t=="bool") t="int";
+        const char* mn=nyrt::builtin_mirror(t);
+        if(!mn) return false;
+        load_mirror(t);
+        VMVal m;
+        bool found=false;
+        for(const char* cn:{nyrt::value_dunder_class(t), mn}){
+            if(!*cn) continue;
+            auto cv=class_vars_.find(cn);
+            if(cv==class_vars_.end()) continue;
+            auto f=cv->second.find(attr);
+            if(f!=cv->second.end()){ m=f->second; found=true; break; }
+        }
+        if(!found&&attr=="__str__"){
+            // a type without a __str__ of its own: object's, its __repr__
+            auto cv=class_vars_.find(mn);
+            if(cv!=class_vars_.end()){ auto f=cv->second.find("__repr__"); if(f!=cv->second.end()){ m=f->second; found=true; } }
+        }
+        if(!found||m.type!=VMType::FUNCTION) return false;
+        out=make_bound(m, obj);
         return true;
     }
     bool any_payload_=false;   // a payload instance was made: natives unwrap their arguments
@@ -5530,7 +5613,7 @@ private:
         const std::vector<VMVal>& dflts=f.list?*f.list:c.param_defaults;
         auto S=[](const std::string& s){ return VMVal::make_str(s); };
         std::vector<VMVal> ps;
-        if(c.is_method) ps.push_back(VMVal::make_list({S("self"),VMVal::make_int(c.posonly>0?0:1),VMVal::make_bool(false),VMVal::make_none()}));
+        if(c.is_method&&!c.bind_first) ps.push_back(VMVal::make_list({S("self"),VMVal::make_int(c.posonly>0?0:1),VMVal::make_bool(false),VMVal::make_none()}));
         bool star=false;
         for(size_t i=0;i<c.param_names.size();i++){
             std::string pn=c.param_names[i];
@@ -5805,11 +5888,11 @@ private:
     }
     // The class namespace as the dict a metaclass gets, and C.__dict__:
     // without the parser's decorator temporaries (round 77).
-    VMVal class_namespace(const std::string& cname) {
+    VMVal class_namespace(const std::string& cname, bool implicit=true) {   // implicit: __new__ as a staticmethod (round 78; not in the namespace a metaclass gets)
         VMVal d=VMVal::make_map();
         auto cv=class_vars_.find(cname);
         if(cv!=class_vars_.end()) for(auto& kv:cv->second)
-            if(!nyrt::is_decorator_temp(kv.first)) (*d.map)[nypy::key_of_str(kv.first)]=method_object_of(kv.second);
+            if(!nyrt::is_decorator_temp(kv.first)) (*d.map)[nypy::key_of_str(kv.first)]=method_object_of(kv.second, implicit?&kv.first:nullptr);
         return d;
     }
     // A class statement with a metaclass: M.__new__ (whose type.__new__
@@ -5862,7 +5945,7 @@ private:
         VMVal name=VMVal::make_str(nyrt::bare_class_name(nyrt::shown_class_name(sub.name)));
         VMVal bases=class_bases_tuple(sub);
         // the namespace: what __prepare__ returned, else the body's (round 77)
-        VMVal ns=prepared?*prepared:class_namespace(sub.name);
+        VMVal ns=prepared?*prepared:class_namespace(sub.name, false);
         bool has_kw=kw.type==VMType::MAP&&kw.map&&!kw.map->empty();
         VMVal made=clsv, m;
         std::string owner;
@@ -5985,9 +6068,13 @@ private:
     }
     // A class namespace's static / class method as the object Python's
     // C.__dict__ holds (round 77); anything else as it is.
-    VMVal method_object_of(const VMVal& v) {
-        if(v.type!=VMType::FUNCTION||!v.code||!(v.code->is_static||v.code->is_classmethod)) return v;
-        VMVal cls=class_value(v.code->is_static?"staticmethod":"classmethod");
+    VMVal method_object_of(const VMVal& v, const std::string* name=nullptr) {
+        if(v.type!=VMType::FUNCTION||!v.code) return v;
+        const char* kind=v.code->is_static?"staticmethod":v.code->is_classmethod?"classmethod":nullptr;
+        // __new__ is a static method without the decorator (round 78)
+        if(!kind&&name) kind=nyrt::implicit_method_kind(*name);
+        if(!kind) return v;
+        VMVal cls=class_value(kind);
         if(cls.type!=VMType::CLASS) return v;
         std::vector<VMVal> a{v};
         return vm_call(cls, a, std::nullopt, nullptr);
@@ -5996,11 +6083,19 @@ private:
     // __delete__: a property, enum.property ...) held by a class: attribute
     // stores look for one from then on (round 77; it was any class defining
     // __set__, which the prelude's property now is).
-    void note_data_descriptor(const VMVal& v) {
+    void note_data_descriptor(const VMVal& v, const std::string* name=nullptr) {
+        if(name&&(is_property_desc(v)||(v.type==VMType::INSTANCE&&any_data_descr_check(v)))) data_descr_names_.insert(*name);   // round 78
         if(any_data_descr_||v.type!=VMType::INSTANCE) return;
         VMVal dm;
         if(class_lookup(v.class_name,"__set__",dm)||class_lookup(v.class_name,"__delete__",dm)) any_data_descr_=true;
     }
+    bool any_data_descr_check(const VMVal& v) {
+        VMVal dm;
+        return class_lookup(v.class_name,"__set__",dm)||class_lookup(v.class_name,"__delete__",dm);
+    }
+    // The names classes hold a data descriptor under (round 78): a field
+    // read checks the class for one only for those (get_attr / lookup_attr).
+    std::unordered_set<std::string> data_descr_names_;
     void class_created(const VMVal& clsv, const VMVal& kw) {
         const std::string& cname=clsv.class_name;
         // a class with its own __getattribute__: attribute reads look for it
@@ -6017,7 +6112,7 @@ private:
                 if(cv->second.count("__eq__")&&!cv->second.count("__hash__")) cv->second["__hash__"]=VMVal::make_none();
                 for(auto& kv:cv->second){
                     if(kv.second.type==VMType::INSTANCE) kv.second=unwrap_method_object(kv.second);
-                    note_data_descriptor(kv.second);
+                    note_data_descriptor(kv.second, &kv.first);
                 }
             }
         }
@@ -6060,24 +6155,28 @@ private:
     VMVal resolve_expr_bases(VMCode& sub, const VMVal& vals) {
         std::vector<std::string> nb;
         std::vector<VMVal> orig;
+        std::vector<const std::string*> orig_slot;   // the base each value came from
         bool any=false;
         for(auto& b:sub.bases){
-            if(!b.empty()&&b[0]=='\x06'){
+            if(!b.empty()&&(b[0]=='\x06'||b[0]=='\x07')){
                 size_t i=(size_t)std::stoul(b.substr(1));
-                orig.push_back((vals.type==VMType::LIST&&vals.list&&i<vals.list->size())?(*vals.list)[i]:VMVal::make_none());
+                VMVal v=(vals.type==VMType::LIST&&vals.list&&i<vals.list->size())?(*vals.list)[i]:VMVal::make_none();
+                // `class C(*bases)`: each item (round 78)
+                if(b[0]=='\x07'){ for(auto& it:iter_items(v)){ orig.push_back(it); orig_slot.push_back(&b); } }
+                else { orig.push_back(v); orig_slot.push_back(&b); }
                 any=true;
                 continue;
             }
             VMVal bv=b.find('.')==std::string::npos?load_var(b):VMVal::make_none();
             if(bv.type!=VMType::CLASS&&bv.type!=VMType::NATIVE) bv=class_value(b);
-            orig.push_back(bv);
+            orig.push_back(bv); orig_slot.push_back(&b);
         }
         if(!any) return VMVal::make_none();
         VMVal orig_t=VMVal::make_tuple(orig);
-        size_t oi=0;
-        for(auto& b:sub.bases){
-            VMVal v=orig[oi++];
-            if(b.empty()||b[0]!='\x06'){ nb.push_back(b); continue; }
+        for(size_t oi=0;oi<orig.size();oi++){
+            const std::string& b=*orig_slot[oi];
+            VMVal v=orig[oi];
+            if(b.empty()||(b[0]!='\x06'&&b[0]!='\x07')){ nb.push_back(b); continue; }
             std::vector<VMVal> entries{v};
             VMVal me;
             if(v.type==VMType::INSTANCE&&class_lookup(v.class_name,"__mro_entries__",me)){
@@ -6190,6 +6289,8 @@ private:
         case VMType::MAP:
             if(v.class_name=="__bound_method__") return runtime_type_value("method");
             if(is_property_desc(v)) return VMVal::make_none();
+            // a module: the prelude's module type (round 78; it was dict)
+            if(is_module_ns(v)){ VMVal mt=class_value("_NyModuleType"); if(mt.type==VMType::CLASS) return mt; }
             return bt("dict");
         case VMType::INSTANCE: { VMVal c=class_value(v.class_name); return c.type==VMType::CLASS?c:VMVal::make_none(); }
         case VMType::CLASS: { VMVal meta=metaclass_of(class_key(v)); if(meta.type==VMType::CLASS) return meta; return bt("type"); }
@@ -6889,6 +6990,7 @@ private:
                     if(rn!=b && (class_reg_.count(rn) || nython::ny_is_builtin_exc(rn))) b=rn;
                 }
                 if(!sub->bases.empty()) sub->parent_class=sub->bases[0];
+                else if(extras) sub->parent_class.clear();   // `class C(*())` (round 78)
                 for(auto& b:sub->bases) mirrors_for(b);   // a builtin base's mirror class (round 77)
                 class_reg_[sub->name]=sub;
                 mro_cache_.clear();
@@ -6936,6 +7038,7 @@ private:
                     push(vm_call_method(obj,mname.s,all_args,&kwargs_map));
                 } else {
                     VMVal callee=pop();
+                    check_callable(callee);
                     push(vm_call(callee,all_args,std::nullopt,&kwargs_map));
                 }
                 break;
@@ -6991,6 +7094,7 @@ private:
                     push(vm_call_method(obj,mname.s,args,has_ex_kw?&ex_kw:nullptr));
                 } else {
                     VMVal callee=pop();
+                    check_callable(callee);   // round 78
                     push(vm_call(callee,args,std::nullopt,has_ex_kw?&ex_kw:nullptr));
                 }
                 break;
@@ -7027,10 +7131,13 @@ private:
                 // before this one so the message can name the identifier.
                 if(callee.type==VMType::NONE||callee.type==VMType::UNDEFINED){
                     std::string called = calleeNameBefore(fr, fr.ip - 1);
-                    if(!called.empty() && !globals_.count(called))
+                    // (round 78: a name bound to None is a TypeError below)
+                    bool bound = !called.empty() && (env_find(fr.closure_env.get(), called) || name_bound(called));
+                    if(!called.empty() && !globals_.count(called) && !bound)
                         throw std::string("__exc__:NameError:'" + called
                             + "' is not defined at line " + std::to_string(ins.line));
                 }
+                check_callable(callee);
                 push(vm_call(callee,args,std::nullopt)); break;
             }
             case Op::CALL_METHOD: {
@@ -8449,6 +8556,37 @@ private:
     }
     // A dict key's stored text (NyStr.hpp): 1 and "1" differ, 1 == 1.0 ==
     // true, tuples are keys, lists are not.
+    // Objects with __hash__ as keys (round 78, vkey): a hash's text -> the
+    // key ids of the objects with that hash, each unequal to the others (an
+    // id whose object is gone is dropped when next seen).
+    std::unordered_map<std::string,std::vector<std::string>> hash_keys_;
+    size_t hash_key_seq_=0;
+    // == for a key collision; one that raises counts as unequal
+    bool key_equals(const VMVal& a, const VMVal& b) {
+        try { return vm_eq(a,b); } catch(VMException&){ return false; }
+    }
+    std::string hashed_key(const VMVal& k, const VMVal& h) {
+        std::string hs=h.to_string();
+        {
+            auto& ids=hash_keys_[hs];
+            for(size_t i=0;i<ids.size();){
+                auto it=vm_key_objs().find(ids[i]);
+                if(it==vm_key_objs().end()){ ids.erase(ids.begin()+(long)i); continue; }
+                VMVal rep=it->second;
+                std::string id=ids[i];
+                if(rep.type==VMType::INSTANCE&&rep.map.get()==k.map.get()) return nypy::key_of_obj(id);
+                if(key_equals(k,rep)) return nypy::key_of_obj(id);
+                i++;
+            }
+        }
+        // equal to its hash as an int (Fraction(2, 2), an IntEnum member):
+        // that int's key, as Python finds it
+        if(h.type==VMType::INT&&key_equals(k,h)) return vkey(h);
+        std::string hid="vh"+hs+"#"+std::to_string(hash_key_seq_++);
+        vm_key_objs().emplace(hid,k);
+        hash_keys_[hs].push_back(hid);
+        return nypy::key_of_obj(hid);
+    }
     std::string vkey(const VMVal& k) {
         switch(k.type){
             case VMType::STRING: return nypy::key_of_str(k.s);
@@ -8475,16 +8613,18 @@ private:
                     VMVal p;   // MyStr("k") is the key "k" (round 77)
                     if(any_payload_&&payload_key(k,p)) return vkey(p);
                 }
-                // An object with __hash__: keyed by its class and hash, as a
-                // set element is (set_key) - two equal dates are one key. The
+                // An object with __hash__ is the key of every object of the
+                // same hash it is equal to (__eq__), as in Python - two equal
+                // dates, a Fraction(2, 2) and 1 (round 78, as
+                // NythonExecutor::hashedKey; it was class name and hash). The
                 // first object stored stands for the key.
                 check_hashable(k);
                 bool f=false;
                 VMVal h=call_dunder_f(k,"__hash__",{},f);
                 if(f){
-                    std::string hid="vh"+k.class_name+":"+h.to_string();
-                    vm_key_objs().emplace(hid,k);
-                    return nypy::key_of_obj(hid);
+                    if(h.type!=VMType::INT&&h.type!=VMType::BOOL)
+                        raise_native_exception("TypeError","__hash__ method should return an integer");
+                    return hashed_key(k,h);
                 }
                 break;
             }
@@ -8522,10 +8662,10 @@ private:
                 VMVal p;   // MyInt(1) is the element 1 (round 77)
                 if(any_payload_&&payload_key(v,p)) return set_key(p);
             }
-            check_hashable(v);
-            bool f=false;
-            VMVal h=call_dunder_f(v,"__hash__",{},f);
-            if(f) return "\x01h"+h.to_string();
+            // an object with __hash__: its dict key, which compares with
+            // __eq__ among the objects of its hash (round 78: the hash alone)
+            VMVal hm;
+            if(class_lookup(v.class_name,"__hash__",hm)) return vkey(v);
         }
         if(v.is_set()){
             if(!v.is_frozenset()) raise_native_exception("TypeError","unhashable type: 'set'");
@@ -8798,7 +8938,8 @@ private:
         // __getattribute__ (round 77).
         if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map&&!(obj.type==VMType::MAP&&dict_method_wins(obj,attr))&&!(any_getattribute_&&getattribute_hook(obj))){
             auto it=obj.map->find(attr);
-            if(it!=obj.map->end()&&!is_property_desc(it->second)) return it->second;
+            if(it!=obj.map->end()&&!is_property_desc(it->second)
+               &&(data_descr_names_.empty()||!data_descr_names_.count(attr))) return it->second;   // round 78
         }
         VMVal v;
         if(lookup_attr(obj, attr, v)) return v;
@@ -8833,6 +8974,7 @@ private:
         if(obj.type==VMType::MAP&&obj.class_name=="__bound_method__"&&obj.map){
             auto fit=obj.map->find("__fn__");
             if(attr=="__self__"){ auto sit=obj.map->find("__self__"); out=sit!=obj.map->end()?sit->second:VMVal::make_none(); return true; }
+            if(attr=="__call__"){ out=obj; return true; }   // m.__call__ (round 78)
             if(fit==obj.map->end()) return false;
             if(attr=="__func__"){ out=fit->second; return true; }
             return lookup_attr(fit->second, attr, out, bind);
@@ -8842,6 +8984,13 @@ private:
         if((obj.type==VMType::INSTANCE||obj.type==VMType::MAP)&&obj.map&&!dict_method_wins(obj,attr)){
             auto it=obj.map->find(attr);
             if(it!=obj.map->end()){
+                // A data descriptor of the class (a property, an object with
+                // __set__ / __delete__) wins over the instance's own field of
+                // that name, as in Python (round 78: the field was read first)
+                if(obj.type==VMType::INSTANCE&&!data_descr_names_.empty()&&data_descr_names_.count(attr)){
+                    VMVal d;
+                    if(class_data_descriptor(obj, attr, d)){ out=bind_member(d, obj, obj.class_name); return true; }
+                }
                 VMVal& v=it->second;
                 // A property stored on the instance itself: self.x = property(get)
                 if(obj.type==VMType::INSTANCE&&is_property_desc(v)){ out=property_get(v, obj); return true; }
@@ -8865,6 +9014,10 @@ private:
             VMVal self_v=(!obj.list||obj.list->empty())?VMVal::make_none():(*obj.list)[0];
             bool cls_recv=self_v.type==VMType::CLASS&&!class_derives(owner,"type");
             std::string mro_of=self_v.type==VMType::INSTANCE?self_v.class_name:cls_recv?class_key(self_v):owner;
+            // the proxy's own fields (round 78)
+            if(attr=="__thisclass__"){ out=class_value(owner); return true; }
+            if(attr=="__self__"){ out=self_v; return true; }
+            if(attr=="__self_class__"){ out=self_v.type==VMType::INSTANCE?class_value(self_v.class_name):self_v; return true; }
             VMVal m; std::string where;
             if(!class_lookup(mro_of, attr, m, &where, &owner)&&!(owner!="object"&&class_lookup("object", attr, m))) return false;
             if(self_v.type==VMType::INSTANCE){ out=bind_member(m, self_v, mro_of); return true; }
@@ -8919,7 +9072,8 @@ private:
                 auto fa=func_attrs_.find(func_key(obj));
                 if(fa!=func_attrs_.end()){ auto it=fa->second.find(attr); if(it!=fa->second.end()){ out=it->second; return true; } }
             }
-            if(attr=="__name__"){ out=VMVal::make_str(obj.code?obj.code->name:""); return true; }
+            if(attr=="__name__"){ out=VMVal::make_str(obj.code?nyrt::unmangled_name(obj.code->name, obj.code->qualname):""); return true; }   // def __m: __m (round 78)
+            if(attr=="__call__"){ out=obj; return true; }   // f.__call__ (round 78)
             if(attr=="__qualname__"){ out=VMVal::make_str(obj.code?(obj.code->qualname.empty()?obj.code->name:obj.code->qualname):""); return true; }
             if(attr=="__doc__"){ out=obj.code&&obj.code->has_doc?VMVal::make_str(obj.code->doc):VMVal::make_none(); return true; }
             // __defaults__, __kwdefaults__, __code__, __qualname__, __module__,
@@ -9028,6 +9182,8 @@ private:
                 }
                 return false;
             }
+            // len.__call__ (round 78): a builtin's - calling it calls it
+            if(attr=="__call__"&&obj.builtin_type_name().empty()){ out=obj; return true; }
             // a builtin method ([].append): __self__, its names (round 77)
             if(obj.class_name.rfind("__bmethod__:",0)==0){
                 std::string q=obj.class_name.substr(12);
@@ -9096,9 +9252,19 @@ private:
             return false;
         default: break;
         }
+        // a number's real / imag, an int's numerator / denominator (round 78)
+        if(obj.type==VMType::INT||obj.type==VMType::BOOL||obj.type==VMType::FLOAT){
+            bool is_int=obj.type!=VMType::FLOAT;
+            VMVal iv=obj.type==VMType::BOOL?VMVal::make_int(obj.b?1:0):obj;
+            if(attr=="real"){ out=iv; return true; }
+            if(attr=="imag"){ out=is_int?VMVal::make_int(0):VMVal::make_float(0.0); return true; }
+            if(is_int&&attr=="numerator"){ out=iv; return true; }
+            if(is_int&&attr=="denominator"){ out=VMVal::make_int(1); return true; }
+        }
         // A builtin value's method, or the object protocol, read as a value.
         if(bind){
             nypy::MemberKind k=vm_member_kind(obj);
+            if(k!=nypy::MemberKind::Other&&builtin_value_dunder(obj,attr,out)) return true;   // (5).__add__ (round 78)
             if(k!=nypy::MemberKind::Other&&nypy::kind_has_method(k,attr)){ out=bound_member(obj,attr); return true; }
         }
         return false;
@@ -9170,6 +9336,7 @@ private:
     }
     std::string attr_error_text(const VMVal& obj, const std::string& attr){
         if(obj.type==VMType::INSTANCE) return "'"+nyrt::shown_class_name(obj.class_name)+"' object has no attribute '"+attr+"'";
+        if(obj.type==VMType::SUPER_PROXY) return "'super' object has no attribute '"+attr+"'";   // round 78
         if(obj.type==VMType::CLASS){
             std::string cname = obj.class_name.empty() ? obj.s : obj.class_name;
             return "type object '"+cname+"' has no attribute '"+attr+"'";
@@ -9292,6 +9459,15 @@ private:
         return class_lookup(obj.class_name, attr, d) && d.type==VMType::INSTANCE && class_lookup(d.class_name, which, m)
                && (m.type==VMType::FUNCTION||m.type==VMType::NATIVE);
     }
+    // obj's class holds a data descriptor named attr - a property, or an
+    // object whose class defines __set__ or __delete__ (round 78: what a read
+    // looks for before the instance's own field)
+    bool class_data_descriptor(const VMVal& obj, const std::string& attr, VMVal& d) {
+        if(!class_lookup(obj.class_name, attr, d)) return false;
+        if(is_property_desc(d)) return true;
+        VMVal m;
+        return d.type==VMType::INSTANCE&&(class_lookup(d.class_name,"__set__",m)||class_lookup(d.class_name,"__delete__",m));
+    }
     void del_attr(const VMVal& obj, const std::string& attr) {
         {
             VMVal m;
@@ -9331,6 +9507,9 @@ private:
                 return;
             }
         }
+        // object() itself has no __dict__ (round 78: it took attributes)
+        if(obj.type==VMType::INSTANCE&&obj.class_name=="object")
+            raise_native_exception("AttributeError","'object' object has no attribute '"+attr+"'");
         if(any_data_descr_){
             VMVal d, m;
             if(data_descriptor(obj, attr, "__set__", d, m)){
@@ -9396,7 +9575,7 @@ private:
             std::string cname = obj.class_name.empty() ? obj.s : obj.class_name;
             // C.f = staticmethod(g) / classmethod(g) / a property (round 77):
             // as in a class body
-            if(val.type==VMType::INSTANCE){ val=unwrap_method_object(val); note_data_descriptor(val); }
+            if(val.type==VMType::INSTANCE){ val=unwrap_method_object(val); note_data_descriptor(val, &attr); }
             class_vars_[cname][attr] = std::move(val);
             if(attr=="__getattribute__"){ any_getattribute_=true; attr_hook_cache_[2].clear(); }   // round 77
             return;
@@ -9629,6 +9808,22 @@ private:
         return std::string();
     }
 
+    // A call of a number, a string, bytes, a list or tuple, a dict or None
+    // (a bound name's value, a literal, what a call returned) is Python's
+    // TypeError (round 78: it gave none); a name bound nowhere is a
+    // NameError before this (CALL_FUNCTION).
+    void check_callable(const VMVal& callee) {
+        switch(callee.type){
+        case VMType::INT: case VMType::FLOAT: case VMType::BOOL: case VMType::STRING: case VMType::BYTES:
+        case VMType::LIST: case VMType::NONE:
+            break;
+        case VMType::MAP:
+            if(!callee.class_name.empty()) return;   // a bound method, a namespace ...
+            break;
+        default: return;
+        }
+        raise_native_exception("TypeError","'"+vm_type_name(callee)+"' object is not callable");
+    }
     VMVal vm_call(VMVal callee, std::vector<VMVal>& args, std::optional<VMVal> self,
                   const VMVal* kwargs=nullptr) {
         if(callee.type==VMType::NONE||callee.type==VMType::UNDEFINED)
@@ -9662,15 +9857,20 @@ private:
             return vm_call(fn,args,std::nullopt,kwargs);
         }
         // super(...): with no arguments the proxy itself; super(Class, obj)
-        // Python's explicit form; any other arguments are Nython's shorthand
-        // for calling the parent constructor, super(name, 4).
+        // Python's explicit form (round 78: any other arguments were Nython's
+        // shorthand for calling the parent constructor, super(name, 4) -
+        // now Python's TypeErrors; write super().__init__(name, 4)).
         if(callee.type==VMType::SUPER_PROXY){
             if(args.empty()) return callee;
+            if(args.size()>2) raise_native_exception("TypeError","super() takes at most 2 arguments ("+std::to_string(args.size())+" given)");
+            if(args[0].type!=VMType::CLASS) raise_native_exception("TypeError","super() argument 1 must be a type, not "+vm_type_name(args[0]));
+            if(args.size()<2) raise_native_exception("TypeError","super(type): unbound super objects are not supported");
             if(args.size()==2&&args[0].type==VMType::CLASS){
                 // obj must be an instance or a subclass of C (round 77)
                 const VMVal& o=args[1];
                 bool ok=(o.type==VMType::INSTANCE&&class_derives(o.class_name,class_key(args[0])))
-                      ||(o.type==VMType::CLASS&&class_derives(class_key(o),class_key(args[0])));
+                      ||(o.type==VMType::CLASS&&class_derives(class_key(o),class_key(args[0])))
+                      ||(o.type==VMType::CLASS&&class_derives(class_key(args[0]),"type"));   // super(Meta, cls) (round 78)
                 if(!ok) raise_native_exception("TypeError","super(type, obj): obj must be an instance or subtype of type");
                 VMVal proxy=callee;
                 proxy.s=args[0].class_name;
@@ -9699,7 +9899,7 @@ private:
         if(callee.type==VMType::FUNCTION&&callee.code){
             // Class.method taken as a value and called with the instance
             // first: f = Animal.speak; f(dog).
-            if(!self && callee.code->is_method && !callee.code->is_static && !args.empty()
+            if(!self && callee.code->is_method && !callee.code->bind_first && !callee.code->is_static && !args.empty()
                ){
                 // any first argument is self (Props.x.fget(None), as Python)
                 VMVal self_val = args[0];
@@ -9800,6 +10000,11 @@ private:
             if(primitive_member(obj,method,args,pm)) return pm;
             throw_exception(make_exception("AttributeError",{VMVal::make_str("'generator' object has no attribute '"+method+"'")}));
         }
+        // f.__call__(...): the call itself, for a function, a bound or
+        // builtin method (round 78)
+        if(method=="__call__"&&(obj.type==VMType::FUNCTION||(obj.type==VMType::MAP&&obj.class_name=="__bound_method__")
+                                ||(obj.type==VMType::NATIVE&&obj.builtin_type_name().empty()&&obj.class_name.rfind("__rtype__:",0)!=0)))
+            return vm_call(obj,args,std::nullopt,kwargs);
         // A value stored as an attribute of a function: f.cache_info(),
         // f.register(int). It was looked for as a method of the function and
         // not found (AttributeError), though reading it worked.
@@ -9813,6 +10018,12 @@ private:
         {
             VMVal pm;
             if(primitive_member(obj,method,args,pm)) return pm;
+        }
+        // (5).__add__(3), [1].__getitem__(0), {}.__contains__(k): the type's
+        // dunder (round 78; its __format__ is the kind's own)
+        if(method.size()>4&&method[0]=='_'&&method[1]=='_'){
+            VMVal bm;
+            if(builtin_value_dunder(obj,method,bm)) return vm_call(bm,args,std::nullopt,kwargs);
         }
         // super().m(...): m from the class after the defining one in
         // type(self)'s MRO, bound to self.
@@ -9910,6 +10121,7 @@ private:
                 if(class_lookup(obj.class_name, "__getattr__", ga)){
                     std::vector<VMVal> ga_args{VMVal::make_str(method)};
                     VMVal target=invoke_method(ga, obj, ga_args, obj.class_name);
+                    check_callable(target);   // round 78: a str gave none
                     return vm_call(target, args, std::nullopt, kwargs);
                 }
             }
@@ -9962,7 +10174,7 @@ private:
             if(class_lookup(obj.class_name, method, m)){
                 if(m.type==VMType::FUNCTION&&m.code){
                     if(m.code->is_classmethod) return invoke_method(m, obj, args, obj.class_name, kwargs);
-                    if(m.code->is_static||!m.code->is_method) return call_function(m, args, std::nullopt, kwargs);
+                    if(m.code->is_static||!m.code->is_method||m.code->bind_first) return call_function(m, args, std::nullopt, kwargs);
                     if(!args.empty()){
                         VMVal self_val=args[0];
                         std::vector<VMVal> rest(args.begin()+1,args.end());
@@ -11345,8 +11557,13 @@ private:
             if(v.type==VMType::INSTANCE){
                 bool f=false;
                 VMVal r=call_dunder_f(v,"__iter__",{},f);
-                if(f) return r;
                 VMVal nx;
+                if(f){
+                    // an iterator, as Python checks it (round 78)
+                    if(r.type!=VMType::GENERATOR&&r.type!=VMType::ITERATOR&&!(r.type==VMType::INSTANCE&&class_lookup(r.class_name,"__next__",nx)))
+                        raise_native_exception("TypeError","iter() returned non-iterator of type '"+vm_type_name(r)+"'");
+                    return r;
+                }
                 if(class_lookup(v.class_name,"__next__",nx)) return v;
                 return VMVal::make_iter(iter_items(v));
             }
@@ -12037,7 +12254,14 @@ private:
                     }
                     VMVal dv;
                     if(vm->view_of(v,&dv)>=0){ int64_t n=0; for(auto& kv:*dv.map) if(!vm_internal_key(kv.first)) n++; return VMVal::make_int(n); }
-                    VMVal r=vm->call_dunder(v,"__len__",{}); if(r.type!=VMType::NONE) return r; break;
+                    bool found=false;
+                    VMVal r=vm->call_dunder_f(v,"__len__",{},found);
+                    if(!found) break;
+                    // an int >= 0, as Python checks it (round 78)
+                    if(r.type==VMType::BOOL) return VMVal::make_int(r.b?1:0);
+                    if(r.type!=VMType::INT) vm->raise_native_exception("TypeError","'"+vm_type_name(r)+"' object cannot be interpreted as an integer");
+                    if(r.s.empty()?r.i<0:(!r.s.empty()&&r.s[0]=='-')) vm->raise_native_exception("ValueError","__len__() should return >= 0");
+                    return r;
                 }
                 // a class whose metaclass defines __len__ (round 77)
                 case VMType::CLASS: { VMVal r; if(!vm->class_meta_.empty()&&vm->meta_call(v,"__len__",{},r)) return r; break; }
@@ -12179,6 +12403,14 @@ private:
         def("pow",[vm](std::vector<VMVal>& a,const VMVal& kw)->VMVal{
             if(a.size()<2) vm->raise_native_exception("TypeError","pow() expected 2 arguments");
             const VMVal* mv=a.size()>=3?&a[2]:kwarg(kw,"mod");
+            // an object's __pow__ (three arguments with a modulus) or the
+            // right operand's __rpow__ (round 78: pow() skipped them)
+            if(a[0].type==VMType::INSTANCE||a[1].type==VMType::INSTANCE){
+                VMVal res;
+                if(mv&&mv->type!=VMType::NONE){
+                    if(a[0].type==VMType::INSTANCE){ bool f=false; res=vm->call_dunder_f(a[0],"__pow__",{a[1],*mv},f); if(f) return res; }
+                } else if(vm->binary_dunder(a[0],a[1],"__pow__","__rpow__",res)) return res;
+            }
             if(mv&&mv->type!=VMType::NONE){
                 nypy::NumV b,e,m;
                 if(!a[0].to_numv(b)||!a[1].to_numv(e)||!mv->to_numv(m)) vm->raise_native_exception("TypeError","unsupported operand type(s) for pow()");
@@ -12442,13 +12674,7 @@ private:
     }
     // Truthiness with __bool__ / __len__ on instances.
     bool truthy(const VMVal& v) {
-        if(v.type==VMType::INSTANCE){
-            VMVal r=call_dunder(v,"__bool__",{});
-            if(r.type!=VMType::NONE) return r.is_truthy();
-            r=call_dunder(v,"__len__",{});
-            if(r.type!=VMType::NONE) return r.is_truthy();
-            return true;
-        }
+        if(v.type==VMType::INSTANCE){ VMVal c=v; return instance_truthy(c); }   // (round 78: one rule)
         return v.is_truthy();
     }
 
@@ -13085,7 +13311,12 @@ private:
             if(a[0].type==VMType::INSTANCE){
                 check_hashable(a[0]);
                 bool f=false; VMVal r=call_dunder_f(a[0],"__hash__",{},f);
-                if(f) return r;
+                if(f){
+                    // an int, as Python checks it (round 78)
+                    if(r.type==VMType::BOOL) return VMVal::make_int(r.b?1:0);
+                    if(r.type!=VMType::INT) raise_native_exception("TypeError","__hash__ method should return an integer");
+                    return r;
+                }
                 uintptr_t raw=a[0].map?(uintptr_t)a[0].map.get():0;
                 return VMVal::make_int((int64_t)(raw>>4));
             }

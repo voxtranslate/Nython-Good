@@ -15,8 +15,8 @@
 #                         Python's TypeErrors for item assignment/deletion
 # ModuleType(name, doc=None)
 #                         a module object (__name__ __doc__ __package__
-#                         __loader__ __spec__, attributes); isinstance() is
-#                         also true for the namespaces `import m` binds
+#                         __loader__ __spec__, attributes); it is type(m)
+#                         for the namespaces `import m` binds (round 78)
 # FunctionType, LambdaType, MethodType, BuiltinFunctionType,
 # BuiltinMethodType, GeneratorType, NoneType
 #                         the runtime's own type objects: type(f) is
@@ -235,47 +235,11 @@ MappingProxyType = mappingproxy
 
 
 # ── ModuleType ───────────────────────────────────────────────────────────────
-def _is_module_namespace(x):
-    # what `import m` binds here: a dict-like namespace carrying the
-    # module's __name__ and __file__
-    if type(x) != "dict":
-        return False
-    return isinstance(getattr(x, "__name__", None), str) and isinstance(getattr(x, "__file__", None), str)
-
-
-class _ModuleTypeMeta(type):
-    def __instancecheck__(cls, obj):
-        if type(obj) is cls:
-            return True
-        for c in getattr(type(obj), "__mro__", ()):
-            if c is cls:
-                return True
-        return _is_module_namespace(obj)
-    def __repr__(cls):
-        return "<class 'module'>"
-
-
-class ModuleType(metaclass=_ModuleTypeMeta):
-    def __init__(self, name, doc=None):
-        if not isinstance(name, str):
-            raise TypeError("module.__init__() argument 'name' must be str, not " + _tname(name))
-        self.__name__ = name
-        self.__doc__ = doc
-        self.__package__ = None
-        self.__loader__ = None
-        self.__spec__ = None
-
-    def __repr__(self):
-        var f = getattr(self, "__file__", None)
-        if f is not None:
-            return "<module " + repr(self.__name__) + " from " + repr(f) + ">"
-        return "<module " + repr(self.__name__) + ">"
-
-    def __dir__(self):
-        return sorted(list(self.__dict__))
-
-ModuleType.__name__ = "module"
-ModuleType.__qualname__ = "module"
+# The runtime's own type of modules (the prelude's _NyModuleType, round
+# 78): type(m) is ModuleType for what `import m` binds, on both engines;
+# ModuleType(name, doc=None) makes a module object, and it can be derived
+# from.
+ModuleType = _NyModuleType
 
 
 # ── dynamic classes ──────────────────────────────────────────────────────────

@@ -388,6 +388,51 @@ class _NyMetaBound:
     def __repr__(self):
         return "<bound method " + getattr(self.__func__, "__name__", "?") + " of " + repr(self.__self__) + ">"
 
+class _NySuper:
+    # super() / super(C, obj) used as a value on the interpreter (round 78):
+    # the engine answers its other attributes and its methods from the
+    # classes after __thisclass__ in the MRO of __self__ (the VM has its own
+    # proxy kind).
+    def __init__(self, t, obj):
+        self.__self_class__ = obj if isinstance(obj, type) else type(obj)
+        self.__self__ = obj
+        self.__thisclass__ = t
+    def __repr__(self):
+        return "<super: <class '" + self.__thisclass__.__name__ + "'>, <" + self.__self_class__.__name__ + " object>>"
+
+class _NyModuleTypeMeta(type):
+    def __instancecheck__(cls, obj):
+        for c in getattr(type(obj), "__mro__", ()):
+            if c is cls:
+                return True
+        return False
+    def __repr__(cls):
+        if cls is _NyModuleType:
+            return "<class 'module'>"
+        return "<class '" + cls.__module__ + "." + cls.__qualname__ + "'>"
+
+class _NyModuleType(metaclass=_NyModuleTypeMeta):
+    # The type of modules (round 78): type(m) for what `import m` binds is
+    # this class on both engines (it was dict), types.ModuleType is it, and
+    # ModuleType(name, doc=None) makes a module object of its own.
+    def __init__(self, name, doc=None):
+        if not isinstance(name, str):
+            raise TypeError("module.__init__() argument 'name' must be str, not " + type(name).__name__)
+        self.__name__ = name
+        self.__doc__ = doc
+        self.__package__ = None
+        self.__loader__ = None
+        self.__spec__ = None
+    def __repr__(self):
+        f = getattr(self, "__file__", None)
+        if f is not None:
+            return "<module " + repr(self.__name__) + " from " + repr(f) + ">"
+        return "<module " + repr(self.__name__) + ">"
+    def __dir__(self):
+        return sorted(list(self.__dict__))
+_NyModuleType.__name__ = "module"
+_NyModuleType.__qualname__ = "module"
+
 def _ny_ann(thunk, text):
     # An annotation's value for __annotations__ (round 77): evaluated when
     # its statement runs, as Python does; one that cannot be evaluated yet - a
@@ -2337,6 +2382,26 @@ def _ny_bformat(self, spec):
         return str(self)
     return format(_ny_payload(self), spec)
 
+# A plain value's own dunders (round 78): (5).__add__(3) is the type's,
+# bound to 5 (the engines look in _NyV_<type> first, then the mirror). int's
+# and float's binary operators take only their own kinds of operand and
+# give NotImplemented for any other - (5).__add__("x"), (5).__eq__(5.0) - as
+# Python's do; the mirror's versions compute (a subclass instance's, whose
+# engine has no reflected fallback to a plain float or str).
+def _ny_vdecline(f, ok):
+    def method(self, o, *rest):
+        if not isinstance(o, ok):
+            return NotImplemented
+        return f(self, o, *rest)
+    method.__name__ = f.__name__
+    method.__qualname__ = f.__name__
+    return method
+
+def _ny_vnum(vcls, bcls, ok, names):
+    for n in names.split():
+        if hasattr(bcls, n):
+            setattr(vcls, n, _ny_vdecline(getattr(bcls, n), ok))
+
 #@ int
 class _NyB_int:
     def __new__(cls, *args, **kw):
@@ -2461,6 +2526,9 @@ class _NyB_int:
     def from_bytes(cls, *args, **kw):
         return cls(int.from_bytes(*args, **kw))
 _ny_bmethods(_NyB_int, "as_integer_ratio bit_count bit_length conjugate to_bytes is_integer")
+class _NyV_int:
+    pass
+_ny_vnum(_NyV_int, _NyB_int, int, "__add__ __radd__ __sub__ __rsub__ __mul__ __rmul__ __truediv__ __rtruediv__ __floordiv__ __rfloordiv__ __mod__ __rmod__ __divmod__ __rdivmod__ __pow__ __rpow__ __lshift__ __rlshift__ __rshift__ __rrshift__ __and__ __rand__ __or__ __ror__ __xor__ __rxor__ __eq__ __ne__ __lt__ __le__ __gt__ __ge__")
 
 #@ float
 class _NyB_float:
@@ -2560,6 +2628,9 @@ class _NyB_float:
     def fromhex(cls, s):
         return cls(float.fromhex(s))
 _ny_bmethods(_NyB_float, "as_integer_ratio conjugate hex is_integer")
+class _NyV_float:
+    pass
+_ny_vnum(_NyV_float, _NyB_float, (int, float), "__add__ __radd__ __sub__ __rsub__ __mul__ __rmul__ __truediv__ __rtruediv__ __floordiv__ __rfloordiv__ __mod__ __rmod__ __divmod__ __rdivmod__ __pow__ __rpow__ __eq__ __ne__ __lt__ __le__ __gt__ __ge__")
 
 # str, bytes, bytearray, tuple, list: the sequence protocol
 #@ str

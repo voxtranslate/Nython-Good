@@ -76,6 +76,10 @@ std::string Parser::dottedName(){
     if (have(TokenType::String)) {
         return prev().value;
     }
+    // a module's name is not mangled (round 78: `import __x` in a class
+    // binds the mangled name, importStmt, but imports __x)
+    mangle_stack_.push_back(std::string());
+    struct Pop { std::vector<std::string>& s; ~Pop(){ s.pop_back(); } } pop_{mangle_stack_};
     // A module may be named by a word that is a Nython keyword (`import
     // enum`, `import struct`): identifier() takes those.
     std::string name = identifier();
@@ -410,6 +414,8 @@ node_ptr Parser::statement(){
         // names (`@repeat`, `@final`) read as names, as everywhere.
         node_ptr dec_expr = ternary();
         have(TokenType::NewLine);
+        // `@staticmethod async def f(x)`: no method (round 78, functionDecl)
+        if(dec_expr && dec_expr->type() == NodeType::VARIABLE && dec_expr->value() == "staticmethod") next_def_static_ = true;
         // Parse the decorated function or class
         node_ptr target = statement();
         {
@@ -1105,7 +1111,14 @@ bool Parser::braceIsExpression(){
         if(tt == TokenType::Assign || isAugAssignType(tt) || tt == TokenType::SemiColon || tt == TokenType::NewLine
            || tt == TokenType::Indent) return false;
     }
-    return comma;
+    if(comma) return true;
+    // `{x}` alone on a line is a set display (round 78: it read as a block
+    // holding x - harmless, but `{[1]}` did not raise "unhashable type"),
+    // unless a soft keyword starts a statement there (`{ print "x" }`,
+    // `{ repeat 3: ... }`)
+    if(k <= 1) return false;
+    if(nameKeyword(t1) && !usedAsName(2)) return false;
+    return true;
 }
 
 node_ptr Parser::expression(){
@@ -1604,9 +1617,11 @@ void Parser::parseCallArgs(std::shared_ptr<CallNode> call){
             for (char c : t.value) if (!(std::isalnum((unsigned char)c) || c == '_')) return false;
             return !std::isdigit((unsigned char)t.value[0]);
         };
-        if(word_tok(token()) && peek(1).type() == TokenType::Assign
+        // `f(x := 1)` is a positional argument, a walrus (round 78: the
+        // lexer gives := the Assign type, so it read as the keyword x)
+        if(word_tok(token()) && peek(1).type() == TokenType::Assign && peek(1).value != ":="
            && peek(2).type() != TokenType::Assign) { // distinguish name=val from name==val
-            Token kw_tok = token();
+            Token kw_tok = rawToken();   // a keyword's name is not mangled (round 78)
             std::string kw_name = kw_tok.value;
             next(); // consume name
             next(); // consume =
@@ -1963,6 +1978,8 @@ node_ptr Parser::fstringNode(const Token& str_tok, const std::string& raw){
                 auto sub_lex = std::make_shared<Lexer>(sub_src);
                 sub_lex->tokenize();
                 Parser sub_parser(&sub_reporter, runner, sub_lex.get());
+                sub_parser.mangle_stack_ = mangle_stack_;   // f"{self.__x}" (round 78)
+                sub_parser.self_scope_ = self_scope_;
                 expr_node = sub_parser.expression();
             } catch(...) {
                 Token vtok = str_tok; vtok.value = expr_str;
@@ -2678,15 +2695,24 @@ static void forward_params(const Token& t, CallNode* call, const std::vector<nod
     }
 }
 
-static node_ptr async_def_desugar(const Token& tok, node_ptr fn, bool is_generator) {
+static node_ptr async_def_desugar(const Token& tok, node_ptr fn, bool is_generator, bool class_method = false) {
     auto* f = static_cast<FunctionNode*>(fn.get());
     Token t = tok;
     auto name_tok = [&](const std::string& v) { Token x = t; x.value = v; return x; };
     bool method = !f->params.empty() &&
         (f->params[0]->value() == "self" || f->params[0]->value() == "this");
+    // A method whose first parameter is not self (`async def m(s)`, an
+    // async classmethod's cls) is reached through that parameter (round 78).
+    std::string via;
+    if (!method && class_method && !f->params.empty() &&
+        f->params[0]->value()[0] != '*' && f->params[0]->value() != "/") {
+        method = true;
+        via = f->params[0]->value();
+    }
     // The function itself (a method: self.name), as the call below names it.
     auto self_ref = [&]() -> node_ptr {
-        if (method) return make_node<AttributeNode>(name_tok(f->name), make_node<SelfNode>(name_tok("self")), f->name);
+        if (method && via.empty()) return make_node<AttributeNode>(name_tok(f->name), make_node<SelfNode>(name_tok("self")), f->name);
+        if (method) return make_node<AttributeNode>(name_tok(f->name), make_node<VariableNode>(name_tok(via)), f->name);
         return make_node<VariableNode>(name_tok(f->name));
     };
     if (is_generator) {
@@ -2745,9 +2771,16 @@ static node_ptr async_def_desugar(const Token& tok, node_ptr fn, bool is_generat
 node_ptr Parser::functionDecl(bool is_method){
     bool is_async = s_async_def_next;
     s_async_def_next = false;
+    // a def directly in a class body is a method whatever its first
+    // parameter is called, unless it is a static method (round 78)
+    bool class_method = !ann_scope_.empty() && ann_scope_.back() == 'c' && !next_def_static_;
+    next_def_static_ = false;
     Token tok = token();
     next(); // consume def/function/fn
+    // `def __m` in a class binds _C__m; __qualname__ is C.__m (round 78)
+    std::string raw_name = rawToken().value;
     std::string name = identifier();
+    if(name != raw_name && name != mangled(raw_name)) raw_name = name;
     std::vector<node_ptr> params;
     if(see(TokenType::ParenOpen)) {
         next(); // consume (
@@ -2770,7 +2803,7 @@ node_ptr Parser::functionDecl(bool is_method){
     auto saved_defaults = std::move(param_defaults_);
     yield_seen_.push_back(false);
     ann_scope_.push_back('f');
-    std::string qualname = qualOf(name);
+    std::string qualname = qualOf(raw_name);
     qual_stack_.push_back(qualname + ".<locals>");
     self_scope_.push_back(!params.empty() && (params[0]->value() == "self" || params[0]->value() == "this"));
     node_ptr body;
@@ -2807,7 +2840,7 @@ node_ptr Parser::functionDecl(bool is_method){
         }
         static_cast<FunctionNode*>(fn.get())->annotations = m;
     }
-    if(is_async) return async_def_desugar(tok, fn, is_gen);
+    if(is_async) return async_def_desugar(tok, fn, is_gen, class_method && name != "__new__");
     return fn;
 }
 
@@ -2943,7 +2976,15 @@ std::vector<node_ptr> Parser::argList(){
 node_ptr Parser::classDecl(){
     Token tok = token();
     mustBe(TokenType::Class);
+    // `class __H` inside a class binds _C__H; its __name__ stays __H
+    // (round 78)
+    std::string raw_name = rawToken().value;
     std::string name = identifier();
+    std::string bind_as;
+    if(name != raw_name && name == mangled(raw_name)){
+        bind_as = name;
+        name = raw_name;
+    }
     // Optional bases: class Foo(Bar, Baz) or class Foo extends Bar
     // Supports: extends, inherits, and parenthesized syntax
     std::vector<node_ptr> bases;
@@ -2962,6 +3003,13 @@ node_ptr Parser::classDecl(){
         // the engines expand an entry named "**")
         if(have(TokenType::Exp)){
             class_kw.push_back({"**", ternary()});
+            return;
+        }
+        // `class C(*bases)`: each item a base (round 78; the engines expand
+        // a starred base)
+        if(have(TokenType::Mul)){
+            Token st = prev();
+            bases.push_back(make_node<UnaryNode>(st, ternary()));
             return;
         }
         // A (dotted) name, or any other expression (Generic[T], a call).
@@ -3024,7 +3072,16 @@ node_ptr Parser::classDecl(){
     ann_scope_.push_back('c');
     class_ann_used_.push_back(false);
     qual_stack_.push_back(qualOf(name));   // its methods are "C.m" (round 77)
-    node_ptr body = blockOrStmt();
+    // the body's private names are mangled with this class's name (round 78)
+    {
+        size_t u = name.find_first_not_of('_');
+        mangle_stack_.push_back(u == std::string::npos ? std::string() : name.substr(u));
+    }
+    node_ptr body;
+    {
+        struct Pop { std::vector<std::string>& s; ~Pop(){ s.pop_back(); } } pop_{mangle_stack_};
+        body = blockOrStmt();
+    }
     qual_stack_.pop_back();
     ann_scope_.pop_back();
     // the docstring, before `var __annotations__ = {}` is put ahead of it
@@ -3047,6 +3104,7 @@ node_ptr Parser::classDecl(){
         auto* cp = static_cast<ClassNode*>(cls.get());
         cp->has_doc = class_has_doc;
         cp->doc = class_doc;
+        if(!bind_as.empty()) cp->bind_name = bind_as;   // round 78
     }
     return cls;
 }
@@ -3383,6 +3441,50 @@ node_ptr Parser::importStmt(){
     return blk;
 }
 
+// An except* clause's body may not leave it with return, nor with a
+// break/continue of a loop outside it (round 78; CPython's compiler: the
+// clause runs as part of a group being split). A def, lambda or class
+// inside starts afresh; a loop inside owns its break/continue.
+static void checkExceptStarFlow(const node_ptr& n, bool in_loop){
+    if(!n) return;
+    auto bad = [&]{ throw SyntaxError(n->token().location(), "'break', 'continue' and 'return' cannot appear in an except* block"); };
+    switch(n->type()){
+    case NodeType::RETURN: bad(); break;
+    case NodeType::BREAK: case NodeType::CONTINUE: if(!in_loop) bad(); break;
+    case NodeType::BLOCK: case NodeType::STATEMENTS:
+        for(auto& s : n->statements()) checkExceptStarFlow(s, in_loop);
+        break;
+    case NodeType::IF: {
+        auto* in = static_cast<IfNode*>(n.get());
+        if(in->is_expr) break;
+        checkExceptStarFlow(in->then_branch, in_loop);
+        for(auto& b : in->elseif_branches) checkExceptStarFlow(b, in_loop);
+        checkExceptStarFlow(in->else_branch, in_loop);
+        break;
+    }
+    case NodeType::TRY: {
+        auto* tn = static_cast<TryNode*>(n.get());
+        checkExceptStarFlow(tn->body, in_loop);
+        for(auto& e : tn->except_clauses) checkExceptStarFlow(e, in_loop);
+        checkExceptStarFlow(tn->else_clause, in_loop);
+        checkExceptStarFlow(tn->finally_clause, in_loop);
+        break;
+    }
+    case NodeType::EXCEPT: checkExceptStarFlow(static_cast<ExceptNode*>(n.get())->body, in_loop); break;
+    case NodeType::WITH: checkExceptStarFlow(static_cast<WithNode*>(n.get())->body, in_loop); break;
+    case NodeType::WHILE:
+        checkExceptStarFlow(static_cast<WhileNode*>(n.get())->body, true);
+        checkExceptStarFlow(static_cast<WhileNode*>(n.get())->else_branch, in_loop);
+        break;
+    case NodeType::FOR:
+        checkExceptStarFlow(static_cast<ForNode*>(n.get())->body, true);
+        checkExceptStarFlow(static_cast<ForNode*>(n.get())->else_branch, in_loop);
+        break;
+    case NodeType::REPEAT: checkExceptStarFlow(static_cast<RepeatNode*>(n.get())->body, true); break;
+    default: break;   // expressions, def, lambda, class
+    }
+}
+
 node_ptr Parser::tryStmt(){
     Token tok = token();
     mustBe(TokenType::Try);
@@ -3438,6 +3540,7 @@ node_ptr Parser::tryStmt(){
             if(have(TokenType::As)) alias = identifier();
             have(TokenType::Colon);
             node_ptr hbody = blockOrStmt();
+            checkExceptStarFlow(hbody, false);   // round 78
             auto run = make_node<BlockNode>(tok);
             if(!alias.empty()) run->add(make_node<AssignmentNode>(T("="), var(alias), match_of()));
             run->add(hbody);

@@ -156,7 +156,13 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         if (E.isInstanceVal(v) && E.instanceHasMethod(v, "__len__")) {
             std::vector<Value> no;
             Value r = E.callMethod(v, "__len__", no, ctx);
-            if (r.type != ValueType::NONE) return r;
+            // an int >= 0, as Python checks it (round 78: anything was
+            // returned as it was)
+            if (r.type == ValueType::BOOLEAN) return intValue(r.value.b ? 1 : 0);
+            if (r.type != ValueType::INTEGER)
+                E.pyRaise("TypeError", "'" + E.typeNameOf(r) + "' object cannot be interpreted as an integer");
+            if (r.value.i.isNegative()) E.pyRaise("ValueError", "__len__() should return >= 0");
+            return r;
         }
         // len(none) is 0, as it always was here: library code takes the
         // length of a missing (none) entry and relies on that.
@@ -318,6 +324,11 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
     case B_POW: {
         need(2, "pow()");
         const Value* mv = arg(2, "mod");
+        // pow(obj, e, m): the object's three-argument __pow__ (round 78)
+        if (mv && mv->type != ValueType::NONE && E.isInstanceValue(args[0]) && E.instanceHasMethod(args[0], "__pow__")) {
+            std::vector<Value> a{args[1], *mv};
+            return E.callMethod(args[0], "__pow__", a, ctx);
+        }
         if (mv && mv->type != ValueType::NONE) {
             NythonExecutor::Num b, e, m;
             if (!NythonExecutor::asNum(args[0], b) || !NythonExecutor::asNum(args[1], e) || !NythonExecutor::asNum(*mv, m))
@@ -372,7 +383,11 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             auto cit = E.instance_to_class.find(v.value.p);
             if (cit != E.instance_to_class.end() && E.classDefines(cit->second, "__hash__")) {
                 std::vector<Value> none;
-                return E.callMethod(v, "__hash__", none, ctx);
+                Value h = E.callMethod(v, "__hash__", none, ctx);
+                // an int, as Python checks it (round 78)
+                if (h.type == ValueType::BOOLEAN) return intValue(h.value.b ? 1 : 0);
+                if (h.type != ValueType::INTEGER) E.pyRaise("TypeError", "__hash__ method should return an integer");
+                return h;
             }
             // by identity, the key dictKey gives it ("u" + its address) -
             // without entering it in the key table, which kept the object

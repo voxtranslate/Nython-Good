@@ -14,11 +14,11 @@ class Animal:
         self.legs = legs
 class Dog(Animal):
     def init(self, name):
-        super(name, 4)
+        super().init(name, 4)
         self.sound = "woof"
 class Puppy(Dog):
     def init(self, name, color):
-        super(name)
+        super().init(name)
         self.color = color
 
 var p = Puppy("Buddy", "brown")
