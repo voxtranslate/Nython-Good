@@ -824,6 +824,14 @@ class IDEViews(IDEPaint):
                 r.text(self.dbg.exception_at, x + self.dp(36), y + self.dp(20), self.f_small, th.text_faint)
                 self._hit(x, y, w, self.dp(40), "@dbg.exception", "", "Go to where the exception was raised")
                 y = y + self.dp(46)
+            if len(self.dbg_why) > 0:
+                # the answer to the last Why? question (round 79)
+                if self._section(r, x, y, w, "WHY", "dbg.why", len(self.dbg_why)):
+                    self._small_button(r, x + w - self.dp(30), y + self.dp(1), self.dp(20), self.dp(20), "close", "@dbg.whyclose", "", "Clear the Answer", false)
+                    y = y + self.ROW_H
+                    y = self._draw_dbg_why(r, x, y, w)
+                else:
+                    y = y + self.ROW_H
             if self._section(r, x, y, w, "VARIABLES", "dbg.vars", -1):
                 y = y + self.ROW_H
                 y = self._draw_dbg_vars(r, x, y, w)
@@ -894,9 +902,114 @@ class IDEViews(IDEPaint):
             r.text(": ", x + self.dp(24) + nw, y + int((lh - self.code_small_h) / 2), self.f_mono_small, th.text_dim)
             r.text(v, x + self.dp(24) + nw + self.f_mono_small.width(": "), y + int((lh - self.code_small_h) / 2), self.f_mono_small, th.text)
             self._hit(x, y, w, lh, "@dbg.var", i, nm + " = " + v)
+            if self._hov(x, y, w, lh) or i == self.dbg_var_sel:
+                # Why? (round 79): the steps that gave it this value
+                self._small_button(r, x + w - self.dp(28), y + self.dp(1), self.dp(20), self.dp(20), "question", "@dbg.why", i, "Why does it have this value?", false)
             y = y + lh
             i = i + 1
         return y
+
+    # ── Why? (round 79) ───────────────────────────────────────────────────────
+    # Whyline questions over the recording (lib/ide_debugger.ny: dynamic
+    # backward slicing): asked of a variable in the Variables pane - why
+    # does it have this value here - or of an editor line - why didn't it
+    # run. The answer is a list of the recording's steps, shown in the WHY
+    # section; a click travels to that step. Its rows are built once per
+    # question (dbg_why: [text, step, file, line, level, kind]); the painter
+    # only draws them.
+    def _draw_dbg_why(self, r, x, y, w):
+        var th = self.th
+        var lh = self.ROW_H
+        r.text(self.dbg_why_title, x + self.dp(16), y + int((lh - self.small_h) / 2), self.f_small, th.text_dim)
+        y = y + lh
+        var i = 0
+        while i < len(self.dbg_why) and y + lh <= self.status_y - self.dp(120):
+            var row = self.dbg_why[i]
+            if self._hov(x, y, w, lh):
+                r.fill_xywh(x, y, w, lh, th.hover)
+            var ix = x + self.dp(16) + row[4] * self.dp(12)
+            var col = th.text
+            if row[5] == "data" or row[5] == "call":
+                col = th.info
+            elif row[5] == "control" or row[5] == "predicate":
+                col = th.warn
+            elif row[5] == "never" or row[5] == "exit":
+                col = th.err
+            r.text(row[6], ix, y + int((lh - self.code_small_h) / 2), self.f_mono_small, th.text_faint)
+            r.text(row[0], ix + self.f_mono_small.width(row[6]), y + int((lh - self.code_small_h) / 2), self.f_mono_small, col)
+            self._hit(x, y, w, lh, "@dbg.whygo", i, row[7])
+            y = y + lh
+            i = i + 1
+        return y
+
+    # The answer's rows: [text, step, file, line, level, kind, "L12 ", tip].
+    def _dbg_why_show(self, title, entries):
+        var rows = []
+        for e in entries:
+            if e["kind"] == "value" or e["kind"] == "question":
+                continue
+            var t = e["text"]
+            if e["kind"] == "data" and e["value"] != none:
+                t = t + "   -> " + e["var"] + " = " + str(e["value"])
+            var tip = os_path_basename(e["file"]) + ":" + str(e["line"])
+            if e["step"] >= 0:
+                tip = tip + "  (step " + str(e["step"] + 1) + ")"
+            rows.append([t, e["step"], e["file"], e["line"], e["level"], e["kind"], "L" + str(e["line"]) + " ", tip])
+        self.dbg_why = rows
+        self.dbg_why_title = title
+        if len(rows) == 0:
+            self.dbg_why = [["no earlier step set it", -1, "", 0, 0, "note", "", ""]]
+        self._show_view("debug")
+        self._dirty = true
+
+    def _dbg_why_value(self, name):
+        if not self.dbg.active:
+            self._notify("Start debugging (F5) to ask why a variable has its value", "warn")
+            return
+        var at = self.dbg.pos
+        if self.dbg_frame >= 0:
+            at = self.dbg_frame
+        if name == none or name == "":
+            var vs = self.dbg_vars_cache()
+            if self.dbg_var_sel >= 0 and self.dbg_var_sel < len(vs):
+                name = vs[self.dbg_var_sel][0]
+            else:
+                self._notify("Select a variable in the Variables pane first", "warn")
+                return
+        var ans = self.dbg.why_value(name, at)
+        var cur = ans[0]["value"] if len(ans) > 0 else none
+        self._dbg_why_show("Why is " + name + " = " + str(cur) + " at line " + str(self.dbg.line_at(at)) + "?", ans)
+
+    def _dbg_why_not(self, row):
+        if not self.dbg.active:
+            self._notify("Start debugging (F5) to ask why a line did not run", "warn")
+            return
+        if not self._is_text():
+            return
+        var d = self.doc()
+        if row == none or row == "":
+            row = self.buf().cursor_row
+        var file = d.path
+        if d == self.dbg_doc and d.kind != "file":
+            file = self.dbg_run_path
+        var ans = self.dbg.why_not(file, row + 1)
+        self._dbg_why_show("Why didn't line " + str(row + 1) + " run?", ans)
+
+    def _dbg_why_go(self, i):
+        if i < 0 or i >= len(self.dbg_why):
+            return
+        var row = self.dbg_why[i]
+        if row[1] >= 0:
+            self.dbg.seek(row[1])
+            self._dbg_sync()
+        elif row[2] != "" and row[3] > 0:
+            if row[2] == self.dbg_run_path and self.dbg_doc != none:
+                var di = self._index_of(self.dbg_doc)
+                if di >= 0:
+                    self._activate(di)
+                    self._goto(row[3] - 1, 0)
+            else:
+                self._open_path(row[2], row[3] - 1, 0)
 
     def dbg_vars_cache(self):
         if self.dbg_vars_pos == self.dbg.pos and self.dbg_vars_frame == self.dbg_frame:

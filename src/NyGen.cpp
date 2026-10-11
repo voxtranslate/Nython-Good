@@ -399,24 +399,53 @@ Value run_body(NythonExecutor& E, Gen* g) {
     return r;
 }
 
+// sys.settrace / sys.setprofile (round 79): a generator's frame gets `call`
+// each time it is resumed (at its def line the first time, at the paused
+// yield after) and `return` each time it yields (the value) or ends, as
+// CPython's; the prelude's generators have no events.
+bool gen_traced(Gen* g) {
+    return (nytrace::t_hooks & nytrace::ANY) && g && g->fn && !NythonExecutor::tbHiddenFile(g->fn->token().fileName());
+}
+size_t gen_frame_idx() { return NythonExecutor::py_frames().size() - 1; }
+
 // The coroutine's function: the body, with everything it raises caught
 // here and handed to the resumer (nothing may unwind past this frame).
 void entry(void* p) {
     Gen* g = (Gen*)p;
     NythonExecutor& E = *g->E;
     try {
+        if (__builtin_expect(gen_traced(g), 0) && g->mode != Mode::Kill) {   // round 79
+            NythonExecutor::cur_stmt() = g->fn;
+            E.pyEvCall(gen_frame_idx());
+        }
         g->retval = run_body(E, g);
+        if (__builtin_expect(gen_traced(g), 0)) E.pyEvReturn(gen_frame_idx(), g->retval);
     } catch (nython::node::ReturnSignal& r) {
         g->retval = r.value;
     } catch (GenKill&) {
     } catch (std::string& s) {
         E.tbUnwind(s);   // the generator's frame, for the traceback (round 77)
+        // the exception and return(None) events; a hook that raises
+        // replaces the exception (round 79)
+        std::string s2 = s;
+        if (__builtin_expect(gen_traced(g), 0)) {
+            try { E.pyEvLeave(s2, gen_frame_idx()); }
+            catch (std::string& h) { s2 = h; }
+            catch (...) {}
+        }
         // PEP 479: a StopIteration escaping a generator body would silently
         // end whatever loop drives it; it becomes a RuntimeError.
-        if (is_exc(E, s, "StopIteration"))
+        if (is_exc(E, s2, "StopIteration"))
             g->exc = std::make_exception_ptr(std::string("__exc__:RuntimeError:generator raised StopIteration"));
+        else if (s2 != s)
+            g->exc = std::make_exception_ptr(s2);
         else
             g->exc = std::current_exception();
+    } catch (std::exception& e) {
+        if (__builtin_expect(gen_traced(g), 0)) {   // round 79
+            try { E.pyEvLeave(NythonExecutor::excFromCpp(e.what()), gen_frame_idx()); } catch (...) {}
+        }
+        g->exc = std::current_exception();
     } catch (...) {
         g->exc = std::current_exception();
     }
@@ -425,6 +454,8 @@ void entry(void* p) {
 
 // What a paused `yield` evaluates to when the generator is resumed.
 Value after_resume(Gen* g) {
+    // resumed: the call event, at the yield (round 79)
+    if (__builtin_expect(gen_traced(g), 0) && g->mode != Mode::Kill) g->E->pyEvCall(gen_frame_idx());
     switch (g->mode) {
     case Mode::Next: return NONE_VALUE;
     case Mode::Send: { Value s = g->xfer; g->xfer = NONE_VALUE; return s; }
@@ -920,6 +951,7 @@ Value yield_value(NythonExecutor& E, const Value& v) {
     (void)E;
     Gen* g = t_cur;
     if (!g || !g->co || nycoro::current() != g->co) raise("SyntaxError", "'yield' outside function");
+    if (__builtin_expect(gen_traced(g), 0)) E.pyEvReturn(gen_frame_idx(), v);   // round 79: the yield's return event
     g->xfer = v;
     g->yielded = true;
     nycoro::suspend();
@@ -988,9 +1020,11 @@ Value yield_from(NythonExecutor& E, const Value& src, Context* ctx) {
             return result;
         }
         // Pass the value up, and what comes back down.
+        if (__builtin_expect(gen_traced(g), 0)) E.pyEvReturn(gen_frame_idx(), v);   // round 79
         g->xfer = v;
         g->yielded = true;
         nycoro::suspend();
+        if (__builtin_expect(gen_traced(g), 0) && g->mode != Mode::Kill) E.pyEvCall(gen_frame_idx());
         m = g->mode;
         in = NONE_VALUE;
         if (m == Mode::Send) { in = g->xfer; g->xfer = NONE_VALUE; if (in.type == ValueType::NONE) m = Mode::Next; }
@@ -1371,7 +1405,11 @@ Value for_loop(NythonExecutor& E, void* for_node, const Value& gv, Context* ctx,
     };
     try {
         Value elem;
-        while (next(E, g, elem, ctx)) {
+        for (bool head_first = true;; head_first = false) {
+            // sys.settrace (round 79): the header's line again before each
+            // next item (NY_PYT_HEAD)
+            if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0) && !head_first) E.pyEvLineAt(fn);
+            if (!next(E, g, elem, ctx)) break;
             bind_item(elem);
             try { NythonExecutor::LoopBody _lb(lf); result = E.evalNode(fn->body, ctx); }
             catch (std::string& flow) {

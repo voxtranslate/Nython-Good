@@ -366,6 +366,8 @@ class NythonIDE(IDETools):
         self.dbg_recording = false
         self.watches = []
         self.dbg_var_sel = -1
+        self.dbg_why = []          # the last Why? answer's rows (round 79, ide_views.ny)
+        self.dbg_why_title = ""
         self.fields = {}           # input name -> LineEdit (caret + selection)
         self.wrap_cache = {}
         self.mm_codes = {}
@@ -1293,6 +1295,17 @@ class NythonIDE(IDETools):
         elif cmd == "@dbg.var":
             self.dbg_var_sel = arg
             self.focus = "debugvars"
+        elif cmd == "@dbg.why":
+            # Why? (round 79): the variable's value, traced back
+            self.dbg_var_sel = arg
+            var wv = self.dbg_vars_cache()
+            if arg < len(wv):
+                self._exec("nython.debug.whyValue", wv[arg][0])
+        elif cmd == "@dbg.whygo":
+            self._dbg_why_go(arg)
+        elif cmd == "@dbg.whyclose":
+            self.dbg_why = []
+            self.dbg_why_title = ""
         elif cmd == "@dbg.exception":
             self.dbg.seek(self.dbg.n - 1)
             self._dbg_sync()
@@ -1371,6 +1384,11 @@ class NythonIDE(IDETools):
                                       ["Run Nython File", "workbench.action.debug.run", ""],
                                       ["Command Palette...", "workbench.action.showCommands", ""]])
             self.ctx_items = self._tools_editor_ctx(self.ctx_items)
+            if self.dbg.active:
+                # Why? (round 79): asked of the line clicked
+                var wp = self._pos_at(e.x, e.y)
+                self.ctx_items.insert(0, ["-", "", ""])
+                self.ctx_items.insert(0, ["Why Didn't This Line Run?", "nython.debug.whyNot", wp[0]])
         elif c == "@gutter.glyph":
             var gp = self._pos_at(e.x, e.y)
             self._open_ctx(e.x, e.y, [["Toggle Breakpoint", "@ctx.brktoggle", gp[0]],
@@ -1393,7 +1411,9 @@ class NythonIDE(IDETools):
             self.dbg_var_sel = h.arg
             var vs = self.dbg_vars_cache()
             if h.arg < len(vs):
-                self._open_ctx(e.x, e.y, [["Copy Value", "@ctx.copytext", vs[h.arg][1]],
+                self._open_ctx(e.x, e.y, [["Why Does It Have This Value?", "nython.debug.whyValue", vs[h.arg][0]],
+                                          ["-", "", ""],
+                                          ["Copy Value", "@ctx.copytext", vs[h.arg][1]],
                                           ["Copy as Expression", "@ctx.copytext", vs[h.arg][0]],
                                           ["Add to Watch", "@ctx.watch", vs[h.arg][0]]])
         elif c == "@term" or c == "@panel.body" or c == "@dbgcon" or c == "@stdin":

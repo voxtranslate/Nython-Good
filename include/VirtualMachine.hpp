@@ -18,6 +18,8 @@
 #include <mutex>
 #include <functional>
 #include "platform_compat.hpp"   // ny_fs (directories on every platform)
+#include "NyPyTrace.hpp"         // sys.settrace / sys.setprofile (round 79)
+#include <thread>
 #include <unordered_set>
 #include <optional>
 #include <cassert>
@@ -507,6 +509,7 @@ struct VMCode {
     bool                     bind_first    = false;
     bool                     is_static     = false;
     bool                     is_classmethod= false;
+    std::string              self_name     = "self";   // the receiver's parameter: self or this (round 79)
     bool                     is_generator  = false;
     // For inspect / __code__ / __qualname__ (round 77): the parser's
     // qualified name, `async def` (its body is rewritten, so nothing else
@@ -543,8 +546,21 @@ struct VMCode {
     }
     int  emit(Op op, int arg=0, int line=0) {
         instructions.emplace_back(op,arg,line);
+        line_start.push_back(0);
         return (int)instructions.size()-1;
     }
+    // sys.settrace's line events (round 79): the instructions that begin a
+    // line as CPython counts them - a statement's first instruction, an
+    // elif test, an except clause, a with statement's exit, a lambda's
+    // body. Execution reaching one on another line than the last event's
+    // (or any backward jump) is a `line` event (VirtualMachine::vm_line_hook).
+    std::vector<uint8_t> line_start;
+    void mark_line_start(int idx, int line=-1) {
+        if(idx<0||idx>=(int)instructions.size()) return;
+        line_start[(size_t)idx]=1;
+        if(line>0) instructions[(size_t)idx].line=line;
+    }
+    bool is_line_start(int idx) const { return idx>=0&&idx<(int)line_start.size()&&line_start[(size_t)idx]; }
     void patch(int idx, int arg) { instructions[idx].arg=arg; }
     // Whether this function is a generator: a yield in its own body. A yield
     // in a nested function belongs to that function - searching sub_codes
@@ -981,8 +997,11 @@ private:
         // (round 78: `super()` alone as a statement no longer calls the
         // parent constructor - Nython's shorthand from before super() was
         // Python's; write super().__init__())
+        int start=C().here();
         visit(nd);
         if(pushes_value(nd)) emit(Op::POP_TOP,0,ln(nd));
+        // a statement's first instruction begins its line (round 79)
+        if(C().here()>start && nd->type()!=NT::BLOCK && nd->type()!=NT::STATEMENTS) C().mark_line_start(start);
     }
 
     // ─── dispatch ──────────────────────────────────────────────────────────
@@ -1261,6 +1280,7 @@ private:
             }
             if(lm->body){ visit(lm->body); emit(Op::RETURN_VALUE,0,l); }
             else{ emit_lc(VMVal::make_none(),l); emit(Op::RETURN_VALUE,0,l); }
+            C().mark_line_start(0);   // the lambda's one line event (round 79)
             renames_.pop_back();
             C().param_defaults.assign(C().param_names.size(), VMVal{VMType::UNDEFINED});
             pop_code();
@@ -1372,6 +1392,7 @@ private:
             C().exc_table[idx].try_end=C().here();
             FinCtx fc=std::move(fin_stack_.back()); fin_stack_.pop_back();
             emit(Op::FIN_NORMAL,0,l2);
+            C().mark_line_start(C().here()-1);   // its exit: the with line again (round 79)
             int fs=C().here();
             C().exc_table[idx].finally_start=fs;
             for(int j:fc.jumps) C().patch(j,fs);
@@ -1766,6 +1787,7 @@ private:
             C().exc_table[idx].depth=persist_depth_;
             bool has_fin=(bool)tn->finally_clause;
             if(has_fin) fin_stack_.push_back({idx,loops_.size(),{}});
+            emit(Op::NOP,0,l);   // the `try:` line's own line event (round 79)
             C().exc_table[idx].try_start=C().here();
             if(tn->body) visit_stmt(tn->body);
             C().exc_table[idx].try_end=C().here();
@@ -1784,6 +1806,7 @@ private:
                 cl.types=en->types; cl.bind_var=en->var;
                 cl.handler=C().here();
                 emit_dn(held,l);
+                C().mark_line_start(cl.handler, ln(en));   // the except clause's line (round 79)
                 if(!en->var.empty()){
                     emit_ln(held,l);
                     if(en->var_global) emit(Op::STORE_GLOBAL_NAME,C().add_name(en->var),l);
@@ -1872,7 +1895,9 @@ private:
         C().patch(jf,C().here());
         for(auto& ei:nd->elseif_branches){
             auto eif=std::static_pointer_cast<nython::node::IfNode>(ei);
+            int es=C().here();
             visit(eif->condition);
+            if(!nd->is_expr) C().mark_line_start(es, ln(eif));   // an elif test begins its line (round 79)
             int jf2=C().here(); emit(Op::JUMP_IF_FALSE,0,l);
             branch(eif->then_branch);
             ends.push_back(C().here()); emit(Op::JUMP_FORWARD,0,l);
@@ -2028,6 +2053,7 @@ private:
         std::string p0=fn->params.empty()?std::string():fn->params[0]->value();
         bool self_first=p0=="self"||p0=="this";
         C().is_method=self_first;
+        if(self_first) C().self_name=p0;   // `this` stays `this` in its signature (round 79)
         if(!self_first&&in_class_body&&fn->name!="__new__"){ C().is_method=true; C().bind_first=true; }
         auto self_param=[&](int i){ return i==0&&self_first; };
         int param_idx=0;
@@ -2138,6 +2164,7 @@ private:
         push_code(cn->name,true);
         code_->is_class=true;  // mark this sub_code as a class
         code_->doc=cn->doc; code_->has_doc=cn->has_doc;
+        code_->qualname=cn->qualname;   // Outer.Inner, f.<locals>.C (round 79)
         // A base given by an expression (Generic[T], a call) is evaluated
         // before MAKE_CLASS; its slot is "\x06<i>" until then (round 77).
         std::vector<np> expr_bases;
@@ -2625,6 +2652,9 @@ struct CallFrame {
     // Its Python frame object's fields (round 78), once a program asked for
     // one (VirtualMachine::frame_object); null for every other call.
     std::shared_ptr<VMMap> fobj;
+    // sys.settrace (round 79): the line of the last line event and the last
+    // instruction run while tracing (a backward jump is a new line event)
+    int trace_line = -1, trace_ip = -1;
 };
 
 struct VMReturn   { VMVal value; };
@@ -2691,7 +2721,14 @@ class VirtualMachine : public Runnable {
     VMVal last_exception_obj_;
     bool prelude_loaded_=false;
     std::vector<nython::node::node_ptr> prelude_asts_;
-    bool vm_trace_ = getenv("NY_VM_TRACE") != nullptr;
+    // NY_VM_TRACE: the instruction dump, tested through nytrace::t_hooks
+    // (round 79: one byte for it and sys.settrace's line events)
+    bool vm_trace_ = vm_trace_init();
+    static bool vm_trace_init() {
+        bool on = getenv("NY_VM_TRACE") != nullptr;
+        if(on) nytrace::t_hooks |= nytrace::VMDEBUG;
+        return on;
+    }
     bool export_to_globals_ = false;   // true while executing an import
     // The call depth of the importing module's own frame: only ITS top-level
     // names are exported. Every `var` in every function the module's code
@@ -3280,6 +3317,8 @@ public:
             std::vector<VMVal> st; st.swap(stack_);
             std::deque<CallFrame> cs; cs.swap(call_stack_);
             VMVal le; std::swap(le, last_exception_obj_);
+            std::unordered_map<std::thread::id, VMHookFns> hk; hk.swap(pyhooks_);   // round 79
+            nytrace::t_hooks = 0;
         }
         vmgc::g_shutdown = false;
         vmgc::collect(*this, 2);
@@ -3679,6 +3718,13 @@ public:
         (*ns.map)["exc_info"]=load_var("_ny_exc_info");
         (*ns.map)["exception"]=load_var("_ny_exc_current");
         (*ns.map)["_getframe"]=load_var("_ny_getframe");
+        // sys.settrace / setprofile and breakpoint()'s hook (round 79)
+        (*ns.map)["settrace"]=load_var("_ny_settrace");
+        (*ns.map)["gettrace"]=load_var("_ny_gettrace");
+        (*ns.map)["setprofile"]=load_var("_ny_setprofile");
+        (*ns.map)["getprofile"]=load_var("_ny_getprofile");
+        (*ns.map)["breakpointhook"]=load_var("_ny_breakpointhook");
+        (*ns.map)["__breakpointhook__"]=load_var("_ny_breakpointhook");
         {
             std::vector<VMVal> wo;
             for(auto& o:nyrt::warn_options()) wo.push_back(VMVal::make_str(o));
@@ -3815,6 +3861,11 @@ private:
         catch (...) { x->exc = std::current_exception(); }   // nothing unwinds across the switch
     }
     VMVal run_frame() {
+        // sys.settrace / sys.setprofile (round 79): one test per frame
+        if(__builtin_expect(nytrace::t_hooks & nytrace::ANY,0)) return run_frame_hooked();
+        return run_frame_plain();
+    }
+    VMVal run_frame_plain() {
         if(!nycoro::current() || !nycoro::stack_exhausted()) return run_loop();
         Extension x{this, VMVal::make_none(), nullptr};
         nycoro::Coro* co = nullptr;
@@ -5613,7 +5664,7 @@ private:
         const std::vector<VMVal>& dflts=f.list?*f.list:c.param_defaults;
         auto S=[](const std::string& s){ return VMVal::make_str(s); };
         std::vector<VMVal> ps;
-        if(c.is_method&&!c.bind_first) ps.push_back(VMVal::make_list({S("self"),VMVal::make_int(c.posonly>0?0:1),VMVal::make_bool(false),VMVal::make_none()}));
+        if(c.is_method&&!c.bind_first) ps.push_back(VMVal::make_list({S(c.self_name),VMVal::make_int(c.posonly>0?0:1),VMVal::make_bool(false),VMVal::make_none()}));
         bool star=false;
         for(size_t i=0;i<c.param_names.size();i++){
             std::string pn=c.param_names[i];
@@ -6395,7 +6446,12 @@ private:
             CallFrame& fr=call_stack_.back();
             if(fr.ip>=(int)fr.code->instructions.size()) return VMVal::make_none();
             const Instruction& ins=fr.code->instructions[fr.ip++];
-            if(vm_trace_) fprintf(stderr,"[vm] op=%d arg=%d depth=%d\n",(int)ins.op,ins.arg,(int)stack_.size());
+            // NY_VM_TRACE's dump and sys.settrace's line events (round 79):
+            // one test of a thread-local byte per instruction when neither is on
+            if(__builtin_expect(nytrace::t_hooks,0)){
+                if(nytrace::t_hooks & nytrace::VMDEBUG) fprintf(stderr,"[vm] op=%d arg=%d depth=%d\n",(int)ins.op,ins.arg,(int)stack_.size());
+                if(nytrace::t_hooks & nytrace::TRACE) vm_line_hook(fr, ins.line);
+            }
             try {
             switch(ins.op){
 
@@ -7035,11 +7091,17 @@ private:
                 VMVal kwargs_map=all_args.back(); all_args.pop_back();
                 if(method_mode){
                     VMVal mname=pop(); VMVal obj=pop();
-                    push(vm_call_method(obj,mname.s,all_args,&kwargs_map));
+                    VMVal m;
+                    if(__builtin_expect(nytrace::t_hooks&nytrace::PROFILE,0)&&obj.type!=VMType::INSTANCE&&obj.type!=VMType::CLASS
+                       &&try_get_attr(obj,mname.s,m)&&m.type==VMType::NATIVE)   // c_call ... (round 79)
+                        push(vm_profile_builtin(m,[&](){ return vm_call_method(obj,mname.s,all_args,&kwargs_map); }));
+                    else push(vm_call_method(obj,mname.s,all_args,&kwargs_map));
                 } else {
                     VMVal callee=pop();
                     check_callable(callee);
-                    push(vm_call(callee,all_args,std::nullopt,&kwargs_map));
+                    if(__builtin_expect(nytrace::t_hooks&nytrace::PROFILE,0)&&callee.type==VMType::NATIVE)   // c_call ... (round 79)
+                        push(vm_profile_builtin(callee,[&](){ return vm_call(callee,all_args,std::nullopt,&kwargs_map); }));
+                    else push(vm_call(callee,all_args,std::nullopt,&kwargs_map));
                 }
                 break;
             }
@@ -7138,6 +7200,10 @@ private:
                             + "' is not defined at line " + std::to_string(ins.line));
                 }
                 check_callable(callee);
+                // a native: c_call ... for the profile function (round 79)
+                if(__builtin_expect(nytrace::t_hooks&nytrace::PROFILE,0)&&callee.type==VMType::NATIVE){
+                    push(vm_profile_builtin(callee,[&](){ return vm_call(callee,args,std::nullopt); })); break;
+                }
                 push(vm_call(callee,args,std::nullopt)); break;
             }
             case Op::CALL_METHOD: {
@@ -7145,6 +7211,14 @@ private:
                 std::vector<VMVal> args(argc);
                 for(int i=argc-1;i>=0;i--) args[i]=pop();
                 VMVal mname=pop(); VMVal obj=pop();
+                // a builtin value's method (xs.append(1)), a module's native
+                // (math.sqrt(x)): c_call ... (round 79)
+                if(__builtin_expect(nytrace::t_hooks&nytrace::PROFILE,0)&&obj.type!=VMType::INSTANCE&&obj.type!=VMType::CLASS){
+                    VMVal m;
+                    if(try_get_attr(obj,mname.s,m)&&m.type==VMType::NATIVE){
+                        push(vm_profile_builtin(m,[&](){ return vm_call_method(obj,mname.s,args); })); break;
+                    }
+                }
                 push(vm_call_method(obj,mname.s,args)); break;
             }
             // A return used to throw VMReturn, caught (and rethrown once) on the
@@ -7518,7 +7592,10 @@ private:
                 if(ex.value.type==VMType::INSTANCE&&ex.value.map&&!tb_reraise_&&!ex.value.map->count("__traceback__")
                    &&!ex.value.map->count("__context__"))
                     set_exc_context(ex.value, vm_exc_current());
+                bool rr=tb_reraise_;
                 tb_here(ex.value);
+                // sys.settrace's exception event, once per frame (round 79)
+                if(__builtin_expect(nytrace::t_hooks&nytrace::TRACE,0)&&!rr) vm_ev_exception(ex.value);
                 if(!dispatch_exception(call_stack_.back(), ex.value)) throw;
               }
               catch(std::string& m) {
@@ -7526,7 +7603,9 @@ private:
                 // VM paths, report errors as "__exc__:Type:message" strings.
                 VMVal ev=exception_from_message(m);
                 set_exc_context(ev, vm_exc_current());
+                bool rr=tb_reraise_;
                 tb_here(ev);
+                if(__builtin_expect(nytrace::t_hooks&nytrace::TRACE,0)&&!rr) vm_ev_exception(ev);   // round 79
                 if(!dispatch_exception(call_stack_.back(), ev)) throw VMException(ev, describe_exception(ev));
               }
               catch(std::exception& exc) {
@@ -7538,7 +7617,9 @@ private:
                 // builtin bridge) leaves it in last_exception_obj_.
                 VMVal ev=take_native_exception(exc.what());
                 set_exc_context(ev, vm_exc_current());
+                bool rr=tb_reraise_;
                 tb_here(ev);
+                if(__builtin_expect(nytrace::t_hooks&nytrace::TRACE,0)&&!rr) vm_ev_exception(ev);   // round 79
                 if(!dispatch_exception(call_stack_.back(), ev)) throw VMException(ev, describe_exception(ev));
               }
         }
@@ -7564,6 +7645,8 @@ private:
     }
     static int frame_line(const CallFrame& f) {
         int ip=f.ip-1;
+        // not started yet: its def line (round 79: a call event's f_lineno)
+        if(ip<0&&f.code) return f.code->first_line;
         return (f.code&&ip>=0&&ip<(int)f.code->instructions.size())?f.code->instructions[(size_t)ip].line:0;
     }
     void tb_here(const VMVal& ev) {
@@ -7801,6 +7884,179 @@ private:
             (*gs.fobj)["_ny_lasti"]=VMVal::make_int(f.ip>0?(int64_t)(f.ip-1)*2:0);
             (*gs.fobj)["_ny_locals"]=locals_dict(gs.locals, gs.self_val, gs.closure, gs.own_env);
         }
+    }
+
+    // ── sys.settrace / sys.setprofile (round 79; the interpreter's
+    // NythonExecutor::pyEvCall ... - the same events, CPython 3.11's) ──
+    //   call       run_frame_hooked: a frame begins (a function, a lambda,
+    //              exec'd code) or a generator resumes; the trace function's
+    //              result becomes the frame's f_trace, then the profile
+    //              function is told
+    //   line       vm_line_hook, per instruction: one that begins a line
+    //              (VMCode::line_start) on another line than the last event,
+    //              or any backward jump - through f_trace
+    //   return     the frame ends or a generator yields (the value; None when
+    //              an exception leaves it)
+    //   exception  run_loop's handlers, once per frame an exception reaches
+    //              (a bare raise / a finally passing it on is not repeated)
+    //   c_call / c_return / c_exception   a native called as a function or
+    //              as a method of a builtin value (vm_profile_builtin)
+    // Hooks run with both off (t_in_hook); one that raises is unset (and the
+    // frame's f_trace cleared) and its exception goes on in the traced code.
+    // The prelude's frames ("stdin") have no events.
+    struct VMHookFns { VMVal trace, profile; };
+    std::unordered_map<std::thread::id, VMHookFns> pyhooks_;
+    static bool hook_set(const VMVal& v) { return v.type!=VMType::NONE && v.type!=VMType::UNDEFINED; }
+    VMHookFns* vm_hooks() {
+        if(pyhooks_.empty()) return nullptr;
+        auto it=pyhooks_.find(std::this_thread::get_id());
+        return it==pyhooks_.end()?nullptr:&it->second;
+    }
+    void vm_hooks_recompute() {
+        uint8_t b=0;
+        auto it=pyhooks_.find(std::this_thread::get_id());
+        if(it!=pyhooks_.end()){
+            if(hook_set(it->second.trace)) b|=nytrace::TRACE;
+            if(hook_set(it->second.profile)) b|=nytrace::PROFILE;
+            if(!b) pyhooks_.erase(it);
+        }
+        nytrace::t_hooks=(uint8_t)((nytrace::t_in_hook?0:b)|(vm_trace_?nytrace::VMDEBUG:0));
+    }
+    // _ny_settrace(fn) / _ny_setprofile(fn)
+    VMVal vm_set_hook(std::vector<VMVal>& a, bool trace) {
+        VMVal fn=a.empty()?VMVal::make_none():a[0];
+        if(!hook_set(fn)&&!vm_hooks()) return VMVal::make_none();
+        VMHookFns& h=pyhooks_[std::this_thread::get_id()];
+        (trace?h.trace:h.profile)=hook_set(fn)?fn:VMVal::make_none();
+        vm_hooks_recompute();
+        return VMVal::make_none();
+    }
+    VMVal vm_get_hook(bool trace) {
+        VMHookFns* h=vm_hooks();
+        return h?(trace?h->trace:h->profile):VMVal::make_none();
+    }
+    VMVal vm_hook_call(const VMVal& fn, const VMVal& frame, const char* ev, const VMVal& arg, uint8_t which) {
+        bool saved=nytrace::t_in_hook;
+        nytrace::t_in_hook=true;
+        nytrace::t_hooks=vm_trace_?nytrace::VMDEBUG:0;
+        VMVal r;
+        try {
+            std::vector<VMVal> a{frame, VMVal::make_str(ev), arg};
+            r=vm_call(fn, a, std::nullopt, nullptr);
+        } catch(...) {
+            nytrace::t_in_hook=saved;
+            if(VMHookFns* h=vm_hooks()) (which==nytrace::TRACE?h->trace:h->profile)=VMVal::make_none();
+            if(which==nytrace::TRACE&&frame.type==VMType::INSTANCE&&frame.map) (*frame.map)["f_trace"]=VMVal::make_none();
+            vm_hooks_recompute();
+            throw;
+        }
+        nytrace::t_in_hook=saved;
+        vm_hooks_recompute();
+        return r;
+    }
+    // An event through frame idx's f_trace (line / return / exception).
+    void vm_ev_local(size_t idx, const char* ev, const VMVal& arg) {
+        CallFrame& f=call_stack_[idx];
+        if(!f.fobj) return;   // no frame object: no f_trace
+        auto it=f.fobj->find("f_trace");
+        if(it==f.fobj->end()||!hook_set(it->second)) return;
+        if(ev[0]=='l'){
+            auto tl=f.fobj->find("f_trace_lines");
+            if(tl!=f.fobj->end()&&!vm_truthy(tl->second)) return;
+        }
+        VMVal ft=it->second;
+        VMVal fo=VMVal::make_instance("_NyFrame", f.fobj);
+        VMVal r=vm_hook_call(ft, fo, ev, arg, nytrace::TRACE);
+        if(hook_set(r)&&fo.map) (*fo.map)["f_trace"]=r;
+    }
+    void vm_ev_profile(size_t idx, const char* ev, const VMVal& arg) {
+        VMHookFns* h=vm_hooks();
+        if(!h||!hook_set(h->profile)) return;
+        VMVal fn=h->profile;
+        VMVal fo=frame_object(idx);
+        vm_hook_call(fn, fo, ev, arg, nytrace::PROFILE);
+    }
+    void vm_ev_call(size_t idx) {
+        if(nytrace::t_hooks&nytrace::TRACE){
+            VMHookFns* h=vm_hooks();
+            if(h&&hook_set(h->trace)){
+                VMVal fn=h->trace;
+                VMVal fo=frame_object(idx);
+                VMVal r=vm_hook_call(fn, fo, "call", VMVal::make_none(), nytrace::TRACE);
+                if(hook_set(r)&&fo.map) (*fo.map)["f_trace"]=r;
+            }
+        }
+        if(nytrace::t_hooks&nytrace::PROFILE) vm_ev_profile(idx, "call", VMVal::make_none());
+    }
+    void vm_ev_return(size_t idx, const VMVal& v) {
+        if(nytrace::t_hooks&nytrace::TRACE) vm_ev_local(idx, "return", v);
+        if(nytrace::t_hooks&nytrace::PROFILE) vm_ev_profile(idx, "return", v);
+    }
+    // The innermost frame runs an instruction on `line`: a line event when
+    // it begins a line other than the last event's, or a backward jump
+    // reached it (CPython 3.11's maybe_call_line_trace).
+    void vm_line_hook(CallFrame& fr, int line) {
+        int ip=fr.ip-1;
+        bool back=ip<fr.trace_ip;
+        fr.trace_ip=ip;
+        if(line<=0) return;
+        if(!back&&(line==fr.trace_line||!fr.code->is_line_start(ip))) return;
+        fr.trace_line=line;
+        if(!fr.fobj||fr.code->file=="stdin") return;
+        vm_ev_local(call_stack_.size()-1, "line", VMVal::make_none());
+    }
+    // The exception `ev` reached the running frame (run_loop's handlers):
+    // the exception event; a hook that raises replaces it.
+    void vm_ev_exception(VMVal& ev) {
+        size_t idx=call_stack_.size()-1;
+        CallFrame& f=call_stack_[idx];
+        if(!f.fobj||!f.code||f.code->file=="stdin") return;
+        auto it=f.fobj->find("f_trace");
+        if(it==f.fobj->end()||!hook_set(it->second)) return;
+        VMVal ty=ev.type==VMType::INSTANCE?class_value(ev.class_name):VMVal::make_none();
+        VMVal tb=VMVal::make_none();
+        if(ev.type==VMType::INSTANCE&&ev.map){ auto ti=ev.map->find("__traceback__"); if(ti!=ev.map->end()) tb=ti->second; }
+        try { vm_ev_local(idx, "exception", VMVal::make_tuple({ty, ev, tb})); }
+        catch(VMException& he){ ev=he.value; }
+    }
+    // A frame run with the call / return events around it.
+    VMVal run_frame_hooked() {
+        size_t idx=call_stack_.size()-1;
+        CallFrame& f=call_stack_.back();   // a deque: the reference stays valid
+        if(!f.code||f.code->file=="stdin"||f.code->file.empty()) return run_frame_plain();
+        // a resumed generator continues the line it paused on
+        if(f.ip>0){ f.trace_ip=f.ip-1; f.trace_line=frame_line(f); }
+        vm_ev_call(idx);
+        VMVal r;
+        try { r=run_frame_plain(); }
+        catch(VMReturn& rv){ if(nytrace::t_hooks&nytrace::ANY) vm_ev_return(idx, rv.value); throw; }
+        catch(VMYield&){ throw; }
+        catch(VMException&){ if(nytrace::t_hooks&nytrace::ANY) vm_ev_return(idx, VMVal::make_none()); throw; }
+        if(nytrace::t_hooks&nytrace::ANY) vm_ev_return(idx, r);
+        return r;
+    }
+    // c_call / c_return / c_exception around a native the running frame calls.
+    template<class F> VMVal vm_profile_builtin(const VMVal& fn, F&& run) {
+        size_t idx=call_stack_.size()-1;
+        if(call_stack_.empty()||!call_stack_.back().code||call_stack_.back().code->file=="stdin") return run();
+        vm_ev_profile(idx, "c_call", fn);
+        VMVal r;
+        try { r=run(); }
+        catch(...) { if(nytrace::t_hooks&nytrace::PROFILE) vm_ev_profile(idx, "c_exception", fn); throw; }
+        if(nytrace::t_hooks&nytrace::PROFILE) vm_ev_profile(idx, "c_return", fn);
+        return r;
+    }
+    // _ny_frame_local_set(frame, name, value): PEP 667's write-through.
+    VMVal frame_local_set(std::vector<VMVal>& a) {
+        size_t idx;
+        if(a.size()<3||a[1].type!=VMType::STRING||!frame_find(a[0], idx)) return VMVal::make_bool(false);
+        CallFrame& f=call_stack_[idx];
+        const std::string& n=a[1].s;
+        if(frame_is_module(f)&&f.code&&f.code->module_env) (*f.code->module_env)[n]=a[2];
+        else if(f.locals.count(n)) f.set(n, a[2]);
+        else if(f.own_env&&f.closure_env&&f.closure_env->count(n)) (*f.closure_env)[n]=a[2];
+        else f.define(n, a[2]);
+        return VMVal::make_bool(true);
     }
 
     // ── Exceptions ───────────────────────────────────────────────────────
@@ -9097,6 +9353,12 @@ private:
                 else if(m.type==VMType::INSTANCE&&descriptor_get(m, VMVal::make_none(), cname, out)) {}
                 else out=m;   // a method read from the class is the plain function
                 return true;
+            }
+            // a nested class's __qualname__ (round 79: the parser's)
+            if(attr=="__qualname__"){
+                std::shared_ptr<VMCode> cc=obj.code;
+                if(!cc){ auto ci=class_reg_.find(cname); if(ci!=class_reg_.end()) cc=ci->second; }
+                if(cc&&cc->is_class&&!cc->qualname.empty()){ out=VMVal::make_str(cc->qualname); return true; }
             }
             // A module's class is "module.Class" (round 77): __name__ is the
             // class's own name, __module__ the module's.
@@ -11496,6 +11758,12 @@ private:
         globals_["_ny_frame_back"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return a.empty()?VMVal::make_none():frame_back(a[0]); });
         globals_["_ny_frame_globals"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return a.empty()?main_globals_map():frame_globals(a[0]); });
         globals_["_ny_builtins_dict"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return builtins_dict(); });
+        // sys.settrace / sys.setprofile and f_locals write-through (round 79)
+        globals_["_ny_settrace"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_set_hook(a, true); });
+        globals_["_ny_setprofile"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_set_hook(a, false); });
+        globals_["_ny_gettrace"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return vm_get_hook(true); });
+        globals_["_ny_getprofile"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return vm_get_hook(false); });
+        globals_["_ny_frame_local_set"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return frame_local_set(a); });
         globals_["_ny_main_globals"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return main_globals_map(); });
         globals_["locals"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return vm_locals_map(); });
         globals_["vars"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_vars(a); });

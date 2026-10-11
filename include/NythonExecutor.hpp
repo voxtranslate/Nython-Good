@@ -29,6 +29,7 @@
 #include "NyRuntime.hpp"
 #include "NyKwMap.hpp"
 #include "NyPrelude.hpp"
+#include "NyPyTrace.hpp"   // sys.settrace / sys.setprofile (round 79)
 #include <algorithm>
 #include <fstream>
 #include <cwctype>
@@ -585,6 +586,7 @@ public:   // NythonExecutor is a struct: members default to public
             "staticmethod","classmethod","callable","dir","vars","globals","locals","eval","exec","compile","_ny_setattr_raw","_ny_delattr_raw","_ny_object_new","_ny_method_new","_ny_subclasses","_ny_type_new","_ny_type_call",
             "_ny_main_globals","_ny_exc_current","_ny_stack",
             "_ny_frame_get","_ny_frame_sync","_ny_frame_back","_ny_frame_globals","_ny_builtins_dict",   // frame objects (round 78)
+            "_ny_settrace","_ny_setprofile","_ny_gettrace","_ny_getprofile","_ny_frame_local_set",   // sys.settrace ... (round 79)
             "_ny_fn_info","_ny_fn_globals","_ny_keywords",   // inspect, f.__code__, keyword (round 77)
             "_ny_unicode_lookup","_ny_unicode_name",          // unicodedata (round 77)
             "_ny_payload","_ny_payload_new","_ny_getattr_raw","_ny_setfield","_ny_delfield",   // builtin subclasses, __getattribute__, __dict__ (round 77)
@@ -607,6 +609,7 @@ public:   // NythonExecutor is a struct: members default to public
             "text_words","ny_symbols","ny_check_syntax","text_diff","fs_list_files","fs_search",
             "text_fold_ranges","text_line_stats","text_todos","fs_todos","text_format_nython",
             "ac_index_new","ac_index_set_base","ac_index_scan","ac_index_rank","text_diff_classify","fs_symbols","ny_check_file","fs_line_stats",
+            "text_defuse",   // round 79: the static half of the debugger's dynamic slices
             // ── GUI builtins — value-returning ──────────────────────────────
             "gui_get_error","gui_sdl_version","gui_get_display_size","gui_get_window_size","gui_set_window_size","gui_set_cursor","gui_hash_id","gui_display_scale","gui_display_density","gui_video_driver","gui_window_scale","gui_measure_text_w","gui_set_clipboard","gui_get_clipboard",
             "gui_wait_events","gui_set_min_size","gui_set_fullscreen","gui_is_fullscreen","gui_show_open_dialog","gui_show_save_dialog","gui_set_text_input_area","gui_draw_arc","gui_draw_text_wrapped","gui_wrap_text","gui_font_metrics","gui_image_size","gui_free_image","gui_push_clip","gui_pop_clip","gui_push_offset","gui_pop_offset","gui_ticks","gui_next_event","gui_event_get",
@@ -886,6 +889,11 @@ public:   // NythonExecutor is a struct: members default to public
         if (ny_pf_ == 2) { broke_var = true; break; } \
         continue; \
     }
+    // sys.settrace (round 79): a for loop's header line is reached again
+    // before each item after the first and when the items run out, as
+    // CPython's line events report it (`node` is the loop's).
+#define NY_PYT_HEAD(again) \
+    if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0) && (again)) pyEvLineAt(node.get());
     // Runs a function body in fc and returns what the call should return:
     // the value of a `return` (fast or thrown), or - as before - the value
     // of the body's last statement when it runs off the end.
@@ -4350,6 +4358,7 @@ public:   // NythonExecutor is a struct: members default to public
         if (isTruthy(cond)) return evalNode(in->then_branch, ctx);
         for (auto& ei : in->elseif_branches) {
             auto eif = static_pointer_cast<IfNode>(ei);
+            if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0) && !in->is_expr) pyEvLineAt(eif.get());   // an elif's line (round 79)
             if (isTruthy(evalNode(eif->condition, ctx))) return evalNode(eif->then_branch, ctx);
         }
         if (in->else_branch) return evalNode(in->else_branch, ctx);
@@ -4361,7 +4370,11 @@ public:   // NythonExecutor is a struct: members default to public
         Value result = NONE_VALUE;
         bool broke = false;
         FlowState& lf = flow();
-        while (isTruthy(evalNode(wn->condition, ctx))) {
+        bool head_first = true;   // round 79: sys.settrace's line event for the header, each time it is tested again
+        while (true) {
+            if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0) && !head_first) pyEvLineAt(node.get());
+            head_first = false;
+            if (!isTruthy(evalNode(wn->condition, ctx))) break;
             try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(wn->body, ctx); }
             catch (std::string& flow) {
                 if (flow == "break") { broke = true; break; }
@@ -4474,11 +4487,13 @@ public:   // NythonExecutor is a struct: members default to public
         // A range of 64-bit ints (round 78): counted, no iterator object.
         if (counted) {
             for (int64_t i = 0; i < r_n; i++) {
+                NY_PYT_HEAD(i > 0)
                 bindv(var_name, intValue(nyrt::range_at(r_first, r_step, i)));
                 try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
                 catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
                 NY_LOOP_FLOW(broke)
             }
+            NY_PYT_HEAD(!broke && r_n > 0)
             if (!broke && fn->else_branch) result = evalNode(fn->else_branch, ctx);
             return result;
         }
@@ -4500,7 +4515,8 @@ public:   // NythonExecutor is a struct: members default to public
                 for (size_t ui = 0; ui < fn->unpack_vars.size(); ui++)
                     bindv(fn->unpack_vars[ui]->value(), ui + 1 < parts.size() ? parts[ui + 1] : NONE_VALUE);
             };
-            for (;;) {
+            for (bool head_first = true;; head_first = false) {
+                NY_PYT_HEAD(!head_first)
                 if (m->size() != size0) pyRaise("RuntimeError", "dictionary changed size during iteration");
                 const std::pair<std::string, Value>* kv = nullptr;
                 while (slot < m->slot_end()) {
@@ -4556,11 +4572,13 @@ public:   // NythonExecutor is a struct: members default to public
         if (iter_val.type == ValueType::INTEGER) {
             int64_t n = bigint_to_i64(iter_val.value.i);
             for (int64_t i = 0; i < n; i++) {
+                NY_PYT_HEAD(i > 0)
                 bindv(var_name, Value((int)i));
                 try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
                 catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
                 NY_LOOP_FLOW(broke)
             }
+            NY_PYT_HEAD(!broke && n > 0)
             if (!broke && fn->else_branch) result = evalNode(fn->else_branch, ctx);
             return result;
         }
@@ -4584,6 +4602,7 @@ public:   // NythonExecutor is a struct: members default to public
                 
                 // List iteration by numeric index
                 for (int i = 0; i < len; i++) {
+                    NY_PYT_HEAD(i > 0)
                     std::string key = std::to_string(i);
                     auto it = cont->container->find(key);
                     if (it != cont->container->end()) {
@@ -4615,6 +4634,7 @@ public:   // NythonExecutor is a struct: members default to public
                         NY_LOOP_FLOW(broke)
                     }
                 }
+                NY_PYT_HEAD(!broke && len > 0)
             }
             if (!broke && fn->else_branch) result = evalNode(fn->else_branch, ctx);
             return result;
@@ -4625,11 +4645,13 @@ public:   // NythonExecutor is a struct: members default to public
         if (auto* bo = bytesOf(iter_val)) {
             Value hold = iter_val;
             for (size_t k = 0; k < bo->s.size(); k++) {
+                NY_PYT_HEAD(k > 0)
                 bindv(var_name, intValue((int64_t)(unsigned char)bo->s[k]));
                 try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
                 catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
                 NY_LOOP_FLOW(broke)
             }
+            NY_PYT_HEAD(!broke && !bo->s.empty())
             if (!broke && fn->else_branch) result = evalNode(fn->else_branch, ctx);
             return result;
         }
@@ -4639,12 +4661,14 @@ public:   // NythonExecutor is a struct: members default to public
             if (!func_names.count(iter_val.value.p)) {
                 // By character, not byte.
                 std::vector<std::string> chars = nypy::u8_chars(*static_cast<std::string*>(iter_val.value.p));
-                for (auto& ch : chars) {
-                    bindv(var_name, makeStringValue(ch));
+                for (size_t ci = 0; ci < chars.size(); ci++) {
+                    NY_PYT_HEAD(ci > 0)
+                    bindv(var_name, makeStringValue(chars[ci]));
                     try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
                     catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
                     NY_LOOP_FLOW(broke)
                 }
+                NY_PYT_HEAD(!broke && !chars.empty())
                 if (!broke && fn->else_branch) result = evalNode(fn->else_branch, ctx);
                 return result;
             }
@@ -4658,7 +4682,8 @@ public:   // NythonExecutor is a struct: members default to public
             if (!instanceHasMethod(iterator, "__next__"))
                 throw std::string("__exc__:TypeError:'" + shownClassName(instanceClassName(iterator)) + "' object is not iterable");
             // Now call __next__ repeatedly until StopIteration
-            while (true) {
+            for (bool head_first = true;; head_first = false) {
+                NY_PYT_HEAD(!head_first)
                 Value item;
                 bool stop = false;
                 try {
@@ -7244,6 +7269,9 @@ public:
         last_stmt() = st;
         cur_stmt() = st.get();   // round 77: frames
         if (trace_on()) traceStatement(st, ctx);
+        // sys.settrace's line event (round 79): one test of a thread-local
+        // byte when no trace function is set
+        if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0)) pyEvLine(st.get());
     }
 
     void traceStatement(const node_ptr& st, Context* ctx) {
@@ -7612,6 +7640,8 @@ public:
                                 if (fn_it->second.find("__builtin__:") == 0) {
                                     std::string bn = fn_it->second.substr(12);
                                     if (!kw_args.empty() && isKwmapBuiltin(bn)) appendKwMap(args, kw_args);
+                                    if (__builtin_expect(nytrace::t_hooks & nytrace::PROFILE, 0))   // math.sqrt(x): c_call ... (round 79)
+                                        return pyProfileBuiltin(attr_val, [&]() { return callBuiltin(bn, args, ctx); });
                                     return callBuiltin(bn, args, ctx);
                                 }
                                 if (fn_it->second.find("__func__:") == 0 || fn_it->second.find("__lambda__") == 0) {
@@ -7696,6 +7726,14 @@ public:
                 if (key_it != kw_args.end() && args.size() == 0) args.push_back(key_it->second);
                 else if (key_it != kw_args.end()) args.insert(args.begin(), key_it->second);
             }
+            // a builtin value's method (xs.append(1)): c_call ... for the
+            // profile function, the bound method as its argument (round 79)
+            if (__builtin_expect(nytrace::t_hooks & nytrace::PROFILE, 0) && !isInstanceVal(obj)
+                && (isStringValue(obj) || bytesOf(obj) || (contOf(obj) && !classNodeOfValue(obj)))) {
+                Value bm;
+                if (getAttrValue(obj, method_name, ctx, bm, true) && bm.type == ValueType::USERDATA)
+                    return pyProfileBuiltin(bm, [&]() { return callMethod(obj, method_name, args, ctx, &kw_args); });
+            }
             return callMethod(obj, method_name, args, ctx, &kw_args);
         }
 
@@ -7774,6 +7812,8 @@ public:
                 for (auto& an : cn->args)
                     if (an->type() == NodeType::KEYWORD_ARG) cur_kw_order_.push_back(static_pointer_cast<KeywordArgNode>(an)->name);
                 KwScope ks(this, kw_args.empty() ? nullptr : &kw_args);
+                if (__builtin_expect(nytrace::t_hooks & nytrace::PROFILE, 0))   // c_call ... (round 79)
+                    return pyProfileBuiltin(callee, [&]() { return gen_s0 != nygen::serial_now() ? callBuiltinTemps(builtin, args, ctx, cn, gen_s0) : callBuiltin(builtin, args, ctx); });
                 if (gen_s0 != nygen::serial_now()) return callBuiltinTemps(builtin, args, ctx, cn, gen_s0);
                 return callBuiltin(builtin, args, ctx);
             }
@@ -7801,6 +7841,8 @@ public:
                 (*kw->container)["__kwargs__"] = Value(1);
                 args.push_back(Value((Collectable*)kw));
             }
+            if (__builtin_expect(nytrace::t_hooks & nytrace::PROFILE, 0))   // c_call ... (round 79)
+                return pyProfileBuiltin(callee, [&]() { return gen_s0 != nygen::serial_now() ? callBuiltinTemps(builtin, args, ctx, cn, gen_s0) : callBuiltin(builtin, args, ctx); });
             if (gen_s0 != nygen::serial_now()) return callBuiltinTemps(builtin, args, ctx, cn, gen_s0);
             return callBuiltin(builtin, args, ctx);
         }
@@ -9033,6 +9075,14 @@ public:
                         out = makeStringValue(dot == std::string::npos ? std::string("__main__") : nm.substr(0, dot));
                         return true;
                     }
+                    // a nested class's __qualname__ is Outer.Inner, a class in
+                    // a function's f.<locals>.C (round 79: the parser's)
+                    if (is_class && attr == "__qualname__") {
+                        if (auto* cnode = dynamic_cast<ClassNode*>(classNodeOfValue(obj)); cnode && !cnode->qualname.empty()) {
+                            out = makeStringValue(cnode->qualname);
+                            return true;
+                        }
+                    }
                     out = makeStringValue(dot == std::string::npos ? nm : nm.substr(dot + 1));
                     return true;
                 }
@@ -10174,6 +10224,218 @@ public:
         nygc::decref(o);
     }
 
+    // ── sys.settrace / sys.setprofile (round 79; CPython 3.11's events) ──
+    // A thread's trace and profile functions are kept here, keyed by
+    // thread; the hot paths test only nytrace::t_hooks (NyPyTrace.hpp).
+    //   call       a frame begins (runBodyHooked: a def, a lambda, exec'd
+    //              code) or a generator resumes (NyGen.cpp): the trace
+    //              function's result becomes the frame's f_trace (None
+    //              leaves it), then the profile function is told
+    //   line       a statement starts (noteStatement), a loop's header is
+    //              reached again (for / while), an except clause takes the
+    //              exception, a with statement exits - through the frame's
+    //              f_trace, when its f_trace_lines is true
+    //   return     the frame ends (its value; None when an exception leaves
+    //              it) or a generator yields (the value): f_trace, then the
+    //              profile function
+    //   exception  an exception reaches a try statement in the frame, or
+    //              leaves the frame - once per frame it passes (a bare
+    //              raise or a finally passing it on does not repeat it):
+    //              (type, value, traceback) to f_trace
+    //   c_call / c_return / c_exception   a builtin called by name or as a
+    //              method of a builtin value (the profile function; arg is
+    //              the builtin)
+    // A hook runs with both off (t_in_hook). One that raises is unset (and
+    // the frame's f_trace cleared) and its exception goes on in the traced
+    // code, as CPython's trace_trampoline / profile_trampoline do. The
+    // prelude's frames ("stdin") have no events, as C functions have none.
+    struct PyHookFns {
+        Value trace, profile;
+        std::string exc_flow;            // the exception last reported ...
+        size_t exc_depth = (size_t)-2;   // ... in the frame at this depth (py_frames().size())
+    };
+    std::unordered_map<std::thread::id, PyHookFns> pyhooks_;
+    std::string pyt_exc_flow_;           // the exception object an event made last
+    Value pyt_exc_obj_;
+    PyHookFns* pyHooks() {
+        if (pyhooks_.empty()) return nullptr;
+        auto it = pyhooks_.find(std::this_thread::get_id());
+        return it == pyhooks_.end() ? nullptr : &it->second;
+    }
+    static bool hookSet(const Value& v) { return v.type != ValueType::NONE && v.type != ValueType::UNDEFINED; }
+    void pyHooksRecompute() {
+        uint8_t b = 0;
+        auto it = pyhooks_.find(std::this_thread::get_id());
+        if (it != pyhooks_.end()) {
+            if (hookSet(it->second.trace)) b |= nytrace::TRACE;
+            if (hookSet(it->second.profile)) b |= nytrace::PROFILE;
+            if (!b) pyhooks_.erase(it);
+        }
+        nytrace::t_hooks = nytrace::t_in_hook ? 0 : b;
+    }
+    // _ny_settrace(fn) / _ny_setprofile(fn); _ny_gettrace() / _ny_getprofile()
+    Value pySetHook(std::vector<Value>& args, bool trace) {
+        Value fn = args.empty() ? NONE_VALUE : args[0];
+        if (!hookSet(fn) && !pyHooks()) return NONE_VALUE;
+        PyHookFns& h = pyhooks_[std::this_thread::get_id()];
+        (trace ? h.trace : h.profile) = hookSet(fn) ? fn : NONE_VALUE;
+        pyHooksRecompute();
+        return NONE_VALUE;
+    }
+    Value pyGetHook(bool trace) {
+        PyHookFns* h = pyHooks();
+        return h ? (trace ? h->trace : h->profile) : NONE_VALUE;
+    }
+    // Calls hook `fn` with (frame, event, arg), both hooks off meanwhile.
+    Value pyHookCall(const Value& fn, const Value& frame, const char* ev, const Value& arg, uint8_t which) {
+        bool saved = nytrace::t_in_hook;
+        nytrace::t_in_hook = true;
+        nytrace::t_hooks = 0;
+        Node* saved_cur = cur_stmt();
+        node_ptr saved_last = last_stmt();
+        // an exception on its way (the exception event, an except clause
+        // about to take it) keeps its traceback record, whatever the hook
+        // raises and catches (as tbFinally)
+        TbPending saved_tb = tb_pending();
+        bool saved_held = tb_frames_held();
+        Value r;
+        try {
+            std::vector<Value> a{frame, makeStringValue(ev), arg};
+            r = callFunctionValue(fn, a, global_ctx);
+        } catch (...) {
+            nytrace::t_in_hook = saved;
+            if (PyHookFns* h = pyHooks()) (which == nytrace::TRACE ? h->trace : h->profile) = NONE_VALUE;
+            if (which == nytrace::TRACE) { if (Context* p = instanceProps(frame)) p->defineByName("f_trace", NONE_VALUE); }
+            cur_stmt() = saved_cur;
+            pyHooksRecompute();
+            throw;
+        }
+        nytrace::t_in_hook = saved;
+        cur_stmt() = saved_cur;
+        last_stmt() = saved_last;
+        tb_pending() = std::move(saved_tb);
+        tb_frames_held() = saved_held;
+        pyHooksRecompute();
+        return r;
+    }
+    Value frameTraceOf(nyheap::Inst* o) {
+        if (!o || !o->props) return NONE_VALUE;
+        Value v = o->props->getByName("f_trace");
+        return hookSet(v) ? v : NONE_VALUE;
+    }
+    static size_t pyTopIdx() { auto& F = py_frames(); return F.empty() ? kNoFrame : F.size() - 1; }
+    // An event through frame idx's f_trace (line / return / exception).
+    void pyEvLocal(size_t idx, const char* ev, const Value& arg) {
+        nyheap::Inst* o = frameSlot(idx);
+        if (!o) return;   // no frame object: no f_trace
+        Value ft = frameTraceOf(o);
+        if (!hookSet(ft)) return;
+        if (ev[0] == 'l') {
+            Value tl = o->props->getByName("f_trace_lines");
+            if (tl.type != ValueType::UNDEFINED && !isTruthy(tl)) return;
+        }
+        Value fo = instValue(o);
+        Value r = pyHookCall(ft, fo, ev, arg, nytrace::TRACE);
+        if (hookSet(r)) { if (Context* p = instanceProps(fo)) p->defineByName("f_trace", r); }
+    }
+    void pyEvProfile(size_t idx, const char* ev, const Value& arg) {
+        PyHookFns* h = pyHooks();
+        if (!h || !hookSet(h->profile)) return;
+        Value fn = h->profile;
+        Value fo = frameObject(idx, frameWhere(idx), false);
+        if (isInstanceVal(fo)) pyHookCall(fn, fo, ev, arg, nytrace::PROFILE);
+    }
+    // A frame begins (record idx; cur_stmt() is its def line).
+    void pyEvCall(size_t idx) {
+        if (nytrace::t_hooks & nytrace::TRACE) {
+            PyHookFns* h = pyHooks();
+            if (h && hookSet(h->trace)) {
+                Value fn = h->trace;
+                Value fo = frameObject(idx, frameWhere(idx), false);
+                if (isInstanceVal(fo)) {
+                    Value r = pyHookCall(fn, fo, "call", NONE_VALUE, nytrace::TRACE);
+                    if (hookSet(r)) { if (Context* p = instanceProps(fo)) p->defineByName("f_trace", r); }
+                }
+            }
+        }
+        if (nytrace::t_hooks & nytrace::PROFILE) pyEvProfile(idx, "call", NONE_VALUE);
+    }
+    // The frame ends with `v` (None when an exception leaves it), or a
+    // generator yields `v`.
+    void pyEvReturn(size_t idx, const Value& v) {
+        if (nytrace::t_hooks & nytrace::TRACE) pyEvLocal(idx, "return", v);
+        if (nytrace::t_hooks & nytrace::PROFILE) pyEvProfile(idx, "return", v);
+    }
+    // A statement starts in the innermost frame.
+    void pyEvLine(Node* st) {
+        if (!st || tbHiddenFile(st->token().fileName())) return;
+        pyEvLocal(pyTopIdx(), "line", NONE_VALUE);
+    }
+    // Execution comes back to `n`'s line (a loop's header, an except
+    // clause, a with statement's exit): a line event there.
+    void pyEvLineAt(Node* n) {
+        cur_stmt() = n;
+        pyEvLine(n);
+    }
+    // The exception `flow` in the running frame: the exception event, once
+    // per frame it passes.
+    void pyEvException(const std::string& flow) {
+        if (flow == "break" || flow == "continue" || !(nytrace::t_hooks & nytrace::TRACE)) return;
+        PyHookFns* h = pyHooks();
+        if (!h) return;
+        size_t depth = py_frames().size();
+        if (h->exc_depth == depth && h->exc_flow == flow) return;
+        h->exc_flow = flow;
+        h->exc_depth = depth;
+        size_t idx = pyTopIdx();
+        nyheap::Inst* o = frameSlot(idx);
+        if (!o || !hookSet(frameTraceOf(o))) return;
+        if (Node* cs = cur_stmt(); cs && tbHiddenFile(cs->token().fileName())) return;
+        Value ev = excInstanceOf(flow);
+        if (!isInstanceVal(ev)) {
+            if (pyt_exc_flow_ != flow) { pyt_exc_obj_ = exceptionObject(flow); pyt_exc_flow_ = flow; }
+            ev = pyt_exc_obj_;
+        }
+        Value ty = exceptionClassValue(flow), tb = NONE_VALUE;
+        if (Context* ep = instanceProps(ev)) { tb = ep->getByName("__traceback__"); if (!isInstanceVal(tb)) tb = NONE_VALUE; }
+        pyEvLocal(idx, "exception", makeListValue({ty, ev, tb}, true));
+    }
+    // An except clause has handled the exception: the next one raised in
+    // this frame is reported again, even with the same text.
+    void pyExcHandled() {
+        if (PyHookFns* h = pyHooks()) { h->exc_flow.clear(); h->exc_depth = (size_t)-2; }
+    }
+    // `flow` leaves frame idx: exception, then return(None).
+    void pyEvLeave(const std::string& flow, size_t idx) {
+        if (!(nytrace::t_hooks & nytrace::ANY) || flow == "break" || flow == "continue") return;
+        pyEvException(flow);
+        pyEvReturn(idx, NONE_VALUE);
+    }
+    // c_call / c_return / c_exception around a builtin called from a frame
+    // that is not the prelude's (`fn` is what the profile function sees).
+    template <class F> Value pyProfileBuiltin(const Value& fn, F&& run) {
+        Node* cs = cur_stmt();
+        if (!(nytrace::t_hooks & nytrace::PROFILE) || (cs && tbHiddenFile(cs->token().fileName()))) return run();
+        size_t idx = pyTopIdx();
+        pyEvProfile(idx, "c_call", fn);
+        Value r;
+        try { r = run(); }
+        catch (...) { if (nytrace::t_hooks & nytrace::PROFILE) pyEvProfile(idx, "c_exception", fn); throw; }
+        if (nytrace::t_hooks & nytrace::PROFILE) pyEvProfile(idx, "c_return", fn);
+        return r;
+    }
+    // _ny_frame_local_set(frame, name, value): frame.f_locals[name] = value
+    // reaching the running frame's variable (PEP 667's write-through);
+    // false when the frame is not running on this thread.
+    Value frameLocalSet(std::vector<Value>& args) {
+        size_t idx;
+        if (args.size() < 3 || !isStringValue(args[1]) || !frameFind(args[0], idx)) return Value(false);
+        Context* c = frameCtx(idx);
+        if (!c) return Value(false);
+        c->defineByName(getStringValue(args[1]), args[2]);
+        return Value(true);
+    }
+
     Value evalTry(node_ptr node, Context* ctx) {
         auto tn = static_pointer_cast<TryNode>(node);
         Value result = NONE_VALUE;
@@ -10197,6 +10459,7 @@ public:
         }
         catch (std::exception& e) { exc = excFromCpp(e.what()); raised = true; }
         if (raised) tbSee(exc);   // round 77: its line here, before a finally runs
+        if (raised && __builtin_expect(nytrace::t_hooks & nytrace::ANY, 0)) pyEvException(exc);   // round 79
 
         if (!raised) {
             if (tn->else_clause) {
@@ -10221,6 +10484,12 @@ public:
         if (!match) { run_finally_exc(); throw exc; }
         // the exception object, with its traceback (round 77)
         exc = tbCaught(exc);
+        if (__builtin_expect(nytrace::t_hooks & nytrace::ANY, 0)) {
+            // round 79: re-raised from here as it is now (a bare raise), it
+            // is not reported again; the clause's own line event
+            if (PyHookFns* h = pyHooks(); h && h->exc_depth == py_frames().size()) h->exc_flow = exc;
+            if (nytrace::t_hooks & nytrace::TRACE) pyEvLineAt(match);
+        }
 
         if (!match->var.empty()) {
             (match->var_global ? moduleCtx(ctx) : ctx)->defineByName(match->var, exceptionObject(exc));
@@ -10242,6 +10511,7 @@ public:
         }
         catch (std::exception& e2) { std::string f3 = excFromCpp(e2.what()); tbHandlerExit(f3); tbSee(f3); run_finally_exc(); throw; }
         catch (...) { run_finally(); throw; }
+        if (__builtin_expect(nytrace::t_hooks & nytrace::ANY, 0)) pyExcHandled();   // round 79
         run_finally();
         return result;
     }
@@ -11265,6 +11535,13 @@ public:
                 ns->set("exc_info", global_ctx->getByName("_ny_exc_info"));
                 ns->set("exception", global_ctx->getByName("_ny_exc_current"));
                 ns->set("_getframe", global_ctx->getByName("_ny_getframe"));
+                // sys.settrace / setprofile and breakpoint()'s hook (round 79)
+                ns->set("settrace", global_ctx->getByName("_ny_settrace"));
+                ns->set("gettrace", global_ctx->getByName("_ny_gettrace"));
+                ns->set("setprofile", global_ctx->getByName("_ny_setprofile"));
+                ns->set("getprofile", global_ctx->getByName("_ny_getprofile"));
+                ns->set("breakpointhook", global_ctx->getByName("_ny_breakpointhook"));
+                ns->set("__breakpointhook__", global_ctx->getByName("_ny_breakpointhook"));
                 ns->set("warnoptions", nyos_list_of(nyrt::warn_options()));
                 // the standard streams (NyPrelude _NyStdStream, round 77)
                 for (const char* st : {"stdin", "stdout", "stderr"}) {
@@ -12307,6 +12584,23 @@ public:
         }
         return nullptr;
     }
+    // exec / eval run their code in a frame of its own - "<module>" of the
+    // snippet's file, "<string>" - as CPython's (round 79: the VM's always
+    // had one; frames, tracebacks and the trace events see it).
+    Value runSnippetFrame(const node_ptr& ast, Context* sc) {
+        FrameGuard _frame(nullptr, sc);
+        if (__builtin_expect(nytrace::t_hooks & nytrace::ANY, 0)) {
+            Node* first = ast.get();
+            if (ast && (ast->type() == NodeType::SCRIPT || ast->type() == NodeType::STATEMENTS || ast->type() == NodeType::BLOCK)) {
+                auto sts = ast->statements();
+                if (!sts.empty() && sts[0]) first = sts[0].get();
+            }
+            if (first && !tbHiddenFile(first->token().fileName())) return runBodyHooked(first, ast, sc, false);
+        }
+        try { return evalNode(ast, sc); }
+        catch (std::string& flow) { tbUnwind(flow); throw; }
+        catch (std::exception& e) { tbUnwind(excFromCpp(e.what())); throw; }
+    }
     Value evalExecBuiltin(bool is_exec, std::vector<Value>& args, Context* ctx) {
         const char* who = is_exec ? "exec" : "eval";
         if (args.empty()) pyRaise("TypeError", std::string(who) + "() missing required argument 'source' (pos 1)");
@@ -12325,7 +12619,7 @@ public:
         Container* ld = has_l ? contOf(args[2]) : nullptr;
         if (has_g && (!gd || seqLen(gd) >= 0)) pyRaise("TypeError", std::string(who) + "() globals must be a dict, not " + typeNameOf(args[1]));
         if (!gd && !ld) {
-            Value r = evalNode(ast, ctx);
+            Value r = runSnippetFrame(ast, ctx);
             return is_exec ? NONE_VALUE : r;
         }
         Context* sc = new Context(runner, "<string>", nullptr, nullptr, global_ctx);
@@ -12370,7 +12664,7 @@ public:
         static const char* const markers[] = {"__len__", "__tuple__", "__set__", "__kwargs__", "__type__", "__class__"};
         std::vector<const char*> fresh_markers;
         if (live) for (const char* m : markers) if (!gd->container->count(m)) fresh_markers.push_back(m);
-        Value r = evalNode(ast, sc);
+        Value r = runSnippetFrame(ast, sc);
         if (live) {
             std::vector<std::pair<std::string, Value>> add;
             for (auto& kv : *gd->container)
@@ -12850,6 +13144,8 @@ public:
         // builtins) meet the same stack check (see evalCall).
         if (nycoro::stack_exhausted()) return nygen::body_on_new_stack(*this, fn, fc);
         FrameGuard _frame(fn, fc);   // round 77: frames and tracebacks
+        // sys.settrace / sys.setprofile (round 79): one test per call
+        if (__builtin_expect(nytrace::t_hooks & nytrace::ANY, 0) && !tbHiddenFile(fn->token().fileName())) return runBodyHooked(fn, fn->body, fc, true);
         try { return evalBody(fn->body, fc); }
         catch (nython::node::ReturnSignal& r) { return r.value; }
         catch (std::string& flow) { tbUnwind(flow); throw; }
@@ -12858,9 +13154,28 @@ public:
     // A lambda's body (round 77: a frame of its own, "<lambda>").
     Value runLambdaBody(LambdaNode* lam, Context* fc) {
         FrameGuard _frame(lam, fc);
+        if (__builtin_expect(nytrace::t_hooks & nytrace::ANY, 0) && !tbHiddenFile(lam->token().fileName())) return runBodyHooked(lam, lam->body, fc, false);   // round 79
         try { return evalNode(lam->body, fc); }
         catch (std::string& flow) { tbUnwind(flow); throw; }
         catch (std::exception& e) { tbUnwind(excFromCpp(e.what())); throw; }
+    }
+    // A function's (or lambda's, or exec'd code's) body with the trace and
+    // profile events around it (round 79): its frame record is the
+    // innermost one (the caller's FrameGuard). `fn_body`: a def's body,
+    // whose value is what `return` gave; else an expression / a module's
+    // statements, whose value is the result.
+    Value runBodyHooked(Node* code, const node_ptr& body, Context* fc, bool fn_body) {
+        size_t idx = py_frames().size() - 1;
+        if (code) cur_stmt() = code;   // the call event's f_lineno: the def line
+        pyEvCall(idx);
+        if (code && code->type() == NodeType::LAMBDA && (nytrace::t_hooks & nytrace::TRACE)) pyEvLine(code);   // a lambda's one line
+        Value result;
+        try { result = fn_body ? evalBody(body, fc) : evalNode(body, fc); }
+        catch (nython::node::ReturnSignal& r) { result = r.value; }
+        catch (std::string& flow) { tbUnwind(flow); pyEvLeave(flow, idx); throw; }
+        catch (std::exception& e) { std::string f = excFromCpp(e.what()); tbUnwind(f); pyEvLeave(f, idx); throw; }
+        if (nytrace::t_hooks & nytrace::ANY) pyEvReturn(idx, result);
+        return result;
     }
     bool iterableBuiltin(const std::string& name, std::vector<Value>& args, Context* ctx, Value& out) {
         static const std::unordered_set<std::string> takes = {
@@ -13179,14 +13494,18 @@ public:
         catch (std::string& flow) {
             if (flow == "break" || flow == "continue") { exit_plain(); throw; }
             std::string f = flow;
+            if (__builtin_expect(nytrace::t_hooks & nytrace::ANY, 0)) pyEvException(f);   // round 79
             if (exit_exc(f)) return NONE_VALUE;
             throw f;
         }
         catch (std::exception& e) {
             std::string flow = excFromCpp(e.what());
+            if (__builtin_expect(nytrace::t_hooks & nytrace::ANY, 0)) pyEvException(flow);   // round 79
             if (exit_exc(flow)) return NONE_VALUE;
             throw flow;
         }
+        // sys.settrace: the with statement's line again as it exits (round 79)
+        if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0)) pyEvLineAt(node.get());
         exit_plain();
         return result;
     }
@@ -13409,6 +13728,11 @@ public:
             pending_ctx_ = Value();
             dead.push_back(uncaught_obj_);
             uncaught_obj_ = Value();
+            for (auto& kv : pyhooks_) { dead.push_back(kv.second.trace); dead.push_back(kv.second.profile); }   // round 79
+            pyhooks_.clear();
+            nytrace::t_hooks = 0;
+            dead.push_back(pyt_exc_obj_);
+            pyt_exc_obj_ = Value();
             if (main_fobj_) {   // round 78
                 dead.push_back(instValue(main_fobj_));
                 nygc::decref(main_fobj_);

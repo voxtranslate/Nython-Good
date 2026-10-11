@@ -7,7 +7,9 @@
 #   Thread(target, args, kwargs, name, daemon), current_thread, main_thread,
 #   active_count, enumerate, get_ident, get_native_id, Lock/allocate_lock,
 #   RLock, Condition, Semaphore, BoundedSemaphore, Event, Timer, Barrier
-#   (BrokenBarrierError), local, excepthook, TIMEOUT_MAX
+#   (BrokenBarrierError), local, excepthook, TIMEOUT_MAX,
+#   settrace/setprofile/gettrace/getprofile (round 79: the sys.settrace /
+#   sys.setprofile functions each thread started afterwards gets)
 #
 # lib/thread.ny is Nython's own threading library (channels, futures, pools,
 # RWLock, atomics...); both run on the same runtime.
@@ -79,6 +81,10 @@ class Thread:
 
     def _bootstrap(self):
         _threads[thread_id()] = self
+        # threading.settrace / setprofile's functions (round 79)
+        var hooked = _trace_hook is not none or _profile_hook is not none
+        if hooked:
+            _sys_hooks(_trace_hook, _profile_hook)
         try:
             self.run()
         except SystemExit:
@@ -86,6 +92,8 @@ class Thread:
         except BaseException as e:
             excepthook(_ExceptHookArgs(type(e), e, none, self))
         finally:
+            if hooked:
+                _sys_hooks(none, none)
             if thread_id() in _threads:
                 del _threads[thread_id()]
 
@@ -205,11 +213,29 @@ def enumerate():
         out.append(t)
     return out
 
+# The trace and profile functions threads started from now on get
+# (round 79: sys.settrace / sys.setprofile are per thread, as CPython's).
+_trace_hook = none
+_profile_hook = none
+
+def _sys_hooks(trace, profile):
+    # this thread's sys.settrace / sys.setprofile
+    _ny_settrace(trace)
+    _ny_setprofile(profile)
+
 def settrace(func):
-    pass
+    global _trace_hook
+    _trace_hook = func
 
 def setprofile(func):
-    pass
+    global _profile_hook
+    _profile_hook = func
+
+def gettrace():
+    return _trace_hook
+
+def getprofile():
+    return _profile_hook
 
 def stack_size(size=0):
     return 0

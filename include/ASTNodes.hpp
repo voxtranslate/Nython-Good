@@ -743,6 +743,9 @@ struct ClassNode : Node {
     // identity: both engines key classes by name) and bound as "Class"
     // (nython::scope::qualify_module_classes, round 77).
     std::string bind_name;
+    // Its __qualname__ (round 79): "Outer.Inner" for a class in a class,
+    // "f.<locals>.C" for one in a function; its name at the top level.
+    std::string qualname;
     // `class C(Base, metaclass=M, flag=1)`: the keywords, evaluated when the
     // class statement runs - metaclass picks the metaclass, the rest go to
     // __init_subclass__ (round 77). A base that is not a (dotted) name -
