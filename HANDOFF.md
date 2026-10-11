@@ -168,7 +168,8 @@ with python3.13's output.
   decoding), so every per-file question (`why_not`, breakpoints by file)
   missed on Windows paths. Each distinct name is now decoded once, when first
   seen.
-- AArch64 (qemu-user): vm_audit95 (decimal), 49, 67 pass on both engines;
+- AArch64 (qemu-user): vm_audit91 (settrace/pdb/profilers), 88, 89, 90, 56,
+  95 (decimal), 49, 67 pass on both engines;
   zlib, pickle, array and zipfile give byte-identical output to x86 on both
   engines (a script compressing at every level/wbits with streaming flushes
   and the optimal parse, CRCs, pickles at every protocol). Suites that spawn
