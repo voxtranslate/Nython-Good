@@ -368,7 +368,8 @@ These were aligned to match how the IDE calls them:
 | vm_audit84 | 212 | round 77: Python's syntax (passes under python3) - soft Nython keywords (`new = 1`, `def f(ref):`, `obj.self`), imports/del/class bases/lambda parameters in every form, expression statements evaluated (`{}["x"]`), assignment and for/with targets, unpack counts, augmented in-place dunders and `@=`, chained comparisons, literals (`\N{...}`), decorators (PEP 614), match, exception groups and `except*` (PEP 654) |
 | vm_audit85 | 73 | round 77: classes deriving from builtin types hold a value (int/float/str/bytes/bytearray/list/dict/set/frozenset/tuple, `int.__new__(cls, v)`), `__getattribute__`, a live `obj.__dict__`, a metaclass's `__prepare__` (passes under python3) |
 | vm_audit86 | 65 | round 77: every class statement its own class, `isinstance(x, object)`, `__eq__` without `__hash__`, property/staticmethod/classmethod objects, dir/vars, two-argument super, bound/builtin method types and reprs, type objects for None/functions/builtins/generators/iterators, dict methods before keys (63 pass under python3) |
-| vm_audit89 | 70 | round 78: frame objects (sys._getframe, inspect.stack/currentframe/getframeinfo/getargvalues, traceback frames with locals, gi_frame, logging's caller info), weak references to functions/classes/sets/builtin subclasses, coroutine objects driven by hand (send/throw/close, cr_*, never-awaited warning), async generator objects (passes under python3) |
+| vm_audit88 | 86 | round 78: the data model - walrus arguments, name mangling, methods bound whatever their first parameter, non-callables, `super(...)` as a proxy value, builtin values' dunders (`(5).__add__`, NotImplemented), `f.__call__`, `type(module)`, data descriptors over instance fields, implicit static/class methods in `C.__dict__`, hashed keys compared with `__eq__`, protocol results checked, `class C(*bases)`, `{x}` statements, `except*` flow (passes under python3) |
+| vm_audit89 | 62 | round 78: frame objects (sys._getframe, inspect.stack/currentframe/getframeinfo/getargvalues, traceback frames with locals, gi_frame, logging's caller info), weak references to functions/classes/sets/builtin subclasses, coroutine objects driven by hand (send/throw/close, cr_*, never-awaited warning), async generator objects (passes under python3) |
 | vm_audit87 | 73 | round 77: `in`/ordering TypeErrors, exceptions' str/repr/args and fields (OSError errno/filename, Unicode errors, SyntaxError), runtime errors with their fields, `iter(f, sentinel)`, generator attributes, `__format__`, `os.stat_result`, live `exec` namespaces, recursive reprs (72 pass under python3) |
 | vm_audit90 | 65 | round 78: lazy `range` (CPython's rangeobject.c: big ints, len/OverflowError, indexing, slicing to a range, O(1) `in`, index/count, ==/hash, repr, read-only start/stop/step, `sum` in O(1)), live dict views (set operations, comparisons, isdisjoint, `.mapping`, reversed, "dictionary changed size during iteration"), lazy zip/map/filter/enumerate/reversed (`zip(strict=True)`) - 63 pass under python3 |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
@@ -1063,6 +1064,25 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   by hand (`async_coro_drive` in NyConc.cpp), `__await__` generators are
   run (`_ny_drive_await`), unawaited ones warn. Async generators give
   `async_generator` objects with awaitable asend/athrow/aclose.
+
+## Round 78: the data-model gaps (see `HANDOFF.md` §0q3)
+
+- **Parser, both engines**: `f(x := 1)` is positional; **name mangling**
+  (`__name` in a class body is `_Class__name`, CPython's `_Py_Mangle`,
+  `Parser::mangle_stack_`); `class C(*bases)`; `{x}` alone is a set
+  display; `return`/`break`/`continue` in `except*` are SyntaxErrors.
+- **Every class-body function is a method** whatever its first parameter
+  is called (VM `VMCode::bind_first`); `__new__` implicitly static,
+  `__init_subclass__`/`__class_getitem__` implicitly class methods.
+- **`super(...)` is a proxy value**; the legacy `super(args)` constructor
+  shorthand and the VM's bare `super()` statement are gone.
+- Calling a non-callable is a TypeError; builtin values' dunders are
+  values (`(5).__add__("x")` is NotImplemented, `_NyV_int`/`_NyV_float`);
+  `f.__call__`; `type(module)` is `types.ModuleType`; data descriptors
+  win over instance fields; objects with `__hash__` are compared with
+  `__eq__` among same-hash keys; `__str__`/`__len__`/`__bool__`/
+  `__hash__`/`__iter__` results are checked; `object()` takes no
+  attributes.
 
 ## Transcripts
 

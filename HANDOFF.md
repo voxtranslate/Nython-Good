@@ -4,9 +4,11 @@ Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
 Last updated: round 78 — **§0q** (lazy `range`, live dict views, lazy
-zip/map/filter/enumerate/reversed) and **§0q2** (frame objects, weak references to
-functions/classes/sets, coroutine and async generator objects); both
-engines. Round 77 — **§0p** (bytes; signals; sockets, TLS, HTTP,
+zip/map/filter/enumerate/reversed), **§0q2** (frame objects, weak references to
+functions/classes/sets, coroutine and async generator objects) and **§0q3**
+(the data-model gaps: name mangling, methods bound whatever their first
+parameter, `super` as a value, builtin values' dunders, data descriptors,
+hashed keys, protocol results checked); both engines. Round 77 — **§0p** (bytes; signals; sockets, TLS, HTTP,
 urllib, WebSockets and the network libraries made real; asyncio and the
 async protocols; modules with their own scope and packages; sets; the
 command line and argparse; per-execution classes, slices, eval/exec,
@@ -289,6 +291,101 @@ gained `Engine::coro_handle` and an `__await__`-generator path in
   engines (coroutine objects and frames over the assembly context switch).
 - Merging the two parts conflicted only in the docs and in
   `lib/collections/abc.ny`'s header comment.
+
+## 0q3. Round 78, part 3 — the data-model gaps (vm_audit88)
+
+The gaps the round-77 agents found and left in §0p's "Not done" list, fixed
+on both engines the CPython 3.11 way. `examples/vm_audit88.ny` (86 checks)
+passes on the interpreter, the VM and under python3.
+
+### Parser (both engines get it)
+- **Walrus as an argument**: `f(x := 1)` is a positional argument
+  (`parseCallArgs`; `f(x=1)` stays a keyword).
+- **Name mangling** (CPython's `_Py_Mangle`): while a class body is parsed,
+  every `__name` identifier (two leading underscores, not two trailing) is
+  read as `_Class__name` - attributes, body names, methods, nested
+  functions, lambdas and comprehensions; the innermost class wins, nothing is
+  mangled under an all-underscore class name. `Parser.hpp`: `mangle_stack_`,
+  `manglable()`, `mangled()`, `rawToken()`; `next()/prev()/peek()/token()`
+  return mangled identifiers. Call keywords and module names in a dotted
+  import are not mangled; a function's `__qualname__`/`__name__` show the
+  raw name (`nyrt::unmangled_name`); a nested `class __H` binds `_C__H`.
+- `class C(*bases)` (a `UnaryNode("*")` base, expanded by both engines);
+  `{x}` alone on a line is a set display unless a soft keyword starts a
+  statement there; `return`/`break`/`continue` in an `except*` block are
+  SyntaxErrors (`checkExceptStarFlow`).
+- Async methods are reached through their first parameter whatever its name
+  (`async def m(s)`, an async classmethod's `cls`); `@staticmethod` keeps
+  the plain path (`next_def_static_`).
+
+### Engines
+- **Every function in a class body is a method** whatever its first
+  parameter is called (`def m(this, x)`, `def m(s)`): the interpreter's
+  `invokeMember`/`makeBoundMethod`, the VM's `VMCode::bind_first`.
+  `__new__` is implicitly static, `__init_subclass__`/`__class_getitem__`
+  implicitly class methods (`nyrt::implicit_method_kind`), and
+  `C.__dict__` shows them as staticmethod/classmethod objects.
+- **Calling a non-callable** raises `TypeError: 'int' object is not
+  callable` on both (the interpreter returned none or "NameError: 'End'";
+  calling bytes crashed it). A name bound nowhere is still a NameError.
+- **`super(...)` is a proxy value** (`s = super(C, self); s.m()`): the
+  interpreter's `_NySuper`, Python's TypeErrors (argument 1 not a type, one
+  argument, more than two), `super(Meta, cls)`; `__thisclass__`,
+  `__self__`, `__self_class__`. The legacy `super(args)` "call the parent's
+  constructor" shorthand and the VM's bare `super()` statement are gone
+  (five old examples now name the constructor: `super().init(...)` for
+  their Nython-style `def init`).
+- **Builtin values' dunders as values**: `(5).__add__(3)`,
+  `int.__add__(2, 3)`, `"ab".__len__()`, `[1].__getitem__(0)`,
+  `{}.__contains__("a")`; `(5).__add__("x")` is NotImplemented (the
+  prelude's `_NyV_int`/`_NyV_float`, then the type's mirror class);
+  `f.__call__`; `real`/`imag`/`numerator`/`denominator` of ints and floats;
+  three-argument `pow` and `__rpow__` call the dunders.
+- **`type(module)`** is the `module` type (`_NyModuleType`,
+  `types.ModuleType`, `ModuleType(name, doc)`); a module prints as
+  `<module 'x' from '...'>`.
+- **Data descriptors win over instance fields** (property, or anything
+  with `__set__`/`__delete__`); non-data descriptors lose to the field.
+- **Objects with `__hash__` as set/dict keys** compare with `__eq__` among
+  keys of the same hash (and against the int equal to their hash), as
+  Python - a `Fraction(2)` and `2` are one key. A non-int `__hash__` is a
+  TypeError.
+- **Protocol results checked**, Python's messages: `__str__`/`__repr__`
+  must return a str, `__len__` an int >= 0, `__bool__` a bool, `__hash__`
+  an int, `__iter__` an iterator. A method supplied by `__getattr__` must
+  be callable. `object()` takes no attributes. Arity errors name the
+  qualname (`C.m() takes ...`).
+
+### Behaviour old Nython code may notice
+- `obj.helper(x)` on a class-body `def helper(x)` with no `self` binds
+  `obj` to `x` (as Python); call it through the class, or make it a
+  `@staticmethod`. Nothing in lib/ or the IDE relied on the old reading.
+- `super(args)` no longer calls the parent's constructor; write
+  `super().__init__(args)` (or `super().init(args)` for a class whose
+  constructor is Nython's `def init`).
+- `__str__`/`__repr__` returning None raise TypeError.
+
+### Not done
+- An `async` staticmethod still fails (its desugared body calls itself by
+  bare name, out of scope there) - as before this round.
+- `inspect.signature` on the VM shows a first parameter named `this` as
+  `self`; a nested class's `__qualname__` is its bare name.
+- `obj.__class__ = Other`, `__slots__`, and slicing a str with an
+  `__index__` object are not implemented.
+- `(5).__add__(1.5)` gives NotImplemented as CPython; a builtin-subclass
+  instance's mirror methods still compute instead.
+- A hashed key's speculative `__eq__` calls swallow exceptions; CPython
+  calls `__eq__` only on a real hash collision.
+
+### Verified after merging it onto parts 1-2
+- Linux, both engines: the sweep 407 runs, 0 not ok; vm_audit88 86/86 on
+  the interpreter, the VM and python3 (89: 62/62/61, 90: 65/65/63);
+  `ide_e2e` 373/373; `ide_lint`, `ny_classcheck`, `cbp.py check` clean;
+  `ide_memprobe --check` 0 KB kept per frame/event/key.
+- The merge conflicted in the VM's `len` (part 1's native range/view
+  lengths beside part 3's checked `__len__`: both kept) and in the parser's
+  async desugar (part 2's coroutine-object reference beside part 3's
+  first-parameter binding: one `self_ref` that knows both).
 
 ## 0p. Round 77 — bytes, the network stack, signals, modules, the CLI, Python compatibility
 
@@ -1171,18 +1268,14 @@ Nython over the class machinery above; each header says what is not there.
   `_NyInstanceDict` (a dict subclass), and `C.__dict__` is still a copy.
 - ~~Coroutine objects are task handles (ints)~~ - real coroutine objects
   since round 78 (§0q).
-- Found with vm_audit86, not fixed: no name mangling (`self.__y` is not
-  `_C__y`); on the VM a method whose first parameter is not named `self` is
-  not bound (the interpreter binds `self`/`this`); on the interpreter,
-  calling a non-callable (`1("x")`) gives none or "NameError: 'End'" instead
-  of TypeError; functions have no `__call__`; `type(module)` is `dict`;
-  `super(C, obj)` used as a value is still the interpreter's
-  parent-constructor shorthand (only `.x`/`.m()` follow Python); an instance
-  field is read before a class data descriptor of the same name;
-  `C.__dict__["__new__"]` is not a staticmethod; ~~`iter(range(n))` is a
-  `list_iterator` (range is a list)~~ (a `range_iterator`, round 78); on the interpreter, set/dict keys of
-  objects with `__hash__` are keyed by class name plus hash, so equal objects
-  of two classes stay distinct.
+- ~~Found with vm_audit86, not fixed: no name mangling; on the VM a method
+  whose first parameter is not named `self` is not bound; calling a
+  non-callable gives none; functions have no `__call__`; `type(module)` is
+  `dict`; `super(C, obj)` as a value is the parent-constructor shorthand; an
+  instance field is read before a class data descriptor;
+  `C.__dict__["__new__"]` is not a staticmethod; `iter(range(n))` is a
+  `list_iterator`; objects with `__hash__` are keyed by class name plus
+  hash~~ - all fixed in round 78 (§0q, §0q3).
 - ~~Frames have no locals; weak references are to instances only~~ - real
   frame objects and weak references to functions, classes and sets since
   round 78 (§0q). Classes deriving from `complex`, `range`,
@@ -1193,14 +1286,15 @@ Nython over the class machinery above; each header says what is not there.
   mapping, `del` in the body does not reach it - see above), and
   `type.__new__` called by a metaclass for a *different* name than the
   statement's makes a new class rather than adopting it.
-- Syntax (vm_audit84): `class C(*bases)`; a statement that is only a set
+- Syntax (vm_audit84): ~~`class C(*bases)`; a statement that is only a set
   display (`{x}` alone on a line) is still a block; `return`/`break`/
-  `continue` inside an `except*` clause are not rejected; `\N{}` knows no
+  `continue` inside an `except*` clause are not rejected~~ (round 78,
+  §0q3); `\N{}` knows no
   name aliases or named sequences, and unicodedata has only `lookup`/`name`;
   `elseif` and `super` stay reserved words; a walrus in a generator
   expression consumed after its function returned binds nowhere visible;
-  rebinding `self` in a scope nested inside a method; int's dunder methods
-  as values (`(5).__add__`).
+  rebinding `self` in a scope nested inside a method; ~~int's dunder methods
+  as values (`(5).__add__`)~~ (round 78, §0q3).
 - Video/audio builtins remain stubs (no codec library).
 
 ## 0o. Round 76 — the "Not done" lists closed

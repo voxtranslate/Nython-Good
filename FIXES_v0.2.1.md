@@ -5596,3 +5596,25 @@ Full detail in `HANDOFF.md` §0p. New tests: `vm_audit65` (bytes, 149 checks), `
 | A program's top-level `list = []` rebound `list` inside every imported module | module scopes chained to the program's globals | they start from a snapshot of the builtins and prelude |
 | `"""x "y" z"""` lost its inner quotes | the lexer dropped a `"` inside a triple-quoted string | kept |
 | `hash(obj)` kept `obj` alive until a full collection | `hash` entered it in the key-object table | not entered |
+
+## Round 78 — lazy range and dict views, frames and coroutine objects, the data model
+
+Full detail in `HANDOFF.md` §0q, §0q2, §0q3. New tests: `vm_audit88` (the data model, 86 checks), `vm_audit89` (frames, weak references, coroutine objects, 62), `vm_audit90` (range, dict views, lazy builtins, 65); all pass under python3 too, except one Nython-only check in 89 and two in 90.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `range(10**12)` exhausted memory; `d.keys() & s` failed; `next(zip(a, b))` failed on lists | `range`, dict views and `zip`/`map`/`filter`/`enumerate`/`reversed` over lists built lists | lazy `range` (CPython's rangeobject.c), live `dict_keys`/`dict_values`/`dict_items`, lazy iterators; no object at all for `for i in range(n)` / `for k, v in d.items()` (`FOR_PREP`) |
+| Changing a dict's size while iterating it was silent | no size check | RuntimeError, as Python |
+| `sys._getframe()`, `inspect.stack()`, `tb_frame`, `gi_frame` gave nothing usable; logging's `%(funcName)s` was empty | no frame objects | `_NyFrame`, made only when asked for and kept in the frame's record |
+| `weakref.ref(f)` for a function, class or set raised | weak references were to instances only | functions, bound methods, classes, sets, builtin-subclass instances |
+| An `async def` call gave an int; `coro.send(None)` did not exist; an unawaited coroutine was silent | coroutines were task handles | `coroutine` objects driven by hand (`send`/`throw`/`close`, `cr_*`), the RuntimeWarning, `async_generator` objects |
+| `print(a := 1)` was a keyword argument | the call grammar read `NAME :=` as `NAME =` | a positional argument |
+| `self.__y` was not `_C__y` | no name mangling | CPython's `_Py_Mangle` in the parser, both engines |
+| VM: `def m(this, x)` / `def m(s)` were not bound; the interpreter bound only `self`/`this` | binding looked at the parameter's name | the first parameter of every class-body function (`bind_first`) |
+| `1("x")` gave none or "NameError: 'End'"; calling bytes crashed the interpreter | no callable check | `TypeError: 'int' object is not callable`, both engines |
+| `s = super(C, self)` called the parent's constructor | a Nython shorthand from before `super()` | a proxy object; the shorthand removed (five examples migrated) |
+| `(5).__add__`, `int.__add__`, `"ab".__len__`, `f.__call__` were missing; `type(os)` was `dict` | builtin values had no dunder methods as values; modules were dicts | `_NyV_int`/`_NyV_float` and the mirror classes; `__call__`; `types.ModuleType` |
+| An instance field shadowed a property of the same name | fields were read first | data descriptors win, non-data descriptors lose (Python's order) |
+| `{Fraction(2), 2}` had two elements on the interpreter | hashed objects were keyed by class name plus hash | same-hash keys compared with `__eq__` |
+| `__str__` returning None printed the default repr; `__len__` returning -1 was accepted | protocol results were not checked | TypeError/ValueError with Python's messages |
+
