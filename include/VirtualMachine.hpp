@@ -198,6 +198,9 @@ enum class Op : uint8_t {
     // LOAD_CONST, which a copied code object gets back.
     LOAD_METHNAME,
     CALL_METHOD_BUILTIN, // s.m(...), xs.m(...), d.m(...) on a str, list or plain dict (its method table)
+    LOAD_SUBSCR_DICT,    // d[k], k a str or 64-bit int, present
+    STORE_SUBSCR_DICT,   // d[k] = v, k a str or 64-bit int
+    LOAD_NAME_ENV,       // a name of the closure environment the function was made in
     OP_COUNT_
 };
 
@@ -226,8 +229,9 @@ inline Op base_op(Op op) {
     case Op::COMPARE_GT_NUM: return Op::COMPARE_GT;
     case Op::COMPARE_GE_NUM: return Op::COMPARE_GE;
     case Op::FOR_ITER_RANGE: case Op::FOR_ITER_LIST: return Op::FOR_ITER;
-    case Op::LOAD_SUBSCR_LIST: return Op::LOAD_SUBSCR;
-    case Op::STORE_SUBSCR_LIST: return Op::STORE_SUBSCR;
+    case Op::LOAD_SUBSCR_LIST: case Op::LOAD_SUBSCR_DICT: return Op::LOAD_SUBSCR;
+    case Op::STORE_SUBSCR_LIST: case Op::STORE_SUBSCR_DICT: return Op::STORE_SUBSCR;
+    case Op::LOAD_NAME_ENV: return Op::LOAD_NAME;
     case Op::UNPACK_SEQ_LIST: return Op::UNPACK_SEQ;
     case Op::CALL_FUNCTION_CLASS: case Op::CALL_FUNCTION_NATIVE: return Op::CALL_FUNCTION;
     case Op::LOAD_GLOBAL_MOD: return Op::LOAD_GLOBAL_NAME;
@@ -7028,6 +7032,12 @@ private:
                 long s=fr.locals.index_of(n);
                 if(s>=0){ c.slot=(int32_t)s; to=Op::LOAD_NAME_FAST; break; }
             }
+            if(!fr.own_env&&fr.closure_env&&!fr.locals.count(n)){
+                // in the environment the function closed over itself
+                long s=fr.closure_env->index_of(n);
+                if(s>=0){ c.slot=(int32_t)s; to=Op::LOAD_NAME_ENV; }
+                break;
+            }
             if(!plain_function_frame(fr)||fr.locals.count(n)) break;
             CallFrame& f0=call_stack_.front();
             VMMap* m=f0.own_env?f0.closure_env.get():&f0.locals;
@@ -7107,6 +7117,8 @@ private:
             const VMVal& o=stack_[ns-2];
             if(o.type==VMType::LIST&&o.list&&!o.is_set()&&small_int(stack_[ns-1])&&(ins.op==Op::LOAD_SUBSCR||!o.b))
                 to=ins.op==Op::LOAD_SUBSCR?Op::LOAD_SUBSCR_LIST:Op::STORE_SUBSCR_LIST;
+            else if(o.type==VMType::MAP&&o.map&&(stack_[ns-1].type==VMType::STRING||small_int(stack_[ns-1])))
+                to=ins.op==Op::LOAD_SUBSCR?Op::LOAD_SUBSCR_DICT:Op::STORE_SUBSCR_DICT;
             break;
         }
         case Op::UNPACK_SEQ: {
@@ -7275,9 +7287,17 @@ private:
         try { result=fast?run_frame_plain():run_frame(); }
         catch(VMReturn& r){ result=r.value; }
         catch(...){ pop_frame(); if(stack_.size()>base) stack_.resize(base); throw; }
+        if(fast&&is_exc_sentinel(result)){
+            // (kept aside while the frame goes: a frame object's last state
+            // is saved then, which may run code)
+            VMVal pe=std::move(pending_exc_); std::string pw=std::move(pending_what_);
+            pop_frame();
+            if(stack_.size()>base) stack_.resize(base);
+            pending_exc_=std::move(pe); pending_what_=std::move(pw);
+            return false;
+        }
         pop_frame();
         if(stack_.size()>base) stack_.resize(base);
-        if(fast&&is_exc_sentinel(result)) return false;
         if(inst) stack_.push_back(std::move(*inst));   // __init__'s result is dropped
         else stack_.push_back(std::move(result));
         return true;
@@ -7756,6 +7776,51 @@ private:
                     }
                 }
                 NY_MISS(LOAD_GLOBAL_NAME);
+            }
+            case Op::LOAD_SUBSCR_DICT: {
+                // d[k] (get_sub's map branch), the key present - the value
+                // replaces the dict on the stack
+                const size_t n=stack_.size();
+                if(n>=2){
+                    VMVal& o=stack_[n-2]; const VMVal& ix=stack_[n-1];
+                    if(o.type==VMType::MAP&&o.map&&(ix.type==VMType::STRING||small_int(ix))){
+                        auto it=o.map->find(ix.type==VMType::STRING?nypy::key_of_str(ix.s):nypy::key_of_int(ix.i));
+                        if(it!=o.map->end()){
+                            std::shared_ptr<VMMap> keep=std::move(o.map);
+                            o=it->second;
+                            stack_.pop_back(); break;
+                        }
+                    }
+                }
+                NY_MISS(LOAD_SUBSCR);
+            }
+            case Op::STORE_SUBSCR_DICT: {
+                // d[k] = v (set_sub's map branch)
+                const size_t n=stack_.size();
+                if(n>=3){
+                    VMVal& o=stack_[n-2]; const VMVal& ix=stack_[n-1];
+                    if(o.type==VMType::MAP&&o.map&&(ix.type==VMType::STRING||small_int(ix))){
+                        (*o.map)[ix.type==VMType::STRING?nypy::key_of_str(ix.s):nypy::key_of_int(ix.i)]=std::move(stack_[n-3]);
+                        stack_.resize(n-3); break;
+                    }
+                }
+                NY_MISS(STORE_SUBSCR);
+            }
+            case Op::LOAD_NAME_ENV: {
+                // get_local's third place: not a local, but in the closure
+                // environment the function was made in (its first map)
+                if(!fr.own_env&&fr.closure_env){
+                    VMIC& c=fr.code->quick.ic[ins.ic-1];
+                    const std::string& n=fr.code->names[ins.arg];
+                    const auto* kv=fr.closure_env->slot_at((size_t)c.slot);
+                    if(!(kv&&kv->first==n)){
+                        long s=fr.closure_env->index_of(n);
+                        kv=s>=0?fr.closure_env->slot_at((size_t)s):nullptr;
+                        if(kv) c.slot=(int32_t)s;
+                    }
+                    if(kv&&!kv->second.is_missing()&&!fr.locals.count(n)){ stack_.push_back(kv->second); break; }
+                }
+                NY_MISS(LOAD_NAME);
             }
 #undef NY_MISS
 
@@ -8826,8 +8891,13 @@ private:
             case Op::IMPORT_NAME: vm_import(fr.code->names[ins.arg]); break;
 
             // Exception handling
-            case Op::RAISE:
-                throw_exception(pop());
+            case Op::RAISE: {
+                // (round 80) handled as a thrown one is, without the throw
+                VMVal ev=pop();
+                pending_what_=describe_exception(ev);
+                pending_exc_=std::move(ev);
+                goto fast_exc_pending;
+            }
             case Op::SETUP_EXCEPT: break;   // marker only; handled structurally
             case Op::END_EXCEPT:   break;   // marker only
             case Op::STORE_EXCEPT_AS: {
@@ -8852,7 +8922,9 @@ private:
                     VMVal cur=pop();
                     if(cur.type==VMType::NONE) raise_native_exception("RuntimeError","No active exception to reraise");
                     tb_reraise_=true;
-                    throw_exception(std::move(cur));
+                    pending_what_=describe_exception(cur);   // (round 80: no throw, as RAISE)
+                    pending_exc_=std::move(cur);
+                    goto fast_exc_pending;
                 }
                 VMVal cause; if(ins.arg==2) cause=pop();
                 VMVal ev=normalize_exception(pop());
@@ -8865,7 +8937,9 @@ private:
                 // traceback it has (this frame already heads it)
                 if(ins.arg==1) tb_reraise_=true;
                 else set_exc_context(ev, vm_exc_current());
-                throw_exception(std::move(ev));
+                pending_what_=describe_exception(ev);   // (round 80: no throw, as RAISE)
+                pending_exc_=std::move(ev);
+                goto fast_exc_pending;
             }
 
             // ── try/finally, with (see ExceptionEntry) ─────────────────────
@@ -15290,6 +15364,9 @@ private:
         case Op::LOAD_GLOBAL_MOD: return "LOAD_GLOBAL_MOD";
         case Op::LOAD_METHNAME: return "LOAD_METHNAME";
         case Op::CALL_METHOD_BUILTIN: return "CALL_METHOD_BUILTIN";
+        case Op::LOAD_SUBSCR_DICT: return "LOAD_SUBSCR_DICT";
+        case Op::STORE_SUBSCR_DICT: return "STORE_SUBSCR_DICT";
+        case Op::LOAD_NAME_ENV: return "LOAD_NAME_ENV";
         case Op::STORE_GLOBAL_NAME: return "STORE_GLOBAL_NAME";
         case Op::JUMP_IF_NONE_KEEP: return "JUMP_IF_NONE_KEEP";
         case Op::JUMP_IF_MISSING_KEEP: return "JUMP_IF_MISSING_KEEP";
