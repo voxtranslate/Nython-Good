@@ -369,6 +369,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit85 | 73 | round 77: classes deriving from builtin types hold a value (int/float/str/bytes/bytearray/list/dict/set/frozenset/tuple, `int.__new__(cls, v)`), `__getattribute__`, a live `obj.__dict__`, a metaclass's `__prepare__` (passes under python3) |
 | vm_audit86 | 65 | round 77: every class statement its own class, `isinstance(x, object)`, `__eq__` without `__hash__`, property/staticmethod/classmethod objects, dir/vars, two-argument super, bound/builtin method types and reprs, type objects for None/functions/builtins/generators/iterators, dict methods before keys (63 pass under python3) |
 | vm_audit87 | 73 | round 77: `in`/ordering TypeErrors, exceptions' str/repr/args and fields (OSError errno/filename, Unicode errors, SyntaxError), runtime errors with their fields, `iter(f, sentinel)`, generator attributes, `__format__`, `os.stat_result`, live `exec` namespaces, recursive reprs (72 pass under python3) |
+| vm_audit90 | 65 | round 78: lazy `range` (CPython's rangeobject.c: big ints, len/OverflowError, indexing, slicing to a range, O(1) `in`, index/count, ==/hash, repr, read-only start/stop/step, `sum` in O(1)), live dict views (set operations, comparisons, isdisjoint, `.mapping`, reversed, "dictionary changed size during iteration"), lazy zip/map/filter/enumerate/reversed (`zip(strict=True)`) - 63 pass under python3 |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -853,7 +854,7 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   evaluates to the subgenerator's return value; StopIteration escaping a body
   is RuntimeError; "generator already executing"; lazy generator expressions;
   `zip`/`map`/`filter`/`enumerate` over a generator and `iter()` are lazy
-  (over lists they still return lists); new `islice` and `take(n, it)`;
+  (over lists too since round 78); new `islice` and `take(n, it)`;
   `any`/`all`/`next`/`in` stop early; `a, b = gen()` unpacks.
 - **Rules**: a started generator is resumed only by the thread that started
   it (RuntimeError, both engines); a generator a `for` loop or a consuming
@@ -1028,6 +1029,24 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   counts; every augmented operator tries its in-place dunder; comparisons
   chain at one level; `except*` and ExceptionGroup (prelude); `\N{name}`
   escapes and `lib/unicodedata.ny` (`src/NyUniNames.cpp`).
+
+## Round 78: lazy range, dict views, lazy builtins (see `HANDOFF.md` §0q)
+
+- `range` is a type (the prelude's class, CPython's semantics, ints of any
+  size); `d.keys()/values()/items()` are live `dict_keys`/`dict_values`/
+  `dict_items` views (set operations on keys/items, `.mapping`, a
+  RuntimeError when the dict changes size under an iterator - `for k in d`
+  too); `zip`/`map`/`filter`/`enumerate`/`reversed` are lazy iterators over
+  every iterable. Both engines make them natively and take native paths
+  for 64-bit ranges and views (`include/NyRange.hpp`); `for i in range(n)`
+  and `for k, v in d.items()` make no object at all (interpreter `evalFor`,
+  VM opcode `FOR_PREP` and in-place loop iterators); `sum(range(...))` is
+  O(1).
+- **Porting**: a result that was indexed or kept as a list needs `list(...)`
+  (`list(d.keys())[0]`, `list(zip(a, b))`). Nython's own `a..b`,
+  `d.entries()`, the flat `keys(d)`/`values(d)`/`items(d)` stay lists, and
+  the flat natives (`random_sample`, `json_encode`...) still take a range or
+  view as its list (`nyrt::takes_range_objects`).
 
 ## Transcripts
 

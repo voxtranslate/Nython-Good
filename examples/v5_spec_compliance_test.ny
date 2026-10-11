@@ -246,8 +246,8 @@ t("closure_5", add5(3), 8)
 t("closure_10", add10(3), 13)
 
 print "=== MAP/FILTER/REDUCE ==="
-t("map", str(map(lambda x: x * 2, [1,2,3])), "[2, 4, 6]")
-t("filter", str(filter(lambda x: x > 2, [1,2,3,4,5])), "[3, 4, 5]")
+t("map", str([v for v in map(lambda x: x * 2, [1,2,3])]), "[2, 4, 6]")   # `list` is a variable here
+t("filter", str([v for v in filter(lambda x: x > 2, [1,2,3,4,5])]), "[3, 4, 5]")
 t("reduce", reduce(lambda a, b: a + b, [1,2,3,4,5]), 15)
 
 print "=== COMPREHENSIONS ==="
@@ -283,7 +283,7 @@ t("min_v", min(3,1,4,1,5), 1)
 t("max_v", max(3,1,4,1,5), 5)
 t("sum", sum([1,2,3,4,5]), 15)
 t("sorted", str(sorted([3,1,4,1,5])), "[1, 1, 3, 4, 5]")
-t("reversed", str(reversed([1,2,3])), "[3, 2, 1]")
+t("reversed", str([v for v in reversed([1,2,3])]), "[3, 2, 1]")
 t("type_int", type(42) == "int", true)
 t("type_str", type("hi") == "string", true)
 t("isinstance", isinstance(42, "int"), true)

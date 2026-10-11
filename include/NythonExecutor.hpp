@@ -47,6 +47,7 @@
 #include <ctime>
 #include <functional>
 #include "NyBigInt.hpp"
+#include "NyRange.hpp"   // range objects and dict views (round 78)
 #include "NyStr.hpp"
 #include "NyBytes.hpp"
 #include "NyScope.hpp"
@@ -474,6 +475,7 @@ struct NythonExecutor {
         } catch (...) {
             std::cerr << "[Nython] prelude failed to load\n";
         }
+        cacheRangeClasses();   // range and the dict views (round 78)
         // --profile measures the program, not the startup prelude (its
         // stream objects were the first calls profiled).
         prof_.clear();
@@ -587,6 +589,7 @@ public:   // NythonExecutor is a struct: members default to public
             "_ny_payload","_ny_payload_new","_ny_getattr_raw","_ny_setfield","_ny_delfield",   // builtin subclasses, __getattribute__, __dict__ (round 77)
             "iter","next","help","Set","Counter","OrderedDict","deque","defaultdict","assert",
             "islice","take",   // lazy iteration (src/NyGen.cpp), both engines
+            "_ny_range_iter","_ny_dict_iter",   // range and dict-view iterators (round 78)
             "sqrt","sin","cos","tan","log","floor","ceil",
             "keys","values","items",
             "read_file","write_file","file_exists",
@@ -1569,6 +1572,125 @@ public:   // NythonExecutor is a struct: members default to public
         return v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p)
             && instance_to_class.count(v.value.p);
     }
+    // ── range and dict views (round 78; NyRange.hpp) ────────────────────
+    // `range`, `dict_keys`, `dict_values` and `dict_items` are the prelude's
+    // classes (NyPrelude.hpp); found when the prelude has run (nullptr
+    // before, and then range() and d.keys() behave as they used to).
+    Node* range_node_ = nullptr;
+    Node* view_nodes_[3] = {nullptr, nullptr, nullptr};
+    void cacheRangeClasses() {
+        range_node_ = classNodeByName("range");
+        view_nodes_[0] = classNodeByName("dict_keys");
+        view_nodes_[1] = classNodeByName("dict_values");
+        view_nodes_[2] = classNodeByName("dict_items");
+        if (!view_nodes_[1] || !view_nodes_[2]) view_nodes_[0] = nullptr;
+    }
+    // The class of an instance, nullptr for anything else.
+    Node* instClassNode(const Value& v) const {
+        if (v.type != ValueType::USERDATA || !v.value.p) return nullptr;
+        auto it = instance_to_class.find(v.value.p);
+        return it == instance_to_class.end() ? nullptr : (Node*)it->second;
+    }
+    // An instance's own field (UNDEFINED if it has none).
+    Value instField(const Value& v, const std::string& name) {
+        auto pit = instance_properties.find(v.value.p);
+        if (pit == instance_properties.end() || !pit->second) return UNDEFINED_VALUE;
+        return pit->second->getByName(name);
+    }
+    bool isRangeValue(const Value& v) const { return range_node_ && instClassNode(v) == range_node_; }
+    // A range whose start, stop and step are 64-bit ints: the native paths.
+    bool rangeOf(const Value& v, int64_t& start, int64_t& stop, int64_t& step) {
+        if (!range_node_ || instClassNode(v) != range_node_) return false;
+        Value a = instField(v, "start"), b = instField(v, "stop"), c = instField(v, "step");
+        return a.type == ValueType::INTEGER && b.type == ValueType::INTEGER && c.type == ValueType::INTEGER
+            && bigint_fits_i64(a.value.i, start) && bigint_fits_i64(b.value.i, stop)
+            && bigint_fits_i64(c.value.i, step) && step != 0;
+    }
+    // range(...) itself: CPython's range_new checks (PyNumber_Index on each
+    // argument, a zero step, no keywords) and the object, made here - the
+    // class has no __init__.
+    Value makeRange(std::vector<Value>& args, const nyrt::OrderedKw<Value>& kw, Context* ctx) {
+        if (!kw.empty()) pyRaise("TypeError", "range() takes no keyword arguments");
+        if (args.empty()) pyRaise("TypeError", "range expected at least 1 argument, got 0");
+        if (args.size() > 3) pyRaise("TypeError", "range expected at most 3 arguments, got " + std::to_string(args.size()));
+        auto idx = [&](const Value& x) -> Value {
+            if (x.type == ValueType::INTEGER) return x;
+            if (x.type == ValueType::BOOLEAN) return intValue((int64_t)(x.value.b ? 1 : 0));
+            Value p;
+            if (any_payload_ && payloadOf(x, p) && p.type == ValueType::INTEGER) return p;
+            if (indexValue(x, p, ctx)) return p.type == ValueType::BOOLEAN ? intValue((int64_t)(p.value.b ? 1 : 0)) : p;
+            pyRaise("TypeError", "'" + typeNameOf(x) + "' object cannot be interpreted as an integer");
+        };
+        Value start = intValue((int64_t)0), stop, step = intValue((int64_t)1);
+        if (args.size() == 1) stop = idx(args[0]);
+        else {
+            start = idx(args[0]);
+            stop = idx(args[1]);
+            if (args.size() == 3) step = idx(args[2]);
+        }
+        if (!isTruthy(step)) pyRaise("ValueError", "range() arg 3 must not be zero");
+        rv_made_ = true;
+        Value inst = newInstance("range", range_node_);
+        Context* p = instance_properties[inst.value.p];
+        p->defineByName("start", start);
+        p->defineByName("stop", stop);
+        p->defineByName("step", step);
+        return inst;
+    }
+    // A dict view: its kind (nyrt::DI_KEYS / DI_VALUES / DI_ITEMS) and dict,
+    // -1 for anything else.
+    int viewOf(const Value& v, Value* dict) {
+        if (!view_nodes_[0]) return -1;
+        Node* cn = instClassNode(v);
+        if (!cn) return -1;
+        int k = cn == view_nodes_[0] ? 0 : cn == view_nodes_[1] ? 1 : cn == view_nodes_[2] ? 2 : -1;
+        if (k < 0) return -1;
+        Value d = instField(v, nyrt::view_field());
+        Container* c = contOf(d);
+        if (!c || seqLen(c) >= 0 || nygen::is_gen(d)) return -1;
+        if (dict) *dict = d;
+        return k;
+    }
+    // d.keys() / d.values() / d.items(): a live view of d.
+    Value makeView(const Value& dict, int kind) {
+        Node* cn = view_nodes_[kind];
+        rv_made_ = true;
+        Value inst = newInstance(static_cast<ClassNode*>(cn)->name, cn);
+        instance_properties[inst.value.p]->defineByName(nyrt::view_field(), dict);
+        return inst;
+    }
+    // Set once a range or a dict view object has been made: until then no
+    // builtin argument can be one (callBuiltin's rangeArgsToLists).
+    bool rv_made_ = false;
+    void rangeArgsToLists(std::vector<Value>& args) {
+        for (auto& a : args) {
+            if (a.type != ValueType::USERDATA || !a.value.p || string_ptrs_.count(a.value.p)) continue;
+            if (!isRangeValue(a) && viewOf(a, nullptr) < 0) continue;
+            std::vector<Value> items;
+            if (rangeOrViewItems(a, items)) a = makeListValue(items);
+        }
+    }
+    // The values a range of 64-bit ints or a dict view holds, natively;
+    // false for anything else (round 78).
+    bool rangeOrViewItems(const Value& v, std::vector<Value>& out) {
+        int64_t a, b, s, n;
+        if (rangeOf(v, a, b, s)) {
+            if (!nyrt::range_len(a, b, s, n)) pyRaise("OverflowError", "Python int too large to convert to C ssize_t");
+            out.reserve(out.size() + (size_t)n);
+            for (int64_t i = 0; i < n; i++) out.push_back(intValue(nyrt::range_at(a, s, i)));
+            return true;
+        }
+        Value d;
+        int k = viewOf(v, &d);
+        if (k < 0) return false;
+        for (auto& kv : *contOf(d)->container) {
+            if (isInternalKey(kv.first)) continue;
+            if (k == 0) out.push_back(keyValue(kv.first));
+            else if (k == 1) out.push_back(kv.second);
+            else out.push_back(makeListValue({keyValue(kv.first), kv.second}, true));
+        }
+        return true;
+    }
     static std::vector<Value> seqItems(Container* c) {
         std::vector<Value> out;
         int64_t n = seqLen(c);
@@ -1744,6 +1866,20 @@ public:   // NythonExecutor is a struct: members default to public
         // An object: __contains__, else a search of what it iterates over
         // (__iter__ / __getitem__), stopping at the first match, as in Python.
         if (isInstanceVal(c)) {
+            // an int in a range of 64-bit ints in O(1); a key in a keys view
+            // (round 78)
+            if (x.type == ValueType::INTEGER || x.type == ValueType::BOOLEAN) {
+                int64_t ra, rb, rs, xi;
+                if (rangeOf(c, ra, rb, rs)) {
+                    if (x.type == ValueType::BOOLEAN) xi = x.value.b ? 1 : 0;
+                    else if (!bigint_fits_i64(x.value.i, xi)) return false;
+                    return nyrt::range_has(ra, rb, rs, xi);
+                }
+            }
+            {
+                Value dv;
+                if (viewOf(c, &dv) == 0) { Container* dc = contOf(dv); return dictFind(dc, x) != dc->container->end(); }
+            }
             if (instanceHasMethod(c, "__contains__")) {
                 std::vector<Value> args = {x};
                 return isTruthy(callMethod(c, "__contains__", args, ctx));
@@ -3020,6 +3156,13 @@ public:   // NythonExecutor is a struct: members default to public
             if (args.size() < lo || args.size() > hi)
                 pyRaise("TypeError", name + "() takes " + (lo == hi ? "exactly " + std::to_string(lo) : "at most " + std::to_string(hi)) + " argument" + (hi == 1 ? "" : "s") + " (" + std::to_string(args.size()) + " given)");
         };
+        // d.keys() / values() / items(): live views, as Python's (round 78;
+        // they were lists). Nython's d.entries() stays a list of pairs.
+        if (is_dict && view_nodes_[0] && (name == "keys" || name == "values" || name == "items") && !nygen::is_gen(obj)) {
+            if (!args.empty()) pyRaise("TypeError", "dict." + name + "() takes no arguments (" + std::to_string(args.size()) + " given)");
+            out = makeView(obj, name == "keys" ? 0 : name == "values" ? 1 : 2);
+            return true;
+        }
         if (name == "keys" || name == "values" || name == "items" || name == "entries") {
             std::vector<Value> r;
             for (auto& kv : C) {
@@ -3268,7 +3411,7 @@ public:   // NythonExecutor is a struct: members default to public
         return c && !isInstanceVal(obj) && seqLen(c) >= 0 && !isSetCont(c);
     }
     Value getItem(const Value& obj, const Value& idx, Context* ctx) {
-        if (nygen::is_gen(obj)) pyRaise("TypeError", "'generator' object is not subscriptable");
+        if (nygen::is_gen(obj)) pyRaise("TypeError", "'" + typeNameOf(obj) + "' object is not subscriptable");
         if (isInstanceValue(idx) && indexableSeq(obj)) {
             Value iv;
             if (indexValue(idx, iv, ctx)) return getItem(obj, iv, ctx);
@@ -3326,6 +3469,16 @@ public:   // NythonExecutor is a struct: members default to public
         }
         // __getitem__ on instances
         if (isInstanceVal(obj)) {
+            // r[i] of a range of 64-bit ints, natively (round 78)
+            if (idx.type == ValueType::INTEGER || idx.type == ValueType::BOOLEAN) {
+                int64_t ra, rb, rs, n, i;
+                if (rangeOf(obj, ra, rb, rs) && nyrt::range_len(ra, rb, rs, n)
+                    && (idx.type == ValueType::BOOLEAN ? (i = idx.value.b ? 1 : 0, true) : bigint_fits_i64(idx.value.i, i))) {
+                    if (i < 0) i += n;
+                    if (i < 0 || i >= n) pyRaise("IndexError", "range object index out of range");
+                    return intValue(nyrt::range_at(ra, rs, i));
+                }
+            }
             if (!instanceHasMethod(obj, "__getitem__"))
                 pyRaise("TypeError", "'" + shownClassName(instanceClassName(obj)) + "' object is not subscriptable");
             std::vector<Value> call_args = {idx};
@@ -3474,8 +3627,13 @@ public:   // NythonExecutor is a struct: members default to public
             for (auto& ch : nypy::u8_chars(*(std::string*)v.value.p)) out.push_back(makeStringValue(ch));
             return out;
         }
-        // An object: __iter__ / __next__ / a __getitem__ sequence (iterValues).
-        if (isInstanceVal(v)) return iterValues(v, ctx);
+        // An object: __iter__ / __next__ / a __getitem__ sequence (iterValues);
+        // a range or dict view natively (round 78).
+        if (isInstanceVal(v)) {
+            std::vector<Value> out;
+            if (rangeOrViewItems(v, out)) return out;
+            return iterValues(v, ctx);
+        }
         // A class whose metaclass defines __iter__ (round 77)
         if (!class_meta_.empty()) {
             Value it;
@@ -4159,7 +4317,65 @@ public:   // NythonExecutor is a struct: members default to public
         bool broke = false;
         FlowState& lf = flow();
         uint64_t gen_s0 = nygen::serial_now();
-        Value iter_val = evalNode(fn->iterable, ctx);
+        // `for i in range(...)` (round 78): the arguments are evaluated and,
+        // when they are 64-bit ints, the loop counts natively without making
+        // the range object; anything else makes it (range() itself checks).
+        // `for k, v in d.items()` (and keys/values) over a plain dict: the
+        // entries are walked without making the view (round 78).
+        Value iter_val;
+        bool counted = false, evaluated = false;
+        int64_t r_first = 0, r_step = 1, r_n = 0;
+        int dict_kind = -1;
+        Value dict_val;
+        if (range_node_ && fn->iterable && fn->iterable->type() == NodeType::CALL) {
+            auto* rc = static_cast<CallNode*>(fn->iterable.get());
+            if (rc->callee && rc->callee->type() == NodeType::VARIABLE && rc->callee->value() == "range"
+                && !rc->args.empty() && rc->args.size() <= 3) {
+                Value callee = evalNode(rc->callee, ctx);
+                if (callee.type == ValueType::USERDATA && callee.value.p == (void*)range_node_) {
+                    std::vector<Value> ra; nyrt::OrderedKw<Value> rkw;
+                    evalCallArgs(rc->args, ctx, ra, rkw);
+                    int64_t b[3] = {0, 0, 1};
+                    bool small = rkw.empty() && !ra.empty() && ra.size() <= 3;
+                    for (size_t k = 0; small && k < ra.size(); k++)
+                        small = ra[k].type == ValueType::INTEGER && bigint_fits_i64(ra[k].value.i, b[ra.size() == 1 ? 1 : k]);
+                    if (small && fn->unpack_vars.empty() && b[2] != 0 && nyrt::range_len(b[0], b[1], b[2], r_n)) {
+                        counted = true; r_first = b[0]; r_step = b[2];
+                    } else iter_val = makeRange(ra, rkw, ctx);
+                    evaluated = true;
+                }
+            } else if (view_nodes_[0] && rc->args.empty() && rc->callee && rc->callee->type() == NodeType::ATTRIBUTE) {
+                // d.keys() / d.values() / d.items() where d is a name or a
+                // field of one (reading it is pure, so when it is not a plain
+                // dict the call is simply evaluated as written)
+                auto* an = static_cast<AttributeNode*>(rc->callee.get());
+                int k = an->attr == "keys" ? 0 : an->attr == "values" ? 1 : an->attr == "items" ? 2 : -1;
+                Value recv;
+                if (k >= 0 && an->object && an->object->type() == NodeType::VARIABLE) recv = evalNode(an->object, ctx);
+                else if (k >= 0 && an->object && an->object->type() == NodeType::ATTRIBUTE) {
+                    auto* inner = static_cast<AttributeNode*>(an->object.get());
+                    if (!any_getattribute_ && inner->object && inner->object->type() == NodeType::VARIABLE) {
+                        Value owner = evalNode(inner->object, ctx);
+                        if (isInstanceValue(owner)) recv = instField(owner, inner->attr);   // its own field, no getter
+                    }
+                }
+                Container* dc = contOf(recv);
+                if (dc && isPlainDict(dc)) { dict_kind = k; dict_val = recv; evaluated = true; }
+            }
+        }
+        if (!evaluated) iter_val = evalNode(fn->iterable, ctx);
+        if (!counted && dict_kind < 0) {
+            int64_t ra, rb, rs;
+            if (fn->unpack_vars.empty() && rangeOf(iter_val, ra, rb, rs) && nyrt::range_len(ra, rb, rs, r_n)) { counted = true; r_first = ra; r_step = rs; }
+            else {
+                // a dict view, or a dict itself (its keys)
+                dict_kind = viewOf(iter_val, &dict_val);
+                if (dict_kind < 0) {
+                    Container* dc = contOf(iter_val);
+                    if (dc && seqLen(dc) < 0 && !nygen::is_gen(iter_val)) { dict_kind = 0; dict_val = iter_val; }
+                }
+            }
+        }
         // A generator the iterable expression made itself belongs to this
         // loop alone: it is closed when the loop ends (break, return, error),
         // as CPython's reference counting does (nygen::fresh).
@@ -4179,6 +4395,61 @@ public:   // NythonExecutor is a struct: members default to public
         // An object whose __iter__ returns a list, a generator or iter(...):
         // the loop runs over that. (The loop below called __next__ on the
         // list, got none forever and never ended.)
+        // A range of 64-bit ints (round 78): counted, no iterator object.
+        if (counted) {
+            for (int64_t i = 0; i < r_n; i++) {
+                bindv(var_name, intValue(nyrt::range_at(r_first, r_step, i)));
+                try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
+                catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
+                NY_LOOP_FLOW(broke)
+            }
+            if (!broke && fn->else_branch) result = evalNode(fn->else_branch, ctx);
+            return result;
+        }
+        // A dict, or a dict view: its entries walked live, as CPython's dict
+        // iterators do (round 78; over a snapshot of the keys, a body adding
+        // or deleting entries went unnoticed - a RuntimeError in Python).
+        if (dict_kind >= 0) {
+            Value hold = dict_val;
+            auto* m = contOf(hold)->container;
+            const size_t size0 = m->size();
+            size_t slot = 0;
+            auto bindElem = [&](const Value& elem) {
+                if (fn->unpack_vars.empty()) { bindv(var_name, elem); return; }
+                if (isInstanceValue(elem)) { bindUnpacked(fn.get(), var_name, elem, ctx, bindv); return; }
+                std::vector<Value> parts;
+                if (Container* ec = contOf(elem); ec && seqLen(ec) >= 0) parts = seqItems(ec);
+                else parts = iterValues(elem, ctx);
+                bindv(var_name, parts.empty() ? NONE_VALUE : parts[0]);
+                for (size_t ui = 0; ui < fn->unpack_vars.size(); ui++)
+                    bindv(fn->unpack_vars[ui]->value(), ui + 1 < parts.size() ? parts[ui + 1] : NONE_VALUE);
+            };
+            for (;;) {
+                if (m->size() != size0) pyRaise("RuntimeError", "dictionary changed size during iteration");
+                const std::pair<std::string, Value>* kv = nullptr;
+                while (slot < m->slot_end()) {
+                    kv = m->slot_at(slot++);
+                    if (kv && !isInternalKey(kv->first)) break;
+                    kv = nullptr;
+                }
+                if (!kv) break;
+                if (dict_kind == 2 && fn->unpack_vars.size() == 1) {
+                    // for k, v in d.items(): no pair is made
+                    Value k = keyValue(kv->first), v = kv->second;
+                    bindv(var_name, k);
+                    bindv(fn->unpack_vars[0]->value(), v);
+                } else {
+                    Value elem = dict_kind == 0 ? keyValue(kv->first) : dict_kind == 1 ? Value(kv->second)
+                               : makeListValue({keyValue(kv->first), kv->second}, true);
+                    bindElem(elem);
+                }
+                try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
+                catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
+                NY_LOOP_FLOW(broke)
+            }
+            if (!broke && fn->else_branch) result = evalNode(fn->else_branch, ctx);
+            return result;
+        }
         Value pre_iterator; bool have_pre_iterator = false;
         if (isInstanceValue(iter_val) && instanceHasMethod(iter_val, "__iter__")) {
             std::vector<Value> no_args;
@@ -4228,17 +4499,11 @@ public:   // NythonExecutor is a struct: members default to public
                 bool is_list = seqLen(cont) >= 0;
                 
                 if (!is_list) {
-                    // Dict/map iteration — iterate all non-internal keys
-                    // Over a snapshot of the keys: the body may add or
-                    // delete entries.
-                    std::vector<Value> keys = iterItems(iter_val, ctx);
-                    for (auto& key : keys) {
-                        bindv(var_name, key);
-                        try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
-                        catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
-                        NY_LOOP_FLOW(broke)
-                    }
-                    return result;
+                    // Dict/map iteration: its keys, live, as Python's
+                    // dict_keyiterator (round 78: over a snapshot, so a body
+                    // adding or deleting entries went unnoticed; it is a
+                    // RuntimeError in Python)
+                    return nygen::for_loop(*this, fn.get(), nygen::make_dict_iter(*this, iter_val, 0, false), ctx, true);
                 }
                 
                 // List iteration by numeric index
@@ -7641,10 +7906,14 @@ public:
         // to a builtin (round 77) - but not to the ones asking for its class,
         // dunders or identity, or storing it (nyrt::payload_transparent)
         if (any_payload_ && !args.empty()) unwrapBuiltinArgs(name_orig, args);
+        // a range or a dict view given to one of Nython's own flat natives is
+        // the list of its values, as before round 78 (nyrt::takes_range_objects)
+        if (rv_made_ && !args.empty() && !nyrt::takes_range_objects(name_orig)) rangeArgsToLists(args);
         if (!args.empty() && nyrt::takes_paths(name_orig)) fspathArgs(args, ctx);
         // islice/take, and iter/next/any/all/zip/map/filter/enumerate given a
         // generator: lazy (src/NyGen.cpp).
-        if (nygen::builtin_candidate(name_orig, args) || (nygen::lazy_builtin_name(name_orig) && anyIteratorObject(args))) {
+        // Round 78: zip/map/filter/enumerate are lazy over every iterable.
+        if (nygen::builtin_candidate(name_orig, args) || nygen::lazy_builtin_name(name_orig)) {
             Value r;
             if (nygen::builtin(*this, name_orig, args, ctx, r)) return r;
         }
@@ -8652,6 +8921,7 @@ public:
         // a class whose metaclass defines __iter__ (round 77)
         if (!class_meta_.empty() && classNodeOfValue(v)) return iterItems(v, ctx);
         if (isInstanceValue(v)) {
+            if (rangeOrViewItems(v, out)) return out;   // round 78
             std::vector<Value> no_args;
             Value iterator = v;
             if (instanceHasMethod(v, "__iter__")) {
@@ -8728,6 +8998,9 @@ public:
             if (nygen::Gen* g = nygen::gen_of(itv)) {
                 Value item;
                 while (nygen::next(*this, g, item, cc)) one(item);
+            } else if (int64_t ra, rb, rs, rn; rangeOf(itv, ra, rb, rs) && nyrt::range_len(ra, rb, rs, rn)) {
+                // a range of 64-bit ints: counted (round 78)
+                for (int64_t i = 0; i < rn; i++) one(intValue(nyrt::range_at(ra, rs, i)));
             } else if (isInstanceValue(itv)) {
                 // An iterator object too (or an object whose __iter__ gives
                 // one): it was read to the end before the first element was
@@ -9613,6 +9886,7 @@ public:
     bool type_call_skip_ = false;
     Value instantiateClass(const Value& cls, std::vector<Value>& args,
                            const nyrt::OrderedKw<Value>& kw, Context* ctx) {
+        if (range_node_ && cls.value.p == (void*)range_node_) return makeRange(args, kw, ctx);   // round 78
         std::string className = fnTag(func_names, cls.value.p).substr(10);
         // OSError(errno, strerror, ...) makes the subclass for that errno:
         // OSError(2, "x") is a FileNotFoundError (round 77, CPython's errnomap)
@@ -12103,7 +12377,7 @@ public:
     }
     bool iterableBuiltin(const std::string& name, std::vector<Value>& args, Context* ctx, Value& out) {
         static const std::unordered_set<std::string> takes = {
-            "list","tuple","set","sorted","min","max","sum","any","all","enumerate","reversed","zip","frozenset"};
+            "list","tuple","set","sorted","min","max","sum","any","all","enumerate","zip","frozenset"};   // reversed: pycore's (round 78)
         if (name == "issubclass" && args.size() >= 2) {
             auto cls_name = [&](const Value& v) -> std::string {
                 if (v.type == ValueType::USERDATA && v.value.p) {
@@ -12216,9 +12490,32 @@ public:
             return true;
         }
         if (name == "iter" && args.size() > 2) pyRaise("TypeError", "iter expected at most 2 arguments, got " + std::to_string(args.size()));
+        // The engines' range and dict-view iterators (round 78): what the
+        // prelude's range.__iter__ / __reversed__ and the views' use. A
+        // range past 64-bit ints gets none (the prelude's generator).
+        if (name == "_ny_range_iter" && args.size() == 3) {
+            int64_t f, s, n;
+            bool ok = true;
+            for (auto& a : args) ok = ok && a.type == ValueType::INTEGER;
+            if (ok && bigint_fits_i64(args[0].value.i, f) && bigint_fits_i64(args[1].value.i, s)
+                && bigint_fits_i64(args[2].value.i, n) && nyrt::range_iter_fits(f, s, n))
+                out = nygen::make_range_iter(*this, f, s, n);
+            else out = NONE_VALUE;
+            return true;
+        }
+        if (name == "_ny_dict_iter" && args.size() == 3) {
+            Num k;
+            int kind = asNum(args[1], k) && k.k == 1 && k.i >= 0 && k.i <= 2 ? (int)k.i : 0;
+            Value d = args[0], p;
+            if (any_payload_ && payloadOf(d, p)) d = p;
+            out = nygen::make_dict_iter(*this, d, kind, isTruthy(args[2]));
+            return true;
+        }
         if (name == "iter" && !args.empty()) {
             const Value& v = args[0];
             if (nygen::is_gen(v)) { out = v; return true; }
+            // a range or a dict view: its native iterator (round 78)
+            if (isRangeValue(v) || viewOf(v, nullptr) >= 0) { out = nygen::make_iter(*this, v, ctx); return true; }
             if (isInstanceValue(v)) {
                 std::vector<Value> none;
                 if (instanceHasMethod(v, "__iter__")) { out = callMethod(v, "__iter__", none, ctx); return true; }
@@ -12248,6 +12545,8 @@ public:
         size_t upto = (name == "zip") ? args.size() : 1;
         bool changed = false;
         for (size_t i = 0; i < upto && i < args.size(); i++) {
+            // a range or a dict view is read natively where it is used (round 78)
+            if (isRangeValue(args[i]) || viewOf(args[i], nullptr) >= 0) continue;
             if (isInstanceValue(args[i]) && (instanceHasMethod(args[i], "__iter__") || instanceHasMethod(args[i], "__next__")
                                              || instanceHasMethod(args[i], "__getitem__"))) {
                 args[i] = makeListValue(iterValues(args[i], ctx));

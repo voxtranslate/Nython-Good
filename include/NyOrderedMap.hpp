@@ -289,6 +289,11 @@ public:
 
     size_t size() const { return live_; }
     bool empty() const { return live_ == 0; }
+    // Positional access for live iterators (round 78: a dict view's
+    // iterator keeps a slot number, not an iterator, and re-checks the map
+    // each step): slots 0 .. slot_end()-1, nullptr for an erased one.
+    size_t slot_end() const { return slots_.size(); }
+    const value_type* slot_at(size_t n) const { return n < slots_.size() && slots_[n].live ? &slots_[n].kv : nullptr; }
     void reserve(size_t n) { if (n > kSmall && index_.size() < n * 2) { if (index_.empty()) index_all(); rebuild_index(n * 2); } }
     void clear() { slots_.clear(); index_.clear(); live_ = 0; used_ = 0; }
 

@@ -207,6 +207,22 @@ inline bool payload_transparent(const std::string& n) {
     };
     return names.count(n) > 0;
 }
+// Builtins that take a range or a dict view as the object itself (round 78):
+// Python's builtins and the protocol helpers. Every other builtin - Nython's
+// own flat natives (random_sample, json_encode, string and tensor
+// functions...) - is given the list of its values, which is what range()
+// and d.keys() returned before (both engines: NythonExecutor::callBuiltin,
+// the VM's builtin bridge).
+inline bool takes_range_objects(const std::string& n) {
+    if (payload_transparent(n)) return true;
+    if (n.rfind("_json_", 0) == 0) return true;   // lib/json's natives: a view is not JSON data
+    static const std::unordered_set<std::string> names = {
+        "list", "tuple", "set", "frozenset", "dict", "sorted", "sum", "any", "all", "enumerate", "zip", "map",
+        "filter", "islice", "take", "bytes", "bytearray", "int", "float", "abs", "round", "pow", "divmod",
+        "hex", "oct", "bin", "chr", "ord", "sizeof", "range", "reduce",
+    };
+    return names.count(n) > 0;
+}
 
 // ── Module namespaces over the flat builtins ─────────────────────────────────
 // `import os` binds a namespace so Python-style code works: os.getcwd() is
@@ -379,7 +395,9 @@ inline bool is_builtin_type_name(const std::string& n) {
 }
 // The prelude's classes that are builtins in Python (round 77): shown as such.
 inline bool is_prelude_builtin_class(const std::string& n) {
-    return n == "property" || n == "staticmethod" || n == "classmethod" || n == "ellipsis";
+    return n == "property" || n == "staticmethod" || n == "classmethod" || n == "ellipsis"
+        // round 78: the dict views and mappingproxy are the prelude's too
+        || n == "dict_keys" || n == "dict_values" || n == "dict_items" || n == "mappingproxy";
 }
 inline std::string class_repr(const std::string& full) {
     std::string n = shown_class_name(full);
@@ -410,6 +428,11 @@ inline const RuntimeType* runtime_type(const std::string& n) {
         {"set_iterator", "generator", "builtins"}, {"bytes_iterator", "generator", "builtins"},
         {"bytearray_iterator", "generator", "builtins"},
         {"range_iterator", "generator", "builtins"}, {"iterator", "generator", "builtins"},
+        // round 78: the iterators of dict views and of reversed()
+        {"dict_valueiterator", "generator", "builtins"}, {"dict_itemiterator", "generator", "builtins"},
+        {"dict_reversekeyiterator", "generator", "builtins"}, {"dict_reversevalueiterator", "generator", "builtins"},
+        {"dict_reverseitemiterator", "generator", "builtins"}, {"list_reverseiterator", "generator", "builtins"},
+        {"reversed", "generator", "builtins"},
     };
     for (auto& x : t) if (n == x.name) return &x;
     return nullptr;

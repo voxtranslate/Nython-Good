@@ -48,6 +48,7 @@
 #include "NyJson.hpp"
 #include "NyFuzzy.hpp"
 #include "NyExcTypes.hpp"
+#include "NyRange.hpp"   // range objects and dict views (round 78)
 #include "NyOrderedMap.hpp"
 #include "NyBigInt.hpp"
 #include "NyStr.hpp"
@@ -149,6 +150,13 @@ enum class Op : uint8_t {
     // visible frame that is not a generator expression's (the module's when
     // there is none) - PEP 572 (round 77).
     DEFINE_OUTER,
+    // `for x in range(a[, b[, c]])` (arg 1-3: the callee and its arguments
+    // on the stack) and `for ... in d.keys()/values()/items()` (arg 10-12:
+    // the receiver): pushes the loop's iterator - counting, or walking the
+    // dict, with no range object or view made when the callee is the
+    // prelude's range / the receiver a plain dict; anything else is called
+    // as written and then iterated as GET_ITER would (round 78).
+    FOR_PREP,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1816,8 +1824,10 @@ private:
         }
         // Expression statement (discard result)
         case NT::RANGE: {
+            // Nython's `a..b` / `a..b..step`: a list, as on the interpreter
+            // (evalRange) - range() is the lazy range object now (round 78)
             auto rn=std::static_pointer_cast<nython::node::RangeNode>(nd);
-            emit_ln("range",l);
+            emit_ln("_ny_range_list",l);
             if(rn->start)visit(rn->start); else emit_lc(VMVal::make_int(0),l);
             if(rn->end_node)visit(rn->end_node); else emit_lc(VMVal::make_int(0),l);
             int rargc=2;
@@ -1908,7 +1918,31 @@ private:
     // ─── for ────────────────────────────────────────────────────────────
     void visit_for(std::shared_ptr<nython::node::ForNode> nd) {
         int l=ln(nd);
-        visit(nd->iterable); emit(Op::GET_ITER,0,l);
+        // `for x in range(...)` and `for ... in d.keys()/values()/items()`:
+        // FOR_PREP (round 78) - the loop counts, or walks the dict, without
+        // making the range object or the view.
+        bool prepped=false;
+        if(nd->iterable&&nd->iterable->type()==NT::CALL){
+            auto cn=std::static_pointer_cast<nython::node::CallNode>(nd->iterable);
+            bool plain=true;
+            for(auto& a:cn->args)
+                if(!a||a->type()==NT::KEYWORD_ARG||a->type()==NT::ASSIGNMENT||(a->type()==NT::UNARY&&(std::static_pointer_cast<nython::node::UnaryNode>(a)->op=="*"
+                   ||std::static_pointer_cast<nython::node::UnaryNode>(a)->op=="**"))) plain=false;
+            if(plain&&cn->callee&&cn->callee->type()==NT::VARIABLE&&cn->callee->value()=="range"&&!cn->args.empty()&&cn->args.size()<=3){
+                visit(cn->callee);
+                for(auto& a:cn->args) visit(a);
+                emit(Op::FOR_PREP,(int)cn->args.size(),l);
+                prepped=true;
+            } else if(plain&&cn->args.empty()&&cn->callee&&cn->callee->type()==NT::ATTRIBUTE){
+                auto an=std::static_pointer_cast<nython::node::AttributeNode>(cn->callee);
+                int k=an->attr=="keys"?0:an->attr=="values"?1:an->attr=="items"?2:-1;
+                bool via_super=an->object&&(an->object->type()==NT::SUPER||(an->object->type()==NT::CALL
+                    &&std::static_pointer_cast<nython::node::CallNode>(an->object)->callee
+                    &&std::static_pointer_cast<nython::node::CallNode>(an->object)->callee->type()==NT::SUPER));
+                if(k>=0&&an->object&&!via_super){ visit(an->object); emit(Op::FOR_PREP,10+k,l); prepped=true; }
+            }
+        }
+        if(!prepped){ visit(nd->iterable); emit(Op::GET_ITER,0,l); }
         int start=C().here();
         // visit_stmt, not visit: the parser yields a BARE expression node as the
         // body when the statement is a single expression (e.g. after a
@@ -2453,6 +2487,7 @@ struct GenState : std::enable_shared_from_this<GenState> {
     // A lazy builtin (zip, map, filter, enumerate, islice) runs this instead
     // of code: the next value, or false once exhausted.
     std::function<bool(VMVal&)> native;
+    bool sticky=false;           // a native whose error is not the end: a dict iterator keeps raising (round 78)
     VirtualMachine* vm=nullptr;  // the VM that runs it (its registry of live generators)
     GenState() = default;
     GenState(const GenState&) = delete;
@@ -2929,7 +2964,7 @@ public:
         struct W { const char* name; size_t from; bool all; };
         const W ws[] = {{"list",0,false},{"tuple",0,false},{"set",0,false},{"sorted",0,false},
             {"sum",0,false},{"min",0,false},{"max",0,false},{"any",0,false},{"all",0,false},
-            {"enumerate",0,false},{"reversed",0,false},{"zip",0,true},{"zip_list",0,true},
+            {"enumerate",0,false},{"zip",0,true},{"zip_list",0,true},   // reversed: its own protocol (round 78)
             {"map",1,true},{"filter",1,true},{"frozenset",0,false}};
         for(const W& w : ws){
             auto it=globals_.find(w.name);
@@ -2955,11 +2990,23 @@ public:
                     VMVal lazy;
                     if(gen_lazy_builtin(nm,a,lazy)) return lazy;
                 }
+                // sum(range(...)) in O(1): the arithmetic series, exact - the
+                // value the loop would reach, without the loop (round 78)
+                if(nm=="sum"&&!a.empty()&&(a.size()==1||(a.size()==2&&a[1].type==VMType::INT))){
+                    int64_t ra,rb,rs,rn;
+                    if(range_of(a[0],ra,rb,rs)&&nyrt::range_len(ra,rb,rs,rn)){
+                        VMVal acc=VMVal::make_bigint(nyrt::range_sum(ra,rs,rn));
+                        return a.size()==2?binop(nypy::A_ADD,a[1],acc):acc;
+                    }
+                }
                 size_t end = all ? a.size() : std::min(a.size(), from+1);
                 for(size_t i=from;i<end;i++){
                     VMVal& x=a[i];
                     if(x.type==VMType::GENERATOR||x.type==VMType::ITERATOR) x=VMVal::make_list(iter_items(x));
                     else if(x.type==VMType::INSTANCE){
+                        // a range or a dict view is read natively where it is
+                        // used (round 78)
+                        if(is_range_inst(x)||view_of(x,nullptr)>=0) continue;
                         VMVal m;
                         if(class_lookup(x.class_name,"__iter__",m)||class_lookup(x.class_name,"__getitem__",m)
                            ||class_lookup(x.class_name,"__next__",m))
@@ -3368,6 +3415,9 @@ public:
             try{ exec_code(code,{},std::nullopt); } catch(VMReturn&){}
             export_to_globals_=old_exp; export_depth_=old_depth;
             for(auto& sub:code->sub_codes) if(sub->is_class&&!class_reg_.count(sub->name)) class_reg_[sub->name]=sub;   // keep the class MAKE_CLASS made (a copy for metaclass= / expression bases), round 77
+            // range and the dict views are the prelude's classes (round 78)
+            { auto it=globals_.find("range"); if(it!=globals_.end()&&it->second.type==VMType::CLASS) range_code_=it->second.code; }
+            views_ready_=class_reg_.count("dict_keys")&&class_reg_.count("dict_values")&&class_reg_.count("dict_items");
         } catch(std::exception& e){ std::cerr<<"[VM] prelude failed to load: "<<e.what()<<"\n"; }
         for(auto& kv:globals_) base_global_names_.insert(kv.first);   // globals() leaves these out
         // open() as a native: the prelude's `def open` raises from its own
@@ -3811,7 +3861,7 @@ private:
             gs.running=true;
             bool got=false;
             try { got=gs.native(out); }
-            catch(...){ gs.running=false; gen_finish(gs); throw; }
+            catch(...){ gs.running=false; if(!gs.sticky) gen_finish(gs); throw; }
             gs.running=false;
             if(!got) gen_finish(gs);
             return got;
@@ -4073,10 +4123,242 @@ public:
         gen_finalize_=false;
     }
 private:
+public:
+    // ── range and dict views (round 78; NyRange.hpp) ───────────────────────
+    // `range`, `dict_keys`, `dict_values`, `dict_items` are the prelude's
+    // classes (NyPrelude.hpp). range() and d.keys() make their instances
+    // here, and the native paths below iterate them, take their len, test
+    // `in` and index a range of 64-bit ints without calling their methods.
+    std::shared_ptr<VMCode> range_code_;   // the prelude's range class (load_prelude)
+    bool views_ready_=false;               // the prelude's view classes exist
+    bool is_range_inst(const VMVal& v) const { return v.type==VMType::INSTANCE&&v.map&&v.class_name=="range"; }
+    bool range_of(const VMVal& v, int64_t& a, int64_t& b, int64_t& s) const {
+        if(!range_code_||!is_range_inst(v)) return false;
+        auto& m=*v.map;
+        auto ia=m.find("start"), ib=m.find("stop"), is=m.find("step");
+        if(ia==m.end()||ib==m.end()||is==m.end()) return false;
+        for(auto* x:{&ia->second,&ib->second,&is->second}) if(x->type!=VMType::INT||!x->s.empty()) return false;
+        a=ia->second.i; b=ib->second.i; s=is->second.i;
+        return s!=0;
+    }
+    // A dict view's kind (nyrt::DI_KEYS ...) and dict; -1 for anything else.
+    int view_of(const VMVal& v, VMVal* dict) const {
+        if(!views_ready_||v.type!=VMType::INSTANCE||!v.map) return -1;
+        int k=nyrt::dict_view_kind(v.class_name);
+        if(k<0) return -1;
+        auto it=v.map->find(nyrt::view_field());
+        if(it==v.map->end()||it->second.type!=VMType::MAP||!it->second.map) return -1;
+        if(dict) *dict=it->second;
+        return k;
+    }
+    // d.keys() / d.values() / d.items(): a live view of d.
+    VMVal make_view(const VMVal& dict, int kind) {
+        static const char* const names[]={"dict_keys","dict_values","dict_items"};
+        auto attrs=new_instance_fields(names[kind]);
+        (*attrs)[nyrt::view_field()]=dict;
+        return VMVal::make_instance(names[kind],attrs);
+    }
+    // range(...) itself: CPython's range_new checks (PyNumber_Index on each
+    // argument, a zero step, no keywords); the class has no __init__.
+    VMVal make_range_val(std::vector<VMVal>& a, const VMVal* kwargs) {
+        VMVal kw=take_kwargs(a);
+        bool has_kw=(kw.type==VMType::MAP&&kw.map&&!kw.map->empty())||(kwargs&&kwargs->type==VMType::MAP&&kwargs->map&&!kwargs->map->empty());
+        if(has_kw) raise_native_exception("TypeError","range() takes no keyword arguments");
+        if(a.empty()) raise_native_exception("TypeError","range expected at least 1 argument, got 0");
+        if(a.size()>3) raise_native_exception("TypeError","range expected at most 3 arguments, got "+std::to_string(a.size()));
+        auto idx=[&](const VMVal& x)->VMVal{
+            if(x.type==VMType::INT) return x;
+            if(x.type==VMType::BOOL) return VMVal::make_int(x.b?1:0);
+            if(x.type==VMType::INSTANCE){
+                VMVal p;
+                if(any_payload_&&payload_of(x,p)&&p.type==VMType::INT) return p;
+                if(index_value(x,p)) return p.type==VMType::BOOL?VMVal::make_int(p.b?1:0):p;
+            }
+            raise_native_exception("TypeError","'"+vm_type_name(x)+"' object cannot be interpreted as an integer");
+        };
+        VMVal start=VMVal::make_int(0), stop, step=VMVal::make_int(1);
+        if(a.size()==1) stop=idx(a[0]);
+        else { start=idx(a[0]); stop=idx(a[1]); if(a.size()==3) step=idx(a[2]); }
+        if(!step.is_truthy()) raise_native_exception("ValueError","range() arg 3 must not be zero");
+        auto attrs=new_instance_fields("range");
+        (*attrs)["start"]=start; (*attrs)["stop"]=stop; (*attrs)["step"]=step;
+        return VMVal::make_instance("range",attrs);
+    }
+    // A range_iterator of n 64-bit ints from `first` by `step`.
+    VMVal range_iter(int64_t first, int64_t step, int64_t n) {
+        struct St { int64_t first, step, n, i=0; };
+        auto st=std::make_shared<St>(St{first,step,n<0?0:n});
+        return gen_native("range_iterator",[st](VMVal& o)->bool{
+            if(st->i>=st->n) return false;
+            o=VMVal::make_int(nyrt::range_at(st->first,st->step,st->i++));
+            return true;
+        });
+    }
+    // A live iterator over a dict's keys / values / items, forwards or
+    // backwards: CPython's dict iterators, "dictionary changed size during
+    // iteration" (sticky) when the dict grows or shrinks under it.
+    VMVal dict_iter(const VMVal& dict, int kind, bool rev) {
+        struct St { std::shared_ptr<VMMap> m; size_t slot, size0; int kind; bool rev; };
+        auto st=std::make_shared<St>(St{dict.map, rev?dict.map->slot_end():0, dict.map->size(), kind, rev});
+        VMVal g=gen_native(nyrt::dict_iter_name(kind,rev),nullptr);
+        GenState* gs=g.gen.get();   // owns the function below
+        gs->native=[this,st,gs](VMVal& o)->bool{
+            VMMap& m=*st->m;
+            if(m.size()!=st->size0){
+                st->size0=(size_t)-1;
+                gs->sticky=true;
+                raise_native_exception("RuntimeError","dictionary changed size during iteration");
+            }
+            for(;;){
+                const std::pair<std::string,VMVal>* kv;
+                if(st->rev){ if(st->slot==0) return false; kv=m.slot_at(--st->slot); }
+                else { if(st->slot>=m.slot_end()) return false; kv=m.slot_at(st->slot++); }
+                if(!kv||vm_internal_key(kv->first)) continue;
+                if(st->kind==0) o=vm_key_value(kv->first);
+                else if(st->kind==1) o=kv->second;
+                else o=VMVal::make_tuple({vm_key_value(kv->first),kv->second});
+                return true;
+            }
+        };
+        return g;
+    }
+    // A loop's own iterator, made by GET_ITER / FOR_PREP right before its
+    // FOR_ITER and never seen by the program (round 78): an ITERATOR with
+    // b set and no item vector, advanced in place by FOR_ITER. A range's
+    // first value, step and count are in `list`, its position in `i`; a
+    // dict's map is `map`, its slot `i`, its size when it started `d`, and
+    // `s` names what it yields.
+    VMVal stack_range_iter(int64_t first, int64_t step, int64_t n) {
+        VMVal x; x.type=VMType::ITERATOR; x.b=true; x.s="range_iterator";
+        x.list=std::make_shared<std::vector<VMVal>>(std::vector<VMVal>{VMVal::make_int(first),VMVal::make_int(step),VMVal::make_int(n<0?0:n)});
+        x.i=0;
+        return x;
+    }
+    VMVal stack_dict_iter(const VMVal& dict, int kind) {
+        VMVal x; x.type=VMType::ITERATOR; x.b=true; x.s=nyrt::dict_iter_name(kind,false);
+        x.map=dict.map; x.i=0; x.d=(double)dict.map->size();
+        return x;
+    }
+    // What GET_ITER pushes for `it`; `loop`: a loop's own iterator (it is
+    // followed by FOR_ITER), which may be one of the in-place ones above.
+    VMVal loop_iter(VMVal it, bool loop) {
+        if(loop){
+            int64_t a,b,s,n;
+            if(it.type==VMType::INSTANCE&&range_of(it,a,b,s)&&nyrt::range_len(a,b,s,n)) return stack_range_iter(a,s,n);
+            VMVal d;
+            int k=-1;
+            if(it.type==VMType::MAP&&it.map&&it.class_name.empty()){ d=it; k=0; }
+            else if(it.type==VMType::INSTANCE) k=view_of(it,&d);
+            if(k>=0) return stack_dict_iter(d,k);
+        }
+        if(it.type==VMType::CLASS&&!class_meta_.empty()){
+            // a class whose metaclass defines __iter__ (round 77)
+            VMVal r;
+            if(meta_call(it,"__iter__",{},r)){
+                if(r.type==VMType::LIST&&r.list){ std::vector<VMVal> c=*r.list; return VMVal::make_iter(std::move(c)); }
+                return r;
+            }
+        }
+        if(it.type==VMType::GENERATOR) return it;
+        if(it.type==VMType::ITERATOR) return it;
+        // a range of 64-bit ints, a dict view, a dict: the native iterator
+        // (round 78; a dict's keys are walked live now)
+        if(it.type==VMType::INSTANCE||it.type==VMType::MAP){
+            VMVal ni;
+            if(native_iter(it,ni)) return ni;
+        }
+        if(it.type==VMType::INSTANCE){
+            // __iter__'s result; else the object itself when it has
+            // __next__; else a __getitem__ sequence, indexed from 0.
+            bool f=false;
+            VMVal iter_res=call_dunder_f(it,"__iter__",{},f);
+            if(f){
+                if(iter_res.type==VMType::LIST&&iter_res.list){ std::vector<VMVal> c=*iter_res.list; return VMVal::make_iter(std::move(c)); }
+                return iter_res;
+            }
+            VMVal nx;
+            if(class_lookup(it.class_name,"__next__",nx)) return it;
+            return VMVal::make_iter(iter_items(it));
+        }
+        if(it.type==VMType::LIST&&it.list){
+            std::vector<VMVal> copy=*it.list; return VMVal::make_iter(std::move(copy));
+        }
+        // a dict's (typed) keys; a string's characters; the old helper for
+        // the rest
+        return make_iter(it);
+    }
+    // The native iterator of a range of 64-bit ints, a dict view or a dict
+    // (round 78); false for anything else.
+    bool native_iter(const VMVal& v, VMVal& out) {
+        if(v.type==VMType::MAP&&v.map&&v.class_name.empty()){ out=dict_iter(v,0,false); return true; }
+        if(v.type!=VMType::INSTANCE) return false;
+        int64_t a,b,s,n;
+        if(range_of(v,a,b,s)&&nyrt::range_len(a,b,s,n)){ out=range_iter(a,s,n); return true; }
+        VMVal d;
+        int k=view_of(v,&d);
+        if(k>=0){ out=dict_iter(d,k,false); return true; }
+        return false;
+    }
+    // reversed(v) of what has no __reversed__ (round 78; it was a reversed
+    // copy as a list): list_reverseiterator over a list (live, as CPython's:
+    // it ends once its index leaves the list), `reversed` over a tuple, str,
+    // bytes or a __getitem__ sequence, dict_reversekeyiterator over a dict;
+    // a set, a generator or an iterator has no order to reverse.
+    VMVal reversed_iter(const VMVal& v) {
+        if(v.type==VMType::LIST&&v.list&&!v.is_set()){
+            struct St { std::shared_ptr<std::vector<VMVal>> l; int64_t i; };
+            auto st=std::make_shared<St>(St{v.list,(int64_t)v.list->size()-1});
+            return gen_native(v.b?"reversed":"list_reverseiterator",[st](VMVal& o)->bool{
+                if(st->i<0||st->i>=(int64_t)st->l->size()) return false;
+                o=(*st->l)[(size_t)st->i--];
+                return true;
+            });
+        }
+        if(v.type==VMType::MAP&&v.map&&v.class_name.empty()) return dict_iter(v,0,true);
+        auto items=std::make_shared<std::vector<VMVal>>();
+        VMVal lm,gm;
+        if(v.type==VMType::STRING||v.type==VMType::BYTES){
+            *items=iter_items(v);
+            std::reverse(items->begin(),items->end());
+        } else if(v.type==VMType::INSTANCE&&class_lookup(v.class_name,"__len__",lm)&&class_lookup(v.class_name,"__getitem__",gm)){
+            // an object with __len__ and __getitem__: indexed from the end
+            VMVal n=call_dunder(v,"__len__",{});
+            if(n.type==VMType::INT) for(int64_t i=n.i-1;i>=0;i--) items->push_back(call_dunder(v,"__getitem__",{VMVal::make_int(i)}));
+        } else raise_native_exception("TypeError","'"+vm_type_name(v)+"' object is not reversible");
+        auto pos=std::make_shared<size_t>(0);
+        return gen_native("reversed",[items,pos](VMVal& o)->bool{
+            if(*pos>=items->size()) return false;
+            o=(*items)[(*pos)++];
+            return true;
+        });
+    }
+    // The values of a range of 64-bit ints or a dict view, natively.
+    bool range_or_view_items(const VMVal& v, std::vector<VMVal>& out) {
+        if(v.type!=VMType::INSTANCE) return false;
+        int64_t a,b,s,n;
+        if(range_of(v,a,b,s)){
+            if(!nyrt::range_len(a,b,s,n)) raise_native_exception("OverflowError","Python int too large to convert to C ssize_t");
+            out.reserve(out.size()+(size_t)n);
+            for(int64_t i=0;i<n;i++) out.push_back(VMVal::make_int(nyrt::range_at(a,s,i)));
+            return true;
+        }
+        VMVal d;
+        int k=view_of(v,&d);
+        if(k<0) return false;
+        for(auto& kv:*d.map){
+            if(vm_internal_key(kv.first)) continue;
+            if(k==0) out.push_back(vm_key_value(kv.first));
+            else if(k==1) out.push_back(kv.second);
+            else out.push_back(VMVal::make_tuple({vm_key_value(kv.first),kv.second}));
+        }
+        return true;
+    }
+private:
     // ── Lazy iteration helpers (zip/map/filter/enumerate/islice/any/all) ──
     // An iterator for anything iterable: generators and iterators as they
     // are, objects through __iter__ / __next__, everything else a snapshot.
     VMVal vm_iter_open(const VMVal& v) {
+        { VMVal ni; if(native_iter(v,ni)) return ni; }   // range, dict view, dict: live (round 78)
         switch(v.type){
             case VMType::GENERATOR: case VMType::ITERATOR: return v;
             case VMType::LIST: { std::vector<VMVal> c; if(v.list) c=*v.list; return VMVal::make_iter(std::move(c)); }
@@ -4140,22 +4422,41 @@ private:
     // the interpreter's (src/NyGen.cpp). Over lists they still return lists.
     bool gen_lazy_builtin(const std::string& nm, std::vector<VMVal>& a, VMVal& out) {
         VMVal kw=take_kwargs(a);
-        size_t first = (nm=="map"||nm=="filter") ? 1 : 0;
-        size_t last = nm=="enumerate" ? std::min<size_t>(1,a.size()) : a.size();
-        bool lazy=false;
-        for(size_t i=first;i<last;i++) if(vm_lazy_arg(a[i])||vm_iterator_object(a[i])) lazy=true;
-        if(!lazy){ if(kw.type==VMType::MAP) a.push_back(kw); return false; }
+        // Lazy over every iterable, as Python's (round 78: over lists they
+        // returned lists; only a generator or an iterator object made them
+        // lazy).
         if(nm=="zip"){
+            bool strict=kw.type==VMType::MAP&&kw.map&&kw.map->count("strict")&&(*kw.map)["strict"].is_truthy();
             auto its=std::make_shared<std::vector<VMVal>>();
             for(auto& x : a) its->push_back(vm_iter_open(x));
-            out=gen_native("zip",[this,its](VMVal& o)->bool{
+            out=gen_native("zip",[this,its,strict](VMVal& o)->bool{
                 if(its->empty()) return false;
                 std::vector<VMVal> row;
-                for(auto& it : *its){ VMVal v; if(!vm_iter_step(it,v)) return false; row.push_back(std::move(v)); }
+                for(size_t k=0;k<its->size();k++){
+                    VMVal v;
+                    if(!vm_iter_step((*its)[k],v)){
+                        // strict=True: every argument must end together
+                        // (CPython's zip_next messages, round 78)
+                        if(strict){
+                            if(k>0) raise_native_exception("ValueError","zip() argument "+std::to_string(k+1)+" is shorter than argument"+(k==1?std::string(" "):std::string("s 1-"))+std::to_string(k));
+                            for(size_t j=1;j<its->size();j++){
+                                VMVal w;
+                                if(vm_iter_step((*its)[j],w))
+                                    raise_native_exception("ValueError","zip() argument "+std::to_string(j+1)+" is longer than argument"+(j==1?std::string(" "):std::string("s 1-"))+std::to_string(j));
+                            }
+                        }
+                        return false;
+                    }
+                    row.push_back(std::move(v));
+                }
                 o=VMVal::make_tuple(std::move(row));
                 return true;
             });
             return true;
+        }
+        if(nm=="enumerate"&&a.empty()){
+            if(kw.type==VMType::MAP&&kw.map&&kw.map->count("iterable")) a.push_back((*kw.map)["iterable"]);
+            else raise_native_exception("TypeError","enumerate() missing required argument 'iterable'");
         }
         if(nm=="map"){
             if(a.size()<2) throw_exception(make_exception("TypeError",{VMVal::make_str("map() must have at least two arguments.")}));
@@ -4203,6 +4504,36 @@ private:
     }
     // islice / take, the same on both engines.
     void register_generator_natives() {
+        // The range and dict-view iterators the prelude's range.__iter__ /
+        // __reversed__ and the views use (round 78); a range past 64-bit
+        // ints gets none (the prelude's generator).
+        globals_["_ny_range_iter"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.size()!=3) return VMVal::make_none();
+            for(auto& x:a) if(x.type!=VMType::INT||!x.s.empty()) return VMVal::make_none();
+            if(!nyrt::range_iter_fits(a[0].i,a[1].i,a[2].i)) return VMVal::make_none();
+            return range_iter(a[0].i,a[1].i,a[2].i);
+        });
+        // `a..b` / `a..b..step` (round 78): the list the interpreter's
+        // evalRange builds - its step defaults to -1 when b < a.
+        globals_["_ny_range_list"]=VMVal::make_native([](std::vector<VMVal>& a)->VMVal{
+            std::vector<VMVal> out;
+            if(a.size()>=2&&a[0].type==VMType::INT&&a[1].type==VMType::INT){
+                int64_t s=a[0].i, e=a[1].i;
+                int64_t step=a.size()>=3&&a[2].type==VMType::INT?a[2].i:(s<=e?1:-1);
+                int64_t n=0;
+                if(step!=0&&nyrt::range_len(s,e,step,n))
+                    for(int64_t i=0;i<n;i++) out.push_back(VMVal::make_int(nyrt::range_at(s,step,i)));
+            }
+            return VMVal::make_list(std::move(out));
+        });
+        globals_["_ny_dict_iter"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.size()!=3) raise_native_exception("TypeError","_ny_dict_iter expected 3 arguments");
+            VMVal d=a[0], p;
+            if(any_payload_&&payload_of(d,p)) d=p;
+            if(d.type!=VMType::MAP||!d.map) raise_native_exception("TypeError","a dict is required");
+            int kind=a[1].type==VMType::INT&&a[1].i>=0&&a[1].i<=2?(int)a[1].i:0;
+            return dict_iter(d,kind,a[2].is_truthy());
+        });
         globals_["islice"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()<2||a.size()>4)
                 throw_exception(make_exception("TypeError",{VMVal::make_str("islice expected 2 to 4 arguments, got "+std::to_string(a.size()))}));
@@ -5740,6 +6071,7 @@ private:
         return nyrt::is_builtin_type_name(native_name(v));
     }
     VMVal instantiate(const VMVal& cls, std::vector<VMVal>& args, const VMVal* kwargs=nullptr) {
+        if(range_code_&&cls.code==range_code_) return make_range_val(args,kwargs);   // range() (round 78)
         // type.__call__ (a metaclass's super().__call__) sets the flag for
         // the one instantiation it makes, which must not run the
         // metaclass's __call__ again; nested ones still do
@@ -6004,6 +6336,16 @@ private:
                 if(obj.type!=VMType::INSTANCE&&idx.type==VMType::INSTANCE&&nyrt::shown_class_name(idx.class_name)=="slice"){
                     std::vector<VMVal> parts=slice_parts(idx);
                     push(vm_call_method(obj,"slice",parts)); break;
+                }
+                if(obj.type==VMType::INSTANCE&&(idx.type==VMType::INT||idx.type==VMType::BOOL)&&(idx.type==VMType::BOOL||idx.s.empty())){
+                    // r[i] of a range of 64-bit ints, natively (round 78)
+                    int64_t ra,rb,rs,rn;
+                    if(range_of(obj,ra,rb,rs)&&nyrt::range_len(ra,rb,rs,rn)){
+                        int64_t i=idx.type==VMType::BOOL?(idx.b?1:0):idx.i;
+                        if(i<0) i+=rn;
+                        if(i<0||i>=rn) raise_native_exception("IndexError","range object index out of range");
+                        push(VMVal::make_int(nyrt::range_at(ra,rs,i))); break;
+                    }
                 }
                 if(obj.type==VMType::INSTANCE){bool f=false;VMVal res=call_dunder_f(obj,"__getitem__",{idx},f);if(f){push(res);break;}
                     throw_exception(make_exception("TypeError",{VMVal::make_str("'"+nyrt::shown_class_name(obj.class_name)+"' object is not subscriptable")}));}
@@ -6652,47 +6994,74 @@ private:
 
             // Iteration
             case Op::GET_ITER: {
-                VMVal it=pop();
-                if(it.type==VMType::CLASS&&!class_meta_.empty()){
-                    // a class whose metaclass defines __iter__ (round 77)
-                    VMVal r;
-                    if(meta_call(it,"__iter__",{},r)){
-                        if(r.type==VMType::LIST&&r.list){ std::vector<VMVal> c=*r.list; push(VMVal::make_iter(std::move(c))); }
-                        else push(r);
-                        break;
+                // directly before FOR_ITER (a loop's own iterator): a range or
+                // a dict is walked in place (round 78)
+                bool loop=fr.ip<(int)fr.code->instructions.size()&&fr.code->instructions[fr.ip].op==Op::FOR_ITER;
+                push(loop_iter(pop(),loop)); break;
+            }
+            case Op::FOR_PREP: {
+                // `for x in range(...)` (arg 1-3) / `for ... in d.keys()`,
+                // values(), items() (arg 10-12): see Op::FOR_PREP (round 78)
+                bool loop=fr.ip<(int)fr.code->instructions.size()&&fr.code->instructions[fr.ip].op==Op::FOR_ITER;
+                if(ins.arg>=10){
+                    int k=ins.arg-10;
+                    VMVal obj=pop();
+                    if(loop&&views_ready_&&obj.type==VMType::MAP&&obj.map&&obj.class_name.empty()){ push(stack_dict_iter(obj,k)); break; }
+                    static const char* const names[]={"keys","values","items"};
+                    std::vector<VMVal> none;
+                    VMVal r=vm_call_method(obj,names[k<0||k>2?0:k],none);
+                    push(loop_iter(std::move(r),loop)); break;
+                }
+                int argc=ins.arg;
+                std::vector<VMVal> args(argc);
+                for(int i=argc-1;i>=0;i--) args[i]=pop();
+                VMVal callee=pop();
+                if(loop&&range_code_&&callee.type==VMType::CLASS&&callee.code==range_code_&&argc>=1&&argc<=3){
+                    int64_t b[3]={0,0,1};
+                    bool small=true;
+                    for(int i=0;i<argc&&small;i++){
+                        small=args[i].type==VMType::INT&&args[i].s.empty();
+                        if(small) b[argc==1?1:i]=args[i].i;
                     }
+                    int64_t n;
+                    if(small&&b[2]!=0&&nyrt::range_len(b[0],b[1],b[2],n)){ push(stack_range_iter(b[0],b[2],n)); break; }
                 }
-                if(it.type==VMType::GENERATOR){push(it);break;}
-                if(it.type==VMType::ITERATOR){push(it);break;}
-                if(it.type==VMType::INSTANCE){
-                    // __iter__'s result; else the object itself when it has
-                    // __next__; else a __getitem__ sequence, indexed from 0.
-                    bool f=false;
-                    VMVal iter_res=call_dunder_f(it,"__iter__",{},f);
-                    if(f){
-                        if(iter_res.type==VMType::LIST&&iter_res.list){ std::vector<VMVal> c=*iter_res.list; push(VMVal::make_iter(std::move(c))); }
-                        else push(iter_res);
-                        break;
-                    }
-                    VMVal nx;
-                    if(class_lookup(it.class_name,"__next__",nx)){ push(it); break; }
-                    push(VMVal::make_iter(iter_items(it))); break;
-                }
-                if(it.type==VMType::LIST&&it.list){
-                    std::vector<VMVal> copy=*it.list; push(VMVal::make_iter(std::move(copy))); break;
-                }
-                if((it.type==VMType::MAP&&it.map)||it.type==VMType::STRING){
-                    // a dict's (typed) keys; a string's characters
-                    push(make_iter(it)); break;
-                }
-                // Fallback: use the old make_iter(VMVal&) helper
-                push(make_iter(it)); break;
+                VMVal r=vm_call(callee,args,std::nullopt);
+                push(loop_iter(std::move(r),loop)); break;
             }
             case Op::FOR_ITER: {
                 // NOTE: use index not reference — gen_next/call_dunder may reallocate stack_
                 int it_idx = (int)stack_.size()-1;
                 if(it_idx < 0){ fr.ip=ins.arg; break; }
                 VMType it_type = stack_[it_idx].type;
+                if(it_type==VMType::ITERATOR&&stack_[it_idx].b&&!stack_[it_idx].iter){
+                    // a loop's own range / dict iterator (FOR_PREP, GET_ITER;
+                    // round 78): advanced in place, nothing allocated but the
+                    // value (and an items pair)
+                    VMVal& si=stack_[it_idx];
+                    VMVal nv;
+                    bool got=false;
+                    if(si.s[0]=='r'){
+                        const std::vector<VMVal>& c=*si.list;
+                        if(si.i<c[2].i){ nv=VMVal::make_int(nyrt::range_at(c[0].i,c[1].i,si.i)); si.i++; got=true; }
+                    } else {
+                        VMMap& m=*si.map;
+                        if((double)m.size()!=si.d) raise_native_exception("RuntimeError","dictionary changed size during iteration");
+                        const char kind=si.s[5];   // dict_[k]eyiterator, dict_[v]alueiterator, dict_[i]temiterator
+                        size_t slot=(size_t)si.i, end=m.slot_end();
+                        while(slot<end){
+                            const auto* kv=m.slot_at(slot++);
+                            if(!kv||vm_internal_key(kv->first)) continue;
+                            if(kind=='k') nv=vm_key_value(kv->first);
+                            else if(kind=='v') nv=kv->second;
+                            else nv=VMVal::make_tuple({vm_key_value(kv->first),kv->second});
+                            got=true; break;
+                        }
+                        si.i=(int64_t)slot;
+                    }
+                    if(!got){ pop(); fr.ip=ins.arg; break; }
+                    push(std::move(nv)); break;
+                }
                 if(it_type==VMType::INSTANCE){
                     VMVal it_copy = stack_[it_idx]; // copy since stack may reallocate
                     VMVal nv;
@@ -7704,6 +8073,7 @@ private:
                 // else a __getitem__ sequence indexed from 0 until
                 // IndexError; anything else is not iterable.
                 std::vector<VMVal> out;
+                if(range_or_view_items(v,out)) return out;   // a range or dict view, natively (round 78)
                 bool f=false;
                 VMVal it=call_dunder_f(v,"__iter__",{},f);
                 if(f && it.type!=VMType::INSTANCE) return iter_items(it);
@@ -7931,6 +8301,16 @@ private:
             return false;
         }
         if(cont.type==VMType::INSTANCE){
+            // an int in a range of 64-bit ints in O(1); a key in a keys view
+            // (round 78)
+            if(item.type==VMType::INT||item.type==VMType::BOOL){
+                int64_t ra,rb,rs;
+                if(range_of(cont,ra,rb,rs)){
+                    if(item.type==VMType::INT&&!item.s.empty()) return false;   // past 64 bits: outside
+                    return nyrt::range_has(ra,rb,rs,item.type==VMType::BOOL?(item.b?1:0):item.i);
+                }
+            }
+            { VMVal dv; if(view_of(cont,&dv)==0) return dv.map->count(vkey(item))>0; }
             bool f=false;
             VMVal res=call_dunder_f(cont,"__contains__",{item},f);
             if(f) return vm_truthy(res);
@@ -9515,6 +9895,12 @@ private:
             int64_t n=0; for(auto& kv:mp) if(!vm_internal_key(kv.first)) n++;
             return VMVal::make_int(n);
         }
+        // d.keys() / values() / items(): live views, as Python's (round 78;
+        // they were lists). Nython's d.entries() stays a list of pairs.
+        if(views_ready_&&(m=="keys"||m=="values"||m=="items")&&obj.class_name.empty()){
+            if(!a.empty()) raise_native_exception("TypeError","dict."+m+"() takes no arguments ("+std::to_string(a.size())+" given)");
+            return make_view(obj, m=="keys"?0:m=="values"?1:2);
+        }
         if(m=="keys"||m=="values"||m=="items"||m=="entries"){
             std::vector<VMVal> r;
             for(auto& [k,v]:mp){
@@ -10614,6 +11000,7 @@ private:
             }
             const VMVal& v=a[0];
             if(v.type==VMType::GENERATOR||v.type==VMType::ITERATOR) return v;
+            { VMVal ni; if(native_iter(v,ni)) return ni; }   // range, dict view, dict (round 78)
             if(v.type==VMType::INSTANCE){
                 bool f=false;
                 VMVal r=call_dunder_f(v,"__iter__",{},f);
@@ -10687,6 +11074,11 @@ private:
                 if(result.is_truthy()) r.push_back(item);}
             return VMVal::make_list(std::move(r));});
         globals_["reduce"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            // any other iterable - a lazy map/filter/zip, a range, a dict
+            // view, a generator - is read first (round 78: reduce(f, map(...))
+            // gave none once map() became lazy)
+            if(a.size()>=2&&a[1].type!=VMType::LIST&&a[1].type!=VMType::NONE&&a[1].type!=VMType::UNDEFINED)
+                a[1]=VMVal::make_list(iter_items(a[1]));
             if(a.size()<2||a[1].type!=VMType::LIST||!a[1].list||vm_arg_list(a,1).empty())
                 return VMVal::make_none();
             auto& lst=vm_arg_list(a,1);
@@ -11293,7 +11685,17 @@ private:
                 case VMType::BYTES: return VMVal::make_int((int64_t)v.bdata().size());
                 case VMType::LIST: return VMVal::make_int(v.list?(int64_t)v.list->size():0);
                 case VMType::MAP: { int64_t n=0; if(v.map) for(auto& kv:*v.map) if(!vm_internal_key(kv.first)) n++; return VMVal::make_int(n); }
-                case VMType::INSTANCE: { VMVal r=vm->call_dunder(v,"__len__",{}); if(r.type!=VMType::NONE) return r; break; }
+                case VMType::INSTANCE: {
+                    // a range of 64-bit ints or a dict view, natively (round 78)
+                    int64_t ra,rb,rs,rn;
+                    if(vm->range_of(v,ra,rb,rs)){
+                        if(!nyrt::range_len(ra,rb,rs,rn)) vm->raise_native_exception("OverflowError","Python int too large to convert to C ssize_t");
+                        return VMVal::make_int(rn);
+                    }
+                    VMVal dv;
+                    if(vm->view_of(v,&dv)>=0){ int64_t n=0; for(auto& kv:*dv.map) if(!vm_internal_key(kv.first)) n++; return VMVal::make_int(n); }
+                    VMVal r=vm->call_dunder(v,"__len__",{}); if(r.type!=VMType::NONE) return r; break;
+                }
                 // a class whose metaclass defines __len__ (round 77)
                 case VMType::CLASS: { VMVal r; if(!vm->class_meta_.empty()&&vm->meta_call(v,"__len__",{},r)) return r; break; }
                 case VMType::ITERATOR: return VMVal::make_int(v.iter?(int64_t)v.iter->second.size()-v.iter->first:0);
@@ -11544,9 +11946,7 @@ private:
             if(a[0].type==VMType::INSTANCE){ VMVal r=vm->call_dunder(a[0],"__reversed__",{}); if(r.type!=VMType::NONE) return r; }
             // a class whose metaclass defines __reversed__: reversed(Color) (round 77)
             if(a[0].type==VMType::CLASS){ VMVal r; if(vm->meta_call(a[0],"__reversed__",{},r)) return r; }
-            std::vector<VMVal> items=vm->iter_items(a[0]);
-            std::reverse(items.begin(),items.end());
-            return VMVal::make_list(std::move(items));
+            return vm->reversed_iter(a[0]);
         });
         def("list",[vm](std::vector<VMVal>& a,const VMVal&)->VMVal{
             if(a.empty()) return VMVal::make_list();
@@ -12172,7 +12572,12 @@ private:
             if(a.empty()) return VMVal::make_list();
             // A dict answers as d.keys() does (typed keys, none values kept,
             // pairs as tuples), like the interpreter's builtin.
-            if(a[0].type==VMType::MAP&&a[0].map){ std::vector<VMVal> none; return call_map_method(a[0],"keys",none); }
+            if(a[0].type==VMType::MAP&&a[0].map){
+                // Nython's keys(d) stays a list (d.keys() is a live view, round 78)
+                std::vector<VMVal> none, items; VMVal r=call_map_method(a[0],"keys",none);
+                if(range_or_view_items(r,items)) return VMVal::make_list(std::move(items));
+                return r;
+            }
             if((a[0].type==VMType::MAP||a[0].type==VMType::INSTANCE)&&a[0].map){
                 std::vector<VMVal> ks;
                 for(auto& [k,v]:*a[0].map) if(v.type!=VMType::NONE) ks.push_back(VMVal::make_str(k));
@@ -12183,7 +12588,12 @@ private:
             if(a.empty()) return VMVal::make_list();
             // A dict answers as d.values() does (typed keys, none values kept,
             // pairs as tuples), like the interpreter's builtin.
-            if(a[0].type==VMType::MAP&&a[0].map){ std::vector<VMVal> none; return call_map_method(a[0],"values",none); }
+            if(a[0].type==VMType::MAP&&a[0].map){
+                // Nython's values(d) stays a list (d.values() is a live view, round 78)
+                std::vector<VMVal> none, items; VMVal r=call_map_method(a[0],"values",none);
+                if(range_or_view_items(r,items)) return VMVal::make_list(std::move(items));
+                return r;
+            }
             if((a[0].type==VMType::MAP||a[0].type==VMType::INSTANCE)&&a[0].map){
                 std::vector<VMVal> vs;
                 for(auto& [k,v]:*a[0].map) if(v.type!=VMType::NONE) vs.push_back(v);
@@ -12194,7 +12604,12 @@ private:
             if(a.empty()) return VMVal::make_list();
             // A dict answers as d.items() does (typed keys, none values kept,
             // pairs as tuples), like the interpreter's builtin.
-            if(a[0].type==VMType::MAP&&a[0].map){ std::vector<VMVal> none; return call_map_method(a[0],"items",none); }
+            if(a[0].type==VMType::MAP&&a[0].map){
+                // Nython's items(d) stays a list (d.items() is a live view, round 78)
+                std::vector<VMVal> none, items; VMVal r=call_map_method(a[0],"items",none);
+                if(range_or_view_items(r,items)) return VMVal::make_list(std::move(items));
+                return r;
+            }
             if((a[0].type==VMType::MAP||a[0].type==VMType::INSTANCE)&&a[0].map){
                 std::vector<VMVal> its;
                 for(auto& [k,v]:*a[0].map){
@@ -12540,6 +12955,7 @@ private:
         case Op::STORE_SELF:   return "STORE_SELF";
         case Op::INPLACE_TRY:  return "INPLACE_TRY";
         case Op::DEFINE_OUTER: return "DEFINE_OUTER";
+        case Op::FOR_PREP:     return "FOR_PREP";   // round 78
         case Op::STORE_GLOBAL_NAME: return "STORE_GLOBAL_NAME";
         case Op::JUMP_IF_NONE_KEEP: return "JUMP_IF_NONE_KEEP";
         case Op::JUMP_IF_MISSING_KEEP: return "JUMP_IF_MISSING_KEEP";

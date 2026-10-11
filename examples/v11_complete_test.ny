@@ -61,7 +61,7 @@ var data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 var evens_sq = sum(map(lambda x: x * x, filter(lambda x: x % 2 == 0, data)))
 t("pipeline", evens_sq, 220)
 var names = ["alice", "bob"]
-var uppers = map(lambda s: s.upper(), names)
+var uppers = list(map(lambda s: s.upper(), names))
 t("map_str", str(uppers), "['ALICE', 'BOB']")
 
 print "=== WITH __enter__/__exit__ ==="

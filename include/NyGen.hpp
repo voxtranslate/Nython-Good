@@ -114,6 +114,16 @@ bool contains_iter(NythonExecutor& E, const Value& v, const Value& x, Context* c
 Value make_iter(NythonExecutor& E, const Value& v, Context* ctx);
 // iter(fn, sentinel): calls fn() until it returns the sentinel (round 77).
 Value make_callable_iter(NythonExecutor& E, const Value& fn, const Value& sentinel);
+// Round 78: a range_iterator of n 64-bit ints from `first` by `step`; a live
+// iterator over a dict's keys (kind 0), values (1) or items (2), forwards or
+// backwards (nyrt::dict_iter_name), raising "dictionary changed size during
+// iteration"; reversed(v) of a list (list_reverseiterator), tuple, str,
+// bytes (reversed) or dict (false: none of those); an iterator over values
+// already collected.
+Value make_range_iter(NythonExecutor& E, int64_t first, int64_t step, int64_t n);
+Value make_dict_iter(NythonExecutor& E, const Value& dict, int kind, bool rev);
+bool make_reversed(NythonExecutor& E, const Value& v, Context* ctx, Value& out);
+Value make_vec_iter(NythonExecutor& E, std::vector<Value> items, const char* name);
 // A generator's attributes (round 77): __name__, __qualname__, gi_running,
 // gi_suspended, gi_frame, gi_code, gi_yieldfrom. False: not one of them.
 bool attr(NythonExecutor& E, const Value& obj, const std::string& name, Value& out);

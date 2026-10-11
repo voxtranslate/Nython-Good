@@ -29,16 +29,14 @@
 #
 # Registered, as CPython does: tuple, str, range -> Sequence; list,
 # bytearray -> MutableSequence; bytes, bytearray -> ByteString; dict ->
-# MutableMapping; frozenset -> Set; set -> MutableSet; generators ->
+# MutableMapping; frozenset -> Set; set -> MutableSet; dict_keys ->
+# KeysView, dict_items -> ItemsView, dict_values -> ValuesView,
+# mappingproxy -> Mapping (round 78: they were lists); generators ->
 # Generator, the lazy iterators -> Iterator, async generators ->
 # AsyncGenerator (lib/abc.ny's stand-ins for the kinds without a type
 # object); collections' own types are registered by lib/collections.
 #
 # Where the engines differ from CPython (so these answers differ):
-#   - range(), dict.keys()/values()/items(), map(), zip() over lists and
-#     filter() return lists, so they are MutableSequences (not KeysView,
-#     ItemsView, ...); there are no distinct dict view or mappingproxy types
-#     to register.
 #   - Coroutine objects are task handles (ints), so a coroutine is not an
 #     Awaitable/Coroutine instance; a class defining __await__ is.
 #   - memoryview does not exist (not registered).
@@ -858,6 +856,14 @@ class ValuesView(MappingView, Collection):
     def __iter__(self):
         for key in self._mapping:
             yield self._mapping[key]
+
+
+# The dict views and mappingproxy are types of their own (round 78; the
+# prelude's), registered as CPython registers them.
+KeysView.register(dict_keys)
+ItemsView.register(dict_items)
+ValuesView.register(dict_values)
+Mapping.register(mappingproxy)
 
 
 # MutableMapping.pop's "no default given"

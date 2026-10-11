@@ -82,14 +82,14 @@ check("bool nonempty list", bool([1]), true)
 
 # ── enumerate / zip patterns ──────────────────────────────────────
 var items = ["a", "b", "c"]
-var indexed = enumerate(items)
+var indexed = list(enumerate(items))
 check("enumerate 0", indexed[0][0], 0)
 check("enumerate val", indexed[0][1], "a")
 check("enumerate 2", indexed[2][0], 2)
 
 var la = [1, 2, 3]
 var lb = ["x", "y", "z"]
-var zipped = zip(la, lb)
+var zipped = list(zip(la, lb))
 check("zip 0", zipped[0][0], 1)
 check("zip str", zipped[1][1], "y")
 

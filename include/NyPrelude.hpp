@@ -544,6 +544,372 @@ class slice:
     def __repr__(self):
         return "slice(" + repr(self.start) + ", " + repr(self.stop) + ", " + repr(self.step) + ")"
 
+# ── range, dict views, mappingproxy (round 78) ────────────────────────────
+# range() and d.keys()/values()/items() returned lists. They are Python's
+# types now, on both engines. The engines make them natively (range() checks
+# its arguments as CPython's range_new does; d.keys() makes a view holding
+# the dict in _ny_mapping), and iterate them, take their len, test `in` and
+# index a range of 64-bit ints without calling these methods: the methods
+# are the general case (ints of any size, slices, set operations) and what
+# Python code reaches directly (r.__len__(), KeysView mixins ...).
+# _ny_range_iter(first, step, n) and _ny_dict_iter(d, kind, reverse) are the
+# engines' native iterators (a range_iterator of 64-bit ints, none past
+# them; a live dict_keyiterator / dict_valueiterator / dict_itemiterator).
+
+def _ny_rlen(start, stop, step):
+    # how many ints range(start, stop, step) holds (CPython's
+    # compute_range_length, any size)
+    if step > 0:
+        if start < stop:
+            return (stop - start - 1) // step + 1
+        return 0
+    if start > stop:
+        return (start - stop - 1) // (0 - step) + 1
+    return 0
+
+def _ny_rhas(start, stop, step, x):
+    # x in range(start, stop, step) for an int x, in O(1)
+    if step > 0:
+        if x < start or x >= stop:
+            return False
+    elif x > start or x <= stop:
+        return False
+    return (x - start) % step == 0
+
+def _ny_rint(x):
+    # what range's methods take arithmetically: an int or a bool, exactly
+    return type(x) is int or type(x) is bool
+
+def _ny_longrange(first, step, n):
+    # iterating a range past 64-bit ints (CPython's longrange_iterator)
+    var i = 0
+    while i < n:
+        yield first + i * step
+        i += 1
+
+class range:
+    # range(stop) / range(start, stop[, step]): CPython's rangeobject.c - a
+    # lazy, immutable sequence of ints of any size; start/stop/step are
+    # read-only. Made by the engines (there is no __init__ to call).
+    def __setattr__(self, name, value):
+        if name == "start" or name == "stop" or name == "step":
+            raise AttributeError("readonly attribute")
+        raise AttributeError("'range' object has no attribute '" + name + "'")
+
+    def __delattr__(self, name):
+        if name == "start" or name == "stop" or name == "step":
+            raise AttributeError("readonly attribute")
+        raise AttributeError("'range' object has no attribute '" + name + "'")
+
+    def __len__(self):
+        var n = _ny_rlen(self.start, self.stop, self.step)
+        if n > 9223372036854775807:
+            raise OverflowError("Python int too large to convert to C ssize_t")
+        return n
+
+    def __bool__(self):
+        return _ny_rlen(self.start, self.stop, self.step) != 0
+
+    def __iter__(self):
+        var n = _ny_rlen(self.start, self.stop, self.step)
+        var it = _ny_range_iter(self.start, self.step, n)
+        return _ny_longrange(self.start, self.step, n) if it is None else it
+
+    def __reversed__(self):
+        var n = _ny_rlen(self.start, self.stop, self.step)
+        var first = self.start + (n - 1) * self.step
+        var it = _ny_range_iter(first, 0 - self.step, n)
+        return _ny_longrange(first, 0 - self.step, n) if it is None else it
+
+    def __contains__(self, x):
+        if _ny_rint(x):
+            return _ny_rhas(self.start, self.stop, self.step, x)
+        for v in self:
+            if v is x or v == x:
+                return True
+        return False
+
+    def index(self, x):
+        if _ny_rint(x):
+            if _ny_rhas(self.start, self.stop, self.step, x):
+                return (x - self.start) // self.step
+            raise ValueError(repr(x) + " is not in range")
+        var i = 0
+        for v in self:
+            if v is x or v == x:
+                return i
+            i += 1
+        raise ValueError("sequence.index(x): x not in sequence")
+
+    def count(self, x):
+        if _ny_rint(x):
+            return 1 if _ny_rhas(self.start, self.stop, self.step, x) else 0
+        var c = 0
+        for v in self:
+            if v is x or v == x:
+                c += 1
+        return c
+
+    def __getitem__(self, i):
+        var n = _ny_rlen(self.start, self.stop, self.step)
+        if isinstance(i, slice):
+            var t = i.indices(n)
+            return range(self.start + t[0] * self.step, self.start + t[1] * self.step, self.step * t[2])
+        if not _ny_rint(i):
+            if hasattr(i, "__index__"):
+                i = i.__index__()
+            else:
+                raise TypeError("range indices must be integers or slices, not " + type(i).__name__)
+        if i < 0:
+            i = i + n
+        if i < 0 or i >= n:
+            raise IndexError("range object index out of range")
+        return self.start + i * self.step
+
+    def __eq__(self, other):
+        # by the sequence it describes: range(0) == range(2, 2)
+        if not isinstance(other, range):
+            return NotImplemented
+        if self is other:
+            return True
+        var n = _ny_rlen(self.start, self.stop, self.step)
+        if n != _ny_rlen(other.start, other.stop, other.step):
+            return False
+        if n == 0:
+            return True
+        if self.start != other.start:
+            return False
+        return n == 1 or self.step == other.step
+
+    def __ne__(self, other):
+        var r = self.__eq__(other)
+        return r if r is NotImplemented else not r
+
+    def __hash__(self):
+        var n = _ny_rlen(self.start, self.stop, self.step)
+        if n == 0:
+            return hash((0, None, None))
+        if n == 1:
+            return hash((1, self.start, None))
+        return hash((n, self.start, self.step))
+
+    def __repr__(self):
+        if self.step == 1:
+            return "range(" + repr(self.start) + ", " + repr(self.stop) + ")"
+        return "range(" + repr(self.start) + ", " + repr(self.stop) + ", " + repr(self.step) + ")"
+
+    def __reduce__(self):
+        return (range, (self.start, self.stop, self.step))
+
+def _ny_view_contains(v, x):
+    # x in a dict view (dict_items: a (key, value) pair whose key is there
+    # with an equal value)
+    var d = v._ny_mapping
+    if isinstance(v, dict_items):
+        if not isinstance(x, tuple) or len(x) != 2:
+            return False
+        if x[0] not in d:
+            return False
+        var found = d[x[0]]
+        return found is x[1] or found == x[1]
+    return x in d
+
+def _ny_view_setlike(o):
+    return isinstance(o, (set, frozenset, dict_keys, dict_items))
+
+def _ny_view_all_in(a, b):
+    for x in a:
+        if x not in b:
+            return False
+    return True
+
+def _ny_view_cmp(v, other, op):
+    # dictview_richcompare: views of keys and items compare as sets with
+    # sets and with each other
+    if not _ny_view_setlike(other):
+        return NotImplemented
+    var a = len(v)
+    var b = len(other)
+    if op == "==":
+        return a == b and _ny_view_all_in(v, other)
+    if op == "!=":
+        return not (a == b and _ny_view_all_in(v, other))
+    if op == "<":
+        return a < b and _ny_view_all_in(v, other)
+    if op == "<=":
+        return a <= b and _ny_view_all_in(v, other)
+    if op == ">":
+        return a > b and _ny_view_all_in(other, v)
+    return a >= b and _ny_view_all_in(other, v)
+
+def _ny_view_and(v, other):
+    # elements of other that are in the view (CPython's _PyDictView_Intersect)
+    var out = set()
+    for x in other:
+        if _ny_view_contains(v, x):
+            out.add(x)
+    return out
+
+def _ny_view_isdisjoint(v, other):
+    for x in other:
+        if _ny_view_contains(v, x):
+            return False
+    return True
+
+class _NyDictSetView:
+    # what dict_keys and dict_items share: the Set operations (a set
+    # results, as in CPython), comparisons with sets, isdisjoint
+    __hash__ = None
+    def __len__(self):
+        return len(self._ny_mapping)
+    def __contains__(self, x):
+        return _ny_view_contains(self, x)
+    def __eq__(self, other):
+        return _ny_view_cmp(self, other, "==")
+    def __ne__(self, other):
+        return _ny_view_cmp(self, other, "!=")
+    def __lt__(self, other):
+        return _ny_view_cmp(self, other, "<")
+    def __le__(self, other):
+        return _ny_view_cmp(self, other, "<=")
+    def __gt__(self, other):
+        return _ny_view_cmp(self, other, ">")
+    def __ge__(self, other):
+        return _ny_view_cmp(self, other, ">=")
+    def __and__(self, other):
+        return _ny_view_and(self, other)
+    def __rand__(self, other):
+        return _ny_view_and(self, other)
+    def __or__(self, other):
+        var s = set(self)
+        s.update(other)
+        return s
+    def __ror__(self, other):
+        var s = set(other)
+        s.update(self)
+        return s
+    def __sub__(self, other):
+        var s = set(self)
+        s.difference_update(other)
+        return s
+    def __rsub__(self, other):
+        var s = set(other)
+        s.difference_update(self)
+        return s
+    def __xor__(self, other):
+        var s = set(self)
+        s.symmetric_difference_update(other)
+        return s
+    def __rxor__(self, other):
+        var s = set(other)
+        s.symmetric_difference_update(self)
+        return s
+    def isdisjoint(self, other):
+        return _ny_view_isdisjoint(self, other)
+    @property
+    def mapping(self):
+        return mappingproxy(self._ny_mapping)
+
+class dict_keys(_NyDictSetView):
+    # d.keys(): a live view of the dict's keys
+    def __iter__(self):
+        return _ny_dict_iter(self._ny_mapping, 0, False)
+    def __reversed__(self):
+        return _ny_dict_iter(self._ny_mapping, 0, True)
+    def __repr__(self):
+        return "dict_keys(" + repr(list(self)) + ")"
+
+class dict_items(_NyDictSetView):
+    # d.items(): a live view of (key, value) pairs
+    def __iter__(self):
+        return _ny_dict_iter(self._ny_mapping, 2, False)
+    def __reversed__(self):
+        return _ny_dict_iter(self._ny_mapping, 2, True)
+    def __repr__(self):
+        return "dict_items(" + repr(list(self)) + ")"
+
+class dict_values:
+    # d.values(): a live view of the values (not a Set; == is identity)
+    def __len__(self):
+        return len(self._ny_mapping)
+    def __iter__(self):
+        return _ny_dict_iter(self._ny_mapping, 1, False)
+    def __reversed__(self):
+        return _ny_dict_iter(self._ny_mapping, 1, True)
+    def __repr__(self):
+        return "dict_values(" + repr(list(self)) + ")"
+    @property
+    def mapping(self):
+        return mappingproxy(self._ny_mapping)
+
+class mappingproxy:
+    # types.MappingProxyType (lib/types.ny names it): a read-only, live view
+    # of a mapping - a dict view's .mapping
+    def __init__(self, mapping):
+        if not (isinstance(mapping, dict) or (hasattr(mapping, "keys") and hasattr(mapping, "__getitem__"))) or isinstance(mapping, (list, tuple, str)):
+            raise TypeError("mappingproxy() argument must be a mapping, not " + type(mapping).__name__)
+        object.__setattr__(self, "_ny_mapping", mapping)
+    def __getitem__(self, key):
+        return self._ny_mapping[key]
+    def __setitem__(self, key, value):
+        raise TypeError("'mappingproxy' object does not support item assignment")
+    def __delitem__(self, key):
+        raise TypeError("'mappingproxy' object does not support item deletion")
+    def __setattr__(self, name, value):
+        raise AttributeError("'mappingproxy' object has no attribute '" + name + "'")
+    def __delattr__(self, name):
+        raise AttributeError("'mappingproxy' object has no attribute '" + name + "'")
+    def get(self, key, default=None):
+        var m = self._ny_mapping
+        if isinstance(m, dict):
+            return m[key] if key in m else default
+        return m.get(key, default)
+    def keys(self):
+        return self._ny_mapping.keys()
+    def values(self):
+        return self._ny_mapping.values()
+    def items(self):
+        return self._ny_mapping.items()
+    def copy(self):
+        var m = self._ny_mapping
+        if isinstance(m, dict):
+            return dict(m)
+        return m.copy()
+    def __len__(self):
+        return len(self._ny_mapping)
+    def __contains__(self, key):
+        return key in self._ny_mapping
+    def __iter__(self):
+        return iter(self._ny_mapping)
+    def __reversed__(self):
+        return reversed(self._ny_mapping)
+    def __eq__(self, other):
+        if isinstance(other, mappingproxy):
+            other = other._ny_mapping
+        return self._ny_mapping == other
+    def __ne__(self, other):
+        return not self.__eq__(other)
+    def __or__(self, other):
+        if isinstance(other, mappingproxy):
+            other = other._ny_mapping
+        var d = dict(self._ny_mapping)
+        for k in list(other.keys()):
+            d[k] = other[k]
+        return d
+    def __ror__(self, other):
+        var d = dict(other)
+        for k in list(self._ny_mapping.keys()):
+            d[k] = self._ny_mapping[k]
+        return d
+    def __ior__(self, other):
+        raise TypeError("'|=' is not supported by mappingproxy; use '|' instead")
+    def __hash__(self):
+        return hash(tuple(sorted([repr(k) for k in self._ny_mapping.keys()])))
+    def __repr__(self):
+        return "mappingproxy(" + repr(self._ny_mapping) + ")"
+    def __str__(self):
+        return str(self._ny_mapping)
+
 class _NyCode:
     # what compile(source, filename, mode) returns; eval() / exec() run it
     def __init__(self, source, filename, mode):

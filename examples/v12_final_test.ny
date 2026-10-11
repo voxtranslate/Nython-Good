@@ -38,7 +38,7 @@ class Item:
 var items = [Item("Apple", 1), Item("Banana", 2), Item("Cherry", 5)]
 var total = reduce(lambda a, b: a + b.price, items, 0)
 t("obj_reduce", total, 8)
-var expensive = filter(lambda i: i.price > 1, items)
+var expensive = list(filter(lambda i: i.price > 1, items))
 t("obj_filter", len(expensive), 2)
 
 print "=== RECURSION ==="
@@ -71,7 +71,7 @@ class Rect(Shape):
     def area(self):
         return self.w * self.h
 var shapes = [Circle(5), Rect(3, 4), Circle(10)]
-var areas = map(lambda s: s.area(), shapes)
+var areas = list(map(lambda s: s.area(), shapes))
 t("poly_areas", str(areas), "[78, 12, 314]")
 t("poly_total", sum(areas), 404)
 

@@ -328,6 +328,15 @@ Value dispatch_core(NythonExecutor& E,
         // ===================== MAP / FILTER / REDUCE =====================
         if (name == "reduce") {
             // reduce(fn, list[, initial])
+            // any other iterable - a lazy map/filter/zip, a range, a dict
+            // view, a generator - is read first (round 78: map() and filter()
+            // are lazy now, and reduce(f, map(...)) gave none)
+            if (args.size() >= 2 && args[0].type == ValueType::USERDATA) {
+                Container* lc = E.contOf(args[1]);
+                bool seq = lc && NythonExecutor::seqLen(lc) >= 0 && !nygen::is_gen(args[1]);
+                if (!seq && (lc || E.isInstanceValue(args[1]) || E.isStringValue(args[1])))
+                    args[1] = E.makeListValue(E.iterItems(args[1], ctx));
+            }
             if (args.size() >= 2 && args[0].type == ValueType::USERDATA && args[1].isCollectable()) {
                 auto* cont = dynamic_cast<Container*>(args[1].value.gc);
                 if (cont && cont->container) {
@@ -443,7 +452,13 @@ Value dispatch_core(NythonExecutor& E,
                 std::vector<Value> none;
                 static const nyrt::OrderedKw<Value> nokw;
                 Value r;
-                if (E.dictMethod(dc, args[0], name, none, nokw, ctx, r)) return r;
+                if (E.dictMethod(dc, args[0], name, none, nokw, ctx, r)) {
+                    // Nython's keys(d) / values(d) / items(d) stay lists:
+                    // d.keys() is a live view since round 78
+                    std::vector<Value> items;
+                    if (E.rangeOrViewItems(r, items)) return E.makeListValue(items);
+                    return r;
+                }
             }
         }
         if (name == "keys") {

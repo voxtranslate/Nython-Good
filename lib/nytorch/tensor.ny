@@ -1298,7 +1298,7 @@ class _Torch:
         return save_tensors(obj, path)
     def load(self, path):
         var m = load_tensors(path)
-        var keys = m.keys()
+        var keys = list(m.keys())
         if len(keys) == 1 and keys[0] == "tensor":
             return m["tensor"]
         return m

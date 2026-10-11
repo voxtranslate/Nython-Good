@@ -187,7 +187,7 @@ class Inspector:
                               str(len(v) - self.max_children) + " more items",
                               self.icons.get("ellipsis"), depth + 1, false))
         elif t == "map" or t == "dict":
-            var keys = v.keys()
+            var keys = list(v.keys())
             var m = len(keys)
             if m > self.max_children:
                 m = self.max_children

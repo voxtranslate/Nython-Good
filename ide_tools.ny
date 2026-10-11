@@ -2862,7 +2862,7 @@ class IDETools(IDEViews):
             return
         var key = self.doc().path + ":" + str(self.buf().cursor_row + 1)
         var m = {}
-        var ks = self.dbg_breaks.keys()
+        var ks = list(self.dbg_breaks.keys())
         var i = 0
         while i < len(ks):
             m[ks[i]] = self.dbg_breaks[ks[i]]

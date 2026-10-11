@@ -231,7 +231,7 @@ t("sum", sum([1,2,3,4,5]), 15)
 t("len_str", len("hello"), 5)
 t("len_list", len([1,2,3]), 3)
 t("sorted", str(sorted([3,1,4,1,5])), "[1, 1, 3, 4, 5]")
-t("reversed", str(reversed([1,2,3])), "[3, 2, 1]")
+t("reversed", str(list(reversed([1,2,3]))), "[3, 2, 1]")
 t("type_int", type(42) == "int", true)
 t("type_str", type("hi") == "string", true)
 t("type_list", type([1,2,3]) == "list", true)
@@ -240,9 +240,9 @@ t("chr_ord", chr(65), "A")
 t("ord_chr", ord("A"), 65)
 
 print "=== ENUMERATE / ZIP ==="
-var en = enumerate(["a", "b", "c"])
+var en = list(enumerate(["a", "b", "c"]))
 t("enum_len", len(en), 3)
-var zp = zip([1,2,3], ["a","b","c"])
+var zp = list(zip([1,2,3], ["a","b","c"]))
 t("zip_len", len(zp), 3)
 
 print "=== SWAP & MULTI-ASSIGN ==="
