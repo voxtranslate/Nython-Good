@@ -62,31 +62,40 @@ class Restart(Exception):
 
 
 def find_function(funcname, filename):
-    cre = re.compile(r"def\s+%s\s*[(]" % re.escape(funcname))
-    try:
-        fp = open(filename)
-    except OSError:
-        return None
-    try:
-        lineno = 0
-        for line in fp.read().split("\n"):
-            lineno += 1
-            if cre.match(line):
-                return funcname, filename, lineno
-    finally:
-        fp.close()
+    # (3.13) the function's first statement, where a breakpoint on it stops
+    cre = re.compile(r"def\s+%s(\s*\[.+\])?\s*[(]" % re.escape(funcname))
+    lines = linecache.getlines(filename)
+    if not lines:
+        try:
+            fp = open(filename)
+        except OSError:
+            return None
+        try:
+            lines = [ln + "\n" for ln in fp.read().split("\n")]
+        finally:
+            fp.close()
+    for i in range(len(lines)):
+        if cre.match(lines[i]):
+            return funcname, filename, _first_statement_line(lines, i)
     return None
 
 
 def find_first_executable_line(code):
-    # (3.13) the line of a function's first statement - after its header
-    # (which may span lines) and its docstring - where a breakpoint set on
-    # the function stops; CPython reads it from the bytecode after RESUME,
-    # this from the source
+    # (3.13) the line of a function's first statement, where a breakpoint
+    # set on the function stops; CPython reads it from the bytecode after
+    # RESUME, this from the source
     lines = linecache.getlines(code.co_filename)
     i = code.co_firstlineno - 1
     if i < 0 or i >= len(lines):
         return code.co_firstlineno
+    return _first_statement_line(lines, i)
+
+
+def _first_statement_line(lines, i):
+    # lines[i] is a def (or a decorator before one): the 1-based line of the
+    # first statement of its body - past a header spread over lines and a
+    # docstring; the def's own line for a one-line body
+    first_line = i + 1
     while i < len(lines) and lines[i].lstrip().startswith("@"):
         i += 1
     depth = 0
@@ -101,7 +110,7 @@ def find_first_executable_line(code):
         if depth <= 0 and text.endswith(":"):
             break
         if depth <= 0 and ":" in text:
-            return code.co_firstlineno   # a one-line body: def f(): return 1
+            return first_line   # def f(): return 1
     in_doc = None
     first = True
     while i < len(lines):
@@ -124,7 +133,7 @@ def find_first_executable_line(code):
             if body[:1] in ('"', "'") and len(body) > 1 and body.rstrip()[-1:] == body[:1]:
                 continue
         return i
-    return code.co_firstlineno
+    return first_line
 
 
 class _rstr:

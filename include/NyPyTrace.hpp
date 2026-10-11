@@ -19,6 +19,7 @@
 // (run_frame). With no hook set nothing else is done.
 #pragma once
 #include <cstdint>
+#include <string>
 
 namespace nytrace {
 
@@ -26,5 +27,18 @@ enum : uint8_t { TRACE = 1, PROFILE = 2, VMDEBUG = 4, ANY = TRACE | PROFILE };
 
 inline thread_local uint8_t t_hooks = 0;
 inline thread_local bool t_in_hook = false;
+
+// A builtin that is a type in Python - calling it makes an object, no
+// c_call event there (str(5), list(xs), zip(a, b)) - or Nython's own
+// method behind a subscript (xs[1:] calls the list's slice): the profile
+// function is not told.
+inline bool no_c_call(const std::string& n) {
+    static const char* const names[] = {"int", "float", "str", "bool", "list", "dict", "tuple", "set", "frozenset",
+                                        "bytes", "bytearray", "complex", "object", "type", "slice", "range",
+                                        "map", "enumerate", "zip", "filter", "reversed", "super", "property",
+                                        "staticmethod", "classmethod", "memoryview"};
+    for (const char* x : names) if (n == x) return true;
+    return false;
+}
 
 }  // namespace nytrace

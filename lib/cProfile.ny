@@ -208,7 +208,9 @@ class Profile:
         elif event == "return":
             self._leave(t)
         elif event == "c_call":
-            if self.builtins:
+            # (disable()'s own sys.setprofile(None) is not counted: _lsprof's
+            # disable is C and calls nothing)
+            if self.builtins and getattr(arg, "__name__", "") != "setprofile":
                 lbl = _builtin_label(arg)
                 self._enter(("~", 0, lbl), lbl, t)
         elif event == "c_return" or event == "c_exception":

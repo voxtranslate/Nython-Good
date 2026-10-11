@@ -529,12 +529,13 @@ def main():
                      help="Keep track of caller/called pairs and write the results to "
                           "sys.stdout after the program exits.")
     grp = parser.add_argument_group("Modifiers")
-    grp.add_argument("-r", "--report", action="store_true",
+    _grp = grp.add_mutually_exclusive_group()
+    _grp.add_argument("-r", "--report", action="store_true",
                      help="Generate a report from a counts file; does not execute any "
                           "code. --file must specify the results file to read, which "
                           "must have been created in a previous run with --count "
                           "--file=FILE")
-    grp.add_argument("-R", "--no-report", action="store_true",
+    _grp.add_argument("-R", "--no-report", action="store_true",
                      help="Do not generate the coverage report files. "
                           "Useful if you want to accumulate over several runs.")
     grp.add_argument("-f", "--file", help="File to accumulate counts over several runs")
@@ -562,8 +563,6 @@ def main():
     parser.add_argument("progname", nargs="?", help="file to run as main program")
     parser.add_argument("arguments", nargs=argparse.REMAINDER, help="arguments to the program")
     opts = parser.parse_args()
-    if opts.report and opts.no_report:
-        parser.error("argument -R/--no-report: not allowed with argument -r/--report")
     ignore_module = []
     for i in opts.ignore_module:
         for mod in i.split(","):

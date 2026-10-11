@@ -4298,36 +4298,41 @@ public:   // NythonExecutor is a struct: members default to public
         std::string sep = " ", end = "\n";
         if (pn->sep) { Value sv = evalNode(pn->sep, ctx); if (!sv.isNone()) sep = getStringValue(sv); }
         if (pn->end) { Value ev = evalNode(pn->end, ctx); if (!ev.isNone()) end = getStringValue(ev); }
-        {
-            // sys.stdout replaced (contextlib.redirect_stdout, a StringIO):
-            // the line goes to its write(), as Python's print does
-            Value target;
-            if (stdoutRedirected(target)) {
-                std::string line;
-                for (size_t i = 0; i < vals.size(); i++) { if (i > 0) line += sep; line += strOf(vals[i], ctx); }
-                line += end;
-                std::vector<Value> wa{makeStringValue(line)};
-                callMethod(target, "write", wa, ctx);
+        auto out = [&]() -> Value {
+            {
+                // sys.stdout replaced (contextlib.redirect_stdout, a StringIO):
+                // the line goes to its write(), as Python's print does
+                Value target;
+                if (stdoutRedirected(target)) {
+                    std::string line;
+                    for (size_t i = 0; i < vals.size(); i++) { if (i > 0) line += sep; line += strOf(vals[i], ctx); }
+                    line += end;
+                    std::vector<Value> wa{makeStringValue(line)};
+                    callMethod(target, "write", wa, ctx);
+                    return NONE_VALUE;
+                }
+            }
+            for (size_t i = 0; i < vals.size(); i++) {
+                if (i > 0) std::cout << sep;
+                printValue(vals[i], ctx);
+            }
+            if (saved) {
+                std::cout.rdbuf(saved);
+                restore.s = nullptr;
+                std::string line = cap.str();
+                std::cout << line << end;
+                if (end != "\n") std::cout.flush();
+                traceOutput(line);
                 return NONE_VALUE;
             }
-        }
-        for (size_t i = 0; i < vals.size(); i++) {
-            if (i > 0) std::cout << sep;
-            printValue(vals[i], ctx);
-        }
-        if (saved) {
-            std::cout.rdbuf(saved);
-            restore.s = nullptr;
-            std::string line = cap.str();
-            std::cout << line << end;
+            std::cout << end;
             if (end != "\n") std::cout.flush();
-            traceOutput(line);
+            else std::cout.flush();
             return NONE_VALUE;
-        }
-        std::cout << end;
-        if (end != "\n") std::cout.flush();
-        else std::cout.flush();
-        return NONE_VALUE;
+        };
+        // print is a builtin function: c_call / c_return (round 79)
+        if (__builtin_expect(nytrace::t_hooks & nytrace::PROFILE, 0)) return pyProfileBuiltin(builtinValue("print"), out);
+        return out();
     }
 
     // The sys module, once imported (one namespace for every import).
@@ -7730,7 +7735,7 @@ public:
             // a builtin value's method (xs.append(1)): c_call ... for the
             // profile function, the bound method as its argument (round 79)
             if (__builtin_expect(nytrace::t_hooks & nytrace::PROFILE, 0) && !isInstanceVal(obj)
-                && (isStringValue(obj) || bytesOf(obj) || (contOf(obj) && !classNodeOfValue(obj)))) {
+                && (isStringValue(obj) || bytesOf(obj) || (contOf(obj) && !classNodeOfValue(obj))) && !nytrace::no_c_call(method_name)) {
                 Value bm;
                 if (getAttrValue(obj, method_name, ctx, bm, true) && bm.type == ValueType::USERDATA)
                     return pyProfileBuiltin(bm, [&]() { return callMethod(obj, method_name, args, ctx, &kw_args); });
@@ -7813,7 +7818,7 @@ public:
                 for (auto& an : cn->args)
                     if (an->type() == NodeType::KEYWORD_ARG) cur_kw_order_.push_back(static_pointer_cast<KeywordArgNode>(an)->name);
                 KwScope ks(this, kw_args.empty() ? nullptr : &kw_args);
-                if (__builtin_expect(nytrace::t_hooks & nytrace::PROFILE, 0))   // c_call ... (round 79)
+                if (__builtin_expect(nytrace::t_hooks & nytrace::PROFILE, 0) && !nytrace::no_c_call(builtin))   // c_call ... (round 79)
                     return pyProfileBuiltin(callee, [&]() { return gen_s0 != nygen::serial_now() ? callBuiltinTemps(builtin, args, ctx, cn, gen_s0) : callBuiltin(builtin, args, ctx); });
                 if (gen_s0 != nygen::serial_now()) return callBuiltinTemps(builtin, args, ctx, cn, gen_s0);
                 return callBuiltin(builtin, args, ctx);
@@ -7842,7 +7847,7 @@ public:
                 (*kw->container)["__kwargs__"] = Value(1);
                 args.push_back(Value((Collectable*)kw));
             }
-            if (__builtin_expect(nytrace::t_hooks & nytrace::PROFILE, 0))   // c_call ... (round 79)
+            if (__builtin_expect(nytrace::t_hooks & nytrace::PROFILE, 0) && !nytrace::no_c_call(builtin))   // c_call ... (round 79)
                 return pyProfileBuiltin(callee, [&]() { return gen_s0 != nygen::serial_now() ? callBuiltinTemps(builtin, args, ctx, cn, gen_s0) : callBuiltin(builtin, args, ctx); });
             if (gen_s0 != nygen::serial_now()) return callBuiltinTemps(builtin, args, ctx, cn, gen_s0);
             return callBuiltin(builtin, args, ctx);

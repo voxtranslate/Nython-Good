@@ -399,6 +399,28 @@ check("profile return values; None when an exception leaves; c_exception", _prof
       [('p_leaf', 8), ('p_raise', None), ('c_exception', 'len')])
 check("getprofile", [got_prof, sys.getprofile()], [True, None])
 
+_cev = []
+def _cprof(frame, event, arg):
+    if event.startswith("c_") and frame.f_code.co_name == "p_builtins":
+        _cev.append((event, getattr(arg, "__name__", "?")))
+
+def p_builtins(xs):
+    a = xs[1:]
+    print("", end="")
+    b = str(5) + repr(list(xs))
+    c = len(xs)
+    d = xs.copy()
+    e = sorted(zip(xs, xs))
+    s = "abc".upper()
+    return a
+
+sys.setprofile(_cprof)
+p_builtins([1, 2, 3])
+sys.setprofile(None)
+check("c_call for print, builtin functions and methods; none for types (str, list, zip) or slicing", _cev,
+      [('c_call', 'print'), ('c_return', 'print'), ('c_call', 'repr'), ('c_return', 'repr'), ('c_call', 'len'), ('c_return', 'len'),
+       ('c_call', 'copy'), ('c_return', 'copy'), ('c_call', 'sorted'), ('c_return', 'sorted'), ('c_call', 'upper'), ('c_return', 'upper')])
+
 # ── 4. f_locals: writes reach the running frame (PEP 667) ────────────────────
 def w_target():   # @w_target
     a = 1

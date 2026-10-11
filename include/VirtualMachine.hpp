@@ -7101,7 +7101,7 @@ private:
                     VMVal mname=pop(); VMVal obj=pop();
                     VMVal m;
                     if(__builtin_expect(nytrace::t_hooks&nytrace::PROFILE,0)&&obj.type!=VMType::INSTANCE&&obj.type!=VMType::CLASS
-                       &&try_get_attr(obj,mname.s,m)&&m.type==VMType::NATIVE)   // c_call ... (round 79)
+                       &&!nytrace::no_c_call(mname.s)&&try_get_attr(obj,mname.s,m)&&m.type==VMType::NATIVE)   // c_call ... (round 79)
                         push(vm_profile_builtin(m,[&](){ return vm_call_method(obj,mname.s,all_args,&kwargs_map); }));
                     else push(vm_call_method(obj,mname.s,all_args,&kwargs_map));
                 } else {
@@ -7221,7 +7221,7 @@ private:
                 VMVal mname=pop(); VMVal obj=pop();
                 // a builtin value's method (xs.append(1)), a module's native
                 // (math.sqrt(x)): c_call ... (round 79)
-                if(__builtin_expect(nytrace::t_hooks&nytrace::PROFILE,0)&&obj.type!=VMType::INSTANCE&&obj.type!=VMType::CLASS){
+                if(__builtin_expect(nytrace::t_hooks&nytrace::PROFILE,0)&&obj.type!=VMType::INSTANCE&&obj.type!=VMType::CLASS&&!nytrace::no_c_call(mname.s)){
                     VMVal m;
                     if(try_get_attr(obj,mname.s,m)&&m.type==VMType::NATIVE){
                         push(vm_profile_builtin(m,[&](){ return vm_call_method(obj,mname.s,args); })); break;
@@ -7447,18 +7447,27 @@ private:
                 for(int i=argc-1;i>=0;--i) vals[i]=pop();
                 std::string out;
                 for(int i=0;i<argc;++i){ if(i) out+=sep; out+=str_of(vals[i]); }
-                {
+                auto emit_out=[&]()->VMVal{
                     // sys.stdout replaced (contextlib.redirect_stdout, a
                     // StringIO): the line goes to its write(), as Python's
                     VMVal target;
                     if(stdout_redirected(target)){
                         std::vector<VMVal> wa{VMVal::make_str(out+end)};
                         vm_call_method(target,"write",wa);
-                        break;
+                        return VMVal::make_none();
                     }
+                    std::cout<<out<<end;
+                    if(end!="\n") std::cout.flush();
+                    return VMVal::make_none();
+                };
+                // print is a builtin function: c_call / c_return (round 79)
+                if(__builtin_expect(nytrace::t_hooks&nytrace::PROFILE,0)){
+                    auto pit=globals_.find("print");
+                    VMVal pf=pit!=globals_.end()?pit->second:VMVal::make_none();
+                    pf.class_name="__builtin__:print";
+                    vm_profile_builtin(pf, emit_out);
                 }
-                std::cout<<out<<end;
-                if(end!="\n") std::cout.flush();
+                else emit_out();
                 break;
             }
             case Op::IMPORT_NAME: vm_import(fr.code->names[ins.arg]); break;
@@ -8058,6 +8067,7 @@ private:
     template<class F> VMVal vm_profile_builtin(const VMVal& fn, F&& run) {
         size_t idx=call_stack_.size()-1;
         if(call_stack_.empty()||!call_stack_.back().code||call_stack_.back().code->file=="stdin") return run();
+        if(nytrace::no_c_call(native_name(fn))) return run();   // a type: str(5), list(xs) ...
         vm_ev_profile(idx, "c_call", fn);
         VMVal r;
         try { r=run(); }
