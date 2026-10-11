@@ -201,6 +201,7 @@ enum class Op : uint8_t {
     LOAD_SUBSCR_DICT,    // d[k], k a str or 64-bit int, present
     STORE_SUBSCR_DICT,   // d[k] = v, k a str or 64-bit int
     LOAD_NAME_ENV,       // a name of the closure environment the function was made in
+    FOR_ITER_GEN,        // a generator (or lazy builtin) iterated by a for loop
     OP_COUNT_
 };
 
@@ -228,7 +229,7 @@ inline Op base_op(Op op) {
     case Op::COMPARE_LE_NUM: return Op::COMPARE_LE;
     case Op::COMPARE_GT_NUM: return Op::COMPARE_GT;
     case Op::COMPARE_GE_NUM: return Op::COMPARE_GE;
-    case Op::FOR_ITER_RANGE: case Op::FOR_ITER_LIST: return Op::FOR_ITER;
+    case Op::FOR_ITER_RANGE: case Op::FOR_ITER_LIST: case Op::FOR_ITER_GEN: return Op::FOR_ITER;
     case Op::LOAD_SUBSCR_LIST: case Op::LOAD_SUBSCR_DICT: return Op::LOAD_SUBSCR;
     case Op::STORE_SUBSCR_LIST: case Op::STORE_SUBSCR_DICT: return Op::STORE_SUBSCR;
     case Op::LOAD_NAME_ENV: return Op::LOAD_NAME;
@@ -323,6 +324,46 @@ struct VMVal {
     std::string class_name;
     // Closure environment: captured variables from enclosing scope
     std::shared_ptr<VMMap>     closure_env;
+
+    // Copies and moves (round 80): member by member, as the implicit ones,
+    // but the two strings are only touched when not empty - most values'
+    // are, and copying or moving an empty std::string still called into
+    // the library (a third of a VMVal copy's cost).
+    VMVal() = default;
+    ~VMVal() = default;
+    explicit VMVal(VMType t) : type(t) {}
+    VMVal(const VMVal& o)
+        : type(o.type), b(o.b), i(o.i), d(o.d), s(), list(o.list), map(o.map), code(o.code),
+          native(o.native), iter(o.iter), gen(o.gen), class_name(), closure_env(o.closure_env) {
+        if(!o.s.empty()) s=o.s;
+        if(!o.class_name.empty()) class_name=o.class_name;
+    }
+    VMVal(VMVal&& o) noexcept
+        : type(o.type), b(o.b), i(o.i), d(o.d), s(), list(std::move(o.list)), map(std::move(o.map)),
+          code(std::move(o.code)), native(std::move(o.native)), iter(std::move(o.iter)), gen(std::move(o.gen)),
+          class_name(), closure_env(std::move(o.closure_env)) {
+        if(!o.s.empty()) s=std::move(o.s);
+        if(!o.class_name.empty()) class_name=std::move(o.class_name);
+    }
+    VMVal& operator=(const VMVal& o) {
+        if(this==&o) return *this;
+        type=o.type; b=o.b; i=o.i; d=o.d;
+        if(o.s.empty()) s.clear(); else s=o.s;
+        list=o.list; map=o.map; code=o.code; native=o.native; iter=o.iter; gen=o.gen;
+        if(o.class_name.empty()) class_name.clear(); else class_name=o.class_name;
+        closure_env=o.closure_env;
+        return *this;
+    }
+    VMVal& operator=(VMVal&& o) noexcept {
+        if(this==&o) return *this;
+        type=o.type; b=o.b; i=o.i; d=o.d;
+        if(o.s.empty()) s.clear(); else s=std::move(o.s);
+        list=std::move(o.list); map=std::move(o.map); code=std::move(o.code); native=std::move(o.native);
+        iter=std::move(o.iter); gen=std::move(o.gen);
+        if(o.class_name.empty()) class_name.clear(); else class_name=std::move(o.class_name);
+        closure_env=std::move(o.closure_env);
+        return *this;
+    }
 
     // A LIST with b == true is a tuple: immutable, printed with parentheses,
     // never equal to a list, hashable as a dict key. An INT whose s is not
@@ -4420,7 +4461,8 @@ private:
         gs.stack_base=stack_.size();
         for(auto& sv : gs.saved_stack) stack_.push_back(std::move(sv));
         gs.saved_stack.clear();
-        CallFrame fr; fr.code=gs.code; fr.ip=(int)gs.ip;
+        CallFrame& fr=call_stack_.emplace_back();   // (round 80: built where it runs)
+        fr.code=gs.code; fr.ip=(int)gs.ip;
         fr.stack_base=gs.stack_base;
         fr.locals=std::move(gs.locals);
         fr.self_val=gs.self_val;
@@ -4428,7 +4470,6 @@ private:
         fr.own_env=gs.own_env;
         fr.gen_state=gs.shared_from_this();
         fr.fobj=gs.fobj;   // round 78
-        call_stack_.push_back(std::move(fr));
         gs.mode=mode; gs.running=true; gs.yielded=false;
         bool at_yield=gs.at_yield;
         gs.at_yield=false;
@@ -7187,6 +7228,7 @@ private:
         case Op::FOR_ITER: {
             if(ns<1) break;
             const VMVal& it=stack_[ns-1];
+            if(it.type==VMType::GENERATOR&&it.gen){ to=Op::FOR_ITER_GEN; break; }
             if(it.type!=VMType::ITERATOR) break;
             if(it.b&&!it.iter&&it.list&&!it.s.empty()&&it.s[0]=='r') to=Op::FOR_ITER_RANGE;
             else if(it.iter) to=Op::FOR_ITER_LIST;
@@ -7674,6 +7716,21 @@ private:
                         if(p->first<(int)p->second.size()){ int k=p->first++; stack_.push_back(p->second[(size_t)k]); break; }
                         stack_.pop_back(); fr.ip=ins.arg; break;
                     }
+                }
+                NY_MISS(FOR_ITER);
+            }
+            case Op::FOR_ITER_GEN: {
+                // FOR_ITER's generator branch: gen_next without its copies
+                if(!stack_.empty()&&stack_.back().type==VMType::GENERATOR&&stack_.back().gen){
+                    const size_t it_idx=stack_.size()-1;
+                    GenState& gs=*stack_[it_idx].gen;
+                    if(gs.done){ stack_.pop_back(); fr.ip=ins.arg; break; }
+                    static const VMVal none_sent=VMVal::make_none();
+                    VMVal out;
+                    gen_resume(gs, 0, none_sent, out);
+                    if(!stack_[it_idx].gen||stack_[it_idx].gen->done){ stack_.pop_back(); fr.ip=ins.arg; break; }
+                    stack_.push_back(std::move(out));
+                    break;
                 }
                 NY_MISS(FOR_ITER);
             }
@@ -15367,6 +15424,7 @@ private:
         case Op::LOAD_SUBSCR_DICT: return "LOAD_SUBSCR_DICT";
         case Op::STORE_SUBSCR_DICT: return "STORE_SUBSCR_DICT";
         case Op::LOAD_NAME_ENV: return "LOAD_NAME_ENV";
+        case Op::FOR_ITER_GEN: return "FOR_ITER_GEN";
         case Op::STORE_GLOBAL_NAME: return "STORE_GLOBAL_NAME";
         case Op::JUMP_IF_NONE_KEEP: return "JUMP_IF_NONE_KEEP";
         case Op::JUMP_IF_MISSING_KEEP: return "JUMP_IF_MISSING_KEEP";
