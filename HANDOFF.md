@@ -279,6 +279,15 @@ gained `Engine::coro_handle` and an `__await__`-generator path in
 - A bare generator (`types.coroutine` without an `__await__` object) is
   not awaitable; weak references to generators are not supported.
 
+### Round 78 (parts 1 and 2 together), verified at 0cdc138
+- Linux, both engines: the sweep 405 runs, 0 not ok; vm_audit89 62 and
+  vm_audit90 65 on both engines (61 and 63 under python3); `ide_e2e`
+  373/373, `ide_lint` clean, `ide_memprobe --check` within its thresholds.
+- Windows 64-bit (MinGW from `nython.cbp`, under Wine): built,
+  `pe_unwind_check` clean, the sweep 405 runs, 0 not ok.
+- Merging the two parts conflicted only in the docs and in
+  `lib/collections/abc.ny`'s header comment.
+
 ## 0p. Round 77 — bytes, the network stack, signals, modules, the CLI, Python compatibility
 
 Everything here works on both engines; the tests named with each part pin
