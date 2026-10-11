@@ -1,0 +1,610 @@
+# nython: module    (import it by name: it runs in a module scope of its own)
+# lib/pstats.ny - Python's pstats: reports of profiler statistics (round 79;
+# lib/cProfile.ny and lib/profile.ny make them).
+#
+#     import cProfile, pstats
+#     pr = cProfile.Profile(); pr.enable(); work(); pr.disable()
+#     pstats.Stats(pr).strip_dirs().sort_stats("cumulative").print_stats(10)
+#
+# Stats(*args, stream=None)   from a profiler (anything with create_stats()),
+#   a file dump_stats() wrote, or another Stats; more arguments are add()ed.
+#   .stats is CPython's: {(filename, lineno, funcname): (primitive calls,
+#   calls, internal time, cumulative time, callers)}, callers mapping each
+#   caller's key to (calls, primitive calls, internal, cumulative) - the
+#   cProfile format - or to a call count (the profile module's);
+#   builtins are keyed ("~", 0, "<built-in method builtins.len>").
+# sort_stats(*keys)    CPython's keys and their unique abbreviations:
+#   calls/ncalls, cumulative/cumtime, filename/module, line, name, nfl,
+#   pcalls, stdname, time/tottime, SortKey members, the old integer
+#   arguments (-1 stdname, 0 calls, 1 time, 2 cumulative); ties keep the
+#   order of the next key, as CPython's TupleComp
+# reverse_order(), strip_dirs() (entries that become equal are added),
+# add(*stats), dump_stats(filename), get_stats_profile() (StatsProfile /
+# FunctionProfile), calc_callees()
+# print_stats(*restrictions)   the header (files, "N function calls (M
+#   primitive calls) in T seconds", "Ordered by: ...") and CPython's
+#   columns "ncalls  tottime  percall  cumtime  percall
+#   filename:lineno(function)"; a restriction is a line count, a fraction
+#   of the lines (0.0 <= f < 1.0) or a regular expression matched against
+#   "file:line(function)", applied in order ("List reduced from N to M due
+#   to restriction <r>")
+# print_callers(*restrictions), print_callees(*restrictions)  with the
+#   "ncalls  tottime  cumtime" sub-header for cProfile's caller tuples
+# SortKey, FunctionProfile, StatsProfile, func_std_string, func_strip_path,
+# func_get_function_name, add_func_stats, add_callers, count_calls, f8
+#
+# Not here: the files dump_stats writes are Nython's own (JSON lines,
+# "NYPSTATS 1" then one entry per function), not CPython's marshal format:
+# a dump from CPython cannot be read and the reverse. The interactive
+# browser (python -m pstats) is not provided.
+
+import os
+import sys
+import time
+import re
+from functools import cmp_to_key
+
+__all__ = ["Stats", "SortKey", "FunctionProfile", "StatsProfile"]
+
+
+class SortKey:
+    # CPython's is an enum of str values; these are the strings themselves
+    # (sort_stats takes them the same way)
+    CALLS = "calls"
+    CUMULATIVE = "cumulative"
+    FILENAME = "filename"
+    LINE = "line"
+    NAME = "name"
+    NFL = "nfl"
+    PCALLS = "pcalls"
+    STDNAME = "stdname"
+    TIME = "time"
+
+
+class FunctionProfile:
+    def __init__(self, ncalls, tottime, percall_tottime, cumtime, percall_cumtime, file_name, line_number):
+        self.ncalls = ncalls
+        self.tottime = tottime
+        self.percall_tottime = percall_tottime
+        self.cumtime = cumtime
+        self.percall_cumtime = percall_cumtime
+        self.file_name = file_name
+        self.line_number = line_number
+
+    def __eq__(self, other):
+        if not isinstance(other, FunctionProfile):
+            return NotImplemented
+        return [self.ncalls, self.tottime, self.percall_tottime, self.cumtime, self.percall_cumtime,
+                self.file_name, self.line_number] == [other.ncalls, other.tottime, other.percall_tottime,
+                other.cumtime, other.percall_cumtime, other.file_name, other.line_number]
+
+    def __hash__(self):
+        return hash((self.ncalls, self.tottime, self.cumtime, self.file_name, self.line_number))
+
+    def __repr__(self):
+        return ("FunctionProfile(ncalls=%r, tottime=%r, percall_tottime=%r, cumtime=%r, percall_cumtime=%r, "
+                "file_name=%r, line_number=%r)" % (self.ncalls, self.tottime, self.percall_tottime, self.cumtime,
+                                                   self.percall_cumtime, self.file_name, self.line_number))
+
+
+class StatsProfile:
+    """Class for keeping track of an item in inventory."""
+    def __init__(self, total_tt, func_profiles):
+        self.total_tt = total_tt
+        self.func_profiles = func_profiles
+
+    def __repr__(self):
+        return "StatsProfile(total_tt=%r, func_profiles=%r)" % (self.total_tt, self.func_profiles)
+
+
+_DUMP_MAGIC = "NYPSTATS 1"
+
+
+def _key_list(k):
+    return [k[0], k[1], k[2]]
+
+
+def _key_of(l):
+    return (l[0], l[1], l[2])
+
+
+def _dump(stats, filename):
+    import json
+    lines = [_DUMP_MAGIC]
+    for func, (cc, nc, tt, ct, callers) in stats.items():
+        cl = []
+        for c, v in callers.items():
+            if isinstance(v, tuple):
+                cl.append([_key_list(c), list(v)])
+            else:
+                cl.append([_key_list(c), v])
+        lines.append(json.dumps([_key_list(func), cc, nc, tt, ct, cl]))
+    f = open(filename, "w")
+    try:
+        f.write("\n".join(lines) + "\n")
+    finally:
+        f.close()
+
+
+def _load(filename):
+    import json
+    f = open(filename)
+    try:
+        text = f.read()
+    finally:
+        f.close()
+    rows = text.split("\n")
+    if not rows or rows[0].strip() != _DUMP_MAGIC:
+        raise ValueError("bad marshal data (not a Nython profile dump: %r)" % filename)
+    out = {}
+    for row in rows[1:]:
+        if not row.strip():
+            continue
+        e = json.loads(row)
+        callers = {}
+        for c in e[5]:
+            v = c[1]
+            callers[_key_of(c[0])] = tuple(v) if isinstance(v, list) else v
+        out[_key_of(e[0])] = (e[1], e[2], e[3], e[4], callers)
+    return out
+
+
+class Stats:
+    """This class is used for creating reports from data generated by the
+    Profile class.  It is a "friend" of that class, and imports data either
+    by direct access to members of Profile class, or by reading in a dictionary
+    that was emitted (via marshal) from the Profile class.
+    """
+
+    sort_arg_dict_default = {
+        "calls": (((1, -1),), "call count"),
+        "ncalls": (((1, -1),), "call count"),
+        "cumtime": (((3, -1),), "cumulative time"),
+        "cumulative": (((3, -1),), "cumulative time"),
+        "filename": (((4, 1),), "file name"),
+        "line": (((5, 1),), "line number"),
+        "module": (((4, 1),), "file name"),
+        "name": (((6, 1),), "function name"),
+        "nfl": (((6, 1), (4, 1), (5, 1)), "name/file/line"),
+        "pcalls": (((0, -1),), "primitive call count"),
+        "stdname": (((7, 1),), "standard name"),
+        "time": (((2, -1),), "internal time"),
+        "tottime": (((2, -1),), "internal time"),
+    }
+
+    def __init__(self, *args, stream=None):
+        self.stream = stream or sys.stdout
+        if not len(args):
+            arg = None
+        else:
+            arg = args[0]
+            args = args[1:]
+        self.init(arg)
+        self.add(*args)
+
+    def init(self, arg):
+        self.all_callees = None  # calc only if needed
+        self.files = []
+        self.fcn_list = None
+        self.total_tt = 0
+        self.total_calls = 0
+        self.prim_calls = 0
+        self.max_name_len = 0
+        self.top_level = set()
+        self.stats = {}
+        self.sort_arg_dict = {}
+        self.sort_type = ""
+        self.load_stats(arg)
+        try:
+            self.get_top_level_stats()
+        except Exception:
+            print("Invalid timing data %s" % (self.files[-1] if self.files else ""), file=self.stream)
+            raise
+
+    def load_stats(self, arg):
+        if arg is None:
+            self.stats = {}
+            return
+        elif isinstance(arg, str):
+            self.stats = _load(arg)
+            try:
+                file_stats = os.stat(arg)
+                arg = time.ctime(file_stats.st_mtime) + "    " + arg
+            except Exception:
+                pass
+            self.files = [arg]
+        elif hasattr(arg, "create_stats"):
+            arg.create_stats()
+            self.stats = arg.stats
+            arg.stats = {}
+        if not self.stats:
+            raise TypeError("Cannot create or construct a %r object from %r" % (self.__class__, arg))
+        return
+
+    def get_top_level_stats(self):
+        for func, (cc, nc, tt, ct, callers) in self.stats.items():
+            self.total_calls += nc
+            self.prim_calls += cc
+            self.total_tt += tt
+            if ("jprofile", 0, "profiler") in callers:
+                self.top_level.add(func)
+            if len(func_std_string(func)) > self.max_name_len:
+                self.max_name_len = len(func_std_string(func))
+
+    def add(self, *arg_list):
+        if not arg_list:
+            return self
+        for item in reversed(arg_list):
+            if type(self) != type(item):
+                item = Stats(item)
+            self.files += item.files
+            self.total_calls += item.total_calls
+            self.prim_calls += item.prim_calls
+            self.total_tt += item.total_tt
+            for func in item.top_level:
+                self.top_level.add(func)
+            if self.max_name_len < item.max_name_len:
+                self.max_name_len = item.max_name_len
+            self.fcn_list = None
+            for func, stat in item.stats.items():
+                if func in self.stats:
+                    old_func_stat = self.stats[func]
+                else:
+                    old_func_stat = (0, 0, 0, 0, {})
+                self.stats[func] = add_func_stats(old_func_stat, stat)
+        return self
+
+    def dump_stats(self, filename):
+        """Write the profile data to a file we know how to load back."""
+        _dump(self.stats, filename)
+
+    def get_sort_arg_defs(self):
+        """Expand all abbreviations that are unique."""
+        if not self.sort_arg_dict:
+            d = {}
+            bad_list = {}
+            for word, tup in self.sort_arg_dict_default.items():
+                fragment = word
+                while fragment:
+                    if fragment in d:
+                        bad_list[fragment] = 0
+                        break
+                    d[fragment] = tup
+                    fragment = fragment[:-1]
+            for word in bad_list:
+                del d[word]
+            self.sort_arg_dict = d
+        return self.sort_arg_dict
+
+    def sort_stats(self, *field):
+        if not field:
+            self.fcn_list = 0
+            return self
+        if len(field) == 1 and isinstance(field[0], int) and not isinstance(field[0], bool):
+            # Be compatible with old profiler
+            field = [{-1: "stdname", 0: "calls", 1: "time", 2: "cumulative"}[field[0]]]
+        elif len(field) >= 2:
+            for arg in field[1:]:
+                if type(arg) != type(field[0]):
+                    raise TypeError("Can't have mixed argument type")
+        sort_arg_defs = self.get_sort_arg_defs()
+        sort_tuple = ()
+        self.sort_type = ""
+        connector = ""
+        for word in field:
+            sort_tuple = sort_tuple + sort_arg_defs[word][0]
+            self.sort_type += connector + sort_arg_defs[word][1]
+            connector = ", "
+        stats_list = []
+        for func, (cc, nc, tt, ct, callers) in self.stats.items():
+            stats_list.append((cc, nc, tt, ct) + func + (func_std_string(func), func))
+        comp = TupleComp(sort_tuple)
+        stats_list.sort(key=cmp_to_key(comp.compare))
+        fcn_list = []
+        for tup in stats_list:
+            fcn_list.append(tup[-1])
+        self.fcn_list = fcn_list
+        return self
+
+    def reverse_order(self):
+        if self.fcn_list:
+            self.fcn_list.reverse()
+        return self
+
+    def strip_dirs(self):
+        oldstats = self.stats
+        newstats = {}
+        self.stats = newstats
+        max_name_len = 0
+        for func, (cc, nc, tt, ct, callers) in oldstats.items():
+            newfunc = func_strip_path(func)
+            if len(func_std_string(newfunc)) > max_name_len:
+                max_name_len = len(func_std_string(newfunc))
+            newcallers = {}
+            for func2, caller in callers.items():
+                newcallers[func_strip_path(func2)] = caller
+            if newfunc in newstats:
+                newstats[newfunc] = add_func_stats(newstats[newfunc], (cc, nc, tt, ct, newcallers))
+            else:
+                newstats[newfunc] = (cc, nc, tt, ct, newcallers)
+        old_top = self.top_level
+        new_top = set()
+        for func in old_top:
+            new_top.add(func_strip_path(func))
+        self.top_level = new_top
+        self.max_name_len = max_name_len
+        self.fcn_list = None
+        self.all_callees = None
+        return self
+
+    def calc_callees(self):
+        if self.all_callees:
+            return
+        all_callees = {}
+        self.all_callees = all_callees
+        for func, (cc, nc, tt, ct, callers) in self.stats.items():
+            if not func in all_callees:
+                all_callees[func] = {}
+            for func2, caller in callers.items():
+                if not func2 in all_callees:
+                    all_callees[func2] = {}
+                all_callees[func2][func] = caller
+        return
+
+    # ── printing ─────────────────────────────────────────────────────────
+    def eval_print_amount(self, sel, list, msg):
+        new_list = list
+        if isinstance(sel, str):
+            try:
+                rex = re.compile(sel)
+            except re.error:
+                msg += "   <Invalid regular expression %r>\n" % sel
+                return new_list, msg
+            new_list = []
+            for func in list:
+                if rex.search(func_std_string(func)):
+                    new_list.append(func)
+        else:
+            count = len(list)
+            if isinstance(sel, float) and 0.0 <= sel and sel < 1.0:
+                count = int(count * sel + 0.5)
+                new_list = list[:count]
+            elif isinstance(sel, int) and 0 <= sel and sel < count:
+                count = sel
+                new_list = list[:count]
+        if len(list) != len(new_list):
+            msg += "   List reduced from %r to %r due to restriction <%r>\n" % (len(list), len(new_list), sel)
+        return new_list, msg
+
+    def get_stats_profile(self):
+        """This method returns an instance of StatsProfile, which contains a
+        mapping of function names to instances of FunctionProfile. Each
+        FunctionProfile instance holds information related to the function's
+        profile such as how long the function took to run, how many times it
+        was called, etc...
+        """
+        func_list = self.fcn_list[:] if self.fcn_list else list(self.stats.keys())
+        if not func_list:
+            return StatsProfile(0, {})
+        total_tt = float(f8(self.total_tt))
+        func_profiles = {}
+        stats_profile = StatsProfile(total_tt, func_profiles)
+        for func in func_list:
+            cc, nc, tt, ct, callers = self.stats[func]
+            file_name, line_number, func_name = func
+            ncalls = str(nc) if nc == cc else (str(nc) + "/" + str(cc))
+            tottime = float(f8(tt))
+            percall_tottime = -1 if nc == 0 else float(f8(tt / nc))
+            cumtime = float(f8(ct))
+            percall_cumtime = -1 if cc == 0 else float(f8(ct / cc))
+            func_profile = FunctionProfile(ncalls, tottime, percall_tottime, cumtime, percall_cumtime,
+                                           file_name, line_number)
+            func_profiles[func_name] = func_profile
+        return stats_profile
+
+    def get_print_list(self, sel_list):
+        width = self.max_name_len
+        if self.fcn_list:
+            stat_list = self.fcn_list[:]
+            msg = "   Ordered by: " + self.sort_type + "\n"
+        else:
+            stat_list = list(self.stats.keys())
+            msg = "   Random listing order was used\n"
+        for selection in sel_list:
+            stat_list, msg = self.eval_print_amount(selection, stat_list, msg)
+        count = len(stat_list)
+        if not stat_list:
+            return 0, stat_list
+        print(msg, file=self.stream)
+        if count < len(self.stats):
+            width = 0
+            for func in stat_list:
+                if len(func_std_string(func)) > width:
+                    width = len(func_std_string(func))
+        return width + 2, stat_list
+
+    def print_stats(self, *amount):
+        for filename in self.files:
+            print(filename, file=self.stream)
+        if self.files:
+            print(file=self.stream)
+        indent = " " * 8
+        for func in self.top_level:
+            print(indent, func_get_function_name(func), file=self.stream)
+        print(indent, self.total_calls, "function calls", end=" ", file=self.stream)
+        if self.total_calls != self.prim_calls:
+            print("(%d primitive calls)" % self.prim_calls, end=" ", file=self.stream)
+        print("in %.3f seconds" % self.total_tt, file=self.stream)
+        print(file=self.stream)
+        width, lst = self.get_print_list(amount)
+        if lst:
+            self.print_title()
+            for func in lst:
+                self.print_line(func)
+            print(file=self.stream)
+            print(file=self.stream)
+        return self
+
+    def print_callees(self, *amount):
+        width, lst = self.get_print_list(amount)
+        if lst:
+            self.calc_callees()
+            self.print_call_heading(width, "called...")
+            for func in lst:
+                if func in self.all_callees:
+                    self.print_call_line(width, func, self.all_callees[func])
+                else:
+                    self.print_call_line(width, func, {})
+            print(file=self.stream)
+            print(file=self.stream)
+        return self
+
+    def print_callers(self, *amount):
+        width, lst = self.get_print_list(amount)
+        if lst:
+            self.print_call_heading(width, "was called by...")
+            for func in lst:
+                cc, nc, tt, ct, callers = self.stats[func]
+                self.print_call_line(width, func, callers, "<-")
+            print(file=self.stream)
+            print(file=self.stream)
+        return self
+
+    def print_call_heading(self, name_size, column_title):
+        print("Function ".ljust(name_size) + column_title, file=self.stream)
+        # print sub-header only if we have new-style callers
+        subheader = False
+        for cc, nc, tt, ct, callers in self.stats.values():
+            if callers:
+                value = next(iter(callers.values()))
+                subheader = isinstance(value, tuple)
+                break
+        if subheader:
+            print(" " * name_size + "    ncalls  tottime  cumtime", file=self.stream)
+
+    def print_call_line(self, name_size, source, call_dict, arrow="->"):
+        print(func_std_string(source).ljust(name_size) + arrow, end=" ", file=self.stream)
+        if not call_dict:
+            print(file=self.stream)
+            return
+        clist = sorted(call_dict.keys())
+        indent = ""
+        for func in clist:
+            name = func_std_string(func)
+            value = call_dict[func]
+            if isinstance(value, tuple):
+                nc, cc, tt, ct = value
+                if nc != cc:
+                    substats = "%d/%d" % (nc, cc)
+                else:
+                    substats = "%d" % (nc,)
+                substats = "%s %s %s  %s" % (substats.rjust(7 + 2 * len(indent)), f8(tt), f8(ct), name)
+                left_width = name_size + 1
+            else:
+                substats = "%s(%r) %s" % (name, value, f8(self.stats[func][3]))
+                left_width = name_size + 3
+            print(indent * left_width + substats, file=self.stream)
+            indent = " "
+
+    def print_title(self):
+        print("   ncalls  tottime  percall  cumtime  percall", end=" ", file=self.stream)
+        print("filename:lineno(function)", file=self.stream)
+
+    def print_line(self, func):
+        cc, nc, tt, ct, callers = self.stats[func]
+        c = str(nc)
+        if nc != cc:
+            c = c + "/" + str(cc)
+        print(c.rjust(9), end=" ", file=self.stream)
+        print(f8(tt), end=" ", file=self.stream)
+        if nc == 0:
+            print(" " * 8, end=" ", file=self.stream)
+        else:
+            print(f8(tt / nc), end=" ", file=self.stream)
+        print(f8(ct), end=" ", file=self.stream)
+        if cc == 0:
+            print(" " * 8, end=" ", file=self.stream)
+        else:
+            print(f8(ct / cc), end=" ", file=self.stream)
+        print(func_std_string(func), file=self.stream)
+
+
+class TupleComp:
+    """This class provides a generic function for comparing any two tuples.
+    Each instance records a list of tuple-indices (from most significant
+    to least significant), and sort direction (ascending or descending) for
+    each tuple-index.  The compare functions can then be used as the function
+    argument to the system sort() function when a list of tuples need to be
+    sorted in the instances order."""
+
+    def __init__(self, comp_select_list):
+        self.comp_select_list = comp_select_list
+
+    def compare(self, left, right):
+        for index, direction in self.comp_select_list:
+            l = left[index]
+            r = right[index]
+            if l < r:
+                return -direction
+            if l > r:
+                return direction
+        return 0
+
+
+def func_strip_path(func_name):
+    filename, line, name = func_name
+    return os.path.basename(filename), line, name
+
+
+def func_get_function_name(func):
+    return func[2]
+
+
+def func_std_string(func_name):  # match what old profile produced
+    if func_name[:2] == ("~", 0):
+        # special case for built-in functions
+        name = func_name[2]
+        if name.startswith("<") and name.endswith(">"):
+            return "{%s}" % name[1:-1]
+        else:
+            return name
+    else:
+        return "%s:%d(%s)" % func_name
+
+
+def add_func_stats(target, source):
+    """Add together all the stats for two profile entries."""
+    cc, nc, tt, ct, callers = source
+    t_cc, t_nc, t_tt, t_ct, t_callers = target
+    return (cc + t_cc, nc + t_nc, tt + t_tt, ct + t_ct, add_callers(t_callers, callers))
+
+
+def add_callers(target, source):
+    """Combine two caller lists in a single list."""
+    new_callers = {}
+    for func, caller in target.items():
+        new_callers[func] = caller
+    for func, caller in source.items():
+        if func in new_callers:
+            if isinstance(caller, tuple):
+                # format used by cProfile
+                old = new_callers[func]
+                new_callers[func] = tuple([caller[i] + old[i] for i in range(len(caller))])
+            else:
+                # format used by profile
+                new_callers[func] += caller
+        else:
+            new_callers[func] = caller
+    return new_callers
+
+
+def count_calls(callers):
+    """Sum the caller statistics to get total number of calls received."""
+    nc = 0
+    for calls in callers.values():
+        nc += calls
+    return nc
+
+
+def f8(x):
+    return "%8.3f" % x
