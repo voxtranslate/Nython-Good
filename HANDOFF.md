@@ -285,6 +285,8 @@ gained `Engine::coro_handle` and an `__await__`-generator path in
   373/373, `ide_lint` clean, `ide_memprobe --check` within its thresholds.
 - Windows 64-bit (MinGW from `nython.cbp`, under Wine): built,
   `pe_unwind_check` clean, the sweep 405 runs, 0 not ok.
+- AArch64 (qemu-user): vm_audit49, 55, 56, 64, 67, 89 and 90 pass on both
+  engines (coroutine objects and frames over the assembly context switch).
 - Merging the two parts conflicted only in the docs and in
   `lib/collections/abc.ny`'s header comment.
 
