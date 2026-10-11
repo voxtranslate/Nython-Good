@@ -98,9 +98,12 @@ import re
 import shutil
 import pickle
 import hashlib
+import ssl
 import tarfile
 import zipfile
 import urllib.request
+import urllib.parse
+import urllib.error
 import unicodedata
 import multiprocessing as mp
 import xml.etree.ElementTree as ET
@@ -457,9 +460,21 @@ class Config:
         #   {'name': 'my_set', 'format': 'paddle', 'img_dir': '...', 'label_file': '.../Label.txt', 'group': 'ja'}
         self.cjk_sources = 'auto'
         self.source_search_roots = ['/kaggle/input', './data']
-        self.auto_download_sources = False       # True: fetch the directly downloadable sets (multi-GB) first
-        self.download_root = '/kaggle/tmp/public_cjk' if os.path.isdir('/kaggle') else './data/public_cjk'
-        self.download_names = ['lsvt', 'art', 'rects', 'kaist', 'synthmlt_zh', 'synthmlt_ja', 'synthmlt_ko']
+        # Automatic download from the ORIGINAL distribution points (see PUBLIC_SOURCE_CATALOG): resumable,
+        # size / MD5 / archive-verified, extracted once and reused (a '.complete' marker per set). On Kaggle the
+        # data goes to the large ephemeral disk; save that folder as a Kaggle dataset to skip it next session.
+        self.auto_download_sources = True
+        self.download_root = '/tmp/a3espotter_data' if os.path.isdir('/kaggle') else './data/public_sources'
+        self.download_names = ['lsvt', 'art', 'rects', 'kaist', 'synthmlt_zh', 'synthmlt_ja', 'synthmlt_ko', 'rctw17']
+        self.custom_download_urls = {}           # e.g. {'rctw17': ['https://.../train_images.zip.001', ...]}
+        self.download_retries = 4
+        self.download_timeout = 60
+        self.download_min_free_gb = 5.0          # never fill the disk below this reserve
+        self.download_keep_archives = False      # delete archives after a verified extraction
+        self.download_allow_legacy_tls = True    # CVC / CTU hosts: chain does not verify -> unverified HTTPS last
+        self.download_use_mirror_fallback = True # SynthMLT: HF word-crop LMDB if the original host is unreachable
+        self.mlt_kaggle_mirrors = ['zubairalibhutto/mlt-19-ocr-dataset']      # MLT-19 needs an RRC account
+        self.ic15_kaggle_mirrors = ['justinbieberjr/idcar-2015-official']    # used only if the RRC download fails
         self.max_images_per_source = None        # e.g. 20000 to bound indexing / epoch composition
         self.index_workers = max(1, min(8, (os.cpu_count() or 2)))
         self.dedup_against_eval = True           # perceptual-hash guard: no val / test image inside training
@@ -1707,58 +1722,86 @@ class _CropCollate:
 
 
 # =====================================================================
-# 2c. NEW - Multi-source merge: public Chinese / Japanese / Korean scene-text sets
+# 2c. Multi-source merge: public Chinese / Japanese / Korean scene-text sets
 # =====================================================================
 # Every set below has the characteristics of MLT-19 / IC15: photographs of natural scenes (synthetic text rendered
 # onto natural backgrounds for SynthMLT), multi-oriented word- or line-level quadrilateral / polygon boxes,
 # transcriptions, and "###" / illegible don't-care regions. All are free for research use; read each licence page.
-# URLs are the official / documented mirrors (MMOCR dataset zoo, E2E-MLT README); RRC pages need a free account.
+# 'files' are the ORIGINAL distribution points (the organisers' own hosts), fetched automatically by
+# `acquire_public_sources`; sizes / MD5s are used to verify complete downloads where they are known.
+# 'fallback' entries are used only when every original location fails, and are labelled as third-party mirrors.
 _SYNTH_BASE = 'http://ptak.felk.cvut.cz/public_datasets/SyntText/'
+_HF_SYNTH = 'https://huggingface.co/datasets/Yesianrohn/SynthMLT/resolve/main/'
+_BCE = 'https://dataset-bj.cdn.bcebos.com/'
+
+
+def _f(url, size=None, md5=None, extract=None):
+    """One downloadable file. extract: None (keep), 'here' (into the source folder) or 'stem' (into <folder>/<stem>)."""
+    if extract is None and url.endswith(('.zip', '.tar', '.tar.gz', '.tgz')):
+        extract = 'here'
+    return {'url': url, 'size': size, 'md5': md5, 'extract': extract}
+
+
 PUBLIC_SOURCE_CATALOG = {
-    'rctw17': {'format': 'rctw', 'group': 'zh', 'script_hint': 'Chinese', 'kind': 'real', 'complete': True,
-               'urls': [],                                   # Baidu / Google-Drive split archives: manual download
-               'homepage': 'https://rctw.vlrlab.net/dataset.html',
-               'note': 'RCTW-17 (Shi et al., ICDAR 2017): 8,034 train images, line quads '
-                       '"x1,y1,...,x4,y4,difficult,\\"text\\"" (train_images/image_N.jpg + train_gts/image_N.txt)'},
-    'rects': {'format': 'rects', 'group': 'zh', 'script_hint': 'Chinese', 'kind': 'real', 'complete': True,
-              'urls': ['https://datasets.cvc.uab.es/rrc/ReCTS.zip'],
-              'homepage': 'https://rrc.cvc.uab.es/?ch=12',
-              'note': 'ReCTS-19 (Liu et al., ICDAR 2019): 20,000 train images of Chinese signboards, per-image JSON '
-                      '{"lines": [{"points": [8 values], "transcription", "ignore"}], "chars": [...]}'},
     'lsvt': {'format': 'lsvt', 'group': 'zh', 'script_hint': 'Chinese', 'kind': 'real', 'complete': True,
-             'urls': ['https://dataset-bj.cdn.bcebos.com/lsvt/train_full_images_0.tar.gz',
-                      'https://dataset-bj.cdn.bcebos.com/lsvt/train_full_images_1.tar.gz',
-                      'https://dataset-bj.cdn.bcebos.com/lsvt/train_full_labels.json'],
+             'files': [_f(_BCE + 'lsvt/train_full_images_0.tar.gz', 4367864124),
+                       _f(_BCE + 'lsvt/train_full_images_1.tar.gz', 4383014034),
+                       _f(_BCE + 'lsvt/train_full_labels.json', 192791636)],
+             'label_file': 'train_full_labels.json',
              'homepage': 'https://rrc.cvc.uab.es/?ch=16',
              'note': 'LSVT-19 (Sun et al., ICCV 2019): 30,000 fully annotated street-view images, one JSON '
-                     '{"gt_N": [{"points": [[x, y], ...], "transcription", "illegibility"}]}'},
+                     '{"gt_N": [{"points": [[x, y], ...], "transcription", "illegibility"}]}; hosted by Baidu, '
+                     'the organiser'},
     'art': {'format': 'art', 'group': 'zh', 'script_hint': None, 'kind': 'real', 'complete': True,
-            'urls': ['https://dataset-bj.cdn.bcebos.com/art/train_images.tar.gz',
-                     'https://dataset-bj.cdn.bcebos.com/art/train_labels.json'],
+            'files': [_f(_BCE + 'art/train_images.tar.gz', 1639636218),
+                      _f(_BCE + 'art/train_labels.json', 42936328)],
+            'label_file': 'train_labels.json',
             'homepage': 'https://rrc.cvc.uab.es/?ch=14',
             'note': 'ArT-19 (Chng et al., ICDAR 2019): 5,603 train images (Chinese + Latin, arbitrary shape; includes '
                     'Total-Text and SCUT-CTW1500), one JSON with polygons and a "language" field'},
+    'rects': {'format': 'rects', 'group': 'zh', 'script_hint': 'Chinese', 'kind': 'real', 'complete': True,
+              'files': [_f('https://datasets.cvc.uab.es/rrc/ReCTS.zip')],
+              'homepage': 'https://rrc.cvc.uab.es/?ch=12',
+              'note': 'ReCTS-19 (Liu et al., ICDAR 2019): 20,000 train images of Chinese signboards, per-image JSON '
+                      '{"lines": [{"points": [8 values], "transcription", "ignore"}], "chars": [...]}'},
     'kaist': {'format': 'kaist', 'group': 'ko', 'script_hint': 'Korean', 'kind': 'real', 'complete': False,
-              'urls': ['http://www.iapr-tc11.org/dataset/KAIST_SceneText/KAIST_all.zip'],
+              'files': [_f('http://www.iapr-tc11.org/dataset/KAIST_SceneText/KAIST_all.zip')],
               'homepage': 'http://www.iapr-tc11.org/mediawiki/index.php/KAIST_Scene_Text_Database',
               'note': 'KAIST Scene Text (Jung et al., 2011): ~3,000 Korean / English / mixed scene photos, XML word '
-                      'boxes with per-character labels. Not every word is annotated -> no background mining.'},
-    'synthmlt_zh': {'format': 'mlt', 'group': 'zh', 'script_hint': 'Chinese', 'kind': 'synthetic', 'complete': True,
-                    'vertex_order': 'auto', 'urls': [_SYNTH_BASE + 'Chinese.zip', _SYNTH_BASE + 'Chinese_gt.zip'],
-                    'homepage': 'https://github.com/MichalBusta/E2E-MLT',
-                    'note': 'SynthMLT (Busta et al., ACCV 2018; the ICDAR-2019 MLT synthetic set), MLT GT format'},
-    'synthmlt_ja': {'format': 'mlt', 'group': 'ja', 'script_hint': 'Japanese', 'kind': 'synthetic', 'complete': True,
-                    'vertex_order': 'auto', 'urls': [_SYNTH_BASE + 'Japanese.zip', _SYNTH_BASE + 'Japanese_gt.zip'],
-                    'homepage': 'https://github.com/MichalBusta/E2E-MLT',
-                    'note': 'SynthMLT Japanese. Free real Japanese scene text with quads beyond MLT is scarce '
-                            '(DOST/ICDAR-2017 omnidirectional video needs RRC registration) - add it as an explicit '
-                            'spec if you have it.'},
-    'synthmlt_ko': {'format': 'mlt', 'group': 'ko', 'script_hint': 'Korean', 'kind': 'synthetic', 'complete': True,
-                    'vertex_order': 'auto', 'urls': [_SYNTH_BASE + 'Korean.zip', _SYNTH_BASE + 'Korean_gt.zip'],
-                    'homepage': 'https://github.com/MichalBusta/E2E-MLT',
-                    'note': 'SynthMLT Korean (AI-Hub Korean scene text is only distributed inside Korea)'},
+                      'boxes with per-character labels (nested zips). Not every word is annotated -> no background '
+                      'mining.'},
+    'rctw17': {'format': 'rctw', 'group': 'zh', 'script_hint': 'Chinese', 'kind': 'real', 'complete': True,
+               'files': [],
+               'homepage': 'https://rctw.vlrlab.net/dataset',
+               'note': 'RCTW-17 (Shi et al., ICDAR 2017): 8,034 train images, line quads "x1,...,y4,difficult,\\"text\\"". '
+                       'The organisers now distribute the training set only through Baidu Pan (the HUST mirror no '
+                       'longer resolves), which cannot be scripted: put direct URLs in Config.custom_download_urls '
+                       "['rctw17'] (e.g. your own copy of train_images.zip.001/.002 + train_gts.zip) or attach it."},
 }
-INDEX_VERSION = 'v5.1'
+for _code, _lang in (('zh', 'Chinese'), ('ja', 'Japanese'), ('ko', 'Korean')):
+    PUBLIC_SOURCE_CATALOG['synthmlt_' + _code] = {
+        'format': 'mlt', 'group': _code, 'script_hint': _lang, 'kind': 'synthetic', 'complete': True,
+        'vertex_order': 'auto',
+        'files': [_f(_SYNTH_BASE + _lang + '.zip'), _f(_SYNTH_BASE + _lang + '_gt.zip')],
+        'fallback': {'kind': 'lmdb_crops', 'urls': [_HF_SYNTH + _lang + '/data.mdb', _HF_SYNTH + _lang + '/lock.mdb'],
+                     'note': 'third-party Hugging Face mirror of the SynthMLT ' + _lang + ' word crops (LMDB, '
+                             'recognition only)'},
+        'homepage': 'https://github.com/MichalBusta/E2E-MLT',
+        'note': 'SynthMLT (Busta et al., ACCV 2018; the ICDAR-2019 MLT synthetic set), MLT GT format, original host '
+                'is HTTP-only'}
+# Base sets: IC15 from the RRC (MD5s as published by MMOCR's dataset zoo); MLT-19 needs an RRC account, so its
+# automatic fallback is a Kaggle copy (Config.mlt_kaggle_mirrors).
+IC15_RRC_FILES = [
+    _f('https://rrc.cvc.uab.es/downloads/ch4_training_images.zip', md5='c51cbace155dcc4d98c8dd19d378f30d', extract='stem'),
+    _f('https://rrc.cvc.uab.es/downloads/ch4_training_localization_transcription_gt.zip',
+       md5='3bfaf1988960909014f7987d2343060b', extract='stem'),
+    _f('https://rrc.cvc.uab.es/downloads/ch4_test_images.zip', md5='97e4c1ddcf074ffcc75feff2b63c35dd', extract='stem'),
+    _f('https://rrc.cvc.uab.es/downloads/Challenge4_Test_Task4_GT.zip', md5='8bce173b06d164b98c357b0eb96ef430',
+       extract='stem')]
+# Hosts whose HTTPS certificate chain fails standard verification (incomplete chain / self-signed). Their files are
+# tried over verified HTTPS, then plain HTTP, then (only if download_allow_legacy_tls) unverified HTTPS.
+LEGACY_TLS_HOSTS = {'datasets.cvc.uab.es', 'rrc.cvc.uab.es', 'ptak.felk.cvut.cz'}
+INDEX_VERSION = 'v5.2'
 PER_IMAGE_FORMATS = {'mlt': '.txt', 'icdar': '.txt', 'rctw': '.txt', 'rects': '.json', 'kaist': '.xml'}
 
 ImageRecord = namedtuple('ImageRecord', ['img', 'src', 'w', 'h', 'ann', 'scripts'])
@@ -1941,18 +1984,44 @@ def _strip_gt_prefix(stem):
     return stem
 
 
+def _dir_affinity(img_path, gt_path):
+    """Number of trailing directory names shared by an image and a GT file ('X_gt' counts as 'X')."""
+    a = os.path.dirname(img_path).split(os.sep)[::-1]
+    b = [d[:-3] if d.lower().endswith('_gt') else d for d in os.path.dirname(gt_path).split(os.sep)[::-1]]
+    n = 0
+    for x, y in zip(a, b):
+        if x.lower() != y.lower():
+            break
+        n += 1
+    return n
+
+
 def _pair_images_with_gt(img_dir, gt_dir, ext):
+    """Pairs images with GT files by stem ('gt_' / 'res_' prefixes ignored). When a stem occurs in several folders
+    (synthetic sets numbered per sub-folder), the GT whose folder path matches the image's best wins; ties are
+    dropped rather than guessed."""
     imgs = list_images_recursive(img_dir)
-    gts = {}
+    gts = defaultdict(list)
     for dp, dn, fn in os.walk(gt_dir):
-        for f in fn:
+        dn.sort()
+        for f in sorted(fn):
             if f.lower().endswith(ext):
-                gts.setdefault(_strip_gt_prefix(os.path.splitext(f)[0]), os.path.join(dp, f))
-    pairs = []
+                gts[_strip_gt_prefix(os.path.splitext(f)[0])].append(os.path.join(dp, f))
+    pairs, ambiguous = [], 0
     for p in imgs:
-        g = gts.get(os.path.splitext(os.path.basename(p))[0])
-        if g is not None:
-            pairs.append((p, g))
+        cands = gts.get(os.path.splitext(os.path.basename(p))[0])
+        if not cands:
+            continue
+        if len(cands) == 1:
+            pairs.append((p, cands[0]))
+            continue
+        scored = sorted(((_dir_affinity(p, g), g) for g in cands), reverse=True)
+        if scored[0][0] > scored[1][0]:
+            pairs.append((p, scored[0][1]))
+        else:
+            ambiguous += 1
+    if ambiguous:
+        print(f"[sources] {ambiguous} images in {img_dir} have several equally plausible GT files - skipped")
     return pairs
 
 
@@ -2218,79 +2287,365 @@ def discover_public_sources(roots, exclude=(), max_depth=7, verbose=True):
     return specs
 
 
-# ------------------------------------------------------------------ optional download (explicit opt-in)
+# ------------------------------------------------------------------ automatic acquisition from the original sources
+class DownloadError(Exception):
+    pass
+
+
+def _url_candidates(url, allow_legacy_tls):
+    """(url, verify_tls) attempts for one published URL: as published, the other scheme, and - only for
+    LEGACY_TLS_HOSTS and only if allowed - HTTPS without certificate verification (integrity then rests on the
+    size / MD5 / archive checks that follow every download)."""
+    scheme, rest = url.split('://', 1)
+    out = [(url, True), (('http://' if scheme == 'https' else 'https://') + rest, True)]
+    if allow_legacy_tls and urllib.parse.urlsplit(url).hostname in LEGACY_TLS_HOSTS:
+        out.append(('https://' + rest, False))
+    return out
+
+
+def _is_cert_error(e):
+    r = getattr(e, 'reason', e)
+    return isinstance(r, ssl.SSLError) or 'CERTIFICATE_VERIFY_FAILED' in str(e) or 'WRONG_VERSION_NUMBER' in str(e)
+
+
+def _http_download(url, path, expected_size=None, verify=True, timeout=60, min_free_bytes=0):
+    """Resumable download to `path` (partial data kept in path + '.part'; an interrupted transfer continues with an
+    HTTP Range request). Refuses HTML answers (login walls / error pages) and incomplete files."""
+    ctx = ssl.create_default_context()
+    if not verify:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+    part = path + '.part'
+    have = os.path.getsize(part) if os.path.exists(part) else 0
+    if expected_size and have > expected_size:
+        os.remove(part)
+        have = 0
+    if expected_size and have == expected_size:
+        os.replace(part, path)
+        return
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (compatible; a3espotter-fetch/5)'})
+    if have:
+        req.add_header('Range', 'bytes=%d-' % have)
+    try:
+        r = opener.open(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        if e.code == 416 and have and (not expected_size or have == expected_size):
+            os.replace(part, path)
+            return
+        raise
+    with r:
+        if 'text/html' in (r.headers.get('Content-Type') or '').lower():
+            raise DownloadError(f'{url} answered with an HTML page (login wall or error page), not the file')
+        if have and getattr(r, 'status', r.getcode()) != 206:
+            have = 0                                    # the server ignored the Range header: start over
+        length = r.headers.get('Content-Length')
+        total = have + int(length) if length else expected_size
+        if total and min_free_bytes:
+            free = shutil.disk_usage(os.path.dirname(path) or '.').free
+            if free < (total - have) + min_free_bytes:
+                raise DownloadError(f'not enough disk space for {os.path.basename(path)}: '
+                                    f'{(total - have) / 2 ** 30:.1f} GB needed + reserve, {free / 2 ** 30:.1f} GB free')
+        bar = tqdm(total=total or None, initial=have, unit='B', unit_scale=True, desc=os.path.basename(path),
+                   mininterval=5.0)
+        with open(part, 'ab' if have else 'wb') as f:
+            while True:
+                chunk = r.read(1 << 22)
+                if not chunk:
+                    break
+                f.write(chunk)
+                bar.update(len(chunk))
+        bar.close()
+    got = os.path.getsize(part)
+    want = expected_size or total
+    if want and got != want:
+        raise DownloadError(f'{url}: incomplete transfer ({got} of {want} bytes; will resume)')
+    os.replace(part, path)
+
+
+def _md5(path):
+    h = hashlib.md5()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 24), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def fetch_file(spec, dest_dir, cfg, extra_urls=()):
+    """Downloads one catalogued file (with fallbacks: other scheme, legacy-TLS hosts, extra URLs). Returns its path."""
+    name = os.path.basename(urllib.parse.urlsplit(spec['url']).path)
+    path = os.path.join(dest_dir, name)
+    if os.path.exists(path) and (not spec.get('size') or os.path.getsize(path) == spec['size']):
+        return path
+    reserve = int(cfg.download_min_free_gb * 2 ** 30)
+    if spec.get('size') and spec.get('extract'):
+        reserve += spec['size']                         # room to extract next to the archive
+    errors, warned = [], False
+    for base in [spec['url']] + list(extra_urls):
+        for url, verify in _url_candidates(base, cfg.download_allow_legacy_tls):
+            if not verify and not warned:
+                print(f"[download] {urllib.parse.urlsplit(url).hostname}: certificate chain does not verify; using "
+                      f"unverified TLS for this academic host (download_allow_legacy_tls=True); integrity is checked "
+                      f"by size / MD5 / archive tests.")
+                warned = True
+            for attempt in range(cfg.download_retries):
+                try:
+                    _http_download(url, path, spec.get('size'), verify, cfg.download_timeout, reserve)
+                    if spec.get('md5') and _md5(path) != spec['md5']:
+                        os.remove(path)
+                        raise DownloadError(f'{url}: MD5 mismatch (corrupted or different file)')
+                    return path
+                except DownloadError as e:
+                    errors.append(str(e))
+                    if 'incomplete transfer' in str(e):
+                        time.sleep(2 ** attempt)
+                        continue
+                    break
+                except urllib.error.HTTPError as e:
+                    errors.append(f'{url}: HTTP {e.code}')
+                    if e.code in (429, 500, 502, 503, 504):
+                        time.sleep(2 ** (attempt + 1))
+                        continue
+                    break
+                except Exception as e:                  # URLError, timeouts, resets, IncompleteRead, TLS
+                    errors.append(f'{url}: {type(e).__name__}: {getattr(e, "reason", e)}')
+                    if _is_cert_error(e):
+                        break
+                    time.sleep(2 ** (attempt + 1))
+    raise DownloadError('; '.join(errors[-3:]) or f'{name}: no URL worked')
+
+
 def _safe_extract(archive, dest):
+    """Extracts only regular files / directories that stay inside `dest` (no path traversal, links or devices);
+    returns the extracted file paths."""
     dest_real = os.path.realpath(dest)
+    out = []
 
     def inside(name):
         target = os.path.realpath(os.path.join(dest, name))
         return target == dest_real or target.startswith(dest_real + os.sep)
     if zipfile.is_zipfile(archive):
         with zipfile.ZipFile(archive) as zf:
+            bad = zf.testzip()
+            if bad is not None:
+                raise DownloadError(f'{os.path.basename(archive)}: corrupted member {bad}')
             for m in zf.infolist():
-                if inside(m.filename):
-                    zf.extract(m, dest)
-    else:
+                if inside(m.filename) and (m.external_attr >> 16) & 0o170000 != 0o120000:   # no symlinks
+                    out.append(zf.extract(m, dest))
+    elif tarfile.is_tarfile(archive):
         with tarfile.open(archive) as tf:
+            safe = [m for m in tf.getmembers() if (m.isfile() or m.isdir()) and inside(m.name)]
             try:
-                tf.extractall(dest, filter='data')
-            except TypeError:
-                safe = [m for m in tf.getmembers() if (m.isfile() or m.isdir()) and inside(m.name)]
+                tf.extractall(dest, members=safe, filter='data')
+            except TypeError:                           # Python without tarfile extraction filters
                 tf.extractall(dest, members=safe)
+            out += [os.path.join(dest, m.name) for m in safe if m.isfile()]
+    else:
+        raise DownloadError(f'{os.path.basename(archive)} is not a zip / tar archive')
+    return out
 
 
-def _download(url, path, retries=3):
-    for attempt in range(retries):
+def _archive_stem(path):
+    b = os.path.basename(path)
+    for ext in ('.tar.gz', '.tgz', '.tar', '.zip'):
+        if b.endswith(ext):
+            return b[:-len(ext)]
+    return os.path.splitext(b)[0]
+
+
+def _extract_archive(path, dest, mode):
+    target = dest if mode == 'here' else os.path.join(dest, _archive_stem(path))
+    os.makedirs(target, exist_ok=True)
+    extracted = _safe_extract(path, target)
+    # nested archives (KAIST ships one zip per folder): extract each next to itself (only files from this archive)
+    for inner in sorted(p for p in extracted if p.lower().endswith('.zip')):
         try:
-            with urllib.request.urlopen(url, timeout=60) as r, open(path + '.part', 'wb') as f:
-                total = int(r.headers.get('Content-Length') or 0)
-                bar = tqdm(total=total or None, unit='B', unit_scale=True, desc=os.path.basename(path), mininterval=5.0)
-                while True:
-                    chunk = r.read(1 << 22)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    bar.update(len(chunk))
-                bar.close()
-            os.replace(path + '.part', path)
-            return True
+            _safe_extract(inner, os.path.splitext(inner)[0])
+            os.remove(inner)
         except Exception as e:
-            print(f"[download] {url} failed ({type(e).__name__}: {e}); retry {attempt + 1}/{retries}")
-            time.sleep(2 ** (attempt + 1))
-    return False
+            print(f"[download] nested archive {inner} skipped: {e}")
+    return target
 
 
-def download_public_sources(cfg, names=None):
-    """Downloads + extracts the catalogued sets that have direct links (several GB each: LSVT ~ 30k photos)."""
-    os.makedirs(cfg.download_root, exist_ok=True)
+def _join_split_archives(dest):
+    """name.zip.001 + name.zip.002 + ... -> name.zip (RCTW-17 style split archives)."""
+    parts = defaultdict(list)
+    for f in os.listdir(dest):
+        m = None if f.startswith('.') else re.match(r'(.+\.(?:zip|tar|tar\.gz))\.(\d{3})$', f)
+        if m:
+            parts[m.group(1)].append((int(m.group(2)), f))
+    for whole, ps in parts.items():
+        out = os.path.join(dest, whole)
+        with open(out, 'wb') as fo:
+            for _, f in sorted(ps):
+                with open(os.path.join(dest, f), 'rb') as fi:
+                    shutil.copyfileobj(fi, fo, 1 << 24)
+        _extract_archive(out, dest, 'here')
+        for _, f in ps:
+            os.remove(os.path.join(dest, f))
+        os.remove(out)
+
+
+def _acquire_file(spec, dest, cfg, extra_urls=()):
+    name = os.path.basename(urllib.parse.urlsplit(spec['url']).path)
+    marker = os.path.join(dest, '.done_' + name)
+    if os.path.exists(marker):
+        return
+    path = fetch_file(spec, dest, cfg, extra_urls)
+    if spec.get('extract'):
+        _extract_archive(path, dest, spec['extract'])
+        if not cfg.download_keep_archives:
+            os.remove(path)
+    open(marker, 'w').close()
+
+
+def _find_file(root, name):
+    for dp, dn, fn in os.walk(root):
+        dn.sort()
+        if name in fn:
+            return os.path.join(dp, name)
+    return None
+
+
+def _downloaded_spec(name, meta, dest):
+    spec = {'name': name, 'catalog': name, 'format': meta['format'], 'img_dir': dest, 'img_dirs': [dest]}
+    if meta['format'] in ('lsvt', 'art'):
+        spec['label_file'] = _find_file(dest, meta['label_file'])
+        if spec['label_file'] is None:
+            return None
+    else:
+        spec['gt_dir'] = dest
+    return spec
+
+
+def acquire_public_sources(cfg, names=None):
+    """Downloads (once; resumable; verified) and extracts every requested catalogued set from its original
+    distribution point. Returns (specs of the sets that are ready, extra word-crop LMDB sources from the declared
+    fallbacks of sets that could not be obtained)."""
+    root = cfg.download_root
+    os.makedirs(root, exist_ok=True)
+    specs, crop_sources = [], []
     for name in names or cfg.download_names:
         meta = PUBLIC_SOURCE_CATALOG.get(name)
         if meta is None:
+            print(f"[download] unknown source {name!r} - skipped")
             continue
-        if not meta['urls']:
-            print(f"[download] {name}: no direct link - download manually from {meta['homepage']}")
-            continue
-        dest = os.path.join(cfg.download_root, name)
-        done = os.path.join(dest, '.complete')
-        if os.path.exists(done):
-            continue
+        dest = os.path.join(root, name)
         os.makedirs(dest, exist_ok=True)
-        ok = True
-        for url in meta['urls']:
-            fn = os.path.join(dest, os.path.basename(url))
-            if not os.path.exists(fn) and not _download(url, fn):
-                ok = False
-                break
-            if fn.endswith(('.zip', '.tar', '.tar.gz', '.tgz')):
-                try:
-                    _safe_extract(fn, dest)
-                    os.remove(fn)
-                except Exception as e:
-                    print(f"[download] could not extract {fn}: {e}")
-                    ok = False
-        if ok:
-            open(done, 'w').close()
-            print(f"[download] {name} ready in {dest}")
+        extra = list((cfg.custom_download_urls or {}).get(name, []))
+        files = list(meta['files']) + [_f(u) for u in extra if not any(u.endswith(os.path.basename(x['url'])) for x in meta['files'])]
+        ok = os.path.exists(os.path.join(dest, '.complete'))
+        if not ok and files:
+            try:
+                print(f"[download] {name}: {meta['note']}")
+                for fs in files:
+                    _acquire_file(fs, dest, cfg)
+                _join_split_archives(dest)
+                open(os.path.join(dest, '.complete'), 'w').close()
+                ok = True
+            except DownloadError as e:
+                print(f"[download] {name}: not available ({e})")
+        elif not files:
+            print(f"[download] {name}: {meta['note']}")
+        spec = _downloaded_spec(name, meta, dest) if ok else None
+        if spec is not None:
+            specs.append(spec)
+            continue
+        fb = meta.get('fallback')
+        if fb and cfg.download_use_mirror_fallback and fb['kind'] == 'lmdb_crops':
+            fdir = os.path.join(dest, 'fallback_lmdb')
+            os.makedirs(fdir, exist_ok=True)
+            try:
+                for u in fb['urls']:
+                    _acquire_file(_f(u, extract=None), fdir, cfg)
+                print(f"[download] {name}: using the {fb['note']}")
+                crop_sources.append({'type': 'lmdb', 'path': fdir, 'name': name + '_crops'})
+            except DownloadError as e:
+                print(f"[download] {name}: fallback not available either ({e})")
+    return specs, crop_sources
+
+
+def _discover_icdar_dirs(roots, gt_regex, img_prefix, need_script_column, max_depth=7):
+    """[(img_dir, gt_dir)] for folders holding ICDAR-style GT files `gt_regex` with matching images nearby."""
+    out = []
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        rdepth = os.path.realpath(root).rstrip(os.sep).count(os.sep)
+        for dp, dn, fn in os.walk(root):
+            if os.path.realpath(dp).count(os.sep) - rdepth >= max_depth:
+                dn[:] = []
+            dn[:] = sorted(d for d in dn if not d.startswith('.'))
+            gts = sorted(f for f in fn if re.match(gt_regex, f))
+            if len(gts) < 5:
+                continue
+            line = _sniff(os.path.join(dp, gts[0]), 1024).lstrip('﻿').split('\n')[0]
+            parts = line.split(',')
+            has_script = len(parts) >= 10 and parts[8].strip().lower() in _SCRIPT_NAMES_LOWER
+            if has_script != need_script_column:
+                continue
+            img_dir = _find_image_dir_near(dp, img_prefix)
+            if img_dir:
+                out.append((img_dir, dp))
+    return out
+
+
+def _kaggle_mirror(slugs):
+    """Downloads a Kaggle dataset with kagglehub (pre-installed and authenticated inside Kaggle notebooks)."""
+    try:
+        import kagglehub
+    except Exception:
+        return None
+    for slug in slugs or []:
+        try:
+            p = kagglehub.dataset_download(slug)
+            print(f"[base-data] fetched Kaggle copy {slug} -> {p}")
+            return p
+        except Exception as e:
+            print(f"[base-data] kagglehub {slug}: {type(e).__name__}: {e}")
+    return None
+
+
+def ensure_base_datasets(cfg):
+    """Makes sure MLT-19 (train) and IC15 (train + test) exist: configured paths -> discovery under
+    source_search_roots -> automatic download. IC15 comes from the RRC itself (MD5-verified, the MMOCR dataset-zoo
+    URLs); MLT-19 downloads need an RRC account, so the automatic fallback is a Kaggle copy (cfg.mlt_kaggle_mirrors)."""
+    roots = [r for r in cfg.source_search_roots if r]
+    have_mlt = bool(cfg.train_img_dir and os.path.isdir(cfg.train_img_dir) and cfg.train_gt_dir and os.path.isdir(cfg.train_gt_dir))
+    if not have_mlt:
+        found = _discover_icdar_dirs(roots, r'(gt_)?tr_img_\d+\.txt$', 'tr_img_', True)
+        if not found and cfg.auto_download_sources:
+            p = _kaggle_mirror(cfg.mlt_kaggle_mirrors)
+            found = _discover_icdar_dirs([p], r'(gt_)?tr_img_\d+\.txt$', 'tr_img_', True) if p else []
+        if found:
+            cfg.train_img_dir, cfg.train_gt_dir = found[0]
+            print(f"[base-data] MLT-19 train: images {cfg.train_img_dir} | GT {cfg.train_gt_dir}")
+        else:
+            print("[base-data] MLT-19 not found. Its official downloads (rrc.cvc.uab.es/?ch=15) need a free RRC account: "
+                  "attach it or set Config.train_img_dir / train_gt_dir.")
+    need_ic15 = not (cfg.ic15_train_img_dir and os.path.isdir(cfg.ic15_train_img_dir) and cfg.test_img_dir
+                     and os.path.isdir(cfg.test_img_dir))
+    if not need_ic15:
+        return
+    found = _discover_icdar_dirs(roots, r'gt_img_\d+\.txt$', 'img_', False)
+    if not found and cfg.auto_download_sources:
+        dest = os.path.join(cfg.download_root, 'ic15')
+        os.makedirs(dest, exist_ok=True)
+        try:
+            for fs in IC15_RRC_FILES:
+                _acquire_file(fs, dest, cfg)
+            found = _discover_icdar_dirs([dest], r'gt_img_\d+\.txt$', 'img_', False)
+        except DownloadError as e:
+            print(f"[base-data] IC15 from the RRC failed ({e}); trying a Kaggle copy.")
+            p = _kaggle_mirror(cfg.ic15_kaggle_mirrors)
+            found = _discover_icdar_dirs([p], r'gt_img_\d+\.txt$', 'img_', False) if p else []
+    train = [f for f in found if 'test' not in f[0].lower()]
+    test = [f for f in found if 'test' in f[0].lower()]
+    if train and not (cfg.ic15_train_img_dir and os.path.isdir(cfg.ic15_train_img_dir)):
+        cfg.ic15_train_img_dir, cfg.ic15_train_gt_dir = train[0]
+    if test and not (cfg.test_img_dir and os.path.isdir(cfg.test_img_dir)):
+        cfg.test_img_dir, cfg.test_gt_dir = test[0]
+    print(f"[base-data] IC15 train: {cfg.ic15_train_img_dir} | IC15 test: {cfg.test_img_dir} (GT {cfg.test_gt_dir})")
 
 
 # ------------------------------------------------------------------ leakage guard (perceptual hash)
@@ -2512,13 +2867,20 @@ class SceneWordStripDataset(Dataset):
 
 
 def resolve_cjk_specs(cfg, exclude_dirs=()):
+    """Public CJK sources: downloaded from their original hosts (auto_download_sources), then attached copies found by
+    signature (cjk_sources='auto') or explicit specs. One spec per catalogued name (downloaded copy first).
+    Returns (specs, extra word-crop sources from declared fallbacks)."""
+    specs, crop_sources = [], []
     if cfg.auto_download_sources:
-        download_public_sources(cfg)
+        specs, crop_sources = acquire_public_sources(cfg)
     if cfg.cjk_sources == 'auto':
-        roots = list(cfg.source_search_roots) + ([cfg.download_root] if cfg.auto_download_sources else [])
-        specs = discover_public_sources(roots, exclude=exclude_dirs)
+        roots = list(cfg.source_search_roots)
+        if not cfg.auto_download_sources:
+            roots.append(cfg.download_root)
+        have = {s['name'] for s in specs}
+        specs += [s for s in discover_public_sources(roots, exclude=exclude_dirs) if s['name'] not in have]
     else:
-        specs = list(cfg.cjk_sources or [])
+        specs += list(cfg.cjk_sources or [])
     out = []
     for s in specs:
         s = _spec_with_defaults(s, cfg)
@@ -2528,7 +2890,7 @@ def resolve_cjk_specs(cfg, exclude_dirs=()):
             print(f"[sources] {s.get('name')}: unsupported format {s.get('format')!r} - skipped")
             continue
         out.append(s)
-    return out
+    return out, crop_sources
 
 
 def build_training_index(cfg, mlt_items, ic15_items, eval_image_paths):
@@ -2545,7 +2907,10 @@ def build_training_index(cfg, mlt_items, ic15_items, eval_image_paths):
                            'weight': float(es.get('repeat', es.get('weight', 1)))})
     exclude = [cfg.train_img_dir, cfg.train_gt_dir, cfg.test_img_dir, cfg.test_gt_dir,
                cfg.ic15_train_img_dir, cfg.ic15_train_gt_dir]
-    specs = [_spec_with_defaults(s, cfg) for s in base_specs] + resolve_cjk_specs(cfg, exclude)
+    cjk_specs, crop_sources = resolve_cjk_specs(cfg, exclude)
+    known = {c.get('path') for c in cfg.crop_rec_sources}
+    cfg.crop_rec_sources = list(cfg.crop_rec_sources) + [c for c in crop_sources if c['path'] not in known]
+    specs = [_spec_with_defaults(s, cfg) for s in base_specs] + cjk_specs
     for spec in specs:
         if spec.get('items') is None and not (spec.get('img_dir') and os.path.isdir(spec['img_dir'])):
             print(f"[sources] {spec.get('name')}: image dir not found - skipped")
@@ -5614,6 +5979,7 @@ def _make_loader(ds, batch_size, collate, sampler=None, shuffle=False, drop_last
 def main(config=None):
     config = config or Config()
     seed_everything(config.seed)
+    ensure_base_datasets(config)              # MLT-19 / IC15: configured -> attached -> downloaded
 
     # ---------------- evaluation splits (MLT-val, IC15-val = test domain) ----------------
     mlt_items = build_items(config.train_img_dir, config.train_gt_dir)
