@@ -77,6 +77,11 @@ std::vector<Value> list_items(const Value& v);
 std::vector<std::pair<std::string, Value>> map_items(const Value& v);
 
 // Paths (pure string operations; see os.cpp for the exact rules).
+// The rest of Python's os (round 80, src/builtins/os_fd.cpp): file
+// descriptors, ids, scandir, pwd/grp, shared memory - `_ny_os_call(op, ...)`
+// with args[0] the op. UNDEFINED_VALUE for an op it does not know.
+Value os_call_ext(NythonExecutor& E, const std::string& op, std::vector<Value>& args);
+
 std::string cwd();
 std::string normpath(const std::string& p);
 std::string abspath(const std::string& p);

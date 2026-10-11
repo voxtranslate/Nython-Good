@@ -178,6 +178,8 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             if (ev || rv) {
                 std::string enc = ev ? E.strOf(*ev, ctx) : std::string("utf-8");
                 std::string err = rv ? E.strOf(*rv, ctx) : std::string("strict");
+                // round 80: a codec or error handler of lib/codecs.ny's registry
+                if (nypy::codec_needs_python(enc, err)) return E.codecHook("_ny_codec_decode", args[0], enc, err, ctx);
                 return str_(E.nyCall([&] { return nypy::bytes_decode(bo->s, enc, err); }));
             }
         }

@@ -1552,6 +1552,9 @@ Value dispatch_os(NythonExecutor& E,
             return make_list(E, {Value((int)ws.ws_col), Value((int)ws.ws_row)});
 #endif
         }
+        // file descriptors, ids, scandir, pwd/grp, shared memory (round 80)
+        Value ext = nyos::os_call_ext(E, op, args);
+        if (ext.type != ValueType::UNDEFINED) return ext;
         raise("ValueError", "_ny_os_call: unknown operation '" + op + "'");
     }
     if (name == "os_uname") {

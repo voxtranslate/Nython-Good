@@ -37,6 +37,13 @@ std::vector<std::string> hash_builtin_names();
 // dispatched through this module's entry points
 Value dispatch_zlib(NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 std::vector<std::string> zlib_builtin_names();
+// lib/codecs.ny's native (round 80, builtins/nycodecs.cpp): registered and
+// dispatched through here, as zlib's.
+Value dispatch_codec(NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
+std::vector<std::string> codec_builtin_names();
+// lib/pickle.ny's fast path for plain data (round 80, builtins/nypickle.cpp)
+Value dispatch_pickle(NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
+std::vector<std::string> pickle_builtin_names();
 
 namespace {
 
@@ -101,6 +108,8 @@ std::vector<std::string> hash_builtin_names() {
             "_hash_b64encode", "_hash_b64decode", "_hash_b32encode", "_hash_b32decode", "_hash_compare",
             "os_urandom", "_ws_mask"};
     for (auto& n : zlib_builtin_names()) v.push_back(n);   // round 79
+    for (auto& n : codec_builtin_names()) v.push_back(n);  // round 80
+    for (auto& n : pickle_builtin_names()) v.push_back(n); // round 80
     return v;
 }
 
@@ -129,6 +138,8 @@ Value dispatch_hash(NythonExecutor& E, const std::string& name, std::vector<Valu
         return E.makeBytesValue(data);
     }
     if (name.compare(0, 6, "_zlib_") == 0) return dispatch_zlib(E, name, args, ctx);   // round 79
+    if (name == "_ny_codec") return dispatch_codec(E, name, args, ctx);   // round 80
+    if (name == "_ny_pickle_dumps" || name == "_ny_pickle_loads") return dispatch_pickle(E, name, args, ctx);   // round 80
     if (name.compare(0, 6, "_hash_") != 0) return UNDEFINED_VALUE;
     nyos::Args A(E, args, {"h", "name", "data", "digest_size", "key", "length", "msg", "password", "salt",
                            "iterations", "dklen", "value", "altchars", "pad", "validate", "a", "b"});

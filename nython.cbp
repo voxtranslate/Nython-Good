@@ -169,6 +169,9 @@
         <Unit filename="src/builtins/text.cpp" />
         <Unit filename="src/builtins/os_time.cpp" />
         <Unit filename="src/builtins/os_proc.cpp" />
+        <Unit filename="src/builtins/os_fd.cpp" />
+        <Unit filename="src/builtins/nycodecs.cpp" />
+        <Unit filename="src/builtins/nypickle.cpp" />
         <Unit filename="src/builtins/pycore.cpp" />
         <Unit filename="src/builtins/gui_harness.cpp" />
         <Unit filename="src/NyConc.cpp" />

@@ -157,7 +157,7 @@ class NythonFile:
         return self.handle <= other
 
     def __str__(self):
-        return "<file '" + self.name + "' mode '" + self.mode + "'>"
+        return "<file '" + str(self.name) + "' mode '" + self.mode + "'>"
 
 class _NyStdStream:
     # sys.stdin / sys.stdout / sys.stderr (round 77): text streams over the
@@ -1357,10 +1357,52 @@ def exit(code=none):
 def quit(code=none):
     raise SystemExit(code)
 
+# str.encode / bytes.decode / str(b, enc, errors) with a codec or an error
+# handler only lib/codecs.ny's registry knows (round 80: both engines call
+# these when NyCodecs.hpp has no such codec or handler)
+def _ny_codec_encode(s, encoding, errors):
+    import codecs
+    return codecs._ny_text_encode(s, encoding, errors)
+
+def _ny_codec_decode(b, encoding, errors):
+    import codecs
+    return codecs._ny_text_decode(b, encoding, errors)
+
 def open(path, mode="r", buffering=-1, encoding="utf-8", errors=none, newline=none, closefd=true, opener=none):
     # Python's parameters in Python's order (round 77: encoding was third)
     if hasattr(path, "__fspath__"):
         path = path.__fspath__()
+    if isinstance(path, int) and not isinstance(path, bool):
+        # a file descriptor (round 80): its own file object, which closes
+        # the descriptor unless closefd is false
+        var fd = path if closefd else _ny_os_call("dup", path)
+        var ff = NythonFile(path, mode, _ny_os_call("fdopen", fd, mode), encoding if encoding is not none else "utf-8")
+        ff.newline = newline
+        return ff
+    if opener is not none:
+        # open(path, mode, opener=f): f(path, flags) gives the descriptor (round 80)
+        var flags = 0
+        var plus = "+" in mode
+        var oc = {}
+        for kv in _ny_os_call("constants"):
+            oc[kv[0]] = kv[1]
+        if "r" in mode:
+            flags = oc["O_RDWR"] if plus else oc["O_RDONLY"]
+        else:
+            flags = oc["O_RDWR"] if plus else oc["O_WRONLY"]
+            flags = flags | oc["O_CREAT"]
+            if "w" in mode:
+                flags = flags | oc["O_TRUNC"]
+            if "a" in mode:
+                flags = flags | oc["O_APPEND"]
+            if "x" in mode:
+                flags = flags | oc["O_EXCL"]
+        if "b" in mode and "O_BINARY" in oc:
+            flags = flags | oc["O_BINARY"]
+        var ofd = opener(path, flags)
+        var fo = NythonFile(path, mode, _ny_os_call("fdopen", ofd, mode), encoding if encoding is not none else "utf-8")
+        fo.newline = newline
+        return fo
     if "b" in mode and encoding != "utf-8" and encoding is not none:
         raise ValueError("binary mode doesn't take an encoding argument")
     if newline is not none and not (newline == "" or newline == "\n" or newline == "\r" or newline == "\r\n"):
@@ -2533,7 +2575,8 @@ _ny_b_repr = repr
 // from int, float, str, bytes, bytearray, list, dict, set, frozenset or tuple
 // finds where the type stands in its MRO (nyrt::builtin_mirror), and the
 // live view obj.__dict__ / vars(obj) gives. The text is in chunks ("#@ name"
-// lines): "base" (helpers), one per type, "dictview". Both engines run a
+// lines): "base" (helpers), one per type, "dictview", "os" (round 80: the
+// rest of Python's os, loaded at the first `import os`). Both engines run a
 // type's chunk (after "base") the first time a class derives from the type
 // or one of its dunders is read (int.__new__), and "dictview" (after "dict")
 // at the first instance __dict__ read - not at startup: a program that never
@@ -3450,6 +3493,762 @@ class _NyInstanceDict(dict):
     def clear(self):
         for k in list(_ny_payload(self).keys()):
             del self[k]
+#@ os
+# ── the rest of Python's os module (round 80) ─────────────────────────────
+# Run the first time a program imports os (both engines' os namespace
+# builders load this chunk, then bind every (name, value) of _ny_os_members
+# - "path.x" into os.path - over the flat os_* builtins of the same name).
+# The natives are _ny_os_call's ops in src/builtins/os_fd.cpp; they raise
+# the OSError subclass of errno with errno, strerror and the file name.
+# os.fspath / os.PathLike, os.scandir / os.DirEntry, os.walk on scandir (as
+# CPython 3.12's, no recursion), file descriptors (open/read/write/close/
+# pipe/dup/dup2/fdopen/lseek/fsync/isatty/truncate/ftruncate, inheritable
+# and blocking flags, the O_* constants), ids and ownership (POSIX), umask,
+# getlogin, mkfifo, major/minor/makedev, getloadavg, sched_getaffinity,
+# access with F_OK/R_OK/W_OK/X_OK, kill, fsencode/fsdecode, get_exec_path,
+# removedirs/renames, the constants curdir/pardir/extsep/altsep/devnull/
+# defpath; and os.path's members whose flat builtin keeps a legacy contract
+# (dirname("a") is "", split and splitext give tuples, "\" is no separator
+# on POSIX, normpath keeps POSIX's "//") or that were missing (splitdrive,
+# lexists, samefile, sameopenfile, samestat, ismount, isjunction,
+# isdevdrive, getatime, getctime, normcase, commonprefix).
+_ny_os_nt = os_name == "nt"
+
+def _ny_os_fspath(path):
+    # os.fspath (PEP 519)
+    if isinstance(path, str) or isinstance(path, bytes):
+        return path
+    var t = type(path)
+    var f = getattr(t, "__fspath__", None)
+    if f is None:
+        raise TypeError("expected str, bytes or os.PathLike object, not " + t.__name__)
+    var r = f(path)
+    if isinstance(r, str) or isinstance(r, bytes):
+        return r
+    raise TypeError("expected " + t.__name__ + ".__fspath__() to return str or bytes, not " + type(r).__name__)
+
+def _ny_os_fsencode(filename):
+    filename = _ny_os_fspath(filename)
+    if isinstance(filename, str):
+        return filename.encode("utf-8", "surrogateescape")
+    return filename
+
+def _ny_os_fsdecode(filename):
+    filename = _ny_os_fspath(filename)
+    if isinstance(filename, bytes):
+        return filename.decode("utf-8", "surrogateescape")
+    return filename
+
+def _ny_os_str(path):
+    # a path argument as the natives take it (bytes paths decoded)
+    path = _ny_os_fspath(path)
+    if isinstance(path, bytes):
+        return path.decode("utf-8", "surrogateescape")
+    return path
+
+class _NyPathLikeMeta(type):
+    # isinstance(x, os.PathLike) / issubclass: a class defining __fspath__
+    # (abc's __subclasshook__ in CPython; abc itself is not loaded for it)
+    def __instancecheck__(cls, obj):
+        return cls.__subclasscheck__(type(obj))
+    def __subclasscheck__(cls, sub):
+        if not isinstance(sub, type):
+            raise TypeError("issubclass() arg 1 must be a class")
+        for k in sub.__mro__:
+            if k is cls:
+                return True
+        if cls is not _ny_os_PathLike:
+            return False
+        for k in sub.__mro__:
+            var d = getattr(k, "__dict__", None)
+            if d is not None and "__fspath__" in d:
+                return d["__fspath__"] is not None
+        return False
+
+class PathLike(metaclass=_NyPathLikeMeta):
+    """Abstract base class for implementing the file system path protocol."""
+    __module__ = "os"
+    def __new__(cls, *args, **kw):
+        if getattr(cls, "__fspath__") is _ny_os_PathLike.__dict__["__fspath__"]:
+            raise TypeError("Can't instantiate abstract class " + cls.__name__ + " with abstract method __fspath__")
+        return object.__new__(cls)
+    def __fspath__(self):
+        """Return the file system path representation of the object."""
+        raise NotImplementedError
+    def __class_getitem__(cls, item):
+        return _NyGenericAlias(cls, item)
+
+_ny_os_PathLike = PathLike
+del PathLike
+
+# ── os.scandir / os.DirEntry ─────────────────────────────────────────────
+class DirEntry:
+    __module__ = "posix"
+    def __init__(self, top, name, kind, ino, bytes_mode):
+        self._ny_name = name
+        self._ny_path = _ny_osp_join(top, name)
+        self._ny_kind = kind
+        self._ny_ino = ino
+        self._ny_stat = None
+        self._ny_lstat = None
+    @property
+    def name(self):
+        return self._ny_name
+    @property
+    def path(self):
+        return self._ny_path
+    def __fspath__(self):
+        return self._ny_path
+    def __repr__(self):
+        return "<DirEntry " + repr(self._ny_name) + ">"
+    def __class_getitem__(cls, item):
+        return _NyGenericAlias(cls, item)
+    def _ny_kindof(self):
+        if self._ny_kind == "?":
+            var m = self.stat(follow_symlinks=False).st_mode & 0o170000
+            self._ny_kind = "d" if m == 0o040000 else "f" if m == 0o100000 else "l" if m == 0o120000 else "o"
+        return self._ny_kind
+    def inode(self):
+        if self._ny_ino == 0:
+            self._ny_ino = self.stat(follow_symlinks=False).st_ino
+        return self._ny_ino
+    def is_symlink(self):
+        return self._ny_kindof() == "l"
+    def is_junction(self):
+        return False
+    def _ny_follow(self, want):
+        try:
+            return (self.stat().st_mode & 0o170000) == want
+        except FileNotFoundError:
+            return False
+    def is_dir(self, *, follow_symlinks=True):
+        var k = self._ny_kindof()
+        if k == "l" and follow_symlinks:
+            return self._ny_follow(0o040000)
+        return k == "d"
+    def is_file(self, *, follow_symlinks=True):
+        var k = self._ny_kindof()
+        if k == "l" and follow_symlinks:
+            return self._ny_follow(0o100000)
+        return k == "f"
+    def stat(self, *, follow_symlinks=True):
+        # cached, as CPython's (lstat for a link not followed)
+        if not follow_symlinks or self._ny_kind == "l" or self._ny_kind == "?":
+            if self._ny_lstat is None:
+                self._ny_lstat = _ny_os_lstat(_ny_os_str(self._ny_path))
+            if not follow_symlinks or (self._ny_lstat.st_mode & 0o170000) != 0o120000:
+                return self._ny_lstat
+        if self._ny_stat is None:
+            self._ny_stat = _ny_os_stat(_ny_os_str(self._ny_path))
+        return self._ny_stat
+
+_ny_os_DirEntry = DirEntry
+del DirEntry
+
+class _NyScandirIterator:
+    def __init__(self, top, items, bytes_mode):
+        self._ny_top = top
+        self._ny_items = items
+        self._ny_i = 0
+        self._ny_bytes = bytes_mode
+    def __iter__(self):
+        return self
+    def __next__(self):
+        if self._ny_items is None or self._ny_i >= len(self._ny_items):
+            self._ny_items = None
+            raise StopIteration
+        var it = self._ny_items[self._ny_i]
+        self._ny_i += 1
+        var name = it[0]
+        if self._ny_bytes:
+            name = name.encode("utf-8", "surrogateescape")
+        return _ny_os_DirEntry(self._ny_top, name, it[1], it[2], self._ny_bytes)
+    def close(self):
+        self._ny_items = None
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        self.close()
+        return False
+    def __repr__(self):
+        return "<posix.ScandirIterator object>"
+
+def _ny_os_scandir(path="."):
+    if path is None:
+        path = "."
+    if isinstance(path, int) and not isinstance(path, bool):
+        raise NotImplementedError("os.scandir() of a file descriptor")
+    path = _ny_os_fspath(path)
+    return _NyScandirIterator(path, _ny_os_call("scandir", _ny_os_str(path)), isinstance(path, bytes))
+
+def _ny_os_walk(top, topdown=True, onerror=None, followlinks=False):
+    # CPython 3.12's os.walk: on scandir, iterative
+    var stack = [_ny_os_fspath(top)]
+    while stack:
+        top = stack.pop()
+        if isinstance(top, tuple):
+            yield top
+            continue
+        var dirs = []
+        var nondirs = []
+        var walk_dirs = []
+        var it = None
+        try:
+            it = _ny_os_scandir(top)
+        except OSError as error:
+            if onerror is not None:
+                onerror(error)
+            continue
+        for entry in it:
+            var is_dir = False
+            try:
+                is_dir = entry.is_dir()
+            except OSError:
+                is_dir = False
+            if is_dir:
+                dirs.append(entry.name)
+            else:
+                nondirs.append(entry.name)
+            if not topdown and is_dir:
+                var walk_into = True
+                if not followlinks:
+                    try:
+                        walk_into = not entry.is_symlink()
+                    except OSError:
+                        walk_into = True
+                if walk_into:
+                    walk_dirs.append(entry.path)
+        it.close()
+        if topdown:
+            yield top, dirs, nondirs
+            for d in reversed(dirs):
+                var new_path = _ny_osp_join(top, d)
+                if followlinks or not _ny_osp_islink(new_path):
+                    stack.append(new_path)
+        else:
+            stack.append((top, dirs, nondirs))
+            for new_path in reversed(walk_dirs):
+                stack.append(new_path)
+
+# ── file descriptors ─────────────────────────────────────────────────────
+def _ny_os_fd(fd):
+    if isinstance(fd, bool) or not isinstance(fd, int):
+        if hasattr(fd, "__index__"):
+            return fd.__index__()
+        raise TypeError("'" + type(fd).__name__ + "' object cannot be interpreted as an integer")
+    return fd
+
+def _ny_os_open(path, flags, mode=0o777, *, dir_fd=None):
+    return _ny_os_call("open", _ny_os_str(path), _ny_os_fd(flags), _ny_os_fd(mode))
+
+def _ny_os_read(fd, n):
+    return _ny_os_call("read", _ny_os_fd(fd), _ny_os_fd(n))
+
+def _ny_os_write(fd, data):
+    if isinstance(data, bytearray):
+        data = bytes(data)
+    if not isinstance(data, bytes):
+        raise TypeError("a bytes-like object is required, not '" + type(data).__name__ + "'")
+    return _ny_os_call("write", _ny_os_fd(fd), data)
+
+def _ny_os_close(fd):
+    _ny_os_call("close", _ny_os_fd(fd))
+
+def _ny_os_closerange(fd_low, fd_high):
+    _ny_os_call("closerange", _ny_os_fd(fd_low), _ny_os_fd(fd_high))
+
+def _ny_os_pipe():
+    return _ny_os_call("pipe")
+
+def _ny_os_dup(fd):
+    return _ny_os_call("dup", _ny_os_fd(fd))
+
+def _ny_os_dup2(fd, fd2, inheritable=True):
+    return _ny_os_call("dup2", _ny_os_fd(fd), _ny_os_fd(fd2), inheritable)
+
+def _ny_os_get_inheritable(fd):
+    return _ny_os_call("get_inheritable", _ny_os_fd(fd))
+
+def _ny_os_set_inheritable(fd, inheritable):
+    _ny_os_call("set_inheritable", _ny_os_fd(fd), inheritable)
+
+def _ny_os_get_blocking(fd):
+    return _ny_os_call("get_blocking", _ny_os_fd(fd))
+
+def _ny_os_set_blocking(fd, blocking):
+    _ny_os_call("set_blocking", _ny_os_fd(fd), blocking)
+
+def _ny_os_lseek(fd, position, whence):
+    return _ny_os_call("lseek", _ny_os_fd(fd), _ny_os_fd(position), _ny_os_fd(whence))
+
+def _ny_os_fsync(fd):
+    if not isinstance(fd, int) and hasattr(fd, "fileno"):
+        fd = fd.fileno()
+    _ny_os_call("fsync", _ny_os_fd(fd))
+
+def _ny_os_isatty(fd):
+    return _ny_os_call("isatty", _ny_os_fd(fd))
+
+def _ny_os_ftruncate(fd, length):
+    _ny_os_call("ftruncate", _ny_os_fd(fd), _ny_os_fd(length))
+
+def _ny_os_truncate(path, length):
+    if isinstance(path, int) and not isinstance(path, bool):
+        return _ny_os_ftruncate(path, length)
+    _ny_os_call("truncate", _ny_os_str(path), _ny_os_fd(length))
+
+def _ny_os_fdopen(fd, mode="r", buffering=-1, encoding=None, *args, **kw):
+    if not isinstance(fd, int):
+        raise TypeError("fdopen() argument must be an int, not " + type(fd).__name__)
+    var f = NythonFile(fd, mode, _ny_os_call("fdopen", fd, mode), encoding if encoding is not None else "utf-8")
+    return f
+
+def _ny_os_strerror(code):
+    return _ny_os_call("strerror", _ny_os_fd(code))
+
+def _ny_os_umask(mask):
+    return _ny_os_call("umask", _ny_os_fd(mask))
+
+def _ny_os_getlogin():
+    return _ny_os_call("getlogin")
+
+def _ny_os_access(path, mode, *, dir_fd=None, effective_ids=False, follow_symlinks=True):
+    return _ny_os_call("access", _ny_os_str(path), _ny_os_fd(mode), effective_ids, follow_symlinks)
+
+def _ny_os_getcwdb():
+    return _ny_os_fsencode(os_getcwd())
+
+def _ny_os_get_exec_path(env=None):
+    if env is None:
+        env = os_environ()
+    var path_list = None
+    for k in ("PATH", b"PATH"):
+        try:
+            path_list = env[k]
+            break
+        except (KeyError, TypeError):
+            pass
+    if path_list is None:
+        path_list = _ny_os_defpath
+    if isinstance(path_list, bytes):
+        path_list = _ny_os_fsdecode(path_list)
+    return path_list.split(os_pathsep)
+
+def _ny_os_removedirs(name):
+    os_rmdir(_ny_os_str(name))
+    var ht = _ny_osp_split(name)
+    var head = ht[0]
+    var tail = ht[1]
+    if not tail:
+        ht = _ny_osp_split(head)
+        head = ht[0]
+        tail = ht[1]
+    while head and tail:
+        try:
+            os_rmdir(_ny_os_str(head))
+        except OSError:
+            break
+        ht = _ny_osp_split(head)
+        head = ht[0]
+        tail = ht[1]
+
+def _ny_os_renames(old, new):
+    var ht = _ny_osp_split(new)
+    if ht[0] and ht[1] and not os_path_exists(_ny_os_str(ht[0])):
+        os_makedirs(_ny_os_str(ht[0]))
+    _ny_os_rename(old, new)
+    ht = _ny_osp_split(old)
+    if ht[0] and ht[1]:
+        try:
+            _ny_os_removedirs(ht[0])
+        except OSError:
+            pass
+
+def _ny_os_kill(pid, sig):
+    _ny_os_call("kill", _ny_os_fd(pid), _ny_os_fd(sig))
+
+def _ny_os_cpu_count():
+    return os_cpu_count()
+
+# ── os.environ: the live environment (CPython's _Environ) ────────────────
+# One mapping for every `import os` (each import used to get a snapshot of
+# its own): reads see the process's environment as it is now, writes and
+# deletes change it (putenv / unsetenv), so a child process inherits them.
+class _Environ:
+    __module__ = "os"
+    def __init__(self, bytes_mode=False):
+        self._ny_bytes = bytes_mode
+    def _ny_k(self, key):
+        if self._ny_bytes:
+            if not isinstance(key, bytes):
+                raise TypeError("bytes expected, not " + type(key).__name__)
+            return key.decode("utf-8", "surrogateescape")
+        if not isinstance(key, str):
+            raise TypeError("str expected, not " + type(key).__name__)
+        return key
+    def _ny_out(self, v):
+        return v.encode("utf-8", "surrogateescape") if self._ny_bytes else v
+    def _ny_all(self):
+        return os_environ()
+    def __getitem__(self, key):
+        var v = os_getenv(self._ny_k(key))
+        if v is None:
+            raise KeyError(key)
+        return self._ny_out(v)
+    def __setitem__(self, key, value):
+        var k = self._ny_k(key)
+        var v = self._ny_k(value)
+        if "=" in k or k == "":
+            raise ValueError("illegal environment variable name")
+        os_setenv(k, v)
+    def __delitem__(self, key):
+        var k = self._ny_k(key)
+        if os_getenv(k) is None:
+            raise KeyError(key)
+        os_unsetenv(k)
+    def __contains__(self, key):
+        try:
+            return os_getenv(self._ny_k(key)) is not None
+        except TypeError:
+            return False
+    def __iter__(self):
+        return iter(self.keys())
+    def __len__(self):
+        return len(self._ny_all())
+    def keys(self):
+        return [self._ny_out(k) for k in self._ny_all()]
+    def values(self):
+        var d = self._ny_all()
+        return [self._ny_out(d[k]) for k in d]
+    def items(self):
+        var d = self._ny_all()
+        return [(self._ny_out(k), self._ny_out(d[k])) for k in d]
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+    def setdefault(self, key, value):
+        if key not in self:
+            self[key] = value
+        return self[key]
+    def pop(self, key, *default):
+        if key in self:
+            var v = self[key]
+            del self[key]
+            return v
+        if default:
+            return default[0]
+        raise KeyError(key)
+    def update(self, *args, **kw):
+        for a in args:
+            var src = a
+            if hasattr(a, "keys"):
+                for k in list(a.keys()):
+                    self[k] = a[k]
+            else:
+                for kv in a:
+                    self[kv[0]] = kv[1]
+        for k in kw:
+            self[k] = kw[k]
+    def clear(self):
+        for k in self.keys():
+            del self[k]
+    def copy(self):
+        return dict(self.items())
+    def __eq__(self, other):
+        if isinstance(other, _Environ):
+            return self.copy() == other.copy()
+        return self.copy() == other
+    def __or__(self, other):
+        var d = self.copy()
+        d.update(other)
+        return d
+    def __ior__(self, other):
+        self.update(other)
+        return self
+    def __repr__(self):
+        return "environ(" + repr(self.copy()) + ")"
+
+_ny_os_environ = _Environ()
+_ny_os_environb = _Environ(True)
+
+def _ny_os_putenv(key, value):
+    os_setenv(_ny_os_str(key), _ny_os_str(value))
+
+# ── os.path where the flat builtins differ from Python ───────────────────
+var _ny_osp_ntmod = []
+def _ny_osp_nt():
+    if not _ny_osp_ntmod:
+        import ntpath
+        _ny_osp_ntmod.append(ntpath)
+    return _ny_osp_ntmod[0]
+
+def _ny_osp_join(a, *p):
+    if _ny_os_nt or isinstance(a, bytes):
+        if _ny_os_nt:
+            return _ny_osp_nt().join(a, *p)
+        a = _ny_os_fspath(a)
+        var path = a
+        for b in p:
+            b = _ny_os_fspath(b)
+            if not isinstance(b, bytes):
+                raise TypeError("Can't mix strings and bytes in path components")
+            if b.startswith(b"/"):
+                path = b
+            elif not path or path.endswith(b"/"):
+                path += b
+            else:
+                path += b"/" + b
+        return path
+    return os_path_join(a, *p)
+
+def _ny_osp_split(p):
+    p = _ny_os_fspath(p)
+    if _ny_os_nt:
+        return _ny_osp_nt().split(p)
+    var sp = b"/" if isinstance(p, bytes) else "/"
+    var i = p.rfind(sp) + 1
+    var head = p[:i]
+    var tail = p[i:]
+    if head and head != sp * len(head):
+        head = head.rstrip(sp)
+    return (head, tail)
+
+def _ny_osp_basename(p):
+    p = _ny_os_fspath(p)
+    if _ny_os_nt:
+        return _ny_osp_nt().basename(p)
+    var sp = b"/" if isinstance(p, bytes) else "/"
+    return p[p.rfind(sp) + 1:]
+
+def _ny_osp_dirname(p):
+    p = _ny_os_fspath(p)
+    if _ny_os_nt:
+        return _ny_osp_nt().dirname(p)
+    var sp = b"/" if isinstance(p, bytes) else "/"
+    var head = p[:p.rfind(sp) + 1]
+    if head and head != sp * len(head):
+        head = head.rstrip(sp)
+    return head
+
+def _ny_osp_splitext(p):
+    p = _ny_os_fspath(p)
+    var sp = "/"
+    var asp = None
+    var dot = "."
+    if isinstance(p, bytes):
+        sp = b"/"
+        dot = b"."
+        if _ny_os_nt:
+            sp = b"\\"
+            asp = b"/"
+    elif _ny_os_nt:
+        sp = "\\"
+        asp = "/"
+    var si = p.rfind(sp)
+    if asp:
+        si = max(si, p.rfind(asp))
+    var di = p.rfind(dot)
+    if di > si:
+        var fi = si + 1
+        while fi < di:
+            if p[fi:fi + 1] != dot:
+                return (p[:di], p[di:])
+            fi += 1
+    return (p, p[:0])
+
+def _ny_osp_splitdrive(p):
+    p = _ny_os_fspath(p)
+    if _ny_os_nt:
+        return _ny_osp_nt().splitdrive(p)
+    return (p[:0], p)
+
+def _ny_osp_normpath(p):
+    p = _ny_os_fspath(p)
+    if _ny_os_nt:
+        return _ny_osp_nt().normpath(p)
+    if isinstance(p, bytes):
+        return _ny_os_fsencode(_ny_osp_normpath(_ny_os_fsdecode(p)))
+    var r = os_path_normpath(p)
+    if p.startswith("//") and not p.startswith("///"):
+        r = "/" + r
+    return r
+
+def _ny_osp_normcase(s):
+    s = _ny_os_fspath(s)
+    if _ny_os_nt:
+        return _ny_osp_nt().normcase(s)
+    return s
+
+def _ny_osp_lexists(path):
+    try:
+        _ny_os_lstat(path)
+    except (OSError, ValueError):
+        return False
+    return True
+
+def _ny_osp_islink(path):
+    try:
+        return (_ny_os_lstat(path).st_mode & 0o170000) == 0o120000
+    except (OSError, ValueError, AttributeError):
+        return False
+
+def _ny_osp_samestat(s1, s2):
+    return s1.st_ino == s2.st_ino and s1.st_dev == s2.st_dev
+
+def _ny_osp_samefile(f1, f2):
+    return _ny_osp_samestat(_ny_os_stat(f1), _ny_os_stat(f2))
+
+def _ny_osp_sameopenfile(fp1, fp2):
+    return _ny_osp_samestat(_ny_os_fstat(fp1), _ny_os_fstat(fp2))
+
+def _ny_osp_ismount(path):
+    if _ny_os_nt:
+        return _ny_osp_nt().ismount(path)
+    var s1 = None
+    try:
+        s1 = _ny_os_lstat(path)
+    except (OSError, ValueError):
+        return False
+    if (s1.st_mode & 0o170000) == 0o120000:
+        return False
+    path = _ny_os_fspath(path)
+    var parent = _ny_osp_join(path, b".." if isinstance(path, bytes) else "..")
+    var s2 = None
+    try:
+        s2 = _ny_os_lstat(os_path_realpath(_ny_os_str(parent)))
+    except (OSError, ValueError):
+        return False
+    return s1.st_dev != s2.st_dev or s1.st_ino == s2.st_ino
+
+def _ny_osp_isjunction(path):
+    _ny_os_fspath(path)
+    return False
+
+def _ny_osp_isdevdrive(path):
+    _ny_os_fspath(path)
+    return False
+
+def _ny_osp_getatime(filename):
+    return _ny_os_stat(filename).st_atime
+
+def _ny_osp_getctime(filename):
+    return _ny_os_stat(filename).st_ctime
+
+def _ny_osp_commonprefix(m):
+    if not m:
+        return ""
+    if not isinstance(m[0], (list, tuple)):
+        m = tuple(map(_ny_os_fspath, m))
+    var s1 = min(m)
+    var s2 = max(m)
+    var i = 0
+    for c in s1:
+        if c != s2[i]:
+            return s1[:i]
+        i += 1
+    return s1
+
+# ── the members (round 80) ───────────────────────────────────────────────
+_ny_os_curdir = "."
+_ny_os_pardir = ".."
+_ny_os_extsep = "."
+_ny_os_altsep = "/" if _ny_os_nt else None
+_ny_os_devnull = "nul" if _ny_os_nt else "/dev/null"
+_ny_os_defpath = ".;C:\\bin" if _ny_os_nt else "/bin:/usr/bin"
+
+def _ny_os_member_list():
+    var m = [("fspath", _ny_os_fspath), ("fsencode", _ny_os_fsencode), ("fsdecode", _ny_os_fsdecode),
+             ("PathLike", _ny_os_PathLike), ("DirEntry", _ny_os_DirEntry), ("scandir", _ny_os_scandir),
+             ("walk", _ny_os_walk), ("open", _ny_os_open), ("read", _ny_os_read), ("write", _ny_os_write),
+             ("close", _ny_os_close), ("closerange", _ny_os_closerange), ("pipe", _ny_os_pipe),
+             ("dup", _ny_os_dup), ("dup2", _ny_os_dup2), ("get_inheritable", _ny_os_get_inheritable),
+             ("set_inheritable", _ny_os_set_inheritable), ("lseek", _ny_os_lseek), ("fsync", _ny_os_fsync),
+             ("isatty", _ny_os_isatty), ("ftruncate", _ny_os_ftruncate), ("truncate", _ny_os_truncate),
+             ("fdopen", _ny_os_fdopen), ("strerror", _ny_os_strerror), ("umask", _ny_os_umask),
+             ("getlogin", _ny_os_getlogin), ("access", _ny_os_access), ("getcwdb", _ny_os_getcwdb),
+             ("get_exec_path", _ny_os_get_exec_path), ("removedirs", _ny_os_removedirs),
+             ("renames", _ny_os_renames), ("kill", _ny_os_kill), ("error", OSError),
+             ("curdir", _ny_os_curdir), ("pardir", _ny_os_pardir), ("extsep", _ny_os_extsep),
+             ("altsep", _ny_os_altsep), ("devnull", _ny_os_devnull), ("defpath", _ny_os_defpath),
+             ("F_OK", 0), ("R_OK", 4), ("W_OK", 2), ("X_OK", 1), ("SEEK_SET", 0), ("SEEK_CUR", 1), ("SEEK_END", 2),
+             ("supports_bytes_environ", not _ny_os_nt), ("environ", _ny_os_environ), ("putenv", _ny_os_putenv),
+             ("path.split", _ny_osp_split), ("path.basename", _ny_osp_basename),
+             ("path.dirname", _ny_osp_dirname), ("path.splitext", _ny_osp_splitext),
+             ("path.splitdrive", _ny_osp_splitdrive), ("path.normpath", _ny_osp_normpath),
+             ("path.normcase", _ny_osp_normcase), ("path.lexists", _ny_osp_lexists),
+             ("path.islink", _ny_osp_islink), ("path.samestat", _ny_osp_samestat),
+             ("path.samefile", _ny_osp_samefile), ("path.sameopenfile", _ny_osp_sameopenfile),
+             ("path.ismount", _ny_osp_ismount), ("path.isjunction", _ny_osp_isjunction),
+             ("path.isdevdrive", _ny_osp_isdevdrive), ("path.getatime", _ny_osp_getatime),
+             ("path.getctime", _ny_osp_getctime), ("path.commonprefix", _ny_osp_commonprefix),
+             ("path.curdir", _ny_os_curdir), ("path.pardir", _ny_os_pardir), ("path.extsep", _ny_os_extsep),
+             ("path.altsep", _ny_os_altsep), ("path.devnull", _ny_os_devnull),
+             ("path.defpath", _ny_os_defpath), ("path.supports_unicode_filenames", _ny_os_nt)]
+    if _ny_os_nt:
+        m.append(("path.join", _ny_osp_join))
+    for c in _ny_os_call("constants"):
+        m.append(c)
+    if not _ny_os_nt:
+        var ids = _ny_os_call("ids")
+        def idf(i):
+            def f():
+                return _ny_os_call("ids")[i]
+            return f
+        m.append(("getuid", idf(0)))
+        m.append(("geteuid", idf(1)))
+        m.append(("getgid", idf(2)))
+        m.append(("getegid", idf(3)))
+        m.append(("getpgrp", idf(4)))
+        def getgroups():
+            return _ny_os_call("getgroups")
+        def setsid():
+            _ny_os_call("setsid")
+        def getsid(pid):
+            return _ny_os_call("getsid", _ny_os_fd(pid))
+        def getpgid(pid):
+            return _ny_os_call("getpgid", _ny_os_fd(pid))
+        def setpgid(pid, pgrp):
+            _ny_os_call("setpgid", _ny_os_fd(pid), _ny_os_fd(pgrp))
+        def chown(path, uid, gid, *, dir_fd=None, follow_symlinks=True):
+            if isinstance(path, int) and not isinstance(path, bool):
+                return _ny_os_call("fchown", path, _ny_os_fd(uid), _ny_os_fd(gid))
+            _ny_os_call("chown", _ny_os_str(path), _ny_os_fd(uid), _ny_os_fd(gid), follow_symlinks)
+        def lchown(path, uid, gid):
+            _ny_os_call("lchown", _ny_os_str(path), _ny_os_fd(uid), _ny_os_fd(gid))
+        def fchown(fd, uid, gid):
+            _ny_os_call("fchown", _ny_os_fd(fd), _ny_os_fd(uid), _ny_os_fd(gid))
+        def fchmod(fd, mode):
+            _ny_os_call("fchmod", _ny_os_fd(fd), _ny_os_fd(mode))
+        def mkfifo(path, mode=0o666, *, dir_fd=None):
+            _ny_os_call("mkfifo", _ny_os_str(path), _ny_os_fd(mode))
+        def mknod(path, mode=0o600, device=0, *, dir_fd=None):
+            _ny_os_call("mknod", _ny_os_str(path), _ny_os_fd(mode), _ny_os_fd(device))
+        def major(device):
+            return _ny_os_call("major", _ny_os_fd(device))
+        def minor(device):
+            return _ny_os_call("minor", _ny_os_fd(device))
+        def makedev(major, minor):
+            return _ny_os_call("makedev", _ny_os_fd(major), _ny_os_fd(minor))
+        def getloadavg():
+            return _ny_os_call("getloadavg")
+        def killpg(pgid, sig):
+            _ny_os_call("killpg", _ny_os_fd(pgid), _ny_os_fd(sig))
+        for f in (getgroups, setsid, getsid, getpgid, setpgid, chown, lchown, fchown, fchmod, mkfifo, mknod,
+                  major, minor, makedev, getloadavg, killpg):
+            f.__module__ = "posix"
+            m.append((f.__name__, f))
+        m.append(("environb", _ny_os_environb))
+        m.append(("get_blocking", _ny_os_get_blocking))
+        m.append(("set_blocking", _ny_os_set_blocking))
+        if os_platform() == "linux":
+            def sched_getaffinity(pid):
+                return set(_ny_os_call("sched_getaffinity", _ny_os_fd(pid)))
+            m.append(("sched_getaffinity", sched_getaffinity))
+    return m
+
+_ny_os_members = _ny_os_member_list()
 )NYMIRRORS";
 }
 // The text of one chunk of builtin_mirrors_source() ("" if there is none).

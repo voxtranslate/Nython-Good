@@ -911,7 +911,8 @@ void install_vm_builtin_bridge(Runnable* runner) {
         [ex, vm](const std::string& n, std::vector<VMVal>& a) -> VMVal {
             BridgeConv conv(*ex);
             conv.vm = vm;
-            if (n.compare(0, 6, "_json_") == 0) conv.opaque = UNDEFINED_VALUE;
+            // (round 80: pickle's native fast path too - a function is not None)
+            if (n.compare(0, 6, "_json_") == 0 || n == "_ny_pickle_dumps") conv.opaque = UNDEFINED_VALUE;
             // Path-like objects (__fspath__) as the strings they stand for,
             // in a copy: the caller's arguments are left as they were.
             std::vector<VMVal> path_args;
