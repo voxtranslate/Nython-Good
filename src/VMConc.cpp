@@ -30,7 +30,7 @@ nyconc::BoxPtr box(const VMVal& v) { return std::make_shared<VMBox>(v); }
 
 struct VMThreadState {
     std::vector<VMVal> stack;
-    std::deque<CallFrame> calls;
+    FrameStack calls;   // (round 80: the VM's FrameStack, was std::deque)
     VMVal last_exc;
     bool export_globals = false;
 };

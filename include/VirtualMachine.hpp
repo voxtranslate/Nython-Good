@@ -191,6 +191,13 @@ enum class Op : uint8_t {
     CALL_FUNCTION_CLASS, // C(a, b): a plain class whose __init__ is a plain method taking a, b
     CALL_FUNCTION_NATIVE,// f(a, b) of a builtin (native)
     LOAD_GLOBAL_MOD,     // a `global` name: a slot of the module frame's map
+    // A method call's name (compiled so, for CALL_METHOD only): pushes a
+    // placeholder naming constants[arg] instead of a copy of the string -
+    // a long method name cost a heap allocation per call. CALL_METHOD
+    // reads the name through it (method_name_of). Its generic form is
+    // LOAD_CONST, which a copied code object gets back.
+    LOAD_METHNAME,
+    CALL_METHOD_BUILTIN, // s.m(...), xs.m(...), d.m(...) on a str, list or plain dict (its method table)
     OP_COUNT_
 };
 
@@ -202,7 +209,7 @@ inline Op base_op(Op op) {
     case Op::LOAD_ATTR_INST: case Op::LOAD_ATTR_CLASS: case Op::LOAD_ATTR_MODULE: return Op::LOAD_ATTR;
     case Op::STORE_ATTR_INST: return Op::STORE_ATTR;
     case Op::CALL_FUNCTION_PY: return Op::CALL_FUNCTION;
-    case Op::CALL_METHOD_PY: return Op::CALL_METHOD;
+    case Op::CALL_METHOD_PY: case Op::CALL_METHOD_BUILTIN: return Op::CALL_METHOD;
     case Op::BINARY_ADD_NUM: return Op::BINARY_ADD;
     case Op::BINARY_SUB_NUM: return Op::BINARY_SUB;
     case Op::BINARY_MUL_NUM: return Op::BINARY_MUL;
@@ -224,6 +231,7 @@ inline Op base_op(Op op) {
     case Op::UNPACK_SEQ_LIST: return Op::UNPACK_SEQ;
     case Op::CALL_FUNCTION_CLASS: case Op::CALL_FUNCTION_NATIVE: return Op::CALL_FUNCTION;
     case Op::LOAD_GLOBAL_MOD: return Op::LOAD_GLOBAL_NAME;
+    case Op::LOAD_METHNAME: return Op::LOAD_CONST;
     default: return op;
     }
 }
@@ -2493,6 +2501,7 @@ private:
         if(cn->callee->type()==NT::ATTRIBUTE){
             auto a=std::static_pointer_cast<nython::node::AttributeNode>(cn->callee);
             visit(a->object); emit_lc(VMVal::make_str(a->attr),l);
+            int name_at=C().here()-1;
             for(auto& arg:pos_args) visit(arg);
             if(has_kw){
                 for(size_t i=0;i<kw_names.size();i++){
@@ -2500,7 +2509,13 @@ private:
                 }
                 emit(Op::BUILD_MAP,(int)kw_names.size(),l);
                 emit(Op::CALL_KW,-(argc+1),l);   // negative: a method call
-            } else emit(Op::CALL_METHOD,argc,l);
+            } else {
+                // the method's name, for CALL_METHOD only: a placeholder
+                // naming the constant rather than a copy of the string
+                // (round 80; LOAD_METHNAME)
+                C().instructions[(size_t)name_at].op=Op::LOAD_METHNAME;
+                emit(Op::CALL_METHOD,argc,l);
+            }
         } else {
             visit(cn->callee);
             for(auto& arg:pos_args) visit(arg);
@@ -2875,6 +2890,68 @@ struct CallFrame {
     int trace_line = -1, trace_ip = -1, end_line = 0;
 };
 
+// The call stack (round 80). Frames never move once pushed - run_loop and
+// the call paths hold references to them across calls, as they did into the
+// std::deque this replaces - and they live in chunks that are kept when
+// frames are popped, so a call allocates no frame storage: a CallFrame is
+// larger than a deque node (512 bytes), so std::deque allocated and freed a
+// node for every call. Moving or swapping the stack (a GIL switch swaps a
+// thread's stacks out and in) moves the chunk pointers, not the frames.
+class FrameStack {
+    static constexpr size_t kChunk = 32;
+    std::vector<CallFrame*> chunks_;
+    size_t n_ = 0;
+    CallFrame* at(size_t i) const { return chunks_[i / kChunk] + (i % kChunk); }
+    CallFrame* next_slot() {
+        if (n_ / kChunk == chunks_.size())
+            chunks_.push_back(static_cast<CallFrame*>(::operator new(sizeof(CallFrame) * kChunk)));
+        return at(n_);
+    }
+    void release() {
+        while (n_) pop_back();
+        for (CallFrame* c : chunks_) ::operator delete(static_cast<void*>(c));
+        chunks_.clear();
+    }
+public:
+    FrameStack() = default;
+    FrameStack(const FrameStack&) = delete;
+    FrameStack& operator=(const FrameStack&) = delete;
+    FrameStack(FrameStack&& o) noexcept : chunks_(std::move(o.chunks_)), n_(o.n_) { o.chunks_.clear(); o.n_ = 0; }
+    FrameStack& operator=(FrameStack&& o) noexcept {
+        if (this != &o) { release(); chunks_ = std::move(o.chunks_); n_ = o.n_; o.chunks_.clear(); o.n_ = 0; }
+        return *this;
+    }
+    ~FrameStack() { release(); }
+    void swap(FrameStack& o) noexcept { chunks_.swap(o.chunks_); std::swap(n_, o.n_); }
+    size_t size() const { return n_; }
+    bool empty() const { return n_ == 0; }
+    CallFrame& operator[](size_t i) { return *at(i); }
+    const CallFrame& operator[](size_t i) const { return *at(i); }
+    CallFrame& back() { return *at(n_ - 1); }
+    const CallFrame& back() const { return *at(n_ - 1); }
+    CallFrame& front() { return *at(0); }
+    const CallFrame& front() const { return *at(0); }
+    void push_back(CallFrame&& f) { CallFrame* p = next_slot(); new (p) CallFrame(std::move(f)); n_++; }
+    CallFrame& emplace_back() { CallFrame* p = next_slot(); new (p) CallFrame(); n_++; return *p; }
+    void pop_back() { n_--; at(n_)->~CallFrame(); }
+    template<class F, class S> class Iter {
+        S* s_; size_t i_;
+    public:
+        Iter(S* s, size_t i) : s_(s), i_(i) {}
+        F& operator*() const { return (*s_)[i_]; }
+        F* operator->() const { return &(*s_)[i_]; }
+        Iter& operator++() { ++i_; return *this; }
+        bool operator!=(const Iter& o) const { return i_ != o.i_; }
+        bool operator==(const Iter& o) const { return i_ == o.i_; }
+    };
+    using iterator = Iter<CallFrame, FrameStack>;
+    using const_iterator = Iter<const CallFrame, const FrameStack>;
+    iterator begin() { return iterator(this, 0); }
+    iterator end() { return iterator(this, n_); }
+    const_iterator begin() const { return const_iterator(this, 0); }
+    const_iterator end() const { return const_iterator(this, n_); }
+};
+
 struct VMReturn   { VMVal value; };
 struct VMYield    { VMVal value; };
 // A raised exception travelling up the C++ stack: the exception object itself
@@ -2932,7 +3009,7 @@ class VirtualMachine : public Runnable {
     // a segfault on any keyword-argument call, e.g. g(1, key=2) or
     // sorted(xs, key=...). deque::push_back does not invalidate references to
     // existing elements.
-    std::deque<CallFrame>                              call_stack_;
+    FrameStack                                         call_stack_;   // (round 80: FrameStack, was std::deque)
     VMMap              globals_;
     EpochMap<std::string,std::shared_ptr<VMCode>> class_reg_;   // writes bump the type epoch (round 80)
     // Class namespaces by class name. Reads go through find() (const);
@@ -3569,7 +3646,7 @@ public:
             VMMap g; g.swap(globals_);
             std::unordered_map<std::string, VMMap> cv; class_vars_.swap(cv);
             std::vector<VMVal> st; st.swap(stack_);
-            std::deque<CallFrame> cs; cs.swap(call_stack_);
+            FrameStack cs; cs.swap(call_stack_);
             VMVal le; std::swap(le, last_exception_obj_);
             std::unordered_map<std::thread::id, VMHookFns> hk; hk.swap(pyhooks_);   // round 79
             nytrace::t_hooks = 0;
@@ -7047,10 +7124,13 @@ private:
             int argc=ins.arg;
             if((int)ns<argc+2) break;
             const VMVal& obj=stack_[ns-2-(size_t)argc];
-            const VMVal& mn=stack_[ns-1-(size_t)argc];
-            if(obj.type!=VMType::INSTANCE||!obj.map||mn.type!=VMType::STRING||obj.map->count(mn.s)) break;
+            const VMVal& mnv=stack_[ns-1-(size_t)argc];
+            if(mnv.type!=VMType::STRING&&!is_method_name_ph(mnv)) break;
+            const std::string& mn=method_name_of(mnv, code);
+            if(builtin_method_kind(obj, mn)){ to=Op::CALL_METHOD_BUILTIN; break; }
+            if(obj.type!=VMType::INSTANCE||!obj.map||obj.map->count(mn)) break;
             c.nways=0; c.epoch=vm_type_epoch();
-            if(method_way(c, obj, mn.s, argc)) to=Op::CALL_METHOD_PY;
+            if(method_way(c, obj, mn, argc)) to=Op::CALL_METHOD_PY;
             break;
         }
         case Op::BINARY_ADD: case Op::BINARY_SUB: case Op::BINARY_MUL: case Op::BINARY_DIV:
@@ -7105,6 +7185,31 @@ private:
         return true;
     }
     static bool small_int(const VMVal& v) { return v.type==VMType::INT&&v.s.empty(); }
+    // LOAD_METHNAME's placeholder: UNDEFINED tagged so, the constant's
+    // index in i (round 80).
+    static const std::string& method_name_tag() { static const std::string t("\x01methname"); return t; }
+    static bool is_method_name_ph(const VMVal& v) { return v.type==VMType::UNDEFINED&&v.s==method_name_tag(); }
+    // CALL_METHOD_BUILTIN: which method table vm_call_method would end in
+    // for obj.mn(...) - 1 a str's (call_str_method), 2 a list's or set's
+    // (call_list_method), 3 a plain dict's (call_map_method, a dict method
+    // name winning over a key) - after none of the checks before them
+    // applies: not an operator, protocol or dunder name (primitive_member,
+    // builtin_value_dunder). 0 for anything else.
+    int builtin_method_kind(const VMVal& obj, const std::string& mn) {
+        if(mn.empty()||(!std::isalnum((unsigned char)mn[0])&&mn[0]!='_')) return 0;
+        if(mn[0]=='_'&&mn.size()>1&&mn[1]=='_') return 0;
+        if(mn=="class_name"||mn=="type_name"||mn=="to_string") return 0;
+        if(obj.type==VMType::STRING) return 1;
+        if(obj.type==VMType::LIST) return 2;
+        if(obj.type==VMType::MAP&&obj.map&&obj.class_name.empty()&&dict_method_wins(obj, mn)) return 3;
+        return 0;
+    }
+    // A CALL_METHOD's method name: the string, or the constant a
+    // placeholder names.
+    static const std::string& method_name_of(const VMVal& v, const VMCode& code) {
+        if(v.type==VMType::UNDEFINED&&v.s==method_name_tag()&&v.i>=0&&(size_t)v.i<code.constants.size()) return code.constants[(size_t)v.i].s;
+        return v.s;
+    }
     // Rewrites a number on the stack in place into a fresh int / float /
     // bool: what make_int / make_float / make_bool would build, without
     // building and moving a value (the common case: no field to reset).
@@ -7360,12 +7465,43 @@ private:
                 const size_t n=stack_.size();
                 if(n>=(size_t)argc+2){
                     const VMVal& obj=stack_[n-2-(size_t)argc];
-                    const VMVal& mn=stack_[n-1-(size_t)argc];
-                    if(obj.type==VMType::INSTANCE&&obj.map&&mn.type==VMType::STRING){
-                        const VMVal* m=method_way(fr.code->quick.ic[ins.ic-1], obj, mn.s, argc);
+                    const VMVal& mnv=stack_[n-1-(size_t)argc];
+                    if(obj.type==VMType::INSTANCE&&obj.map&&(mnv.type==VMType::STRING||is_method_name_ph(mnv))){
+                        const std::string& mn=method_name_of(mnv, *fr.code);
+                        const VMVal* m=method_way(fr.code->quick.ic[ins.ic-1], obj, mn, argc);
                         // (re-checked: a code object's flags can change)
-                        if(plain_method(m, argc)&&!(any_getattribute_&&getattribute_hook(obj))&&!obj.map->count(mn.s)){
+                        if(plain_method(m, argc)&&!(any_getattribute_&&getattribute_hook(obj))&&!obj.map->count(mn)){
                             call_py_fast(n-2-(size_t)argc, argc, m, true);
+                            break;
+                        }
+                    }
+                }
+                NY_MISS(CALL_METHOD);
+            }
+            case Op::CALL_METHOD_BUILTIN: {
+                // vm_call_method's way to a str / list / dict method,
+                // without its chain of checks or the copies of the receiver
+                // it makes on the way (a c_call for the profile function
+                // goes the generic way)
+                const int argc=ins.arg;
+                const size_t n=stack_.size();
+                if(n>=(size_t)argc+2&&!(nytrace::t_hooks&nytrace::PROFILE)){
+                    const size_t head=n-2-(size_t)argc;
+                    const VMVal& mnv=stack_[head+1];
+                    if(mnv.type==VMType::STRING||is_method_name_ph(mnv)){
+                        int kind=builtin_method_kind(stack_[head], method_name_of(mnv, *fr.code));
+                        if(kind){
+                            // the name outlives the stack slots (a placeholder's is a constant)
+                            std::string own;
+                            const std::string* mn=&method_name_of(mnv, *fr.code);
+                            if(!is_method_name_ph(mnv)){ own=mnv.s; mn=&own; }
+                            std::vector<VMVal> args;
+                            args.reserve((size_t)argc);
+                            for(size_t k=head+2;k<n;k++) args.push_back(std::move(stack_[k]));
+                            VMVal o=std::move(stack_[head]);
+                            stack_.resize(head);
+                            VMVal r=kind==1?str_call(o,*mn,args):kind==2?list_call(o,*mn,args):call_map_method(o,*mn,args);
+                            stack_.push_back(std::move(r));
                             break;
                         }
                     }
@@ -7580,6 +7716,12 @@ private:
 #undef NY_MISS
 
             case Op::LOAD_CONST:  push(fr.code->constants[ins.arg]); break;
+            case Op::LOAD_METHNAME: {   // round 80
+                stack_.emplace_back();
+                VMVal& p=stack_.back();
+                p.type=VMType::UNDEFINED; p.s=method_name_tag(); p.i=ins.arg;
+                break;
+            }
             case Op::LOAD_NAME: {
                 NY_QUICKEN();   // round 80
                 // Reading a name bound nowhere raises NameError (it read none).
@@ -8383,15 +8525,16 @@ private:
                 std::vector<VMVal> args(argc);
                 for(int i=argc-1;i>=0;i--) args[i]=pop();
                 VMVal mname=pop(); VMVal obj=pop();
+                const std::string& mn=method_name_of(mname, *fr.code);   // round 80
                 // a builtin value's method (xs.append(1)), a module's native
                 // (math.sqrt(x)): c_call ... (round 79)
-                if(__builtin_expect(nytrace::t_hooks&nytrace::PROFILE,0)&&obj.type!=VMType::INSTANCE&&obj.type!=VMType::CLASS&&!nytrace::no_c_call(mname.s)){
+                if(__builtin_expect(nytrace::t_hooks&nytrace::PROFILE,0)&&obj.type!=VMType::INSTANCE&&obj.type!=VMType::CLASS&&!nytrace::no_c_call(mn)){
                     VMVal m;
-                    if(try_get_attr(obj,mname.s,m)&&m.type==VMType::NATIVE){
-                        push(vm_profile_builtin(m,[&](){ return vm_call_method(obj,mname.s,args); })); break;
+                    if(try_get_attr(obj,mn,m)&&m.type==VMType::NATIVE){
+                        push(vm_profile_builtin(m,[&](){ return vm_call_method(obj,mn,args); })); break;
                     }
                 }
-                push(vm_call_method(obj,mname.s,args)); break;
+                push(vm_call_method(obj,mn,args)); break;
             }
             // A return used to throw VMReturn, caught (and rethrown once) on the
             // way out: two C++ unwinds per call, ~90% of a function call's cost
@@ -13466,7 +13609,13 @@ private:
     }
     VMVal str_method(VMVal obj, const std::string& m) {
         VirtualMachine* vm=this;
-        return VMVal::make_native([obj,m,vm](std::vector<VMVal>& a)->VMVal{
+        return VMVal::make_native([obj,m,vm](std::vector<VMVal>& a)->VMVal{ return vm->str_call(obj,m,a); });
+    }
+    // A str's method m called with a: str_method's native, which
+    // call_str_method calls directly (round 80, as list_call).
+    VMVal str_call(const VMVal& obj, const std::string& m, std::vector<VMVal>& a) {
+        VirtualMachine* vm=this;
+        {
             VMVal kw=take_kwargs(a);
             if(m=="format") return VMVal::make_str(vm->str_format(obj.s,a,kw.type==VMType::MAP?&kw:nullptr));
             if(m=="format_map"){
@@ -13498,11 +13647,10 @@ private:
             nypy::SRes r;
             if(vm->nycall([&]{ return nypy::str_method(obj.s,m,sa,r); })) return from_sres(r);
             return vm->missing_attr(obj,m);
-        });
+        }
     }
     VMVal call_str_method(VMVal obj, const std::string& m, std::vector<VMVal>& a) {
-        VMVal fn=str_method(obj,m);
-        return fn.type==VMType::NATIVE?fn.native(a):VMVal::make_none();
+        return str_call(obj,m,a);   // (round 80: str_method's native, without making it)
     }
 
     // ── Built-in list methods ───────────────────────────────────────────
@@ -13602,7 +13750,14 @@ private:
     }
     VMVal list_method(VMVal obj, const std::string& m) {
         VirtualMachine* vm=this;
-        return VMVal::make_native([obj,m,vm](std::vector<VMVal>& a)->VMVal{
+        return VMVal::make_native([obj,m,vm](std::vector<VMVal>& a)->VMVal{ return vm->list_call(obj,m,a); });
+    }
+    // A list's (or set's) method m called with a: list_method's native,
+    // which call_list_method calls directly (round 80: it made the native,
+    // a copy of the list value in a std::function, for every call).
+    VMVal list_call(const VMVal& obj, const std::string& m, std::vector<VMVal>& a) {
+        VirtualMachine* vm=this;
+        {
             if(!obj.list) return VMVal::make_none();
             if(obj.is_set()){
                 VMVal so=obj, out;
@@ -13726,11 +13881,10 @@ private:
                 for(int64_t k=0,i=st;k<n;k++,i+=step) sub.push_back(lst[(size_t)i]);
                 VMVal r=VMVal::make_list(std::move(sub)); r.b=obj.b; return r;}
             return vm->missing_attr(obj,m);
-        });
+        }
     }
     VMVal call_list_method(VMVal obj, const std::string& m, std::vector<VMVal>& a) {
-        VMVal fn=list_method(obj,m);
-        return fn.type==VMType::NATIVE?fn.native(a):VMVal::make_none();
+        return list_call(obj,m,a);   // (round 80: list_method's native, without making it)
     }
 
     // ── Built-in registration ───────────────────────────────────────────
@@ -15084,6 +15238,8 @@ private:
         case Op::CALL_FUNCTION_CLASS: return "CALL_FUNCTION_CLASS";
         case Op::CALL_FUNCTION_NATIVE: return "CALL_FUNCTION_NATIVE";
         case Op::LOAD_GLOBAL_MOD: return "LOAD_GLOBAL_MOD";
+        case Op::LOAD_METHNAME: return "LOAD_METHNAME";
+        case Op::CALL_METHOD_BUILTIN: return "CALL_METHOD_BUILTIN";
         case Op::STORE_GLOBAL_NAME: return "STORE_GLOBAL_NAME";
         case Op::JUMP_IF_NONE_KEEP: return "JUMP_IF_NONE_KEEP";
         case Op::JUMP_IF_MISSING_KEEP: return "JUMP_IF_MISSING_KEEP";
