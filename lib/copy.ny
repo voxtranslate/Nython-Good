@@ -280,6 +280,9 @@ def _reduce(x, cls):
         return x.__reduce_ex__(4)
     if _own_hook(cls, "__reduce__"):
         return x.__reduce__()
+    # __new__'s arguments: object.__reduce_ex__(4) as CPython makes it
+    if _own_hook(cls, "__getnewargs_ex__") or _own_hook(cls, "__getnewargs__"):
+        return copyreg._ny_reduce_newobj(x)
     return none
 
 

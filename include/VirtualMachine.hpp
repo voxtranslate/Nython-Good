@@ -5356,8 +5356,15 @@ private:
         VMVal d=VMVal::make_map();
         if(obj.type==VMType::INSTANCE&&obj.map)
             for(auto& kv:*obj.map)
-                if(kv.first!="\x01weakref"&&!nyrt::hidden_field(kv.first)) (*d.map)[nypy::key_of_str(kv.first)]=kv.second;
+                if(kv.first!="\x01weakref"&&!nyrt::hidden_field(kv.first)
+                   &&(slot_flags_.empty()||!is_slot_of(obj,kv.first)))   // a slot's value is not in __dict__ (round 79)
+                    (*d.map)[nypy::key_of_str(kv.first)]=kv.second;
         return d;
+    }
+    // obj's class holds a slot (a member descriptor) named n (round 79)
+    bool is_slot_of(const VMVal& obj, const std::string& n) {
+        VMVal d;
+        return class_lookup(obj.class_name, n, d)&&d.type==VMType::INSTANCE&&d.class_name=="_NyMemberDescriptor";
     }
     VMVal instance_dict_view(const VMVal& obj) {
         if(obj.type!=VMType::INSTANCE||!obj.map) return instance_fields(obj);
@@ -9103,8 +9110,7 @@ private:
             }
             if(attr=="__dict__"){
                 // (none for a class with __slots__ and no __dict__ - round 79)
-                if(!slot_flags_.empty()&&is_dictless(obj))
-                    raise_native_exception("AttributeError","'"+nyrt::shown_class_name(obj.class_name)+"' object has no attribute '__dict__'");
+                if(!slot_flags_.empty()&&is_dictless(obj)) return false;
                 // a live view of the fields (round 77; it was a copy): names
                 // as dict keys, self.__x__ listed too, the engine's hidden
                 // fields left out
@@ -9604,7 +9610,8 @@ private:
             std::vector<std::pair<std::string,VMVal>> items;
             for(auto& kv:*src.map) if(!vm_internal_key(kv.first)&&nypy::key_kind(kv.first)==nypy::K_STR) items.push_back({nypy::key_payload(kv.first),kv.second});
             std::vector<std::string> drop;
-            for(auto& kv:*obj.map) if(kv.first!="\x01weakref"&&!nyrt::hidden_field(kv.first)) drop.push_back(kv.first);
+            for(auto& kv:*obj.map)
+                if(kv.first!="\x01weakref"&&!nyrt::hidden_field(kv.first)&&(slot_flags_.empty()||!is_slot_of(obj,kv.first))) drop.push_back(kv.first);   // (slots stay - round 79)
             for(auto& d:drop) obj.map->erase(d);
             for(auto& kv:items) (*obj.map)[kv.first]=kv.second;
             return;

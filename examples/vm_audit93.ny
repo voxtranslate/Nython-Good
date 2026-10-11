@@ -677,6 +677,30 @@ check("add (recursive, filter) and append on disk",
       [["tree", "tree/inner", "tree/inner/two.txt", "tree/one.txt", "filtered", "filtered/inner", "filtered/one.txt"],
        ["one.txt", "two.txt"], b"two", "FileExistsError:"])
 
+# the command lines (Nython's binary; python3's own -m zipfile/-m tarfile are CPython's)
+if nython:
+    import subprocess
+
+    def run_cli(*argv):
+        r = subprocess.run([sys.executable] + list(argv), capture_output=True, text=True)
+        return [r.returncode, r.stdout]
+
+    cz = os.path.join(TMP, "cli.zip")
+    ct = os.path.join(TMP, "cli.tar.gz")
+    c1 = run_cli("-m", "zipfile", "-c", cz, srcf)
+    c2 = run_cli("-m", "zipfile", "-l", cz)
+    c3 = run_cli("-m", "zipfile", "-t", cz)
+    c4 = run_cli("-m", "zipfile", "-e", cz, os.path.join(TMP, "cliout"))
+    c5 = run_cli("-m", "tarfile", "-c", ct, srcf)
+    c6 = run_cli("-m", "tarfile", "-l", ct)
+    c7 = run_cli("-m", "tarfile", "-e", ct, os.path.join(TMP, "cliout2"))
+    check("nython -m zipfile and -m tarfile",
+          [c1[0], c2[1].split("\n")[1].split()[0], c3[1].strip(), open(os.path.join(TMP, "cliout", "src.txt")).read()[:9],
+           c5[0], c6[1].strip().endswith("src.txt"), c7[0], zipfile.is_zipfile(cz), tarfile.is_tarfile(ct)],
+          [0, "src.txt", "Done testing", "from disk", 0, True, 0, True, True])
+else:
+    check("nython -m zipfile and -m tarfile", True, True)
+
 # ═══ pickle ══════════════════════════════════════════════════════════════════
 shared = [1, 2]
 d1 = {"a": 1, "b": [1, 2, 3], "c": (1, 2)}
@@ -911,6 +935,32 @@ pb_data = pickle.dumps(pickle.PickleBuffer(bytearray(b"out of band")), 5, buffer
 check("protocol 5: out-of-band buffers", [pb_data, len(bufs), bytes(pickle.loads(pb_data, buffers=[bytearray(b"out of band")])),
                                           pickle.dumps(pickle.PickleBuffer(b"in band"), 5)],
       [b"\x80\x05\x97.", 1, b"out of band", b"\x80\x05\x95\x0b\x00\x00\x00\x00\x00\x00\x00C\x07in band\x94."])
+class SafeUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module == "builtins" and name == "set":
+            return set
+        raise pickle.UnpicklingError("global '" + module + "." + name + "' is forbidden")
+
+
+check("find_class restricts globals", [SafeUnpickler(io.BytesIO(pickle.dumps({1, 2}, 3))).load(),
+                                       raises(SafeUnpickler(io.BytesIO(pickle.dumps(Point(1, 2), 4))).load)],
+      [{1, 2}, "UnpicklingError: global '__main__.Point' is forbidden"])
+# CPython's pickles of Point(1, 2) at protocols 0, 2 and 4
+cp_points = [b"ccopy_reg\n_reconstructor\np0\n(c__main__\nPoint\np1\nc__builtin__\nobject\np2\nNtp3\nRp4\n(dp5\nVx\np6\nI1\nsVy\np7\nI2\nsb.",
+             b"\x80\x02c__main__\nPoint\nq\x00)\x81q\x01}q\x02(X\x01\x00\x00\x00xq\x03K\x01X\x01\x00\x00\x00yq\x04K\x02ub.",
+             b"\x80\x04\x95*\x00\x00\x00\x00\x00\x00\x00\x8c\x08__main__\x94\x8c\x05Point\x94\x93\x94)\x81\x94}\x94(\x8c\x01x\x94K\x01\x8c\x01y\x94K\x02ub."]
+check("CPython's pickles of an instance", [[type(pickle.loads(b)).__name__ for b in cp_points], [pickle.loads(b) == Point(1, 2) for b in cp_points],
+                                           [pickle.dumps(Point(1, 2), p) for p in (0, 2, 4)] == cp_points],
+      [["Point", "Point", "Point"], [True, True, True], True])
+pm = io.BytesIO()
+pp = pickle.Pickler(pm, 2)
+pp.dump(shared)
+pp.dump(shared)
+pp.clear_memo()
+pp.dump(shared)
+pu = pickle.Unpickler(io.BytesIO(pm.getvalue()))
+check("a Pickler's memo across dumps, clear_memo", [len(pm.getvalue()), pu.load(), pu.load(), pu.load()],
+      [29, [1, 2], [1, 2], [1, 2]])
 pk = os.path.join(TMP, "data.pkl")
 with open(pk, "wb") as f:
     pickle.dump({"a": [1, 2]}, f)
@@ -926,6 +976,9 @@ dc = copy.deepcopy(sl)
 check("copy and deepcopy of slotted objects", [type(cs).__name__, cs.x, cs.y is sl.y, dc.y == sl.y, dc.y is sl.y],
       ["Slotted", 1, True, True, False])
 check("copy of an object with slots and __dict__", [copy.copy(swd).x, copy.copy(swd).extra], [1, 2])
+check("copy through __getnewargs__ / __getnewargs_ex__ / __reduce__", [copy.copy(NewArgs(3)).v, copy.deepcopy(NewArgsEx(4, b=5)).b,
+                                                                       copy.copy(Red(2)).a, copy.deepcopy(WithState()).secret],
+      [3, 5, 4, "restored"])
 check("object.__reduce_ex__ and copyreg", [Point(1, 2).__reduce_ex__(2)[0] is copyreg.__newobj__, Point(1, 2).__reduce_ex__(2)[1] == (Point,),
                                            Point(1, 2).__reduce_ex__(1)[0] is copyreg._reconstructor, Point(1, 2).__getstate__(),
                                            NewArgs(3).__reduce_ex__(2)[1] == (NewArgs, 3)],
@@ -971,6 +1024,37 @@ check("range errors, CPython's messages",
        "ValueError: bad typecode (must be b, B, u, h, H, i, I, l, L, q, Q, f or d)",
        "TypeError: can only append array (not \"list\") to array", "TypeError: bad argument type for built-in operation",
        "TypeError: unhashable type: 'array.array'"])
+check("constructors", [array("i", range(3)), list(array("B", b"ab")), array("i", [True]), array("f", [1e300]),
+                       array("d", array("i", [1, 2])), raises(array, "i", array("d", [1.0])), raises(array, "i", "abc"),
+                       raises(array, "u", [1])],
+      [array("i", [0, 1, 2]), [97, 98], array("i", [1]), array("f", [float("inf")]), array("d", [1.0, 2.0]),
+       "TypeError: 'float' object cannot be interpreted as an integer", "TypeError: cannot use a str to initialize an array with typecode 'i'",
+       "TypeError: array item must be unicode character"])
+ax = array("i", [1, 2, 3, 4])
+ax[::2] = array("i", [9, 9])
+
+def bad_extended():
+    ax[::2] = array("i", [1])
+
+def bad_slice():
+    ax[0:1] = [5]
+
+def bad_item():
+    ax[0] = 2 ** 40
+
+check("extended slices, item errors", [ax, raises(bad_extended), raises(bad_slice), raises(bad_item), raises(lambda: ax[10]),
+                                       raises(array("i").pop), raises(ax.pop, 10), raises(ax.index, 7), raises(ax.remove, 7),
+                                       raises(ax.extend, array("d", [1.0])), ax.index(9, 1)],
+      [array("i", [9, 2, 9, 4]), "ValueError: attempt to assign array of size 1 to extended slice of size 2",
+       "TypeError: can only assign array (not \"list\") to array slice", "OverflowError: signed integer is greater than maximum",
+       "IndexError: array index out of range", "IndexError: pop from empty array", "IndexError: pop index out of range",
+       "ValueError: array.index(x): x not in array", "ValueError: array.remove(x): x not in array",
+       "TypeError: can only extend with array of same kind", 2])
+ay = array("b", [1])
+ay += array("b", [2])
+ay *= 2
+check("in-place operators, iteration, buffer_info", [ay, list(ay), [x * 2 for x in ay], ay.buffer_info()[1], array("i", [5]) in [array("i", [5])]],
+      [array("b", [1, 2, 1, 2]), [1, 2, 1, 2], [2, 4, 2, 4], 4, True])
 af = os.path.join(TMP, "arr.bin")
 with open(af, "wb") as f:
     array("H", [1, 2, 3]).tofile(f)

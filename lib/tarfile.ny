@@ -287,7 +287,7 @@ def copyfileobj(src, dst, length=none, exception=OSError, bufsize=none):
 def _filemode(mode):
     var kinds = [(0o140000, "s"), (0o120000, "l"), (0o100000, "-"), (0o060000, "b"), (0o040000, "d"),
                  (0o020000, "c"), (0o010000, "p")]
-    var k = "-"
+    var k = "?"
     for pair in kinds:
         if (mode & 0o170000) == pair[0]:
             k = pair[1]
@@ -1348,12 +1348,12 @@ class TarFile:
                     print("????-??-?? ??:??:??", end=" ")
                 else:
                     print("%d-%02d-%02d %02d:%02d:%02d" % tuple(time.localtime(tarinfo.mtime))[:6], end=" ")
-            print(tarinfo.name + ("/" if tarinfo.isdir() else ""), end="")
+            print(tarinfo.name + ("/" if tarinfo.isdir() else ""), end=" ")
             if verbose:
                 if tarinfo.issym():
-                    print(" -> " + tarinfo.linkname, end="")
+                    print("-> " + tarinfo.linkname, end=" ")
                 if tarinfo.islnk():
-                    print(" link to " + tarinfo.linkname, end="")
+                    print("link to " + tarinfo.linkname, end=" ")
             print()
 
     def add(self, name, arcname=none, recursive=true, filter=none):

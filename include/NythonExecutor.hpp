@@ -2651,7 +2651,8 @@ public:   // NythonExecutor is a struct: members default to public
             for (auto& k : keys) { auto it = dictFind(sc, k); vals.push_back(it != sc->container->end() ? it->second : NONE_VALUE); }
             Context* f = fieldsOf(obj, "__dict__");
             std::vector<std::string> drop;
-            if (f->container) for (auto& kv : *f->container) if (!nyrt::hidden_field(kv.first)) drop.push_back(kv.first);
+            if (f->container) for (auto& kv : *f->container)
+                if (!nyrt::hidden_field(kv.first) && (!member_desc_node_ || !isSlotOf(obj, kv.first))) drop.push_back(kv.first);   // (slots stay - round 79)
             for (auto& d : drop) f->container->erase(d);
             for (size_t i = 0; i < keys.size(); i++) if (isStringValue(keys[i])) f->defineByName(getStringValue(keys[i]), vals[i]);
             return;
@@ -12142,7 +12143,8 @@ public:
         auto pit = instance_properties.find(obj.value.p);
         if (obj.type == ValueType::USERDATA && obj.value.p && pit != instance_properties.end() && pit->second && pit->second->container)
             for (auto& kv : *pit->second->container)
-                if (!nyrt::hidden_field(kv.first)) (*d->container)[nypy::key_of_str(kv.first)] = kv.second;
+                if (!nyrt::hidden_field(kv.first) && (!member_desc_node_ || !isSlotOf(obj, kv.first)))   // a slot's value is not in __dict__ (round 79)
+                    (*d->container)[nypy::key_of_str(kv.first)] = kv.second;
         return dv;
     }
     Value instanceDictView(const Value& obj) {
