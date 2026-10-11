@@ -4,7 +4,9 @@
 #include "NyGC.hpp"
 #include "NyCoro.hpp"
 #include "NyConc.hpp"
+#include "NyRange.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <exception>
 #include <unordered_map>
@@ -32,13 +34,21 @@ enum class Mode : uint8_t { Next, Send, Throw, Close, Kill };
 enum class Op : uint8_t { Zip, Map, Filter, Enumerate, Islice, Iter, CallIter };
 
 // A position in anything iterable, advanced one value at a time.
+// Round 78: RANGE is any range of 64-bit ints (first, step, count), DICT a
+// live walk of a dict's entries (keys, values or items, either way, raising
+// "dictionary changed size during iteration" as CPython's dict iterators
+// do), REVSEQ a list/tuple read backwards (CPython's list_reverseiterator).
 struct Cursor {
-    enum K : uint8_t { END, SEQ, VEC, RANGE, GEN, INST, GETITEM };
+    enum K : uint8_t { END, SEQ, VEC, RANGE, GEN, INST, GETITEM, DICT, REVSEQ };
     K k = END;
     Value hold;                 // the iterated object, kept alive
-    Container* c = nullptr;     // SEQ: a list/tuple read by index (length re-read each step)
-    int64_t i = 0, n = 0;       // SEQ/VEC/RANGE/GETITEM position; RANGE end
-    std::vector<Value> v;       // VEC: a snapshot (dict keys, a string's characters, a set)
+    Container* c = nullptr;     // SEQ/REVSEQ: a list/tuple read by index (length re-read each step); DICT: the dict
+    int64_t i = 0, n = 0;       // SEQ/VEC/RANGE/GETITEM/REVSEQ position; RANGE count
+    int64_t first = 0, st = 1;  // RANGE: the first value and the step (round 78)
+    size_t slot = 0, size0 = 0; // DICT: the next slot, and the dict's size when it started
+    uint8_t dk = 0;             // DICT: 0 keys, 1 values, 2 (key, value) items
+    bool rev = false;           // DICT: backwards
+    std::vector<Value> v;       // VEC: a snapshot (a string's characters, a set)
     Gen* g = nullptr;           // GEN
     Value it;                   // INST: the iterator (has __next__)
     Value stop_value;           // INST: the value of the StopIteration that ended it
@@ -102,6 +112,7 @@ struct Gen {
     Value fnv;
     Value idx;                    // enumerate's next index
     int64_t cnt = 0, nxt = 0, stop = -1, step = 1;   // islice
+    bool strict = false;          // zip(..., strict=True) (round 78)
 };
 
 namespace {
@@ -210,11 +221,18 @@ void report_ignored(NythonExecutor& E, Gen* g, const std::string& s) {
 }
 
 // ── Cursors ─────────────────────────────────────────────────────────────────
+// A live walk of dict c (round 78); cu.hold keeps the dict alive.
+void open_dict(Cursor& cu, Container* c, uint8_t kind, bool rev) {
+    cu.k = Cursor::DICT; cu.c = c; cu.dk = kind; cu.rev = rev;
+    cu.size0 = c->container->size();
+    cu.slot = rev ? c->container->slot_end() : 0;
+}
+
 void open(NythonExecutor& E, const Value& val, Context* ctx, Cursor& cu, bool owns = false) {
     cu = Cursor();
     cu.hold = val;
     if (Gen* g = gen_of(val)) { cu.k = Cursor::GEN; cu.g = g; cu.owns = owns; return; }
-    if (val.type == ValueType::INTEGER) {   // range(n) is an integer on this engine
+    if (val.type == ValueType::INTEGER) {   // the legacy `for i in n` (0 .. n-1)
         cu.k = Cursor::RANGE; cu.n = bigint_to_i64(val.value.i); return;
     }
     if (E.isBytesValue(val)) { cu.k = Cursor::VEC; cu.v = E.iterItems(val, ctx); return; }
@@ -226,9 +244,22 @@ void open(NythonExecutor& E, const Value& val, Context* ctx, Cursor& cu, bool ow
     if (Container* c = E.contOf(val)) {
         int64_t n = NythonExecutor::seqLen(c);
         if (n >= 0 && !NythonExecutor::isSetCont(c)) { cu.k = Cursor::SEQ; cu.c = c; return; }
+        if (n < 0) { open_dict(cu, c, 0, false); return; }   // a dict's keys, live (round 78)
         cu.k = Cursor::VEC;
-        cu.v = E.iterItems(val, ctx);   // a set's items, a dict's typed keys
+        cu.v = E.iterItems(val, ctx);   // a set's items
         return;
+    }
+    // A range of 64-bit ints and a dict view: natively (round 78); a big
+    // range goes through its __iter__ below.
+    {
+        int64_t a, b, s;
+        if (E.rangeOf(val, a, b, s)) {
+            int64_t n;
+            if (nyrt::range_len(a, b, s, n)) { cu.k = Cursor::RANGE; cu.first = a; cu.st = s; cu.n = n; return; }
+        }
+        Value dv;
+        int kind = E.viewOf(val, &dv);
+        if (kind >= 0) { cu.hold = dv; open_dict(cu, E.contOf(dv), (uint8_t)kind, false); return; }
     }
     if (E.isInstanceValue(val)) {
         std::vector<Value> none;
@@ -267,8 +298,37 @@ bool step(NythonExecutor& E, Cursor& cu, Value& out, Context* ctx) {
         return true;
     case Cursor::RANGE:
         if (cu.i >= cu.n) { cu.k = Cursor::END; return false; }
-        out = intValue(cu.i++);
+        out = intValue(nyrt::range_at(cu.first, cu.st, cu.i++));
         return true;
+    case Cursor::DICT: {
+        // CPython's dictiter_iternextkey & co: a size change raises, and
+        // keeps raising (round 78)
+        auto* m = cu.c->container;
+        if (m->size() != cu.size0) {
+            cu.size0 = (size_t)-1;
+            raise("RuntimeError", "dictionary changed size during iteration");
+        }
+        for (;;) {
+            const std::pair<std::string, Value>* kv;
+            if (cu.rev) { if (cu.slot == 0) break; kv = m->slot_at(--cu.slot); }
+            else { if (cu.slot >= m->slot_end()) break; kv = m->slot_at(cu.slot++); }
+            if (!kv || NythonExecutor::isInternalKey(kv->first)) continue;
+            if (cu.dk == 0) out = E.keyValue(kv->first);
+            else if (cu.dk == 1) out = kv->second;
+            else out = E.makeListValue({E.keyValue(kv->first), kv->second}, true);
+            return true;
+        }
+        cu.k = Cursor::END;
+        return false;
+    }
+    case Cursor::REVSEQ: {
+        // CPython's listreviter_next: stops once the index leaves the list
+        int64_t n = NythonExecutor::seqLen(cu.c);
+        if (cu.i < 0 || cu.i >= n) { cu.k = Cursor::END; return false; }
+        auto it = cu.c->container->find(std::to_string(cu.i--));
+        out = it != cu.c->container->end() ? it->second : NONE_VALUE;
+        return true;
+    }
     case Cursor::GEN:
         if (next(E, cu.g, out, ctx)) return true;
         cu.k = Cursor::END;
@@ -567,9 +627,25 @@ bool native_next(NythonExecutor& E, Gen* g, Value& out, Context* ctx) {
         if (g->src.empty()) return false;
         std::vector<Value> row;
         row.reserve(g->src.size());
-        for (auto& s : g->src) {
+        for (size_t k = 0; k < g->src.size(); k++) {
             Value v;
-            if (!step(E, s, v, ctx)) return false;
+            if (!step(E, g->src[k], v, ctx)) {
+                // strict=True: every argument must end together (CPython's
+                // zip_next messages, round 78)
+                if (g->strict) {
+                    std::string plural = k == 1 ? " " : "s 1-";
+                    if (k > 0)
+                        raise("ValueError", "zip() argument " + std::to_string(k + 1) + " is shorter than argument" + plural + std::to_string(k));
+                    for (size_t j = 1; j < g->src.size(); j++) {
+                        Value w;
+                        if (step(E, g->src[j], w, ctx)) {
+                            std::string pl = j == 1 ? " " : "s 1-";
+                            raise("ValueError", "zip() argument " + std::to_string(j + 1) + " is longer than argument" + pl + std::to_string(j));
+                        }
+                    }
+                }
+                return false;
+            }
             row.push_back(v);
         }
         out = E.makeListValue(row, true);
@@ -644,6 +720,10 @@ bool machine_next(NythonExecutor& E, Gen* g, Value& out, Context* ctx) {
     try {
         got = g->kind == Kind::GenExpr ? genexpr_next(E, g, out) : native_next(E, g, out, ctx);
     } catch (...) {
+        // a dict iterator that saw its dict change size keeps raising, as
+        // CPython's does (round 78); anything else is finished
+        if (g->kind == Kind::Native && g->op == Op::Iter && g->src.size() == 1 && g->src[0].k == Cursor::DICT
+            && g->src[0].size0 == (size_t)-1) { g->st = St::Suspended; throw; }
         finish(E, g);
         throw;
     }
@@ -1161,20 +1241,24 @@ bool builtin(NythonExecutor& E, const std::string& name, std::vector<Value>& arg
         return true;
     }
     if (name == "zip" || name == "map" || name == "filter" || name == "enumerate") {
-        size_t first = (name == "map" || name == "filter") ? 1 : 0;
-        size_t last = name == "enumerate" ? 1 : args.size();
-        bool lazy = false;
-        for (size_t i = first; i < last && i < args.size(); i++)
-            if (is_gen(args[i]) || iterator_object(E, args[i])) lazy = true;
-        if (!lazy) return false;
+        // Lazy over every iterable, as Python's (round 78: over lists they
+        // returned lists; only a generator or an iterator object made them
+        // lazy).
         if (name == "zip") {
+            const Value* sv = kwv("strict");
+            bool strict = sv && E.isTruthy(*sv);
             E.cur_kwargs_ = nullptr;
             Value res = make_native(E, Op::Zip, "zip");
             Gen* g = gen_of(res);
             g->src.resize(args.size());
             for (size_t i = 0; i < args.size(); i++) open(E, args[i], ctx, g->src[i], owns_arg(fresh_mask, i));
+            g->strict = strict;
             out = res;
             return true;
+        }
+        if (name == "enumerate" && args.empty()) {
+            if (const Value* it = kwv("iterable")) args.push_back(*it);
+            else raise("TypeError", "enumerate() missing required argument 'iterable'");
         }
         if (name == "map") {
             E.cur_kwargs_ = nullptr;
@@ -1246,7 +1330,19 @@ Value for_loop(NythonExecutor& E, void* for_node, const Value& gv, Context* ctx,
     bool broke = false, returning = false;
     Value result = NONE_VALUE;
     std::string var_name = fn->var->value();
+    // as evalFor binds: a name declared `global` is the module's (round 78:
+    // dicts, dict views and big ranges loop here now too)
+    auto gref = [](const node_ptr& v) {
+        return v && v->type() == NodeType::VARIABLE && static_cast<nython::node::VariableNode*>(v.get())->global_ref;
+    };
+    bool any_global = gref(fn->var);
+    for (auto& u : fn->unpack_vars) any_global = any_global || gref(u);
     auto bindv = [&](const std::string& n, const Value& v) {
+        if (any_global) {
+            bool glob = n == var_name && gref(fn->var);
+            for (auto& u : fn->unpack_vars) if (!glob && u->value() == n) glob = gref(u);
+            if (glob) { E.moduleCtx(ctx)->defineByName(n, v); return; }
+        }
         if (fn->rebinds) ctx->setByName(n, v); else ctx->defineByName(n, v);
     };
     auto bind_item = [&](const Value& elem) {
@@ -1320,12 +1416,75 @@ Value make_iter(NythonExecutor& E, const Value& v, Context* ctx) {
     if (cu.k == Cursor::GEN) return cu.hold;   // __iter__ returned a generator
     if (cu.k == Cursor::INST && E.isInstanceValue(cu.it)) return cu.it;
     // named as Python names it: list_iterator, str_iterator, ... (round 77)
-    std::string py, legacy;
-    std::string tn = E.typeObjectNames(E.typeObjectOf(v), py, legacy) ? py : std::string();
-    bool ascii = true;
-    if (tn == "str") for (unsigned char ch : E.getStringValue(v)) if (ch >= 0x80) { ascii = false; break; }
+    std::string name;
+    if (cu.k == Cursor::RANGE && E.isInstanceValue(v)) name = "range_iterator";        // round 78
+    else if (cu.k == Cursor::DICT) name = nyrt::dict_iter_name(cu.dk, false);         // round 78
+    else {
+        std::string py, legacy;
+        std::string tn = E.typeObjectNames(E.typeObjectOf(v), py, legacy) ? py : std::string();
+        bool ascii = true;
+        if (tn == "str") for (unsigned char ch : E.getStringValue(v)) if (ch >= 0x80) { ascii = false; break; }
+        name = nyrt::iterator_type_for(tn, ascii);
+    }
     Value res = make_native(E, Op::Iter, "iterator");
-    gen_of(res)->name = nyrt::iterator_type_for(tn, ascii);
+    gen_of(res)->name = name;
+    gen_of(res)->src.push_back(std::move(cu));
+    return res;
+}
+
+// ── Round 78: range and dict-view iterators, reversed() ─────────────────────
+Value make_range_iter(NythonExecutor& E, int64_t first, int64_t step, int64_t n) {
+    Value res = make_native(E, Op::Iter, "range_iterator");
+    Cursor cu;
+    cu.k = Cursor::RANGE; cu.first = first; cu.st = step; cu.n = n < 0 ? 0 : n;
+    gen_of(res)->src.push_back(std::move(cu));
+    return res;
+}
+
+Value make_dict_iter(NythonExecutor& E, const Value& dict, int kind, bool rev) {
+    Container* c = E.contOf(dict);
+    if (!c || NythonExecutor::seqLen(c) >= 0 || is_gen(dict)) raise("TypeError", "a dict is required");
+    Value res = make_native(E, Op::Iter, nyrt::dict_iter_name(kind, rev));
+    Cursor cu;
+    cu.hold = dict;
+    open_dict(cu, c, (uint8_t)kind, rev);
+    gen_of(res)->src.push_back(std::move(cu));
+    return res;
+}
+
+bool make_reversed(NythonExecutor& E, const Value& v, Context* ctx, Value& out) {
+    if (is_gen(v)) return false;
+    Cursor cu;
+    cu.hold = v;
+    const char* name = "reversed";
+    if (Container* c = E.contOf(v)) {
+        int64_t n = NythonExecutor::seqLen(c);
+        if (n < 0) {   // a dict: its keys, last first (3.8+)
+            open_dict(cu, c, 0, true);
+            name = "dict_reversekeyiterator";
+        } else if (NythonExecutor::isSetCont(c)) {
+            raise("TypeError", std::string("'") + (NythonExecutor::isFrozenCont(c) ? "frozenset" : "set") + "' object is not reversible");
+        } else {
+            cu.k = Cursor::REVSEQ; cu.c = c; cu.i = n - 1;
+            if (!NythonExecutor::isTupleCont(c)) name = "list_reverseiterator";
+        }
+    } else if (E.isStringValue(v) || E.isBytesValue(v)) {
+        cu.k = Cursor::VEC;
+        cu.v = E.iterItems(v, ctx);
+        std::reverse(cu.v.begin(), cu.v.end());
+    } else {
+        return false;
+    }
+    Value res = make_native(E, Op::Iter, name);
+    gen_of(res)->src.push_back(std::move(cu));
+    out = res;
+    return true;
+}
+
+Value make_vec_iter(NythonExecutor& E, std::vector<Value> items, const char* name) {
+    Value res = make_native(E, Op::Iter, name);
+    Cursor cu;
+    cu.k = Cursor::VEC; cu.v = std::move(items);
     gen_of(res)->src.push_back(std::move(cu));
     return res;
 }

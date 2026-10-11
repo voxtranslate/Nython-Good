@@ -130,7 +130,7 @@ class CommandRegistry:
                 shown = string_strip(alts[i])
             i = i + 1
         self.cmds[id].keys = shown
-        var others = touched.keys()
+        var others = list(touched.keys())
         i = 0
         while i < len(others):
             self._refresh_keys(others[i])

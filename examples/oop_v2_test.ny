@@ -143,7 +143,7 @@ t("hof", apply(lambda x: x * x, 5), 25)
 
 var items = [3, 1, 4, 1, 5, 9]
 t("sorted", str(sorted(items)), "[1, 1, 3, 4, 5, 9]")
-t("reversed", str(reversed([1, 2, 3])), "[3, 2, 1]")
+t("reversed", str(list(reversed([1, 2, 3]))), "[3, 2, 1]")
 t("sum", sum(items), 23)
 t("min_list", min(items), 1)
 t("max_list", max(items), 9)

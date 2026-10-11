@@ -12,7 +12,7 @@ var doubled = [x * 2 for x in range(1, 6)].filter(lambda x: x > 4)
 t("comp_chain", str(doubled), "[6, 8, 10]")
 
 print "=== 2. NESTED MAP/FILTER/REDUCE ==="
-var data = range(1, 21)
+var data = list(range(1, 21))
 var result = data.filter(lambda x: x % 3 == 0).map(lambda x: x * x).reduce(lambda a, b: a + b, 0)
 t("nested_mfr", result, 819)
 

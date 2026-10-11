@@ -160,7 +160,7 @@ class Module:
             else:
                 dst.data = src.data
             i = i + 1
-        var sk = sd.keys()
+        var sk = list(sd.keys())
         i = 0
         while i < len(sk):
             if not own.has_key(sk[i]):

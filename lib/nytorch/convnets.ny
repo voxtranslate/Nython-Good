@@ -1528,7 +1528,7 @@ class CheckpointManager:
             return true
         if type(st) != "map":
             return false
-        var ks = st.keys()
+        var ks = list(st.keys())
         var i = 0
         while i < len(ks):
             if not isinstance(st[ks[i]], Tensor):
@@ -1620,7 +1620,7 @@ class LearningRateFinder:
             raise ValueError("LearningRateFinder.run needs at least one [x, y] batch")
         var saved = self.model.state_dict()
         var snapshot = {}
-        var ks = saved.keys()
+        var ks = list(saved.keys())
         var i = 0
         while i < len(ks):
             snapshot[ks[i]] = saved[ks[i]].clone().detach()

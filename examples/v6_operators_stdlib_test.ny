@@ -88,7 +88,7 @@ t("sum", sum([1, 2, 3, 4, 5]), 15)
 t("len_s", len("hello"), 5)
 t("len_l", len([1, 2, 3]), 3)
 t("sorted", str(sorted([3, 1, 4])), "[1, 3, 4]")
-t("reversed", str(reversed([1, 2, 3])), "[3, 2, 1]")
+t("reversed", str(list(reversed([1, 2, 3]))), "[3, 2, 1]")
 t("int_s", int("42"), 42)
 t("float_s", float("3.14"), 3.14)
 t("str_i", str(42), "42")
@@ -146,8 +146,8 @@ var unique = Set(words)
 t("set_len", len(unique), 3)
 
 print "=== MAP/FILTER/REDUCE ==="
-t("map", str(map(lambda x: x * 2, [1,2,3])), "[2, 4, 6]")
-t("filter", str(filter(lambda x: x > 2, [1,2,3,4,5])), "[3, 4, 5]")
+t("map", str(list(map(lambda x: x * 2, [1,2,3]))), "[2, 4, 6]")
+t("filter", str(list(filter(lambda x: x > 2, [1,2,3,4,5]))), "[3, 4, 5]")
 t("reduce", reduce(lambda a, b: a + b, [1,2,3,4,5]), 15)
 
 print "=== STDLIB MODULES ==="

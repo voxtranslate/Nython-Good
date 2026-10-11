@@ -246,9 +246,9 @@ t("min", min(3, 1, 4, 1, 5), 1)
 t("max", max(3, 1, 4, 1, 5), 5)
 t("sum", sum([1, 2, 3, 4, 5]), 15)
 t("sorted", str(sorted([3, 1, 4, 1, 5])), "[1, 1, 3, 4, 5]")
-t("reversed", str(reversed([1, 2, 3])), "[3, 2, 1]")
-t("enumerate_b", str(enumerate(["a", "b"])), "[(0, 'a'), (1, 'b')]")
-t("zip_b", str(zip([1, 2], [3, 4])), "[(1, 3), (2, 4)]")
+t("reversed", str(list(reversed([1, 2, 3]))), "[3, 2, 1]")
+t("enumerate_b", str(list(enumerate(["a", "b"]))), "[(0, 'a'), (1, 'b')]")
+t("zip_b", str(list(zip([1, 2], [3, 4]))), "[(1, 3), (2, 4)]")
 t("chr_ord", chr(ord("A")), "A")
 
 print ""

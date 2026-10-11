@@ -251,7 +251,7 @@ check("factorial 10", factorial(10), 3628800)
 
 # ── Enumerate with index ────────────────────────────────────────
 var items = ["a", "b", "c"]
-var indexed = enumerate(items)
+var indexed = list(enumerate(items))
 check("enum len", len(indexed), 3)
 check("enum 0 idx", indexed[0][0], 0)
 check("enum 0 val", indexed[0][1], "a")
@@ -260,7 +260,7 @@ check("enum 2 idx", indexed[2][0], 2)
 # ── zip patterns ─────────────────────────────────────────────────
 var keys = ["x", "y", "z"]
 var vals = [10, 20, 30]
-var zipped = zip(keys, vals)
+var zipped = list(zip(keys, vals))
 check("zip len", len(zipped), 3)
 check("zip 0 key", zipped[0][0], "x")
 check("zip 0 val", zipped[0][1], 10)

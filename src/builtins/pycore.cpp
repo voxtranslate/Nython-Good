@@ -137,11 +137,21 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         if (auto* bo = E.bytesOf(v)) return intValue((int64_t)bo->s.size());
         if (E.isStringValue(v)) return intValue((int64_t)nypy::u8_len(*(std::string*)v.value.p));
         // A generator has no length (it is lazy), as in Python.
-        if (nygen::is_gen(v)) E.pyRaise("TypeError", "object of type 'generator' has no len()");
+        if (nygen::is_gen(v)) E.pyRaise("TypeError", "object of type '" + E.typeNameOf(v) + "' has no len()");
         if (Container* c = E.contOf(v)) {
             int64_t n = NythonExecutor::seqLen(c);
             if (n >= 0) return intValue(n);
             return intValue(E.dictSize(c));
+        }
+        // a range of 64-bit ints or a dict view, natively (round 78)
+        {
+            int64_t a, b, s, n;
+            if (E.rangeOf(v, a, b, s)) {
+                if (!nyrt::range_len(a, b, s, n)) E.pyRaise("OverflowError", "Python int too large to convert to C ssize_t");
+                return intValue(n);
+            }
+            Value dv;
+            if (E.viewOf(v, &dv) >= 0) return intValue(E.dictSize(E.contOf(dv)));
         }
         if (E.isInstanceVal(v) && E.instanceHasMethod(v, "__len__")) {
             std::vector<Value> no;
@@ -399,8 +409,17 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
     }
     case B_SUM: {
         need(1, "sum()");
-        std::vector<Value> items = E.iterItems(args[0], ctx);
         const Value* sv = arg(1, "start");
+        // sum(range(...)) in O(1): the arithmetic series, exact - the value
+        // the loop would reach, without the loop (round 78)
+        {
+            int64_t a, b, s, n;
+            if (E.rangeOf(args[0], a, b, s) && nyrt::range_len(a, b, s, n) && (!sv || sv->type == ValueType::INTEGER)) {
+                Value acc = intValue(nyrt::range_sum(a, s, n));
+                return sv ? E.binaryOp(NythonExecutor::OP_ADD, *sv, acc, ctx) : acc;
+            }
+        }
+        std::vector<Value> items = E.iterItems(args[0], ctx);
         Value acc = sv ? *sv : intValue(0);
         if (E.isStringValue(acc)) E.pyRaise("TypeError", "sum() can't sum strings [use ''.join(seq) instead]");
         for (auto& v : items) acc = E.binaryOp(NythonExecutor::OP_ADD, acc, v, ctx);
@@ -444,9 +463,25 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             Value r = E.callMethod(args[0], "__reversed__", no, ctx);
             if (r.type != ValueType::NONE) return r;
         }
-        std::vector<Value> items = E.iterItems(args[0], ctx);
-        std::reverse(items.begin(), items.end());
-        return E.makeListValue(items);
+        // An iterator, as Python's (round 78; it was a reversed copy as a
+        // list): list_reverseiterator over a list, `reversed` over a tuple,
+        // str or bytes, dict_reversekeyiterator over a dict. A generator or
+        // a set has no order to reverse.
+        {
+            Value r;
+            if (nygen::make_reversed(E, args[0], ctx, r)) return r;
+        }
+        // an object with __len__ and __getitem__: indexed from the end
+        if (E.isInstanceVal(args[0]) && E.instanceHasMethod(args[0], "__len__") && E.instanceHasMethod(args[0], "__getitem__")) {
+            std::vector<Value> no;
+            NythonExecutor::Num n;
+            Value lv = E.callMethod(args[0], "__len__", no, ctx);
+            std::vector<Value> items;
+            if (NythonExecutor::asNum(lv, n) && n.k == 1)
+                for (int64_t i = n.i - 1; i >= 0; i--) { std::vector<Value> ia{intValue(i)}; items.push_back(E.callMethod(args[0], "__getitem__", ia, ctx)); }
+            return nygen::make_vec_iter(E, std::move(items), "reversed");
+        }
+        E.pyRaise("TypeError", "'" + E.typeNameOf(args[0]) + "' object is not reversible");
     }
     case B_LIST: case B_TUPLE:
         if (args.empty()) return E.makeListValue({}, id == B_TUPLE);

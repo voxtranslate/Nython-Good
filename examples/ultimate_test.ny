@@ -170,7 +170,7 @@ test("bin", bin(42), "0b101010")
 test("chr", chr(65), "A")
 test("ord", ord("A"), 65)
 test("sorted", str(sorted([3,1,2])), "[1, 2, 3]")
-test("reversed", str(reversed([1,2,3])), "[3, 2, 1]")
+test("reversed", str(list(reversed([1,2,3]))), "[3, 2, 1]")
 
 print ""
 print "--- Conversions ---"

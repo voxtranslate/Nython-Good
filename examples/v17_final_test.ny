@@ -21,9 +21,9 @@ var squares = {str(x): x*x for x in range(5)}
 t("dict_comp", squares["4"], 16)
 
 print "=== RANGE ==="
-t("range5", str(range(5)), "[0, 1, 2, 3, 4]")
-t("range_step", str(range(0,10,3)), "[0, 3, 6, 9]")
-t("range_neg", str(range(5,0,-1)), "[5, 4, 3, 2, 1]")
+t("range5", str(list(range(5))), "[0, 1, 2, 3, 4]")
+t("range_step", str(list(range(0,10,3))), "[0, 3, 6, 9]")
+t("range_neg", str(list(range(5,0,-1))), "[5, 4, 3, 2, 1]")
 
 print "=== PATTERNS ==="
 # Linked list
