@@ -109,9 +109,9 @@ def _reduce_ex(self, proto):
     if _has_own_getstate(cls):
         dict = self.__getstate__()
     else:
+        # (3.11: object.__getstate__ exists, so this is the message)
         if getattr(self, "__slots__", none):
-            raise TypeError("cannot pickle " + repr(cls.__name__) + " object: a class that defines __slots__ "
-                            + "without defining __getstate__ cannot be pickled with protocol " + str(proto))
+            raise TypeError("a class that defines __slots__ without defining __getstate__ cannot be pickled")
         dict = _ny_getstate(self)
     if dict:
         return _reconstructor, args, dict

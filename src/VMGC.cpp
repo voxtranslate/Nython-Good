@@ -365,6 +365,26 @@ void safe_point_slow(VirtualMachine& vm) {
     if (!final_queue().empty()) g_pending.store(true, std::memory_order_relaxed);
 }
 
+void for_each_value(const std::function<void(VMVal&)>& f) {   // round 79
+    for (int g = 0; g < 3; g++)
+        for (auto& e : gen(g)) {
+            auto keep = e.w.lock();
+            if (!keep) continue;
+            switch (e.k) {
+                case K_LIST: for (auto& v : *static_cast<List*>(e.raw)) f(v); break;
+                case K_MAP: for (auto& kv : *static_cast<Map*>(e.raw)) f(kv.second); break;
+                case K_ITER: for (auto& v : static_cast<IterPair*>(e.raw)->second) f(v); break;
+                case K_GEN: {
+                    auto* gs = static_cast<GenState*>(e.raw);
+                    for (auto& kv : gs->locals) f(kv.second);
+                    for (auto& v : gs->saved_stack) f(v);
+                    if (gs->self_val) f(*gs->self_val);
+                    break;
+                }
+            }
+        }
+}
+
 long collect(VirtualMachine& vm, int generation) {
     if (generation < 0) generation = 0;
     if (generation > 2) generation = 2;

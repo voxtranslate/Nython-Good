@@ -1085,6 +1085,22 @@ class object:
     def __getattribute__(self, name):
         return _ny_getattr_raw(self, name)
 
+    # the pickle and copy protocol (round 79): lib/copyreg.ny does what
+    # CPython's typeobject.c does - reduce_newobj for protocol 2 and up,
+    # copyreg._reduce_ex below it, object_getstate (the attributes, the
+    # slots as a (dict, slots) pair)
+    def __reduce_ex__(self, protocol):
+        import copyreg
+        return copyreg._ny_reduce_ex(self, protocol)
+
+    def __reduce__(self):
+        import copyreg
+        return copyreg._reduce_ex(self, 0)
+
+    def __getstate__(self):
+        import copyreg
+        return copyreg._ny_getstate(self)
+
 def _ny_complex_part(x):
     # a component as Python shows it: 2.0 -> 2, 1.5 -> 1.5
     var t = repr(float(x))
@@ -3065,6 +3081,136 @@ class _NyB_frozenset:
     def __class_getitem__(cls, item):
         return _ny_bgeneric(cls, item)
 _ny_bmethods(_NyB_frozenset, "copy difference intersection isdisjoint issubset issuperset symmetric_difference union")
+
+#@ slots
+# __slots__ and __class__ assignment (round 79). Both engines run this chunk
+# the first time a class statement's namespace holds __slots__ or an object's
+# __class__ is assigned. A slot is a member descriptor on the class (C.x);
+# its value is the instance's field of that name, which the engines read and
+# store directly (the descriptor's __get__/__set__ are what C.x.__get__(o)
+# calls). A class whose MRO declares __slots__ everywhere (object and the
+# builtin types aside) without "__dict__" makes instances that take no other
+# attribute (_ny_mark_slots flag 1); without "__weakref__" anywhere, no weak
+# reference (flag 2, lib/weakref.ny).
+class _NyMemberDescriptor:
+    def __init__(self, name, owner):
+        self.__name__ = name
+        self.__objclass__ = owner
+        self.__qualname__ = getattr(owner, "__qualname__", owner.__name__) + "." + name
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        return _ny_getfield(obj, self.__name__)
+    def __set__(self, obj, value):
+        _ny_setfield(obj, self.__name__, value)
+    def __delete__(self, obj):
+        try:
+            _ny_delfield(obj, self.__name__)
+        except KeyError:
+            raise AttributeError(self.__name__) from None
+    def __repr__(self):
+        return "<member '" + self.__name__ + "' of '" + self.__objclass__.__name__ + "' objects>"
+_NyMemberDescriptor.__name__ = "member_descriptor"
+_NyMemberDescriptor.__qualname__ = "member_descriptor"
+
+def _ny_slots_of(c):
+    var d = getattr(c, "__dict__", None)
+    if d is None or "__slots__" not in d:
+        return None
+    var s = d["__slots__"]
+    if isinstance(s, str):
+        return [s]
+    return list(s)
+
+def _ny_builtin_base(c):
+    return c is object or getattr(c, "__module__", None) == "builtins"
+
+def _ny_init_slots(cls):
+    # type.__new__'s handling of __slots__
+    var names = _ny_slots_of(cls)
+    var ns = cls.__dict__
+    var base_dict = False
+    var base_weak = False
+    for b in cls.__mro__[1:]:
+        if _ny_builtin_base(b):
+            continue
+        var bs = _ny_slots_of(b)
+        if bs is None:
+            base_dict = True
+            base_weak = True
+        else:
+            if "__dict__" in bs:
+                base_dict = True
+            if "__weakref__" in bs:
+                base_weak = True
+    var has_dict = base_dict
+    var has_weak = base_weak
+    var made = []
+    for n in names:
+        if not isinstance(n, str):
+            raise TypeError("__slots__ items must be strings, not '" + type(n).__name__ + "'")
+        if not n.isidentifier():
+            raise TypeError("__slots__ must be identifiers")
+        if n == "__dict__":
+            if has_dict:
+                raise TypeError("__dict__ slot disallowed: we already got one")
+            has_dict = True
+            continue
+        if n == "__weakref__":
+            if has_weak:
+                raise TypeError("__weakref__ slot disallowed: either we already got one, or __itemsize__ != 0")
+            has_weak = True
+            continue
+        var m = n
+        if n.startswith("__") and not n.endswith("__"):
+            var stripped = cls.__name__.lstrip("_")
+            if stripped:
+                m = "_" + stripped + n
+        if m in ns:
+            raise ValueError(repr(m) + " in __slots__ conflicts with class variable")
+        made.append(m)
+    for m in made:
+        _ny_setattr_raw(cls, m, _NyMemberDescriptor(m, cls))
+    _ny_mark_slots(cls, (0 if has_dict else 1) | (0 if has_weak else 2))
+
+def _ny_class_layout(cls):
+    # what CPython's compatible_for_assignment compares, simplified: the
+    # slots added along the MRO, whether instances have a __dict__, and the
+    # builtin type the class derives from
+    var slots = []
+    var dictful = False
+    var builtin = None
+    for c in cls.__mro__:
+        if c is object:
+            continue
+        if _ny_builtin_base(c):
+            if builtin is None:
+                builtin = c.__name__
+            continue
+        var s = _ny_slots_of(c)
+        if s is None:
+            dictful = True
+            continue
+        for n in s:
+            if n == "__dict__":
+                dictful = True
+            elif n != "__weakref__":
+                if n.startswith("__") and not n.endswith("__") and c.__name__.lstrip("_"):
+                    n = "_" + c.__name__.lstrip("_") + n
+                slots.append(n)
+    return (dictful, tuple(slots), builtin)
+
+def _ny_set_class(obj, cls):
+    # obj.__class__ = cls (object.__class__'s setter)
+    if not isinstance(cls, type):
+        raise TypeError("__class__ must be set to a class, not '" + type(cls).__name__ + "' object")
+    var old = type(obj)
+    if isinstance(obj, type) or _ny_builtin_base(old) or _ny_builtin_base(cls):
+        raise TypeError("__class__ assignment only supported for mutable types or ModuleType subclasses")
+    if _ny_class_layout(old) != _ny_class_layout(cls):
+        raise TypeError("__class__ assignment: '" + cls.__name__ + "' object layout differs from '" + old.__name__ + "'")
+    # (the same TypeError when obj is not an instance of a class)
+    _ny_switch_class(obj, cls)
 
 #@ dictview
 # obj.__dict__ / vars(obj): a live view of an instance's attributes (round

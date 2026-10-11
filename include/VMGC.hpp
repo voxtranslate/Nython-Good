@@ -27,6 +27,7 @@
 // finalizer resurrected them (PEP 442).
 #include <atomic>
 #include <cstddef>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -107,6 +108,10 @@ struct FinalDeleter {
 std::shared_ptr<Map> new_finalizable_map(const std::string& cls);
 
 long collect(VirtualMachine& vm, int generation = 2);
+// Every value held in a live tracked container (list, map, iterator,
+// generator frame), for in-place updates (round 79: __class__ assignment
+// renames an instance's class in each value that refers to it).
+void for_each_value(const std::function<void(VMVal&)>& f);
 void set_enabled(bool on);
 bool is_enabled();
 void set_threshold(int gen, long v);

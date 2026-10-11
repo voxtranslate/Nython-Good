@@ -5658,7 +5658,10 @@ private:
     VMVal vm_vars(std::vector<VMVal>& a) {
         if(a.empty()) return vm_locals_map();
         const VMVal& o=a[0];
-        // an instance's: its __dict__, the live view (round 77)
+        // an instance's: its __dict__, the live view (round 77); none with
+        // __slots__ and no __dict__ (round 79)
+        if(o.type==VMType::INSTANCE&&!slot_flags_.empty()&&is_dictless(o))
+            raise_native_exception("TypeError","vars() argument must have __dict__ attribute");
         if(o.type==VMType::INSTANCE) return instance_dict_view(o);
         VMVal d=VMVal::make_map();
         if(o.type==VMType::CLASS) return class_namespace(class_key(o));
@@ -6096,8 +6099,59 @@ private:
     // The names classes hold a data descriptor under (round 78): a field
     // read checks the class for one only for those (get_attr / lookup_attr).
     std::unordered_set<std::string> data_descr_names_;
+    // ── __slots__ and __class__ assignment (round 79) ─────────────────────
+    // As NythonExecutor's section of the same name: the prelude's "slots"
+    // chunk does the Python-level work; per class the flags _ny_mark_slots
+    // gave (1: no __dict__, 2: no weak references); a slot's member
+    // descriptor reads and stores the instance's field directly.
+    std::unordered_map<std::string,int> slot_flags_;
+    bool is_dictless(const VMVal& obj) {
+        if(obj.type!=VMType::INSTANCE) return false;
+        auto it=slot_flags_.find(obj.class_name);
+        return it!=slot_flags_.end()&&(it->second&1);
+    }
+    VMVal slots_fn(const char* name) {
+        load_mirror("slots");
+        return load_var(name);
+    }
+    void set_class_of(const VMVal& obj, const VMVal& cls) {
+        std::vector<VMVal> a{obj, cls};
+        vm_call(slots_fn("_ny_set_class"), a, std::nullopt, nullptr);
+    }
+    // _ny_switch_class(obj, cls): the class is held in every value that
+    // refers to the instance (VMVal::class_name), so each one the VM can
+    // reach - the stack, the frames, the globals, class attributes and every
+    // container the collector tracks - is given the new name.
+    void switch_class(const VMVal& obj, const VMVal& cls) {
+        if(obj.type!=VMType::INSTANCE||!obj.map||cls.type!=VMType::CLASS)
+            raise_native_exception("TypeError","__class__ assignment only supported for mutable types or ModuleType subclasses");
+        const std::string to=class_key(cls);
+        if(!class_reg_.count(to)&&cls.code) class_reg_[to]=cls.code;
+        const void* target=obj.map.get();
+        auto fix=[&](VMVal& v){ if(v.type==VMType::INSTANCE&&v.map.get()==target) v.class_name=to; };
+        for(auto& v:stack_) fix(v);
+        for(auto& f:call_stack_){
+            for(auto& kv:f.locals) fix(kv.second);
+            if(f.self_val) fix(*f.self_val);
+        }
+        for(auto& kv:globals_) fix(kv.second);
+        for(auto& cv:class_vars_) for(auto& kv:cv.second) fix(kv.second);
+        vmgc::for_each_value(fix);
+        no_new_.clear();
+        mro_cache_.clear();
+    }
     void class_created(const VMVal& clsv, const VMVal& kw) {
         const std::string& cname=clsv.class_name;
+        // __slots__ (round 79): the prelude's _ny_init_slots (mirrors chunk
+        // "slots") checks them and puts a member descriptor on the class for
+        // each, as type.__new__ does, before anything else sees the class
+        {
+            auto cv=class_vars_.find(cname);
+            if(cv!=class_vars_.end()&&cv->second.count("__slots__")){
+                std::vector<VMVal> a{clsv};
+                vm_call(slots_fn("_ny_init_slots"), a, std::nullopt, nullptr);
+            }
+        }
         // a class with its own __getattribute__: attribute reads look for it
         // (round 77; object's is the plain lookup)
         if(!any_getattribute_&&nyrt::shown_class_name(cname)!="object"){
@@ -8989,7 +9043,11 @@ private:
                 // that name, as in Python (round 78: the field was read first)
                 if(obj.type==VMType::INSTANCE&&!data_descr_names_.empty()&&data_descr_names_.count(attr)){
                     VMVal d;
-                    if(class_data_descriptor(obj, attr, d)){ out=bind_member(d, obj, obj.class_name); return true; }
+                    if(class_data_descriptor(obj, attr, d)){
+                        // a slot's member descriptor reads the field (round 79)
+                        if(d.type==VMType::INSTANCE&&d.class_name=="_NyMemberDescriptor"){ out=it->second; return true; }
+                        out=bind_member(d, obj, obj.class_name); return true;
+                    }
                 }
                 VMVal& v=it->second;
                 // A property stored on the instance itself: self.x = property(get)
@@ -9044,6 +9102,9 @@ private:
                 return true;
             }
             if(attr=="__dict__"){
+                // (none for a class with __slots__ and no __dict__ - round 79)
+                if(!slot_flags_.empty()&&is_dictless(obj))
+                    raise_native_exception("AttributeError","'"+nyrt::shown_class_name(obj.class_name)+"' object has no attribute '__dict__'");
                 // a live view of the fields (round 77; it was a copy): names
                 // as dict keys, self.__x__ listed too, the engine's hidden
                 // fields left out
@@ -9469,6 +9530,7 @@ private:
         return d.type==VMType::INSTANCE&&(class_lookup(d.class_name,"__set__",m)||class_lookup(d.class_name,"__delete__",m));
     }
     void del_attr(const VMVal& obj, const std::string& attr) {
+        if(attr=="__class__"&&obj.type==VMType::INSTANCE) raise_native_exception("TypeError","can't delete __class__ attribute");   // round 79
         {
             VMVal m;
             if(instance_attr_hook(obj,1,m)){
@@ -9510,9 +9572,14 @@ private:
         // object() itself has no __dict__ (round 78: it took attributes)
         if(obj.type==VMType::INSTANCE&&obj.class_name=="object")
             raise_native_exception("AttributeError","'object' object has no attribute '"+attr+"'");
+        // obj.__class__ = C (round 79): the prelude's _ny_set_class checks
+        // and switches it (any kind of value - it raises for builtin ones)
+        if(attr=="__class__"&&obj.type!=VMType::CLASS){ set_class_of(obj, val); return; }
         if(any_data_descr_){
             VMVal d, m;
             if(data_descriptor(obj, attr, "__set__", d, m)){
+                // a slot (round 79): its value is the instance's field
+                if(d.class_name=="_NyMemberDescriptor"&&obj.map){ (*obj.map)[attr]=std::move(val); return; }
                 // the prelude's property: its setter called directly (round 77)
                 if(d.class_name=="property"&&d.map){
                     auto it=d.map->find("fset");
@@ -9524,6 +9591,10 @@ private:
             }
         }
         if(!class_meta_.empty()&&meta_attr_hook(obj,"__setattr__",{VMVal::make_str(attr), val})) return;
+        // an instance of a class with __slots__ and no __dict__ takes no
+        // other attribute (round 79; its slots were stored above)
+        if(!slot_flags_.empty()&&is_dictless(obj))
+            raise_native_exception("AttributeError","'"+nyrt::shown_class_name(obj.class_name)+"' object has no attribute '"+attr+"'");
         // obj.__dict__ = d: the fields become d's items (round 77; it stored
         // a field named __dict__)
         if(attr=="__dict__"&&obj.type==VMType::INSTANCE&&obj.map){
@@ -11453,6 +11524,26 @@ private:
         globals_["_ny_delfield"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
             if(a.size()<2||a[0].type!=VMType::INSTANCE||!a[0].map) raise_native_exception("TypeError","__dict__: not an instance");
             if(a[1].type!=VMType::STRING||nyrt::hidden_field(a[1].s)||!a[0].map->erase(a[1].s)) return missing_key(a[1]);
+            return VMVal::make_none(); });
+        // __slots__ and __class__ assignment (round 79; the prelude's "slots"
+        // chunk): a slot's value, a class's slot flags, an instance's class
+        globals_["_ny_getfield"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.size()<2||a[0].type!=VMType::INSTANCE||!a[0].map) raise_native_exception("TypeError","__slots__: not an instance");
+            std::string n=a[1].type==VMType::STRING?a[1].s:std::string();
+            auto it=n.empty()?a[0].map->end():a[0].map->find(n);
+            if(it==a[0].map->end())
+                raise_native_exception("AttributeError","'"+nyrt::shown_class_name(a[0].class_name)+"' object has no attribute '"+n+"'");
+            return it->second; });
+        globals_["_ny_mark_slots"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.size()>=2&&a[0].type==VMType::CLASS&&a[1].type==VMType::INT) slot_flags_[class_key(a[0])]=(int)a[1].i;
+            return VMVal::make_none(); });
+        globals_["_ny_slot_flags"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.empty()||a[0].type!=VMType::CLASS) return VMVal::make_int(0);
+            auto it=slot_flags_.find(class_key(a[0]));
+            return VMVal::make_int(it==slot_flags_.end()?0:it->second); });
+        globals_["_ny_switch_class"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{
+            if(a.size()<2) raise_native_exception("TypeError","_ny_switch_class(obj, cls)");
+            switch_class(a[0],a[1]);
             return VMVal::make_none(); });
         // object.__getattribute__(obj, name): the attribute lookup without
         // the class's __getattribute__ and __getattr__ (round 77)

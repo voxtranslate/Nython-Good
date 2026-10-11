@@ -576,6 +576,9 @@ def _create_simple_gzip_header(compresslevel, mtime=none):
 
 def compress(data, compresslevel=_COMPRESS_LEVEL_BEST, mtime=none):
     var d = zlib._data(data)
+    if mtime == 0:
+        # (3.11: zlib's own gzip header - OS 3, its XFL - when mtime is 0)
+        return zlib.compress(d, compresslevel, 31)
     var header = _create_simple_gzip_header(compresslevel, mtime)
     var trailer = _u32(zlib.crc32(d)) + _u32(len(d) & 0xffffffff)
     return header + zlib.compress(d, compresslevel, -15) + trailer

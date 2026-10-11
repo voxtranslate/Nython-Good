@@ -384,10 +384,19 @@ def _main_globals():
     return f.f_globals
 
 
+# the builtins every program starts with (the prelude's private names left out)
+def _builtins_dict():
+    import sys
+    return sys._getframe(0).f_builtins
+
+
+_BUILTINS = _builtins_dict()
+
+
 def _builtin(name):
-    if not (isinstance(name, str) and name.isidentifier()) or name.startswith("_"):
+    if not isinstance(name, str) or name not in _BUILTINS:
         raise AttributeError(name)
-    return eval(name)
+    return _BUILTINS[name]
 
 
 class _ModuleView:
@@ -527,6 +536,7 @@ class Pickler:
         self.fix_imports = fix_imports and protocol < 3
         self._buffer_callback = buffer_callback
         self.memo = {}
+        self._fresh = 0
         self._out = bytearray()
         self._frame_start = -1
         self._framing = false
@@ -596,11 +606,11 @@ class Pickler:
             return ("b", obj)
         return id(obj)
 
-    def _memoize(self, obj):
+    def _memoize(self, obj, key=none):
         if self.fast:
             return
         var idx = len(self.memo)
-        self.memo[self._memo_key(obj)] = (idx, obj)
+        self.memo[self._memo_key(obj) if key is none else key] = (idx, obj)
         if self.proto >= 4:
             self._write(MEMOIZE)
         elif not self.bin:
@@ -808,7 +818,7 @@ class Pickler:
             if obj.readonly:
                 self._write(READONLY_BUFFER)
 
-    def _save_str(self, obj):
+    def _save_str(self, obj, key=none):
         if self.bin:
             var enc = obj.encode("utf-8")
             var n = len(enc)
@@ -822,7 +832,7 @@ class Pickler:
                 raise OverflowError("serializing a string larger than 4 GiB requires pickle protocol 4 or higher")
         else:
             self._write(UNICODE + _raw_unicode_escape(obj) + b"\n")
-        self._memoize(obj)
+        self._memoize(obj, key)
 
     def _save_tuple(self, obj):
         var n = len(obj)
@@ -1095,8 +1105,16 @@ class Pickler:
         if parent is module:
             name = lastname
         if self.proto >= 4:
-            self.save(module_name)
-            self.save(name)
+            if getattr(obj, "_ny_ctype", false):
+                # a type CPython implements in C makes its __module__ and
+                # __qualname__ strings anew: never found in the memo
+                self._fresh = self._fresh + 1
+                self._save_str(module_name, ("fresh", self._fresh))
+                self._fresh = self._fresh + 1
+                self._save_str(name, ("fresh", self._fresh))
+            else:
+                self.save(module_name)
+                self.save(name)
             self._write(STACK_GLOBAL)
         elif parent is not module:
             self._save_reduce((getattr, (parent, lastname)), none)
@@ -1298,9 +1316,7 @@ class Unpickler:
                     self._frame = none
                 var b = self._read_raw(1)
                 if not b:
-                    if first:
-                        raise EOFError("Ran out of input")
-                    raise UnpicklingError("pickle data was truncated")
+                    raise EOFError("Ran out of input")
                 key = b[0]
             first = false
             try:
@@ -1341,7 +1357,7 @@ class Unpickler:
         return b.decode(self.encoding, self.errors)
 
     def persistent_load(self, pid):
-        raise UnpicklingError("A load persistent id instruction was encountered, but no persistent_load "
+        raise UnpicklingError("A load persistent id instruction was encountered,\nbut no persistent_load "
                               + "function was specified.")
 
     def find_class(self, module, name):
