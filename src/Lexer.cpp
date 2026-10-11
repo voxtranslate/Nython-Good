@@ -511,9 +511,20 @@ inline std::vector<Token> optimize(std::vector<Token> tk) {
         // literal continued on the next line inside parentheses was a
         // syntax error. Line breaks skipped inside brackets keep their
         // indentation bookkeeping (paren_indent_delta).
-        if(tk[i].type()==TokenType::String) {
-            Token token = tk[i];
-            int j = i + 1, last = i, d = 0, d_last = 0;
+        // round 79: f-strings join the run too ("a" f"{x}", f"{x}" f"{y}",
+        // Python's implicit concatenation): an f-string is the token `f`
+        // then its text, so a run holding one becomes one f-string, the
+        // braces of its plain pieces doubled so that they stay literal.
+        auto f_at = [&](int k) {
+            return k + 1 < nb && tk[k].type()==TokenType::Identifier && tk[k].value=="f"
+                && tk[k+1].type()==TokenType::String;
+        };
+        if(tk[i].type()==TokenType::String || f_at(i)) {
+            int first_str = f_at(i) ? i + 1 : i;
+            int f_tok = f_at(i) ? i : -1;
+            Token token = tk[first_str];
+            std::vector<std::pair<bool, std::string>> parts{{f_tok >= 0, tk[first_str].value}};
+            int j = first_str + 1, last = first_str, d = 0, d_last = 0;
             while(j < nb) {
                 TokenType t = tk[j].type();
                 if(paren_depth > 0 && (t==TokenType::NewLine || t==TokenType::Indent || t==TokenType::Dedent)) {
@@ -522,11 +533,23 @@ inline std::vector<Token> optimize(std::vector<Token> tk) {
                     j++;
                     continue;
                 }
-                if(t==TokenType::String) { token.value.append(tk[j].value); last = j; d_last = d; j++; continue; }
+                if(t==TokenType::String) { parts.push_back({false, tk[j].value}); last = j; d_last = d; j++; continue; }
+                if(f_at(j)) {
+                    parts.push_back({true, tk[j+1].value});
+                    if(f_tok < 0) f_tok = j;
+                    last = j + 1; d_last = d; j += 2;
+                    continue;
+                }
                 break;
             }
-            if(last > i) {
+            if(last > first_str) {
                 paren_indent_delta += d_last;
+                token.value.clear();
+                for(auto& pc : parts) {
+                    if(f_tok < 0 || pc.first) { token.value += pc.second; continue; }
+                    for(char c : pc.second) { token.value += c; if(c=='{' || c=='}') token.value += c; }
+                }
+                if(f_tok >= 0) ret.push_back(tk[f_tok]);
                 ret.push_back(token);
                 i = last + 1;
                 continue;
