@@ -1763,6 +1763,17 @@ class _NyFrame:
         _ny_frame_sync(self)
         return self._ny_line
 
+    @f_lineno.setter
+    def f_lineno(self, lineno):
+        # (round 79) CPython's trace functions can move a frame to another
+        # line; Nython's frames cannot: a ValueError, as CPython gives for a
+        # jump it refuses (pdb reports "Jump failed: ...")
+        if type(lineno) is not int:
+            raise ValueError("lineno must be an integer")
+        if lineno < self.f_code.co_firstlineno:
+            raise ValueError("line " + str(lineno) + " comes before the current code block")
+        raise ValueError("line " + str(lineno) + ": a frame's line cannot be changed (Nython has no jump)")
+
     @property
     def f_lasti(self):
         _ny_frame_sync(self)

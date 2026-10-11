@@ -826,7 +826,7 @@ class IDEViews(IDEPaint):
                 y = y + self.dp(46)
             if len(self.dbg_why) > 0:
                 # the answer to the last Why? question (round 79)
-                if self._section(r, x, y, w, "WHY", "dbg.why", len(self.dbg_why)):
+                if self._section(r, x, y, w, "WHY", "dbg.why", -1):
                     self._small_button(r, x + w - self.dp(30), y + self.dp(1), self.dp(20), self.dp(20), "close", "@dbg.whyclose", "", "Clear the Answer", false)
                     y = y + self.ROW_H
                     y = self._draw_dbg_why(r, x, y, w)
@@ -951,9 +951,11 @@ class IDEViews(IDEPaint):
             var t = e["text"]
             if e["kind"] == "data" and e["value"] != none:
                 t = t + "   -> " + e["var"] + " = " + str(e["value"])
-            var tip = os_path_basename(e["file"]) + ":" + str(e["line"])
+            # the tooltip: the whole answer (the row may be cut at the
+            # sidebar's edge) and where it travels
+            var tip = t + "  -  " + os_path_basename(e["file"]) + ":" + str(e["line"])
             if e["step"] >= 0:
-                tip = tip + "  (step " + str(e["step"] + 1) + ")"
+                tip = tip + " (step " + str(e["step"] + 1) + ")"
             rows.append([t, e["step"], e["file"], e["line"], e["level"], e["kind"], "L" + str(e["line"]) + " ", tip])
         self.dbg_why = rows
         self.dbg_why_title = title

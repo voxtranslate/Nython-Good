@@ -820,6 +820,8 @@ def sc_debug_why(s):
     palette(s, "Debug: Why Does This Variable Have This Value?")
     st = ide.state()
     c(st["dbg_why_title"] == "Why is best = 20 at line 8?", "why: the question names the value", st["dbg_why_title"])
+    if s.shots:
+        ide.screenshot(os.path.join(s.shots, "debug-why-value.png"))
     rows = st["dbg_why"]
     c(len(rows) > 0 and rows[0][1] == 5 and rows[0][2] == "data" and rows[0][0].endswith("-> best = 20"),
       "why: first answer is the last write, with its value", rows[:2])
@@ -839,7 +841,7 @@ def sc_debug_why(s):
     ide.key("ctrl+g")
     ide.type("7\n")
     st = ide.state()
-    ln = ide.find('print("huge")', exact=False, region=R(330, 60, 900, 600))
+    ln = ide.find('"huge"', exact=True, region=R(330, 60, 900, 600))   # line 7's tokens
     ide.right_click(int(ln.cx), int(ln.cy))
     f = ide.snap()
     c(f.has("Why Didn't This Line Run?", exact=True), "why: the editor's context menu asks it while debugging")
@@ -849,6 +851,8 @@ def sc_debug_why(s):
     rows = st["dbg_why"]
     c(len(rows) > 0 and rows[0][2] == "predicate" and rows[0][1] == 6 and "(last: best = 20)" in rows[0][0],
       "why-not: the test that was false, with its values", rows)
+    if s.shots:
+        ide.screenshot(os.path.join(s.shots, "debug-why-not.png"))
     t = ide.find("was false each of 1 time", exact=False, region=side)
     ide.click(int(t.cx), int(t.cy))
     st = ide.state()

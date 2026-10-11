@@ -177,6 +177,10 @@ def t_lam():   # @t_lam
     f = lambda q: q + 1   # @t_lamdef
     return f(2)
 
+def t_doc():   # @t_doc
+    """A docstring is no code: no line event."""
+    return 1
+
 def t_retfin():   # @t_retfin
     try:
         return 1
@@ -196,7 +200,7 @@ def t_brkfin():   # @t_brkfin
     z = 2
 
 for _nm in ["t_for", "t_while", "t_if", "t_try", "t_inner", "t_outer", "t_gen", "t_usegen", "t_fin", "t_callfin",
-            "t_with", "t_loopret", "t_cont", "t_lam", "t_retfin", "t_fall", "t_brkfin"]:
+            "t_with", "t_loopret", "t_cont", "t_lam", "t_retfin", "t_fall", "t_brkfin", "t_doc"]:
     _base[_nm] = line_of(_nm)
 _base["<lambda>"] = line_of("t_lamdef")
 
@@ -245,6 +249,8 @@ check("return through a finally: the return event on the finally's last line", [
 check("falling off the end after a loop: return on the header's line; pass has its line", [traced(t_fall, 2), _events],
       [None, [('call', 't_fall', 0), ('line', 't_fall', 1), ('line', 't_fall', 2), ('line', 't_fall', 1), ('line', 't_fall', 2),
               ('line', 't_fall', 1), ('return', 't_fall', 1, None)]])
+check("a docstring has no line event", [traced(t_doc), _events],
+      [1, [('call', 't_doc', 0), ('line', 't_doc', 2), ('return', 't_doc', 2, 1)]])
 check("break through a finally", [traced(t_brkfin), _events],
       [None, [('call', 't_brkfin', 0), ('line', 't_brkfin', 1), ('line', 't_brkfin', 2), ('line', 't_brkfin', 3), ('line', 't_brkfin', 5),
               ('line', 't_brkfin', 6), ('return', 't_brkfin', 6, None)]])
@@ -1097,6 +1103,32 @@ code.interact(banner="hi", readfunc=lambda prompt: _lines.pop(0) if _lines else 
 sys.stdout = _saved_out
 sys.stderr = _saved_err
 check("code.interact with a readfunc", _ibuf.getvalue(), "hi\n42\n\nbye\n")
+
+# ── 15. reprlib (pdb's reprs of return values) ───────────────────────────────
+import reprlib
+
+check("reprlib.repr: long containers and strings cut", [reprlib.repr(list(range(100))), reprlib.repr("x" * 100),
+                                                        reprlib.repr(tuple(range(10))), reprlib.repr({i: i for i in range(10)}),
+                                                        reprlib.repr(set(range(3))), reprlib.repr(2 ** 200)],
+      ['[0, 1, 2, 3, 4, 5, ...]', "'xxxxxxxxxxxx...xxxxxxxxxxxxx'", '(0, 1, 2, 3, 4, 5, ...)',
+       '{0: 0, 1: 1, 2: 2, 3: 3, ...}', '{0, 1, 2}', '160693804425899027...2993782792835301376'])
+check("reprlib.Repr: nesting levels and limits", [reprlib.Repr().repr([[[[[[[1]]]]]]]), reprlib.Repr().repr([])],
+      ['[[[[[[[...]]]]]]]', '[]'])
+_r = reprlib.Repr()
+_r.maxlist = 2
+check("Repr attributes", _r.repr([1, 2, 3]), "[1, 2, ...]")
+
+class _Rec:
+    def __init__(self):
+        self.items = []
+    @reprlib.recursive_repr()
+    def __repr__(self):
+        return "<Rec " + ", ".join(repr(i) for i in self.items) + ">"
+
+_rec = _Rec()
+_rec.items.append(1)
+_rec.items.append(_rec)
+check("recursive_repr", repr(_rec), "<Rec 1, ...>")
 
 for r in results:
     if r[1]:

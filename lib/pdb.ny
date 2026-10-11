@@ -22,7 +22,7 @@
 #   cl(ear) [file:lineno | bpnumber ...], disable / enable bpnumber ...,
 #   condition bpnumber [expr], ignore bpnumber [count], commands [bpnumber]
 #   (... end, silent), s(tep), n(ext), unt(il) [lineno], r(eturn),
-#   c(ont(inue)), j(ump) lineno (same block, see below), l(ist) [first[,
+#   c(ont(inue)), j(ump) lineno (refused, see below), l(ist) [first[,
 #   last] | .], ll / longlist, a(rgs), p expr, pp expr, whatis expr,
 #   source expr, display [expr] / undisplay [expr], retval / rv, interact,
 #   alias [name [command]] / unalias name (%1 ... and %* parameters),
@@ -38,10 +38,9 @@
 # ("0" disables, "mod.func" calls that, unset is pdb.set_trace).
 #
 # Not here: readline completion (complete_* exist but nothing calls them);
-# SIGINT during `continue` does not break into the debugger; `jump` moves
-# within the statements of the block being run (and back to a loop's
-# header from its body) - the frame's f_lineno assignment - and refuses the
-# rest with CPython's message where it has one.
+# SIGINT during `continue` does not break into the debugger; `jump`: a
+# frame's f_lineno cannot be assigned on Nython, so every jump is "Jump
+# failed: ..." (CPython's message for a target before the function).
 
 import os
 import io

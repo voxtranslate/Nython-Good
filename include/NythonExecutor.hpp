@@ -10375,6 +10375,10 @@ public:
     // A statement starts in the innermost frame.
     void pyEvLine(Node* st) {
         if (!st || tbHiddenFile(st->token().fileName())) return;
+        // a function's docstring is no code in CPython: no line event
+        if (st->type() == NodeType::STRING && !py_frames().empty()) {
+            if (auto* fn = dynamic_cast<FunctionNode*>(py_frames().back().code); fn && fn->has_doc && st->token().value == fn->doc) return;
+        }
         pyEvLocal(pyTopIdx(), "line", NONE_VALUE);
     }
     // Execution comes back to `n`'s line (a loop's header, an except

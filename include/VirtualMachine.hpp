@@ -1000,8 +1000,10 @@ private:
         int start=C().here();
         visit(nd);
         if(pushes_value(nd)) emit(Op::POP_TOP,0,ln(nd));
-        // a statement's first instruction begins its line (round 79)
-        if(C().here()>start && nd->type()!=NT::BLOCK && nd->type()!=NT::STATEMENTS) C().mark_line_start(start);
+        // a statement's first instruction begins its line (round 79) - not
+        // a function's docstring, which is no code in CPython
+        if(C().here()>start && nd->type()!=NT::BLOCK && nd->type()!=NT::STATEMENTS
+           && !(nd->type()==NT::STRING && C().has_doc && !C().is_class && nd->token().value==C().doc)) C().mark_line_start(start);
     }
 
     // ─── dispatch ──────────────────────────────────────────────────────────
