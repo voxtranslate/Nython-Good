@@ -485,6 +485,13 @@ def _global_name(obj):
     var module = _whichmodule(obj, name)
     if module == "builtins" or module == "__builtin__":
         module = "builtins"
+    elif module == "__main__" and "." not in name:
+        # the builtin exception classes and functions say __main__ here
+        try:
+            if _builtin(name) is obj:
+                module = "builtins"
+        except Exception:
+            pass
     return module, name
 
 
@@ -691,17 +698,21 @@ class Pickler:
             if reduce is not none:
                 rv = reduce(obj)
             else:
-                var rex = none
-                var cls_has_own = false
+                # a class's own __reduce_ex__, else its own __reduce__,
+                # else object.__reduce_ex__ (copyreg)
+                var found = false
                 for c in t.__mro__:
                     if c is object:
                         break
-                    if "__reduce_ex__" in c.__dict__ or "__reduce__" in c.__dict__:
-                        cls_has_own = true
+                    if "__reduce_ex__" in copyreg._cdict(c):
+                        rv = obj.__reduce_ex__(self.proto)
+                        found = true
                         break
-                if cls_has_own:
-                    rv = obj.__reduce_ex__(self.proto)
-                else:
+                    if "__reduce__" in copyreg._cdict(c):
+                        rv = obj.__reduce__()
+                        found = true
+                        break
+                if not found:
                     rv = copyreg._ny_reduce_ex(obj, self.proto)
         if isinstance(rv, str):
             self.save_global(obj, rv)
@@ -799,7 +810,7 @@ class Pickler:
 
     def _save_str(self, obj):
         if self.bin:
-            var enc = obj.encode("utf-8", "surrogatepass")
+            var enc = obj.encode("utf-8")
             var n = len(enc)
             if n <= 0xff and self.proto >= 4:
                 self._write_bytes(SHORT_BINUNICODE + bytes([n]), enc)
@@ -1359,7 +1370,7 @@ class Unpickler:
                 return klass(*args)
             except TypeError as err:
                 raise TypeError("in constructor for " + klass.__name__ + ": " + str(err)) from None
-        return klass.__new__(klass)
+        return copyreg._ny_new(klass, ())
 
     def _op(self, key):
         var st = self.stack
@@ -1463,13 +1474,13 @@ class Unpickler:
             st.append(_raw_unicode_unescape(self._readline()[:-1]))
         elif key == 0x58:                      # BINUNICODE
             var n = _le_int(self._read(4))
-            st.append(bytes(self._read(n)).decode("utf-8", "surrogatepass"))
+            st.append(bytes(self._read(n)).decode("utf-8"))
         elif key == 0x8d:                      # BINUNICODE8
             var n = _le_int(self._read(8))
-            st.append(bytes(self._read(n)).decode("utf-8", "surrogatepass"))
+            st.append(bytes(self._read(n)).decode("utf-8"))
         elif key == 0x8c:                      # SHORT_BINUNICODE
             var n = self._read(1)[0]
-            st.append(bytes(self._read(n)).decode("utf-8", "surrogatepass"))
+            st.append(bytes(self._read(n)).decode("utf-8"))
         elif key == 0x74:                      # TUPLE
             var items = self._pop_mark()
             self.stack.append(tuple(items))
@@ -1519,12 +1530,12 @@ class Unpickler:
         elif key == 0x81:                      # NEWOBJ
             var args = st.pop()
             var cls = st.pop()
-            st.append(cls.__new__(cls, *args))
+            st.append(copyreg._ny_new(cls, args))
         elif key == 0x92:                      # NEWOBJ_EX
             var kwargs = st.pop()
             var args = st.pop()
             var cls = st.pop()
-            st.append(cls.__new__(cls, *args, **kwargs))
+            st.append(copyreg._ny_new(cls, args, kwargs))
         elif key == 0x63:                      # GLOBAL
             var module = self._readline()[:-1].decode("utf-8")
             var name = self._readline()[:-1].decode("utf-8")

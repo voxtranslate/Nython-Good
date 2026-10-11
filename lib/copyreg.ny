@@ -40,6 +40,17 @@ def pickle_complex(c):
 dispatch_table[complex] = pickle_complex
 
 
+# cls.__new__(cls, *args): a class that names no base reads no __new__
+# here (object's is not found through it), so object.__new__ stands in
+def _ny_new(cls, args, kwargs=none):
+    var nw = getattr(cls, "__new__", none)
+    if nw is none:
+        return object.__new__(cls)
+    if kwargs:
+        return nw(cls, *args, **kwargs)
+    return nw(cls, *args)
+
+
 def _reconstructor(cls, base, state):
     var obj = none
     if base is object:
@@ -52,6 +63,14 @@ def _reconstructor(cls, base, state):
 
 
 _HEAPTYPE = 1 << 9
+
+
+# a class's own namespace ({} for a builtin type, which has none here)
+def _cdict(c):
+    try:
+        return c.__dict__
+    except AttributeError:
+        return {}
 
 _BUILTIN_TYPES = (int, float, str, bytes, bytearray, list, dict, tuple, set, frozenset, complex, bool)
 
@@ -67,7 +86,7 @@ def _has_own_getstate(cls):
     for c in cls.__mro__:
         if c is object:
             return false
-        if "__getstate__" in c.__dict__:
+        if "__getstate__" in _cdict(c):
             return true
     return false
 
@@ -100,15 +119,15 @@ def _reduce_ex(self, proto):
 
 
 def __newobj__(cls, *args):
-    return cls.__new__(cls, *args)
+    return _ny_new(cls, args)
 
 
 def __newobj_ex__(cls, args, kwargs):
-    return cls.__new__(cls, *args, **kwargs)
+    return _ny_new(cls, args, kwargs)
 
 
 def _slotnames(cls):
-    var names = cls.__dict__.get("__slotnames__")
+    var names = _cdict(cls).get("__slotnames__")
     if names is not none:
         return names
     names = []
@@ -116,8 +135,8 @@ def _slotnames(cls):
         pass
     else:
         for c in cls.__mro__:
-            if "__slots__" in c.__dict__:
-                var slots = c.__dict__["__slots__"]
+            if "__slots__" in _cdict(c):
+                var slots = _cdict(c)["__slots__"]
                 if isinstance(slots, str):
                     slots = (slots,)
                 for name in slots:
@@ -217,19 +236,26 @@ def _ny_reduce_newobj(obj):
     return newobj, newargs, state, listitems, dictitems
 
 
+_EXC_FIELDS = ("args", "errno", "strerror", "filename", "filename2", "winerror", "characters_written", "msg",
+               "lineno", "offset", "text", "end_lineno", "end_offset", "print_file_and_line", "code", "value",
+               "name", "path", "obj", "encoding", "object", "start", "end", "reason", "exceptions", "message")
+
+
 def _ny_reduce_ex(obj, proto):
     # object.__reduce_ex__: a class's own __reduce__ wins
     var cls = type(obj)
     for c in cls.__mro__:
         if c is object:
             break
-        if "__reduce__" in c.__dict__:
+        if "__reduce__" in _cdict(c):
             return obj.__reduce__()
     if isinstance(obj, BaseException):
+        # BaseException.__reduce__: (type, args) and the instance's own
+        # attributes (not the ones CPython keeps in the exception itself)
         var d = obj.__dict__ if _ny_has_dict(obj) else {}
         var st = {}
         for k in d:
-            if not k.startswith("__"):
+            if not k.startswith("__") and k not in _EXC_FIELDS:
                 st[k] = d[k]
         if len(st):
             return cls, tuple(obj.args), st
