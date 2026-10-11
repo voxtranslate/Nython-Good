@@ -46,19 +46,19 @@ class Animal:
         self.name = name
 class Dog(Animal):
     def init(self, name):
-        super(name)
+        super().init(name)
     def speak(self):
         return self.name + " barks"
 
 class Cat extends Animal:
     def init(self, name):
-        super(name)
+        super().init(name)
     def speak(self):
         return self.name + " meows"
 
 class Bird inherits Animal:
     def init(self, name):
-        super(name)
+        super().init(name)
     def speak(self):
         return self.name + " tweets"
 
@@ -80,11 +80,11 @@ class L1:
         self.a = 1
 class L2(L1):
     def init(self):
-        super()
+        super().init()
         self.b = 2
 class L3(L2):
     def init(self):
-        super()
+        super().init()
         self.c = 3
 var deep = L3()
 t("super_a", deep.a, 1)

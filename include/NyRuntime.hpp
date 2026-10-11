@@ -139,6 +139,26 @@ inline bool decorator_binding(const std::string& n, int& skip) {
     return false;
 }
 
+// A class body's __new__ is a static method, __init_subclass__ and
+// __class_getitem__ class methods, without a decorator: what C.__dict__
+// shows them as (round 78, both engines).
+inline const char* implicit_method_kind(const std::string& n) {
+    if (n == "__new__") return "staticmethod";
+    if (n == "__init_subclass__" || n == "__class_getitem__") return "classmethod";
+    return nullptr;
+}
+// A function's __name__ when its binding name is private-mangled (round 78:
+// `def __m` in class C binds _C__m, the parser's name; its __name__ is __m,
+// the last part of its __qualname__ "C.__m").
+inline std::string unmangled_name(const std::string& name, const std::string& qualname) {
+    if (name.size() < 4 || name[0] != '_' || name[1] == '_' || qualname.empty()) return name;
+    size_t dot = qualname.rfind('.');
+    std::string last = dot == std::string::npos ? qualname : qualname.substr(dot + 1);
+    if (last.size() < 3 || last[0] != '_' || last[1] != '_' || name.size() <= last.size()
+        || name.compare(name.size() - last.size(), last.size(), last) != 0) return name;
+    return last;
+}
+
 // issubclass over the builtin types (round 77): a type derives from itself
 // and from object, bool from int.
 inline bool builtin_type_derives(const std::string& sub, const std::string& sup) {
@@ -184,6 +204,16 @@ inline bool mirror_dunder(const std::string& a) {
     if (a.size() < 5 || a[0] != '_' || a[1] != '_') return false;
     for (const char* n : names) if (a == n) return true;
     return false;
+}
+// The class holding a plain value's own versions of its type's dunders,
+// looked at before the mirror class (round 78): int's and float's binary
+// operators give Python's NotImplemented for an operand the type does not
+// take - (5).__add__("x") - where the mirror's compute for a subclass
+// instance. "" for the other types.
+inline const char* value_dunder_class(const std::string& t) {
+    if (t == "int") return "_NyV_int";
+    if (t == "float") return "_NyV_float";
+    return "";
 }
 // The builtin type a mirror class stands for ("" for any other class name).
 inline std::string mirror_builtin(const std::string& cls) {
