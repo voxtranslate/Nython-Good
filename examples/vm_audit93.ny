@@ -1161,6 +1161,16 @@ check("__slots__ on builtin subclasses", [raises(make_sub, "int", "    __slots__
                                           make_sub("int", "    __slots__ = ()\n")(5) + 1, sst.upper(), sst.a, raises(setattr, sst, "b", 2)],
       ["TypeError: nonempty __slots__ not supported for subtype of 'int'", "TypeError: nonempty __slots__ not supported for subtype of 'tuple'",
        6, "Q", 1, "AttributeError: 'C' object has no attribute 'b'"])
+
+# a program that rebinds the builtins the engines' __slots__ support calls
+shadow = os.path.join(TMP, "shadow.py")
+with open(shadow, "w") as f:
+    f.write("list = []\nstr = 1\ntype = 2\nisinstance = 3\ngetattr = 4\nrepr = 5\ntuple = 6\n"
+            "class S:\n    __slots__ = ('a',)\ns = S()\ns.a = 7\ntry:\n    s.b = 1\nexcept AttributeError as e:\n    print(s.a, e)\n")
+import subprocess
+shadow_runs = [[sys.executable, shadow], [sys.executable, "--vm", shadow]] if nython else [[sys.executable, shadow]] * 2
+check("__slots__ in a program that rebinds builtins", [subprocess.run(r, capture_output=True, text=True).stdout.strip() for r in shadow_runs],
+      ["7 'S' object has no attribute 'b'"] * 2)
 sd = SlottedWithDict()
 sd.x = 1
 sd.free = 2
