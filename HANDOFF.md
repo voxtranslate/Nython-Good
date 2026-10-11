@@ -870,6 +870,12 @@ Nython over the class machinery above; each header says what is not there.
   has different size": GCC aligned that function-local static to 8 (padded to
   16 bytes) in one unit and to 4 (12 bytes) in another - the same object,
   only the padding differs, so it is harmless.
+- **AArch64 (qemu-user), round 77 at ec3d5b6** (`make cli BUILD=build-arm64
+  CXX=aarch64-linux-gnu-g++`, run with `qemu-aarch64 -L
+  /usr/aarch64-linux-gnu`): vm_audit49, 54, 55, 56, 60, 64, 65, 67, 69, 72,
+  79, 84, 85, 86 and 87 pass on both engines - the assembly context switch
+  under generators and async tasks, the memory suites, and the round's
+  language, class-model and value suites.
 
 ### A running program's input (vm_audit71, tools/ide_e2e.py `run`/`terminal`)
 - The IDE closed a program's stdin (`os_spawn(..., input="")`), so its first
