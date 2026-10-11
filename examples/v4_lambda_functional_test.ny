@@ -37,7 +37,7 @@ t("counter3", c(), 3)
 print "=== MAP/FILTER/REDUCE ==="
 t("map_double", str(map(lambda x: x * 2, [1,2,3,4,5])), "[2, 4, 6, 8, 10]")
 t("map_square", str(map(lambda x: x * x, [1,2,3])), "[1, 4, 9]")
-t("map_str", str(map(lambda x: str(x) + "!", [1,2,3])), "[1!, 2!, 3!]")
+t("map_str", str(map(lambda x: str(x) + "!", [1,2,3])), "['1!', '2!', '3!']")
 
 t("filter_gt", str(filter(lambda x: x > 3, [1,2,3,4,5])), "[4, 5]")
 t("filter_even", str(filter(lambda x: x % 2 == 0, [1,2,3,4,5,6])), "[2, 4, 6]")

@@ -4,6 +4,7 @@
 #include "Lexer.hpp"
 #include "Except.hpp"
 #include "Context.hpp"
+#include "NyGC.hpp"
 
 
 using nython::lexer::Token;
@@ -13,17 +14,48 @@ using nython::exception::RuntimeError;
 namespace nython{
 namespace kernel{
 
+// A scope is born with one reference, its creator's (NyGC.hpp): the call
+// that runs in it (CtxReaper), the class or namespace body, the closure made
+// from it. The creator releases it; whatever else still refers to it - a
+// child scope's parent link, a function defined in it, an instance's fields
+// - holds its own counted reference.
 Context::Context(Runnable* runner, const std::string& name, Collectable* self, Collectable* klass, Context* parent): Container(runner, Type::CONTEXT), name{name},
 self{self}, klass{klass}, parent{parent}, inFunction{},inClass{},inNameSpace{},inBlock{}, inModule{} {
+    gc_rc = 1;
+    if (this->parent) nygc::incref(this->parent);
+    nygc::track(this);
 }
 
 Context::~Context(){
+    Context* p = parent;
+    parent = nullptr;
+    if (p) nygc::decref(p);
+    // a scope over a dict's map (exec(src, ns), round 77): the map is the
+    // dict's, not freed here
+    if (Collectable* o = ns_owner) { container = nullptr; ns_owner = nullptr; nygc::decref(o); }
+}
+
+void Context::gc_traverse(nython::gc::GcVisitFn visit, void* arg) {
+    if (ns_owner) visit(ns_owner, arg);          // its variables are the dict's (round 77)
+    else Container::gc_traverse(visit, arg);
+    if (parent) visit(parent, arg);
+}
+
+void Context::gc_clear() {
+    if (Collectable* o = ns_owner) { container = nullptr; ns_owner = nullptr; nygc::decref(o); }
+    else Container::gc_clear();
+    Context* p = parent;
+    parent = nullptr;
+    if (p) nygc::decref(p);
 }
 
 Context& Context::operator=(Context&& ctx){
     if(this!=&ctx){
         name        = std::move(ctx.name);
-        parent      = std::move(ctx.parent);
+        Context* old_parent = parent;
+        parent      = ctx.parent;
+        ctx.parent  = nullptr;
+        if (old_parent) nygc::decref(old_parent);
         self        = std::move(ctx.self);
         klass       = std::move(ctx.klass);
         runner      = std::move(ctx.runner);
@@ -117,7 +149,11 @@ Object* Context::getParent() {
 }
 
 void Context::setParent(Object* parent) {
-    this->parent = (Context*)parent;
+    Context* np = (Context*)parent;
+    if (np) nygc::incref(np);
+    Context* old = this->parent;
+    this->parent = np;
+    if (old) nygc::decref(old);
 }
 
 

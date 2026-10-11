@@ -19,6 +19,7 @@ namespace nython {
 namespace lexer{
 extern std::map<TokenType,std::string> TokenTypeNames;
 }
+namespace node { struct CallNode; }
 }
 
 namespace nython::parser {
@@ -42,6 +43,31 @@ private:
 
     /// Temporary storage for parameter default values during function parsing
     std::vector<node_ptr> param_defaults_;
+    size_t param_posonly_ = 0;   // paramList: parameters before a bare `/`
+    // Annotations (round 77). The kind of scope each statement is parsed in
+    // ('c' a class body, 'f' a function body; empty: the module); whether a
+    // class body / the module stored an annotation (it then starts with
+    // `var __annotations__ = {}`); `from __future__ import annotations`
+    // (annotations stay strings); paramList's parameter annotations.
+    std::vector<char> ann_scope_;
+    std::vector<bool> class_ann_used_;
+    bool module_ann_used_ = false;
+    bool future_annotations_ = false;
+    std::vector<std::pair<std::string, node_ptr>> param_ann_;
+    // Per function being parsed: the names it declared `global`/`nonlocal`.
+    std::vector<std::vector<std::string>> outer_decls_;
+    std::vector<std::vector<std::string>> global_decls_;   // `global` only, per function
+    // Per function being parsed: whether its body yields (an `async def`
+    // that yields is an async generator).
+    std::vector<bool> yield_seen_;
+    // The scopes around the definition being parsed, for __qualname__
+    // (round 77): a class's name, or a function's qualname + ".<locals>".
+    std::vector<std::string> qual_stack_;
+    std::string qualOf(const std::string& name) const {
+        return qual_stack_.empty() ? name : qual_stack_.back() + "." + name;
+    }
+    // The comprehension clause haveCompFor() just consumed was `async for`.
+    bool comp_async_ = false;
     // Set when a statement was terminated by ';' rather than a newline.
     // Statement parsers consume the semicolon themselves, so blockOrStmt()
     // cannot otherwise tell that an inline suite continues.
@@ -150,6 +176,30 @@ private:
 
     std::string identifier();
     std::string dottedName();
+    // Soft keywords (round 77): the word at the start of a statement is a
+    // name when usedAsName(); var/let/const/ref declare when declFollows().
+    bool usedAsName(int k = 1);
+    bool declFollows();
+    // Binding positions (assignment, del, walrus targets): `self`/`this`
+    // there are the names, not the Nython self-reference (round 77).
+    node_ptr asTarget(node_ptr t);
+    // `this` reads as self only inside a def whose first parameter is
+    // self/this; elsewhere it is the ordinary name (round 77).
+    std::vector<bool> self_scope_;
+    // A statement that starts with `{` is a dict/set display when the
+    // brace is followed by more of an expression (`{}["x"]`, `{1} | s`)
+    // rather than a block (round 77).
+    bool braceIsExpression();
+    // star_expressions: `1, 2`, `*a, b` (a tuple display) or one expression
+    node_ptr exprList(Token tok, std::vector<node_ptr>* items = nullptr, node_ptr first = nullptr);
+    // del target lists: `del a, (b, [c])` (round 77)
+    void delTargets(node_ptr t, std::vector<node_ptr>& out);
+    // lambda parameters before a bare `/`
+    size_t lambda_posonly_ = 0;
+    // Binding a value to a (tuple/list/starred) target, into `block`
+    std::string unpackTemp();
+    void bindTarget(const Token& op, node_ptr t, node_ptr value, node_ptr block);
+    void bindTargets(const Token& op, const std::vector<node_ptr>& ts, int star, const std::string& src, node_ptr block);
 
     bool isCompoundStatement();
     bool isFlowStatement();
@@ -186,8 +236,16 @@ private:
     node_ptr power();
     node_ptr unary();
     node_ptr postfix();
+    // postfix() pieces, shared by `.`/`[`/`(` and their optional forms
+    void parseCallArgs(std::shared_ptr<nython::node::CallNode> call);
+    node_ptr parseSubscriptTail(Token tok, node_ptr expr);
+    std::string memberName();
+    bool postfixOther(node_ptr& expr);
+    node_ptr coalesce();          // a ?? b
     node_ptr primary();
     node_ptr atom();
+    // f"..." / `...${}...` interpolation: literal parts and fields, joined by +
+    node_ptr fstringNode(const Token& str_tok, const std::string& raw);
 
     // Statement parsing
     node_ptr statement();
@@ -208,11 +266,35 @@ private:
     node_ptr raiseStmt();
     node_ptr assertStmt();
     node_ptr switchStmt();
+    // `match` (Python's structural pattern matching): the patterns parse into
+    // MatchPat and the statement desugars into an if-chain over a subject
+    // temporary - see switchStmt().
+    struct MatchPat {
+        enum Kind { WILD, CAPTURE, VALUE, OR, SEQ, CLASS, MAP } kind = WILD;
+        std::string name;                 // CAPTURE
+        std::string as_name;              // `pattern as name`, any kind
+        node_ptr value;                   // VALUE: the expression; CLASS: the class
+        std::vector<std::shared_ptr<MatchPat>> subs;   // OR / SEQ / CLASS positional
+        int star = -1;                    // SEQ: index of the starred item
+        std::string star_name;            // SEQ: its name ("" or "_" binds nothing)
+        std::vector<std::pair<std::string, std::shared_ptr<MatchPat>>> kw;  // CLASS keywords
+        std::vector<std::pair<node_ptr, std::shared_ptr<MatchPat>>> items; // MAP
+        std::string rest;                 // MAP: **rest
+    };
+    std::shared_ptr<MatchPat> matchPattern();        // open sequence at the top
+    std::shared_ptr<MatchPat> matchOrPattern();
+    std::shared_ptr<MatchPat> matchClosedPattern();
+    node_ptr matchStmt(Token tok, node_ptr subject);
     node_ptr enumDecl();
     node_ptr lambdaExpr();
     node_ptr deleteStmt();
     node_ptr yieldStmt();
-    node_ptr withStmt();
+    node_ptr withStmt(bool is_async = false);
+    node_ptr wrap_call(const std::string& helper, node_ptr arg);
+    std::string tokenText(int from, int to);                  // source text of tokens [from, to)
+    node_ptr annotationValue(node_ptr expr, int from, int to); // what __annotations__ stores
+    node_ptr annotationsDecl(const Token& t);                 // `var __annotations__ = {}`
+    bool haveCompFor();
     node_ptr repeatStmt();
     node_ptr loopStmt();
     node_ptr blockStmt();
@@ -225,6 +307,17 @@ private:
     std::vector<node_ptr> lambdaParamList();
     std::vector<node_ptr> argList();
     node_ptr listLiteral();
+    // Starred elements in displays (round 77): [*a, b], (*a, b), {*a},
+    // {**d, k: v}. Outside an assignment target they become calls of the
+    // prelude's _ny_list_cat / _ny_dict_merge; inside one they stay
+    // UnaryNode("*") targets.
+    node_ptr starElem();
+    node_ptr catStarred(Token tok, const std::vector<node_ptr>& elems, const char* wrap);
+    bool in_assign_target_ = false;
+    // After the first `for` of a comprehension: its clauses.
+    node_ptr comprehension(Token tok, int kind, node_ptr elt, node_ptr value);
+    node_ptr compTarget();
+    node_ptr compTargetOne();
     node_ptr mapLiteral();
     node_ptr tupleLiteral();
 

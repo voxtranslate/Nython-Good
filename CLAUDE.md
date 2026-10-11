@@ -28,6 +28,9 @@ nython/
 │   │   ├── audio.cpp         ← audio builtins (stubs)
 │   │   ├── threading.cpp     ← thread_create, thread_sleep, mutex_*
 │   │   ├── lang.cpp          ← lang_define_token, lang_eval, ...
+│   │   ├── text.cpp          ← editor text services: symbols, syntax check,
+│   │   │                        Myers diff, workspace search, folding, format,
+│   │   │                        completion index (keeps the IDE's hot paths native)
 │   │   └── gui.cpp           ← SDL3 GUI backend (38 gui_* functions)
 │   └── ...                   ← Lexer, Parser, Value, GarbageCollector, etc.
 ├── include/                  ← C++ headers
@@ -48,14 +51,34 @@ nython/
 │   ├── ide_selection.ny      ← multi-cursor selection model
 │   ├── ide_inspector.ny      ← universal value inspector
 │   ├── stdlib.ny             ← standard library
+│   ├── argparse.ny, collections.ny, asyncio.ny, socket.ny, ssl.ny,
+│   │   select.ny, selectors.ny, signal.ny, websocket.ny, threading.ny,
+│   │   socketserver.ny, hashlib.ny, hmac.ny, base64.ny, secrets.ny
+│   │                         ← Python's modules (round 77; `# nython: module`
+│   │                            files run in a scope of their own)
+│   ├── http/, urllib/        ← packages: http.client/server/cookiejar,
+│   │                            urllib.request/parse/error
 │   ├── nytorch.ny            ← ML framework entry point
 │   ├── nytorch/              ← 17 nytorch sub-modules
 │   └── ...                   ← network.ny, thread.ny, os.ny, etc.
-├── nython_ide.ny             ← THE SHIPPED IDE (v4, ~3,700 lines) ← --ide loads this
-├── ide_editor.ny             ← editor buffer used by the shipped IDE
+├── nython_ide.ny             ← THE SHIPPED IDE ← --ide loads this. One class,
+│                                NythonIDE, split across a chain of files:
+├── ide_core.ny               ←   documents, command registry, _exec dispatcher
+├── ide_ops.ny                ←   jobs, find, Quick Input, run, settings, watcher
+├── ide_paint.ny              ←   theme + every painter (allocation-free)
+├── ide_views.ny              ←   Explorer/Search/SCM/Debug/Extensions/Outline/AI
+├── ide_tools.ny              ←   Code::Blocks side: build targets, bookmarks,
+│                                folding, snippets, keymaps, wizard, tools
+├── ide_editor.ny             ← EditorBuffer, SyntaxHighlighter
 ├── ide_icons.ny              ← icon set: Codicon glyphs, vector fallback
 ├── ide_project.ny            ← workspace / project model
 ├── ide_workshop.ny           ← language workshop panel
+├── lib/ide_workbench.ny      ← CommandRegistry, HitMap, QuickInput, LineEdit, ...
+├── lib/ide_scm.ny            ← GitRepo + LineDiff (Myers) for Source Control
+├── lib/ide_debugger.ny       ← record-and-replay debugger over `--trace`
+├── tools/                    ← ide_driver.py / ide_e2e.py (drive the real IDE
+│                                headlessly), ide_lint.py, ide_memprobe.py,
+│                                nyshot.py (frame capture → PNG), sweep.py
 ├── assets/fonts/codicon.ttf  ← VS Code icon font (CC BY 4.0, licence beside it)
 ├── examples/nython_ide.ny    ← a v3 DEMO, not shipped — see IDE_FILES.md
 ├── examples/                 ← 356 example scripts
@@ -66,7 +89,7 @@ nython/
 │                                SDL3 is found (see "Development environment")
 ├── HANDOFF.md                ← START HERE when resuming
 ├── FIXES_v0.2.1.md           ← round-by-round log: every bug and why
-├── GC_NOTES.md               ← the container leak: diagnosis and three fixes
+├── GC_NOTES.md               ← memory management: refcounting + cycle collector (round 75)
 ├── MEMORY_NOTES.md           ← writing Nython the runtime can afford
 ├── IDE_FILES.md              ← which IDE file is real (this has bitten before)
 ├── nython.cbp                ← Code::Blocks project (SDL3 pre-configured)
@@ -99,6 +122,37 @@ loudly if not found) if auto-detection picks the wrong one.
 - Link libraries: `ws2_32`, `SDL3`, `SDL3_ttf`, `SDL3_image`
 - Copy `SDL3.dll`, `SDL3_ttf.dll`, `SDL3_image.dll` next to `nython.exe`
 - See `SDL3_SETUP.md` for detailed instructions
+- The `.cbp` lists its units: **a new `src/**.cpp` must be added to it** (seven
+  were missing after round 74 and the Windows build could not link).
+- Command strings (`os_exec`, `os_run("...")`, `os_spawn("...")`, the IDE's git,
+  build and tool commands) run through a POSIX `sh` when one is found - Git for
+  Windows' (Source Control needs git anyway), MSYS2's, or `NY_SH` - else
+  through `cmd.exe`. `os_shell()` says which.
+- Tested from Linux without Windows: `tools/cross_windows.sh deps && tools/cross_windows.sh build`
+  cross-compiles with MinGW against SDL3 built for Windows; `build-win/nywin`
+  runs it under Wine and `python3 tools/sweep.py --bin build-win/nywin` sweeps it.
+  The build takes its units, flags and libraries from `nython.cbp` itself
+  (`tools/cbp.py`), so it builds exactly what Code::Blocks builds.
+  `ARCH=i686` builds and runs the **32-bit** edition (w64devkit i686, 32-bit
+  MSYS2) into `build-win32/`.
+- **`python3 tools/cbp.py check`** (every sweep runs it) fails when a
+  `src/**.cpp` is not a `<Unit>` of `nython.cbp` - a unit missing there links
+  on Linux and fails only in Code::Blocks (it happened twice).
+- `long` is 32 bits on Windows: never cast a Nython integer through `long`
+  (use `int64_t`/`long long`, `intValue()`, `bigint_to_i64()`).
+- 32-bit builds: `size_t` is 32 bits (never `>> 32` a `size_t`; keep hashes
+  `uint64_t`) and there is no `unsigned __int128`.
+- Write `"??="` in C++ string literals as `"?\?="` (a trigraph otherwise:
+  a warning on every file that includes the line).
+- Never use `__builtin_frame_address` in code that can be inlined into the
+  engines (use `nycoro::stack_position()`). On Windows x64 it gives a large
+  function a frame pointer whose XMM-save unwind info GCC records wrongly,
+  so exceptions corrupt XMM registers or crash; `tools/pe_unwind_check.py`
+  (run by the 64-bit cross build) rejects any such function.
+- The project targets Vista (`_WIN32_WINNT=0x0600`): a newer Win32 API must be
+  looked up with `GetProcAddress` (see `stack_limits` in `src/NyCoro.cpp`).
+- It links with an 8 MB main stack (`-Wl,--stack,8388608`), as Linux gives;
+  the PE default of 2 MB made deep recursion and nested generators stop early.
 
 ### Development environment (no SDL3 available)
 
@@ -114,8 +168,27 @@ NY_STUB_AUTOQUIT=120 ./build/nython --ide    # IDE runs and exits cleanly
 ```
 
 `NY_STUB_AUTOQUIT=<n>` makes the stub deliver one quit event after *n* empty
-polls so event loops terminate; `NY_STUB_DPI_SCALE=<f>` fakes a HiDPI display.
-Full detail in `HANDOFF.md`.
+polls so event loops terminate; `NY_STUB_DPI_SCALE=<f>` fakes a HiDPI display,
+following macOS/Wayland's model (`NY_STUB_DPI_MODE=points`, the default) or
+Windows/X11's (`=pixels`). Full detail in `HANDOFF.md`.
+
+### Real SDL3 in a container (round 75)
+
+The stub is not the only option: `tools/build_sdl3.sh` builds the real SDL3,
+SDL3_ttf (with HarfBuzz, as releases are) and SDL3_image into `/opt/sdl3`, and
+the IDE then runs on a real X server, Xvfb, or SDL's offscreen driver - with
+the same scripted-input / frame-capture test harness as the stub
+(`src/builtins/gui_harness.cpp`), so the whole e2e suite runs against it:
+
+```bash
+tools/build_sdl3.sh
+PKG_CONFIG_PATH=/opt/sdl3/lib/pkgconfig make cli BUILD=build-sdl NYTHON_SDL_STUB=0
+PKG_CONFIG_PATH=/opt/sdl3/lib/pkgconfig make     BUILD=build-sdl NYTHON_SDL_STUB=0
+Xvfb :99 -screen 0 1920x1080x24 &
+NY_IDE_BINARY=build-sdl/nython NY_IDE_ENV="SDL_VIDEODRIVER=x11 DISPLAY=:99" python3 tools/ide_e2e.py
+```
+
+`NY_REAL_PIXELS=1` makes each `snap` also write a PNG of the real rendering.
 
 ### Key build flags
 - `-DNYTHON_WITH_IDE=1` (default) — no-arg launch opens IDE; `=0` opens REPL
@@ -204,6 +277,8 @@ def make_fn(n):
 
 ### GarbageCollector lock bug (fixed)
 Lines 77 and 228 in `GarbageCollector.cpp` had temporary locks that were immediately destroyed. Fixed to named variables (`gc_lock`, `dealloc_lock`).
+The old `GarbageCollector` itself was removed in round 76 (unused since
+round 75's `NyGC`/`VMGC`).
 
 ### IDE import weight
 `nython_ide.ny` must NOT import `"lib/nytorch.ny"` (loads 220+ classes, causes OOM). The builtins are already registered via `gui.ny`'s bare `import nytorch`.
@@ -228,7 +303,7 @@ These were aligned to match how the IDE calls them:
 | test_vm | 12 | Core VM |
 | test_vm2 | 48 | Core VM |
 | test_vm3 | 27 | Core VM |
-| test_vm4 | 56 | Core VM |
+| test_vm4 | 57 | Core VM |
 | test_vm_extended | 30 | Core VM |
 | test_vm_stress | 37 | Core VM |
 | vm_audit22 | 88 | Advanced patterns |
@@ -250,8 +325,56 @@ These were aligned to match how the IDE calls them:
 | test_nytorch15 | 184 | ML cognitive |
 | test_nytorch16 | 153 | ML pipeline |
 | test_nytorch17 | 199 | ML device-agnostic |
+| vm_audit42 | 73 | IDE workbench model: registry, chords, when-clauses, QuickInput, LineEdit |
+| vm_audit43 | 52 | EditorBuffer undo groups/indentation/final newline, LineDiff, GitRepo |
+| vm_audit44 | 46 | record-and-replay debugger, including a real `--trace` recording |
+| vm_audit45 | 45 | JSON codec, print call form, list pop/insert, deep equality, file_mtime |
+| vm_audit46 | 252 | OS layer: paths, files, file objects, typed errors, os_run/os_spawn, env, time, full-width ints, sys.argv |
+| vm_audit47 | 153 | nytorch: kernels, autograd, Module/optimizers, XOR and a toy CNN, checked against PyTorch numbers and finite differences; one definition per class name |
+| vm_audit48 | 143 | threads and synchronisation: mutex/rwlock/condition/semaphore/barrier/latch/atomics/channels/queues/futures/pools, deadlock detection, no lock convoys (rwlock too, round 76) |
+| vm_audit49 | 52 | async/await: tasks, gather, wait_for, cancellation, deterministic order; tasks are coroutines (no OS thread per task, blocking inside a generator, per-task exception state) |
+| vm_audit50 | 51 | `lib/thread.ny` over the native runtime |
+| vm_audit51 | 52 | native editor text services (symbols, syntax check, diff, search, folding, format, completion index) |
+| vm_audit60 | 284 | Python values and builtins: dicts, ints, formatting, operators, tuples, strings (same results under python3) |
+| vm_audit61 | 33 | Nython-only value behaviour |
+| vm_audit62 | 29 | tensor type promotion: integer results for integer-closed ops (NumPy's rule), floats otherwise, exact 64-bit sums |
+| vm_audit55 | 4059 | memory: refcounting frees at once, cycles (self, pair, ring, closure over its instance, bound method on its instance, self-containing list/dict) collected, `__del__` once + resurrection, nothing reachable freed (2000-node graph), loops do not grow the heap, threads collecting concurrently, `weakref` |
+| vm_audit52 | — | exceptions as objects: typed except across calls, finally/raise, with protocol, NameError/AttributeError/TypeError |
+| vm_audit53 | — | classes: C3 MRO, super(), class bodies, properties, the operator and object protocols |
+| vm_audit54 | — | comprehensions, match patterns, walrus, unpacking, generators, calls (`**d`, arity) |
+| vm_audit56 | 120 | lazy generators: infinite ones with islice/take/zip/any, side-effect order, send/throw/close/GeneratorExit/finally, StopIteration.value, `yield from` (600 deep), genexps, `__iter__` generators, unpacking, errors, threads (same results under python3) |
+| vm_audit57 | 212 | strict reads (AttributeError/KeyError), getattr/hasattr/setattr/delattr/get/setdefault, `?.` `?[` `??` `??=`, `undefined`, var/let/const/global/nonlocal scope rules in every context, suffix literals (round 75) |
+| vm_audit63 | 59 | round 76: const/nonlocal/global checks (static, SyntaxError), lambda closures and defaults, print's argument order, error columns, lazy iterators |
+| vm_audit64 | 26 | round 76: objects used as dict keys freed (cycles through keys too), suspended-generator cycles collected with their finally blocks run, bound builtin members freed |
+| vm_audit65 | 149 | round 77: bytes/bytearray (literals, escapes, codecs, methods, bytearray mutation), builtin types as namespaces (same results under python3) |
+| vm_audit66 | 33 | round 77: signals - handlers, SIGINT as KeyboardInterrupt, interrupted waits resuming (PEP 475), signal channels |
+| vm_audit67 | 44 | round 77: modules with their own scope, from-imports, packages, async with/for/generators, asyncio, VM closures per call |
+| vm_audit68 | 32 | round 77: sockets - TCP/UDP/IPv6/AF_UNIX, timeouts, makefile, select/selectors, errors, colorless I/O in tasks |
+| vm_audit69 | 40 | round 77: sets and frozensets - typed keys, API, operators, subset comparisons |
+| vm_audit70 | 79 | round 77: http.client/server, urllib, cookies, WebSockets (RFC 6455), TLS with a throwaway CA, network/webserver/sockets/clientserver libraries, math, hashlib |
+| vm_audit71 | 97 | round 77: the command line on each engine (-c/-m/-i/-, sys.argv, SystemExit statuses, the prompt), argparse against python3's output, sys.stdin/stdout/stderr, print(file=), a running program's stdin (os_spawn(stdin=true), input requests), locals/globals/vars/dir, kwargs order |
+| vm_audit72 | 56 | round 77: Python compatibility, passes under python3 too - starred displays, annotations, f"{x=}", slice objects, eval/exec/compile, complex, per-execution classes, collections, object/issubclass, __setattr__/__delattr__, threading.local, docstrings, positional-only parameters, keyword module names |
+| vm_audit73 | 292 | round 77: itertools, functools, operator, heapq, bisect, copy, contextlib |
+| vm_audit75 | 1004 | round 77: string, textwrap, pprint, csv, statistics, fractions, struct, calendar, uuid |
+| vm_audit76 | 273 | round 77: fnmatch, glob, shutil, tempfile, pathlib, subprocess, platform, getpass, logging, unittest, queue |
+| vm_audit77 | 274 | round 77: json, random (CPython's sequences for a seed), datetime, time, io, open(newline=) |
+| vm_audit78 | 147 | round 77: re - Python's syntax and messages over a native engine immune to catastrophic backtracking (selective memoization) |
+| vm_audit79 | 43 | round 77: class machinery, passes under python3 - annotations, PEP 487 (__init_subclass__, __set_name__), __new__, PEP 560/604 generics and unions, metaclasses, NotImplemented and reflected operators, __mro__/__bases__/__subclasses__ |
+| vm_audit80 | 15 | round 77: type() gives type objects (type(5) is int, type(obj) is its class, x.__class__), equal to their legacy names on Nython; typeof(x) is the name |
+| vm_audit74 | 124 | round 77: abc (ABCMeta, register, subclass hooks), numbers, collections.abc (all 26 ABCs, mixins, builtin registrations), singledispatch on ABCs and annotations |
+| vm_audit81 | 116 | round 77: enum (EnumType metaclass, auto, Flag boundaries, functional API) and dataclasses (every parameter, field, KW_ONLY, InitVar, frozen) |
+| vm_audit82 | 140 | round 77: typing (Union, generics, TypeVar, Protocol, NamedTuple, TypedDict, get_type_hints, check_type), types, inspect (signature, bind, getsource), keyword |
+| vm_audit83 | 158 | round 77: weakref (callbacks, proxies, weak dicts, finalize), warnings (filters, catch_warnings, -W), traceback (real tracebacks, chains), linecache, atexit |
+| vm_audit84 | 212 | round 77: Python's syntax (passes under python3) - soft Nython keywords (`new = 1`, `def f(ref):`, `obj.self`), imports/del/class bases/lambda parameters in every form, expression statements evaluated (`{}["x"]`), assignment and for/with targets, unpack counts, augmented in-place dunders and `@=`, chained comparisons, literals (`\N{...}`), decorators (PEP 614), match, exception groups and `except*` (PEP 654) |
+| vm_audit85 | 73 | round 77: classes deriving from builtin types hold a value (int/float/str/bytes/bytearray/list/dict/set/frozenset/tuple, `int.__new__(cls, v)`), `__getattribute__`, a live `obj.__dict__`, a metaclass's `__prepare__` (passes under python3) |
+| vm_audit86 | 65 | round 77: every class statement its own class, `isinstance(x, object)`, `__eq__` without `__hash__`, property/staticmethod/classmethod objects, dir/vars, two-argument super, bound/builtin method types and reprs, type objects for None/functions/builtins/generators/iterators, dict methods before keys (63 pass under python3) |
+| vm_audit87 | 73 | round 77: `in`/ordering TypeErrors, exceptions' str/repr/args and fields (OSError errno/filename, Unicode errors, SyntaxError), runtime errors with their fields, `iter(f, sentinel)`, generator attributes, `__format__`, `os.stat_result`, live `exec` namespaces, recursive reprs (72 pass under python3) |
+| tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
-Run all: `for t in examples/test_*.ny examples/vm_audit*.ny; do ./build/nython-cli "$t"; done`
+Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
+(the older feature suites, stdlib_test/stdlib_v2_test included since round 75),
+`examples/vm_audit*.ny` and `examples/gui_tests/test_*.ny`, on both engines,
+failing on "N failed" output as well as on the exit code.
 
 ## Language changes since this file was written
 
@@ -300,21 +423,61 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
 | `--profile` | real per-function counts and self/total time |
 | `gui_hash_id` | native FNV-1a for immediate-mode widget identity |
 | `gui_display_scale` | HiDPI content scale |
+| `print(a, b, sep=, end=)` | the call form, both engines (round 73) |
+| `fuzzy_score` / `fuzzy_positions` / `fuzzy_rank` | best-alignment fuzzy matching, native, both engines |
+| `file_mtime(path)` | ms since epoch, -1 if missing (folders too) |
+| `--trace OUT file.ny` | statement-level recording for the IDE's debugger |
+| `--profile` allocations | per function: objects and strings kept (`NY_PROFILE_SORT=alloc`); `NY_PROFILE_OUT=f nython --ide` profiles the IDE |
+| `a?.b` `a?.m(x)` `a?[k]` `a?.[k]` `f?.(x)` | optional chaining (round 75): none when the receiver is none/undefined **or** the member/key/index is missing; the rest of the chain is skipped, arguments included. A present link and every plain step after it stay strict (`a?.b.c` raises if `a.b` is none). Not assignable. |
+| `a ?? b`, `t ??= v` | null coalescing (round 75): `b` only when `a` is none or undefined (lazy); `??=` assigns only when `t` is none/undefined or, for an attribute/key, missing; object and index evaluated once |
+| `delattr`, `del obj.x` | remove an attribute (AttributeError if absent); `getattr`/`hasattr`/`setattr` work on every kind of value, as in Python |
+| `global x` | a real declaration now: creates the module variable and skips an enclosing function's `x` (round 75) |
+| suffix literals | `1k == 1000` (int), `2.5k == 2500`, `1.1k == 1100`; a float only when fractional (`1m == 0.001`, `1500m == 1.5`) |
+| `NY_LENIENT_READS=log` | porting aid: a missing attribute/key read prints `[lenient-read] file:line: ...` once and yields none instead of raising |
 
 ### Known limitations
 
-- **Containers are never reclaimed by the interpreter** — see `GC_NOTES.md`.
-  The VM does not have this problem (it uses `shared_ptr`).
-- `len()` counts characters but `s[i]` / `s[a:b]` index bytes.
-- `1.+(2, 3)` parses but evaluates to `none` — primitives have no members.
+- ~~**Containers are never reclaimed by the interpreter**~~ — **resolved
+  (round 75)**: reference counting plus a generational cycle collector on
+  both engines (the VM leaked every reference cycle). Lists, dicts,
+  strings, functions, bound methods, instances and scopes are freed, cycles
+  included; `__del__` runs once; `gc_collect()`/`gc_stats()`/`weakref()`.
+  200k container literals: 598 MB → 11 MB. See `GC_NOTES.md`.
+- ~~The VM has no tuple type~~ — **resolved (round 74)**: real tuples on both engines.
+- ~~`len()` counts characters but `s[i]` / `s[a:b]` index bytes~~ — **resolved
+  (round 74)**: indexing, slicing and `len` all count UTF-8 characters.
+- ~~`1.+(2, 3)` evaluates to `none`~~ — **resolved (round 74)**: operators as members.
 - ~~Integer `/` differs between engines~~ — **resolved (round 71)**: `/` is
   always true division (float), `//`/`\` are floor division (int) on both
   engines. See "Round 71 fixes" below.
-- `generator.send()` not implemented (eager-collection architecture).
+- ~~Interpreter generators are still eager~~ — **resolved (round 75)**:
+  generator bodies run on stackful coroutines (`NyCoro`/`NyGen`), lazily,
+  with the whole protocol (send/throw/close, `yield from`, StopIteration.value)
+  on both engines; generator expressions are lazy on both. See HANDOFF §0l.
+  Still open there: a generator dropped mid-iteration is finalized when its
+  loop/consumer ends or at program exit, not the moment its last reference
+  goes (that needs the interpreter's reference counting).
 - Video builtins are stubs (need ffmpeg).
-- `@property` as decorator syntax on a class method doesn't work on the VM
-  (the explicit `x = property(getter)` form does) — see HANDOFF 5.9.
-  Interpreter-only-correct, not yet ported.
+- ~~`@property` doesn't work on the VM~~ — **resolved (round 74)**: VM class
+  bodies run (properties with setters, static/class methods, decorators).
+- ~~Reading a missing attribute gives `none`~~ — **ruled and done (round
+  75)**: reading a missing attribute raises AttributeError and a missing
+  dict key KeyError, as in Python, on both engines (so do `none.x`,
+  `none[k]`, `none.m()`); absence is handled on purpose with `getattr(o, n,
+  d)` / `hasattr` / `d.get(k, d)` / `k in d` / `o?.x` / `d?[k]` / `x ?? d`.
+  Every library, the IDE and the tests were migrated (HANDOFF §0m).
+- ~~A plain `x = ...` rebinds a global — to be ruled on~~ — **ruled (round
+  75)**: kept. Inside a function a plain assignment rebinds the nearest
+  existing binding (enclosing functions, then the module); if there is none
+  it creates a local. `var`/`let`/`const` (equivalent, function-scoped)
+  declare a local that shadows any outer name for the rest of that function
+  from the point it runs; `global` names the module's variable, `nonlocal`
+  the enclosing function's. for-loop targets, parameters, comprehension
+  variables and `except ... as` are local declarations too.
+- ~~Interpreter lambdas capture loop variables by value~~ — **resolved
+  (round 76)**: lambdas close over their scope by reference, as `def` does
+  (`[lambda: i for i in range(3)]` gives 2, 2, 2, as Python), and a lambda
+  can call itself through the name it is assigned to.
 
 ## Session Workflow
 
@@ -329,7 +492,11 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
 4. Reproduce a defect minimally, trace it to source, fix **both engines
    together**, and add a test asserting values rather than termination.
 5. Re-run the sweep and compare divergence *sets* against
-   `/tmp/obuild/nython_orig`, not counts.
+   `/tmp/obuild/nython_orig`, not counts:
+   `python3 tools/sweep.py --base /tmp/obuild/nython_orig` does both engines
+   and prints regressions and fixes as sets. For IDE changes also run
+   `python3 tools/ide_lint.py`, `python3 tools/ide_e2e.py` and
+   `python3 tools/ide_memprobe.py --check`.
 6. Package to `/mnt/user-data/outputs/`.
 7. State plainly what was not done. A green suite that hides an unadopted module
    or a one-engine feature is worse than an honest gap.
@@ -512,6 +679,355 @@ zero-initialized bias) turned out not to be a bug — confirmed by printing
 the pre-activations and by re-checking with inputs that avoid that one
 coincidental point, which alone resolved it. See `HANDOFF.md` §0c for
 the full trace.
+
+## Round 73: the IDE to VS Code standard, verified by driving it
+
+The shipped IDE was rewritten around VS Code's model and then exercised end to
+end by a headless driver, which found and fixed real defects in the IDE, the
+runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
+
+- **IDE**: command registry (~150 VS Code ids, chords, when-clauses) behind
+  menus, palette, context menus, status bar and keys; Quick Input with `>`
+  `:` `@` `#`; document model with dirty tracking and Save/Don't Save/Cancel;
+  grouped undo (typing runs, typing over a selection, multi-caret edits,
+  comment/move-line/indent conversions are one step each); text fields with
+  a real caret and selection (`LineEdit`); per-file indentation detection,
+  Spaces/Tabs picker and conversion, tabs rendered at tab stops; workspace
+  file watching (explorer refresh, reload of clean editors, save-conflict
+  dialog); Source Control on git with Myers gutter bars and a diff view; a
+  record-and-replay debugger (breakpoints, step in/over/out, step back,
+  reverse continue, variables, call stack, watch); Extensions = the lib
+  catalog. The final newline is an empty last line, as in VS Code.
+- **Verification**: `tools/ide_e2e.py` (scenarios through real input, plus a
+  dead-click audit of every clickable in the editor, views and panels),
+  `tools/ide_lint.py` (unknown members, reserved words, dead commands and
+  click targets), `tools/ide_memprobe.py` (memory kept per frame/key/scroll).
+- **Runtime, both engines**: one JSON codec (`include/NyJson.hpp`; the
+  interpreter's was unescaped and flat); `print(a, b, sep=, end=)`;
+  `list.pop(i)` (VM ignored `i`), `insert` with negative index; deep `==`/`!=`
+  on the interpreter (nested lists were never equal, all maps were equal);
+  `true == 1` on the VM; `map.clear()` (turned maps into lists); the uncaught
+  exception is now in `--trace` recordings; `launch_ide` reports syntax
+  errors instead of terminating; background jobs whose output ended in a
+  newline never finished (os_exec strips it).
+- **Memory** (IDE, per `ide_memprobe.py`): idle 3.45 → 0 KB/frame, typing
+  787 → ~40 KB/key, scrolling 161 → ~7 KB/event, hover 40 → 0.
+
+## Round 74: the OS layer (see `HANDOFF.md` §0f)
+
+- **One implementation per os/io/time builtin, both engines.** The VM's own
+  copies were deleted; it reaches the interpreter's through the bridge.
+  Files: `src/builtins/os.cpp` (files, paths, env), `os_time.cpp`,
+  `os_proc.cpp`; helpers in `include/builtins/os.hpp`; conventions in
+  `include/NyRuntime.hpp`; the startup prelude (file objects, `open()`) in
+  `include/NyPrelude.hpp`.
+- Legacy names keep their return-value contract; the new `os_*` names raise
+  typed errors (FileNotFoundError, IsADirectoryError, FileExistsError, ...)
+  that the bridge turns into VM exceptions.
+- **Builtin kwargs**: names in `kwmap_builtins` (evalCall) get their keyword
+  arguments as one trailing map, as the VM's CALL_KW already did; read them
+  with `nyos::Args`.
+- New: `open()` file objects, `os_run(cmd, cwd=, env=, input=, timeout=)`
+  (argv list = no shell), `os_spawn`/`os_poll`/`os_wait`/`os_kill`, `os_walk`,
+  `os_glob`, `os_rmtree`/`os_copytree`/`os_move`, `os_stat`, `os_mkstemp`,
+  path normpath/relpath/split/splitext/expanduser/..., `time_strftime`/
+  `gmtime`/`strptime`/`time_iso`/`monotonic`/`time_ns`, `sys.argv`,
+  `__name__`, `__file__`, `import os` / `time.time()` namespaces.
+- Interpreter integers: `int()`, `//`, `//=`, `**=`, `abs()`, unary `-`, `~`
+  no longer truncate to 32 bits.
+
+## Round 74: threads, synchronisation and async (see `HANDOFF.md` §0g)
+
+- One concurrency runtime for both engines: `include/NyConc.hpp`,
+  `src/NyConc.cpp` (engine adapters: `threading.cpp`, `src/VMConc.cpp`).
+- One process-wide GIL (FIFO ticket lock, 5 ms hand-over). It is off
+  until the first thread starts. A due hand-over waits while the thread holds
+  a Nython lock (at most one more interval) and happens right after its last
+  unlock, and a released mutex wakes one waiter to compete for it instead of
+  being handed to a thread still waiting for the GIL - no lock convoys
+  (round 75; `thread_wait_count()` measures it). **Any native code that blocks must release
+  it**: wrap the wait in `nyconc::GilRelease unlocked;` and touch no engine
+  state inside it.
+- `async def` / `await`; channels with `select`; futures, pools, task
+  groups; `DeadlockError` / `LockOrderError` instead of hangs.
+
+## Round 74: nytorch (see `HANDOFF.md` §0h)
+
+- One tensor kernel library for both engines: `include/NyTensor.hpp`,
+  `src/builtins/nytensor.cpp` (interpreter: `dispatch_nt` first in the
+  callBuiltin chain; VM: `register_nt_natives()`). Tensors are flat lists
+  plus a shape; float64; broadcasting, axis reductions, batched matmul,
+  conv/pool/norm, seeded RNG, save/load v2.
+- `lib/nytorch/`: Tensor + autograd (`tensor.ny`), Module/Sequential
+  (`module.ny`), layers, losses, optimizers, data; every model class now
+  computes (no random-output stubs).
+- **One definition per class name under `lib/`**: `python3
+  tools/ny_classcheck.py` fails on duplicates (a later same-named class
+  silently replaces the earlier one). Run it after adding a class.
+
+## Round 74: Python values and builtins (see `HANDOFF.md` §0i)
+
+- Shared value libraries for both engines: `NyBigInt`, `NyStr`,
+  `NyFormat`, `NyOrderedMap`, `builtins/pycore.cpp`.
+- Dicts keep insertion order with typed keys; ints are exact at any size;
+  one formatter (f-strings with specs, `format`, `str.format`, `%`);
+  tuples; UTF-8 character indexing; IndexError/KeyError on out-of-range.
+- Arithmetic on unsupported types raises TypeError (it used to give none /
+  1). Reading a missing dict key raises KeyError since round 75 (§0m).
+- VM natives receive keyword arguments as a trailing map marked
+  `class_name "__kwargs__"` (`take_kwargs()`); OS builtins read the same
+  map with `nyos::Args`.
+
+## Round 74: the language engines (see `HANDOFF.md` §0j)
+
+- **Exceptions are objects on both engines**: builtin exceptions are real
+  classes (`ZeroDivisionError` is an `ArithmeticError`); typed `except`
+  catches errors raised in called functions and by the runtime; an
+  unmatched `except` passes the error on after `finally`; `with` passes
+  `(type, value, tb)` to `__exit__` and a true return suppresses.
+- **Errors that used to be silent**: undefined names raise NameError;
+  calling a missing method raises AttributeError; a call that does not fit
+  the parameters raises TypeError (Python's messages).
+- **Classes**: C3 MRO over every base, `super()`, class bodies on the VM
+  (`@property`/setter, `@staticmethod`/`@classmethod`), defaults evaluated at
+  definition, the operator/object protocols (`__eq__` in containers,
+  `__iter__`, `__radd__`, …), `__mro__`/`__bases__`.
+- **VM name resolution is lexical** (it used to search every frame).
+- **Syntax**: match patterns (`|`, guards, sequence/mapping/class/`as`),
+  walrus in `if`/`while`, raw strings, general decorators, starred and
+  nested unpacking, several `for`/`if` clauses in comprehensions, `@`.
+- Divergence battery (286 programs, interpreter / VM / python3 all agree):
+  87 at f284623 → 262 now.
+
+## Round 75: real SDL3 and HiDPI (see `HANDOFF.md` §0n)
+
+- **Real SDL3** builds (`tools/build_sdl3.sh`, `make BUILD=build-sdl
+  NYTHON_SDL_STUB=0`) and passes the whole e2e suite on X11, at 1× and at
+  200%; the test harness gives the real backend the stub's event scripts and
+  display-list capture, plus real-pixel PNGs.
+- **HiDPI, both of SDL3's models**: windows can be sized in layout units
+  (`Window.layout_units`, `gui_create_window` flag 16) - the same workbench on
+  a 200% Windows/X11 panel (twice the points) and a Retina Mac (twice the
+  pixels per point). Draw at the window's display scale (`Window.scale()`,
+  predicted by `gui_display_scale() * gui_display_density()`), not the
+  content scale. `"scale"` events (`Window.on_scale`) report a move to a
+  monitor of another scale; the IDE rebuilds its metrics and fonts.
+- The e2e suite is scale-independent (`R()`/`D()` in `tools/ide_e2e.py`) and
+  passes in full at 2× in both stub models.
+- Legacy flat tensor ops follow NumPy's promotion rule: integer inputs stay
+  integers through `+ - *`, dot, sum, max/min, abs/neg/sign, `relu`.
+
+## Round 75: memory management on both engines (see `HANDOFF.md` §0k, `GC_NOTES.md`)
+
+- **Interpreter**: exact reference counting (`Collectable::gc_rc`, counted by
+  every `Value` copy through `TValue::o`) plus a generational cycle collector
+  (trial deletion, `src/NyGC.cpp`). Strings, functions, bound methods and
+  instances are heap objects (`include/NyHeap.hpp`) that erase their
+  side-table entries when freed; scopes are counted (`CtxReaper` releases).
+- **VM**: `shared_ptr` counts as before, plus a cycle collector over
+  weak_ptr-registered containers (`src/VMGC.cpp`); deep chains are freed
+  iteratively (a 30k-node list used to crash the VM when dropped).
+- `__del__` runs once, at the next statement/instruction boundary, never
+  inside a decrement; cyclic garbage is finalized first (PEP 442).
+- Full collections also run when the heap has doubled since the last one
+  (`mallinfo2`), then `malloc_trim`: memory stays within ~2x what is live.
+- **A pointer kept outside a `Value` must hold a reference** (`nygc::incref`)
+  or be erased when the object dies - a freed address is reused at once, and
+  a stale entry then describes a different object. Collections run only at
+  safe points; counts are touched only with the GIL held.
+- Builtins (both engines): `gc_collect`, `gc_enable`/`gc_disable`/
+  `gc_is_enabled`, `gc_set_threshold`/`gc_get_threshold`, `gc_stats`,
+  `gc_live_objects`, `mem_rss_kb`, `mem_peak_rss_kb`, `weakref`.
+- `make asan` → `build-asan/nython-cli` (ASan + UBSan + LSan).
+
+## Round 75: lazy generators (see `HANDOFF.md` §0l)
+
+- **Interpreter**: a generator function's body runs on a stackful coroutine
+  (`include/NyCoro.hpp`, `src/NyCoro.cpp`: mmap'd 1 MB stacks committed as
+  touched, guard page, pooled; x86-64/AArch64 register switch, ucontext
+  elsewhere, pooled Windows fibers - tested under Wine only) driven by `src/NyGen.cpp`
+  (`include/NyGen.hpp`); the hooks in `NythonExecutor.hpp` are small and
+  marked `nygen`. `NY_GEN_STACK_KB` sets the stack size.
+- **Both engines**: `send`/`throw`/`close` with GeneratorExit and finally at the
+  paused yield; StopIteration.value; `yield from` delegates all four and
+  evaluates to the subgenerator's return value; StopIteration escaping a body
+  is RuntimeError; "generator already executing"; lazy generator expressions;
+  `zip`/`map`/`filter`/`enumerate` over a generator and `iter()` are lazy
+  (over lists they still return lists); new `islice` and `take(n, it)`;
+  `any`/`all`/`next`/`in` stop early; `a, b = gen()` unpacks.
+- **Rules**: a started generator is resumed only by the thread that started
+  it (RuntimeError, both engines); a generator a `for` loop or a consuming
+  builtin made itself is closed when that consumer is done (as CPython's
+  reference counting would); every generator still paused at program end is
+  closed, oldest first. The VM raises RecursionError at 1000 frames (it
+  crashed with SIGSEGV at ~1400).
+
+## Round 75: strict reads, optional chaining, declarations, suffix literals (see `HANDOFF.md` §0m)
+
+- **Missing reads raise, on both engines**: `obj.missing` → AttributeError
+  (instances, classes, none, dicts read with `.`, str/list/int/functions...),
+  `d[missing]` → KeyError, `none[k]`/`5[0]` → TypeError, `none.m()` /
+  `"s".nosuch()` → AttributeError, `none.x = v` → AttributeError. A builtin
+  value's method read as a value is bound (`f = xs.append`), from one table
+  both engines share (`include/NyMembers.hpp`).
+- **Absence on purpose**: `getattr`/`hasattr`/`setattr`/`delattr` for every
+  value, `d.get`/`setdefault`/`in`; `a?.b`, `a?.m(x)`, `a?[k]`, `a?.[k]`,
+  `f?.(x)` (none when the receiver is none/undefined or the member is
+  missing; the rest of the chain is skipped); `a ?? b`; `t ??= v`. The C
+  ternary still parses (`c ? .5 : 1`, `c ? [1] : [2]`: `?[` is optional
+  indexing only when glued to its receiver). AST: `OptChainNode`/`HoleNode`
+  (`ASTNodes.hpp`); VM ops `JUMP_IF_NONE_KEEP`, `JUMP_IF_MISSING_KEEP`,
+  `JUMP_IF_NOT_NONE_OR_POP`, `LOAD_ATTR_OPT`, `LOAD_SUBSCR_OPT`,
+  `CHECK_MEMBER`, `DUP_TOP_TWO`.
+- **`undefined`** is a value distinct from none on both engines (the VM
+  compiled the literal to nothing); the runtime never produces it for
+  absence. `??`/`?.` treat it as absent. `del x` unbinds `x` (NameError
+  after).
+- **Scope ruling**: plain assignment rebinds the nearest binding, `var`/
+  `let`/`const` declare a local, `global x` creates/targets the module
+  variable (`LOAD_GLOBAL_NAME`/`STORE_GLOBAL_NAME` on the VM).
+- **Suffix literals** are ints when whole (`1k`, `2.5k`, `1.1k`), floats
+  when fractional (`1m`), decided on the digits in the lexer.
+- **Migration**: every read the libraries, the IDE and the tests made of a
+  missing attribute/key was found with `NY_LENIENT_READS=log` (both engines,
+  every example and test, the whole IDE e2e) plus two static scans, and fixed
+  idiomatically (`.get`, `?.`, attributes initialised in `__init__`).
+  `tools/ny_attrcheck.py` finds `self.x` reads of attributes set only lazily;
+  `tools/ide_e2e.py` now fails on AttributeError/KeyError/NameError/TypeError
+  or `[lenient-read]` in the IDE log.
+
+## Round 76: the "Not done" lists closed (see `HANDOFF.md` §0o)
+
+- **Static scope checks, both engines** (`src/NyScope.cpp`, run by
+  `Parser::parse`): `const` is enforced (assign/augment/delete/redeclare/
+  unpack/loop over it is a SyntaxError before the program runs);
+  `nonlocal x` needs an enclosing function binding x; a walrus,
+  `except ... as` and `with ... as` of a `global` name bind the module's.
+- **Interpreter**: lambdas close over their scope by reference (self-
+  recursion, Python's late binding; defaults evaluated when made);
+  `print(a(), b())` evaluates every argument first; IndexError reads
+  `list index out of range`.
+- **Error columns**: every syntax error said column 2 (`Location::reset`
+  ignored its column); tokens are located where they start, a column counts
+  characters, and the caret is placed by characters.
+- **Lazy iterators** print as Python's (`<zip object at ...>`), have no
+  `send`/`throw`, and `isinstance(x, "generator")` is true for them; `type()`
+  stays "generator" (Nython's dict is the type "map").
+- **rwlock competitive succession**: a released lock wakes one writer heir
+  or every reader, and is taken only by a running thread (6 writers x 3000:
+  33,922 thread sleeps -> 144). New `rwlock_waiting_writers`.
+- **Async tasks are coroutines** on their loop's thread (`NyCoro`), not OS
+  threads: no thread per task (2000 tasks: 2002 threads -> 1), switches
+  3-12x faster; a task blocking inside a generator relays out through it
+  (`nyconc::relay_requested`/`relay_park`). The interpreter's per-thread
+  state is swapped for threads and tasks (`InterpEngine::State`): a bare
+  `raise` could re-raise another thread's exception.
+- **Memory**: objects used as dict keys are freed (`nygc::KeyTable`, and in
+  `VMGC.cpp`), cycles through keys included; a cycle through a suspended
+  generator is collected, its finally blocks run first (both engines); bound
+  builtin members are heap objects (`nyheap::BMember`); the old
+  `GarbageCollector` and the unused `Evaluator.hpp` are removed;
+  `mem_rss_kb` works on Windows.
+
+## Round 77: bytes, the network stack, the CLI, Python compatibility (see `HANDOFF.md` §0p)
+
+- **bytes/bytearray** (`include/NyBytes.hpp`), Python string escapes,
+  builtin types as namespaces (`str.upper(s)`, `int.from_bytes`).
+- **Signals**: `signal` module, SIGINT -> KeyboardInterrupt (status 130),
+  handlers at safe points and inside blocking waits (PEP 475).
+- **Network**: one non-blocking socket table (`src/builtins/net.cpp`) behind
+  `lib/socket.ny`/`select`/`selectors`; TLS loaded at run time
+  (`src/builtins/tls.cpp`, `lib/ssl.ny`); `lib/http/` (client, server,
+  cookiejar), `lib/urllib/`, `lib/websocket.ny` (RFC 6455), hashlib/hmac/
+  base64/secrets; network.ny, webserver.ny, sockets.ny, clientserver.ny are
+  real. Blocking calls release the GIL; in async tasks they park the task
+  (colorless I/O). `nython -m http.server` serves a directory.
+- **Async**: `async with/for`, async generators, `lib/asyncio.ny`.
+- **Modules**: `import name` runs a `.ny` file in its own scope (classes
+  named `m.Class`), `from m import ...`, packages, NYTHONPATH. **Sets** are
+  a real type; **math** is Python's module on both engines.
+- **CLI** (`src/main.cpp`): `-c/-m/-i/-q/-u/-E/-`, `--vm` for every form,
+  `--check`; the prompt shows reprs and keeps `_`; **SystemExit is real**
+  (`exit()` raises it). `sys.stdin/stdout/stderr`; `print(*xs, file=,
+  flush=)`; `lib/argparse.ny` is Python's algorithm with Python's help
+  layout.
+- **Python compatibility**: each execution of a class statement makes a
+  new class (re-runs are `Name#n`, shown as Name); `[*a]`, `{**d}`,
+  `[x, *y] = s`; annotations; `f"{x=}"`; slice objects reaching
+  `__getitem__`; `eval`/`exec`/`compile`; complex numbers and `2j`;
+  `object`; `__setattr__`/`__delattr__`; docstrings and `help()`;
+  `locals/globals/vars/dir`; `**kwargs` in call order; `lib/collections.ny`
+  (deque, Counter, defaultdict, OrderedDict, namedtuple, ChainMap).
+- **Program input in the IDE**: `os_spawn(cmd, stdin=true)` +
+  `os_proc_write`/`os_proc_close_stdin`; with `NY_INPUT_REQUEST` set a
+  program announces each stdin read (`nyconc::INPUT_REQUEST_MARK` on
+  stdout). Run shows the pending prompt with an input line in the Output
+  panel (focus `"stdin"`), the Terminal forwards lines to a running
+  command, Ctrl+D ends input.
+- **Gotchas**: `C.__dict__` is a copy (an instance's is live since
+  vm_audit85); coroutine
+  objects are task handles (ints); a prelude name (`slice`, `object`,
+  `complex`, `help`) shadows the old placeholder builtin of that name.
+- **Classes** (vm_audit79): annotations are kept (`__annotations__`);
+  `__new__`, `__init_subclass__` with class keywords, `__set_name__`,
+  `__class_getitem__`, `__mro_entries__`, `list[int]`/`X | Y`;
+  **metaclasses** (`type.__new__` adopts the class the statement built;
+  M's dunders, methods and properties reach the class; `type(n, b, ns)`);
+  `NotImplemented` and the reflected-operator protocol; full
+  `__mro__`/`__bases__`, `__subclasses__()`. A module function stored as a
+  class attribute is bound as a method (wrap it in `staticmethod`, as
+  CPython's own code does).
+- **`type(x)` gives type objects** (vm_audit80): `type(5) is int`,
+  `type(obj) is its class`, `(5).__class__`; a type object `==` its name,
+  Python's or the legacy one (`type(x) == "list"`, `"string"`, `"map"`), so
+  old code keeps working - but `str(type(x))` is `"<class 'int'>"`. Use
+  `typeof(x)` for Nython's name as a string. `int is int` is identity.
+- **Classes and objects** (vm_audit86): each class statement its own class
+  (`Name#n` for a second one); property/staticmethod/classmethod are objects
+  (`C.__dict__["p"].fget`); type objects for None, functions, methods,
+  builtins, generators and iterators (`type(f) is types.FunctionType`, still
+  `== "function"`); a plain dict's methods (`get`, `keys`, `pop`...) win over
+  its keys, other names still read keys.
+- **Values and errors** (vm_audit87): `1 in 5` and `1 < "a"` raise
+  TypeError; exceptions print and carry fields as CPython (`e.errno`,
+  `e.filename` on native OSErrors; no legacy `e.msg` any more - use
+  `str(e)` or `e.args`); `os.stat()` is an `os.stat_result`; `exec(src, ns)`
+  runs with `ns` as live globals.
+- **Class-machinery modules** (vm_audit74, 81-83): abc, numbers,
+  collections.abc (collections is a package now), enum, dataclasses,
+  typing (+ `check_type`), types, inspect (+ `signature_diff`), keyword,
+  weakref, warnings (+ `deprecated`, `-W`), traceback, linecache, atexit.
+  Engines: `f.__code__`/`__defaults__`/`__qualname__`, real tracebacks
+  (`e.__traceback__`, `__context__`/`__cause__`, `sys.exc_info()`, Python's
+  "Traceback (most recent call last):" before the `[Nython]`/`[VMError]`
+  line), weakref callbacks, data descriptors, `__index__`, `__hash__ =
+  None`, metaclass `__setattr__`, dunder names in `__dict__`, module scopes
+  from a builtins snapshot.
+- **Builtin subclasses, `__getattribute__`, `__dict__`, `__prepare__`**
+  (vm_audit85): `class MyInt(int)` ... instances hold their value in the
+  hidden field `__ny_payload__`; the prelude's mirror class of the type
+  (`_NyB_int` ..., loaded on first need, `nyrt::builtin_mirror`) stands where
+  the type is in the MRO; builtins are given the value except
+  `nyrt::payload_transparent`'s. `__getattribute__` is dispatched once a
+  class defines one; `obj.__dict__`/`vars(obj)` is a live
+  `_NyInstanceDict`; `__prepare__`'s mapping gets each binding of the body
+  through `__setitem__` (`Context::storeHook` / `CallFrame::prep_ns`).
+  enum's `_EnumDict`, NamedTuple and namedtuple as real tuples use them.
+- **Standard library** (vm_audit73, 75-78): json, random, datetime, time,
+  io, string, textwrap, pprint, csv, statistics, fractions, struct,
+  calendar, uuid, fnmatch, glob, shutil, tempfile, pathlib, subprocess,
+  platform, getpass, logging, unittest, queue, itertools, functools,
+  operator, heapq, bisect, copy, contextlib, re (a native engine with
+  selective memoization - no catastrophic backtracking).
+- **Python's syntax** (vm_audit84): Nython's extra keywords are soft - a
+  keyword only where its construct starts (`new A()`, `var x`, `unless c:`),
+  a name elsewhere (`new = old + 1`, `def f(ref):`, `print = log`); only
+  elseif/super and the literals stay reserved (`keyword.nyhardkwlist`).
+  A statement starting with `{` is a block only when it is not an
+  expression; `x = 1, 2` and `return a, b` are tuples; unpacking checks
+  counts; every augmented operator tries its in-place dunder; comparisons
+  chain at one level; `except*` and ExceptionGroup (prelude); `\N{name}`
+  escapes and `lib/unicodedata.ny` (`src/NyUniNames.cpp`).
 
 ## Transcripts
 

@@ -402,6 +402,20 @@ namespace ny_fs {
         if (!cur.empty()) { struct stat st{}; if (stat(cur.c_str(),&st)!=0) NY_MKDIR(cur.c_str(),0755); }
         return exists(path);
     }
+    // Whether a directory can be a namespace package (round 77): it holds a
+    // .ny file, or a folder that does. Without this, any directory on the
+    // module path (Linux's /sys for `import sys`) became an empty package.
+    inline bool holds_modules(const std::string& dir, int depth = 1) {
+        for (auto& n : listdir(dir)) {
+            if (n.size() > 3 && n.compare(n.size() - 3, 3, ".ny") == 0) return true;
+            if (depth > 0 && n[0] != '.') {
+                struct stat st{};
+                std::string sub = dir + "/" + n;
+                if (stat(sub.c_str(), &st) == 0 && S_ISDIR(st.st_mode) && holds_modules(sub, depth - 1)) return true;
+            }
+        }
+        return false;
+    }
     // Cross-platform path join
     inline std::string join(const std::string& a, const std::string& b) {
         if (a.empty()) return b;

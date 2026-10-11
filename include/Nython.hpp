@@ -61,7 +61,7 @@
 
 // ─── Version ────────────────────────────────────────────────────────────────
 #ifndef NYTHON_VERSION
-  #define NYTHON_VERSION "0.2.0"
+  #define NYTHON_VERSION "0.2.1"   // one value: Definitions.hpp has the same (they disagreed: 0.2.0 and 0.3.0)
 #endif
 
 // ─── Exit Codes ─────────────────────────────────────────────────────────────

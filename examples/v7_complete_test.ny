@@ -77,7 +77,7 @@ cx //= 5
 t("fdiv_eq", cx, 5)
 
 print "=== BUILTINS ==="
-t("divmod", str(divmod(17, 5)), "[3, 2]")
+t("divmod", str(divmod(17, 5)), "(3, 2)")
 t("round2", round(3.14159, 2), 3.14)
 t("all_t", all([1, 2, 3]), true)
 t("any_t", any([0, 0, 1]), true)

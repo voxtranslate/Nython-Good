@@ -15,7 +15,7 @@ class Managed:
     def __enter__(self):
         self.state = "open"
         return self
-    def __exit__(self):
+    def __exit__(self, exc_type=none, exc_value=none, tb=none):
         self.state = "closed"
 var m = Managed("res")
 with m as r:
@@ -73,12 +73,12 @@ t("isalpha", isalpha_str("abc"), true)
 t("isalpha_f", isalpha_str("123"), false)
 
 print "=== EVERYTHING OBJECT ==="
-t("type_int", type(42), "int")
-t("type_str", type("hi"), "string")
-t("type_list", type([1]), "list")
-t("type_bool", type(true), "bool")
-t("type_none", type(none), "none")
-t("type_float", type(3.14), "float")
+t("type_int", type(42) == "int", true)
+t("type_str", type("hi") == "string", true)
+t("type_list", type([1]) == "list", true)
+t("type_bool", type(true) == "bool", true)
+t("type_none", type(none) == "none", true)
+t("type_float", type(3.14) == "float", true)
 t("str_int", str(42), "42")
 t("str_bool", str(true), "true")
 t("bool_0", bool(0), false)
@@ -96,7 +96,7 @@ function fdiv(a, b) { return a / b }
 def fsub(a, b): return a - b
 t("fn", fadd(3, 4), 7)
 t("func", fmul(3, 4), 12)
-t("function", fdiv(10, 2), 5)
+t("function", fdiv(10, 2), 5.0)
 t("def", fsub(10, 3), 7)
 
 print ""

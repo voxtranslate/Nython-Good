@@ -12,6 +12,8 @@
 #   DataNormalizer, DataAugmentor, Preprocessor, DataSplitter
 # ============================================================
 
+import "lib/nytorch/core.ny"
+
 import nytorch
 
 # -----------------------------------------
@@ -106,9 +108,11 @@ class ImageAugmentor:
             return flipped
         return img
 
-    def add_noise(self, img):
+    def add_noise(self, img, std=none):
         var noise = tensor_randn([img.size()])
         var std_v = self.noise_std
+        if std != none:
+            std_v = std
         var scaled = tensor_scale(noise, std_v)
         var noisy_data = tensor_add(img.data, scaled)
         var result = ImageTensor(img.H, img.W, img.C)
@@ -274,7 +278,7 @@ class Vocabulary:
         self.add_token("<EOS>")
 
     def add_token(self, token):
-        if self.word2id[token] == none:
+        if self.word2id.get(token) == none:
             self.word2id[token] = self.size
             self.id2word = self.id2word + [token]
             self.counts[token] = 0
@@ -286,7 +290,7 @@ class Vocabulary:
         var n = len(tokens)
         while i < n:
             var t = tokens[i]
-            var existing_count = self.counts[t]
+            var existing_count = self.counts.get(t)
             if existing_count == none:
                 self.add_token(t)
                 self.counts[t] = 1
@@ -296,7 +300,7 @@ class Vocabulary:
         return self
 
     def encode(self, token):
-        var id_val = self.word2id[token]
+        var id_val = self.word2id.get(token)
         if id_val == none:
             return 1
         return id_val
@@ -321,18 +325,30 @@ class Vocabulary:
         var ids = self.encode_sequence(tokens)
         return tensor(ids)
 
+    # the k most frequent words as [count, word], most frequent first
+    # (ties in word order)
     def top_k_frequent(self, k):
         var pairs = []
         var i = 0
         var n = len(self.id2word)
         while i < n:
             var w = self.id2word[i]
-            var c = self.counts[w]
+            var c = self.counts.get(w)
             if c == none:
-                var c = 0
-            var pairs = pairs + [[c, w]]
-            var i = i + 1
-        return pairs
+                c = 0
+            pairs.append([c, w])
+            i = i + 1
+        var out = []
+        while len(out) < k and len(pairs) > 0:
+            var best = 0
+            var j = 1
+            while j < len(pairs):
+                if pairs[j][0] > pairs[best][0]:
+                    best = j
+                j = j + 1
+            out.append(pairs[best])
+            pairs = pairs[:best] + pairs[best + 1:]
+        return out
 
 # -----------------------------------------
 # 167. Tokenizer
@@ -493,9 +509,9 @@ class TFIDFVectorizer:
         var n = len(tokens)
         while i < n:
             var t = tokens[i]
-            if seen[t] == none:
+            if seen.get(t) == none:
                 seen[t] = true
-                if self.df_store[t] == none:
+                if self.df_store.get(t) == none:
                     self.df_store[t] = 1
                 else:
                     self.df_store[t] = self.df_store[t] + 1
@@ -515,7 +531,7 @@ class TFIDFVectorizer:
         return to_float(count) / to_float(n)
 
     def idf(self, term):
-        var df_val = self.df_store[term]
+        var df_val = self.df_store.get(term)
         if df_val == none:
             var df_val = 0
         var total = self.doc_count

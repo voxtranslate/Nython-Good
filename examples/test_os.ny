@@ -42,8 +42,9 @@ assert_true("is_file nope", not p.is_file("/tmp"))
 # ─── FileSystem ──────────────────────────────────────────────────────────────
 section("FileSystem")
 var fs = FileSystem()
-var test_path = "/tmp/nython_os_test.txt"
-var test_dir = "/tmp/nython_test_dir"
+# Names of this run's own (the sweep runs this file on both engines at once).
+var test_path = "/tmp/nython_os_test_" + str(os_getpid()) + ".txt"
+var test_dir = "/tmp/nython_test_dir_" + str(os_getpid())
 
 assert_true("write", fs.write(test_path, "Hello Nython!"))
 assert_eq("read", fs.read(test_path), "Hello Nython!")
@@ -70,6 +71,8 @@ assert_true("deleted", not fs.exists(file2))
 
 fs.delete(test_path)
 assert_true("deleted main", not fs.exists(test_path))
+os_rmtree(test_dir)
+assert_true("dir removed", not fs.exists(test_dir))
 
 # ─── Env ─────────────────────────────────────────────────────────────────────
 section("Env")

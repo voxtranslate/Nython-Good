@@ -27,15 +27,30 @@ check("tensor_sum",  tensor_sum(a),     6.0)
 check("tensor_mean", tensor_mean(a),    2.0)
 check("tensor_max",  tensor_max(a),     3.0)
 
-print "=== degrades instead of crashing ==="
-# The point of these is that they RETURN. Before the guard they took down the
-# process, so any result at all is the pass condition.
-var r1 = tensor_add(a, none)
-print "  ok   tensor_add(a, none) returned"
-var r2 = tensor_dot(none, none)
-print "  ok   tensor_dot(none, none) returned"
-var r3 = tensor_sum(none)
-print "  ok   tensor_sum(none) returned"
+print "=== bad arguments raise instead of crashing ==="
+# Before the guard these took down the process. Since the shared tensor
+# kernels (round 74) a missing operand is a catchable TypeError on both
+# engines, instead of a crash or a made-up result.
+var raised = 0
+try:
+    tensor_add(a, none)
+except e:
+    raised = raised + 1
+try:
+    tensor_dot(none, none)
+except e:
+    raised = raised + 1
+try:
+    tensor_sum(none)
+except e:
+    raised = raised + 1
+check("tensor_add(a, none) / tensor_dot(none, none) / tensor_sum(none) raise", raised, 3)
+var typed = ""
+try:
+    tensor_add(a, none)
+except TypeError as e:
+    typed = "TypeError"
+check("the error is a TypeError", typed, "TypeError")
 
 print ""
 if failures == 0:

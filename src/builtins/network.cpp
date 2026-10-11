@@ -40,6 +40,7 @@
 
 // Full executor definition (needed for E.getStringValue etc.)
 #include "NythonExecutor.hpp"
+#include "builtins/os.hpp"
 
 // Portable setsockopt: Windows takes (const char*), POSIX takes (const void*)
 #ifdef _WIN32
@@ -63,6 +64,270 @@ using namespace nython::kernel;
 using namespace nython::parser;
 using namespace nython::reader;
 using namespace nython::exception;
+
+// ════════════════════════════════════════════════════════════════════════════════
+// One HTTP/1.1 exchange for http_get / http_post / http_request /
+// http_get_json / http_post_json (round 77). They used to open an IPv4
+// socket with gethostbyname, send, and read to the close: no https, no
+// timeout, the GIL held for the whole wait, chunked bodies returned with
+// their chunk sizes, redirects not followed. Now: the socket layer
+// (builtins/net.cpp: every address getaddrinfo gives, a timeout, waits that
+// release the GIL and park an async task), TLS through builtins/tls.cpp with
+// the system's trust store and host name checks, chunked and Content-Length
+// bodies, and up to 10 redirects.
+// ════════════════════════════════════════════════════════════════════════════════
+namespace {
+struct HttpOut {
+    int status = 0;
+    std::string reason, head, body, url, error;
+    std::vector<std::pair<std::string, std::string>> headers;
+};
+
+std::string lower_ascii(std::string s) { for (auto& c : s) c = (char)std::tolower((unsigned char)c); return s; }
+
+bool split_url(const std::string& url, std::string& scheme, std::string& host, int& port, std::string& target) {
+    size_t p = url.find("://");
+    std::string rest = url;
+    scheme = "http";
+    if (p != std::string::npos) { scheme = lower_ascii(url.substr(0, p)); rest = url.substr(p + 3); }
+    if (scheme != "http" && scheme != "https") return false;
+    size_t slash = rest.find_first_of("/?#");
+    std::string auth = slash == std::string::npos ? rest : rest.substr(0, slash);
+    target = slash == std::string::npos ? "/" : rest.substr(slash);
+    size_t hash = target.find('#');
+    if (hash != std::string::npos) target = target.substr(0, hash);
+    if (target.empty() || target[0] != '/') target = "/" + target;
+    size_t at = auth.rfind('@');
+    if (at != std::string::npos) auth = auth.substr(at + 1);
+    port = scheme == "https" ? 443 : 80;
+    if (!auth.empty() && auth[0] == '[') {
+        size_t e = auth.find(']');
+        if (e == std::string::npos) return false;
+        host = auth.substr(1, e - 1);
+        if (e + 1 < auth.size() && auth[e + 1] == ':') port = std::atoi(auth.c_str() + e + 2);
+    } else {
+        size_t c = auth.rfind(':');
+        if (c != std::string::npos) { host = auth.substr(0, c); port = std::atoi(auth.c_str() + c + 1); }
+        else host = auth;
+    }
+    return !host.empty() && port > 0 && port < 65536;
+}
+
+std::string join_url(const std::string& base, const std::string& loc) {
+    if (loc.find("://") != std::string::npos) return loc;
+    size_t p = base.find("://");
+    size_t path_at = base.find('/', p == std::string::npos ? 0 : p + 3);
+    std::string origin = path_at == std::string::npos ? base : base.substr(0, path_at);
+    if (loc.compare(0, 2, "//") == 0) return base.substr(0, p + 1) + loc;
+    if (!loc.empty() && loc[0] == '/') return origin + loc;
+    if (path_at == std::string::npos) return origin + "/" + loc;
+    std::string path = base.substr(path_at);
+    size_t q = path.find('?');
+    if (q != std::string::npos) path = path.substr(0, q);
+    return origin + path.substr(0, path.rfind('/') + 1) + loc;
+}
+
+HttpOut http_once(NythonExecutor& E, Context* ctx, const std::string& method, const std::string& url,
+                  const std::vector<std::pair<std::string, std::string>>& extra, const std::string& body, double timeout) {
+    HttpOut out;
+    out.url = url;
+    std::string scheme, host, target;
+    int port = 0;
+    if (!split_url(url, scheme, host, port, target)) { out.error = "unsupported URL: " + url; return out; }
+    auto call = [&](const char* n, std::vector<Value> a) { return E.callBuiltin(n, a, ctx); };
+    Value h = NONE_VALUE;
+    std::string last_err = "no address";
+    try {
+        Value infos = call("_net_getaddrinfo", {E.makeStringValue(host), Value((int64_t)port), Value((int64_t)0), Value((int64_t)SOCK_STREAM)});
+        for (auto& ai : E.listItems(infos)) {
+            auto f = E.listItems(ai);
+            if (f.size() < 5) continue;
+            Value cand = NONE_VALUE;
+            try {
+                cand = call("_net_socket", {f[0], f[1], f[2]});
+                call("_net_settimeout", {cand, Value(timeout)});
+                call("_net_connect", {cand, f[4]});
+                h = cand;
+                break;
+            } catch (std::string& e) {
+                if (e.find("KeyboardInterrupt") != std::string::npos) throw;
+                last_err = e;
+                if (cand.type != ValueType::NONE) { try { call("_net_close", {cand}); } catch (...) {} }
+            }
+        }
+    } catch (std::string& e) {
+        if (e.find("KeyboardInterrupt") != std::string::npos) throw;
+        last_err = e;
+    }
+    if (h.type == ValueType::NONE) { out.error = last_err; return out; }
+    struct Closer {
+        NythonExecutor& E; Context* ctx; Value h;
+        ~Closer() { try { std::vector<Value> a{h}; E.callBuiltin("_net_close", a, ctx); } catch (...) {} }
+    } closer{E, ctx, h};
+    try {
+        if (scheme == "https") {
+            static int64_t tls_ctx = 0;
+            if (!tls_ctx) {
+                Value c = call("_tls_ctx_new", {Value(false)});
+                call("_tls_ctx_default_paths", {c});
+                tls_ctx = bigint_to_i64(c.value.i);
+            }
+            call("_tls_wrap", {h, Value(tls_ctx), Value(false), E.makeStringValue(host), Value(true), Value(true)});
+        }
+        std::string hosthdr = host.find(':') != std::string::npos ? "[" + host + "]" : host;
+        if (port != (scheme == "https" ? 443 : 80)) hosthdr += ":" + std::to_string(port);
+        std::string req = method + " " + target + " HTTP/1.1\r\nHost: " + hosthdr + "\r\n";
+        bool has_ua = false, has_ct = false, has_accept = false;
+        for (auto& kv : extra) {
+            std::string k = lower_ascii(kv.first);
+            has_ua |= k == "user-agent"; has_ct |= k == "content-type"; has_accept |= k == "accept";
+        }
+        if (!has_ua) req += "User-Agent: Nython/0.2.1\r\n";
+        if (!has_accept) req += "Accept: */*\r\n";
+        req += "Accept-Encoding: identity\r\nConnection: close\r\n";
+        if (!body.empty() || method == "POST" || method == "PUT" || method == "PATCH") {
+            req += "Content-Length: " + std::to_string(body.size()) + "\r\n";
+            if (!has_ct && !body.empty()) req += "Content-Type: application/x-www-form-urlencoded\r\n";
+        }
+        for (auto& kv : extra) req += kv.first + ": " + kv.second + "\r\n";
+        req += "\r\n";
+        req += body;
+        call("_net_sendall", {h, E.makeBytesValue(req)});
+        std::string resp;
+        while (true) {
+            Value chunk = call("_net_recv", {h, Value((int64_t)65536)});
+            auto* bo = E.bytesOf(chunk);
+            if (!bo || bo->s.empty()) break;
+            resp += bo->s;
+        }
+        size_t he = resp.find("\r\n\r\n");
+        if (he == std::string::npos) { out.error = "malformed response"; out.body = resp; return out; }
+        out.head = resp.substr(0, he);
+        std::string raw = resp.substr(he + 4);
+        size_t eol = out.head.find("\r\n");
+        std::string status_line = out.head.substr(0, eol);
+        size_t sp1 = status_line.find(' ');
+        if (sp1 != std::string::npos) {
+            out.status = std::atoi(status_line.c_str() + sp1 + 1);
+            size_t sp2 = status_line.find(' ', sp1 + 1);
+            if (sp2 != std::string::npos) out.reason = status_line.substr(sp2 + 1);
+        }
+        bool chunked = false;
+        long long clen = -1;
+        size_t pos = eol == std::string::npos ? out.head.size() : eol + 2;
+        while (pos < out.head.size()) {
+            size_t e = out.head.find("\r\n", pos);
+            if (e == std::string::npos) e = out.head.size();
+            std::string line = out.head.substr(pos, e - pos);
+            size_t c = line.find(':');
+            if (c != std::string::npos) {
+                std::string k = line.substr(0, c), v = line.substr(c + 1);
+                while (!v.empty() && (v[0] == ' ' || v[0] == '\t')) v.erase(0, 1);
+                out.headers.push_back({k, v});
+                std::string kl = lower_ascii(k);
+                if (kl == "transfer-encoding" && lower_ascii(v).find("chunked") != std::string::npos) chunked = true;
+                if (kl == "content-length") clen = std::atoll(v.c_str());
+            }
+            pos = e + 2;
+        }
+        if (chunked) {
+            size_t i = 0;
+            while (i < raw.size()) {
+                size_t le = raw.find("\r\n", i);
+                if (le == std::string::npos) break;
+                long long n = std::strtoll(raw.substr(i, le - i).c_str(), nullptr, 16);
+                if (n <= 0) break;
+                out.body.append(raw, le + 2, (size_t)n);
+                i = le + 2 + (size_t)n + 2;
+            }
+        } else if (clen >= 0 && (size_t)clen < raw.size()) {
+            out.body = raw.substr(0, (size_t)clen);
+        } else {
+            out.body = raw;
+        }
+        if (method == "HEAD" || out.status == 204 || out.status == 304) out.body.clear();
+    } catch (std::string& e) {
+        if (e.find("KeyboardInterrupt") != std::string::npos) throw;
+        out.error = e;
+        out.status = 0;
+    }
+    return out;
+}
+
+HttpOut http_fetch(NythonExecutor& E, Context* ctx, std::string method, std::string url,
+                   const std::vector<std::pair<std::string, std::string>>& extra, std::string body, double timeout) {
+    HttpOut r;
+    for (int hop = 0; hop <= 10; hop++) {
+        r = http_once(E, ctx, method, url, extra, body, timeout);
+        if (!r.error.empty()) return r;
+        if (r.status != 301 && r.status != 302 && r.status != 303 && r.status != 307 && r.status != 308) return r;
+        std::string loc;
+        for (auto& kv : r.headers) if (lower_ascii(kv.first) == "location") loc = kv.second;
+        if (loc.empty()) return r;
+        url = join_url(url, loc);
+        if (r.status == 303 || ((r.status == 301 || r.status == 302) && method == "POST")) {
+            if (method != "HEAD") method = "GET";
+            body.clear();
+        }
+    }
+    return r;
+}
+
+// Headers given as "K: v\r\n..." text (the legacy form) or a map.
+std::vector<std::pair<std::string, std::string>> header_args(NythonExecutor& E, const Value& v) {
+    std::vector<std::pair<std::string, std::string>> out;
+    if (v.type == ValueType::NONE || v.type == ValueType::UNDEFINED) return out;
+    if (E.isStringValue(v)) {
+        std::string t = E.getStringValue(v);
+        size_t pos = 0;
+        while (pos < t.size()) {
+            size_t e = t.find('\n', pos);
+            if (e == std::string::npos) e = t.size();
+            std::string line = t.substr(pos, e - pos);
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            size_t c = line.find(':');
+            if (c != std::string::npos) {
+                std::string val = line.substr(c + 1);
+                while (!val.empty() && val[0] == ' ') val.erase(0, 1);
+                out.push_back({line.substr(0, c), val});
+            }
+            pos = e + 1;
+        }
+        return out;
+    }
+    for (auto& kv : nyos::map_items(v))
+        out.push_back({kv.first, E.isStringValue(kv.second) ? E.getStringValue(kv.second) : E.reprOf(kv.second)});
+    return out;
+}
+
+std::string body_arg(NythonExecutor& E, const Value& v) {
+    if (v.type == ValueType::NONE || v.type == ValueType::UNDEFINED) return std::string();
+    if (auto* bo = E.bytesOf(v)) return bo->s;
+    return E.getStringValue(v);
+}
+
+Value http_result_map(NythonExecutor& E, Runnable* runner, const HttpOut& r) {
+    Object* m = new Object(runner, "map", Type::MAP);
+    m->set("status", Value((int64_t)r.status));
+    m->set("reason", E.makeStringValue(r.reason));
+    m->set("headers", E.makeStringValue(r.head));
+    Object* hm = new Object(runner, "map", Type::MAP);
+    std::vector<std::pair<std::string, std::string>> joined;      // repeated fields joined with ", "
+    for (auto& kv : r.headers) {
+        std::string k = lower_ascii(kv.first);
+        bool found = false;
+        for (auto& j : joined) if (j.first == k) { j.second += ", " + kv.second; found = true; }
+        if (!found) joined.push_back({k, kv.second});
+    }
+    for (auto& j : joined) hm->set(j.first, E.makeStringValue(j.second));
+    m->set("header_map", Value((Collectable*)hm));
+    m->set("body", E.makeStringValue(r.body));
+    m->set("content", E.makeBytesValue(r.body));
+    m->set("url", E.makeStringValue(r.url));
+    m->set("error", r.error.empty() ? NONE_VALUE : E.makeStringValue(r.error));
+    return Value((Collectable*)m);
+}
+} // namespace
 
 // ════════════════════════════════════════════════════════════════════════════════
 // dispatch_network
@@ -200,10 +465,10 @@ Value dispatch_network(NythonExecutor& E,
                 if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) { ny_close_socket(sock); return NONE_VALUE; }
                 struct timeval tv{0, (suseconds_t)(timeout_ms * 1000)};
                 NY_SETSOCKOPT(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-                char buf[65536];
-                ssize_t n = recv(sock, buf, sizeof(buf)-1, 0);
+                std::vector<char> buf(65536);   // heap: see dispatch_io's (io.cpp)
+                ssize_t n = recv(sock, buf.data(), (int)buf.size() - 1, 0);
                 ny_close_socket(sock);
-                if (n > 0) { buf[n] = '\0'; return makeStringValue(std::string(buf, (size_t)n)); }
+                if (n > 0) return makeStringValue(std::string(buf.data(), (size_t)n));
             }
 #endif
             return NONE_VALUE;
@@ -247,9 +512,10 @@ Value dispatch_network(NythonExecutor& E,
                 if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) { ny_close_socket(sock); return NONE_VALUE; }
                 struct timeval tv{0, (suseconds_t)(timeout_ms * 1000)};
                 NY_SETSOCKOPT(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-                char buf[65536];
+                std::vector<char> buf_v(65536);   // heap: see dispatch_io's (io.cpp)
+                char* buf = buf_v.data();
                 struct sockaddr_in sender{}; socklen_t slen = sizeof(sender);
-                ssize_t n = recvfrom(sock, buf, sizeof(buf)-1, 0, (struct sockaddr*)&sender, &slen);
+                ssize_t n = recvfrom(sock, buf, (int)buf_v.size() - 1, 0, (struct sockaddr*)&sender, &slen);
                 ny_close_socket(sock);
                 if (n > 0) {
                     buf[n] = '\0';
@@ -660,87 +926,19 @@ Value dispatch_network(NythonExecutor& E,
             return Value(0);
         }
         if (name == "http_request") {
-            // Full HTTP request: http_request(method, url, headers={}, body="")
-            // Returns: {status: int, headers: str, body: str}
-            if (args.size() >= 2) {
-                std::string method = getStringValue(args[0]);
-                std::string url = getStringValue(args[1]);
-                std::string extra_headers = (args.size() >= 3) ? getStringValue(args[2]) : "";
-                std::string body = (args.size() >= 4) ? getStringValue(args[3]) : "";
-                
-                // Parse URL
-                std::string host, path = "/";
-                int port = 80;
-                std::string u = url;
-                if (u.substr(0, 7) == "http://") u = u.substr(7);
-                else if (u.substr(0, 8) == "https://") { u = u.substr(8); port = 443; }
-                size_t slash = u.find('/');
-                if (slash != std::string::npos) { host = u.substr(0, slash); path = u.substr(slash); }
-                else host = u;
-                size_t colon = host.find(':');
-                if (colon != std::string::npos) {
-                    port = std::stoi(host.substr(colon + 1));
-                    host = host.substr(0, colon);
-                }
-                
-                int sockfd = ::socket(AF_INET, SOCK_STREAM, 0);
-                if (sockfd < 0) return NONE_VALUE;
-                struct sockaddr_in addr;
-                addr.sin_family = AF_INET;
-                addr.sin_port = htons(static_cast<uint16_t>(port));
-                struct hostent* he = ::gethostbyname(host.c_str());
-                if (!he) { ny_close_socket(sockfd); return NONE_VALUE; }
-                memcpy(&addr.sin_addr, he->h_addr_list[0], static_cast<size_t>(he->h_length));
-                if (connect(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-                    ny_close_socket(sockfd); return NONE_VALUE;
-                }
-                
-                std::string request = method + " " + path + " HTTP/1.1\r\n";
-                request += "Host: " + host + "\r\n";
-                request += "Connection: close\r\n";
-                if (!body.empty()) {
-                    request += "Content-Length: " + std::to_string(body.size()) + "\r\n";
-                }
-                request += extra_headers;
-                request += "\r\n";
-                request += body;
-                
-                send(sockfd, request.c_str(), request.size(), 0);
-                
-                std::string response;
-                char buffer[4096];
-                ssize_t n;
-                while ((n = recv(sockfd, buffer, sizeof(buffer), 0)) > 0) {
-                    response.append(buffer, static_cast<size_t>(n));
-                }
-                ny_close_socket(sockfd);
-                
-                // Parse response
-                Object* result = new Object((Runnable*)runner, "map", Type::MAP);
-                size_t header_end = response.find("\r\n\r\n");
-                if (header_end != std::string::npos) {
-                    std::string headers = response.substr(0, header_end);
-                    std::string resp_body = response.substr(header_end + 4);
-                    // Parse status code
-                    int status = 0;
-                    size_t sp1 = headers.find(' ');
-                    if (sp1 != std::string::npos) {
-                        size_t sp2 = headers.find(' ', sp1 + 1);
-                        if (sp2 != std::string::npos) {
-                            try { status = std::stoi(headers.substr(sp1 + 1, sp2 - sp1 - 1)); } catch(...) {}
-                        }
-                    }
-                    result->set("status", Value(status));
-                    result->set("headers", makeStringValue(headers));
-                    result->set("body", makeStringValue(resp_body));
-                } else {
-                    result->set("status", Value(0));
-                    result->set("headers", makeStringValue(""));
-                    result->set("body", makeStringValue(response));
-                }
-                return Value((Collectable*)result);
-            }
-            return NONE_VALUE;
+            // http_request(method, url, headers="" | {..}, body="", timeout=30)
+            //   -> {status, reason, headers (text), header_map, body, content,
+            //       url (after redirects), error}; none when it cannot connect.
+            if (args.size() < 2) return NONE_VALUE;
+            std::string method = getStringValue(args[0]);
+            for (auto& c : method) c = (char)std::toupper((unsigned char)c);
+            Value hv = args.size() > 2 ? args[2] : NONE_VALUE;
+            Value bv = args.size() > 3 ? args[3] : NONE_VALUE;
+            double timeout = 30.0;
+            if (args.size() > 4) { Value t = args[4]; if (t.type == ValueType::DOUBLE) timeout = (double)t.value.d; else if (t.type == ValueType::INTEGER) timeout = (double)bigint_to_i64(t.value.i); }
+            HttpOut r = http_fetch(E, ctx, method, getStringValue(args[1]), header_args(E, hv), body_arg(E, bv), timeout);
+            if (!r.error.empty() && r.head.empty()) return NONE_VALUE;
+            return http_result_map(E, runner, r);
         }
         if (name == "socket_create") {
             int sockfd = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -794,7 +992,17 @@ Value dispatch_network(NythonExecutor& E,
                 addr.sin_addr.s_addr = INADDR_ANY;
                 addr.sin_port = htons(static_cast<uint16_t>(port));
                 int opt = 1;
+#ifdef _WIN32
+                // Windows' SO_REUSEADDR lets a second socket bind a port that
+                // is in use - both then get connections - where POSIX's only
+                // allows rebinding past TIME_WAIT. Windows' default already
+                // allows the latter, so it is left alone there, as Python's
+                // socket.create_server does: a second listener gets a bind
+                // error, as on Linux (a program can still ask for "reuseaddr").
+                (void)opt;
+#else
                 NY_SETSOCKOPT(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#endif
                 return Value(bind(sockfd, (struct sockaddr*)&addr, sizeof(addr)) == 0);
             }
             return Value(false);
@@ -818,48 +1026,23 @@ Value dispatch_network(NythonExecutor& E,
             return Value(-1);
         }
         if (name == "http_get" || name == "http_post") {
-            // Simple HTTP using raw sockets
-            if (args.size() >= 1) {
-                std::string url = getStringValue(args[0]);
-                std::string body = (args.size() >= 2) ? getStringValue(args[1]) : "";
-                // Parse URL: http://host:port/path
-                std::string host, path = "/";
-                int port = 80;
-                std::string u = url;
-                if (u.substr(0, 7) == "http://") u = u.substr(7);
-                auto slash_pos = u.find('/');
-                if (slash_pos != std::string::npos) { path = u.substr(slash_pos); u = u.substr(0, slash_pos); }
-                auto colon_pos = u.find(':');
-                if (colon_pos != std::string::npos) { host = u.substr(0, colon_pos); port = std::stoi(u.substr(colon_pos + 1)); }
-                else host = u;
-                // Connect
-                int sockfd = ::socket(AF_INET, SOCK_STREAM, 0);
-                if (sockfd < 0) return makeStringValue("");
-                struct hostent* he = gethostbyname(host.c_str());
-                if (!he) { ny_close_socket(sockfd); return makeStringValue(""); }
-                struct sockaddr_in addr;
-                addr.sin_family = AF_INET;
-                addr.sin_port = htons(static_cast<uint16_t>(port));
-                memcpy(&addr.sin_addr, he->h_addr_list[0], he->h_length);
-                if (connect(sockfd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { ny_close_socket(sockfd); return makeStringValue(""); }
-                // Build request
-                std::string method = (name == "http_post") ? "POST" : "GET";
-                std::string req = method + " " + path + " HTTP/1.1\r\nHost: " + host + "\r\nConnection: close\r\n";
-                if (!body.empty()) req += "Content-Length: " + std::to_string(body.size()) + "\r\nContent-Type: application/x-www-form-urlencoded\r\n";
-                req += "\r\n" + body;
-                send(sockfd, req.c_str(), req.size(), 0);
-                // Receive
-                std::string response;
-                char buf[4096];
-                ssize_t n;
-                while ((n = recv(sockfd, buf, sizeof(buf), 0)) > 0) response.append(buf, n);
-                ny_close_socket(sockfd);
-                // Strip HTTP headers
-                auto hdr_end = response.find("\r\n\r\n");
-                if (hdr_end != std::string::npos) response = response.substr(hdr_end + 4);
-                return makeStringValue(response);
+            // http_get(url, headers=none, timeout=30) / http_post(url, body,
+            // headers=none, timeout=30) -> the body text ("" when it fails).
+            if (args.empty()) return makeStringValue("");
+            std::string url = getStringValue(args[0]);
+            Value hv = NONE_VALUE, bv = NONE_VALUE;
+            double timeout = 30.0;
+            auto num = [&](const Value& t) { return t.type == ValueType::DOUBLE ? (double)t.value.d : t.type == ValueType::INTEGER ? (double)bigint_to_i64(t.value.i) : 30.0; };
+            if (name == "http_post") {
+                if (args.size() > 1) bv = args[1];
+                if (args.size() > 2) hv = args[2];
+                if (args.size() > 3) timeout = num(args[3]);
+            } else {
+                if (args.size() > 1) hv = args[1];
+                if (args.size() > 2) timeout = num(args[2]);
             }
-            return makeStringValue("");
+            HttpOut r = http_fetch(E, ctx, name == "http_post" ? "POST" : "GET", url, header_args(E, hv), body_arg(E, bv), timeout);
+            return makeStringValue(r.body);
         }
 
         // ===================== COLLECTIONS MODULE =====================

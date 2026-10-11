@@ -130,7 +130,7 @@ assert_true("renderer", r.handle == none)
 
 # ── ToastManager ─────────────────────────────────────────────────────────
 section("ToastManager")
-var tm = ToastManager()
+var tm = ToastManager(1600)
 tm.show("hello", "info", 3000)
 assert_true("toast active", tm.count > 0)
 

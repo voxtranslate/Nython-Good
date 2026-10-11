@@ -11,6 +11,8 @@
 #   AgentWorld, AgentBuilder
 # ============================================================
 
+import "lib/nytorch/core.ny"
+
 import nytorch
 
 # -----------------------------------------
@@ -38,8 +40,12 @@ class StorageManager:
         var p = self.base_dir + "/tensors/" + name + ".nyt"
         return tensor_load(p)
 
-    def save_model(self, name, params):
+    # meta: an optional note kept beside the model (callers pass
+    # "epoch=3 val_loss=0.1" and the like).
+    def save_model(self, name, params, meta=none):
         var p = self.base_dir + "/models/" + name + ".nym"
+        if meta != none:
+            write_file(p + ".meta", str(meta))
         return model_save(params, p)
 
     def load_model(self, name):

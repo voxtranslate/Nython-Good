@@ -90,12 +90,13 @@ class LangDef:
         return lang_define_prefix(name, trigger_token, handler_fn)
 
     def operator(self, symbol, handler_fn, arity="infix", precedence=50, description=""):
-        """Register a symbolic operator (non-identifier chars like ??, <~>, >>>).
+        """Register a symbolic operator (non-identifier chars like <~>, $$).
         The lexer will recognise the symbol and the executor will call
-        handler_fn with the appropriate operands.
+        handler_fn with the appropriate operands. (`??` is built in since
+        round 75: a ?? b is b when a is none or undefined.)
 
         Example:
-            lang.operator("??", lambda a, b: a if a != none else b,
+            lang.operator("$$", lambda a, b: a if a != none else b,
                           arity="infix", precedence=30)
         """
         return lang_define_operator(symbol, arity, precedence, handler_fn, description)

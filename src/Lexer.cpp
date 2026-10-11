@@ -6,6 +6,7 @@
 // fmt provided by Definitions.hpp
 #include "PrettyPrinter.hpp"
 #include "DynamicLang.hpp"
+#include "NyUniNames.hpp"
 #include <sstream>
 // ^ explicit: libstdc++ supplies these transitively, MinGW does not.
 
@@ -29,7 +30,7 @@ std::map<TokenType,std::string> Warnings = {
 std::map<TokenType,std::string> TokenTypeNames = {
 	{TokenType::End,"End"},{TokenType::NewLine,"NewLine"},{TokenType::Indent,"Indent"},{TokenType::Dedent,"Dedent"},{TokenType::Comment,"Comment"},
 	{TokenType::Identifier,"Identifier"},{TokenType::Float,"Float"},{TokenType::Integer,"Integer"},{TokenType::Hex,"Hex"},{TokenType::Oct,"Oct"},{TokenType::Binary,"Binary"},
-	{TokenType::Complex,"Complex"},{TokenType::String,"String"},{TokenType::True,"True"},{TokenType::False,"False"},{TokenType::None,"None"},{TokenType::Not,"Not"},{TokenType::And,"And"},
+	{TokenType::Complex,"Complex"},{TokenType::String,"String"},{TokenType::Bytes,"Bytes"},{TokenType::True,"True"},{TokenType::False,"False"},{TokenType::None,"None"},{TokenType::Not,"Not"},{TokenType::And,"And"},
 	{TokenType::Or,"Or"},{TokenType::Xor,"Xor"},{TokenType::Class,"Class"},{TokenType::Abstract,"Abstract"},{TokenType::Continue,"Continue"},{TokenType::If,"If"},{TokenType::Else,"Else"},{TokenType::ElseIf,"ElseIf"},{TokenType::For,"For"},{TokenType::Default,"Default"},{TokenType::Do,"Do"},{TokenType::Extends,"Extends"},{TokenType::Finally,"Finally"},{TokenType::Final,"Final"},{TokenType::Implements,"Implements"},{TokenType::Import,"Import"},
 	{TokenType::In,"In"},{TokenType::Pass,"Pass"},{TokenType::Instanceof,"Instanceof"},{TokenType::Subclassof,"Subclassof"},{TokenType::Parentof,"Parentof"},{TokenType::Interface,"Interface"},{TokenType::Package,"Package"},
 	{TokenType::NameSpace,"NameSpace"},{TokenType::Private,"Private"},{TokenType::Protected,"Protected"},{TokenType::Public,"Public"},{TokenType::Return,"Return"},{TokenType::Static,"Static"},
@@ -54,7 +55,9 @@ std::map<TokenType,std::string> TokenTypeNames = {
 	{TokenType::BraceClose,"BraceClose"},{TokenType::Comma,"Comma"},{TokenType::Colon,"Colon"},{TokenType::Dot,"Dot"},{TokenType::SemiColon,"SemiColon"},
 	{TokenType::BracketOpen,"BracketOpen"},{TokenType::BracketClose,"BracketClose"},{TokenType::ParenOpen,"ParenOpen"},{TokenType::Regex,"Regex"},{TokenType::New,"New"},{TokenType::Struct,"Struct"},
 	{TokenType::ParenClose,"ParenClose"},{TokenType::At,"At"},{TokenType::RightArrow,"RightArrow"},{TokenType::LeftArrow,"LeftArrow"},{TokenType::Var,"Var"},{TokenType::Block,"Block"},
-	{TokenType::Const,"Const"},{TokenType::Let,"Let"},{TokenType::Undefined,"Undefined"},{TokenType::Ref,"Ref"},{TokenType::QuestionMark,"QuestionMark"},{TokenType::Comment,"Comment"}
+	{TokenType::Const,"Const"},{TokenType::Let,"Let"},{TokenType::Undefined,"Undefined"},{TokenType::Ref,"Ref"},{TokenType::QuestionMark,"QuestionMark"},{TokenType::Comment,"Comment"},
+	{TokenType::NullCoalesce,"NullCoalesce"},{TokenType::NullCoalesceAssign,"NullCoalesceAssign"},{TokenType::OptDot,"OptDot"},{TokenType::OptBracket,"OptBracket"},
+	{TokenType::MatMulAssign,"MatMulAssign"}
 };
 
 static const TokenDef KeywordTokens[] = {
@@ -156,6 +159,12 @@ static const TokenDef KeywordTokens[] = {
 	TokenDef(TokenType::Except,std::string("catch"), TokenKind::Name, TokenClass::Keyword),
 	// JS/C "null" is an alias for Nython/Python "none"
 	TokenDef(TokenType::None,std::string("null"), TokenKind::Name, TokenClass::Keyword),
+	// Python's capitalised spellings. `True` used to be an ordinary (undefined)
+	// name reading none, so a Python-style `while True:` never ran and
+	// `return True` returned a falsy value.
+	TokenDef(TokenType::True,std::string("True"), TokenKind::Name, TokenClass::Keyword),
+	TokenDef(TokenType::False,std::string("False"), TokenKind::Name, TokenClass::Keyword),
+	TokenDef(TokenType::None,std::string("None"), TokenKind::Name, TokenClass::Keyword),
 	// Lua "elseif" as alias for "elif"
 	TokenDef(TokenType::ElseIf,std::string("elseif"), TokenKind::Name, TokenClass::Keyword)
 };
@@ -244,6 +253,12 @@ inline ConstArray<TokenDef const> Delims() {
 
 inline ConstArray<TokenDef const> Keywords() {
 	return { KeywordTokens };
+}
+
+std::vector<std::string> keyword_spellings() {
+	std::vector<std::string> out;
+	for (auto& k : KeywordTokens) out.push_back(k.value);
+	return out;
 }
 
 inline bool is_ident_char(char c, bool first = false) {
@@ -369,6 +384,7 @@ std::string Lexer::fileName() {
 
 void Lexer::reset_token() {
     source.location.reset(source.location.row, source.location.column);
+    token_start = source.location;
     TokenIdent ident(TokenType::Invalid, TokenKind::Invalid, TokenClass::Invalid);
     token = Token(ident, "invalid" , source.location);
 }
@@ -446,7 +462,14 @@ bool Lexer::is_binary(char cp) {
 
 Token& Lexer::make_token(TokenIdent ident) {
 	this->token.ident     = ident;
+	// A token is located where it starts. The column used to be reset to 1
+	// for every token, so every error said column 2. A token that spans
+	// lines (a triple-quoted string, a newline) keeps the position where it
+	// ends, as before: statement line numbers (tracing, the debugger, error
+	// lines) are taken from those rows.
 	this->token._location = source.location;
+	if (token_start.row == source.location.row)
+	    this->token._location.column = token_start.column;
 	return this->token;
 }
 
@@ -482,11 +505,31 @@ inline std::vector<Token> optimize(std::vector<Token> tk) {
 	for(auto i = 0; i < nb; ) {
         // Guard all tk[i+1] accesses with bounds check
         while(i < nb-1 && tk[i].type()==TokenType::NewLine && tk[i+1].type()==TokenType::NewLine) i++;
-        if(i < nb-1 && tk[i].type()==TokenType::String && tk[i+1].type()==TokenType::String) {
+        // Adjacent string literals are one string, as in Python: 'a' 'b'
+        // == 'ab', and inside brackets across lines too. The joined token
+        // used to be built and dropped, so 'a' 'b' 'c' read as 'c' and a
+        // literal continued on the next line inside parentheses was a
+        // syntax error. Line breaks skipped inside brackets keep their
+        // indentation bookkeeping (paren_indent_delta).
+        if(tk[i].type()==TokenType::String) {
             Token token = tk[i];
-            while(i < nb-1 && tk[i].type()==TokenType::String && tk[i+1].type()==TokenType::String) {
-                token.value.append(tk[i+1].value);
-                i++;
+            int j = i + 1, last = i, d = 0, d_last = 0;
+            while(j < nb) {
+                TokenType t = tk[j].type();
+                if(paren_depth > 0 && (t==TokenType::NewLine || t==TokenType::Indent || t==TokenType::Dedent)) {
+                    if(t==TokenType::Indent) d++;
+                    else if(t==TokenType::Dedent) d--;
+                    j++;
+                    continue;
+                }
+                if(t==TokenType::String) { token.value.append(tk[j].value); last = j; d_last = d; j++; continue; }
+                break;
+            }
+            if(last > i) {
+                paren_indent_delta += d_last;
+                ret.push_back(token);
+                i = last + 1;
+                continue;
             }
         }
         if(i >= nb) break;
@@ -514,8 +557,12 @@ inline std::vector<Token> optimize(std::vector<Token> tk) {
             paren_indent_delta--;
             i++; continue;
         }
-        // Guard tk[i+1] access before using it
-        if(i < nb-1 && tk[i].type()==TokenType::Comma && tk[i+1].type()==TokenType::NewLine) {
+        // Guard tk[i+1] access before using it. A trailing comma at the end
+        // of a line joins the next one only when that is indented under it:
+        // `y = 3,` / `return 1,` / `i, = x` end their statement, as in
+        // Python (round 77: the next line became part of the tuple).
+        if(i < nb-2 && tk[i].type()==TokenType::Comma && tk[i+1].type()==TokenType::NewLine
+           && tk[i+2].type()==TokenType::Indent) {
             ret.push_back(tk[i]);
             i += 2;
         } else {
@@ -653,8 +700,34 @@ void Lexer::read_token() {
           break;
         }
         case '?': {
-            this->token.value = "?";
-            make_token(TokenType::QuestionMark,TokenKind::QuestionMark,TokenClass::Delimiter);
+            // `??` / `??=` null-coalescing, `?.` / `?[` optional chaining,
+            // else the `?` of the C-style ternary `c ? a : b`. Two spellings
+            // stay the ternary's: `c ? .5 : 1` (a digit after `?.`) and
+            // `c ? [1] : [2]` - `?[` is optional indexing only when the `?`
+            // is glued to its receiver (`a?[k]`); `a?.[k]` always is.
+            char n1 = source.peek_char(), n2 = source.peek_char(1);
+            char before = source.peek_char(-2);
+            bool glued = before != '\0' && !std::isspace((unsigned char)before);
+            if (n1 == '?' && n2 == '=') {
+                source.read_char(); source.read_char();
+                this->token.value = "?\?=";
+                make_token(TokenType::NullCoalesceAssign,TokenKind::QuestionMark,TokenClass::Assignment);
+            } else if (n1 == '?') {
+                source.read_char();
+                this->token.value = "??";
+                make_token(TokenType::NullCoalesce,TokenKind::QuestionMark,TokenClass::Operator);
+            } else if (n1 == '.' && !std::isdigit((unsigned char)n2) && n2 != '.') {
+                source.read_char();
+                this->token.value = "?.";
+                make_token(TokenType::OptDot,TokenKind::QuestionMark,TokenClass::Delimiter);
+            } else if (n1 == '[' && glued) {
+                // the `[` stays for the parser: OptBracket then BracketOpen
+                this->token.value = "?[";
+                make_token(TokenType::OptBracket,TokenKind::QuestionMark,TokenClass::Delimiter);
+            } else {
+                this->token.value = "?";
+                make_token(TokenType::QuestionMark,TokenKind::QuestionMark,TokenClass::Delimiter);
+            }
           break;
         }
         case ':': {
@@ -679,6 +752,11 @@ void Lexer::read_token() {
                 source.read_char();
                 this->consume_string(source.current_char);
                 this->token.type(TokenType::Identifier);
+              } else if (this->source.peek_char() == '=') {
+                // `a @= b` (round 77: it read as a decorator `@` and `=`)
+                this->source.read_char();
+                this->token.value = "@=";
+                make_token(TokenType::MatMulAssign,TokenKind::At,TokenClass::Assignment);
               } else {
                 this->token.value = "@";
                 make_token(TokenType::At,TokenKind::At,TokenClass::Delimiter);
@@ -1267,7 +1345,9 @@ void Lexer::consume_numeric() {
                 break;
             }
 			case 'j': case 'J':{
-                this->consume_cplx();
+                // 0j: the decimal path reads imaginary literals (consume_cplx
+                // lost the character after them: print(0j) was a syntax error)
+                this->consume_decimal();
                 break;
             }
 			case '.': case 'e': case 'E':{
@@ -1348,6 +1428,51 @@ inline bool isComplex(char cp) {
     return cp == 'j' or cp == 'J';
 }
 
+// The decimal digits of a suffixed number literal as the lexer spelled it
+// ("2.5e+3", "1500e-3", "1e3e+3": mantissa, then the exponents written and
+// implied by the suffix) when its value is a whole number; "" otherwise.
+static std::string scaled_suffix_integer(const std::string& lit) {
+    std::string mant;
+    long exp10 = 0;
+    size_t i = 0;
+    while (i < lit.size() && lit[i] != 'e' && lit[i] != 'E') mant += lit[i++];
+    while (i < lit.size()) {
+        i++;                                   // the 'e'
+        size_t start = i;
+        if (i < lit.size() && (lit[i] == '+' || lit[i] == '-')) i++;
+        while (i < lit.size() && std::isdigit((unsigned char)lit[i])) i++;
+        if (i == start) return std::string();
+        try { exp10 += std::stol(lit.substr(start, i - start)); } catch (...) { return std::string(); }
+    }
+    std::string digits;
+    long frac = 0;
+    bool point = false;
+    for (char c : mant) {
+        if (c == '.') { point = true; continue; }
+        if (!std::isdigit((unsigned char)c)) return std::string();
+        digits += c;
+        if (point) frac++;
+    }
+    if (digits.empty()) return std::string();
+    long shift = exp10 - frac;                 // value = digits * 10^shift
+    if (shift < 0) {
+        // Whole only if the digits dropped are all zeros.
+        long drop = -shift;
+        if (drop > (long)digits.size()) {
+            for (char c : digits) if (c != '0') return std::string();
+            return "0";
+        }
+        for (size_t k = digits.size() - (size_t)drop; k < digits.size(); k++)
+            if (digits[k] != '0') return std::string();
+        digits.resize(digits.size() - (size_t)drop);
+    } else {
+        if (shift > 4000) return std::string();
+        digits.append((size_t)shift, '0');
+    }
+    size_t nz = digits.find_first_not_of('0');
+    return nz == std::string::npos ? std::string("0") : digits.substr(nz);
+}
+
 void Lexer::consume_decimal() {
     char cp;
     char numchar;
@@ -1421,14 +1546,33 @@ void Lexer::consume_decimal() {
     }
     source.put_char();
     if (cp == '.' && !point_passed) {
-        cp = source.peek_char();
-        if(std::isspace(cp)) {
+        // the '.' was put back: peek_char() is it, peek_char(1) what follows
+        cp = source.peek_char(1);
+        // `5.` is a float before a space and before what ends an operand
+        // (`[5., 0.]`, `f(1.)`; round 77) - `1.+(2, 3)` stays a member call
+        if(std::isspace(cp) || cp == ',' || cp == ')' || cp == ']' || cp == '}' || cp == ':' || cp == ';'
+           || cp == '#' || cp == '\0') {
         	source.read_char();
         	decoder << '.';
         	point_passed = true;
         }
     }
     this->token.value = decoder.str();
+    // A unit suffix (1k, 2.5M, 3m, 10u ...) scales the number by a power of
+    // ten. The literal is an exact integer when the scaled value is whole
+    // (1k == 1000, 2.5k == 2500, 2000m == 2) and a float only when it is
+    // fractional (1m == 0.001, 1500m == 1.5); arithmetic then follows the
+    // operation (1k / 3 is a float, 1k // 3 and 1k * 2 are ints). It used
+    // to be a float always. Worked out on the digits, not in binary
+    // floating point, so 1.1k is exactly 1100.
+    if ( units_passed && !complx_passed ) {
+        std::string whole = scaled_suffix_integer(this->token.value);
+        if (!whole.empty()) {
+            this->token.value = whole;
+            make_token(TokenType::Integer,TokenKind::Number,TokenClass::Literal);
+            return;
+        }
+    }
     //Check if we parsed a complex
     if ( complx_passed ) {
         source.read_char();
@@ -1446,6 +1590,8 @@ void Lexer::consume_hex() {
     bool point_passed = false;
     this->token.value.clear();
     this->token.value.append("0x");
+    // `0x_ff`, `0xff_ff`: an underscore between digits (round 77)
+    if (source.current_char == '_' && Lexer::is_hex(source.peek_char())) source.read_char();
     // There has to be at least one hex character
     if (!Lexer::is_hex(source.current_char)) {
         this->unexpectedChar();
@@ -1454,6 +1600,8 @@ void Lexer::consume_hex() {
     while (true) {
         if (Lexer::is_hex(cp)) {
             this->token.value += static_cast<char>(cp);
+            cp = source.read_char();
+        } else if (cp == '_' && Lexer::is_hex(source.peek_char())) {
             cp = source.read_char();
         } else if (cp == '.') {
             if (point_passed) {
@@ -1479,6 +1627,7 @@ void Lexer::consume_octal() {
     bool point_passed = false;
     this->token.value.clear();
     this->token.value.append("0o");
+    if (source.current_char == '_' && Lexer::is_octal(source.peek_char())) source.read_char();   // 0o_17 (round 77)
     // There has to be at least one hex character
     if (!Lexer::is_octal(source.current_char)) {
         this->unexpectedChar();
@@ -1487,6 +1636,8 @@ void Lexer::consume_octal() {
     while (true) {
         if (Lexer::is_octal(cp)) {
             this->token.value += static_cast<char>(cp);
+            cp = source.read_char();
+        } else if (cp == '_' && Lexer::is_octal(source.peek_char())) {
             cp = source.read_char();
         }else if (cp == '.') {
             if (point_passed) {
@@ -1512,6 +1663,7 @@ void Lexer::consume_binary() {
     bool point_passed = false;
     this->token.value.clear();
     this->token.value.append("0b");
+    if (source.current_char == '_' && Lexer::is_binary(source.peek_char())) source.read_char();   // 0b_1010 (round 77)
     // There has to be at least one hex character
     if (!Lexer::is_binary(source.current_char)) {
         this->unexpectedChar();
@@ -1520,6 +1672,8 @@ void Lexer::consume_binary() {
     while (true) {
         if (Lexer::is_binary(cp)) {
             this->token.value += static_cast<char>(cp);
+            cp = source.read_char();
+        } else if (cp == '_' && Lexer::is_binary(source.peek_char())) {
             cp = source.read_char();
         }else if (cp == '.') {
             if (point_passed) {
@@ -1653,8 +1807,160 @@ void Lexer::consume_ident() {
         source.appendToFrame(source.current_char);
     }
     source.put_char();
-    this->token.value = source.get_current_frame();
+    std::string ident = source.get_current_frame();
+    // r"..." / r'...': a raw string - backslashes are kept as written.
+    if ((ident == "r" || ident == "R") && (source.peek_char() == '"' || source.peek_char() == '\'')) {
+        char q = source.read_char();
+        consume_raw_string(q);
+        return;
+    }
+    // b"..." / rb"..." (any case, either order): a bytes literal (round 77).
+    if (source.peek_char() == '"' || source.peek_char() == '\'') {
+        std::string lo;
+        for (char c : ident) lo += (char)((c >= 'A' && c <= 'Z') ? c + 32 : c);
+        if (lo == "b" || lo == "rb" || lo == "br") {
+            char q = source.read_char();
+            consume_bytes(q, lo != "b");
+            return;
+        }
+        // u"..." is a plain string; F"..." an f-string (the parser reads
+        // `f` + a string); rf"..." / fR"..." an f-string over a raw string:
+        // the `f` token, then the raw text (round 77)
+        if (lo == "u") {
+            char q = source.read_char();
+            consume_string(q);
+            return;
+        }
+        if (lo == "f") ident = "f";
+        if (lo == "rf" || lo == "fr") {
+            this->token.value = "f";
+            make_token(TokenType::Identifier,TokenKind::Identifier,TokenClass::Identifier);
+            tokens.push_back(this->token);
+            char q = source.read_char();
+            consume_raw_string(q);
+            return;
+        }
+    }
+    this->token.value = ident;
     make_token(TokenType::Identifier,TokenKind::Identifier,TokenClass::Identifier);
+}
+
+// The body of a raw string literal, its opening quote just read (a single
+// quote, or the first of three). Nothing is an escape; a backslash only keeps
+// the quote after it from ending the string, as in Python.
+void Lexer::consume_raw_string(char q) {
+    std::string out;
+    int n = 1;
+    if (source.peek_char() == q) {
+        source.read_char();
+        if (source.peek_char() == q) { source.read_char(); n = 3; }
+        else { this->token.value = ""; make_token(TokenType::String,TokenKind::String,TokenClass::Literal); return; }
+    }
+    while (true) {
+        char c = source.read_char();
+        if (c == '\0' || c == (char)-1) {
+            this->token.value = out;
+            errors++;
+            make_token(TokenType::UnterminatedStringError,TokenKind::Error, TokenClass::Invalid);
+            add_info_item(LexerInfoLevel::Error,token);
+            return;
+        }
+        if (c == '\\') {
+            out += c;
+            char d = source.read_char();
+            if (d == '\0' || d == (char)-1) continue;
+            out += d;
+            continue;
+        }
+        if (c == q) {
+            if (n == 1) break;
+            if (source.peek_char() == q) {
+                source.read_char();
+                if (source.peek_char() == q) { source.read_char(); break; }
+                out += q; out += q; continue;
+            }
+        }
+        if (c == '\n' && n == 1) {
+            this->token.value = out;
+            errors++;
+            make_token(TokenType::UnterminatedStringError,TokenKind::Error, TokenClass::Invalid);
+            add_info_item(LexerInfoLevel::Error,token);
+            return;
+        }
+        out += c;
+    }
+    this->token.value = out;
+    make_token(TokenType::String,TokenKind::String,TokenClass::Literal);
+}
+
+// The body of a bytes literal, its opening quote just read. Python's rules:
+// only ASCII characters may be written in it, \xhh and \ooo give any byte,
+// \u is not an escape, an unknown escape keeps its backslash; a raw one
+// (rb"...") keeps every backslash.
+void Lexer::consume_bytes(char q, bool raw) {
+    std::string out;
+    int n = 1;
+    if (source.peek_char() == q) {
+        source.read_char();
+        if (source.peek_char() == q) { source.read_char(); n = 3; }
+        else { this->token.value = ""; make_token(TokenType::Bytes,TokenKind::String,TokenClass::Literal); return; }
+    }
+    auto fail = [&](const char* why) {
+        this->token.value = why;
+        errors++;
+        make_token(TokenType::UnterminatedStringError,TokenKind::Error, TokenClass::Invalid);
+        add_info_item(LexerInfoLevel::Error,token);
+    };
+    while (true) {
+        char c = source.read_char();
+        if (c == '\0' || c == (char)-1) { fail("unterminated bytes literal"); return; }
+        if ((unsigned char)c >= 0x80) { fail("bytes can only contain ASCII literal characters"); return; }
+        if (c == '\n' && n == 1) { fail("unterminated bytes literal"); return; }
+        if (c == q) {
+            if (n == 1) break;
+            if (source.peek_char() == q) {
+                source.read_char();
+                if (source.peek_char() == q) { source.read_char(); break; }
+                out += q; out += q; continue;
+            }
+            out += q; continue;
+        }
+        if (c != '\\') { if (c != '\r') out += c; continue; }
+        char d = source.read_char();
+        if (d == '\0' || d == (char)-1) { fail("unterminated bytes literal"); return; }
+        if (raw) { out += '\\'; out += d; continue; }
+        switch (d) {
+            case '\n': break;                       // line continuation
+            case '\\': out += '\\'; break;
+            case '\'': out += '\''; break;
+            case '"': out += '"'; break;
+            case 'a': out += '\a'; break;
+            case 'b': out += '\b'; break;
+            case 'f': out += '\f'; break;
+            case 'n': out += '\n'; break;
+            case 'r': out += '\r'; break;
+            case 't': out += '\t'; break;
+            case 'v': out += '\v'; break;
+            case 'x': {
+                char h1 = source.read_char();
+                char h2 = source.read_char();
+                if (!is_hex(h1) || !is_hex(h2)) { fail("invalid \\x escape in bytes literal"); return; }
+                out += (char)((hex2num(h1) << 4) | hex2num(h2));
+                break;
+            }
+            default:
+                if (d >= '0' && d <= '7') {
+                    int v = d - '0';
+                    for (int k = 0; k < 2 && source.peek_char() >= '0' && source.peek_char() <= '7'; k++)
+                        v = v * 8 + (source.read_char() - '0');
+                    out += (char)(v & 0xFF);
+                } else {
+                    out += '\\'; out += d;            // unknown: kept as written
+                }
+        }
+    }
+    this->token.value = out;
+    make_token(TokenType::Bytes,TokenKind::String,TokenClass::Literal);
 }
 
 void Lexer::consume_regex(char first) {
@@ -1711,6 +2017,11 @@ void Lexer::consume_string(char first) {
                 );
                 return;
 			}
+			// A quote that did not end a triple-quoted string is part of it
+			// ("""say "hi" """ kept no quotes, so exec'd source and docstrings
+			// lost them) - round 77.
+			if(quote_count == 3 && cur != first && end_quote_count > 0)
+				for(int q = 0; q < end_quote_count; q++) strbuff << first;
 			if(cur != '\\' && cur != '\x0c' && cur != '\r') {
 				// For triple-quoted strings (quote_count==3), preserve literal newlines
 				if(cur == '\n') {
@@ -1817,12 +2128,54 @@ void Lexer::consume_string(char first) {
                             }
                             break;
                         }
+						case 'N': {
+                            // \N{EM DASH}: the character of that name, as in
+                            // Python (round 77; NyUniNames.hpp). An unknown
+                            // name is a SyntaxError, as there.
+                            if(source.peek_char() != '{') { strbuff << '\\' << c; break; }
+                            source.read_char();
+                            std::string nm;
+                            char nc;
+                            while((nc = source.peek_char()) != '}' && nc != '\0' && nc != '\n' && nc != first && nm.size() < 128) {
+                                source.read_char();
+                                nm += nc;
+                            }
+                            uint32_t codepoint = 0;
+                            if(nc == '}' && ::nyuni::lookup(nm, codepoint)) {
+                                source.read_char();
+                                if(codepoint < 0x80) {
+                                    strbuff << (char)codepoint;
+                                } else if(codepoint < 0x800) {
+                                    strbuff << (char)(0xC0|(codepoint>>6));
+                                    strbuff << (char)(0x80|(codepoint&0x3F));
+                                } else if(codepoint < 0x10000) {
+                                    strbuff << (char)(0xE0|(codepoint>>12));
+                                    strbuff << (char)(0x80|((codepoint>>6)&0x3F));
+                                    strbuff << (char)(0x80|(codepoint&0x3F));
+                                } else {
+                                    strbuff << (char)(0xF0|(codepoint>>18));
+                                    strbuff << (char)(0x80|((codepoint>>12)&0x3F));
+                                    strbuff << (char)(0x80|((codepoint>>6)&0x3F));
+                                    strbuff << (char)(0x80|(codepoint&0x3F));
+                                }
+                            } else {
+                                throw nython::exception::SyntaxError(
+                                    Location(source.location.row, source.location.column, source.fileName()),
+                                    nc == '}' ? "(unicode error) 'unicodeescape' codec can't decode bytes: unknown Unicode character name"
+                                              : "(unicode error) 'unicodeescape' codec can't decode bytes: malformed \\N character escape");
+                            }
+                            break;
+                        }
 						case 'x': case 'X': {
-                            // \xHH hex escape (exactly 2 hex digits)
+                            // \xHH: the code point U+00HH, as in Python ("\xe9"
+                            // is "é"; it used to be the raw byte 0xE9, which is
+                            // not UTF-8 - b"\xe9" is the byte).
                             char h1 = source.read_char();
                             char h2 = source.read_char();
                             if(is_hex(h1) && is_hex(h2)) {
-                                strbuff << (char)((hex2num(h1)<<4)|hex2num(h2));
+                                uint32_t cp = (uint32_t)((hex2num(h1)<<4)|hex2num(h2));
+                                if(cp < 0x80) strbuff << (char)cp;
+                                else { strbuff << (char)(0xC0|(cp>>6)); strbuff << (char)(0x80|(cp&0x3F)); }
                             } else {
                                 strbuff << '\\' << c;
                                 if(!is_hex(h1)) source.put_char();
@@ -1834,8 +2187,25 @@ void Lexer::consume_string(char first) {
                             this->unexpectedChar();
                             break;
                         }
+						case '0': case '1': case '2': case '3': case '4': case '5': case '6': case '7': {
+                            // \ooo: up to three octal digits, a code point
+                            uint32_t cp = (uint32_t)(c - '0');
+                            for(int k = 0; k < 2; k++) {
+                                char o = source.peek_char();
+                                if(o < '0' || o > '7') break;
+                                source.read_char();
+                                cp = cp * 8 + (uint32_t)(o - '0');
+                            }
+                            if(cp < 0x80) strbuff << (char)cp;
+                            else { strbuff << (char)(0xC0|(cp>>6)); strbuff << (char)(0x80|(cp&0x3F)); }
+                            break;
+                        }
+						case '\n':
+                            // a backslash at the end of a line continues it
+                            break;
 						default:
-						    strbuff << char(cur);
+						    // an unknown escape keeps its backslash, as in Python
+						    strbuff << '\\' << c;
 						break;
 					}
 				}

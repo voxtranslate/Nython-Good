@@ -8,6 +8,7 @@
 #include "Class.hpp"
 #include "Object.hpp"
 #include "Collectable.hpp"
+#include "NyGC.hpp"
 
 
 
@@ -15,13 +16,18 @@ namespace nython {
 namespace gc {
 
 Collectable::Collectable(Type type_arg): type{type_arg}, marked{false}, runner{nullptr} {
+    collectables_created()++;
 }
 
 Collectable::Collectable(Runnable* runner_arg, Type type_arg): type{type_arg}, marked{false}, runner{runner_arg} {
+    collectables_created()++;
 }
 
 Collectable::~Collectable() {
-    clean();
+    if (gc_counted) collectables_created()--;
+    // An object destroyed by any route other than its count reaching zero
+    // (a legacy delete) must still leave the generation lists intact.
+    if (gc_flags & 1u) nygc::untrack(this);
 }
 
 void Collectable::clean() {

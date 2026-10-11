@@ -19,7 +19,6 @@
 #include <sys/stat.h>
 #include <Runflags.hpp>
 #include "Runnable.hpp"
-#include "GarbageCollector.hpp"
 
 #include <cstdio>
 #ifdef _WIN32
@@ -93,17 +92,12 @@ static const std::string kLicense =
     "OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE \n"
     "SOFTWARE.";
 
-using gc::MemoryCell;
-using gc::GarbageCollector;
-
 struct Interpreter extends Runnable {
 
-    friend class GarbageCollector;
     std::string input;
     std::string program;
 	std::string historyPath;
     RunFlags flags;
-    GarbageCollector gc;
     std::atomic<bool> running;
 
 	Interpreter(Reporter* reporter, int argc, char** argv, char** environment);
@@ -123,42 +117,6 @@ struct Interpreter extends Runnable {
      */
 
     inline static void changeConsoleCharacterMode(){
-    }
-
-    template<typename T>
-    T* create() {
-        MemoryCell* cell = this->gc.allocate();
-        T* object = nullptr;
-        try{
-            object = new T();
-        }catch(...){
-            this->gc.do_collect();
-            try{
-                object = new T();
-            }catch(std::bad_alloc& e){
-                throw e;
-            }
-        }
-        cell->value = object;
-        return cell->as<T>();
-    }
-
-    template<class T,class First,class...Rest>
-    T* create(First&& first, Rest&&... rest) {
-        MemoryCell* cell = this->gc.allocate();
-        T* object = nullptr;
-        try{
-            object = new T(std::forward<First&&>(first),std::forward<Rest&&>(rest)...);
-        }catch(...){
-            this->gc.do_collect();
-            try{
-                object = new T(std::forward<First&&>(first),std::forward<Rest&&>(rest)...);
-            }catch(std::bad_alloc& e){
-                throw e;
-            }
-        }
-        cell->value = object;
-        return cell->as<T>();
     }
 
     inline static bool FileExists(const std::string& name) {

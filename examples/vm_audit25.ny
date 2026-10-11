@@ -224,8 +224,8 @@ check("not false", not false, true)
 check("complex bool", (true and false) or (not false), true)
 
 # ── Type coercion ────────────────────────────────────────────────
-check("int+float", type(1 + 1.0), "float")
-check("int*float", type(2 * 3.14), "float")
+check("int+float", type(1 + 1.0) == "float", true)
+check("int*float", type(2 * 3.14) == "float", true)
 check("str+str", "a" + "b", "ab")
 
 # ── Walrus-style patterns ───────────────────────────────────────
@@ -262,10 +262,11 @@ check("softmax sum ~1", round(t2[0]+t2[1]+t2[2]+t2[3]+t2[4]), 1)
 # ── File and KV ops ──────────────────────────────────────────────
 write_file("/tmp/ny_audit25.txt", "test content 25")
 check("file write+read", read_file("/tmp/ny_audit25.txt"), "test content 25")
-kv_set("/tmp/ny_audit25.kv", "key1", "val1")
-kv_set("/tmp/ny_audit25.kv", "key2", "val2")
-check("kv get", kv_get("/tmp/ny_audit25.kv", "key1"), "val1")
-var kk = kv_keys("/tmp/ny_audit25.kv")
+var kvp = os_path_join(os_gettempdir(), "ny_audit25_" + str(os_getpid()) + ".kv")
+kv_set(kvp, "key1", "val1")
+kv_set(kvp, "key2", "val2")
+check("kv get", kv_get(kvp, "key1"), "val1")
+var kk = kv_keys(kvp)
 check("kv keys", len(kk), 2)
 
 print ""

@@ -10,12 +10,16 @@
 # `_disasm_file` emitted one "EXEC" per non-blank line; `_profile_file` made up
 # timings. None of them ever touched the compiler.
 #
-# Everything here shells out to the actual toolchain via os_exec and parses what
-# comes back, so what the IDE shows is what the language actually does.
+# Everything here runs the actual binary (os_run with an argv list: no shell,
+# the same on every platform) and parses what comes back, so what the IDE
+# shows is what the language actually does.
 #
 #   var tc = Toolchain()
 #   var r = tc.run(source, false)     # r.ok, r.lines, r.exit_code, r.ms
 #   var d = tc.diagnose(source)       # list of {line, severity, message}
+
+import sys
+
 
 class Diagnostic:
     def __init__(self, line, severity, message):
@@ -43,90 +47,124 @@ class ToolResult:
 class Toolchain:
     def __init__(self):
         self.exe = self._find_exe()
-        self.tmp_dir = "/tmp"
+        # The system's temporary directory ("/tmp" does not exist on Windows).
+        self.tmp_dir = string_replace(os_gettempdir(), "\\", "/").rstrip("/")
+        if self.tmp_dir == "":
+            self.tmp_dir = "/tmp"
         self.seq = 0
         self.last_command = ""
 
-    # The IDE may be launched from anywhere; prefer a binary sitting next to the
-    # workspace, then fall back to PATH.
+    # The IDE may be launched from anywhere. The binary running the IDE
+    # exports its own path as NYTHON_EXE (src/main.cpp), which is always the
+    # right one; otherwise prefer a binary next to the workspace, then PATH.
     def _find_exe(self):
-        for cand in ["./nython", "./ny_test", "./build/nython"]:
+        var own = getenv("NYTHON_EXE")
+        if own != none and own != "" and path_exists(own):
+            return own
+        # Else the interpreter running this: always a binary of this build,
+        # and one for this platform (a checkout can hold binaries built for
+        # another - a Linux ./ny_test beside a Windows nython.exe).
+        var me = sys.executable
+        if me != none and me != "" and path_exists(me):
+            return me
+        for cand in ["./nython", "./ny_test", "./build/nython", "./nython.exe", "./build/nython.exe"]:
             if path_exists(cand):
                 return cand
         return "nython"
 
     def available(self):
-        var probe = os_exec(self.exe + " --version 2>&1")
-        return string_find(probe, "Nython") >= 0
+        return string_find(self.version(), "Nython") >= 0
 
     def version(self):
-        return os_exec(self.exe + " --version 2>&1")
+        try:
+            return os_run([self.exe, "--version"], merge=true)["stdout"]
+        except Exception as e:
+            return ""
 
     # ── temp file plumbing ───────────────────────────────────────────────────
+    # This process's own name (the counter starts at 1 in every process: two
+    # IDEs, or a test run on both engines at once, wrote each other's files).
     def _temp_path(self, name):
         self.seq = self.seq + 1
         var safe = name
         if len(safe) == 0:
             safe = "buffer"
-        return self.tmp_dir + "/nyide_" + str(self.seq) + "_" + safe
+        return self.tmp_dir + "/nyide_" + str(os_getpid()) + "_" + str(self.seq) + "_" + safe
 
     def _stage(self, source, name):
         var p = self._temp_path(name)
         write_file(p, source)
         return p
 
-    # Runs a command, capturing stdout+stderr together and the exit status.
-    # os_exec only returns output, so the status is smuggled out on a final line.
-    def _exec(self, cmd):
-        self.last_command = cmd
-        var full = "{ " + cmd + " ; } 2>&1 ; echo __NY_EXIT__$?"
-        var raw = os_exec(full)
+    # Runs argv + [the staged source] and removes the staged file (its output
+    # is captured whole; the files used to pile up in the temp directory).
+    def _staged(self, argv, source, name):
+        var p = self._stage(source, name)
+        var res = self._timed(argv + [p])
+        self._unstage(p)
+        return res
+
+    def _unstage(self, p):
+        try:
+            os_remove(p)
+        except Exception:
+            pass
+
+    # Runs a program (argv list, no shell - nothing in a path is interpreted,
+    # on any platform), capturing stdout and stderr together, in order, and
+    # the exit status.
+    def _exec(self, argv):
+        var shown = []
+        for a in argv:
+            shown.append(shell_quote(a))
+        self.last_command = " ".join(shown)
         var res = ToolResult()
+        var raw = ""
+        try:
+            var r = os_run(argv, merge=true)
+            raw = r["stdout"]
+            res.exit_code = r["code"]
+        except Exception as e:
+            raw = str(e)
+            res.exit_code = 127
         res.raw = raw
-        var parts = string_split(raw, "\n")
-        var i = 0
-        while i < len(parts):
-            var ln = parts[i]
-            if string_startswith(ln, "__NY_EXIT__"):
-                res.exit_code = int(ln[11:])
-            else:
+        if raw.endswith("\n"):
+            raw = raw[:len(raw) - 1]
+        if raw != "":
+            for ln in string_split(raw, "\n"):
+                # A Windows program ends its lines with \r\n.
+                if ln.endswith("\r"):
+                    ln = ln[:len(ln) - 1]
                 res.add(ln)
-            i = i + 1
         res.ok = res.exit_code == 0
         return res
 
-    def _timed(self, cmd):
+    def _timed(self, argv):
         var t0 = time_now()
-        var res = self._exec(cmd)
+        var res = self._exec(argv)
         res.ms = int((time_now() - t0) * 1000.0)
         return res
 
     # ── pipeline modes ───────────────────────────────────────────────────────
     def run(self, source, name, use_vm):
-        var p = self._stage(source, name)
-        var flag = ""
         if use_vm:
-            flag = "--vm "
-        return self._timed(self.exe + " " + flag + p)
+            return self._staged([self.exe, "--vm"], source, name)
+        return self._staged([self.exe], source, name)
 
     def tokenize(self, source, name):
-        var p = self._stage(source, name)
-        return self._timed(self.exe + " -t " + p)
+        return self._staged([self.exe, "-t"], source, name)
 
     def ast(self, source, name):
-        var p = self._stage(source, name)
-        return self._timed(self.exe + " -a " + p)
+        return self._staged([self.exe, "-a"], source, name)
 
     def disasm(self, source, name):
-        var p = self._stage(source, name)
-        return self._timed(self.exe + " -d " + p)
+        return self._staged([self.exe, "-d"], source, name)
 
     # ── profiling ────────────────────────────────────────────────────────────
     # Runs under `--profile` and splits the measured report off the program's
     # own stdout. Rows are [name, calls, total_ms, self_ms], hottest first.
     def profile(self, source, name):
-        var p = self._stage(source, name)
-        var res = self._timed(self.exe + " --profile " + p)
+        var res = self._staged([self.exe, "--profile"], source, name)
         var rows = []
         var in_report = false
         var i = 0
@@ -163,7 +201,8 @@ class Toolchain:
     def diagnose(self, source, name):
         var out = []
         var p = self._stage(source, name)
-        var res = self._exec(self.exe + " -a " + p)
+        var res = self._exec([self.exe, "-a", p])
+        self._unstage(p)
         var i = 0
         while i < res.line_count:
             var ln = res.lines[i]

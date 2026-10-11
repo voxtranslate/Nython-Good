@@ -5361,3 +5361,238 @@ Also cross-checked that every file the handoff references exists.
 | `MEMORY_NOTES.md` | writing Nython the runtime can afford |
 | `IDE_FILES.md` | which IDE file is real |
 | `tests/ide/README_HEADLESS.md` | running GUI tests without a display |
+
+---
+
+## Round 73 — the IDE to VS Code standard, verified by driving it
+
+Full account in `HANDOFF.md` §0d. The log entry, by defect:
+
+| Defect | Cause | Fix |
+|---|---|---|
+| Nothing on a click or key had ever been tested | the stub could only construct and quit the IDE | scripted/live input + frame capture in the stub; `tools/ide_driver.py`, `tools/ide_e2e.py` |
+| JSON wrong on the interpreter (unescaped, flat only), `\u` wrong on the VM | two separate hand-written codecs | `include/NyJson.hpp`, one codec for both engines |
+| `print("a", b)` printed a tuple (interpreter); tuples flattened, `sep=` broken (VM) | the call form parsed as a print statement of one tuple | parser recognises `print(...)` with `sep=`/`end=`; both engines |
+| `[[1]] == [[1]]` false, `{"a":1} == {"b":2}` true, `[1] != [1]` true (interpreter) | elements compared by printed form; maps had "length 0"; `!=` compared identity | `valuesEqual`, recursive, used by both operators |
+| `true == 1` false (VM) | no cross-type rule | bool/int/float comparisons as on the interpreter |
+| `list.pop(i)` removed the last item (VM); `insert(-1, x)` made key "-1" (interpreter) | index ignored / not normalised | both fixed, negative indices on both |
+| `map.clear()` made the map a list | `__len__` written unconditionally | lists stay lists, maps stay maps |
+| `--trace` lost the uncaught exception | RAII guard closed the file inside the `try` | guard moved outside |
+| IDE terminated on a syntax error | `launch_ide` did not catch `SyntaxError` | caught and reported with location |
+| Jobs whose output ended in `\n` never finished | `os_exec` strips trailing newlines; byte offset drifted | line-counted polling with a sentinel; subshell for `exit N` |
+| Translucent rounded fills had dark corners | corner circles overlapped the body rects | scanline fill |
+| 787 KB kept per keystroke, 3.45 KB per idle frame | literal strings and one-char strings made per evaluation; `__parent_class__` string per method call; per-key autocomplete rebuild; paint-time list literals | interning; native `fuzzy_rank`; caches keyed by line text |
+| Menus could not be switched by hovering | dismiss layer registered above the menu bar | bar re-registered above it |
+| Unhandled Quick Input keys reached the editor | no `qi` branch in focus routing | added |
+| Inputs had no caret or selection | append-only string fields | `LineEdit` for every input |
+
+New: `fuzzy_score`/`fuzzy_positions`/`fuzzy_rank`, `file_mtime`, allocation
+columns in `--profile`, `NY_PROFILE_OUT` for the IDE, `tools/sweep.py`,
+`tools/ide_lint.py`, `tools/ide_memprobe.py`, `examples/vm_audit42`–`45.ny`.
+
+## Round 74 — responsive IDE, Code::Blocks features, and every layer under it
+
+Full detail in `HANDOFF.md`:
+- §0e: the IDE, engine speed and the build
+- §0f: OS
+- §0g: threads and async
+- §0h: nytorch
+- §0i: values and builtins
+- §0j: exceptions, classes, scope and syntax
+
+Final state: the both-engine sweep has 202 runs and 0 not-ok runs, the
+first with no failing run on either engine. `ide_e2e` passes 354 of 354.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| A one-line call cost 20 µs (interpreter) / 70 µs (VM) | every `return` threw a C++ exception, and every `break`/`continue` threw a `std::string` | pending-flow flag on the interpreter; `RETURN_VALUE` returns from `run_loop` |
+| `while` swallowed every exception in its body (interpreter) | a catch-all around the body | rethrow what is not break/continue |
+| Resizing never relaid out the IDE | an inherited method read as a value gave `none` | MRO walk in `evalAttribute` |
+| 381 ms per keystroke in an 1,800-line file | completion rescanned the document; the syntax check spawned an interpreter; Myers diff ran in the painter; search read every file in script | native `text.cpp` services and a completion index |
+| Completion, replace, paste over a selection, format and case change each took two undo steps | a delete and an insert recorded as separate groups | `open_group`/`close_group` |
+| Ctrl+wheel zoom never worked | wheel events carried no modifiers | modifiers on wheel events (gui.cpp and the stub) |
+| `echo $GREET` in a user tool printed nothing | `K=v cmd` expands `$K` before the assignment | `export K=v;` first |
+| The UI drew at double size on Retina / scaled Wayland | metrics were scaled by the display scale while the window was in points | high pixel density; the window works in pixels |
+| Background threads froze while a GUI window idled | `SDL_WaitEventTimeout` held the GIL | released around the wait |
+| `test_nytorch17` failed about 4% of runs | the prune threshold `‖w‖·s/n` sometimes pruned nothing | exact magnitude pruning |
+| `Queue`/`PriorityQueue`/`Timer` depended on import order | defined in both `stdlib.ny` and `thread.ny` | one definition; `tools/ny_classcheck.py` |
+| `vm_audit24`/`43` failed only in parallel sweeps | both engines' runs shared one temp path | per-run paths |
+| VM typed `except` missed errors raised in callees | the exception object was lost on unwind | exceptions carried as objects |
+| Undefined names, missing methods and bad calls gave `none` | no checks | NameError / AttributeError / TypeError |
+
+New:
+- **IDE:** `ide_tools.ny` (Code::Blocks features, split editor, column selection).
+- **Natives and runtimes:** `src/builtins/text.cpp`, the OS layer (`os_proc.cpp`, `os_time.cpp`), `NyConc`, `NyTensor`, and the nypy value libraries.
+- **Tools:** `tools/ny_classcheck.py`.
+- **Tests:** `vm_audit46`–`54`, `60`, `61`.
+
+## Round 75 — memory, lazy generators, strict reads, real SDL3, HiDPI, Windows
+
+Full detail in `HANDOFF.md`:
+- §0k: reference counting and a cycle collector on both engines (and `GC_NOTES.md`)
+- §0l: lazy generators on the interpreter; the VM's generator protocol completed
+- §0m: strict attribute and key reads, `?.` / `??`, the scope ruling, suffix literals
+- §0n: real SDL3, HiDPI on both of SDL3's models, every test in the sweep, the Windows build
+
+Final state:
+- **Sweep:** 350 runs, 0 not ok, on Linux (both engines, 0 regressions against round 73's build) and on Windows (the MinGW build under Wine).
+- **`ide_e2e`:**
+  - On the stub: 365 of 365 at 1×, at 2× in the macOS/Wayland model and at 2× in the Windows/X11 model.
+  - On real SDL3 under X11: 357 of 357 at 1920×1080 and at 4K 200%. The 8 missing checks are the live-scale checks, which only the stub can drive.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| The interpreter never freed a container (598 MB for 200k literals; `test_nytorch15`/`16` peaked near 1.1 GB) | no reclamation at all: values were raw pointers kept forever | exact reference counting plus a generational cycle collector (trial deletion) on both engines; 11 MB, 80 MB and 151 MB |
+| The VM leaked every cycle (100k self-cycles: 445 MB) and crashed dropping a 200k-node list | `shared_ptr` alone; the recursive destructor overflowed the stack | the same cycle collector over the VM's containers; iterative freeing |
+| An infinite generator hung the interpreter; `send()` acted like `next()` | the body ran to completion into a list before the first value | stackful coroutines (hand-written switch on x86-64/AArch64, pooled fibers on Windows) with the full protocol; genexps, `zip`/`map`/`filter`/`enumerate` lazy |
+| The VM crashed with SIGSEGV at ~1,400 frames of recursion | no depth check | RecursionError at 1,000 frames or at the native stack's floor |
+| A misspelt attribute or dict key read as `none` and failed far away | lenient reads, which the GUI library relied on | AttributeError / KeyError, as Python; absence handled on purpose with `?.`, `?[`, `??`, `??=`, `getattr`, `hasattr`, `.get`; every library, the IDE and the tests migrated (found with `NY_LENIENT_READS=log` and `tools/ny_attrcheck.py`) |
+| `undefined` compiled to nothing on the VM | no constant for it | a value distinct from none on both engines |
+| `global x` in a function did not create `x`; `1.1k` was a float | undecided rulings | plain assignment rebinds the nearest binding, `var`/`let`/`const` declare, `global` names the module variable; suffix literals are ints when whole |
+| A 200% X11/Windows display got an 800×480 workbench; a Retina Mac would have drawn it at half size | window sized in pixels, drawn at the content scale | layout-unit windows (flag 16) drawn at the window's display scale; `scale` events |
+| HiDPI tests passed in a model no platform has | the stub scaled pixels and points at once | `NY_STUB_DPI_MODE=points` (macOS/Wayland) / `=pixels` (Windows/X11) |
+| Nothing had ever run on real SDL3 | only the stub was built | `tools/build_sdl3.sh`; the scripted-input / display-list harness on the real backend; real-pixel PNGs |
+| Text mis-kerned on real SDL3 | SDL_ttf built without HarfBuzz | vendored HarfBuzz, as releases are |
+| Windows: every run with redirected output exited at once with code 6 | `setupConsole` called `exit(GetLastError())` when stdout was not a console | VT processing only on a console; never exits |
+| Windows: integers above 2^31 wrapped | casts through `long`, 32 bits on LLP64 | `long long` / `bigint` everywhere |
+| Windows: the IDE's Run, Build, terminal and git refresh did nothing | `os_spawn` and friends raised "not supported" | a Win32 process layer: CreateProcessW, Job Objects, non-blocking pipes, POSIX `sh` discovery, `merge=` |
+| Windows: `\r` at the end of every line read from a Windows program's file; mtimes to the second | binary reads for text handles; the CRT's `stat` | universal newlines for text handles; FILETIME times |
+| Windows: the Code::Blocks build did not link | seven units missing from `nython.cbp` | added; the generators build for Vista; an 8 MB main stack as on Linux |
+| Threads that lock in a loop crawled (8 × 10k lock/unlock: 6 s; over 20 s under Wine) | lock convoys: the GIL switched out lock holders, and unlock handed the mutex to a thread still waiting for the GIL | a GIL hand-over waits for the holder's unlock; competitive succession for mutexes; 0.8 s |
+| `gui_poll_events` handed out a freed list | a static empty list held no reference | found by the collector's invariants; fixed |
+| A property's getter could be freed and its identity reused by the next `def` | `@prop.setter` dropped the getter's reference | found by vm_audit53 under the collector; fixed |
+| Seven older `*_test.ny` files failed; `rl_test` read a stray `/tmp` file | never swept; stale expectations | every `*_test.ny` in the sweep; own temp files; legacy tensor ops follow NumPy's type promotion |
+| `test_nytorch10`/`12` failed only in parallel sweeps | both engines shared one on-disk store under `/tmp` | per-run directories |
+| The Code::Blocks build did not link after the memory-management merge (undefined `nygc::*` / `vmgc::*`) | `src/NyGC.cpp` and `src/VMGC.cpp` were never added to `nython.cbp`; the cross build compiled `src/*.cpp` with its own flags, so it could not notice | added; the cross build now builds from `nython.cbp` itself (`tools/cbp.py`), and every sweep runs `cbp.py check` |
+| A 32-bit build (w64devkit i686): `unsigned __int128` does not exist; `NyOrderedMap` shifted a 32-bit `size_t` right by 32 (undefined) | written and tested for 64-bit only | Mersenne reduction in 64-bit arithmetic for `hash()` (still Python's values); a 64-bit hash on every platform; `ARCH=i686` cross build and sweep |
+| ~580 warnings in a Code::Blocks build | trigraph `"??="` literals; the shift above; `-Warray-bounds` false positive on MinGW's `NtCurrentTeb()` (GCC bug 99578); a maybe-uninitialised `cp` in NyJson | `"?\?="`; the 64-bit hash; silenced in NyCoro's Windows code only; initialised - 0 warnings under the project's `-Wall -O2`, 32- and 64-bit |
+| 64-bit Windows at the project's `-O2`: a raise from deep recursion inside a generator crashed; any exception through `evalCall` restored XMM6/XMM7 from the wrong address | `__builtin_frame_address(0)` inlined into the engines forced a frame pointer set before the stack allocation, and GCC records the XMM saves relative to the final RSP while the Windows unwinder reads them relative to the frame pointer | `nycoro::stack_position()` (the address of a local); `tools/pe_unwind_check.py` rejects such functions after every 64-bit cross build |
+| UBSan: a tuple literal read its elements through a `ListNode` pointer; `-2**63` negated in `long long` | a cast to the wrong node type; a signed negation that overflows | read through `TupleNode`; negate in the unsigned type (vm_audit60 checks -2**63) |
+
+New:
+- **Runtimes:** `NyGC`/`NyHeap` and `VMGC`; `NyCoro`/`NyGen`; `NyMembers.hpp`; `gui_harness.cpp`.
+- **Builtins:** `gc_*`, `mem_rss_kb`, `weakref`, `thread_wait_count`, `gui_display_density`, `gui_video_driver` and `os_shell`.
+- **Tools:** `tools/build_sdl3.sh`, `tools/cross_windows.sh` (`ARCH=i686` too), `tools/cbp.py`, `tools/pe_unwind_check.py`, `tools/ny_attrcheck.py`, `tools/lsan.supp` and `make asan`.
+- **Tests:** `vm_audit55`–`57` and `62`, and `gui_tests/test_28`–`29`.
+
+## Round 76 — the "Not done" lists closed
+
+Full detail in `HANDOFF.md` §0o. New tests: `vm_audit63` (59 checks) and `vm_audit64` (26), plus new sections of `vm_audit48` (rwlock) and `vm_audit49` (tasks as coroutines). The new checks fail on round 75's build: vm_audit64 12 of 26 on the interpreter and 10 on the VM; vm_audit49 2002 OS threads for 2000 tasks, and a bare `raise` that re-raised the other task's exception.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `const K = 5` then `K = 6` was allowed | nothing checked it | a static scope pass over every parsed program (`src/NyScope.cpp`, both engines): assigning, augmenting, deleting, re-declaring, unpacking into or looping over a const is a SyntaxError before the program runs |
+| `nonlocal zz` with no enclosing `zz` rebound a global or made a local | not checked | SyntaxError, as Python (also at module level, and together with `global`) |
+| A walrus, `except ... as` or `with ... as` of a `global` name bound a local | the parser marks only plain variable nodes | the scope pass marks those binding forms; both engines bind the module's variable |
+| `fact = lambda n: ... fact(n - 1)` raised NameError on the interpreter; `[lambda: i for i in range(3)]` gave 0, 1, 2 | a lambda copied every visible binding when it was made | it closes over its scope by reference, as `def` does; defaults evaluated when it is made |
+| `print(a(), b())` printed `a`'s output, then `a()`'s value, then `b`'s output | evaluated and printed one argument at a time | all arguments evaluated first |
+| Every syntax error said column 2; the IDE's diagnostics landed at the start of the line | `Location::reset` ignored its column argument, so each token restarted at column 1 | tokens located where they start; columns count characters (tab and UTF-8 sequences are one); the caret is placed by characters |
+| `isinstance(g, "generator")` was false for a generator; `zip(gen).send(1)` acted as `next()`; lazy iterators printed as `<generator object zip>` | not handled | true for every lazy iterator; AttributeError for send/throw; Python's repr (`type()` stays "generator": Nython's dict is the type "map") |
+| 6 threads writing under an rwlock: 33,922 thread sleeps for 18,000 locks (17,699 on the VM) | a waiter's predicate took the lock as it woke, before it had the GIL; every unlock woke every waiter | competitive succession, as for the mutex: one writer heir or all readers woken, the lock taken by a running thread (144 / 61 sleeps) |
+| 2000 async tasks were 2000 OS threads; each switch was a thread hand-off | a task was a thread passed a baton through the GIL | a task is a coroutine on its loop's thread (2000 tasks: 1 thread; 0.60 s -> 0.23 s, VM 0.31 s -> 0.07 s; switches 3-12x faster); a task blocking inside a generator relays out through it |
+| A bare `raise` in one thread or task could re-raise another's exception | the interpreter's exception stack (and owner stack) were shared by all threads | a per-thread interpreter state swapped with the GIL and at task switches (`InterpEngine::State`) |
+| Every object ever used as a dict key - or only looked up as one - lived until the program ended (both engines) | the key table held it | full collections count the table's references as the dicts': objects no live dict uses are freed, cycles through keys included |
+| A cycle through a suspended generator leaked on the interpreter; the VM freed it without running its finally blocks | the generator's references were invisible; the VM just cleared it | the collector sees the generator's record, and closes a suspended generator found unreachable before freeing it (PEP 442's order), on both engines |
+| `f = xs.append` kept `xs` alive forever (2000 reads: 2000 lists) | bound builtin members were never freed | heap objects (`nyheap::BMember`) freed with their last reference |
+| `mem_rss_kb()` read 0 on Windows | `/proc` only | the working set through `K32GetProcessMemoryInfo` (psapi.dll's on Vista) |
+| IndexError read "index 5 out of range (length 2)" on the interpreter, "list index out of range" on the VM | two messages | Python's, on both |
+
+| VM: after `import nytorch`, `repr("a\nb")` was unescaped, `ord("é")` gave 195, `sorted(gen)` returned `[<generator>]` | the import registered an old block of 171 general builtins again, over the current ones | the builtins are registered once, at start-up; the import is an acknowledgement |
+| The Windows sweep under Wine failed a different network or file test each run (a hang to the timeout, an empty recv) | the sweep runs a file on both engines at once, and four tests used fixed ports or `/tmp` paths | port 0 read back with `socket_getsockname`; per-pid paths |
+| Windows: a second program could bind a port another was listening on, both receiving connections | `socket_bind` set SO_REUSEADDR, which means that on Windows | not set on Windows (its default already rebinds past TIME_WAIT), as Python's `create_server` |
+| `IdeIntegration.format_code` never returned | its loop never advanced | fixed |
+| Two IDEs (or a test run on both engines at once) ran each other's REPL/command-line programs | the toolchain's staged files were `nyide_<n>_<name>` with `n` from 1 in every process; untitled runs `nyide_run_<n>.ny` | process / session id in the names; staged files removed after the run |
+| 32-bit Windows: 2000 async tasks raised MemoryError | 1 MB of stack address space per task (2 GB in all) | 256 KB task stacks there; deep calls continue on extension stacks on both engines (the VM's `run_frame`, as the interpreter's generators). Under Wine a fiber still reserves 1 MB at least (about 1800 tasks on 32-bit); vm_audit49 sizes its count by the new `sys.maxsize` |
+| A builtin called near the floor of a small coroutine stack crashed | `dispatch_io`/`dispatch_network` (and the pipe drain) held a 64 KB buffer on the stack, reserved on every call of the dispatcher | heap buffers |
+
+Removed: `src/GarbageCollector.cpp`, `include/GarbageCollector.hpp`, `include/GarbageCollectorConfig.hpp` (unused since round 75) and `include/Evaluator.hpp` (never used; the only caller of the old allocator).
+
+## Round 77 — bytes, the network stack, signals, modules, the CLI, Python compatibility
+
+Full detail in `HANDOFF.md` §0p. New tests: `vm_audit65` (bytes, 149 checks), `vm_audit66` (signals, 33), `vm_audit67` (modules/async, 44), `vm_audit68` (sockets, 32), `vm_audit69` (sets, 40), `vm_audit70` (HTTP/WebSockets/TLS/libraries, 79), `vm_audit71` (CLI/argparse/stdio/program input/reflection, 97), `vm_audit72` (Python compatibility, 53 - passes under python3 too). Sweep at the end: 371 runs, 0 not ok.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `b"ab"` was a string; `"\xe9"` was the raw byte 0xE9 | no bytes type; escapes produced bytes | `bytes`/`bytearray` on both engines (`NyBytes.hpp`); escapes follow Python |
+| Ctrl+C killed the process, skipping every finally block | no signal handling | SIGINT raises KeyboardInterrupt (status 130); `signal` module; waits resume after a handler (PEP 475) |
+| A blocking socket call froze every thread; inside a task it froze the loop | the GIL was held; no poller | the GIL is released; tasks park on their loop's poller (colorless I/O) |
+| `http_get` deadlocked against a server thread in the same program | a duplicate implementation in string.cpp held the GIL | one implementation, GIL released, https/IPv6/chunked/redirects |
+| `import m` leaked m's names into the importer and saw the importer's | modules were included | a module runs in a scope of its own; classes named `m.Class`; packages |
+| `import sys` found Linux's `/sys` as a package | any directory counted | a namespace package must hold `.ny` files |
+| The VM's sets were lists deduplicated by repr | no set type | a real set with typed keys on both engines |
+| `nython -c`, `-m`, `-i`, `-` did not exist; `exit()` killed the process on the spot | no CLI; exit called std::exit | the CLI; `exit()`/`sys.exit()` raise SystemExit |
+| `def f(**kw)` saw `f(a=1, b=2)`'s keywords as `{'b': 2, 'a': 1}` on the interpreter | an unordered map | `nyrt::OrderedKw` (PEP 468) |
+| `locals()`, `globals()`, `vars()`, `dir()` returned none | placeholders | implemented on both engines |
+| `deque([1, 2])` was `[]`; `Counter`/`defaultdict`/`OrderedDict` likewise wrong | native stubs | `lib/collections.ny` |
+| `[*a, 3]`, `{**d}`, `x: int = 5`, `f"{x=}"`, `def f(a, /, b)` were syntax errors | not parsed | parsed (lowered to prelude helpers / dropped annotations) |
+| A class made in a function called twice: instances of the first used the second's methods and closures | one class per class statement (classes keyed by name) | each execution makes a new class (`Name#n`, shown as Name); bases resolved through the scope |
+| `obj[1:3]` never reached a user `__getitem__`; `slice()` returned none | slices were `.slice()` calls | a prelude `slice`; the dunders receive it; slice objects index builtins |
+| `eval`, `exec`, `compile` did not exist | — | both engines, with namespaces |
+| `2j` read none; `print(0j)` was a syntax error | no complex type; the lexer's `0j` path swallowed the next character | a prelude `complex`; `0j` lexed by the decimal path |
+| `o.x = 1` never reached a user `__setattr__`; `threading.local()` raised NameError | not dispatched; it called natives that never existed | `__setattr__`/`__delattr__` dispatched (cached per class); `threading.local` built on them |
+| VM: `super().missing()` returned none | silent | falls back to `object`, else AttributeError |
+| VM: `self.__class__()` raised AttributeError | the method-call path did not know it | constructs the object's class |
+| `f.__doc__` raised AttributeError; `help()` did nothing | docstrings not kept | the parser records them; `__doc__` on both engines; `help()` prints them |
+| `--profile` listed the prelude's stream objects | profiling started before the prelude | the table is cleared after it |
+| A program run from the IDE got EOF at its first `input()`, and its prompt never appeared; the Terminal refused input while a command ran | the IDE closed the program's stdin (`input=""`) and showed output by whole lines (a prompt has no newline) | `os_spawn(..., stdin=true)` + `os_proc_write`/`os_proc_close_stdin`; with `NY_INPUT_REQUEST` set a program announces each read of stdin (an OSC mark on stdout, `nyconc::announce_input_request`); the Output panel shows the pending prompt with an input line, focused when the program asks; the Terminal sends typed lines to a running command; Ctrl+D ends input |
+| Windows: every line `os_run`/`os_exec`/`os_proc_read` returned ended in `\r` | Windows programs write `\r\n` and it was passed through | read as Python's text mode reads it (universal newlines), a split `\r\n` carried across reads |
+| The Windows cross-build no longer compiled | `ErrMode::STRICT/IGNORE/REPLACE` collided with Windows headers' macros; a POSIX `closedir` and lambdas without a return on the Windows paths | renamed (`ErrMode::Strict/...`), Windows paths fixed |
+| `def f(a, /, b)` accepted `f(a=1, b=2)`; `import string`, `from re import match` were syntax errors | positional-only parsed and dropped; keywords as module names | enforced with Python's TypeError; module names may be keywords; `from m import (a, b as c,)` |
+| `f.__annotations__` raised; `x: int = 5` in a class kept no record | annotations parsed and dropped | kept as Python does (functions, class bodies, modules; text under `from __future__ import annotations`; unresolvable forward references kept as text) |
+| `__new__`, `__init_subclass__`, `__set_name__`, `__class_getitem__`, `metaclass=` were ignored | not implemented | PEP 487/560/604 and metaclasses on both engines (type.__new__ adopts the class the statement built) |
+| `x.__add__` returning `NotImplemented` raised NameError; the reflected method was never tried | no NotImplemented | the reflected-operator protocol, subclass priority, TypeError when every method declines |
+| VM: `V(1) == W()` gave True/False instead of `__eq__`'s value; `V(1) < 5` compared garbage | the result was coerced to bool; ordering fell back to VMVal order | the dunder's own value; TypeError |
+| `class M(type)`: `M.__mro__` was `(M,)`; `A.__subclasses__()` raised | builtin bases and object left out | `(M, type, object)`, `__bases__` a tuple, `__subclasses__()`, `mro()` |
+| `type(5) is int` was false; `type(x)(v)`, `{int: f}[type(x)]`, `(5).__class__` failed | type() returned strings | type objects that still `==` their legacy names; `typeof(x)` is the name |
+| `int is int`, `C is C` were false | a type on the left was tested for membership in the right | identity |
+| VM: `{int: 1, str: 2}` had one entry | natives had no key of their own | keyed by what they are |
+| VM: `def size(cls)` as a property getter or metaclass method got no argument | only a first parameter named `self` made a method | the object is the first argument |
+| There was no `re`; `re.match(r"(a+)+$", "a" * 30 + "b")` does not finish in 10 s under CPython 3.11 | — | `re` on a native engine with selective memoization (Davis et al., IEEE S&P 2021): well under a second on both engines |
+| Windows: csv files written with `open(..., newline="")` had `\r\r\n` line ends | `newline=` was ignored and the C runtime translated `\n` underneath | Python's `newline=` on both engines; an explicit one opens the handle raw |
+| `open(p, "w", -1, "utf-8")` took -1 as the encoding | encoding was the third parameter | Python's order: file, mode, buffering, encoding, errors, newline |
+| Windows: `datetime.fromtimestamp(-1.5, timezone.utc)` raised OverflowError | `gmtime_s` refuses negative times | UTC computed from the calendar (`utc_tm`), every platform |
+| Windows: `os.utime(directory, ...)` raised PermissionError | the CRT's `_utime` cannot open a directory | `SetFileTime` with backup semantics, to 100 ns |
+| Windows: `time.localtime(-3600)` / `datetime.fromtimestamp(0)` raised OverflowError | `localtime_s` refuses times before 1970; datetime's fold probe asked for one | the zone's standard bias applied to the UTC arithmetic; the probe skipped near the epoch on Windows, as CPython |
+| Windows: vm_audit76 failed on symlinks and every subprocess check | an unprivileged account cannot make symlinks; the checks ran `sh`, `echo`, `cat` | symlink checks only where one can be made; subprocess checks run a Python child, POSIX tools only where `sh` exists |
+| Windows: an asyncio program that served one connection never returned from `asyncio.run` (vm_audit67 hung under Wine) | a task waiting on a socket was not `blocking`, so cancelling it did nothing; Linux's `poll` woke it anyway (POLLNVAL on the closed socket), `WSAPoll` failed the whole call and the reactor spun | the waiting task is `blocking`; a failed `WSAPoll` is retried socket by socket to report the invalid one |
+| Windows: `time.strftime("%c")` gave `1/5/2024 3:04:05 AM`, `%Y` gave `0001`, an unknown directive aborted the program | the C runtime's strftime follows its locale and its own rules | strftime implemented in Nython's runtime with glibc's C-locale output and flags, the same on every platform |
+| Windows: vm_audit76's cleanup raised PermissionError | `open(p).read()` left the file open until the program ended, and Windows cannot delete an open file | `NythonFile.__del__` closes a file dropped without `close()`, as CPython |
+| Without OpenSSL, `urlopen("http://...")` raised SSLError (vm_audit70 then hung waiting for its server threads) | every opener's `HTTPSHandler` made a TLS context in its constructor | the context is made by the first https request |
+| Windows: `urlopen("file:" + pathname2url(p))` failed ("file not on local host") | `pathname2url`/`url2pathname` only quoted: a drive letter read as a host | CPython's `nturl2path` on Windows |
+| Windows: a WebSocket client never saw the server's Close frame after a protocol error (ConnectionResetError) | the server closed the socket with the bad frame's bytes unread, so TCP sent a reset, which discards the peer's unread data | a lingering close: half-close, drain the peer's input briefly, then close |
+| Windows: "Exception in thread: AttributeError: 'NoneType' object has no attribute 'accept'" when a server stopped | accept loops re-read the socket attribute that `stop()` sets to none on another thread | each loop reads its socket once |
+| Windows: vm_audit76 failed 19 checks | the test expected `/` in paths, POSIX permission bits and LF-only file sizes | portable expectations (CPython's results on Windows) |
+| VM: two functions each defining `class P` shared one class (`f1()().m()` ran f2's method) | classes were keyed by name | a second class statement of a name is registered as `Name#n`, both engines |
+| `isinstance(5, object)` was false | `object` was not a base of builtin values | true for every value and type |
+| A class defining `__eq__` only stayed hashable | `__hash__` was inherited | `__hash__ = None` as CPython |
+| `C.__dict__["p"]` gave a function (interpreter) or a map (VM); `C.p` called the getter | properties were native tags | property/staticmethod/classmethod are prelude objects, unwrapped when the class is made |
+| `dir(obj)` lacked class attributes; `super(C, obj).m()` outside a method returned none | `dir` listed instance fields only; super needed a method frame | CPython 3.11's `dir`; two-argument super on both engines |
+| VM: `type(xs.append)` read `'map'`, `[].append.__name__` raised | builtin methods had no type | `builtin_function_or_method` / `method` with Python's reprs and attributes |
+| `type(None)`, functions, generators gave strings | no type objects for them | runtime type objects (`NoneType`, `function`, `generator`, `zip`, ...), still `==` the legacy names |
+| `d = {"get": 1}; d.get("x")` called the key | keys were read before a dict's methods | the methods win; other names still read keys |
+| `1 in 5` was false; `1 < "a"`, `None < 1` compared | no type check on membership and ordering | TypeError with Python's messages, both engines |
+| `str(KeyError("k"))` was `k`; a subclass's `self.msg` was overwritten by `super().__init__` | exceptions kept a legacy `msg` and printed their first argument | CPython's str/repr/args per class; `msg` removed |
+| `except FileNotFoundError as e: e.filename` was missing | native OSErrors carried only a message | errno/strerror/filename/filename2 parsed back from the OS layer's messages; `OSError(2, "x")` is a FileNotFoundError |
+| VM: `next(5)` returned none; `iter(f, sentinel)` missing | | TypeError; a lazy `callable_iterator` |
+| `f"{obj}"` ignored `__format__` | the empty spec skipped it | `__format__` called, `object.__format__` rejects a spec |
+| `os.stat(p)` was a dict | no structure sequences | `os.stat_result`, `terminal_size`, `times`, `uname` |
+| `exec(src, ns)`: functions defined there did not see later changes to `ns`; `def __init__` was not exported | the namespace was copied in and out | `ns` is the code's live globals |
+| VM: printing a two-list cycle overflowed the stack | no recursion guard in repr | `[...]` / `{...}` / `(...)` as CPython |
+| `new = 1`, `def f(ref):`, `obj.self` were syntax errors | Nython's extra keywords were reserved everywhere | soft keywords: a keyword only where its construct starts (vm_audit84) |
+| `import os, sys`, `del a, b`, `class K(weakref.ref)`, `lambda *, k: k` were syntax errors | the grammar lacked these forms | the forms of CPython's grammar, both engines |
+| `{}["x"]` as a statement raised nothing; `x = 1, 2` was not a tuple; unpacking ignored counts | expression statements and target lists were not Python's | evaluated, tuples, counts checked with Python's messages |
+| `1 < x < 3` chains, `@=`, `\N{...}`, PEP 614 decorators, `except*` were missing or wrong | | comparisons one precedence level; in-place dunders tried first; 138,552 Unicode names (compressed table); exception groups (PEP 654) |
+| `class MyInt(int)` instances held no value; `int.__new__(cls, v)` did not exist | builtin bases were names only | the value in a hidden payload field, a prelude mirror class per builtin type loaded on first use (vm_audit85) |
+| `__getattribute__` was never called; `obj.__dict__` was a copy; `__prepare__` was ignored | | dispatched (no cost until a class defines one); a live `_NyInstanceDict` view; the body's bindings go through the prepared mapping, in order |
+| VM: `self = expr` left the value on the stack; `|=` on a set subclass ignored `__ior__` | no store for a self target; augmented operators never tried in-place dunders | `STORE_SELF`; `INPLACE_TRY` before the binary operator |
+| A tuple never matched `case (a, b):` | sequence patterns tested for a list | `isinstance(x, (list, tuple))` |
+| After merging vm_audit85 and 87: `format(Mixed.A)` for `class Mixed(str, Enum)` gave `'a'`, not `'Mixed.A'` | f-strings now call `__format__` (87), and the str mirror class (85) supplies one that enum's "is this the data type's method?" equality missed (`str.__format__` read off the type is a native) | enum decides by where the method is found in the MRO (`_ny_found_on_data_type`) |
+| Windows: `os.get_terminal_size()` off a console raised an OSError with no `errno` | `[WinError N]` messages were not parsed into fields | `winerror`, `errno` mapped from it (CPython's table), `[WinError N]` kept in `str(e)`, both engines |
+| No abc, enum, dataclasses, typing, types, inspect, keyword, weakref, warnings, traceback, numbers, collections.abc | — | written over the class machinery, CPython's algorithms and messages (vm_audit74, 81-83) |
+| `e.__traceback__`, `sys.exc_info()`, `raise X from Y`'s `__cause__` did not exist; an uncaught error showed one line | exceptions carried a location string only | real traceback objects on both engines; Python's traceback block before the `[Nython]`/`[VMError]` line |
+| `sys.exc_info()` could return another thread's (or a suspended generator's) exception | `handling_obj_` was not swapped with the rest of the per-thread state | saved and restored with it |
+| VM: an exception's `__excN__` variable stayed set after its handler | never cleared | cleared when the exception leaves the clause |
+| `f(__x__=1)` never reached parameter `__x__`; `C.__dict__` and `vars(obj)` lacked dunder names | dunder keys were stored raw and read as internal markers | keys encoded as dict keys (`key_of_str`) |
+| A program's top-level `list = []` rebound `list` inside every imported module | module scopes chained to the program's globals | they start from a snapshot of the builtins and prelude |
+| `"""x "y" z"""` lost its inner quotes | the lexer dropped a `"` inside a triple-quoted string | kept |
+| `hash(obj)` kept `obj` alive until a full collection | `hash` entered it in the key-object table | not entered |

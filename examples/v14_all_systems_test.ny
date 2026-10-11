@@ -49,9 +49,10 @@ t("write_read", cat("/tmp/ny_test_file.txt"), "hello nython")
 t("exists_t", exists("/tmp/ny_test_file.txt"), true)
 t("exists_f", exists("/tmp/no_such_file_xyz"), false)
 t("pwd", len(pwd()) > 0, true)
-t("env", len(env("HOME")) > 0, true)
+# PATH: set on every platform (Windows has no HOME)
+t("env", len(env("PATH")) > 0, true)
 var files = ls("/tmp")
-t("ls_type", type(files), "list")
+t("ls_type", type(files) == "list", true)
 t("ls_len", len(files) > 0, true)
 
 print "=== ACTIVATION FUNCTIONS ==="
@@ -79,7 +80,7 @@ t("sha256_len", len(sha256("hello")), 64)
 print "=== ALL MODULES ==="
 import math
 t("pi", PI > 3.14, true)
-t("sqrt", sqrt(25), 5)
+t("sqrt", sqrt(25), 5.0)
 import collections
 var wc = Counter("a b a a".split(" "))
 t("counter", wc["a"], 3)

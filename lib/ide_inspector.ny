@@ -40,7 +40,23 @@ class Inspector:
 
     # ── type identification ──────────────────────────────────────────────────
     def type_of(self, v):
-        return type(v)
+        # the names the rows show and the views compare against: type()
+        # gives type objects since round 77 (type(5) is int)
+        var t = type(v)
+        if isinstance(t, "str"):
+            return t
+        # None, functions, bound methods, builtins and generators have type
+        # objects of their own too (round 77): their legacy names, which
+        # those type objects equal
+        for k in ["none", "function", "builtin", "generator"]:
+            if t == k:
+                return k
+        var n = t.__name__
+        if n == "str":
+            return "string"
+        if n == "dict":
+            return "map"
+        return n
 
     def icon_for(self, v):
         var t = self.type_of(v)
@@ -84,8 +100,7 @@ class Inspector:
     def truncate(self, s, n):
         if len(s) <= n:
             return s
-        # len() is characters and slicing is bytes, so a character count is
-        # always <= the safe byte count; slicing at it cannot overrun.
+        # len() and slicing both count characters.
         return s[0:n] + "…"
 
     def has_control(self, s):
