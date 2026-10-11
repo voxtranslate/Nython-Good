@@ -5620,7 +5620,7 @@ Full detail in `HANDOFF.md` §0q, §0q2, §0q3. New tests: `vm_audit88` (the dat
 
 ## Round 79 — binary data and serialization, tracing and profiling, text formats
 
-Full detail in `HANDOFF.md` §0r. New test: `vm_audit93` (zlib, archives, pickle, `__slots__`, `__class__` assignment, 176 checks; passes under python3 too).
+Full detail in `HANDOFF.md` §0r, §0r2. New tests: `vm_audit93` (zlib, archives, pickle, `__slots__`, `__class__` assignment, 176 checks), `vm_audit94` (text formats and utilities, 162), `vm_audit95` (decimal, 2050); all pass under python3 too (94: the 152 that are not Nython-only).
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -5629,4 +5629,13 @@ Full detail in `HANDOFF.md` §0r. New test: `vm_audit93` (zlib, archives, pickle
 | `obj.__class__ = Other` created a field | no class switch | CPython's layout checks, then the instance retagged (interpreter) / every value rewritten (VM) |
 | `P().__reduce_ex__(2)`, `__getstate__()` did not exist | `object` had no reduce protocol | CPython's `reduce_newobj` / `object_getstate` |
 | A program's `let list = []` broke `abc.ABC` once slots were processed | prelude chunks load lazily into the program's globals | the slots chunk calls builtins through unrebindable names |
+| No decimal, difflib, shlex, configparser, tomllib, html, xml, ipaddress, graphlib, contextvars, concurrent.futures, zoneinfo, mimetypes | — | CPython's pure-Python modules adapted; an expat-compatible XML parser written in Nython |
+| `mod.x = v` from outside was not seen by the module's own functions; a module's `global` rebinding was not seen by importers | a module ran in a scope copied into its namespace at the end | the namespace map is the module's scope (both engines) |
+| `"a b c".split(maxsplit=1)` split everything | str methods dropped keyword arguments (both engines) | CPython's keyword slots and messages (`nypy::str_kw_slot`) |
+| `"a" f"{x}"` was a syntax error; a comment indented differently from the code was a syntax error | the lexer joined only plain strings; comment-only lines took part in indentation | f-strings join; comment-only lines are ignored for blocks |
+| `_pydecimal`'s `a--n//a>>1` computed garbage (ln/log10/** wrong) | `--` after an operand was a postfix decrement | `x--y` is `x - (-y)`, `x++y` is `x + (+y)` |
+| `except _Stop:` caught everything | a leading-underscore name was read as Nython's catch-all binding | judged as a type |
+| for-loops over a class with only `__getitem__` raised "not iterable" (interpreter) | no sequence protocol in `evalFor` | `__getitem__` until IndexError |
+| VM: `{"d": date(1,2,3)} == {"d": date(1,2,3)}` was false | dict values compared by identity | compared with `==` |
+| An asyncio task saw the context of whoever ran last | no per-task context | each task starts in a copy of its creator's (PEP 567) |
 

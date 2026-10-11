@@ -373,6 +373,8 @@ These were aligned to match how the IDE calls them:
 | vm_audit87 | 73 | round 77: `in`/ordering TypeErrors, exceptions' str/repr/args and fields (OSError errno/filename, Unicode errors, SyntaxError), runtime errors with their fields, `iter(f, sentinel)`, generator attributes, `__format__`, `os.stat_result`, live `exec` namespaces, recursive reprs (72 pass under python3) |
 | vm_audit90 | 65 | round 78: lazy `range` (CPython's rangeobject.c: big ints, len/OverflowError, indexing, slicing to a range, O(1) `in`, index/count, ==/hash, repr, read-only start/stop/step, `sum` in O(1)), live dict views (set operations, comparisons, isdisjoint, `.mapping`, reversed, "dictionary changed size during iteration"), lazy zip/map/filter/enumerate/reversed (`zip(strict=True)`) - 63 pass under python3 |
 | vm_audit93 | 176 | round 79: zlib (native DEFLATE, CPython-made streams read and Nython-made ones read by CPython, the opt-in optimal parse), binascii, gzip, zipfile, tarfile, pickle byte-identical to CPython at protocols 0-5, copyreg, array, `__slots__`, `__class__` assignment (passes under python3) |
+| vm_audit94 | 162 | round 79: difflib (byte-identical to CPython, plus patience/histogram diffs), shlex, configparser, tomllib (+ dumps), html, xml (an expat-compatible parser in Nython, ElementTree, minidom), ipaddress, graphlib, contextvars per task, concurrent.futures (threads and real processes), zoneinfo, mimetypes - generated from `tools/vm_audit94_spec.py` (152 pass under python3; 10 test Nython-only additions) |
+| vm_audit95 | 2050 | round 79: decimal - the API and 1,981 vectors with CPython's results and flags at precisions 9/16/34 (passes under python3) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -1098,6 +1100,19 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   layout errors) on both engines; `object.__reduce_ex__`/`__getstate__`.
 - Prelude mirror chunks run in the program's globals: call builtins there
   through names a program cannot rebind (`_ny_b_list`, ...).
+
+## Round 79: text formats and utilities (see `HANDOFF.md` §0r2)
+
+- `lib/`: decimal, difflib (+ Nython-only patience/histogram diffs),
+  shlex, configparser, tomllib (+ `dumps`), html, xml (`xml.parsers.expat`
+  is written in Nython), ipaddress, graphlib, contextvars, concurrent.futures,
+  zoneinfo, mimetypes. Most are CPython's pure-Python code, adapted.
+- **Modules are live namespaces** (both engines): `mod.x = v` is seen by the
+  module's own code, a module's `global` rebinding by its importers.
+- contextvars: each asyncio task starts in a copy of its creator's context
+  (`Task::ctx_data` in `src/NyConc.cpp`).
+- Lexer: `"a" f"{x}"` concatenates; comment-only lines never open/close a
+  block; `x--y` is `x - (-y)`. str methods take keyword arguments.
 
 ## Transcripts
 
