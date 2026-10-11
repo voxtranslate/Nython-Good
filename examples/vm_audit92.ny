@@ -123,12 +123,15 @@ var BAD = text_defuse("x = = 1\n")
 check("a syntax error: entry 0 says so", [sorted(BAD[0].keys()), "Unexpected token" in BAD[0]["error"] or "invalid syntax" in BAD[0]["error"]], [["error"], True])
 
 # ── Part 2: a recording, and the questions ───────────────────────────────────
-var exe = "./ny_test"
-if not os_exists(exe):
-    exe = "./build/nython-cli"
+# the running binary (nython.exe under Wine/Windows, where ./ny_test is the
+# Linux build) and the platform's temporary directory
+import sys
+import tempfile
+var exe = sys.executable
 var pid = os.getpid()
-var prog = "/tmp/ny_audit92_" + str(pid) + "_prog.ny"
-var rec_path = "/tmp/ny_audit92_" + str(pid) + ".jsonl"
+var tmpd = tempfile.gettempdir()
+var prog = os.path.join(tmpd, "ny_audit92_" + str(pid) + "_prog.ny")
+var rec_path = os.path.join(tmpd, "ny_audit92_" + str(pid) + ".jsonl")
 write_file(prog, PROG)
 var run = os_run([exe, "--trace", rec_path, prog])
 check("the program ran under --trace", [run["code"] if type(run) == "map" else run.returncode], [0])

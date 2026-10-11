@@ -158,6 +158,21 @@ with python3.13's output.
   check` clean; `ide_memprobe --check` passes.
 - The merge conflicted only in the lexer, where parts A and C made the same
   comment-line fix.
+- Windows 64-bit (under Wine): built, `pe_unwind_check` clean, the sweep 417
+  runs, 0 not ok - after two fixes found there: vm_audit92 launched
+  `./ny_test` (the Linux build) instead of `sys.executable` and hung; and
+  **the debugger kept a recording's file names JSON-escaped** (`C:\\\\users`
+  with doubled backslashes - `_add_step` reads them from the raw line without
+  decoding), so every per-file question (`why_not`, breakpoints by file)
+  missed on Windows paths. Each distinct name is now decoded once, when first
+  seen.
+- AArch64 (qemu-user): vm_audit95 (decimal), 49, 67 pass on both engines;
+  zlib, pickle, array and zipfile give byte-identical output to x86 on both
+  engines (a script compressing at every level/wbits with streaming flushes
+  and the optimal parse, CRCs, pickles at every protocol). Suites that spawn
+  `sys.executable` (46, 92, 93's CLI part, 94's ProcessPoolExecutor) cannot
+  run under qemu-user here: the container has no binfmt_misc, so the AArch64
+  binary cannot be executed directly.
 
 ## 0r2. Round 79, part C — text formats and utility modules (vm_audit94, vm_audit95)
 

@@ -5644,4 +5644,5 @@ Full detail in `HANDOFF.md` §0r, §0r2, §0r3. New tests: `vm_audit91` (settrac
 | `async @staticmethod` failed; nested classes' `__qualname__` was the bare name | the desugared body called itself by a name not in scope; no class qualname | rewritten to an inner function; `Outer.Inner`, `f.<locals>.C` |
 | `eval("a if c else b")` was a SyntaxError (both engines) | the expression-program check did not accept a conditional | accepted |
 | `frame.f_locals["x"] = 5` changed nothing | f_locals was a snapshot | PEP 667 write-through proxy |
+| Windows: the debugger's per-file questions (`why_not`, file breakpoints) never matched | a recording's file names were kept JSON-escaped (`C:\\\\users`) | each name decoded once when first seen |
 

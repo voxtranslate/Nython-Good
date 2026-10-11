@@ -32,6 +32,7 @@ class DebugSession:
         self.depths = []
         self.files = []            # file id per event
         self.file_names = []
+        self._file_raw = []        # each file name as the recording spelled it
         self.out_before = []       # number of output lines emitted before each event
         self.outputs = []
         self.n = 0
@@ -64,6 +65,7 @@ class DebugSession:
         self.depths = []
         self.files = []
         self.file_names = []
+        self._file_raw = []
         self.out_before = []
         self.outputs = []
         self.exception = ""
@@ -116,12 +118,18 @@ class DebugSession:
         var depth = int(string_slice(rest2, 0, comma2))
         var fid = -1
         var k = 0
-        while k < len(self.file_names):
-            if self.file_names[k] == file:
+        while k < len(self._file_raw):
+            if self._file_raw[k] == file:
                 fid = k
             k = k + 1
         if fid < 0:
-            self.file_names.append(file)
+            # the name as JSON wrote it ("C:\\\\a" on Windows): decoded once,
+            # when the file is first seen (round 79)
+            self._file_raw.append(file)
+            var name = file
+            if string_find(file, "\\") >= 0:
+                name = json_decode("\"" + file + "\"")
+            self.file_names.append(name)
             fid = len(self.file_names) - 1
         self.raw.append(ln)
         self.lines.append(line)
