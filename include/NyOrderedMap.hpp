@@ -297,6 +297,9 @@ public:
     // The slot number holding key k, or -1 (round 80: the VM's inline
     // caches keep it and check the key at that slot on each use).
     long index_of(std::string_view k) const { return find_slot(k); }
+    // Adds a key the caller knows is absent (a new call frame's distinct
+    // parameter names), without looking for it first (round 80).
+    V& append_new(const std::string& k, V&& v) { return slots_[insert_new(std::string(k), std::move(v))].kv.second; }
     void reserve(size_t n) { if (n > kSmall && index_.size() < n * 2) { if (index_.empty()) index_all(); rebuild_index(n * 2); } }
     void clear() { slots_.clear(); index_.clear(); live_ = 0; used_ = 0; }
 

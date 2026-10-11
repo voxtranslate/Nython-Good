@@ -699,8 +699,13 @@ struct VMCode {
     mutable int8_t                       plain_params = -1;
     bool all_plain_params() const {
         if(plain_params<0){
+            // (and no name twice: CALL_*_PY binds them without looking)
             bool p=true;
-            for(auto& pn:param_names) if(pn.empty()||pn[0]=='*'){ p=false; break; }
+            for(size_t i=0;i<param_names.size()&&p;i++){
+                const std::string& pn=param_names[i];
+                if(pn.empty()||pn[0]=='*'){ p=false; break; }
+                for(size_t j=0;j<i;j++) if(param_names[j]==pn){ p=false; break; }
+            }
             plain_params=p?1:0;
         }
         return plain_params==1;
@@ -3657,7 +3662,17 @@ public:
 
     // Teardown frees the program's values first (gc_teardown), while the
     // generator registry they report to still exists.
-    ~VirtualMachine() override { gc_teardown(); vm_live(this, -1); }
+    ~VirtualMachine() override {
+        // NY_QUICK_STATS=1: what the quickening did (round 80)
+        if(getenv("NY_QUICK_STATS")){
+            fprintf(stderr,"[quicken] specialized %ld, failed attempts %ld, deopts %ld, guard misses %ld\n",
+                    quick_stat(0),quick_stat(1),quick_stat(2),quick_stat(3));
+            for(int o=0;o<(int)Op::OP_COUNT_;o++)
+                if(quick_op_stat((Op)o,0)||quick_op_stat((Op)o,1))
+                    fprintf(stderr,"[quicken]   %-22s misses %ld deopts %ld\n",op_name((Op)o).c_str(),quick_op_stat((Op)o,0),quick_op_stat((Op)o,1));
+        }
+        gc_teardown(); vm_live(this, -1);
+    }
     // The VMs alive now: a generator can be destroyed after its VM (a value
     // kept in a static table), and ~GenState must not call into a dead one.
     // op: 1 add, -1 remove, 0 query.
@@ -6760,7 +6775,12 @@ private:
     // the attempts. CALL_METHOD_PY keeps up to VMIC::kWays receiver classes
     // (a polymorphic inline cache, Hölzle, Chambers & Ungar, ECOOP 1991).
     static constexpr uint16_t kMissLimit = 32;
-    static long& quick_stat(int k) { static long s[8]={0,0,0,0,0,0,0,0}; return s[k]; }   // NY_QUICK_STATS
+    // Counters for NY_QUICK_STATS=1 (printed at exit): 0 specialized,
+    // 1 attempts that failed, 2 deopts, 3 guard misses.
+    static long& quick_stat(int k) { static long s[8]={0,0,0,0,0,0,0,0}; return s[k]; }
+    // NY_VM_TRACE=2: the dump shows specialized ops as they are (=1 shows
+    // the generic form, as before)
+    static bool vm_trace_raw() { static const bool r=[]{ const char* e=getenv("NY_VM_TRACE"); return e&&std::string(e)=="2"; }(); return r; }
     void quick_init(VMCode& c) {
         if(c.quick.ic) return;
         uint32_t n=0;
@@ -6782,10 +6802,12 @@ private:
         VMIC& c=code.quick.ic[ins.ic-1];
         if(++c.misses<kMissLimit) return;
         c.misses=0;
+        quick_stat(2)++; quick_op_stat(ins.op,1)++;
         ins.op=base_op(ins.op);       // deopt
         quick_backoff(ins, &c);
-        quick_stat(2)++;
     }
+    // NY_QUICK_STATS: guard misses (k 0) and deopts (k 1) per specialized op
+    static long& quick_op_stat(Op op, int k) { static long s[2][256]={}; return s[k][(uint8_t)op]; }
     // A frame whose name lookups go straight from its own locals to the
     // main module's frame: no closure environment (so no enclosing frame
     // is visible), not a module's code, not another thread's call stack.
@@ -7019,7 +7041,10 @@ private:
     // (CALL_FUNCTION) or the receiver's (CALL_METHOD, `fn` the method,
     // the name above it).
     void call_py_fast(size_t head, int argc, const VMVal* fn, bool method) {
-        CallFrame nf;
+        // The frame is built where it will run (a deque element does not
+        // move), so check_depth's test is made with it already pushed.
+        call_stack_.emplace_back();
+        CallFrame& nf=call_stack_.back();
         {
             const VMVal& f=fn?*fn:stack_[head];
             nf.code=f.code;
@@ -7027,14 +7052,17 @@ private:
         }
         const auto& pn=nf.code->param_names;
         size_t a0=stack_.size()-(size_t)argc;
-        for(int k=0;k<argc;k++) nf.locals[pn[(size_t)k]]=std::move(stack_[a0+(size_t)k]);
+        for(int k=0;k<argc;k++) nf.locals.append_new(pn[(size_t)k], std::move(stack_[a0+(size_t)k]));
         if(method) nf.self_val.emplace(std::move(stack_[head]));
         stack_.resize(head);
-        check_depth();
+        if(call_stack_.size()-1>=kMaxFrames||(!nycoro::current()&&nycoro::native_stack_exhausted())){
+            call_stack_.pop_back();
+            check_depth();   // raises the RecursionError (the frame not pushed yet, as exec_code has it)
+            throw_exception(make_exception("RecursionError",{VMVal::make_str("maximum recursion depth exceeded")}));
+        }
         size_t base=stack_.size();
         nf.ip=0;
         nf.stack_base=base;
-        call_stack_.push_back(std::move(nf));
         VMVal result=VMVal::make_none();
         try { result=run_frame(); }
         catch(VMReturn& r){ result=r.value; }
@@ -7054,20 +7082,26 @@ private:
         // (`fr`) stay valid because deque elements never move.
         nyconc::tick();
         if(__builtin_expect(nyconc::signal_pending(),0)&&signal_hook_) signal_hook_();
+        // Every run_loop runs exactly one frame (the one on top now), and a
+        // frame's code never changes: both are looked up once (round 80).
+        // A GIL switch swaps the stacks out and back in, and deque elements
+        // and code vectors never move, so `fr` stays the running frame.
+        CallFrame& fr=call_stack_.back();
+        Instruction* const ins0=fr.code->instructions.data();
+        const int ninstr=(int)fr.code->instructions.size();
         while(true){
             // Queued __del__ calls and due cycle collections (one load).
             vmgc::safe_point(*this);
             // Generators dropped while paused in a try/with are closed here,
             // between two instructions (gen_dropped).
             if(__builtin_expect(gen_zombie_flag_,0)) run_gen_zombies();
-            CallFrame& fr=call_stack_.back();
-            if(fr.ip>=(int)fr.code->instructions.size()) return VMVal::make_none();
+            if(fr.ip>=ninstr) return VMVal::make_none();
             // (round 80: not const - quickening rewrites it in place)
-            Instruction& ins=fr.code->instructions[fr.ip++];
+            Instruction& ins=ins0[fr.ip++];
             // NY_VM_TRACE's dump and sys.settrace's line events (round 79):
             // one test of a thread-local byte per instruction when neither is on
             if(__builtin_expect(nytrace::t_hooks,0)){
-                if(nytrace::t_hooks & nytrace::VMDEBUG) fprintf(stderr,"[vm] op=%d arg=%d depth=%d\n",(int)base_op(ins.op),ins.arg,(int)stack_.size());
+                if(nytrace::t_hooks & nytrace::VMDEBUG) fprintf(stderr,"[vm] op=%d arg=%d depth=%d\n",(int)(vm_trace_raw() ? ins.op : base_op(ins.op)),ins.arg,(int)stack_.size());
                 if(nytrace::t_hooks & nytrace::TRACE) vm_line_hook(fr, ins.line);
             }
             try {
@@ -7083,7 +7117,7 @@ private:
             // ── Specialized forms (round 80; see specialize_at) ────────
             // Each checks its guard and does what its generic form would;
             // a failed guard counts a miss and runs the generic form.
-#define NY_MISS(GEN) do { quick_miss(*fr.code, ins); quick_stat(3)++; op=Op::GEN; goto redispatch; } while(0)
+#define NY_MISS(GEN) do { quick_stat(3)++; quick_op_stat(ins.op,0)++; quick_miss(*fr.code, ins); op=Op::GEN; goto redispatch; } while(0)
             case Op::LOAD_NAME_FAST: {
                 if(!fr.own_env){
                     const auto* kv=fr.locals.slot_at((size_t)fr.code->quick.ic[ins.ic-1].slot);
@@ -7136,8 +7170,10 @@ private:
                     if(obj.type==VMType::INSTANCE&&obj.map&&c.epoch==vm_type_epoch()&&!(any_getattribute_&&getattribute_hook(obj))){
                         const auto* kv=obj.map->slot_at((size_t)c.slot);
                         if(kv&&kv->first==fr.code->names[ins.arg]&&!is_property_desc(kv->second)){
-                            VMVal v=kv->second;   // before obj, which may hold the last reference to the map, goes
-                            obj=std::move(v); break;
+                            // obj may hold the last reference to the map
+                            // the value is in: kept until it is copied
+                            std::shared_ptr<VMMap> keep=std::move(obj.map);
+                            obj=kv->second; break;
                         }
                     }
                 }
@@ -7150,8 +7186,8 @@ private:
                     if(obj.type==VMType::MAP&&obj.map.get()==c.map&&!obj.class_name.empty()&&c.epoch==vm_type_epoch()){
                         const auto* kv=obj.map->slot_at((size_t)c.slot);
                         if(kv&&kv->first==fr.code->names[ins.arg]&&!is_property_desc(kv->second)){
-                            VMVal v=kv->second;
-                            obj=std::move(v); break;
+                            std::shared_ptr<VMMap> keep=std::move(obj.map);
+                            obj=kv->second; break;
                         }
                     }
                 }
@@ -7165,8 +7201,7 @@ private:
                        &&(obj.class_name.empty()?obj.s:obj.class_name)==c.cls){
                         const VMVal& m=*c.ptr;
                         if(!(m.type==VMType::FUNCTION&&m.code&&m.code->is_classmethod)){
-                            VMVal v=m;
-                            obj=std::move(v); break;
+                            obj=m; break;   // (a class namespace's slot: not owned by obj)
                         }
                     }
                 }
@@ -7613,7 +7648,7 @@ private:
             }
 
             case Op::DUP_TOP:  { VMVal v=peek(); push(v); break; }
-            case Op::POP_TOP:  pop(); break;
+            case Op::POP_TOP:  if(!stack_.empty()) stack_.pop_back(); break;   // (round 80: no moved copy)
             case Op::ROT_TWO:  { VMVal a=pop(),b=pop(); push(a); push(b); break; }
             case Op::ROT_THREE:{ VMVal a=pop(),b=pop(),c=pop(); push(a); push(c); push(b); break; }
 
@@ -7761,8 +7796,16 @@ private:
             }
             case Op::COMPARE_IN:       { VMVal c=pop(),it=pop(); push(VMVal::make_bool(op_in(it,c))); break; }
             case Op::COMPARE_NOT_IN:   { VMVal c=pop(),it=pop(); push(VMVal::make_bool(!op_in(it,c))); break; }
-            case Op::COMPARE_IS:       { VMVal r=pop(),l=pop(); push(VMVal::make_bool(op_is(l,r))); break; }
-            case Op::COMPARE_IS_NOT:   { VMVal r=pop(),l=pop(); push(VMVal::make_bool(!op_is(l,r))); break; }
+            // (round 80: in place - op_is runs no code)
+            case Op::COMPARE_IS: case Op::COMPARE_IS_NOT: {
+                const size_t n=stack_.size();
+                if(n>=2){
+                    bool r=op_is(stack_[n-2],stack_[n-1]);
+                    if(op==Op::COMPARE_IS_NOT) r=!r;
+                    stack_.pop_back(); set_bool_inplace(stack_.back(),r); break;
+                }
+                VMVal r=pop(),l=pop(); bool b=op_is(l,r); push(VMVal::make_bool(op==Op::COMPARE_IS?b:!b)); break;
+            }
             case Op::COMPARE_IS_TYPE:
             case Op::COMPARE_IS_NOT_TYPE: {
                 VMVal t=pop(),v=pop();
@@ -7796,7 +7839,10 @@ private:
                 break;
             }
             // not: Python truthiness, including __bool__ / __len__.
-            case Op::UNARY_NOT:    { VMVal v=pop(); push(VMVal::make_bool(!vm_truthy(v))); break; }
+            case Op::UNARY_NOT:    {
+                // (round 80: in place, unless __bool__ / __len__ may run)
+                if(!stack_.empty()&&stack_.back().type!=VMType::INSTANCE){ VMVal& t=stack_.back(); set_bool_inplace(t,!t.is_truthy()); break; }
+                VMVal v=pop(); push(VMVal::make_bool(!vm_truthy(v))); break; }
             case Op::UNARY_BITNOT: { VMVal v=pop(); nypy::NumV nv;
                 if(v.to_numv(nv)){ push(nycall([&]{ return VMVal::from_numv(nypy::num_invert(nv)); })); break; }
                 if(v.type==VMType::INSTANCE){ push(unary_dunder(v,"__invert__","~")); break; }
@@ -7817,16 +7863,30 @@ private:
                 if(__builtin_expect(nyconc::signal_pending(),0)&&signal_hook_) signal_hook_();
                 fr.ip=ins.arg; break;
             case Op::JUMP_IF_FALSE: {
+                // (round 80: tested in place unless __bool__ / __len__ may run)
+                if(!stack_.empty()&&stack_.back().type!=VMType::INSTANCE){
+                    bool t=stack_.back().is_truthy(); stack_.pop_back();
+                    if(!t) fr.ip=ins.arg;
+                    break;
+                }
                 VMVal v=pop();
                 bool t = (v.type==VMType::INSTANCE) ? instance_truthy(v) : v.is_truthy();
                 if(!t) fr.ip=ins.arg; break;
             }
             case Op::JUMP_IF_TRUE: {
+                if(!stack_.empty()&&stack_.back().type!=VMType::INSTANCE){   // (round 80)
+                    bool t=stack_.back().is_truthy(); stack_.pop_back();
+                    if(t) fr.ip=ins.arg;
+                    break;
+                }
                 VMVal v=pop();
                 bool t = (v.type==VMType::INSTANCE) ? instance_truthy(v) : v.is_truthy();
                 if(t) fr.ip=ins.arg; break;
             }
-            case Op::JUMP_IF_FALSE_OR_POP: { VMVal t=peek(); if(!vm_truthy(t)) fr.ip=ins.arg; else pop(); break; }
+            case Op::JUMP_IF_FALSE_OR_POP: {
+                // (round 80: no copy of the value tested, unless __bool__ may run)
+                if(!stack_.empty()&&stack_.back().type!=VMType::INSTANCE){ if(!stack_.back().is_truthy()) fr.ip=ins.arg; else stack_.pop_back(); break; }
+                VMVal t=peek(); if(!vm_truthy(t)) fr.ip=ins.arg; else pop(); break; }
             case Op::JUMP_IF_NONE_KEEP:
                 if(!stack_.empty()&&stack_.back().is_nullish()){ stack_.back()=VMVal::make_none(); fr.ip=ins.arg; }
                 break;
@@ -7836,7 +7896,9 @@ private:
             case Op::JUMP_IF_NOT_NONE_OR_POP:
                 if(!stack_.empty()&&!stack_.back().is_nullish()) fr.ip=ins.arg; else pop();
                 break;
-            case Op::JUMP_IF_TRUE_OR_POP:  { VMVal t=peek(); if(vm_truthy(t))  fr.ip=ins.arg; else pop(); break; }
+            case Op::JUMP_IF_TRUE_OR_POP:  {
+                if(!stack_.empty()&&stack_.back().type!=VMType::INSTANCE){ if(stack_.back().is_truthy()) fr.ip=ins.arg; else stack_.pop_back(); break; }   // (round 80)
+                VMVal t=peek(); if(vm_truthy(t))  fr.ip=ins.arg; else pop(); break; }
 
             // Make function/class
             case Op::MAKE_FUNCTION: {
