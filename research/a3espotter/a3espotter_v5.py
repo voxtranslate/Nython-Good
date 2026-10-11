@@ -4711,10 +4711,15 @@ class SpottingEngine:
         st = cfg.feature_stride
         if max(H, W) <= cfg.tile_max_side:
             z, d, f = self._forward(self._to_tensor(canvas))
+            try:                                      # for the attention figure (strip forwards overwrite it later)
+                self.last_attention = self.model.backbone.blocks[0].attn.attention_map[0].float().cpu().numpy()
+            except Exception:
+                self.last_attention = None
             return z[0].cpu().numpy(), d[0].cpu().numpy(), f.float().cpu()
+        self.last_attention = None                    # tiled: no single whole-image map
         T = int(cfg.tile_size // 32 * 32)
         ov = int(cfg.tile_overlap)
-        step = max(32, T - ov)
+        step = max(32, (T - ov) // 32 * 32)          # multiple of the stride: tiles land on whole feature cells
         Th, Tw = min(T, H), min(T, W)
 
         def starts(total, t):
@@ -4748,8 +4753,9 @@ class SpottingEngine:
 
     # ---------------- decoding: consensus script posterior + entropy-gated PMI prior ----------------
     def _consensus(self, sp, q, mass):
-        """pi ~ p_head(s) * q_ctc(s)^(gamma * w), w = min(1, expected emitted characters / 2): the script implied
-        by what was actually read overrides a confident but wrong script head (the IC15 'Chinese' Latin words)."""
+        """pi ~ p_head(s) * q_ctc(s)^(gamma * w), w = min(1, mass / 2) with mass = expected number of NON-BLANK
+        CTC frames (>= the number of emitted characters, so w saturates early): the script implied by what was
+        actually read overrides a confident but wrong script head (the IC15 'Chinese' Latin words)."""
         w = (mass.float() / 2.0).clamp(0, 1).unsqueeze(-1) * float(self.cfg.script_consensus_gamma)
         return torch.softmax(torch.log(sp.float() + 1e-6) + w * torch.log(q.float() + 1e-3), -1)
 
@@ -4808,7 +4814,7 @@ class SpottingEngine:
     @torch.no_grad()
     def read_strips(self, img, rboxes, polys):
         """Rectified-strip re-reading: each (unpadded) oriented box in ORIGINAL image pixels is padded, warped to a
-        strip whose text height is roi_h * stride, and read by the same network (dense features of the strip +
+        strip whose PADDED box height is roi_h * stride (text ~ 28 px; same as training), and read by the same network (dense features of the strip +
         one RoI covering it) - the path trained by the scene-strip stream."""
         cfg = self.cfg
         if len(rboxes) == 0:
@@ -4843,9 +4849,12 @@ class SpottingEngine:
         self.model.eval()
         scales = list(cfg.test_scales) if cfg.test_scales else [1.0]
         per_scale = []
+        attention = None
         for sc in scales:
             canvas, (sx, sy), (nh, nw) = self._prepare(img, sc)
             z, d, f = self.dense(canvas)
+            if attention is None:
+                attention = getattr(self, 'last_attention', None)
             per_scale.append({'sx': sx, 'sy': sy, 'nh': nh, 'nw': nw, 'z': z, 'd': d, 'f': f})
         ref = per_scale[0]
         st = cfg.feature_stride
@@ -4936,7 +4945,7 @@ class SpottingEngine:
             det['e2e'] = bool(legible and rr['text'] and rr['rec_conf'] >= cfg.e2e_min_rec_conf)
             dets.append(det)
         maps = {'text': S[-1], 'kernel0': S[0], 'direction': d_up, 'labels': labels, 'grid_stride': grid_stride,
-                'scale': (ref['sx'], ref['sy'])}
+                'scale': (ref['sx'], ref['sy']), 'attention': attention}
         return dets, rejected, maps
 
 
@@ -5337,12 +5346,16 @@ class Inferencer:
         except Exception as e:
             print(f"[interpret] t-SNE failed: {e}")
 
-    def interpret_attention(self, img, tag=''):
+    def interpret_attention(self, img, tag='', maps=None):
+        """SGDLA focus of the whole-image pass (taken from `maps`; after predict() the module's own buffer holds the
+        last STRIP batch's map, which V5's figure would otherwise stretch over the photo). Skipped for tiled images."""
         try:
-            blk = self.model.backbone.blocks[0].attn
-            if blk.attention_map is None:
+            a = maps.get('attention') if maps is not None else None
+            if a is None:
                 return
-            a = blk.attention_map[0].float().cpu().numpy()
+            a = np.asarray(a, dtype=np.float32)
+            nh, nw = int(round(img.shape[0] * maps['scale'][1])), int(round(img.shape[1] * maps['scale'][0]))
+            a = a[:max(1, int(math.ceil(nh / 16.0))), :max(1, int(math.ceil(nw / 16.0)))]   # drop canvas padding
             a = (a - a.min()) / (a.max() - a.min() + 1e-6)
             fig, axs = plt.subplots(1, 2, figsize=(12, 5))
             axs[0].imshow(img); axs[0].axis('off')
@@ -5418,7 +5431,7 @@ class Inferencer:
                 save_prediction_figure(img, dets, rejected, maps, os.path.join(cfg.vis_dir, f'{self.diag_name}_{fname}.png'),
                                        fname, gts)
                 if self.explain:
-                    self.interpret_attention(img, tag=f'{n:04d}')
+                    self.interpret_attention(img, tag=f'{n:04d}', maps=maps)
             if n == 0 and self.explain:
                 self.interpret_shap(img)
         metrics = summarize_eval(acc) if has_gt else None
@@ -5537,9 +5550,21 @@ def _ckpt_stage(ck):
     return snap.get('stage_name', 'v4')
 
 
-def find_warm_start_checkpoint(cfg):
-    """Explicit init_checkpoint, else best/latest of a previous stage in chkp_dir, else a best_model.pth found in an
-    attached Kaggle dataset (e.g. the outputs of the V4 notebook). Returns (path, config_snapshot, stage)."""
+def _safe_ckpt_meta(path):
+    """(stage, config_snapshot) of a checkpoint, or None if it cannot be read (e.g. a file cut off mid-write)."""
+    try:
+        ck = torch.load(path, map_location='cpu', weights_only=False)
+    except Exception as e:
+        print(f"[stage] cannot read {path} ({type(e).__name__}); ignoring it.")
+        return None
+    meta = (_ckpt_stage(ck), ck.get('config_snapshot'))
+    del ck
+    return meta
+
+
+def _checkpoint_candidates(cfg):
+    """init_checkpoint, then chkp_dir, then checkpoints inside attached Kaggle datasets (e.g. a previous session's or
+    the V4 notebook's output), best before latest."""
     cands = [cfg.init_checkpoint] if cfg.init_checkpoint else []
     cands += [os.path.join(cfg.chkp_dir, 'best_model.pth'), os.path.join(cfg.chkp_dir, 'latest_model.pth')]
     for root in cfg.source_search_roots:
@@ -5553,31 +5578,66 @@ def find_warm_start_checkpoint(cfg):
                     if f in fn:
                         found.append(os.path.join(dp, f))
             cands += sorted(found, key=lambda p: (not p.endswith('best_model.pth'), p))
+    out, seen = [], set()
     for p in cands:
-        if not p or not os.path.exists(p):
+        if p and os.path.exists(p) and os.path.realpath(p) not in seen:
+            seen.add(os.path.realpath(p))
+            out.append(p)
+    return out
+
+
+def find_warm_start_checkpoint(cfg):
+    """First readable checkpoint of ANOTHER stage among _checkpoint_candidates (same-stage files are resumed by
+    plan_stage instead). Returns (path, config_snapshot, stage)."""
+    for p in _checkpoint_candidates(cfg):
+        meta = _safe_ckpt_meta(p)
+        if meta is None:
             continue
-        try:
-            ck = torch.load(p, map_location='cpu', weights_only=False)
-        except Exception as e:
-            print(f"[stage] cannot read {p}: {e}")
+        stage, snap = meta
+        if snap is None:
+            print(f"[stage] {p}: pre-V4 checkpoint (no config snapshot) - not usable for a warm start.")
+        elif stage == cfg.stage_name:
             continue
-        snap, stage = ck.get('config_snapshot'), _ckpt_stage(ck)
-        del ck
-        if snap is not None and stage != cfg.stage_name:
+        else:
             return p, snap, stage
     return None, None, None
 
 
 def plan_stage(cfg):
-    """'resume' (latest checkpoint belongs to this stage) | 'warm' (start this stage from a previous stage's
-    weights) | 'scratch'."""
+    """'resume' | 'warm' | 'scratch'.
+    resume: chkp_dir/latest_model.pth belongs to this stage, or - new Kaggle session, empty /kaggle/working - a
+            same-stage latest_model.pth is found in init_checkpoint / attached datasets: it (and the same-stage best)
+            is copied into chkp_dir and training continues where it stopped.
+    warm:   start this stage from a previous stage's weights.  scratch: nothing usable found."""
     latest = os.path.join(cfg.chkp_dir, 'latest_model.pth')
+    prev = os.path.join(cfg.chkp_dir, 'latest_model_prev.pth')
     if os.path.exists(latest):
-        ck = torch.load(latest, map_location='cpu', weights_only=False)
-        stage, snap = _ckpt_stage(ck), ck.get('config_snapshot')
-        del ck
-        if stage == cfg.stage_name and snap is not None:
-            return {'mode': 'resume', 'path': latest, 'snapshot': snap}
+        meta = _safe_ckpt_meta(latest)
+        if meta is None:
+            bad = latest.replace('.pth', f'_unreadable_{int(time.time())}.pth')
+            os.replace(latest, bad)
+            print(f"[stage] moved the unreadable checkpoint to {os.path.basename(bad)}.")
+        elif meta[0] == cfg.stage_name and meta[1] is not None:
+            return {'mode': 'resume', 'path': latest, 'snapshot': meta[1]}
+    if not os.path.exists(latest) and os.path.exists(prev):
+        meta = _safe_ckpt_meta(prev)
+        if meta and meta[0] == cfg.stage_name and meta[1] is not None:
+            shutil.copy2(prev, latest)
+            print(f"[stage] resuming stage '{cfg.stage_name}' from the previous checkpoint (latest_model_prev.pth).")
+            return {'mode': 'resume', 'path': latest, 'snapshot': meta[1]}
+    for p in _checkpoint_candidates(cfg):
+        if not p.endswith('latest_model.pth') or os.path.realpath(p) == os.path.realpath(latest):
+            continue
+        meta = _safe_ckpt_meta(p)
+        if meta and meta[0] == cfg.stage_name and meta[1] is not None:
+            shutil.copy2(p, latest)
+            best_src = os.path.join(os.path.dirname(p), 'best_model.pth')
+            best_dst = os.path.join(cfg.chkp_dir, 'best_model.pth')
+            bm = _safe_ckpt_meta(best_src) if os.path.exists(best_src) else None
+            if bm and bm[0] == cfg.stage_name and os.path.realpath(best_src) != os.path.realpath(best_dst):
+                shutil.copy2(best_src, best_dst)
+            print(f"[stage] resuming stage '{cfg.stage_name}' from {p} (copied into {cfg.chkp_dir}).")
+            return {'mode': 'resume', 'path': latest, 'snapshot': meta[1]}
     path, snap, stage = find_warm_start_checkpoint(cfg)
     if path:
         print(f"[stage] new stage '{cfg.stage_name}': warm start from {path} (stage '{stage}', "
@@ -5603,21 +5663,27 @@ class Trainer:
                  'one_minus_ned', 'spot_score', 'dets_per_image']
 
     def __init__(self, model, train_loader, val_loader, config, train_loader_factory=None, val_items=None,
-                 crop_loader=None, domain_val_items=None, crop_loaders=None, mixers=None, plan=None):
+                 crop_loader=None, domain_val_items=None, crop_loaders=None, mixers=None, plan=None,
+                 val_loader_factory=None):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.config = config
         self.train_loader_factory = train_loader_factory
+        self.val_loader_factory = val_loader_factory
         self.val_items = val_items or []
         self.domain_val_items = domain_val_items or []
-        # auxiliary recognition streams, used round-robin: (loader, weight, name)
-        self.crop_streams = []
+        # auxiliary recognition streams, used round-robin: (loader, weight, name) or (loader, weight, name, factory)
+        self.crop_streams, self.crop_factories = [], []
         for item in (crop_loaders or []):
-            if item is not None:
-                self.crop_streams.append(item if isinstance(item, tuple) else (item, config.w_crop_rec, 'crop'))
+            if item is None:
+                continue
+            item = item if isinstance(item, tuple) else (item, config.w_crop_rec, 'crop')
+            self.crop_streams.append(tuple(item[:3]))
+            self.crop_factories.append(item[3] if len(item) > 3 else None)
         if crop_loader is not None:
             self.crop_streams.append((crop_loader, config.w_crop_rec, 'crop'))
+            self.crop_factories.append(None)
         self._crop_iters = [None] * len(self.crop_streams)
         self._crop_turn = 0
         self.mixers = [m for m in (mixers or []) if m is not None]
@@ -5692,6 +5758,35 @@ class Trainer:
         return self.peak_lr * f
 
     # ------------------------------ helpers ------------------------------
+    @staticmethod
+    def _is_worker_crash(e):
+        m = str(e)
+        return 'DataLoader worker' in m and ('killed by signal' in m or 'exited unexpectedly' in m)
+
+    def _rebuild_loaders(self):
+        """After a worker crash every loader with persistent workers is poisoned (torch raises again on each next()
+        / iter()), so all of them are rebuilt, not only the training loader."""
+        if self.train_loader_factory is not None:
+            self.train_loader = self.train_loader_factory()
+        if self.val_loader_factory is not None:
+            self.val_loader = self.val_loader_factory()
+        for i, f in enumerate(self.crop_factories):
+            if f is not None:
+                loader, w, name = self.crop_streams[i]
+                self.crop_streams[i] = (f(), w, name)
+        self._crop_iters = [None] * len(self.crop_streams)
+
+    def _with_loader_retry(self, fn, what, tries=3):
+        for attempt in range(tries + 1):
+            try:
+                return fn()
+            except RuntimeError as e:
+                if not self._is_worker_crash(e) or attempt == tries:
+                    raise
+                print(f"[Trainer] DataLoader worker crashed during {what} (retry {attempt + 1}/{tries}); "
+                      f"rebuilding all loaders.")
+                self._rebuild_loaders()
+
     def _to_device(self, batch):
         return {k: (v.to(self.device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
 
@@ -5835,19 +5930,20 @@ class Trainer:
         sums, n = defaultdict(float), 0
         pix = [0.0, 0.0, 0.0]
         rm = defaultdict(float)
+        cnts = defaultdict(int)
         for raw in tqdm(self.val_loader, desc=f"Epoch {epoch + 1} [Valid]", mininterval=2.0):
             batch = self._to_device(raw)
             dense, rois, tgt, loss, logs, _ = self._step_forward(model, batch, mine=False)
             for k, v in logs.items():
                 sums[k] += v
+                cnts[k] += 1
             n += 1
             i, p, g = compute_metrics(dense['detection_masks'], batch['masks'], batch['training_mask'])
             pix[0] += i; pix[1] += p; pix[2] += g
             if rois is not None:
                 for k, v in compute_recognition_metrics(rois, tgt, self.config).items():
                     rm[k] += v
-        n = max(n, 1)
-        out = {k: v / n for k, v in sums.items()}
+        out = {k: v / max(cnts[k], 1) for k, v in sums.items()}   # per key: rec/script terms skip RoI-less batches
         pp = pix[0] / max(pix[1], 1e-6)
         pr = pix[0] / max(pix[2], 1e-6)
         out.update({'pix_precision': pp, 'pix_recall': pr, 'pix_f': 2 * pp * pr / max(pp + pr, 1e-6),
@@ -5918,16 +6014,14 @@ class Trainer:
             try:
                 tr, gn, mined, clip_frac = self.train_one_epoch(epoch)
             except RuntimeError as e:
-                msg = str(e)
-                crashed = 'DataLoader worker' in msg and ('killed by signal' in msg or 'exited unexpectedly' in msg)
-                if not crashed or self.train_loader_factory is None or retries >= 3:
+                if not self._is_worker_crash(e) or retries >= 3:
                     raise
                 retries += 1
-                print(f"[Trainer] DataLoader worker crashed (retry {retries}/3); rebuilding the loader.")
-                self.train_loader = self.train_loader_factory()
+                print(f"[Trainer] DataLoader worker crashed (retry {retries}/3); rebuilding all loaders.")
+                self._rebuild_loaders()
                 continue
             retries = 0
-            va = self.validate(epoch)
+            va = self._with_loader_retry(lambda: self.validate(epoch), 'validation')
             self._update_mixers(va.get('per_script', {}))
             h = self.history
             for k in ('total', 'det', 'text', 'kernel', 'dir', 'rec', 'ctc', 'script_consistency', 'script', 'verify',
@@ -5950,7 +6044,7 @@ class Trainer:
 
             do_eval = (self.val_items or self.domain_val_items) and \
                 ((epoch + 1) % cfg.eval_every == 0 or epoch + 1 == self.total_epochs)
-            ev = self.evaluate_instances() if do_eval else None
+            ev = self._with_loader_retry(self.evaluate_instances, 'evaluation') if do_eval else None
             ev_m = ev.get('mlt') if ev else None
             ev_i = ev.get('ic15') if ev else None
             for k in self.EVAL_KEYS:
@@ -6009,21 +6103,32 @@ class Trainer:
     def _schedule(self):
         return {'peak_lr': self.peak_lr, 'total_epochs': self.total_epochs, 'warmup_epochs': self.warmup_epochs}
 
+    @staticmethod
+    def _atomic_save(obj, path, keep_prev=False):
+        """Write to a temporary file, then rename: a kill during the write (12-h limit, OOM, worker SIGCHLD) can
+        no longer leave a truncated checkpoint that blocks every later run. keep_prev keeps the previous file as
+        *_prev.pth (plan_stage falls back to it if the latest one is ever unreadable)."""
+        tmp = path + '.tmp'
+        torch.save(obj, tmp)
+        if keep_prev and os.path.exists(path):
+            os.replace(path, path.replace('.pth', '_prev.pth'))
+        os.replace(tmp, path)
+
     def save_checkpoint(self, epoch, is_best=False, metrics=None):
         snap = self.config.snapshot()
         stage = self.config.stage_name
-        torch.save({'epoch': epoch, 'global_step': self.global_step, 'model_state': self.model.state_dict(),
+        if is_best:                                   # best first: latest's best_score must describe a saved file
+            self._atomic_save({'model_state': self.ema.ema.state_dict(), 'config_snapshot': snap, 'stage': stage,
+                               'vocab_chars': self.config.chars, 'epoch': epoch, 'metrics': metrics},
+                              os.path.join(self.config.chkp_dir, 'best_model.pth'))
+        self._atomic_save({'epoch': epoch, 'global_step': self.global_step, 'model_state': self.model.state_dict(),
                     'ema_state': self.ema.ema.state_dict(), 'ema_updates': self.ema.updates,
                     'criterion_state': self.criterion.state_dict(), 'optimizer_state': self.optimizer.state_dict(),
                     'scaler_state': self.scaler.state_dict(), 'history': self.history, 'config_snapshot': snap,
                     'vocab_chars': self.config.chars, 'best_score': self.best_score, 'best_epoch': self.best_epoch,
                     'evals_without_improvement': self.evals_without_improvement, 'stage': stage,
                     'schedule': self._schedule(), 'mixer_beta': self.mixer_beta.tolist()},
-                   os.path.join(self.config.chkp_dir, 'latest_model.pth'))
-        if is_best:
-            torch.save({'model_state': self.ema.ema.state_dict(), 'config_snapshot': snap, 'stage': stage,
-                        'vocab_chars': self.config.chars, 'epoch': epoch, 'metrics': metrics},
-                       os.path.join(self.config.chkp_dir, 'best_model.pth'))
+                          os.path.join(self.config.chkp_dir, 'latest_model.pth'), keep_prev=True)
 
     @staticmethod
     def _filtered_load(module, state):
@@ -6037,21 +6142,25 @@ class Trainer:
         if os.path.exists(self._epoch_log_path):
             os.replace(self._epoch_log_path, self._epoch_log_path.replace('.csv', f'_backup_{int(time.time())}.csv'))
 
-    def _archive_previous_stage(self, old_stage):
-        """Keeps the previous stage's checkpoints next to the new ones (latest -> moved, best -> copied)."""
+    def _archive_previous_stage(self, old_stage=None):
+        """Keeps other stages' checkpoints next to the new ones (latest -> moved, best -> copied), named after the
+        stage stored IN each file; an existing archive is never overwritten (a numeric suffix is added)."""
         d = self.config.chkp_dir
-        tag = re.sub(r'[^A-Za-z0-9_]+', '_', str(old_stage))
         for name, move in (('latest_model.pth', True), ('best_model.pth', False)):
             src = os.path.join(d, name)
+            if not os.path.exists(src):
+                continue
+            meta = _safe_ckpt_meta(src)
+            if meta is None or meta[0] == self.config.stage_name:
+                continue
+            tag = re.sub(r'[^A-Za-z0-9_]+', '_', str(meta[0]))
             dst = os.path.join(d, name.replace('.pth', f'_{tag}.pth'))
-            if os.path.exists(src) and not os.path.exists(dst):
-                try:
-                    ck_stage = _ckpt_stage(torch.load(src, map_location='cpu', weights_only=False))
-                except Exception:
-                    continue
-                if ck_stage != self.config.stage_name:
-                    (os.replace if move else shutil.copy2)(src, dst)
-                    print(f"[stage] archived {name} of stage '{ck_stage}' as {os.path.basename(dst)}")
+            k = 2
+            while os.path.exists(dst):
+                dst = os.path.join(d, name.replace('.pth', f'_{tag}_{k}.pth'))
+                k += 1
+            (os.replace if move else shutil.copy2)(src, dst)
+            print(f"[stage] archived {name} of stage '{meta[0]}' as {os.path.basename(dst)}")
 
     def load_checkpoint(self):
         cfg = self.config
@@ -6111,6 +6220,8 @@ class Trainer:
         self.best_score = ckpt.get('best_score', -1e9)
         self.best_epoch = ckpt.get('best_epoch', 0)
         self.evals_without_improvement = ckpt.get('evals_without_improvement', 0)
+        for k, m in enumerate(self.mixers):           # a resumed session must not replay session 1's draws
+            m.epoch = (self.start_epoch + 1) * 1000 + k
         if ckpt.get('mixer_beta') is not None and len(ckpt['mixer_beta']) == cfg.num_scripts:
             self.mixer_beta = np.asarray(ckpt['mixer_beta'], dtype=np.float64)
             for m in self.mixers:
@@ -6262,8 +6373,9 @@ def apply_config_snapshot(config, snap, keys=None):
 
 
 def load_model_for_inference(path, config=None, device='cpu'):
-    """Rebuild a model from best_model.pth / latest_model.pth (vocab, architecture and the calibrated operating
-    point come from the checkpoint)."""
+    """Rebuild a model from best_model.pth / final_ema_model.pth / latest_model.pth (vocab and architecture come from
+    the checkpoint; the calibrated operating point is stored in best_model.pth, or in final_ema_model.pth when the
+    final EMA weights were used, not in latest_model.pth)."""
     config = config or Config()
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
     if 'config_snapshot' in ckpt:
@@ -6343,24 +6455,30 @@ def main(config=None):
     def build_train_loader():
         return _make_loader(train_dataset, config.batch_size, collate_fn, sampler=sampler, drop_last=True, workers=nw)
 
+    def build_val_loader():
+        return _make_loader(val_dataset, config.batch_size, collate_fn, workers=nw)
+
     train_loader = build_train_loader()
-    val_loader = _make_loader(val_dataset, config.batch_size, collate_fn, workers=nw)
+    val_loader = build_val_loader()
 
     streams, mixers = [], [sampler]
     if config.use_scene_strips and config.w_strip_rec > 0:
         strip_ds = SceneWordStripDataset(train_dataset, config, config.strips_per_image)
         strip_sampler = ScriptAdaptiveMixtureSampler(base_w, mass, config.samples_per_epoch, seed=config.seed + 11)
-        strip_loader = _make_loader(strip_ds, config.strip_batch_images, _CropCollate(config.crop_batch_size),
-                                    sampler=strip_sampler, drop_last=True, workers=config.strip_num_workers)
-        streams.append((strip_loader, config.w_strip_rec, 'strip'))
+        def build_strip_loader():
+            return _make_loader(strip_ds, config.strip_batch_images, _CropCollate(config.crop_batch_size),
+                                sampler=strip_sampler, drop_last=True, workers=config.strip_num_workers)
+        streams.append((build_strip_loader(), config.w_strip_rec, 'strip', build_strip_loader))
         mixers.append(strip_sampler)
         print(f"Scene-word strip stream: {config.strip_batch_images} images x <= {config.strips_per_image} strips per step.")
     if config.crop_rec_sources:
         crop_ds = CropRecognitionDataset(config.crop_rec_sources, config, config.crop_max_samples)
         if len(crop_ds) > 0:
             print(f"Word-crop recognition stream: {len(crop_ds)} samples, batch {config.crop_batch_size}.")
-            streams.append((_make_loader(crop_ds, config.crop_batch_size, _CropCollate(), shuffle=True, drop_last=True,
-                                         workers=config.strip_num_workers), config.w_crop_rec, 'crop'))
+            def build_crop_loader():
+                return _make_loader(crop_ds, config.crop_batch_size, _CropCollate(), shuffle=True, drop_last=True,
+                                    workers=config.strip_num_workers)
+            streams.append((build_crop_loader(), config.w_crop_rec, 'crop', build_crop_loader))
 
     seed_cuda(config.seed)
     model = A3ESpotter_V5(config)
@@ -6370,29 +6488,35 @@ def main(config=None):
           f"{len(model.recognizer.classifier.component_names)}")
 
     trainer = Trainer(model, train_loader, val_loader, config, train_loader_factory=build_train_loader,
-                      val_items=val_items, domain_val_items=ic15_val, crop_loaders=streams, mixers=mixers, plan=plan)
+                      val_items=val_items, domain_val_items=ic15_val, crop_loaders=streams, mixers=mixers, plan=plan,
+                      val_loader_factory=build_val_loader)
     trainer.run()
 
     model = trainer.ema.ema
     best_path = os.path.join(config.chkp_dir, 'best_model.pth')
+    used_best = False
     if config.use_best_checkpoint_for_inference and os.path.exists(best_path):
         best = torch.load(best_path, map_location='cpu', weights_only=False)
         if 'config_snapshot' in best and _ckpt_stage(best) == config.stage_name:
             Trainer._filtered_load(model, best['model_state'])
+            used_best = True
             print(f"[inference] loaded best_model.pth (epoch {best.get('epoch', -1) + 1}, metrics={best.get('metrics')})")
         else:
             print("[inference] best_model.pth belongs to another stage; using the final EMA weights.")
+        del best
     if config.calibrate_operating_point:
         calib_items = ic15_val if ic15_val else val_items
         calibrate_operating_point(model, config, calib_items)
-        try:                                   # store the calibrated operating point with the weights
-            for name in ('best_model.pth',):
-                p = os.path.join(config.chkp_dir, name)
-                if os.path.exists(p):
-                    ck = torch.load(p, map_location='cpu', weights_only=False)
-                    if _ckpt_stage(ck) == config.stage_name:
-                        ck['config_snapshot'] = config.snapshot()
-                        torch.save(ck, p)
+        # store the calibrated operating point WITH the weights it was calibrated for
+        try:
+            if used_best:
+                ck = torch.load(best_path, map_location='cpu', weights_only=False)
+                ck['config_snapshot'] = config.snapshot()
+                Trainer._atomic_save(ck, best_path)
+            else:
+                Trainer._atomic_save({'model_state': model.state_dict(), 'config_snapshot': config.snapshot(),
+                                      'stage': config.stage_name, 'vocab_chars': config.chars},
+                                     os.path.join(config.chkp_dir, 'final_ema_model.pth'))
         except Exception as e:
             print(f"[calibration] could not store the operating point in the checkpoint: {e}")
     inferencer = TiledInferencer(model, config) if config.use_tiling else Inferencer(model, config)

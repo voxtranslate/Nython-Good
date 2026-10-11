@@ -42,7 +42,7 @@ Free real-photo Japanese scene text with quad annotations is scarce beyond MLT i
 
 ## Cross-check (second pass)
 
-Four independent reviews covered the whole file. Every finding below was reproduced or traced, then fixed.
+Four independent reviews covered the whole file (data/config, multi-source merge, model/losses/evaluation, engine/trainer/main). Every finding below was reproduced or traced, then fixed.
 
 **Labels and targets**
 - Box jitter was proportional to line *length*, so it cut 1–3 characters off long CJK lines while their full label was kept. It is now proportional to text height.
@@ -66,10 +66,21 @@ Four independent reviews covered the whole file. Every finding below was reprodu
 - One broken label file stopped the run.
 - Worker memory: the index and the crop index are numpy-backed, so forked workers share them.
 
+**Training runs across Kaggle sessions**
+- A new session silently restarted the stage instead of resuming. A same-stage checkpoint attached from the previous session (or set as `init_checkpoint`) is now copied in and resumed.
+- A checkpoint cut off mid-write blocked every later run. Checkpoints are now written atomically, the best checkpoint is written before the latest, the previous latest is kept as a fallback, and unreadable files are moved aside.
+- Resumed sessions replayed session 1's sample order. The samplers are now offset by epoch.
+- A DataLoader worker crash poisoned the validation and strip loaders. All loaders are now rebuilt and validation/evaluation retried.
+- Archived checkpoints are named after the stage stored in each file.
+
 **Evaluation and inference**
 - Validation recognition metrics were a random subsample.
 - A full 1-NED (misses and false alarms count as 1) is reported next to the matched-pairs version.
 - Two latent crashes are fixed: a dtype cast and a missing `detach()`.
+- The attention figure showed the last strip batch's map; it now shows the whole-image pass.
+- Validation losses were averaged over batches that had no such RoIs.
+- Tile offsets are aligned to the network stride.
+- The calibrated operating point is stored with the weights it was calibrated for (`best_model.pth`, or `final_ema_model.pth`).
 
 ## Running on Kaggle
 
