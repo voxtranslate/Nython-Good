@@ -5176,9 +5176,22 @@ public:   // NythonExecutor is a struct: members default to public
                     std::vector<Value> none;
                     return makeStringValue(strFormat(s, none, kw, ctx));
                 }
+                // round 79: keyword arguments go where the method takes them
+                // (NyStr.hpp: str_kw_slot); they used to be dropped
+                std::vector<Value> kargs;
+                const std::vector<Value>* sargs = &args;
+                if (!kw_args_in.empty()) {
+                    kargs = args;
+                    for (auto& kv : kw_args_in) {
+                        size_t pos = nyCall([&] { return nypy::str_kw_slot(method_name, kv.first); });
+                        if (kargs.size() <= pos) kargs.resize(pos + 1, NONE_VALUE);
+                        kargs[pos] = kv.second;
+                    }
+                    sargs = &kargs;
+                }
                 std::vector<nypy::SArg> sa;
-                sa.reserve(args.size());
-                for (auto& a : args) sa.push_back(toSArg(a, ctx));
+                sa.reserve(sargs->size());
+                for (auto& a : *sargs) sa.push_back(toSArg(a, ctx));
                 nypy::SRes r;
                 if (nyCall([&] { return nypy::str_method(s, method_name, sa, r); })) return fromSRes(r);
             }

@@ -1782,6 +1782,11 @@ bool Lexer::handle_indentation() {
 		else break;
 	}
 	source.put_char();
+	// round 79: a comment-only line does not change the indentation, as in
+	// Python's tokenizer - a comment indented deeper than the code around it
+	// (a continued trailing comment) or less (one at column 0 inside a
+	// function) was an Indent/Dedent and a syntax error
+	if(c == '#') return false;
 	if(col > indent) {
 		///Adjust the current indentation level.
 		indent = col;

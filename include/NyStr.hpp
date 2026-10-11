@@ -682,6 +682,26 @@ inline SRes sres_int(int64_t i) { SRes r; r.k = SRes::INT; r.i = i; return r; }
 inline SRes sres_bool(bool b) { SRes r; r.k = SRes::BOOL; r.b = b; return r; }
 inline SRes sres_list(std::vector<std::string> v, bool tuple = false) { SRes r; r.k = tuple ? SRes::TUPLE : SRes::LIST; r.v = std::move(v); return r; }
 
+// round 79: the positional slot a keyword argument of a str method fills, as
+// CPython's str methods take keywords (split/rsplit: sep, maxsplit;
+// splitlines: keepends; expandtabs: tabsize); any other keyword is CPython's
+// TypeError. Both engines used to drop keyword arguments to str methods
+// silently ("a b c".split(maxsplit=1) split everything).
+inline size_t str_kw_slot(const std::string& m, const std::string& k) {
+    if (m == "split" || m == "rsplit") {
+        if (k == "sep") return 0;
+        if (k == "maxsplit") return 1;
+    } else if (m == "splitlines") {
+        if (k == "keepends") return 0;
+    } else if (m == "expandtabs") {
+        if (k == "tabsize") return 0;
+    } else {
+        raise("TypeError", "str." + m + "() takes no keyword arguments");
+    }
+    raise("TypeError", "'" + k + "' is an invalid keyword argument for " + m + "()");
+    return 0;
+}
+
 inline bool str_method(const std::string& s, const std::string& m, const std::vector<SArg>& a, SRes& out) {
     const size_t n = a.size();
     // The method name against each literal: length first, no strlen.

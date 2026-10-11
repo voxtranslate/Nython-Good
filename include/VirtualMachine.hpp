@@ -11974,6 +11974,17 @@ private:
                 std::string err=(rv&&rv->type!=VMType::NONE)?vm->vm_str(*rv):std::string("strict");
                 return VMVal::make_bytes(vm->nycall([&]{ return nypy::str_encode(obj.s,enc,err); }));
             }
+            // round 79: keyword arguments go where the method takes them
+            // (NyStr.hpp: str_kw_slot); they used to be dropped
+            if(kw.type==VMType::MAP&&kw.map&&!kw.map->empty()){
+                for(auto& kv:*kw.map){
+                    if(vm_internal_key(kv.first)) continue;
+                    std::string k=nypy::key_payload(kv.first);
+                    size_t pos=vm->nycall([&]{ return nypy::str_kw_slot(m,k); });
+                    if(a.size()<=pos) a.resize(pos+1,VMVal::make_none());
+                    a[pos]=kv.second;
+                }
+            }
             std::vector<nypy::SArg> sa; sa.reserve(a.size());
             for(auto& v:a) sa.push_back(vm->to_sarg(v));
             nypy::SRes r;
