@@ -158,8 +158,10 @@ with python3.13's output.
   check` clean; `ide_memprobe --check` passes.
 - The merge conflicted only in the lexer, where parts A and C made the same
   comment-line fix.
-- Windows 64-bit (under Wine): built, `pe_unwind_check` clean, the sweep 417
-  runs, 0 not ok - after two fixes found there: vm_audit92 launched
+- Windows 64-bit (under Wine): built, `pe_unwind_check` clean; the sweep 417
+  runs, 415 ok and vm_audit92 timing out on both engines. After two fixes
+  vm_audit92 passes 49/49 under Wine on both engines (the sweep was not run
+  again): it launched
   `./ny_test` (the Linux build) instead of `sys.executable` and hung; and
   **the debugger kept a recording's file names JSON-escaped** (`C:\\\\users`
   with doubled backslashes - `_add_step` reads them from the raw line without
