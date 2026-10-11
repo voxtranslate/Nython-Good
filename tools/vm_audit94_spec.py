@@ -391,6 +391,7 @@ chk("escaping and short_empty_elements", "[ET.tostring(esc, encoding='unicode'),
 chk("method=html", "[ET.tostring(ET.fromstring('<p><br/>x<script>a&lt;b</script></p>'), method='html')]")
 chk("indent and write", "[ET.tostring(ind.getroot(), encoding='unicode'), wb.getvalue(), ws.getvalue()]")
 chk("register_namespace", "ET.tostring(ET.Element('{urn:my}tag', {'{urn:my}at': '1'}), encoding='unicode')")
+chk("default_namespace, xml_declaration, parse", "[ET.tostring(ET.fromstring('<q:a xmlns:q=\"urn:q\"><q:b/></q:a>'), encoding='unicode', default_namespace='urn:q'), ET.tostring(ET.Element('a'), xml_declaration=True, encoding='unicode'), ET.parse(io.BytesIO(b'<r><s>1</s></r>')).getroot().find('s').text, ET.parse(io.StringIO('<r a=\"b\"/>')).getroot().attrib, err(lambda: ET.tostring(ET.Element('{u}a'), default_namespace='v'))]")
 chk("iterparse events", "iter_events")
 chk("XMLPullParser", "[pull1, pull2]")
 chk("TreeBuilder comments and PIs", "[(c.tag is ET.Comment, c.tag is ET.PI, c.text) for c in tb_root]")

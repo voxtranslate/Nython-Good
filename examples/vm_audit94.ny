@@ -438,6 +438,8 @@ check('indent and write', [ET.tostring(ind.getroot(), encoding='unicode'), wb.ge
       ['<a>\n  <b>\n    <c />\n  </b>\n  <d>t</d>\n</a>', b"<?xml version='1.0' encoding='utf-8'?>\n<a>\n  <b>\n    <c />\n  </b>\n  <d>t</d>\n</a>", '<ns0:a xmlns:ns0="urn:q"><ns0:b /></ns0:a>'])
 check('register_namespace', ET.tostring(ET.Element('{urn:my}tag', {'{urn:my}at': '1'}), encoding='unicode'),
       '<my:tag xmlns:my="urn:my" my:at="1" />')
+check('default_namespace, xml_declaration, parse', [ET.tostring(ET.fromstring('<q:a xmlns:q="urn:q"><q:b/></q:a>'), encoding='unicode', default_namespace='urn:q'), ET.tostring(ET.Element('a'), xml_declaration=True, encoding='unicode'), ET.parse(io.BytesIO(b'<r><s>1</s></r>')).getroot().find('s').text, ET.parse(io.StringIO('<r a="b"/>')).getroot().attrib, err(lambda: ET.tostring(ET.Element('{u}a'), default_namespace='v'))],
+      ['<a xmlns="urn:q"><b /></a>', "<?xml version='1.0' encoding='utf-8'?>\n<a />", '1', {'a': 'b'}, 'no error'])
 check('iterparse events', iter_events,
       [('start-ns', ('', 'u')), ('start', '{u}a'), ('start', '{u}b'), ('end', '{u}b'), ('start', '{u}c'), ('end', '{u}c'), ('end', '{u}a'), ('end-ns', None)])
 check('XMLPullParser', [pull1, pull2],
