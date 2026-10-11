@@ -536,6 +536,14 @@ async def cv_main2():
     request_id.set("m")
     await cv_setter()
     return request_id.get()
+def cv_in_thread():
+    old = request_id.get()
+    request_id.set("changed in thread")
+    return old
+async def cv_main3():
+    request_id.set("caller")
+    r = await asyncio.to_thread(cv_in_thread)
+    return [r, request_id.get()]
 ''')
 chk("ContextVar get / set / reset", "cv_log")
 chk("Context.run and the mapping", "cv_run")
@@ -544,6 +552,7 @@ chk("Token.MISSING and reprs", "[repr(Token.MISSING), repr(cv_v).startswith(\"<C
 chk("a new thread starts with an empty context", "thread_seen")
 chk("each asyncio task runs in a copy of its creator's context", "asyncio.run(cv_main())")
 chk("an awaited coroutine shares its caller's context", "[asyncio.run(cv_main2()), request_id.get()]")
+chk("asyncio.to_thread runs in a copy of the caller's context", "asyncio.run(cv_main3())")
 
 # ── concurrent.futures ───────────────────────────────────────────────────────
 code('''

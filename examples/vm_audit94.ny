@@ -613,6 +613,14 @@ async def cv_main2():
     request_id.set("m")
     await cv_setter()
     return request_id.get()
+def cv_in_thread():
+    old = request_id.get()
+    request_id.set("changed in thread")
+    return old
+async def cv_main3():
+    request_id.set("caller")
+    r = await asyncio.to_thread(cv_in_thread)
+    return [r, request_id.get()]
 check('ContextVar get / set / reset', cv_log,
       [1, 'v', 5, True, True, 1])
 check('Context.run and the mapping', cv_run,
@@ -627,6 +635,8 @@ check("each asyncio task runs in a copy of its creator's context", asyncio.run(c
       [['parent/child1', 'parent2/child2'], 'parent2'])
 check("an awaited coroutine shares its caller's context", [asyncio.run(cv_main2()), request_id.get()],
       ['inner', 'none'])
+check("asyncio.to_thread runs in a copy of the caller's context", asyncio.run(cv_main3()),
+      ['caller', 'caller'])
 
 # ── concurrent.futures ───────────────────────────────────────────────────────
 import logging
