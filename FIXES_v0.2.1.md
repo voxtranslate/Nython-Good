@@ -5618,3 +5618,15 @@ Full detail in `HANDOFF.md` §0q, §0q2, §0q3. New tests: `vm_audit88` (the dat
 | `{Fraction(2), 2}` had two elements on the interpreter | hashed objects were keyed by class name plus hash | same-hash keys compared with `__eq__` |
 | `__str__` returning None printed the default repr; `__len__` returning -1 was accepted | protocol results were not checked | TypeError/ValueError with Python's messages |
 
+## Round 79 — binary data and serialization, tracing and profiling, text formats
+
+Full detail in `HANDOFF.md` §0r. New test: `vm_audit93` (zlib, archives, pickle, `__slots__`, `__class__` assignment, 176 checks; passes under python3 too).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| No zlib, gzip, zipfile, tarfile, binascii, pickle, copyreg, array | — | native DEFLATE (`nyzlib.cpp`) and the modules over it, interoperable with CPython both ways; pickle byte-identical for builtin values |
+| `__slots__` was an ordinary class variable | no member descriptors | CPython's slots: member descriptors, dictless instances, its errors |
+| `obj.__class__ = Other` created a field | no class switch | CPython's layout checks, then the instance retagged (interpreter) / every value rewritten (VM) |
+| `P().__reduce_ex__(2)`, `__getstate__()` did not exist | `object` had no reduce protocol | CPython's `reduce_newobj` / `object_getstate` |
+| A program's `let list = []` broke `abc.ABC` once slots were processed | prelude chunks load lazily into the program's globals | the slots chunk calls builtins through unrebindable names |
+

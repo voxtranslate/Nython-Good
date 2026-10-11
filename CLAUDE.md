@@ -372,6 +372,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit89 | 62 | round 78: frame objects (sys._getframe, inspect.stack/currentframe/getframeinfo/getargvalues, traceback frames with locals, gi_frame, logging's caller info), weak references to functions/classes/sets/builtin subclasses, coroutine objects driven by hand (send/throw/close, cr_*, never-awaited warning), async generator objects (passes under python3) |
 | vm_audit87 | 73 | round 77: `in`/ordering TypeErrors, exceptions' str/repr/args and fields (OSError errno/filename, Unicode errors, SyntaxError), runtime errors with their fields, `iter(f, sentinel)`, generator attributes, `__format__`, `os.stat_result`, live `exec` namespaces, recursive reprs (72 pass under python3) |
 | vm_audit90 | 65 | round 78: lazy `range` (CPython's rangeobject.c: big ints, len/OverflowError, indexing, slicing to a range, O(1) `in`, index/count, ==/hash, repr, read-only start/stop/step, `sum` in O(1)), live dict views (set operations, comparisons, isdisjoint, `.mapping`, reversed, "dictionary changed size during iteration"), lazy zip/map/filter/enumerate/reversed (`zip(strict=True)`) - 63 pass under python3 |
+| vm_audit93 | 176 | round 79: zlib (native DEFLATE, CPython-made streams read and Nython-made ones read by CPython, the opt-in optimal parse), binascii, gzip, zipfile, tarfile, pickle byte-identical to CPython at protocols 0-5, copyreg, array, `__slots__`, `__class__` assignment (passes under python3) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -1083,6 +1084,20 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   `__eq__` among same-hash keys; `__str__`/`__len__`/`__bool__`/
   `__hash__`/`__iter__` results are checked; `object()` takes no
   attributes.
+
+## Round 79: binary data and serialization (see `HANDOFF.md` §0r)
+
+- **zlib without a system zlib**: `src/builtins/nyzlib.cpp` (inflate,
+  deflate after zlib's algorithm, crc32/adler32), reached through the
+  hashing bridge (`_zlib_*`); `lib/zlib.ny` is Python's API.
+  `zlib.compress_optimal()` is Nython's opt-in Zopfli-style optimal parse.
+- `lib/`: binascii, gzip, zipfile, tarfile, pickle (byte-identical to
+  CPython for builtin values, protocols 0-5), copyreg, array.
+- `__slots__` (the prelude's lazily loaded `#@ slots` chunk: member
+  descriptors, dictless instances) and `obj.__class__ = Other` (CPython's
+  layout errors) on both engines; `object.__reduce_ex__`/`__getstate__`.
+- Prelude mirror chunks run in the program's globals: call builtins there
+  through names a program cannot rebind (`_ny_b_list`, ...).
 
 ## Transcripts
 

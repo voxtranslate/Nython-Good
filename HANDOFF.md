@@ -3,7 +3,10 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 78 — **§0q** (lazy `range`, live dict views, lazy
+Last updated: round 79 — **§0r** (zlib/DEFLATE written natively with an
+opt-in Zopfli-style optimal parse; binascii, gzip, zipfile, tarfile, pickle
+byte-identical to CPython's, copyreg, array; `__slots__` and `__class__`
+assignment; both engines). Round 78 — **§0q** (lazy `range`, live dict views, lazy
 zip/map/filter/enumerate/reversed), **§0q2** (frame objects, weak references to
 functions/classes/sets, coroutine and async generator objects) and **§0q3**
 (the data-model gaps: name mangling, methods bound whatever their first
@@ -40,6 +43,101 @@ multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
 
 ---
+
+## 0r. Round 79, part B — zlib, archives, pickle, `__slots__`, `__class__` assignment (vm_audit93)
+
+`examples/vm_audit93.ny` (176 checks) passes on the interpreter, the VM and
+python3; every expected value is CPython's, streams/archives/pickles made by
+CPython are embedded and read, and (python3 on PATH) CPython decompresses
+and reads what Nython wrote.
+
+### DEFLATE, natively (`src/builtins/nyzlib.cpp`, namespace `nyz`)
+- No system zlib (the MinGW and 32-bit builds link what `nython.cbp` lists):
+  crc32 (slicing-by-8), adler32, crc_hqx; an `Inflater` for raw/zlib/gzip/
+  auto streams that resumes on any input chunking (it marks and rolls back
+  when input runs out), with zlib's error messages; a `Deflater` after
+  zlib's algorithm (its level table and lazy matching, length-limited
+  Huffman codes by package-merge, `scan_tree` run-length coding, its choice
+  of stored/fixed/dynamic blocks, strategies, every flush mode, preset
+  dictionaries, `deflateInit2`'s rules). Sizes are within a few bytes of
+  CPython's zlib at every level (6 MB of text: level 9 823,642 vs 823,649).
+- Reached through the existing hashing bridge (`hash_builtin_names()` /
+  `dispatch_hash` forward `_zlib_*`), so both engines have the natives.
+- **Innovation, opt-in**: `zlib.compress_optimal(data, iterations=15)` (or
+  `compress(..., nython_optimal=True)`), an optimal parse after Zopfli
+  (Alakuijala & Vandevenne, 2013): long hash chains with the match length at
+  every distance, an entropy cost model re-estimated each iteration, a
+  shortest-path parse and block splitting. Standard DEFLATE (CPython reads
+  it), 5-10% smaller than level 9 (word text 21,298 -> 19,773; Nython
+  source 13,432 -> 12,726).
+
+### Modules (`lib/`)
+- `zlib` (Python's API: `compress`/`decompress`, `compressobj`/
+  `decompressobj` with every parameter and `zdict`, `copy`, flush modes,
+  `unconsumed_tail`/`unused_data`/`eof`, `crc32`/`adler32`, `error`),
+  `binascii` (the 3.11 module), `gzip` (`GzipFile`, multi-member,
+  `compress(mtime=0)` byte-identical to 3.11), `zipfile` (r/w/x/a, STORED
+  and DEFLATED, ZIP64, data descriptors, sanitized extraction, ZipCrypto
+  reading, `zipfile.Path`, `-m zipfile`), `tarfile` (ustar/gnu/pax read and
+  write, `:gz` and stream modes, PEP 706 filters, `-m tarfile`), `pickle`
+  (after `_pickle.c`: **byte-identical to CPython for builtin values at
+  protocols 0-5**, every opcode loaded, the reduce protocol with
+  `__getnewargs(_ex)__`/`__getstate__`/`__setstate__`/slot state,
+  `dispatch_table`, `reducer_override`, persistent ids, protocol-5
+  out-of-band buffers), `copyreg`, `array` (every typecode, CPython's
+  overflow messages, pickling). `copy`, `functools.partial` and `weakref`
+  follow the new protocols.
+
+### Engines
+- `object` has `__reduce_ex__`, `__reduce__`, `__getstate__` (CPython's
+  `reduce_newobj`/`object_getstate` in Nython, `copyreg._ny_*`); a class
+  without an explicit base reaches them through the `object` fallback
+  (`findClassMember` / VM `class_lookup`).
+- **`__slots__`**: the prelude's `#@ slots` mirror chunk, loaded the first
+  time a class namespace has `__slots__` or `__class__` is assigned:
+  `_NyMemberDescriptor` (`member_descriptor`, `<member 'x' of 'C' objects>`)
+  per slot, `_ny_init_slots(cls)` doing `type.__new__`'s checks (CPython's
+  errors), flags (`_ny_mark_slots`: no `__dict__`, no weak references).
+  Dictless instances reject other names, have no `__dict__`/`vars()`, slot
+  values stay out of `__dict__`. The chunk calls builtins only through
+  `_ny_b_list`... (a program that rebinds `list` broke it).
+- **`obj.__class__ = Other`**: CPython's three errors (`_ny_class_layout`,
+  `_ny_set_class`), then `_ny_switch_class`: the interpreter retags the
+  instance (its class is keyed by identity); the VM, whose values carry
+  their class name, rewrites every value pointing at that instance (stack,
+  frames, globals, class variables, every container the collector tracks -
+  `vmgc::for_each_value`). `del obj.__class__` is a TypeError.
+
+### Not done
+- After `zipfile.ZIP_FILECOUNT_LIMIT = 3` from outside, the module's own code
+  still sees the old value (module globals assigned from another module;
+  both engines).
+- Instances of a class without an explicit base still miss most `object`
+  members (`hasattr(P(), "__setattr__")` is false, `P.__new__` missing);
+  only the three pickle-protocol names were added to the fallback.
+- Prelude mirror chunks resolve builtins in the program's globals: only the
+  slots chunk is protected from a program rebinding `list`/`dict`/...
+- `dataclass(slots=True)` sets `__slots__` without rebuilding the class.
+- pickle memoizes str/bytes by value (valid, different only for equal
+  strings built at run time); sets are written in insertion order; no
+  `pickletools`; no memoryview (`PickleBuffer` wraps bytes/bytearray).
+- zipfile: no bzip2/lzma (RuntimeError as CPython without them), no writing
+  of encrypted members, AES, multi-disk; tarfile: no bz2/xz, no chown,
+  device/FIFO members not created.
+- Missing elsewhere, found here: `sys.version_info`, `__import__`, codecs
+  `surrogatepass`/`cp437`, the `stat` module, `os.chown/mkfifo/getuid/
+  fspath/scandir`, `os.path.splitdrive/lexists`; builtin exception classes
+  report `__module__` `"__main__"`; on the VM `f_builtins["len"] is len` is
+  false.
+- The VM's class switch misses a reference held only on the native side.
+
+### Verified
+- At the agent's c9b4853 (identical code to the merge; the branch head had
+  added one doc line): the sweep 409 runs, 0 not ok; `ide_e2e` 373/373;
+  `ny_classcheck` and `cbp.py check` clean.
+- After merging: vm_audit93 176/176 on the interpreter, the VM and python3;
+  vm_audit53, 55, 64, 85, 86, 88, 89, 90 and v5_spec_compliance_test pass on
+  both engines.
 
 ## 0q. Round 78, part 1 — lazy `range`, live dict views, lazy builtins (both engines)
 
