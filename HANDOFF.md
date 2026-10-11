@@ -278,6 +278,13 @@ ide_lint and ide_memprobe clean.
 
 ---
 
+### Verified after merging onto the branch head (66d7877)
+- Linux, both engines: the sweep 419 runs, 0 not ok; vm_audit96 116 on the
+  interpreter and the VM, 115 under python3 (one Nython-only check);
+  vm_audit24 (the only `${...}` user), 44, 77, 84, 88, 91-94 still pass;
+  `ide_e2e` 390/390; `ide_lint`, `ny_classcheck`, `cbp.py check` clean;
+  `ide_memprobe --check` passes. The merge had no conflicts.
+
 ## 0r3. Round 79, part A — `sys.settrace`/`setprofile`, pdb and the profilers, "Why?" in the debugger (vm_audit91, vm_audit92)
 
 `examples/vm_audit91.ny` (104 checks) passes on the interpreter, the VM and
