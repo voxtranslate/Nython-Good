@@ -4945,6 +4945,17 @@ private:
             for(size_t k=0;k<a.list->size();k++) if(!vm_eq((*a.list)[k],(*b.list)[k])) return false;
             return true;
         }
+        // round 79: a dict's values are compared with == too, so an object's
+        // __eq__ counts ({"d": date(2024, 1, 2)} == {"d": date(2024, 1, 2)}
+        // was False: VMVal's == compares instances by identity)
+        if(a.type==VMType::MAP&&b.type==VMType::MAP&&a.map&&b.map&&a.map!=b.map){
+            if(a.map->size()!=b.map->size()) return false;
+            for(auto& kv:*a.map){
+                auto it=b.map->find(kv.first);
+                if(it==b.map->end()||!vm_eq(kv.second,it->second)) return false;
+            }
+            return true;
+        }
         return a==b;
     }
     bool vm_ne(const VMVal& a, const VMVal& b) {
@@ -10782,8 +10793,10 @@ private:
         tag_module_code(code, env);
         code->module_top=true;
         // Registered before the module runs, so a circular import binds it.
-        auto nsmap=std::make_shared<VMMap>(); vmgc::track_map(nsmap);
-        VMVal nsv=VMVal::make_map(); nsv.map=nsmap; nsv.class_name=name;
+        // round 79: the namespace IS the module's globals map, so the module
+        // object stays live (a `global` rebinding inside it is what importers
+        // read, `mod.x = v` from outside is what its code sees), as Python's.
+        VMVal nsv=VMVal::make_map(); nsv.map=env; nsv.class_name=name;
         module_ns_[name]=nsv;
         bool old_exp=export_to_globals_; int old_depth=export_depth_;
         export_to_globals_=false; export_depth_=-1;
@@ -10792,7 +10805,6 @@ private:
         try{ exec_code(code,{},std::nullopt); }
         catch(VMReturn&){}
         catch(...){ module_ns_.erase(name); globals_.erase("__imported_"+name); throw; }
-        for(auto& kv:*env) (*nsmap)[kv.first]=kv.second;
         for(auto& sub:code->sub_codes) if(sub->is_class&&!class_reg_.count(sub->name)) class_reg_[sub->name]=sub;   // keep the class MAKE_CLASS made (a copy for metaclass= / expression bases), round 77
         return nsv;
     }
@@ -12072,6 +12084,17 @@ private:
                 std::string enc=(ev&&ev->type!=VMType::NONE)?vm->vm_str(*ev):std::string("utf-8");
                 std::string err=(rv&&rv->type!=VMType::NONE)?vm->vm_str(*rv):std::string("strict");
                 return VMVal::make_bytes(vm->nycall([&]{ return nypy::str_encode(obj.s,enc,err); }));
+            }
+            // round 79: keyword arguments go where the method takes them
+            // (NyStr.hpp: str_kw_slot); they used to be dropped
+            if(kw.type==VMType::MAP&&kw.map&&!kw.map->empty()){
+                for(auto& kv:*kw.map){
+                    if(vm_internal_key(kv.first)) continue;
+                    std::string k=nypy::key_payload(kv.first);
+                    size_t pos=vm->nycall([&]{ return nypy::str_kw_slot(m,k); });
+                    if(a.size()<=pos) a.resize(pos+1,VMVal::make_none());
+                    a[pos]=kv.second;
+                }
             }
             std::vector<nypy::SArg> sa; sa.reserve(a.size());
             for(auto& v:a) sa.push_back(vm->to_sarg(v));

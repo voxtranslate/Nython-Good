@@ -655,6 +655,7 @@ struct Task : Obj {
     bool timer_set = false;
     std::multimap<std::pair<TP, uint64_t>, Task*>::iterator timer_it;
     Coro* manual = nullptr;                  // a coroutine driven by hand (round 78: coro_drive)
+    BoxPtr ctx_data;                         // round 79: the contextvars mapping it starts with
 };
 
 // A task waiting for a socket or pipe to be ready (wait_io, section 9).
@@ -1416,6 +1417,14 @@ static BoxPtr run_coro_body(Engine& e, Coro* c) {
 static Task* new_task_locked(Loop* L, Engine& e, std::function<BoxPtr(Engine&)> entry, const std::string& name) {
     auto t = std::make_shared<Task>();
     t->loop = L; t->engine = &e; t->entry = std::move(entry); t->name = name;
+    // round 79 (lib/contextvars.ny, PEP 567): a task runs in a copy of the
+    // context current where it was made. The context's mapping is immutable
+    // (each ContextVar.set makes a new one), so the copy is one reference,
+    // handed to the task's record when it starts (grant).
+    if (t_self) {
+        auto ci = t_self->tls.find("__ny_ctx_data");
+        if (ci != t_self->tls.end()) t->ctx_data = ci->second;
+    }
     add_obj(t, true);
     L->tasks.push_back(t);
     L->ready.push_back(t.get());
@@ -1517,6 +1526,7 @@ static void grant(std::unique_lock<std::mutex>& lk, Loop* L, Task* t) {
         rec->cancel_sticky = false;
         rec->started = true;
         rec->estate = t->engine->state_new();
+        if (t->ctx_data) rec->tls["__ny_ctx_data"] = std::move(t->ctx_data);   // round 79: contextvars
         t->thr = rec;
         try { t->co = nycoro::create(&task_entry, t, task_stack_size()); }
         catch (std::bad_alloc&) {

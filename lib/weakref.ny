@@ -620,6 +620,10 @@ class WeakValueDictionary:
     def __setitem__(self, key, value):
         self.data[key] = KeyedRef(value, self._remove, key)
 
+    def clear(self):
+        # (round 79: MutableMapping's clear - zoneinfo's clear_cache uses it)
+        self.data.clear()
+
     def copy(self):
         var dup = WeakValueDictionary()
         for pair in list(self.data.items()):
@@ -842,6 +846,11 @@ class WeakKeyDictionary:
             if k is not None:
                 out.append((k, e[1], e[0]))
         return out
+
+    def clear(self):
+        # (round 79: MutableMapping's clear)
+        self._entries.clear()
+        self._index.clear()
 
     def __delitem__(self, key):
         var s = self._find(key)

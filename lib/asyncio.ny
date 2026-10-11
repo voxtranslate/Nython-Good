@@ -447,7 +447,13 @@ async def to_thread(func, *args, **kwargs):
     # func(*args, **kwargs) on a thread of its own; awaiting it lets the loop
     # run meanwhile.
     var fut = Future()
+    # round 79: the thread runs in a copy of the caller's context, as
+    # CPython's to_thread (contextvars.copy_context().run): the context's
+    # mapping is immutable, so the copy is the reference (lib/contextvars.ny)
+    var ctx_data = thread_local_get("__ny_ctx_data", none)
     def work():
+        if ctx_data is not none:
+            thread_local_set("__ny_ctx_data", ctx_data)
         try:
             var r = func(*args, **kwargs)
             fut._result = r

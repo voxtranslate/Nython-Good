@@ -4669,18 +4669,31 @@ public:   // NythonExecutor is a struct: members default to public
             // Call __iter__ if present to get the iterator (may return self)
             std::vector<Value> no_args;
             Value iterator = have_pre_iterator ? pre_iterator : iter_val;
-            if (!instanceHasMethod(iterator, "__next__"))
-                throw std::string("__exc__:TypeError:'" + shownClassName(instanceClassName(iterator)) + "' object is not iterable");
+            // round 79: the sequence protocol - __getitem__(0), (1), ...
+            // until IndexError, Python's fallback for an object with no
+            // __iter__ (list(obj) took it; a for loop said "not iterable")
+            bool by_index = false;
+            int by_index_i = 0;
+            if (!instanceHasMethod(iterator, "__next__")) {
+                if (!have_pre_iterator && instanceHasMethod(iterator, "__getitem__")) by_index = true;
+                else throw std::string("__exc__:TypeError:'" + shownClassName(instanceClassName(iterator)) + "' object is not iterable");
+            }
             // Now call __next__ repeatedly until StopIteration
             while (true) {
                 Value item;
                 bool stop = false;
                 try {
-                    item = callMethod(iterator, "__next__", no_args, ctx);
+                    if (by_index) {
+                        std::vector<Value> ia{Value(by_index_i++)};
+                        item = callMethod(iterator, "__getitem__", ia, ctx);
+                    } else {
+                        item = callMethod(iterator, "__next__", no_args, ctx);
+                    }
                 } catch (nython::node::ReturnSignal& rs) {
                     item = rs.value;
                 } catch (std::string& exc) {
-                    if (excTypeMatches(exc, "StopIteration") || exc.find("StopIteration") != std::string::npos) { stop = true; }
+                    if (by_index ? (excTypeMatches(exc, "IndexError") || excTypeMatches(exc, "StopIteration"))
+                                 : (excTypeMatches(exc, "StopIteration") || exc.find("StopIteration") != std::string::npos)) { stop = true; }
                     else throw;
                 }
                 if (stop) break;
@@ -5190,9 +5203,22 @@ public:   // NythonExecutor is a struct: members default to public
                     std::vector<Value> none;
                     return makeStringValue(strFormat(s, none, kw, ctx));
                 }
+                // round 79: keyword arguments go where the method takes them
+                // (NyStr.hpp: str_kw_slot); they used to be dropped
+                std::vector<Value> kargs;
+                const std::vector<Value>* sargs = &args;
+                if (!kw_args_in.empty()) {
+                    kargs = args;
+                    for (auto& kv : kw_args_in) {
+                        size_t pos = nyCall([&] { return nypy::str_kw_slot(method_name, kv.first); });
+                        if (kargs.size() <= pos) kargs.resize(pos + 1, NONE_VALUE);
+                        kargs[pos] = kv.second;
+                    }
+                    sargs = &kargs;
+                }
                 std::vector<nypy::SArg> sa;
-                sa.reserve(args.size());
-                for (auto& a : args) sa.push_back(toSArg(a, ctx));
+                sa.reserve(sargs->size());
+                for (auto& a : *sargs) sa.push_back(toSArg(a, ctx));
                 nypy::SRes r;
                 if (nyCall([&] { return nypy::str_method(s, method_name, sa, r); })) return fromSRes(r);
             }
@@ -10849,6 +10875,14 @@ public:
         Context* mctx = new Context(runner, module_name, nullptr, nullptr, module_base_ctx_ ? module_base_ctx_ : global_ctx);
         mctx->inModule = true;
         mctx->parentFilter = &module_filter_;
+        // round 79: the module's scope IS its namespace's map (as exec(src,
+        // ns) does), so the module object stays live: what its functions
+        // rebind with `global` is what importers read (mimetypes.inited,
+        // zoneinfo.TZPATH), and `mod.x = v` from outside is what they see.
+        delete mctx->container;
+        mctx->container = ns->container;
+        mctx->ns_owner = ns;
+        nygc::incref(ns);
         module_ctxs_.push_back(mctx);
         mctx->defineByName("__name__", makeStringValue(module_name));
         mctx->defineByName("__file__", makeStringValue(filepath));
@@ -10862,7 +10896,6 @@ public:
             catch (std::exception& e) { tbUnwind(excFromCpp(e.what())); module_ns_.erase(module_name); imported_modules_.erase(module_name); throw; }
         }
         for (auto& kv : func_names) if (!before.count(kv.first)) module_owned_.insert(kv.first);
-        for (auto& kv : *mctx->container) ns->set(kv.first, kv.second);
         return nsv;
     }
     Value importModule(const std::string& filepath, const std::string& module_name,

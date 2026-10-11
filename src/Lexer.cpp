@@ -511,9 +511,20 @@ inline std::vector<Token> optimize(std::vector<Token> tk) {
         // literal continued on the next line inside parentheses was a
         // syntax error. Line breaks skipped inside brackets keep their
         // indentation bookkeeping (paren_indent_delta).
-        if(tk[i].type()==TokenType::String) {
-            Token token = tk[i];
-            int j = i + 1, last = i, d = 0, d_last = 0;
+        // round 79: f-strings join the run too ("a" f"{x}", f"{x}" f"{y}",
+        // Python's implicit concatenation): an f-string is the token `f`
+        // then its text, so a run holding one becomes one f-string, the
+        // braces of its plain pieces doubled so that they stay literal.
+        auto f_at = [&](int k) {
+            return k + 1 < nb && tk[k].type()==TokenType::Identifier && tk[k].value=="f"
+                && tk[k+1].type()==TokenType::String;
+        };
+        if(tk[i].type()==TokenType::String || f_at(i)) {
+            int first_str = f_at(i) ? i + 1 : i;
+            int f_tok = f_at(i) ? i : -1;
+            Token token = tk[first_str];
+            std::vector<std::pair<bool, std::string>> parts{{f_tok >= 0, tk[first_str].value}};
+            int j = first_str + 1, last = first_str, d = 0, d_last = 0;
             while(j < nb) {
                 TokenType t = tk[j].type();
                 if(paren_depth > 0 && (t==TokenType::NewLine || t==TokenType::Indent || t==TokenType::Dedent)) {
@@ -522,11 +533,23 @@ inline std::vector<Token> optimize(std::vector<Token> tk) {
                     j++;
                     continue;
                 }
-                if(t==TokenType::String) { token.value.append(tk[j].value); last = j; d_last = d; j++; continue; }
+                if(t==TokenType::String) { parts.push_back({false, tk[j].value}); last = j; d_last = d; j++; continue; }
+                if(f_at(j)) {
+                    parts.push_back({true, tk[j+1].value});
+                    if(f_tok < 0) f_tok = j;
+                    last = j + 1; d_last = d; j += 2;
+                    continue;
+                }
                 break;
             }
-            if(last > i) {
+            if(last > first_str) {
                 paren_indent_delta += d_last;
+                token.value.clear();
+                for(auto& pc : parts) {
+                    if(f_tok < 0 || pc.first) { token.value += pc.second; continue; }
+                    for(char c : pc.second) { token.value += c; if(c=='{' || c=='}') token.value += c; }
+                }
+                if(f_tok >= 0) ret.push_back(tk[f_tok]);
                 ret.push_back(token);
                 i = last + 1;
                 continue;
@@ -598,6 +621,17 @@ void Lexer::read_token() {
     reset_token();
     source.reset_frame();
     bool potential_keyword = true;
+    // round 79: the ++ / -- at the current character sits between an operand
+    // and another operand glued to it (x--y): Python's binary and unary sign
+    auto glued_unary = [this]() {
+        char n = this->source.peek_char(1);
+        bool operand_next = std::isalnum((unsigned char)n) || n == '_' || n == '(' || n == '['
+                            || n == '"' || n == '\'' || (unsigned char)n >= 0x80;
+        if (!operand_next || tokens.empty()) return false;
+        TokenType pt = tokens.back().type();
+        return pt == TokenType::Identifier || pt == TokenType::Integer || pt == TokenType::Float
+            || pt == TokenType::ParenClose || pt == TokenType::BracketClose || pt == TokenType::String;
+    };
     switch(source.read_char()) {
         case '0':
         case '1':
@@ -1019,6 +1053,15 @@ void Lexer::read_token() {
         }
         /// + -  *
         case '+': {
+            // round 79: x++y / x--y are Python's x + (+y) / x - (-y): after
+            // an operand, a ++ or -- glued to another operand is two
+            // operators, not Nython's postfix increment / decrement
+            // (_pydecimal's `a--n//a>>1` read as a decrement)
+            if (this->source.peek_char() == '+' && glued_unary()) {
+                this->token.value = "+";
+                make_token(TokenType::Add,TokenKind::Plus,TokenClass::Operator);
+                break;
+            }
             switch (this->source.peek_char()) {
                 case '+': {
                   this->token.value = "++";
@@ -1041,6 +1084,11 @@ void Lexer::read_token() {
             break;
         }
         case '-': {
+            if (this->source.peek_char() == '-' && glued_unary()) {   // round 79: see '+'
+                this->token.value = "-";
+                make_token(TokenType::Sub,TokenKind::Minus,TokenClass::Operator);
+                break;
+            }
             switch (this->source.peek_char()) {
                 case '-': {
                   this->token.value = "--";
@@ -1759,6 +1807,11 @@ bool Lexer::handle_indentation() {
 		else break;
 	}
 	source.put_char();
+	// round 79: a comment-only line does not change the indentation, as in
+	// Python's tokenizer - a comment indented deeper than the code around it
+	// (a continued trailing comment) or less (one at column 0 inside a
+	// function) was an Indent/Dedent and a syntax error
+	if(c == '#') return false;
 	if(col > indent) {
 		///Adjust the current indentation level.
 		indent = col;

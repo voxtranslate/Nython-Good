@@ -3567,8 +3567,13 @@ node_ptr Parser::tryStmt(){
     // Nython catch-all binding `except e:` otherwise. Both engines used to
     // read every bare name as a binding, so `except ValueError:` caught
     // everything - and rebound the name ValueError to the exception.
+    // round 79: a private class name counts too (`except _Stop:`, after its
+    // leading underscores) - it was a catch-all binding named _Stop, which
+    // caught every exception
     auto is_type_name = [](const std::string& n) {
-        return nython::ny_is_builtin_exc(n) || (!n.empty() && n[0] >= 'A' && n[0] <= 'Z')
+        size_t u = 0;
+        while (u < n.size() && n[u] == '_') u++;
+        return nython::ny_is_builtin_exc(n) || (u < n.size() && n[u] >= 'A' && n[u] <= 'Z')
                || n.find('.') != std::string::npos;
     };
     // `except mod.Error`: the whole dotted name; both engines look it up in
