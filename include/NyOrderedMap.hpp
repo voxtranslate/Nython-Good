@@ -294,6 +294,9 @@ public:
     // each step): slots 0 .. slot_end()-1, nullptr for an erased one.
     size_t slot_end() const { return slots_.size(); }
     const value_type* slot_at(size_t n) const { return n < slots_.size() && slots_[n].live ? &slots_[n].kv : nullptr; }
+    // The slot number holding key k, or -1 (round 80: the VM's inline
+    // caches keep it and check the key at that slot on each use).
+    long index_of(std::string_view k) const { return find_slot(k); }
     void reserve(size_t n) { if (n > kSmall && index_.size() < n * 2) { if (index_.empty()) index_all(); rebuild_index(n * 2); } }
     void clear() { slots_.clear(); index_.clear(); live_ = 0; used_ = 0; }
 

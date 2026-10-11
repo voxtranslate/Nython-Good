@@ -159,16 +159,110 @@ enum class Op : uint8_t {
     // prelude's range / the receiver a plain dict; anything else is called
     // as written and then iterated as GET_ITER would (round 78).
     FOR_PREP,
+
+    // ── Specialized forms (round 80: quickening, PEP 659 / Brunthaler) ──
+    // The compiler never emits these. A generic instruction that has run a
+    // few times rewrites itself in place into one of them (specialize_at)
+    // and fills its inline cache (VMCode::quick); each one checks a cheap
+    // guard and, when it fails, runs as its generic form (base_op) - after
+    // enough misses it rewrites itself back (deopt) with an exponential
+    // backoff before it may specialize again. Nothing else ever sees them:
+    // base_op() maps each to its generic op for every reader of the
+    // instruction stream.
+    LOAD_NAME_FAST,      // a local of the running frame: a slot of fr.locals
+    LOAD_NAME_MOD,       // a module-level name read in a function: a slot of the module frame's map
+    LOAD_NAME_GLOBAL,    // a builtin / imported global: a slot of globals_, the module map unchanged
+    STORE_NAME_FAST,     // an existing local of the running frame
+    LOAD_ATTR_INST,      // an instance's own field: a slot of its field map
+    LOAD_ATTR_CLASS,     // C.x on a class: the class namespace slot (type epoch)
+    LOAD_ATTR_MODULE,    // m.x on a module namespace: a slot of its map
+    STORE_ATTR_INST,     // an instance's existing field
+    CALL_FUNCTION_PY,    // f(a, b) of a plain function with exactly that many plain parameters
+    CALL_METHOD_PY,      // obj.m(a, b) of a plain method of obj's class (a small polymorphic cache)
+    BINARY_ADD_NUM, BINARY_SUB_NUM, BINARY_MUL_NUM, BINARY_DIV_NUM,   // int (64-bit) / float operands
+    BINARY_FLOOR_DIV_INT, BINARY_MOD_INT,
+    IADD_NUM, ISUB_NUM, IMUL_NUM,
+    COMPARE_EQ_NUM, COMPARE_NE_NUM, COMPARE_LT_NUM, COMPARE_LE_NUM, COMPARE_GT_NUM, COMPARE_GE_NUM,
+    FOR_ITER_RANGE,      // a loop's own range iterator (FOR_PREP / GET_ITER)
+    FOR_ITER_LIST,       // an item-vector iterator (a list or tuple snapshot)
+    OP_COUNT_
 };
+
+// The generic instruction a specialized one stands for (round 80).
+inline Op base_op(Op op) {
+    switch(op){
+    case Op::LOAD_NAME_FAST: case Op::LOAD_NAME_MOD: case Op::LOAD_NAME_GLOBAL: return Op::LOAD_NAME;
+    case Op::STORE_NAME_FAST: return Op::STORE_NAME;
+    case Op::LOAD_ATTR_INST: case Op::LOAD_ATTR_CLASS: case Op::LOAD_ATTR_MODULE: return Op::LOAD_ATTR;
+    case Op::STORE_ATTR_INST: return Op::STORE_ATTR;
+    case Op::CALL_FUNCTION_PY: return Op::CALL_FUNCTION;
+    case Op::CALL_METHOD_PY: return Op::CALL_METHOD;
+    case Op::BINARY_ADD_NUM: return Op::BINARY_ADD;
+    case Op::BINARY_SUB_NUM: return Op::BINARY_SUB;
+    case Op::BINARY_MUL_NUM: return Op::BINARY_MUL;
+    case Op::BINARY_DIV_NUM: return Op::BINARY_DIV;
+    case Op::BINARY_FLOOR_DIV_INT: return Op::BINARY_FLOOR_DIV;
+    case Op::BINARY_MOD_INT: return Op::BINARY_MOD;
+    case Op::IADD_NUM: return Op::IADD;
+    case Op::ISUB_NUM: return Op::ISUB;
+    case Op::IMUL_NUM: return Op::IMUL;
+    case Op::COMPARE_EQ_NUM: return Op::COMPARE_EQ;
+    case Op::COMPARE_NE_NUM: return Op::COMPARE_NE;
+    case Op::COMPARE_LT_NUM: return Op::COMPARE_LT;
+    case Op::COMPARE_LE_NUM: return Op::COMPARE_LE;
+    case Op::COMPARE_GT_NUM: return Op::COMPARE_GT;
+    case Op::COMPARE_GE_NUM: return Op::COMPARE_GE;
+    case Op::FOR_ITER_RANGE: case Op::FOR_ITER_LIST: return Op::FOR_ITER;
+    default: return op;
+    }
+}
+// Whether a generic instruction has specialized forms (it counts its runs).
+inline bool op_specializable(Op op) {
+    switch(op){
+    case Op::LOAD_NAME: case Op::STORE_NAME: case Op::LOAD_ATTR: case Op::STORE_ATTR:
+    case Op::CALL_FUNCTION: case Op::CALL_METHOD:
+    case Op::BINARY_ADD: case Op::BINARY_SUB: case Op::BINARY_MUL: case Op::BINARY_DIV:
+    case Op::BINARY_FLOOR_DIV: case Op::BINARY_MOD:
+    case Op::IADD: case Op::ISUB: case Op::IMUL:
+    case Op::COMPARE_EQ: case Op::COMPARE_NE: case Op::COMPARE_LT: case Op::COMPARE_LE:
+    case Op::COMPARE_GT: case Op::COMPARE_GE:
+    case Op::FOR_ITER:
+        return true;
+    default: return false;
+    }
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // INSTRUCTION
 // ═══════════════════════════════════════════════════════════════════════════
 struct Instruction {
     Op  op;
+    // Quickening (round 80), in what was padding (the struct stays 12
+    // bytes): `ctr` counts a specializable generic instruction's runs down
+    // to its next attempt at specializing; `ic` is its inline cache, an
+    // index (1-based, 0 = none yet) into its code object's VMCode::quick.
+    uint8_t  ctr = kWarmup;
+    uint16_t ic  = 0;
     int arg;
     int line;
+    static constexpr uint8_t kWarmup = 2;
     Instruction(Op o, int a=0, int ln=0) : op(o), arg(a), line(ln) {}
+    // Back to the generic form, as compiled (a copied code object).
+    void dequicken() { op=base_op(op); ctr=kWarmup; ic=0; }
+};
+static_assert(sizeof(Instruction)==12, "quickening keeps Instruction at 12 bytes");
+// The instruction vector of a code object. A copy (a class statement run
+// again copies its methods' code) starts unspecialized: its inline caches
+// are not copied (round 80).
+struct InstrVec : std::vector<Instruction> {
+    InstrVec() = default;
+    InstrVec(const InstrVec& o) : std::vector<Instruction>(o) { for(auto& i:*this) i.dequicken(); }
+    InstrVec(InstrVec&&) noexcept = default;
+    InstrVec& operator=(const InstrVec& o) {
+        if(this!=&o){ std::vector<Instruction>::operator=(o); for(auto& i:*this) i.dequicken(); }
+        return *this;
+    }
+    InstrVec& operator=(InstrVec&&) noexcept = default;
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -480,6 +574,77 @@ struct ExceptionEntry {
     std::string held;
 };
 
+// ── Inline caches (round 80) ────────────────────────────────────────────
+// One per specializable instruction of a code object that has started
+// specializing (VMQuick, allocated once and never moved or freed while the
+// code lives - a frame paused in a call keeps no reference into it anyway).
+// They hold no owning reference to any value: slot numbers, the identity
+// of a map they index (checked, never dereferenced unless it matches the
+// map in hand), and pointers into class namespaces valid while the type
+// epoch they were taken at is current (vm_type_epoch). The cycle collector
+// therefore has nothing to see here. Threads: a code object's caches are
+// shared by the threads running it; the GIL serializes every read and
+// write, and a specialized instruction copies what it needs out of its
+// cache before anything that can switch threads or re-enter the VM.
+struct VMICWay {                  // one receiver class of a polymorphic call site
+    std::string  cls;
+    const VMVal* fn = nullptr;    // the method: a slot of that class's namespace (or its MRO's)
+};
+struct VMIC {
+    uint64_t     epoch  = 0;      // vm_type_epoch() when filled (class-keyed entries)
+    const void*  map    = nullptr;// the map `slot` indexes (module frame, globals, module namespace)
+    const VMVal* ptr    = nullptr;// a class namespace slot (LOAD_ATTR_CLASS)
+    int32_t      slot   = -1;     // slot number in a map (OrderedMap::slot_at)
+    uint16_t     misses = 0;      // guard failures since it specialized
+    uint8_t      backoff= 0;      // failed attempts so far: the next wait is 2^backoff runs
+    uint8_t      nways  = 0;      // CALL_METHOD_PY: receiver classes cached (<= kWays)
+    static constexpr int kWays = 4;
+    std::string  cls;             // the class the entry is for (way 0 of a CALL_METHOD_PY site)
+    // CALL_METHOD_PY's further ways (1 .. kWays-1), allocated when the site
+    // first sees a second class and kept (emptied, not freed) for as long
+    // as the code lives
+    std::unique_ptr<VMICWay[]> way;
+};
+struct VMQuick {
+    std::unique_ptr<VMIC[]> ic;   // indexed by Instruction::ic - 1
+    uint32_t n = 0;
+    VMQuick() = default;
+    VMQuick(const VMQuick&) {}                          // a copied code object starts without caches
+    VMQuick& operator=(const VMQuick&) { return *this; }
+};
+// The type epoch (round 80): bumped by every change that can change what
+// an attribute or method lookup through a class finds - a class namespace
+// written or erased, a class made, an MRO cache cleared, __getattribute__,
+// data descriptors, __slots__, metaclasses, __class__ assignment. A cache
+// entry keyed by a class is valid only while the epoch it was filled at is
+// current. Global to the process: every VM shares it (a bump is never
+// wrong, only slower).
+inline uint64_t& vm_type_epoch() { static uint64_t e = 1; return e; }
+inline void vm_types_changed() { ++vm_type_epoch(); }
+// The VM's tables of class facts wrapped so that each change bumps the
+// epoch (round 80): EpochMap / EpochSet on every write, EpochCache (a
+// memo the VM fills on reads) only when it is cleared, EpochFlag when set.
+template<class K, class V> struct EpochMap : std::unordered_map<K,V> {
+    using Base = std::unordered_map<K,V>;
+    V& operator[](const K& k) { vm_types_changed(); return Base::operator[](k); }
+    size_t erase(const K& k) { vm_types_changed(); return Base::erase(k); }
+    void clear() { vm_types_changed(); Base::clear(); }
+};
+template<class K> struct EpochSet : std::unordered_set<K> {
+    using Base = std::unordered_set<K>;
+    auto insert(const K& k) { vm_types_changed(); return Base::insert(k); }
+    size_t erase(const K& k) { vm_types_changed(); return Base::erase(k); }
+    void clear() { vm_types_changed(); Base::clear(); }
+};
+template<class M> struct EpochCache : M {
+    void clear() { vm_types_changed(); M::clear(); }
+};
+struct EpochFlag {
+    bool v = false;
+    EpochFlag& operator=(bool b) { if(b!=v) vm_types_changed(); v=b; return *this; }
+    operator bool() const { return v; }
+};
+
 struct VMCode {
     std::string              name;
     std::string              doc;           // docstring (__doc__, round 77)
@@ -488,7 +653,7 @@ struct VMCode {
     std::string              parent_class;
     std::vector<std::string> bases;         // every base class, in order (parent_class is bases[0])
     std::string              owner_class;   // class that defines this method
-    std::vector<Instruction> instructions;
+    InstrVec                 instructions;
     std::vector<VMVal>       constants;
     std::vector<std::string> names;
     std::vector<std::string> param_names;
@@ -526,6 +691,20 @@ struct VMCode {
     bool                   module_top = false;
     std::vector<std::shared_ptr<VMCode>> sub_codes;
     std::vector<ExceptionEntry>          exc_table;
+    // Quickening (round 80): the inline caches, made on the first attempt
+    // to specialize one of its instructions (VirtualMachine::quick_init).
+    VMQuick                              quick;
+    // Its parameters are all plain names (no *args, keyword-only marker,
+    // **kwargs): -1 not known yet (CALL_FUNCTION_PY / CALL_METHOD_PY).
+    mutable int8_t                       plain_params = -1;
+    bool all_plain_params() const {
+        if(plain_params<0){
+            bool p=true;
+            for(auto& pn:param_names) if(pn.empty()||pn[0]=='*'){ p=false; break; }
+            plain_params=p?1:0;
+        }
+        return plain_params==1;
+    }
 
     int add_const(VMVal v) {
         if(v.type==VMType::NONE){
@@ -2632,6 +2811,21 @@ struct CallFrame {
         // Return undefined to signal not found
         VMVal undef; undef.type=VMType::UNDEFINED; return undef;
     }
+    // get_local's lookup without the copy: where the value lives, or null
+    // (round 80)
+    const VMVal* local_ptr(const std::string& n) const {
+        if(own_env){
+            auto e=closure_env->find(n);
+            if(e!=closure_env->end()) return &e->second;
+        }
+        auto it=locals.find(n);
+        if(it!=locals.end()) return &it->second;
+        if(VMMap* e=env_find(own_env ? env_up(closure_env.get()) : closure_env.get(), n)){
+            auto it2=e->find(n);
+            if(it2!=e->end()) return &it2->second;
+        }
+        return nullptr;
+    }
     VMVal& local(const std::string& n)           { return locals[n]; }
     void   set(const std::string& n, VMVal v)    {
         // A local (mirrored in the frame's own environment); else the
@@ -2723,8 +2917,26 @@ class VirtualMachine : public Runnable {
     // existing elements.
     std::deque<CallFrame>                              call_stack_;
     VMMap              globals_;
-    std::unordered_map<std::string,std::shared_ptr<VMCode>> class_reg_;
-    std::unordered_map<std::string,VMMap> class_vars_;
+    EpochMap<std::string,std::shared_ptr<VMCode>> class_reg_;   // writes bump the type epoch (round 80)
+    // Class namespaces by class name. Reads go through find() (const);
+    // every write - operator[], find_mut(), erase(), swap(), a mutable
+    // walk - bumps the type epoch the inline caches are keyed by (round 80),
+    // so a namespace cannot change behind a cached lookup.
+    struct ClassVars {
+        using Map = std::unordered_map<std::string,VMMap>;
+        using const_iterator = Map::const_iterator;
+        using iterator = Map::iterator;
+        Map m;
+        const_iterator find(const std::string& k) const { return m.find(k); }
+        const_iterator end() const { return m.end(); }
+        const_iterator begin() const { return m.begin(); }
+        size_t count(const std::string& k) const { return m.count(k); }
+        VMMap& operator[](const std::string& k) { vm_types_changed(); return m[k]; }
+        iterator find_mut(const std::string& k) { vm_types_changed(); return m.find(k); }
+        Map& all_mut() { vm_types_changed(); return m; }
+        void swap(Map& o) { vm_types_changed(); m.swap(o); }
+    };
+    ClassVars class_vars_;
     VMVal last_exception_obj_;
     bool prelude_loaded_=false;
     std::vector<nython::node::node_ptr> prelude_asts_;
@@ -2761,16 +2973,20 @@ class VirtualMachine : public Runnable {
     }
 
     // Stack helpers
-    void   push(VMVal v)       { stack_.push_back(std::move(v)); }
+    // (round 80: by reference - a VMVal is large, and taking it by value
+    // made every push one more move and destruction)
+    void   push(const VMVal& v) { stack_.push_back(v); }
+    void   push(VMVal&& v)      { stack_.push_back(std::move(v)); }
     // Guarded: popping an empty operand stack was undefined behaviour and
     // crashed the process. A stack imbalance is a compiler/opcode bug, but it
     // should surface as a diagnosable error rather than a segfault.
-    VMVal  pop() {
-        if(stack_.empty()){
-            if(getenv("NY_VM_TRACE")) fprintf(stderr,"[vm] operand stack underflow\n");
-            return VMVal::make_none();
-        }
+    __attribute__((always_inline)) VMVal pop() {
+        if(__builtin_expect(stack_.empty(),0)) return pop_underflow();
         VMVal v=std::move(stack_.back()); stack_.pop_back(); return v;
+    }
+    __attribute__((noinline,cold)) static VMVal pop_underflow() {
+        if(getenv("NY_VM_TRACE")) fprintf(stderr,"[vm] operand stack underflow\n");
+        return VMVal::make_none();
     }
     VMVal& peek(int off=0) {
         static VMVal s_none = VMVal::make_none();
@@ -2845,7 +3061,12 @@ private:
     // Whether `n` names anything a LOAD_NAME can find (a variable in a
     // visible scope, a global, or an interpreter builtin).
     bool name_bound(const std::string& n) {
-        for(int i=(int)call_stack_.size()-1;i>=0;i--){
+        const int top=(int)call_stack_.size()-1;
+        const bool chain=top>=0&&call_stack_[top].closure_env;
+        for(int i=top;i>=0;i--){
+            // (round 80) without a closure environment no frame between the
+            // running one and the module's is visible: skip them all
+            if(!chain&&i>0&&i<top){ i=1; continue; }
             if(!frame_visible(i)) continue;
             const auto& f=call_stack_[i];
             if(f.has_local(n)) return true;
@@ -2856,10 +3077,13 @@ private:
         return bridge_exists() && bridge_exists()(n);
     }
     VMVal load_var(const std::string& n) {
-        for(int i=(int)call_stack_.size()-1;i>=0;i--){
+        const int top=(int)call_stack_.size()-1;
+        const bool chain=top>=0&&call_stack_[top].closure_env;
+        for(int i=top;i>=0;i--){
+            if(!chain&&i>0&&i<top){ i=1; continue; }   // (round 80, as name_bound)
             if(!frame_visible(i)) continue;
-            auto v=call_stack_[i].get_local(n);
-            if(!v.is_missing()) return v;
+            const VMVal* p=call_stack_[i].local_ptr(n);   // (round 80: one copy)
+            if(p&&!p->is_missing()) return *p;
         }
         if(VMMap* me=menv()){
             auto mi=me->find(n);
@@ -2892,7 +3116,10 @@ private:
     }
     // del x: the nearest binding of x goes (the scopes store_var looks in).
     bool delete_var(const std::string& n) {
-        for(int i=(int)call_stack_.size()-1;i>=0;i--){
+        const int top=(int)call_stack_.size()-1;
+        const bool chain=top>=0&&call_stack_[top].closure_env;
+        for(int i=top;i>=0;i--){
+            if(!chain&&i>0&&i<top){ i=1; continue; }   // (round 80, as name_bound)
             if(!frame_visible(i)) continue;
             auto& f=call_stack_[i];
             bool hit=f.locals.erase(n)>0;
@@ -2922,7 +3149,10 @@ private:
         // An existing binding in a lexically visible scope is rebound
         // (Nython's `x = ...` updates an enclosing variable); otherwise the
         // name becomes a local of the running frame.
-        for(int i=(int)call_stack_.size()-1;i>=0;i--){
+        const int top=(int)call_stack_.size()-1;
+        const bool chain=top>=0&&call_stack_[top].closure_env;
+        for(int i=top;i>=0;i--){
+            if(!chain&&i>0&&i<top){ i=1; continue; }   // (round 80, as name_bound)
             if(!frame_visible(i)) continue;
             auto& f=call_stack_[i];
             auto li=f.locals.find(n);
@@ -3320,7 +3550,7 @@ public:
         vmgc::g_shutdown = true;       // a dying __del__ instance is just freed
         {
             VMMap g; g.swap(globals_);
-            std::unordered_map<std::string, VMMap> cv; cv.swap(class_vars_);
+            std::unordered_map<std::string, VMMap> cv; class_vars_.swap(cv);
             std::vector<VMVal> st; st.swap(stack_);
             std::deque<CallFrame> cs; cs.swap(call_stack_);
             VMVal le; std::swap(le, last_exception_obj_);
@@ -3808,7 +4038,8 @@ public:
         for(int i=0;i<(int)code.names.size();i++){if(i)oss<<", ";oss<<i<<":"<<code.names[i];}
         oss<<"\n"<<ind<<"  Instructions:\n";
         for(int i=0;i<(int)code.instructions.size();i++){
-            const auto& ins=code.instructions[i];
+            Instruction ins=code.instructions[i];
+            ins.op=base_op(ins.op);   // as compiled (round 80)
             oss<<ind<<"    "<<std::setw(4)<<i<<"  "<<std::left<<std::setw(24)<<op_name(ins.op)<<ins.arg;
             if(ins.op==Op::LOAD_CONST&&ins.arg<(int)code.constants.size())
                 oss<<"  ("<<code.constants[ins.arg].repr()<<")";
@@ -5161,7 +5392,7 @@ private:
     // for `name = constant` pairs and find methods among its compiled code
     // objects, so a class variable computed by an expression, a decorator,
     // @property, a second base, and any class-level statement were ignored.
-    std::unordered_map<std::string,std::shared_ptr<std::vector<std::string>>> mro_cache_;
+    EpochCache<std::unordered_map<std::string,std::shared_ptr<std::vector<std::string>>>> mro_cache_;   // (round 80: EpochCache)
     std::shared_ptr<std::vector<std::string>> class_mro(const std::string& cls) {
         auto it=mro_cache_.find(cls);
         if(it!=mro_cache_.end()) return it->second;
@@ -5218,7 +5449,7 @@ private:
     }
     // The namespace of an MRO entry: a builtin type's is its mirror's
     // (round 77, see class_lookup).
-    std::unordered_map<std::string,VMMap>::iterator class_vars_at(const std::string& c) {
+    ClassVars::const_iterator class_vars_at(const std::string& c) const {
         auto cv=class_vars_.find(c);
         if(cv!=class_vars_.end()||mirrors_loaded_.empty()) return cv;
         const char* mn=nyrt::builtin_mirror(c);
@@ -5264,7 +5495,7 @@ private:
     // type answers for it where the type stands in the MRO (class_lookup);
     // natives are given the payload (vm_call). The mirrors are loaded per
     // type, on first need (load_mirror).
-    std::unordered_set<std::string> mirrors_loaded_;
+    EpochSet<std::string> mirrors_loaded_;   // (round 80: EpochSet)
     void load_mirror(const std::string& chunk) {
         if(mirrors_loaded_.count(chunk)) return;
         mirrors_loaded_.insert(chunk);
@@ -5935,7 +6166,7 @@ private:
     // ── metaclasses (round 77) ──────────────────────────────────────────
     // A class's metaclass: its statement's metaclass=, else the nearest
     // base's (MRO order); none for a plain class.
-    std::unordered_set<std::string> metaclass_types_;   // classes deriving from type
+    EpochSet<std::string> metaclass_types_;   // classes deriving from type (round 80: EpochSet)
     std::vector<std::pair<VMVal,bool>> constructing_;   // see type_new
     bool type_call_skip_=false;                         // see instantiate
     VMVal metaclass_of(const std::string& cname) {
@@ -6121,8 +6352,8 @@ private:
     }
     // A class's own __new__ (not object's); classes without one are
     // remembered until the next class is made.
-    std::unordered_set<std::string> no_new_;
-    std::unordered_map<std::string,VMVal> class_meta_;   // metaclass= of a class statement
+    EpochCache<std::unordered_set<std::string>> no_new_;   // (round 80: EpochCache)
+    EpochMap<std::string,VMVal> class_meta_;   // metaclass= of a class statement (round 80: EpochMap)
     bool class_new(const std::string& cname, VMVal& m) {
         if(no_new_.count(cname)) return false;
         std::string owner;
@@ -6179,13 +6410,13 @@ private:
     }
     // The names classes hold a data descriptor under (round 78): a field
     // read checks the class for one only for those (get_attr / lookup_attr).
-    std::unordered_set<std::string> data_descr_names_;
+    EpochSet<std::string> data_descr_names_;   // (round 80: EpochSet)
     // ── __slots__ and __class__ assignment (round 79) ─────────────────────
     // As NythonExecutor's section of the same name: the prelude's "slots"
     // chunk does the Python-level work; per class the flags _ny_mark_slots
     // gave (1: no __dict__, 2: no weak references); a slot's member
     // descriptor reads and stores the instance's field directly.
-    std::unordered_map<std::string,int> slot_flags_;
+    EpochMap<std::string,int> slot_flags_;   // (round 80: EpochMap)
     bool is_dictless(const VMVal& obj) {
         if(obj.type!=VMType::INSTANCE) return false;
         auto it=slot_flags_.find(obj.class_name);
@@ -6216,13 +6447,14 @@ private:
             if(f.self_val) fix(*f.self_val);
         }
         for(auto& kv:globals_) fix(kv.second);
-        for(auto& cv:class_vars_) for(auto& kv:cv.second) fix(kv.second);
+        for(auto& cv:class_vars_.all_mut()) for(auto& kv:cv.second) fix(kv.second);
         vmgc::for_each_value(fix);
         no_new_.clear();
         mro_cache_.clear();
     }
     void class_created(const VMVal& clsv, const VMVal& kw) {
         const std::string& cname=clsv.class_name;
+        vm_types_changed();   // a new class (round 80)
         // __slots__ (round 79): the prelude's _ny_init_slots (mirrors chunk
         // "slots") checks them and puts a member descriptor on the class for
         // each, as type.__new__ does, before anything else sees the class
@@ -6240,8 +6472,8 @@ private:
             if(cv!=class_vars_.end()&&cv->second.count("__getattribute__")) any_getattribute_=true;
         }
         {
-            auto cv=class_vars_.find(cname);
-            if(cv!=class_vars_.end()){
+            auto cv=class_vars_.find_mut(cname);
+            if(cv!=class_vars_.m.end()){
                 // __eq__ without __hash__ makes the class unhashable, as
                 // Python's type.__new__ does (round 77)
                 if(cv->second.count("__eq__")&&!cv->second.count("__hash__")) cv->second["__hash__"]=VMVal::make_none();
@@ -6514,6 +6746,307 @@ private:
         return ns;
     }
 
+    // ── Quickening: the specializing adaptive interpreter (round 80) ──────
+    // After PEP 659 (CPython 3.11) and Brunthaler's "Inline Caching Meets
+    // Quickening" (ECOOP 2010): a specializable generic instruction counts
+    // its runs (Instruction::ctr); at zero, specialize_at() looks at the
+    // operands it is about to get and, when a specialized form fits,
+    // rewrites the instruction in place and fills its inline cache
+    // (VMCode::quick). The specialized form checks a guard that makes it
+    // exactly what the generic code would do; a failed guard runs the
+    // generic code instead and counts a miss (quick_miss), and kMissLimit
+    // misses rewrite it back - with an exponential backoff before the next
+    // attempt, so a site that will not stay monomorphic stops paying for
+    // the attempts. CALL_METHOD_PY keeps up to VMIC::kWays receiver classes
+    // (a polymorphic inline cache, Hölzle, Chambers & Ungar, ECOOP 1991).
+    static constexpr uint16_t kMissLimit = 32;
+    static long& quick_stat(int k) { static long s[8]={0,0,0,0,0,0,0,0}; return s[k]; }   // NY_QUICK_STATS
+    void quick_init(VMCode& c) {
+        if(c.quick.ic) return;
+        uint32_t n=0;
+        for(auto& ins:c.instructions) if(op_specializable(base_op(ins.op))) n++;
+        c.quick.ic.reset(new VMIC[n?n:1]);
+        c.quick.n=n;
+        uint32_t k=0;
+        for(auto& ins:c.instructions) if(op_specializable(base_op(ins.op))){ k++; ins.ic=k<=65535?(uint16_t)k:0; }
+    }
+    // A failed attempt: wait 4, 8, ... 255 runs before the next one.
+    static void quick_backoff(Instruction& ins, VMIC* c) {
+        int e=c?c->backoff:6;
+        if(c&&c->backoff<6) c->backoff++;
+        ins.ctr=(uint8_t)std::min(255,4<<e);
+    }
+    // A specialized instruction's guard failed (it runs as its generic op).
+    void quick_miss(VMCode& code, Instruction& ins) {
+        if(ins.ic==0||ins.ic>code.quick.n) return;
+        VMIC& c=code.quick.ic[ins.ic-1];
+        if(++c.misses<kMissLimit) return;
+        c.misses=0;
+        ins.op=base_op(ins.op);       // deopt
+        quick_backoff(ins, &c);
+        quick_stat(2)++;
+    }
+    // A frame whose name lookups go straight from its own locals to the
+    // main module's frame: no closure environment (so no enclosing frame
+    // is visible), not a module's code, not another thread's call stack.
+    bool plain_function_frame(const CallFrame& f) const {
+        return !f.own_env && !f.closure_env && call_stack_.size()>1 && !f.code->module_env && !in_other_thread();
+    }
+    // class_lookup without the copy: the slot of the class namespace that
+    // holds attr, or null - also null where class_lookup would answer from
+    // object's fallback (those are left to the generic path).
+    const VMVal* class_lookup_ptr(const std::string& cls, const std::string& attr) {
+        auto mro=class_mro(cls);
+        for(size_t i=0;i<mro->size();i++){
+            auto cv=class_vars_.find((*mro)[i]);
+            if(cv==class_vars_.end()){
+                const char* mn=mirrors_loaded_.empty()?nullptr:nyrt::builtin_mirror((*mro)[i]);
+                if(!mn||(cv=class_vars_.find(mn))==class_vars_.end()) continue;
+            }
+            auto f=cv->second.find(attr);
+            if(f==cv->second.end()) continue;
+            return &f->second;
+        }
+        return nullptr;
+    }
+    // A method CALL_METHOD_PY may call as exec_code would: a plain method
+    // (self, then exactly argc plain parameters, not a generator).
+    static bool plain_method(const VMVal* m, int argc) {
+        return m&&m->type==VMType::FUNCTION&&m->code&&m->code->is_method&&!m->code->is_static
+            &&!m->code->is_classmethod&&!m->code->bind_first&&m->code->param_names.size()==(size_t)argc
+            &&m->code->all_plain_params()&&!m->code->has_yield();
+    }
+    // The cached method for obj's class at a CALL_METHOD_PY site, adding
+    // the class as a new way when there is room; null when the site cannot
+    // be served (vm_call_method's generic path runs).
+    const VMVal* method_way(VMIC& c, const VMVal& obj, const std::string& mn, int argc) {
+        if(c.epoch!=vm_type_epoch()){ c.nways=0; c.epoch=vm_type_epoch(); }
+        if(c.nways>0&&obj.class_name==c.cls) return c.ptr;
+        for(int k=1;k<c.nways;k++) if(obj.class_name==c.way[k-1].cls) return c.way[k-1].fn;
+        if(c.nways>=VMIC::kWays) return nullptr;
+        // a new receiver class
+        if(any_getattribute_&&getattribute_hook(obj)) return nullptr;
+        const VMVal* m=class_lookup_ptr(obj.class_name, mn);
+        if(!plain_method(m, argc)) return nullptr;
+        if(c.nways==0){ c.cls=obj.class_name; c.ptr=m; }
+        else {
+            if(!c.way) c.way.reset(new VMICWay[VMIC::kWays-1]);
+            c.way[c.nways-1].cls=obj.class_name; c.way[c.nways-1].fn=m;
+        }
+        c.nways++;
+        return m;
+    }
+    // Rewrites `ins` (a generic instruction whose counter ran out) into a
+    // specialized form for the operands now on the stack, or backs off.
+    // True when it did: the caller runs the specialized form at once.
+    bool specialize_at(CallFrame& fr, Instruction& ins) {
+        VMCode& code=*fr.code;
+        if(!code.quick.ic) quick_init(code);
+        if(ins.ic==0||ins.ic>code.quick.n){ ins.ctr=255; return false; }
+        VMIC& c=code.quick.ic[ins.ic-1];
+        c.misses=0;
+        Op to=Op::NOP;
+        const size_t ns=stack_.size();
+        switch(ins.op){
+        case Op::LOAD_NAME: {
+            const std::string& n=code.names[ins.arg];
+            if(!fr.own_env){
+                long s=fr.locals.index_of(n);
+                if(s>=0){ c.slot=(int32_t)s; to=Op::LOAD_NAME_FAST; break; }
+            }
+            if(!plain_function_frame(fr)||fr.locals.count(n)) break;
+            CallFrame& f0=call_stack_.front();
+            VMMap* m=f0.own_env?f0.closure_env.get():&f0.locals;
+            long s=m->index_of(n);
+            if(s>=0){ c.map=m; c.slot=(int32_t)s; to=Op::LOAD_NAME_MOD; break; }
+            if(f0.own_env||f0.closure_env||f0.locals.count(n)) break;
+            s=globals_.index_of(n);
+            if(s>=0){ c.slot=(int32_t)s; to=Op::LOAD_NAME_GLOBAL; }
+            break;
+        }
+        case Op::STORE_NAME: {
+            if(code.is_class||fr.own_env||exporting()) break;
+            long s=fr.locals.index_of(code.names[ins.arg]);
+            if(s>=0){ c.slot=(int32_t)s; to=Op::STORE_NAME_FAST; }
+            break;
+        }
+        case Op::LOAD_ATTR: {
+            if(ns<1) break;
+            const VMVal& obj=stack_[ns-1];
+            const std::string& a=code.names[ins.arg];
+            if(a=="__class__"||a=="__dict__") break;
+            if(obj.type==VMType::INSTANCE&&obj.map){
+                if(any_getattribute_&&getattribute_hook(obj)) break;
+                if(!data_descr_names_.empty()&&data_descr_names_.count(a)) break;
+                long s=obj.map->index_of(a);
+                if(s<0||is_property_desc(obj.map->slot_at((size_t)s)->second)) break;
+                c.slot=(int32_t)s; c.epoch=vm_type_epoch(); to=Op::LOAD_ATTR_INST;
+            } else if(obj.type==VMType::MAP&&obj.map&&!obj.class_name.empty()){
+                if(!data_descr_names_.empty()&&data_descr_names_.count(a)) break;
+                long s=obj.map->index_of(a);
+                if(s<0||is_property_desc(obj.map->slot_at((size_t)s)->second)) break;
+                c.map=obj.map.get(); c.slot=(int32_t)s; c.epoch=vm_type_epoch(); to=Op::LOAD_ATTR_MODULE;
+            } else if(obj.type==VMType::CLASS){
+                // C.x: lookup_attr's class branch finds it in the MRO, and a
+                // classmethod is bound / a descriptor's __get__ runs - cached
+                // only for a value that is returned as it is
+                if(any_getattribute_) break;
+                std::string ck=class_key(obj);
+                const VMVal* p=class_lookup_ptr(ck, a);
+                if(!p) break;
+                if(p->type==VMType::FUNCTION&&p->code&&p->code->is_classmethod) break;
+                if(p->type==VMType::INSTANCE){
+                    if(p->class_name=="property") break;
+                    VMVal g;
+                    if(class_lookup(p->class_name,"__get__",g)) break;
+                }
+                c.cls=ck; c.ptr=p; c.epoch=vm_type_epoch(); to=Op::LOAD_ATTR_CLASS;
+            }
+            break;
+        }
+        case Op::STORE_ATTR: {
+            if(ns<2) break;
+            const VMVal& obj=stack_[ns-1];
+            const std::string& a=code.names[ins.arg];
+            if(obj.type!=VMType::INSTANCE||!obj.map||obj.class_name=="object"||a=="__class__"||a=="__dict__") break;
+            VMVal m; std::string owner;
+            // no __setattr__ but object's (set_attr's instance_attr_hook)
+            if(class_lookup(obj.class_name,"__setattr__",m,&owner)&&nyrt::shown_class_name(owner)!="object") break;
+            // no data descriptor of the class for it, no __slots__ without
+            // __dict__, and the class's own member of that name (if any) not
+            // a property
+            if(any_data_descr_){ VMVal d, dm; if(data_descriptor(obj, a, "__set__", d, dm)) break; }
+            if(!slot_flags_.empty()&&is_dictless(obj)) break;
+            VMVal cm;
+            if(class_lookup(obj.class_name, a, cm)&&is_property_desc(cm)) break;
+            long s=obj.map->index_of(a);
+            c.slot=(int32_t)s; c.cls=obj.class_name; c.epoch=vm_type_epoch(); to=Op::STORE_ATTR_INST;
+            break;
+        }
+        case Op::CALL_FUNCTION: {
+            int argc=ins.arg;
+            if((int)ns<=argc) break;
+            const VMVal& f=stack_[ns-1-(size_t)argc];
+            if(f.type==VMType::FUNCTION&&f.code&&!f.code->is_method&&f.code->param_names.size()==(size_t)argc
+               &&f.code->all_plain_params()&&!f.code->has_yield()) to=Op::CALL_FUNCTION_PY;
+            break;
+        }
+        case Op::CALL_METHOD: {
+            int argc=ins.arg;
+            if((int)ns<argc+2) break;
+            const VMVal& obj=stack_[ns-2-(size_t)argc];
+            const VMVal& mn=stack_[ns-1-(size_t)argc];
+            if(obj.type!=VMType::INSTANCE||!obj.map||mn.type!=VMType::STRING||obj.map->count(mn.s)) break;
+            c.nways=0; c.epoch=vm_type_epoch();
+            if(method_way(c, obj, mn.s, argc)) to=Op::CALL_METHOD_PY;
+            break;
+        }
+        case Op::BINARY_ADD: case Op::BINARY_SUB: case Op::BINARY_MUL: case Op::BINARY_DIV:
+        case Op::IADD: case Op::ISUB: case Op::IMUL:
+        case Op::COMPARE_EQ: case Op::COMPARE_NE: case Op::COMPARE_LT: case Op::COMPARE_LE:
+        case Op::COMPARE_GT: case Op::COMPARE_GE: {
+            if(ns<2) break;
+            const VMVal& l=stack_[ns-2]; const VMVal& r=stack_[ns-1];
+            bool num=(small_int(l)||l.type==VMType::FLOAT)&&(small_int(r)||r.type==VMType::FLOAT);
+            if(!num) break;
+            // comparisons: int with int or float with float (mixed ones
+            // need the exact comparison num_cmp makes)
+            bool cmp=ins.op>=Op::COMPARE_EQ&&ins.op<=Op::COMPARE_GE;
+            if(cmp&&l.type!=r.type) break;
+            switch(ins.op){
+                case Op::BINARY_ADD: to=Op::BINARY_ADD_NUM; break;
+                case Op::BINARY_SUB: to=Op::BINARY_SUB_NUM; break;
+                case Op::BINARY_MUL: to=Op::BINARY_MUL_NUM; break;
+                case Op::BINARY_DIV: to=Op::BINARY_DIV_NUM; break;
+                case Op::IADD: to=Op::IADD_NUM; break;
+                case Op::ISUB: to=Op::ISUB_NUM; break;
+                case Op::IMUL: to=Op::IMUL_NUM; break;
+                case Op::COMPARE_EQ: to=Op::COMPARE_EQ_NUM; break;
+                case Op::COMPARE_NE: to=Op::COMPARE_NE_NUM; break;
+                case Op::COMPARE_LT: to=Op::COMPARE_LT_NUM; break;
+                case Op::COMPARE_LE: to=Op::COMPARE_LE_NUM; break;
+                case Op::COMPARE_GT: to=Op::COMPARE_GT_NUM; break;
+                default: to=Op::COMPARE_GE_NUM; break;
+            }
+            break;
+        }
+        case Op::BINARY_FLOOR_DIV: case Op::BINARY_MOD: {
+            if(ns<2) break;
+            if(small_int(stack_[ns-2])&&small_int(stack_[ns-1]))
+                to=ins.op==Op::BINARY_MOD?Op::BINARY_MOD_INT:Op::BINARY_FLOOR_DIV_INT;
+            break;
+        }
+        case Op::FOR_ITER: {
+            if(ns<1) break;
+            const VMVal& it=stack_[ns-1];
+            if(it.type!=VMType::ITERATOR) break;
+            if(it.b&&!it.iter&&it.list&&!it.s.empty()&&it.s[0]=='r') to=Op::FOR_ITER_RANGE;
+            else if(it.iter) to=Op::FOR_ITER_LIST;
+            break;
+        }
+        default: break;
+        }
+        if(to==Op::NOP){ quick_backoff(ins, &c); quick_stat(1)++; return false; }
+        ins.op=to;
+        c.backoff=0;
+        quick_stat(0)++;
+        return true;
+    }
+    static bool small_int(const VMVal& v) { return v.type==VMType::INT&&v.s.empty(); }
+    // Rewrites a number on the stack in place into a fresh int / float /
+    // bool: what make_int / make_float / make_bool would build, without
+    // building and moving a value (the common case: no field to reset).
+    static bool plain_scalar(const VMVal& v) {
+        return v.s.empty()&&v.class_name.empty()&&!v.list&&!v.map&&!v.code&&!v.native&&!v.iter&&!v.gen&&!v.closure_env;
+    }
+    static void set_int_inplace(VMVal& v, int64_t x) {
+        if(__builtin_expect(!plain_scalar(v),0)){ v=VMVal::make_int(x); return; }
+        v.type=VMType::INT; v.b=false; v.i=x; v.d=0.0;
+    }
+    static void set_float_inplace(VMVal& v, double x) {
+        if(__builtin_expect(!plain_scalar(v),0)){ v=VMVal::make_float(x); return; }
+        v.type=VMType::FLOAT; v.b=false; v.i=0; v.d=x;
+    }
+    static void set_bool_inplace(VMVal& v, bool x) {
+        if(__builtin_expect(!plain_scalar(v),0)){ v=VMVal::make_bool(x); return; }
+        v.type=VMType::BOOL; v.b=x; v.i=0; v.d=0.0;
+    }
+    // CALL_FUNCTION_PY / CALL_METHOD_PY: what exec_code does for a plain
+    // function or method called with exactly its positional parameters -
+    // the arguments (the top argc values of the stack) are moved into the
+    // new frame's locals, without the argument vectors, copies and
+    // bind_args the generic call path makes. `head` is the callee's slot
+    // (CALL_FUNCTION) or the receiver's (CALL_METHOD, `fn` the method,
+    // the name above it).
+    void call_py_fast(size_t head, int argc, const VMVal* fn, bool method) {
+        CallFrame nf;
+        {
+            const VMVal& f=fn?*fn:stack_[head];
+            nf.code=f.code;
+            nf.closure_env=f.closure_env;
+        }
+        const auto& pn=nf.code->param_names;
+        size_t a0=stack_.size()-(size_t)argc;
+        for(int k=0;k<argc;k++) nf.locals[pn[(size_t)k]]=std::move(stack_[a0+(size_t)k]);
+        if(method) nf.self_val.emplace(std::move(stack_[head]));
+        stack_.resize(head);
+        check_depth();
+        size_t base=stack_.size();
+        nf.ip=0;
+        nf.stack_base=base;
+        call_stack_.push_back(std::move(nf));
+        VMVal result=VMVal::make_none();
+        try { result=run_frame(); }
+        catch(VMReturn& r){ result=r.value; }
+        catch(...){ pop_frame(); if(stack_.size()>base) stack_.resize(base); throw; }
+        pop_frame();
+        if(stack_.size()>base) stack_.resize(base);
+        stack_.push_back(std::move(result));
+    }
+
+    // A specializable generic instruction counts its runs and, at zero, tries
+    // to specialize; on success the specialized form runs at once (round 80).
+#define NY_QUICKEN() do { if(__builtin_expect(ins.op==op&&--ins.ctr==0,0)&&specialize_at(fr,ins)){ op=ins.op; goto redispatch; } } while(0)
         VMVal run_loop() {
         // GIL switch points (round 74), as in CPython: entering a frame and
         // every backward jump (JUMP_ABSOLUTE closes each loop). A switch
@@ -6529,21 +7062,274 @@ private:
             if(__builtin_expect(gen_zombie_flag_,0)) run_gen_zombies();
             CallFrame& fr=call_stack_.back();
             if(fr.ip>=(int)fr.code->instructions.size()) return VMVal::make_none();
-            const Instruction& ins=fr.code->instructions[fr.ip++];
+            // (round 80: not const - quickening rewrites it in place)
+            Instruction& ins=fr.code->instructions[fr.ip++];
             // NY_VM_TRACE's dump and sys.settrace's line events (round 79):
             // one test of a thread-local byte per instruction when neither is on
             if(__builtin_expect(nytrace::t_hooks,0)){
-                if(nytrace::t_hooks & nytrace::VMDEBUG) fprintf(stderr,"[vm] op=%d arg=%d depth=%d\n",(int)ins.op,ins.arg,(int)stack_.size());
+                if(nytrace::t_hooks & nytrace::VMDEBUG) fprintf(stderr,"[vm] op=%d arg=%d depth=%d\n",(int)base_op(ins.op),ins.arg,(int)stack_.size());
                 if(nytrace::t_hooks & nytrace::TRACE) vm_line_hook(fr, ins.line);
             }
             try {
-            switch(ins.op){
+            // The op dispatched on: the instruction's, or its generic form
+            // when a specialized one's guard failed (round 80).
+            Op op=ins.op;
+            redispatch:
+            switch(op){
 
             case Op::NOP: break;
             case Op::HALT: return VMVal::make_none();
 
+            // ── Specialized forms (round 80; see specialize_at) ────────
+            // Each checks its guard and does what its generic form would;
+            // a failed guard counts a miss and runs the generic form.
+#define NY_MISS(GEN) do { quick_miss(*fr.code, ins); quick_stat(3)++; op=Op::GEN; goto redispatch; } while(0)
+            case Op::LOAD_NAME_FAST: {
+                if(!fr.own_env){
+                    const auto* kv=fr.locals.slot_at((size_t)fr.code->quick.ic[ins.ic-1].slot);
+                    if(kv&&kv->first==fr.code->names[ins.arg]){ stack_.push_back(kv->second); break; }
+                }
+                NY_MISS(LOAD_NAME);
+            }
+            case Op::LOAD_NAME_MOD: {
+                const VMIC& c=fr.code->quick.ic[ins.ic-1];
+                if(plain_function_frame(fr)){
+                    CallFrame& f0=call_stack_.front();
+                    VMMap* m=f0.own_env?f0.closure_env.get():&f0.locals;
+                    if(m==c.map){
+                        const std::string& n=fr.code->names[ins.arg];
+                        const auto* kv=m->slot_at((size_t)c.slot);
+                        if(kv&&kv->first==n&&!fr.locals.count(n)){ stack_.push_back(kv->second); break; }
+                    }
+                }
+                NY_MISS(LOAD_NAME);
+            }
+            case Op::LOAD_NAME_GLOBAL: {
+                const VMIC& c=fr.code->quick.ic[ins.ic-1];
+                if(plain_function_frame(fr)){
+                    CallFrame& f0=call_stack_.front();
+                    const std::string& n=fr.code->names[ins.arg];
+                    const auto* kv=globals_.slot_at((size_t)c.slot);
+                    if(kv&&kv->first==n&&!f0.own_env&&!f0.closure_env&&!f0.locals.count(n)&&!fr.locals.count(n)){
+                        VMVal& gv=const_cast<VMVal&>(kv->second);
+                        // (load_var: a builtin carries its name)
+                        if(gv.type==VMType::NATIVE&&gv.class_name.empty()) gv.class_name="__native__:"+n;
+                        stack_.push_back(gv); break;
+                    }
+                }
+                NY_MISS(LOAD_NAME);
+            }
+            case Op::STORE_NAME_FAST: {
+                if(!fr.own_env&&!exporting()&&!stack_.empty()){
+                    const auto* kv=fr.locals.slot_at((size_t)fr.code->quick.ic[ins.ic-1].slot);
+                    if(kv&&kv->first==fr.code->names[ins.arg]){
+                        const_cast<VMVal&>(kv->second)=std::move(stack_.back());
+                        stack_.pop_back(); break;
+                    }
+                }
+                NY_MISS(STORE_NAME);
+            }
+            case Op::LOAD_ATTR_INST: {
+                const VMIC& c=fr.code->quick.ic[ins.ic-1];
+                if(!stack_.empty()){
+                    VMVal& obj=stack_.back();
+                    if(obj.type==VMType::INSTANCE&&obj.map&&c.epoch==vm_type_epoch()&&!(any_getattribute_&&getattribute_hook(obj))){
+                        const auto* kv=obj.map->slot_at((size_t)c.slot);
+                        if(kv&&kv->first==fr.code->names[ins.arg]&&!is_property_desc(kv->second)){
+                            VMVal v=kv->second;   // before obj, which may hold the last reference to the map, goes
+                            obj=std::move(v); break;
+                        }
+                    }
+                }
+                NY_MISS(LOAD_ATTR);
+            }
+            case Op::LOAD_ATTR_MODULE: {
+                const VMIC& c=fr.code->quick.ic[ins.ic-1];
+                if(!stack_.empty()){
+                    VMVal& obj=stack_.back();
+                    if(obj.type==VMType::MAP&&obj.map.get()==c.map&&!obj.class_name.empty()&&c.epoch==vm_type_epoch()){
+                        const auto* kv=obj.map->slot_at((size_t)c.slot);
+                        if(kv&&kv->first==fr.code->names[ins.arg]&&!is_property_desc(kv->second)){
+                            VMVal v=kv->second;
+                            obj=std::move(v); break;
+                        }
+                    }
+                }
+                NY_MISS(LOAD_ATTR);
+            }
+            case Op::LOAD_ATTR_CLASS: {
+                const VMIC& c=fr.code->quick.ic[ins.ic-1];
+                if(!stack_.empty()){
+                    VMVal& obj=stack_.back();
+                    if(obj.type==VMType::CLASS&&c.epoch==vm_type_epoch()
+                       &&(obj.class_name.empty()?obj.s:obj.class_name)==c.cls){
+                        const VMVal& m=*c.ptr;
+                        if(!(m.type==VMType::FUNCTION&&m.code&&m.code->is_classmethod)){
+                            VMVal v=m;
+                            obj=std::move(v); break;
+                        }
+                    }
+                }
+                NY_MISS(LOAD_ATTR);
+            }
+            case Op::STORE_ATTR_INST: {
+                const VMIC& c=fr.code->quick.ic[ins.ic-1];
+                const size_t n=stack_.size();
+                if(n>=2){
+                    VMVal& obj=stack_[n-1];
+                    if(obj.type==VMType::INSTANCE&&obj.map&&c.epoch==vm_type_epoch()&&obj.class_name==c.cls){
+                        VMMap& m=*obj.map;
+                        const std::string& a=fr.code->names[ins.arg];
+                        const auto* kv=c.slot>=0?m.slot_at((size_t)c.slot):nullptr;
+                        VMVal* dst=nullptr;
+                        if(kv&&kv->first==a) dst=const_cast<VMVal*>(&kv->second);
+                        else { auto it=m.find(a); if(it!=m.end()) dst=&it->second; }
+                        if(!dst){ m[a]=std::move(stack_[n-2]); stack_.pop_back(); stack_.pop_back(); break; }
+                        if(!is_property_desc(*dst)){ *dst=std::move(stack_[n-2]); stack_.pop_back(); stack_.pop_back(); break; }
+                    }
+                }
+                NY_MISS(STORE_ATTR);
+            }
+            case Op::CALL_FUNCTION_PY: {
+                const int argc=ins.arg;
+                const size_t n=stack_.size();
+                if(n>(size_t)argc){
+                    const VMVal& f=stack_[n-1-(size_t)argc];
+                    if(f.type==VMType::FUNCTION&&f.code&&!f.code->is_method&&f.code->param_names.size()==(size_t)argc
+                       &&f.code->all_plain_params()&&!f.code->has_yield()){
+                        call_py_fast(n-1-(size_t)argc, argc, nullptr, false);
+                        break;
+                    }
+                }
+                NY_MISS(CALL_FUNCTION);
+            }
+            case Op::CALL_METHOD_PY: {
+                const int argc=ins.arg;
+                const size_t n=stack_.size();
+                if(n>=(size_t)argc+2){
+                    const VMVal& obj=stack_[n-2-(size_t)argc];
+                    const VMVal& mn=stack_[n-1-(size_t)argc];
+                    if(obj.type==VMType::INSTANCE&&obj.map&&mn.type==VMType::STRING){
+                        const VMVal* m=method_way(fr.code->quick.ic[ins.ic-1], obj, mn.s, argc);
+                        // (re-checked: a code object's flags can change)
+                        if(plain_method(m, argc)&&!(any_getattribute_&&getattribute_hook(obj))&&!obj.map->count(mn.s)){
+                            call_py_fast(n-2-(size_t)argc, argc, m, true);
+                            break;
+                        }
+                    }
+                }
+                NY_MISS(CALL_METHOD);
+            }
+            // Numbers: two 64-bit ints (overflow goes the generic way, to a
+            // big int) or floats, mixed with an int for arithmetic - the
+            // result written over the left operand in place.
+#define NY_ARITH_NUM(NAME, GEN, IOP, FOP)                                                     \
+            case Op::NAME: {                                                                    \
+                const size_t n=stack_.size();                                                   \
+                if(n>=2){                                                                       \
+                    VMVal& l=stack_[n-2]; const VMVal& r=stack_[n-1];                           \
+                    if(small_int(l)&&small_int(r)){                                             \
+                        int64_t res;                                                            \
+                        if(!IOP(l.i,r.i,res)){ set_int_inplace(l,res); stack_.pop_back(); break; } \
+                    } else if((l.type==VMType::FLOAT||small_int(l))&&(r.type==VMType::FLOAT||small_int(r))){ \
+                        double x=l.type==VMType::FLOAT?l.d:(double)l.i;                         \
+                        double y=r.type==VMType::FLOAT?r.d:(double)r.i;                         \
+                        set_float_inplace(l, x FOP y); stack_.pop_back(); break;                \
+                    }                                                                           \
+                }                                                                               \
+                NY_MISS(GEN);                                                                   \
+            }
+            NY_ARITH_NUM(BINARY_ADD_NUM, BINARY_ADD, nypy::add_ovf, +)
+            NY_ARITH_NUM(BINARY_SUB_NUM, BINARY_SUB, nypy::sub_ovf, -)
+            NY_ARITH_NUM(BINARY_MUL_NUM, BINARY_MUL, nypy::mul_ovf, *)
+            NY_ARITH_NUM(IADD_NUM, IADD, nypy::add_ovf, +)
+            NY_ARITH_NUM(ISUB_NUM, ISUB, nypy::sub_ovf, -)
+            NY_ARITH_NUM(IMUL_NUM, IMUL, nypy::mul_ovf, *)
+#undef NY_ARITH_NUM
+            case Op::BINARY_DIV_NUM: {
+                // a / b is a float: ints of at most 53 bits (exact as
+                // doubles, as nypy::arith takes them) or floats; a zero
+                // divisor goes the generic way (ZeroDivisionError)
+                const size_t n=stack_.size();
+                if(n>=2){
+                    VMVal& l=stack_[n-2]; const VMVal& r=stack_[n-1];
+                    auto ok=[](const VMVal& v){ return v.type==VMType::FLOAT||(small_int(v)&&v.i>=-9007199254740992LL&&v.i<=9007199254740992LL); };
+                    if(ok(l)&&ok(r)){
+                        double y=r.type==VMType::FLOAT?r.d:(double)r.i;
+                        if(y!=0.0){
+                            double x=l.type==VMType::FLOAT?l.d:(double)l.i;
+                            set_float_inplace(l, x/y); stack_.pop_back(); break;
+                        }
+                    }
+                }
+                NY_MISS(BINARY_DIV);
+            }
+            case Op::BINARY_FLOOR_DIV_INT: case Op::BINARY_MOD_INT: {
+                const size_t n=stack_.size();
+                if(n>=2){
+                    VMVal& l=stack_[n-2]; const VMVal& r=stack_[n-1];
+                    if(small_int(l)&&small_int(r)&&r.i!=0&&!(l.i==INT64_MIN&&r.i==-1)){
+                        set_int_inplace(l, op==Op::BINARY_MOD_INT?nypy::floormod_i64(l.i,r.i):nypy::floordiv_i64(l.i,r.i));
+                        stack_.pop_back(); break;
+                    }
+                }
+                if(op==Op::BINARY_MOD_INT) NY_MISS(BINARY_MOD);
+                NY_MISS(BINARY_FLOOR_DIV);
+            }
+            // Comparisons of two ints or two floats (NaN compares false, as
+            // num_cmp's unordered answer does).
+#define NY_CMP_NUM(NAME, GEN, CMP)                                                            \
+            case Op::NAME: {                                                                    \
+                const size_t n=stack_.size();                                                   \
+                if(n>=2){                                                                       \
+                    VMVal& l=stack_[n-2]; const VMVal& r=stack_[n-1];                           \
+                    if(small_int(l)&&small_int(r)){ bool b=l.i CMP r.i; set_bool_inplace(l,b); stack_.pop_back(); break; } \
+                    if(l.type==VMType::FLOAT&&r.type==VMType::FLOAT){ bool b=l.d CMP r.d; set_bool_inplace(l,b); stack_.pop_back(); break; } \
+                }                                                                               \
+                NY_MISS(GEN);                                                                   \
+            }
+            NY_CMP_NUM(COMPARE_EQ_NUM, COMPARE_EQ, ==)
+            NY_CMP_NUM(COMPARE_NE_NUM, COMPARE_NE, !=)
+            NY_CMP_NUM(COMPARE_LT_NUM, COMPARE_LT, <)
+            NY_CMP_NUM(COMPARE_LE_NUM, COMPARE_LE, <=)
+            NY_CMP_NUM(COMPARE_GT_NUM, COMPARE_GT, >)
+            NY_CMP_NUM(COMPARE_GE_NUM, COMPARE_GE, >=)
+#undef NY_CMP_NUM
+            case Op::FOR_ITER_RANGE: {
+                // a loop's own range iterator (FOR_ITER's first branch)
+                if(!stack_.empty()){
+                    VMVal& si=stack_.back();
+                    if(si.type==VMType::ITERATOR&&si.b&&!si.iter&&si.list&&!si.s.empty()&&si.s[0]=='r'){
+                        const std::vector<VMVal>& cc=*si.list;
+                        if(si.i<cc[2].i){
+                            int64_t v=nyrt::range_at(cc[0].i,cc[1].i,si.i);
+                            si.i++;
+                            stack_.emplace_back();
+                            VMVal& nv=stack_.back(); nv.type=VMType::INT; nv.i=v;
+                            break;
+                        }
+                        stack_.pop_back(); fr.ip=ins.arg; break;
+                    }
+                }
+                NY_MISS(FOR_ITER);
+            }
+            case Op::FOR_ITER_LIST: {
+                // an item-vector iterator (FOR_ITER's last branch)
+                if(!stack_.empty()){
+                    VMVal& it=stack_.back();
+                    if(it.type==VMType::ITERATOR&&it.iter){
+                        auto* p=it.iter.get();
+                        if(p->first<(int)p->second.size()){ int k=p->first++; stack_.push_back(p->second[(size_t)k]); break; }
+                        stack_.pop_back(); fr.ip=ins.arg; break;
+                    }
+                }
+                NY_MISS(FOR_ITER);
+            }
+#undef NY_MISS
+
             case Op::LOAD_CONST:  push(fr.code->constants[ins.arg]); break;
             case Op::LOAD_NAME: {
+                NY_QUICKEN();   // round 80
                 // Reading a name bound nowhere raises NameError (it read none).
                 const std::string& n=fr.code->names[ins.arg];
                 push(load_var(n));
@@ -6554,6 +7340,7 @@ private:
                 break;
             }
             case Op::STORE_NAME: {
+                NY_QUICKEN();   // round 80
                 // A class body binds in the class namespace, always (through
                 // a metaclass's __prepare__ mapping first - round 77).
                 if(fr.code->is_class){
@@ -6693,6 +7480,7 @@ private:
             }
 
             case Op::LOAD_ATTR: {
+                NY_QUICKEN();   // round 80
                 VMVal obj=pop(); push(get_attr(obj,fr.code->names[ins.arg])); break;
             }
             case Op::LOAD_ATTR_OPT: {
@@ -6710,6 +7498,7 @@ private:
                 break;
             case Op::DUP_TOP_TWO: { VMVal b=peek(0), a=peek(1); push(a); push(b); break; }
             case Op::STORE_ATTR: {
+                NY_QUICKEN();   // round 80
                 VMVal obj=pop(); VMVal val=pop();
                 set_attr(obj,fr.code->names[ins.arg],std::move(val)); break;
             }
@@ -6832,7 +7621,9 @@ private:
             // the right operand's reflected one (__add__, then __radd__ -
             // so sum() of objects and 5 + v work); then Python's numeric
             // and sequence semantics (binop, shared with the interpreter).
-            case Op::BINARY_ADD: { VMVal r=pop(),lv=pop();
+            case Op::BINARY_ADD: {
+                NY_QUICKEN();   // round 80
+                VMVal r=pop(),lv=pop();
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(lv,r,"__add__","__radd__",res)){ push(std::move(res)); break; } }
                 // A string joined with an instance takes str(instance).
                 if(r.type==VMType::INSTANCE&&lv.type==VMType::STRING) r=VMVal::make_str(vm_str(r));
@@ -6841,10 +7632,14 @@ private:
                     int64_t sum; if(!nypy::add_ovf(lv.i,r.i,sum)){ push(VMVal::make_int(sum)); break; }
                 }
                 push(binop(nypy::A_ADD,lv,r)); break; }
-            case Op::BINARY_SUB: { VMVal r=pop(),lv=pop();
+            case Op::BINARY_SUB: {
+                NY_QUICKEN();   // round 80
+                VMVal r=pop(),lv=pop();
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(lv,r,"__sub__","__rsub__",res)){ push(std::move(res)); break; } }
                 push(binop(nypy::A_SUB,lv,r)); break; }
-            case Op::BINARY_MUL: { VMVal r=pop(),lv=pop();
+            case Op::BINARY_MUL: {
+                NY_QUICKEN();   // round 80
+                VMVal r=pop(),lv=pop();
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(lv,r,"__mul__","__rmul__",res)){ push(std::move(res)); break; } }
                 push(binop(nypy::A_MUL,lv,r)); break; }
             case Op::BINARY_MATMUL: { VMVal r=pop(),l=pop();
@@ -6853,9 +7648,10 @@ private:
                 break; }
             case Op::BINARY_DIV: case Op::BINARY_MOD: case Op::BINARY_POW: case Op::BINARY_FLOOR_DIV:
             case Op::BINARY_AND: case Op::BINARY_OR: case Op::BINARY_XOR: case Op::BINARY_LSHIFT: case Op::BINARY_RSHIFT: {
+                if(op==Op::BINARY_DIV||op==Op::BINARY_MOD||op==Op::BINARY_FLOOR_DIV) NY_QUICKEN();   // round 80
                 VMVal r=pop(),l=pop();
                 int aop; const char* dunder; const char* rdunder;
-                switch(ins.op){
+                switch(op){   // (round 80: op - ins.op may be a specialized form)
                     case Op::BINARY_DIV: aop=nypy::A_DIV; dunder="__truediv__"; rdunder="__rtruediv__"; break;
                     case Op::BINARY_MOD: aop=nypy::A_MOD; dunder="__mod__"; rdunder="__rmod__"; break;
                     case Op::BINARY_POW: aop=nypy::A_POW; dunder="__pow__"; rdunder="__rpow__"; break;
@@ -6885,7 +7681,9 @@ private:
                 }
                 push(binop(aop,l,r)); break; }
             // Compares
-            case Op::COMPARE_EQ: { VMVal r=pop(),lv=pop();
+            case Op::COMPARE_EQ: {
+                NY_QUICKEN();   // round 80
+                VMVal r=pop(),lv=pop();
                 // an object's __eq__ result as it is (a numpy-style
                 // elementwise == stays an object); identity when declined
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){
@@ -6894,7 +7692,9 @@ private:
                     push(VMVal::make_bool(op_is(lv,r))); break;
                 }
                 push(VMVal::make_bool(vm_eq(lv,r))); break; }
-            case Op::COMPARE_NE: { VMVal r=pop(),lv=pop();
+            case Op::COMPARE_NE: {
+                NY_QUICKEN();   // round 80
+                VMVal r=pop(),lv=pop();
                 if(lv.type==VMType::INSTANCE||r.type==VMType::INSTANCE){
                     VMVal res;
                     if(rich_compare(lv,r,"__ne__","__ne__",res)){ push(std::move(res)); break; }
@@ -6920,6 +7720,7 @@ private:
                 push(VMVal::make_bool(lv.is_truthy()!=r.is_truthy())); break;
             }
             case Op::COMPARE_LT: {
+                NY_QUICKEN();   // round 80
                 VMVal r=pop(),lv=pop();
                 if(lv.is_set()&&r.is_set()){ push(VMVal::make_bool(lv.list->size()<r.list->size()&&set_subset(lv,r))); break; }
                 if((lv.type==VMType::BYTES)!=(r.type==VMType::BYTES)&&lv.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
@@ -6929,6 +7730,7 @@ private:
                 push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)<0 : lv<r)); break;
             }
             case Op::COMPARE_LE: {
+                NY_QUICKEN();   // round 80
                 VMVal r=pop(),lv=pop();
                 if(lv.is_set()&&r.is_set()){ push(VMVal::make_bool(set_subset(lv,r))); break; }
                 if((lv.type==VMType::BYTES)!=(r.type==VMType::BYTES)&&lv.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
@@ -6938,6 +7740,7 @@ private:
                 push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)<=0 : lv<=r)); break;
             }
             case Op::COMPARE_GT: {
+                NY_QUICKEN();   // round 80
                 VMVal r=pop(),lv=pop();
                 if(lv.is_set()&&r.is_set()){ push(VMVal::make_bool(lv.list->size()>r.list->size()&&set_subset(r,lv))); break; }
                 if((lv.type==VMType::BYTES)!=(r.type==VMType::BYTES)&&lv.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
@@ -6947,6 +7750,7 @@ private:
                 push(VMVal::make_bool(lv.type==VMType::LIST&&r.type==VMType::LIST ? cmp_val(lv,r)>0 : lv>r)); break;
             }
             case Op::COMPARE_GE: {
+                NY_QUICKEN();   // round 80
                 VMVal r=pop(),lv=pop();
                 if(lv.is_set()&&r.is_set()){ push(VMVal::make_bool(set_subset(r,lv))); break; }
                 if((lv.type==VMType::BYTES)!=(r.type==VMType::BYTES)&&lv.type!=VMType::INSTANCE&&r.type!=VMType::INSTANCE)
@@ -6972,7 +7776,7 @@ private:
                     try{ rv=load_var(t.s); have=true; }catch(...){}
                     if(have&&(rv.type==VMType::CLASS||!rv.builtin_type_name().empty())){
                         r=v==rv;
-                        push(VMVal::make_bool(ins.op==Op::COMPARE_IS_TYPE ? r : !r)); break;
+                        push(VMVal::make_bool(op==Op::COMPARE_IS_TYPE ? r : !r)); break;
                     }
                 }
                 if(ins.arg==1 && (named=load_var(t.s)).type!=VMType::NONE && named.type!=VMType::CLASS
@@ -6980,7 +7784,7 @@ private:
                     r=op_is(v,named);          // an ordinary value: identity
                 else
                     r=value_is_type(v,t.s);
-                push(VMVal::make_bool(ins.op==Op::COMPARE_IS_TYPE ? r : !r)); break;
+                push(VMVal::make_bool(op==Op::COMPARE_IS_TYPE ? r : !r)); break;
             }
             // Unary
             case Op::UNARY_NEG: {
@@ -7262,6 +8066,7 @@ private:
                 break;
             }
             case Op::CALL_FUNCTION: {
+                NY_QUICKEN();   // round 80
                 int argc=ins.arg;
                 std::vector<VMVal> args(argc);
                 for(int i=argc-1;i>=0;i--) args[i]=pop();
@@ -7291,6 +8096,7 @@ private:
                 push(vm_call(callee,args,std::nullopt)); break;
             }
             case Op::CALL_METHOD: {
+                NY_QUICKEN();   // round 80
                 int argc=ins.arg;
                 std::vector<VMVal> args(argc);
                 for(int i=argc-1;i>=0;i--) args[i]=pop();
@@ -7408,13 +8214,13 @@ private:
             case Op::GET_ITER: {
                 // directly before FOR_ITER (a loop's own iterator): a range or
                 // a dict is walked in place (round 78)
-                bool loop=fr.ip<(int)fr.code->instructions.size()&&fr.code->instructions[fr.ip].op==Op::FOR_ITER;
+                bool loop=fr.ip<(int)fr.code->instructions.size()&&base_op(fr.code->instructions[fr.ip].op)==Op::FOR_ITER;
                 push(loop_iter(pop(),loop)); break;
             }
             case Op::FOR_PREP: {
                 // `for x in range(...)` (arg 1-3) / `for ... in d.keys()`,
                 // values(), items() (arg 10-12): see Op::FOR_PREP (round 78)
-                bool loop=fr.ip<(int)fr.code->instructions.size()&&fr.code->instructions[fr.ip].op==Op::FOR_ITER;
+                bool loop=fr.ip<(int)fr.code->instructions.size()&&base_op(fr.code->instructions[fr.ip].op)==Op::FOR_ITER;
                 if(ins.arg>=10){
                     int k=ins.arg-10;
                     VMVal obj=pop();
@@ -7442,6 +8248,7 @@ private:
                 push(loop_iter(std::move(r),loop)); break;
             }
             case Op::FOR_ITER: {
+                NY_QUICKEN();   // round 80
                 // NOTE: use index not reference — gen_next/call_dunder may reallocate stack_
                 int it_idx = (int)stack_.size()-1;
                 if(it_idx < 0){ fr.ip=ins.arg; break; }
@@ -7648,6 +8455,7 @@ private:
             }
 
             case Op::IADD: {
+                NY_QUICKEN();   // round 80
                 VMVal r=pop(),l=pop();
                 if(l.type==VMType::INSTANCE){
                     VMVal res=ni_none(call_dunder(l,"__iadd__",{r}));
@@ -7663,11 +8471,15 @@ private:
                 }
                 push(binop_inplace(nypy::A_ADD,l,r)); break;
             }
-            case Op::ISUB: { VMVal r=pop(),l=pop();
+            case Op::ISUB: {
+                NY_QUICKEN();   // round 80
+                VMVal r=pop(),l=pop();
                 if(l.type==VMType::INSTANCE){ VMVal res=ni_none(call_dunder(l,"__isub__",{r})); if(res.type==VMType::NONE) res=ni_none(call_dunder(l,"__sub__",{r})); if(res.type!=VMType::NONE){push(res);break;} }
                 if(r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(l,r,"__sub__","__rsub__",res)){push(res);break;} }
                 push(binop(nypy::A_SUB,l,r)); break; }
-            case Op::IMUL: { VMVal r=pop(),l=pop();
+            case Op::IMUL: {
+                NY_QUICKEN();   // round 80
+                VMVal r=pop(),l=pop();
                 if(l.type==VMType::INSTANCE){ VMVal res=ni_none(call_dunder(l,"__imul__",{r})); if(res.type==VMType::NONE) res=ni_none(call_dunder(l,"__mul__",{r})); if(res.type!=VMType::NONE){push(res);break;} }
                 if(r.type==VMType::INSTANCE){ VMVal res; if(binary_dunder(l,r,"__mul__","__rmul__",res)){push(res);break;} }
                 push(binop_inplace(nypy::A_MUL,l,r)); break; }
@@ -7717,6 +8529,8 @@ private:
               }
         }
     }
+
+#undef NY_QUICKEN
 
     // ── Tracebacks (round 77) ────────────────────────────────────────────
     // An exception passing through a frame gets an entry for it at the head
@@ -9753,7 +10567,7 @@ private:
     // instance whose class defines one (not object's) runs it; object's own
     // store directly through _ny_setattr_raw / _ny_delattr_raw. Cached per
     // class until the next class statement.
-    std::unordered_map<std::string, uint8_t> attr_hook_cache_[3];   // __setattr__, __delattr__, __getattribute__ (round 77)
+    EpochCache<std::unordered_map<std::string, uint8_t>> attr_hook_cache_[3];   // __setattr__, __delattr__, __getattribute__ (round 77; round 80: EpochCache)
     static inline thread_local int raw_attr_depth_=0;
     bool instance_attr_hook(const VMVal& obj, int which, VMVal& m) {
         if(raw_attr_depth_>0||obj.type!=VMType::INSTANCE) return false;
@@ -9774,7 +10588,7 @@ private:
     // not go through it. object.__getattribute__ (_ny_getattr_raw) is the
     // normal lookup without __getattr__. Nothing is looked for until a
     // class defines one (any_getattribute_).
-    bool any_getattribute_=false;
+    EpochFlag any_getattribute_;   // (round 80: EpochFlag)
     bool raw_getattr_once_=false;              // the next lookup is object.__getattribute__'s
     const VMMap* raw_getattr_obj_=nullptr;     // ... and its object's __getattr__ is not called
     bool getattribute_hook(const VMVal& obj) {
@@ -9826,7 +10640,7 @@ private:
     // held by the instance's class runs for an assignment / deletion of that
     // attribute (round 77, as NythonExecutor::dataDescriptor). Any class
     // defining one turns the check on (class_created).
-    bool any_data_descr_=false;
+    EpochFlag any_data_descr_;   // (round 80: EpochFlag)
     bool data_descriptor(const VMVal& obj, const std::string& attr, const char* which, VMVal& d, VMVal& m) {
         if(!any_data_descr_||obj.type!=VMType::INSTANCE) return false;
         return class_lookup(obj.class_name, attr, d) && d.type==VMType::INSTANCE && class_lookup(d.class_name, which, m)
@@ -9863,8 +10677,8 @@ private:
         if((obj.type==VMType::MAP||obj.type==VMType::INSTANCE)&&obj.map&&obj.map->erase(attr)) return;
         if(obj.type==VMType::CLASS){
             std::string cname = obj.class_name.empty() ? obj.s : obj.class_name;
-            auto it=class_vars_.find(cname);
-            if(it!=class_vars_.end()&&it->second.erase(attr)) return;
+            auto it=class_vars_.find_mut(cname);
+            if(it!=class_vars_.m.end()&&it->second.erase(attr)) return;
         }
         if(obj.type==VMType::FUNCTION){
             auto fa=func_attrs_.find(func_key(obj));
@@ -10178,14 +10992,15 @@ private:
         int seen = 0;
         for(int k = ip - 1; k >= 0 && k > ip - 64; --k){
             const auto& pi = fr.code->instructions[k];
-            if(pi.op==Op::LOAD_NAME){
+            const Op pop_ = base_op(pi.op);   // a quickened LOAD_NAME is still one (round 80)
+            if(pop_==Op::LOAD_NAME){
                 if(seen >= argc){
                     if(pi.arg >= 0 && pi.arg < (int)fr.code->names.size())
                         return fr.code->names[pi.arg];
                     return std::string();
                 }
                 seen++;
-            } else if(pi.op==Op::LOAD_CONST){
+            } else if(pop_==Op::LOAD_CONST){
                 seen++;
             }
         }
@@ -13952,6 +14767,34 @@ private:
         case Op::INPLACE_TRY:  return "INPLACE_TRY";
         case Op::DEFINE_OUTER: return "DEFINE_OUTER";
         case Op::FOR_PREP:     return "FOR_PREP";   // round 78
+        // the specialized forms (round 80)
+        case Op::LOAD_NAME_FAST: return "LOAD_NAME_FAST";
+        case Op::LOAD_NAME_MOD: return "LOAD_NAME_MOD";
+        case Op::LOAD_NAME_GLOBAL: return "LOAD_NAME_GLOBAL";
+        case Op::STORE_NAME_FAST: return "STORE_NAME_FAST";
+        case Op::LOAD_ATTR_INST: return "LOAD_ATTR_INST";
+        case Op::LOAD_ATTR_CLASS: return "LOAD_ATTR_CLASS";
+        case Op::LOAD_ATTR_MODULE: return "LOAD_ATTR_MODULE";
+        case Op::STORE_ATTR_INST: return "STORE_ATTR_INST";
+        case Op::CALL_FUNCTION_PY: return "CALL_FUNCTION_PY";
+        case Op::CALL_METHOD_PY: return "CALL_METHOD_PY";
+        case Op::BINARY_ADD_NUM: return "BINARY_ADD_NUM";
+        case Op::BINARY_SUB_NUM: return "BINARY_SUB_NUM";
+        case Op::BINARY_MUL_NUM: return "BINARY_MUL_NUM";
+        case Op::BINARY_DIV_NUM: return "BINARY_DIV_NUM";
+        case Op::BINARY_FLOOR_DIV_INT: return "BINARY_FLOOR_DIV_INT";
+        case Op::BINARY_MOD_INT: return "BINARY_MOD_INT";
+        case Op::IADD_NUM: return "IADD_NUM";
+        case Op::ISUB_NUM: return "ISUB_NUM";
+        case Op::IMUL_NUM: return "IMUL_NUM";
+        case Op::COMPARE_EQ_NUM: return "COMPARE_EQ_NUM";
+        case Op::COMPARE_NE_NUM: return "COMPARE_NE_NUM";
+        case Op::COMPARE_LT_NUM: return "COMPARE_LT_NUM";
+        case Op::COMPARE_LE_NUM: return "COMPARE_LE_NUM";
+        case Op::COMPARE_GT_NUM: return "COMPARE_GT_NUM";
+        case Op::COMPARE_GE_NUM: return "COMPARE_GE_NUM";
+        case Op::FOR_ITER_RANGE: return "FOR_ITER_RANGE";
+        case Op::FOR_ITER_LIST: return "FOR_ITER_LIST";
         case Op::STORE_GLOBAL_NAME: return "STORE_GLOBAL_NAME";
         case Op::JUMP_IF_NONE_KEEP: return "JUMP_IF_NONE_KEEP";
         case Op::JUMP_IF_MISSING_KEEP: return "JUMP_IF_MISSING_KEEP";
