@@ -234,6 +234,12 @@ _condition_map = {ConversionSyntax:InvalidOperation,
                   InvalidContext:InvalidOperation}
 
 # Valid rounding modes
+# (the C module's message for a rounding mode that is not one)
+_ROUNDING_MSG = ("valid values for rounding are:\n"
+                 "  [ROUND_CEILING, ROUND_FLOOR, ROUND_UP, ROUND_DOWN,\n"
+                 "   ROUND_HALF_UP, ROUND_HALF_DOWN, ROUND_HALF_EVEN,\n"
+                 "   ROUND_05UP]")
+
 _rounding_modes = (ROUND_DOWN, ROUND_HALF_UP, ROUND_HALF_EVEN, ROUND_CEILING,
                    ROUND_FLOOR, ROUND_UP, ROUND_HALF_DOWN, ROUND_05UP)
 
@@ -371,14 +377,10 @@ class Decimal(object):
         # tuple/list conversion (possibly from as_tuple())
         if isinstance(value, (list,tuple)):
             if len(value) != 3:
-                raise ValueError('Invalid tuple size in creation of Decimal '
-                                 'from list or tuple.  The list or tuple '
-                                 'should have exactly three elements.')
+                raise ValueError('argument must be a sequence of length 3')
             # process sign.  The isinstance test rejects floats
             if not (isinstance(value[0], int) and value[0] in (0,1)):
-                raise ValueError("Invalid sign.  The first value in the tuple "
-                                 "should be an integer; either 0 for a "
-                                 "positive number or 1 for a negative number.")
+                raise ValueError("sign must be an integer with the value 0 or 1")
             self._sign = value[0]
             if value[2] == 'F':
                 # infinity: value[1] is ignored
@@ -394,9 +396,7 @@ class Decimal(object):
                         if digits or digit != 0:
                             digits.append(digit)
                     else:
-                        raise ValueError("The second value in the tuple must "
-                                         "be composed of integers in the range "
-                                         "0 through 9.")
+                        raise ValueError("coefficient must be a tuple of digits")
                 if value[2] in ('n', 'N'):
                     # NaN: digits form the diagnostic
                     self._int = ''.join(map(str, digits))
@@ -426,7 +426,7 @@ class Decimal(object):
             self._is_special  = value._is_special
             return self
 
-        raise TypeError("Cannot convert %r to Decimal" % value)
+        raise TypeError("conversion from %s to Decimal is not supported" % type(value).__name__)
 
     @classmethod
     def from_float(cls, f):
@@ -642,7 +642,7 @@ class Decimal(object):
         # in the documentation.  (See library docs, 'Built-in Types').
         if self._is_special:
             if self.is_snan():
-                raise TypeError('Cannot hash a signaling NaN value.')
+                raise TypeError('Cannot hash a signaling NaN value')
             elif self.is_nan():
                 return object.__hash__(self)
             else:
@@ -1240,9 +1240,9 @@ class Decimal(object):
     def __int__(self):
         if self._is_special:
             if self._isnan():
-                raise ValueError("Cannot convert NaN to integer")
+                raise ValueError("cannot convert NaN to integer")
             elif self._isinfinity():
-                raise OverflowError("Cannot convert infinity to integer")
+                raise OverflowError("cannot convert Infinity to integer")
         s = (-1)**self._sign
         if self._exp >= 0:
             return s*int(self._int)*10**self._exp
@@ -1440,25 +1440,25 @@ class Decimal(object):
         # one-argument form
         if self._is_special:
             if self.is_nan():
-                raise ValueError("cannot round a NaN")
+                raise ValueError("cannot convert NaN to integer")
             else:
-                raise OverflowError("cannot round an infinity")
+                raise OverflowError("cannot convert Infinity to integer")
         return int(self._rescale(0, ROUND_HALF_EVEN))
 
     def __floor__(self):
         if self._is_special:
             if self.is_nan():
-                raise ValueError("cannot round a NaN")
+                raise ValueError("cannot convert NaN to integer")
             else:
-                raise OverflowError("cannot round an infinity")
+                raise OverflowError("cannot convert Infinity to integer")
         return int(self._rescale(0, ROUND_FLOOR))
 
     def __ceil__(self):
         if self._is_special:
             if self.is_nan():
-                raise ValueError("cannot round a NaN")
+                raise ValueError("cannot convert NaN to integer")
             else:
-                raise OverflowError("cannot round an infinity")
+                raise OverflowError("cannot convert Infinity to integer")
         return int(self._rescale(0, ROUND_CEILING))
 
     def fma(self, other, third, context=None):
@@ -2030,6 +2030,8 @@ class Decimal(object):
         return _dec_from_triple(dup._sign, dup._int[:end], exp)
 
     def quantize(self, exp, rounding=None, context=None):
+        if rounding is not None and rounding not in _rounding_modes:
+            raise TypeError(_ROUNDING_MSG)
         exp = _convert_other(exp, raiseit=True)
 
         if context is None:
@@ -2132,6 +2134,8 @@ class Decimal(object):
         return ans
 
     def to_integral_exact(self, rounding=None, context=None):
+        if rounding is not None and rounding not in _rounding_modes:
+            raise TypeError(_ROUNDING_MSG)
         if self._is_special:
             ans = self._check_nans(context=context)
             if ans:
@@ -2152,6 +2156,8 @@ class Decimal(object):
         return ans
 
     def to_integral_value(self, rounding=None, context=None):
+        if rounding is not None and rounding not in _rounding_modes:
+            raise TypeError(_ROUNDING_MSG)
         if context is None:
             context = getcontext()
         if rounding is None:
@@ -3232,17 +3238,20 @@ class Context(object):
             self.flags = flags
 
     def _set_integer_check(self, name, value, vmin, vmax):
+        # (the C module's messages)
         if not isinstance(value, int):
-            raise TypeError("%s must be an integer" % name)
+            raise TypeError("an integer is required")
         if vmin == '-inf':
             if value > vmax:
-                raise ValueError("%s must be in [%s, %d]. got: %s" % (name, vmin, vmax, value))
+                raise ValueError("valid range for %s is [MIN_EMIN, 0]" % name)
         elif vmax == 'inf':
             if value < vmin:
-                raise ValueError("%s must be in [%d, %s]. got: %s" % (name, vmin, vmax, value))
+                if name == 'prec':
+                    raise ValueError("valid range for prec is [1, MAX_PREC]")
+                raise ValueError("valid range for %s is [0, MAX_EMAX]" % name)
         else:
             if value < vmin or value > vmax:
-                raise ValueError("%s must be in [%d, %d]. got %s" % (name, vmin, vmax, value))
+                raise ValueError("valid values for %s are 0 or 1" % name)
         return object.__setattr__(self, name, value)
 
     def _set_signal_dict(self, name, d):
@@ -3271,7 +3280,10 @@ class Context(object):
             if not value in _rounding_modes:
                 # raise TypeError even for strings to have consistency
                 # among various implementations.
-                raise TypeError("%s: invalid rounding mode" % value)
+                raise TypeError("valid values for rounding are:\n"
+                                "  [ROUND_CEILING, ROUND_FLOOR, ROUND_UP, ROUND_DOWN,\n"
+                                "   ROUND_HALF_UP, ROUND_HALF_DOWN, ROUND_HALF_EVEN,\n"
+                                "   ROUND_05UP]")
             return object.__setattr__(self, name, value)
         elif name == 'flags' or name == 'traps':
             return self._set_signal_dict(name, value)
@@ -4148,7 +4160,7 @@ class _locale:
 def _parse_format_specifier(format_spec, _localeconv=None):
     m = _parse_format_specifier_regex.match(format_spec)
     if m is None:
-        raise ValueError("Invalid format specifier: " + format_spec)
+        raise ValueError("invalid format string")
 
     # get the dictionary
     format_dict = m.groupdict()
@@ -4160,11 +4172,9 @@ def _parse_format_specifier(format_spec, _localeconv=None):
     format_dict['zeropad'] = (format_dict['zeropad'] is not None)
     if format_dict['zeropad']:
         if fill is not None:
-            raise ValueError("Fill character conflicts with '0'"
-                             " in format specifier: " + format_spec)
+            raise ValueError("invalid format string")
         if align is not None:
-            raise ValueError("Alignment conflicts with '0' in "
-                             "format specifier: " + format_spec)
+            raise ValueError("invalid format string")
     format_dict['fill'] = fill or ' '
     # PEP 3101 originally specified that the default alignment should
     # be left;  it was later agreed that right-aligned makes more sense
@@ -4194,8 +4204,7 @@ def _parse_format_specifier(format_spec, _localeconv=None):
         if _localeconv is None:
             _localeconv = _locale.localeconv()
         if format_dict['thousands_sep'] is not None:
-            raise ValueError("Explicit thousands separator conflicts with "
-                             "'n' type in format specifier: " + format_spec)
+            raise ValueError("invalid format string")
         format_dict['thousands_sep'] = _localeconv['thousands_sep']
         format_dict['grouping'] = _localeconv['grouping']
         format_dict['decimal_point'] = _localeconv['decimal_point']
