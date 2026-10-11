@@ -2937,6 +2937,23 @@ struct CallFrame {
     // the tracing hooks: an exception leaving it is returned to the caller
     // (VirtualMachine::exc_sentinel), not thrown (round 80).
     bool fast_exc = false;
+    // Back to a new frame's state, releasing everything the frame holds in
+    // the order its destructor would (members in reverse), but keeping the
+    // locals' storage: FrameStack reuses popped frames (round 80).
+    void reset() {
+        fast_exc=false; trace_line=-1; trace_ip=-1; end_line=0;
+        fobj.reset();
+        stack_base=0;
+        prep_skip=0;
+        prep_ns.reset();
+        gen_state.reset();
+        own_env=false;
+        closure_env.reset();
+        self_val.reset();
+        locals.clear_keep();
+        ip=0;
+        code.reset();
+    }
 };
 
 // The call stack (round 80). Frames never move once pushed - run_loop and
@@ -2949,7 +2966,8 @@ struct CallFrame {
 class FrameStack {
     static constexpr size_t kChunk = 32;
     std::vector<CallFrame*> chunks_;
-    size_t n_ = 0;
+    size_t n_ = 0;       // frames in use
+    size_t built_ = 0;   // frames constructed: in use, or popped and reset for the next call
     CallFrame* at(size_t i) const { return chunks_[i / kChunk] + (i % kChunk); }
     CallFrame* next_slot() {
         if (n_ / kChunk == chunks_.size())
@@ -2958,6 +2976,7 @@ class FrameStack {
     }
     void release() {
         while (n_) pop_back();
+        while (built_) { built_--; at(built_)->~CallFrame(); }
         for (CallFrame* c : chunks_) ::operator delete(static_cast<void*>(c));
         chunks_.clear();
     }
@@ -2965,13 +2984,13 @@ public:
     FrameStack() = default;
     FrameStack(const FrameStack&) = delete;
     FrameStack& operator=(const FrameStack&) = delete;
-    FrameStack(FrameStack&& o) noexcept : chunks_(std::move(o.chunks_)), n_(o.n_) { o.chunks_.clear(); o.n_ = 0; }
+    FrameStack(FrameStack&& o) noexcept : chunks_(std::move(o.chunks_)), n_(o.n_), built_(o.built_) { o.chunks_.clear(); o.n_ = 0; o.built_ = 0; }
     FrameStack& operator=(FrameStack&& o) noexcept {
-        if (this != &o) { release(); chunks_ = std::move(o.chunks_); n_ = o.n_; o.chunks_.clear(); o.n_ = 0; }
+        if (this != &o) { release(); chunks_ = std::move(o.chunks_); n_ = o.n_; built_ = o.built_; o.chunks_.clear(); o.n_ = 0; o.built_ = 0; }
         return *this;
     }
     ~FrameStack() { release(); }
-    void swap(FrameStack& o) noexcept { chunks_.swap(o.chunks_); std::swap(n_, o.n_); }
+    void swap(FrameStack& o) noexcept { chunks_.swap(o.chunks_); std::swap(n_, o.n_); std::swap(built_, o.built_); }
     size_t size() const { return n_; }
     bool empty() const { return n_ == 0; }
     CallFrame& operator[](size_t i) { return *at(i); }
@@ -2980,9 +2999,17 @@ public:
     const CallFrame& back() const { return *at(n_ - 1); }
     CallFrame& front() { return *at(0); }
     const CallFrame& front() const { return *at(0); }
-    void push_back(CallFrame&& f) { CallFrame* p = next_slot(); new (p) CallFrame(std::move(f)); n_++; }
-    CallFrame& emplace_back() { CallFrame* p = next_slot(); new (p) CallFrame(); n_++; return *p; }
-    void pop_back() { n_--; at(n_)->~CallFrame(); }
+    // A popped frame is reset, not destroyed, and the next push at that
+    // depth reuses it - its locals' storage too (CallFrame::reset).
+    void push_back(CallFrame&& f) {
+        if (n_ < built_) { *at(n_) = std::move(f); n_++; return; }
+        CallFrame* p = next_slot(); new (p) CallFrame(std::move(f)); n_++; built_++;
+    }
+    CallFrame& emplace_back() {
+        if (n_ < built_) return *at(n_++);
+        CallFrame* p = next_slot(); new (p) CallFrame(); n_++; built_++; return *p;
+    }
+    void pop_back() { n_--; at(n_)->reset(); }
     template<class F, class S> class Iter {
         S* s_; size_t i_;
     public:
@@ -7055,11 +7082,43 @@ private:
         ic_add_way(c, obj.class_name, nullptr);
         return true;
     }
+    // Whether specializing is turned off for generic op `op` (read once).
+    static bool quicken_off(Op op) {
+        static const int mask=[]{
+            const char* q=getenv("NY_QUICKEN");
+            if(q&&std::string(q)=="0") return 0x3f;
+            const char* sk=getenv("NY_QUICKEN_SKIP");
+            int m=0;
+            if(sk){
+                std::string s=sk;
+                if(s.find("names")!=std::string::npos) m|=1;
+                if(s.find("attrs")!=std::string::npos) m|=2;
+                if(s.find("calls")!=std::string::npos) m|=4;
+                if(s.find("arith")!=std::string::npos) m|=8;
+                if(s.find("iter")!=std::string::npos) m|=16;
+                if(s.find("subscr")!=std::string::npos) m|=32;
+            }
+            return m;
+        }();
+        if(!mask) return false;
+        switch(op){
+            case Op::LOAD_NAME: case Op::STORE_NAME: case Op::LOAD_GLOBAL_NAME: return mask&1;
+            case Op::LOAD_ATTR: case Op::STORE_ATTR: return mask&2;
+            case Op::CALL_FUNCTION: case Op::CALL_METHOD: return mask&4;
+            case Op::FOR_ITER: return mask&16;
+            case Op::LOAD_SUBSCR: case Op::STORE_SUBSCR: case Op::UNPACK_SEQ: return mask&32;
+            default: return mask&8;
+        }
+    }
     // Rewrites `ins` (a generic instruction whose counter ran out) into a
     // specialized form for the operands now on the stack, or backs off.
     // True when it did: the caller runs the specialized form at once.
     bool specialize_at(CallFrame& fr, Instruction& ins) {
         VMCode& code=*fr.code;
+        // NY_QUICKEN=0 turns specializing off (to compare behaviour or
+        // speed); NY_QUICKEN_SKIP=names,attrs,calls,arith,iter,subscr leaves
+        // those families generic (round 80)
+        if(__builtin_expect(quicken_off(base_op(ins.op)),0)){ ins.ctr=255; return false; }
         if(!code.quick.ic) quick_init(code);
         if(ins.ic==0||ins.ic>code.quick.n){ ins.ctr=255; return false; }
         VMIC& c=code.quick.ic[ins.ic-1];
