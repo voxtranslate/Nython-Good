@@ -65,6 +65,8 @@ class IDELive(IDETools):
         self.prof_cols = ["ncalls", "tottime", "percall", "cumtime", "cumpercall", "name"]
         self.prof_heads = ["ncalls", "tottime", "percall", "cumtime", "percall", "filename:lineno(function)"]
         self.prof_widths = [80, 70, 70, 70, 70, 0]
+        self.prof_sort_tips = ["Sort by calls", "Sort by internal time", "Sort by internal time per call",
+                               "Sort by cumulative time", "Sort by cumulative time per call", "Sort by name"]
         # the flame graph's warm palette (Gregg's "hot" colours), made once
         self.prof_palette = []
         var pi = 0
@@ -528,11 +530,13 @@ class IDELive(IDETools):
 
     # The two exception breakpoints, as checkboxes.
     def _draw_live_exc_rows(self, r, x, y, w):
-        y = self._live_check_row(r, x, y, w, "Raised Exceptions", self.live_exc_raised, "nython.debug.toggleRaised")
-        y = self._live_check_row(r, x, y, w, "Uncaught Exceptions", self.live_exc_uncaught, "nython.debug.toggleUncaught")
+        y = self._live_check_row(r, x, y, w, "Raised Exceptions", self.live_exc_raised, "nython.debug.toggleRaised",
+                                 "Live debugging stops where an exception is raised")
+        y = self._live_check_row(r, x, y, w, "Uncaught Exceptions", self.live_exc_uncaught, "nython.debug.toggleUncaught",
+                                 "Live debugging stops on an exception nothing caught")
         return y + self.dp(4)
 
-    def _live_check_row(self, r, x, y, w, label, on, cmd):
+    def _live_check_row(self, r, x, y, w, label, on, cmd, tip):
         var th = self.th
         var lh = self.ROW_H
         if self._hov(x, y, w, lh):
@@ -543,7 +547,7 @@ class IDELive(IDETools):
         if on:
             self.icons.draw(r, "check", bx - self.dp(1), by - self.dp(1), self.dp(16), th.text)
         r.text(label, bx + self.dp(22), y + int((lh - self.ui_h) / 2), self.f_ui, th.text)
-        self._hit(x, y, w, lh, cmd, "", "Break on " + label + " in live debugging")
+        self._hit(x, y, w, lh, cmd, "", tip)
         return y + lh
 
     def _draw_live_view(self, r, x, w):
@@ -807,18 +811,20 @@ class IDELive(IDETools):
         self.prof_sel = fi
         var rows = []
         var f = P.funcs[fi]
-        rows.append(["Callers of " + f.name + "   (calls  tottime  cumtime)", -1, "head"])
+        rows.append(["Callers of " + f.name + "   (calls  tottime  cumtime)", -1, "head", ""])
         var cs = P.callers_of(fi)
         if len(cs) == 0:
-            rows.append(["    (none: called from outside the profile)", -1, "none"])
+            rows.append(["    (none: called from outside the profile)", -1, "none", ""])
         for c in cs:
-            rows.append(["    " + self._prof_calls(c) + "  " + prof_fmt(c[3]) + "  " + prof_fmt(c[4]) + "   " + P.funcs[c[0]].short, c[0], "caller"])
-        rows.append(["Callees of " + f.name, -1, "head"])
+            rows.append(["    " + self._prof_calls(c) + "  " + prof_fmt(c[3]) + "  " + prof_fmt(c[4]) + "   " + P.funcs[c[0]].short, c[0], "caller",
+                         "Select and open " + P.funcs[c[0]].label])
+        rows.append(["Callees of " + f.name, -1, "head", ""])
         var ce = P.callees_of(fi)
         if len(ce) == 0:
-            rows.append(["    (none)", -1, "none"])
+            rows.append(["    (none)", -1, "none", ""])
         for c2 in ce:
-            rows.append(["    " + self._prof_calls(c2) + "  " + prof_fmt(c2[3]) + "  " + prof_fmt(c2[4]) + "   " + P.funcs[c2[0]].short, c2[0], "callee"])
+            rows.append(["    " + self._prof_calls(c2) + "  " + prof_fmt(c2[3]) + "  " + prof_fmt(c2[4]) + "   " + P.funcs[c2[0]].short, c2[0], "callee",
+                         "Select and open " + P.funcs[c2[0]].label])
         self.prof_rel = rows
         self._dirty = true
 
@@ -880,7 +886,7 @@ class IDELive(IDETools):
             if active:
                 var ic = "chevron-down" if P.sort_desc else "chevron-up"
                 self.icons.draw(r, ic, hx - self.dp(14) if k < 5 else hx + self.f_small_bold.width(hl) + self.dp(2), ty + self.dp(2), self.dp(14), th.accent)
-            self._hit(cx, ty, cw, lh, "@prof.sort", k, "Sort by " + self.prof_cols[k])
+            self._hit(cx, ty, cw, lh, "@prof.sort", k, self.prof_sort_tips[k])
             cx = cx + cw
             k = k + 1
         r.fill_xywh(x + self.dp(16), ty + lh, tw - self.dp(16), 1, th.panel_border)
@@ -917,7 +923,7 @@ class IDELive(IDETools):
             cx = self._prof_cell(r, cx, self.dp(self.prof_widths[2]), tyy, f.s_pc)
             cx = self._prof_cell(r, cx, self.dp(self.prof_widths[3]), tyy, f.s_ct)
             cx = self._prof_cell(r, cx, self.dp(self.prof_widths[4]), tyy, f.s_pc2)
-            r.text(f.label, cx + self.dp(4), tyy, self.f_mono_small, th.info if not f.builtin else th.text_dim)
+            r.text(f.short, cx + self.dp(4), tyy, self.f_mono_small, th.info if not f.builtin else th.text_dim)
             self._hit(x + self.dp(8), ry, tw - self.dp(8), lh, "@prof.row", fi, f.label)
             ry = ry + lh
             i = i + 1
@@ -937,7 +943,7 @@ class IDELive(IDETools):
                     r.fill_xywh(x + self.dp(8), yy, tw - self.dp(8), lh, th.hover)
                 r.text(rr[0], x + self.dp(16), yy + int((lh - self.code_small_h) / 2), self.f_mono_small if rr[2] != "head" else self.f_small_bold, rc)
                 if rr[1] >= 0:
-                    self._hit(x + self.dp(8), yy, tw - self.dp(8), lh, "@prof.rel", rr[1], "Select and open " + P.funcs[rr[1]].label)
+                    self._hit(x + self.dp(8), yy, tw - self.dp(8), lh, "@prof.rel", rr[1], rr[3])
                 yy = yy + lh
                 j = j + 1
         # the flame graph (an icicle: the root at the top)

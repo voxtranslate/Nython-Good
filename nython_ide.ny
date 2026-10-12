@@ -1417,7 +1417,7 @@ class NythonIDE(IDELive):
                                           ["Copy Value", "@ctx.copytext", vs[h.arg][1]],
                                           ["Copy as Expression", "@ctx.copytext", vs[h.arg][0]],
                                           ["Add to Watch", "@ctx.watch", vs[h.arg][0]]])
-        elif string_startswith(c, "@live."):
+        elif c == "@live.var":
             self._live_context(h, e)
         elif c == "@term" or c == "@panel.body" or c == "@dbgcon" or c == "@stdin":
             self._open_ctx(e.x, e.y, [["Copy All", "@ctx.copypanel", ""], ["Clear", "workbench.action.terminal.clear", ""]])

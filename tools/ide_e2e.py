@@ -884,7 +884,7 @@ def sc_live_debug(s):
     ide.type("5\n")
     ide.key("f9")
     ide.key("alt+f5")
-    st = s.wait_until(lambda st: st["live_state"] == "paused" and st["live_line"] == 5 and st["live_vars"], timeout=30)
+    st = s.wait_until(lambda st: st["live_state"] == "paused" and st["live_line"] == 5 and [1, "n", "4"] in st["live_vars"], timeout=30)
     c(st["live_state"] == "paused" and st["live_line"] == 5 and st["live_reason"] == "breakpoint",
       "live: Alt+F5 runs live and stops at the breakpoint", (st["live_state"], st["live_line"], st["live_reason"], st["status"]))
     c(st["live_frames"] == [["total", 5], ["<module>", 10]], "live: the call stack", st["live_frames"])
@@ -928,6 +928,8 @@ def sc_live_debug(s):
     st = s.wait_until(lambda st: st["dbg_why_title"].startswith("Why is s"))
     c(st["dbg_why_title"] == "Why is s = 0?" and any(r[2] == "data" and r[1] == 5 for r in st["dbg_why"]),
       "live: Why? answered from the ring buffer", (st["dbg_why_title"], st["dbg_why"][:3]))
+    if s.shots:
+        ide.screenshot(os.path.join(s.shots, "live-why.png"))
     # set a variable: double-click it, type the new value
     st = ide.state()
     t = ide.find("n", region=side)
@@ -946,6 +948,8 @@ def sc_live_debug(s):
     ide.click(int(t.cx), int(t.cy))
     st = s.wait_until(lambda st: [2, "1", "5"] in st["live_vars"])
     c([2, "0", "4"] in st["live_vars"] and [2, "1", "5"] in st["live_vars"], "live: a list expands into its items", st["live_vars"])
+    if s.shots:
+        ide.screenshot(os.path.join(s.shots, "live-paused.png"))
     # a watch expression
     palette(s, "Run: Remove All Breakpoints")
     hm = ide.hitmap()
@@ -960,6 +964,7 @@ def sc_live_debug(s):
     ide.key("f5")
     st = s.wait_until(lambda st: not st["live_active"], timeout=30)
     c(not st["live_active"], "live: continue runs to the end and the session ends", (st["live_state"], st["live_active"]))
+    ide.click_text("OUTPUT")
     ok = False
     for _ in range(60):
         if ide.snap().has("total 1", exact=True):
@@ -971,7 +976,10 @@ def sc_live_debug(s):
     c(any("exited with code 0" in ln for ln in st["dbgcon"]), "live: the exit code in the Debug Console", st["dbgcon"][-3:])
     # pause interrupts a running loop
     s.write("spin.ny", SPIN)
-    s.open_file("spin.ny")
+    time.sleep(1.5)
+    ide.key("ctrl+p")
+    ide.type("spin.ny")
+    ide.key("enter")
     ide.key("alt+f5")
     st = s.wait_until(lambda st: st["live_state"] == "running", timeout=30)
     time.sleep(0.5)
@@ -987,7 +995,7 @@ def sc_live_debug(s):
     st = s.wait_until(lambda st: not st["live_active"], timeout=30)
     ok = False
     for _ in range(60):
-        if ide.snap().has("stopped at True", exact=True):
+        if ide.snap().has("stopped at true", exact=True):
             ok = True
             break
         time.sleep(0.1)
