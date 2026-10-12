@@ -4,8 +4,11 @@
 # shorter path the next time (NythonExecutor: literal values made once, an
 # operator's code, int/float arithmetic and comparisons without the general
 # dispatch, a name's hash and the slot it was found in, a field's slot in an
-# instance, plain calls of plain functions without the side tables, and a
-# polymorphic inline cache per method-call site). Every scenario here first
+# instance, plain calls of plain functions without the side tables, a
+# polymorphic inline cache per method-call site, a cache for class
+# attributes and methods read as values, a builtin value's own methods
+# straight from its table, and return/break/continue leaving try/finally
+# and with without an exception). Every scenario here first
 # runs a site long enough for it to have specialized, then changes what it
 # sees - a global, a builtin shadowed, a function replaced by a lambda, a
 # class or a builtin at the same call, a method replaced in a class or a
