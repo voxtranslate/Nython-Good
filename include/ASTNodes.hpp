@@ -27,6 +27,10 @@ struct YieldSignal  { Value value; YieldSignal(Value v)  : value(v) {}  };
 // ═══════════════════════════════════════════════════════════════════════════
 
 struct IntegerNode : Node {
+    // The interpreter's value of the literal, made on its first evaluation
+    // (round 81; an int holds no heap reference).
+    Value made_value{};
+    bool made = false;
     IntegerNode(Token t) : Node(t, NodeType::INTEGER) {}
     Value eval(Context* ctx) override {
         auto& v = _token.value;
@@ -45,6 +49,8 @@ struct IntegerNode : Node {
 };
 
 struct FloatNode : Node {
+    Value made_value{};   // round 81, as IntegerNode's
+    bool made = false;
     FloatNode(Token t) : Node(t, NodeType::FLOAT) {}
     Value eval(Context* ctx) override {
         return Value(std::strtod(_token.value.c_str(), nullptr));   // 5e-324 / 1e400 (stod threw)
@@ -107,6 +113,17 @@ struct VariableNode : Node {
     // module level (created there by an assignment), whatever an enclosing
     // function binds.
     bool global_ref = false;
+    // Round 81, the interpreter's cache for reading the name: its hash,
+    // computed once, and the scope depth and slot it was found at last
+    // (checked - the key still in that slot - before use).
+    uint64_t name_hash = 0;
+    bool hashed = false;
+    uint8_t hint_depth = 0xFF;
+    uint32_t hint_slot = 0;
+    // ... and for assigning it: whether it is one of the builtins' names,
+    // as of the executor's version of that set (base_names_ver_).
+    uint32_t base_ver = 0;
+    bool base_hit = false;
     VariableNode(Token t) : Node(t, NodeType::VARIABLE), name(t.value) {}
     std::string value() override { return name; }
     Value eval(Context* ctx) override {
@@ -220,6 +237,7 @@ struct UnaryNode : Node {
 
 struct BinaryNode : Node {
     node_ptr left, right; std::string op;
+    int8_t opc = -1;   // round 81: the interpreter's code for `op`, worked out on first use
     BinaryNode(Token t, node_ptr l, node_ptr r) : Node(t, NodeType::BINARY), left(l), right(r), op(t.value) {}
     Value eval(Context* ctx) override {
         // Short-circuit
@@ -244,6 +262,25 @@ struct BinaryNode : Node {
 
 struct AttributeNode : Node {
     node_ptr object; std::string attr;
+    uint32_t slot_hint = 0;   // round 81: the interpreter's cache of the field's slot (NythonExecutor::fieldAt)
+    // Round 81: whether `attr` is a name some class holds a data descriptor
+    // under, as of the executor's version of that set ...
+    uint32_t dd_ver = 0;
+    bool dd_hit = false;
+    // ... and, for `obj.attr = v` on instances, the interpreter's inline
+    // cache (NythonExecutor::storeFast): per receiver class, the class
+    // namespaces of its MRO, none of which holds `attr` (so no descriptor,
+    // property or class hook applies), each with the version of its keys.
+    struct StoreIC {
+        void* cls = nullptr;            // the receiver's class node; nullptr: empty
+        uint64_t epoch = 0;
+        const void* by = nullptr;
+        std::vector<std::pair<Context*, uint32_t>> ns;
+    };
+    static constexpr int kStoreWays = 2;
+    std::unique_ptr<StoreIC[]> sic;
+    uint8_t sic_next = 0, sic_skip = 0, sic_backoff = 0;
+    uint32_t store_hint = 0;            // the field's slot in the instance's scope
     AttributeNode(Token t, node_ptr o, const std::string& a) : Node(t, NodeType::ATTRIBUTE), object(o), attr(a) {}
     Value eval(Context* ctx) override {
         Value obj = object->eval(ctx);
@@ -360,6 +397,32 @@ struct RangeNode : Node {
 
 struct CallNode : Node {
     node_ptr callee; std::vector<node_ptr> args;
+    int8_t plain_args = -1;   // round 81: 1 when every argument is a plain positional one (no name=, * or **)
+    // Round 81: the interpreter's polymorphic inline cache for `obj.m(...)`
+    // on instances (NythonExecutor::methodFast): per receiver class, the
+    // plain method the call resolves to and where its class namespace holds
+    // it. Nothing here owns a reference: an entry is valid only while the
+    // executor's specialization epoch is the one it was made in, and every
+    // use checks the namespaces still hold what it says.
+    struct MethodIC {
+        void* cls = nullptr;            // the receiver's class node; nullptr: empty
+        uint64_t epoch = 0;
+        const void* by = nullptr;       // the executor that made it
+        Node* fn = nullptr;             // the method's FunctionNode
+        Node* owner = nullptr;          // the class in the MRO that defines it
+        void* m_p = nullptr;            // the method value's identity ...
+        void* m_o = nullptr;            // ... and its heap object
+        Context* owner_ctx = nullptr;   // the owner's namespace
+        uint32_t owner_slot = 0;        // the method's slot in it
+        // the namespaces before the owner in the MRO (none holds the name),
+        // each with the version of its keys then (OrderedMap::version)
+        std::vector<std::pair<Context*, uint32_t>> prefix;
+    };
+    static constexpr int kMethodWays = 4;   // receiver classes per site (Hölzle et al. 1991)
+    std::unique_ptr<MethodIC[]> mic;        // made on first use
+    uint8_t mic_next = 0;                   // the way the next new class takes
+    uint8_t mic_skip = 0;                   // calls left before trying to fill again
+    uint8_t mic_backoff = 0;                // how many fills found nothing to cache
     CallNode(Token t, node_ptr c) : Node(t, NodeType::CALL), callee(c), args{} {}
     Node* add(node_ptr n) override { args.push_back(n); return this; }
     std::vector<node_ptr> statements() override { return args; }
@@ -708,6 +771,11 @@ struct FunctionNode : Node {
     std::string qualname;
     bool is_async = false, is_async_gen = false;
     int first_line = 0;   // a decorated def: its first decorator's line (co_firstlineno)
+    // What the interpreter's call fast path needs, worked out on first use
+    // (round 81): whether every parameter is a plain name, their names, and
+    // whether the body yields (-1: not known yet).
+    int8_t simple_sig = -1, body_yields = -1;
+    std::vector<std::string> param_names;
     FunctionNode(Token t, const std::string& n, node_ptr b, bool m=false) : Node(t, NodeType::FUNCTION), name(n), params{}, body(b), is_method(m), defaults{} {}
     Node* add(node_ptr n) override { params.push_back(n); return this; }
     Value eval(Context* ctx) override {
@@ -728,6 +796,8 @@ struct LambdaNode : Node {
     // The interpreter binds a lambda's arguments as a def's
     // (bindParamsImpl): this FunctionNode carries its signature (round 77).
     node_ptr sig;
+    int8_t simple_sig = -1;                  // round 81, as FunctionNode's
+    std::vector<std::string> param_names;
     LambdaNode(Token t, node_ptr b) : Node(t, NodeType::LAMBDA), params{}, body(b), defaults{} {}
     Node* add(node_ptr n) override { params.push_back(n); return this; }
     Value eval(Context* ctx) override {

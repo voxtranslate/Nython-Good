@@ -15,6 +15,7 @@ python3's (the benchmarks are deterministic), so a speedup that came from a
 wrong answer is reported as an error rather than as a win.
 
     python3 tools/bench/run.py                       # build/nython-cli --vm, 5 runs
+    python3 tools/bench/run.py --engine interp       # the tree-walking interpreter
     python3 tools/bench/run.py --base /tmp/old/nython-cli -n 7 --python
     python3 tools/bench/run.py -k fib -k richards    # a subset
     python3 tools/bench/run.py --bin build-win/nywin # under Wine (a wrapper script)
@@ -60,6 +61,7 @@ def main():
     ap.add_argument("--bin", default=os.path.join(ROOT, "build", "nython-cli"), help="the Nython binary measured")
     ap.add_argument("--base", help="a baseline Nython binary to compare against")
     ap.add_argument("--interp", action="store_true", help="run the interpreter instead of the VM (--vm)")
+    ap.add_argument("--engine", choices=["interp", "vm"], help="the engine measured (round 81; --interp is --engine interp)")
     ap.add_argument("--python", action="store_true", help="also time python3 for reference")
     ap.add_argument("-n", type=int, default=5, help="runs per benchmark and binary (default 5)")
     ap.add_argument("-k", action="append", default=[], help="only benchmarks whose file name contains this")
@@ -68,6 +70,8 @@ def main():
     ap.add_argument("--json", help="write the raw times to this file")
     args = ap.parse_args()
 
+    if args.engine:
+        args.interp = args.engine == "interp"
     eng = [] if args.interp else ["--vm"]
     files = bench_files(args.k)
     if not files:

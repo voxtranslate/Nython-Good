@@ -13,16 +13,19 @@ namespace nython {
 namespace kernel {
 
 Container::Container(Type type_arg, uint32_t initial_capacity): Collectable(type_arg), location{} {
+    gc_flags |= nygc::F_KCONT;   // round 81: NythonExecutor::contOf
     this->container = new ContainerType();
     this->container->reserve(initial_capacity);
 }
 
 Container::Container(Runnable* runner, Type type, uint32_t initial_capacity): Collectable(runner,type), location{} {
+    gc_flags |= nygc::F_KCONT;   // round 81
     this->container = new ContainerType();
     this->container->reserve(initial_capacity);
 }
 
 Container::Container(const Container& o) : Collectable(o), location{o.location} {
+    gc_flags |= nygc::F_KCONT;   // round 81
     this->container = o.container ? new ContainerType(*o.container) : nullptr;
 }
 
