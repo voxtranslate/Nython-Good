@@ -1053,6 +1053,14 @@ public:   // NythonExecutor is a struct: members default to public
     // (`pend`), the rest are evaluated as by evalNode.
     Value evalP(const node_ptr& n, Context* ctx) { return evalNode(n, ctx, true); }
     [[gnu::always_inline]] static bool pendingSet() { return __builtin_expect(flow().pending != 0, 0); }
+    // round 82: whether `v`, what an evaluator given `pend` returned, left an
+    // exception pending. Such an evaluator returns None whenever it leaves
+    // one (every `pendExc` site returns NONE_VALUE, and so do evalBody and
+    // runFunctionBody when they hand it on), so the flag is read only for a
+    // None - CPython's NULL-then-PyErr_Occurred() test.
+    [[gnu::always_inline]] static bool raisedBy(const Value& v) {
+        return __builtin_expect(v.type == ValueType::NONE, 0) && pendingSet();
+    }
 
     // `pend` (round 82): see evalP - handed to the evaluators that take it
     Value evalNode(const node_ptr& node, Context* ctx, bool pend = false) {
@@ -1418,7 +1426,7 @@ public:   // NythonExecutor is a struct: members default to public
         Value val = vd->init ? (evalNode(vd->init, ctx, pend)) : NONE_VALUE;
         // round 82: the value raised (evalP) - `val` (none), the one named
         // result, so it is still built in place
-        if (pend && pendingSet()) return val;
+        if (pend && raisedBy(val)) return val;
         // a, b = gen(): the targets index a list of its values (nygen); an
         // object with __iter__ / __next__ is iterated the same way, as Python
         // unpacks (it was indexed: "'It' object is not subscriptable").
@@ -1470,7 +1478,7 @@ public:   // NythonExecutor is a struct: members default to public
     Value evalAssignment(const node_ptr& node, Context* ctx, bool pend = false) {
         auto* an = static_cast<AssignmentNode*>((node).get());
         Value val = evalNode(an->value_node, ctx, pend);
-        if (pend && pendingSet()) return val;   // round 82: the value raised (evalP; see evalVarDecl)
+        if (pend && raisedBy(val)) return val;   // round 82: the value raised (evalP; see evalVarDecl)
         if (an->target->type() == NodeType::VARIABLE) {
             auto* vn = static_cast<VariableNode*>((an->target).get());
             // In a class body a name is always bound in the class namespace:
@@ -2769,7 +2777,7 @@ public:   // NythonExecutor is a struct: members default to public
             old_val = evalNode(an->target, ctx);
         }
         Value new_val = evalNode(an->value_node, ctx, pend);
-        if (pend && pendingSet()) return NONE_VALUE;   // round 82: the value raised (evalP)
+        if (pend && raisedBy(new_val)) return NONE_VALUE;   // round 82: the value raised (evalP)
         Value result;
         // Two numbers (round 81): binaryOp's answer without its other checks
         // (no container, bytes or object is involved), then the store.
@@ -4590,13 +4598,13 @@ public:   // NythonExecutor is a struct: members default to public
         // to test only for false/none and always produced a bool for `and`.
         case OP_AND: {
             Value lv = evalNode(bn->left, ctx, pend);
-            if (pend && pendingSet()) return NONE_VALUE;   // round 82
+            if (pend && raisedBy(lv)) return NONE_VALUE;   // round 82
             if (!isTruthy(lv)) return lv;
             return evalNode(bn->right, ctx, pend);
         }
         case OP_OR: {
             Value lv = evalNode(bn->left, ctx, pend);
-            if (pend && pendingSet()) return NONE_VALUE;   // round 82
+            if (pend && raisedBy(lv)) return NONE_VALUE;   // round 82
             if (isTruthy(lv)) return lv;
             return evalNode(bn->right, ctx, pend);
         }
@@ -4631,9 +4639,9 @@ public:   // NythonExecutor is a struct: members default to public
         default: break;
         }
         Value lv = evalNode(bn->left, ctx, pend);
-        if (pend && pendingSet()) return NONE_VALUE;   // round 82
+        if (pend && raisedBy(lv)) return NONE_VALUE;   // round 82
         Value rv = evalNode(bn->right, ctx, pend);
-        if (pend && pendingSet()) return NONE_VALUE;
+        if (pend && raisedBy(rv)) return NONE_VALUE;
         if (opc == OP_UNKNOWN) {
             // a @ b: __matmul__ / __rmatmul__ only.
             if (bn->op == "@") {
@@ -4737,7 +4745,7 @@ public:   // NythonExecutor is a struct: members default to public
     Value evalUnary(const node_ptr& node, Context* ctx, bool pend = false) {
         auto* un = static_cast<UnaryNode*>((node).get());
         Value v = evalNode(un->operand, ctx, pend);
-        if (pend && pendingSet()) return NONE_VALUE;   // round 82 (evalP)
+        if (pend && raisedBy(v)) return NONE_VALUE;   // round 82 (evalP)
         const std::string& op = un->op;
         if (op == "!" || op == "not") return Value(!isTruthy(v));
         if (op == "-" || op == "+" || op == "~") {
@@ -4959,7 +4967,7 @@ public:   // NythonExecutor is a struct: members default to public
     Value evalIf(const node_ptr& node, Context* ctx, bool pend = false) {
         auto* in = static_cast<IfNode*>((node).get());
         Value cond = evalNode(in->condition, ctx, pend);
-        if (pend && pendingSet()) return NONE_VALUE;   // round 82: the test raised (evalP)
+        if (pend && raisedBy(cond)) return NONE_VALUE;   // round 82: the test raised (evalP)
         if (isTruthy(cond)) return evalNode(in->then_branch, ctx);
         for (auto& ei : in->elseif_branches) {
             auto* eif = static_cast<IfNode*>((ei).get());
@@ -4982,7 +4990,7 @@ public:   // NythonExecutor is a struct: members default to public
             head_first = false;
             if (pend) {
                 Value c = evalP(wn->condition, ctx);
-                if (pendingSet()) return result;
+                if (raisedBy(c)) return result;
                 if (!isTruthy(c)) break;
             } else if (!isTruthy(evalNode(wn->condition, ctx))) break;
             try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(wn->body, ctx); }
@@ -8792,7 +8800,7 @@ public:
             }
 
             Value obj = evalNode(attr->object, ctx, pend);
-            if (pend && pendingSet()) return NONE_VALUE;   // round 82
+            if (pend && raisedBy(obj)) return NONE_VALUE;   // round 82
 
             // Evaluate arguments
             std::vector<Value> args; nyrt::OrderedKw<Value> kw_args;
@@ -8806,7 +8814,7 @@ public:
                     ArgBuf argv;
                     for (auto& a : cn->args) {
                         argv.push(evalNode(a, ctx, pend));
-                        if (pend && pendingSet()) return NONE_VALUE;   // round 82: by the flag
+                        if (pend && raisedBy(argv[argv.n - 1])) return NONE_VALUE;   // round 82: by the flag
                     }
                     {
                         Value out;
@@ -9075,7 +9083,7 @@ public:
                 ArgBuf argv;
                 for (size_t i = 0; i < na; i++) {
                     argv.push(evalNode(cn->args[i], ctx, pend));
-                    if (pend && pendingSet()) return NONE_VALUE;   // round 82: by the flag
+                    if (pend && raisedBy(argv[argv.n - 1])) return NONE_VALUE;   // round 82: by the flag
                 }
                 nyheap::Func* fo = static_cast<nyheap::Func*>(callee.value.o);
                 Context* cp = fo->scope ? scopeOf(fo->scope) : ctx;
@@ -10603,7 +10611,7 @@ public:
         FlowState& f = flow();
         const bool pend = rn->expr && ctx && f.fast_ctx == ctx && astSpecOn();   // canPend
         Value val = rn->expr ? evalNode(rn->expr, ctx, pend) : NONE_VALUE;
-        if (pend && f.pending) return val;
+        if (pend && val.type == ValueType::NONE && f.pending) return val;   // raisedBy
         if (ctx && f.fast_ctx == ctx) { f.value = val; f.pending = 1; return val; }
         throw nython::node::ReturnSignal{val};
     }
