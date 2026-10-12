@@ -449,6 +449,13 @@ engines the same way unless said.
 - `python3 tools/sweep.py`: 425 runs, 0 not ok.
 - `tools/ide_e2e.py` 390 passed, 0 failed; `tools/ide_lint.py` 0
   unresolved; `tools/ide_memprobe.py --check` 0.00 KB per frame/event/key.
+- **Merged with part C** (only the docs conflicted): vm_audit99 and
+  vm_audit101 125/125 on both engines (vm_audit99 under python3 too) - the
+  live `f_globals`/`globals()` views and the jumpable line events did not
+  disturb the debug server; `python3 tools/sweep.py` 427 runs, 0 not ok;
+  `tools/ide_e2e.py` 442 passed, 0 failed (part C's `live`/`profile`
+  scenarios included); `tools/ide_memprobe.py --check` 0.00 KB on every
+  probe (`live`/`profile` too); lint, classcheck, cbp clean.
 
 ## 0s3. Round 80, part C — a specializing adaptive interpreter for the VM (vm_audit98, `tools/bench/`)
 
