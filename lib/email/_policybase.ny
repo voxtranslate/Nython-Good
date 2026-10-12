@@ -104,9 +104,11 @@ def _extend_docstrings(cls):
     if cls.__doc__ and cls.__doc__.startswith('+'):
         cls.__doc__ = _append_doc(cls.__bases__[0].__doc__, cls.__doc__)
     for name, attr in cls.__dict__.items():
-        if attr.__doc__ and attr.__doc__.startswith('+'):
+        # (Nython: a builtin value such as True has no __doc__ - getattr)
+        adoc = getattr(attr, '__doc__', None)
+        if isinstance(adoc, str) and adoc.startswith('+'):
             for c in (c for base in cls.__bases__ for c in base.mro()):
-                doc = getattr(getattr(c, name), '__doc__')
+                doc = getattr(getattr(c, name), '__doc__', None)
                 if doc:
                     attr.__doc__ = _append_doc(doc, attr.__doc__)
                     break

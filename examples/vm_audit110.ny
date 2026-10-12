@@ -1831,6 +1831,269 @@ def protocol_checks():
     check("telnetlib", [r, opts, log], [[b'login: ', b'Password: ', [0, b'42'], b' \xff done\r\n$ ', b'bye\r\n'], [(b'\xfd', b'\x18')], [b'user\n', b'p\xff\xffss\n', b'exit\n']])
 
 
+# ── the protocol clients over TLS (lib/ssl.ny): STARTTLS and implicit TLS ────
+def _make_certs():
+    import os
+    import subprocess
+    import tempfile
+    d = tempfile.mkdtemp()
+    ext = os.path.join(d, "ext.cnf")
+    f = open(ext, "w")
+    f.write("subjectAltName=DNS:localhost,IP:127.0.0.1\nbasicConstraints=CA:FALSE\n"
+            "keyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n")
+    f.close()
+    steps = [
+        ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", d + "/ca.key", "-out", d + "/ca.pem",
+         "-days", "2", "-subj", "/CN=audit110 CA"],
+        ["openssl", "req", "-newkey", "rsa:2048", "-nodes", "-keyout", d + "/server.key", "-out", d + "/server.csr",
+         "-subj", "/CN=localhost"],
+        ["openssl", "x509", "-req", "-in", d + "/server.csr", "-CA", d + "/ca.pem", "-CAkey", d + "/ca.key",
+         "-CAcreateserial", "-out", d + "/server.pem", "-days", "2", "-extfile", ext]]
+    for s in steps:
+        try:
+            r = subprocess.run(s, capture_output=True, timeout=60)
+        except Exception:
+            return None
+        if r.returncode != 0:
+            return None
+    return d
+
+
+def _tls_serve(handler, sctx, implicit):
+    # a server thread whose handler(state, log) reads and writes through
+    # state["rfile"] / state["send"] and can switch the connection to TLS
+    import threading
+    srv = _listener()
+    port = srv.getsockname()[1]
+    log = []
+    def run():
+        conn, addr = srv.accept()
+        state = {}
+        def use(c):
+            state["conn"] = c
+            state["rfile"] = c.makefile("rb")
+        def send(line):
+            if isinstance(line, str):
+                line = line.encode("utf-8")
+            state["conn"].sendall(line + b"\r\n")
+        def starttls():
+            state["rfile"].close()
+            use(sctx.wrap_socket(state["conn"], server_side=True))
+        state["send"] = send
+        state["starttls"] = starttls
+        try:
+            if implicit:
+                use(sctx.wrap_socket(conn, server_side=True))
+            else:
+                use(conn)
+            handler(state, log)
+        except Exception as e:
+            log.append("server error: " + type(e).__name__ + ": " + str(e))
+        try:
+            state["rfile"].close()
+            state["conn"].close()
+        except Exception:
+            pass
+        srv.close()
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    return port, log, t
+
+
+def smtp_tls_handler(state, log):
+    send = state["send"]
+    send("220 tls.local ESMTP")
+    while True:
+        line = _readline(state["rfile"])
+        if line is None:
+            break
+        log.append(line)
+        verb = line.split(" ")[0].upper()
+        if verb == "EHLO":
+            send("250-tls.local")
+            if "secure" not in log:
+                send("250-STARTTLS")
+            send("250 AUTH PLAIN")
+        elif verb == "STARTTLS":
+            send("220 2.0.0 Ready to start TLS")
+            state["starttls"]()
+            log.append("secure")
+        elif verb == "AUTH":
+            send("235 ok")
+        elif verb in ("MAIL", "RCPT", "NOOP", "RSET"):
+            send("250 OK")
+        elif verb == "DATA":
+            send("354 go")
+            while state["rfile"].readline() != b".\r\n":
+                pass
+            send("250 queued")
+        elif verb == "QUIT":
+            send("221 bye")
+            break
+        else:
+            send("502 no")
+
+
+def pop_tls_handler(state, log):
+    send = state["send"]
+    send("+OK secure POP3")
+    while True:
+        line = _readline(state["rfile"])
+        if line is None:
+            break
+        log.append(line)
+        cmd = line.split(" ")[0].upper()
+        if cmd == "STAT":
+            send("+OK 0 0")
+        elif cmd == "QUIT":
+            send("+OK bye")
+            break
+        else:
+            send("+OK")
+
+
+def imap_tls_handler(state, log):
+    send = state["send"]
+    send("* OK [CAPABILITY IMAP4rev1] secure IMAP")
+    while True:
+        line = _readline(state["rfile"])
+        if line is None:
+            break
+        log.append(line)
+        tag, rest = line.split(" ", 1)
+        cmd = rest.split(" ")[0].upper()
+        if cmd == "CAPABILITY":
+            send("* CAPABILITY IMAP4rev1")
+            send(tag + " OK done")
+        elif cmd == "LOGIN":
+            send(tag + " OK logged in")
+        elif cmd == "LOGOUT":
+            send("* BYE")
+            send(tag + " OK bye")
+            break
+        else:
+            send(tag + " OK " + cmd)
+
+
+def ftp_tls_handler(state, log, sctx):
+    send = state["send"]
+    pasv = [None]
+    prot = ["C"]
+    send("220 secure FTP")
+    while True:
+        line = _readline(state["rfile"])
+        if line is None:
+            break
+        log.append(line)
+        cmd, _, arg = line.partition(" ")
+        cmd = cmd.upper()
+        if cmd == "AUTH":
+            send("234 AUTH TLS ok")
+            state["starttls"]()
+        elif cmd == "USER":
+            send("331 password")
+        elif cmd == "PASS":
+            send("230 logged in")
+        elif cmd == "PBSZ":
+            send("200 PBSZ=0")
+        elif cmd == "PROT":
+            prot[0] = arg
+            send("200 protection level " + arg)
+        elif cmd == "TYPE":
+            send("200 ok")
+        elif cmd == "PASV":
+            ls = _listener()
+            pasv[0] = ls
+            p = ls.getsockname()[1]
+            send("227 Entering Passive Mode (127,0,0,1,%d,%d)." % (p >> 8, p & 255))
+        elif cmd in ("RETR", "NLST"):
+            send("150 here it comes")
+            c, a = pasv[0].accept()
+            pasv[0].close()
+            if prot[0] == "P":
+                c = sctx.wrap_socket(c, server_side=True)
+            c.sendall(b"secret data\r\n" if cmd == "RETR" else b"a.txt\r\nb.txt\r\n")
+            if prot[0] == "P":
+                c.unwrap()
+            c.close()
+            send("226 done")
+        elif cmd == "QUIT":
+            send("221 bye")
+            break
+        else:
+            send("502 no")
+
+
+def tls_protocol_checks():
+    try:
+        import ssl
+    except ImportError:
+        print("NOTICE: TLS protocol checks skipped - no ssl module")
+        return
+    import smtplib
+    import poplib
+    import imaplib
+    import ftplib
+    d = _make_certs()
+    if d is None:
+        print("NOTICE: TLS protocol checks skipped - no openssl command")
+        return
+    sctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    sctx.load_cert_chain(d + "/server.pem", d + "/server.key")
+    cctx = ssl.create_default_context(cafile=d + "/ca.pem")
+    # SMTP with STARTTLS
+    port, log, t = _tls_serve(smtp_tls_handler, sctx, False)
+    s = smtplib.SMTP("localhost", port, local_hostname="client.local", timeout=10)
+    r = [s.ehlo()[0], s.has_extn("starttls"), s.starttls(context=cctx), type(s.sock).__name__, s.sock.version()[:3]]
+    s.ehlo()
+    r.append(s.has_extn("starttls"))
+    r.append(s.login("u", "p"))
+    r.append(s.sendmail("a@b.c", ["d@e.f"], "Subject: tls\r\n\r\nsecure\r\n"))
+    r.append(s.quit())
+    t.join(10)
+    check("smtplib: STARTTLS", [r, [x for x in log if not x.startswith("AUTH")]], [[250, True, (220, b'2.0.0 Ready to start TLS'), 'SSLSocket', 'TLS', False, (235, b'ok'), {}, (221, b'bye')], ['ehlo client.local', 'STARTTLS', 'secure', 'ehlo client.local', 'mail FROM:<a@b.c>', 'rcpt TO:<d@e.f>', 'data', 'quit']])
+    # SMTP_SSL
+    port, log, t = _tls_serve(smtp_tls_handler, sctx, True)
+    s = smtplib.SMTP_SSL("localhost", port, local_hostname="client.local", context=cctx, timeout=10)
+    r = [s.ehlo()[0], type(s.sock).__name__, s.noop(), s.quit()]
+    t.join(10)
+    check("smtplib.SMTP_SSL", r, [250, 'SSLSocket', (250, b'OK'), (221, b'bye')])
+    # a certificate the client does not trust
+    port, log, t = _tls_serve(smtp_tls_handler, sctx, True)
+    try:
+        smtplib.SMTP_SSL("localhost", port, context=ssl.create_default_context(), timeout=10)
+        r = "connected"
+    except ssl.SSLError as e:
+        r = type(e).__name__
+    t.join(10)
+    check("smtplib.SMTP_SSL: an untrusted certificate", r, 'SSLCertVerificationError')
+    # POP3_SSL, IMAP4_SSL
+    port, log, t = _tls_serve(pop_tls_handler, sctx, True)
+    p = poplib.POP3_SSL("localhost", port, context=cctx, timeout=10)
+    r = [p.getwelcome(), p.stat(), type(p.sock).__name__, p.quit()]
+    t.join(10)
+    check("poplib.POP3_SSL", r, [b'+OK secure POP3', (0, 0), 'SSLSocket', b'+OK bye'])
+    port, log, t = _tls_serve(imap_tls_handler, sctx, True)
+    im = imaplib.IMAP4_SSL("localhost", port, ssl_context=cctx, timeout=10)
+    r = [im.welcome, im.login("u", "p"), im.noop(), im.logout()]
+    t.join(10)
+    check("imaplib.IMAP4_SSL", r, [b'* OK [CAPABILITY IMAP4rev1] secure IMAP', ('OK', [b'logged in']), ('OK', [b'NOOP']), ('BYE', [b''])])
+    # FTP_TLS with a protected data channel
+    port, log, t = _tls_serve(lambda st, lg: ftp_tls_handler(st, lg, sctx), sctx, False)
+    f = ftplib.FTP_TLS(context=cctx, timeout=10)
+    r = [f.connect("localhost", port), f.login("u", "p"), type(f.sock).__name__, f.prot_p()]
+    lines = []
+    r.append(f.retrlines("RETR x.txt", lines.append))
+    r.append(lines)
+    r.append(f.nlst())
+    r.append(f.quit())
+    t.join(10)
+    check("ftplib.FTP_TLS", [r, log], [['220 secure FTP', '230 logged in', 'SSLSocket', '200 protection level P', '226 done', ['secret data'], ['a.txt', 'b.txt'], '221 bye'], ['AUTH TLS', 'USER u', 'PASS p', 'PBSZ 0', 'PROT P', 'TYPE A', 'PASV', 'RETR x.txt', 'TYPE A', 'PASV', 'NLST', 'QUIT']])
+    import shutil
+    shutil.rmtree(d)
+
+
 
 import warnings as _warnings
 _warnings.simplefilter("ignore", DeprecationWarning)
@@ -1844,6 +2107,7 @@ section("dbm/shelve/mailbox", store_checks)
 section("wsgiref", wsgi_checks)
 section("xmlrpc", xmlrpc_checks)
 section("protocols", protocol_checks)
+section("protocols over TLS", tls_protocol_checks)
 
 for r in results:
     if r[1]:

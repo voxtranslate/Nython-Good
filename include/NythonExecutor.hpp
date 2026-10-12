@@ -15578,7 +15578,11 @@ public:
             if (cit == class_ctx_map_.end() || !cit->second || !cit->second->container) continue;
             auto& cont = *cit->second->container;
             auto it = cont.find("__init__");
-            if (it == cont.end()) it = cont.find("init");
+            // round 83: Nython's `def init` constructor alias is not used for
+            // a class with a __new__ of its own - a Python class, where `init`
+            // is an ordinary method (email.headerregistry's BaseHeader.__new__
+            // calls self.init(name, **kw) itself)
+            if (it == cont.end() && !own_new) it = cont.find("init");
             if (it == cont.end()) continue;
             if (it->second.type != ValueType::USERDATA || !it->second.value.p || !func_names.count(it->second.value.p)) continue;
             invokeMember(it->second, c, inst, args, kw, ctx);

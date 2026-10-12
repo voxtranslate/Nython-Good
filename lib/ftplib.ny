@@ -49,6 +49,13 @@ import sys
 import socket
 from socket import _GLOBAL_DEFAULT_TIMEOUT
 
+def _sys_audit(*args):
+    # sys.audit (PEP 578) where the runtime has it (Nython: not yet)
+    a = getattr(sys, "audit", None)
+    if a is not None:
+        a(*args)
+
+
 __all__ = ["FTP", "error_reply", "error_temp", "error_perm", "error_proto",
            "all_errors"]
 
@@ -163,7 +170,7 @@ class FTP:
             raise ValueError('Non-blocking socket (timeout=0) is not supported')
         if source_address is not None:
             self.source_address = source_address
-        sys.audit("ftplib.connect", self, self.host, self.port)
+        _sys_audit("ftplib.connect", self, self.host, self.port)
         self.sock = socket.create_connection((self.host, self.port), self.timeout,
                                              source_address=self.source_address)
         self.af = self.sock.family
@@ -204,7 +211,7 @@ class FTP:
     def putline(self, line):
         if '\r' in line or '\n' in line:
             raise ValueError('an illegal newline character should not be contained')
-        sys.audit("ftplib.sendcmd", self, line)
+        _sys_audit("ftplib.sendcmd", self, line)
         line = line + CRLF
         if self.debugging > 1:
             print('*put*', self.sanitize(line))

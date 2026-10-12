@@ -52,7 +52,10 @@ import urllib.parse
 from email.parser import FeedParser
 from email.message import Message
 import html
-import locale
+try:
+    import locale
+except ImportError:            # (Nython: locale where the library has it)
+    locale = None
 import tempfile
 import warnings
 
@@ -397,7 +400,7 @@ class FieldStorage:
                 qs = sys.argv[1]
             else:
                 qs = ""
-            qs = qs.encode(locale.getpreferredencoding(), 'surrogateescape')
+            qs = qs.encode(locale.getpreferredencoding() if locale is not None else 'utf-8', 'surrogateescape')
             fp = BytesIO(qs)
             if headers is None:
                 headers = {'content-type':

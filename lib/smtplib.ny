@@ -63,6 +63,13 @@ import datetime
 import sys
 from email.base64mime import body_encode as encode_base64
 
+def _sys_audit(*args):
+    # sys.audit (PEP 578) where the runtime has it (Nython: not yet)
+    a = getattr(sys, "audit", None)
+    if a is not None:
+        a(*args)
+
+
 __all__ = ["SMTPException", "SMTPNotSupportedError", "SMTPServerDisconnected", "SMTPResponseException",
            "SMTPSenderRefused", "SMTPRecipientsRefused", "SMTPDataError",
            "SMTPConnectError", "SMTPHeloError", "SMTPAuthenticationError",
@@ -346,7 +353,7 @@ class SMTP:
                     raise OSError("nonnumeric port")
         if not port:
             port = self.default_port
-        sys.audit("smtplib.connect", self, host, port)
+        _sys_audit("smtplib.connect", self, host, port)
         self.sock = self._get_socket(host, port, self.timeout)
         self.file = None
         (code, msg) = self.getreply()
@@ -364,7 +371,7 @@ class SMTP:
                 # should not be used, but 'data' needs to convert the string to
                 # binary itself anyway, so that's not a problem.
                 s = s.encode(self.command_encoding)
-            sys.audit("smtplib.send", self, s)
+            _sys_audit("smtplib.send", self, s)
             try:
                 self.sock.sendall(s)
             except OSError:

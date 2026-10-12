@@ -122,7 +122,21 @@ import socketserver
 import sys
 import os
 import re
-import pydoc
+try:
+    import pydoc
+    _HTMLDoc = pydoc.HTMLDoc
+except (ImportError, AttributeError):   # (Nython: DocXMLRPCServer needs a pydoc with HTMLDoc)
+    pydoc = None
+    _HTMLDoc = object
+
+
+def _getdoc(object):
+    # pydoc.getdoc where there is one
+    if pydoc is not None and hasattr(pydoc, "getdoc"):
+        return _getdoc(object)
+    import inspect
+    result = inspect.getdoc(object) or inspect.getcomments(object)
+    return result and re.sub('^ *\n', '', result.rstrip()) or ''
 import traceback
 try:
     import fcntl
@@ -344,7 +358,7 @@ class SimpleXMLRPCDispatcher:
         if method is None:
             return ""
         else:
-            return pydoc.getdoc(method)
+            return _getdoc(method)
 
     def system_multicall(self, call_list):
         """system.multicall([{'methodName': 'add', 'params': [2, 2]}, ...]) => \
@@ -710,7 +724,7 @@ class CGIXMLRPCRequestHandler(SimpleXMLRPCDispatcher):
 # -----------------------------------------------------------------------------
 # Self documenting XML-RPC Server.
 
-class ServerHTMLDoc(pydoc.HTMLDoc):
+class ServerHTMLDoc(_HTMLDoc):
     """Class used to generate pydoc HTML document for a server"""
 
     def markup(self, text, escape=None, funcs={}, classes={}, methods={}):
@@ -771,7 +785,7 @@ class ServerHTMLDoc(pydoc.HTMLDoc):
             argspec = object[0] or argspec
             docstring = object[1] or ""
         else:
-            docstring = pydoc.getdoc(object)
+            docstring = _getdoc(object)
 
         decl = title + argspec + (note and self.grey(
                '<font face="helvetica, arial">%s</font>' % note))

@@ -34,6 +34,13 @@ import binascii, errno, random, re, socket, subprocess, sys, time, calendar
 from datetime import datetime, timezone, timedelta
 from io import DEFAULT_BUFFER_SIZE
 
+def _sys_audit(*args):
+    # sys.audit (PEP 578) where the runtime has it (Nython: not yet)
+    a = getattr(sys, "audit", None)
+    if a is not None:
+        a(*args)
+
+
 try:
     import ssl
     HAVE_SSL = True
@@ -303,7 +310,7 @@ class IMAP4:
         if timeout is not None and not timeout:
             raise ValueError('Non-blocking socket (timeout=0) is not supported')
         host = None if not self.host else self.host
-        sys.audit("imaplib.open", self, self.host, self.port)
+        _sys_audit("imaplib.open", self, self.host, self.port)
         address = (host, self.port)
         if timeout is not None:
             return socket.create_connection(address, timeout)
@@ -336,7 +343,7 @@ class IMAP4:
 
     def send(self, data):
         """Send data to remote."""
-        sys.audit("imaplib.send", self, data)
+        _sys_audit("imaplib.send", self, data)
         self.sock.sendall(data)
 
 

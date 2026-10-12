@@ -749,7 +749,7 @@ class Aifc_write:
 
     def writeframesraw(self, data):
         if not isinstance(data, (bytes, bytearray)):
-            data = memoryview(data).cast('B')
+            data = data.tobytes() if hasattr(data, 'tobytes') else bytes(data)   # (Nython has no memoryview)
         self._ensure_header_written(len(data))
         nframes = len(data) // (self._sampwidth * self._nchannels)
         if self._convert:

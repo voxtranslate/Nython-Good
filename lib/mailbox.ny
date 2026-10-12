@@ -17,7 +17,23 @@ import os
 import time
 import calendar
 import socket
-import errno
+import sys
+try:
+    import errno
+except ImportError:
+    # (Nython: the errno values this module needs, where there is no
+    # errno module yet - Linux's, macOS's and Windows' own numbers)
+    import types as _types
+    import sys as _sys
+    _mac = _sys.platform == "darwin"
+    _win = _sys.platform == "win32"
+    errno = _types.SimpleNamespace(
+        EACCES=13, EEXIST=17, ENOENT=2, EROFS=30, EPIPE=32,
+        EAGAIN=35 if _mac else 11,
+        ECONNRESET=10054 if _win else 54 if _mac else 104,
+        ECONNABORTED=10053 if _win else 53 if _mac else 103,
+        ENOTCONN=10057 if _win else 57 if _mac else 107)
+    del _types, _mac, _win, _sys
 import copy
 import warnings
 import email

@@ -2,6 +2,9 @@
 # lib/urllib/parse.ny - Python's urllib.parse (RFC 3986, round 77):
 # urlparse/urlsplit/urlunparse/urlunsplit/urljoin/urldefrag, quote/unquote
 # (UTF-8), quote_plus/unquote_plus, urlencode, parse_qs/parse_qsl.
+# unwrap and the private _splittype/_splithost/_splituser/_splitpasswd/
+# _splitport/_splitnport/_splitquery/_splittag/_splitattr/_splitvalue
+# helpers other standard modules call (round 83).
 
 uses_netloc = ["", "ftp", "http", "gopher", "nntp", "telnet", "imap", "wais", "file", "mms", "https",
                "shttp", "snews", "prospero", "rtsp", "rtspu", "rsync", "svn", "svn+ssh", "sftp", "nfs",
@@ -358,3 +361,95 @@ def parse_qs(qs, keep_blank_values=false, strict_parsing=false, encoding="utf-8"
         else:
             d[kv[0]] = [kv[1]]
     return d
+
+
+# ── the legacy split helpers (round 83: CPython's private _split* functions,
+# which xmlrpc.client and other standard modules call, and unwrap) ─────────
+def unwrap(url):
+    url = str(url).strip()
+    if url[:1] == '<' and url[-1:] == '>':
+        url = url[1:-1].strip()
+    if url[:4] == 'URL:':
+        url = url[4:].strip()
+    return url
+
+
+def _splittype(url):
+    i = url.find(":")
+    if i > 0 and "/" not in url[:i]:
+        return url[:i].lower(), url[i + 1:]
+    return None, url
+
+
+def _splithost(url):
+    if url[:2] == "//":
+        rest = url[2:]
+        end = len(rest)
+        for ch in "/#?":
+            k = rest.find(ch)
+            if k >= 0 and k < end:
+                end = k
+        host_port = rest[:end]
+        path = rest[end:]
+        if path and path[0] != '/':
+            path = '/' + path
+        return host_port, path
+    return None, url
+
+
+def _splituser(host):
+    user, delim, host = host.rpartition('@')
+    return (user if delim else None), host
+
+
+def _splitpasswd(user):
+    user, delim, passwd = user.partition(':')
+    return user, (passwd if delim else None)
+
+
+def _splitport(host):
+    i = host.rfind(":")
+    if i >= 0:
+        port = host[i + 1:]
+        if port.isdigit() and port.isascii():
+            return host[:i], port
+        if port == "":
+            return host[:i], None
+    return host, None
+
+
+def _splitnport(host, defport=-1):
+    host, delim, port = host.rpartition(':')
+    if not delim:
+        host = port
+    elif port:
+        if port.isdigit() and port.isascii():
+            nport = int(port)
+        else:
+            nport = None
+        return host, nport
+    return host, defport
+
+
+def _splitquery(url):
+    path, delim, query = url.rpartition('?')
+    if delim:
+        return path, query
+    return url, None
+
+
+def _splittag(url):
+    path, delim, tag = url.rpartition('#')
+    if delim:
+        return path, tag
+    return url, None
+
+
+def _splitattr(url):
+    words = url.split(';')
+    return words[0], words[1:]
+
+
+def _splitvalue(attr):
+    attr, delim, value = attr.partition('=')
+    return attr, (value if delim else None)

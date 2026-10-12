@@ -360,7 +360,11 @@ def getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
         out.append((r[0], r[1], r[2], r[3], _addr(r[4])))
     return out
 
-def create_connection(address, timeout=none, source_address=none):
+# round 83: the "no timeout given" sentinel of Python's socket module
+# (smtplib, ftplib, poplib ... take timeout=socket._GLOBAL_DEFAULT_TIMEOUT)
+_GLOBAL_DEFAULT_TIMEOUT = object()
+
+def create_connection(address, timeout=_GLOBAL_DEFAULT_TIMEOUT, source_address=none):
     # Python's: every address the name resolves to, in order, until one connects
     var host = address[0]
     var port = address[1]
@@ -369,7 +373,7 @@ def create_connection(address, timeout=none, source_address=none):
         var s = none
         try:
             s = socket(ai[0], ai[1], ai[2])
-            if timeout is not none:
+            if timeout is not none and timeout is not _GLOBAL_DEFAULT_TIMEOUT:
                 s.settimeout(timeout)
             if source_address is not none:
                 s.bind(source_address)
@@ -410,6 +414,55 @@ def gethostbyname(name):
 
 def gethostbyaddr(ip):
     return _net_gethostbyaddr(ip)
+
+# round 83: the services database (/etc/services where there is one, else
+# the well-known ports), as getservbyname/getservbyport read it
+_services = none
+_WELL_KNOWN = [("ftp-data", 20, "tcp"), ("ftp", 21, "tcp"), ("ssh", 22, "tcp"), ("telnet", 23, "tcp"),
+               ("smtp", 25, "tcp"), ("domain", 53, "tcp"), ("domain", 53, "udp"), ("http", 80, "tcp"),
+               ("pop3", 110, "tcp"), ("nntp", 119, "tcp"), ("ntp", 123, "udp"), ("imap", 143, "tcp"),
+               ("snmp", 161, "udp"), ("ldap", 389, "tcp"), ("https", 443, "tcp"), ("submissions", 465, "tcp"),
+               ("submission", 587, "tcp"), ("ldaps", 636, "tcp"), ("imaps", 993, "tcp"), ("pop3s", 995, "tcp")]
+
+def _services_table():
+    global _services
+    if _services is not none:
+        return _services
+    var table = []
+    try:
+        var f = open("/etc/services")
+        for line in f:
+            line = line.split("#")[0].split()
+            if len(line) < 2 or "/" not in line[1]:
+                continue
+            var pp = line[1].split("/")
+            try:
+                var port = int(pp[0])
+            except ValueError:
+                continue
+            for name in [line[0]] + line[2:]:
+                table.append((name, port, pp[1]))
+        f.close()
+    except OSError:
+        pass
+    if not table:
+        table = list(_WELL_KNOWN)
+    _services = table
+    return table
+
+def getservbyname(servicename, protocolname=none):
+    for e in _services_table():
+        if e[0] == servicename and (protocolname is none or e[2] == protocolname):
+            return e[1]
+    raise OSError("service/proto not found")
+
+def getservbyport(port, protocolname=none):
+    if not (0 <= port <= 65535):
+        raise OverflowError("getservbyport: port must be 0-65535.")
+    for e in _services_table():
+        if e[1] == port and (protocolname is none or e[2] == protocolname):
+            return e[0]
+    raise OSError("port/proto not found")
 
 def getnameinfo(sockaddr, flags=0):
     return _net_getnameinfo(sockaddr, flags)

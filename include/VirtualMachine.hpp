@@ -6761,13 +6761,15 @@ private:
         return vm_call(m, args, std::nullopt, kwargs);
     }
     // The constructor, first class in the MRO defining __init__ (or init).
-    bool find_ctor(const std::string& cls, VMVal& out, std::string* owner=nullptr) {
+    // round 83: alias=false (a class with a __new__ of its own: a Python
+    // class, where `init` is an ordinary method) looks for __init__ only.
+    bool find_ctor(const std::string& cls, VMVal& out, std::string* owner=nullptr, bool alias=true) {
         auto mro=class_mro(cls);
         for(auto& c:*mro){
             auto cv=class_vars_at(c);
             if(cv==class_vars_.end()) continue;
             auto f=cv->second.find("__init__");
-            if(f==cv->second.end()) f=cv->second.find("init");
+            if(f==cv->second.end()&&alias) f=cv->second.find("init");
             if(f!=cv->second.end()&&(f->second.type==VMType::FUNCTION||f->second.type==VMType::NATIVE)){
                 out=f->second;
                 if(owner) *owner=c;
@@ -7343,7 +7345,7 @@ private:
                     if(vm_exc_classes().count(cls.class_name)&&inst.map){ set_exc_args(*inst.map, inst.class_name, args); set_exc_kw(*inst.map, inst.class_name, kwargs); }
                     VMVal init; std::string owner;
                     // (round 81: object's __init__ does nothing; not called)
-                    if(find_ctor(cls.class_name, init, &owner)&&nyrt::shown_class_name(owner)!="object") invoke_method(init, inst, args, cls.class_name, kwargs);
+                    if(find_ctor(cls.class_name, init, &owner, false)&&nyrt::shown_class_name(owner)!="object") invoke_method(init, inst, args, cls.class_name, kwargs);   // round 83: no init alias
                 }
                 return inst;
             }

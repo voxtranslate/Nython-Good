@@ -25,7 +25,47 @@ is read when the database is opened, and some updates rewrite the whole index)
 
 """
 
-import ast as _ast
+try:
+    import ast as _ast
+    _literal_eval = _ast.literal_eval
+except ImportError:
+    _ast = None
+    # (Nython: until lib/ast.ny exists) the one shape the index file has:
+    # "'key', (pos, siz)" - a str literal (as repr() writes it) and two ints
+    def _literal_eval(line):
+        q = line[0]
+        if q not in "'\"":
+            raise ValueError("malformed node or string: " + repr(line))
+        i = 1
+        out = []
+        esc = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", "'": "'", '"': '"', "0": "\0", "a": "\a",
+               "b": "\b", "f": "\f", "v": "\v"}
+        while line[i] != q:
+            c = line[i]
+            if c == "\\":
+                n = line[i + 1]
+                if n == "x":
+                    out.append(chr(int(line[i + 2:i + 4], 16)))
+                    i = i + 4
+                    continue
+                if n == "u":
+                    out.append(chr(int(line[i + 2:i + 6], 16)))
+                    i = i + 6
+                    continue
+                if n == "U":
+                    out.append(chr(int(line[i + 2:i + 10], 16)))
+                    i = i + 10
+                    continue
+                out.append(esc[n])
+                i = i + 2
+                continue
+            out.append(c)
+            i = i + 1
+        rest = line[i + 1:].strip()
+        if not rest.startswith(","):
+            raise ValueError("malformed node or string: " + repr(line))
+        nums = rest[1:].strip().strip("()").split(",")
+        return "".join(out), (int(nums[0]), int(nums[1]))
 import io as _io
 import os as _os
 import collections.abc
@@ -108,7 +148,7 @@ class _Database(collections.abc.MutableMapping):
             with f:
                 for line in f:
                     line = line.rstrip()
-                    key, pos_and_siz_pair = _ast.literal_eval(line)
+                    key, pos_and_siz_pair = _literal_eval(line)
                     key = key.encode('Latin-1')
                     self._index[key] = pos_and_siz_pair
 

@@ -31,14 +31,134 @@ import inspect
 import keyword
 import linecache
 import os
-import pydoc
 import sys
 import tempfile
 import time
-import tokenize
 import traceback
 import warnings
 from html import escape as html_escape
+try:
+    import tokenize
+except ImportError:                 # (Nython: tokenize may be absent - no variable dump then)
+    tokenize = None
+
+
+# pydoc's html.repr/escape/preformat and text.repr (CPython's HTMLRepr and
+# TextRepr), used when lib/pydoc.ny lacks them.
+def _pydoc_fallback():
+    import re
+    from reprlib import Repr
+
+    def replace(text, *pairs):
+        while pairs:
+            text = pairs[1].join(text.split(pairs[0]))
+            pairs = pairs[2:]
+        return text
+
+    def cram(text, maxlen):
+        if len(text) > maxlen:
+            pre = max(0, (maxlen-3)//2)
+            post = max(0, maxlen-3-pre)
+            return text[:pre] + '...' + text[len(text)-post:]
+        return text
+
+    _re_stripid = re.compile(r' at 0x[0-9a-f]{6,16}(>+)$', re.IGNORECASE)
+    def stripid(text):
+        return _re_stripid.sub(r'\1', text)
+
+    class TextRepr(Repr):
+        def __init__(self):
+            Repr.__init__(self)
+            self.maxlist = self.maxtuple = 20
+            self.maxdict = 10
+            self.maxstring = self.maxother = 100
+
+        def repr1(self, x, level):
+            if hasattr(type(x), '__name__'):
+                methodname = 'repr_' + '_'.join(type(x).__name__.split())
+                if hasattr(self, methodname):
+                    return getattr(self, methodname)(x, level)
+            return cram(stripid(repr(x)), self.maxother)
+
+        def repr_string(self, x, level):
+            test = cram(x, self.maxstring)
+            testrepr = repr(test)
+            if '\\' in test and '\\' not in replace(testrepr, r'\\', ''):
+                return 'r' + testrepr[0] + test + testrepr[0]
+            return testrepr
+
+        repr_str = repr_string
+
+        def repr_instance(self, x, level):
+            try:
+                return cram(stripid(repr(x)), self.maxstring)
+            except:
+                return '<%s instance>' % x.__class__.__name__
+
+    class HTMLRepr(Repr):
+        def __init__(self):
+            Repr.__init__(self)
+            self.maxlist = self.maxtuple = 20
+            self.maxdict = 10
+            self.maxstring = self.maxother = 100
+
+        def escape(self, text):
+            return replace(text, '&', '&amp;', '<', '&lt;', '>', '&gt;')
+
+        def repr(self, object):
+            return Repr.repr(self, object)
+
+        def repr1(self, x, level):
+            if hasattr(type(x), '__name__'):
+                methodname = 'repr_' + '_'.join(type(x).__name__.split())
+                if hasattr(self, methodname):
+                    return getattr(self, methodname)(x, level)
+            return self.escape(cram(stripid(repr(x)), self.maxother))
+
+        def repr_string(self, x, level):
+            test = cram(x, self.maxstring)
+            testrepr = repr(test)
+            if '\\' in test and '\\' not in replace(testrepr, r'\\', ''):
+                return 'r' + testrepr[0] + self.escape(test) + testrepr[0]
+            return re.sub(r'((\\[\\abfnrtv\'"]|\\[0-9]..|\\x..|\\u....)+)',
+                          r'<span class="repr">\1</span>',
+                          self.escape(testrepr))
+
+        repr_str = repr_string
+
+        def repr_instance(self, x, level):
+            try:
+                return self.escape(cram(stripid(repr(x)), self.maxstring))
+            except:
+                return self.escape('<%s instance>' % x.__class__.__name__)
+
+    class _Html:
+        def __init__(self):
+            r = HTMLRepr()
+            self.repr = r.repr
+            self.escape = r.escape
+
+        def preformat(self, text):
+            text = self.escape(text.expandtabs())
+            return replace(text, '\n\n', '\n \n', '\n\n', '\n \n',
+                                 ' ', '&nbsp;', '\n', '<br>\n')
+
+    class _Text:
+        def __init__(self):
+            self.repr = TextRepr().repr
+
+    class _Pydoc:
+        pass
+    m = _Pydoc()
+    m.html = _Html()
+    m.text = _Text()
+    return m
+
+try:
+    import pydoc
+    pydoc.html.repr, pydoc.html.escape, pydoc.html.preformat, pydoc.text.repr
+except (ImportError, AttributeError):
+    pydoc = _pydoc_fallback()
 
 warnings._deprecated(__name__, remove=(3, 13))
 
@@ -91,6 +211,8 @@ def lookup(name, frame, locals):
 def scanvars(reader, frame, locals):
     """Scan one logical line of Python and look up values of variables used."""
     vars, lasttoken, parent, prefix, value = [], None, None, '', __UNDEF__
+    if tokenize is None:
+        return vars
     for ttype, token, start, end, line in tokenize.generate_tokens(reader):
         if ttype == tokenize.NEWLINE: break
         if ttype == tokenize.NAME and token not in keyword.kwlist:
@@ -191,7 +313,7 @@ function calls leading up to the error, in the order they occurred.</p>'''
                                 pydoc.html.escape(str(evalue)))]
     for name in dir(evalue):
         if name[:1] == '_': continue
-        value = pydoc.html.repr(getattr(evalue, name))
+        value = pydoc.html.repr(getattr(evalue, name, None))   # (Nython: not every name dir() lists reads)
         exception.append('\n<br>%s%s&nbsp;=\n%s' % (indent, name, value))
 
     return head + ''.join(frames) + ''.join(exception) + '''
@@ -261,7 +383,7 @@ function calls leading up to the error, in the order they occurred.
 
     exception = ['%s: %s' % (str(etype), str(evalue))]
     for name in dir(evalue):
-        value = pydoc.text.repr(getattr(evalue, name))
+        value = pydoc.text.repr(getattr(evalue, name, None))   # (Nython: not every name dir() lists reads)
         exception.append('\n%s%s = %s' % (" "*4, name, value))
 
     return head + ''.join(frames) + ''.join(exception) + '''

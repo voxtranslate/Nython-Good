@@ -251,6 +251,10 @@ def set_bytes_content(msg, data, maintype, subtype, cte='base64',
     msg.set_payload(data)
     msg['Content-Transfer-Encoding'] = cte
     _finalize_set(msg, disposition, filename, cid, params)
-for typ in (bytes, bytearray, memoryview):
+try:
+    _bytes_types = (bytes, bytearray, memoryview)
+except NameError:                   # (Nython has no memoryview)
+    _bytes_types = (bytes, bytearray)
+for typ in _bytes_types:
     raw_data_manager.add_set_handler(typ, set_bytes_content)
 del typ
