@@ -69,6 +69,7 @@ nython/
 ├── ide_views.ny              ←   Explorer/Search/SCM/Debug/Extensions/Outline/AI
 ├── ide_tools.ny              ←   Code::Blocks side: build targets, bookmarks,
 │                                folding, snippets, keymaps, wizard, tools
+├── ide_live.ny               ←   live debugging + the PROFILE panel (round 81)
 ├── ide_editor.ny             ← EditorBuffer, SyntaxHighlighter
 ├── ide_icons.ny              ← icon set: Codicon glyphs, vector fallback
 ├── ide_project.ny            ← workspace / project model
@@ -76,6 +77,9 @@ nython/
 ├── lib/ide_workbench.ny      ← CommandRegistry, HitMap, QuickInput, LineEdit, ...
 ├── lib/ide_scm.ny            ← GitRepo + LineDiff (Myers) for Source Control
 ├── lib/ide_debugger.ny       ← record-and-replay debugger over `--trace`
+├── lib/ide_debugserver.ny    ← live debug server (`nython --debug-port N`, DAP)
+├── lib/ide_debugclient.ny    ← the IDE's side of it
+├── lib/ide_profile.ny        ← cProfile dump → table, callers, flame graph
 ├── tools/                    ← ide_driver.py / ide_e2e.py (drive the real IDE
 │                                headlessly), ide_lint.py, ide_memprobe.py,
 │                                nyshot.py (frame capture → PNG), sweep.py
@@ -380,6 +384,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit96 | 116 | round 80: the gaps rounds 78-79 found - two interpreter crashes, object's members on every class, except <expression>, numeric keys across int/float/Fraction/Decimal, dataclass(slots=True), sys.modules/__import__/importlib, relative imports, sys's facts, sys.excepthook and -O, exec/eval namespaces, a live os.environ, threading._register_atexit, str.maketrans/translate, `${` in a Python-mode file (passes under python3) |
 | vm_audit97 | 262 | round 80: os.fspath/PathLike, scandir, real file descriptors, ids, posixpath/ntpath/genericpath/stat/pwd/grp, codecs (every error handler, cp437/cp1252/utf-16/32/idna/punycode, bytes codecs), multiprocessing (Process, queues, pipes, locks across processes, shared Value/Array/SharedMemory, Pool with work stealing, Manager), ProcessPoolExecutor over pickle (passes under python3; 240 under Wine, POSIX-only checks skipped) |
 | vm_audit98 | 72 | round 80: the specializing VM's every fast path and its deoptimization (class/method/global/builtin changes after specialization, `__class__` reassignment, big-int overflow, polymorphic sites, descriptors, slots, generators, threads, tracing mid-loop) - passes on both engines, under python3 and with `NY_QUICKEN=0` |
+| vm_audit101 | 125 | round 81: the live debug server driven over its socket (`--debug-port`, DAP messages: breakpoints with conditions/hit counts/log messages, stepping, pause, stack/scopes/variables by reference, evaluate, setVariable, raised/uncaught exceptions, `--connect`, stdin/argv untouched) and its ring buffer (stepBack/reverseContinue/seek, Why? over the live history); the Profile view's reader on real `-m cProfile [--stacks]` dumps (Nython-only) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -1197,6 +1202,36 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   `EpochFlag`), or caches go stale. `VMVal` is not an aggregate.
 - `call_stack_` is a `FrameStack` (frames reused); exceptions inside the
   run loop travel without a C++ throw (`fast_exc_pending`).
+
+## Round 81: live debugging and the Profile view (see `HANDOFF.md` §0t3)
+
+- **`nython [--vm] --debug-port N file.ny`** runs the program under
+  `lib/ide_debugserver.ny` (`DebugServer(bdb.Bdb)`): a local socket, the
+  Debug Adapter Protocol's framing and messages (breakpoints with
+  conditions/hit counts/log messages, continue/next/stepIn/stepOut, pause
+  from the socket thread, stackTrace/scopes/variables by reference,
+  evaluate, setVariable, raised/uncaught exceptions, exceptionInfo). The
+  program's stdin/stdout/argv stay its own. `-m ide_debugserver --connect
+  H:P` calls a listening client instead.
+- **Step back on a live program**: the trace function keeps the last 2000
+  statements (`--ring N`, `--no-ring`) as `--trace` events; `stepBack`,
+  `reverseContinue`, `nython/seek` replay them (lib/ide_debugger.ny's
+  `DebugSession.load_lines`) and `nython/whyValue` / `nython/whyNot` run the
+  round-79 slicer over them. Containers are rendered when the history is
+  read (the ring keeps each step's bindings, not copies).
+- The trace function's hot path reads the frame through `_ny_frame_sync`
+  (f_lineno / f_locals' native layer) and takes the file and function from
+  the call event; `f_globals` and `globals()` are copies on both engines, so
+  the server writes module variables through the namespace the program was
+  exec'd in (or the module object).
+- **IDE**: `ide_live.ny` (`IDELive`, between IDETools and NythonIDE) - Run
+  with Live Debugging (Alt+F5), Pause (F6), the expandable Variables tree,
+  Set Value (double-click), exception-breakpoint checkboxes; and the PROFILE
+  panel: `-m cProfile --stacks` read by `lib/ide_profile.ny`, a sortable
+  table, callers/callees, an icicle flame graph.
+- **cProfile `stacks=True` / `--stacks`** (Nython's addition) keeps the
+  calling context tree; `dump_stats` appends it as a `{"cct": ...}` line that
+  `pstats` skips.
 
 ## Transcripts
 

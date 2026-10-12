@@ -66,7 +66,12 @@
 # history's frames are rebuilt from depths, and nothing there can be
 # changed or evaluated beyond a recorded variable's rendering. Travelling
 # forward again reaches the present, where the live program waits.
-# Cost: measured on a loop in examples/vm_audit101.ny's notes and HANDOFF.
+# Cost (HANDOFF.md §0t3): tracing alone makes a tight loop ~20x slower on
+# the interpreter and ~80x on the VM (a trace function per line, as with
+# CPython's pdb); the ring about doubles that (+16 us a statement on the
+# interpreter, +5 us on the VM), because a step's record is only the dict
+# _ny_frame_sync already makes - variables are rendered when the history
+# is read, not per statement. --no-ring turns it off.
 #
 # DebugServer(ring=2000) is the server; serve(path, args, host, port,
 # connect) runs a program under it and returns its exit status; main() is

@@ -523,6 +523,35 @@ check("a breakpoint after input()", [st["reason"], d.values()["name"]], ["breakp
 d.req("continue", {"threadId": 1})
 check("stdin, stdout and sys.argv under the debug server", [d.finish(), d.out], [0, "Name? hi ada ['a1', 'b2']\n"])
 
+# the module's own command line: --connect to a client that listens, and
+# --no-ring (no history: stepBack is refused)
+var ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+ls.bind(("127.0.0.1", 0))
+ls.listen(1)
+var cport = ls.getsockname()[1]
+var cproc = subprocess.Popen([exe] + engine + ["-m", "ide_debugserver", "--connect", "127.0.0.1:" + str(cport), "--no-ring", p3],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+ls.settimeout(20)
+var acc = ls.accept()
+ls.close()
+d = Dap.__new__(Dap)
+d.sock = acc[0]
+d.proc = cproc
+d.buf = b""
+d.seq = 0
+d.events = []
+d.start({p3: [{"line": 2}]})
+st = d.event("stopped")
+check("--connect: the server called the client", [st["reason"], d.stack()[0][:2], d.caps.get("nythonHistory")], ["breakpoint", ["pick", 2], 0])
+check("threads", d.req("threads")["body"]["threads"], [{"id": 1, "name": "MainThread"}])
+check("source", d.req("source", {"source": {"path": p3}})["body"]["content"] == PROG3, True)
+var sb = d.req("stepBack", {"threadId": 1})
+check("--no-ring: no history to step back into", [sb["success"], "ring buffer is off" in sb.get("message", "")], [False, True])
+check("--no-ring: no Why? either", d.req("nython/whyValue", {"name": "best"})["success"], False)
+check("a request the server does not know", [d.req("goto", {"targetId": 1})["success"], d.req("nython/ping")["body"]["state"]], [False, "paused"])
+d.req("continue", {"threadId": 1})
+check("--connect: the program's end", [d.finish(), d.out], [0, "r 20\n"])
+
 # ── 4. the profile view's reader ─────────────────────────────────────────────
 var PROG6 = """def fib(n):
     if n < 2:
