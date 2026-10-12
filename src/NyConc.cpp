@@ -680,6 +680,7 @@ struct Task : Obj {
     bool ephemeral = false;
     bool has_cancel_msg = false;
     std::string cancel_msg;
+    int64_t coro_id = 0;                     // round 82: the coroutine it runs (ensure_task_locked)
 };
 
 // A task waiting for a socket or pipe to be ready (wait_io, section 9).
@@ -1433,6 +1434,7 @@ struct Coro : Obj {
     int in_mode = 0; BoxPtr in_val;
     bool has_out = false; BoxPtr out_val;
     BoxPtr awaiting, frame;         // cr_await / cr_frame while parked
+    bool dropped = false;           // round 82: its object went while a task still ran it
 };
 // The coroutine's state: 0 created, 1 running, 2 suspended, 3 closed
 // (inspect's CORO_*). Runtime mutex held.
@@ -1484,11 +1486,17 @@ static Task* ensure_task_locked(Loop* L, Engine& e, const Awaitable::Item& it) {
         auto oi = RT().objs.find(it.h);
         Obj* o = oi == RT().objs.end() ? nullptr : oi->second.get();
         if (auto* c = dynamic_cast<Coro*>(o)) {
-            if (c->task) return get_obj<Task>(c->task, "task");
+            if (c->task) {
+                // round 82: a task that was freed (finished and detached) ran it
+                auto ti = RT().objs.find(c->task);
+                if (ti == RT().objs.end()) raise("RuntimeError", "cannot reuse already awaited coroutine");
+                return get_obj<Task>(c->task, "task");
+            }
             if (c->consumed) raise("RuntimeError", "cannot reuse already awaited coroutine");   // round 78
             c->consumed = true;
             Task* t = new_task_locked(L, e, [c](Engine& en) { return run_coro_body(en, c); }, c->name);
             c->task = t->id;
+            t->coro_id = c->id;
             return t;
         }
         if (auto* t = dynamic_cast<Task*>(o)) return t;
@@ -1546,11 +1554,33 @@ static void task_entry(void* arg) {
     catch (std::exception& x) { failed = true; err = NyError::make("RuntimeError", x.what()); }
     catch (...) { failed = true; err = NyError::make("RuntimeError", "task '" + tp->name + "' was ended by an unknown exception"); }
     tp->entry = nullptr;      // captured engine values go while the GIL is held
+    // round 82: the coroutine it ran lets go of its function and arguments
+    // now (nothing runs it again), and goes with them when its object is
+    // gone already - a coroutine spawned and dropped at once (a watcher, a
+    // transport's reader) kept everything it was called with forever.
+    std::shared_ptr<Obj> coro_gone;
+    BoxPtr coro_fn;
+    std::vector<BoxPtr> coro_args;
     {
         std::lock_guard<std::mutex> l(RT().m);
         task_finish_locked(tp, res, failed, err);
         finish_thread_locked(r, res, failed, err);
+        if (tp->coro_id) {
+            auto ci = RT().objs.find(tp->coro_id);
+            Coro* c = ci == RT().objs.end() ? nullptr : dynamic_cast<Coro*>(ci->second.get());
+            if (c && c->task == tp->id && !c->mtask) {
+                coro_fn = std::move(c->fn);
+                coro_args = std::move(c->args);
+                c->fn = nullptr;
+                c->args.clear();
+                c->finished = true;
+                if (c->dropped) { coro_gone = ci->second; RT().objs.erase(ci); }
+            }
+        }
     }
+    coro_fn = nullptr;
+    coro_args.clear();
+    coro_gone.reset();
     res = nullptr; err = NyError();
     switch_state(r, tp->loop->thread);
 }
@@ -1749,6 +1779,11 @@ static BoxPtr await_value(Engine& e, int64_t h, bool is_handle, const BoxPtr& v)
                 ~Running() { c->inline_running = false; c->finished = true; }
             } running(c);
             return run_coro_body(e, c);
+        }
+        {
+            // round 82: its task was freed (finished and detached) - it ran
+            std::lock_guard<std::mutex> l(RT().m);
+            if (!RT().objs.count(tid)) raise("RuntimeError", "cannot reuse already awaited coroutine");
         }
         return await_value(e, tid, true, nullptr);
     }
@@ -3004,12 +3039,13 @@ static std::unordered_map<std::string, Handler>& table() {
                 std::lock_guard<std::mutex> l(RT().m);
                 auto it = RT().objs.find(a.as_int(0));
                 Coro* c = it == RT().objs.end() ? nullptr : dynamic_cast<Coro*>(it->second.get());
-                if (!c || c->running || c->inline_running) return Ret::none();
+                if (!c) return Ret::none();
+                if (c->running || c->inline_running) { c->dropped = true; return Ret::none(); }
                 if (c->mtask && !c->mtask->done) return Ret::none();
                 if (c->task) {
                     auto ti = RT().objs.find(c->task);
                     Task* t = ti == RT().objs.end() ? nullptr : dynamic_cast<Task*>(ti->second.get());
-                    if (t && !t->done) return Ret::none();
+                    if (t && !t->done) { c->dropped = true; return Ret::none(); }   // round 82: freed when it ends
                 }
                 dead = it->second;
                 RT().objs.erase(it);
@@ -3039,6 +3075,7 @@ static std::unordered_map<std::string, Handler>& table() {
                     busy = t && !t->done;
                 }
                 if (!busy) { dead = it->second; RT().objs.erase(it); }
+                else if (!c->mtask) c->dropped = true;     // round 82: freed when its task ends
             }
             dead.reset();
             return Ret::integer(st);
@@ -3361,6 +3398,36 @@ static std::unordered_map<std::string, Handler>& table() {
             }
             dead.reset();
             return Ret::none();
+        };
+        // async_task_detach(h): nothing will ask about task h any more (an
+        // asyncio Task object that is gone, a transport's reader): its
+        // records are freed as soon as it has finished - now, if it has.
+        // Without this every task a long-running loop made stayed in the
+        // runtime's table for the life of the process.
+        T["async_task_detach"] = [](Engine&, const Args& a) {
+            if (a.size() < 1 || !a.is_number(0)) return Ret::none();
+            std::shared_ptr<Obj> gone;
+            {
+                std::lock_guard<std::mutex> l(RT().m);
+                auto it = RT().objs.find(a.as_int(0));
+                Task* t = it == RT().objs.end() ? nullptr : dynamic_cast<Task*>(it->second.get());
+                if (!t) return Ret::none();
+                t->ephemeral = true;
+                if (t->done && !t->co && !t->in_ready && !(t->loop && t->loop->current == t)) {
+                    gone = it->second;
+                    RT().objs.erase(it);
+                    if (t->thr) RT().threads.erase(t->thr->id);
+                }
+            }
+            gone.reset();      // GIL held: a builtin
+            return Ret::none();
+        };
+        // async_current_task_user(): the running task, unless it is one of
+        // the loop's own (a callback, a transport's reader - ephemeral):
+        // asyncio.current_task() is None there, as in CPython's callbacks.
+        T["async_current_task_user"] = [](Engine& e, const Args&) {
+            ThreadRec* self = current(e);
+            return Ret::integer(self->task && !self->task->ephemeral ? self->task->id : 0);
         };
         // async_current_loop(): the handle of the loop running this task (0:
         // none, or one of async_run's private loops).

@@ -1,4 +1,5 @@
 // VMGC.cpp - the VM's cycle collector and finalizer queue (include/VMGC.hpp).
+#include <chrono>
 #include "VirtualMachine.hpp"
 
 #include <deque>
@@ -265,7 +266,16 @@ void collect_due(VirtualMachine& vm) {
     // A full collection also when the heap has doubled since the last one
     // (NyGC.cpp explains why object counts alone are not enough; the factor
     // backs off to 4 and 8 while collections find little).
-    size_t h = nygc::heap_bytes();
+    // round 82: sampled at most every 4 ms and ~5% of the time (NyGC.cpp's
+    // collect_due: mallinfo2 at every safe point made many tasks quadratic)
+    static std::chrono::steady_clock::time_point next_sample{};
+    auto now = std::chrono::steady_clock::now();
+    size_t h = 0;
+    if (now >= next_sample) {
+        h = nygc::heap_bytes();
+        auto took = std::chrono::steady_clock::now() - now;
+        next_sample = now + std::max<std::chrono::steady_clock::duration>(std::chrono::milliseconds(4), took * 20);
+    }
     if (h && !heap_after_full) heap_after_full = h;
     if (h > heap_factor * heap_after_full && h > heap_after_full + ((size_t)16 << 20)) {
         size_t before = gen(0).size() + gen(1).size() + gen(2).size();

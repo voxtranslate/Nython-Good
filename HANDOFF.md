@@ -3,7 +3,8 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 81, follow-ups — **§0t4** (gaps the round's agents found: class lambdas bound, `del C.m`, `list.pop`'s index, UnboundLocalError, set iterators; a package's `__spec__` on Windows; vm_audit102).
+Last updated: round 82, part B — **§0u2** (asyncio's missing half: the event-loop API over a persistent native loop, transports and protocols over TCP/UDP/Unix with flow control, streams rebuilt on StreamReaderProtocol, subprocesses waited for on the reactor, add_signal_handler and asyncio.run's Ctrl+C, TLS and start_tls, 3.12's cancellation rules, eager tasks, structured-concurrency reports; a GC heap-sampling fix that made many tasks quadratic, a VM break/continue-out-of-except leak; vm_audit104).
+Round 81, follow-ups — **§0t4** (gaps the round's agents found: class lambdas bound, `del C.m`, `list.pop`'s index, UnboundLocalError, set iterators; a package's `__spec__` on Windows; vm_audit102).
 Round 81, part A — **§0t** (the semantic gaps round 80 left:
 `except ... as e` unbinding, a live `globals()` and the real `__main__`,
 `__spec__` and `sys.meta_path`/`path_hooks` in the import statement,
@@ -77,6 +78,207 @@ multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
 
 ---
+
+## 0u2. Round 82, part B — asyncio's missing half: the loop API, transports and protocols, subprocesses, Unix sockets, signals, TLS (vm_audit104)
+
+`lib/asyncio.ny` became the package `lib/asyncio/` (`__init__.ny` holds
+everything; `subprocess`, `events`, `protocols`, `transports`, `streams`,
+`futures`, `tasks`, `locks`, `queues`, `runners`, `timeouts`,
+`base_events`, `coroutines`, `taskgroups`, `exceptions` re-export from it,
+so `asyncio.subprocess.PIPE` and `from asyncio.subprocess import PIPE`
+work after `import asyncio`). CPython 3.12's semantics and messages; the
+module's header lists what is there and what is not. `examples/vm_audit104.ny`
+(117 checks on both engines; under python3.11 106 pass with eager tasks and
+Queue.shutdown skipped, 3.12 107, 3.13 all 109) pins it.
+
+### The event loop is a persistent native loop
+- `new_event_loop()` gives a `SelectorEventLoop` over `async_loop_new()`
+  (src/NyConc.cpp): a native `Loop` that outlives a run. Tasks and callbacks
+  are put on it before it runs and from any thread (`async_loop_spawn`,
+  `async_loop_call` - thread-safe, they wake a polling loop);
+  `run_until_complete`/`run_forever` run it on the calling thread
+  (`async_loop_run(loop, task)`) and leave what is unfinished for the next
+  run; `stop()` (`async_loop_stop`) ends a run after the batch that was ready
+  (asyncio's rule; a stop before the run gives one batch); `close()`
+  (`async_loop_close`) cancels what is left, lets it unwind and frees it.
+  The classic `loop.run_until_complete(start_server(...)); loop.run_forever()`
+  works. `async_current_loop()` maps a running task to its loop object.
+- `call_soon`/`call_later`/`call_at` make a `Handle`/`TimerHandle` whose
+  `_run` is one callback task of the loop (`async_loop_call(loop, delay, fn)`
+  - a CALL_LATER with an absolute deadline, so a timer set before the loop
+  runs fires at its time). Callback tasks are *ephemeral*: their records
+  are freed as soon as they have run. FIFO with task wake-ups, as asyncio's
+  ready queue. `current_task()` is None inside a callback.
+- `asyncio.run`/`Runner` are CPython's: a loop per Runner, the main task,
+  `_cancel_all_tasks`, `shutdown_asyncgens`, `shutdown_default_executor`;
+  Ctrl+C installs the Runner's SIGINT handler: the first one cancels the
+  main task and `KeyboardInterrupt` is raised once it has unwound (a main
+  task that handles the cancellation returns normally); the default handler
+  is restored after.
+- Task: CPython's `Task(coro, loop=, name=, context=, eager_start=)` over a
+  native task; `cancel(msg)` (the native `task_cancel(h, msg)` - the
+  CancelledError carries msg), `cancelling()`/`uncancel()` counted on the
+  object, `get_coro/get_context/get_stack`, done callbacks run by a watcher
+  task. `wait_for` and `timeout()`/`timeout_at()` are 3.12's (an
+  `async with Timeout` that cancels the task and turns its CancelledError
+  into TimeoutError *only* when no other cancellation is pending, so an
+  outer cancel stays a CancelledError). `eager_task_factory`: the native
+  `async_create_task_eager` puts the new task at the front of the ready
+  queue and the creator right behind it - the new task runs until its first
+  wait (or to its end) inside `create_task`. Barrier is 3.11's state
+  machine; `Queue.shutdown` is 3.13's (getters woken through the channel's
+  close).
+- Exception handlers: `set/get/call/default_exception_handler` with
+  CPython's contexts; the default one logs through the `asyncio` logger
+  (`logging`, loaded on first use). Debug mode (`set_debug`,
+  `PYTHONASYNCIODEBUG`, `run(debug=True)`) records where handles were made
+  and logs callbacks slower than `slow_callback_duration`.
+- `run_in_executor`: a ThreadPoolExecutor given by `set_default_executor`
+  or any concurrent.futures executor; the default is a thread per call
+  (concurrent.futures is heavy to import). `to_thread` goes through it.
+
+### Transports and protocols
+All of `asyncio.protocols`/`transports`; `_SocketTransport` serves TCP,
+Unix and TLS sockets: the socket is non-blocking, a reader task waits for
+it on the loop's reactor (`sock.wait_readable()` parks the task) and calls
+the protocol (`data_received`, `eof_received` - a true result keeps the
+connection half-open - or a `BufferedProtocol`'s `get_buffer`/
+`buffer_updated`); `write()` sends at once what the socket takes and
+buffers the rest for a writer task, calling `pause_writing()` above the high
+water mark and `resume_writing()` at the low one
+(`set_write_buffer_limits`, 64 KB/16 KB by default). `pause_reading`/
+`resume_reading`/`is_reading`, `abort`, `write_eof`, `get_extra_info`
+(socket, sockname, peername, sslcontext, ssl_object, peercert, cipher).
+`create_connection` (resolution in the executor unless the host is
+numeric; CPython's argument checks and "Connect call failed" errors),
+`create_server` -> `Server` (`serve_forever`, `start_serving`, `close`,
+`wait_closed` waiting for the connections too, `sockets`, `async with`),
+`connect_accepted_socket`, `create_datagram_endpoint` (UDP; `sendto`,
+`error_received`), `create_unix_connection`/`create_unix_server` (a stale
+socket file is replaced), `add_reader`/`add_writer` (a task per descriptor,
+level-triggered), `sock_*`. The streams are CPython's code over the
+protocols (`StreamReaderProtocol`, `FlowControlMixin`; `drain()` really
+waits while the transport is paused; `StreamWriter.start_tls`).
+
+### Subprocesses
+`create_subprocess_exec/_shell` -> `Process` (stdin/stdout/stderr streams,
+`communicate`, `wait`, `returncode`, `pid`, `send_signal`/`terminate`/
+`kill`), `loop.subprocess_exec/_shell` with a `SubprocessProtocol`
+(`pipe_data_received`, `pipe_connection_lost`, `process_exited`, then
+`connection_lost`). Built on `os_spawn` (lib/subprocess.ny's plan:
+PIPE/STDOUT/DEVNULL/None) plus one new native, `os_proc_fds(pid)` - the
+pipes' descriptors - so **the pipes are waited for on the loop's reactor**
+(`_net_select` on them parks the pump task; `os_proc_read` drains; stdin is
+made non-blocking and written with `os.write`, the task waiting for the
+pipe while it is full). Chosen over a pipe-watching thread: no thread per
+child, no extra wake-ups, and a 300 KB `communicate()` input cannot
+deadlock against the child's output (both directions are serviced by the
+same loop). On Windows, whose pipes cannot be polled (`os_proc_fds` gives
+-2), the pump polls `os_proc_read` with a 1-50 ms backoff and stdin is
+written by `os_proc_write` in an executor thread. The exit status is
+polled (`os_poll`, 1-50 ms backoff) once the pipes have closed.
+
+### Signals
+`loop.add_signal_handler(sig, cb, *args)` installs a Nython signal handler
+(round 77's layer: it runs on the main thread at the next safe point, in a
+task or between tasks) that schedules the Handle as a loop callback;
+`remove_signal_handler` restores SIG_DFL (default_int_handler for
+SIGINT). CPython's errors (`sig N cannot be caught`, coroutine callbacks,
+invalid numbers). POSIX only, as CPython (NotImplementedError on Windows).
+
+### TLS
+`ssl=` on `create_connection`/`create_server`/`open_connection`/
+`start_server`/`create_unix_*`, `ssl_handshake_timeout`, `loop.start_tls`
+and `StreamWriter.start_tls`: the socket is wrapped by lib/ssl.ny (the TLS
+layer is the socket's) with the handshake done in the task (parked, with
+the handshake timeout as the socket's timeout), then the transport reads
+and writes it as a plain one; `start_tls` stops the old transport's reader
+(a paused reader never reads the ClientHello) and makes a new transport
+over the same descriptor. Closing sends close_notify. vm_audit104 makes a
+throwaway CA with openssl (strict-X509 compliant: python3.13 checks key
+usage).
+
+### Structured-concurrency reports (the innovation)
+After Smith's "Notes on structured concurrency" and Trio's nurseries,
+which make it impossible for a task to outlive the block that started it:
+asyncio cannot forbid it without breaking programs, so it reports it.
+`asyncio.run(main, orphans="warn"|"raise"|"ignore")`, `Runner(orphans=)`,
+on by default ("warn") in debug mode. Tracked tasks record where they were
+created (`sys._getframe`) and by which task; when a task ends while a task
+it created still runs, and when the run's main task ends with tasks left,
+each is reported to the loop's exception handler ("Task 'kid' outlived the
+task that created it (parent) and is still running (created at f.ny:12)");
+`Runner.orphans` lists the reports (`_OrphanReport`: name, why, created_at,
+parent, coro); "raise" cancels them and raises `OrphanedTasksError` (unless
+main itself failed). TaskGroup children never trigger it (the group awaits
+them). Untracked loops pay nothing.
+
+### Engine changes (all marked "round 82")
+- `src/NyConc.cpp`: `Loop` gains `handle`, `steps`, `stop_at`,
+  `since_poll`, `stopping`, `prune_at`; `LoopObj`; `Task` gains `ephemeral`,
+  `has_cancel_msg`/`cancel_msg` (before it starts), `coro_id`; `ThreadRec`
+  gains `has_cancel_msg`/`cancel_msg`; `Coro` gains `dropped`; `Awaitable`
+  gains an absolute deadline (`has_at`/`at`) used by `run_call_later`.
+  Builtins `async_loop_new/spawn/call/run/stop/close`,
+  `async_current_loop`, `async_create_task_eager`, `async_task_detach`;
+  `task_cancel(h, msg)`. `grant()` counts steps, frees finished ephemeral
+  tasks and prunes a persistent loop's task list as it doubles (engine
+  values released with the GIL held); `run_loop_until` polls the reactor
+  without waiting every 32 steps while tasks stay ready (a `while not done:
+  await sleep(0)` waiting for a socket starved it); `loop_poll_io(no_wait)`.
+  `task_entry` lets go of a finished task's coroutine function and
+  arguments (and of the coroutine record when its object is already gone -
+  a coroutine spawned and dropped at once kept everything it was called
+  with forever). `item_of` keeps the coroutine an `__await__` made alive
+  with the item (a gather of asyncio Futures returned handle numbers: the
+  coroutines were collected before the gather ran them).
+- `src/builtins/os_proc.cpp`: `os_proc_fds(pid)`; registered in
+  `include/NythonExecutor.hpp`'s builtin list (the VM reaches it through the
+  bridge).
+- `src/VMConc.cpp` `raise_in_vm`: a typed runtime error is raised through
+  `raise_native_exception`, so it has the arguments its message stands for
+  (an OSError's errno/strerror - `signal.signal(SIGKILL, f)` gave the VM an
+  OSError without errno).
+- `include/VirtualMachine.hpp` compiler: `break`/`continue` inside except
+  clauses of the innermost loop delete those clauses' hidden exception
+  variables (`release_loop_excs`, `LoopCtx::exc_base`) as the clause's end
+  does. Kept, the exception stayed "being handled": every later exception
+  got it as `__context__`, an endless chain (an accept loop leaked ~12 KB
+  per connection).
+- `src/NyGC.cpp`, `src/VMGC.cpp` `collect_due`: the heap (mallinfo2) is
+  sampled at most every 4 ms and never more than ~5% of the time. It ran at
+  every safe point with work - each coroutine object's `__del__` is one -
+  and mallinfo2 walks the free lists: 2000 tasks awaiting a helper
+  coroutine took 7 s (interpreter) / 2.7 s (VM) instead of 0.5 / 0.4 s; the
+  VM's stream echo benchmark went from 44 s to 0.8 s.
+
+### Measured (this container, loaded; `scratchpad` benchmarks, interpreter / VM / CPython 3.11)
+| | interpreter | VM | CPython |
+|---|---|---|---|
+| 10000 call_soon callbacks | 0.58 s | 0.24 s | 0.03 s |
+| 2000 protocol echo round trips | 0.37 s | 0.23 s | 0.22 s |
+| 2000 stream echo round trips | 2.3 s | 0.8 s | 0.13 s |
+| gather of 2000 tasks (sleep(0) each) | 0.38 s | 0.18 s | 0.03 s |
+A long-running server's memory is flat (1000s of connections through
+`start_server`: live objects bounded on both engines).
+
+### Not done / found
+- `shutdown_asyncgens()` closes nothing (no `sys.set_asyncgen_hooks`);
+  "Task exception was never retrieved" is not logged; loop.sendfile,
+  sock_sendfile, connect_read_pipe/connect_write_pipe, child watchers and
+  the Proactor loop are not provided.
+- time.sleep (and every blocking call) in a task or a callback parks it
+  instead of blocking the loop (Nython's colorless I/O) - a CPU-bound
+  callback is what debug mode reports as slow.
+- The runtime's handles for events, semaphores and queues (asyncio.Event,
+  Lock, Queue, each Future while awaited) are never freed (pre-existing:
+  no release native); tasks that `gather` makes from coroutines stay in the
+  runtime's table (Task objects detach theirs when they are collected).
+- Interpreter: a `while` loop whose except clause `continue`s keeps the
+  last 256 raised exceptions (the exception ring, bounded) - not a leak,
+  but their frames stay alive until the ring turns over.
+- A TaskGroup with one failing child still raises the error itself rather
+  than an ExceptionGroup (vm_audit67 pins the old behaviour).
 
 ## 0t4. Round 81, follow-ups — what the round's agents found (vm_audit102)
 

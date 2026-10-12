@@ -380,6 +380,23 @@ def set_event_loop(loop):
 def new_event_loop():
     return get_event_loop_policy().new_event_loop()
 
+# ─── Runtime events, pooled ─────────────────────────────────────────────────
+# A future, a paused transport, an executor call wait on one of the
+# runtime's events while something is waiting; the runtime never frees an
+# event, so they are taken from a pool and given back (cleared) when the
+# wait is over, instead of one per future for the life of the process.
+_ev_pool = []
+
+def _ev_get():
+    if len(_ev_pool) > 0:
+        return _ev_pool.pop()
+    return event_create()
+
+def _ev_put(ev):
+    event_clear(ev)
+    if len(_ev_pool) < 256:
+        _ev_pool.append(ev)
+
 # ─── Handles ────────────────────────────────────────────────────────────────
 
 _cb_task = 0             # the native task running a loop callback (current_task() is None there)
@@ -552,7 +569,8 @@ class Future:
         self._exception = none
         self._cancel_message = none
         self._callbacks = []
-        self._ev = event_create()
+        self._ev = none           # taken from the pool by the first waiter
+        self._waiters = 0
         self._log_traceback = false
 
     def _repr_info(self):
@@ -632,7 +650,9 @@ class Future:
         return true
 
     def _schedule_callbacks(self):
-        event_set(self._ev)
+        var ev = self._ev
+        if ev is not none:
+            event_set(ev)
         if len(self._callbacks) == 0:
             return
         var cbs = self._callbacks
@@ -664,9 +684,15 @@ class Future:
 
     async def _wait(self):
         if self._state == _PENDING:
+            if self._ev is none:
+                self._ev = _ev_get()
+            self._waiters = self._waiters + 1
             self._asyncio_future_blocking = true
             try:
-                event_wait(self._ev)
+                # (state checked again: a thread may have set the result
+                # while the event was being taken)
+                if self._state == _PENDING:
+                    event_wait(self._ev)
             except CancelledError as e:
                 # the task awaiting it was cancelled: so is the future (as
                 # Task.cancel() cancels the future its task waits for)
@@ -674,6 +700,11 @@ class Future:
                 raise
             finally:
                 self._asyncio_future_blocking = false
+                self._waiters = self._waiters - 1
+                if self._waiters == 0 and self._state != _PENDING and self._ev is not none:
+                    var ev = self._ev
+                    self._ev = none
+                    _ev_put(ev)
         return self.result()
 
 def _cancel_text(e):
@@ -759,19 +790,44 @@ def wrap_future(future, *, loop=none):
 
 _tasks = {}          # native task handle -> Task
 _task_count = 0
+_prune_at = 512
 
 def _forget_done():
     var gone = []
     for h in _tasks:
-        if task_done(h):
+        var finished = true
+        try:
+            finished = task_done(h)
+        except ValueError:
+            pass               # freed already
+        if finished:
             gone.append(h)
     for h in gone:
         del _tasks[h]
 
 def _register(t):
-    if len(_tasks) > 512:
+    # Tasks are kept here until they are done (the loop holds them, as
+    # CPython's does); finished ones are dropped as the table doubles.
+    global _prune_at
+    if len(_tasks) > _prune_at:
         _forget_done()
+        _prune_at = max(512, 2 * len(_tasks))
     _tasks[t._h] = t
+
+def _cancel_handle(h):
+    # cancel one of the loop's internal tasks (it may be gone already)
+    if h != 0 and h != async_current_task():
+        try:
+            task_cancel(h)
+        except ValueError:
+            pass
+
+def _spawn_internal(lo, coro):
+    # a task of the loop's own (a transport's reader, a watcher): nothing
+    # asks about it once it has finished, so its records go then
+    var h = lo._spawn(coro, false)
+    async_task_detach(h)
+    return h
 
 async def _in_context(ctx, coro):
     # create_task(context=ctx): the task's steps run in ctx, and what they
@@ -860,6 +916,13 @@ class Task(Future):
 
     __iter__ = __await__
 
+    def __del__(self):
+        # nothing can ask the runtime about this task any more: its records
+        # are freed once it has finished
+        var h = getattr(self, "_h", 0)
+        if h:
+            async_task_detach(h)
+
     def get_coro(self):
         return self._coro
 
@@ -940,7 +1003,7 @@ class Task(Future):
             self._loop.call_soon(_run_task_callbacks, self)
         elif not self._cb_watch:
             self._cb_watch = true
-            self._loop._spawn(_task_watcher(self), false)
+            _spawn_internal(self._loop, _task_watcher(self))
 
     def remove_done_callback(self, fn):
         var keep = []
@@ -1016,7 +1079,9 @@ async def _wrap_awaitable(aw):
     return await aw
 
 def current_task(loop=none):
-    var h = async_current_task()
+    # none in a loop callback or the loop's own machinery (a transport's
+    # reader calling the protocol), as CPython's callbacks
+    var h = async_current_task_user()
     if h == 0 or h == _cb_task:
         return none
     if loop is not none and _get_running_loop() is not loop:
@@ -1029,8 +1094,12 @@ def all_tasks(loop=none):
     var out = set()
     for h in list(_tasks.keys()):
         var t = _tasks.get(h)
-        if t is not none and t._loop is loop and not task_done(h):
-            out.add(t)
+        if t is not none and t._loop is loop:
+            try:
+                if not task_done(h):
+                    out.add(t)
+            except ValueError:
+                pass
     return out
 
 def _eager_task(loop, coro, *, name=none, context=none):
@@ -1250,26 +1319,49 @@ def run_coroutine_threadsafe(coro, loop):
     loop.call_soon_threadsafe(callback)
     return fut
 
+_tf_lock = mutex_create()     # one for every _ThreadFuture
+
 class _ThreadFuture:
     # concurrent.futures.Future's surface (result(timeout), exception,
     # done, cancel, add_done_callback), safe to complete from any thread
     def __init__(self):
-        self._ev = event_create()
-        self._lock = mutex_create()
+        self._ev = none
+        self._lock = _tf_lock
         self._state = "PENDING"
         self._result = none
         self._exc = none
         self._cbs = []
+        self._waiters = 0
 
     def __repr__(self):
         return "<Future at 0x" + format(id(self), "x") + " state=" + string_lower(self._state) + ">"
 
     def _wait(self, timeout):
+        mutex_lock(self._lock)
         if self._state == "FINISHED" or self._state == "CANCELLED":
+            mutex_unlock(self._lock)
             return
-        if timeout is none:
-            event_wait(self._ev)
-        elif not event_wait_timeout(self._ev, timeout * 1000):
+        if self._ev is none:
+            self._ev = _ev_get()
+        var ev = self._ev
+        self._waiters = self._waiters + 1
+        mutex_unlock(self._lock)
+        var ok = true
+        try:
+            if timeout is none:
+                event_wait(ev)
+            else:
+                ok = event_wait_timeout(ev, timeout * 1000)
+        finally:
+            mutex_lock(self._lock)
+            self._waiters = self._waiters - 1
+            var give_back = self._waiters == 0 and self.done() and self._ev is not none
+            if give_back:
+                self._ev = none
+            mutex_unlock(self._lock)
+            if give_back:
+                _ev_put(ev)
+        if not ok:
             raise TimeoutError()
 
     def result(self, timeout=none):
@@ -1304,8 +1396,10 @@ class _ThreadFuture:
             mutex_unlock(self._lock)
             return true
         self._state = "CANCELLED"
+        var ev = self._ev
         mutex_unlock(self._lock)
-        event_set(self._ev)
+        if ev is not none:
+            event_set(ev)
         self._fire()
         return true
 
@@ -1325,8 +1419,10 @@ class _ThreadFuture:
         self._result = result
         self._exc = exc
         self._state = "FINISHED"
+        var ev = self._ev
         mutex_unlock(self._lock)
-        event_set(self._ev)
+        if ev is not none:
+            event_set(ev)
         self._fire()
 
     def set_result(self, result):
@@ -2130,9 +2226,8 @@ class _SocketTransport(_FlowControlMixin):
         self._read_done = false
         self._reader_h = 0
         self._writer_h = 0
-        self._resume_ev = event_create()
-        self._flushed_ev = event_create()
-        event_set(self._flushed_ev)
+        self._resume_ev = none       # pooled events, while paused / draining for start_tls
+        self._flushed_ev = none
         self._detached = false
         self._is_tls = getattr(sock, "context", none) is not none and hasattr(sock, "server_side")
         if self._server is not none:
@@ -2174,7 +2269,7 @@ class _SocketTransport(_FlowControlMixin):
                         self._loop.call_exception_handler({"message": "Exception in callback " + _callback_name(self._protocol.connection_made) + "()",
                                                            "exception": exc, "transport": self, "protocol": self._protocol})
                 if not self._closing:
-                    self._reader_h = self._loop._spawn(self._read_loop(), false)
+                    self._reader_h = _spawn_internal(self._loop, self._read_loop())
         finally:
             if waiter is not none:
                 _set_result_unless_cancelled(waiter, none)
@@ -2196,6 +2291,8 @@ class _SocketTransport(_FlowControlMixin):
         if not self.is_reading():
             return
         self._paused = true
+        if self._resume_ev is none:
+            self._resume_ev = _ev_get()
         event_clear(self._resume_ev)
         if self._loop._debug:
             logger.debug("%r pauses reading", self)
@@ -2204,16 +2301,20 @@ class _SocketTransport(_FlowControlMixin):
         if self._closing or not self._paused:
             return
         self._paused = false
-        event_set(self._resume_ev)
+        if self._resume_ev is not none:
+            event_set(self._resume_ev)
         if self._loop._debug:
             logger.debug("%r resumes reading", self)
 
     async def _read_loop(self):
         var buffered = isinstance(self._protocol, BufferedProtocol)
+        var me = async_current_task()
         try:
             while not self._closing and not self._read_done and not self._detached:
                 if self._paused:
-                    event_wait(self._resume_ev)
+                    var rev = self._resume_ev
+                    if rev is not none:
+                        event_wait(rev)
                     continue
                 self._sock.wait_readable()
                 if self._paused or self._closing or self._detached:
@@ -2248,6 +2349,9 @@ class _SocketTransport(_FlowControlMixin):
             return
         except (SystemExit, KeyboardInterrupt) as e:
             self._loop._interrupt(e)
+        finally:
+            if self._reader_h == me:
+                self._reader_h = 0
 
     def _read_buffered(self):
         # BufferedProtocol: read into the protocol's buffer
@@ -2304,14 +2408,12 @@ class _SocketTransport(_FlowControlMixin):
         self._read_done = true
         var h = self._reader_h
         self._reader_h = 0
-        if h != 0 and h != async_current_task() and not task_done(h):
-            task_cancel(h)
+        _cancel_handle(h)
 
     def _stop_writer(self):
         var h = self._writer_h
         self._writer_h = 0
-        if h != 0 and h != async_current_task() and not task_done(h):
-            task_cancel(h)
+        _cancel_handle(h)
 
     def write(self, data):
         _check_data(data)
@@ -2350,10 +2452,13 @@ class _SocketTransport(_FlowControlMixin):
         for d in list_of_data:
             self.write(d)
 
+    def _flush_done(self):
+        if self._flushed_ev is not none:
+            event_set(self._flushed_ev)
+
     def _start_writer(self):
-        event_clear(self._flushed_ev)
-        if self._writer_h == 0 or task_done(self._writer_h):
-            self._writer_h = self._loop._spawn(self._write_loop(), false)
+        if self._writer_h == 0:
+            self._writer_h = _spawn_internal(self._loop, self._write_loop())
 
     async def _write_loop(self):
         try:
@@ -2372,13 +2477,13 @@ class _SocketTransport(_FlowControlMixin):
                     raise
                 except BaseException as exc:
                     self._buffer = bytearray()
-                    event_set(self._flushed_ev)
+                    self._flush_done()
                     self._fatal_error(exc, "Fatal write error on socket transport")
                     return
                 if n > 0:
                     del self._buffer[:n]
                 self._maybe_resume_protocol()
-            event_set(self._flushed_ev)
+            self._flush_done()
             if self._closing and not self._detached:
                 if not self._conn_lost:
                     self._conn_lost = self._conn_lost + 1
@@ -2437,7 +2542,7 @@ class _SocketTransport(_FlowControlMixin):
             return
         if len(self._buffer) > 0:
             self._buffer = bytearray()
-            event_set(self._flushed_ev)
+            self._flush_done()
             self._stop_writer()
         if not self._closing:
             self._closing = true
@@ -2464,14 +2569,33 @@ class _SocketTransport(_FlowControlMixin):
                     pass
             self._sock = none
             self._protocol = none
+            self._release_events()
             var srv = self._server
             if srv is not none:
                 srv._detach()
                 self._server = none
 
+    def _release_events(self):
+        if self._resume_ev is not none:
+            var ev = self._resume_ev
+            self._resume_ev = none
+            if self._reader_h == 0:
+                _ev_put(ev)
+            else:
+                event_set(ev)      # a reader still waiting there goes on (and ends); not pooled
+
     async def _drain_for_tls(self):
-        while len(self._buffer) > 0 and not self._conn_lost:
-            event_wait(self._flushed_ev)
+        if len(self._buffer) == 0:
+            return
+        self._flushed_ev = _ev_get()
+        try:
+            while len(self._buffer) > 0 and not self._conn_lost:
+                event_wait(self._flushed_ev)
+                event_clear(self._flushed_ev)
+        finally:
+            var ev = self._flushed_ev
+            self._flushed_ev = none
+            _ev_put(ev)
 
     def _detach_for_tls(self):
         # start_tls: this transport hands its socket over to a TLS one
@@ -2523,7 +2647,7 @@ class _DatagramTransport(DatagramTransport, _FlowControlMixin):
                     self._loop.call_exception_handler({"message": "Exception in callback " + _callback_name(self._protocol.connection_made) + "()",
                                                        "exception": exc, "transport": self, "protocol": self._protocol})
                 if not self._closing:
-                    self._reader_h = self._loop._spawn(self._read_loop(), false)
+                    self._reader_h = _spawn_internal(self._loop, self._read_loop())
         finally:
             if waiter is not none:
                 _set_result_unless_cancelled(waiter, none)
@@ -2595,8 +2719,8 @@ class _DatagramTransport(DatagramTransport, _FlowControlMixin):
                 return
         self._buffer.append((bytes(data), addr))
         self._buffer_size = self._buffer_size + len(data)
-        if self._writer_h == 0 or task_done(self._writer_h):
-            self._writer_h = self._loop._spawn(self._write_loop(), false)
+        if self._writer_h == 0:
+            self._writer_h = _spawn_internal(self._loop, self._write_loop())
         self._maybe_pause_protocol()
 
     async def _write_loop(self):
@@ -2638,8 +2762,7 @@ class _DatagramTransport(DatagramTransport, _FlowControlMixin):
         self._closing = true
         var h = self._reader_h
         self._reader_h = 0
-        if h != 0 and h != async_current_task() and not task_done(h):
-            task_cancel(h)
+        _cancel_handle(h)
         if len(self._buffer) == 0:
             self._conn_lost = self._conn_lost + 1
             self._loop.call_soon(self._call_connection_lost, none)
@@ -2658,12 +2781,12 @@ class _DatagramTransport(DatagramTransport, _FlowControlMixin):
             return
         self._buffer = []
         self._buffer_size = 0
-        if self._writer_h != 0 and self._writer_h != async_current_task() and not task_done(self._writer_h):
-            task_cancel(self._writer_h)
+        _cancel_handle(self._writer_h)
+        self._writer_h = 0
         if not self._closing:
             self._closing = true
-            if self._reader_h != 0 and self._reader_h != async_current_task() and not task_done(self._reader_h):
-                task_cancel(self._reader_h)
+            _cancel_handle(self._reader_h)
+            self._reader_h = 0
         self._conn_lost = self._conn_lost + 1
         self._loop.call_soon(self._call_connection_lost, exc)
 
@@ -2746,7 +2869,7 @@ class Server(AbstractServer):
         self._serving = true
         for s in self._sockets:
             s.listen(self._backlog)
-            self._accept_tasks.append(self._loop._spawn(self._loop._accept_loop(self, s), false))
+            self._accept_tasks.append(_spawn_internal(self._loop, self._loop._accept_loop(self, s)))
 
     def get_loop(self):
         return self._loop
@@ -2766,8 +2889,7 @@ class Server(AbstractServer):
             return
         self._sockets = none
         for h in self._accept_tasks:
-            if h != async_current_task() and not task_done(h):
-                task_cancel(h)
+            _cancel_handle(h)
         self._accept_tasks = []
         for s in socks:
             try:
@@ -2970,6 +3092,8 @@ class BaseEventLoop(AbstractEventLoop):
         finally:
             self._running = false
             self._thread_id = none
+            if not isinstance(future, Task) or future._loop is not self:
+                async_task_detach(target)
         self._raise_pending()
         if not future.done():
             raise RuntimeError("Event loop stopped before Future completed.")
@@ -3194,7 +3318,7 @@ class BaseEventLoop(AbstractEventLoop):
         var h = Handle(callback, args, self, none)
         var w = _FdWatch(self, fd, h, writing)
         table[key] = w
-        w._task = self._spawn(w._watch(), false)
+        w._task = _spawn_internal(self, w._watch())
         return h
 
     def _unwatch_fd(self, table, fd):
@@ -3519,7 +3643,7 @@ class BaseEventLoop(AbstractEventLoop):
                 conn.setblocking(false)
                 var extra = {"peername": pair[1]}
                 if server._ssl_context is not none:
-                    self._spawn(self._accept_tls(server, conn, extra), false)
+                    _spawn_internal(self, self._accept_tls(server, conn, extra))
                 else:
                     try:
                         _SocketTransport(self, conn, server._protocol_factory(), none, extra, server)
@@ -3926,8 +4050,8 @@ class _FdWatch:
         self._stopped = true
         self._handle.cancel()
         var h = self._task
-        if h != 0 and h != async_current_task() and not task_done(h):
-            task_cancel(h)
+        self._task = 0
+        _cancel_handle(h)
 
 class _OrphanReport:
     # one structured-concurrency finding: a task left running
@@ -4405,13 +4529,18 @@ class _PipeTransport(BaseTransport):
         return not self._closing and not self._proc._paused
 
     def pause_reading(self):
-        self._proc._paused = true
-        event_clear(self._proc._resume_ev)
+        var pr = self._proc
+        pr._paused = true
+        if pr._resume_ev is none:
+            pr._resume_ev = _ev_get()
+        event_clear(pr._resume_ev)
 
     def resume_reading(self):
-        if self._proc._paused:
-            self._proc._paused = false
-            event_set(self._proc._resume_ev)
+        var pr = self._proc
+        if pr._paused:
+            pr._paused = false
+            if pr._resume_ev is not none:
+                event_set(pr._resume_ev)
 
 class _WritePipeTransport(_PipeTransport, _FlowControlMixin):
     def __init__(self, proc):
@@ -4485,8 +4614,7 @@ class _SubprocessTransport(SubprocessTransport):
         self._closed = false
         self._exit_waiters = []
         self._paused = false
-        self._resume_ev = event_create()
-        event_set(self._resume_ev)
+        self._resume_ev = none        # pooled, while a pipe reader is paused
         self._in_buf = bytearray()
         self._in_writer = 0
         self._in_closing = false
@@ -4545,7 +4673,7 @@ class _SubprocessTransport(SubprocessTransport):
             if not waiter.done():
                 waiter.set_exception(exc)
             return
-        self._pump_h = self._loop._spawn(self._pump(), false)
+        self._pump_h = _spawn_internal(self._loop, self._pump())
         _set_result_unless_cancelled(waiter, none)
 
     def get_protocol(self):
@@ -4626,8 +4754,8 @@ class _SubprocessTransport(SubprocessTransport):
 
     # ── stdin ──
     def _start_stdin_writer(self):
-        if self._in_writer == 0 or task_done(self._in_writer):
-            self._in_writer = self._loop._spawn(self._write_stdin(), false)
+        if self._in_writer == 0:
+            self._in_writer = _spawn_internal(self._loop, self._write_stdin())
 
     async def _write_stdin(self):
         var wp = self._pipes.get(0)
@@ -4667,6 +4795,8 @@ class _SubprocessTransport(SubprocessTransport):
             if wp is not none and not getattr(wp, "_lost", false):
                 wp._lost = true
                 self._call(self._protocol.pipe_connection_lost, 0, exc)
+        finally:
+            self._in_writer = 0
 
     # ── output and exit ──
     def _deliver(self, fd, data):
@@ -4702,7 +4832,9 @@ class _SubprocessTransport(SubprocessTransport):
                 if len(pollable) == 0 and not unpollable:
                     break
                 if self._paused:
-                    event_wait(self._resume_ev)
+                    var rev = self._resume_ev
+                    if rev is not none:
+                        event_wait(rev)
                     continue
                 if len(pollable) > 0:
                     _net_select(pollable, [], [], none if not unpollable else 0.05)
@@ -4737,6 +4869,10 @@ class _SubprocessTransport(SubprocessTransport):
 
     def _process_exited(self, returncode):
         self._returncode = returncode
+        if self._resume_ev is not none:
+            var ev = self._resume_ev
+            self._resume_ev = none
+            _ev_put(ev)
         if 0 in self._pipes and not getattr(self._pipes[0], "_lost", false):
             self._in_buf = bytearray()
             self._pipes[0]._lost = true

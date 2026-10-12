@@ -51,7 +51,7 @@ nython/
 │   ├── ide_selection.ny      ← multi-cursor selection model
 │   ├── ide_inspector.ny      ← universal value inspector
 │   ├── stdlib.ny             ← standard library
-│   ├── argparse.ny, collections.ny, asyncio.ny, socket.ny, ssl.ny,
+│   ├── argparse.ny, collections.ny, asyncio/, socket.ny, ssl.ny,
 │   │   select.ny, selectors.ny, signal.ny, websocket.ny, threading.ny,
 │   │   socketserver.ny, hashlib.ny, hmac.ny, base64.ny, secrets.ny
 │   │                         ← Python's modules (round 77; `# nython: module`
@@ -387,6 +387,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit98 | 72 | round 80: the specializing VM's every fast path and its deoptimization (class/method/global/builtin changes after specialization, `__class__` reassignment, big-int overflow, polymorphic sites, descriptors, slots, generators, threads, tracing mid-loop) - passes on both engines, under python3 and with `NY_QUICKEN=0` |
 | vm_audit100 | 114 | round 81: the self-optimizing interpreter's every cache and its fallback (globals/builtins rebound or shadowed, functions replaced, class attributes and methods changed in a class or a base or deleted, fields shadowing them, `__class__` reassigned, `__get__` added later, big-int overflow, `exec`, closures, generators, recursion, threads, return/break/continue through try/finally/with, builtin values' methods, tracing and profiling mid-loop) - passes on both engines, under python3 and with `NY_ASTSPEC=0` |
 | vm_audit102 | 51 | round 81 follow-ups: a lambda put in a class bound when read as a value, `del C.m` (an override, then the base's), `list.pop`'s integer index (`__index__`, TypeError), UnboundLocalError (both engines, CPython's message; NyScope flags reads of names a function binds), set iterators noticing a size change (passes under python3) |
+| vm_audit104 | 117 | round 82: asyncio's loop API (run_until_complete/run_forever/stop/close, call_soon/later/at, Handle/TimerHandle, executors, exception handlers, debug), transports and protocols over TCP/UDP/Unix (Server, flow control, BufferedProtocol), streams on StreamReaderProtocol, subprocesses (communicate, pipelines, SubprocessProtocol, signals to children), add_signal_handler and asyncio.run's Ctrl+C, TLS and start_tls, 3.12's cancellation (cancel(msg), cancelling/uncancel, wait_for/timeout), eager tasks, Barrier, Queue.shutdown, structured-concurrency reports (passes under python3.11-3.13) |
 | vm_audit101 | 125 | round 81: the live debug server driven over its socket (`--debug-port`, DAP messages: breakpoints with conditions/hit counts/log messages, stepping, pause, stack/scopes/variables by reference, evaluate, setVariable, raised/uncaught exceptions, `--connect`, stdin/argv untouched) and its ring buffer (stepBack/reverseContinue/seek, Why? over the live history); the Profile view's reader on real `-m cProfile [--stacks]` dumps (Nython-only) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
@@ -1282,6 +1283,30 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
 - A `Value` has no `Token` any more (`Value::token_default()`); heap objects
   carry kind flags (`nygc::F_KSTR/F_KINST/F_KFUNC/F_KCONT`) that
   `heapKind`/`contOf` read instead of the side tables.
+
+## Round 82: asyncio's missing half (see `HANDOFF.md` §0u2)
+
+- `lib/asyncio/` is a package (`__init__.ny` + re-exporting submodules:
+  `asyncio.subprocess`, `events`, `protocols`, `transports`, `streams`, ...).
+- **An event loop object is a persistent native loop** (`async_loop_new`,
+  `async_loop_run/stop/close/spawn/call` in `src/NyConc.cpp`): callbacks and
+  tasks can be put on it before it runs and from any thread; runs leave what
+  is unfinished for the next one; `stop()` ends a run after the ready batch.
+  A `call_soon` callback is one *ephemeral* native task (freed once run).
+- Transports read in a task that parks on the reactor and write
+  non-blocking with a buffer and a writer task (flow control at the
+  high/low water marks); streams are CPython's code over
+  `StreamReaderProtocol`. Subprocess pipes are waited for on the reactor
+  (`os_proc_fds`); on Windows they are polled. Signals: a Nython handler
+  schedules the loop callback. TLS: the socket is wrapped by `lib/ssl.ny`.
+- **Write internal tasks with `_spawn_internal`** (detached: freed when
+  done) and never call `task_done`/`task_cancel` on their handles - use
+  `_cancel_handle`. A Task object detaches its native task when collected.
+- Engine fixes found on the way: the GC sampled the heap (mallinfo2) at
+  every safe point - many suspended tasks were quadratic (NyGC/VMGC); the
+  VM's `break`/`continue` out of an except clause left the exception "being
+  handled" (an endless `__context__` chain); a finished task now lets go of
+  its coroutine's arguments.
 
 ## Transcripts
 

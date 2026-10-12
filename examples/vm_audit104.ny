@@ -274,6 +274,50 @@ asyncio.set_event_loop(None)
 loop2.close()
 check("run_forever serves a server made by run_until_complete", replies, [b"got ping\n"])
 
+# an accept loop's `except BlockingIOError: ...; continue` (the VM kept every
+# exception left that way as the next one's __context__ - round 82)
+def ctx_after_continue():
+    out = []
+    for i in range(3):
+        try:
+            raise KeyError(i)
+        except KeyError:
+            continue
+    out.append(sys.exc_info()[0])
+    try:
+        raise ValueError("fresh")
+    except ValueError as e:
+        out.append(e.__context__)
+    i = 0
+    while i < 3:
+        i += 1
+        try:
+            raise KeyError(i)
+        except KeyError:
+            if i == 1:
+                continue
+            break
+    try:
+        raise ValueError("fresh2")
+    except ValueError as e:
+        out.append(e.__context__)
+    while True:
+        try:
+            raise KeyError("in loop")
+        except KeyError:
+            try:
+                raise IndexError("inner")
+            except IndexError as inner:
+                out.append(type(inner.__context__).__name__)
+                break
+    try:
+        raise ValueError("fresh3")
+    except ValueError as e:
+        out.append(e.__context__)
+    return out
+check("leaving an except clause by continue/break ends its handling", ctx_after_continue(),
+      [None, None, None, "KeyError", None])
+
 # ── 2. tasks: 3.12's cancellation rules ───────────────────────────────────────
 async def cancellation():
     out = {}
@@ -576,6 +620,7 @@ class Collect(asyncio.Protocol):
         self.done = done
         self.buf = b""
         self.log = []
+        self.cur = "unset"
     def connection_made(self, transport):
         self.transport = transport
         self.log.append("made")
@@ -585,6 +630,7 @@ class Collect(asyncio.Protocol):
         transport.write_eof()
     def data_received(self, data):
         self.buf += data
+        self.cur = asyncio.current_task()
     def eof_received(self):
         self.log.append("eof")
     def connection_lost(self, exc):
@@ -604,6 +650,7 @@ async def tcp_protocols():
     out["echo"] = await asyncio.wait_for(done, 5)
     await asyncio.sleep(0.02)
     out["client log"] = pr.log
+    out["current_task in data_received"] = pr.cur
     out["server log"] = slog
     out["closing"] = tr.is_closing()
     server.close()
@@ -677,6 +724,7 @@ check("TCP echo with a Protocol (write, writelines, write_eof)", tp["echo"], b"H
 check("the client's callbacks in order", tp["client log"], ["made", True, "eof", "lost ok"])
 check("the server's callbacks in order", tp["server log"], ["server made", "server eof", "server lost ok"])
 check("is_closing after connection_lost", tp["closing"], True)
+check("current_task() is None in a protocol callback", tp["current_task in data_received"], None)
 check("Server.close / wait_closed", tp["closed"], [False, ()])
 check("create_connection refused", tp["refused"], "ConnectionRefusedError")
 check("create_connection argument errors", [tp["both"], tp["neither"]],
