@@ -379,7 +379,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit95 | 2050 | round 79: decimal - the API and 1,981 vectors with CPython's results and flags at precisions 9/16/34 (passes under python3) |
 | vm_audit96 | 116 | round 80: the gaps rounds 78-79 found - two interpreter crashes, object's members on every class, except <expression>, numeric keys across int/float/Fraction/Decimal, dataclass(slots=True), sys.modules/__import__/importlib, relative imports, sys's facts, sys.excepthook and -O, exec/eval namespaces, a live os.environ, threading._register_atexit, str.maketrans/translate, `${` in a Python-mode file (passes under python3) |
 | vm_audit97 | 262 | round 80: os.fspath/PathLike, scandir, real file descriptors, ids, posixpath/ntpath/genericpath/stat/pwd/grp, codecs (every error handler, cp437/cp1252/utf-16/32/idna/punycode, bytes codecs), multiprocessing (Process, queues, pipes, locks across processes, shared Value/Array/SharedMemory, Pool with work stealing, Manager), ProcessPoolExecutor over pickle (passes under python3; 240 under Wine, POSIX-only checks skipped) |
-| vm_audit99 | 116 | round 81: `except E as e` unbinds e, a live `globals()`/`locals()`/`vars()` and the real `__main__` module, `__spec__`/`__loader__`, `sys.meta_path`/`sys.path_hooks` in the import statement, attribute hooks assigned later, live list iterators, "P() takes no arguments", CPython's default repr, `frame.f_lineno` jumps and pdb's `jump`, `sys.getrefcount`/`stdlib_module_names`/`displayhook`, `-OO`, 3000 frames deep, exec with dict-subclass namespaces (passes under python3) |
+| vm_audit99 | 125 | round 81: `except E as e` unbinds e, a live `globals()`/`locals()`/`vars()` and the real `__main__` module, `__spec__`/`__loader__`, `sys.meta_path`/`sys.path_hooks` in the import statement, attribute hooks assigned later, live list iterators, "P() takes no arguments", CPython's default repr, `frame.f_lineno` jumps and pdb's `jump`, `sys.getrefcount`/`stdlib_module_names`/`displayhook`, `-OO`, 3000 frames deep, exec with dict-subclass and mapping namespaces, live `f_globals`, "Set changed size during iteration", CPython's function reprs, the `__class__` cell (passes under python3) |
 | vm_audit98 | 72 | round 80: the specializing VM's every fast path and its deoptimization (class/method/global/builtin changes after specialization, `__class__` reassignment, big-int overflow, polymorphic sites, descriptors, slots, generators, threads, tracing mid-loop) - passes on both engines, under python3 and with `NY_QUICKEN=0` |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
@@ -1223,6 +1223,9 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   `sys.setrecursionlimit(5000)` then 3000 frames works on both engines.
 - `sys.getrefcount`, `sys.stdlib_module_names`, `sys.displayhook` (the
   prompt honours a program's own), `-OO`.
+- Also: `frame.f_globals` is the live globals() view; a set changed in size
+  during a loop raises "Set changed size during iteration"; functions show
+  as `<function Qualname at 0x...>`; `__class__` in a method is its class.
 
 ## Transcripts
 

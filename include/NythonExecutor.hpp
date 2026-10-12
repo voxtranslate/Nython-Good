@@ -1214,6 +1214,11 @@ public:   // NythonExecutor is a struct: members default to public
         // that resolve by another route (a class or function an imported
         // module registered) are not errors.
         if (!(vn->global_ref ? moduleCtx(ctx) : ctx)->hasByName(vn->name) && !knownName(vn->name)) {
+            // round 81: __class__ in a method is the class defining it
+            // (CPython's implicit __class__ cell, the one super() uses)
+            if (vn->name == "__class__" && !owner_stack_.empty() && owner_stack_.back()
+                && owner_stack_.back()->type() == NodeType::CLASS)
+                return classValueOfNode(owner_stack_.back());
             std::string hint = suggestName(vn->name);
             if (!hint.empty()) hint = "  (did you mean '" + hint + "'?)";
             throw std::string("__exc__:NameError:name '" + vn->name + "' is not defined" + hint);
@@ -3862,13 +3867,17 @@ public:   // NythonExecutor is a struct: members default to public
                 if (getAttrValue(cls, "__qualname__", c, q) && isStringValue(q)) qn = getStringValue(q);
             } catch (std::string&) {}
         }
+        return "<" + (mod.empty() || mod == "builtins" ? qn : mod + "." + qn) + " object at " + idHex(v, c) + ">";
+    }
+    // the address id(v) gives, as reprs show it (round 81)
+    std::string idHex(const Value& v, Context* c) {
         std::vector<Value> ia{v};
         Value idv = callBuiltin("id", ia, c);
         int64_t id = 0;
         if (idv.type == ValueType::INTEGER) bigint_fits_i64(idv.value.i, id);
         char buf[40];
         std::snprintf(buf, sizeof buf, "0x%llx", (unsigned long long)id);
-        return "<" + (mod.empty() || mod == "builtins" ? qn : mod + "." + qn) + " object at " + buf + ">";
+        return buf;
     }
     // Python's type name for messages.
     std::string typeNameOf(const Value& v) {
@@ -4002,6 +4011,17 @@ public:   // NythonExecutor is a struct: members default to public
                             return "<bound method " + bm->second->name + " of " + toText(r, true, ctx, depth + 1) + ">";
                         return "<built-in method " + bm->second->name + " of " + typeNameOf(r) + " object at " + hexId(r) + ">";
                     }
+                }
+                // round 81: a function as CPython shows it, <function
+                // Qualname at 0x...> with the address id() gives (it was
+                // <function name>)
+                if (fit->second.rfind("__class__:", 0) != 0) {
+                    Value q;
+                    std::string qn;
+                    try {
+                        if (specialAttribute(v, "__qualname__", ctx ? ctx : global_ctx, q) && isStringValue(q)) qn = getStringValue(q);
+                    } catch (std::string&) {}
+                    if (!qn.empty()) return "<function " + qn + " at " + idHex(v, ctx ? ctx : global_ctx) + ">";
                 }
                 return funcDisplayName(fit->second);
             }
@@ -4769,12 +4789,16 @@ public:   // NythonExecutor is a struct: members default to public
                 // List iteration by numeric index - round 81: the list's
                 // length read at each step, as CPython's listiterator (an
                 // item appended in the loop is reached, a shrunk list ends
-                // it); a set keeps the length it started with
+                // it); a set keeps the length it started with, and one whose
+                // size changed is a RuntimeError, as CPython's setiterator
                 const bool live = !isSetCont(cont);
+                const int start_len = len;
                 for (int i = 0; ; i++) {
-                    if (live && i > 0) {
+                    if (i > 0) {
                         auto li = cont->container->find("__len__");
-                        len = li != cont->container->end() ? static_cast<int>(bigint_to_i64(li->second.value.i)) : 0;
+                        int now = li != cont->container->end() ? static_cast<int>(bigint_to_i64(li->second.value.i)) : 0;
+                        if (live) len = now;
+                        else if (now != start_len) pyRaise("RuntimeError", "Set changed size during iteration");
                     }
                     if (i >= len) break;
                     NY_PYT_HEAD(i > 0)
@@ -10568,11 +10592,12 @@ public:
         Value b = p ? p->getByName("_ny_back") : NONE_VALUE;
         return isInstanceVal(b) ? b : NONE_VALUE;
     }
-    // _ny_frame_globals(f): f.f_globals, its module's names (a copy, as
-    // globals() is here).
+    // _ny_frame_globals(f): f.f_globals - round 81: its module's live
+    // globals() view (sys._getframe(1).f_globals["x"] = v binds x in the
+    // caller's module, as CPython); it was a copy.
     Value frameGlobals(std::vector<Value>& args) {
         size_t idx;
-        if (!args.empty() && frameFind(args[0], idx)) return reflectGlobals(frameCtx(idx));
+        if (!args.empty() && frameFind(args[0], idx)) return globalsView(frameCtx(idx));
         std::string mod = "__main__";
         if (Context* p = args.empty() ? nullptr : instanceProps(args[0])) {
             std::vector<Value> info = listItems(p->getByName("_ny_info"));
@@ -10581,9 +10606,9 @@ public:
         if (mod != "__main__")
             for (Context* m : module_ctxs_) {
                 Value n = m ? m->getByName("__name__") : NONE_VALUE;
-                if (isStringValue(n) && getStringValue(n) == mod) return reflectGlobals(m);
+                if (isStringValue(n) && getStringValue(n) == mod) return globalsView(m);
             }
-        return reflectGlobals(nullptr);
+        return globalsView(nullptr);
     }
     // _ny_builtins_dict(): f.f_builtins - the builtins every program starts
     // with (the prelude's private names left out).

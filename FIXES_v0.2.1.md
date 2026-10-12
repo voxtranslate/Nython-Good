@@ -5707,7 +5707,7 @@ Full detail in `HANDOFF.md` §0s3. New test: `vm_audit98` (72 checks; passes und
 
 ## Round 81, part A — the semantic gaps round 80 left
 
-Full detail in `HANDOFF.md` §0t. New test: `vm_audit99` (116 checks; passes on both engines and under python3).
+Full detail in `HANDOFF.md` §0t. New test: `vm_audit99` (125 checks; passes on both engines and under python3).
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -5726,3 +5726,7 @@ Full detail in `HANDOFF.md` §0t. New test: `vm_audit99` (116 checks; passes on 
 | No `sys.getrefcount`, `sys.stdlib_module_names`, `sys.displayhook`; `-OO` kept docstrings | — | the engines' counts; lib/'s names; the prompt calls a program's displayhook; `docstringOf` drops them at `-OO` |
 | Both engines stopped near 1100 frames whatever `sys.setrecursionlimit` said | ~7 KB of native stack per Nython frame on an 8 MB stack | a call near the end of the native stack goes on on an extension stack (NyCoro's segments): 3000 deep at limit 5000 works, threads too |
 | Interpreter SIGSEGV on `def __eq__(self, o): return self == o` | recursion through operators never passed `evalCall`'s depth check | `runFunctionBody` checks the frame depth: RecursionError |
+| `sys._getframe(1).f_globals[name] = v` did nothing; `f_globals is globals()` false | f_globals was a copy | the module's live globals() view |
+| A set changed in size during a loop: no error (the VM walked a copy) | — | CPython's RuntimeError "Set changed size during iteration" (both engines' loops) |
+| `repr(f)` was `<function f>` (`<function s__static__>` for a staticmethod on the interpreter) | — | `<function Qualname at 0x...>`, the address id() gives |
+| `__class__` in a method was a NameError | no implicit cell | the class defining the method (the one super() uses) |

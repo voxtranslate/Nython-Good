@@ -799,6 +799,58 @@ t.join()
 sys.setrecursionlimit(old_limit)
 check("3000 frames deep in a thread", thread_res, [3000])
 
+# ── more of this kind: frame globals, sets, function reprs, __class__ ──────
+def caller_globals():
+    return sys._getframe(1).f_globals
+check("f_globals is globals()", [sys._getframe().f_globals is globals(), caller_globals() is globals()], [True, True])
+def inject(name, value):
+    sys._getframe(1).f_globals[name] = value
+inject("fg_injected", 41)
+check("sys._getframe(1).f_globals[name] = v binds a global", fg_injected + 1, 42)
+check("a module function's __globals__ is its module's namespace",
+      textwrap.TextWrapper.__init__.__globals__ is vars(textwrap), True)
+set99 = {1, 2, 3}
+def grow_set():
+    for x in set99:
+        set99.add(x + 10)
+try:
+    grow_set()
+    check("a set changed during iteration", "no error", "RuntimeError: Set changed size during iteration")
+except RuntimeError as e:
+    check("a set changed during iteration", "RuntimeError: " + str(e), "RuntimeError: Set changed size during iteration")
+seen99 = []
+for x in {5, 6}:
+    seen99.append(x)
+check("a set iterated without change", sorted(seen99), [5, 6])
+shrink99 = {1, 2, 3}
+try:
+    for x in shrink99:
+        shrink99.discard(3)
+    check("a set shrunk during iteration", "no error", "RuntimeError")
+except RuntimeError:
+    check("a set shrunk during iteration", "RuntimeError", "RuntimeError")
+def plain99():
+    pass
+class R99:
+    def m(self):
+        return __class__
+    @staticmethod
+    def s():
+        pass
+def outer99():
+    def inner():
+        pass
+    return inner
+check("function reprs are CPython's",
+      [repr(plain99) == "<function plain99 at " + hex(id(plain99)) + ">",
+       repr(R99.m).startswith("<function R99.m at 0x"), repr(R99.s).startswith("<function R99.s at 0x"),
+       repr(outer99()).startswith("<function outer99.<locals>.inner at 0x"), str(plain99) == repr(plain99)],
+      [True, True, True, True, True])
+check("__class__ in a method is its class", R99().m() is R99, True)
+class R99Sub(R99):
+    pass
+check("__class__ is the defining class, not the instance's", R99Sub().m() is R99, True)
+
 for r in results:
     if r[1]:
         pass_n = pass_n + 1

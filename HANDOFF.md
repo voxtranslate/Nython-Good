@@ -71,7 +71,7 @@ collisions.
 
 ## 0t. Round 81 — the semantic gaps round 80 left (vm_audit99)
 
-`examples/vm_audit99.ny` (116 checks) passes on the interpreter, the VM and
+`examples/vm_audit99.ny` (125 checks) passes on the interpreter, the VM and
 python3.11; every expected value is CPython's (a jump into a `with` body:
 3.11 and 3.12 word the error differently, the check accepts both). Both
 engines the same way unless said.
@@ -153,11 +153,11 @@ engines the same way unless said.
   in the loop is reached, a list that shrank ends it. `iter(list)`,
   enumerate/zip/map/filter over a list (`vm_iter_open`) and a GET_ITER not
   followed by FOR_ITER are live too (`list_iter`, a native generator; an
-  exhausted one stays exhausted). The O(n) copy per loop is gone. Sets still
-  iterate a copy.
+  exhausted one stays exhausted). The O(n) copy per loop is gone; a set's
+  loop walks the set's own items too (see "More of this kind").
 - Interpreter: `iter(list)` was live already; its list loop read the length
-  once (appends unseen) - it is read at each step now (a set keeps the
-  length it started with).
+  once (appends unseen) - it is read at each step now (a set's size is
+  checked instead).
 
 ### Classes that take no arguments
 - `P(1, 2)` for a class with neither `__init__` nor `__new__` of its own:
@@ -243,7 +243,37 @@ engines the same way unless said.
   reading itself; it is a RecursionError now (`runFunctionBody` checks the
   frame depth against the recursion limit).
 
+### More of this kind (found and fixed)
+- `frame.f_globals` is the module's live globals() view (`sys._getframe(1).
+  f_globals[name] = v` binds a global of the caller's module, a common
+  metaprogramming idiom; `f_globals is globals()`). Interpreter
+  `frameGlobals`, VM `frame_globals` (a prelude frame keeps its copy).
+- A set changed in size while a loop walks it is CPython's RuntimeError
+  "Set changed size during iteration" (the interpreter's loop checks the
+  size at each step; the VM's loop walks the set's own items through
+  `stack_set_iter` - it walked a copy - and checks the size in FOR_ITER).
+  `iter(s)` / `next()` by hand still walk without the check.
+- Functions show as CPython's `<function Qualname at 0x...>` (the address
+  id() gives): `<function outer.<locals>.inner at 0x...>`, `<function
+  K.s at 0x...>` for a staticmethod (the interpreter showed
+  `<function s__static__>`). Interpreter `toText` (`idHex`, shared with the
+  default instance repr), VM `VMVal::repr`.
+- `__class__` read in a method is the class defining it (CPython's implicit
+  cell, the class super() uses): the NameError path of the interpreter's
+  `evalVariable` (the running method's `owner_stack_`) and of the VM's
+  LOAD_NAME (`VMCode::owner_class`) - no cost to names that resolve.
+- `exec(src, g, mapping)`: a locals mapping that is not a dict
+  (collections.OrderedDict) is read through `keys()`/`__getitem__` and
+  written back through `__setitem__`.
+- `import builtins` from a script beside a `builtins.ny` (see above).
+- Interpreter SIGSEGV on recursion through operators (see Deep recursion).
+
 ### Not done / found
+- Reading a function's local before it is assigned (or after `del`) is a
+  NameError, not CPython's UnboundLocalError (a NameError subclass:
+  `except NameError` catches both); the scope ruling of round 75 decides
+  what is local at run time, so the engines would need a static scan.
+- The program has no `__loader__` and no `__builtins__` global.
 - A jump from a for loop's header event into its body is refused on the
   interpreter (CPython allows it: the iterator is on the stack there), as
   is one from an except clause's own line into its body; jumping out of
@@ -251,11 +281,10 @@ engines the same way unless said.
   skipped by the jump).
 - `__spec__` read as a global name inside an imported module is None (the
   module object has the real one); the program's `__loader__` is not set.
-- Sets iterate a copy (no "Set changed size during iteration").
 - `builtins._` is not set by the display hook (the program's `_` is).
 
 ### Verified
-- vm_audit99: 116 passed on the interpreter, the VM and python3.11.
+- vm_audit99: 125 passed on the interpreter, the VM and python3.11.
 - vm_audit53/72/74/76/79/80/81/82/83 pass on both engines;
   `tools/ny_classcheck.py` clean; `tools/cbp.py check` 61 units.
 - `python3 tools/sweep.py`: 425 runs, 0 not ok.

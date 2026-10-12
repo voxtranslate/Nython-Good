@@ -986,7 +986,15 @@ inline std::string VMVal::to_string() const {
         }
         return r+"}";
     }
-    case VMType::FUNCTION: return "<function "+(code?code->name:"?")+">"; 
+    case VMType::FUNCTION: {
+        // round 81: as CPython, <function Qualname at 0x...> with the
+        // address id() gives (it was <function name>)
+        if(!code) return "<function ?>";
+        uintptr_t raw=(uintptr_t)code.get()^((uintptr_t)closure_env.get()*31)^((uintptr_t)list.get()*17);
+        char buf[40];
+        std::snprintf(buf, sizeof buf, "0x%llx", (unsigned long long)(raw & 0x7fffffffffffffffULL));
+        return "<function "+(code->qualname.empty()?code->name:code->qualname)+" at "+buf+">";
+    }
     case VMType::CLASS:    return nyrt::class_repr(class_name);
     case VMType::INSTANCE: {
         // An exception reads as its message, as in Python: str(e) is the
@@ -5036,6 +5044,14 @@ public:
     static bool is_stack_list_iter(const VMVal& it) {
         return it.type==VMType::ITERATOR&&it.b&&!it.iter&&it.list&&!it.s.empty()&&(it.s[0]=='l'||it.s[0]=='t');
     }
+    // round 81: a set's, the set's own items read by index (they were
+    // copied), its size at the start in `d`: a set whose size changed is a
+    // RuntimeError at the next step, as CPython's setiterator
+    VMVal stack_set_iter(const VMVal& s) {
+        VMVal x; x.type=VMType::ITERATOR; x.b=true; x.s="set_iterator";
+        x.list=s.list; x.i=0; x.d=(double)s.list->size();
+        return x;
+    }
     // What GET_ITER pushes for `it`; `loop`: a loop's own iterator (it is
     // followed by FOR_ITER), which may be one of the in-place ones above.
     VMVal loop_iter(VMVal it, bool loop) {
@@ -5048,6 +5064,7 @@ public:
             else if(it.type==VMType::INSTANCE) k=view_of(it,&d);
             if(k>=0) return stack_dict_iter(d,k);
             if(it.type==VMType::LIST&&it.list&&!it.is_set()) return stack_list_iter(it);   // round 81
+            if(it.type==VMType::LIST&&it.list&&it.is_set()) return stack_set_iter(it);    // round 81
         }
         if(it.type==VMType::CLASS&&!class_meta_.empty()){
             // a class whose metaclass defines __iter__ (round 77)
@@ -8359,6 +8376,13 @@ private:
                 push(load_var(n));
                 if(stack_.back().type==VMType::NONE && !name_bound(n)){
                     pop();
+                    // round 81: __class__ in a method is the class defining
+                    // it (CPython's implicit __class__ cell, the one super()
+                    // uses)
+                    if(n=="__class__"&&!fr.code->owner_class.empty()&&class_reg_.count(fr.code->owner_class)){
+                        push(class_value(fr.code->owner_class));
+                        break;
+                    }
                     throw_exception(make_exception("NameError",{VMVal::make_str("name '"+n+"' is not defined")}));
                 }
                 break;
@@ -9325,6 +9349,11 @@ private:
                         // round 81: a list (or tuple) read live by index
                         const std::vector<VMVal>& L=*si.list;
                         if(si.i<(int64_t)L.size()){ nv=L[(size_t)si.i]; si.i++; got=true; }
+                    } else if(si.s[0]=='s'){
+                        // round 81: a set's own items (stack_set_iter)
+                        const std::vector<VMVal>& L=*si.list;
+                        if((double)L.size()!=si.d) raise_native_exception("RuntimeError","Set changed size during iteration");
+                        if(si.i<(int64_t)L.size()){ nv=L[(size_t)si.i]; si.i++; got=true; }
                     } else {
                         VMMap& m=*si.map;
                         if((double)m.size()!=si.d) raise_native_exception("RuntimeError","dictionary changed size during iteration");
@@ -9810,10 +9839,16 @@ private:
         }
         return VMVal::make_none();
     }
-    // _ny_frame_globals(f): f.f_globals.
+    // _ny_frame_globals(f): f.f_globals - round 81: its module's live
+    // globals() view (sys._getframe(1).f_globals["x"] = v binds x in the
+    // caller's module, as CPython); it was a copy.
     VMVal frame_globals(const VMVal& fo) {
         size_t idx;
-        if(frame_find(fo, idx)) return frame_globals_of(call_stack_[idx]);
+        if(frame_find(fo, idx)){
+            const CallFrame& f=call_stack_[idx];
+            if(f.code&&f.code->prelude_code) return frame_globals_of(f);
+            return vm_globals_view_of(f.code?f.code->module_env:nullptr);
+        }
         std::string mod="__main__";
         if(fo.type==VMType::INSTANCE&&fo.map){
             auto it=fo.map->find("_ny_info");
@@ -9822,13 +9857,9 @@ private:
         }
         if(mod!="__main__"){
             auto mi=module_ns_.find(mod);
-            if(mi!=module_ns_.end()&&mi->second.type==VMType::MAP&&mi->second.map){
-                VMVal d=VMVal::make_map();
-                for(auto& kv:*mi->second.map) if(!reflect_hidden(kv.first)) (*d.map)[nypy::key_of_str(kv.first)]=kv.second;
-                return d;
-            }
+            if(mi!=module_ns_.end()&&mi->second.type==VMType::MAP&&mi->second.map) return vm_globals_view_of(mi->second.map);
         }
-        return main_globals_map();
+        return vm_globals_view_of(nullptr);
     }
     // _ny_builtins_dict(): f.f_builtins - the builtins every program
     // starts with (the prelude's private names left out).
