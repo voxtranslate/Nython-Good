@@ -8,7 +8,10 @@ Last updated: round 80 — **§0s** (part A: the correctness gaps rounds
 `except <expression>`, numeric keys across int/float/Fraction/Decimal,
 `sys.modules`/`__import__`/importlib/pkgutil/runpy, relative imports,
 sys's facts and `sys.excepthook`, `-O`, a live `os.environ`, prelude code
-immune to rebound builtins, `${...}` only in Nython source; both engines).
+immune to rebound builtins, `${...}` only in Nython source) and **§0s2**
+(part B: os.fspath/scandir/file descriptors, posixpath/ntpath/stat/pwd/grp,
+a full codecs module, multiprocessing over pickle with a work-stealing Pool;
+both engines).
 Round 79 — **§0r** (zlib/DEFLATE written natively with an
 opt-in Zopfli-style optimal parse; binascii, gzip, zipfile, tarfile, pickle
 byte-identical to CPython's, copyreg, array; `__slots__` and `__class__`
@@ -56,6 +59,112 @@ multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
 
 ---
+
+## 0s2. Round 80, part B — the OS layer's gaps, codecs, multiprocessing (vm_audit97)
+
+`examples/vm_audit97.ny` passes 262/262 on the interpreter, the VM and
+python3, and 240/240 under Wine on both engines (22 POSIX-only checks skip
+there cleanly).
+
+### os, os.path, stat, pwd, grp
+- A lazily loaded prelude chunk `#@ os` plus native `src/builtins/os_fd.cpp`:
+  `fspath`/`fsencode`/`fsdecode`/`PathLike` (`__fspath__` honoured by the
+  path functions and `open`), `scandir`/`DirEntry` (cached stat, context
+  manager) and `walk` over it (3.12's), **real file descriptors** (`open`
+  with `O_*` flags, `read`/`write`/`close`/`closerange`/`pipe`/`dup`/`dup2`,
+  inheritable and blocking flags, `lseek`, `fsync`, `isatty`, `truncate`/
+  `ftruncate`, `fdopen`; `open(fd)` and `opener=`), ids, `umask`,
+  `getlogin`, `chown`/`lchown`/`fchown`, `mkfifo`/`mknod`, `major`/`minor`/
+  `makedev`, `getloadavg`, `sched_getaffinity`, `cpu_count`,
+  `get_exec_path`, `access` with `F_OK`..., the path constants,
+  `removedirs`/`renames`/`kill`; os.path `splitdrive`, `lexists`,
+  `samefile`/`sameopenfile`/`samestat`, `ismount`, `isjunction`,
+  `isdevdrive`, `splitroot`. `os.path.splitext` returns a tuple.
+- `lib/posixpath.ny`, `ntpath.ny`, `genericpath.ny` are CPython's (checked
+  against python3 on a battery of paths; on Windows `os.path` delegates to
+  ntpath); `lib/stat.ny` complete (`os.stat_result` agrees); `lib/pwd.ny`,
+  `lib/grp.ny` (ModuleNotFoundError on Windows). tarfile uses them for owner
+  names and chowns on extraction as root.
+- **One os module per program** on both engines (also `sys.modules["os"]`,
+  part A): a module made per import was freed with a function's local
+  `import os` and its address, still in the interpreter's
+  `namespace_objs_`, typed the next dict made there as a module.
+- `os.environ`: part A's `_NyEnviron` (merged: part B had written a second
+  `_Environ` reading the live environment on each access; CPython's is a
+  copy taken at startup that writes through, which is part A's).
+- Windows: `os.stat` fills `st_ino`/`st_dev`/`st_nlink`
+  (GetFileInformationByHandle); `os.path.exists(os.devnull)` is true.
+
+### codecs
+- `lib/codecs.ny`: the whole API (registry, CodecInfo, incremental and
+  stream classes, `open`, `EncodedFile`, BOMs, `register_error`/
+  `lookup_error`, the `_codecs` functions); all eight error handlers on
+  every codec in both directions with CPython's positions and messages;
+  utf-8, utf-8-sig, utf-16/32 (le/be), latin-1, ascii, cp437, cp850, cp1252,
+  mac-roman, unicode_escape, raw_unicode_escape, idna, punycode, and the
+  bytes-to-bytes hex/base64/zlib/quopri/rot13. One native table
+  (`include/NyCodecs.hpp`, `NyCodecTables.inc`, `src/builtins/nycodecs.cpp`)
+  serves `str.encode`/`bytes.decode` too (`NyBytes.hpp` delegates to it; a
+  codec or handler only Python provides goes through the prelude's
+  `_ny_codec_encode`/`_decode`).
+
+### multiprocessing (spawn) and ProcessPoolExecutor over pickle
+- `lib/multiprocessing/`: Process; Queue/SimpleQueue/JoinableQueue; Pipe/
+  Connection; Lock/RLock/Semaphore/BoundedSemaphore/Event/Condition/Barrier
+  across processes through a lock server (a thread per process; AF_UNIX on
+  POSIX, TCP loopback on Windows; an HMAC check of the authkey; everything
+  pickled); Value/Array/RawValue/RawArray and
+  `shared_memory.SharedMemory` (mmap / CreateFileMapping); Pool and
+  ThreadPool; Manager (a server process); `connection.Listener`/`Client`;
+  `get_context("spawn")`. All of it works under Wine.
+- **Innovation: work stealing in Pool** (Blumofe & Leiserson, 1999): each
+  worker has its own deque and steals half of the longest. Makespans with 4
+  workers and uneven tasks: expensive-last 0.51 s (FIFO chunk 1) / 1.35 s
+  (chunk 4) -> 0.50 s (ideal 0.45); heavy-tailed 0.98 / 1.01 -> 0.87 (ideal
+  0.74); 400 empty tasks 0.95 / 0.30 -> 0.55 - the balance of chunk 1 with
+  less overhead.
+- `concurrent.futures.ProcessPoolExecutor` sends pickle (round 79's JSON
+  carrier is gone; `mp_context` is accepted and ignored).
+- pickle: a native fast path for plain data at protocols 4-5
+  (`src/builtins/nypickle.cpp`, CPython's bytes, its 1000-item batches with
+  the trailing empty batch); os functions pickle as `posix.getpid` /
+  `nt.getpid`; `__mp_main__` maps to `__main__`.
+
+### Engine changes
+- Interpreter: `makeOsNamespace` loads the os chunk and binds its
+  `_ny_os_members`, cached (`os_ns_cache_`); `codecHook` for `str.encode`
+  and `bytes.decode`. VM: `define_os_module` likewise (`os_ns_`, the module's
+  `class_name` is "os"), `open()` routes an int path or `opener=` to
+  `_ny_open_fd`, `codec_hook`; **`del L[1:3]` emptied the strings it kept**
+  (an element moved onto itself) - fixed.
+- `src/main.cpp` BridgeConv: shared references and cycles survive the
+  interpreter-VM bridge (`built` memo), and `copy_back` no longer writes
+  None over functions held in containers.
+- New units `src/builtins/os_fd.cpp`, `nycodecs.cpp`, `nypickle.cpp` (in
+  `nython.cbp`).
+
+### Not done
+- multiprocessing: no fork/forkserver, no waitable OS sentinels, no feeder
+  thread, no ShareableList; server objects are not freed before their
+  server exits; a Barrier's action runs in the process that gets index 0; a
+  Pipe end held by a killed process is not closed; ctypes types are given
+  as strings.
+- os: no `dir_fd`; Windows has no ownership, FIFO or device functions;
+  under Wine `os.getppid()` is 0.
+- codecs: no cp1251, CJK, utf-7...; idna's nameprep only lower-cases.
+- The interpreter's `namespace_objs_` can still go stale for other freed
+  namespace objects (only os is cached); the VM's `exec("import os", ns)`
+  binds in the globals.
+
+### Verified after merging onto part A
+- Linux, both engines: the sweep 421 runs, 0 not ok; vm_audit97 262 and
+  vm_audit96 116 on both engines (262 / 115 under python3); vm_audit46,
+  76, 77, 93, 94, 91, 92, 44 still pass; `ide_e2e` 390/390; `ide_lint`,
+  `ny_classcheck`, `cbp.py check` (61 units) clean; `ide_memprobe --check`
+  0 KB kept.
+- The merge conflicted in `makeOsNamespace` / `define_os_module` (part A's
+  `sys.modules["os"]` and part B's cache: both kept) and duplicated
+  `os.environ` (part A's `_NyEnviron` kept, part B's `_Environ` removed).
 
 ## 0s. Round 80, part A — the correctness gaps rounds 78-79 found (vm_audit96)
 

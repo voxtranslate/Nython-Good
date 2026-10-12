@@ -5677,3 +5677,18 @@ Full detail in `HANDOFF.md` §0s. New test: `vm_audit96` (116 checks), passes un
 | `ThreadPoolExecutor` workers were daemons drained by atexit | no `threading._register_atexit` | callbacks run before non-daemon threads are joined (both engines) |
 | `str.maketrans` / `str.translate` missing | — | all three forms, CPython's messages |
 | `string.Template("${name}")` in Python code interpolated `name` | `${...}` made any quoted literal an f-string, and the interpreter re-interpolated at run time | `${...}` only in Nython source: not in raw strings, bytes, f-strings, nor any quoted string of a `.py` file, a `# nython: module` module or a `# nython: python` file; no run-time re-interpolation |
+
+## Round 80, part B — the OS layer's gaps, codecs, multiprocessing
+
+Full detail in `HANDOFF.md` §0s2. New test: `vm_audit97` (262 checks; passes under python3 too, and 240 under Wine with the POSIX-only checks skipped).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| No `os.fspath`, `scandir`, file descriptors, `getuid`, `chown`, `mkfifo`; no posixpath/ntpath/stat/pwd/grp/codecs/multiprocessing | — | the os chunk and `os_fd.cpp`; CPython's modules; codecs over one native table; multiprocessing (spawn) over pickle with a work-stealing Pool |
+| A function's local `import os` could make a later dict print and pickle as a module (interpreter) | the namespace was freed while its address stayed in `namespace_objs_` | one os module per program |
+| VM: `del L[1:3]` on `["A", "b", "c", "D"]` gave `['', 'D']` | an element kept in place was moved onto itself | not moved |
+| A container shared or cyclic lost its sharing crossing between the engines' bridge; functions held in a container became None after a bridged call | no memo in `to_vm`/`build`; `copy_back` rewrote unchanged opaque values | memoized; unchanged elements kept |
+| `str.encode`/`bytes.decode` knew a few codecs and handlers | per-engine tables | one table (`NyCodecs.hpp`) with every handler; the rest through `lib/codecs.ny` |
+| Windows: `os.stat(p).st_ino` was 0; `os.path.exists(os.devnull)` false | `_stat64` fields; character devices not seen | GetFileInformationByHandle; devices seen |
+| `os.path.splitext` returned a list | — | a tuple |
+

@@ -378,6 +378,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit94 | 162 | round 79: difflib (byte-identical to CPython, plus patience/histogram diffs), shlex, configparser, tomllib (+ dumps), html, xml (an expat-compatible parser in Nython, ElementTree, minidom), ipaddress, graphlib, contextvars per task, concurrent.futures (threads and real processes), zoneinfo, mimetypes - generated from `tools/vm_audit94_spec.py` (152 pass under python3; 10 test Nython-only additions) |
 | vm_audit95 | 2050 | round 79: decimal - the API and 1,981 vectors with CPython's results and flags at precisions 9/16/34 (passes under python3) |
 | vm_audit96 | 116 | round 80: the gaps rounds 78-79 found - two interpreter crashes, object's members on every class, except <expression>, numeric keys across int/float/Fraction/Decimal, dataclass(slots=True), sys.modules/__import__/importlib, relative imports, sys's facts, sys.excepthook and -O, exec/eval namespaces, a live os.environ, threading._register_atexit, str.maketrans/translate, `${` in a Python-mode file (passes under python3) |
+| vm_audit97 | 262 | round 80: os.fspath/PathLike, scandir, real file descriptors, ids, posixpath/ntpath/genericpath/stat/pwd/grp, codecs (every error handler, cp437/cp1252/utf-16/32/idna/punycode, bytes codecs), multiprocessing (Process, queues, pipes, locks across processes, shared Value/Array/SharedMemory, Pool with work stealing, Manager), ProcessPoolExecutor over pickle (passes under python3; 240 under Wine, POSIX-only checks skipped) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -1169,6 +1170,19 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   the class; ImportError/AttributeError/NameError `name=` fields; two
   interpreter segfaults fixed (classmethod(GenericAlias) as
   `__class_getitem__`, a builtin's bound method as a class attribute).
+
+## Round 80: the OS layer, codecs, multiprocessing (see `HANDOFF.md` §0s2)
+
+- The rest of Python's os is a lazily loaded prelude chunk (`#@ os`) plus
+  native `src/builtins/os_fd.cpp`: fspath/PathLike, scandir, real file
+  descriptors, ids, chown/mkfifo, the path constants; posixpath/ntpath/
+  genericpath/stat/pwd/grp in `lib/`. One os module per program.
+- One codec table for `str.encode`/`bytes.decode` and `lib/codecs.ny`
+  (`include/NyCodecs.hpp`): every error handler, cp437/cp1252/utf-16/32,
+  idna/punycode, the bytes codecs.
+- `lib/multiprocessing/` (spawn only; locks through a lock server, shared
+  memory by mmap/CreateFileMapping, a work-stealing Pool);
+  ProcessPoolExecutor sends pickle.
 
 ## Transcripts
 
