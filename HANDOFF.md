@@ -90,7 +90,8 @@ work after `import asyncio`). CPython 3.12's semantics and messages; the
 module's header lists what is there and what is not. `examples/vm_audit104.ny`
 (113 checks on both engines; the shared part passes under python3.11 - 108,
 eager tasks and Queue.shutdown skipped -, 3.12 - 109 - and 3.13 - all 110;
-under Wine 101 pass, the POSIX-only parts and TLS skipped) pins it.
+under Wine 102 pass on both engines, subprocesses included - the POSIX-only
+parts and TLS skipped) pins it.
 
 ### The event loop is a persistent native loop
 - `new_event_loop()` gives a `SelectorEventLoop` over `async_loop_new()`
