@@ -82,6 +82,186 @@ static inline double ny_num(const Value& v) {
     }
 }
 
+// isinstance(x, T) (round 81: out of dispatch_tensor's chain of names, so
+// callBuiltin reaches it directly - it was the 300th name tried there).
+Value builtin_isinstance(NythonExecutor& E, std::vector<Value>& args, Context* ctx) {
+    auto  getStringValue   = [&](const Value& v) { return E.getStringValue(v); };
+    auto  callBuiltin      = [&](const std::string& n, std::vector<Value>& a, Context* c) { return E.callBuiltin(n, a, c); };
+    auto& func_names       = E.func_names;
+    auto& instance_to_class= E.instance_to_class;
+    auto& class_by_name    = E.class_by_name;
+    auto& class_parent     = E.class_parent;
+    // a runtime type object (NoneType, function, method, generator,
+    // list_iterator ...): exactly that kind - round 77
+    if (args.size() >= 2 && E.runtimeTypeOf(args[1])) {
+        Value t = E.typeObjectOf(args[0]);
+        return Value(t.type == ValueType::USERDATA && t.value.p == args[1].value.p);
+    }
+    // isinstance(x, int | str): any of the union's types (round 77)
+    if (args.size() >= 2 && E.isInstanceValue(args[1]) && E.shownClassName(E.instanceClassName(args[1])) == "_NyUnionType") {
+        Value ua = args[1];
+        for (auto& t : E.listItems(E.attrOf(ua, "__args__"))) {
+            if (t.type == ValueType::NONE) { if (args[0].type == ValueType::NONE) return Value(true); continue; }
+            std::vector<Value> one{args[0], t};
+            Value r = callBuiltin("isinstance", one, ctx);
+            if (r.type == ValueType::BOOLEAN && r.value.b) return Value(true);
+        }
+        return Value(false);
+    }
+    // an object whose class defines __instancecheck__ (typing's
+    // List, Union[int, str] ...), as CPython asks type(cls) - round 77
+    if (args.size() >= 2 && E.isInstanceValue(args[1]) && E.instanceHasMethod(args[1], "__instancecheck__")) {
+        std::vector<Value> one{args[0]};
+        return Value(E.isTruthy(E.callMethod(args[1], "__instancecheck__", one, ctx)));
+    }
+    // everything is an object: isinstance(5, object), (C, object),
+    // (None, object) - round 77
+    if (args.size() >= 2 && E.classNodeOfValue(args[1]) && E.classNodeOfValue(args[1]) == E.classNodeByName("object"))
+        return Value(true);
+    // a metaclass's __instancecheck__; isinstance(C, type) / (C, M)
+    if (args.size() >= 2 && E.classNodeOfValue(args[1])) {
+        if (!E.class_meta_.empty()) {
+            Value r;
+            if (E.metaCall(args[1], "__instancecheck__", {args[0]}, ctx, r)) return Value(E.isTruthy(r));
+        }
+        if (nython::node::Node* xc = E.classNodeOfValue(args[0])) {
+            Value meta = E.metaclassOf(xc);
+            std::string want = static_cast<nython::node::ClassNode*>(E.classNodeOfValue(args[1]))->name;
+            if (meta.type != ValueType::NONE)
+                return Value(E.classDerivesFrom(static_cast<nython::node::ClassNode*>(E.classNodeOfValue(meta))->name, want));
+            return Value(false);
+        }
+    }
+    // isinstance(C, type), and of a builtin type: isinstance(int, type)
+    // read false (round 77)
+    if (args.size() >= 2 && (E.classNodeOfValue(args[0]) || E.isTypeObject(args[0])) && args[1].type == ValueType::USERDATA
+        && E.fnTag(E.func_names, args[1].value.p) == "__builtin__:type")
+        return Value(true);
+    // isinstance(x, (A, B)): any of them.
+    if (args.size() >= 2 && args[1].isCollectable() && args[1].value.gc) {
+        auto* tc = dynamic_cast<Container*>(args[1].value.gc);
+        if (tc && tc->container && tc->container->count("__len__")) {
+            for (auto& t : E.listItems(args[1])) {
+                std::vector<Value> one{args[0], t};
+                Value r = callBuiltin("isinstance", one, ctx);
+                if (r.type == ValueType::BOOLEAN && r.value.b) return Value(true);
+            }
+            return Value(false);
+        }
+    }
+    if (args.size() >= 2) {
+        // Extract type name: handle builtin funcs (int, str, float...) and class objects
+        std::string type_name;
+        if (args[1].type == ValueType::USERDATA && args[1].value.p) {
+            // Check if it's a string first
+            if (E.string_ptrs_.count(args[1].value.p)) {
+                type_name = *static_cast<std::string*>(args[1].value.p);
+            } else {
+                auto fit = func_names.find(args[1].value.p);
+                if (fit != func_names.end()) {
+                    if (fit->second.find("__builtin__:") == 0)
+                        type_name = fit->second.substr(12);
+                    else if (fit->second.find("__class__:") == 0)
+                        type_name = fit->second.substr(10);
+                    else
+                        type_name = getStringValue(args[1]);
+                } else {
+                    type_name = getStringValue(args[1]);
+                }
+            }
+        } else {
+            type_name = getStringValue(args[1]);
+        }
+        // An instance of a class deriving from a builtin type
+        // (class Color(IntEnum), IntEnum(int, ...)) is one (round 77).
+        if (E.isInstanceValue(args[0]) && type_name != "object" && nyrt::is_builtin_type_name(type_name)
+            && E.classDerivesFrom(E.instanceClassName(args[0]), type_name)) return Value(true);
+        // bool is a subclass of int, as in Python.
+        if (type_name == "int" || type_name == "integer") return Value(args[0].type == ValueType::INTEGER || args[0].type == ValueType::BOOLEAN);
+        if (type_name == "tuple") {
+            auto* cont = args[0].isCollectable() ? dynamic_cast<Container*>(args[0].value.gc) : nullptr;
+            return Value(cont && cont->container && cont->container->count("__tuple__") > 0);
+        }
+        if (type_name == "bytes" || type_name == "bytearray") {
+            auto* bo = E.bytesOf(args[0]);
+            return Value(bo && bo->mut == (type_name == "bytearray"));
+        }
+        if (E.isBytesValue(args[0]) && (type_name == "str" || type_name == "string")) return Value(false);
+        if (type_name == "float" || type_name == "double") return Value(args[0].type == ValueType::DOUBLE);
+        if (type_name == "bool" || type_name == "boolean") return Value(args[0].type == ValueType::BOOLEAN);
+        if (type_name == "str" || type_name == "string") {
+            // Positive string pointer check first
+            if (args[0].type == ValueType::USERDATA && args[0].value.p
+                && E.string_ptrs_.count(args[0].value.p))
+                return Value(true);
+            if (args[0].isCollectable() && args[0].value.gc) {
+                Type t = args[0].value.gc->getType();
+                if (t == Type::STRING) return Value(true);
+            }
+            // Also check if it's a USERDATA string (our runtime representation)
+            if (args[0].type == ValueType::USERDATA && args[0].value.p) {
+                auto fit = func_names.find(args[0].value.p);
+                if (fit == func_names.end() && !instance_to_class.count(args[0].value.p))
+                    return Value(true);
+            }
+            return Value(false);
+        }
+        if (type_name == "list" || type_name == "array") {
+            // Check via __len__ key (our list representation); a
+            // tuple, set or generator is no list.
+            if (args[0].isCollectable() && args[0].value.gc) {
+                auto* cont = dynamic_cast<Container*>(args[0].value.gc);
+                if (cont && cont->container && cont->container->count("__len__"))
+                    return Value(!cont->container->count("__tuple__") && !cont->container->count("__set__")
+                                 && !cont->container->count("__gen__"));
+            }
+            return Value(false);
+        }
+        if (type_name == "set" || type_name == "frozenset") {
+            Container* sc = E.setOf(args[0]);
+            return Value(sc && NythonExecutor::isFrozenCont(sc) == (type_name == "frozenset"));
+        }
+        if (type_name == "map" || type_name == "dict") {
+            // what type() calls a dict: a container that is no
+            // sequence (json_decode's maps carry the LIST tag, so
+            // the tag alone said false for them)
+            if (E.isInstanceValue(args[0])) return Value(false);
+            return Value(E.typeNameOf(args[0]) == "dict");
+        }
+        if (type_name == "none") return Value(args[0].type == ValueType::NONE);
+        // Every lazy iterator: a generator, a generator expression,
+        // zip/map/filter/enumerate/islice over one, iter() (it read
+        // false for all of them).
+        if (type_name == "generator") return Value(nygen::is_gen(args[0]));
+        if (type_name == "function") return Value(args[0].type == ValueType::USERDATA && args[0].value.p && !E.string_ptrs_.count(args[0].value.p) && func_names.count(args[0].value.p));
+        // Check class instances (user-defined classes) — type_name is the class name.
+        // Every base counts, and a builtin exception base too
+        // (isinstance(e, Exception) for class E(Exception)).
+        if (E.isInstanceValue(args[0])) {
+            std::string icn = E.instanceClassName(args[0]);
+            if (!icn.empty() && E.classDerivesFrom(icn, type_name)) return Value(true);
+        }
+        if (args[0].type == ValueType::USERDATA && args[0].value.p && !E.string_ptrs_.count(args[0].value.p)) {
+            auto cit2 = instance_to_class.find(args[0].value.p);
+            if (cit2 != instance_to_class.end()) {
+                void* walk_cls = cit2->second;
+                while (walk_cls) {
+                    for (auto& kv : class_by_name) {
+                        if (kv.second == walk_cls && kv.first == type_name) return Value(true);
+                    }
+                    auto pit2 = class_parent.find(walk_cls);
+                    if (pit2 != class_parent.end()) {
+                        auto par = class_by_name.find(pit2->second);
+                        if (par != class_by_name.end()) { walk_cls = par->second; continue; }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    return Value(false);
+}
+
 Value dispatch_tensor(NythonExecutor& E,
                        const std::string& name,
                        std::vector<Value>& args,
@@ -370,177 +550,7 @@ Value dispatch_tensor(NythonExecutor& E,
             if (!ok) E.pyRaise("EOFError", "EOF when reading a line");
             return E.makeStringValue(line);
         }
-        if (name == "isinstance") {
-            // a runtime type object (NoneType, function, method, generator,
-            // list_iterator ...): exactly that kind - round 77
-            if (args.size() >= 2 && E.runtimeTypeOf(args[1])) {
-                Value t = E.typeObjectOf(args[0]);
-                return Value(t.type == ValueType::USERDATA && t.value.p == args[1].value.p);
-            }
-            // isinstance(x, int | str): any of the union's types (round 77)
-            if (args.size() >= 2 && E.isInstanceValue(args[1]) && E.shownClassName(E.instanceClassName(args[1])) == "_NyUnionType") {
-                Value ua = args[1];
-                for (auto& t : E.listItems(E.attrOf(ua, "__args__"))) {
-                    if (t.type == ValueType::NONE) { if (args[0].type == ValueType::NONE) return Value(true); continue; }
-                    std::vector<Value> one{args[0], t};
-                    Value r = callBuiltin("isinstance", one, ctx);
-                    if (r.type == ValueType::BOOLEAN && r.value.b) return Value(true);
-                }
-                return Value(false);
-            }
-            // an object whose class defines __instancecheck__ (typing's
-            // List, Union[int, str] ...), as CPython asks type(cls) - round 77
-            if (args.size() >= 2 && E.isInstanceValue(args[1]) && E.instanceHasMethod(args[1], "__instancecheck__")) {
-                std::vector<Value> one{args[0]};
-                return Value(E.isTruthy(E.callMethod(args[1], "__instancecheck__", one, ctx)));
-            }
-            // everything is an object: isinstance(5, object), (C, object),
-            // (None, object) - round 77
-            if (args.size() >= 2 && E.classNodeOfValue(args[1]) && E.classNodeOfValue(args[1]) == E.classNodeByName("object"))
-                return Value(true);
-            // a metaclass's __instancecheck__; isinstance(C, type) / (C, M)
-            if (args.size() >= 2 && E.classNodeOfValue(args[1])) {
-                if (!E.class_meta_.empty()) {
-                    Value r;
-                    if (E.metaCall(args[1], "__instancecheck__", {args[0]}, ctx, r)) return Value(E.isTruthy(r));
-                }
-                if (nython::node::Node* xc = E.classNodeOfValue(args[0])) {
-                    Value meta = E.metaclassOf(xc);
-                    std::string want = static_cast<nython::node::ClassNode*>(E.classNodeOfValue(args[1]))->name;
-                    if (meta.type != ValueType::NONE)
-                        return Value(E.classDerivesFrom(static_cast<nython::node::ClassNode*>(E.classNodeOfValue(meta))->name, want));
-                    return Value(false);
-                }
-            }
-            // isinstance(C, type), and of a builtin type: isinstance(int, type)
-            // read false (round 77)
-            if (args.size() >= 2 && (E.classNodeOfValue(args[0]) || E.isTypeObject(args[0])) && args[1].type == ValueType::USERDATA
-                && E.fnTag(E.func_names, args[1].value.p) == "__builtin__:type")
-                return Value(true);
-            // isinstance(x, (A, B)): any of them.
-            if (args.size() >= 2 && args[1].isCollectable() && args[1].value.gc) {
-                auto* tc = dynamic_cast<Container*>(args[1].value.gc);
-                if (tc && tc->container && tc->container->count("__len__")) {
-                    for (auto& t : E.listItems(args[1])) {
-                        std::vector<Value> one{args[0], t};
-                        Value r = callBuiltin("isinstance", one, ctx);
-                        if (r.type == ValueType::BOOLEAN && r.value.b) return Value(true);
-                    }
-                    return Value(false);
-                }
-            }
-            if (args.size() >= 2) {
-                // Extract type name: handle builtin funcs (int, str, float...) and class objects
-                std::string type_name;
-                if (args[1].type == ValueType::USERDATA && args[1].value.p) {
-                    // Check if it's a string first
-                    if (E.string_ptrs_.count(args[1].value.p)) {
-                        type_name = *static_cast<std::string*>(args[1].value.p);
-                    } else {
-                        auto fit = func_names.find(args[1].value.p);
-                        if (fit != func_names.end()) {
-                            if (fit->second.find("__builtin__:") == 0)
-                                type_name = fit->second.substr(12);
-                            else if (fit->second.find("__class__:") == 0)
-                                type_name = fit->second.substr(10);
-                            else
-                                type_name = getStringValue(args[1]);
-                        } else {
-                            type_name = getStringValue(args[1]);
-                        }
-                    }
-                } else {
-                    type_name = getStringValue(args[1]);
-                }
-                // An instance of a class deriving from a builtin type
-                // (class Color(IntEnum), IntEnum(int, ...)) is one (round 77).
-                if (E.isInstanceValue(args[0]) && type_name != "object" && nyrt::is_builtin_type_name(type_name)
-                    && E.classDerivesFrom(E.instanceClassName(args[0]), type_name)) return Value(true);
-                // bool is a subclass of int, as in Python.
-                if (type_name == "int" || type_name == "integer") return Value(args[0].type == ValueType::INTEGER || args[0].type == ValueType::BOOLEAN);
-                if (type_name == "tuple") {
-                    auto* cont = args[0].isCollectable() ? dynamic_cast<Container*>(args[0].value.gc) : nullptr;
-                    return Value(cont && cont->container && cont->container->count("__tuple__") > 0);
-                }
-                if (type_name == "bytes" || type_name == "bytearray") {
-                    auto* bo = E.bytesOf(args[0]);
-                    return Value(bo && bo->mut == (type_name == "bytearray"));
-                }
-                if (E.isBytesValue(args[0]) && (type_name == "str" || type_name == "string")) return Value(false);
-                if (type_name == "float" || type_name == "double") return Value(args[0].type == ValueType::DOUBLE);
-                if (type_name == "bool" || type_name == "boolean") return Value(args[0].type == ValueType::BOOLEAN);
-                if (type_name == "str" || type_name == "string") {
-                    // Positive string pointer check first
-                    if (args[0].type == ValueType::USERDATA && args[0].value.p
-                        && E.string_ptrs_.count(args[0].value.p))
-                        return Value(true);
-                    if (args[0].isCollectable() && args[0].value.gc) {
-                        Type t = args[0].value.gc->getType();
-                        if (t == Type::STRING) return Value(true);
-                    }
-                    // Also check if it's a USERDATA string (our runtime representation)
-                    if (args[0].type == ValueType::USERDATA && args[0].value.p) {
-                        auto fit = func_names.find(args[0].value.p);
-                        if (fit == func_names.end() && !instance_to_class.count(args[0].value.p))
-                            return Value(true);
-                    }
-                    return Value(false);
-                }
-                if (type_name == "list" || type_name == "array") {
-                    // Check via __len__ key (our list representation); a
-                    // tuple, set or generator is no list.
-                    if (args[0].isCollectable() && args[0].value.gc) {
-                        auto* cont = dynamic_cast<Container*>(args[0].value.gc);
-                        if (cont && cont->container && cont->container->count("__len__"))
-                            return Value(!cont->container->count("__tuple__") && !cont->container->count("__set__")
-                                         && !cont->container->count("__gen__"));
-                    }
-                    return Value(false);
-                }
-                if (type_name == "set" || type_name == "frozenset") {
-                    Container* sc = E.setOf(args[0]);
-                    return Value(sc && NythonExecutor::isFrozenCont(sc) == (type_name == "frozenset"));
-                }
-                if (type_name == "map" || type_name == "dict") {
-                    // what type() calls a dict: a container that is no
-                    // sequence (json_decode's maps carry the LIST tag, so
-                    // the tag alone said false for them)
-                    if (E.isInstanceValue(args[0])) return Value(false);
-                    return Value(E.typeNameOf(args[0]) == "dict");
-                }
-                if (type_name == "none") return Value(args[0].type == ValueType::NONE);
-                // Every lazy iterator: a generator, a generator expression,
-                // zip/map/filter/enumerate/islice over one, iter() (it read
-                // false for all of them).
-                if (type_name == "generator") return Value(nygen::is_gen(args[0]));
-                if (type_name == "function") return Value(args[0].type == ValueType::USERDATA && args[0].value.p && !E.string_ptrs_.count(args[0].value.p) && func_names.count(args[0].value.p));
-                // Check class instances (user-defined classes) — type_name is the class name.
-                // Every base counts, and a builtin exception base too
-                // (isinstance(e, Exception) for class E(Exception)).
-                if (E.isInstanceValue(args[0])) {
-                    std::string icn = E.instanceClassName(args[0]);
-                    if (!icn.empty() && E.classDerivesFrom(icn, type_name)) return Value(true);
-                }
-                if (args[0].type == ValueType::USERDATA && args[0].value.p && !E.string_ptrs_.count(args[0].value.p)) {
-                    auto cit2 = instance_to_class.find(args[0].value.p);
-                    if (cit2 != instance_to_class.end()) {
-                        void* walk_cls = cit2->second;
-                        while (walk_cls) {
-                            for (auto& kv : class_by_name) {
-                                if (kv.second == walk_cls && kv.first == type_name) return Value(true);
-                            }
-                            auto pit2 = class_parent.find(walk_cls);
-                            if (pit2 != class_parent.end()) {
-                                auto par = class_by_name.find(pit2->second);
-                                if (par != class_by_name.end()) { walk_cls = par->second; continue; }
-                            }
-                            break;
-                        }
-                    }
-                }
-            }
-            return Value(false);
-        }
+        if (name == "isinstance") return builtin_isinstance(E, args, ctx);
         if (name == "display" || name == "show") {
             // Print and return value (usable in lambdas)
             for (size_t i = 0; i < args.size(); i++) {

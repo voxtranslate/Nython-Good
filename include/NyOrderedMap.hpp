@@ -98,6 +98,7 @@ private:
             c0_ = nullptr; more_.clear();
         }
         void swap(Slots& o) noexcept { std::swap(c0_, o.c0_); more_.swap(o.more_); std::swap(n_, o.n_); }
+        size_t chunks_beyond_first() const { return more_.size(); }   // round 81
     };
     Slots slots_;
     // Index cells: kEmpty, kDeleted, or (high 32 bits of the hash << 32 | slot
@@ -337,6 +338,10 @@ public:
     // keeps its storage for the entries to come (round 80: a VM call
     // frame's locals, reused by the next call at that depth).
     void clear_keep() { slots_.clear_keep(); index_.clear(); live_ = 0; used_ = 0; ver_++; }
+    // Whether the map's storage is small enough to keep for reuse once it
+    // is emptied (round 81: Container's map pool) - its first chunk of slots
+    // only, and a small index.
+    bool pool_small() const { return slots_.chunks_beyond_first() == 0 && index_.capacity() <= 64; }
 
     iterator find(std::string_view k) {
         const Slot* sp = nullptr;

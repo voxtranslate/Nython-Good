@@ -107,19 +107,24 @@ struct UndefinedNode : Node {
 // VARIABLE / IDENTIFIER
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Round 81: the interpreter's cache for reading a name through the scope
+// chain (NythonExecutor::lookupName): the name's hash, computed once, and
+// the scope depth and slot it was found at last (checked - the key still in
+// that slot - before use; the scopes before it are searched as ever).
+struct NameCache {
+    uint64_t hash = 0;
+    bool hashed = false;
+    uint8_t depth = 0xFF;
+    uint32_t slot = 0;
+};
+
 struct VariableNode : Node {
     std::string name;
     // Declared `global` in the enclosing function: read and assigned at
     // module level (created there by an assignment), whatever an enclosing
     // function binds.
     bool global_ref = false;
-    // Round 81, the interpreter's cache for reading the name: its hash,
-    // computed once, and the scope depth and slot it was found at last
-    // (checked - the key still in that slot - before use).
-    uint64_t name_hash = 0;
-    bool hashed = false;
-    uint8_t hint_depth = 0xFF;
-    uint32_t hint_slot = 0;
+    NameCache nc;   // round 81: reading it (NythonExecutor::lookupName)
     // ... and for assigning it: whether it is one of the builtins' names,
     // as of the executor's version of that set (base_names_ver_).
     uint32_t base_ver = 0;
@@ -134,6 +139,8 @@ struct VariableNode : Node {
 };
 
 struct SelfNode : Node {
+    NameCache nc_self, nc_this;   // round 81: the interpreter's caches for reading self / this
+    int8_t is_this = -1;          // ... and whether it is spelled `this` (-1: not looked yet)
     SelfNode(Token t) : Node(t, NodeType::SELF) {}
     Value eval(Context* ctx) override { return ctx ? ctx->getByName("self") : NONE_VALUE; }
 };
@@ -294,6 +301,7 @@ struct AttributeNode : Node {
 
 struct SubscriptNode : Node {
     node_ptr object, index;
+    int8_t slot_off = 0;   // round 81: where a list's item sits relative to its index, as last seen
     SubscriptNode(Token t, node_ptr o, node_ptr i) : Node(t, NodeType::SUBSCRIPT), object(o), index(i) {}
     Value eval(Context* ctx) override {
         Value obj = object->eval(ctx);
@@ -333,6 +341,8 @@ struct AssignmentNode : Node {
 
 struct AugAssignNode : Node {
     node_ptr target, value_node; std::string op;
+    int8_t opc = -1;          // round 81: the interpreter's code for op's operator, worked out on first use
+    bool plain_op = false;    // ... and whether op is an arithmetic one (not ~= or @=)
     AugAssignNode(Token t, node_ptr tgt, node_ptr val) : Node(t, NodeType::ASSIGNMENT_AUG), target(tgt), value_node(val), op(t.value) {}
     Value eval(Context* ctx) override {
         Value old_val = target->eval(ctx);
@@ -417,6 +427,8 @@ struct CallNode : Node {
         // the namespaces before the owner in the MRO (none holds the name),
         // each with the version of its keys then (OrderedMap::version)
         std::vector<std::pair<Context*, uint32_t>> prefix;
+        const Value* parent_name = nullptr;   // the interned name of the owner's first base (__parent_class__)
+        bool append_ok = false;          // the scope's names are distinct: appended, no lookups
     };
     static constexpr int kMethodWays = 4;   // receiver classes per site (Hölzle et al. 1991)
     std::unique_ptr<MethodIC[]> mic;        // made on first use
@@ -592,6 +604,7 @@ struct ForNode : Node {
     std::vector<node_ptr> unpack_vars;
     node_ptr else_branch; // for tuple unpacking: for k, v in ...
     bool rebinds = false; // the loop variable was declared global/nonlocal
+    uint32_t var_hint = 0; // round 81: the interpreter's cache of the loop variable's slot
     ForNode(Token t, node_ptr v, node_ptr i, node_ptr b) : Node(t, NodeType::FOR), var(v), iterable(i), body(b), unpack_vars{}, else_branch{} {}
     Value eval(Context* ctx) override {
         Value iter_val = iterable->eval(ctx);
@@ -775,6 +788,7 @@ struct FunctionNode : Node {
     // (round 81): whether every parameter is a plain name, their names, and
     // whether the body yields (-1: not known yet).
     int8_t simple_sig = -1, body_yields = -1;
+    bool names_distinct = false;   // (with simple_sig) no parameter name twice
     std::vector<std::string> param_names;
     FunctionNode(Token t, const std::string& n, node_ptr b, bool m=false) : Node(t, NodeType::FUNCTION), name(n), params{}, body(b), is_method(m), defaults{} {}
     Node* add(node_ptr n) override { params.push_back(n); return this; }
@@ -797,6 +811,7 @@ struct LambdaNode : Node {
     // (bindParamsImpl): this FunctionNode carries its signature (round 77).
     node_ptr sig;
     int8_t simple_sig = -1;                  // round 81, as FunctionNode's
+    bool names_distinct = false;
     std::vector<std::string> param_names;
     LambdaNode(Token t, node_ptr b) : Node(t, NodeType::LAMBDA), params{}, body(b), defaults{} {}
     Node* add(node_ptr n) override { params.push_back(n); return this; }

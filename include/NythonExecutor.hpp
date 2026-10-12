@@ -47,6 +47,7 @@
 #include <sstream>
 #include <ctime>
 #include <functional>
+#include <charconv>   // round 81: std::to_chars (list keys)
 #include "NyBigInt.hpp"
 #include "NyRange.hpp"   // range objects and dict views (round 78)
 #include "NyStr.hpp"
@@ -253,6 +254,8 @@ Value dispatch_gui      (NythonExecutor& E, const std::string& name, std::vector
 Value dispatch_text     (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_lang     (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_pycore   (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
+// isinstance (round 81: called by callBuiltin directly; builtins/tensor.cpp)
+Value builtin_isinstance(NythonExecutor& E, std::vector<Value>& args, Context* ctx);
 
 
 struct NythonExecutor;
@@ -1075,13 +1078,17 @@ public:   // NythonExecutor is a struct: members default to public
             case NodeType::SELF: {
                 // `this` in a def whose first parameter is this: that
                 // parameter, however the method was bound (round 78)
-                if (node->tok().value == "this") {   // (round 81: no Token copy)
-                    static const std::string kThis = "this";   // (round 81: no std::string made per read)
-                    Value tv = ctx->getByName(kThis);
+                // (round 81: no Token copy, no std::string made per read, and
+                // the node's caches of where the names were found)
+                auto* sn = static_cast<SelfNode*>(node.get());
+                if (__builtin_expect(sn->is_this < 0, 0)) sn->is_this = node->tok().value == "this" ? 1 : 0;
+                if (sn->is_this) {
+                    static const std::string kThis = "this";
+                    Value tv = lookupName(kThis, sn->nc_this, ctx);
                     if (tv.type != ValueType::UNDEFINED) return tv;
                 }
                 static const std::string kSelf = "self";
-                return ctx->getByName(kSelf);
+                return lookupName(kSelf, sn->nc_self, ctx);
             }
             case NodeType::SUPER: return ctx->getByName("super");
             case NodeType::WALRUS: {
@@ -1241,21 +1248,21 @@ public:   // NythonExecutor is a struct: members default to public
     // here with the node's cache (round 81): the name hashed once, and the
     // slot it was found in last tried first at that depth (the key still
     // there makes it the entry). The scopes before it are searched as ever.
-    Value lookupName(VariableNode* vn, Context* c) {
-        if (!astSpecOn()) return c->getByName(vn->name);
-        const std::string& n = vn->name;
-        if (__builtin_expect(!vn->hashed, 0)) { vn->name_hash = ContainerType::hash_key(n); vn->hashed = true; }
+    Value lookupName(VariableNode* vn, Context* c) { return lookupName(vn->name, vn->nc, c); }
+    Value lookupName(const std::string& n, NameCache& nc, Context* c) {
+        if (!astSpecOn()) return c->getByName(n);
+        if (__builtin_expect(!nc.hashed, 0)) { nc.hash = ContainerType::hash_key(n); nc.hashed = true; }
         unsigned d = 0;
         for (;;) {
             const ContainerType* m = c->container;
             if (!m) return NONE_VALUE;
-            if (d == vn->hint_depth) {
-                const ContainerType::value_type* kv = m->slot_at(vn->hint_slot);
+            if (d == nc.depth) {
+                const ContainerType::value_type* kv = m->slot_at(nc.slot);
                 if (kv && kv->first == n) return kv->second;
             }
-            long s = m->index_of_h(n, vn->name_hash);
+            long s = m->index_of_h(n, nc.hash);
             if (s >= 0) {
-                if (d < 0xFF) { vn->hint_depth = (uint8_t)d; vn->hint_slot = (uint32_t)s; }
+                if (d < 0xFF) { nc.depth = (uint8_t)d; nc.slot = (uint32_t)s; }
                 return m->slot_at((size_t)s)->second;
             }
             if (!c->parent) return UNDEFINED_VALUE;
@@ -1378,7 +1385,9 @@ public:   // NythonExecutor is a struct: members default to public
             auto* sub = static_cast<SubscriptNode*>((an->target).get());
             Value obj = evalNode(sub->object, ctx);
             Value idx = evalNode(sub->index, ctx);
-            setItem(obj, idx, val, ctx);
+            // a list's item by an int index (round 81)
+            ContainerType::value_type* kv = astSpecOn() ? seqItemSlot(obj, idx, sub->slot_off, true) : nullptr;
+            if (kv) kv->second = val; else setItem(obj, idx, val, ctx);
         } else if (an->target->type() == NodeType::CALL) {
             // Slice assignment: arr[1:3] = [20, 30] is parsed as arr.slice(1,3) = [20,30]
             auto* cn = static_cast<CallNode*>((an->target).get());
@@ -1748,14 +1757,63 @@ public:   // NythonExecutor is a struct: members default to public
         return c->container ? c : nullptr;
     }
     // Length of a list/tuple/set container, -1 if it is not one.
+    // (round 81: the marker keys' hashes are computed once - a list read
+    // asked for "__len__", "__set__" and "__tuple__" by hashing each again)
+    struct MarkerKey {
+        std::string key; uint64_t hash;
+        explicit MarkerKey(const char* k) : key(k), hash(ContainerType::hash_key(k)) {}
+    };
+    static const MarkerKey& kLenKey() { static const MarkerKey k("__len__"); return k; }
+    static const MarkerKey& kTupleKey() { static const MarkerKey k("__tuple__"); return k; }
+    static const MarkerKey& kSetKey() { static const MarkerKey k("__set__"); return k; }
+    static const MarkerKey& kGenKey() { static const MarkerKey k("__gen__"); return k; }
+    static bool hasMarker(Container* c, const MarkerKey& k) { return c->container->index_of_h(k.key, k.hash) >= 0; }
     static int64_t seqLen(Container* c) {
-        auto it = c->container->find("__len__");
-        if (it == c->container->end()) return -1;
-        return bigint_to_i64(it->second.value.i);
+        const MarkerKey& k = kLenKey();
+        long s = c->container->index_of_h(k.key, k.hash);
+        if (s < 0) return -1;
+        return bigint_to_i64(c->container->slot_at((size_t)s)->second.value.i);
     }
-    static bool isTupleCont(Container* c) { return c->container->count("__tuple__") > 0; }
-    static bool isSetCont(Container* c) { return c->container->count("__set__") > 0; }
-    static bool isGenCont(Container* c) { return c->container->count("__gen__") > 0; }
+    static bool isTupleCont(Container* c) { return hasMarker(c, kTupleKey()); }
+    static bool isSetCont(Container* c) { return hasMarker(c, kSetKey()); }
+    static bool isGenCont(Container* c) { return hasMarker(c, kGenKey()); }
+    // ── list[i] and list[i] = v (round 81) ──────────────────────────────
+    // A list or tuple holds its items under "0", "1" ...: getItem and
+    // setItem look the decimal key up after their other checks. For an int
+    // index into one (not a set, generator, dict or object) in range, these
+    // do what those do, the key spelled without a std::string and its slot
+    // guessed from the index plus the offset the site saw last (lists keep
+    // their items in order, after or before their markers).
+    static std::string_view decKey(int64_t j, char* buf) {
+        auto r = std::to_chars(buf, buf + 24, j);
+        return std::string_view(buf, (size_t)(r.ptr - buf));
+    }
+    static ContainerType::value_type* seqSlot(ContainerType* m, int64_t j, int8_t& off) {
+        char buf[24];
+        std::string_view key = decKey(j, buf);
+        ContainerType::value_type* kv = m->slot_at_mut((size_t)(j + off));
+        if (kv && kv->first == key) return kv;
+        long s = m->index_of(key);
+        if (s < 0) return nullptr;
+        long d = s - (long)j;
+        if (d >= -100 && d <= 100) off = (int8_t)d;
+        return m->slot_at_mut((size_t)s);
+    }
+    // The container of a list or tuple an int index reads in range, with
+    // its slot; nullptr when getItem's general path must answer.
+    ContainerType::value_type* seqItemSlot(const Value& obj, const Value& idx, int8_t& off, bool store) {
+        if (idx.type != ValueType::INTEGER || obj.type != ValueType::COLLECTABLE) return nullptr;
+        Container* c = contOf(obj);
+        if (!c || nygen::is_gen(obj)) return nullptr;
+        int64_t n = seqLen(c);
+        if (n < 0 || isSetCont(c)) return nullptr;
+        if (store && isTupleCont(c)) return nullptr;
+        int64_t i;
+        if (!bigint_fits_i64(idx.value.i, i)) return nullptr;
+        int64_t j = i < 0 ? i + n : i;
+        if (j < 0 || j >= n) return nullptr;
+        return seqSlot(c->container, j, off);
+    }
     bool isInstanceVal(const Value& v) const {
         if (v.type != ValueType::USERDATA) return false;
         switch (heapKind(v)) {   // round 81
@@ -2563,9 +2621,14 @@ public:   // NythonExecutor is a struct: members default to public
         auto* an = static_cast<AugAssignNode*>((node).get());
         const std::string& op = an->op;
         if (op == "?\?=") return evalCoalesceAssign(an, ctx);
-        std::string base = op.substr(0, op.size() > 0 ? op.size() - 1 : 0);
-        if (op == ">>>=") base = ">>";
-        int opc = binOpCode(base);
+        // the operator's code, worked out from its text once (round 81)
+        if (__builtin_expect(an->opc < 0, 0)) {
+            std::string base = op.substr(0, op.size() > 0 ? op.size() - 1 : 0);
+            if (op == ">>>=") base = ">>";
+            an->opc = (int8_t)binOpCode(base);
+            an->plain_op = op != "~=" && op != "@=";
+        }
+        const int opc = an->opc;
         // Target: read its current value, remembering where to store.
         Value obj, idx, old_val;
         int kind = an->target->type() == NodeType::SUBSCRIPT ? 1 : an->target->type() == NodeType::ATTRIBUTE ? 2 : 0;
@@ -2573,7 +2636,8 @@ public:   // NythonExecutor is a struct: members default to public
             auto* sub = static_cast<SubscriptNode*>((an->target).get());
             obj = evalNode(sub->object, ctx);
             idx = evalNode(sub->index, ctx);
-            old_val = getItem(obj, idx, ctx);
+            ContainerType::value_type* kv = astSpecOn() ? seqItemSlot(obj, idx, sub->slot_off, false) : nullptr;   // round 81
+            old_val = kv ? kv->second : getItem(obj, idx, ctx);
         } else if (kind == 2) {
             auto* attr = static_cast<AttributeNode*>((an->target).get());
             obj = evalNode(attr->object, ctx);
@@ -2583,6 +2647,13 @@ public:   // NythonExecutor is a struct: members default to public
         }
         Value new_val = evalNode(an->value_node, ctx);
         Value result;
+        // Two numbers (round 81): binaryOp's answer without its other checks
+        // (no container, bytes or object is involved), then the store.
+        if (astSpecOn() && an->plain_op && opc != OP_UNKNOWN && isNumType(old_val.type) && isNumType(new_val.type)
+            && numBinary(opc, old_val, new_val, result)) {
+            storeAugTarget(an, kind, obj, idx, result, ctx);
+            return result;
+        }
         Container* oc = contOf(old_val);
         if (op == "~=") {
             // `x ~= y` assigns the bitwise complement of the right operand
@@ -2652,11 +2723,23 @@ public:   // NythonExecutor is a struct: members default to public
                 else result = binaryOp(opc, old_val, new_val, ctx);
             }
         }
-        if (kind == 1) setItem(obj, idx, result, ctx);
-        else if (kind == 2) setAttr(obj, static_pointer_cast<AttributeNode>(an->target)->attr, result);
+        storeAugTarget(an, kind, obj, idx, result, ctx);
+        return result;
+    }
+    // The store of `t op= v`: an item, an attribute (an instance's field
+    // through the target's cache - round 81) or a name.
+    void storeAugTarget(AugAssignNode* an, int kind, const Value& obj, const Value& idx, const Value& result, Context* ctx) {
+        if (kind == 1) {
+            auto* sub = static_cast<SubscriptNode*>(an->target.get());
+            ContainerType::value_type* kv = astSpecOn() ? seqItemSlot(obj, idx, sub->slot_off, true) : nullptr;   // round 81
+            if (kv) kv->second = result; else setItem(obj, idx, result, ctx);
+        }
+        else if (kind == 2) {
+            auto* at = static_cast<AttributeNode*>(an->target.get());
+            if (!(astSpecOn() && heapKind(obj) == HK_INST && storeFast(at, obj, result))) setAttr(obj, at->attr, result);
+        }
         else if (an->target->type() == NodeType::VARIABLE)
             assignName(static_cast<VariableNode*>(an->target.get()), result, ctx);
-        return result;
     }
 
     // t ??= v: v is evaluated and assigned only when t is absent - none or
@@ -3891,6 +3974,8 @@ public:   // NythonExecutor is a struct: members default to public
         auto* sn = static_cast<SubscriptNode*>((node).get());
         Value obj = evalNode(sn->object, ctx);
         Value idx = evalNode(sn->index, ctx);
+        if (astSpecOn())   // a list's item by an int index (round 81)
+            if (ContainerType::value_type* kv = seqItemSlot(obj, idx, sn->slot_off, false)) return kv->second;
         return getItem(obj, idx, ctx);
     }
 
@@ -4776,8 +4861,22 @@ public:   // NythonExecutor is a struct: members default to public
         // list, got none forever and never ended.)
         // A range of 64-bit ints (round 78): counted, no iterator object.
         if (counted) {
+            // round 81: a plain local loop variable is stored straight into
+            // its slot (defineByName's store, the slot remembered by the node)
+            const bool plain_var = astSpecOn() && fn->unpack_vars.empty() && !fn->rebinds
+                && !(fn->var && fn->var->type() == NodeType::VARIABLE && static_cast<VariableNode*>(fn->var.get())->global_ref);
             for (int64_t i = 0; i < r_n; i++) {
                 NY_PYT_HEAD(i > 0)
+                if (plain_var && ctx->container && !ctx->storeHook) {
+                    ContainerType* m = ctx->container;
+                    if (ContainerType::value_type* kv = m->slot_at_mut(fn->var_hint); kv && kv->first == var_name)
+                        kv->second = intValue(nyrt::range_at(r_first, r_step, i));
+                    else {
+                        (*m)[var_name] = intValue(nyrt::range_at(r_first, r_step, i));
+                        long s = m->index_of(var_name);
+                        if (s >= 0) fn->var_hint = (uint32_t)s;
+                    }
+                } else
                 bindv(var_name, intValue(nyrt::range_at(r_first, r_step, i)));
                 try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
                 catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
@@ -7238,6 +7337,23 @@ public:   // NythonExecutor is a struct: members default to public
         e->fn = fn; e->owner = owner; e->m_p = m.value.p; e->m_o = (void*)m.value.o;
         e->owner_ctx = octx; e->owner_slot = (uint32_t)slot;
         e->prefix = std::move(prefix);
+        // __parent_class__: the interned string's entry (interned_ keeps it
+        // for the executor's life, at a stable address)
+        e->parent_name = nullptr;
+        auto* ocn = static_cast<ClassNode*>(owner);
+        if (!ocn->bases.empty()) {
+            std::string pn = ocn->bases[0]->value();
+            internString(pn);
+            e->parent_name = &interned_.find(pn)->second;
+        }
+        // the scope's names - self, this, the parameters, __parent_class__ -
+        // are distinct, so a fresh scope takes them without lookups
+        bool ok = fn->names_distinct;
+        for (size_t i = 1; ok && i < names->size(); i++) {
+            const std::string& pn = (*names)[i];
+            if (pn == "self" || pn == "this" || pn == "__parent_class__") ok = false;
+        }
+        e->append_ok = ok;
         return e;
     }
     // Whether none of these class namespaces holds `name`: a namespace
@@ -7361,11 +7477,19 @@ public:   // NythonExecutor is a struct: members default to public
         const std::vector<std::string>& names = fn->param_names;
         Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
         CtxReaper _reap(this, fc);
-        fc->defineByName("self", obj);
-        if (names[0] == "this") fc->defineByName("this", obj);
-        for (size_t i = 1; i < names.size(); i++) fc->defineByName(names[i], argv[i - 1]);
-        auto* ocn = static_cast<ClassNode*>(owner);
-        if (!ocn->bases.empty()) fc->defineByName("__parent_class__", internString(ocn->bases[0]->value()));
+        static const std::string kSelf = "self", kThis = "this", kParent = "__parent_class__";
+        if (e->append_ok) {
+            ContainerType* m2 = fc->container;
+            m2->append_new(kSelf, Value(obj));
+            if (names[0] == kThis) m2->append_new(kThis, Value(obj));
+            for (size_t i = 1; i < names.size(); i++) m2->append_new(names[i], Value(argv[i - 1]));
+            if (e->parent_name) m2->append_new(kParent, Value(*e->parent_name));
+        } else {
+            fc->defineByName(kSelf, obj);
+            if (names[0] == kThis) fc->defineByName(kThis, obj);
+            for (size_t i = 1; i < names.size(); i++) fc->defineByName(names[i], argv[i - 1]);
+            if (e->parent_name) fc->defineByName(kParent, *e->parent_name);
+        }
         OwnerScope _os(owner_stack_, owner);
         out = runFunctionBody(fn, fc);
         return true;
@@ -7397,18 +7521,34 @@ public:   // NythonExecutor is a struct: members default to public
             }
             return true;
         };
+        auto distinct = [](const std::vector<std::string>& names) {
+            for (size_t i = 0; i < names.size(); i++)
+                for (size_t j = i + 1; j < names.size(); j++) if (names[i] == names[j]) return false;
+            return true;
+        };
         if (code->type() == NodeType::FUNCTION) {
             auto* fn = static_cast<FunctionNode*>(code);
-            if (__builtin_expect(fn->simple_sig < 0, 0)) fn->simple_sig = analyse(fn->params, fn->param_names) ? 1 : 0;
+            if (__builtin_expect(fn->simple_sig < 0, 0)) {
+                fn->simple_sig = analyse(fn->params, fn->param_names) ? 1 : 0;
+                fn->names_distinct = fn->simple_sig && distinct(fn->param_names);
+            }
             return fn->simple_sig ? &fn->param_names : nullptr;
         }
         if (code->type() == NodeType::LAMBDA) {
             auto* lam = static_cast<LambdaNode*>(code);
-            if (__builtin_expect(lam->simple_sig < 0, 0))
+            if (__builtin_expect(lam->simple_sig < 0, 0)) {
                 lam->simple_sig = (lam->posonly == 0 && analyse(lam->params, lam->param_names)) ? 1 : 0;
+                lam->names_distinct = lam->simple_sig && distinct(lam->param_names);
+            }
             return lam->simple_sig ? &lam->param_names : nullptr;
         }
         return nullptr;
+    }
+    // Whether the simple parameters of `code` (simpleParams) are all distinct:
+    // a fresh scope then takes them with append_new, no lookup first.
+    static bool paramsDistinct(Node* code) {
+        return code->type() == NodeType::FUNCTION ? static_cast<FunctionNode*>(code)->names_distinct
+                                                  : static_cast<LambdaNode*>(code)->names_distinct;
     }
 
     void evalCallArgs(const std::vector<node_ptr>& raw_args, Context* ctx,
@@ -8463,7 +8603,10 @@ public:
                 // copied, not moved: the arguments stay referenced until the
                 // call is over, as the general path's argument vector keeps them
                 // (so what they release dies in the same order)
-                for (size_t i = 0; i < na; i++) fc->defineByName((*names)[i], argv[i]);
+                if (paramsDistinct(code))   // a fresh scope, distinct names: appended
+                    for (size_t i = 0; i < na; i++) fc->container->append_new((*names)[i], Value(argv[i]));
+                else
+                    for (size_t i = 0; i < na; i++) fc->defineByName((*names)[i], argv[i]);
                 if (is_def) return runFunctionBody(static_cast<FunctionNode*>(code), fc);
                 return runLambdaBody(static_cast<LambdaNode*>(code), fc);
             }
@@ -8913,6 +9056,10 @@ public:
             result = dispatch_pyrandom(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
             result = dispatch_pyjson(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         }
+        // isinstance: what dispatch_tensor does with it, without the ~600
+        // names compared on the way (the dispatchers before it know no
+        // isinstance; round 81)
+        if (name.size() == 10 && name == "isinstance") return builtin_isinstance(*this, args, ctx);
         // Shared tensor kernels first: they replace the older per-module
         // implementations of the same names (see include/NyTensor.hpp).
         result = dispatch_nt(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
