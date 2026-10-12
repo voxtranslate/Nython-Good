@@ -271,10 +271,10 @@ class IDELive(IDETools):
         self.dbg_doc = d
         self.dbg_run_path = path
         var port = dap_free_port()
-        self.live.watches = self.watches
         self.live.exc_filters = self._live_filters()
         self.live.bp_files = self._live_bp_files()
         self.live.start(port)
+        self.live.watches = self.watches        # (start() clears the session's state)
         self.live_brk_gen = self.brk_gen
         self.live_extra_n = len(self.brk_extra)
         self.live_watch_n = len(self.watches)
