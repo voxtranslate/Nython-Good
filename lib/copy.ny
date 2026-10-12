@@ -122,6 +122,21 @@ def _own_hook(cls, name):
     return false
 
 
+def _user_reduce(cls):
+    # round 83: a __reduce_ex__/__reduce__ a class of the program defines on
+    # top of a builtin type (email.headerregistry's str headers): copy uses
+    # it, as CPython does, instead of the builtin value's own copy
+    for c in cls.__mro__:
+        if c is object or c in (str, int, float, bytes, bytearray, list, dict, set, frozenset, tuple):
+            return false
+        if c.__name__.startswith("_NyB_"):
+            return false
+        var d = copyreg._cdict(c)
+        if "__reduce_ex__" in d or "__reduce__" in d:
+            return true
+    return false
+
+
 def _state_of(x):
     # what __reduce_ex__ would give as the state: the class's __getstate__(),
     # else object.__getstate__'s - the attributes (None when there are
@@ -218,7 +233,7 @@ def copy(x):
 
     See the module's __doc__ string for more info.
     """
-    if _is_instance(x) and not _has_class_attr(x.__class__, "__copy__"):
+    if _is_instance(x) and not _has_class_attr(x.__class__, "__copy__") and not _user_reduce(x.__class__):
         var bv = _builtin_value(x)
         if bv is not none:
             return _copy_valued(x, bv, none)
@@ -300,7 +315,8 @@ def deepcopy(x, memo=none, _nil=[]):
     var y = memo.get(d, _nil)
     if id(y) != id(_nil):
         return y
-    if _is_instance(x) and not _has_class_attr(x.__class__, "__deepcopy__") and _builtin_value(x) is not none:
+    if (_is_instance(x) and not _has_class_attr(x.__class__, "__deepcopy__") and _builtin_value(x) is not none
+            and not _user_reduce(x.__class__)):
         y = _copy_valued(x, _builtin_value(x), memo)
     elif isinstance(x, list):
         y = []

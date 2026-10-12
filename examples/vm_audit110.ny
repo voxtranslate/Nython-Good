@@ -491,6 +491,66 @@ def sqlite_checks():
     shutil.rmtree(d)
 
 
+# ── sqlite3: callbacks from several threads at once ─────────────────────────
+def sqlite_thread_checks():
+    try:
+        import sqlite3
+    except ImportError as e:
+        print("NOTICE: sqlite3 thread checks skipped - " + str(e))
+        return
+    import os
+    import tempfile
+    import threading
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "threads.db")
+    con = sqlite3.connect(path)
+    con.execute("create table t(n)")
+    con.executemany("insert into t values (?)", [(i,) for i in range(200)])
+    con.commit()
+    con.close()
+    results = {}
+    def worker(k):
+        c = sqlite3.connect(path, timeout=30)
+        c.create_function("scale", 1, lambda v: v * k)
+        class Sum:
+            def __init__(self):
+                self.s = 0
+            def step(self, v):
+                self.s += v
+            def finalize(self):
+                return self.s
+        c.create_aggregate("mysum", 1, Sum)
+        c.create_collation("rev", lambda a, b: (a < b) - (a > b))
+        r = c.execute("select mysum(scale(n)) from t").fetchone()[0]
+        r2 = [x[0] for x in c.execute("select cast(n as text) from t where n < 5 order by 1 collate rev")]
+        c.close()
+        results[k] = (r, r2)
+    ts = [threading.Thread(target=worker, args=(k,)) for k in range(1, 5)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    check("sqlite3: callbacks in four threads at once", sorted(results.items()),
+          [(k, (19900 * k, ["4", "3", "2", "1", "0"])) for k in range(1, 5)])
+    shared = sqlite3.connect(path, check_same_thread=False)
+    shared.create_function("twice", 1, lambda v: v * 2)
+    out = []
+    lock = threading.Lock()
+    def user(i):
+        v = shared.execute("select twice(n) from t where n = ?", (i,)).fetchone()[0]
+        with lock:
+            out.append(v)
+    ts = [threading.Thread(target=user, args=(i,)) for i in range(8)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    shared.close()
+    check("sqlite3: one connection shared by threads, with a function", sorted(out), [0, 2, 4, 6, 8, 10, 12, 14])
+    import shutil
+    shutil.rmtree(d)
+
+
 # ── email ────────────────────────────────────────────────────────────────────
 MIME_SAMPLE = (
     "Return-Path: <alice@example.org>\n"
@@ -1831,6 +1891,93 @@ def protocol_checks():
     check("telnetlib", [r, opts, log], [[b'login: ', b'Password: ', [0, b'42'], b' \xff done\r\n$ ', b'bye\r\n'], [(b'\xfd', b'\x18')], [b'user\n', b'p\xff\xffss\n', b'exit\n']])
 
 
+# ── LMTP over a Unix socket, SMTPUTF8 ────────────────────────────────────────
+def lmtp_handler(conn, rfile, send, log):
+    send("220 lmtp.local LMTP ready")
+    rcpts = 0
+    while True:
+        line = rfile.readline()
+        if not line:
+            break
+        line = line.decode("utf-8").rstrip("\r\n")
+        log.append(line)
+        verb = line.split(" ")[0].upper()
+        if verb == "LHLO":
+            send("250-lmtp.local")
+            send("250-8BITMIME")
+            send("250 SMTPUTF8")
+        elif verb == "MAIL":
+            rcpts = 0
+            send("250 OK")
+        elif verb == "RCPT":
+            rcpts = rcpts + 1
+            send("250 OK")
+        elif verb == "DATA":
+            send("354 go")
+            body = []
+            while True:
+                l = rfile.readline()
+                if l == b".\r\n":
+                    break
+                body.append(l)
+            log.append(b"".join(body))
+            for i in range(rcpts):
+                send("250 delivered %d" % (i + 1))
+        elif verb == "QUIT":
+            send("221 bye")
+            break
+        else:
+            send("502 no")
+
+
+def lmtp_checks():
+    import socket
+    import smtplib
+    import threading
+    import tempfile
+    import os
+    import email.message
+    if not hasattr(socket, "AF_UNIX"):
+        print("NOTICE: LMTP checks skipped - no AF_UNIX sockets")
+        return
+    d = tempfile.mkdtemp()
+    path = os.path.join(d, "lmtp.sock")
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    srv.listen(1)
+    log = []
+    def run():
+        conn, addr = srv.accept()
+        rfile = conn.makefile("rb")
+        def send(line):
+            conn.sendall(line.encode("utf-8") + b"\r\n")
+        try:
+            lmtp_handler(conn, rfile, send, log)
+        except Exception as e:
+            log.append("server error: " + str(e))
+        rfile.close()
+        conn.close()
+        srv.close()
+    t = threading.Thread(target=run)
+    t.daemon = True
+    t.start()
+    lm = smtplib.LMTP(path)
+    r = [lm.ehlo("client.local"), lm.does_esmtp, lm.has_extn("smtputf8")]
+    m = email.message.EmailMessage()
+    m["From"] = "Jörg <jörg@example.de>"
+    m["To"] = "a@example.com"
+    m["Subject"] = "Grüße"
+    m.set_content("hallo\n")
+    r.append(lm.send_message(m))
+    r.append(lm.quit())
+    t.join(10)
+    check("smtplib.LMTP over a Unix socket, SMTPUTF8", [r, [x for x in log if isinstance(x, str)]], [[(250, b'lmtp.local\n8BITMIME\nSMTPUTF8'), True, True, {}, (221, b'bye')], ['lhlo client.local', 'mail FROM:<jörg@example.de> SMTPUTF8 BODY=8BITMIME', 'rcpt TO:<a@example.com>', 'data', 'quit']])
+    data = [x for x in log if isinstance(x, bytes)][0]
+    check("smtplib: the SMTPUTF8 message", data.split(b"\r\n")[:3], [b'From: J\xc3\xb6rg <j\xc3\xb6rg@example.de>', b'To: a@example.com', b'Subject: Gr\xc3\xbc\xc3\x9fe'])
+    import shutil
+    shutil.rmtree(d)
+
+
 # ── the protocol clients over TLS (lib/ssl.ny): STARTTLS and implicit TLS ────
 def _make_certs():
     import os
@@ -2098,6 +2245,7 @@ def tls_protocol_checks():
 import warnings as _warnings
 _warnings.simplefilter("ignore", DeprecationWarning)
 section("sqlite3", sqlite_checks)
+section("sqlite3 and threads", sqlite_thread_checks)
 section("email", email_checks)
 section("plistlib", plist_checks)
 section("quopri/uu", quopri_uu_checks)
@@ -2107,6 +2255,7 @@ section("dbm/shelve/mailbox", store_checks)
 section("wsgiref", wsgi_checks)
 section("xmlrpc", xmlrpc_checks)
 section("protocols", protocol_checks)
+section("LMTP", lmtp_checks)
 section("protocols over TLS", tls_protocol_checks)
 
 for r in results:

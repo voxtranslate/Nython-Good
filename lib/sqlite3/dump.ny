@@ -1,7 +1,9 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
 # lib/sqlite3/dump.ny - Python's sqlite3.dump (CPython 3.12's
 # Lib/sqlite3/dump.py): _iterdump(connection), the SQL text
-# Connection.iterdump() yields - the same lines CPython's gives.
+# Connection.iterdump() yields - the same lines CPython's gives. Also from
+# 3.13: filter= (a LIKE pattern for the names of the objects dumped) and a
+# cursor of its own without the connection's row_factory.
 
 # Mimic the sqlite3 console shell's .dump command
 # Author: Paul Kippes <kippesp@gmail.com>
@@ -12,7 +14,7 @@
 # future enhancements, you should normally quote any identifier that
 # is an English language word, even if you do not have to."
 
-def _iterdump(connection):
+def _iterdump(connection, *, filter=None):
     """
     Returns an iterator to the dump of the database in an SQL text format.
 
@@ -23,6 +25,14 @@ def _iterdump(connection):
 
     writeable_schema = False
     cu = connection.cursor()
+    cu.row_factory = None  # (3.13) Make sure we get predictable results.
+    if filter:
+        # (3.13) Return database objects which match the filter pattern.
+        filter_name_clause = 'AND "name" LIKE ?'
+        params = [filter]
+    else:
+        filter_name_clause = ""
+        params = []
     yield('BEGIN TRANSACTION;')
 
     # sqlite_master table contains the SQL CREATE statements for the database.
@@ -31,9 +41,10 @@ def _iterdump(connection):
         FROM "sqlite_master"
             WHERE "sql" NOT NULL AND
             "type" == 'table'
+            """ + filter_name_clause + """
             ORDER BY "name"
         """
-    schema_res = cu.execute(q)
+    schema_res = cu.execute(q, params)
     sqlite_sequence = []
     for table_name, type, sql in schema_res.fetchall():
         if table_name == 'sqlite_sequence':
@@ -77,8 +88,9 @@ def _iterdump(connection):
         FROM "sqlite_master"
             WHERE "sql" NOT NULL AND
             "type" IN ('index', 'trigger', 'view')
+            """ + filter_name_clause + """
         """
-    schema_res = cu.execute(q)
+    schema_res = cu.execute(q, params)
     for name, type, sql in schema_res.fetchall():
         yield('{0};'.format(sql))
 

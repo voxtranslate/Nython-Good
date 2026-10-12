@@ -656,20 +656,22 @@ class Connection:
             raise ProgrammingError("You can only execute one statement at a time.")
         return st
 
+    # the statement cache: least recently used first (CPython's is a
+    # functools.lru_cache of cached_statements entries)
     def _statement(self, sql):
-        st = self._cache.get(sql)
-        if st is not None and st.h:
-            if _sql_busy(st.h):
-                return self._prepare(sql)
-            return st
+        cache = self._cache
+        st = cache.get(sql)
         if st is not None:
+            del cache[sql]
+            cache[sql] = st                      # now the most recently used
+            if st.h and _sql_busy(st.h):
+                return self._prepare(sql)
             return st
         st = self._prepare(sql)
         if self._cache_size > 0:
-            if len(self._cache) >= self._cache_size:
-                for k in list(self._cache.keys())[:max(1, len(self._cache) - self._cache_size + 1)]:
-                    del self._cache[k]
-            self._cache[sql] = st
+            while len(cache) >= self._cache_size:
+                del cache[next(iter(cache))]
+            cache[sql] = st
         return st
 
     def _step(self, st):
@@ -911,10 +913,11 @@ class Connection:
         self._check_open()
         _sql_interrupt(self._h)
 
-    def iterdump(self):
+    def iterdump(self, *, filter=None):
+        # filter= is 3.13's (a LIKE pattern for the objects' names)
         self._check()
         from sqlite3.dump import _iterdump
-        return _iterdump(self)
+        return _iterdump(self, filter=filter)
 
     def backup(self, target, *, pages=-1, progress=None, name="main", sleep=0.250):
         self._check()

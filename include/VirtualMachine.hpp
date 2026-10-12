@@ -6077,7 +6077,19 @@ private:
         const std::string& c=f.class_name;
         std::string n=c.rfind("__builtin__:",0)==0?c.substr(12):c.rfind("__native__:",0)==0?c.substr(11):c;
         if(n.empty()||nyrt::payload_transparent(n)) return;
-        for(auto& a:args){ VMVal p; if(a.type==VMType::INSTANCE&&!iter_overridden(a)&&payload_of(a,p)) a=p; }
+        // round 83: what a builtin container's method stores or gives back
+        // stays the instance it is - list.append(x), list.insert(i, x),
+        // set.add(x), dict.setdefault/get/pop(k, d) (a str subclass appended
+        // to a list subclass came back a plain str: email's TokenList)
+        size_t keep_from=args.size();
+        if(n.rfind("__bmethod__:",0)==0){
+            static const std::unordered_set<std::string> stores={"__bmethod__:list.append","__bmethod__:set.add"};
+            static const std::unordered_set<std::string> second={"__bmethod__:list.insert","__bmethod__:dict.setdefault",
+                                                                  "__bmethod__:dict.get","__bmethod__:dict.pop"};
+            if(stores.count(n)) return;
+            if(second.count(n)) keep_from=1;
+        }
+        for(size_t i=0;i<args.size()&&i<keep_from;i++){ auto& a=args[i]; VMVal p; if(a.type==VMType::INSTANCE&&!iter_overridden(a)&&payload_of(a,p)) a=p; }
     }
     // A class with an __iter__ of its own (Flag's, a list subclass's): a
     // native is given the instance and iterates it through that, as

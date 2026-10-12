@@ -30,7 +30,16 @@ Public functions:       Internaldate2tuple
 
 __version__ = "2.58"
 
-import binascii, errno, random, re, socket, subprocess, sys, time, calendar
+import binascii, random, re, socket, subprocess, sys, time, calendar
+try:
+    import errno
+except ImportError:
+    # (Nython: the errno value this module needs, where there is no errno
+    # module yet - Linux's, macOS's and Windows' own numbers)
+    import types as _types
+    errno = _types.SimpleNamespace(ENOTCONN=10057 if sys.platform == "win32" else
+                                   57 if sys.platform == "darwin" else 107)
+    del _types
 from datetime import datetime, timezone, timedelta
 from io import DEFAULT_BUFFER_SIZE
 
