@@ -10420,6 +10420,7 @@ private:
     // message (round 77, NythonExecutor::excArgsFromMessage): an OSError's
     // errno and filenames, a codec error's fields, a KeyError's key.
     std::vector<VMVal> exc_args_from_message(const std::string& type, const std::string& msg) {
+        if(msg.empty()) return {};   // Type(): empty args, as CPython (round 82)
         int kind=nython::ny_exc_kind([&](const char* b){ return class_derives(type,b); });
         if(kind==nython::NYX_OS){
             nython::NyErrnoParts ep;

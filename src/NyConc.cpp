@@ -367,6 +367,10 @@ static void check_cancel_locked(ThreadRec* self) {
             self->has_cancel_msg = false;
             raise("CancelledError", self->cancel_msg);
         }
+        // a task cancelled without a message: CancelledError() with empty
+        // args, as CPython's (round 82; it carried "thread 'task-f' was
+        // cancelled"); a plain thread keeps its text
+        if (self->task) raise("CancelledError", "");
         raise("CancelledError", "thread " + self->label() + " was cancelled");
     }
 }
@@ -1530,7 +1534,7 @@ static bool task_cancel_locked(Task* t) {
         auto& r = t->loop->ready;
         r.erase(std::remove(r.begin(), r.end(), t), r.end());
         task_finish_locked(t, nullptr, true, NyError::make("CancelledError",
-            t->has_cancel_msg ? t->cancel_msg : "task '" + t->name + "' was cancelled"));   // round 82: cancel(msg)
+            t->has_cancel_msg ? t->cancel_msg : std::string()));   // round 82: cancel(msg); none: empty args
         return true;
     }
     if (t->thr) {
@@ -2154,6 +2158,16 @@ static std::unordered_map<std::string, Handler>& table() {
         };
         T["thread_id"] = [](Engine& e, const Args&) { return Ret::integer(current(e)->id); };
         T["thread_current"] = T["thread_id"];
+        // thread_os_id(): the OS thread's record id - inside an async task,
+        // the thread running its loop (a task has a record of its own;
+        // CPython's get_ident() in a coroutine is the thread's). round 82:
+        // sys.set_asyncgen_hooks keys its per-thread hooks by it.
+        T["thread_os_id"] = [](Engine& e, const Args&) {
+            ThreadRec* self = current(e);
+            std::lock_guard<std::mutex> l(RT().m);
+            if (self->task && self->task->loop && self->task->loop->thread) return Ret::integer(self->task->loop->thread->id);
+            return Ret::integer(self->id);
+        };
         T["thread_main"] = [](Engine& e, const Args&) { current(e); return Ret::integer(RT().main_id); };
         T["thread_name"] = [](Engine& e, const Args& a) {
             ThreadRec* self = current(e);

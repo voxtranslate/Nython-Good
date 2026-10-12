@@ -3,7 +3,8 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 82, part C — **§0u** (NyxAI: lib/aiagent.ny made a programming agent that works offline - BM25F retrieval, program facts from the real parser (`ny_facts`), a rule engine, test generation, docstrings, review and fixes, a completion model - and the IDE's AGENT view; vm_audit105, e2e `agent`).
+Last updated: round 82, follow-ups — **§0u4** (asyncio where part B left it different from CPython - TaskGroup groups, wait(), CancelledError(), the default executor, create_server(None), sendfile, pipes, async generator hooks; a `gc` module; `fileno()` the OS descriptor; vm_audit106).
+Round 82, part C — **§0u** (NyxAI: lib/aiagent.ny made a programming agent that works offline - BM25F retrieval, program facts from the real parser (`ny_facts`), a rule engine, test generation, docstrings, review and fixes, a completion model - and the IDE's AGENT view; vm_audit105, e2e `agent`).
 Round 82, part B — **§0u2** (asyncio's missing half: the event-loop API over a persistent native loop, transports and protocols over TCP/UDP/Unix with flow control, streams rebuilt on StreamReaderProtocol, subprocesses waited for on the reactor, add_signal_handler and asyncio.run's Ctrl+C, TLS and start_tls, 3.12's cancellation rules, eager tasks, structured-concurrency reports; a GC heap-sampling fix that made many tasks quadratic, a VM break/continue-out-of-except leak; vm_audit104).
 Round 81, follow-ups — **§0t4** (gaps the round's agents found: class lambdas bound, `del C.m`, `list.pop`'s index, UnboundLocalError, set iterators; a package's `__spec__` on Windows; vm_audit102).
 Round 81, part A — **§0t** (the semantic gaps round 80 left:
@@ -79,6 +80,90 @@ multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
 
 ---
+
+## 0u4. Round 82, follow-ups — asyncio as CPython, a `gc` module, real file descriptors (vm_audit106)
+
+`examples/vm_audit106.ny` (25 checks) passes on both engines and under
+python3 (3.11). Part B's report listed what it left different from
+CPython or out; done here, each reproduced first:
+
+- **TaskGroup** raises every failure as a `BaseExceptionGroup` (an
+  ExceptionGroup when all are Exceptions), a single one included - it
+  raised a lone failure bare - with the children's errors in the order they
+  failed and the body's last (it put the body's first); a child's
+  SystemExit/KeyboardInterrupt is raised as itself; a failed child aborts
+  the group from the loop (`call_soon`), as CPython's done callback does,
+  so two children failing in one step both report (`except*` sees both).
+  vm_audit67 was adapted (one failure is a group of one).
+- **`wait()` refuses coroutines** (3.11: "Passing coroutines is forbidden,
+  use tasks explicitly.").
+- **`task.cancel()` without a message** gives `CancelledError()` with empty
+  args (the runtime's "thread 'task-f' was cancelled" text was the
+  argument): `check_cancel_locked` raises an empty message for a task, and
+  **both engines now make a runtime error with no message `Type()`**
+  (`excArgsFromMessage` / `exc_args_from_message`: empty args; StopIteration
+  and GeneratorExit already were). vm_audit49 (the native async API) checked
+  that str(e) mentioned "cancelled"; it now checks the type.
+- **The default executor** is a `concurrent.futures.ThreadPoolExecutor`
+  (`thread_name_prefix="asyncio"`), made on first use (it was a thread per
+  call; `_DefaultExecutor` is gone).
+- **`create_server(host=None)`** listens on every wildcard address
+  getaddrinfo gives (IPv4 and IPv6; it bound 0.0.0.0 only), skipping a
+  family the host cannot open (this container has no IPv6 sockets -
+  CPython does the same).
+- **`loop.sock_sendfile`** (the kernel's `os.sendfile` where there is one,
+  falling back to reading blocks, `fallback=`), **`loop.sendfile`** through a
+  transport (CPython's `_SendfileFallbackProtocol`: reading paused, writing
+  paced by the transport's flow control, the protocol restored after) and
+  the parameter checks; **`os.sendfile(out, in, offset, count)`** is new
+  (Linux/macOS, `src/builtins/os_fd.cpp` + the prelude's POSIX members).
+- **`loop.connect_read_pipe` / `connect_write_pipe`** with CPython's
+  `unix_events` pipe transports (`_UnixReadPipeTransport`,
+  `_UnixWritePipeTransport`: non-blocking fd, add_reader/add_writer,
+  write buffering with flow control, the reader's end closing seen as the
+  write end becoming readable); POSIX only (NotImplementedError on Windows).
+- **Async generator hooks**: `sys.set_asyncgen_hooks` /
+  `get_asyncgen_hooks` (an `asyncgen_hooks` struct sequence; per OS thread,
+  keyed by the new native `thread_os_id()` - inside a task `thread_id()` is
+  the task's own record, so the loop's thread is what CPython's thread
+  state stands for). The prelude's `_NyAsyncGen` calls firstiter on its
+  first step (`__anext__`/`asend`/`athrow`/`aclose`, and `async for`
+  through `_ny_aiter`) and the finalizer from `__del__` when it has not
+  finished. The loop installs its hooks while it runs (as CPython's
+  `run_forever`), keeps started generators in a WeakSet, and
+  `shutdown_asyncgens()` closes them (it closed nothing) - so `asyncio.run`
+  runs the `finally` of a generator the program abandoned.
+- **A `gc` module** (`lib/gc.ny`; there was none - `import gc` failed):
+  enable/disable/isenabled, collect(generation) with `callbacks`,
+  get_count/get_threshold/set_threshold/get_stats, garbage, is_tracked,
+  freeze, get/set_debug, over the engines' `gc_*` builtins (its header says
+  what is approximated: collect is always full, get_objects/get_referrers
+  are not provided).
+- **Found on the way: a file object's `fileno()` was its handle number**
+  (1000 and up), not the OS descriptor, on both engines - `os.*` accepted it
+  (`fd_arg` maps handles), but `select`/`poll` took it literally, saw an
+  invalid descriptor and reported it ready (the write-pipe transport closed
+  itself at once). `NythonFile.fileno()` now returns the descriptor (new
+  native `file_fileno`, `src/builtins/io.cpp`); `fd_arg` still accepts a
+  handle number.
+
+### Verified
+- vm_audit106 25/25 on both engines and under python3; vm_audit67, 104, 49,
+  97, 76, 77, 93 on both engines; `python3 tools/sweep.py` 437 runs, only
+  vm_audit49's pinned message failing (adapted, then 54/54 on both
+  engines); `tools/ide_e2e.py` 463 passed; `ide_memprobe --check` passes;
+  lint, classcheck, cbp clean.
+
+### Not done
+- "Task exception was never retrieved" is not reported: the runtime does
+  not record whether a task's error was observed by an `await` (the library
+  only sees `result()`/`exception()`), so a `__del__` report would have
+  false positives. Needs a flag in NyConc's Task set when its error is
+  delivered.
+- Native handles of asyncio's Event/Lock/Queue (NyConc events, semaphores,
+  queues) are still never freed (part B's finding).
+- `threading.get_ident()` inside a task is still the task's record id
+  (CPython: the thread's); only the asyncgen hooks use `thread_os_id()`.
 
 ## 0u. Round 82, part C — NyxAI, a programming agent that works offline (vm_audit105, e2e `agent`)
 

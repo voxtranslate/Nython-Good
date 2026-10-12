@@ -179,8 +179,10 @@ async def cancel_main():
     try:
         await t
     except e:
-        msg = str(e)
-    return [task_cancelled(t), contains(msg, "cancelled")]
+        # a task cancelled without a message gets CancelledError() - empty
+        # args, as CPython's (round 82; the runtime's text was the message)
+        msg = type(e).__name__
+    return [task_cancelled(t), contains(msg, "Cancelled")]
 log = []
 check("task_cancel", async_run(cancel_main()), [true, true])
 

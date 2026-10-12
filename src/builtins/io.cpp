@@ -354,6 +354,20 @@ Value dispatch_io(NythonExecutor& E,
             auto it = file_handles.find((int)h);
             return it == file_handles.end() ? nullptr : it->second;
         };
+        // file_fileno(h): the OS descriptor under an open file (round 82: a
+        // file object's fileno() gave its handle number, 1000 and up, which
+        // select/poll and the OS do not know; os.* functions still take
+        // either, through fd_arg)
+        if (name == "file_fileno") {
+            FILE* f = file_of(0);
+            if (!f) return nyos::make_int(-1);
+            std::fflush(f);
+#ifdef _WIN32
+            return nyos::make_int((long long)_fileno(f));
+#else
+            return nyos::make_int((long long)::fileno(f));
+#endif
+        }
         if (name == "file_close" || name == "fclose") {
             if (args.empty()) return Value(false);
             long long h = handle_of(E, args[0]);

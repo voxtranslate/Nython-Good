@@ -126,7 +126,10 @@ class NythonFile:
             file_close(self.handle)
 
     def fileno(self):
-        return self.handle
+        # the OS descriptor, as CPython's (round 82: it was the handle number)
+        if self.closed:
+            raise ValueError("I/O operation on closed file")
+        return file_fileno(self.handle)
 
     def __enter__(self):
         return self
@@ -1735,29 +1738,80 @@ def _ny_await_iter(g):
 # asend, athrow and aclose return awaitables of one step of it (Python's
 # async_generator_asend / async_generator_athrow), which can also be driven
 # by hand. `async for` reads the generator directly.
+# sys.set_asyncgen_hooks / get_asyncgen_hooks (round 82): firstiter is
+# called with an async generator when it is first stepped, finalizer when
+# one that has not finished is collected - asyncio's loop uses them to close
+# the generators a program abandoned (loop.shutdown_asyncgens). Kept per
+# thread, as CPython keeps them in the thread state.
+_ny_agen_hooks_by_thread = {}
+_ny_agen_unset = object()
+
+def _ny_agen_hooks_now():
+    return _ny_agen_hooks_by_thread.get(thread_os_id(), (None, None))
+
+def _ny_set_asyncgen_hooks(firstiter=_ny_agen_unset, finalizer=_ny_agen_unset):
+    if finalizer is not _ny_agen_unset and finalizer is not None and not callable(finalizer):
+        raise TypeError("callable finalizer expected, got " + type(finalizer).__name__)
+    if firstiter is not _ny_agen_unset and firstiter is not None and not callable(firstiter):
+        raise TypeError("callable firstiter expected, got " + type(firstiter).__name__)
+    var cur = _ny_agen_hooks_now()
+    var fi = cur[0] if firstiter is _ny_agen_unset else firstiter
+    var fn = cur[1] if finalizer is _ny_agen_unset else finalizer
+    _ny_agen_hooks_by_thread[thread_os_id()] = (fi, fn)
+
+def _ny_get_asyncgen_hooks():
+    var cur = _ny_agen_hooks_now()
+    return _NySysAsyncGenHooks((cur[0], cur[1]))
+
 class _NyAsyncGen:
     def __init__(self, g, name="", qualname=""):
         self._g = g
         self._ny_running = False
+        self._ny_hooked = False      # firstiter called, finalizer taken (round 82)
+        self._ny_finalizer = None
+        self._ny_closed = False      # finished or closed: nothing for a finalizer to do
         self.__name__ = name
         self.__qualname__ = qualname
+
+    def _ny_init_hooks(self):
+        if self._ny_hooked:
+            return
+        self._ny_hooked = True
+        var h = _ny_agen_hooks_now()
+        if h[1] is not None:
+            self._ny_finalizer = h[1]
+        if h[0] is not None:
+            h[0](self)
+
+    def __del__(self):
+        # an unfinished generator collected: its finalizer (asyncio's
+        # schedules aclose() on its loop), as CPython's _PyGen_Finalize
+        var fin = self._ny_finalizer
+        if fin is not None and not self._ny_closed:
+            self._ny_finalizer = None
+            fin(self)
 
     def __aiter__(self):
         return self
 
     def __anext__(self):
+        self._ny_init_hooks()
         return _NyAGenASend(self, 0, None)
 
     def asend(self, value):
+        self._ny_init_hooks()
         return _NyAGenASend(self, 0, value)
 
     def athrow(self, typ, val=None, tb=None):
+        self._ny_init_hooks()
         return _NyAGenAThrow(self, 1, _ny_exc_of(typ, val, tb))
 
     def aclose(self):
+        self._ny_init_hooks()
         return _NyAGenAThrow(self, 2, None)
 
     def __iter__(self):
+        self._ny_init_hooks()
         return self._g
 
     @property
@@ -1800,13 +1854,19 @@ def _ny_agen_step(ag, mode, value):
             return ag._g.send(value)
         if mode == 1:
             return ag._g.throw(value)
+        ag._ny_closed = true
         try:
             ag._g.close()
         except RuntimeError:
             raise RuntimeError("async generator ignored GeneratorExit")
         return None
     except StopIteration:
+        ag._ny_closed = true
         raise StopAsyncIteration()
+    except BaseException:
+        if ag._g.gi_frame is None:      # an error ended it
+            ag._ny_closed = true
+        raise
     finally:
         ag._ny_running = false
 
@@ -1844,6 +1904,7 @@ def _ny_adrive(it):
 
 def _ny_aiter(o):
     if isinstance(o, _NyAsyncGen):
+        o._ny_init_hooks()     # async for steps it: the hooks run (round 82)
         return o._g
     if hasattr(o, "__aiter__"):
         return _ny_adrive(o.__aiter__())
@@ -3080,6 +3141,16 @@ def _ny_module_spec_attr(module, attr):
 
 # ── sys's Python members (round 80): the engines make the sys module and
 # call _ny_sys_extend(sys) once ─────────────────────────────────────────
+class _NySysAsyncGenHooks(_NyStructSeq):
+    __module__ = "sys"
+    _ny_qual = "asyncgen_hooks"
+    _ny_names = ("firstiter", "finalizer")
+    n_sequence_fields = 2
+    n_fields = 2
+    n_unnamed_fields = 0
+_NySysAsyncGenHooks.__name__ = "asyncgen_hooks"
+_NySysAsyncGenHooks.__qualname__ = "asyncgen_hooks"
+
 class _NySysVersionInfo(_NyStructSeq):
     __module__ = "sys"
     _ny_qual = "sys.version_info"
@@ -3307,6 +3378,8 @@ def _ny_sys_extend(sysmod):
     # Nython's own version in sys.implementation, as PyPy does
     var vi = _NySysVersionInfo((3, 12, 0, "final", 0))
     sysmod.version_info = vi
+    sysmod.set_asyncgen_hooks = _ny_set_asyncgen_hooks     # round 82
+    sysmod.get_asyncgen_hooks = _ny_get_asyncgen_hooks
     sysmod.hexversion = 0x030C00F0
     sysmod.api_version = 1013
     sysmod.implementation = _NySysNamespace(name="nython", cache_tag=None,
@@ -5125,8 +5198,12 @@ def _ny_os_member_list():
             return _ny_os_call("getloadavg")
         def killpg(pgid, sig):
             _ny_os_call("killpg", _ny_os_fd(pgid), _ny_os_fd(sig))
+        def sendfile(out_fd, in_fd, offset, count):
+            # (round 82) the kernel's sendfile(2); offset None: the file's position
+            return _ny_os_call("sendfile", _ny_os_fd(out_fd), _ny_os_fd(in_fd),
+                               None if offset is None else _ny_os_fd(offset), _ny_os_fd(count))
         for f in (getgroups, setsid, getsid, getpgid, setpgid, chown, lchown, fchown, fchmod, mkfifo, mknod,
-                  major, minor, makedev, getloadavg, killpg):
+                  major, minor, makedev, getloadavg, killpg, sendfile):
             f.__module__ = "posix"
             m.append((f.__name__, f))
         m.append(("environb", _ny_os_environb()))

@@ -5776,4 +5776,13 @@ Full detail in `HANDOFF.md` §0u (part C), §0u2 (part B). New tests: `vm_audit1
 | A gather of asyncio Futures returned handle numbers | the coroutine an `__await__` returned was not kept alive | `item_of` keeps it |
 | VM: a natively raised OSError had no `errno`/`strerror` | `raise_in_vm` bypassed the typed path | through `raise_native_exception` |
 | `while not done: await sleep(0)` starved socket I/O | the reactor was polled only when no task was ready | polled without waiting every 32 steps |
+| TaskGroup: one failure raised bare; the body's error first | not CPython's 3.11 rule | always a (Base)ExceptionGroup, children's errors then the body's; a failed child aborts the group from the loop |
+| `asyncio.wait([coro])` accepted | 3.11 forbids it | TypeError "Passing coroutines is forbidden, use tasks explicitly." |
+| `CancelledError` from `task.cancel()` had args `("thread 'task-f' was cancelled",)` | the runtime's text was the message | an empty message for tasks; both engines make an empty-message runtime error `Type()` |
+| `run_in_executor(None, ...)`: a thread per call | a stop-gap executor | a ThreadPoolExecutor, as CPython |
+| `create_server(None, port)` listened on IPv4 only | a fixed 0.0.0.0 | every wildcard address getaddrinfo gives, unopenable families skipped |
+| No `sock_sendfile`/`sendfile`/`os.sendfile`, no `connect_read_pipe`/`connect_write_pipe` | not written | CPython's algorithms (kernel sendfile with fallback; unix_events pipe transports) |
+| `shutdown_asyncgens()` closed nothing; no `sys.set_asyncgen_hooks` | async generators were not tracked | hooks in the prelude's async generators (firstiter, finalizer from `__del__`), installed by the running loop |
+| `import gc` failed | no module | `lib/gc.ny` over the engines' collector |
+| `f.fileno()` was 1000 and up; `select([f])` reported it ready at once | the file object's handle number, not its descriptor | `file_fileno`: the OS descriptor |
 

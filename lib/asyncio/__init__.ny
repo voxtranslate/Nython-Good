@@ -98,30 +98,31 @@
 # lets the loop's other tasks run, a yielded awaitable is awaited.
 #
 # Differences from Python, on purpose or for now:
-#   - a TaskGroup whose children fail raises the error itself when one child
-#     failed, an ExceptionGroup (the builtin; `except*` splits it) when
-#     several did, so the common case stays catchable by type;
-#   - wait() also takes coroutines (3.11 forbids them) and returns (done,
-#     pending) as sets of Task objects;
-#   - a CancelledError a task gets from cancel() without a message carries
-#     the runtime's text ("thread 'task-f' was cancelled") rather than none;
-#   - the default executor is a thread per call until set_default_executor
-#     gives a concurrent.futures.ThreadPoolExecutor;
-#   - shutdown_asyncgens() closes nothing: async generators are not tracked
-#     (there is no sys.set_asyncgen_hooks);
 #   - an SSL transport sends close_notify when it closes but does not wait
 #     for the peer's; can_write_eof() is false for them (as for CPython's);
-#   - loop.sendfile/sock_sendfile, connect_read_pipe/connect_write_pipe and
-#     the child watchers are not provided; add_reader/add_writer take
-#     sockets everywhere and other descriptors on POSIX only;
+#   - the child watchers are not provided; add_reader/add_writer take
+#     sockets everywhere and other descriptors on POSIX only, so
+#     connect_read_pipe/connect_write_pipe are POSIX only (NotImplementedError
+#     on Windows); loop.sendfile always takes the fallback (a transport's
+#     buffer and flow control), sock_sendfile the kernel's os.sendfile on
+#     Linux/macOS;
 #   - a callback or task that raises KeyboardInterrupt/SystemExit stops the
 #     loop and the exception leaves run_until_complete/run_forever, as in
-#     CPython, but only for loop callbacks and the task being run.
+#     CPython, but only for loop callbacks and the task being run;
+#   - "Task exception was never retrieved" is not reported (the runtime
+#     does not record whether an await observed a task's error), and the
+#     native handles under Event/Lock/Queue are not freed.
 import socket
 import os
 import sys
 
 _subprocess_mod = none
+
+def _ny_weakset():
+    # the loop's set of started async generators (round 82): weak, as
+    # CPython's - a generator dropped by the program is not kept alive
+    import weakref
+    return weakref.WeakSet()
 
 def _sp():
     # lib/subprocess.ny, loaded when the first child is started
@@ -1178,11 +1179,16 @@ async def _cancel_and_wait(fut):
 async def wait(fs, *, timeout=none, return_when=ALL_COMPLETED):
     if isfuture(fs) or iscoroutine(fs):
         raise TypeError("expect a list of futures, not " + type(fs).__name__)
-    var tasks = [ensure_future(a) for a in fs]
-    if len(tasks) == 0:
+    var items = list(fs)
+    if len(items) == 0:
         raise ValueError("Set of Tasks/Futures is empty.")
     if return_when != FIRST_COMPLETED and return_when != FIRST_EXCEPTION and return_when != ALL_COMPLETED:
         raise ValueError("Invalid return_when value: " + str(return_when))
+    # 3.11+: coroutines are refused (round 82; they were wrapped in tasks)
+    for a in items:
+        if iscoroutine(a):
+            raise TypeError("Passing coroutines is forbidden, use tasks explicitly.")
+    var tasks = [ensure_future(a) for a in set(items)]
     var ev = Event()
     def check(_t=none):
         var n_done = 0
@@ -1553,6 +1559,7 @@ class TaskGroup:
     def __init__(self):
         self._tasks = []
         self._errors = []
+        self._base_error = none   # a child's SystemExit/KeyboardInterrupt, raised as itself
         self._parent = none
         self._loop = none
         self._in_body = false
@@ -1603,8 +1610,15 @@ class TaskGroup:
     async def __aexit__(self, et, ev, tb):
         self._in_body = false
         var body_error = none
-        if et is not none and not (self._parent_cancel_requested and issubclass(et, CancelledError)):
+        var propagate_cancel = none
+        if et is not none and issubclass(et, CancelledError):
+            if not self._parent_cancel_requested:
+                propagate_cancel = ev
+            self._abort()
+        elif et is not none:
             body_error = ev
+            if self._base_error is none and isinstance(ev, (SystemExit, KeyboardInterrupt)):
+                self._base_error = ev
             self._abort()
         var i = 0
         while i < len(self._tasks):
@@ -1618,13 +1632,19 @@ class TaskGroup:
         self._closed = true
         if self._parent_cancel_requested:
             self._parent.uncancel()
-        if len(self._errors) == 1 and body_error is none:
-            raise self._errors[0]
-        if len(self._errors) > 0:
-            var errs = self._errors
-            if body_error is not none:
-                errs = [body_error] + errs
-            raise ExceptionGroup("unhandled errors in a TaskGroup", errs)
+        # CPython 3.11+: a child's SystemExit/KeyboardInterrupt as itself;
+        # otherwise every error - the children's in the order they failed,
+        # then the body's - in one group, even a single one (round 82: one
+        # failure was raised bare, the body's error first)
+        if self._base_error is not none:
+            raise self._base_error
+        if propagate_cancel is not none and len(self._errors) == 0:
+            raise propagate_cancel
+        var errs = list(self._errors)
+        if body_error is not none:
+            errs.append(body_error)
+        if len(errs) > 0:
+            raise BaseExceptionGroup("unhandled errors in a TaskGroup", errs)
         if self._parent_cancel_requested and et is not none and issubclass(et, CancelledError):
             return true
         return false
@@ -1636,7 +1656,12 @@ async def _tg_child(group, coro):
         raise
     except BaseException as e:
         group._errors.append(e)
-        group._abort()
+        if group._base_error is none and isinstance(e, (SystemExit, KeyboardInterrupt)):
+            group._base_error = e
+        # the abort runs from the loop, after the tasks already ready in
+        # this step (CPython aborts from the child's done callback): two
+        # children failing in one step both report their errors (round 82)
+        group._loop.call_soon(group._abort)
         raise
 
 # ─── Synchronisation ────────────────────────────────────────────────────────
@@ -2204,6 +2229,7 @@ def _check_data(data):
         raise TypeError("data argument must be a bytes-like object, not " + repr(type(data).__name__))
 
 class _SocketTransport(_FlowControlMixin):
+    _sendfile_compatible = "fallback"   # loop.sendfile (round 82)
     # A stream socket (TCP, Unix, or TLS over either) driven by the loop: a
     # reader task feeds the protocol, write() sends what the socket takes at
     # once and a writer task the rest.
@@ -2942,39 +2968,6 @@ class Server(AbstractServer):
         self._waiters.append(waiter)
         await waiter
 
-# ─── Executors ──────────────────────────────────────────────────────────────
-
-class _DefaultExecutor:
-    # The loop's default executor until set_default_executor gives one: a
-    # thread per call, joined by shutdown().
-    def __init__(self):
-        self._threads = []
-        self._shutdown = false
-
-    def submit(self, fn, *args):
-        if self._shutdown:
-            raise RuntimeError("cannot schedule new futures after shutdown")
-        var fut = _ThreadFuture()
-        def work():
-            try:
-                fut.set_result(fn(*args))
-            except BaseException as e:
-                fut.set_exception(e)
-        var live = []
-        for th in self._threads:
-            if thread_is_alive(th):
-                live.append(th)
-        self._threads = live
-        self._threads.append(thread_create(work))
-        return fut
-
-    def shutdown(self, wait=true, *, cancel_futures=false):
-        self._shutdown = true
-        if wait:
-            for th in self._threads:
-                thread_join(th)
-            self._threads = []
-
 # ─── The event loop ─────────────────────────────────────────────────────────
 
 class AbstractEventLoop:
@@ -3012,6 +3005,7 @@ class BaseEventLoop(AbstractEventLoop):
         self._default_executor = none
         self._executor_shutdown_called = false
         self._asyncgens_shutdown_called = false
+        self._asyncgens = _ny_weakset()
         self._task_factory = none
         self._signal_handlers = {}
         self._readers = {}
@@ -3073,9 +3067,30 @@ class BaseEventLoop(AbstractEventLoop):
         pass
 
     # ── running ──
+    def _install_agen_hooks(self):
+        # while the loop runs, async generators report to it (round 82, as
+        # CPython's run_forever): first stepped, they join _asyncgens;
+        # collected unfinished, their aclose() is scheduled here
+        var old = sys.get_asyncgen_hooks()
+        sys.set_asyncgen_hooks(firstiter=self._asyncgen_firstiter_hook, finalizer=self._asyncgen_finalizer_hook)
+        return old
+
+    def _asyncgen_firstiter_hook(self, agen):
+        if self._asyncgens_shutdown_called:
+            import warnings
+            warnings.warn("asynchronous generator " + repr(agen) + " was scheduled after loop.shutdown_asyncgens() call",
+                          ResourceWarning, source=self)
+        self._asyncgens.add(agen)
+
+    def _asyncgen_finalizer_hook(self, agen):
+        self._asyncgens.discard(agen)
+        if not self.is_closed():
+            self.call_soon_threadsafe(self.create_task, agen.aclose())
+
     def run_forever(self):
         self._check_closed()
         self._check_running()
+        var old_hooks = self._install_agen_hooks()
         self._running = true
         self._thread_id = thread_id()
         try:
@@ -3083,6 +3098,7 @@ class BaseEventLoop(AbstractEventLoop):
         finally:
             self._running = false
             self._thread_id = none
+            sys.set_asyncgen_hooks(*old_hooks)
         self._raise_pending()
 
     def run_until_complete(self, future):
@@ -3094,6 +3110,7 @@ class BaseEventLoop(AbstractEventLoop):
             target = future._h
         else:
             target = self._spawn(_wait_quietly(future), false)
+        var old_hooks = self._install_agen_hooks()
         self._running = true
         self._thread_id = thread_id()
         try:
@@ -3101,6 +3118,7 @@ class BaseEventLoop(AbstractEventLoop):
         finally:
             self._running = false
             self._thread_id = none
+            sys.set_asyncgen_hooks(*old_hooks)
             if not isinstance(future, Task) or future._loop is not self:
                 async_task_detach(target)
         self._raise_pending()
@@ -3224,7 +3242,10 @@ class BaseEventLoop(AbstractEventLoop):
             if self._executor_shutdown_called:
                 raise RuntimeError("Executor shutdown has been called")
             if executor is none:
-                executor = _DefaultExecutor()
+                # CPython's: a thread pool, made on first use (round 82; it
+                # was a thread per call)
+                import concurrent.futures
+                executor = concurrent.futures.ThreadPoolExecutor(thread_name_prefix="asyncio")
                 self._default_executor = executor
         return wrap_future(executor.submit(func, *args), loop=self)
 
@@ -3262,7 +3283,21 @@ class BaseEventLoop(AbstractEventLoop):
             thread_join(th)
 
     async def shutdown_asyncgens(self):
+        # every async generator started on this loop and not finished is
+        # closed (round 82: it closed nothing)
         self._asyncgens_shutdown_called = true
+        if len(self._asyncgens) == 0:
+            return
+        var closing = list(self._asyncgens)
+        self._asyncgens.clear()
+        var results = await gather(*[ag.aclose() for ag in closing], return_exceptions=true)
+        var i = 0
+        while i < len(closing):
+            var r = results[i]
+            if isinstance(r, Exception):
+                self.call_exception_handler({"message": "an error occurred during closing of asynchronous generator " + repr(closing[i]),
+                                             "exception": r, "asyncgen": closing[i]})
+            i = i + 1
 
     # ── errors ──
     def get_exception_handler(self):
@@ -3358,6 +3393,168 @@ class BaseEventLoop(AbstractEventLoop):
         if self.is_closed():
             return false
         return self._unwatch_fd(self._writers, fd)
+
+    # ── sendfile (round 82; after CPython's base_events) ──
+    def _check_sendfile_params(self, sock, file, offset, count):
+        if "b" not in getattr(file, "mode", "b"):
+            raise ValueError("file should be opened in binary mode")
+        if not sock.type == socket.SOCK_STREAM:
+            raise ValueError("only SOCK_STREAM type sockets are supported")
+        if count is not none:
+            if not isinstance(count, int):
+                raise TypeError("count must be a positive integer (got " + repr(count) + ")")
+            if count <= 0:
+                raise ValueError("count must be a positive integer (got " + repr(count) + ")")
+        if not isinstance(offset, int):
+            raise TypeError("offset must be a non-negative integer (got " + repr(offset) + ")")
+        if offset < 0:
+            raise ValueError("offset must be a non-negative integer (got " + repr(offset) + ")")
+
+    async def sock_sendfile(self, sock, file, offset=0, count=none, *, fallback=true):
+        # the kernel's os.sendfile where there is one (Linux, macOS), else
+        # (or when it is refused) the file read in blocks and sent
+        if self._debug and sock.gettimeout() != 0:
+            raise ValueError("the socket must be non-blocking")
+        self._check_sendfile_params(sock, file, offset, count)
+        try:
+            return await self._sock_sendfile_native(sock, file, offset, count)
+        except SendfileNotAvailableError:
+            if not fallback:
+                raise
+        return await self._sock_sendfile_fallback(sock, file, offset, count)
+
+    async def _sock_sendfile_native(self, sock, file, offset, count):
+        if not hasattr(os, "sendfile"):
+            raise SendfileNotAvailableError("os.sendfile() is not available")
+        var fileno = none
+        try:
+            fileno = file.fileno()
+        except BaseException:
+            raise SendfileNotAvailableError("not a regular file")
+        var blocksize = 0
+        try:
+            var size = os.fstat(fileno).st_size
+            blocksize = (count if count else size) if size > 0 else 0
+        except OSError:
+            raise SendfileNotAvailableError("not a regular file")
+        if blocksize == 0:
+            return 0
+        if count:
+            blocksize = min(blocksize, count)
+        var total_sent = 0
+        var pos = offset
+        try:
+            while true:
+                var left = blocksize - total_sent
+                if count:
+                    left = count - total_sent
+                if left <= 0:
+                    break
+                var sent = 0
+                try:
+                    sent = os.sendfile(sock.fileno(), fileno, pos, min(left, 0x7fff0000))
+                except (BlockingIOError, InterruptedError):
+                    sock.wait_writable()
+                    continue
+                except OSError as exc:
+                    if total_sent == 0:
+                        # nothing went yet: let the fallback try (EINVAL on
+                        # odd files, ENOTSOCK ...), as CPython does
+                        raise SendfileNotAvailableError("os.sendfile call failed") from exc
+                    raise
+                if sent == 0:
+                    break
+                total_sent = total_sent + sent
+                pos = pos + sent
+            return total_sent
+        finally:
+            if total_sent > 0 and hasattr(file, "seek"):
+                file.seek(offset + total_sent)
+
+    async def _sock_sendfile_fallback(self, sock, file, offset, count):
+        if offset:
+            file.seek(offset)
+        var blocksize = min(count, 256 * 1024) if count else 256 * 1024
+        var total_sent = 0
+        try:
+            while true:
+                if count:
+                    blocksize = min(count - total_sent, blocksize)
+                    if blocksize <= 0:
+                        break
+                var data = await self.run_in_executor(none, file.read, blocksize)
+                if not data:
+                    break
+                await self.sock_sendall(sock, data)
+                total_sent = total_sent + len(data)
+            return total_sent
+        finally:
+            if total_sent > 0 and hasattr(file, "seek"):
+                file.seek(offset + total_sent)
+
+    async def sendfile(self, transport, file, offset=0, count=none, *, fallback=true):
+        # through a transport: its write buffer and the protocol's flow
+        # control (the fallback CPython uses for every transport but plain
+        # sockets with a native sendfile)
+        if transport.is_closing():
+            raise RuntimeError("Transport is closing")
+        var mode = getattr(transport, "_sendfile_compatible", _SENDFILE_UNSUPPORTED)
+        if mode == _SENDFILE_UNSUPPORTED:
+            raise RuntimeError("sendfile is not supported for transport " + repr(transport))
+        if not fallback:
+            raise RuntimeError("fallback is disabled and native sendfile is not supported for transport " + repr(transport))
+        self._check_sendfile_params(transport.get_extra_info("socket") or _SendfileStreamProbe(), file, offset, count)
+        return await self._sendfile_fallback(transport, file, offset, count)
+
+    async def _sendfile_fallback(self, transp, file, offset, count):
+        if offset:
+            file.seek(offset)
+        var blocksize = min(count, 16384) if count else 16384
+        var total_sent = 0
+        var proto = _SendfileFallbackProtocol(transp)
+        try:
+            while true:
+                if count:
+                    blocksize = min(count - total_sent, blocksize)
+                    if blocksize <= 0:
+                        return total_sent
+                var data = await self.run_in_executor(none, file.read, blocksize)
+                if not data:
+                    return total_sent
+                await proto.drain()
+                transp.write(data)
+                total_sent = total_sent + len(data)
+        finally:
+            if total_sent > 0 and hasattr(file, "seek"):
+                file.seek(offset + total_sent)
+            await proto.restore()
+
+    # ── pipes (round 82; after CPython's unix_events) ──
+    async def connect_read_pipe(self, protocol_factory, pipe):
+        if _WINDOWS:
+            raise NotImplementedError("connect_read_pipe is not supported on Windows")
+        var protocol = protocol_factory()
+        var waiter = self.create_future()
+        var transport = _UnixReadPipeTransport(self, pipe, protocol, waiter)
+        try:
+            await waiter
+        except BaseException:
+            transport.close()
+            raise
+        return (transport, protocol)
+
+    async def connect_write_pipe(self, protocol_factory, pipe):
+        if _WINDOWS:
+            raise NotImplementedError("connect_write_pipe is not supported on Windows")
+        var protocol = protocol_factory()
+        var waiter = self.create_future()
+        var transport = _UnixWritePipeTransport(self, pipe, protocol, waiter)
+        try:
+            await waiter
+        except BaseException:
+            transport.close()
+            raise
+        return (transport, protocol)
 
     # ── low-level socket operations ──
     async def sock_recv(self, sock, n):
@@ -3584,19 +3781,23 @@ class BaseEventLoop(AbstractEventLoop):
                 hosts = list(host)
             var seen = set()
             for hst in hosts:
-                var infos = none
-                if hst is none:
-                    infos = [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("0.0.0.0", port))]
-                    if family == socket.AF_INET6:
-                        infos = [(socket.AF_INET6, socket.SOCK_STREAM, 0, "", ("::", port, 0, 0))]
-                else:
-                    infos = await self._ensure_resolved((hst, port), family, socket.SOCK_STREAM, 0, flags)
+                # every address getaddrinfo gives - for host None the
+                # wildcards of both families, as CPython (round 82: IPv4 only)
+                var infos = await self._ensure_resolved((hst, port), family, socket.SOCK_STREAM, 0, flags)
                 for info in infos:
                     var key = (info[0], tuple(info[4]))
                     if key in seen:
                         continue
                     seen.add(key)
-                    var s = socket.socket(info[0], info[1], info[2])
+                    var s = none
+                    try:
+                        s = socket.socket(info[0], info[1], info[2])
+                    except OSError:
+                        # a family this host cannot open (no IPv6): skipped,
+                        # as CPython assumes a bad family/type combination
+                        if self._debug:
+                            logger.warning("create_server() failed to create socket.socket(%r, %r, %r)", info[0], info[1], info[2])
+                        continue
                     sockets.append(s)
                     try:
                         if reuse_address:
@@ -3968,6 +4169,7 @@ class _ForeignLoop(BaseEventLoop):
         self._default_executor = none
         self._executor_shutdown_called = false
         self._asyncgens_shutdown_called = false
+        self._asyncgens = _ny_weakset()
         self._task_factory = none
         self._signal_handlers = {}
         self._readers = {}
@@ -4597,6 +4799,341 @@ class _WritePipeTransport(_PipeTransport, _FlowControlMixin):
                 self._proc._protocol.resume_writing()
             except BaseException:
                 pass
+
+# ─── sendfile through a transport, and pipe transports (round 82) ──────────
+
+_SENDFILE_UNSUPPORTED = "unsupported"
+_SENDFILE_FALLBACK = "fallback"
+
+class _SendfileStreamProbe:
+    # stands for a transport without a socket in _check_sendfile_params
+    type = socket.SOCK_STREAM
+
+class _SendfileFallbackProtocol(Protocol):
+    # Takes the transport's protocol's place while a file is sent through
+    # it: reading paused, writing paced by pause_writing/resume_writing
+    # (CPython's base_events._SendfileFallbackProtocol).
+    def __init__(self, transp):
+        self._transport = transp
+        self._proto = transp.get_protocol()
+        self._should_resume_reading = transp.is_reading()
+        self._should_resume_writing = getattr(transp, "_protocol_paused", false)
+        transp.pause_reading()
+        transp.set_protocol(self)
+        if self._should_resume_writing:
+            self._write_ready_fut = transp._loop.create_future()
+        else:
+            self._write_ready_fut = none
+
+    async def drain(self):
+        if self._transport.is_closing():
+            raise ConnectionError("Connection closed by peer")
+        var fut = self._write_ready_fut
+        if fut is none:
+            return
+        await fut
+
+    def connection_made(self, transport):
+        raise RuntimeError("Invalid state: connection should have been established already.")
+
+    def connection_lost(self, exc):
+        if self._write_ready_fut is not none:
+            if exc is none:
+                self._write_ready_fut.set_exception(ConnectionError("Connection is closed by peer"))
+            else:
+                self._write_ready_fut.set_exception(exc)
+        self._proto.connection_lost(exc)
+
+    def pause_writing(self):
+        if self._write_ready_fut is not none:
+            return
+        self._write_ready_fut = self._transport._loop.create_future()
+
+    def resume_writing(self):
+        if self._write_ready_fut is none:
+            return
+        self._write_ready_fut.set_result(false)
+        self._write_ready_fut = none
+
+    def data_received(self, data):
+        raise RuntimeError("Invalid state: reading should be paused")
+
+    def eof_received(self):
+        raise RuntimeError("Invalid state: reading should be paused")
+
+    async def restore(self):
+        self._transport.set_protocol(self._proto)
+        if self._should_resume_reading:
+            self._transport.resume_reading()
+        if self._write_ready_fut is not none:
+            # Cancel the future; the transport is either fine (and
+            # resume_writing will not be called) or closing.
+            self._write_ready_fut.cancel()
+        if self._should_resume_writing:
+            self._proto.resume_writing()
+
+def _pipe_mode_ok(fileno):
+    import stat
+    var mode = os.fstat(fileno).st_mode
+    return stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) or stat.S_ISCHR(mode)
+
+class _UnixReadPipeTransport(ReadTransport):
+    # The read end of a pipe (or a socket / character device) as a
+    # transport: data_received with each read, eof_received then
+    # connection_lost at end of file (CPython's unix_events).
+    max_size = 256 * 1024
+
+    def __init__(self, loop, pipe, protocol, waiter=none, extra=none):
+        super().__init__(extra)
+        self._extra["pipe"] = pipe
+        self._loop = loop
+        self._pipe = pipe
+        self._fileno = pipe.fileno()
+        self._protocol = protocol
+        self._closing = false
+        self._paused = false
+        if not _pipe_mode_ok(self._fileno):
+            self._pipe = none
+            self._fileno = none
+            self._protocol = none
+            raise ValueError("Pipe transport is for pipes/sockets only.")
+        os.set_blocking(self._fileno, false)
+        self._loop.call_soon(self._protocol.connection_made, self)
+        self._loop.call_soon(self._add_reader, self._fileno, self._read_ready)
+        if waiter is not none:
+            self._loop.call_soon(_set_result_unless_cancelled, waiter, none)
+
+    def __repr__(self):
+        var info = [type(self).__name__]
+        if self._pipe is none:
+            info.append("closed")
+        elif self._closing:
+            info.append("closing")
+        info.append("fd=" + str(self._fileno))
+        return "<" + " ".join(info) + ">"
+
+    def _add_reader(self, fd, callback):
+        if not self.is_reading():
+            return
+        self._loop.add_reader(fd, callback)
+
+    def is_reading(self):
+        return not self._paused and not self._closing
+
+    def _read_ready(self):
+        var data = none
+        try:
+            data = os.read(self._fileno, self.max_size)
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError as exc:
+            self._fatal_error(exc, "Fatal read error on pipe transport")
+            return
+        if data:
+            self._protocol.data_received(data)
+        else:
+            self._closing = true
+            self._loop.remove_reader(self._fileno)
+            self._loop.call_soon(self._protocol.eof_received)
+            self._loop.call_soon(self._call_connection_lost, none)
+
+    def pause_reading(self):
+        if not self.is_reading():
+            return
+        self._paused = true
+        self._loop.remove_reader(self._fileno)
+
+    def resume_reading(self):
+        if self._closing or not self._paused:
+            return
+        self._paused = false
+        self._loop.add_reader(self._fileno, self._read_ready)
+
+    def set_protocol(self, protocol):
+        self._protocol = protocol
+
+    def get_protocol(self):
+        return self._protocol
+
+    def is_closing(self):
+        return self._closing
+
+    def close(self):
+        if not self._closing:
+            self._close(none)
+
+    def _fatal_error(self, exc, message="Fatal error on pipe transport"):
+        if not isinstance(exc, OSError):
+            self._loop.call_exception_handler({"message": message, "exception": exc,
+                                               "transport": self, "protocol": self._protocol})
+        self._close(exc)
+
+    def _close(self, exc):
+        self._closing = true
+        self._loop.remove_reader(self._fileno)
+        self._loop.call_soon(self._call_connection_lost, exc)
+
+    def _call_connection_lost(self, exc):
+        try:
+            self._protocol.connection_lost(exc)
+        finally:
+            self._pipe.close()
+            self._pipe = none
+            self._protocol = none
+            self._loop = none
+
+class _UnixWritePipeTransport(_FlowControlMixin):
+    # The write end of a pipe as a transport: os.write at once, the rest
+    # buffered and written when the pipe is writable, flow control at the
+    # water marks; the peer closing its end is seen as the pipe becoming
+    # readable (CPython's unix_events).
+    def __init__(self, loop, pipe, protocol, waiter=none, extra=none):
+        super().__init__(extra, loop)
+        self._extra["pipe"] = pipe
+        self._pipe = pipe
+        self._fileno = pipe.fileno()
+        self._protocol = protocol
+        self._buffer = bytearray()
+        self._conn_lost = 0
+        self._closing = false
+        if not _pipe_mode_ok(self._fileno):
+            self._pipe = none
+            self._fileno = none
+            self._protocol = none
+            raise ValueError("Pipe transport is only for pipes, sockets and character devices")
+        os.set_blocking(self._fileno, false)
+        self._loop.call_soon(self._protocol.connection_made, self)
+        self._loop.call_soon(self._loop.add_reader, self._fileno, self._read_ready)
+        if waiter is not none:
+            self._loop.call_soon(_set_result_unless_cancelled, waiter, none)
+
+    def __repr__(self):
+        var info = [type(self).__name__]
+        if self._pipe is none:
+            info.append("closed")
+        elif self._closing:
+            info.append("closing")
+        info.append("fd=" + str(self._fileno))
+        info.append("bufsize=" + str(self.get_write_buffer_size()))
+        return "<" + " ".join(info) + ">"
+
+    def get_write_buffer_size(self):
+        return len(self._buffer)
+
+    def _read_ready(self):
+        # the pipe was closed by the peer
+        if self._buffer:
+            self._close(BrokenPipeError())
+        else:
+            self._close()
+
+    def write(self, data):
+        _check_data(data)
+        data = bytes(data)
+        if not data:
+            return
+        if self._conn_lost or self._closing:
+            if self._conn_lost >= 5:
+                logger.warning("pipe closed by peer or os.write(pipe, data) raised exception.")
+            self._conn_lost = self._conn_lost + 1
+            return
+        if not self._buffer:
+            var n = 0
+            try:
+                n = os.write(self._fileno, data)
+            except (BlockingIOError, InterruptedError):
+                n = 0
+            except (SystemExit, KeyboardInterrupt):
+                raise
+            except BaseException as exc:
+                self._conn_lost = self._conn_lost + 1
+                self._fatal_error(exc, "Fatal write error on pipe transport")
+                return
+            if n == len(data):
+                return
+            elif n > 0:
+                data = data[n:]
+            self._loop.add_writer(self._fileno, self._write_ready)
+        self._buffer.extend(data)
+        self._maybe_pause_protocol()
+
+    def writelines(self, list_of_data):
+        self.write(b"".join([bytes(d) for d in list_of_data]))
+
+    def _write_ready(self):
+        var n = 0
+        try:
+            n = os.write(self._fileno, bytes(self._buffer))
+        except (BlockingIOError, InterruptedError):
+            return
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except BaseException as exc:
+            self._buffer.clear()
+            self._conn_lost = self._conn_lost + 1
+            self._loop.remove_writer(self._fileno)
+            self._fatal_error(exc, "Fatal write error on pipe transport")
+            return
+        if n == len(self._buffer):
+            self._buffer.clear()
+            self._loop.remove_writer(self._fileno)
+            self._maybe_resume_protocol()   # may append to the buffer
+            if self._closing:
+                self._loop.remove_reader(self._fileno)
+                self._call_connection_lost(none)
+            return
+        elif n > 0:
+            del self._buffer[:n]
+
+    def can_write_eof(self):
+        return true
+
+    def write_eof(self):
+        if self._closing:
+            return
+        self._closing = true
+        if not self._buffer:
+            self._loop.remove_reader(self._fileno)
+            self._loop.call_soon(self._call_connection_lost, none)
+
+    def set_protocol(self, protocol):
+        self._protocol = protocol
+
+    def get_protocol(self):
+        return self._protocol
+
+    def is_closing(self):
+        return self._closing
+
+    def close(self):
+        if self._pipe is not none and not self._closing:
+            self.write_eof()
+
+    def abort(self):
+        self._close(none)
+
+    def _fatal_error(self, exc, message="Fatal error on pipe transport"):
+        if not isinstance(exc, OSError):
+            self._loop.call_exception_handler({"message": message, "exception": exc,
+                                               "transport": self, "protocol": self._protocol})
+        self._close(exc)
+
+    def _close(self, exc=none):
+        self._closing = true
+        if self._buffer:
+            self._loop.remove_writer(self._fileno)
+        self._buffer.clear()
+        self._loop.remove_reader(self._fileno)
+        self._loop.call_soon(self._call_connection_lost, exc)
+
+    def _call_connection_lost(self, exc):
+        try:
+            self._protocol.connection_lost(exc)
+        finally:
+            self._pipe.close()
+            self._pipe = none
+            self._protocol = none
+            self._loop = none
 
 class _SubprocessTransport(SubprocessTransport):
     # A child started by os_spawn: one task reads its pipes (on the

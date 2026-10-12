@@ -318,7 +318,7 @@ async def aio_main():
         r["wait_for"] = "no timeout"
     except asyncio.TimeoutError:
         r["wait_for"] = "TimeoutError"
-    var dp = await asyncio.wait([work(5, 0.01), work(6, 0.3)], return_when=asyncio.FIRST_COMPLETED)
+    var dp = await asyncio.wait([asyncio.create_task(work(5, 0.01)), asyncio.create_task(work(6, 0.3))], return_when=asyncio.FIRST_COMPLETED)
     r["wait"] = [len(dp[0]), len(dp[1])]
     for p in dp[1]:
         p.cancel()
@@ -438,8 +438,9 @@ async def aio_main():
             tg.create_task(boom(0.01, "child failed"))
             await asyncio.sleep(5)
             tg_fail = "body ran on"
-    except ValueError as e:
-        tg_fail = str(e)
+    except ExceptionGroup as e:
+        # one failure is a group too, as CPython 3.11+ (round 82)
+        tg_fail = str(e.exceptions[0]) if len(e.exceptions) == 1 else "several"
     async def stubborn():
         try:
             await asyncio.sleep(5)

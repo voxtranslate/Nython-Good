@@ -45,6 +45,10 @@
 #  if defined(__linux__)
 #    include <sys/sysmacros.h>
 #    include <sched.h>
+#    include <sys/sendfile.h>
+#  elif defined(__APPLE__)
+#    include <sys/socket.h>
+#    include <sys/uio.h>
 #  endif
 #else
 #  include <io.h>
@@ -272,6 +276,39 @@ Value os_call_ext(NythonExecutor& E, const std::string& op, std::vector<Value>& 
         }
         if (put < 0) raise_errno(err, "");
         return make_int(put);
+    }
+    // os.sendfile(out_fd, in_fd, offset, count): the kernel copies from a file
+    // to a socket (round 82; asyncio's sock_sendfile uses it). offset None
+    // is the file's position (Linux, as CPython); POSIX only.
+    if (op == "sendfile") {
+#if defined(__linux__) || defined(__APPLE__)
+        int out_fd = fd_arg(E, A(0)), in_fd = fd_arg(E, A(1));
+        bool has_off = A(2).type != ValueType::NONE;
+        long long off = has_off ? I(2, 0) : 0, count = I(3, 0);
+        if (off < 0) raise_errno(EINVAL, "");
+        long long sent = 0;
+        int err = 0;
+        {
+            nyconc::GilRelease unlocked;
+#  if defined(__APPLE__)
+            off_t len = (off_t)count;
+            int r;
+            do { len = (off_t)count; r = ::sendfile(in_fd, out_fd, (off_t)off, &len, nullptr, 0); }
+            while (r < 0 && errno == EINTR && len == 0);
+            sent = (r < 0 && len == 0) ? -1 : (long long)len;
+            if (sent < 0) err = errno;
+#  else
+            off_t o = (off_t)off;
+            do { sent = (long long)::sendfile(out_fd, in_fd, has_off ? &o : nullptr, (size_t)count); }
+            while (sent < 0 && errno == EINTR);
+            if (sent < 0) err = errno;
+#  endif
+        }
+        if (sent < 0) raise_errno(err, "");
+        return make_int(sent);
+#else
+        raise_errno(ENOSYS, "");
+#endif
     }
     if (op == "close") {
         int fd = fd_arg(E, A(0));

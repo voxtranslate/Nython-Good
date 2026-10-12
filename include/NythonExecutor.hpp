@@ -706,7 +706,7 @@ public:   // NythonExecutor is a struct: members default to public
             "cos_sim","cosine_similarity","cross_entropy_loss","ctc_loss","device_info","dns_resolve","dropout","elu",
             "embedding","embedding_lookup","env_get","eprint","exec_cmd","exp","fclose","fft_magnitude",
             "file_append","file_close","file_copy","file_delete","file_open","file_read","file_readline","file_readlines",
-            "file_read_bytes","file_readline_bytes","file_truncate",
+            "file_read_bytes","file_readline_bytes","file_truncate","file_fileno",
             "stream_write","stream_flush","stream_isatty","stream_readline","stream_read",
             "file_rename","file_size","file_mtime","fuzzy_score","fuzzy_positions","fuzzy_rank","file_write","file_writelines","flush","fprint","fread","freadline",
             "fs_mkdirs","fs_stat","fs_walk","function","fwrite","gelu","getcwd","getenv",
@@ -10756,6 +10756,9 @@ public:
     // from the codec (nypy::last_unicode_error), a KeyError's key from its
     // repr (a str or int key; anything else stays the text).
     std::vector<Value> excArgsFromMessage(const std::string& t, const std::string& msg) {
+        // a runtime error with no message is Type() - empty args, as CPython
+        // (round 82: CancelledError() from cancel() had args ('',))
+        if (msg.empty()) return {};
         int kind = excKindOf(t);
         if (kind == nython::NYX_OS) {
             nython::NyErrnoParts ep;
