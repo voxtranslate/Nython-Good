@@ -393,6 +393,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit104 | 113 | round 82: asyncio's loop API (run_until_complete/run_forever/stop/close, call_soon/later/at, Handle/TimerHandle, executors, exception handlers, debug), transports and protocols over TCP/UDP/Unix (Server, flow control, BufferedProtocol), streams on StreamReaderProtocol, subprocesses (communicate, pipelines, SubprocessProtocol, signals to children), add_signal_handler and asyncio.run's Ctrl+C, TLS and start_tls, 3.12's cancellation (cancel(msg), cancelling/uncancel, wait_for/timeout), eager tasks, Barrier, Queue.shutdown, structured-concurrency reports (passes under python3.11-3.13) |
 | vm_audit101 | 125 | round 81: the live debug server driven over its socket (`--debug-port`, DAP messages: breakpoints with conditions/hit counts/log messages, stepping, pause, stack/scopes/variables by reference, evaluate, setVariable, raised/uncaught exceptions, `--connect`, stdin/argv untouched) and its ring buffer (stepBack/reverseContinue/seek, Why? over the live history); the Profile view's reader on real `-m cProfile [--stacks]` dumps (Nython-only) |
 | vm_audit106 | 27 | round 82 follow-ups: TaskGroup exception groups (children's errors then the body's), wait() refusing coroutines, CancelledError() with empty args, the ThreadPoolExecutor default executor, create_server(None) on every family it can open, sock_sendfile/sendfile/os.sendfile, connect_read_pipe/connect_write_pipe, sys.set_asyncgen_hooks and shutdown_asyncgens, the `gc` module, unretrieved task/future exceptions reported, native objects freed (passes under python3) |
+| vm_audit107 | 22 | round 82 follow-ups (2): `import name` finds `.py` modules, `__init__.py` packages and `.py` namespace packages (`.ny` first, so a `.py` never shadows a library module), `-m name.py`, quoted imports from any directory, `threading.Lock` released by another thread (Python's ownerless lock) and its errors, threading seen from asyncio tasks (get_ident/current_thread/local), `_thread` (passes under python3) |
 | vm_audit105 | 118 | round 82: lib/aiagent.ny's NyxAgent on a fixture workspace - `ny_facts`, call/import graphs, BM25F rankings (definitions over uses, call-graph neighbours, incremental, JSON round trip), the rule engine (closure, stratified negation, why), explain/doc/review/fix at exact lines, generated tests that run and pass (doctests, boundaries, a shrunk counterexample, a hang, a .py module under python3), completion MRR before/after training, GitHubLearner over a local http.server (Nython-only) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
@@ -1338,6 +1339,18 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   VM's `break`/`continue` out of an except clause left the exception "being
   handled" (an endless `__context__` chain); a finished task now lets go of
   its coroutine's arguments.
+
+## Round 82 follow-ups (see `HANDOFF.md` §0u4, §0u5)
+
+- `import name` also finds `name.py` / `name/__init__.py`, after every
+  directory's `.ny` (`nyrt::module_exts`); quoted imports are also looked
+  for in the library directories and the installation's root.
+- **`threading.Lock` is Python's ownerless lock** (`pylock_create`): another
+  thread may release it; it is outside DeadlockError/LockOrderError
+  checking. `mutex_create` keeps Nython's owned, checked mutex.
+- In an asyncio task, threading's ident/current_thread/local are the loop
+  thread's (`thread_os_id()`); `thread_id()` is the task's record.
+- `lib/gc.ny`, `lib/_thread.ny`; `f.fileno()` is the OS descriptor.
 
 ## Transcripts
 

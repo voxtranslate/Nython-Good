@@ -1164,12 +1164,13 @@ static bool find_module_file(const std::string& mod, std::string& out) {
     std::vector<std::string> dirs = {"", "lib/"};
     for (auto& d : nyrt::library_dirs()) dirs.push_back(d);
     struct stat st;
-    for (auto& d : dirs) {
-        std::string f = d + rel + ".ny";
-        if (stat(f.c_str(), &st) == 0 && !S_ISDIR(st.st_mode)) { out = f; return true; }
-        std::string m = d + rel + "/__main__.ny";
-        if (stat(m.c_str(), &st) == 0) { out = m; return true; }
-    }
+    for (auto& ext : nyrt::module_exts())   // round 82: a .py module when no .ny is found
+        for (auto& d : dirs) {
+            std::string f = d + rel + ext;
+            if (stat(f.c_str(), &st) == 0 && !S_ISDIR(st.st_mode)) { out = f; return true; }
+            std::string m = d + rel + "/__main__" + ext;
+            if (stat(m.c_str(), &st) == 0) { out = m; return true; }
+        }
     return false;
 }
 

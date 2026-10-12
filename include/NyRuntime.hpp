@@ -84,6 +84,43 @@ inline std::vector<std::string> library_dirs() {
     return out;
 }
 
+// round 82: a package's __init__ file (Nython's __init__.ny or Python's
+// __init__.py), and the module source extensions in the order a search
+// takes them: every directory is searched for a .ny module before any is
+// for a .py one, so a .py file never shadows a library module.
+inline bool is_package_init(const std::string& p) {
+    if (p.size() < 12) return false;
+    char sep = p[p.size() - 12];
+    if (sep != '/' && sep != '\\') return false;
+    return p.compare(p.size() - 11, 11, "__init__.ny") == 0 || p.compare(p.size() - 11, 11, "__init__.py") == 0;
+}
+inline const std::vector<std::string>& module_exts() {
+    static const std::vector<std::string> e = {".ny", ".py"};
+    return e;
+}
+// round 82: where a quoted import (`import "lib/x.ny"`, `import "gui.ny"`)
+// is looked for after the importer's directory, the working directory and
+// their ancestors: each library directory, and the directory holding it
+// (the installation's root, by which the library's own files name each
+// other - "lib/x.ny"), so a program anywhere can include them.
+inline std::vector<std::string> quoted_import_candidates(const std::string& name) {
+    std::vector<std::string> out;
+    size_t slash = name.find_last_of("/\\");
+    bool has_ext = name.find('.', slash == std::string::npos ? 0 : slash + 1) != std::string::npos;
+    for (auto& d : library_dirs()) {
+        std::string root;
+        std::string p = d.substr(0, d.size() - 1);
+        size_t c = p.find_last_of("/\\");
+        if (c != std::string::npos) root = p.substr(0, c + 1);
+        for (const std::string& base : {d, root}) {
+            if (base.empty()) continue;
+            out.push_back(base + name + ".ny");
+            if (has_ext) out.push_back(base + name);
+        }
+    }
+    return out;
+}
+
 // The exit status for an uncaught SystemExit whose message (str(e)) is
 // `msg`: "" or "None" -> 0, an integer -> it, anything else is printed on
 // stderr -> 1 (as Python).

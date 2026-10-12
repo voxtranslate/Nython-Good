@@ -407,7 +407,7 @@ namespace ny_fs {
     // module path (Linux's /sys for `import sys`) became an empty package.
     inline bool holds_modules(const std::string& dir, int depth = 1) {
         for (auto& n : listdir(dir)) {
-            if (n.size() > 3 && n.compare(n.size() - 3, 3, ".ny") == 0) return true;
+            if (n.size() > 3 && (n.compare(n.size() - 3, 3, ".ny") == 0 || n.compare(n.size() - 3, 3, ".py") == 0)) return true;
             if (depth > 0 && n[0] != '.') {
                 struct stat st{};
                 std::string sub = dir + "/" + n;

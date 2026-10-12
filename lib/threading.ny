@@ -113,7 +113,7 @@ class Thread:
     def join(self, timeout=none):
         if not self._started:
             raise RuntimeError("cannot join thread before it is started")
-        if self._ident == thread_id():
+        if self._ident == thread_os_id():
             raise RuntimeError("cannot join current thread")
         if timeout == none:
             thread_join(self._ident)
@@ -186,7 +186,7 @@ def main_thread():
     return _main
 
 def current_thread():
-    var i = thread_id()
+    var i = thread_os_id()
     if i == thread_main():
         return main_thread()
     var t = _threads.get(i)
@@ -198,10 +198,10 @@ def currentThread():
     return current_thread()
 
 def get_ident():
-    return thread_id()
+    return thread_os_id()
 
 def get_native_id():
-    return thread_id()
+    return thread_os_id()
 
 def active_count():
     return thread_count()
@@ -253,13 +253,20 @@ def _register_atexit(func, *arg, **kwargs):
     _ny_threading_atexits.append(call)
 
 class Lock:
+    # Python's primitive lock (round 82: a native lock with no owner,
+    # pylock_create - any thread may release it, and acquiring it again
+    # waits for that instead of raising DeadlockError)
     def __init__(self):
-        self._id = mutex_create()
+        self._id = pylock_create()
 
     def acquire(self, blocking=true, timeout=-1):
         if not blocking:
+            if timeout != -1:
+                raise ValueError("can't specify a timeout for a non-blocking call")
             return mutex_try_lock(self._id)
-        if timeout != none and timeout >= 0:
+        if timeout != none and timeout != -1:
+            if timeout < 0:
+                raise ValueError("timeout value must be positive")
             return mutex_lock_timeout(self._id, timeout * 1000)
         mutex_lock(self._id)
         return true
@@ -278,12 +285,46 @@ class Lock:
         mutex_unlock(self._id)
         return false
 
+    def __repr__(self):
+        return "<" + ("locked" if self.locked() else "unlocked") + " _thread.lock object at " + hex(id(self)) + ">"
+
+    def __del__(self):
+        # round 82: the native lock goes with the object (sync_free frees
+        # it only when no thread holds or waits for it)
+        _free_native(self)
+
+def _free_native(obj):
+    var h = getattr(obj, "_id", none)
+    if h is not none:
+        try:
+            sync_free(h)
+        except BaseException:
+            pass
+
 def allocate_lock():
     return Lock()
 
 class RLock(Lock):
+    # owned and re-entrant, as CPython's (a native recursive mutex)
     def __init__(self):
         self._id = rmutex_create()
+
+    def release(self):
+        try:
+            mutex_unlock(self._id)
+        except RuntimeError:
+            raise RuntimeError("cannot release un-acquired lock")
+
+    def __exit__(self, t=none, v=none, tb=none):
+        self.release()
+        return false
+
+    def _is_owned(self):
+        return mutex_owner(self._id) == thread_id()
+
+    def __repr__(self):
+        var o = mutex_owner(self._id)
+        return "<" + ("locked" if o else "unlocked") + " _thread.RLock object owner=" + str(o) + " at " + hex(id(self)) + ">"
 
 class Condition:
     def __init__(self, lock=none):
@@ -328,6 +369,9 @@ class Condition:
     def notifyAll(self):
         cond_notify_all(self._id)
 
+    def __del__(self):
+        _free_native(self)
+
     def __enter__(self):
         return self._lock.__enter__()
 
@@ -359,6 +403,9 @@ class Semaphore:
         self.release()
         return false
 
+    def __del__(self):
+        _free_native(self)
+
 class BoundedSemaphore(Semaphore):
     def __init__(self, value=1):
         if value < 0:
@@ -389,6 +436,9 @@ class Event:
         if timeout == none:
             return event_wait(self._id)
         return event_wait_timeout(self._id, timeout * 1000)
+
+    def __del__(self):
+        _free_native(self)
 
 class Timer(Thread):
     # Calls function(*args, **kwargs) after `interval` seconds unless

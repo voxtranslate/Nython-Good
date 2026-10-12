@@ -615,11 +615,12 @@ static std::string lock_name(int64_t id);
 
 // lockdep: taking `id` while holding H. An earlier observed order id -> ... -> h
 // means two threads could deadlock even if they did not this time.
+static bool is_pylock_locked(int64_t id);
 static void lockdep_check_locked(ThreadRec* self, int64_t id) {
     auto& rt = RT();
     if (!rt.lockdep) return;
     for (auto h : self->held) {
-        if (h == id) continue;
+        if (h == id || is_pylock_locked(h)) continue;
         std::set<int64_t> seen;
         if (order_path(id, h, seen))
             raise("LockOrderError", "lock order inversion: " + lock_name(h) + " is held while taking " +
@@ -628,7 +629,7 @@ static void lockdep_check_locked(ThreadRec* self, int64_t id) {
 }
 static void lockdep_note_locked(ThreadRec* self, int64_t id) {
     auto& rt = RT();
-    if (rt.lockdep) for (auto h : self->held) if (h != id) rt.order[h].insert(id);
+    if (rt.lockdep) for (auto h : self->held) if (h != id && !is_pylock_locked(h)) rt.order[h].insert(id);
     self->held.push_back(id);
 }
 static void held_erase(ThreadRec* self, int64_t id) {
@@ -828,12 +829,19 @@ static void task_park(std::unique_lock<std::mutex>& lk, ThreadRec* self, const D
 
 struct Mutex : Obj, Waitable {
     bool recursive = false;
+    // round 82: Python's primitive lock (threading.Lock, pylock_create): no
+    // owner - any thread may release it, its holder acquiring it again waits
+    // (for another thread's release) instead of raising DeadlockError, and
+    // it takes no part in lock-order checking or the wait-for graph, where a
+    // lock used as a signal would be reported falsely
+    bool pylock = false;
     ThreadRec* owner = nullptr;
+    int64_t owner_id = 0;           // the record id of `owner` (a pylock is released through it)
     int count = 0;
     WQ wq;
     ThreadRec* heir = nullptr;      // the waiter woken to compete for it (mutex_wake_heir)
-    void owners(std::vector<ThreadRec*>& out) const override { if (owner) out.push_back(owner); }
-    std::string describe() const override { return (recursive ? "rmutex#" : "mutex#") + std::to_string(id); }
+    void owners(std::vector<ThreadRec*>& out) const override { if (owner && !pylock) out.push_back(owner); }
+    std::string describe() const override { return (pylock ? "lock#" : recursive ? "rmutex#" : "mutex#") + std::to_string(id); }
 };
 
 struct RWLock : Obj {
@@ -853,6 +861,12 @@ struct RWWait : Waitable {
     std::string describe() const override { return "rwlock#" + std::to_string(rw->id) + (write ? " (write)" : " (read)"); }
 };
 
+static bool is_pylock_locked(int64_t id) {
+    auto it = RT().objs.find(id);
+    if (it == RT().objs.end()) return false;
+    auto* m = dynamic_cast<Mutex*>(it->second.get());
+    return m && m->pylock;
+}
 static std::string lock_name(int64_t id) {
     auto it = RT().objs.find(id);
     if (it != RT().objs.end()) {
@@ -900,16 +914,20 @@ static bool mutex_acquire(Engine& e, int64_t h, double timeout_ms) {
             std::lock_guard<std::mutex> l(RT().m);
             m = get_obj<Mutex>(h, "mutex");
             try {
-                if (m->owner == self) {
+                if (m->owner == self && !m->pylock) {
                     if (m->recursive) { m->count++; return true; }
                     raise("DeadlockError", "deadlock detected: thread " + self->label() + " tried to lock " +
                           m->describe() + ", which it already holds (not recursive)");
                 }
                 check_cancel_locked(self);
-                lockdep_check_locked(self, h);
+                if (!m->pylock) lockdep_check_locked(self, h);
             } catch (...) { mutex_heir_quit(m, self); throw; }
             if (m->heir == self) m->heir = nullptr;      // the heir competes now
-            if (!m->owner) { m->owner = self; m->count = 1; lockdep_note_locked(self, h); return true; }
+            if (!m->owner) {
+                m->owner = self; m->owner_id = self->id; m->count = 1;
+                if (m->pylock) self->held.push_back(h); else lockdep_note_locked(self, h);
+                return true;
+            }
             if (timeout_ms == 0 || dl.expired()) return false;
         }
         bool woken;
@@ -935,6 +953,20 @@ static void mutex_release(Engine& e, int64_t h) {
     ThreadRec* self = current(e);
     std::lock_guard<std::mutex> l(RT().m);
     Mutex* m = get_obj<Mutex>(h, "mutex");
+    if (m->pylock) {
+        // any thread releases a Python lock; the acquirer's held list (the
+        // GIL hand-over's "holds a lock") is found by its record id, as a
+        // task's record may be gone by then
+        if (!m->owner) raise("RuntimeError", "release unlocked lock");
+        if (m->owner == self) held_erase(self, h);
+        else {
+            auto it = RT().threads.find(m->owner_id);
+            if (it != RT().threads.end() && it->second.get() == m->owner) held_erase(m->owner, h);
+        }
+        m->owner = nullptr; m->owner_id = 0; m->count = 0;
+        mutex_wake_heir(m);
+        return;
+    }
     if (m->owner != self)
         raise("RuntimeError", "cannot unlock " + m->describe() + ": not held by thread " + self->label());
     if (--m->count > 0) return;
@@ -1105,7 +1137,7 @@ static bool cond_wait(Engine& e, int64_t ch, int64_t mh, double timeout_ms) {
             block(lk, self, {&m->wq},
                   [m, self] {
                       if (m->heir == self) m->heir = nullptr;
-                      if (!m->owner) { m->owner = self; return true; }
+                      if (!m->owner) { m->owner = self; m->owner_id = self->id; return true; }
                       return false;
                   },
                   Deadline::never(), m, false);
@@ -2295,6 +2327,13 @@ static std::unordered_map<std::string, Handler>& table() {
             return Ret::integer(add_obj(m));
         };
         T["mutex_create_recursive"] = T["rmutex_create"];
+        // pylock_create(): Python's primitive lock (threading.Lock) - see Mutex::pylock
+        T["pylock_create"] = [](Engine& e, const Args&) {
+            current(e);
+            std::lock_guard<std::mutex> l(RT().m);
+            auto m = std::make_shared<Mutex>(); m->pylock = true;
+            return Ret::integer(add_obj(m));
+        };
         T["mutex_lock"] = [](Engine& e, const Args& a) { return Ret::boolean(mutex_acquire(e, H(a, 0, "mutex_lock"), -1)); };
         T["mutex_try_lock"] = [](Engine& e, const Args& a) { return Ret::boolean(mutex_acquire(e, H(a, 0, "mutex_try_lock"), 0)); };
         T["mutex_trylock"] = T["mutex_try_lock"];

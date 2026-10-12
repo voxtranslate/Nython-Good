@@ -5788,3 +5788,9 @@ Full detail in `HANDOFF.md` §0u (part C), §0u2 (part B). New tests: `vm_audit1
 | A failed task nobody awaited was never reported | the runtime did not record whether a task's error was handed out; finished tasks stayed in asyncio's registry | `Task::err_seen` + `task_error_unseen`; `Task.__del__`/`Future.__del__` report through the exception handler; the registry drops a task when its body ends |
 | asyncio's Event/Lock/Semaphore/Queue kept their native objects forever | the runtime never freed sync objects | `sync_free(h)` (refused while anything waits), called from their `__del__` |
 
+| `import name` never found `name.py`; `-m name` neither | the search tried `.ny` files only | `.py` modules and `__init__.py` packages after every directory's `.ny` (`nyrt::module_exts`, both engines, `-m`) - a `.py` never shadows a library module |
+| `import "lib/x.ny"` worked only from the installation's directory | quoted names were looked for beside the importer, the working directory and its ancestors | also in each library directory and the installation's root (`nyrt::quoted_import_candidates`) |
+| `threading.get_ident()`/`current_thread()`/`threading.local` inside an asyncio task were the task's own | `thread_id()` is the task's record | `thread_os_id()`: the thread running the loop, as CPython |
+| `import _thread` failed | no module | `lib/_thread.ny` (start_new_thread, allocate_lock, interrupt_main, ...) |
+| `lock.acquire()` in one thread and `lock.release()` in another raised DeadlockError on the next acquire | `threading.Lock` was an owned mutex | a native Python lock (`pylock_create`: no owner, outside lock-order checking); CPython's errors (`release unlocked lock`, `cannot release un-acquired lock`, timeout checks) and reprs |
+| threading's Lock/Condition/Semaphore/Event kept their native objects forever | as asyncio's | `__del__` -> `sync_free` |

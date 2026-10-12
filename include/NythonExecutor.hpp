@@ -12672,7 +12672,7 @@ public:
         bool dir = false;
         std::string p = name.empty() ? std::string() : findModulePath(nullptr, name, &dir);
         std::string kind = p.empty() ? "" : dir ? "namespace"
-                         : (p.size() > 12 && p.compare(p.size() - 12, 12, "/__init__.ny") == 0) ? "package" : "file";
+                         : nyrt::is_package_init(p) ? "package" : "file";
         return nyos_list_of({p, kind});
     }
     // What sys.modules says about `name` wins over the engine's own cache.
@@ -12759,7 +12759,8 @@ public:
         // import ABCMeta` in lib/collections/abc.ny is lib/abc.ny, not the
         // module importing it (round 77).
         struct stat pst;
-        bool in_package = !here.empty() && stat((here + "__init__.ny").c_str(), &pst) == 0;
+        bool in_package = !here.empty() && (stat((here + "__init__.ny").c_str(), &pst) == 0
+                                            || stat((here + "__init__.py").c_str(), &pst) == 0);
         if (!here.empty() && !in_package) { dirs.push_back(here); dirs.push_back(here + "lib/"); }
         for (auto& d : sysPathDirs()) dirs.push_back(d);   // round 80
         for (const char* d : {"", "./", "lib/", "./lib/"}) dirs.push_back(d);
@@ -12804,10 +12805,13 @@ public:
         // round 81: `builtins` is the builtin module whatever sits beside
         // the script (CPython's BuiltinImporter comes first)
         if (dotted == "builtins") dirs = nyrt::library_dirs();
-        for (auto& d : dirs) {
-            if (stat((d + rel + ".ny").c_str(), &st) == 0 && !S_ISDIR(st.st_mode)) return d + rel + ".ny";
-            if (stat((d + rel + "/__init__.ny").c_str(), &st) == 0) return d + rel + "/__init__.ny";
-        }
+        // round 82: then name.py / name/__init__.py, when no directory has
+        // a .ny one (nyrt::module_exts)
+        for (auto& ext : nyrt::module_exts())
+            for (auto& d : dirs) {
+                if (stat((d + rel + ext).c_str(), &st) == 0 && !S_ISDIR(st.st_mode)) return d + rel + ext;
+                if (stat((d + rel + "/__init__" + ext).c_str(), &st) == 0) return d + rel + "/__init__" + ext;
+            }
         if (is_dir) for (auto& d : dirs) {
             std::string p = d.empty() ? rel : d + rel;
             if (stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode) && ny_fs::holds_modules(p)) { *is_dir = true; return p; }
@@ -12818,7 +12822,7 @@ public:
     bool isPackageName(const node_ptr& node, const std::string& name) {
         bool dir = false;
         std::string p = findModulePath(node, name, &dir);
-        return dir || (p.size() > 12 && p.compare(p.size() - 12, 12, "/__init__.ny") == 0);
+        return dir || nyrt::is_package_init(p);
     }
     // Module `dotted`, loaded once (its namespace).
     Value loadModule(const node_ptr& node, const std::string& dotted) {
@@ -12925,8 +12929,7 @@ public:
         mctx->defineByName("__name__", makeStringValue(module_name));
         mctx->defineByName("__file__", makeStringValue(filepath));
         {   // round 80: __package__ (relative imports, importlib) and a package's __path__
-            bool pkg = filepath.size() >= 12 && filepath.compare(filepath.size() - 11, 11, "__init__.ny") == 0
-                       && (filepath[filepath.size() - 12] == '/' || filepath[filepath.size() - 12] == '\\');
+            bool pkg = nyrt::is_package_init(filepath);
             size_t dot = module_name.rfind('.');
             mctx->defineByName("__package__", makeStringValue(pkg ? module_name : dot == std::string::npos ? std::string() : module_name.substr(0, dot)));
             if (pkg) {
@@ -13762,7 +13765,8 @@ public:
             // not beside a module of a package, for a name without quotes
             // (see moduleDirs, round 77)
             struct stat pst;
-            if (!here.empty() && !quoted && stat((here + "__init__.ny").c_str(), &pst) == 0) here.clear();
+            if (!here.empty() && !quoted && (stat((here + "__init__.ny").c_str(), &pst) == 0
+                                             || stat((here + "__init__.py").c_str(), &pst) == 0)) here.clear();
             if (!here.empty()) {
                 search_paths.push_back(here + module_name + ".ny");
                 search_paths.push_back(here + module_name);
@@ -13780,6 +13784,7 @@ public:
         for (auto& c : ancestorCandidates(node, module_name + ".ny")) search_paths.push_back(c);
         for (auto& c : ancestorCandidates(node, module_name)) search_paths.push_back(c);
         for (auto& d : nyrt::library_dirs()) search_paths.push_back(d + module_name + ".ny");
+        if (quoted) for (auto& c : nyrt::quoted_import_candidates(module_name)) search_paths.push_back(c);   // round 82
         // round 81: `builtins` is the builtin module whatever sits beside
         // the script (CPython's BuiltinImporter comes first)
         if (!quoted && module_name == "builtins") {
@@ -13792,6 +13797,8 @@ public:
             struct stat buf;
             if (stat(p.c_str(), &buf) == 0) { filepath = p; break; }
         }
+        // round 82: `import name` finds name.py when there is no name.ny
+        if (filepath.empty() && !quoted && module_name != "builtins") filepath = findModulePath(node, module_name);
         // A module that cannot be found used to import silently, so every name
         // it would have defined then failed later with no hint that the import
         // was the cause. Name the module and where it was looked for.
@@ -13868,7 +13875,7 @@ public:
                 {
                     size_t cut = stem.find_last_of("/\\");
                     if (cut != std::string::npos) stem = stem.substr(cut + 1);
-                    if (stem.size() > 3 && stem.compare(stem.size() - 3, 3, ".ny") == 0) stem = stem.substr(0, stem.size() - 3);
+                    if (stem.size() > 3 && (stem.compare(stem.size() - 3, 3, ".ny") == 0 || stem.compare(stem.size() - 3, 3, ".py") == 0)) stem = stem.substr(0, stem.size() - 3);
                 }
                 Value prev_name = ctx->getByName("__name__"), prev_file = ctx->getByName("__file__");
                 NameScope name_scope(ctx, prev_name, prev_file, makeStringValue(stem), makeStringValue(filepath));

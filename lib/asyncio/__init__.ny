@@ -334,7 +334,7 @@ class BaseDefaultEventLoopPolicy(AbstractEventLoopPolicy):
         self._set_called = {}
 
     def get_event_loop(self):
-        var tid = thread_id()
+        var tid = thread_os_id()
         var lo = self._local.get(tid)
         if lo is none and not self._set_called.get(tid, false) and tid == thread_main():
             lo = self.new_event_loop()
@@ -344,7 +344,7 @@ class BaseDefaultEventLoopPolicy(AbstractEventLoopPolicy):
         return lo
 
     def set_event_loop(self, loop):
-        var tid = thread_id()
+        var tid = thread_os_id()
         self._set_called[tid] = true
         if loop is not none and not isinstance(loop, AbstractEventLoop):
             raise TypeError("loop must be an instance of AbstractEventLoop or None, not '" + type(loop).__name__ + "'")
@@ -3159,7 +3159,7 @@ class BaseEventLoop(AbstractEventLoop):
         self._check_running()
         var old_hooks = self._install_agen_hooks()
         self._running = true
-        self._thread_id = thread_id()
+        self._thread_id = thread_os_id()
         try:
             async_loop_run(self._h, none)
         finally:
@@ -3179,7 +3179,7 @@ class BaseEventLoop(AbstractEventLoop):
             target = self._spawn(_wait_quietly(future), false)
         var old_hooks = self._install_agen_hooks()
         self._running = true
-        self._thread_id = thread_id()
+        self._thread_id = thread_os_id()
         try:
             async_loop_run(self._h, target)
         finally:
@@ -5730,7 +5730,7 @@ class Runner:
         except AttributeError:
             pass
         var sigint_handler = none
-        if thread_id() == thread_main() and not _WINDOWS:
+        if thread_os_id() == thread_main() and not _WINDOWS:
             import signal
             if signal.getsignal(signal.SIGINT) is signal.default_int_handler:
                 var runner = self

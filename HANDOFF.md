@@ -3,7 +3,8 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 82, follow-ups — **§0u4** (asyncio where part B left it different from CPython - TaskGroup groups, wait(), CancelledError(), the default executor, create_server(None), sendfile, pipes, async generator hooks; a `gc` module; `fileno()` the OS descriptor; vm_audit106).
+Last updated: round 82, follow-ups (2) — **§0u5** (`import name` finds `.py` modules and packages, `.ny` first; quoted imports from anywhere; `threading.Lock` is Python's ownerless lock; tasks see their loop's thread in threading; `_thread`; vm_audit107).
+Round 82, follow-ups — **§0u4** (asyncio where part B left it different from CPython - TaskGroup groups, wait(), CancelledError(), the default executor, create_server(None), sendfile, pipes, async generator hooks; a `gc` module; `fileno()` the OS descriptor; vm_audit106).
 Round 82, part C — **§0u** (NyxAI: lib/aiagent.ny made a programming agent that works offline - BM25F retrieval, program facts from the real parser (`ny_facts`), a rule engine, test generation, docstrings, review and fixes, a completion model - and the IDE's AGENT view; vm_audit105, e2e `agent`).
 Round 82, part B — **§0u2** (asyncio's missing half: the event-loop API over a persistent native loop, transports and protocols over TCP/UDP/Unix with flow control, streams rebuilt on StreamReaderProtocol, subprocesses waited for on the reactor, add_signal_handler and asyncio.run's Ctrl+C, TLS and start_tls, 3.12's cancellation rules, eager tasks, structured-concurrency reports; a GC heap-sampling fix that made many tasks quadratic, a VM break/continue-out-of-except leak; vm_audit104).
 Round 81, follow-ups — **§0t4** (gaps the round's agents found: class lambdas bound, `del C.m`, `list.pop`'s index, UnboundLocalError, set iterators; a package's `__spec__` on Windows; vm_audit102).
@@ -80,6 +81,61 @@ multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
 
 ---
+
+## 0u5. Round 82, follow-ups (2) — Python source modules, quoted imports from anywhere, Python's lock (vm_audit107)
+
+`examples/vm_audit107.ny` (22 checks) passes on both engines and under
+python3 (the quoted-import checks are Nython-only and count as passed
+there). Agent C's and part B's reports listed these; each was reproduced
+first:
+
+- **`import name` finds `name.py`**, a package's `__init__.py` and a
+  namespace package of `.py` modules (both engines' `findModulePath` /
+  `find_module_path`, the legacy single-name path, `-m`, importlib's
+  `find_spec`, `__package__`/`__path__` for a `.py` package:
+  `nyrt::is_package_init`). **Every directory is searched for `name.ny`
+  before any is for `name.py`** (`nyrt::module_exts`), so the library's
+  `.ny` modules are never shadowed by a stray `.py` file - CPython's
+  sys.path order lets a `random.py` beside a script replace the standard
+  library's; a `.ny` file beside the script still wins, as before. Within
+  one directory `dual.ny` wins over `dual.py`.
+- **A quoted import is also looked for in each library directory and in
+  the installation's root** (`nyrt::quoted_import_candidates`): the
+  library's files name each other `"lib/x.ny"`, which resolved only from
+  the repository's directory or below it; a program anywhere can now
+  `import "lib/heapq.ny" as hq`.
+- **`threading.Lock` is Python's primitive lock**: a native mutex in a new
+  mode (`Mutex::pylock`, `pylock_create()`): no owner - any thread releases
+  it, and its holder acquiring it again *waits* for that (it raised
+  DeadlockError: the acquire-here/release-there idiom, a lock used as a
+  binary signal, failed on both engines). It takes no part in the wait-for
+  graph or in lock-order checking (a lock used as a signal would be
+  reported falsely), but still counts as held for the GIL hand-over; its
+  release by another thread finds the acquirer's record by id (a task's
+  record may be gone). CPython's errors and reprs (`release unlocked lock`,
+  RLock's `cannot release un-acquired lock`, `can't specify a timeout for a
+  non-blocking call`, `timeout value must be positive`). RLock stays an
+  owned recursive mutex, as CPython's.
+- **Inside an asyncio task, `threading.get_ident()`, `current_thread()`
+  and `threading.local` are the loop thread's** (`thread_os_id()`), as in
+  CPython - a task is not a thread; asyncio's per-thread policy map and
+  `loop._thread_id` use it too. (`thread_id()` stays the record id - the
+  native runtime's own per-task notion.)
+- **`lib/_thread.ny`**: `start_new_thread` (daemon, an escaping exception
+  reported as "Exception ignored in thread started by"), `allocate_lock`/
+  `LockType`, `RLock`, `get_ident`, `get_native_id`, `interrupt_main`
+  (the handler runs in the main thread; nothing when SIG_DFL/SIG_IGN),
+  `exit`, `stack_size` (validated; always 0), `TIMEOUT_MAX`, `error`,
+  `_count`, `_local`.
+- threading's Lock, Condition, Semaphore and Event free their native
+  objects in `__del__` (`sync_free`), as asyncio's do since §0u4.
+
+### Not done
+- `threading.get_native_id()` is the runtime's record id, not the OS's
+  thread id; `stack_size()` sets nothing.
+- A single-threaded program that acquires a held `threading.Lock` without
+  a timeout waits forever, as in CPython (an owned `mutex_create` lock
+  still raises DeadlockError).
 
 ## 0u4. Round 82, follow-ups — asyncio as CPython, a `gc` module, real file descriptors (vm_audit106)
 
@@ -172,8 +228,9 @@ CPython or out; done here, each reproduced first:
   found them kept for the life of the process).
 
 ### Not done
-- `threading.get_ident()` inside a task is still the task's record id
-  (CPython: the thread's); only the asyncgen hooks use `thread_os_id()`.
+- ~~`threading.get_ident()` inside a task is still the task's record id
+  (CPython: the thread's); only the asyncgen hooks use `thread_os_id()`.~~
+  **Done in §0u5.**
 
 ## 0u. Round 82, part C — NyxAI, a programming agent that works offline (vm_audit105, e2e `agent`)
 

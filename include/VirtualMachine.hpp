@@ -13300,10 +13300,13 @@ private:
         // round 81: `builtins` is the builtin module whatever sits beside
         // the script (CPython's BuiltinImporter comes first)
         if(dotted=="builtins") dirs=nyrt::library_dirs();
-        for(auto& d:dirs){
-            if(::stat((d+rel+".ny").c_str(),&st)==0 && !S_ISDIR(st.st_mode)) return d+rel+".ny";
-            if(::stat((d+rel+"/__init__.ny").c_str(),&st)==0) return d+rel+"/__init__.ny";
-        }
+        // round 82: then name.py / name/__init__.py, when no directory has
+        // a .ny one (nyrt::module_exts)
+        for(auto& ext:nyrt::module_exts())
+            for(auto& d:dirs){
+                if(::stat((d+rel+ext).c_str(),&st)==0 && !S_ISDIR(st.st_mode)) return d+rel+ext;
+                if(::stat((d+rel+"/__init__"+ext).c_str(),&st)==0) return d+rel+"/__init__"+ext;
+            }
         if(is_dir) for(auto& d:dirs){
             std::string p=d.empty()?rel:d+rel;
             if(::stat(p.c_str(),&st)==0 && S_ISDIR(st.st_mode) && holds_modules(p)){ *is_dir=true; return p; }
@@ -13313,7 +13316,7 @@ private:
     bool is_package_name(const std::string& name) {
         bool dir=false;
         std::string p=find_module_path(name,&dir);
-        return dir || (p.size()>12 && p.compare(p.size()-12,12,"/__init__.ny")==0);
+        return dir || nyrt::is_package_init(p);
     }
     VMVal load_module(const std::string& dotted) {
         sync_module(dotted);   // round 80
@@ -13396,8 +13399,7 @@ private:
         (*env)["__name__"]=VMVal::make_str(name);
         (*env)["__file__"]=VMVal::make_str(filepath);
         {   // round 80: __package__ (relative imports, importlib) and a package's __path__
-            bool pkg=filepath.size()>=12&&filepath.compare(filepath.size()-11,11,"__init__.ny")==0
-                     &&(filepath[filepath.size()-12]=='/'||filepath[filepath.size()-12]=='\\');
+            bool pkg=nyrt::is_package_init(filepath);
             size_t dot=name.rfind('.');
             (*env)["__package__"]=VMVal::make_str(pkg?name:dot==std::string::npos?std::string():name.substr(0,dot));
             if(pkg){
@@ -13681,10 +13683,13 @@ private:
             for(auto& c:ancestors(name+".ny")) paths.push_back(c);
             for(auto& c:ancestors(name)) paths.push_back(c);
             for(auto& d:nyrt::library_dirs()) paths.push_back(d+name+".ny");
+            if(!bare) for(auto& c:nyrt::quoted_import_candidates(name)) paths.push_back(c);   // round 82
             // round 81: `builtins` is the builtin module whatever sits beside
             // the script (CPython's BuiltinImporter comes first)
             if(bare&&name=="builtins"){ paths.clear(); for(auto& d:nyrt::library_dirs()) paths.push_back(d+name+".ny"); }
             for(auto& p:paths){struct stat st;if(::stat(p.c_str(),&st)==0){filepath=p;break;}}
+            // round 82: `import name` finds name.py when there is no name.ny
+            if(filepath.empty()&&bare&&name!="builtins") filepath=find_module_path(name);
             // Kept for the error message below; `paths` goes out of scope here.
             for(size_t i=0;i<paths.size();++i){ if(i) tried_paths+=", "; tried_paths+=paths[i]; }
         }
@@ -13740,7 +13745,7 @@ private:
                 std::string stem=filepath;
                 size_t cut=stem.find_last_of("/\\");
                 if(cut!=std::string::npos) stem=stem.substr(cut+1);
-                if(stem.size()>3&&stem.compare(stem.size()-3,3,".ny")==0) stem=stem.substr(0,stem.size()-3);
+                if(stem.size()>3&&(stem.compare(stem.size()-3,3,".ny")==0||stem.compare(stem.size()-3,3,".py")==0)) stem=stem.substr(0,stem.size()-3);
                 globals_["__name__"]=VMVal::make_str(stem);
                 globals_["__file__"]=VMVal::make_str(filepath);
             }
@@ -14354,7 +14359,7 @@ private:
             std::string name=a.empty()?std::string():vm_str(a[0]);
             bool dir=false;
             std::string p=name.empty()?std::string():find_module_path(name,&dir);
-            std::string kind=p.empty()?"":dir?"namespace":(p.size()>12&&p.compare(p.size()-12,12,"/__init__.ny")==0)?"package":"file";
+            std::string kind=p.empty()?"":dir?"namespace":nyrt::is_package_init(p)?"package":"file";
             return VMVal::make_list({VMVal::make_str(p),VMVal::make_str(kind)});
         });
         globals_["locals"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{
