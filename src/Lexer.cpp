@@ -396,7 +396,7 @@ void Lexer::reset_token() {
 }
 
 bool Lexer::isKeyWord(const std::string word) {
-    for(auto kw:Keywords()) {
+    for(const auto& kw:Keywords()) {   // round 82: by reference (a TokenDef - a string - was copied per keyword)
         if((kw.value.size() == word.size())&&(kw.value.c_str() == word)) {
             return true;
         }
@@ -405,7 +405,7 @@ bool Lexer::isKeyWord(const std::string word) {
 }
 
 bool Lexer::isOperator(const std::string word) {
-    for(auto op:Ops()) {
+    for(const auto& op:Ops()) {   // round 82
         if((op.value.size() == word.size())&&(op.value.c_str() == word)) {
             return true;
         }
@@ -414,7 +414,7 @@ bool Lexer::isOperator(const std::string word) {
 }
 
 bool Lexer::isSeparator(const std::string word) {
-    for(auto d:Delims()) {
+    for(const auto& d:Delims()) {   // round 82
         if((d.value.size() == word.size())&&(d.value.c_str() == word)) {
             return true;
         }
@@ -1362,7 +1362,7 @@ void Lexer::read_token() {
     // Change the type of keyword tokens
     if (this->token.type() == TokenType::Identifier && potential_keyword) {
         bool matched_kw = false;
-        for(auto kw : Keywords()) {
+        for(const auto& kw : Keywords()) {   // round 82: by reference (a string copied per keyword per identifier: 8% of the startup)
             if(this->token.value == kw.value) {
                 this->token.ident = kw.ident;
                 matched_kw = true;

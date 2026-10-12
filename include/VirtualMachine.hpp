@@ -1103,13 +1103,15 @@ class Compiler {
         auto c=std::make_shared<VMCode>(); c->name=name; c->is_class=is_class;
         code_stack_.push_back(code_); code_=c;
         body_saves_.push_back({std::move(loops_),std::move(fin_stack_),persist_depth_,std::move(exc_vars_)});
-        loops_.clear(); fin_stack_.clear(); persist_depth_=0; exc_vars_.clear();
+        body_saves_.back().fbl=std::move(fin_body_loops_);   // round 82
+        loops_.clear(); fin_stack_.clear(); persist_depth_=0; exc_vars_.clear(); fin_body_loops_.clear();
     }
     std::shared_ptr<VMCode> pop_code() {
         {
             auto& sv=body_saves_.back();
             loops_=std::move(sv.loops); fin_stack_=std::move(sv.fins);
             persist_depth_=sv.depth; exc_vars_=std::move(sv.ev);
+            fin_body_loops_=std::move(sv.fbl);   // round 82
             body_saves_.pop_back();
         }
         auto c=code_; code_=code_stack_.back(); code_stack_.pop_back();
@@ -1221,8 +1223,17 @@ class Compiler {
     // A function, lambda or class body starts with none of the above: a
     // `break` in a nested function does not belong to the enclosing loop and
     // a `return` there does not run the enclosing function's finally blocks.
-    struct SavedBody { std::vector<LoopCtx> loops; std::vector<FinCtx> fins; int depth; std::vector<std::string> ev; };
+    struct SavedBody { std::vector<LoopCtx> loops; std::vector<FinCtx> fins; int depth; std::vector<std::string> ev; std::vector<size_t> fbl{}; };
     std::vector<SavedBody> body_saves_;
+    // round 82: the finally bodies being compiled (innermost last), each as
+    // the loop depth it began at. Such a body runs over its try's state on
+    // the operand stack (FIN_NORMAL / the exception / a pending return), so
+    // a break or continue in it leaving a loop around the try drops that
+    // state first: FOR_ITER read it as its iterator (the loop ended).
+    std::vector<size_t> fin_body_loops_;
+    void drop_fin_states(int l){
+        for(size_t k=fin_body_loops_.size(); k-- > 0 && fin_body_loops_[k]>=loops_.size();) emit(Op::POP_TOP,0,l);
+    }
 
 public:
     Compiler() : code_(std::make_shared<VMCode>()) { code_->name="<module>"; }
@@ -1990,6 +2001,7 @@ private:
 
         // Break / Continue
         case NT::BREAK:
+            drop_fin_states(l);   // round 82: leaving a finally body
             // A break in a `for` must discard the iterator FOR_ITER would have
             // popped on natural exit; otherwise it outlives the loop.
             if(!loops_.empty() && loops_.back().is_for) emit(Op::POP_TOP,0,l);
@@ -1997,6 +2009,7 @@ private:
             else emit(Op::JUMP_ABSOLUTE,-9991,l);
             break;
         case NT::CONTINUE:
+            drop_fin_states(l);   // round 82: leaving a finally body
             if(loop_exit_crosses_finally()){ emit(Op::FIN_JUMP,-9992,l); jump_to_finally(l); }
             else emit(Op::JUMP_ABSOLUTE,-9992,l);
             break;
@@ -2115,7 +2128,9 @@ private:
                 C().exc_table[idx].finally_start=fs;
                 for(int j:fc.jumps) C().patch(j,fs);
                 persist_depth_++;
+                fin_body_loops_.push_back(loops_.size());   // round 82
                 visit_stmt(tn->finally_clause);
+                fin_body_loops_.pop_back();
                 persist_depth_--;
                 emit(Op::END_FINALLY, fin_stack_.empty()?-1:fin_stack_.back().entry, l);
             }
@@ -4063,18 +4078,33 @@ public:
     }
     bool prompt_session_=false;
 
+    // round 82: the prelude's AST, parsed once per process: the VM compiles
+    // it and its builtin bridge's interpreter (NythonExecutor::loadPrelude)
+    // runs it - each parsed it (a third of the VM's startup). Neither
+    // changes it (the parser's runner is not kept in it; the interpreter
+    // rewrites only expression bases of a class statement, which the
+    // prelude has none of). A failed parse is not kept: the next caller
+    // tries again and reports it.
+    static nython::node::node_ptr shared_prelude_ast() {
+        static std::mutex mu;
+        static nython::node::node_ptr ast;
+        std::lock_guard<std::mutex> lk(mu);
+        if(ast) return ast;
+        auto source=nython::reader::SourceCode(std::string(nyrt::prelude_source()));
+        auto reporter=std::make_shared<nython::exception::Reporter>(source);
+        auto lx=std::make_shared<nython::lexer::Lexer>(source);
+        lx->tokenize();
+        nython::parser::Parser pr(reporter.get(),nullptr,lx.get());
+        ast=pr.parse();
+        return ast;
+    }
     // The Nython prelude (include/NyPrelude.hpp) - the same text the
     // interpreter runs at startup: file objects for open().
     void load_prelude() {
         if(prelude_loaded_) return;
         prelude_loaded_=true;
         try {
-            auto source=nython::reader::SourceCode(std::string(nyrt::prelude_source()));
-            auto reporter=std::make_shared<nython::exception::Reporter>(source);
-            auto lx=std::make_shared<nython::lexer::Lexer>(source);
-            lx->tokenize();
-            auto pr=std::make_shared<nython::parser::Parser>(reporter.get(),(nython::Runnable*)this,lx.get());
-            auto ast=pr->parse();
+            auto ast=shared_prelude_ast();   // round 82
             if(!ast) return;
             prelude_asts_.push_back(ast);
             Compiler c; auto code=c.compile(ast);

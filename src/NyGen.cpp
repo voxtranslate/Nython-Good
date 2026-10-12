@@ -1,6 +1,8 @@
 // NyGen.cpp — lazy generators on the interpreter; see include/NyGen.hpp.
 #include "NythonExecutor.hpp"
 #include "NyGen.hpp"
+#include <optional>
+#include <array>
 #include "NyGC.hpp"
 #include "NyCoro.hpp"
 #include "NyConc.hpp"
@@ -1475,7 +1477,9 @@ Value for_loop(NythonExecutor& E, void* for_node, const Value& gv, Context* ctx,
     const size_t nt = fn->unpack_vars.size() + 1;
     const bool by_parts = NythonExecutor::astSpecOn() && nt >= 2 && nt <= 8 && g->kind == Kind::Native
         && ((g->op == Op::Enumerate && nt == 2) || (g->op == Op::Zip && g->src.size() == nt));
-    Value parts[8];
+    std::optional<std::array<Value, 8>> parts_store;   // made only for that loop
+    if (by_parts) parts_store.emplace();
+    Value* parts = by_parts ? parts_store->data() : nullptr;
     try {
         Value elem;
         for (bool head_first = true;; head_first = false) {

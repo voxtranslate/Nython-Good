@@ -149,7 +149,9 @@ static const std::set<std::string> builtin_set = {
 // old bigint_to_i64 went through a decimal string and std::stoll on every
 // arithmetic operation (a quarter of a call-heavy loop's time) and returned 0
 // for anything past 64 bits.
-inline bool bigint_fits_i64(const nython::kernel::bigint& b, int64_t& out) {
+// (round 82: always inlined - every int operand asks, and as a call it was
+// 2-3% of the call-heavy benchmarks)
+[[gnu::always_inline]] inline bool bigint_fits_i64(const nython::kernel::bigint& b, int64_t& out) {
     const auto& d = b.limbs();
     size_t n = d.size();
     while (n && d[n - 1] == 0) n--;
@@ -498,12 +500,8 @@ struct NythonExecutor {
             std::cerr << "[Nython] builtin exception classes failed to load\n";
         }
         try {
-            auto source = SourceCode(std::string(nyrt::prelude_source()));
-            auto reporter = std::make_shared<Reporter>(source);
-            auto lex = std::make_shared<Lexer>(source);
-            lex->tokenize();
-            auto parser = std::make_shared<Parser>(reporter.get(), (Runnable*)runner, lex.get());
-            auto ast = parser->parse();
+            // round 82: parsed once per process (the VM's compiler shares it)
+            auto ast = nython::vm::VirtualMachine::shared_prelude_ast();
             if (ast) {
                 imported_asts.push_back(ast);
                 // round 80: the prelude's code runs in prelude_ctx_, a scope
@@ -1036,23 +1034,11 @@ public:   // NythonExecutor is a struct: members default to public
     // right after - so an exception it raises may come back by the flag
     // (see FlowState): the nodes that can raise one that way are given leave
     // (`pend`), the rest are evaluated as by evalNode.
-    Value evalP(const node_ptr& n, Context* ctx) {
-        switch (n->type()) {
-            case NodeType::CALL: return evalCall(n, ctx, true);
-            case NodeType::BINARY: return evalBinary(n, ctx, true);
-            case NodeType::SUBSCRIPT: return evalSubscript(n, ctx, true);
-            case NodeType::ATTRIBUTE: return evalAttribute(n, ctx, true);
-            case NodeType::UNARY: return evalUnary(n, ctx, true);
-            case NodeType::ASSIGNMENT: return evalAssignment(n, ctx, true);
-            case NodeType::VARIABLE_DECL: return evalVarDecl(n, ctx, true);
-            case NodeType::ASSIGNMENT_AUG: return evalAugAssignment(n, ctx, true);
-            case NodeType::IF: return evalIf(n, ctx, true);
-            default: return evalNode(n, ctx);
-        }
-    }
+    Value evalP(const node_ptr& n, Context* ctx) { return evalNode(n, ctx, true); }
     static bool pendingSet() { return __builtin_expect(flow().pending != 0, 0); }
 
-    Value evalNode(const node_ptr& node, Context* ctx) {
+    // `pend` (round 82): see evalP - handed to the evaluators that take it
+    Value evalNode(const node_ptr& node, Context* ctx, bool pend = false) {
         if (!node) return NONE_VALUE;
 
         switch (node->type()) {
@@ -1068,13 +1054,13 @@ public:   // NythonExecutor is a struct: members default to public
             case NodeType::NONE: return NONE_VALUE;
             case NodeType::UNDEFINED: return UNDEFINED_VALUE;
             case NodeType::VARIABLE: return evalVariable(node, ctx);
-            case NodeType::VARIABLE_DECL: return evalVarDecl(node, ctx);
-            case NodeType::ASSIGNMENT: return evalAssignment(node, ctx);
-            case NodeType::ASSIGNMENT_AUG: return evalAugAssignment(node, ctx);
-            case NodeType::BINARY: return evalBinary(node, ctx);
-            case NodeType::UNARY: return evalUnary(node, ctx);
+            case NodeType::VARIABLE_DECL: return evalVarDecl(node, ctx, pend);
+            case NodeType::ASSIGNMENT: return evalAssignment(node, ctx, pend);
+            case NodeType::ASSIGNMENT_AUG: return evalAugAssignment(node, ctx, pend);
+            case NodeType::BINARY: return evalBinary(node, ctx, pend);
+            case NodeType::UNARY: return evalUnary(node, ctx, pend);
             case NodeType::PRINT: return evalPrint(node, ctx);
-            case NodeType::IF: return evalIf(node, ctx);
+            case NodeType::IF: return evalIf(node, ctx, pend);
             case NodeType::WHILE: return evalWhile(node, ctx);
             case NodeType::FOR: return evalFor(node, ctx);
             case NodeType::FUNCTION: return evalFunctionDecl(node, ctx);
@@ -1091,11 +1077,11 @@ public:   // NythonExecutor is a struct: members default to public
                 throw std::string("continue");
             }
             case NodeType::PASS: return NONE_VALUE;
-            case NodeType::CALL: return evalCall(node, ctx);
-            case NodeType::ATTRIBUTE: return evalAttribute(node, ctx);
+            case NodeType::CALL: return evalCall(node, ctx, pend);
+            case NodeType::ATTRIBUTE: return evalAttribute(node, ctx, pend);
             case NodeType::OPT_CHAIN: return evalOptChain(static_cast<OptChainNode*>(node.get()), ctx);
             case NodeType::CHAIN_HOLE: return static_cast<HoleNode*>(node.get())->slot;
-            case NodeType::SUBSCRIPT: return evalSubscript(node, ctx);
+            case NodeType::SUBSCRIPT: return evalSubscript(node, ctx, pend);
             case NodeType::LIST: return evalList(node, ctx);
             case NodeType::COMPLEX: return evalComprehension(node, ctx);
             case NodeType::COMPREHENSION: return evalComprehensionNode(node, ctx);
@@ -1211,7 +1197,7 @@ public:   // NythonExecutor is a struct: members default to public
         // round 82: in a function's own statements every construct up to
         // evalBody checks the pending flag, so an exception raised by a
         // statement's expression may come back by it (evalP)
-        const bool pend = canPend(ctx);
+        const bool pend = f.fast_ctx == ctx && ctx && astSpecOn();
         for (;;) {
             try {
                 for (size_t i = start; i < stmts.size(); i++) {
@@ -5517,6 +5503,13 @@ public:   // NythonExecutor is a struct: members default to public
             case NodeType::FUNCTION: case NodeType::LAMBDA: case NodeType::CLASS:
             case NodeType::COMPREHENSION:
                 return false;
+            // round 82: leaves - no child can yield (the chain of
+            // dynamic_casts below ran for each; most nodes are these)
+            case NodeType::VARIABLE: case NodeType::INTEGER: case NodeType::FLOAT: case NodeType::STRING:
+            case NodeType::TRUE: case NodeType::FALSE: case NodeType::NONE: case NodeType::UNDEFINED:
+            case NodeType::PASS: case NodeType::BREAK: case NodeType::CONTINUE: case NodeType::GLOBAL:
+            case NodeType::SELF: case NodeType::SUPER: case NodeType::BYTES:
+                return false;
             default: break;
         }
         Node* n = node.get();
@@ -6944,6 +6937,7 @@ public:   // NythonExecutor is a struct: members default to public
                 }
             }
             cn->bases = nb;
+            ++class_names_ver_;   // round 82
         }
         // `class C(Base, metaclass=M, **kw)`: the keywords, for
         // __init_subclass__ (metaclass: the class's metaclass).
@@ -7004,6 +6998,7 @@ public:   // NythonExecutor is a struct: members default to public
         class_val.value.p = (void*)node.get();
         func_names[(void*)node.get()] = "__class__:" + cn->name;
         class_by_name[cn->name] = (void*)node.get();
+        ++class_names_ver_;   // round 82: classDerivesFrom's answers
         mro_cache_.clear(); specInvalidate();
         attr_hook_cache_[0].clear();
         attr_hook_cache_[1].clear();
@@ -7288,6 +7283,7 @@ public:   // NythonExecutor is a struct: members default to public
         Value cls = classValueOfNode(node.get());
         func_names[(void*)node.get()] = "__class__:" + full;
         class_by_name[full] = (void*)node.get();
+        ++class_names_ver_;   // round 82
         if (!node->bases.empty()) class_parent[(void*)node.get()] = node->bases[0]->value();
         mro_cache_.clear(); specInvalidate();
         attr_hook_cache_[0].clear();
@@ -7548,6 +7544,7 @@ public:   // NythonExecutor is a struct: members default to public
         class_val.value.p = (void*)node.get();
         func_names[(void*)node.get()] = "__class__:" + in_->name;
         class_by_name[in_->name] = (void*)node.get();
+        ++class_names_ver_;   // round 82
         ctx->defineByName(in_->name, class_val);
         if (in_->body) {
             Context* iface_ctx = new Context(runner, in_->name, nullptr, nullptr, ctx);
@@ -11177,7 +11174,30 @@ public:
     }
     // Whether class `cls` is `want` or derives from it - through every base
     // of a user class, then Python's builtin exception hierarchy.
+    // round 82: the answers, kept while no class name is bound anew and no
+    // class statement's bases change (class_names_ver_): every except clause
+    // tested and every exception made (isExceptionClass, setExceptionArgs'
+    // four questions) walked class_by_name - a std::map by name - and the
+    // builtin hierarchy by string (11% of the exceptions benchmark)
+    uint64_t class_names_ver_ = 1, derives_memo_ver_ = 0;
+    std::unordered_map<std::string, bool> derives_memo_;
     bool classDerivesFrom(const std::string& cls, const std::string& want, int depth = 0) {
+        if (cls == want) return true;
+        if (depth == 0 && astSpecOn()) {
+            if (derives_memo_ver_ != class_names_ver_ || derives_memo_.size() > 8192) { derives_memo_.clear(); derives_memo_ver_ = class_names_ver_; }
+            std::string key;
+            key.reserve(cls.size() + want.size() + 1);
+            key.append(cls).push_back('\x1f');
+            key.append(want);
+            auto it = derives_memo_.find(key);
+            if (it != derives_memo_.end()) return it->second;
+            bool r = classDerivesFromWalk(cls, want, 0);
+            derives_memo_.emplace(std::move(key), r);
+            return r;
+        }
+        return classDerivesFromWalk(cls, want, depth);
+    }
+    bool classDerivesFromWalk(const std::string& cls, const std::string& want, int depth) {
         if (cls == want) return true;
         if (depth > 32 || cls.empty()) return false;
         auto it = class_by_name.find(cls);
@@ -15549,8 +15569,10 @@ public:
         FrameGuard _frame(fn, fc);   // round 77: frames and tracebacks
         // sys.settrace / sys.setprofile (round 79): one test per call
         if (__builtin_expect(nytrace::t_hooks & nytrace::ANY, 0) && !tbHiddenFile(fn->tok().fileName())) return runBodyHooked(fn, fn->body, fc, true);
-        Value r;
-        try { r = evalBody(fn->body, fc); }
+        try {
+            Value r = evalBody(fn->body, fc);
+            if (__builtin_expect(flow().pending != kPendExc, 1)) return r;
+        }
         catch (nython::node::ReturnSignal& rs) { return rs.value; }
         catch (std::string& flow) {
             tbUnwind(flow);
@@ -15561,13 +15583,10 @@ public:
         // round 82: the body raised by the pending flag - recorded as it
         // leaves this frame, then handed on as the call site asked
         FlowState& f = flow();
-        if (__builtin_expect(f.pending == kPendExc, 0)) {
-            std::string e = takeExc(f);
-            tbUnwind(e);
-            if (pend) { pendExc(std::move(e)); return NONE_VALUE; }
-            throw e;
-        }
-        return r;
+        std::string e = takeExc(f);
+        tbUnwind(e);
+        if (pend) { pendExc(std::move(e)); return NONE_VALUE; }
+        throw e;
     }
     // A lambda's body (round 77: a frame of its own, "<lambda>").
     Value runLambdaBody(LambdaNode* lam, Context* fc) {
