@@ -83,6 +83,10 @@ namespace nython::vm {
 // ═══════════════════════════════════════════════════════════════════════════
 // OPCODE
 // ═══════════════════════════════════════════════════════════════════════════
+// round 82: UNPACK_SEQ's argument - the count, and the strict flag (a for
+// statement's targets: Python's unpacking, see Op::UNPACK_SEQ)
+static constexpr int kUnpackCount = 0xFFFF;
+static constexpr int kUnpackStrict = 1 << 16;
 enum class Op : uint8_t {
     LOAD_CONST, LOAD_NAME, STORE_NAME, DEFINE_NAME,
     LOAD_ATTR,  STORE_ATTR, LOAD_SUBSCR, STORE_SUBSCR, DELETE_SUBSCR, DELETE_ATTR,
@@ -2291,19 +2295,15 @@ private:
             else if(nd->rebinds) emit_sn(n,l); else emit_dn(n,l);
         };
         if(!nd->unpack_vars.empty()) {
-            // for a, b, c in ...: FOR_ITER pushed [a_val, b_val,...]; unpack by index
-            std::string tmp="__for_unpack__";
-            emit_dn(tmp,l);
-            // Assign first var (nd->var)
-            int idx0=C().add_const(VMVal::make_int(0));
-            emit_ln(tmp,l); emit(Op::LOAD_CONST,idx0,l); emit(Op::LOAD_SUBSCR,0,l);
+            // for a, b, c in ...: the item FOR_ITER pushed, unpacked as
+            // Python unpacks it (round 82: UNPACK_SEQ's strict form -
+            // exactly that many values, else a ValueError; an object or a
+            // set iterated; a number a TypeError. It was indexed through a
+            // temporary: missing values an IndexError, extra ones dropped,
+            // an object with __iter__ "not subscriptable")
+            emit(Op::UNPACK_SEQ,(int)(nd->unpack_vars.size()+1)|kUnpackStrict,l);
             bind_loop(nd->var?nd->var->value():"_");
-            // Assign rest (nd->unpack_vars)
-            for(int ui=0;ui<(int)nd->unpack_vars.size();ui++){
-                int ci=C().add_const(VMVal::make_int(ui+1));
-                emit_ln(tmp,l); emit(Op::LOAD_CONST,ci,l); emit(Op::LOAD_SUBSCR,0,l);
-                bind_loop(nd->unpack_vars[ui]->value());
-            }
+            for(auto& u:nd->unpack_vars) bind_loop(u->value());
         } else {
             // The loop variable is a local of the running function (as on
             // the interpreter): a STORE rebound a global of the same name,
@@ -7668,7 +7668,7 @@ private:
         case Op::UNPACK_SEQ: {
             if(ns<1) break;
             const VMVal& q=stack_[ns-1];
-            if(q.type==VMType::LIST&&q.list&&!q.is_set()&&q.list->size()==(size_t)ins.arg) to=Op::UNPACK_SEQ_LIST;
+            if(q.type==VMType::LIST&&q.list&&!q.is_set()&&q.list->size()==(size_t)(ins.arg&kUnpackCount)) to=Op::UNPACK_SEQ_LIST;   // (round 82: the count bits)
             break;
         }
         case Op::LOAD_GLOBAL_NAME: {
@@ -8288,10 +8288,11 @@ private:
                 const size_t n=stack_.size();
                 if(n>=1){
                     VMVal& q=stack_[n-1];
-                    if(q.type==VMType::LIST&&q.list&&!q.is_set()&&q.list->size()==(size_t)ins.arg){
+                    const int cnt=ins.arg&kUnpackCount;   // round 82: the count bits
+                    if(q.type==VMType::LIST&&q.list&&!q.is_set()&&q.list->size()==(size_t)cnt){
                         std::shared_ptr<std::vector<VMVal>> keep=std::move(q.list);
                         stack_.pop_back();
-                        for(int i=ins.arg-1;i>=0;i--) stack_.push_back((*keep)[(size_t)i]);
+                        for(int i=cnt-1;i>=0;i--) stack_.push_back((*keep)[(size_t)i]);
                         break;
                     }
                 }
@@ -9439,8 +9440,29 @@ private:
             }
             case Op::UNPACK_SEQ: {
                 NY_QUICKEN();   // round 80
-                VMVal seq=pop(); int n=ins.arg;
+                VMVal seq=pop(); int n=ins.arg&kUnpackCount;
                 std::vector<VMVal> items;
+                if(ins.arg&kUnpackStrict){
+                    // round 82: a for statement's targets - Python's unpacking
+                    // (CPython's unpack_iterable): exactly n values, at most
+                    // n + 1 read from an iterator
+                    if(seq.type==VMType::LIST&&seq.list&&!seq.is_set()) items=*seq.list;
+                    else {
+                        if(seq.type==VMType::NONE||seq.type==VMType::BOOL||seq.type==VMType::INT||seq.type==VMType::FLOAT||seq.type==VMType::UNDEFINED)
+                            raise_native_exception("TypeError","cannot unpack non-iterable "+vm_type_name(seq)+" object");
+                        if(seq.type==VMType::INSTANCE){
+                            VMVal m;
+                            if(!class_lookup(seq.class_name,"__iter__",m)&&!class_lookup(seq.class_name,"__next__",m)&&!class_lookup(seq.class_name,"__getitem__",m))
+                                raise_native_exception("TypeError","cannot unpack non-iterable "+vm_type_name(seq)+" object");
+                        }
+                        VMVal it=vm_iter_open(seq), v;
+                        while((int)items.size()<=n&&vm_iter_step(it,v)) items.push_back(std::move(v));
+                    }
+                    if((int)items.size()>n) raise_native_exception("ValueError","too many values to unpack (expected "+std::to_string(n)+")");
+                    if((int)items.size()<n) raise_native_exception("ValueError","not enough values to unpack (expected "+std::to_string(n)+", got "+std::to_string(items.size())+")");
+                    for(int i=n-1;i>=0;i--) push(items[(size_t)i]);
+                    break;
+                }
                 if(seq.type==VMType::LIST&&seq.list) items=*seq.list;
                 else if(seq.type==VMType::STRING||seq.type==VMType::MAP||seq.type==VMType::ITERATOR||seq.type==VMType::GENERATOR)
                     items=iter_items(seq);   // by character / key / item

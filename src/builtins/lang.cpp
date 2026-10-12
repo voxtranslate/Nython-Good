@@ -267,6 +267,9 @@ Value dispatch_lang(NythonExecutor& E, const std::string& name,
             auto ast = parser->parse();
             if (ast) {
                 E.imported_asts.push_back(ast);
+                // round 82: the code is not the caller's own statements -
+                // it must not leave by the caller's pending flags
+                NythonExecutor::SuspendFast _sf;
                 return E.evalNode(ast, ctx);
             }
         } catch (nython::node::ReturnSignal& r) {

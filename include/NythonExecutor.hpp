@@ -938,13 +938,40 @@ public:   // NythonExecutor is a struct: members default to public
     //     break inside them throws exactly as before and they keep their
     //     finally/__exit__/else handling.
     // Thread-local, so each thread has its own.
+    //
+    // Exceptions (round 82): a Python exception raised inside Nython code
+    // travels the same way - pending 4, the exception string in `exc` (the
+    // string a C++ throw would carry) - CPython's error indicator
+    // (PyErr_Occurred with a NULL return; its 3.11 zero-cost tables are the
+    // C++ throw we keep for everything else). A statement may leave by it
+    // where a return may (fast_ctx is its context: canPend); an expression
+    // only when the evaluator that asked for its value checks the flag
+    // right after (evalP: the `pend` argument evalCall, evalBinary,
+    // evalSubscript, ... receive), so a pending exception never reaches
+    // code that would go on with the value. evalTry/evalWith take it as
+    // their catch clauses take a thrown one; a function's frame records it
+    // as it leaves (runFunctionBody, tbUnwind) and hands it on by the flag
+    // only when its call site asked (pend), else throws it - so builtins
+    // calling back into Nython code, generators, threads and the prelude
+    // see the C++ throw as before. Constructs that run user code must take
+    // it out of the flag first (takeExc) and put it back (pendExc).
     struct FlowState {
         Context* fast_ctx = nullptr;
         bool brk_ok = false;
-        int pending = 0;          // 1 return, 2 break, 3 continue
+        int pending = 0;          // 1 return, 2 break, 3 continue, 4 exception (round 82)
         Value value;              // a pending return's value
+        std::string exc;          // a pending exception (round 82)
     };
     static FlowState& flow() { static thread_local FlowState f; return f; }
+    static constexpr int kPendExc = 4;   // round 82
+    // round 82: the exception leaves by the flag
+    static void pendExc(std::string e) { FlowState& f = flow(); f.exc = std::move(e); f.pending = kPendExc; }
+    // round 82: the pending exception, taken out of the flag
+    static std::string takeExc(FlowState& f) { std::string e = std::move(f.exc); f.exc.clear(); f.pending = 0; return e; }
+    // round 82: whether a statement running in ctx may leave by the flag
+    // (every construct up to its function's evalBody checks it)
+    static bool canPend(Context* ctx) { return ctx && astSpecOn() && flow().fast_ctx == ctx; }
+    static bool isLoopFlow(const std::string& s) { return s == "break" || s == "continue"; }
     struct SuspendFast {
         FlowState& f; Context* c; bool b;
         SuspendFast() : f(flow()), c(f.fast_ctx), b(f.brk_ok) { f.fast_ctx = nullptr; f.brk_ok = false; }
@@ -966,7 +993,7 @@ public:   // NythonExecutor is a struct: members default to public
     // FlowState reference and `result` its running value.
 #define NY_LOOP_FLOW(broke_var) \
     if (lf.pending) { \
-        if (lf.pending == 1) return result; \
+        if (lf.pending == 1 || lf.pending == kPendExc) return result; \
         int ny_pf_ = lf.pending; lf.pending = 0; \
         if (ny_pf_ == 2) { broke_var = true; break; } \
         continue; \
@@ -999,11 +1026,31 @@ public:   // NythonExecutor is a struct: members default to public
         // None on the VM and in Python).
         Value v = NONE_VALUE;
         if (f.pending) {
+            if (f.pending == kPendExc) return v;   // round 82: its caller (runFunctionBody) takes it
             if (f.pending == 1) { v = f.value; f.value = NONE_VALUE; }
             f.pending = 0;
         }
         return v;
     }
+    // round 82: evaluates `n` for an evaluator that checks the pending flag
+    // right after - so an exception it raises may come back by the flag
+    // (see FlowState): the nodes that can raise one that way are given leave
+    // (`pend`), the rest are evaluated as by evalNode.
+    Value evalP(const node_ptr& n, Context* ctx) {
+        switch (n->type()) {
+            case NodeType::CALL: return evalCall(n, ctx, true);
+            case NodeType::BINARY: return evalBinary(n, ctx, true);
+            case NodeType::SUBSCRIPT: return evalSubscript(n, ctx, true);
+            case NodeType::ATTRIBUTE: return evalAttribute(n, ctx, true);
+            case NodeType::UNARY: return evalUnary(n, ctx, true);
+            case NodeType::ASSIGNMENT: return evalAssignment(n, ctx, true);
+            case NodeType::VARIABLE_DECL: return evalVarDecl(n, ctx, true);
+            case NodeType::ASSIGNMENT_AUG: return evalAugAssignment(n, ctx, true);
+            case NodeType::IF: return evalIf(n, ctx, true);
+            default: return evalNode(n, ctx);
+        }
+    }
+    static bool pendingSet() { return __builtin_expect(flow().pending != 0, 0); }
 
     Value evalNode(const node_ptr& node, Context* ctx) {
         if (!node) return NONE_VALUE;
@@ -1015,7 +1062,7 @@ public:   // NythonExecutor is a struct: members default to public
             case NodeType::INTEGER: return evalInteger(node);
             case NodeType::FLOAT: return evalFloat(node);
             case NodeType::STRING: return evalString(node, ctx);
-            case NodeType::BYTES: return makeBytesValue(node->token().value);
+            case NodeType::BYTES: return makeBytesValue(node->tok().value);
             case NodeType::TRUE: return Value(true);
             case NodeType::FALSE: return Value(false);
             case NodeType::NONE: return NONE_VALUE;
@@ -1161,6 +1208,10 @@ public:   // NythonExecutor is a struct: members default to public
                 if (!resume) jumpResuming() = false;
             }
         }
+        // round 82: in a function's own statements every construct up to
+        // evalBody checks the pending flag, so an exception raised by a
+        // statement's expression may come back by it (evalP)
+        const bool pend = canPend(ctx);
         for (;;) {
             try {
                 for (size_t i = start; i < stmts.size(); i++) {
@@ -1169,7 +1220,7 @@ public:   // NythonExecutor is a struct: members default to public
                     if (__builtin_expect(resume, 0) && i == start) { resume = false; result = resumeInto(child, ctx); }
                     else {
                         noteStatement(child, ctx);
-                        result = evalNode(child, ctx);
+                        result = pend ? evalP(child, ctx) : evalNode(child, ctx);
                     }
                     if (f.pending) return result;
                 }
@@ -1359,9 +1410,10 @@ public:   // NythonExecutor is a struct: members default to public
         return false;
     }
 
-    Value evalVarDecl(const node_ptr& node, Context* ctx) {
+    Value evalVarDecl(const node_ptr& node, Context* ctx, bool pend = false) {
         auto* vd = static_cast<VarDeclNode*>((node).get());
-        Value val = vd->init ? evalNode(vd->init, ctx) : NONE_VALUE;
+        Value val = vd->init ? (pend ? evalP(vd->init, ctx) : evalNode(vd->init, ctx)) : NONE_VALUE;
+        if (pend && pendingSet()) return NONE_VALUE;   // round 82: the value raised (evalP)
         // a, b = gen(): the targets index a list of its values (nygen); an
         // object with __iter__ / __next__ is iterated the same way, as Python
         // unpacks (it was indexed: "'It' object is not subscriptable").
@@ -1410,9 +1462,10 @@ public:   // NythonExecutor is a struct: members default to public
         return val;
     }
 
-    Value evalAssignment(const node_ptr& node, Context* ctx) {
+    Value evalAssignment(const node_ptr& node, Context* ctx, bool pend = false) {
         auto* an = static_cast<AssignmentNode*>((node).get());
-        Value val = evalNode(an->value_node, ctx);
+        Value val = pend ? evalP(an->value_node, ctx) : evalNode(an->value_node, ctx);
+        if (pend && pendingSet()) return NONE_VALUE;   // round 82: the value raised (evalP)
         if (an->target->type() == NodeType::VARIABLE) {
             auto* vn = static_cast<VariableNode*>((an->target).get());
             // In a class body a name is always bound in the class namespace:
@@ -2682,7 +2735,7 @@ public:   // NythonExecutor is a struct: members default to public
     // the same operators as the binary form, and stores back. Lists are
     // mutable, so `L += it` extends and `L *= n` repeats in place: every
     // alias sees the change (a new list used to be built, or none returned).
-    Value evalAugAssignment(const node_ptr& node, Context* ctx) {
+    Value evalAugAssignment(const node_ptr& node, Context* ctx, bool pend = false) {
         auto* an = static_cast<AugAssignNode*>((node).get());
         const std::string& op = an->op;
         if (op == "?\?=") return evalCoalesceAssign(an, ctx);
@@ -2710,7 +2763,8 @@ public:   // NythonExecutor is a struct: members default to public
         } else {
             old_val = evalNode(an->target, ctx);
         }
-        Value new_val = evalNode(an->value_node, ctx);
+        Value new_val = pend ? evalP(an->value_node, ctx) : evalNode(an->value_node, ctx);
+        if (pend && pendingSet()) return NONE_VALUE;   // round 82: the value raised (evalP)
         Value result;
         // Two numbers (round 81): binaryOp's answer without its other checks
         // (no container, bytes or object is involved), then the store.
@@ -3870,11 +3924,13 @@ public:   // NythonExecutor is a struct: members default to public
         Container* c = contOf(obj);
         return c && !isInstanceVal(obj) && seqLen(c) >= 0 && !isSetCont(c);
     }
-    Value getItem(const Value& obj, const Value& idx, Context* ctx) {
+    // `exc_out` (round 82): a list's, tuple's or dict's IndexError /
+    // KeyError is put there (and none returned) instead of thrown.
+    Value getItem(const Value& obj, const Value& idx, Context* ctx, std::string* exc_out = nullptr) {
         if (nygen::is_gen(obj)) pyRaise("TypeError", "'" + typeNameOf(obj) + "' object is not subscriptable");
         if (isInstanceValue(idx) && indexableSeq(obj)) {
             Value iv;
-            if (indexValue(idx, iv, ctx)) return getItem(obj, iv, ctx);
+            if (indexValue(idx, iv, ctx)) return getItem(obj, iv, ctx, exc_out);
         }
         {
             std::vector<Value> parts;
@@ -3916,7 +3972,9 @@ public:   // NythonExecutor is a struct: members default to public
                     }
                     // Python's words, as the VM says them (it said "index 5
                     // out of range (length 2)" here).
-                    throw std::string(std::string("__exc__:IndexError:") + (isTupleCont(cont) ? "tuple" : "list") + " index out of range");
+                    std::string e = std::string("__exc__:IndexError:") + (isTupleCont(cont) ? "tuple" : "list") + " index out of range";
+                    if (exc_out) { *exc_out = std::move(e); return NONE_VALUE; }   // round 82
+                    throw e;
                 }
             }
             auto it = dictFind(cont, idx);
@@ -3924,6 +3982,7 @@ public:   // NythonExecutor is a struct: members default to public
             // A missing dict key raises KeyError, as in Python (round 75: it
             // read none). d.get(k, default), `k in d` and d?[k] are the
             // graceful forms.
+            if (n < 0 && exc_out && !nypy::lenient_reads_log()) { *exc_out = keyErrorFlow(idx); return NONE_VALUE; }   // round 82
             if (n < 0) return missingKey(idx, ctx);
             pyRaise("TypeError", std::string(isTupleCont(cont) ? "tuple" : "list") + " indices must be integers or slices, not " + typeNameOf(idx));
         }
@@ -4055,12 +4114,21 @@ public:   // NythonExecutor is a struct: members default to public
         dictSet(cont, idx, val);
     }
 
-    Value evalSubscript(const node_ptr& node, Context* ctx) {
+    // `pend` (round 82): the evaluator asking checks the pending flag right
+    // after (evalP) - a missing key or an index out of range of a list,
+    // tuple or dict raises by it (getItem's exc_out).
+    Value evalSubscript(const node_ptr& node, Context* ctx, bool pend = false) {
         auto* sn = static_cast<SubscriptNode*>((node).get());
         Value obj = evalNode(sn->object, ctx);
         Value idx = evalNode(sn->index, ctx);
         if (astSpecOn())   // a list's item by an int index (round 81)
             if (ContainerType::value_type* kv = seqItemSlot(obj, idx, sn->slot_off, false)) return kv->second;
+        if (pend) {
+            std::string e;
+            Value r = getItem(obj, idx, ctx, &e);
+            if (!e.empty()) { pendExc(std::move(e)); return NONE_VALUE; }
+            return r;
+        }
         return getItem(obj, idx, ctx);
     }
 
@@ -4503,7 +4571,10 @@ public:   // NythonExecutor is a struct: members default to public
         return makeStringValue(out);
     }
 
-    Value evalBinary(const node_ptr& node, Context* ctx) {
+    // `pend` (round 82): the evaluator asking checks the pending flag right
+    // after (evalP); the operands are evaluated so too, and a division by
+    // zero raises by the flag.
+    Value evalBinary(const node_ptr& node, Context* ctx, bool pend = false) {
         BinaryNode* bn = static_cast<BinaryNode*>(node.get());
         // the operator's code, worked out from its text once (round 81)
         if (__builtin_expect(bn->opc < 0, 0)) bn->opc = (int8_t)binOpCode(bn->op);
@@ -4512,8 +4583,18 @@ public:   // NythonExecutor is a struct: members default to public
         // `and` / `or` short-circuit on truthiness and yield an operand, as in
         // Python: 0 or "x" is "x", [] or [1] is [1], "" and 1 is "". They used
         // to test only for false/none and always produced a bool for `and`.
-        case OP_AND: { Value lv = evalNode(bn->left, ctx); if (!isTruthy(lv)) return lv; return evalNode(bn->right, ctx); }
-        case OP_OR:  { Value lv = evalNode(bn->left, ctx); if (isTruthy(lv)) return lv; return evalNode(bn->right, ctx); }
+        case OP_AND: {
+            Value lv = pend ? evalP(bn->left, ctx) : evalNode(bn->left, ctx);
+            if (pend && pendingSet()) return NONE_VALUE;   // round 82
+            if (!isTruthy(lv)) return lv;
+            return pend ? evalP(bn->right, ctx) : evalNode(bn->right, ctx);
+        }
+        case OP_OR: {
+            Value lv = pend ? evalP(bn->left, ctx) : evalNode(bn->left, ctx);
+            if (pend && pendingSet()) return NONE_VALUE;   // round 82
+            if (isTruthy(lv)) return lv;
+            return pend ? evalP(bn->right, ctx) : evalNode(bn->right, ctx);
+        }
         // a ?? b: b only when a is none or undefined (and only then evaluated).
         case OP_COALESCE: { Value lv = evalNode(bn->left, ctx); if (!isAbsent(lv)) return lv; return evalNode(bn->right, ctx); }
         case OP_IS: case OP_ISNOT: {
@@ -4544,8 +4625,10 @@ public:   // NythonExecutor is a struct: members default to public
         }
         default: break;
         }
-        Value lv = evalNode(bn->left, ctx);
-        Value rv = evalNode(bn->right, ctx);
+        Value lv = pend ? evalP(bn->left, ctx) : evalNode(bn->left, ctx);
+        if (pend && pendingSet()) return NONE_VALUE;   // round 82
+        Value rv = pend ? evalP(bn->right, ctx) : evalNode(bn->right, ctx);
+        if (pend && pendingSet()) return NONE_VALUE;
         if (opc == OP_UNKNOWN) {
             // a @ b: __matmul__ / __rmatmul__ only.
             if (bn->op == "@") {
@@ -4558,10 +4641,26 @@ public:   // NythonExecutor is a struct: members default to public
         // Numbers (round 81): what binaryOp does with two of them, without
         // its checks for sets, objects and bytes (none of which a number is).
         if (astSpecOn() && isNumType(lv.type) && isNumType(rv.type)) {
+            if (pend && (opc == OP_DIV || opc == OP_FLOORDIV || opc == OP_MOD)) {
+                // round 82: ZeroDivisionError by the flag (nypy::arith's words)
+                Num x, y;
+                asNum(lv, x); asNum(rv, y);
+                if (const char* zm = zeroDivMessage(opc, x, y)) { pendExc(std::string("__exc__:ZeroDivisionError:") + zm); return NONE_VALUE; }
+            }
             Value r;
             if (numBinary(opc, lv, rv, r)) return r;
         }
         return binaryOp(opc, std::move(lv), std::move(rv), ctx);
+    }
+    // round 82: the message of the ZeroDivisionError x / // % y raises
+    // (nypy::arith's), or nullptr when y is not zero
+    static const char* zeroDivMessage(int opc, const Num& x, const Num& y) {
+        if (!((y.k == 1 && y.i == 0) || (y.k == 3 && y.d == 0.0))) return nullptr;
+        bool fl = x.k == 3 || y.k == 3;
+        if (opc == OP_DIV) return fl ? "float division by zero" : "division by zero";
+        if (opc == OP_FLOORDIV) return fl ? "float floor division by zero" : "integer division or modulo by zero";
+        if (opc == OP_MOD) return fl ? "float modulo" : "integer modulo by zero";
+        return nullptr;
     }
     static bool isNumType(ValueType t) {
         return t == ValueType::INTEGER || t == ValueType::DOUBLE || t == ValueType::BOOLEAN;
@@ -4630,9 +4729,10 @@ public:   // NythonExecutor is a struct: members default to public
         }
     }
 
-    Value evalUnary(const node_ptr& node, Context* ctx) {
+    Value evalUnary(const node_ptr& node, Context* ctx, bool pend = false) {
         auto* un = static_cast<UnaryNode*>((node).get());
-        Value v = evalNode(un->operand, ctx);
+        Value v = pend ? evalP(un->operand, ctx) : evalNode(un->operand, ctx);
+        if (pend && pendingSet()) return NONE_VALUE;   // round 82 (evalP)
         const std::string& op = un->op;
         if (op == "!" || op == "not") return Value(!isTruthy(v));
         if (op == "-" || op == "+" || op == "~") {
@@ -4851,9 +4951,10 @@ public:   // NythonExecutor is a struct: members default to public
     void printValue(Value v, Context* ctx = nullptr) { std::cout << strOf(v, ctx); }
 
     // ─── CONTROL FLOW ───────────────────────────────────────────────────
-    Value evalIf(const node_ptr& node, Context* ctx) {
+    Value evalIf(const node_ptr& node, Context* ctx, bool pend = false) {
         auto* in = static_cast<IfNode*>((node).get());
-        Value cond = evalNode(in->condition, ctx);
+        Value cond = pend ? evalP(in->condition, ctx) : evalNode(in->condition, ctx);
+        if (pend && pendingSet()) return NONE_VALUE;   // round 82: the test raised (evalP)
         if (isTruthy(cond)) return evalNode(in->then_branch, ctx);
         for (auto& ei : in->elseif_branches) {
             auto* eif = static_cast<IfNode*>((ei).get());
@@ -4870,10 +4971,15 @@ public:   // NythonExecutor is a struct: members default to public
         bool broke = false;
         FlowState& lf = flow();
         bool head_first = true;   // round 79: sys.settrace's line event for the header, each time it is tested again
+        const bool pend = canPend(ctx);   // round 82: the test may raise by the flag (evalP)
         while (true) {
             if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0) && !head_first) pyEvLineAt(node.get(), true);
             head_first = false;
-            if (!isTruthy(evalNode(wn->condition, ctx))) break;
+            if (pend) {
+                Value c = evalP(wn->condition, ctx);
+                if (pendingSet()) return result;
+                if (!isTruthy(c)) break;
+            } else if (!isTruthy(evalNode(wn->condition, ctx))) break;
             try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(wn->body, ctx); }
             catch (std::string& flow) {
                 if (flow == "break") { broke = true; break; }
@@ -4895,11 +5001,79 @@ public:   // NythonExecutor is a struct: members default to public
     // loop's bind_item (src/NyGen.cpp) does (round 77).
     template <class Bind>
     void bindUnpacked(ForNode* fn, const std::string& var_name, const Value& item, Context* ctx, Bind& bindv) {
-        std::vector<Value> parts = iterValues(item, ctx);
-        bindv(var_name, parts.empty() ? NONE_VALUE : parts[0]);
-        for (size_t ui = 0; ui < fn->unpack_vars.size(); ui++)
-            bindv(fn->unpack_vars[ui]->value(), ui + 1 < parts.size() ? parts[ui + 1] : NONE_VALUE);
+        bindForItem(fn, var_name, item, ctx, bindv);   // round 82
     }
+    // round 82: `for a, b, c in ...` - the item's values bound to the loop's
+    // targets, as Python unpacks: exactly as many (ValueError otherwise,
+    // CPython's words), a non-iterable item a TypeError, an iterator read no
+    // further than one past the count. (A list or tuple item had extra
+    // values dropped and missing ones bound to none; a string item bound
+    // only the first target.) Every loop kind binds through it - evalFor's
+    // and nygen::for_loop's.
+    template <class Bind>
+    void bindForItem(ForNode* fn, const std::string& var_name, const Value& item, Context* ctx, Bind& bindv) {
+        const size_t n = fn->unpack_vars.size() + 1;
+        if (Container* ec = contOf(item); ec && !isGenCont(ec) && !isSetCont(ec) && seqLen(ec) >= 0) {
+            int64_t len = seqLen(ec);
+            if ((size_t)len == n) {
+                // a list or tuple of that many: its items in place
+                bindv(var_name, seqAt(ec, 0));
+                for (size_t ui = 1; ui < n; ui++) bindv(fn->unpack_vars[ui - 1]->value(), seqAt(ec, (int64_t)ui));
+                return;
+            }
+            forUnpackCount(n, (size_t)len);
+        }
+        std::vector<Value> parts = forUnpackParts(item, n, ctx);
+        bindv(var_name, parts[0]);
+        for (size_t ui = 1; ui < n; ui++) bindv(fn->unpack_vars[ui - 1]->value(), parts[ui]);
+    }
+    // round 82: a list's or tuple's item i (0 <= i < its length)
+    static Value seqAt(Container* c, int64_t i) {
+        int8_t off = 0;
+        ContainerType::value_type* kv = seqSlot(c->container, i, off);
+        return kv ? kv->second : NONE_VALUE;
+    }
+    [[noreturn]] static void forUnpackRaise(size_t n, size_t got) {
+        if (got > n) pyRaise("ValueError", "too many values to unpack (expected " + std::to_string(n) + ")");
+        pyRaise("ValueError", "not enough values to unpack (expected " + std::to_string(n) + ", got " + std::to_string(got) + ")");
+    }
+    static void forUnpackCount(size_t n, size_t got) { if (got != n) forUnpackRaise(n, got); }
+    // round 82: the n values of an item that is not a list or tuple: a
+    // string's characters, a dict's keys, a set's items, an object's or a
+    // generator's values (at most n + 1 read, as CPython's unpack_iterable)
+    std::vector<Value> forUnpackParts(const Value& item, size_t n, Context* ctx) {
+        std::vector<Value> out;
+        switch (item.type) {
+            case ValueType::INTEGER: case ValueType::DOUBLE: case ValueType::BOOLEAN:
+            case ValueType::NONE: case ValueType::UNDEFINED:
+                pyRaise("TypeError", "cannot unpack non-iterable " + typeNameOf(item) + " object");
+            default: break;
+        }
+        if (Container* ec = contOf(item); ec && !isGenCont(ec) && !isSetCont(ec) && seqLen(ec) >= 0) out = seqItems(ec);
+        else if (isStringValue(item) || bytesOf(item) || (contOf(item) && !nygen::is_gen(item))) out = iterItems(item, ctx);
+        else if (isInstanceValue(item) && !rangeOf3(item) && viewOf(item, nullptr) < 0
+                 && !instanceHasMethod(item, "__iter__") && !instanceHasMethod(item, "__next__") && !instanceHasMethod(item, "__getitem__"))
+            pyRaise("TypeError", "cannot unpack non-iterable " + shownClassName(instanceClassName(item)) + " object");
+        else if (isInstanceValue(item) || nygen::is_gen(item)) {
+            Value it = nygen::make_iter(*this, item, ctx);
+            if (nygen::is_gen(it)) {
+                Value lst = nygen::unpack_list(*this, it, (int)n, ctx);   // n values exactly, or its ValueError
+                if (Container* lc = contOf(lst)) out = seqItems(lc);
+            } else {
+                std::vector<Value> no_args;
+                while (out.size() <= n) {
+                    Value v;
+                    try { v = callMethod(it, "__next__", no_args, ctx); }
+                    catch (nython::node::ReturnSignal& r) { v = r.value; }
+                    catch (std::string& exc) { if (excTypeMatches(exc, "StopIteration")) break; throw; }
+                    out.push_back(v);
+                }
+            }
+        } else out = iterItems(item, ctx);   // a class whose metaclass iterates, or its TypeError
+        forUnpackCount(n, out.size());
+        return out;
+    }
+    bool rangeOf3(const Value& v) { int64_t a, b, s; return rangeOf(v, a, b, s); }
     Value evalFor(const node_ptr& node, Context* ctx) {
         auto* fn = static_cast<ForNode*>((node).get());
         bool broke = false;
@@ -5020,13 +5194,7 @@ public:   // NythonExecutor is a struct: members default to public
             size_t slot = 0;
             auto bindElem = [&](const Value& elem) {
                 if (fn->unpack_vars.empty()) { bindv(var_name, elem); return; }
-                if (isInstanceValue(elem)) { bindUnpacked(fn, var_name, elem, ctx, bindv); return; }
-                std::vector<Value> parts;
-                if (Container* ec = contOf(elem); ec && seqLen(ec) >= 0) parts = seqItems(ec);
-                else parts = iterValues(elem, ctx);
-                bindv(var_name, parts.empty() ? NONE_VALUE : parts[0]);
-                for (size_t ui = 0; ui < fn->unpack_vars.size(); ui++)
-                    bindv(fn->unpack_vars[ui]->value(), ui + 1 < parts.size() ? parts[ui + 1] : NONE_VALUE);
+                bindForItem(fn, var_name, elem, ctx, bindv);   // round 82: the count checked
             };
             for (bool head_first = true;; head_first = false) {
                 NY_PYT_HEAD(!head_first)
@@ -5133,26 +5301,10 @@ public:   // NythonExecutor is a struct: members default to public
                     auto it = cont->container->find(key);
                     if (it != cont->container->end()) {
                         Value elem = it->second;
-                        if (!fn->unpack_vars.empty() && isInstanceValue(elem)) {
-                            // an object (a tuple subclass's instance ...):
-                            // unpacked by iterating it (round 77)
-                            bindUnpacked(fn, var_name, elem, ctx, bindv);
-                        } else if (!fn->unpack_vars.empty() && elem.isCollectable() && elem.value.gc) {
-                            // Tuple unpacking: destructure element
-                            auto* elem_cont = dynamic_cast<Container*>(elem.value.gc);
-                            if (elem_cont && elem_cont->container) {
-                                // First var gets index 0
-                                auto it0 = elem_cont->container->find("0");
-                                if (it0 != elem_cont->container->end())
-                                    bindv(var_name, it0->second);
-                                // Remaining vars get indices 1, 2, ...
-                                for (size_t ui = 0; ui < fn->unpack_vars.size(); ui++) {
-                                    auto itN = elem_cont->container->find(std::to_string(ui + 1));
-                                    if (itN != elem_cont->container->end())
-                                        bindv(fn->unpack_vars[ui]->value(), itN->second);
-                                }
-                            }
-                        } else {
+                        // round 82: a tuple, list, string, object ... item
+                        // unpacked as Python does, its count checked
+                        if (!fn->unpack_vars.empty()) bindForItem(fn, var_name, elem, ctx, bindv);
+                        else {
                             bindv(var_name, elem);
                         }
                         try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
@@ -5234,20 +5386,10 @@ public:   // NythonExecutor is a struct: members default to public
                     else throw;
                 }
                 if (stop) break;
-                // Unpack tuples for k,v iteration
-                if (!fn->unpack_vars.empty() && isInstanceValue(item)) {
-                    bindUnpacked(fn, var_name, item, ctx, bindv);   // round 77
-                } else if (!fn->unpack_vars.empty() && item.isCollectable()) {
-                    auto* cont = dynamic_cast<Container*>(item.value.gc);
-                    if (cont && cont->container) {
-                        bindv(var_name, cont->container->count("0") ? (*cont->container)["0"] : NONE_VALUE);
-                        for (size_t ui = 0; ui < fn->unpack_vars.size(); ui++) {
-                            std::string uname = fn->unpack_vars[ui]->value();
-                            auto uit = cont->container->find(std::to_string(ui + 1));
-                            bindv(uname, uit != cont->container->end() ? uit->second : NONE_VALUE);
-                        }
-                    }
-                } else {
+                // Unpack the item for `for k, v in ...` (round 82: as
+                // Python does, its count checked - bindForItem)
+                if (!fn->unpack_vars.empty()) bindForItem(fn, var_name, item, ctx, bindv);
+                else {
                     bindv(var_name, item);
                 }
                 try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
@@ -7730,7 +7872,7 @@ public:   // NythonExecutor is a struct: members default to public
     }
     // The call itself, when the site's cache answers for this receiver;
     // false (nothing done) otherwise.
-    bool methodFast(CallNode* cn, const std::string& name, const Value& obj, ArgBuf& argv, Context* ctx, Value& out) {
+    bool methodFast(CallNode* cn, const std::string& name, const Value& obj, ArgBuf& argv, Context* ctx, Value& out, bool pend = false) {
         auto* io = static_cast<nyheap::Inst*>(obj.value.o);
         void* cls = io->cls;
         CallNode::MethodIC* e = nullptr;
@@ -7785,7 +7927,7 @@ public:   // NythonExecutor is a struct: members default to public
             if (e->parent_name) fc->defineByName(kParent, *e->parent_name);
         }
         OwnerScope _os(owner_stack_, owner);
-        out = runFunctionBody(fn, fc);
+        out = runFunctionBody(fn, fc, pend);   // round 82: pend, the call site's
         return true;
     }
     // Every argument a plain positional one (not name=v, *xs or **kw).
@@ -8278,7 +8420,7 @@ public:
     static std::string last_stmt_where() {
         auto& n = last_stmt();
         if (!n) return std::string();
-        auto tk = n->token();
+        const auto& tk = n->tok();
         return tk.fileName() + ":" + std::to_string(tk.line());
     }
 
@@ -8390,7 +8532,7 @@ public:
     void traceStatement(const node_ptr& st, Context* ctx) {
         auto& T = tracer();
         if (!st || T.in_repr || T.capped) return;
-        auto tk = st->token();
+        const auto& tk = st->tok();
         std::string file = tk.fileName();
         if (!traceIsUserFile(file)) return;
         if (T.events >= T.max_events) {
@@ -8492,17 +8634,20 @@ public:
             auto at = static_pointer_cast<AttributeNode>(cn->callee);
             std::string base;
             if (at->object && at->object->type() == NodeType::VARIABLE)
-                base = at->object->token().value + ".";
+                base = at->object->tok().value + ".";
             else if (at->object && at->object->type() == NodeType::SELF)
                 base = "self.";
             return base + at->attr;
         }
         if (cn->callee->type() == NodeType::VARIABLE)
-            return cn->callee->token().value;
+            return cn->callee->tok().value;
         return std::string();
     }
 
-    Value evalCall(const node_ptr& node, Context* ctx) {
+    // `pend` (round 82): the evaluator asking checks the pending flag right
+    // after (evalP) - the fast paths below then let an exception come back
+    // by it (from an argument, the receiver or the callee's body).
+    Value evalCall(const node_ptr& node, Context* ctx, bool pend = false) {
         if (call_depth_ >= maxCallDepth())
             throw std::string("__exc__:RecursionError:maximum call depth exceeded ("
                               + std::to_string(maxCallDepth()) + ") — check for unintended "
@@ -8630,7 +8775,8 @@ public:
                 return NONE_VALUE;
             }
 
-            Value obj = evalNode(attr->object, ctx);
+            Value obj = pend ? evalP(attr->object, ctx) : evalNode(attr->object, ctx);
+            if (pend && pendingSet()) return NONE_VALUE;   // round 82
 
             // Evaluate arguments
             std::vector<Value> args; nyrt::OrderedKw<Value> kw_args;
@@ -8642,10 +8788,16 @@ public:
                 if (__builtin_expect(cn->plain_args < 0, 0)) cn->plain_args = plainCallArgs(cn) ? 1 : 0;
                 if (cn->plain_args && cn->args.size() < kFastArgs) {
                     ArgBuf argv;
+                    if (pend) {   // round 82: an argument's exception by the flag
+                        for (auto& a : cn->args) {
+                            argv.push(evalP(a, ctx));
+                            if (pendingSet()) return NONE_VALUE;
+                        }
+                    } else
                     for (auto& a : cn->args) argv.push(evalNode(a, ctx));
                     {
                         Value out;
-                        if (methodFast(cn, method_name, obj, argv, ctx, out)) return out;
+                        if (methodFast(cn, method_name, obj, argv, ctx, out, pend)) return out;
                     }
                     args.reserve(argv.n);
                     for (size_t i = 0; i < argv.n; i++) args.push_back(std::move(argv[i]));
@@ -8908,6 +9060,12 @@ public:
             const std::vector<std::string>* names = (cn->plain_args && code && na <= kFastArgs) ? simpleParams(code) : nullptr;
             if (names && names->size() == na && astSpecOn()) {
                 ArgBuf argv;
+                if (pend) {   // round 82: an argument's exception by the flag
+                    for (size_t i = 0; i < na; i++) {
+                        argv.push(evalP(cn->args[i], ctx));
+                        if (pendingSet()) return NONE_VALUE;
+                    }
+                } else
                 for (size_t i = 0; i < na; i++) argv.push(evalNode(cn->args[i], ctx));
                 nyheap::Func* fo = static_cast<nyheap::Func*>(callee.value.o);
                 Context* cp = fo->scope ? scopeOf(fo->scope) : ctx;
@@ -8922,7 +9080,7 @@ public:
                     for (size_t i = 0; i < na; i++) fc->container->append_new((*names)[i], Value(argv[i]));
                 else
                     for (size_t i = 0; i < na; i++) fc->defineByName((*names)[i], argv[i]);
-                if (is_def) return runFunctionBody(static_cast<FunctionNode*>(code), fc);
+                if (is_def) return runFunctionBody(static_cast<FunctionNode*>(code), fc, pend);
                 return runLambdaBody(static_cast<LambdaNode*>(code), fc);
             }
         }
@@ -8993,6 +9151,12 @@ public:
                 if (__builtin_expect(nytrace::t_hooks & nytrace::PROFILE, 0) && !nytrace::no_c_call(builtin))   // c_call ... (round 79)
                     return pyProfileBuiltin(callee, [&]() { return gen_s0 != nygen::serial_now() ? callBuiltinTemps(builtin, args, ctx, cn, gen_s0) : callBuiltin(builtin, args, ctx); });
                 if (gen_s0 != nygen::serial_now()) return callBuiltinTemps(builtin, args, ctx, cn, gen_s0);
+                // round 82: its exception goes on by the flag from here (a
+                // throw unwinds the builtin's frames only)
+                if (pend) {
+                    try { return callBuiltin(builtin, args, ctx); }
+                    catch (std::string& e) { if (isLoopFlow(e)) throw; pendExc(std::move(e)); return NONE_VALUE; }
+                }
                 return callBuiltin(builtin, args, ctx);
             }
             static const std::unordered_set<std::string> kw_builtins = {
@@ -9022,6 +9186,10 @@ public:
             if (__builtin_expect(nytrace::t_hooks & nytrace::PROFILE, 0) && !nytrace::no_c_call(builtin))   // c_call ... (round 79)
                 return pyProfileBuiltin(callee, [&]() { return gen_s0 != nygen::serial_now() ? callBuiltinTemps(builtin, args, ctx, cn, gen_s0) : callBuiltin(builtin, args, ctx); });
             if (gen_s0 != nygen::serial_now()) return callBuiltinTemps(builtin, args, ctx, cn, gen_s0);
+            if (pend) {   // round 82, as above
+                try { return callBuiltin(builtin, args, ctx); }
+                catch (std::string& e) { if (isLoopFlow(e)) throw; pendExc(std::move(e)); return NONE_VALUE; }
+            }
             return callBuiltin(builtin, args, ctx);
         }
         // A builtin value's method read as a value (f = xs.append; f(1)).
@@ -9057,7 +9225,7 @@ public:
                     CtxReaper _reap(this, fn_ctx);
                     // Bind parameters with keyword arg and *args support
                     bindParamsKw(fn, args, kw_args, fn_ctx, ctx, 0, callee.value.p);
-                    return runFunctionBody(fn, fn_ctx);
+                    return runFunctionBody(fn, fn_ctx, pend);   // round 82: pend, the call site's
                 } else if (raw->type() == NodeType::LAMBDA) {
                     auto lam = static_cast<LambdaNode*>(raw);
                     // Use closure context if available (for returned lambdas)
@@ -9478,7 +9646,9 @@ public:
     // AttributeError, whatever the object (round 75: it read none, and
     // library code probed optional attributes that way). Graceful forms:
     // getattr(o, n, d), hasattr, `o?.attr` and `o?.attr ?? d`.
-    Value evalAttribute(const node_ptr& node, Context* ctx) {
+    // `pend` (round 82): the evaluator asking checks the pending flag right
+    // after (evalP) - a missing attribute raises by it.
+    Value evalAttribute(const node_ptr& node, Context* ctx, bool pend = false) {
         auto* an = static_cast<AttributeNode*>(node.get());
         {
             Value sv;
@@ -9511,6 +9681,10 @@ public:
         if (astSpecOn() && !any_getattribute_ && obj.type == ValueType::USERDATA && obj.value.p
             && classLoadFast(an, obj, ctx, v)) return v;
         if (getAttrValue(obj, an->attr, ctx, v)) return v;
+        if (pend && !nypy::lenient_reads_log()) {   // round 82: missingAttribute's, by the flag
+            pendExc("__exc__:AttributeError:" + attributeErrorText(obj, an->attr));
+            return NONE_VALUE;
+        }
         return missingAttribute(obj, an->attr, node.get());
     }
     // The entry of `key` in a scope's map, trying the slot `hint` remembers
@@ -9999,7 +10173,7 @@ public:
         // [7]: the code's identity (round 81: one code object per function,
         // so f.__code__ is frame.f_code - the prelude's _ny_code_of)
         return makeListValue({makeStringValue(name), makeStringValue(qn), mod, makeListValue(ps), Value(flags),
-                              makeStringValue(node->token().fileName()), Value(fn && fn->first_line ? fn->first_line : (int)node->token().line()),
+                              makeStringValue(node->tok().fileName()), Value(fn && fn->first_line ? fn->first_line : (int)node->tok().line()),
                               intValue((int64_t)(uintptr_t)node)});
     }
     // _ny_fn_globals(f) (round 77): f.__globals__, the names of the module
@@ -10086,7 +10260,7 @@ public:
     }
     void logLenientRead(Node* where, const std::string& what) {
         std::string loc;
-        if (where) { auto tk = where->token(); loc = tk.fileName() + ":" + std::to_string(tk.line()); }
+        if (where) { const auto& tk = where->tok(); loc = tk.fileName() + ":" + std::to_string(tk.line()); }
         else loc = last_stmt_where();
         static std::mutex mu;
         static std::set<std::string> seen;
@@ -10413,6 +10587,14 @@ public:
     // ─── RETURN ─────────────────────────────────────────────────────────
     Value evalReturn(const node_ptr& node, Context* ctx) {
         auto* rn = static_cast<ReturnNode*>((node).get());
+        // round 82: `return f(x)` - the call's exception may come back by
+        // the flag (evalP), and leaves as the statement's
+        if (rn->expr && canPend(ctx)) {
+            Value val = evalP(rn->expr, ctx);
+            FlowState& f = flow();
+            if (f.pending) return NONE_VALUE;
+            f.value = val; f.pending = 1; return val;
+        }
         Value val = rn->expr ? evalNode(rn->expr, ctx) : NONE_VALUE;
         FlowState& f = flow();
         if (ctx && f.fast_ctx == ctx) { f.value = val; f.pending = 1; return val; }
@@ -10564,7 +10746,7 @@ public:
         auto cn = static_pointer_cast<ComplexNode>(node);
         if (cn->items.size() < 2) return NONE_VALUE;
         // List comprehension: [expr for var in iterable if cond]
-        std::string var_name = cn->token().value;
+        std::string var_name = cn->tok().value;
         node_ptr expr_node = cn->items[0];
         node_ptr iter_node = cn->items[1];
         node_ptr filter_node = (cn->items.size() >= 3) ? cn->items[2] : nullptr;
@@ -10787,7 +10969,9 @@ public:
     }
     // KeyError(key) raised by the runtime (a missing key, set.remove, ...):
     // the key itself is its argument, as in Python (round 77).
-    [[noreturn]] void raiseKeyError(const Value& key) {
+    [[noreturn]] void raiseKeyError(const Value& key) { throw keyErrorFlow(key); }
+    // round 82: what raiseKeyError raises, not thrown
+    std::string keyErrorFlow(const Value& key) {
         Node* cn = classNodeByName("KeyError");
         if (cn) {
             Value cv; cv.type = ValueType::USERDATA; cv.value.p = (void*)cn;
@@ -10796,10 +10980,10 @@ public:
             Value inst = instantiateClass(cv, a, no_kw, global_ctx);
             if (isInstanceVal(inst)) {
                 if (!handling_obj_.empty()) setExcContext(inst, handling_obj_.back().second);
-                throw rememberRaised("KeyError", inst);
+                return rememberRaised("KeyError", inst);
             }
         }
-        pyRaise("KeyError", reprOf(key));
+        return "__exc__:KeyError:" + reprOf(key);
     }
     std::string valueToDisplay(const Value& v) {
         if (v.type == ValueType::USERDATA && v.value.p && instance_to_class.count(v.value.p))
@@ -10902,9 +11086,8 @@ public:
     Value excInstanceOf(const std::string& flow) {
         size_t op = flow.find(":__obj__:");
         if (op == std::string::npos || flow.compare(0, 8, "__exc__:") != 0) return NONE_VALUE;
-        uintptr_t ptr_val = 0;
-        std::istringstream iss(flow.substr(op + 9));
-        iss >> std::hex >> ptr_val;
+        // round 82: the serial read without a stream (one was made per read)
+        uintptr_t ptr_val = (uintptr_t)std::strtoull(flow.c_str() + op + 9, nullptr, 16);
         auto eit = exc_instance_map_.find(reinterpret_cast<void*>(ptr_val));
         if (eit != exc_instance_map_.end()) return eit->second;
         // Evicted from the ring below while an except clause still handles it.
@@ -10931,9 +11114,13 @@ public:
             exc_instance_map_.erase(exc_ring_.front());
             exc_ring_.pop_front();
         }
-        std::ostringstream oss;
-        oss << "__exc__:" << class_name << ":__obj__:" << std::hex << serial;
-        return oss.str();
+        // round 82: spelled without a stream (one was made per raise)
+        char hex[20];
+        auto r = std::to_chars(hex, hex + sizeof hex, (unsigned long long)serial, 16);
+        std::string out;
+        out.reserve(17 + class_name.size() + (size_t)(r.ptr - hex));
+        out.append("__exc__:").append(class_name).append(":__obj__:").append(hex, (size_t)(r.ptr - hex));
+        return out;
     }
     // The exception object an except clause binds: the raised instance, or
     // for an error raised as "__exc__:Type:message" (runtime errors, native
@@ -11143,7 +11330,7 @@ public:
     // program's top level), whose frame object the entry gets (round 78).
     void tbRecord(TbPending& P, Node* where, const PyFrame& fr, size_t idx) {
         if (!where) return;
-        auto tk = where->token();
+        const auto& tk = where->tok();
         std::string file = tk.fileName();
         if (tbHiddenFile(file)) return;
         P.recs.push_back({std::move(file), (int64_t)tk.line(), frameName(fr.code), frameModule(fr.ctx), frameObject(idx, where, false)});
@@ -11299,6 +11486,7 @@ public:
     template <class Fn> void tbFinally(Fn&& f) {
         TbPending saved = tb_pending();
         f();
+        if (flow().pending) return;   // round 82: its own flow replaced the exception (as when it throws)
         tb_pending() = std::move(saved);
         tb_pending().last = cur_stmt();
         for (auto& r : tb_pending().recs) if (r.frame.value.o) { tb_frames_held() = true; break; }   // round 78
@@ -11362,7 +11550,7 @@ public:
         std::vector<Value> out;
         auto add = [&](Node* where, const PyFrame& fr) {
             if (!where) return;
-            auto tk = where->token();
+            const auto& tk = where->tok();
             std::string file = tk.fileName();
             if (tbHiddenFile(file)) return;
             std::vector<Value> t{makeStringValue(file), intValue((int64_t)tk.line()),
@@ -11405,7 +11593,7 @@ public:
     // The prelude's frames are not shown (as in _ny_stack)
     bool frameVisible(size_t idx) {
         Node* w = frameWhere(idx);
-        return w && !tbHiddenFile(w->token().fileName());
+        return w && !tbHiddenFile(w->tok().fileName());
     }
     nyheap::Inst*& frameSlot(size_t idx) { return idx == kNoFrame ? main_fobj_ : py_frames()[idx].fobj; }
     Context* frameCtx(size_t idx) { return idx == kNoFrame ? global_ctx : py_frames()[idx].ctx; }
@@ -11418,7 +11606,7 @@ public:
         if (code) {
             auto* fnode = dynamic_cast<FunctionNode*>(code);
             std::string nm = fnode ? fnode->name : std::string("<lambda>");
-            int64_t ln = (int64_t)code->token().line();
+            int64_t ln = (int64_t)code->tok().line();
             auto it = frame_info_memo_.find(code);
             if (it != frame_info_memo_.end() && it->second.name == nm && it->second.line == ln
                 && (!fnode || fn_qualname_.empty())) return it->second.info;
@@ -11428,7 +11616,7 @@ public:
                 return info;
             }
         }
-        std::string file = where ? where->token().fileName() : std::string("<unknown>");
+        std::string file = where ? where->tok().fileName() : std::string("<unknown>");
         return makeListValue({makeStringValue("<module>"), makeStringValue("<module>"), makeStringValue(frameModule(ctx)),
                               makeListValue({}), intValue((int64_t)0), makeStringValue(file), intValue((int64_t)1)});
     }
@@ -11437,7 +11625,7 @@ public:
     void frameStore(nyheap::Inst* o, Node* where, Context* ctx, int64_t line = 0, bool with_locals = true) {
         Context* p = o ? o->props : nullptr;
         if (!p) return;
-        if (where) line = (int64_t)where->token().line();
+        if (where) line = (int64_t)where->tok().line();
         p->defineByName("_ny_line", intValue(line));
         p->defineByName("_ny_lasti", intValue(line * 2));   // no instruction offsets here: approximate
         if (with_locals) p->defineByName("_ny_locals", ctx ? reflectLocals(ctx) : reflectGlobals(nullptr));
@@ -11723,16 +11911,16 @@ public:
     // `jumpable` (round 81): a statement's line, a loop header's or an
     // elif's - where a trace function may move the frame (f_lineno).
     void pyEvLine(Node* st, bool jumpable = false) {
-        if (!st || tbHiddenFile(st->token().fileName())) return;
+        if (!st || tbHiddenFile(st->tok().fileName())) return;
         // a function's docstring is no code in CPython: no line event
         if (st->type() == NodeType::STRING && !py_frames().empty()) {
-            if (auto* fn = dynamic_cast<FunctionNode*>(py_frames().back().code); fn && fn->has_doc && st->token().value == fn->doc) return;
+            if (auto* fn = dynamic_cast<FunctionNode*>(py_frames().back().code); fn && fn->has_doc && st->tok().value == fn->doc) return;
         }
         size_t idx = pyTopIdx();
         JumpState& js = jumpState();
         if (__builtin_expect(js.skip_idx != SIZE_MAX, 0)) {
             // the line a jump went to: not reported (as CPython does not)
-            bool same = js.skip_idx == idx && js.skip_line == (int)st->token().line();
+            bool same = js.skip_idx == idx && js.skip_line == (int)st->tok().line();
             js.skip_idx = SIZE_MAX;
             if (same) return;
         }
@@ -11836,7 +12024,7 @@ public:
     }
     static void jumpWalkStmt(Node* s, std::vector<Node*>& chain, std::vector<JumpEntry>& out) {
         chain.push_back(s);
-        out.push_back({(int)s->token().line(), chain});
+        out.push_back({(int)s->tok().line(), chain});
         if (s->type() != NodeType::FUNCTION && s->type() != NodeType::CLASS) {   // their bodies are frames of their own
             std::vector<Node*> kids;
             jumpChildren(s, kids);
@@ -11868,7 +12056,7 @@ public:
             return false;
         };
         if (auto* fn = dynamic_cast<FunctionNode*>(py_frames()[idx].code)) {
-            root = fn->body.get(); first = fn->first_line ? (int)fn->first_line : (int)fn->token().line();
+            root = fn->body.get(); first = fn->first_line ? (int)fn->first_line : (int)fn->tok().line();
             holds(root);
         } else {
             if (main_ast_ && holds(main_ast_)) root = main_ast_;
@@ -11984,7 +12172,7 @@ public:
                 try { LoopBody _lb(lf); r = enter(n->body); }
                 catch (std::string& f) { if (f == "break") broke = true; else if (f != "continue") throw; }
                 if (lf.pending) {
-                    if (lf.pending == 1) return r;
+                    if (lf.pending == 1 || lf.pending == kPendExc) return r;   // round 82: an exception too
                     int pf = lf.pending; lf.pending = 0;
                     if (pf == 2) broke = true;
                 }
@@ -12031,7 +12219,7 @@ public:
         size_t idx = pyTopIdx();
         nyheap::Inst* o = frameSlot(idx);
         if (!o || !hookSet(frameTraceOf(o))) return;
-        if (Node* cs = cur_stmt(); cs && tbHiddenFile(cs->token().fileName())) return;
+        if (Node* cs = cur_stmt(); cs && tbHiddenFile(cs->tok().fileName())) return;
         Value ev = excInstanceOf(flow);
         if (!isInstanceVal(ev)) {
             if (pyt_exc_flow_ != flow) { pyt_exc_obj_ = exceptionObject(flow); pyt_exc_flow_ = flow; }
@@ -12056,7 +12244,7 @@ public:
     // that is not the prelude's (`fn` is what the profile function sees).
     template <class F> Value pyProfileBuiltin(const Value& fn, F&& run) {
         Node* cs = cur_stmt();
-        if (!(nytrace::t_hooks & nytrace::PROFILE) || (cs && tbHiddenFile(cs->token().fileName()))) return run();
+        if (!(nytrace::t_hooks & nytrace::PROFILE) || (cs && tbHiddenFile(cs->tok().fileName()))) return run();
         size_t idx = pyTopIdx();
         pyEvProfile(idx, "c_call", fn);
         Value r;
@@ -12094,6 +12282,13 @@ public:
     // `fast` (round 81): the statement runs without SuspendFast, so a return
     // or break in its clauses sets the pending flag instead of throwing;
     // each clause is checked for it as it ends. Otherwise as before.
+    // round 82: an exception may arrive by the flag too (pending 4) - from
+    // the body, the else clause or a handler - and is taken as the catch
+    // clauses take a thrown one; one that goes on leaves by the flag where
+    // the statement may (canPend: always when it came that way). A finally
+    // body run while an exception propagates that leaves by the flag
+    // itself (return, break, continue, its own exception) replaces it, as
+    // in Python (round 81's fast path re-raised the exception after it).
     Value evalTry(const node_ptr& node, Context* ctx, bool fast = false) {
         auto* tn = static_cast<TryNode*>(node.get());
         FlowState& fl = flow();
@@ -12103,8 +12298,16 @@ public:
         // propagates - it used to be silently dropped), and an exception
         // raised by a handler or the else clause (it used to skip finally).
         auto run_finally = [&]() { if (tn->finally_clause) evalNode(tn->finally_clause, ctx); };
-        // ... with an exception on its way out (its traceback record kept, round 77)
-        auto run_finally_exc = [&]() { if (tn->finally_clause) tbFinally([&]() { evalNode(tn->finally_clause, ctx); }); };
+        // ... with an exception on its way out (its traceback record kept,
+        // round 77); true when the body's own flow replaced it (round 82)
+        auto run_finally_exc = [&]() -> bool {
+            if (!tn->finally_clause) return false;
+            tbFinally([&]() { evalNode(tn->finally_clause, ctx); });
+            return fast && fl.pending;
+        };
+        // round 82: an exception going on from here - by the flag when the
+        // statement may leave by it, else thrown
+        const bool may_pend = fast && canPend(ctx);
         std::string exc;
         bool raised = false;
         try {
@@ -12117,6 +12320,7 @@ public:
             exc = flow; raised = true;
         }
         catch (std::exception& e) { exc = excFromCpp(e.what()); raised = true; }
+        if (fast && fl.pending == kPendExc) { exc = takeExc(fl); raised = true; }   // round 82
         if (raised) tbSee(exc);   // round 77: its line here, before a finally runs
         if (raised && __builtin_expect(nytrace::t_hooks & nytrace::ANY, 0)) pyEvException(exc);   // round 79
 
@@ -12128,11 +12332,19 @@ public:
                 catch (JumpSignal&) { throw; }   // round 81: a jump runs no finally
                 catch (nython::node::ReturnSignal&) { run_finally(); throw; }
                 catch (std::string& f2) {
-                    if (f2 == "break" || f2 == "continue") run_finally(); else { tbSee(f2); run_finally_exc(); }
+                    if (f2 == "break" || f2 == "continue") run_finally();
+                    else { tbSee(f2); if (run_finally_exc()) return result; }
                     throw;
                 }
-                catch (std::exception& e3) { tbSee(excFromCpp(e3.what())); run_finally_exc(); throw; }
+                catch (std::exception& e3) { tbSee(excFromCpp(e3.what())); if (run_finally_exc()) return result; throw; }
                 catch (...) { run_finally(); throw; }
+                if (fast && fl.pending == kPendExc) {   // round 82: the else clause raised
+                    std::string f2 = takeExc(fl);
+                    tbSee(f2);
+                    if (run_finally_exc()) return result;
+                    pendExc(std::move(f2));
+                    return NONE_VALUE;
+                }
                 if (fast && fl.pending) { leaveWithPending(fl, tn->finally_clause, ctx); return result; }   // round 81
             }
             run_finally();
@@ -12144,7 +12356,11 @@ public:
             auto* en = static_cast<ExceptNode*>(ec.get());
             if (excClauseMatches(en, exc, ctx)) { match = en; break; }
         }
-        if (!match) { run_finally_exc(); throw exc; }
+        if (!match) {
+            if (run_finally_exc()) return result;
+            if (may_pend) { pendExc(std::move(exc)); return NONE_VALUE; }   // round 82
+            throw exc;
+        }
         // the exception object, with its traceback (round 77)
         exc = tbCaught(exc);
         if (__builtin_expect(nytrace::t_hooks & nytrace::ANY, 0)) {
@@ -12187,11 +12403,20 @@ public:
             if (f2 == "break" || f2 == "continue") { run_finally(); throw; }
             tbHandlerExit(f2);
             tbSee(f2);
-            run_finally_exc();
+            if (run_finally_exc()) return result;
+            if (may_pend) { pendExc(f2); return NONE_VALUE; }   // round 82
             throw;
         }
-        catch (std::exception& e2) { std::string f3 = excFromCpp(e2.what()); tbHandlerExit(f3); tbSee(f3); run_finally_exc(); throw; }
+        catch (std::exception& e2) { std::string f3 = excFromCpp(e2.what()); tbHandlerExit(f3); tbSee(f3); if (run_finally_exc()) return result; throw; }
         catch (...) { run_finally(); throw; }
+        if (fast && fl.pending == kPendExc) {   // round 82: the handler raised (a bare raise, a new exception)
+            std::string f2 = takeExc(fl);
+            tbHandlerExit(f2);
+            tbSee(f2);
+            if (run_finally_exc()) return result;
+            pendExc(std::move(f2));
+            return NONE_VALUE;
+        }
         // a return/break/continue left the handler: as the thrown one did
         // (the finally body, no pyExcHandled) - round 81
         if (fast && fl.pending) { leaveWithPending(fl, tn->finally_clause, ctx); return result; }
@@ -12295,14 +12520,21 @@ public:
         runConstructor(instance, args, kw, ctx);
         return instance;
     }
+    // round 82: the raise statement leaves by the pending flag where it may
+    // (canPend), else throws as before; raiseFlow makes what it raises.
     Value evalRaise(const node_ptr& node, Context* ctx) {
-        auto rn = static_pointer_cast<RaiseNode>(node);
+        std::string e = raiseFlow(node, ctx);
+        if (canPend(ctx)) { pendExc(std::move(e)); return NONE_VALUE; }
+        throw e;
+    }
+    std::string raiseFlow(const node_ptr& node, Context* ctx) {
+        auto* rn = static_cast<RaiseNode*>(node.get());
         if (!rn->expr) {
             // Bare `raise`: the exception the enclosing except clause is
             // handling (it used to raise the string "Exception"), with the
             // traceback it has (round 77).
-            if (!handling_exc_.empty()) { tbReraise(handling_exc_.back()); throw std::string(handling_exc_.back()); }
-            throw std::string("__exc__:RuntimeError:No active exception to reraise");
+            if (!handling_exc_.empty()) { tbReraise(handling_exc_.back()); return handling_exc_.back(); }
+            return "__exc__:RuntimeError:No active exception to reraise";
         }
         Value v = evalNode(rn->expr, ctx);
         // `raise SomeClass` raises a new instance of it.
@@ -12315,7 +12547,7 @@ public:
                     v = instantiateClass(v, none_args, no_kw, ctx);
                 } else if (fit->second.rfind("__builtin__:", 0) == 0
                            && nython::ny_is_builtin_exc(fit->second.substr(12))) {
-                    throw std::string("__exc__:" + fit->second.substr(12) + ":");
+                    return "__exc__:" + fit->second.substr(12) + ":";
                 }
             }
         }
@@ -12343,13 +12575,13 @@ public:
                 // raised while an except clause handles another: that one
                 // is its __context__ (round 77)
                 if (!handling_obj_.empty()) setExcContext(v, handling_obj_.back().second);
-                throw rememberRaised(class_name, v);
+                return rememberRaised(class_name, v);
             }
-            throw getStringValue(v);
+            return getStringValue(v);
         }
-        if (v.type == ValueType::USERDATA && v.value.p) throw getStringValue(v);   // a string
-        if (v.type == ValueType::NONE) throw std::string("__exc__:Exception:");
-        throw std::string(v.toString());
+        if (v.type == ValueType::USERDATA && v.value.p) return getStringValue(v);   // a string
+        if (v.type == ValueType::NONE) return "__exc__:Exception:";
+        return v.toString();
     }
 
     Value evalAssert(const node_ptr& node, Context* ctx) {
@@ -12362,7 +12594,9 @@ public:
             } else {
                 msg = "Assertion failed";
             }
-            throw std::string("__exc__:AssertionError:" + msg);
+            std::string e = "__exc__:AssertionError:" + msg;
+            if (canPend(ctx)) { pendExc(std::move(e)); return NONE_VALUE; }   // round 82, as raise
+            throw e;
         }
         return NONE_VALUE;
     }
@@ -12372,7 +12606,7 @@ public:
     // Tokens carry their source file, so this needs no extra plumbing.
     std::string importerDir(const node_ptr& node) {
         if (!node) return std::string();
-        std::string f = node->token().fileName();
+        std::string f = node->tok().fileName();
         if (f.empty()) return std::string();
         size_t cut = f.find_last_of("/\\");
         if (cut == std::string::npos) return std::string();
@@ -12450,7 +12684,7 @@ public:
     // holds 1 must still be a value test.
     std::string typeNameOperand(const node_ptr& node, Context* ctx) {
         if (!node || node->type() != NodeType::VARIABLE) return std::string();
-        const std::string n = node->token().value;
+        const std::string n = node->tok().value;
         if (n.empty()) return std::string();
         static const std::set<std::string> type_names = {
             "int","Integer","integer","float","Float","double","Double",
@@ -14609,13 +14843,17 @@ public:
     // had one; frames, tracebacks and the trace events see it).
     Value runSnippetFrame(const node_ptr& ast, Context* sc) {
         FrameGuard _frame(nullptr, sc);
+        // round 82: exec(src) runs in the caller's own scope - its
+        // statements are not the caller's, whose pending flags they must
+        // not use (a raise there left by the flag, through exec)
+        SuspendFast _sf;
         if (__builtin_expect(nytrace::t_hooks & nytrace::ANY, 0)) {
             Node* first = ast.get();
             if (ast && (ast->type() == NodeType::SCRIPT || ast->type() == NodeType::STATEMENTS || ast->type() == NodeType::BLOCK)) {
                 auto sts = ast->statements();
                 if (!sts.empty() && sts[0]) first = sts[0].get();
             }
-            if (first && !tbHiddenFile(first->token().fileName())) return runBodyHooked(first, ast, sc, false);
+            if (first && !tbHiddenFile(first->tok().fileName())) return runBodyHooked(first, ast, sc, false);
         }
         try { return evalNode(ast, sc); }
         catch (std::string& flow) { tbUnwind(flow); throw; }
@@ -15291,7 +15529,10 @@ public:
     // A function body run to completion: its value. A generator function's
     // body does not run here: the call makes the generator, which runs the
     // body on a coroutine of its own, a step per next() (src/NyGen.cpp).
-    Value runFunctionBody(FunctionNode* fn, Context* fc) {
+    // `pend` (round 82): the call site checks the pending flag right after
+    // (evalP), so an exception leaving the body - by the flag or thrown - is
+    // handed on by the flag once the frame has recorded it; else thrown.
+    Value runFunctionBody(FunctionNode* fn, Context* fc, bool pend = false) {
         // whether the body yields, remembered by the def (round 81: a hash
         // lookup per call)
         if (__builtin_expect(fn->body_yields < 0, 0)) fn->body_yields = bodyYields(fn->body) ? 1 : 0;
@@ -15307,16 +15548,31 @@ public:
             return nygen::body_on_new_stack(*this, fn, fc);
         FrameGuard _frame(fn, fc);   // round 77: frames and tracebacks
         // sys.settrace / sys.setprofile (round 79): one test per call
-        if (__builtin_expect(nytrace::t_hooks & nytrace::ANY, 0) && !tbHiddenFile(fn->token().fileName())) return runBodyHooked(fn, fn->body, fc, true);
-        try { return evalBody(fn->body, fc); }
-        catch (nython::node::ReturnSignal& r) { return r.value; }
-        catch (std::string& flow) { tbUnwind(flow); throw; }
+        if (__builtin_expect(nytrace::t_hooks & nytrace::ANY, 0) && !tbHiddenFile(fn->tok().fileName())) return runBodyHooked(fn, fn->body, fc, true);
+        Value r;
+        try { r = evalBody(fn->body, fc); }
+        catch (nython::node::ReturnSignal& rs) { return rs.value; }
+        catch (std::string& flow) {
+            tbUnwind(flow);
+            if (pend && !isLoopFlow(flow)) { pendExc(flow); return NONE_VALUE; }   // round 82
+            throw;
+        }
         catch (std::exception& e) { tbUnwind(excFromCpp(e.what())); throw; }
+        // round 82: the body raised by the pending flag - recorded as it
+        // leaves this frame, then handed on as the call site asked
+        FlowState& f = flow();
+        if (__builtin_expect(f.pending == kPendExc, 0)) {
+            std::string e = takeExc(f);
+            tbUnwind(e);
+            if (pend) { pendExc(std::move(e)); return NONE_VALUE; }
+            throw e;
+        }
+        return r;
     }
     // A lambda's body (round 77: a frame of its own, "<lambda>").
     Value runLambdaBody(LambdaNode* lam, Context* fc) {
         FrameGuard _frame(lam, fc);
-        if (__builtin_expect(nytrace::t_hooks & nytrace::ANY, 0) && !tbHiddenFile(lam->token().fileName())) return runBodyHooked(lam, lam->body, fc, false);   // round 79
+        if (__builtin_expect(nytrace::t_hooks & nytrace::ANY, 0) && !tbHiddenFile(lam->tok().fileName())) return runBodyHooked(lam, lam->body, fc, false);   // round 79
         try { return evalNode(lam->body, fc); }
         catch (std::string& flow) { tbUnwind(flow); throw; }
         catch (std::exception& e) { tbUnwind(excFromCpp(e.what())); throw; }
@@ -15336,6 +15592,13 @@ public:
         catch (nython::node::ReturnSignal& r) { result = r.value; }
         catch (std::string& flow) { tbUnwind(flow); pyEvLeave(flow, idx); throw; }
         catch (std::exception& e) { std::string f = excFromCpp(e.what()); tbUnwind(f); pyEvLeave(f, idx); throw; }
+        // round 82: raised by the pending flag - as the catch above, thrown
+        if (FlowState& f = flow(); __builtin_expect(f.pending == kPendExc, 0)) {
+            std::string e = takeExc(f);
+            tbUnwind(e);
+            pyEvLeave(e, idx);
+            throw e;
+        }
         if (nytrace::t_hooks & nytrace::ANY) pyEvReturn(idx, result);
         return result;
     }
@@ -15675,6 +15938,9 @@ public:
             return sup;
         };
         Value result = NONE_VALUE;
+        // round 82: an exception __exit__ does not suppress goes on by the
+        // pending flag where the statement may leave by it
+        const bool may_pend = fast && canPend(ctx);
         try {
             result = evalNode(wn->body, ctx);
         }
@@ -15685,6 +15951,7 @@ public:
             std::string f = flow;
             if (__builtin_expect(nytrace::t_hooks & nytrace::ANY, 0)) pyEvException(f);   // round 79
             if (exit_exc(f)) return NONE_VALUE;
+            if (may_pend) { pendExc(std::move(f)); return NONE_VALUE; }   // round 82
             throw f;
         }
         catch (std::exception& e) {
@@ -15698,6 +15965,15 @@ public:
         // is a call, whose body must not see it), as for the thrown flow
         if (fast) {
             FlowState& fl = flow();
+            if (fl.pending == kPendExc) {
+                // round 82: an exception left the body by the flag - taken
+                // out of it while __exit__ runs, as the catch above does
+                std::string f = takeExc(fl);
+                if (__builtin_expect(nytrace::t_hooks & nytrace::ANY, 0)) pyEvException(f);
+                if (exit_exc(f)) return NONE_VALUE;
+                pendExc(std::move(f));
+                return NONE_VALUE;
+            }
             if (fl.pending) {
                 int p = fl.pending;
                 Value pv = std::move(fl.value);

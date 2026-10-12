@@ -35,7 +35,7 @@ inline std::ostream& operator<<(std::ostream& os,LexerInfoLevel level);
 using token_list = std::vector<Token>;
 using lexer_ptr  = std::shared_ptr<Lexer>;
 
-struct Lexer extends ILexer{
+struct Lexer final extends ILexer{   // round 82: final (direct calls)
 
     SourceCode& source;
     Token token;
@@ -74,11 +74,11 @@ public:
     void statistics();
     void reset();
     void dump();
-    Token next();
-    Token prev();
-    Token curr();
-    Token peek(int i);
-    std::vector<Token> tokenize();
+    const Token& next();   // round 82: by reference (the vector is not changed while it is read)
+    const Token& prev();
+    const Token& curr();
+    const Token& peek(int i);
+    const std::vector<Token>& tokenize();
     std::string code();
     std::string fileName();
     std::string toString();
