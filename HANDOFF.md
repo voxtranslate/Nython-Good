@@ -3,6 +3,10 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
+Round 81, part C — **§0t3** (live debugging: `nython --debug-port N`, a
+DAP-style debug server over bdb with step back and Why? over a ring buffer
+of recent statements; the IDE's live mode and PROFILE panel with a flame
+graph from cProfile's new calling context tree).
 Last updated: round 80 — **§0s** (part A: the correctness gaps rounds
 78-79 found - two interpreter crashes, object's members on every class,
 `except <expression>`, numeric keys across int/float/Fraction/Decimal,
@@ -61,6 +65,146 @@ multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
 
 ---
+
+## 0t3. Round 81, part C — live debugging and the Profile view (vm_audit101, e2e `live`/`profile`)
+
+`examples/vm_audit101.ny` (125 checks, Nython-only) passes on both engines:
+it starts real programs with `nython [--vm] --debug-port N`, drives the
+server with a DAP client written in the test, and reads real `-m cProfile`
+dumps. `tools/ide_e2e.py` gained `live` (37 checks, the program's stdin
+through the Output panel's input line among them) and `profile` (15) - the
+whole suite 442 passed, 0 failed;
+`tools/ide_memprobe.py` gained `live` and `profile` probes (0 KB/event).
+
+### The debug server (`lib/ide_debugserver.ny`, `DebugServer(bdb.Bdb)`)
+- `nython --debug-port N file.ny args` (main.cpp: rewritten to `-m
+  ide_debugserver --port N file.ny args`; `--debug-port 0` picks a port and
+  prints it on stderr; `--vm` works) listens on 127.0.0.1, waits for a
+  client, runs the program once `configurationDone` arrives. `-m
+  ide_debugserver --connect H:P` calls a listening client; `--ring N`,
+  `--no-ring`, `--stop-on-entry`.
+- Wire: DAP's `Content-Length` framing and message shapes. Requests:
+  initialize (capabilities incl. `supportsStepBack`, filters raised /
+  uncaught), launch/attach (stopOnEntry), setBreakpoints (moved to the next
+  statement and verified with `text_defuse`; condition, hitCondition `5
+  ==5 >5 >=5 <5 <=5 %5`, logMessage with `{expr}`), setExceptionBreakpoints,
+  configurationDone, threads, continue, next, stepIn, stepOut, pause,
+  stackTrace (paging), scopes (Locals, Globals), variables (children by
+  reference, made when asked; start/count), evaluate (an expression; in the
+  "repl" context a statement whose bindings reach the frame), setVariable
+  (a local through PEP 667's f_locals, a module variable, a list item, a
+  dict value, an attribute), exceptionInfo, source, stepBack,
+  reverseContinue, disconnect/terminate, and Nython's `nython/history`,
+  `nython/whyValue`, `nython/whyNot`, `nython/seek`, `nython/ping`. Events:
+  initialized, process, stopped (entry/breakpoint/step/pause/exception),
+  output (log points, condition errors, the uncaught traceback), exited,
+  terminated.
+- Threads: a socket thread reads; it answers initialize / setBreakpoints /
+  pause / threads / disconnect itself and queues the rest for the program's
+  thread, setting one attention flag the trace function tests per line -
+  that is how a pause reaches a running loop. While paused the program's
+  thread blocks on the queue and answers frame requests. The program's
+  stdin/stdout/argv are untouched (checked in vm_audit101; the IDE's Run
+  input line works under it).
+- Exceptions: "raised" stops once per exception object where it is raised
+  (StopIteration/GeneratorExit/SystemExit skipped); "uncaught" stops post
+  mortem on the traceback's frames (their last locals), then the
+  traceback is printed as Python's and the status is 1.
+- Just my code: frames in `lib/` and the prelude are not traced (call
+  events return None, as CPython allows); only the main thread is debugged.
+- **The hot path** (`trace_dispatch`): file/function/depth come from the
+  call event (`self._top`), the line and a fresh locals dict from one
+  `_ny_frame_sync(frame)` (the native layer under f_lineno/f_locals; the
+  property and the PEP 667 proxy cost ~25 µs a line on the interpreter),
+  one bound method is returned for every event. Without the ring and with
+  no breakpoint in the file and no step pending, a line costs the
+  attention test, one dict lookup and one compare.
+- **Engine gap found, worked around**: `frame.f_globals` and `globals()`
+  are copies on both engines (CPython's are the live module dict): a write
+  never reaches the program. The server writes module variables through
+  the namespace it exec'd the program in (live - `exec(code, ns)` reads
+  `ns`) and through the module object for imported modules
+  (`_globals`/`_set_global`).
+
+### Step back and Why? on the live program (the innovation)
+- Omniscient debugging (Lewis, "Debugging Backwards in Time", AADEBUG
+  2003; Pothier, Tanter & Piquer, "Scalable Omniscient Debugging", OOPSLA
+  2007 - TOD) records everything; here the trace function keeps only the
+  last N statements (2000) in a ring buffer: per statement the call's
+  (file, function, depth), the line, and the dict of that frame's
+  variables `_ny_frame_sync` made. `history_lines()` renders them as the
+  `--trace` JSON lines, and `lib/ide_debugger.ny`'s `DebugSession`
+  (`load_lines`, new) replays them: stepBack / next / stepIn / stepOut /
+  continue / reverseContinue move a cursor through the history (the stack
+  rebuilt from depths, the recorded variables shown, evaluate limited to
+  them, setVariable refused), forward steps reach "the present" where the
+  live program waits, and continue from there goes on live; a breakpoint
+  met while travelling stops there, the present included. `nython/whyValue`
+  and `nython/whyNot` run round 79's dynamic slicer over the history.
+- Approximated: only the last N statements (a write before them answers
+  "was not set by a recorded statement"); a step's bindings are exact but
+  an object they point to (a list, a dict, an instance) is rendered when
+  the history is read, so a later mutation shows at earlier steps (the
+  slicer still sees `xs.append(v)` as writing `xs` - text_defuse's static
+  write set); renderings are short (8 items, 6 keys, `<Cls object>`).
+- Cost, measured (tools: a 100,000-iteration loop in a function and a
+  50,000-iteration one at module level, min of 3 interleaved runs, a busy
+  4-core machine):
+
+  | | plain | traced, `--no-ring` | traced + ring | ring per statement |
+  |---|---|---|---|---|
+  | interpreter, function | 201 ms | 4100 ms (20x) | 8866 ms (2.2x tracing) | +16 µs |
+  | interpreter, module   | 85 ms  | 1986 ms (23x) | 4629 ms (2.3x) | +18 µs |
+  | VM, function          | 18.5 ms | 1457 ms (79x) | 2963 ms (2.0x) | +5 µs |
+  | VM, module            | 8.1 ms | 679 ms (84x)  | 2015 ms (3.0x) | +9 µs |
+
+  Tracing is what any bdb-style live debugger pays (a Python-level trace
+  function per line, as CPython's pdb before PEP 669); the ring about
+  doubles it (a module frame's dict is a copy of all globals, hence the
+  higher module cost). Before the hot-path rewrite the ring cost 4.4x
+  tracing (rendering every variable per line).
+
+### The IDE (`ide_live.ny`, `IDELive` between IDETools and NythonIDE)
+- Run > Start Live Debugging (Alt+F5; also a button in Run and Debug):
+  the program runs as `nython --debug-port N` with its output and input in
+  the Output panel; `lib/ide_debugclient.ny`'s `LiveDebugClient` connects
+  (retrying while the program starts) and is polled once per frame
+  (`NythonIDE._tick` -> `_live_tick`). The same view, toolbar, keys and
+  gutter breakpoints as record-and-replay: Continue/Pause (F5/F6), F10/F11/
+  Shift+F11, Step Back (Ctrl+Shift+F11, through the server's history),
+  Restart, Stop; VARIABLES is a tree (chevrons; children fetched by
+  reference on first open; double-click or the context menu's Set Value
+  sets one); WATCH and the Debug Console evaluate in the selected frame;
+  CALL STACK selects a frame (its line and locals); "Raised Exceptions" /
+  "Uncaught Exceptions" checkboxes; Why? (the "?" on a variable, the
+  palette, the editor's context menu) is answered by the server and its
+  rows travel through the history. Breakpoints edited during a session are
+  sent at once (`brk_gen`).
+- Run > Profile with cProfile (Flame Graph): `nython -m cProfile --stacks
+  -o OUT file.ny`, then the PROFILE panel (`lib/ide_profile.ny`): the table
+  (ncalls as calls/primitive, tottime, percall, cumtime, percall; click a
+  heading to sort, again to flip), the selection's callers and callees, and
+  an icicle flame graph (Gregg, CACM 2016) with a tooltip per bar; a click
+  on a row, caller, callee or bar selects the function and opens its
+  source. "Profile: Copy Folded Stacks" gives flamegraph.pl's input.
+- **cProfile `--stacks` / `Profile(stacks=True)`** (Nython's addition):
+  the profiler also keeps the calling context tree (Ammons, Ball & Larus,
+  PLDI 1997) - one node per call path, one dict lookup per call - so the
+  flame graph is exact. Without it the graph is derived from cProfile's
+  caller->callee aggregates as gprof does (a callee's subtree under each
+  caller scaled by that edge's share of its time; recursion folded), and
+  says so. `dump_stats` appends the tree as a `{"cct": ...}` line;
+  `pstats._load` skips it.
+
+### Not done
+- Data breakpoints, function breakpoints, goto/restartFrame (frames cannot
+  jump), completions, loadedSources; threads other than the main one are
+  not debugged; pause waits for the next line a user frame runs (not
+  inside time.sleep or input()); live debugging runs the interpreter (the
+  server itself works on `--vm`, as vm_audit101 shows, but the IDE has no
+  switch for it); the IDE's flame graph does not zoom.
+- `f_globals` / `globals()` are not live on either engine (worked around
+  in the server, not fixed).
 
 ## 0s3. Round 80, part C — a specializing adaptive interpreter for the VM (vm_audit98, `tools/bench/`)
 

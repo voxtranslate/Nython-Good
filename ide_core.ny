@@ -9,6 +9,8 @@
 #      IDEPaint     ide_paint.ny  theme, layout, every draw routine, hit map
 #      IDEViews     ide_views.ny  side bar views: Explorer, Search, Source
 #                                 Control, Run and Debug, Extensions, ...
+#      IDETools     ide_tools.ny  the Code::Blocks side (build, bookmarks, ...)
+#      IDELive      ide_live.ny   live debugging, the Profile view (round 81)
 #      NythonIDE    nython_ide.ny state, input routing, frame loop
 #
 #  Commands follow VS Code: an id, a category and a title, and a keybinding.

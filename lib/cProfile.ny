@@ -37,6 +37,21 @@
 # the program's own; call counts are exact. The default timer is
 # time.perf_counter (CPython's is the same clock in nanoseconds).
 #
+# Nython's addition (round 81): Profile(stacks=True) - and `nython -m
+# cProfile --stacks` - also keeps the calling context tree (Ammons, Ball &
+# Larus, "Exploiting Hardware Performance Counters with Flow and Context
+# Sensitive Profiling", PLDI 1997): one node per distinct call path, with
+# its calls, inline and total time, kept as the _lsprof contexts are pushed
+# and popped (one dict lookup per call). cProfile's own data keeps only one
+# aggregate per caller->callee edge, from which whole stacks cannot be
+# recovered; the tree gives exact stacks, so a flame graph (the IDE's
+# Profile view, lib/ide_profile.ny) is drawn from what really ran.
+# calling_context_tree() returns it as {"keys": [[file, line, name], ...],
+# "nodes": [[parent, key, calls, inline, total], ...]} (node 0 is the root,
+# parents come first); dump_stats writes it as one more line,
+# {"cct": ...}, which pstats skips. Paths deeper than 512 calls are folded
+# into their 512th node.
+#
 # Not here: dump_stats writes pstats' Nython format (see lib/pstats.ny),
 # not marshal; timeunit is accepted and ignored (times are seconds).
 
@@ -96,6 +111,20 @@ class _Context:
         self.previous = previous
         self.subt = 0.0
         self.t0 = t0
+        self.node = None
+        self.folded = False
+
+
+class _CCNode:
+    # a node of the calling context tree (round 81): one call path
+    def __init__(self, key, parent, depth):
+        self.key = key
+        self.parent = parent
+        self.depth = depth
+        self.kids = {}
+        self.calls = 0
+        self.it = 0.0
+        self.tt = 0.0
 
 
 def _builtin_label(fn):
@@ -129,8 +158,9 @@ class Profile:
     is, in seconds).
     """
 
-    def __init__(self, timer=None, timeunit=0.0, subcalls=True, builtins=True):
+    def __init__(self, timer=None, timeunit=0.0, subcalls=True, builtins=True, stacks=False):
         self.timer = timer if timer is not None else time.perf_counter
+        self._cct = _CCNode(None, None, 0) if stacks else None   # round 81
         self.timeunit = timeunit
         self.subcalls = subcalls
         self.builtins = builtins
@@ -163,6 +193,17 @@ class Profile:
     def _enter(self, key, code, t):
         e = self._entry(key, code)
         ctx = _Context(e, self._cur, t)
+        if self._cct is not None:
+            parent = ctx.previous.node if ctx.previous is not None else self._cct
+            node = parent.kids.get(key)
+            if node is None:
+                if parent.depth >= 512:
+                    node = parent
+                    ctx.folded = True
+                else:
+                    node = _CCNode(key, parent, parent.depth + 1)
+                    parent.kids[key] = node
+            ctx.node = node
         self._cur = ctx
         e.recursionLevel += 1
         if self.subcalls and ctx.previous is not None:
@@ -185,6 +226,13 @@ class Profile:
             e.recursivecallcount += 1
         e.it += it
         e.callcount += 1
+        node = ctx.node
+        if node is not None and not ctx.folded:
+            node.calls += 1
+            node.it += it
+            node.tt += tt
+        elif node is not None:
+            node.it += it
         if self.subcalls and ctx.previous is not None:
             s = self._sub(ctx.previous.entry, e)
             s.recursionLevel -= 1
@@ -293,6 +341,41 @@ class Profile:
     def dump_stats(self, file):
         self.create_stats()
         pstats.Stats(self).dump_stats(file)
+        if self._cct is not None:
+            import json
+            f = open(file, "a")
+            try:
+                f.write(json.dumps({"cct": self.calling_context_tree()}) + "\n")
+            finally:
+                f.close()
+
+    def calling_context_tree(self):
+        """The calling context tree (Profile(stacks=True); round 81):
+        {"keys": [[file, line, name], ...], "nodes": [[parent, key, calls,
+        inline time, total time], ...]}, the root first (parent -1, key -1),
+        each node after its parent; None without stacks=True."""
+        if self._cct is None:
+            return None
+        keys = []
+        kidx = {}
+        nodes = [[-1, -1, 0, 0.0, 0.0]]
+        todo = [(self._cct, 0)]
+        tot = 0.0
+        while todo:
+            n, ni = todo.pop()
+            for k in sorted(n.kids.keys(), key=str):
+                c = n.kids[k]
+                ki = kidx.get(k)
+                if ki is None:
+                    ki = len(keys)
+                    kidx[k] = ki
+                    keys.append([k[0], k[1], k[2]])
+                nodes.append([ni, ki, c.calls, c.it, c.tt])
+                if n is self._cct:
+                    tot += c.tt
+                todo.append((c, len(nodes) - 1))
+        nodes[0][4] = tot
+        return {"keys": keys, "nodes": nodes}
 
     def create_stats(self):
         self.disable()
@@ -381,13 +464,13 @@ def run(statement, filename=None, sort=-1):
         _show(prof, filename, sort)
 
 
-def runctx(statement, globals, locals, filename=None, sort=-1):
+def runctx(statement, globals, locals, filename=None, sort=-1, stacks=False):
     """Run statement under profiler, supplying your own globals and locals,
     optionally saving results in filename.
 
     statement and filename have the same semantics as profile.run
     """
-    prof = Profile()
+    prof = Profile(stacks=stacks)
     try:
         prof.runctx(statement, globals, locals)
     except SystemExit:
@@ -416,6 +499,7 @@ def _main_with(runctx_fn, progname):
     sort = -1
     module = False
     valid = sorted(pstats.Stats.sort_arg_dict_default)
+    stacks = False
     while args and args[0].startswith("-") and args[0] != "-":
         a = args[0]
         args = args[1:]
@@ -436,6 +520,8 @@ def _main_with(runctx_fn, progname):
             sort = a[7:]
         elif a == "-m":
             module = True
+        elif a == "--stacks" and progname == "cProfile.py":
+            stacks = True       # round 81: the calling context tree too
         elif a in ("-h", "--help"):
             print("Usage: " + usage)
             sys.exit(0)
@@ -463,7 +549,10 @@ def _main_with(runctx_fn, progname):
     code = compile(src, target, "exec")
     globs = {"__file__": target, "__name__": "__main__", "__package__": None, "__cached__": None}
     try:
-        runctx_fn(code, globs, None, outfile, sort)
+        if stacks:
+            runctx(code, globs, None, outfile, sort, stacks=True)
+        else:
+            runctx_fn(code, globs, None, outfile, sort)
     except BrokenPipeError as exc:
         # Prevent "Exception ignored" during interpreter shutdown.
         sys.stdout = None

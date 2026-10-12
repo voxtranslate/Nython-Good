@@ -10,6 +10,10 @@ the real IDE headlessly and reports the resident-set growth for:
     hover    the pointer moving over the workbench (hover, tooltips)
     typing   characters typed into an editor
     scroll   wheel scrolling through a long file
+    split    hover with two editor groups (beyond plain hover)
+    live     hover while a live debug session is paused: the Variables
+             tree, stack and toolbar repainted (beyond plain hover; round 81)
+    profile  hover over the PROFILE panel: table and flame graph (round 81)
 
     python3 tools/ide_memprobe.py            # report
     python3 tools/ide_memprobe.py --check    # exit 1 above the ceilings
@@ -28,7 +32,7 @@ from ide_driver import IDE  # noqa: E402
 # KB of resident memory kept, per unit. Measured when these were set:
 # idle 0.0, hover 0.0, typing ~40, scroll ~7 (before this round's fixes:
 # 3.45, 40, 787 and 161).
-CEILINGS = {"idle": 0.5, "hover": 2.0, "typing": 50.0, "scroll": 12.0, "split": 2.0}
+CEILINGS = {"idle": 0.5, "hover": 2.0, "typing": 50.0, "scroll": 12.0, "split": 2.0, "live": 2.0, "profile": 2.0}
 
 
 def rss_kb(pid):
@@ -64,6 +68,9 @@ def main(argv):
     with open(os.path.join(ws, "long.ny"), "w") as f:
         for i in range(600):
             f.write("def f%d(x):\n    return x * %d + len(\"%d\")\n\n" % (i, i, i))
+    with open(os.path.join(ws, "live.ny"), "w") as f:
+        f.write("def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\n\n"
+                "data = [1, 2, 3]\nfor k in range(3):\n    print(fib(8 + k), data)\n")
     ide = IDE(cwd=ws, env={"HOME": root})
     ide.start()
     results = {}
@@ -112,12 +119,46 @@ def main(argv):
         settle(ide)
         sp = measure(ide, hover, 150, 60)
         results["split"] = (sp[0] - base[0], sp[1], sp[2])
+        ide.key("ctrl+\\")
+        settle(ide)
+
+        def wait_state(pred, timeout=40):
+            t0 = time.time()
+            st = ide.state()
+            while not pred(st) and time.time() - t0 < timeout:
+                ide.wait(4)
+                st = ide.state()
+            return st
+
+        # live debugging, paused at a breakpoint (round 81)
+        ide.key("ctrl+p")
+        ide.type("live.ny")
+        ide.key("enter")
+        settle(ide)
+        base = measure(ide, hover, 150, 60)
+        ide.key("ctrl+g")
+        ide.type("8\n")
+        ide.key("f9")
+        ide.key("alt+f5")
+        wait_state(lambda st: st.get("live_state") == "paused" and len(st.get("live_vars", [])) > 2)
+        lv = measure(ide, hover, 150, 60)
+        results["live"] = (lv[0] - base[0], lv[1], lv[2])
+        ide.key("shift+f5")
+        wait_state(lambda st: not st.get("live_active"))
+        ide.key("f9")
+        # the Profile view
+        ide.key("ctrl+shift+p")
+        ide.type("Profile with cProfile")
+        ide.key("enter")
+        wait_state(lambda st: st.get("prof_n", 0) > 0 and st.get("panel") == "profile")
+        settle(ide)
+        results["profile"] = measure(ide, hover, 150, 60)
     finally:
         ide.close()
         ide.cleanup()
         shutil.rmtree(root, ignore_errors=True)
     bad = []
-    for k in ["idle", "hover", "typing", "scroll", "split"]:
+    for k in ["idle", "hover", "typing", "scroll", "split", "live", "profile"]:
         per, b, a = results[k]
         unit = "frame" if k == "idle" else ("event" if k != "typing" else "key")
         flag = ""

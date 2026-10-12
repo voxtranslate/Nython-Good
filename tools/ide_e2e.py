@@ -864,6 +864,253 @@ def sc_debug_why(s):
     ide.key("shift+f5")
 
 
+LIVE = ('def total(n):\n    s = 0\n    i = 0\n    while i < n:\n        s = s + i\n        i = i + 1\n'
+        '    return s\n\nvar data = [4, 5]\nvar r = total(4)\nprint("total", r)\n')
+SPIN = 'var stop = false\nvar n = 0\nwhile not stop:\n    n = n + 1\nprint("stopped at", n > 0)\n'
+EXC = ('def check(x):\n    if x > 0:\n        raise ValueError("bad " + str(x))\n    return x\n\n'
+       'try:\n    check(1)\nexcept ValueError as e:\n    print("caught", e)\nprint("end")\n')
+
+
+def sc_live_debug(s):
+    """Live debugging (round 81): the program runs under the debug server;
+    a breakpoint stops it, F10 steps, the Variables tree shows (and expands)
+    its values, the Debug Console evaluates in the frame, a double-click
+    sets a variable, Step Back travels through the server's ring buffer,
+    Why? is answered from it, and the program runs to its end with the
+    values set while paused."""
+    s.write("live.ny", LIVE)
+    s.write("spin.ny", SPIN)
+    s.write("exc.ny", EXC)
+    s.write("ask.ny", ASK)
+    ide = s.start()
+    c = s.res.check
+    s.open_file("live.ny")
+    ide.key("ctrl+g")
+    ide.type("5\n")
+    ide.key("f9")
+    ide.key("alt+f5")
+    st = s.wait_until(lambda st: st["live_state"] == "paused" and st["live_line"] == 5 and [1, "n", "4"] in st["live_vars"], timeout=30)
+    c(st["live_state"] == "paused" and st["live_line"] == 5 and st["live_reason"] == "breakpoint",
+      "live: Alt+F5 runs live and stops at the breakpoint", (st["live_state"], st["live_line"], st["live_reason"], st["status"]))
+    c(st["live_frames"] == [["total", 5], ["<module>", 10]], "live: the call stack", st["live_frames"])
+    c([0, "Locals", ""] in st["live_vars"] and [1, "n", "4"] in st["live_vars"] and [1, "s", "0"] in st["live_vars"],
+      "live: the frame's variables", st["live_vars"])
+    c(st["view"] == "debug" and st["row"] == 4 and st["title"] == "live.ny", "live: the editor shows the stopped line",
+      (st["view"], st.get("row"), st["title"]))
+    f = ide.snap()
+    c(f.has("VARIABLES", exact=True) and f.has("CALL STACK", exact=True) and f.has("Paused on breakpoint", exact=True),
+      "live: the Run and Debug view")
+    c(f.has("Raised Exceptions", exact=True) and f.has("Uncaught Exceptions", exact=True), "live: exception breakpoints listed")
+    ide.key("f10")
+    st = s.wait_until(lambda st: st["live_state"] == "paused" and st["live_line"] == 6 and st["live_vars"])
+    c(st["live_line"] == 6 and st["live_reason"] == "step", "live: F10 steps over", (st["live_line"], st["live_reason"]))
+    ide.key("f10")
+    st = s.wait_until(lambda st: st["live_state"] == "paused" and st["live_line"] == 4 and [1, "i", "1"] in st["live_vars"])
+    c(st["live_line"] == 4 and [1, "i", "1"] in st["live_vars"], "live: F10 again, i is 1", (st["live_line"], st["live_vars"]))
+    # the Debug Console evaluates in the frame
+    ide.key("ctrl+shift+y")
+    st = ide.state()
+    ide.click_text("DEBUG CONSOLE")
+    ide.type("s + i * 100\n")
+    st = s.wait_until(lambda st: "100" in st["dbgcon"])
+    c("> s + i * 100" in st["dbgcon"] and "100" in st["dbgcon"], "live: the Debug Console evaluates in the frame", st["dbgcon"][-4:])
+    # step back through the history, then forward to the present
+    ide.key("ctrl+shift+f11")
+    st = s.wait_until(lambda st: st["live_history"] is not None and st["live_vars"])
+    c(st["live_history"] is not None and st["live_line"] == 6, "live: Step Back travels into the recent history",
+      (st["live_history"], st["live_line"]))
+    f = ide.snap()
+    c(f.has("History: step", exact=False), "live: the view says it is history")
+    ide.key("f10")
+    st = s.wait_until(lambda st: st["live_history"] is None and st["live_line"] == 4)
+    c(st["live_history"] is None and st["live_line"] == 4, "live: a step forward reaches the present again",
+      (st["live_history"], st["live_line"]))
+    # Why? about the live program, from its history
+    side = R(48, 30, 300, 900)
+    t = ide.find("s", region=side)
+    ide.click(int(t.cx), int(t.cy))
+    palette(s, "Debug: Why Does This Variable Have This Value?")
+    st = s.wait_until(lambda st: st["dbg_why_title"].startswith("Why is s"))
+    c(st["dbg_why_title"] == "Why is s = 0?" and any(r[2] == "data" and r[1] == 5 for r in st["dbg_why"]),
+      "live: Why? answered from the ring buffer", (st["dbg_why_title"], st["dbg_why"][:3]))
+    if s.shots:
+        ide.screenshot(os.path.join(s.shots, "live-why.png"))
+    # set a variable: double-click it, type the new value
+    st = ide.state()
+    t = ide.find("n", region=side)
+    ide.dblclick(int(t.cx), int(t.cy))
+    st = ide.state()
+    c(st["qi"] and "4" in st["qi_value"], "live: a double-click opens Set Value with the value", (st["qi"], st["qi_value"]))
+    ide.type("2\n")
+    st = s.wait_until(lambda st: [1, "n", "2"] in st["live_vars"])
+    c([1, "n", "2"] in st["live_vars"], "live: the variable is set in the running frame", st["live_vars"])
+    # the caller's frame: an expandable list
+    t = ide.find("<module>", region=side)
+    ide.click(int(t.cx), int(t.cy))
+    st = s.wait_until(lambda st: st["live_frame_sel"] == 1 and any(v[1] == "data" for v in st["live_vars"]))
+    c(st["live_frame_sel"] == 1 and [1, "data", "[4, 5]"] in st["live_vars"], "live: a caller's frame and its variables", st["live_vars"])
+    t = ide.find("data", region=side)
+    ide.click(int(t.cx), int(t.cy))
+    st = s.wait_until(lambda st: [2, "1", "5"] in st["live_vars"])
+    c([2, "0", "4"] in st["live_vars"] and [2, "1", "5"] in st["live_vars"], "live: a list expands into its items", st["live_vars"])
+    if s.shots:
+        ide.screenshot(os.path.join(s.shots, "live-paused.png"))
+    # a watch expression
+    palette(s, "Run: Remove All Breakpoints")
+    hm = ide.hitmap()
+    adds = [h for h in hm if h[4] == "@dbg.addwatch"]
+    c(len(adds) == 1, "live: the WATCH section's + button", len(adds))
+    if adds:
+        ide.click(adds[0][0] + adds[0][2] // 2, adds[0][1] + adds[0][3] // 2)
+        ide.type("len(data) * 10\n")
+    st = s.wait_until(lambda st: st["live_watch"].get("len(data) * 10") is not None)
+    c(st["live_watch"].get("len(data) * 10") == "20", "live: a watch expression, in the selected frame", st["live_watch"])
+    # continue: no breakpoint left, the program ends with n = 2
+    ide.key("f5")
+    st = s.wait_until(lambda st: not st["live_active"], timeout=30)
+    c(not st["live_active"], "live: continue runs to the end and the session ends", (st["live_state"], st["live_active"]))
+    ide.click_text("OUTPUT")
+    ok = False
+    for _ in range(60):
+        if ide.snap().has("total 1", exact=True):
+            ok = True
+            break
+        time.sleep(0.1)
+    c(ok, "live: the program's output, with n set to 2 while paused")
+    st = ide.state()
+    c(any("exited with code 0" in ln for ln in st["dbgcon"]), "live: the exit code in the Debug Console", st["dbgcon"][-3:])
+    # pause interrupts a running loop
+    ide.key("ctrl+p")
+    ide.type("spin.ny")
+    ide.key("enter")
+    ide.key("alt+f5")
+    st = s.wait_until(lambda st: st["live_state"] == "running", timeout=30)
+    time.sleep(0.5)
+    ide.key("f6")
+    st = s.wait_until(lambda st: st["live_state"] == "paused" and st["live_vars"], timeout=30)
+    c(st["live_state"] == "paused" and st["live_reason"] == "pause" and st["live_line"] in (3, 4),
+      "live: F6 pauses a running loop", (st["live_state"], st["live_reason"], st["live_line"]))
+    t = ide.find("stop", region=side)
+    ide.dblclick(int(t.cx), int(t.cy))
+    ide.type("True\n")
+    st = s.wait_until(lambda st: [1, "stop", "True"] in st["live_vars"])
+    ide.key("f5")
+    st = s.wait_until(lambda st: not st["live_active"], timeout=30)
+    ok = False
+    for _ in range(60):
+        if ide.snap().has("stopped at true", exact=True):
+            ok = True
+            break
+        time.sleep(0.1)
+    c(ok and not st["live_active"], "live: setting the flag ends the loop, the program finishes")
+    # Restart starts the program again; Stop ends a session at once
+    ide.key("alt+f5")
+    s.wait_until(lambda st: st["live_state"] == "running", timeout=30)
+    ide.key("ctrl+shift+f5")
+    st = s.wait_until(lambda st: st["live_state"] == "running", timeout=30)
+    time.sleep(0.3)
+    ide.key("f6")
+    st = s.wait_until(lambda st: st["live_state"] == "paused" and st["live_vars"], timeout=30)
+    c(st["live_state"] == "paused" and [1, "stop", "false"] in st["live_vars"], "live: Ctrl+Shift+F5 restarts the program",
+      (st["live_state"], st["live_vars"][:4]))
+    ide.key("shift+f5")
+    st = s.wait_until(lambda st: not st["live_active"], timeout=10)
+    c(not st["live_active"], "live: Shift+F5 stops the live session", st["live_state"])
+    # exception breakpoints: a raised one stops where it is raised
+    ide.key("ctrl+p")
+    ide.type("exc.ny")
+    ide.key("enter")
+    st = ide.state()
+    c(st["title"] == "exc.ny", "live: exc.ny opened", st["title"])
+    ide.click_text("Raised Exceptions")
+    st = ide.state()
+    c(st["live_exc"] == [True, True], "live: the Raised Exceptions checkbox", st["live_exc"])
+    ide.key("alt+f5")
+    st = s.wait_until(lambda st: st["live_state"] == "paused" and st["live_frames"], timeout=30)
+    c(st["live_reason"] == "exception" and st["live_exc_text"] == "ValueError: bad 1" and st["live_frames"][0] == ["check", 3],
+      "live: stopped where the exception was raised", (st["live_reason"], st["live_exc_text"], st["live_frames"]))
+    c(ide.snap().has("ValueError: bad 1", exact=True), "live: the exception shown in the view")
+    ide.key("f5")
+    st = s.wait_until(lambda st: not st["live_active"], timeout=30)
+    c(not st["live_active"] and any("exited with code 0" in ln for ln in st["dbgcon"]),
+      "live: the caught exception lets the program finish", st["dbgcon"][-3:])
+    ide.click_text("Raised Exceptions")
+    # the program's own input still comes from the Output panel's input line
+    ide.key("ctrl+p")
+    ide.type("ask.ny")
+    ide.key("enter")
+    ide.key("ctrl+g")
+    ide.type("4\n")
+    ide.key("f9")
+    ide.key("alt+f5")
+    st = s.wait_until(lambda st: st["focus"] == "stdin", timeout=30)
+    c(st["focus"] == "stdin" and st["live_state"] == "running", "live/stdin: the input line takes focus when the program asks",
+      (st["focus"], st["live_state"]))
+    ide.type("ada\n")
+    time.sleep(0.3)
+    st = s.wait_until(lambda st: st["focus"] == "stdin", timeout=30)
+    ide.type("7\n")
+    st = s.wait_until(lambda st: st["live_state"] == "paused" and [1, "n", "7"] in st["live_vars"], timeout=30)
+    c(st["live_line"] == 4 and [1, "name", "'ada'"] in st["live_vars"] and [1, "n", "7"] in st["live_vars"],
+      "live/stdin: the lines typed reached the program, stopped after them", (st["live_line"], st["live_vars"]))
+    ide.key("f9")
+    ide.key("f5")
+    st = s.wait_until(lambda st: st["focus"] == "stdin", timeout=30)
+    ide.key("ctrl+d")
+    st = s.wait_until(lambda st: not st["live_active"], timeout=30)
+    ide.click_text("OUTPUT")
+    f = ide.snap()
+    c(f.has("hello ada", exact=True) and f.has("square 49", exact=True) and f.has("eof seen", exact=True),
+      "live/stdin: the program's output and its end of input")
+
+
+PROF = ('def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\n\n'
+        'def work():\n    s = 0\n    for i in range(200):\n        s = s + len(str(i))\n    return s\n\n'
+        'print(fib(12), work())\n')
+
+
+def sc_profile(s):
+    """The Profile view (round 81): cProfile's table, sortable by column,
+    callers and callees of the selection, and a flame graph from the real
+    call paths; a click opens the function's source."""
+    ide = s.start()
+    c = s.res.check
+    s.write("prof.ny", PROF)
+    s.open_file("prof.ny")
+    palette(s, "Run: Profile with cProfile (Flame Graph)")
+    st = s.wait_until(lambda st: st["prof_n"] > 0 and st["panel"] == "profile", timeout=40)
+    c(st["panel"] == "profile" and st["prof_n"] > 3, "profile: the PROFILE panel opens with the functions", (st["panel"], st["prof_n"]))
+    c(st["prof_exact"] and st["prof_flame_n"] > 10, "profile: a flame graph from real call paths", (st["prof_exact"], st["prof_flame_n"]))
+    c(st["prof_sort"] == ["cumtime", True], "profile: sorted by cumulative time first", st["prof_sort"])
+    f = ide.snap()
+    c(f.has("ncalls", exact=True) and f.has("cumtime", exact=True) and f.has("Flame graph", exact=False),
+      "profile: the table's headings and the flame graph's title")
+    c(f.has("465/1", exact=True), "profile: fib's calls, total/primitive (fib(12): 465 calls)")
+    ide.click_text("tottime")
+    st = ide.state()
+    c(st["prof_sort"] == ["tottime", True], "profile: a heading sorts by its column", st["prof_sort"])
+    ide.click_text("tottime")
+    st = ide.state()
+    c(st["prof_sort"] == ["tottime", False], "profile: the same heading again flips the order", st["prof_sort"])
+    ide.click_text("ncalls")
+    st = ide.state()
+    c(st["prof_rows"][0] == "fib", "profile: by calls, fib first", st["prof_rows"][:3])
+    panel = (0, st["H"] - D(400), st["W"], D(400))
+    t = ide.find("465/1", region=panel)
+    ide.click(int(t.cx), int(t.cy))
+    st = ide.state()
+    c(st["prof_sel"] == "fib" and st["title"] == "prof.ny" and st["row"] == 0, "profile: a row selects and opens its source",
+      (st["prof_sel"], st["title"], st.get("row")))
+    c(any(r.startswith("Callers of fib") for r in st["prof_rel"]) and any("<module>" in r for r in st["prof_rel"]),
+      "profile: the selection's callers and callees", st["prof_rel"])
+    t = ide.find("work", region=(st["W"] // 2, st["H"] - D(400), st["W"] // 2, D(400)))
+    c(t is not None, "profile: work's bar in the flame graph")
+    if t is not None:
+        ide.click(int(t.cx), int(t.cy))
+        st = ide.state()
+        c(st["prof_sel"] == "work" and st["row"] == 5, "profile: a bar selects its function and opens it", (st["prof_sel"], st.get("row")))
+
+
 def sc_scm(s):
     s.git("init", "-q")
     s.git("add", "-A")
@@ -1753,7 +2000,8 @@ SCENARIOS = [
     ("multicursor", sc_multicursor), ("palette", sc_palette), ("quickopen", sc_quick_open),
     ("menus", sc_menus), ("find", sc_find_replace), ("statusbar", sc_statusbar),
     ("explorer", sc_explorer_ops), ("close", sc_close_dirty), ("terminal", sc_terminal),
-    ("run", sc_run), ("problems", sc_syntax_problems), ("debug", sc_debugger), ("debug-why", sc_debug_why), ("scm", sc_scm),
+    ("run", sc_run), ("problems", sc_syntax_problems), ("debug", sc_debugger), ("debug-why", sc_debug_why),
+    ("live", sc_live_debug), ("profile", sc_profile), ("scm", sc_scm),
     ("search", sc_search), ("views", sc_views_layout), ("deadclicks", sc_dead_clicks),
     ("deadviews", sc_dead_clicks_views), ("build", sc_build), ("cbedit", sc_cb_editing),
     ("cbtools", sc_cb_tools), ("cbdebug", sc_cb_debug), ("responsive", sc_responsive),

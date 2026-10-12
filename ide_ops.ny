@@ -1508,7 +1508,7 @@ class IDEOps(IDECore):
             self.job_text = self.job_text + ln + "\n"
 
     def _finish_job(self, code):
-        var dt = time_ms() - self.job_t0
+        var dt = int(time_ms() - self.job_t0)   # whole ms (time_ms() is fractional; round 81)
         self.job_running = false
         self.job_in_profile = false
         if self.job_mode == "Debug":

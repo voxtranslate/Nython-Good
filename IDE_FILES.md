@@ -31,7 +31,8 @@ single file is too large for the parser and each has one concern:
 | `ide_paint.ny` | `IDETheme`, `IDEPaint(IDEOps)` | layout and every painter: title bar/menus, activity bar, tabs, breadcrumbs, editor, minimap, panel, status bar, overlays. Paint methods allocate nothing per frame (see "Memory" below) |
 | `ide_views.ny` | `IDEViews(IDEPaint)` | the side bar views: Explorer, Search, Source Control, Run and Debug, Extensions, Outline, AI |
 | `ide_tools.ny` | `IDETools(IDEViews)` | the Code::Blocks side (round 74): build targets and a time-sliced Build/Rebuild/Clean with a Build Log, bookmarks, code folding, split editor groups, column selection, abbreviations/snippets with tab stops, insert/overwrite, keymaps (VS Code / Code::Blocks) and key rebinding by capture, class wizard, code statistics, TODO list, user tools with macros, environment variables, breakpoint conditions/hit counts/log points, run to cursor, session restore |
-| `nython_ide.ny` | `NythonIDE(IDETools)` | state, input routing (mouse, keyboard, text), the frame loop, launch |
+| `ide_live.ny` | `IDELive(IDETools)` | round 81: live debugging (a program run as `nython --debug-port N` under `lib/ide_debugserver.ny`, driven by `lib/ide_debugclient.ny`: Pause, the expandable Variables tree, Set Value, Watch/Debug Console in the selected frame, exception breakpoints, Step Back and Why? from the server's ring buffer) and the PROFILE panel (cProfile's table, callers/callees, a flame graph) |
+| `nython_ide.ny` | `NythonIDE(IDELive)` | state, input routing (mouse, keyboard, text), the frame loop, launch |
 
 Models with no window, testable on both engines:
 
@@ -40,6 +41,9 @@ Models with no window, testable on both engines:
 | `lib/ide_workbench.ny` | `CommandRegistry` (keys, chords, when-clauses), `HitMap`, `Frecency`, `QuickInput`, `LineEdit`, `Notifications`, `NavHistory` — `examples/vm_audit42.ny` |
 | `lib/ide_scm.ny` | `GitRepo`, `LineDiff` (Myers diff for gutter bars) — `examples/vm_audit43.ny` |
 | `lib/ide_debugger.ny` | `DebugSession`, the record-and-replay debugger over `nython --trace` — `examples/vm_audit44.ny` |
+| `lib/ide_debugserver.ny` | `DebugServer` (round 81): the live debug server inside the debugged program (`nython --debug-port N`, Debug Adapter Protocol messages, ring buffer of recent statements) — `examples/vm_audit101.ny` |
+| `lib/ide_debugclient.ny` | `LiveDebugClient` (round 81): the IDE's non-blocking side of the protocol, polled once per frame — `tools/ide_e2e.py` `live` |
+| `lib/ide_profile.ny` | `ProfileData` (round 81): a cProfile dump as table, callers/callees, flame graph and folded stacks — `examples/vm_audit101.ny` |
 | `ide_editor.ny` | `EditorBuffer` (operation undo, grouped steps, indentation), `SyntaxHighlighter`, `detect_indentation` — `vm_audit36/37/43` |
 
 Also imported: `ide_project.ny` (workspace tree), `ide_icons.ny` (Codicon

@@ -538,7 +538,7 @@ class IDEPaint(IDEOps):
             r.shadow_xywh(self.ACT_W, self.content_y, self.side_w, self.content_h, 14, 2, 0, th.shadow)
             self._draw_sidebar(r)
         self._draw_statusbar(r)
-        if self.dbg.active:
+        if self._debugging():
             self._draw_debug_toolbar(r)
         # Overlays, topmost last.
         self.drawing_overlay = true
@@ -672,7 +672,7 @@ class IDEPaint(IDEOps):
             var badge = 0
             if key == "scm":
                 badge = self.scm_count
-            elif key == "debug" and self.dbg.active:
+            elif key == "debug" and self._debugging():
                 badge = -1
             if badge != 0:
                 var bx = int(self.ACT_W / 2) + self.dp(3)
@@ -958,7 +958,7 @@ class IDEPaint(IDEOps):
                     ln = self._vrow_to_row(d, vr)
                 var y = ey + i * lh - yoff
                 var line = b.lines[ln]
-                if ln == self.dbg_line_row and self.dbg.active and self._dbg_doc_is_active():
+                if ln == self.dbg_line_row and self._debugging() and self._dbg_doc_is_active():
                     r.fill_xywh(tx_clip, y, self.ed_w - self.GUTTER_W, lh, th.debug_line)
                 elif ln == cur_row and sel == none and self.focus == "editor":
                     r.fill_xywh(tx_clip, y, self.ed_w - self.GUTTER_W, 1, th.line_border)
@@ -1046,7 +1046,7 @@ class IDEPaint(IDEOps):
                     r.fill_circle(bcx, bcy, self.dp(5), th.breakpoint)
                 elif ln2 == glyph_hover_row:
                     r.fill_circle(bcx, bcy, self.dp(5), self._a(th.breakpoint, 90))
-                if ln2 == self.dbg_line_row and self.dbg.active and self._dbg_doc_is_active():
+                if ln2 == self.dbg_line_row and self._debugging() and self._dbg_doc_is_active():
                     self.icons.draw(r, "debug-stackframe", bcx - self.dp(8), bcy - self.dp(8), self.dp(16), th.warn)
                 # Bookmarks (sorted rows; walked alongside the visible rows).
                 while bj < len(bm) and bm[bj] < ln2:
@@ -1072,6 +1072,11 @@ class IDEPaint(IDEOps):
                         r.fill_xywh(dx - 1, y2 + lh - 3, self.dp(6), 4, th.gutter_del)
             i = i + 1
         r.clear_clip()
+
+    # A debug session of either kind: record-and-replay (self.dbg) or live
+    # (self.live, ide_live.ny; round 81).
+    def _debugging(self):
+        return self.dbg.active or self.live.active
 
     def _dbg_doc_is_active(self):
         return self.dbg_line_path != "" and self.doc().path == self.dbg_line_path
@@ -1764,6 +1769,8 @@ class IDEPaint(IDEOps):
             self._draw_dbg_console(r, x, by, w, bh)
         elif ap == "inspector":
             self._draw_inspector(r, x, by, w, bh)
+        elif ap == "profile":
+            self._draw_profile(r, x, by, w, bh)
         elif ap == "buildlog":
             self._draw_lines(r, x, by, w, bh, self.build_lines, self.build_kinds, "buildlog", "No build output yet. Build with " + self._or_none(self.reg.keys_of("nython.build")) + ".")
         elif ap == "todo":
@@ -2055,7 +2062,7 @@ class IDEPaint(IDEOps):
         var y = self.status_y
         var h = self.STATUS_H
         var bg = th.status_bg
-        if self.dbg.active:
+        if self._debugging():
             bg = th.status_dbg
         elif self.ws.root == "":
             bg = th.status_nofolder
@@ -2075,7 +2082,7 @@ class IDEPaint(IDEOps):
             x = self._status_item(r, x, y, h, "loading", "Building", "nython.abort", "", "Click to abort the build")
         if self.job_running:
             x = self._status_item(r, x, y, h, "loading", self.st_job, "@job.stop", "", "Click to stop the running program")
-        if self.dbg.active:
+        if self._debugging():
             x = self._status_item(r, x, y, h, "debug-alt", self.st_debug, "workbench.view.debug", "", "Run and Debug")
         # Right side, laid out right-to-left. Items that do not fit beside the
         # left group drop out lowest-priority first: encoding, line endings,
