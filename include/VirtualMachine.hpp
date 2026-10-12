@@ -2959,9 +2959,10 @@ struct CallFrame {
 // The call stack (round 80). Frames never move once pushed - run_loop and
 // the call paths hold references to them across calls, as they did into the
 // std::deque this replaces - and they live in chunks that are kept when
-// frames are popped, so a call allocates no frame storage: a CallFrame is
-// larger than a deque node (512 bytes), so std::deque allocated and freed a
-// node for every call. Moving or swapping the stack (a GIL switch swaps a
+// frames are popped, so a call allocates no frame storage: a CallFrame (432
+// bytes on x86-64) is more than half of libstdc++'s 512-byte deque node, so
+// each node held one frame and std::deque allocated and freed a node for
+// every call. Moving or swapping the stack (a GIL switch swaps a
 // thread's stacks out and in) moves the chunk pointers, not the frames.
 class FrameStack {
     static constexpr size_t kChunk = 32;
