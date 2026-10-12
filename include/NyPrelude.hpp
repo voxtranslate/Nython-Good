@@ -3038,6 +3038,16 @@ def _ny_load_spec(sysm, spec):
     sysm.modules[name] = module
     return module
 
+def _ny_mapping_snapshot(m):
+    # (round 81) exec/eval's locals given as a mapping that is not a dict
+    # (collections.OrderedDict, a UserDict...): its bindings, read through
+    # its own keys() and __getitem__; the engines write back through its
+    # __setitem__ what the code bound
+    var d = {}
+    for k in m.keys():
+        d[k] = m[k]
+    return d
+
 def _ny_module_spec_attr(module, attr):
     # (round 81) __spec__ / __loader__ of a module the engines imported,
     # made when first read: importlib.machinery's ModuleSpec and loader for
@@ -3236,7 +3246,13 @@ def _ny_stdlib_names():
     # sys.stdlib_module_names (round 81): the modules and packages of the
     # standard library directory (lib/), and the ones the engines make
     var names = set(("builtins", "math", "os", "sys"))
+    # the library directory: the one of the engines' search path holding
+    # the standard library's own files
     var lib = _ny_sys_info("prefix") + "/lib"
+    for d in _ny_sys_info("path")[1:]:
+        if d and os_isfile(d + "/builtins.ny") and os_isfile(d + "/abc.ny"):
+            lib = d
+            break
     try:
         for e in os_listdir(lib):
             if e.endswith(".ny"):

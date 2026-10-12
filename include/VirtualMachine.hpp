@@ -6165,10 +6165,14 @@ private:
         // module's own scope: a module's map is its scope (the live path
         // below); the program's globals are given to the code and what it
         // binds, rebinds or deletes is stored back into them
+        // a dict subclass's object (round 81): its value is read, what the
+        // code binds goes back through its __setitem__ (it was lost in a copy)
+        VMVal sub_out=VMVal::make_none();
+        const bool same_gl=has_g&&has_l&&a[1].type==VMType::INSTANCE&&a[2].type==VMType::INSTANCE&&a[2].map==a[1].map;
         if(has_g&&a[1].type==VMType::INSTANCE){
             VMVal mod;
             int k=globals_view_kind(a[1],mod);
-            bool same_l=!has_l||(a[2].type==VMType::INSTANCE&&a[2].map==a[1].map);
+            bool same_l=!has_l||same_gl;
             if(k==2&&same_l){ a[1]=mod; if(has_l) a[2]=mod; }
             else if(k==1&&same_l){
                 Compiler c0; auto code0=c0.compile(ast);
@@ -6186,9 +6190,24 @@ private:
                 for(auto& kv:seed) if(!locals.count(kv.first)) vm_main_del(kv.first);
                 return VMVal::make_none();
             }
-            else a[1]=unwrap_payload(a[1]);
+            else {
+                VMVal p;
+                if(any_payload_&&payload_of(a[1],p)){ if(same_l) sub_out=a[1]; a[1]=p; }
+            }
         }
-        if(has_l&&a[2].type==VMType::INSTANCE) a[2]=unwrap_payload(a[2]);
+        if(has_l&&a[2].type==VMType::INSTANCE){
+            VMVal p;
+            if(same_gl&&sub_out.type==VMType::INSTANCE) has_l=false;   // one mapping: the globals
+            else if(any_payload_&&payload_of(a[2],p)){ sub_out=a[2]; a[2]=p; }
+            else if(sub_out.type!=VMType::INSTANCE){
+                // round 81: locals may be any mapping (Python): its bindings
+                // are read through keys()/__getitem__, written back through
+                // __setitem__ like a dict subclass's
+                std::vector<VMVal> sa{a[2]};
+                VMVal snap=vm_call(load_var("_ny_mapping_snapshot"),sa,std::nullopt);
+                sub_out=a[2]; a[2]=snap;
+            }
+        }
         if(has_g&&a[1].type!=VMType::MAP) raise_native_exception("TypeError",std::string(who)+"() globals must be a dict, not "+vm_type_name(a[1]));
         Compiler c; auto code=c.compile(ast);
         if(has_g||has_l){
@@ -6213,7 +6232,7 @@ private:
             // later changes to it, and what they bind with `global` lands
             // in it. With a locals dict too, a scope made from both, its
             // bindings copied into the locals dict afterwards.
-            bool live=has_g&&a[1].map&&(!has_l||(a[2].type==VMType::MAP&&a[2].map==a[1].map));
+            bool live=has_g&&a[1].map&&(!has_l||(a[2].type==VMType::MAP&&a[2].map==a[1].map))&&sub_out.type!=VMType::INSTANCE;
             if(live){
                 env=a[1].map;
                 std::vector<std::pair<std::string,VMVal>> dunders;
@@ -6242,6 +6261,25 @@ private:
                 return VMVal::make_none();
             }
             VMVal out=has_l&&a[2].type==VMType::MAP?a[2]:a[1];
+            if(sub_out.type==VMType::INSTANCE){
+                // a dict subclass (round 81): what the code bound or rebound,
+                // through its __setitem__
+                for(auto& kv:*env){
+                    if(!exported(kv.first)) continue;
+                    bool same=false;
+                    for(const VMVal* src0:{has_l&&a[2].map?&a[2]:nullptr, has_g&&a[1].map?&a[1]:nullptr}){
+                        if(!src0) continue;
+                        auto s=src0->map->find(nypy::key_of_str(kv.first));
+                        if(s==src0->map->end()) continue;
+                        same=vm_same(s->second,kv.second);
+                        break;
+                    }
+                    if(same) continue;
+                    std::vector<VMVal> sa{VMVal::make_str(kv.first),kv.second};
+                    vm_call_method(sub_out,"__setitem__",sa);
+                }
+                return VMVal::make_none();
+            }
             for(auto& kv:*env) if(exported(kv.first)) (*out.map)[nypy::key_of_str(kv.first)]=kv.second;
             return VMVal::make_none();
         }
@@ -13173,6 +13211,9 @@ private:
         std::replace(rel.begin(),rel.end(),'.','/');
         struct stat st;
         auto dirs=module_dirs();
+        // round 81: `builtins` is the builtin module whatever sits beside
+        // the script (CPython's BuiltinImporter comes first)
+        if(dotted=="builtins") dirs=nyrt::library_dirs();
         for(auto& d:dirs){
             if(::stat((d+rel+".ny").c_str(),&st)==0 && !S_ISDIR(st.st_mode)) return d+rel+".ny";
             if(::stat((d+rel+"/__init__.ny").c_str(),&st)==0) return d+rel+"/__init__.ny";
@@ -13554,6 +13595,9 @@ private:
             for(auto& c:ancestors(name+".ny")) paths.push_back(c);
             for(auto& c:ancestors(name)) paths.push_back(c);
             for(auto& d:nyrt::library_dirs()) paths.push_back(d+name+".ny");
+            // round 81: `builtins` is the builtin module whatever sits beside
+            // the script (CPython's BuiltinImporter comes first)
+            if(bare&&name=="builtins"){ paths.clear(); for(auto& d:nyrt::library_dirs()) paths.push_back(d+name+".ny"); }
             for(auto& p:paths){struct stat st;if(::stat(p.c_str(),&st)==0){filepath=p;break;}}
             // Kept for the error message below; `paths` goes out of scope here.
             for(size_t i=0;i<paths.size();++i){ if(i) tried_paths+=", "; tried_paths+=paths[i]; }

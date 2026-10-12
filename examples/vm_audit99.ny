@@ -202,6 +202,19 @@ check("f.__globals__ is globals()", fglobals.__globals__ is globals(), True)
 ns = {}
 exec("gg = globals()", ns)
 check("globals() in exec(src, ns) is ns", ns["gg"] is ns, True)
+import collections
+od_locals = collections.OrderedDict(a=1)
+exec("w = a + 4\nv = 2", {}, od_locals)
+check("exec(src, g, a dict subclass) binds through it", [od_locals.get("w"), list(od_locals)], [5, ["a", "w", "v"]])
+class LogDict(dict):
+    def __setitem__(self, k, v):
+        dict.__setitem__(self, k, v * 10)
+ld99 = LogDict(base=1)
+exec("got = base + 1", ld99)
+check("exec(src, a dict subclass as globals)", ld99.get("got"), 20)
+import builtins
+check("import builtins is the builtin module (a builtins.ny beside the script is not)",
+      [builtins.__name__, hasattr(builtins, "print")], ["builtins", True])
 
 # ── __spec__ / __loader__; sys.meta_path and sys.path_hooks ──────────────────
 import json, collections

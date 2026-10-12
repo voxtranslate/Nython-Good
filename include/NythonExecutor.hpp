@@ -11816,6 +11816,9 @@ public:
         std::replace(rel.begin(), rel.end(), '.', '/');
         struct stat st;
         auto dirs = moduleDirs(node);
+        // round 81: `builtins` is the builtin module whatever sits beside
+        // the script (CPython's BuiltinImporter comes first)
+        if (dotted == "builtins") dirs = nyrt::library_dirs();
         for (auto& d : dirs) {
             if (stat((d + rel + ".ny").c_str(), &st) == 0 && !S_ISDIR(st.st_mode)) return d + rel + ".ny";
             if (stat((d + rel + "/__init__.ny").c_str(), &st) == 0) return d + rel + "/__init__.ny";
@@ -12792,6 +12795,12 @@ public:
         for (auto& c : ancestorCandidates(node, module_name + ".ny")) search_paths.push_back(c);
         for (auto& c : ancestorCandidates(node, module_name)) search_paths.push_back(c);
         for (auto& d : nyrt::library_dirs()) search_paths.push_back(d + module_name + ".ny");
+        // round 81: `builtins` is the builtin module whatever sits beside
+        // the script (CPython's BuiltinImporter comes first)
+        if (!quoted && module_name == "builtins") {
+            search_paths.clear();
+            for (auto& d : nyrt::library_dirs()) search_paths.push_back(d + module_name + ".ny");
+        }
 
         std::string filepath;
         for (auto& p : search_paths) {
@@ -13645,17 +13654,31 @@ public:
         // round 81: exec(src, globals()) / eval(src, globals()) run in that
         // module's own scope (the view stands for it); any other dict
         // subclass is given as its value
+        // a dict subclass's object: its value is read, what the code binds
+        // goes back through its __setitem__ (OrderedDict, a class body's
+        // namespace...) - it was lost in a copy
+        Value sub_out = NONE_VALUE;
+        bool same_gl = has_g && has_l && args[2].type == args[1].type && args[2].value.p == args[1].value.p;
         if (has_g) {
             Context* vs = globalsViewScope(args[1]);
-            bool same_l = !has_l || (args[2].type == args[1].type && args[2].value.p == args[1].value.p);
-            if (vs && same_l) {
+            if (vs && (!has_l || same_gl)) {
                 Value r = runSnippetFrame(ast, vs);
                 return is_exec ? NONE_VALUE : r;
             }
             Value p;
-            if (any_payload_ && payloadOf(args[1], p)) args[1] = p;
+            if (any_payload_ && payloadOf(args[1], p)) { if (!has_l || same_gl) sub_out = args[1]; args[1] = p; }
         }
-        if (has_l && any_payload_) { Value p; if (payloadOf(args[2], p)) args[2] = p; }
+        if (has_l && any_payload_) { Value p; if (payloadOf(args[2], p)) { sub_out = args[2]; args[2] = p; } }
+        if (has_l && !same_gl && isInstanceValue(args[2]) && !isInstanceValue(sub_out)) {
+            // round 81: locals may be any mapping (Python): its bindings
+            // are read through keys()/__getitem__, written back through
+            // __setitem__ like a dict subclass's
+            std::vector<Value> a{args[2]};
+            Value snap = callFunctionValue(global_ctx->getByName("_ny_mapping_snapshot"), a, ctx);
+            sub_out = args[2];
+            args[2] = snap;
+        }
+        if (same_gl && isInstanceValue(sub_out)) has_l = false;   // one mapping: the globals
         Container* gd = has_g ? contOf(args[1]) : nullptr;
         Container* ld = has_l ? contOf(args[2]) : nullptr;
         if (has_g && (!gd || seqLen(gd) >= 0)) pyRaise("TypeError", std::string(who) + "() globals must be a dict, not " + typeNameOf(args[1]));
@@ -13674,7 +13697,7 @@ public:
         };
         // A dict's string key is the plain name, except a dunder name
         // ("\x01s__x__"); a scope keys every name plainly.
-        bool live = gd && (!ld || ld == gd);
+        bool live = gd && (!ld || ld == gd) && !isInstanceValue(sub_out);
         if (live) {
             // exec(src, ns) / eval(src, ns): the scope's variables ARE the
             // dict's (round 77, as Python) - functions defined there see
@@ -13716,6 +13739,26 @@ public:
         }
         if (!is_exec) return r;
         Container* out = ld ? ld : gd;
+        if (isInstanceValue(sub_out)) {
+            // a dict subclass (round 81): what the code bound or rebound,
+            // through its __setitem__
+            for (auto& kv : *sc->container) {
+                if (!exported(kv.first)) continue;
+                // as it was loaded: from the locals, else the globals
+                bool same = false;
+                for (Container* src0 : {ld, gd}) {
+                    if (!src0) continue;
+                    auto s = src0->container->find(nypy::key_of_str(kv.first));
+                    if (s == src0->container->end()) continue;
+                    same = identical(s->second, kv.second);
+                    break;
+                }
+                if (same) continue;
+                std::vector<Value> a{makeStringValue(kv.first), kv.second};
+                callMethod(sub_out, "__setitem__", a, ctx);
+            }
+            return NONE_VALUE;
+        }
         for (auto& kv : *sc->container) if (exported(kv.first)) dictSet(out, makeStringValue(kv.first), kv.second);
         return NONE_VALUE;
     }

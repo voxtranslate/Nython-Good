@@ -5704,3 +5704,25 @@ Full detail in `HANDOFF.md` §0s3. New test: `vm_audit98` (72 checks; passes und
 | Merging parts A and C: with a program's `list = []`, abc.ABC's `__slots__ = ()` called the program's list on the VM | the LOAD_NAME_MOD/GLOBAL caches read the program's frame for prelude code, which part A made invisible to it | prelude code is not specialized onto the program's frame (`plain_function_frame`) |
 | Windows: `pkgutil.extend_path([], pkg) != pkg.__path__` | a package's `__path__` mixed separators (`\\tmp\\pk/relx`) and importlib's PathFinder joined with `/` | the native separator in both, as CPython |
 
+
+## Round 81, part A — the semantic gaps round 80 left
+
+Full detail in `HANDOFF.md` §0t. New test: `vm_audit99` (116 checks; passes on both engines and under python3).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `except E as e:` left `e` bound after the clause | the name was an ordinary binding | unbound when the clause ends however it ends (interpreter `evalTry`'s `UnbindAs`; VM `Compiler::visit_unbinding_clause`, CPython's `try/finally: e = None; del e`), the lowered `except <expression> as e` too |
+| `globals()["x"] = 1` did not make `x`; `del globals()["x"]` did nothing; `globals() is globals()` false | `globals()` was a snapshot dict | the prelude's `_NyGlobalsDict`, a live view of the module's namespace (one per module); `locals()`/`vars()` at module level, `vars(module)`, `f.__globals__` are it; `exec(src, globals())` runs in that scope |
+| `setattr(sys.modules["__main__"], "y", 2)` did not make a global; `vars(__main__)` did not list them | `__main__` was a separate object | `_NyMainModule` reads, writes and deletes the program's globals; its `__dict__` is the globals view |
+| `exec(src, g, OrderedDict(...))` / a dict subclass as exec's namespace lost what the code bound | the mapping was copied | read through `keys()`/`__getitem__`, bindings written back through `__setitem__` |
+| Modules had no `__spec__`/`__loader__`; `sys.meta_path` / `sys.path_hooks` were ignored by `import` | the engines' import never consulted them | lazy `__spec__`/`__loader__` (ModuleSpec, SourceFileLoader); `_ny_import_via_hooks` (CPython's `_find_spec`), None at once without a finder of the program's own |
+| `import builtins` gave `examples/builtins.ny` (a demo beside the script) | the script's directory came first | `builtins` is searched in the library directories only (BuiltinImporter first) |
+| `C.__setattr__ = f` after instances stored attributes: ignored | the attribute-hook caches were not cleared | cleared on any store/delete of those names on a class (VM: EpochCaches) |
+| VM: `for x in lst` copied the list (O(n)); an append in the loop was not reached | the loop iterated a snapshot | the list itself by index (`stack_list_iter`, FOR_ITER / FOR_ITER_LIST), `iter(list)` live (`list_iter`); the interpreter's list loop re-reads the length each step |
+| `class P: pass; P(1, 2)` was accepted | object's `__init__`/`__new__` ignored arguments | "P() takes no arguments", "object.__init__() takes exactly one argument (the instance to initialize)" (CPython's excess-args rules, `_ny_ctor_check`); `super().__init__(x)` reaching object raises too |
+| `repr(P())` was `<P instance>` | — | `<__main__.P object at 0x...>` (module, qualname, id); `to_string()` too |
+| Setting `frame.f_lineno` from a trace function did nothing; pdb's `jump` did nothing | — | jumps with CPython 3.12's rules and messages (interpreter: `frameJump`/`JumpSignal`/`resumeInto`; VM: `vm_frame_jump`/`vm_apply_jump` over the bytecode's blocks) |
+| `frame.f_code is f.__code__` was false | a new code object per read | one code object per function (`_ny_code_of`) |
+| No `sys.getrefcount`, `sys.stdlib_module_names`, `sys.displayhook`; `-OO` kept docstrings | — | the engines' counts; lib/'s names; the prompt calls a program's displayhook; `docstringOf` drops them at `-OO` |
+| Both engines stopped near 1100 frames whatever `sys.setrecursionlimit` said | ~7 KB of native stack per Nython frame on an 8 MB stack | a call near the end of the native stack goes on on an extension stack (NyCoro's segments): 3000 deep at limit 5000 works, threads too |
+| Interpreter SIGSEGV on `def __eq__(self, o): return self == o` | recursion through operators never passed `evalCall`'s depth check | `runFunctionBody` checks the frame depth: RecursionError |
