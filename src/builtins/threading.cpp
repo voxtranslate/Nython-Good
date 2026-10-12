@@ -43,6 +43,38 @@
 
 #include "NyConc.hpp"
 
+// (round 83) faulthandler / tracemalloc (builtins/nyfault.cpp): an
+// interpreter thread's frames, innermost first, as the traceback machinery
+// reads them (NythonExecutor's frameName/frameLine), without allocating -
+// a signal handler calls it. The prelude's frames ("stdin") are left out.
+void ny_interp_walk(const NythonExecutor::PyFrames* F, nython::node::Node* cur,
+                    nyconc::Engine::FrameEmit emit, void* sink) {
+    using nython::node::Node;
+    auto put = [&](Node* where, const char* name) {
+        if (!where) return;
+        const auto& loc = where->tok()._location;
+        if (loc.filename.size() == 5 && loc.filename.compare(0, 5, "stdin") == 0) return;
+        emit(sink, loc.filename.c_str(), (long)loc.row, name);
+    };
+    size_t n = F ? F->size() : 0;
+    for (size_t i = n; i-- > 0;) {
+        const NythonExecutor::PyFrame& fr = (*F)[i];
+        const char* name = "<lambda>";
+        Node* where = cur;
+        if (fr.code && fr.code->type() == nython::node::NodeType::FUNCTION) {
+            const std::string& nm = static_cast<nython::node::FunctionNode*>(fr.code)->name;
+            if (!nm.empty()) name = nm.c_str();
+        } else if (fr.code && fr.code->type() == nython::node::NodeType::LAMBDA) {
+            where = fr.code;
+        } else if (!fr.code) {
+            name = "<module>";
+        }
+        put(where, name);
+        cur = fr.call_site;
+    }
+    put(cur, "<module>");
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Interpreter side of the concurrency runtime (src/NyConc.cpp).
 // All semantics live in the runtime; this only converts values and errors.
@@ -223,7 +255,25 @@ struct InterpEngine : nyconc::Engine {
     };
     void* state_new() override { return new State(); }
     void state_free(void* p) override { delete static_cast<State*>(p); }
-    void swap_in(void* p) override { swap(static_cast<State*>(p)); }
+    // (round 83) faulthandler: the frames running now are the GIL holder's
+    // thread-locals; swap_in notes where they are.
+    std::atomic<const NythonExecutor::PyFrames*> live_frames{nullptr};
+    std::atomic<nython::node::Node* const*> live_cur{nullptr};
+    void walk_frames(const void* estate, FrameEmit emit, void* sink) override {
+        if (estate) {
+            auto* st = static_cast<const State*>(estate);
+            ny_interp_walk(&st->frames, st->cur, emit, sink);
+            return;
+        }
+        const NythonExecutor::PyFrames* F = live_frames.load(std::memory_order_acquire);
+        nython::node::Node* const* cur = live_cur.load(std::memory_order_acquire);
+        if (F) ny_interp_walk(F, cur ? *cur : nullptr, emit, sink);
+    }
+    void swap_in(void* p) override {
+        swap(static_cast<State*>(p));
+        live_frames.store(&NythonExecutor::py_frames(), std::memory_order_release);
+        live_cur.store(&NythonExecutor::cur_stmt(), std::memory_order_release);
+    }
     void swap_out(void* p) override { swap(static_cast<State*>(p)); }
     void swap(State* st) {
         if (!st) return;

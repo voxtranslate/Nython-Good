@@ -54,6 +54,7 @@
 #include "NyBytes.hpp"
 #include "NyScope.hpp"
 #include "builtins/net.hpp"
+#include "builtins/sysmods.hpp"   // round 83: errno, fcntl, mmap, bz2, lzma, cmath, ...
 #include "NyFormat.hpp"
 #include "NyMembers.hpp"
 
@@ -813,6 +814,7 @@ public:   // NythonExecutor is a struct: members default to public
         for (auto& name : pyjson_builtin_names()) registerBuiltin(name);
         for (auto& name : pyrandom_builtin_names()) registerBuiltin(name);
         for (auto& name : re_builtin_names()) registerBuiltin(name);
+        for (auto& name : sysmods_builtin_names()) registerBuiltin(name);   // round 83
         // Exception types
         std::vector<std::string> exc_types = {
             "Exception","BaseException","Error",
@@ -9400,6 +9402,7 @@ public:
             result = dispatch_tls(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
             result = dispatch_hash(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
             if (name.compare(0, 4, "_re_") == 0) return dispatch_re(*this, name, args, ctx);
+            result = dispatch_sysmods(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;   // round 83
         }
         if (name == "os_urandom") return dispatch_hash(*this, name, args, ctx);
         if (name.compare(0, 5, "math_") == 0) {

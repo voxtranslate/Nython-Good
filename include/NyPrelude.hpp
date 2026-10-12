@@ -5114,6 +5114,10 @@ def _ny_osp_commonprefix(m):
     return s1
 
 # ── the members (round 80) ───────────────────────────────────────────────
+def _ny_os__exit(status):
+    # (round 83) _exit(2): the process ends at once, no cleanup
+    _sys_exit(_ny_os_fd(status))
+
 _ny_os_curdir = "."
 _ny_os_pardir = ".."
 _ny_os_extsep = "."
@@ -5136,7 +5140,7 @@ def _ny_os_member_list():
              ("curdir", _ny_os_curdir), ("pardir", _ny_os_pardir), ("extsep", _ny_os_extsep),
              ("altsep", _ny_os_altsep), ("devnull", _ny_os_devnull), ("defpath", _ny_os_defpath),
              ("F_OK", 0), ("R_OK", 4), ("W_OK", 2), ("X_OK", 1), ("SEEK_SET", 0), ("SEEK_CUR", 1), ("SEEK_END", 2),
-             ("supports_bytes_environ", not _ny_os_nt), ("environ", _ny_os_environ()), ("putenv", _ny_os_putenv),
+             ("supports_bytes_environ", not _ny_os_nt), ("environ", _ny_os_environ()), ("putenv", _ny_os_putenv), ("_exit", _ny_os__exit),
              ("path.split", _ny_osp_split), ("path.basename", _ny_osp_basename),
              ("path.dirname", _ny_osp_dirname), ("path.splitext", _ny_osp_splitext),
              ("path.splitdrive", _ny_osp_splitdrive), ("path.normpath", _ny_osp_normpath),
@@ -5206,6 +5210,96 @@ def _ny_os_member_list():
                   major, minor, makedev, getloadavg, killpg, sendfile):
             f.__module__ = "posix"
             m.append((f.__name__, f))
+        # (round 83) the process calls pty needs - fork, forkpty, openpty,
+        # login_tty, waitpid, the wait-status macros, the exec family
+        # (builtins/nysysmods.cpp); the child of a fork goes on alone
+        # (nyconc::after_fork_child)
+        def fork():
+            return _sys_fork()
+        def forkpty():
+            return tuple(_sys_forkpty())
+        def openpty():
+            return tuple(_sys_openpty())
+        def login_tty(fd):
+            _sys_login_tty(_ny_os_fd(fd))
+        def waitpid(pid, options):
+            return tuple(_sys_waitpid(_ny_os_fd(pid), _ny_os_fd(options)))
+        def ttyname(fd):
+            return _sys_ttyname(_ny_os_fd(fd))
+        def WIFEXITED(status):
+            return _sys_wstatus("exited", status)
+        def WEXITSTATUS(status):
+            return _sys_wstatus("exitstatus", status)
+        def WIFSIGNALED(status):
+            return _sys_wstatus("signaled", status)
+        def WTERMSIG(status):
+            return _sys_wstatus("termsig", status)
+        def WIFSTOPPED(status):
+            return _sys_wstatus("stopped", status)
+        def WSTOPSIG(status):
+            return _sys_wstatus("stopsig", status)
+        def WCOREDUMP(status):
+            return _sys_wstatus("coredump", status)
+        def WIFCONTINUED(status):
+            return _sys_wstatus("continued", status)
+        def waitstatus_to_exitcode(status):
+            if _sys_wstatus("exited", status):
+                return _sys_wstatus("exitstatus", status)
+            if _sys_wstatus("signaled", status):
+                return -_sys_wstatus("termsig", status)
+            raise ValueError("invalid wait status: " + str(status))
+        def execv(path, args):
+            _sys_execv(_ny_os_str(path), [_ny_os_str(a) for a in args], None)
+        def execve(path, args, env):
+            _sys_execv(_ny_os_str(path), [_ny_os_str(a) for a in args],
+                       [_ny_os_str(k) + "=" + _ny_os_str(env[k]) for k in env])
+        def _execvpe(file, args, env=None):
+            if os_path_dirname(file):
+                if env is None:
+                    execv(file, args)
+                else:
+                    execve(file, args, env)
+                return
+            var saved = None
+            var last = None
+            for d in _ny_os_get_exec_path(env):
+                var full = os_path_join(d, file)
+                try:
+                    if env is None:
+                        execv(full, args)
+                    else:
+                        execve(full, args, env)
+                except (FileNotFoundError, NotADirectoryError) as e:
+                    last = e
+                except OSError as e:
+                    last = e
+                    if saved is None:
+                        saved = e
+            if saved is not None:
+                raise saved
+            if last is not None:
+                raise last
+            raise FileNotFoundError(2, "No such file or directory", file)
+        def execl(file, *args):
+            execv(file, args)
+        def execle(file, *args):
+            execve(file, args[:-1], args[-1])
+        def execlp(file, *args):
+            _execvpe(file, args)
+        def execlpe(file, *args):
+            _execvpe(file, args[:-1], args[-1])
+        def execvp(file, args):
+            _execvpe(file, args)
+        def execvpe(file, args, env):
+            _execvpe(file, args, env)
+        for f in (fork, forkpty, openpty, login_tty, waitpid, ttyname, WIFEXITED, WEXITSTATUS, WIFSIGNALED,
+                  WTERMSIG, WIFSTOPPED, WSTOPSIG, WCOREDUMP, WIFCONTINUED, waitstatus_to_exitcode, execv, execve,
+                  execl, execle, execlp, execlpe, execvp, execvpe):
+            f.__module__ = "posix"
+            m.append((f.__name__, f))
+        m.append(("WNOHANG", _sys_wstatus("WNOHANG", 0)))
+        m.append(("WUNTRACED", _sys_wstatus("WUNTRACED", 0)))
+        m.append(("WCONTINUED", _sys_wstatus("WCONTINUED", 0)))
         m.append(("environb", _ny_os_environb()))
         m.append(("get_blocking", _ny_os_get_blocking))
         m.append(("set_blocking", _ny_os_set_blocking))

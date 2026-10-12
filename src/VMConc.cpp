@@ -15,6 +15,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 #include "VirtualMachine.hpp"
 #include "NyConc.hpp"
+#include "builtins/sysmods.hpp"   // round 83: nyfault_set_vm_engine
+#include <cstring>
 
 namespace nython::vm {
 
@@ -105,6 +107,20 @@ struct VMArgs : nyconc::Args {
 struct VMConcEngine : nyconc::Engine {
     VirtualMachine& vm;
     explicit VMConcEngine(VirtualMachine& m) : vm(m) {}
+
+    // (round 83) faulthandler / tracemalloc: a thread's frames, innermost
+    // first - the running ones (vm.call_stack_) or a parked thread's. Reads
+    // only: a signal handler calls it. The prelude's frames are left out.
+    void walk_frames(const void* estate, FrameEmit emit, void* sink) override {
+        const FrameStack& fs = estate ? static_cast<const VMThreadState*>(estate)->calls : vm.call_stack_;
+        for (size_t i = fs.size(); i-- > 0;) {
+            const CallFrame& f = fs[i];
+            if (!f.code) continue;
+            const std::string& file = f.code->file;
+            if (file.size() == 5 && std::memcmp(file.data(), "stdin", 5) == 0) continue;
+            emit(sink, file.c_str(), VirtualMachine::frame_line(f), f.code->name.empty() ? "<module>" : f.code->name.c_str());
+        }
+    }
 
     nyconc::BoxPtr call(const nyconc::BoxPtr& fn, const std::vector<nyconc::BoxPtr>& args) override {
         VMVal f = unbox(fn);
@@ -248,6 +264,7 @@ void VMConc::install(VirtualMachine& vm) {
     // the engine as still referenced at exit (deliberate, not a leak).
     static auto* engines = new std::vector<VMConcEngine*>();
     engines->push_back(eng);
+    nyfault_set_vm_engine(eng, static_cast<const Runnable*>(&vm));   // round 83: faulthandler, tracemalloc
     // A signal's handler runs at the next tick site (frame entry, backward
     // jump); its exception is raised into the VM there.
     vm.raise_nyerror_ = [eng](const nyconc::NyError& err) { eng->raise_in_vm(err); };

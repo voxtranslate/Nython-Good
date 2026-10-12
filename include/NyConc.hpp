@@ -93,6 +93,13 @@ struct Engine {
     virtual void  state_free(void*) {}
     virtual void  swap_in(void*) {}
     virtual void  swap_out(void*) {}
+    // (round 83) faulthandler: write a thread's Python-level frames, innermost
+    // first, through emit(sink, file, line, function) - `estate` a parked
+    // thread's saved state (state_new's), or nullptr for the frames running
+    // now (the GIL holder's, or the only thread's). Reads memory only (no
+    // allocation, no lock): a signal handler calls it.
+    using FrameEmit = void (*)(void* sink, const char* file, long line, const char* name);
+    virtual void  walk_frames(const void* estate, FrameEmit emit, void* sink) { (void)estate; (void)emit; (void)sink; }
 };
 
 // ── Arguments / results of the shared builtin dispatcher ────────────────────
@@ -149,6 +156,15 @@ void set_switch_interval(double seconds);
 // True when this thread may touch engine values: it holds the GIL, or there
 // is no GIL yet (one thread).
 bool holds_gil();
+// (round 83) In a child process after fork(): only the calling thread goes
+// on; the GIL is off again and that thread is the main thread.
+void after_fork_child();
+// (round 83) faulthandler: the runtime's threads (not async tasks) as a
+// signal handler may read them - without waiting for the runtime mutex (0
+// when another thread holds it) and without allocating. `current`: the
+// calling OS thread's record; `gil_owner`: its frames are the live ones.
+struct ThreadSnap { int64_t id; const void* estate; Engine* engine; bool gil_owner; bool current; };
+size_t thread_snapshot(ThreadSnap* out, size_t max);
 // Release the GIL around a blocking native operation (no-op when inactive or
 // not held). The operation must not touch engine state while released.
 struct GilRelease {

@@ -1354,6 +1354,30 @@ def unregister(search_function):
     _cache.clear()
 
 
+_encodings_loaded = False
+
+
+def _load_encodings():
+    global _encodings_loaded
+    _encodings_loaded = True
+    try:
+        import encodings
+    except ImportError:
+        pass
+
+
+def _search(key):
+    for f in list(_search_functions):
+        var r = f(key)
+        if r is not None:
+            if not isinstance(r, CodecInfo):
+                if not isinstance(r, tuple) or len(r) != 4:
+                    raise TypeError("codec search functions must return 4-tuples")
+                r = CodecInfo(*r)
+            return r
+    return None
+
+
 def lookup(encoding):
     """Looks up a codec tuple in the Python codec registry and returns a CodecInfo object."""
     if not isinstance(encoding, str):
@@ -1371,15 +1395,12 @@ def lookup(encoding):
         if py is not None:
             info = _stateless_info(py[0], py[1], py[2], py[3])
         else:
-            for f in _search_functions:
-                var r = f(key)
-                if r is not None:
-                    if not isinstance(r, CodecInfo):
-                        if not isinstance(r, tuple) or len(r) != 4:
-                            raise TypeError("codec search functions must return 4-tuples")
-                        r = CodecInfo(*r)
-                    info = r
-                    break
+            info = _search(key)
+            if info is None and not _encodings_loaded:
+                # (round 83) the encodings package, as CPython's startup
+                # imports it: its search function knows the code pages
+                _load_encodings()
+                info = _search(key)
     if info is None:
         raise LookupError("unknown encoding: " + encoding)
     _cache[key] = info

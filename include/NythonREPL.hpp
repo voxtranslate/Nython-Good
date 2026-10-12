@@ -274,11 +274,70 @@ public:
     }
 };
 
+// ─── The readline module's view of the editor (round 83) ───────────────────
+// lib/readline.ny (builtins/nyreadline.cpp) works over this editor rather
+// than over libreadline: one history for the process (the prompt's Up/Down
+// and readline's add_history/get_history_item/read_history_file are the same
+// list), and Tab asks the module's completer through `complete`, which the
+// prompt sets for the engine running it (src/main.cpp).
+struct ReadlineState {
+    std::vector<std::string> history;
+    bool auto_history = true;
+    std::string delims = " \t\n`~!@#$%^&*()-=+[{]}\\|;:'\",<>/?";
+    std::string line_buffer;     // while completing: the line, and where the word is
+    int begidx = 0, endidx = 0;
+    std::string insert;          // insert_text() from a hook: put in at the cursor
+    std::function<std::vector<std::string>(const std::string& text, const std::string& line, int beg, int end)> complete;
+};
+inline ReadlineState& readline_state() { static ReadlineState* s = new ReadlineState(); return *s; }
+
 // ─── The actual multiline REPL editor ──────────────────────────────────────
 class MultilineEditor {
     Terminal term_{};
-    std::vector<std::string> history_{};
+    std::vector<std::string>& history_ = readline_state().history;   // round 83: shared with readline
     int hist_idx_ = 0;
+    int tabs_ = 0;   // Tabs in a row (a second one lists the candidates)
+
+    // Tab with a completer: the word before the cursor completed (the common
+    // prefix of the candidates; a second Tab lists them). false: no
+    // completer, or nothing but blanks before the cursor - Tab indents.
+    bool complete() {
+        ReadlineState& rs = readline_state();
+        if (!rs.complete) return false;
+        std::string& line = lines_[cl_];
+        if (line.find_first_not_of(" \t") >= (size_t)cc_) return false;
+        int beg = cc_;
+        while (beg > 0 && rs.delims.find(line[beg - 1]) == std::string::npos) beg--;
+        std::string text = line.substr(beg, cc_ - beg);
+        rs.line_buffer = line; rs.begidx = beg; rs.endidx = cc_;
+        term_.disableRaw();
+        std::vector<std::string> c = rs.complete(text, line, beg, cc_);
+        term_.enableRaw();
+        if (c.empty()) return true;
+        std::string common = c[0];
+        for (auto& s : c) {
+            size_t k = 0;
+            while (k < common.size() && k < s.size() && common[k] == s[k]) k++;
+            common.resize(k);
+        }
+        if (c.size() == 1 && !common.empty() && rs.delims.find(common.back()) == std::string::npos
+            && common.back() != '(' && common.back() != '.') common += ' ';
+        if (common.size() > text.size() && common.compare(0, text.size(), text) == 0) {
+            line.replace(beg, cc_ - beg, common);
+            cc_ = beg + (int)common.size();
+            refreshLine();
+            tabs_ = 0;
+            return true;
+        }
+        if (++tabs_ >= 2 && c.size() > 1) {
+            w_raw("\r\n", 2);
+            for (auto& s : c) { w_str(s); w_raw("  ", 2); }
+            w_raw("\r\n", 2);
+            refreshAll();
+            tabs_ = 0;
+        }
+        return true;
+    }
 
     std::vector<std::string> lines_{};
     int cl_ = 0; // cursor line
@@ -404,6 +463,11 @@ public:
     Result collect(std::string& code) {
         lines_ = {""};
         cl_ = 0; cc_ = 0;
+        if (!readline_state().insert.empty()) {   // round 83: readline.insert_text()
+            lines_[0] = readline_state().insert;
+            cc_ = (int)lines_[0].size();
+            readline_state().insert.clear();
+        }
         hist_idx_ = (int)history_.size();
 
         term_.enableRaw();
@@ -462,7 +526,9 @@ public:
                 continue;
             }
 
+            if (key != Terminal::K_TAB) tabs_ = 0;
             if (key == Terminal::K_TAB) {
+                if (complete()) continue;   // round 83: readline's completer
                 lines_[cl_].insert(cc_, "    ");
                 cc_ += 4;
                 refreshLine();
@@ -550,7 +616,7 @@ public:
 
         // Save to history
         auto p = code.find_first_not_of(" \t\r\n");
-        if (p != std::string::npos && (history_.empty() || history_.back()!=code)) {
+        if (p != std::string::npos && readline_state().auto_history && (history_.empty() || history_.back()!=code)) {
             history_.push_back(code);
             while (history_.size()>1000) history_.erase(history_.begin());
         }

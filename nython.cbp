@@ -172,6 +172,13 @@
         <Unit filename="src/builtins/os_fd.cpp" />
         <Unit filename="src/builtins/nycodecs.cpp" />
         <Unit filename="src/builtins/nypickle.cpp" />
+        <Unit filename="src/builtins/nysysmods.cpp" />
+        <Unit filename="src/builtins/nymmap.cpp" />
+        <Unit filename="src/builtins/nybz2.cpp" />
+        <Unit filename="src/builtins/nylzma.cpp" />
+        <Unit filename="src/builtins/nycmath.cpp" />
+        <Unit filename="src/builtins/nyfault.cpp" />
+        <Unit filename="src/builtins/nyreadline.cpp" />
         <Unit filename="src/builtins/pycore.cpp" />
         <Unit filename="src/builtins/gui_harness.cpp" />
         <Unit filename="src/NyConc.cpp" />
