@@ -88,8 +88,9 @@ everything; `subprocess`, `events`, `protocols`, `transports`, `streams`,
 so `asyncio.subprocess.PIPE` and `from asyncio.subprocess import PIPE`
 work after `import asyncio`). CPython 3.12's semantics and messages; the
 module's header lists what is there and what is not. `examples/vm_audit104.ny`
-(117 checks on both engines; under python3.11 106 pass with eager tasks and
-Queue.shutdown skipped, 3.12 107, 3.13 all 109) pins it.
+(113 checks on both engines; the shared part passes under python3.11 - 108,
+eager tasks and Queue.shutdown skipped -, 3.12 - 109 - and 3.13 - all 110;
+under Wine 101 pass, the POSIX-only parts and TLS skipped) pins it.
 
 ### The event loop is a persistent native loop
 - `new_event_loop()` gives a `SelectorEventLoop` over `async_loop_new()`
@@ -220,8 +221,12 @@ them). Untracked loops pay nothing.
   gains `has_cancel_msg`/`cancel_msg`; `Coro` gains `dropped`; `Awaitable`
   gains an absolute deadline (`has_at`/`at`) used by `run_call_later`.
   Builtins `async_loop_new/spawn/call/run/stop/close`,
-  `async_current_loop`, `async_create_task_eager`, `async_task_detach`;
-  `task_cancel(h, msg)`. `grant()` counts steps, frees finished ephemeral
+  `async_current_loop`, `async_current_task_user` (0 in a callback or the
+  loop's own tasks: `current_task()` is None there), `async_create_task_eager`,
+  `async_task_detach` (a task nothing will ask about any more - an asyncio
+  Task object that was collected, a transport's reader - is freed when it
+  has finished; awaiting a coroutine whose freed task ran it is "cannot
+  reuse already awaited coroutine"); `task_cancel(h, msg)`. `grant()` counts steps, frees finished ephemeral
   tasks and prunes a persistent loop's task list as it doubles (engine
   values released with the GIL held); `run_loop_until` polls the reactor
   without waiting every 32 steps while tasks stay ready (a `while not done:
@@ -252,15 +257,19 @@ them). Untracked loops pay nothing.
   coroutine took 7 s (interpreter) / 2.7 s (VM) instead of 0.5 / 0.4 s; the
   VM's stream echo benchmark went from 44 s to 0.8 s.
 
-### Measured (this container, loaded; `scratchpad` benchmarks, interpreter / VM / CPython 3.11)
+### Measured (this container, under load from other builds; interpreter / VM / CPython 3.11)
 | | interpreter | VM | CPython |
 |---|---|---|---|
-| 10000 call_soon callbacks | 0.58 s | 0.24 s | 0.03 s |
-| 2000 protocol echo round trips | 0.37 s | 0.23 s | 0.22 s |
-| 2000 stream echo round trips | 2.3 s | 0.8 s | 0.13 s |
-| gather of 2000 tasks (sleep(0) each) | 0.38 s | 0.18 s | 0.03 s |
-A long-running server's memory is flat (1000s of connections through
-`start_server`: live objects bounded on both engines).
+| 10000 call_soon callbacks | 0.49 s | 0.31 s | 0.03 s |
+| 2000 protocol echo round trips | 0.23 s | 0.19 s | 0.22 s |
+| 2000 stream echo round trips | 2.3 s | 0.90 s | 0.13 s |
+| gather of 2000 tasks (sleep(0) each) | 0.33 s | 0.19 s | 0.03 s |
+| 1000 start_server/open_connection round trips | 5.4 s | 2.9 s | - |
+Memory is flat across thousands of connections through `start_server` on
+both engines (before the fixes above: +54 KB (interpreter) / +70 KB (VM)
+of RSS per connection). `import asyncio` takes ~0.14 s on the interpreter
+(a 5000-line module and its 15 submodules; lib/subprocess is loaded with
+the first child).
 
 ### Not done / found
 - `shutdown_asyncgens()` closes nothing (no `sys.set_asyncgen_hooks`);
