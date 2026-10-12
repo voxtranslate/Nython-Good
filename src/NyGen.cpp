@@ -1408,7 +1408,7 @@ Value for_loop(NythonExecutor& E, void* for_node, const Value& gv, Context* ctx,
         for (bool head_first = true;; head_first = false) {
             // sys.settrace (round 79): the header's line again before each
             // next item (NY_PYT_HEAD)
-            if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0) && !head_first) E.pyEvLineAt(fn);
+            if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0) && !head_first) E.pyEvLineAt(fn, true);
             if (!next(E, g, elem, ctx)) break;
             bind_item(elem);
             try { NythonExecutor::LoopBody _lb(lf); result = E.evalNode(fn->body, ctx); }

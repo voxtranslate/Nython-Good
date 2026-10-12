@@ -3,7 +3,14 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 81, part C — **§0t3** (live debugging: `nython --debug-port N`, a
+Last updated: round 81, part A — **§0t** (the semantic gaps round 80 left:
+`except ... as e` unbinding, a live `globals()` and the real `__main__`,
+`__spec__` and `sys.meta_path`/`path_hooks` in the import statement,
+attribute hooks assigned later, live list iteration, "P() takes no
+arguments", CPython's default repr, `f_lineno` jumps and pdb's `jump`,
+`sys.getrefcount`/`stdlib_module_names`/`displayhook`, `-OO`, deep
+recursion on extension stacks; both engines).
+Round 81, part C — **§0t3** (live debugging: `nython --debug-port N`, a
 DAP-style debug server over bdb with step back and Why? over a ring buffer
 of recent statements; the IDE's live mode and PROFILE panel with a flame
 graph from cProfile's new calling context tree). Round 80 — **§0s** (part A: the correctness gaps rounds
@@ -220,6 +227,228 @@ whole suite 442 passed, 0 failed;
   - its first run timed out in the `scroll` probe waiting for a frame at a
   load average of 13.5 on 4 cores (two agents building); the rerun at the
   same load passed. Not investigated further.
+
+## 0t. Round 81, part A — the semantic gaps round 80 left (vm_audit99)
+
+`examples/vm_audit99.ny` (125 checks) passes on the interpreter, the VM and
+python3.11; every expected value is CPython's (a jump into a `with` body:
+3.11 and 3.12 word the error differently, the check accepts both). Both
+engines the same way unless said.
+
+### except E as e
+- The name is unbound when the clause ends, however it ends (falling off,
+  return, break/continue, an exception out of it), before the try's own
+  finally runs - CPython's `try: body finally: e = None; del e`, with no
+  line event of its own. Interpreter: `evalTry`'s `UnbindAs` guard around
+  the handler body. VM: `Compiler::visit_unbinding_clause` compiles the
+  body as a try/finally whose finally stores None and deletes the name.
+  `except <expression> as e` (the parser's lowered catch-all) unbinds its
+  clauses' names too (`ExceptNode::unbind_names`, set in
+  `Parser::tryStmt`).
+
+### globals(), locals(), vars(), exec, sys.modules["__main__"]
+- `globals()` is the module's live namespace: the prelude's
+  `_NyGlobalsDict` (dictview chunk, a `_NyInstanceDict`), one per module
+  (`globals() is globals()`), whose value is the module's variables as they
+  are now (the engines' payload of a view whose field `__ny_globals_of__`
+  is the module object, None for the program - `globalsOf` / `globals_of`)
+  and whose stores and deletions bind and unbind them (`_ny_main_set` /
+  `_ny_main_del` for the program, setattr/delattr on a module's live
+  namespace). `type(globals()).__name__` is "dict" and it is a dict
+  instance, but `type(globals()) is dict` is False.
+- `locals()` and `vars()` at a module's top level are that view; so are
+  `vars(module)` and `f.__globals__`; inside `exec(src, ns)`, `globals()` is
+  `ns` itself. `exec(src, globals())` / `eval(src, globals())` run in that
+  module's scope (exec and eval are payload-transparent now:
+  `nyrt::payload_transparent`); a dict subclass given as exec's globals or
+  locals, or any mapping as its locals (collections.OrderedDict, a
+  UserDict - read through its `keys()`/`__getitem__`, the prelude's
+  `_ny_mapping_snapshot`), gets what the code binds or rebinds through its
+  `__setitem__` (it was lost in a copy). A name the code deletes is not
+  deleted from such a mapping.
+- `sys.modules["__main__"]` (`_NyMainModule`): setting or deleting an
+  attribute binds or unbinds the program's global; its `__dict__` (a
+  property - `vars()` honours a class's own `__dict__` now on both engines)
+  is the program's globals view. The program has `__spec__` (None).
+
+### __spec__, __loader__, sys.meta_path, sys.path_hooks
+- A module the engines imported gets `__spec__` / `__loader__` when first
+  read (`_ny_module_spec_attr`: importlib.machinery's ModuleSpec and
+  SourceFileLoader for its file, BuiltinImporter's for sys/os/math/
+  builtins) - lazily, so an import costs what it did.
+- The import statement asks the prelude's `_ny_import_via_hooks(name)` for
+  a module that is not loaded yet (CPython's `_find_and_load` order):
+  `sys.meta_path`'s default entries stand for the engines' own search
+  (`_NyNativeFinder("builtin")`, `("path")`, marked `_ny_kind`); a program's
+  finder before them is asked first, after them only for what they cannot
+  find; with `sys.path_hooks`, each sys.path entry (a package's `__path__`
+  for a submodule) is offered to the hooks and the finder kept in
+  `sys.path_importer_cache` (None for an entry no hook takes - the engines'
+  own directory search). A spec is loaded as `_load_unlocked`
+  (create_module, the module's attributes, sys.modules, exec_module). With
+  no finder or hook of a program's own it returns None at once, and only
+  for a module not loaded yet: importing 22 stdlib modules (json, re,
+  collections, decimal, datetime, enum, dataclasses, typing...) took
+  0.646 s on the interpreter before and 0.650 s after (VM 0.59 s / 0.51-
+  0.55 s), and 40,000 imports of loaded modules 0.028 s / 0.69 s on both
+  binaries (min of 3 interleaved runs against 2eb1221's build). The
+  benchmark suite (`tools/bench/run.py --base`, 2eb1221): VM 1.04x,
+  interpreter 1.04x geomean - no change outside noise.
+- `import builtins` is lib/builtins.ny whatever sits beside the script
+  (examples/builtins.ny, a demo, shadowed it - CPython's BuiltinImporter
+  comes first).
+
+### Attribute hooks assigned later
+- `C.__setattr__ = f`, `__delattr__`, `__getattribute__` (and `__new__`)
+  assigned to a class - or deleted from it - after instances stored
+  attributes: the hook caches are cleared (interpreter `setAttr` /
+  `delAttrValue` on a class; VM `set_attr` / `del_attr` - EpochCaches, so the
+  specialized code sees it too).
+
+### Live list iteration
+- VM: `for x in some_list` iterates the list itself by index (a loop's own
+  `list_iterator` on the stack, `stack_list_iter`, served by FOR_ITER's
+  in-place branch and by FOR_ITER_LIST when specialized): an item appended
+  in the loop is reached, a list that shrank ends it. `iter(list)`,
+  enumerate/zip/map/filter over a list (`vm_iter_open`) and a GET_ITER not
+  followed by FOR_ITER are live too (`list_iter`, a native generator; an
+  exhausted one stays exhausted). The O(n) copy per loop is gone; a set's
+  loop walks the set's own items too (see "More of this kind").
+- Interpreter: `iter(list)` was live already; its list loop read the length
+  once (appends unseen) - it is read at each step now (a set's size is
+  checked instead).
+
+### Classes that take no arguments
+- `P(1, 2)` for a class with neither `__init__` nor `__new__` of its own:
+  `TypeError: P() takes no arguments` (`object(1)`, `class C(object)`,
+  `P(x=1)` too); `object.__init__(self, x)` reached from an `__init__`
+  (`super().__init__(x)` included) and `object.__new__(cls, x)` from a
+  `__new__` give CPython's "takes exactly one argument" errors - the
+  prelude's `_ny_ctor_check`, run by object's `__init__`/`__new__` only when
+  given arguments. Exceptions and builtin subclasses take their arguments as
+  before. object's own `__init__` is no longer called by an instantiation
+  (it did nothing). Interpreter `runConstructor` / `superCall`; VM
+  `instantiate` / `check_no_ctor_args` / super's ctor path.
+- Repository code that relied on the leniency: none found - every example,
+  test and GUI test (the sweep, both engines) and the IDE (e2e, lint)
+  pass with no change to lib/, the IDE or examples/.
+
+### The default repr
+- `<__main__.P object at 0x...>` - the class's `__module__` and
+  `__qualname__`, the address id() gives - for repr, str, format,
+  f-strings, containers and the object protocol's `to_string()`
+  (`defaultInstanceRepr` / `vm_default_repr`). Adapted:
+  `examples/gui_tests/test_25_object_protocol.ny` (it expected `<Child
+  instance>`). Nothing in the IDE or lib/ relied on the old form.
+
+### f_lineno jumps (pdb's jump)
+- A trace function may set `frame.f_lineno` from a 'line' event of that
+  frame, with CPython's rules and 3.12's messages: not from 'call' ("can't
+  jump from the 'call' trace event of a new frame"), 'return'/'exception'
+  ("can only jump from a 'line' trace event") or outside a trace function;
+  "line N comes before / after the current code block"; to the first line
+  with a statement on or after N; not into a for loop's body or a with body
+  ("can't jump into the body of a for loop" - 3.12's message for both), nor
+  an except clause ("can't jump into an 'except' block as there's no
+  exception"). It may enter if/elif/else, while bodies, try bodies, else
+  and finally blocks; what it leaves is just left (no finally or `__exit__`
+  runs, as in CPython); jumping to a for loop's line starts the loop again
+  (3.11's behaviour). The target's own line event is not reported, as
+  CPython's is not. pdb's `jump` works (it already set f_lineno).
+- Interpreter: `frameJump` analyses the code block's statements over the
+  AST (`jumpWalk`: each statement with its chain of blocks); the jump is a
+  `JumpSignal` thrown when the trace function returns (`pyEvLine`), caught
+  by `evalStatements` of the deepest block holding both statements, which
+  goes on at the target, entering blocks on the way down (`jumpResume`,
+  `resumeInto`). Cost when not tracing: one thread-local byte per block
+  entry (`jumpResuming`); `evalScript` is `evalStatements` now.
+- VM: `vm_frame_jump` works over the bytecode: the blocks an instruction
+  is in come from the code itself (FOR_ITER ranges, the exception table's
+  handlers, finally blocks and with bodies - `vm_blocks_at`); `run_loop`
+  pops what the left blocks keep on the stack, pushes a normal state for a
+  finally entered, clears a left handler's exception and moves `ip`
+  (`vm_apply_jump`) - no cost when not tracing.
+- `f.__code__ is frame.f_code` - one code object per function
+  (`_ny_code_of`, over a code identity `_ny_fn_info` now gives as its 8th
+  item): trace functions compare them, and could not.
+
+### sys
+- `sys.getrefcount(x)`: the real count (interpreter `gc_rc`, VM the shared
+  count) less the call's own reference, plus one for the argument -
+  CPython's numbers for `y = x`, a list holding it...; 2**32-1 for values
+  without a count (ints, floats, bools, None, VM strings), as 3.12 reports
+  immortal objects.
+- `sys.stdlib_module_names`: a frozenset of lib/'s modules and packages and
+  the engines' own (builtins, math, os, sys).
+- `sys.displayhook` / `__displayhook__` (`_ny_displayhook`, CPython's: None
+  not shown, the repr on sys.stdout, the value kept in `_`); the
+  interactive prompt (-i and the REPL, both engines) calls a program's own
+  hook instead of showing the value itself (`_ny_prompt_display`).
+- `-OO` drops docstrings (`__doc__` None - the parser's `docstringOf`).
+
+### Deep recursion
+- Both engines stopped near 1100 frames (8 MB of native stack, ~7 KB a
+  Nython frame) whatever the recursion limit. A call near the end of a
+  thread's own stack now goes on on an extension stack - the segmented
+  stack generators and async tasks already had (`nygen::call_on_new_stack`
+  / `body_on_new_stack`, the VM's `run_frame_plain` extension) - so
+  `sys.setrecursionlimit(5000)` then 3000 frames works on both engines, in
+  threads too, wherever NyCoro runs (fibers on Windows, 32-bit included:
+  1 MB segments of reserved address space, made only that deep). The
+  recursion limit itself is unchanged (the interpreter keeps its margin of
+  100: 4899 frames at 5000, the VM 4998 as CPython).
+- Found and fixed: the interpreter crashed (SIGSEGV) on recursion that did
+  not pass `evalCall` - `def __eq__(self, o): return self == o`, a property
+  reading itself; it is a RecursionError now (`runFunctionBody` checks the
+  frame depth against the recursion limit).
+
+### More of this kind (found and fixed)
+- `frame.f_globals` is the module's live globals() view (`sys._getframe(1).
+  f_globals[name] = v` binds a global of the caller's module, a common
+  metaprogramming idiom; `f_globals is globals()`). Interpreter
+  `frameGlobals`, VM `frame_globals` (a prelude frame keeps its copy).
+- A set changed in size while a loop walks it is CPython's RuntimeError
+  "Set changed size during iteration" (the interpreter's loop checks the
+  size at each step; the VM's loop walks the set's own items through
+  `stack_set_iter` - it walked a copy - and checks the size in FOR_ITER).
+  `iter(s)` / `next()` by hand still walk without the check.
+- Functions show as CPython's `<function Qualname at 0x...>` (the address
+  id() gives): `<function outer.<locals>.inner at 0x...>`, `<function
+  K.s at 0x...>` for a staticmethod (the interpreter showed
+  `<function s__static__>`). Interpreter `toText` (`idHex`, shared with the
+  default instance repr), VM `VMVal::repr`.
+- `__class__` read in a method is the class defining it (CPython's implicit
+  cell, the class super() uses): the NameError path of the interpreter's
+  `evalVariable` (the running method's `owner_stack_`) and of the VM's
+  LOAD_NAME (`VMCode::owner_class`) - no cost to names that resolve.
+- `exec(src, g, mapping)`: a locals mapping that is not a dict
+  (collections.OrderedDict) is read through `keys()`/`__getitem__` and
+  written back through `__setitem__`.
+- `import builtins` from a script beside a `builtins.ny` (see above).
+- Interpreter SIGSEGV on recursion through operators (see Deep recursion).
+
+### Not done / found
+- Reading a function's local before it is assigned (or after `del`) is a
+  NameError, not CPython's UnboundLocalError (a NameError subclass:
+  `except NameError` catches both); the scope ruling of round 75 decides
+  what is local at run time, so the engines would need a static scan.
+- The program has no `__loader__` and no `__builtins__` global.
+- A jump from a for loop's header event into its body is refused on the
+  interpreter (CPython allows it: the iterator is on the stack there), as
+  is one from an except clause's own line into its body; jumping out of
+  `except E as e:` unbinds `e` on the interpreter (CPython's cleanup is
+  skipped by the jump).
+- `__spec__` read as a global name inside an imported module is None (the
+  module object has the real one); the program's `__loader__` is not set.
+- `builtins._` is not set by the display hook (the program's `_` is).
+
+### Verified
+- vm_audit99: 125 passed on the interpreter, the VM and python3.11.
+- vm_audit53/72/74/76/79/80/81/82/83 pass on both engines;
+  `tools/ny_classcheck.py` clean; `tools/cbp.py check` 61 units.
+- `python3 tools/sweep.py`: 425 runs, 0 not ok.
+- `tools/ide_e2e.py` 390 passed, 0 failed; `tools/ide_lint.py` 0
+  unresolved; `tools/ide_memprobe.py --check` 0.00 KB per frame/event/key.
 
 ## 0s3. Round 80, part C — a specializing adaptive interpreter for the VM (vm_audit98, `tools/bench/`)
 

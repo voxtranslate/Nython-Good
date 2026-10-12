@@ -273,6 +273,7 @@ inline bool payload_transparent(const std::string& n) {
         "println", "len", "iter", "next", "bool", "callable", "getattr", "setattr", "hasattr", "delattr", "vars",
         "dir", "super", "weakref", "min", "max", "help", "object", "property", "staticmethod", "classmethod",
         "display", "show", "__format_value__", "anext", "aiter", "reversed",
+        "exec", "eval",   // round 81: given globals() itself (a view of the module), they unwrap other dicts
     };
     return names.count(n) > 0;
 }

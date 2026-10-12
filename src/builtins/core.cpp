@@ -655,8 +655,42 @@ Value dispatch_core(NythonExecutor& E,
         }
         if (name == "eval" || name == "exec") return E.evalExecBuiltin(name == "exec", args, ctx);
         if (name == "compile") return E.compileBuiltin(args, ctx);
-        if (name == "locals") return E.reflectLocals(ctx);
-        if (name == "globals") return E.reflectGlobals(ctx);
+        // round 81: globals() is the module's live namespace (a view), and
+        // so is locals() at a module's top level, as in CPython
+        if (name == "locals") {
+            if (!ctx || ctx == E.global_ctx || ctx->inModule || !ctx->parent) return E.globalsView(ctx);
+            return E.reflectLocals(ctx);
+        }
+        if (name == "globals") return E.globalsView(ctx);
+        // the program's globals stored and deleted by name: globals()'s
+        // view and sys.modules["__main__"] (round 81)
+        if (name == "_ny_main_set") {
+            if (args.size() < 2 || !E.isStringValue(args[0])) E.pyRaise("TypeError", "_ny_main_set(name, value)");
+            E.global_ctx->defineByName(E.getStringValue(args[0]), args[1]);
+            return NONE_VALUE;
+        }
+        if (name == "_ny_main_del") {
+            if (args.empty() || !E.isStringValue(args[0])) E.pyRaise("TypeError", "_ny_main_del(name)");
+            return Value(E.global_ctx->container && E.global_ctx->container->erase(E.getStringValue(args[0])) > 0);
+        }
+        if (name == "_ny_globals_view") {
+            // the program's globals() view (from anywhere)
+            return E.globalsView(nullptr);
+        }
+        if (name == "_ny_frame_jump") return E.frameJump(args);   // frame.f_lineno = n (round 81)
+        if (name == "_ny_getrefcount") {
+            // sys.getrefcount(x) (round 81): the object's count (exact
+            // reference counting, NyGC) without the references this call
+            // holds itself, plus one for the argument - as CPython counts;
+            // what is not a counted object (int, float, bool, None) is
+            // immortal there: 2**32 - 1, as 3.12 reports it
+            if (args.size() != 1) E.pyRaise("TypeError", "sys.getrefcount() takes exactly one argument (" + std::to_string(args.size()) + " given)");
+            Collectable* o = args[0].value.o;
+            if (!o) return Value(bigint((long long)4294967295LL));
+            static const long long kCallRefs = getenv("NY_RC_RAW") ? 0 : 1;   // the argument vector's copy
+            long long rc = (long long)o->gc_rc - kCallRefs + 1;
+            return Value(bigint(rc < 1 ? 1LL : rc));
+        }
         // The __main__ module's globals, from anywhere (a library module's
         // globals() is its own): unittest.main() finds the program's
         // TestCase classes here, as Python's reads sys.modules["__main__"].

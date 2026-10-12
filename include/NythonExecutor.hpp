@@ -620,6 +620,8 @@ public:   // NythonExecutor is a struct: members default to public
             "pow","divmod","input","dict","display","show","is_int","is_float","is_string","is_list","is_none","is_bool","to_int","to_float","to_str","clamp","lerp","map_range","repeat_str","repeat","flatten","flat","shell","system","ls","cat","pwd","mkdir","write","exists","env","all","any","complex","slice","super","property",
             "staticmethod","classmethod","callable","dir","vars","globals","locals","eval","exec","compile","_ny_setattr_raw","_ny_delattr_raw","_ny_object_new","_ny_method_new","_ny_subclasses","_ny_type_new","_ny_type_call",
             "_ny_main_globals","_ny_exc_current","_ny_stack",
+            "_ny_main_set","_ny_main_del","_ny_globals_view",   // globals() as a live view (round 81)
+            "_ny_getrefcount","_ny_frame_jump",                 // sys.getrefcount, frame.f_lineno = n (round 81)
             "_ny_modules","_ny_module_new","_ny_module_exec","_ny_find_module",   // sys.modules, importlib (round 80)
             "_ny_sys_info","_ny_recursion_limit",                                 // sys's facts (round 80)
             "_ny_frame_get","_ny_frame_sync","_ny_frame_back","_ny_frame_globals","_ny_builtins_dict",   // frame objects (round 78)
@@ -804,6 +806,7 @@ public:   // NythonExecutor is a struct: members default to public
         // evalImport switches both while a module's top level runs.
         global_ctx->defineByName("__name__", makeStringValue("__main__"));
         global_ctx->defineByName("__file__", makeStringValue(nyrt::script_path()));
+        global_ctx->defineByName("__spec__", NONE_VALUE);   // a script run directly (round 81)
         // Math constants
         global_ctx->defineByName("PI", Value(3.14159265358979323846));
         global_ctx->defineByName("E", Value(2.71828182845904523536));
@@ -857,6 +860,7 @@ public:   // NythonExecutor is a struct: members default to public
 
     Value execute(node_ptr ast) {
         if (!ast) return NONE_VALUE;
+        main_ast_ = ast.get();   // round 81: the module frame's code block (f_lineno jumps)
         try {
             return evalNode(ast, global_ctx);
         } catch (std::string& flow) {
@@ -932,7 +936,7 @@ public:   // NythonExecutor is a struct: members default to public
     // before each item after the first and when the items run out, as
     // CPython's line events report it (`node` is the loop's).
 #define NY_PYT_HEAD(again) \
-    if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0) && (again)) pyEvLineAt(node.get());
+    if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0) && (again)) pyEvLineAt(node.get(), true);
     // Runs a function body in fc and returns what the call should return:
     // the value of a `return` (fast or thrown), or - as before - the value
     // of the body's last statement when it runs off the end.
@@ -944,7 +948,13 @@ public:   // NythonExecutor is a struct: members default to public
         } _restore{f, f.fast_ctx, f.brk_ok};
         f.fast_ctx = fc;
         f.brk_ok = false;
-        evalNode(body, fc);
+        try { evalNode(body, fc); }
+        catch (JumpSignal&) {
+            // (round 81) a jump is always caught inside its own frame; one
+            // that is not would leave the frame - stop it here
+            jumpResume().clear(); jumpResuming() = false;
+            throw std::string("__exc__:SystemError:f_lineno: the jump target was not reached");
+        }
         // A function returns what its `return` gave, else None - not the value
         // of its last statement (round 77: `def f(): 5` returned 5 here and
         // None on the VM and in Python).
@@ -1067,28 +1077,46 @@ public:   // NythonExecutor is a struct: members default to public
     // body's last value is still what it evaluates to): holding it kept an
     // object that `L.pop()` removed alive for one more statement, so its
     // __del__ ran late.
-    Value evalScript(node_ptr node, Context* ctx) {
-        Value result = NONE_VALUE;
-        FlowState& f = flow();
-        for (auto& child : node->statements()) {
-            if (result.value.o) result = Value();
-            noteStatement(child, ctx);
-            result = evalNode(child, ctx);
-            if (f.pending) return result;
-        }
-        return result;
-    }
+    Value evalScript(node_ptr node, Context* ctx) { return evalStatements(node, ctx); }
 
     Value evalStatements(node_ptr node, Context* ctx) {
         Value result = NONE_VALUE;
         FlowState& f = flow();
-        for (auto& child : node->statements()) {
-            if (result.value.o) result = Value();
-            noteStatement(child, ctx);
-            result = evalNode(child, ctx);
-            if (f.pending) return result;
+        auto stmts = node->statements();
+        size_t start = 0;
+        bool resume = false;
+        // round 81: a jump (frame.f_lineno) going on inside this block
+        if (__builtin_expect(jumpResuming(), 0)) {
+            auto& R = jumpResume();
+            if (R.empty()) jumpResuming() = false;
+            else if (R.front().first == node.get()) {
+                start = R.front().second;
+                R.erase(R.begin());
+                resume = !R.empty();
+                if (!resume) jumpResuming() = false;
+            }
         }
-        return result;
+        for (;;) {
+            try {
+                for (size_t i = start; i < stmts.size(); i++) {
+                    const node_ptr& child = stmts[i];
+                    if (result.value.o) result = Value();
+                    if (__builtin_expect(resume, 0) && i == start) { resume = false; result = resumeInto(child, ctx); }
+                    else {
+                        noteStatement(child, ctx);
+                        result = evalNode(child, ctx);
+                    }
+                    if (f.pending) return result;
+                }
+                return result;
+            } catch (JumpSignal& js) {
+                // round 81: a jump to a statement of this block (or below it)
+                if (js.block != node.get()) throw;
+                start = js.index;
+                resume = !jumpResume().empty();
+                result = NONE_VALUE;
+            }
+        }
     }
 
     // ─── LITERALS ───────────────────────────────────────────────────────
@@ -1186,6 +1214,11 @@ public:   // NythonExecutor is a struct: members default to public
         // that resolve by another route (a class or function an imported
         // module registered) are not errors.
         if (!(vn->global_ref ? moduleCtx(ctx) : ctx)->hasByName(vn->name) && !knownName(vn->name)) {
+            // round 81: __class__ in a method is the class defining it
+            // (CPython's implicit __class__ cell, the one super() uses)
+            if (vn->name == "__class__" && !owner_stack_.empty() && owner_stack_.back()
+                && owner_stack_.back()->type() == NodeType::CLASS)
+                return classValueOfNode(owner_stack_.back());
             std::string hint = suggestName(vn->name);
             if (!hint.empty()) hint = "  (did you mean '" + hint + "'?)";
             throw std::string("__exc__:NameError:name '" + vn->name + "' is not defined" + hint);
@@ -2764,6 +2797,11 @@ public:   // NythonExecutor is a struct: members default to public
                     class_vars_[cn->name + "." + name] = val;
                     if (!class_vars_deleted_.empty()) class_vars_deleted_.erase(cn->name + "." + name);
                     if (name == "__getattribute__") { any_getattribute_ = true; attr_hook_cache_[2].clear(); }
+                    // round 81: a hook assigned after instances stored
+                    // attributes is called from now on (the cache said none)
+                    if (name == "__setattr__") attr_hook_cache_[0].clear();
+                    if (name == "__delattr__") attr_hook_cache_[1].clear();
+                    if (name == "__new__") no_new_.clear();
                     if (name == "__iter__") iter_own_cache_.clear();   // round 77
                     // Also update class_ctx_map_ so subsequent reads via evalAttribute see the new value.
                     // In the class's own namespace: setByName walked on into
@@ -3813,6 +3851,34 @@ public:   // NythonExecutor is a struct: members default to public
         std::snprintf(buf, sizeof buf, "0x%llx", (unsigned long long)p);
         return buf;
     }
+    // round 81: an instance's default repr (and str), CPython's
+    // object.__repr__: <module.Qualname object at 0x...>, with the class's
+    // __module__ and __qualname__ and the address id() gives (it was
+    // "<P instance>")
+    std::string defaultInstanceRepr(const Value& v, Context* c) {
+        std::string mod = "__main__", qn = typeNameOf(v);
+        if (Node* cn = classNodeOfInstance(v)) {
+            Value cls = classValueOfNode(cn), m, q;
+            try {
+                if (getAttrValue(cls, "__module__", c, m)) {
+                    if (isStringValue(m)) mod = getStringValue(m);
+                    else if (m.type == ValueType::NONE) mod.clear();
+                }
+                if (getAttrValue(cls, "__qualname__", c, q) && isStringValue(q)) qn = getStringValue(q);
+            } catch (std::string&) {}
+        }
+        return "<" + (mod.empty() || mod == "builtins" ? qn : mod + "." + qn) + " object at " + idHex(v, c) + ">";
+    }
+    // the address id(v) gives, as reprs show it (round 81)
+    std::string idHex(const Value& v, Context* c) {
+        std::vector<Value> ia{v};
+        Value idv = callBuiltin("id", ia, c);
+        int64_t id = 0;
+        if (idv.type == ValueType::INTEGER) bigint_fits_i64(idv.value.i, id);
+        char buf[40];
+        std::snprintf(buf, sizeof buf, "0x%llx", (unsigned long long)id);
+        return buf;
+    }
     // Python's type name for messages.
     std::string typeNameOf(const Value& v) {
         switch (v.type) {
@@ -3919,7 +3985,7 @@ public:   // NythonExecutor is a struct: members default to public
                 // repr(), as in Python and on the VM (round 77: the args'
                 // reprs, not the message quoted).
                 if (exc) return repr ? exceptionRepr(v, c) : exceptionMessage(v);
-                return "<" + typeNameOf(v) + " instance>";
+                return defaultInstanceRepr(v, c);   // round 81
             }
             auto fit = func_names.find(v.value.p);
             if (fit != func_names.end()) {
@@ -3945,6 +4011,17 @@ public:   // NythonExecutor is a struct: members default to public
                             return "<bound method " + bm->second->name + " of " + toText(r, true, ctx, depth + 1) + ">";
                         return "<built-in method " + bm->second->name + " of " + typeNameOf(r) + " object at " + hexId(r) + ">";
                     }
+                }
+                // round 81: a function as CPython shows it, <function
+                // Qualname at 0x...> with the address id() gives (it was
+                // <function name>)
+                if (fit->second.rfind("__class__:", 0) != 0) {
+                    Value q;
+                    std::string qn;
+                    try {
+                        if (specialAttribute(v, "__qualname__", ctx ? ctx : global_ctx, q) && isStringValue(q)) qn = getStringValue(q);
+                    } catch (std::string&) {}
+                    if (!qn.empty()) return "<function " + qn + " at " + idHex(v, ctx ? ctx : global_ctx) + ">";
                 }
                 return funcDisplayName(fit->second);
             }
@@ -4467,7 +4544,7 @@ public:   // NythonExecutor is a struct: members default to public
         if (isTruthy(cond)) return evalNode(in->then_branch, ctx);
         for (auto& ei : in->elseif_branches) {
             auto eif = static_pointer_cast<IfNode>(ei);
-            if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0) && !in->is_expr) pyEvLineAt(eif.get());   // an elif's line (round 79)
+            if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0) && !in->is_expr) pyEvLineAt(eif.get(), true);   // an elif's line (round 79)
             if (isTruthy(evalNode(eif->condition, ctx))) return evalNode(eif->then_branch, ctx);
         }
         if (in->else_branch) return evalNode(in->else_branch, ctx);
@@ -4481,7 +4558,7 @@ public:   // NythonExecutor is a struct: members default to public
         FlowState& lf = flow();
         bool head_first = true;   // round 79: sys.settrace's line event for the header, each time it is tested again
         while (true) {
-            if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0) && !head_first) pyEvLineAt(node.get());
+            if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0) && !head_first) pyEvLineAt(node.get(), true);
             head_first = false;
             if (!isTruthy(evalNode(wn->condition, ctx))) break;
             try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(wn->body, ctx); }
@@ -4709,8 +4786,21 @@ public:   // NythonExecutor is a struct: members default to public
                     return nygen::for_loop(*this, fn.get(), nygen::make_dict_iter(*this, iter_val, 0, false), ctx, true);
                 }
                 
-                // List iteration by numeric index
-                for (int i = 0; i < len; i++) {
+                // List iteration by numeric index - round 81: the list's
+                // length read at each step, as CPython's listiterator (an
+                // item appended in the loop is reached, a shrunk list ends
+                // it); a set keeps the length it started with, and one whose
+                // size changed is a RuntimeError, as CPython's setiterator
+                const bool live = !isSetCont(cont);
+                const int start_len = len;
+                for (int i = 0; ; i++) {
+                    if (i > 0) {
+                        auto li = cont->container->find("__len__");
+                        int now = li != cont->container->end() ? static_cast<int>(bigint_to_i64(li->second.value.i)) : 0;
+                        if (live) len = now;
+                        else if (now != start_len) pyRaise("RuntimeError", "Set changed size during iteration");
+                    }
+                    if (i >= len) break;
                     NY_PYT_HEAD(i > 0)
                     std::string key = std::to_string(i);
                     auto it = cont->container->find(key);
@@ -7482,7 +7572,7 @@ public:
         if (trace_on()) traceStatement(st, ctx);
         // sys.settrace's line event (round 79): one test of a thread-local
         // byte when no trace function is set
-        if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0)) pyEvLine(st.get());
+        if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0)) pyEvLine(st.get(), true);
     }
 
     void traceStatement(const node_ptr& st, Context* ctx) {
@@ -7601,16 +7691,18 @@ public:
     }
 
     Value evalCall(node_ptr node, Context* ctx) {
-        if (call_depth_ >= maxCallDepth()
-            // past the default depth, the native stack is the limit too (a
-            // raised recursion limit must not overflow it - round 80)
-            || (call_depth_ > 800 && !nycoro::current() && nycoro::native_stack_exhausted()))
+        if (call_depth_ >= maxCallDepth())
             throw std::string("__exc__:RecursionError:maximum call depth exceeded ("
                               + std::to_string(maxCallDepth()) + ") — check for unintended "
                               "self-recursion, e.g. a method with the same name as a builtin");
         // Inside a generator the body runs on the generator's own stack;
         // near its end, the call continues on an extension stack (nygen).
-        if (nycoro::stack_exhausted()) return nygen::call_on_new_stack(*this, node, ctx);
+        // round 81: so does a call near the end of the thread's own stack
+        // (past the default depth): a raised recursion limit is reached on
+        // segments of coroutine stack (it stopped near 1100 frames with
+        // RecursionError, 8 MB at ~7 KB a frame)
+        if (nycoro::stack_exhausted() || (call_depth_ > 800 && !nycoro::current() && nycoro::native_stack_exhausted()))
+            return nygen::call_on_new_stack(*this, node, ctx);
         DepthGuard _depth_guard(call_depth_);
         auto cn = static_pointer_cast<CallNode>(node);
         // Zero cost when profiling is off: ProfScope short-circuits on the flag.
@@ -8682,6 +8774,13 @@ public:
                 }
                 auto it = cont->container->find(attr);
                 if (it != cont->container->end()) { out = it->second; return true; }
+                // round 81: a module's __spec__ / __loader__, made when first
+                // read (the prelude's _ny_module_spec_attr)
+                if ((attr == "__spec__" || attr == "__loader__") && isModuleNamespace(obj)) {
+                    std::vector<Value> a{obj, makeStringValue(attr)};
+                    out = callFunctionValue(global_ctx->getByName("_ny_module_spec_attr"), a, ctx ? ctx : global_ctx);
+                    return true;
+                }
                 // A dict / list / tuple / set method read as a value.
                 if (bind && builtinValueDunder(obj, attr, out)) return true;   // [1].__getitem__ (round 78)
                 if (bind && nypy::kind_has_method(memberKindOf(obj), attr)) { out = boundMember(obj, attr); return true; }
@@ -8973,8 +9072,11 @@ public:
             if (it != fn_qualname_.end()) qn = it->second;
         }
         if (qn.empty()) qn = name;
+        // [7]: the code's identity (round 81: one code object per function,
+        // so f.__code__ is frame.f_code - the prelude's _ny_code_of)
         return makeListValue({makeStringValue(name), makeStringValue(qn), mod, makeListValue(ps), Value(flags),
-                              makeStringValue(node->token().fileName()), Value(fn && fn->first_line ? fn->first_line : (int)node->token().line())});
+                              makeStringValue(node->token().fileName()), Value(fn && fn->first_line ? fn->first_line : (int)node->token().line()),
+                              intValue((int64_t)(uintptr_t)node)});
     }
     // _ny_fn_globals(f) (round 77): f.__globals__, the names of the module
     // f was defined in (a copy, as globals() is here).
@@ -8985,7 +9087,7 @@ public:
         }
         if (!isPlainFunction(f)) return NONE_VALUE;
         auto cc = closure_contexts.find(f.value.p);
-        return reflectGlobals(cc == closure_contexts.end() ? global_ctx : cc->second);
+        return globalsView(cc == closure_contexts.end() ? global_ctx : cc->second);   // round 81: the live view
     }
     // A heap object (nyheap::BMember) holding the receiver; the tables refer
     // to it without owning it and lose its entries when it is freed.
@@ -10490,11 +10592,12 @@ public:
         Value b = p ? p->getByName("_ny_back") : NONE_VALUE;
         return isInstanceVal(b) ? b : NONE_VALUE;
     }
-    // _ny_frame_globals(f): f.f_globals, its module's names (a copy, as
-    // globals() is here).
+    // _ny_frame_globals(f): f.f_globals - round 81: its module's live
+    // globals() view (sys._getframe(1).f_globals["x"] = v binds x in the
+    // caller's module, as CPython); it was a copy.
     Value frameGlobals(std::vector<Value>& args) {
         size_t idx;
-        if (!args.empty() && frameFind(args[0], idx)) return reflectGlobals(frameCtx(idx));
+        if (!args.empty() && frameFind(args[0], idx)) return globalsView(frameCtx(idx));
         std::string mod = "__main__";
         if (Context* p = args.empty() ? nullptr : instanceProps(args[0])) {
             std::vector<Value> info = listItems(p->getByName("_ny_info"));
@@ -10503,9 +10606,9 @@ public:
         if (mod != "__main__")
             for (Context* m : module_ctxs_) {
                 Value n = m ? m->getByName("__name__") : NONE_VALUE;
-                if (isStringValue(n) && getStringValue(n) == mod) return reflectGlobals(m);
+                if (isStringValue(n) && getStringValue(n) == mod) return globalsView(m);
             }
-        return reflectGlobals(nullptr);
+        return globalsView(nullptr);
     }
     // _ny_builtins_dict(): f.f_builtins - the builtins every program starts
     // with (the prelude's private names left out).
@@ -10651,6 +10754,13 @@ public:
             if (tl.type != ValueType::UNDEFINED && !isTruthy(tl)) return;
         }
         Value fo = instValue(o);
+        // round 81: which event a jump (f_lineno) would be made from - a
+        // line event's is set by pyEvLine
+        struct EvScope {
+            JumpEv saved; bool set;
+            EvScope(size_t i, const char* e) : saved(jumpEv()), set(e[0] != 'l') { if (set) jumpEv() = JumpEv{i, e[0], nullptr, false}; }
+            ~EvScope() { if (set) jumpEv() = saved; }
+        } _evs(idx, ev);
         Value r = pyHookCall(ft, fo, ev, arg, nytrace::TRACE);
         if (hookSet(r)) { if (Context* p = instanceProps(fo)) p->defineByName("f_trace", r); }
     }
@@ -10669,6 +10779,9 @@ public:
                 Value fn = h->trace;
                 Value fo = frameObject(idx, frameWhere(idx), false);
                 if (isInstanceVal(fo)) {
+                    JumpEv saved = jumpEv();   // round 81: no jump from a call event
+                    jumpEv() = JumpEv{idx, 'c', nullptr, false};
+                    struct Restore { JumpEv s; ~Restore() { jumpEv() = s; } } _restore{saved};
                     Value r = pyHookCall(fn, fo, "call", NONE_VALUE, nytrace::TRACE);
                     if (hookSet(r)) { if (Context* p = instanceProps(fo)) p->defineByName("f_trace", r); }
                 }
@@ -10683,19 +10796,303 @@ public:
         if (nytrace::t_hooks & nytrace::PROFILE) pyEvProfile(idx, "return", v);
     }
     // A statement starts in the innermost frame.
-    void pyEvLine(Node* st) {
+    // `jumpable` (round 81): a statement's line, a loop header's or an
+    // elif's - where a trace function may move the frame (f_lineno).
+    void pyEvLine(Node* st, bool jumpable = false) {
         if (!st || tbHiddenFile(st->token().fileName())) return;
         // a function's docstring is no code in CPython: no line event
         if (st->type() == NodeType::STRING && !py_frames().empty()) {
             if (auto* fn = dynamic_cast<FunctionNode*>(py_frames().back().code); fn && fn->has_doc && st->token().value == fn->doc) return;
         }
-        pyEvLocal(pyTopIdx(), "line", NONE_VALUE);
+        size_t idx = pyTopIdx();
+        JumpState& js = jumpState();
+        if (__builtin_expect(js.skip_idx != SIZE_MAX, 0)) {
+            // the line a jump went to: not reported (as CPython does not)
+            bool same = js.skip_idx == idx && js.skip_line == (int)st->token().line();
+            js.skip_idx = SIZE_MAX;
+            if (same) return;
+        }
+        JumpEv saved = jumpEv();
+        jumpEv() = JumpEv{idx, 'l', st, jumpable};
+        try { pyEvLocal(idx, "line", NONE_VALUE); }
+        catch (...) { jumpEv() = saved; js.pending = false; throw; }
+        jumpEv() = saved;
+        if (__builtin_expect(js.pending, 0)) {
+            // round 81: the trace function set f_lineno - go there
+            js.pending = false;
+            jumpResume() = std::move(js.rest);
+            js.rest.clear();
+            jumpResuming() = !jumpResume().empty();
+            throw JumpSignal{js.block, js.index};
+        }
     }
     // Execution comes back to `n`'s line (a loop's header, an except
     // clause, a with statement's exit): a line event there.
-    void pyEvLineAt(Node* n) {
+    void pyEvLineAt(Node* n, bool jumpable = false) {
         cur_stmt() = n;
-        pyEvLine(n);
+        pyEvLine(n, jumpable);
+    }
+
+    // ── frame.f_lineno = n: a trace function moves its frame (round 81) ──
+    // CPython's frame_setlineno over the tree: from a 'line' event of the
+    // frame to the first statement on or after line n in its code block
+    // (the def's body, or a module's). A jump may enter if/elif/else,
+    // while bodies, try bodies, else and finally blocks and a for loop's
+    // else; not a for loop's body (its iterator would be missing), an
+    // except clause (no exception) or a with body (no __exit__) - CPython's
+    // compatible stacks. What it leaves (loops, handlers, with bodies,
+    // finally blocks) is just left: no finally or __exit__ runs, as there.
+    // The jump is a JumpSignal thrown when the trace function returns,
+    // caught by the deepest block holding both statements
+    // (evalStatements), which goes on at the target, entering the blocks on
+    // the way down (jumpResume, resumeInto). The target's own line event
+    // is not reported, as CPython's is not.
+    struct JumpSignal { Node* block; size_t index; };
+    struct JumpEv { size_t idx = SIZE_MAX; char ev = 0; Node* stmt = nullptr; bool jumpable = false; };
+    static JumpEv& jumpEv() { static thread_local JumpEv e; return e; }
+    struct JumpState {
+        bool pending = false;                        // a jump to take when the trace function returns
+        Node* block = nullptr; size_t index = 0;     // the block that goes on, at this statement
+        std::vector<std::pair<Node*, size_t>> rest;  // the bodies entered below it (index SIZE_MAX: not a block)
+        size_t skip_idx = SIZE_MAX; int skip_line = 0;   // the target's own line event
+    };
+    static JumpState& jumpState() { static thread_local JumpState s; return s; }
+    static std::vector<std::pair<Node*, size_t>>& jumpResume() { static thread_local std::vector<std::pair<Node*, size_t>> r; return r; }
+    static bool& jumpResuming() { static thread_local bool b = false; return b; }
+    static bool jumpIsBlock(Node* n) {
+        return n && (n->type() == NodeType::BLOCK || n->type() == NodeType::STATEMENTS || n->type() == NodeType::SCRIPT);
+    }
+    // The bodies a statement holds, in order (elif and except clauses are
+    // nodes of their own, their bodies below them).
+    static void jumpChildren(Node* s, std::vector<Node*>& out) {
+        switch (s->type()) {
+            case NodeType::IF: {
+                auto* n = static_cast<IfNode*>(s);
+                if (n->is_expr) return;
+                if (n->then_branch) out.push_back(n->then_branch.get());
+                for (auto& e : n->elseif_branches) if (e) out.push_back(e.get());
+                if (n->else_branch) out.push_back(n->else_branch.get());
+                return;
+            }
+            case NodeType::WHILE: {
+                auto* n = static_cast<WhileNode*>(s);
+                if (n->body) out.push_back(n->body.get());
+                if (n->else_branch) out.push_back(n->else_branch.get());
+                return;
+            }
+            case NodeType::FOR: {
+                auto* n = static_cast<ForNode*>(s);
+                if (n->body) out.push_back(n->body.get());
+                if (n->else_branch) out.push_back(n->else_branch.get());
+                return;
+            }
+            case NodeType::TRY: {
+                auto* n = static_cast<TryNode*>(s);
+                if (n->body) out.push_back(n->body.get());
+                for (auto& e : n->except_clauses) if (e) out.push_back(e.get());
+                if (n->else_clause) out.push_back(n->else_clause.get());
+                if (n->finally_clause) out.push_back(n->finally_clause.get());
+                return;
+            }
+            case NodeType::EXCEPT: { auto* n = static_cast<ExceptNode*>(s); if (n->body) out.push_back(n->body.get()); return; }
+            case NodeType::WITH: { auto* n = static_cast<WithNode*>(s); if (n->body) out.push_back(n->body.get()); return; }
+            default: return;
+        }
+    }
+    // Every statement of a code block with the chain of nodes down to it
+    // (block, statement, block, statement ...; a body that is a single
+    // statement, an elif or except clause, stands in the chain itself).
+    struct JumpEntry { int line; std::vector<Node*> chain; };
+    static void jumpWalk(Node* n, std::vector<Node*>& chain, std::vector<JumpEntry>& out) {
+        if (!n) return;
+        if (!jumpIsBlock(n)) { jumpWalkStmt(n, chain, out); return; }
+        chain.push_back(n);
+        for (auto& s : n->statements()) if (s) jumpWalkStmt(s.get(), chain, out);
+        chain.pop_back();
+    }
+    static void jumpWalkStmt(Node* s, std::vector<Node*>& chain, std::vector<JumpEntry>& out) {
+        chain.push_back(s);
+        out.push_back({(int)s->token().line(), chain});
+        if (s->type() != NodeType::FUNCTION && s->type() != NodeType::CLASS) {   // their bodies are frames of their own
+            std::vector<Node*> kids;
+            jumpChildren(s, kids);
+            for (Node* k : kids) jumpWalk(k, chain, out);
+        }
+        chain.pop_back();
+    }
+    Node* main_ast_ = nullptr;   // the program's tree: the module frame's code block
+    // _ny_frame_jump(frame, lineno): the f_lineno setter's work (both
+    // engines check CPython's rules; the messages are 3.12's)
+    Value frameJump(std::vector<Value>& args) {
+        size_t idx;
+        JumpEv ev = jumpEv();
+        if (args.size() < 2 || !frameFind(args[0], idx) || ev.idx != idx || !ev.ev)
+            pyRaise("ValueError", "f_lineno can only be set in a trace function");
+        if (ev.ev == 'c') pyRaise("ValueError", "can't jump from the 'call' trace event of a new frame");
+        if (ev.ev != 'l' || !ev.jumpable || !ev.stmt) pyRaise("ValueError", "can only jump from a 'line' trace event");
+        int64_t lineno = 0;
+        if (args[1].type != ValueType::INTEGER || !bigint_fits_i64(args[1].value.i, lineno)) pyRaise("ValueError", "lineno must be an integer");
+        // the code block: the function's body, else the module's
+        Node* root = nullptr;
+        int first = 1;
+        std::vector<JumpEntry> entries;
+        std::vector<Node*> chain;
+        auto holds = [&](Node* r) {
+            entries.clear(); chain.clear();
+            jumpWalk(r, chain, entries);
+            for (auto& e : entries) if (e.chain.back() == ev.stmt) return true;
+            return false;
+        };
+        if (auto* fn = dynamic_cast<FunctionNode*>(py_frames()[idx].code)) {
+            root = fn->body.get(); first = fn->first_line ? (int)fn->first_line : (int)fn->token().line();
+            holds(root);
+        } else {
+            if (main_ast_ && holds(main_ast_)) root = main_ast_;
+            else for (auto& a : imported_asts) if (a && holds(a.get())) { root = a.get(); break; }
+            if (!root) pyRaise("ValueError", "can't jump from unreachable code");
+        }
+        if (lineno < first) pyRaise("ValueError", "line " + std::to_string(lineno) + " comes before the current code block");
+        const JumpEntry* from = nullptr;
+        int best = INT_MAX;
+        for (auto& e : entries) {
+            if (!from && e.chain.back() == ev.stmt) from = &e;
+            if (e.line >= lineno && e.line < best) best = e.line;
+        }
+        if (best == INT_MAX) pyRaise("ValueError", "line " + std::to_string(lineno) + " comes after the current code block");
+        if (!from) pyRaise("ValueError", "can't jump from unreachable code");
+        std::string err;
+        for (auto& e : entries) {
+            if (e.line != best) continue;
+            const auto& a = from->chain;
+            const auto& b = e.chain;
+            size_t p = 0;
+            while (p < a.size() && p < b.size() && a[p] == b[p]) p++;
+            // the deepest block both are in
+            size_t blk = SIZE_MAX;
+            for (size_t q = std::min(p, b.size()); q-- > 0;) if (jumpIsBlock(b[q])) { blk = q; break; }
+            if (blk == SIZE_MAX || blk + 1 >= b.size()) { if (err.empty()) err = "can't jump there"; continue; }
+            // what the jump enters below the common part
+            std::string why;
+            for (size_t q = blk + 1; q + 1 < b.size() && why.empty(); q++) {
+                if (q + 1 < p) continue;   // still common: not entered
+                Node* s = b[q]; Node* c = b[q + 1];
+                if (s->type() == NodeType::FOR && c == static_cast<ForNode*>(s)->body.get())
+                    why = "can't jump into the body of a for loop";
+                else if (s->type() == NodeType::WITH)
+                    why = "can't jump into the body of a for loop";   // CPython 3.12's message for a with body
+                else if (s->type() == NodeType::EXCEPT || c->type() == NodeType::EXCEPT)
+                    why = "can't jump into an 'except' block as there's no exception";
+            }
+            if (!why.empty()) { if (err.empty()) err = why; continue; }
+            JumpState& js = jumpState();
+            js.block = b[blk];
+            js.index = 0;
+            {
+                auto stmts = b[blk]->statements();
+                for (size_t k = 0; k < stmts.size(); k++) if (stmts[k].get() == b[blk + 1]) { js.index = k; break; }
+            }
+            js.rest.clear();
+            for (size_t q = blk + 1; q + 1 < b.size();) {
+                Node* c = b[q + 1];
+                if (jumpIsBlock(c) && q + 2 < b.size()) {
+                    size_t ix = 0;
+                    auto cs = c->statements();
+                    for (size_t k = 0; k < cs.size(); k++) if (cs[k].get() == b[q + 2]) { ix = k; break; }
+                    js.rest.push_back({c, ix});
+                    q += 2;
+                } else {
+                    js.rest.push_back({c, SIZE_MAX});
+                    q += 1;
+                }
+            }
+            js.pending = true;
+            js.skip_idx = idx;
+            // a jump to the def line itself reports the first line again
+            js.skip_line = (lineno == first && best > first) ? -1 : best;
+            return NONE_VALUE;
+        }
+        pyRaise("ValueError", err.empty() ? std::string("cannot find bytecode for specified line") : err);
+        return NONE_VALUE;
+    }
+    // A statement a jump goes into (jumpResume's front is the body it
+    // enters): that body runs, its header skipped - an if's test, a
+    // while's (then the loop goes on), a try's body under its handlers, an
+    // else or finally block as the statement would run it.
+    Value resumeInto(const node_ptr& x, Context* ctx) {
+        auto& R = jumpResume();
+        if (R.empty()) return evalNode(x, ctx);
+        Node* c = R.front().first;
+        auto enter = [&](const node_ptr& body) -> Value {
+            if (!jumpIsBlock(body.get())) {
+                R.erase(R.begin());
+                if (!R.empty()) return resumeInto(body, ctx);
+            }
+            return evalNode(body, ctx);   // a block resumes itself (evalStatements)
+        };
+        switch (x->type()) {
+            case NodeType::IF: {
+                auto* n = static_cast<IfNode*>(x.get());
+                if (n->then_branch.get() == c) return enter(n->then_branch);
+                if (n->else_branch.get() == c) return enter(n->else_branch);
+                for (size_t k = 0; k < n->elseif_branches.size(); k++) {
+                    if (n->elseif_branches[k].get() != c) continue;
+                    R.erase(R.begin());
+                    auto* e = static_cast<IfNode*>(c);
+                    if (!R.empty() && R.front().first == e->then_branch.get()) return enter(e->then_branch);
+                    R.clear();
+                    // at the elif's own line: its test, and the chain from there
+                    for (size_t j = k; j < n->elseif_branches.size(); j++) {
+                        auto* ej = static_cast<IfNode*>(n->elseif_branches[j].get());
+                        if (j > k && __builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0)) pyEvLineAt(ej, true);
+                        if (isTruthy(evalNode(ej->condition, ctx))) return evalNode(ej->then_branch, ctx);
+                    }
+                    return n->else_branch ? evalNode(n->else_branch, ctx) : NONE_VALUE;
+                }
+                break;
+            }
+            case NodeType::WHILE: {
+                auto* n = static_cast<WhileNode*>(x.get());
+                if (n->else_branch.get() == c) return enter(n->else_branch);
+                if (n->body.get() != c) break;
+                FlowState& lf = flow();
+                Value r;
+                bool broke = false;
+                try { LoopBody _lb(lf); r = enter(n->body); }
+                catch (std::string& f) { if (f == "break") broke = true; else if (f != "continue") throw; }
+                if (lf.pending) {
+                    if (lf.pending == 1) return r;
+                    int pf = lf.pending; lf.pending = 0;
+                    if (pf == 2) broke = true;
+                }
+                if (broke) return NONE_VALUE;
+                // the loop goes on: its test again (its line, as a repetition)
+                if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0)) pyEvLineAt(x.get(), true);
+                return evalWhile(x, ctx);
+            }
+            case NodeType::FOR: {
+                auto* n = static_cast<ForNode*>(x.get());
+                if (n->else_branch.get() == c) return enter(n->else_branch);
+                break;
+            }
+            case NodeType::TRY: {
+                auto* n = static_cast<TryNode*>(x.get());
+                SuspendFast _sf;
+                if (n->body.get() == c) return evalTry(x, ctx);   // the body resumes under the handlers
+                if (n->finally_clause.get() == c) return enter(n->finally_clause);
+                if (n->else_clause.get() == c) {
+                    Value r;
+                    try { r = enter(n->else_clause); }
+                    catch (JumpSignal&) { throw; }
+                    catch (...) { if (n->finally_clause) evalNode(n->finally_clause, ctx); throw; }
+                    if (n->finally_clause) evalNode(n->finally_clause, ctx);
+                    return r;
+                }
+                break;
+            }
+            default: break;
+        }
+        R.clear();
+        return evalNode(x, ctx);
     }
     // The exception `flow` in the running frame: the exception event, once
     // per frame it passes.
@@ -10785,6 +11182,8 @@ public:
             if (tn->else_clause) {
                 try { result = evalNode(tn->else_clause, ctx); }
                 catch (nython::node::YieldSignal&) { throw; }
+                catch (JumpSignal&) { throw; }   // round 81: a jump runs no finally
+                catch (nython::node::ReturnSignal&) { run_finally(); throw; }
                 catch (std::string& f2) {
                     if (f2 == "break" || f2 == "continue") run_finally(); else { tbSee(f2); run_finally_exc(); }
                     throw;
@@ -10820,8 +11219,26 @@ public:
             std::vector<std::string>& v; std::vector<std::pair<std::string, Value>>& o;
             ~PopHandling() { v.pop_back(); o.pop_back(); }
         } _ph{handling_exc_, handling_obj_};
-        try { result = evalNode(match->body, ctx); }
+        try {
+            // round 81: `except E as e:` unbinds e when the clause ends,
+            // however it ends - before the handlers below and the try's
+            // finally run (CPython: try: body finally: e = None; del e)
+            struct UnbindAs {
+                NythonExecutor* x; Context* ctx; ExceptNode* en;
+                ~UnbindAs() {
+                    if (en->var.empty()) return;
+                    auto unbind = [&](const std::string& n, bool g) {
+                        Context* c = g ? x->moduleCtx(ctx) : ctx;
+                        if (c && c->container) c->container->erase(n);
+                    };
+                    unbind(en->var, en->var_global);
+                    for (auto& u : en->unbind_names) unbind(u.first, u.second);   // the lowered `except <expr> as e`
+                }
+            } _ua{this, ctx, match};
+            result = evalNode(match->body, ctx);
+        }
         catch (nython::node::YieldSignal&) { throw; }
+        catch (JumpSignal&) { throw; }   // round 81: a jump out of the clause runs no finally
         catch (std::string& f2) {
             if (f2 == "break" || f2 == "continue") { run_finally(); throw; }
             tbHandlerExit(f2);
@@ -10913,7 +11330,7 @@ public:
                 Value inst = invokeMember(nm, where, cls, a, kw, ctx);
                 if (isInstanceValue(inst) && classDerivesFrom(instanceClassName(inst), static_cast<ClassNode*>(cn)->name)) {
                     if (isExceptionClass(className)) { setExceptionArgs(inst, args); setExceptionKw(inst, kw); }
-                    runConstructor(inst, args, kw, ctx);
+                    runConstructor(inst, args, kw, ctx, true);
                 }
                 return inst;
             }
@@ -11180,6 +11597,8 @@ public:
             if (custom.type == ValueType::USERDATA && !getStringValue(custom).empty()
                 && getStringValue(custom).rfind("<function", 0) != 0)
                 return custom;
+            // round 81: str(obj)'s default, <__main__.C object at 0x...>
+            if (isInstanceValue(obj)) return makeStringValue(defaultInstanceRepr(obj, ctx ? ctx : global_ctx));
             return makeStringValue("<" + class_of() + " instance>");
         }
         if (name == "id") {
@@ -11422,6 +11841,9 @@ public:
         std::replace(rel.begin(), rel.end(), '.', '/');
         struct stat st;
         auto dirs = moduleDirs(node);
+        // round 81: `builtins` is the builtin module whatever sits beside
+        // the script (CPython's BuiltinImporter comes first)
+        if (dotted == "builtins") dirs = nyrt::library_dirs();
         for (auto& d : dirs) {
             if (stat((d + rel + ".ny").c_str(), &st) == 0 && !S_ISDIR(st.st_mode)) return d + rel + ".ny";
             if (stat((d + rel + "/__init__.ny").c_str(), &st) == 0) return d + rel + "/__init__.ny";
@@ -11626,6 +12048,18 @@ public:
         const bool from_import = !in_node->names.empty();
         if (!quoted && in_node->alias.empty() && !from_import && isIdentifierText(module_name)) implicit_alias = module_name;
         if (!quoted) syncModule(module_name);   // round 80: sys.modules first
+        // round 81: sys.meta_path / sys.path_hooks - a module not loaded yet
+        // is offered to a program's own finders (the prelude's
+        // _ny_import_via_hooks, None at once while there are none: the
+        // native search below)
+        if (!quoted && sys_ns_.type != ValueType::UNDEFINED && !module_ns_.count(module_name)) {
+            Value hook = global_ctx->getByName("_ny_import_via_hooks");
+            if (hook.type == ValueType::USERDATA && hook.value.p) {
+                std::vector<Value> ha{makeStringValue(module_name)};
+                Value got = callFunctionValue(hook, ha, ctx);
+                if (got.type != ValueType::NONE && got.type != ValueType::UNDEFINED) syncModule(module_name);
+            }
+        }
         {
             // a module runs once: a later import (named or aliased) binds the
             // namespace its first import made
@@ -12386,6 +12820,12 @@ public:
         for (auto& c : ancestorCandidates(node, module_name + ".ny")) search_paths.push_back(c);
         for (auto& c : ancestorCandidates(node, module_name)) search_paths.push_back(c);
         for (auto& d : nyrt::library_dirs()) search_paths.push_back(d + module_name + ".ny");
+        // round 81: `builtins` is the builtin module whatever sits beside
+        // the script (CPython's BuiltinImporter comes first)
+        if (!quoted && module_name == "builtins") {
+            search_paths.clear();
+            for (auto& d : nyrt::library_dirs()) search_paths.push_back(d + module_name + ".ny");
+        }
 
         std::string filepath;
         for (auto& p : search_paths) {
@@ -12692,6 +13132,11 @@ public:
                         // not read again from the class body (round 77)
                         class_vars_deleted_.insert(cn->name + "." + name);
                     }
+                    // round 81: a removed attribute hook is no longer called
+                    if (name == "__setattr__") attr_hook_cache_[0].clear();
+                    else if (name == "__delattr__") attr_hook_cache_[1].clear();
+                    else if (name == "__getattribute__") attr_hook_cache_[2].clear();
+                    else if (name == "__new__") no_new_.clear();
                     return;
                 }
             }
@@ -12903,7 +13348,13 @@ public:
         if (it == pit->second->container->end()) {
             // an instance-dict view's value: its owner's fields as they are now
             it = pit->second->container->find("__ny_view_of__");
-            if (it == pit->second->container->end()) return false;
+            if (it == pit->second->container->end()) {
+                // round 81: a globals() view's: the module's variables now
+                it = pit->second->container->find("__ny_globals_of__");
+                if (it == pit->second->container->end()) return false;
+                out = globalsOf(it->second);
+                return true;
+            }
             out = instanceFields(it->second);
             return true;
         }
@@ -13213,6 +13664,7 @@ public:
     Value evalExecBuiltin(bool is_exec, std::vector<Value>& args, Context* ctx) {
         const char* who = is_exec ? "exec" : "eval";
         if (args.empty()) pyRaise("TypeError", std::string(who) + "() missing required argument 'source' (pos 1)");
+        if (any_payload_) { Value p; if (payloadOf(args[0], p)) args[0] = p; }   // a str subclass (round 81: exec is payload-transparent)
         std::string mode = is_exec ? "exec" : "eval", fname = "<string>";
         std::string src = snippetSource(args[0], mode, fname, who);
         if (mode == "exec") is_exec = true;    // eval(compile(..., "exec")) runs it
@@ -13224,6 +13676,34 @@ public:
         if (!ast) return NONE_VALUE;
         if (!is_exec && !nython::node::is_expression_program(ast)) pyRaise("SyntaxError", "invalid syntax");
         bool has_g = args.size() > 1 && !args[1].isNone(), has_l = args.size() > 2 && !args[2].isNone();
+        // round 81: exec(src, globals()) / eval(src, globals()) run in that
+        // module's own scope (the view stands for it); any other dict
+        // subclass is given as its value
+        // a dict subclass's object: its value is read, what the code binds
+        // goes back through its __setitem__ (OrderedDict, a class body's
+        // namespace...) - it was lost in a copy
+        Value sub_out = NONE_VALUE;
+        bool same_gl = has_g && has_l && args[2].type == args[1].type && args[2].value.p == args[1].value.p;
+        if (has_g) {
+            Context* vs = globalsViewScope(args[1]);
+            if (vs && (!has_l || same_gl)) {
+                Value r = runSnippetFrame(ast, vs);
+                return is_exec ? NONE_VALUE : r;
+            }
+            Value p;
+            if (any_payload_ && payloadOf(args[1], p)) { if (!has_l || same_gl) sub_out = args[1]; args[1] = p; }
+        }
+        if (has_l && any_payload_) { Value p; if (payloadOf(args[2], p)) { sub_out = args[2]; args[2] = p; } }
+        if (has_l && !same_gl && isInstanceValue(args[2]) && !isInstanceValue(sub_out)) {
+            // round 81: locals may be any mapping (Python): its bindings
+            // are read through keys()/__getitem__, written back through
+            // __setitem__ like a dict subclass's
+            std::vector<Value> a{args[2]};
+            Value snap = callFunctionValue(global_ctx->getByName("_ny_mapping_snapshot"), a, ctx);
+            sub_out = args[2];
+            args[2] = snap;
+        }
+        if (same_gl && isInstanceValue(sub_out)) has_l = false;   // one mapping: the globals
         Container* gd = has_g ? contOf(args[1]) : nullptr;
         Container* ld = has_l ? contOf(args[2]) : nullptr;
         if (has_g && (!gd || seqLen(gd) >= 0)) pyRaise("TypeError", std::string(who) + "() globals must be a dict, not " + typeNameOf(args[1]));
@@ -13242,7 +13722,7 @@ public:
         };
         // A dict's string key is the plain name, except a dunder name
         // ("\x01s__x__"); a scope keys every name plainly.
-        bool live = gd && (!ld || ld == gd);
+        bool live = gd && (!ld || ld == gd) && !isInstanceValue(sub_out);
         if (live) {
             // exec(src, ns) / eval(src, ns): the scope's variables ARE the
             // dict's (round 77, as Python) - functions defined there see
@@ -13284,6 +13764,26 @@ public:
         }
         if (!is_exec) return r;
         Container* out = ld ? ld : gd;
+        if (isInstanceValue(sub_out)) {
+            // a dict subclass (round 81): what the code bound or rebound,
+            // through its __setitem__
+            for (auto& kv : *sc->container) {
+                if (!exported(kv.first)) continue;
+                // as it was loaded: from the locals, else the globals
+                bool same = false;
+                for (Container* src0 : {ld, gd}) {
+                    if (!src0) continue;
+                    auto s = src0->container->find(nypy::key_of_str(kv.first));
+                    if (s == src0->container->end()) continue;
+                    same = identical(s->second, kv.second);
+                    break;
+                }
+                if (same) continue;
+                std::vector<Value> a{makeStringValue(kv.first), kv.second};
+                callMethod(sub_out, "__setitem__", a, ctx);
+            }
+            return NONE_VALUE;
+        }
         for (auto& kv : *sc->container) if (exported(kv.first)) dictSet(out, makeStringValue(kv.first), kv.second);
         return NONE_VALUE;
     }
@@ -13324,6 +13824,59 @@ public:
                 (*d->container)[nypy::key_of_str(kv.first)] = kv.second;   // a dict key (round 78: __name__ was not one)
             }
         return Value((Collectable*)d);
+    }
+    // ── globals(): the module's live namespace (round 81) ──────────────
+    // A view - the prelude's _NyGlobalsDict - whose value is the module's
+    // variables as they are now (payloadOf) and whose stores and deletions
+    // bind and unbind them (_ny_main_set / _ny_main_del for the program,
+    // setattr / delattr on an imported module's live namespace); one per
+    // module, so globals() is globals(). Its field __ny_globals_of__ is none
+    // for the program, else the module's namespace object.
+    Value main_globals_view_;
+    std::unordered_map<const void*, Value> module_globals_views_;
+    Value globalsOf(const Value& owner) {
+        Container* c = owner.type == ValueType::NONE ? nullptr : contOf(owner);
+        if (!c) return reflectGlobals(nullptr);
+        auto* d = new Object((Runnable*)runner, "map", Type::MAP);
+        Value dv((Collectable*)d);
+        for (auto& kv : *c->container) if (!reflectHidden(kv.first)) (*d->container)[nypy::key_of_str(kv.first)] = kv.second;
+        return dv;
+    }
+    // The module scope a globals() view stands for (null: not a view)
+    Context* globalsViewScope(const Value& v) {
+        if (!isInstanceValue(v)) return nullptr;
+        auto pit = instance_properties.find(v.value.p);
+        if (pit == instance_properties.end() || !pit->second || !pit->second->container) return nullptr;
+        auto it = pit->second->container->find("__ny_globals_of__");
+        if (it == pit->second->container->end()) return nullptr;
+        if (it->second.type == ValueType::NONE) return global_ctx;
+        for (Context* m : module_ctxs_) if (m && it->second.isCollectable() && m->ns_owner == it->second.value.gc) return m;
+        return nullptr;
+    }
+    Value globalsView(Context* ctx) {
+        Context* m = moduleCtx(ctx ? ctx : global_ctx);
+        Value owner = NONE_VALUE;
+        if (m && m != global_ctx) {
+            if (!m->ns_owner) return reflectGlobals(ctx);
+            Value o(m->ns_owner);
+            if (!isModuleNamespace(o)) return o;   // exec(src, ns): ns itself, as CPython
+            owner = o;
+        }
+        return globalsViewFor(owner);
+    }
+    // the view for a module object (none: the program)
+    Value globalsViewFor(const Value& owner) {
+        Value& slot = owner.type == ValueType::NONE ? main_globals_view_ : module_globals_views_[(const void*)owner.value.gc];
+        if (isInstanceValue(slot)) return slot;
+        ensureMirror("dictview");
+        Node* vn = classNodeByName("_NyGlobalsDict");
+        if (!vn) return globalsOf(owner);
+        Value view = newInstance(static_cast<ClassNode*>(vn)->name, (void*)vn);
+        auto vit = instance_properties.find(view.value.p);
+        if (vit != instance_properties.end() && vit->second) vit->second->defineByName("__ny_globals_of__", owner);
+        any_payload_ = true;
+        slot = view;
+        return view;
     }
     Value reflectLocals(Context* ctx) {
         if (!ctx || ctx == global_ctx || ctx->inModule || !ctx->parent) return reflectGlobals(ctx);
@@ -13371,13 +13924,29 @@ public:
                && seqLen(c) < 0;
     }
     Value reflectVars(std::vector<Value>& args, Context* ctx) {
-        if (args.empty()) return reflectLocals(ctx);
+        if (args.empty()) {
+            // round 81: at a module's top level, its globals() view
+            if (!ctx || ctx == global_ctx || ctx->inModule || !ctx->parent) return globalsView(ctx);
+            return reflectLocals(ctx);
+        }
         const Value& o = args[0];
+        // round 81: a module's, its live globals() view
+        if (isModuleNamespace(o) && o.isCollectable())
+            for (Context* m : module_ctxs_) if (m && m->ns_owner == o.value.gc) return globalsViewFor(o);
         // an instance's: its __dict__, the live view (round 77); none with
         // __slots__ and no __dict__ (round 79)
         if (isInstanceValue(o) && !slot_flags_.empty() && isDictless(o))
             pyRaise("TypeError", "vars() argument must have __dict__ attribute");
-        if (isInstanceValue(o)) return instanceDictView(o);
+        if (isInstanceValue(o)) {
+            // a class's own __dict__ (a property: sys.modules["__main__"]'s
+            // is the program's globals - round 81)
+            Value dm; Node* downer = nullptr;
+            if (Node* cn = classNodeOfInstance(o); cn && findClassMember(cn, "__dict__", dm, &downer) && downer != classNodeByName("object")) {
+                Value r;
+                if (getAttrValue(o, "__dict__", ctx, r)) return r;
+            }
+            return instanceDictView(o);
+        }
         auto* d = new Object((Runnable*)runner, "map", Type::MAP);
         Value dv((Collectable*)d);
         if (Node* cn = classNodeOfValue(o)) return classNamespace(cn);
@@ -13732,6 +14301,14 @@ public:
             // Reaching a builtin exception base sets the exception's args;
             // reaching object, nothing.
             if (isInstanceValue(self) && isExceptionClass(instanceClassName(self))) { setExceptionArgs(self, args); setExceptionKw(self, kw); }
+            // round 81: object.__init__ given arguments - its errors (the
+            // prelude's object.__init__ checks CPython's rules)
+            else if (!args.empty() || !kw.empty())
+                if (Node* objn = classNodeByName("object"))
+                    if (findClassMember(objn, "__init__", m, &where) && m.type == ValueType::USERDATA && m.value.p && func_names.count(m.value.p)) {
+                        out = invoke(m, where);
+                        return true;
+                    }
             out = NONE_VALUE;
             return true;
         }
@@ -13758,7 +14335,13 @@ public:
         if (bodyYields(fn->body)) return nygen::make_function_gen(*this, fn, fc);
         // Calls that do not pass through evalCall (operators, callbacks of
         // builtins) meet the same stack check (see evalCall).
-        if (nycoro::stack_exhausted()) return nygen::body_on_new_stack(*this, fn, fc);
+        // (round 81: on the thread's own stack too - and the recursion
+        // limit holds here, for frames that evalCall does not count: a
+        // __eq__ that compares with itself crashed the interpreter)
+        if (py_frames().size() >= (size_t)nyrt::recursion_limit())
+            throw std::string("__exc__:RecursionError:maximum recursion depth exceeded");
+        if (nycoro::stack_exhausted() || (!nycoro::current() && nycoro::native_stack_exhausted()))
+            return nygen::body_on_new_stack(*this, fn, fc);
         FrameGuard _frame(fn, fc);   // round 77: frames and tracebacks
         // sys.settrace / sys.setprofile (round 79): one test per call
         if (__builtin_expect(nytrace::t_hooks & nytrace::ANY, 0) && !tbHiddenFile(fn->token().fileName())) return runBodyHooked(fn, fn->body, fc, true);
@@ -14006,10 +14589,13 @@ public:
     // Runs the constructor of a new instance: the first class in its MRO
     // that defines __init__ or init.
     void runConstructor(Value inst, std::vector<Value>& args,
-                        const nyrt::OrderedKw<Value>& kw, Context* ctx) {
+                        const nyrt::OrderedKw<Value>& kw, Context* ctx, bool own_new = false) {
         Node* cls = classNodeOfInstance(inst);
         if (!cls) return;
+        Node* objn = classNodeByName("object");
         for (Node* c : classMro(cls)) {
+            // round 81: object's own __init__ (it does nothing) is not called
+            if (c == objn) break;
             auto cit = class_ctx_map_.find((void*)c);
             if (cit == class_ctx_map_.end() || !cit->second || !cit->second->container) continue;
             auto& cont = *cit->second->container;
@@ -14019,6 +14605,14 @@ public:
             if (it->second.type != ValueType::USERDATA || !it->second.value.p || !func_names.count(it->second.value.p)) continue;
             invokeMember(it->second, c, inst, args, kw, ctx);
             return;
+        }
+        // round 81: neither __init__ nor __new__ of its own, and arguments:
+        // CPython's object_new - "P() takes no arguments" (an exception
+        // class takes any)
+        if (!own_new && (!args.empty() || !kw.empty())) {
+            std::string cn = static_cast<ClassNode*>(cls)->name;
+            if (!isExceptionClass(cn))
+                pyRaise("TypeError", nyrt::bare_class_name(shownClassName(cn)) + "() takes no arguments");
         }
     }
     // Calls method `name` of an instance (or a class) through the class

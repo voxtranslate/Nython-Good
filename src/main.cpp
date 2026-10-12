@@ -608,7 +608,17 @@ static void interp_chunk(NythonExecutor& exec, Runnable* runner, const std::stri
         repl_keep().push_back(ast); repl_keep().push_back(par); repl_keep().push_back(lex); repl_keep().push_back(rep);
         bool expr = is_expression_chunk(ast);
         Value val = exec.execute(ast);
-        if (echo && expr && val.type != ValueType::NONE && val.type != ValueType::UNDEFINED) {
+        // round 81: a program's own sys.displayhook shows the value instead
+        // (the prelude's _ny_prompt_display calls it, None included)
+        bool hooked = false;
+        if (echo && expr) {
+            Value hook = exec.global_ctx->getByName("_ny_prompt_display");
+            if (hook.type == ValueType::USERDATA && hook.value.p) {
+                std::vector<Value> ha{val.type == ValueType::UNDEFINED ? NONE_VALUE : val};
+                hooked = exec.isTruthy(exec.callFunctionValue(hook, ha, exec.global_ctx));
+            }
+        }
+        if (echo && expr && !hooked && val.type != ValueType::NONE && val.type != ValueType::UNDEFINED) {
             std::cout << exec.reprOf(val, exec.global_ctx) << std::endl;
             exec.global_ctx->defineByName("_", val);
         }
@@ -1009,8 +1019,9 @@ static void vm_chunk(nython::vm::VirtualMachine& vm, VMMap& session, const std::
         repl_keep().push_back(ast); repl_keep().push_back(par); repl_keep().push_back(lex); repl_keep().push_back(rep);
         bool expr = echo && is_expression_chunk(ast);
         if (expr) {
-            // the value lands in a variable the prompt then shows
-            auto src2 = SourceCode::from_text("__ny_repl_v__ = (" + code + ")", "<stdin>");
+            // the value lands in a variable the prompt then shows - or a
+            // program's own sys.displayhook does (round 81)
+            auto src2 = SourceCode::from_text("__ny_repl_v__ = (" + code + ")\n__ny_repl_h__ = _ny_prompt_display(__ny_repl_v__)", "<stdin>");
             auto rep2 = std::make_shared<Reporter>(src2);
             auto lex2 = std::make_shared<Lexer>(src2);
             lex2->tokenize();
@@ -1029,7 +1040,10 @@ static void vm_chunk(nython::vm::VirtualMachine& vm, VMMap& session, const std::
             if (it != session.end()) {
                 VMVal v = it->second;
                 session.erase("__ny_repl_v__");
-                if (v.type != VMType::NONE && v.type != VMType::UNDEFINED) {
+                auto hk = session.find("__ny_repl_h__");
+                bool hooked = hk != session.end() && hk->second.type == VMType::BOOL && hk->second.b;
+                if (hk != session.end()) session.erase(hk);
+                if (!hooked && v.type != VMType::NONE && v.type != VMType::UNDEFINED) {
                     std::cout << vm.repr_of(v) << std::endl;
                     session["_"] = v;
                 }

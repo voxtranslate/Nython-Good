@@ -383,6 +383,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit95 | 2050 | round 79: decimal - the API and 1,981 vectors with CPython's results and flags at precisions 9/16/34 (passes under python3) |
 | vm_audit96 | 116 | round 80: the gaps rounds 78-79 found - two interpreter crashes, object's members on every class, except <expression>, numeric keys across int/float/Fraction/Decimal, dataclass(slots=True), sys.modules/__import__/importlib, relative imports, sys's facts, sys.excepthook and -O, exec/eval namespaces, a live os.environ, threading._register_atexit, str.maketrans/translate, `${` in a Python-mode file (passes under python3) |
 | vm_audit97 | 262 | round 80: os.fspath/PathLike, scandir, real file descriptors, ids, posixpath/ntpath/genericpath/stat/pwd/grp, codecs (every error handler, cp437/cp1252/utf-16/32/idna/punycode, bytes codecs), multiprocessing (Process, queues, pipes, locks across processes, shared Value/Array/SharedMemory, Pool with work stealing, Manager), ProcessPoolExecutor over pickle (passes under python3; 240 under Wine, POSIX-only checks skipped) |
+| vm_audit99 | 125 | round 81: `except E as e` unbinds e, a live `globals()`/`locals()`/`vars()` and the real `__main__` module, `__spec__`/`__loader__`, `sys.meta_path`/`sys.path_hooks` in the import statement, attribute hooks assigned later, live list iterators, "P() takes no arguments", CPython's default repr, `frame.f_lineno` jumps and pdb's `jump`, `sys.getrefcount`/`stdlib_module_names`/`displayhook`, `-OO`, 3000 frames deep, exec with dict-subclass and mapping namespaces, live `f_globals`, "Set changed size during iteration", CPython's function reprs, the `__class__` cell (passes under python3) |
 | vm_audit98 | 72 | round 80: the specializing VM's every fast path and its deoptimization (class/method/global/builtin changes after specialization, `__class__` reassignment, big-int overflow, polymorphic sites, descriptors, slots, generators, threads, tracing mid-loop) - passes on both engines, under python3 and with `NY_QUICKEN=0` |
 | vm_audit101 | 125 | round 81: the live debug server driven over its socket (`--debug-port`, DAP messages: breakpoints with conditions/hit counts/log messages, stepping, pause, stack/scopes/variables by reference, evaluate, setVariable, raised/uncaught exceptions, `--connect`, stdin/argv untouched) and its ring buffer (stepBack/reverseContinue/seek, Why? over the live history); the Profile view's reader on real `-m cProfile [--stacks]` dumps (Nython-only) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
@@ -1232,6 +1233,34 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
 - **cProfile `stacks=True` / `--stacks`** (Nython's addition) keeps the
   calling context tree; `dump_stats` appends it as a `{"cct": ...}` line that
   `pstats` skips.
+
+## Round 81: the semantic gaps round 80 left (see `HANDOFF.md` §0t)
+
+- `except E as e:` unbinds `e` when the clause ends (both engines).
+- `globals()` is the module's live namespace (the prelude's `_NyGlobalsDict`
+  view: `globals()["x"] = 1` binds x; `globals() is globals()`), and so are
+  `locals()`/`vars()` at module level, `vars(module)`, `f.__globals__`;
+  `sys.modules["__main__"]` binds globals on setattr; `exec(src, globals())`
+  runs in that module; a dict subclass as exec's namespace, or any mapping
+  as its locals, gets the bindings through its `__setitem__`. `import
+  builtins` is lib/builtins.ny whatever sits beside the script.
+- Modules have `__spec__`/`__loader__` (made when first read); the import
+  statement honours `sys.meta_path` and `sys.path_hooks` (a program's own
+  finders only - the default entries stand for the native search).
+- `P(1)` for a class without `__init__`/`__new__` is "P() takes no
+  arguments"; object's `__init__`/`__new__` given arguments raise as
+  CPython's. The default repr is `<__main__.P object at 0x...>`.
+- A trace function can set `frame.f_lineno` (pdb's `jump`); `f.__code__ is
+  frame.f_code`.
+- Lists iterate live on the VM (no copy per loop); the interpreter's loop
+  sees appends.
+- Deep recursion runs on extension stacks past a thread's own stack:
+  `sys.setrecursionlimit(5000)` then 3000 frames works on both engines.
+- `sys.getrefcount`, `sys.stdlib_module_names`, `sys.displayhook` (the
+  prompt honours a program's own), `-OO`.
+- Also: `frame.f_globals` is the live globals() view; a set changed in size
+  during a loop raises "Set changed size during iteration"; functions show
+  as `<function Qualname at 0x...>`; `__class__` in a method is its class.
 
 ## Transcripts
 
