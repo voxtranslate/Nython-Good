@@ -71,7 +71,7 @@ collisions.
 
 The tree-walking interpreter (`include/NythonExecutor.hpp`, the default
 engine) is **3.09x faster** (geometric mean of the 11 benchmarks of
-`tools/bench/`, Linux; Windows under "Windows" below) with no behaviour
+`tools/bench/`, Linux; 2.87x x64 and 2.69x i686 under Wine) with no behaviour
 change: the sweep and `ide_e2e` are the oracle, and `examples/vm_audit100.ny`
 (114 checks; the interpreter, the interpreter with `NY_ASTSPEC=0`, the VM and
 python3) runs every specialized path long enough for it to specialize and
@@ -106,6 +106,19 @@ Instructions are each benchmark's run under callgrind less the startup
 The VM is unchanged (0.99x by time, its instruction counts within 0.2%);
 the interpreter is now within 1.2-2.4x of it except for exceptions (4.4x).
 Every run's result line equals python3's.
+
+### Windows (MinGW, under Wine; the round-80 tree cross-built the same way as the base)
+- x64 (`tools/cross_windows.sh build`; `pe_unwind_check` clean): **2.87x**
+  (min of 3; closures 3.13x, deltablue 3.05x, dict_str 2.38x, exceptions
+  1.80x, fannkuch 2.46x, fib 4.06x, generators 2.65x, nbody 3.19x,
+  raytrace 2.62x, richards 2.91x, spectral_norm 4.05x).
+- i686 (`ARCH=i686`): **2.69x** (closures 2.30x, deltablue 2.96x, dict_str
+  2.50x, exceptions 1.80x, fannkuch 2.36x, fib 3.08x, generators 2.37x,
+  nbody 2.86x, raytrace 2.77x, richards 3.58x, spectral_norm 3.58x).
+- vm_audit100 passes on both (interpreter, `NY_ASTSPEC=0`, VM), and so do
+  vm_audit53, 55, 56, 72, 79, 88, 91, 98. The i686 link's "duplicate
+  section `.data$_ZZN4nyrt15class_dir_names...`" message comes from the
+  round-80 tree too.
 
 ### Where the time went (callgrind, before)
 - **Value copies and the allocator** - the interpreter's equivalent of the
@@ -252,6 +265,16 @@ strings: dict_str -24%, exceptions -18%, closures -16%, deltablue -9%,
 vm_audit55 -27%, vm_audit73 -11%, vm_audit100 -11%; the small benchmarks
 are within +1.3 MB. The IDE's `ide_memprobe --check` still finds no growth
 per frame, key, scroll or split.
+
+### Verified (b7bb7b8 + docs)
+- The sweep: 425 runs, 0 not ok. `ide_e2e` 390 passed, 0 failed;
+  `ide_memprobe --check` (no growth); `ny_classcheck`; `cbp.py check` (61
+  units; no new .cpp).
+- vm_audit100 (114) on the interpreter, with `NY_ASTSPEC=0`, on the VM and
+  under python3; vm_audit26 27 53 55 56 57 60 64 72 74 76 79 80 81 82 83 85
+  86 88 89 91 98 on the interpreter and with `NY_ASTSPEC=0`; 53 72 74 76 79
+  80 81 82 83 98 on the VM.
+- The VM's instruction counts (fib, closures) are within 0.2% of round 80's.
 
 ### Not done / found
 - **Python exceptions are still C++ throws** on the interpreter: the
