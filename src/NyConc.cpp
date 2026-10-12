@@ -130,6 +130,8 @@ struct ThreadRec : Waitable {
     // cancellation
     bool cancel_requested = false;
     bool cancel_sticky = true;      // threads: every checkpoint raises; tasks: once
+    bool has_cancel_msg = false;    // round 82: a task's Task.cancel(msg)
+    std::string cancel_msg;
     // blocking state (all guarded by the runtime mutex)
     std::condition_variable cv;
     bool blocking = false, blocked_forever = false, woken = false;
@@ -361,9 +363,9 @@ static void check_cancel_locked(ThreadRec* self) {
     if (self->cancel_requested) {
         if (!self->cancel_sticky) self->cancel_requested = false;
         // round 82: Task.cancel(msg) - the CancelledError carries msg
-        if (self->task && self->task->has_cancel_msg) {
-            self->task->has_cancel_msg = false;
-            raise("CancelledError", self->task->cancel_msg);
+        if (self->has_cancel_msg) {
+            self->has_cancel_msg = false;
+            raise("CancelledError", self->cancel_msg);
         }
         raise("CancelledError", "thread " + self->label() + " was cancelled");
     }
@@ -1964,8 +1966,11 @@ static Awaitable::Item item_of(Engine& e, const Args& a, size_t i) {
     for (int depth = 0; depth < 16; depth++) {
         int64_t h;
         // A coroutine object (round 78): its handle, and the object kept
-        // with it (a gather or wait_for holding it keeps it alive).
-        if (e.coro_handle(v, h)) { it.is_handle = true; it.h = h; it.v = obj; return it; }
+        // with it (a gather or wait_for holding it keeps it alive). round
+        // 82: the coroutine itself when an __await__ made it - a gather of
+        // asyncio Futures dropped those coroutines before running them, and
+        // with them their handles (the results were the handle numbers).
+        if (e.coro_handle(v, h)) { it.is_handle = true; it.h = h; it.v = depth == 0 ? obj : v; return it; }
         BoxPtr r = e.await_target(v);
         if (!r) break;
         if (e.unbox_int(r, h)) { it.is_handle = true; it.h = h; it.v = obj; return it; }
@@ -3177,7 +3182,10 @@ static std::unordered_map<std::string, Handler>& table() {
             std::lock_guard<std::mutex> l(RT().m);
             Task* t = get_obj<Task>(H(a, 0, "task_cancel"), "task");
             // round 82: task_cancel(h, msg) - Task.cancel(msg)
-            if (!t->done && a.size() > 1 && !a.is_none(1)) { t->has_cancel_msg = true; t->cancel_msg = a.as_str(1); }
+            if (!t->done && a.size() > 1 && !a.is_none(1)) {
+                if (t->thr) { t->thr->has_cancel_msg = true; t->thr->cancel_msg = a.as_str(1); }
+                else { t->has_cancel_msg = true; t->cancel_msg = a.as_str(1); }
+            }
             return Ret::boolean(task_cancel_locked(t));
         };
         T["task_done"] = [](Engine&, const Args& a) {

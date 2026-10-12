@@ -109,8 +109,8 @@
 #     gives a concurrent.futures.ThreadPoolExecutor;
 #   - shutdown_asyncgens() closes nothing: async generators are not tracked
 #     (there is no sys.set_asyncgen_hooks);
-#   - SSL transports close without the close_notify exchange, and
-#     can_write_eof() is false for them (as for CPython's);
+#   - an SSL transport sends close_notify when it closes but does not wait
+#     for the peer's; can_write_eof() is false for them (as for CPython's);
 #   - loop.sendfile/sock_sendfile, connect_read_pipe/connect_write_pipe and
 #     the child watchers are not provided; add_reader/add_writer take
 #     sockets everywhere and other descriptors on POSIX only;
@@ -801,6 +801,7 @@ class Task(Future):
         self._created_at = none
         self._parent = none
         self._children = none
+        self._run_main = false
         if name is none:
             _task_count = _task_count + 1
             self._name = "Task-" + str(_task_count)
@@ -969,7 +970,8 @@ async def _tracked(t, body):
         return await body
     finally:
         var kids = t._children
-        if kids is not none:
+        # a run's main task: what it leaves is reported when the run ends
+        if kids is not none and not t._run_main:
             for k in kids:
                 if not task_done(k._h):
                     t._loop._report_orphan(k, "outlived the task that created it (" + t._name + ")")
@@ -1051,6 +1053,12 @@ def gather(*aws, return_exceptions=false):
     # A future over the awaitables' results, in their order; cancelling it
     # cancels them.
     var lo = _get_running_loop()
+    if lo is none:
+        # the loop of the first future given, as CPython's gather
+        for a in aws:
+            if isfuture(a) and getattr(a, "_loop", none) is not none:
+                lo = a._loop
+                break
     if lo is none:
         lo = get_event_loop()
     if len(aws) == 0:
@@ -2143,15 +2151,24 @@ class _SocketTransport(_FlowControlMixin):
         return "<" + " ".join(info) + ">"
 
     def _start(self, waiter, call_connection_made):
-        if self._conn_lost:
+        # connection_made, then reading, then the waiter (as CPython's
+        # three call_soon's: a failing connection_made is reported to the
+        # exception handler and the connection still goes on)
+        try:
+            if not self._conn_lost:
+                if call_connection_made:
+                    try:
+                        self._protocol.connection_made(self)
+                    except (SystemExit, KeyboardInterrupt):
+                        raise
+                    except BaseException as exc:
+                        self._loop.call_exception_handler({"message": "Exception in callback " + _callback_name(self._protocol.connection_made) + "()",
+                                                           "exception": exc, "transport": self, "protocol": self._protocol})
+                if not self._closing:
+                    self._reader_h = self._loop._spawn(self._read_loop(), false)
+        finally:
             if waiter is not none:
                 _set_result_unless_cancelled(waiter, none)
-            return
-        if call_connection_made:
-            self._protocol.connection_made(self)
-        self._reader_h = self._loop._spawn(self._read_loop(), false)
-        if waiter is not none:
-            _set_result_unless_cancelled(waiter, none)
 
     def set_protocol(self, protocol):
         self._protocol = protocol
@@ -2354,7 +2371,9 @@ class _SocketTransport(_FlowControlMixin):
                 self._maybe_resume_protocol()
             event_set(self._flushed_ev)
             if self._closing and not self._detached:
-                self._call_connection_lost(none)
+                if not self._conn_lost:
+                    self._conn_lost = self._conn_lost + 1
+                    self._call_connection_lost(none)
             elif self._eof:
                 try:
                     self._sock.shutdown(socket.SHUT_WR)
@@ -2423,6 +2442,13 @@ class _SocketTransport(_FlowControlMixin):
                 self._protocol.connection_lost(exc)
         finally:
             if self._sock is not none:
+                if self._is_tls:
+                    # close_notify (not waiting for the peer's), so the peer
+                    # sees a clean end of stream
+                    try:
+                        self._sock.unwrap()
+                    except BaseException:
+                        pass
                 try:
                     self._sock.close()
                 except OSError:
@@ -2478,14 +2504,20 @@ class _DatagramTransport(DatagramTransport, _FlowControlMixin):
         return "<_SelectorDatagramTransport" + (" closing" if self._closing else "") + ">"
 
     def _start(self, waiter):
-        if self._conn_lost:
+        try:
+            if not self._conn_lost:
+                try:
+                    self._protocol.connection_made(self)
+                except (SystemExit, KeyboardInterrupt):
+                    raise
+                except BaseException as exc:
+                    self._loop.call_exception_handler({"message": "Exception in callback " + _callback_name(self._protocol.connection_made) + "()",
+                                                       "exception": exc, "transport": self, "protocol": self._protocol})
+                if not self._closing:
+                    self._reader_h = self._loop._spawn(self._read_loop(), false)
+        finally:
             if waiter is not none:
                 _set_result_unless_cancelled(waiter, none)
-            return
-        self._protocol.connection_made(self)
-        self._reader_h = self._loop._spawn(self._read_loop(), false)
-        if waiter is not none:
-            _set_result_unless_cancelled(waiter, none)
 
     def get_protocol(self):
         return self._protocol
@@ -2583,7 +2615,8 @@ class _DatagramTransport(DatagramTransport, _FlowControlMixin):
                 self._buffer.pop(0)
                 self._buffer_size = self._buffer_size - len(item[0])
                 self._maybe_resume_protocol()
-            if self._closing:
+            if self._closing and not self._conn_lost:
+                self._conn_lost = self._conn_lost + 1
                 self._call_connection_lost(none)
         except CancelledError:
             return
@@ -3831,7 +3864,7 @@ class DefaultEventLoopPolicy(BaseDefaultEventLoopPolicy):
 
 def _env_debug():
     var v = os.environ.get("PYTHONASYNCIODEBUG", "")
-    return v != "" and not sys.flags.ignore_environment
+    return v != "" and not getattr(sys.flags, "ignore_environment", false)
 
 async def _wait_quietly(fut):
     try:
@@ -3976,6 +4009,9 @@ class StreamReaderProtocol(FlowControlMixin):
         self._stream_writer = writer
         self._transport = transport
         self._over_ssl = transport.get_extra_info("sslcontext") is not none
+        # start_tls made a new transport: the reader's flow control is its
+        if self._stream_reader is not none:
+            self._stream_reader.set_transport(transport)
 
     def connection_made(self, transport):
         var reader = self._stream_reader
@@ -4855,15 +4891,9 @@ class Process:
         return output
 
     async def communicate(self, input=none):
-        var a = self._noop()
-        var b = self._noop()
-        var c = self._noop()
-        if self.stdin is not none:
-            a = self._feed_stdin(input)
-        if self.stdout is not none:
-            b = self._read_stream(1)
-        if self.stderr is not none:
-            c = self._read_stream(2)
+        var a = self._feed_stdin(input) if self.stdin is not none else self._noop()
+        var b = self._read_stream(1) if self.stdout is not none else self._noop()
+        var c = self._read_stream(2) if self.stderr is not none else self._noop()
         var res = await gather(a, b, c)
         await self.wait()
         return (res[1], res[2])
@@ -4936,6 +4966,10 @@ class Runner:
         self._lazy_init()
         var lo = self._loop
         var task = lo.create_task(coro, context=context)
+        try:
+            task._run_main = true
+        except AttributeError:
+            pass
         var sigint_handler = none
         if thread_id() == thread_main() and not _WINDOWS:
             import signal
@@ -4988,7 +5022,11 @@ class Runner:
             var reps = list(lo._orphans)
             lo._orphans = []
             _cancel_all_tasks(lo)
-            raise OrphanedTasksError(str(len(reps)) + " task(s) left running: " + ", ".join([repr(r.name) for r in reps]), reps)
+            var names = []
+            for rp in reps:
+                if repr(rp.name) not in names:
+                    names.append(repr(rp.name))
+            raise OrphanedTasksError(str(len(names)) + " task(s) left running: " + ", ".join(names), reps)
 
     def _lazy_init(self):
         if self._state == "closed":

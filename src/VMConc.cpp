@@ -233,8 +233,10 @@ struct VMConcEngine : nyconc::Engine {
             }
             throw std::runtime_error(raw);
         }
-        vm.last_exception_obj_ = exception_instance(err.type, err.msg);
-        throw std::runtime_error(err.type + ": " + err.msg);
+        // round 82: with the arguments its message stands for, as the VM's
+        // own natives raise them (an OSError's errno and strerror - the
+        // interpreter already gave signal.signal(SIGKILL, f)'s e.errno == 22)
+        vm.raise_native_exception(err.type, err.msg);
     }
 };
 

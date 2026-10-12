@@ -569,7 +569,7 @@ class UpperEcho(asyncio.Protocol):
     def eof_received(self):
         self.log.append("server eof")
     def connection_lost(self, exc):
-        self.log.append("server lost " + repr(exc))
+        self.log.append("server lost " + ("ok" if exc is None else repr(exc)))
 
 class Collect(asyncio.Protocol):
     def __init__(self, done):
@@ -588,7 +588,7 @@ class Collect(asyncio.Protocol):
     def eof_received(self):
         self.log.append("eof")
     def connection_lost(self, exc):
-        self.log.append("lost " + repr(exc))
+        self.log.append("lost " + ("ok" if exc is None else repr(exc)))
         self.done.set_result(self.buf)
 
 async def tcp_protocols():
@@ -664,7 +664,7 @@ async def tcp_protocols():
         def connection_made(self, t):
             t.abort()
         def connection_lost(self, exc):
-            done2.set_result(repr(exc))
+            done2.set_result("ok" if exc is None else repr(exc))
     await loop.create_connection(Aborter, "127.0.0.1", server4.sockets[0].getsockname()[1])
     out["abort"] = await asyncio.wait_for(done2, 5)
     server4.close()
@@ -674,8 +674,8 @@ tp = run(tcp_protocols())
 check("Server object", [tp["serving"], tp["server loop"]], [True, True])
 check("get_extra_info", tp["extra"], [True, "127.0.0.1", True, "dflt"])
 check("TCP echo with a Protocol (write, writelines, write_eof)", tp["echo"], b"HELLO, PROTOCOLS")
-check("the client's callbacks in order", tp["client log"], ["made", True, "eof", "lost None"])
-check("the server's callbacks in order", tp["server log"], ["server made", "server eof", "server lost None"])
+check("the client's callbacks in order", tp["client log"], ["made", True, "eof", "lost ok"])
+check("the server's callbacks in order", tp["server log"], ["server made", "server eof", "server lost ok"])
 check("is_closing after connection_lost", tp["closing"], True)
 check("Server.close / wait_closed", tp["closed"], [False, ()])
 check("create_connection refused", tp["refused"], "ConnectionRefusedError")
@@ -685,7 +685,7 @@ check("start_serving=False, start_serving(), serve_forever cancelled",
       [tp["not yet serving"], tp["serve_forever"], tp["serve_forever cancelled"]], [False, True, False])
 check("async with server", [tp["async with"], tp["after async with"]], [True, False])
 check("connect_accepted_socket", tp["connect_accepted_socket"], b"ACCEPTED")
-check("abort() ends the connection at once", tp["abort"], "None")
+check("abort() ends the connection at once", tp["abort"], "ok")
 
 # ── 4. flow control ───────────────────────────────────────────────────────────
 async def flow_control():
