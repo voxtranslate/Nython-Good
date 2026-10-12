@@ -72,7 +72,7 @@ ifeq ($(USE_SDL_STUB),yes)
   # Headless SDL3/SDL3_ttf/SDL3_image stand-in — see thirdparty/sdl3-stub/.
   # No real SDL3 is linked; the stub's own .cpp is added to the object list
   # below and provides every symbol gui.cpp needs as a headless no-op.
-  SDL3_CFLAGS  := $(STUB_INCLUDE)
+  SDL3_CFLAGS  := $(STUB_INCLUDE) -DNYTHON_SDL_STUB=1
   SDL3_LDFLAGS :=
 else
   SDL3_CFLAGS  := $(SDL3_CFLAGS_REAL)
@@ -85,28 +85,46 @@ else
     SDL3_LDFLAGS = -L/usr/local/lib -lSDL3
   endif
   SDL3_LDFLAGS += -lSDL3_ttf -lSDL3_image
+  # An SDL3 outside the system library path (e.g. built from source into
+  # /opt/sdl3 with PKG_CONFIG_PATH=/opt/sdl3/lib/pkgconfig) is found at run
+  # time through an rpath, so the binary runs without LD_LIBRARY_PATH.
+  SDL3_LIBDIR := $(shell pkg-config --variable=libdir sdl3 2>/dev/null)
+  ifneq ($(filter-out /usr/lib /usr/lib64 /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu,$(SDL3_LIBDIR)),)
+    SDL3_LDFLAGS += -Wl,-rpath,$(SDL3_LIBDIR)
+  endif
+endif
+
+# ── Objects ────────────────────────────────────────────────────────
+# Every translation unit except main.cpp is identical in the IDE and CLI
+# builds, so it is compiled once into build/obj and shared; only main.cpp
+# (which reads NYTHON_WITH_IDE) is compiled per flavour. -MMD -MP records
+# each object's header dependencies, so editing a header such as
+# NythonExecutor.hpp rebuilds exactly the objects that include it - the
+# stale-object trap (CLAUDE.md, "Stale object files") no longer needs a
+# `make clean`.
+# BUILD selects the output directory, so a real-SDL3 build can live next to
+# the stub build: make BUILD=build-sdl NYTHON_SDL_STUB=0
+BUILD         ?= build
+OBJDIR         = $(BUILD)/obj
+DEPFLAGS       = -MMD -MP
+BASE_CXXFLAGS  = $(CXXSTD) $(CXXOPT) $(CXXWARN) $(INCLUDE) $(SDL3_CFLAGS)
+COMMON_SRCS    = $(filter-out src/main.cpp,$(SRCS))
+COMMON_OBJS    = $(patsubst src/%.cpp,$(OBJDIR)/%.o,$(COMMON_SRCS))
+ifeq ($(USE_SDL_STUB),yes)
+  COMMON_OBJS += $(OBJDIR)/sdl3_stub.o
 endif
 
 # ── IDE build (default) ────────────────────────────────────────────
-IDE_BUILDDIR   = build/ide
-IDE_OBJS       = $(patsubst src/%.cpp,$(IDE_BUILDDIR)/%.o,$(filter src/%.cpp,$(SRCS))) \
-                 $(patsubst src/builtins/%.cpp,$(IDE_BUILDDIR)/builtins/%.o,$(filter src/builtins/%.cpp,$(SRCS)))
-IDE_TARGET     = build/nython$(EXE)
-IDE_CXXFLAGS   = $(CXXSTD) $(CXXOPT) $(CXXWARN) $(INCLUDE) -DNYTHON_WITH_IDE=1 $(SDL3_CFLAGS)
+IDE_OBJS       = $(OBJDIR)/main_ide.o $(COMMON_OBJS)
+IDE_TARGET     = $(BUILD)/nython$(EXE)
+IDE_CXXFLAGS   = $(BASE_CXXFLAGS) -DNYTHON_WITH_IDE=1
 
 # ── CLI build ──────────────────────────────────────────────────────
-CLI_BUILDDIR   = build/cli
-CLI_OBJS       = $(patsubst src/%.cpp,$(CLI_BUILDDIR)/%.o,$(filter src/%.cpp,$(SRCS))) \
-                 $(patsubst src/builtins/%.cpp,$(CLI_BUILDDIR)/builtins/%.o,$(filter src/builtins/%.cpp,$(SRCS)))
-CLI_TARGET     = build/nython-cli$(EXE)
-CLI_CXXFLAGS   = $(CXXSTD) $(CXXOPT) $(CXXWARN) $(INCLUDE) -DNYTHON_WITH_IDE=0 $(SDL3_CFLAGS)
+CLI_OBJS       = $(OBJDIR)/main_cli.o $(COMMON_OBJS)
+CLI_TARGET     = $(BUILD)/nython-cli$(EXE)
+CLI_CXXFLAGS   = $(BASE_CXXFLAGS) -DNYTHON_WITH_IDE=0
 
-ifeq ($(USE_SDL_STUB),yes)
-  IDE_OBJS += $(IDE_BUILDDIR)/sdl3_stub.o
-  CLI_OBJS += $(CLI_BUILDDIR)/sdl3_stub.o
-endif
-
-.PHONY: all ide cli clean help
+.PHONY: all ide cli clean help asan
 
 # ── Default: IDE build ──────────────────────────────────────────────
 all: ide
@@ -127,48 +145,50 @@ cli: $(CLI_TARGET)
 	@echo ""
 
 # ── Link ───────────────────────────────────────────────────────────
-$(IDE_TARGET): $(IDE_OBJS) | build
+$(IDE_TARGET): $(IDE_OBJS) | $(BUILD)
 	$(CXX) $(IDE_CXXFLAGS) $^ -o $@ $(LDFLAGS) $(SDL3_LDFLAGS)
 
-$(CLI_TARGET): $(CLI_OBJS) | build
+$(CLI_TARGET): $(CLI_OBJS) | $(BUILD)
 	$(CXX) $(CLI_CXXFLAGS) $^ -o $@ $(LDFLAGS) $(SDL3_LDFLAGS)
 
-# ── Compile IDE objects ────────────────────────────────────────────
-$(IDE_BUILDDIR)/%.o: src/%.cpp | $(IDE_BUILDDIR)
-	$(CXX) $(IDE_CXXFLAGS) -c $< -o $@
+# ── Compile ────────────────────────────────────────────────────────
+$(OBJDIR)/%.o: src/%.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(BASE_CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
-$(IDE_BUILDDIR)/builtins/%.o: src/builtins/%.cpp | $(IDE_BUILDDIR)/builtins
-	$(CXX) $(IDE_CXXFLAGS) -c $< -o $@
+$(OBJDIR)/main_ide.o: src/main.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(IDE_CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
-# ── Compile CLI objects ────────────────────────────────────────────
-$(CLI_BUILDDIR)/%.o: src/%.cpp | $(CLI_BUILDDIR)
-	$(CXX) $(CLI_CXXFLAGS) -c $< -o $@
-
-$(CLI_BUILDDIR)/builtins/%.o: src/builtins/%.cpp | $(CLI_BUILDDIR)/builtins
-	$(CXX) $(CLI_CXXFLAGS) -c $< -o $@
+$(OBJDIR)/main_cli.o: src/main.cpp
+	@mkdir -p $(dir $@)
+	$(CXX) $(CLI_CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
 # ── Compile SDL3 stub (only when USE_SDL_STUB=yes) ────────────────
-$(IDE_BUILDDIR)/sdl3_stub.o: $(STUB_SRC) | $(IDE_BUILDDIR)
-	$(CXX) $(IDE_CXXFLAGS) -c $< -o $@
+$(OBJDIR)/sdl3_stub.o: $(STUB_SRC)
+	@mkdir -p $(dir $@)
+	$(CXX) $(BASE_CXXFLAGS) $(DEPFLAGS) -c $< -o $@
 
-$(CLI_BUILDDIR)/sdl3_stub.o: $(STUB_SRC) | $(CLI_BUILDDIR)
-	$(CXX) $(CLI_CXXFLAGS) -c $< -o $@
+-include $(COMMON_OBJS:.o=.d) $(OBJDIR)/main_ide.d $(OBJDIR)/main_cli.d
+
+# ── Sanitizer build (round 75) ─────────────────────────────────────
+# AddressSanitizer (use-after-free, double free, overflows) + LeakSanitizer
+# (leaks at exit) + UBSan, in its own tree so it never mixes with the normal
+# objects:  make asan  ->  build-asan/nython-cli
+#   ulimit -s 65536   # ASan frames overflow 8 MB in the deep-recursion tests
+#   LSAN_OPTIONS=suppressions=tools/lsan.supp build-asan/nython-cli examples/vm_audit55.ny
+# UBSan reports and continues ("runtime error:" lines); grep the output.
+ASAN_CXXOPT = -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
+asan:
+	$(MAKE) cli BUILD=build-asan CXXOPT="$(ASAN_CXXOPT)"
 
 # ── Directories ────────────────────────────────────────────────────
-build:
-	mkdir -p build
-$(IDE_BUILDDIR):
-	mkdir -p $(IDE_BUILDDIR)
-$(IDE_BUILDDIR)/builtins:
-	mkdir -p $(IDE_BUILDDIR)/builtins
-$(CLI_BUILDDIR):
-	mkdir -p $(CLI_BUILDDIR)
-$(CLI_BUILDDIR)/builtins:
-	mkdir -p $(CLI_BUILDDIR)/builtins
+$(BUILD):
+	mkdir -p $(BUILD)
 
 # ── Clean ──────────────────────────────────────────────────────────
 clean:
-	rm -rf build
+	rm -rf $(BUILD) build-asan
 
 # ── Help ───────────────────────────────────────────────────────────
 help:
@@ -178,6 +198,7 @@ help:
 	@echo "  make          Build IDE version → build/nython"
 	@echo "  make ide      Same as above"
 	@echo "  make cli      Build CLI version → build/nython-cli"
+	@echo "  make asan     ASan+UBSan+LSan CLI build → build-asan/nython-cli"
 	@echo "  make clean    Remove all build artifacts"
 	@echo ""
 	@echo "  SDL3 is always required:"

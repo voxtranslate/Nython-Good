@@ -75,7 +75,7 @@ def make_filter(pred):
 var get_positives = make_filter(lambda x: x > 0)
 var get_evens = make_filter(lambda x: x % 2 == 0)
 t("ho_filter_pos", str(get_positives([-3, -1, 0, 2, 5])), "[2, 5]")
-t("ho_filter_even", str(get_evens(range(1, 11))), "[2, 4, 6, 8, 10]")
+t("ho_filter_even", str(get_evens(list(range(1, 11)))), "[2, 4, 6, 8, 10]")
 
 print "=== 8. MATRIX OPS ==="
 def mat_new(rows, cols, val):
@@ -127,7 +127,7 @@ def bfs(graph, start):
     return visited
 
 var g = {"A": ["B", "C"], "B": ["D"], "C": ["D", "E"], "D": [], "E": []}
-t("bfs", str(bfs(g, "A")), "[A, B, C, D, E]")
+t("bfs", str(bfs(g, "A")), "['A', 'B', 'C', 'D', 'E']")
 
 print "=== 10. GENERIC SORT ==="
 def insertion_sort(lst):

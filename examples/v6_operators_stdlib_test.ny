@@ -56,13 +56,14 @@ t("sub_eq", x, 12)
 x *= 2
 t("mul_eq", x, 24)
 x /= 4
-t("div_eq", x, 6)
+t("div_eq", x, 6.0)    # / is true division (round 71): x is a float from here
 x %= 4
-t("mod_eq", x, 2)
+t("mod_eq", x, 2.0)
 x **= 3
-t("pow_eq", x, 8)
+t("pow_eq", x, 8.0)
 x //= 3
-t("fdiv_eq", x, 2)
+t("fdiv_eq", x, 2.0)
+x = int(x)            # bitwise operators take ints, as in Python
 x &= 3
 t("and_eq", x, 2)
 x |= 12
@@ -87,7 +88,7 @@ t("sum", sum([1, 2, 3, 4, 5]), 15)
 t("len_s", len("hello"), 5)
 t("len_l", len([1, 2, 3]), 3)
 t("sorted", str(sorted([3, 1, 4])), "[1, 3, 4]")
-t("reversed", str(reversed([1, 2, 3])), "[3, 2, 1]")
+t("reversed", str(list(reversed([1, 2, 3]))), "[3, 2, 1]")
 t("int_s", int("42"), 42)
 t("float_s", float("3.14"), 3.14)
 t("str_i", str(42), "42")
@@ -99,7 +100,7 @@ t("hex", hex(255), "0xff")
 t("bin", bin(10), "0b1010")
 t("oct", oct(8), "0o10")
 t("pow2", pow(2, 10), 1024)
-t("divmod", str(divmod(17, 5)), "[3, 2]")
+t("divmod", str(divmod(17, 5)), "(3, 2)")
 t("round1", round(3.7), 4)
 t("round2", round(3.14159, 2), 3.14)
 t("all_t", all([true, true, true]), true)
@@ -111,12 +112,12 @@ t("all_i0", all([1, 0, 3]), false)
 t("any_i", any([0, 0, 1]), true)
 
 print "=== TYPE SYSTEM ==="
-t("type_int", type(42), "int")
-t("type_float", type(3.14), "float")
-t("type_str", type("hi"), "string")
-t("type_bool", type(true), "bool")
-t("type_list", type([1, 2]), "list")
-t("type_none", type(none), "none")
+t("type_int", type(42) == "int", true)
+t("type_float", type(3.14) == "float", true)
+t("type_str", type("hi") == "string", true)
+t("type_bool", type(true) == "bool", true)
+t("type_list", type([1, 2]) == "list", true)
+t("type_none", type(none) == "none", true)
 t("isinstance_i", isinstance(42, "int"), true)
 t("isinstance_s", isinstance("hi", "string"), true)
 
@@ -124,7 +125,7 @@ print "=== STRING METHODS ==="
 t("upper", "hello".upper(), "HELLO")
 t("lower", "WORLD".lower(), "world")
 t("strip", "  hi  ".strip(), "hi")
-t("split", str("a,b,c".split(",")), "[a, b, c]")
+t("split", str("a,b,c".split(",")), "['a', 'b', 'c']")
 t("join", "-".join(["x", "y", "z"]), "x-y-z")
 t("replace", "aabb".replace("a", "x"), "xxbb")
 t("find", "abcdef".find("cd"), 2)
@@ -145,8 +146,8 @@ var unique = Set(words)
 t("set_len", len(unique), 3)
 
 print "=== MAP/FILTER/REDUCE ==="
-t("map", str(map(lambda x: x * 2, [1,2,3])), "[2, 4, 6]")
-t("filter", str(filter(lambda x: x > 2, [1,2,3,4,5])), "[3, 4, 5]")
+t("map", str(list(map(lambda x: x * 2, [1,2,3]))), "[2, 4, 6]")
+t("filter", str(list(filter(lambda x: x > 2, [1,2,3,4,5]))), "[3, 4, 5]")
 t("reduce", reduce(lambda a, b: a + b, [1,2,3,4,5]), 15)
 
 print "=== STDLIB MODULES ==="

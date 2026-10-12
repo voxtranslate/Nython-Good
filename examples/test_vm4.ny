@@ -26,7 +26,10 @@ check("zeros len", len(t3), 3)
 var t4 = tensor_ones(4)
 check("ones", t4[3], 1.0)
 
-check("dot product", tensor_dot([1,2,3],[4,5,6]), 32.0)
+# The result type follows the operation (NumPy's promotion rule, round 75):
+# a dot product of integers is an integer; of floats, a float.
+check("dot product", tensor_dot([1,2,3],[4,5,6]), 32)
+check("dot product of floats", tensor_dot([1.0,2.0,3.0],[4.0,5.0,6.0]), 32.0)
 check("tensor sum", tensor_sum([1.0,2.0,3.0,4.0]), 10.0)
 check("tensor mean", tensor_mean([1.0,2.0,3.0,4.0]), 2.5)
 
@@ -79,14 +82,14 @@ check("bool nonempty list", bool([1]), true)
 
 # ── enumerate / zip patterns ──────────────────────────────────────
 var items = ["a", "b", "c"]
-var indexed = enumerate(items)
+var indexed = list(enumerate(items))
 check("enumerate 0", indexed[0][0], 0)
 check("enumerate val", indexed[0][1], "a")
 check("enumerate 2", indexed[2][0], 2)
 
 var la = [1, 2, 3]
 var lb = ["x", "y", "z"]
-var zipped = zip(la, lb)
+var zipped = list(zip(la, lb))
 check("zip 0", zipped[0][0], 1)
 check("zip str", zipped[1][1], "y")
 

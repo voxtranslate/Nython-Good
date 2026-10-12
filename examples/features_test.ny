@@ -77,7 +77,7 @@ except e:
 t("assert_fail", caught_assert, true)
 
 print "=== STRING SORT + METHODS ==="
-t("sort_str", str(sorted(["cherry", "apple", "banana"])), "[apple, banana, cherry]")
+t("sort_str", str(sorted(["cherry", "apple", "banana"])), "['apple', 'banana', 'cherry']")
 t("chr_ord", chr(ord("Z")), "Z")
 t("chr_range", chr(65) + chr(66) + chr(67), "ABC")
 t("startswith", "nython".startswith("ny"), true)

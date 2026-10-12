@@ -55,11 +55,13 @@ assert_true("deleted key", sess.get("role") == none)
 
 section("SessionStore")
 var store = SessionStore(3600)
+# create() returns the new session's id (the test read .sid off that string,
+# which gave none - and passed or failed by accident)
 var s1 = store.create()
 var s2 = store.create()
 assert_true("s1 created", s1 != none)
-assert_true("different sids", s1.sid != s2.sid)
-var sid1 = s1.sid
+assert_true("different sids", s1 != s2)
+var sid1 = s1
 var found = store.get(sid1)
 assert_true("found", found != none)
 assert_eq("found sid", found.sid, sid1)

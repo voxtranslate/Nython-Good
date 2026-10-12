@@ -13,6 +13,8 @@
 #include <algorithm>    //reverse
 #include <type_traits>  //make_signed_t
 #include <stdexcept>    //invalid_argument, runtime_error
+#include <cstdint>      //uint32_t
+#include <iterator>     //reverse_iterator
 
 namespace nython{
 
@@ -23,13 +25,124 @@ struct String;
 struct Integer;
 struct Rational;
 
+// The limbs of a bigint (round 81): the subset of std::vector's interface
+// bigint uses, with room for two limbs inside the object. Every interpreter
+// int is a bigint (Value::value.i), so with a std::vector each int made or
+// copied - every `i + 1`, every argument passed - allocated on the heap; the
+// ints that fit 128 bits now never do. Iterators are plain pointers.
+class LimbVec {
+public:
+    typedef unsigned long long value_type;
+    typedef value_type* iterator;
+    typedef const value_type* const_iterator;
+    typedef std::reverse_iterator<iterator> reverse_iterator;
+    typedef std::reverse_iterator<const_iterator> const_reverse_iterator;
+    typedef size_t size_type;
+    static constexpr uint32_t kInline = 2;
+
+    LimbVec() noexcept : n_(0), cap_(kInline) { u_.buf[0] = 0; u_.buf[1] = 0; }
+    LimbVec(const LimbVec& o) : n_(0), cap_(kInline) { u_.buf[0] = 0; u_.buf[1] = 0; assign_from(o.data(), o.n_); }
+    LimbVec(LimbVec&& o) noexcept : n_(o.n_), cap_(o.cap_) {
+        u_ = o.u_;
+        o.n_ = 0; o.cap_ = kInline;
+    }
+    explicit LimbVec(const std::vector<value_type>& v) : n_(0), cap_(kInline) { u_.buf[0] = 0; u_.buf[1] = 0; assign_from(v.data(), (uint32_t)v.size()); }
+    ~LimbVec() { if (cap_ > kInline) ::operator delete(u_.heap); }
+    LimbVec& operator=(const LimbVec& o) { if (this != &o) assign_from(o.data(), o.n_); return *this; }
+    LimbVec& operator=(LimbVec&& o) noexcept {
+        if (this != &o) {
+            if (cap_ > kInline) ::operator delete(u_.heap);
+            n_ = o.n_; cap_ = o.cap_; u_ = o.u_;
+            o.n_ = 0; o.cap_ = kInline;
+        }
+        return *this;
+    }
+    bool operator==(const LimbVec& o) const {
+        if (n_ != o.n_) return false;
+        const value_type* a = data(); const value_type* b = o.data();
+        for (uint32_t i = 0; i < n_; i++) if (a[i] != b[i]) return false;
+        return true;
+    }
+    bool operator!=(const LimbVec& o) const { return !(*this == o); }
+
+    size_t size() const { return n_; }
+    bool empty() const { return n_ == 0; }
+    value_type* data() { return cap_ > kInline ? u_.heap : u_.buf; }
+    const value_type* data() const { return cap_ > kInline ? u_.heap : u_.buf; }
+    value_type& operator[](size_t i) { return data()[i]; }
+    const value_type& operator[](size_t i) const { return data()[i]; }
+    value_type& back() { return data()[n_ - 1]; }
+    const value_type& back() const { return data()[n_ - 1]; }
+    iterator begin() { return data(); }
+    iterator end() { return data() + n_; }
+    const_iterator begin() const { return data(); }
+    const_iterator end() const { return data() + n_; }
+    reverse_iterator rbegin() { return reverse_iterator(end()); }
+    reverse_iterator rend() { return reverse_iterator(begin()); }
+    const_reverse_iterator rbegin() const { return const_reverse_iterator(end()); }
+    const_reverse_iterator rend() const { return const_reverse_iterator(begin()); }
+
+    void clear() { n_ = 0; }
+    void reserve(size_t n) { if (n > cap_) grow((uint32_t)n); }
+    void push_back(value_type v) { if (n_ == cap_) grow(cap_ * 2); data()[n_++] = v; }
+    void pop_back() { n_--; }
+    void resize(size_t n) {
+        if (n > cap_) grow((uint32_t)n);
+        value_type* d = data();
+        for (size_t i = n_; i < n; i++) d[i] = 0;
+        n_ = (uint32_t)n;
+    }
+    iterator insert(iterator pos, value_type v) {
+        size_t at = (size_t)(pos - data());
+        if (n_ == cap_) grow(cap_ * 2);
+        value_type* d = data();
+        for (size_t i = n_; i > at; i--) d[i] = d[i - 1];
+        d[at] = v;
+        n_++;
+        return d + at;
+    }
+    iterator erase(iterator first, iterator last) {
+        value_type* d = data();
+        size_t a = (size_t)(first - d), b = (size_t)(last - d);
+        if (a >= b) return first;
+        for (size_t i = b; i < n_; i++) d[a + i - b] = d[i];
+        n_ -= (uint32_t)(b - a);
+        return d + a;
+    }
+    void swap(LimbVec& o) noexcept { LimbVec t(std::move(o)); o = std::move(*this); *this = std::move(t); }
+
+private:
+    union U { value_type buf[kInline]; value_type* heap; } u_;
+    uint32_t n_, cap_;
+    void grow(uint32_t want) {
+        if (want < kInline * 2) want = kInline * 2;
+        value_type* nd = static_cast<value_type*>(::operator new(sizeof(value_type) * want));
+        const value_type* od = data();
+        for (uint32_t i = 0; i < n_; i++) nd[i] = od[i];
+        if (cap_ > kInline) ::operator delete(u_.heap);
+        u_.heap = nd;
+        cap_ = want;
+    }
+    void assign_from(const value_type* src, uint32_t n) {
+        if (n > cap_) {
+            value_type* nd = static_cast<value_type*>(::operator new(sizeof(value_type) * n));
+            if (cap_ > kInline) ::operator delete(u_.heap);
+            u_.heap = nd;
+            cap_ = n;
+        }
+        value_type* d = data();
+        for (uint32_t i = 0; i < n; i++) d[i] = src[i];
+        n_ = n;
+    }
+};
+
 class bigint{
 
     //types
     typedef bigint                      __Myt;
     typedef unsigned long long          __Int;
     typedef signed long long            __SInt;
-    typedef std::vector<__Int>          __Data;
+    typedef LimbVec                     __Data;
     template<bool B, typename T1, typename T2>struct __TypeSelect
     {
         typedef T2 type;
@@ -63,10 +176,9 @@ public:
         a?set("1"):set("0");
     }
 
-    virtual ~bigint()
-    {
-        data_.clear();
-    }
+    // Not virtual (round 81): nothing derives from bigint, and the vtable
+    // pointer made every Value 8 bytes larger and every copy slower.
+    ~bigint() = default;
 
     __Myt & operator =(const __Myt & a) = default;
     __Myt && operator =(__Myt && a)
@@ -441,6 +553,32 @@ public:
     int sign()
     {
         return sign_?1:0;
+    }
+
+    // Direct access to the representation (sign + little-endian 64-bit
+    // magnitude limbs), for exact conversions without a decimal round trip.
+    // Zero may be stored as no limbs or as a single 0 limb.
+    bool isNegative() const
+    {
+        if(!sign_) return false;
+        for(auto v : data_) if(v) return true;
+        return false;
+    }
+    const __Data & limbs() const
+    {
+        return data_;
+    }
+    void assignLimbs(bool neg, __Data d)
+    {
+        data_ = std::move(d);
+        sign_ = neg;
+        shrink();
+    }
+    void assignLimbs(bool neg, const std::vector<__Int>& d)
+    {
+        data_ = __Data(d);
+        sign_ = neg;
+        shrink();
     }
 
     //==================================================================
@@ -1270,7 +1408,9 @@ private:
     }
     static __Int abs(const __SInt & a)
     {
-        return (a < 0 ? -a : a);
+        // Negate in the unsigned type: -a overflows for the most negative
+        // value (-2^63), whose magnitude only the unsigned type can hold.
+        return (a < 0 ? __Int(0) - __Int(a) : __Int(a));
     }
     static int plus(__Int & a, const __Int & b)
     {

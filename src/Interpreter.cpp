@@ -8,15 +8,13 @@
 namespace nython {
 namespace interpreter {
 
-    Interpreter::Interpreter(Reporter* reporter, int argc, char** argv, char** environment): Runnable(reporter), input{}, program{}, historyPath{"history"}, flags{argc, argv, environment}, gc{GarbageCollectorConfig{}, this}, running{false} {
+    Interpreter::Interpreter(Reporter* reporter, int argc, char** argv, char** environment): Runnable(reporter), input{}, program{}, historyPath{"history"}, flags{argc, argv, environment}, running{false} {
 
         this->flags.historyPath = historyPath;
 
     }
 
     Interpreter::~Interpreter(){
-        /// garbage collector will automatically remove this reference.
-        this->gc.do_collect();
     }
 
     void Interpreter::usage(){

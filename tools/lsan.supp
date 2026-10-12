@@ -1,0 +1,10 @@
+# LeakSanitizer suppressions for `make asan` runs (LSAN_OPTIONS=suppressions=tools/lsan.supp).
+# Handles the headless SDL3 stub hands out and gui.cpp caches for the life of
+# the process (fonts, cursors, textures): external-library resources, not
+# interpreter heap objects.
+leak:TTF_OpenFont
+leak:SDL_CreateSystemCursor
+leak:SDL_CreateTexture
+leak:SDL_CreateRenderer
+leak:SDL_CreateWindow
+leak:IMG_Load

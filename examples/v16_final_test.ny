@@ -8,10 +8,10 @@ def t(name, actual, expected):
         print "FAIL: " + name + " got=" + str(actual) + " exp=" + str(expected)
 
 print "=== RANGE ==="
-t("range5", str(range(5)), "[0, 1, 2, 3, 4]")
-t("range28", str(range(2, 8)), "[2, 3, 4, 5, 6, 7]")
-t("range_step", str(range(0, 10, 2)), "[0, 2, 4, 6, 8]")
-t("range_neg", str(range(5, 0, -1)), "[5, 4, 3, 2, 1]")
+t("range5", str(list(range(5))), "[0, 1, 2, 3, 4]")
+t("range28", str(list(range(2, 8))), "[2, 3, 4, 5, 6, 7]")
+t("range_step", str(list(range(0, 10, 2))), "[0, 2, 4, 6, 8]")
+t("range_neg", str(list(range(5, 0, -1))), "[5, 4, 3, 2, 1]")
 
 print "=== REVERSE MUL ==="
 t("int_str", 3 * "ab", "ababab")
@@ -25,7 +25,7 @@ t("str_rev", "hello"[::-1], "olleh")
 
 print "=== COMPLEX ==="
 var words = ["hello", "world"]
-t("map_upper", str(map(lambda w: w.upper(), words)), "[HELLO, WORLD]")
+t("map_upper", str(list(map(lambda w: w.upper(), words))), "['HELLO', 'WORLD']")
 t("reduce_join", reduce(lambda a, b: a + " " + b, words), "hello world")
 var data = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 t("pipeline", sum(filter(lambda x: x % 2 == 0, data)), 30)

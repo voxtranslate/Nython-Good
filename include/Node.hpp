@@ -32,13 +32,18 @@ struct Node extends INode, public std::enable_shared_from_this<Node> {
     virtual ~Node(){
     }
 
-    virtual NodeType type(){
+    // final (round 81): no node overrides them, and a call through a Node
+    // pointer is then a field read instead of a virtual call.
+    NodeType type() final {
     	return _type;
     }
 
-	virtual Token token(){
+	Token token() final {
 		return _token;
 	}
+	// The token without copying it (round 81): token() returns a copy, two
+	// strings and all, which the interpreter made on hot paths.
+	const Token& tok() const { return _token; }
 
 	virtual node_ptr get(int index){
     	if(index>=int(statements().size())) exception::IndexOutOfRangeError(location(), utils::format("The index you have provided is out of range: maximun value should be ", size()-1));

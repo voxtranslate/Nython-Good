@@ -10,7 +10,9 @@
 #
 #   :cmd     IDE actions      :run, :build, :open, :find, :goto, :panel
 #   >expr    language         evaluated by the real interpreter
-#   @agent   AI agents        @ask, @explain, @fix, @test, @doc, @agents
+#   @agent   the agent        @ask, @explain, @test, @doc, @review, @fix, @agents
+#                             (lib/aiagent.ny's NyxAgent, run by the IDE:
+#                             ide_agent.ny; answers in the AGENT view)
 #
 # The sigil decides the namespace, so nothing is ambiguous: `:run` is always the
 # IDE, `print(1)` is always the language, `@ask why` is always an agent. A bare
@@ -112,7 +114,7 @@ class CommandLine:
         if len(parts) == 0:
             return CommandResult(false, "empty command")
         var verb = string_lower(parts[0])
-        var alias = self.aliases[verb]
+        var alias = self.aliases.get(verb)
         if alias != none:
             verb = alias
         var arg = ""
@@ -124,7 +126,7 @@ class CommandLine:
             res.add("IDE      :run :build :vm :tokens :ast :disasm :profile")
             res.add("         :open <f> :save :goto <n> :find <t> :panel <name>")
             res.add("         :theme :clear :history :quit")
-            res.add("agents   @agents @ask <q> @explain @fix @test @doc")
+            res.add("agents   @agents @ask <q> @explain <sym> @test <fn> @doc <fn> @review @fix")
             res.add("language type an expression, or > expr")
             return res
         if verb == "history":
@@ -199,12 +201,14 @@ class CommandLine:
 
         var res = CommandResult(true, "")
         if verb == "agents":
-            res.add("available agents:")
-            res.add("  explain   describe what the current file does")
-            res.add("  fix       propose a fix for the first diagnostic")
-            res.add("  test      draft a test for the current file")
-            res.add("  doc       draft documentation for the current file")
-            res.add("  ask       free-form question about the workspace")
+            res.add("the agent answers from this workspace's code (no model, no network):")
+            res.add("  ask <question>     ranked, cited passages of code and documents (BM25)")
+            res.add("  explain <symbol>   what a function or class does: parameters, returns,")
+            res.add("                     raises, calls, callers, complexity, inferred facts")
+            res.add("  test <function>    writes and runs a unittest module for it")
+            res.add("  doc <function>     drafts a docstring (Args, Returns, Raises)")
+            res.add("  review [file]      findings with file:line and a fix suggestion")
+            res.add("  fix [file]         the mechanical fixes as a diff, to apply")
             return res
 
         # Every agent action names itself and carries its argument; the IDE
