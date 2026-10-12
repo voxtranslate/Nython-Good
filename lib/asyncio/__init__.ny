@@ -120,7 +120,16 @@
 import socket
 import os
 import sys
-import subprocess as _subprocess
+
+_subprocess_mod = none
+
+def _sp():
+    # lib/subprocess.ny, loaded when the first child is started
+    global _subprocess_mod
+    if _subprocess_mod is none:
+        import subprocess as sp_mod
+        _subprocess_mod = sp_mod
+    return _subprocess_mod
 
 TimeoutError = TimeoutError
 CancelledError = CancelledError
@@ -4629,9 +4638,10 @@ class _SubprocessTransport(SubprocessTransport):
                          "restore_signals", "pass_fds", "user", "group", "extra_groups", "umask",
                          "startupinfo", "creationflags", "executable"):
                 raise TypeError("subprocess_exec() got an unexpected keyword argument '" + k + "'")
-        var plan = _subprocess._SubprocessPlan(stdin, stdout, stderr, false)
-        var cmd = _subprocess._native_cmd(args, shell)
-        var kw = _subprocess._native_opts(plan, cwd, env)
+        var spm = _sp()
+        var plan = spm._SubprocessPlan(stdin, stdout, stderr, false)
+        var cmd = spm._native_cmd(args, shell)
+        var kw = spm._native_opts(plan, cwd, env)
         if plan.keep_stdin:
             kw["stdin"] = true
         elif plan.input is not none:
@@ -4842,8 +4852,8 @@ class _SubprocessTransport(SubprocessTransport):
                     await sleep(delay)
                     delay = min(delay * 2, 0.05)
                 var r = os_proc_read(pid)
-                var out = _subprocess._as_bytes(r["stdout"])
-                var err = _subprocess._as_bytes(r["stderr"])
+                var out = r["stdout"].encode("utf-8")
+                var err = r["stderr"].encode("utf-8")
                 if len(out) > 0 or len(err) > 0:
                     delay = 0.001
                 self._deliver(1, out)
