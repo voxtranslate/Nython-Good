@@ -1206,8 +1206,9 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   view: `globals()["x"] = 1` binds x; `globals() is globals()`), and so are
   `locals()`/`vars()` at module level, `vars(module)`, `f.__globals__`;
   `sys.modules["__main__"]` binds globals on setattr; `exec(src, globals())`
-  runs in that module; a dict subclass as exec's namespace gets the bindings
-  through its `__setitem__`.
+  runs in that module; a dict subclass as exec's namespace, or any mapping
+  as its locals, gets the bindings through its `__setitem__`. `import
+  builtins` is lib/builtins.ny whatever sits beside the script.
 - Modules have `__spec__`/`__loader__` (made when first read); the import
   statement honours `sys.meta_path` and `sys.path_hooks` (a program's own
   finders only - the default entries stand for the native search).

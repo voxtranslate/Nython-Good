@@ -128,7 +128,13 @@ engines the same way unless said.
   own directory search). A spec is loaded as `_load_unlocked`
   (create_module, the module's attributes, sys.modules, exec_module). With
   no finder or hook of a program's own it returns None at once, and only
-  for a module not loaded yet: TIMING.
+  for a module not loaded yet: importing 22 stdlib modules (json, re,
+  collections, decimal, datetime, enum, dataclasses, typing...) took
+  0.646 s on the interpreter before and 0.650 s after (VM 0.59 s / 0.51-
+  0.55 s), and 40,000 imports of loaded modules 0.028 s / 0.69 s on both
+  binaries (min of 3 interleaved runs against 2eb1221's build). The
+  benchmark suite (`tools/bench/run.py --base`, 2eb1221): VM 1.04x,
+  interpreter 1.04x geomean - no change outside noise.
 - `import builtins` is lib/builtins.ny whatever sits beside the script
   (examples/builtins.ny, a demo, shadowed it - CPython's BuiltinImporter
   comes first).
@@ -164,7 +170,9 @@ engines the same way unless said.
   before. object's own `__init__` is no longer called by an instantiation
   (it did nothing). Interpreter `runConstructor` / `superCall`; VM
   `instantiate` / `check_no_ctor_args` / super's ctor path.
-- Repository code that relied on the leniency: LIBFIX.
+- Repository code that relied on the leniency: none found - every example,
+  test and GUI test (the sweep, both engines) and the IDE (e2e, lint)
+  pass with no change to lib/, the IDE or examples/.
 
 ### The default repr
 - `<__main__.P object at 0x...>` - the class's `__module__` and
@@ -247,7 +255,12 @@ engines the same way unless said.
 - `builtins._` is not set by the display hook (the program's `_` is).
 
 ### Verified
-SWEEP
+- vm_audit99: 116 passed on the interpreter, the VM and python3.11.
+- vm_audit53/72/74/76/79/80/81/82/83 pass on both engines;
+  `tools/ny_classcheck.py` clean; `tools/cbp.py check` 61 units.
+- `python3 tools/sweep.py`: 425 runs, 0 not ok.
+- `tools/ide_e2e.py` 390 passed, 0 failed; `tools/ide_lint.py` 0
+  unresolved; `tools/ide_memprobe.py --check` 0.00 KB per frame/event/key.
 
 ## 0s3. Round 80, part C — a specializing adaptive interpreter for the VM (vm_audit98, `tools/bench/`)
 
