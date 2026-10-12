@@ -153,6 +153,10 @@ compared with python3's.
   top-level `list = []`, abc.ABC's `__slots__ = ()` called the program's list
   (`v5_spec_compliance_test` on the VM). `plain_function_frame` now excludes
   prelude code; vm_audit98 checks it in a subprocess on both engines.
+- Verified after both fixes (all of round 80): the sweep 423 runs, 0 not
+  ok; vm_audit96/97/98 on both engines and python3 (98 also with
+  `NY_QUICKEN=0`); `ide_e2e` 390/390; `ide_lint`, `ny_classcheck`,
+  `cbp.py check` (61 units) clean; `ide_memprobe --check` passes.
 
 ### Not done / found
 - `C.__setattr__ = f` assigned after instances stored attributes is ignored
