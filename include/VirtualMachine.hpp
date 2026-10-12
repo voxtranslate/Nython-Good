@@ -7516,7 +7516,7 @@ private:
         if(method) nf.self_val.emplace(std::move(stack_[head]));
         else if(inst) nf.self_val.emplace(*inst);
         stack_.resize(head);
-        if(call_stack_.size()-1>=kMaxFrames||(!nycoro::current()&&nycoro::native_stack_exhausted())){
+        if(call_stack_.size()-1>=(size_t)nyrt::recursion_limit()||(!nycoro::current()&&nycoro::native_stack_exhausted())){   // the settable limit (round 80, part A)
             call_stack_.pop_back();
             check_depth();   // raises the RecursionError (the frame not pushed yet, as exec_code has it)
             throw_exception(make_exception("RecursionError",{VMVal::make_str("maximum recursion depth exceeded")}));

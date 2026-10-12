@@ -300,8 +300,11 @@ check("overflow, underflow, subnormal, clamped", [str(Context(Emax=9, traps=[]).
                                                  err(lambda: Context(Emax=9).multiply(D("9E+9"), D(10))),
                                                  str(Context(Emax=9, prec=3, clamp=1, traps=[]).create_decimal("1E+9"))],
       ["Infinity", "1E-12", "3.3E-10", "Overflow: [<class 'decimal.Overflow'>]", "1.00E+9"])
+# the limits follow the C size, as CPython's (425000000 on a 32-bit build)
+import sys
+LIM = [999999999999999999, 999999999999999999, -999999999999999999, -1999999999999999997] if sys.maxsize > 2 ** 32 else [425000000, 425000000, -425000000, -849999999]
 check("MAX_PREC and the other limits", [decimal.MAX_PREC, decimal.MAX_EMAX, decimal.MIN_EMIN, decimal.MIN_ETINY, decimal.HAVE_THREADS],
-      [999999999999999999, 999999999999999999, -999999999999999999, -1999999999999999997, True])
+      LIM + [True])
 
 # ── getcontext / setcontext / localcontext ───────────────────────────────────
 setcontext(Context(prec=12))
