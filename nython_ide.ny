@@ -11,7 +11,7 @@
 #  (tests and tools/ construct NythonIDE() and drive it directly).
 # ══════════════════════════════════════════════════════════════════════════════
 
-import "ide_tools.ny"
+import "ide_live.ny"
 import "ide_workshop.ny"
 import "lib/aiagent.ny"
 import "lib/gui_motion.ny"
@@ -23,7 +23,7 @@ def hit(rx, ry, rw, rh, px, py):
     return px >= rx and px < rx + rw and py >= ry and py < ry + rh
 
 
-class NythonIDE(IDETools):
+class NythonIDE(IDELive):
     def __init__(self):
         self.th = IDETheme()
         self.session_id = time_ms() % 100000000
@@ -111,6 +111,7 @@ class NythonIDE(IDETools):
         self.git = GitRepo()
         self.linediff = LineDiff()
         self.dbg = DebugSession()
+        self._live_init()          # ide_live.ny: live debugging, Profile (round 81)
         self.ai = CodeAnalyzer()
         self.toolchain = Toolchain()
         self.cmdline = CommandLine(self.toolchain, self.ai)
@@ -133,8 +134,8 @@ class NythonIDE(IDETools):
                           "Run and Debug (Ctrl+Shift+D)", "Extensions (Ctrl+Shift+X)", "Outline", "AI Assistant"]
         self.view_titles = ["EXPLORER", "SEARCH", "SOURCE CONTROL", "RUN AND DEBUG", "EXTENSIONS", "OUTLINE", "AI ASSISTANT"]
         self.active_view = "explorer"
-        self.panel_keys = ["problems", "output", "debug", "terminal", "buildlog", "todo", "inspector", "workshop"]
-        self.panel_labels = ["PROBLEMS", "OUTPUT", "DEBUG CONSOLE", "TERMINAL", "BUILD LOG", "TODO", "INSPECTOR", "LANGUAGE WORKSHOP"]
+        self.panel_keys = ["problems", "output", "debug", "terminal", "profile", "buildlog", "todo", "inspector", "workshop"]
+        self.panel_labels = ["PROBLEMS", "OUTPUT", "DEBUG CONSOLE", "TERMINAL", "PROFILE", "BUILD LOG", "TODO", "INSPECTOR", "LANGUAGE WORKSHOP"]
         self.active_panel = "problems"
         self.sidebar_open = true
         self.panel_open = true
@@ -781,7 +782,7 @@ class NythonIDE(IDETools):
                 self.tab_scroll_px = strip - self.tabs_total_w
             if self.tab_scroll_px > 0:
                 self.tab_scroll_px = 0
-        elif c == "@panel.body" or c == "@term" or c == "@dbgcon" or c == "@stdin" or c == "@problem" or c == "@problem.file":
+        elif c == "@panel.body" or c == "@term" or c == "@dbgcon" or c == "@stdin" or c == "@problem" or c == "@problem.file" or c == "@prof.row" or c == "@prof.rel" or c == "@prof.sort":
             self.panel_scroll = self.panel_scroll - dy * 3
             if self.panel_scroll < 0:
                 self.panel_scroll = 0
@@ -1384,7 +1385,7 @@ class NythonIDE(IDETools):
                                       ["Run Nython File", "workbench.action.debug.run", ""],
                                       ["Command Palette...", "workbench.action.showCommands", ""]])
             self.ctx_items = self._tools_editor_ctx(self.ctx_items)
-            if self.dbg.active:
+            if self._debugging():
                 # Why? (round 79): asked of the line clicked
                 var wp = self._pos_at(e.x, e.y)
                 self.ctx_items.insert(0, ["-", "", ""])
@@ -1416,6 +1417,8 @@ class NythonIDE(IDETools):
                                           ["Copy Value", "@ctx.copytext", vs[h.arg][1]],
                                           ["Copy as Expression", "@ctx.copytext", vs[h.arg][0]],
                                           ["Add to Watch", "@ctx.watch", vs[h.arg][0]]])
+        elif string_startswith(c, "@live."):
+            self._live_context(h, e)
         elif c == "@term" or c == "@panel.body" or c == "@dbgcon" or c == "@stdin":
             self._open_ctx(e.x, e.y, [["Copy All", "@ctx.copypanel", ""], ["Clear", "workbench.action.terminal.clear", ""]])
 
@@ -2550,6 +2553,10 @@ class NythonIDE(IDETools):
             var v = self.dbg.value_of(word)
             if v != none:
                 info = word + " = " + v
+        elif self.live.active and self.live.state == "paused":
+            var lv = self.live.value_of(word)
+            if lv != none:
+                info = word + " = " + lv
         if info == "":
             var syms = self._outline_syms()
             var i = 0
@@ -2599,7 +2606,7 @@ class NythonIDE(IDETools):
         # frame that painted nothing. While a program, a build or a debug
         # recording runs, output and progress must arrive promptly, so it
         # only naps one frame then.
-        if self.job_running or self.build_running or self.dbg_recording or (self.scm_job != none and self.scm_job.running):
+        if self.job_running or self.build_running or self.dbg_recording or self.live.active or (self.scm_job != none and self.scm_job.running):
             self.win.idle_wait_ms = 16
         else:
             self.win.idle_wait_ms = 250
@@ -2609,6 +2616,7 @@ class NythonIDE(IDETools):
         self._watch_tick(now)
         if self.job_running:
             self._poll_job()
+        self._live_tick()
         if self.term_proc != none and self.term_proc.running:
             self._poll_term()
             self._dirty = true

@@ -60,6 +60,15 @@ class DebugSession:
 
     # ── loading ──────────────────────────────────────────────────────────────
     def load(self, path):
+        var text = read_file(path)
+        if text == none:
+            return false
+        self.load_lines(string_split(text, "\n"))
+        return true
+
+    # The recording's lines (a --trace file's, or the live debug server's
+    # ring buffer - lib/ide_debugserver.ny, round 81) without a file.
+    def load_lines(self, rows):
         self.raw = []
         self.lines = []
         self.depths = []
@@ -77,10 +86,6 @@ class DebugSession:
         self._acts = none
         self._act_parent = []
         self._hit_nos = none
-        var text = read_file(path)
-        if text == none:
-            return false
-        var rows = string_split(text, "\n")
         var i = 0
         while i < len(rows):
             var ln = rows[i]
@@ -101,7 +106,6 @@ class DebugSession:
         self.n = len(self.raw)
         self.pos = -1
         self._cur_pos = -2
-        return true
 
     # {"f":"<file>","l":<n>,"d":<n>,"fn":...} - read the three hot fields
     # without decoding the whole object.

@@ -1176,6 +1176,8 @@ static void print_usage() {
         << "  -t, --tokenize    dump the tokens          -a, --ast      dump the AST\n"
         << "  -d, --disasm      dump the VM bytecode     -p, --profile  per-function timings\n"
         << "      --trace OUT   record each executed statement to OUT (JSON lines)\n"
+        << "      --debug-port N  run the program under the live debug server (lib/ide_debugserver.ny),\n"
+        << "                    listening on 127.0.0.1:N for a client (0: any port, printed)\n"
         << "  --cli, --repl     the interactive prompt (no IDE)\n"
         << "  --ide             NythonIDE\n"
         << "  -V, -v, --version the version          -h, --help     this text\n\n"
@@ -1222,7 +1224,7 @@ int main(int argc, char** argv, char** env) {
         // --trace OUT file, -p file, -t/-a/-d file.
         bool use_vm = false, inspect = false, quiet = false, force_repl = false, profile = false, ide = false;
         for (int k = 0; k < argc; k++) nyrt::orig_argv().push_back(argv[k]);   // sys.orig_argv (round 80)
-        std::string tool, mode, target, trace_out;
+        std::string tool, mode, target, trace_out, debug_port;
         int i = 1;
         auto bad = [&](const std::string& m) { std::cerr << "nython: " << m << "\nTry 'nython -h' for more information.\n"; return 2; };
         for (; i < argc; i++) {
@@ -1244,6 +1246,17 @@ int main(int argc, char** argv, char** env) {
                 else if (a == "--trace") {
                     if (i + 1 >= argc) return bad("--trace needs an output file");
                     trace_out = argv[++i];
+                }
+                // round 81: live debugging - the program runs under
+                // lib/ide_debugserver.ny, which listens on the port
+                else if (a == "--debug-port" || a.rfind("--debug-port=", 0) == 0) {
+                    if (a.size() > 12) debug_port = a.substr(13);
+                    else {
+                        if (i + 1 >= argc) return bad("--debug-port needs a port number");
+                        debug_port = argv[++i];
+                    }
+                    if (debug_port.empty() || debug_port.find_first_not_of("0123456789") != std::string::npos)
+                        return bad("--debug-port needs a port number");
                 }
                 else return bad("unknown option " + a);
                 continue;
@@ -1307,7 +1320,18 @@ int main(int argc, char** argv, char** env) {
 #endif
         // The program and sys.argv (Python's: "-c", the module's path, "-").
         Program prog;
-        if (mode == "file") {
+        if (!debug_port.empty()) {
+            // round 81: `--debug-port N file args` is `-m ide_debugserver
+            // --port N file args` (the server runs the program itself)
+            if (mode != "file") return bad("--debug-port needs a program file");
+            if (!trace_out.empty() || profile || !tool.empty()) return bad("--debug-port runs the program under the debugger only");
+            std::string server;
+            if (!find_module_file("ide_debugserver", server)) { std::cerr << "nython: No module named ide_debugserver\n"; return 1; }
+            prog.path = server;
+            nyrt::set_command_line(server, argc, argv, i);
+            auto& av = nyrt::argv();
+            av.insert(av.begin() + 1, {std::string("--port"), debug_port, target});
+        } else if (mode == "file") {
             prog.path = target;
             nyrt::set_command_line(target, argc, argv, i);
         } else if (mode == "cmd") {

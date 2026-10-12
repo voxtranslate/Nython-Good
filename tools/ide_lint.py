@@ -24,11 +24,11 @@ import re
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CHAIN_FILES = ["ide_core.ny", "ide_ops.ny", "ide_paint.ny", "ide_views.ny", "ide_tools.ny", "nython_ide.ny"]
-CHAIN_CLASSES = ["IDECore", "IDEOps", "IDEPaint", "IDEViews", "IDETools", "NythonIDE"]
+CHAIN_FILES = ["ide_core.ny", "ide_ops.ny", "ide_paint.ny", "ide_views.ny", "ide_tools.ny", "ide_live.ny", "nython_ide.ny"]
+CHAIN_CLASSES = ["IDECore", "IDEOps", "IDEPaint", "IDEViews", "IDETools", "IDELive", "NythonIDE"]
 SOURCE_FILES = CHAIN_FILES + ["ide_editor.ny", "ide_project.ny", "ide_icons.ny", "ide_workshop.ny",
                               "lib/ide_workbench.ny", "lib/ide_scm.ny", "lib/ide_debugger.ny",
-                              "lib/ide_selection.ny", "lib/gui.ny", "lib/gui_motion.ny",
+                              "lib/ide_selection.ny", "lib/gui.ny", "lib/gui_motion.ny", "lib/ide_debugclient.ny", "lib/ide_profile.ny",
                               "lib/ide_toolchain.ny", "lib/ide_commands.ny", "lib/aiagent.ny", "lib/icons.ny"]
 
 # Receiver expression (regex, matched right before ".name") -> class.
@@ -40,6 +40,7 @@ TYPED = [
     (r"self\.icons", "Icons"), (r"self\.win", "Window"), (r"self\.job", "BgProc"), (r"self\.term_proc", "BgProc"),
     (r"self\.cmdline", "CommandLine"), (r"self\.workshop", "LangWorkshopPanel"), (r"self\.ease", "Ease"),
     (r"self\.ai", "CodeAnalyzer"), (r"self\.qi\.fuzzy", "Fuzzy"),
+    (r"self\.live", "LiveDebugClient"), (r"\bL", "LiveDebugClient"), (r"self\.prof", "ProfileData"), (r"\bP", "ProfileData"),
     (r"self\.f_[a-z_]+", "Font"), (r"self\.buf\(\)", "EditorBuffer"), (r"\bb", "EditorBuffer"),
     (r"d\.buf", "EditorBuffer"), (r"self\.doc\(\)", "Doc"),
     (r"\bth", "IDETheme"), (r"self\.th", "IDETheme"), (r"\br", "Renderer"),

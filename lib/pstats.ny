@@ -149,6 +149,8 @@ def _load(filename):
         if not row.strip():
             continue
         e = json.loads(row)
+        if not isinstance(e, list):
+            continue        # cProfile's calling context tree (round 81)
         callers = {}
         for c in e[5]:
             v = c[1]
