@@ -1777,10 +1777,20 @@ public:   // NythonExecutor is a struct: members default to public
     static const MarkerKey& kTupleKey() { static const MarkerKey k("__tuple__"); return k; }
     static const MarkerKey& kSetKey() { static const MarkerKey k("__set__"); return k; }
     static const MarkerKey& kGenKey() { static const MarkerKey k("__gen__"); return k; }
-    static bool hasMarker(Container* c, const MarkerKey& k) { return c->container->index_of_h(k.key, k.hash) >= 0; }
+    // The slot of a marker key, or -1: the last two slots first (a list or
+    // tuple made at once ends with "__len__", then "__tuple__"), then the
+    // lookup - keys are unique, so a slot holding it is its slot (round 81).
+    static long markerSlot(const ContainerType* m, const MarkerKey& k) {
+        const size_t e = m->slot_end();
+        for (size_t back = 1; back <= 2 && back <= e; back++) {
+            const ContainerType::value_type* kv = m->slot_at(e - back);
+            if (kv && kv->first == k.key) return (long)(e - back);
+        }
+        return m->index_of_h(k.key, k.hash);
+    }
+    static bool hasMarker(Container* c, const MarkerKey& k) { return markerSlot(c->container, k) >= 0; }
     static int64_t seqLen(Container* c) {
-        const MarkerKey& k = kLenKey();
-        long s = c->container->index_of_h(k.key, k.hash);
+        long s = markerSlot(c->container, kLenKey());
         if (s < 0) return -1;
         return bigint_to_i64(c->container->slot_at((size_t)s)->second.value.i);
     }
@@ -1984,10 +1994,15 @@ public:   // NythonExecutor is a struct: members default to public
     }
     Value makeListValue(const std::vector<Value>& items, bool tuple = false) {
         auto* obj = new Object((Runnable*)runner, tuple ? "tuple" : "list", Type::LIST);
+        // round 81: the keys are new and distinct, so each is appended
+        // without being looked for first (the same entries, in the same order)
+        ContainerType& m = *obj->container;
+        m.reserve(items.size() + 2);
         int64_t i = 0;
-        for (auto& v : items) (*obj->container)[std::to_string(i++)] = v;
-        (*obj->container)["__len__"] = intValue(i);
-        if (tuple) (*obj->container)["__tuple__"] = Value(1);
+        char buf[24];
+        for (auto& v : items) m.append_new(std::string(decKey(i++, buf)), Value(v));
+        m.append_new(std::string("__len__"), intValue(i));
+        if (tuple) m.append_new(std::string("__tuple__"), Value(1));
         return Value((Collectable*)obj);
     }
     // Raises a Python exception the way the interpreter represents them.
@@ -3443,7 +3458,10 @@ public:   // NythonExecutor is a struct: members default to public
         if (name == "append" || name == "push") {
             if (args.size() != 1) pyRaise("TypeError", "list.append() takes exactly one argument (" + std::to_string(args.size()) + " given)");
             C[std::to_string(n)] = args[0];
-            C["__len__"] = intValue(n + 1);
+            // round 81: "__len__" through its known hash (it is there: n came from it)
+            const MarkerKey& lk = kLenKey();
+            if (long ls = C.index_of_h(lk.key, lk.hash); ls >= 0) C.slot_at_mut((size_t)ls)->second = intValue(n + 1);
+            else C["__len__"] = intValue(n + 1);
             out = NONE_VALUE; return true;
         }
         if (name == "extend") {
@@ -9277,12 +9295,19 @@ public:
             ? static_pointer_cast<TupleNode>(node)->elements
             : static_pointer_cast<ListNode>(node)->elements;
         auto* obj = new Object((Runnable*)runner, is_tuple ? "tuple" : "list", Type::LIST);
+        // round 81: the keys are new and distinct - each appended at once
+        // (Object::set inserted it after looking for it; the same entries in
+        // the same order)
+        ContainerType& m = *obj->container;
+        m.reserve(elements.size() + 2);
         int idx = 0;
+        char buf[24];
         for (auto& el : elements) {
-            obj->set(std::to_string(idx++), evalNode(el, ctx));
+            Value v = evalNode(el, ctx);
+            m.append_new(std::string(decKey(idx++, buf)), std::move(v));
         }
-        obj->set("__len__", Value((int)idx));
-        if (is_tuple) obj->set("__tuple__", Value(1));
+        m.append_new(std::string("__len__"), Value((int)idx));
+        if (is_tuple) m.append_new(std::string("__tuple__"), Value(1));
         return Value((Collectable*)obj);
     }
 
