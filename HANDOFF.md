@@ -153,6 +153,14 @@ compared with python3's.
   top-level `list = []`, abc.ABC's `__slots__ = ()` called the program's list
   (`v5_spec_compliance_test` on the VM). `plain_function_frame` now excludes
   prelude code; vm_audit98 checks it in a subprocess on both engines.
+- Windows 64-bit (under Wine): built, `pe_unwind_check` clean; the sweep 423
+  runs, 421 ok - vm_audit96's `pkgutil.extend_path` check failed on both
+  engines: **a package's `__path__` mixed separators on Windows**
+  (`\\tmp\\pk/relx`: the engines strip `/__init__.ny` from a path they built
+  with `/`) and importlib's PathFinder joined with `/` too, so the two never
+  compared equal. Both now use the native separator, as CPython (the engines'
+  `__path__`, `PathFinder.find_spec`, `_spec_for_path`); vm_audit96 then
+  passes 115/115 under Wine on both engines (the sweep was not run again).
 - Verified after both fixes (all of round 80): the sweep 423 runs, 0 not
   ok; vm_audit96/97/98 on both engines and python3 (98 also with
   `NY_QUICKEN=0`); `ide_e2e` 390/390; `ide_lint`, `ny_classcheck`,

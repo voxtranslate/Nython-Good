@@ -11547,7 +11547,13 @@ public:
                        && (filepath[filepath.size() - 12] == '/' || filepath[filepath.size() - 12] == '\\');
             size_t dot = module_name.rfind('.');
             mctx->defineByName("__package__", makeStringValue(pkg ? module_name : dot == std::string::npos ? std::string() : module_name.substr(0, dot)));
-            if (pkg) mctx->defineByName("__path__", nyos_list_of({filepath.substr(0, filepath.size() - 12)}));
+            if (pkg) {
+                std::string dir = filepath.substr(0, filepath.size() - 12);
+#ifdef _WIN32
+                for (char& ch : dir) if (ch == '/') ch = '\\';   // native separators, as CPython's __path__ (round 80)
+#endif
+                mctx->defineByName("__path__", nyos_list_of({dir}));
+            }
         }
         std::unordered_set<void*> before;
         for (auto& kv : func_names) before.insert(kv.first);

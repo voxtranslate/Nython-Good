@@ -12907,7 +12907,13 @@ private:
                      &&(filepath[filepath.size()-12]=='/'||filepath[filepath.size()-12]=='\\');
             size_t dot=name.rfind('.');
             (*env)["__package__"]=VMVal::make_str(pkg?name:dot==std::string::npos?std::string():name.substr(0,dot));
-            if(pkg) (*env)["__path__"]=VMVal::make_list({VMVal::make_str(filepath.substr(0,filepath.size()-12))});
+            if(pkg){
+                std::string dir=filepath.substr(0,filepath.size()-12);
+#ifdef _WIN32
+                for(char& ch : dir) if(ch=='/') ch='\\';   // native separators, as CPython's __path__ (round 80)
+#endif
+                (*env)["__path__"]=VMVal::make_list({VMVal::make_str(dir)});
+            }
         }
         tag_module_code(code, env);
         code->module_top=true;

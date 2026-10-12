@@ -231,7 +231,8 @@ def _spec_for_path(fullname, path, kind):
     loader = SourceFileLoader(fullname, path)
     spec = ModuleSpec(fullname, loader, origin=path, is_package=(kind == "package"))
     if kind == "package":
-        spec.submodule_search_locations = [path.replace("\\", "/").rpartition("/")[0]]
+        import os
+        spec.submodule_search_locations = [os.path.dirname(path)]   # native separators, as the engines' __path__
     spec.has_location = True
     return spec
 
@@ -250,16 +251,18 @@ class PathFinder:
             if not found[0]:
                 return None
             return _spec_for_path(fullname, found[0], found[1])
+        import os
         tail = fullname.rpartition(".")[2]
+        sep = os.sep   # native separators, as the engines' __path__ (round 80)
         for entry in path:
             if not isinstance(entry, str):
                 continue
             base = entry.rstrip("/\\")
-            for kind, candidate in (("package", base + "/" + tail + "/__init__.ny"),
-                                    ("file", base + "/" + tail + ".ny")):
+            for kind, candidate in (("package", base + sep + tail + sep + "__init__.ny"),
+                                    ("file", base + sep + tail + ".ny")):
                 if _ny_path_isfile(candidate):
                     return _spec_for_path(fullname, candidate, kind)
-            d = base + "/" + tail
+            d = base + sep + tail
             if _ny_path_isdir(d):
                 return _spec_for_path(fullname, d, "namespace")
         return None

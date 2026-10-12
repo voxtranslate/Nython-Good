@@ -5702,4 +5702,5 @@ Full detail in `HANDOFF.md` §0s3. New test: `vm_audit98` (72 checks; passes und
 | Merging parts A and C: the fast call path used the removed `kMaxFrames` | part A made the limit settable (`sys.setrecursionlimit`) | the fast path uses `nyrt::recursion_limit()` |
 | vm_audit95 failed on 32-bit Windows | it expected the 64-bit decimal limits | the check follows `sys.maxsize` (425000000 on 32-bit, as CPython) |
 | Merging parts A and C: with a program's `list = []`, abc.ABC's `__slots__ = ()` called the program's list on the VM | the LOAD_NAME_MOD/GLOBAL caches read the program's frame for prelude code, which part A made invisible to it | prelude code is not specialized onto the program's frame (`plain_function_frame`) |
+| Windows: `pkgutil.extend_path([], pkg) != pkg.__path__` | a package's `__path__` mixed separators (`\\tmp\\pk/relx`) and importlib's PathFinder joined with `/` | the native separator in both, as CPython |
 
