@@ -21,6 +21,7 @@
 //   fs_todos(root, tags=[...], max=5000)              [[relpath, row, col, tag, text, owner], ...]
 //   text_format_nython(source, indent_unit, opts)     conservative formatter (see below)
 //   text_defuse(source)                               per line: reads, writes, controlling predicates (round 79)
+//   ny_facts(source)                                  per function: parameters, calls, returns, raises, ... (round 82)
 //
 // Lists arrive either as a Nython list of strings or as one string (split on
 // newlines). All rows/columns are 0-based; columns count characters.
@@ -28,6 +29,8 @@
 #include "platform_compat.hpp"
 
 #include <algorithm>
+#include <array>
+#include <tuple>
 #include <cstring>
 #include <fstream>
 #include <map>
@@ -868,7 +871,17 @@ struct DefUseWalker {
             case NodeType::IMPORT: {
                 auto im = std::static_pointer_cast<ImportNode>(s);
                 DefUse& d = mark("import");
-                if (!im->names.empty()) for (auto& n : im->names) { std::string nm = n; size_t sp = nm.find(" as "); if (sp != std::string::npos) nm = nm.substr(sp + 4); add(d.writes, nm); }
+                // `from m import a as b` binds b: the parser joins the name
+                // and its alias with \x05 (round 82: such an import wrote
+                // nothing here)
+                if (!im->names.empty()) for (auto& n : im->names) {
+                    std::string nm = n;
+                    size_t x5 = nm.find('\x05');
+                    size_t sp = nm.find(" as ");
+                    if (x5 != std::string::npos) nm = nm.substr(x5 + 1);
+                    else if (sp != std::string::npos) nm = nm.substr(sp + 4);
+                    add(d.writes, nm);
+                }
                 else if (!im->alias.empty()) add(d.writes, im->alias);
                 else { std::string m = im->module_name; size_t dot = m.find('.'); add(d.writes, dot == std::string::npos ? m : m.substr(0, dot)); }
                 return;
@@ -951,6 +964,902 @@ Value text_defuse(NythonExecutor& E, std::vector<Value>& args) {
         out.add(mv);
     }
     return out.done();
+}
+
+// ── ny_facts (round 82) ──────────────────────────────────────────────────────
+// What a program-understanding tool needs about each function, from the real
+// parser's AST (lib/nyxai/facts.ny builds the agent's program model on it:
+// explanations, the call and import graphs, docstrings, generated tests and
+// the review rules).
+//
+//   ny_facts(source) -> {
+//     "error": none or [line, message] when the source does not parse,
+//     "doc": the module docstring or none,
+//     "functions": [{ "name", "qualname", "class" (enclosing class or ""),
+//         "parent" (enclosing def's qualname or ""), "line" (the def), "first"
+//         (its first decorator's line), "end", "decorators": [source text],
+//         "is_async", "is_generator", "doc", "doc_line",
+//         "params": [{"name", "kind" (inspect's: positional_only,
+//             positional_or_keyword, var_positional, keyword_only,
+//             var_keyword), "default" (source text or none), "default_kind"
+//             ("literal", "list", "dict", "set", "call:<callee>", "name",
+//             "expr"; none without one), "annotation" (source text or none)}],
+//         "return_annotation", "returns": [[line, has_value, text]],
+//         "raises": [[line, exception, text]] (exception "" for a bare raise),
+//         "calls": [[line, callee text]], "reads", "writes", "globals",
+//         "nonlocals", "excepts": [[line, [types]]] ([] for a bare except),
+//         "complexity" (McCabe's v(G): 1 + if/elif/ternary/for/while/except/
+//             case/assert/boolean operators/comprehension clauses),
+//         "end_reachable" (control can fall off the end: an implicit None)}],
+//     "classes": [{"name", "qualname", "line", "end", "bases": [text], "doc",
+//                  "methods": [names], "decorators"}],
+//     "imports": [{"line", "module", "names": [...], "alias", "quoted"}],
+//     "module": the same facts as a function's for the top-level code,
+//     "unreachable": [[line, end, after_line, after_kind]] - statements after
+//         a return/raise/break/continue (or an if/try whose every branch
+//         ends so) in the same block,
+//     "bare_excepts": [line], "none_compares": [[line, op]] (== / != None)}
+// Lines are 1-based. A function's or class's end includes the comment lines
+// inside it (its block ends where the indentation returns to the def's).
+struct FParam { std::string name, kind, def, def_kind, ann; bool has_def = false, has_ann = false; };
+struct FFunc {
+    std::string name, qual, cls, parent, doc, ret_ann;
+    int line = 0, first = 0, end = 0, doc_line = 0, complexity = 1;
+    bool is_async = false, is_gen = false, has_doc = false, has_ret_ann = false, end_reachable = true;
+    std::vector<FParam> params;
+    std::vector<std::string> decorators;
+    std::vector<std::tuple<int, bool, std::string>> returns;
+    std::vector<std::tuple<int, std::string, std::string>> raises;
+    std::vector<std::pair<int, std::string>> calls;
+    std::vector<std::pair<int, std::vector<std::string>>> excepts;
+    std::set<std::string> reads, writes, globals, nonlocals;
+    std::vector<std::string> write_order;
+};
+struct FClass {
+    std::string name, qual, doc;
+    int line = 0, end = 0;
+    bool has_doc = false;
+    std::vector<std::string> bases, methods, decorators;
+};
+struct FImport { int line = 0; std::string module, alias; std::vector<std::string> names; bool quoted = false; };
+
+std::string py_repr_str(const std::string& s) {
+    bool sq = s.find('\'') != std::string::npos, dq = s.find('"') != std::string::npos;
+    char q = (sq && !dq) ? '"' : '\'';
+    std::string o(1, q);
+    for (unsigned char c : s) {
+        if (c == '\\') o += "\\\\";
+        else if (c == (unsigned char)q) { o += '\\'; o += (char)c; }
+        else if (c == '\n') o += "\\n";
+        else if (c == '\t') o += "\\t";
+        else if (c == '\r') o += "\\r";
+        else if (c < 0x20 || c == 0x7f) { char b[8]; snprintf(b, sizeof b, "\\x%02x", c); o += b; }
+        else o += (char)c;
+    }
+    o += q;
+    return o;
+}
+
+// Source text of an expression, from the AST (what a default, a decorator,
+// a callee or a returned value says); "..." for what it does not render.
+std::string unparse(const node_ptr& n, int depth = 0) {
+    if (!n) return std::string();
+    if (depth > 24) return "...";
+    auto U = [&](const node_ptr& c) { return unparse(c, depth + 1); };
+    auto join = [&](const std::vector<node_ptr>& v) {
+        std::string o;
+        for (size_t i = 0; i < v.size(); i++) { if (i) o += ", "; o += U(v[i]); }
+        return o;
+    };
+    switch (n->type()) {
+        case NodeType::INTEGER: case NodeType::FLOAT: return n->token().value;
+        case NodeType::STRING: return py_repr_str(n->token().value);
+        case NodeType::BYTES: return "b" + py_repr_str(n->token().value);
+        case NodeType::TRUE: return "True";
+        case NodeType::FALSE: return "False";
+        case NodeType::NONE: return "None";
+        case NodeType::UNDEFINED: return "undefined";
+        case NodeType::VARIABLE: return n->value();
+        case NodeType::SELF: return "self";
+        case NodeType::SUPER: return "super";
+        case NodeType::ATTRIBUTE: { auto a = std::static_pointer_cast<AttributeNode>(n); return U(a->object) + "." + a->attr; }
+        case NodeType::SUBSCRIPT: { auto s = std::static_pointer_cast<SubscriptNode>(n); return U(s->object) + "[" + U(s->index) + "]"; }
+        case NodeType::SLICE: { auto s = std::static_pointer_cast<SliceNode>(n); std::string o = U(s->start) + ":" + U(s->end_node); if (s->step) o += ":" + U(s->step); return o; }
+        case NodeType::CALL: { auto c = std::static_pointer_cast<CallNode>(n); return U(c->callee) + "(" + join(c->args) + ")"; }
+        case NodeType::KEYWORD_ARG: { auto k = std::static_pointer_cast<KeywordArgNode>(n); return k->name + "=" + U(k->val); }
+        case NodeType::UNARY: {
+            auto u = std::static_pointer_cast<UnaryNode>(n);
+            if (u->op == "not" || u->op == "!") return "not " + U(u->operand);
+            return u->op + U(u->operand);
+        }
+        case NodeType::BINARY: { auto b = std::static_pointer_cast<BinaryNode>(n); return U(b->left) + " " + b->op + " " + U(b->right); }
+        case NodeType::LIST: case NodeType::ARRAY: return "[" + join(n->statements()) + "]";
+        case NodeType::TUPLE: { auto e = n->statements(); return "(" + join(e) + (e.size() == 1 ? ",)" : ")"); }
+        case NodeType::MAP: {
+            std::string o = "{";
+            auto es = n->statements();
+            for (size_t i = 0; i < es.size(); i++) {
+                if (i) o += ", ";
+                if (es[i] && es[i]->type() == NodeType::MAP_ENTRY) { auto e = std::static_pointer_cast<MapEntryNode>(es[i]); o += U(e->key) + ": " + U(e->val); }
+                else o += U(es[i]);
+            }
+            return o + "}";
+        }
+        case NodeType::LAMBDA: return "lambda";
+        case NodeType::IF: {
+            auto i = std::static_pointer_cast<IfNode>(n);
+            if (i->is_expr) return U(i->then_branch) + " if " + U(i->condition) + " else " + U(i->else_branch);
+            return "...";
+        }
+        case NodeType::COMPREHENSION: {
+            auto c = std::static_pointer_cast<ComprehensionNode>(n);
+            std::string o = U(c->elt);
+            if (c->kind == ComprehensionNode::DICT) o += ": " + U(c->value);
+            for (auto& cl : c->clauses) {
+                o += " for " + U(cl.target) + " in " + U(cl.iter);
+                for (auto& cd : cl.conds) o += " if " + U(cd);
+            }
+            if (c->kind == ComprehensionNode::LIST) return "[" + o + "]";
+            if (c->kind == ComprehensionNode::GEN) return "(" + o + ")";
+            return "{" + o + "}";
+        }
+        default: return "...";
+    }
+}
+
+std::string default_kind(const node_ptr& n) {
+    if (!n) return std::string();
+    switch (n->type()) {
+        case NodeType::INTEGER: case NodeType::FLOAT: case NodeType::STRING: case NodeType::BYTES:
+        case NodeType::TRUE: case NodeType::FALSE: case NodeType::NONE: case NodeType::TUPLE: case NodeType::UNARY:
+            return "literal";
+        case NodeType::LIST: case NodeType::ARRAY: return "list";
+        case NodeType::MAP: return "dict";
+        case NodeType::COMPREHENSION: {
+            int k = std::static_pointer_cast<ComprehensionNode>(n)->kind;
+            return k == ComprehensionNode::DICT ? "dict" : k == ComprehensionNode::SET ? "set" : k == ComprehensionNode::LIST ? "list" : "expr";
+        }
+        case NodeType::CALL: return "call:" + unparse(std::static_pointer_cast<CallNode>(n)->callee);
+        case NodeType::VARIABLE: case NodeType::ATTRIBUTE: return "name";
+        default: return "expr";
+    }
+}
+
+struct FactsWalker {
+    std::vector<FFunc> funcs;
+    std::vector<FClass> classes;
+    std::vector<FImport> imports;
+    FFunc module;
+    std::vector<std::array<int, 3>> unreachable;
+    std::vector<std::string> unreachable_kind;
+    std::vector<int> bare_excepts;
+    std::vector<std::pair<int, std::string>> none_cmps;
+    const std::vector<std::string>* src = nullptr;
+    std::vector<int> fstack;            // open functions (indices into funcs)
+    std::vector<std::string> cstack;    // enclosing classes
+    std::vector<int> class_open;        // open classes (indices into classes)
+    std::vector<size_t> class_fdepths;  // len(fstack) when each class opened
+
+    FFunc& cur() { return fstack.empty() ? module : funcs[fstack.back()]; }
+
+    void touch(int line) {
+        for (int fi : fstack) if (line > funcs[fi].end) funcs[fi].end = line;
+        for (int ci : class_open) if (line > classes[ci].end) classes[ci].end = line;
+    }
+    // Where the block a statement on `line` opens ends: the last non-blank
+    // line before the indentation returns to the statement's own.
+    int indent_end(int line) {
+        if (!src || line < 1 || line > (int)src->size()) return line;
+        size_t ind = indent_width((*src)[line - 1], 4);
+        int last = line;
+        for (int l = line + 1; l <= (int)src->size(); l++) {
+            const std::string& s = (*src)[l - 1];
+            if (is_blank(s)) continue;
+            if (indent_width(s, 4) <= ind) break;
+            last = l;
+        }
+        return last;
+    }
+    void read(const std::string& n, std::set<std::string>* bound) {
+        if (defuse_temp(n)) return;
+        if (bound && bound->count(n)) return;
+        cur().reads.insert(n);
+    }
+    void write(const std::string& n) {
+        if (defuse_temp(n)) return;
+        // directly in a class body: a class attribute, not a variable of
+        // the enclosing scope
+        if (!class_fdepths.empty() && fstack.size() == class_fdepths.back()) return;
+        FFunc& f = cur();
+        if (f.writes.insert(n).second) f.write_order.push_back(n);
+    }
+    void targets(const node_ptr& t, std::set<std::string>* bound) {
+        if (!t) return;
+        switch (t->type()) {
+            case NodeType::VARIABLE: write(t->value()); return;
+            case NodeType::TUPLE: case NodeType::LIST: for (auto& e : t->statements()) targets(e, bound); return;
+            case NodeType::UNARY: targets(std::static_pointer_cast<UnaryNode>(t)->operand, bound); return;
+            case NodeType::ATTRIBUTE: expr(std::static_pointer_cast<AttributeNode>(t)->object, bound); return;
+            case NodeType::SUBSCRIPT: { auto s = std::static_pointer_cast<SubscriptNode>(t); expr(s->object, bound); expr(s->index, bound); return; }
+            default: expr(t, bound); return;
+        }
+    }
+    void expr(const node_ptr& n, std::set<std::string>* bound, int depth = 0) {
+        if (!n || depth > 300) return;
+        touch(n->line());
+        auto R = [&](const node_ptr& c) { expr(c, bound, depth + 1); };
+        switch (n->type()) {
+            case NodeType::VARIABLE: read(n->value(), bound); return;
+            case NodeType::SELF: read("self", bound); return;
+            case NodeType::STRING: {
+                const std::string& raw = n->token().value;
+                size_t p = 0;
+                while ((p = raw.find("${", p)) != std::string::npos) {
+                    size_t e = raw.find('}', p + 2);
+                    if (e == std::string::npos) break;
+                    read(raw.substr(p + 2, e - p - 2), bound);
+                    p = e + 1;
+                }
+                return;
+            }
+            case NodeType::ATTRIBUTE: R(std::static_pointer_cast<AttributeNode>(n)->object); return;
+            case NodeType::SUBSCRIPT: { auto s = std::static_pointer_cast<SubscriptNode>(n); R(s->object); R(s->index); return; }
+            case NodeType::UNARY: R(std::static_pointer_cast<UnaryNode>(n)->operand); return;
+            case NodeType::BINARY: {
+                auto b = std::static_pointer_cast<BinaryNode>(n);
+                if (b->op == "and" || b->op == "or" || b->op == "&&" || b->op == "||") cur().complexity++;
+                if ((b->op == "==" || b->op == "!=") && ((b->left && b->left->type() == NodeType::NONE) || (b->right && b->right->type() == NodeType::NONE)))
+                    none_cmps.push_back({n->line(), b->op});
+                R(b->left); R(b->right);
+                return;
+            }
+            case NodeType::CALL: {
+                auto c = std::static_pointer_cast<CallNode>(n);
+                std::string callee = unparse(c->callee);
+                if (!callee.empty() && callee.rfind("__dec", 0) != 0 && callee.rfind("_ny", 0) != 0) cur().calls.push_back({n->line(), callee});
+                R(c->callee);
+                for (auto& a : c->args) R(a);
+                return;
+            }
+            case NodeType::KEYWORD_ARG: R(std::static_pointer_cast<KeywordArgNode>(n)->val); return;
+            case NodeType::MAP_ENTRY: { auto e = std::static_pointer_cast<MapEntryNode>(n); R(e->key); R(e->val); return; }
+            case NodeType::SLICE: { auto s = std::static_pointer_cast<SliceNode>(n); R(s->start); R(s->end_node); R(s->step); return; }
+            case NodeType::RANGE: { auto s = std::static_pointer_cast<RangeNode>(n); R(s->start); R(s->end_node); R(s->step); return; }
+            case NodeType::WALRUS: { auto w = std::static_pointer_cast<WalrusNode>(n); R(w->init); write(w->name); return; }
+            case NodeType::IF: {
+                auto i = std::static_pointer_cast<IfNode>(n);
+                if (i->is_expr) cur().complexity++;
+                R(i->condition); R(i->then_branch); R(i->else_branch);
+                for (auto& e : i->elseif_branches) R(e);
+                return;
+            }
+            case NodeType::YIELD: cur().is_gen = true; R(std::static_pointer_cast<YieldNode>(n)->expr); return;
+            case NodeType::YIELD_FROM: cur().is_gen = true; R(std::static_pointer_cast<YieldFromNode>(n)->expr); return;
+            case NodeType::LAMBDA: {
+                auto l = std::static_pointer_cast<LambdaNode>(n);
+                for (auto& dv : l->defaults) R(dv);
+                std::set<std::string> b2 = bound ? *bound : std::set<std::string>();
+                for (auto& p : l->params) { std::string pn = p->value(); while (!pn.empty() && pn[0] == '*') pn.erase(0, 1); b2.insert(pn); }
+                expr(l->body, &b2, depth + 1);
+                return;
+            }
+            case NodeType::COMPREHENSION: {
+                auto c = std::static_pointer_cast<ComprehensionNode>(n);
+                std::set<std::string> b2 = bound ? *bound : std::set<std::string>();
+                for (auto& cl : c->clauses) {
+                    cur().complexity++;
+                    expr(cl.iter, &b2, depth + 1);
+                    std::vector<std::string> ts;
+                    DefUseWalker::target_names(cl.target, ts);
+                    for (auto& t : ts) b2.insert(t);
+                    for (auto& cd : cl.conds) { cur().complexity++; expr(cd, &b2, depth + 1); }
+                }
+                expr(c->elt, &b2, depth + 1);
+                expr(c->value, &b2, depth + 1);
+                return;
+            }
+            case NodeType::OPT_CHAIN: {
+                auto o = std::static_pointer_cast<OptChainNode>(n);
+                R(o->recv); R(o->index); R(o->call); R(o->rest);
+                return;
+            }
+            case NodeType::FUNCTION: case NodeType::CLASS: stmt(n); return;
+            default: break;
+        }
+        for (auto& c : n->statements()) R(c);
+    }
+
+    // A string token carries the line it ends on: a triple-quoted
+    // docstring starts as many lines earlier as it holds newlines.
+    static int string_first_line(const node_ptr& n) {
+        int nl = 0;
+        for (char ch : n->token().value) if (ch == '\n') nl++;
+        return std::max(1, n->line() - nl);
+    }
+    static bool is_dec_block(const node_ptr& n) {
+        if (!n || n->type() != NodeType::BLOCK) return false;
+        auto ss = n->statements();
+        if (ss.size() != 3 || !ss[0] || ss[0]->type() != NodeType::ASSIGNMENT) return false;
+        auto a = std::static_pointer_cast<AssignmentNode>(ss[0]);
+        return a->target && a->target->type() == NodeType::VARIABLE && a->target->value().rfind("__dec", 0) == 0;
+    }
+    // a `break` that leaves the loop this body belongs to
+    static bool has_break(const node_ptr& n, int depth = 0) {
+        if (!n || depth > 200) return false;
+        switch (n->type()) {
+            case NodeType::BREAK: return true;
+            case NodeType::WHILE: case NodeType::FOR: case NodeType::FUNCTION: case NodeType::CLASS: case NodeType::LAMBDA: return false;
+            case NodeType::IF: {
+                auto i = std::static_pointer_cast<IfNode>(n);
+                if (has_break(i->then_branch, depth + 1) || has_break(i->else_branch, depth + 1)) return true;
+                for (auto& e : i->elseif_branches) if (has_break(std::static_pointer_cast<IfNode>(e)->then_branch, depth + 1)) return true;
+                return false;
+            }
+            case NodeType::TRY: {
+                auto t = std::static_pointer_cast<TryNode>(n);
+                if (has_break(t->body, depth + 1) || has_break(t->else_clause, depth + 1) || has_break(t->finally_clause, depth + 1)) return true;
+                for (auto& ec : t->except_clauses) if (has_break(std::static_pointer_cast<ExceptNode>(ec)->body, depth + 1)) return true;
+                return false;
+            }
+            case NodeType::WITH: return has_break(std::static_pointer_cast<WithNode>(n)->body, depth + 1);
+            case NodeType::SWITCH: {
+                auto sw = std::static_pointer_cast<SwitchNode>(n);
+                for (auto& c : sw->cases) if (has_break(std::static_pointer_cast<CaseNode>(c)->body, depth + 1)) return true;
+                auto dn = std::dynamic_pointer_cast<DefaultNode>(sw->default_case);
+                return has_break(dn ? dn->body : sw->default_case, depth + 1);
+            }
+            case NodeType::BLOCK: case NodeType::STATEMENTS: case NodeType::SCRIPT:
+                for (auto& s : n->statements()) if (has_break(s, depth + 1)) return true;
+                return false;
+            default: return false;
+        }
+    }
+    // Control never passes the end of this statement (or block).
+    static bool terminates(const node_ptr& n, int depth = 0) {
+        if (!n || depth > 200) return false;
+        switch (n->type()) {
+            case NodeType::RETURN: case NodeType::RAISE: case NodeType::BREAK: case NodeType::CONTINUE: return true;
+            case NodeType::IF: {
+                auto i = std::static_pointer_cast<IfNode>(n);
+                if (i->is_expr || !i->else_branch) return false;
+                if (!terminates(i->then_branch, depth + 1) || !terminates(i->else_branch, depth + 1)) return false;
+                for (auto& e : i->elseif_branches) if (!terminates(std::static_pointer_cast<IfNode>(e)->then_branch, depth + 1)) return false;
+                return true;
+            }
+            case NodeType::TRY: {
+                auto t = std::static_pointer_cast<TryNode>(n);
+                if (terminates(t->finally_clause, depth + 1)) return true;
+                if (!(terminates(t->body, depth + 1) || terminates(t->else_clause, depth + 1))) return false;
+                for (auto& ec : t->except_clauses) if (!terminates(std::static_pointer_cast<ExceptNode>(ec)->body, depth + 1)) return false;
+                return true;
+            }
+            case NodeType::WHILE: {
+                auto w = std::static_pointer_cast<WhileNode>(n);
+                bool forever = w->condition && (w->condition->type() == NodeType::TRUE
+                    || (w->condition->type() == NodeType::INTEGER && w->condition->token().value != "0"));
+                return forever && !has_break(w->body);
+            }
+            case NodeType::WITH: return terminates(std::static_pointer_cast<WithNode>(n)->body, depth + 1);
+            case NodeType::SWITCH: {
+                auto sw = std::static_pointer_cast<SwitchNode>(n);
+                if (!sw->default_case) return false;
+                for (auto& c : sw->cases) if (!terminates(std::static_pointer_cast<CaseNode>(c)->body, depth + 1)) return false;
+                auto dn = std::dynamic_pointer_cast<DefaultNode>(sw->default_case);
+                return terminates(dn ? dn->body : sw->default_case, depth + 1);
+            }
+            case NodeType::BLOCK: case NodeType::STATEMENTS: case NodeType::SCRIPT:
+                if (is_dec_block(n)) return false;
+                for (auto& s : n->statements()) if (terminates(s, depth + 1)) return true;
+                return false;
+            default: return false;
+        }
+    }
+    static const char* kind_of(const node_ptr& n) {
+        switch (n->type()) {
+            case NodeType::RETURN: return "return";
+            case NodeType::RAISE: return "raise";
+            case NodeType::BREAK: return "break";
+            case NodeType::CONTINUE: return "continue";
+            case NodeType::IF: return "if";
+            case NodeType::TRY: return "try";
+            case NodeType::WHILE: return "while";
+            default: return "block";
+        }
+    }
+    static int first_line(const node_ptr& n) {
+        if (!n) return 0;
+        if (is_dec_block(n)) return n->statements()[0]->line();
+        if (n->type() == NodeType::BLOCK || n->type() == NodeType::STATEMENTS) {
+            auto ss = n->statements();
+            return ss.empty() ? n->line() : first_line(ss[0]);
+        }
+        return n->line();
+    }
+
+    void block(const node_ptr& b, bool doc_ok = false) {
+        if (!b) return;
+        NodeType t = b->type();
+        if ((t == NodeType::BLOCK || t == NodeType::STATEMENTS || t == NodeType::SCRIPT) && !is_dec_block(b)) {
+            auto ss = b->statements();
+            for (size_t i = 0; i < ss.size(); i++) {
+                const node_ptr& s = ss[i];
+                if (!s) continue;
+                if (i == 0 && doc_ok && s->type() == NodeType::STRING) { touch(s->line()); continue; }
+                stmt(s);
+                if (i + 1 < ss.size() && terminates(s)) {
+                    int ul = first_line(ss[i + 1]);
+                    int ue = 0;
+                    for (size_t j = i + 1; j < ss.size(); j++) {
+                        int fl = first_line(ss[j]);
+                        ue = std::max(ue, std::max(fl, indent_end(fl)));
+                    }
+                    unreachable.push_back({ul, ue, s->line()});
+                    unreachable_kind.push_back(kind_of(s));
+                    for (size_t j = i + 1; j < ss.size(); j++) stmt(ss[j]);
+                    break;
+                }
+            }
+            return;
+        }
+        stmt(b);
+    }
+
+    void def(const node_ptr& s, const std::vector<std::string>& decos, int first) {
+        auto f = std::static_pointer_cast<FunctionNode>(s);
+        write(f->name);
+        FFunc F;
+        F.name = f->name;
+        F.qual = f->qualname.empty() ? f->name : f->qualname;
+        size_t base = class_fdepths.empty() ? (size_t)-1 : class_fdepths.back();
+        F.cls = (!cstack.empty() && fstack.size() == base) ? cstack.back() : std::string();
+        F.parent = fstack.empty() ? std::string() : funcs[fstack.back()].qual;
+        F.line = s->line();
+        F.first = first ? first : (f->first_line ? f->first_line : s->line());
+        F.end = s->line();
+        F.decorators = decos;
+        F.is_async = f->is_async || f->is_async_gen;
+        F.is_gen = f->is_async_gen;
+        F.has_doc = f->has_doc;
+        F.doc = f->doc;
+        // parameters: names, kinds, defaults and annotations
+        std::map<std::string, std::string> anns;
+        if (f->annotations && f->annotations->type() == NodeType::MAP) {
+            for (auto& e : f->annotations->statements()) {
+                if (!e || e->type() != NodeType::MAP_ENTRY) continue;
+                auto me = std::static_pointer_cast<MapEntryNode>(e);
+                if (!me->key || me->key->type() != NodeType::STRING || !me->val) continue;
+                std::string text;
+                if (me->val->type() == NodeType::STRING) text = me->val->token().value;
+                else if (me->val->type() == NodeType::CALL) {
+                    auto c = std::static_pointer_cast<CallNode>(me->val);
+                    if (c->args.size() >= 2 && c->args[1] && c->args[1]->type() == NodeType::STRING) text = c->args[1]->token().value;
+                    else text = unparse(me->val);
+                } else text = unparse(me->val);
+                anns[me->key->token().value] = text;
+            }
+        }
+        bool kwonly = false;
+        for (size_t i = 0; i < f->params.size(); i++) {
+            std::string pn = f->params[i]->value();
+            if (pn == "*") { kwonly = true; continue; }
+            FParam P;
+            if (pn.rfind("**", 0) == 0) { P.name = pn.substr(2); P.kind = "var_keyword"; }
+            else if (pn.rfind("*", 0) == 0) { P.name = pn.substr(1); P.kind = "var_positional"; kwonly = true; }
+            else { P.name = pn; P.kind = i < f->posonly ? "positional_only" : kwonly ? "keyword_only" : "positional_or_keyword"; }
+            node_ptr dv = i < f->defaults.size() ? f->defaults[i] : nullptr;
+            if (dv) { P.has_def = true; P.def = unparse(dv); P.def_kind = default_kind(dv); }
+            auto ai = anns.find(P.name);
+            if (ai != anns.end()) { P.has_ann = true; P.ann = ai->second; }
+            F.params.push_back(P);
+        }
+        auto ri = anns.find("return");
+        if (ri != anns.end()) { F.has_ret_ann = true; F.ret_ann = ri->second; }
+        // defaults are evaluated in the enclosing scope
+        for (auto& dv : f->defaults) expr(dv, nullptr);
+        funcs.push_back(F);
+        int fi = (int)funcs.size() - 1;
+        fstack.push_back(fi);
+        for (auto& P : funcs[fi].params) write(P.name);
+        if (f->body) {
+            auto ss = f->body->statements();
+            if (!ss.empty() && ss[0] && ss[0]->type() == NodeType::STRING) funcs[fi].doc_line = string_first_line(ss[0]);
+        }
+        block(f->body, true);
+        funcs[fi].end_reachable = !terminates(f->body);
+        int ie = indent_end(funcs[fi].line);
+        if (ie > funcs[fi].end) funcs[fi].end = ie;
+        int end = funcs[fi].end;
+        fstack.pop_back();
+        touch(end);
+    }
+
+    void klass(const node_ptr& s, const std::vector<std::string>& decos) {
+        auto c = std::static_pointer_cast<ClassNode>(s);
+        std::string bound = c->bind_name.empty() ? c->name : c->bind_name;
+        write(bound);
+        FClass C;
+        C.name = bound;
+        C.qual = c->qualname.empty() ? bound : c->qualname;
+        C.line = s->line();
+        C.end = s->line();
+        C.doc = c->doc;
+        C.has_doc = c->has_doc;
+        C.decorators = decos;
+        for (auto& b : c->bases) { C.bases.push_back(unparse(b)); expr(b, nullptr); }
+        classes.push_back(C);
+        int ci = (int)classes.size() - 1;
+        class_open.push_back(ci);
+        cstack.push_back(bound);
+        class_fdepths.push_back(fstack.size());
+        // the class body: its methods; its other statements count as the
+        // enclosing scope's (rarely more than assignments)
+        if (c->body) {
+            auto ss = c->body->statements();
+            for (size_t i = 0; i < ss.size(); i++) {
+                node_ptr x = ss[i];
+                if (!x) continue;
+                if (i == 0 && x->type() == NodeType::STRING) { touch(x->line()); continue; }
+                node_ptr inner = x;
+                while (is_dec_block(inner)) inner = inner->statements()[1];
+                if (inner && inner->type() == NodeType::FUNCTION) classes[ci].methods.push_back(std::static_pointer_cast<FunctionNode>(inner)->name);
+                stmt(x);
+            }
+        }
+        class_fdepths.pop_back();
+        cstack.pop_back();
+        class_open.pop_back();
+        int ie = indent_end(classes[ci].line);
+        if (ie > classes[ci].end) classes[ci].end = ie;
+        touch(classes[ci].end);
+    }
+
+    // @d1 @d2 def f: the parser's [__decN__ = d, def, f = __decN__(f)] blocks
+    void decorated(const node_ptr& b) {
+        std::vector<std::string> decos;
+        int first = b->line();
+        node_ptr x = b;
+        while (is_dec_block(x)) {
+            auto ss = x->statements();
+            auto a = std::static_pointer_cast<AssignmentNode>(ss[0]);
+            decos.push_back(unparse(a->value_node));
+            expr(a->value_node, nullptr);
+            if (ss[0]->line() < first) first = ss[0]->line();
+            x = ss[1];
+        }
+        if (x && x->type() == NodeType::FUNCTION) def(x, decos, first);
+        else if (x && x->type() == NodeType::CLASS) klass(x, decos);
+        else stmt(x);
+    }
+
+    void stmt(const node_ptr& s) {
+        if (!s) return;
+        touch(s->line());
+        std::set<std::string>* nb = nullptr;
+        switch (s->type()) {
+            case NodeType::BLOCK: case NodeType::STATEMENTS:
+                if (is_dec_block(s)) { decorated(s); return; }
+                block(s);
+                return;
+            case NodeType::FUNCTION: def(s, {}, 0); return;
+            case NodeType::CLASS: klass(s, {}); return;
+            case NodeType::ASSIGNMENT: {
+                auto a = std::static_pointer_cast<AssignmentNode>(s);
+                expr(a->value_node, nb);
+                targets(a->target, nb);
+                return;
+            }
+            case NodeType::ASSIGNMENT_AUG: {
+                auto a = std::static_pointer_cast<AugAssignNode>(s);
+                expr(a->value_node, nb);
+                expr(a->target, nb);
+                targets(a->target, nb);
+                return;
+            }
+            case NodeType::VARIABLE_DECL: {
+                auto v = std::static_pointer_cast<VarDeclNode>(s);
+                expr(v->init, nb);
+                write(v->name);
+                return;
+            }
+            case NodeType::IF: {
+                auto i = std::static_pointer_cast<IfNode>(s);
+                if (i->is_expr) break;
+                cur().complexity++;
+                expr(i->condition, nb);
+                block(i->then_branch);
+                for (auto& e : i->elseif_branches) {
+                    auto ei = std::static_pointer_cast<IfNode>(e);
+                    touch(ei->line());
+                    cur().complexity++;
+                    expr(ei->condition, nb);
+                    block(ei->then_branch);
+                }
+                block(i->else_branch);
+                return;
+            }
+            case NodeType::WHILE: {
+                auto w = std::static_pointer_cast<WhileNode>(s);
+                cur().complexity++;
+                expr(w->condition, nb);
+                block(w->body);
+                block(w->else_branch);
+                return;
+            }
+            case NodeType::FOR: {
+                auto f = std::static_pointer_cast<ForNode>(s);
+                cur().complexity++;
+                expr(f->iterable, nb);
+                targets(f->var, nb);
+                for (auto& u : f->unpack_vars) targets(u, nb);
+                block(f->body);
+                block(f->else_branch);
+                return;
+            }
+            case NodeType::TRY: {
+                auto t = std::static_pointer_cast<TryNode>(s);
+                block(t->body);
+                for (auto& ec : t->except_clauses) {
+                    auto en = std::static_pointer_cast<ExceptNode>(ec);
+                    touch(en->line());
+                    cur().complexity++;
+                    std::vector<std::string> types;
+                    for (auto& ty : en->types) if (!defuse_temp(ty)) { types.push_back(ty); read(ty, nb); }
+                    if (en->types.empty()) bare_excepts.push_back(en->line());
+                    cur().excepts.push_back({en->line(), types});
+                    if (!en->var.empty()) write(en->var);
+                    block(en->body);
+                }
+                block(t->else_clause);
+                block(t->finally_clause);
+                return;
+            }
+            case NodeType::WITH: {
+                auto w = std::static_pointer_cast<WithNode>(s);
+                expr(w->expr, nb);
+                if (!w->alias.empty()) write(w->alias);
+                block(w->body);
+                return;
+            }
+            case NodeType::SWITCH: {
+                auto sw = std::static_pointer_cast<SwitchNode>(s);
+                expr(sw->subject, nb);
+                for (auto& c : sw->cases) {
+                    auto cn = std::static_pointer_cast<CaseNode>(c);
+                    touch(cn->line());
+                    cur().complexity++;
+                    expr(cn->value_node, nb);
+                    block(cn->body);
+                }
+                if (sw->default_case) {
+                    auto dn = std::dynamic_pointer_cast<DefaultNode>(sw->default_case);
+                    block(dn ? dn->body : sw->default_case);
+                }
+                return;
+            }
+            case NodeType::RETURN: {
+                auto r = std::static_pointer_cast<ReturnNode>(s);
+                bool has_value = r->expr && r->expr->type() != NodeType::NONE;
+                cur().returns.push_back({s->line(), has_value, r->expr ? unparse(r->expr) : std::string()});
+                expr(r->expr, nb);
+                return;
+            }
+            case NodeType::RAISE: {
+                auto r = std::static_pointer_cast<RaiseNode>(s);
+                std::string exc;
+                if (r->expr) {
+                    node_ptr e = r->expr;
+                    if (e->type() == NodeType::CALL) e = std::static_pointer_cast<CallNode>(e)->callee;
+                    exc = unparse(e);
+                }
+                cur().raises.push_back({s->line(), exc, r->expr ? unparse(r->expr) : std::string()});
+                expr(r->expr, nb);
+                expr(r->cause, nb);
+                return;
+            }
+            case NodeType::ASSERT: {
+                auto a = std::static_pointer_cast<AssertNode>(s);
+                cur().complexity++;
+                expr(a->condition, nb);
+                expr(a->message, nb);
+                return;
+            }
+            case NodeType::IMPORT: {
+                auto im = std::static_pointer_cast<ImportNode>(s);
+                FImport I;
+                I.line = s->line();
+                I.module = im->module_name;
+                I.alias = im->alias;
+                I.quoted = im->quoted;
+                // "from m import a as b": the parser joins name and alias
+                // with \x05 (nyrt::import_name_alias); shown as " as "
+                for (auto& n : im->names) {
+                    std::string nm = n;
+                    size_t x5 = nm.find('\x05');
+                    if (x5 != std::string::npos) nm = nm.substr(0, x5) + " as " + nm.substr(x5 + 1);
+                    I.names.push_back(nm);
+                }
+                imports.push_back(I);
+                if (!im->names.empty()) {
+                    for (auto& n : I.names) {
+                        std::string nm = n;
+                        size_t sp = nm.find(" as ");
+                        if (sp != std::string::npos) nm = nm.substr(sp + 4);
+                        if (nm != "*") write(nm);
+                    }
+                } else if (!im->alias.empty()) write(im->alias);
+                else if (!im->quoted) { std::string m = im->module_name; size_t dot = m.find('.'); write(dot == std::string::npos ? m : m.substr(0, dot)); }
+                return;
+            }
+            case NodeType::GLOBAL: {
+                auto g = std::static_pointer_cast<GlobalNode>(s);
+                if (g->is_nonlocal) cur().nonlocals.insert(g->name); else cur().globals.insert(g->name);
+                return;
+            }
+            case NodeType::DELETE: targets(std::static_pointer_cast<DeleteNode>(s)->target, nb); return;
+            case NodeType::PRINT: {
+                auto p = std::static_pointer_cast<PrintNode>(s);
+                cur().calls.push_back({s->line(), "print"});
+                for (auto& a : p->args) expr(a, nb);
+                expr(p->sep, nb); expr(p->end, nb);
+                return;
+            }
+            case NodeType::PASS: case NodeType::BREAK: case NodeType::CONTINUE: return;
+            default: break;
+        }
+        expr(s, nb);
+    }
+};
+
+Value ny_facts(NythonExecutor& E, std::vector<Value>& args) {
+    auto* res = new Object((Runnable*)E.runner, "map", Type::MAP);
+    Value out((Collectable*)res);
+    auto& M = *res->container;
+    std::string src = args.empty() ? std::string() : E.getStringValue(args[0]);
+    std::vector<std::string> src_lines;
+    split_lines(src, src_lines);
+    FactsWalker W;
+    W.src = &src_lines;
+    std::string error;
+    int error_line = 0;
+    try {
+        auto source = SourceCode(src + "\n");
+        auto reporter = std::make_shared<Reporter>(source);
+        auto lexer = std::make_shared<Lexer>(source);
+        auto parser = std::make_shared<Parser>(reporter.get(), (Runnable*)E.runner, lexer.get());
+        lexer->tokenize();
+        node_ptr ast = parser->parse();
+        if (ast) {
+            auto ss = ast->statements();
+            if (!ss.empty() && ss[0] && ss[0]->type() == NodeType::STRING) {
+                W.module.has_doc = true;
+                W.module.doc = ss[0]->token().value;
+                W.module.doc_line = FactsWalker::string_first_line(ss[0]);
+            }
+            W.block(ast, true);
+            W.module.end_reachable = !FactsWalker::terminates(ast);
+        }
+    } catch (nython::exception::Error& e) { error = e.message(); error_line = (int)e.location().row; }
+    catch (std::exception& e) { error = e.what(); }
+    catch (std::string& s) { error = s; }
+    catch (...) { error = "could not be parsed"; }
+    W.module.name = "<module>";
+    W.module.qual = "<module>";
+    W.module.line = 1;
+    W.module.first = 1;
+    W.module.end = (int)src_lines.size();
+    auto S = [&](const std::string& s) { return E.makeStringValue(s); };
+    auto I = [&](long long x) { return Value(bigint(x)); };
+    auto strs = [&](const std::set<std::string>& s) { ListBuilder l(E); for (auto& x : s) l.add_str(x); return l.done(); };
+    auto vstrs = [&](const std::vector<std::string>& s) { ListBuilder l(E); for (auto& x : s) l.add_str(x); return l.done(); };
+    auto newmap = [&]() { return new Object((Runnable*)E.runner, "map", Type::MAP); };
+    auto opt_str = [&](bool has, const std::string& s) { return has ? S(s) : NONE_VALUE; };
+    auto func_map = [&](const FFunc& F) {
+        auto* m = newmap();
+        Value mv((Collectable*)m);
+        auto& C = *m->container;
+        C["name"] = S(F.name);
+        C["qualname"] = S(F.qual);
+        C["class"] = S(F.cls);
+        C["parent"] = S(F.parent);
+        C["line"] = I(F.line);
+        C["first"] = I(F.first ? F.first : F.line);
+        C["end"] = I(F.end);
+        C["decorators"] = vstrs(F.decorators);
+        C["is_async"] = Value(F.is_async);
+        C["is_generator"] = Value(F.is_gen);
+        C["doc"] = opt_str(F.has_doc, F.doc);
+        C["doc_line"] = I(F.doc_line);
+        ListBuilder ps(E);
+        for (auto& P : F.params) {
+            auto* pm = newmap();
+            Value pv((Collectable*)pm);
+            auto& PC = *pm->container;
+            PC["name"] = S(P.name);
+            PC["kind"] = S(P.kind);
+            PC["default"] = opt_str(P.has_def, P.def);
+            PC["default_kind"] = opt_str(P.has_def, P.def_kind);
+            PC["annotation"] = opt_str(P.has_ann, P.ann);
+            ps.add(pv);
+        }
+        C["params"] = ps.done();
+        C["return_annotation"] = opt_str(F.has_ret_ann, F.ret_ann);
+        ListBuilder rs(E);
+        for (auto& r : F.returns) { ListBuilder e(E); e.add_int(std::get<0>(r)); e.add(Value(std::get<1>(r))); e.add_str(std::get<2>(r)); rs.add(e.done()); }
+        C["returns"] = rs.done();
+        ListBuilder xs(E);
+        for (auto& r : F.raises) { ListBuilder e(E); e.add_int(std::get<0>(r)); e.add_str(std::get<1>(r)); e.add_str(std::get<2>(r)); xs.add(e.done()); }
+        C["raises"] = xs.done();
+        ListBuilder cs(E);
+        for (auto& c : F.calls) { ListBuilder e(E); e.add_int(c.first); e.add_str(c.second); cs.add(e.done()); }
+        C["calls"] = cs.done();
+        C["reads"] = strs(F.reads);
+        C["writes"] = vstrs(F.write_order);
+        C["globals"] = strs(F.globals);
+        C["nonlocals"] = strs(F.nonlocals);
+        ListBuilder es(E);
+        for (auto& x : F.excepts) { ListBuilder e(E); e.add_int(x.first); e.add(vstrs(x.second)); es.add(e.done()); }
+        C["excepts"] = es.done();
+        C["complexity"] = I(F.complexity);
+        C["end_reachable"] = Value(F.end_reachable);
+        return mv;
+    };
+    if (!error.empty()) {
+        ListBuilder e(E);
+        e.add_int(error_line);
+        e.add_str(error);
+        M["error"] = e.done();
+    } else M["error"] = NONE_VALUE;
+    M["doc"] = opt_str(W.module.has_doc, W.module.doc);
+    ListBuilder fs(E);
+    for (auto& F : W.funcs) fs.add(func_map(F));
+    M["functions"] = fs.done();
+    ListBuilder cl(E);
+    for (auto& C0 : W.classes) {
+        auto* m = newmap();
+        Value mv((Collectable*)m);
+        auto& C = *m->container;
+        C["name"] = S(C0.name);
+        C["qualname"] = S(C0.qual);
+        C["line"] = I(C0.line);
+        C["end"] = I(C0.end);
+        C["bases"] = vstrs(C0.bases);
+        C["doc"] = opt_str(C0.has_doc, C0.doc);
+        C["methods"] = vstrs(C0.methods);
+        C["decorators"] = vstrs(C0.decorators);
+        cl.add(mv);
+    }
+    M["classes"] = cl.done();
+    ListBuilder im(E);
+    for (auto& I0 : W.imports) {
+        auto* m = newmap();
+        Value mv((Collectable*)m);
+        auto& C = *m->container;
+        C["line"] = I(I0.line);
+        C["module"] = S(I0.module);
+        C["names"] = vstrs(I0.names);
+        C["alias"] = S(I0.alias);
+        C["quoted"] = Value(I0.quoted);
+        im.add(mv);
+    }
+    M["imports"] = im.done();
+    M["module"] = func_map(W.module);
+    ListBuilder ur(E);
+    for (size_t i = 0; i < W.unreachable.size(); i++) {
+        ListBuilder e(E);
+        e.add_int(W.unreachable[i][0]);
+        e.add_int(W.unreachable[i][1]);
+        e.add_int(W.unreachable[i][2]);
+        e.add_str(W.unreachable_kind[i]);
+        ur.add(e.done());
+    }
+    M["unreachable"] = ur.done();
+    ListBuilder be(E);
+    for (int l : W.bare_excepts) be.add_int(l);
+    M["bare_excepts"] = be.done();
+    ListBuilder nc(E);
+    for (auto& p : W.none_cmps) { ListBuilder e(E); e.add_int(p.first); e.add_str(p.second); nc.add(e.done()); }
+    M["none_compares"] = nc.done();
+    return out;
 }
 
 // ── text_diff (Myers, O((N+M)D) time, snapshots of V for the backtrack) ─────
@@ -1834,6 +2743,7 @@ Value dispatch_text(NythonExecutor& E, const std::string& name, std::vector<Valu
             if (name == "ny_symbols") return ny_symbols(E, args);
             if (name == "ny_check_syntax") return ny_check_syntax(E, args);
             if (name == "ny_check_file") return ny_check_file(E, args);
+            if (name == "ny_facts") return ny_facts(E, args);   // round 82
             break;
         case 'f':
             if (name == "fs_list_files") return fs_list_files(E, args);

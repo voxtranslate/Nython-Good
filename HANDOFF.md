@@ -3,7 +3,8 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 81, follow-ups — **§0t4** (gaps the round's agents found: class lambdas bound, `del C.m`, `list.pop`'s index, UnboundLocalError, set iterators; a package's `__spec__` on Windows; vm_audit102).
+Last updated: round 82, part C — **§0u** (NyxAI: lib/aiagent.ny made a programming agent that works offline - BM25F retrieval, program facts from the real parser (`ny_facts`), a rule engine, test generation, docstrings, review and fixes, a completion model - and the IDE's AGENT view; vm_audit105, e2e `agent`).
+Round 81, follow-ups — **§0t4** (gaps the round's agents found: class lambdas bound, `del C.m`, `list.pop`'s index, UnboundLocalError, set iterators; a package's `__spec__` on Windows; vm_audit102).
 Round 81, part A — **§0t** (the semantic gaps round 80 left:
 `except ... as e` unbinding, a live `globals()` and the real `__main__`,
 `__spec__` and `sys.meta_path`/`path_hooks` in the import statement,
@@ -77,6 +78,149 @@ multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
 
 ---
+
+## 0u. Round 82, part C — NyxAI, a programming agent that works offline (vm_audit105, e2e `agent`)
+
+`lib/aiagent.ny` (pre-round-73 keyword matching that indexed empty lists as
+dicts) is now an agent that answers from the workspace's code, with no model
+and no network, deterministically. The parts are a package of their own,
+`lib/nyxai/` (`# nython: module` files), put together by `lib/aiagent.ny`'s
+`NyxAgent` and wired into the IDE by `ide_agent.ny`.
+
+### The native part: `ny_facts(source)` (`src/builtins/text.cpp`)
+Walks the AST the engines run (as `text_defuse` does) and returns, per
+function: name, qualname, enclosing class and def, lines (def, first
+decorator, end - indentation-based so trailing comments count), decorators
+(source text), async/generator, docstring and its line, parameters (name,
+inspect's kind, default as source text and its kind - literal/list/dict/
+set/call:<callee>/name/expr, annotation text), return annotation, returns
+([line, has value, text]), raises ([line, exception, text]), calls ([line,
+callee text]), names read and written, `global`/`nonlocal`, except clauses
+with their types, McCabe's complexity (decision points as radon counts
+them) and whether control can fall off the end; per class: bases, doc,
+methods, decorators; imports; unreachable statements (after return/raise/
+break/continue or an if/try whose every branch ends so); bare excepts;
+`== None` comparisons; the module's own top-level facts. Expressions are
+rendered back to text by a small unparser. Registered in
+`NythonExecutor::registerBuiltins` (the VM reaches it through the bridge).
+
+### lib/nyxai
+- `facts.ny` — `ProgramModel`: modules, `FunctionInfo`/`ClassInfo`, name
+  resolution across files (same module, `from m import f`, `mod.f`,
+  `self.m`/`cls.m`/`super().m` through workspace base classes, a class call
+  as its `__init__`, else the only function of that name), the call graph,
+  callers, reachability, the import graph (quoted imports matched by path),
+  external imports, globals read/written; `rule_facts()` and
+  `default_rules()` for the rule engine.
+- `index.ny` — `WorkspaceIndex`: BM25F (Robertson & Zaragoza 2009) over
+  function/class/module chunks and document sections (Markdown headings),
+  fields name 4 / doc 2 / comments 1.5 / code 1 / path 1; identifiers split
+  at camelCase/snake_case and stemmed lightly; a definition of a symbol the
+  query names x2 over its uses; one step of score propagation over the call
+  graph (0.3 of a neighbour's score, after Shakery & Zhai 2003); each hit
+  cites file:line of its best-matching line; incremental `update_file`/
+  `remove_file`; JSON `save`/`load`; `refresh()` re-indexes by mtime.
+- `rules.ny` — `RuleEngine`: facts as tuples, rules with `?variables`,
+  `("not", ...)` and `("test", fn)` conditions, functions as conclusions;
+  alpha memories by predicate and by (predicate, position, value), semi-
+  naive joins from the new fact (Forgy's Rete at a small scale), stratified
+  negation (an unstratifiable program raises ValueError), `why()`
+  derivations. `default_rules`: reaches, recursive, isa (exception
+  hierarchy), handles, may_raise / raises_via through calls not handled
+  there, impure (module writes, I/O) / pure, called, unused.
+- `review.ny` — `Reviewer`: unused-import, unused-variable (def-use from
+  `text_defuse`, closures counted), unreachable-code, shadowed-builtin,
+  mutable-default, bare-except, none-comparison, too-complex (McCabe > 10),
+  missing-self, inconsistent-return (PEP 8); each finding file:line, a
+  message, a suggestion, and line edits for the mechanical ones;
+  `fix_text` applies non-overlapping edits and returns difflib's unified
+  diff (patience).
+- `testgen.ny` — `TestGenerator`: parameter domains from annotations,
+  defaults, else type probing in a child (int, str, list, float: the first
+  that raises neither TypeError nor AttributeError, as Pynguin does);
+  boundary values one parameter at a time; the docstring's doctests; random
+  inputs (a seeded LCG) checking determinism and that nothing but declared
+  (or boundary-observed) exceptions is raised - a counterexample is shrunk
+  greedily in one child (QuickCheck); everything runs in a child process
+  (`sys.executable`) with a timeout, and the child logs each case before it
+  runs, so a call that never returns costs only that case (reported, the
+  rest run in a fresh child). The module it writes asserts what was
+  observed (assertEqual on values whose repr evaluates back, assertAlmostEqual
+  on floats, assertRaises, a type check otherwise) and runs with
+  `nython test_x.ny` and `nython -m unittest test_x`; for a `.py` module the
+  test loads it by path (importlib.util), so `python3 -m unittest` runs it
+  too (Nython's `import name` finds only `.ny` files - not changed).
+- `docgen.ny` — `draft_docstring`/`docstring_edit`: Google style; summary
+  from the name or the existing first line, Args with types from
+  annotations/defaults and how the body uses each (iterated, called,
+  indexed, may be None, passed to f()), Returns from the annotation or the
+  returned expressions' kind, Raises with the condition the raise is control
+  dependent on (`text_defuse`'s predicates: "If m < 1.") and what calls let
+  through (the rule engine's raises_via).
+
+### lib/aiagent.ny
+`NyxAgent(root, state_dir)`: `index_workspace()` (loads and refreshes a
+saved index or builds one, trains the completion model), `file_changed()`,
+`sync()` (what changed on disk, by mtime),
+`ask()`, `explain()`, `test()`, `doc()`, `review()`, `fix()` (a diff;
+`apply()` writes it), `rerank()`, `run_command(verb, arg)`; replies are
+`AgentReply` objects (items with style and an optional file:line link).
+The round-72 classes keep their names and interfaces, now on these parts:
+`CodeKnowledgeBase` ranks documents by BM25; `CodeAnalyzer.analyze()` is the
+review rules (same dict shape the IDE read); `ReasoningEngine` is the rule
+engine (a word condition is the fact mentions(stem), so "terror" no longer
+matches "error"); `GitHubLearner`/`DocumentLearner` fetch through
+urllib.request with a configurable `raw_base`; the empty-list-as-dict
+writes (`self.rules[self.rule_count] = ...`), `most_accessed`'s infinite
+loop and `forget`'s None entries are gone.
+
+### The completion model (`lib/nytorch/agent_learn.ny`)
+`code_tokens()` (one native regex pass), `CodeTokenModel` - an online
+trigram/bigram/unigram model with Witten-Bell interpolation and a cache of
+recent identifiers (Hindle et al. ICSE 2012; Tu, Su & Devanbu FSE 2014) -
+and `CompletionRanker`, which adds the round-72 category MLP
+(`TokenLanguageModel`, gradient steps on a sample of each file's category
+pairs) and re-orders a candidate list: exact-case prefix matches, then
+case-insensitive ones, then fuzzy ones, the model's order within each.
+`completion_mrr()` measures the mean reciprocal rank of the token the user
+went on to type in the list the IDE shows (ac_index_rank) after its first
+character: on vm_audit105's held-out file 0.639 before training, 0.975
+after two files of the same project. The MLP's gradient steps are the slow
+part, so they are sampled (24 pairs a file, 240 in all); the n-gram counts
+see every token.
+
+### The IDE (`ide_agent.ny`, `IDEAgent` between IDELive and NythonIDE)
+Terminal `@ask/@explain/@test/@doc/@review/@fix`; palette "Agent: Ask...",
+"Explain Symbol", "Generate Tests", "Draft Docstring", "Review File", "Fix
+File", "Apply Fix", "Discard Fix", "Index Workspace" (symbol commands use
+the word under the caret); the activity bar's sparkle view is now AGENT:
+the last answer, every file:line a link, Apply/Discard for a fix or a
+docstring (the diff is shown first; applying replaces the editor's text as
+one undo group). Answers are also written to the Output panel. The index
+lives in the IDE's temporary directory (`<tmp>/nyide_agent/<path key>`); a
+saved or reloaded file is re-indexed at once, every command first refreshes
+by mtime; `_ac_open_now` re-ranks the completion list once the model is
+trained. e2e `agent`; memprobe `agent` (hover with an answer shown) and
+`agentkey` (typing with re-ranking).
+
+### Also
+- `nython -m unittest test_x [Test.test_m ...]` (lib/unittest.ny's
+  `_ny_unittest_cli`): the names' tests (a test_x.py is loaded by path), or
+  the working directory's test*.ny/py files. Run as `__main__`, unittest.ny
+  is a second copy of the module, so the CLI uses the imported `unittest`'s
+  loader and runner (as CPython's unittest/__main__.py does).
+- `text_defuse` bound nothing for `from m import a as b` (the parser joins
+  name and alias with `\x05`; only " as " was looked for) - it binds `b` now.
+- vm_audit105: 118 checks, both engines (~10 s each).
+
+### Not done
+- No free-text generation: answers are ranked, cited excerpts and facts.
+- Test generation covers functions and static methods (and methods of
+  classes constructible without arguments); not generators, async
+  functions, or user-defined argument types.
+- Retrieval is lexical (no synonyms/embeddings); the index is per root.
+- The rule engine is monotonic (no retraction); `handles` is per function,
+  not per try block.
 
 ## 0t4. Round 81, follow-ups — what the round's agents found (vm_audit102)
 

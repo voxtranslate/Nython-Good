@@ -36,7 +36,10 @@
 #     the exception line; there are no frame lines.
 #   - main() finds the program's TestCase classes in the __main__ module's
 #     globals (_ny_main_globals); setUpModule/tearDownModule there are run.
-#     Test discovery in directories (unittest discover) is not provided.
+#     `nython -m unittest test_x [test_y.TestC.test_m ...]` runs the named
+#     modules' tests (round 82); with no names (or `discover`) the
+#     test*.ny / test*.py files of the working directory - recursive
+#     discovery in packages is not provided.
 #   - assertRaisesRegex/assertRegex take a pattern string (searched with
 #     the runtime's regex engine, ECMAScript syntax - Python's for the
 #     common subset) or a compiled pattern with .search().
@@ -3028,3 +3031,106 @@ class TestProgram:
 
 
 main = TestProgram
+
+
+# `nython -m unittest [-v|-q|-f] [-k PATTERN] [name ...]` (round 82):
+# CPython's command line. A name is a module - imported from the working
+# directory or sys.path, test_x.ny or test_x.py - optionally followed by
+# .TestCase or .TestCase.test_method; a path (test_x.ny, dir/test_x.py)
+# names its module. With no names, or `discover`, the test*.ny / test*.py
+# files of the working directory are run (discovery is not recursive here).
+def _ny_unittest_cli(argv):
+    import importlib
+    # run as __main__, this file is not the `unittest` the test modules
+    # import: their TestCase is that module's, so its loader and runner are
+    # used (CPython's unittest/__main__.py does the same)
+    import unittest as _ut
+    var verbosity = 1
+    var failfast = false
+    var names = []
+    var patterns = []
+    var args = list(argv[1:])
+    var i = 0
+    while i < len(args):
+        var a = args[i]
+        if a in ["-v", "--verbose"]:
+            verbosity = 2
+        elif a in ["-q", "--quiet"]:
+            verbosity = 0
+        elif a in ["-f", "--failfast"]:
+            failfast = true
+        elif a in ["-b", "--buffer", "-c", "--catch", "--locals"]:
+            pass
+        elif a == "-k":
+            i = i + 1
+            patterns.append(args[i])
+        elif a.startswith("-k"):
+            patterns.append(a[2:])
+        elif a in ["-h", "--help"]:
+            print("usage: python -m unittest [-h] [-v] [-q] [-f] [-k TESTNAMEPATTERNS] [tests ...]")
+            raise SystemExit(0)
+        elif a.startswith("-"):
+            print("usage: python -m unittest [-h] [-v] [-q] [-f] [-k TESTNAMEPATTERNS] [tests ...]")
+            print("python -m unittest: error: unrecognized arguments: " + a)
+            raise SystemExit(2)
+        else:
+            names.append(a)
+        i = i + 1
+    var cwd = os.getcwd()
+    if cwd not in sys.path:
+        sys.path.insert(0, cwd)
+    if len(names) == 0 or names[0] == "discover":
+        names = []
+        for fn in sorted(os.listdir(cwd)):
+            if fn.startswith("test") and (fn.endswith(".py") or fn.endswith(".ny")):
+                var stem = fn[0:len(fn) - 3]
+                if stem not in names:
+                    names.append(stem)
+    var loader = _ut.TestLoader()
+    if len(patterns) > 0:
+        loader.testNamePatterns = [("*" + p + "*") if "*" not in p else p for p in patterns]
+    var suite = _ut.TestSuite([])
+    for name in names:
+        var nm = name
+        if nm.endswith(".py") or nm.endswith(".ny"):
+            var d = os.path.dirname(nm)
+            if d != "" and os.path.abspath(d) not in sys.path:
+                sys.path.insert(0, os.path.abspath(d))
+            nm = os.path.basename(nm)[0:len(os.path.basename(nm)) - 3]
+        var parts = nm.split(".")
+        var mod = none
+        var k = len(parts)
+        while k > 0 and mod is none:
+            try:
+                mod = importlib.import_module(".".join(parts[0:k]))
+            except ImportError:
+                # a test_x.py: Nython imports .ny files by name, so a .py
+                # module is loaded from its path
+                var py = none
+                for d in sys.path:
+                    var cand = os.path.join(d if d != "" else cwd, parts[0] + ".py")
+                    if k == 1 and py is none and os.path.isfile(cand):
+                        py = cand
+                if py is not none:
+                    import importlib.util as _ilu
+                    var spec = _ilu.spec_from_file_location(parts[0], py)
+                    mod = _ilu.module_from_spec(spec)
+                    sys.modules[parts[0]] = mod
+                    spec.loader.exec_module(mod)
+                elif k == 1:
+                    raise
+                else:
+                    k = k - 1
+        var rest = ".".join(parts[k:])
+        if rest == "":
+            suite.addTest(loader.loadTestsFromModule(mod))
+        else:
+            suite.addTest(loader.loadTestsFromName(rest, mod))
+    var result = _ut.TextTestRunner(none, true, verbosity, failfast).run(suite)
+    if result.testsRun == 0 and len(result.skipped) == 0:
+        raise SystemExit(_NO_TESTS_EXITCODE)
+    raise SystemExit(0 if result.wasSuccessful() else 1)
+
+
+if __name__ == "__main__":
+    _ny_unittest_cli(sys.argv)

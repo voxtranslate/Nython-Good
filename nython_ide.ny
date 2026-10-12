@@ -12,6 +12,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 
 import "ide_live.ny"
+import "ide_agent.ny"
 import "ide_workshop.ny"
 import "lib/aiagent.ny"
 import "lib/gui_motion.ny"
@@ -23,7 +24,7 @@ def hit(rx, ry, rw, rh, px, py):
     return px >= rx and px < rx + rw and py >= ry and py < ry + rh
 
 
-class NythonIDE(IDELive):
+class NythonIDE(IDEAgent):
     def __init__(self):
         self.th = IDETheme()
         self.session_id = time_ms() % 100000000
@@ -382,6 +383,7 @@ class NythonIDE(IDELive):
         self.acts_scm = [["check", "git.commit", "", "Commit"], ["refresh", "git.refresh", "", "Refresh"], ["ellipsis", "@scm.more", "", "More Actions..."]]
         self.acts_ext = [["refresh", "@ext.refresh", "", "Refresh"]]
         self.acts_ai = [["refresh", "nython.ai.analyze", "", "Analyse Again"]]
+        self._agent_init()         # ide_agent.ny: the programming agent (round 82)
         self.ac_row = -1
         self.ac_start = -1
         self.ac_doc = none
@@ -2027,18 +2029,28 @@ class NythonIDE(IDELive):
                     self._show_panel(self.panel_keys[i])
                 i = i + 1
         elif string_startswith(action, "agent:"):
+            # @ask/@explain/@test/@doc/@review/@fix: lib/aiagent.ny's NyxAgent
+            # (ide_agent.ny); the answer goes to the AGENT view and the
+            # Output panel, its first lines here.
             var verb = string_slice(action, 6, len(action))
-            if verb == "fix" or verb == "explain":
-                self._ai_analyze(true)
-                if self.ai_n == 0:
-                    self._term_print("no issues found in " + self.doc().title, "ok")
+            var rep = self._agent_command(verb, arg)
+            if rep != none:
                 var j = 0
-                while j < self.ai_n:
-                    var it = self.ai_issues[j]
-                    self._term_print("line " + str(it["line"]) + ": " + it["message"], "out")
+                while j < len(rep.items) and j < 12:
+                    var it = rep.items[j]
+                    var k = "out"
+                    if it.style == "err" or it.style == "diff-":
+                        k = "err"
+                    elif it.style == "ok" or it.style == "diff+":
+                        k = "ok"
+                    elif it.style == "warn":
+                        k = "warn"
+                    elif it.style == "dim" or it.style == "code":
+                        k = "dim"
+                    self._term_print(it.text, k)
                     j = j + 1
-            else:
-                self._term_print("@" + verb + " needs a language model, which is not connected; @explain and @fix use the local analyser.", "warn")
+                if len(rep.items) > 12:
+                    self._term_print("... " + str(len(rep.items) - 12) + " more lines in the AGENT view", "dim")
 
     # ── editor keys ──────────────────────────────────────────────────────────
     def _editor_key(self, e):
@@ -2434,6 +2446,9 @@ class NythonIDE(IDELive):
         var res = ac_index_rank(self.ac_index, self.ac_prefix, 60, self.ac_prefix)
         self.ac_items = res[0]
         self.ac_kinds = res[1]
+        # ... then re-ranked by the agent's model of this workspace, once
+        # it has learned one (ide_agent.ny, round 82)
+        self._agent_rerank(b.get_line(b.cursor_row), st, self.ac_prefix)
         # Snippets take part in completion, as in VS Code: an exact prefix
         # goes first (so Tab after "def" expands the snippet instead of
         # accepting some other word that merely contains "def"), others

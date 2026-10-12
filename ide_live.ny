@@ -1,7 +1,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 #  ide_live.ny — IDELive: live debugging and the Profile view (round 81).
 #  Part of the NythonIDE class chain (see ide_core.ny's header), between
-#  IDETools and NythonIDE.
+#  IDETools and IDEAgent.
 #
 #  Live debugging: "Run with Live Debugging" (Alt+F5) starts the program as
 #  `nython --debug-port N file.ny` - it runs under lib/ide_debugserver.ny -
