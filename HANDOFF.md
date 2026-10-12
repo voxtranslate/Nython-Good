@@ -161,6 +161,13 @@ compared with python3's.
   compared equal. Both now use the native separator, as CPython (the engines'
   `__path__`, `PathFinder.find_spec`, `_spec_for_path`); vm_audit96 then
   passes 115/115 under Wine on both engines (the sweep was not run again).
+- Windows 32-bit (i686, under Wine): vm_audit98, 96, 97 (240, POSIX-only
+  checks skipped), 95 (with the 32-bit decimal limits), 93, 91, 88, 56 pass
+  on both engines.
+- AArch64 (qemu-user): vm_audit98 (the 72 checks that do not spawn
+  `sys.executable`, also with `NY_QUICKEN=0`), 95, 91, 89, 88, 56, 49 pass on
+  both engines; 96 and 98's subprocess check cannot run there (no
+  binfmt_misc in this container).
 - Verified after both fixes (all of round 80): the sweep 423 runs, 0 not
   ok; vm_audit96/97/98 on both engines and python3 (98 also with
   `NY_QUICKEN=0`); `ide_e2e` 390/390; `ide_lint`, `ny_classcheck`,
