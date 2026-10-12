@@ -1303,7 +1303,10 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   else; a construct that runs user code while a flag is set takes it out
   first (`takeExc`) and puts it back (`pendExc`); code that evaluates
   statements in a caller's scope (`exec`, `lang_eval`) runs under
-  `SuspendFast`.
+  `SuspendFast`. `flow()` reads a constant-initialized per-thread pointer
+  (`t_flow_`): never put a `thread_local` with a constructor in a hot
+  inline function (its guard and constructor land at every use, and GCC
+  stopped inlining `pendingSet` over it).
 - `for a, b in enumerate(...)` / `zip(...)` bind the targets from the
   iterator's parts (no tuple per step); a for statement's targets are
   unpacked as Python does on both engines (exactly that many values,
