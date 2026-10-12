@@ -1,5 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
-# lib/encodings/punycode.ny - CPython 3.12's encodings/punycode.py (round 83), unchanged.
+# lib/encodings/punycode.ny - CPython 3.12's encodings/punycode.py (round 83); its memoryview test adapted.
 
 """ Codec for the Punicode encoding, as specified in RFC 3492
 
@@ -185,7 +185,7 @@ def insertion_sort(base, extended, errors):
 def punycode_decode(text, errors):
     if isinstance(text, str):
         text = text.encode("ascii")
-    if isinstance(text, memoryview):
+    if not isinstance(text, (str, bytes)):   # (round 83: no memoryview here)
         text = bytes(text)
     pos = text.rfind(b"-")
     if pos == -1:

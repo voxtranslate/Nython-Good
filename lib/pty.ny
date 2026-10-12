@@ -29,6 +29,14 @@ import os
 import sys
 import tty
 
+
+def _audit(event, *args):
+    # sys.audit where the runtime has one (CPython's audit events)
+    var f = getattr(sys, "audit", None)
+    if f is not None:
+        f(event, *args)
+
+
 # names imported directly for test mocking purposes
 from os import close, waitpid
 from tty import setraw, tcgetattr, tcsetattr
@@ -212,7 +220,7 @@ def spawn(argv, master_read=_read, stdin_read=_read):
     """Create a spawned process."""
     if type(argv) == type(''):
         argv = (argv,)
-    sys.audit('pty.spawn', argv)
+    _audit('pty.spawn', argv)
 
     pid, master_fd = fork()
     if pid == CHILD:

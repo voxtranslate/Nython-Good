@@ -219,7 +219,7 @@ Value dispatch_mmap(NythonExecutor& E, const std::string& name, std::vector<Valu
         if (fileno != -1) {
             HANDLE fh = (HANDLE)_get_osfhandle((int)fileno);
             if (fh == INVALID_HANDLE_VALUE) fail_errno(EBADF);
-            if (!DuplicateHandle(GetCurrentProcess(), fh, GetCurrentProcess(), &m->file, 0, FALSE, DUPLICATE_SAME_ACCESS))
+            if (!DuplicateHandle(GetCurrentProcess(), fh, GetCurrentProcess(), &m->file, 0, 0, DUPLICATE_SAME_ACCESS))
                 fail("OSError", "[WinError " + std::to_string(GetLastError()) + "] DuplicateHandle failed");
             LARGE_INTEGER fs;
             if (!GetFileSizeEx(m->file, &fs)) fail("OSError", "[WinError " + std::to_string(GetLastError()) + "] cannot get the file size");

@@ -21,8 +21,9 @@
 # candidates) - get_completer, get_completer_delims / set_completer_delims,
 # get_begidx / get_endidx / get_line_buffer (what is being completed),
 # get_completion_type, set_completion_display_matches_hook,
-# set_startup_hook / set_pre_input_hook (run before each prompt line),
-# insert_text, redisplay, parse_and_bind / read_init_file (the bindings
+# set_startup_hook / set_pre_input_hook (kept and checked; the editor does
+# not call them), insert_text (the text starts the next prompt line),
+# redisplay, parse_and_bind / read_init_file (the bindings
 # Nython's editor has are fixed: "tab: complete" and the like are accepted),
 # backend ("nython"), _READLINE_VERSION/_READLINE_RUNTIME_VERSION/
 # _READLINE_LIBRARY_VERSION (those of GNU readline 8.2 it imitates).

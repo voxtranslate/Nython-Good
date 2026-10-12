@@ -34,7 +34,7 @@
 //   _tm_start(nframe)  _tm_stop()  _tm_is_tracing()  _tm_get_traceback_limit()
 //   _tm_get_traced_memory() -> [current, peak]   _tm_reset_peak()   _tm_clear_traces()
 //   _tm_get_traces() -> [[domain, size, ((file, line), ...), total_nframe], ...]
-//   _tm_object_traceback(address) -> ((file, line), ...) or none   _tm_memory()
+//   _tm_object_traceback(obj, id(obj)) -> ((file, line), ...) or none   _tm_memory()
 #include "platform_compat.hpp"
 #include "NythonExecutor.hpp"
 #include "NyConc.hpp"
@@ -770,7 +770,16 @@ Value dispatch_fault(NythonExecutor& E, const std::string& name, std::vector<Val
     }
     if (name == "_tm_object_traceback") {
         if (!g_tm || !nytm::g_on.load()) return NONE_VALUE;
-        uintptr_t addr = (uintptr_t)(uint64_t)iarg(a, 0);
+        // the object's own block: the interpreter's heap object, or (on the
+        // VM, whose values the bridge copies) the address id() gives
+        uintptr_t addr = 0;
+        if (!g_vm_mode.load() && !a.empty()) {
+            const Value& v = a[0];
+            if (v.type == ValueType::USERDATA && v.value.o) addr = (uintptr_t)v.value.o;
+            else if (v.isCollectable() && v.value.gc) addr = (uintptr_t)v.value.gc;
+        } else {
+            addr = (uintptr_t)(uint64_t)iarg(a, 1);
+        }
         if (!addr) return NONE_VALUE;
         int64_t tb = -1;
         TBCopy copy;

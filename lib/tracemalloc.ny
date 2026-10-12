@@ -93,7 +93,7 @@ def _get_traces():
 def _get_object_traceback(obj):
     if obj is None or isinstance(obj, (bool, int, float)):
         return None
-    return _tm_object_traceback(id(obj))
+    return _tm_object_traceback(obj, id(obj))
 
 
 def _format_size(size, sign):

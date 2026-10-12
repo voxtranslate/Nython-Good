@@ -346,9 +346,10 @@ class BZ2File(_compression.BaseStream):
         if isinstance(data, (bytes, bytearray)):
             length = len(data)
         else:
-            # accept any data that supports the buffer protocol
-            data = memoryview(data)
-            length = data.nbytes
+            # accept any data that supports the buffer protocol (here:
+            # anything bytes() takes - Nython has no memoryview)
+            data = bytes(data)
+            length = len(data)
 
         compressed = self._compressor.compress(data)
         self._fp.write(compressed)
