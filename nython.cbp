@@ -159,6 +159,7 @@
         <Unit filename="src/builtins/tensor.cpp" />
         <Unit filename="src/builtins/nytensor.cpp" />
         <Unit filename="src/builtins/threading.cpp" />
+        <Unit filename="src/builtins/nysqlite.cpp" />
         <Unit filename="src/builtins/tls.cpp" />
         <Unit filename="src/builtins/hashing.cpp" />
         <Unit filename="src/builtins/pymath.cpp" />

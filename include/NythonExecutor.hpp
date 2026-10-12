@@ -54,6 +54,7 @@
 #include "NyBytes.hpp"
 #include "NyScope.hpp"
 #include "builtins/net.hpp"
+#include "builtins/nysqlite.hpp"   // (round 83) sqlite3
 #include "NyFormat.hpp"
 #include "NyMembers.hpp"
 
@@ -808,6 +809,7 @@ public:   // NythonExecutor is a struct: members default to public
         // The socket and TLS layers (round 77): the VM reaches them through the bridge.
         for (auto& name : net_builtin_names()) registerBuiltin(name);
         for (auto& name : tls_builtin_names()) registerBuiltin(name);
+        for (auto& name : sqlite_builtin_names()) registerBuiltin(name);   // (round 83) libsqlite3, at run time
         for (auto& name : hash_builtin_names()) registerBuiltin(name);
         for (auto& name : pymath_builtin_names()) registerBuiltin(name);
         for (auto& name : pyjson_builtin_names()) registerBuiltin(name);
@@ -2397,7 +2399,7 @@ public:   // NythonExecutor is a struct: members default to public
             "file_open", "file_open_or_raise", "os_proc_read", "os_poll"
         };
         if (named.count(n)) return true;
-        static const char* pre[] = {"_net_", "_sig_", "_ws_", "_tls_", "_http_", "_struct_", "_codec_", "_cli_", "_hash_", "math_"};
+        static const char* pre[] = {"_net_", "_sig_", "_ws_", "_tls_", "_http_", "_struct_", "_codec_", "_cli_", "_hash_", "math_", "_sql_"};   // _sql_: round 83
         for (const char* p : pre) if (n.rfind(p, 0) == 0) return true;
         size_t dot = n.find('.');
         return dot != std::string::npos && nypy::type_kind(n.substr(0, dot)) != nypy::MemberKind::Other;
@@ -9398,6 +9400,7 @@ public:
             // the round 77 socket and TLS layers (builtins/net.cpp, tls.cpp)
             result = dispatch_net(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
             result = dispatch_tls(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
+            if (name.compare(0, 5, "_sql_") == 0) return dispatch_sqlite(*this, name, args, ctx);   // (round 83)
             result = dispatch_hash(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
             if (name.compare(0, 4, "_re_") == 0) return dispatch_re(*this, name, args, ctx);
         }
