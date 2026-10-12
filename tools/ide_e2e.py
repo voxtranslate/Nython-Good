@@ -881,6 +881,7 @@ def sc_live_debug(s):
     s.write("live.ny", LIVE)
     s.write("spin.ny", SPIN)
     s.write("exc.ny", EXC)
+    s.write("ask.ny", ASK)
     ide = s.start()
     c = s.res.check
     s.open_file("live.ny")
@@ -1034,6 +1035,33 @@ def sc_live_debug(s):
     c(not st["live_active"] and any("exited with code 0" in ln for ln in st["dbgcon"]),
       "live: the caught exception lets the program finish", st["dbgcon"][-3:])
     ide.click_text("Raised Exceptions")
+    # the program's own input still comes from the Output panel's input line
+    ide.key("ctrl+p")
+    ide.type("ask.ny")
+    ide.key("enter")
+    ide.key("ctrl+g")
+    ide.type("4\n")
+    ide.key("f9")
+    ide.key("alt+f5")
+    st = s.wait_until(lambda st: st["focus"] == "stdin", timeout=30)
+    c(st["focus"] == "stdin" and st["live_state"] == "running", "live/stdin: the input line takes focus when the program asks",
+      (st["focus"], st["live_state"]))
+    ide.type("ada\n")
+    time.sleep(0.3)
+    st = s.wait_until(lambda st: st["focus"] == "stdin", timeout=30)
+    ide.type("7\n")
+    st = s.wait_until(lambda st: st["live_state"] == "paused" and [1, "n", "7"] in st["live_vars"], timeout=30)
+    c(st["live_line"] == 4 and [1, "name", "'ada'"] in st["live_vars"] and [1, "n", "7"] in st["live_vars"],
+      "live/stdin: the lines typed reached the program, stopped after them", (st["live_line"], st["live_vars"]))
+    ide.key("f9")
+    ide.key("f5")
+    st = s.wait_until(lambda st: st["focus"] == "stdin", timeout=30)
+    ide.key("ctrl+d")
+    st = s.wait_until(lambda st: not st["live_active"], timeout=30)
+    ide.click_text("OUTPUT")
+    f = ide.snap()
+    c(f.has("hello ada", exact=True) and f.has("square 49", exact=True) and f.has("eof seen", exact=True),
+      "live/stdin: the program's output and its end of input")
 
 
 PROF = ('def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\n\n'

@@ -71,7 +71,9 @@ collisions.
 `examples/vm_audit101.ny` (125 checks, Nython-only) passes on both engines:
 it starts real programs with `nython [--vm] --debug-port N`, drives the
 server with a DAP client written in the test, and reads real `-m cProfile`
-dumps. `tools/ide_e2e.py` gained `live` (34 checks) and `profile` (15);
+dumps. `tools/ide_e2e.py` gained `live` (37 checks, the program's stdin
+through the Output panel's input line among them) and `profile` (15) - the
+whole suite 442 passed, 0 failed;
 `tools/ide_memprobe.py` gained `live` and `profile` probes (0 KB/event).
 
 ### The debug server (`lib/ide_debugserver.ny`, `DebugServer(bdb.Bdb)`)
