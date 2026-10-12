@@ -1190,7 +1190,10 @@ class Compiler {
     // (pushed by GET_ITER, popped by FOR_ITER on exhaustion). A `break` jumps
     // past FOR_ITER, so it must pop that iterator itself or it is left behind
     // and the *enclosing* loop's FOR_ITER advances it instead of its own.
-    struct LoopCtx { int start; std::vector<int> breaks,conts; bool is_for=false; };
+    // exc_base (round 82): how many except clauses were open when the loop
+    // began - a break/continue leaving the ones opened inside it lets go of
+    // their exceptions (exc_vars_).
+    struct LoopCtx { int start; std::vector<int> breaks,conts; bool is_for=false; size_t exc_base=0; };
     std::vector<LoopCtx> loops_;
 
     // try/finally and with: the finally blocks the code being compiled is
@@ -1208,6 +1211,17 @@ class Compiler {
     void jump_to_finally(int l){
         fin_stack_.back().jumps.push_back(C().here());
         emit(Op::JUMP_ABSOLUTE,-1,l);
+    }
+    // round 82: a break/continue inside except clauses of the innermost loop
+    // leaves them: their hidden exception variables go, as the clause's own
+    // end deletes them. Kept, the exception stayed "being handled" - every
+    // later exception got it as __context__, a chain that grew for as long as
+    // the loop ran (an accept loop's `except BlockingIOError: ...; continue`
+    // kept every one).
+    void release_loop_excs(int l){
+        if(loops_.empty()) return;
+        for(size_t i=exc_vars_.size(); i>loops_.back().exc_base; i--)
+            emit(Op::DELETE_NAME,C().add_name(rn(exc_vars_[i-1])),l);
     }
     // True when a break/continue here leaves a try/with inside the innermost
     // loop, and so must run that statement's finally first.
@@ -1986,6 +2000,7 @@ private:
 
         // Break / Continue
         case NT::BREAK:
+            release_loop_excs(l);   // round 82
             // A break in a `for` must discard the iterator FOR_ITER would have
             // popped on natural exit; otherwise it outlives the loop.
             if(!loops_.empty() && loops_.back().is_for) emit(Op::POP_TOP,0,l);
@@ -1993,6 +2008,7 @@ private:
             else emit(Op::JUMP_ABSOLUTE,-9991,l);
             break;
         case NT::CONTINUE:
+            release_loop_excs(l);   // round 82
             if(loop_exit_crosses_finally()){ emit(Op::FIN_JUMP,-9992,l); jump_to_finally(l); }
             else emit(Op::JUMP_ABSOLUTE,-9992,l);
             break;
@@ -2221,7 +2237,7 @@ private:
     void visit_while(std::shared_ptr<nython::node::WhileNode> nd) {
         int l=ln(nd);
         int start=C().here();
-        loops_.push_back({start,{},{},false});
+        loops_.push_back({start,{},{},false,exc_vars_.size()});
         visit(nd->condition);
         int je=C().here(); emit(Op::JUMP_IF_FALSE,0,l);
         visit_stmt(nd->body);
@@ -2279,7 +2295,7 @@ private:
         // value on the stack every iteration; FOR_ITER reads stack_.back(), so
         // it then read that leftover instead of the iterator and the loop ran
         // exactly once — silently, with no error.
-        loops_.push_back({start,{},{},true});
+        loops_.push_back({start,{},{},true,exc_vars_.size()});
         int fi=C().here(); emit(Op::FOR_ITER,0,l);
         // A name declared `global` is the module's (VariableNode::global_ref).
         auto bind_loop=[&](const std::string& n){

@@ -1,6 +1,7 @@
 // NyGC.cpp - reference counting and the generational cycle collector for the
 // interpreter's heap. See include/NyGC.hpp for the model and its invariants,
 // and GC_NOTES.md for how the engine's objects plug into it.
+#include <chrono>
 #include "NyGC.hpp"
 #include "NyStr.hpp"
 #if defined(_WIN32)
@@ -260,7 +261,22 @@ void collect_due() {
     // While a program is only building (the full collections find little),
     // the factor backs off to 4 and 8, so growing a large live structure
     // does not pay a full collection at every doubling.
-    size_t h = heap_bytes();
+    //
+    // round 82: the heap is sampled at most every 4 ms, and never for more
+    // than ~5% of the time. mallinfo2 walks the allocator's free lists -
+    // milliseconds on a large, fragmented heap - and this ran at every safe
+    // point with work to do (each coroutine object's __del__ is one): 2000
+    // asyncio tasks awaiting a helper coroutine took 7 s instead of 0.3 s.
+    // The rule needs 16 MB of growth before it fires, so sampling now and
+    // then loses nothing.
+    static std::chrono::steady_clock::time_point next_sample{};
+    auto now = std::chrono::steady_clock::now();
+    size_t h = 0;
+    if (now >= next_sample) {
+        h = heap_bytes();
+        auto took = std::chrono::steady_clock::now() - now;
+        next_sample = now + std::max<std::chrono::steady_clock::duration>(std::chrono::milliseconds(4), took * 20);
+    }
     if (h && !heap_after_full) heap_after_full = h;
     if (h > heap_factor * heap_after_full && h > heap_after_full + ((size_t)16 << 20)) {
         long long before = tracked_objects();

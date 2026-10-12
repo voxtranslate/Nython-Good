@@ -931,6 +931,24 @@ Value dispatch_os_proc(NythonExecutor& E,
         return Value((int)pid);
 #endif
     }
+    // os_proc_fds(pid) -> [stdin, stdout, stderr]: the descriptors of the
+    // pipes still open to a process os_spawn started, -1 for one that is
+    // closed or was never a pipe. On Windows an open pipe is -2: it has no
+    // descriptor a poll can wait on. (round 82: asyncio waits for a child's
+    // output on its loop's reactor, so the loop is never blocked on a pipe.)
+    if (name == "os_proc_fds") {
+        long long pid = args.size() > 0 ? nyos::to_int(args[0], -1) : -1;
+        std::lock_guard<std::mutex> lk(procs_mutex());
+        auto it = procs().find(pid);
+        if (it == procs().end()) raise("ChildProcessError", "no child process with pid " + std::to_string(pid) + " was started by os_spawn");
+        Proc& p = it->second;
+#ifdef _WIN32
+        auto h = [](HANDLE x) { return Value(x == INVALID_HANDLE_VALUE ? -1 : -2); };
+        return E.makeListValue({h(p.in_h), h(p.out_h), h(p.err_h)});
+#else
+        return E.makeListValue({Value(p.in_fd), Value(p.out_fd), Value(p.err_fd)});
+#endif
+    }
     // A running process's stdin (os_spawn(..., stdin=true)): text written
     // to it, then closed for end-of-input (round 77: the IDE's Run takes
     // the program's input this way).
