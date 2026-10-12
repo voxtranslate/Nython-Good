@@ -1331,7 +1331,166 @@ if TLS is not None:
 else:
     skip("TLS (needs the openssl command)")
 
-# ── 12. Nython: structured-concurrency reports ────────────────────────────────
+# ── 12. contexts, reprs, the asyncio logger, BufferedProtocol, policies ───────
+import contextvars
+import logging
+
+cv = contextvars.ContextVar("cv", default="unset")
+
+async def contexts():
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    ctx.run(cv.set, "in ctx")
+    async def read_cv():
+        v = cv.get()
+        cv.set("changed in task")
+        return v
+    t = asyncio.create_task(read_cv(), context=ctx)
+    r = await t
+    got = []
+    loop.call_soon(lambda: got.append(cv.get()), context=ctx)
+    loop.call_soon(lambda: got.append(cv.get()))
+    await asyncio.sleep(0.01)
+    return [r, ctx[cv], cv.get(), t.get_context() is ctx if hasattr(t, "get_context") else True, got]
+check("create_task(context=) and call_soon(context=)", run(contexts()),
+      ["in ctx", "changed in task", "unset", True, ["changed in task", "unset"]])
+
+def module_cb():
+    pass
+
+async def reprs():
+    loop = asyncio.get_running_loop()
+    out = []
+    f = loop.create_future()
+    out.append(repr(f))
+    f.set_result(1)
+    out.append(repr(f))
+    f2 = loop.create_future()
+    f2.set_exception(ValueError("x"))
+    out.append(repr(f2))
+    f2.exception()
+    f3 = loop.create_future()
+    f3.cancel("why")
+    out.append(repr(f3))
+    try:
+        f3.result()
+    except asyncio.CancelledError as e:
+        out.append(e.args)
+    h = loop.call_soon(module_cb)
+    out.append(repr(h).startswith("<Handle module_cb() at "))
+    th = loop.call_later(100, print, "x")
+    out.append(repr(th).startswith("<TimerHandle when="))
+    out.append(" print(" in repr(th))
+    th.cancel()
+    out.append(repr(th).startswith("<TimerHandle cancelled when="))
+    w = loop.create_future()
+    async def waiter():
+        await w
+    tw = asyncio.create_task(waiter())
+    await asyncio.sleep(0)
+    tw.cancel()
+    try:
+        await tw
+    except asyncio.CancelledError:
+        pass
+    out.append([w.cancelled(), tw.cancelled()])
+    try:
+        f.set_result(2)
+    except asyncio.InvalidStateError:
+        out.append("InvalidStateError")
+    try:
+        loop.create_future().result()
+    except asyncio.InvalidStateError as e:
+        out.append(str(e))
+    q3 = asyncio.Queue(3)
+    out.append([repr(q3).startswith("<Queue at 0x"), repr(q3).endswith(" maxsize=3>"), str(q3)])
+    async with asyncio.timeout(10) as cm:
+        out.append(repr(cm).startswith("<Timeout [active] when="))
+    out.append(repr(cm))
+    return out
+check("reprs and future states", run(reprs()),
+      ["<Future pending>", "<Future finished result=1>", "<Future finished exception=ValueError('x')>",
+       "<Future cancelled>", ("why",), True, True, True, True, [True, True], "InvalidStateError",
+       "Result is not set.", [True, True, "<Queue maxsize=3>"], True, "<Timeout [finished]>"])
+
+class Capture(logging.Handler):
+    def __init__(self):
+        logging.Handler.__init__(self)
+        self.records = []
+    def emit(self, record):
+        self.records.append(record)
+cap = Capture()
+alog = logging.getLogger("asyncio")
+alog.addHandler(cap)
+alog.propagate = False
+
+def cb_fails():
+    raise ValueError("into the log")
+lg_loop = asyncio.new_event_loop()
+lg_loop.call_soon(cb_fails)
+lg_loop.call_soon(lg_loop.stop)
+lg_loop.run_forever()
+r0 = cap.records[0]
+check("the default exception handler logs to the 'asyncio' logger",
+      [r0.levelname, r0.getMessage().startswith("Exception in callback cb_fails() at "), "handle: <Handle cb_fails() at " in r0.getMessage(),
+       r0.exc_info[0] is ValueError], ["ERROR", True, True, True])
+def busy():
+    # CPU-bound (time.sleep in a Nython task parks the task, it does not
+    # hold up the loop)
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 0.03:
+        pass
+lg_loop.set_debug(True)
+lg_loop.slow_callback_duration = 0.01
+lg_loop.call_soon(busy)
+lg_loop.call_soon(lg_loop.stop)
+lg_loop.run_forever()
+slow = [r for r in cap.records if r.levelname == "WARNING" and r.getMessage().startswith("Executing ")]
+check("debug mode logs slow callbacks", [len(slow) >= 1, len(slow) > 0 and slow[0].getMessage().startswith("Executing <Handle busy() at "),
+                                        len(slow) > 0 and " created at " in slow[0].getMessage() and " took 0.0" in slow[0].getMessage()], [True, True, True])
+lg_loop.close()
+alog.removeHandler(cap)
+alog.propagate = True
+
+async def buffered():
+    loop = asyncio.get_running_loop()
+    async def send_some(reader, writer):
+        writer.write(b"buffered protocol data")
+        await writer.drain()
+        writer.close()
+    server = await asyncio.start_server(send_some, "127.0.0.1", 0)
+    done = loop.create_future()
+    class BufReader(asyncio.BufferedProtocol):
+        def __init__(self):
+            self.buf = bytearray(4)
+            self.data = b""
+            self.sizes = []
+        def get_buffer(self, sizehint):
+            return self.buf
+        def buffer_updated(self, nbytes):
+            self.sizes.append(nbytes)
+            self.data += bytes(self.buf[:nbytes])
+        def eof_received(self):
+            done.set_result(self.data)
+    tr, pr = await loop.create_connection(BufReader, "127.0.0.1", server.sockets[0].getsockname()[1])
+    same = tr.get_protocol() is pr
+    data = await asyncio.wait_for(done, 5)
+    out = [data, max(pr.sizes) <= 4, same]
+    server.close()
+    await server.wait_closed()
+    return out
+check("BufferedProtocol reads into the protocol's buffer", run(buffered()), [b"buffered protocol data", True, True])
+
+pol = asyncio.get_event_loop_policy()
+nl = pol.new_event_loop()
+asyncio.set_event_loop(nl)
+check("the event loop policy", [isinstance(pol, asyncio.DefaultEventLoopPolicy), asyncio.get_event_loop() is nl,
+                                isinstance(nl, asyncio.AbstractEventLoop), isinstance(nl, asyncio.SelectorEventLoop),
+                                nl.time() <= time.monotonic()], [True, True, True, True, True])
+asyncio.set_event_loop(None)
+nl.close()
+
+# ── 13. Nython: structured-concurrency reports ───────────────────────────────
 if nython:
     async def leaves_children():
         loop = asyncio.get_running_loop()

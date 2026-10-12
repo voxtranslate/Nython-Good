@@ -453,11 +453,14 @@ class Handle:
         except (SystemExit, KeyboardInterrupt) as e:
             lo._interrupt(e)
         except BaseException as exc:
-            var ctx = {"message": "Exception in callback " + _format_callback_source(self._callback, self._args),
-                       "exception": exc, "handle": self}
-            if self._source_traceback is not none:
-                ctx["source_traceback"] = self._source_traceback
-            lo.call_exception_handler(ctx)
+            # a callback parked in a blocking call (time.sleep parks the
+            # task) is cancelled when its loop closes: not an error then
+            if not (lo._closed and isinstance(exc, CancelledError)):
+                var ctx = {"message": "Exception in callback " + _format_callback_source(self._callback, self._args),
+                           "exception": exc, "handle": self}
+                if self._source_traceback is not none:
+                    ctx["source_traceback"] = [self._source_traceback]
+                lo.call_exception_handler(ctx)
         finally:
             _cb_task = prev
         if lo._debug:
@@ -587,7 +590,7 @@ class Future:
         if self._state == _CANCELLED:
             raise self._make_cancelled_error()
         if self._state != _FINISHED:
-            raise InvalidStateError("Result is not ready.")
+            raise InvalidStateError("Result is not set.")
         self._log_traceback = false
         if self._exception is not none:
             raise self._exception
@@ -1782,13 +1785,19 @@ class Queue:
         self._all_done.set()
         self._shutdown = false
 
-    def __repr__(self):
-        var s = "<" + type(self).__name__ + " maxsize=" + repr(self._maxsize)
-        if self.qsize() > 0:
+    def _format(self):
+        var s = "maxsize=" + repr(self._maxsize)
+        if self._unfinished > 0:
             s = s + " tasks=" + str(self._unfinished)
         if self._shutdown:
             s = s + " shutdown"
-        return s + ">"
+        return s
+
+    def __repr__(self):
+        return "<" + type(self).__name__ + " at 0x" + format(id(self), "x") + " " + self._format() + ">"
+
+    def __str__(self):
+        return "<" + type(self).__name__ + " " + self._format() + ">"
 
     @property
     def maxsize(self):
