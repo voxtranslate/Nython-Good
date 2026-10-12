@@ -639,6 +639,9 @@ class Connection:
 
     # -- statements ---------------------------------------------------------
     def _prepare(self, sql):
+        lim = _sql_limit(self._h, 1, -1)              # SQLITE_LIMIT_SQL_LENGTH
+        if len(sql) * 4 > lim and len(sql.encode("utf-8")) > lim:
+            raise DataError("query string is too large")
         if "\0" in sql:
             raise ProgrammingError("the query contains a null character")
         r = self._drive(_sql_prepare(self._h, sql, 0))
@@ -1248,13 +1251,15 @@ class Cursor:
             raise ValueError("embedded null character")
         con = self._connection
         h = con._h
+        script = sql_script.encode("utf-8")
+        if len(script) > _sql_limit(h, 1, -1):
+            raise DataError("query string is too large")
         self._reset()
         self._stmt = None
         if con._autocommit == LEGACY_TRANSACTION_CONTROL and not _sql_autocommit(h):
             r = con._drive(_sql_exec(h, "COMMIT"))
             if r[1] != 0:
                 raise con._error()
-        script = sql_script.encode("utf-8")
         off = 0
         n = len(script)
         while True:
