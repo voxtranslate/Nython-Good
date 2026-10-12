@@ -149,9 +149,7 @@ static const std::set<std::string> builtin_set = {
 // old bigint_to_i64 went through a decimal string and std::stoll on every
 // arithmetic operation (a quarter of a call-heavy loop's time) and returned 0
 // for anything past 64 bits.
-// (round 82: always inlined - every int operand asks, and as a call it was
-// 2-3% of the call-heavy benchmarks)
-[[gnu::always_inline]] inline bool bigint_fits_i64(const nython::kernel::bigint& b, int64_t& out) {
+inline bool bigint_fits_i64(const nython::kernel::bigint& b, int64_t& out) {
     const auto& d = b.limbs();
     size_t n = d.size();
     while (n && d[n - 1] == 0) n--;
@@ -960,7 +958,13 @@ public:   // NythonExecutor is a struct: members default to public
         Value value;              // a pending return's value
         std::string exc;          // a pending exception (round 82)
     };
-    static FlowState& flow() { static thread_local FlowState f; return f; }
+    // round 82: reached through a constant-initialized per-thread pointer, so
+    // a use is one TLS load and a test: the function-local thread_local put
+    // its guard and constructor at every inlined use, and the hot checks
+    // (pendingSet) stopped being inlined
+    static inline constinit thread_local FlowState* t_flow_ = nullptr;
+    [[gnu::noinline, gnu::cold]] static FlowState& flowInit() { static thread_local FlowState f; t_flow_ = &f; return f; }
+    static FlowState& flow() { FlowState* p = t_flow_; return __builtin_expect(p != nullptr, 1) ? *p : flowInit(); }
     static constexpr int kPendExc = 4;   // round 82
     // round 82: the exception leaves by the flag
     static void pendExc(std::string e) { FlowState& f = flow(); f.exc = std::move(e); f.pending = kPendExc; }
@@ -1048,7 +1052,7 @@ public:   // NythonExecutor is a struct: members default to public
     // (see FlowState): the nodes that can raise one that way are given leave
     // (`pend`), the rest are evaluated as by evalNode.
     Value evalP(const node_ptr& n, Context* ctx) { return evalNode(n, ctx, true); }
-    static bool pendingSet() { return __builtin_expect(flow().pending != 0, 0); }
+    [[gnu::always_inline]] static bool pendingSet() { return __builtin_expect(flow().pending != 0, 0); }
 
     // `pend` (round 82): see evalP - handed to the evaluators that take it
     Value evalNode(const node_ptr& node, Context* ctx, bool pend = false) {
@@ -8798,13 +8802,10 @@ public:
                 if (__builtin_expect(cn->plain_args < 0, 0)) cn->plain_args = plainCallArgs(cn) ? 1 : 0;
                 if (cn->plain_args && cn->args.size() < kFastArgs) {
                     ArgBuf argv;
-                    if (pend) {   // round 82: an argument's exception by the flag
-                        for (auto& a : cn->args) {
-                            argv.push(evalP(a, ctx));
-                            if (pendingSet()) return NONE_VALUE;
-                        }
-                    } else
-                    for (auto& a : cn->args) argv.push(evalNode(a, ctx));
+                    for (auto& a : cn->args) {
+                        argv.push(evalNode(a, ctx, pend));
+                        if (pend && pendingSet()) return NONE_VALUE;   // round 82: by the flag
+                    }
                     {
                         Value out;
                         if (methodFast(cn, method_name, obj, argv, ctx, out, pend)) return out;
@@ -9070,13 +9071,10 @@ public:
             const std::vector<std::string>* names = (cn->plain_args && code && na <= kFastArgs) ? simpleParams(code) : nullptr;
             if (names && names->size() == na && astSpecOn()) {
                 ArgBuf argv;
-                if (pend) {   // round 82: an argument's exception by the flag
-                    for (size_t i = 0; i < na; i++) {
-                        argv.push(evalP(cn->args[i], ctx));
-                        if (pendingSet()) return NONE_VALUE;
-                    }
-                } else
-                for (size_t i = 0; i < na; i++) argv.push(evalNode(cn->args[i], ctx));
+                for (size_t i = 0; i < na; i++) {
+                    argv.push(evalNode(cn->args[i], ctx, pend));
+                    if (pend && pendingSet()) return NONE_VALUE;   // round 82: by the flag
+                }
                 nyheap::Func* fo = static_cast<nyheap::Func*>(callee.value.o);
                 Context* cp = fo->scope ? scopeOf(fo->scope) : ctx;
                 const bool is_def = code->type() == NodeType::FUNCTION;
@@ -10598,15 +10596,12 @@ public:
     Value evalReturn(const node_ptr& node, Context* ctx) {
         auto* rn = static_cast<ReturnNode*>((node).get());
         // round 82: `return f(x)` - the call's exception may come back by
-        // the flag (evalP), and leaves as the statement's
-        if (rn->expr && canPend(ctx)) {
-            Value val = evalP(rn->expr, ctx);
-            FlowState& f = flow();
-            if (f.pending) return NONE_VALUE;
-            f.value = val; f.pending = 1; return val;
-        }
-        Value val = rn->expr ? evalNode(rn->expr, ctx) : NONE_VALUE;
+        // the flag (evalP), and leaves as the statement's (val is none then;
+        // one named value, so it is built in place)
+        const bool pend = rn->expr && canPend(ctx);
+        Value val = rn->expr ? evalNode(rn->expr, ctx, pend) : NONE_VALUE;
         FlowState& f = flow();
+        if (pend && f.pending) return val;
         if (ctx && f.fast_ctx == ctx) { f.value = val; f.pending = 1; return val; }
         throw nython::node::ReturnSignal{val};
     }
