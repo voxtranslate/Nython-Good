@@ -148,20 +148,30 @@ CPython or out; done here, each reproduced first:
   handle number.
 
 ### Verified
-- vm_audit106 25/25 on both engines and under python3; vm_audit67, 104, 49,
+- vm_audit106 27/27 on both engines (26 under python3: the native-object
+  check is Nython-only); vm_audit67, 104, 49,
   97, 76, 77, 93 on both engines; `python3 tools/sweep.py` 437 runs, only
   vm_audit49's pinned message failing (adapted, then 54/54 on both
   engines); `tools/ide_e2e.py` 463 passed; `ide_memprobe --check` passes;
   lint, classcheck, cbp clean.
 
+- **"Task exception was never retrieved" / "Future exception was never
+  retrieved"**: NyConc's Task records whether its error was handed to anyone
+  (`err_seen`: an await, `task_result`, gather - which takes every child's
+  outcome, as CPython's - a hand-driven coroutine, async_run's main task);
+  the new native `task_error_unseen(h)` tells asyncio's `Task.__del__`,
+  which reports through the loop's exception handler as CPython's
+  `Future.__del__`; asyncio's own Future reports from its `_log_traceback`.
+  So that a dropped finished task is collected at all, the task registry
+  (`_tasks`) lets go of a task when its body ends (`_forget_when_done`; it
+  kept finished ones until the table doubled).
+- **The native objects under asyncio's Event, Lock, Semaphore and Queue are
+  freed** with them (`__del__` -> the new native `sync_free(h)`, which drops
+  an event/semaphore/mutex/condition/rwlock/barrier/latch/atomic/channel
+  only while nothing waits on it - a waiter holds it by address; part B
+  found them kept for the life of the process).
+
 ### Not done
-- "Task exception was never retrieved" is not reported: the runtime does
-  not record whether a task's error was observed by an `await` (the library
-  only sees `result()`/`exception()`), so a `__del__` report would have
-  false positives. Needs a flag in NyConc's Task set when its error is
-  delivered.
-- Native handles of asyncio's Event/Lock/Queue (NyConc events, semaphores,
-  queues) are still never freed (part B's finding).
 - `threading.get_ident()` inside a task is still the task's record id
   (CPython: the thread's); only the asyncgen hooks use `thread_os_id()`.
 

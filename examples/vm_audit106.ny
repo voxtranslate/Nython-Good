@@ -521,6 +521,83 @@ check("gc: enable/disable, collect with callbacks, thresholds, stats", gc_api(),
       [True, False, True, ["start", "stop"], ["collected", "generation", "uncollectable"], "invalid generation", 1234, True,
        3, ["collected", "collections", "uncollectable"], 3, False, False, True, True, []])
 
+# ── exceptions nobody retrieved ───────────────────────────────────────────
+async def unretrieved():
+    loop = asyncio.get_running_loop()
+    seen = []
+    loop.set_exception_handler(lambda lp, ctx: seen.append((ctx["message"], type(ctx.get("exception")).__name__)))
+    async def boom():
+        raise ValueError("lost")
+    t = asyncio.create_task(boom())
+    await asyncio.sleep(0.01)
+    del t
+    gc.collect()
+    await asyncio.sleep(0)
+    t2 = asyncio.create_task(boom())          # awaited: not reported
+    try:
+        await t2
+    except ValueError:
+        pass
+    del t2
+    t3 = asyncio.create_task(boom())          # exception() asked: not reported
+    await asyncio.sleep(0.01)
+    t3.exception()
+    del t3
+    t4 = asyncio.create_task(asyncio.sleep(5))   # cancelled: not reported
+    await asyncio.sleep(0)
+    t4.cancel()
+    await asyncio.sleep(0.01)
+    del t4
+    t5 = asyncio.create_task(boom())          # gathered: not reported
+    await asyncio.gather(t5, return_exceptions=True)
+    del t5
+    f = loop.create_future()                  # a Future: reported too
+    f.set_exception(KeyError("k"))
+    del f
+    gc.collect()
+    await asyncio.sleep(0)
+    loop.set_exception_handler(None)
+    return seen
+
+check("exceptions nobody retrieved are reported when their task/future goes", asyncio.run(unretrieved()),
+      [("Task exception was never retrieved", "ValueError"), ("Future exception was never retrieved", "KeyError")])
+
+# ── native objects under asyncio's primitives are freed (Nython-only) ─────
+if sys.implementation.name == "nython":
+    def freed(h):
+        try:
+            semaphore_value(h)
+            return False
+        except ValueError:
+            return True
+    lk = asyncio.Lock()
+    h_lock = lk._sem
+    sem = asyncio.Semaphore(3)
+    h_sem = sem._sem
+    alive_before = [freed(h_lock), freed(h_sem)]
+    del lk, sem
+    gc.collect()
+    q = asyncio.Queue()
+    hq = q._q
+    ev = asyncio.Event()
+    hev = ev._id
+    del q, ev
+    gc.collect()
+    def gone_q(h):
+        try:
+            queue_size(h)
+            return False
+        except ValueError:
+            return True
+    def gone_ev(h):
+        try:
+            event_is_set(h)
+            return False
+        except ValueError:
+            return True
+    check("asyncio Lock/Semaphore/Queue/Event free their native objects", [alive_before, freed(h_lock), freed(h_sem), gone_q(hq), gone_ev(hev)],
+          [[False, False], True, True, True, True])
+
 # ── os.sendfile ───────────────────────────────────────────────────────────
 if hasattr(os, "sendfile") and POSIX:
     a, b = socket.socketpair()

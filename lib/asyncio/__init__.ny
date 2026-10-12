@@ -109,9 +109,8 @@
 #   - a callback or task that raises KeyboardInterrupt/SystemExit stops the
 #     loop and the exception leaves run_until_complete/run_forever, as in
 #     CPython, but only for loop callbacks and the task being run;
-#   - "Task exception was never retrieved" is not reported (the runtime
-#     does not record whether an await observed a task's error), and the
-#     native handles under Event/Lock/Queue are not freed.
+#   - nothing more listed here: the native objects under Event, Lock,
+#     Semaphore and Queue are freed with them (round 82).
 import socket
 import os
 import sys
@@ -397,6 +396,14 @@ def new_event_loop():
 # wait is over, instead of one per future for the life of the process.
 _ev_pool = []
 
+def _free_native(h):
+    # a runtime event/semaphore/queue nothing waits on is freed (round 82)
+    if h:
+        try:
+            sync_free(h)
+        except BaseException:
+            pass
+
 def _ev_get():
     if len(_ev_pool) > 0:
         return _ev_pool.pop()
@@ -583,6 +590,14 @@ class Future:
         self._waiters = 0
         self._log_traceback = false
 
+    def __del__(self):
+        # an exception nobody retrieved, reported when the future goes, as
+        # CPython's Future.__del__ (round 82)
+        if not getattr(self, "_log_traceback", false):
+            return
+        self._log_traceback = false
+        _report_unretrieved(self, self.__class__.__name__, self._exception)
+
     def _repr_info(self):
         var info = [string_lower(self._state)]
         if self._state == _FINISHED:
@@ -727,6 +742,19 @@ def _cancel_text(e):
         return none
     return m
 
+def _report_unretrieved(fut, kind, exc):
+    var loop = getattr(fut, "_loop", none)
+    if loop is none:
+        return
+    var ctx = {"message": kind + " exception was never retrieved", "exception": exc, "future": fut}
+    var tb = getattr(fut, "_source_traceback", none) or getattr(fut, "_created_at", none)
+    if tb is not none:
+        ctx["source_traceback"] = tb if isinstance(tb, list) else [tb]
+    try:
+        loop.call_exception_handler(ctx)
+    except BaseException:
+        pass
+
 def _set_result_unless_cancelled(fut, result):
     if fut.cancelled():
         return
@@ -815,6 +843,13 @@ def _forget_done():
     for h in gone:
         del _tasks[h]
 
+async def _forget_when_done(box, body):
+    try:
+        return await body
+    finally:
+        if box[0] != 0:
+            _tasks.pop(box[0], none)
+
 def _register(t):
     # Tasks are kept here until they are done (the loop holds them, as
     # CPython's does); finished ones are dropped as the table doubles.
@@ -894,8 +929,15 @@ class Task(Future):
                     parent._children = []
                 parent._children.append(self)
             body = _tracked(self, body)
-        self._h = loop._spawn(body, eager_start)
+        # the registry lets go of it when its body ends (round 82): a
+        # finished task the program dropped is collected, as CPython's,
+        # and an error nobody retrieved is reported then
+        var box = [0]
+        self._h = loop._spawn(_forget_when_done(box, body), eager_start)
+        box[0] = self._h
         _register(self)
+        if task_done(self._h):
+            _tasks.pop(self._h, none)
 
     def __repr__(self):
         var info = []
@@ -928,9 +970,18 @@ class Task(Future):
 
     def __del__(self):
         # nothing can ask the runtime about this task any more: its records
-        # are freed once it has finished
+        # are freed once it has finished - after reporting an error nobody
+        # awaited or asked for (round 82: "Task exception was never
+        # retrieved", as CPython's Future.__del__)
         var h = getattr(self, "_h", 0)
         if h:
+            if task_error_unseen(h):
+                var exc = none
+                try:
+                    task_result(h)
+                except BaseException as e:
+                    exc = e
+                _report_unretrieved(self, "Task", exc)
             async_task_detach(h)
 
     def get_coro(self):
@@ -1670,6 +1721,10 @@ class Event:
     def __init__(self):
         self._id = event_create()
 
+    def __del__(self):
+        # its native object goes with it (round 82: kept for the process)
+        _free_native(getattr(self, "_id", 0))
+
     def __repr__(self):
         return "<asyncio.locks.Event object [" + ("set" if self.is_set() else "unset") + "]>"
 
@@ -1690,6 +1745,10 @@ class Lock:
     # Not reentrant, no owner: any task may release it (as in Python).
     def __init__(self):
         self._sem = semaphore_create(1, 1)
+
+    def __del__(self):
+        # its native object goes with it (round 82: kept for the process)
+        _free_native(getattr(self, "_sem", 0))
 
     def __repr__(self):
         return "<asyncio.locks.Lock object [" + ("locked" if self.locked() else "unlocked") + "]>"
@@ -1719,6 +1778,10 @@ class Semaphore:
         if value < 0:
             raise ValueError("Semaphore initial value must be >= 0")
         self._sem = semaphore_create(value)
+
+    def __del__(self):
+        # its native object goes with it (round 82: kept for the process)
+        _free_native(getattr(self, "_sem", 0))
 
     def locked(self):
         return semaphore_value(self._sem) == 0
@@ -1914,6 +1977,10 @@ class Queue:
         self._all_done = Event()
         self._all_done.set()
         self._shutdown = false
+
+    def __del__(self):
+        # its native object goes with it (round 82: kept for the process)
+        _free_native(getattr(self, "_q", 0))
 
     def _format(self):
         var s = "maxsize=" + repr(self._maxsize)

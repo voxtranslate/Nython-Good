@@ -5785,4 +5785,6 @@ Full detail in `HANDOFF.md` §0u (part C), §0u2 (part B). New tests: `vm_audit1
 | `shutdown_asyncgens()` closed nothing; no `sys.set_asyncgen_hooks` | async generators were not tracked | hooks in the prelude's async generators (firstiter, finalizer from `__del__`), installed by the running loop |
 | `import gc` failed | no module | `lib/gc.ny` over the engines' collector |
 | `f.fileno()` was 1000 and up; `select([f])` reported it ready at once | the file object's handle number, not its descriptor | `file_fileno`: the OS descriptor |
+| A failed task nobody awaited was never reported | the runtime did not record whether a task's error was handed out; finished tasks stayed in asyncio's registry | `Task::err_seen` + `task_error_unseen`; `Task.__del__`/`Future.__del__` report through the exception handler; the registry drops a task when its body ends |
+| asyncio's Event/Lock/Semaphore/Queue kept their native objects forever | the runtime never freed sync objects | `sync_free(h)` (refused while anything waits), called from their `__del__` |
 

@@ -685,6 +685,10 @@ struct Task : Obj {
     bool has_cancel_msg = false;
     std::string cancel_msg;
     int64_t coro_id = 0;                     // round 82: the coroutine it runs (ensure_task_locked)
+    // round 82: its error was handed to someone (an await, task_result,
+    // gather, a hand-driven coroutine): asyncio reports a failed task whose
+    // error nobody saw ("Task exception was never retrieved") when it goes
+    bool err_seen = false;
 };
 
 // A task waiting for a socket or pipe to be ready (wait_io, section 9).
@@ -1736,7 +1740,7 @@ static BoxPtr async_run(Engine& e, const Awaitable::Item& main_item) {
     }
     if (loop_failed) throw loop_err;
     std::lock_guard<std::mutex> l(RT().m);
-    if (main_task->failed) throw main_task->err;
+    if (main_task->failed) { main_task->err_seen = true; throw main_task->err; }
     return main_task->result ? main_task->result : e.box_none();
 }
 
@@ -1750,7 +1754,7 @@ static BoxPtr run_call_later(Engine& e, ThreadRec* self, Awaitable* a) {
 }
 
 static BoxPtr task_outcome_locked(Engine& e, Task* t) {
-    if (t->failed) throw t->err;
+    if (t->failed) { t->err_seen = true; throw t->err; }
     return t->result ? t->result : e.box_none();
 }
 
@@ -1959,6 +1963,7 @@ static Ret coro_drive(Engine& e, int64_t h, int mode, const BoxPtr& val, bool va
     c->finished = true;
     c->awaiting = nullptr; c->frame = nullptr; c->out_val = nullptr;
     if (t->failed) {
+        t->err_seen = true;
         if (mode == 2 && err_is(t->err, "GeneratorExit")) return Ret::lst({Ret::integer(1), Ret::none()});
         if (err_is(t->err, "StopIteration")) raise("RuntimeError", "coroutine raised StopIteration");
         throw t->err;
@@ -2124,6 +2129,9 @@ static Ret gather_in_loop(Engine& e, Awaitable* a, ThreadRec* self, Loop* L) {
     std::lock_guard<std::mutex> l(RT().m);
     Task* first_fail = nullptr;
     for (auto* t : ts) if (t->done && t->failed && (!first_fail || t->done_seq < first_fail->done_seq)) first_fail = t;
+    // gather takes every child's outcome (CPython's gather calls exception()
+    // on each child as it finishes): none of them is reported unseen
+    for (auto* t : ts) if (t->done && t->failed) t->err_seen = true;
     if (first_fail && !rex) throw first_fail->err;
     std::vector<Ret> out;
     for (auto* t : ts) {
@@ -3246,6 +3254,46 @@ static std::unordered_map<std::string, Handler>& table() {
         T["task_cancelled"] = [](Engine&, const Args& a) {
             std::lock_guard<std::mutex> l(RT().m);
             return Ret::boolean(get_obj<Task>(H(a, 0, "task_cancelled"), "task")->cancelled);
+        };
+        // sync_free(h): forget a synchronisation object nothing waits on - an
+        // event, semaphore, mutex, condition, rwlock, barrier, latch, atomic
+        // or channel/queue (round 82: asyncio's Lock/Event/Semaphore/
+        // Condition/Queue free theirs from __del__; the runtime kept every
+        // one for the life of the process). False, and nothing done, while a
+        // thread or task waits on it (a waiter holds it by address) or for a
+        // handle that is no such object.
+        T["sync_free"] = [](Engine&, const Args& a) {
+            std::shared_ptr<Obj> keep;
+            {
+                std::lock_guard<std::mutex> l(RT().m);
+                if (a.size() < 1 || !a.is_number(0)) return Ret::boolean(false);
+                auto it = RT().objs.find(a.as_int(0));
+                if (it == RT().objs.end()) return Ret::boolean(false);
+                Obj* o = it->second.get();
+                bool idle = false;
+                if (auto* x = dynamic_cast<Sema*>(o)) idle = x->wq.empty();
+                else if (auto* x = dynamic_cast<Event*>(o)) idle = x->wq.empty();
+                else if (auto* x = dynamic_cast<Mutex*>(o)) idle = x->wq.empty() && !x->owner && !x->heir;
+                else if (auto* x = dynamic_cast<Cond*>(o)) idle = x->waiters.empty();
+                else if (auto* x = dynamic_cast<RWLock*>(o)) idle = x->rq.empty() && x->wq.empty() && !x->writer && x->readers.empty() && !x->heir;
+                else if (auto* x = dynamic_cast<Barrier*>(o)) idle = x->wq.empty();
+                else if (auto* x = dynamic_cast<Latch*>(o)) idle = x->wq.empty();
+                else if (dynamic_cast<Atom*>(o)) idle = true;
+                else if (auto* x = dynamic_cast<Chan*>(o)) idle = x->wq.empty() && x->recv_waiting == 0;
+                if (!idle) return Ret::boolean(false);
+                keep = it->second;
+                RT().objs.erase(it);
+            }
+            keep.reset();   // a channel's items (engine values) go outside the runtime mutex
+            return Ret::boolean(true);
+        };
+        // task_error_unseen(h): it failed (not cancelled) and its error was
+        // never handed to anyone - asyncio's "Task exception was never
+        // retrieved" (round 82)
+        T["task_error_unseen"] = [](Engine&, const Args& a) {
+            std::lock_guard<std::mutex> l(RT().m);
+            Task* t = get_obj<Task>(H(a, 0, "task_error_unseen"), "task");
+            return Ret::boolean(t->done && t->failed && !t->cancelled && !t->err_seen && !is_cancel_error(t->err));
         };
         T["task_result"] = [](Engine& e, const Args& a) {
             std::lock_guard<std::mutex> l(RT().m);
