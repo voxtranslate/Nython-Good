@@ -257,6 +257,10 @@ class IDELive(IDETools):
         if not self._is_text() or self.doc().lang != "nython":
             self._notify("Open a Nython file to debug it", "warn")
             return
+        if self.job_running and self.job_mode == "Live":
+            # the last session's program is still going away: start once it has
+            self.live_restart = true
+            return
         if self.job_running:
             self._notify("A program is already running - stop it first (Shift+F5)", "warn")
             return

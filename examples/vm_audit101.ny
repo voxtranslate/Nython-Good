@@ -60,10 +60,14 @@ def free_port():
 
 # ── a DAP client ─────────────────────────────────────────────────────────────
 class Dap:
-    def __init__(self, prog, args=None):
+    def __init__(self, prog, args=None, stdin_text=None):
         self.port = free_port()
         self.proc = subprocess.Popen([exe] + engine + ["--debug-port", str(self.port), prog] + (args or []),
-                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                     stdin=subprocess.PIPE if stdin_text is not None else None)
+        if stdin_text is not None:
+            self.proc.stdin.write(stdin_text)
+            self.proc.stdin.close()
         self.sock = None
         var t0 = time.monotonic()
         while self.sock is None and time.monotonic() - t0 < 20:
@@ -510,6 +514,15 @@ check("next out of the module's function, back in the program", d.stack()[0][:2]
 d.req("continue", {"threadId": 1})
 check("its result", [d.finish(), d.out], [0, "42\n"])
 
+# the program's own stdin and argv are its own: the protocol has a socket
+var p7 = tmp_file("p7", "import sys\nname = input(\"Name? \")\nprint(\"hi\", name, sys.argv[1:])\n")
+d = Dap(p7, ["a1", "b2"], "ada\n")
+d.start({p7: [{"line": 3}]})
+st = d.event("stopped")
+check("a breakpoint after input()", [st["reason"], d.values()["name"]], ["breakpoint", "'ada'"])
+d.req("continue", {"threadId": 1})
+check("stdin, stdout and sys.argv under the debug server", [d.finish(), d.out], [0, "Name? hi ada ['a1', 'b2']\n"])
+
 # ── 4. the profile view's reader ─────────────────────────────────────────────
 var PROG6 = """def fib(n):
     if n < 2:
@@ -592,7 +605,7 @@ check("derived: recursion folds into the call on the path", len(dfib), 1)
 check("a file that is not a dump", [ProfileData().load(p6), ProfileData().load(p6 + ".missing")], [False, False])
 os.remove(out6)
 
-for pth in [p1, p2, p3, p4, p5, p6, lib_p]:
+for pth in [p1, p2, p3, p4, p5, p6, p7, lib_p]:
     os.remove(pth)
 
 # ── report ───────────────────────────────────────────────────────────────────

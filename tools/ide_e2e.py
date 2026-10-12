@@ -867,6 +867,8 @@ def sc_debug_why(s):
 LIVE = ('def total(n):\n    s = 0\n    i = 0\n    while i < n:\n        s = s + i\n        i = i + 1\n'
         '    return s\n\nvar data = [4, 5]\nvar r = total(4)\nprint("total", r)\n')
 SPIN = 'var stop = false\nvar n = 0\nwhile not stop:\n    n = n + 1\nprint("stopped at", n > 0)\n'
+EXC = ('def check(x):\n    if x > 0:\n        raise ValueError("bad " + str(x))\n    return x\n\n'
+       'try:\n    check(1)\nexcept ValueError as e:\n    print("caught", e)\nprint("end")\n')
 
 
 def sc_live_debug(s):
@@ -876,9 +878,11 @@ def sc_live_debug(s):
     sets a variable, Step Back travels through the server's ring buffer,
     Why? is answered from it, and the program runs to its end with the
     values set while paused."""
+    s.write("live.ny", LIVE)
+    s.write("spin.ny", SPIN)
+    s.write("exc.ny", EXC)
     ide = s.start()
     c = s.res.check
-    s.write("live.ny", LIVE)
     s.open_file("live.ny")
     ide.key("ctrl+g")
     ide.type("5\n")
@@ -975,8 +979,6 @@ def sc_live_debug(s):
     st = ide.state()
     c(any("exited with code 0" in ln for ln in st["dbgcon"]), "live: the exit code in the Debug Console", st["dbgcon"][-3:])
     # pause interrupts a running loop
-    s.write("spin.ny", SPIN)
-    time.sleep(1.5)
     ide.key("ctrl+p")
     ide.type("spin.ny")
     ide.key("enter")
@@ -1000,12 +1002,38 @@ def sc_live_debug(s):
             break
         time.sleep(0.1)
     c(ok and not st["live_active"], "live: setting the flag ends the loop, the program finishes")
-    # Stop ends a session at once
+    # Restart starts the program again; Stop ends a session at once
     ide.key("alt+f5")
     s.wait_until(lambda st: st["live_state"] == "running", timeout=30)
+    ide.key("ctrl+shift+f5")
+    st = s.wait_until(lambda st: st["live_state"] == "running", timeout=30)
+    time.sleep(0.3)
+    ide.key("f6")
+    st = s.wait_until(lambda st: st["live_state"] == "paused" and st["live_vars"], timeout=30)
+    c(st["live_state"] == "paused" and [1, "stop", "false"] in st["live_vars"], "live: Ctrl+Shift+F5 restarts the program",
+      (st["live_state"], st["live_vars"][:4]))
     ide.key("shift+f5")
-    st = s.wait_until(lambda st: not st["live_active"] and st["status"] != "", timeout=10)
+    st = s.wait_until(lambda st: not st["live_active"], timeout=10)
     c(not st["live_active"], "live: Shift+F5 stops the live session", st["live_state"])
+    # exception breakpoints: a raised one stops where it is raised
+    ide.key("ctrl+p")
+    ide.type("exc.ny")
+    ide.key("enter")
+    st = ide.state()
+    c(st["title"] == "exc.ny", "live: exc.ny opened", st["title"])
+    ide.click_text("Raised Exceptions")
+    st = ide.state()
+    c(st["live_exc"] == [True, True], "live: the Raised Exceptions checkbox", st["live_exc"])
+    ide.key("alt+f5")
+    st = s.wait_until(lambda st: st["live_state"] == "paused" and st["live_frames"], timeout=30)
+    c(st["live_reason"] == "exception" and st["live_exc_text"] == "ValueError: bad 1" and st["live_frames"][0] == ["check", 3],
+      "live: stopped where the exception was raised", (st["live_reason"], st["live_exc_text"], st["live_frames"]))
+    c(ide.snap().has("ValueError: bad 1", exact=True), "live: the exception shown in the view")
+    ide.key("f5")
+    st = s.wait_until(lambda st: not st["live_active"], timeout=30)
+    c(not st["live_active"] and any("exited with code 0" in ln for ln in st["dbgcon"]),
+      "live: the caught exception lets the program finish", st["dbgcon"][-3:])
+    ide.click_text("Raised Exceptions")
 
 
 PROF = ('def fib(n):\n    if n < 2:\n        return n\n    return fib(n - 1) + fib(n - 2)\n\n'

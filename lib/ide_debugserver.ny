@@ -443,11 +443,8 @@ class DebugServer(bdb.Bdb):
         if event == "line":
             if self.quitting:
                 return None
-            if self._attn and self._attend(frame):
-                return self._td
             top = self._top
-            bps = self._bps.get(top[0])
-            sf = self.stopframe
+            line = 0
             if self._ring_n:
                 _ny_frame_sync(frame)
                 line = frame._ny_line
@@ -458,11 +455,17 @@ class DebugServer(bdb.Bdb):
                     i = 0
                 self._ring_i = i
                 self._ring_total = self._ring_total + 1
-            elif bps or sf is None or frame is sf:
-                _ny_frame_sync(frame)
-                line = frame._ny_line
-            else:
+            # (a pause stops here: the line it stops at is in the history)
+            if self._attn and self._attend(frame):
                 return self._td
+            bps = self._bps.get(top[0])
+            sf = self.stopframe
+            if not self._ring_n:
+                if bps or sf is None or frame is sf:
+                    _ny_frame_sync(frame)
+                    line = frame._ny_line
+                else:
+                    return self._td
             if bps:
                 b = bps.get(line)
                 if b is not None:
