@@ -793,14 +793,23 @@ struct BridgeConv {
         if (!c || !c->container) return VMVal::make_none();
         auto oit = origin_of.find(c);
         if (oit != origin_of.end()) return origin[oit->second].second;
+        // one VM value per interpreter container (round 80): a container
+        // the result holds twice stays one object (pickle.loads of a shared
+        // list gave two copies), and a cycle stays a cycle
+        auto bit = built.find(c);
+        if (bit != built.end()) return bit->second;
         return build(c);
     }
+    std::unordered_map<const Container*, VMVal> built;
 
     // Converts a container's contents, without consulting its own origin.
     VMVal build(Container* c) {
         auto& m = *c->container;
         auto len_it = m.find("__len__");
         if (len_it != m.end()) {
+            bool plain_list = !m.count("__set__") && !m.count("__tuple__");
+            VMVal r;
+            if (plain_list) { r = VMVal::make_list({}); built[c] = r; }
             std::vector<VMVal> out;
             int64_t n = bigint_to_i64(len_it->second.value.i);
             out.reserve((size_t)std::max<int64_t>(n, 0));
@@ -808,16 +817,28 @@ struct BridgeConv {
                 auto it = m.find(std::to_string(i));
                 out.push_back(it == m.end() ? VMVal::make_none() : to_vm(it->second));
             }
-            if (m.count("__set__") && vm) return vm->make_set_value(out, NythonExecutor::isFrozenCont(c));
-            return m.count("__tuple__") ? VMVal::make_tuple(std::move(out)) : VMVal::make_list(std::move(out));
+            if (plain_list) { *r.list = std::move(out); return r; }
+            if (m.count("__set__") && vm) r = vm->make_set_value(out, NythonExecutor::isFrozenCont(c));
+            else r = VMVal::make_tuple(std::move(out));
+            built[c] = r;
+            return r;
         }
         VMVal r = VMVal::make_map();
+        built[c] = r;
         for (auto& kv : m) (*r.map)[kv.first] = to_vm(kv.second);
         return r;
     }
 
     // True when the interpreter value still is what the VM value was.
     bool same(const Value& a, const VMVal& b) {
+        // (round 80) a VM value with no interpreter form (a function, a
+        // class) crossed as `opaque`: still there when that is - copy_back
+        // wrote none over every function in a container a builtin was given
+        switch (b.type) {
+            case VMType::NONE: case VMType::BOOL: case VMType::INT: case VMType::FLOAT: case VMType::STRING:
+            case VMType::BYTES: case VMType::LIST: case VMType::MAP: case VMType::INSTANCE: break;
+            default: return a.type == opaque.type;
+        }
         if (auto* bo = exec.bytesOf(a)) {
             if (b.type != VMType::BYTES || b.b != bo->mut) return false;
             for (auto& ba : barrays) if (ba.first == bo) return ba.second.list.get() == b.list.get();
@@ -867,7 +888,10 @@ struct BridgeConv {
                 out.reserve((size_t)std::max<int64_t>(n, 0));
                 for (int64_t i = 0; i < n; i++) {
                     auto it = m.find(std::to_string(i));
-                    out.push_back(it == m.end() ? VMVal::make_none() : to_vm(it->second));
+                    if (it == m.end()) { out.push_back(VMVal::make_none()); continue; }
+                    // an element still as it was stays the VM's own (round 80)
+                    if (i < (int64_t)vm.list->size() && same(it->second, (*vm.list)[(size_t)i])) out.push_back((*vm.list)[(size_t)i]);
+                    else out.push_back(to_vm(it->second));
                 }
                 *vm.list = std::move(out);
             } else {
@@ -885,7 +909,8 @@ struct BridgeConv {
                 VMMap fresh;
                 for (auto& kv : m) {
                     if (inst && kv.first == "__class__") continue;
-                    fresh[kv.first] = to_vm(kv.second);
+                    auto old_it = vm.map->find(kv.first);   // unchanged: the VM's own (round 80)
+                    fresh[kv.first] = old_it != vm.map->end() && same(kv.second, old_it->second) ? old_it->second : to_vm(kv.second);
                 }
                 // the engine's hidden field stays as it is (round 77)
                 if (inst) { auto hf = vm.map->find("\x01weakref"); if (hf != vm.map->end()) fresh[hf->first] = hf->second; }
@@ -915,7 +940,8 @@ void install_vm_builtin_bridge(Runnable* runner) {
         [ex, vm](const std::string& n, std::vector<VMVal>& a) -> VMVal {
             BridgeConv conv(*ex);
             conv.vm = vm;
-            if (n.compare(0, 6, "_json_") == 0) conv.opaque = UNDEFINED_VALUE;
+            // (round 80: pickle's native fast path too - a function is not None)
+            if (n.compare(0, 6, "_json_") == 0 || n == "_ny_pickle_dumps") conv.opaque = UNDEFINED_VALUE;
             // Path-like objects (__fspath__) as the strings they stand for,
             // in a copy: the caller's arguments are left as they were.
             std::vector<VMVal> path_args;

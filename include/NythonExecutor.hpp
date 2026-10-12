@@ -521,7 +521,7 @@ struct NythonExecutor {
     void ensureMirror(const std::string& chunk) {
         if (mirrors_loaded_.count(chunk)) return;
         mirrors_loaded_.insert(chunk);
-        if (chunk != "base") ensureMirror("base");
+        if (chunk != "base" && chunk != "os") ensureMirror("base");   // (round 80: "os" needs no mirror base)
         if (chunk == "dictview") ensureMirror("dict");
         try {
             auto source = SourceCode(nyrt::builtin_mirror_chunk(chunk));
@@ -1310,13 +1310,24 @@ public:   // NythonExecutor is a struct: members default to public
     // `import os`: a namespace over the os_* builtins (os.getcwd,
     // os.path.join, ...) plus os.sep/pathsep/linesep/name and a snapshot of
     // os.environ. The flat os_* names stay registered as well.
+    // One os module per program (round 80): every `import os` binds this
+    // namespace, as CPython's sys.modules["os"]. One made per import was
+    // freed when a function's local `import os` went, and its address,
+    // still in namespace_objs_, made the next dict made there a "module"
+    // (pickle's **kwargs); it also rebuilt ~300 members per import.
+    Value os_ns_cache_ = NONE_VALUE;
     Value makeOsNamespace() {
-        // round 80: one os module (sys.modules["os"]; it was made anew by
-        // each import, each with its own snapshot of os.environ)
+        // round 80: one os module per program - sys.modules["os"] when it is
+        // there (part A), else the one made first (part B's cache: a module
+        // made per import was freed with a function's local `import os`, and
+        // its address, still in namespace_objs_, typed the next dict made
+        // there as a module)
         {
             auto oc = module_ns_.find("os");
             if (oc != module_ns_.end() && contOf(oc->second)) return oc->second;
         }
+        if (os_ns_cache_.type != ValueType::NONE) { noteModule("os", os_ns_cache_); return os_ns_cache_; }
+        ensureMirror("os");   // the rest of Python's os, in Nython (round 80, NyPrelude.hpp "#@ os")
         std::vector<std::string> names;
         for (auto& kv : builtin_ptrs) names.push_back(kv.first);
         auto* ns = new Object((Runnable*)runner, "os", Type::MAP);
@@ -1350,12 +1361,37 @@ public:   // NythonExecutor is a struct: members default to public
         Value envbf = global_ctx->getByName("_ny_os_environb");
         if (envbf.type == ValueType::USERDATA && envbf.value.p) ns->set("environb", callFunctionValue(envbf, no_args, global_ctx));
 #endif
+        // round 80: the "os" chunk's (name, value) pairs - fspath, scandir,
+        // walk, the fd functions, ids, constants; "path.x" into os.path -
+        // bound over the flat builtins of those names (None values too)
+        {
+            Value mem = global_ctx->getByName("_ny_os_members");
+            for (auto& pair : nyos_pairs(mem)) {
+                if (pair.first.rfind("path.", 0) == 0) (*path->container)[pair.first.substr(5)] = pair.second;
+                else (*ns->container)[pair.first] = pair.second;
+            }
+        }
         ns->set("path", Value((Collectable*)path));
         ns->set("__name__", makeStringValue("os"));
         Value nsv((Collectable*)ns);
         noteModule("os", nsv);
         noteModule("os.path", Value((Collectable*)path));   // sys.modules["os.path"] (round 80)
+        os_ns_cache_ = nsv;
         return nsv;
+    }
+
+    // The (str, value) pairs of a list of 2-tuples (round 80: _ny_os_members).
+    std::vector<std::pair<std::string, Value>> nyos_pairs(const Value& lst) {
+        std::vector<std::pair<std::string, Value>> out;
+        Container* c = contOf(lst);
+        if (!c || !c->container->count("__len__")) return out;
+        for (auto& item : seqItems(c)) {
+            Container* t = contOf(item);
+            if (!t) continue;
+            auto kv = seqItems(t);
+            if (kv.size() == 2) out.push_back({getStringValue(kv[0]), kv[1]});
+        }
+        return out;
     }
 
     Value nyos_list_of(const std::vector<std::string>& items) {
@@ -5176,6 +5212,15 @@ public:   // NythonExecutor is a struct: members default to public
         return false;
     }
 
+    // str.encode / bytes.decode / str(b, enc, errors) with a codec or an
+    // error handler that only lib/codecs.ny's registry knows (round 80): the
+    // prelude's _ny_codec_encode / _ny_codec_decode (fn) run it there.
+    Value codecHook(const char* fn, const Value& obj, const std::string& enc, const std::string& err, Context* ctx) {
+        Value f = global_ctx->getByName(fn);
+        std::vector<Value> a{obj, makeStringValue(enc), makeStringValue(err)};
+        return callFunctionValue(f, a, ctx);
+    }
+
     // A method of a bytes / bytearray value (NyBytes.hpp: bytes_method).
     // Keyword arguments are placed where the method takes them.
     Value bytesMethodCall(const Value& obj, nyheap::Bytes* bo, const std::string& m, std::vector<Value>& args_in,
@@ -5208,6 +5253,12 @@ public:   // NythonExecutor is a struct: members default to public
             if (step == 1) { if (cnt > 0) out = s.substr((size_t)st, (size_t)cnt); }
             else for (int64_t k = 0, i = st; k < cnt; k++, i += step) out += s[(size_t)i];
             return makeBytesValue(std::move(out), bo->mut);
+        }
+        if (m == "decode") {
+            // round 80: a codec or error handler of lib/codecs.ny's registry
+            std::string enc = args.size() >= 1 && isStringValue(args[0]) ? getStringValue(args[0]) : std::string("utf-8");
+            std::string err = args.size() >= 2 && isStringValue(args[1]) ? getStringValue(args[1]) : std::string("strict");
+            if (nypy::codec_needs_python(enc, err)) return codecHook("_ny_codec_decode", obj, enc, err, ctx);
         }
         if (m == "fromhex") {
             if (args.size() != 1 || !isStringValue(args[0])) pyRaise("TypeError", "fromhex() argument must be str, not " + (args.empty() ? std::string("nothing") : typeNameOf(args[0])));
@@ -5279,6 +5330,8 @@ public:   // NythonExecutor is a struct: members default to public
                     if (args.size() >= 2 && args[1].type != ValueType::NONE) err = strOf(args[1], ctx);
                     auto ki = kw_args_in.find("encoding"); if (ki != kw_args_in.end()) enc = strOf(ki->second, ctx);
                     ki = kw_args_in.find("errors"); if (ki != kw_args_in.end()) err = strOf(ki->second, ctx);
+                    // round 80: a codec or error handler of lib/codecs.ny's registry
+                    if (nypy::codec_needs_python(enc, err)) return codecHook("_ny_codec_encode", obj, enc, err, ctx);
                     return makeBytesValue(nyCall([&] { return nypy::str_encode(s, enc, err); }));
                 }
                 // round 80: str.translate / str.maketrans (the prelude's:

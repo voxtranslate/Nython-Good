@@ -29,18 +29,29 @@
 #   CPython's messages; USTAR_FORMAT, GNU_FORMAT, PAX_FORMAT,
 #   DEFAULT_FORMAT, the type constants; nython -m tarfile -l|-c|-e|-t.
 #
+# Owners (round 80): gettarinfo/add fill uname and gname from the password
+# and group databases (pwd, grp), and extraction as root sets each member's
+# owner by name, falling back to its uid/gid (numeric_owner=True: the
+# numbers only), as CPython; FIFO members are created (os.mkfifo), device
+# members too with os.mknod (as root).
+#
 # Not here: bz2 and xz compression (CompressionError "bz2 module is not
 # available", as CPython without it); GNU sparse members are read as their
-# stored data; owner names come from the archive only (no pwd/grp: uname
-# and gname are "" when adding files); chown is not done on extraction;
-# device and FIFO members are not created (ExtractError, non-fatal by
-# default); the extraction filter defaults to fully_trusted, as in 3.11.
+# stored data; the extraction filter defaults to fully_trusted, as in 3.11.
 import io
 import os
 import time
 import copy
 import re
 import zlib
+try:
+    import pwd
+except ImportError:
+    pwd = none
+try:
+    import grp
+except ImportError:
+    grp = none
 
 __all__ = ["TarFile", "TarInfo", "is_tarfile", "TarError", "ReadError", "CompressionError", "StreamError",
            "ExtractError", "HeaderError", "ENCODING", "USTAR_FORMAT", "GNU_FORMAT", "PAX_FORMAT",
@@ -1322,6 +1333,20 @@ class TarFile:
         tarinfo.mode = stmd
         tarinfo.uid = statres.st_uid
         tarinfo.gid = statres.st_gid
+        if pwd:
+            try:
+                tarinfo.uname = pwd.getpwuid(tarinfo.uid)[0]
+            except KeyError:
+                pass
+        if grp:
+            try:
+                tarinfo.gname = grp.getgrgid(tarinfo.gid)[0]
+            except KeyError:
+                pass
+        if type == CHRTYPE or type == BLKTYPE:
+            if hasattr(os, "major") and hasattr(os, "minor"):
+                tarinfo.devmajor = os.major(statres.st_rdev)
+                tarinfo.devminor = os.minor(statres.st_rdev)
         tarinfo.size = statres.st_size if type == REGTYPE else 0
         tarinfo.mtime = statres.st_mtime
         tarinfo.type = type
@@ -1519,6 +1544,7 @@ class TarFile:
         else:
             self.makefile(tarinfo, targetpath)
         if set_attrs:
+            self.chown(tarinfo, targetpath, numeric_owner)
             if not tarinfo.issym():
                 self.chmod(tarinfo, targetpath)
                 self.utime(tarinfo, targetpath)
@@ -1544,10 +1570,22 @@ class TarFile:
         self._dbg(1, "tarfile: Unknown file type " + repr(tarinfo.type) + ", extracted as regular file.")
 
     def makefifo(self, tarinfo, targetpath):
-        raise ExtractError("fifo not supported by system")
+        if hasattr(os, "mkfifo"):
+            os.mkfifo(targetpath)
+        else:
+            raise ExtractError("fifo not supported by system")
 
     def makedev(self, tarinfo, targetpath):
-        raise ExtractError("special devices not supported by system")
+        if not hasattr(os, "mknod") or not hasattr(os, "makedev"):
+            raise ExtractError("special devices not supported by system")
+        var mode = tarinfo.mode
+        if mode is none:
+            mode = 0o600
+        if tarinfo.isblk():
+            mode = mode | 0o060000
+        else:
+            mode = mode | 0o020000
+        os.mknod(targetpath, mode, os.makedev(tarinfo.devmajor, tarinfo.devminor))
 
     def makelink(self, tarinfo, targetpath):
         try:
@@ -1567,7 +1605,39 @@ class TarFile:
                 raise ExtractError("unable to resolve link inside archive") from None
 
     def chown(self, tarinfo, targetpath, numeric_owner):
-        pass
+        """Set owner of targetpath according to tarinfo. If numeric_owner
+           is True, use .gid/.uid instead of .gname/.uname. If numeric_owner
+           is False, fall back to .gid/.uid when the search based on name
+           fails.
+        """
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            # We have to be root to do so.
+            var g = tarinfo.gid
+            var u = tarinfo.uid
+            if not numeric_owner:
+                try:
+                    if grp and tarinfo.gname:
+                        g = grp.getgrnam(tarinfo.gname)[2]
+                except KeyError:
+                    pass
+                try:
+                    if pwd and tarinfo.uname:
+                        u = pwd.getpwnam(tarinfo.uname)[2]
+                except KeyError:
+                    pass
+            # a filter (data_filter) may have dropped the ids: -1 leaves them
+            if g is None:
+                g = -1
+            if u is None:
+                u = -1
+            try:
+                if tarinfo.issym() and hasattr(os, "lchown"):
+                    os.lchown(targetpath, u, g)
+                else:
+                    os.chown(targetpath, u, g)
+            except (OSError, OverflowError) as e:
+                # OverflowError: an id that does not fit in id_t
+                raise ExtractError("could not change owner") from e
 
     def chmod(self, tarinfo, targetpath):
         if tarinfo.mode is none:

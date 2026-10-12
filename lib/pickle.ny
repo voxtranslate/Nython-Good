@@ -376,8 +376,21 @@ class PickleBuffer:
 
 
 # ── where globals come from ─────────────────────────────────────────────────
+_main_override = []
+
+
+def _ny_set_main(ns):
+    # a spawned multiprocessing child runs its parent's main program as
+    # __mp_main__ in the namespace ns: "__main__" and "__mp_main__" are
+    # looked up there (round 80; CPython aliases sys.modules["__main__"])
+    del _main_override[:]
+    _main_override.append(ns)
+
+
 def _main_globals():
     # the running program's globals (sys.modules["__main__"] in CPython)
+    if _main_override:
+        return _main_override[0]
     return _ny_main_globals()
 
 
@@ -415,12 +428,17 @@ _module_cache = {}
 def _import(module):
     if module == "builtins":
         return "builtins"
-    if module == "__main__":
+    if module == "__main__" or module == "__mp_main__":
         return _ModuleView("__main__", _main_globals())
     if module == "copyreg":
         return copyreg
     if module == "_codecs" or module == "codecs":
         return "_codecs"
+    if module == "posix" or module == "nt" or module == "os":
+        # CPython's os functions are posix's / nt's (round 80); imported
+        # here, as the VM's exec("import os", ns) binds no name in ns
+        import os
+        return os
     var m = _module_cache.get(module)
     if m is not none:
         return m
@@ -476,6 +494,18 @@ def _whichmodule(obj, name):
     return "__main__"
 
 
+def _os_function_name(obj):
+    # The name os gives a builtin function (os.getpid is the builtin
+    # os_getpid): CPython pickles it as posix.getpid / nt.getpid (round 80)
+    import os
+    for k in dir(os):
+        if k.startswith("_") or k == "path":
+            continue
+        if getattr(os, k, none) is obj:
+            return k
+    return none
+
+
 def _global_name(obj):
     # (module, qualified name) of a class or function, builtins included
     if obj is _codecs_encode:
@@ -491,7 +521,15 @@ def _global_name(obj):
     var module = _whichmodule(obj, name)
     if module == "builtins" or module == "__builtin__":
         module = "builtins"
-    elif module == "__main__" and "." not in name:
+        if type(obj).__name__ == "builtin_function_or_method" and (name.startswith("os_") or name not in _BUILTINS):
+            var osname = _os_function_name(obj)
+            if osname is not none:
+                import os
+                return ("nt" if os.name == "nt" else "posix"), osname
+    elif module == "__mp_main__":
+        # what a spawned child's main program defines is __main__'s too
+        module = "__main__"
+    if module == "__main__" and "." not in name:
         # the builtin exception classes and functions say __main__ here
         try:
             if _builtin(name) is obj:
@@ -1697,6 +1735,14 @@ def dump(obj, file, protocol=none, fix_imports=true, buffer_callback=none):
 
 
 def dumps(obj, protocol=none, fix_imports=true, buffer_callback=none):
+    # plain data at protocols 4 and 5: the same bytes, natively (round 80,
+    # src/builtins/nypickle.cpp; none when obj holds anything else)
+    if buffer_callback is none:
+        var p = DEFAULT_PROTOCOL if protocol is none else protocol
+        if p == 4 or p == 5:
+            var fast = _ny_pickle_dumps(obj, p)
+            if fast is not none:
+                return fast
     var sink = _BytesSink()
     Pickler(sink, protocol, fix_imports, buffer_callback).dump(obj)
     return sink.data
@@ -1709,6 +1755,11 @@ def load(file, fix_imports=true, encoding="ASCII", errors="strict", buffers=none
 def loads(data, fix_imports=true, encoding="ASCII", errors="strict", buffers=none):
     if isinstance(data, str):
         raise TypeError("a bytes-like object is required, not 'str'")
+    if buffers is none:
+        # plain data, natively (round 80; (False, None) for anything else)
+        var r = _ny_pickle_loads(bytes(data))
+        if r[0]:
+            return r[1]
     var u = Unpickler(none, fix_imports, encoding, errors, buffers)
     u._set_bytes(bytes(data))
     return u.load()

@@ -27,25 +27,22 @@
 # the __cause__ (CPython's _RemoteTraceback). A worker's prints reach this
 # process's stdout.
 #
-# What a call can carry: Nython has no pickle module yet, so calls, results
-# and exceptions travel as JSON in a format of this module's own, which
-# carries None, bools, ints of any size, floats (inf and nan too), complex,
-# str, bytes, bytearray, lists, tuples, dicts (any of these as keys), sets
-# and frozensets, nested; functions, classes and builtins by their module
-# and qualified name (module-level ones, as pickle can send); instances of
-# classes defined at module level, by class and __dict__ (pickle's default
-# for plain objects); exceptions by class and args. Anything else - a
-# lambda, a nested function, an open file, a lock - fails the future with
-# PicklingError (pickle.PicklingError when a pickle module exists), as
-# CPython's pool does for what pickle cannot send.
+# What a call can carry: anything pickle (lib/pickle.ny, CPython's format)
+# can - calls, their arguments, results and exceptions are pickled (round
+# 80; round 79 carried them in a JSON format of its own, before pickle
+# existed). Functions and classes go by reference, so they must be defined
+# at the top level of a module or of the main program; a lambda, a nested
+# function, an open file or a lock fails the future with
+# pickle.PicklingError, as CPython's pool does.
 #
 # Differences from CPython: mp_context is accepted and ignored (there is one
-# way to start a process); the transport is the format above, not pickle.
+# way to start a process, spawn); the workers are driven over their stdin
+# and stdout (each message a line: a marker and the base64 of its pickle).
 
 import os
 import sys
-import json
 import base64
+import pickle
 import threading
 import queue
 import atexit
@@ -77,8 +74,6 @@ _MARK = "\x00nypool\x00"
 _WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_procworker.ny")
 
 # ── the transport ────────────────────────────────────────────────────────────
-
-
 def _qualname(obj):
     var q = getattr(obj, "__qualname__", None)
     if q is None:
@@ -86,150 +81,20 @@ def _qualname(obj):
     return q
 
 
-_BUILTIN_CLASSES = set("""BaseException BaseExceptionGroup Exception ExceptionGroup ArithmeticError
-AssertionError AttributeError BlockingIOError BrokenPipeError BufferError ChildProcessError
-ConnectionAbortedError ConnectionError ConnectionRefusedError ConnectionResetError EOFError
-EnvironmentError FileExistsError FileNotFoundError FloatingPointError GeneratorExit IOError
-ImportError IndentationError IndexError InterruptedError IsADirectoryError KeyError
-KeyboardInterrupt LookupError MemoryError ModuleNotFoundError NameError NotADirectoryError
-NotImplementedError OSError OverflowError PermissionError ProcessLookupError RecursionError
-ReferenceError RuntimeError StopAsyncIteration StopIteration SyntaxError SystemError SystemExit
-TabError TimeoutError TypeError UnboundLocalError UnicodeDecodeError UnicodeEncodeError
-UnicodeError UnicodeTranslateError ValueError ZeroDivisionError Warning UserWarning
-DeprecationWarning PendingDeprecationWarning SyntaxWarning RuntimeWarning FutureWarning
-ImportWarning UnicodeWarning BytesWarning ResourceWarning EncodingWarning""".split())
-
-
 def _module_of(obj):
     var m = getattr(obj, "__module__", None)
     if m is None:
         m = "builtins"
-    # (Nython reports the builtin exception classes as defined in __main__)
-    if m == "__main__" and isinstance(obj, type) and getattr(obj, "__name__", "") in _BUILTIN_CLASSES:
-        m = "builtins"
     return m
 
 
-def _ref(obj):
-    var q = _qualname(obj)
-    if q is None or "<" in q:
-        raise PicklingError("Can't pickle " + repr(obj) + ": it is not a module-level function or class")
-    return [_module_of(obj), q]
+def _pack(msg):
+    # one line: the marker's line form of a pickled message
+    return base64.b64encode(pickle.dumps(msg, 5)).decode("ascii")
 
 
-def encode(obj):
-    # a JSON-able form of obj (see the header)
-    if obj is None or obj is True or obj is False:
-        return obj
-    var t = type(obj)
-    if t is bool:
-        return obj
-    if t is int:
-        if -9007199254740991 <= obj <= 9007199254740991:
-            return obj
-        return {"i": str(obj)}
-    if t is str:
-        return obj
-    if t is float:
-        return {"f": repr(obj)}
-    if t is list:
-        return [encode(x) for x in obj]
-    if t is tuple:
-        return {"t": [encode(x) for x in obj]}
-    if t is dict:
-        return {"d": [[encode(k), encode(obj[k])] for k in obj]}
-    if t is bytes:
-        return {"b": base64.b64encode(obj).decode("ascii")}
-    if t is bytearray:
-        return {"ba": base64.b64encode(bytes(obj)).decode("ascii")}
-    if t is set:
-        return {"s": [encode(x) for x in obj]}
-    if t is frozenset:
-        return {"fs": [encode(x) for x in obj]}
-    if t is complex:
-        return {"c": [repr(obj.real), repr(obj.imag)]}
-    if isinstance(obj, BaseException):
-        return {"e": _ref(type(obj)), "a": [encode(x) for x in obj.args]}
-    if isinstance(obj, type) or type(obj).__name__ in ("function", "builtin_function_or_method"):
-        return {"r": _ref(obj)}
-    var cls = type(obj)
-    var d = getattr(obj, "__dict__", None)
-    if d is not None and "<" not in (_qualname(cls) or "<"):
-        return {"o": _ref(cls), "v": encode(dict(d))}
-    raise PicklingError("Can't pickle " + repr(obj) + ": no way to send it to a worker process")
-
-
-def _resolve(ref, main_ns):
-    var mod = ref[0]
-    var qual = ref[1]
-    var obj = None
-    if mod == "__main__" or mod == "__mp_main__":
-        if main_ns is None:
-            raise PicklingError("Can't find " + qual + " in __main__")
-        obj = main_ns
-        var parts = qual.split(".")
-        obj = main_ns[parts[0]]
-        for p in parts[1:]:
-            obj = getattr(obj, p)
-        return obj
-    if mod == "builtins":
-        var parts = qual.split(".")
-        obj = eval(parts[0])
-        for p in parts[1:]:
-            obj = getattr(obj, p)
-        return obj
-    var ns = {}
-    exec("import " + mod + " as _m", ns)
-    obj = ns["_m"]
-    for p in qual.split("."):
-        obj = getattr(obj, p)
-    return obj
-
-
-def decode(v, main_ns=None):
-    if v is None or isinstance(v, (bool, int, str)):
-        return v
-    if isinstance(v, list):
-        return [decode(x, main_ns) for x in v]
-    if "i" in v:
-        return int(v["i"])
-    if "f" in v:
-        return float(v["f"])
-    if "t" in v:
-        return tuple(decode(x, main_ns) for x in v["t"])
-    if "d" in v:
-        var d = {}
-        for kv in v["d"]:
-            d[decode(kv[0], main_ns)] = decode(kv[1], main_ns)
-        return d
-    if "b" in v:
-        return base64.b64decode(v["b"])
-    if "ba" in v:
-        return bytearray(base64.b64decode(v["ba"]))
-    if "s" in v:
-        return set(decode(x, main_ns) for x in v["s"])
-    if "fs" in v:
-        return frozenset(decode(x, main_ns) for x in v["fs"])
-    if "c" in v:
-        return complex(float(v["c"][0]), float(v["c"][1]))
-    if "e" in v:
-        var cls = _resolve(v["e"], main_ns)
-        var args = [decode(x, main_ns) for x in v["a"]]
-        try:
-            return cls(*args)
-        except Exception:
-            var e = Exception(*args)
-            return e
-    if "r" in v:
-        return _resolve(v["r"], main_ns)
-    if "o" in v:
-        var cls = _resolve(v["o"], main_ns)
-        var obj = object.__new__(cls)
-        var fields = decode(v["v"], main_ns)
-        for k in fields:
-            setattr(obj, k, fields[k])
-        return obj
-    raise ValueError("bad message")
+def _unpack(text):
+    return pickle.loads(base64.b64decode(text))
 
 
 # ── the pool ─────────────────────────────────────────────────────────────────
@@ -268,13 +133,13 @@ class _Worker:
                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.calls = 0
         if ex._initializer is not None:
-            self.send({"op": "init", "fn": encode(ex._initializer), "args": encode(tuple(ex._initargs))})
+            self.send(("init", ex._initializer, tuple(ex._initargs)))
             var r = self.receive()
-            if r is None or "initerr" in r:
+            if r is None or r[0] == "initerr":
                 raise BrokenProcessPool("A child process terminated abruptly, the process pool is not usable anymore")
 
     def send(self, msg):
-        self.proc.stdin.write(json.dumps(msg) + "\n")
+        self.proc.stdin.write(_pack(msg) + "\n")
         self.proc.stdin.flush()
 
     def receive(self):
@@ -284,13 +149,13 @@ class _Worker:
             if not line:
                 return None
             if line.startswith(_MARK):
-                return json.loads(line[len(_MARK):])
+                return _unpack(line[len(_MARK):].rstrip("\n"))
             sys.stdout.write(line)
 
     def stop(self):
         if self.proc is not None:
             try:
-                self.send({"op": "quit"})
+                self.send(("quit",))
                 self.proc.stdin.close()
             except Exception:
                 pass
@@ -319,14 +184,14 @@ class _Worker:
                 continue
             var msg = None
             try:
-                msg = {"op": "call", "fn": encode(item[1]), "args": encode(tuple(item[2])),
-                       "kwargs": encode(dict(item[3])), "chunk": item[4]}
+                msg = _pack(("call", item[1], tuple(item[2]), dict(item[3]), item[4]))
             except BaseException as e:
                 f.set_exception(e)
                 continue
             var r = None
             try:
-                self.send(msg)
+                self.proc.stdin.write(msg + "\n")
+                self.proc.stdin.flush()
                 r = self.receive()
             except OSError:
                 r = None
@@ -337,17 +202,12 @@ class _Worker:
                 ex._set_broken("A child process terminated abruptly, the process pool is not usable anymore")
                 self.stop()
                 return
-            # what the result names from __main__ is looked up where the
-            # called function was defined
-            var mns = None
-            if _module_of(item[1]) == "__main__":
-                mns = getattr(item[1], "__globals__", None)
             try:
-                if "ok" in r:
-                    f.set_result(decode(r["ok"], mns))
+                if r[0] == "ok":
+                    f.set_result(r[1])
                 else:
-                    var exc = decode(r["err"], mns)
-                    exc.__cause__ = _RemoteTraceback('\n"""\n' + r.get("tb", "") + '"""')
+                    var exc = r[1]
+                    exc.__cause__ = _RemoteTraceback('\n"""\n' + r[2] + '"""')
                     f.set_exception(exc)
             except BaseException as e:
                 f.set_exception(e)

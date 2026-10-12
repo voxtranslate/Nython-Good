@@ -589,7 +589,8 @@ check("argv on the VM", string_replace(os_run([exe, "--vm", S + "/child46.ny", "
 import os
 check("os.getcwd()", os.getcwd(), os_getcwd())
 check("os.path.join()", os.path.join("a", "b"), os_path_join("a", "b"))
-check("os.path.splitext()", os.path.splitext("x.tar.gz"), ["x.tar", ".gz"])
+# a tuple, as Python's (round 80: os.path.split/splitext are the "os" chunk's)
+check("os.path.splitext()", os.path.splitext("x.tar.gz"), ("x.tar", ".gz"))
 check("os.sep / os.name", [os.sep, os.name], [os_sep, os_name])
 check("os.environ", os.environ["PATH"], os_getenv("PATH"))
 check("os.getpid()", os.getpid(), os_getpid())

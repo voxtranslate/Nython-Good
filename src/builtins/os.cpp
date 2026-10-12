@@ -358,10 +358,34 @@ namespace {
 using nyos::raise;
 using nyos::raise_errno;
 
-bool path_stat(const std::string& p, struct stat& st) { return ::stat(p.c_str(), &st) == 0; }
+#ifdef _WIN32
+std::wstring widen_os(const std::string& s);
+// A character device the C runtime's stat does not see (os.devnull "nul",
+// "con", ...): CPython's os.stat gives it st_mode S_IFCHR, so
+// os.path.exists(os.devnull) is True there too (round 80).
+static bool win_char_device(const std::string& p, struct stat& st) {
+    if (p.empty()) return false;
+    HANDLE h = CreateFileW(widen_os(p).c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool chr = GetFileType(h) == FILE_TYPE_CHAR;
+    CloseHandle(h);
+    if (!chr) return false;
+    std::memset(&st, 0, sizeof st);
+    st.st_mode = _S_IFCHR;
+    return true;
+}
+#endif
+bool path_stat(const std::string& p, struct stat& st) {
+#ifdef _WIN32
+    return ::stat(p.c_str(), &st) == 0 || win_char_device(p, st);
+#else
+    return ::stat(p.c_str(), &st) == 0;
+#endif
+}
 bool path_lstat(const std::string& p, struct stat& st) {
 #ifdef _WIN32
-    return ::stat(p.c_str(), &st) == 0;
+    return ::stat(p.c_str(), &st) == 0 || win_char_device(p, st);
 #else
     return ::lstat(p.c_str(), &st) == 0;
 #endif
@@ -498,6 +522,25 @@ Value stat_map(NythonExecutor& E, const struct stat* st, bool link, const std::s
 #else
     (void)path;
 #endif
+    long long ino = ok ? (long long)st->st_ino : 0, dev = ok ? (long long)st->st_dev : 0, nlink = ok ? (long long)st->st_nlink : 0;
+#ifdef _WIN32
+    // (round 80) the file index, volume serial and link count, as CPython's
+    // os.stat on Windows: the C runtime's _stat gives 0, 0 and 1, so
+    // os.path.samefile / samestat and DirEntry.inode could not tell files apart
+    if (ok && path) {
+        HANDLE h = CreateFileW(widen_os(*path).c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            BY_HANDLE_FILE_INFORMATION fi;
+            if (GetFileInformationByHandle(h, &fi)) {
+                ino = (long long)(((unsigned long long)fi.nFileIndexHigh << 32) | fi.nFileIndexLow);
+                dev = (long long)fi.dwVolumeSerialNumber;
+                nlink = (long long)fi.nNumberOfLinks;
+            }
+            CloseHandle(h);
+        }
+    }
+#endif
     std::vector<std::pair<std::string, Value>> m = {
         {"exists",  Value(ok)},
         {"size",    make_int(ok ? (long long)st->st_size : 0)},
@@ -512,9 +555,9 @@ Value stat_map(NythonExecutor& E, const struct stat* st, bool link, const std::s
         {"permissions", make_int(ok ? (long long)(st->st_mode & 07777) : 0)},
         {"uid",     make_int(ok ? (long long)st->st_uid : 0)},
         {"gid",     make_int(ok ? (long long)st->st_gid : 0)},
-        {"nlink",   make_int(ok ? (long long)st->st_nlink : 0)},
-        {"ino",     make_int(ok ? (long long)st->st_ino : 0)},
-        {"dev",     make_int(ok ? (long long)st->st_dev : 0)},
+        {"nlink",   make_int(nlink)},
+        {"ino",     make_int(ino)},
+        {"dev",     make_int(dev)},
     };
     // os.stat_result's st_*_ns, st_blocks, st_blksize, st_rdev (round 77):
     // the times exactly, in nanoseconds
@@ -1552,6 +1595,9 @@ Value dispatch_os(NythonExecutor& E,
             return make_list(E, {Value((int)ws.ws_col), Value((int)ws.ws_row)});
 #endif
         }
+        // file descriptors, ids, scandir, pwd/grp, shared memory (round 80)
+        Value ext = nyos::os_call_ext(E, op, args);
+        if (ext.type != ValueType::UNDEFINED) return ext;
         raise("ValueError", "_ny_os_call: unknown operation '" + op + "'");
     }
     if (name == "os_uname") {

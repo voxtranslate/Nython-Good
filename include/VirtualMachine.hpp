@@ -3660,6 +3660,18 @@ public:
             }
             VMVal mode=args.size()>1?args[1]:kwget("mode");
             if(mode.type==VMType::NONE) mode=VMVal::make_str("r");
+            {
+                // open(fd) and opener= (round 80): the prelude's _ny_open_fd
+                VMVal opener_fn=args.size()>7?args[7]:kwget("opener");
+                if(path.type==VMType::INT||opener_fn.type!=VMType::NONE){
+                    VMVal cfd=args.size()>6?args[6]:kwget("closefd");
+                    if(cfd.type==VMType::NONE) cfd=VMVal::make_bool(true);
+                    VMVal enc0=args.size()>3?args[3]:kwget("encoding");
+                    VMVal nl0=args.size()>5?args[5]:kwget("newline");
+                    std::vector<VMVal> fa={path,mode,enc0,nl0,cfd,opener_fn};
+                    return vm_call(load_var("_ny_open_fd"),fa,std::nullopt);
+                }
+            }
             // open(file, mode, buffering, encoding, errors, newline), Python's
             // order; newline= as the prelude's open (NythonFile.newline):
             // an explicit one opens the handle raw (round 77)
@@ -3692,9 +3704,14 @@ public:
     // `import os`: os.getcwd(), os.path.join(), ... over the interpreter's
     // os_* builtins (include/NyRuntime.hpp module_members), plus the
     // constants and a snapshot of os.environ - as on the interpreter.
+    // One os module per program (round 80), as the interpreter's
+    // os_ns_cache_: every `import os` binds the same namespace (CPython's
+    // sys.modules["os"]), named "os" whatever it is imported as.
+    VMVal os_ns_;
     VMVal define_os_module(const std::string& as_name, bool bind=true) {   // bind=false: just made (round 77)
-        // round 80: one os module (sys.modules["os"]), bound in the
-        // importing scope
+        // round 80: one os module per program - sys.modules["os"] when it is
+        // there (part A), else the one made first (part B's os_ns_), bound in
+        // the importing scope
         {
             auto oc=module_ns_.find("os");
             if(oc!=module_ns_.end()&&oc->second.type==VMType::MAP&&oc->second.map){
@@ -3702,6 +3719,8 @@ public:
                 return oc->second;
             }
         }
+        if(os_ns_.type==VMType::MAP&&os_ns_.map){ note_module("os",os_ns_); if(bind) define_var(as_name,os_ns_); return os_ns_; }
+        load_mirror("os");   // the rest of Python's os, in Nython (round 80, NyPrelude.hpp "#@ os")
         std::vector<std::string> names;
         if(bridge_names()) names=bridge_names()();
         VMVal ns=VMVal::make_map(), path=VMVal::make_map();
@@ -3740,12 +3759,27 @@ public:
             if(ebf.type==VMType::FUNCTION) (*ns.map)["environb"]=vm_call(ebf,none_args,std::nullopt);
 #endif
         }
+        // round 80: the "os" chunk's (name, value) pairs - fspath, scandir,
+        // walk, the fd functions, ids, constants; "path.x" into os.path -
+        // bound over the flat builtins of those names (None values too)
+        {
+            auto mit=globals_.find("_ny_os_members");
+            if(mit!=globals_.end()&&mit->second.type==VMType::LIST&&mit->second.list){
+                for(auto& item : *mit->second.list){
+                    if(item.type!=VMType::LIST||!item.list||item.list->size()!=2||(*item.list)[0].type!=VMType::STRING) continue;
+                    const std::string& k=(*item.list)[0].s;
+                    if(k.rfind("path.",0)==0) (*path.map)[k.substr(5)]=(*item.list)[1];
+                    else (*ns.map)[k]=(*item.list)[1];
+                }
+            }
+        }
         path.class_name="path";
         (*ns.map)["path"]=path;
         (*ns.map)["__name__"]=VMVal::make_str("os");
         ns.class_name="os";   // round 80: its name, not the alias it is bound as
         note_module("os",ns);
         note_module("os.path",path);   // sys.modules["os.path"] (round 80)
+        os_ns_=ns;
         if(bind) define_var(as_name,ns);
         return ns;
     }
@@ -5364,7 +5398,7 @@ private:
     void load_mirror(const std::string& chunk) {
         if(mirrors_loaded_.count(chunk)) return;
         mirrors_loaded_.insert(chunk);
-        if(chunk!="base") load_mirror("base");
+        if(chunk!="base"&&chunk!="os") load_mirror("base");   // (round 80: "os" needs no mirror base)
         if(chunk=="dictview") load_mirror("dict");
         try {
             auto source=nython::reader::SourceCode(nyrt::builtin_mirror_chunk(chunk));
@@ -6896,7 +6930,10 @@ private:
                         std::vector<bool> gone((size_t)len,false);
                         for(int64_t k=0,i=st;k<n;k++,i+=step) gone[(size_t)i]=true;
                         size_t w=0;
-                        for(size_t r=0;r<L.size();r++) if(!gone[r]) L[w++]=std::move(L[r]);
+                        // (round 80: an element kept in place was moved onto
+                        // itself, which emptied a string - del L[1:3] of
+                        // ["A", "b", "c", "D"] gave ['', 'D'])
+                        for(size_t r=0;r<L.size();r++) if(!gone[r]){ if(w!=r) L[w]=std::move(L[r]); w++; }
                         L.resize(w);
                         break;
                     }
@@ -10884,6 +10921,15 @@ private:
         }
         return pos<a.size()?&a[pos]:nullptr;
     }
+    // str.encode / bytes.decode / str(b, enc, errors) with a codec or an
+    // error handler that only lib/codecs.ny's registry knows (round 80): the
+    // prelude's _ny_codec_encode / _ny_codec_decode (fn) run it there.
+    VMVal codec_hook(const char* fn, const VMVal& obj, const std::string& enc, const std::string& err) {
+        VMVal f=load_var(fn);
+        std::vector<VMVal> ca={obj,VMVal::make_str(enc),VMVal::make_str(err)};
+        return vm_call(f,ca,std::nullopt);
+    }
+
     // bytes / bytearray methods (NyBytes.hpp: bytes_method).
     VMVal call_bytes_method(VMVal obj, const std::string& m, std::vector<VMVal>& args_in, const VMVal* kw) {
         std::vector<VMVal> a=args_in;
@@ -10903,6 +10949,12 @@ private:
                 if(a.size()<=pos) a.resize(pos+1,VMVal::make_none());
                 a[pos]=kv.second;
             }
+        }
+        if(m=="decode"){
+            // round 80: a codec or error handler of lib/codecs.ny's registry
+            std::string enc=a.size()>=1&&a[0].type==VMType::STRING?a[0].s:std::string("utf-8");
+            std::string err=a.size()>=2&&a[1].type==VMType::STRING?a[1].s:std::string("strict");
+            if(nypy::codec_needs_python(enc,err)) return codec_hook("_ny_codec_decode",obj,enc,err);
         }
         if(m=="fromhex"){
             if(a.size()!=1||a[0].type!=VMType::STRING) raise_native_exception("TypeError","fromhex() argument must be str");
@@ -12752,6 +12804,8 @@ private:
                 const VMVal* rv=kw_or_pos(kw.type==VMType::MAP?&kw:nullptr,"errors",a,1);
                 std::string enc=(ev&&ev->type!=VMType::NONE)?vm->vm_str(*ev):std::string("utf-8");
                 std::string err=(rv&&rv->type!=VMType::NONE)?vm->vm_str(*rv):std::string("strict");
+                // round 80: a codec or error handler of lib/codecs.ny's registry
+                if(nypy::codec_needs_python(enc,err)) return vm->codec_hook("_ny_codec_encode",obj,enc,err);
                 return VMVal::make_bytes(vm->nycall([&]{ return nypy::str_encode(obj.s,enc,err); }));
             }
             // round 79: keyword arguments go where the method takes them
@@ -13071,6 +13125,8 @@ private:
                 const VMVal* rv=a.size()>=3?&a[2]:kwarg(kw,"errors");
                 if(ev||rv){
                     std::string enc=ev?vm->vm_str(*ev):std::string("utf-8"), err=rv?vm->vm_str(*rv):std::string("strict");
+                    // round 80: a codec or error handler of lib/codecs.ny's registry
+                    if(nypy::codec_needs_python(enc,err)) return vm->codec_hook("_ny_codec_decode",a[0],enc,err);
                     return VMVal::make_str(vm->nycall([&]{ return nypy::bytes_decode(a[0].bdata(),enc,err); }));
                 }
             }
