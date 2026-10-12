@@ -200,11 +200,17 @@ if posix:
     # ── a real SIGINT: busy loop, sleep, input; exit status 130 ──────────
     if os_exists(exe):
         var base = os_path_join(os_gettempdir(), "ny_audit66_" + str(os_getpid()))
-        # SIGINT to the child's process group 0.6 s after it starts; stdin a
-        # pipe that stays open (a shell pipeline), for input()
+        # SIGINT to the child once it is waiting; stdin a pipe that stays open
+        # (a shell pipeline), for input(). Each child writes READY just inside its try block, before it blocks;
+        # the signal is sent once that file exists (round 81: a fixed 0.6 s
+        # raced a loaded machine - a child still importing lib/thread.ny got
+        # the SIGINT before its try and the interrupt went uncaught).
+        var ready_path = base + "_ready"
         def child(src, piped):
             var path = base + "_child.ny"
-            write_file(path, src)
+            if os_exists(ready_path):
+                os_remove(ready_path)
+            write_file(path, string_replace(src, "@READY@", "write_file(" + repr(ready_path) + ", \"1\")"))
             var p
             if piped:
                 var cmd = "sleep 5 | " + shell_quote(exe)
@@ -213,21 +219,27 @@ if posix:
                 p = os_spawn(cmd + " " + shell_quote(path))
             else:
                 p = os_spawn([exe] + flags + [path])
-            sleep(0.6)
+            var waited = 0.0
+            while not os_exists(ready_path) and waited < 30.0:
+                sleep(0.05)
+                waited = waited + 0.05
+            sleep(0.3)   # into the wait itself
             os_kill(p, signal.SIGINT)
             var code = os_wait(p, timeout=10)
             var out = os_proc_read(p)
             os_remove(path)
+            if os_exists(ready_path):
+                os_remove(ready_path)
             return {"returncode": code, "stdout": out["stdout"], "stderr": out["stderr"]}
-        var r1 = child("try:\n    var n = 0\n    while true:\n        n = n + 1\nfinally:\n    print(\"finally ran\")\n", false)
+        var r1 = child("try:\n    @READY@\n    var n = 0\n    while true:\n        n = n + 1\nfinally:\n    print(\"finally ran\")\n", false)
         check("busy loop: finally ran", string_strip(r1["stdout"]), "finally ran")
         check("busy loop: KeyboardInterrupt reported", string_find(r1["stderr"], "KeyboardInterrupt") >= 0, true)
         check("busy loop: exit status 130", r1["returncode"], 130)
-        var r2 = child("try:\n    sleep(30)\nexcept KeyboardInterrupt:\n    print(\"sleep interrupted\")\n", false)
+        var r2 = child("try:\n    @READY@\n    sleep(30)\nexcept KeyboardInterrupt:\n    print(\"sleep interrupted\")\n", false)
         check("sleep interrupted", string_strip(r2["stdout"]), "sleep interrupted")
-        var r3 = child("try:\n    input()\nexcept KeyboardInterrupt:\n    print(\"input interrupted\")\n", true)
+        var r3 = child("try:\n    @READY@\n    input()\nexcept KeyboardInterrupt:\n    print(\"input interrupted\")\n", true)
         check("input interrupted", string_strip(r3["stdout"]), "input interrupted")
-        var r4 = child("import \"lib/thread.ny\"\nvar l = Lock()\nvar ready = ThreadEvent()\ndef holder():\n    l.acquire()\n    ready.set()\n    sleep(20)\nvar t = Thread(holder, daemon=true)\nt.start()\nready.wait()\ntry:\n    l.acquire()\nexcept KeyboardInterrupt:\n    print(\"lock wait interrupted\")\n", false)
+        var r4 = child("import \"lib/thread.ny\"\nvar l = Lock()\nvar ready = ThreadEvent()\ndef holder():\n    l.acquire()\n    ready.set()\n    sleep(20)\nvar t = Thread(holder, daemon=true)\nt.start()\nready.wait()\ntry:\n    @READY@\n    l.acquire()\nexcept KeyboardInterrupt:\n    print(\"lock wait interrupted\")\n", false)
         check("lock wait interrupted", string_strip(r4["stdout"]), "lock wait interrupted")
 
 print("Results: " + str(pass_n) + " passed, " + str(fail_n) + " failed")

@@ -5704,3 +5704,12 @@ Full detail in `HANDOFF.md` §0s3. New test: `vm_audit98` (72 checks; passes und
 | Merging parts A and C: with a program's `list = []`, abc.ABC's `__slots__ = ()` called the program's list on the VM | the LOAD_NAME_MOD/GLOBAL caches read the program's frame for prelude code, which part A made invisible to it | prelude code is not specialized onto the program's frame (`plain_function_frame`) |
 | Windows: `pkgutil.extend_path([], pkg) != pkg.__path__` | a package's `__path__` mixed separators (`\\tmp\\pk/relx`) and importlib's PathFinder joined with `/` | the native separator in both, as CPython |
 
+## Round 81 — live debugging and profiling in the IDE, semantic gaps, a faster interpreter
+
+Full detail in `HANDOFF.md` §0t3 (part C). New test: `vm_audit101` (the live debug server and the Profile reader, 125 checks, Nython-only).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| The IDE could only replay a finished recording; no profiler view | — | `nython --debug-port N` runs the program under a DAP-style debug server (bdb), with step back and Why? over a ring buffer of recent statements; a PROFILE panel with a flame graph (cProfile's new calling context tree) |
+| `vm_audit66 --vm` "lock wait interrupted" failed on a loaded machine | SIGINT sent a fixed 0.6 s after start reached a child before its `try` | children signal readiness through a file; the parent waits for it |
+

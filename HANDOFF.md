@@ -3,11 +3,10 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Round 81, part C — **§0t3** (live debugging: `nython --debug-port N`, a
+Last updated: round 81, part C — **§0t3** (live debugging: `nython --debug-port N`, a
 DAP-style debug server over bdb with step back and Why? over a ring buffer
 of recent statements; the IDE's live mode and PROFILE panel with a flame
-graph from cProfile's new calling context tree).
-Last updated: round 80 — **§0s** (part A: the correctness gaps rounds
+graph from cProfile's new calling context tree). Round 80 — **§0s** (part A: the correctness gaps rounds
 78-79 found - two interpreter crashes, object's members on every class,
 `except <expression>`, numeric keys across int/float/Fraction/Decimal,
 `sys.modules`/`__import__`/importlib/pkgutil/runpy, relative imports,
@@ -205,6 +204,22 @@ whole suite 442 passed, 0 failed;
   switch for it); the IDE's flame graph does not zoom.
 - `f_globals` / `globals()` are not live on either engine (worked around
   in the server, not fixed).
+
+### Merged onto round 80 (2eb1221)
+- No conflicts. The agent's sweep had one failure, `vm_audit66 --vm` "lock
+  wait interrupted", under load: the test sent SIGINT a fixed 0.6 s after
+  starting each child, and a child still importing `lib/thread.ny` got it
+  before its `try` (the interrupt went uncaught). **The children now write a
+  ready file just inside their `try`, and the signal waits for it** (plus
+  0.3 s to be inside the wait). vm_audit66 then passed on both engines on a
+  machine loaded by two agents' builds.
+- Verified after merging: the sweep 425 runs, 0 not ok; vm_audit101 125,
+  66, 44, 91, 92 on both engines; `ide_e2e` 442/442 (`live` and `profile`
+  included); `ide_lint`, `ny_classcheck`, `cbp.py check` clean;
+  `ide_memprobe --check` passes (0 KB kept, the `live`/`profile` probes too)
+  - its first run timed out in the `scroll` probe waiting for a frame at a
+  load average of 13.5 on 4 cores (two agents building); the rerun at the
+  same load passed. Not investigated further.
 
 ## 0s3. Round 80, part C — a specializing adaptive interpreter for the VM (vm_audit98, `tools/bench/`)
 
