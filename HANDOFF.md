@@ -3,6 +3,11 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
+Round 81, part B — **§0t2** (the tree-walking interpreter 3.09x faster - a
+self-optimizing AST interpreter: in-node caches with guards, polymorphic
+inline caches for method calls, attribute stores and class attributes,
+speculative lexical addressing, slimmer Values, `return`/`break` through
+`try`/`with` without C++ throws; `NY_ASTSPEC=0` turns it off; vm_audit100).
 Last updated: round 80 — **§0s** (part A: the correctness gaps rounds
 78-79 found - two interpreter crashes, object's members on every class,
 `except <expression>`, numeric keys across int/float/Fraction/Decimal,
@@ -61,6 +66,223 @@ multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
 
 ---
+
+## 0t2. Round 81, part B — a self-optimizing AST interpreter (vm_audit100, `tools/bench/`)
+
+The tree-walking interpreter (`include/NythonExecutor.hpp`, the default
+engine) is **3.09x faster** (geometric mean of the 11 benchmarks of
+`tools/bench/`, Linux; Windows under "Windows" below) with no behaviour
+change: the sweep and `ide_e2e` are the oracle, and `examples/vm_audit100.ny`
+(114 checks; the interpreter, the interpreter with `NY_ASTSPEC=0`, the VM and
+python3) runs every specialized path long enough for it to specialize and
+then changes what it saw - a global rebound to another type or shadowed
+later, a builtin shadowed, a function replaced by a lambda, a class
+attribute or method changed (in the class or a base, or deleted), a field
+shadowing a method or class attribute, `__class__` reassigned, `__get__`
+added to a cached attribute's class, a new field layout, an int overflowing
+a specialized add, `exec` adding a name, closures, generators, recursion,
+threads, `return`/`break`/`continue` through `try`/`finally`/`with` (a
+`finally` that returns, breaks or raises), tracing and profiling switched
+on mid-loop.
+
+### Benchmarks (`tools/bench/run.py --engine interp -n 5 --python --base <round-80 binary>`, min of 5, seconds)
+| bench | round 80 | now | speedup | instructions (callgrind) | VM now | python3 |
+|---|---|---|---|---|---|---|
+| closures | 1.582 | 0.539 | 2.93x | 11.92G -> 4.27G | 0.373 | 0.050 |
+| deltablue | 2.673 | 0.789 | 3.39x | 12.93G -> 4.45G | 0.515 | 0.023 |
+| dict_str | 0.753 | 0.290 | 2.60x | 4.46G -> 1.94G | 0.242 | 0.029 |
+| exceptions | 0.938 | 0.535 | 1.75x | 7.58G -> 4.30G | 0.122 | 0.006 |
+| fannkuch | 2.775 | 1.094 | 2.54x | 18.79G -> 8.10G | 0.461 | 0.046 |
+| fib | 1.027 | 0.244 | 4.22x | 7.07G -> 1.99G | 0.142 | 0.019 |
+| generators | 1.238 | 0.476 | 2.60x | 8.71G -> 3.23G | 0.382 | 0.056 |
+| nbody | 1.060 | 0.308 | 3.44x | 7.79G -> 2.95G | 0.237 | 0.018 |
+| raytrace | 2.265 | 0.569 | 3.98x | 11.55G -> 3.88G | 0.318 | 0.035 |
+| richards | 3.367 | 0.690 | 4.88x | 19.00G -> 4.50G | 0.397 | 0.052 |
+| spectral_norm | 1.792 | 0.612 | 2.93x | 13.15G -> 4.12G | 0.329 | 0.038 |
+| **geometric mean** | | | **3.09x** | **2.78x fewer** | | |
+
+Instructions are each benchmark's run under callgrind less the startup
+(~0.48G, the prelude and `import time`, which `bench_time` leaves out too).
+The VM is unchanged (0.99x by time, its instruction counts within 0.2%);
+the interpreter is now within 1.2-2.4x of it except for exceptions (4.4x).
+Every run's result line equals python3's.
+
+### Where the time went (callgrind, before)
+- **Value copies and the allocator** - the interpreter's equivalent of the
+  VM's 40%: in fib, `Value`'s copy/move constructors, destructor and default
+  constructor 17%, malloc/free 21%, memcpy 4% and `std::string` assignment 2%
+  - most of it the `Token` every `Value` carried (two strings and a vector:
+  copied by each copy, never set). `shared_ptr` releases 2.5% (every eval
+  function took its node by value).
+- **Lookups by string and by pointer**: in richards `OrderedMap::find_slot`
+  6.3% (a name looked up scope by scope, a field, a class namespace), the
+  side tables (`func_names`, `instance_to_class`, `class_ctx_map_`,
+  `instance_properties` as `std::map`s) 6.5%, string comparisons and
+  `strlen` against literals 5% (`fnTag` copies, `rfind("__class__:")`
+  tests, the builtin dispatch chain's names), `findClassMember` /
+  `getAttrValue` walking the MRO for every method call 3%; in dict_str
+  `__dynamic_cast` 1.7% (`contOf`).
+- **The generic paths for simple things**: `1 + 1` through `binaryOp`
+  (operands copied, the operator's text compared), literals parsed from
+  their token text on each evaluation (`strtol` 1.2% of fib), a vector, a
+  keyword map and four side-table lookups per call.
+- **Exception unwinding**: raytrace threw a C++ exception for every
+  `return` inside `try`/`finally` (2,381 throws, 4% of its time); the
+  exceptions benchmark spends ~65% in the unwinder (unchanged - see "Not
+  done").
+
+### What was done (and from where)
+The model is Würthinger et al.'s self-optimizing AST interpreter (DLS 2012,
+the Truffle node model): a node keeps what it observed - a value, an
+operator code, a scope depth and slot, a receiver class - and takes a short
+path behind a cheap guard; a failed guard runs the general code, unchanged.
+Nodes are not replaced (the AST is shared with the parser, the debugger and
+the static scope checks), so the state lives in fields of the node
+(`ASTNodes.hpp`, "round 81"). The general paths stay the specification:
+every fast path sits next to the code it skips, with the argument why each
+skipped step would have answered no.
+
+- **Values**: a `Value` no longer carries a `Token` (two strings and a
+  vector, copied with every Value; nothing ever set it -
+  `Value::token_default()` answers the few readers); its constructors and
+  destructor are inline; `TValue` has no padding (80 bytes, from 112);
+  `bigint` keeps two limbs inline (`LimbVec`, no allocation below 2^128)
+  and has no vtable. Eval functions take `const node_ptr&` (a shared_ptr
+  copy - two atomic operations - per node evaluated before).
+- **Kinds by flag** (`nygc::F_KSTR/F_KINST/F_KFUNC/F_KCONT`, set by the
+  constructors): `heapKind`, `contOf`, `isInstanceVal`, `isStringValue`,
+  `bytesOf` answer without hash/tree lookups or `dynamic_cast`; an
+  instance's class and field scope come from its object (`instPropsOf`,
+  `instClassNode`); the instance side tables are hashed.
+- **Literals and operators**: an int/float literal is made once; a binary
+  or augmented operator's code is worked out once; int/float arithmetic and
+  comparisons skip the general dispatch (`numBinary`, exact overflow to big
+  ints); `x += 1` on a name stores without a second lookup.
+- **Names** - speculative lexical addressing, guarded: a name node hashes
+  its name once and remembers the depth and slot it was found at; that slot
+  is tried first at that depth (its key still there makes it the entry)
+  and the scopes before it are still searched, so a name added later to an
+  inner scope (a local, `exec`, a frame's `f_locals`) is seen. Static
+  (depth, slot) resolution was not taken: scopes here are dynamic (`exec`
+  namespaces, PEP 667 `f_locals` writes, plain assignment rebinding the
+  nearest binding, live module namespaces) and the guarded form costs one
+  key comparison. `self`/`this` the same; whether an assigned name is a
+  builtin's is remembered while that set is unchanged.
+- **Calls**: a def or lambda with plain parameters, called with as many
+  plain positional arguments, takes them on the C++ stack (`ArgBuf`), its
+  code and scope from its heap object (`nyheap::Func::code`), and binds
+  distinct parameter names by appending to the fresh scope. **Method calls
+  on instances** go through a polymorphic inline cache per call site
+  (Hölzle, Chambers & Ungar, ECOOP 1991; 4 classes, exponential backoff when
+  filling keeps failing, `methodICFill`/`methodFast`): the method, the
+  namespace and slot that hold it, and the namespaces before it in the MRO
+  with the versions of their key sets (`NyOrderedMap::version`). Attribute
+  stores on instances: a 2-way cache of the same kind (`storeFast`); field
+  reads keep their slot (`fieldAt`). **Class attributes and methods read as
+  values** (`Strength.REQUIRED`, `f = obj.m`): a per-node cache of the
+  namespace and slot that answered (`classLoadFast`), whose value then goes
+  through the same last steps as the general walk (`classNsResult`).
+- **A builtin value's own method** (`s.strip()`, `d.get(k)`,
+  `xs.append(x)`): for a str, a plain dict or a list and a name its kind's
+  table has, straight to that table (`builtinMethodFast`;
+  `builtinMethodKinds` decides per site); `isinstance` is called directly,
+  not after ~300 name comparisons in `dispatch_tensor`.
+- **Control flow**: `return`/`break`/`continue` inside `try`/`finally` and
+  `with` set the pending flag instead of throwing (round 74 did it for the
+  rest): the statement checks the flag as each clause ends and runs the
+  finally body / `__exit__` with it cleared, then restores it
+  (`leaveWithPending`) - a raytrace frame's `return` inside `try` threw.
+- **Containers**: `xs[i]`/`xs[i] = v` find the slot from the index
+  (`seqSlot`); ordering, `in`, `==` and `seqItems` likewise; the marker keys
+  are hashed once and tried at the end first (`markerSlot`); lists and
+  tuples are built by appending; emptied small maps are kept per thread for
+  the next scope or container (`Container.cpp`, `MapPool`).
+- **Invalidation**: one specialization epoch (`spec_epoch_`,
+  `specInvalidate()`), bumped by whatever can change what a cache assumed
+  about classes - an MRO computed or dropped, a class namespace set
+  (`setClassContext`) or dropped, `class_vars_` written or deleted, a
+  function's kind tag changing (property/staticmethod/classmethod), a
+  `__getattribute__`/`__setattr__` hook appearing, `__slots__` flags, the
+  death of a function a cache names (`F_KICREF`). Caches own no references:
+  they hold slot numbers and pointers valid for the epoch they were made in,
+  plus the executor that made them.
+- Not taken: rewriting nodes in place (the AST is shared); superinstructions;
+  exceptions without a throw (the interpreter's Python exceptions are still
+  C++ throws - see "Not done").
+
+### What each part bought (instructions, callgrind, geometric mean of the 11 benchmarks)
+| step | fewer instructions | biggest gains |
+|---|---|---|
+| 1: Values without tokens, inline limbs, kind flags, `const node_ptr&`, cached literals and operator codes, `numBinary`, name caches, plain calls on the stack, method-call and store caches, field slots (8672f55) | 2.42x | fib 3.28x, richards 3.33x, spectral_norm 2.81x |
+| 2: `self` caches, distinct-name binding, aug-assign and `xs[i]` fast paths, the map pool, `isinstance` direct, try/with without throws, builtin values' methods, class-attribute cache, sequence comparisons by slot (72a75c6) | 1.14x | dict_str 1.34x, richards 1.27x, raytrace 1.19x |
+| 3: lists and tuples built by appending, marker keys at the end (b7bb7b8) | 1.01x | closures 1.08x, spectral_norm 1.04x |
+| total | 2.78x | (3.09x by time) |
+| of which the general paths alone (`NY_ASTSPEC=0`) | 1.91x | fib 2.25x, spectral_norm 2.43x |
+| and the caches and specialized paths on top | 1.46x | richards 2.71x, deltablue 1.92x, raytrace 1.87x, fib 1.58x |
+
+By time (min of 3, interleaved): step 1 2.67x, step 2 1.15x, step 3 1.06x;
+`NY_ASTSPEC=0` 1.98x over round 80, the caches 1.46x over that. The caches
+cost nothing measurable where they do not apply except in the exceptions
+benchmark (4% more instructions with them: more and larger frames for the
+unwinder to walk).
+
+### Rules for anyone changing the interpreter now
+- **Anything that changes a class bumps the epoch**: a new write to
+  `class_vars_`, `class_ctx_map_`, `mro_cache_`, `slot_flags_`, a function's
+  tag in `func_names`, or a hook cache must call `specInvalidate()`.
+- **A new step before the class walk or the kind's method table** in
+  `getAttrValue`, `callMethod` or `evalCall` must be mirrored in the fast
+  path that skips it (`classLoadFill`, `builtinMethodKinds`/
+  `builtinMethodFast`, `methodICFill`, `storeICFill`) or excluded there.
+- A construct that runs statements and does not check the pending flag
+  must suspend it (`SuspendFast`); one that runs user code while a
+  return is pending must clear the flag around it (`leaveWithPending`).
+- `NY_ASTSPEC=0` turns every cache and specialized path off (the general
+  paths run); it is the first thing to try when a result differs.
+
+### Memory
+Peak RSS against round 80: **+0.8 MB at startup** (`pass`: 23.4 -> 24.2 MB)
+- the AST's nodes carry their caches (a name node's hash, depth and slot,
+a call's argument and signature facts, an operator's code; the inline
+caches themselves are made on a site's first use: ~110 bytes per method-call
+way, 4 ways, ~50 per store way, 2 ways, ~70 per class-attribute read) - and
+the map pool keeps up to 64 emptied maps per thread. Programs that hold
+values use less, because a `Value` is 80 bytes (from 112) and owns no token
+strings: dict_str -24%, exceptions -18%, closures -16%, deltablue -9%,
+vm_audit55 -27%, vm_audit73 -11%, vm_audit100 -11%; the small benchmarks
+are within +1.3 MB. The IDE's `ide_memprobe --check` still finds no growth
+per frame, key, scroll or split.
+
+### Not done / found
+- **Python exceptions are still C++ throws** on the interpreter: the
+  exceptions benchmark spends ~65% in the unwinder (`__gxx_personality_v0`
+  scanning the call-site tables of the evaluator's very large functions),
+  so it gained least (1.75x). The VM's round-80 answer (a pending
+  exception travelling by return value) would need every eval function to
+  check a flag after every sub-evaluation; not attempted.
+- Startup is ~480 million instructions (~0.14 s), most of it the parser
+  copying `Token`s (`Parser::token()` returns one by value); the benchmarks'
+  `bench_time` excludes it, every run pays it.
+- Tuples made by `enumerate`/`zip`/`items()` in a `for` with a tuple target
+  are still built and unpacked (spectral_norm: 10% in `makeListValue`).
+- Remaining costs (fib, richards): `Value` copies (a `bigint` and a
+  `long double` in every one), the per-call `Context` and its map, name
+  lookups in the scopes before the cached depth, the builtin dispatch
+  chain's string comparisons (`callBuiltin`, `iterableBuiltin`).
+- Found, not fixed (pre-existing, both checked against the round-80
+  binary): on the interpreter a lambda stored as a class attribute after
+  the class statement (`C.m = lambda self: 1`) is not bound when read as a
+  value (`b = o.m; b()` raises TypeError; the VM and python3 bind it);
+  `del C.m` leaves `o.m()` callable on the interpreter (the class-body scan
+  in `callMethod` finds the deleted def; the VM and python3 raise
+  AttributeError); `[1, 2].pop("x")` returns None on the interpreter and
+  pops 2 on the VM (python3 raises TypeError).
+- The round-80 note on `C.__setattr__ = f` set after instances stored
+  attributes (ignored on both engines) still holds; the store cache
+  checks the same hook test (`instanceAttrHook`) as the general path.
+- vm_audit66 (signals) failed once on the VM in a sweep run under heavy
+  load (exit 1); it passed 12/12 runs of the new binary and 12/12 of the
+  round-80 one afterwards, and in the final sweep.
 
 ## 0s3. Round 80, part C — a specializing adaptive interpreter for the VM (vm_audit98, `tools/bench/`)
 

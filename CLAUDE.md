@@ -380,6 +380,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit96 | 116 | round 80: the gaps rounds 78-79 found - two interpreter crashes, object's members on every class, except <expression>, numeric keys across int/float/Fraction/Decimal, dataclass(slots=True), sys.modules/__import__/importlib, relative imports, sys's facts, sys.excepthook and -O, exec/eval namespaces, a live os.environ, threading._register_atexit, str.maketrans/translate, `${` in a Python-mode file (passes under python3) |
 | vm_audit97 | 262 | round 80: os.fspath/PathLike, scandir, real file descriptors, ids, posixpath/ntpath/genericpath/stat/pwd/grp, codecs (every error handler, cp437/cp1252/utf-16/32/idna/punycode, bytes codecs), multiprocessing (Process, queues, pipes, locks across processes, shared Value/Array/SharedMemory, Pool with work stealing, Manager), ProcessPoolExecutor over pickle (passes under python3; 240 under Wine, POSIX-only checks skipped) |
 | vm_audit98 | 72 | round 80: the specializing VM's every fast path and its deoptimization (class/method/global/builtin changes after specialization, `__class__` reassignment, big-int overflow, polymorphic sites, descriptors, slots, generators, threads, tracing mid-loop) - passes on both engines, under python3 and with `NY_QUICKEN=0` |
+| vm_audit100 | 114 | round 81: the self-optimizing interpreter's every cache and its fallback (globals/builtins rebound or shadowed, functions replaced, class attributes and methods changed in a class or a base or deleted, fields shadowing them, `__class__` reassigned, `__get__` added later, big-int overflow, `exec`, closures, generators, recursion, threads, return/break/continue through try/finally/with, builtin values' methods, tracing and profiling mid-loop) - passes on both engines, under python3 and with `NY_ASTSPEC=0` |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -1197,6 +1198,25 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   `EpochFlag`), or caches go stale. `VMVal` is not an aggregate.
 - `call_stack_` is a `FrameStack` (frames reused); exceptions inside the
   run loop travel without a C++ throw (`fast_exc_pending`).
+
+## Round 81: a self-optimizing interpreter (see `HANDOFF.md` §0t2)
+
+- The tree-walking interpreter's nodes keep what they observed (Würthinger
+  et al., DLS 2012): literal values, operator codes, a name's depth and slot
+  (tried first, the scopes before it still searched), a field's slot, plain
+  calls with the arguments on the C++ stack, polymorphic inline caches for
+  method calls and attribute stores on instances and for class attributes,
+  a builtin value's own methods straight from its table; `return`/`break`
+  through `try`/`with` set the pending flag instead of throwing. 3.09x faster
+  (`python3 tools/bench/run.py --engine interp`). `NY_ASTSPEC=0` turns it off.
+- **Anything that changes a class calls `specInvalidate()`** (the epoch the
+  caches are valid for): writes to `class_vars_`, `class_ctx_map_`,
+  `mro_cache_`, `slot_flags_`, function kind tags, hook caches. A new step
+  before the class walk or a builtin kind's method table in `getAttrValue` /
+  `callMethod` / `evalCall` must be mirrored in the fast path that skips it.
+- A `Value` has no `Token` any more (`Value::token_default()`); heap objects
+  carry kind flags (`nygc::F_KSTR/F_KINST/F_KFUNC/F_KCONT`) that
+  `heapKind`/`contOf` read instead of the side tables.
 
 ## Transcripts
 
