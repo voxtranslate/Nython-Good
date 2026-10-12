@@ -6,6 +6,8 @@
 # the context manager) and FTP_TLS (auth, prot_p/prot_c, ccc), the
 # error_reply/error_temp/error_perm/error_proto classes - over
 # lib/socket.ny and lib/ssl.ny.
+#
+# sys.audit events are raised only where the runtime has sys.audit.
 
 """An FTP client class and some helper functions.
 

@@ -4,6 +4,8 @@
 # classes (MaildirMessage, mboxMessage, MHMessage, BabylMessage,
 # MMDFMessage), locking (lock/unlock with dot-locking and fcntl where the
 # os layer has it), folders, NoSuchMailboxError and the other errors.
+#
+# Locking uses fcntl.lockf where lib has an fcntl module, dot-locking always.
 
 """Read/write support for Maildir, mbox, MH, Babyl, and MMDF mailboxes."""
 

@@ -5,6 +5,8 @@
 # responses, literals, continuation requests, starttls), IMAP4_SSL,
 # IMAP4_stream (over a subprocess), Internaldate2tuple, Int2AP, ParseFlags,
 # Time2Internaldate - over lib/socket.ny and lib/ssl.ny.
+#
+# sys.audit events are raised only where the runtime has sys.audit.
 
 """IMAP4 client.
 

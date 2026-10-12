@@ -43,7 +43,7 @@
 //   _sql_readonly(stmt)  _sql_busy(stmt)  _sql_stmt_sql(stmt)
 //   _sql_create_function(h, name, narg, flags, kind, fid) -> rc  kind 0 scalar, 1 aggregate, 2 window
 //   _sql_create_collation(h, name, fid) -> rc   _sql_set_authorizer(h, on)
-//   _sql_set_progress(h, on, n)   _sql_set_trace(h, on)
+//   _sql_set_progress(h, on, n)   _sql_set_trace(h, statements, profile)
 //   _sql_backup_init(dst, dname, src, sname) -> [rc, b]  _sql_backup_step(b, n) -> [0, rc, remaining, pages]
 //   _sql_backup_finish(b) -> rc
 //   _sql_blob_open(h, db, table, column, row, writable) -> [rc, b]   _sql_blob_close(b)
@@ -63,6 +63,7 @@
 #include <mutex>
 #include <unordered_map>
 #ifdef _WIN32
+#  include <winsock2.h>     // (before windows.h, as tls.cpp)
 #  include <windows.h>
 #else
 #  include <dlfcn.h>
@@ -85,7 +86,7 @@ typedef void (*xfinal_t)(sqlite3_context*);
 constexpr int SQLITE_OK = 0, SQLITE_ERROR = 1, SQLITE_NOMEM = 7, SQLITE_MISUSE = 21,
               SQLITE_ROW = 100, SQLITE_DONE = 101, SQLITE_DENY = 1;
 constexpr int SQLITE_INTEGER = 1, SQLITE_FLOAT = 2, SQLITE_TEXT = 3, SQLITE_BLOB = 4, SQLITE_NULL = 5;
-constexpr int SQLITE_UTF8 = 1, SQLITE_TRACE_STMT = 1;
+constexpr int SQLITE_UTF8 = 1, SQLITE_TRACE_STMT = 1, SQLITE_TRACE_PROFILE = 2;
 #define SQLITE_TRANSIENT_ ((xdestroy_t)(intptr_t)-1)
 
 struct Api {
@@ -208,7 +209,12 @@ Api& api() {
     std::vector<std::string> names;
     if (const char* env = std::getenv("NY_LIBSQLITE3")) if (*env) names.push_back(env);
 #ifdef _WIN32
-    for (const char* n : {"sqlite3.dll", "libsqlite3-0.dll", "libsqlite3.dll", "winsqlite3.dll"}) names.push_back(n);
+    for (const char* n : {"sqlite3.dll", "libsqlite3-0.dll", "libsqlite3.dll"}) names.push_back(n);
+#  ifdef _WIN64
+    // Windows 10's own copy; its 32-bit build exports __stdcall functions,
+    // which these cdecl pointers cannot call, so only on 64-bit Windows
+    names.push_back("winsqlite3.dll");
+#  endif
     for (auto& n : names) { HMODULE h = LoadLibraryA(n.c_str()); if (h) { a.lib = (void*)h; g_lib_name = n; break; } }
 #elif defined(__APPLE__)
     for (const char* n : {"libsqlite3.dylib", "/usr/lib/libsqlite3.dylib", "/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib",
@@ -494,7 +500,7 @@ std::shared_ptr<Stmt> get_stmt(int64_t h) {
 
 // ── operations on coroutines ────────────────────────────────────────────────
 enum Kind { K_FUNC = 1, K_STEP = 2, K_FINAL = 3, K_VALUE = 4, K_INVERSE = 5, K_COLLATE = 6,
-            K_AUTH = 7, K_PROGRESS = 8, K_TRACE = 9 };
+            K_AUTH = 7, K_PROGRESS = 8, K_TRACE = 9, K_PROFILE = 10 };
 
 struct Op {
     int64_t id = 0;
@@ -707,17 +713,28 @@ int cb_progress(void* p) {
     return op->reply.t == SQLITE_INTEGER && op->reply.i != 0 ? 1 : 0;
 }
 
-int cb_trace(unsigned type, void* p, void* stmt, void* sqltext) {
+int cb_trace(unsigned type, void* p, void* stmt, void* x) {
     (void)p;
-    if (type != SQLITE_TRACE_STMT) return 0;
     Api& a = api();
-    Val v;
-    v.t = SQLITE_TEXT;
-    char* ex = a.expanded_sql ? a.expanded_sql(stmt) : nullptr;
-    if (ex) { v.s = ex; a.free_(ex); }
-    else if (sqltext) v.s = (const char*)sqltext;
-    std::vector<Val> args{v};
-    ask(K_TRACE, 0, 0, std::move(args));
+    if (type == SQLITE_TRACE_STMT) {
+        Val v;
+        v.t = SQLITE_TEXT;
+        char* ex = a.expanded_sql ? a.expanded_sql(stmt) : nullptr;
+        if (ex) { v.s = ex; a.free_(ex); }
+        else if (x) v.s = (const char*)x;
+        std::vector<Val> args{v};
+        ask(K_TRACE, 0, 0, std::move(args));
+    } else if (type == SQLITE_TRACE_PROFILE) {
+        // (Nython-only: Connection.set_profile_callback) the statement that
+        // finished and the nanoseconds it ran
+        Val v;
+        v.t = SQLITE_TEXT;
+        char* ex = a.expanded_sql ? a.expanded_sql(stmt) : nullptr;
+        if (ex) { v.s = ex; a.free_(ex); }
+        else { const char* q = a.sql(stmt); if (q) v.s = q; }
+        std::vector<Val> args{v, ival(x ? (int64_t)*(sqlite3_int64*)x : 0)};
+        ask(K_PROFILE, 0, 0, std::move(args));
+    }
     return 0;
 }
 
@@ -1148,13 +1165,16 @@ Value dispatch_sqlite(NythonExecutor& E, const std::string& name, std::vector<Va
         if (on != c->progress) { c->hooks += on ? 1 : -1; c->progress = on; }
         return NONE_VALUE;
     }
-    if (name == "_sql_set_trace") {
+    if (name == "_sql_set_trace") {     // (h, statements, profile)
         Api& a = need();
         auto c = get_conn(iarg(E, A, 0));
         bool on = A.size() > 1 && E.isTruthy(A[1]);
+        bool prof = A.size() > 2 && E.isTruthy(A[2]);
         if (!a.trace_v2) fail("NotSupportedError", "sqlite3_trace_v2 is not available");
-        a.trace_v2(c->db, on ? SQLITE_TRACE_STMT : 0, on ? cb_trace : nullptr, nullptr);
-        if (on != c->trace) { c->hooks += on ? 1 : -1; c->trace = on; }
+        unsigned mask = (on ? SQLITE_TRACE_STMT : 0) | (prof ? SQLITE_TRACE_PROFILE : 0);
+        a.trace_v2(c->db, mask, mask ? cb_trace : nullptr, nullptr);
+        bool any = mask != 0;
+        if (any != c->trace) { c->hooks += any ? 1 : -1; c->trace = any; }
         return NONE_VALUE;
     }
     if (name == "_sql_backup_init") {

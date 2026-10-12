@@ -6,6 +6,8 @@
 # write with IAC doubling, option negotiation callbacks, interact, mt_interact,
 # the context manager) and the telnet command constants; selectors-based
 # waits.
+#
+# sys.audit events are raised only where the runtime has sys.audit.
 
 r"""TELNET client class.
 

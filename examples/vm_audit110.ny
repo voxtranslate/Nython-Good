@@ -199,6 +199,17 @@ def sqlite_checks():
         r1 = [False, True, True, False, ["ValueError", "autocommit must be True, False, or sqlite3.LEGACY_TRANSACTION_CONTROL"], True]
     check("autocommit= (3.12)", r1, [False, True, True, False,
                                      ["ValueError", "autocommit must be True, False, or sqlite3.LEGACY_TRANSACTION_CONTROL"], True])
+    # Nython-only: the profile callback (SQLITE_TRACE_PROFILE)
+    if hasattr(con2, "set_profile_callback"):
+        prof = []
+        con2.set_profile_callback(lambda sql, ns: prof.append((sql, isinstance(ns, int) and ns >= 0)))
+        con2.execute("select count(*) from t").fetchall()
+        con2.set_profile_callback(None)
+        con2.execute("select 1").fetchall()
+        rp = prof
+    else:
+        rp = [("select count(*) from t", True)]
+    check("Nython's set_profile_callback", rp, [("select count(*) from t", True)])
     # executescript
     con3 = sqlite3.connect(":memory:")
     con3.executescript("""
@@ -839,6 +850,104 @@ def email_checks():
     dh = reg("Date", "Fri, 13 Sep 2024 01:02:03 -0700")
     check("HeaderRegistry", [type(dh).__name__, dh.datetime.year, dh.max_count, str(email.headerregistry.Address(addr_spec="x@y.z"))],
           ["_UniqueDateHeader", 2024, 1, "x@y.z"])
+
+
+# ── email: the default policy's API (MIMEPart, contentmanager, policies) ─────
+def email_api_checks():
+    import email
+    import email.policy
+    import email.message
+    import email.headerregistry
+    import email.contentmanager
+    import email.generator
+    import io
+    pol = email.policy.default
+    check("policies", [pol.max_line_length, repr(pol.linesep), pol.utf8, email.policy.SMTP.linesep == "\r\n",
+                       email.policy.SMTPUTF8.utf8, email.policy.HTTP.max_line_length, email.policy.strict.raise_on_defect,
+                       email.policy.compat32.max_line_length, pol.clone(max_line_length=40).max_line_length,
+                       (pol + email.policy.strict).raise_on_defect, type(pol.header_factory).__name__], [78, "'\\n'", False, True, True, None, True, 78, 40, True, 'HeaderRegistry'])
+    try:
+        pol.max_line_length = 5
+        r = "no error"
+    except AttributeError as e:
+        r = str(e)
+    check("policies are immutable", r, "'EmailPolicy' object attribute 'max_line_length' is read-only")
+    try:
+        pol.clone(nosuch=1)
+        r = "no error"
+    except TypeError as e:
+        r = str(e)
+    check("clone() of an unknown attribute", r, "'nosuch' is an invalid keyword argument for EmailPolicy")
+    m = email.message.EmailMessage()
+    m["From"] = email.headerregistry.Address("A", "a", "x.org")
+    m["To"] = [email.headerregistry.Address("B", "b", "y.org"), email.headerregistry.Group("team", [email.headerregistry.Address("C", "c", "z.org")])]
+    m["Subject"] = "API"
+    m.set_content("<p>html <img src='cid:img1@x'></p>\n", subtype="html")
+    m.add_related(b"GIF89a....", "image", "gif", cid="<img1@x>")
+    m.add_alternative("plain\n")
+    check("make_alternative/add_related structure", [p.get_content_type() for p in m.walk()], ['multipart/alternative', 'multipart/related', 'text/html', 'image/gif', 'text/plain'])
+    check("get_body preferences", [m.get_body().get_content_type(), m.get_body(("plain",)).get_content(),
+                                   m.get_body(("related",)).get_content_type(), m.get_body(("html",)).get_content()], ['multipart/related', 'plain\n', 'multipart/related', "<p>html <img src='cid:img1@x'></p>\n"])
+    check("iter_parts", [p.get_content_type() for p in m.iter_parts()], ['multipart/related', 'text/plain'])
+    att = email.message.EmailMessage()
+    att.set_content(b"\x00\x01data", maintype="application", subtype="octet-stream", filename="d.bin", disposition="attachment",
+                    headers=["X-Extra: 1"])
+    check("set_content bytes", [att["Content-Type"], att["Content-Disposition"], att["Content-Transfer-Encoding"], att["X-Extra"],
+                                att.get_content(), att.get_payload()], ['application/octet-stream', 'attachment; filename="d.bin"', 'base64', '1', b'\x00\x01data', 'AAFkYXRh\n'])
+    inner = email.message.EmailMessage()
+    inner["Subject"] = "inner"
+    inner.set_content("inner body\n")
+    outer = email.message.EmailMessage()
+    outer["Subject"] = "outer"
+    outer.set_content(inner)
+    check("set_content a message", [outer.get_content_type(), outer.get_content()["Subject"], outer.as_string().split("\n")[:4]], ['message/rfc822', 'inner', ['Subject: outer', 'Content-Type: message/rfc822', 'Content-Transfer-Encoding: 8bit', 'MIME-Version: 1.0']])
+    mixed = email.message.EmailMessage()
+    mixed.set_content("text\n")
+    mixed.make_mixed()
+    mixed.attach(att)
+    check("make_mixed", [p.get_content_type() for p in mixed.walk()], ['multipart/mixed', 'text/plain', 'application/octet-stream'])
+    mixed.clear_content()
+    check("clear_content", [mixed.get_content_type(), mixed.is_multipart(), list(mixed.keys())], ['text/plain', False, ['MIME-Version']])
+    h = email.message.EmailMessage()
+    h["Content-Type"] = "text/plain; charset=utf-8; format=flowed"
+    h["Date"] = "Thu, 01 Jan 2004 12:00:00 +0100"
+    h["Message-ID"] = "<1@x>"
+    h["Content-Disposition"] = 'attachment; filename="a b.txt"'
+    h["MIME-Version"] = "1.0"
+    h["Content-Transfer-Encoding"] = "base64"
+    check("header objects", [h["Content-Type"].content_type, dict(h["Content-Type"].params), h["Content-Type"].maintype,
+                             h["Date"].datetime.isoformat(), h["Content-Disposition"].content_disposition,
+                             h["MIME-Version"].major, h["Content-Transfer-Encoding"].cte, type(h["Message-ID"]).__name__], ['text/plain', {'charset': 'utf-8', 'format': 'flowed'}, 'text', '2004-01-01T12:00:00+01:00', 'attachment', 1, 'base64', '_MessageIDHeader'])
+    try:
+        h["Date"] = "again"
+        r = "no error"
+    except ValueError as e:
+        r = str(e)
+    check("a unique header twice", r, 'There may be at most 1 Date headers in a message')
+    a = email.headerregistry.Address("Jane Q. Public", "jqp", "example.com")
+    check("Address", [str(a), a.addr_spec, repr(a), str(email.headerregistry.Address(addr_spec="a.b@c.d")),
+                      str(email.headerregistry.Group("g", [a])), str(email.headerregistry.Group(None, [a]))], ['"Jane Q. Public" <jqp@example.com>', 'jqp@example.com', "Address(display_name='Jane Q. Public', username='jqp', domain='example.com')", 'a.b@c.d', 'g: "Jane Q. Public" <jqp@example.com>;', '"Jane Q. Public" <jqp@example.com>'])
+    try:
+        email.headerregistry.Address(addr_spec="not an address")
+        r = "no error"
+    except Exception as e:
+        r = type(e).__name__
+    check("a bad addr_spec", r, 'InvalidHeaderDefect')
+    out = io.BytesIO()
+    msg = email.message.EmailMessage(policy=email.policy.SMTPUTF8)
+    msg["To"] = "jö@ex.de"
+    msg["Subject"] = "über"
+    msg.set_content("x\n")
+    email.generator.BytesGenerator(out).flatten(msg)
+    check("SMTPUTF8 keeps UTF-8 headers", out.getvalue().split(b"\r\n")[:2], [b'To: j\xc3\xb6@ex.de', b'Subject: \xc3\xbcber'])
+    folded = email.message.EmailMessage(policy=email.policy.default.clone(max_line_length=30))
+    folded["Subject"] = "one two three four five six seven eight nine ten"
+    check("folding at max_line_length", folded.as_string().split("\n")[:4], ['Subject: one two three four', ' five six seven eight nine ten', '', ''])
+    p = email.message_from_bytes(b"Subject: =?utf-8?b?w6k=?=\nContent-Type: text/plain; charset=latin-1\nContent-Transfer-Encoding: 8bit\n\ncaf\xe9\n",
+                                 policy=email.policy.default)
+    check("8bit latin-1 body", [p["Subject"], p.get_content()], ['é', 'café\n'])
+    check("get_content_maintype/subtype/charset", [p.get_content_maintype(), p.get_content_subtype(), p.get_content_charset(),
+                                                   p.get_param("charset"), p.get_params()], ['text', 'plain', 'latin-1', 'latin-1', [('text/plain', ''), ('charset', 'latin-1')]])
 
 
 # ── plistlib, quopri, uu, netrc, mailcap, cgi, cgitb ─────────────────────────
@@ -2247,6 +2356,7 @@ _warnings.simplefilter("ignore", DeprecationWarning)
 section("sqlite3", sqlite_checks)
 section("sqlite3 and threads", sqlite_thread_checks)
 section("email", email_checks)
+section("email: the default policy's API", email_api_checks)
 section("plistlib", plist_checks)
 section("quopri/uu", quopri_uu_checks)
 section("netrc/mailcap/cgi", netrc_mailcap_cgi_checks)

@@ -3,6 +3,8 @@
 # (user/pass_, apop, rpop, stat, list, retr, dele, noop, rset, quit, top,
 # uidl, utf8, capa, stls) and POP3_SSL, error_proto - over lib/socket.ny
 # and lib/ssl.ny.
+#
+# sys.audit events are raised only where the runtime has sys.audit.
 
 """A POP3 client class.
 

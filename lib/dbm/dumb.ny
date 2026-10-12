@@ -1,6 +1,9 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
 # lib/dbm/dumb.ny - Python's dbm.dumb (CPython 3.13's Lib/dbm/dumb.py): the
 # portable dbm in pure Python - a .dat file of values and a .dir index.
+#
+# The index file is read with ast.literal_eval where lib has ast, else with
+# a parser of the one shape the index has.
 
 """A dumb and slow but simple dbm clone.
 

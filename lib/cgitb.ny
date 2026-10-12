@@ -3,6 +3,10 @@
 # deprecated for removal in 3.13 - importing it warns): the traceback
 # formatter for CGI scripts - html() and text() reports with the source
 # around each frame and its variables, Hook, enable, handler, reset.
+#
+# The report's per-line variable dump needs lib/tokenize.ny (without it the
+# frames are listed without their variables); pydoc's reprs are used when
+# lib/pydoc.ny has them, CPython's HTMLRepr/TextRepr carried here otherwise.
 
 """More comprehensive traceback formatting for Python scripts.
 

@@ -46,13 +46,17 @@
 # function as ordinary Nython code (src/builtins/nysqlite.cpp has the
 # design). The GIL is released while SQLite works.
 #
-# Not provided: Connection.__call__ (CPython's statement objects), the
-# statement cache's exact LRU accounting (statements are cached per SQL text
-# up to cached_statements), PyErr_WriteUnraisable's exact report for a failed
-# callback under enable_callback_tracebacks(True) (the traceback is printed
-# with "Exception ignored in:" as CPython's default hook does). When the
-# SQLite library cannot be found, importing this module raises ImportError
-# naming it.
+# Nython-only: Connection.set_profile_callback(cb) - cb(sql, nanoseconds)
+# after each statement finishes (SQLite's SQLITE_TRACE_PROFILE).
+# Also from 3.13: iterdump(filter=). Statements are kept in a least-recently-
+# used cache of cached_statements entries, as CPython's.
+#
+# Not provided: Connection.__call__ (CPython's statement objects);
+# PyErr_WriteUnraisable's exact report for a failed callback under
+# enable_callback_tracebacks(True) (the traceback is printed after
+# "Exception ignored in:", as CPython's default hook does, or given to a
+# sys.unraisablehook the program set). When the SQLite library cannot be
+# found, importing this module raises ImportError naming it.
 
 if not _sql_available():
     raise ImportError("No module named '_sqlite3': " + _sql_why())
@@ -482,6 +486,7 @@ class Connection:
         self._authorizer = None
         self._progress = None
         self._trace = None
+        self._profile = None
         self._pending = None
         self._blobs = []
         self._initialized = True
@@ -632,6 +637,14 @@ class Connection:
             if fn is not None:
                 try:
                     fn(args[0])
+                except BaseException as e:
+                    self._callback_failed(fn, e)
+            return _sql_resume(op, 0)
+        if kind == 10:                                 # the profile callback (Nython-only)
+            fn = self._profile
+            if fn is not None:
+                try:
+                    fn(args[0], args[1])
                 except BaseException as e:
                     self._callback_failed(fn, e)
             return _sql_resume(op, 0)
@@ -906,7 +919,17 @@ class Connection:
         if trace_callback is not None and not callable(trace_callback):
             raise TypeError("parameter must be callable")
         self._trace = trace_callback
-        _sql_set_trace(self._h, trace_callback is not None)
+        _sql_set_trace(self._h, trace_callback is not None, self._profile is not None)
+
+    # Nython-only: profile_callback(sql, nanoseconds) after each statement
+    # finishes (SQLite's SQLITE_TRACE_PROFILE - the successor of the
+    # sqlite3_profile hook CPython never exposed); None removes it.
+    def set_profile_callback(self, profile_callback):
+        self._check()
+        if profile_callback is not None and not callable(profile_callback):
+            raise TypeError("parameter must be callable")
+        self._profile = profile_callback
+        _sql_set_trace(self._h, self._trace is not None, profile_callback is not None)
 
     # -- the rest -----------------------------------------------------------
     def interrupt(self):

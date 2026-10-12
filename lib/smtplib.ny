@@ -6,6 +6,8 @@
 # noop, quit, the context manager, set_debuglevel), SMTP_SSL, LMTP (over
 # TCP or a Unix socket), quotedata, and the SMTP*Error classes - over
 # lib/socket.ny and lib/ssl.ny.
+#
+# sys.audit events are raised only where the runtime has sys.audit.
 
 #! /usr/bin/python3.12
 

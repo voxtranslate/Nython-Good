@@ -5,6 +5,9 @@
 # register_introspection_functions, register_multicall_functions),
 # MultiPathXMLRPCServer, CGIXMLRPCRequestHandler, DocXMLRPCServer and
 # ServerHTMLDoc - over http.server and socketserver.
+#
+# Not provided while lib/pydoc.ny has no HTMLDoc: DocXMLRPCServer,
+# DocCGIXMLRPCRequestHandler and ServerHTMLDoc (the documenting server).
 
 r"""XML-RPC Servers.
 
