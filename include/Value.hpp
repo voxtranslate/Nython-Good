@@ -71,17 +71,18 @@ typedef Value (*CFunction) (Runnable* runner, std::vector<Value>& args);
 */
 typedef struct TValue {
 
+	// (round 81: the fields are ordered to leave no padding - 80 bytes, from 112)
 	Collectable* gc = nullptr;  /* collectable object */
 	void* p = nullptr;          /* light user data */
-	bool b = false;             /* boolean */
-	bigint i{};                 /* integer numbers */
-	long double d = 0.0L;       /* float numbers */
 	// The heap object this value keeps alive (NyGC.hpp): the Collectable
 	// itself for a COLLECTABLE value, the object that owns the payload `p`
 	// points into for a string, function, bound method or instance, and
 	// nullptr for everything that is not reference counted (numbers, AST
 	// classes, builtins). Every copy counts a reference.
 	Collectable* o = nullptr;
+	bigint i{};                 /* integer numbers */
+	bool b = false;             /* boolean */
+	long double d = 0.0L;       /* float numbers */
 
 	TValue() = default;
 
@@ -98,10 +99,10 @@ typedef struct TValue {
 	explicit TValue(void* p_) : p{p_} {}
 	explicit TValue(Collectable* gc_) : gc{gc_}, o{gc_} { if (o) nygc::incref(o); }
 
-	TValue(const TValue& that) : gc{that.gc}, p{that.p}, b{that.b}, i{that.i}, d{that.d}, o{that.o} {
+	TValue(const TValue& that) : gc{that.gc}, p{that.p}, o{that.o}, i{that.i}, b{that.b}, d{that.d} {
 		if (o) nygc::incref(o);
 	}
-	TValue(TValue&& that) noexcept : gc{that.gc}, p{that.p}, b{that.b}, i{std::move(that.i)}, d{that.d}, o{that.o} {
+	TValue(TValue&& that) noexcept : gc{that.gc}, p{that.p}, o{that.o}, i{std::move(that.i)}, b{that.b}, d{that.d} {
 		that.o = nullptr;
 	}
 	~TValue() { if (o) nygc::decref(o); }
@@ -164,23 +165,29 @@ struct Value {
     ValueKind kind = ValueKind::VAR;
 	ValueType type = ValueType::NONE;
 	TValue    value{};
-	Token     token{};
+	// Round 81: a Value no longer carries a Token. Nothing ever set it (every
+	// Value's was the default one, "End" at stdin:1:1), yet each copy, move
+	// and destruction of a Value copied its two strings - the largest part of
+	// what copying a Value cost. The places that read it use that default.
+	static const Token& token_default() { static const Token t{}; return t; }
 
-	explicit Value();
-	explicit Value(bool b);
-	explicit Value(int num);
-	explicit Value(bigint num);
-	explicit Value(uint64_t num);
-	explicit Value(long int num);
+	// The constructors and the destructor are inline (round 81): they were
+	// out of line in Value.cpp, a call per Value made, copied or dropped.
+	Value() : type{ValueType::NONE}, value{} {}
+	explicit Value(bool b) : type{ValueType::BOOLEAN}, value{b} {}
+	explicit Value(int num) : type{ValueType::INTEGER}, value{bigint(num)} {}
+	explicit Value(bigint num) : type{ValueType::INTEGER}, value{std::move(num)} {}
+	explicit Value(uint64_t num) : type{ValueType::INTEGER}, value{bigint(num)} {}
+	explicit Value(long int num) : type{ValueType::INTEGER}, value{bigint(num)} {}
 #if defined(__MINGW32__) || defined(__MINGW64__)
-	explicit Value(long long num);
+	explicit Value(long long num) : type{ValueType::INTEGER}, value{bigint(num)} {}
 #endif
-	explicit Value(double num);
-	explicit Value(long double num);
-	explicit Value(Collectable* c);
-	explicit Value(void* p);
-	Value(const Value& that);
-	~Value();
+	explicit Value(double num) : type{ValueType::DOUBLE}, value{static_cast<long double>(num)} {}
+	explicit Value(long double num) : type{ValueType::DOUBLE}, value{num} {}
+	explicit Value(Collectable* c) : type{ValueType::COLLECTABLE}, value{c} {}
+	explicit Value(void* p) : type{ValueType::USERDATA}, value{p} {}
+	Value(const Value& that) : access{that.access}, kind{that.kind}, type{that.type}, value{that.value} {}
+	~Value() = default;
 
 	// `value` is assigned last: releasing the old reference can free the
 	// object `that` is stored in (x = x.next through a container slot).
@@ -189,7 +196,6 @@ struct Value {
 			type   = that.type;
 			access = that.access;
 			kind   = that.kind;
-			token  = that.token;
 			value  = that.value;
 		}
 		return *this;
@@ -198,7 +204,7 @@ struct Value {
 	// Move constructor
 	Value(Value&& that) noexcept
 		: access{that.access}, kind{that.kind}, type{that.type},
-		  value{std::move(that.value)}, token{std::move(that.token)} {}
+		  value{std::move(that.value)} {}
 
 	// Move assignment
 	Value& operator=(Value&& that) noexcept {
@@ -206,7 +212,6 @@ struct Value {
 			type   = that.type;
 			access = that.access;
 			kind   = that.kind;
-			token  = std::move(that.token);
 			value  = std::move(that.value);
 		}
 		return *this;

@@ -5738,3 +5738,13 @@ Full detail in `HANDOFF.md` §0t. New test: `vm_audit99` (125 checks; passes on 
 | A set changed in size during a loop: no error (the VM walked a copy) | — | CPython's RuntimeError "Set changed size during iteration" (both engines' loops) |
 | `repr(f)` was `<function f>` (`<function s__static__>` for a staticmethod on the interpreter) | — | `<function Qualname at 0x...>`, the address id() gives |
 | `__class__` in a method was a NameError | no implicit cell | the class defining the method (the one super() uses) |
+
+## Round 81, part B — a self-optimizing AST interpreter
+
+Full detail in `HANDOFF.md` §0t2. New test: `vm_audit100` (114 checks; passes on both engines, under python3 and with `NY_ASTSPEC=0`); benchmarks in `tools/bench/` (`--engine interp`).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| The interpreter was 3-9x slower than the round-80 VM and 22-165x slower than python3 | every `Value` carried a `Token` (two strings, a vector) copied with it; kinds told apart by side-table and `std::map` lookups and `dynamic_cast`; names looked up by string in every scope; the generic operator dispatch for `1 + 1`; a vector, a map and the side tables per call; method and class-attribute reads walked the MRO each time; eval functions took `shared_ptr`s by value | Values without tokens and with inline limbs, kind flags, in-node caches (literals, operator codes, a name's depth and slot, a field's slot), plain calls on the C++ stack, polymorphic inline caches for method calls, stores and class attributes, a builtin value's methods straight from its table: 3.09x faster (geomean of 11 benchmarks) |
+| A `return` inside `try`/`finally` or `with` cost a C++ exception (raytrace: 2,381 throws) | those statements suspended the pending-flag control flow | they check the flag themselves and run `finally` / `__exit__` with it cleared |
+| `isinstance(x, T)` cost ~300 string comparisons first | it was the 300th name tried in `dispatch_tensor` | called directly from `callBuiltin` (`builtin_isinstance`) |

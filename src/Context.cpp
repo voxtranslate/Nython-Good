@@ -91,7 +91,7 @@ void Context::set(const Value& name, Value value) {
         parent->set(name, value);
         return;
     }
-    Token token = name.token;
+    Token token = Value::token_default();   // round 81: Values carry no token
     throw RuntimeError(token.location(), "Undefined variable \'" + token.value + "\'.");
 }
 
@@ -115,7 +115,7 @@ Value Context::get(const Value& name) {
     }
 
     // if it still has not been found, the variable doesn't exist
-    Token token = name.token;
+    Token token = Value::token_default();   // round 81: Values carry no token
     throw RuntimeError(token.location(), "Undefined variable \'" + token.value + "\'.");
 }
 

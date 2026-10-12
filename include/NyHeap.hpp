@@ -19,6 +19,7 @@
 #include "NyGC.hpp"
 
 struct NythonExecutor;
+namespace nython::node { struct Node; }
 
 namespace nyheap {
 
@@ -61,6 +62,10 @@ struct Func final : Collectable {
     int64_t id;
     NythonExecutor* E;
     Context* scope = nullptr;           // counted
+    // Its FunctionNode / LambdaNode (round 81: what func_ast_nodes lists for
+    // it, kept here too so a call needs no lookup). AST nodes live as long
+    // as the program (the executor keeps every parsed tree).
+    nython::node::Node* code = nullptr;
     Func(NythonExecutor* e, int64_t i);
     ~Func() override;
     void setScope(Context* c) {

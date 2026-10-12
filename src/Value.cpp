@@ -15,48 +15,7 @@ using nython::gc::Collectable;
 namespace nython{
 namespace kernel{
 
-Value::Value() : type{ValueType::NONE},value{} {
-}
-
-Value::Value(bool b) : type{ValueType::BOOLEAN},value{b} {
-}
-
-Value::Value(int num) : Value(bigint(num)) {
-}
-
-Value::Value(uint64_t num) : Value(bigint(num)) {
-}
-
-Value::Value(long int num) : Value(bigint(num)) {
-}
-
-#if defined(__MINGW32__) || defined(__MINGW64__)
-Value::Value(long long num) : Value(bigint(num)) {
-}
-#endif
-
-Value::Value(bigint num) : type{ValueType::INTEGER},value{num} {
-}
-
-Value::Value(double num) : Value(ldouble(num)) {
-}
-
-Value::Value(long double num) : type{ValueType::DOUBLE},value{num} {
-}
-
-Value::Value(Collectable* obj) : type{ValueType::COLLECTABLE},value{obj} {
-}
-
-Value::Value(void* p) : type{ValueType::USERDATA},value{p} {
-}
-
-Value::Value(const Value& that)
-	: access{that.access}, kind{that.kind}, type{that.type},
-	  value{that.value}, token{that.token} {
-}
-
-Value::~Value(){
-}
+// The constructors and the destructor are inline in Value.hpp (round 81).
 
 Value Value::Undefined(){
 	Value v;

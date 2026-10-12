@@ -26,12 +26,14 @@ inline void executor_died(const NythonExecutor* e) {
 // ── Str ──────────────────────────────────────────────────────────────────
 inline Str::Str(NythonExecutor* e, const std::string& x) : Collectable(nython::kernel::Type::STRING), s(x), E(e) {
     gc_counted = 0;
+    gc_flags |= nygc::F_KSTR;   // round 81
     nython::gc::collectables_created()--;
     nygc::g_live_strings++;
     nygc::g_string_bytes += (long long)s.size();
 }
 inline Str::Str(NythonExecutor* e, std::string&& x) : Collectable(nython::kernel::Type::STRING), s(std::move(x)), E(e) {
     gc_counted = 0;
+    gc_flags |= nygc::F_KSTR;   // round 81
     nython::gc::collectables_created()--;
     nygc::g_live_strings++;
     nygc::g_string_bytes += (long long)s.size();
@@ -56,9 +58,12 @@ inline Bytes::~Bytes() {
 }
 
 // ── Func ─────────────────────────────────────────────────────────────────
-inline Func::Func(NythonExecutor* e, int64_t i) : Collectable(nython::kernel::Type::FUNCTION), id(i), E(e) {}
+inline Func::Func(NythonExecutor* e, int64_t i) : Collectable(nython::kernel::Type::FUNCTION), id(i), E(e) { gc_flags |= nygc::F_KFUNC; }   // round 81
 inline Func::~Func() {
-    if (E && executor_alive(E)) E->forgetFunction((void*)&id);
+    if (E && executor_alive(E)) {
+        if (gc_flags & nygc::F_KICREF) E->specInvalidate();   // round 81: a cached method died
+        E->forgetFunction((void*)&id);
+    }
     Context* s = scope;
     scope = nullptr;
     if (s) nygc::decref(s);
@@ -118,7 +123,7 @@ inline void BMember::gc_clear() {
 
 // ── Inst ─────────────────────────────────────────────────────────────────
 inline Inst::Inst(NythonExecutor* e, const std::string& t, void* class_node)
-    : Collectable(nython::kernel::Type::INSTANCE), tag(t), E(e), cls(class_node) {}
+    : Collectable(nython::kernel::Type::INSTANCE), tag(t), E(e), cls(class_node) { gc_flags |= nygc::F_KINST; }   // round 81
 inline Inst::~Inst() {
     if (E && executor_alive(E)) E->forgetInstance((void*)&tag);
     Context* p = props;

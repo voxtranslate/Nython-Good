@@ -385,6 +385,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit97 | 262 | round 80: os.fspath/PathLike, scandir, real file descriptors, ids, posixpath/ntpath/genericpath/stat/pwd/grp, codecs (every error handler, cp437/cp1252/utf-16/32/idna/punycode, bytes codecs), multiprocessing (Process, queues, pipes, locks across processes, shared Value/Array/SharedMemory, Pool with work stealing, Manager), ProcessPoolExecutor over pickle (passes under python3; 240 under Wine, POSIX-only checks skipped) |
 | vm_audit99 | 125 | round 81: `except E as e` unbinds e, a live `globals()`/`locals()`/`vars()` and the real `__main__` module, `__spec__`/`__loader__`, `sys.meta_path`/`sys.path_hooks` in the import statement, attribute hooks assigned later, live list iterators, "P() takes no arguments", CPython's default repr, `frame.f_lineno` jumps and pdb's `jump`, `sys.getrefcount`/`stdlib_module_names`/`displayhook`, `-OO`, 3000 frames deep, exec with dict-subclass and mapping namespaces, live `f_globals`, "Set changed size during iteration", CPython's function reprs, the `__class__` cell (passes under python3) |
 | vm_audit98 | 72 | round 80: the specializing VM's every fast path and its deoptimization (class/method/global/builtin changes after specialization, `__class__` reassignment, big-int overflow, polymorphic sites, descriptors, slots, generators, threads, tracing mid-loop) - passes on both engines, under python3 and with `NY_QUICKEN=0` |
+| vm_audit100 | 114 | round 81: the self-optimizing interpreter's every cache and its fallback (globals/builtins rebound or shadowed, functions replaced, class attributes and methods changed in a class or a base or deleted, fields shadowing them, `__class__` reassigned, `__get__` added later, big-int overflow, `exec`, closures, generators, recursion, threads, return/break/continue through try/finally/with, builtin values' methods, tracing and profiling mid-loop) - passes on both engines, under python3 and with `NY_ASTSPEC=0` |
 | vm_audit101 | 125 | round 81: the live debug server driven over its socket (`--debug-port`, DAP messages: breakpoints with conditions/hit counts/log messages, stepping, pause, stack/scopes/variables by reference, evaluate, setVariable, raised/uncaught exceptions, `--connect`, stdin/argv untouched) and its ring buffer (stepBack/reverseContinue/seek, Why? over the live history); the Profile view's reader on real `-m cProfile [--stacks]` dumps (Nython-only) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
@@ -1222,9 +1223,9 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   read (the ring keeps each step's bindings, not copies).
 - The trace function's hot path reads the frame through `_ny_frame_sync`
   (f_lineno / f_locals' native layer) and takes the file and function from
-  the call event; `f_globals` and `globals()` are copies on both engines, so
-  the server writes module variables through the namespace the program was
-  exec'd in (or the module object).
+  the call event; the server writes module variables through the namespace
+  the program was exec'd in (or the module object) - written when
+  `f_globals`/`globals()` were copies; they are live views since part A.
 - **IDE**: `ide_live.ny` (`IDELive`, between IDETools and NythonIDE) - Run
   with Live Debugging (Alt+F5), Pause (F6), the expandable Variables tree,
   Set Value (double-click), exception-breakpoint checkboxes; and the PROFILE
@@ -1261,6 +1262,25 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
 - Also: `frame.f_globals` is the live globals() view; a set changed in size
   during a loop raises "Set changed size during iteration"; functions show
   as `<function Qualname at 0x...>`; `__class__` in a method is its class.
+
+## Round 81: a self-optimizing interpreter (see `HANDOFF.md` §0t2)
+
+- The tree-walking interpreter's nodes keep what they observed (Würthinger
+  et al., DLS 2012): literal values, operator codes, a name's depth and slot
+  (tried first, the scopes before it still searched), a field's slot, plain
+  calls with the arguments on the C++ stack, polymorphic inline caches for
+  method calls and attribute stores on instances and for class attributes,
+  a builtin value's own methods straight from its table; `return`/`break`
+  through `try`/`with` set the pending flag instead of throwing. 3.09x faster
+  (`python3 tools/bench/run.py --engine interp`). `NY_ASTSPEC=0` turns it off.
+- **Anything that changes a class calls `specInvalidate()`** (the epoch the
+  caches are valid for): writes to `class_vars_`, `class_ctx_map_`,
+  `mro_cache_`, `slot_flags_`, function kind tags, hook caches. A new step
+  before the class walk or a builtin kind's method table in `getAttrValue` /
+  `callMethod` / `evalCall` must be mirrored in the fast path that skips it.
+- A `Value` has no `Token` any more (`Value::token_default()`); heap objects
+  carry kind flags (`nygc::F_KSTR/F_KINST/F_KFUNC/F_KCONT`) that
+  `heapKind`/`contOf` read instead of the side tables.
 
 ## Transcripts
 

@@ -12,17 +12,64 @@
 namespace nython {
 namespace kernel {
 
+// ── Maps kept for reuse (round 81) ──────────────────────────────────────────
+// Every call makes a scope and every list or dict literal a container, each
+// with a map whose first chunk of slots is allocated on its first entry and
+// freed with it. Emptied maps that never grew past that chunk are kept here
+// (per thread, a few dozen) and handed to the next container, storage and
+// all: two allocations and two frees less per call. Emptying one destroys
+// its entries in order, as deleting it did. The state is trivially
+// destructible; the reaper frees what is kept when the thread ends, and a
+// map released after that is deleted as before.
+namespace {
+struct MapPool {
+    static constexpr int kCap = 64;
+    ContainerType* maps[kCap];
+    int n;
+    bool dead;
+};
+thread_local MapPool t_map_pool;   // zero-initialized
+struct MapPoolReaper {
+    bool armed = false;
+    ~MapPoolReaper() {
+        MapPool& p = t_map_pool;
+        p.dead = true;
+        while (p.n > 0) delete p.maps[--p.n];
+    }
+};
+thread_local MapPoolReaper t_map_pool_reaper;
+ContainerType* acquire_map() {
+    MapPool& p = t_map_pool;
+    if (p.n > 0) return p.maps[--p.n];
+    return new ContainerType();
+}
+}
+// Not static: Container's destructor and the executor's scope switches use it.
+void release_container_map(ContainerType* m) {
+    if (!m) return;
+    MapPool& p = t_map_pool;
+    if (!p.dead && p.n < MapPool::kCap && m->pool_small()) {
+        t_map_pool_reaper.armed = true;   // (its first use in this thread registers its destructor)
+        m->clear_keep();
+        if (!p.dead && p.n < MapPool::kCap) { p.maps[p.n++] = m; return; }
+    }
+    delete m;
+}
+
 Container::Container(Type type_arg, uint32_t initial_capacity): Collectable(type_arg), location{} {
-    this->container = new ContainerType();
+    gc_flags |= nygc::F_KCONT;   // round 81: NythonExecutor::contOf
+    this->container = acquire_map();   // (round 81: from the pool when one is kept)
     this->container->reserve(initial_capacity);
 }
 
 Container::Container(Runnable* runner, Type type, uint32_t initial_capacity): Collectable(runner,type), location{} {
-    this->container = new ContainerType();
+    gc_flags |= nygc::F_KCONT;   // round 81
+    this->container = acquire_map();
     this->container->reserve(initial_capacity);
 }
 
 Container::Container(const Container& o) : Collectable(o), location{o.location} {
+    gc_flags |= nygc::F_KCONT;   // round 81
     this->container = o.container ? new ContainerType(*o.container) : nullptr;
 }
 
@@ -44,7 +91,7 @@ Container& Container::operator=(const Container& o) {
 Container::~Container() {
     ContainerType* m = this->container;
     this->container = nullptr;
-    delete m;
+    release_container_map(m);   // round 81: kept for reuse when small (deleted otherwise)
 }
 
 void Container::gc_traverse(nython::gc::GcVisitFn visit, void* arg) {

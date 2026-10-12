@@ -47,6 +47,7 @@
 #include <sstream>
 #include <ctime>
 #include <functional>
+#include <charconv>   // round 81: std::to_chars (list keys)
 #include "NyBigInt.hpp"
 #include "NyRange.hpp"   // range objects and dict views (round 78)
 #include "NyStr.hpp"
@@ -253,6 +254,8 @@ Value dispatch_gui      (NythonExecutor& E, const std::string& name, std::vector
 Value dispatch_text     (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_lang     (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
 Value dispatch_pycore   (NythonExecutor& E, const std::string& name, std::vector<Value>& args, Context* ctx);
+// isinstance (round 81: called by callBuiltin directly; builtins/tensor.cpp)
+Value builtin_isinstance(NythonExecutor& E, std::vector<Value>& args, Context* ctx);
 
 
 struct NythonExecutor;
@@ -345,8 +348,36 @@ struct NythonExecutor {
         bytes_ptrs_.emplace((void*)&bo->s, bo);
         return nyheap::userValue(bo, (void*)&bo->s);
     }
+    // ── Kinds of heap values by their objects' flags (round 81) ──────────
+    // A USERDATA value's object (value.o) says what the value is when
+    // value.p is that object's own payload and this executor made it: the
+    // side tables are then known to agree with it (a live Str is listed in
+    // string_ptrs_, a live Inst in instance_to_class and func_names, a live
+    // Func in func_names), so the hash and tree lookups in them are skipped.
+    // Anything else - a value without an owner, another executor's object -
+    // still takes the lookups. (nygc::F_K* flags, set by the constructors.)
+    enum HeapKind { HK_UNKNOWN = 0, HK_STR, HK_INST, HK_FUNC };
+    int heapKind(const Value& v) const {
+        nython::gc::Collectable* o = v.value.o;
+        if (!o || v.type != ValueType::USERDATA) return HK_UNKNOWN;
+        const uint16_t f = o->gc_flags;
+        if (f & nygc::F_KSTR) {
+            auto* so = static_cast<nyheap::Str*>(o);
+            return (v.value.p == (void*)&so->s && so->E == this) ? HK_STR : HK_UNKNOWN;
+        }
+        if (f & nygc::F_KINST) {
+            auto* io = static_cast<nyheap::Inst*>(o);
+            return (v.value.p == (void*)&io->tag && io->E == this) ? HK_INST : HK_UNKNOWN;
+        }
+        if (f & nygc::F_KFUNC) {
+            auto* fo = static_cast<nyheap::Func*>(o);
+            return (v.value.p == (void*)&fo->id && fo->E == this) ? HK_FUNC : HK_UNKNOWN;
+        }
+        return HK_UNKNOWN;
+    }
     nyheap::Bytes* bytesOf(const Value& v) const {
         if (v.type != ValueType::USERDATA || !v.value.p) return nullptr;
+        if (heapKind(v) != HK_UNKNOWN) return nullptr;   // a str, instance or function (round 81)
         auto it = bytes_ptrs_.find(v.value.p);
         return it == bytes_ptrs_.end() ? nullptr : it->second;
     }
@@ -376,6 +407,12 @@ struct NythonExecutor {
 
     // Get string from a string Value
     bool isStringValue(const Value& v) {
+        if (v.type != ValueType::USERDATA) return false;   // round 81: numbers, containers ... at once
+        switch (heapKind(v)) {
+            case HK_STR: return true;
+            case HK_INST: case HK_FUNC: return false;
+            default: break;
+        }
         if (v.type == ValueType::USERDATA && v.value.p && string_ptrs_.count(v.value.p))
             return true;
         return v.type == ValueType::USERDATA && v.value.p 
@@ -497,6 +534,7 @@ struct NythonExecutor {
         // builtins and the prelude, not the program's own names.
         if (global_ctx && global_ctx->container)
             for (auto& kv : *global_ctx->container) base_global_names_.insert(kv.first);
+        base_names_ver_++;   // round 81: assignName caches against it
         module_filter_ = [this](const std::string& n) {
             return base_global_names_.count(n) > 0 || builtin_ptrs.count(n) > 0 || builtin_set.count(n) > 0;
         };
@@ -545,12 +583,13 @@ struct NythonExecutor {
                         global_ctx->defineByName(kv.first, kv.second);
                         if (module_base_ctx_) module_base_ctx_->defineByName(kv.first, kv.second);
                         base_global_names_.insert(kv.first);
+                        base_names_ver_++;   // round 81
                     }
             }
         } catch (std::exception& e) {
             std::cerr << "[Nython] builtin mirror '" << chunk << "' failed to load: " << e.what() << "\n";
         }
-        mro_cache_.clear();
+        mro_cache_.clear(); specInvalidate();
     }
     // The prelude's scope gets its own copy of the global map (loadPrelude).
     void splitPreludeScope() {
@@ -966,7 +1005,7 @@ public:   // NythonExecutor is a struct: members default to public
         return v;
     }
 
-    Value evalNode(node_ptr node, Context* ctx) {
+    Value evalNode(const node_ptr& node, Context* ctx) {
         if (!node) return NONE_VALUE;
 
         switch (node->type()) {
@@ -1017,7 +1056,12 @@ public:   // NythonExecutor is a struct: members default to public
             case NodeType::TUPLE: return evalList(node, ctx);
             case NodeType::ARRAY: return evalList(node, ctx);
             case NodeType::RANGE: return evalRange(node, ctx);
-            case NodeType::TRY: { SuspendFast _sf; return evalTry(node, ctx); }
+            case NodeType::TRY: {
+                // round 81: try checks the pending flag itself (evalTry), so
+                // a return/break/continue in its body or handlers need not throw
+                if (astSpecOn()) return evalTry(node, ctx, true);
+                SuspendFast _sf; return evalTry(node, ctx);
+            }
             case NodeType::RAISE: return evalRaise(node, ctx);
             case NodeType::ASSERT: return evalAssert(node, ctx);
             case NodeType::IMPORT: { SuspendFast _sf; return evalImport(node, ctx); }
@@ -1028,7 +1072,10 @@ public:   // NythonExecutor is a struct: members default to public
             case NodeType::DYN_BINOP:  return evalDynBinop(node, ctx);
             case NodeType::LAMBDA: return evalLambda(node, ctx);
             case NodeType::REPEAT: return evalRepeat(node, ctx);
-            case NodeType::WITH: { SuspendFast _sf; return evalWith(node, ctx); }
+            case NodeType::WITH: {
+                if (astSpecOn()) return evalWith(node, ctx, true);   // round 81, as try
+                SuspendFast _sf; return evalWith(node, ctx);
+            }
             case NodeType::NAMESPACE: { SuspendFast _sf; return evalNamespace(node, ctx); }
             case NodeType::INTERFACE: { SuspendFast _sf; return evalInterfaceDecl(node, ctx); }
             case NodeType::YIELD: {
@@ -1049,11 +1096,17 @@ public:   // NythonExecutor is a struct: members default to public
             case NodeType::SELF: {
                 // `this` in a def whose first parameter is this: that
                 // parameter, however the method was bound (round 78)
-                if (node->token().value == "this") {
-                    Value tv = ctx->getByName("this");
+                // (round 81: no Token copy, no std::string made per read, and
+                // the node's caches of where the names were found)
+                auto* sn = static_cast<SelfNode*>(node.get());
+                if (__builtin_expect(sn->is_this < 0, 0)) sn->is_this = node->tok().value == "this" ? 1 : 0;
+                if (sn->is_this) {
+                    static const std::string kThis = "this";
+                    Value tv = lookupName(kThis, sn->nc_this, ctx);
                     if (tv.type != ValueType::UNDEFINED) return tv;
                 }
-                return ctx->getByName("self");
+                static const std::string kSelf = "self";
+                return lookupName(kSelf, sn->nc_self, ctx);
             }
             case NodeType::SUPER: return ctx->getByName("super");
             case NodeType::WALRUS: {
@@ -1077,12 +1130,24 @@ public:   // NythonExecutor is a struct: members default to public
     // body's last value is still what it evaluates to): holding it kept an
     // object that `L.pop()` removed alive for one more statement, so its
     // __del__ ran late.
-    Value evalScript(node_ptr node, Context* ctx) { return evalStatements(node, ctx); }
+    // A block's statements in place (round 81): Node::statements() returns a
+    // copy of the vector, an allocation and a reference count per statement
+    // each time a block ran.
+    static const std::vector<node_ptr>& blockStmts(Node* n) {
+        static const std::vector<node_ptr> none;
+        switch (n->type()) {
+            case NodeType::STATEMENTS: return static_cast<StatementsNode*>(n)->stmts;
+            case NodeType::BLOCK: return static_cast<BlockNode*>(n)->stmts;
+            case NodeType::SCRIPT: return static_cast<Script*>(n)->decls;
+            default: return none;
+        }
+    }
+    Value evalScript(const node_ptr& node, Context* ctx) { return evalStatements(node, ctx); }
 
-    Value evalStatements(node_ptr node, Context* ctx) {
+    Value evalStatements(const node_ptr& node, Context* ctx) {
         Value result = NONE_VALUE;
         FlowState& f = flow();
-        auto stmts = node->statements();
+        const auto& stmts = blockStmts(node.get());
         size_t start = 0;
         bool resume = false;
         // round 81: a jump (frame.f_lineno) going on inside this block
@@ -1120,29 +1185,41 @@ public:   // NythonExecutor is a struct: members default to public
     }
 
     // ─── LITERALS ───────────────────────────────────────────────────────
-    Value evalInteger(node_ptr node) {
-        const std::string& v = node->token().value;
+    Value evalInteger(const node_ptr& node) {
+        // The literal's value, made once (round 81): it was parsed from the
+        // token's text on every evaluation. An int refers to no heap object,
+        // so the node can keep it.
+        auto* in = static_cast<IntegerNode*>(node.get());
+        if (__builtin_expect(in->made, 1)) return in->made_value;
+        const std::string& v = in->tok().value;
         // Up to 18 decimal digits fit an int64 whatever they are.
         if (!v.empty() && v.size() <= 18 && std::all_of(v.begin(), v.end(), [](char c) { return c >= '0' && c <= '9'; }))
-            return intValue((int64_t)std::strtoll(v.c_str(), nullptr, 10));
+            in->made_value = intValue((int64_t)std::strtoll(v.c_str(), nullptr, 10));
         // Prefixed (0x/0o/0b), long or with underscores: exact at any size
         // (literals past 64 bits used to read as 0).
-        return intValue(nypy::parse_int_literal(v));
+        else in->made_value = intValue(nypy::parse_int_literal(v));
+        in->made = true;
+        return in->made_value;
     }
 
     // strtod, not stod: a literal past the double range is inf and one below
     // the normal range a subnormal (1e-320), as Python reads them; stod threw
     // out_of_range for both, which made them 0.0 here and a compile error on
     // the VM.
-    Value evalFloat(node_ptr node) {
+    Value evalFloat(const node_ptr& node) {
         // strtod, not stod: a literal that underflows or overflows (5e-324,
         // 1e400) is the nearest double or inf, as in Python; stod threw and
-        // the literal read 0.0.
-        return Value(std::strtod(node->token().value.c_str(), nullptr));
+        // the literal read 0.0. Made once (round 81), as an int literal.
+        auto* fl = static_cast<FloatNode*>(node.get());
+        if (__builtin_expect(fl->made, 1)) return fl->made_value;
+        fl->made_value = Value(std::strtod(fl->tok().value.c_str(), nullptr));
+        fl->made = true;
+        return fl->made_value;
     }
 
-    Value evalString(node_ptr node, Context* ctx = nullptr) {
-        const std::string& raw = node->token().value;
+    Value evalString(const node_ptr& node, Context* ctx = nullptr) {
+        // round 81: the node's token read in place (token() copied it each time)
+        const std::string& raw = node->tok().value;
         // round 80: ${...} is interpolated by the parser (a literal holding
         // it becomes an f-string there); a string node still holding it is
         // text - f"${{x}}", a raw string, a Python-mode file - as on the VM
@@ -1153,6 +1230,7 @@ public:   // NythonExecutor is a struct: members default to public
         // each pass - in the IDE, most of the memory typing consumed.
         auto* sn = dynamic_cast<StringNode*>(node.get());
         if (sn) {
+            if (__builtin_expect(sn->interned_by == (const void*)this, 1)) return sn->interned;   // round 81
             if (sn->interned_by != (const void*)this) {
                 sn->interned = makeStringValue(raw);
                 sn->interned_by = (const void*)this;
@@ -1185,21 +1263,57 @@ public:   // NythonExecutor is a struct: members default to public
             // global scope, which the assignment replaced for the whole
             // program). At the top level it shadows the builtin, as before.
             const std::string& n = vn->name;
-            if (ctx != global_ctx && base_global_names_.count(n) && !program_rebound_.count(n)) {
+            // whether n is a builtin's name, remembered by the node while the
+            // set is unchanged (round 81: a string hash per assignment)
+            if (vn->base_ver != base_names_ver_ || !astSpecOn()) {
+                vn->base_hit = base_global_names_.count(n) > 0;
+                vn->base_ver = base_names_ver_;
+            }
+            const bool base = vn->base_hit;
+            if (ctx != global_ctx && base && !program_rebound_.count(n)) {
                 Context* c = ctx;
                 while (c && !(c->container && c->container->count(n))) c = c->inModule ? nullptr : c->parent;
                 if (c == global_ctx) { ctx->defineByName(n, val); return; }
             }
-            if (ctx == global_ctx && base_global_names_.count(n)) program_rebound_.insert(n);
+            if (ctx == global_ctx && base) program_rebound_.insert(n);
             ctx->setByName(n, val);
         }
     }
     std::unordered_set<std::string> program_rebound_;   // builtin names the program's top level rebound
+    uint32_t base_names_ver_ = 1;   // round 81: bumped whenever base_global_names_ grows
 
-    Value evalVariable(node_ptr node, Context* ctx) {
-        auto vn = static_pointer_cast<VariableNode>(node);
+    // A name's value through the scope chain - Context::getByName, walked
+    // here with the node's cache (round 81): the name hashed once, and the
+    // slot it was found in last tried first at that depth (the key still
+    // there makes it the entry). The scopes before it are searched as ever.
+    Value lookupName(VariableNode* vn, Context* c) { return lookupName(vn->name, vn->nc, c); }
+    Value lookupName(const std::string& n, NameCache& nc, Context* c) {
+        if (!astSpecOn()) return c->getByName(n);
+        if (__builtin_expect(!nc.hashed, 0)) { nc.hash = ContainerType::hash_key(n); nc.hashed = true; }
+        unsigned d = 0;
+        for (;;) {
+            const ContainerType* m = c->container;
+            if (!m) return NONE_VALUE;
+            if (d == nc.depth) {
+                const ContainerType::value_type* kv = m->slot_at(nc.slot);
+                if (kv && kv->first == n) return kv->second;
+            }
+            long s = m->index_of_h(n, nc.hash);
+            if (s >= 0) {
+                if (d < 0xFF) { nc.depth = (uint8_t)d; nc.slot = (uint32_t)s; }
+                return m->slot_at((size_t)s)->second;
+            }
+            if (!c->parent) return UNDEFINED_VALUE;
+            if (c->parentFilter && !(*c->parentFilter)(n)) return UNDEFINED_VALUE;
+            c = c->parent;
+            d++;
+        }
+    }
+
+    Value evalVariable(const node_ptr& node, Context* ctx) {
+        auto* vn = static_cast<VariableNode*>((node).get());
         // Check user-defined first
-        Value found = vn->global_ref ? moduleCtx(ctx)->getByName(vn->name) : ctx->getByName(vn->name);
+        Value found = lookupName(vn, vn->global_ref ? moduleCtx(ctx) : ctx);
         if (found.type != ValueType::UNDEFINED) return found;
         // Then check builtins — return a USERDATA marker
         if (builtin_set.count(vn->name)) {
@@ -1240,8 +1354,8 @@ public:   // NythonExecutor is a struct: members default to public
         return false;
     }
 
-    Value evalVarDecl(node_ptr node, Context* ctx) {
-        auto vd = static_pointer_cast<VarDeclNode>(node);
+    Value evalVarDecl(const node_ptr& node, Context* ctx) {
+        auto* vd = static_cast<VarDeclNode*>((node).get());
         Value val = vd->init ? evalNode(vd->init, ctx) : NONE_VALUE;
         // a, b = gen(): the targets index a list of its values (nygen); an
         // object with __iter__ / __next__ is iterated the same way, as Python
@@ -1291,34 +1405,37 @@ public:   // NythonExecutor is a struct: members default to public
         return val;
     }
 
-    Value evalAssignment(node_ptr node, Context* ctx) {
-        auto an = static_pointer_cast<AssignmentNode>(node);
+    Value evalAssignment(const node_ptr& node, Context* ctx) {
+        auto* an = static_cast<AssignmentNode*>((node).get());
         Value val = evalNode(an->value_node, ctx);
         if (an->target->type() == NodeType::VARIABLE) {
-            auto vn = static_pointer_cast<VariableNode>(an->target);
+            auto* vn = static_cast<VariableNode*>((an->target).get());
             // In a class body a name is always bound in the class namespace:
             // setByName found a same-named variable in an enclosing scope and
             // rebound IT (`items = []` in a class body overwrote the global
             // builtin `items`, and the class never got the attribute).
-            assignName(vn.get(), val, ctx);
+            assignName(vn, val, ctx);
         } else if (an->target->type() == NodeType::SELF) {
             // self = expr (round 77: `self = super().__new__(cls, v)` in a
             // __new__ was dropped)
             ctx->setByName("self", val);
         } else if (an->target->type() == NodeType::ATTRIBUTE) {
-            auto attr = static_pointer_cast<AttributeNode>(an->target);
+            auto* attr = static_cast<AttributeNode*>((an->target).get());
             Value obj = evalNode(attr->object, ctx);
-            setAttr(obj, attr->attr, val);
+            // an instance's field through the target's cache (round 81)
+            if (!(astSpecOn() && heapKind(obj) == HK_INST && storeFast(attr, obj, val))) setAttr(obj, attr->attr, val);
         } else if (an->target->type() == NodeType::SUBSCRIPT) {
-            auto sub = static_pointer_cast<SubscriptNode>(an->target);
+            auto* sub = static_cast<SubscriptNode*>((an->target).get());
             Value obj = evalNode(sub->object, ctx);
             Value idx = evalNode(sub->index, ctx);
-            setItem(obj, idx, val, ctx);
+            // a list's item by an int index (round 81)
+            ContainerType::value_type* kv = astSpecOn() ? seqItemSlot(obj, idx, sub->slot_off, true) : nullptr;
+            if (kv) kv->second = val; else setItem(obj, idx, val, ctx);
         } else if (an->target->type() == NodeType::CALL) {
             // Slice assignment: arr[1:3] = [20, 30] is parsed as arr.slice(1,3) = [20,30]
-            auto cn = static_pointer_cast<CallNode>(an->target);
+            auto* cn = static_cast<CallNode*>((an->target).get());
             if (cn->callee && cn->callee->type() == NodeType::ATTRIBUTE) {
-                auto attr = static_pointer_cast<AttributeNode>(cn->callee);
+                auto* attr = static_cast<AttributeNode*>((cn->callee).get());
                 if (attr->attr == "slice" && cn->args.size() >= 1) {
                     Value obj = evalNode(attr->object, ctx);
                     std::vector<Value> sargs;
@@ -1675,19 +1792,88 @@ public:   // NythonExecutor is a struct: members default to public
     // USERDATA pointers told apart by the side tables.
     Container* contOf(const Value& v) const {
         if (!v.isCollectable() || !v.value.gc) return nullptr;
-        auto* c = dynamic_cast<Container*>(v.value.gc);
-        return (c && c->container) ? c : nullptr;
+        // round 81: every Container constructor sets F_KCONT, so the flag
+        // answers what dynamic_cast did
+        nython::gc::Collectable* g = v.value.gc;
+        if (!(g->gc_flags & nygc::F_KCONT)) return nullptr;
+        auto* c = static_cast<Container*>(g);
+        return c->container ? c : nullptr;
     }
     // Length of a list/tuple/set container, -1 if it is not one.
-    static int64_t seqLen(Container* c) {
-        auto it = c->container->find("__len__");
-        if (it == c->container->end()) return -1;
-        return bigint_to_i64(it->second.value.i);
+    // (round 81: the marker keys' hashes are computed once - a list read
+    // asked for "__len__", "__set__" and "__tuple__" by hashing each again)
+    struct MarkerKey {
+        std::string key; uint64_t hash;
+        explicit MarkerKey(const char* k) : key(k), hash(ContainerType::hash_key(k)) {}
+    };
+    static const MarkerKey& kLenKey() { static const MarkerKey k("__len__"); return k; }
+    static const MarkerKey& kTupleKey() { static const MarkerKey k("__tuple__"); return k; }
+    static const MarkerKey& kSetKey() { static const MarkerKey k("__set__"); return k; }
+    static const MarkerKey& kGenKey() { static const MarkerKey k("__gen__"); return k; }
+    // The slot of a marker key, or -1: the last two slots first (a list or
+    // tuple made at once ends with "__len__", then "__tuple__"), then the
+    // lookup - keys are unique, so a slot holding it is its slot (round 81).
+    static long markerSlot(const ContainerType* m, const MarkerKey& k) {
+        const size_t e = m->slot_end();
+        for (size_t back = 1; back <= 2 && back <= e; back++) {
+            const ContainerType::value_type* kv = m->slot_at(e - back);
+            if (kv && kv->first == k.key) return (long)(e - back);
+        }
+        return m->index_of_h(k.key, k.hash);
     }
-    static bool isTupleCont(Container* c) { return c->container->count("__tuple__") > 0; }
-    static bool isSetCont(Container* c) { return c->container->count("__set__") > 0; }
-    static bool isGenCont(Container* c) { return c->container->count("__gen__") > 0; }
+    static bool hasMarker(Container* c, const MarkerKey& k) { return markerSlot(c->container, k) >= 0; }
+    static int64_t seqLen(Container* c) {
+        long s = markerSlot(c->container, kLenKey());
+        if (s < 0) return -1;
+        return bigint_to_i64(c->container->slot_at((size_t)s)->second.value.i);
+    }
+    static bool isTupleCont(Container* c) { return hasMarker(c, kTupleKey()); }
+    static bool isSetCont(Container* c) { return hasMarker(c, kSetKey()); }
+    static bool isGenCont(Container* c) { return hasMarker(c, kGenKey()); }
+    // ── list[i] and list[i] = v (round 81) ──────────────────────────────
+    // A list or tuple holds its items under "0", "1" ...: getItem and
+    // setItem look the decimal key up after their other checks. For an int
+    // index into one (not a set, generator, dict or object) in range, these
+    // do what those do, the key spelled without a std::string and its slot
+    // guessed from the index plus the offset the site saw last (lists keep
+    // their items in order, after or before their markers).
+    static std::string_view decKey(int64_t j, char* buf) {
+        auto r = std::to_chars(buf, buf + 24, j);
+        return std::string_view(buf, (size_t)(r.ptr - buf));
+    }
+    static ContainerType::value_type* seqSlot(ContainerType* m, int64_t j, int8_t& off) {
+        char buf[24];
+        std::string_view key = decKey(j, buf);
+        ContainerType::value_type* kv = m->slot_at_mut((size_t)(j + off));
+        if (kv && kv->first == key) return kv;
+        long s = m->index_of(key);
+        if (s < 0) return nullptr;
+        long d = s - (long)j;
+        if (d >= -100 && d <= 100) off = (int8_t)d;
+        return m->slot_at_mut((size_t)s);
+    }
+    // The container of a list or tuple an int index reads in range, with
+    // its slot; nullptr when getItem's general path must answer.
+    ContainerType::value_type* seqItemSlot(const Value& obj, const Value& idx, int8_t& off, bool store) {
+        if (idx.type != ValueType::INTEGER || obj.type != ValueType::COLLECTABLE) return nullptr;
+        Container* c = contOf(obj);
+        if (!c || nygen::is_gen(obj)) return nullptr;
+        int64_t n = seqLen(c);
+        if (n < 0 || isSetCont(c)) return nullptr;
+        if (store && isTupleCont(c)) return nullptr;
+        int64_t i;
+        if (!bigint_fits_i64(idx.value.i, i)) return nullptr;
+        int64_t j = i < 0 ? i + n : i;
+        if (j < 0 || j >= n) return nullptr;
+        return seqSlot(c->container, j, off);
+    }
     bool isInstanceVal(const Value& v) const {
+        if (v.type != ValueType::USERDATA) return false;
+        switch (heapKind(v)) {   // round 81
+            case HK_INST: return true;
+            case HK_STR: case HK_FUNC: return false;
+            default: break;
+        }
         return v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p)
             && instance_to_class.count(v.value.p);
     }
@@ -1705,8 +1891,26 @@ public:   // NythonExecutor is a struct: members default to public
         if (!view_nodes_[1] || !view_nodes_[2]) view_nodes_[0] = nullptr;
     }
     // The class of an instance, nullptr for anything else.
+    // An instance's field scope (instance_properties' entry), nullptr for
+    // anything else. Round 81: read from the instance's object when the value
+    // owns it (Inst::props is that entry: set together, cleared together).
+    Context* instPropsOf(const Value& v) const {
+        if (v.type != ValueType::USERDATA || !v.value.p) return nullptr;
+        switch (heapKind(v)) {
+            case HK_INST: return static_cast<nyheap::Inst*>(v.value.o)->props;
+            case HK_STR: case HK_FUNC: return nullptr;
+            default: break;
+        }
+        auto pit = instance_properties.find(v.value.p);
+        return pit == instance_properties.end() ? nullptr : pit->second;
+    }
     Node* instClassNode(const Value& v) const {
         if (v.type != ValueType::USERDATA || !v.value.p) return nullptr;
+        switch (heapKind(v)) {   // round 81: an instance's class is in its object too (switchClass keeps both)
+            case HK_INST: return (Node*)static_cast<nyheap::Inst*>(v.value.o)->cls;
+            case HK_STR: case HK_FUNC: return nullptr;
+            default: break;
+        }
         auto it = instance_to_class.find(v.value.p);
         return it == instance_to_class.end() ? nullptr : (Node*)it->second;
     }
@@ -1815,18 +2019,23 @@ public:   // NythonExecutor is a struct: members default to public
         int64_t n = seqLen(c);
         if (n <= 0) return out;
         out.reserve((size_t)n);
+        int8_t off = 0;   // round 81: seqSlot, not find(std::to_string(i))
         for (int64_t i = 0; i < n; i++) {
-            auto it = c->container->find(std::to_string(i));
-            if (it != c->container->end()) out.push_back(it->second);
+            if (auto* kv = seqSlot(c->container, i, off)) out.push_back(kv->second);
         }
         return out;
     }
     Value makeListValue(const std::vector<Value>& items, bool tuple = false) {
         auto* obj = new Object((Runnable*)runner, tuple ? "tuple" : "list", Type::LIST);
+        // round 81: the keys are new and distinct, so each is appended
+        // without being looked for first (the same entries, in the same order)
+        ContainerType& m = *obj->container;
+        m.reserve(items.size() + 2);
         int64_t i = 0;
-        for (auto& v : items) (*obj->container)[std::to_string(i++)] = v;
-        (*obj->container)["__len__"] = intValue(i);
-        if (tuple) (*obj->container)["__tuple__"] = Value(1);
+        char buf[24];
+        for (auto& v : items) m.append_new(std::string(decKey(i++, buf)), Value(v));
+        m.append_new(std::string("__len__"), intValue(i));
+        if (tuple) m.append_new(std::string("__tuple__"), Value(1));
         return Value((Collectable*)obj);
     }
     // Raises a Python exception the way the interpreter represents them.
@@ -1949,10 +2158,11 @@ public:   // NythonExecutor is a struct: members default to public
             int64_t la = seqLen(ca), lb = seqLen(cb);
             // dicts, and a list against a tuple, have no order (round 77)
             if (la < 0 || lb < 0 || isTupleCont(ca) != isTupleCont(cb)) return orderFail(a, b);
+            int8_t oa = 0, ob = 0;   // round 81: seqSlot, not find(std::to_string(i))
             for (int64_t i = 0; i < la && i < lb; i++) {
-                auto ia = ca->container->find(std::to_string(i));
-                auto ib = cb->container->find(std::to_string(i));
-                if (ia == ca->container->end() || ib == cb->container->end()) return orderFail(a, b);
+                auto* ia = seqSlot(ca->container, i, oa);
+                auto* ib = seqSlot(cb->container, i, ob);
+                if (!ia || !ib) return orderFail(a, b);
                 if (valuesEqual(ia->second, ib->second, depth + 1)) continue;
                 return orderValues(ia->second, ib->second, res, ctx, depth + 1);
             }
@@ -2019,9 +2229,10 @@ public:   // NythonExecutor is a struct: members default to public
         if (isSetCont(cont)) return setHas(cont, x);   // one lookup (round 77)
         int64_t n = seqLen(cont);
         if (n >= 0) {
+            int8_t off = 0;   // round 81: seqSlot, not find(std::to_string(i))
             for (int64_t i = 0; i < n; i++) {
-                auto it = cont->container->find(std::to_string(i));
-                if (it != cont->container->end() && valuesEqual(x, it->second, 0)) return true;
+                auto* kv = seqSlot(cont->container, i, off);
+                if (kv && valuesEqual(x, kv->second, 0)) return true;
             }
             return false;
         }
@@ -2466,23 +2677,29 @@ public:   // NythonExecutor is a struct: members default to public
     // the same operators as the binary form, and stores back. Lists are
     // mutable, so `L += it` extends and `L *= n` repeats in place: every
     // alias sees the change (a new list used to be built, or none returned).
-    Value evalAugAssignment(node_ptr node, Context* ctx) {
-        auto an = static_pointer_cast<AugAssignNode>(node);
+    Value evalAugAssignment(const node_ptr& node, Context* ctx) {
+        auto* an = static_cast<AugAssignNode*>((node).get());
         const std::string& op = an->op;
-        if (op == "?\?=") return evalCoalesceAssign(an.get(), ctx);
-        std::string base = op.substr(0, op.size() > 0 ? op.size() - 1 : 0);
-        if (op == ">>>=") base = ">>";
-        int opc = binOpCode(base);
+        if (op == "?\?=") return evalCoalesceAssign(an, ctx);
+        // the operator's code, worked out from its text once (round 81)
+        if (__builtin_expect(an->opc < 0, 0)) {
+            std::string base = op.substr(0, op.size() > 0 ? op.size() - 1 : 0);
+            if (op == ">>>=") base = ">>";
+            an->opc = (int8_t)binOpCode(base);
+            an->plain_op = op != "~=" && op != "@=";
+        }
+        const int opc = an->opc;
         // Target: read its current value, remembering where to store.
         Value obj, idx, old_val;
         int kind = an->target->type() == NodeType::SUBSCRIPT ? 1 : an->target->type() == NodeType::ATTRIBUTE ? 2 : 0;
         if (kind == 1) {
-            auto sub = static_pointer_cast<SubscriptNode>(an->target);
+            auto* sub = static_cast<SubscriptNode*>((an->target).get());
             obj = evalNode(sub->object, ctx);
             idx = evalNode(sub->index, ctx);
-            old_val = getItem(obj, idx, ctx);
+            ContainerType::value_type* kv = astSpecOn() ? seqItemSlot(obj, idx, sub->slot_off, false) : nullptr;   // round 81
+            old_val = kv ? kv->second : getItem(obj, idx, ctx);
         } else if (kind == 2) {
-            auto attr = static_pointer_cast<AttributeNode>(an->target);
+            auto* attr = static_cast<AttributeNode*>((an->target).get());
             obj = evalNode(attr->object, ctx);
             if (!getAttrValue(obj, attr->attr, ctx, old_val)) old_val = missingAttribute(obj, attr->attr, an->target.get());
         } else {
@@ -2490,6 +2707,13 @@ public:   // NythonExecutor is a struct: members default to public
         }
         Value new_val = evalNode(an->value_node, ctx);
         Value result;
+        // Two numbers (round 81): binaryOp's answer without its other checks
+        // (no container, bytes or object is involved), then the store.
+        if (astSpecOn() && an->plain_op && opc != OP_UNKNOWN && isNumType(old_val.type) && isNumType(new_val.type)
+            && numBinary(opc, old_val, new_val, result)) {
+            storeAugTarget(an, kind, obj, idx, result, ctx);
+            return result;
+        }
         Container* oc = contOf(old_val);
         if (op == "~=") {
             // `x ~= y` assigns the bitwise complement of the right operand
@@ -2559,11 +2783,23 @@ public:   // NythonExecutor is a struct: members default to public
                 else result = binaryOp(opc, old_val, new_val, ctx);
             }
         }
-        if (kind == 1) setItem(obj, idx, result, ctx);
-        else if (kind == 2) setAttr(obj, static_pointer_cast<AttributeNode>(an->target)->attr, result);
+        storeAugTarget(an, kind, obj, idx, result, ctx);
+        return result;
+    }
+    // The store of `t op= v`: an item, an attribute (an instance's field
+    // through the target's cache - round 81) or a name.
+    void storeAugTarget(AugAssignNode* an, int kind, const Value& obj, const Value& idx, const Value& result, Context* ctx) {
+        if (kind == 1) {
+            auto* sub = static_cast<SubscriptNode*>(an->target.get());
+            ContainerType::value_type* kv = astSpecOn() ? seqItemSlot(obj, idx, sub->slot_off, true) : nullptr;   // round 81
+            if (kv) kv->second = result; else setItem(obj, idx, result, ctx);
+        }
+        else if (kind == 2) {
+            auto* at = static_cast<AttributeNode*>(an->target.get());
+            if (!(astSpecOn() && heapKind(obj) == HK_INST && storeFast(at, obj, result))) setAttr(obj, at->attr, result);
+        }
         else if (an->target->type() == NodeType::VARIABLE)
             assignName(static_cast<VariableNode*>(an->target.get()), result, ctx);
-        return result;
     }
 
     // t ??= v: v is evaluated and assigned only when t is absent - none or
@@ -2795,8 +3031,9 @@ public:   // NythonExecutor is a struct: members default to public
                     noteDataDescriptor(val2, &name);
                     const Value& val = val2;
                     class_vars_[cn->name + "." + name] = val;
+                    specInvalidate();   // round 81: the method caches read class_vars_
                     if (!class_vars_deleted_.empty()) class_vars_deleted_.erase(cn->name + "." + name);
-                    if (name == "__getattribute__") { any_getattribute_ = true; attr_hook_cache_[2].clear(); }
+                    if (name == "__getattribute__") { any_getattribute_ = true; attr_hook_cache_[2].clear(); specInvalidate(); }
                     // round 81: a hook assigned after instances stored
                     // attributes is called from now on (the cache said none)
                     if (name == "__setattr__") attr_hook_cache_[0].clear();
@@ -3013,27 +3250,31 @@ public:   // NythonExecutor is a struct: members default to public
         if (a.isCollectable() && b.isCollectable() && a.value.gc && b.value.gc) {
             if (a.value.gc == b.value.gc) return true;
             if (nygen::is_gen(a) || nygen::is_gen(b)) return false;   // generators: identity
-            auto* lc = dynamic_cast<Container*>(a.value.gc);
-            auto* rc = dynamic_cast<Container*>(b.value.gc);
-            if (!lc || !rc || !lc->container || !rc->container) return a == b;
+            // round 81: the kind flag (contOf), the marker keys' hashes and
+            // seqSlot, not dynamic_cast, "__len__" hashed again and
+            // find(std::to_string(i)) - the same answers
+            Container* lc = contOf(a);
+            Container* rc = contOf(b);
+            if (!lc || !rc) return a == b;
             auto& L = *lc->container;
             auto& R = *rc->container;
-            auto li = L.find("__len__");
-            auto ri = R.find("__len__");
-            bool llist = li != L.end(), rlist = ri != R.end();
+            const MarkerKey& lk = kLenKey();
+            long lis = L.index_of_h(lk.key, lk.hash), ris = R.index_of_h(lk.key, lk.hash);
+            bool llist = lis >= 0, rlist = ris >= 0;
             if (llist != rlist) return false;
             if (llist) {
-                int64_t ln = bigint_to_i64(li->second.value.i);
-                int64_t rn = bigint_to_i64(ri->second.value.i);
+                int64_t ln = bigint_to_i64(L.slot_at((size_t)lis)->second.value.i);
+                int64_t rn = bigint_to_i64(R.slot_at((size_t)ris)->second.value.i);
                 if (ln != rn) return false;
                 if (isTupleCont(lc) != isTupleCont(rc)) return false;
-                bool lset = L.count("__set__") > 0, rset = R.count("__set__") > 0;
+                bool lset = isSetCont(lc), rset = isSetCont(rc);
                 if (lset != rset) return false;
                 if (lset) return setEqual(lc, rc);   // set == frozenset by content
+                int8_t ox = 0, oy = 0;
                 for (int64_t i = 0; i < ln; i++) {
-                    auto x2 = L.find(std::to_string(i));
-                    auto y2 = R.find(std::to_string(i));
-                    if (x2 == L.end() || y2 == R.end()) return false;
+                    auto* x2 = seqSlot(lc->container, i, ox);
+                    auto* y2 = seqSlot(rc->container, i, oy);
+                    if (!x2 || !y2) return false;
                     if (!valuesEqual(x2->second, y2->second, depth + 1)) return false;
                 }
                 return true;
@@ -3255,7 +3496,10 @@ public:   // NythonExecutor is a struct: members default to public
         if (name == "append" || name == "push") {
             if (args.size() != 1) pyRaise("TypeError", "list.append() takes exactly one argument (" + std::to_string(args.size()) + " given)");
             C[std::to_string(n)] = args[0];
-            C["__len__"] = intValue(n + 1);
+            // round 81: "__len__" through its known hash (it is there: n came from it)
+            const MarkerKey& lk = kLenKey();
+            if (long ls = C.index_of_h(lk.key, lk.hash); ls >= 0) C.slot_at_mut((size_t)ls)->second = intValue(n + 1);
+            else C["__len__"] = intValue(n + 1);
             out = NONE_VALUE; return true;
         }
         if (name == "extend") {
@@ -3798,10 +4042,12 @@ public:   // NythonExecutor is a struct: members default to public
         dictSet(cont, idx, val);
     }
 
-    Value evalSubscript(node_ptr node, Context* ctx) {
-        auto sn = static_pointer_cast<SubscriptNode>(node);
+    Value evalSubscript(const node_ptr& node, Context* ctx) {
+        auto* sn = static_cast<SubscriptNode*>((node).get());
         Value obj = evalNode(sn->object, ctx);
         Value idx = evalNode(sn->index, ctx);
+        if (astSpecOn())   // a list's item by an int index (round 81)
+            if (ContainerType::value_type* kv = seqItemSlot(obj, idx, sn->slot_off, false)) return kv->second;
         return getItem(obj, idx, ctx);
     }
 
@@ -4244,9 +4490,11 @@ public:   // NythonExecutor is a struct: members default to public
         return makeStringValue(out);
     }
 
-    Value evalBinary(node_ptr node, Context* ctx) {
+    Value evalBinary(const node_ptr& node, Context* ctx) {
         BinaryNode* bn = static_cast<BinaryNode*>(node.get());
-        int opc = binOpCode(bn->op);
+        // the operator's code, worked out from its text once (round 81)
+        if (__builtin_expect(bn->opc < 0, 0)) bn->opc = (int8_t)binOpCode(bn->op);
+        const int opc = bn->opc;
         switch (opc) {
         // `and` / `or` short-circuit on truthiness and yield an operand, as in
         // Python: 0 or "x" is "x", [] or [1] is [1], "" and 1 is "". They used
@@ -4294,7 +4542,59 @@ public:   // NythonExecutor is a struct: members default to public
             }
             return NONE_VALUE;
         }
-        return binaryOp(opc, lv, rv, ctx);
+        // Numbers (round 81): what binaryOp does with two of them, without
+        // its checks for sets, objects and bytes (none of which a number is).
+        if (astSpecOn() && isNumType(lv.type) && isNumType(rv.type)) {
+            Value r;
+            if (numBinary(opc, lv, rv, r)) return r;
+        }
+        return binaryOp(opc, std::move(lv), std::move(rv), ctx);
+    }
+    static bool isNumType(ValueType t) {
+        return t == ValueType::INTEGER || t == ValueType::DOUBLE || t == ValueType::BOOLEAN;
+    }
+    // binaryOp's answer for two numbers (bool, int or float), or false for
+    // an operator it does not handle here (in, xor ...: binaryOp's then).
+    bool numBinary(int opc, const Value& lv, const Value& rv, Value& out) {
+        Num x, y;
+        asNum(lv, x); asNum(rv, y);
+        switch (opc) {
+        case OP_ADD: case OP_SUB: case OP_MUL:
+            if (x.k == 1 && y.k == 1) {
+                int64_t r;
+                bool ovf = opc == OP_ADD ? nypy::add_ovf(x.i, y.i, r) : opc == OP_SUB ? nypy::sub_ovf(x.i, y.i, r)
+                                                                       : __builtin_mul_overflow(x.i, y.i, &r);
+                if (!ovf) { out = intValue(r); return true; }
+            } else if (x.k == 3 && y.k == 3) {
+                out = Value(opc == OP_ADD ? x.d + y.d : opc == OP_SUB ? x.d - y.d : x.d * y.d);
+                return true;
+            }
+            out = numArith(opc, x, y);
+            return true;
+        case OP_DIV: case OP_FLOORDIV: case OP_POW: case OP_MOD: case OP_LSHIFT: case OP_RSHIFT:
+            out = numArith(opc, x, y);
+            return true;
+        case OP_BAND: case OP_BOR: case OP_BXOR: {
+            Value r = numArith(opc, x, y);
+            if (lv.type == ValueType::BOOLEAN && rv.type == ValueType::BOOLEAN) out = Value(isTruthy(r));
+            else out = std::move(r);
+            return true;
+        }
+        case OP_EQ: out = Value(numCmp(x, y) == 0); return true;
+        case OP_NE: out = Value(numCmp(x, y) != 0); return true;
+        case OP_LT: case OP_LE: case OP_GT: case OP_GE: {
+            int c = numCmp(x, y);
+            if (c == 2) { out = Value(false); return true; }   // a NaN: unordered
+            out = Value(opc == OP_LT ? c < 0 : opc == OP_LE ? c <= 0 : opc == OP_GT ? c > 0 : c >= 0);
+            return true;
+        }
+        case OP_SEQ: case OP_SNE: {
+            bool eq = lv.type == rv.type && numCmp(x, y) == 0;
+            out = Value(opc == OP_SEQ ? eq : !eq);
+            return true;
+        }
+        default: return false;
+        }
     }
 
     // Identity for `is`: immutable values (numbers, strings, none, bools)
@@ -4317,8 +4617,8 @@ public:   // NythonExecutor is a struct: members default to public
         }
     }
 
-    Value evalUnary(node_ptr node, Context* ctx) {
-        auto un = static_pointer_cast<UnaryNode>(node);
+    Value evalUnary(const node_ptr& node, Context* ctx) {
+        auto* un = static_cast<UnaryNode*>((node).get());
         Value v = evalNode(un->operand, ctx);
         const std::string& op = un->op;
         if (op == "!" || op == "not") return Value(!isTruthy(v));
@@ -4355,7 +4655,7 @@ public:   // NythonExecutor is a struct: members default to public
                 ctx->setByName(un->operand->value(), result);
             } else if (un->operand->type() == NodeType::ATTRIBUTE) {
                 // Handle obj.field++
-                auto attr = static_pointer_cast<AttributeNode>(un->operand);
+                auto* attr = static_cast<AttributeNode*>((un->operand).get());
                 Value obj = evalNode(attr->object, ctx);
                 if (obj.type == ValueType::USERDATA && obj.value.p) {
                     auto pit = instance_properties.find(obj.value.p);
@@ -4460,7 +4760,7 @@ public:   // NythonExecutor is a struct: members default to public
     }
 
     // ─── PRINT ──────────────────────────────────────────────────────────
-    Value evalPrint(node_ptr node, Context* ctx) {
+    Value evalPrint(const node_ptr& node, Context* ctx) {
         auto pn = static_pointer_cast<PrintNode>(node);
         // While tracing, the printed line is also recorded, so the debugger
         // can show exactly the output produced up to the current step.
@@ -4538,21 +4838,21 @@ public:   // NythonExecutor is a struct: members default to public
     void printValue(Value v, Context* ctx = nullptr) { std::cout << strOf(v, ctx); }
 
     // ─── CONTROL FLOW ───────────────────────────────────────────────────
-    Value evalIf(node_ptr node, Context* ctx) {
-        auto in = static_pointer_cast<IfNode>(node);
+    Value evalIf(const node_ptr& node, Context* ctx) {
+        auto* in = static_cast<IfNode*>((node).get());
         Value cond = evalNode(in->condition, ctx);
         if (isTruthy(cond)) return evalNode(in->then_branch, ctx);
         for (auto& ei : in->elseif_branches) {
-            auto eif = static_pointer_cast<IfNode>(ei);
-            if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0) && !in->is_expr) pyEvLineAt(eif.get(), true);   // an elif's line (round 79)
+            auto* eif = static_cast<IfNode*>((ei).get());
+            if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0) && !in->is_expr) pyEvLineAt(eif, true);   // an elif's line (round 79)
             if (isTruthy(evalNode(eif->condition, ctx))) return evalNode(eif->then_branch, ctx);
         }
         if (in->else_branch) return evalNode(in->else_branch, ctx);
         return NONE_VALUE;
     }
 
-    Value evalWhile(node_ptr node, Context* ctx) {
-        auto wn = static_pointer_cast<WhileNode>(node);
+    Value evalWhile(const node_ptr& node, Context* ctx) {
+        auto* wn = static_cast<WhileNode*>((node).get());
         Value result = NONE_VALUE;
         bool broke = false;
         FlowState& lf = flow();
@@ -4587,8 +4887,8 @@ public:   // NythonExecutor is a struct: members default to public
         for (size_t ui = 0; ui < fn->unpack_vars.size(); ui++)
             bindv(fn->unpack_vars[ui]->value(), ui + 1 < parts.size() ? parts[ui + 1] : NONE_VALUE);
     }
-    Value evalFor(node_ptr node, Context* ctx) {
-        auto fn = static_pointer_cast<ForNode>(node);
+    Value evalFor(const node_ptr& node, Context* ctx) {
+        auto* fn = static_cast<ForNode*>((node).get());
         bool broke = false;
         FlowState& lf = flow();
         uint64_t gen_s0 = nygen::serial_now();
@@ -4672,8 +4972,22 @@ public:   // NythonExecutor is a struct: members default to public
         // list, got none forever and never ended.)
         // A range of 64-bit ints (round 78): counted, no iterator object.
         if (counted) {
+            // round 81: a plain local loop variable is stored straight into
+            // its slot (defineByName's store, the slot remembered by the node)
+            const bool plain_var = astSpecOn() && fn->unpack_vars.empty() && !fn->rebinds
+                && !(fn->var && fn->var->type() == NodeType::VARIABLE && static_cast<VariableNode*>(fn->var.get())->global_ref);
             for (int64_t i = 0; i < r_n; i++) {
                 NY_PYT_HEAD(i > 0)
+                if (plain_var && ctx->container && !ctx->storeHook) {
+                    ContainerType* m = ctx->container;
+                    if (ContainerType::value_type* kv = m->slot_at_mut(fn->var_hint); kv && kv->first == var_name)
+                        kv->second = intValue(nyrt::range_at(r_first, r_step, i));
+                    else {
+                        (*m)[var_name] = intValue(nyrt::range_at(r_first, r_step, i));
+                        long s = m->index_of(var_name);
+                        if (s >= 0) fn->var_hint = (uint32_t)s;
+                    }
+                } else
                 bindv(var_name, intValue(nyrt::range_at(r_first, r_step, i)));
                 try { LoopBody _lb(lf); if (result.value.o) result = Value(); result = evalNode(fn->body, ctx); }
                 catch (std::string& flow) { if (flow == "break") { broke = true; break; } if (flow == "continue") continue; throw; }
@@ -4693,7 +5007,7 @@ public:   // NythonExecutor is a struct: members default to public
             size_t slot = 0;
             auto bindElem = [&](const Value& elem) {
                 if (fn->unpack_vars.empty()) { bindv(var_name, elem); return; }
-                if (isInstanceValue(elem)) { bindUnpacked(fn.get(), var_name, elem, ctx, bindv); return; }
+                if (isInstanceValue(elem)) { bindUnpacked(fn, var_name, elem, ctx, bindv); return; }
                 std::vector<Value> parts;
                 if (Container* ec = contOf(elem); ec && seqLen(ec) >= 0) parts = seqItems(ec);
                 else parts = iterValues(elem, ctx);
@@ -4752,7 +5066,7 @@ public:   // NythonExecutor is a struct: members default to public
             }
         }
         // A generator: one value per iteration, pulled lazily (src/NyGen.cpp).
-        if (nygen::is_gen(iter_val)) return nygen::for_loop(*this, fn.get(), iter_val, ctx, gen_owned);
+        if (nygen::is_gen(iter_val)) return nygen::for_loop(*this, fn, iter_val, ctx, gen_owned);
 
         // range() returns an integer — iterate 0..n-1
         if (iter_val.type == ValueType::INTEGER) {
@@ -4783,7 +5097,7 @@ public:   // NythonExecutor is a struct: members default to public
                     // dict_keyiterator (round 78: over a snapshot, so a body
                     // adding or deleting entries went unnoticed; it is a
                     // RuntimeError in Python)
-                    return nygen::for_loop(*this, fn.get(), nygen::make_dict_iter(*this, iter_val, 0, false), ctx, true);
+                    return nygen::for_loop(*this, fn, nygen::make_dict_iter(*this, iter_val, 0, false), ctx, true);
                 }
                 
                 // List iteration by numeric index - round 81: the list's
@@ -4809,7 +5123,7 @@ public:   // NythonExecutor is a struct: members default to public
                         if (!fn->unpack_vars.empty() && isInstanceValue(elem)) {
                             // an object (a tuple subclass's instance ...):
                             // unpacked by iterating it (round 77)
-                            bindUnpacked(fn.get(), var_name, elem, ctx, bindv);
+                            bindUnpacked(fn, var_name, elem, ctx, bindv);
                         } else if (!fn->unpack_vars.empty() && elem.isCollectable() && elem.value.gc) {
                             // Tuple unpacking: destructure element
                             auto* elem_cont = dynamic_cast<Container*>(elem.value.gc);
@@ -4909,7 +5223,7 @@ public:   // NythonExecutor is a struct: members default to public
                 if (stop) break;
                 // Unpack tuples for k,v iteration
                 if (!fn->unpack_vars.empty() && isInstanceValue(item)) {
-                    bindUnpacked(fn.get(), var_name, item, ctx, bindv);   // round 77
+                    bindUnpacked(fn, var_name, item, ctx, bindv);   // round 77
                 } else if (!fn->unpack_vars.empty() && item.isCollectable()) {
                     auto* cont = dynamic_cast<Container*>(item.value.gc);
                     if (cont && cont->container) {
@@ -4938,7 +5252,7 @@ public:   // NythonExecutor is a struct: members default to public
         return result;
     }
 
-    Value evalRepeat(node_ptr node, Context* ctx) {
+    Value evalRepeat(const node_ptr& node, Context* ctx) {
         auto rn = static_pointer_cast<RepeatNode>(node);
         Value count = evalNode(rn->count, ctx);
         int64_t n = (count.type == ValueType::INTEGER) ? bigint_to_i64(count.value.i) : 0;
@@ -4958,7 +5272,7 @@ public:   // NythonExecutor is a struct: members default to public
         return result;
     }
 
-    Value evalSwitch(node_ptr node, Context* ctx) {
+    Value evalSwitch(const node_ptr& node, Context* ctx) {
         auto sn = static_pointer_cast<SwitchNode>(node);
         Value subject = evalNode(sn->subject, ctx);
         for (auto& c : sn->cases) {
@@ -4997,7 +5311,7 @@ public:   // NythonExecutor is a struct: members default to public
     }
 
     // ─── FUNCTION / CLASS / LAMBDA ──────────────────────────────────────
-    Value evalFunctionDecl(node_ptr node, Context* ctx) {
+    Value evalFunctionDecl(const node_ptr& node, Context* ctx) {
         auto fn = static_pointer_cast<FunctionNode>(node);
         // A unique identity per function value: the id inside its heap
         // object (nyheap::Func), which owns every side-table entry below.
@@ -5009,6 +5323,7 @@ public:   // NythonExecutor is a struct: members default to public
         fo->setScope(ctx);
         // Also store the AST node pointer so we can find the FunctionNode later
         func_ast_nodes[unique_ptr] = (void*)node.get();
+        fo->code = node.get();   // round 81
         heap_owner_[unique_ptr] = fo;
         nygc::track(fo);
         captureDefaults(fn.get(), unique_ptr, ctx);
@@ -5040,7 +5355,7 @@ public:   // NythonExecutor is a struct: members default to public
     // with, except/else/finally clauses and switch cases were not looked at,
     // so such a function ran as a plain function and its yield aborted the
     // process with an uncaught YieldSignal.
-    bool hasYield(node_ptr node) {
+    bool hasYield(const node_ptr& node) {
         if (!node) return false;
         switch (node->type()) {
             case NodeType::YIELD: case NodeType::YIELD_FROM: return true;
@@ -5365,6 +5680,126 @@ public:   // NythonExecutor is a struct: members default to public
         pyRaise("AttributeError", "'" + typeNameOf(obj) + "' object has no attribute '" + m + "'");
     }
 
+    // A str method (callMethod's string section, round 81: its own function,
+    // which evalCall's builtin-method path calls too): false when no str
+    // method has the name. `s` is the string's text.
+    bool strMethodCall(const Value& obj, const std::string& s, const std::string& method_name, std::vector<Value>& args,
+                       const nyrt::OrderedKw<Value>& kw_args_in, Context* ctx, Value& out) {
+        // Every str method has one implementation shared with the VM
+        // (NyStr.hpp: nypy::str_method); only format needs values.
+        if (method_name == "format") { out = makeStringValue(strFormat(s, args, kw_args_in, ctx)); return true; }
+        if (method_name == "encode") {
+            // str -> bytes (NyBytes.hpp: str_encode)
+            std::string enc = "utf-8", err = "strict";
+            if (args.size() >= 1 && args[0].type != ValueType::NONE) enc = strOf(args[0], ctx);
+            if (args.size() >= 2 && args[1].type != ValueType::NONE) err = strOf(args[1], ctx);
+            auto ki = kw_args_in.find("encoding"); if (ki != kw_args_in.end()) enc = strOf(ki->second, ctx);
+            ki = kw_args_in.find("errors"); if (ki != kw_args_in.end()) err = strOf(ki->second, ctx);
+            // round 80: a codec or error handler of lib/codecs.ny's registry
+            if (nypy::codec_needs_python(enc, err)) { out = codecHook("_ny_codec_encode", obj, enc, err, ctx); return true; }
+            out = makeBytesValue(nyCall([&] { return nypy::str_encode(s, enc, err); }));
+            return true;
+        }
+        // round 80: str.translate / str.maketrans (the prelude's:
+        // the table is any mapping, read with __getitem__)
+        if (method_name == "translate" || method_name == "maketrans") {
+            if (!kw_args_in.empty()) pyRaise("TypeError", "str." + method_name + "() takes no keyword arguments");
+            std::vector<Value> a;
+            if (method_name == "translate") {
+                if (args.size() != 1) pyRaise("TypeError", "str.translate() takes exactly one argument (" + std::to_string(args.size()) + " given)");
+                a.push_back(obj);
+            }
+            for (auto& x : args) a.push_back(x);
+            out = callFunctionValue(global_ctx->getByName(method_name == "translate" ? "_ny_str_translate" : "_ny_str_maketrans"), a, ctx);
+            return true;
+        }
+        if (method_name == "format_map" && !args.empty()) {
+            nyrt::OrderedKw<Value> kw;
+            if (Container* mc = contOf(args[0])) for (auto& kv : *mc->container) if (!isInternalKey(kv.first)) kw[nypy::key_payload(kv.first)] = kv.second;
+            std::vector<Value> none;
+            out = makeStringValue(strFormat(s, none, kw, ctx));
+            return true;
+        }
+        // round 79: keyword arguments go where the method takes them
+        // (NyStr.hpp: str_kw_slot); they used to be dropped
+        std::vector<Value> kargs;
+        const std::vector<Value>* sargs = &args;
+        if (!kw_args_in.empty()) {
+            kargs = args;
+            for (auto& kv : kw_args_in) {
+                size_t pos = nyCall([&] { return nypy::str_kw_slot(method_name, kv.first); });
+                if (kargs.size() <= pos) kargs.resize(pos + 1, NONE_VALUE);
+                kargs[pos] = kv.second;
+            }
+            sargs = &kargs;
+        }
+        std::vector<nypy::SArg> sa;
+        sa.reserve(sargs->size());
+        for (auto& a : *sargs) sa.push_back(toSArg(a, ctx));
+        nypy::SRes r;
+        if (nyCall([&] { return nypy::str_method(s, method_name, sa, r); })) { out = fromSRes(r); return true; }
+        return false;
+    }
+
+    // ── A builtin value's own method, called (round 81) ──────────────────
+    // s.strip(), d.get(k), xs.append(x): for a str, a plain dict or a list,
+    // and a name the method table of its kind has, every step evalCall and
+    // callMethod take before they reach that table answers no - no
+    // __getattribute__ (checked by the caller), no field, key or callable
+    // held under the name (a list holds none but its items; a plain dict's
+    // methods win over its keys), no object-protocol or operator member,
+    // no attribute read (getAttrValue gives nothing for these without
+    // binding), no set, bytes or generator - so the table is asked at once.
+    // Names those steps treat specially are never taken (sort's keyword
+    // arguments, slice, class_name, type_name, to_string), nor is anything
+    // under a profile function (its c_call events) or NY_LENIENT_READS=log
+    // (its notes on shadowed keys). The tables answer as before: what they
+    // do not take goes the general way, and they take nothing before
+    // answering no.
+    enum : uint8_t { BM_STR = 1, BM_DICT = 2, BM_LIST = 4, BM_KNOWN = 128 };
+    static uint8_t builtinMethodKinds(const std::string& m) {
+        uint8_t k = BM_KNOWN;
+        if (m.empty() || !std::isalpha((unsigned char)m[0])) return k;
+        if (m == "sort" || m == "sorted" || m == "slice" || m == "class_name" || m == "type_name" || m == "to_string") return k;
+        // str: strMethodCall answers, or raises, for these (format_map
+        // without arguments falls through to str_method: not taken)
+        bool str_ok = m == "format" || m == "encode" || m == "translate" || m == "maketrans";
+        if (!str_ok && m != "format_map") {
+            // str_method's answer depends on the name alone (no name it does
+            // not know raises): asked once with nothing
+            static const std::vector<nypy::SArg> none;
+            nypy::SRes r;
+            try { str_ok = nypy::str_method(std::string(), m, none, r); } catch (...) { str_ok = true; }
+        }
+        if (str_ok) k |= BM_STR;
+        // dict: the names dictMethod always takes that also win over a key
+        // of the name (nyrt::is_dict_method_name)
+        static const char* const dict_names[] = {"keys", "values", "items", "get", "pop", "popitem", "setdefault", "update", "clear", "copy"};
+        for (const char* x : dict_names) if (m == x) { k |= BM_DICT; break; }
+        // list: listMethod's names (sort aside)
+        static const char* const list_names[] = {"index", "indexOf", "count", "pop", "insert", "copy", "reverse", "clear", "extend", "append", "push"};
+        for (const char* x : list_names) if (m == x) { k |= BM_LIST; break; }
+        return k;
+    }
+    bool builtinMethodFast(CallNode* cn, const Value& obj, const std::string& m, std::vector<Value>& args,
+                           const nyrt::OrderedKw<Value>& kw, Context* ctx, Value& out) {
+        if (__builtin_expect(!cn->bm_kinds, 0)) cn->bm_kinds = builtinMethodKinds(m);
+        const uint8_t k = cn->bm_kinds;
+        if (!(k & (BM_STR | BM_DICT | BM_LIST))) return false;
+        if (obj.type == ValueType::USERDATA) {
+            if (!(k & BM_STR) || heapKind(obj) != HK_STR) return false;
+            return strMethodCall(obj, *static_cast<const std::string*>(obj.value.p), m, args, kw, ctx, out);
+        }
+        Container* c = contOf(obj);
+        if (!c || nygen::is_gen(obj) || nypy::lenient_reads_log()) return false;
+        if (seqLen(c) < 0) {
+            if (!(k & BM_DICT) || !isPlainDict(c)) return false;
+            return dictMethod(c, obj, m, args, kw, ctx, out);
+        }
+        if (!(k & BM_LIST) || isSetCont(c) || isGenCont(c) || c->container->index_of(m) >= 0) return false;
+        return listMethod(c, obj, m, args, kw, ctx, out);
+    }
+
     Value callMethod(Value obj, const std::string& method_name, std::vector<Value>& args, Context* ctx,
                      const nyrt::OrderedKw<Value>* kw_in = nullptr) {
         static const nyrt::OrderedKw<Value> kEmptyKw;
@@ -5410,56 +5845,8 @@ public:   // NythonExecutor is a struct: members default to public
             std::string s = getStringValue(obj);
             bool is_string = string_ptrs_.count(obj.value.p) || (!func_names.count(obj.value.p) && !instance_to_class.count(obj.value.p));
             if (is_string) {
-                // Every str method has one implementation shared with the VM
-                // (NyStr.hpp: nypy::str_method); only format needs values.
-                if (method_name == "format") return makeStringValue(strFormat(s, args, kw_args_in, ctx));
-                if (method_name == "encode") {
-                    // str -> bytes (NyBytes.hpp: str_encode)
-                    std::string enc = "utf-8", err = "strict";
-                    if (args.size() >= 1 && args[0].type != ValueType::NONE) enc = strOf(args[0], ctx);
-                    if (args.size() >= 2 && args[1].type != ValueType::NONE) err = strOf(args[1], ctx);
-                    auto ki = kw_args_in.find("encoding"); if (ki != kw_args_in.end()) enc = strOf(ki->second, ctx);
-                    ki = kw_args_in.find("errors"); if (ki != kw_args_in.end()) err = strOf(ki->second, ctx);
-                    // round 80: a codec or error handler of lib/codecs.ny's registry
-                    if (nypy::codec_needs_python(enc, err)) return codecHook("_ny_codec_encode", obj, enc, err, ctx);
-                    return makeBytesValue(nyCall([&] { return nypy::str_encode(s, enc, err); }));
-                }
-                // round 80: str.translate / str.maketrans (the prelude's:
-                // the table is any mapping, read with __getitem__)
-                if (method_name == "translate" || method_name == "maketrans") {
-                    if (!kw_args_in.empty()) pyRaise("TypeError", "str." + method_name + "() takes no keyword arguments");
-                    std::vector<Value> a;
-                    if (method_name == "translate") {
-                        if (args.size() != 1) pyRaise("TypeError", "str.translate() takes exactly one argument (" + std::to_string(args.size()) + " given)");
-                        a.push_back(obj);
-                    }
-                    for (auto& x : args) a.push_back(x);
-                    return callFunctionValue(global_ctx->getByName(method_name == "translate" ? "_ny_str_translate" : "_ny_str_maketrans"), a, ctx);
-                }
-                if (method_name == "format_map" && !args.empty()) {
-                    nyrt::OrderedKw<Value> kw;
-                    if (Container* mc = contOf(args[0])) for (auto& kv : *mc->container) if (!isInternalKey(kv.first)) kw[nypy::key_payload(kv.first)] = kv.second;
-                    std::vector<Value> none;
-                    return makeStringValue(strFormat(s, none, kw, ctx));
-                }
-                // round 79: keyword arguments go where the method takes them
-                // (NyStr.hpp: str_kw_slot); they used to be dropped
-                std::vector<Value> kargs;
-                const std::vector<Value>* sargs = &args;
-                if (!kw_args_in.empty()) {
-                    kargs = args;
-                    for (auto& kv : kw_args_in) {
-                        size_t pos = nyCall([&] { return nypy::str_kw_slot(method_name, kv.first); });
-                        if (kargs.size() <= pos) kargs.resize(pos + 1, NONE_VALUE);
-                        kargs[pos] = kv.second;
-                    }
-                    sargs = &kargs;
-                }
-                std::vector<nypy::SArg> sa;
-                sa.reserve(sargs->size());
-                for (auto& a : *sargs) sa.push_back(toSArg(a, ctx));
-                nypy::SRes r;
-                if (nyCall([&] { return nypy::str_method(s, method_name, sa, r); })) return fromSRes(r);
+                Value sr;
+                if (strMethodCall(obj, s, method_name, args, kw_args_in, ctx, sr)) return sr;   // (round 81: its own function)
             }
         }
 
@@ -6458,10 +6845,10 @@ public:   // NythonExecutor is a struct: members default to public
         class_val.value.p = (void*)node.get();
         func_names[(void*)node.get()] = "__class__:" + cn->name;
         class_by_name[cn->name] = (void*)node.get();
-        mro_cache_.clear();
+        mro_cache_.clear(); specInvalidate();
         attr_hook_cache_[0].clear();
         attr_hook_cache_[1].clear();
-        attr_hook_cache_[2].clear();
+        attr_hook_cache_[2].clear(); specInvalidate();   /* round 81 */
         no_new_.clear();
         if (cn->body)
             for (auto& st : cn->body->statements())
@@ -6704,10 +7091,10 @@ public:   // NythonExecutor is a struct: members default to public
                     }
                 }
                 if (classNodeOfValue(mcs)) class_meta_[(void*)cnode] = mcs;
-                mro_cache_.clear();
+                mro_cache_.clear(); specInvalidate();
                 attr_hook_cache_[0].clear();
                 attr_hook_cache_[1].clear();
-        attr_hook_cache_[2].clear();
+        attr_hook_cache_[2].clear(); specInvalidate();   /* round 81 */
                 classCreated(cls, cnode, kw, ctx);
                 return cls;
             }
@@ -6743,10 +7130,10 @@ public:   // NythonExecutor is a struct: members default to public
         func_names[(void*)node.get()] = "__class__:" + full;
         class_by_name[full] = (void*)node.get();
         if (!node->bases.empty()) class_parent[(void*)node.get()] = node->bases[0]->value();
-        mro_cache_.clear();
+        mro_cache_.clear(); specInvalidate();
         attr_hook_cache_[0].clear();
         attr_hook_cache_[1].clear();
-        attr_hook_cache_[2].clear();
+        attr_hook_cache_[2].clear(); specInvalidate();   /* round 81 */
         no_new_.clear();
         Context* class_ctx = new Context(runner, full, nullptr, nullptr, global_ctx);
         CtxReaper _class_creator(this, class_ctx);
@@ -6849,7 +7236,7 @@ public:   // NythonExecutor is a struct: members default to public
     // stores look for one from then on (round 77; it was any class defining
     // __set__, which the prelude's property now is).
     void noteDataDescriptor(const Value& v, const std::string* name = nullptr) {
-        if (name && isDataDescriptorValue(v)) data_descr_names_.insert(*name);   // round 78
+        if (name && isDataDescriptorValue(v) && data_descr_names_.insert(*name).second) dd_names_ver_++;   // round 78 (round 81: versioned)
         if (any_data_descr_ || !isInstanceValue(v)) return;
         if (instanceHasMethod(v, "__set__") || instanceHasMethod(v, "__delete__")) any_data_descr_ = true;
     }
@@ -6859,6 +7246,7 @@ public:   // NythonExecutor is a struct: members default to public
     // read first). The names classes hold one under, so a field read pays
     // for the check only for those.
     std::unordered_set<std::string> data_descr_names_;
+    uint32_t dd_names_ver_ = 1;   // round 81: bumped when a name is added to data_descr_names_
     bool isDataDescriptorValue(const Value& d) {
         if (isInstanceValue(d)) return instanceHasMethod(d, "__set__") || instanceHasMethod(d, "__delete__");
         return d.type == ValueType::USERDATA && d.value.p
@@ -6994,7 +7382,7 @@ public:   // NythonExecutor is a struct: members default to public
     // main switch that bypassed InterfaceNode's own (dead) eval() entirely,
     // so an interface's name was never defined at all and `implements
     // Shape` silently referenced nothing.
-    Value evalInterfaceDecl(node_ptr node, Context* ctx) {
+    Value evalInterfaceDecl(const node_ptr& node, Context* ctx) {
         auto in_ = static_pointer_cast<InterfaceNode>(node);
         Value class_val;
         class_val.type = ValueType::USERDATA;
@@ -7011,7 +7399,7 @@ public:   // NythonExecutor is a struct: members default to public
         return class_val;
     }
 
-    Value evalLambda(node_ptr node, Context* ctx) {
+    Value evalLambda(const node_ptr& node, Context* ctx) {
         auto* fo = new nyheap::Func(this, ++closure_id_counter);
         void* unique_ptr = (void*)&fo->id;
         Value fn_val = nyheap::userValue(fo, unique_ptr);
@@ -7038,6 +7426,7 @@ public:   // NythonExecutor is a struct: members default to public
             fn_defaults_val_[unique_ptr] = std::move(vals);
         }
         func_ast_nodes[unique_ptr] = (void*)node.get();
+        fo->code = node.get();   // round 81
         heap_owner_[unique_ptr] = fo;
         nygc::track(fo);
         return fn_val;
@@ -7046,16 +7435,409 @@ public:   // NythonExecutor is a struct: members default to public
 
     // Helper: build a positional args list and a keyword map from a CallNode's arg list
     // Returns positional args in call_args, named args in kw_args (name->value)
+    // ── Specialization (round 81) ───────────────────────────────────────
+    // The interpreter's nodes remember what they saw and take a shorter,
+    // equivalent path next time (a self-optimizing AST interpreter, after
+    // Würthinger et al., DLS 2012). NY_ASTSPEC=0 turns every one of them
+    // off, so a wrong answer can be told from a generic one.
+    static inline const bool ast_spec_on_ = [] {
+        const char* e = std::getenv("NY_ASTSPEC");
+        return !(e && e[0] == '0' && e[1] == 0);
+    }();
+    static bool astSpecOn() { return ast_spec_on_; }
+    static constexpr size_t kFastArgs = 8;   // arguments a fast call keeps on the C++ stack
+    // The specialization epoch: what the method caches assume about classes
+    // (their MROs, which namespace is each class's, class_vars_, the kind
+    // a function's tag gives it, that a cached method is still alive) holds
+    // only while it is unchanged; everything that can change those bumps it.
+    uint64_t spec_epoch_ = 1;
+    void specInvalidate() { ++spec_epoch_; }
+    // Up to kFastArgs argument values on the C++ stack, made in order and
+    // destroyed in order as a std::vector's are (round 81).
+    struct ArgBuf {
+        alignas(Value) unsigned char raw[sizeof(Value) * kFastArgs];
+        size_t n = 0;
+        ArgBuf() = default;
+        ArgBuf(const ArgBuf&) = delete;
+        ArgBuf& operator=(const ArgBuf&) = delete;
+        Value& operator[](size_t i) { return reinterpret_cast<Value*>(raw)[i]; }
+        void push(Value&& v) { new (&(*this)[n]) Value(std::move(v)); n++; }
+        ~ArgBuf() { for (size_t i = 0; i < n; i++) (*this)[i].~Value(); }
+    };
+    // Whether the statements of a class body assign `name` at their top
+    // level (getAttrValue evaluates such an assignment for a class whose
+    // namespace lacks the name).
+    static bool classBodyAssigns(ClassNode* cn, const std::string& name) {
+        if (!cn || !cn->body) return false;
+        for (auto& stmt : blockStmts(cn->body.get())) {
+            if (stmt && stmt->type() == NodeType::ASSIGNMENT) {
+                auto* as = static_cast<AssignmentNode*>(stmt.get());
+                if (as->target && as->target->type() == NodeType::VARIABLE && as->target->value() == name) return true;
+            }
+        }
+        return false;
+    }
+    // ── obj.m(args) on an instance, through the site's cache (round 81) ──
+    // What evalCall's method path, callMethod, callClassMethod and
+    // invokeMember do for a plain method - a def written in a class body,
+    // first parameter self (or this), every parameter a plain name, called
+    // with that many positional arguments - when nothing comes first: no
+    // __getattribute__ anywhere, no instance field of that name, no class
+    // before the owner in the MRO naming it (in its namespace, class_vars_
+    // or its body). The entry is made by those same lookups (fill) and
+    // checked on each use; anything else takes the general path.
+    CallNode::MethodIC* methodICFill(CallNode* cn, const std::string& name, Node* cls, size_t na) {
+        if (name.size() >= 2 && name[0] == '_' && name[1] == '_') return nullptr;   // dunders: callMethod's own first
+        if (name == "slice") return nullptr;
+        if (!cls || cls->type() != NodeType::CLASS) return nullptr;
+        if (cls == preludeSuperNode()) return nullptr;            // super(...) proxies
+        auto mit = mro_cache_.find(cls);
+        if (mit == mro_cache_.end()) return nullptr;              // the general path works the MRO out first
+        const std::vector<Node*>& mro = mit->second;
+        std::vector<std::pair<Context*, uint32_t>> prefix;
+        Node* owner = nullptr; Context* octx = nullptr; long slot = -1;
+        for (Node* c : mro) {
+            auto cit = class_ctx_map_.find((void*)c);
+            Context* cc = (cit != class_ctx_map_.end() && cit->second && cit->second->container) ? cit->second : nullptr;
+            if (cc) {
+                long n = cc->container->index_of(name);
+                if (n >= 0) { owner = c; octx = cc; slot = n; break; }
+            }
+            // getAttrValue's other places for this class: none may name it
+            if (c->type() != NodeType::CLASS) return nullptr;
+            auto* ccn = static_cast<ClassNode*>(c);
+            if (class_vars_.count(ccn->name + "." + name) || classBodyAssigns(ccn, name)) return nullptr;
+            if (cc) prefix.push_back({cc, cc->container->version()});
+        }
+        if (!owner || owner->type() != NodeType::CLASS) return nullptr;
+        const Value& m = octx->container->slot_at((size_t)slot)->second;
+        if (heapKind(m) != HK_FUNC) return nullptr;
+        auto* fo = static_cast<nyheap::Func*>(m.value.o);
+        Node* code = fo->code;
+        if (!code || code->type() != NodeType::FUNCTION) return nullptr;
+        auto* fn = static_cast<FunctionNode*>(code);
+        std::string tag = fnTag(func_names, m.value.p);
+        if (tag.rfind("__func__:", 0) != 0 || tag.find("__static__") != std::string::npos
+            || tag.find("__classmethod__") != std::string::npos || tag.find("__property__") != std::string::npos)
+            return nullptr;
+        if (!direct_methods_.count(fn)) return nullptr;
+        const std::vector<std::string>* names = simpleParams(fn);
+        if (!names || names->size() != na + 1 || ((*names)[0] != "self" && (*names)[0] != "this")) return nullptr;
+        if (!cn->mic) cn->mic.reset(new CallNode::MethodIC[CallNode::kMethodWays]);
+        CallNode::MethodIC* e = nullptr;
+        for (int w = 0; w < CallNode::kMethodWays && !e; w++)   // a stale or empty way first
+            if (cn->mic[w].epoch != spec_epoch_ || cn->mic[w].by != this || !cn->mic[w].cls) e = &cn->mic[w];
+        if (!e) { e = &cn->mic[cn->mic_next]; cn->mic_next = (uint8_t)((cn->mic_next + 1) % CallNode::kMethodWays); }
+        fo->gc_flags |= nygc::F_KICREF;   // its death ends the epoch
+        e->cls = (void*)cls; e->epoch = spec_epoch_; e->by = this;
+        e->fn = fn; e->owner = owner; e->m_p = m.value.p; e->m_o = (void*)m.value.o;
+        e->owner_ctx = octx; e->owner_slot = (uint32_t)slot;
+        e->prefix = std::move(prefix);
+        // __parent_class__: the interned string's entry (interned_ keeps it
+        // for the executor's life, at a stable address)
+        e->parent_name = nullptr;
+        auto* ocn = static_cast<ClassNode*>(owner);
+        if (!ocn->bases.empty()) {
+            std::string pn = ocn->bases[0]->value();
+            internString(pn);
+            e->parent_name = &interned_.find(pn)->second;
+        }
+        // the scope's names - self, this, the parameters, __parent_class__ -
+        // are distinct, so a fresh scope takes them without lookups
+        bool ok = fn->names_distinct;
+        for (size_t i = 1; ok && i < names->size(); i++) {
+            const std::string& pn = (*names)[i];
+            if (pn == "self" || pn == "this" || pn == "__parent_class__") ok = false;
+        }
+        e->append_ok = ok;
+        return e;
+    }
+    // Whether none of these class namespaces holds `name`: a namespace
+    // whose keys have not changed since (its version) still does not; one
+    // whose keys changed is looked in, and its version taken again when it
+    // still lacks the name.
+    static bool namespacesLack(std::vector<std::pair<Context*, uint32_t>>& ns, const std::string& name) {
+        for (auto& [c, ver] : ns) {
+            const ContainerType* m = c->container;
+            if (!m || m->version() == ver) continue;
+            if (m->index_of(name) >= 0) return false;
+            ver = m->version();
+        }
+        return true;
+    }
+    // ── obj.attr = v on an instance, through the target's cache (round 81) ──
+    // setAttr for an instance whose class (and every class in its MRO)
+    // holds nothing named attr and has no __setattr__: no hook, descriptor,
+    // property or slot applies, and the value goes into the instance's
+    // fields - which is all this does. The entry is made by setAttr's own
+    // tests (fill) and its namespaces' keys checked on each use.
+    AttributeNode::StoreIC* storeICFill(AttributeNode* an, const Value& obj, Node* cls) {
+        const std::string& name = an->attr;
+        if (name.size() >= 2 && name[0] == '_' && name[1] == '_') return nullptr;   // dunders: setAttr's own first
+        if (name == "mro") return nullptr;                 // findClassMember's fallback to object's
+        if (!cls || cls->type() != NodeType::CLASS || raw_attr_depth_ > 0) return nullptr;
+        if (instanceAttrHook(obj, 0)) return nullptr;                             // a __setattr__
+        if (!object_class_node_) object_class_node_ = classNodeByName("object");
+        if (cls == object_class_node_) return nullptr;                            // object() takes no fields
+        if (!slot_flags_.empty() && isDictless(obj)) return nullptr;              // __slots__ without __dict__
+        auto mit = mro_cache_.find(cls);
+        if (mit == mro_cache_.end()) return nullptr;
+        std::vector<std::pair<Context*, uint32_t>> ns;
+        for (Node* c : mit->second) {
+            auto cit = class_ctx_map_.find((void*)c);
+            if (cit == class_ctx_map_.end() || !cit->second || !cit->second->container) continue;
+            if (cit->second->container->index_of(name) >= 0) return nullptr;      // a class holds the name
+            ns.push_back({cit->second, cit->second->container->version()});
+        }
+        if (!an->sic) an->sic.reset(new AttributeNode::StoreIC[AttributeNode::kStoreWays]);
+        AttributeNode::StoreIC* e = nullptr;
+        for (int w = 0; w < AttributeNode::kStoreWays && !e; w++)
+            if (an->sic[w].epoch != spec_epoch_ || an->sic[w].by != this || !an->sic[w].cls) e = &an->sic[w];
+        if (!e) { e = &an->sic[an->sic_next]; an->sic_next = (uint8_t)((an->sic_next + 1) % AttributeNode::kStoreWays); }
+        e->cls = (void*)cls; e->epoch = spec_epoch_; e->by = this;
+        e->ns = std::move(ns);
+        return e;
+    }
+    bool storeFast(AttributeNode* an, const Value& obj, const Value& val) {
+        if (raw_attr_depth_ > 0) return false;
+        auto* io = static_cast<nyheap::Inst*>(obj.value.o);
+        void* cls = io->cls;
+        Context* props = io->props;
+        if (!props || !props->container || props->storeHook) return false;
+        AttributeNode::StoreIC* e = nullptr;
+        if (an->sic)
+            for (int w = 0; w < AttributeNode::kStoreWays; w++) {
+                AttributeNode::StoreIC& x = an->sic[w];
+                if (x.cls == cls && x.epoch == spec_epoch_ && x.by == this) { e = &x; break; }
+            }
+        if (!e) {
+            if (an->sic_skip) { an->sic_skip--; return false; }
+            e = storeICFill(an, obj, (Node*)cls);
+            if (!e) {
+                if (an->sic_backoff < 7) an->sic_backoff++;
+                an->sic_skip = (uint8_t)((1u << an->sic_backoff) - 1);
+                return false;
+            }
+            an->sic_backoff = 0;
+        }
+        if (!namespacesLack(e->ns, an->attr)) { e->cls = nullptr; return false; }
+        // the field: its slot from last time when it still holds it
+        ContainerType* m = props->container;
+        if (ContainerType::value_type* kv = m->slot_at_mut(an->store_hint); kv && kv->first == an->attr) { kv->second = val; return true; }
+        long n = m->index_of(an->attr);
+        if (n >= 0) { an->store_hint = (uint32_t)n; m->slot_at_mut((size_t)n)->second = val; return true; }
+        (*m)[an->attr] = val;                              // a new field: the last slot
+        an->store_hint = (uint32_t)(m->slot_end() - 1);
+        return true;
+    }
+    // ── obj.attr answered by a class namespace, through the node's cache (round 81) ──
+    // getAttrValue, for a class or an instance with no field of that name
+    // (and no __getattribute__ anywhere), walks the class's MRO: in each
+    // class its namespace, its class_vars_ entry and the assignments of its
+    // body, until one names attr - then classNsResult makes the result. The
+    // entry is made by those same lookups and remembers the namespace and
+    // slot that answered and the namespaces before it (none naming attr,
+    // their keys' versions); a hit gives the value found there to
+    // classNsResult as the walk would. Dunder names are left to the general
+    // path (its special cases come first).
+    AttributeNode::LoadIC* classLoadFill(AttributeNode* an, void* cls, bool inst) {
+        const std::string& name = an->attr;
+        if (name.size() >= 2 && name[0] == '_' && name[1] == '_') return nullptr;
+        // what getAttrValue takes cls for: a class (its own node)
+        if (!cls || func_ast_nodes.count(cls) || instance_to_class.count(cls)) return nullptr;
+        if (fnTag(func_names, cls).rfind("__class__:", 0) != 0) return nullptr;
+        Node* cn = (Node*)cls;
+        if (cn->type() != NodeType::CLASS) return nullptr;
+        if (inst && cn == preludeSuperNode()) return nullptr;   // super(...) proxies
+        auto mit = mro_cache_.find(cn);
+        if (mit == mro_cache_.end()) return nullptr;            // the general path works the MRO out first
+        std::vector<std::pair<Context*, uint32_t>> prefix;
+        Node* owner = nullptr; Context* octx = nullptr; long slot = -1;
+        for (Node* c : mit->second) {
+            if (c->type() != NodeType::CLASS) return nullptr;
+            auto cit = class_ctx_map_.find((void*)c);
+            Context* cc = (cit != class_ctx_map_.end() && cit->second && cit->second->container) ? cit->second : nullptr;
+            if (cc) {
+                long n = cc->container->index_of(name);
+                if (n >= 0) {
+                    if (cc->container->slot_at((size_t)n)->second.type == ValueType::UNDEFINED) return nullptr;
+                    owner = c; octx = cc; slot = n;
+                    break;
+                }
+            }
+            auto* ccn = static_cast<ClassNode*>(c);
+            std::string key = ccn->name + "." + name;
+            if (class_vars_.count(key)) return nullptr;
+            if (ccn->body && (class_vars_deleted_.empty() || !class_vars_deleted_.count(key)) && classBodyAssigns(ccn, name)) return nullptr;
+            if (cc) prefix.push_back({cc, cc->container->version()});
+        }
+        if (!owner) return nullptr;
+        if (!an->lic) an->lic.reset(new AttributeNode::LoadIC());
+        AttributeNode::LoadIC* e = an->lic.get();
+        e->cls = cls; e->inst = inst; e->epoch = spec_epoch_; e->by = this;
+        e->owner = owner; e->owner_ctx = octx; e->owner_slot = (uint32_t)slot;
+        e->prefix = std::move(prefix);
+        return e;
+    }
+    bool classLoadFast(AttributeNode* an, const Value& obj, Context* ctx, Value& out) {
+        void* cls;
+        bool inst;
+        switch (heapKind(obj)) {
+            case HK_INST: {
+                auto* io = static_cast<nyheap::Inst*>(obj.value.o);
+                // a field of that name answers first (evalAttribute's own
+                // path did not take it: a property or data descriptor)
+                if (io->props && io->props->container && io->props->container->index_of(an->attr) >= 0) return false;
+                cls = io->cls; inst = true;
+                break;
+            }
+            case HK_UNKNOWN: cls = obj.value.p; inst = false; break;
+            default: return false;   // a str's or function's attributes: their own paths
+        }
+        AttributeNode::LoadIC* e = an->lic.get();
+        if (!(e && e->cls == cls && e->inst == inst && e->epoch == spec_epoch_ && e->by == this)) {
+            if (an->lic_skip) { an->lic_skip--; return false; }
+            e = classLoadFill(an, cls, inst);
+            if (!e) {
+                if (an->lic_backoff < 7) an->lic_backoff++;
+                an->lic_skip = (uint8_t)((1u << an->lic_backoff) - 1);
+                return false;
+            }
+            an->lic_backoff = 0;
+        }
+        if (!namespacesLack(e->prefix, an->attr)) { e->cls = nullptr; return false; }
+        const ContainerType::value_type* kv = e->owner_ctx->container ? e->owner_ctx->container->slot_at(e->owner_slot) : nullptr;
+        if (!kv || kv->first != an->attr || kv->second.type == ValueType::UNDEFINED) { e->cls = nullptr; return false; }
+        Value cv = kv->second;   // a copy, as the walk takes
+        return classNsResult(cv, obj, cls, e->owner, ctx, true, out);
+    }
+    // The call itself, when the site's cache answers for this receiver;
+    // false (nothing done) otherwise.
+    bool methodFast(CallNode* cn, const std::string& name, const Value& obj, ArgBuf& argv, Context* ctx, Value& out) {
+        auto* io = static_cast<nyheap::Inst*>(obj.value.o);
+        void* cls = io->cls;
+        CallNode::MethodIC* e = nullptr;
+        if (cn->mic)
+            for (int w = 0; w < CallNode::kMethodWays; w++) {
+                CallNode::MethodIC& x = cn->mic[w];
+                if (x.cls == cls && x.epoch == spec_epoch_ && x.by == this) { e = &x; break; }
+            }
+        if (!e) {
+            // a site where filling keeps finding nothing tries less often
+            if (cn->mic_skip) { cn->mic_skip--; return false; }
+            e = methodICFill(cn, name, (Node*)cls, argv.n);
+            if (!e) {
+                if (cn->mic_backoff < 7) cn->mic_backoff++;
+                cn->mic_skip = (uint8_t)((1u << cn->mic_backoff) - 1);
+                return false;
+            }
+            cn->mic_backoff = 0;
+        }
+        // the checks of each use: no instance field of that name, nothing
+        // before the owner naming it, the owner still holding the method
+        Context* props = io->props;
+        if (props && props->container && props->container->index_of(name) >= 0) return false;
+        if (!namespacesLack(e->prefix, name)) { e->cls = nullptr; return false; }
+        const ContainerType* om = e->owner_ctx->container;
+        const ContainerType::value_type* kv = om ? om->slot_at(e->owner_slot) : nullptr;
+        if (!kv || kv->first != name || kv->second.type != ValueType::USERDATA
+            || kv->second.value.p != e->m_p || (void*)kv->second.value.o != e->m_o) { e->cls = nullptr; return false; }
+        // invokeMember, for a method with self: the method value held for
+        // the call (callClassMethod's `m`), a scope over the one the class
+        // was defined in, self (and this), the parameters, __parent_class__
+        Value m = kv->second;
+        auto* fn = static_cast<FunctionNode*>(e->fn);
+        Node* owner = e->owner;
+        auto* fo = static_cast<nyheap::Func*>(m.value.o);
+        Context* cp = global_ctx;
+        if (Context* sc = fo->scope) cp = sc->inClass && sc->parent ? sc->parent : sc;
+        const std::vector<std::string>& names = fn->param_names;
+        Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
+        CtxReaper _reap(this, fc);
+        static const std::string kSelf = "self", kThis = "this", kParent = "__parent_class__";
+        if (e->append_ok) {
+            ContainerType* m2 = fc->container;
+            m2->append_new(kSelf, Value(obj));
+            if (names[0] == kThis) m2->append_new(kThis, Value(obj));
+            for (size_t i = 1; i < names.size(); i++) m2->append_new(names[i], Value(argv[i - 1]));
+            if (e->parent_name) m2->append_new(kParent, Value(*e->parent_name));
+        } else {
+            fc->defineByName(kSelf, obj);
+            if (names[0] == kThis) fc->defineByName(kThis, obj);
+            for (size_t i = 1; i < names.size(); i++) fc->defineByName(names[i], argv[i - 1]);
+            if (e->parent_name) fc->defineByName(kParent, *e->parent_name);
+        }
+        OwnerScope _os(owner_stack_, owner);
+        out = runFunctionBody(fn, fc);
+        return true;
+    }
+    // Every argument a plain positional one (not name=v, *xs or **kw).
+    static bool plainCallArgs(CallNode* cn) {
+        for (auto& a : cn->args) {
+            if (!a) return false;
+            if (a->type() == NodeType::KEYWORD_ARG) return false;
+            if (a->type() == NodeType::UNARY) {
+                const std::string& op = static_cast<UnaryNode*>(a.get())->op;
+                if (op == "*" || op == "**") return false;
+            }
+        }
+        return true;
+    }
+    // The parameter names of a def or lambda whose parameters are all plain
+    // names (no *args, **kw, bare * or /): bindParamsImpl / bindLambdaParams
+    // then bind n positional arguments to them in order and nothing else.
+    // nullptr for any other signature.
+    static const std::vector<std::string>* simpleParams(Node* code) {
+        auto analyse = [](const std::vector<node_ptr>& params, std::vector<std::string>& names) {
+            names.clear();
+            for (auto& p : params) {
+                if (!p) return false;
+                std::string n = p->value();
+                if (n.empty() || n[0] == '*') return false;
+                names.push_back(std::move(n));
+            }
+            return true;
+        };
+        auto distinct = [](const std::vector<std::string>& names) {
+            for (size_t i = 0; i < names.size(); i++)
+                for (size_t j = i + 1; j < names.size(); j++) if (names[i] == names[j]) return false;
+            return true;
+        };
+        if (code->type() == NodeType::FUNCTION) {
+            auto* fn = static_cast<FunctionNode*>(code);
+            if (__builtin_expect(fn->simple_sig < 0, 0)) {
+                fn->simple_sig = analyse(fn->params, fn->param_names) ? 1 : 0;
+                fn->names_distinct = fn->simple_sig && distinct(fn->param_names);
+            }
+            return fn->simple_sig ? &fn->param_names : nullptr;
+        }
+        if (code->type() == NodeType::LAMBDA) {
+            auto* lam = static_cast<LambdaNode*>(code);
+            if (__builtin_expect(lam->simple_sig < 0, 0)) {
+                lam->simple_sig = (lam->posonly == 0 && analyse(lam->params, lam->param_names)) ? 1 : 0;
+                lam->names_distinct = lam->simple_sig && distinct(lam->param_names);
+            }
+            return lam->simple_sig ? &lam->param_names : nullptr;
+        }
+        return nullptr;
+    }
+    // Whether the simple parameters of `code` (simpleParams) are all distinct:
+    // a fresh scope then takes them with append_new, no lookup first.
+    static bool paramsDistinct(Node* code) {
+        return code->type() == NodeType::FUNCTION ? static_cast<FunctionNode*>(code)->names_distinct
+                                                  : static_cast<LambdaNode*>(code)->names_distinct;
+    }
+
     void evalCallArgs(const std::vector<node_ptr>& raw_args, Context* ctx,
                       std::vector<Value>& call_args,
                       nyrt::OrderedKw<Value>& kw_args) {
         for (auto& a : raw_args) {
             if (a->type() == NodeType::KEYWORD_ARG) {
                 // Named argument: name=value
-                auto kn = static_pointer_cast<KeywordArgNode>(a);
+                auto* kn = static_cast<KeywordArgNode*>((a).get());
                 kw_args[kn->name] = evalNode(kn->val, ctx);
             } else if (a->type() == NodeType::UNARY) {
-                auto un = static_pointer_cast<UnaryNode>(a);
+                auto* un = static_cast<UnaryNode*>((a).get());
                 if (un->op == "*") {
                     // *iterable spread: unpack list/range into positional args
                     // (any iterable: a string's characters, a dict's keys,
@@ -7641,7 +8423,7 @@ public:
     // it returns. Their finally blocks run then, as under CPython's reference
     // counting, and nothing is left suspended behind any(x for x in ...).
     Value callBuiltinTemps(const std::string& b, std::vector<Value>& args, Context* ctx,
-                           const std::shared_ptr<CallNode>& cn, uint64_t s0) {
+                           CallNode* cn, uint64_t s0) {
         uint32_t mask = 0;
         size_t pos = 0;
         bool simple = true;
@@ -7674,7 +8456,7 @@ public:
     }
 
     // Best-effort display name for a call site: `f()`, `obj.m()` -> "obj.m".
-    std::string callTargetName(const std::shared_ptr<CallNode>& cn) {
+    std::string callTargetName(CallNode* cn) {
         if (!cn || !cn->callee) return std::string();
         if (cn->callee->type() == NodeType::ATTRIBUTE) {
             auto at = static_pointer_cast<AttributeNode>(cn->callee);
@@ -7690,7 +8472,7 @@ public:
         return std::string();
     }
 
-    Value evalCall(node_ptr node, Context* ctx) {
+    Value evalCall(const node_ptr& node, Context* ctx) {
         if (call_depth_ >= maxCallDepth())
             throw std::string("__exc__:RecursionError:maximum call depth exceeded ("
                               + std::to_string(maxCallDepth()) + ") — check for unintended "
@@ -7704,15 +8486,15 @@ public:
         if (nycoro::stack_exhausted() || (call_depth_ > 800 && !nycoro::current() && nycoro::native_stack_exhausted()))
             return nygen::call_on_new_stack(*this, node, ctx);
         DepthGuard _depth_guard(call_depth_);
-        auto cn = static_pointer_cast<CallNode>(node);
+        auto* cn = static_cast<CallNode*>((node).get());
         // Zero cost when profiling is off: ProfScope short-circuits on the flag.
         ProfScope _prof(this, profiling_enabled() ? callTargetName(cn) : std::string());
         TraceFrame _trace_frame(trace_on() ? callTargetName(cn) : std::string());
 
         // Special handling for method calls: obj.method(args)
         if (cn->callee->type() == NodeType::ATTRIBUTE) {
-            auto attr = static_pointer_cast<AttributeNode>(cn->callee);
-            std::string method_name = attr->attr;
+            auto* attr = static_cast<AttributeNode*>((cn->callee).get());
+            const std::string& method_name = attr->attr;   // (round 81: not copied - the AST outlives the call)
 
             // ── super.method(args) — call parent class method with current self ──
             // Match both `super.method()` and `super().method()` patterns
@@ -7822,7 +8604,30 @@ public:
 
             // Evaluate arguments
             std::vector<Value> args; nyrt::OrderedKw<Value> kw_args;
-            evalCallArgs(cn->args, ctx, args, kw_args);
+            // A method of an instance with plain arguments (round 81): the
+            // arguments go on the C++ stack and the site's inline cache is
+            // asked (methodFast); when it does not answer they move into
+            // `args` and the general path goes on as before.
+            if (astSpecOn() && !any_getattribute_ && heapKind(obj) == HK_INST) {
+                if (__builtin_expect(cn->plain_args < 0, 0)) cn->plain_args = plainCallArgs(cn) ? 1 : 0;
+                if (cn->plain_args && cn->args.size() < kFastArgs) {
+                    ArgBuf argv;
+                    for (auto& a : cn->args) argv.push(evalNode(a, ctx));
+                    {
+                        Value out;
+                        if (methodFast(cn, method_name, obj, argv, ctx, out)) return out;
+                    }
+                    args.reserve(argv.n);
+                    for (size_t i = 0; i < argv.n; i++) args.push_back(std::move(argv[i]));
+                } else evalCallArgs(cn->args, ctx, args, kw_args);
+            } else {
+                evalCallArgs(cn->args, ctx, args, kw_args);
+                // a str's, plain dict's or list's own method (round 81)
+                if (astSpecOn() && !any_getattribute_ && !(nytrace::t_hooks & nytrace::PROFILE)) {
+                    Value r;
+                    if (builtinMethodFast(cn, obj, method_name, args, kw_args, ctx, r)) return r;
+                }
+            }
 
             // obj.m(...) on an object whose class defines __getattribute__:
             // m is what it gives (round 77)
@@ -7840,10 +8645,10 @@ public:
             // (functions, lambdas, closures). Check the attribute VALUE first;
             // if it is a callable, invoke it directly rather than as a named method.
             if (obj.type == ValueType::USERDATA && obj.value.p) {
-                auto pit = instance_properties.find(obj.value.p);
-                if (pit != instance_properties.end()) {
+                Context* pit_props = instPropsOf(obj);   // round 81: no table iterator kept (the table is hashed)
+                if (pit_props) {
                     try {
-                        Value attr_val = pit->second->getByName(method_name);
+                        Value attr_val = pit_props->getByName(method_name);
                         // An object with __call__ held in an attribute.
                         if (isInstanceValue(attr_val) && instanceHasMethod(attr_val, "__call__"))
                             return callMethod(attr_val, "__call__", args, ctx, &kw_args);
@@ -7864,7 +8669,7 @@ public:
                                 // object protocol's hash.
                                 if (is_bi) {
                                     bool own = false;
-                                    pit->second->access_container_shared([&](ContainerType* c) { own = c && c->count(method_name); });
+                                    pit_props->access_container_shared([&](ContainerType* c) { own = c && c->count(method_name); });
                                     if (!own) is_bi = false;
                                 }
                                 if (is_fn || is_lam || is_bi) {
@@ -8052,11 +8857,45 @@ public:
         // parent's constructor, super(name, 4) - write super().__init__(name, 4)).
         if (cn->callee->type() == NodeType::SUPER) {
             Node* owner = nullptr; Value self;
-            superArgs(cn.get(), ctx, owner, self);
+            superArgs(cn, ctx, owner, self);
             return makeSuperProxy(owner, self, ctx);
         }
 
         Value callee = evalNode(cn->callee, ctx);
+
+        // ── A plain function called with plain arguments (round 81) ──────
+        // A def or lambda whose parameters are all plain names, given exactly
+        // that many positional arguments: what the general path below does
+        // for it - its arguments evaluated in order, a scope over the one it
+        // closes over, each parameter bound - without the lookups in
+        // func_names / func_ast_nodes / closure_contexts (the function's
+        // object holds its code and scope), the argument vector, the
+        // keyword map and the parameter analysis, which the nodes remember.
+        if (heapKind(callee) == HK_FUNC) {
+            if (__builtin_expect(cn->plain_args < 0, 0)) cn->plain_args = plainCallArgs(cn) ? 1 : 0;
+            Node* code = static_cast<nyheap::Func*>(callee.value.o)->code;
+            const size_t na = cn->args.size();
+            const std::vector<std::string>* names = (cn->plain_args && code && na <= kFastArgs) ? simpleParams(code) : nullptr;
+            if (names && names->size() == na && astSpecOn()) {
+                ArgBuf argv;
+                for (size_t i = 0; i < na; i++) argv.push(evalNode(cn->args[i], ctx));
+                nyheap::Func* fo = static_cast<nyheap::Func*>(callee.value.o);
+                Context* cp = fo->scope ? scopeOf(fo->scope) : ctx;
+                const bool is_def = code->type() == NodeType::FUNCTION;
+                Context* fc = is_def ? new Context(runner, static_cast<FunctionNode*>(code)->name, nullptr, nullptr, cp)
+                                     : new Context(runner, "<lambda>", nullptr, nullptr, cp);
+                CtxReaper _reap_fast(this, fc);
+                // copied, not moved: the arguments stay referenced until the
+                // call is over, as the general path's argument vector keeps them
+                // (so what they release dies in the same order)
+                if (paramsDistinct(code))   // a fresh scope, distinct names: appended
+                    for (size_t i = 0; i < na; i++) fc->container->append_new((*names)[i], Value(argv[i]));
+                else
+                    for (size_t i = 0; i < na; i++) fc->defineByName((*names)[i], argv[i]);
+                if (is_def) return runFunctionBody(static_cast<FunctionNode*>(code), fc);
+                return runLambdaBody(static_cast<LambdaNode*>(code), fc);
+            }
+        }
 
         // Evaluate arguments (handles keyword args, *spread, **spread)
         std::vector<Value> args;
@@ -8104,7 +8943,7 @@ public:
                 if (it != func_names.end()) fname = it->second;
             }
         }
-        if (fname.empty()) fname = callee.token.value;
+        if (fname.empty()) fname = Value::token_default().value;   // round 81: a Value has no token of its own ("End")
         if (fname.find("__builtin__:") == 0) {
             std::string builtin = fname.substr(12);
             // Flatten kwargs for builtins that accept them (key=, reverse=, default=)
@@ -8359,8 +9198,10 @@ public:
     // (method ptr, instance ptr) -> binding, so re-reading the same method off
     // the same object reuses one binding while it is alive.
     std::map<std::pair<void*, void*>, nyheap::Bound*> bound_cache_;
-    std::map<void*, void*> instance_to_class; // instance ptr -> class node ptr
-    std::map<void*, Context*> instance_properties;
+    // Hashed (round 81; never iterated, so their order never showed): a
+    // tree lookup per attribute access cost log2(live instances) steps.
+    std::unordered_map<void*, void*> instance_to_class; // instance ptr -> class node ptr
+    std::unordered_map<void*, Context*> instance_properties;
     std::map<std::string, void*> class_by_name; // className -> class node ptr
     std::vector<std::string> super_parent_stack; // for chained super() calls
     std::map<void*, std::string> class_parent; // class node ptr -> parent class name
@@ -8370,6 +9211,7 @@ public:
     std::map<void*, Context*> class_ctx_map_; // class node ptr -> evaluated class body context (for decorators); owns a reference
     void setClassContext(void* class_node, Context* c) {
         nygc::incref(c);
+        specInvalidate();   // round 81: the method caches remember class namespaces
         Context*& slot = class_ctx_map_[class_node];
         Context* old = slot;
         slot = c;
@@ -8440,7 +9282,7 @@ public:
             // property(fn) — tag the function value with __property__ marker
             any_property_ = true;
             if (!args.empty() && args[0].type == ValueType::USERDATA && args[0].value.p) {
-                func_names[args[0].value.p] += "__property__";
+                func_names[args[0].value.p] += "__property__"; specInvalidate();   // round 81: a cached method may change kind
                 return args[0];
             }
             return NONE_VALUE;
@@ -8448,7 +9290,7 @@ public:
         if (name_orig == "staticmethod") {
             // staticmethod(fn) — tag with __static__ so it's called without self
             if (!args.empty() && args[0].type == ValueType::USERDATA && args[0].value.p) {
-                func_names[args[0].value.p] += "__static__";
+                func_names[args[0].value.p] += "__static__"; specInvalidate();
                 return args[0];
             }
             return NONE_VALUE;
@@ -8456,7 +9298,7 @@ public:
         if (name_orig == "classmethod") {
             // classmethod(fn) — tag with __classmethod__
             if (!args.empty() && args[0].type == ValueType::USERDATA && args[0].value.p) {
-                func_names[args[0].value.p] += "__classmethod__";
+                func_names[args[0].value.p] += "__classmethod__"; specInvalidate();
                 return args[0];
             }
             return NONE_VALUE;
@@ -8499,6 +9341,10 @@ public:
             result = dispatch_pyrandom(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
             result = dispatch_pyjson(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
         }
+        // isinstance: what dispatch_tensor does with it, without the ~600
+        // names compared on the way (the dispatchers before it know no
+        // isinstance; round 81)
+        if (name.size() == 10 && name == "isinstance") return builtin_isinstance(*this, args, ctx);
         // Shared tensor kernels first: they replace the older per-module
         // implementations of the same names (see include/NyTensor.hpp).
         result = dispatch_nt(*this, name, args, ctx); if (result.type != ValueType::UNDEFINED) return result;
@@ -8533,7 +9379,7 @@ public:
 
 
     // ─── COLLECTIONS ────────────────────────────────────────────────────
-    Value evalList(node_ptr node, Context* ctx) {
+    Value evalList(const node_ptr& node, Context* ctx) {
         // A TupleNode is not a ListNode (only laid out alike): read the
         // elements through the node's own type.
         bool is_tuple = (node->type() == NodeType::TUPLE);
@@ -8541,20 +9387,27 @@ public:
             ? static_pointer_cast<TupleNode>(node)->elements
             : static_pointer_cast<ListNode>(node)->elements;
         auto* obj = new Object((Runnable*)runner, is_tuple ? "tuple" : "list", Type::LIST);
+        // round 81: the keys are new and distinct - each appended at once
+        // (Object::set inserted it after looking for it; the same entries in
+        // the same order)
+        ContainerType& m = *obj->container;
+        m.reserve(elements.size() + 2);
         int idx = 0;
+        char buf[24];
         for (auto& el : elements) {
-            obj->set(std::to_string(idx++), evalNode(el, ctx));
+            Value v = evalNode(el, ctx);
+            m.append_new(std::string(decKey(idx++, buf)), std::move(v));
         }
-        obj->set("__len__", Value((int)idx));
-        if (is_tuple) obj->set("__tuple__", Value(1));
+        m.append_new(std::string("__len__"), Value((int)idx));
+        if (is_tuple) m.append_new(std::string("__tuple__"), Value(1));
         return Value((Collectable*)obj);
     }
 
-    Value evalMap(node_ptr node, Context* ctx) {
-        auto mn = static_pointer_cast<MapNode>(node);
+    Value evalMap(const node_ptr& node, Context* ctx) {
+        auto* mn = static_cast<MapNode*>((node).get());
         auto* cont = new Object((Runnable*)runner, "map", Type::MAP);
         for (auto& e : mn->entries) {
-            auto me = static_pointer_cast<MapEntryNode>(e);
+            auto* me = static_cast<MapEntryNode*>((e).get());
             Value key = evalNode(me->key, ctx);
             Value val = evalNode(me->val, ctx);
             // Use string key for map storage
@@ -8563,7 +9416,7 @@ public:
         return Value((Collectable*)cont);
     }
 
-    Value evalRange(node_ptr node, Context* ctx) {
+    Value evalRange(const node_ptr& node, Context* ctx) {
         auto rn = static_pointer_cast<RangeNode>(node);
         Value start = evalNode(rn->start, ctx);
         Value end = evalNode(rn->end_node, ctx);
@@ -8590,7 +9443,7 @@ public:
     // AttributeError, whatever the object (round 75: it read none, and
     // library code probed optional attributes that way). Graceful forms:
     // getattr(o, n, d), hasattr, `o?.attr` and `o?.attr ?? d`.
-    Value evalAttribute(node_ptr node, Context* ctx) {
+    Value evalAttribute(const node_ptr& node, Context* ctx) {
         auto* an = static_cast<AttributeNode*>(node.get());
         {
             Value sv;
@@ -8601,19 +9454,45 @@ public:
         // namespace (a Value is not cheap to copy: it carries a Token) -
         // unless its class defines __getattribute__ (round 77).
         if (obj.type == ValueType::USERDATA && obj.value.p && !(any_getattribute_ && getattributeHook(obj))) {
-            auto pit = instance_properties.find(obj.value.p);
-            if (pit != instance_properties.end() && pit->second && pit->second->container) {
-                auto fit = pit->second->container->find(an->attr);
-                if (fit != pit->second->container->end() && !isPropertyGetter(fit->second)
-                    && (data_descr_names_.empty() || !data_descr_names_.count(an->attr)))   // round 78
-                    return fit->second;
+            Context* pc = instPropsOf(obj);
+            if (pc && pc->container) {
+                // Round 81: the field's slot in the instance's scope, cached
+                // in the node and checked (the key still there) before use -
+                // instances of a class mostly lay their fields out alike.
+                const auto* kv = fieldAt(pc->container, an->attr, an->slot_hint);
+                // whether some class holds a data descriptor of this name
+                // (round 78), remembered by the node while the set of such
+                // names is unchanged (round 81)
+                if (an->dd_ver != dd_names_ver_ || !astSpecOn()) {
+                    an->dd_hit = !data_descr_names_.empty() && data_descr_names_.count(an->attr);
+                    an->dd_ver = dd_names_ver_;
+                }
+                if (kv && !isPropertyGetter(kv->second) && !an->dd_hit)
+                    return kv->second;
             }
         }
         Value v;
+        // a class attribute or a method read as a value (round 81)
+        if (astSpecOn() && !any_getattribute_ && obj.type == ValueType::USERDATA && obj.value.p
+            && classLoadFast(an, obj, ctx, v)) return v;
         if (getAttrValue(obj, an->attr, ctx, v)) return v;
         return missingAttribute(obj, an->attr, node.get());
     }
+    // The entry of `key` in a scope's map, trying the slot `hint` remembers
+    // first and remembering where it was found (round 81: an inline cache of
+    // the slot, validated by the key it holds, as the VM's are).
+    static const ContainerType::value_type* fieldAt(const ContainerType* m, const std::string& key, uint32_t& hint) {
+        const ContainerType::value_type* kv = astSpecOn() ? m->slot_at(hint) : nullptr;
+        if (kv && kv->first == key) return kv;
+        long n = m->index_of(key);
+        if (n < 0) return nullptr;
+        hint = (uint32_t)n;
+        return m->slot_at((size_t)n);
+    }
     bool isPropertyGetter(const Value& v) {
+        // round 81: only property() tags a function "__property__", and it
+        // sets any_property_ first
+        if (!any_property_) return false;
         if (v.type != ValueType::USERDATA || !v.value.p) return false;
         auto fn_it = func_names.find(v.value.p);
         return fn_it != func_names.end() && fn_it->second.find("__property__") != std::string::npos;
@@ -8692,6 +9571,61 @@ public:
         return getAttrValue(obj, name, ctx, v, false) || hasMethodMember(obj, name);
     }
 
+    // obj.attr found in the namespace of class_node, an MRO class of
+    // class_ptr (getAttrValue's last steps for it, round 81: its own
+    // function, which classLoadFast calls too): a property's getter run, a
+    // descriptor's __get__, a classmethod bound to the class, a method
+    // bound to an instance, else the value itself.
+    bool classNsResult(const Value& cv, const Value& obj, void* class_ptr, Node* class_node, Context* ctx, bool bind, Value& out) {
+        if (cv.type == ValueType::NONE) { out = cv; return true; }   // `x = None` in the class body
+        // Check if this is a @property getter — invoke it with self
+        if (cv.type == ValueType::USERDATA && cv.value.p) {
+            auto fn_it = func_names.find(cv.value.p);
+            if (fn_it != func_names.end() && fn_it->second.find("__property__") != std::string::npos) {
+                void* pst = cv.value.p;
+                auto pit2 = func_ast_nodes.find(cv.value.p);
+                if (pit2 != func_ast_nodes.end()) pst = pit2->second;
+                Node* raw = (Node*)pst;
+                if (raw && raw->type() == NodeType::FUNCTION) {
+                    auto fn = static_cast<FunctionNode*>(raw);
+                    Context* cp = ctx;
+                    auto cit2 = closure_contexts.find(cv.value.p);
+                    if (cit2 != closure_contexts.end()) cp = scopeOf(cit2->second);
+                    Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
+                    CtxReaper _reap_prop2(this, fc);
+                    fc->defineByName("self", obj);
+                    if (!fn->params.empty()) fc->defineByName(fn->params[0]->value(), obj);   // def p(s) (round 78)
+                    out = runFunctionBody(fn, fc);
+                    return true;
+                }
+            }
+        }
+        // A descriptor (an object whose class defines __get__):
+        // the attribute is what its __get__ gives. Not with
+        // bind=false: the call that follows runs it (once).
+        if (bind && descriptorGet(cv, obj, class_ptr, ctx, out, false, class_node)) return true;
+        // A method read as a value off an INSTANCE must carry its
+        // instance with it, or `self` is lost at call time.
+        // bind=false (evalCall's method path, hasMemberNoEval):
+        // only the kind is looked at, so no heap object is made
+        // for a binding that would be freed right after the call.
+        // A classmethod read as a value (getattr(Cls, "cm"),
+        // f = obj.cm) is bound to the receiver's class, as
+        // Python's classmethod descriptor binds it; it used to
+        // come back unbound, so calling it lacked `cls`.
+        if (bind && cv.type == ValueType::USERDATA && cv.value.p
+            && fnTag(func_names, cv.value.p).find("__classmethod__") != std::string::npos) {
+            Value clsv;
+            clsv.type = ValueType::USERDATA;
+            clsv.value.p = class_ptr;
+            out = makeBoundClassMethod(cv, clsv);
+            return true;
+        }
+        if (bind && instance_to_class.count(obj.value.p)) { out = makeBoundMethod(cv, obj); return true; }
+        out = cv;
+        return true;
+    }
+
     // obj.attr for a value in hand: true with the value in `out`, false when
     // obj has no such attribute - nothing is raised for that. Property
     // getters and __getattr__ run, and what they raise propagates. `bind`
@@ -8721,19 +9655,21 @@ public:
         }
         // Check instance properties first (and invoke @property getters)
         if (obj.type == ValueType::USERDATA && obj.value.p) {
-            auto pit = instance_properties.find(obj.value.p);
-            if (pit != instance_properties.end() && pit->second && pit->second->container) {
+            // (round 81: the scope, not the table's iterator, is kept - the
+            // table is hashed now, and the class lookup below may add to it)
+            Context* pc = instPropsOf(obj);
+            if (pc && pc->container) {
                 // Present even when it holds undefined (self.x = undefined).
-                auto fit0 = pit->second->container->find(attr);
+                auto fit0 = pc->container->find(attr);
                 // A data descriptor of the class (a property, an object with
                 // __set__ / __delete__) wins over the instance's own field of
                 // that name, as in Python (round 78: the field was read
                 // first): the class lookup below reads it.
                 // A slot's member descriptor (round 79) reads that field.
-                if (fit0 != pit->second->container->end() && !data_descr_names_.empty() && classDataDescriptor(obj, attr)
+                if (fit0 != pc->container->end() && !data_descr_names_.empty() && classDataDescriptor(obj, attr)
                     && !isSlotOf(obj, attr))
-                    fit0 = pit->second->container->end();
-                if (fit0 != pit->second->container->end()) {
+                    fit0 = pc->container->end();
+                if (fit0 != pc->container->end()) {
                     const Value& v = fit0->second;
                     // Check if this is a @property — if so, call it with self
                     if (v.type == ValueType::USERDATA && v.value.p) {
@@ -8845,6 +9781,7 @@ public:
             // If obj is an instance, find its class; if it IS a class, use directly
             void* class_ptr = obj.value.p;
             auto inst_it = instance_to_class.find(class_ptr);
+            const bool was_inst = inst_it != instance_to_class.end();   // round 81: the iterator is not kept (hashed table)
             if (inst_it != instance_to_class.end()) class_ptr = inst_it->second;
             void* ast_ptr = class_ptr;
             auto ast_it = func_ast_nodes.find(class_ptr);
@@ -8862,7 +9799,7 @@ public:
                 // a class's __name__ / __qualname__ is its own, never a base's
                 // namespace entry (round 80: a dataclass(slots=True) base's
                 // __qualname__ named its subclasses)
-                if (mro_node != mro.front() && inst_it == instance_to_class.end() && (attr == "__qualname__" || attr == "__name__")) continue;
+                if (mro_node != mro.front() && !was_inst && (attr == "__qualname__" || attr == "__name__")) continue;
                 class_node = mro_node;
                 auto* cn = static_cast<ClassNode*>(class_node);
                 // Check class body context (handles @staticmethod, @property, class vars).
@@ -8877,55 +9814,7 @@ public:
                         auto own = ctx_it->second->container->find(attr);
                         if (own != ctx_it->second->container->end()) cv = own->second;
                     }
-                    if (cv.type == ValueType::NONE) { out = cv; return true; }   // `x = None` in the class body
-                    if (cv.type != ValueType::UNDEFINED) {
-                        // Check if this is a @property getter — invoke it with self
-                        if (cv.type == ValueType::USERDATA && cv.value.p) {
-                            auto fn_it = func_names.find(cv.value.p);
-                            if (fn_it != func_names.end() && fn_it->second.find("__property__") != std::string::npos) {
-                                void* pst = cv.value.p;
-                                auto pit2 = func_ast_nodes.find(cv.value.p);
-                                if (pit2 != func_ast_nodes.end()) pst = pit2->second;
-                                Node* raw = (Node*)pst;
-                                if (raw && raw->type() == NodeType::FUNCTION) {
-                                    auto fn = static_cast<FunctionNode*>(raw);
-                                    Context* cp = ctx;
-                                    auto cit2 = closure_contexts.find(cv.value.p);
-                                    if (cit2 != closure_contexts.end()) cp = scopeOf(cit2->second);
-                                    Context* fc = new Context(runner, fn->name, nullptr, nullptr, cp);
-                                    CtxReaper _reap_prop2(this, fc);
-                                    fc->defineByName("self", obj);
-                                    if (!fn->params.empty()) fc->defineByName(fn->params[0]->value(), obj);   // def p(s) (round 78)
-                                    out = runFunctionBody(fn, fc);
-                                    return true;
-                                }
-                            }
-                        }
-                        // A descriptor (an object whose class defines __get__):
-                        // the attribute is what its __get__ gives. Not with
-                        // bind=false: the call that follows runs it (once).
-                        if (bind && descriptorGet(cv, obj, class_ptr, ctx, out, false, class_node)) return true;
-                        // A method read as a value off an INSTANCE must carry its
-                        // instance with it, or `self` is lost at call time.
-                        // bind=false (evalCall's method path, hasMemberNoEval):
-                        // only the kind is looked at, so no heap object is made
-                        // for a binding that would be freed right after the call.
-                        // A classmethod read as a value (getattr(Cls, "cm"),
-                        // f = obj.cm) is bound to the receiver's class, as
-                        // Python's classmethod descriptor binds it; it used to
-                        // come back unbound, so calling it lacked `cls`.
-                        if (bind && cv.type == ValueType::USERDATA && cv.value.p
-                            && fnTag(func_names, cv.value.p).find("__classmethod__") != std::string::npos) {
-                            Value clsv;
-                            clsv.type = ValueType::USERDATA;
-                            clsv.value.p = class_ptr;
-                            out = makeBoundClassMethod(cv, clsv);
-                            return true;
-                        }
-                        if (bind && instance_to_class.count(obj.value.p)) { out = makeBoundMethod(cv, obj); return true; }
-                        out = cv;
-                        return true;
-                    }
+                    if (cv.type != ValueType::UNDEFINED) return classNsResult(cv, obj, class_ptr, class_node, ctx, bind, out);   // (round 81: its own function)
                 }
                 // Check class_vars_ (mutable class-level variables set at runtime)
                 std::string cv_key = cn->name + "." + attr;
@@ -9487,8 +10376,8 @@ public:
     }
 
     // ─── RETURN ─────────────────────────────────────────────────────────
-    Value evalReturn(node_ptr node, Context* ctx) {
-        auto rn = static_pointer_cast<ReturnNode>(node);
+    Value evalReturn(const node_ptr& node, Context* ctx) {
+        auto* rn = static_cast<ReturnNode*>((node).get());
         Value val = rn->expr ? evalNode(rn->expr, ctx) : NONE_VALUE;
         FlowState& f = flow();
         if (ctx && f.fast_ctx == ctx) { f.value = val; f.pending = 1; return val; }
@@ -9563,7 +10452,7 @@ public:
         ctx->defineByName(target->value(), v);
     }
 
-    Value evalComprehensionNode(node_ptr node, Context* ctx) {
+    Value evalComprehensionNode(const node_ptr& node, Context* ctx) {
         auto cn = static_pointer_cast<ComprehensionNode>(node);
         // (x for x in it): a lazy generator, not a list (src/NyGen.cpp).
         if (cn->kind == ComprehensionNode::GEN) return nygen::make_genexpr(*this, node, ctx);
@@ -9636,7 +10525,7 @@ public:
         return lst;
     }
 
-    Value evalComprehension(node_ptr node, Context* ctx) {
+    Value evalComprehension(const node_ptr& node, Context* ctx) {
         auto cn = static_pointer_cast<ComplexNode>(node);
         if (cn->items.size() < 2) return NONE_VALUE;
         // List comprehension: [expr for var in iterable if cond]
@@ -11153,8 +12042,26 @@ public:
         return Value(true);
     }
 
-    Value evalTry(node_ptr node, Context* ctx) {
-        auto tn = static_pointer_cast<TryNode>(node);
+    // A return, break or continue left a try's body, else clause or handler
+    // by the pending flag (round 81; `fast` below): the finally body runs
+    // with the flag cleared, then the flow goes on - unless the finally body
+    // itself returned, broke, continued or raised, which replaces it, as it
+    // does when the flow is thrown.
+    void leaveWithPending(FlowState& f, const node_ptr& fin, Context* ctx) {
+        if (!fin) return;
+        int p = f.pending;
+        Value v = std::move(f.value);
+        f.pending = 0;
+        f.value = NONE_VALUE;
+        evalNode(fin, ctx);
+        if (!f.pending) { f.pending = p; f.value = std::move(v); }
+    }
+    // `fast` (round 81): the statement runs without SuspendFast, so a return
+    // or break in its clauses sets the pending flag instead of throwing;
+    // each clause is checked for it as it ends. Otherwise as before.
+    Value evalTry(const node_ptr& node, Context* ctx, bool fast = false) {
+        auto* tn = static_cast<TryNode*>(node.get());
+        FlowState& fl = flow();
         Value result = NONE_VALUE;
         // The finally body runs on every way out: normal completion, return,
         // break/continue, an exception no clause matches (which then
@@ -11179,6 +12086,7 @@ public:
         if (raised && __builtin_expect(nytrace::t_hooks & nytrace::ANY, 0)) pyEvException(exc);   // round 79
 
         if (!raised) {
+            if (fast && fl.pending) { leaveWithPending(fl, tn->finally_clause, ctx); return result; }   // round 81
             if (tn->else_clause) {
                 try { result = evalNode(tn->else_clause, ctx); }
                 catch (nython::node::YieldSignal&) { throw; }
@@ -11190,6 +12098,7 @@ public:
                 }
                 catch (std::exception& e3) { tbSee(excFromCpp(e3.what())); run_finally_exc(); throw; }
                 catch (...) { run_finally(); throw; }
+                if (fast && fl.pending) { leaveWithPending(fl, tn->finally_clause, ctx); return result; }   // round 81
             }
             run_finally();
             return result;
@@ -11248,6 +12157,9 @@ public:
         }
         catch (std::exception& e2) { std::string f3 = excFromCpp(e2.what()); tbHandlerExit(f3); tbSee(f3); run_finally_exc(); throw; }
         catch (...) { run_finally(); throw; }
+        // a return/break/continue left the handler: as the thrown one did
+        // (the finally body, no pyExcHandled) - round 81
+        if (fast && fl.pending) { leaveWithPending(fl, tn->finally_clause, ctx); return result; }
         if (__builtin_expect(nytrace::t_hooks & nytrace::ANY, 0)) pyExcHandled();   // round 79
         run_finally();
         return result;
@@ -11262,9 +12174,17 @@ public:
     // propagate.
     // The storage of a new instance: a heap object (nyheap::Inst) that owns
     // its field scope and every side-table entry keyed by its identity.
+    // Where an Inst's identity (its tag) sits in it, measured on the first
+    // instance made (round 81): the object of a live instance's identity.
+    ptrdiff_t inst_tag_off_ = -1;
+    nyheap::Inst* instObjectOf(void* p) const {
+        if (inst_tag_off_ < 0 || !p || !instance_to_class.count(p)) return nullptr;
+        return reinterpret_cast<nyheap::Inst*>(static_cast<char*>(p) - inst_tag_off_);
+    }
     Value newInstance(const std::string& className, void* class_ptr) {
         auto* io = new nyheap::Inst(this, "__instance__:" + className, class_ptr);
         void* ip = (void*)&io->tag;
+        if (inst_tag_off_ < 0) inst_tag_off_ = (char*)ip - (char*)io;
         Value instance = nyheap::userValue(io, ip);
         instance_to_class[ip] = class_ptr;
         func_names[ip] = "__instance__:" + className;
@@ -11340,7 +12260,7 @@ public:
         runConstructor(instance, args, kw, ctx);
         return instance;
     }
-    Value evalRaise(node_ptr node, Context* ctx) {
+    Value evalRaise(const node_ptr& node, Context* ctx) {
         auto rn = static_pointer_cast<RaiseNode>(node);
         if (!rn->expr) {
             // Bare `raise`: the exception the enclosing except clause is
@@ -11397,7 +12317,7 @@ public:
         throw std::string(v.toString());
     }
 
-    Value evalAssert(node_ptr node, Context* ctx) {
+    Value evalAssert(const node_ptr& node, Context* ctx) {
         auto an = static_pointer_cast<AssertNode>(node);
         if (!isTruthy(evalNode(an->condition, ctx))) {
             std::string msg;
@@ -12030,7 +12950,7 @@ public:
         }
         return rest.empty() ? package : package + "." + rest;
     }
-    Value evalImport(node_ptr node, Context* ctx) {
+    Value evalImport(const node_ptr& node, Context* ctx) {
         auto in_node = static_pointer_cast<ImportNode>(node);
         std::string module_name = in_node->module_name;
         // Strip quotes if present
@@ -12969,7 +13889,7 @@ public:
         return NONE_VALUE;
     }
 
-        Value evalEnum(node_ptr node, Context* ctx) {
+        Value evalEnum(const node_ptr& node, Context* ctx) {
         auto en = static_pointer_cast<EnumNode>(node);
         // Create enum as Object with only named members (no numeric keys)
         auto* obj = new Object((Runnable*)runner, en->name, Type::MAP);
@@ -12988,7 +13908,7 @@ public:
         return enum_val;
     }
 
-    Value evalDelete(node_ptr node, Context* ctx) {
+    Value evalDelete(const node_ptr& node, Context* ctx) {
         auto dn = static_pointer_cast<DeleteNode>(node);
         if (dn->target->type() == NodeType::VARIABLE) {
             // del x unbinds the nearest x: reading it afterwards is a
@@ -13129,6 +14049,7 @@ public:
                 if (cit != class_ctx_map_.end() && cit->second && cit->second->container && cit->second->container->erase(name)) {
                     if (auto* cn = dynamic_cast<ClassNode*>((Node*)(ast_it != func_ast_nodes.end() ? ast_it->second : obj.value.p))) {
                         class_vars_.erase(cn->name + "." + name);
+                        specInvalidate();   // round 81
                         // not read again from the class body (round 77)
                         class_vars_deleted_.insert(cn->name + "." + name);
                     }
@@ -13153,7 +14074,7 @@ public:
 
     // ── evalMacroCall ─────────────────────────────────────────────────────────
     // Invokes a user-registered Nython macro handler with collected token args.
-    Value evalMacroCall(node_ptr node, Context* ctx) {
+    Value evalMacroCall(const node_ptr& node, Context* ctx) {
         auto* mn = static_cast<MacroCallNode*>(node.get());
         auto& reg = nython::DynamicLangRegistry::instance();
 
@@ -13177,7 +14098,7 @@ public:
 
     // ── evalDynBinop ──────────────────────────────────────────────────────────
     // Evaluates lhs and rhs, then calls the registered handler(lhs, rhs).
-    Value evalDynBinop(node_ptr node, Context* ctx) {
+    Value evalDynBinop(const node_ptr& node, Context* ctx) {
         auto* dn = static_cast<DynBinopNode*>(node.get());
         auto& reg = nython::DynamicLangRegistry::instance();
 
@@ -13331,8 +14252,7 @@ public:
         return (n && n->type() == NodeType::CLASS) ? n : nullptr;
     }
     bool isInstanceValue(const Value& v) {
-        return v.type == ValueType::USERDATA && v.value.p && !string_ptrs_.count(v.value.p)
-               && instance_to_class.count(v.value.p);
+        return isInstanceVal(v);   // round 81: the same test (it was written twice)
     }
     // ── Classes deriving from builtin types (round 77) ──────────────────
     // An instance of `class MyInt(int)` holds its value - the payload - in
@@ -13459,7 +14379,7 @@ public:
         return NONE_VALUE;
     }
     void markSlots(const Value& cls, int flags) {
-        if (Node* cn = classNodeOfValue(cls)) slot_flags_[cn] = flags;
+        if (Node* cn = classNodeOfValue(cls)) { slot_flags_[cn] = flags; specInvalidate(); }   // (round 81: store caches read it)
     }
     int slotFlags(const Value& cls) {
         Node* cn = classNodeOfValue(cls);
@@ -13481,8 +14401,13 @@ public:
         void* p = obj.value.p;
         instance_to_class[p] = cls.value.p;
         func_names[p] = tag;
-        if (auto* io = dynamic_cast<nyheap::Inst*>(obj.value.o)) { io->tag = tag; io->cls = cls.value.p; }
-        mro_cache_.clear();
+        // The instance's object is found from its identity even when this
+        // value does not own it (round 81: instClassNode reads the class
+        // from the object, so the two must never disagree).
+        nyheap::Inst* io = dynamic_cast<nyheap::Inst*>(obj.value.o);
+        if (!io || (void*)&io->tag != p) io = instObjectOf(p);
+        if (io) { io->tag = tag; io->cls = cls.value.p; }
+        mro_cache_.clear(); specInvalidate();
     }
     Value unwrapPayload(const Value& v) { Value p; return any_payload_ && payloadOf(v, p) ? p : v; }
     void unwrapPayloadArgs(std::vector<Value>& args) {
@@ -14332,7 +15257,10 @@ public:
     // body does not run here: the call makes the generator, which runs the
     // body on a coroutine of its own, a step per next() (src/NyGen.cpp).
     Value runFunctionBody(FunctionNode* fn, Context* fc) {
-        if (bodyYields(fn->body)) return nygen::make_function_gen(*this, fn, fc);
+        // whether the body yields, remembered by the def (round 81: a hash
+        // lookup per call)
+        if (__builtin_expect(fn->body_yields < 0, 0)) fn->body_yields = bodyYields(fn->body) ? 1 : 0;
+        if (fn->body_yields) return nygen::make_function_gen(*this, fn, fc);
         // Calls that do not pass through evalCall (operators, callbacks of
         // builtins) meet the same stack check (see evalCall).
         // (round 81: on the thread's own stack too - and the recursion
@@ -14682,8 +15610,8 @@ public:
     // for an exception - a truthy result suppresses it - and (none, none,
     // none) otherwise. It used to be called with no arguments at all, and
     // its result was ignored.
-    Value evalWith(node_ptr node, Context* ctx) {
-        auto wn = static_pointer_cast<WithNode>(node);
+    Value evalWith(const node_ptr& node, Context* ctx, bool fast = false) {
+        auto* wn = static_cast<WithNode*>(node.get());
         Value v = evalNode(wn->expr, ctx);
         bool managed = isInstanceValue(v);
         Value ctx_val = v;
@@ -14730,13 +15658,29 @@ public:
             if (exit_exc(flow)) return NONE_VALUE;
             throw flow;
         }
+        // round 81 (`fast`): a return/break/continue left the body by the
+        // pending flag - __exit__(None, None, None) runs with it cleared (it
+        // is a call, whose body must not see it), as for the thrown flow
+        if (fast) {
+            FlowState& fl = flow();
+            if (fl.pending) {
+                int p = fl.pending;
+                Value pv = std::move(fl.value);
+                fl.pending = 0;
+                fl.value = NONE_VALUE;
+                exit_plain();
+                fl.pending = p;
+                fl.value = std::move(pv);
+                return result;
+            }
+        }
         // sys.settrace: the with statement's line again as it exits (round 79)
         if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0)) pyEvLineAt(node.get());
         exit_plain();
         return result;
     }
 
-    Value evalNamespace(node_ptr node, Context* ctx) {
+    Value evalNamespace(const node_ptr& node, Context* ctx) {
         auto nn = static_pointer_cast<NameSpaceNode>(node);
         Context* ns_ctx = new Context(runner, nn->name, nullptr, nullptr, ctx);
         CtxReaper _ns_creator(this, ns_ctx);   // its functions hold their own references
@@ -14974,6 +15918,7 @@ public:
             if (keys_owner_ == this) { keys_owner_ = nullptr; nygc::g_keys = nygc::KeyTable(); }
             for (auto& kv : class_vars_) dead.push_back(kv.second);
             class_vars_.clear();
+            specInvalidate();   // round 81
             for (auto& kv : prop_setters_) dead.push_back(kv.second);
             prop_setters_.clear();
             for (auto& kv : prop_setter_target_) dead.push_back(kv.second);
@@ -14990,6 +15935,7 @@ public:
         std::vector<Context*> bodies;
         for (auto& kv : class_ctx_map_) if (kv.second) bodies.push_back(kv.second);
         class_ctx_map_.clear();
+        specInvalidate();   // round 81
         for (Context* c : bodies) { c->gc_clear(); nygc::decref(c); }
         global_ctx->gc_clear();
         nygc::collect(nygc::kGenerations - 1);

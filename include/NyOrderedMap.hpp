@@ -98,6 +98,7 @@ private:
             c0_ = nullptr; more_.clear();
         }
         void swap(Slots& o) noexcept { std::swap(c0_, o.c0_); more_.swap(o.more_); std::swap(n_, o.n_); }
+        size_t chunks_beyond_first() const { return more_.size(); }   // round 81
     };
     Slots slots_;
     // Index cells: kEmpty, kDeleted, or (high 32 bits of the hash << 32 | slot
@@ -105,6 +106,10 @@ private:
     std::vector<uint64_t> index_;
     size_t live_ = 0;
     size_t used_ = 0;              // index cells that are not empty (live + deleted)
+    // Bumped whenever the set of keys changes - a key added or erased, the
+    // map cleared, swapped or assigned (round 81): the interpreter's caches
+    // that a name is NOT in a class namespace check this instead of looking.
+    uint32_t ver_ = 0;
 
     static constexpr uint64_t kEmpty = ~(uint64_t)0, kDeleted = ~(uint64_t)0 - 1;
     static bool is_ref(uint64_t c) { return c < kDeleted; }
@@ -201,6 +206,7 @@ private:
                 size_t n = slots_.size();
                 slots_.emplace(std::move(k), std::move(v), 0);
                 live_++;
+                ver_++;
                 return n;
             }
             index_all();
@@ -215,6 +221,7 @@ private:
         slots_.emplace(std::move(k), std::move(v), h);
         index_[i] = cell_of(h, n);
         live_++;
+        ver_++;
         return n;
     }
     void kill_slot(size_t n) {
@@ -227,6 +234,7 @@ private:
         sl.kv.second = V();
         std::string().swap(sl.kv.first);
         live_--;
+        ver_++;
         // Trailing tombstones are dropped outright.
         while (!slots_.empty() && !slots_.back().live) slots_.pop_back();
     }
@@ -276,10 +284,23 @@ public:
     using const_iterator = Iter<const OrderedMap, const value_type>;
 
     OrderedMap() = default;
-    OrderedMap(const OrderedMap&) = default;
-    OrderedMap(OrderedMap&&) noexcept = default;
-    OrderedMap& operator=(const OrderedMap&) = default;
-    OrderedMap& operator=(OrderedMap&&) noexcept = default;
+    // (round 81: as the defaults, but a map's version is its own)
+    OrderedMap(const OrderedMap& o) : slots_(o.slots_), index_(o.index_), live_(o.live_), used_(o.used_) {}
+    OrderedMap(OrderedMap&& o) noexcept : slots_(std::move(o.slots_)), index_(std::move(o.index_)), live_(o.live_), used_(o.used_) {
+        o.live_ = 0; o.used_ = 0; o.ver_++;
+    }
+    OrderedMap& operator=(const OrderedMap& o) {
+        if (this != &o) { slots_ = o.slots_; index_ = o.index_; live_ = o.live_; used_ = o.used_; ver_++; }
+        return *this;
+    }
+    OrderedMap& operator=(OrderedMap&& o) noexcept {
+        if (this != &o) {
+            slots_ = std::move(o.slots_); index_ = std::move(o.index_); live_ = o.live_; used_ = o.used_;
+            o.live_ = 0; o.used_ = 0; o.ver_++; ver_++;
+        }
+        return *this;
+    }
+    uint32_t version() const { return ver_; }
     OrderedMap(std::initializer_list<value_type> il) { for (auto& p : il) (*this)[p.first] = p.second; }
 
     iterator begin() { return iterator(this, 0); }
@@ -296,18 +317,32 @@ public:
     // each step): slots 0 .. slot_end()-1, nullptr for an erased one.
     size_t slot_end() const { return slots_.size(); }
     const value_type* slot_at(size_t n) const { return n < slots_.size() && slots_[n].live ? &slots_[n].kv : nullptr; }
+    value_type* slot_at_mut(size_t n) { return n < slots_.size() && slots_[n].live ? &slots_[n].kv : nullptr; }   // round 81
     // The slot number holding key k, or -1 (round 80: the VM's inline
     // caches keep it and check the key at that slot on each use).
     long index_of(std::string_view k) const { return find_slot(k); }
+    // The same with the key's hash (hash_key) already known (round 81: the
+    // interpreter's name lookups hash each name once, not at each scope).
+    static uint64_t hash_key(std::string_view k) { return hash_of(k); }
+    long index_of_h(std::string_view k, uint64_t h) const {
+        if (index_.empty()) return find_slot(k);
+        long c = find_cell(k, h, nullptr);
+        return c < 0 ? -1 : (long)slot_of(index_[(size_t)c]);
+    }
     // Adds a key the caller knows is absent (a new call frame's distinct
     // parameter names), without looking for it first (round 80).
     V& append_new(const std::string& k, V&& v) { return slots_[insert_new(std::string(k), std::move(v))].kv.second; }
+    V& append_new(std::string&& k, V&& v) { return slots_[insert_new(std::move(k), std::move(v))].kv.second; }   // round 81: the key moved in
     void reserve(size_t n) { if (n > kSmall && index_.size() < n * 2) { if (index_.empty()) index_all(); rebuild_index(n * 2); } }
-    void clear() { slots_.clear(); index_.clear(); live_ = 0; used_ = 0; }
+    void clear() { slots_.clear(); index_.clear(); live_ = 0; used_ = 0; ver_++; }
     // Empties the map as clear() does (entries destroyed in order) but
     // keeps its storage for the entries to come (round 80: a VM call
     // frame's locals, reused by the next call at that depth).
-    void clear_keep() { slots_.clear_keep(); index_.clear(); live_ = 0; used_ = 0; }
+    void clear_keep() { slots_.clear_keep(); index_.clear(); live_ = 0; used_ = 0; ver_++; }
+    // Whether the map's storage is small enough to keep for reuse once it
+    // is emptied (round 81: Container's map pool) - its first chunk of slots
+    // only, and a small index.
+    bool pool_small() const { return slots_.chunks_beyond_first() == 0 && index_.capacity() <= 64; }
 
     iterator find(std::string_view k) {
         const Slot* sp = nullptr;
@@ -404,6 +439,7 @@ public:
     void swap(OrderedMap& o) noexcept {
         slots_.swap(o.slots_); index_.swap(o.index_);
         std::swap(live_, o.live_); std::swap(used_, o.used_);
+        ver_++; o.ver_++;
     }
     bool operator==(const OrderedMap& o) const {
         if (size() != o.size()) return false;

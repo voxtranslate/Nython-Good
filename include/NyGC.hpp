@@ -47,6 +47,18 @@ enum : uint16_t {
     F_COLLECTING = 16,   // scratch: in the generations being collected
     F_DEALLOC    = 32,   // being destroyed
     F_WEAKREFD   = 64,   // weakref() targets it: tell g_weak_hook when it dies
+    // What kind of object it is (round 81), set once by its constructor, so
+    // the interpreter tells a string, an instance, a function and a
+    // container apart by one bit test instead of a hash or tree lookup in a
+    // side table or a dynamic_cast (NythonExecutor::isStringValue ...).
+    F_KSTR       = 128,  // a nyheap::Str
+    F_KINST      = 256,  // a nyheap::Inst
+    F_KFUNC      = 512,  // a nyheap::Func
+    F_KCONT      = 1024, // a nython::kernel::Container (lists, dicts, scopes ...)
+    // A nyheap::Func an inline cache of the interpreter names (round 81):
+    // its death ends the caches' epoch (NythonExecutor::spec_epoch_), so a
+    // new function at its address is never taken for it.
+    F_KICREF     = 2048,
 };
 // Called when an object with F_WEAKREFD is destroyed (its weak references
 // then give none).
