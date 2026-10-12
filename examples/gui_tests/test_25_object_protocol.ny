@@ -60,8 +60,11 @@ check("parent class_name", p.class_name(), "Base")
 check("type() agrees", type(c), c.class_name())
 
 # ── to_string ────────────────────────────────────────────────────────────────
-check("default to_string", c.to_string(), "<Child instance>")
-check("base to_string", p.to_string(), "<Base instance>")
+# (round 81: the default is str(obj), CPython's <__main__.Child object at 0x...>)
+check("default to_string", c.to_string(), str(c))
+check_true("default to_string's form", c.to_string().startswith("<__main__.Child object at 0x"))
+check("base to_string", p.to_string(), str(p))
+check_true("base to_string's form", p.to_string().startswith("<__main__.Base object at 0x"))
 check("user to_string wins", u.to_string(), "CUSTOM!")
 
 # ── is_a walks the inheritance chain ─────────────────────────────────────────
