@@ -14,6 +14,10 @@ the real IDE headlessly and reports the resident-set growth for:
     live     hover while a live debug session is paused: the Variables
              tree, stack and toolbar repainted (beyond plain hover; round 81)
     profile  hover over the PROFILE panel: table and flame graph (round 81)
+    agent    hover while the AGENT view shows an answer (beyond plain hover;
+             round 82)
+    agentkey typing once the agent's completion model re-ranks the list
+             (round 82)
 
     python3 tools/ide_memprobe.py            # report
     python3 tools/ide_memprobe.py --check    # exit 1 above the ceilings
@@ -32,7 +36,8 @@ from ide_driver import IDE  # noqa: E402
 # KB of resident memory kept, per unit. Measured when these were set:
 # idle 0.0, hover 0.0, typing ~40, scroll ~7 (before this round's fixes:
 # 3.45, 40, 787 and 161).
-CEILINGS = {"idle": 0.5, "hover": 2.0, "typing": 50.0, "scroll": 12.0, "split": 2.0, "live": 2.0, "profile": 2.0}
+CEILINGS = {"idle": 0.5, "hover": 2.0, "typing": 50.0, "scroll": 12.0, "split": 2.0, "live": 2.0, "profile": 2.0,
+            "agent": 2.0, "agentkey": 50.0}
 
 
 def rss_kb(pid):
@@ -153,19 +158,42 @@ def main(argv):
         wait_state(lambda st: st.get("prof_n", 0) > 0 and st.get("panel") == "profile")
         settle(ide)
         results["profile"] = measure(ide, hover, 150, 60)
+        # the AGENT view with an answer (round 82)
+        t = ide.find("app.ny")
+        ide.dblclick(int(t.cx), int(t.cy))
+        settle(ide)
+        base = measure(ide, hover, 150, 60)
+        ide.key("ctrl+shift+p")
+        ide.type("Agent: Ask")
+        ide.key("enter")
+        ide.type("where is greet\n")
+        wait_state(lambda st: st.get("agent_count", 0) >= 1 and st.get("view") == "ai", 120)
+        settle(ide)
+        ag = measure(ide, hover, 150, 60)
+        results["agent"] = (ag[0] - base[0], ag[1], ag[2])
+        # typing with the completion list re-ranked by the agent's model
+        t = ide.find("app.ny", region=(0, 0, 400, 900))
+        ide.dblclick(int(t.cx), int(t.cy))
+        settle(ide)
+
+        def typing2(n):
+            ide.key("ctrl+end")
+            for i in range(n):
+                ide.type("g" if i % 8 else "\n")
+        results["agentkey"] = measure(ide, typing2, 150, 40)
     finally:
         ide.close()
         ide.cleanup()
         shutil.rmtree(root, ignore_errors=True)
     bad = []
-    for k in ["idle", "hover", "typing", "scroll", "split", "live", "profile"]:
+    for k in ["idle", "hover", "typing", "scroll", "split", "live", "profile", "agent", "agentkey"]:
         per, b, a = results[k]
-        unit = "frame" if k == "idle" else ("event" if k != "typing" else "key")
+        unit = "frame" if k == "idle" else ("event" if k not in ("typing", "agentkey") else "key")
         flag = ""
         if per > CEILINGS[k]:
             flag = "  ABOVE CEILING %.1f" % CEILINGS[k]
             bad.append(k)
-        print("%-7s %7.2f KB/%-5s  (rss %d -> %d KB)%s" % (k, per, unit, b, a, flag))
+        print("%-8s %7.2f KB/%-5s  (rss %d -> %d KB)%s" % (k, per, unit, b, a, flag))
     if check and bad:
         return 1
     return 0

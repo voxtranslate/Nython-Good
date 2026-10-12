@@ -1995,6 +1995,123 @@ def sc_hidpi_live(s):
       "hidpi: back at the first scale, the first layout", (st["dpi"], st["W"], st["H"]))
 
 
+# ── the programming agent (round 82, ide_agent.ny) ──────────────────────────
+AGENT_MATH = """def clamp(x: int, lo: int = 0, hi: int = 10) -> int:
+    \"\"\"Clamp x into the range [lo, hi].\"\"\"
+    if lo > hi:
+        raise ValueError("lo > hi")
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+
+def scale(values, factor=2):
+    out = []
+    for v in values:
+        out.append(clamp(v * factor))
+    return out
+"""
+AGENT_LINT = "import os\n\n\ndef check(x, seen=[]):\n    if x == None:\n        return 0\n    return x\n"
+
+
+def sc_agent(s):
+    """The programming agent: @ask/@explain from the Terminal, Review / Fix /
+    Draft Docstring / Generate Tests from the palette; answers in the AGENT
+    view with file:line links; a fix shown as a diff, then applied to the
+    editor as one undoable edit; completions re-ranked by the model trained
+    on the workspace."""
+    s.write("mathx.ny", AGENT_MATH)
+    s.write("lint.ny", AGENT_LINT)
+    ide = s.start()
+    c = s.res.check
+    side = R(48, 30, 270, 900)
+    term = R(318, 690, 1300, 250)
+
+    def to_terminal():
+        # Ctrl+` toggles: press it until the terminal has the focus
+        for _ in range(3):
+            if ide.state()["focus"] == "terminal":
+                return
+            ide.key("ctrl+`")
+
+    to_terminal()
+    ide.type("@ask where is clamp\n")
+    st = s.wait_until(lambda st: st["agent_count"] >= 1, timeout=60)
+    c(st["agent_kind"] == "ask" and st["view"] == "ai" and st["sidebar"], "agent: @ask answers in the AGENT view",
+      (st["agent_kind"], st["view"]))
+    c(st["agent_files"] == 4 and st["agent_trained"] == 4, "agent: the workspace was indexed and learned",
+      (st["agent_files"], st["agent_trained"]))
+    c(st["agent_items"][0] == "1. mathx.ny:1  function clamp", "agent: the best answer, cited", st["agent_items"][:3])
+    f = ide.snap()
+    c(f.has("AGENT", exact=True, region=side) and f.has("1. mathx.ny:1  function clamp", exact=True, region=side),
+      "agent: the view shows the answer")
+    c(f.has("1. mathx.ny:1  function clamp", exact=True, region=term), "agent: and the Terminal its first lines")
+    ide.click_text("1. mathx.ny:1  function clamp", region=side)
+    st = ide.state()
+    c(st["title"] == "mathx.ny" and st["row"] == 0, "agent: a link opens the file at its line", (st["title"], st.get("row")))
+    to_terminal()
+    ide.type("@explain clamp\n")
+    st = s.wait_until(lambda st: st["agent_count"] >= 2, timeout=60)
+    c(st["agent_kind"] == "explain" and "Raises ValueError on line 4: raise ValueError('lo > hi')" in st["agent_items"]
+      and "Called by scale (mathx.ny:12)" in st["agent_items"], "agent: @explain from the facts", st["agent_items"])
+    ide.click_text("Called by scale (mathx.ny:12)", region=side)
+    st = ide.state()
+    c(st["title"] == "mathx.ny" and st["row"] == 11, "agent: a caller's link", st.get("row"))
+    # Review and Fix from the palette, on the open editor
+    ide.key("ctrl+shift+e")
+    s.open_file("lint.ny")
+    palette(s, "Agent: Review File")
+    st = s.wait_until(lambda st: st["agent_count"] >= 3, timeout=60)
+    c(st["agent_kind"] == "review" and [l[1] for l in st["agent_links"] if l[0] == "lint.ny"][0:6] == [1, 1, 4, 4, 5, 5],
+      "agent: review findings at their lines", st["agent_items"])
+    palette(s, "Agent: Fix File")
+    st = s.wait_until(lambda st: st["agent_count"] >= 4, timeout=60)
+    c(st["agent_kind"] == "fix" and st["agent_pending"], "agent: a fix is shown before it is applied", st["agent_items"][:4])
+    f = ide.snap()
+    c(f.has("+def check(x, seen=None):", exact=True, region=side) and f.has("-    if x == None:", exact=True, region=side),
+      "agent: the diff in the view")
+    st = ide.state()
+    c(st["text"] == AGENT_LINT, "agent: nothing changed yet", st["text"])
+    ide.click_text("Apply Fix", region=side)
+    st = ide.state()
+    c(st["agent_applied"] == 1 and st["dirty"] and "def check(x, seen=None):" in st["text"] and "if x is None:" in st["text"]
+      and "import os" not in st["text"], "agent: Apply Fix edits the editor", st["text"])
+    ide.key("ctrl+z")
+    st = ide.state()
+    c(st["text"] == AGENT_LINT, "agent: one Ctrl+Z undoes the whole fix", st["text"])
+    # Draft Docstring for the word under the caret, inserted on request
+    ide.key("ctrl+shift+e")
+    s.open_file("mathx.ny")
+    ide.key("ctrl+g")
+    ide.type("12\n")
+    for _ in range(6):
+        ide.key("right")
+    palette(s, "Agent: Draft Docstring")
+    st = s.wait_until(lambda st: st["agent_count"] >= 5, timeout=60)
+    c(st["agent_kind"] == "doc" and st["agent_pending"] and "        values: Iterated over." in st["agent_items"],
+      "agent: a docstring drafted for the symbol under the caret", st["agent_items"])
+    ide.click_text("Insert Docstring", region=side)
+    st = ide.state()
+    c('    """Scale.' in st["text"] and st["dirty"], "agent: the docstring inserted", st["text"][:400])
+    ide.key("ctrl+s")
+    # Generate Tests: a test module written next to the file, run, passing
+    to_terminal()
+    ide.type("@test clamp\n")
+    st = s.wait_until(lambda st: st["agent_count"] >= 6, timeout=120)
+    c(st["agent_kind"] == "test" and st["agent_ok"] and os.path.exists(os.path.join(s.ws, "test_mathx_clamp.ny")),
+      "agent: Generate Tests writes a module that passes", st["agent_items"])
+    # completions re-ranked by the model of this workspace
+    ide.key("ctrl+shift+e")
+    s.open_file("mathx.ny")
+    ide.key("ctrl+end")
+    ide.type("\nvar y = cl")
+    st = s.wait_until(lambda st: st["agent_rerank_n"] >= 1, timeout=10)
+    c(st["agent_rerank_n"] >= 1, "agent: the completion list re-ranked", st["agent_rerank_n"])
+    ide.key("escape")
+
+
 SCENARIOS = [
     ("boot", sc_boot), ("edit", sc_edit_undo_save), ("clipboard", sc_clipboard_lines),
     ("multicursor", sc_multicursor), ("palette", sc_palette), ("quickopen", sc_quick_open),
@@ -2007,6 +2124,7 @@ SCENARIOS = [
     ("cbtools", sc_cb_tools), ("cbdebug", sc_cb_debug), ("responsive", sc_responsive),
     ("session", sc_session), ("columns", sc_column_select),
     ("split", sc_split), ("window", sc_window_events), ("hidpi", sc_hidpi_live),
+    ("agent", sc_agent),
 ]
 
 

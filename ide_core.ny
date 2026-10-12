@@ -11,6 +11,7 @@
 #                                 Control, Run and Debug, Extensions, ...
 #      IDETools     ide_tools.ny  the Code::Blocks side (build, bookmarks, ...)
 #      IDELive      ide_live.ny   live debugging, the Profile view (round 81)
+#      IDEAgent     ide_agent.ny  the programming agent, the AGENT view (round 82)
 #      NythonIDE    nython_ide.ny state, input routing, frame loop
 #
 #  Commands follow VS Code: an id, a category and a title, and a keybinding.

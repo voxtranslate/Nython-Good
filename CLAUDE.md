@@ -70,6 +70,7 @@ nython/
 ├── ide_tools.ny              ←   Code::Blocks side: build targets, bookmarks,
 │                                folding, snippets, keymaps, wizard, tools
 ├── ide_live.ny               ←   live debugging + the PROFILE panel (round 81)
+├── ide_agent.ny              ←   the programming agent: @ask/@explain/... + AGENT view (round 82)
 ├── ide_editor.ny             ← EditorBuffer, SyntaxHighlighter
 ├── ide_icons.ny              ← icon set: Codicon glyphs, vector fallback
 ├── ide_project.ny            ← workspace / project model
@@ -80,6 +81,8 @@ nython/
 ├── lib/ide_debugserver.ny    ← live debug server (`nython --debug-port N`, DAP)
 ├── lib/ide_debugclient.ny    ← the IDE's side of it
 ├── lib/ide_profile.ny        ← cProfile dump → table, callers, flame graph
+├── lib/aiagent.ny            ← NyxAI / NyxAgent: the offline programming agent (round 82)
+├── lib/nyxai/                ← its parts: facts, index (BM25F), rules, review, testgen, docgen
 ├── tools/                    ← ide_driver.py / ide_e2e.py (drive the real IDE
 │                                headlessly), ide_lint.py, ide_memprobe.py,
 │                                nyshot.py (frame capture → PNG), sweep.py
@@ -388,6 +391,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit100 | 114 | round 81: the self-optimizing interpreter's every cache and its fallback (globals/builtins rebound or shadowed, functions replaced, class attributes and methods changed in a class or a base or deleted, fields shadowing them, `__class__` reassigned, `__get__` added later, big-int overflow, `exec`, closures, generators, recursion, threads, return/break/continue through try/finally/with, builtin values' methods, tracing and profiling mid-loop) - passes on both engines, under python3 and with `NY_ASTSPEC=0` |
 | vm_audit102 | 51 | round 81 follow-ups: a lambda put in a class bound when read as a value, `del C.m` (an override, then the base's), `list.pop`'s integer index (`__index__`, TypeError), UnboundLocalError (both engines, CPython's message; NyScope flags reads of names a function binds), set iterators noticing a size change (passes under python3) |
 | vm_audit101 | 125 | round 81: the live debug server driven over its socket (`--debug-port`, DAP messages: breakpoints with conditions/hit counts/log messages, stepping, pause, stack/scopes/variables by reference, evaluate, setVariable, raised/uncaught exceptions, `--connect`, stdin/argv untouched) and its ring buffer (stepBack/reverseContinue/seek, Why? over the live history); the Profile view's reader on real `-m cProfile [--stacks]` dumps (Nython-only) |
+| vm_audit105 | 118 | round 82: lib/aiagent.ny's NyxAgent on a fixture workspace - `ny_facts`, call/import graphs, BM25F rankings (definitions over uses, call-graph neighbours, incremental, JSON round trip), the rule engine (closure, stratified negation, why), explain/doc/review/fix at exact lines, generated tests that run and pass (doctests, boundaries, a shrunk counterexample, a hang, a .py module under python3), completion MRR before/after training, GitHubLearner over a local http.server (Nython-only) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -1282,6 +1286,32 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
 - A `Value` has no `Token` any more (`Value::token_default()`); heap objects
   carry kind flags (`nygc::F_KSTR/F_KINST/F_KFUNC/F_KCONT`) that
   `heapKind`/`contOf` read instead of the side tables.
+
+## Round 82: NyxAI, a programming agent (see `HANDOFF.md` §0u)
+
+- `lib/aiagent.ny`'s **`NyxAgent`** answers from the workspace's code -
+  offline, deterministic, no model: `ask` (BM25F retrieval with cited
+  file:line snippets), `explain` (facts, call graph, inferences), `test`
+  (writes and runs a unittest module: boundary/random inputs in a child
+  process, doctests, shrunk counterexamples), `doc` (Args/Returns/Raises from
+  the facts), `review` (10 rules that analyse the program) and `fix` (the
+  mechanical fixes as a diff). The parts are `lib/nyxai/` (facts, index,
+  rules, review, testgen, docgen - `# nython: module` files); the round-72
+  class names (NyxAI, CodeKnowledgeBase, ReasoningEngine, GitHubLearner ...)
+  work on them.
+- **`ny_facts(source)`** (`src/builtins/text.cpp`): per-function facts from
+  the real parser - parameters (kinds, defaults, annotations), returns,
+  raises, calls, reads/writes, globals, except clauses, McCabe complexity,
+  fall-off-the-end; classes, imports, unreachable code, bare excepts,
+  `== None`.
+- **Completion**: `lib/nytorch/agent_learn.ny`'s `CompletionRanker` (an
+  online n-gram + cache model with the round-72 category MLP) re-ranks the
+  IDE's completion list once the agent has indexed the workspace.
+- **IDE** (`ide_agent.ny`, `IDEAgent` between IDELive and NythonIDE):
+  `@ask/@explain/@test/@doc/@review/@fix` in the Terminal, "Agent: ..." in
+  the palette, the AGENT view (links, Apply/Discard for a fix or a
+  docstring); e2e `agent`.
+- `nython -m unittest test_x` runs a test module (`lib/unittest.ny`).
 
 ## Transcripts
 
