@@ -855,6 +855,288 @@ exec("def sq(x):\n    return x * x\nclass E:\n    def m(self, x):\n        retur
 e_obj = ns["E"]()
 check("functions and methods defined by exec, through hot sites", [sum(ns["sq"](i) for i in range(10)), sum(e_obj.m(i) for i in range(10))], [285, 295])
 
+# ── return / break / continue through try, finally and with ─────────────────
+# (the interpreter leaves these statements by a flag, not an exception)
+log = []
+def ret_in_try(k):
+    try:
+        if k % 2 == 0:
+            return "even"
+        log.append("odd body")
+    finally:
+        log.append("fin " + str(k))
+    return "odd"
+check("return in try runs finally", [ret_in_try(k) for k in range(4)], ["even", "odd", "even", "odd"])
+check("return in try: finally order", log, ["fin 0", "odd body", "fin 1", "fin 2", "odd body", "fin 3"])
+def fin_overrides(k):
+    try:
+        return "try"
+    finally:
+        if k > 1:
+            return "finally"
+check("a return in finally replaces the try's", [fin_overrides(k) for k in range(4)], ["try", "try", "finally", "finally"])
+def fin_raises(k):
+    try:
+        return k
+    finally:
+        if k == 2:
+            raise ValueError("from finally")
+got = []
+for k in range(4):
+    try:
+        got.append(fin_raises(k))
+    except ValueError as e:
+        got.append(str(e))
+check("an exception from finally replaces the return", got, [0, 1, "from finally", 3])
+def loop_flow():
+    out = []
+    for i in range(8):
+        try:
+            if i == 1:
+                continue
+            if i == 5:
+                break
+            out.append(i)
+        finally:
+            out.append("f" + str(i))
+    else:
+        out.append("else")
+    return out
+check("break and continue in try run finally (no loop else)", loop_flow(), [0, "f0", "f1", 2, "f2", 3, "f3", 4, "f4", "f5"])
+def fin_continue():
+    out = []
+    for i in range(4):
+        try:
+            if i == 2:
+                return "returned"
+        finally:
+            out.append(i)
+            if i == 2:
+                break
+    out.append("after")
+    return out
+check("break in finally cancels the return", fin_continue(), [0, 1, 2, "after"])
+def ret_in_handler(k):
+    try:
+        if k % 3 == 0:
+            raise KeyError(k)
+        return "body"
+    except KeyError:
+        return "handler"
+    else:
+        return "else"
+    finally:
+        log.append("h" + str(k))
+log = []
+check("return in body / handler with else and finally", [ret_in_handler(k) for k in range(4)], ["handler", "body", "body", "handler"])
+check("return in handler: finally each time", log, ["h0", "h1", "h2", "h3"])
+def ret_in_else(k):
+    try:
+        x = k
+    except Exception:
+        return "exc"
+    else:
+        if x > 1:
+            return "else"
+    finally:
+        log.append("e" + str(k))
+    return "end"
+log = []
+check("return in else clause", [ret_in_else(k) for k in range(4)], ["end", "end", "else", "else"])
+check("return in else clause: finally", log, ["e0", "e1", "e2", "e3"])
+def nested_try(k):
+    try:
+        try:
+            if k:
+                return "inner"
+        finally:
+            log.append("in")
+    finally:
+        log.append("out")
+    return "none"
+log = []
+check("return through nested finally blocks", [nested_try(0), nested_try(1)], ["none", "inner"])
+check("nested finally order", log, ["in", "out", "in", "out"])
+class Managed:
+    def __init__(self):
+        self.events = []
+    def __enter__(self):
+        self.events.append("enter")
+        return self
+    def __exit__(self, t, v, tb):
+        self.events.append("exit")
+        self.events.append(t is None)
+        return False
+def with_return(m, k):
+    with m:
+        if k:
+            return "in with"
+        m.events.append("body")
+    return "after"
+mg = Managed()
+check("return in with calls __exit__ (every statement of it)", [with_return(mg, 0), with_return(mg, 1)], ["after", "in with"])
+check("return in with: events", mg.events, ["enter", "body", "exit", True, "enter", "exit", True])
+def with_loop(m):
+    n = 0
+    for i in range(5):
+        with m:
+            if i == 1:
+                continue
+            if i == 3:
+                break
+            n += 1
+    return n
+mg = Managed()
+check("break and continue in with", [with_loop(mg), mg.events.count("exit")], [2, 4])
+def gen_fin():
+    try:
+        yield 1
+        yield 2
+        return
+    finally:
+        log.append("gen fin")
+log = []
+check("return in a generator's try", [list(gen_fin()), log], [[1, 2], ["gen fin"]])
+def try_in_recursion(n):
+    try:
+        if n == 0:
+            return 0
+        return n + try_in_recursion(n - 1)
+    finally:
+        pass
+check("return in try through recursion", try_in_recursion(50), 1275)
+def ret_value_kept():
+    try:
+        return [1, 2]
+    finally:
+        def inner():
+            return "inner value"
+        inner()
+check("a call in finally does not take the pending return", ret_value_kept(), [1, 2])
+
+# ── a builtin value's own method ─────────────────────────────────────────────
+words = ["  Alpha,", "beta.", "Gamma!", "delta"]
+counts = {}
+for rnd in range(N):
+    for w in words:
+        w2 = w.strip(" .,!").lower()
+        counts[w2] = counts.get(w2, 0) + 1
+check("str and dict methods in a hot loop", sorted(counts.items()), [("alpha", N), ("beta", N), ("delta", N), ("gamma", N)])
+shadow = {"get": "the key", "items": 5}
+check("a dict's methods win over its keys", [shadow.get("get"), shadow.get("nope", 0), len(list(shadow.items()))], ["the key", 0, 2])
+acc = []
+for i in range(N):
+    acc.append(i)
+    if i % 3 == 0:
+        acc.pop()
+check("list.append / pop in a hot loop", [len(acc), acc[:4]], [80, [1, 2, 4, 5]])
+tp = (3, 1, 3, 2)
+check("tuple.count / index", [tp.count(3), tp.index(2)], [2, 3])
+try:
+    tp.append(1)
+    check("tuple.append raises", "no error", "AttributeError")
+except AttributeError:
+    check("tuple.append raises", "AttributeError", "AttributeError")
+srt = [5, 3, 9]
+srt.sort(reverse=True)
+check("list.sort keyword arguments", srt, [9, 5, 3])
+check("str methods with keyword arguments", ["a,b,c".split(sep=",", maxsplit=1), "x".center(5, "*")], [["a", "b,c"], "**x**"])
+check("str.format / encode / join", ["{}-{}".format(1, 2), "hé".encode("utf-8"), "-".join(["a", "b"])], ["1-2", b"h\xc3\xa9", "a-b"])
+import json
+check("a module's function of a method's name", json.loads("[1, 2]"), [1, 2])
+class MyList(list):
+    def append(self, x):
+        list.append(self, x * 10)
+ml = MyList()
+for i in range(3):
+    ml.append(i)
+check("a list subclass's own method", list(ml), [0, 10, 20])
+mixed = ["abc", {"k": 1}, [7]]
+seen = []
+for rnd in range(4):
+    for v in mixed:
+        seen.append(v.copy() if not isinstance(v, str) else v.upper())
+check("one site, a str, a dict and a list", seen[:3], ["ABC", {"k": 1}, [7]])
+
+# ── class attributes and methods read as values ──────────────────────────────
+class Const:
+    LIMIT = 10
+    NAME = "c"
+    def meth(self):
+        return "meth"
+class SubConst(Const):
+    pass
+vals = []
+for i in range(N):
+    if i == H:
+        Const.LIMIT = 20
+    vals.append(Const.LIMIT)
+check("a class attribute changed after caching", [vals[0], vals[H - 1], vals[H], vals[-1]], [10, 10, 20, 20])
+vals = []
+for i in range(N):
+    if i == H:
+        SubConst.LIMIT = 99
+    vals.append(SubConst.LIMIT)
+check("a base's attribute shadowed by the subclass later", [vals[0], vals[H], Const.LIMIT], [20, 99, 20])
+vals = []
+for i in range(N):
+    if i == H:
+        del SubConst.LIMIT
+    vals.append(SubConst.LIMIT)
+check("the subclass's attribute deleted: the base's again", [vals[0], vals[H]], [99, 20])
+sc = SubConst()
+vals = []
+for i in range(N):
+    if i == H:
+        sc.NAME = "own"
+    vals.append(sc.NAME)
+check("an instance field shadowing a class attribute later", [vals[0], vals[H], SubConst.NAME], ["c", "own", "c"])
+def replaced_meth(self):
+    return "replaced"
+vals = []
+for i in range(N):
+    if i == H:
+        Const.meth = replaced_meth
+    vals.append(sc.meth())
+    bm = sc.meth
+    vals.append(bm())
+check("a method read as a value, replaced later", [vals[0], vals[1], vals[2 * H], vals[2 * H + 1]], ["meth", "meth", "replaced", "replaced"])
+class WithProp:
+    BASE = 3
+    @property
+    def doubled(self):
+        return self.BASE * 2
+    @classmethod
+    def make(cls):
+        return cls.__name__
+wp = WithProp()
+check("a property and a classmethod read through hot sites", [[wp.doubled for i in range(5)][-1], [WithProp.make() for i in range(5)][-1], [wp.make for i in range(3)][-1]()], [6, "WithProp", "WithProp"])
+class Desc:
+    def __init__(self, v):
+        self.v = v
+class HasDesc:
+    d = Desc(5)
+vals = []
+for i in range(N):
+    if i == H:
+        Desc.__get__ = lambda self, obj, owner: "via get"
+    r = HasDesc.d
+    vals.append(r if isinstance(r, str) else r.v)
+check("__get__ added to a cached attribute's class", [vals[0], vals[H]], [5, "via get"])
+class OtherConst:
+    LIMIT = "other"
+class Swap:
+    LIMIT = "swap"
+sw = Swap()
+vals = []
+for i in range(N):
+    if i == H:
+        sw.__class__ = OtherConst
+    vals.append(sw.LIMIT)
+check("__class__ reassigned under a cached attribute read", [vals[0], vals[H]], ["swap", "other"])
+pairs = [(i % 3, -i) for i in range(12)]
+check("tuples ordered and compared item by item", [sorted(pairs)[:3], (1, 2) in [(0, 0), (1, 2)], [[1, (2, 3)]] == [[1, (2, 3)]], (1, 2) < (1, 3)], [[(0, -9), (0, -6), (0, -3)], True, True, True])
+
 for r in results:
     if r[1]:
         pass_n = pass_n + 1

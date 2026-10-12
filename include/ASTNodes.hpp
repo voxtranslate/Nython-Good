@@ -288,6 +288,25 @@ struct AttributeNode : Node {
     std::unique_ptr<StoreIC[]> sic;
     uint8_t sic_next = 0, sic_skip = 0, sic_backoff = 0;
     uint32_t store_hint = 0;            // the field's slot in the instance's scope
+    // Round 81: for reads of `attr` that a class namespace answers (a class
+    // attribute, a method read as a value), the interpreter's cache
+    // (NythonExecutor::classLoadFast): the receiver's class, whether the
+    // receiver is an instance of it or the class itself, the namespace and
+    // slot that held `attr`, and the namespaces before it in the MRO (none
+    // holding it) with their keys' versions. Owns no reference; valid while
+    // the executor's specialization epoch is the one it was made in.
+    struct LoadIC {
+        void* cls = nullptr;            // nullptr: empty
+        bool inst = false;
+        uint64_t epoch = 0;
+        const void* by = nullptr;
+        Node* owner = nullptr;
+        Context* owner_ctx = nullptr;
+        uint32_t owner_slot = 0;
+        std::vector<std::pair<Context*, uint32_t>> prefix;
+    };
+    std::unique_ptr<LoadIC> lic;
+    uint8_t lic_skip = 0, lic_backoff = 0;
     AttributeNode(Token t, node_ptr o, const std::string& a) : Node(t, NodeType::ATTRIBUTE), object(o), attr(a) {}
     Value eval(Context* ctx) override {
         Value obj = object->eval(ctx);
@@ -435,6 +454,9 @@ struct CallNode : Node {
     uint8_t mic_next = 0;                   // the way the next new class takes
     uint8_t mic_skip = 0;                   // calls left before trying to fill again
     uint8_t mic_backoff = 0;                // how many fills found nothing to cache
+    // Round 81: for `x.m(...)`, the builtin kinds (str, dict, list) whose
+    // method table has m (NythonExecutor::builtinMethodKinds); 0 = not yet known.
+    uint8_t bm_kinds = 0;
     CallNode(Token t, node_ptr c) : Node(t, NodeType::CALL), callee(c), args{} {}
     Node* add(node_ptr n) override { args.push_back(n); return this; }
     std::vector<node_ptr> statements() override { return args; }
