@@ -1284,7 +1284,7 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   carry kind flags (`nygc::F_KSTR/F_KINST/F_KFUNC/F_KCONT`) that
   `heapKind`/`contOf` read instead of the side tables.
 
-## Round 82: the interpreter's remaining costs (see `HANDOFF.md` §0u)
+## Round 82, part A: the interpreter's remaining costs (see `HANDOFF.md` §0u3)
 
 - **Python exceptions travel by the pending flag** on the interpreter
   (`FlowState::pending == kPendExc`, the string in `FlowState::exc` -

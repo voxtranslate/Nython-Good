@@ -3,7 +3,7 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 82, part A — **§0u** (the interpreter's remaining
+Last updated: round 82, part A — **§0u3** (the interpreter's remaining
 costs: Python exceptions travelling by a pending flag instead of C++
 throws, startup 2.5x/4x fewer instructions, loop targets bound from
 enumerate/zip without a tuple; vm_audit103).
