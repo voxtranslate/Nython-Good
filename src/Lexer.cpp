@@ -362,7 +362,7 @@ const Token& Lexer::prev() {
     return tokens[current-1];
 }
 
-const Token& Lexer::curr() {
+const Token& Lexer::curr_edge() {
     if(current < 0) return tokens.empty() ? no_token() : tokens.front();
     if(current>=int(tokens.size())) return tokens.empty() ? no_token() : tokens.back();
     return tokens[current];

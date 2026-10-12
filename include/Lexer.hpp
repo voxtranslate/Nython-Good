@@ -76,7 +76,12 @@ public:
     void dump();
     const Token& next();   // round 82: by reference (the vector is not changed while it is read)
     const Token& prev();
-    const Token& curr();
+    // round 82: the common case inline (the parser asks at every see/have)
+    inline const Token& curr() {
+        if (__builtin_expect(current >= 0 && current < int(tokens.size()), 1)) return tokens[current];
+        return curr_edge();
+    }
+    const Token& curr_edge();
     const Token& peek(int i);
     const std::vector<Token>& tokenize();
     std::string code();

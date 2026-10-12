@@ -1004,7 +1004,14 @@ public:   // NythonExecutor is a struct: members default to public
     // Runs a function body in fc and returns what the call should return:
     // the value of a `return` (fast or thrown), or - as before - the value
     // of the body's last statement when it runs off the end.
-    Value evalBody(node_ptr body, Context* fc) {
+    // `pend` (round 82): an exception the body raised by the pending flag
+    // is recorded as leaving the frame (tbUnwind) here, then handed on by
+    // the flag (pend) or thrown - marked as recorded (tbUnwound) for the
+    // catch clauses of runFunctionBody / runBodyHooked, so they do not
+    // record it twice. (runFunctionBody returns the body's value without a
+    // copy, as before round 82.)
+    static bool& tbUnwound() { static thread_local bool b = false; return b; }
+    Value evalBody(node_ptr body, Context* fc, bool pend = false) {
         FlowState& f = flow();
         struct Restore {
             FlowState& f; Context* c; bool b;
@@ -1024,7 +1031,13 @@ public:   // NythonExecutor is a struct: members default to public
         // None on the VM and in Python).
         Value v = NONE_VALUE;
         if (f.pending) {
-            if (f.pending == kPendExc) return v;   // round 82: its caller (runFunctionBody) takes it
+            if (f.pending == kPendExc) {   // round 82
+                std::string e = takeExc(f);
+                tbUnwind(e);
+                if (pend) { pendExc(std::move(e)); return v; }
+                tbUnwound() = true;
+                throw e;
+            }
             if (f.pending == 1) { v = f.value; f.value = NONE_VALUE; }
             f.pending = 0;
         }
@@ -15569,24 +15582,15 @@ public:
         FrameGuard _frame(fn, fc);   // round 77: frames and tracebacks
         // sys.settrace / sys.setprofile (round 79): one test per call
         if (__builtin_expect(nytrace::t_hooks & nytrace::ANY, 0) && !tbHiddenFile(fn->tok().fileName())) return runBodyHooked(fn, fn->body, fc, true);
-        try {
-            Value r = evalBody(fn->body, fc);
-            if (__builtin_expect(flow().pending != kPendExc, 1)) return r;
-        }
+        try { return evalBody(fn->body, fc, pend); }   // round 82: pend - see evalBody
         catch (nython::node::ReturnSignal& rs) { return rs.value; }
         catch (std::string& flow) {
-            tbUnwind(flow);
+            if (tbUnwound()) tbUnwound() = false;   // round 82: evalBody recorded it
+            else tbUnwind(flow);
             if (pend && !isLoopFlow(flow)) { pendExc(flow); return NONE_VALUE; }   // round 82
             throw;
         }
         catch (std::exception& e) { tbUnwind(excFromCpp(e.what())); throw; }
-        // round 82: the body raised by the pending flag - recorded as it
-        // leaves this frame, then handed on as the call site asked
-        FlowState& f = flow();
-        std::string e = takeExc(f);
-        tbUnwind(e);
-        if (pend) { pendExc(std::move(e)); return NONE_VALUE; }
-        throw e;
     }
     // A lambda's body (round 77: a frame of its own, "<lambda>").
     Value runLambdaBody(LambdaNode* lam, Context* fc) {
@@ -15609,7 +15613,12 @@ public:
         Value result;
         try { result = fn_body ? evalBody(body, fc) : evalNode(body, fc); }
         catch (nython::node::ReturnSignal& r) { result = r.value; }
-        catch (std::string& flow) { tbUnwind(flow); pyEvLeave(flow, idx); throw; }
+        catch (std::string& flow) {
+            if (tbUnwound()) tbUnwound() = false;   // round 82: evalBody recorded it
+            else tbUnwind(flow);
+            pyEvLeave(flow, idx);
+            throw;
+        }
         catch (std::exception& e) { std::string f = excFromCpp(e.what()); tbUnwind(f); pyEvLeave(f, idx); throw; }
         // round 82: raised by the pending flag - as the catch above, thrown
         if (FlowState& f = flow(); __builtin_expect(f.pending == kPendExc, 0)) {

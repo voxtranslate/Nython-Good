@@ -3,7 +3,11 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 81, follow-ups — **§0t4** (gaps the round's agents found: class lambdas bound, `del C.m`, `list.pop`'s index, UnboundLocalError, set iterators; a package's `__spec__` on Windows; vm_audit102).
+Last updated: round 82, part A — **§0u** (the interpreter's remaining
+costs: Python exceptions travelling by a pending flag instead of C++
+throws, startup 2.5x/4x fewer instructions, loop targets bound from
+enumerate/zip without a tuple; vm_audit103).
+Round 81, follow-ups — **§0t4** (gaps the round's agents found: class lambdas bound, `del C.m`, `list.pop`'s index, UnboundLocalError, set iterators; a package's `__spec__` on Windows; vm_audit102).
 Round 81, part A — **§0t** (the semantic gaps round 80 left:
 `except ... as e` unbinding, a live `globals()` and the real `__main__`,
 `__spec__` and `sys.meta_path`/`path_hooks` in the import statement,

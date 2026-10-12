@@ -507,7 +507,11 @@ bool resume_function(NythonExecutor& E, Gen* g, Mode m) {
     bool r_brk = f.brk_ok;
     int r_pend = f.pending;
     Value r_val = f.value;
-    std::string r_exc = std::move(f.exc);   // round 82
+    // round 82: the pending exception's string, kept only when there is one
+    // (a string moved in and out at every resume cost the generators
+    // benchmark 0.4%)
+    std::string r_exc;
+    if (r_pend == NythonExecutor::kPendExc) r_exc = std::move(f.exc);
     node_ptr r_last = NythonExecutor::last_stmt();
     Node* r_cur = NythonExecutor::cur_stmt();
     Gen* r_gen = t_cur;
@@ -520,7 +524,7 @@ bool resume_function(NythonExecutor& E, Gen* g, Mode m) {
         f.brk_ok = g->saved.brk_ok;
         f.pending = g->saved.pending;
         f.value = g->saved.value;
-        f.exc = std::move(g->saved.exc);   // round 82
+        if (g->saved.pending == NythonExecutor::kPendExc) f.exc = std::move(g->saved.exc);   // round 82
         if (g->saved.last) NythonExecutor::last_stmt() = g->saved.last;
         NythonExecutor::call_depth_ = rd + 1 + g->saved.rel_depth;
         H.insert(H.end(), g->saved.handling.begin(), g->saved.handling.end());
@@ -547,7 +551,7 @@ bool resume_function(NythonExecutor& E, Gen* g, Mode m) {
         g->saved.brk_ok = f.brk_ok;
         g->saved.pending = f.pending;
         g->saved.value = f.value;
-        g->saved.exc = std::move(f.exc);   // round 82
+        if (f.pending == NythonExecutor::kPendExc) g->saved.exc = std::move(f.exc);   // round 82
         g->saved.last = NythonExecutor::last_stmt();
         g->saved.cur = NythonExecutor::cur_stmt();
         NythonExecutor::cur_stmt() = r_cur;
@@ -574,7 +578,7 @@ bool resume_function(NythonExecutor& E, Gen* g, Mode m) {
         f.brk_ok = r_brk;
         f.pending = r_pend;
         f.value = r_val;
-        f.exc = r_exc;   // round 82 (a copy: the loop may come round again)
+        if (r_pend == NythonExecutor::kPendExc) f.exc = r_exc;   // round 82 (a copy: the loop may come round again)
         NythonExecutor::call_depth_ = rd;
         t_cur = r_gen;
         if (nycoro::done(g->co) || !nyconc::relay_requested()) break;

@@ -387,6 +387,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit98 | 72 | round 80: the specializing VM's every fast path and its deoptimization (class/method/global/builtin changes after specialization, `__class__` reassignment, big-int overflow, polymorphic sites, descriptors, slots, generators, threads, tracing mid-loop) - passes on both engines, under python3 and with `NY_QUICKEN=0` |
 | vm_audit100 | 114 | round 81: the self-optimizing interpreter's every cache and its fallback (globals/builtins rebound or shadowed, functions replaced, class attributes and methods changed in a class or a base or deleted, fields shadowing them, `__class__` reassigned, `__get__` added later, big-int overflow, `exec`, closures, generators, recursion, threads, return/break/continue through try/finally/with, builtin values' methods, tracing and profiling mid-loop) - passes on both engines, under python3 and with `NY_ASTSPEC=0` |
 | vm_audit102 | 51 | round 81 follow-ups: a lambda put in a class bound when read as a value, `del C.m` (an override, then the base's), `list.pop`'s integer index (`__index__`, TypeError), UnboundLocalError (both engines, CPython's message; NyScope flags reads of names a function binds), set iterators noticing a size change (passes under python3) |
+| vm_audit103 | 43 | round 82: exceptions travelling by the pending flag on the interpreter and their fallbacks - raised and caught in the same function, in callers, from every expression context, through builtin callbacks, generators, threads, `with` suppression, finally ordering and replacement, tracebacks, `sys.settrace` exception events, `__context__`/`__cause__`, `except*`; loop targets over enumerate/zip/items/lists/generators/objects with their counts checked, starred and nested targets (passes under python3 and with `NY_ASTSPEC=0`) |
 | vm_audit101 | 125 | round 81: the live debug server driven over its socket (`--debug-port`, DAP messages: breakpoints with conditions/hit counts/log messages, stepping, pause, stack/scopes/variables by reference, evaluate, setVariable, raised/uncaught exceptions, `--connect`, stdin/argv untouched) and its ring buffer (stepBack/reverseContinue/seek, Why? over the live history); the Profile view's reader on real `-m cProfile [--stacks]` dumps (Nython-only) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
@@ -1282,6 +1283,38 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
 - A `Value` has no `Token` any more (`Value::token_default()`); heap objects
   carry kind flags (`nygc::F_KSTR/F_KINST/F_KFUNC/F_KCONT`) that
   `heapKind`/`contOf` read instead of the side tables.
+
+## Round 82: the interpreter's remaining costs (see `HANDOFF.md` §0u)
+
+- **Python exceptions travel by the pending flag** on the interpreter
+  (`FlowState::pending == kPendExc`, the string in `FlowState::exc` -
+  CPython's error indicator): a `raise`, an `assert`, and the KeyError /
+  IndexError / AttributeError / ZeroDivisionError / a builtin's error
+  raised under an evaluator that checks the flag (`evalP`, the `pend`
+  argument of `evalNode` and the evaluators it dispatches to) go back to
+  the `try` without a C++ throw. A statement may leave by it where a
+  return may (`canPend`: the function's own statements); a frame hands it
+  on by the flag only when its call site asked (`runFunctionBody(pend)`).
+  Everything else (builtins calling back, generator bodies, threads,
+  `exec`, the prelude's callbacks) still throws. exceptions benchmark 4.5x
+  fewer instructions.
+- **Rules**: an evaluator given `pend` must check the flag right after
+  each child it evaluated with `evalP` and return before doing anything
+  else; a construct that runs user code while a flag is set takes it out
+  first (`takeExc`) and puts it back (`pendExc`); code that evaluates
+  statements in a caller's scope (`exec`, `lang_eval`) runs under
+  `SuspendFast`.
+- `for a, b in enumerate(...)` / `zip(...)` bind the targets from the
+  iterator's parts (no tuple per step); a for statement's targets are
+  unpacked as Python does on both engines (exactly that many values,
+  CPython's ValueError; objects and strings iterated) - the VM's
+  `UNPACK_SEQ` has a strict form (`kUnpackStrict`).
+- Startup: the parser reads tokens by reference (`Parser::token()` /
+  `ILexer` / `IParser` return `const Token&`; `Parser`/`Lexer` are
+  `final`), the keyword tables are walked by reference, the VM and its
+  builtin bridge share one parse of the prelude
+  (`VirtualMachine::shared_prelude_ast`): `-c pass` 2.5x (interpreter) and
+  4x (VM) fewer instructions.
 
 ## Transcripts
 
