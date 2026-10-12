@@ -643,6 +643,10 @@ struct ExceptNode : Node {
     // `name`/`alias` keep their historical spelling for older consumers.
     std::vector<std::string> types; std::string var;
     bool var_global = false;     // `var` was declared `global` (set by NyScope)
+    // round 81: the names `except <expression> as e` clauses bind inside the
+    // catch-all the parser lowers them to (with whether each is `global`),
+    // unbound with `var` when the clause ends, as CPython deletes them
+    std::vector<std::pair<std::string, bool>> unbind_names;
     ExceptNode(Token t, const std::string& n, const std::string& a, node_ptr b) : Node(t, NodeType::EXCEPT), name(n), alias(a), body(b) {}
     Value eval(Context* ctx) override { return body->eval(ctx); }
 };

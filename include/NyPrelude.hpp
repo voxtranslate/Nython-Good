@@ -1013,6 +1013,22 @@ class _NyFuncCode:
     def __repr__(self):
         return "<code object " + self.co_name + ", file \"" + self.co_filename + "\", line " + str(self.co_firstlineno) + ">"
 
+_ny_code_cache = {}
+def _ny_code_of(info):
+    # one code object per function's code (round 81: f.__code__ is
+    # frame.f_code, as in CPython - trace functions compare them); info[7]
+    # is the code's identity, checked against what it describes in case it
+    # was reused
+    if len(info) > 7:
+        var k = info[7]
+        var c = _ny_code_cache.get(k)
+        if c is not None and c.co_name == info[0] and c.co_firstlineno == info[6] and c.co_filename == info[5] and c.co_qualname == info[1]:
+            return c
+        c = _NyFuncCode(info)
+        _ny_code_cache[k] = c
+        return c
+    return _NyFuncCode(info)
+
 def _ny_fn_attr(f, attr):
     # A function's __defaults__, __kwdefaults__, __code__, __qualname__,
     # __module__, __globals__ (round 77; both engines read them here).
@@ -1024,7 +1040,7 @@ def _ny_fn_attr(f, attr):
     if attr == "__module__":
         return info[2]
     if attr == "__code__":
-        return _NyFuncCode(info)
+        return _ny_code_of(info)
     if attr == "__defaults__":
         var d = [p[3] for p in info[3] if p[1] <= 1 and p[2]]
         return tuple(d) if len(d) > 0 else None
@@ -1054,7 +1070,10 @@ class object:
         return list(cls.__mro__)
     def __new__(cls, *args, **kw):
         # object.__new__(cls) / super().__new__(cls): a bare instance
-        # (round 77; a class's own __new__ runs before __init__)
+        # (round 77; a class's own __new__ runs before __init__); extra
+        # arguments are CPython's object_new errors (round 81)
+        if args or kw:
+            _ny_ctor_check(cls, True)
         return _ny_object_new(cls)
     @classmethod
     def __init_subclass__(cls, **kw):
@@ -1071,7 +1090,9 @@ class object:
     # and the plain attribute store a __setattr__ hands on to
     # (object.__setattr__(self, k, v) / super().__setattr__(k, v))
     def __init__(self, *args, **kwargs):
-        pass
+        # extra arguments are CPython's object_init errors (round 81)
+        if args or kwargs:
+            _ny_ctor_check(type(self), False)
 
     def __setattr__(self, name, value):
         _ny_setattr_raw(self, name, value)
@@ -1100,6 +1121,35 @@ class object:
     def __getstate__(self):
         import copyreg
         return copyreg._ny_getstate(self)
+
+def _ny_ctor_check(cls, is_new):
+    # (round 81) object.__new__(cls, *args) / object.__init__(self, *args)
+    # given arguments: CPython's object_new / object_init - an error unless
+    # the class overrides the other one (a builtin type or exception along
+    # the MRO takes its own arguments)
+    var own_init = False
+    var own_new = False
+    for k in cls.__mro__:
+        if k is object:
+            break
+        if getattr(k, "__module__", None) == "builtins":
+            return None
+        var d = k.__dict__
+        if "__init__" in d or "init" in d:
+            own_init = True
+        if "__new__" in d:
+            own_new = True
+    if is_new:
+        if own_new:
+            raise TypeError("object.__new__() takes exactly one argument (the type to instantiate)")
+        if not own_init:
+            raise TypeError(cls.__name__ + "() takes no arguments")
+    else:
+        if own_init:
+            raise TypeError("object.__init__() takes exactly one argument (the instance to initialize)")
+        if not own_new:
+            raise TypeError(cls.__name__ + "() takes no arguments")
+    return None
 
 class _NyObjectExtra:
     # The rest of object's methods (round 80). They cannot be in object's
@@ -1565,7 +1615,7 @@ class _NyCoroutine(_NyCoroDriver):
 
     @property
     def cr_code(self):
-        return _NyFuncCode(_ny_fn_info(self._ny_fn))
+        return _ny_code_of(_ny_fn_info(self._ny_fn))
 
     @property
     def cr_running(self):
@@ -1868,7 +1918,7 @@ class _NyFrame:
     def f_code(self):
         var c = self._ny_code
         if c is None:
-            c = _NyFuncCode(self._ny_info)
+            c = _ny_code_of(self._ny_info)
             self._ny_code = c
         return c
 
@@ -1879,14 +1929,13 @@ class _NyFrame:
 
     @f_lineno.setter
     def f_lineno(self, lineno):
-        # (round 79) CPython's trace functions can move a frame to another
-        # line; Nython's frames cannot: a ValueError, as CPython gives for a
-        # jump it refuses (pdb reports "Jump failed: ...")
+        # (round 81) a trace function moves its frame to another line, by
+        # CPython's rules (the engines check them and make the jump when the
+        # trace function returns); a refused jump is a ValueError (pdb's
+        # "Jump failed: ...")
         if type(lineno) is not int:
             raise ValueError("lineno must be an integer")
-        if lineno < self.f_code.co_firstlineno:
-            raise ValueError("line " + str(lineno) + " comes before the current code block")
-        raise ValueError("line " + str(lineno) + ": a frame's line cannot be changed (Nython has no jump)")
+        _ny_frame_jump(self, lineno)
 
     @property
     def f_lasti(self):
@@ -2737,13 +2786,30 @@ def _ny_str_translate(s, table):
 # function; "__main__" is the running program, its globals read through
 # the module object.
 class _NyMainModule(_NyModuleType):
+    # round 81: the real main module - setting or deleting an attribute
+    # binds or unbinds the program's global, and its __dict__ (vars()) is
+    # the program's globals() itself
     def __init__(self):
-        _NyModuleType.__init__(self, "__main__")
+        object.__setattr__(self, "__name__", "__main__")
+        object.__setattr__(self, "__doc__", None)
+        object.__setattr__(self, "__package__", None)
+        object.__setattr__(self, "__loader__", None)
+        object.__setattr__(self, "__spec__", None)
     def __getattr__(self, name):
         var g = _ny_main_globals()
         if name in g:
             return g[name]
         raise AttributeError("module '__main__' has no attribute '" + name + "'")
+    def __setattr__(self, name, value):
+        if name in ("__name__", "__doc__", "__package__", "__loader__", "__spec__"):
+            object.__setattr__(self, name, value)
+        _ny_main_set(name, value)
+    def __delattr__(self, name):
+        if not _ny_main_del(name):
+            raise AttributeError("module '__main__' has no attribute '" + name + "'")
+    @property
+    def __dict__(self):
+        return _ny_globals_view()
     def __dir__(self):
         return sorted(list(_ny_main_globals()))
 
@@ -2822,6 +2888,179 @@ def __import__(name, globals=None, locals=None, fromlist=(), level=0):
     if hasattr(module, "__path__"):
         return _ny_handle_fromlist(module, fromlist)
     return module
+
+# ── sys.meta_path and sys.path_hooks for the import statement (round 81) ──
+# importlib._bootstrap._find_and_load: when a module is not in sys.modules
+# yet the engines ask _ny_import_via_hooks(name) first. sys.meta_path's
+# default entries stand for the engines' own search (BuiltinImporter, then
+# PathFinder - importlib.machinery's classes once it is imported, these
+# stand-ins until then), so with no finder or path hook of a program's own
+# it answers None at once and the import goes the native way. A finder put
+# before them is asked first; one after them only for what they cannot
+# find. Through PathFinder, sys.path_hooks are tried on each sys.path entry
+# (a package's __path__ for a submodule), their finder kept in
+# sys.path_importer_cache (None for an entry no hook takes: the engines'
+# own directory search). A spec found is loaded as CPython's
+# _load_unlocked: create_module, the module's attributes, sys.modules,
+# exec_module.
+class _NyNativeFinder:
+    def __init__(self, kind):
+        self._ny_kind = kind
+    def find_spec(self, fullname, path=None, target=None):
+        import importlib.machinery
+        var c = importlib.machinery.BuiltinImporter if self._ny_kind == "builtin" else importlib.machinery.PathFinder
+        return c.find_spec(fullname, path, target)
+    def invalidate_caches(self):
+        pass
+    def __repr__(self):
+        if self._ny_kind == "builtin":
+            return "<class '_frozen_importlib.BuiltinImporter'>"
+        return "<class '_frozen_importlib_external.PathFinder'>"
+
+_ny_hooks_native = object()
+
+def _ny_import_via_hooks(name):
+    var sysm = _ny_sys_ref[0]
+    if sysm is None:
+        return None
+    var mp = getattr(sysm, "meta_path", None)
+    var hooks = getattr(sysm, "path_hooks", None)
+    if not hooks:
+        var plain = True
+        for f in mp or ():
+            if getattr(f, "_ny_kind", None) is None:
+                plain = False
+                break
+        if plain:
+            return None
+    var path = None
+    var parent = name.rpartition(".")[0]
+    if parent:
+        var pm = sysm.modules.get(parent)
+        if pm is None:
+            __import__(parent)
+            pm = sysm.modules.get(parent)
+        if name in sysm.modules:
+            return sysm.modules[name]
+        path = getattr(pm, "__path__", None)
+        if path is None:
+            raise ModuleNotFoundError("No module named " + repr(name) + "; " + repr(parent) + " is not a package", name=name)
+    for finder in list(mp or ()):
+        var kind = getattr(finder, "_ny_kind", None)
+        if kind == "builtin":
+            if not parent and name in sysm.builtin_module_names:
+                return None
+            continue
+        if kind == "path":
+            if hooks:
+                var hs = _ny_path_hooks_spec(sysm, name, path, hooks)
+                if hs is _ny_hooks_native:
+                    return None
+                if hs is not None:
+                    return _ny_load_spec(sysm, hs)
+                continue
+            if _ny_find_module(name)[0]:
+                return None
+            continue
+        var fs = getattr(finder, "find_spec", None)
+        if fs is None:
+            continue
+        var spec = fs(name, path, None)
+        if spec is not None:
+            return _ny_load_spec(sysm, spec)
+    return None
+
+def _ny_path_hooks_spec(sysm, name, path, hooks):
+    # importlib.machinery.PathFinder._get_spec over sys.path_hooks
+    var entries = path if path is not None else sysm.path
+    var cache = sysm.path_importer_cache
+    var tail = name.rpartition(".")[2]
+    for entry in list(entries):
+        if not isinstance(entry, str):
+            continue
+        var finder = None
+        if entry in cache:
+            finder = cache[entry]
+        else:
+            for hook in list(hooks):
+                try:
+                    finder = hook(entry)
+                    break
+                except ImportError:
+                    continue
+            cache[entry] = finder
+        if finder is None:
+            # no hook takes it: the engines' own search of that directory
+            var d = entry if entry else "."
+            if os_isfile(d + "/" + tail + ".ny") or os_isfile(d + "/" + tail + "/__init__.ny"):
+                return _ny_hooks_native
+            continue
+        var spec = finder.find_spec(name, None)
+        if spec is not None and (spec.loader is not None or spec.submodule_search_locations):
+            return spec
+    return None
+
+def _ny_load_spec(sysm, spec):
+    var name = spec.name
+    var loader = spec.loader
+    var module = None
+    if loader is not None and hasattr(loader, "create_module"):
+        module = loader.create_module(spec)
+    elif loader is None and not spec.submodule_search_locations:
+        raise ImportError("missing loader", name=name)
+    if module is None:
+        module = _ny_module_new(name)
+    for k, v in (("__name__", name), ("__loader__", loader), ("__package__", getattr(spec, "parent", name.rpartition(".")[0])), ("__spec__", spec)):
+        try:
+            setattr(module, k, v)
+        except AttributeError:
+            pass
+    if spec.submodule_search_locations is not None:
+        try:
+            module.__path__ = spec.submodule_search_locations
+        except AttributeError:
+            pass
+    if getattr(spec, "has_location", False) and spec.origin is not None:
+        try:
+            module.__file__ = spec.origin
+        except AttributeError:
+            pass
+    sysm.modules[name] = module
+    try:
+        if loader is not None and hasattr(loader, "exec_module"):
+            loader.exec_module(module)
+        elif loader is not None and hasattr(loader, "load_module"):
+            loader.load_module(name)
+    except BaseException:
+        sysm.modules.pop(name, None)
+        raise
+    module = sysm.modules.pop(name)
+    sysm.modules[name] = module
+    return module
+
+def _ny_module_spec_attr(module, attr):
+    # (round 81) __spec__ / __loader__ of a module the engines imported,
+    # made when first read: importlib.machinery's ModuleSpec and loader for
+    # its file (BuiltinImporter's for sys, os, math, builtins)
+    import importlib.machinery
+    var m = importlib.machinery
+    var name = getattr(module, "__name__", None)
+    var f = getattr(module, "__file__", None)
+    var spec = None
+    if isinstance(f, str) and f:
+        var kind = "package" if f.endswith("__init__.ny") else "file"
+        spec = m._spec_for_path(name, f, kind)
+    elif getattr(module, "__path__", None) is not None:
+        var p = list(module.__path__)
+        spec = m._spec_for_path(name, p[0] if p else "", "namespace")
+    else:
+        spec = m.ModuleSpec(name, m.BuiltinImporter, origin="built-in")
+    try:
+        setattr(module, "__spec__", spec)
+        setattr(module, "__loader__", spec.loader)
+    except AttributeError:
+        pass
+    return spec if attr == "__spec__" else spec.loader
 
 # ── sys's Python members (round 80): the engines make the sys module and
 # call _ny_sys_extend(sys) once ─────────────────────────────────────────
@@ -2993,6 +3232,53 @@ def _ny_setswitchinterval(interval):
         raise ValueError("switch interval must be strictly positive")
     _ny_sys_info("switch_interval", v)
 
+def _ny_stdlib_names():
+    # sys.stdlib_module_names (round 81): the modules and packages of the
+    # standard library directory (lib/), and the ones the engines make
+    var names = set(("builtins", "math", "os", "sys"))
+    var lib = _ny_sys_info("prefix") + "/lib"
+    try:
+        for e in os_listdir(lib):
+            if e.endswith(".ny"):
+                names.add(e[:-3])
+            elif not e.startswith(".") and os_isfile(lib + "/" + e + "/__init__.ny"):
+                names.add(e)
+    except OSError:
+        pass
+    return frozenset(names)
+
+def _ny_displayhook(value):
+    # sys.displayhook / sys.__displayhook__ (round 81): what the prompt does
+    # with an expression's value - None is not shown; anything else is
+    # printed as its repr on sys.stdout and kept in `_`
+    if value is None:
+        return None
+    _ny_main_set("_", None)
+    var text = repr(value)
+    var s = _ny_sys_ref[0]
+    var out = getattr(s, "stdout", None) if s is not None else None
+    if out is None:
+        print(text)
+    else:
+        out.write(text + "\n")
+    _ny_main_set("_", value)
+    return None
+
+def _ny_prompt_display(value):
+    # (round 81) the interactive prompt (-i, the REPL) calls this for an
+    # expression's value: False while sys.displayhook is the default (the
+    # engines show it themselves), else the program's hook was called
+    var s = _ny_sys_ref[0]
+    if s is None:
+        return False
+    var h = getattr(s, "displayhook", None)
+    if h is _ny_displayhook:
+        return False
+    if h is None:
+        raise RuntimeError("lost sys.displayhook")
+    h(value)
+    return True
+
 def _ny_sys_extend(sysmod):
     # the Python-level members of sys: the language level Nython implements
     # (the standard library's ports follow CPython 3.12) in version_info,
@@ -3013,9 +3299,14 @@ def _ny_sys_extend(sysmod):
     sysmod.maxunicode = 1114111
     sysmod.dont_write_bytecode = True
     sysmod.path = _ny_sys_info("path")
-    sysmod.meta_path = []
+    # round 81: the import statement consults these (_ny_import_via_hooks)
+    sysmod.meta_path = [_NyNativeFinder("builtin"), _NyNativeFinder("path")]
     sysmod.path_hooks = []
     sysmod.path_importer_cache = {}
+    sysmod.stdlib_module_names = _ny_stdlib_names()
+    sysmod.getrefcount = _ny_getrefcount
+    sysmod.displayhook = _ny_displayhook
+    sysmod.__displayhook__ = _ny_displayhook
     sysmod.builtin_module_names = ("builtins", "math", "os", "sys")
     sysmod.orig_argv = _ny_sys_info("orig_argv")
     sysmod.modules = _ny_modules()
@@ -4145,6 +4436,30 @@ class _NyInstanceDict(dict):
     def clear(self):
         for k in list(_ny_payload(self).keys()):
             del self[k]
+
+class _NyGlobalsDict(_NyInstanceDict):
+    # globals() (round 81): a module's live namespace as a dict - its value
+    # is the module's variables as they are now (the engines' payload of a
+    # view whose __ny_globals_of__ is the module object, None for the
+    # program), and storing or deleting a key binds or unbinds the variable.
+    def __setitem__(self, k, v):
+        if not isinstance(k, str):
+            raise TypeError("globals() keys must be str here, not " + type(k).__name__)
+        var o = self.__ny_globals_of__
+        if o is None:
+            _ny_main_set(k, v)
+        else:
+            setattr(o, k, v)
+    def __delitem__(self, k):
+        var o = self.__ny_globals_of__
+        if k not in _ny_payload(self):
+            raise KeyError(k)
+        if o is None:
+            _ny_main_del(k)
+        else:
+            delattr(o, k)
+_NyGlobalsDict.__name__ = "dict"
+_NyGlobalsDict.__qualname__ = "dict"
 #@ os
 # ── the rest of Python's os module (round 80) ─────────────────────────────
 # Run the first time a program imports os (both engines' os namespace

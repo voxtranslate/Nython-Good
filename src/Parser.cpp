@@ -23,6 +23,9 @@ namespace nython::parser {
 // A body's docstring: its first statement, when that is a string literal.
 static bool docstringOf(const node_ptr& body, std::string& out){
     if(!body) return false;
+    // -OO (round 81): docstrings are dropped, as CPython compiles them -
+    // __doc__ is None
+    if(nyrt::cli_flags().optimize >= 2) return false;
     node_ptr first = body;
     for(int d = 0; d < 3 && first && first->type() != NodeType::STRING; d++){
         auto st = first->statements();
@@ -3802,6 +3805,17 @@ node_ptr Parser::tryStmt(){
         auto enp = std::static_pointer_cast<ExceptNode>(en);
         enp->types = {"BaseException"};
         enp->var = ev;
+        // round 81: `as e` is unbound when the clause ends (CPython deletes it)
+        for(size_t j = first_expr; j < eclauses.size(); j++){
+            const std::string& n = eclauses[j].var;
+            if(n.empty()) continue;
+            bool seen = false;
+            for(auto& u : enp->unbind_names) if(u.first == n) seen = true;
+            if(seen) continue;
+            bool is_global = !global_decls_.empty()
+                             && std::find(global_decls_.back().begin(), global_decls_.back().end(), n) != global_decls_.back().end();
+            enp->unbind_names.push_back({n, is_global});
+        }
         tn->except_clauses.push_back(en);
     }
     return try_node;
