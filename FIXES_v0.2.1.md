@@ -5692,3 +5692,14 @@ Full detail in `HANDOFF.md` §0s2. New test: `vm_audit97` (262 checks; passes un
 | Windows: `os.stat(p).st_ino` was 0; `os.path.exists(os.devnull)` false | `_stat64` fields; character devices not seen | GetFileInformationByHandle; devices seen |
 | `os.path.splitext` returned a list | — | a tuple |
 
+## Round 80, part C — a specializing adaptive interpreter for the VM
+
+Full detail in `HANDOFF.md` §0s3. New test: `vm_audit98` (72 checks; passes under python3 and with `NY_QUICKEN=0`); benchmarks in `tools/bench/`.
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| The VM was 20-80x slower than python3 | every instruction did the general lookup; 216-byte `VMVal` copies; a frame walk per name lookup; a deque node per call; the C++ unwinder for every raise | quickening with inline caches and deoptimization, polymorphic caches, a type epoch, reused frames, cheaper copies, exceptions without a throw: 3.15x faster (geomean of 11 benchmarks) |
+| Merging parts A and C: the fast call path used the removed `kMaxFrames` | part A made the limit settable (`sys.setrecursionlimit`) | the fast path uses `nyrt::recursion_limit()` |
+| vm_audit95 failed on 32-bit Windows | it expected the 64-bit decimal limits | the check follows `sys.maxsize` (425000000 on 32-bit, as CPython) |
+| Merging parts A and C: with a program's `list = []`, abc.ABC's `__slots__ = ()` called the program's list on the VM | the LOAD_NAME_MOD/GLOBAL caches read the program's frame for prelude code, which part A made invisible to it | prelude code is not specialized onto the program's frame (`plain_function_frame`) |
+

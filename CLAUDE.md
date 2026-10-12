@@ -379,6 +379,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit95 | 2050 | round 79: decimal - the API and 1,981 vectors with CPython's results and flags at precisions 9/16/34 (passes under python3) |
 | vm_audit96 | 116 | round 80: the gaps rounds 78-79 found - two interpreter crashes, object's members on every class, except <expression>, numeric keys across int/float/Fraction/Decimal, dataclass(slots=True), sys.modules/__import__/importlib, relative imports, sys's facts, sys.excepthook and -O, exec/eval namespaces, a live os.environ, threading._register_atexit, str.maketrans/translate, `${` in a Python-mode file (passes under python3) |
 | vm_audit97 | 262 | round 80: os.fspath/PathLike, scandir, real file descriptors, ids, posixpath/ntpath/genericpath/stat/pwd/grp, codecs (every error handler, cp437/cp1252/utf-16/32/idna/punycode, bytes codecs), multiprocessing (Process, queues, pipes, locks across processes, shared Value/Array/SharedMemory, Pool with work stealing, Manager), ProcessPoolExecutor over pickle (passes under python3; 240 under Wine, POSIX-only checks skipped) |
+| vm_audit98 | 72 | round 80: the specializing VM's every fast path and its deoptimization (class/method/global/builtin changes after specialization, `__class__` reassignment, big-int overflow, polymorphic sites, descriptors, slots, generators, threads, tracing mid-loop) - passes on both engines, under python3 and with `NY_QUICKEN=0` |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -1183,6 +1184,19 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
 - `lib/multiprocessing/` (spawn only; locks through a lock server, shared
   memory by mmap/CreateFileMapping, a work-stealing Pool);
   ProcessPoolExecutor sends pickle.
+
+## Round 80: a specializing VM (see `HANDOFF.md` §0s3)
+
+- The VM quickens (PEP 659 / Brunthaler 2010): generic instructions
+  rewrite themselves into specialized forms with inline caches and
+  deoptimize on a failed guard; polymorphic caches at call/store sites;
+  invalidation by one process-wide type epoch. 3.15x faster
+  (`python3 tools/bench/run.py`). `NY_QUICKEN=0` turns it off.
+- **Write VM class tables only through their wrappers** (`class_vars_`'s
+  `find_mut`/`all_mut`/`operator[]`, `EpochMap`/`EpochSet`/`EpochCache`/
+  `EpochFlag`), or caches go stale. `VMVal` is not an aggregate.
+- `call_stack_` is a `FrameStack` (frames reused); exceptions inside the
+  run loop travel without a C++ throw (`fast_exc_pending`).
 
 ## Transcripts
 

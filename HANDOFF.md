@@ -11,7 +11,9 @@ sys's facts and `sys.excepthook`, `-O`, a live `os.environ`, prelude code
 immune to rebound builtins, `${...}` only in Nython source) and **§0s2**
 (part B: os.fspath/scandir/file descriptors, posixpath/ntpath/stat/pwd/grp,
 a full codecs module, multiprocessing over pickle with a work-stealing Pool;
-both engines).
+both engines) and **§0s3** (part C: the VM 3.15x faster - a specializing
+adaptive interpreter with inline caches, deoptimization and a type epoch;
+`tools/bench/`).
 Round 79 — **§0r** (zlib/DEFLATE written natively with an
 opt-in Zopfli-style optimal parse; binascii, gzip, zipfile, tarfile, pickle
 byte-identical to CPython's, copyreg, array; `__slots__` and `__class__`
@@ -59,6 +61,108 @@ multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
 
 ---
+
+## 0s3. Round 80, part C — a specializing adaptive interpreter for the VM (vm_audit98, `tools/bench/`)
+
+The VM is **3.15x faster** (geometric mean of 11 benchmarks, Linux; 2.42x
+x64 and 2.40x i686 under Wine) with no behaviour change: the sweep and
+`ide_e2e` are the oracle, and `examples/vm_audit98.ny` (72 checks, the
+interpreter, the VM and python3; also with `NY_QUICKEN=0`) exercises every
+specialized path and its deoptimization (a method added to a base after a
+site specialized, `__class__` reassigned, globals and builtins rebound, an
+int overflowing into a big int, a site turning polymorphic, descriptors and
+`__getattr__` appearing later, `__slots__`, generators, threads rebinding a
+global while another calls, tracing switched on mid-loop).
+
+### Benchmarks (`tools/bench/run.py -n 5 --python --base <old binary>`, min of 5, seconds)
+| bench | before | after | speedup | python3 |
+|---|---|---|---|---|
+| closures | 0.794 | 0.298 | 2.66x | 0.045 |
+| deltablue | 0.824 | 0.360 | 2.29x | 0.022 |
+| dict_str | 0.372 | 0.191 | 1.94x | 0.023 |
+| exceptions | 0.740 | 0.105 | 7.03x | 0.005 |
+| fannkuch | 0.958 | 0.414 | 2.31x | 0.039 |
+| fib | 0.557 | 0.106 | 5.26x | 0.017 |
+| generators | 0.794 | 0.332 | 2.39x | 0.027 |
+| nbody | 0.735 | 0.214 | 3.44x | 0.016 |
+| raytrace | 0.921 | 0.293 | 3.14x | 0.029 |
+| richards | 1.190 | 0.348 | 3.42x | 0.047 |
+| spectral_norm | 1.024 | 0.304 | 3.36x | 0.033 |
+
+The VM is still 6-22x slower than python3. Each benchmark's result line is
+compared with python3's.
+
+### What was done (and from where)
+- **Profile first** (callgrind; no perf here): ~40% of the time was `pop()`
+  and `VMVal` move/copy/destroy (a `VMVal` is 216 bytes: 2 strings, 7
+  shared pointers), ~10% `frame_visible` (a walk over every frame per name
+  lookup), and in the exceptions benchmark 85% was the C++ unwinder.
+- **Generic paths** (1.31x alone): reused frames (`FrameStack`; a
+  `std::deque` allocated a node per call), cheaper `VMVal` copies/moves,
+  push/pop by reference, in-place generic ops, O(1) name walks when the top
+  frame has no closure environment, a `LOAD_METHNAME` placeholder for the
+  method name, direct str/list method calls (no `std::function` per call).
+- **Quickening** (PEP 659; Brunthaler, "Inline Caching Meets Quickening",
+  ECOOP 2010): a generic instruction counts down two runs, then rewrites
+  itself into a specialized form with an inline cache (37 new ops after
+  `FOR_PREP`: attribute loads/stores, method calls, global/name loads,
+  int/float/str arithmetic and comparisons, subscripts, Python calls with
+  exact arguments, builtin calls, iteration); a failed guard runs the
+  generic case (`redispatch:`), 32 misses rewrite it back with exponential
+  backoff (4, 8 ... 255 runs). **Polymorphic inline caches** (Hölzle,
+  Chambers & Ungar, ECOOP 1991) at method-call and attribute-store sites:
+  up to 4 receiver classes.
+- **Invalidation**: one process-wide type epoch instead of per-class
+  versions - every write to a class table goes through wrappers that bump
+  it, and the compiler enforces that (`ClassVars`, `EpochMap`, `EpochSet`,
+  `EpochCache`, `EpochFlag`); dict/global/local caches hold a slot number
+  and check the key still sits there (exact: `NyOrderedMap`'s slots are
+  stable).
+- **Exceptions without a C++ throw** inside the loop (`RAISE`, re-raise,
+  `RAISE_ERROR` jump to `fast_exc_pending`; a frame run by a specialized
+  call returns its exception with a sentinel): the exceptions benchmark
+  executes 7.5x fewer instructions.
+- Not taken: superinstructions (the profile did not point at pairs),
+  computed goto (~1% mispredicted indirect jumps, so ~3% at most), unboxing
+  `VMVal` (too invasive; now the largest remaining cost).
+- Switches: `NY_QUICKEN=0`, `NY_QUICKEN_SKIP=names,attrs,calls,arith,
+  iter,subscr`, `NY_QUICK_STATS=1`, `NY_VM_TRACE=2` (shows specialized ops).
+
+### Rules for anyone changing the VM now
+- **Write class tables only through their wrappers** (`class_vars_.find_mut`
+  / `all_mut` / `operator[]`, the `Epoch*` types): a write that skips them
+  leaves a stale cache, a silent wrong answer.
+- **`VMVal` is not an aggregate any more**: brace-initialising it with more
+  than its type does not compile.
+- Caches hold no owning references (slot numbers, compared map identities,
+  pointers valid for the current type epoch); a reused frame releases all
+  it held when popped; caches are per code object, under the GIL.
+- Specialized instructions still raise line events (the trace check stays
+  one byte per instruction); specialized calls run the traced frame loop
+  whenever a hook is set; builtin fast paths step aside under a profiler.
+- Memory: `Instruction` stays 12 bytes (`static_assert`), 16 bytes per
+  code object, a 72-byte cache entry per specializable instruction on the
+  first specialization attempt (code run once never allocates), 120 bytes
+  per polymorphic site; peak memory about +1 MB.
+
+### Merged onto parts A and B
+- Two semantic conflicts, no textual one: part C's fast call path named the
+  `kMaxFrames` part A had replaced with `nyrt::recursion_limit()` (it did not
+  compile), and **`LOAD_NAME_MOD`/`LOAD_NAME_GLOBAL` read the program's frame
+  for prelude code**, which part A had made invisible to it - with a program's
+  top-level `list = []`, abc.ABC's `__slots__ = ()` called the program's list
+  (`v5_spec_compliance_test` on the VM). `plain_function_frame` now excludes
+  prelude code; vm_audit98 checks it in a subprocess on both engines.
+
+### Not done / found
+- `C.__setattr__ = f` assigned after instances stored attributes is ignored
+  on both engines (the attribute-hook cache is not cleared for it).
+- The VM's list iterator walks a copy of the list (an O(n) copy per loop,
+  changes during the loop unseen).
+- The quickening statistics counters are `long` (32-bit on Windows,
+  diagnostic only); the cache entry could shrink to 40 bytes.
+- Remaining cost: 216-byte `VMVal` copies, class-name string comparisons,
+  map lookups in generic code, `isinstance` and object construction.
 
 ## 0s2. Round 80, part B — the OS layer's gaps, codecs, multiprocessing (vm_audit97)
 

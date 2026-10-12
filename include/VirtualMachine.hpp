@@ -7121,7 +7121,10 @@ private:
     // main module's frame: no closure environment (so no enclosing frame
     // is visible), not a module's code, not another thread's call stack.
     bool plain_function_frame(const CallFrame& f) const {
-        return !f.own_env && !f.closure_env && call_stack_.size()>1 && !f.code->module_env && !in_other_thread();
+        // not the prelude's code either: it does not see the program's frame
+        // (frame_visible, round 80 part A) - a program's `list = []` must not
+        // reach a LOAD_NAME_MOD cache made for prelude code
+        return !f.own_env && !f.closure_env && call_stack_.size()>1 && !f.code->module_env && !f.code->prelude_code && !in_other_thread();
     }
     // class_lookup without the copy: the slot of the class namespace that
     // holds attr, or null - also null where class_lookup would answer from

@@ -859,6 +859,20 @@ check("tracing switched on mid-loop: events of the specialized code",
       events[:6], [("call", 0), ("line", 1), ("line", 2), ("line", 3), ("line", 4), ("return", 4)])
 check("tracing switched on mid-loop: every traced call", len(events), 4 * 6)
 
+# A program that rebinds a builtin at top level (`list = []`) while prelude
+# code that reads `list` gets specialized: the prelude does not see the
+# program's frame (round 80 part A), so a LOAD_NAME_MOD/GLOBAL cache must not
+# be made for its code (found merging parts A and C: abc.ABC's
+# `__slots__ = ()` called the program's list).
+import subprocess
+shadow_prog = "list = []\nimport abc\ndef mk(i):\n    class A(abc.ABC):\n        __slots__ = ()\n    return A.__name__\nprint([mk(i) for i in range(6)])\n"
+shadow_runs = [[sys.executable, "-c", shadow_prog]]
+if nython:
+    shadow_runs.append([sys.executable, "--vm", "-c", shadow_prog])
+check("a rebound builtin never reaches the prelude's specialized code",
+      [subprocess.run(r, capture_output=True, text=True).stdout.strip() for r in shadow_runs],
+      ["['A', 'A', 'A', 'A', 'A', 'A']"] * len(shadow_runs))
+
 for r in results:
     if r[1]:
         pass_n = pass_n + 1
