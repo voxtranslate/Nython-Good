@@ -5761,3 +5761,19 @@ Full detail in `HANDOFF.md` §0t4. New test: `vm_audit102` (51 checks; passes on
 | Reading a local before it is bound: NameError | no static knowledge of a function's bindings at run time | NyScope flags reads of names the function binds (`VariableNode::local_read`); both engines raise UnboundLocalError there |
 | `next(iter(s))` after `s.add(x)`: no error | iter() over a set walked a copy | the set and its size kept; "Set changed size during iteration" (both engines) |
 | Windows: vm_audit99 "a package's __spec__" | the spec's search locations were rebuilt from `__file__` with `/` while `__path__` has native separators | the spec uses the module's `__path__` |
+
+## Round 82 — an offline programming agent, asyncio's missing half, the interpreter's remaining costs
+
+Full detail in `HANDOFF.md` §0u (part C), §0u2 (part B). New tests: `vm_audit105` (NyxAI, 118 checks, Nython-only; e2e `agent`), `vm_audit104` (asyncio, 113 checks; 108-110 under python3.11-3.13).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `lib/aiagent.ny` matched keywords and raised IndexError in several methods; the IDE's `@ask/@test/@doc/@review` were not wired | pre-round-73 code (empty lists indexed as dicts) | NyxAI: BM25F retrieval, program facts from the parser (`ny_facts`), a forward-chaining rule engine, 10 review rules with fixes as diffs, test generation with shrinking, docstrings, completion re-ranking; the IDE's AGENT view |
+| `text_defuse`: `from m import a as b` bound nothing | the parser joins name and alias with `\x05` | binds `b` |
+| asyncio had no loop API, transports/protocols, subprocesses, Unix sockets, signal handlers, TLS streams | round 77 did tasks and streams only | `lib/asyncio/` (a package): a persistent native loop, CPython's protocols/transports and streams, `create_subprocess_*` over the reactor (`os_proc_fds`), `add_signal_handler`, `ssl=`/`start_tls`, 3.12 cancellation, eager tasks, orphaned-task reports |
+| VM: `break`/`continue` out of an except clause left its exception bound; later exceptions got it as `__context__` (an accept loop leaked) | the hidden `__excN__` was not released on BREAK/CONTINUE | `release_loop_excs()` (`LoopCtx::exc_base`) |
+| Many tasks were quadratic (2000 tasks: 7 s interpreter, 2.7 s VM) | `mallinfo2` sampled at every safe point with work | sampled at most every 4 ms and ~5% of the time (`collect_due`, both collectors) |
+| A gather of asyncio Futures returned handle numbers | the coroutine an `__await__` returned was not kept alive | `item_of` keeps it |
+| VM: a natively raised OSError had no `errno`/`strerror` | `raise_in_vm` bypassed the typed path | through `raise_native_exception` |
+| `while not done: await sleep(0)` starved socket I/O | the reactor was polled only when no task was ready | polled without waiting every 32 steps |
+

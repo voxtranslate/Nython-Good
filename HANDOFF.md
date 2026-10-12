@@ -486,6 +486,22 @@ first (`/tmp`-style probes compared with python3), then fixed:
   under python3; vm_audit99 125/125 on both engines; `python3
   tools/sweep.py` 431 runs, 0 not ok.
 
+
+### Platforms (round 81 with its follow-ups, eab9350; AArch64 at ae70e3b)
+- **Windows 64-bit under Wine** (`tools/cross_windows.sh build`, then
+  `python3 tools/sweep.py --bin build-win/nywin`): the full sweep, 431
+  runs, 0 not ok; `pe_unwind_check` clean.
+- **Windows 32-bit under Wine** (`ARCH=i686`): vm_audit99 (3000 frames
+  deep under `setrecursionlimit(5000)` included), 100, 101, 102, 98, 95,
+  91, 88, 56 pass on both engines.
+- **AArch64 under qemu-user** (`make cli BUILD=build-arm64
+  CXX=aarch64-linux-gnu-g++ -j1`): vm_audit100, 102, 95, 91, 88, 56, 49
+  pass on both engines. vm_audit99, 98 and 105 stop at their first child
+  process: they run `sys.executable`, an AArch64 binary this container can
+  only start through qemu (no binfmt_misc), so the shell gets garbage - an
+  environment limit, not a failure of the code under test (round 80 noted
+  the same for vm_audit98).
+
 ## 0t3. Round 81, part C — live debugging and the Profile view (vm_audit101, e2e `live`/`profile`)
 
 `examples/vm_audit101.ny` (125 checks, Nython-only) passes on both engines:
