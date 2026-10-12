@@ -360,6 +360,11 @@ static void wake_all(WQ& q) {
 static void check_cancel_locked(ThreadRec* self) {
     if (self->cancel_requested) {
         if (!self->cancel_sticky) self->cancel_requested = false;
+        // round 82: Task.cancel(msg) - the CancelledError carries msg
+        if (self->task && self->task->has_cancel_msg) {
+            self->task->has_cancel_msg = false;
+            raise("CancelledError", self->task->cancel_msg);
+        }
         raise("CancelledError", "thread " + self->label() + " was cancelled");
     }
 }
@@ -667,6 +672,12 @@ struct Task : Obj {
     std::multimap<std::pair<TP, uint64_t>, Task*>::iterator timer_it;
     Coro* manual = nullptr;                  // a coroutine driven by hand (round 78: coro_drive)
     BoxPtr ctx_data;                         // round 79: the contextvars mapping it starts with
+    // round 82: a loop callback's task (async_loop_call) - nothing awaits
+    // it, so its records are freed as soon as it has run; and the message
+    // Task.cancel(msg) gives its CancelledError.
+    bool ephemeral = false;
+    bool has_cancel_msg = false;
+    std::string cancel_msg;
 };
 
 // A task waiting for a socket or pipe to be ready (wait_io, section 9).
@@ -694,11 +705,26 @@ struct Loop {
 #ifndef _WIN32
     int wake_r = -1, wake_w = -1;
 #endif
+    // round 82 (lib/asyncio, the loop API): a loop made by async_loop_new
+    // outlives one run - its handle (0 for async_run's private loops), the
+    // task steps taken (stop() ends a run after the batch that was ready),
+    // a stop request, and the steps since the reactor was last polled (a
+    // loop whose ready queue never empties still polls I/O every 32 steps).
+    int64_t handle = 0;
+    uint64_t steps = 0, stop_at = 0, since_poll = 0;
+    bool stopping = false;
+    size_t prune_at = 256;
     ~Loop() {
 #ifndef _WIN32
         if (wake_r >= 0) { ::close(wake_r); ::close(wake_w); }
 #endif
     }
+};
+
+// round 82: a loop made by async_loop_new (asyncio's event loop object).
+struct LoopObj : Obj {
+    std::shared_ptr<Loop> L;
+    bool running = false, closed = false;
 };
 
 static void loop_wake_poll(Loop* L) {
@@ -1417,6 +1443,7 @@ struct Awaitable : Obj {
     Item target{};
     BoxPtr fn; std::vector<BoxPtr> args;
     bool return_exceptions = false;
+    bool has_at = false; TP at{};            // round 82: a loop timer's absolute deadline (async_loop_call)
 };
 
 static BoxPtr run_coro_body(Engine& e, Coro* c) {
@@ -1492,7 +1519,8 @@ static bool task_cancel_locked(Task* t) {
         t->in_ready = false;
         auto& r = t->loop->ready;
         r.erase(std::remove(r.begin(), r.end(), t), r.end());
-        task_finish_locked(t, nullptr, true, NyError::make("CancelledError", "task '" + t->name + "' was cancelled"));
+        task_finish_locked(t, nullptr, true, NyError::make("CancelledError",
+            t->has_cancel_msg ? t->cancel_msg : "task '" + t->name + "' was cancelled"));   // round 82: cancel(msg)
         return true;
     }
     if (t->thr) {
@@ -1549,6 +1577,7 @@ static void grant(std::unique_lock<std::mutex>& lk, Loop* L, Task* t) {
         }
     }
     ThreadRec* loop_rec = L->thread;
+    L->steps++;                      // round 82: stop()'s batch, the reactor's fairness
     lk.unlock();
     gil_acquire();
     switch_state(loop_rec, t->thr.get());
@@ -1562,9 +1591,32 @@ static void grant(std::unique_lock<std::mutex>& lk, Loop* L, Task* t) {
     gil_release();
     lk.lock();
     if (L->current == t) L->current = nullptr;
+    // round 82: a finished loop callback's records go now (nothing awaits
+    // it); the loop's own list drops finished tasks as it doubles, so a
+    // long-running loop does not keep every task it ever ran.
+    if (t->ephemeral && t->done && !t->co) {
+        RT().objs.erase(t->id);          // L->tasks still holds it, until pruned
+        if (t->thr) RT().threads.erase(t->thr->id);
+    }
+    if (L->handle && L->tasks.size() > L->prune_at) {
+        std::vector<std::shared_ptr<Task>> keep, gone;
+        for (auto& x : L->tasks) {
+            if (x->done && !x->co && !x->in_ready && x.get() != t) gone.push_back(std::move(x));
+            else keep.push_back(std::move(x));
+        }
+        L->tasks.swap(keep);
+        L->prune_at = std::max<size_t>(256, 2 * L->tasks.size());
+        // engine values (results, thread-locals) go with the GIL held and
+        // the runtime mutex released
+        lk.unlock();
+        gil_acquire();
+        gone.clear();
+        gil_release();
+        lk.lock();
+    }
 }
 
-static void loop_poll_io(std::unique_lock<std::mutex>& lk, Loop* L);
+static void loop_poll_io(std::unique_lock<std::mutex>& lk, Loop* L, bool no_wait = false);
 static void loop_run_signals(std::unique_lock<std::mutex>& lk);
 
 // Run loop L until `until` holds. Loop thread, runtime mutex held, GIL released.
@@ -1581,13 +1633,18 @@ static void run_loop_until(std::unique_lock<std::mutex>& lk, Loop* L, const std:
             make_ready(t);
         }
         if (!L->ready.empty()) {
+            // round 82: tasks that are always ready (a `while not done:
+            // await sleep(0)` waiting for a socket) must not starve the
+            // reactor - poll it without waiting every 32 steps, as asyncio
+            // polls its selector once per loop iteration.
+            if (!L->io.empty() && ++L->since_poll >= 32) { L->since_poll = 0; loop_poll_io(lk, L, true); continue; }
             Task* t = L->ready.front();
             L->ready.pop_front();
             if (t->done) { t->in_ready = false; continue; }
             grant(lk, L, t);
             continue;
         }
-        if (!L->io.empty()) { loop_poll_io(lk, L); continue; }
+        if (!L->io.empty()) { L->since_poll = 0; loop_poll_io(lk, L); continue; }
         if (!L->timers.empty()) {
             TP until_tp = L->timers.begin()->first.first;
             if (watch) until_tp = std::min(until_tp, Clock::now() + kSignalSlice);
@@ -1645,6 +1702,15 @@ static BoxPtr async_run(Engine& e, const Awaitable::Item& main_item) {
     std::lock_guard<std::mutex> l(RT().m);
     if (main_task->failed) throw main_task->err;
     return main_task->result ? main_task->result : e.box_none();
+}
+
+// A CALL_LATER: wait out its delay, then call. round 82: a loop timer
+// (async_loop_call) has an absolute deadline, kept whenever the loop runs.
+static BoxPtr run_call_later(Engine& e, ThreadRec* self, Awaitable* a) {
+    Deadline dl = Deadline::in_ms(a->secs * 1000.0);
+    if (a->has_at) { dl.finite = true; dl.tp = a->at; }
+    if (!a->has_at || !dl.expired()) block_released(self, {}, [] { return false; }, dl, nullptr);
+    return e.call(a->fn, a->args);
 }
 
 static BoxPtr task_outcome_locked(Engine& e, Task* t) {
@@ -1726,10 +1792,7 @@ static BoxPtr await_value(Engine& e, int64_t h, bool is_handle, const BoxPtr& v)
         block_released(self, {}, [] { return false; }, Deadline::in_ms(ms < 0 ? 0 : ms), nullptr);
         return e.box_none();
     }
-    if (a->kind == Awaitable::CALL_LATER) {
-        block_released(self, {}, [] { return false; }, Deadline::in_ms(a->secs * 1000.0), nullptr);
-        return e.call(a->fn, a->args);
-    }
+    if (a->kind == Awaitable::CALL_LATER) return run_call_later(e, self, a);
     // gather / wait_for need a loop; outside one, run a private loop for them.
     if (!self->task) {
         Awaitable::Item it{true, h, nullptr};
@@ -3112,7 +3175,10 @@ static std::unordered_map<std::string, Handler>& table() {
         };
         T["task_cancel"] = [](Engine&, const Args& a) {
             std::lock_guard<std::mutex> l(RT().m);
-            return Ret::boolean(task_cancel_locked(get_obj<Task>(H(a, 0, "task_cancel"), "task")));
+            Task* t = get_obj<Task>(H(a, 0, "task_cancel"), "task");
+            // round 82: task_cancel(h, msg) - Task.cancel(msg)
+            if (!t->done && a.size() > 1 && !a.is_none(1)) { t->has_cancel_msg = true; t->cancel_msg = a.as_str(1); }
+            return Ret::boolean(task_cancel_locked(t));
         };
         T["task_done"] = [](Engine&, const Args& a) {
             std::lock_guard<std::mutex> l(RT().m);
@@ -3131,6 +3197,196 @@ static std::unordered_map<std::string, Handler>& table() {
         T["async_current_task"] = [](Engine& e, const Args&) {
             ThreadRec* self = current(e);
             return Ret::integer(self->task ? self->task->id : 0);
+        };
+        // ── persistent loops (round 82: lib/asyncio's event loop API) ──────
+        // async_loop_new() -> a loop that outlives a run: tasks and callbacks
+        // can be put on it before it runs and from any thread
+        // (async_loop_spawn, async_loop_call); run_until_complete/run_forever
+        // run it on the calling thread (async_loop_run) and leave what is
+        // unfinished for the next run; stop() ends a run after the batch that
+        // was ready (async_loop_stop); close() cancels what is left, lets it
+        // unwind and frees the loop (async_loop_close).
+        T["async_loop_new"] = [](Engine& e, const Args&) {
+            current(e);
+            auto lo = std::make_shared<LoopObj>();
+            lo->L = std::make_shared<Loop>();
+            std::lock_guard<std::mutex> l(RT().m);
+            int64_t h = add_obj(lo, true);
+            lo->L->handle = h;
+            return Ret::integer(h);
+        };
+        T["async_loop_spawn"] = [](Engine& e, const Args& a) {
+            current(e);
+            if (a.size() < 2) raise("TypeError", "async_loop_spawn(loop, awaitable)");
+            int64_t lh = H(a, 0, "async_loop_spawn");
+            Awaitable::Item it = item_of(e, a, 1);
+            std::lock_guard<std::mutex> l(RT().m);
+            LoopObj* lo = get_obj<LoopObj>(lh, "event loop");
+            if (lo->closed) raise("RuntimeError", "Event loop is closed");
+            Task* t = ensure_task_locked(lo->L.get(), e, it);
+            loop_wake_poll(lo->L.get());
+            return Ret::integer(t->id);
+        };
+        // async_loop_call(loop, delay, fn, *args): fn(*args) as a callback
+        // task of the loop, `delay` seconds from now (none: as soon as
+        // possible) whenever the loop runs; freed once it has run.
+        T["async_loop_call"] = [](Engine& e, const Args& a) {
+            current(e);
+            if (a.size() < 3) raise("TypeError", "async_loop_call(loop, delay, fn, *args)");
+            int64_t lh = H(a, 0, "async_loop_call");
+            auto aw = std::make_shared<Awaitable>();
+            aw->kind = Awaitable::CALL_LATER;
+            aw->has_at = true;
+            aw->at = Clock::now();
+            if (!a.is_none(1)) {
+                double d = a.as_num(1);
+                if (d > 0) aw->at += std::chrono::microseconds((long long)(d * 1e6));
+            }
+            aw->fn = need_callable(e, a, 2, "async_loop_call");
+            aw->args = rest(a, 3);
+            std::lock_guard<std::mutex> l(RT().m);
+            LoopObj* lo = get_obj<LoopObj>(lh, "event loop");
+            if (lo->closed) raise("RuntimeError", "Event loop is closed");
+            Task* t = new_task_locked(lo->L.get(), e, [aw](Engine& en) {
+                return run_call_later(en, current(en), aw.get()); }, "callback");
+            t->ephemeral = true;
+            loop_wake_poll(lo->L.get());
+            return Ret::integer(t->id);
+        };
+        // async_loop_run(loop, task=none): run the loop on this thread until
+        // the task is done (none: until stopped); true when it is.
+        T["async_loop_run"] = [](Engine& e, const Args& a) -> Ret {
+            ThreadRec* self = current(e);
+            if (self->task) raise("RuntimeError", "Cannot run the event loop while another loop is running");
+            int64_t lh = H(a, 0, "async_loop_run");
+            std::shared_ptr<Loop> L;
+            Task* target = nullptr;
+            std::shared_ptr<Obj> keep_target;
+            {
+                std::lock_guard<std::mutex> l(RT().m);
+                LoopObj* lo = get_obj<LoopObj>(lh, "event loop");
+                if (lo->closed) raise("RuntimeError", "Event loop is closed");
+                if (lo->running) raise("RuntimeError", "This event loop is already running");
+                L = lo->L;
+                if (a.size() > 1 && !a.is_none(1)) {
+                    target = get_obj<Task>(H(a, 1, "async_loop_run"), "task");
+                    keep_target = RT().objs[target->id];
+                }
+                lo->running = true;
+                L->thread = self;
+                // stop() called before this run: one batch, then out (asyncio's rule)
+                if (L->stopping) L->stop_at = L->steps + L->ready.size();
+            }
+            ensure_active(e);
+            struct Running {
+                int64_t lh; Loop* L;
+                ~Running() {
+                    std::lock_guard<std::mutex> l(RT().m);
+                    L->stopping = false;
+                    auto it = RT().objs.find(lh);
+                    if (it != RT().objs.end()) if (auto* lo = dynamic_cast<LoopObj*>(it->second.get())) lo->running = false;
+                }
+            } running{lh, L.get()};
+            bool done = false;
+            {
+                GilRelease rel;
+                std::unique_lock<std::mutex> lk(RT().m);
+                Loop* Lp = L.get();
+                run_loop_until(lk, Lp, [Lp, target] {
+                    if (target && target->done) return true;
+                    return Lp->stopping && Lp->steps >= Lp->stop_at;
+                });
+                done = target && target->done;
+            }
+            return Ret::boolean(done);
+        };
+        T["async_loop_stop"] = [](Engine&, const Args& a) {
+            std::lock_guard<std::mutex> l(RT().m);
+            LoopObj* lo = get_obj<LoopObj>(H(a, 0, "async_loop_stop"), "event loop");
+            Loop* L = lo->L.get();
+            if (!L->stopping) {
+                L->stopping = true;
+                // what is ready now still runs (asyncio runs the current
+                // batch of callbacks), then the run ends
+                L->stop_at = L->steps + L->ready.size();
+            }
+            L->cv.notify_all();
+            loop_wake_poll(L);
+            return Ret::none();
+        };
+        // async_loop_close(loop): cancel what is left, let it unwind, free it.
+        T["async_loop_close"] = [](Engine& e, const Args& a) {
+            ThreadRec* self = current(e);
+            int64_t lh = H(a, 0, "async_loop_close");
+            std::shared_ptr<Loop> L;
+            {
+                std::lock_guard<std::mutex> l(RT().m);
+                auto it = RT().objs.find(lh);
+                LoopObj* lo = it == RT().objs.end() ? nullptr : dynamic_cast<LoopObj*>(it->second.get());
+                if (!lo || lo->closed) return Ret::none();
+                if (lo->running || self->task) raise("RuntimeError", "Cannot close a running event loop");
+                lo->closed = true;
+                L = lo->L;
+            }
+            ensure_active(e);
+            {
+                GilRelease rel;
+                std::unique_lock<std::mutex> lk(RT().m);
+                L->thread = self;
+                L->stopping = false;
+                for (auto& t : L->tasks) task_cancel_locked(t.get());
+                try {
+                    run_loop_until(lk, L.get(), [&L] {
+                        for (auto& t : L->tasks) if (!t->done) return false;
+                        return true;
+                    });
+                } catch (NyError&) { /* still blocked after cancellation: give up on them */ }
+            }
+            std::shared_ptr<Obj> dead;
+            {
+                std::lock_guard<std::mutex> l(RT().m);
+                bool stuck = false;
+                for (auto& t : L->tasks) if (t->co) stuck = true;
+                if (stuck) new std::shared_ptr<Loop>(L);       // their stacks point at it (as async_run keeps it)
+                auto it = RT().objs.find(lh);
+                if (it != RT().objs.end()) { dead = it->second; RT().objs.erase(it); }
+            }
+            dead.reset();
+            return Ret::none();
+        };
+        // async_current_loop(): the handle of the loop running this task (0:
+        // none, or one of async_run's private loops).
+        T["async_current_loop"] = [](Engine& e, const Args&) {
+            ThreadRec* self = current(e);
+            return Ret::integer(self->task && self->task->loop ? self->task->loop->handle : 0);
+        };
+        // async_create_task_eager(coro): a task that starts at once - it
+        // runs until its first wait (or to its end) before the calling task
+        // goes on (asyncio.eager_task_factory, 3.12).
+        T["async_create_task_eager"] = [](Engine& e, const Args& a) {
+            ThreadRec* self = current(e);
+            if (!self->task) raise("RuntimeError", "no running event loop");
+            if (a.size() < 1) raise("TypeError", "async_create_task_eager(coroutine)");
+            Awaitable::Item it = item_of(e, a, 0);
+            Task* t;
+            {
+                std::lock_guard<std::mutex> l(RT().m);
+                t = ensure_task_locked(self->task->loop, e, it);
+                if (t->done || t->started || t->loop != self->task->loop) return Ret::integer(t->id);
+            }
+            int64_t id = t->id;
+            {
+                GilRelease rel;
+                std::unique_lock<std::mutex> lk(RT().m);
+                Task* me = self->task;
+                auto& r = me->loop->ready;
+                r.erase(std::remove(r.begin(), r.end(), t), r.end());
+                r.erase(std::remove(r.begin(), r.end(), me), r.end());
+                r.push_front(me); me->in_ready = true;
+                r.push_front(t); t->in_ready = true;
+                task_park(lk, self, Deadline::never());
+            }
+            return Ret::integer(id);
         };
 
         // ── signals (section 9) ─────────────────────────────────────────────
@@ -3473,13 +3729,14 @@ bool read_stdin_line(std::string& out) {
 // The loop's reactor: poll every waiting task's descriptor (and the wake
 // pipe, and on the main thread the signal pipe) until the next timer.
 // Runtime mutex held on entry and exit, released while polling.
-static void loop_poll_io(std::unique_lock<std::mutex>& lk, Loop* L) {
+static void loop_poll_io(std::unique_lock<std::mutex>& lk, Loop* L, bool no_wait) {
     const bool watch = sig_watch();
     int ms = -1;
     if (!L->timers.empty()) {
         double d = std::chrono::duration<double, std::milli>(L->timers.begin()->first.first - Clock::now()).count();
         ms = d <= 0 ? 0 : (int)std::min(d + 0.999, 3600000.0);
     }
+    if (no_wait) ms = 0;     // round 82: a fairness poll between ready tasks
     std::vector<IoWait*> ws = L->io;
 #ifdef _WIN32
     if (ms < 0 || ms > 10) ms = 10;   // no wake socket: other threads' wake-ups are seen within 10 ms
