@@ -3060,6 +3060,12 @@ def _ny_module_spec_attr(module, attr):
     if isinstance(f, str) and f:
         var kind = "package" if f.endswith("__init__.ny") else "file"
         spec = m._spec_for_path(name, f, kind)
+        # a package's search locations are its __path__, as CPython's
+        # module.__path__ is spec.submodule_search_locations (native
+        # separators on Windows - they were rebuilt from __file__)
+        var pp = getattr(module, "__path__", None)
+        if kind == "package" and pp is not None:
+            spec.submodule_search_locations = pp
     elif getattr(module, "__path__", None) is not None:
         var p = list(module.__path__)
         spec = m._spec_for_path(name, p[0] if p else "", "namespace")

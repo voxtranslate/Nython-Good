@@ -251,6 +251,8 @@ void open(NythonExecutor& E, const Value& val, Context* ctx, Cursor& cu, bool ow
         if (n < 0) { open_dict(cu, c, 0, false); return; }   // a dict's keys, live (round 78)
         cu.k = Cursor::VEC;
         cu.v = E.iterItems(val, ctx);   // a set's items
+        // ... and the set with its size, checked at each step (round 81)
+        cu.c = c; cu.size0 = (size_t)n;
         return;
     }
     // A range of 64-bit ints and a dict view: natively (round 78); a big
@@ -297,6 +299,12 @@ bool step(NythonExecutor& E, Cursor& cu, Value& out, Context* ctx) {
         return true;
     }
     case Cursor::VEC:
+        // a set whose size changed: CPython's setiterator error, raised again
+        // at every later step (round 81; the snapshot hid the change)
+        if (cu.c && (size_t)NythonExecutor::seqLen(cu.c) != cu.size0) {
+            cu.size0 = (size_t)-1;
+            raise("RuntimeError", "Set changed size during iteration");
+        }
         if ((size_t)cu.i >= cu.v.size()) { cu.k = Cursor::END; return false; }
         out = cu.v[(size_t)cu.i++];
         return true;
@@ -764,9 +772,10 @@ bool machine_next(NythonExecutor& E, Gen* g, Value& out, Context* ctx) {
     try {
         got = g->kind == Kind::GenExpr ? genexpr_next(E, g, out) : native_next(E, g, out, ctx);
     } catch (...) {
-        // a dict iterator that saw its dict change size keeps raising, as
-        // CPython's does (round 78); anything else is finished
-        if (g->kind == Kind::Native && g->op == Op::Iter && g->src.size() == 1 && g->src[0].k == Cursor::DICT
+        // a dict (or set, round 81) iterator that saw it change size keeps
+        // raising, as CPython's does (round 78); anything else is finished
+        if (g->kind == Kind::Native && g->op == Op::Iter && g->src.size() == 1
+            && (g->src[0].k == Cursor::DICT || (g->src[0].k == Cursor::VEC && g->src[0].c))
             && g->src[0].size0 == (size_t)-1) { g->st = St::Suspended; throw; }
         finish(E, g);
         throw;

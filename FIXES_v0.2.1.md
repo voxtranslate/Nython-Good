@@ -5748,3 +5748,16 @@ Full detail in `HANDOFF.md` §0t2. New test: `vm_audit100` (114 checks; passes o
 | The interpreter was 3-9x slower than the round-80 VM and 22-165x slower than python3 | every `Value` carried a `Token` (two strings, a vector) copied with it; kinds told apart by side-table and `std::map` lookups and `dynamic_cast`; names looked up by string in every scope; the generic operator dispatch for `1 + 1`; a vector, a map and the side tables per call; method and class-attribute reads walked the MRO each time; eval functions took `shared_ptr`s by value | Values without tokens and with inline limbs, kind flags, in-node caches (literals, operator codes, a name's depth and slot, a field's slot), plain calls on the C++ stack, polymorphic inline caches for method calls, stores and class attributes, a builtin value's methods straight from its table: 3.09x faster (geomean of 11 benchmarks) |
 | A `return` inside `try`/`finally` or `with` cost a C++ exception (raytrace: 2,381 throws) | those statements suspended the pending-flag control flow | they check the flag themselves and run `finally` / `__exit__` with it cleared |
 | `isinstance(x, T)` cost ~300 string comparisons first | it was the 300th name tried in `dispatch_tensor` | called directly from `callBuiltin` (`builtin_isinstance`) |
+
+## Round 81, follow-ups — what the round's agents found
+
+Full detail in `HANDOFF.md` §0t4. New test: `vm_audit102` (51 checks; passes on both engines, with `NY_ASTSPEC=0` and under python3).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Interpreter: `C.m = lambda self: 1; f = o.m; f()` - "missing 1 required positional argument: 'self'" | `makeBoundMethod` bound only def functions | lambdas bound too; a bound lambda's call puts its instance first (`bindLambdaParams`) |
+| Interpreter: after `del C.m`, `o.m()` still ran the def | `callMethod`'s class-body scans found the deleted def | the scans skip a member `del` removed (`memberDeleted`) |
+| `[1, 2].pop("x")`: None (interpreter), 2 (VM) | a non-int index fell through to older pops | CPython's TypeError; `__index__`/bool/int subclasses accepted |
+| Reading a local before it is bound: NameError | no static knowledge of a function's bindings at run time | NyScope flags reads of names the function binds (`VariableNode::local_read`); both engines raise UnboundLocalError there |
+| `next(iter(s))` after `s.add(x)`: no error | iter() over a set walked a copy | the set and its size kept; "Set changed size during iteration" (both engines) |
+| Windows: vm_audit99 "a package's __spec__" | the spec's search locations were rebuilt from `__file__` with `/` while `__path__` has native separators | the spec uses the module's `__path__` |

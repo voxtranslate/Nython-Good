@@ -721,6 +721,9 @@ struct VMCode {
     InstrVec                 instructions;
     std::vector<VMVal>       constants;
     std::vector<std::string> names;
+    // Names this function binds and also reads (VariableNode::local_read):
+    // unbound when read, an UnboundLocalError (round 81).
+    std::vector<std::string> local_reads;
     std::vector<std::string> param_names;
     std::vector<VMVal>       param_defaults; // parallel to param_names; UNDEFINED = no default
     // For each default value MAKE_FUNCTION pops, the param_names index it
@@ -1286,11 +1289,19 @@ private:
         case NT::OPT_CHAIN: visit_opt_chain(std::static_pointer_cast<nython::node::OptChainNode>(nd)); break;
 
         // Names
-        case NT::VARIABLE:
-            if(std::static_pointer_cast<nython::node::VariableNode>(nd)->global_ref)
+        case NT::VARIABLE: {
+            auto* vn=static_cast<nython::node::VariableNode*>(nd.get());
+            if(vn->global_ref)
                 emit(Op::LOAD_GLOBAL_NAME,C().add_name(nd->token().value),l);
-            else emit_ln(nd->token().value,l);
+            else {
+                if(vn->local_read){   // round 81
+                    auto& lr=C().local_reads;
+                    if(std::find(lr.begin(),lr.end(),vn->name)==lr.end()) lr.push_back(vn->name);
+                }
+                emit_ln(nd->token().value,l);
+            }
             break;
+        }
         // self: the method's receiver; outside every method (no def around
         // it has a first parameter self) the ordinary name `self` (round 77:
         // it read none).
@@ -5097,7 +5108,7 @@ public:
         }
         if(it.type==VMType::LIST&&it.list){
             if(!it.is_set()) return list_iter(it);   // round 81: live, not a copy
-            std::vector<VMVal> copy=*it.list; return VMVal::make_iter(std::move(copy));
+            return set_iter(it);                     // round 81: its size checked
         }
         // a dict's (typed) keys; a string's characters; the old helper for
         // the rest
@@ -5107,6 +5118,28 @@ public:
     // CPython's listiterator - an item appended before the iterator ends is
     // reached, a shrunk list ends it, and an exhausted iterator stays so
     // (it iterated a copy made when it was created)
+    // round 81: iter(set) - the set's own items by position, its size
+    // checked at each step, as CPython's setiterator ("Set changed size
+    // during iteration", raised again at every later step); it walked a
+    // copy, so a change went unnoticed
+    VMVal set_iter(const VMVal& v) {
+        struct St { std::shared_ptr<std::vector<VMVal>> l; size_t i, size0; };
+        auto st=std::make_shared<St>(St{v.list,0,v.list?v.list->size():0});
+        VMVal g=gen_native("set_iterator",nullptr);
+        GenState* gs=g.gen.get();   // owns the function below
+        gs->native=[this,st,gs](VMVal& o)->bool{
+            if(!st->l) return false;
+            if(st->l->size()!=st->size0){
+                st->size0=(size_t)-1;
+                gs->sticky=true;
+                raise_native_exception("RuntimeError","Set changed size during iteration");
+            }
+            if(st->i>=st->l->size()){ st->l.reset(); return false; }
+            o=(*st->l)[st->i++];
+            return true;
+        };
+        return g;
+    }
     VMVal list_iter(const VMVal& v) {
         struct St { std::shared_ptr<std::vector<VMVal>> l; size_t i; };
         auto st=std::make_shared<St>(St{v.list,0});
@@ -5193,7 +5226,8 @@ private:
             case VMType::GENERATOR: case VMType::ITERATOR: return v;
             case VMType::LIST: {
                 if(v.list&&!v.is_set()) return list_iter(v);   // live (round 81)
-                std::vector<VMVal> c; if(v.list) c=*v.list; return VMVal::make_iter(std::move(c));
+                if(v.list) return set_iter(v);                  // size checked (round 81)
+                return VMVal::make_iter(std::vector<VMVal>{});
             }
             case VMType::STRING: case VMType::MAP: case VMType::INT: case VMType::BYTES: return VMVal::make_iter(iter_items(v));
             case VMType::INSTANCE: {
@@ -8383,6 +8417,10 @@ private:
                         push(class_value(fr.code->owner_class));
                         break;
                     }
+                    // round 81: a name the function binds, read while unbound
+                    auto& lr=fr.code->local_reads;
+                    if(!lr.empty()&&std::find(lr.begin(),lr.end(),n)!=lr.end())
+                        throw_exception(make_exception("UnboundLocalError",{VMVal::make_str("cannot access local variable '"+n+"' where it is not associated with a value")}));
                     throw_exception(make_exception("NameError",{VMVal::make_str("name '"+n+"' is not defined")}));
                 }
                 break;
@@ -14376,6 +14414,7 @@ private:
                 return VMVal::make_iter(iter_items(v));
             }
             if(v.type==VMType::LIST&&v.list&&!v.is_set()) return list_iter(v);   // live (round 81)
+            if(v.type==VMType::LIST&&v.list&&v.is_set()) return set_iter(v);     // size checked (round 81)
             if(v.type==VMType::LIST||v.type==VMType::STRING||v.type==VMType::MAP||v.type==VMType::BYTES){
                 // named as Python names it: list_iterator, str_iterator ... (round 77)
                 VMVal it=VMVal::make_iter(iter_items(v));
@@ -14878,7 +14917,15 @@ private:
         }
         if(m=="count"){ nargs(1,"count()"); int64_t c=0; for(auto& v:L) if(v==a[0]) c++; out=VMVal::make_int(c); return true; }
         if(m=="pop"){
-            if(!a.empty()&&a[0].type!=VMType::INT&&a[0].type!=VMType::BOOL) return false;
+            if(a.size()>1) raise_native_exception("TypeError","pop expected at most 1 argument, got "+std::to_string(a.size()));
+            // the index is an int (a bool, an __index__ object); anything
+            // else is CPython's TypeError - it fell through to the older pop,
+            // which removed the last item (round 81)
+            if(!a.empty()&&a[0].type!=VMType::INT&&a[0].type!=VMType::BOOL){
+                VMVal iv;
+                if(index_value(a[0],iv)) a[0]=iv;
+                else raise_native_exception("TypeError","'"+vm_type_name(a[0])+"' object cannot be interpreted as an integer");
+            }
             if(n==0) raise_native_exception("IndexError","pop from empty list");
             int64_t i=a.empty()?n-1:index_of(a[0],"list");
             if(i<0) i+=n;

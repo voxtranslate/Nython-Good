@@ -48,6 +48,7 @@ struct Scope {
     std::vector<WalrusNode*> walruses;
     std::vector<ExceptNode*> excepts;
     std::vector<WithNode*> withs;
+    std::vector<VariableNode*> reads;          // names read here (round 81)
     std::vector<std::unique_ptr<Scope>> children;
     Scope(Kind k, Scope* p) : kind(k), parent(p) {}
 
@@ -188,9 +189,14 @@ struct Collector {
         case NodeType::ASSIGNMENT_AUG: {
             auto a = std::static_pointer_cast<AugAssignNode>(n);
             walk(a->value_node, s);
+            if (a->target && a->target->type() == NodeType::VARIABLE)   // `x += 1` reads x first
+                s->reads.push_back(static_cast<VariableNode*>(a->target.get()));
             target(a->target, s, Write::ASSIGN);
             break;
         }
+        case NodeType::VARIABLE:
+            s->reads.push_back(static_cast<VariableNode*>(n.get()));
+            break;
         case NodeType::WALRUS: {
             auto w = std::static_pointer_cast<WalrusNode>(n);
             walk(w->init, s);
@@ -423,6 +429,15 @@ void check_scope(Scope* s) {
     for (auto* x : s->walruses) x->global_ref = s->globals.count(x->name) > 0;
     for (auto* x : s->excepts) x->var_global = s->globals.count(x->var) > 0;
     for (auto* x : s->withs) x->alias_global = s->globals.count(x->alias) > 0;
+    // A name a function binds anywhere in its body (an assignment, a loop
+    // or except/with target, a def, an import, a parameter), not declared
+    // global or nonlocal there: reading it while unbound is CPython's
+    // UnboundLocalError (round 81).
+    if (s->kind == Kind::FUNCTION)
+        for (auto* r : s->reads)
+            if (!s->globals.count(r->name) && !s->nonlocals.count(r->name)
+                && (s->declared.count(r->name) || s->assigned.count(r->name)))
+                r->local_read = true;
     for (auto& c : s->children) check_scope(c.get());
 }
 

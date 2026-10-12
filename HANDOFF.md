@@ -3,7 +3,8 @@
 Read this first. `CLAUDE.md` describes the project as it was designed;
 this file describes it **as it actually is**, including the traps.
 
-Last updated: round 81, part A — **§0t** (the semantic gaps round 80 left:
+Last updated: round 81, follow-ups — **§0t4** (gaps the round's agents found: class lambdas bound, `del C.m`, `list.pop`'s index, UnboundLocalError, set iterators; a package's `__spec__` on Windows; vm_audit102).
+Round 81, part A — **§0t** (the semantic gaps round 80 left:
 `except ... as e` unbinding, a live `globals()` and the real `__main__`,
 `__spec__` and `sys.meta_path`/`path_hooks` in the import statement,
 attribute hooks assigned later, live list iteration, "P() takes no
@@ -76,6 +77,58 @@ multi-cursor (71b/71c), §0c nytorch autograd (72), §5.10 nytorch class-name
 collisions.
 
 ---
+
+## 0t4. Round 81, follow-ups — what the round's agents found (vm_audit102)
+
+`examples/vm_audit102.ny` (51 checks) passes on the interpreter, with
+`NY_ASTSPEC=0`, on the VM and under python3. Every item was reproduced
+first (`/tmp`-style probes compared with python3), then fixed:
+
+- **A lambda put in a class binds as a def does** (interpreter): `C.m =
+  lambda self: 1; f = o.m; f()` raised "missing 1 required positional
+  argument: 'self'" - `makeBoundMethod` bound only FUNCTION nodes. It now
+  binds a lambda too, and `bindLambdaParams` puts a bound lambda's instance
+  first (its defaults are read under the lambda itself). `o.m()` always
+  worked; a lambda stored on an instance is still not bound.
+- **`del C.m` removes the method** (interpreter): the call path's
+  class-body scans (`callMethod`: the class's own body, the MRO bases, the
+  parent chain, the legacy super path) found the deleted def again. They
+  now skip a member `del` removed (`memberDeleted`, over round 77's
+  `class_vars_deleted_`); deleting an override reveals the base's method,
+  deleting the base's raises AttributeError, assigning it again works.
+- **`list.pop` takes an integer index** (both engines): `[1, 2].pop("x")`
+  gave None on the interpreter (it fell through to the old dict-style pop)
+  and popped 2 on the VM (the older pop ignored a non-int). Now CPython's
+  "'str' object cannot be interpreted as an integer"; `__index__` objects,
+  bools and int subclasses work; more than one argument is a TypeError.
+- **UnboundLocalError** (both engines): reading a name a function binds
+  (an assignment, `+=`, a loop/except/with target, a def, an import, a
+  parameter - not declared global/nonlocal) while it is unbound raised
+  `NameError: name 'x' is not defined`. The static scope pass
+  (`src/NyScope.cpp`) now records each function's reads and flags those of
+  names it binds (`VariableNode::local_read`); the interpreter's
+  `evalVariable` and the VM's `LOAD_NAME` (through `VMCode::local_reads`)
+  raise CPython's `UnboundLocalError: cannot access local variable 'x'
+  where it is not associated with a value` instead - looked at only where
+  a NameError would be raised, so no hot path pays. Nython's scope ruling
+  is untouched: a function that assigns `x` still reads a global `x`
+  before its own assignment (CPython raises there; Nython rebinds the
+  nearest binding, round 75), so the error appears only when no binding
+  exists anywhere.
+- **A set iterator notices the set changing size** (both engines): `it =
+  iter(s); next(it); s.add(9); next(it)` went on over a copy. The VM's
+  `set_iter` (a native generator like round 78's `dict_iter`) and the
+  interpreter's set cursor (`Cursor::VEC` with the set and its size) raise
+  "Set changed size during iteration", again at every later step, as
+  CPython's setiterator; part A had done the same for loops.
+- **A package's `__spec__` on Windows**: `submodule_search_locations` was
+  rebuilt from `__file__` (`lib/collections`) while round 80 gives
+  `__path__` native separators (`lib\collections`), so vm_audit99's
+  "a package's __spec__" failed under Wine. The spec now uses the module's
+  `__path__`, as CPython's `module.__path__` is the spec's list.
+- Verified: vm_audit102 51/51 on both engines, with `NY_ASTSPEC=0` and
+  under python3; vm_audit99 125/125 on both engines; `python3
+  tools/sweep.py` 431 runs, 0 not ok.
 
 ## 0t3. Round 81, part C — live debugging and the Profile view (vm_audit101, e2e `live`/`profile`)
 
@@ -217,7 +270,8 @@ whole suite 442 passed, 0 failed;
   server itself works on `--vm`, as vm_audit101 shows, but the IDE has no
   switch for it); the IDE's flame graph does not zoom.
 - `f_globals` / `globals()` are not live on either engine (worked around
-  in the server, not fixed).
+  in the server, not fixed). **Fixed by part A** (live views on both
+  engines); the server's workaround still works and was kept.
 
 ### Merged onto round 80 (2eb1221)
 - No conflicts. The agent's sweep had one failure, `vm_audit66 --vm` "lock
@@ -482,10 +536,13 @@ per frame, key, scroll or split.
   `del C.m` leaves `o.m()` callable on the interpreter (the class-body scan
   in `callMethod` finds the deleted def; the VM and python3 raise
   AttributeError); `[1, 2].pop("x")` returns None on the interpreter and
-  pops 2 on the VM (python3 raises TypeError).
+  pops 2 on the VM (python3 raises TypeError). **All three fixed in the
+  follow-ups, §0t4.**
 - The round-80 note on `C.__setattr__ = f` set after instances stored
   attributes (ignored on both engines) still holds; the store cache
   checks the same hook test (`instanceAttrHook`) as the general path.
+  (Part A fixed it on both engines; the merge keeps both the hook-cache
+  clear and this part's epoch bump.)
 - vm_audit66 (signals) failed once on the VM in a sweep run under heavy
   load (exit 1); it passed 12/12 runs of the new binary and 12/12 of the
   round-80 one afterwards, and in the final sweep.
@@ -673,7 +730,8 @@ engines the same way unless said.
   "Set changed size during iteration" (the interpreter's loop checks the
   size at each step; the VM's loop walks the set's own items through
   `stack_set_iter` - it walked a copy - and checks the size in FOR_ITER).
-  `iter(s)` / `next()` by hand still walk without the check.
+  `iter(s)` / `next()` by hand still walk without the check (fixed in
+  the follow-ups, §0t4).
 - Functions show as CPython's `<function Qualname at 0x...>` (the address
   id() gives): `<function outer.<locals>.inner at 0x...>`, `<function
   K.s at 0x...>` for a staticmethod (the interpreter showed
@@ -693,7 +751,8 @@ engines the same way unless said.
 - Reading a function's local before it is assigned (or after `del`) is a
   NameError, not CPython's UnboundLocalError (a NameError subclass:
   `except NameError` catches both); the scope ruling of round 75 decides
-  what is local at run time, so the engines would need a static scan.
+  what is local at run time, so the engines would need a static scan. (Fixed in the follow-ups, §0t4: NyScope flags the
+  reads, so no run-time scan was needed.)
 - The program has no `__loader__` and no `__builtins__` global.
 - A jump from a for loop's header event into its body is refused on the
   interpreter (CPython allows it: the iterator is on the stack there), as

@@ -1333,6 +1333,11 @@ public:   // NythonExecutor is a struct: members default to public
             if (vn->name == "__class__" && !owner_stack_.empty() && owner_stack_.back()
                 && owner_stack_.back()->type() == NodeType::CLASS)
                 return classValueOfNode(owner_stack_.back());
+            // round 81: a name its function binds, read before it is
+            // bound (or after del): CPython's UnboundLocalError
+            if (vn->local_read)
+                throw std::string("__exc__:UnboundLocalError:cannot access local variable '" + vn->name
+                                  + "' where it is not associated with a value");
             std::string hint = suggestName(vn->name);
             if (!hint.empty()) hint = "  (did you mean '" + hint + "'?)";
             throw std::string("__exc__:NameError:name '" + vn->name + "' is not defined" + hint);
@@ -3559,8 +3564,16 @@ public:   // NythonExecutor is a struct: members default to public
             out = intValue(cnt); return true;
         }
         if (name == "pop") {
-            // A non-integer argument is a dict-style pop on a map; not here.
-            if (!args.empty() && args[0].type != ValueType::INTEGER && args[0].type != ValueType::BOOLEAN) return false;
+            if (args.size() > 1) pyRaise("TypeError", "pop expected at most 1 argument, got " + std::to_string(args.size()));
+            // The index is an int (a bool, an __index__ object, an int
+            // subclass); anything else is CPython's TypeError - it fell
+            // through to the dict-style pop, which gave None (round 81).
+            if (!args.empty() && args[0].type != ValueType::INTEGER && args[0].type != ValueType::BOOLEAN) {
+                Value p;
+                if (any_payload_ && payloadOf(args[0], p) && p.type == ValueType::INTEGER) args[0] = p;
+                else if (indexValue(args[0], p, ctx)) args[0] = p;
+                else pyRaise("TypeError", "'" + typeNameOf(args[0]) + "' object cannot be interpreted as an integer");
+            }
             if (n == 0) pyRaise("IndexError", "pop from empty list");
             int64_t i = n - 1;
             if (!args.empty()) { Num k; asNum(args[0], k); i = k.k == 1 ? k.i : INT64_MAX; if (i < 0) i += n; }
@@ -5428,8 +5441,11 @@ public:   // NythonExecutor is a struct: members default to public
         auto ast_it = func_ast_nodes.find(fn_val.value.p);
         if (ast_it != func_ast_nodes.end()) ast_ptr = ast_it->second;
         Node* raw = (Node*)ast_ptr;
-        if (!raw || raw->type() != NodeType::FUNCTION) return fn_val;
-        auto* fn = static_cast<FunctionNode*>(raw);
+        // a lambda in a class binds as any function does (round 81:
+        // `C.m = lambda self: 1; f = o.m; f()` lost the instance)
+        const bool is_lambda = raw && raw->type() == NodeType::LAMBDA && tag.rfind("__lambda__", 0) == 0;
+        if (!raw || (raw->type() != NodeType::FUNCTION && !is_lambda)) return fn_val;
+        auto* fn = is_lambda ? nullptr : static_cast<FunctionNode*>(raw);
         // One written in the class body binds when it takes self (a Nython
         // method without self stays a plain function); one put in the class
         // from elsewhere - a decorator's wrapper(*args) - binds whatever its
@@ -5438,7 +5454,7 @@ public:   // NythonExecutor is a struct: members default to public
         // (round 78: one written in the class body binds whatever its first
         // parameter is called, as Python - `def m(this, x)`, `def m(s)`;
         // __new__ is a static method)
-        if (direct_methods_.count(fn) && fn->name == "__new__") return fn_val;
+        if (fn && direct_methods_.count(fn) && fn->name == "__new__") return fn_val;
         // Reuse an existing binding for this exact (method, instance) pair.
         //
         // Without this, every read of `obj.method` as a VALUE allocated a fresh
@@ -5459,7 +5475,7 @@ public:   // NythonExecutor is a struct: members default to public
         if (cached != bound_cache_.end())
             return nyheap::userValue(cached->second, (void*)&cached->second->tag);
 
-        auto* bo = new nyheap::Bound(this, "__bound__:" + fn->name);
+        auto* bo = new nyheap::Bound(this, "__bound__:" + (fn ? fn->name : std::string("<lambda>")));
         void* bp = (void*)&bo->tag;
         Value out = nyheap::userValue(bo, bp);
         bo->fn = fn_val;
@@ -6462,7 +6478,8 @@ public:   // NythonExecutor is a struct: members default to public
             }
 
             // Search class body for the method (fallback for non-decorated methods)
-            if (cn->body) {
+            // - not one `del C.m` removed (round 81: it was still called)
+            if (cn->body && !memberDeleted(cn, method_name)) {
                 for (auto& stmt : cn->body->statements()) {
                     if (stmt->type() == NodeType::FUNCTION) {
                         auto* fn = static_cast<FunctionNode*>(stmt.get());
@@ -6512,7 +6529,7 @@ public:   // NythonExecutor is a struct: members default to public
                 Node* parent_node = classNodeByName(parent_name);
                 if (!parent_node) continue;
                 auto* pcn = static_cast<ClassNode*>(parent_node);
-                if (!pcn->body) continue;
+                if (!pcn->body || memberDeleted(pcn, method_name)) continue;   // del Base.m (round 81)
                 for (auto& stmt : pcn->body->statements()) {
                     if (stmt->type() != NodeType::FUNCTION) continue;
                     auto* fn = static_cast<FunctionNode*>(stmt.get());
@@ -6541,7 +6558,7 @@ public:   // NythonExecutor is a struct: members default to public
                 Node* parent_node = (Node*)parent_class_it->second;
                 if (parent_node->type() == NodeType::CLASS) {
                     auto* pcn = static_cast<ClassNode*>(parent_node);
-                    if (pcn->body) {
+                    if (pcn->body && !memberDeleted(pcn, method_name)) {
                         for (auto& stmt : pcn->body->statements()) {
                             if (stmt->type() == NodeType::FUNCTION) {
                                 auto* fn = static_cast<FunctionNode*>(stmt.get());
@@ -6571,7 +6588,7 @@ public:   // NythonExecutor is a struct: members default to public
                     Node* parent_node = (Node*)parent_class_it->second;
                     if (parent_node->type() == NodeType::CLASS) {
                         auto* pcn = static_cast<ClassNode*>(parent_node);
-                        if (pcn->body) {
+                        if (pcn->body && !memberDeleted(pcn, method_name)) {
                             for (auto& stmt : pcn->body->statements()) {
                                 if (stmt->type() == NodeType::FUNCTION) {
                                     auto* fn = static_cast<FunctionNode*>(stmt.get());
@@ -8039,6 +8056,19 @@ public:   // NythonExecutor is a struct: members default to public
     void bindLambdaParams(LambdaNode* lam, std::vector<Value>& args,
                           const nyrt::OrderedKw<Value>& kw, Context* fc, Context* def_ctx,
                           void* callee_ptr = nullptr) {
+        // a lambda bound as a method (makeBoundMethod) takes its instance
+        // first; its defaults are kept under the lambda itself (round 81)
+        if (callee_ptr && !bound_self_.empty()) {
+            auto bs = bound_self_.find(callee_ptr);
+            if (bs != bound_self_.end()) {
+                std::vector<Value> with_self;
+                with_self.reserve(args.size() + 1);
+                with_self.push_back(bs->second->self);
+                for (auto& a : args) with_self.push_back(a);
+                bindLambdaParams(lam, with_self, kw, fc, def_ctx, bs->second->fn.value.p);
+                return;
+            }
+        }
         // Python's whole parameter grammar - `*`, `/`, keyword-only
         // parameters, **kw, unexpected keywords - binds as a def's does
         // (round 77: `lambda *, k: k`, `lambda **kw: kw` and `lambda a, /, b`
@@ -8571,7 +8601,7 @@ public:
                         Node* pnode = (Node*)pcit->second;
                         if (pnode && pnode->type() == NodeType::CLASS) {
                             auto* pcn = static_cast<ClassNode*>(pnode);
-                            if (pcn->body) {
+                            if (pcn->body && !memberDeleted(pcn, method_name)) {
                                 for (auto& stmt : pcn->body->statements()) {
                                     if (stmt->type() != NodeType::FUNCTION) continue;
                                     auto* fn = static_cast<FunctionNode*>(stmt.get());
@@ -9208,6 +9238,11 @@ public:
     std::unordered_map<void*, Value> exc_instance_map_; // raised instance ptr -> Value
     std::map<std::string, Value> class_vars_; // "ClassName.varName" -> Value (shared class-level variables)
     std::unordered_set<std::string> class_vars_deleted_;   // "ClassName.varName" deleted (round 77)
+    // `del C.m` removed m from the class: its def in the class body is not
+    // found again (round 81)
+    bool memberDeleted(const ClassNode* cn, const std::string& n) const {
+        return !class_vars_deleted_.empty() && class_vars_deleted_.count(cn->name + "." + n);
+    }
     std::map<void*, Context*> class_ctx_map_; // class node ptr -> evaluated class body context (for decorators); owns a reference
     void setClassContext(void* class_node, Context* c) {
         nygc::incref(c);

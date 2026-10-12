@@ -124,6 +124,10 @@ struct VariableNode : Node {
     // module level (created there by an assignment), whatever an enclosing
     // function binds.
     bool global_ref = false;
+    // A read of a name its own function binds (set by NyScope): bound
+    // nowhere when read, it is CPython's UnboundLocalError, not a NameError
+    // (round 81; the flag is looked at only where a NameError would be).
+    bool local_read = false;
     NameCache nc;   // round 81: reading it (NythonExecutor::lookupName)
     // ... and for assigning it: whether it is one of the builtins' names,
     // as of the executor's version of that set (base_names_ver_).
