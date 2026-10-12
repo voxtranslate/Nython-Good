@@ -1010,6 +1010,26 @@ async def lowlevel():
     out["getnameinfo"] = (await loop.getnameinfo(("127.0.0.1", 80), socket.NI_NUMERICHOST | socket.NI_NUMERICSERV))
     return out
 
+async def busy_wait_io():
+    # a task that keeps the loop busy (sleep(0) in a loop) must not starve
+    # the I/O: the reader still runs
+    loop = asyncio.get_running_loop()
+    a, b = socket.socketpair()
+    a.setblocking(False)
+    b.setblocking(False)
+    got = []
+    loop.add_reader(b, lambda: got.append(b.recv(10)))
+    a.send(b"ping")
+    n = 0
+    while not got and n < 100000:
+        await asyncio.sleep(0)
+        n += 1
+    loop.remove_reader(b)
+    a.close()
+    b.close()
+    return [got, n < 1000]
+check("I/O is polled while tasks stay ready", run(busy_wait_io()), [[b"ping"], True])
+
 ll = run(lowlevel())
 check("sock_sendall / sock_recv / sock_recv_into", [ll["sock_recv"], ll["sock_recv_into"]], [b"over a socketpair", [5, b"12345"]])
 check("add_reader / remove_reader", ll["add_reader"], [[b"readable"], True, False])
