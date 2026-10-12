@@ -1296,17 +1296,19 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   return may (`canPend`: the function's own statements); a frame hands it
   on by the flag only when its call site asked (`runFunctionBody(pend)`).
   Everything else (builtins calling back, generator bodies, threads,
-  `exec`, the prelude's callbacks) still throws. exceptions benchmark 4.5x
-  fewer instructions.
-- **Rules**: an evaluator given `pend` must check the flag right after
-  each child it evaluated with `evalP` and return before doing anything
-  else; a construct that runs user code while a flag is set takes it out
-  first (`takeExc`) and puts it back (`pendExc`); code that evaluates
-  statements in a caller's scope (`exec`, `lang_eval`) runs under
-  `SuspendFast`. `flow()` reads a constant-initialized per-thread pointer
-  (`t_flow_`): never put a `thread_local` with a constructor in a hot
-  inline function (its guard and constructor land at every use, and GCC
-  stopped inlining `pendingSet` over it).
+  `exec`, the prelude's callbacks) still throws. The exceptions benchmark:
+  4.9G -> 1.1G instructions, 3x faster.
+- **Rules**: an evaluator given `pend` must check `raisedBy(v)` right
+  after each child it evaluated with `pend` and return before doing
+  anything else, and must **return None whenever it leaves an exception
+  pending** (`raisedBy` reads the flag only for a None result, CPython's
+  NULL-then-`PyErr_Occurred()`); a construct that runs user code while a
+  flag is set takes it out first (`takeExc`) and puts it back (`pendExc`);
+  code that evaluates statements in a caller's scope (`exec`, `lang_eval`)
+  runs under `SuspendFast`. `flow()` reads a constant-initialized
+  per-thread pointer (`t_flow_`): never put a `thread_local` with a
+  constructor in a hot inline function (its guard and constructor land at
+  every use, and GCC stopped inlining `pendingSet` over it).
 - `for a, b in enumerate(...)` / `zip(...)` bind the targets from the
   iterator's parts (no tuple per step); a for statement's targets are
   unpacked as Python does on both engines (exactly that many values,
