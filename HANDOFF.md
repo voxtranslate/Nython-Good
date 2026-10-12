@@ -444,6 +444,21 @@ per frame, key, scroll or split.
   80 81 82 83 98 on the VM.
 - The VM's instruction counts (fib, closures) are within 0.2% of round 80's.
 
+### Merged with parts A and C
+- Conflicts only in `evalStatements` (part A's jump resumption kept, over
+  part B's in-place statement list), `evalCall`'s first lines (part A's
+  extension-stack test kept; B's fast paths come after it, and every
+  function body still passes `runFunctionBody`'s recursion-limit check)
+  and the class-attribute store (a hook assigned on a class clears A's
+  hook caches and bumps B's epoch).
+- vm_audit99/100/101 pass on the interpreter, with `NY_ASTSPEC=0` and on
+  the VM (99 and 100 under python3); `python3 tools/sweep.py` 429 runs, 0
+  not ok; `tools/ide_e2e.py` 442 passed; memprobe 0.00 KB everywhere.
+- The merged interpreter against part B's own binary
+  (`run.py --engine interp -n 5`): 1.03x geometric mean (noise both ways;
+  generators re-run with `-n 11`: 0.97x) - part A's changes cost nothing
+  measurable, so the 3.09x over round 80 stands.
+
 ### Not done / found
 - **Python exceptions are still C++ throws** on the interpreter: the
   exceptions benchmark spends ~65% in the unwinder (`__gxx_personality_v0`
