@@ -1694,7 +1694,12 @@ def charmap_build(map):
     return d
 
 
+_ny_str_type = str
+
+
 def charmap_encode(str, errors=None, mapping=None):
+    # (the parameter is CPython's name; it hides the type - round 83: an
+    # error handler's str replacement was never encoded through the map)
     if mapping is None:
         return latin_1_encode(str, errors)
     var out = bytearray()
@@ -1718,7 +1723,7 @@ def charmap_encode(str, errors=None, mapping=None):
                 h = lookup_error(errors or "strict")
             var res = h(exc)
             var rep = res[0]
-            if isinstance(rep, str):
+            if isinstance(rep, _ny_str_type):
                 rep = charmap_encode(rep, "strict", mapping)[0]
             out.extend(rep)
             i = res[1] if res[1] >= 0 else n + res[1]

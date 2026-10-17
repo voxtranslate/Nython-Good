@@ -9751,8 +9751,9 @@ public:
                 auto it = cont->container->find(attr);
                 if (it != cont->container->end()) { out = it->second; return true; }
                 // round 81: a module's __spec__ / __loader__, made when first
-                // read (the prelude's _ny_module_spec_attr)
-                if ((attr == "__spec__" || attr == "__loader__") && isModuleNamespace(obj)) {
+                // read (the prelude's _ny_module_spec_attr); round 83: its
+                // __dict__, the live namespace vars(module) gives
+                if ((attr == "__spec__" || attr == "__loader__" || attr == "__dict__") && isModuleNamespace(obj)) {
                     std::vector<Value> a{obj, makeStringValue(attr)};
                     out = callFunctionValue(global_ctx->getByName("_ny_module_spec_attr"), a, ctx ? ctx : global_ctx);
                     return true;

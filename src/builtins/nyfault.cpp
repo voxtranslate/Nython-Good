@@ -105,8 +105,6 @@ namespace {
 
 // ── which engine runs the program ───────────────────────────────────────────
 std::atomic<nyconc::Engine*> g_vm_engine{nullptr};
-std::atomic<const void*> g_vm_runnable{nullptr};
-std::atomic<bool> g_vm_mode{false};
 // the interpreter thread that last called in: its frames are the live ones
 // while there is no second thread (no GIL)
 std::atomic<const NythonExecutor::PyFrames*> g_frames{nullptr};
@@ -115,16 +113,36 @@ std::atomic<int64_t> g_ident{0};
 thread_local bool t_python = false;      // this thread has run Python code (its frames are initialized)
 
 void note_caller(NythonExecutor& E, int64_t ident) {
-    const void* vmr = g_vm_runnable.load();
-    bool vm = vmr && (const void*)E.runner == vmr;
-    g_vm_mode.store(vm);
-    if (!vm) {
-        g_frames.store(&NythonExecutor::py_frames());
-        g_cur.store(&NythonExecutor::cur_stmt());
-    }
+    (void)E;
+    g_frames.store(&NythonExecutor::py_frames());
+    g_cur.store(&NythonExecutor::cur_stmt());
     if (ident) g_ident.store(ident);
     t_python = true;
 }
+
+// Which engine runs the program: both engines exist in either mode (the
+// interpreter's host is a VirtualMachine too), so the frames tell - the VM's
+// stack has frames only when the VM runs the program, and the interpreter's
+// walk leaves out the prelude, all a VM-mode thread ever ran there.
+struct CountSink {
+    nyconc::Engine::FrameEmit emit;
+    void* sink;
+    int n;
+};
+void count_emit(void* s, const char* file, long line, const char* name) {
+    auto* c = static_cast<CountSink*>(s);
+    c->n++;
+    if (c->emit) c->emit(c->sink, file, line, name);
+}
+// the VM's live frames, through emit; false when it has none
+bool walk_vm_live(nyconc::Engine::FrameEmit emit, void* sink) {
+    nyconc::Engine* e = g_vm_engine.load();
+    if (!e) return false;
+    CountSink c{emit, sink, 0};
+    e->walk_frames(nullptr, count_emit, &c);
+    return c.n > 0;
+}
+bool vm_running() { return walk_vm_live(nullptr, nullptr); }
 
 // ── async-signal-safe output ────────────────────────────────────────────────
 void wr(int fd, const char* s, size_t n) {
@@ -204,10 +222,7 @@ void dump_emit(void* s, const char* file, long line, const char* name) {
 
 // the frames running now (the GIL holder's, or the only thread's)
 void walk_live(nyconc::Engine::FrameEmit emit, void* sink, bool self) {
-    if (g_vm_mode.load()) {
-        if (nyconc::Engine* e = g_vm_engine.load()) e->walk_frames(nullptr, emit, sink);
-        return;
-    }
+    if (walk_vm_live(emit, sink)) return;
     if (self && t_python) {
         ny_interp_walk(&NythonExecutor::py_frames(), NythonExecutor::cur_stmt(), emit, sink);
         return;
@@ -219,7 +234,6 @@ void walk_live(nyconc::Engine::FrameEmit emit, void* sink, bool self) {
 void dump_frames(int fd, nyconc::Engine* eng, const void* estate, bool live, bool self) {
     DumpSink d{fd, 0, false};
     if (live) walk_live(dump_emit, &d, self);
-    else if (g_vm_mode.load() && g_vm_engine.load()) g_vm_engine.load()->walk_frames(estate, dump_emit, &d);
     else if (eng) eng->walk_frames(estate, dump_emit, &d);
     if (d.depth == 0) ws(fd, "  <no Python frame>\n");
 }
@@ -472,8 +486,11 @@ void capture_emit(void* s, const char* file, long line, const char* name) {
 } // namespace
 
 void nyfault_set_vm_engine(nyconc::Engine* eng, const void* vm_runnable) {
-    g_vm_engine.store(eng);
-    g_vm_runnable.store(vm_runnable);
+    // the first VM made is the one that runs the program (in VM mode; the
+    // interpreter's host VM never has frames)
+    (void)vm_runnable;
+    nyconc::Engine* none = nullptr;
+    g_vm_engine.compare_exchange_strong(none, eng);
 }
 
 namespace nytm {
@@ -481,10 +498,7 @@ namespace nytm {
 // thread): the engine's live frames when this thread holds the GIL.
 static void capture(Capture& c) {
     if (!nyconc::holds_gil() || (!t_python && !nyconc::active())) return;
-    if (g_vm_mode.load()) {
-        if (nyconc::Engine* e = g_vm_engine.load()) e->walk_frames(nullptr, capture_emit, &c);
-        return;
-    }
+    if (walk_vm_live(capture_emit, &c)) return;
     if (t_python) ny_interp_walk(&NythonExecutor::py_frames(), NythonExecutor::cur_stmt(), capture_emit, &c);
 }
 static uint32_t intern_tb(TM* tm, Capture& c) {
@@ -773,7 +787,7 @@ Value dispatch_fault(NythonExecutor& E, const std::string& name, std::vector<Val
         // the object's own block: the interpreter's heap object, or (on the
         // VM, whose values the bridge copies) the address id() gives
         uintptr_t addr = 0;
-        if (!g_vm_mode.load() && !a.empty()) {
+        if (!vm_running() && !a.empty()) {
             const Value& v = a[0];
             if (v.type == ValueType::USERDATA && v.value.o) addr = (uintptr_t)v.value.o;
             else if (v.isCollectable() && v.value.gc) addr = (uintptr_t)v.value.gc;

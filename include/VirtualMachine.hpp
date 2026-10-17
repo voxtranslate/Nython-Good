@@ -11528,8 +11528,9 @@ private:
                 return true;
             }
             // round 81: a module's __spec__ / __loader__, made when first
-            // read (the prelude's _ny_module_spec_attr)
-            if(obj.type==VMType::MAP&&(attr=="__spec__"||attr=="__loader__")&&is_module_ns(obj)&&!is_property_desc(obj)&&obj.class_name.rfind("__",0)!=0){
+            // read (the prelude's _ny_module_spec_attr); round 83: its
+            // __dict__, the live namespace vars(module) gives
+            if(obj.type==VMType::MAP&&(attr=="__spec__"||attr=="__loader__"||attr=="__dict__")&&is_module_ns(obj)&&!is_property_desc(obj)&&obj.class_name.rfind("__",0)!=0){
                 std::vector<VMVal> a{obj, VMVal::make_str(attr)};
                 out=vm_call(load_var("_ny_module_spec_attr"),a,std::nullopt);
                 return true;
@@ -12706,6 +12707,11 @@ private:
                 std::vector<VMVal> ga{make_slice_object(spec)};
                 return invoke_method(m, obj, ga, obj.class_name);
             }
+            // self.__class__(...): a new instance of the object's class -
+            // before __getattr__, which is asked only for what does not
+            // exist (round 83: a class with __getattr__ was asked for
+            // __class__, filecmp.dircmp's phase4)
+            if(method=="__class__") return vm_call(class_value(obj.class_name), args, std::nullopt, kwargs);
             // __getattr__ supplies attributes that do not exist otherwise.
             {
                 VMVal ga;
@@ -12722,8 +12728,6 @@ private:
             // Only reached once no user-defined method/attribute of this name
             // was found above, so a class's own to_string/class_name etc, if
             // it defines one, still wins.
-            // self.__class__(...): a new instance of the object's class
-            if(method=="__class__") return vm_call(class_value(obj.class_name), args, std::nullopt, kwargs);
             if(method=="class_name"||method=="type_name")
                 return VMVal::make_str(nyrt::shown_class_name(obj.class_name));
             if(method=="to_string"||method=="str")

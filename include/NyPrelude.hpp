@@ -3113,6 +3113,9 @@ def _ny_module_spec_attr(module, attr):
     # (round 81) __spec__ / __loader__ of a module the engines imported,
     # made when first read: importlib.machinery's ModuleSpec and loader for
     # its file (BuiltinImporter's for sys, os, math, builtins)
+    if attr == "__dict__":
+        # (round 83) module.__dict__: its live namespace, as vars(module)
+        return vars(module)
     import importlib.machinery
     var m = importlib.machinery
     var name = getattr(module, "__name__", None)
@@ -5254,7 +5257,7 @@ def _ny_os_member_list():
             _sys_execv(_ny_os_str(path), [_ny_os_str(a) for a in args],
                        [_ny_os_str(k) + "=" + _ny_os_str(env[k]) for k in env])
         def _execvpe(file, args, env=None):
-            if os_path_dirname(file):
+            if _ny_osp_dirname(file):
                 if env is None:
                     execv(file, args)
                 else:
@@ -5263,7 +5266,7 @@ def _ny_os_member_list():
             var saved = None
             var last = None
             for d in _ny_os_get_exec_path(env):
-                var full = os_path_join(d, file)
+                var full = _ny_osp_join(d, file)
                 try:
                     if env is None:
                         execv(full, args)

@@ -141,6 +141,7 @@ if posix:
 
 # ── termios, tty, pty (POSIX) ────────────────────────────────────────────────
 if posix:
+    import errno
     import termios
     import tty
     import pty
@@ -604,6 +605,7 @@ check("install binds _", builtins._("Hello"), "Hallo")
 del builtins._
 
 # ── readline, rlcompleter ────────────────────────────────────────────────────
+import math
 try:
     import readline
     have_readline = True
@@ -863,6 +865,14 @@ with lzma.open(lp, "rt", encoding="utf-8") as f:
 with lzma.LZMAFile(lp) as f:
     check("LZMAFile", [f.read(2), f.tell(), f.seekable()], [b"xz", 2, True])
 check("concatenated streams", lzma.decompress(lzma.compress(b"a") + lzma.compress(b"b")), b"ab")
+if nython:
+    # without liblzma (NY_NO_LIBLZMA=1 pretends it is absent) the native
+    # decoder still reads .xz and .lzma; a compressor names the library
+    r = child("import lzma\nprint(int(lzma.decompress(bytes.fromhex('" + xz.hex() + "')) == b'nython lzma test\\n' * 20))\n"
+              "print(lzma.decompress(bytes.fromhex('" + alone.hex() + "')))\n"
+              "try:\n    lzma.compress(b'x')\nexcept lzma.LZMAError as e:\n    print(int('liblzma' in str(e)))\n",
+              {"NY_NO_LIBLZMA": "1"})
+    check("without liblzma: the native decoder", [r[0]] + r[1].split(), [0, "1", "b'alone", "format'", "1"])
 
 # ── faulthandler ─────────────────────────────────────────────────────────────
 import faulthandler
@@ -963,6 +973,7 @@ check("Traceback.format", tracemalloc.Traceback(((__file__, 1),)).format(), ['  
 
 # ── locale ───────────────────────────────────────────────────────────────────
 import locale
+import codecs
 check("setlocale C", [locale.setlocale(locale.LC_ALL, "C"), locale.setlocale(locale.LC_NUMERIC), locale.getlocale(locale.LC_NUMERIC)],
       ["C", "C", (None, None)])
 conv = locale.localeconv()
