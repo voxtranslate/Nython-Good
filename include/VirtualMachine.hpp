@@ -1981,6 +1981,12 @@ private:
                 emit(Op::LOAD_NAME,C().add_name(acc),l);
                 emit(Op::CALL_FUNCTION,1,l);
             } else emit(Op::LOAD_NAME,C().add_name(acc),l);
+            // (round 83) the accumulator goes once the result is on the
+            // stack: kept, it held the list until the comprehension ran
+            // again (`del` of the result freed nothing; in a class body it
+            // was a class attribute). The renamed targets stay - a lambda
+            // made in the element may read them later.
+            emit(Op::DELETE_NAME,C().add_name(acc),l);
             break;
         }
         case NT::LIST: {

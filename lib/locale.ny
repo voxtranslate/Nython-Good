@@ -25,8 +25,11 @@
 # setlocale(LC_NUMERIC) report, so locale.str(1.5) gives "1,5" in de_DE as
 # in CPython.
 #
-# Not here: locale.format() (removed in 3.12); the UTF-8 mode CPython can
-# run in (sys.flags.utf8_mode is 0: getpreferredencoding is the locale's).
+# Nython always runs in what CPython calls UTF-8 mode (sys.flags.utf8_mode
+# is 1), so getpreferredencoding() is 'utf-8', as CPython's is under -X utf8;
+# getencoding() is the C library's CODESET.
+#
+# Not here: locale.format() (removed in 3.12).
 
 """Locale support module.
 

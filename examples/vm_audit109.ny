@@ -1012,6 +1012,32 @@ except locale.Error:
     pass
 locale.setlocale(locale.LC_ALL, "C")
 
+# ── found on the way ─────────────────────────────────────────────────────────
+import gc
+import json
+import weakref
+class Kept:
+    pass
+made = [Kept() for i in range(3)]
+first = weakref.ref(made[0])
+del made
+gc.collect()
+class WithComp:
+    squares = [i * i for i in range(3)]
+check("a comprehension's list goes with its last reference (and is no class attribute)",
+      [first() is None, [k for k in vars(WithComp) if "comp" in k], WithComp.squares], [True, [], [0, 1, 4]])
+json.__dict__["ny109_x"] = 5
+check("module.__dict__ is its live namespace", [json.__dict__["dumps"] is json.dumps, json.ny109_x, "loads" in json.__dict__],
+      [True, 5, True])
+class Lazy:
+    def __getattr__(self, name):
+        raise AttributeError(name)
+    def again(self):
+        return self.__class__()
+check("self.__class__() in a class with __getattr__", type(Lazy().again()).__name__, "Lazy")
+with io.open_code(__file__) as f:
+    check("io.open_code", [f.read(2), raises(io.open_code, 5)[0]], [b"# ", "TypeError"])
+
 # ── done ─────────────────────────────────────────────────────────────────────
 shutil.rmtree(TMP, ignore_errors=True)
 for r in results:
