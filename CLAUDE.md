@@ -394,6 +394,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit101 | 125 | round 81: the live debug server driven over its socket (`--debug-port`, DAP messages: breakpoints with conditions/hit counts/log messages, stepping, pause, stack/scopes/variables by reference, evaluate, setVariable, raised/uncaught exceptions, `--connect`, stdin/argv untouched) and its ring buffer (stepBack/reverseContinue/seek, Why? over the live history); the Profile view's reader on real `-m cProfile [--stacks]` dumps (Nython-only) |
 | vm_audit106 | 27 | round 82 follow-ups: TaskGroup exception groups (children's errors then the body's), wait() refusing coroutines, CancelledError() with empty args, the ThreadPoolExecutor default executor, create_server(None) on every family it can open, sock_sendfile/sendfile/os.sendfile, connect_read_pipe/connect_write_pipe, sys.set_asyncgen_hooks and shutdown_asyncgens, the `gc` module, unretrieved task/future exceptions reported, native objects freed (passes under python3) |
 | vm_audit107 | 22 | round 82 follow-ups (2): `import name` finds `.py` modules, `__init__.py` packages and `.py` namespace packages (`.ny` first, so a `.py` never shadows a library module), `-m name.py`, quoted imports from any directory, `threading.Lock` released by another thread (Python's ownerless lock) and its errors, threading seen from asyncio tasks (get_ident/current_thread/local), `_thread` (passes under python3) |
+| vm_audit110 | 259 | round 83, part C: sqlite3 over libsqlite3 loaded at run time (every DB-API path, transactions incl. `autocommit=`, user functions/aggregates/window functions/collations, authorizer/progress/trace, Row, blobs, backup, iterdump text, adapters/converters, callbacks from several threads), dbm (dumb, sqlite3)/shelve, the email package (CPython's exact strings: parse/generate round trips, the default policy's EmailMessage/MIMEPart API, MIME classes, utils, headers), quopri/uu/mailbox/mailcap/netrc/cgi/cgitb, plistlib and audioop/wave/aifc/sunau byte-identical to CPython's, wsgiref and xmlrpc over HTTP, smtplib/poplib/imaplib/ftplib/telnetlib/LMTP against servers on localhost, and over TLS (passes under python3) |
 | vm_audit105 | 118 | round 82: lib/aiagent.ny's NyxAgent on a fixture workspace - `ny_facts`, call/import graphs, BM25F rankings (definitions over uses, call-graph neighbours, incremental, JSON round trip), the rule engine (closure, stratified negation, why), explain/doc/review/fix at exact lines, generated tests that run and pass (doctests, boundaries, a shrunk counterexample, a hang, a .py module under python3), completion MRR before/after training, GitHubLearner over a local http.server (Nython-only) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
@@ -1351,6 +1352,31 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
 - In an asyncio task, threading's ident/current_thread/local are the loop
   thread's (`thread_os_id()`); `thread_id()` is the task's record.
 - `lib/gc.ny`, `lib/_thread.ny`; `f.fileno()` is the OS descriptor.
+
+## Round 83, part C: sqlite3, email, the mail/network protocols, data formats (see `HANDOFF.md` §0v3)
+
+- **`sqlite3`** over libsqlite3 loaded at run time (`src/builtins/nysqlite.cpp`,
+  natives `_sql_*`; `NY_LIBSQLITE3`; ImportError naming the library when it is
+  absent): `lib/_sqlite3.ny` is CPython's C module written in Nython (the whole
+  DB-API, transactions as 3.12 - `autocommit=` too -, user functions/
+  aggregates/window functions/collations, authorizer/progress/trace, Row,
+  Blob, backup, serialize, adapters/converters, CPython's messages);
+  `lib/sqlite3/` is CPython's package. **SQLite's callbacks never call into an
+  engine**: a connection's SQLite calls run on a NyCoro coroutine that a
+  callback suspends; the native returns the request, `_sqlite3.ny` calls the
+  function as ordinary Nython code and resumes it (`_sql_resume`). The GIL is
+  released while SQLite runs.
+- `dbm` (3.13's: dbm.sqlite3, dbm.dumb, whichdb), `shelve`.
+- **`email`** (CPython 3.12's package, file for file), `quopri`, `uu`,
+  `mailbox`, `mailcap`; `smtplib`, `poplib`, `imaplib`, `ftplib`,
+  `telnetlib`, `xmlrpc`, `wsgiref`, `cgi`, `cgitb`, `netrc`; `plistlib`;
+  `audioop` (the C module in Nython), `wave`, `aifc`, `sunau`, `chunk`,
+  `sndhdr`, `imghdr` - outputs byte-identical to CPython 3.12's.
+- A class with a `__new__` of its own does not get Nython's `def init`
+  constructor alias (both engines): Python classes use `init` as an ordinary
+  method.
+- Ported CPython modules that use `errno`/`locale`/`tokenize`/`ast`/`pydoc`
+  do so when present; `sys.audit` is called only where the runtime has it.
 
 ## Transcripts
 

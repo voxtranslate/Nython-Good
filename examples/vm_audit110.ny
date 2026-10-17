@@ -3,18 +3,23 @@
 #
 # sqlite3 over libsqlite3 loaded at run time (transactions, every DB-API
 # path, user functions/aggregates/window functions/collations, the
-# authorizer and progress handler, adapters and converters, Row, blobs,
-# backup, iterdump text, CPython's messages); dbm (dumb, sqlite3) and
-# shelve; the email package (parse/generate round trips of a real-world
-# MIME message with CPython's exact strings, the default policy's
-# EmailMessage, the compat32 MIME classes, utils, header, charset,
-# defects); quopri, uu, mailbox (mbox, Maildir, MH, Babyl, MMDF), mailcap,
-# netrc, cgi, cgitb; plistlib (XML and binary bytes as CPython's);
-# audioop, wave, aifc, sunau, chunk, sndhdr, imghdr; wsgiref and xmlrpc
-# over real HTTP servers; smtplib, poplib, imaplib, ftplib (passive and
-# active) and telnetlib against servers written here, on localhost.
-# Every expected value is CPython's (computed by python3). Where SQLite is
-# not installed the sqlite3 checks are skipped with a notice.
+# authorizer, progress and trace hooks, adapters and converters, Row,
+# blobs, backup, iterdump text, CPython's messages, callbacks from several
+# threads at once); dbm (dumb, sqlite3) and shelve; the email package
+# (parse/generate round trips of a real-world MIME message with CPython's
+# exact strings, the default policy's EmailMessage/MIMEPart API, the
+# compat32 MIME classes, utils, header, charset, defects); quopri, uu,
+# mailbox (mbox, Maildir, MH, Babyl, MMDF), mailcap, netrc, cgi, cgitb;
+# plistlib (XML and binary bytes as CPython's); audioop, wave, aifc, sunau,
+# chunk, sndhdr, imghdr; wsgiref and xmlrpc over real HTTP servers;
+# smtplib, poplib, imaplib, ftplib (passive and active), telnetlib and LMTP
+# (a Unix socket, SMTPUTF8) against servers written here, on localhost, and
+# STARTTLS/SMTP_SSL/POP3_SSL/IMAP4_SSL/FTP_TLS with a throwaway CA.
+# Every expected value is CPython's (computed by python3; the 3.12-only
+# checks carry CPython 3.12's values on 3.11 too). Skipped with a notice
+# (not counted): the sqlite3 checks where SQLite is not installed, the TLS
+# checks where there is no openssl command, LMTP where there are no Unix
+# sockets.
 #
 #     ./build/nython-cli examples/vm_audit110.ny
 #     ./build/nython-cli --vm examples/vm_audit110.ny
