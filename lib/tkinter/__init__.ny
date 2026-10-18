@@ -2019,7 +2019,9 @@ class Misc:
         "type hello", "key ctrl+a", "drag 10 10 90 10", "wheel 20 20 -1",
         "resize 400 300", ...) to the real event loop and return once all
         of them have been delivered and the resulting idle work is done.
-        Needs NY_STUB_EVENTS set before the first window opens."""
+        Coordinates are the window's; the input goes to the most recently
+        opened window, as in the stub's scripts ("window N" picks the Nth
+        open one).  Needs NY_STUB_EVENTS set before the first window opens."""
         cmds = []
         for c in commands:
             if isinstance(c, (list, tuple)):
