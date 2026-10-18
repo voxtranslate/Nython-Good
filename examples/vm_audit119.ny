@@ -466,6 +466,27 @@ for r in range(3):
 res = "module res"
 check("functions made in a loop", [[f(10) for f in made], res], [[10, 11, 12], "module res"])
 
+import asyncio
+av = "module av"
+
+async def coro():
+    av = "local av"
+    await asyncio.sleep(0)
+    return av
+
+check("async def: its assignment is its local", [asyncio.run(coro()), av], ["local av", "module av"])
+
+def lambda_reads_later_binding():
+    get = lambda: later
+    later = "bound after the lambda"
+    return get()
+
+check("a lambda reads the enclosing function's later binding", lambda_reads_later_binding(), "bound after the lambda")
+
+global gx
+gx = "module gx"
+check("global at module level", gx, "module gx")
+
 def try_finally():
     try:
         out = "try"

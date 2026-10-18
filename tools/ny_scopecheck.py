@@ -33,7 +33,7 @@ the engines see. Each is classified:
                Python's. Listed.
 
     python3 tools/ny_scopecheck.py                    # summary of lib/ + the IDE
-    python3 tools/ny_scopecheck.py --list [a|b|c] [files...]
+    python3 tools/ny_scopecheck.py --list [--only a|b|c] [files...]
     python3 tools/ny_scopecheck.py --python-ready [files...]
                      # the files whose functions bind as Python's rule says
                      # they should: no case (a) or (c) left (case (b) is what
@@ -100,10 +100,8 @@ def classify(c):
 
 
 def rel(f):
-    try:
-        return os.path.relpath(f, ROOT)
-    except ValueError:
-        return f
+    r = os.path.relpath(os.path.abspath(f), ROOT)
+    return f if r.startswith("..") else r
 
 
 def describe(c):
@@ -173,7 +171,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("files", nargs="*")
     ap.add_argument("--bin", default=os.path.join(ROOT, "build", "nython-cli"))
-    ap.add_argument("--list", nargs="?", const="abc", default=None)
+    ap.add_argument("--list", action="store_true")
+    ap.add_argument("--only", default="abc", help="with --list: the classes listed (a, b, c)")
     ap.add_argument("--python-ready", action="store_true")
     ap.add_argument("--fix", action="store_true")
     ap.add_argument("--fix-locals", action="store_true")
@@ -197,9 +196,9 @@ def main():
             if n["a"] == 0 and n["c"] == 0:
                 print(rel(f))
         return 0
-    if a.list is not None:
+    if a.list:
         for c in cases:
-            if classify(c) in a.list:
+            if classify(c) in a.only:
                 print("(%s) %s" % (classify(c), describe(c)))
         return 0
     total = collections.Counter(classify(c) for c in cases)

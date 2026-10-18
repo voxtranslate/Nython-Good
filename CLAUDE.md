@@ -406,6 +406,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit113 | 389 | round 84 (part B): unicodedata (every property over a sample, NormalizationTest-14.0.0, ucd_3_2_0, aliases and named sequences), str by the database (full case mapping, final sigma, casefold, title, the is* predicates, Unicode whitespace and line breaks, int/float/complex/Decimal of Unicode digits), PEP 3131 identifiers, re's Unicode classes, the CJK codecs (every one, every error handler, incremental, streams), utf-7, the single-byte code pages, idna's nameprep, email charsets, mbcs/oem/code_page_* on Windows (392 there, run under Wine); generated from python3.11's values (`tools/vm_audit113_spec.py`; the 380 shared checks pass under python3.11) |
 | vm_audit114 | 215 | round 84 (part C): tkinter/ttk/turtle over Nython's own Tk (the Tcl subset, widgets, geometry managers, events and bindings, variables, images, fonts, ttk styles, dialogs, turtle) driven through the scripted-input harness (python3: skipped without tkinter) |
 | vm_audit115 | 611 | round 84 (part D): curses without ncurses - ten programs under a pty on xterm-256color and vt100 compared cell for cell with CPython+ncurses through the VT emulator, terminfo against infocmp, tparm, byte counts (585 under python3.11 with ncurses) |
+| vm_audit119 | 82 | round 85 (part F): Python's binding rule in a Python-language file - every binding form, UnboundLocalError, closures/nonlocal, class bodies, comprehensions, generators, decorators, exec/eval/compile/ast from the file; Nython-only: a `.ny` file keeps Nython's rule, the def-line opt-in, `-W nython-scope` / `NY_SCOPE_WARN`, `--scope-report` (63 pass under python3) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -510,7 +511,9 @@ These entries are now **fixed**; they are listed so old notes are not trusted:
   declare a local that shadows any outer name for the rest of that function
   from the point it runs; `global` names the module's variable, `nonlocal`
   the enclosing function's. for-loop targets, parameters, comprehension
-  variables and `except ... as` are local declarations too.
+  variables and `except ... as` are local declarations too. Round 85:
+  Python-language source (.py, `# nython: python`, the ported lib modules)
+  follows Python's rule instead - see "Round 85, part F".
 - ~~Interpreter lambdas capture loop variables by value~~ — **resolved
   (round 76)**: lambdas close over their scope by reference, as `def` does
   (`[lambda: i for i in range(3)]` gives 2, 2, 2, as Python), and a lambda
@@ -1643,7 +1646,54 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
 - **Ported Python code and the scope rule**: two round 84 agents hit
   Nython's rule that a plain assignment in a function rebinds a module name
   of the same name (tkinter's `W` became a widget path); write `var` for
-  locals in ported modules.
+  locals in ported modules. (Round 85: the ported modules are now
+  Python-language and bind as CPython does - see below.)
+
+## Round 85, part F: Python's binding rule for Python-language source
+
+- **Python-language source binds names as CPython does, on both engines**: a
+  `.py` file, a file whose leading comment block says `# nython: python`,
+  code `compile()`/`exec()`/`eval()` compile when called from such a file
+  (a code object keeps its rule: `_NyCode._ny_pyrule`; code named after a
+  source file - `compile(src, "prog.ny", ...)`, as runpy/pdb/cProfile run a
+  program - is that file's language, `nython::scope::code_rule`), and ast
+  trees compiled (lib/ast.ny is Python-language). A name a function binds
+  anywhere (assignment, augmented assignment, for/with/except-as, `del`,
+  import, def/class, walrus - one in a comprehension binds in the function -,
+  match captures) is its local unless declared global/nonlocal; reading it
+  unbound is UnboundLocalError. `.ny` files keep Nython's rule.
+- **Decided once, in the static scope pass** (`src/NyScope.cpp`, CPython's
+  symtable pass): each read, assignment and del of such a local is marked
+  `VariableNode::py_bind = 1`; the interpreter reads it from the function's
+  own scope only (`readPyLocal`, the node's slot cache at depth 0), binds it
+  there (`assignName`) and deletes it there (`evalDelete`); the VM emits
+  `LOAD_LOCAL` / `DEFINE_NAME` / `DELETE_LOCAL` (round 85 ops, after
+  FIN_EXC_OF). exec without namespaces in a Python-language function runs in
+  a scope of its own (its top-level writes `py_bind = 2`): it reads the
+  function's variables but cannot change them (CPython).
+- A Nython function opts in with `# nython: python` on its def line (its
+  nested functions too).
+- **Census**: `python3 tools/ny_scopecheck.py` (over `nython --scope-report
+  files...`, a hidden flag: the parser's own analysis) lists every place the
+  two rules disagree, classified (a) rebinding meant / (b) clobber / (c)
+  unclear; `--fix` adds the `global`/`nonlocal` case (a) needs, `--fix-locals`
+  a `var` for case (b). lib/ and the IDE: 68 cases, all in CPython-ported
+  modules where CPython means a local (one live bug: `_parseaddr`'s
+  `quote = False` replaced the module's quote()). The 435 CPython-ported
+  `# nython: module` files are marked `# nython: python` (a second line);
+  Nython's own (`_tkinter/`, `nyxai/`, `_nyvt`, `ide_debugserver`,
+  `websocket`, the generated `_nydocs`, `html/entities`) and every
+  non-module library stay Nython-language.
+- **Warnings for Nython code**: `-W nython-scope[:filter]` or
+  `NY_SCOPE_WARN=1|all|<path substring>` prints, when a Nython-language file
+  is parsed, each function assignment/augmentation/del that rebinds a module
+  (or enclosing function) variable without a declaration, and each read of
+  a name before a local binding of it ("1": files outside the library).
+- Not done: CPython's "cannot access free variable" message (a closure read
+  of an enclosing local not yet bound falls back to the module's name or a
+  NameError); `exec("global x ...")` from a Python-language function binds
+  the module's x through the snippet's scope chain as CPython does, but a
+  name exec'd code binds is not visible to a later `locals()` there.
 
 ## Transcripts
 

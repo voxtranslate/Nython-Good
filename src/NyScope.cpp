@@ -49,18 +49,21 @@ struct Pos {
     Pos(const Location& l) : row(l.row), col(l.column) {}
 };
 
+// A declaration: where, and (round 85) what declared the name first - 'p'
+// a parameter, 'd' def, 'c' class, 'i' import, 'v' var/let/const, 't' a
+// for/with/except target or walrus, 'n' an enum/interface/namespace.
+struct Decl : Location {
+    char kind = 'v';
+    Decl(const Location& l, char k = 'v') : Location(l), kind(k) {}
+};
+
 struct Scope {
     Kind kind;
     Scope* parent;
     bool py = false;    // round 85: Python's binding rule here (NyScope.hpp)
     Node* fn = nullptr; // round 85: the def or lambda this function scope is
-    std::map<std::string, Location> declared;  // var/let/const, params, def, class, import, loop/except/with targets
-    // round 85: what declared each name first - 'p' a parameter, 'd' def,
-    // 'c' class, 'i' import, 'v' var/let/const, 't' a for/with/except
-    // target or walrus, 'n' an enum/interface/namespace
-    std::map<std::string, char> dkind;
+    std::map<std::string, Decl> declared;      // var/let/const, params, def, class, import, loop/except/with targets
     std::set<std::string> assigned;            // plain assignment targets
-    std::map<std::string, Pos> assigned_at;    // round 85: ... where first assigned
     std::map<std::string, Location> consts;    // const declarations here
     std::map<std::string, Location> globals;   // `global x`
     std::map<std::string, Location> nonlocals; // `nonlocal x`
@@ -94,7 +97,8 @@ struct Lines {
     bool any = false;   // the source holds "nython: python" at all
     void init(const std::string& c) {
         code = &c;
-        any = c.find("nython: python") != std::string::npos || c.find("nython:python") != std::string::npos;
+        // ('#' first: memchr skips through a source by its rarest character)
+        any = c.find("# nython: python") != std::string::npos;
         if (!any) return;
         starts.push_back(0);
         for (size_t i = 0; i < c.size(); i++) if (c[i] == '\n') starts.push_back(i + 1);
@@ -145,9 +149,9 @@ struct Collector {
             auto d = s->declared.find(n);
             if (d != s->declared.end())
                 throw SyntaxError(at, "cannot redeclare '" + n + "' as a constant " + on_line(d->second));
-            s->consts.emplace(n, at);
+            s->consts.try_emplace(n, at);
         }
-        if (s->declared.emplace(n, at).second) s->dkind.emplace(n, kind);
+        s->declared.try_emplace(n, at, kind);   // (made only when new)
     }
 
     void write(Scope* s, const std::string& n, Write how, const Location& at, VariableNode* node = nullptr) {
@@ -155,11 +159,8 @@ struct Collector {
         // name like any other (`_ = f()` in a function is its local)
         if (n.empty() || (n == "_" && !s->py)) return;
         s->writes.push_back({n, how, at, node, cur_aug});
-        if (how == Write::ASSIGN) {
-            s->assigned.insert(n);
-            s->assigned_at.emplace(n, Pos(at));   // round 85
-        }
-        else if (how == Write::LOCAL) { if (s->declared.emplace(n, at).second) s->dkind.emplace(n, 't'); }
+        if (how == Write::ASSIGN) s->assigned.insert(n);
+        else if (how == Write::LOCAL) s->declared.try_emplace(n, at, 't');
     }
 
     // An assignment / loop target: a name, or a tuple/list of targets.
@@ -193,7 +194,7 @@ struct Collector {
         if (!n) return;
         switch (n->type()) {
         case NodeType::FUNCTION: {
-            auto f = std::static_pointer_cast<FunctionNode>(n);
+            auto* f = static_cast<FunctionNode*>(n.get());   // (no count traffic)
             all(f->defaults, s);
             if (!f->name.empty()) declare(s, f->name, n->token().location(), false, 'd');
             Scope* fs = child(s, Kind::FUNCTION);
@@ -205,7 +206,7 @@ struct Collector {
             break;
         }
         case NodeType::LAMBDA: {
-            auto f = std::static_pointer_cast<LambdaNode>(n);
+            auto* f = static_cast<LambdaNode*>(n.get());
             all(f->defaults, s);
             Scope* fs = child(s, Kind::FUNCTION);
             fs->fn = n.get();
@@ -214,26 +215,26 @@ struct Collector {
             break;
         }
         case NodeType::CLASS: {
-            auto c = std::static_pointer_cast<ClassNode>(n);
+            auto* c = static_cast<ClassNode*>(n.get());
             all(c->bases, s);
             declare(s, c->name, n->token().location(), false, 'c');
             walk(c->body, child(s, Kind::CLASS));
             break;
         }
         case NodeType::INTERFACE: {
-            auto c = std::static_pointer_cast<InterfaceNode>(n);
+            auto* c = static_cast<InterfaceNode*>(n.get());
             declare(s, c->name, n->token().location(), false, 'n');
             walk(c->body, child(s, Kind::CLASS));
             break;
         }
         case NodeType::NAMESPACE: {
-            auto c = std::static_pointer_cast<NameSpaceNode>(n);
+            auto* c = static_cast<NameSpaceNode*>(n.get());
             declare(s, c->name, n->token().location(), false, 'n');
             walk(c->body, child(s, Kind::CLASS));
             break;
         }
         case NodeType::ENUM: {
-            auto e = std::static_pointer_cast<EnumNode>(n);
+            auto* e = static_cast<EnumNode*>(n.get());
             declare(s, e->name, n->token().location(), false, 'n');
             for (auto& it : e->items)
                 if (it && it->type() == NodeType::ENUM_ITEM)
@@ -241,19 +242,19 @@ struct Collector {
             break;
         }
         case NodeType::VARIABLE_DECL: {
-            auto d = std::static_pointer_cast<VarDeclNode>(n);
+            auto* d = static_cast<VarDeclNode*>(n.get());
             walk(d->init, s);
             declare(s, d->name, n->token().location(), d->is_const);
             break;
         }
         case NodeType::ASSIGNMENT: {
-            auto a = std::static_pointer_cast<AssignmentNode>(n);
+            auto* a = static_cast<AssignmentNode*>(n.get());
             walk(a->value_node, s);
             target(a->target, s, Write::ASSIGN);
             break;
         }
         case NodeType::ASSIGNMENT_AUG: {
-            auto a = std::static_pointer_cast<AugAssignNode>(n);
+            auto* a = static_cast<AugAssignNode*>(n.get());
             walk(a->value_node, s);
             if (a->target && a->target->type() == NodeType::VARIABLE)   // `x += 1` reads x first
                 s->reads.push_back(static_cast<VariableNode*>(a->target.get()));
@@ -266,10 +267,10 @@ struct Collector {
             s->reads.push_back(static_cast<VariableNode*>(n.get()));
             break;
         case NodeType::WALRUS: {
-            auto w = std::static_pointer_cast<WalrusNode>(n);
+            auto* w = static_cast<WalrusNode*>(n.get());
             walk(w->init, s);
             write(s, w->name, Write::LOCAL, n->token().location());
-            s->walruses.push_back(w.get());
+            s->walruses.push_back(w);
             // round 85: in a comprehension it binds in the scope around
             // the comprehensions (PEP 572)
             if (s->kind == Kind::COMP) {
@@ -280,7 +281,7 @@ struct Collector {
             break;
         }
         case NodeType::DELETE: {
-            auto d = std::static_pointer_cast<DeleteNode>(n);
+            auto* d = static_cast<DeleteNode*>(n.get());
             if (d->target && d->target->type() == NodeType::VARIABLE)
                 write(s, d->target->value(), Write::DEL, d->target->token().location(),
                       static_cast<VariableNode*>(d->target.get()));
@@ -288,7 +289,7 @@ struct Collector {
             break;
         }
         case NodeType::FOR: {
-            auto f = std::static_pointer_cast<ForNode>(n);
+            auto* f = static_cast<ForNode*>(n.get());
             walk(f->iterable, s);
             target(f->var, s, Write::LOCAL);
             for (auto& u : f->unpack_vars) target(u, s, Write::LOCAL);
@@ -297,44 +298,44 @@ struct Collector {
             break;
         }
         case NodeType::WHILE: {
-            auto w = std::static_pointer_cast<WhileNode>(n);
+            auto* w = static_cast<WhileNode*>(n.get());
             walk(w->condition, s); walk(w->body, s); walk(w->else_branch, s);
             break;
         }
         case NodeType::REPEAT: {
-            auto r = std::static_pointer_cast<RepeatNode>(n);
+            auto* r = static_cast<RepeatNode*>(n.get());
             walk(r->count, s); walk(r->body, s);
             break;
         }
         case NodeType::IF: {
-            auto i = std::static_pointer_cast<IfNode>(n);
+            auto* i = static_cast<IfNode*>(n.get());
             walk(i->condition, s); walk(i->then_branch, s);
             all(i->elseif_branches, s);
             walk(i->else_branch, s);
             break;
         }
         case NodeType::SWITCH: {
-            auto w = std::static_pointer_cast<SwitchNode>(n);
+            auto* w = static_cast<SwitchNode*>(n.get());
             walk(w->subject, s); all(w->cases, s); walk(w->default_case, s);
             break;
         }
         case NodeType::CASE: {
-            auto c = std::static_pointer_cast<CaseNode>(n);
+            auto* c = static_cast<CaseNode*>(n.get());
             walk(c->value_node, s); walk(c->body, s);
             break;
         }
         case NodeType::DEFAULT:
-            walk(std::static_pointer_cast<DefaultNode>(n)->body, s);
+            walk(static_cast<DefaultNode*>(n.get())->body, s);
             break;
         case NodeType::TRY: {
-            auto t = std::static_pointer_cast<TryNode>(n);
+            auto* t = static_cast<TryNode*>(n.get());
             walk(t->body, s);
             for (auto& ec : t->except_clauses) {
                 if (!ec || ec->type() != NodeType::EXCEPT) { walk(ec, s); continue; }
-                auto e = std::static_pointer_cast<ExceptNode>(ec);
+                auto* e = static_cast<ExceptNode*>(ec.get());
                 if (!e->var.empty()) {
                     write(s, e->var, Write::LOCAL, ec->token().location());
-                    s->excepts.push_back(e.get());
+                    s->excepts.push_back(e);
                 }
                 walk(e->body, s);
             }
@@ -342,17 +343,17 @@ struct Collector {
             break;
         }
         case NodeType::WITH: {
-            auto w = std::static_pointer_cast<WithNode>(n);
+            auto* w = static_cast<WithNode*>(n.get());
             walk(w->expr, s);
             if (!w->alias.empty()) {
                 write(s, w->alias, Write::LOCAL, n->token().location());
-                s->withs.push_back(w.get());
+                s->withs.push_back(w);
             }
             walk(w->body, s);
             break;
         }
         case NodeType::GLOBAL: {
-            auto g = std::static_pointer_cast<GlobalNode>(n);
+            auto* g = static_cast<GlobalNode*>(n.get());
             Location at = n->token().location();
             if (g->is_nonlocal) {
                 if (s->kind == Kind::MODULE)
@@ -368,13 +369,13 @@ struct Collector {
             break;
         }
         case NodeType::IMPORT: {
-            auto im = std::static_pointer_cast<ImportNode>(n);
+            auto* im = static_cast<ImportNode*>(n.get());
             if (!im->alias.empty()) declare(s, im->alias, n->token().location(), false, 'i');
             for (auto& nm : im->names) declare(s, nm, n->token().location(), false, 'i');
             break;
         }
         case NodeType::COMPREHENSION: {
-            auto c = std::static_pointer_cast<ComprehensionNode>(n);
+            auto* c = static_cast<ComprehensionNode*>(n.get());
             Scope* cs = child(s, Kind::COMP);
             for (auto& cl : c->clauses) {
                 walk(cl.iter, cs);
@@ -385,68 +386,68 @@ struct Collector {
             break;
         }
         case NodeType::CALL: {
-            auto c = std::static_pointer_cast<CallNode>(n);
+            auto* c = static_cast<CallNode*>(n.get());
             walk(c->callee, s); all(c->args, s);
             break;
         }
-        case NodeType::KEYWORD_ARG: walk(std::static_pointer_cast<KeywordArgNode>(n)->val, s); break;
-        case NodeType::UNARY: walk(std::static_pointer_cast<UnaryNode>(n)->operand, s); break;
+        case NodeType::KEYWORD_ARG: walk(static_cast<KeywordArgNode*>(n.get())->val, s); break;
+        case NodeType::UNARY: walk(static_cast<UnaryNode*>(n.get())->operand, s); break;
         case NodeType::BINARY: {
-            auto b = std::static_pointer_cast<BinaryNode>(n);
+            auto* b = static_cast<BinaryNode*>(n.get());
             walk(b->left, s); walk(b->right, s);
             break;
         }
-        case NodeType::ATTRIBUTE: walk(std::static_pointer_cast<AttributeNode>(n)->object, s); break;
+        case NodeType::ATTRIBUTE: walk(static_cast<AttributeNode*>(n.get())->object, s); break;
         case NodeType::SUBSCRIPT: {
-            auto x = std::static_pointer_cast<SubscriptNode>(n);
+            auto* x = static_cast<SubscriptNode*>(n.get());
             walk(x->object, s); walk(x->index, s);
             break;
         }
         case NodeType::SLICE: {
-            auto x = std::static_pointer_cast<SliceNode>(n);
+            auto* x = static_cast<SliceNode*>(n.get());
             walk(x->start, s); walk(x->end_node, s); walk(x->step, s);
             break;
         }
         case NodeType::RANGE: {
-            auto x = std::static_pointer_cast<RangeNode>(n);
+            auto* x = static_cast<RangeNode*>(n.get());
             walk(x->start, s); walk(x->end_node, s); walk(x->step, s);
             break;
         }
         case NodeType::MAP_ENTRY: {
-            auto x = std::static_pointer_cast<MapEntryNode>(n);
+            auto* x = static_cast<MapEntryNode*>(n.get());
             walk(x->key, s); walk(x->val, s);
             break;
         }
-        case NodeType::RETURN: walk(std::static_pointer_cast<ReturnNode>(n)->expr, s); break;
-        case NodeType::YIELD: walk(std::static_pointer_cast<YieldNode>(n)->expr, s); break;
-        case NodeType::YIELD_FROM: walk(std::static_pointer_cast<YieldFromNode>(n)->expr, s); break;
+        case NodeType::RETURN: walk(static_cast<ReturnNode*>(n.get())->expr, s); break;
+        case NodeType::YIELD: walk(static_cast<YieldNode*>(n.get())->expr, s); break;
+        case NodeType::YIELD_FROM: walk(static_cast<YieldFromNode*>(n.get())->expr, s); break;
         case NodeType::RAISE: {
-            auto r = std::static_pointer_cast<RaiseNode>(n);
+            auto* r = static_cast<RaiseNode*>(n.get());
             walk(r->expr, s); walk(r->cause, s);
             break;
         }
         case NodeType::ASSERT: {
-            auto a = std::static_pointer_cast<AssertNode>(n);
+            auto* a = static_cast<AssertNode*>(n.get());
             walk(a->condition, s); walk(a->message, s);
             break;
         }
         case NodeType::PRINT: {
-            auto p = std::static_pointer_cast<PrintNode>(n);
+            auto* p = static_cast<PrintNode*>(n.get());
             all(p->args, s); walk(p->sep, s); walk(p->end, s);
             break;
         }
         case NodeType::OPT_CHAIN: {
-            auto o = std::static_pointer_cast<OptChainNode>(n);
+            auto* o = static_cast<OptChainNode*>(n.get());
             walk(o->recv, s); walk(o->index, s); walk(o->call, s); walk(o->rest, s);
             break;
         }
         case NodeType::DYN_BINOP: {
-            auto d = std::static_pointer_cast<DynBinopNode>(n);
+            auto* d = static_cast<DynBinopNode*>(n.get());
             walk(d->lhs, s); walk(d->rhs, s);
             break;
         }
         case NodeType::COMPLEX:
-            all(std::static_pointer_cast<ComplexNode>(n)->items, s);
+            all(static_cast<ComplexNode*>(n.get())->items, s);
             break;
         default:
             // Blocks, statement lists, list/tuple/map literals, script.
@@ -513,6 +514,16 @@ std::set<std::string> py_locals(const Scope* s) {
 
 bool before(const Pos& a, const Pos& b) { return a.row < b.row || (a.row == b.row && a.col < b.col); }
 
+// Where and how `outer` binds n (for the reports): its declaration, else
+// its first plain assignment ('a'), else 'g' (only declared global there).
+void outer_binding(const Scope* outer, const std::string& n, Pos& at, char& kind) {
+    auto od = outer->declared.find(n);
+    if (od != outer->declared.end()) { at = Pos(od->second); kind = od->second.kind; return; }
+    for (auto& w : outer->writes)
+        if (w.how == Write::ASSIGN && w.name == n) { at = Pos(w.where); kind = 'a'; return; }
+    kind = 'g';
+}
+
 std::string qual_of(const Scope* s) {
     if (!s || !s->fn) return "<module>";
     if (s->fn->type() == NodeType::FUNCTION) {
@@ -565,16 +576,7 @@ void differences(Scope* s, Pass& ps) {
         seen.insert(n);
         char okind = 'a';
         Pos opos;
-        auto od = outer->declared.find(n);
-        if (od != outer->declared.end()) {
-            opos = Pos(od->second);
-            auto k = outer->dkind.find(n);
-            okind = k != outer->dkind.end() ? k->second : 'v';
-        } else {
-            auto oa = outer->assigned_at.find(n);
-            if (oa != outer->assigned_at.end()) opos = oa->second;
-            else okind = 'g';
-        }
+        outer_binding(outer, n, opos, okind);
         // the function uses the outer value: an augmented assignment, a
         // del, or a read of the name on or before the line of the write
         bool uses = w.aug || w.how == Write::DEL;
@@ -604,8 +606,7 @@ void differences(Scope* s, Pass& ps) {
     // variable there, Python's rule raises UnboundLocalError ("read").
     for (auto& [n, at] : s->declared) {
         if (seen.count(n) || s->globals.count(n) || s->nonlocals.count(n) || n == "self" || n == "this") continue;
-        auto k = s->dkind.find(n);
-        if (k == s->dkind.end() || k->second == 'p') continue;
+        if (at.kind == 'p') continue;
         Pos dp(at);
         VariableNode* first = nullptr;
         for (auto* r : s->reads)
@@ -622,15 +623,7 @@ void differences(Scope* s, Pass& ps) {
         Pos rp(first->token().location());
         Pos opos;
         char okind = 'a';
-        auto od = outer->declared.find(n);
-        if (od != outer->declared.end()) {
-            opos = Pos(od->second);
-            auto ok = outer->dkind.find(n);
-            okind = ok != outer->dkind.end() ? ok->second : 'v';
-        } else {
-            auto oa = outer->assigned_at.find(n);
-            if (oa != outer->assigned_at.end()) opos = oa->second; else okind = 'g';
-        }
+        outer_binding(outer, n, opos, okind);
         std::string where = outer == ps.root ? std::string("module") : "function:" + qual_of(outer);
         if (ps.report)
             *ps.report << ps.file << '\t' << rp.row << '\t' << rp.col << '\t' << qual_of(s) << '\t' << n << '\t'
@@ -733,7 +726,8 @@ bool python_source(const std::string& file, const std::string& code) {
         size_t b = code.find_first_not_of(" \t\r", i);
         if (b == std::string::npos || b >= e) { i = e + 1; continue; }   // a blank line
         if (code[b] != '#') break;                                       // the code starts
-        size_t p = code.find("nython:", b);
+        size_t p = std::string_view(code.data() + b, e - b).find("nython:");   // (in this line only)
+        if (p != std::string_view::npos) p += b;
         if (p != std::string::npos && p < e) {
             size_t w = code.find_first_not_of(" \t", p + 7);
             if (w != std::string::npos && w + 6 <= e && code.compare(w, 6, "python") == 0
@@ -790,7 +784,7 @@ void check(const node_ptr& root, const std::string& file, const std::string& cod
     Collector c;
     c.root = std::make_unique<Scope>(Kind::MODULE, nullptr);
     c.root->py = py;
-    if (!py) c.lines.init(code);   // a def may opt in
+    if (!py && !file.empty()) c.lines.init(code);   // a def may opt in (not in the engines' own text)
     ps.root = c.root.get();
     c.walk(root, c.root.get());
     check_scope(c.root.get(), ps);

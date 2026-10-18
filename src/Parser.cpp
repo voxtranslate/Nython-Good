@@ -78,8 +78,8 @@ node_ptr Parser::parse() {
         // (Python's binding rule; `stdin` is the engines' own text - the prelude)
         if(!ast_mode_){
             std::string file = scanner->source.fileName();
-            if(file == "stdin") file.clear();
-            nython::scope::check(root, file, scanner->source.sourceCode());
+            if(file == "stdin") nython::scope::check(root, std::string(), std::string());   // (not copied: the prelude is Nython)
+            else nython::scope::check(root, file, scanner->source.sourceCode());
         }
         return root;
     }
