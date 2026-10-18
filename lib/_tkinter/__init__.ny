@@ -35,6 +35,7 @@ from _tkinter import canvas
 from _tkinter import image
 from _tkinter import ttk
 from _tkinter import ttk2
+from _tkinter import dialogs
 
 TK_VERSION = core.TK_VERSION
 TCL_VERSION = core.TCL_VERSION

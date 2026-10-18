@@ -1715,8 +1715,8 @@ def label_opts():
     # ttkLabel / button "label" options
     return [O("text", "text", "Text", "", "string"), O("textvariable", "textVariable", "Variable", "", "var"),
             O("underline", "underline", "Underline", -1, "int"), O("width", "width", "Width", None, "string"),
-            O("image", "image", "Image", None, "image"), O("compound", "compound", "Compound", None, "compound"),
-            O("padding", "padding", "Pad", None, "padding")]
+            O("image", "image", "Image", None, "ttk_image"), O("compound", "compound", "Compound", None, "ttk_compound"),
+            O("padding", "padding", "Pad", None, "ttk_padding")]
 
 
 class TtkWidget(TkWin):
@@ -1910,7 +1910,7 @@ class TtkWidget(TkWin):
 
 # ── frame, label, buttons, separator, sizegrip, labelframe, menubutton ───
 FRAME_OPTS = [O("borderwidth", "borderWidth", "BorderWidth", None, "pixels_or_none"),
-              O("padding", "padding", "Pad", None, "padding"),
+              O("padding", "padding", "Pad", None, "ttk_padding"),
               O("relief", "relief", "Relief", None, "relief_or_none"),
               O("width", "width", "Width", 0, "pixels"),
               O("height", "height", "Height", 0, "pixels")] + core_opts("0")
@@ -2181,7 +2181,7 @@ class TtkLabelframe(TtkFrame):
 # the extra option kinds of ttk widgets ("none" = the style decides)
 def _norm_ttk(app, kind, v, optname):
     s = join_list(v) if isinstance(v, (tuple, list)) else tcl_str(v)
-    if kind == "compound":
+    if kind == "ttk_compound":
         if s == "":
             return None
         return match_prefix(s, ["none", "text", "image", "center", "top", "bottom", "left", "right"], "compound")
@@ -2205,12 +2205,12 @@ def _norm_ttk(app, kind, v, optname):
         return match_prefix(s, ["left", "right", "center"], "justification")
     if base == "var":
         return s
-    if kind == "padding":
+    if kind == "ttk_padding":
         if s == "":
             return None
         parse_padding(s)
         return s
-    if kind == "image":
+    if kind == "ttk_image":
         if s == "":
             return None
         nm = _words(s)[0]
@@ -2222,7 +2222,7 @@ def _norm_ttk(app, kind, v, optname):
     return _norm(app, kind, v, optname)
 
 
-_TTK_KINDS = set(["compound", "padding", "image", "pixels_or_none", "color_or_none", "font_or_none",
+_TTK_KINDS = set(["ttk_compound", "ttk_padding", "ttk_image", "pixels_or_none", "color_or_none", "font_or_none",
                   "relief_or_none", "anchor_or_none", "justify_or_none", "var_or_none", "string_or_none"])
 
 

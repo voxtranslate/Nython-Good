@@ -788,19 +788,19 @@ class Misc:
         """Return value of Tcl variable NAME."""
         return self.tk.getvar(name)
 
-    def _getint(self, s):
+    def getint(self, s):
         try:
             return self.tk.getint(s)
         except TclError as exc:
             raise ValueError(str(exc))
 
-    def _getdouble(self, s):
+    def getdouble(self, s):
         try:
             return self.tk.getdouble(s)
         except TclError as exc:
             raise ValueError(str(exc))
 
-    def _getboolean(self, s):
+    def getboolean(self, s):
         """Return a boolean value for Tcl boolean values true and false given as parameter."""
         try:
             return self.tk.getboolean(s)
@@ -1668,9 +1668,16 @@ class Misc:
     def _substitute(self, *args):
         """Internal function."""
         if len(args) != len(self._subst_format): return args
-        getboolean = self.tk.getboolean
+        # Nython: locals declared - a plain assignment would rebind the
+        # module's getboolean/getint and the constants N, E, W, X, Y
+        var getboolean = self.tk.getboolean
 
-        getint = self.tk.getint
+        var getint = self.tk.getint
+        var E = None
+        var N = None
+        var W = None
+        var X = None
+        var Y = None
         def getint_event(s):
             """Tk changed behavior in 8.4.2, returning "??" rather more often."""
             try:
@@ -2017,6 +2024,18 @@ class Misc:
             else:
                 cmds.append(c)
         return self.tk.ny_drive(cmds)
+
+    def _ny_queue(self, *commands):
+        """Append scripted input for the headless backend without waiting
+        for it to be processed (for modal dialogs, whose own event loop
+        reads it). Nython only."""
+        cmds = []
+        for c in commands:
+            if isinstance(c, (list, tuple)):
+                cmds.extend(c)
+            else:
+                cmds.append(c)
+        return self.tk.ny_queue(cmds)
 
     def _ny_snapshot(self):
         """The last frame the backend presented, as a list of display-list

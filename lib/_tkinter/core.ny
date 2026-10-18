@@ -188,7 +188,7 @@ class App:
         self.vars = {}
         self.traces = {}
         self.tracing = set()
-        self.wantobjects = wantobjects
+        self._wantobjects = wantobjects
         self.appname = baseName if baseName else "tk"
         cn = className if className else "Tk"
         self.classname = cn[0].upper() + cn[1:]
@@ -373,6 +373,14 @@ class App:
         if not words:
             raise TclError("wrong # args")
         return self.interp.invoke(words)
+
+    def wantobjects(self, *args):
+        # tkapp.wantobjects([value]): results as Python objects (always so
+        # here; the setting is remembered)
+        if args:
+            self._wantobjects = 1 if args[0] else 0
+            return None
+        return self._wantobjects
 
     def eval(self, script):
         # a `return` at the top level ends the script with its value
@@ -1169,6 +1177,10 @@ class App:
             return False
         if t == "quit":
             self.last_input = _now_ms()
+            if self.dialog_waiter is not None:
+                # a native file dialog is open: closing is its Cancel
+                self.dialog_waiter.append((0, ""))
+                return False
             target = top if (e.get("window", 0) and top is not None) else self.root
             if target is None and top is not None:
                 target = top
@@ -1497,6 +1509,12 @@ class App:
         if state & B.ControlMask and len(ch) == 1 and ch.isalpha() and ord(ch) < 128:
             ch = chr(ord(ch.lower()) - 96)
         target = self.focus if (self.focus is not None and not self.focus.destroyed and self.focus.top is top) else None
+        if target is None and self.focus is not None and not self.focus.destroyed and self.focus.top.mapped \
+                and self.focus.top.native is not None and not getattr(self.focus.top, "IS_MENU", False):
+            # the window manager gives the keyboard to the focus window's
+            # toplevel (a dialog just mapped), whichever window the backend
+            # reported the key in
+            target = self.focus
         if target is None:
             target = getattr(top, "focus_last", None)
             if target is None or target.destroyed:
@@ -3053,6 +3071,17 @@ class App:
                 self.pump_native(1)
         self.update()
         return 1 if tag in self.sync_seen else 0
+
+    def ny_queue(self, commands):
+        # the harness: append scripted input without waiting for it (a
+        # modal dialog's own event loop will read it)
+        path = os.environ.get("NY_STUB_EVENTS", "")
+        if path == "":
+            raise TclError("the scripted-input harness is not active (set NY_STUB_EVENTS before Tk starts)")
+        with open(path, "a") as f:
+            for c in commands:
+                f.write(c + "\n")
+        return ""
 
     def after_idle_once(self, w, key, func):
         # a widget's own idle handler (Tk_DoWhenIdle with a "pending" flag,

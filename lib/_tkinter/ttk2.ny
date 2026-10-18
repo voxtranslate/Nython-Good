@@ -1078,7 +1078,7 @@ class Tab:
 class TtkNotebook(TtkWidget):
     CLASS = "TNotebook"
     OPTS = [O("width", "width", "Width", 0, "pixels"), O("height", "height", "Height", 0, "pixels"),
-            O("padding", "padding", "Padding", None, "padding"),
+            O("padding", "padding", "Padding", None, "ttk_padding"),
             O("takefocus", "takeFocus", "TakeFocus", "ttk::takefocus", "string"),
             O("cursor", "cursor", "Cursor", "", "cursor"), O("style", "style", "Style", "", "string"),
             O("class", "", "", "", "string")]
@@ -1825,7 +1825,7 @@ class TtkTreeview(TtkWidget):
             O("show", "show", "Show", "tree headings", "list"),
             O("selectmode", "selectMode", "SelectMode", "extended", "enum:extended|browse|none:selectmode"),
             O("height", "height", "Height", 10, "int"),
-            O("padding", "padding", "Pad", None, "padding"),
+            O("padding", "padding", "Pad", None, "ttk_padding"),
             O("xscrollcommand", "xScrollCommand", "ScrollCommand", "", "command"),
             O("yscrollcommand", "yScrollCommand", "ScrollCommand", "", "command"),
             O("takefocus", "takeFocus", "TakeFocus", "ttk::takefocus", "string"),

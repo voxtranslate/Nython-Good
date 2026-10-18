@@ -126,14 +126,14 @@ def _parse_color(s):
         if not ok:
             raise TclError("invalid color name \"" + s + "\"")
         k = n // 3
-        comps = [int(h[i * k:(i + 1) * k], 16) for i in range(3)]
+        cs = [int(h[i * k:(i + 1) * k], 16) for i in range(3)]
         if k == 1:
-            comps = [c * 17 for c in comps]
+            cs = [c * 17 for c in cs]
         elif k == 3:
-            comps = [c >> 4 for c in comps]
+            cs = [c >> 4 for c in cs]
         elif k == 4:
-            comps = [c >> 8 for c in comps]
-        return (comps[0] << 16) | (comps[1] << 8) | comps[2]
+            cs = [c >> 8 for c in cs]
+        return (cs[0] << 16) | (cs[1] << 8) | cs[2]
     key = s.replace(" ", "").lower()
     v = COLORS.get(key)
     if v is None:

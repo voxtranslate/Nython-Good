@@ -461,9 +461,15 @@ class Interp:
 
     def invoke(self, words):
         name = tcl_str(words[0])
+        cmd = self.commands.get(name)
+        if cmd is not None:
+            return cmd(self, words)
+        # "::a::b" and "a::b" name the same command (the global namespace)
         if name.startswith("::"):
             name = name[2:]
-        cmd = self.commands.get(name)
+            cmd = self.commands.get(name)
+        else:
+            cmd = self.commands.get("::" + name)
         if cmd is not None:
             return cmd(self, words)
         p = self.procs.get(name)

@@ -1849,12 +1849,12 @@ class TkCanvas(TkWin):
         out = ["% item " + str(it.id) + " (" + k + ")"]
 
         def path(pts, closed):
-            s = "%g %g moveto" % (pts[0], flip - pts[1])
+            ps = "%g %g moveto" % (pts[0], flip - pts[1])
             for i in range(2, len(pts) - 1, 2):
-                s += " %g %g lineto" % (pts[i], flip - pts[i + 1])
+                ps += " %g %g lineto" % (pts[i], flip - pts[i + 1])
             if closed:
-                s += " closepath"
-            return s
+                ps += " closepath"
+            return ps
 
         width = self._width(it) if k not in ("text", "window", "image", "bitmap") else 0
         dash = parse_dash(self.eff(it, "dash"), width) if k in ("line", "polygon", "rectangle", "oval", "arc") and self.eff(it, "dash") else []
