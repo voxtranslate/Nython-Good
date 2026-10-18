@@ -202,6 +202,7 @@ class App:
         self.after_info = {}
         self.after_n = 0
         self.idle_q = []
+        self.idle_once = set()
         self.layout_queued = False
         self.in_layout = False
         self.layout_dirty = False
@@ -970,6 +971,9 @@ class App:
                 self.do_layout()
             elif kind == "redisplay":
                 self.redisplay()
+            elif kind == "py":
+                self.idle_once.discard(ident)
+                script()
             else:
                 if ident in self.after_info:
                     del self.after_info[ident]
@@ -3038,6 +3042,15 @@ class App:
                 self.pump_native(1)
         self.update()
         return 1 if tag in self.sync_seen else 0
+
+    def after_idle_once(self, w, key, func):
+        # a widget's own idle handler (Tk_DoWhenIdle with a "pending" flag,
+        # as tkText.c's and tkCanvas.c's redisplay/update callbacks)
+        k = (id(w), key)
+        if k in self.idle_once:
+            return
+        self.idle_once.add(k)
+        self.idle_q.append(("py", k, func))
 
     def after_idle_script(self, script):
         ident = self.after_id()

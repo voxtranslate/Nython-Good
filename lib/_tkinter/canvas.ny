@@ -546,6 +546,7 @@ class TkCanvas(TkWin):
                 c[i] += dx
                 c[i + 1] += dy
             it.bbox = None
+            it.text_layout = None
             moved = True
             if it.kind == "window":
                 self.app.relayout()
@@ -581,6 +582,7 @@ class TkCanvas(TkWin):
                 c[i] = xo + xs * (c[i] - xo)
                 c[i + 1] = yo + ys * (c[i + 1] - yo)
             it.bbox = None
+            it.text_layout = None
         self.damage()
         return ""
 
@@ -1021,7 +1023,7 @@ class TkCanvas(TkWin):
     def text_point_index(self, it, x, y):
         lay = self.text_lines(it)
         f = self.app.font_of(it.opts["font"])
-        lines, tw, th, ox, oy = lay
+        lines, tw, th, ox, oy = lay[:5]
         k = 0
         for (s, lx, ly, lw) in lines:
             if y < oy + ly + f.metrics()[2] or (s, lx, ly, lw) == lines[-1]:
@@ -1156,10 +1158,23 @@ class TkCanvas(TkWin):
         if it.text_layout is None:
             f = self.app.font_of(it.opts["font"])
             lines, tw, th = layout_text(f, it.opts.get("text", ""), self.ipx(it.opts.get("width", 0)), it.opts["justify"])
-            x, y = self.anchor_xy(it.opts["anchor"], it.coords[0], it.coords[1], tw, th)
-            ox = int(x + (0.5 if x >= 0 else -0.5))
-            oy = int(y + (0.5 if y >= 0 else -0.5))
-            it.text_layout = (lines, tw, th, ox, oy)
+            # tkCanvText.c ComputeTextBbox: integer halves (C's -w/2)
+            a = it.opts["anchor"]
+            dx = 0
+            dy = 0
+            if a in ("n", "center", "s"):
+                dx = -(tw // 2)
+            elif a in ("ne", "e", "se"):
+                dx = -tw
+            if a in ("w", "center", "e"):
+                dy = -(th // 2)
+            elif a in ("sw", "s", "se"):
+                dy = -th
+            x = it.coords[0] + dx
+            y = it.coords[1] + dy
+            ox = int(math.floor(x + 0.5))
+            oy = int(math.floor(y + 0.5))
+            it.text_layout = (lines, tw, th, ox, oy, x, y)
         return it.text_layout
 
     def item_bbox(self, it):
@@ -1198,11 +1213,22 @@ class TkCanvas(TkWin):
         if k == "arc":
             return self._arc_bbox(it)
         if k == "line":
-            pts = self.line_points(it)
-            if not pts:
+            if not c:
                 return (-1, -1, -1, -1)
-            x1 = x2 = int(c[0])
-            y1 = y2 = int(c[1])
+            # tkCanvLine.c ComputeLineBbox: the control points (not the
+            # spline), the first one truncated, the arrow tips, then the
+            # width and one pixel of fudge on every side
+            width = max(1.0, self._width(it))
+            arrow = it.opts.get("arrow", "none")
+            fa = la = None
+            fx = c[0]
+            fy = c[1]
+            if arrow != "none" and len(c) >= 4:
+                fa, la = self.arrow_polys(it, width)
+                if fa:
+                    fx, fy = fa[-1]
+            x1 = x2 = int(fx)
+            y1 = y2 = int(fy)
             box = [x1, y1, x2, y2]
 
             def inc(px, py):
@@ -1217,16 +1243,16 @@ class TkCanvas(TkWin):
                 if ty > box[3]:
                     box[3] = ty
 
-            for i in range(2, len(pts) - 1, 2):
-                inc(pts[i], pts[i + 1])
-            width = max(1.0, self._width(it))
-            arrow = it.opts.get("arrow", "none")
-            if arrow != "none":
-                fa, la = self.arrow_polys(it, width)
-                if arrow in ("first", "both") and fa:
-                    inc(fa[0], fa[1])
-                if arrow in ("last", "both") and la:
-                    inc(la[0], la[1])
+            n = len(c)
+            for i in range(2, n - 1, 2):
+                if la and i == n - 2:
+                    inc(la[-1][0], la[-1][1])
+                else:
+                    inc(c[i], c[i + 1])
+            if fa:
+                inc(fa[0], fa[1])
+            if la:
+                inc(la[0], la[1])
             iw = int(width + 0.5)
             box = [box[0] - iw, box[1] - iw, box[2] + iw, box[3] + iw]
             if len(c) == 2:
@@ -1236,17 +1262,31 @@ class TkCanvas(TkWin):
             pts = self.poly_points(it)
             if not pts:
                 return (-1, -1, -1, -1)
-            xs = [int(pts[i] + 0.5) for i in range(0, len(pts), 2)]
-            ys = [int(pts[i] + 0.5) for i in range(1, len(pts), 2)]
+            # tkCanvPoly.c ComputePolygonBbox: the control points, the first
+            # truncated, the rest rounded; half the outline; one pixel more
+            cc = list(c)
+            xs = [int(cc[0])] + [int(cc[i] + 0.5) for i in range(2, len(cc) - 1, 2)]
+            ys = [int(cc[1])] + [int(cc[i] + 0.5) for i in range(3, len(cc), 2)]
             x1, y1, x2, y2 = min(xs), min(ys), max(xs), max(ys)
             if self.eff(it, "outline") != "":
                 width = max(1.0, self._width(it))
-                iw = int(width + 1.5)
+                iw = int((width + 1.5) / 2.0) + 1
                 return (x1 - iw, y1 - iw, x2 + iw, y2 + iw)
             return (x1 - 1, y1 - 1, x2 + 1, y2 + 1)
         if k == "text":
-            lines, tw, th, ox, oy = self.text_lines(it)
-            return (ox, oy, ox + tw + 1, oy + th + 1) if it.opts.get("text", "") != "" else (ox, oy, ox + 1, oy + th + 1)
+            lay = self.text_lines(it)
+            tw = lay[1]
+            th = lay[2]
+            if self.eff(it, "fill") == "":
+                tw = th = 0
+            # the bbox takes in the insertion cursor's half width or the
+            # selection border, whichever is larger (ComputeTextBbox)
+            fudge = (self.px("insertwidth") + 1) // 2
+            fudge = max(fudge, self.px("selectborderwidth"))
+            x = lay[5]
+            y = lay[6]
+            return (int(math.floor(x - fudge + 0.5)), int(math.floor(y + 0.5)),
+                    int(math.floor(x + tw + fudge + 0.5)), int(math.floor(y + th + 0.5)))
         if k in ("window", "image", "bitmap"):
             if k == "window":
                 w = it.win
@@ -1643,7 +1683,7 @@ class TkCanvas(TkWin):
             if col is None:
                 return
             f = self.app.font_of(it.opts["font"])
-            lines, tw, th, tx, ty = self.text_lines(it)
+            lines, tw, th, tx, ty = self.text_lines(it)[:5]
             kk = 0
             for (s, lx, ly, lw) in lines:
                 if self.sel_item is it and self.sel_first >= 0:
@@ -1861,7 +1901,7 @@ class TkCanvas(TkWin):
                 return out
             f = self.app.font_of(it.opts["font"])
             asc, desc, ls, fixed = f.metrics()
-            lines, tw, th, tx, ty = self.text_lines(it)
+            lines, tw, th, tx, ty = self.text_lines(it)[:5]
             out.append("/" + _ps_font(f) + " findfont %d scalefont setfont" % f.px())
             out.append(self.ps_color(col, mode))
             for (s, lx, ly, lw) in lines:
