@@ -143,6 +143,7 @@
         <Unit filename="src/NyGC.cpp" />
         <Unit filename="src/NyScope.cpp" />
         <Unit filename="src/NyUniNames.cpp" />
+        <Unit filename="src/NyUniData.cpp" />
         <Unit filename="src/VMGC.cpp" />
         <!-- ═══════════ Builtin modules ═══════════ -->
         <Unit filename="src/builtins/audio.cpp" />
@@ -175,6 +176,8 @@
         <Unit filename="src/builtins/os_proc.cpp" />
         <Unit filename="src/builtins/os_fd.cpp" />
         <Unit filename="src/builtins/nycodecs.cpp" />
+        <Unit filename="src/builtins/nyunicode.cpp" />
+        <Unit filename="src/builtins/nycjk.cpp" />
         <Unit filename="src/builtins/nypickle.cpp" />
         <Unit filename="src/builtins/nysysmods.cpp" />
         <Unit filename="src/builtins/nymmap.cpp" />
@@ -194,6 +197,8 @@
         <Unit filename="include/NyCoro.hpp" />
         <Unit filename="include/NyGen.hpp" />
         <Unit filename="include/NyUniNames.hpp" />
+        <Unit filename="include/NyUniData.hpp" />
+        <Unit filename="include/NyCJK.hpp" />
         <Unit filename="include/NyGC.hpp" />
         <Unit filename="include/NyScope.hpp" />
         <Unit filename="include/VMGC.hpp" />

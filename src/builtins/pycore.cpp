@@ -220,7 +220,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
             if (b.k != 1 || (base != 0 && (base < 2 || base > 36))) E.pyRaise("ValueError", "int() base must be >= 2 and <= 36, or 0");
             nypy::BigInt out;
             const std::string& s = bo ? bo->s : *(std::string*)v.value.p;
-            if (!nypy::parse_int_str(s, base, out))
+            if (!nypy::parse_int_str(bo ? s : nypy::uni_to_ascii(s), base, out))   // (round 84: Unicode digits and spaces)
                 E.pyRaise("ValueError", "invalid literal for int() with base " + std::to_string(base) + ": " + (bo ? E.reprOf(v, ctx) : nypy::str_repr(s)));
             return intValue(out);
         }
@@ -240,8 +240,8 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         if (E.isStringValue(v) || E.isBytesValue(v)) {
             const std::string& s = *(std::string*)v.value.p;
             nypy::BigInt out;
-            if (!nypy::parse_int_default(s, out))
-                E.pyRaise("ValueError", "invalid literal for int() with base 10: " + nypy::str_repr(s));
+            if (!nypy::parse_int_default(E.isStringValue(v) ? nypy::uni_to_ascii(s) : s, out))   // (round 84)
+                E.pyRaise("ValueError", "invalid literal for int() with base 10: " + (E.isStringValue(v) ? nypy::str_repr(s) : E.reprOf(v, ctx)));   // (round 84: a bytes literal shows as bytes)
             return intValue(out);
         }
         if (E.isInstanceVal(v) && E.instanceHasMethod(v, "__int__")) {
@@ -259,7 +259,7 @@ Value dispatch_pycore(NythonExecutor& E, const std::string& name, std::vector<Va
         if (E.isStringValue(v)) {
             const std::string& s = *(std::string*)v.value.p;
             double d;
-            if (!nypy::parse_float_str(s, d)) E.pyRaise("ValueError", "could not convert string to float: " + nypy::str_repr(s));
+            if (!nypy::parse_float_str(nypy::uni_to_ascii(s), d)) E.pyRaise("ValueError", "could not convert string to float: " + nypy::str_repr(s));
             return Value(d);
         }
         if (auto* bo = E.bytesOf(v)) {   // (round 83) float(b"1.5"), as CPython

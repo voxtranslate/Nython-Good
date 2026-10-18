@@ -1,5 +1,5 @@
 # nython: module    (import it by name: it runs in a module scope of its own)
-# lib/encodings/idna.ny - the idna codec (round 83): IDNA (RFC 3490) over lib/codecs.ny's: ToASCII/ToUnicode per label, punycode, the ACE prefix; nameprep is lower-casing.
+# lib/encodings/idna.ny - the idna codec (round 83): IDNA (RFC 3490) over lib/codecs.ny's: ToASCII/ToUnicode per label, punycode, the ACE prefix; nameprep is RFC 3491's (round 84).
 import codecs
 
 _info = codecs.lookup('idna')

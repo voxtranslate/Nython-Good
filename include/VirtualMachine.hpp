@@ -15813,7 +15813,7 @@ private:
                 if(b.k!=1||(base!=0&&(base<2||base>36))) vm->raise_native_exception("ValueError","int() base must be >= 2 and <= 36, or 0");
                 nypy::BigInt out;
                 const std::string& txt=v.type==VMType::BYTES?v.bdata():v.s;
-                if(!nypy::parse_int_str(txt,base,out))
+                if(!nypy::parse_int_str(v.type==VMType::BYTES?txt:nypy::uni_to_ascii(txt),base,out))   // (round 84: Unicode digits and spaces)
                     vm->raise_native_exception("ValueError","invalid literal for int() with base "+std::to_string(base)+": "+(v.type==VMType::BYTES?v.to_string():nypy::str_repr(v.s)));
                 return VMVal::make_bigint(out);
             }
@@ -15830,7 +15830,7 @@ private:
                 case VMType::STRING: case VMType::BYTES: {
                     nypy::BigInt out;
                     const std::string& txt=v.type==VMType::BYTES?v.bdata():v.s;
-                    if(!nypy::parse_int_default(txt,out))
+                    if(!nypy::parse_int_default(v.type==VMType::BYTES?txt:nypy::uni_to_ascii(txt),out))   // (round 84)
                         vm->raise_native_exception("ValueError","invalid literal for int() with base 10: "+(v.type==VMType::BYTES?v.to_string():nypy::str_repr(v.s)));
                     return VMVal::make_bigint(out);
                 }
@@ -15846,7 +15846,7 @@ private:
             if(v.to_numv(n)) return VMVal::make_float(n.dbl());
             if(v.type==VMType::STRING){
                 double d;
-                if(!nypy::parse_float_str(v.s,d)) vm->raise_native_exception("ValueError","could not convert string to float: "+nypy::str_repr(v.s));
+                if(!nypy::parse_float_str(nypy::uni_to_ascii(v.s),d)) vm->raise_native_exception("ValueError","could not convert string to float: "+nypy::str_repr(v.s));
                 return VMVal::make_float(d);
             }
             if(v.type==VMType::BYTES){   // (round 83) float(b"1.5"), as CPython

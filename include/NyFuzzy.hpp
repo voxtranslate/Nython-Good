@@ -19,8 +19,14 @@
 //   +8 when it directly follows the previous match
 //   -1 per text character passed over before the last match
 //   -len(text)/4, so shorter candidates win ties ("Run" over "Run Task...")
-// Matching is case-insensitive for ASCII; other characters compare exactly.
-// All positions are character (code point) indices, like string_slice.
+// Matching is case-insensitive, and (round 84) Unicode-aware: a character
+// is compared by its search key - its compatibility decomposition (NFKD)
+// without the combining marks, case-folded - so "resume" finds "résumé",
+// "file" finds "ﬁle", "strasse" finds "Straße" and "abc" finds "ＡＢＣ"
+// (the folding search UTS #10 section 8 and ICU's "accent-insensitive"
+// collation strength give, done here character by character). ASCII text
+// takes the old path unchanged. All positions are character (code point)
+// indices in the original text, like string_slice.
 #pragma once
 
 #include <algorithm>
@@ -28,6 +34,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "NyUniData.hpp"
 
 namespace nyfuzzy {
 
@@ -125,12 +132,59 @@ inline bool score(const std::vector<uint32_t>& q, const std::vector<uint32_t>& t
     return true;
 }
 
+// The search keys of a text (round 84): each character's NFKD, combining
+// marks dropped, case-folded; `from` maps each key back to its character.
+// ASCII is its own key (fold() compares it).
+inline void search_keys(const std::vector<uint32_t>& t, std::vector<uint32_t>& keys, std::vector<int>* from) {
+    keys.clear();
+    if (from) from->clear();
+    for (size_t i = 0; i < t.size(); i++) {
+        uint32_t c = t[i];
+        size_t before = keys.size();
+        if (c < 0x80) keys.push_back(c);
+        else {
+            std::vector<uint32_t> d = nyucd::normalize(nyucd::NFKD, std::vector<uint32_t>{c});
+            for (uint32_t x : d) {
+                const char* cat = nyucd::category(x);
+                if (cat[0] == 'M') continue;   // Mn, Mc, Me: the accents
+                uint32_t f[3];
+                int n = nyucd::to_folded_full(x, f);
+                for (int k = 0; k < n; k++) keys.push_back(f[k]);
+            }
+            if (keys.size() == before) keys.push_back(c);   // (a mark alone is its own key)
+        }
+        if (from) while (from->size() < keys.size()) from->push_back((int)i);
+    }
+}
+inline bool all_ascii(const std::vector<uint32_t>& v) {
+    for (uint32_t c : v) if (c >= 0x80) return false;
+    return true;
+}
+// q against t by their search keys, positions mapped back to t's characters
+inline bool score_keys(const std::vector<uint32_t>& tq, const std::vector<uint32_t>& tt, int& out, std::vector<int>* pos) {
+    if (all_ascii(tq) && all_ascii(tt)) return score(tq, tt, out, pos);
+    std::vector<uint32_t> kq, kt;
+    std::vector<int> from;
+    search_keys(tq, kq, nullptr);
+    search_keys(tt, kt, pos ? &from : nullptr);
+    std::vector<int> kpos;
+    if (!score(kq, kt, out, pos ? &kpos : nullptr)) return false;
+    if (pos) {
+        pos->clear();
+        for (int k : kpos) {
+            int c = from[(size_t)k];
+            if (pos->empty() || pos->back() != c) pos->push_back(c);
+        }
+    }
+    return true;
+}
+
 inline bool score(const std::string& q, const std::string& t, int& out, std::vector<int>* pos = nullptr) {
     // Very long candidates are matched on their first 1024 characters.
     auto tq = codepoints(q), tt = codepoints(t);
     if (tt.size() > 1024) tt.resize(1024);
     if (tq.size() > 64) tq.resize(64);
-    return score(tq, tt, out, pos);
+    return score_keys(tq, tt, out, pos);
 }
 
 // Indices of the texts that match, best first (ties keep their order).
@@ -145,7 +199,7 @@ inline std::vector<int> rank(const std::string& q, const std::vector<std::string
         if (tq.empty()) { hits.push_back({0, (int)i}); continue; }
         auto tt = codepoints(texts[i]);
         if (tt.size() > 1024) tt.resize(1024);
-        if (!score(tq, tt, sc)) continue;
+        if (!score_keys(tq, tt, sc, nullptr)) continue;
         long long key = (long long)sc * 10 + (bonus && i < bonus->size() ? (*bonus)[i] : 0);
         hits.push_back({key, (int)i});
     }

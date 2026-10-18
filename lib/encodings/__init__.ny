@@ -25,9 +25,13 @@
 # rot_13, punycode, undefined; idna and quopri_codec are lib/codecs.ny's
 # (idna's nameprep is lower-casing: no Unicode 3.2 normalization tables).
 #
-# Not here: the CJK multibyte codecs (big5, gbk, gb18030, shift_jis,
-# euc_jp, iso2022_*...), utf_7, mbcs/oem (Windows' code pages through the OS):
-# looking them up raises LookupError("unknown encoding: ...").
+# Round 84: the CJK multibyte codecs (big5, big5hkscs, cp950, gb2312, gbk,
+# gb18030, hz, euc_jp, euc_jis_2004, euc_jisx0213, shift_jis, shift_jis_2004,
+# shift_jisx0213, cp932, iso2022_jp/_1/_2/_2004/_3/_ext, iso2022_kr, euc_kr,
+# cp949, johab - CPython's modules over _codecs_cn/hk/iso2022/jp/kr/tw and
+# _multibytecodec, native in src/builtins/nycjk.cpp), utf_7, and mbcs/oem
+# (Windows' code pages through WideCharToMultiByte; elsewhere their import
+# fails and the lookup is a LookupError, as in CPython).
 
 """ Standard "encodings" Package
 
@@ -193,8 +197,8 @@ if sys.platform == 'win32':
     # Python does not support custom code pages.
     def _alias_mbcs(encoding):
         try:
-            import _winapi
-            ansi_code_page = "cp%s" % _winapi.GetACP()
+            # (round 84: _winapi.GetACP() is the _ny_codec native's "acp")
+            ansi_code_page = "cp%s" % _ny_codec("acp")
             if encoding == ansi_code_page:
                 import encodings.mbcs
                 return encodings.mbcs.getregentry()

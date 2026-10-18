@@ -1,6 +1,8 @@
-// Unicode character names (round 77) - see include/NyUniNames.hpp.
+// Unicode character names (round 77; aliases, named sequences and CPython's
+// spelling rules round 84) - see include/NyUniNames.hpp.
 #include "NyUniNames.hpp"
 #include "NyUniNamesData.hpp"
+#include "NyUniData.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -63,7 +65,7 @@ const Table& table() {
             if (bits >= 8) { bits -= 8; bin.push_back((uint8_t)((acc >> bits) & 0xFF)); }
         }
         t.names.reserve(nyuni_data::kNamed);
-        t.by_name.reserve((size_t)nyuni_data::kNamed + kHangulCount);
+        t.by_name.reserve((size_t)nyuni_data::kNamed);
         size_t i = 0;
         int64_t cp = -1;
         while (i < bin.size()) {
@@ -88,18 +90,66 @@ const Table& table() {
             t.by_name.emplace(nm, (uint32_t)cp);
             t.names.emplace_back((uint32_t)cp, std::move(nm));
         }
-        for (uint32_t s = 0; s < kHangulCount; s++) t.by_name.emplace(hangul(kHangulFirst + s), kHangulFirst + s);
     });
     return t;
 }
 
 }  // namespace
 
-bool lookup(const std::string& name, uint32_t& cp) {
+// CPython's _getcode (Modules/unicodedata.c): "HANGUL SYLLABLE " and "CJK
+// UNIFIED IDEOGRAPH-" names are read as they are spelled (upper case, four
+// or five hex digits); every other name without regard to case - the
+// stored ones, the other names made from the code point (CJK COMPATIBILITY
+// IDEOGRAPH-F900, NUSHU CHARACTER-1B170 ...), then the aliases (round 84)
+// and, for unicodedata.lookup, the named sequences. ucd_3_2_0 knows no
+// aliases, sequences or characters added since.
+namespace {
+int find_syllable(const std::string& s, size_t pos, const char* const* col, int count, int& len) {
+    len = -1;
+    int at = -1;
+    for (int i = 0; i < count; i++) {
+        int l = (int)std::strlen(col[i]);
+        if (l <= len) continue;
+        if (pos + (size_t)l <= s.size() && s.compare(pos, (size_t)l, col[i]) == 0) { len = l; at = i; }
+    }
+    if (len == -1) len = 0;
+    return at;
+}
+bool unified_ideograph(uint32_t v) {
+    return (v >= 0x3400 && v <= 0x4DBF) || (v >= 0x4E00 && v <= 0x9FFF) || (v >= 0x20000 && v <= 0x2A6DF) ||
+           (v >= 0x2A700 && v <= 0x2B738) || (v >= 0x2B740 && v <= 0x2B81D) || (v >= 0x2B820 && v <= 0x2CEA1) ||
+           (v >= 0x2CEB0 && v <= 0x2EBE0) || (v >= 0x30000 && v <= 0x3134A);
+}
+bool getcode(const std::string& name, std::vector<uint32_t>& out, bool named_seq, bool v320) {
+    out.clear();
+    static const char kHangul[] = "HANGUL SYLLABLE ", kCjk[] = "CJK UNIFIED IDEOGRAPH-";
+    if (name.compare(0, 16, kHangul) == 0) {
+        size_t pos = 16;
+        int len;
+        int L = find_syllable(name, pos, kJamoL, 19, len); pos += (size_t)len;
+        int V = find_syllable(name, pos, kJamoV, 21, len); pos += (size_t)len;
+        int T = find_syllable(name, pos, kJamoT, 28, len); pos += (size_t)len;
+        if (L < 0 || V < 0 || T < 0 || pos != name.size()) return false;
+        out.push_back(kHangulFirst + ((uint32_t)L * 21 + (uint32_t)V) * 28 + (uint32_t)T);
+        return true;
+    }
+    if (name.compare(0, 22, kCjk) == 0) {
+        std::string hex = name.substr(22);
+        if (hex.size() != 4 && hex.size() != 5) return false;
+        uint32_t v = 0;
+        for (char c : hex) {
+            int h = (c >= '0' && c <= '9') ? c - '0' : (c >= 'A' && c <= 'F') ? c - 'A' + 10 : -1;
+            if (h < 0) return false;
+            v = v * 16 + (uint32_t)h;
+        }
+        if (!unified_ideograph(v)) return false;
+        out.push_back(v);
+        return true;
+    }
     std::string up(name);
     for (auto& c : up) if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
-    // CJK UNIFIED IDEOGRAPH-4E00 and the other names made from the code point
     for (const auto& d : nyuni_data::kDerived) {
+        if (std::strcmp(d.prefix, kCjk) == 0) continue;
         size_t pl = std::strlen(d.prefix);
         if (up.size() <= pl || up.compare(0, pl, d.prefix) != 0) continue;
         std::string hex = up.substr(pl);
@@ -111,13 +161,42 @@ bool lookup(const std::string& name, uint32_t& cp) {
             if (h < 0) { ok = false; break; }
             v = v * 16 + (uint32_t)h;
         }
-        if (ok && v >= d.first && v <= d.last) { cp = v; return true; }
+        char canon[16];
+        std::snprintf(canon, sizeof canon, "%04X", (unsigned)v);
+        if (!ok || hex != canon || v < d.first || v > d.last) continue;
+        if (v320 && !nyucd::assigned_3_2_0(v)) return false;
+        out.push_back(v);
+        return true;
     }
     const Table& t = table();
     auto it = t.by_name.find(up);
-    if (it == t.by_name.end()) return false;
-    cp = it->second;
+    if (it != t.by_name.end()) {
+        if (v320 && !nyucd::assigned_3_2_0(it->second)) return false;
+        out.push_back(it->second);
+        return true;
+    }
+    if (v320) return false;
+    uint32_t cp;
+    if (nyucd::alias_lookup(up, cp)) { out.push_back(cp); return true; }
+    if (named_seq && nyucd::named_sequence_lookup(up, out)) return true;
+    return false;
+}
+}  // namespace
+
+bool lookup(const std::string& name, uint32_t& cp) {
+    std::vector<uint32_t> out;
+    if (!getcode(name, out, false, false) || out.size() != 1) return false;
+    cp = out[0];
     return true;
+}
+
+bool lookup_seq(const std::string& name, std::vector<uint32_t>& out, bool ucd_3_2_0) {
+    return getcode(name, out, true, ucd_3_2_0);
+}
+
+std::string name_3_2_0(uint32_t cp) {
+    if (!nyucd::assigned_3_2_0(cp)) return std::string();
+    return name(cp);
 }
 
 std::string name(uint32_t cp) {

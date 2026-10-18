@@ -1274,6 +1274,18 @@ int64_t g_next = 1;
 
 } // namespace nyz
 
+// round 84: a zlib stream inflated, for other natives' compressed tables
+// (builtins/nycjk.cpp's CJK mapping tables)
+std::string nyz_inflate(const std::string& data) {
+    nyz::Inflater f;
+    f.wrap = 1;
+    f.start();
+    f.in = data;
+    std::string out;
+    f.run(out, 0);
+    return out;
+}
+
 namespace {
 
 [[noreturn]] void fail(const std::string& type, const std::string& msg) { nyos::raise(type, msg); }
