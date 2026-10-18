@@ -189,6 +189,33 @@ if have_tk:
         top.update()
         check("place", [p1.winfo_x(), p1.winfo_y(), p1.winfo_width(), p2.winfo_x(), p2.winfo_y()],
               [10, 20, 50, 75, 35])
+        p3 = tk.Frame(top, width=20, height=10)
+        p3.place(x=10, y=5, relwidth=0.5, relheight=0.25)
+        p4 = tk.Frame(top, width=20, height=10)
+        p4.place(relx=1.0, rely=1.0, x=-5, y=-5, anchor="se")
+        top.update()
+        check("place relwidth / anchor se", [p3.winfo_width(), p3.winfo_height(), p4.winfo_x(), p4.winfo_y()],
+              [100, 25, 175, 85])
+        # PlaceInfoCommand builds a string: tkinter's place_info gives strings
+        pi = p2.place_info()
+        check("place_info", [pi["in"] is top, pi["relx"], pi["x"], pi["width"], pi["relwidth"], pi["anchor"],
+                             pi["bordermode"]], [True, "0.5", "0", "50", "", "center", "inside"])
+        p2.place_configure(relx=0.25)
+        top.update()
+        check("place_configure moves it", p2.winfo_x(), 25)
+        p3.place_forget()
+        top.update()
+        check("place_forget / place_slaves", [p3.winfo_ismapped(), [str(w) for w in top.place_slaves()]],
+              [0, [str(p1), str(p2), str(p4)]])
+        bfr = tk.Frame(top, width=100, height=60, bd=5, relief="ridge")
+        bfr.place(x=0, y=0, width=100, height=60)
+        in1 = tk.Frame(bfr)
+        in1.place(x=0, y=0, relwidth=1.0, height=10)
+        in2 = tk.Frame(bfr)
+        in2.place(x=0, y=0, relwidth=1.0, height=10, bordermode="outside")
+        top.update()
+        check("bordermode inside/outside", [in1.winfo_x(), in1.winfo_width(), in2.winfo_x(), in2.winfo_width()],
+              [5, 90, 0, 100])
         top.destroy()
 
         # ── events and bindings ───────────────────────────────────────────
@@ -787,34 +814,153 @@ if have_tk:
         myf = tkfont.Font(root, family="Helvetica", size=12, weight="bold")
         check("font", [myf.actual("weight"), myf.cget("size"), myf.measure("") , myf.metrics("linespace") > 0,
                        str(myf) in tkfont.names(root)], ["bold", 12, 0, True, True])
+        fm = myf.metrics()
+        check("font metrics", [sorted(fm.keys()), fm["linespace"] == fm["ascent"] + fm["descent"], fm["fixed"],
+                               tkfont.nametofont("TkFixedFont").metrics("fixed")],
+              [["ascent", "descent", "fixed", "linespace"], True, 0, 1])
+        check("font actual()", sorted(myf.actual().keys()),
+              ["family", "overstrike", "size", "slant", "underline", "weight"])
+        myf.configure(size=14)
+        plainf = tkfont.Font(root, family="Helvetica", size=14)
+        check("font configure / measure", [myf["size"], myf.actual("size"), myf.measure("abc") < myf.measure("abcd"),
+                                           myf.measure("abc") >= plainf.measure("abc")], [14, 14, True, True])
+        cpf = myf.copy()
+        check("font copy / equality", [cpf.name != myf.name, cpf.actual() == myf.actual(), cpf == myf,
+                                       myf == tkfont.Font(root, name=myf.name, exists=True)], [True, True, False, True])
+        check("font from a description", [tkfont.Font(root, font=("Courier", 10, "italic")).actual("slant"),
+                                           tkfont.Font(root, font="Times 9 underline").actual("underline")],
+              ["italic", 1])
+        try:
+            tkfont.Font(root, name="nosuchfont", exists=True)
+            check("font exists=True", "no error", "TclError")
+        except TclError as e:
+            check("font exists=True", str(e), "named font nosuchfont does not already exist")
+        lblf = tkfont.Font(root, name="vm114font", size=9)
+        try:
+            tkfont.Font(root, name="vm114font")
+            check("font name taken", "no error", "TclError")
+        except TclError as e:
+            check("font name taken", str(e), 'named font "vm114font" already exists')
+        flab = tk.Label(root, text="x", font=lblf)
+        flab.pack()
+        root.update()
+        h9 = flab.winfo_reqheight()
+        lblf.configure(size=20)
+        root.update()
+        check("a named font's change reaches its widgets", [flab.cget("font"), flab.winfo_reqheight() > h9],
+              ["vm114font", True])
+        flab.destroy()
+        check("families", [type(tkfont.families(root)).__name__, len(tkfont.families(root)) > 0], ["tuple", True])
 
         # ── dialogs, answered by scripted input ───────────────────────────
-        # (the input is queued once the dialog is up: a timer that fires in
-        # the dialog's own event loop)
+        # (the input is queued once the dialog is up, mapped and has the
+        # focus: a timer polling for it in the dialog's own event loop)
         from tkinter import messagebox, simpledialog, filedialog
 
-        def answer_later(*cmds):
-            root.after(150, lambda: root._ny_queue(*cmds))
+        def dialog_up(m, title):
+            foc = str(m.tk.call("focus"))
+            if foc == "":
+                return False
+            todo = list(m.tk.splitlist(m.tk.call("winfo", "children", ".")))
+            while todo:
+                p = str(todo.pop())
+                if str(m.tk.call("winfo", "toplevel", p)) == p:
+                    if str(m.tk.call("wm", "title", p)) == title and str(m.tk.call("winfo", "ismapped", p)) == "1" \
+                            and str(m.tk.call("winfo", "toplevel", foc)) == p:
+                        return True
+                todo.extend(m.tk.splitlist(m.tk.call("winfo", "children", p)))
+            return False
 
-        answer_later("key Return")
-        check("messagebox.showinfo (Return)", messagebox.showinfo("Title", "Message", parent=root), "ok")
-        answer_later("key Escape")
-        check("messagebox.askyesno (Escape is No)", messagebox.askyesno("Q", "Sure?", parent=root), False)
-        answer_later("key Return")
-        check("messagebox.askokcancel (Return)", messagebox.askokcancel("Q", "Go on?", parent=root), True)
-        answer_later("text 42", "key Return")
+        def answer_when(cond, cmds, then=None, m=None):
+            m = root if m is None else m
+            tries = [0]
+
+            def poll():
+                tries[0] += 1
+                if cond():
+                    m._ny_queue(*cmds)
+                    if then is not None:
+                        then()
+                elif tries[0] < 1500:
+                    m.after(20, poll)
+            m.after(20, poll)
+
+        def answer(title, *cmds):
+            answer_when(lambda: dialog_up(root, title), cmds)
+
+        def answer_native(*cmds):
+            answer_when(lambda: getattr(root.tk, "dialog_waiter", None) is not None, cmds)
+
+        answer("Info", "key Return")
+        check("messagebox.showinfo (Return)", messagebox.showinfo("Info", "Message", parent=root), "ok")
+        answer("YN", "key Escape")
+        check("messagebox.askyesno (Escape is No)", messagebox.askyesno("YN", "Sure?", parent=root), False)
+        answer("YN2", "key Tab", "key Return")
+        check("messagebox.askyesno (Tab to No, Return)", messagebox.askyesno("YN2", "Sure?", parent=root), False)
+        answer("OC", "key Return")
+        check("messagebox.askokcancel (Return)", messagebox.askokcancel("OC", "Go on?", parent=root), True)
+        answer("AQ", "key Return")
+        check("messagebox.askquestion", messagebox.askquestion("AQ", "Go?", parent=root), "yes")
+        answer("YNC", "key Escape")
+        check("messagebox.askyesnocancel (Escape is None)", messagebox.askyesnocancel("YNC", "Save?", parent=root), None)
+        answer("RC", "key Return")
+        check("messagebox.askretrycancel", messagebox.askretrycancel("RC", "Again?", parent=root), True)
+        answer("W", "key Return")
+        answer_when(lambda: dialog_up(root, "E"), ["key Return"])
+        check("showwarning / showerror", [messagebox.showwarning("W", "Careful", parent=root),
+                                          messagebox.showerror("E", "Bad", parent=root)], ["ok", "ok"])
+        answer("Q", "text 42", "key Return")
         check("simpledialog.askinteger", simpledialog.askinteger("Q", "Number?", parent=root), 42)
-        answer_later("text abc", "key Return")
-        check("simpledialog.askstring", simpledialog.askstring("Q", "Name?", parent=root), "abc")
-        picked_file = os.path.join(tempfile.gettempdir(), "picked.txt")
-        answer_later("dialog " + picked_file)
+        # out of range: the warning, then a good answer
+        answer_when(lambda: dialog_up(root, "R"), ["text 50", "key Return"],
+                    then=lambda: answer_when(lambda: dialog_up(root, "Too large"), ["key Return"],
+                                             then=lambda: answer("R", "key ctrl+/", "text 5", "key Return")))
+        check("askinteger validates against maxvalue",
+              simpledialog.askinteger("R", "1..10", minvalue=1, maxvalue=10, parent=root), 5)
+        answer("S", "text abc", "key Return")
+        check("simpledialog.askstring", simpledialog.askstring("S", "Name?", parent=root), "abc")
+        answer("S2", "key Escape")
+        check("askstring cancelled", simpledialog.askstring("S2", "Name?", parent=root), None)
+        answer("F", "text 2.5", "key Return")
+        check("simpledialog.askfloat", simpledialog.askfloat("F", "x?", parent=root), 2.5)
+        answer_when(lambda: dialog_up(root, "F2"), ["text abc", "key Return"],
+                    then=lambda: answer_when(lambda: dialog_up(root, "Illegal value"), ["key Return"],
+                                             then=lambda: answer("F2", "key Escape")))
+        check("askfloat: an illegal value warns, then cancel",
+              simpledialog.askfloat("F2", "x?", parent=root), None)
+        picked_file = os.path.join(tempfile.gettempdir(), "vm_audit114_%d.txt" % os.getpid())
+        with open(picked_file, "w") as pf:
+            pf.write("picked\n")
+        answer_native("dialog " + picked_file)
         check("filedialog.askopenfilename", filedialog.askopenfilename(parent=root), picked_file)
-        answer_later("dialog")
+        answer_native("dialog")
         check("filedialog cancelled", filedialog.asksaveasfilename(parent=root), "")
+        answer_native("dialog " + picked_file)
+        check("askopenfilenames", filedialog.askopenfilenames(parent=root), (picked_file,))
+        answer_native("dialog " + picked_file)
+        pfo = filedialog.askopenfile(parent=root)
+        check("askopenfile opens it", [pfo.name, pfo.read()], [picked_file, "picked\n"])
+        pfo.close()
+        answer_native("dialog")
+        check("askopenfile cancelled", filedialog.askopenfile(parent=root), None)
+        answer_native("dialog " + tempfile.gettempdir())
+        check("askdirectory", filedialog.askdirectory(parent=root), tempfile.gettempdir())
+        os.remove(picked_file)
 
-        root.after(150, lambda: root._ny_queue("key Return"))
-        check("colorchooser.askcolor (Return keeps the colour)", colorchooser.askcolor("#ff8000", parent=root),
-              ((255, 128, 0), "#ff8000"))
+        answer("Pick", "key Return")
+        check("colorchooser.askcolor (Return keeps the colour)",
+              colorchooser.askcolor("#ff8000", parent=root, title="Pick"), ((255, 128, 0), "#ff8000"))
+        answer("Pick2", "key Escape")
+        check("colorchooser cancelled", colorchooser.askcolor("#123456", parent=root, title="Pick2"), (None, None))
+
+        stx.pack()
+        root.update()
+        check("ScrolledText's geometry methods are its frame's",
+              [str(stx.pack_info()["in"]), stx.winfo_parent() == str(stx.frame), stx.vbar.get()[0]], [".", True, 0.0])
+        stx.see("end")
+        root.update()
+        check("ScrolledText scrolls", stx.vbar.get()[1], 1.0)
+        stx.pack_forget()
 
         # ── turtle ────────────────────────────────────────────────────────
         import turtle
@@ -896,9 +1042,9 @@ if have_tk:
         scr.listen()
         troot._ny_drive("key Up", "key a")
         check("onkey (on release) / onkeypress", keys, ["up", "press a"])
-        troot.after(150, lambda: troot._ny_queue("text Ada", "key Return"))
+        answer_when(lambda: dialog_up(troot, "Name"), ["text Ada", "key Return"], m=troot)
         check("screen.textinput", scr.textinput("Name", "Who?"), "Ada")
-        troot.after(150, lambda: troot._ny_queue("text 7.5", "key Return"))
+        answer_when(lambda: dialog_up(troot, "Num"), ["text 7.5", "key Return"], m=troot)
         check("screen.numinput", scr.numinput("Num", "How many?", minval=0, maxval=10), 7.5)
         scr.setworldcoordinates(-10, -10, 10, 10)
         check("setworldcoordinates", [scr.mode(), round(scr.xscale * 20) == scr.canvwidth], ["world", True])

@@ -64,6 +64,8 @@ DONT_WAIT = 2
 ALL_EVENTS = -3
 
 _APPS = []
+# native events read from the backend and not yet dispatched (pump_native)
+_BACKLOG = []
 
 
 def _now_ms():
@@ -1059,24 +1061,34 @@ class App:
         return self.root is not None and not self.root.destroyed
 
     def pump_native(self, wait_ms):
-        if not self.natives:
+        # one native event per call, as Tcl_DoOneEvent serves one: what the
+        # backend gave beyond it waits in the thread's backlog, so input
+        # typed ahead of a nested loop's end (a dialog answered, then keys
+        # for the window under it) reaches the windows as they are then
+        bl = _BACKLOG
+        if not bl:
+            if not self.natives and not self.any_natives():
+                if wait_ms > 0:
+                    time.sleep(min(wait_ms, 20) / 1000.0)
+                return False
             if wait_ms > 0:
-                time.sleep(min(wait_ms, 20) / 1000.0)
-            return False
-        if wait_ms > 0:
-            evs = gui_wait_events(-1, wait_ms)
-        else:
-            evs = gui_poll_events(-1)
-        n = len(evs)
-        if n == 0:
-            return False
-        i = 0
-        while i < n:
-            e = evs[i]
-            nxt = evs[i + 1] if i + 1 < n else None
-            consumed = self.owner_of(e).native_event(e, nxt)
-            i += 2 if consumed else 1
+                evs = gui_wait_events(-1, wait_ms)
+            else:
+                evs = gui_poll_events(-1)
+            if len(evs) == 0:
+                return False
+            bl.extend(evs)
+        e = bl.pop(0)
+        nxt = bl[0] if bl else None
+        if self.owner_of(e).native_event(e, nxt) and bl:
+            bl.pop(0)
         return True
+
+    def any_natives(self):
+        for a in _APPS:
+            if a.natives:
+                return True
+        return False
 
     def owner_of(self, e):
         # every Tk application of the thread shares one event source, as
@@ -1296,9 +1308,13 @@ class App:
             self.key_event(top, e.get("key", ""), e.get("keycode", 0), ch, t == "keydown", st)
             return used
         if t == "textinput":
+            # text arrives without its modifiers; a backend never sends text
+            # for a Control/Alt/Meta chord, so those are not held for it
+            # (the last chord's state would make <Control-Key> eat the text)
+            st = self.mods & ~(B.ControlMask | B.ALT_MASK | B.META_MASK)
             for c in e.get("text", ""):
-                self.key_event(top, "", 0, c, True, self.mods)
-                self.key_event(top, "", 0, c, False, self.mods)
+                self.key_event(top, "", 0, c, True, st | self.buttons)
+                self.key_event(top, "", 0, c, False, st | self.buttons)
             return False
         if t == "dropfile" or t == "droptext":
             w = self.window_at(top, e.get("x", 0), e.get("y", 0) - top.menubar_height())

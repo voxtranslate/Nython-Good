@@ -6177,7 +6177,7 @@ private:
     // round 84: the instance's class (not the builtin's mirror) defines d
     bool own_dunder(const VMVal& v, const char* d) {
         VMVal m; std::string owner;
-        return class_lookup(v.class_name,d,m,&owner)&&!nyrt::builtin_mirror(owner);
+        return class_lookup(v.class_name,d,m,&owner)&&nyrt::mirror_builtin(owner).empty();
     }
     bool iter_overridden(const VMVal& v) {
         auto it=iter_own_cache_.find(v.class_name);

@@ -20,7 +20,7 @@
 # Integer arithmetic is C's (division truncates toward zero) as in Tk, so
 # the pixel results are Tk's for the same requested sizes.
 
-from _tkinter.tcl import TclError, tcl_str, split_list, join_list, get_int, get_double, get_boolean, match_prefix, or_list
+from _tkinter.tcl import TclError, tcl_str, split_list, join_list, get_int, get_double, get_boolean, match_prefix, or_list, quote_elem
 from _tkinter.util import pixels, cdiv, cround
 
 # ── pack ─────────────────────────────────────────────────────────────────────
@@ -1123,17 +1123,18 @@ def place_configure(app, slave, args):
 
 
 def place_info(app, slave):
+    # PlaceInfoCommand builds a string (Tcl_AppendPrintfToObj, "%.4g" for
+    # the relative values), so tkinter's place_info() gives strings
     if slave.manager != "place":
-        return ()
+        return ""
     i = slave.minfo
-    return ("-in", slave.gmaster.path, "-x", i.x, "-relx", _g(i.relx), "-y", i.y, "-rely", _g(i.rely),
-            "-width", i.width if i.width is not None else "", "-relwidth", _g(i.relwidth) if i.relwidth is not None else "",
-            "-height", i.height if i.height is not None else "", "-relheight", _g(i.relheight) if i.relheight is not None else "",
-            "-anchor", i.anchor, "-bordermode", i.bordermode)
-
-
-def _g(v):
-    return v
+    out = "-in " + quote_elem(slave.gmaster.path) + " "
+    out += "-x %d -relx %.4g -y %d -rely %.4g" % (i.x, i.relx, i.y, i.rely)
+    out += (" -width %d" % i.width) if i.width is not None else " -width {}"
+    out += (" -relwidth %.4g" % i.relwidth) if i.relwidth is not None else " -relwidth {}"
+    out += (" -height %d" % i.height) if i.height is not None else " -height {}"
+    out += (" -relheight %.4g" % i.relheight) if i.relheight is not None else " -relheight {}"
+    return out + " -anchor " + i.anchor + " -bordermode " + i.bordermode
 
 
 def place_arrange(app, m):
