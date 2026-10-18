@@ -4,6 +4,7 @@
 #include <map>
 #include <vector>
 #include <deque>
+#include <unordered_map>
 #include "IParser.hpp"
 
 using nython::node::Node;
@@ -101,7 +102,7 @@ private:
     const Token* mangled_src_ = nullptr;
     std::string mangled_cls_;
     inline const Token& mg(const Token& t) {
-        if(mangle_stack_.empty() || mangle_stack_.back().empty() || t.type() != TokenType::Identifier
+        if(ast_mode_ || mangle_stack_.empty() || mangle_stack_.back().empty() || t.type() != TokenType::Identifier
            || !manglable(t.value))
             return t;
         if(mangled_src_ == &t && !mangled_.empty() && mangled_cls_ == mangle_stack_.back())
@@ -263,37 +264,63 @@ private:
     node_ptr script();
     node_ptr stmt();
 
+    // round 83: ast mode (lib/ast.ny, Parser.cpp's "ast mode"): each of these
+    // records the span of the node it returns - its first token through the
+    // last one read - when ast_mode_ is set; otherwise it is the plain call.
+    int lastTok() const;
+    void spanSet(const Node* n, int t0);
+#define NY_AST_SPANNED(fn) \
+    node_ptr fn##_(); \
+    inline node_ptr fn(){ \
+        if(__builtin_expect(!ast_mode_, 1)) return fn##_(); \
+        int t0__ = scanner->current; node_ptr n__ = fn##_(); spanSet(n__.get(), t0__); return n__; \
+    }
+    NY_AST_SPANNED(statement)
+    NY_AST_SPANNED(assignment)
+    NY_AST_SPANNED(ternary)
+    NY_AST_SPANNED(coalesce)
+    NY_AST_SPANNED(rangeExpr)
+    NY_AST_SPANNED(logicalOr)
+    NY_AST_SPANNED(logicalAnd)
+    NY_AST_SPANNED(bitwiseOr)
+    NY_AST_SPANNED(bitwiseXor)
+    NY_AST_SPANNED(bitwiseAnd)
+    NY_AST_SPANNED(comparison)
+    NY_AST_SPANNED(shift)
+    NY_AST_SPANNED(addition)
+    NY_AST_SPANNED(multiplication)
+    NY_AST_SPANNED(power)
+    NY_AST_SPANNED(unary)
+    NY_AST_SPANNED(postfix)
+    NY_AST_SPANNED(primary)
+    NY_AST_SPANNED(atom)
+    NY_AST_SPANNED(lambdaExpr)
+    NY_AST_SPANNED(starElem)
+    NY_AST_SPANNED(listLiteral)
+    NY_AST_SPANNED(mapLiteral)
+#undef NY_AST_SPANNED
+    // ast mode's own forms of these statements (round 83)
+    node_ptr importAst();
+    node_ptr tryAst();
+    // round 83: where each byte of an f-string's value is in the source - as
+    // the start of a part (r, c) and as the end of one (er, ec)
+    struct FPos { uint32_t r = 0, c = 0, er = 0, ec = 0; };
+    using FPositions = std::vector<FPos>;
+    node_ptr fstringAst(const Token& str_tok, const std::string& raw, const FPositions* at = nullptr);
+    bool fstrPositions(const Token& str_tok, const std::string& raw, FPositions& at);
+
     // Expression parsing (Pratt-style precedence climbing)
     node_ptr expression();
-    node_ptr assignment();
-    node_ptr ternary();
-    node_ptr rangeExpr();
-    node_ptr logicalOr();
-    node_ptr logicalAnd();
-    node_ptr bitwiseOr();
-    node_ptr bitwiseXor();
-    node_ptr bitwiseAnd();
     node_ptr equality();
-    node_ptr comparison();
-    node_ptr shift();
-    node_ptr addition();
-    node_ptr multiplication();
-    node_ptr power();
-    node_ptr unary();
-    node_ptr postfix();
     // postfix() pieces, shared by `.`/`[`/`(` and their optional forms
     void parseCallArgs(std::shared_ptr<nython::node::CallNode> call);
     node_ptr parseSubscriptTail(Token tok, node_ptr expr);
     std::string memberName();
     bool postfixOther(node_ptr& expr);
-    node_ptr coalesce();          // a ?? b
-    node_ptr primary();
-    node_ptr atom();
     // f"..." / `...${}...` interpolation: literal parts and fields, joined by +
     node_ptr fstringNode(const Token& str_tok, const std::string& raw);
 
     // Statement parsing
-    node_ptr statement();
     node_ptr expressionStmt();
     node_ptr varDecl(bool is_const = false, bool is_let = false);
     node_ptr ifStmt();
@@ -325,13 +352,17 @@ private:
         std::vector<std::pair<std::string, std::shared_ptr<MatchPat>>> kw;  // CLASS keywords
         std::vector<std::pair<node_ptr, std::shared_ptr<MatchPat>>> items; // MAP
         std::string rest;                 // MAP: **rest
+        // round 83: token spans (ast mode) - the pattern's, and with its
+        // `as name`
+        int t0 = -1, t1 = -1, as_t0 = -1, as_t1 = -1;
     };
     std::shared_ptr<MatchPat> matchPattern();        // open sequence at the top
     std::shared_ptr<MatchPat> matchOrPattern();
     std::shared_ptr<MatchPat> matchClosedPattern();
+    std::shared_ptr<MatchPat> matchClosedPattern_();   // round 83: matchClosedPattern() records its span
+    node_ptr patAst(const std::shared_ptr<MatchPat>& p);   // round 83: Python's pattern nodes
     node_ptr matchStmt(Token tok, node_ptr subject);
     node_ptr enumDecl();
-    node_ptr lambdaExpr();
     node_ptr deleteStmt();
     node_ptr yieldStmt();
     node_ptr withStmt(bool is_async = false);
@@ -351,12 +382,10 @@ private:
     std::vector<node_ptr> paramList();
     std::vector<node_ptr> lambdaParamList();
     std::vector<node_ptr> argList();
-    node_ptr listLiteral();
     // Starred elements in displays (round 77): [*a, b], (*a, b), {*a},
     // {**d, k: v}. Outside an assignment target they become calls of the
     // prelude's _ny_list_cat / _ny_dict_merge; inside one they stay
     // UnaryNode("*") targets.
-    node_ptr starElem();
     node_ptr catStarred(Token tok, const std::vector<node_ptr>& elems, const char* wrap);
     bool in_assign_target_ = false;
     // After the first `for` of a comprehension: its clauses.
@@ -364,7 +393,6 @@ private:
     node_ptr compTarget();
     node_ptr compTargetOne();
     node_ptr starTargetSpec(node_ptr& target);   // round 84
-    node_ptr mapLiteral();
     node_ptr tupleLiteral();
 
 
@@ -373,6 +401,34 @@ public:
     // Constructor
     Parser(Reporter* reporter, Runnable* runner, Lexer* lexer);
     node_ptr parse();
+
+    // ── ast mode (round 83; lib/ast.ny through _ny_ast, src/builtins/text.cpp)
+    // The parser keeps Python's tree shape (PyAstNode where it would
+    // desugar), does not mangle private names, runs no scope checks and
+    // records spans; the tree is for lib/ast.ny only, never executed.
+    bool ast_mode_ = false;
+    // a node's tokens: [first, last] indexes into the lexer's tokens
+    std::unordered_map<const Node*, std::pair<int,int>> ast_spans_;
+    // an expression written in parentheses: the span with them ({-2, -2}:
+    // parenthesised inside an f-string field)
+    std::unordered_map<const Node*, std::pair<int,int>> ast_outer_;
+    // "async" (AsyncFor, an async comprehension clause's iterable), "star"
+    // (TryStar), "inclusive" (a...b)
+    std::unordered_map<const Node*, std::string> ast_flags_;
+    // the expressions of f-string fields (their positions are the f-string's)
+    std::vector<node_ptr> fstr_nodes_;
+    // exact positions inside an f-string (CPython 3.12's): the tokens of its
+    // fields' expressions, moved to the source's coordinates - a field
+    // node's span indexes them from kAstExtra; off in a field's own parser
+    // (an f-string nested in a field is located at itself); the source and
+    // its line starts, made on first need
+    static constexpr int kAstExtra = 1 << 28;
+    std::vector<Token> ast_extra_toks_;
+    bool ast_fstr_exact_ = true;
+    std::string ast_src_;
+    std::vector<size_t> ast_line_starts_;
+    node_ptr parseAst(const std::string& mode);   // "exec", "eval", "single", "func_type"
+    const Lexer* lexer() const { return scanner; }
 
 };
 

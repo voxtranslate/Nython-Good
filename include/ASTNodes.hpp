@@ -1053,6 +1053,37 @@ struct OptChainNode : Node {
 
 // Whether a parsed program is one expression: the prompt shows its value,
 // eval() accepts it (round 77; main.cpp's, shared).
+// round 83: a node of Python's own tree shape, made by the parser in ast
+// mode only (Parser::ast_mode_, for lib/ast.ny through _ny_ast in
+// src/builtins/text.cpp) where it would otherwise desugar - a Compare, a
+// Slice, a JoinedStr, an ImportFrom ... The engines never see one.
+struct PyAstNode : Node {
+    std::string kind;
+    std::vector<std::pair<std::string, node_ptr>> kids;                // one child each (may be null)
+    std::vector<std::pair<std::string, std::vector<node_ptr>>> lists;  // lists of children (null items allowed)
+    std::vector<std::pair<std::string, std::string>> strs;              // strings (absent: None)
+    std::vector<std::pair<std::string, std::vector<std::string>>> strlists;
+    std::vector<std::pair<std::string, long long>> ints;
+    PyAstNode(Token t, std::string k) : Node(t, NodeType::PY_AST), kind(std::move(k)) {}
+    PyAstNode* kid(const char* f, node_ptr n) { kids.emplace_back(f, std::move(n)); return this; }
+    PyAstNode* list(const char* f, std::vector<node_ptr> v) { lists.emplace_back(f, std::move(v)); return this; }
+    PyAstNode* str(const char* f, std::string v) { strs.emplace_back(f, std::move(v)); return this; }
+    PyAstNode* strl(const char* f, std::vector<std::string> v) { strlists.emplace_back(f, std::move(v)); return this; }
+    PyAstNode* num(const char* f, long long v) { ints.emplace_back(f, v); return this; }
+    node_ptr kidOf(const std::string& f) const { for (auto& k : kids) if (k.first == f) return k.second; return nullptr; }
+    const std::vector<node_ptr>* listOf(const std::string& f) const { for (auto& l : lists) if (l.first == f) return &l.second; return nullptr; }
+    const std::string* strOf(const std::string& f) const { for (auto& s : strs) if (s.first == f) return &s.second; return nullptr; }
+    const std::vector<std::string>* strlOf(const std::string& f) const { for (auto& s : strlists) if (s.first == f) return &s.second; return nullptr; }
+    long long numOf(const std::string& f, long long d = 0) const { for (auto& i : ints) if (i.first == f) return i.second; return d; }
+    std::vector<node_ptr> statements() override {
+        std::vector<node_ptr> out;
+        for (auto& k : kids) if (k.second) out.push_back(k.second);
+        for (auto& l : lists) for (auto& n : l.second) if (n) out.push_back(n);
+        return out;
+    }
+    Value eval(Context*) override { return NONE_VALUE; }
+};
+
 inline bool is_expression_program(const node_ptr& ast) {
     node_ptr n = ast;
     for (int depth = 0; n && depth < 4; depth++) {

@@ -2,6 +2,8 @@
 #pragma GCC diagnostic ignored "-Wunused-but-set-variable"
 #include "Parser.hpp"
 #include <functional>
+#include <map>
+#include <cctype>
 #include <set>
 #include "NyExcTypes.hpp"
 #include "SourceCode.hpp"
@@ -69,10 +71,94 @@ Parser::Parser(Reporter* reporter, Runnable* runner_arg, Lexer* lexer): IParser(
 node_ptr Parser::parse() {
     try {
         node_ptr root = script();
-        nython::scope::check(root);   // nonlocal / const / global binding forms (NyScope.hpp)
+        // nonlocal / const / global binding forms (NyScope.hpp); not in ast
+        // mode (round 83: ast.parse checks no scopes - CPython's symtable
+        // pass reports those at compile time)
+        if(!ast_mode_) nython::scope::check(root);
         return root;
     }
     catch (SyntaxError& ex) { throw ex; }
+}
+
+// ── ast mode (round 83) ──────────────────────────────────────────────────────
+// lib/ast.ny's ast.parse is built on this parser: `_ny_ast(source, mode)`
+// (src/builtins/text.cpp) parses with ast_mode_ set, and the parser then
+// keeps Python's shape where it would desugar (PyAstNode: decorators,
+// chained comparisons, slices, f-strings, starred displays, unpacking
+// assignments, match, except clauses, imports, with items ...), records
+// the token span of each node it returns (ast_spans_; ast_outer_ for the
+// parentheses around an expression), does not mangle private names, keeps
+// asserts under -O and runs no scope checks. The tree is never executed.
+
+// The last token read, past the newlines/indentation/semicolons that end a
+// statement.
+int Parser::lastTok() const {
+    int i = scanner->current - 1;
+    while(i >= 0){
+        TokenType t = scanner->tokens[(size_t)i].type();
+        if(t != TokenType::NewLine && t != TokenType::Indent && t != TokenType::Dedent
+           && t != TokenType::SemiColon && t != TokenType::End) break;
+        i--;
+    }
+    return i;
+}
+
+void Parser::spanSet(const Node* n, int t0){
+    if(!n || ast_spans_.count(n)) return;
+    int nt = (int)scanner->tokens.size();
+    while(t0 < nt){
+        TokenType t = scanner->tokens[(size_t)t0].type();
+        if(t != TokenType::NewLine && t != TokenType::Indent && t != TokenType::Dedent) break;
+        t0++;
+    }
+    int t1 = lastTok();
+    if(t0 < 0 || t1 < t0) return;
+    ast_spans_[n] = {t0, t1};
+}
+
+// The tree for ast.parse(source, mode=...): "exec" a Script, "eval" one
+// expression (a tuple display allowed), "single" a Script of the
+// statements, "func_type" a PyAstNode FunctionType.
+node_ptr Parser::parseAst(const std::string& mode){
+    ast_mode_ = true;
+    if(mode == "eval" || mode == "func_type"){
+        while(have(TokenType::NewLine) || have(TokenType::Indent) || have(TokenType::Dedent)) {}
+        Token tok = token();
+        node_ptr result;
+        if(mode == "eval"){
+            if(see(TokenType::End)) throw SyntaxError(tok.location(), "invalid syntax");
+            int t0 = scanner->current;
+            result = exprList(tok);
+            spanSet(result.get(), t0);
+        } else {
+            // (argtypes) -> returns
+            mustBe(TokenType::ParenOpen);
+            std::vector<node_ptr> args;
+            while(!see(TokenType::ParenClose) && !see(TokenType::End)){
+                int a0 = scanner->current;
+                node_ptr a;
+                if(have(TokenType::Mul) || have(TokenType::Exp)){
+                    Token st = prev();
+                    a = make_node<UnaryNode>(st, expression());
+                } else a = expression();
+                spanSet(a.get(), a0);
+                args.push_back(a);
+                if(!have(TokenType::Comma)) break;
+            }
+            mustBe(TokenType::ParenClose);
+            mustBe(TokenType::RightArrow);
+            int r0 = scanner->current;
+            node_ptr ret = expression();
+            spanSet(ret.get(), r0);
+            auto ft = std::make_shared<PyAstNode>(tok, "FunctionType");
+            ft->list("argtypes", args)->kid("returns", ret);
+            result = ft;
+        }
+        while(have(TokenType::NewLine) || have(TokenType::Indent) || have(TokenType::Dedent) || have(TokenType::SemiColon)) {}
+        if(!see(TokenType::End)) throw SyntaxError(token().location(), "invalid syntax");
+        return result;
+    }
+    return parse();
 }
 
 std::string Parser::dottedName(){
@@ -308,7 +394,7 @@ node_ptr Parser::script(){
     }
     mustBe(TokenType::End);
     // A module that annotates a name has __annotations__ (round 77).
-    if(module_ann_used_) node->add(annotationsDecl(tok));
+    if(module_ann_used_ && !ast_mode_) node->add(annotationsDecl(tok));   // round 83: not in ast mode
     for(auto& s : stmts) node->add(s);
     return node;
 }
@@ -319,7 +405,7 @@ node_ptr Parser::stmt(){
     return statement();
 }
 
-node_ptr Parser::statement(){
+node_ptr Parser::statement_(){   // round 83: statement() records its span in ast mode (Parser.hpp)
     // ── Dynamic keyword dispatch ───────────────────────────────────
     // If the current token is a dynamic keyword (__dyntok:ID:name),
     // look up its registered rules and route accordingly.
@@ -422,6 +508,18 @@ node_ptr Parser::statement(){
         if(dec_expr && dec_expr->type() == NodeType::VARIABLE && dec_expr->value() == "staticmethod") next_def_static_ = true;
         // Parse the decorated function or class
         node_ptr target = statement();
+        if(ast_mode_){
+            // round 83: Python's decorator_list (outermost first); a stacked
+            // decorator's statement() returned a Decorated already
+            if(target && target->type() == NodeType::PY_AST && static_cast<PyAstNode*>(target.get())->kind == "Decorated"){
+                auto& decs = static_cast<PyAstNode*>(target.get())->lists[0].second;
+                decs.insert(decs.begin(), dec_expr);
+                return target;
+            }
+            auto d = std::make_shared<PyAstNode>(dec_tok, "Decorated");
+            d->list("decorators", {dec_expr})->kid("target", target);
+            return d;
+        }
         {
             // a decorated function's co_firstlineno is its first decorator's
             // line, as in CPython (round 77; stacked decorators wrap it in
@@ -479,6 +577,15 @@ node_ptr Parser::statement(){
         // async_def_desugar).
         if(see(TokenType::For)){
             node_ptr f = forStmt();
+            if(ast_mode_){   // round 83: AsyncFor, its iterable as written
+                ast_flags_[f.get()] = "async";
+                while(have(TokenType::NewLine)) {}
+                if(see(TokenType::Else) && f->type() == NodeType::FOR){
+                    next(); have(TokenType::Colon);
+                    static_cast<ForNode*>(f.get())->else_branch = blockOrStmt();
+                }
+                return f;
+            }
             if(f && f->type() == NodeType::FOR){
                 auto* fn = static_cast<ForNode*>(f.get());
                 fn->iterable = wrap_call("_ny_aiter", fn->iterable);
@@ -578,14 +685,21 @@ node_ptr Parser::statement(){
         // enclosing function's x, and a walrus / `except ... as` / `with
         // ... as` of a global-declared name binds the module's.
         auto decls = make_node<BlockNode>(token());
+        std::vector<std::string> names;   // round 83: ast mode's Global / Nonlocal
         do {
             Token ntok = token();
             std::string n = identifier();
             if(!outer_decls_.empty()) outer_decls_.back().push_back(n);
             if(is_global && !global_decls_.empty()) global_decls_.back().push_back(n);
             decls->add(make_node<GlobalNode>(ntok, n, !is_global));
+            names.push_back(n);
         } while(have(TokenType::Comma));
         have(TokenType::SemiColon); have(TokenType::NewLine);
+        if(ast_mode_){
+            auto g = std::make_shared<PyAstNode>(decls->token(), is_global ? "Global" : "Nonlocal");
+            g->strl("names", names);
+            return g;
+        }
         return decls;
     }
     if(see(TokenType::Return)) return returnStmt();
@@ -620,7 +734,9 @@ node_ptr Parser::statement(){
     if(see(TokenType::Assert)) return assertStmt();
 
     // Misc
-    if(see(TokenType::Print) && !usedAsName()) return printStmt();
+    // round 83: in ast mode `print(...)` is Python's call (an expression
+    // statement); the Nython statement form `print x` stays a statement
+    if(see(TokenType::Print) && !usedAsName() && !(ast_mode_ && peek().type() == TokenType::ParenOpen)) return printStmt();
     if(see(TokenType::Import)||see(TokenType::From)) return importStmt();
     if(see(TokenType::Delete) && !(value() == "delete" && usedAsName())) return deleteStmt();
     if(see(TokenType::With)) return withStmt();
@@ -719,7 +835,7 @@ node_ptr Parser::statement(){
 
     // Block - or a dict/set display starting an expression statement
     // (`{}["x"]` raises KeyError, round 77)
-    if(see(TokenType::BraceOpen)) return braceIsExpression() ? expressionStmt() : block();
+    if(see(TokenType::BraceOpen)) return (ast_mode_ || braceIsExpression()) ? expressionStmt() : block();   // round 83: Python's is always a display
 
     // Annotated assignment (PEP 526): `x: int = 5`, `self.x: T = v`,
     // `x: int` (an annotation alone binds nothing). The annotation is
@@ -759,6 +875,15 @@ node_ptr Parser::statement(){
             node_ptr ann = ternary();   // the annotation (not expression(): `T = v` is not an assignment)
             int a1 = scanner->current;
             node_ptr value = nullptr;
+            if(ast_mode_){
+                // round 83: AnnAssign (a tuple display may be its value)
+                if(have(TokenType::Assign)) value = see(TokenType::Yield) ? expression() : exprList(token());
+                consumed_semi_ = have(TokenType::SemiColon);
+                if(!consumed_semi_) have(TokenType::NewLine);
+                auto n = std::make_shared<PyAstNode>(tok0, "AnnAssign");
+                n->kid("target", target)->kid("annotation", ann)->kid("value", value)->num("simple", simple ? 1 : 0);
+                return n;
+            }
             if(have(TokenType::Assign)) value = expression();
             have(TokenType::SemiColon); have(TokenType::NewLine);
             node_ptr assign = nullptr;
@@ -834,20 +959,35 @@ node_ptr Parser::statement(){
         }
         if(!eqs.empty() && (comma_before_last || bracketed_group)) {
             Token op = token();
-            struct Group { std::vector<node_ptr> ts; int star = -1; bool comma = false; };
+            Token first_tok = token();
+            // round 83: t0/t1 - the group's tokens (ast mode's Tuple target)
+            struct Group { std::vector<node_ptr> ts; int star = -1; bool comma = false; int t0 = -1, t1 = -1; };
             std::vector<Group> groups;
             in_assign_target_ = true;
             try {
                 for(size_t g = 0; g < eqs.size(); g++){
                     Group gr;
+                    gr.t0 = scanner->current;
                     while(true){
-                        if(have(TokenType::Mul)) { gr.star = (int)gr.ts.size(); gr.ts.push_back(asTarget(postfix())); }
+                        if(have(TokenType::Mul)) {
+                            gr.star = (int)gr.ts.size();
+                            Token st = prev();
+                            int s0 = scanner->current - 1;
+                            node_ptr t = asTarget(postfix());
+                            if(ast_mode_){   // round 83: the Starred target itself
+                                st.value = "*";
+                                t = make_node<UnaryNode>(st, t);
+                                spanSet(t.get(), s0);
+                            }
+                            gr.ts.push_back(t);
+                        }
                         else gr.ts.push_back(asTarget(postfix()));
                         if(!have(TokenType::Comma)) break;
                         gr.comma = true;
                         if(see(TokenType::Assign)) break;
                     }
-                    for(auto& t : gr.ts) checkAssignable(t);
+                    gr.t1 = lastTok();
+                    for(auto& t : gr.ts) checkAssignable(isStarElem(t) ? static_cast<UnaryNode*>(t.get())->operand : t);
                     groups.push_back(std::move(gr));
                     op = token();
                     mustBe(TokenType::Assign);
@@ -856,9 +996,26 @@ node_ptr Parser::statement(){
             in_assign_target_ = false;
             // the value: one expression or a tuple display (`*x` allowed)
             std::vector<node_ptr> vals;
-            node_ptr value = exprList(op, &vals);
+            int v0 = scanner->current;
+            node_ptr value = see(TokenType::Yield) && ast_mode_ ? expression() : exprList(op, &vals);
             consumed_semi_ = have(TokenType::SemiColon);
             if(!consumed_semi_) have(TokenType::NewLine);
+            if(ast_mode_){
+                // round 83: Assign(targets, value) - a target list unpacked
+                // is a Tuple (bracketed ones are the Tuple/List postfix() read)
+                spanSet(value.get(), v0);
+                std::vector<node_ptr> targets;
+                for(auto& g : groups){
+                    if(g.ts.size() == 1 && !g.comma && g.star < 0) { targets.push_back(g.ts[0]); continue; }
+                    auto tup = make_node<TupleNode>(first_tok);
+                    for(auto& t : g.ts) tup->add(t);
+                    if(g.t0 >= 0 && g.t1 >= g.t0) ast_spans_[tup.get()] = {g.t0, g.t1};
+                    targets.push_back(tup);
+                }
+                auto n = std::make_shared<PyAstNode>(first_tok, "Assign");
+                n->list("targets", targets)->kid("value", value);
+                return n;
+            }
             auto block = make_node<BlockNode>(op);
             auto tmp_name = [&]() { return unpackTemp(); };
             auto var_ref = [&](const std::string& n) { Token t = op; t.value = n; return make_node<VariableNode>(t); };
@@ -945,8 +1102,9 @@ node_ptr Parser::exprList(Token tok, std::vector<node_ptr>* items, node_ptr firs
     }
     std::vector<node_ptr> elems{first};
     bool starred = isStarElem(first);
+    int trailing = -1;   // round 83: a trailing comma ends the tuple's span (ast mode)
     while(have(TokenType::Comma)){
-        if(endsExprList(token().type())) break;
+        if(endsExprList(token().type())) { trailing = scanner->current - 1; break; }
         node_ptr e = starElem();
         // `a, b += 1` / `x = 1, y = 2`: an assignment is not an item
         if(e && (e->type() == NodeType::ASSIGNMENT_AUG || e->type() == NodeType::ASSIGNMENT))
@@ -955,10 +1113,17 @@ node_ptr Parser::exprList(Token tok, std::vector<node_ptr>* items, node_ptr firs
         starred = starred || isStarElem(e);
         elems.push_back(e);
     }
-    if(starred) return catStarred(tok, elems, "tuple");
+    if(starred && !ast_mode_) return catStarred(tok, elems, "tuple");   // round 83: ast mode keeps the display
     auto tup = make_node<TupleNode>(tok);
     for(auto& e : elems) tup->add(e);
     if(items) *items = elems;
+    if(ast_mode_ && trailing >= 0){
+        auto o = ast_outer_.find(first.get());
+        auto sp0 = ast_spans_.find(first.get());
+        int t0 = (o != ast_outer_.end() && o->second.first >= 0) ? o->second.first
+               : sp0 != ast_spans_.end() ? sp0->second.first : -1;
+        if(t0 >= 0) ast_spans_[tup.get()] = {t0, trailing};
+    }
     return tup;
 }
 
@@ -1132,7 +1297,7 @@ node_ptr Parser::expression(){
     return assignment();
 }
 
-node_ptr Parser::assignment(){
+node_ptr Parser::assignment_(){   // round 83: assignment() records its span in ast mode (Parser.hpp)
     node_ptr left = ternary();
     // `self = x`, `(self := x)`: the name (round 77)
     if(left && left->type() == NodeType::SELF && (see(TokenType::Assign) || isAugAssign()))
@@ -1144,6 +1309,11 @@ node_ptr Parser::assignment(){
     if(see(TokenType::Assign) && token().value == ":=" && left && left->type() == NodeType::VARIABLE){
         Token op = token(); next();
         node_ptr init = ternary();
+        if(ast_mode_){   // round 83: NamedExpr, its target the Name node
+            auto n = std::make_shared<PyAstNode>(op, "NamedExpr");
+            n->kid("target", left)->kid("value", init);
+            return n;
+        }
         return make_node<WalrusNode>(op, left->value(), init);
     }
     // `a?.b = v` has no meaning when a is none: an optional chain is read-only.
@@ -1165,7 +1335,7 @@ node_ptr Parser::assignment(){
     return left;
 }
 
-node_ptr Parser::ternary(){
+node_ptr Parser::ternary_(){   // round 83: ternary() records its span in ast mode (Parser.hpp)
     // yield as expression: allows "var x = yield val" and "x = yield val"
     if(see(TokenType::Yield)) {
         Token tok = token(); next(); // consume 'yield'
@@ -1210,7 +1380,7 @@ node_ptr Parser::ternary(){
 // a ?? b: a, unless a is none or undefined - then b, which is evaluated
 // only in that case. Binds looser than `or` and tighter than the ternaries
 // (C#'s and JavaScript's place), and groups to the right: a ?? b ?? c.
-node_ptr Parser::coalesce(){
+node_ptr Parser::coalesce_(){   // round 83: coalesce() records its span in ast mode (Parser.hpp)
     node_ptr left = rangeExpr();
     if(have(TokenType::NullCoalesce)){
         Token tok = prev();
@@ -1230,7 +1400,7 @@ node_ptr Parser::coalesce(){
 // was a syntax error even though every piece needed to run it was present.
 // Sits directly above logicalOr so `1..n` binds tighter than `and`/`or` but
 // looser than arithmetic, making `1..n+1` mean `1..(n+1)`.
-node_ptr Parser::rangeExpr(){
+node_ptr Parser::rangeExpr_(){   // round 83: rangeExpr() records its span in ast mode (Parser.hpp)
     node_ptr lo = logicalOr();
     if(see(TokenType::Interval) || see(TokenType::Ellipsis)){
         bool inclusive = see(TokenType::Ellipsis);
@@ -1242,6 +1412,11 @@ node_ptr Parser::rangeExpr(){
         if(see(TokenType::Interval)){
             next();
             step = logicalOr();
+        }
+        if(inclusive && ast_mode_){   // round 83: NyRange(inclusive=1)
+            auto r = make_node<RangeNode>(tok, lo, hi, step);
+            ast_flags_[r.get()] = "inclusive";
+            return r;
         }
         if(inclusive){
             // `a...b` includes b. Represent it as a half-open range ending at
@@ -1259,7 +1434,7 @@ node_ptr Parser::rangeExpr(){
     return lo;
 }
 
-node_ptr Parser::logicalOr(){
+node_ptr Parser::logicalOr_(){   // round 83: logicalOr() records its span in ast mode (Parser.hpp)
     node_ptr left = logicalAnd();
     while(have(TokenType::Or)||have(TokenType::Xor)){
         Token op = prev();
@@ -1274,7 +1449,7 @@ node_ptr Parser::logicalOr(){
 // Python's precedence, loosest first: or, and, comparisons (==, <, in,
 // is, ...), |, ^, &, shifts, arithmetic. The bitwise operators used to sit
 // below the comparisons, as in C, so `d & 1 == 0` read d & (1 == 0).
-node_ptr Parser::logicalAnd(){
+node_ptr Parser::logicalAnd_(){   // round 83: logicalAnd() records its span in ast mode (Parser.hpp)
     // `not` binds looser than every comparison, as in Python: `not a < b`
     // is `not (a < b)` and `not x in s` is `not (x in s)`. It used to be
     // parsed only as a unary prefix (unary()), so `not 1 < 0` was
@@ -1297,7 +1472,7 @@ node_ptr Parser::logicalAnd(){
     return left;
 }
 
-node_ptr Parser::bitwiseOr(){
+node_ptr Parser::bitwiseOr_(){   // round 83: bitwiseOr() records its span in ast mode (Parser.hpp)
     node_ptr left = bitwiseXor();
     while(have(TokenType::BinOr)){
         Token op = prev(); node_ptr right = bitwiseXor();
@@ -1306,7 +1481,7 @@ node_ptr Parser::bitwiseOr(){
     return left;
 }
 
-node_ptr Parser::bitwiseXor(){
+node_ptr Parser::bitwiseXor_(){   // round 83: bitwiseXor() records its span in ast mode (Parser.hpp)
     node_ptr left = bitwiseAnd();
     while(have(TokenType::BinXor)){
         Token op = prev(); node_ptr right = bitwiseAnd();
@@ -1315,7 +1490,7 @@ node_ptr Parser::bitwiseXor(){
     return left;
 }
 
-node_ptr Parser::bitwiseAnd(){
+node_ptr Parser::bitwiseAnd_(){   // round 83: bitwiseAnd() records its span in ast mode (Parser.hpp)
     node_ptr left = shift();
     while(have(TokenType::BinAnd)){
         Token op = prev(); node_ptr right = shift();
@@ -1336,7 +1511,7 @@ node_ptr Parser::equality(){
 // a bool with 2, and `in`/`is` did not chain at all). A middle operand
 // that is not a plain name or literal is evaluated once into a hidden
 // name.
-node_ptr Parser::comparison(){
+node_ptr Parser::comparison_(){   // round 83: comparison() records its span in ast mode (Parser.hpp)
     node_ptr first = bitwiseOr();
     std::vector<Token> ops;
     std::vector<node_ptr> operands{first};
@@ -1362,6 +1537,14 @@ node_ptr Parser::comparison(){
         operands.push_back(bitwiseOr());
     }
     if(ops.empty()) return first;
+    if(ast_mode_){   // round 83: Compare(left, ops, comparators), unchained
+        auto c = std::make_shared<PyAstNode>(ops[0], "Compare");
+        std::vector<std::string> os;
+        for(auto& o : ops) os.push_back(o.value);
+        c->kid("left", operands[0])->strl("ops", os)
+         ->list("comparators", std::vector<node_ptr>(operands.begin() + 1, operands.end()));
+        return c;
+    }
     if(ops.size() == 1) return make_node<BinaryNode>(ops[0], operands[0], operands[1]);
     auto simple = [](const node_ptr& n){
         if(!n) return true;
@@ -1391,7 +1574,7 @@ node_ptr Parser::comparison(){
     return result;
 }
 
-node_ptr Parser::shift(){
+node_ptr Parser::shift_(){   // round 83: shift() records its span in ast mode (Parser.hpp)
     node_ptr left = addition();
     while(have(TokenType::ShiftLeft)||have(TokenType::ShiftRight)){
         Token op = prev(); node_ptr right = addition();
@@ -1400,7 +1583,7 @@ node_ptr Parser::shift(){
     return left;
 }
 
-node_ptr Parser::addition(){
+node_ptr Parser::addition_(){   // round 83: addition() records its span in ast mode (Parser.hpp)
     node_ptr left = multiplication();
     while(have(TokenType::Add)||have(TokenType::Sub)){
         Token op = prev(); node_ptr right = multiplication();
@@ -1409,7 +1592,7 @@ node_ptr Parser::addition(){
     return left;
 }
 
-node_ptr Parser::multiplication(){
+node_ptr Parser::multiplication_(){   // round 83: multiplication() records its span in ast mode (Parser.hpp)
     node_ptr left = power();
     // `a @ b` (matrix multiplication: __matmul__). At the start of a
     // statement `@` is a decorator; statement() takes that before this.
@@ -1421,7 +1604,7 @@ node_ptr Parser::multiplication(){
     return left;
 }
 
-node_ptr Parser::power(){
+node_ptr Parser::power_(){   // round 83: power() records its span in ast mode (Parser.hpp)
     // A sign binds looser than ** on its left, as in Python: -2**2 is
     // -(2**2) == -4, not (-2)**2. The exponent is parsed here too, so it may
     // carry its own sign (2**-1).
@@ -1438,7 +1621,7 @@ node_ptr Parser::power(){
     return left;
 }
 
-node_ptr Parser::unary(){
+node_ptr Parser::unary_(){   // round 83: unary() records its span in ast mode (Parser.hpp)
     // `new` is the instantiation operator only before a class name (`new
     // A()`, `new mod.A`); `new = old + 1`, `obj.new`, `f(new)` use the name
     // (round 77).
@@ -1473,7 +1656,8 @@ node_ptr Parser::unary(){
     return postfix();
 }
 
-node_ptr Parser::postfix(){
+node_ptr Parser::postfix_(){   // round 83: postfix() records its span in ast mode (Parser.hpp)
+    int pf0 = scanner->current;   // round 83: where each step's span starts (ast mode)
     node_ptr expr = primary();
     // Indents consumed to join a continued method chain. The lexer pairs each
     // Indent with a Dedent; since this indent never opened a block, the matching
@@ -1558,7 +1742,7 @@ node_ptr Parser::postfix(){
             // statement form uses for these too (round 77: the builtin
             // ignored sep= on the interpreter and printed the keyword map
             // on the VM)
-            if(expr && expr->type() == NodeType::VARIABLE && expr->value() == "print"
+            if(!ast_mode_ && expr && expr->type() == NodeType::VARIABLE && expr->value() == "print"
                && expr->token().type() == TokenType::Print){
                 bool needs = false;
                 for(auto& a : call->args)
@@ -1570,14 +1754,17 @@ node_ptr Parser::postfix(){
                 }
             }
             expr = call;
+            if(ast_mode_) spanSet(expr.get(), pf0);   // round 83
         } else if(have(TokenType::BracketOpen)){
             // Subscript or slice
             expr = parseSubscriptTail(prev(), expr);
+            if(ast_mode_) spanSet(expr.get(), pf0);   // round 83
         } else if(have(TokenType::Dot)){
             // Attribute access.
             Token tok = token();
             std::string attr = memberName();
             expr = make_node<AttributeNode>(tok, expr, attr);
+            if(ast_mode_) spanSet(expr.get(), pf0);   // round 83
         } else if(see(TokenType::DoubleAdd) || see(TokenType::DoubleSub) || see(TokenType::RightArrow)
                   || see(TokenType::Identifier)){
             // Postfix ++/--, an arrow function or a dynamic infix operator
@@ -1641,6 +1828,7 @@ void Parser::parseCallArgs(std::shared_ptr<CallNode> call){
             return comprehension(prev(), ComprehensionNode::GEN, first_expr, nullptr);
         return first_expr;
     };
+    int p0 = scanner->current - 1;   // round 83: the `(`
     if(!see(TokenType::ParenClose)){
         call->add(parse_call_arg());
         while(have(TokenType::Comma) && !see(TokenType::ParenClose)){
@@ -1648,6 +1836,12 @@ void Parser::parseCallArgs(std::shared_ptr<CallNode> call){
         }
     }
     mustBe(TokenType::ParenClose);
+    // round 83: a generator expression that is the only argument has the
+    // call's parentheses (CPython's positions)
+    if(ast_mode_ && call->args.size() == 1 && call->args[0]->type() == NodeType::COMPREHENSION
+       && static_cast<ComprehensionNode*>(call->args[0].get())->kind == ComprehensionNode::GEN
+       && !ast_spans_.count(call->args[0].get()))
+        ast_spans_[call->args[0].get()] = {p0, scanner->current - 1};
 }
 
 // `expr[` ... `]` after its `[` (tok): a SubscriptNode, or a slice as the
@@ -1661,6 +1855,43 @@ node_ptr Parser::parseSubscriptTail(Token tok, node_ptr expr){
         Token nt = tok; nt.value = "none";
         return make_node<NoneNode>(nt);
     };
+    if(ast_mode_){
+        // round 83: Python's subscript - Slice(lower, upper, step) nodes and
+        // expressions, a Tuple of them when there is a comma
+        std::vector<node_ptr> items;
+        bool comma = false;
+        int tup0 = scanner->current;
+        while(!see(TokenType::BracketClose) && !see(TokenType::End)){
+            int s0 = scanner->current;
+            node_ptr lo, hi, st;
+            bool is_slice = false;
+            if(!see(TokenType::Colon)) lo = starElem();
+            if(see(TokenType::Colon)){
+                is_slice = true;
+                next();
+                if(!see(TokenType::Colon) && !see(TokenType::Comma) && !see(TokenType::BracketClose)) hi = expression();
+                if(have(TokenType::Colon) && !see(TokenType::Comma) && !see(TokenType::BracketClose)) st = expression();
+            }
+            if(is_slice){
+                auto sl = std::make_shared<PyAstNode>(tok, "Slice");
+                sl->kid("lower", lo)->kid("upper", hi)->kid("step", st);
+                spanSet(sl.get(), s0);
+                items.push_back(sl);
+            } else items.push_back(lo);
+            if(!have(TokenType::Comma)) break;
+            comma = true;
+        }
+        int tup1 = lastTok();
+        mustBe(TokenType::BracketClose);
+        node_ptr index;
+        if(comma || items.size() != 1){
+            auto tup = make_node<TupleNode>(tok);
+            for(auto& it : items) tup->add(it);
+            if(tup1 >= tup0) ast_spans_[tup.get()] = {tup0, tup1};
+            index = tup;
+        } else index = items[0];
+        return make_node<SubscriptNode>(tok, expr, index);
+    }
     // A subscript list with a slice in it - `x[1:2, ::3]`, `x[:, 0]`,
     // `x[0, 1:]` (round 77: a syntax error) - indexes with a tuple whose
     // slices are slice objects, as Python builds it. A lone slice keeps the
@@ -1861,12 +2092,13 @@ bool Parser::postfixOther(node_ptr& expr){
     return true;
 }
 
-node_ptr Parser::primary(){
+node_ptr Parser::primary_(){   // round 83: primary() records its span in ast mode (Parser.hpp)
     // `...` where an expression starts is the Ellipsis object (`def f(): ...`,
     // tuple[int, ...], x[..., 0]); between two operands it is the inclusive
     // range a...b.
     if(see(TokenType::Ellipsis)) {
         Token et = token(); next();
+        if(ast_mode_) return std::make_shared<PyAstNode>(et, "Ellipsis");   // round 83: Constant(Ellipsis)
         et.value = "Ellipsis";
         return make_node<VariableNode>(et);
     }
@@ -1883,6 +2115,11 @@ node_ptr Parser::primary(){
         if(!as_name) {
             Token at = token(); next();
             node_ptr operand = unary();
+            if(ast_mode_){   // round 83: Await(value)
+                auto aw = std::make_shared<PyAstNode>(at, "Await");
+                aw->kid("value", operand);
+                return aw;
+            }
             at.value = "async_await";
             auto call = make_node<CallNode>(at, make_node<VariableNode>(at));
             call->add(operand);
@@ -1907,7 +2144,379 @@ node_ptr Parser::primary(){
 // engines that applies the conversion (!r/!s/!a) and the format spec with
 // Python's semantics; a spec may itself contain {fields}. Both used to be
 // dropped: f"{x:.2f}" printed x unformatted and f"{s!r}" printed s.
+// round 83: an f-string in ast mode - Python's JoinedStr(values) of
+// Constant and FormattedValue(value, conversion, format_spec) nodes, a
+// format spec a JoinedStr of its own; the fields are split as fstringNode
+// splits them. A field that does not parse is a SyntaxError here (the
+// engines' f-strings read it as a name).
+// round 83: with `atp` - where each byte of raw is in the source
+// (fstrPositions) - every part gets CPython 3.12's exact position: a literal
+// run (a plain literal joined to it with its quotes), a field from its { to
+// its }, a format spec from its : to the field's }, and the field's
+// expression the positions of its own tokens (moved from the field's text
+// to the source; its spans index ast_extra_toks_ from kAstExtra). Without
+// it every part is located at the whole f-string (and so are a field's
+// nodes).
+node_ptr Parser::fstringAst(const Token& str_tok, const std::string& raw, const FPositions* atp){
+    std::vector<node_ptr> parts;
+    std::string current;
+    size_t cur_start = 0;   // where `current` began in raw
+    const bool exact = atp != nullptr && atp->size() == raw.size() + 1;
+    static const FPositions none_at;
+    const FPositions& at = exact ? *atp : none_at;   // raw index -> (row, column) in the source
+    auto place = [&](Token& t, size_t i0, size_t i1) {
+        if (!exact) return;
+        t._location.row = at[i0].r; t._location.column = at[i0].c;
+        t.end_row = at[i1].er; t.end_col = at[i1].ec;
+    };
+    auto lit = [&](const std::string& text, size_t i0, size_t i1) -> node_ptr {
+        Token ltok = str_tok; ltok.value = text;
+        ltok.type(TokenType::String);
+        place(ltok, i0, i1);
+        return make_node<StringNode>(ltok);
+    };
+    size_t fi = 0;
+    while (fi < raw.size()) {
+        if (raw[fi] == '{' && fi + 1 < raw.size() && raw[fi+1] != '{') {
+            const size_t fopen = fi;
+            fi++;
+            std::string field;
+            int depth = 1;
+            char quote = 0;
+            while (fi < raw.size()) {
+                char c = raw[fi];
+                if (quote) { if (c == quote) quote = 0; }
+                else if (c == '\'' || c == '"') quote = c;
+                else if (c == '{' || c == '[' || c == '(') depth++;
+                else if (c == ']' || c == ')') depth--;
+                else if (c == '}') { depth--; if (depth == 0) break; }
+                field += c; fi++;
+            }
+            if (fi >= raw.size()) throw SyntaxError(str_tok.location(), "f-string: expecting '}'");
+            const size_t fclose = fi;
+            fi++;   // the closing '}'
+            size_t k = 0; int lvl = 0; quote = 0;
+            std::string expr_str, conv, spec;
+            bool has_spec = false;
+            for (; k < field.size(); k++) {
+                char c = field[k];
+                if (quote) { if (c == quote) quote = 0; continue; }
+                if (c == '\'' || c == '"') { quote = c; continue; }
+                if (c == '(' || c == '[' || c == '{') lvl++;
+                else if (c == ')' || c == ']' || c == '}') lvl--;
+                else if (lvl == 0 && c == '!' && k + 1 < field.size() && field[k+1] != '=' &&
+                         (k + 2 >= field.size() || field[k+2] == ':')) break;
+                else if (lvl == 0 && c == ':') break;
+            }
+            expr_str = field.substr(0, k);
+            const size_t expr_end = fopen + 1 + k;   // where the expression's text ends in raw
+            if (k < field.size() && field[k] == '!') {
+                conv = field.substr(k + 1, 1);
+                k += 2;
+            }
+            size_t spec_colon = 0;
+            if (k < field.size() && field[k] == ':') { spec = field.substr(k + 1); has_spec = true; spec_colon = fopen + 1 + k; }
+            bool debug = false;
+            {
+                size_t e = expr_str.find_last_not_of(" \t\n");
+                if (e != std::string::npos && expr_str[e] == '=' && e > 0) {
+                    char before = expr_str[e - 1];
+                    if (before != '=' && before != '!' && before != '<' && before != '>') {
+                        // f"{x=}": the text before it and the expression's
+                        // own text (with its =) are one Constant, as CPython's
+                        if (current.empty()) cur_start = fopen + 1;
+                        current += expr_str;
+                        parts.push_back(lit(current, cur_start, expr_end));
+                        current.clear();
+                        debug = true;
+                        expr_str = expr_str.substr(0, e);
+                        if (conv.empty() && !has_spec) conv = "r";
+                    }
+                }
+            }
+            if (!debug && !current.empty()) { parts.push_back(lit(current, cur_start, fopen)); current.clear(); }
+            size_t b0 = expr_str.find_first_not_of(" \t\n");
+            if (b0 == std::string::npos) throw SyntaxError(str_tok.location(), "f-string: valid expression required before '}'");
+            size_t e0 = expr_str.find_last_not_of(" \t\n");
+            expr_str = expr_str.substr(b0, e0 - b0 + 1);
+            const size_t expr_at = fopen + 1 + b0;   // the expression's first character in raw
+            node_ptr expr_node;
+            bool field_exact = false;
+            {
+                reader::SourceCode sub_src("(" + expr_str + ")");
+                nython::exception::Reporter sub_reporter(sub_src);
+                auto sub_lex = std::make_shared<Lexer>(sub_src);
+                sub_lex->force_python_strings = true;
+                sub_lex->tokenize();
+                if (exact) {
+                    // the field's tokens in the source's coordinates: a
+                    // (row, column) of "(" + expr_str + ")" -> its byte in
+                    // expr_str -> where that byte is in the source
+                    std::map<std::pair<uint32_t,uint32_t>, size_t> idx;
+                    uint32_t r = 1, c = 2;
+                    for (size_t i = 0; i < expr_str.size(); i++) {
+                        idx[{r, c}] = i;
+                        unsigned char ch = (unsigned char)expr_str[i];
+                        if (ch == '\n') { r++; c = 1; }
+                        else if (i + 1 >= expr_str.size() || (((unsigned char)expr_str[i + 1]) & 0xC0) != 0x80) c++;
+                    }
+                    idx[{r, c}] = expr_str.size();
+                    field_exact = true;
+                    for (auto& t : sub_lex->tokens) {
+                        auto s0 = idx.find({t._location.row, t._location.column});
+                        auto s1 = idx.find({t.end_row, t.end_col});
+                        if (s0 == idx.end() || s1 == idx.end()) continue;   // "(", ")", the end
+                        t._location.row = at[expr_at + s0->second].r;
+                        t._location.column = at[expr_at + s0->second].c;
+                        t.end_row = at[expr_at + s1->second].er;
+                        t.end_col = at[expr_at + s1->second].ec;
+                    }
+                }
+                Parser sub_parser(&sub_reporter, runner, sub_lex.get());
+                sub_parser.ast_mode_ = true;
+                sub_parser.ast_fstr_exact_ = false;   // an f-string in the field: located at itself
+                sub_parser.self_scope_ = self_scope_;
+                node_ptr e = sub_parser.exprList(sub_parser.token());
+                expr_node = e;
+                while (sub_parser.have(TokenType::NewLine)) {}
+                if (!sub_parser.see(TokenType::End)) throw SyntaxError(str_tok.location(), "f-string: expecting '}'");
+                if (field_exact) {
+                    // the field's spans, over its tokens kept here
+                    const int base = kAstExtra + (int)ast_extra_toks_.size();
+                    for (auto& t : sub_lex->tokens) ast_extra_toks_.push_back(t);
+                    for (auto& kv : sub_parser.ast_spans_) {
+                        if (kv.second.first < 0 || kv.second.second >= kAstExtra) continue;
+                        std::pair<int,int> sp = kv.second;
+                        // a tuple's span takes in the parentheses written
+                        // around it: the field's own are the wrapping ones
+                        if (kv.first == e.get() && sp.first == 0 && sp.second >= 2) { sp.first++; sp.second--; }
+                        ast_spans_[kv.first] = {base + sp.first, base + sp.second};
+                    }
+                    for (auto& kv : sub_parser.ast_outer_) {
+                        if (kv.first == e.get()) continue;   // the parentheses the field was wrapped in
+                        if (kv.second.first >= 0 && kv.second.second < kAstExtra)
+                            ast_outer_[kv.first] = {base + kv.second.first, base + kv.second.second};
+                        else
+                            ast_outer_[kv.first] = {-2, -2};
+                    }
+                } else {
+                    // the field's nodes are located at the f-string (their own
+                    // positions are within the field's text)
+                    for (auto& kv : sub_parser.ast_outer_) ast_outer_[kv.first] = {-2, -2};
+                }
+                fstr_nodes_.push_back(e);
+                for (auto& kv : sub_parser.ast_flags_) ast_flags_[kv.first] = kv.second;
+            }
+            int conversion = -1;
+            if (conv == "r") conversion = 'r';
+            else if (conv == "s") conversion = 's';
+            else if (conv == "a") conversion = 'a';
+            else if (!conv.empty()) throw SyntaxError(str_tok.location(), "f-string: invalid conversion character '" + conv + "': expected 's', 'r', or 'a'");
+            node_ptr spec_node;
+            if (has_spec) {
+                const size_t spec_at = spec_colon + 1;
+                if (exact) {
+                    FPositions sub(at.begin() + (long)spec_at, at.begin() + (long)fclose + 1);
+                    spec_node = fstringAst(str_tok, spec, &sub);
+                } else spec_node = fstringAst(str_tok, spec);
+                if (exact) place(spec_node->_token, spec_colon, fclose);
+            }
+            Token fvt = str_tok;
+            place(fvt, fopen, fclose + 1);
+            auto fv = std::make_shared<PyAstNode>(fvt, "FormattedValue");
+            fv->kid("value", expr_node)->num("conversion", conversion)->kid("format_spec", spec_node);
+            if (field_exact) fv->num("exact", 1);
+            parts.push_back(fv);
+        } else if (raw[fi] == '{' && fi + 1 < raw.size() && raw[fi+1] == '{') {
+            if (current.empty()) cur_start = fi;
+            current += '{'; fi += 2;
+        } else if (raw[fi] == '}' && fi + 1 < raw.size() && raw[fi+1] == '}') {
+            if (current.empty()) cur_start = fi;
+            current += '}'; fi += 2;
+        } else if (raw[fi] == '}') {
+            throw SyntaxError(str_tok.location(), "f-string: single '}' is not allowed");
+        } else { if (current.empty()) cur_start = fi; current += raw[fi]; fi++; }
+    }
+    if (!current.empty()) parts.push_back(lit(current, cur_start, raw.size()));
+    auto js = std::make_shared<PyAstNode>(str_tok, "JoinedStr");
+    js->list("values", parts);
+    if (exact) js->num("exact", 1);
+    return js;
+}
+
+// round 83: the literal runs and {fields} of an f-string's text - raw (the
+// lexer's value) or `source` text (escapes not decoded: \N{...} and an
+// escaped character belong to the literal run) - as [a, b) byte ranges from
+// `base`; false where the text does not split (left to the parser).
+namespace {
+struct FSeg { char kind; size_t a, b; };   // 'L' a literal run, 'F' a {field}
+bool fstr_segments(const std::string& s, bool source, std::vector<FSeg>& out, size_t base = 0) {
+    const size_t npos = std::string::npos;
+    size_t i = 0, n = s.size(), lit0 = npos;
+    auto flush = [&](size_t end) { if (lit0 != npos) { out.push_back({'L', base + lit0, base + end}); lit0 = npos; } };
+    while (i < n) {
+        char c = s[i];
+        if (source && c == '\\' && i + 1 < n) {
+            if (lit0 == npos) lit0 = i;
+            if (s[i+1] == 'N' && i + 2 < n && s[i+2] == '{') {
+                size_t j = s.find('}', i + 3);
+                if (j == npos) return false;
+                i = j + 1;
+                continue;
+            }
+            i += (s[i+1] == '{' || s[i+1] == '}') ? 1 : 2;
+            continue;
+        }
+        if ((c == '{' || c == '}') && i + 1 < n && s[i+1] == c) { if (lit0 == npos) lit0 = i; i += 2; continue; }
+        if (c == '{') {
+            flush(i);
+            size_t f0 = i++;
+            int depth = 1;
+            char quote = 0;
+            while (i < n) {
+                char d = s[i];
+                if (quote) { if (d == quote) quote = 0; }
+                else if (d == '\'' || d == '"') quote = d;
+                else if (d == '{' || d == '[' || d == '(') depth++;
+                else if (d == ']' || d == ')') depth--;
+                else if (d == '}') { depth--; if (depth == 0) break; }
+                i++;
+            }
+            if (i >= n) return false;
+            out.push_back({'F', base + f0, base + ++i});
+            continue;
+        }
+        if (c == '}') return false;
+        if (lit0 == npos) lit0 = i;
+        i++;
+    }
+    flush(n);
+    return true;
+}
+}
+
+// round 83: where each byte of an f-string's value (raw) is in the source:
+// the literal's source text - one f-string, or a run of literals the lexer
+// joined (`"a" f"{x}"`) - split as raw is, the two matched part for part (a
+// field's text must be the same in both; a literal run is located from its
+// first character to its last, a plain literal of the run with its prefix
+// and quotes, as CPython 3.12). False when they do not match (a raw
+// f-string, an escape that makes a brace, bytes): the parts are then
+// located at the whole string.
+bool Parser::fstrPositions(const Token& str_tok, const std::string& raw, FPositions& at){
+    if (!scanner || str_tok.end_row == 0) return false;
+    if (ast_line_starts_.empty()) {
+        ast_src_ = scanner->source.sourceCode();
+        ast_line_starts_.push_back(0);
+        for (size_t i = 0; i < ast_src_.size(); i++) if (ast_src_[i] == '\n') ast_line_starts_.push_back(i + 1);
+    }
+    auto offset = [&](uint32_t r, uint32_t c, size_t& out) -> bool {
+        if (r < 1 || r > ast_line_starts_.size()) return false;
+        size_t i = ast_line_starts_[r - 1];
+        for (uint32_t k = 1; k < c; k++) {
+            if (i >= ast_src_.size() || ast_src_[i] == '\n') return false;
+            i++;
+            while (i < ast_src_.size() && (((unsigned char)ast_src_[i]) & 0xC0) == 0x80) i++;
+        }
+        out = i;
+        return true;
+    };
+    size_t a = 0, b = 0;
+    if (!offset(str_tok._location.row, str_tok._location.column, a) || !offset(str_tok.end_row, str_tok.end_col, b) || b <= a) return false;
+    const std::string text = ast_src_.substr(a, b - a);
+    // the source position of every byte of the text
+    std::vector<std::pair<uint32_t,uint32_t>> sp(text.size() + 1);
+    {
+        uint32_t r = str_tok._location.row, c = str_tok._location.column;
+        for (size_t i = 0; i < text.size(); i++) {
+            sp[i] = {r, c};
+            unsigned char ch = (unsigned char)text[i];
+            if (ch == '\n') { r++; c = 1; }
+            else if (i + 1 >= text.size() || (((unsigned char)text[i + 1]) & 0xC0) != 0x80) c++;
+        }
+        sp[text.size()] = {r, c};
+    }
+    // the literals of the text, each split into its parts
+    std::vector<FSeg> src;
+    size_t i = 0;
+    const size_t n = text.size();
+    while (i < n) {
+        char c = text[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') { i++; continue; }
+        if (c == '\\' && i + 1 < n && (text[i+1] == '\n' || text[i+1] == '\r')) { i += 2; continue; }
+        if (c == '#') { while (i < n && text[i] != '\n') i++; continue; }
+        size_t p0 = i;
+        bool rawp = false, fp = false;
+        auto prefix_char = [&](char ch) -> bool {
+            char l = (char)std::tolower((unsigned char)ch);
+            if (l == 'r') rawp = true;
+            else if (l == 'f') fp = true;
+            else if (l != 'u') return false;   // bytes, or not a literal
+            return true;
+        };
+        if (p0 == 0) {
+            // the first literal's prefix is a token of its own, before the text
+            for (size_t k = a; k > 0 && std::isalpha((unsigned char)ast_src_[k - 1]); k--)
+                if (!prefix_char(ast_src_[k - 1])) return false;
+        }
+        while (i < n && std::isalpha((unsigned char)text[i])) {
+            if (!prefix_char(text[i])) return false;
+            i++;
+        }
+        if (i >= n || (text[i] != '\'' && text[i] != '"')) return false;
+        const size_t ql = (i + 2 < n && text[i+1] == text[i] && text[i+2] == text[i]) ? 3 : 1;
+        const std::string q = text.substr(i, ql);
+        i += ql;
+        const size_t b0 = i;
+        while (i < n && text.compare(i, ql, q) != 0) i += text[i] == '\\' ? 2 : 1;
+        if (i >= n) return false;
+        const size_t b1 = i;
+        i += ql;
+        if (fp) {
+            if (rawp) return false;   // a raw f-string: not mapped
+            if (!fstr_segments(text.substr(b0, b1 - b0), true, src, b0)) return false;
+        } else if (b1 > b0 || src.empty() || src.back().kind == 'L') {
+            src.push_back({'L', p0, i});   // a plain literal, with its prefix and quotes
+        }
+    }
+    std::vector<FSeg> m;   // consecutive literal runs are one
+    for (auto& g : src) {
+        if (g.kind == 'L' && !m.empty() && m.back().kind == 'L') m.back().b = g.b;
+        else m.push_back(g);
+    }
+    std::vector<FSeg> rs;
+    if (!fstr_segments(raw, false, rs) || rs.size() != m.size()) return false;
+    // a byte where one part ends and the next begins has two positions:
+    // where the next one starts (r, c) and where the last one ends (er, ec)
+    auto both = [](std::pair<uint32_t,uint32_t> x) { return FPos{x.first, x.second, x.first, x.second}; };
+    at.assign(raw.size() + 1, both(sp[0]));
+    for (size_t k = 0; k < rs.size(); k++) {
+        if (rs[k].kind != m[k].kind) return false;
+        const size_t ra = rs[k].a, rb = rs[k].b, ma = m[k].a;
+        if (rs[k].kind == 'F') {
+            const size_t len = rb - ra;
+            if (m[k].b - ma != len || text.compare(ma, len, raw, ra, len) != 0) return false;
+            for (size_t j = 0; j < len; j++) { at[ra + j].r = sp[ma + j].first; at[ra + j].c = sp[ma + j].second; }
+            for (size_t j = 1; j < len; j++) { at[ra + j].er = sp[ma + j].first; at[ra + j].ec = sp[ma + j].second; }
+        } else {
+            for (size_t j = ra; j < rb; j++) { at[j].r = sp[ma].first; at[j].c = sp[ma].second; }
+            for (size_t j = ra + 1; j < rb; j++) { at[j].er = sp[ma].first; at[j].ec = sp[ma].second; }
+        }
+        at[rb].er = sp[m[k].b].first;
+        at[rb].ec = sp[m[k].b].second;
+        at[rb].r = at[rb].er;   // (the next part, if any, sets its own start)
+        at[rb].c = at[rb].ec;
+    }
+    if (rs.empty()) at[0] = both(sp[text.size()]);   // f'': nothing to locate but the end
+    return true;
+}
+
 node_ptr Parser::fstringNode(const Token& str_tok, const std::string& raw){
+    if(ast_mode_){   // round 83
+        FPositions at;
+        if(ast_fstr_exact_ && fstrPositions(str_tok, raw, at)) return fstringAst(str_tok, raw, &at);
+        return fstringAst(str_tok, raw);
+    }
     std::vector<node_ptr> parts;
     std::string current;
     auto lit = [&](const std::string& text) {
@@ -2018,7 +2627,7 @@ node_ptr Parser::fstringNode(const Token& str_tok, const std::string& raw){
     return result;
 }
 
-node_ptr Parser::atom(){
+node_ptr Parser::atom_(){   // round 83: atom() records its span in ast mode (Parser.hpp)
     Token tok = token();
 
     // Literals
@@ -2061,6 +2670,11 @@ node_ptr Parser::atom(){
     // An imaginary literal, 2j / 1.5J: complex(0, 2.0) (round 77; it read none)
     if(have(TokenType::Complex)){
         Token ct = prev();
+        if(ast_mode_){   // round 83: Constant(complex)
+            auto c = std::make_shared<PyAstNode>(ct, "Complex");
+            c->str("text", ct.value);
+            return c;
+        }
         std::string num = ct.value;
         if(!num.empty() && (num.back() == 'j' || num.back() == 'J')) num.pop_back();
         if(num.find('.') == std::string::npos && num.find('e') == std::string::npos && num.find('E') == std::string::npos) num += ".0";
@@ -2114,6 +2728,7 @@ node_ptr Parser::atom(){
 
     // Parenthesized expression or tuple
     if(have(TokenType::ParenOpen)){
+        int p0 = scanner->current - 1;   // round 83: the `(` (ast mode's outer span)
         if(have(TokenType::ParenClose)) return make_node<TupleNode>(tok); // empty tuple
         // Walrus operator: (var name = expr)
         if(see(TokenType::Var) && peek(1).type()==TokenType::Identifier && peek(2).type()==TokenType::Assign) {
@@ -2147,11 +2762,12 @@ node_ptr Parser::atom(){
                 }
             }
             mustBe(TokenType::ParenClose);
-            if(starred && !in_assign_target_) return catStarred(tok, tuple->statements(), "tuple");
+            if(starred && !in_assign_target_ && !ast_mode_) return catStarred(tok, tuple->statements(), "tuple");
             return tuple;
         }
         if(isStarElem(expr)) throw SyntaxError(tok.location(), "cannot use starred expression here");
         mustBe(TokenType::ParenClose);
+        if(ast_mode_ && expr) ast_outer_[expr.get()] = {p0, scanner->current - 1};   // round 83
         return expr;
     }
 
@@ -2444,8 +3060,10 @@ node_ptr Parser::ifStmt(){
 
     // Else-if chains
     while(have(TokenType::NewLine)) {}
+    std::vector<int> elif_at;   // round 83: each elif's first token (ast mode)
     while(have(TokenType::ElseIf)||have(TokenType::ElseIf)||(see(TokenType::Else)&&peek().type()==TokenType::If)){
         if(prev().type()==TokenType::Else) next(); // consume 'if'
+        elif_at.push_back(scanner->current - 1);
         Token eitok = prev();   // the elif's own line (round 79: sys.settrace's line event)
         // Same rule as the if-condition above: let expression() own the parens.
         node_ptr eicond = expression();
@@ -2460,6 +3078,9 @@ node_ptr Parser::ifStmt(){
         have(TokenType::Colon);
         if_node->else_branch = blockOrStmt();
     }
+    // round 83: an elif's If runs to the end of the statement, as CPython's
+    if(ast_mode_)
+        for(size_t i = 0; i < elif_at.size(); i++) spanSet(if_node->elseif_branches[i].get(), elif_at[i]);
     return node;
 }
 
@@ -2584,14 +3205,17 @@ node_ptr Parser::forStmt(){
         }
     } else {
         Token tt0 = token();
+        int ft0 = scanner->current;   // round 83
         std::vector<node_ptr> ts;
         bool comma = false, starred = false;
         in_assign_target_ = true;
         try {
             while(!see(TokenType::In)){
                 if(see(TokenType::Mul)){
+                    int s0 = scanner->current;   // round 83
                     Token st = token(); next(); st.value = "*";
                     ts.push_back(make_node<UnaryNode>(st, asTarget(postfix())));
+                    if(ast_mode_) spanSet(ts.back().get(), s0);
                     starred = true;
                 } else ts.push_back(asTarget(postfix()));
                 if(!have(TokenType::Comma)) break;
@@ -2605,6 +3229,16 @@ node_ptr Parser::forStmt(){
             auto tup = make_node<TupleNode>(tt0);
             for(auto& t : ts) tup->add(t);
             complex_target = tup;
+        }
+        if(ast_mode_ && complex_target){
+            // round 83: the target as written
+            if(complex_target->type() == NodeType::TUPLE && !(ts.size() == 1 && !comma && !starred)) spanSet(complex_target.get(), ft0);
+            mustBe(TokenType::In);
+            node_ptr iter = exprList(token());
+            if(hp) mustBe(TokenType::ParenClose);
+            have(TokenType::Colon);
+            node_ptr body = blockOrStmt();
+            return make_node<ForNode>(tok, complex_target, iter, body);
         }
         Token vt = tt0; vt.value = "__for" + unpackTemp();
         var = make_node<VariableNode>(vt);
@@ -2898,7 +3532,7 @@ node_ptr Parser::functionDecl(bool is_method){
         }
         static_cast<FunctionNode*>(fn.get())->annotations = m;
     }
-    if(is_async) return async_def_desugar(tok, fn, is_gen, class_method && name != "__new__", class_static);
+    if(is_async && !ast_mode_) return async_def_desugar(tok, fn, is_gen, class_method && name != "__new__", class_static);   // round 83: not in ast mode
     return fn;
 }
 
@@ -2941,6 +3575,7 @@ std::vector<node_ptr> Parser::lambdaParamList(){
             throw SyntaxError(ptok.location(), "invalid syntax: expected a parameter name, found " + ptok.value);
         next();
         auto pnode = make_node<VariableNode>(ptok);
+        if(ast_mode_) spanSet(pnode.get(), scanner->current - 1);   // round 83
         if(va) static_cast<VariableNode*>(pnode.get())->name = "*" + ptok.value;
         else if(kw) static_cast<VariableNode*>(pnode.get())->name = "**" + ptok.value;
         else static_cast<VariableNode*>(pnode.get())->name = ptok.value;
@@ -2981,6 +3616,7 @@ std::vector<node_ptr> Parser::paramList(){
             bool va = have(TokenType::Mul);
             bool kw = !va && have(TokenType::Exp);
             // Accept identifier or keyword as param name
+            int n0 = scanner->current;   // round 83: the arg's span (ast mode)
             Token ptok = token();
             ptok.value = token().value; // ensure we get the text
             next();
@@ -2992,9 +3628,11 @@ std::vector<node_ptr> Parser::paramList(){
             // `name: T`: kept for the function's __annotations__
             if(have(TokenType::Colon)) {
                 int a0 = scanner->current;
-                node_ptr ann = ternary();
+                // `*args: *Ts` (PEP 646) is a starred annotation
+                node_ptr ann = (ast_mode_ && va && see(TokenType::Mul)) ? starElem() : ternary();
                 param_ann_.push_back({ptok.value, annotationValue(ann, a0, scanner->current)});
             }
+            if(ast_mode_) spanSet(pnode.get(), n0);   // round 83
             if(have(TokenType::Assign)) param_defaults_.push_back(expression());
             else param_defaults_.push_back(nullptr);
         };
@@ -3051,18 +3689,32 @@ node_ptr Parser::classDecl(){
     // keywords are read and not used.
     std::vector<std::pair<std::string, node_ptr>> class_kw;
     auto base = [&]() {
+        // round 83: in ast mode a keyword is a PyAstNode keyword(arg, value)
+        auto ast_kw = [&](const std::string& kn, node_ptr v, int k0) -> node_ptr {
+            if(!ast_mode_) return v;
+            auto kw = std::make_shared<PyAstNode>(tok, "keyword");
+            if(kn != "**") kw->str("arg", kn);
+            kw->kid("value", v);
+            spanSet(kw.get(), k0);
+            return kw;
+        };
         if((see(TokenType::Identifier) || nameKeyword(token().type())) && peek().type() == TokenType::Assign){
+            int k0 = scanner->current;
             std::string kn = identifier();
             next();
-            class_kw.push_back({kn, expression()});
+            node_ptr v = expression();
+            class_kw.push_back({kn, ast_kw(kn, v, k0)});
             return;
         }
         // `class C(**kw)`: the dict's items are keywords too (round 77;
         // the engines expand an entry named "**")
         if(have(TokenType::Exp)){
-            class_kw.push_back({"**", ternary()});
+            int k0 = scanner->current - 1;
+            node_ptr v = ternary();
+            class_kw.push_back({"**", ast_kw("**", v, k0)});
             return;
         }
+        if(ast_mode_ && !see(TokenType::Mul)){ bases.push_back(expression()); return; }   // round 83: the expression as written
         // `class C(*bases)`: each item a base (round 78; the engines expand
         // a starred base)
         if(have(TokenType::Mul)){
@@ -3147,7 +3799,7 @@ node_ptr Parser::classDecl(){
     // (round 77: a class with annotations lost its __doc__)
     std::string class_doc;
     bool class_has_doc = docstringOf(body, class_doc);
-    if(class_ann_used_.back() && body){
+    if(class_ann_used_.back() && body && !ast_mode_){   // round 83: not in ast mode
         // the class body starts with `var __annotations__ = {}`
         auto nb = make_node<BlockNode>(body->token());
         nb->add(annotationsDecl(tok));
@@ -3433,7 +4085,74 @@ node_ptr Parser::printStmt(){
     return node;
 }
 
+// round 83: an import in ast mode - Import(names) / ImportFrom(module,
+// names, level), each name an alias(name, asname) with its own span
+node_ptr Parser::importAst(){
+    Token tok = token();
+    auto alias_of = [&](const std::string& n, const std::string& as, int a0) -> node_ptr {
+        auto a = std::make_shared<PyAstNode>(tok, "alias");
+        a->str("name", n);
+        if(!as.empty()) a->str("asname", as);
+        spanSet(a.get(), a0);
+        return a;
+    };
+    std::vector<node_ptr> names;
+    if(have(TokenType::From)){
+        long long level = 0;
+        while(true){
+            if(have(TokenType::Dot)) level += 1;
+            else if(have(TokenType::Interval)) level += 2;
+            else if(have(TokenType::Ellipsis)) level += 3;
+            else break;
+        }
+        bool has_mod = !(level > 0 && see(TokenType::Import));
+        std::string mod = has_mod ? dottedName() : std::string();
+        mustBe(TokenType::Import);
+        if(see(TokenType::Mul)){
+            int a0 = scanner->current;
+            next();
+            names.push_back(alias_of("*", "", a0));
+        } else {
+            bool paren = have(TokenType::ParenOpen);
+            auto skip_nl = [&]() { if(paren) while(have(TokenType::NewLine) || have(TokenType::Indent) || have(TokenType::Dedent)) {} };
+            skip_nl();
+            while(true){
+                int a0 = scanner->current;
+                std::string n = identifier();
+                std::string as;
+                if(have(TokenType::As)) as = identifier();
+                names.push_back(alias_of(n, as, a0));
+                skip_nl();
+                if(!have(TokenType::Comma)) break;
+                skip_nl();
+                if(paren && see(TokenType::ParenClose)) break;
+            }
+            if(paren) mustBe(TokenType::ParenClose);
+        }
+        consumed_semi_ = have(TokenType::SemiColon);
+        if(!consumed_semi_) have(TokenType::NewLine);
+        auto n = std::make_shared<PyAstNode>(tok, "ImportFrom");
+        if(has_mod) n->str("module", mod);
+        n->list("names", names)->num("level", level);
+        return n;
+    }
+    mustBe(TokenType::Import);
+    do {
+        int a0 = scanner->current;
+        std::string mod = dottedName();
+        std::string as;
+        if(have(TokenType::As)) as = identifier();
+        names.push_back(alias_of(mod, as, a0));
+    } while(have(TokenType::Comma));
+    consumed_semi_ = have(TokenType::SemiColon);
+    if(!consumed_semi_) have(TokenType::NewLine);
+    auto n = std::make_shared<PyAstNode>(tok, "Import");
+    n->list("names", names);
+    return n;
+}
+
 node_ptr Parser::importStmt(){
+    if(ast_mode_) return importAst();   // round 83
     Token tok = token();
     if(have(TokenType::From)){
         // a relative import (round 80: `from . import a`, `from ..m import
@@ -3555,7 +4274,50 @@ static void checkExceptStarFlow(const node_ptr& n, bool in_loop){
     }
 }
 
+// round 83: a try statement in ast mode - a TryNode whose except clauses
+// are PyAstNode ExceptHandler(type, name, body) nodes, `except*` marked in
+// ast_flags_ ("star": TryStar); else/finally are read by statement().
+node_ptr Parser::tryAst(){
+    Token tok = token();
+    mustBe(TokenType::Try);
+    have(TokenType::Colon);
+    node_ptr body = blockOrStmt();
+    auto try_node = make_node<TryNode>(tok, body);
+    auto tn = std::static_pointer_cast<TryNode>(try_node);
+    while(have(TokenType::NewLine)) {}
+    bool star = false, plain = false;
+    while(see(TokenType::Except) && !(value() == "catch" && usedAsName())){
+        int h0 = scanner->current;
+        Token etok = token();
+        next();
+        bool is_star = have(TokenType::Mul);
+        if(is_star) star = true; else plain = true;
+        if(star && plain) throw SyntaxError(etok.location(), "cannot have both 'except' and 'except*' on the same 'try'");
+        node_ptr type;
+        std::string name;
+        if(!see(TokenType::Colon) && !see(TokenType::As)){
+            type = ternary();
+            if(see(TokenType::Comma)) throw SyntaxError(token().location(), "multiple exception types must be parenthesized");
+        }
+        if(is_star && !type) throw SyntaxError(etok.location(), "expected one or more exception types");
+        if(have(TokenType::As)) name = identifier();
+        have(TokenType::Colon);
+        node_ptr hbody = blockOrStmt();
+        if(is_star) checkExceptStarFlow(hbody, false);
+        auto h = std::make_shared<PyAstNode>(etok, "ExceptHandler");
+        h->kid("type", type);
+        if(!name.empty()) h->str("name", name);
+        h->kid("body", hbody);
+        spanSet(h.get(), h0);
+        tn->except_clauses.push_back(h);
+        while(have(TokenType::NewLine)) {}
+    }
+    if(star) ast_flags_[try_node.get()] = "star";
+    return try_node;
+}
+
 node_ptr Parser::tryStmt(){
+    if(ast_mode_) return tryAst();   // round 83
     Token tok = token();
     mustBe(TokenType::Try);
     have(TokenType::Colon);
@@ -3846,13 +4608,13 @@ node_ptr Parser::assertStmt(){
     if(have(TokenType::Comma)) msg = expression();
     have(TokenType::SemiColon); have(TokenType::NewLine);
     // -O (round 80): assert statements are dropped, as CPython compiles them
-    if(nyrt::cli_flags().optimize > 0) return make_node<PassNode>(tok);
+    if(nyrt::cli_flags().optimize > 0 && !ast_mode_) return make_node<PassNode>(tok);   // round 83: kept in ast mode
     return make_node<AssertNode>(tok, cond, msg);
 }
 
 node_ptr Parser::switchStmt(){
     Token tok = token(); mustBe(TokenType::Switch);
-    if(tok.value == "match") return matchStmt(tok, expression());
+    if(tok.value == "match") return matchStmt(tok, ast_mode_ ? exprList(token()) : expression());   // round 83: `match a, b:` in ast mode
     bool hp = have(TokenType::ParenOpen);
     node_ptr subject = expression();
     if(hp) mustBe(TokenType::ParenClose);
@@ -3915,10 +4677,13 @@ node_ptr Parser::switchStmt(){
 std::shared_ptr<Parser::MatchPat> Parser::matchPattern(){
     // Top level: an open sequence `case a, *rest:` is a sequence pattern.
     auto seq = std::make_shared<MatchPat>(); seq->kind = MatchPat::SEQ;
+    int t0 = scanner->current;   // round 83: spans (ast mode)
     auto item = [&](){
         if(have(TokenType::Mul)){
+            int s0 = scanner->current - 1;
             seq->star = (int)seq->subs.size(); seq->star_name = identifier();
             seq->subs.push_back(std::make_shared<MatchPat>());
+            seq->subs.back()->t0 = s0; seq->subs.back()->t1 = lastTok();
         } else seq->subs.push_back(matchOrPattern());
     };
     item();
@@ -3927,28 +4692,42 @@ std::shared_ptr<Parser::MatchPat> Parser::matchPattern(){
         if(see(TokenType::Colon) || see(TokenType::If)) break;
         item();
     }
+    seq->t0 = t0; seq->t1 = lastTok();
     return seq;
 }
 
 std::shared_ptr<Parser::MatchPat> Parser::matchOrPattern(){
+    int t0 = scanner->current;   // round 83: spans (ast mode)
     auto first = matchClosedPattern();
     std::shared_ptr<MatchPat> p = first;
     if(see(TokenType::BinOr)){
         p = std::make_shared<MatchPat>(); p->kind = MatchPat::OR;
         p->subs.push_back(first);
         while(have(TokenType::BinOr)) p->subs.push_back(matchClosedPattern());
+        p->t0 = t0; p->t1 = lastTok();
     }
     if(have(TokenType::As)){
         if(!p->as_name.empty()){
             auto w = std::make_shared<MatchPat>(); w->kind = MatchPat::OR;
             w->subs.push_back(p); p = w;
+            p->t0 = t0; p->t1 = lastTok() - 1;
         }
         p->as_name = identifier();
+        p->as_t0 = t0; p->as_t1 = lastTok();
     }
     return p;
 }
 
+// round 83: a closed pattern's span (ast mode); a parenthesised one keeps
+// the span of the pattern inside, as CPython's
 std::shared_ptr<Parser::MatchPat> Parser::matchClosedPattern(){
+    int t0 = scanner->current;
+    auto p = matchClosedPattern_();
+    if(p && p->t0 < 0){ p->t0 = t0; p->t1 = lastTok(); }
+    return p;
+}
+
+std::shared_ptr<Parser::MatchPat> Parser::matchClosedPattern_(){
     auto p = std::make_shared<MatchPat>();
     Token tok = token();
     // Items of a bracketed sequence, `*name` allowed once.
@@ -3958,8 +4737,10 @@ std::shared_ptr<Parser::MatchPat> Parser::matchClosedPattern(){
             while(have(TokenType::NewLine)) {}
             if(see(close)) break;
             if(have(TokenType::Mul)){
+                int s0 = scanner->current - 1;   // round 83
                 p->star = (int)p->subs.size(); p->star_name = identifier();
                 p->subs.push_back(std::make_shared<MatchPat>());
+                p->subs.back()->t0 = s0; p->subs.back()->t1 = lastTok();
             } else p->subs.push_back(matchOrPattern());
             while(have(TokenType::NewLine)) {}
             if(!have(TokenType::Comma)) break;
@@ -4045,7 +4826,120 @@ std::shared_ptr<Parser::MatchPat> Parser::matchClosedPattern(){
     throw SyntaxError(tok.location(), "Unexpected token in a case pattern: " + tok.value);
 }
 
+// round 83: a pattern as Python's tree has it (ast mode): MatchValue,
+// MatchSingleton, MatchSequence/MatchStar, MatchMapping, MatchClass,
+// MatchAs, MatchOr, each with its span
+node_ptr Parser::patAst(const std::shared_ptr<MatchPat>& p){
+    Token tok = token();
+    auto mk = [&](const char* kind, int t0, int t1) {
+        auto n = std::make_shared<PyAstNode>(tok, kind);
+        if(t0 >= 0 && t1 >= t0) ast_spans_[n.get()] = {t0, t1};
+        return n;
+    };
+    node_ptr out;
+    switch(p->kind){
+    case MatchPat::WILD:
+        out = mk("MatchAs", p->t0, p->t1);
+        break;
+    case MatchPat::CAPTURE: {
+        auto n = mk("MatchAs", p->t0, p->t1);
+        n->str("name", p->name);
+        out = n;
+        break;
+    }
+    case MatchPat::VALUE: {
+        node_ptr v = p->value;
+        bool single = v && (v->type() == NodeType::NONE || v->type() == NodeType::TRUE || v->type() == NodeType::FALSE);
+        auto n = mk(single ? "MatchSingleton" : "MatchValue", p->t0, p->t1);
+        n->kid("value", v);
+        out = n;
+        break;
+    }
+    case MatchPat::OR: {
+        if(p->subs.size() == 1){ out = patAst(p->subs[0]); break; }
+        auto n = mk("MatchOr", p->t0, p->t1);
+        std::vector<node_ptr> ps;
+        for(auto& s : p->subs) ps.push_back(patAst(s));
+        n->list("patterns", ps);
+        out = n;
+        break;
+    }
+    case MatchPat::SEQ: {
+        auto n = mk("MatchSequence", p->t0, p->t1);
+        std::vector<node_ptr> ps;
+        for(size_t i = 0; i < p->subs.size(); i++){
+            if((int)i == p->star){
+                auto st = mk("MatchStar", p->subs[i]->t0, p->subs[i]->t1);
+                if(p->star_name != "_") st->str("name", p->star_name);
+                ps.push_back(st);
+            } else ps.push_back(patAst(p->subs[i]));
+        }
+        n->list("patterns", ps);
+        out = n;
+        break;
+    }
+    case MatchPat::CLASS: {
+        auto n = mk("MatchClass", p->t0, p->t1);
+        std::vector<node_ptr> ps, kps;
+        std::vector<std::string> ks;
+        for(auto& s : p->subs) ps.push_back(patAst(s));
+        for(auto& kv : p->kw){ ks.push_back(kv.first); kps.push_back(patAst(kv.second)); }
+        n->kid("cls", p->value)->list("patterns", ps)->strl("kwd_attrs", ks)->list("kwd_patterns", kps);
+        out = n;
+        break;
+    }
+    case MatchPat::MAP: {
+        auto n = mk("MatchMapping", p->t0, p->t1);
+        std::vector<node_ptr> ks, ps;
+        for(auto& kv : p->items){ ks.push_back(kv.first); ps.push_back(patAst(kv.second)); }
+        n->list("keys", ks)->list("patterns", ps);
+        if(!p->rest.empty()) n->str("rest", p->rest);
+        out = n;
+        break;
+    }
+    }
+    if(!p->as_name.empty()){
+        auto n = mk("MatchAs", p->as_t0, p->as_t1);
+        n->kid("pattern", out)->str("name", p->as_name);
+        out = n;
+    }
+    return out;
+}
+
 node_ptr Parser::matchStmt(Token tok, node_ptr subject){
+    if(ast_mode_){
+        // round 83: Match(subject, cases=[match_case(pattern, guard, body)])
+        have(TokenType::Colon);
+        bool has_brace = have(TokenType::BraceOpen);
+        have(TokenType::NewLine);
+        bool has_indent = have(TokenType::Indent);
+        auto at_end = [&]() -> bool {
+            if(has_brace && see(TokenType::BraceClose)) return true;
+            if(has_indent && see(TokenType::Dedent)) return true;
+            return see(TokenType::End);
+        };
+        std::vector<node_ptr> cases;
+        while(!at_end()){
+            while(have(TokenType::NewLine)) {}
+            if(at_end()) break;
+            if(!have(TokenType::Case))
+                throw SyntaxError(token().location(), "Expected 'case' in a match statement, got: " + token().value);
+            auto pat = matchPattern();
+            node_ptr guard;
+            if(have(TokenType::If)) guard = expression();
+            mustBe(TokenType::Colon);
+            node_ptr body = blockOrStmt();
+            auto mc = std::make_shared<PyAstNode>(tok, "match_case");
+            mc->kid("pattern", patAst(pat))->kid("guard", guard)->kid("body", body);
+            cases.push_back(mc);
+        }
+        if(has_indent) have(TokenType::Dedent);
+        if(has_brace) have(TokenType::BraceClose);
+        have(TokenType::NewLine);
+        auto m = std::make_shared<PyAstNode>(tok, "Match");
+        m->kid("subject", subject)->list("cases", cases);
+        return m;
+    }
     static int match_counter = 0;
     int id = match_counter++;
     std::string subj = "__ms" + std::to_string(id) + "__";
@@ -4272,6 +5166,20 @@ void Parser::delTargets(node_ptr t, std::vector<node_ptr>& out){
 
 node_ptr Parser::deleteStmt(){
     Token tok = token(); mustBe(TokenType::Delete);
+    if(ast_mode_){
+        // round 83: Delete(targets), each as written (a tuple stays one)
+        std::vector<node_ptr> ts;
+        do {
+            if(endsExprList(token().type())) break;
+            ts.push_back(asTarget(ternary()));
+        } while(have(TokenType::Comma));
+        if(ts.empty()) throw SyntaxError(tok.location(), "invalid syntax");
+        consumed_semi_ = have(TokenType::SemiColon);
+        if(!consumed_semi_) have(TokenType::NewLine);
+        auto d = std::make_shared<PyAstNode>(tok, "Delete");
+        d->list("targets", ts);
+        return d;
+    }
     std::vector<node_ptr> targets;
     do {
         if(endsExprList(token().type())) break;
@@ -4314,6 +5222,32 @@ node_ptr Parser::withStmt(bool is_async){
     std::vector<std::pair<node_ptr, std::string>> items;
     std::vector<std::pair<std::string, node_ptr>> bind_after;
     skip_nl();
+    if(ast_mode_){
+        // round 83: With/AsyncWith(items, body), each a withitem(context_expr,
+        // optional_vars) with the target as written
+        std::vector<node_ptr> witems;
+        do {
+            skip_nl();
+            if(paren && see(TokenType::ParenClose)) break;
+            node_ptr expr = ternary();
+            node_ptr target;
+            if(have(TokenType::As)){
+                in_assign_target_ = true;
+                try { target = asTarget(postfix()); } catch(...) { in_assign_target_ = false; throw; }
+                in_assign_target_ = false;
+            }
+            auto wi = std::make_shared<PyAstNode>(tok, "withitem");
+            wi->kid("context_expr", expr)->kid("optional_vars", target);
+            witems.push_back(wi);
+            skip_nl();
+        } while(have(TokenType::Comma));
+        if(paren){ skip_nl(); mustBe(TokenType::ParenClose); }
+        have(TokenType::Colon);
+        node_ptr body = blockOrStmt();
+        auto w = std::make_shared<PyAstNode>(tok, is_async ? "AsyncWith" : "With");
+        w->list("items", witems)->kid("body", body);
+        return w;
+    }
     do {
         skip_nl();
         if(paren && see(TokenType::ParenClose)) break;
@@ -4411,6 +5345,7 @@ std::string Parser::tokenText(int from, int to){
 // a name from an unimported module), so an annotation never breaks a
 // program that does not read it.
 node_ptr Parser::annotationValue(node_ptr expr, int from, int to){
+    if(ast_mode_) return expr;   // round 83: the annotation itself
     Token t = expr ? expr->token() : token();
     t.value = tokenText(from, to);
     auto text = make_node<StringNode>(t);
@@ -4439,7 +5374,7 @@ bool Parser::haveCompFor(){
     return false;
 }
 
-node_ptr Parser::lambdaExpr(){
+node_ptr Parser::lambdaExpr_(){   // round 83: lambdaExpr() records its span in ast mode (Parser.hpp)
     Token tok = token(); mustBe(TokenType::Lambda);
     // A lambda inside a parameter list (`def f(g=lambda n: n, h=2)`) has
     // defaults of its own: the list's are put back after it (round 78 - the
@@ -4575,16 +5510,20 @@ node_ptr Parser::comprehension(Token tok, int kind, node_ptr elt, node_ptr value
         cl.target = compTarget();
         mustBe(TokenType::In);
         cl.iter = logicalOr();
-        // round 84: a starred target (`for a, *b in it`): the names stay
-        // the target and each item is reshaped first (the prelude's
-        // _ny_star_iter: the starred part a list, CPython's count errors)
-        if(node_ptr spec = starTargetSpec(cl.target)){
-            if(async_clause) throw SyntaxError(tok.location(), "a starred target in an async comprehension is not supported");
-            auto call = std::static_pointer_cast<CallNode>(wrap_call("_ny_star_iter", cl.iter));
-            call->add(spec);
-            cl.iter = call;
+        if(async_clause && ast_mode_) ast_flags_[cl.iter.get()] = "async";   // round 83: is_async=1
+        else if(!ast_mode_){
+            // round 84: a starred target (`for a, *b in it`): the names stay
+            // the target and each item is reshaped first (the prelude's
+            // _ny_star_iter: the starred part a list, CPython's count errors);
+            // ast mode keeps Python's Starred
+            if(node_ptr spec = starTargetSpec(cl.target)){
+                if(async_clause) throw SyntaxError(tok.location(), "a starred target in an async comprehension is not supported");
+                auto call = std::static_pointer_cast<CallNode>(wrap_call("_ny_star_iter", cl.iter));
+                call->add(spec);
+                cl.iter = call;
+            }
+            if(async_clause) cl.iter = wrap_call("_ny_aiter", cl.iter);
         }
-        if(async_clause) cl.iter = wrap_call("_ny_aiter", cl.iter);
         while(have(TokenType::If)) cl.conds.push_back(logicalOr());
         cp->clauses.push_back(std::move(cl));
     } while(haveCompFor());
@@ -4595,6 +5534,39 @@ node_ptr Parser::comprehension(Token tok, int kind, node_ptr elt, node_ptr value
 // parenthesised) comma-separated list of targets.
 node_ptr Parser::compTargetOne(){
     Token tok = token();
+    if(ast_mode_){
+        // round 83: Python's target - `(x)` is x, `(a, b)` a Tuple, `[a]` a
+        // List, `*x` Starred, an attribute or item too
+        int t0 = scanner->current;
+        if(see(TokenType::Mul)){
+            Token st = token(); next(); st.value = "*";
+            node_ptr t = make_node<UnaryNode>(st, compTargetOne());
+            spanSet(t.get(), t0);
+            return t;
+        }
+        if(have(TokenType::ParenOpen) || have(TokenType::BracketOpen)){
+            bool list = prev().type() == TokenType::BracketOpen;
+            if(have(list ? TokenType::BracketClose : TokenType::ParenClose)){
+                node_ptr e = list ? make_node<ListNode>(tok) : make_node<TupleNode>(tok);
+                spanSet(e.get(), t0);
+                return e;
+            }
+            node_ptr t = compTarget();
+            mustBe(list ? TokenType::BracketClose : TokenType::ParenClose);
+            if(list){
+                auto l = make_node<ListNode>(tok);
+                if(t->type() == NodeType::TUPLE && !ast_outer_.count(t.get())) for(auto& e : t->statements()) l->add(e);
+                else l->add(t);
+                spanSet(l.get(), t0);
+                return l;
+            }
+            if(t->type() == NodeType::TUPLE && !ast_outer_.count(t.get())){ ast_spans_.erase(t.get()); spanSet(t.get(), t0); }
+            else ast_outer_[t.get()] = {t0, scanner->current - 1};
+            return t;
+        }
+        node_ptr t = asTarget(postfix());
+        return t;
+    }
     if(have(TokenType::ParenOpen)){
         node_ptr t = compTarget();
         mustBe(TokenType::ParenClose);
@@ -4660,6 +5632,7 @@ node_ptr Parser::starTargetSpec(node_ptr& target){
 
 node_ptr Parser::compTarget(){
     Token tok = token();
+    int t0 = scanner->current;   // round 83
     node_ptr first = compTargetOne();
     if(!see(TokenType::Comma)) return first;
     auto tup = make_node<TupleNode>(tok);
@@ -4668,10 +5641,11 @@ node_ptr Parser::compTarget(){
         if(see(TokenType::In) || see(TokenType::ParenClose) || see(TokenType::BracketClose)) break;
         tup->add(compTargetOne());
     }
+    if(ast_mode_) spanSet(tup.get(), t0);
     return tup;
 }
 
-node_ptr Parser::starElem(){
+node_ptr Parser::starElem_(){   // round 83: starElem() records its span in ast mode (Parser.hpp)
     if(see(TokenType::Mul)){
         Token st = token();
         next();
@@ -4703,7 +5677,7 @@ node_ptr Parser::catStarred(Token tok, const std::vector<node_ptr>& elems, const
     return w;
 }
 
-node_ptr Parser::listLiteral(){
+node_ptr Parser::listLiteral_(){   // round 83: listLiteral() records its span in ast mode (Parser.hpp)
     Token tok = token();
     mustBe(TokenType::BracketOpen);
     if(see(TokenType::BracketClose)){
@@ -4728,7 +5702,7 @@ node_ptr Parser::listLiteral(){
         list->add(e);
     }
     mustBe(TokenType::BracketClose);
-    if(starred && !in_assign_target_) return catStarred(tok, list->statements(), nullptr);
+    if(starred && !in_assign_target_ && !ast_mode_) return catStarred(tok, list->statements(), nullptr);   // round 83
     return list;
 }
 
@@ -4802,9 +5776,54 @@ node_ptr Parser::repeatStmt(){
     return make_node<WhileNode>(tok, true_cond, block);
 }
 
-node_ptr Parser::mapLiteral(){
+node_ptr Parser::mapLiteral_(){   // round 83: mapLiteral() records its span in ast mode (Parser.hpp)
     Token tok = token();
     mustBe(TokenType::BraceOpen);
+    if(ast_mode_){
+        // round 83: Dict(keys, values) - a None key for `**d` - or Set(elts),
+        // or a dict/set comprehension
+        std::vector<node_ptr> keys, vals;
+        auto dict = [&]() -> node_ptr {
+            auto d = std::make_shared<PyAstNode>(tok, "Dict");
+            d->list("keys", keys)->list("values", vals);
+            return d;
+        };
+        if(have(TokenType::BraceClose)) return dict();
+        if(have(TokenType::Exp)){ keys.push_back(nullptr); vals.push_back(bitwiseOr()); }
+        else {
+            node_ptr first = starElem();
+            if(!isStarElem(first) && have(TokenType::Colon)){
+                node_ptr v = expression();
+                if(haveCompFor()){
+                    node_ptr comp = comprehension(tok, ComprehensionNode::DICT, first, v);
+                    mustBe(TokenType::BraceClose);
+                    return comp;
+                }
+                keys.push_back(first); vals.push_back(v);
+            } else {
+                if(!isStarElem(first) && haveCompFor()){
+                    node_ptr comp = comprehension(tok, ComprehensionNode::SET, first, nullptr);
+                    mustBe(TokenType::BraceClose);
+                    return comp;
+                }
+                std::vector<node_ptr> elts{first};
+                while(have(TokenType::Comma) && !see(TokenType::BraceClose)) elts.push_back(starElem());
+                mustBe(TokenType::BraceClose);
+                auto st = std::make_shared<PyAstNode>(tok, "Set");
+                st->list("elts", elts);
+                return st;
+            }
+        }
+        while(have(TokenType::Comma) && !see(TokenType::BraceClose)){
+            if(have(TokenType::Exp)){ keys.push_back(nullptr); vals.push_back(bitwiseOr()); continue; }
+            node_ptr k = expression();
+            mustBe(TokenType::Colon);
+            node_ptr v = expression();
+            keys.push_back(k); vals.push_back(v);
+        }
+        mustBe(TokenType::BraceClose);
+        return dict();
+    }
     // Could be a map or a block — if first token is identifier followed by colon, it's a map
     if(see(TokenType::BraceClose)){
         next(); return make_node<MapNode>(tok); // empty map

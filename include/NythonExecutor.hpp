@@ -691,6 +691,8 @@ public:   // NythonExecutor is a struct: members default to public
             "ac_index_new","ac_index_set_base","ac_index_scan","ac_index_rank","text_diff_classify","fs_symbols","ny_check_file","fs_line_stats",
             "text_defuse",   // round 79: the static half of the debugger's dynamic slices
             "ny_facts",      // round 82: per-function facts from the real parser (lib/nyxai)
+            "_ny_ast",       // round 83: Python's tree from the real parser (lib/ast.ny)
+            "_ny_vm_code",   // round 83: the VM's code objects (lib/dis.ny)
             // ── GUI builtins — value-returning ──────────────────────────────
             "gui_get_error","gui_sdl_version","gui_get_display_size","gui_get_window_size","gui_set_window_size","gui_set_cursor","gui_hash_id","gui_display_scale","gui_display_density","gui_video_driver","gui_window_scale","gui_measure_text_w","gui_set_clipboard","gui_get_clipboard",
             "gui_wait_events","gui_set_min_size","gui_set_fullscreen","gui_is_fullscreen","gui_show_open_dialog","gui_show_save_dialog","gui_set_text_input_area","gui_draw_arc","gui_draw_text_wrapped","gui_wrap_text","gui_font_metrics","gui_image_size","gui_free_image","gui_push_clip","gui_pop_clip","gui_push_offset","gui_pop_offset","gui_ticks","gui_next_event","gui_event_get",
@@ -2479,7 +2481,9 @@ public:   // NythonExecutor is a struct: members default to public
             "os_getenv", "getenv", "env", "os_makedirs", "os_rmtree",
             "os_mkstemp", "os_mkdtemp", "os_path_relpath", "os_utime",
             "time_format", "time_date", "time_strftime", "time_iso",
-            "file_open", "file_open_or_raise", "os_proc_read", "os_poll"
+            "file_open", "file_open_or_raise", "os_proc_read", "os_poll",
+            "compile",   // round 83: flags=ast.PyCF_ONLY_AST, filename=, mode=
+            "_ny_vm_code"   // round 83: adaptive=
         };
         if (named.count(n)) return true;
         static const char* pre[] = {"_net_", "_sig_", "_ws_", "_tls_", "_http_", "_struct_", "_codec_", "_cli_", "_hash_", "math_", "_sql_"};   // _sql_: round 83
@@ -2545,7 +2549,8 @@ public:   // NythonExecutor is a struct: members default to public
                 if (args.size() != 1 || !isStringValue(args[0])) pyRaise("TypeError", "fromhex() argument must be str");
                 std::string h = *(std::string*)args[0].value.p;
                 if (t == "float") {
-                    double d = std::strtod(h.c_str(), nullptr);
+                    // round 83: CPython's grammar (strtod read "0.8" as decimal)
+                    double d = nyCall([&] { return nypy::float_fromhex(h); });
                     out = Value(d);
                     return true;
                 }
@@ -5610,6 +5615,9 @@ public:   // NythonExecutor is a struct: members default to public
     Value makeBoundMethod(Value fn_val, Value self_val) {
         if (fn_val.type != ValueType::USERDATA || !fn_val.value.p) return fn_val;
         if (string_ptrs_.count(fn_val.value.p)) return fn_val;
+        // round 83: a bound method stays bound to its own instance (one
+        // stored in a class and read through another instance)
+        if (!bound_self_.empty() && bound_self_.count(fn_val.value.p)) return fn_val;
         auto fit = func_names.find(fn_val.value.p);
         if (fit == func_names.end()) return fn_val;
         const std::string& tag = fit->second;
@@ -10233,6 +10241,45 @@ public:
                               makeStringValue(node->tok().fileName()), Value(fn && fn->first_line ? fn->first_line : (int)node->tok().line()),
                               intValue((int64_t)(uintptr_t)node)});
     }
+    // round 83: _ny_vm_code(f | source | code object, adaptive=False) on the
+    // interpreter (lib/dis.ny): a function's code as the VM compiles it - its
+    // FunctionNode / LambdaNode compiled on its own with the VM's compiler
+    // (a method as a plain function; nothing is specialized here, so
+    // `adaptive` shows the compiled form) - or the source compiled; the
+    // JSON of VirtualMachine::code_json.
+    Value vmCodeInfo(std::vector<Value>& args) {
+        takeKwMap(args);
+        if (args.empty()) return NONE_VALUE;
+        Value f = args[0];
+        if (f.type == ValueType::NONE) return makeStringValue(nython::vm::VirtualMachine::opnames_json());
+        if (f.type == ValueType::USERDATA && f.value.p && !bound_self_.empty()) {
+            auto bs = bound_self_.find(f.value.p);
+            if (bs != bound_self_.end() && bs->second) f = bs->second->fn;
+        }
+        if (isPlainFunction(f)) {
+            auto an = func_ast_nodes.find(f.value.p);
+            Node* node = an == func_ast_nodes.end() ? nullptr : (Node*)an->second;
+            if (!node) return NONE_VALUE;
+            nython::vm::Compiler comp;
+            auto code = comp.compile(node->shared_from_this());
+            if (!code || code->sub_codes.empty() || !code->sub_codes[0]) return NONE_VALUE;
+            auto fc = code->sub_codes[0];
+            if (fc->file.empty()) fc->file = node->tok().fileName();
+            return makeStringValue(nython::vm::VirtualMachine::code_json(*fc, false));
+        }
+        if (isStringValue(f) || bytesOf(f) || (isInstanceValue(f) && shownClassName(instanceClassName(f)) == "_NyCode")) {
+            std::string mode = "exec", fname = "<dis>";
+            std::string src = snippetSource(f, mode, fname, "dis");
+            node_ptr ast = parseSnippet(src, fname);
+            nython::vm::Compiler comp;
+            auto code = comp.compile(ast);
+            if (!code) return NONE_VALUE;
+            code->name = "<module>";
+            code->file = fname;
+            return makeStringValue(nython::vm::VirtualMachine::code_json(*code, false));
+        }
+        return NONE_VALUE;
+    }
     // _ny_fn_globals(f) (round 77): f.__globals__, the names of the module
     // f was defined in (a copy, as globals() is here).
     Value fnGlobals(Value f) {
@@ -12837,6 +12884,23 @@ public:
     // declared class), return that name; otherwise "" so the caller falls back
     // to a value comparison. Only a bare VARIABLE counts: `1 is x` where x
     // holds 1 must still be a value test.
+    // (round 83) whether a type word names something else here than the
+    // builtin it is (a parameter `object` holding a class or a function):
+    // its binding is not the prelude's / builtins' one - or, for a word with
+    // no builtin binding (Integer, string ...), an ordinary value (a
+    // function, instance, module, number, string, container)
+    bool typeWordShadowed(const std::string& n, Context* ctx) {
+        Value b = ctx->getByName(n);
+        if (b.type == ValueType::NONE || b.type == ValueType::UNDEFINED) return false;
+        Value bv = (prelude_ctx_ ? prelude_ctx_ : global_ctx)->getByName(n);
+        if (bv.type != ValueType::UNDEFINED && bv.type != ValueType::NONE) return !identical(b, bv);
+        if (isTypeObject(b)) return false;
+        if (b.type == ValueType::USERDATA && b.value.p) {
+            std::string tag = fnTag(func_names, b.value.p);
+            if (tag.rfind("__builtin__:", 0) == 0 || tag.rfind("__rtype__:", 0) == 0 || tag.rfind("__class__:", 0) == 0) return false;
+        }
+        return true;
+    }
     std::string typeNameOperand(const node_ptr& node, Context* ctx) {
         if (!node || node->type() != NodeType::VARIABLE) return std::string();
         const std::string n = node->tok().value;
@@ -12848,7 +12912,13 @@ public:
             "tuple","Tuple","set","Set","bytes","bytearray",
             "none","None","function","Function","Object","object","any","Any"
         };
-        if (type_names.count(n)) return n;
+        if (type_names.count(n)) {
+            // round 83: a type word bound to an ordinary value - a parameter
+            // or local named `object`, `list`, `str` (CPython's pydoc:
+            // `module is not object`) - is that value: identity, as Python
+            if (ctx && n != "None" && n != "none" && typeWordShadowed(n, ctx)) return std::string();
+            return n;
+        }
         // A declared class name is a type; a variable holding a value is not.
         if (class_by_name.count(n) && ctx && ctx->getByName(n).type == ValueType::UNDEFINED)
             return n;
@@ -14990,7 +15060,8 @@ public:
         }
         if (auto* bo = bytesOf(v)) return bo->s;
         if (isStringValue(v)) return getStringValue(v);
-        pyRaise("TypeError", std::string(who) + "() arg 1 must be a string, bytes or code object");
+        // (round 83: compile()'s own message names AST objects, as CPython's)
+        pyRaise("TypeError", std::string(who) + "() arg 1 must be a string, bytes or " + (std::string(who) == "compile" ? "AST" : "code") + " object");
         return std::string();
     }
     node_ptr parseSnippet(const std::string& src, const std::string& fname) {
@@ -15171,6 +15242,23 @@ public:
         return NONE_VALUE;
     }
     Value compileBuiltin(std::vector<Value>& args, Context* ctx) {
+        // round 83: compile(tree, filename, mode) and compile(source, ...,
+        // flags=ast.PyCF_ONLY_AST) are lib/ast.ny's (the prelude's
+        // _ny_compile_ast); keyword arguments are taken (isKwmapBuiltin)
+        {
+            auto kw = takeKwMap(args);
+            long long flags = args.size() > 3 && args[3].type == ValueType::INTEGER ? (long long)bigint_to_i64(args[3].value.i) : 0;
+            if (args.empty() && kw.count("source")) args.push_back(kw["source"]);
+            if (args.size() == 1 && kw.count("filename")) args.push_back(kw["filename"]);
+            if (args.size() == 2 && kw.count("mode")) args.push_back(kw["mode"]);
+            if (kw.count("flags") && kw["flags"].type == ValueType::INTEGER) flags = (long long)bigint_to_i64(kw["flags"].value.i);
+            bool tree = !args.empty() && isInstanceValue(args[0]) && shownClassName(instanceClassName(args[0])) != "_NyCode";
+            if (tree || (flags & 0x400)) {
+                std::vector<Value> a{args[0], args.size() > 1 ? args[1] : makeStringValue("<unknown>"),
+                                     args.size() > 2 ? args[2] : makeStringValue("exec"), Value((int)flags)};
+                return callFunctionValue(global_ctx->getByName("_ny_compile_ast"), a, ctx);
+            }
+        }
         if (args.size() < 3) pyRaise("TypeError", "compile() missing required argument (source, filename, mode)");
         if (nyrt::audit_on()) auditEvent("compile", {args[0], args[1]}, ctx);   // round 84
         std::string fname = getStringValue(args[1]), mode = getStringValue(args[2]);
@@ -15445,6 +15533,13 @@ public:
     // as for a plain call.
     Value invokeMember(Value m, Node* owner, Value self, std::vector<Value>& args,
                        const nyrt::OrderedKw<Value>& kw, Context* ctx) {
+        // round 83: a method already bound to an object and stored in a
+        // class (`repr = _repr_instance.repr` in a class body - pydoc's
+        // TextDoc) is called with its own instance, as Python's method
+        // objects are no descriptors; it was bound again, to the instance
+        // or class it was read through
+        if (m.value.p && !bound_self_.empty() && bound_self_.count(m.value.p))
+            return callFunctionValue(m, args, ctx, kw.empty() ? nullptr : &kw);
         std::string tag = fnTag(func_names, m.value.p);
         bool is_static = tag.find("__static__") != std::string::npos;
         bool is_cm = tag.find("__classmethod__") != std::string::npos;

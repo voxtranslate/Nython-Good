@@ -15,6 +15,7 @@
 #include <vector>
 #include <cstring>
 #include <cmath>
+#include <cctype>
 #include "NyStr.hpp"
 #include "NyBigInt.hpp"
 #include "NyCodecs.hpp"
@@ -92,6 +93,41 @@ inline std::string bytes_fromhex(const std::string& s) {
         i += 2;
     }
     return r;
+}
+// float.fromhex(s) (round 83): CPython's grammar - optional sign, optional
+// 0x, hex digits with an optional point, an optional p exponent; inf / nan.
+// Both engines called strtod, which reads "0.8" as decimal (it needs the
+// 0x): float.fromhex('0.8') was 0.8, not 0.5 (antigravity.geohash).
+inline double float_fromhex(const std::string& s0) {
+    size_t a = 0, b = s0.size();
+    while (a < b && std::isspace((unsigned char)s0[a])) a++;
+    while (b > a && std::isspace((unsigned char)s0[b - 1])) b--;
+    std::string s = s0.substr(a, b - a);
+    std::string low;
+    for (char c : s) low += (char)std::tolower((unsigned char)c);
+    std::string body = low;
+    bool neg = false;
+    if (!body.empty() && (body[0] == '+' || body[0] == '-')) { neg = body[0] == '-'; body = body.substr(1); }
+    if (body == "inf" || body == "infinity") return neg ? -HUGE_VAL : HUGE_VAL;
+    if (body == "nan") return neg ? -std::nan("") : std::nan("");
+    if (body.size() >= 2 && body[0] == '0' && body[1] == 'x') body = body.substr(2);
+    // validate: hexdigits [. hexdigits] [p [sign] digits], at least one digit
+    size_t i = 0, digits = 0;
+    while (i < body.size() && hex_digit(body[i]) >= 0) { i++; digits++; }
+    if (i < body.size() && body[i] == '.') { i++; while (i < body.size() && hex_digit(body[i]) >= 0) { i++; digits++; } }
+    bool ok = digits > 0;
+    if (ok && i < body.size() && body[i] == 'p') {
+        i++;
+        if (i < body.size() && (body[i] == '+' || body[i] == '-')) i++;
+        size_t e0 = i;
+        while (i < body.size() && body[i] >= '0' && body[i] <= '9') i++;
+        ok = i > e0;
+    }
+    if (!ok || i != body.size()) raise("ValueError", "invalid hexadecimal floating-point string");
+    std::string hx = std::string(neg ? "-" : "") + "0x" + body;
+    double d = std::strtod(hx.c_str(), nullptr);
+    if (std::isinf(d)) raise("OverflowError", "hexadecimal value too large to represent as a float");
+    return d;
 }
 
 // ── codecs ──────────────────────────────────────────────────────────────

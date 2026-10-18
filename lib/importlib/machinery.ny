@@ -254,15 +254,22 @@ class PathFinder:
         import os
         tail = fullname.rpartition(".")[2]
         sep = os.sep   # native separators, as the engines' __path__ (round 80)
+        # every directory's .ny first, then their .py (round 83, as the
+        # import statement looks since round 82: pyclbr / modulefinder
+        # search a given path for .py modules), then namespace packages
+        for ext in (".ny", ".py"):
+            for entry in path:
+                if not isinstance(entry, str):
+                    continue
+                base = entry.rstrip("/\\") or ("." if not entry else entry)   # '' is the current directory
+                for kind, candidate in (("package", base + sep + tail + sep + "__init__" + ext),
+                                        ("file", base + sep + tail + ext)):
+                    if _ny_path_isfile(candidate):
+                        return _spec_for_path(fullname, candidate, kind)
         for entry in path:
             if not isinstance(entry, str):
                 continue
-            base = entry.rstrip("/\\")
-            for kind, candidate in (("package", base + sep + tail + sep + "__init__.ny"),
-                                    ("file", base + sep + tail + ".ny")):
-                if _ny_path_isfile(candidate):
-                    return _spec_for_path(fullname, candidate, kind)
-            d = base + sep + tail
+            d = (entry.rstrip("/\\") or ("." if not entry else entry)) + sep + tail
             if _ny_path_isdir(d):
                 return _spec_for_path(fullname, d, "namespace")
         return None

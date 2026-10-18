@@ -124,7 +124,8 @@ enum class NodeType:uint8_t {
     COMPREHENSION,
     OPT_CHAIN,     // a?.b / a?[k] / a?.m(x) / f?.(x) and the chain after it
     CHAIN_HOLE,    // the value an OPT_CHAIN computed, where the chain resumes
-    BYTES          // b"..." (round 77)
+    BYTES,         // b"..." (round 77)
+    PY_AST         // round 83: a node of Python's tree shape (PyAstNode; the parser's ast mode only)
 };
 
 struct INode{

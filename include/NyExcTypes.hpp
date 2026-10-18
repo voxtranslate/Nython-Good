@@ -54,6 +54,8 @@ inline const char* ny_builtin_exc_parent(const std::string& name) {
         {"ImportError", "Exception"},
         {"ModuleNotFoundError", "ImportError"},
         {"SyntaxError", "Exception"},
+        {"IndentationError", "SyntaxError"},   // round 83: Python's (tokenize, tabnanny, ast)
+        {"TabError", "IndentationError"},
         {"AssertionError", "Exception"},
         {"StopIteration", "Exception"},
         {"StopAsyncIteration", "Exception"},
@@ -137,7 +139,7 @@ inline const std::vector<std::string>& ny_builtin_exc_names() {
         "NotImplementedError", "RecursionError", "OSError", "IOError",
         "FileNotFoundError", "FileExistsError", "PermissionError",
         "TimeoutError", "ConnectionError", "ImportError",
-        "ModuleNotFoundError", "SyntaxError", "AssertionError",
+        "ModuleNotFoundError", "SyntaxError", "IndentationError", "TabError", "AssertionError",
         "StopIteration", "StopAsyncIteration", "MemoryError", "EOFError", "EnvironmentError",
         "SSLError", "SSLCertVerificationError", "SSLEOFError", "SSLZeroReturnError",
         "SSLWantReadError", "SSLWantWriteError", "SSLSyscallError",

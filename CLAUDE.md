@@ -400,6 +400,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit109 | 255 | round 83 (part B): errno, fcntl, termios/tty/pty (os.fork/forkpty/openpty/waitpid/exec*), resource, syslog, mmap, cmath (CPython's special values), colorsys, sched, getopt, optparse (help text identical), fileinput, filecmp, gettext (.mo files, plurals), readline/rlcompleter, site/sysconfig, webbrowser, zipimport/zipapp (`nython app.pyz`), encodings, stringprep, bz2 (byte-identical to libbz2), lzma (liblzma at run time, a native decoder without it), faulthandler (both engines' stacks, a real SIGSEGV), tracemalloc, locale; module.__dict__, comprehension lists freed on the VM (passes under python3) |
 | vm_audit111 | 53 | round 83: ctypes - type's own members (`type.__new__/__call__/__setattr__` in metaclasses), simple types, structures (bit fields, packing, anonymous, byte order), unions, arrays, pointers, libc calls (strlen/labs/strtod/sprintf/div, errcheck), callbacks (qsort, a double callback, a struct by value), errno, util/wintypes, the built-in caller without libffi (passes under python3) |
 | vm_audit116 | 34 | round 84 (part 0): module AttributeError text, `{}.append` on the interpreter, BaseException's members as values, instance `__module__`/`__weakref__`, builtins' docstrings, a finally body seeing its exception, strict and starred comprehension targets, `sys.audit`/`addaudithook` events, VM comprehension targets freed, True/None spelled by the program's language (passes under python3) |
+| vm_audit108 | 224 | round 83: ast (the real parser's tree: dump of a corpus with positions, f-string parts, unparse round trips, literal_eval, visitors/transformers, compile of a tree, SyntaxErrors), tokenize/token (3.12 f-string tokens, detect_encoding, untokenize), symtable, dis/opcode (Nython's VM bytecode, the adaptive view on the VM), marshal bytes, pickletools.dis/optimize text, pydoc, pyclbr, tabnanny, py_compile, compileall, modulefinder, this, multi-line string lines; generated from CPython 3.12's values (`tools/gen_vm_audit108.py`; 206 under python3.12, 191 under 3.11) |
 | tools/ide_e2e.py | — | the real IDE driven headlessly (run with python3) |
 
 Run all: `python3 tools/sweep.py` — every `examples/test_*.ny`, `examples/*_test.ny`
@@ -1344,6 +1345,36 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   VM's `break`/`continue` out of an except clause left the exception "being
   handled" (an endless `__context__` chain); a finished task now lets go of
   its coroutine's arguments.
+
+## Round 83, part A: Python's language-tooling modules (see `HANDOFF.md` §0v2)
+
+- `lib/`: ast, token, tokenize, symtable, dis, opcode, marshal,
+  pickletools, pydoc, pyclbr, tabnanny, py_compile, compileall,
+  modulefinder, this, antigravity.
+- **`ast.parse` is the real parser's tree**: `_ny_ast` (text.cpp,
+  `AstExporter`) runs `Parser::parseAst` in *ast mode* (`ast_mode_`:
+  Python's shape where the parser would desugar - `PyAstNode` -, spans per
+  node in `ast_spans_`/`ast_outer_`, no mangling or scope checks).
+  **Anything new the parser desugars needs its ast-mode branch** or
+  ast.parse shows Nython's lowering. `compile(tree, ...)` on both engines
+  goes to the prelude's `_ny_compile_ast` (the tree's unparsed source, each
+  statement on its tree's line).
+- **Tokens carry an end** (`Token::end_row/end_col`) and a multi-line
+  string token is located at its first line (statement lines, tracebacks,
+  line events and `--trace` of a docstring or a multi-line string
+  statement were its last line).
+- **`dis`/`opcode` describe Nython's VM bytecode** (`_ny_vm_code(f |
+  source | code, adaptive)` on both engines; `_ny_vm_code(None)` the
+  instruction set; offsets are instruction indexes); `dis(f,
+  adaptive=True)` on the VM shows the quickened instructions.
+- Engine fixes found on the way: a bound method stored in a class stays
+  bound (interpreter); a type word bound to something else (a parameter
+  `object`) is that value in `is` (both); `float.fromhex` without `0x`
+  (both); a prelude function's plain assignment rebinds a program global
+  of that name on the interpreter - **always `var` in prelude functions**
+  (`_NyModuleType.__repr__` clobbered a program's `f`).
+- `python3.12 tools/gen_vm_audit108.py` regenerates examples/vm_audit108.ny
+  from CPython 3.12's values.
 
 ## Round 82 follow-ups (see `HANDOFF.md` §0u4, §0u5)
 

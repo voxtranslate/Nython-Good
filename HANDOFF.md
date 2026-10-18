@@ -7,6 +7,7 @@ Last updated: round 84, part 0 — **§0w** (the semantic gaps rounds 82-83 foun
 Round 83, ctypes — **§0v4** (ctypes over libffi loaded at run time, or Nython's own caller built on the calling conventions' register files; type's own members; a metaclass's operators on its classes)
 Round 83, part B — **§0v** (Python's system and command-line modules: errno, fcntl, termios, tty, pty, resource, syslog, mmap, faulthandler, tracemalloc, locale, gettext, getopt, optparse, fileinput, filecmp, sched, cmath, colorsys, readline, rlcompleter, site, sysconfig, webbrowser, zipimport, zipapp, encodings, stringprep, bz2, lzma; module.__dict__ and hashable modules on both engines; VM comprehension results freed; vm_audit109).
 Round 83, part C — **§0v3** (sqlite3 over libsqlite3 loaded at run time, its callbacks run by suspending a coroutine; dbm/shelve; the email package and the mail modules; smtplib/poplib/imaplib/ftplib/telnetlib/xmlrpc/wsgiref/cgi/netrc; plistlib; audioop and the audio-file modules; vm_audit110).
+Round 83, part A — **§0v2** (Python's language-tooling modules: ast from the real parser's ast mode, tokenize/token, symtable, dis/opcode over the VM's bytecode with its adaptive view, marshal, pickletools, pydoc, pyclbr, tabnanny, py_compile, compileall, modulefinder, this, antigravity; tokens carry an end and a multi-line string its first line; vm_audit108).
 Round 82, follow-ups (2) — **§0u5** (`import name` finds `.py` modules and packages, `.ny` first; quoted imports from anywhere; `threading.Lock` is Python's ownerless lock; tasks see their loop's thread in threading; `_thread`; vm_audit107).
 Round 82, follow-ups — **§0u4** (asyncio where part B left it different from CPython - TaskGroup groups, wait(), CancelledError(), the default executor, create_server(None), sendfile, pipes, async generator hooks; a `gc` module; `fileno()` the OS descriptor; vm_audit106).
 Round 82, part C — **§0u** (NyxAI: lib/aiagent.ny made a programming agent that works offline - BM25F retrieval, program facts from the real parser (`ny_facts`), a rule engine, test generation, docstrings, review and fixes, a completion model - and the IDE's AGENT view; vm_audit105, e2e `agent`).
@@ -625,6 +626,147 @@ sockets.
 - Windows: `sqlite3.dll` / (64-bit) `winsqlite3.dll` are looked for, but
   the MinGW cross build and Wine were not run this round.
 - bytes %-formatting (PEP 461), see above.
+## 0v2. Round 83, part A — Python's language-tooling modules over Nython's own parser and VM (vm_audit108)
+
+`examples/vm_audit108.ny` (224 checks on Nython) passes on both
+engines (also with `NY_ASTSPEC=0` and `NY_QUICKEN=0`), under python3.12
+(206) and under python3.11 (191: the PY312-guarded checks are
+skipped there). It is generated: `python3.12 tools/gen_vm_audit108.py`
+evaluates every check's expression under CPython 3.12 and writes its value
+as the expectation (as vm_audit94 is made from CPython 3.11); the
+Nython-only checks at the end (dis and opcode over the VM's bytecode, the
+adaptive view, antigravity) are written by hand.
+
+Merged onto round 84 part 0 (76638aa): sweep 451 runs, 0 not ok; `tools/ide_e2e.py` 463
+passed; vm_audit108 224/224 on both engines. In ast mode the parser keeps a
+starred comprehension target as Python's Starred (round 84's lowering is not
+applied there).
+
+**New modules** (lib/): `ast`, `token`, `tokenize`, `symtable`, `dis`,
+`opcode`, `marshal`, `pickletools`, `pydoc`, `pyclbr`, `tabnanny`,
+`py_compile`, `compileall`, `modulefinder`, `this`, `antigravity`. Each
+header says what is there and what is not.
+
+- **`ast.parse` is the real parser's tree.** `_ny_ast(source, mode,
+  filename)` (src/builtins/text.cpp, `AstExporter`) runs
+  `Parser::parseAst`, the parser every program goes through, in an *ast
+  mode* (`Parser::ast_mode_`): where it would desugar it keeps Python's
+  shape (`PyAstNode`, include/ASTNodes.hpp - decorators, chained
+  comparisons, slices, f-strings, starred displays and unpacking
+  assignments, match, except clauses, imports, with items, async
+  constructs), it does not mangle private names, runs no NyScope check,
+  keeps asserts, and records each node's tokens (`ast_spans_`, the
+  parentheses written around an expression in `ast_outer_`, flags in
+  `ast_flags_`; 23 parse functions are wrapped by `NY_AST_SPANNED`, one
+  well-predicted branch when ast mode is off). The exporter emits
+  CPython-shaped maps (columns UTF-8 byte offsets) that lib/ast.ny makes
+  into its node classes. `ast.dump` of a 94-construct corpus is identical
+  to CPython 3.12's with and without attributes, unparse round-trips it;
+  **anything new the parser desugars needs its ast-mode branch**.
+- **Tokens have an end** (`Token::end_row/end_col`, computed in
+  `Lexer::make_token` from the token's bytes) and **a string token that
+  spans lines is located where it starts** - a docstring's or a multi-line
+  string statement's line was its last one in tracebacks, line events and
+  `--trace` (vm_audit91/44/92/101 and the e2e suite pass unchanged).
+- **f-strings are located part by part** in ast mode as CPython 3.12 does
+  (`Parser::fstrPositions`): the literal's source text - an f-string, or a
+  run of literals the lexer joined - is split as the value is and the two
+  are matched part for part, so each literal run, field (`{` to `}`),
+  format spec (`:` to `}`) and the nodes of a field's expression get exact
+  positions; a field's tokens are moved to the source's coordinates and
+  kept in `Parser::ast_extra_toks_` (spans index them from `kAstExtra`).
+  An f-string nested in a field, a raw f-string, or one whose escape makes
+  a brace has its parts at the whole string.
+- **`compile(tree, filename, mode)`** on both engines hands the tree to
+  the prelude's `_ny_compile_ast` -> `ast._ny_compile`, which compiles the
+  tree's unparsed source written with each statement on its tree's line
+  (tracebacks and line events are the tree's linenos); `compile(src, f,
+  mode, ast.PyCF_ONLY_AST)` returns the tree.
+- **`dis` / `opcode` are about Nython's VM**, not CPython's bytecode:
+  `_ny_vm_code(f | source | code, adaptive)` returns a code object as JSON
+  (`VirtualMachine::code_json`) on both engines - on the VM the function's
+  own running code, on the interpreter its node compiled with the VM's
+  compiler; `_ny_vm_code(None)` is the instruction set (`opnames_json`).
+  Offsets are instruction indexes, jumps "to N". **`dis(f,
+  adaptive=True)` on the VM shows the instructions round 80's quickening
+  rewrote** (LOAD_NAME_FAST, BINARY_ADD_NUM, FOR_ITER_RANGE ...), as
+  CPython 3.12's adaptive view; on the interpreter it is the compiled form.
+- marshal is format 4 byte for byte (FLAG_REF set as CPython sets it for
+  values held by a variable and built from literals - CPython's rule is
+  the reference count); pickletools is CPython's file adapted
+  (`dis`/`genops`/`optimize` byte-identical); pydoc is CPython's text half.
+
+**Engine changes** (all commented `round 83`):
+- `include/Token.hpp`: `end_row`/`end_col` (copied by the copy/move
+  constructors and assignments).
+- `include/Lexer.hpp`, `src/Lexer.cpp`: `token_start_off` (set in
+  `reset_token`); `make_token` computes the end and locates a String/Bytes
+  token spanning lines at its start; `optimize()` gives a joined literal
+  its last piece's end and puts an f-string's `f` token at the run's
+  start; `force_python_strings` (lib/ast.ny parses Python source).
+- `include/INode.hpp` (`NodeType::PY_AST`), `include/ASTNodes.hpp`
+  (`PyAstNode`), `include/Parser.hpp`/`src/Parser.cpp`: ast mode
+  (`ast_mode_`, `parseAst`, `ast_spans_`/`ast_outer_`/`ast_flags_`,
+  `NY_AST_SPANNED`, `importAst`, `tryAst`, `patAst`, `fstringAst`,
+  `fstrPositions`, `ast_extra_toks_`, `mg()` not mangling in ast mode, and
+  the ast-mode branches of the statement and expression parsers).
+- `src/builtins/text.cpp`: `_ny_ast` (`AstExporter`); `string_first_line`
+  clamps a line of 0 to 1.
+- `include/NythonExecutor.hpp`: `_ny_ast`/`_ny_vm_code` registered;
+  `compile` and `_ny_vm_code` take keyword arguments; `compileBuiltin`
+  sends an AST or `PyCF_ONLY_AST` to `_ny_compile_ast`; `vmCodeInfo`;
+  `makeBoundMethod` returns a bound method unchanged and `invokeMember`
+  calls one with its own instance (a bound method stored in a class -
+  pydoc's `repr = _repr_instance.repr` - was bound again); `typeNameOperand`
+  / `typeWordShadowed` (a type word bound to something other than the
+  builtin is that value in `is`: `module is not object` with a parameter
+  `object`); `snippetSource`'s message for compile ("... or AST object");
+  `float.fromhex` through `nypy::float_fromhex`. `src/builtins/core.cpp`:
+  `_ny_vm_code` dispatched.
+- `include/VirtualMachine.hpp`: names for 17 opcodes `op_name` lacked;
+  `json_q`, `code_json`, `opnames_json`, `vm_code_info`, the
+  `_ny_vm_code` global; `vm_compile` sends an AST / `PyCF_ONLY_AST` to
+  `_ny_compile_ast`; `snippet_source`'s compile message;
+  `COMPARE_IS_TYPE` arg 2 for builtin type words (`type_word_shadowed`);
+  `float.fromhex` through `nypy::float_fromhex`.
+- `include/NyBytes.hpp`: `nypy::float_fromhex` (CPython's grammar:
+  `float.fromhex('0.8')` was 0.8 on both engines - strtod needs `0x`).
+- `include/NyPrelude.hpp`: `_ny_compile_ast`; `_NyModuleType.__repr__`
+  declares `var f` - **a prelude function's plain assignment rebinds a
+  program global of that name on the interpreter** (repr() of the module
+  inspect.getmodule makes replaced a program's function `f` with its
+  `__file__`); the prelude has no other such assignment
+  (scanned).
+- `include/NyExcTypes.hpp`, `include/NyRuntime.hpp`: IndentationError
+  (a SyntaxError) and TabError (an IndentationError) are builtin classes.
+
+### Not done
+- ast: `type_comments` (no TypeIgnore / type_comment), `feature_version`
+  (accepted, ignored), 3.12's `type X = ...` and generic def/class (the
+  parser reads neither); syntax errors give CPython's bracket messages and
+  "invalid syntax", not its more specific wordings.
+- dis: no CACHE entries, positions without columns, `co_code` keeps an
+  argument's low byte only (the Instruction objects have the full one),
+  free/cell variables not analysed; on the interpreter `adaptive=True` is
+  the compiled form.
+- marshal: code objects (ValueError, both ways); FLAG_REF can differ from
+  CPython's for a value CPython built at run time (its rule is the
+  reference count) - both read back alike.
+- pydoc: no HTML, no server, no MODULE REFERENCE, no topics; help() in the
+  prelude does not go through it. pickletools: no `-t` (no doctest module).
+  py_compile / compileall check syntax and write nothing. antigravity
+  opens nothing (there is no webbrowser module).
+- Found, not changed: under `nython -m mod` sys.path[0] is the module's
+  directory, not the current one (CPython's), so `nython -m pyclbr name`
+  does not find a module of the current directory by name; on the
+  interpreter, `import builtins` run inside a module that is the main
+  program, after it defined a name a builtin has, gives that module's
+  definition (tokenize and py_compile keep the builtins they shadow at
+  import time); ~~builtin types have no `__doc__` (AttributeError) and
+  `type.__subclasses__(C)` is an AttributeError on both engines~~ (both
+  fixed by the time this part was merged: round 84 part 0 §0w and round 83's
+  ctypes §0v4; pydoc's workarounds stay harmless); `inspect.getmodule()`
+  makes a new module object per call.
 
 ## 0u5. Round 82, follow-ups (2) — Python source modules, quoted imports from anywhere, Python's lock (vm_audit107)
 

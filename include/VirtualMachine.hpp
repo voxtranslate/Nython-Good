@@ -1538,7 +1538,11 @@ private:
                         "none","None","function","Function","Object","object","any","Any"};
                     visit(b->left);
                     emit_lc(VMVal::make_str(tn),l);
-                    emit(op=="is not"?Op::COMPARE_IS_NOT_TYPE:Op::COMPARE_IS_TYPE, words.count(tn)?0:1, l);
+                    // arg 2 (round 83): a type word other than None, which
+                    // a parameter or local may hold an ordinary value under
+                    // (`module is not object` in CPython's pydoc): identity then
+                    emit(op=="is not"?Op::COMPARE_IS_NOT_TYPE:Op::COMPARE_IS_TYPE,
+                         words.count(tn)?((tn=="None"||tn=="none")?0:2):1, l);
                     break;
                 }
             }
@@ -4486,6 +4490,163 @@ public:
         return oss.str();
     }
 
+    // round 83: lib/dis.ny's view of a code object, as JSON - what
+    // _ny_vm_code(f | source | code, adaptive=False) returns on both engines
+    // (the interpreter compiles with this VM's compiler and asks the same):
+    //   {"name", "qualname", "filename", "firstlineno", "params", "posonly",
+    //    "flags": {"generator", "async", "async_gen", "method", "class",
+    //    "static", "classmethod"}, "doc", "names": [...],
+    //    "consts": [{"repr", "type", "value" (when JSON has it), "int" (an
+    //    int's digits)}], "code": [[opname, opcode, arg, line, starts_line,
+    //    generic opname]], "exc_table": [{"start", "end", "handlers",
+    //    "else", "finally"}], "subs": [nested code objects]}
+    // `adaptive`: each instruction as it runs now - the specialized form a
+    // hot instruction rewrote itself into (round 80's quickening), as
+    // CPython 3.12's dis(adaptive=True); otherwise as compiled.
+    static void json_q(std::string& o, const std::string& s) {
+        o+='"';
+        for(unsigned char ch:s){
+            if(ch=='"'||ch=='\\'){ o+='\\'; o+=(char)ch; }
+            else if(ch=='\n') o+="\\n";
+            else if(ch=='\t') o+="\\t";
+            else if(ch=='\r') o+="\\r";
+            else if(ch<0x20){ char b[8]; snprintf(b,sizeof b,"\\u%04x",ch); o+=b; }
+            else o+=(char)ch;
+        }
+        o+='"';
+    }
+    static std::string code_json(const VMCode& c, bool adaptive) {
+        std::string o="{";
+        auto key=[&](const char* k){ if(o.size()>1) o+=','; json_q(o,k); o+=':'; };
+        auto boolv=[&](bool b){ o+=b?"true":"false"; };
+        key("name"); json_q(o,c.name);
+        key("qualname"); json_q(o,c.qualname.empty()?c.name:c.qualname);
+        key("filename"); json_q(o,c.file);
+        key("firstlineno"); o+=std::to_string(c.first_line);
+        key("params"); o+='[';
+        for(size_t i=0;i<c.param_names.size();i++){ if(i) o+=','; json_q(o,c.param_names[i]); }
+        o+=']';
+        key("posonly"); o+=std::to_string(c.posonly);
+        key("self"); if(c.is_method&&!c.bind_first) json_q(o,c.self_name); else o+="null";
+        key("flags"); o+='{';
+        o+="\"generator\":"; boolv(c.has_yield()&&!c.is_async);
+        o+=",\"async\":"; boolv(c.is_async&&!c.is_async_gen);
+        o+=",\"async_gen\":"; boolv(c.is_async_gen);
+        o+=",\"method\":"; boolv(c.is_method);
+        o+=",\"class\":"; boolv(c.is_class);
+        o+=",\"static\":"; boolv(c.is_static);
+        o+=",\"classmethod\":"; boolv(c.is_classmethod);
+        o+=",\"module\":"; boolv(c.module_top);
+        o+='}';
+        key("doc"); if(c.has_doc) json_q(o,c.doc); else o+="null";
+        key("names"); o+='[';
+        for(size_t i=0;i<c.names.size();i++){ if(i) o+=','; json_q(o,c.names[i]); }
+        o+=']';
+        key("consts"); o+='[';
+        for(size_t i=0;i<c.constants.size();i++){
+            if(i) o+=',';
+            const VMVal& v=c.constants[i];
+            o+="{\"repr\":"; json_q(o,v.repr());
+            const char* t="other";
+            switch(v.type){
+            case VMType::NONE: t="NoneType"; o+=",\"value\":null"; break;
+            case VMType::BOOL: t="bool"; o+=v.b?",\"value\":true":",\"value\":false"; break;
+            case VMType::INT: t="int"; o+=",\"int\":"; json_q(o,v.repr()); break;
+            case VMType::FLOAT: t="float"; o+=",\"float\":"; json_q(o,v.repr()); break;
+            case VMType::STRING: t="str"; o+=",\"value\":"; json_q(o,v.s); break;
+            case VMType::BYTES: t="bytes"; break;
+            case VMType::FUNCTION: t="code"; break;
+            default: break;
+            }
+            o+=",\"type\":"; json_q(o,t);
+            o+='}';
+        }
+        o+=']';
+        key("code"); o+='[';
+        for(size_t i=0;i<c.instructions.size();i++){
+            if(i) o+=',';
+            const Instruction& ins=c.instructions[i];
+            Op op=adaptive?ins.op:base_op(ins.op);
+            o+='['; json_q(o,op_name(op));
+            o+=','+std::to_string((int)op)+','+std::to_string(ins.arg)+','+std::to_string(ins.line)+',';
+            o+=c.is_line_start((int)i)?"1":"0";
+            o+=','; json_q(o,op_name(base_op(ins.op)));
+            o+=']';
+        }
+        o+=']';
+        key("exc_table"); o+='[';
+        for(size_t i=0;i<c.exc_table.size();i++){
+            if(i) o+=',';
+            const ExceptionEntry& e=c.exc_table[i];
+            o+="{\"start\":"+std::to_string(e.try_start)+",\"end\":"+std::to_string(e.try_end)+",\"handlers\":[";
+            for(size_t k=0;k<e.clauses.size();k++){
+                if(k) o+=',';
+                o+="{\"target\":"+std::to_string(e.clauses[k].handler)+",\"types\":[";
+                for(size_t q=0;q<e.clauses[k].types.size();q++){ if(q) o+=','; json_q(o,e.clauses[k].types[q]); }
+                o+="],\"name\":"; json_q(o,e.clauses[k].bind_var); o+='}';
+            }
+            o+="],\"else\":"+std::to_string(e.else_handler)+",\"finally\":"+std::to_string(e.finally_start)+'}';
+        }
+        o+=']';
+        key("subs"); o+='[';
+        for(size_t i=0;i<c.sub_codes.size();i++){ if(i) o+=','; o+=c.sub_codes[i]?code_json(*c.sub_codes[i],adaptive):std::string("null"); }
+        o+="]}";
+        return o;
+    }
+    // (round 83) whether a type word (COMPARE_IS_TYPE arg 2) names
+    // something else here than the builtin it is - a parameter `object`
+    // holding a class or a function: its binding is not globals_' one, or,
+    // for a word with no builtin binding, an ordinary value
+    bool type_word_shadowed(const std::string& n, VMVal& named) {
+        named=load_var(n);
+        if(named.type==VMType::NONE||named.type==VMType::UNDEFINED) return false;
+        auto it=globals_.find(n);
+        if(it!=globals_.end()&&it->second.type!=VMType::NONE&&it->second.type!=VMType::UNDEFINED)
+            return !op_is(named,it->second);
+        return named.type!=VMType::CLASS&&named.type!=VMType::NATIVE&&named.builtin_type_name().empty();
+    }
+    // _ny_vm_code(None): the instruction set, for lib/opcode.ny -
+    // {"opname": [256 names, "<n>" where no instruction has the number],
+    //  "generic": [the generic instruction each one stands for]}.
+    static std::string opnames_json() {
+        std::string o="{\"opname\":[";
+        for(int g=0;g<2;g++){
+            if(g) o+="],\"generic\":[";
+            for(int i=0;i<256;i++){
+                if(i) o+=',';
+                std::string n=i<(int)Op::OP_COUNT_?op_name(g?base_op((Op)i):(Op)i):"???";
+                json_q(o,n=="???"?"<"+std::to_string(i)+">":n);
+            }
+        }
+        o+="]}";
+        return o;
+    }
+    // _ny_vm_code(f | source | code object, adaptive=False) on the VM: a
+    // function's own code (as it runs now), or source compiled.
+    VMVal vm_code_info(std::vector<VMVal>& a) {
+        VMVal kw=take_kwargs(a);
+        bool adaptive=a.size()>1&&a[1].is_truthy();
+        if(kw.type==VMType::MAP&&kw.map){ auto it=kw.map->find("adaptive"); if(it!=kw.map->end()) adaptive=it->second.is_truthy(); }
+        if(a.empty()) return VMVal::make_none();
+        VMVal f=a[0];
+        if(f.type==VMType::NONE) return VMVal::make_str(opnames_json());
+        if(f.type==VMType::MAP&&f.class_name=="__bound_method__"&&f.map){
+            auto it=f.map->find("__fn__");
+            if(it!=f.map->end()){ VMVal fn=it->second; f=fn; }
+        }
+        if(f.type==VMType::FUNCTION&&f.code) return VMVal::make_str(code_json(*f.code,adaptive));
+        if(f.type==VMType::STRING||(f.type==VMType::INSTANCE&&nyrt::shown_class_name(f.class_name)=="_NyCode")){
+            std::string mode="exec", fname="<dis>";
+            std::string src=snippet_source(f,mode,fname,"dis");
+            auto ast=parse_snippet(src,fname);
+            Compiler comp;
+            auto code=comp.compile(ast);
+            if(code){ code->name="<module>"; code->file=fname; }
+            return code?VMVal::make_str(code_json(*code,false)):VMVal::make_none();
+        }
+        return VMVal::make_none();
+    }
+
 private:
     // ── Execute a VMCode object ──────────────────────────────────────────
     // ── UTF-8 index helpers ─────────────────────────────────────────────────
@@ -6266,7 +6427,8 @@ private:
         }
         if(v.type==VMType::BYTES) return v.bdata();
         if(v.type==VMType::STRING) return v.s;
-        raise_native_exception("TypeError",std::string(who)+"() arg 1 must be a string, bytes or code object");
+        // (round 83: compile()'s own message names AST objects, as CPython's)
+        raise_native_exception("TypeError",std::string(who)+"() arg 1 must be a string, bytes or "+(std::string(who)=="compile"?"AST":"code")+" object");
         return std::string();
     }
     nython::node::node_ptr parse_snippet(const std::string& src, const std::string& fname) {
@@ -6488,6 +6650,25 @@ private:
         }
     }
     VMVal vm_compile(std::vector<VMVal>& a) {
+        // round 83: compile(tree, filename, mode) and compile(source, ...,
+        // flags=ast.PyCF_ONLY_AST) are lib/ast.ny's (the prelude's
+        // _ny_compile_ast); keyword arguments are taken
+        {
+            VMVal kw=take_kwargs(a);
+            long long flags=a.size()>3&&a[3].type==VMType::INT?a[3].i:0;
+            if(kw.type==VMType::MAP&&kw.map){
+                auto g=[&](const char* k)->const VMVal*{ auto it=kw.map->find(k); return it==kw.map->end()?nullptr:&it->second; };
+                if(a.empty()&&g("source")) a.push_back(*g("source"));
+                if(a.size()==1&&g("filename")) a.push_back(*g("filename"));
+                if(a.size()==2&&g("mode")) a.push_back(*g("mode"));
+                if(const VMVal* f=g("flags")) if(f->type==VMType::INT) flags=f->i;
+            }
+            bool tree=!a.empty()&&a[0].type==VMType::INSTANCE&&nyrt::shown_class_name(a[0].class_name)!="_NyCode";
+            if(tree||(flags&0x400)){
+                std::vector<VMVal> ca{a[0],a.size()>1?a[1]:VMVal::make_str("<unknown>"),a.size()>2?a[2]:VMVal::make_str("exec"),VMVal::make_int(flags)};
+                return vm_call(load_var("_ny_compile_ast"),ca,std::nullopt,nullptr);
+            }
+        }
         if(a.size()<3) raise_native_exception("TypeError","compile() missing required argument (source, filename, mode)");
         if(nyrt::audit_on()) audit_event("compile",{a[0],a[1]});   // round 84
         std::string fname=a[1].to_string(), mode=a[2].to_string();
@@ -9006,6 +9187,8 @@ private:
                 if(ins.arg==1 && (named=load_var(t.s)).type!=VMType::NONE && named.type!=VMType::CLASS
                    && named.type!=VMType::UNDEFINED)
                     r=op_is(v,named);          // an ordinary value: identity
+                else if(ins.arg==2 && type_word_shadowed(t.s,named))
+                    r=op_is(v,named);          // round 83: a type word naming something else here
                 else
                     r=value_is_type(v,t.s);
                 push(VMVal::make_bool(op==Op::COMPARE_IS_TYPE ? r : !r)); break;
@@ -13246,7 +13429,7 @@ private:
             }
             if(m=="fromhex"){
                 if(a.size()!=1||a[0].type!=VMType::STRING) raise_native_exception("TypeError","fromhex() argument must be str");
-                if(t=="float") return VMVal::make_float(std::strtod(a[0].s.c_str(),nullptr));
+                if(t=="float") return VMVal::make_float(nycall([&]{ return nypy::float_fromhex(a[0].s); }));   // round 83: CPython's grammar
                 return VMVal::make_bytes(nycall([&]{ return nypy::bytes_fromhex(a[0].s); }),t=="bytearray");
             }
             if(m=="maketrans"&&t=="str"){   // round 80: CPython's three forms (the prelude's)
@@ -14518,6 +14701,7 @@ private:
         globals_["eval"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_eval_exec(false,a); });
         globals_["exec"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_eval_exec(true,a); });
         globals_["compile"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_compile(a); });
+        globals_["_ny_vm_code"]=VMVal::make_native([this](std::vector<VMVal>& a)->VMVal{ return vm_code_info(a); });   // round 83: lib/dis.ny
         // round 81: globals() is the module's live namespace (a view), and
         // so is locals() at a module's top level, as in CPython
         globals_["globals"]=VMVal::make_native([this](std::vector<VMVal>&)->VMVal{ return vm_globals_view(); });
@@ -16844,7 +17028,24 @@ private:
         case Op::END_FINALLY:  return "END_FINALLY";
         case Op::WITH_ENTER:   return "WITH_ENTER";
         case Op::WITH_EXIT:    return "WITH_EXIT";
-        default:               return "???";
+                case Op::DELETE_SUBSCR: return "DELETE_SUBSCR";   // round 83 (dis)
+        case Op::DELETE_ATTR: return "DELETE_ATTR";   // round 83 (dis)
+        case Op::ROT_THREE: return "ROT_THREE";   // round 83 (dis)
+        case Op::COMPARE_IS_TYPE: return "COMPARE_IS_TYPE";   // round 83 (dis)
+        case Op::COMPARE_IS_NOT_TYPE: return "COMPARE_IS_NOT_TYPE";   // round 83 (dis)
+        case Op::UNARY_POS: return "UNARY_POS";   // round 83 (dis)
+        case Op::YIELD_VALUE: return "YIELD_VALUE";   // round 83 (dis)
+        case Op::IADD: return "IADD";   // round 83 (dis)
+        case Op::ISUB: return "ISUB";   // round 83 (dis)
+        case Op::IMUL: return "IMUL";   // round 83 (dis)
+        case Op::IDIV: return "IDIV";   // round 83 (dis)
+        case Op::IMOD: return "IMOD";   // round 83 (dis)
+        case Op::CALL_KW: return "CALL_KW";   // round 83 (dis)
+        case Op::RAISE: return "RAISE";   // round 83 (dis)
+        case Op::STORE_EXCEPT_AS: return "STORE_EXCEPT_AS";   // round 83 (dis)
+        case Op::LOAD_SELF_ATTR: return "LOAD_SELF_ATTR";   // round 83 (dis)
+        case Op::STORE_SELF_ATTR: return "STORE_SELF_ATTR";   // round 83 (dis)
+default:               return "???";
         }
     }
 };

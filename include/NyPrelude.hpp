@@ -427,7 +427,11 @@ class _NyModuleType(metaclass=_NyModuleTypeMeta):
         self.__loader__ = None
         self.__spec__ = None
     def __repr__(self):
-        f = getattr(self, "__file__", None)
+        # (round 83: `var` - a plain assignment here rebound the program's
+        # own global `f` on the interpreter, where prelude functions see the
+        # program's globals: repr() of a module made by inspect.getmodule
+        # replaced the program's function f with its __file__)
+        var f = getattr(self, "__file__", None)
         if f is not None:
             return "<module " + repr(self.__name__) + " from " + repr(f) + ">"
         return "<module " + repr(self.__name__) + ">"
@@ -1553,6 +1557,13 @@ def exit(code=none):
 
 def quit(code=none):
     raise SystemExit(code)
+
+# compile(tree, filename, mode) and compile(source, filename, mode,
+# ast.PyCF_ONLY_AST): both engines' compile() hands these to lib/ast.ny
+# (round 83)
+def _ny_compile_ast(source, filename, mode, flags):
+    import ast
+    return ast._ny_compile(source, filename, mode, flags)
 
 # str.encode / bytes.decode / str(b, enc, errors) with a codec or an error
 # handler only lib/codecs.ny's registry knows (round 80: both engines call
