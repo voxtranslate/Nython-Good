@@ -7,6 +7,7 @@ Last updated: round 84, part A — **§0x** (memoryview and the buffer protocol 
 Round 84, part B — **§0x2** (the Unicode database - unicodedata complete from compact generated tables; str's case mappings and predicates by it on both engines; PEP 3131 identifiers; the CJK codecs ported from CPython's cjkcodecs; utf-7; mbcs/oem on Windows; idna's nameprep; Unicode-aware fuzzy matching; vm_audit113)
 Round 84, part C — **§0x3** (tkinter, ttk and turtle over Nython's own GUI backend: a Tcl subset, Tk's core, pack/grid/place, the classic and ttk widgets, photo images, dialogs; CPython's tkinter package and turtle.py; vm_audit114)
 Round 84, part D — **§0x4** (curses without ncurses: terminfo, tparm, ncurses' screen model and update algorithm, input and mouse, panels; a VT/xterm emulator the test compares with CPython+ncurses through; vm_audit115)
+Round 84 (main session) — **§0w2** (the functions CPython implements in C are builtins: a table generated from CPython, sealed when their module has run; natives carry their module's names; PEP 562 module __getattr__/__dir__; int() through __index__/__trunc__, float() overflow; PEP 701 f-strings; an unbound name hidden by a method of that name; the library searched before the importer's ancestors; vm_audit117)
 Round 84, ctypes and Windows — **§0w1** (ctypes structures passed and returned by value on every ABI without libffi - SysV eightbyte classification, AAPCS64, Win64, i686; Windows callback trampolines per float mask and stdcall; the Windows gaps round 83 left: zipapp path-hook recursion, liblzma's header errors, faulthandler's SIGSEGV, mmap's messages, AF_UNIX)
 Round 84, part 0 — **§0w** (the semantic gaps rounds 82-83 found: module attribute messages, BaseException's members and builtins' docstrings as values, a finally body seeing its exception, strict and starred comprehension targets, sys.audit, True/None spelled by the program's language)
 Round 83, ctypes — **§0v4** (ctypes over libffi loaded at run time, or Nython's own caller built on the calling conventions' register files; type's own members; a metaclass's operators on its classes)
@@ -694,6 +695,113 @@ probe, lint, class check and cbp check clean.
   the library modules' own. exec's event carries the source string, not a
   code object.
 - A starred target in an async comprehension.
+
+## 0w2. Round 84 (main session) — C-implemented functions as builtins, module __getattr__, PEP 701 f-strings, the gaps the round's agents found (vm_audit117)
+
+`examples/vm_audit117.ny` (33 checks) passes on both engines and under
+python3.12 (32 under python3.11, which has no PEP 701).
+
+time.time, operator.add, heapq.heappush, bisect.insort, zlib.crc32,
+binascii.hexlify, struct.pack, functools.reduce, os.fspath, os.scandir ...
+are written in Nython; in CPython they are builtin functions, and code
+relies on what that means: a builtin stored as a class attribute is not
+bound (`converter = time.gmtime` in logging.Formatter, `timer =
+time.perf_counter`), `inspect.isbuiltin` is true, `type(f)` is
+`builtin_function_or_method`. lib/time.ny wrapped its functions in
+`staticmethod` to get the first (so `type(time.time)` was staticmethod);
+every other module bound them as methods.
+
+- **A table generated from CPython** (`tools/gen_builtin_fns.py` ->
+  `include/NyBuiltinFns.hpp`, `nyrt::cpython_builtin_fns(module)`): for
+  every module lib/ provides (and the engines' os, sys, time, gc), the
+  public names that are builtin functions of a module in any CPython
+  3.10-3.13 found (942 names, 86 modules; bound methods of an instance, as
+  random.random is, are not).
+- **The engines seal a module when it has run** (interpreter
+  `runModuleFile` / the os namespace builder -> `sealCModule`; VM
+  `load_module_file` / its os builder -> `seal_cmodule`): the prelude's
+  `_ny_seal_cmodule(module, names)` marks each plain function the module
+  binds under one of its names with the native `_ny_mark_builtin`, and a
+  function written under a private name (`_ny_os_fspath`) takes the public
+  one (`__name__`, `__qualname__`). A program's own functions and the
+  library's that CPython writes in Python (os.walk, json.dumps) are
+  never touched (a Nython native is a builtin whatever CPython does:
+  os.makedirs is `os_makedirs`).
+- **A marked function** is static (the interpreter's `__static__` tag plus
+  `__nybuiltin__`, `isNyBuiltinTag`; the VM's `VMCode::is_static` plus
+  `VMCode::nybuiltin`): not bound through a class or an instance; `type()`
+  is builtin_function_or_method; its repr is `<built-in function name>`;
+  `C.__dict__` holds the function itself (no staticmethod object); its
+  `__self__` is its module (`moduleValueByName` / `module_value_by_name`:
+  sys.modules, the engine's own, builtins). It keeps `__code__`,
+  `__defaults__` and its def's signature (`inspect.signature` gives it:
+  CPython has text signatures for some builtins and none for others).
+- **Natives carry their module's names** (`nyrt::builtin_public`):
+  math.sqrt is `sqrt` of `math` (it was `math_sqrt` of builtins),
+  sys.getrefcount `getrefcount` of sys, sys.exception `exception`,
+  sys.settrace `settrace` (repr `<built-in function settrace>`), the os_*
+  natives os binds as they are (getcwd, getpid ...) os's; `__self__` is
+  the module (`len.__self__` is builtins).
+- The prelude's `_ny_builtins_module()` (the builtins module, imported on
+  first need) did not exist although both engines' sys.modules builders
+  called it: `sys.modules["builtins"]` was missing. lib/builtins.ny now
+  finds itself through `_ny_modules()` (sys's setup imports it before sys
+  has its `modules` attribute).
+- VM: `math.floor`, `math.ceil`, `math.trunc` (wrapped to honour
+  `__floor__`/`__ceil__`/`__trunc__`) printed as `<native>` and had no
+  `__name__`: the wrapper carries the native's tag.
+
+**The gaps the round's agents found** (both engines unless noted):
+- **PEP 562**: a module's own `__getattr__` supplies a name it lacks (`m.x`,
+  `getattr`/`hasattr`, `m.f(...)`, `from m import x`, `__all__` in `from m
+  import *`) and its `__dir__` answers `dir(m)` (interpreter
+  `moduleGetattr` in `getAttrValue`, `callMethod`, `bindFromNamespace`; VM
+  `lookup_attr`, `vm_call_method`, `bind_from_namespace`). lib/sqlite3's
+  deprecated names rely on it.
+- **"cannot import name 'x' from 'm' (path)"**, CPython's text: the
+  module's file, or "(unknown location)" (`importWhere` / `import_where`).
+- **`int(x)` falls back to `__index__`, then `__trunc__`** (it raised
+  TypeError); `float(x)` to `__index__`; **`float()` of an int too large
+  is OverflowError** "int too large to convert to float" (it was inf).
+- **The installation's own `lib/` is searched before the importing file's
+  ancestors** (interpreter `moduleDirs`, VM `module_dirs`): a program run
+  from inside another checkout loaded that checkout's library modules (the
+  agents' worktrees, nested in the main checkout, got its lib/ast.ny).
+- **Interpreter: an unbound name read as `undefined`, not NameError, when
+  any method or nested function had that name** (`knownName` counted every
+  function value's name; asyncio's `Future.result` hid a missing `result`
+  depending on which function values were alive - a pdb check failed after
+  an unrelated merge). Only top-level functions and classes count now.
+- **PEP 701 f-strings**: a replacement field may use the f-string's own
+  quote, nest f-strings, span lines and hold comments
+  (`f"{", ".join(xs)}"`, `f"{d["k"]}"`). The lexer reads the string after
+  an `f` prefix with its fields copied as written
+  (`Lexer::read_fstring_field` / `read_nested_string`: nested strings of
+  any quote, brackets counted, a format spec's own fields followed). Raw
+  f-strings (`rf"..."`) still end at their first quote.
+
+### Not done
+- `os.remove` is the `os_unlink` native, so its `__name__` is `unlink`
+  (CPython has two functions); `__module__` of os's natives is `os`
+  (CPython: `posix`, which Nython does not have as a module).
+- A marked function still accepts keyword arguments for parameters CPython
+  makes positional-only (`time.sleep(secs=1)`), and has `__code__`.
+- `str.upper` shows as `<built-in function str.upper>` (CPython:
+  `<method 'upper' of 'str' objects>`, a method_descriptor).
+- `"s" + memoryview(b"x")` concatenates its repr (TypeError in CPython);
+  `bytes.partition(sep)` gives the separator as bytes, not the object.
+- Python's binding rule (an assignment in a function makes a local) for
+  Python-language files: two agents hit Nython's rule in ported code.
+- 158 public functions CPython has in these modules are missing in Nython
+  (os: sysconf, statvfs, pread/pwrite, setuid/setgid..., sched_*,
+  posix_spawn, getrandom, the xattr calls, eventfd, memfd_create, wait3/4,
+  waitid ...; time.clock_gettime/clock_settime/clock_getres;
+  signal.pthread_kill/sigtimedwait/sigwaitinfo/set_wakeup_fd/siginterrupt;
+  socket.if_nameindex/CMSG_LEN/CMSG_SPACE/sethostname; sys's
+  set_int_max_str_digits/unraisablehook/getallocatedblocks;
+  gc.get_objects/get_referents/get_referrers; codecs' utf_7; ssl.RAND_*;
+  hashlib.scrypt; locale's gettext functions). The generator's probe lists
+  them.
 
 ## 0w1. Round 84 (main session) — ctypes structures by value on every ABI, and the Windows gaps round 83 left
 

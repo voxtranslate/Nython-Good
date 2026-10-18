@@ -400,6 +400,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit109 | 255 | round 83 (part B): errno, fcntl, termios/tty/pty (os.fork/forkpty/openpty/waitpid/exec*), resource, syslog, mmap, cmath (CPython's special values), colorsys, sched, getopt, optparse (help text identical), fileinput, filecmp, gettext (.mo files, plurals), readline/rlcompleter, site/sysconfig, webbrowser, zipimport/zipapp (`nython app.pyz`), encodings, stringprep, bz2 (byte-identical to libbz2), lzma (liblzma at run time, a native decoder without it), faulthandler (both engines' stacks, a real SIGSEGV), tracemalloc, locale; module.__dict__, comprehension lists freed on the VM (passes under python3) |
 | vm_audit111 | 55 | round 83 (structures by value without libffi: round 84): ctypes - type's own members (`type.__new__/__call__/__setattr__` in metaclasses), simple types, structures (bit fields, packing, anonymous, byte order), unions, arrays, pointers, libc calls (strlen/labs/strtod/sprintf/div, errcheck), callbacks (qsort, a double callback, a struct by value), errno, util/wintypes, the built-in caller without libffi (passes under python3) |
 | vm_audit116 | 34 | round 84 (part 0): module AttributeError text, `{}.append` on the interpreter, BaseException's members as values, instance `__module__`/`__weakref__`, builtins' docstrings, a finally body seeing its exception, strict and starred comprehension targets, `sys.audit`/`addaudithook` events, VM comprehension targets freed, True/None spelled by the program's language (passes under python3) |
+| vm_audit117 | 33 | round 84: the functions CPython implements in C are builtins (types, reprs, no binding through a class, `__self__`, natives' module names), PEP 562 module `__getattr__`/`__dir__` and from-imports, int() via `__index__`/`__trunc__`, float() overflow, an unbound name with a method of that name, PEP 701 f-strings (passes under python3.12; 32 under 3.11) |
 | vm_audit108 | 224 | round 83: ast (the real parser's tree: dump of a corpus with positions, f-string parts, unparse round trips, literal_eval, visitors/transformers, compile of a tree, SyntaxErrors), tokenize/token (3.12 f-string tokens, detect_encoding, untokenize), symtable, dis/opcode (Nython's VM bytecode, the adaptive view on the VM), marshal bytes, pickletools.dis/optimize text, pydoc, pyclbr, tabnanny, py_compile, compileall, modulefinder, this, multi-line string lines; generated from CPython 3.12's values (`tools/gen_vm_audit108.py`; 206 under python3.12, 191 under 3.11) |
 | vm_audit112 | 135 | round 84 (part A): memoryview and the buffer protocol (PEP 3118/688) - views of bytes/bytearray/array/mmap/ctypes/memoryview/`__buffer__` classes, attributes, casts, N-dim shapes and strides, every native format, slicing and slice assignment, ==/hash, CPython's messages, exports blocking resizes (BufferError), bytes-like arguments everywhere (struct/zlib/bz2/lzma/binascii/hashlib/io/files/sockets/os/wave/sqlite3/pickle), readinto into views, ctypes from_buffer, bytes % args (PEP 461) (passes under python3.12; 132 under 3.11) |
 | vm_audit113 | 389 | round 84 (part B): unicodedata (every property over a sample, NormalizationTest-14.0.0, ucd_3_2_0, aliases and named sequences), str by the database (full case mapping, final sigma, casefold, title, the is* predicates, Unicode whitespace and line breaks, int/float/complex/Decimal of Unicode digits), PEP 3131 identifiers, re's Unicode classes, the CJK codecs (every one, every error handler, incremental, streams), utf-7, the single-byte code pages, idna's nameprep, email charsets, mbcs/oem/code_page_* on Windows (392 there, run under Wine); generated from python3.11's values (`tools/vm_audit113_spec.py`; the 380 shared checks pass under python3.11) |
@@ -1531,6 +1532,22 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
   raise, `__context__`; VM opcode `FIN_EXC_OF`); comprehension targets
   unpack strictly and may be starred (`_ny_star_iter`); the VM deletes a
   comprehension's targets unless something made inside it may read them.
+
+## Round 84: C-implemented functions as builtins, PEP 562, PEP 701 (see `HANDOFF.md` §0w2)
+
+- `include/NyBuiltinFns.hpp` (generated: `python3 tools/gen_builtin_fns.py >
+  include/NyBuiltinFns.hpp`) names, per module, the functions CPython
+  implements in C; when such a module has run the engines call the
+  prelude's `_ny_seal_cmodule`, which makes each plain function bound under
+  one of those names a builtin (`_ny_mark_builtin`: static, type
+  builtin_function_or_method). A natively implemented library function
+  needs no staticmethod wrapper any more.
+- A module's own `__getattr__`/`__dir__` (PEP 562) are honoured on both
+  engines; the installation's lib/ is searched before the importer's
+  ancestor directories; f-strings may nest their own quotes (PEP 701 - the
+  lexer copies replacement fields as written).
+- Interpreter: `knownName` counts only top-level functions and classes (a
+  method named like an unbound name made the read `undefined`).
 
 ## Round 84: ctypes structures by value everywhere, Windows gaps (see `HANDOFF.md` §0w1)
 

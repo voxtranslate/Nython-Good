@@ -5892,6 +5892,22 @@ Full detail in `HANDOFF.md` §0x4. New test: `vm_audit115` (611 checks; both eng
 | `import curses` failed | no ncurses binding | `src/builtins/nycurses.cpp`: terminfo, tparm, ncurses' screen model and update algorithm (hashmap/hardscroll/mvcur), input and mouse, SIGWINCH; `lib/_curses.ny`, `_curses_panel`, `lib/curses/` |
 | Interpreter: after `import curses.has_key`, `curses.has_key` was the function, not the submodule | `Object::set` never overwrites an existing name | the submodule is bound, as CPython (the VM already did) |
 
+## Round 84 — C-implemented functions as builtins, PEP 562, PEP 701, the gaps the round's agents found
+
+Full detail in `HANDOFF.md` §0w2. New test: `vm_audit117` (33 checks; both engines; python3.12, 32 under 3.11).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `class C: now = time.time` then `C().now()` passed the instance (operator.add, heapq.heappush ... alike); `type(time.time)` was staticmethod | CPython's C functions are Nython functions here, and functions bind | the functions CPython implements in C are made builtins when their module has run (`NyBuiltinFns.hpp`, `_ny_seal_cmodule`) |
+| `math.sqrt.__name__` was `math_sqrt`, `__module__` builtins; `sys.getrefcount` was `_ny_getrefcount` | natives named by their builtin tag | `nyrt::builtin_public`: the module's names, `__self__` the module |
+| A module's `__getattr__` / `__dir__` were never called (both engines) | no PEP 562 | read misses, method calls, from-imports and `__all__` ask it; `dir(m)` uses `__dir__` |
+| `int(obj)` with only `__index__` / `__trunc__` raised TypeError; `float(2**1100)` was inf | - | CPython's fallbacks; OverflowError "int too large to convert to float" |
+| "cannot import name 'x' from 'm'" had no location | - | " (file)" / " (unknown location)", as CPython |
+| A program run from inside another checkout imported that checkout's library modules (both engines) | the importer's ancestors (and their lib/) were searched before the installation's lib/ | the installation's lib/ first |
+| Interpreter: an unbound name read as `undefined` when any method or nested function had that name (a pdb check broke after an unrelated merge) | `knownName` counted every function value's name | only top-level functions and classes; hints never suggest the name itself |
+| `f"{", ".join(xs)}"`, `f"{d["k"]}"` were SyntaxErrors (both engines) | the lexer ended an f-string at its first matching quote | PEP 701: fields copied as written (nested strings, nested f-strings, comments, multi-line fields) |
+| `sys.modules` had no "builtins"; VM `math.floor` printed `<native>` | the prelude's `_ny_builtins_module` did not exist; an unnamed wrapper | added; the wrapper carries the native's tag |
+
 ## Round 84 — ctypes structures by value everywhere, and the Windows gaps round 83 left
 
 Full detail in `HANDOFF.md` §0w1. `vm_audit111` has 55 checks (both engines; python3; under Wine 64-bit without libffi).
