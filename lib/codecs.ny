@@ -38,8 +38,10 @@
 # it too, through the prelude's _ny_codec_encode/_ny_codec_decode).
 #
 # Not here: the other encodings package codecs (cp1251, shift_jis, the
-# CJK codecs, utf-7, bz2_codec, uu_codec...); idna is "basic": nameprep is
-# lower-casing (no Unicode normalization tables, no stringprep checks).
+# CJK codecs (round 84: lib/encodings/ and lib/_multibytecodec.ny, over
+# src/builtins/nycjk.cpp), bz2_codec, uu_codec...). utf-7 is native (round
+# 84), and so are mbcs/oem/code_page_* on Windows; idna's nameprep is RFC
+# 3491's (round 84: stringprep and unicodedata.ucd_3_2_0's NFKC).
 
 import sys
 
@@ -1215,6 +1217,32 @@ def _idna_split(s):
     return labels
 
 
+def _nameprep(label):
+    # RFC 3491 Nameprep (round 84; CPython's encodings.idna.nameprep): map
+    # (B.1 to nothing, B.2 case folding), NFKC in Unicode 3.2.0
+    # (unicodedata.ucd_3_2_0), the prohibited characters, the bidi rules
+    import stringprep
+    import unicodedata
+    var newlabel = []
+    for c in label:
+        if stringprep.in_table_b1(c):
+            continue
+        newlabel.append(stringprep.map_table_b2(c))
+    label = unicodedata.ucd_3_2_0.normalize("NFKC", "".join(newlabel))
+    for c in label:
+        if (stringprep.in_table_c12(c) or stringprep.in_table_c22(c) or stringprep.in_table_c3(c)
+                or stringprep.in_table_c4(c) or stringprep.in_table_c5(c) or stringprep.in_table_c6(c)
+                or stringprep.in_table_c7(c) or stringprep.in_table_c8(c) or stringprep.in_table_c9(c)):
+            raise UnicodeError("Invalid character %r" % c)
+    var RandAL = [stringprep.in_table_d1(x) for x in label]
+    if any(RandAL):
+        if any(stringprep.in_table_d2(x) for x in label):
+            raise UnicodeError("Violation of BIDI requirement 2")
+        if not RandAL[0] or not RandAL[-1]:
+            raise UnicodeError("Violation of BIDI requirement 3")
+    return label
+
+
 def _ToASCII(label):
     try:
         var b = label.encode("ascii")
@@ -1223,7 +1251,7 @@ def _ToASCII(label):
         raise UnicodeError("label empty or too long")
     except UnicodeEncodeError:
         pass
-    label = label.lower()
+    label = _nameprep(label)
     try:
         var b2 = label.encode("ascii")
         if 0 < len(b2) < 64:
@@ -1252,7 +1280,11 @@ def _ToUnicode(label):
         except UnicodeError:
             pure_ascii = False
     if not pure_ascii:
-        label = label.lower().encode("ascii")
+        label = _nameprep(label)
+        try:
+            label = label.encode("ascii")
+        except UnicodeError:
+            raise UnicodeError("Invalid character in IDN label")
     if not label[:4].lower() == _ace_prefix:
         return str(label, "ascii")
     var label1 = label[len(_ace_prefix):]
@@ -1612,6 +1644,110 @@ latin_1_encode = _enc_fn("latin-1")
 ascii_encode = _enc_fn("ascii")
 unicode_escape_encode = _enc_fn("unicode-escape")
 raw_unicode_escape_encode = _enc_fn("raw-unicode-escape")
+# (round 84) UTF-7 (RFC 2152), native: CPython's encoder (set O and
+# whitespace written directly) and its liberal decoder
+utf_7_encode = _enc_fn("utf-7")
+utf_7_decode = _dec_fn("utf-7")
+
+
+if sys.platform == "win32":
+    # (round 84) Windows' code pages: mbcs (CP_ACP), oem (CP_OEMCP) and any
+    # code page, through WideCharToMultiByte / MultiByteToWideChar (the
+    # _ny_codec native's "cp_encode" / "cp_decode"), with CPython's error
+    # positions and reasons; a handler registered with register_error runs
+    # here. They exist on Windows only, as in CPython.
+    def _cp_encode(cp, input, errors, what):
+        _check_str(input, what)
+        if errors is None:
+            errors = "strict"
+        if not isinstance(errors, str):
+            raise TypeError(what + "() argument 'errors' must be str, not " + type(errors).__name__)
+        if errors in _BUILTIN_HANDLERS:
+            return (_ny_codec("cp_encode", cp, input, errors, True, 0)[0], len(input))
+        var parts = []
+        var pos = 0
+        var n = len(input)
+        while True:
+            var r = _ny_codec("cp_encode", cp, input, "__ny_stop__", True, pos)
+            parts.append(r[0])
+            if r[2] is None:
+                break
+            var e = r[2]
+            var exc = UnicodeEncodeError(e[3], input, e[0], e[1], e[2])
+            var res = lookup_error(errors)(exc)
+            if not isinstance(res, tuple) or len(res) != 2:
+                raise TypeError("encoding error handler must return (str/bytes, int) tuple")
+            var rep = res[0]
+            if isinstance(rep, str):
+                for ch in rep:
+                    if ord(ch) > 127:
+                        raise UnicodeEncodeError(e[3], input, e[0], e[1], "unable to encode error handler result to ASCII")
+                parts.append(rep.encode("ascii"))
+            elif isinstance(rep, (bytes, bytearray)):
+                parts.append(bytes(rep))
+            else:
+                raise TypeError("encoding error handler must return (str/bytes, int) tuple")
+            var newpos = res[1]
+            if newpos < 0:
+                newpos += n
+            if not 0 <= newpos <= n:
+                raise IndexError("position " + str(res[1]) + " from error handler out of bounds")
+            pos = newpos
+            if pos >= n:
+                break
+        return (b"".join(parts), n)
+
+    def _cp_decode(cp, data, errors, final):
+        data = _as_bytes(data, "decode")
+        if errors is None:
+            errors = "strict"
+        if errors in _BUILTIN_HANDLERS:
+            var r = _ny_codec("cp_decode", cp, data, errors, final, 0)
+            return (r[0], r[1])
+        var parts = []
+        var pos = 0
+        var n = len(data)
+        var consumed = 0
+        while True:
+            var r = _ny_codec("cp_decode", cp, data, "__ny_stop__", final, pos)
+            parts.append(r[0])
+            if r[2] is None:
+                consumed = r[1]
+                break
+            var e = r[2]
+            var exc = UnicodeDecodeError(e[3], data, e[0], e[1], e[2])
+            var res = lookup_error(errors)(exc)
+            if not isinstance(res, tuple) or len(res) != 2 or not isinstance(res[0], str):
+                raise TypeError("decoding error handler must return (str, int) tuple")
+            parts.append(res[0])
+            var newpos = res[1]
+            if newpos < 0:
+                newpos += n
+            if not 0 <= newpos <= n:
+                raise IndexError("position " + str(res[1]) + " from error handler out of bounds")
+            pos = newpos
+            if pos >= n:
+                consumed = n
+                break
+        return ("".join(parts), consumed)
+
+    def mbcs_encode(str, errors=None):
+        return _cp_encode(0, str, errors, "mbcs_encode")
+
+    def mbcs_decode(data, errors=None, final=False):
+        return _cp_decode(0, data, errors, final)
+
+    def oem_encode(str, errors=None):
+        return _cp_encode(1, str, errors, "oem_encode")
+
+    def oem_decode(data, errors=None, final=False):
+        return _cp_decode(1, data, errors, final)
+
+    def code_page_encode(code_page, str, errors=None):
+        return _cp_encode(code_page, str, errors, "code_page_encode")
+
+    def code_page_decode(code_page, data, errors=None, final=False):
+        return _cp_decode(code_page, data, errors, final)
 
 
 def latin_1_decode(data, errors=None):

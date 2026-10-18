@@ -7,6 +7,8 @@
 #include "PrettyPrinter.hpp"
 #include "DynamicLang.hpp"
 #include "NyUniNames.hpp"
+#include "NyUniData.hpp"   // PEP 3131 identifiers (round 84)
+#include <cstdio>
 #include <sstream>
 // ^ explicit: libstdc++ supplies these transitively, MinGW does not.
 
@@ -1929,6 +1931,47 @@ void Lexer::consume_ident() {
             tokens.push_back(this->token);
             char q = source.read_char();
             consume_raw_string(q);
+            return;
+        }
+    }
+    // round 84: PEP 3131 - an identifier with non-ASCII characters is
+    // XID_Start XID_Continue* and is NFKC-normalized (`ﬁ = 1` binds `fi`,
+    // `ℌ` is `H`), as CPython's tokenizer and parser do. In a Python-mode
+    // file (.py, `# nython: python` / `module`) any other character is
+    // CPython's SyntaxError ("invalid character '€' (U+20AC)"); Nython
+    // source keeps its other identifiers (emoji ...) as they are written.
+    bool ascii_ident = true;
+    for (char ch : ident) if ((unsigned char)ch >= 0x80) { ascii_ident = false; break; }
+    if (!ascii_ident) {
+        bool valid = true;
+        uint32_t bad = 0;
+        size_t k = 0;
+        bool first = true;
+        while (k < ident.size()) {
+            unsigned char b0 = (unsigned char)ident[k];
+            size_t len = b0 < 0x80 ? 1 : (b0 & 0xE0) == 0xC0 ? 2 : (b0 & 0xF0) == 0xE0 ? 3 : 4;
+            if (k + len > ident.size()) len = 1;
+            uint32_t cp = len == 1 ? b0 : len == 2 ? (b0 & 0x1Fu) : len == 3 ? (b0 & 0x0Fu) : (b0 & 0x07u);
+            for (size_t j = 1; j < len; j++) cp = (cp << 6) | ((unsigned char)ident[k + j] & 0x3Fu);
+            k += len;
+            bool ok = cp == '_' || cp == '$' || (first ? nyucd::is_xid_start(cp) : nyucd::is_xid_continue(cp));
+            if (!ok) { valid = false; bad = cp; break; }
+            first = false;
+        }
+        if (valid) ident = nyucd::normalize_utf8(nyucd::NFKC, ident);
+        else if (python_strings) {
+            char hex[16];
+            std::snprintf(hex, sizeof hex, "%04X", (unsigned)bad);
+            std::string ch;
+            if (bad < 0x80) ch += (char)bad;
+            else if (bad < 0x800) { ch += (char)(0xC0 | (bad >> 6)); ch += (char)(0x80 | (bad & 0x3F)); }
+            else if (bad < 0x10000) { ch += (char)(0xE0 | (bad >> 12)); ch += (char)(0x80 | ((bad >> 6) & 0x3F)); ch += (char)(0x80 | (bad & 0x3F)); }
+            else { ch += (char)(0xF0 | (bad >> 18)); ch += (char)(0x80 | ((bad >> 12) & 0x3F)); ch += (char)(0x80 | ((bad >> 6) & 0x3F)); ch += (char)(0x80 | (bad & 0x3F)); }
+            this->token.value = nyucd::is_printable(bad) ? "invalid character '" + ch + "' (U+" + hex + ")"
+                                                         : std::string("invalid non-printable character U+") + hex;
+            errors++;
+            make_token(TokenType::UnterminatedStringError,TokenKind::Error, TokenClass::Invalid);
+            add_info_item(LexerInfoLevel::Error,token);
             return;
         }
     }

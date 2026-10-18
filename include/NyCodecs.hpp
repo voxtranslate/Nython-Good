@@ -4,7 +4,10 @@
 // (through the _ny_codec native, src/builtins/nycodecs.cpp).
 //
 // Codecs: utf-8, utf-8-sig, utf-16 / -le / -be, utf-32 / -le / -be, latin-1,
-// ascii, cp437, cp850, cp1252, mac-roman, unicode_escape, raw_unicode_escape
+// ascii, cp437, cp850, cp1252, mac-roman, unicode_escape, raw_unicode_escape,
+// utf-7 (round 84), and the CJK codecs (round 84: include/NyCJK.hpp,
+// src/builtins/nycjk.cpp - for str.encode/bytes.decode with a builtin
+// handler; lib/codecs.ny reaches them through lib/encodings/)
 // - with CPython's names and aliases (encodings.aliases), its error ranges,
 // reasons and messages ("'charmap' codec can't encode characters in
 // position 1-2: character maps to <undefined>"), and every builtin error
@@ -28,11 +31,12 @@
 #include "NyStr.hpp"
 #include "NyBigInt.hpp"
 #include "NyUniNames.hpp"
+#include "NyCJK.hpp"   // the CJK codecs (round 84)
 
 namespace nypy {
 
 enum class Cx : int { UTF8, UTF8SIG, UTF16, UTF16LE, UTF16BE, UTF32, UTF32LE, UTF32BE, LATIN1, ASCII,
-                      CP437, CP850, CP1252, MACROMAN, UNIESC, RAWUNIESC };
+                      CP437, CP850, CP1252, MACROMAN, UNIESC, RAWUNIESC, UTF7 /* round 84 */ };
 
 // encodings.normalize_encoding + lower case: runs of characters other than
 // letters, digits and '.' become one '_'
@@ -83,6 +87,8 @@ inline bool codec_find(const std::string& encoding, Cx& out) {
         {"cp1252", Cx::CP1252}, {"1252", Cx::CP1252}, {"windows_1252", Cx::CP1252},
         {"mac_roman", Cx::MACROMAN}, {"macintosh", Cx::MACROMAN}, {"macroman", Cx::MACROMAN},
         {"unicode_escape", Cx::UNIESC}, {"raw_unicode_escape", Cx::RAWUNIESC},
+        {"utf_7", Cx::UTF7}, {"u7", Cx::UTF7}, {"utf7", Cx::UTF7}, {"unicode_1_1_utf_7", Cx::UTF7},
+        {"csunicode11utf7", Cx::UTF7},
     };
     for (auto& a : t) if (n == a.n) { out = a.c; return true; }
     return false;
@@ -106,6 +112,7 @@ inline const char* cx_name(Cx c) {
         case Cx::CP1252: return "cp1252";
         case Cx::MACROMAN: return "mac-roman";
         case Cx::UNIESC: return "unicode-escape";
+        case Cx::UTF7: return "utf-7";
         default: return "raw-unicode-escape";
     }
 }
@@ -118,6 +125,7 @@ inline const char* cx_encname(Cx c) {
         case Cx::CP437: case Cx::CP850: case Cx::CP1252: case Cx::MACROMAN: return "charmap";
         case Cx::UNIESC: return "unicodeescape";
         case Cx::RAWUNIESC: return "rawunicodeescape";
+        case Cx::UTF7: return "utf7";
         default: return cx_name(c);
     }
 }
@@ -141,7 +149,11 @@ inline bool eh_find(const std::string& e, EH& out) {
 // _ny_codec_decode instead.
 inline bool codec_needs_python(const std::string& encoding, const std::string& errors) {
     Cx c; EH e;
-    return !codec_find(encoding, c) || !eh_find(errors, e);
+    if (codec_find(encoding, c)) return !eh_find(errors, e);
+    // round 84: the CJK codecs (src/builtins/nycjk.cpp) are native too with
+    // a builtin handler; a registered one runs in lib/_multibytecodec.ny
+    if (!nycjk::codec_of(encoding).empty()) return !eh_find(errors, e) || e == EH::Stop;
+    return true;
 }
 
 // The first error the "stop" handler met.
@@ -415,8 +427,102 @@ struct CxDecoder {
                 return n;
             }
             case Cx::UNIESC: return run_unicode_escape(i, false);
+            case Cx::UTF7: return run_utf7(i);
             default: return run_unicode_escape(i, true);
         }
+    }
+
+    // UTF-7 (round 84): CPython's PyUnicode_DecodeUTF7Stateful - decoded
+    // liberally; final false leaves an unfinished shift sequence (from its
+    // '+') unconsumed and its output undone. Every error is met outside a
+    // shift sequence, so resuming after a handler starts afresh.
+    static bool b64(unsigned char c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '/';
+    }
+    static unsigned from_b64(unsigned char c) {
+        return (c >= 'A' && c <= 'Z') ? c - 'A' : (c >= 'a' && c <= 'z') ? c - 'a' + 26
+             : (c >= '0' && c <= '9') ? c - '0' + 52 : c == '+' ? 62 : 63;
+    }
+    size_t run_utf7(size_t i) {
+        size_t n = s.size();
+        bool inShift = false;
+        size_t shiftOutStart = 0, startinpos = 0;
+        unsigned base64bits = 0;
+        unsigned long base64buffer = 0;
+        uint32_t surrogate = 0;
+        while (i < n) {
+            unsigned char ch = (unsigned char)s[i];
+            const char* errmsg = nullptr;
+            if (inShift) {
+                if (b64(ch)) {
+                    base64buffer = (base64buffer << 6) | from_b64(ch);
+                    base64bits += 6;
+                    i++;
+                    if (base64bits >= 16) {
+                        uint32_t outCh = (uint32_t)(base64buffer >> (base64bits - 16)) & 0xFFFF;
+                        base64bits -= 16;
+                        base64buffer &= (1UL << base64bits) - 1;
+                        if (surrogate) {
+                            if (outCh >= 0xDC00 && outCh <= 0xDFFF) {
+                                u8_encode(0x10000 + ((surrogate - 0xD800) << 10) + (outCh - 0xDC00), out);
+                                surrogate = 0;
+                                continue;
+                            }
+                            u8_encode(surrogate, out);
+                            surrogate = 0;
+                        }
+                        if (outCh >= 0xD800 && outCh <= 0xDBFF) surrogate = outCh;
+                        else u8_encode(outCh, out);
+                    }
+                    continue;
+                }
+                inShift = false;   // leaving a base-64 section
+                if (base64bits > 0) {
+                    if (base64bits >= 6) { i++; errmsg = "partial character in shift sequence"; }
+                    else if (base64buffer != 0) { i++; errmsg = "non-zero padding bits in shift sequence"; }
+                }
+                if (!errmsg) {
+                    if (surrogate && ch <= 127 && ch != '+') u8_encode(surrogate, out);
+                    surrogate = 0;
+                    if (ch == '-') i++;   // '-' is absorbed, other terminators kept
+                    continue;
+                }
+            } else if (ch == '+') {
+                startinpos = i;
+                i++;
+                if (i < n && s[i] == '-') { i++; out += '+'; continue; }
+                if (i < n && !b64((unsigned char)s[i])) { i++; errmsg = "ill-formed sequence"; }
+                else {
+                    inShift = true;
+                    surrogate = 0;
+                    shiftOutStart = out.size();
+                    base64bits = 0;
+                    base64buffer = 0;
+                    continue;
+                }
+            } else if (ch <= 127) {
+                out += (char)ch;
+                i++;
+                continue;
+            } else {
+                startinpos = i;
+                i++;
+                errmsg = "unexpected special character";
+            }
+            size_t next = i;
+            if (!bad(startinpos, i, errmsg, next)) return startinpos;
+            i = next;
+        }
+        if (inShift && final) {
+            if (surrogate || base64bits >= 6 || (base64bits > 0 && base64buffer != 0)) {
+                size_t next = n;
+                if (!bad(startinpos, n, "unterminated shift sequence", next)) return startinpos;
+                if (next < n) return run_utf7(next);
+            }
+            return n;
+        }
+        if (inShift) { out.resize(shiftOutStart); return startinpos; }
+        return n;
     }
 
     // utf8_unit of NyBytes.hpp: the length of the valid sequence at i, or
@@ -717,8 +823,63 @@ struct CxEncoder {
     }
 };
 
+// UTF-7 (round 84), CPython's _PyUnicode_EncodeUTF7(str, 0, 0): set O and
+// whitespace written directly, everything else in base 64 (lone
+// surrogates too: the encoder never fails)
+inline std::string utf7_encode(const std::vector<uint32_t>& cps) {
+    static const char cat[128] = {
+        3, 3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 3, 3, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+        2, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0,
+        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 3, 1, 1, 1,
+        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 3, 3};
+    static const char* B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    auto direct = [&](uint32_t c) { return c < 128 && c > 0 && (cat[c] == 0 || cat[c] == 2 || cat[c] == 1); };
+    auto isb64 = [](uint32_t c) {
+        return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '+' || c == '/';
+    };
+    std::string out;
+    bool inShift = false;
+    unsigned bits = 0;
+    unsigned long buf = 0;
+    auto put16 = [&](uint32_t u) {
+        bits += 16;
+        buf = (buf << 16) | u;
+        while (bits >= 6) { out += B64[(buf >> (bits - 6)) & 0x3F]; bits -= 6; }
+    };
+    for (uint32_t ch : cps) {
+        if (inShift) {
+            if (direct(ch)) {
+                if (bits) { out += B64[(buf << (6 - bits)) & 0x3F]; buf = 0; bits = 0; }
+                inShift = false;
+                if (isb64(ch) || ch == '-') out += '-';
+                out += (char)ch;
+                continue;
+            }
+        } else {
+            if (ch == '+') { out += "+-"; continue; }
+            if (direct(ch)) { out += (char)ch; continue; }
+            out += '+';
+            inShift = true;
+        }
+        if (ch >= 0x10000) {
+            uint32_t v = ch - 0x10000;
+            put16(0xD800 + (v >> 10));
+            ch = 0xDC00 + (v & 0x3FF);
+        }
+        put16(ch);
+    }
+    if (bits) out += B64[(buf << (6 - bits)) & 0x3F];
+    if (inShift) out += '-';
+    return out;
+}
+
 // str -> bytes. consumed: characters encoded (for "stop").
 inline std::string codec_encode(Cx c, const std::string& s, EH eh, size_t start, size_t& consumed, CxErr& err) {
+    if (c == Cx::UTF7) {   // (round 84; the whole str at once - it never stops)
+        std::vector<uint32_t> cps = cx_codepoints(s);
+        consumed = cps.size();
+        return start == 0 ? utf7_encode(cps) : utf7_encode(std::vector<uint32_t>(cps.begin() + (long)std::min(start, cps.size()), cps.end()));
+    }
     CxEncoder e(c, eh, s, err);
     consumed = e.run(start);
     return std::move(e.out);
@@ -756,7 +917,11 @@ std::string cx_wrapped(const std::string& encoding, bool decoding, F f) {
 inline std::string codec_decode_all(const std::string& s, const std::string& encoding, const std::string& errors) {
     Cx c;
     EH e;
-    if (!codec_find(encoding, c)) raise("LookupError", "unknown encoding: " + encoding);
+    if (!codec_find(encoding, c)) {
+        std::string cjk = nycjk::codec_of(encoding);   // (round 84)
+        if (cjk.empty()) raise("LookupError", "unknown encoding: " + encoding);
+        return cx_wrapped(encoding, true, [&] { return nycjk::decode_all(cjk, s, errors); });
+    }
     if (!eh_find(errors, e) || e == EH::Stop) raise("LookupError", "unknown error handler name '" + errors + "'");
     if (c == Cx::UTF8 && is_ascii(s)) return s;
     return cx_wrapped(encoding, true, [&] {
@@ -768,7 +933,11 @@ inline std::string codec_decode_all(const std::string& s, const std::string& enc
 inline std::string codec_encode_all(const std::string& s, const std::string& encoding, const std::string& errors) {
     Cx c;
     EH e;
-    if (!codec_find(encoding, c)) raise("LookupError", "unknown encoding: " + encoding);
+    if (!codec_find(encoding, c)) {
+        std::string cjk = nycjk::codec_of(encoding);   // (round 84)
+        if (cjk.empty()) raise("LookupError", "unknown encoding: " + encoding);
+        return cx_wrapped(encoding, false, [&] { return nycjk::encode_all(cjk, s, errors); });
+    }
     if (!eh_find(errors, e) || e == EH::Stop) raise("LookupError", "unknown error handler name '" + errors + "'");
     if (c == Cx::UTF8 && !cx_has_surrogate(s)) return s;
     if ((c == Cx::ASCII || c == Cx::LATIN1) && is_ascii(s)) return s;

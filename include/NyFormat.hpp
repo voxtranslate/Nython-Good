@@ -531,6 +531,25 @@ inline double round_ndigits(double x, int64_t nd) {
 }
 
 // ── int() / float() parsing ─────────────────────────────────────────────
+// (round 84) What int(), float() and complex() read of a str, as CPython's
+// _PyUnicode_TransformDecimalAndSpaceToASCII: every Unicode whitespace
+// character a space, every decimal digit (category Nd: "٣", "३", "３") its
+// ASCII digit, and the first other non-ASCII character a '?' that ends the
+// text (so it cannot parse). Bytes are parsed as they are.
+inline std::string uni_to_ascii(const std::string& s) {
+    if (is_ascii(s)) return s;
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size();) {
+        uint32_t c = u8_decode(s, i);
+        if (c < 127) { out += (char)c; continue; }
+        if (nyucd::is_space(c)) { out += ' '; continue; }
+        int d = nyucd::to_decimal(c);
+        if (d < 0) { out += '?'; break; }
+        out += (char)('0' + d);
+    }
+    return out;
+}
 // Python int(str, base): surrounding whitespace, sign, optional 0x/0o/0b
 // prefix (base 0 or matching base), single underscores between digits.
 inline bool parse_int_str(const std::string& in, int base, BigInt& out) {

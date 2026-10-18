@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include "NyBigInt.hpp"
+#include "NyUniData.hpp"
 #include <cstdlib>
 #include <cstdio>
 #include <cmath>
@@ -123,177 +124,168 @@ inline bool seq_index(int64_t len, int64_t& i) {
     return i >= 0 && i < len;
 }
 
-// ── character classes (ASCII exact, common Unicode letters approximated) ─
-inline bool cp_is_space(uint32_t c) {
-    return c == ' ' || (c >= 9 && c <= 13) || (c >= 0x1C && c <= 0x1F) || c == 0x85 || c == 0xA0 ||
-           c == 0x1680 || (c >= 0x2000 && c <= 0x200A) || c == 0x2028 || c == 0x2029 || c == 0x202F ||
-           c == 0x205F || c == 0x3000;
-}
-inline bool cp_is_digit(uint32_t c) { return c >= '0' && c <= '9'; }
-inline uint32_t cp_upper(uint32_t c) {
-    if (c < 0x80) return (c >= 'a' && c <= 'z') ? c - 32 : c;
-    if ((c >= 0xE0 && c <= 0xFE && c != 0xF7)) return c - 0x20;
-    if (c == 0xFF) return 0x178;
-    if (c == 0xB5) return 0x39C;
-    if (c >= 0x100 && c <= 0x137) return (c & 1) ? c - 1 : c;
-    if (c >= 0x139 && c <= 0x148) return (c & 1) ? c : c - 1;
-    if (c >= 0x14A && c <= 0x177) return (c & 1) ? c - 1 : c;
-    if (c >= 0x179 && c <= 0x17E) return (c & 1) ? c : c - 1;
-    if (c == 0x17F) return 'S';
-    if (c >= 0x3B1 && c <= 0x3C9 && c != 0x3C2) return c - 0x20;
-    if (c == 0x3C2) return 0x3A3;
-    if (c >= 0x3AC && c <= 0x3AF) { static const uint32_t m[] = {0x386, 0x388, 0x389, 0x38A}; return m[c - 0x3AC]; }
-    if (c >= 0x430 && c <= 0x44F) return c - 0x20;
-    if (c >= 0x450 && c <= 0x45F) return c - 0x50;
-    if (c >= 0x460 && c <= 0x4FF) return (c & 1) ? c - 1 : c;
-    return c;
-}
-inline uint32_t cp_lower(uint32_t c) {
-    if (c < 0x80) return (c >= 'A' && c <= 'Z') ? c + 32 : c;
-    if ((c >= 0xC0 && c <= 0xDE && c != 0xD7)) return c + 0x20;
-    if (c == 0x178) return 0xFF;
-    if (c >= 0x100 && c <= 0x137) return (c & 1) ? c : c + 1;
-    if (c >= 0x139 && c <= 0x148) return (c & 1) ? c + 1 : c;
-    if (c >= 0x14A && c <= 0x177) return (c & 1) ? c : c + 1;
-    if (c >= 0x179 && c <= 0x17E) return (c & 1) ? c + 1 : c;
-    if (c >= 0x391 && c <= 0x3A9 && c != 0x3A2) return c + 0x20;
-    if (c == 0x386) return 0x3AC;
-    if (c >= 0x388 && c <= 0x38A) return c + 0x25;
-    if (c >= 0x410 && c <= 0x42F) return c + 0x20;
-    if (c >= 0x400 && c <= 0x40F) return c + 0x50;
-    if (c >= 0x460 && c <= 0x4FF) return (c & 1) ? c : c + 1;
-    return c;
-}
-inline bool cp_is_upper(uint32_t c) { return cp_lower(c) != c; }
-inline bool cp_is_lower(uint32_t c) { return cp_upper(c) != c || c == 0xDF || c == 0x138; }
-inline bool cp_is_cased(uint32_t c) { return cp_is_upper(c) || cp_is_lower(c); }
-inline bool cp_is_alpha(uint32_t c) {
-    if (c < 0x80) return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
-    if (c == 0xAA || c == 0xB5 || c == 0xBA) return true;
-    if (c >= 0xC0 && c <= 0x24F) return c != 0xD7 && c != 0xF7;
-    if (c >= 0x250 && c <= 0x2C1) return true;
-    if (c >= 0x370 && c <= 0x3FF) return c != 0x375 && c != 0x37E && c != 0x384 && c != 0x385 && c != 0x387;
-    if (c >= 0x400 && c <= 0x481) return true;
-    if (c >= 0x48A && c <= 0x52F) return true;
-    if (c >= 0x531 && c <= 0x556) return true;
-    if (c >= 0x561 && c <= 0x587) return true;
-    if (c >= 0x5D0 && c <= 0x5EA) return true;
-    if (c >= 0x620 && c <= 0x64A) return true;
-    if (c >= 0x904 && c <= 0x939) return true;
-    if (c >= 0xE01 && c <= 0xE30) return true;
-    if (c >= 0x1E00 && c <= 0x1FBC) return true;
-    if (c >= 0x3041 && c <= 0x3096) return true;
-    if (c >= 0x30A1 && c <= 0x30FA) return true;
-    if (c >= 0x3400 && c <= 0x4DBF) return true;
-    if (c >= 0x4E00 && c <= 0x9FFF) return true;
-    if (c >= 0xAC00 && c <= 0xD7A3) return true;
-    if (c >= 0xF900 && c <= 0xFAFF) return true;
-    return false;
-}
-inline bool cp_is_printable(uint32_t c) {
-    if (c < 0x20 || c == 0x7F) return false;
-    if (c >= 0x80 && c <= 0xA0) return false;
-    if (c == 0xAD) return false;
-    if (c == 0x2028 || c == 0x2029 || (c >= 0x2000 && c <= 0x200F) || (c >= 0x202A && c <= 0x202F) || c == 0x205F || c == 0x3000 || c == 0xFEFF) return false;
-    if (c >= 0xD800 && c <= 0xDFFF) return false;
-    return true;
-}
+// ── character classes: the Unicode database (round 84) ─────────────────
+// Every class and case mapping is CPython's (Objects/unicodectype.c) over
+// Unicode 14.0.0 - include/NyUniData.hpp; ASCII is answered inline first.
+inline bool cp_is_space(uint32_t c) { return nyucd::is_space(c); }
+inline bool cp_is_digit(uint32_t c) { return nyucd::is_digit(c); }
+inline uint32_t cp_upper(uint32_t c) { return nyucd::to_upper(c); }
+inline uint32_t cp_lower(uint32_t c) { return nyucd::to_lower(c); }
+inline bool cp_is_upper(uint32_t c) { return nyucd::is_upper(c); }
+inline bool cp_is_lower(uint32_t c) { return nyucd::is_lower(c); }
+inline bool cp_is_cased(uint32_t c) { return nyucd::is_cased(c); }
+inline bool cp_is_alpha(uint32_t c) { return nyucd::is_alpha(c); }
+inline bool cp_is_printable(uint32_t c) { return nyucd::is_printable(c); }
 
 // ── case mapping ────────────────────────────────────────────────────────
+// The full mappings (SpecialCasing's "ß" -> "SS", "İ" -> "i̇", "ŉ" -> "ʼN"),
+// and lower-casing's one context: a capital sigma is final (ς) after a
+// cased letter and case-ignorable ones, not followed by more of them and a
+// cased letter (CPython's handle_capital_sigma).
+inline uint32_t sigma_at(const std::vector<uint32_t>& cps, size_t i) {
+    int64_t j = (int64_t)i - 1;
+    uint32_t c = 0;
+    for (; j >= 0; j--) { c = cps[(size_t)j]; if (!nyucd::is_case_ignorable(c)) break; }
+    bool fin = j >= 0 && nyucd::is_cased(c);
+    if (fin) {
+        size_t k = i + 1;
+        for (; k < cps.size(); k++) { c = cps[k]; if (!nyucd::is_case_ignorable(c)) break; }
+        fin = k == cps.size() || !nyucd::is_cased(c);
+    }
+    return fin ? 0x3C2 : 0x3C3;
+}
+inline int lower_at(const std::vector<uint32_t>& cps, size_t i, uint32_t* m) {
+    if (cps[i] == 0x3A3) { m[0] = sigma_at(cps, i); return 1; }
+    return nyucd::to_lower_full(cps[i], m);
+}
+inline void put_cps(std::string& r, const uint32_t* m, int n) { for (int k = 0; k < n; k++) u8_encode(m[k], r); }
 inline std::string str_upper(const std::string& s) {
     std::string r; r.reserve(s.size());
     if (is_ascii(s)) { for (char c : s) r += (c >= 'a' && c <= 'z') ? (char)(c - 32) : c; return r; }
+    uint32_t m[3];
     for (size_t i = 0; i < s.size();) {
-        uint32_t c = u8_decode(s, i);
-        if (c == 0xDF) { r += "SS"; continue; }
-        u8_encode(cp_upper(c), r);
+        unsigned char b = (unsigned char)s[i];
+        if (b < 0x80) { r += (b >= 'a' && b <= 'z') ? (char)(b - 32) : (char)b; i++; continue; }
+        put_cps(r, m, nyucd::to_upper_full(u8_decode(s, i), m));
     }
     return r;
 }
 inline std::string str_lower(const std::string& s) {
     std::string r; r.reserve(s.size());
     if (is_ascii(s)) { for (char c : s) r += (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c; return r; }
-    for (size_t i = 0; i < s.size();) u8_encode(cp_lower(u8_decode(s, i)), r);
+    auto cps = u8_codepoints(s);
+    uint32_t m[3];
+    for (size_t i = 0; i < cps.size(); i++) {
+        uint32_t c = cps[i];
+        if (c < 0x80) { r += (c >= 'A' && c <= 'Z') ? (char)(c + 32) : (char)c; continue; }
+        put_cps(r, m, lower_at(cps, i, m));
+    }
     return r;
 }
 inline std::string str_casefold(const std::string& s) {
-    std::string r;
-    for (size_t i = 0; i < s.size();) { uint32_t c = u8_decode(s, i); if (c == 0xDF) r += "ss"; else u8_encode(cp_lower(c), r); }
+    if (is_ascii(s)) return str_lower(s);
+    std::string r; r.reserve(s.size());
+    uint32_t m[3];
+    for (size_t i = 0; i < s.size();) put_cps(r, m, nyucd::to_folded_full(u8_decode(s, i), m));
     return r;
 }
 inline std::string str_swapcase(const std::string& s) {
-    std::string r;
-    for (size_t i = 0; i < s.size();) {
-        uint32_t c = u8_decode(s, i);
-        if (c == 0xDF) { r += "SS"; continue; }
-        if (cp_is_upper(c)) u8_encode(cp_lower(c), r);
-        else if (cp_is_lower(c)) u8_encode(cp_upper(c), r);
+    std::string r; r.reserve(s.size());
+    auto cps = u8_codepoints(s);
+    uint32_t m[3];
+    for (size_t i = 0; i < cps.size(); i++) {
+        uint32_t c = cps[i];
+        if (nyucd::is_upper(c)) put_cps(r, m, lower_at(cps, i, m));
+        else if (nyucd::is_lower(c)) put_cps(r, m, nyucd::to_upper_full(c, m));
         else u8_encode(c, r);
     }
     return r;
 }
 inline std::string str_capitalize(const std::string& s) {
-    std::string r; bool first = true;
-    for (size_t i = 0; i < s.size();) {
-        uint32_t c = u8_decode(s, i);
-        if (first) { if (c == 0xDF) r += "Ss"; else u8_encode(cp_upper(c), r); first = false; }
-        else u8_encode(cp_lower(c), r);
-    }
+    // (the first character title-cased, as CPython 3.8+)
+    std::string r; r.reserve(s.size());
+    auto cps = u8_codepoints(s);
+    uint32_t m[3];
+    for (size_t i = 0; i < cps.size(); i++)
+        put_cps(r, m, i == 0 ? nyucd::to_title_full(cps[i], m) : lower_at(cps, i, m));
     return r;
 }
 inline std::string str_title(const std::string& s) {
-    std::string r; bool prev_cased = false;
-    for (size_t i = 0; i < s.size();) {
-        uint32_t c = u8_decode(s, i);
-        bool cased = cp_is_cased(c);
-        if (cased) { if (prev_cased) u8_encode(cp_lower(c), r); else if (c == 0xDF) r += "Ss"; else u8_encode(cp_upper(c), r); }
-        else u8_encode(c, r);
-        prev_cased = cased;
+    std::string r; r.reserve(s.size());
+    auto cps = u8_codepoints(s);
+    uint32_t m[3];
+    bool prev_cased = false;
+    for (size_t i = 0; i < cps.size(); i++) {
+        uint32_t c = cps[i];
+        put_cps(r, m, prev_cased ? lower_at(cps, i, m) : nyucd::to_title_full(c, m));
+        prev_cased = nyucd::is_cased(c);
     }
     return r;
 }
 
-// ── predicates ──────────────────────────────────────────────────────────
+// ── predicates (CPython's unicode_is*_impl) ─────────────────────────────
 template<class F> inline bool all_cps(const std::string& s, F f) {
     if (s.empty()) return false;
-    for (size_t i = 0; i < s.size();) if (!f(u8_decode(s, i))) return false;
+    for (size_t i = 0; i < s.size();) {
+        unsigned char b = (unsigned char)s[i];
+        if (b < 0x80) { if (!f((uint32_t)b)) return false; i++; continue; }
+        if (!f(u8_decode(s, i))) return false;
+    }
     return true;
 }
-inline bool str_isdigit(const std::string& s) { return all_cps(s, cp_is_digit); }
-inline bool str_isalpha(const std::string& s) { return all_cps(s, cp_is_alpha); }
-inline bool str_isalnum(const std::string& s) { return all_cps(s, [](uint32_t c) { return cp_is_alpha(c) || cp_is_digit(c); }); }
-inline bool str_isspace(const std::string& s) { return all_cps(s, cp_is_space); }
+inline bool str_isdigit(const std::string& s) { return all_cps(s, nyucd::is_digit); }
+inline bool str_isdecimal(const std::string& s) { return all_cps(s, nyucd::is_decimal); }
+inline bool str_isnumeric(const std::string& s) { return all_cps(s, nyucd::is_numeric); }
+inline bool str_isalpha(const std::string& s) { return all_cps(s, nyucd::is_alpha); }
+inline bool str_isalnum(const std::string& s) { return all_cps(s, nyucd::is_alnum); }
+inline bool str_isspace(const std::string& s) { return all_cps(s, nyucd::is_space); }
 inline bool str_isascii(const std::string& s) { return is_ascii(s); }
 inline bool str_isprintable(const std::string& s) {
-    for (size_t i = 0; i < s.size();) if (!cp_is_printable(u8_decode(s, i))) return false;
+    for (size_t i = 0; i < s.size();) if (!nyucd::is_printable(u8_decode(s, i))) return false;
     return true;
 }
 inline bool str_isupper(const std::string& s) {
+    if (s.empty()) return false;
     bool cased = false;
-    for (size_t i = 0; i < s.size();) { uint32_t c = u8_decode(s, i); if (cp_is_lower(c)) return false; if (cp_is_upper(c)) cased = true; }
+    size_t n = 0;
+    for (size_t i = 0; i < s.size(); n++) {
+        uint32_t c = u8_decode(s, i);
+        if (n == 0 && i == s.size()) return nyucd::is_upper(c);   // one character
+        if (nyucd::is_lower(c) || nyucd::is_title(c)) return false;
+        if (nyucd::is_upper(c)) cased = true;
+    }
     return cased;
 }
 inline bool str_islower(const std::string& s) {
+    if (s.empty()) return false;
     bool cased = false;
-    for (size_t i = 0; i < s.size();) { uint32_t c = u8_decode(s, i); if (cp_is_upper(c)) return false; if (cp_is_lower(c)) cased = true; }
+    size_t n = 0;
+    for (size_t i = 0; i < s.size(); n++) {
+        uint32_t c = u8_decode(s, i);
+        if (n == 0 && i == s.size()) return nyucd::is_lower(c);
+        if (nyucd::is_upper(c) || nyucd::is_title(c)) return false;
+        if (nyucd::is_lower(c)) cased = true;
+    }
     return cased;
 }
 inline bool str_istitle(const std::string& s) {
     bool cased = false, prev_cased = false;
     for (size_t i = 0; i < s.size();) {
         uint32_t c = u8_decode(s, i);
-        if (cp_is_upper(c)) { if (prev_cased) return false; prev_cased = true; cased = true; }
-        else if (cp_is_lower(c)) { if (!prev_cased) return false; prev_cased = true; cased = true; }
+        if (nyucd::is_upper(c) || nyucd::is_title(c)) { if (prev_cased) return false; prev_cased = true; cased = true; }
+        else if (nyucd::is_lower(c)) { if (!prev_cased) return false; prev_cased = true; cased = true; }
         else prev_cased = false;
     }
     return cased;
 }
+// PEP 3131: XID_Start or "_", then XID_Continue (no NFKC: "ﬁ" is one)
 inline bool str_isidentifier(const std::string& s) {
     if (s.empty()) return false;
     bool first = true;
     for (size_t i = 0; i < s.size();) {
         uint32_t c = u8_decode(s, i);
-        bool ok = c == '_' || cp_is_alpha(c) || (!first && cp_is_digit(c));
+        bool ok = first ? (c == '_' || (c < 0x80 ? nyucd::is_alpha(c) : nyucd::is_xid_start(c)))
+                        : (c < 0x80 ? (nyucd::is_alnum(c) || c == '_') : nyucd::is_xid_continue(c));
         if (!ok) return false;
         first = false;
     }
@@ -739,7 +731,9 @@ inline bool str_method(const std::string& s, const std::string& m, const std::ve
     if (M("swapcase")) { out = sres_str(str_swapcase(s)); return true; }
     if (M("capitalize")) { out = sres_str(str_capitalize(s)); return true; }
     if (M("title")) { out = sres_str(str_title(s)); return true; }
-    if (M("isdigit") || M("isdecimal") || M("isnumeric")) { out = sres_bool(str_isdigit(s)); return true; }
+    if (M("isdigit")) { out = sres_bool(str_isdigit(s)); return true; }
+    if (M("isdecimal")) { out = sres_bool(str_isdecimal(s)); return true; }
+    if (M("isnumeric")) { out = sres_bool(str_isnumeric(s)); return true; }
     if (M("isalpha")) { out = sres_bool(str_isalpha(s)); return true; }
     if (M("isalnum")) { out = sres_bool(str_isalnum(s)); return true; }
     if (M("isspace")) { out = sres_bool(str_isspace(s)); return true; }

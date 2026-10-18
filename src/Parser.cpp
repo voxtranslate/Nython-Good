@@ -2198,6 +2198,10 @@ node_ptr Parser::atom(){
     }
 
     // If we got here, unexpected token — error
+    // (round 84: the lexer's PEP 3131 error, CPython's message as it is)
+    if (tok.type() == TokenType::UnterminatedStringError
+        && (tok.value.rfind("invalid character '", 0) == 0 || tok.value.rfind("invalid non-printable character U+", 0) == 0))
+        throw SyntaxError(tok.location(), tok.value);
     throw SyntaxError(tok.location(), "Unexpected token: " + tok.value);
     return nullptr;
 }

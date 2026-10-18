@@ -5610,6 +5610,10 @@ public:   // NythonExecutor is a struct: members default to public
     Value makeBoundMethod(Value fn_val, Value self_val) {
         if (fn_val.type != ValueType::USERDATA || !fn_val.value.p) return fn_val;
         if (string_ptrs_.count(fn_val.value.p)) return fn_val;
+        // round 84: a bound method kept as a class attribute stays bound to
+        // its own instance (CPython's method objects have no __get__:
+        // `class Codec: encode = codec.encode` in the encodings modules)
+        if (!bound_self_.empty() && bound_self_.count(fn_val.value.p)) return fn_val;
         auto fit = func_names.find(fn_val.value.p);
         if (fit == func_names.end()) return fn_val;
         const std::string& tag = fit->second;
