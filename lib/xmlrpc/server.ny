@@ -136,7 +136,7 @@ except (ImportError, AttributeError):   # (Nython: DocXMLRPCServer needs a pydoc
 def _getdoc(object):
     # pydoc.getdoc where there is one
     if pydoc is not None and hasattr(pydoc, "getdoc"):
-        return _getdoc(object)
+        return pydoc.getdoc(object)
     import inspect
     result = inspect.getdoc(object) or inspect.getcomments(object)
     return result and re.sub('^ *\n', '', result.rstrip()) or ''

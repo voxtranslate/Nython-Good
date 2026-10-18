@@ -233,10 +233,19 @@ def copy(x):
 
     See the module's __doc__ string for more info.
     """
-    if _is_instance(x) and not _has_class_attr(x.__class__, "__copy__") and not _user_reduce(x.__class__):
-        var bv = _builtin_value(x)
-        if bv is not none:
-            return _copy_valued(x, bv, none)
+    if _is_instance(x) and not _has_class_attr(x.__class__, "__copy__"):
+        if _user_reduce(x.__class__):
+            # round 83: before the atomic and container shortcuts, which a str
+            # or list subclass would otherwise take
+            var urv = _reduce(x, x.__class__)
+            if urv is not none:
+                if isinstance(urv, str):
+                    return x
+                return _reconstruct(x, none, urv)
+        else:
+            var bv = _builtin_value(x)
+            if bv is not none:
+                return _copy_valued(x, bv, none)
     if _is_atomic(x):
         return x
     if isinstance(x, list):

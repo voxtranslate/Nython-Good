@@ -670,22 +670,28 @@ class Connection:
         return st
 
     # the statement cache: least recently used first (CPython's is a
-    # functools.lru_cache of cached_statements entries)
+    # functools.lru_cache of cached_statements entries). (Nython) A cursor
+    # takes its statement out of the cache and gives it back once reset, so
+    # two threads sharing the connection never both get it: CPython holds
+    # the GIL from the lookup to sqlite3_step, Nython's may change hands in
+    # between. One dict operation each way, atomic under the GIL.
     def _statement(self, sql):
-        cache = self._cache
-        st = cache.get(sql)
-        if st is not None:
-            del cache[sql]
-            cache[sql] = st                      # now the most recently used
-            if st.h and _sql_busy(st.h):
-                return self._prepare(sql)
+        st = self._cache.pop(sql, None)
+        if st is not None and not (st.h and _sql_busy(st.h)):
             return st
-        st = self._prepare(sql)
-        if self._cache_size > 0:
-            while len(cache) >= self._cache_size:
-                del cache[next(iter(cache))]
-            cache[sql] = st
-        return st
+        return self._prepare(sql)
+
+    def _give_back(self, st):
+        if not st.h or self._cache_size <= 0 or self._h is None:
+            return
+        cache = self._cache
+        while len(cache) >= self._cache_size:
+            try:
+                cache.pop(next(iter(cache)), None)
+            except (StopIteration, RuntimeError):
+                break
+        if cache.setdefault(st.sql, st) is not st:
+            pass                                 # another one is cached: this one is freed with its last reference
 
     def _step(self, st):
         return self._drive(_sql_step(st.h))[1]
@@ -1100,6 +1106,7 @@ class Cursor:
         self.row_factory = None
         self._stmt = None
         self._casts = None
+        self._raw = None
         self._closed = False
         self._locked = False
         self._initialized = True
@@ -1121,6 +1128,14 @@ class Cursor:
         st = self._stmt
         if st is not None and st.h:
             _sql_reset(st.h)
+
+    # the cursor is done with its statement: reset, back to the cache
+    def _drop(self):
+        st = self._stmt
+        self._stmt = None
+        if st is not None and st.h:
+            _sql_reset(st.h)
+            self._connection._give_back(st)
 
     def _bind(self, st, params):
         con = self._connection
@@ -1176,6 +1191,7 @@ class Cursor:
         dt = con.detect_types
         if not dt or not st.h:
             self._casts = None
+            self._raw = None
             return
         casts = []
         any_ = False
@@ -1201,6 +1217,9 @@ class Cursor:
             if conv is not None:
                 any_ = True
         self._casts = casts if any_ else None
+        # the columns read as bytes, for _sql_row: flags, not the converters
+        # (a VM function reaches the interpreter's natives as no value)
+        self._raw = [c is not None for c in casts] if any_ else None
 
     def _execute(self, multiple, sql, second):
         self._check()
@@ -1211,7 +1230,7 @@ class Cursor:
                 params_iter = iter(second)
             else:
                 params_iter = iter([() if second is _MISSING else second])
-            self._reset()
+            self._drop()
             self.description = None
             st = con._statement(sql)
             self._stmt = st
@@ -1249,14 +1268,13 @@ class Cursor:
                 self.lastrowid = _sql_last_rowid(con._h)
         except BaseException:
             if self._stmt is not None:
-                self._reset()
-                self._stmt = None
+                self._drop()
             self.rowcount = -1
             raise
         finally:
             self._locked = False
         if self._stmt is not None and not _sql_busy(self._stmt.h):
-            self._stmt = None
+            self._drop()
         return self
 
     def execute(self, sql, parameters=_MISSING, /):
@@ -1280,8 +1298,7 @@ class Cursor:
         script = sql_script.encode("utf-8")
         if len(script) > _sql_limit(h, 1, -1):
             raise DataError("query string is too large")
-        self._reset()
-        self._stmt = None
+        self._drop()
         if con._autocommit == LEGACY_TRANSACTION_CONTROL and not _sql_autocommit(h):
             r = con._drive(_sql_exec(h, "COMMIT"))
             if r[1] != 0:
@@ -1314,15 +1331,15 @@ class Cursor:
         casts = self._casts
         h = st.h
         if tf is str:
-            row = _sql_row(h, 0, casts)
+            row = _sql_row(h, 0, self._raw)
             if type(row) is tuple:
                 names = _sql_columns(h)
                 raise OperationalError("Could not decode to UTF-8 column '" + names[row[0]][0] +
                                        "' with text '" + row[1].decode("utf-8", "replace") + "'")
         elif tf is bytes:
-            row = _sql_row(h, 1, casts)
+            row = _sql_row(h, 1, self._raw)
         else:
-            pr = _sql_row(h, 2, casts)
+            pr = _sql_row(h, 2, self._raw)
             row = pr[0]
             types = pr[1]
             for i in range(len(row)):
@@ -1356,12 +1373,10 @@ class Cursor:
         if rc == 101:
             if st.is_dml:
                 self.rowcount = _sql_changes(con._h)
-            _sql_reset(st.h)
-            self._stmt = None
+            self._drop()
         elif rc != 100:
             exc = con._error()
-            _sql_reset(st.h)
-            self._stmt = None
+            self._drop()
             raise exc
         if self.row_factory is not None:
             row = self.row_factory(self, row)
@@ -1406,8 +1421,7 @@ class Cursor:
             raise ProgrammingError("Base Cursor.__init__ not called.")
         self._connection._check()
         if self._stmt is not None:
-            self._reset()
-            self._stmt = None
+            self._drop()
         self._closed = True
 
     def setinputsizes(self, sizes, /):

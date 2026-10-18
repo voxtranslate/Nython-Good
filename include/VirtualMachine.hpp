@@ -13714,6 +13714,9 @@ private:
         if(filepath.empty()){
             // A builtin module has no file and that is not an error.
             if(builtin_modules.count(name)) return;
+            // (round 83) not imported: a later `import name` looks again (a
+            // second `try: import m` used to succeed, binding nothing)
+            globals_.erase(guard_key);
             // std::runtime_error, not std::string: the VM's try/except handler
             // catches what Op::RAISE throws, which is runtime_error. Throwing a
             // std::string unwound straight out of run_loop, so an import error
@@ -15288,6 +15291,11 @@ private:
             if(v.type==VMType::STRING){
                 double d;
                 if(!nypy::parse_float_str(v.s,d)) vm->raise_native_exception("ValueError","could not convert string to float: "+nypy::str_repr(v.s));
+                return VMVal::make_float(d);
+            }
+            if(v.type==VMType::BYTES){   // (round 83) float(b"1.5"), as CPython
+                double d;
+                if(!nypy::parse_float_str(v.bdata(),d)) vm->raise_native_exception("ValueError","could not convert string to float: "+nypy::bytes_repr(v.bdata(),v.b));
                 return VMVal::make_float(d);
             }
             if(v.type==VMType::INSTANCE){ VMVal r=vm->call_dunder(v,"__float__",{}); if(r.type!=VMType::NONE) return r; }

@@ -524,7 +524,7 @@ def sqlite_thread_checks():
     con.executemany("insert into t values (?)", [(i,) for i in range(200)])
     con.commit()
     con.close()
-    results = {}
+    by_thread = {}
     def worker(k):
         c = sqlite3.connect(path, timeout=30)
         c.create_function("scale", 1, lambda v: v * k)
@@ -540,13 +540,13 @@ def sqlite_thread_checks():
         r = c.execute("select mysum(scale(n)) from t").fetchone()[0]
         r2 = [x[0] for x in c.execute("select cast(n as text) from t where n < 5 order by 1 collate rev")]
         c.close()
-        results[k] = (r, r2)
+        by_thread[k] = (r, r2)
     ts = [threading.Thread(target=worker, args=(k,)) for k in range(1, 5)]
     for t in ts:
         t.start()
     for t in ts:
         t.join()
-    check("sqlite3: callbacks in four threads at once", sorted(results.items()),
+    check("sqlite3: callbacks in four threads at once", sorted(by_thread.items()),
           [(k, (19900 * k, ["4", "3", "2", "1", "0"])) for k in range(1, 5)])
     shared = sqlite3.connect(path, check_same_thread=False)
     shared.create_function("twice", 1, lambda v: v * 2)
@@ -1344,6 +1344,71 @@ def store_checks():
     shutil.rmtree(d)
 
 
+# ── what the engines needed for these modules ───────────────────────────────
+def engine_checks():
+    import copy
+    # a module that is not found is not imported: a later import looks again
+    def try_import():
+        try:
+            import _vm_audit110_missing_module
+            return "imported"
+        except ImportError as e:
+            return type(e).__name__ + ": " + str(e)
+    check("a module not found is looked for again by the next import", [try_import(), try_import()],
+          ["ModuleNotFoundError: No module named '_vm_audit110_missing_module'"] * 2)
+    check("float() of bytes and bytearray",
+          [float(b" 1.5 "), float(bytearray(b"2e3")), err(lambda: float(b"x")), err(lambda: float(bytearray(b"y")))],
+          [1.5, 2000.0, ["ValueError", "could not convert string to float: b'x'"],
+           ["ValueError", "could not convert string to float: bytearray(b'y')"]])
+
+    # a class with a __new__ of its own: a method named init is an ordinary
+    # method (email.headerregistry's headers)
+    class H(str):
+        def __new__(cls, name, value):
+            self = str.__new__(cls, value)
+            self.init(name, extra=1)
+            return self
+
+        def init(self, name, *, extra):
+            self.name = name
+            self.extra = extra
+    h = H("n", "v")
+    check("with __new__, init is an ordinary method", [h, h.name, h.extra, type(h).__name__], ["v", "n", 1, "H"])
+
+    # builtin methods of builtin subclasses store their arguments as given
+    class S(str):
+        pass
+
+    class L(list):
+        pass
+
+    class St(set):
+        pass
+
+    class D(dict):
+        pass
+    lst = L()
+    lst.append(S("a"))
+    lst.insert(0, S("b"))
+    st = St()
+    st.add(S("c"))
+    d = D()
+    d.setdefault("k", S("d"))
+    check("list/set/dict subclasses keep the instances they are given",
+          [type(lst[0]).__name__, type(lst[1]).__name__, type(next(iter(st))).__name__, type(d["k"]).__name__,
+           type(d.get("zz", S("e"))).__name__, type(d.pop("zz", S("f"))).__name__],
+          ["S", "S", "S", "S", "S", "S"])
+
+    # copy and deepcopy use a builtin subclass's own __reduce__
+    class R(str):
+        def __reduce__(self):
+            return (R, (str(self) + "!",))
+    c1 = copy.copy(R("x"))
+    c2 = copy.deepcopy(R("y"))
+    check("copy honours a builtin subclass's __reduce__", [c1, type(c1).__name__, c2, type(c2).__name__],
+          ["x!", "R", "y!", "R"])
+
+
 # ── wsgiref, xmlrpc ──────────────────────────────────────────────────────────
 def wsgi_checks():
     import io
@@ -1709,7 +1774,7 @@ def imap_handler(conn, rfile, send, log):
             send(tag + " OK SEARCH completed")
         elif cmd == "FETCH":
             if "RFC822" in rest:
-                conn.sendall(b"* 1 FETCH (FLAGS (\\Seen) RFC822 {%d}\r\n" % len(msg) + msg + b")\r\n")
+                conn.sendall(("* 1 FETCH (FLAGS (\\Seen) RFC822 {%d}\r\n" % len(msg)).encode() + msg + b")\r\n")
             else:
                 send("* 1 FETCH (FLAGS (\\Seen) UID 101)")
             send(tag + " OK FETCH completed")
@@ -2367,6 +2432,7 @@ section("quopri/uu", quopri_uu_checks)
 section("netrc/mailcap/cgi", netrc_mailcap_cgi_checks)
 section("audio", audio_checks)
 section("dbm/shelve/mailbox", store_checks)
+section("the engines", engine_checks)
 section("wsgiref", wsgi_checks)
 section("xmlrpc", xmlrpc_checks)
 section("protocols", protocol_checks)

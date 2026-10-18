@@ -13806,6 +13806,9 @@ public:
         // it would have defined then failed later with no hint that the import
         // was the cause. Name the module and where it was looked for.
         if (filepath.empty()) {
+            // (round 83) not imported: a later `import name` looks again (a
+            // second `try: import m` used to succeed, binding nothing)
+            imported_modules_.erase(module_name);
             std::string tried;
             for (size_t i = 0; i < search_paths.size(); ++i) {
                 if (i) tried += ", ";

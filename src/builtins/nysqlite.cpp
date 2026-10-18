@@ -600,6 +600,13 @@ Value run(NythonExecutor& E, const std::shared_ptr<Conn>& c, std::function<void(
 
 Val ival(int64_t x) { Val v; v.t = SQLITE_INTEGER; v.i = x; return v; }
 
+// (round 83) Every SQLite call that may take the connection's mutex runs with
+// the GIL released. A thread whose statement is paused in a callback holds
+// that (recursive) mutex while it runs the callback's Nython code, which needs
+// the GIL: another thread waiting for the mutex with the GIL held would
+// deadlock them both. Nothing inside touches a Value.
+template <class F> auto nogil(F&& f) -> decltype(f()) { nyconc::GilRelease g; return f(); }
+
 // ── the C callbacks (on an operation's coroutine, GIL released) ─────────────
 void set_result(Api& a, sqlite3_context* ctx, Op* op, const char* errmsg) {
     if (op->status == 5) { a.result_error_toobig(ctx); return; }   // an int beyond 64 bits, as CPython
@@ -875,10 +882,10 @@ Value dispatch_sqlite(NythonExecutor& E, const std::string& name, std::vector<Va
                 else ++it2;
             }
         }
-        for (auto& s : mine) if (s->st) { a.finalize(s->st); s->st = nullptr; }
         int rc;
         {
             nyconc::GilRelease g;
+            for (auto& s : mine) if (s->st) { a.finalize(s->st); s->st = nullptr; }
             rc = a.close_v2(c->db);
         }
         std::lock_guard<std::mutex> l(g_mu);
@@ -890,34 +897,44 @@ Value dispatch_sqlite(NythonExecutor& E, const std::string& name, std::vector<Va
     if (name == "_sql_errinfo") {
         Api& a = need();
         auto c = get_conn(iarg(E, A, 0));
-        int code = a.errcode(c->db), ext = a.extended_errcode(c->db);
+        int code = 0, ext = 0;
+        std::string msg;
+        nogil([&] {
+            code = a.errcode(c->db); ext = a.extended_errcode(c->db);
+            const char* m = a.errmsg(c->db);
+            if (m) msg = m;
+        });
         const char* n = code_name(ext);
         if (!n) n = code_name(code);
         std::vector<Value> r{intValue((int64_t)code), intValue((int64_t)ext), E.makeStringValue(n ? n : "SQLITE_UNKNOWN"),
-                             E.makeStringValue(a.errmsg(c->db))};
+                             E.makeStringValue(msg)};
         return E.makeListValue(r);
     }
-    if (name == "_sql_busy_timeout") { Api& a = need(); auto c = get_conn(iarg(E, A, 0)); return intValue((int64_t)a.busy_timeout(c->db, (int)iarg(E, A, 1))); }
-    if (name == "_sql_autocommit") { Api& a = need(); auto c = get_conn(iarg(E, A, 0)); return Value(a.get_autocommit(c->db) != 0); }
+    if (name == "_sql_busy_timeout") {
+        Api& a = need(); auto c = get_conn(iarg(E, A, 0)); int ms = (int)iarg(E, A, 1);
+        return intValue((int64_t)nogil([&] { return a.busy_timeout(c->db, ms); }));
+    }
+    if (name == "_sql_autocommit") { Api& a = need(); auto c = get_conn(iarg(E, A, 0)); return Value(nogil([&] { return a.get_autocommit(c->db); }) != 0); }
     if (name == "_sql_changes") {
         Api& a = need(); auto c = get_conn(iarg(E, A, 0));
-        return intValue(a.changes64 ? (int64_t)a.changes64(c->db) : (int64_t)a.changes(c->db));
+        return intValue(nogil([&] { return a.changes64 ? (int64_t)a.changes64(c->db) : (int64_t)a.changes(c->db); }));
     }
     if (name == "_sql_total_changes") {
         Api& a = need(); auto c = get_conn(iarg(E, A, 0));
-        return intValue(a.total_changes64 ? (int64_t)a.total_changes64(c->db) : (int64_t)a.total_changes(c->db));
+        return intValue(nogil([&] { return a.total_changes64 ? (int64_t)a.total_changes64(c->db) : (int64_t)a.total_changes(c->db); }));
     }
-    if (name == "_sql_last_rowid") { Api& a = need(); auto c = get_conn(iarg(E, A, 0)); return intValue((int64_t)a.last_insert_rowid(c->db)); }
+    if (name == "_sql_last_rowid") { Api& a = need(); auto c = get_conn(iarg(E, A, 0)); return intValue((int64_t)nogil([&] { return a.last_insert_rowid(c->db); })); }
     if (name == "_sql_interrupt") { Api& a = need(); auto c = get_conn(iarg(E, A, 0)); a.interrupt(c->db); return NONE_VALUE; }
     if (name == "_sql_limit") {
         Api& a = need(); auto c = get_conn(iarg(E, A, 0));
-        return intValue((int64_t)a.limit(c->db, (int)iarg(E, A, 1), (int)iarg(E, A, 2, -1)));
+        int id = (int)iarg(E, A, 1), nv = (int)iarg(E, A, 2, -1);
+        return intValue((int64_t)nogil([&] { return a.limit(c->db, id, nv); }));
     }
     if (name == "_sql_db_config") {
         Api& a = need(); auto c = get_conn(iarg(E, A, 0));
         if (!a.db_config) fail("NotSupportedError", "sqlite3_db_config is not available");
-        int out = 0;
-        int rc = a.db_config(c->db, (int)iarg(E, A, 1), (int)iarg(E, A, 2, -1), &out);
+        int out = 0, op = (int)iarg(E, A, 1), on = (int)iarg(E, A, 2, -1);
+        int rc = nogil([&] { return a.db_config(c->db, op, on, &out); });
         std::vector<Value> r{intValue((int64_t)rc), intValue((int64_t)out)};
         return E.makeListValue(r);
     }
@@ -925,13 +942,19 @@ Value dispatch_sqlite(NythonExecutor& E, const std::string& name, std::vector<Va
         Api& a = need(); auto c = get_conn(iarg(E, A, 0));
         std::string s = sarg(E, A, 1);
         if (!a.txn_state) return intValue((int64_t)-1);
-        return intValue((int64_t)a.txn_state(c->db, has_arg(A, 1) ? s.c_str() : nullptr));
+        bool named = has_arg(A, 1);
+        return intValue((int64_t)nogil([&] { return a.txn_state(c->db, named ? s.c_str() : nullptr); }));
     }
     if (name == "_sql_filename") {
         Api& a = need(); auto c = get_conn(iarg(E, A, 0));
         std::string s = has_arg(A, 1) ? sarg(E, A, 1) : std::string("main");
-        const char* f = a.db_filename ? a.db_filename(c->db, s.c_str()) : nullptr;
-        return f ? E.makeStringValue(f) : NONE_VALUE;
+        bool got = false;
+        std::string fn;
+        nogil([&] {
+            const char* f = a.db_filename ? a.db_filename(c->db, s.c_str()) : nullptr;
+            if (f) { got = true; fn = f; }
+        });
+        return got ? E.makeStringValue(fn) : NONE_VALUE;
     }
     if (name == "_sql_prepare") {
         Api& a = need();
@@ -1017,12 +1040,12 @@ Value dispatch_sqlite(NythonExecutor& E, const std::string& name, std::vector<Va
             s = it->second;
             g_stmts.erase(it);
         }
-        int rc = s->st ? a.finalize(s->st) : 0;
+        int rc = s->st ? nogil([&] { return a.finalize(s->st); }) : 0;
         s->st = nullptr;
         return intValue((int64_t)rc);
     }
-    if (name == "_sql_reset") { Api& a = need(); auto s = get_stmt(iarg(E, A, 0)); return intValue((int64_t)a.reset(s->st)); }
-    if (name == "_sql_clear_bindings") { Api& a = need(); auto s = get_stmt(iarg(E, A, 0)); return intValue((int64_t)a.clear_bindings(s->st)); }
+    if (name == "_sql_reset") { Api& a = need(); auto s = get_stmt(iarg(E, A, 0)); return intValue((int64_t)nogil([&] { return a.reset(s->st); })); }
+    if (name == "_sql_clear_bindings") { Api& a = need(); auto s = get_stmt(iarg(E, A, 0)); return intValue((int64_t)nogil([&] { return a.clear_bindings(s->st); })); }
     if (name == "_sql_bind_count") { Api& a = need(); auto s = get_stmt(iarg(E, A, 0)); return intValue((int64_t)a.bind_parameter_count(s->st)); }
     if (name == "_sql_bind_name") {
         Api& a = need(); auto s = get_stmt(iarg(E, A, 0));
@@ -1036,26 +1059,36 @@ Value dispatch_sqlite(NythonExecutor& E, const std::string& name, std::vector<Va
         Val v;
         int r = A.size() > 2 ? from_value(E, A[2], v) : 0;
         if (r != 0) return intValue((int64_t)r);
-        int rc;
-        switch (v.t) {
-            case SQLITE_INTEGER: rc = a.bind_int64(s->st, i, v.i); break;
-            case SQLITE_FLOAT: rc = a.bind_double(s->st, i, v.d); break;
-            case SQLITE_TEXT: rc = a.bind_text(s->st, i, v.s.data(), (int)v.s.size(), SQLITE_TRANSIENT_); break;
-            case SQLITE_BLOB: rc = a.bind_blob(s->st, i, v.s.data(), (int)v.s.size(), SQLITE_TRANSIENT_); break;
-            default: rc = a.bind_null(s->st, i);
-        }
+        int rc = nogil([&] {
+            switch (v.t) {
+                case SQLITE_INTEGER: return a.bind_int64(s->st, i, v.i);
+                case SQLITE_FLOAT: return a.bind_double(s->st, i, v.d);
+                case SQLITE_TEXT: return a.bind_text(s->st, i, v.s.data(), (int)v.s.size(), SQLITE_TRANSIENT_);
+                case SQLITE_BLOB: return a.bind_blob(s->st, i, v.s.data(), (int)v.s.size(), SQLITE_TRANSIENT_);
+                default: return a.bind_null(s->st, i);
+            }
+        });
         return intValue((int64_t)rc);
     }
     if (name == "_sql_column_count") { Api& a = need(); auto s = get_stmt(iarg(E, A, 0)); return intValue((int64_t)a.column_count(s->st)); }
     if (name == "_sql_columns") {
         Api& a = need();
         auto s = get_stmt(iarg(E, A, 0));
-        int n = a.column_count(s->st);
+        std::vector<Val> names, decls;      // SQLITE_NULL for a column without one
+        nogil([&] {
+            int n = a.column_count(s->st);
+            names.resize(n); decls.resize(n);
+            for (int i = 0; i < n; i++) {
+                const char* nm = a.column_name(s->st, i);
+                const char* dt = a.column_decltype ? a.column_decltype(s->st, i) : nullptr;
+                if (nm) { names[i].t = SQLITE_TEXT; names[i].s = nm; }
+                if (dt) { decls[i].t = SQLITE_TEXT; decls[i].s = dt; }
+            }
+        });
         std::vector<Value> cols;
-        for (int i = 0; i < n; i++) {
-            const char* nm = a.column_name(s->st, i);
-            const char* dt = a.column_decltype ? a.column_decltype(s->st, i) : nullptr;
-            std::vector<Value> pr{nm ? E.makeStringValue(nm) : NONE_VALUE, dt ? E.makeStringValue(dt) : NONE_VALUE};
+        for (size_t i = 0; i < names.size(); i++) {
+            std::vector<Value> pr{names[i].t == SQLITE_TEXT ? E.makeStringValue(names[i].s) : NONE_VALUE,
+                                  decls[i].t == SQLITE_TEXT ? E.makeStringValue(decls[i].s) : NONE_VALUE};
             cols.push_back(E.makeListValue(pr));
         }
         return E.makeListValue(cols);
@@ -1068,39 +1101,50 @@ Value dispatch_sqlite(NythonExecutor& E, const std::string& name, std::vector<Va
         std::vector<Value> types;
         std::vector<bool> raw;
         if (has_arg(A, 2)) for (auto& v : E.listItems(A[2])) raw.push_back(E.isTruthy(v));
-        int n = a.column_count(s->st);
-        std::vector<Value> row;
-        row.reserve(n);
-        for (int i = 0; i < n; i++) {
-            int t = a.column_type(s->st, i);
-            if (mode == 2) types.push_back(intValue((int64_t)t));
-            if (t == SQLITE_NULL) { row.push_back(NONE_VALUE); continue; }
-            if (i < (int)raw.size() && raw[i]) {
-                const void* p = a.column_blob(s->st, i);
-                int nb = a.column_bytes(s->st, i);
-                row.push_back(E.makeBytesValue(p ? std::string((const char*)p, (size_t)nb) : std::string()));
-                continue;
-            }
-            switch (t) {
-                case SQLITE_INTEGER: row.push_back(intValue((int64_t)a.column_int64(s->st, i))); break;
-                case SQLITE_FLOAT: row.push_back(Value(a.column_double(s->st, i))); break;
-                case SQLITE_TEXT: {
-                    const unsigned char* p = a.column_text(s->st, i);
-                    int nb = a.column_bytes(s->st, i);
-                    std::string txt = p ? std::string((const char*)p, (size_t)nb) : std::string();
-                    if (text_bytes) { row.push_back(E.makeBytesValue(txt)); break; }
-                    if (!valid_utf8(txt)) {
-                        std::vector<Value> bad{intValue((int64_t)i), E.makeBytesValue(txt)};
-                        return E.makeListValue(bad, true);    // a tuple: the column that is not UTF-8
-                    }
-                    row.push_back(E.makeStringValue(txt));
-                    break;
-                }
-                default: {
+        // the columns are read with the GIL released, the values made after
+        std::vector<int> ts;
+        std::vector<Val> vs;
+        nogil([&] {
+            int n = a.column_count(s->st);
+            ts.resize(n); vs.resize(n);
+            for (int i = 0; i < n; i++) {
+                int t = ts[i] = a.column_type(s->st, i);
+                Val& v = vs[i];
+                if (t == SQLITE_NULL) continue;
+                bool blob = (i < (int)raw.size() && raw[i]) || (t != SQLITE_INTEGER && t != SQLITE_FLOAT && t != SQLITE_TEXT);
+                if (blob) {
                     const void* p = a.column_blob(s->st, i);
                     int nb = a.column_bytes(s->st, i);
-                    row.push_back(E.makeBytesValue(p ? std::string((const char*)p, (size_t)nb) : std::string()));
+                    v.t = SQLITE_BLOB;
+                    if (p) v.s.assign((const char*)p, (size_t)nb);
+                } else if (t == SQLITE_INTEGER) { v.t = SQLITE_INTEGER; v.i = (int64_t)a.column_int64(s->st, i); }
+                else if (t == SQLITE_FLOAT) { v.t = SQLITE_FLOAT; v.d = a.column_double(s->st, i); }
+                else {
+                    const unsigned char* p = a.column_text(s->st, i);
+                    int nb = a.column_bytes(s->st, i);
+                    v.t = SQLITE_TEXT;
+                    if (p) v.s.assign((const char*)p, (size_t)nb);
                 }
+            }
+        });
+        std::vector<Value> row;
+        row.reserve(vs.size());
+        for (size_t i = 0; i < vs.size(); i++) {
+            if (mode == 2) types.push_back(intValue((int64_t)ts[i]));
+            Val& v = vs[i];
+            if (ts[i] == SQLITE_NULL) { row.push_back(NONE_VALUE); continue; }
+            switch (v.t) {
+                case SQLITE_INTEGER: row.push_back(intValue(v.i)); break;
+                case SQLITE_FLOAT: row.push_back(Value(v.d)); break;
+                case SQLITE_TEXT:
+                    if (text_bytes) { row.push_back(E.makeBytesValue(v.s)); break; }
+                    if (!valid_utf8(v.s)) {
+                        std::vector<Value> bad{intValue((int64_t)i), E.makeBytesValue(v.s)};
+                        return E.makeListValue(bad, true);    // a tuple: the column that is not UTF-8
+                    }
+                    row.push_back(E.makeStringValue(v.s));
+                    break;
+                default: row.push_back(E.makeBytesValue(v.s));
             }
         }
         if (mode == 2) { std::vector<Value> pr{E.makeListValue(row), E.makeListValue(types)}; return E.makeListValue(pr); }
@@ -1117,21 +1161,18 @@ Value dispatch_sqlite(NythonExecutor& E, const std::string& name, std::vector<Va
         int narg = (int)iarg(E, A, 2, -1), flags = (int)iarg(E, A, 3, 0) | SQLITE_UTF8;
         int kind = (int)iarg(E, A, 4, 0);
         int64_t fid = iarg(E, A, 5, 0);
-        int rc;
-        if (kind == 2) {
-            if (!a.create_window_function) fail("NotSupportedError", "create_window_function() requires SQLite 3.25.0 or higher");
-            if (!fid) rc = a.create_window_function(c->db, fname.c_str(), narg, flags, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
-            else {
+        if (kind == 2 && !a.create_window_function) fail("NotSupportedError", "create_window_function() requires SQLite 3.25.0 or higher");
+        int rc = nogil([&] {
+            if (kind == 2) {
+                if (!fid) return a.create_window_function(c->db, fname.c_str(), narg, flags, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
                 auto* fd = new FnData{h, fid};
-                rc = a.create_window_function(c->db, fname.c_str(), narg, flags, fd, cb_step, cb_final, cb_value, cb_inverse, cb_destroy);
+                return a.create_window_function(c->db, fname.c_str(), narg, flags, fd, cb_step, cb_final, cb_value, cb_inverse, cb_destroy);
             }
-        } else if (!fid) {
-            rc = a.create_function_v2(c->db, fname.c_str(), narg, flags, nullptr, nullptr, nullptr, nullptr, nullptr);
-        } else {
+            if (!fid) return a.create_function_v2(c->db, fname.c_str(), narg, flags, nullptr, nullptr, nullptr, nullptr, nullptr);
             auto* fd = new FnData{h, fid};
-            if (kind == 1) rc = a.create_function_v2(c->db, fname.c_str(), narg, flags, fd, nullptr, cb_step, cb_final, cb_destroy);
-            else rc = a.create_function_v2(c->db, fname.c_str(), narg, flags, fd, cb_func, nullptr, nullptr, cb_destroy);
-        }
+            if (kind == 1) return a.create_function_v2(c->db, fname.c_str(), narg, flags, fd, nullptr, cb_step, cb_final, cb_destroy);
+            return a.create_function_v2(c->db, fname.c_str(), narg, flags, fd, cb_func, nullptr, nullptr, cb_destroy);
+        });
         if (rc == SQLITE_OK) c->hooks += fid ? 1 : 0;
         return intValue((int64_t)rc);
     }
@@ -1141,9 +1182,10 @@ Value dispatch_sqlite(NythonExecutor& E, const std::string& name, std::vector<Va
         auto c = get_conn(h);
         std::string cname = sarg(E, A, 1);
         int64_t fid = iarg(E, A, 2, 0);
-        int rc;
-        if (!fid) rc = a.create_collation_v2(c->db, cname.c_str(), SQLITE_UTF8, nullptr, nullptr, nullptr);
-        else rc = a.create_collation_v2(c->db, cname.c_str(), SQLITE_UTF8, new FnData{h, fid}, cb_collate, cb_destroy);
+        int rc = nogil([&] {
+            if (!fid) return a.create_collation_v2(c->db, cname.c_str(), SQLITE_UTF8, nullptr, nullptr, nullptr);
+            return a.create_collation_v2(c->db, cname.c_str(), SQLITE_UTF8, new FnData{h, fid}, cb_collate, cb_destroy);
+        });
         if (rc == SQLITE_OK && fid) c->hooks++;
         return intValue((int64_t)rc);
     }
@@ -1152,7 +1194,7 @@ Value dispatch_sqlite(NythonExecutor& E, const std::string& name, std::vector<Va
         auto c = get_conn(iarg(E, A, 0));
         bool on = A.size() > 1 && E.isTruthy(A[1]);
         if (!a.set_authorizer) fail("NotSupportedError", "sqlite3_set_authorizer is not available");
-        int rc = a.set_authorizer(c->db, on ? cb_auth : nullptr, nullptr);
+        int rc = nogil([&] { return a.set_authorizer(c->db, on ? cb_auth : nullptr, nullptr); });
         if (on != c->authorizer) { c->hooks += on ? 1 : -1; c->authorizer = on; }
         return intValue((int64_t)rc);
     }
@@ -1161,7 +1203,8 @@ Value dispatch_sqlite(NythonExecutor& E, const std::string& name, std::vector<Va
         auto c = get_conn(iarg(E, A, 0));
         bool on = A.size() > 1 && E.isTruthy(A[1]);
         if (!a.progress_handler) fail("NotSupportedError", "sqlite3_progress_handler is not available");
-        a.progress_handler(c->db, (int)iarg(E, A, 2, 0), on ? cb_progress : nullptr, nullptr);
+        int every = (int)iarg(E, A, 2, 0);
+        nogil([&] { a.progress_handler(c->db, every, on ? cb_progress : nullptr, nullptr); });
         if (on != c->progress) { c->hooks += on ? 1 : -1; c->progress = on; }
         return NONE_VALUE;
     }
@@ -1172,7 +1215,7 @@ Value dispatch_sqlite(NythonExecutor& E, const std::string& name, std::vector<Va
         bool prof = A.size() > 2 && E.isTruthy(A[2]);
         if (!a.trace_v2) fail("NotSupportedError", "sqlite3_trace_v2 is not available");
         unsigned mask = (on ? SQLITE_TRACE_STMT : 0) | (prof ? SQLITE_TRACE_PROFILE : 0);
-        a.trace_v2(c->db, mask, mask ? cb_trace : nullptr, nullptr);
+        nogil([&] { return a.trace_v2(c->db, mask, mask ? cb_trace : nullptr, nullptr); });
         bool any = mask != 0;
         if (any != c->trace) { c->hooks += any ? 1 : -1; c->trace = any; }
         return NONE_VALUE;
@@ -1185,11 +1228,13 @@ Value dispatch_sqlite(NythonExecutor& E, const std::string& name, std::vector<Va
         auto src = get_conn(iarg(E, A, 2));
         std::string sn = sarg(E, A, 3);
         sqlite3_backup* b;
+        int err = 0;
         {
             nyconc::GilRelease g;
             b = a.backup_init(dst->db, dn.c_str(), src->db, sn.c_str());
+            if (!b) err = a.errcode(dst->db);
         }
-        if (!b) { std::vector<Value> r{intValue((int64_t)a.errcode(dst->db)), NONE_VALUE}; return E.makeListValue(r); }
+        if (!b) { std::vector<Value> r{intValue((int64_t)err), NONE_VALUE}; return E.makeListValue(r); }
         std::lock_guard<std::mutex> l(g_mu);
         int64_t id = new_id();
         g_backups[id] = b;
@@ -1225,7 +1270,7 @@ Value dispatch_sqlite(NythonExecutor& E, const std::string& name, std::vector<Va
             b = it->second;
             g_backups.erase(it);
         }
-        return intValue((int64_t)a.backup_finish(b));
+        return intValue((int64_t)nogil([&] { return a.backup_finish(b); }));
     }
     if (name == "_sql_blob_open") {
         Api& a = need();
@@ -1265,7 +1310,7 @@ Value dispatch_sqlite(NythonExecutor& E, const std::string& name, std::vector<Va
             b = it->second;
             g_blobs.erase(it);
         }
-        return intValue((int64_t)a.blob_close(b));
+        return intValue((int64_t)nogil([&] { return a.blob_close(b); }));
     }
     if (name == "_sql_blob_bytes") { Api& a = need(); return intValue((int64_t)a.blob_bytes(get_blob(iarg(E, A, 0)))); }
     if (name == "_sql_blob_read") {
@@ -1298,12 +1343,17 @@ Value dispatch_sqlite(NythonExecutor& E, const std::string& name, std::vector<Va
         if (!a.serialize) fail("NotSupportedError", "serialize() is not available");
         auto c = get_conn(iarg(E, A, 0));
         std::string nm = has_arg(A, 1) ? sarg(E, A, 1) : std::string("main");
-        sqlite3_int64 size = 0;
-        unsigned char* p = a.serialize(c->db, nm.c_str(), &size, 0);
-        if (!p) return NONE_VALUE;
-        Value r = E.makeBytesValue(std::string((const char*)p, (size_t)size));
-        a.free_(p);
-        return r;
+        std::string out;
+        bool got = nogil([&] {
+            sqlite3_int64 size = 0;
+            unsigned char* p = a.serialize(c->db, nm.c_str(), &size, 0);
+            if (!p) return false;
+            out.assign((const char*)p, (size_t)size);
+            a.free_(p);
+            return true;
+        });
+        if (!got) return NONE_VALUE;
+        return E.makeBytesValue(out);
     }
     if (name == "_sql_deserialize") {
         Api& a = need();
@@ -1315,24 +1365,29 @@ Value dispatch_sqlite(NythonExecutor& E, const std::string& name, std::vector<Va
         if (!buf) fail("MemoryError", "");
         if (!data.empty()) memcpy(buf, data.data(), data.size());
         // SQLITE_DESERIALIZE_FREEONCLOSE | SQLITE_DESERIALIZE_RESIZEABLE, as CPython
-        int rc = a.deserialize(c->db, nm.c_str(), buf, (sqlite3_int64)data.size(), (sqlite3_int64)data.size(), 1 | 2);
+        int rc = nogil([&] { return a.deserialize(c->db, nm.c_str(), buf, (sqlite3_int64)data.size(), (sqlite3_int64)data.size(), 1 | 2); });
         return intValue((int64_t)rc);
     }
     if (name == "_sql_enable_load_extension") {
         Api& a = need();
         if (!a.enable_load_extension) fail("AttributeError", "'sqlite3.Connection' object has no attribute 'enable_load_extension'");
         auto c = get_conn(iarg(E, A, 0));
-        return intValue((int64_t)a.enable_load_extension(c->db, A.size() > 1 && E.isTruthy(A[1]) ? 1 : 0));
+        int on = A.size() > 1 && E.isTruthy(A[1]) ? 1 : 0;
+        return intValue((int64_t)nogil([&] { return a.enable_load_extension(c->db, on); }));
     }
     if (name == "_sql_load_extension") {
         Api& a = need();
         if (!a.load_extension) fail("AttributeError", "'sqlite3.Connection' object has no attribute 'load_extension'");
         auto c = get_conn(iarg(E, A, 0));
         std::string path = sarg(E, A, 1), entry = sarg(E, A, 2);
-        char* err = nullptr;
-        int rc = a.load_extension(c->db, path.c_str(), has_arg(A, 2) ? entry.c_str() : nullptr, &err);
-        std::string msg = err ? err : "";
-        if (err) a.free_(err);
+        bool named = has_arg(A, 2);
+        std::string msg;
+        int rc = nogil([&] {
+            char* err = nullptr;
+            int r = a.load_extension(c->db, path.c_str(), named ? entry.c_str() : nullptr, &err);
+            if (err) { msg = err; a.free_(err); }
+            return r;
+        });
         std::vector<Value> r{intValue((int64_t)rc), E.makeStringValue(msg)};
         return E.makeListValue(r);
     }
