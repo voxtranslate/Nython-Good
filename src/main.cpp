@@ -187,7 +187,7 @@ int run_program(const Program& prog, bool show_ast = false) {
         auto lexer = std::make_shared<Lexer>(source);
         auto vm_ptr = std::make_shared<nython::vm::VirtualMachine>(reporter.get());
         auto parser = std::make_shared<Parser>(reporter.get(), (Runnable*)vm_ptr.get(), lexer.get());
-        auto tokens = lexer->tokenize();
+        lexer->tokenize();   // round 82: the tokens stay in the lexer (a copy was made here)
         auto ast = parser->parse();
         if (show_ast && ast) {
             nython::utils::PrettyPrinter pp;

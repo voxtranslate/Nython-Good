@@ -343,28 +343,32 @@ void Lexer::unexpectedChar() {
     throw UnexpectedCharError(location, std::to_string(source.current_char));
 }
 
-Token Lexer::next() {
+// round 82: the accessors return the token in place; the empty list's
+// stand-in is a default token
+static const Token& no_token() { static const Token t; return t; }
+
+const Token& Lexer::next() {
     // Past the last token (the End token pushed by tokenize()): keep
     // returning that End token rather than a default-constructed Token,
     // whose Location{} is (1,1,"stdin"). A default-constructed token has no
     // relation to the file being parsed, so an unterminated construct at
     // EOF reported "stdin:1:1" instead of the real end-of-file position.
-    if(current>=int(tokens.size())) return tokens.empty() ? Token() : tokens.back();
+    if(current>=int(tokens.size())) return tokens.empty() ? no_token() : tokens.back();
     return tokens[current++];
 }
 
-Token Lexer::prev() {
-    if(current <= 0) return tokens.empty() ? Token() : tokens.front();
+const Token& Lexer::prev() {
+    if(current <= 0) return tokens.empty() ? no_token() : tokens.front();
     return tokens[current-1];
 }
 
-Token Lexer::curr() {
-    if(current < 0) return tokens.empty() ? Token() : tokens.front();
-    if(current>=int(tokens.size())) return tokens.empty() ? Token() : tokens.back();
+const Token& Lexer::curr_edge() {
+    if(current < 0) return tokens.empty() ? no_token() : tokens.front();
+    if(current>=int(tokens.size())) return tokens.empty() ? no_token() : tokens.back();
     return tokens[current];
 }
 
-Token Lexer::peek(int i) {
+const Token& Lexer::peek(int i) {
     if(current + i >= int(tokens.size()) || current + i < 0 ) {
         fmt::print("index out out range with value : {}\n", current + i);
         std::stringstream msg;
@@ -385,12 +389,14 @@ std::string Lexer::fileName() {
 void Lexer::reset_token() {
     source.location.reset(source.location.row, source.location.column);
     token_start = source.location;
-    TokenIdent ident(TokenType::Invalid, TokenKind::Invalid, TokenClass::Invalid);
-    token = Token(ident, "invalid" , source.location);
+    // round 82: in place (a Token was made and moved in for each token read)
+    token.ident = TokenIdent(TokenType::Invalid, TokenKind::Invalid, TokenClass::Invalid);
+    token.value.assign("invalid");
+    token._location = source.location;
 }
 
 bool Lexer::isKeyWord(const std::string word) {
-    for(auto kw:Keywords()) {
+    for(const auto& kw:Keywords()) {   // round 82: by reference (a TokenDef - a string - was copied per keyword)
         if((kw.value.size() == word.size())&&(kw.value.c_str() == word)) {
             return true;
         }
@@ -399,7 +405,7 @@ bool Lexer::isKeyWord(const std::string word) {
 }
 
 bool Lexer::isOperator(const std::string word) {
-    for(auto op:Ops()) {
+    for(const auto& op:Ops()) {   // round 82
         if((op.value.size() == word.size())&&(op.value.c_str() == word)) {
             return true;
         }
@@ -408,7 +414,7 @@ bool Lexer::isOperator(const std::string word) {
 }
 
 bool Lexer::isSeparator(const std::string word) {
-    for(auto d:Delims()) {
+    for(const auto& d:Delims()) {   // round 82
         if((d.value.size() == word.size())&&(d.value.c_str() == word)) {
             return true;
         }
@@ -498,6 +504,7 @@ std::string Lexer::toString() {
 
 inline std::vector<Token> optimize(std::vector<Token> tk) {
 	std::vector<Token> ret;
+	ret.reserve(tk.size());   // round 82
 	int nb = (int)tk.size();
 	int paren_depth = 0;
 	int paren_indent_delta = 0;
@@ -549,8 +556,8 @@ inline std::vector<Token> optimize(std::vector<Token> tk) {
                     if(f_tok < 0 || pc.first) { token.value += pc.second; continue; }
                     for(char c : pc.second) { token.value += c; if(c=='{' || c=='}') token.value += c; }
                 }
-                if(f_tok >= 0) ret.push_back(tk[f_tok]);
-                ret.push_back(token);
+                if(f_tok >= 0) ret.push_back(std::move(tk[f_tok]));
+                ret.push_back(std::move(token));
                 i = last + 1;
                 continue;
             }
@@ -568,7 +575,7 @@ inline std::vector<Token> optimize(std::vector<Token> tk) {
         }
         // After closing last paren, consume extra Dedent tokens to rebalance
         if(paren_depth == 0 && paren_indent_delta > 0 && tk[i].type()==TokenType::NewLine) {
-            ret.push_back(tk[i++]);
+            ret.push_back(std::move(tk[i++]));
             while(i < nb && paren_indent_delta > 0 && tk[i].type()==TokenType::Dedent) {
                 paren_indent_delta--;
                 i++;
@@ -586,10 +593,10 @@ inline std::vector<Token> optimize(std::vector<Token> tk) {
         // Python (round 77: the next line became part of the tuple).
         if(i < nb-2 && tk[i].type()==TokenType::Comma && tk[i+1].type()==TokenType::NewLine
            && tk[i+2].type()==TokenType::Indent) {
-            ret.push_back(tk[i]);
+            ret.push_back(std::move(tk[i]));
             i += 2;
         } else {
-            ret.push_back(tk[i++]);
+            ret.push_back(std::move(tk[i++]));
         }
     }
 	return ret;
@@ -625,7 +632,7 @@ static bool python_string_mode(const std::string& file, const std::string& code)
     return false;
 }
 
-std::vector<Token> Lexer::tokenize() {
+const std::vector<Token>& Lexer::tokenize() {   // round 82: the tokens in place (each call copied them)
     reset();
     if(source.line_number()<0) source.read();
     python_strings = python_string_mode(source.fileName(), source.sourceCode());
@@ -644,7 +651,7 @@ std::vector<Token> Lexer::tokenize() {
     this->token.value = "End";
     make_token(TokenType::End, TokenKind::End, TokenClass::Eof);
     tokens.push_back(this->token);
-    tokens = optimize(tokens);
+    tokens = optimize(std::move(tokens));   // round 82: moved, not copied (twice)
     return tokens;
 }
 
@@ -1355,7 +1362,7 @@ void Lexer::read_token() {
     // Change the type of keyword tokens
     if (this->token.type() == TokenType::Identifier && potential_keyword) {
         bool matched_kw = false;
-        for(auto kw : Keywords()) {
+        for(const auto& kw : Keywords()) {   // round 82: by reference (a string copied per keyword per identifier: 8% of the startup)
             if(this->token.value == kw.value) {
                 this->token.ident = kw.ident;
                 matched_kw = true;

@@ -7,6 +7,10 @@ Last updated: round 82, follow-ups (2) — **§0u5** (`import name` finds `.py` 
 Round 82, follow-ups — **§0u4** (asyncio where part B left it different from CPython - TaskGroup groups, wait(), CancelledError(), the default executor, create_server(None), sendfile, pipes, async generator hooks; a `gc` module; `fileno()` the OS descriptor; vm_audit106).
 Round 82, part C — **§0u** (NyxAI: lib/aiagent.ny made a programming agent that works offline - BM25F retrieval, program facts from the real parser (`ny_facts`), a rule engine, test generation, docstrings, review and fixes, a completion model - and the IDE's AGENT view; vm_audit105, e2e `agent`).
 Round 82, part B — **§0u2** (asyncio's missing half: the event-loop API over a persistent native loop, transports and protocols over TCP/UDP/Unix with flow control, streams rebuilt on StreamReaderProtocol, subprocesses waited for on the reactor, add_signal_handler and asyncio.run's Ctrl+C, TLS and start_tls, 3.12's cancellation rules, eager tasks, structured-concurrency reports; a GC heap-sampling fix that made many tasks quadratic, a VM break/continue-out-of-except leak; vm_audit104).
+Round 82, part A — **§0u3** (the interpreter's remaining
+costs: Python exceptions travelling by a pending flag instead of C++
+throws, startup 2.5x/4x fewer instructions, loop targets bound from
+enumerate/zip without a tuple; vm_audit103).
 Round 81, follow-ups — **§0t4** (gaps the round's agents found: class lambdas bound, `del C.m`, `list.pop`'s index, UnboundLocalError, set iterators; a package's `__spec__` on Windows; vm_audit102).
 Round 81, part A — **§0t** (the semantic gaps round 80 left:
 `except ... as e` unbinding, a live `globals()` and the real `__main__`,
@@ -585,6 +589,377 @@ the first child).
   but their frames stay alive until the ring turns over.
 - A TaskGroup with one failing child still raises the error itself rather
   than an ExceptionGroup (vm_audit67 pins the old behaviour).
+
+## 0u3. Round 82, part A — the interpreter's remaining costs (vm_audit103, `tools/bench/`)
+
+Round 81 part B's "Not done" list: Python exceptions on the interpreter
+were C++ throws, startup was ~0.4G instructions (mostly the parser
+copying `Token`s), and `for a, b in enumerate(xs)` built and unpacked a
+tuple per step. All three are done, with no behaviour change where the
+old behaviour was Python's - the sweep, `ide_e2e`, vm_audit100 (and with
+`NY_ASTSPEC=0`) are the oracle - and two places where it was not
+(below, "Found and fixed"). `examples/vm_audit103.ny` (43 checks; the
+interpreter, `NY_ASTSPEC=0`, the VM and python3) runs every new path and
+its fallback.
+
+### Benchmarks
+`tools/bench/`, round 81 (eab9350) -> now. **Instructions** are
+callgrind's counts (they do not move with the machine's load): the timed
+work is the whole run minus the same file run without its final `main()`
+call (startup, parsing, the module's setup), which is shown separately.
+
+| benchmark | interpreter, work: r81 | now | | VM, work: r81 | now | | setup, interpreter | setup, VM |
+|---|---|---|---|---|---|---|---|---|
+| closures | 4.294G | 4.329G | 0.992x | 2.957G | 2.955G | 1.001x | 526M -> 206M | 893M -> 228M |
+| deltablue | 4.368G | 4.376G | 0.998x | 3.130G | 3.132G | 0.999x | 604M -> 232M | 969M -> 252M |
+| dict_str | 1.851G | 1.862G | 0.994x | 1.405G | 1.406G | 0.999x | 624M -> 236M | 989M -> 256M |
+| exceptions | 4.369G | 0.943G | 4.631x | 1.113G | 1.116G | 0.998x | 525M -> 206M | 892M -> 227M |
+| fannkuch | 8.102G | 8.113G | 0.999x | 3.909G | 3.911G | 0.999x | 522M -> 205M | 887M -> 226M |
+| fib | 1.985G | 2.032G | 0.977x | 1.251G | 1.251G | 1.000x | 516M -> 203M | 881M -> 225M |
+| generators | 3.213G | 3.267G | 0.984x | 3.300G | 3.300G | 1.000x | 525M -> 206M | 891M -> 227M |
+| nbody | 2.923G | 2.943G | 0.993x | 2.419G | 2.422G | 0.999x | 537M -> 209M | 903M -> 231M |
+| raytrace | 3.890G | 3.846G | 1.012x | 2.578G | 2.579G | 1.000x | 554M -> 214M | 922M -> 237M |
+| richards | 4.448G | 4.497G | 0.989x | 3.222G | 3.223G | 1.000x | 566M -> 217M | 933M -> 240M |
+| spectral_norm | 4.109G | 3.283G | 1.252x | 3.103G | 2.679G | 1.158x | 522M -> 205M | 888M -> 226M |
+| geomean | | | 1.166x | | | 1.013x | | |
+
+So the work itself costs what it did, except where this round removed
+it: the exceptions benchmark (4.6x fewer instructions), spectral_norm
+(1.25x on the interpreter, 1.16x on the VM: `for i, x in enumerate(...)`
+rows bound without a tuple / unpacked by the strict `UNPACK_SEQ`) and
+raytrace (1%). Elsewhere the interpreter executes 0.1-2.3% more: the
+pending-flag checks (`raisedBy`: two byte compares per binary operation,
+one per argument, per `if` test, per `return`), which pay for the 4.6x.
+Every run is 0.31-0.39G instructions cheaper on the interpreter and
+0.65-0.73G on the VM before its work starts.
+
+**Time** (`python3 tools/bench/run.py -n 7 --python --base ...`: the
+benchmark's own `bench_time`, min of 7 runs interleaved with the
+baseline; a 4-vCPU Xeon VM, load 0.5-3 - right after a reboot, before the
+other agents' builds started. The VM's work is instruction for
+instruction round 81's (above), so its column - 0.95x to 1.00x but for
+spectral_norm - is the size of this machine's noise and layout effects):
+
+| benchmark | interpreter r81 | now | | VM r81 | now | | python3 | interpreter / python3 |
+|---|---|---|---|---|---|---|---|---|
+| closures | 0.447 | 0.449 | 1.00x | 0.299 | 0.301 | 0.99x | 0.0469 | 9.6x |
+| deltablue | 0.596 | 0.675 | 0.88x | 0.383 | 0.383 | 1.00x | 0.0229 | 29.5x |
+| dict_str | 0.223 | 0.223 | 1.00x | 0.178 | 0.188 | 0.95x | 0.0231 | 9.7x |
+| exceptions | 0.465 | 0.139 | 3.35x | 0.115 | 0.121 | 0.95x | 0.0049 | 28.4x |
+| fannkuch | 0.845 | 0.853 | 0.99x | 0.426 | 0.427 | 1.00x | 0.0387 | 22.0x |
+| fib | 0.212 | 0.219 | 0.97x | 0.108 | 0.113 | 0.96x | 0.0171 | 12.8x |
+| generators | 0.372 | 0.385 | 0.97x | 0.341 | 0.351 | 0.97x | 0.0271 | 14.2x |
+| nbody | 0.270 | 0.273 | 0.99x | 0.224 | 0.226 | 0.99x | 0.0164 | 16.6x |
+| raytrace | 0.512 | 0.520 | 0.98x | 0.287 | 0.300 | 0.96x | 0.0316 | 16.5x |
+| richards | 0.560 | 0.555 | 1.01x | 0.346 | 0.365 | 0.95x | 0.0487 | 11.4x |
+| spectral_norm | 0.490 | 0.395 | 1.24x | 0.317 | 0.268 | 1.18x | 0.0330 | 12.0x |
+| geomean | | | 1.12x | | | 0.99x | | |
+
+(deltablue's 0.88x is one fast baseline run: the medians are 0.701 s and
+0.699 s.) Under the other agents' load (8-9) the same runs gave the
+interpreter 0.92x-1.15x on these benchmarks and the VM 0.86x-1.11x - the
+measurement, not the code.
+
+**Time follows instructions only loosely, and why was measured as far
+as this machine allows** (it exposes no performance counters). Under
+cachegrind fib executes 9% fewer instructions than round 81 (startup
+included), yet its L1 instruction-cache misses went from 2.9M to
+4.2M-9.7M: the interpreter's hot path is ~305 64-byte lines (19 KB, the
+same before and after) spread over very large functions (`evalCall` 26 KB,
+`lookupName` 40 KB), and how many of them meet in one of the 64 sets of a
+32 KB 8-way L1i is decided by where the linker puts each function - the
+same objects linked in four other orders gave 4.2M, 6.1M, 7.9M and 9.7M.
+Timed the same way at load 1-3, five link orders of round 81's objects
+ran fib's work in 0.226-0.240 s and five of this round's (before its last
+trims of the checks) in 0.239-0.251 s (nbody
+0.281-0.296 vs 0.300-0.308, richards 0.603-0.651 vs 0.607-0.675): the
+layout alone moves these benchmarks by ~5%, and what remained then (~3-6%
+on fib and nbody, within the noise on richards) was more than the
+instructions explained - the GCC inlining decisions moved with the new
+code (`evalSubscript` is a call now, it was inlined into `evalNode`). The
+trims that followed (`raisedBy`, the NRVO fixes, `flow()` through a TLS
+pointer) brought the final build to the table above. This is
+the effect Mytkowicz et al. measured ("Producing wrong data without doing
+anything obviously wrong!", ASPLOS 2009) and Stabilizer (Curtsinger &
+Berger, ASPLOS 2013) randomizes away; the cure is layout -
+profile-guided hot/cold splitting (`-fprofile-use`) or a post-link
+optimizer (BOLT) - not done here: it changes the build on every platform.
+Whole runs (`--wall`, what `time nython bm_x.ny` sees) are faster on both
+engines: geomean 1.22x (interpreter) and 1.30x (VM) over the 11 whole
+runs; exceptions 3.05x / 1.42x, fib 1.15x / 1.50x, spectral_norm 1.22x /
+1.38x.
+
+### Exceptions without C++ throws (the design and where it comes from)
+The literature has two models for exceptional control flow in an
+interpreter: table-driven unwinding (C++'s "zero-cost" exceptions,
+CPython 3.11's exception table) and an error indicator returned by value
+(CPython up to 3.10: every C function returns NULL with `PyErr_Occurred()`
+set, and every caller checks). The interpreter used the first for Python
+exceptions - a `std::string` thrown and caught by `evalTry` - and paid
+for it: `__gxx_personality_v0` scans the call-site table of every frame
+it passes, and the evaluator's functions are very large (65% of the
+exceptions benchmark). Round 80 gave the VM the second model
+(`fast_exc_pending`); this round gives it to the interpreter, **confined
+by a permission** so the old model stays the fallback everywhere the
+second cannot be proven safe:
+
+- `FlowState::pending == kPendExc` (4) with the exception string in
+  `FlowState::exc` - the string a throw would carry, so everything that
+  reads it (`excTypeOf`, `excInstanceOf`, `tbSee`/`tbCaught`, the clause
+  matching) is unchanged. `pendExc` sets it, `takeExc` takes it.
+- **Statements** may leave by it where a `return` may: `canPend(ctx)` is
+  `fast_ctx == ctx` (round 74's rule: every construct between a function's
+  statement and its `evalBody` checks the flag; `SuspendFast` constructs
+  turn it off). `evalRaise` (via `raiseFlow`) and `evalAssert` use it.
+- **Expressions** may raise by it only when the evaluator asking checks
+  the flag right after: `evalP(n)` is `evalNode(n, ctx, pend=true)`, and
+  `pend` is handed to the evaluators that use it - `evalCall` (its fast
+  paths: a plain def, the method inline cache, the general def path, a
+  builtin's error caught at the call), `evalBinary` (and a division by
+  zero), `evalUnary`, `evalSubscript` (a missing key / index:
+  `getItem(..., exc_out)`, `keyErrorFlow`), `evalAttribute`,
+  `evalAssignment`/`evalAugAssignment`/`evalVarDecl`/`evalIf`/`evalWhile`'s
+  test/`evalReturn`. Any other evaluator gets `pend == false` and its
+  children throw as before - so a pending exception never reaches code
+  that would go on with the value. An evaluator given `pend` returns None
+  whenever it leaves an exception pending, so its caller reads the flag
+  only for a None result (`raisedBy(v)`: CPython's "NULL, then
+  `PyErr_Occurred()`") - one byte compare on the value just returned in
+  the common case, the thread-local flag only for a None.
+- **A frame** records the exception leaving it (`tbUnwind`, in
+  `evalBody`) and hands it on by the flag only when its call site asked
+  (`runFunctionBody(fn, fc, pend)`); otherwise it is thrown there - so
+  builtins calling back into Nython code (`sorted(key=)`, `map`), the
+  prelude's callbacks, threads and anything else native see the C++ throw
+  they always did. A generator's body (`nygen::run_body`) throws it at the
+  coroutine's base; `exec`'s code and `lang_eval` run under `SuspendFast`
+  (they run statements in the caller's scope, and must not use its
+  flags).
+- `evalTry` takes an exception that arrives by the flag as its catch
+  clauses take a thrown one (same `tbSee`, `pyEvException`, matching,
+  `tbCaught`, `handling_exc_`, `UnbindAs`, `tbHandlerExit`); one that goes
+  on (no clause matches, a handler or the else clause raised) goes by the
+  flag when the statement may (a thrown one too: the rest of its way up
+  is then throw-free). `evalWith` likewise (`__exit__` with the exception,
+  suppression). Loops, `if`, blocks and `nygen::for_loop` leave on it as
+  on a pending return.
+- **Rules**: an evaluator given `pend` checks `raisedBy` after each child
+  it evaluated with it and returns (None) before anything else; anything
+  that runs user code while a flag is set takes it out first and puts it
+  back; code that evaluates statements in a caller's scope runs under
+  `SuspendFast`. Every `pendExc` site is marked `round 82`.
+
+What remains in the exceptions benchmark is what Python does too: the
+exception objects, their traceback entries (`makeTbValue`) and frame
+objects, `__init__` calls. Two costs on that path went as well:
+`classDerivesFrom` (every except clause tested, four questions per
+exception made) walked `class_by_name` by string - memoized while no
+class name is bound anew (`class_names_ver_`); `rememberRaised` /
+`excInstanceOf` used string streams.
+
+### Startup
+`-c pass` under callgrind: interpreter **399M -> 159M instructions (2.51x)**,
+VM **769M -> 181M (4.24x)**; wall time (min of 30 runs, interleaved)
+interpreter 90 -> 54 ms, VM 170 -> 60 ms. A benchmark file up to its
+`main()` (startup, its parse, `import time`, module-level code):
+interpreter 516-624M -> 203-236M, VM 881-989M -> 225-256M.
+- The parser copied the current token - two strings - at every
+  `token()`, `see()`, `have()` (`Parser::token()` and the lexer's
+  accessors returned `Token` by value through virtual calls): ~60% of the
+  interpreter's startup. They return `const Token&` now (`IParser`,
+  `ILexer`, `Lexer`, `Parser`; `Parser` and `Lexer` are `final`, so the
+  calls are direct); a mangled identifier (`__x` in a class) is a copy
+  kept in `Parser::mangled_` (a deque: its address stays).
+- The lexer copied a `TokenDef` (a string) per keyword for every
+  identifier it read (`for (auto kw : Keywords())`), built a `Token` per
+  token in `reset_token`, and `tokenize()` copied the token vector twice
+  (`optimize` by value, the return value).
+- The VM's startup parsed the prelude twice (its own and its builtin
+  bridge's interpreter): `VirtualMachine::shared_prelude_ast()` parses it
+  once per process; neither engine changes the AST (the interpreter
+  rewrites only a class statement's expression bases, which the prelude
+  has none of).
+- `hasYield` (once per def) ran its chain of `dynamic_cast`s for leaves.
+
+### Loop targets
+`for i, x in enumerate(xs)` / `for a, b, c in zip(...)`: when the targets
+are a flat list of names as long as each row, `nygen::for_loop` binds
+them from the iterator's parts (`machine_next_parts`, the same guard and
+finish as `machine_next`) - no tuple per step; enumerate's index is a
+machine int incremented in place. The dict paths (`d.items()`) already
+made no pair. The rest falls back to the tuple, and every loop kind binds
+through `bindForItem`: a list or tuple item bound in place, anything else
+iterated (`forUnpackParts`), the count checked.
+
+### Found and fixed
+- **A `finally` that returns, breaks or continues while an exception
+  propagates** re-raised the exception after it on the interpreter
+  (round 81's fast `try`: `def f(): try: raise E finally: return 1` raised
+  E); it replaces the exception now, as in Python (`run_finally_exc`
+  reports it; `tbFinally` keeps the new record).
+- **A for statement's targets were not unpacked as Python's**: the
+  interpreter bound missing values to None, dropped extra ones and bound
+  only the first target of a string item; the VM indexed the item
+  through a temporary (missing values an IndexError, an object with
+  `__iter__` "not subscriptable"). Both engines now raise CPython's
+  "too many values to unpack (expected 2)" / "not enough values to unpack
+  (expected 3, got 2)" / "cannot unpack non-iterable int object" and
+  iterate strings, objects and sets (VM: `UNPACK_SEQ` with
+  `kUnpackStrict`, quickened as before). Comprehension targets are as
+  they were on both engines (lax: see Not done).
+- **VM: `break`/`continue` inside a `finally` body** left the try's state
+  on the operand stack, which the loop's `FOR_ITER` then read as its
+  iterator: the loop ended (`for i in range(3): try: ... finally:
+  continue` ran once). `Compiler::drop_fin_states` pops it first.
+
+### Engine changes (file, function: what)
+Every change is marked `round 82` in the source.
+
+- `include/NythonExecutor.hpp` (the interpreter):
+  - `FlowState`: `pending == kPendExc` (4) and the string `exc`;
+    `pendExc`, `takeExc`, `canPend`, `isLoopFlow`, `pendingSet`,
+    `raisedBy(v)` (the flag read only when `v` is None: every evaluator
+    given `pend` returns None whenever it leaves an exception pending);
+    `NY_LOOP_FLOW` leaves on an exception as on a return.
+  - `evalNode(node, ctx, pend = false)` hands `pend` to `evalCall`,
+    `evalBinary`, `evalUnary`, `evalSubscript`, `evalAttribute`,
+    `evalAssignment`, `evalAugAssignment`, `evalVarDecl`, `evalIf` (each
+    gained a `bool pend = false` parameter, evaluates its children with
+    `evalNode(child, ctx, pend)` and checks `raisedBy` after each);
+    `evalP(n, ctx)` is `evalNode(n, ctx, true)`. `evalVarDecl` and
+    `evalAssignment` return their one named result on that path too
+    (NRVO: an early `return NONE_VALUE` made every declaration copy its
+    value).
+  - `evalStatements`: its statements evaluated with `pend` when
+    `fast_ctx == ctx`; `evalWhile`: its test likewise; `evalReturn`: its
+    value likewise (one named result, so it is still built in place).
+  - `evalRaise` (now over `raiseFlow`, which returns what it used to
+    throw) and `evalAssert`: by the flag when `canPend`.
+  - `evalTry`: an exception from the body, the else clause or a handler by
+    the flag; an unmatched / re-raised one goes on by the flag
+    (`may_pend`); `run_finally_exc` returns whether the finally body's own
+    flow replaced the exception (then it is dropped, as in Python).
+    `tbFinally`: keeps the new record when the body left by a flag.
+  - `evalWith`: an exception by the flag runs `__exit__` as the catch
+    clause does; an unsuppressed one goes on by the flag.
+  - `evalBody(body, fc, pend = false)`: an exception leaving by the flag
+    is recorded (`tbUnwind`) and handed on by the flag or thrown, marked
+    `tbUnwound()` so `runFunctionBody`/`runBodyHooked` do not record it
+    twice. `runFunctionBody(fn, fc, pend = false)`: a thrown exception
+    caught there goes on by the flag when `pend`. `runBodyHooked`.
+  - `evalCall`: the receiver and the arguments of the two fast paths
+    evaluated with `pend`; `pend` passed to `methodFast`,
+    `runFunctionBody` (plain def, method cache, general def path); a
+    builtin's error caught at the call when `pend`.
+  - `getItem(obj, idx, ctx, exc_out = nullptr)`: a list/tuple IndexError
+    or dict KeyError put in `exc_out`; `keyErrorFlow` (what
+    `raiseKeyError` throws); `evalAttribute`'s missing attribute;
+    `zeroDivMessage` (nypy::arith's messages; `evalBinary` asks only when
+    the divisor is zero).
+  - `runSnippetFrame` (exec/eval) runs under `SuspendFast`.
+  - `bindForItem`, `forUnpackParts`, `forUnpackCount`, `seqAt`: a for
+    statement's targets unpacked as Python does (`bindUnpacked` and
+    evalFor's three binding sites use them).
+  - `classDerivesFrom` memoized (`derives_memo_`, `class_names_ver_`
+    bumped where `class_by_name` is written and in `evalClassDecl`'s bases
+    rewrite), the walk in `classDerivesFromWalk`.
+  - `rememberRaised`, `excInstanceOf`: no string streams.
+  - `loadPrelude`: `VirtualMachine::shared_prelude_ast()`.
+  - `hasYield`: leaves answer at once.
+  - `flow()`: the per-thread `FlowState` reached through a
+    constant-initialized pointer (`t_flow_`, set by `flowInit()`), so a use
+    is a TLS load and a test - the function-local `thread_local` put its
+    guard and constructor at every inlined use and kept `pendingSet` out of
+    line (2.7M calls in fib); `pendingSet` always inlined.
+  - `->token()` copies replaced by `->tok()` (34 sites; `tbRecord`,
+    `frameWhere`, `pyEvException`, ...).
+  - `resumeInto`'s while: leaves on an exception as on a return.
+- `src/NyGen.cpp`: `Saved::exc`; `run_body` throws a body's exception that
+  came by the flag; `resume_function` keeps the resumer's and the
+  generator's pending exception string (only when one is pending);
+  `for_loop` leaves on an exception as on a return, binds through
+  `bindForItem`, and binds enumerate/zip rows from their parts
+  (`native_next_parts`, `machine_next_parts`); `enum_advance` (a machine
+  int incremented in place).
+- `include/VirtualMachine.hpp` (the VM): `kUnpackCount`/`kUnpackStrict`;
+  `Compiler::visit_for` unpacks a for statement's targets with `UNPACK_SEQ
+  n|kUnpackStrict` (it indexed a temporary); `UNPACK_SEQ`'s strict form
+  (Python's unpacking) and the count mask in its quickening
+  (`UNPACK_SEQ_LIST`); `Compiler::fin_body_loops_`/`drop_fin_states` (a
+  break/continue in a finally body pops the try's state; `SavedBody::fbl`
+  saves it per function); `shared_prelude_ast()` used by `load_prelude`.
+- Parser and lexer (both engines): `IParser`/`ILexer`/`Parser`/`Lexer`
+  token accessors return `const Token&`; `Parser::mg` keeps mangled copies
+  in `mangled_`; `Parser::see` reads the type in place; `Parser` and
+  `Lexer` are `final`; `Lexer::curr()` inline (`curr_edge()` out of line);
+  `Lexer::tokenize()` returns `const std::vector<Token>&` and moves into
+  `optimize`; `reset_token` in place; the keyword/operator/delimiter
+  tables walked by reference.
+- `src/builtins/lang.cpp`: `lang_eval` runs under `SuspendFast`.
+- `src/main.cpp`: `run_program`'s unused copy of the token vector (`auto tokens = lexer->tokenize()`) dropped.
+
+### Memory
+Peak RSS (MB, Linux, one run each), round 81 -> now:
+
+| | interpreter | VM |
+|---|---|---|
+| `-c pass` | 24.5 -> 21.1 | 30.4 -> 21.9 |
+| fib / nbody / richards | 24.5 / 24.9 / 26.0 -> 21.6 / 22.1 / 22.5 | 30.2 / 30.6 / 31.3 -> 24.3 / 24.8 / 25.4 |
+| closures / deltablue | 26.6 / 29.2 -> 26.7 / 28.9 | 34.3 / 37.6 -> 30.7 / 34.5 |
+| dict_str / exceptions | 47.8 / 36.5 -> 48.0 / 36.8 | 56.2 / 30.7 -> 53.2 / 25.9 |
+
+The parse no longer makes transient copies of every token (-3 to -4 MB
+on most runs), and the VM keeps one prelude AST instead of two (-5 to
+-6 MB). The pending exception adds one `std::string` to the per-thread
+`FlowState`. `ide_memprobe --check`: idle 0.01 KB/frame, hover 0.05,
+typing 3.15 KB/key, scroll/split/live/profile 0.00-0.03 (all under their
+ceilings).
+
+### Windows
+`tools/cross_windows.sh build` and `ARCH=i686 tools/cross_windows.sh
+build` (the units, flags and libraries of `nython.cbp`) build the final
+source; `pe_unwind_check` passes on the 64-bit `nython.exe`; the one
+warning is the existing `K_FROZENSET` switch in `vm_key_value`.
+Under Wine: vm_audit103 43/43 and vm_audit100 on both engines, 64-bit
+and 32-bit.
+
+`tools/bench/run.py --engine interp --bin build-win/nywin --base <round
+81's build> -n 3` (the interpreter, `bench_time`, min of 3 interleaved
+runs under Wine on the same machine at load ~7, so +-10%):
+
+| | closures | deltablue | dict_str | exceptions | fannkuch | fib | generators | nbody | raytrace | richards | spectral_norm | geomean |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 64-bit r81 (s) | 0.954 | 1.188 | 0.367 | 0.838 | 1.488 | 0.581 | 0.930 | 0.479 | 0.959 | 1.316 | 0.783 | |
+| 64-bit now (s) | 0.920 | 1.203 | 0.406 | 0.305 | 1.373 | 0.535 | 0.930 | 0.473 | 0.974 | 1.266 | 0.619 | |
+| | 1.04x | 0.99x | 0.90x | **2.75x** | 1.08x | 1.09x | 1.00x | 1.01x | 0.98x | 1.04x | 1.27x | 1.13x |
+| 32-bit r81 (s) | 0.989 | 1.359 | 0.386 | 0.698 | 1.520 | 0.559 | 0.929 | 0.515 | 1.021 | 1.478 | 0.865 | |
+| 32-bit now (s) | 0.966 | 1.168 | 0.422 | 0.259 | 1.464 | 0.587 | 0.911 | 0.568 | 1.015 | 1.334 | 0.690 | |
+| | 1.02x | 1.16x | 0.92x | **2.70x** | 1.04x | 0.95x | 1.02x | 0.91x | 1.01x | 1.11x | 1.25x | 1.13x |
+
+### Not done / found
+- Comprehension targets (`[x for a, b in pairs]`) still pad missing
+  values with None and drop extra ones, on both engines (`bindTarget`,
+  the VM's lax `UNPACK_SEQ`).
+- `sys.exc_info()` and a bare `raise` inside a `finally` body run while an
+  exception propagates do not see that exception on either engine
+  (CPython: they do), and on the interpreter an exception raised there
+  gets no `__context__` (the VM sets it).
+- Exceptions raised by native code below a non-`pend` call site (a
+  builtin's own callback, a generator's next() from a builtin) are still
+  thrown; a traceback entry still makes its frame object eagerly
+  (`tbRecord` → `frameObject`): the largest part of what the exceptions
+  benchmark costs now, with the exception objects themselves.
+- **The flag checks are not free**: the timed work of the call-heavy
+  benchmarks is 0.1-2.3% more instructions (a check is a byte compare on
+  the value returned plus the `pend` argument), and the final build runs
+  them at 0.97x-1.01x of round 81 on a quiet machine (fib 0.97x,
+  generators 0.97x, raytrace 0.98x). Not recovered here; the next step is
+  layout (`-fprofile-use` hot/cold splitting, BOLT), which the spread over
+  link orders (Benchmarks above) says is worth ~5% by itself.
+- The remaining per-call costs (fib, richards, generators): `Value`
+  copies (a bigint and a long double in every one), the per-call
+  `Context` (a name string, a map, GC tracking), name lookups before the
+  cached depth.
 
 ## 0t4. Round 81, follow-ups — what the round's agents found (vm_audit102)
 

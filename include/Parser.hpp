@@ -3,6 +3,7 @@
 
 #include <map>
 #include <vector>
+#include <deque>
 #include "IParser.hpp"
 
 using nython::node::Node;
@@ -27,7 +28,7 @@ namespace nython::parser {
 using nython::lexer::TokenTypeNames;
 
 /// class that defines a parser that converts a list of tokens into a list of nodes
-class Parser extends IParser {
+class Parser final extends IParser {   // round 82: final - its own token()/see() calls are direct
 public:
     Parser(const Parser&) = delete;
     Parser& operator=(const Parser&) = delete;
@@ -90,31 +91,46 @@ private:
         return v.size() > 2 && v[0] == '_' && v[1] == '_'
                && !(v[v.size()-1] == '_' && v[v.size()-2] == '_') && v.find('.') == std::string::npos;
     }
-    inline Token mg(Token t) const {
-        if(!mangle_stack_.empty() && !mangle_stack_.back().empty() && t.type() == TokenType::Identifier
-           && manglable(t.value))
-            t.value = "_" + mangle_stack_.back() + t.value;
-        return t;
+    // round 82: the parser reads tokens by reference (they were copied -
+    // two strings each - at every token()/see()/have(): ~40% of the
+    // startup's instructions, the prelude's parse). The lexer's token
+    // vector does not change while a parse runs; a mangled identifier is a
+    // copy kept here for the parse (a deque: its address stays), made once
+    // per token and class name.
+    std::deque<Token> mangled_;
+    const Token* mangled_src_ = nullptr;
+    std::string mangled_cls_;
+    inline const Token& mg(const Token& t) {
+        if(mangle_stack_.empty() || mangle_stack_.back().empty() || t.type() != TokenType::Identifier
+           || !manglable(t.value))
+            return t;
+        if(mangled_src_ == &t && !mangled_.empty() && mangled_cls_ == mangle_stack_.back())
+            return mangled_.back();
+        mangled_.push_back(t);
+        mangled_.back().value = "_" + mangle_stack_.back() + t.value;
+        mangled_src_ = &t;
+        mangled_cls_ = mangle_stack_.back();
+        return mangled_.back();
     }
     std::string mangled(const std::string& n) const {
         if(!mangle_stack_.empty() && !mangle_stack_.back().empty() && manglable(n)) return "_" + mangle_stack_.back() + n;
         return n;
     }
-    inline Token rawToken(){ return scanner->curr(); }
+    inline const Token& rawToken(){ return scanner->curr(); }
 
-	inline Token next(){
+	inline const Token& next(){
         return mg(scanner->next());
     }
 
-    inline Token prev(){
+    inline const Token& prev(){
         return mg(scanner->prev());
     }
 
-    inline Token peek(int pos = 1){
+    inline const Token& peek(int pos = 1){
         return mg(scanner->peek(pos));
     }
 
-    inline Token token(){
+    inline const Token& token(){
         return mg(scanner->curr());
     }
 
@@ -157,7 +173,7 @@ private:
     }
 
     inline bool see(TokenType type){
-        return token().type() == type;
+        return scanner->curr().type() == type;   // round 82: mangling never changes a type
     }
 
     inline bool have(TokenType type){
@@ -182,7 +198,7 @@ private:
             throw report<SyntaxError>(next().location(), fmt::format("Expected {}, but found {}", type, next().type()));
     }
 
-    inline Token consume(TokenType type, std::string context = ""){
+    inline const Token& consume(TokenType type, std::string context = ""){
         if(see(type)){
             return next();
         } else if (!context.empty())

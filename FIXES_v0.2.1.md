@@ -5794,3 +5794,17 @@ Full detail in `HANDOFF.md` §0u (part C), §0u2 (part B). New tests: `vm_audit1
 | `import _thread` failed | no module | `lib/_thread.ny` (start_new_thread, allocate_lock, interrupt_main, ...) |
 | `lock.acquire()` in one thread and `lock.release()` in another raised DeadlockError on the next acquire | `threading.Lock` was an owned mutex | a native Python lock (`pylock_create`: no owner, outside lock-order checking); CPython's errors (`release unlocked lock`, `cannot release un-acquired lock`, timeout checks) and reprs |
 | threading's Lock/Condition/Semaphore/Event kept their native objects forever | as asyncio's | `__del__` -> `sync_free` |
+
+## Round 82, part A — the interpreter's remaining costs
+
+Full detail in `HANDOFF.md` §0u3. New test: `vm_audit103` (43 checks; passes on both engines, with `NY_ASTSPEC=0` and under python3).
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Interpreter: the exceptions benchmark 4.9G instructions, 65% of it in C++ unwinding | every Python exception was a C++ throw, and `__gxx_personality_v0` scans the call-site tables of the evaluator's very large frames | an exception travels by a pending flag (`FlowState::pending == kPendExc`) wherever the code it passes through checks the flag (statements of a function, the evaluators handed `pend`, the frames whose call site asked); a throw stays the fallback across native code: 4.89G -> 1.15G instructions (the timed work 4.37G -> 0.94G), 3x faster |
+| Startup: 399M instructions (interpreter), 769M (VM) | the parser copied the current token (two strings) on every look; the lexer copied a keyword definition per identifier and the token vector twice; the VM parsed the prelude twice | tokens by `const&` (`IParser`/`ILexer`/`Parser`/`Lexer`), tables walked by reference, one prelude AST per process: 159M / 181M (`-c pass`: 90 -> 54 ms, 170 -> 60 ms) |
+| `for i, x in enumerate(xs)` built and unpacked a tuple per step | generic unpacking of the row | targets bound from the iterator's parts (enumerate, zip); a machine int incremented in place |
+| Interpreter: `try: raise E` + `finally: return 1` raised E | round 81's fast `try` re-raised after a finally body that left by a flag | the finally's own return/break/continue replaces the exception, as in Python |
+| `for a, b in [(1, 2, 3)]`: a=1, b=2 (interpreter), IndexError / "not subscriptable" (VM); a string item bound one target | lax unpacking of for targets on both engines | CPython's ValueError/TypeError messages; strings, sets and objects iterated (VM: `UNPACK_SEQ` with `kUnpackStrict`) |
+| VM: `for i in range(3): try: ... finally: continue` ran once | the try's state left on the operand stack was read by `FOR_ITER` as its iterator | `Compiler::drop_fin_states` pops it before the jump |
+| Interpreter: `classDerivesFrom` walked `class_by_name` by string for every except clause tested | no memo | memoized per (class, wanted) while no class name is rebound |

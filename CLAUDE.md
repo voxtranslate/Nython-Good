@@ -391,6 +391,7 @@ These were aligned to match how the IDE calls them:
 | vm_audit100 | 114 | round 81: the self-optimizing interpreter's every cache and its fallback (globals/builtins rebound or shadowed, functions replaced, class attributes and methods changed in a class or a base or deleted, fields shadowing them, `__class__` reassigned, `__get__` added later, big-int overflow, `exec`, closures, generators, recursion, threads, return/break/continue through try/finally/with, builtin values' methods, tracing and profiling mid-loop) - passes on both engines, under python3 and with `NY_ASTSPEC=0` |
 | vm_audit102 | 51 | round 81 follow-ups: a lambda put in a class bound when read as a value, `del C.m` (an override, then the base's), `list.pop`'s integer index (`__index__`, TypeError), UnboundLocalError (both engines, CPython's message; NyScope flags reads of names a function binds), set iterators noticing a size change (passes under python3) |
 | vm_audit104 | 113 | round 82: asyncio's loop API (run_until_complete/run_forever/stop/close, call_soon/later/at, Handle/TimerHandle, executors, exception handlers, debug), transports and protocols over TCP/UDP/Unix (Server, flow control, BufferedProtocol), streams on StreamReaderProtocol, subprocesses (communicate, pipelines, SubprocessProtocol, signals to children), add_signal_handler and asyncio.run's Ctrl+C, TLS and start_tls, 3.12's cancellation (cancel(msg), cancelling/uncancel, wait_for/timeout), eager tasks, Barrier, Queue.shutdown, structured-concurrency reports (passes under python3.11-3.13) |
+| vm_audit103 | 43 | round 82: exceptions travelling by the pending flag on the interpreter and their fallbacks - raised and caught in the same function, in callers, from every expression context, through builtin callbacks, generators, threads, `with` suppression, finally ordering and replacement, tracebacks, `sys.settrace` exception events, `__context__`/`__cause__`, `except*`; loop targets over enumerate/zip/items/lists/generators/objects with their counts checked, starred and nested targets (passes under python3 and with `NY_ASTSPEC=0`) |
 | vm_audit101 | 125 | round 81: the live debug server driven over its socket (`--debug-port`, DAP messages: breakpoints with conditions/hit counts/log messages, stepping, pause, stack/scopes/variables by reference, evaluate, setVariable, raised/uncaught exceptions, `--connect`, stdin/argv untouched) and its ring buffer (stepBack/reverseContinue/seek, Why? over the live history); the Profile view's reader on real `-m cProfile [--stacks]` dumps (Nython-only) |
 | vm_audit106 | 27 | round 82 follow-ups: TaskGroup exception groups (children's errors then the body's), wait() refusing coroutines, CancelledError() with empty args, the ThreadPoolExecutor default executor, create_server(None) on every family it can open, sock_sendfile/sendfile/os.sendfile, connect_read_pipe/connect_write_pipe, sys.set_asyncgen_hooks and shutdown_asyncgens, the `gc` module, unretrieved task/future exceptions reported, native objects freed (passes under python3) |
 | vm_audit107 | 22 | round 82 follow-ups (2): `import name` finds `.py` modules, `__init__.py` packages and `.py` namespace packages (`.ny` first, so a `.py` never shadows a library module), `-m name.py`, quoted imports from any directory, `threading.Lock` released by another thread (Python's ownerless lock) and its errors, threading seen from asyncio tasks (get_ident/current_thread/local), `_thread` (passes under python3) |
@@ -1351,6 +1352,43 @@ runtime and both engines. Full detail in `HANDOFF.md` §0d; the short list:
 - In an asyncio task, threading's ident/current_thread/local are the loop
   thread's (`thread_os_id()`); `thread_id()` is the task's record.
 - `lib/gc.ny`, `lib/_thread.ny`; `f.fileno()` is the OS descriptor.
+
+## Round 82, part A: the interpreter's remaining costs (see `HANDOFF.md` §0u3)
+
+- **Python exceptions travel by the pending flag** on the interpreter
+  (`FlowState::pending == kPendExc`, the string in `FlowState::exc` -
+  CPython's error indicator): a `raise`, an `assert`, and the KeyError /
+  IndexError / AttributeError / ZeroDivisionError / a builtin's error
+  raised under an evaluator that checks the flag (`evalP`, the `pend`
+  argument of `evalNode` and the evaluators it dispatches to) go back to
+  the `try` without a C++ throw. A statement may leave by it where a
+  return may (`canPend`: the function's own statements); a frame hands it
+  on by the flag only when its call site asked (`runFunctionBody(pend)`).
+  Everything else (builtins calling back, generator bodies, threads,
+  `exec`, the prelude's callbacks) still throws. The exceptions benchmark:
+  4.9G -> 1.1G instructions, 3x faster.
+- **Rules**: an evaluator given `pend` must check `raisedBy(v)` right
+  after each child it evaluated with `pend` and return before doing
+  anything else, and must **return None whenever it leaves an exception
+  pending** (`raisedBy` reads the flag only for a None result, CPython's
+  NULL-then-`PyErr_Occurred()`); a construct that runs user code while a
+  flag is set takes it out first (`takeExc`) and puts it back (`pendExc`);
+  code that evaluates statements in a caller's scope (`exec`, `lang_eval`)
+  runs under `SuspendFast`. `flow()` reads a constant-initialized
+  per-thread pointer (`t_flow_`): never put a `thread_local` with a
+  constructor in a hot inline function (its guard and constructor land at
+  every use, and GCC stopped inlining `pendingSet` over it).
+- `for a, b in enumerate(...)` / `zip(...)` bind the targets from the
+  iterator's parts (no tuple per step); a for statement's targets are
+  unpacked as Python does on both engines (exactly that many values,
+  CPython's ValueError; objects and strings iterated) - the VM's
+  `UNPACK_SEQ` has a strict form (`kUnpackStrict`).
+- Startup: the parser reads tokens by reference (`Parser::token()` /
+  `ILexer` / `IParser` return `const Token&`; `Parser`/`Lexer` are
+  `final`), the keyword tables are walked by reference, the VM and its
+  builtin bridge share one parse of the prelude
+  (`VirtualMachine::shared_prelude_ast`): `-c pass` 2.5x (interpreter) and
+  4x (VM) fewer instructions.
 
 ## Transcripts
 

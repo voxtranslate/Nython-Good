@@ -1,6 +1,8 @@
 // NyGen.cpp — lazy generators on the interpreter; see include/NyGen.hpp.
 #include "NythonExecutor.hpp"
 #include "NyGen.hpp"
+#include <optional>
+#include <array>
 #include "NyGC.hpp"
 #include "NyCoro.hpp"
 #include "NyConc.hpp"
@@ -61,6 +63,7 @@ struct Saved {
     bool brk_ok = false;
     int pending = 0;
     Value value;
+    std::string exc;                      // a pending exception (round 82)
     node_ptr last;
     Node* cur = nullptr;                  // NythonExecutor::cur_stmt() (round 77)
     int rel_depth = 0;                    // call depth inside the generator
@@ -400,6 +403,9 @@ Value run_body(NythonExecutor& E, Gen* g) {
     f.pending = 0;
     f.value = NONE_VALUE;
     E.evalNode(g->fn->body, g->fc);
+    // round 82: the body raised by the pending flag - thrown from here, as
+    // it was thrown through the body before (entry() takes it)
+    if (f.pending == NythonExecutor::kPendExc) { std::string e = NythonExecutor::takeExc(f); f.value = NONE_VALUE; throw e; }
     Value r = NONE_VALUE;
     if (f.pending == 1) r = f.value;
     f.pending = 0;
@@ -501,6 +507,11 @@ bool resume_function(NythonExecutor& E, Gen* g, Mode m) {
     bool r_brk = f.brk_ok;
     int r_pend = f.pending;
     Value r_val = f.value;
+    // round 82: the pending exception's string, kept only when there is one
+    // (a string moved in and out at every resume cost the generators
+    // benchmark 0.4%)
+    std::string r_exc;
+    if (r_pend == NythonExecutor::kPendExc) r_exc = std::move(f.exc);
     node_ptr r_last = NythonExecutor::last_stmt();
     Node* r_cur = NythonExecutor::cur_stmt();
     Gen* r_gen = t_cur;
@@ -513,6 +524,7 @@ bool resume_function(NythonExecutor& E, Gen* g, Mode m) {
         f.brk_ok = g->saved.brk_ok;
         f.pending = g->saved.pending;
         f.value = g->saved.value;
+        if (g->saved.pending == NythonExecutor::kPendExc) f.exc = std::move(g->saved.exc);   // round 82
         if (g->saved.last) NythonExecutor::last_stmt() = g->saved.last;
         NythonExecutor::call_depth_ = rd + 1 + g->saved.rel_depth;
         H.insert(H.end(), g->saved.handling.begin(), g->saved.handling.end());
@@ -539,6 +551,7 @@ bool resume_function(NythonExecutor& E, Gen* g, Mode m) {
         g->saved.brk_ok = f.brk_ok;
         g->saved.pending = f.pending;
         g->saved.value = f.value;
+        if (f.pending == NythonExecutor::kPendExc) g->saved.exc = std::move(f.exc);   // round 82
         g->saved.last = NythonExecutor::last_stmt();
         g->saved.cur = NythonExecutor::cur_stmt();
         NythonExecutor::cur_stmt() = r_cur;
@@ -565,6 +578,7 @@ bool resume_function(NythonExecutor& E, Gen* g, Mode m) {
         f.brk_ok = r_brk;
         f.pending = r_pend;
         f.value = r_val;
+        if (r_pend == NythonExecutor::kPendExc) f.exc = r_exc;   // round 82 (a copy: the loop may come round again)
         NythonExecutor::call_depth_ = rd;
         t_cur = r_gen;
         if (nycoro::done(g->co) || !nyconc::relay_requested()) break;
@@ -673,6 +687,47 @@ bool genexpr_next(NythonExecutor& E, Gen* g, Value& out) {
 }
 
 // ── Native lazy iterators ──────────────────────────────────────────────────
+// enumerate's next index (round 82: a machine int without binaryOp)
+void enum_advance(NythonExecutor& E, Gen* g, Context* ctx) {
+    int64_t i;
+    if (g->idx.type == ValueType::INTEGER && bigint_fits_i64(g->idx.value.i, i) && i < INT64_MAX) g->idx = intValue(i + 1);
+    else g->idx = E.binaryOp(NythonExecutor::OP_ADD, g->idx, intValue(1), ctx);
+}
+// round 82: `for i, x in enumerate(...)` / `for a, b, c in zip(x, y, z)` -
+// what native_next makes a tuple of, its parts straight into `parts` (as
+// many as the loop has targets: enumerate's 2, zip's one per source; the
+// caller checked), so the loop binds them without the tuple
+bool native_next_parts(NythonExecutor& E, Gen* g, Value* parts, Context* ctx) {
+    if (g->op == Op::Enumerate) {
+        Value v;
+        if (!step(E, g->src[0], v, ctx)) return false;
+        parts[0] = g->idx;
+        parts[1] = std::move(v);
+        enum_advance(E, g, ctx);
+        return true;
+    }
+    // Op::Zip, as native_next
+    for (size_t k = 0; k < g->src.size(); k++) {
+        Value v;
+        if (!step(E, g->src[k], v, ctx)) {
+            if (g->strict) {
+                std::string plural = k == 1 ? " " : "s 1-";
+                if (k > 0)
+                    raise("ValueError", "zip() argument " + std::to_string(k + 1) + " is shorter than argument" + plural + std::to_string(k));
+                for (size_t j = 1; j < g->src.size(); j++) {
+                    Value w;
+                    if (step(E, g->src[j], w, ctx)) {
+                        std::string pl = j == 1 ? " " : "s 1-";
+                        raise("ValueError", "zip() argument " + std::to_string(j + 1) + " is longer than argument" + pl + std::to_string(j));
+                    }
+                }
+            }
+            return false;
+        }
+        parts[k] = std::move(v);
+    }
+    return true;
+}
 bool native_next(NythonExecutor& E, Gen* g, Value& out, Context* ctx) {
     switch (g->op) {
     case Op::Zip: {
@@ -727,7 +782,7 @@ bool native_next(NythonExecutor& E, Gen* g, Value& out, Context* ctx) {
         Value v;
         if (!step(E, g->src[0], v, ctx)) return false;
         out = E.makeListValue({g->idx, v}, true);
-        g->idx = E.binaryOp(NythonExecutor::OP_ADD, g->idx, intValue(1), ctx);
+        enum_advance(E, g, ctx);
         return true;
     }
     case Op::Iter:
@@ -780,6 +835,19 @@ bool machine_next(NythonExecutor& E, Gen* g, Value& out, Context* ctx) {
         finish(E, g);
         throw;
     }
+    if (!got) { finish(E, g); return false; }
+    g->st = St::Suspended;
+    return true;
+}
+
+// round 82: machine_next for native_next_parts (the same guard and finish)
+bool machine_next_parts(NythonExecutor& E, Gen* g, Value* parts, Context* ctx) {
+    if (g->st == St::Done) return false;
+    if (g->st == St::Running) raise("ValueError", "generator already executing");
+    g->st = St::Running;
+    bool got;
+    try { got = native_next_parts(E, g, parts, ctx); }
+    catch (...) { finish(E, g); throw; }
     if (!got) { finish(E, g); return false; }
     g->st = St::Suspended;
     return true;
@@ -1405,21 +1473,31 @@ Value for_loop(NythonExecutor& E, void* for_node, const Value& gv, Context* ctx,
     };
     auto bind_item = [&](const Value& elem) {
         if (fn->unpack_vars.empty()) { bindv(var_name, elem); return; }
-        std::vector<Value> parts;
-        if (Container* ec = E.contOf(elem); ec && NythonExecutor::seqLen(ec) >= 0) parts = NythonExecutor::seqItems(ec);
-        else parts = E.iterValues(elem, ctx);
-        bindv(var_name, parts.empty() ? NONE_VALUE : parts[0]);
-        for (size_t ui = 0; ui < fn->unpack_vars.size(); ui++)
-            bindv(fn->unpack_vars[ui]->value(), ui + 1 < parts.size() ? parts[ui + 1] : NONE_VALUE);
+        E.bindForItem(fn, var_name, elem, ctx, bindv);   // round 82: as Python unpacks, the count checked
     };
+    // round 82: enumerate / zip with as many targets as each row has
+    // values: the targets bound from the parts, no tuple made per step
+    // (NY_ASTSPEC=0: the tuple, as before)
+    const size_t nt = fn->unpack_vars.size() + 1;
+    const bool by_parts = NythonExecutor::astSpecOn() && nt >= 2 && nt <= 8 && g->kind == Kind::Native
+        && ((g->op == Op::Enumerate && nt == 2) || (g->op == Op::Zip && g->src.size() == nt));
+    std::optional<std::array<Value, 8>> parts_store;   // made only for that loop
+    if (by_parts) parts_store.emplace();
+    Value* parts = by_parts ? parts_store->data() : nullptr;
     try {
         Value elem;
         for (bool head_first = true;; head_first = false) {
             // sys.settrace (round 79): the header's line again before each
             // next item (NY_PYT_HEAD)
             if (__builtin_expect(nytrace::t_hooks & nytrace::TRACE, 0) && !head_first) E.pyEvLineAt(fn, true);
-            if (!next(E, g, elem, ctx)) break;
-            bind_item(elem);
+            if (by_parts) {
+                if (!machine_next_parts(E, g, parts, ctx)) break;
+                bindv(var_name, parts[0]);
+                for (size_t ui = 1; ui < nt; ui++) bindv(fn->unpack_vars[ui - 1]->value(), parts[ui]);
+            } else {
+                if (!next(E, g, elem, ctx)) break;
+                bind_item(elem);
+            }
             try { NythonExecutor::LoopBody _lb(lf); result = E.evalNode(fn->body, ctx); }
             catch (std::string& flow) {
                 if (flow == "break") { broke = true; break; }
@@ -1427,7 +1505,7 @@ Value for_loop(NythonExecutor& E, void* for_node, const Value& gv, Context* ctx,
                 throw;
             }
             if (lf.pending) {
-                if (lf.pending == 1) { returning = true; break; }
+                if (lf.pending == 1 || lf.pending == NythonExecutor::kPendExc) { returning = true; break; }   // round 82: an exception too
                 int p = lf.pending;
                 lf.pending = 0;
                 if (p == 2) { broke = true; break; }
