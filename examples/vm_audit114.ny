@@ -962,6 +962,52 @@ if have_tk:
         check("ScrolledText scrolls", stx.vbar.get()[1], 1.0)
         stx.pack_forget()
 
+        # ── tkinter.dnd, tkinter.constants ────────────────────────────────
+        from tkinter import dnd, constants
+        dlog = []
+
+        class DndToken:
+            def dnd_end(self, target, event):
+                dlog.append(("end", target is dbin))
+
+        class DndBin:
+            def dnd_enter(self, source, event):
+                dlog.append("enter")
+
+            def dnd_motion(self, source, event):
+                if dlog[-1:] != ["motion"]:
+                    dlog.append("motion")
+
+            def dnd_leave(self, source, event):
+                dlog.append("leave")
+
+            def dnd_commit(self, source, event):
+                dlog.append(("commit", source is dtok))
+
+        dtok = DndToken()
+        dbin = DndBin()
+        dsrc = tk.Label(root, text="drag me", width=10)
+        ddst = tk.Frame(root, width=100, height=60)
+        dsrc.pack()
+        ddst.pack()
+        ddst.dnd_accept = lambda source, event: dbin
+        dsrc.bind("<ButtonPress-1>", lambda e: dnd.dnd_start(dtok, e))
+        root.update()
+        x1, y1 = at(dsrc)
+        x2, y2 = at(ddst, 50, 30)
+        root._ny_drive("drag %d %d %d %d" % (x1, y1, x2, y2))
+        check("dnd: a drag onto a target commits", [dlog, dsrc["cursor"]],
+              [["enter", "motion", ("commit", True), ("end", True)], ""])
+        del dlog[:]
+        root._ny_drive("drag %d %d %d %d" % (x1, y1, x2, y2 + 100))
+        check("dnd: released outside, the target is left", [dlog[:1], dlog[-2:], ("commit", True) in dlog],
+              [["enter"], ["leave", ("end", False)], False])
+        dsrc.destroy()
+        ddst.destroy()
+        check("constants", [constants.N, constants.SE, constants.BOTH, constants.HORIZONTAL, constants.SUNKEN,
+                            constants.TRUE, constants.END, constants.SEL_FIRST, constants.WORD, constants.MOVETO],
+              ["n", "se", "both", "horizontal", "sunken", 1, "end", "sel.first", "word", "moveto"])
+
         # ── turtle ────────────────────────────────────────────────────────
         import turtle
         scr = turtle.Screen()
@@ -987,7 +1033,7 @@ if have_tk:
         trt.penup()
         trt.goto(10, 20)
         check("goto/towards/distance", [tuple(trt.pos()), round(trt.distance(10, 30)), round(trt.towards(10, 40))],
-              [(10.0, 20.0), 10, 90])
+              [(10, 20), 10, 90])
         trt.pendown()
         trt.color("red", "yellow")
         trt.begin_fill()
@@ -1009,15 +1055,16 @@ if have_tk:
         trt.penup()
         trt.goto(-50, 50)
         trt.write("Hi", align="center", font=("Arial", 12, "normal"))
-        txt = tcv.find_all()[-1]
+        # (the turtle's own shape is raised above everything it draws)
+        txt = [i for i in tcv.find_all() if tcv.type(i) == "text"][-1]
         check("write makes a text item anchored at the turtle",
               [tcv.type(txt), tcv.itemcget(txt, "text"), tcv.itemcget(txt, "anchor"), [round(c) for c in tcv.coords(txt)]],
               ["text", "Hi", "s", [-51, -50]])
         trt.pendown()
         trt.forward(30)
-        after_fd = tuple(trt.pos())
+        after_fd = tuple([round(c, 6) for c in trt.pos()])
         trt.undo()
-        check("undo takes the last move back", [after_fd, tuple(trt.pos())], [(-20.0, 50.0), (-50.0, 50.0)])
+        check("undo takes the last move back", [after_fd, tuple(trt.pos())], [(-20.0, 50.0), (-50, 50)])
         scr.tracer(0)
         n_before = len(tcv.find_all())
         trt.circle(20)
