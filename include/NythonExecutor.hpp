@@ -13259,7 +13259,11 @@ public:
             prefix = i ? prefix + "." + parts[i] : parts[i];
             Value ns = loadModule(node, prefix);
             if (i == 0) first = ns;
-            else if (auto* po = dynamic_cast<Object*>(prev.value.gc)) po->set(parts[i], ns);
+            // round 84: the submodule replaces what the package bound under
+            // its name (CPython's _find_and_load_unlocked: after `import
+            // curses.has_key`, curses.has_key is the module, not the
+            // function) - Object::set never overwrites an existing entry
+            else if (auto* po = dynamic_cast<Object*>(prev.value.gc)) (*po->container)[parts[i]] = ns;
             prev = ns;
         }
         if (!in_node->names.empty()) {

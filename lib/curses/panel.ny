@@ -1,0 +1,9 @@
+# nython: module    (import curses.panel)
+# lib/curses/panel.ny - curses.panel (round 84): CPython's curses/panel.py,
+# over lib/_curses_panel.ny (panel stacks in Nython over the curses natives).
+"""curses.panel
+
+Module for using panels with curses.
+"""
+
+from _curses_panel import *
